@@ -10,6 +10,7 @@ const neurons = @import("../../plan/neurons.zig");
 const crypto = @import("../../config/key_vault.zig");
 const cf_oauth = @import("../../config/cf_oauth.zig");
 const modelcfg = @import("modelcfg"); // a MODULE (src/worker/modelcfg.zig) — shared with the compiled-in desk
+const builtin_mod = @import("../builtin.zig"); // the built-in engine's sentinel + live-endpoint resolution
 const tail_fanout = @import("../control/fanout.zig");
 const wtools = @import("../tools.zig"); // for safeRel — ONE definition of "inside the workspace"
 const cpaths = @import("../chat/paths.zig"); // conv → build-tree mapping (scheduled runs → _sched/{task}/runs/)
@@ -126,16 +127,19 @@ pub fn deploySwarm(app: *App, arena: std.mem.Allocator, u: http.User, body: Depl
         if (app.ledger) |l| if (!l.hasBalance(u.id, u.plan))
             return failCap("you're out of neurons for this billing period — upgrade your plan or add a top-up to run more swarms");
     }
-    // A cast targets a LOCAL model when the provider is ollama OR the base_url names a loopback host. This set
-    // MUST match the worker's isLocal() (src/worker/llm.zig): a host the worker treats as local but the gate
-    // misses is a privilege gap — a non-admin reaching the host's loopback. 0.0.0.0 and [::1] were the gap.
+    // A cast targets a LOCAL model when the provider is ollama or builtin OR the base_url names a loopback
+    // host. This set MUST match the worker's isLocal() (src/worker/llm.zig): a host the worker treats as
+    // local but the gate misses is a privilege gap — a non-admin reaching the host's loopback. 0.0.0.0 and
+    // [::1] were the gap. The builtin sentinel resolves to a loopback base below, so it belongs here too.
     const local_model = std.mem.eql(u8, body.provider, "ollama") or
+        std.mem.eql(u8, body.provider, builtin_mod.SENTINEL) or
+        builtin_mod.isSentinelBase(body.base_url) or
         std.mem.indexOf(u8, body.base_url, "localhost") != null or
         std.mem.indexOf(u8, body.base_url, "127.0.0.1") != null or
         std.mem.indexOf(u8, body.base_url, "0.0.0.0") != null or
         std.mem.indexOf(u8, body.base_url, "[::1]") != null;
     if (local_model and !app.auth.isAdmin(u))
-        return failCap("local models (Ollama) are admin-only and don't run in the hosted environment — choose Cloudflare Workers AI or bring your own API key");
+        return failCap("local models (Ollama or the built-in engine) are admin-only and don't run in the hosted environment — choose Cloudflare Workers AI or bring your own API key");
 
     var rnd: [8]u8 = undefined;
     app.io.random(&rnd);
@@ -236,6 +240,17 @@ pub fn deploySwarm(app: *App, arena: std.mem.Allocator, u: http.User, body: Depl
             if (eff_base.len == 0 and rk.base_url.len > 0) eff_base = rk.base_url;
         };
     }
+    // BUILT-IN engine: the catalog's `builtin` provider (or its sentinel base) resolves to the server's
+    // own loopback engine endpoint + per-boot bearer — the same server-side swap the "cloudflare"
+    // sentinel gets above. Refused honestly when the engine is not in this build/boot: a cast that
+    // would silently fall through to another endpoint is worse than a clear no.
+    if (std.mem.eql(u8, eff_provider, builtin_mod.SENTINEL) or builtin_mod.isSentinelBase(eff_base)) {
+        const r = builtin_mod.resolve(arena) orelse return failSrv("the built-in model engine is not available (server built without -Dbuiltin, or its endpoint failed to start) — pick another provider, or rebuild with the default options");
+        eff_base = r.base;
+        eff_key = r.key;
+        if (eff_model.len == 0) eff_model = builtin_mod.MODEL_ID;
+    }
+
     // A local-provider cast with no explicit base_url must resolve to the local Ollama, NEVER the worker's
     // OpenAI fallback (run.zig defaults an empty base to api.openai.com — and with a server-env OPENAI/ANTHROPIC
     // key the worker inherits, that becomes real egress). The desk always sends a base; a direct /cast API

@@ -2980,3 +2980,49 @@ edit, confirm it applied, then run.
   bare "Protocol" error and the agent tries to launch Chrome instead of saying "extension disconnected,
   ask the user to reconnect." That opacity is a separate fix from the root cause.
 - verified: suite exit 0, new test collected (the counterfactual fired by name). Full oracle running.
+
+## 0110 — 2026-07-31 — the BUILT-IN engine: the server serves the-veil-12b itself (plug-and-play tier)
+- owner: build the-veil-12b into the server as an embedded default so a fresh install needs NO external
+  model runtime; keep every existing provider exactly as it was; the repo must not gain a 12GB download
+  (weights will live at huggingface.co/gary23w/the-veil-12b — repo exists, GGUF not uploaded yet).
+- shape: compile the inference library IN (the vendor/lua pattern, but as a LAZY hash-pinned dependency
+  — llama_cpp b10205, ~15MB source fetched at build, -Dbuiltin default true, =false builds today's lean
+  binary); serve it behind a loopback-only endpoint under the builtin path prefix (worker subprocesses
+  reach it over TCP like any local backend, port scanned 8788-8797, every route except the version
+  probe gated by a per-boot bearer); weights are DATA pulled on demand into {data}/models
+  (NL_MODELS_DIR override, cloud-synced-dir warning), sha256-verified against the repo's own
+  large-file record before serving.
+- the decisive recon find: the engine-side gemma4 renderer (gemma4.zig, byte-verified vs the model's
+  own chat template) + llm.zig's raw path already define the model's best-measured serving contract
+  (27/30 vs 18/30 through the conventional renderer). So the endpoint speaks the NATIVE dialect —
+  version probe, show (family gemma4, SERVING window, params), generate raw verbatim, chat rendered
+  through gemma4.renderPrompt, plus an OpenAI-compatible door for the one-shots — and llm.zig's only
+  change is isOllama() also recognizing the builtin path marker. Chat, swarm, streamed and blocking
+  all run the SAME renderer now; the desk needed ZERO changes to select it (catalog kind 1 passes the
+  sentinel base through, the server resolves).
+- resolution: models.yaml appends provider `builtin` (base = the "builtin" SENTINEL, keyless+local,
+  index contract preserved, modelcfg order test extended); deploy/service.zig and chat/service.zig swap
+  the sentinel for the live endpoint+bearer at request time (the cloudflare-sentinel pattern); builtin
+  joins the local-model admin gate in deploys.
+- engine (llamaeng.zig + llamashim.c): single-flight, lazy load, idle unload (NL_BUILTIN_KEEPALIVE),
+  PREFIX REUSE via seq_rm so a steady-state chat turn re-prefills only its newest messages — the
+  difference between usable and unusable on CPU. The shim is scalar/pointer-only on purpose: the
+  library's big by-value param structs never cross the FFI line, so a pin bump that changes a field is
+  a compile error in the shim, never silent ABI skew. Spike measured on this box: model loads, 4.5
+  tok/s greedy CPU, exe grows ~6MB.
+- downloader (modelpull.zig): repo tree API is the manifest (election rule pinned: q4_k_m wins, else
+  largest, no large-file record = no candidate), .part + full-file sha + rename, curl resume for TLS,
+  loopback rides httpc (how the fakehttp e2e test runs), cancel keeps the .part. `veil model
+  status|pull|import|cancel|rm` + the models/builtin routes + a web Settings panel render it. import
+  auto-discovers the local runtime's content-addressed blob and verifies against ITS manifest digest —
+  owners of an existing local copy never redownload 7GB.
+- verified so far: full server suite green (612 tests, all new modules covered against a mock Engine —
+  auth gate, show shapes, raw verbatim, chat→structured tool_calls, channel machine with byte-split
+  markers, election/digest/sha vectors, loopback pull e2e, sentinel resolution, catalog pins);
+  models.json regenerated in sync; spike proved real weights load+generate through the pinned library
+  on this machine.
+- NOT done, named: the GGUF is not on the HF repo yet (pull resolves "not published" until the owner
+  uploads — the runtime-resolving manifest was designed for exactly this); desk-native download button
+  (web+CLI carry the downloader UX, engine errors point at both); GPU backends (CPU-only v1); aarch64
+  arch flags are conservative (no dotprod/i8mm pin); streamed chat against REAL weights not yet
+  exercised end-to-end (mock-engine streamed, live blocking smoke next).

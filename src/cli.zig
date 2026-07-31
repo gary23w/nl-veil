@@ -59,6 +59,7 @@ pub fn isCommand(sub: []const u8) bool {
         "sched",     "hub",           "doctor", "health",  "desktop",   "desk",
         "help",      "--help",        "-h",     "version", "--version", "exec-tool",
         "sync-read", "sync-manifest", "rag",    "themes",  "plugins",   "plug",
+        "model",
     };
     for (verbs) |v| if (std.mem.eql(u8, sub, v)) return true;
     return false;
@@ -93,6 +94,7 @@ pub fn dispatch(ctx: *Ctx, sub: []const u8, args: []const []const u8) u8 {
     if (std.mem.eql(u8, sub, "rag")) return cmdRag(ctx, args);
     if (std.mem.eql(u8, sub, "themes")) return cmdThemes(ctx, args);
     if (std.mem.eql(u8, sub, "plugins") or std.mem.eql(u8, sub, "plug")) return cmdPlugins(ctx, args);
+    if (std.mem.eql(u8, sub, "model")) return cmdModel(ctx, args);
     std.debug.print("unknown command '{s}' — run `veil help`\n", .{sub});
     return 1;
 }
@@ -706,6 +708,142 @@ fn cmdDesktop(ctx: *Ctx) u8 {
     return 0;
 }
 
+// ------------------------------------------------------------------------------- built-in model
+
+/// `veil model status|pull|import|cancel|rm` — the CLI face of /api/v1/models/builtin. pull and
+/// import kick a server-side background job and then POLL the status route, drawing progress until
+/// the job lands; Ctrl-C only stops the drawing (the server finishes or resumes later).
+fn cmdModel(ctx: *Ctx, args: []const []const u8) u8 {
+    const sub = if (args.len > 0) args[0] else "status";
+    if (std.mem.eql(u8, sub, "status")) return modelStatusOnce(ctx, true);
+    if (std.mem.eql(u8, sub, "pull")) {
+        const resp = call(ctx, "POST", "/api/v1/models/builtin/pull", "{}", 10, true) catch return unreachable_msg(ctx);
+        defer if (resp.body.len > 0) ctx.gpa.free(resp.body);
+        if (resp.status != 200) {
+            std.debug.print("pull not started (HTTP {d}): {s}\n", .{ resp.status, resp.body[0..@min(resp.body.len, 300)] });
+            return 1;
+        }
+        return modelWatch(ctx);
+    }
+    if (std.mem.eql(u8, sub, "import")) {
+        var body_buf: [640]u8 = undefined;
+        var body: []const u8 = "{}";
+        var i: usize = 1;
+        while (i < args.len) : (i += 1) {
+            if (flagVal(args, &i, args[i], "--path")) |p| {
+                var esc: [560]u8 = undefined;
+                var n: usize = 0;
+                for (p) |c| { // JSON-escape the path (backslashes on Windows)
+                    if (n + 2 >= esc.len) break;
+                    if (c == '\\' or c == '"') {
+                        esc[n] = '\\';
+                        n += 1;
+                    }
+                    esc[n] = c;
+                    n += 1;
+                }
+                body = std.fmt.bufPrint(&body_buf, "{{\"path\":\"{s}\"}}", .{esc[0..n]}) catch "{}";
+            }
+        }
+        const resp = call(ctx, "POST", "/api/v1/models/builtin/import", body, 10, true) catch return unreachable_msg(ctx);
+        defer if (resp.body.len > 0) ctx.gpa.free(resp.body);
+        if (resp.status != 200) {
+            std.debug.print("import not started (HTTP {d}): {s}\n", .{ resp.status, resp.body[0..@min(resp.body.len, 300)] });
+            return 1;
+        }
+        return modelWatch(ctx);
+    }
+    if (std.mem.eql(u8, sub, "cancel")) {
+        const resp = call(ctx, "POST", "/api/v1/models/builtin/cancel", "{}", 10, true) catch return unreachable_msg(ctx);
+        defer if (resp.body.len > 0) ctx.gpa.free(resp.body);
+        out("cancel requested — the partial transfer stays for a later resume\n", .{});
+        return 0;
+    }
+    if (std.mem.eql(u8, sub, "rm")) {
+        const resp = call(ctx, "DELETE", "/api/v1/models/builtin", null, 10, true) catch return unreachable_msg(ctx);
+        defer if (resp.body.len > 0) ctx.gpa.free(resp.body);
+        if (resp.status != 200) {
+            std.debug.print("rm failed (HTTP {d}): {s}\n", .{ resp.status, resp.body[0..@min(resp.body.len, 300)] });
+            return 1;
+        }
+        out("weights removed\n", .{});
+        return 0;
+    }
+    std.debug.print("unknown model subcommand '{s}' — status | pull | import [--path FILE] | cancel | rm\n", .{sub});
+    return 1;
+}
+
+/// One status read, pretty-printed. Returns the process exit code (0 even for absent — status is a
+/// report, not a failure).
+fn modelStatusOnce(ctx: *Ctx, verbose: bool) u8 {
+    const resp = call(ctx, "GET", "/api/v1/models/builtin", null, 8, true) catch return unreachable_msg(ctx);
+    defer if (resp.body.len > 0) ctx.gpa.free(resp.body);
+    if (resp.status != 200) {
+        std.debug.print("status failed (HTTP {d}): {s}\n", .{ resp.status, resp.body[0..@min(resp.body.len, 300)] });
+        return 1;
+    }
+    const parsed = std.json.parseFromSlice(std.json.Value, ctx.gpa, resp.body, .{}) catch {
+        std.debug.print("unparseable status reply\n", .{});
+        return 1;
+    };
+    defer parsed.deinit();
+    const o = if (parsed.value == .object) parsed.value.object else {
+        std.debug.print("unparseable status reply\n", .{});
+        return 1;
+    };
+    const state = if (o.get("state")) |v| (if (v == .string) v.string else "?") else "?";
+    const compiled = if (o.get("compiled")) |v| (v == .bool and v.bool) else false;
+    const model = if (o.get("model")) |v| (if (v == .string) v.string else "?") else "?";
+    out("built-in model: {s}\n", .{model});
+    out("  engine:  {s}{s}\n", .{ state, if (compiled) "" else "  (not compiled into this build: -Dbuiltin=false)" });
+    if (o.get("path")) |v| if (v == .string and v.string.len > 0) out("  weights: {s}\n", .{v.string});
+    if (o.get("err")) |v| if (v == .string and v.string.len > 0) out("  error:   {s}\n", .{v.string});
+    if (verbose) {
+        if (o.get("bytes_total")) |bt| if (bt == .integer and bt.integer > 0) {
+            const done: i64 = if (o.get("bytes_done")) |bd| (if (bd == .integer) bd.integer else 0) else 0;
+            out("  transfer: {d} / {d} MB\n", .{ @divTrunc(done, 1 << 20), @divTrunc(bt.integer, 1 << 20) });
+        };
+        if (o.get("synced_dir_warning")) |v| if (v == .bool and v.bool)
+            out("  note: the models dir is under a cloud-synced folder — set NL_MODELS_DIR to a local path\n", .{});
+    }
+    return 0;
+}
+
+/// Poll status ~1Hz until the transfer lands; draw progress in place. The terminal states are the
+/// exit code: done/cold/ready = 0, failed/cancelled = 1.
+fn modelWatch(ctx: *Ctx) u8 {
+    var last_pct: i64 = -1;
+    while (true) {
+        const resp = call(ctx, "GET", "/api/v1/models/builtin", null, 8, false) catch return unreachable_msg(ctx);
+        defer if (resp.body.len > 0) ctx.gpa.free(resp.body);
+        if (resp.status != 200) return 1;
+        const parsed = std.json.parseFromSlice(std.json.Value, ctx.gpa, resp.body, .{}) catch return 1;
+        defer parsed.deinit();
+        const o = if (parsed.value == .object) parsed.value.object else return 1;
+        const state = if (o.get("state")) |v| (if (v == .string) v.string else "?") else "?";
+        const pct: i64 = if (o.get("pct")) |v| (if (v == .integer) v.integer else 0) else 0;
+        const done: i64 = if (o.get("bytes_done")) |v| (if (v == .integer) v.integer else 0) else 0;
+        if (std.mem.eql(u8, state, "downloading") or std.mem.eql(u8, state, "importing")) {
+            if (pct != last_pct) {
+                out("\r{s}: {d}%  ({d} MB)      ", .{ state, pct, @divTrunc(done, 1 << 20) });
+                last_pct = pct;
+            }
+        } else if (std.mem.eql(u8, state, "resolving") or std.mem.eql(u8, state, "verifying")) {
+            out("\r{s}...                       ", .{state});
+        } else {
+            out("\n", .{});
+            if (std.mem.eql(u8, state, "failed") or std.mem.eql(u8, state, "cancelled")) {
+                const err = if (o.get("err")) |v| (if (v == .string) v.string else "") else "";
+                out("{s}: {s}\n", .{ state, err });
+                return 1;
+            }
+            out("done — the built-in engine now serves {s}\n", .{if (o.get("file")) |v| (if (v == .string) v.string else "") else ""});
+            return 0;
+        }
+        ctx.io.sleep(.{ .nanoseconds = std.time.ns_per_s }, .awake) catch {};
+    }
+}
+
 fn cmdHelp() u8 {
     out(
         \\veil — the local agentic swarm + chat control plane
@@ -728,6 +866,14 @@ fn cmdHelp() u8 {
         \\
         \\CHAT (the server-side veil brain)
         \\  chat [conv]                  interactive chat; steer/stop a running turn inline
+        \\
+        \\BUILT-IN MODEL (the-veil-12b served by the server itself — no external runtime)
+        \\  model status                 weights + engine + any download in flight
+        \\  model pull                   download the published weights (resumable, sha-verified)
+        \\  model import [--path FILE]   copy an already-downloaded GGUF into the store instead
+        \\                               (no --path: auto-import this machine's local-runtime copy)
+        \\  model cancel                 cancel the running pull/import (the partial resumes later)
+        \\  model rm                     remove the serving weights
         \\
         \\MODEL TRIO (environment, read by `veil chat`)
         \\  Every LLM call carries a role, and each role can run on a different model. Set what you want;

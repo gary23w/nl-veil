@@ -23,6 +23,7 @@ const cf_oauth = @import("../../config/cf_oauth.zig");
 const chat_engine = @import("engine.zig");
 const llm = @import("../llm.zig");
 const modelcfg = @import("modelcfg");
+const builtin_mod = @import("../builtin.zig"); // the built-in engine's sentinel + live-endpoint resolution
 
 /// The reserved uid for INSTANCE-WIDE credentials. Real accounts start at 1 (auth_core.next_id), so 0
 /// can never collide with one, and the shared key reuses the per-user vault's sealing and scoping
@@ -62,6 +63,15 @@ fn roleDefault(model: []const u8, base_url: []const u8, d_model: []const u8, d_b
 /// browser sends the endpoint and nothing else, and the key stays server-side in the per-user vault.
 /// A non-blank key always wins: an explicitly-supplied key is the caller's stated intent.
 fn resolveRole(app: *App, uid: u64, arena: std.mem.Allocator, base_url: []const u8, model: []const u8, api_key: []const u8) struct { base: []const u8, key: []const u8 } {
+    // BUILT-IN engine: the sentinel base resolves to the live loopback endpoint + per-boot bearer,
+    // exactly like deploy resolution does for casts. When the engine is not available, resolve to a
+    // guaranteed-dead loopback port so the turn fails with the honest local-model connect error
+    // (the Settings status row carries the why); leaving the bare sentinel would read as a curl
+    // usage error instead.
+    if (builtin_mod.isSentinelBase(base_url)) {
+        if (builtin_mod.resolve(arena)) |r| return .{ .base = r.base, .key = r.key };
+        return .{ .base = "http://127.0.0.1:1" ++ builtin_mod.PATH_PREFIX ++ "/v1", .key = "" };
+    }
     if (api_key.len != 0) return .{ .base = base_url, .key = api_key };
 
     const looks_cf = std.mem.indexOf(u8, base_url, "api.cloudflare.com") != null and std.mem.indexOf(u8, base_url, "/ai/") != null;

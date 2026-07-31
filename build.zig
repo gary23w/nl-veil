@@ -84,6 +84,19 @@ pub fn build(b: *std.Build) void {
     // does not link libc — Lua needs it, so addLua sets it).
     addLua(b, exe.root_module);
 
+    // ---- the BUILT-IN model engine (embedded inference; -Dbuiltin, default true) ----
+    // The plug-and-play tier: the server serves the-veil-12b itself from a downloaded GGUF, no
+    // separate local model runtime. Same compile-the-C-in pattern as Lua above, but the ~15MB of
+    // ggml+llama source arrives as a LAZY hash-pinned dependency (like raylib for -Dapp) instead of
+    // living in vendor/ — the repo stays light and `-Dbuiltin=false` never even fetches it.
+    // build_options.builtin gates the ONE construction site (main.zig); everything else about the
+    // feature (endpoint, downloader, catalog entry) compiles in every build and simply resolves
+    // "unavailable" when this is off.
+    const with_builtin = b.option(bool, "builtin", "compile the built-in model engine into `veil` (default true; -Dbuiltin=false = lean build, the builtin provider reports unavailable)") orelse true;
+    const llama_dep: ?*std.Build.Dependency = if (with_builtin) b.lazyDependency("llama_cpp", .{}) else null;
+    const builtin_on = with_builtin and llama_dep != null;
+    if (llama_dep) |lc| addLlamaCpp(b, exe.root_module, lc, target);
+
     // ---- the desktop GUI, compiled IN (one binary) ----
     // Was: shell out to desk/'s own `zig build` and ship a second veil-desk.exe that the server SPAWNED.
     // Now: desk/src/main.zig is imported as the module "desk" and src/main.zig calls desk.runApp() on the
@@ -102,6 +115,7 @@ pub fn build(b: *std.Build) void {
 
     const build_options = b.addOptions();
     build_options.addOption(bool, "gui", gui);
+    build_options.addOption(bool, "builtin", builtin_on);
     exe.root_module.addImport("build_options", build_options.createModule());
 
     if (raylib_dep) |raylib| {
@@ -177,6 +191,9 @@ pub fn build(b: *std.Build) void {
     // pulled the GUI in would need GL on every CI box, which is exactly what -Dapp=false exists to avoid.
     const test_options = b.addOptions();
     test_options.addOption(bool, "gui", false);
+    // Tests never compile the inference library: builtin_endpoint/builtin/modelpull test against a
+    // MOCK engine, and llamaeng.zig's externs stay unreferenced when this is false.
+    test_options.addOption(bool, "builtin", false);
     tests.root_module.addImport("build_options", test_options.createModule());
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run all unit tests");
@@ -190,6 +207,148 @@ pub fn build(b: *std.Build) void {
     const modelcfg_tests = b.addTest(.{ .root_module = modelcfg });
     test_step.dependOn(&b.addRunArtifact(modelcfg_tests).step);
 }
+
+/// Compile the embedded inference library (the lazy `llama_cpp` dependency) into `mod`, CPU
+/// backend only, plus the veil_ll_* C shim (src/worker/llamashim.c) that src/worker/llamaeng.zig
+/// binds. Mirrors the library's own CPU build recipe: base + backend registry + one CPU variant
+/// with the x86-64 AVX2 baseline (its default x64 release configuration) or the arm sources on
+/// aarch64; anything else falls back to the generic kernels. C++17 with exceptions (the library
+/// throws), UBSan off for the same reason as Lua below: its intentional aliasing is not ours to trap.
+fn addLlamaCpp(b: *std.Build, mod: *std.Build.Module, dep: *std.Build.Dependency, target: std.Build.ResolvedTarget) void {
+    mod.link_libc = true;
+    mod.link_libcpp = true;
+
+    for ([_][]const u8{ "include", "ggml/include", "ggml/src", "ggml/src/ggml-cpu", "src" }) |p|
+        mod.addIncludePath(dep.path(p));
+
+    // NDEBUG unconditionally: the library's asserts abort the whole server process, and the Debug
+    // builds of THIS repo are for debugging veil, not ggml.
+    const common = [_][]const u8{
+        "-DNDEBUG",
+        "-DGGML_VERSION=\"b10205\"",
+        "-DGGML_COMMIT=\"b10205\"",
+        "-DGGML_USE_CPU",
+        "-fno-sanitize=undefined",
+    };
+    var cflags_list: std.ArrayListUnmanaged([]const u8) = .empty;
+    var cxxflags_list: std.ArrayListUnmanaged([]const u8) = .empty;
+    cflags_list.appendSlice(b.allocator, &common) catch @panic("oom");
+    cflags_list.append(b.allocator, "-std=c11") catch @panic("oom");
+    cxxflags_list.appendSlice(b.allocator, &common) catch @panic("oom");
+    cxxflags_list.append(b.allocator, "-std=c++17") catch @panic("oom");
+    // glibc hides the affinity/clock/getline family behind _GNU_SOURCE; the library's own build
+    // defines it on Linux, so the cross-compiled server target needs it too (mac and windows
+    // compile clean without extra feature macros).
+    if (target.result.os.tag == .linux) {
+        cflags_list.append(b.allocator, "-D_GNU_SOURCE") catch @panic("oom");
+        cxxflags_list.append(b.allocator, "-D_GNU_SOURCE") catch @panic("oom");
+    }
+    const cflags = cflags_list.items;
+    const cxxflags = cxxflags_list.items;
+
+    const arch = target.result.cpu.arch;
+    const arch_flags: []const []const u8 = if (arch == .x86_64)
+        &.{ "-msse4.2", "-mf16c", "-mfma", "-mbmi2", "-mavx", "-mavx2", "-DGGML_SSE42", "-DGGML_F16C", "-DGGML_FMA", "-DGGML_BMI2", "-DGGML_AVX", "-DGGML_AVX2" }
+    else if (arch == .aarch64)
+        &.{}
+    else
+        &.{"-DGGML_CPU_GENERIC"};
+
+    // ---- ggml base + backend registry ----
+    mod.addCSourceFiles(.{
+        .root = dep.path("ggml/src"),
+        .files = &.{ "ggml.c", "ggml-alloc.c", "ggml-quants.c" },
+        .flags = cflags,
+    });
+    mod.addCSourceFiles(.{
+        .root = dep.path("ggml/src"),
+        .files = &.{ "ggml.cpp", "ggml-backend.cpp", "ggml-backend-meta.cpp", "ggml-backend-dl.cpp", "ggml-backend-reg.cpp", "ggml-opt.cpp", "ggml-threading.cpp", "gguf.cpp" },
+        .flags = cxxflags,
+    });
+
+    // ---- the CPU backend, single variant ----
+    const cpu_extra = [_][]const u8{ "-DGGML_USE_LLAMAFILE", "-DGGML_USE_CPU_REPACK" };
+    addCFiles(b, mod, dep.path("ggml/src/ggml-cpu"), &.{ "ggml-cpu.c", "quants.c" }, cflags, arch_flags, &cpu_extra);
+    addCFiles(b, mod, dep.path("ggml/src/ggml-cpu"), &.{ "ggml-cpu.cpp", "repack.cpp", "hbm.cpp", "traits.cpp", "binary-ops.cpp", "unary-ops.cpp", "vec.cpp", "ops.cpp", "amx/amx.cpp", "amx/mmq.cpp", "llamafile/sgemm.cpp" }, cxxflags, arch_flags, &cpu_extra);
+    if (arch == .x86_64) {
+        addCFiles(b, mod, dep.path("ggml/src/ggml-cpu"), &.{"arch/x86/quants.c"}, cflags, arch_flags, &cpu_extra);
+        addCFiles(b, mod, dep.path("ggml/src/ggml-cpu"), &.{"arch/x86/repack.cpp"}, cxxflags, arch_flags, &cpu_extra);
+    } else if (arch == .aarch64) {
+        addCFiles(b, mod, dep.path("ggml/src/ggml-cpu"), &.{"arch/arm/quants.c"}, cflags, arch_flags, &cpu_extra);
+        addCFiles(b, mod, dep.path("ggml/src/ggml-cpu"), &.{"arch/arm/repack.cpp"}, cxxflags, arch_flags, &cpu_extra);
+    }
+
+    // ---- llama ----
+    mod.addCSourceFiles(.{
+        .root = dep.path("src"),
+        .files = &llama_sources,
+        .flags = cxxflags,
+    });
+    // src/models/*.cpp (one graph per architecture, ~140 files) — enumerated from the fetched tree
+    // at configure time, so a pin bump that adds a model never needs a hand-edit here.
+    const io = b.graph.io;
+    const models_dir = dep.path("src/models").getPath3(b, null);
+    var names: std.ArrayListUnmanaged([]const u8) = .empty;
+    var d = models_dir.root_dir.handle.openDir(io, models_dir.subPathOrDot(), .{ .iterate = true }) catch @panic("llama_cpp dependency: src/models missing");
+    defer d.close(io);
+    var it = d.iterate();
+    while (it.next(io) catch @panic("llama_cpp dependency: src/models unreadable")) |e| {
+        if (e.kind != .file or !std.mem.endsWith(u8, e.name, ".cpp")) continue;
+        names.append(b.allocator, b.dupe(e.name)) catch @panic("oom");
+    }
+    mod.addCSourceFiles(.{
+        .root = dep.path("src/models"),
+        .files = names.items,
+        .flags = cxxflags,
+    });
+
+    // ---- the veil_ll_* shim ----
+    mod.addCSourceFiles(.{
+        .root = b.path("src/worker"),
+        .files = &.{"llamashim.c"},
+        .flags = cflags,
+    });
+}
+
+fn addCFiles(b: *std.Build, mod: *std.Build.Module, root: std.Build.LazyPath, files: []const []const u8, base: []const []const u8, arch: []const []const u8, extra: []const []const u8) void {
+    var flags: std.ArrayListUnmanaged([]const u8) = .empty;
+    flags.appendSlice(b.allocator, base) catch @panic("oom");
+    flags.appendSlice(b.allocator, arch) catch @panic("oom");
+    flags.appendSlice(b.allocator, extra) catch @panic("oom");
+    mod.addCSourceFiles(.{ .root = root, .files = files, .flags = flags.items });
+}
+
+const llama_sources = [_][]const u8{
+    "llama-adapter.cpp",
+    "llama-arch.cpp",
+    "llama-batch.cpp",
+    "llama-chat.cpp",
+    "llama-context.cpp",
+    "llama-cparams.cpp",
+    "llama-grammar.cpp",
+    "llama-graph.cpp",
+    "llama-hparams.cpp",
+    "llama-impl.cpp",
+    "llama-io.cpp",
+    "llama-kv-cache-dsa.cpp",
+    "llama-kv-cache-dsv4.cpp",
+    "llama-kv-cache-iswa.cpp",
+    "llama-kv-cache.cpp",
+    "llama-memory-hybrid-iswa.cpp",
+    "llama-memory-hybrid.cpp",
+    "llama-memory-recurrent.cpp",
+    "llama-memory.cpp",
+    "llama-mmap.cpp",
+    "llama-model-loader.cpp",
+    "llama-model-saver.cpp",
+    "llama-model.cpp",
+    "llama-quant.cpp",
+    "llama-sampler.cpp",
+    "llama-vocab.cpp",
+    "llama.cpp",
+    "unicode-data.cpp",
+    "unicode.cpp",
+};
 
 /// Compile the vendored Lua 5.4 core into `mod` and make its headers reachable. The plugin/theme
 /// runtime (src/plug/lua.zig) declares the C API as externs, so no translate-c step is needed — just

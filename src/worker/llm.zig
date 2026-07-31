@@ -10,6 +10,7 @@ const builtin = @import("builtin");
 const httpc = @import("httpc.zig");
 const rate = @import("rate.zig");
 const fakehttp = @import("fakehttp.zig"); // TEST ONLY: the canned gateway the H11 test at the bottom dials
+const gemma4 = @import("gemma4.zig"); // engine-side wire format, used when a backend fails the name-binding probe
 
 pub const Reply = struct {
     content: []u8,
@@ -208,6 +209,25 @@ pub const Caps = struct {
     /// tool_calls, or does the model emit the call as text markup (e.g. DeepSeek's ｜DSML｜ emission)? Measured
     /// by a real startup completion, cached per model. Defaults to trusted; only clear text-emission evidence flips it.
     tools_native_ok: bool = true,
+    /// The wire family the BACKEND reports for this model (/api/show -> details.family), e.g. "gemma4".
+    /// Discovered, never inferred from the model id: a fork or a rename must not change how we talk to it.
+    family: [32]u8 = @splat(0),
+    family_len: u8 = 0,
+    /// Does the backend's own prompt rendering put the tool NAMES in front of the model?
+    ///
+    /// Probed by offering a tool whose name cannot be guessed from pretraining and checking whether the
+    /// call comes back under that exact name. A backend can hand the model a tools array well enough to
+    /// trigger tool-calling while still failing to bind the names — the model then falls back on names it
+    /// memorised (`Read`, `WebSearch`, `Browser`), which the engine rejects as unknown tools. Measured on
+    /// 30 harness drills, that cost 18/30 with 5 invented names where engine-side rendering scored 27/30
+    /// with none.
+    ///
+    /// Same trust bias as the other probes: assume the backend is fine, and let only clear evidence flip it.
+    name_binding_ok: bool = true,
+
+    pub fn familyName(self: *const Caps) []const u8 {
+        return self.family[0..self.family_len];
+    }
 };
 var caps: Caps = .{};
 
@@ -277,7 +297,11 @@ pub fn isLocal(base_url: []const u8) bool {
 }
 fn isOllama(base_url: []const u8) bool {
     if (caps.probed) return caps.ollama_native;
-    return isLocal(base_url) and std.mem.indexOf(u8, base_url, "11434") != null;
+    // "/builtin" marks the server's own embedded-engine endpoint (worker/builtin.zig PATH_PREFIX):
+    // it speaks the same native local dialect on whatever loopback port it bound, so it takes the
+    // native path even before any probe has run.
+    return isLocal(base_url) and (std.mem.indexOf(u8, base_url, "11434") != null or
+        std.mem.indexOf(u8, base_url, "/builtin") != null);
 }
 /// Floor on max_tokens for a LOCAL **thinking** model: its hidden reasoning eats the budget before the answer,
 /// so a small-budget call would come back empty. Give those calls room to think AND answer.
@@ -499,6 +523,16 @@ fn completeOllamaNative(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8,
     defer gpa.free(temp_frag);
     var root = trimSlash(base_url);
     if (std.mem.endsWith(u8, root, "/v1")) root = root[0 .. root.len - 3];
+
+    // When the startup probe measured that this backend's rendering does not bind tool NAMES, render the
+    // prompt here and post it verbatim instead. Both conditions are discovered, never assumed: the family
+    // comes from /api/show, the verdict from a real completion. If either is absent we fall through to the
+    // ordinary /api/chat path below, unchanged.
+    if (tools_json.len > 0 and !caps.name_binding_ok and gemma4.canRenderFamily(caps.familyName())) {
+        if (completeGemma4Raw(gpa, io, run_dir, tag, base_url, root, key, model, messages_json, tools_json, np, temp_frag)) |step| return step;
+        // rendering failed (malformed buffer): fall through rather than lose the turn
+    }
+
     const url = std.fmt.allocPrint(gpa, "{s}/api/chat", .{root}) catch return stepErr(gpa, "oom");
     defer gpa.free(url);
     const body = ollamaNativeBody(gpa, model, messages_json, tools_json, np, effectiveCtx(), temp_frag) catch return stepErr(gpa, "oom");
@@ -514,6 +548,90 @@ fn completeOllamaNative(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8,
         .ms = @intCast(@max(@divTrunc(t1.nanoseconds - t0, std.time.ns_per_ms), 0)),
         .ts = t1.toSeconds(),
     });
+}
+
+/// Post an engine-rendered prompt to /api/generate with raw:true, bypassing the backend's own renderer, and
+/// parse the tool calls back out of the raw text ourselves. Returns null when the conversation buffer cannot
+/// be rendered, so the caller can fall back to the ordinary chat path.
+fn completeGemma4Raw(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const u8, base_url: []const u8, root: []const u8, key: []const u8, model: []const u8, messages_json: []const u8, tools_json: []const u8, np: u32, temp_frag: []const u8) ?Step {
+    const prompt = gemma4.renderPrompt(gpa, messages_json, tools_json) catch return null;
+    defer gpa.free(prompt);
+    const url = std.fmt.allocPrint(gpa, "{s}/api/generate", .{root}) catch return null;
+    defer gpa.free(url);
+
+    var pj: std.ArrayListUnmanaged(u8) = .empty;
+    defer pj.deinit(gpa);
+    jstr(gpa, &pj, prompt) catch return null;
+    // raw:true tells Ollama to skip its template entirely and send these bytes through unchanged.
+    const body = std.fmt.allocPrint(
+        gpa,
+        "{{\"model\":\"{s}\",\"prompt\":{s},\"raw\":true,\"stream\":false,\"keep_alive\":\"{s}\"," ++
+            "\"options\":{{\"num_predict\":{d},\"num_ctx\":{d},\"stop\":[\"{s}\"]{s}}}}}",
+        .{ model, pj.items, OLLAMA_KEEP_ALIVE, np, effectiveCtx(), "<turn|>", temp_frag },
+    ) catch return null;
+    defer gpa.free(body);
+
+    const t0 = std.Io.Timestamp.now(io, .real).nanoseconds;
+    const r = postUrl(gpa, io, run_dir, tag, url, key, body, true, np);
+    const t1 = std.Io.Timestamp.now(io, .real);
+    if (!r.ok) return Step{ .content = r.content, .reasoning = gpa.dupe(u8, "") catch @constCast(""), .calls = &.{}, .ok = false };
+    defer gpa.free(r.content);
+
+    const Gen = struct {
+        response: ?[]const u8 = null,
+        eval_count: ?u64 = 0,
+        prompt_eval_count: ?u64 = 0,
+        @"error": ?[]const u8 = null,
+    };
+    const parsed = std.json.parseFromSlice(Gen, gpa, r.content, .{ .ignore_unknown_fields = true }) catch return null;
+    defer parsed.deinit();
+    if (parsed.value.@"error") |e| return stepErr(gpa, std.fmt.allocPrint(gpa, "provider error: {s}", .{e}) catch "provider error");
+    const text = parsed.value.response orelse return null;
+
+    const ms: u64 = @intCast(@max(@divTrunc(t1.nanoseconds - t0, std.time.ns_per_ms), 0));
+    if (parsed.value.eval_count) |ec| {
+        const pin = parsed.value.prompt_eval_count orelse 0;
+        if (isLocal(base_url)) {
+            _ = tokens_in_free.fetchAdd(pin, .monotonic);
+            _ = tokens_out_free.fetchAdd(ec, .monotonic);
+        } else {
+            _ = tokens_in.fetchAdd(pin, .monotonic);
+            _ = tokens_out.fetchAdd(ec, .monotonic);
+        }
+        meterTL(pin, ec, 0);
+        meterRole(tag, model, base_url, pin, ec, 0, ms);
+        _ = calls_made.fetchAdd(1, .monotonic);
+        std.log.info("llm[{s}/{s}] {d}ms in={d} out={d} (engine-rendered)", .{ tag, model, ms, pin, ec });
+        logCall(t1.toSeconds(), tag, model, base_url, ms, pin, 0, ec);
+    }
+
+    var reply = gemma4.parseCompletion(gpa, text) catch return null;
+    defer reply.deinit(gpa);
+
+    var calls: std.ArrayListUnmanaged(ToolCall) = .empty;
+    for (reply.calls) |c| {
+        const id = mintCallId(gpa) catch continue;
+        const name = gpa.dupe(u8, c.name) catch {
+            gpa.free(id);
+            continue;
+        };
+        const args = gpa.dupe(u8, c.args_json) catch {
+            gpa.free(id);
+            gpa.free(name);
+            continue;
+        };
+        calls.append(gpa, .{ .id = id, .name = name, .args = args }) catch {
+            gpa.free(id);
+            gpa.free(name);
+            gpa.free(args);
+        };
+    }
+    return Step{
+        .content = gpa.dupe(u8, reply.content) catch @constCast(""),
+        .reasoning = gpa.dupe(u8, reply.thinking) catch @constCast(""),
+        .calls = calls.toOwnedSlice(gpa) catch &.{},
+        .ok = true,
+    };
 }
 
 /// The num_ctx actually requested: never MORE than the model's probed maximum (asking beyond it is silently
@@ -766,6 +884,24 @@ pub fn probeCapabilities(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8
         }
     }
 
+    // NAME-BINDING PROBE: only worth asking when the backend claims tools AND we could actually take over
+    // rendering for the family it reported — a verdict we cannot act on is a wasted model load. Cached per
+    // model like the others.
+    if (caps.ollama_native and caps.tools and gemma4.canRenderFamily(caps.familyName())) {
+        var kb: [160]u8 = undefined;
+        const nkey = std.fmt.bufPrint(&kb, "namebind:{s}", .{model}) catch model;
+        if (cachedLargeVerdict(gpa, io, run_dir, nkey)) |v| {
+            caps.name_binding_ok = v;
+        } else {
+            caps.name_binding_ok = probeNameBinding(gpa, io, run_dir, host, key, model);
+            storeLargeVerdict(gpa, io, run_dir, nkey, caps.name_binding_ok);
+        }
+        if (!caps.name_binding_ok) std.log.info(
+            "llm: backend rendering does not bind tool names for {s} (family {s}) - rendering engine-side",
+            .{ model, caps.familyName() },
+        );
+    }
+
     if (!caps.ollama_native) {
         // OpenAI-style hosted backend: measure whether a tools-array completion comes back as STRUCTURED
         // tool_calls or as text markup (DeepSeek-style emission). The fence decision must ride measured
@@ -834,6 +970,20 @@ fn parseShowCaps(raw: []const u8) void {
             }
             if (mv.object.get("general.parameter_count")) |pv| {
                 if (pv == .integer and pv.integer > 0) caps.param_count = @intCast(pv.integer);
+            }
+        }
+    }
+    // details.family is the backend's own statement of the wire format. Taking it from here
+    // rather than from the model id means a rename, a fork, or a locally-created variant is
+    // classified by what it IS, not by what someone called it.
+    if (root.get("details")) |dv| {
+        if (dv == .object) {
+            if (dv.object.get("family")) |fv| {
+                if (fv == .string and fv.string.len > 0) {
+                    const n = @min(fv.string.len, caps.family.len);
+                    @memcpy(caps.family[0..n], fv.string[0..n]);
+                    caps.family_len = @intCast(n);
+                }
             }
         }
     }
@@ -990,6 +1140,83 @@ fn probeLargeToolCall(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, h
     defer gpa.free(r.content);
     if (!r.ok) return true; // network flake ≠ parser wall
     return largeToolCallVerdict(r.content);
+}
+
+/// The probe belt: three ORDINARY snake_case tool names, offered together, asked for one at a time.
+///
+/// Ordinary names are the whole point, and this was measured the hard way. A nonce name like
+/// `nl_probe_echo_q7` is answered CORRECTLY by a backend that is badly broken for real belts — even with
+/// twenty nonce tools on the belt — so a nonce probe reports a confident false pass. Belt size is not the
+/// trigger either. Name FAMILIARITY is: asked to use `read_file` the model answers `Read`, and `observe`
+/// came back across runs as `Observe`, `Inflection`, and `Gemma_29B_16K__memory__observe` — tool namespaces
+/// memorised during the model's own agentic fine-tuning, surfacing in place of the name it was handed.
+const NameStim = struct { tool: []const u8, ask: []const u8 };
+const NAME_PROBE_STIMULI = [_]NameStim{
+    .{ .tool = "read_file", .ask = "Read the file notes/todo.txt and tell me the first line." },
+    .{ .tool = "observe", .ask = "Store this fact: the CI runner is gh-runner-04." },
+    .{ .tool = "stop_process", .ask = "Terminate the process with pid 8123." },
+};
+const NAME_PROBE_BELT =
+    "{\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"description\":\"Read a text file.\"," ++
+    "\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"]}}}," ++
+    "{\"type\":\"function\",\"function\":{\"name\":\"observe\",\"description\":\"Store one concrete fact.\"," ++
+    "\"parameters\":{\"type\":\"object\",\"properties\":{\"fact\":{\"type\":\"string\"}},\"required\":[\"fact\"]}}}," ++
+    "{\"type\":\"function\",\"function\":{\"name\":\"stop_process\",\"description\":\"Kill a process by pid.\"," ++
+    "\"parameters\":{\"type\":\"object\",\"properties\":{\"pid\":{\"type\":\"integer\"}},\"required\":[\"pid\"]}}}";
+
+/// Does this backend's rendering put the SUPPLIED tool names in front of the model, or does the model answer
+/// with names of its own?
+///
+/// The engine rejects any call naming a tool that is not on the belt, so a substituted name costs the entire
+/// turn. Measured over 30 harness drills: 18/30 with five off-belt names through the backend's renderer,
+/// against 27/30 with none once the prompt was rendered engine-side.
+///
+/// A call naming something never offered is positive evidence; no call is inconclusive. The substituted name
+/// is not stable between runs, so ANY single sighting flips the verdict — the failure is intermittent, and
+/// one occurrence is enough to prefer the path that never shows it.
+fn probeNameBinding(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, host: []const u8, key: []const u8, model: []const u8) bool {
+    const chat_url = std.fmt.allocPrint(gpa, "{s}/api/chat", .{host}) catch return true;
+    defer gpa.free(chat_url);
+    for (NAME_PROBE_STIMULI) |st| {
+        var msg: std.ArrayListUnmanaged(u8) = .empty;
+        defer msg.deinit(gpa);
+        msg.appendSlice(gpa, "{\"role\":\"user\",\"content\":") catch return true;
+        jstr(gpa, &msg, st.ask) catch return true;
+        msg.appendSlice(gpa, "}") catch return true;
+        const body = std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"tools\":[{s}],\"stream\":false,\"options\":{{\"num_predict\":200,\"temperature\":0}}}}", .{ model, msg.items, NAME_PROBE_BELT }) catch return true;
+        defer gpa.free(body);
+        const r = postUrl(gpa, io, run_dir, "probe-name", chat_url, key, body, true, 200); // matches num_predict above
+        defer gpa.free(r.content);
+        if (!r.ok) continue; // network flake is not binding evidence
+        if (!nameBindingVerdict(r.content)) return false;
+    }
+    return true;
+}
+
+/// True unless the reply names a tool that was never offered.
+fn nameBindingVerdict(raw: []const u8) bool {
+    const Resp = struct {
+        message: ?struct {
+            tool_calls: ?[]const struct {
+                function: struct { name: []const u8 = "" },
+            } = null,
+        } = null,
+        @"error": ?[]const u8 = null,
+    };
+    const parsed = std.json.parseFromSlice(Resp, std.heap.page_allocator, raw, .{ .ignore_unknown_fields = true }) catch return true;
+    defer parsed.deinit();
+    if (parsed.value.@"error" != null) return true;
+    const m = parsed.value.message orelse return true;
+    const tcs = m.tool_calls orelse return true; // no call: inconclusive, not evidence
+    if (tcs.len == 0) return true;
+    for (tcs) |tc| {
+        var on_belt = false;
+        for (NAME_PROBE_STIMULI) |st| {
+            if (std.mem.eql(u8, tc.function.name, st.tool)) on_belt = true;
+        }
+        if (!on_belt) return false; // named something that was never on the belt
+    }
+    return true;
 }
 
 fn largeToolCallVerdict(raw: []const u8) bool {
@@ -2354,6 +2581,10 @@ test "probe-first override: a probed cap wins over the port/name heuristics; unp
     caps = .{};
     try std.testing.expect(isOllama("http://localhost:11434/v1"));
     try std.testing.expect(!isOllama("http://localhost:1234/v1"));
+    // the built-in engine endpoint: recognized by its path marker on any loopback port, unprobed —
+    // and NEVER for a hosted URL that happens to carry the word
+    try std.testing.expect(isOllama("http://127.0.0.1:8788/builtin/v1"));
+    try std.testing.expect(!isOllama("https://example.com/builtin/v1"));
     try std.testing.expect(isThinking("gpt-oss:20b"));
     try std.testing.expect(!isThinking("llama3.1:8b"));
 
@@ -2981,4 +3212,89 @@ test "every exit from streamAttempt accounts for what the provider billed" {
         }
     }
     try std.testing.expect(explicit >= 2); // not vacuous: the success paths are still there
+}
+
+test "the name-binding probe flips only on a call naming a tool that was never offered" {
+    // Only positive evidence may flip the verdict: a wrong flip moves every turn of a healthy
+    // backend onto the engine-rendered path.
+    for (NAME_PROBE_STIMULI) |st| {
+        var buf: [160]u8 = undefined;
+        const ok = try std.fmt.bufPrint(&buf, "{{\"message\":{{\"tool_calls\":[{{\"function\":{{\"name\":\"{s}\"}}}}]}}}}", .{st.tool});
+        try std.testing.expect(nameBindingVerdict(ok));
+    }
+
+    // the live failures, verbatim: case-mangles and memorised namespaces, none of them on the belt
+    try std.testing.expect(!nameBindingVerdict("{\"message\":{\"tool_calls\":[{\"function\":{\"name\":\"Read\"}}]}}"));
+    try std.testing.expect(!nameBindingVerdict("{\"message\":{\"tool_calls\":[{\"function\":{\"name\":\"Observe\"}}]}}"));
+    try std.testing.expect(!nameBindingVerdict("{\"message\":{\"tool_calls\":[{\"function\":{\"name\":\"StopProcess\"}}]}}"));
+    try std.testing.expect(!nameBindingVerdict("{\"message\":{\"tool_calls\":[{\"function\":{\"name\":\"Inflection\"}}]}}"));
+    try std.testing.expect(!nameBindingVerdict("{\"message\":{\"tool_calls\":[{\"function\":{\"name\":\"Gemma_29B_16K__memory__observe\"}}]}}"));
+
+    // inconclusive: no call, empty list, an unrelated backend error, unparseable body
+    try std.testing.expect(nameBindingVerdict("{\"message\":{\"content\":\"sure, I'll do that\"}}"));
+    try std.testing.expect(nameBindingVerdict("{\"message\":{\"tool_calls\":[]}}"));
+    try std.testing.expect(nameBindingVerdict("{\"error\":\"model is loading\"}"));
+    try std.testing.expect(nameBindingVerdict("not json at all"));
+}
+
+test "the probe stimuli are ordinary names, because nonce names hide the failure" {
+    // A nonce belt was tried first and reported a false pass: the same backend that substitutes
+    // `Read` for `read_file` answers `nl_probe_echo_q7` correctly, even among twenty nonce tools.
+    // The stimulus set must therefore stay familiar-looking, and every ask must name its tool.
+    for (NAME_PROBE_STIMULI) |st| {
+        try std.testing.expect(st.tool.len > 0 and st.ask.len > 0);
+        // Ordinary lowercase names only. The distinguishing property is that the model has
+        // priors about the name -- an uppercase letter or a digit-suffixed nonce is exactly
+        // the shape that answered correctly and hid the failure.
+        for (st.tool) |c| try std.testing.expect(std.ascii.isLower(c) or c == '_');
+        try std.testing.expect(std.mem.indexOf(u8, NAME_PROBE_BELT, st.tool) != null); // actually offered
+    }
+}
+
+test "the wire family is read from the backend's report, never from the model id" {
+    // A fork, a rename, or a locally-created variant must be classified by what /api/show says
+    // it IS. parseShowCaps writes into the shared caps record, so restore it afterwards.
+    const saved = caps;
+    defer caps = saved;
+
+    caps = .{};
+    parseShowCaps("{\"details\":{\"family\":\"gemma4\",\"parameter_size\":\"11.9B\"}}");
+    try std.testing.expectEqualStrings("gemma4", caps.familyName());
+    try std.testing.expect(gemma4.canRenderFamily(caps.familyName()));
+
+    // a model whose NAME says gemma-4 but whose backend reports otherwise is not ours to render
+    caps = .{};
+    parseShowCaps("{\"details\":{\"family\":\"qwen2\"}}");
+    try std.testing.expectEqualStrings("qwen2", caps.familyName());
+    try std.testing.expect(!gemma4.canRenderFamily(caps.familyName()));
+
+    // absent details: no family, so the engine never takes over rendering
+    caps = .{};
+    parseShowCaps("{\"capabilities\":[\"tools\"]}");
+    try std.testing.expectEqual(@as(usize, 0), caps.familyName().len);
+    try std.testing.expect(!gemma4.canRenderFamily(caps.familyName()));
+}
+
+test "engine-side rendering is off unless BOTH signals say to take over" {
+    // Guards the gate in completeOllamaNative: a healthy backend keeps /api/chat even for a
+    // family we could render, and an unrenderable family keeps it even when binding is broken.
+    const saved = caps;
+    defer caps = saved;
+    const takeOver = struct {
+        fn f(c: Caps) bool {
+            return !c.name_binding_ok and gemma4.canRenderFamily(c.familyName());
+        }
+    }.f;
+
+    caps = .{};
+    parseShowCaps("{\"details\":{\"family\":\"gemma4\"}}");
+    caps.name_binding_ok = true;
+    try std.testing.expect(!takeOver(caps)); // renderable, but the backend is fine
+    caps.name_binding_ok = false;
+    try std.testing.expect(takeOver(caps)); // renderable AND broken -> take over
+
+    caps = .{};
+    parseShowCaps("{\"details\":{\"family\":\"llama\"}}");
+    caps.name_binding_ok = false;
+    try std.testing.expect(!takeOver(caps)); // broken, but we do not know this wire format
 }

@@ -32,6 +32,9 @@ test {
     _ = @import("worker/browser/ext_api.zig"); // who may pair, who may relay
     _ = @import("worker/pixelrag.zig"); // doc-id safety, fact sanitising, query→tile scoring
     _ = @import("worker/bufedit.zig");
+    _ = @import("worker/builtin.zig"); // built-in engine facade: sentinel resolution + weights-store election
+    _ = @import("worker/builtin_endpoint.zig"); // the engine's loopback dialect surface, tested on a mock engine
+    _ = @import("worker/modelpull.zig"); // weights downloader: repo resolve, resume, sha verify — via fakehttp
     _ = @import("worker/chat/context.zig");
     _ = @import("worker/chat/engine.zig");
     _ = @import("worker/chat/paths.zig");
@@ -54,6 +57,7 @@ test {
     _ = @import("worker/crawl.zig");
     _ = @import("worker/deps.zig");
     _ = @import("worker/evcursor.zig"); // events.jsonl poll cursor: probe sentinel, page cap, catch-up walk
+    _ = @import("worker/gemma4.zig"); // gemma4 wire format: byte-exact vs the model's own chat template
     _ = @import("worker/httpc.zig");
     _ = @import("worker/hyperspace.zig");
     _ = @import("worker/lineage.zig"); // cross-run persistent swarm memory (stable neuron-db identity)

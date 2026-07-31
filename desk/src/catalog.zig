@@ -124,9 +124,13 @@ test "no provider the catalog ships can resolve to a base that still carries the
 test "the whole shipped catalog fits the 256-byte scratch every call site declares" {
     var out: [CALLSITE_SCRATCH]u8 = undefined;
     for (providers) |p| {
-        // mock ships an empty base on purpose; everything else is an absolute URL the desk hands the server
+        // mock ships an empty base on purpose, and builtin ships the "builtin" SENTINEL the server
+        // swaps for its live engine endpoint (worker/builtin.zig — the desk passes it through
+        // verbatim, which is exactly why it must NOT look like a URL); everything else is an
+        // absolute URL the desk hands the server.
         try std.testing.expect(p.base_url.len <= CALLSITE_SCRATCH);
-        if (p.base_url.len > 0) try std.testing.expect(std.mem.startsWith(u8, p.base_url, "http"));
+        if (p.base_url.len > 0 and !std.mem.eql(u8, p.base_url, "builtin"))
+            try std.testing.expect(std.mem.startsWith(u8, p.base_url, "http"));
         _ = resolveBase(&p, "", &out);
     }
     // and a resolved template with a real 32-hex Cloudflare account id still fits — if it ever stops
