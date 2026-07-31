@@ -69,9 +69,11 @@ pub const Poller = struct {
     last_cfm_s: i64 = 0, // Cloudflare live-models fetch throttle (only while connected; 0 = fetch next tick)
     last_bi_s: i64 = 0, // built-in model status poll throttle (0 = poll next tick; verbs reset it)
     // built-in transition memory (poller-local): a transfer that lands or fails raises ONE toast,
-    // not one per poll tick.
+    // not one per poll tick. Same for the update-check verdict.
     prev_bi_state: [16]u8 = undefined,
     prev_bi_state_len: u8 = 0,
+    prev_bi_upd: [10]u8 = undefined,
+    prev_bi_upd_len: u8 = 0,
 
     // notification de-dup state (poller-local)
     grad_warned: bool = false,
@@ -157,6 +159,7 @@ pub const Poller = struct {
                 .builtin_cancel => self.doBuiltinVerb(.cancel),
                 .builtin_import => self.doBuiltinVerb(.import),
                 .builtin_remove => self.doBuiltinVerb(.remove),
+                .builtin_check => self.doBuiltinVerb(.check),
             }
         }
     }
@@ -695,7 +698,8 @@ pub const Poller = struct {
             const busy = std.mem.eql(u8, self.prev_bi_state[0..self.prev_bi_state_len], "downloading") or
                 std.mem.eql(u8, self.prev_bi_state[0..self.prev_bi_state_len], "importing") or
                 std.mem.eql(u8, self.prev_bi_state[0..self.prev_bi_state_len], "verifying") or
-                std.mem.eql(u8, self.prev_bi_state[0..self.prev_bi_state_len], "resolving");
+                std.mem.eql(u8, self.prev_bi_state[0..self.prev_bi_state_len], "resolving") or
+                std.mem.eql(u8, self.prev_bi_upd[0..self.prev_bi_upd_len], "checking");
             const bi_every: i64 = if (busy or self.prev_bi_state_len == 0) 2 else 10;
             if (online and now_s - self.last_bi_s >= bi_every) {
                 self.last_bi_s = now_s;
@@ -966,7 +970,7 @@ pub const Poller = struct {
     /// The server does the actual work in its own background thread; this just starts it and turns
     /// the reply into a toast. Every path resets the status throttle so the panel reflects the new
     /// state on the very next tick.
-    fn doBuiltinVerb(self: *Poller, verb: enum { pull, cancel, import, remove }) void {
+    fn doBuiltinVerb(self: *Poller, verb: enum { pull, cancel, import, remove, check }) void {
         var tbuf: [128]u8 = undefined;
         const tok = self.tokenSnap(&tbuf);
         const resp = switch (verb) {
@@ -974,6 +978,7 @@ pub const Poller = struct {
             .cancel => netcli.builtinCancel(self.io, self.gpa, self.port(), tok),
             .import => netcli.builtinImport(self.io, self.gpa, self.port(), tok),
             .remove => netcli.builtinRemove(self.io, self.gpa, self.port(), tok),
+            .check => netcli.builtinCheck(self.io, self.gpa, self.port(), tok),
         } orelse {
             self.store.pushNotif("Built-in model", "server unreachable - is it running?", 2);
             return;
@@ -987,7 +992,7 @@ pub const Poller = struct {
         if (resp.status == 409) {
             self.store.pushNotif("Built-in model", switch (verb) {
                 .remove => "a transfer is running - cancel it first",
-                else => "a download or import is already running",
+                else => "a download, import or check is already running",
             }, 2);
             return;
         }
@@ -1000,6 +1005,7 @@ pub const Poller = struct {
             .cancel => self.store.pushNotif("Built-in model", "cancelling - the partial stays for a later resume", 1),
             .import => self.store.pushNotif("Built-in model", "importing this machine's local copy...", 1),
             .remove => self.store.pushNotif("Built-in model", "weights removed", 1),
+            .check => self.store.pushNotif("Built-in model", "checking the published repo for a newer release...", 1),
         }
     }
 
@@ -1021,11 +1027,16 @@ pub const Poller = struct {
         const err = valueForKey(resp.body, "err", &erb);
         var pbuf: [600]u8 = undefined;
         const path = valueForKey(resp.body, "path", &pbuf);
+        var usb: [10]u8 = undefined;
+        const upd_state = valueForKey(resp.body, "update_state", &usb);
+        var ufb: [64]u8 = undefined;
+        const upd_file = valueForKey(resp.body, "update_file", &ufb);
         const compiled = std.mem.indexOf(u8, resp.body, "\"compiled\":true") != null;
         const pct: u8 = @intCast(@min(intForKey(resp.body, "pct") orelse 0, 100));
         const done_mb: u32 = @intCast(@min((intForKey(resp.body, "bytes_done") orelse 0) >> 20, std.math.maxInt(u32)));
         const total_mb: u32 = @intCast(@min((intForKey(resp.body, "bytes_total") orelse 0) >> 20, std.math.maxInt(u32)));
         const params_b: u32 = @intCast(@min(intForKey(resp.body, "params_b") orelse 0, 10_000));
+        const upd_mb: u32 = @intCast(@min(intForKey(resp.body, "update_mb") orelse 0, std.math.maxInt(u32)));
 
         // terminal-transition toast: transferring → ready/cold = landed; → failed/cancelled = didn't
         const was = self.prev_bi_state[0..self.prev_bi_state_len];
@@ -1041,6 +1052,21 @@ pub const Poller = struct {
         const pn = @min(state.len, self.prev_bi_state.len);
         @memcpy(self.prev_bi_state[0..pn], state[0..pn]);
         self.prev_bi_state_len = @intCast(pn);
+
+        // check-verdict toast: checking → update/current/failed, once
+        const uwas = self.prev_bi_upd[0..self.prev_bi_upd_len];
+        if (std.mem.eql(u8, uwas, "checking") and !std.mem.eql(u8, upd_state, "checking")) {
+            if (std.mem.eql(u8, upd_state, "update")) {
+                self.store.pushNotif("Built-in model update", "a newer release is published - Update in Settings installs it", 1);
+            } else if (std.mem.eql(u8, upd_state, "current")) {
+                self.store.pushNotif("Built-in model", "up to date with the published release", 1);
+            } else if (std.mem.eql(u8, upd_state, "failed")) {
+                self.store.pushNotif("Built-in model", "update check failed - no network, or nothing published yet", 2);
+            }
+        }
+        const un = @min(upd_state.len, self.prev_bi_upd.len);
+        @memcpy(self.prev_bi_upd[0..un], upd_state[0..un]);
+        self.prev_bi_upd_len = @intCast(un);
 
         self.store.lock();
         defer self.store.unlock();
@@ -1061,6 +1087,13 @@ pub const Poller = struct {
         const en = @min(err.len, s.bi_err.len);
         @memcpy(s.bi_err[0..en], err[0..en]);
         s.bi_err_len = @intCast(en);
+        const usn = @min(upd_state.len, s.bi_upd_state.len);
+        @memcpy(s.bi_upd_state[0..usn], upd_state[0..usn]);
+        s.bi_upd_state_len = @intCast(usn);
+        const ufn = @min(upd_file.len, s.bi_upd_file.len);
+        @memcpy(s.bi_upd_file[0..ufn], upd_file[0..ufn]);
+        s.bi_upd_file_len = @intCast(ufn);
+        s.bi_upd_mb = upd_mb;
     }
 
     /// Poll GET /oauth/cloudflare/status and publish {configured, connected, account_id} to the store. Cheap

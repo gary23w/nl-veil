@@ -7317,6 +7317,11 @@ fn drawSettings(store: *Store, body: t.Rect) void {
         var arn: usize = 0;
         var erb: [160]u8 = undefined;
         var ern: usize = 0;
+        var usb: [10]u8 = undefined;
+        var usn: usize = 0;
+        var ufb: [64]u8 = undefined;
+        var ufn: usize = 0;
+        var upd_mb: u32 = 0;
         {
             store.lock();
             defer store.unlock();
@@ -7332,6 +7337,11 @@ fn drawSettings(store: *Store, body: t.Rect) void {
             @memcpy(arb[0..arn], store.bi_arch[0..arn]);
             ern = store.bi_err_len;
             @memcpy(erb[0..ern], store.bi_err[0..ern]);
+            usn = store.bi_upd_state_len;
+            @memcpy(usb[0..usn], store.bi_upd_state[0..usn]);
+            ufn = store.bi_upd_file_len;
+            @memcpy(ufb[0..ufn], store.bi_upd_file[0..ufn]);
+            upd_mb = store.bi_upd_mb;
         }
         const bi_st = stb[0..stn];
         const bi_busy = std.mem.eql(u8, bi_st, "downloading") or std.mem.eql(u8, bi_st, "importing") or
@@ -7410,6 +7420,29 @@ fn drawSettings(store: *Store, body: t.Rect) void {
                     store.pushCmd(store_mod.mkCmd(.builtin_remove, "", ""));
                 }
                 y += t.BTN_MD + 10;
+
+                // the update lane: an installed store can ask the published repo whether a newer
+                // release exists; a pull IS the updater (it verifies + hot-swaps server-side)
+                const upd = usb[0..usn];
+                if (std.mem.eql(u8, upd, "update")) {
+                    t.text(t.z("update available: {s} ({d} MB)", .{ ufb[0..ufn], upd_mb }), @intFromFloat(x), @intFromFloat(y + 6), 11, t.blue);
+                    const up_lbl = t.z("Update now", .{});
+                    const up_w = t.btnW(up_lbl, t.BTN_MD);
+                    if (t.buttonSolid(.{ .x = x + colw - up_w, .y = y, .width = up_w, .height = t.BTN_MD }, up_lbl, t.blue, true)) {
+                        store.pushCmd(store_mod.mkCmd(.builtin_pull, "", ""));
+                    }
+                    y += t.BTN_MD + 10;
+                } else if (std.mem.eql(u8, upd, "checking")) {
+                    t.text(t.z("checking the published repo...", .{}), @intFromFloat(x), @intFromFloat(y + 2), 11, t.comment);
+                    y += 22;
+                } else {
+                    const chk_lbl = t.z("Check for updates", .{});
+                    if (t.buttonGhost(.{ .x = x, .y = y, .width = t.btnW(chk_lbl, t.BTN_MD), .height = t.BTN_MD }, chk_lbl, t.blue, true)) {
+                        store.pushCmd(store_mod.mkCmd(.builtin_check, "", ""));
+                    }
+                    if (std.mem.eql(u8, upd, "current")) t.text(t.z("up to date with the published release", .{}), @intFromFloat(x + t.btnW(chk_lbl, t.BTN_MD) + 10), @intFromFloat(y + 8), 11, t.comment);
+                    y += t.BTN_MD + 10;
+                }
             }
         }
     }

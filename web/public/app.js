@@ -3337,6 +3337,7 @@ async function refreshBuiltinPanel() {
   if (!j || !j.ok) { hostEl.innerHTML = '<div class="muted">status unavailable (server offline?)</div>'; return; }
   const busy = j.state === 'resolving' || j.state === 'downloading' || j.state === 'verifying' || j.state === 'importing';
   const served = j.state === 'ready' || j.state === 'cold';
+  const checking = j.update_state === 'checking';
   const mb = (n) => Math.round((n || 0) / 1048576);
   let line = '';
   if (!j.compiled) line = 'not compiled into this server build (-Dbuiltin=false)';
@@ -3344,23 +3345,37 @@ async function refreshBuiltinPanel() {
   else if (served) line = `ready to serve (${j.arch || '?'} · ${j.params_b || '?'}B · ${j.ctx || '?'} ctx window)`;
   else if (j.state === 'failed') line = 'failed: ' + (j.err || 'unknown');
   else line = 'weights not downloaded yet — pull them from ' + j.repo + ' (about 7 GB, verified)';
+  // the update lane, shown only when something is installed: a check compares the store's sha
+  // against the repo's current release; Update runs the same verified pull (hot-swapped server-side)
+  let updLine = '';
+  if (served && !busy) {
+    if (checking) updLine = '<div class="muted">checking the published repo…</div>';
+    else if (j.update_state === 'update') updLine = `<div>update available: <span class="mono">${esc(j.update_file || '')}</span> (${j.update_mb || '?'} MB)</div>`;
+    else if (j.update_state === 'current') updLine = '<div class="muted">up to date with the published release</div>';
+    else if (j.update_state === 'failed') updLine = '<div class="muted">update check failed — no network, or nothing published yet</div>';
+  }
   hostEl.innerHTML = `
     <div class="set-row">
       <div><b>${esc(j.model)} — served by this server, no external runtime</b>
         <div class="muted">${esc(line)}</div>
+        ${updLine}
         ${j.synced_dir_warning ? '<div class="muted">note: the models dir is under a cloud-synced folder — set NL_MODELS_DIR to a local path</div>' : ''}
       </div>
       <div>
         ${j.compiled && !busy && !served ? '<button class="btn btn-sm btn-solid" id="biPull">Download</button> <button class="btn btn-sm" id="biImport">Import local copy</button>' : ''}
         ${busy ? '<button class="btn btn-sm" id="biCancel">Cancel</button>' : ''}
+        ${j.compiled && !busy && served && j.update_state === 'update' ? '<button class="btn btn-sm btn-solid" id="biUpd">Update now</button>' : ''}
+        ${j.compiled && !busy && served && !checking ? '<button class="btn btn-sm" id="biCheck">Check for updates</button>' : ''}
         ${j.compiled && !busy && served ? '<button class="btn btn-sm btn-danger" id="biRm">Remove</button>' : ''}
       </div>
     </div>`;
   if (el('biPull')) el('biPull').addEventListener('click', async () => { try { await jpost('/api/v1/models/builtin/pull', {}); } catch (e) {} refreshBuiltinPanel(); });
+  if (el('biUpd')) el('biUpd').addEventListener('click', async () => { try { await jpost('/api/v1/models/builtin/pull', {}); } catch (e) {} refreshBuiltinPanel(); });
+  if (el('biCheck')) el('biCheck').addEventListener('click', async () => { try { await jpost('/api/v1/models/builtin/check', {}); } catch (e) {} refreshBuiltinPanel(); });
   if (el('biImport')) el('biImport').addEventListener('click', async () => { try { await jpost('/api/v1/models/builtin/import', {}); } catch (e) {} refreshBuiltinPanel(); });
   if (el('biCancel')) el('biCancel').addEventListener('click', async () => { try { await jpost('/api/v1/models/builtin/cancel', {}); } catch (e) {} refreshBuiltinPanel(); });
   if (el('biRm')) el('biRm').addEventListener('click', async () => { try { await jdel('/api/v1/models/builtin'); } catch (e) {} refreshBuiltinPanel(); });
-  if (busy) setTimeout(refreshBuiltinPanel, 1200);
+  if (busy || checking) setTimeout(refreshBuiltinPanel, 1200);
 }
 
 function renderSettings(host) {

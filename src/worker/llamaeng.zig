@@ -148,19 +148,38 @@ pub fn configure(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process
 
 /// Re-point at a (possibly different) weights file after the store changed — configure() minus the
 /// env re-read, safe from any thread (the pull thread calls it via modelpull.on_store_change).
+/// A SAME-path repoint is what an in-place update produces: the bytes changed under the name, so
+/// when the engine is unloaded and the meta was cleared (unload()), re-probe rather than no-op.
 pub fn repoint(path: ?[]const u8) void {
     if (!g.configured) return;
     lock();
     defer unlock();
     const new_path = path orelse "";
     const cur = g.path[0..g.path_len];
-    if (std.mem.eql(u8, cur, new_path)) return;
+    if (std.mem.eql(u8, cur, new_path)) {
+        if (g.path_len > 0 and g.ctx == null and g.meta.arch_len == 0 and !g.load_failed) metaProbeLocked();
+        return;
+    }
     unloadLocked();
     g.load_failed = false;
     g.meta = .{};
     g.path_len = @intCast(@min(new_path.len, g.path.len));
     @memcpy(g.path[0..g.path_len], new_path[0..g.path_len]);
     if (g.path_len > 0) metaProbeLocked();
+}
+
+/// Drop the loaded weights and the cached meta, WAITING OUT any in-flight generation (same mutex).
+/// The store calls this via modelpull.on_before_swap right before it replaces or removes the
+/// serving file — Windows refuses to touch a file the engine still maps. The meta clears too: the
+/// bytes under the path are about to change, so what was probed is about to be a lie; the
+/// store-change repoint afterwards re-probes whatever actually landed.
+pub fn unload() void {
+    if (!g.configured) return;
+    lock();
+    defer unlock();
+    unloadLocked();
+    g.load_failed = false;
+    g.meta = .{};
 }
 
 fn ensureBackendLocked() void {
