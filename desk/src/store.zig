@@ -22,7 +22,7 @@ const SpinLock = struct {
 
 pub const Tab = enum { dashboard, chat, swarm, hub, scheduled, settings }; // deploy = the Swarm tab's inner form
 
-pub const CmdKind = enum { none, select, say, set_goal, stop, deploy, delete, open_folder, refresh_now, open_file, sched_create, sched_update, sched_toggle, sched_delete, sched_run, oauth_cf_login, oauth_cf_logout };
+pub const CmdKind = enum { none, select, say, set_goal, stop, deploy, delete, open_folder, refresh_now, open_file, sched_create, sched_update, sched_toggle, sched_delete, sched_run, oauth_cf_login, oauth_cf_logout, builtin_pull, builtin_cancel, builtin_import, builtin_remove };
 
 /// A UI→poller command. Fixed-size, copied by value into the ring, so no cross-thread allocation.
 pub const Command = struct {
@@ -849,6 +849,24 @@ pub const Store = struct {
     cf_models: [MAX_CF_MODELS][96]u8 = undefined,
     cf_model_lens: [MAX_CF_MODELS]u8 = undefined,
     cf_model_count: usize = 0,
+
+    // --- built-in model status (poller writes from GET /api/v1/models/builtin; Settings tab reads) ---
+    // One snapshot of the server's own engine: whether the binary carries it (-Dbuiltin), whether the
+    // weights are on disk, and any transfer in flight. Bytes come pre-reduced to MB — the UI never
+    // needs finer, and u32 MB cannot overflow for any model that fits a disk.
+    bi_seen: bool = false, //          a status fetch has landed at least once
+    bi_compiled: bool = false, //      the server binary carries the engine
+    bi_has_weights: bool = false, //   a serving gguf is on the server's disk
+    bi_state: [16]u8 = undefined, //   absent|resolving|downloading|verifying|importing|cold|ready|failed|cancelled|idle
+    bi_state_len: u8 = 0,
+    bi_pct: u8 = 0,
+    bi_done_mb: u32 = 0,
+    bi_total_mb: u32 = 0,
+    bi_params_b: u32 = 0,
+    bi_arch: [24]u8 = undefined,
+    bi_arch_len: u8 = 0,
+    bi_err: [160]u8 = undefined,
+    bi_err_len: u8 = 0,
 
     // --- command ring (UI writes head, poller reads tail) ---
     cmds: [CMD_RING]Command = undefined,

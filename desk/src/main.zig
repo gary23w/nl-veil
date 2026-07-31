@@ -95,6 +95,16 @@ fn tbThemeRect() t.Rect {
 const InnerTab = enum { console, details, files };
 const DdKind = enum { none, provider, model, style, minutes, stack, mode, chat_provider, chat_byok, chat_model, think_provider, think_byok, think_model, prompt_provider, prompt_byok, prompt_model, sched_model };
 
+/// catalog.providers index of the BUILT-IN provider — the Settings one-click select writes it into
+/// chat_byok. Comptime so a catalog edit that drops or renames the provider fails the build here
+/// instead of quietly pointing the click at whichever provider inherited the slot.
+const BUILTIN_IDX: u8 = blk: {
+    for (catalog.providers, 0..) |p, i| {
+        if (std.mem.eql(u8, p.key, "builtin")) break :blk @intCast(i);
+    }
+    @compileError("models.yaml no longer ships a 'builtin' provider");
+};
+
 const ChatInner = enum { chat, metrics, files }; // the Chat center-pane inner tabs
 const RightTab = enum { activity, memory }; // the right pane's inner tabs (Swarm activity | Memory)
 const SchedInner = enum { tasks, build }; // the Tasks tab's inner tabs (task list | builder form)
@@ -7289,6 +7299,122 @@ fn drawSettings(store: *Store, body: t.Rect) void {
         setField(&ui.s_cfacct, cfab[0..cfan]);
         ui.s_seeded = true;
     }
+    // ---- BUILT-IN MODEL: the server serves the-veil-12b itself (no external runtime) ----
+    // Pure render over store.bi_* — the poller owns the status poll and every verb rides the
+    // command ring, so nothing here touches io. The download itself runs SERVER-side: closing
+    // this window never interrupts it, and the bar picks the transfer back up on relaunch.
+    y = settingSection(x, y, colw, "BUILT-IN MODEL");
+    {
+        var bi_seen = false;
+        var bi_compiled = false;
+        var bi_pct: u8 = 0;
+        var bi_done_mb: u32 = 0;
+        var bi_total_mb: u32 = 0;
+        var bi_params: u32 = 0;
+        var stb: [16]u8 = undefined;
+        var stn: usize = 0;
+        var arb: [24]u8 = undefined;
+        var arn: usize = 0;
+        var erb: [160]u8 = undefined;
+        var ern: usize = 0;
+        {
+            store.lock();
+            defer store.unlock();
+            bi_seen = store.bi_seen;
+            bi_compiled = store.bi_compiled;
+            bi_pct = store.bi_pct;
+            bi_done_mb = store.bi_done_mb;
+            bi_total_mb = store.bi_total_mb;
+            bi_params = store.bi_params_b;
+            stn = store.bi_state_len;
+            @memcpy(stb[0..stn], store.bi_state[0..stn]);
+            arn = store.bi_arch_len;
+            @memcpy(arb[0..arn], store.bi_arch[0..arn]);
+            ern = store.bi_err_len;
+            @memcpy(erb[0..ern], store.bi_err[0..ern]);
+        }
+        const bi_st = stb[0..stn];
+        const bi_busy = std.mem.eql(u8, bi_st, "downloading") or std.mem.eql(u8, bi_st, "importing") or
+            std.mem.eql(u8, bi_st, "verifying") or std.mem.eql(u8, bi_st, "resolving");
+        const bi_served = std.mem.eql(u8, bi_st, "ready") or std.mem.eql(u8, bi_st, "cold") or std.mem.eql(u8, bi_st, "done");
+        const bi_failed = std.mem.eql(u8, bi_st, "failed");
+
+        if (!bi_seen) {
+            t.text(t.z("the-veil-12b - checking the server...", .{}), @intFromFloat(x), @intFromFloat(y), 11, t.comment);
+        } else if (!bi_compiled) {
+            t.text(t.z("this server build carries no built-in engine (-Dbuiltin=false) - rebuild with defaults to enable it", .{}), @intFromFloat(x), @intFromFloat(y), 11, t.comment);
+        } else if (bi_served) {
+            t.text(t.z("the-veil-12b installed ({s} {d}B) - this server runs it with zero setup, no key, no external runtime", .{ arb[0..arn], bi_params }), @intFromFloat(x), @intFromFloat(y), 11, t.green);
+        } else if (bi_failed) {
+            t.text(t.z("failed: {s}", .{erb[0..ern]}), @intFromFloat(x), @intFromFloat(y), 11, t.red);
+        } else if (bi_busy) {
+            t.text(t.z("installing - the transfer runs on the server; closing this window is fine", .{}), @intFromFloat(x), @intFromFloat(y), 11, t.comment);
+        } else {
+            t.text(t.z("not downloaded - about 7 GB, sha-verified against the publisher's record before it ever serves", .{}), @intFromFloat(x), @intFromFloat(y), 11, t.comment);
+        }
+        y += 20;
+
+        // the loading bar: filled to the server-reported pct, labeled with real transferred bytes
+        if (bi_busy) {
+            const bar_h: f32 = 18;
+            t.panelBordered(.{ .x = x, .y = y, .width = colw, .height = bar_h }, t.withAlpha(t.blue, 24), t.comment);
+            const frac: f32 = @as(f32, @floatFromInt(bi_pct)) / 100.0;
+            const fillw: f32 = (colw - 2) * frac;
+            if (fillw >= 1) t.fillRect(@intFromFloat(x + 1), @intFromFloat(y + 1), @intFromFloat(fillw), @intFromFloat(bar_h - 2), t.withAlpha(t.blue, 150));
+            const bar_lbl = if (bi_total_mb > 0)
+                t.z("{s}  {d}%  ({d} / {d} MB)", .{ bi_st, bi_pct, bi_done_mb, bi_total_mb })
+            else
+                t.z("{s}...", .{bi_st});
+            t.text(bar_lbl, @intFromFloat(x + 8), @intFromFloat(y + 3), 11, t.blue);
+            y += bar_h + 8;
+        }
+
+        if (bi_seen and bi_compiled) {
+            if (bi_busy) {
+                const cancel_lbl = t.z("Cancel", .{});
+                if (t.button(.{ .x = x, .y = y, .width = t.btnW(cancel_lbl, t.BTN_MD), .height = t.BTN_MD }, cancel_lbl, t.red, true)) {
+                    store.pushCmd(store_mod.mkCmd(.builtin_cancel, "", ""));
+                }
+                y += t.BTN_MD + 10;
+            } else if (!bi_served) {
+                const dl_lbl = t.z("Download the-veil-12b (~7 GB)", .{});
+                const dl_w = t.btnW(dl_lbl, t.BTN_MD);
+                if (t.buttonSolid(.{ .x = x, .y = y, .width = dl_w, .height = t.BTN_MD }, dl_lbl, t.blue, true)) {
+                    store.pushCmd(store_mod.mkCmd(.builtin_pull, "", ""));
+                }
+                const imp_lbl = t.z("Import local copy", .{});
+                if (t.button(.{ .x = x + dl_w + 8, .y = y, .width = t.btnW(imp_lbl, t.BTN_MD), .height = t.BTN_MD }, imp_lbl, t.blue, true)) {
+                    store.pushCmd(store_mod.mkCmd(.builtin_import, "", ""));
+                }
+                y += t.BTN_MD + 10;
+            } else {
+                const on_builtin = chat_kind == 1 and chat_byok == BUILTIN_IDX;
+                const use_lbl = t.z("Use built-in for chat", .{});
+                const use_w = t.btnW(use_lbl, t.BTN_MD);
+                if (t.buttonSolid(.{ .x = x, .y = y, .width = use_w, .height = t.BTN_MD }, use_lbl, if (on_builtin) t.green else t.blue, !on_builtin)) {
+                    store.lock();
+                    const s = &store.settings;
+                    s.chat_kind = 1;
+                    s.chat_byok = BUILTIN_IDX;
+                    const mid = "the-veil-12b";
+                    @memcpy(s.chat_model[0..mid.len], mid);
+                    s.chat_model_len = @intCast(mid.len);
+                    store.unlock();
+                    store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
+                    store.pushNotif("Chat: built-in model", "the-veil-12b serves from this server - no key, no external runtime", 1);
+                }
+                if (on_builtin) t.text(t.z("chat runs on the built-in model", .{}), @intFromFloat(x + use_w + 10), @intFromFloat(y + 8), 11, t.green);
+                const rm_lbl = t.z("Remove", .{});
+                const rm_w = t.btnW(rm_lbl, t.BTN_MD);
+                if (t.button(.{ .x = x + colw - rm_w, .y = y, .width = rm_w, .height = t.BTN_MD }, rm_lbl, t.red, true)) {
+                    store.pushCmd(store_mod.mkCmd(.builtin_remove, "", ""));
+                }
+                y += t.BTN_MD + 10;
+            }
+        }
+    }
+    y += 8;
+
     y = settingSection(x, y, colw, "CHAT MODEL");
     t.text(t.z("the Chat tab talks through this provider - its swarm casts use it too", .{}), @intFromFloat(x), @intFromFloat(y), 11, t.comment);
     y += 20;

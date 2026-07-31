@@ -67,6 +67,11 @@ pub const Poller = struct {
     narr_until_s: i64 = 0, // estimated end of the current utterance — the next waits (no overlapping voices)
     last_cf_s: i64 = 0, // Cloudflare OAuth status poll throttle (reset to 0 to poll on the next tick)
     last_cfm_s: i64 = 0, // Cloudflare live-models fetch throttle (only while connected; 0 = fetch next tick)
+    last_bi_s: i64 = 0, // built-in model status poll throttle (0 = poll next tick; verbs reset it)
+    // built-in transition memory (poller-local): a transfer that lands or fails raises ONE toast,
+    // not one per poll tick.
+    prev_bi_state: [16]u8 = undefined,
+    prev_bi_state_len: u8 = 0,
 
     // notification de-dup state (poller-local)
     grad_warned: bool = false,
@@ -148,6 +153,10 @@ pub const Poller = struct {
                 .sched_run => self.doSchedRun(c.idStr()),
                 .oauth_cf_login => self.doOauthCfLogin(),
                 .oauth_cf_logout => self.doOauthCfLogout(),
+                .builtin_pull => self.doBuiltinVerb(.pull),
+                .builtin_cancel => self.doBuiltinVerb(.cancel),
+                .builtin_import => self.doBuiltinVerb(.import),
+                .builtin_remove => self.doBuiltinVerb(.remove),
             }
         }
     }
@@ -679,6 +688,21 @@ pub const Poller = struct {
             }
         }
 
+        // 1d) built-in model status — fast (2s) while a transfer runs so the Settings progress bar
+        // moves like one, lazy (10s) otherwise. last_bi_s starts 0 and every verb resets it, so the
+        // first tick and every click reflect the server's truth promptly.
+        {
+            const busy = std.mem.eql(u8, self.prev_bi_state[0..self.prev_bi_state_len], "downloading") or
+                std.mem.eql(u8, self.prev_bi_state[0..self.prev_bi_state_len], "importing") or
+                std.mem.eql(u8, self.prev_bi_state[0..self.prev_bi_state_len], "verifying") or
+                std.mem.eql(u8, self.prev_bi_state[0..self.prev_bi_state_len], "resolving");
+            const bi_every: i64 = if (busy or self.prev_bi_state_len == 0) 2 else 10;
+            if (online and now_s - self.last_bi_s >= bi_every) {
+                self.last_bi_s = now_s;
+                self.refreshBuiltin();
+            }
+        }
+
         // 2) roster — a data-dir walk + per-swarm summary reads. Per-tick ONLY while something is live
         // (a cast's progress/finish must show within a second); idle, the walk drops to every 5s. A deploy
         // or delete resets last_roster_s so its effect shows on the very next tick.
@@ -938,6 +962,107 @@ pub const Poller = struct {
         self.store.pushNotif("Cloudflare", "disconnected", 1);
     }
 
+    /// One built-in model verb (Download / Cancel / Import / Remove) fired from the Settings tab.
+    /// The server does the actual work in its own background thread; this just starts it and turns
+    /// the reply into a toast. Every path resets the status throttle so the panel reflects the new
+    /// state on the very next tick.
+    fn doBuiltinVerb(self: *Poller, verb: enum { pull, cancel, import, remove }) void {
+        var tbuf: [128]u8 = undefined;
+        const tok = self.tokenSnap(&tbuf);
+        const resp = switch (verb) {
+            .pull => netcli.builtinPull(self.io, self.gpa, self.port(), tok),
+            .cancel => netcli.builtinCancel(self.io, self.gpa, self.port(), tok),
+            .import => netcli.builtinImport(self.io, self.gpa, self.port(), tok),
+            .remove => netcli.builtinRemove(self.io, self.gpa, self.port(), tok),
+        } orelse {
+            self.store.pushNotif("Built-in model", "server unreachable - is it running?", 2);
+            return;
+        };
+        defer if (resp.body.len > 0) self.gpa.free(resp.body);
+        self.last_bi_s = 0; // whatever happened, show the server's truth next tick
+        if (resp.status == 401 or resp.status == 403) {
+            self.store.pushNotif("Built-in model", "unauthorized - set the admin token in Settings", 2);
+            return;
+        }
+        if (resp.status == 409) {
+            self.store.pushNotif("Built-in model", switch (verb) {
+                .remove => "a transfer is running - cancel it first",
+                else => "a download or import is already running",
+            }, 2);
+            return;
+        }
+        if (resp.status < 200 or resp.status >= 300) {
+            self.store.pushNotif("Built-in model", "the server rejected the request", 2);
+            return;
+        }
+        switch (verb) {
+            .pull => self.store.pushNotif("Built-in model", "downloading the-veil-12b - progress shows in Settings", 1),
+            .cancel => self.store.pushNotif("Built-in model", "cancelling - the partial stays for a later resume", 1),
+            .import => self.store.pushNotif("Built-in model", "importing this machine's local copy...", 1),
+            .remove => self.store.pushNotif("Built-in model", "weights removed", 1),
+        }
+    }
+
+    /// Poll GET /api/v1/models/builtin and publish the snapshot the Settings panel renders. Raises
+    /// ONE toast on the transfer's terminal transition (landed / failed), keyed on the state string
+    /// changing — the panel itself is the progress display, the toast is for a user on another tab.
+    fn refreshBuiltin(self: *Poller) void {
+        var tbuf: [128]u8 = undefined;
+        const tok = self.tokenSnap(&tbuf);
+        const resp = netcli.builtinStatus(self.io, self.gpa, self.port(), tok) orelse return;
+        defer if (resp.body.len > 0) self.gpa.free(resp.body);
+        if (resp.status != 200) return; // transient (or unauthenticated) — keep the last-known state
+
+        var stb: [16]u8 = undefined;
+        const state = valueForKey(resp.body, "state", &stb);
+        var arb: [24]u8 = undefined;
+        const arch = valueForKey(resp.body, "arch", &arb);
+        var erb: [160]u8 = undefined;
+        const err = valueForKey(resp.body, "err", &erb);
+        var pbuf: [600]u8 = undefined;
+        const path = valueForKey(resp.body, "path", &pbuf);
+        const compiled = std.mem.indexOf(u8, resp.body, "\"compiled\":true") != null;
+        const pct: u8 = @intCast(@min(intForKey(resp.body, "pct") orelse 0, 100));
+        const done_mb: u32 = @intCast(@min((intForKey(resp.body, "bytes_done") orelse 0) >> 20, std.math.maxInt(u32)));
+        const total_mb: u32 = @intCast(@min((intForKey(resp.body, "bytes_total") orelse 0) >> 20, std.math.maxInt(u32)));
+        const params_b: u32 = @intCast(@min(intForKey(resp.body, "params_b") orelse 0, 10_000));
+
+        // terminal-transition toast: transferring → ready/cold = landed; → failed/cancelled = didn't
+        const was = self.prev_bi_state[0..self.prev_bi_state_len];
+        const was_busy = std.mem.eql(u8, was, "downloading") or std.mem.eql(u8, was, "importing") or
+            std.mem.eql(u8, was, "verifying") or std.mem.eql(u8, was, "resolving");
+        if (was_busy and !std.mem.eql(u8, was, state)) {
+            if (std.mem.eql(u8, state, "ready") or std.mem.eql(u8, state, "cold") or std.mem.eql(u8, state, "done")) {
+                self.store.pushNotif("Built-in model ready", "the-veil-12b is installed - the server can now serve it with zero setup", 1);
+            } else if (std.mem.eql(u8, state, "failed")) {
+                self.store.pushNotif("Built-in model failed", if (err.len > 0) err else "the transfer did not complete", 2);
+            }
+        }
+        const pn = @min(state.len, self.prev_bi_state.len);
+        @memcpy(self.prev_bi_state[0..pn], state[0..pn]);
+        self.prev_bi_state_len = @intCast(pn);
+
+        self.store.lock();
+        defer self.store.unlock();
+        const s = self.store;
+        s.bi_seen = true;
+        s.bi_compiled = compiled;
+        s.bi_has_weights = path.len > 0;
+        const sn = @min(state.len, s.bi_state.len);
+        @memcpy(s.bi_state[0..sn], state[0..sn]);
+        s.bi_state_len = @intCast(sn);
+        s.bi_pct = pct;
+        s.bi_done_mb = done_mb;
+        s.bi_total_mb = total_mb;
+        s.bi_params_b = params_b;
+        const an = @min(arch.len, s.bi_arch.len);
+        @memcpy(s.bi_arch[0..an], arch[0..an]);
+        s.bi_arch_len = @intCast(an);
+        const en = @min(err.len, s.bi_err.len);
+        @memcpy(s.bi_err[0..en], err[0..en]);
+        s.bi_err_len = @intCast(en);
+    }
+
     /// Poll GET /oauth/cloudflare/status and publish {configured, connected, account_id} to the store. Cheap
     /// GET beside the fleet/sched polls; a pending login clears once connected flips true.
     fn refreshCfOAuth(self: *Poller) void {
@@ -1073,6 +1198,25 @@ fn valueForKey(json: []const u8, key: []const u8, buf: []u8) []const u8 {
         n += 1;
     }
     return buf[0..n];
+}
+
+/// The integer value of a top-level `"key":123` in a flat, server-controlled JSON object (the
+/// built-in status reply). Null when absent or not a plain non-negative integer — the caller's
+/// fallback (0) is always the honest render for those. The key match includes the ':' so a key
+/// that PREFIXES another ("pct" vs a hypothetical "pct_x") can never read the wrong field.
+fn intForKey(json: []const u8, key: []const u8) ?u64 {
+    var kb: [40]u8 = undefined;
+    const pat = std.fmt.bufPrint(&kb, "\"{s}\":", .{key}) catch return null;
+    const at = std.mem.indexOf(u8, json, pat) orelse return null;
+    var i = at + pat.len;
+    while (i < json.len and json[i] == ' ') i += 1;
+    var v: u64 = 0;
+    var any = false;
+    while (i < json.len and json[i] >= '0' and json[i] <= '9') : (i += 1) {
+        v = @min(v *% 10 +% (json[i] - '0'), std.math.maxInt(u63));
+        any = true;
+    }
+    return if (any) v else null;
 }
 
 /// Fill one SchedRow from a task object, walking it pair-by-pair (scan.nextJsonPair) so free-text values
@@ -1341,6 +1485,20 @@ test "valueForKey: escapes, a missing key, and the buffer ceiling" {
     // pointed at Cloudflare's own replies and scan.nextJsonPair handles user-authored text.
     const malformed = "{\"note\":\"raw \"account_id\":\"stolen\" quote\",\"account_id\":\"real\"}";
     try std.testing.expectEqualStrings("stolen", valueForKey(malformed, "account_id", &buf));
+}
+
+test "intForKey: exact reads, key-prefix immunity, and honest nulls for absent or non-numeric values" {
+    const body = "{\"ok\":true,\"pct\":43,\"bytes_done\":3273465856,\"bytes_total\":7381381728,\"params_b\":12,\"port\":8908,\"file\":\"x.gguf\"}";
+    try std.testing.expectEqual(@as(u64, 43), intForKey(body, "pct").?);
+    try std.testing.expectEqual(@as(u64, 3273465856), intForKey(body, "bytes_done").?);
+    try std.testing.expectEqual(@as(u64, 7381381728), intForKey(body, "bytes_total").?);
+    try std.testing.expectEqual(@as(u64, 8908), intForKey(body, "port").?);
+    // absent key, and a key whose value is a string, both read as "no number" — never 0-as-fact
+    try std.testing.expect(intForKey(body, "missing") == null);
+    try std.testing.expect(intForKey(body, "file") == null);
+    // the ':' in the pattern means "pct" can never match inside a longer key's name
+    const tricky = "{\"pct_target\":99,\"pct\":7}";
+    try std.testing.expectEqual(@as(u64, 7), intForKey(tricky, "pct").?);
 }
 
 test "a steer pasted with a control byte still builds a control body the reader accepts" {
