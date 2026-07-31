@@ -800,6 +800,11 @@ src/
     control/{supervisor,writer,fanout}.zig  swarm processes, the control bus, event streaming
     deploy/service.zig     the cast/deploy door + swarm files, bundle, archive, lifecycle
     neuron/client.zig      the neuron-db memory bridge (fail-open)
+    builtin.zig  builtin_endpoint.zig  llamaeng.zig  llamashim.c  modelpull.zig  the BUILT-IN model:
+                                                   the-veil-12b served by the server itself from a
+                                                   downloaded GGUF (-Dbuiltin, default true) — store,
+                                                   loopback engine endpoint, embedded inference, and
+                                                   the verified weights downloader
     run.zig  agi.zig  oscillation.zig  rsi.zig  vcs.zig  tools.zig  writer.zig …  the moment loop,
                                                    the Veil, the self-improvement faculties, the
                                                    micro-VCS for concurrent minds

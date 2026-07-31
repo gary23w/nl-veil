@@ -22,6 +22,18 @@
             .hash = "raylib_zig-6.0.0-KE8REDJ4BQBu7lKwYNt6R4j5ywPeS37zqW6zrtjCcRwH",
             .lazy = true,
         },
+        // The embedded inference library behind the BUILT-IN model engine (-Dbuiltin, default true):
+        // ggml + llama compiled straight into `veil` (CPU backend only), the same
+        // compile-the-C-in pattern as vendor/lua — but fetched, not vendored, because it is ~15MB
+        // of source the repo should not carry. Pinned to a release tag; the veil_ll_* shim
+        // (src/worker/llamashim.c) turns any upstream API drift into a compile error at bump time.
+        // LAZY so `-Dbuiltin=false` (and dependency resolution on boxes that never build it) skips
+        // the fetch entirely, exactly like raylib for -Dapp=false.
+        .llama_cpp = .{
+            .url = "https://github.com/ggml-org/llama.cpp/archive/refs/tags/b10205.tar.gz",
+            .hash = "N-V-__8AAATougkyBgkEUyIB0p6OIvQe9n-O1DPDXPIvSZ_Z",
+            .lazy = true,
+        },
     },
     .paths = .{
         "build.zig",

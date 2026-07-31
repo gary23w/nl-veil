@@ -7853,3 +7853,23 @@ test "planReconcile actually CALLS parseDoneList — the extraction must not bec
         return error.DoneListParserNotWired;
     }
 }
+
+test "the tiered pairing actually covers a 12B: compact prompt AND compact belt, together" {
+    // The full doctrine teaches recall_hive / open_subchat / cast / get_credential, none of which the
+    // compact belt advertises. A live capture showed the FULL prompt beside a 20-tool compact-looking
+    // belt (fixed since, in a2f5cc7) -- so pin the pairing at the tier that actually runs locally here,
+    // not just the abstract "compact prompt is clean" property the neighbouring test already covers.
+    const ids = [_][]const u8{
+        "xentriom/gemma-4-12B-agentic-fable5-composer2.5-v2",
+        "gemma-4-12b-gary-v1",
+        "veil-12b",
+    };
+    for (ids) |id| {
+        const sensed = modelcfg.senseModel(id, true); // local backend
+        if (sensed.tier != .small) {
+            std.debug.print("\n{s} senses as {s}: it would get the FULL doctrine. Its belt must then " ++
+                "advertise every verb that doctrine teaches.\n", .{ id, @tagName(sensed.tier) });
+            return error.TierWouldTeachUnadvertisedVerbs;
+        }
+    }
+}

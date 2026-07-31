@@ -85,6 +85,10 @@ providers:
         label: Gemma 4 12B Coder v1
       - id: xentriom/gemma-4-12B-agentic-fable5-composer2.5-v2
         label: Gemma 4 12B Agentic v2
+      # The harness's own model. "12b" is in the id, so senseModel tiers it small and it gets
+      # the compact prompt+belt pairing a 12B needs -- no params_b/tier pin required.
+      - id: the-veil-12b
+        label: The Veil 12B
 
   # Cloudflare Workers AI via its OpenAI-compatible endpoint. Needs BOTH an account id (in the URL) and a
   # token; blank sends the "cloudflare" sentinel so a server configured with NL_CF_ACCOUNT_ID +
@@ -273,3 +277,20 @@ providers:
         label: Kimi K2.7 Code (highspeed)
       - id: kimi-k2.6
         label: Kimi K2.6
+
+  # The BUILT-IN engine: the server serves the-veil-12b itself, in-process, from a downloaded GGUF —
+  # no external runtime, the plug-and-play tier. `base: builtin` is a SENTINEL the server swaps for
+  # its live loopback engine endpoint at request time (deploy/chat resolution — the same trick as the
+  # "cloudflare" sentinel), so nothing here hardcodes a port. keyless+local: no key field in the UI,
+  # admin-gated like every local provider; the endpoint itself is per-boot-bearer gated. The id
+  # matches the ollama row above on purpose — one model, two ways to serve it — and senseModel tiers
+  # it small from the id either way. Appended LAST, per the ORDER MATTERS note at the top.
+  - key: builtin
+    label: Built-in (The Veil, no setup)
+    base: builtin
+    needs_key: false
+    keyless: true
+    local: true
+    models:
+      - id: the-veil-12b
+        label: The Veil 12B (built-in)

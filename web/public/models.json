@@ -111,6 +111,13 @@
       "kind": "openai-compatible",
       "base_url": "https://api.moonshot.ai/v1",
       "needs_key": true
+    },
+    {
+      "key": "builtin",
+      "label": "Built-in (The Veil, no setup)",
+      "kind": "openai-compatible",
+      "base_url": "local",
+      "needs_key": false
     }
   ],
   "models": [
@@ -313,126 +320,6 @@
       "tools": "partial",
       "cost": "low",
       "note": "Cheapest 4.1 tier; fast 1M-context model for light tasks. Function calling supported but the nano tier is weaker for complex multi-tool orchestration — verify per swarm. Uses max_tokens."
-    },
-    {
-      "id": "qwen2.5-coder:7b",
-      "label": "Qwen2.5-Coder 7B",
-      "provider": "ollama",
-      "hosting": "local",
-      "context": 32768,
-      "tools": "reliable",
-      "cost": "free",
-      "note": "Best value free-local tool caller for agentic/coding minds. ~4.7GB download, runs in ~6-8GB VRAM/RAM at Q4. Solid, consistent function-calling for single and small multi-tool loops. Default recommendation for most users."
-    },
-    {
-      "id": "qwen2.5-coder:14b",
-      "label": "Qwen2.5-Coder 14B",
-      "provider": "ollama",
-      "hosting": "local",
-      "context": 32768,
-      "tools": "reliable",
-      "cost": "free",
-      "note": "Step up from 7B; noticeably better at multi-step tool plans and arg formatting. ~9GB download, wants ~12-16GB VRAM/RAM at Q4. Good sweet spot for serious agentic work on a 16GB machine."
-    },
-    {
-      "id": "qwen2.5:7b",
-      "label": "Qwen2.5 7B Instruct",
-      "provider": "ollama",
-      "hosting": "local",
-      "context": 32768,
-      "tools": "reliable",
-      "cost": "free",
-      "note": "General-purpose sibling of the coder; reliable native tool support, better for non-code conversational minds. ~4.7GB, ~6-8GB VRAM/RAM at Q4."
-    },
-    {
-      "id": "qwen2.5:14b",
-      "label": "Qwen2.5 14B Instruct",
-      "provider": "ollama",
-      "hosting": "local",
-      "context": 32768,
-      "tools": "reliable",
-      "cost": "free",
-      "note": "More capable general tool-using mind; handles multi-tool reasoning better than 7B. ~9GB, ~12-16GB VRAM/RAM at Q4."
-    },
-    {
-      "id": "mistral-nemo:12b",
-      "label": "Mistral Nemo 12B",
-      "provider": "ollama",
-      "hosting": "local",
-      "context": 128000,
-      "tools": "reliable",
-      "cost": "free",
-      "note": "Native tool support, 128K context (big win for long agent transcripts), multilingual. ~7.1GB, fits 12GB VRAM at Q4_K_M. Strong 'step up from 8B' pick for quality-sensitive minds."
-    },
-    {
-      "id": "qwen2.5-coder:32b",
-      "label": "Qwen2.5-Coder 32B",
-      "provider": "ollama",
-      "hosting": "local",
-      "context": 32768,
-      "tools": "reliable",
-      "cost": "high",
-      "note": "Strongest free-local coder/tool caller in this family; most robust in complex swarms. ~20GB download, needs ~24GB+ VRAM (or 32GB+ RAM, slow on CPU). 'cost=high' = local hardware burden, not a fee."
-    },
-    {
-      "id": "mistral-small:24b",
-      "label": "Mistral Small 3 24B",
-      "provider": "ollama",
-      "hosting": "local",
-      "context": 32768,
-      "tools": "reliable",
-      "cost": "high",
-      "note": "Owns the agentic/structured-JSON niche with strong native function calling; very steady in multi-tool loops. ~14GB download, wants ~24GB VRAM (or 32GB RAM). 'cost=high' = hardware, not a fee."
-    },
-    {
-      "id": "command-r:35b",
-      "label": "Command R 35B",
-      "provider": "ollama",
-      "hosting": "local",
-      "context": 128000,
-      "tools": "reliable",
-      "cost": "high",
-      "note": "Cohere model purpose-built for RAG + tool use; very reliable structured tool calls and citations. Heavy: ~20GB download, ~24GB+ VRAM. 'cost=high' = local hardware burden, not a fee."
-    },
-    {
-      "id": "qwen3:14b",
-      "label": "Qwen3 14B",
-      "provider": "ollama",
-      "hosting": "local",
-      "context": 32768,
-      "tools": "partial",
-      "cost": "free",
-      "note": "Stronger Qwen3 with tool+thinking support and better agent reasoning than 8B. Caveat: confirm thinking-mode tool calls are stable on your Ollama build. ~9.3GB, ~12-16GB VRAM at Q4."
-    },
-    {
-      "id": "qwen3:8b",
-      "label": "Qwen3 8B",
-      "provider": "ollama",
-      "hosting": "local",
-      "context": 32768,
-      "tools": "partial",
-      "cost": "free",
-      "note": "Tools + thinking modes; agent-oriented. HONEST: tool-calling in thinking mode can be inconsistent across Ollama versions — verify against your swarm before trusting. ~5.2GB, ~8GB VRAM at Q4."
-    },
-    {
-      "id": "llama3.1:8b",
-      "label": "Llama 3.1 8B",
-      "provider": "ollama",
-      "hosting": "local",
-      "context": 128000,
-      "tools": "partial",
-      "cost": "free",
-      "note": "HONEST: emits tool calls but is unreliable in complex multi-tool swarms (drops/duplicates calls, malformed args). Fine for simple single-tool minds. ~4.7GB, runs in ~6GB VRAM. Prefer qwen2.5-coder:7b for real agentic use."
-    },
-    {
-      "id": "llama3.2:3b",
-      "label": "Llama 3.2 3B",
-      "provider": "ollama",
-      "hosting": "local",
-      "context": 128000,
-      "tools": "partial",
-      "cost": "free",
-      "note": "Lightweight (runs on ~4GB, even CPU-tolerable). Supports tools but small size means shaky arg accuracy and weak multi-step planning. Good for cheap/edge minds with one or two simple tools."
     },
     {
       "id": "moonshotai/kimi-k2-instruct-0905",
@@ -911,18 +798,6 @@
       "hosting": "hosted"
     },
     {
-      "id": "gpt-oss:20b",
-      "label": "gpt-oss 20B",
-      "provider": "ollama",
-      "hosting": "local"
-    },
-    {
-      "id": "hermes3:8b",
-      "label": "Hermes 3 8B",
-      "provider": "ollama",
-      "hosting": "local"
-    },
-    {
       "id": "openai/gpt-oss-20b",
       "label": "GPT-OSS 20B",
       "provider": "huggingface",
@@ -983,6 +858,36 @@
       "hosting": "hosted"
     },
     {
+      "id": "gpt-oss:20b",
+      "label": "gpt-oss 20B",
+      "provider": "ollama",
+      "hosting": "local"
+    },
+    {
+      "id": "qwen2.5-coder:7b",
+      "label": "Qwen2.5 Coder 7B",
+      "provider": "ollama",
+      "hosting": "local"
+    },
+    {
+      "id": "qwen2.5:14b",
+      "label": "Qwen2.5 14B",
+      "provider": "ollama",
+      "hosting": "local"
+    },
+    {
+      "id": "llama3.1:8b",
+      "label": "Llama 3.1 8B",
+      "provider": "ollama",
+      "hosting": "local"
+    },
+    {
+      "id": "hermes3:8b",
+      "label": "Hermes 3 8B",
+      "provider": "ollama",
+      "hosting": "local"
+    },
+    {
       "id": "xentriom/gemma-4-12B-coder-fable5-composer2.5-v1",
       "label": "Gemma 4 12B Coder v1",
       "provider": "ollama",
@@ -991,6 +896,12 @@
     {
       "id": "xentriom/gemma-4-12B-agentic-fable5-composer2.5-v2",
       "label": "Gemma 4 12B Agentic v2",
+      "provider": "ollama",
+      "hosting": "local"
+    },
+    {
+      "id": "the-veil-12b",
+      "label": "The Veil 12B",
       "provider": "ollama",
       "hosting": "local"
     }

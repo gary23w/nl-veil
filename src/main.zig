@@ -49,6 +49,15 @@ const plug_theme = @import("plug/theme.zig");
 pub const HAS_GUI = build_options.gui;
 const desk = if (HAS_GUI) @import("desk") else struct {};
 
+/// Whether the BUILT-IN model engine is compiled into this binary (`-Dbuiltin`, default true).
+/// False keeps llamaeng's C externs (and the whole embedded inference library) out of the build;
+/// the endpoint/downloader/status modules compile either way and honestly report "unavailable".
+pub const HAS_BUILTIN = build_options.builtin;
+const llamaeng = if (HAS_BUILTIN) @import("worker/llamaeng.zig") else struct {};
+const builtin_state = @import("worker/builtin.zig");
+const builtin_endpoint = @import("worker/builtin_endpoint.zig");
+const modelpull = @import("worker/modelpull.zig");
+
 // .info, explicitly: the default log_level tracks the optimize mode, and the ReleaseFast default (.err)
 // would silently swallow every operational message below — including the one-shot generated-admin-password
 // banner. This is the single binary-wide switch; per-module scopes are declared at each file's top.
@@ -583,6 +592,30 @@ pub fn main(init: std.process.Init) !void {
     const plug_registry = plugins.loadAll(gpa, io, init.environ_map, paths.data, .{});
     log.info("plugins: {d} loaded, {d} themes in workspace", .{ plug_registry.count(), plug_registry.themes.count });
 
+    // ---- the BUILT-IN model engine: weights store + loopback dialect endpoint ----
+    // The plug-and-play tier: the server serves the-veil-12b itself. builtin_state owns the store
+    // ({data}/models or NL_MODELS_DIR) and the per-boot bearer; the endpoint is a separate
+    // loopback-only listener because swarm minds are subprocesses and reach it over TCP; the
+    // catalog's `builtin` provider carries a sentinel base that deploy/chat resolution swaps for
+    // the live endpoint. In a -Dbuiltin=false build everything below still answers status routes —
+    // it just reports compiled:false and resolution says unavailable.
+    builtin_state.init(io, init.environ_map, paths.data);
+    modelpull.configure(gpa, io, init.environ_map);
+    if (comptime HAS_BUILTIN) {
+        llamaeng.configure(gpa, io, init.environ_map, builtin_state.modelPath());
+        modelpull.on_store_change = builtinStoreChanged;
+        if (builtin_endpoint.start(gpa, io, llamaeng.engine(), init.environ_map)) |bport| {
+            const winf = llamaeng.info();
+            log.info("built-in model engine: {s} on 127.0.0.1:{d}{s} (weights: {s})", .{ builtin_state.MODEL_ID, bport, builtin_state.PATH_PREFIX, @tagName(winf.state) });
+        } else |e| {
+            log.warn("built-in model engine endpoint failed to start ({t}) — the builtin provider will resolve unavailable", .{e});
+        }
+        if (builtin_state.syncedDirWarning())
+            log.warn("models dir sits under a cloud-synced folder — set NL_MODELS_DIR to a local path so multi-GB weights stay out of sync churn", .{});
+    } else {
+        log.info("built-in model engine: not compiled in (-Dbuiltin=false)", .{});
+    }
+
     var app = App{ .gpa = gpa, .io = io, .auth = &auth, .sup = &sup, .audit = &audit, .login_guard = &login_guard, .vault = &vault, .data = paths.data, .server_key = sup.server_key, .open_registration = open_reg, .cf_account_id = cf_account, .workers_ai_token = wai_token, .retention_days = retention_days, .production = production, .recipes = recipe_registry, .plugs = plug_registry, .ledger = &ledger, .keys = &api_keys, .cf_oauth_client_id = init.environ_map.get("NL_CF_OAUTH_CLIENT_ID") orelse cf_oauth.DEFAULT_CLIENT_ID, .cf_oauth_scopes = init.environ_map.get("NL_CF_OAUTH_SCOPES") orelse "account:read ai:write offline_access", .cf_oauth_redirect = cf_oauth_redirect, .cf_oauth_auth_url = init.environ_map.get("NL_CF_OAUTH_AUTH_URL") orelse "https://dash.cloudflare.com/oauth2/auth", .cf_oauth_token_url = init.environ_map.get("NL_CF_OAUTH_TOKEN_URL") orelse "https://dash.cloudflare.com/oauth2/token", .cf_oauth_accounts_url = init.environ_map.get("NL_CF_OAUTH_ACCOUNTS_URL") orelse "https://api.cloudflare.com/client/v4/accounts", .cfg = &server_cfg };
     // SCHEDULED TASKS run on their own background thread (the second one beside Supervisor.bgLoop, same ~5s
     // cadence): a due task spawns a full chat turn, which must never ride an httpz request thread. Spawned here
@@ -674,6 +707,14 @@ pub fn main(init: std.process.Init) !void {
     // Which local models Ollama has ACTUALLY pulled — the catalog lists what is worth running, not
     // what is installed, and only this machine can answer the difference.
     router.get("/api/v1/models/local", local_models.list, .{});
+    // The BUILT-IN model: one status snapshot (weights store + engine + any transfer in flight),
+    // and the verbs that change the store. Same requireUser gate as /models/local — all of it is
+    // "what can THIS host serve".
+    router.get("/api/v1/models/builtin", builtinStatus, .{});
+    router.post("/api/v1/models/builtin/pull", builtinPull, .{});
+    router.post("/api/v1/models/builtin/cancel", builtinCancel, .{});
+    router.post("/api/v1/models/builtin/import", builtinImport, .{});
+    router.delete("/api/v1/models/builtin", builtinDelete, .{});
     router.post("/api/v1/oauth/cloudflare/start", cf_oauth.start, .{});
     router.get("/api/v1/oauth/cloudflare/callback", cf_oauth.callback, .{});
     router.get("/api/v1/oauth/cloudflare/status", cf_oauth.status, .{});
@@ -1106,6 +1147,103 @@ fn healthDeps(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     // Copy out under the lock so a concurrent refresh can never reset the arena from under this response.
     res.content_type = .JSON;
     res.body = res.arena.dupe(u8, g_deps_json) catch return http.serverErr(res, "oom");
+}
+
+// ---- the BUILT-IN model routes -------------------------------------------------------------------
+
+/// modelpull's store-change hook: re-point the engine at whatever the store now elects. Runs on the
+/// pull/import thread; repoint is thread-safe. Only referenced from the comptime HAS_BUILTIN branch
+/// of boot, so a lean build never analyzes the llamaeng call.
+fn builtinStoreChanged() void {
+    if (comptime HAS_BUILTIN) llamaeng.repoint(builtin_state.modelPath());
+}
+
+/// GET /api/v1/models/builtin → the one snapshot the desk row, the web settings and `veil model
+/// status` all render: compiled?, endpoint port, weights store, engine state, transfer progress.
+/// A transfer in flight is the headline (it is what the user is waiting on); otherwise the engine
+/// state is (absent/cold/ready/failed).
+fn builtinStatus(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
+    _ = http.requireUser(app, req, res) orelse return;
+    const ps = modelpull.status();
+    const inf: builtin_state.Info = if (comptime HAS_BUILTIN) llamaeng.info() else .{};
+    const transferring = switch (ps.state) {
+        .resolving, .downloading, .verifying, .importing => true,
+        else => false,
+    };
+    const headline: []const u8 = if (transferring or ps.state == .failed) @tagName(ps.state) else @tagName(inf.state);
+    const pct: u64 = if (ps.bytes_total > 0) @min(ps.bytes_done * 100 / ps.bytes_total, 100) else 0;
+    try res.json(.{
+        .ok = true,
+        .compiled = HAS_BUILTIN,
+        .state = headline,
+        .model = builtin_state.MODEL_ID,
+        .repo = builtin_state.HF_REPO,
+        .port = builtin_state.port(),
+        .file = ps.file,
+        .path = builtin_state.modelPath() orelse "",
+        .bytes_total = ps.bytes_total,
+        .bytes_done = ps.bytes_done,
+        .pct = pct,
+        .arch = inf.archName(),
+        .params_b = inf.params_b,
+        .ctx = inf.ctx_serving,
+        .err = if (ps.state == .failed) ps.err else inf.errMsg(),
+        .synced_dir_warning = builtin_state.syncedDirWarning(),
+    }, .{});
+}
+
+/// POST /api/v1/models/builtin/pull → start the background download from the published repo.
+/// 409 while one runs; the client then just polls status.
+fn builtinPull(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
+    _ = http.requireUser(app, req, res) orelse return;
+    modelpull.startPull() catch |e| {
+        res.status = if (e == error.Busy) 409 else 503;
+        try res.json(.{ .ok = false, .@"error" = if (e == error.Busy) "a pull or import is already running" else "the downloader is not ready" }, .{});
+        return;
+    };
+    try res.json(.{ .ok = true, .started = true }, .{});
+}
+
+/// POST /api/v1/models/builtin/cancel → cooperative cancel; the .part stays for a later resume.
+fn builtinCancel(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
+    _ = http.requireUser(app, req, res) orelse return;
+    modelpull.cancel();
+    try res.json(.{ .ok = true }, .{});
+}
+
+/// POST /api/v1/models/builtin/import {path?} → copy an already-downloaded GGUF into the store on a
+/// background thread (path absent = auto-discover the local runtime's verified blob for this model).
+fn builtinImport(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
+    _ = http.requireUser(app, req, res) orelse return;
+    var explicit: ?[]const u8 = null;
+    if (req.body()) |b| {
+        const parsed = std.json.parseFromSlice(std.json.Value, res.arena, b, .{}) catch null;
+        if (parsed) |p| if (p.value == .object) if (p.value.object.get("path")) |v| if (v == .string and v.string.len > 0) {
+            explicit = v.string;
+        };
+    }
+    modelpull.startImport(explicit) catch |e| {
+        res.status = if (e == error.Busy) 409 else 400;
+        try res.json(.{ .ok = false, .@"error" = switch (e) {
+            error.Busy => "a pull or import is already running",
+            error.PathTooLong => "path too long",
+            else => "the importer is not ready",
+        } }, .{});
+        return;
+    };
+    try res.json(.{ .ok = true, .started = true }, .{});
+}
+
+/// DELETE /api/v1/models/builtin → drop the serving weights (refused mid-transfer). The engine
+/// re-points to nothing via the same store-change hook the pull uses.
+fn builtinDelete(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
+    _ = http.requireUser(app, req, res) orelse return;
+    modelpull.remove(app.io) catch |e| {
+        res.status = if (e == error.Busy) 409 else 500;
+        try res.json(.{ .ok = false, .@"error" = if (e == error.Busy) "a pull or import is running — cancel it first" else "could not remove the weights file" }, .{});
+        return;
+    };
+    try res.json(.{ .ok = true }, .{});
 }
 
 const INSTANCE_MIND_CAP = 25;

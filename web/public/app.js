@@ -3325,6 +3325,44 @@ const TRIO_HELP = `
   </div>
 </details>`;
 
+/** The Built-in model panel: one /api/v1/models/builtin snapshot rendered as a row plus the verbs
+    that change the store (download / import / cancel / remove). Re-polls itself while a transfer
+    runs and stops the moment the panel leaves the DOM (navigating away unmounts it). */
+async function refreshBuiltinPanel() {
+  const hostEl = el('builtinPanel');
+  if (!hostEl) return;
+  let j = null;
+  try { j = await jget('/api/v1/models/builtin', 8000); } catch (e) {}
+  if (!el('builtinPanel')) return;
+  if (!j || !j.ok) { hostEl.innerHTML = '<div class="muted">status unavailable (server offline?)</div>'; return; }
+  const busy = j.state === 'resolving' || j.state === 'downloading' || j.state === 'verifying' || j.state === 'importing';
+  const served = j.state === 'ready' || j.state === 'cold';
+  const mb = (n) => Math.round((n || 0) / 1048576);
+  let line = '';
+  if (!j.compiled) line = 'not compiled into this server build (-Dbuiltin=false)';
+  else if (busy) line = j.state + (j.bytes_total ? ` — ${j.pct}% (${mb(j.bytes_done)} / ${mb(j.bytes_total)} MB)` : '…');
+  else if (served) line = `ready to serve (${j.arch || '?'} · ${j.params_b || '?'}B · ${j.ctx || '?'} ctx window)`;
+  else if (j.state === 'failed') line = 'failed: ' + (j.err || 'unknown');
+  else line = 'weights not downloaded yet — pull them from ' + j.repo + ' (about 7 GB, verified)';
+  hostEl.innerHTML = `
+    <div class="set-row">
+      <div><b>${esc(j.model)} — served by this server, no external runtime</b>
+        <div class="muted">${esc(line)}</div>
+        ${j.synced_dir_warning ? '<div class="muted">note: the models dir is under a cloud-synced folder — set NL_MODELS_DIR to a local path</div>' : ''}
+      </div>
+      <div>
+        ${j.compiled && !busy && !served ? '<button class="btn btn-sm btn-solid" id="biPull">Download</button> <button class="btn btn-sm" id="biImport">Import local copy</button>' : ''}
+        ${busy ? '<button class="btn btn-sm" id="biCancel">Cancel</button>' : ''}
+        ${j.compiled && !busy && served ? '<button class="btn btn-sm btn-danger" id="biRm">Remove</button>' : ''}
+      </div>
+    </div>`;
+  if (el('biPull')) el('biPull').addEventListener('click', async () => { try { await jpost('/api/v1/models/builtin/pull', {}); } catch (e) {} refreshBuiltinPanel(); });
+  if (el('biImport')) el('biImport').addEventListener('click', async () => { try { await jpost('/api/v1/models/builtin/import', {}); } catch (e) {} refreshBuiltinPanel(); });
+  if (el('biCancel')) el('biCancel').addEventListener('click', async () => { try { await jpost('/api/v1/models/builtin/cancel', {}); } catch (e) {} refreshBuiltinPanel(); });
+  if (el('biRm')) el('biRm').addEventListener('click', async () => { try { await jdel('/api/v1/models/builtin'); } catch (e) {} refreshBuiltinPanel(); });
+  if (busy) setTimeout(refreshBuiltinPanel, 1200);
+}
+
 function renderSettings(host) {
   const st = S.settings;
   host.innerHTML = `
@@ -3366,6 +3404,9 @@ function renderSettings(host) {
         ${TRIO_HELP}
         <div id="rolePanels"></div>
       </div>
+
+      <div class="section-head"><h2>Built-in model</h2></div>
+      <div class="panel set-panel" id="builtinPanel"><div class="muted">checking…</div></div>
 
       <div class="section-head"><h2>Auto-loop</h2></div>
       <div class="panel set-panel">
@@ -3427,6 +3468,7 @@ function renderSettings(host) {
   el('setLoop').addEventListener('change', (e) => { S.settings.loop = parseInt(e.target.value, 10) || 0; saveSettings(); });
   el('setOut').addEventListener('click', async () => { try { await api.logout(); } catch (e) {} onSignedOut(); });
   el('kAdd').addEventListener('click', addProviderKey);
+  refreshBuiltinPanel();
   if (el('useDefault')) el('useDefault').addEventListener('change', (e) => {
     // Clearing BOTH fields is what SELECTS the server default — the server only
     // applies it when the pair is blank, so half-clearing would silently do

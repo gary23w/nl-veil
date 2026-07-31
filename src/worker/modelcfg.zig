@@ -509,8 +509,26 @@ test "models.yaml parses: provider order pins the desk's persisted dropdown indi
     // workers-ai was commented out of models.yaml deliberately, so it is absent here and everything
     // after it moved down one. Any desk config persisted BEFORE that edit with byok >= 3 now points a
     // slot left; a desk that has since re-saved is self-consistent again.
-    const expect = [_][]const u8{ "anthropic", "openai", "ollama", "groq", "deepseek", "google", "mock", "huggingface", "zai", "tokengo", "openrouter", "moonshot" };
+    const expect = [_][]const u8{ "anthropic", "openai", "ollama", "groq", "deepseek", "google", "mock", "huggingface", "zai", "tokengo", "openrouter", "moonshot", "builtin" };
     for (expect, 0..) |k, i| try std.testing.expectEqualStrings(k, providers[i].key);
+}
+
+test "builtin provider: sentinel base, keyless+local, serves exactly the-veil-12b" {
+    const p = for (providers) |pr| {
+        if (std.mem.eql(u8, pr.key, "builtin")) break pr;
+    } else unreachable;
+    // The base is the SENTINEL, not a URL — deploy/chat resolution swaps it for the live loopback
+    // engine endpoint (worker/builtin.zig). A port hardcoded here would rot the moment the endpoint
+    // moved, which is the whole reason the sentinel exists.
+    try std.testing.expectEqualStrings("builtin", p.base_url);
+    try std.testing.expect(!p.needs_key and p.keyless and p.local and !p.needs_account);
+    try std.testing.expectEqual(@as(usize, 1), p.models.len);
+    try std.testing.expectEqualStrings("the-veil-12b", p.models[0].id);
+    // the id carries "12b", so the size-adaptive prompts tier it small with no pin — same as the
+    // ollama row for the same model
+    try std.testing.expectEqual(Tier.small, senseModel("the-veil-12b", false).tier);
+    // and a sentinel base must never resolve to a BYOK provider (no key can belong to it)
+    try std.testing.expect(providerForBase("builtin") == null);
 }
 
 test "moonshot (Kimi) provider: first-party API, kimi-k3 flagship first, OpenAI-compatible BYOK" {
