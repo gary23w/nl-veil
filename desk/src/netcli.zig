@@ -282,6 +282,24 @@ pub fn builtinRemove(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u
     return httpReq(io, gpa, "DELETE", port, "/api/v1/models/builtin", token, null, 10);
 }
 
+/// GET /api/v1/dataset — is a training set recording, what has it captured, what sets exist.
+pub fn datasetStatus(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8) ?Resp {
+    log.trace("netcli.datasetStatus port={d}", .{port});
+    return httpReq(io, gpa, "GET", port, "/api/v1/dataset", token, null, 6);
+}
+
+/// POST /api/v1/dataset/start — begin capturing every LLM call and tool run into a new set.
+pub fn datasetStart(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8, body_json: []const u8) ?Resp {
+    log.trace("netcli.datasetStart port={d}", .{port});
+    return httpReq(io, gpa, "POST", port, "/api/v1/dataset/start", token, body_json, 10);
+}
+
+/// POST /api/v1/dataset/stop — close the set out (marker dropped, meta.json finalized).
+pub fn datasetStop(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8) ?Resp {
+    log.trace("netcli.datasetStop port={d}", .{port});
+    return httpReq(io, gpa, "POST", port, "/api/v1/dataset/stop", token, "{}", 10);
+}
+
 /// POST /api/v1/models/builtin/check — ask the server to compare the repo's current release
 /// against what the store serves; the verdict lands in status as update_state.
 pub fn builtinCheck(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8) ?Resp {

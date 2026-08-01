@@ -55,6 +55,7 @@ test {
     _ = @import("worker/browser/launch.zig"); // direct, per ledger 0029
     _ = @import("worker/browser/util.zig");
     _ = @import("worker/crawl.zig");
+    _ = @import("worker/dataset.zig"); // training-set capture: the sft/raw/tools record shapes + the marker switch
     _ = @import("worker/deps.zig");
     _ = @import("worker/evcursor.zig"); // events.jsonl poll cursor: probe sentinel, page cap, catch-up walk
     _ = @import("worker/gemma4.zig"); // gemma4 wire format: byte-exact vs the model's own chat template

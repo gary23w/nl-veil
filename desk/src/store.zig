@@ -22,7 +22,7 @@ const SpinLock = struct {
 
 pub const Tab = enum { dashboard, chat, swarm, hub, scheduled, settings }; // deploy = the Swarm tab's inner form
 
-pub const CmdKind = enum { none, select, say, set_goal, stop, deploy, delete, open_folder, refresh_now, open_file, sched_create, sched_update, sched_toggle, sched_delete, sched_run, oauth_cf_login, oauth_cf_logout, builtin_pull, builtin_cancel, builtin_import, builtin_remove, builtin_check };
+pub const CmdKind = enum { none, select, say, set_goal, stop, deploy, delete, open_folder, refresh_now, open_file, sched_create, sched_update, sched_toggle, sched_delete, sched_run, oauth_cf_login, oauth_cf_logout, builtin_pull, builtin_cancel, builtin_import, builtin_remove, builtin_check, dataset_start, dataset_stop };
 
 /// A UI→poller command. Fixed-size, copied by value into the ring, so no cross-thread allocation.
 pub const Command = struct {
@@ -877,6 +877,16 @@ pub const Store = struct {
     bi_upd_file: [64]u8 = undefined,
     bi_upd_file_len: u8 = 0,
     bi_upd_mb: u32 = 0,
+
+    // --- training-set capture (poller writes from GET /api/v1/dataset; Settings reads) ---
+    ds_seen: bool = false,
+    ds_recording: bool = false,
+    ds_id: [40]u8 = undefined,
+    ds_id_len: u8 = 0,
+    ds_calls: u64 = 0,
+    ds_examples: u64 = 0,
+    ds_tools: u64 = 0,
+    ds_sets: u32 = 0, // how many sets exist on disk
 
     // --- command ring (UI writes head, poller reads tail) ---
     cmds: [CMD_RING]Command = undefined,

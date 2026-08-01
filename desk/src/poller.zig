@@ -68,6 +68,7 @@ pub const Poller = struct {
     last_cf_s: i64 = 0, // Cloudflare OAuth status poll throttle (reset to 0 to poll on the next tick)
     last_cfm_s: i64 = 0, // Cloudflare live-models fetch throttle (only while connected; 0 = fetch next tick)
     last_bi_s: i64 = 0, // built-in model status poll throttle (0 = poll next tick; verbs reset it)
+    last_ds_s: i64 = 0, // training-set capture poll throttle (fast while recording so counts climb live)
     // built-in transition memory (poller-local): a transfer that lands or fails raises ONE toast,
     // not one per poll tick. Same for the update-check verdict.
     prev_bi_state: [16]u8 = undefined,
@@ -160,6 +161,8 @@ pub const Poller = struct {
                 .builtin_import => self.doBuiltinVerb(.import),
                 .builtin_remove => self.doBuiltinVerb(.remove),
                 .builtin_check => self.doBuiltinVerb(.check),
+                .dataset_start => self.doDataset(true, c.textStr()),
+                .dataset_stop => self.doDataset(false, ""),
             }
         }
     }
@@ -707,6 +710,20 @@ pub const Poller = struct {
             }
         }
 
+        // 1e) training-set capture — 3s while a set is open so the captured counts visibly climb,
+        // 15s otherwise (it is a static "no set recording" the rest of the time).
+        {
+            self.store.lock();
+            const rec = self.store.ds_recording;
+            const seen = self.store.ds_seen;
+            self.store.unlock();
+            const ds_every: i64 = if (rec or !seen) 3 else 15;
+            if (online and now_s - self.last_ds_s >= ds_every) {
+                self.last_ds_s = now_s;
+                self.refreshDataset();
+            }
+        }
+
         // 2) roster — a data-dir walk + per-swarm summary reads. Per-tick ONLY while something is live
         // (a cast's progress/finish must show within a second); idle, the walk drops to every 5s. A deploy
         // or delete resets last_roster_s so its effect shows on the very next tick.
@@ -1007,6 +1024,88 @@ pub const Poller = struct {
             .remove => self.store.pushNotif("Built-in model", "weights removed", 1),
             .check => self.store.pushNotif("Built-in model", "checking the published repo for a newer release...", 1),
         }
+    }
+
+    /// Start or stop training-set capture. The server owns the recording (it is the process every
+    /// chat turn runs in); this just flips it and re-polls so the panel reflects the truth at once.
+    fn doDataset(self: *Poller, start: bool, label: []const u8) void {
+        var tbuf: [128]u8 = undefined;
+        const tok = self.tokenSnap(&tbuf);
+        const resp = blk: {
+            if (!start) break :blk netcli.datasetStop(self.io, self.gpa, self.port(), tok);
+            var body: [256]u8 = undefined;
+            var esc: [180]u8 = undefined;
+            var n: usize = 0;
+            for (label) |ch| { // a label is free text from the UI — escape it into the JSON body
+                if (n + 2 >= esc.len) break;
+                if (ch == '\\' or ch == '"') {
+                    esc[n] = '\\';
+                    n += 1;
+                }
+                esc[n] = if (ch < 0x20) ' ' else ch;
+                n += 1;
+            }
+            const b = std.fmt.bufPrint(&body, "{{\"label\":\"{s}\"}}", .{esc[0..n]}) catch "{}";
+            break :blk netcli.datasetStart(self.io, self.gpa, self.port(), tok, b);
+        } orelse {
+            self.store.pushNotif("Dataset", "server unreachable - is it running?", 2);
+            return;
+        };
+        defer if (resp.body.len > 0) self.gpa.free(resp.body);
+        self.last_ds_s = 0; // show the new state on the very next tick
+        if (resp.status == 401 or resp.status == 403) {
+            self.store.pushNotif("Dataset", "unauthorized - set the admin token in Settings", 2);
+            return;
+        }
+        if (resp.status == 409) {
+            self.store.pushNotif("Dataset", if (start) "a dataset is already recording" else "no dataset is recording", 2);
+            return;
+        }
+        if (resp.status < 200 or resp.status >= 300) {
+            self.store.pushNotif("Dataset", "the server rejected the request", 2);
+            return;
+        }
+        if (start) {
+            self.store.pushNotif("Building dataset", "every chat turn, tool call and reply is being captured for training", 1);
+        } else {
+            self.store.pushNotif("Dataset closed", "the set is finalized and ready to train on", 1);
+        }
+    }
+
+    /// Poll GET /api/v1/dataset and publish the capture snapshot the Settings panel renders.
+    fn refreshDataset(self: *Poller) void {
+        var tbuf: [128]u8 = undefined;
+        const tok = self.tokenSnap(&tbuf);
+        const resp = netcli.datasetStatus(self.io, self.gpa, self.port(), tok) orelse return;
+        defer if (resp.body.len > 0) self.gpa.free(resp.body);
+        if (resp.status != 200) return; // transient — keep the last-known state
+        var idb: [40]u8 = undefined;
+        const id = valueForKey(resp.body, "id", &idb);
+        const recording = std.mem.indexOf(u8, resp.body, "\"recording\":true") != null;
+        const calls = intForKey(resp.body, "calls") orelse 0;
+        const examples = intForKey(resp.body, "examples") orelse 0;
+        const tool_runs = intForKey(resp.body, "tool_runs") orelse 0;
+        // how many sets exist: count the `"id":` keys inside the sets array (each set's meta carries one)
+        var sets: u32 = 0;
+        if (std.mem.indexOf(u8, resp.body, "\"sets\":[")) |at| {
+            var i = at;
+            while (std.mem.indexOfPos(u8, resp.body, i, "\"id\":")) |hit| {
+                sets += 1;
+                i = hit + 5;
+            }
+        }
+        self.store.lock();
+        defer self.store.unlock();
+        const s = self.store;
+        s.ds_seen = true;
+        s.ds_recording = recording;
+        const n = @min(id.len, s.ds_id.len);
+        @memcpy(s.ds_id[0..n], id[0..n]);
+        s.ds_id_len = @intCast(n);
+        s.ds_calls = calls;
+        s.ds_examples = examples;
+        s.ds_tools = tool_runs;
+        s.ds_sets = sets;
     }
 
     /// Poll GET /api/v1/models/builtin and publish the snapshot the Settings panel renders. Raises

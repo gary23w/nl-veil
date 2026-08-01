@@ -7480,6 +7480,61 @@ fn drawSettings(store: *Store, body: t.Rect) void {
     }
     y += 8;
 
+    // ---- BUILD DATASET: capture everything the veil does, in a shape a fine-tune can eat ----
+    // Pure render over store.ds_* (the poller owns the status poll; the two verbs ride the command
+    // ring). Recording is SERVER-side and marker-driven, so it survives closing this window and it
+    // also captures swarm minds — the copy says so rather than implying the desk is doing the work.
+    y = settingSection(x, y, colw, "BUILD DATASET");
+    {
+        var ds_seen = false;
+        var ds_rec = false;
+        var idb: [40]u8 = undefined;
+        var idn: usize = 0;
+        var calls: u64 = 0;
+        var examples: u64 = 0;
+        var toolruns: u64 = 0;
+        var nsets: u32 = 0;
+        {
+            store.lock();
+            defer store.unlock();
+            ds_seen = store.ds_seen;
+            ds_rec = store.ds_recording;
+            idn = store.ds_id_len;
+            @memcpy(idb[0..idn], store.ds_id[0..idn]);
+            calls = store.ds_calls;
+            examples = store.ds_examples;
+            toolruns = store.ds_tools;
+            nsets = store.ds_sets;
+        }
+        if (!ds_seen) {
+            t.text(t.z("checking the server...", .{}), @intFromFloat(x), @intFromFloat(y), 11, t.comment);
+        } else if (ds_rec) {
+            t.text(t.z("RECORDING {s} - {d} training examples, {d} model calls, {d} tool runs captured", .{ idb[0..idn], examples, calls, toolruns }), @intFromFloat(x), @intFromFloat(y), 11, t.green);
+        } else {
+            t.text(t.z("off - turn it on and every chat turn, tool call, reasoning trace and swarm build is captured", .{}), @intFromFloat(x), @intFromFloat(y), 11, t.comment);
+        }
+        y += 18;
+        t.text(t.z("written to <data>/sets/<id>/ as sft.jsonl (OpenAI messages format), by-model shards, raw + tools logs{s}", .{if (nsets > 0) t.z(" - {d} set(s) on disk", .{nsets}) else ""}), @intFromFloat(x), @intFromFloat(y), 11, t.comment);
+        y += 22;
+        if (ds_seen) {
+            if (ds_rec) {
+                const stop_lbl = t.z("Stop + finalize", .{});
+                if (t.buttonSolid(.{ .x = x, .y = y, .width = t.btnW(stop_lbl, t.BTN_MD), .height = t.BTN_MD }, stop_lbl, t.red, true)) {
+                    store.pushCmd(store_mod.mkCmd(.dataset_stop, "", ""));
+                }
+            } else {
+                const go_lbl = t.z("Build dataset", .{});
+                if (t.buttonSolid(.{ .x = x, .y = y, .width = t.btnW(go_lbl, t.BTN_MD), .height = t.BTN_MD }, go_lbl, t.blue, true)) {
+                    // the label is what the set is FOR — the desk sends the active chat's name when
+                    // there is one, so a set is identifiable later without opening it
+                    store.pushCmd(store_mod.mkCmd(.dataset_start, "", "desk session"));
+                }
+            }
+            y += t.BTN_MD + 10;
+        }
+    }
+    y += 8;
+
     y = settingSection(x, y, colw, "CHAT MODEL");
     t.text(t.z("the Chat tab talks through this provider - its swarm casts use it too", .{}), @intFromFloat(x), @intFromFloat(y), 11, t.comment);
     y += 20;

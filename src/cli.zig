@@ -59,7 +59,7 @@ pub fn isCommand(sub: []const u8) bool {
         "sched",     "hub",           "doctor", "health",  "desktop",   "desk",
         "help",      "--help",        "-h",     "version", "--version", "exec-tool",
         "sync-read", "sync-manifest", "rag",    "themes",  "plugins",   "plug",
-        "model",
+        "model",     "dataset",       "set",
     };
     for (verbs) |v| if (std.mem.eql(u8, sub, v)) return true;
     return false;
@@ -95,6 +95,7 @@ pub fn dispatch(ctx: *Ctx, sub: []const u8, args: []const []const u8) u8 {
     if (std.mem.eql(u8, sub, "themes")) return cmdThemes(ctx, args);
     if (std.mem.eql(u8, sub, "plugins") or std.mem.eql(u8, sub, "plug")) return cmdPlugins(ctx, args);
     if (std.mem.eql(u8, sub, "model")) return cmdModel(ctx, args);
+    if (std.mem.eql(u8, sub, "dataset") or std.mem.eql(u8, sub, "set")) return cmdDataset(ctx, args);
     std.debug.print("unknown command '{s}' — run `veil help`\n", .{sub});
     return 1;
 }
@@ -707,6 +708,89 @@ fn cmdDesktop(ctx: *Ctx) u8 {
     return 0;
 }
 
+// ------------------------------------------------------------------------------- training sets
+
+/// `veil dataset start|stop|status` — the CLI face of /api/v1/dataset. Recording is server-side, so
+/// this only flips the switch and reports; the capture keeps running after the CLI exits.
+fn cmdDataset(ctx: *Ctx, args: []const []const u8) u8 {
+    const sub = if (args.len > 0) args[0] else "status";
+    if (std.mem.eql(u8, sub, "start")) {
+        var body: [320]u8 = undefined;
+        var esc: [220]u8 = undefined;
+        var n: usize = 0;
+        if (args.len > 1) {
+            for (args[1]) |ch| {
+                if (n + 2 >= esc.len) break;
+                if (ch == '\\' or ch == '"') {
+                    esc[n] = '\\';
+                    n += 1;
+                }
+                esc[n] = if (ch < 0x20) ' ' else ch;
+                n += 1;
+            }
+        }
+        const b = std.fmt.bufPrint(&body, "{{\"label\":\"{s}\"}}", .{esc[0..n]}) catch "{}";
+        const resp = call(ctx, "POST", "/api/v1/dataset/start", b, 10, true) catch return unreachable_msg(ctx);
+        defer if (resp.body.len > 0) ctx.gpa.free(resp.body);
+        if (resp.status != 200) {
+            std.debug.print("could not start (HTTP {d}): {s}\n", .{ resp.status, resp.body[0..@min(resp.body.len, 300)] });
+            return 1;
+        }
+        out("recording — every LLM call and tool run is being captured\n", .{});
+        return datasetStatusOnce(ctx);
+    }
+    if (std.mem.eql(u8, sub, "stop")) {
+        const resp = call(ctx, "POST", "/api/v1/dataset/stop", "{}", 10, true) catch return unreachable_msg(ctx);
+        defer if (resp.body.len > 0) ctx.gpa.free(resp.body);
+        if (resp.status != 200) {
+            std.debug.print("could not stop (HTTP {d}): {s}\n", .{ resp.status, resp.body[0..@min(resp.body.len, 300)] });
+            return 1;
+        }
+        out("set closed and finalized\n", .{});
+        return datasetStatusOnce(ctx);
+    }
+    if (std.mem.eql(u8, sub, "status") or std.mem.eql(u8, sub, "list")) return datasetStatusOnce(ctx);
+    std.debug.print("unknown dataset subcommand '{s}' — start [label] | stop | status\n", .{sub});
+    return 1;
+}
+
+fn datasetStatusOnce(ctx: *Ctx) u8 {
+    const resp = call(ctx, "GET", "/api/v1/dataset", null, 8, true) catch return unreachable_msg(ctx);
+    defer if (resp.body.len > 0) ctx.gpa.free(resp.body);
+    if (resp.status != 200) {
+        std.debug.print("status failed (HTTP {d})\n", .{resp.status});
+        return 1;
+    }
+    const parsed = std.json.parseFromSlice(std.json.Value, ctx.gpa, resp.body, .{}) catch {
+        std.debug.print("unparseable status reply\n", .{});
+        return 1;
+    };
+    defer parsed.deinit();
+    const o = if (parsed.value == .object) parsed.value.object else return 1;
+    const rec = if (o.get("recording")) |v| (v == .bool and v.bool) else false;
+    if (rec) {
+        out("recording {s}: {d} examples, {d} calls, {d} tool runs\n", .{
+            if (o.get("id")) |v| (if (v == .string) v.string else "?") else "?",
+            if (o.get("examples")) |v| (if (v == .integer) v.integer else 0) else 0,
+            if (o.get("calls")) |v| (if (v == .integer) v.integer else 0) else 0,
+            if (o.get("tool_runs")) |v| (if (v == .integer) v.integer else 0) else 0,
+        });
+    } else out("not recording\n", .{});
+    if (o.get("root")) |v| if (v == .string) out("  sets dir: {s}\n", .{v.string});
+    if (o.get("sets")) |sv| if (sv == .array) {
+        for (sv.array.items) |s| {
+            if (s != .object) continue;
+            const so = s.object;
+            out("  {s: <28} {d: >6} examples  {s}\n", .{
+                if (so.get("id")) |v| (if (v == .string) v.string else "?") else "?",
+                if (so.get("examples")) |v| (if (v == .integer) v.integer else 0) else 0,
+                if (so.get("label")) |v| (if (v == .string) v.string else "") else "",
+            });
+        }
+    };
+    return 0;
+}
+
 // ------------------------------------------------------------------------------- built-in model
 
 /// `veil model status|pull|import|cancel|rm` — the CLI face of /api/v1/models/builtin. pull and
@@ -912,6 +996,12 @@ fn cmdHelp() u8 {
         \\  model pull                   download the published weights (resumable, sha-verified)
         \\  model import [--path FILE]   copy an already-downloaded GGUF into the store instead
         \\                               (no --path: auto-import this machine's local-runtime copy)
+        \\
+        \\TRAINING SETS (capture everything for a fine-tune — see <data>/sets/<id>/README.md)
+        \\  dataset start [label]        record every LLM call + tool run into a new set
+        \\  dataset stop                 close the set out (finalizes meta.json)
+        \\  dataset status               is a set recording, what has it captured, what exists
+        \\
         \\  model check                  is a newer release published? (compares shas; pull installs it)
         \\  model cancel                 cancel the running pull/import (the partial resumes later)
         \\  model rm                     remove the serving weights

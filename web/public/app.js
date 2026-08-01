@@ -3378,6 +3378,44 @@ async function refreshBuiltinPanel() {
   if (busy || checking) setTimeout(refreshBuiltinPanel, 1200);
 }
 
+/** The Build dataset panel: capture every LLM call and tool run into a training set. Recording is
+    SERVER-side and survives this tab closing; it also covers swarm minds, which are separate
+    processes. Re-polls itself while a set is open so the captured counts climb live. */
+async function refreshDatasetPanel() {
+  const hostEl = el('datasetPanel');
+  if (!hostEl) return;
+  let j = null;
+  try { j = await jget('/api/v1/dataset', 8000); } catch (e) {}
+  if (!el('datasetPanel')) return;
+  if (!j || !j.ok) { hostEl.innerHTML = '<div class="muted">status unavailable (server offline?)</div>'; return; }
+  const line = j.recording
+    ? `<b>recording ${esc(j.id)}</b> — ${j.examples} training examples, ${j.calls} model calls, ${j.tool_runs} tool runs captured`
+    : 'off — turn it on and every chat turn, tool call, reasoning trace and swarm build is captured';
+  const sets = (j.sets || []).slice(0, 8);
+  hostEl.innerHTML = `
+    <div class="set-row">
+      <div><b>Capture a training set</b>
+        <div class="muted">${line}</div>
+        <div class="muted">written to <span class="mono">${esc(j.root || '<data>/sets')}/&lt;id&gt;/</span> —
+          <span class="mono">sft.jsonl</span> in OpenAI messages format (messages + tools + tool_calls + reasoning),
+          per-model shards, plus verbatim <span class="mono">raw.jsonl</span> and <span class="mono">tools.jsonl</span></div>
+      </div>
+      <div>${j.recording ? '<button class="btn btn-sm btn-danger" id="dsStop">Stop + finalize</button>' : '<button class="btn btn-sm btn-solid" id="dsGo">Build dataset</button>'}</div>
+    </div>
+    ${sets.length ? `<div class="muted" style="margin-top:10px">${sets.length} set${sets.length === 1 ? '' : 's'} on disk:</div>
+      <ul class="mono" style="margin:4px 0 0 16px">${sets.map((s) =>
+        `<li>${esc(s.id || '?')} — ${s.examples || 0} examples${s.label ? ' · ' + esc(s.label) : ''}${s.closed ? '' : ' · <em>open</em>'}</li>`).join('')}</ul>` : ''}`;
+  if (el('dsGo')) el('dsGo').addEventListener('click', async () => {
+    try { await jpost('/api/v1/dataset/start', { label: 'web session' }); } catch (e) {}
+    refreshDatasetPanel();
+  });
+  if (el('dsStop')) el('dsStop').addEventListener('click', async () => {
+    try { await jpost('/api/v1/dataset/stop', {}); } catch (e) {}
+    refreshDatasetPanel();
+  });
+  if (j.recording) setTimeout(refreshDatasetPanel, 3000);
+}
+
 function renderSettings(host) {
   const st = S.settings;
   host.innerHTML = `
@@ -3422,6 +3460,9 @@ function renderSettings(host) {
 
       <div class="section-head"><h2>Built-in model</h2></div>
       <div class="panel set-panel" id="builtinPanel"><div class="muted">checking…</div></div>
+
+      <div class="section-head"><h2>Build dataset</h2></div>
+      <div class="panel set-panel" id="datasetPanel"><div class="muted">checking…</div></div>
 
       <div class="section-head"><h2>Auto-loop</h2></div>
       <div class="panel set-panel">
@@ -3484,6 +3525,7 @@ function renderSettings(host) {
   el('setOut').addEventListener('click', async () => { try { await api.logout(); } catch (e) {} onSignedOut(); });
   el('kAdd').addEventListener('click', addProviderKey);
   refreshBuiltinPanel();
+  refreshDatasetPanel();
   if (el('useDefault')) el('useDefault').addEventListener('change', (e) => {
     // Clearing BOTH fields is what SELECTS the server default — the server only
     // applies it when the pair is blank, so half-clearing would silently do
