@@ -348,12 +348,25 @@ fn writeReadme(dir: []const u8, id: []const u8, label: []const u8) void {
         \\- `source` — `chat`, `swarm`, or `task`: which surface generated it.
         \\- `role_label` — the engine's own name for the call (`chat`, `plan`, `loop`, `compact`, …), so a
         \\  trainer can keep the agentic step and the summarizer apart.
+        \\- `finish_reason` — `tool_calls`, `stop`, or `length`. Read this before training; see below.
         \\
         \\## Filtering
         \\
         \\Records are appended as they happen, so a failed or refused call is here too — that is deliberate
         \\(a set with no failures teaches a model that failure never happens). `ok:false` marks them; drop
         \\them with `jq 'select(.ok)'` if your run wants only clean turns.
+        \\
+        \\**Drop `finish_reason:"length"` before you train.** Those completions were cut off mid-generation
+        \\when the token budget ran out — the text ends mid-word and there is no answer and no tool call,
+        \\only a truncated reasoning trace. They look like empty replies and they teach exactly that. On the
+        \\first real capture they were 13% of the set. `jq 'select(.finish_reason != "length")'`.
+        \\
+        \\**A `stop` record with an empty completion is usually CORRECT, not broken.** The memory-extraction
+        \\role emits nothing when a turn holds no durable fact ("Nothing qualifies. Output empty."). That is
+        \\right for that role and poison for general chat, so split on `role_label` rather than deleting it.
+        \\
+        \\**Decontaminate against your eval before training.** These are real turns, so anything you also
+        \\use as a held-out drill will be in here. Match on the normalised user turn, not just byte equality.
         \\
     , .{ id, if (label.len > 0) label else "(no label)" }) catch return;
     defer gpa.free(body);
@@ -492,6 +505,16 @@ pub fn recordCall(c_in: Call) void {
             kv(&sft, "base_url", c.base_url) catch return;
             kv(&sft, "source", @tagName(c.source)) catch return;
             kv(&sft, "role_label", c.role_label) catch return;
+            // finish_reason belongs in the TRAINING file, not only in raw.jsonl. A record that stopped
+            // on `length` is a truncated generation: the model was still mid-thought when the token
+            // budget ran out, so its completion ends mid-word and there is no answer or tool call at
+            // all. Measured on set-20260801-173947-000: 36 of 287 records (13%) — reasoning tails like
+            // "...Today is 202" and "...The goal is \"Deep-research DISTRIB". Training on those teaches
+            // a model to stop mid-thought, which is exactly the empty-reply defect that cost gary-v1
+            // seven drills. Without this field a trainer reading sft.jsonl cannot tell them from a
+            // complete record without cross-referencing raw.jsonl by timestamp, so the honest thing is
+            // to carry the flag where the filtering happens.
+            kv(&sft, "finish_reason", c.finish_reason) catch return;
             sft.print(gpa, ",\"ok\":{s},\"ts\":{d}}}\n", .{ if (c.ok) "true" else "false", nowS() }) catch return;
             appendTo(dir, "sft.jsonl", sft.items);
             // and the per-model shard: "train on only what THIS model produced"
@@ -954,6 +977,11 @@ test "a set records a full turn: sft example carries messages, tools, reasoning 
     try std.testing.expectEqualStrings("write_file", tc[0].object.get("function").?.object.get("name").?.string);
     // the tools array rides along, so tool SELECTION is trainable and not just prose
     try std.testing.expectEqual(@as(usize, 1), p.value.object.get("tools").?.array.items.len);
+    // finish_reason must reach the TRAINING file, not raw.jsonl alone. A `length` record is a
+    // truncated generation — no answer, no tool call, just a reasoning trace cut off mid-word — and a
+    // trainer reading sft.jsonl has to be able to drop it without cross-referencing raw by timestamp.
+    // 13% of the first real capture (set-20260801-173947-000) were exactly that.
+    try std.testing.expectEqualStrings("tool_calls", p.value.object.get("finish_reason").?.string);
     try std.testing.expectEqualStrings("the-veil-12b", p.value.object.get("model").?.string);
     try std.testing.expectEqualStrings("127.0.0.1:8788", p.value.object.get("provider").?.string);
 
