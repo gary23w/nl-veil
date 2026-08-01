@@ -785,6 +785,32 @@ pub fn fillRect(x: i32, y: i32, w: i32, h: i32, c: Color) void {
     rl.drawRectangle(x, y, w, h, c);
 }
 
+/// A faint square lattice inside `r` — the reading-surface grid the web client and the docs sites draw
+/// on the same kind of panel, so a chat looks like a chat everywhere. Two loops of 1px rects, no texture
+/// and no per-frame allocation; `cell` is the pitch in unscaled pixels.
+///
+/// The lines are INSET from the panel edge: `panel`/`panelBordered` round their corners at radius 7, and a
+/// full-bleed grid would paint a few stray pixels outside the curve. The inset costs one grid line at most
+/// and keeps the corner clean.
+pub fn grid(r: Rect, cell: f32, c: Color) void {
+    if (cell < 4 or r.width < cell or r.height < cell) return;
+    const inset: f32 = 3;
+    const x0 = r.x + inset;
+    const y0 = r.y + inset;
+    const w = r.width - inset * 2;
+    const h = r.height - inset * 2;
+    if (w <= 0 or h <= 0) return;
+
+    var x = x0 + cell;
+    while (x < x0 + w) : (x += cell) {
+        rl.drawRectangle(@intFromFloat(x), @intFromFloat(y0), 1, @intFromFloat(h), c);
+    }
+    var y = y0 + cell;
+    while (y < y0 + h) : (y += cell) {
+        rl.drawRectangle(@intFromFloat(x0), @intFromFloat(y), @intFromFloat(w), 1, c);
+    }
+}
+
 pub fn hline(x: i32, y: i32, w: i32, c: Color) void {
     rl.drawRectangle(x, y, w, 1, c);
 }

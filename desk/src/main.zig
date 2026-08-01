@@ -83,6 +83,16 @@ const WIN_H = 820;
 const TITLE_H = 34;
 const TAB_H = 38;
 
+// The transcript's background lattice — the same pitch and weight the web client uses (styles.css
+// .transcript), so a chat has one grain across both clients. Fine and very faint on purpose: this is the
+// texture of the surface, not a ruler, and it must never compete with a message for attention. Both
+// palettes carry it, since the line colour is `border`, which re-tints with the active theme.
+// The alpha is NOT the web's 0.30 verbatim: the desk paints this on `bg_dark`, which sits closer to
+// `border` than the web transcript's `bg` does, so the same alpha would come out fainter here. 58/255
+// lands the composited line within a shade or two of the web client's in both palettes.
+const CHAT_GRID_CELL: f32 = 22;
+const CHAT_GRID_ALPHA: u8 = 58;
+
 // Titlebar interactive zones — ONE definition shared by drawTitlebar (pixels) and handleWindowChrome
 // (drag hit-test) so the drag zone and the rendered rects can't drift apart.
 fn tbFileRect() t.Rect {
@@ -4077,6 +4087,10 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
     }
     const view = t.Rect{ .x = r.x, .y = r.y + tab_h + 6, .width = r.width, .height = r.height - input_h - status_h - 14 - tab_h - 6 };
     t.panelBordered(view, t.bg_dark, t.border);
+    // The transcript reads as a surface rather than a void. Drawn on the panel, BEFORE the messages and
+    // outside the scroll scissor, so it stays pinned to the frame instead of sliding with the text — the
+    // same behaviour the web client gets from a non-`local` background-attachment.
+    t.grid(view, CHAT_GRID_CELL, t.withAlpha(t.border, CHAT_GRID_ALPHA));
 
     const fsz: i32 = 14;
     const cols = monoCols(view.width - 28, fsz);

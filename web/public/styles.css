@@ -46,6 +46,9 @@
   --tonal:         color-mix(in srgb, var(--accent) 14%, transparent);
   --tonal-hover:   color-mix(in srgb, var(--accent) 25%, transparent);
   --on-accent:     #fafbff;
+  /* the transcript's background lattice — derived from the border so it
+     re-tints with any fetched theme, exactly like every other surface fill */
+  --grid-line:     color-mix(in srgb, var(--border) 30%, transparent);
 
   /* chat roles */
   --role-user:      var(--cyan);
@@ -664,7 +667,20 @@ table.data td.num { text-align: right; font-variant-numeric: tabular-nums; }
 }
 .chat-back { display: none; }
 
-.transcript { padding: var(--pad); }
+/* The transcript reads as a surface rather than a void: a fine, very faint
+   lattice at the same pitch the desk draws (main.zig CHAT_GRID_CELL), so a chat
+   has one grain across both clients.
+
+   background-attachment stays at its `scroll` default, which on an overflow
+   container pins the background to the element's own box — the grid holds still
+   while the messages move over it. `local` would drag it along with them. */
+.transcript {
+  padding: var(--pad);
+  background-image:
+    linear-gradient(to right, var(--grid-line) 1px, transparent 1px),
+    linear-gradient(to bottom, var(--grid-line) 1px, transparent 1px);
+  background-size: 22px 22px;
+}
 
 /* ---------------- messages ---------------- */
 .msg { margin-bottom: 18px; max-width: 900px; }
