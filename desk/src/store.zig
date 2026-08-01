@@ -865,6 +865,10 @@ pub const Store = struct {
     bi_params_b: u32 = 0,
     bi_arch: [24]u8 = undefined,
     bi_arch_len: u8 = 0,
+    bi_gpu: [64]u8 = undefined, // the accelerator the runtime can see ("" = none)
+    bi_gpu_len: u8 = 0,
+    bi_gpu_layers: u32 = 0, // where the offload fit landed (0 = CPU serving)
+    bi_tps10: u32 = 0, // measured decode rate, tenths of a token/s (0 = not measured yet)
     bi_err: [160]u8 = undefined,
     bi_err_len: u8 = 0,
     // the update lane (never|checking|current|update|failed) + what a pull would install

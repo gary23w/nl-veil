@@ -3342,7 +3342,7 @@ async function refreshBuiltinPanel() {
   let line = '';
   if (!j.compiled) line = 'not compiled into this server build (-Dbuiltin=false)';
   else if (busy) line = j.state + (j.bytes_total ? ` — ${j.pct}% (${mb(j.bytes_done)} / ${mb(j.bytes_total)} MB)` : '…');
-  else if (served) line = `ready to serve (${j.arch || '?'} · ${j.params_b || '?'}B · ${j.ctx || '?'} ctx window)`;
+  else if (served) line = `ready to serve (${j.arch || '?'} · ${j.params_b || '?'}B · ${j.ctx || '?'} ctx window${j.gpu && j.gpu_layers > 0 ? ' · GPU: ' + j.gpu + (j.gpu_layers < 999 ? ` [${j.gpu_layers} layers]` : '') : ' · CPU'}${j.decode_tps10 ? ' · ≈' + (j.decode_tps10 / 10).toFixed(1) + ' tok/s' : ''})`;
   else if (j.state === 'failed') line = 'failed: ' + (j.err || 'unknown');
   else line = 'weights not downloaded yet — pull them from ' + j.repo + ' (about 7 GB, verified)';
   // the update lane, shown only when something is installed: a check compares the store's sha

@@ -34,6 +34,28 @@
             .hash = "N-V-__8AAATougkyBgkEUyIB0p6OIvQe9n-O1DPDXPIvSZ_Z",
             .lazy = true,
         },
+        // The GPU (Vulkan) tier of the built-in engine (-Dvulkan, default true off macOS).
+        // veil_vulkan_shaders is OUR pre-generated artifact (a build-assets release on this very
+        // repo): the backend's 134 compute shaders compiled to embedded SPIR-V once, with the
+        // define set build.zig's addVulkan mirrors — so user/CI builds never need a Vulkan SDK or
+        // glslc. Regenerate + republish when the llama_cpp pin changes (release notes say how).
+        // vulkan_headers is the matching Khronos header-only package; no import library is linked
+        // anywhere — the backend dlopens the runtime loader, so GPU-less machines still boot.
+        .veil_vulkan_shaders = .{
+            .url = "https://github.com/gary23w/nl-veil/releases/download/builtin-assets-b10205/veil-vulkan-shaders-b10205.tar.gz",
+            .hash = "N-V-__8AAD6zbAyRnTagRx-GpjW08tC8BS_28BrLt5ZP_1k0",
+            .lazy = true,
+        },
+        .vulkan_headers = .{
+            .url = "https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/vulkan-sdk-1.4.350.0.tar.gz",
+            .hash = "N-V-__8AAPnEbQK6L3hGtJefy0xZjeg7KOxIEj8_obZC2_lF",
+            .lazy = true,
+        },
+        .spirv_headers = .{
+            .url = "https://github.com/KhronosGroup/SPIRV-Headers/archive/refs/tags/vulkan-sdk-1.4.350.0.tar.gz",
+            .hash = "N-V-__8AAOWAPQDTQrudoJ1kyAzjkh3mLopx0pq3uHSy2LDi",
+            .lazy = true,
+        },
     },
     .paths = .{
         "build.zig",
