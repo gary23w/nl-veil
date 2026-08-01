@@ -18,6 +18,7 @@ const llm = @import("llm.zig");
 const modelcfg = @import("modelcfg"); // a MODULE (this dir's modelcfg.zig) — shared with the compiled-in desk
 const httpc = @import("httpc.zig");
 const tools = @import("tools.zig");
+const dataset = @import("dataset.zig"); // training-set capture (this process records as `swarm`)
 const depprobe = @import("deps.zig"); // aliased: `deps` is already a local name for project-dependency strings all over this file
 const commons = @import("commons.zig");
 const oscillation = @import("oscillation.zig");
@@ -583,6 +584,13 @@ fn prefetchPacks(w: *Worker, goal: []const u8, egress_allow: []const u8) void {
 }
 
 pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, run_dir: []const u8, neuron_bin: []const u8, cli_model: []const u8) !void {
+    // TRAINING-SET CAPTURE in a swarm worker. A mind is a separate PROCESS, so it learns where the
+    // sets live from NL_SETS_DIR (the supervisor injects it); with no such env this stays inert and
+    // the worker records nothing. The marker file inside that dir is the live on/off switch, so a
+    // set opened AFTER this worker started is still picked up on its next call.
+    dataset.configure(gpa, io, environ, "");
+    dataset.setSource(.swarm);
+
     const mani_path = try std.fmt.allocPrint(gpa, "{s}/swarm.json", .{run_dir});
     defer gpa.free(mani_path);
     const mani_raw = std.Io.Dir.cwd().readFileAlloc(io, mani_path, gpa, .limited(256 << 10)) catch {

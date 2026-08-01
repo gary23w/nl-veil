@@ -21,6 +21,7 @@ const pixelrag = @import("pixelrag.zig");
 const deps = @import("deps.zig");
 const ragmirror = @import("ragmirror.zig");
 const recipes = @import("recipes.zig"); // recipe tools: DATA sequences over already-allowed tools (Feature: granted recipes)
+const dataset = @import("dataset.zig"); // training-set capture — the tool-execution half of a set
 const cpaths = @import("chat/paths.zig"); // sub-chat family base for recall (chat:<parent>__sN → chat:<parent>)
 
 /// Injected into an authored tool's Python body ONLY when NL_BROWSER_DRIVER is enabled: a `browser(action,
@@ -1206,7 +1207,39 @@ fn grantedRecipe(ctx: *ToolCtx, name: []const u8) ?*const recipes.Recipe {
 
 /// Run one tool. `args_json` is the raw arguments string from the tool_call. Returns a gpa-owned result
 /// (caller frees) — always a string, even on error, so it can feed back to the model.
+///
+/// TRAINING CAPTURE rides this one dispatcher (see worker/dataset.zig): every tool the model runs —
+/// chat turn or swarm mind, built-in or recipe, allowed or refused — passes through here exactly once
+/// per call, with the arguments it asked for and the result it will read. That pair is "how the AI
+/// builds", and it is recorded only while a set is open (one atomic load otherwise).
 pub fn execute(ctx: *ToolCtx, name: []const u8, args_json: []const u8) []u8 {
+    if (dataset.armed()) return executeRecorded(ctx, name, args_json);
+    return executeInner(ctx, name, args_json);
+}
+
+/// execute() with the training-set record around it. Split out so the hot path (no set recording)
+/// carries nothing but the atomic load above — no timer, no extra frame.
+fn executeRecorded(ctx: *ToolCtx, name: []const u8, args_json: []const u8) []u8 {
+    const t0 = std.Io.Timestamp.now(ctx.io, .real).nanoseconds;
+    const out = executeInner(ctx, name, args_json);
+    const ms: u64 = @intCast(@max(@divTrunc(std.Io.Timestamp.now(ctx.io, .real).nanoseconds - t0, std.time.ns_per_ms), 0));
+    // A tool reports failure in its RESULT TEXT (the string the model reads), never out-of-band —
+    // so the record's `ok` reads the same signal the model does rather than inventing a new one.
+    const ok = !(std.mem.startsWith(u8, out, "error") or std.mem.startsWith(u8, out, "ERROR") or
+        std.mem.startsWith(u8, out, "refused") or std.mem.eql(u8, out, SANDBOX_REFUSAL));
+    dataset.recordTool(.{
+        .name = name,
+        .args_json = args_json,
+        .result = out,
+        .ok = ok,
+        .ms = ms,
+        .mind = ctx.mind,
+        .round = ctx.round,
+    });
+    return out;
+}
+
+fn executeInner(ctx: *ToolCtx, name: []const u8, args_json: []const u8) []u8 {
     const gpa = ctx.gpa;
     // THE SANDBOX GATE. First thing in the dispatcher, before any tool-specific logic, so there is exactly one
     // place a capability decision is made. A sandboxed caller passes a name iff it is on the built-in sandbox
@@ -4511,10 +4544,18 @@ test "isBuiltinTool claims every name execute() can dispatch (reads the dispatch
     // built-in. Rather than trusting a second hand-copied list, read execute()'s source and assert every
     // literal it routes on is claimed. The trio routing audit uses this same read-your-own-source trick.
     const src = @embedFile("tools.zig"); // this file, read as text — same trick trio_routing_test uses
-    const start = std.mem.indexOf(u8, src, "pub fn execute(ctx: *ToolCtx") orelse return error.TestUnexpectedResult;
-    // execute() ends where the next top-level decl begins — the first line-start "fn " after it.
+    // ANCHOR ON executeInner, NOT on `pub fn execute`. The public entry is now a two-line wrapper (the
+    // training-set capture split), and anchoring there would scan a body with no dispatch arms in it —
+    // the loops below would find nothing and this audit would pass VACUOUSLY while the real dispatcher
+    // drifted. executeInner IS the dispatcher; assert it exists so a future rename fails loudly here
+    // instead of quietly disarming the check.
+    const start = std.mem.indexOf(u8, src, "fn executeInner(ctx: *ToolCtx") orelse return error.TestUnexpectedResult;
+    // the dispatcher ends where the next top-level decl begins — the first line-start "fn " after it.
     const end = std.mem.indexOfPos(u8, src, start + 40, "\nfn ") orelse src.len;
     const body = src[start..end];
+    // and the body it found must actually BE the dispatcher: a handful of arms at minimum, or the
+    // anchor moved and this test is auditing the wrong function.
+    try std.testing.expect(std.mem.count(u8, body, "eql(u8, name, \"") > 10);
 
     // every `std.mem.eql(u8, name, "X")` — the exact-match dispatch arms
     var i: usize = 0;

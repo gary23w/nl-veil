@@ -57,6 +57,7 @@ const llamaeng = if (HAS_BUILTIN) @import("worker/llamaeng.zig") else struct {};
 const builtin_state = @import("worker/builtin.zig");
 const builtin_endpoint = @import("worker/builtin_endpoint.zig");
 const modelpull = @import("worker/modelpull.zig");
+const dataset = @import("worker/dataset.zig");
 
 // .info, explicitly: the default log_level tracks the optimize mode, and the ReleaseFast default (.err)
 // would silently swallow every operational message below — including the one-shot generated-admin-password
@@ -601,6 +602,13 @@ pub fn main(init: std.process.Init) !void {
     // it just reports compiled:false and resolution says unavailable.
     builtin_state.init(io, init.environ_map, paths.data);
     modelpull.configure(gpa, io, init.environ_map);
+
+    // ---- TRAINING-SET CAPTURE ("build dataset") ----
+    // Inert until a set is opened. Configured here so the sets root exists before the first turn,
+    // and so a set left recording across a restart is adopted rather than orphaned. This process
+    // serves the chat surface, so its records are tagged `chat`; a swarm worker tags its own `swarm`.
+    dataset.configure(gpa, io, init.environ_map, paths.data);
+    dataset.setSource(.chat);
     if (comptime HAS_BUILTIN) {
         llamaeng.configure(gpa, io, init.environ_map, builtin_state.modelPath());
         modelpull.on_store_change = builtinStoreChanged;
@@ -717,6 +725,11 @@ pub fn main(init: std.process.Init) !void {
     router.post("/api/v1/models/builtin/import", builtinImport, .{});
     router.post("/api/v1/models/builtin/check", builtinCheck, .{});
     router.delete("/api/v1/models/builtin", builtinDelete, .{});
+    // TRAINING SETS ("build dataset"): start/stop recording, and list what has been captured. Authed
+    // like the other host-inspection routes — a set is a verbatim transcript of this user's work.
+    router.get("/api/v1/dataset", datasetStatus, .{});
+    router.post("/api/v1/dataset/start", datasetStart, .{});
+    router.post("/api/v1/dataset/stop", datasetStop, .{});
     router.post("/api/v1/oauth/cloudflare/start", cf_oauth.start, .{});
     router.get("/api/v1/oauth/cloudflare/callback", cf_oauth.callback, .{});
     router.get("/api/v1/oauth/cloudflare/status", cf_oauth.status, .{});
@@ -1152,6 +1165,71 @@ fn healthDeps(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
 }
 
 // ---- the BUILT-IN model routes -------------------------------------------------------------------
+
+// ---- TRAINING SETS ("build dataset") --------------------------------------------------------------
+
+/// GET /api/v1/dataset → {recording, id, counts, root, sets:[…]}. One read for the whole panel: is a
+/// set open, what has it captured so far, and what sets already exist (each entry is that set's own
+/// meta.json, so the listing cannot drift from the set).
+fn datasetStatus(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
+    _ = http.requireUser(app, req, res) orelse return;
+    const s = dataset.status();
+    var sets: std.ArrayListUnmanaged(u8) = .empty;
+    dataset.listInto(res.arena, &sets);
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    try out.print(res.arena, "{{\"ok\":true,\"configured\":{s},\"recording\":{s}", .{
+        if (s.configured) "true" else "false",
+        if (s.recording) "true" else "false",
+    });
+    try out.appendSlice(res.arena, ",\"id\":");
+    try http.jstr(res.arena, &out, s.id);
+    try out.appendSlice(res.arena, ",\"root\":");
+    try http.jstr(res.arena, &out, s.root);
+    try out.print(res.arena, ",\"calls\":{d},\"examples\":{d},\"tool_runs\":{d},\"sets\":[", .{ s.calls, s.examples, s.tools });
+    try out.appendSlice(res.arena, sets.items);
+    try out.appendSlice(res.arena, "]}");
+    res.content_type = .JSON;
+    res.body = out.items;
+}
+
+/// POST /api/v1/dataset/start {label?} → begin capturing every LLM call and tool run, from any
+/// surface, into a new set. 409 when one is already open (two writers into one set interleave).
+fn datasetStart(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
+    _ = http.requireUser(app, req, res) orelse return;
+    var label: []const u8 = "";
+    if (req.body()) |b| {
+        const parsed = std.json.parseFromSlice(std.json.Value, res.arena, b, .{}) catch null;
+        if (parsed) |p| if (p.value == .object) if (p.value.object.get("label")) |v| if (v == .string) {
+            label = v.string;
+        };
+    }
+    const id = dataset.start(label) catch |e| {
+        res.status = switch (e) {
+            error.AlreadyRecording => 409,
+            error.NotConfigured => 503,
+            else => 500,
+        };
+        try res.json(.{ .ok = false, .@"error" = switch (e) {
+            error.AlreadyRecording => "a dataset is already recording — stop it first",
+            error.NotConfigured => "the recorder is not ready",
+            else => "could not create the set directory",
+        } }, .{});
+        return;
+    };
+    try res.json(.{ .ok = true, .id = id, .recording = true }, .{});
+}
+
+/// POST /api/v1/dataset/stop → close the set out: drop the marker (every process stops capturing on
+/// its next call) and finalize meta.json with the observed counts.
+fn datasetStop(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
+    _ = http.requireUser(app, req, res) orelse return;
+    dataset.stop() catch |e| {
+        res.status = if (e == error.NotRecording) 409 else 503;
+        try res.json(.{ .ok = false, .@"error" = if (e == error.NotRecording) "no dataset is recording" else "the recorder is not ready" }, .{});
+        return;
+    };
+    try res.json(.{ .ok = true, .recording = false }, .{});
+}
 
 /// modelpull's store-change hook: re-point the engine at whatever the store now elects. Runs on the
 /// pull/import thread; repoint is thread-safe. Only referenced from the comptime HAS_BUILTIN branch

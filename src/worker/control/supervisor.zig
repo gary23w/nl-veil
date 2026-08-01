@@ -3,6 +3,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const crypto = @import("../../config/key_vault.zig");
+const dataset = @import("../dataset.zig"); // training-set root, injected so a mind records into the same set
 const NeuronLedger = @import("../../plan/neurons.zig").NeuronLedger;
 const cpaths = @import("../chat/paths.zig"); // conv → build-tree mapping (scheduled runs → _sched/{task}/runs/)
 
@@ -177,11 +178,13 @@ pub const Supervisor = struct {
             .stderr = .ignore,
             .create_no_window = true, // don't pop a console window per worker on Windows (windowless parent)
         };
-        var child_env: ?std.process.Environ.Map = if (self.parent_env) |penv| self.encInjectEnv(penv, run_dir) else null;
-        defer if (child_env) |*m| m.deinit();
-        if (child_env) |*m| opts.environ_map = m;
+        var child_env: ?ChildEnv = if (self.parent_env) |penv| self.childEnv(penv, run_dir) else null;
+        defer if (child_env) |*ce| ce.map.deinit();
+        if (child_env) |*ce| opts.environ_map = &ce.map;
         const child = try std.process.spawn(self.io, opts);
-        return .{ .child = child, .encrypted = child_env != null };
+        // `encrypted` is the SEALED-KEYS signal, not "did we build an env" — a child env may exist
+        // only to carry the training-set root, which is not a credential fact.
+        return .{ .child = child, .encrypted = if (child_env) |ce| ce.encrypted else false };
     }
 
     pub fn spawn(self: *Supervisor, uid: u64, id: []const u8, name: []const u8, run_dir: []const u8, model: []const u8, minds: usize) !*Swarm {
@@ -242,20 +245,37 @@ pub const Supervisor = struct {
         log.info("auto-restarted crashed swarm {s} (restart {d}/{d})", .{ id, sw.restarts, MAX_RESTARTS });
     }
 
-    fn encInjectEnv(self: *Supervisor, penv: *const std.process.Environ.Map, run_dir: []const u8) ?std.process.Environ.Map {
-        var ebuf: [1280]u8 = undefined;
-        const p = std.fmt.bufPrint(&ebuf, "{s}/keys.env.enc", .{run_dir}) catch return null;
-        const b64 = std.Io.Dir.cwd().readFileAlloc(self.io, p, self.gpa, .limited(8 << 10)) catch return null;
-        defer self.gpa.free(b64);
-        const pt = crypto.open(self.gpa, self.server_key, std.mem.trim(u8, b64, " \r\n\t")) orelse return null;
-        defer self.gpa.free(pt);
-        var m = penv.clone(self.gpa) catch return null;
-        var it = std.mem.tokenizeAny(u8, pt, "\r\n");
-        while (it.next()) |line| {
-            const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
-            m.put(line[0..eq], line[eq + 1 ..]) catch {};
+    /// The child's environment, or null to inherit the parent's unchanged. TWO independent reasons to
+    /// build one, so the result says which applied: the run's sealed keys (the `encrypted` signal the
+    /// caller reports back), and the training-set root (NL_SETS_DIR) so a mind's LLM calls and tool
+    /// runs land in the SAME set the server is recording — a worker is a separate process and has no
+    /// other way to find it. Neither present ⇒ null ⇒ the parent env, exactly as before.
+    const ChildEnv = struct { map: std.process.Environ.Map, encrypted: bool };
+
+    fn childEnv(self: *Supervisor, penv: *const std.process.Environ.Map, run_dir: []const u8) ?ChildEnv {
+        const sets = dataset.setsDir();
+        var keys: ?[]u8 = null;
+        defer if (keys) |k| self.gpa.free(k);
+        {
+            var ebuf: [1280]u8 = undefined;
+            if (std.fmt.bufPrint(&ebuf, "{s}/keys.env.enc", .{run_dir})) |p| {
+                if (std.Io.Dir.cwd().readFileAlloc(self.io, p, self.gpa, .limited(8 << 10))) |b64| {
+                    defer self.gpa.free(b64);
+                    keys = crypto.open(self.gpa, self.server_key, std.mem.trim(u8, b64, " \r\n\t"));
+                } else |_| {}
+            } else |_| {}
         }
-        return m;
+        if (keys == null and sets.len == 0) return null;
+        var m = penv.clone(self.gpa) catch return null;
+        if (sets.len > 0) m.put("NL_SETS_DIR", sets) catch {};
+        if (keys) |pt| {
+            var it = std.mem.tokenizeAny(u8, pt, "\r\n");
+            while (it.next()) |line| {
+                const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+                m.put(line[0..eq], line[eq + 1 ..]) catch {};
+            }
+        }
+        return .{ .map = m, .encrypted = keys != null };
     }
 
     pub fn get(self: *Supervisor, id: []const u8) ?*Swarm {

@@ -17,6 +17,11 @@ __pycache__/
 # Runtime: per-run swarm dirs (work, sqlite memory, event streams)
 data/
 
+# Captured training sets ("build dataset"). These live at {data}/sets/ — already covered by data/
+# above — but NL_SETS_DIR can point anywhere, including the repo root, and a set is multi-MB of
+# verbatim conversation content: never committable, and never something to leak into a PR by accident.
+sets/
+
 # Runtime neuron-db files a local dev run drops at the repo root
 neurons.db
 neurons.db-*

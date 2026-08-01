@@ -11,6 +11,7 @@ const httpc = @import("httpc.zig");
 const rate = @import("rate.zig");
 const fakehttp = @import("fakehttp.zig"); // TEST ONLY: the canned gateway the H11 test at the bottom dials
 const gemma4 = @import("gemma4.zig"); // engine-side wire format, used when a backend fails the name-binding probe
+const dataset = @import("dataset.zig"); // training-set capture — inert unless a set is recording
 
 pub const Reply = struct {
     content: []u8,
@@ -542,12 +543,17 @@ fn completeOllamaNative(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8,
     const t1 = std.Io.Timestamp.now(io, .real);
     if (!r.ok) return .{ .content = r.content, .reasoning = gpa.dupe(u8, "") catch @constCast(""), .calls = &.{}, .ok = false };
     defer gpa.free(r.content);
-    return parseOllamaNative(gpa, base_url, r.content, .{
+    const ms: u64 = @intCast(@max(@divTrunc(t1.nanoseconds - t0, std.time.ns_per_ms), 0));
+    const step = parseOllamaNative(gpa, base_url, r.content, .{
         .tag = tag,
         .model = model,
-        .ms = @intCast(@max(@divTrunc(t1.nanoseconds - t0, std.time.ns_per_ms), 0)),
+        .ms = ms,
         .ts = t1.toSeconds(),
     });
+    // the native transport reports its counts inside parseOllamaNative; the record carries the ones
+    // the recorder can see without re-parsing, and raw.jsonl keeps the whole response either way
+    recordDataset(gpa, tag, model, base_url, body, &step, ms, 0, 0, false);
+    return step;
 }
 
 /// Post an engine-rendered prompt to /api/generate with raw:true, bypassing the backend's own renderer, and
@@ -626,12 +632,16 @@ fn completeGemma4Raw(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, ta
             gpa.free(args);
         };
     }
-    return Step{
+    const step = Step{
         .content = gpa.dupe(u8, reply.content) catch @constCast(""),
         .reasoning = gpa.dupe(u8, reply.thinking) catch @constCast(""),
         .calls = calls.toOwnedSlice(gpa) catch &.{},
         .ok = true,
     };
+    // raw_prompt: this path ships a PRE-RENDERED wire-format prompt, not a messages array, so the
+    // recorder keeps it verbatim in raw.jsonl instead of inventing an OpenAI example for it.
+    recordDataset(gpa, tag, model, base_url, body, &step, @intCast(@max(@divTrunc(t1.nanoseconds - t0, std.time.ns_per_ms), 0)), 0, 0, true);
+    return step;
 }
 
 /// The num_ctx actually requested: never MORE than the model's probed maximum (asking beyond it is silently
@@ -1461,9 +1471,13 @@ fn completeBodyH(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: [
     const parsed = std.json.parseFromSlice(Resp, gpa, r.content, .{ .ignore_unknown_fields = true }) catch
         return stepErr(gpa, std.fmt.allocPrint(gpa, "bad LLM response: {s}", .{r.content[0..@min(r.content.len, 300)]}) catch "unparseable response");
     defer parsed.deinit();
+    var ds_in: u64 = 0; // this call's token counts, hoisted for the dataset record at the tail
+    var ds_out: u64 = 0;
     if (parsed.value.usage) |u| {
         const nested: u64 = if (u.prompt_tokens_details) |d| d.cached_tokens else 0;
         const cached = @max(nested, @max(u.prompt_cache_hit_tokens, u.cached_tokens));
+        ds_in = u.prompt_tokens;
+        ds_out = u.completion_tokens;
         if (isLocal(base_url)) {
             _ = tokens_in_free.fetchAdd(u.prompt_tokens, .monotonic);
             _ = tokens_out_free.fetchAdd(u.completion_tokens, .monotonic);
@@ -1510,7 +1524,9 @@ fn completeBodyH(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: [
     const content = gpa.dupe(u8, msg.content orelse "") catch return stepErr(gpa, "oom");
     const reasoning = gpa.dupe(u8, msg.reasoning orelse msg.reasoning_content orelse "") catch return stepErr(gpa, "oom");
     const trunc = if (parsed.value.choices[0].finish_reason) |fr| std.mem.eql(u8, fr, "length") else false;
-    return .{ .content = content, .reasoning = reasoning, .calls = calls.toOwnedSlice(gpa) catch &.{}, .ok = true, .truncated = trunc };
+    const step = Step{ .content = content, .reasoning = reasoning, .calls = calls.toOwnedSlice(gpa) catch &.{}, .ok = true, .truncated = trunc };
+    recordDataset(gpa, tag, model, base_url, body, &step, @intCast(@max(call_ms, 0)), ds_in, ds_out, false);
+    return step;
 }
 
 // ============================================================================
@@ -2340,7 +2356,9 @@ fn streamAttempt(
             };
             meterStream(&st, local, streamAttrib(io, tag, model, base_url, call_t0));
             reported = true;
-            return .{ .content = c_owned, .reasoning = r_owned, .calls = calls, .ok = true, .truncated = st.truncated };
+            const step = Step{ .content = c_owned, .reasoning = r_owned, .calls = calls, .ok = true, .truncated = st.truncated };
+            recordDataset(gpa, tag, model, base_url, body, &step, @intCast(@max(@divTrunc(std.Io.Timestamp.now(io, .real).nanoseconds - call_t0, std.time.ns_per_ms), 0)), st.p_in, st.p_out, false);
+            return step;
         }
         freeCalls(gpa, calls); // couldn't reconstruct (native miss, or hosted fragments with no usable name) → complete()
         return null;
@@ -2355,7 +2373,60 @@ fn streamAttempt(
     };
     meterStream(&st, local, streamAttrib(io, tag, model, base_url, call_t0));
     reported = true;
-    return .{ .content = c_owned, .reasoning = r_owned, .calls = &.{}, .ok = true, .truncated = st.truncated };
+    const step = Step{ .content = c_owned, .reasoning = r_owned, .calls = &.{}, .ok = true, .truncated = st.truncated };
+    // THE headline record: the streamed chat answer is the turn the user actually saw.
+    recordDataset(gpa, tag, model, base_url, body, &step, @intCast(@max(@divTrunc(std.Io.Timestamp.now(io, .real).nanoseconds - call_t0, std.time.ns_per_ms), 0)), st.p_in, st.p_out, false);
+    return step;
+}
+
+/// Hand one completed call to the training-set recorder. Inert (one atomic load) unless a set is
+/// recording — this sits on every completion path, so it must cost nothing when it is off.
+///
+/// The assistant's tool calls are rebuilt into OpenAI WIRE shape here rather than in dataset.zig:
+/// `ToolCall.args` holds the DECODED argument text on both transports (the OpenAI path parses the
+/// JSON string out, the native path stringifies the object), and a training record wants what the
+/// wire format wants — `arguments` as a JSON string. Doing it at the one place that knows the
+/// transport keeps the recorder transport-agnostic.
+fn recordDataset(
+    gpa: std.mem.Allocator,
+    tag: []const u8,
+    model: []const u8,
+    base_url: []const u8,
+    body: []const u8,
+    step: *const Step,
+    ms: u64,
+    tok_in: u64,
+    tok_out: u64,
+    raw_prompt: bool,
+) void {
+    if (!dataset.armed()) return;
+    var tc: std.ArrayListUnmanaged(u8) = .empty;
+    defer tc.deinit(gpa);
+    for (step.calls, 0..) |c, i| {
+        if (i > 0) tc.append(gpa, ',') catch return;
+        tc.appendSlice(gpa, "{\"id\":") catch return;
+        jstr(gpa, &tc, c.id) catch return;
+        tc.appendSlice(gpa, ",\"type\":\"function\",\"function\":{\"name\":") catch return;
+        jstr(gpa, &tc, c.name) catch return;
+        tc.appendSlice(gpa, ",\"arguments\":") catch return;
+        jstr(gpa, &tc, c.args) catch return;
+        tc.appendSlice(gpa, "}}") catch return;
+    }
+    dataset.recordCall(.{
+        .role_label = tag,
+        .model = model,
+        .base_url = base_url,
+        .request_body = body,
+        .content = step.content,
+        .reasoning = step.reasoning,
+        .tool_calls = tc.items,
+        .finish_reason = if (step.truncated) "length" else if (step.calls.len > 0) "tool_calls" else "stop",
+        .ok = step.ok,
+        .ms = ms,
+        .tokens_in = tok_in,
+        .tokens_out = tok_out,
+        .raw_prompt = raw_prompt,
+    });
 }
 
 fn trimSlash(s: []const u8) []const u8 {
