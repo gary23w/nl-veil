@@ -1,0 +1,322 @@
+/* ============================================================================
+   nl-veil docs — the design system
+   Every token below is the SAME token the product uses: the palette is lifted
+   from desk/src/theme.zig, the geometry from theme.zig:381-389, and the type
+   stack from web/public/styles.css. The site, the web client and the desktop
+   shell read as one product because they are literally the same values.
+   LIGHT is the default in all three (theme.zig:207).
+   ========================================================================= */
+
+:root {
+  /* ---- palette: light (theme.zig light_palette) ---- */
+  --bg:      #f5f7fb;
+  --bg-dark: #e9edf5;
+  --bg-hl:   #dfe7f4;
+  --bg-sel:  #cfdcf3;
+  --fg:      #14182b;
+  --fg-dim:  #46557a;
+  --comment: #6d7a99;
+  --border:  #d3dbe9;
+  --blue:    #2f6feb;
+  --cyan:    #0b84a5;
+  --green:   #2f8f46;
+  --magenta: #8a3ffc;
+  --orange:  #c27a00;
+  --red:     #c93a4a;
+  --yellow:  #a06a00;
+  --teal:    #0f8a83;
+  --on-accent: #fafbff;
+
+  /* ---- semantic aliases: name things by job, not by hue ----
+     The 16 slots above stay VERBATIM — a theme.zig palette or a Lua theme drops
+     straight in. The text-carrying aliases below are each pushed a fixed step
+     toward --fg: the palette is tuned for app chrome, and this page puts the
+     same colours in 11-13px running prose, where the raw slots land just under
+     the 4.5:1 floor. Because the step is toward --fg it darkens on light and
+     lightens on dark — one rule, every scheme, hue unchanged. */
+  --surface:          var(--bg);
+  --surface-raised:   var(--bg-dark);
+  --surface-hover:    var(--bg-hl);
+  --surface-selected: var(--bg-sel);
+  --text:             var(--fg);
+  --text-secondary:   var(--fg-dim);
+  --text-muted:       color-mix(in srgb, var(--comment) 70%, var(--fg));
+  --accent:           color-mix(in srgb, var(--blue) 82%, var(--fg));
+  --danger:           color-mix(in srgb, var(--red) 84%, var(--fg));
+  --success:          color-mix(in srgb, var(--green) 80%, var(--fg));
+  --warn:             color-mix(in srgb, var(--orange) 70%, var(--fg));
+  --brand:            color-mix(in srgb, var(--magenta) 84%, var(--fg));
+  --accent-teal:      color-mix(in srgb, var(--teal) 76%, var(--fg));
+  --role-user:        color-mix(in srgb, var(--cyan) 78%, var(--fg));
+  --role-assistant:   var(--brand);
+
+  /* derived fills — the desk alpha-blends these over bg_hl at draw time */
+  --code-bg:       color-mix(in srgb, var(--bg-hl) 67%, transparent);
+  --chip-bg:       color-mix(in srgb, var(--bg-hl) 82%, transparent);
+  --table-head-bg: color-mix(in srgb, var(--bg-hl) 51%, transparent);
+  --table-zebra:   color-mix(in srgb, var(--bg-hl) 22%, transparent);
+  --tonal:         color-mix(in srgb, var(--accent) 14%, transparent);
+  --tonal-hover:   color-mix(in srgb, var(--accent) 25%, transparent);
+
+  /* ---- type ---- */
+  --font-ui: Calibri, Corbel, Candara, "Segoe UI", -apple-system, "Helvetica Neue",
+             "DejaVu Sans", "Liberation Sans", sans-serif;
+  --font-mono: Consolas, "Lucida Console", Menlo, "SF Mono", "DejaVu Sans Mono",
+               "Liberation Mono", monospace;
+
+  --fs-display: 26px;
+  --fs-title:   20px;
+  --fs-h1:      22px;
+  --fs-h2:      19px;
+  --fs-h3:      17px;
+  --fs-body:    14px;
+  --fs-ui:      13px;
+  --fs-small:   12px;
+  --fs-micro:   11px;
+  --lh-body:    1.5;
+
+  /* ---- geometry (theme.zig:381-389) ---- */
+  --pad:     16px;
+  --pad-in:  12px;
+  --gap:     12px;
+  --radius:      7px;
+  --radius-btn:  8px;
+  --radius-pill: 999px;
+  --field-h:  34px;
+  --topbar-h: 52px;
+
+  /* ---- the site's own long-form measures (the product has no prose column) ---- */
+  --page:    1180px;
+  --measure: 68ch;
+  --section-gap: clamp(56px, 8vw, 104px);
+
+  color-scheme: light;
+}
+
+/* The toggle wins in BOTH directions, so a reader who picks light on a dark OS
+   keeps light. The OS preference only decides the unset case, which the inline
+   boot script in <head> resolves before first paint. */
+:root[data-theme="dark"] {
+  --bg:      #1a1b26;
+  --bg-dark: #16161e;
+  --bg-hl:   #1f2335;
+  --bg-sel:  #283457;
+  --fg:      #e9edfa;
+  --fg-dim:  #a9b1d6;
+  --comment: #565f89;
+  --border:  #292e42;
+  --blue:    #7aa2f7;
+  --cyan:    #7dcfff;
+  --green:   #9ece6a;
+  --magenta: #bb9af7;
+  --orange:  #ff9e64;
+  --red:     #f7768e;
+  --yellow:  #e0af68;
+  --teal:    #2ac3de;
+  --on-accent: #141620;
+  color-scheme: dark;
+}
+
+/* The third shipped theme (theme.zig matrix_palette). Like the desk, it also
+   puts the WHOLE page in the mono face — the console font is as much the theme
+   as the palette. */
+:root[data-theme="matrix"] {
+  --bg:      #061106;
+  --bg-dark: #030a03;
+  --bg-hl:   #0b200e;
+  --bg-sel:  #134020;
+  --fg:      #4aff7f;
+  --fg-dim:  #2fd465;
+  --comment: #1d9448;
+  --border:  #15421f;
+  --blue:    #3bff9d;
+  --cyan:    #00ffd0;
+  --green:   #00ff41;
+  --magenta: #bd66ff;
+  --orange:  #ffa028;
+  --red:     #ff4d4d;
+  --yellow:  #ffd93b;
+  --teal:    #00c9a0;
+  --on-accent: #030a03;
+  --font-ui: var(--font-mono);
+  color-scheme: dark;
+}
+
+/* ============================================================ base */
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+html {
+  scroll-behavior: smooth;
+  /* the sticky topbar must not sit on top of the heading a #link just jumped to */
+  scroll-padding-top: calc(var(--topbar-h) + 18px);
+}
+@media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+
+body {
+  font-family: var(--font-ui);
+  font-size: var(--fs-body);
+  line-height: var(--lh-body);
+  color: var(--text);
+  background: var(--surface);
+  -webkit-font-smoothing: antialiased;
+  -webkit-text-size-adjust: 100%;
+  overflow-x: clip;
+}
+
+::selection { background: var(--surface-selected); color: var(--text); }
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 3px;
+}
+
+* { scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
+
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; text-underline-offset: 2px; }
+
+/* ============================================================ primitives
+   Same names, same shapes as web/public/styles.css — a control that looks like
+   a veil button on the site behaves like one in the app. */
+button, input, select, textarea { font-family: inherit; font-size: var(--fs-ui); color: inherit; }
+button { background: none; border: 0; cursor: pointer; touch-action: manipulation; }
+
+.btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 7px;
+  min-height: var(--field-h);
+  min-width: 44px;
+  padding: 0 15px;
+  border-radius: var(--radius-btn);
+  background: var(--tonal);
+  color: var(--accent);
+  font-weight: 600;
+  white-space: nowrap;
+  transition: background .13s ease, color .13s ease, filter .13s ease;
+}
+.btn:hover { background: var(--tonal-hover); text-decoration: none; }
+.btn:active { transform: translateY(1px); }
+.btn svg { width: 16px; height: 16px; flex: 0 0 auto; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+
+.btn-solid { background: var(--accent); color: var(--on-accent); }
+.btn-solid:hover { background: var(--accent); filter: brightness(1.08); }
+.btn-ghost { background: transparent; color: var(--text-secondary); }
+.btn-ghost:hover { background: var(--surface-hover); color: var(--text); }
+.btn-lg { min-height: 40px; padding: 0 20px; font-size: var(--fs-body); }
+.btn-sm { min-height: 28px; padding: 0 10px; font-size: var(--fs-small); }
+
+.icon-btn {
+  width: 38px; height: 38px;
+  display: grid; place-items: center;
+  border-radius: var(--radius-btn);
+  color: var(--text-secondary);
+  flex: 0 0 auto;
+}
+.icon-btn:hover { background: var(--surface-hover); color: var(--text); text-decoration: none; }
+.icon-btn svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+
+input[type=search], input[type=text] {
+  width: 100%;
+  min-height: var(--field-h);
+  padding: 7px 11px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text);
+}
+input[type=search]:focus { outline: none; border-color: var(--accent); }
+input[type=search]::-webkit-search-cancel-button { filter: grayscale(1); opacity: .5; }
+
+.panel {
+  background: var(--surface-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 4px 10px;
+  border-radius: var(--radius-pill);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  font-size: var(--fs-micro);
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+.chip-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--success); flex: 0 0 auto; }
+
+.tag {
+  display: inline-block;
+  padding: 2px 7px;
+  border-radius: 4px;
+  background: var(--chip-bg);
+  font-family: var(--font-mono);
+  font-size: var(--fs-micro);
+  letter-spacing: .04em;
+  color: var(--text-secondary);
+}
+
+.mono  { font-family: var(--font-mono); }
+.dim   { color: var(--text-secondary); }
+.muted { color: var(--text-muted); }
+.row   { display: flex; align-items: center; gap: var(--gap); }
+.grow  { flex: 1; min-width: 0; }
+.ellip { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.nobr  { white-space: nowrap; }
+.visually-hidden {
+  position: absolute; width: 1px; height: 1px;
+  overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap;
+}
+
+/* inline code in prose — the app pads it the same way (styles.css:703) */
+code {
+  font-family: var(--font-mono);
+  font-size: .92em;
+  padding: 1px 5px;
+  background: var(--chip-bg);
+  border-radius: 4px;
+  color: var(--accent-teal);
+  word-break: break-word;
+}
+
+/* ---------------- code blocks (styles.css .code-block) ---------------- */
+pre.md-code, .code-block {
+  margin: 0 0 12px;
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+pre.md-code { padding: 10px 12px; overflow-x: auto; }
+pre.md-code code {
+  display: block;
+  padding: 0; background: none; border-radius: 0;
+  color: var(--text);
+  font-size: var(--fs-small);
+  line-height: 1.5;
+  white-space: pre;
+  word-break: normal;
+}
+
+/* ---------------- tables (styles.css .table-wrap) ---------------- */
+.md-tablewrap { margin: 0 0 12px; border: 1px solid var(--border); border-radius: var(--radius); overflow-x: auto; }
+.md-table { width: max-content; min-width: 100%; border-collapse: collapse; font-size: var(--fs-small); }
+.md-table th, .md-table td { padding: 6px 10px; border-top: 1px solid var(--border); text-align: left; }
+.md-table th { background: var(--table-head-bg); font-weight: 650; border-top: 0; }
+.md-table tr:nth-child(even) td { background: var(--table-zebra); }
+
+/* ---------------- motion ---------------- */
+.reveal {
+  opacity: 0;
+  transform: translateY(14px);
+  transition: opacity .5s ease, transform .5s cubic-bezier(.2,.7,.3,1);
+}
+.reveal.in { opacity: 1; transform: none; }
+@media (prefers-reduced-motion: reduce) {
+  .reveal { opacity: 1; transform: none; transition: none; }
+  *, *::before, *::after { animation-duration: .001ms !important; animation-iteration-count: 1 !important; }
+}

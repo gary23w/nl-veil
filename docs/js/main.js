@@ -1,101 +1,117 @@
-/* FILE NL-VEIL — load choreography, scroll reveals, grease-pencil circles. */
+/* nl-veil docs — page shell: theme, reveals, platform detection, scroll spy.
+   The theme cycle mirrors the product: the three built-ins the desk compiles in
+   (theme.zig initThemes) in the same order, persisted under the same key the
+   web client uses so a reader who flips to dark here lands in dark there. */
 (function () {
   'use strict';
 
   const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-
-  // "click" is a mouse word — fingers tap
-  const hintVerb = document.getElementById('hintVerb');
-  if (hintVerb && window.matchMedia('(pointer: coarse)').matches) hintVerb.textContent = 'TAP';
-
-  // ---- the veil persona: pull the cord to darken the reading room ----
-  const cord = document.getElementById('veilCord');
-  const cordLabel = document.getElementById('veilCordLabel');
   const root = document.documentElement;
-  function paintCord() {
-    const on = root.hasAttribute('data-veil');
-    if (cord) {
-      cord.setAttribute('aria-pressed', String(on));
-      cord.setAttribute('aria-label', on ? 'Leave the veil — back to the reading room' : 'Enter the veil — a darker reading room');
+
+  /* ---------------- theme ---------------- */
+  const THEMES = [
+    { id: 'light',  name: 'Light',       chrome: '#e9edf5' },
+    { id: 'dark',   name: 'Tokyo Night', chrome: '#16161e' },
+    { id: 'matrix', name: 'Matrix',      chrome: '#030a03' }
+  ];
+  const ICONS = {
+    // sun / moon / terminal — the same stroke language as the app's icon set
+    light:  '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="4.5"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M19.1 4.9l-1.4 1.4M6.3 17.7l-1.4 1.4"/></svg>',
+    dark:   '<svg viewBox="0 0 24 24"><path d="M20.5 14.5A8.5 8.5 0 0 1 9.5 3.5a8.5 8.5 0 1 0 11 11z"/></svg>',
+    matrix: '<svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9l3 3-3 3M13 15h4"/></svg>'
+  };
+
+  const themeBtn = document.getElementById('themeBtn');
+
+  function currentTheme() { return root.getAttribute('data-theme') || 'light'; }
+
+  function setTheme(id) {
+    const t = THEMES.find((x) => x.id === id) || THEMES[0];
+    root.setAttribute('data-theme', t.id);
+    try { localStorage.setItem('veil.theme', t.id); } catch (e) {}
+    // one theme-color meta, rewritten — the media-query pair in <head> only
+    // covers the unset case, and an explicit choice has to beat it
+    document.querySelectorAll('meta[name=theme-color]').forEach((m) => m.remove());
+    const meta = document.createElement('meta');
+    meta.name = 'theme-color';
+    meta.content = t.chrome;
+    document.head.appendChild(meta);
+    if (themeBtn) {
+      themeBtn.innerHTML = ICONS[t.id];
+      themeBtn.title = 'Theme: ' + t.name + ' (click to cycle)';
+      themeBtn.setAttribute('aria-label', 'Theme: ' + t.name + '. Click to cycle.');
     }
-    if (cordLabel) cordLabel.textContent = on ? 'LEAVE THE VEIL' : 'ENTER THE VEIL';
+    // the map paints its links on a canvas, so a palette change has to be
+    // repainted by hand — CSS cannot reach inside a 2D context
+    if (window.VeilMap) window.VeilMap.repaint();
   }
-  paintCord();
-  if (cord) {
-    cord.addEventListener('click', () => {
-      const on = root.toggleAttribute('data-veil');
-      try { localStorage.setItem('nl-veil-persona', on ? 'veil' : 'file'); } catch (e) {}
-      paintCord();
+
+  setTheme(currentTheme());
+  if (themeBtn) {
+    themeBtn.addEventListener('click', () => {
+      const i = THEMES.findIndex((x) => x.id === currentTheme());
+      setTheme(THEMES[(i + 1) % THEMES.length].id);
     });
   }
 
-  // load sequence
-  requestAnimationFrame(() => {
-    requestAnimationFrame(() => document.body.classList.add('loaded'));
-  });
-
-  // scroll reveals
+  /* ---------------- scroll reveals ---------------- */
   const revealables = document.querySelectorAll('.reveal');
   if (reduceMotion) {
     revealables.forEach((el) => el.classList.add('in'));
   } else {
     const io = new IntersectionObserver((entries) => {
       for (const en of entries) {
-        if (en.isIntersecting) {
-          en.target.classList.add('in');
-          io.unobserve(en.target);
-        }
+        if (en.isIntersecting) { en.target.classList.add('in'); io.unobserve(en.target); }
       }
     }, { threshold: 0.12, rootMargin: '0px 0px -48px 0px' });
     revealables.forEach((el) => io.observe(el));
   }
 
-  // property receipt: tag the download row for the machine that's reading. Purely additive — every row
-  // stays visible and clickable, so a wrong guess (or no guess at all) costs nobody a download.
+  /* ---------------- platform detection ----------------
+     Purely additive: every card stays visible and every link stays live, so a
+     wrong guess (or no guess) costs nobody a download. */
   (() => {
-    const rows = document.getElementById('relList');
-    if (!rows) return;
+    const grid = document.getElementById('dlGrid');
+    if (!grid) return;
     const ua = navigator.userAgent || '';
     const plat = navigator.platform || '';
-    let os = null;
-    if (/Win/i.test(plat) || /Windows/i.test(ua)) os = 'win';
-    else if (/Mac/i.test(plat) || /Mac OS X/i.test(ua)) os = 'macarm';
-    else if (/Linux/i.test(plat) && !/Android/i.test(ua)) os = 'linux';
-    // Apple Silicon still reports as Intel in the UA, and userAgentData is no better, so Macs guess arm64
-    // (the majority now). Both mac rows sit right there, so a miss is a glance, not a dead end.
-    const row = os && rows.querySelector('.rel-row[data-os="' + os + '"]');
-    if (row) row.classList.add('is-yours');
+    let os = null, label = '';
+    if (/Win/i.test(plat) || /Windows/i.test(ua)) { os = 'win'; label = 'for Windows'; }
+    // Apple Silicon still reports as Intel in the UA and userAgentData is no
+    // better, so Macs guess arm64 (the majority now). Both mac cards sit right
+    // there, so a miss is a glance, not a dead end.
+    else if (/Mac/i.test(plat) || /Mac OS X/i.test(ua)) { os = 'macarm'; label = 'for macOS'; }
+    else if (/Linux/i.test(plat) && !/Android/i.test(ua)) { os = 'linux'; label = 'for Linux'; }
+    const card = os && grid.querySelector('.dl-card[data-os="' + os + '"]');
+    if (!card) return;
+    card.classList.add('is-yours');
+    const badge = document.createElement('span');
+    badge.className = 'dl-yours';
+    badge.textContent = 'your machine';
+    card.appendChild(badge);
+    const heroBtn = document.querySelector('.hero-cta .btn-solid');
+    if (heroBtn && label) heroBtn.appendChild(document.createTextNode(' ' + label));
   })();
 
-  // grease-pencil circles on the flagged rounds
-  const CIRCLE_PATH = 'M18,34 C12,16 58,6 96,9 C134,12 152,24 148,38 C144,52 100,58 62,55 C28,52 12,44 22,28 C30,15 70,8 108,12';
-  document.querySelectorAll('.tl-entry[data-circle]').forEach((entry) => {
-    const timeEl = entry.querySelector('.tl-time');
-    if (!timeEl) return;
-    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-    svg.setAttribute('class', 'tl-circle');
-    svg.setAttribute('viewBox', '0 0 164 64');
-    svg.setAttribute('aria-hidden', 'true');
-    const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-    path.setAttribute('d', CIRCLE_PATH);
-    svg.appendChild(path);
-    timeEl.appendChild(svg);
-    const len = path.getTotalLength();
-    path.style.strokeDasharray = String(len);
-    if (reduceMotion) {
-      path.style.strokeDashoffset = '0';
-    } else {
-      path.style.strokeDashoffset = String(len);
-      path.style.transition = 'stroke-dashoffset 1.1s cubic-bezier(.5,.1,.3,1) .35s';
-      const io2 = new IntersectionObserver((entries) => {
-        for (const en of entries) {
-          if (en.isIntersecting) {
-            path.style.strokeDashoffset = '0';
-            io2.disconnect();
-          }
-        }
-      }, { threshold: 0.4 });
-      io2.observe(entry);
-    }
-  });
+  /* ---------------- nav scroll spy ---------------- */
+  (() => {
+    const links = Array.from(document.querySelectorAll('.nav a[href^="#"]'));
+    if (!links.length) return;
+    const targets = links
+      .map((a) => ({ a, el: document.getElementById(a.getAttribute('href').slice(1)) }))
+      .filter((x) => x.el);
+    if (!targets.length) return;
+    let active = null;
+    const spy = new IntersectionObserver((entries) => {
+      for (const en of entries) {
+        if (!en.isIntersecting) continue;
+        const hit = targets.find((t) => t.el === en.target);
+        if (!hit || hit === active) continue;
+        if (active) active.a.classList.remove('active');
+        hit.a.classList.add('active');
+        active = hit;
+      }
+    }, { rootMargin: '-45% 0px -50% 0px' });
+    targets.forEach((t) => spy.observe(t.el));
+  })();
 })();
