@@ -34,11 +34,27 @@ PY="${PYTHON:-python}"
 command -v "$PY" >/dev/null 2>&1 || PY=python3
 
 fail=0
+# STRICT gates refuse to read a zero exit as success when the log says a step died. The zig build
+# runner has been observed printing "failed command: … zig build-exe" and a promoted LLD error and
+# STILL exiting 0 — which reported a broken Linux GUI build as PASS in CI. Only build gates set
+# this: the test gates legitimately print "failed command" on the IPC flake and then re-run the
+# binary standalone (see zig_tests), so a blanket check there would fail every green run.
+GATE_STRICT=0
+gate_build() { GATE_STRICT=1; gate "$@"; GATE_STRICT=0; }
+
 gate() { # gate <name> <cmd...>
   name="$1"; shift
   printf '>> %s\n' "$name"
   log="${TMPDIR:-/tmp}/nlveil-gate.$$.log"
   if "$@" >"$log" 2>&1; then
+    if [ "$GATE_STRICT" = 1 ] && grep -qE '^failed command:|^error: ' "$log"; then
+      cat "$log"
+      printf '   FAIL (exit 0, but the log shows a failed step — see above)\n'
+      grep -E '^failed command:|^error: ' "$log" | tail -4 | sed 's/^/   > /'
+      rm -f "$log"
+      fail=1
+      return
+    fi
     cat "$log"
     printf '   PASS\n'
     rm -f "$log"
@@ -92,7 +108,7 @@ gate_webjs() {
     echo "SKIPPED: node not on PATH — web/public/app.js was NOT parsed"; fi
 }
 gate "web assets parse (node --check app.js)" gate_webjs
-gate "zig build server-only (-Dapp=false)" "$ZIG" build -Dapp=false $CACHE_ARGS --prefix "$PREFIX"
+gate_build "zig build server-only (-Dapp=false)" "$ZIG" build -Dapp=false $CACHE_ARGS --prefix "$PREFIX"
 # `zig build test` can EXIT 0 after its test binary died without reporting a single result: the build
 # runner prints `failed command: "...test.exe" ... --listen=-` and returns success anyway. Taking that
 # as green means calling the suite passed while knowing nothing whatever about it -- the worst thing an
@@ -105,9 +121,30 @@ zig_tests() { # zig_tests <cmd...> -- forwards output, returns a verdict backed 
   "$@" >"$raw" 2>&1
   rc=$?
   cat "$raw"
-  exe=$(sed -n 's/^failed command: "\([^"]*test\.exe\)".*/\1/p' "$raw" | head -1 | sed 's/\\\\/\\/g')
+  # BOTH spellings of the runner's failure line. It used to match only the Windows one --
+  #   failed command: "C:\...\test.exe" "--cache-dir=..."
+  # -- while Linux CI prints it unquoted and with no .exe:
+  #   failed command: ./.zig-cache/o/HASH/test --cache-dir=... --seed=... --listen=-
+  # so on Linux `exe` came back empty, the function fell through to the runner's exit code, and
+  # that code was 0. Both test gates reported PASS having produced NO test verdict at all --
+  # exactly what this helper's header promises can never happen.
+  exe=$(sed -n \
+    -e 's/^failed command: "\([^"]*test\.exe\)".*/\1/p' \
+    -e 's|^failed command: \([^" ][^ ]*/test\)\( .*\)\{0,1\}$|\1|p' \
+    "$raw" | head -1 | sed 's/\\\\/\\/g')
+  if [ -z "$exe" ]; then
+    # No named binary. If the runner ALSO printed a failure line, it died without a verdict and a
+    # zero exit is meaningless -- never let that read as green.
+    if grep -q '^failed command:' "$raw"; then
+      rm -f "$raw"
+      echo "   the runner reported a failed command but named no test binary --"
+      echo "   that is a gate with no verdict; refusing to call it green"
+      return 96
+    fi
+    rm -f "$raw"
+    return "$rc"
+  fi
   rm -f "$raw"
-  [ -n "$exe" ] || return "$rc"
   echo "   build runner died without naming a test (IPC flake) -- rerunning it standalone:"
   echo "   $exe"
   [ -f "$exe" ] || { echo "   that exe is gone -- refusing to call this green"; return 97; }
@@ -118,7 +155,7 @@ gate "zig build test (src suite)" zig_tests "$ZIG" build test $CACHE_ARGS
 gate_desk() { ( cd desk && zig_tests "$ZIG" build test $CACHE_ARGS ); }
 gate "zig build test (desk suite)" gate_desk
 if [ "${1:-}" = "--full" ]; then
-  gate "zig build default (GUI merged in)" "$ZIG" build $CACHE_ARGS --prefix "$PREFIX"
+  gate_build "zig build default (GUI merged in)" "$ZIG" build $CACHE_ARGS --prefix "$PREFIX"
 fi
 
 echo
