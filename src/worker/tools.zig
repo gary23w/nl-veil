@@ -2954,8 +2954,14 @@ fn editFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
     // failure mode edit_file exists to prevent. Stat first: only a genuinely absent file says "does not exist",
     // and a file past even the raised ceiling says so honestly and forbids the rewrite.
     const original = std.Io.Dir.cwd().readFileAlloc(ctx.io, full, gpa, .limited(EDIT_MAX_BYTES)) catch blk_big: {
+        // ATTRIBUTE THE PATH. This used to open with a bare "{path} does not exist", which says nothing
+        // about WHERE the path came from. Observed live (conv c6a6df468): the model had itself emitted a
+        // malformed path, read this error, and told the user "You typed weather.pe** instead of
+        // weather.py" — blaming them for its own argument, which is worse than the failed edit because it
+        // sends the user hunting for a typo they never made. The path in an edit_file error is ALWAYS the
+        // model's own; saying so costs a clause and removes the misreading.
         const st = std.Io.Dir.cwd().statFile(ctx.io, full, .{}) catch
-            return std.fmt.allocPrint(gpa, "{s} does not exist — edit_file only changes an EXISTING file; use write_file to create a new one.", .{npath}) catch dupe(gpa, "file not found — use write_file to create it");
+            return std.fmt.allocPrint(gpa, "{s} does not exist — that path came from YOUR tool call, not from the user, so do not report it as their typo. edit_file only changes an EXISTING file: re-check the path against a recent read_file/list_dir result, or use write_file to create it.", .{npath}) catch dupe(gpa, "file not found — that path came from YOUR call; use write_file to create it");
         if (st.size > EDIT_MAX_BYTES)
             return std.fmt.allocPrint(gpa, "{s} EXISTS ({d} bytes) but is too large for edit_file to load. It was NOT modified — do NOT rewrite it with write_file (that would destroy it). Narrow the change: read the exact region with read_file start_line/end_line, or split the file first.", .{ npath, st.size }) catch dupe(gpa, "file too large to edit — do not rewrite it");
         break :blk_big std.Io.Dir.cwd().readFileAlloc(ctx.io, full, gpa, .limited(@intCast(st.size + 1))) catch

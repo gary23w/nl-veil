@@ -53,6 +53,18 @@ const App = http.App;
 /// turn, and a genuine runaway summarizes (below) rather than committing a raw step-limit string.
 const MAX_ITERS: usize = 24;
 
+/// Identical (call, result) repeats before the echo guard refuses that ONE signature. Module-level so the
+/// hard stop below can be checked against it — the two only work as a pair.
+const ECHO_LIMIT: u8 = 3;
+
+/// How many ALREADY-REFUSED tool calls end the turn outright (see `loop_refusals` in runInnerAgentic).
+/// The echo guard refuses one signature once it has returned the identical result 3 times; this counts
+/// those refusals across the whole turn, so a model cycling between tools — which never drives a single
+/// signature hard enough to matter — still terminates instead of grinding to MAX_ITERS. Three is
+/// deliberately generous: reaching it takes at least ~12 calls that all returned identical results with
+/// the in-band warnings ignored every time, so a model making any real progress never reaches it.
+const LOOP_STOP_REFUSALS: u32 = 3;
+
 /// Hard ceiling on AUTO-LOOP drive steps in one turn when the loop is OFF (loop=0). Kept low (6): a higher cap
 /// lets a thorough model "verify" and re-read forever after a fix, while 6 still fits a build + a couple of
 /// follow-through steps and a plain Q&A stops after one (DONE). The user's Stop reaches the turn (control.jsonl),
@@ -5820,6 +5832,17 @@ fn runInnerAgentic(
     // list_dir do natively) — the moment deliberate tool WEIGHING should happen and doesn't.
     var fail_streak_tool: u64 = 0;
     var fail_streak: u32 = 0;
+    // LOOP HARD STOP. The echo guard refuses an individual call once it has returned the identical
+    // result echo_limit times, but refusing a call is not the same as ending a turn: a model that
+    // CYCLES between tools never trips one signature hard enough to matter and just runs to MAX_ITERS.
+    // Observed live (conv c6a6df468): edit_file → run_python → run_tests → read_file → edit_file …,
+    // every edit rejected for a malformed anchor, the deliverable already written and working, and the
+    // desk sat there looking hung until the round cap.
+    //
+    // This counts only calls the echo guard ALREADY refused, so it cannot fire on a model that is making
+    // progress — reaching it means at least LOOP_STOP_REFUSALS * echo_limit calls returned identical
+    // results and the warnings were ignored every time. Frontier models on working paths never see it.
+    var loop_refusals: u32 = 0;
 
     // Everything already in conv_buf when this pass begins (system + bounded history + prior drive steps). This
     // pass's tool-call/result growth is measured against it so within-turn compaction can bound just the growth.
@@ -5846,6 +5869,21 @@ fn runInnerAgentic(
         switch (drainChatControl(app, conv_dir, steer_cursor, conv_buf)) {
             .stop => return .{ .outcome = .stopped, .content = gpa.dupe(u8, last_content) catch empty },
             .none => {},
+        }
+
+        // LOOP HARD STOP (see loop_refusals above). Checked HERE — before spending another inference —
+        // because the refusals that got us here already proved the next one has nothing new to work with.
+        // End the turn honestly rather than grinding to MAX_ITERS: say the loop was cut, keep whatever the
+        // model did narrate, and point at the file ledger, which records what genuinely landed on disk (in
+        // the observed case the deliverable was already written and working while the model kept retrying).
+        if (loop_refusals >= LOOP_STOP_REFUSALS) {
+            emitKV(app, conv_dir, "status", "text", "loop guard: stopped this turn — the same calls kept returning the same results");
+            const note = "(engine: I stopped this turn. The same tool calls kept returning identical results and the loop guard refused them repeatedly, so further rounds could not make progress. Anything already written to the workdir is listed above and is real — re-read it before redoing the work.)";
+            const combined = if (last_content.len > 0)
+                std.fmt.allocPrint(gpa, "{s}\n\n{s}", .{ last_content, note }) catch gpa.dupe(u8, note) catch empty
+            else
+                gpa.dupe(u8, note) catch empty;
+            return .{ .outcome = .stopped, .content = combined, .tools_ran = any_tool };
         }
 
         // STREAMING: the model's reply + reasoning type out via streamOnDelta as {kind:token|reasoning,delta}
@@ -6027,9 +6065,12 @@ fn runInnerAgentic(
             // One threshold now. The legitimate case is untouched: the guard keys on the RESULT hash, so a read
             // returning something different (the read-after-write cycle BUILD DISCIPLINE asks for) resets the
             // count and never trips this.
-            const echo_limit: u8 = 3;
+            const echo_limit: u8 = ECHO_LIMIT;
             const echo_blocked = echo_slot != null and echo_slot.?.count >= echo_limit;
-            if (echo_blocked) echo_slot.?.count +|= 1;
+            if (echo_blocked) {
+                echo_slot.?.count +|= 1;
+                loop_refusals +|= 1; // see LOOP HARD STOP above; checked after this call's result lands
+            }
             // QUERY FORMULATION (prompting): chat used to hand web_search the model's query verbatim — the swarm
             // has had a formulation step for a while (run.zig scoutQuery) and the chat side had none at all.
             // Gated on the call actually being about to EXECUTE (the three guard conditions below are the ones
@@ -7872,4 +7913,27 @@ test "the tiered pairing actually covers a 12B: compact prompt AND compact belt,
             return error.TierWouldTeachUnadvertisedVerbs;
         }
     }
+}
+
+test "the loop hard stop is reachable before MAX_ITERS, or it is dead code" {
+    // The echo guard refuses ONE signature after ECHO_LIMIT identical results; the hard stop ends the turn
+    // after LOOP_STOP_REFUSALS such refusals. The two only work as a pair, and the pair only works if the
+    // stop can actually be reached inside a turn's round budget. A live loop (conv c6a6df468) cycled
+    // edit_file -> run_python -> run_tests -> read_file and ran to MAX_ITERS because nothing counted
+    // refusals ACROSS signatures; if someone later raises either constant past the round cap, the stop
+    // silently stops firing and that hang comes back with no test failing.
+    //
+    // Worst case is one refusal per distinct signature: each needs ECHO_LIMIT calls to arm plus one more
+    // to be refused, so the stop needs LOOP_STOP_REFUSALS * (ECHO_LIMIT + 1) rounds of headroom.
+    const worst_case_rounds: usize = @as(usize, LOOP_STOP_REFUSALS) * (@as(usize, ECHO_LIMIT) + 1);
+    if (worst_case_rounds >= MAX_ITERS) {
+        std.debug.print("\nloop hard stop needs up to {d} rounds but MAX_ITERS is {d}: the turn hits the " ++
+            "round cap first and the hard stop never fires.\n", .{ worst_case_rounds, MAX_ITERS });
+        return error.LoopStopUnreachable;
+    }
+    // And it must not be so eager that a model taking one extra look trips it: a single refused signature
+    // is a nudge, never a turn-ender.
+    const t = std.testing;
+    try t.expect(LOOP_STOP_REFUSALS > 1);
+    try t.expect(ECHO_LIMIT > 1);
 }

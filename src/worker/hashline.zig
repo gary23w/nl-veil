@@ -88,6 +88,20 @@ pub fn parseAnchor(raw: []const u8) ?Anchor {
     var s = std.mem.trim(u8, raw, " \t\r\n");
     if (std.mem.indexOf(u8, s, "\u{2192}")) |p| s = std.mem.trimEnd(u8, s[0..p], " \t");
     if (std.mem.indexOf(u8, s, "->")) |p| s = std.mem.trimEnd(u8, s[0..p], " \t");
+    // MARKDOWN DECORATION. Same tolerance as the `→content` suffix above and for the same reason:
+    // the anchor names a real line, only the packaging is wrong, so repairing beats rejecting the
+    // whole atomic batch.
+    //
+    // Seen in production (conv c6a6df468): `the-veil-12b` sent `3:qfm:ldp**` for a live `3:qfm:ldp`,
+    // edit_file rejected it, and the model re-read and retried until the desk looked hung. Replaying
+    // that captured turn reproduced it ~13 times across several batches, then stopped reproducing
+    // entirely on a later model load — so it is INTERMITTENT and load-state dependent, not a
+    // deterministic property of the weights (Ollama's native path is known to vary across loads).
+    // Frequency is therefore unmeasured; what is certain is that it happens and that it costs the
+    // whole edit when it does. Tolerating it is cheap and costs nothing for models that never decorate.
+    //
+    // Safe to trim from both ends: a well-formed anchor is digits, ':' and lowercase a-z only.
+    s = std.mem.trim(u8, s, "*`_ \t");
     if (s.len == 0) return null;
     if (std.ascii.eqlIgnoreCase(s, "EOF")) return .{ .line = 0, .eof = true };
     if (std.mem.eql(u8, s, "0:") or std.mem.eql(u8, s, "0")) return .{ .line = 0, .bof = true };
@@ -545,6 +559,38 @@ test "taggedBody: a pasted-back read view is caught; ordinary code and prose are
     try t.expect(!taggedBody("")); // nothing to vote on
     // one quoted anchor inside otherwise-real content is a comment or a doc, not a pasted view
     try t.expect(!taggedBody("// see 42:abc:def\u{2192}load(path)\nfn main() void {}\nreturn;\n"));
+}
+
+test "a markdown-decorated anchor still names its line" {
+    // The live failure (conv c6a6df468): `the-veil-12b` sent `3:qfm:ldp**` for a real `3:qfm:ldp`,
+    // edit_file rejected it, and the model re-read and retried until the desk appeared to hang.
+    // Intermittent rather than deterministic (see parseAnchor), which is exactly why the parser has
+    // to absorb it — an edit must not depend on the model's packaging being tidy that run.
+    const gpa = t.allocator;
+    const src = "import urllib.request\ntry:\n    with urllib.request.open(\"u\") as r:\n        print(r)\n";
+    var lines = try splitLines(gpa, src);
+    defer lines.deinit(gpa);
+    var ab: [24]u8 = undefined;
+    const clean = renderAnchor(lines.items, 2, &ab); // the `with ...` line, 0-based index 2
+    const want = parseAnchor(clean) orelse return error.NoParse;
+
+    for ([_][]const u8{ "**", "*", "`", "__" }) |deco| {
+        const decorated = try std.fmt.allocPrint(gpa, "{s}{s}", .{ clean, deco });
+        defer gpa.free(decorated);
+        const got = parseAnchor(decorated) orelse return error.DecoratedAnchorRejected;
+        try t.expectEqual(want.line, got.line);
+        try t.expectEqualSlices(u8, &want.local, &got.local);
+        try t.expectEqual(Verdict.valid, validate(lines.items, got));
+    }
+    // wrapped on both sides, and still carrying the `→text` a read prints
+    const wrapped = try std.fmt.allocPrint(gpa, "**{s}\u{2192}    with urllib.request.open(\"u\") as r:**", .{clean});
+    defer gpa.free(wrapped);
+    const got = parseAnchor(wrapped) orelse return error.WrappedAnchorRejected;
+    try t.expectEqual(want.line, got.line);
+    // and a genuinely malformed anchor is still rejected -- tolerance must not become "accept anything"
+    try t.expect(parseAnchor("3:qq:ldp") == null); // hash too short
+    try t.expect(parseAnchor("3:qfm:ld9") == null); // digit in a hash
+    try t.expect(parseAnchor("**") == null);
 }
 
 test "a tag copied without its line number still names the line — uniquely or not at all" {
