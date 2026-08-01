@@ -32,8 +32,10 @@
   font-weight: 400; font-size: var(--fs-micro);
   color: var(--text-muted); letter-spacing: 0;
 }
-.mark { width: 22px; height: 22px; flex: 0 0 auto; display: block; }
-.mark-lg { width: 44px; height: 44px; }
+/* Element-scoped on purpose: a bare `.mark` once collided with a timeline row
+   modifier and collapsed it to a 22px box. The brand mark is always an <svg>. */
+svg.mark { width: 22px; height: 22px; flex: 0 0 auto; display: block; }
+svg.mark-lg { width: 44px; height: 44px; }
 
 .nav { display: flex; align-items: center; gap: 2px; margin-left: 8px; }
 .nav a {
@@ -401,8 +403,8 @@ main > section:last-child { padding-bottom: var(--section-gap); }
   width: 9px; height: 9px; border-radius: 50%;
   background: var(--surface); border: 2px solid var(--border);
 }
-.tl-entry.mark .tl-time { color: var(--brand); }
-.tl-entry.mark .tl-time::after { background: var(--brand); border-color: var(--brand); }
+.tl-entry.flag .tl-time { color: var(--brand); }
+.tl-entry.flag .tl-time::after { background: var(--brand); border-color: var(--brand); }
 .tl-body p { font-size: var(--fs-body); }
 .tl-body strong { font-weight: 650; }
 .tl-note {
