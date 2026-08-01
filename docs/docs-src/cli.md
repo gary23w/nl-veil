@@ -26,7 +26,7 @@ One dispatcher for every CLI verb: swarms (`cast`/`deploy`/`list`/`stop`/`rm`/`e
 - `cli/exec_tool.zig` — the shared tool executor (`exec-tool`, `sync-*` verbs; delegated tool runs)
 - `cli/chat.zig` / `cli/hub.zig` — the substantial subcommands, kept in sibling files with thin entry points here
 - `worker/chat/sync.zig` — safe-root/safe-path checks + manifest/read responses for workdir sync frames
-- `worker/chat/toolperf.zig` — the engine's learned tool digest, reused by `doctor --growth`
+- `worker/chat/toolperf.zig` — the engine's learned tool digest, reused by `doctor --runtime`
 - Lazily per verb: `worker/ragmirror.zig`, `worker/ragingest.zig`, `worker/oscillation.zig`, `worker/tools.zig` (rag), `plug/theme.zig` (the frozen slot_names for `themes <id>`)
 
 ## Usage Context
@@ -36,7 +36,7 @@ One dispatcher for every CLI verb: swarms (`cast`/`deploy`/`list`/`stop`/`rm`/`e
 ## Notable Implementation Details
 
 - `deploy` is `cast` with `--continuous` implied; `--lineage <id>` persists swarm memory so re-casts compound.
-- `doctor --growth` reads `{data}` directly on purpose — the report (toolperf digest, sched fail-streaks, per-model llm.jsonl rollup) works with the server down.
+- `doctor --runtime` reads `{data}` directly on purpose — the report (toolperf digest, sched fail-streaks, per-model llm.jsonl rollup) works with the server down.
 - `followConv` only consumes up to the last COMPLETE line of a 512 KB events page: advancing the cursor over a torn `tool_request` frame would leave the turn blocked forever.
 - `cmdDesktop` relaunches THIS executable detached (the GUI is compiled in; there is no separate desk binary anymore).
 - `themes` needs no auth (public endpoint); `plugins` needs the admin key — a 401/403 on the read exits clean with a tailored note, on `reload` it exits 1.

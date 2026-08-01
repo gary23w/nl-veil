@@ -1,7 +1,7 @@
 # How to write a test in this repo
 
-Every rule here was paid for by a real failure — the ledger entry that bought it is named in
-parentheses. Read this before adding tests; hand it to any agent you ask to write them.
+Every rule here was paid for by a real failure; the parenthesised numbers are the incident ids of
+those failures. Read this before adding tests; hand it to any agent you ask to write them.
 
 ## The shape
 
