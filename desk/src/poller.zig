@@ -1023,6 +1023,8 @@ pub const Poller = struct {
         const state = valueForKey(resp.body, "state", &stb);
         var arb: [24]u8 = undefined;
         const arch = valueForKey(resp.body, "arch", &arb);
+        var gpb: [64]u8 = undefined;
+        const gpu = valueForKey(resp.body, "gpu", &gpb);
         var erb: [160]u8 = undefined;
         const err = valueForKey(resp.body, "err", &erb);
         var pbuf: [600]u8 = undefined;
@@ -1037,6 +1039,8 @@ pub const Poller = struct {
         const total_mb: u32 = @intCast(@min((intForKey(resp.body, "bytes_total") orelse 0) >> 20, std.math.maxInt(u32)));
         const params_b: u32 = @intCast(@min(intForKey(resp.body, "params_b") orelse 0, 10_000));
         const upd_mb: u32 = @intCast(@min(intForKey(resp.body, "update_mb") orelse 0, std.math.maxInt(u32)));
+        const gpu_layers: u32 = @intCast(@min(intForKey(resp.body, "gpu_layers") orelse 0, 999));
+        const tps10: u32 = @intCast(@min(intForKey(resp.body, "decode_tps10") orelse 0, 100_000));
 
         // terminal-transition toast: transferring → ready/cold = landed; → failed/cancelled = didn't
         const was = self.prev_bi_state[0..self.prev_bi_state_len];
@@ -1084,6 +1088,11 @@ pub const Poller = struct {
         const an = @min(arch.len, s.bi_arch.len);
         @memcpy(s.bi_arch[0..an], arch[0..an]);
         s.bi_arch_len = @intCast(an);
+        const gn = @min(gpu.len, s.bi_gpu.len);
+        @memcpy(s.bi_gpu[0..gn], gpu[0..gn]);
+        s.bi_gpu_len = @intCast(gn);
+        s.bi_gpu_layers = gpu_layers;
+        s.bi_tps10 = tps10;
         const en = @min(err.len, s.bi_err.len);
         @memcpy(s.bi_err[0..en], err[0..en]);
         s.bi_err_len = @intCast(en);

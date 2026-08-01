@@ -95,7 +95,18 @@ pub fn build(b: *std.Build) void {
     const with_builtin = b.option(bool, "builtin", "compile the built-in model engine into `veil` (default true; -Dbuiltin=false = lean build, the builtin provider reports unavailable)") orelse true;
     const llama_dep: ?*std.Build.Dependency = if (with_builtin) b.lazyDependency("llama_cpp", .{}) else null;
     const builtin_on = with_builtin and llama_dep != null;
-    if (llama_dep) |lc| addLlamaCpp(b, exe.root_module, lc, target);
+    // The GPU tier: the Vulkan backend compiled in, shaders from the pre-generated artifact (no
+    // Vulkan SDK at build), loader dlopen'd at run (no GPU = clean CPU fallback). Off on macOS
+    // (no native Vulkan there — Apple silicon's fast unified-memory CPU path serves until a Metal
+    // tier exists). -Dvulkan=false keeps the small binary: the shader payload is ~50MB of exe.
+    const with_vulkan = b.option(bool, "vulkan", "compile the GPU (Vulkan) backend into the built-in engine (default true off macOS; adds ~50MB of embedded shaders)") orelse true;
+    const want_vk = builtin_on and with_vulkan and target.result.os.tag != .macos;
+    const vk_headers: ?*std.Build.Dependency = if (want_vk) b.lazyDependency("vulkan_headers", .{}) else null;
+    const spv_headers: ?*std.Build.Dependency = if (want_vk) b.lazyDependency("spirv_headers", .{}) else null;
+    const vk_shaders: ?*std.Build.Dependency = if (want_vk) b.lazyDependency("veil_vulkan_shaders", .{}) else null;
+    const vulkan_on = want_vk and vk_headers != null and spv_headers != null and vk_shaders != null;
+    if (llama_dep) |lc| addLlamaCpp(b, exe.root_module, lc, target, vulkan_on);
+    if (vulkan_on) addVulkan(b, exe.root_module, llama_dep.?, vk_headers.?, spv_headers.?, vk_shaders.?, target);
 
     // ---- the desktop GUI, compiled IN (one binary) ----
     // Was: shell out to desk/'s own `zig build` and ship a second veil-desk.exe that the server SPAWNED.
@@ -214,7 +225,7 @@ pub fn build(b: *std.Build) void {
 /// with the x86-64 AVX2 baseline (its default x64 release configuration) or the arm sources on
 /// aarch64; anything else falls back to the generic kernels. C++17 with exceptions (the library
 /// throws), UBSan off for the same reason as Lua below: its intentional aliasing is not ours to trap.
-fn addLlamaCpp(b: *std.Build, mod: *std.Build.Module, dep: *std.Build.Dependency, target: std.Build.ResolvedTarget) void {
+fn addLlamaCpp(b: *std.Build, mod: *std.Build.Module, dep: *std.Build.Dependency, target: std.Build.ResolvedTarget, vulkan: bool) void {
     mod.link_libc = true;
     mod.link_libcpp = true;
 
@@ -242,6 +253,12 @@ fn addLlamaCpp(b: *std.Build, mod: *std.Build.Module, dep: *std.Build.Dependency
     if (target.result.os.tag == .linux) {
         cflags_list.append(b.allocator, "-D_GNU_SOURCE") catch @panic("oom");
         cxxflags_list.append(b.allocator, "-D_GNU_SOURCE") catch @panic("oom");
+    }
+    // the backend REGISTRY (ggml-backend-reg.cpp) only registers what this define admits — it must
+    // ride every ggml unit whenever the Vulkan tier is compiled in (addVulkan adds the backend itself)
+    if (vulkan) {
+        cflags_list.append(b.allocator, "-DGGML_USE_VULKAN") catch @panic("oom");
+        cxxflags_list.append(b.allocator, "-DGGML_USE_VULKAN") catch @panic("oom");
     }
     const cflags = cflags_list.items;
     const cxxflags = cxxflags_list.items;
@@ -308,6 +325,61 @@ fn addLlamaCpp(b: *std.Build, mod: *std.Build.Module, dep: *std.Build.Dependency
         .files = &.{"llamashim.c"},
         .flags = cflags,
     });
+}
+
+/// Compile the Vulkan backend + the pre-generated shader units into `mod`. The shader artifact was
+/// generated with EXACTLY the GLSLC_SUPPORT define set below — the backend's #ifdefs must agree
+/// with what the shaders actually contain, so these stay a matched pair with the release asset.
+/// No import library: the backend's dynamic dispatcher dlopens the platform's Vulkan loader at
+/// runtime, so a machine with no GPU (or no loader at all) boots normally and serves CPU.
+fn addVulkan(b: *std.Build, mod: *std.Build.Module, llama: *std.Build.Dependency, headers: *std.Build.Dependency, spirv: *std.Build.Dependency, shaders: *std.Build.Dependency, target: std.Build.ResolvedTarget) void {
+    mod.addIncludePath(headers.path("include"));
+    mod.addIncludePath(spirv.path("include")); // spirv/unified1/spirv.hpp
+    mod.addIncludePath(shaders.path("")); // the generated ggml-vulkan-shaders.hpp
+
+    const flags = [_][]const u8{
+        "-std=c++17",
+        "-DNDEBUG",
+        "-fno-sanitize=undefined",
+        "-DGGML_USE_VULKAN",
+        "-DGGML_VULKAN_COOPMAT_GLSLC_SUPPORT",
+        "-DGGML_VULKAN_COOPMAT2_GLSLC_SUPPORT",
+        "-DGGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT",
+        "-DGGML_VULKAN_BFLOAT16_GLSLC_SUPPORT",
+    };
+    mod.addCSourceFiles(.{
+        .root = llama.path("ggml/src/ggml-vulkan"),
+        .files = &.{"ggml-vulkan.cpp"},
+        .flags = &flags,
+    });
+
+    // every pre-generated shader unit in the artifact (one per upstream .comp source)
+    const io = b.graph.io;
+    const sdir = shaders.path("").getPath3(b, null);
+    var names: std.ArrayListUnmanaged([]const u8) = .empty;
+    var d = sdir.root_dir.handle.openDir(io, sdir.subPathOrDot(), .{ .iterate = true }) catch @panic("veil_vulkan_shaders artifact unreadable");
+    defer d.close(io);
+    var it = d.iterate();
+    while (it.next(io) catch @panic("veil_vulkan_shaders artifact unreadable")) |e| {
+        if (e.kind != .file or !std.mem.endsWith(u8, e.name, ".cpp")) continue;
+        names.append(b.allocator, b.dupe(e.name)) catch @panic("oom");
+    }
+    if (names.items.len == 0) @panic("veil_vulkan_shaders artifact contains no shader units");
+    mod.addCSourceFiles(.{
+        .root = shaders.path(""),
+        .files = names.items,
+        .flags = &flags,
+    });
+
+    // the vkloader shim: the 3 symbols ggml-vulkan calls directly, forwarded to a lazily-dlopen'd
+    // loader so the binary has NO load-time Vulkan dependency (see the file header). Vulkan headers
+    // for the PFN typedefs; libdl on linux for dlopen.
+    mod.addCSourceFiles(.{
+        .root = b.path("src/worker"),
+        .files = &.{"vkloader.c"},
+        .flags = &.{ "-std=c11", "-fno-sanitize=undefined" },
+    });
+    if (target.result.os.tag == .linux) mod.linkSystemLibrary("dl", .{});
 }
 
 fn addCFiles(b: *std.Build, mod: *std.Build.Module, root: std.Build.LazyPath, files: []const []const u8, base: []const []const u8, arch: []const []const u8, extra: []const []const u8) void {

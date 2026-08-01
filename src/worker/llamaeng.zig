@@ -7,16 +7,27 @@
 //! build_options.builtin is true (main.zig gates the one construction site).
 //!
 //! Design points, in the order they matter:
-//!   * ONE model, ONE context, single-flight: `generate` holds the engine mutex for the whole
-//!     inference. Concurrent callers queue on the mutex — the same behavior a busy local runtime
-//!     gives them, minus a request queue to misbehave.
-//!   * PREFIX REUSE: chat resends the whole rendered conversation every turn; re-prefilling it on
-//!     a CPU would cost tens of seconds per turn. The engine keeps the token vector currently in
-//!     kv memory, finds the longest common prefix with the new prompt, drops only the divergent
-//!     tail (veil_ll_seq_rm) and decodes the suffix. Worst case (no overlap) is exactly the naive
-//!     cost; the steady-state chat turn re-evaluates only its newest messages.
+//!   * ROLE-AFFINE KV SLOTS. The turn loop interleaves up to ten DIFFERENT prompts (the agentic
+//!     step, the planner, the drive loop, compaction …) through one engine. A single kv sequence
+//!     re-prefilled the whole conversation on nearly every call — tens of seconds of full-core
+//!     work per call on a CPU, which is what "the app eats the machine" was. The engine now keeps
+//!     N sequences (NL_BUILTIN_SLOTS, default 4); each request is routed to the slot whose cached
+//!     tokens share the LONGEST PREFIX with its prompt, a barely-matching prompt takes an empty
+//!     slot before it evicts a warm one, and only the divergent tail is ever re-evaluated. Each
+//!     prompt family stabilizes its own slot, so a steady-state call prefills only its newest
+//!     messages. The kv allocation is per-slot-window × slots, and slot count HALVES automatically
+//!     when that allocation does not fit the machine.
+//!   * SPLIT THREAD POOLS. Decode is memory-bandwidth-bound (~physical cores is the sweet spot,
+//!     more just contends); prefill is compute-bound and scales wider. NL_BUILTIN_THREADS /
+//!     NL_BUILTIN_THREADS_BATCH pin either; the defaults are half the logical cores for decode and
+//!     all of them for prefill — an embedded harness must be a polite tenant, so neither default
+//!     grabs more than the work can actually use.
+//!   * SINGLE-FLIGHT: `generate` holds the engine mutex for the whole inference. Concurrent
+//!     callers queue — the same behavior a busy local runtime gives them.
 //!   * LAZY LOAD + IDLE UNLOAD: the first request pays the model load; an unloader thread returns
 //!     the ~7GB working set to the OS after NL_BUILTIN_KEEPALIVE seconds (default 300) of quiet.
+//!   * PER-REQUEST PERF LOG: every generation logs reused/prefilled token counts and both phase
+//!     rates — the regression instrument for this whole module.
 //!   * NO TESTS HERE: everything reachable without weights lives in builtin.zig /
 //!     builtin_endpoint.zig and is tested there against a mock Engine; a test block in this file
 //!     would drag unresolved externs into every `zig build test`.
@@ -31,17 +42,18 @@ const Sampler = opaque {};
 
 extern fn veil_ll_backend_init() void;
 extern fn veil_ll_log_quiet() void;
-extern fn veil_ll_load(path: [*:0]const u8) ?*Model;
+extern fn veil_ll_load(path: [*:0]const u8, n_gpu_layers: i32) ?*Model;
 extern fn veil_ll_load_meta(path: [*:0]const u8) ?*Model;
+extern fn veil_ll_gpu_desc(buf: [*]u8, cap: usize) i32;
 extern fn veil_ll_model_free(m: *Model) void;
-extern fn veil_ll_ctx_new(m: *Model, n_ctx: u32, n_batch: u32, n_threads: i32) ?*Ctx;
+extern fn veil_ll_ctx_new(m: *Model, n_ctx_total: u32, n_batch: u32, n_threads: i32, n_threads_batch: i32, n_seq: u32) ?*Ctx;
 extern fn veil_ll_ctx_free(c: *Ctx) void;
 extern fn veil_ll_vocab(m: *const Model) *const Vocab;
 extern fn veil_ll_tokenize(v: *const Vocab, text: [*]const u8, len: i32, toks: [*]i32, cap: i32, add_special: bool, parse_special: bool) i32;
-extern fn veil_ll_decode(c: *Ctx, toks: [*]i32, n: i32) i32;
+extern fn veil_ll_decode_seq(c: *Ctx, toks: [*]i32, n: i32, first_pos: i32, seq: i32, logits_last: bool) i32;
 extern fn veil_ll_mem_clear(c: *Ctx) void;
-extern fn veil_ll_seq_rm(c: *Ctx, p0: i32, p1: i32) bool;
-extern fn veil_ll_sampler_new(temp: f32, top_p: f32, seed: u32) ?*Sampler;
+extern fn veil_ll_seq_rm(c: *Ctx, seq: i32, p0: i32, p1: i32) bool;
+extern fn veil_ll_sampler_new(temp: f32, top_k: i32, top_p: f32, seed: u32) ?*Sampler;
 extern fn veil_ll_sampler_free(s: *Sampler) void;
 extern fn veil_ll_sample(s: *Sampler, c: *Ctx) i32;
 extern fn veil_ll_is_eog(v: *const Vocab, t: i32) bool;
@@ -54,9 +66,22 @@ const log = std.log.scoped(.llamaeng);
 
 /// Default sampling when the request pins nothing — the conventional local-model defaults, so the
 /// builtin backend behaves like the other local backends the engine already knows how to drive.
+/// top_k rides every sampled request: on a 262k-token vocabulary it is the cheap gate that keeps
+/// per-token sampling cost flat.
 const DEFAULT_TEMP: f32 = 0.8;
 const DEFAULT_TOP_P: f32 = 0.95;
+const DEFAULT_TOP_K: i32 = 40;
 const N_BATCH: u32 = 512;
+const MAX_SLOTS: u32 = 8;
+/// A prompt matching a warm slot by fewer than this many tokens is "unrelated" — it takes an empty
+/// slot (or the LRU) rather than evicting someone's cache for a nothing match.
+const MIN_AFFINITY: usize = 16;
+
+const Slot = struct {
+    /// Token vector currently materialized in this slot's kv sequence (prompt + generated).
+    toks: std.ArrayListUnmanaged(i32) = .empty,
+    used_s: i64 = 0,
+};
 
 const G = struct {
     mutex: std.Io.Mutex = .init,
@@ -67,11 +92,20 @@ const G = struct {
     ctx: ?*Ctx = null,
     path: [512]u8 = @splat(0),
     path_len: u16 = 0,
-    n_ctx: u32 = 8192,
+    n_ctx: u32 = 8192, // the PER-SLOT window (what /api/show reports)
     n_threads: i32 = 0,
+    n_threads_batch: i32 = 0,
+    n_slots_cfg: u32 = 4,
+    n_slots_live: u32 = 0, // after allocation (halved until the kv fits)
+    /// NL_BUILTIN_GPU: auto (default, offload everything a device will take), off, or a layer count.
+    gpu_layers: i32 = 999,
+    gpu_layers_live: i32 = 0, // where the fit ladder actually landed (0 = CPU serving)
+    // measured rates from the LAST generation (tenths of a token/s) — the status row's honest
+    // "what does THIS device actually deliver", instead of anyone guessing from specs
+    last_decode_tps10: u32 = 0,
+    last_prefill_tps10: u32 = 0,
+    slots: [MAX_SLOTS]Slot = [_]Slot{.{}} ** MAX_SLOTS,
     keepalive_s: i64 = 300,
-    /// Token vector currently materialized in kv memory (prompt + generated), for prefix reuse.
-    kv_toks: std.ArrayListUnmanaged(i32) = .empty,
     last_used_s: i64 = 0,
     /// Filled by the cheap metadata probe at configure() so /api/show answers before any full load.
     meta: builtin_mod.Info = .{},
@@ -92,6 +126,9 @@ fn unlock() void {
 fn nowS(io: std.Io) i64 {
     return @intCast(std.Io.Timestamp.now(io, .real).toSeconds());
 }
+fn nowMs(io: std.Io) i64 {
+    return @intCast(@divTrunc(std.Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_ms));
+}
 
 /// Point the engine at a weights file (or at nothing). Called at boot and again after a
 /// pull/import/delete changes the store. Cheap: full model load stays lazy; only the metadata
@@ -107,20 +144,43 @@ pub fn configure(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process
             if (n >= 1024) g.n_ctx = @min(n, 131072);
         } else |_| {}
     }
+    if (environ.get("NL_BUILTIN_SLOTS")) |v| {
+        if (std.fmt.parseInt(u32, std.mem.trim(u8, v, " \r\n\t"), 10)) |n| {
+            if (n >= 1) g.n_slots_cfg = @min(n, MAX_SLOTS);
+        } else |_| {}
+    }
+    const cpus: i32 = @intCast(std.Thread.getCpuCount() catch 8);
     if (environ.get("NL_BUILTIN_THREADS")) |v| {
         if (std.fmt.parseInt(i32, std.mem.trim(u8, v, " \r\n\t"), 10)) |n| {
             if (n > 0) g.n_threads = @min(n, 64);
         } else |_| {}
     }
     if (g.n_threads == 0) {
-        // logical/2 ≈ physical cores — the sweet spot for this workload; hyperthreads only add
-        // contention on the shared FMA units. Floor 4 so small boxes still parallelize.
-        const cpus: i32 = @intCast(std.Thread.getCpuCount() catch 8);
+        // logical/2 ≈ physical cores — decode is bandwidth-bound; hyperthreads only contend
         g.n_threads = @max(4, @min(@divTrunc(cpus, 2), 16));
+    }
+    if (environ.get("NL_BUILTIN_THREADS_BATCH")) |v| {
+        if (std.fmt.parseInt(i32, std.mem.trim(u8, v, " \r\n\t"), 10)) |n| {
+            if (n > 0) g.n_threads_batch = @min(n, 64);
+        } else |_| {}
+    }
+    if (g.n_threads_batch == 0) {
+        // prefill is compute-bound and scales across every logical core
+        g.n_threads_batch = @max(g.n_threads, @min(cpus, 32));
     }
     if (environ.get("NL_BUILTIN_KEEPALIVE")) |v| {
         if (std.fmt.parseInt(i64, std.mem.trim(u8, v, " \r\n\t"), 10)) |n| {
             if (n >= 30) g.keepalive_s = n;
+        } else |_| {}
+    }
+    if (environ.get("NL_BUILTIN_GPU")) |v| {
+        const t = std.mem.trim(u8, v, " \r\n\t");
+        if (std.ascii.eqlIgnoreCase(t, "off") or std.mem.eql(u8, t, "0")) {
+            g.gpu_layers = 0;
+        } else if (std.ascii.eqlIgnoreCase(t, "auto")) {
+            g.gpu_layers = 999;
+        } else if (std.fmt.parseInt(i32, t, 10)) |n| {
+            g.gpu_layers = @max(0, @min(n, 999));
         } else |_| {}
     }
 
@@ -196,6 +256,8 @@ fn setErrLocked(msg: []const u8) void {
 }
 
 /// Vocab-only load: arch + param count without touching the weight tensors. ~100ms on a 7GB file.
+/// Also records which GPU-class device the runtime sees (backend registry is up by now) — the
+/// status row's answer to "is it on the GPU?".
 fn metaProbeLocked() void {
     ensureBackendLocked();
     var zbuf: [513]u8 = undefined;
@@ -214,6 +276,10 @@ fn metaProbeLocked() void {
         g.meta.arch_len = @intCast(n);
     }
     g.meta.params_b = @intCast((veil_ll_n_params(m) + 500_000_000) / 1_000_000_000);
+    if (g.gpu_layers > 0) {
+        const gn = veil_ll_gpu_desc(&g.meta.gpu, g.meta.gpu.len);
+        g.meta.gpu_len = if (gn > 0) @intCast(gn) else 0;
+    }
 }
 
 fn pathZLocked(buf: []u8) ?[*:0]const u8 {
@@ -223,29 +289,75 @@ fn pathZLocked(buf: []u8) ?[*:0]const u8 {
     return @ptrCast(buf[0..g.path_len :0].ptr);
 }
 
-fn ensureLoadedLocked() ![]const u8 {
-    if (g.ctx != null) return "";
+fn ensureLoadedLocked() !void {
+    if (g.ctx != null) return;
     if (g.path_len == 0) return error.NoWeights;
     ensureBackendLocked();
     var zbuf: [513]u8 = undefined;
     const p = pathZLocked(&zbuf) orelse return error.NoWeights;
     const t0 = nowS(g.io);
-    const m = veil_ll_load(p) orelse {
+
+    // GPU FIT LADDER. "auto" must work on ANY card, and the only honest fit test on unknown
+    // hardware is the allocation itself: try full offload, and on failure walk down (¾, ½, ¼,
+    // CPU), logging where it landed. A 4GB card ends up partially offloaded; no card ends up
+    // with a hard-failed engine. Each rung costs a load attempt — seconds, once, at first use.
+    var gpu_avail = false;
+    {
+        var gbuf: [64]u8 = undefined;
+        gpu_avail = g.gpu_layers > 0 and veil_ll_gpu_desc(&gbuf, gbuf.len) > 0;
+    }
+    const ladder = [_]i32{ g.gpu_layers, @divTrunc(g.gpu_layers * 3, 4), @divTrunc(g.gpu_layers, 2), @divTrunc(g.gpu_layers, 4), 0 };
+    var rung: usize = if (gpu_avail) 0 else ladder.len - 1;
+    const m: *Model, const ngl: i32 = blk: {
+        while (rung < ladder.len) : (rung += 1) {
+            const try_ngl = ladder[rung];
+            if (veil_ll_load(p, try_ngl)) |m| break :blk .{ m, try_ngl };
+            if (try_ngl > 0) log.warn("offload at {d} layers did not fit — retrying lower", .{try_ngl});
+        }
         g.load_failed = true;
         setErrLocked("model load failed (corrupt file, unsupported quant, or out of memory)");
         return error.LoadFailed;
     };
-    const c = veil_ll_ctx_new(m, g.n_ctx, N_BATCH, g.n_threads) orelse {
-        veil_ll_model_free(m);
-        g.load_failed = true;
-        setErrLocked("context allocation failed (not enough memory for the kv window)");
-        return error.LoadFailed;
+
+    // Slot budget follows PLACEMENT. On CPU, slot caching is the difference between seconds and
+    // minutes per call, and system RAM has room for windows × slots. On a GPU the kv rides VRAM
+    // beside the weights AND prefill runs ~50x faster, so extra slots buy little and can cost the
+    // whole fit — serve 1 slot (NL_BUILTIN_SLOTS still overrides upward for big-VRAM boxes).
+    var n: u32 = if (ngl > 0) @min(g.n_slots_cfg, 1) else @max(1, g.n_slots_cfg);
+    if (ngl > 0 and g.n_slots_cfg > 4) n = 2; // an explicit big ask on a GPU box: meet halfway
+    const c: *Ctx = blk: {
+        while (true) {
+            if (veil_ll_ctx_new(m, g.n_ctx * n, N_BATCH, g.n_threads, g.n_threads_batch, n)) |c| break :blk c;
+            if (n == 1) {
+                veil_ll_model_free(m);
+                g.load_failed = true;
+                setErrLocked("context allocation failed (not enough memory for even one kv window)");
+                return error.LoadFailed;
+            }
+            n /= 2;
+            log.warn("kv allocation did not fit — retrying with {d} slot(s)", .{n});
+        }
     };
     g.model = m;
     g.ctx = c;
-    g.kv_toks.clearRetainingCapacity();
-    log.info("model loaded in {d}s (ctx={d} threads={d})", .{ nowS(g.io) - t0, g.n_ctx, g.n_threads });
-    return "";
+    g.n_slots_live = n;
+    g.gpu_layers_live = ngl;
+    for (g.slots[0..MAX_SLOTS]) |*sl| {
+        sl.toks.clearRetainingCapacity();
+        sl.used_s = 0;
+    }
+    log.info("model loaded in {d}s (window={d} x {d} slots, threads={d}/{d} batch, gpu_layers={d})", .{ nowS(g.io) - t0, g.n_ctx, n, g.n_threads, g.n_threads_batch, ngl });
+
+    // WARM THE GPU PIPELINES. The Vulkan backend compiles its compute pipelines LAZILY on first
+    // decode — ~15-20s of one-time cost that, unwarmed, lands on the user's first chat turn as a
+    // mysterious stall. A single throwaway token decode here pays it during load (behind the
+    // "installing/loading" state) instead. CPU serving compiles nothing, so skip it there.
+    if (ngl > 0) {
+        var warm = [_]i32{0}; // token 0 (BOS-ish); we discard the result, only the pipeline compile matters
+        _ = veil_ll_decode_seq(c, &warm, 1, 0, 0, true);
+        _ = veil_ll_seq_rm(c, 0, 0, -1); // leave slot 0 clean for the first real request
+        log.info("gpu pipelines warmed ({d}s total to ready)", .{nowS(g.io) - t0});
+    }
 }
 
 fn unloadLocked() void {
@@ -253,7 +365,11 @@ fn unloadLocked() void {
     if (g.model) |m| veil_ll_model_free(m);
     g.ctx = null;
     g.model = null;
-    g.kv_toks.clearRetainingCapacity();
+    g.n_slots_live = 0;
+    for (g.slots[0..MAX_SLOTS]) |*sl| {
+        sl.toks.clearAndFree(g.gpa);
+        sl.used_s = 0;
+    }
 }
 
 fn unloaderLoop() void {
@@ -275,6 +391,8 @@ pub fn info() builtin_mod.Info {
     defer unlock();
     var out = g.meta;
     out.ctx_serving = g.n_ctx;
+    out.gpu_layers = g.gpu_layers_live;
+    out.decode_tps10 = g.last_decode_tps10;
     out.state = if (g.path_len == 0)
         .absent
     else if (g.load_failed)
@@ -300,13 +418,13 @@ pub fn engine() builtin_mod.Engine {
     return .{ .ctx = @ptrCast(&vt_ctx), .generate = vtGenerate, .info = vtInfo };
 }
 
-/// One full generation under the engine mutex. See the module header for the prefix-reuse and
+/// One full generation under the engine mutex. See the module header for the slot, thread and
 /// stop-withholding contracts; the sink receives raw text with stop sequences never leaked.
 pub fn generate(gpa: std.mem.Allocator, req: builtin_mod.GenReq) !builtin_mod.GenRes {
     if (!g.configured) return error.NoWeights;
     lock();
     defer unlock();
-    _ = try ensureLoadedLocked();
+    try ensureLoadedLocked();
     g.last_used_s = nowS(g.io);
     defer g.last_used_s = nowS(g.io);
 
@@ -314,47 +432,75 @@ pub fn generate(gpa: std.mem.Allocator, req: builtin_mod.GenReq) !builtin_mod.Ge
     const vocab = veil_ll_vocab(g.model.?);
 
     // ---- tokenize (specials parsed: the rendered prompt carries the wire-format tokens) ----
-    const cap: i32 = @intCast(g.n_ctx);
     const toks = try gpa.alloc(i32, g.n_ctx);
     defer gpa.free(toks);
-    const n_tok = veil_ll_tokenize(vocab, req.prompt.ptr, @intCast(req.prompt.len), toks.ptr, cap, false, true);
+    const n_tok = veil_ll_tokenize(vocab, req.prompt.ptr, @intCast(req.prompt.len), toks.ptr, @intCast(g.n_ctx), false, true);
     if (n_tok <= 0) return error.PromptTooLong; // negative = needed size exceeds the serving window
     const prompt_toks = toks[0..@intCast(n_tok)];
     // leave real room to answer: a prompt that fills the window would generate nothing useful
     if (prompt_toks.len + 16 > g.n_ctx) return error.PromptTooLong;
 
-    // ---- prefix reuse ----
-    var common: usize = 0;
-    const kv = g.kv_toks.items;
-    while (common < kv.len and common < prompt_toks.len and kv[common] == prompt_toks[common]) common += 1;
+    // ---- slot election: longest shared prefix wins; weak matches take an empty slot before
+    // evicting a warm one; everything warm and nothing matching → the least recently used ----
+    var best_slot: usize = 0;
+    var best_common: usize = 0;
+    var empty_slot: ?usize = null;
+    var lru_slot: usize = 0;
+    var lru_s: i64 = std.math.maxInt(i64);
+    for (g.slots[0..g.n_slots_live], 0..) |*sl, i| {
+        if (sl.toks.items.len == 0 and empty_slot == null) empty_slot = i;
+        if (sl.used_s < lru_s) {
+            lru_s = sl.used_s;
+            lru_slot = i;
+        }
+        const kv = sl.toks.items;
+        var c: usize = 0;
+        while (c < kv.len and c < prompt_toks.len and kv[c] == prompt_toks[c]) c += 1;
+        if (c > best_common) {
+            best_common = c;
+            best_slot = i;
+        }
+    }
+    var slot = best_slot;
+    var common = best_common;
+    if (best_common < MIN_AFFINITY) {
+        slot = empty_slot orelse lru_slot;
+        common = if (slot == best_slot) best_common else 0;
+    }
+    const sl = &g.slots[slot];
     // the final prompt token must be DECODED this call so its logits exist to sample from
     if (common == prompt_toks.len) common -= 1;
-    if (common < kv.len) {
-        if (!veil_ll_seq_rm(ctx, @intCast(common), -1)) {
-            veil_ll_mem_clear(ctx);
+    if (common < sl.toks.items.len) {
+        if (!veil_ll_seq_rm(ctx, @intCast(slot), @intCast(common), -1)) {
+            _ = veil_ll_seq_rm(ctx, @intCast(slot), 0, -1);
             common = 0;
         }
     }
-    g.kv_toks.clearRetainingCapacity();
-    g.kv_toks.appendSlice(g.gpa, prompt_toks) catch {};
+    sl.toks.clearRetainingCapacity();
+    sl.toks.appendSlice(g.gpa, prompt_toks) catch {};
+    sl.used_s = nowS(g.io);
 
     // ---- prefill the divergent suffix in batch-sized chunks ----
+    const t_pre0 = nowMs(g.io);
     var at: usize = common;
     while (at < prompt_toks.len) {
         const n: usize = @min(N_BATCH, prompt_toks.len - at);
-        if (veil_ll_decode(ctx, prompt_toks.ptr + at, @intCast(n)) != 0) {
-            veil_ll_mem_clear(ctx);
-            g.kv_toks.clearRetainingCapacity();
+        const last = at + n == prompt_toks.len;
+        if (veil_ll_decode_seq(ctx, prompt_toks.ptr + at, @intCast(n), @intCast(at), @intCast(slot), last) != 0) {
+            _ = veil_ll_seq_rm(ctx, @intCast(slot), 0, -1);
+            sl.toks.clearRetainingCapacity();
             return error.DecodeFailed;
         }
         at += n;
     }
+    const prefill_ms = nowMs(g.io) - t_pre0;
+    const prefilled = prompt_toks.len - common;
 
     // ---- sampler ----
     g.seed_seq +%= 1;
     const temp: f32 = if (req.temp < 0) DEFAULT_TEMP else req.temp;
     const top_p: f32 = if (req.temp < 0) DEFAULT_TOP_P else req.top_p;
-    const smpl = veil_ll_sampler_new(temp, top_p, g.seed_seq ^ @as(u32, @truncate(@as(u64, @intFromPtr(&g))))) orelse return error.DecodeFailed;
+    const smpl = veil_ll_sampler_new(temp, DEFAULT_TOP_K, top_p, g.seed_seq ^ @as(u32, @truncate(@as(u64, @intFromPtr(&g))))) orelse return error.DecodeFailed;
     defer veil_ll_sampler_free(smpl);
 
     // ---- decode loop with stop withholding ----
@@ -367,13 +513,14 @@ pub fn generate(gpa: std.mem.Allocator, req: builtin_mod.GenReq) !builtin_mod.Ge
     var truncated = false;
     var aborted = false;
     var piece_buf: [512]u8 = undefined;
+    const t_gen0 = nowMs(g.io);
 
     outer: while (true) {
         if (produced >= req.n_predict) {
             truncated = true;
             break;
         }
-        if (g.kv_toks.items.len + 1 >= g.n_ctx) {
+        if (sl.toks.items.len + 1 >= g.n_ctx) {
             truncated = true;
             break;
         }
@@ -411,18 +558,34 @@ pub fn generate(gpa: std.mem.Allocator, req: builtin_mod.GenReq) !builtin_mod.Ge
             }
         }
         var one = [1]i32{tok};
-        if (veil_ll_decode(ctx, &one, 1) != 0) break;
-        g.kv_toks.append(g.gpa, tok) catch {};
+        if (veil_ll_decode_seq(ctx, &one, 1, @intCast(sl.toks.items.len), @intCast(slot), true) != 0) break;
+        sl.toks.append(g.gpa, tok) catch {};
     }
+    const gen_ms = nowMs(g.io) - t_gen0;
 
     // flush the withheld tail (minus any stop already truncated away)
     if (req.on_piece != null and !aborted and text.items.len > emitted) {
         _ = req.on_piece.?(req.sink_ctx.?, text.items[emitted..]);
     }
 
+    const prefill_tps: f64 = if (prefill_ms > 0) @as(f64, @floatFromInt(prefilled)) * 1000.0 / @as(f64, @floatFromInt(prefill_ms)) else 0.0;
+    const decode_tps: f64 = if (gen_ms > 0) @as(f64, @floatFromInt(produced)) * 1000.0 / @as(f64, @floatFromInt(gen_ms)) else 0.0;
+    if (produced >= 4) g.last_decode_tps10 = @intFromFloat(@min(decode_tps * 10.0, 100_000)); // tiny gens are noise, not a measurement
+    if (prefilled >= 64) g.last_prefill_tps10 = @intFromFloat(@min(prefill_tps * 10.0, 1_000_000));
+    log.info("gen: slot={d} reuse={d} prefill={d}tk/{d}ms ({d:.1} t/s) decode={d}tk/{d}ms ({d:.1} t/s)", .{
+        slot,
+        common,
+        prefilled,
+        prefill_ms,
+        prefill_tps,
+        produced,
+        gen_ms,
+        decode_tps,
+    });
+
     return .{
         .text = try text.toOwnedSlice(gpa),
-        .prompt_tokens = @intCast(prompt_toks.len - common),
+        .prompt_tokens = @intCast(prefilled),
         .gen_tokens = produced,
         .truncated = truncated,
     };

@@ -7315,6 +7315,10 @@ fn drawSettings(store: *Store, body: t.Rect) void {
         var stn: usize = 0;
         var arb: [24]u8 = undefined;
         var arn: usize = 0;
+        var gpb: [64]u8 = undefined;
+        var gpn: usize = 0;
+        var bi_gpu_layers: u32 = 0;
+        var bi_tps10: u32 = 0;
         var erb: [160]u8 = undefined;
         var ern: usize = 0;
         var usb: [10]u8 = undefined;
@@ -7335,6 +7339,10 @@ fn drawSettings(store: *Store, body: t.Rect) void {
             @memcpy(stb[0..stn], store.bi_state[0..stn]);
             arn = store.bi_arch_len;
             @memcpy(arb[0..arn], store.bi_arch[0..arn]);
+            gpn = store.bi_gpu_len;
+            @memcpy(gpb[0..gpn], store.bi_gpu[0..gpn]);
+            bi_gpu_layers = store.bi_gpu_layers;
+            bi_tps10 = store.bi_tps10;
             ern = store.bi_err_len;
             @memcpy(erb[0..ern], store.bi_err[0..ern]);
             usn = store.bi_upd_state_len;
@@ -7354,7 +7362,17 @@ fn drawSettings(store: *Store, body: t.Rect) void {
         } else if (!bi_compiled) {
             t.text(t.z("this server build carries no built-in engine (-Dbuiltin=false) - rebuild with defaults to enable it", .{}), @intFromFloat(x), @intFromFloat(y), 11, t.comment);
         } else if (bi_served) {
-            t.text(t.z("the-veil-12b installed ({s} {d}B) - this server runs it with zero setup, no key, no external runtime", .{ arb[0..arn], bi_params }), @intFromFloat(x), @intFromFloat(y), 11, t.green);
+            if (gpn > 0 and bi_gpu_layers > 0) {
+                if (bi_tps10 > 0) {
+                    t.text(t.z("the-veil-12b installed ({s} {d}B - GPU: {s} - ~{d}.{d} tok/s) - zero setup, no key", .{ arb[0..arn], bi_params, gpb[0..gpn], bi_tps10 / 10, bi_tps10 % 10 }), @intFromFloat(x), @intFromFloat(y), 11, t.green);
+                } else {
+                    t.text(t.z("the-veil-12b installed ({s} {d}B - GPU: {s}) - zero setup, no key, no external runtime", .{ arb[0..arn], bi_params, gpb[0..gpn] }), @intFromFloat(x), @intFromFloat(y), 11, t.green);
+                }
+            } else if (bi_tps10 > 0) {
+                t.text(t.z("the-veil-12b installed ({s} {d}B - CPU - ~{d}.{d} tok/s) - zero setup, no key, no external runtime", .{ arb[0..arn], bi_params, bi_tps10 / 10, bi_tps10 % 10 }), @intFromFloat(x), @intFromFloat(y), 11, t.green);
+            } else {
+                t.text(t.z("the-veil-12b installed ({s} {d}B - CPU) - zero setup, no key, no external runtime", .{ arb[0..arn], bi_params }), @intFromFloat(x), @intFromFloat(y), 11, t.green);
+            }
         } else if (bi_failed) {
             t.text(t.z("failed: {s}", .{erb[0..ern]}), @intFromFloat(x), @intFromFloat(y), 11, t.red);
         } else if (bi_busy) {

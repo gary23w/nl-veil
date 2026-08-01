@@ -72,11 +72,22 @@ pub const Info = struct {
     /// The window the engine actually SERVES (its context allocation), not the model's trained max.
     /// /api/show reports this so the client never requests a window the engine cannot hold.
     ctx_serving: u32 = 0,
+    /// The GPU-class device the runtime can see (empty = none → CPU serving). Status surfaces it
+    /// so "is it on the GPU?" is read off the row, never guessed from noise.
+    gpu: [64]u8 = @splat(0),
+    gpu_len: u8 = 0,
+    /// Where the offload fit ladder actually landed (0 = CPU serving; partial counts are real).
+    gpu_layers: i32 = 0,
+    /// Measured decode rate of the last real generation, tenths of a token/s (0 = not measured yet).
+    decode_tps10: u32 = 0,
     err: [192]u8 = @splat(0),
     err_len: u8 = 0,
 
     pub fn archName(self: *const Info) []const u8 {
         return self.arch[0..self.arch_len];
+    }
+    pub fn gpuName(self: *const Info) []const u8 {
+        return self.gpu[0..self.gpu_len];
     }
     pub fn errMsg(self: *const Info) []const u8 {
         return self.err[0..self.err_len];

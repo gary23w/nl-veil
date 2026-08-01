@@ -27,10 +27,31 @@ void veil_ll_log_quiet(void) {
     llama_log_set(veil_ll_log_null, NULL);
 }
 
-struct llama_model * veil_ll_load(const char * path) {
+/* n_gpu_layers: 0 = CPU only; large (999) = offload everything a present accelerator can take.
+ * With no usable device at runtime the library warns and loads CPU buffers — same file, same
+ * call, graceful floor. */
+struct llama_model * veil_ll_load(const char * path, int32_t n_gpu_layers) {
     struct llama_model_params p = llama_model_default_params();
-    p.n_gpu_layers = 0; /* CPU-only build */
+    p.n_gpu_layers = n_gpu_layers;
     return llama_model_load_from_file(path, p);
+}
+
+/* Description of the first GPU-class compute device the runtime can actually see (empty when
+ * none): what the status row shows so "is it on the GPU?" is never a guess. */
+int32_t veil_ll_gpu_desc(char * buf, size_t cap) {
+    size_t n = ggml_backend_dev_count();
+    for (size_t i = 0; i < n; i++) {
+        ggml_backend_dev_t d = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            const char * desc = ggml_backend_dev_description(d);
+            if (!desc) return 0;
+            size_t len = strlen(desc);
+            if (len > cap) len = cap;
+            memcpy(buf, desc, len);
+            return (int32_t) len;
+        }
+    }
+    return 0;
 }
 
 /* Metadata-only load: vocab + header, no weight tensors. Cheap (~100ms on a 7GB file) —
@@ -46,14 +67,16 @@ void veil_ll_model_free(struct llama_model * m) {
     llama_model_free(m);
 }
 
-struct llama_context * veil_ll_ctx_new(struct llama_model * m, uint32_t n_ctx, uint32_t n_batch, int32_t n_threads) {
+/* n_ctx_total is the WHOLE kv allocation shared by n_seq slots (the engine sizes it as
+ * per-slot-window * slots). Decode threads and batch (prefill) threads split: decode is
+ * memory-bandwidth-bound and wants ~physical cores; prefill is compute-bound and scales wider. */
+struct llama_context * veil_ll_ctx_new(struct llama_model * m, uint32_t n_ctx_total, uint32_t n_batch, int32_t n_threads, int32_t n_threads_batch, uint32_t n_seq) {
     struct llama_context_params p = llama_context_default_params();
-    p.n_ctx   = n_ctx;
-    p.n_batch = n_batch;
-    if (n_threads > 0) {
-        p.n_threads       = n_threads;
-        p.n_threads_batch = n_threads;
-    }
+    p.n_ctx     = n_ctx_total;
+    p.n_batch   = n_batch;
+    p.n_seq_max = n_seq > 0 ? n_seq : 1;
+    if (n_threads > 0)       p.n_threads       = n_threads;
+    if (n_threads_batch > 0) p.n_threads_batch = n_threads_batch;
     return llama_init_from_model(m, p);
 }
 
@@ -69,25 +92,50 @@ int32_t veil_ll_tokenize(const struct llama_vocab * v, const char * text, int32_
     return llama_tokenize(v, text, len, toks, cap, add_special, parse_special);
 }
 
-int32_t veil_ll_decode(struct llama_context * c, llama_token * toks, int32_t n) {
-    return llama_decode(c, llama_batch_get_one(toks, n));
+/* One decode of `n` tokens into sequence `seq` at positions [first_pos, first_pos+n). Logits are
+ * computed only for the final token when logits_last (the sampling read); pure prefill chunks pass
+ * false and skip the lm_head entirely. Static scratch is safe: the engine is single-flight by its
+ * own mutex, so exactly one decode is ever in here. */
+int32_t veil_ll_decode_seq(struct llama_context * c, llama_token * toks, int32_t n, int32_t first_pos, int32_t seq, bool logits_last) {
+    enum { CAP = 4096 };
+    static llama_pos     pos[CAP];
+    static int32_t       nsq[CAP];
+    static llama_seq_id  sid;
+    static llama_seq_id *sidp[CAP];
+    static int8_t        lgt[CAP];
+    if (n <= 0 || n > CAP) return -1;
+    sid = (llama_seq_id) seq;
+    for (int32_t i = 0; i < n; i++) {
+        pos[i]  = first_pos + i;
+        nsq[i]  = 1;
+        sidp[i] = &sid;
+        lgt[i]  = (logits_last && i == n - 1) ? 1 : 0;
+    }
+    struct llama_batch b = { n, toks, NULL, pos, nsq, sidp, lgt };
+    return llama_decode(c, b);
 }
 
 void veil_ll_mem_clear(struct llama_context * c) {
     llama_memory_clear(llama_get_memory(c), true);
 }
 
-/* Drop cached positions [p0, p1) of the single serving sequence — the prefix-reuse primitive. */
-bool veil_ll_seq_rm(struct llama_context * c, int32_t p0, int32_t p1) {
-    return llama_memory_seq_rm(llama_get_memory(c), 0, p0, p1);
+/* Drop cached positions [p0, p1) of one slot's sequence — the prefix-reuse primitive. */
+bool veil_ll_seq_rm(struct llama_context * c, int32_t seq, int32_t p0, int32_t p1) {
+    return llama_memory_seq_rm(llama_get_memory(c), (llama_seq_id) seq, p0, p1);
 }
 
-struct llama_sampler * veil_ll_sampler_new(float temp, float top_p, uint32_t seed) {
+/* Chain order mirrors the conventional local-serving default: top_k first (cuts the 262k-entry
+ * vocab to k before anything sorts), then top_p, temperature, and the seeded pick. top_k is the
+ * cheap gate that keeps per-token sampling cost flat on huge vocabularies. */
+struct llama_sampler * veil_ll_sampler_new(float temp, int32_t top_k, float top_p, uint32_t seed) {
     struct llama_sampler_chain_params cp = llama_sampler_chain_default_params();
     struct llama_sampler * chain = llama_sampler_chain_init(cp);
     if (temp <= 0.0f) {
         llama_sampler_chain_add(chain, llama_sampler_init_greedy());
     } else {
+        if (top_k > 0) {
+            llama_sampler_chain_add(chain, llama_sampler_init_top_k(top_k));
+        }
         if (top_p > 0.0f && top_p < 1.0f) {
             llama_sampler_chain_add(chain, llama_sampler_init_top_p(top_p, 1));
         }

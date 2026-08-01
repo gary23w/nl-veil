@@ -1196,6 +1196,9 @@ fn builtinStatus(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         .arch = inf.archName(),
         .params_b = inf.params_b,
         .ctx = inf.ctx_serving,
+        .gpu = inf.gpuName(),
+        .gpu_layers = inf.gpu_layers,
+        .decode_tps10 = inf.decode_tps10,
         .err = if (ps.state == .failed) ps.err else inf.errMsg(),
         .synced_dir_warning = builtin_state.syncedDirWarning(),
         // the update lane: what the repo currently publishes vs what this store serves
