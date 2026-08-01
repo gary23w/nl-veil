@@ -1019,6 +1019,15 @@ const WORKING_KEEP_TAIL_BYTES: usize = 32 * 1024;
 /// something to anchor on.
 const WORKING_HARD_FOLD_BYTES: usize = 48 * 1024;
 
+/// Floor for the window-scaled working budget (see workingBudgetBytes). Small enough that a genuinely tiny
+/// window still folds, large enough that one real tool round survives a fold — below this the model spends
+/// every round re-reading what the previous fold deleted, which is worse than a slightly long prompt.
+const WORKING_MIN_BUDGET_BYTES: usize = 6 * 1024;
+
+/// Bytes the window must keep free for the model's own answer, when sizing the working span. num_predict is
+/// 2048 tokens at the small tier (turnTokenBudget); at the same pessimistic 3 bytes/token that is ~6 KB.
+const turnOutputReserveBytes: usize = 6 * 1024;
+
 /// Clip an oversized tool result to head + elision note + tail (UTF-8-boundary safe). Returns `result`
 /// unchanged (same pointer) when it already fits; otherwise a NEW gpa string (caller frees whichever it holds).
 fn clipToolResult(gpa: std.mem.Allocator, result: []const u8) []u8 {
@@ -1900,7 +1909,10 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
         // CROSS-STEP COMPACTION: fold accumulated drive-step growth (prior settled answers + compacted notes) into
         // one note when it crosses the budget, so a long multi-step / afk turn can't overflow the model window
         // across steps. No-op on the first step (nothing past the assembled prefix yet).
-        compactWorking(app, llm_dir, think.base_url, think.key, think.model, &conv_buf, assembled_len, &ctx, &tool_obs);
+        // Budget keyed on the CODING model + this turn's tool array: coding is what consumes conv_buf, and
+        // the schemas ride in the same window. `think` here is only who WRITES the fold.
+        compactWorking(app, llm_dir, think.base_url, think.key, think.model, &conv_buf, assembled_len, &ctx, &tool_obs,
+            workingBudgetBytes(trio.coding.base_url, trio.coding.model, assembled_len + turn_tools.len));
 
         // PLAN STEP: when a plan is active, take the next pending subtask and inject it as this step's working turn
         // (so the agentic pass works THAT subtask, route-hinted). No plan → drive step 0 works the user's message
@@ -5767,6 +5779,40 @@ fn turnTokenBudget(environ: *const std.process.Environ.Map, base_url: []const u8
     return @max(1024, @as(u32, @intFromFloat(8192.0 * scale)));
 }
 
+/// Bytes of WORKING SPAN a turn may accumulate before compaction must fold it, for a turn whose prompt is
+/// CONSUMED by `model`. `fixed_bytes` is the part of the prompt compaction cannot touch — the assembled
+/// prefix (system blocks + bounded history) plus the tool-schema array.
+///
+/// Why this exists. The three working-span constants are absolute byte counts, measured on a large window
+/// and never related to the window actually being served. On the built-in 12B that serves 8192 tokens
+/// (~28 KB of text) they are all bigger than the whole window: compaction does not even TRIGGER until the
+/// span passes 24 KB, and the tail it preserves is 32 KB. Add a 20-tool schema array (~13 KB) and the
+/// system blocks (~6 KB) and the prompt is over the window long before the fold that was supposed to
+/// prevent that can fire. The provider then rejects the request outright — `in:0, out:0` — which is the
+/// "prompt exceeds the serving context window" seen in conv c6a6e014f.
+///
+/// It also disabled the memory path. compactWorking is what flushes queued observes into neuron-db before
+/// dropping bytes (MEMORY-BEFORE-FORGETTING). Never reaching the trigger means a small model never banks
+/// anything and never gets it back through assoc recall — the DB is wired up correctly and simply never
+/// runs for the tier that needs it most.
+///
+/// LARGE WINDOWS ARE UNTOUCHED, deliberately: when the window can already hold the existing constants this
+/// returns WORKING_COMPACT_BYTES unchanged, so every model that works today keeps byte-identical behaviour.
+/// Only a window too small for them tightens, and never below a floor that still fits one real tool round.
+fn workingBudgetBytes(base_url: []const u8, model: []const u8, fixed_bytes: usize) usize {
+    const local = std.mem.indexOf(u8, base_url, "127.0.0.1") != null or
+        std.mem.indexOf(u8, base_url, "localhost") != null;
+    const win_tokens: usize = @as(usize, modelcfg.senseModel(model, local).ctx_k) * 1024;
+    // 3 bytes/token is deliberately pessimistic: measured 3.5 on this corpus (5577 tokens for 19639 bytes),
+    // and under-estimating the window is the safe direction — it folds early rather than overflowing.
+    const win_bytes = win_tokens * 3;
+    const reserve = @as(usize, turnOutputReserveBytes) + fixed_bytes;
+    if (win_bytes <= reserve) return WORKING_MIN_BUDGET_BYTES;
+    const available = win_bytes - reserve;
+    if (available >= WORKING_HARD_FOLD_BYTES) return cctx.WORKING_COMPACT_BYTES; // roomy: today's behaviour
+    return @max(WORKING_MIN_BUDGET_BYTES, @min(cctx.WORKING_COMPACT_BYTES, available));
+}
+
 fn runInnerAgentic(
     app: *App,
     uid: u64,
@@ -6443,7 +6489,8 @@ fn runInnerAgentic(
         }
         // WITHIN-TURN COMPACTION (step boundary): if this pass's working growth has crossed the budget, compress it
         // into a progress note so a long/afk turn can keep going without overflowing the model window.
-        compactWorking(app, run_root, think.base_url, think.key, think.model, conv_buf, base_len, ctx, tool_obs);
+        compactWorking(app, run_root, think.base_url, think.key, think.model, conv_buf, base_len, ctx, tool_obs,
+            workingBudgetBytes(base_url, model, base_len + turn_tools.len));
         // GROUND-TRUTH CONFLICT SPLICE — after compaction (never folded into a summary), before any steer
         // (the user's live instruction stays last, i.e. most salient).
         if (post_note.items.len > 0)
@@ -7395,8 +7442,15 @@ fn summarizeWorkingSpan(app: *App, run_root: []const u8, base_url: []const u8, k
 /// dangling tool_calls). When no safe splice point exists the span is left alone, or folded whole past
 /// WORKING_HARD_FOLD_BYTES — see the two constants for both cases.
 /// Best-effort: a failed summary leaves the buffer as-is (the MAX_ITERS cap still bounds the pass).
-fn compactWorking(app: *App, run_root: []const u8, base_url: []const u8, key: []const u8, model: []const u8, conv_buf: *std.ArrayListUnmanaged(u8), base_len: usize, ctx: *tools.ToolCtx, tool_obs: *std.ArrayListUnmanaged([]u8)) void {
-    if (conv_buf.items.len <= base_len or conv_buf.items.len - base_len <= cctx.WORKING_COMPACT_BYTES) return;
+fn compactWorking(app: *App, run_root: []const u8, base_url: []const u8, key: []const u8, model: []const u8, conv_buf: *std.ArrayListUnmanaged(u8), base_len: usize, ctx: *tools.ToolCtx, tool_obs: *std.ArrayListUnmanaged([]u8), budget: usize) void {
+    if (conv_buf.items.len <= base_len or conv_buf.items.len - base_len <= budget) return;
+    // The tail kept verbatim must be SMALLER than the trigger, or a fold cannot shrink the span. At the
+    // stock 24 KB trigger / 32 KB tail it never did: folding only really began at 32 KB. That slack is
+    // affordable on a large window and fatal on a small one, so on a tightened budget the tail is half of
+    // it — every fold then halves the span and the loop is guaranteed to make progress.
+    const roomy = budget >= cctx.WORKING_COMPACT_BYTES;
+    const keep_tail = if (roomy) WORKING_KEEP_TAIL_BYTES else @max(2 * 1024, budget / 2);
+    const hard_fold = if (roomy) WORKING_HARD_FOLD_BYTES else budget + budget / 2;
     const gpa = app.gpa;
     // MEMORY-BEFORE-FORGETTING: the span about to be folded holds tool findings whose queued observes have
     // not landed yet (the queue normally flushes at turn exit). Flush them NOW — one batched subprocess —
@@ -7414,13 +7468,13 @@ fn compactWorking(app: *App, run_root: []const u8, base_url: []const u8, key: []
     // a message boundary: it anchors only on a user/assistant/system object and explicitly refuses an orphan tool
     // result — one whose tool_calls announcement is inside the folded span is an immediate provider 400.
     const span = conv_buf.items[base_len..];
-    const tail = msgTail(span, WORKING_KEEP_TAIL_BYTES);
+    const tail = msgTail(span, keep_tail);
     // msgTail returns the whole input when it finds no valid anchor in the keep window — one enormous message,
     // or a round whose own tool results fill the window (their announcement sits further back). There is no
     // splice that doesn't tear the sequence then, so keep the span intact and wait for the next round to give
     // it an anchor; only past WORKING_HARD_FOLD_BYTES do we fall back to folding the span whole.
     const splice = tail.len < span.len;
-    if (!splice and span.len < WORKING_HARD_FOLD_BYTES) return;
+    if (!splice and span.len < hard_fold) return;
     const older = if (splice) span[0 .. span.len - tail.len - 1] else span; // -1 drops msgTail's skipped comma
     if (older.len == 0) return; // nothing older than the tail — nothing to summarize
     const note = summarizeWorkingSpan(app, run_root, base_url, key, model, older) orelse return;
@@ -7913,6 +7967,27 @@ test "the tiered pairing actually covers a 12B: compact prompt AND compact belt,
             return error.TierWouldTeachUnadvertisedVerbs;
         }
     }
+}
+
+test "the working budget tightens for a small window and leaves a roomy one alone" {
+    const t = std.testing;
+    // ROOMY: a large-window model must behave byte-identically to before this existed. Only a window too
+    // small for the stock constants is allowed to change anything.
+    try t.expectEqual(cctx.WORKING_COMPACT_BYTES, workingBudgetBytes("https://api.example.com", "deepseek-v4-pro", 8 * 1024));
+
+    // TIGHT: the built-in 12B serves 8192 tokens. Its fixed prefix in a real turn (conv c6a6e014f) was
+    // ~19 KB -- ~6 KB of system blocks plus a 13 KB 20-tool schema array -- which together with the answer
+    // reserve already exceeds the window. The budget must collapse to the floor instead of sitting at 24 KB,
+    // which is what let the span grow past the window before compaction could ever trigger.
+    const tight = workingBudgetBytes("http://127.0.0.1:11434", "the-veil-12b", 19 * 1024);
+    try t.expect(tight < cctx.WORKING_COMPACT_BYTES);
+    try t.expectEqual(WORKING_MIN_BUDGET_BYTES, tight);
+    // Never zero however hostile the input -- a zero budget folds every round and the model spends the turn
+    // re-reading what the previous fold deleted.
+    try t.expect(workingBudgetBytes("http://127.0.0.1:11434", "the-veil-12b", 10 * 1024 * 1024) > 0);
+    // A fold on a tightened budget must actually SHRINK the span: the kept tail has to be under the trigger.
+    // At the stock 24 KB trigger / 32 KB tail it is not, which is affordable only when the window dwarfs both.
+    try t.expect(@max(2 * 1024, tight / 2) < tight);
 }
 
 test "the loop hard stop is reachable before MAX_ITERS, or it is dead code" {

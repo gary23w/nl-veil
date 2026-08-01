@@ -73,6 +73,11 @@ const DEFAULT_TOP_P: f32 = 0.95;
 const DEFAULT_TOP_K: i32 = 40;
 const N_BATCH: u32 = 512;
 const MAX_SLOTS: u32 = 8;
+
+/// Floor the load-time window ladder will step down to. Below this the harness's own fixed prefix cannot
+/// fit and every turn would fail anyway, so failing the LOAD is the honest outcome — a served window that
+/// cannot hold a single prompt is worse than a clear "not enough memory" at startup.
+const MIN_SERVING_CTX: u32 = 4096;
 /// A prompt matching a warm slot by fewer than this many tokens is "unrelated" — it takes an empty
 /// slot (or the LRU) rather than evicting someone's cache for a nothing match.
 const MIN_AFFINITY: usize = 16;
@@ -92,7 +97,20 @@ const G = struct {
     ctx: ?*Ctx = null,
     path: [512]u8 = @splat(0),
     path_len: u16 = 0,
-    n_ctx: u32 = 8192, // the PER-SLOT window (what /api/show reports)
+    /// The PER-SLOT window (what /api/show reports). 8192 could not hold a chat turn: the harness's
+    /// un-compactable prefix is ~6.4k tokens on its own (~2k of system blocks + ~4.4k for the 20-tool
+    /// schema array), and num_predict reserves 2048 more, so the window was already oversubscribed
+    /// before the user's first message — every conversation ended in "prompt exceeds the serving
+    /// context window" (conv c6a6e014f). Worse, chat compaction only triggers past 24 KB of working
+    /// span, which is the whole 8192-token window, so the fold that banks findings into neuron-db
+    /// before dropping them never ran for this tier at all.
+    ///
+    /// 16384 leaves ~8k of real conversation room. Cost is ~128 KB/token of kv (48 layers, 8 kv heads,
+    /// 8 full-attention layers at 512+512; the other 40 are SWA and cheap), so ~2.4 GB beside a 7.4 GB
+    /// Q4 model — fits a 12 GB card. 32768 would not, which is why this is not simply the 32768 the
+    /// chat client already asks for in num_ctx. Anything that cannot hold this degrades at load rather
+    /// than failing (see the allocation ladder), and NL_BUILTIN_CTX still overrides in both directions.
+    n_ctx: u32 = 16384,
     n_threads: i32 = 0,
     n_threads_batch: i32 = 0,
     n_slots_cfg: u32 = 4,
@@ -325,17 +343,32 @@ fn ensureLoadedLocked() !void {
     // whole fit — serve 1 slot (NL_BUILTIN_SLOTS still overrides upward for big-VRAM boxes).
     var n: u32 = if (ngl > 0) @min(g.n_slots_cfg, 1) else @max(1, g.n_slots_cfg);
     if (ngl > 0 and g.n_slots_cfg > 4) n = 2; // an explicit big ask on a GPU box: meet halfway
+    var win: u32 = g.n_ctx;
     const c: *Ctx = blk: {
         while (true) {
-            if (veil_ll_ctx_new(m, g.n_ctx * n, N_BATCH, g.n_threads, g.n_threads_batch, n)) |c| break :blk c;
-            if (n == 1) {
-                veil_ll_model_free(m);
-                g.load_failed = true;
-                setErrLocked("context allocation failed (not enough memory for even one kv window)");
-                return error.LoadFailed;
+            if (veil_ll_ctx_new(m, win * n, N_BATCH, g.n_threads, g.n_threads_batch, n)) |c| {
+                g.n_ctx = win; // serve — and report through /api/show — the window that actually fit
+                break :blk c;
             }
-            n /= 2;
-            log.warn("kv allocation did not fit — retrying with {d} slot(s)", .{n});
+            if (n > 1) {
+                n /= 2;
+                log.warn("kv allocation did not fit — retrying with {d} slot(s)", .{n});
+                continue;
+            }
+            // SLOTS EXHAUSTED: halve the WINDOW before giving up. This ladder only ever degraded slots,
+            // so a box that could not hold one window failed the load outright — and raising the default
+            // window would have turned that into a regression for smaller machines. Halving keeps the
+            // plug-and-play promise: a box that used to serve 8192 still serves 8192, it just arrives
+            // there by stepping down instead of by the constant happening to suit it.
+            if (win > MIN_SERVING_CTX) {
+                win = @max(MIN_SERVING_CTX, win / 2);
+                log.warn("kv allocation did not fit at 1 slot — retrying with a {d}-token window", .{win});
+                continue;
+            }
+            veil_ll_model_free(m);
+            g.load_failed = true;
+            setErrLocked("context allocation failed (not enough memory for even one kv window)");
+            return error.LoadFailed;
         }
     };
     g.model = m;
