@@ -172,6 +172,45 @@ main > section:last-child { padding-bottom: var(--section-gap); }
 }
 @keyframes veil-spin { to { transform: rotate(360deg); } }
 
+/* The mock's turn indicator runs the two states the real client has: the turn
+   spins, then it lands and a tick draws in. Both children share one grid cell so
+   the swap costs no layout, and the 7s cycle is deliberately slow — the hero
+   gets one quiet moving part, not a spinner that never resolves.
+   The cycle animates OPACITY only: .spin already owns `transform` for its
+   rotation, and a second animation on the same property would win and stop it. */
+.mock-status {
+  position: relative;
+  width: 13px; height: 13px; flex: 0 0 auto;
+  display: inline-grid; place-items: center;
+}
+.mock-status .spin { grid-area: 1 / 1; animation: veil-spin .8s linear infinite, mock-turn-spin 7s ease-in-out infinite; }
+.mock-status svg {
+  grid-area: 1 / 1;
+  width: 13px; height: 13px;
+  fill: none; stroke: var(--success);
+  stroke-width: 3; stroke-linecap: round; stroke-linejoin: round;
+  stroke-dasharray: 24; stroke-dashoffset: 24;
+  opacity: 0;
+  animation: mock-turn-check 7s ease-in-out infinite;
+}
+@keyframes mock-turn-spin {
+  0%, 44%  { opacity: 1; }
+  50%, 94% { opacity: 0; }
+  100%     { opacity: 1; }
+}
+@keyframes mock-turn-check {
+  0%, 44%  { opacity: 0; stroke-dashoffset: 24; }
+  50%      { opacity: 1; stroke-dashoffset: 24; }
+  64%, 92% { opacity: 1; stroke-dashoffset: 0; }
+  98%, 100% { opacity: 0; stroke-dashoffset: 24; }
+}
+/* Reduced motion: settle on the DONE state. A frozen spinner reads as wedged,
+   which is the one thing this row must never say. */
+@media (prefers-reduced-motion: reduce) {
+  .mock-status .spin { display: none; }
+  .mock-status svg { opacity: 1; stroke-dashoffset: 0; animation: none; }
+}
+
 /* ---------------- stat strip ---------------- */
 .stat-grid {
   display: grid; gap: var(--gap);
