@@ -119,10 +119,10 @@ const NEURON_BIN = if (builtin.os.tag == .windows) "bin/neuron.exe" else "bin/ne
 /// which always atomises — so tests must use that same shape or they are asserting against a store
 /// that quietly kept nothing.
 ///
-/// Ledger 0053: the old 7-char probe `cHJvYmU` was one of the dropped shapes, so the live test below
-/// returned SkipZigTest on EVERY machine — reported as "no binary on this box", which was false and
-/// is why it went unnoticed. Its assertions had never run, including the satellite guard 0042 cited
-/// as its ratchet. One shared probe now, so a value can never again be wrong in only one test.
+/// The old 7-char probe `cHJvYmU` was one of the dropped shapes, so the live test below returned
+/// SkipZigTest on EVERY machine — reported as "no binary on this box", which was false and is why it
+/// went unnoticed for so long. Its assertions had never run, including the satellite spawn guard.
+/// One shared probe now, so a value can never again be wrong in only one test.
 const PROBE_V = "bmxfdmVpbF9jbGllbnRfcHJvYmVfdmFsdWU=";
 const VAL_ONE = "eyJ2IjoxLCJ3aG8iOiJmaXJzdCB3cml0ZSJ9";
 const VAL_TWO = "eyJ2IjoyLCJ3aG8iOiJzZWNvbmQgd3JpdGUifQ==";
@@ -210,9 +210,9 @@ test "live: put is an UPSERT — a second write wins, which the forget-first is 
 }
 
 test "live: reading N records costs exactly N+1 spawns — the startup cost cannot silently regress" {
-    // Ledger 0042 cut startup from 6N process spawns to N+1 and recorded `ratchet: none new`, so the
-    // win rested on a filter no test priced. A new satellite kind, or the filter being "simplified"
-    // away, would restore the old cost with the oracle still green. This prices it.
+    // Startup was cut from 6N process spawns to N+1, and for a while the win rested on a filter no
+    // test priced. A new satellite kind, or the filter being "simplified" away, would restore the old
+    // cost with the oracle still green. This prices it.
     const gpa = std.testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{ .environ = testEnviron() });
     defer threaded.deinit();

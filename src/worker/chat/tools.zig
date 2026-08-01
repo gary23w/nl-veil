@@ -597,7 +597,7 @@ fn tailLines(s: []const u8, max: usize) []const u8 {
 /// This endpoint takes the stricter reading (admin_only wins in chatTool below), so it is an
 /// INCONSISTENCY rather than a hole, and resolving it is a capability decision: `pixel_search` only
 /// reads already-ingested tiles, while its siblings `pixel_capture`/`pixel_ingest` touch the host
-/// screen and are unambiguously admin-only. Recorded in harness/LEDGER.md as H26 for the owner.
+/// screen and are unambiguously admin-only. Left as the owner's call, and pinned by the test below.
 const KNOWN_CAP_OVERLAP = [_][]const u8{"pixel_search"};
 
 test "the capability split stays a partition, apart from the one overlap on record" {
