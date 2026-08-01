@@ -601,7 +601,121 @@ fn setsDirRaw() []const u8 {
     return st.root[0..st.root_len];
 }
 
-fn appendTo(dir: []const u8, rel: []const u8, data: []const u8) void {
+/// Opening of the system block holding the user's durable credential store. Everything from here to
+/// the end of that JSON string is dropped: the block's own header calls its contents "keys, logins,
+/// preferences", so there is nothing in it worth training on and a great deal worth leaking.
+const MEM_MARKER = "YOUR MEMORY (durable facts";
+
+/// Credential prefixes masked wherever they appear. Deliberately few — a prefix that also occurs in
+/// ordinary prose would blank real training signal, so only unambiguous ones are listed.
+const TOKEN_PREFIXES = [_][]const u8{ "hf_", "sk-", "ghp_", "gho_", "github_pat_", "vcp_", "xoxb-", "xoxp-", "AKIA", "AIza" };
+
+fn isTokenChar(c: u8) bool {
+    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_' or c == '-';
+}
+
+/// End of the JSON string containing `from`: the next UNESCAPED quote.
+fn jsonStrEnd(s: []const u8, from: usize) usize {
+    var i = from;
+    while (i < s.len) : (i += 1) {
+        if (s[i] == '\\') {
+            i += 1;
+            continue;
+        }
+        if (s[i] == '"') return i;
+    }
+    return s.len;
+}
+
+/// Scrub credentials out of a record before it is ever written.
+///
+/// Why this is here rather than left to whoever trains on the set. A captured set is the one artefact
+/// of this server MEANT to travel — uploaded to a training run, shared, published beside a model. The
+/// capture point is the LLM boundary, and the request body there carries the whole system prompt,
+/// which includes the user's durable memory store. Measured on the first real set
+/// (set-20260801-171249-000, 90 records): a live third-party API key, a login, and the operator's
+/// email address 46 times, present in sft.jsonl AND raw.jsonl AND by-model/. A training set is the
+/// worst possible place to discover that late, because by then it has been copied somewhere else.
+///
+/// Conservative on purpose: it masks what is unambiguously a credential and leaves the rest alone.
+/// Bare 32-hex is NOT masked — tool-call ids and content hashes look identical, and blanking those
+/// would corrupt the very structure the set exists to teach. Returns null when nothing matched, so
+/// the ordinary path allocates nothing.
+fn redact(gpa: std.mem.Allocator, data: []const u8) ?[]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    var changed = false;
+    var i: usize = 0;
+    while (i < data.len) {
+        // 1. durable-memory block: drop from the marker to the end of its JSON string
+        if (std.mem.startsWith(u8, data[i..], MEM_MARKER)) {
+            out.appendSlice(gpa, "[memory block redacted at capture]") catch {
+                out.deinit(gpa);
+                return null;
+            };
+            i = jsonStrEnd(data, i);
+            changed = true;
+            continue;
+        }
+        // 2. prefixed credentials (hf_…, ghp_…, AKIA…)
+        var hit = false;
+        for (TOKEN_PREFIXES) |pfx| {
+            if (!std.mem.startsWith(u8, data[i..], pfx)) continue;
+            var j = i + pfx.len;
+            while (j < data.len and isTokenChar(data[j])) j += 1;
+            if (j - i < pfx.len + 12) break; // too short to be a real key — leave the prose alone
+            out.appendSlice(gpa, "[redacted-token]") catch {
+                out.deinit(gpa);
+                return null;
+            };
+            i = j;
+            changed = true;
+            hit = true;
+            break;
+        }
+        if (hit) continue;
+        // 3. email addresses
+        if (data[i] == '@') {
+            var s = i;
+            while (s > 0 and (isTokenChar(data[s - 1]) or data[s - 1] == '.' or data[s - 1] == '%' or data[s - 1] == '+')) s -= 1;
+            var e = i + 1;
+            var dot = false;
+            while (e < data.len and (isTokenChar(data[e]) or data[e] == '.')) : (e += 1) {
+                if (data[e] == '.') dot = true;
+            }
+            // needs a local part, a dotted domain and a plausible length — otherwise it is prose
+            if (s < i and dot and e > i + 3 and e - i <= 64 and (i - s) <= out.items.len) {
+                out.shrinkRetainingCapacity(out.items.len - (i - s));
+                out.appendSlice(gpa, "[redacted-email]") catch {
+                    out.deinit(gpa);
+                    return null;
+                };
+                i = e;
+                changed = true;
+                continue;
+            }
+        }
+        out.append(gpa, data[i]) catch {
+            out.deinit(gpa);
+            return null;
+        };
+        i += 1;
+    }
+    if (!changed) {
+        out.deinit(gpa);
+        return null;
+    }
+    return out.toOwnedSlice(gpa) catch {
+        out.deinit(gpa);
+        return null;
+    };
+}
+
+fn appendTo(dir: []const u8, rel: []const u8, data_in: []const u8) void {
+    // EVERY output file is written through here — that is why the scrub lives here rather than at the
+    // four call sites, so a fifth output cannot be added and silently skip it.
+    const scrubbed = redact(st.gpa, data_in);
+    defer if (scrubbed) |s| st.gpa.free(s);
+    const data = scrubbed orelse data_in;
     var pbuf: [900]u8 = undefined;
     const p = std.fmt.bufPrint(&pbuf, "{s}/{s}", .{ dir, rel }) catch return;
     const d = std.Io.Dir.cwd();
@@ -1038,4 +1152,40 @@ test "the marker is the switch: stop finalizes and no further call is captured" 
     var sbuf: [256]u8 = undefined;
     const sft_path = try std.fmt.bufPrint(&sbuf, "{s}/sets/{s}/sft.jsonl", .{ root, id });
     try std.testing.expect(std.Io.Dir.cwd().statFile(io, sft_path, .{}) == error.FileNotFound);
+}
+
+test "redact strips the memory block, keys and emails before anything is written" {
+    const gpa = std.testing.allocator;
+    // Shaped like a real record: the durable-memory system block spliced into a JSON messages array.
+    // Measured on set-20260801-171249-000 this block carried a live third-party API key, a login and
+    // the operator's email 46 times, into sft.jsonl, raw.jsonl and by-model/ alike.
+    const rec =
+        "{\"messages\":[{\"role\":\"system\",\"content\":\"YOUR MEMORY (durable facts this user asked you " ++
+        "to keep) - [key] Discourse API key: 9f8e7d6c5b4a39281706\"},{\"role\":\"user\",\"content\":\"mail me at " ++
+        "someone@example.com with hf_AbCdEfGhIjKlMnOpQrStUvWx\"}],\"model\":\"m\"}";
+    const got = redact(gpa, rec) orelse return error.NothingRedacted;
+    defer gpa.free(got);
+
+    // the three secrets are gone
+    try std.testing.expect(std.mem.indexOf(u8, got, "Discourse API key") == null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "9f8e7d6c5b4a39281706") == null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "someone@example.com") == null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "hf_AbCdEfGhIjKlMnOpQrStUvWx") == null);
+    // and their placeholders are there instead
+    try std.testing.expect(std.mem.indexOf(u8, got, "[memory block redacted at capture]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "[redacted-email]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "[redacted-token]") != null);
+    // the record is still parseable JSON — a scrub that corrupts the line destroys the whole set for a
+    // line-oriented reader, which is worse than the leak it was fixing
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, got, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("m", parsed.value.object.get("model").?.string);
+
+    // TRAINING SIGNAL SURVIVES: a record with no secrets is returned untouched (null = no copy), and
+    // things that merely look secret-ish are left alone — a scrub that eats tool-call ids or ordinary
+    // prose would quietly destroy what the set exists to teach.
+    const clean = "{\"messages\":[{\"role\":\"assistant\",\"content\":\"call id tc0b0e53f0cc6f0353 ok\"}]}";
+    try std.testing.expect(redact(gpa, clean) == null);
+    const hexy = "{\"id\":\"36a7f6a6f5a9448496de641cf64bd375\",\"sk-\":\"short\"}"; // hash + too-short prefix
+    try std.testing.expect(redact(gpa, hexy) == null);
 }
