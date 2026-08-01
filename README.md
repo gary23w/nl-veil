@@ -8,7 +8,9 @@
   <a href="https://github.com/gary23w/nl-veil/actions/workflows/release.yml"><img alt="build" src="https://github.com/gary23w/nl-veil/actions/workflows/release.yml/badge.svg"></a>
   <a href="https://github.com/gary23w/nl-veil/releases/latest"><img alt="release" src="https://img.shields.io/badge/release-v1.0.0--alpha.10-A8241B"></a>
   <img alt="zig" src="https://img.shields.io/badge/zig-0.16-F7A41D?logo=zig&logoColor=white">
-  <img alt="model" src="https://img.shields.io/badge/model-gary--neuron--emergent-6E4A27">
+  <a href="https://huggingface.co/gary23w/the-veil-12b"><img alt="built-in model" src="https://img.shields.io/badge/built--in%20model-the--veil--12b-6E4A27?logo=huggingface&logoColor=white"></a>
+  <a href="https://huggingface.co/gary23w/gary-neuron-emergent"><img alt="memory cortex" src="https://img.shields.io/badge/cortex-gary--neuron--emergent-6E4A27?logo=huggingface&logoColor=white"></a>
+  <a href="https://github.com/gary23w/neuron-db"><img alt="memory" src="https://img.shields.io/badge/memory-neuron--db-31405C"></a>
   <a href="LICENSE"><img alt="license" src="https://img.shields.io/badge/license-MIT-31405C"></a>
   <a href="https://github.com/gary23w/nl-veil/stargazers"><img alt="stars" src="https://img.shields.io/github/stars/gary23w/nl-veil?style=social"></a>
 </p>
@@ -17,20 +19,36 @@
 building, remembering, **learning from its own mistakes** — while one unified consciousness, **the
 Veil**, integrates the whole hive into a single first-person "I" that speaks for it and steers it.
 
-It runs on **any model** — a free local one through Ollama, or a hosted/BYOK endpoint — and needs no
-cloud account and no database service. **One Zig binary is the whole thing**: the server, the native
-desktop app, the web UI, the memory engine, and the built-in `veil` command line. Download it, run it,
-and you're in. No Python, no Node, no Docker.
+**It brings its own model.** The server serves
+**[the-veil-12b](https://huggingface.co/gary23w/the-veil-12b)** *in-process* — no Ollama, no llama
+runtime, no API key, nothing to install beside it. Click **download the model** in the app (or
+`veil model pull`) and the whole thing works offline. Point it at Ollama or a hosted/BYOK endpoint
+instead whenever you'd rather; **any** OpenAI-compatible endpoint works.
+
+**One Zig binary is the whole thing**: the server, the native desktop app, the web UI, the inference
+engine, the memory engine, and the `veil` command line. Download it, run it, and you're in. No
+Python, no Node, no Docker, no cloud account, no database service.
 
 > ⭐ **If the veil is useful to you, [star it on GitHub](https://github.com/gary23w/nl-veil).** It's a
 > solo project — a star genuinely helps it reach the next person who'd get something out of it.
 
-**New in v1** — the **chat brain moved into the server** (clients are now thin; see
-[the chat brain](#the-chat-brain-runs-in-the-server)), a built-in **`veil` CLI** that retires the old
-Python launcher, **[scheduled tasks](#scheduled-tasks)** that run through chat, a native desktop
-dashboard ([veil-desk](#the-desktop--veil-desk)), a swarm that **keeps a playbook** ([it learns](#it-learns)),
-and **prebuilt one-click binaries** for Windows, Linux, and macOS. Browse the annotated source as a
-case file at **[the docs site](https://gary23w.github.io/nl-veil/)** (`docs/`).
+**What's in it now**
+
+| | |
+|---|---|
+| [**The built-in model**](#the-built-in-model--nothing-to-install) | `the-veil-12b` served in-process from a downloaded GGUF — no external runtime, no key, works offline |
+| [**The chat brain in the server**](#the-chat-brain-runs-in-the-server) | one agentic turn loop, server-side; the web app, the desktop and `veil chat` are thin clients of it |
+| [**The model trio**](#three-models-one-turn--the-model-trio) | every LLM call is labelled and routed — coding / thinking / prompting — so a cheap model can carry the bulk |
+| [**Your own browser**](#it-can-use-your-browser) | drive the Chrome/Edge you're already signed into, through a tiny extension — or a private throwaway profile |
+| [**The tool belt**](#the-tool-belt) | ~58 tools: files, shell, tests, web, deep crawl, memory, images/OCR, MCP servers, tool authoring |
+| [**Memory that compounds**](#how-it-works) | [neuron-db](https://github.com/gary23w/neuron-db) behind every recall, with `--lineage` so re-casts get better |
+| [**Built-in RAG**](#what-you-can-do) | mirror the [nl-rag](https://github.com/gary23w/nl-rag) corpus to disk and research with the network off |
+| [**It learns**](#it-learns) | a playbook of fixes verified by real exit codes, a smoke gate, and a judge that reads the trace |
+| [**Themes & plugins**](#make-it-your-own--themes--plugins) | Lua, hot-reloaded, across web + desktop + CLI ([PLUGINS.md](PLUGINS.md)) |
+| [**Scheduled tasks**](#scheduled-tasks) · [**the desktop**](#the-desktop--veil-desk) · [**the fleet hub**](#the-fleet-hub--many-swarms-one-console) | cron-ish runs that are real conversations, a native dashboard, one console over every swarm |
+
+Browse the annotated source as a case file at **[the docs site](https://gary23w.github.io/nl-veil/)**
+(`docs/`).
 
 ## One server, three faces
 
@@ -153,8 +171,11 @@ terminal and your terminal is left alone.
 > it is worth knowing before you leave it running on a café wifi. `NL_BIND=127.0.0.1` pins it to this
 > machine only. See [the walkthrough](#walkthrough-run-it-add-people-put-it-on-your-network).
 
-Point the model endpoint with `NL_LLM_BASE_URL` / `NL_LLM_MODEL` / `NL_LLM_KEY` (it defaults to a
-local Ollama), or pick a model in the web UI / the desktop. The server **always** mints an admin key
+**About models:** you don't have to bring one — download the built-in `the-veil-12b` in the app (or
+`veil model pull`) and it serves itself, [see below](#the-built-in-model--nothing-to-install). To use
+something else, point the endpoint with `NL_LLM_BASE_URL` / `NL_LLM_MODEL` / `NL_LLM_KEY` (a local
+Ollama is the fallback default), or just pick a model in the web UI / the desktop. The server
+**always** mints an admin key
 at `data/.desktop_key`; the CLI and the desktop read it automatically, so same-machine commands never
 prompt for auth. It is a file readable only by your OS user — opening the port to the LAN does not
 make a local file more reachable. **Any `veil <verb>` auto-starts the server if it isn't already up.**
@@ -163,6 +184,50 @@ make a local file more reachable. **Any `veil <verb>` auto-starts the server if 
 swarm workdirs, logs, all of it. Nothing is written to a system temp dir and nothing leaves the
 machine. Move the folder and you move the whole install; back it up and you've backed up everything.
 (From a source checkout it resolves to the repo's own `data/`, so dev and release never share state.)
+
+## The built-in model — nothing to install
+
+Most local-AI setups start with a second program: install a runtime, pull a model, keep it running,
+point the app at it. **veil skips that.** The inference engine is compiled into the binary, and the
+server serves **[the-veil-12b](https://huggingface.co/gary23w/the-veil-12b)** itself from a GGUF on
+disk. There is no runtime to install, no port to keep alive, no key to paste.
+
+The weights are the only thing not in the download (a model is bigger than an app), so the first run
+offers to fetch them:
+
+```sh
+veil model status              # weights + engine + any download in flight
+veil model pull                # download the published weights — resumable, sha256-verified
+veil model import [--path F]   # copy a GGUF you already have (no --path: find your local runtime's copy)
+veil model check               # is a newer release published? (compares shas; `pull` installs it)
+veil model cancel              # stop the running pull — the partial resumes next time
+veil model rm                  # remove the serving weights
+```
+
+In the desktop there's a panel for the same thing: a **download** button, a live progress bar, and
+one click to make it the active model. A finished download **hot-swaps** into the running server —
+no restart. An install manifest beside the weights records what is installed and how it arrived, so
+`check` can tell "you have the current build" apart from "you have something you imported".
+
+- **It runs on your GPU when you have one.** The Vulkan backend is compiled in and the loader is
+  opened at run time, so a machine with no GPU falls back to CPU cleanly rather than failing to
+  start. (`-Dvulkan=false` cuts ~50 MB of embedded shaders from the binary; macOS builds are CPU-only
+  until a Metal tier exists — Apple silicon's unified memory carries it.)
+- **The engine endpoint is not an open local port.** It is loopback-only and every request carries a
+  bearer minted fresh at boot, so other processes on the machine can't quietly use your model the way
+  they can with a conventional runtime.
+- **It is one provider among the others.** Pick `builtin` in Settings, or keep Ollama, or a hosted
+  endpoint, or a different model per role — see [the model trio](#three-models-one-turn--the-model-trio).
+- **You can leave it out.** `zig build -Dbuiltin=false` never even fetches the inference sources; the
+  builtin provider then simply reports itself unavailable and everything else works as before.
+
+> **The engine is tuned for small local models, not just big hosted ones.** A model at or below ~24B
+> (or with a ≤15k window) gets a **compact tool belt** and a tighter doctrine — fewer verbs to rule
+> out per call, no delegation concepts, honest "I can't read that" answers instead of fumbled
+> fetches. Capability isn't removed: the full tool schema still dispatches if the model calls it.
+> For local Gemma-4 the engine also renders the prompt itself rather than going through the runtime's
+> template — verified byte-for-byte against the model's own chat template, which measured 27/30 on
+> the harness drills against 18/30 through the runtime's renderer (`src/worker/gemma4.zig`).
 
 ## Walkthrough: run it, add people, put it on your network
 
@@ -352,6 +417,7 @@ SWARMS
   cast "<goal>" [flags]        deploy a swarm to work a goal
       --minutes N  --minds N  --model M  --provider P  --base-url U  --key K
       --style S  --name N  --continuous  --offline  --follow
+      --lineage <id>           persist this swarm's memory under <id> so re-casts COMPOUND
   deploy "<goal>" [flags]      alias for `cast --continuous` (a sustained hive)
   list | ls | ps               list your swarms
   stop <id>                    ask a swarm to stop
@@ -360,6 +426,23 @@ SWARMS
 
 CHAT (the server-side veil brain)
   chat [conv]                  interactive REPL; a line typed mid-turn steers the running turn
+
+BUILT-IN MODEL (the-veil-12b, served in-process — no external runtime)
+  model status                 weights + engine + any download in flight
+  model pull                   download the published weights (resumable, sha-verified)
+  model import [--path FILE]   copy a GGUF you already have into the store
+  model check                  is a newer release published? (`pull` installs it)
+  model cancel                 cancel the running pull (the partial resumes later)
+  model rm                     remove the serving weights
+
+KNOWLEDGE (the local pack corpus — built-in RAG)
+  rag status                   is a local knowledge mirror active, and where from
+  rag sync --from <clone>      copy an nl-rag checkout into the app's data dir for offline RAG
+      --tier atlas|facts|full  manifest only | +INDEX+distilled facts (default) | +every page
+      --dest <dir>             sync somewhere else (e.g. vendor/nl-rag pre-build)
+      --include-auto           also copy machine-grown packs (off-topic risk; off by default)
+  rag ingest <file>            absorb a local book/doc/notes into the hive as recallable facts
+      --scope S --name L --cap N --db <hive.sqlite>
 
 SCHEDULED TASKS (admin-gated)
   sched list
@@ -380,9 +463,13 @@ EXTENSIONS (themes + plugins — see PLUGINS.md)
   plugins reload               admin: rescan <data>/plugins + <data>/themes, hot-swap
 
 MISC
-  doctor | health              check server + token health
+  doctor [--runtime]           server + token health; --runtime folds the runtime ledgers in
+                               (learned tool behavior, schedule fail-streaks, per-model usage)
+                               and works with the server down
   desktop | desk               open the app window (like a bare `veil`, but detached)
   exec-tool <tool> [args]      run one hive tool directly, in this process
+  local-host                   the per-machine daemon that owns stateful local resources
+                               (browser sessions) — started for you on demand
   sync-manifest / sync-read    the file-sync side of a delegated turn
   version | help
 ```
@@ -444,6 +531,61 @@ veil chat — conversation cli7f3a1c
 
 > what are you working on?
 ```
+
+## The tool belt
+
+A turn is only as useful as what it can actually touch. The engine ships **~58 tools**, all executed
+by the server on the host machine (never in your browser), all logged as event frames you can watch
+live:
+
+| group | tools |
+|---|---|
+| **Files & code** | `read_file` `write_file` `edit_file` `delete_file` `list_dir` `stage_file` `stage_delivery` |
+| **Run things** | `host_command` `run_tests` `run_python` `host_status` `host_explore` `stop_process` `poll` `probe` |
+| **Web & research** | `web_search` `web_fetch` `read_url` `fetch_json` `deep_crawl` `read_doc` `osint_scan` |
+| **Your browser** | `browser_navigate` `browser_read` `browser_click` `browser_click_at` `browser_type` `browser_type_text` `browser_key` `browser_scroll` `browser_eval` `browser_console` `browser_network` `browser_close` |
+| **Screen & images** | `pixel_capture` `pixel_ingest` `pixel_search` — screenshots and attached images become searchable text + regions, so a model that can't see gets the picture anyway |
+| **Memory** | `observe` `recall` `recall_hive` `absorb` `journal` `share` `save_skill` `note_stance` |
+| **Coordination** | `send_message` `ask_veil` `add_task` `complete_task` `propose_plan_change` |
+| **Other AI apps** | `mcp_discover` `mcp_call` — find the MCP servers already configured on this machine (Claude Desktop, Cursor, VS Code) plus local AI runtimes, and call their tools as if they were veil's |
+| **Self-improvement** | `make_tool` (author a new tool at run time) `set_directive` (write its own playbook) `propose_change` / `simulate_change` / `patch_system` (governed, trial-gated) |
+| **Secrets** | `get_credential` — the broker hands over a named credential; the value never enters the transcript |
+
+Two of these deserve a note. **`poll` replaces blind sleeping**: a bounded watch loop that samples a
+file, URL, port, process, command, or swarm until it's done or the budget expires, so a long wait is
+a chain of bounded polls instead of one guess. And **`stop_process`** exists because a turn that can
+start a server must be able to end one — a Stop from you now reaches a blocking tool instead of
+waiting for it to finish.
+
+Non-admin accounts run a **restricted subset** (workspace files, research, and the whole memory
+surface — but no shell, no browser, no MCP, no tool authoring, no casting). See
+[everyone else is sandboxed](#everyone-else-is-sandboxed).
+
+## It can use your browser
+
+Research that hits a login wall is research that stops. So the veil can drive **the browser you are
+already signed into** — your profile, your cookies, your sessions, and you sitting right there to
+answer a verification prompt — through a deliberately tiny **Chrome/Edge extension** in
+[`extension/`](extension/).
+
+- **Load it once.** `chrome://extensions` → *Developer mode* → **Load unpacked** → pick `extension/`.
+  It finds the local server itself, pairs over loopback only, and remembers the pairing across a
+  server restart.
+- **The extension holds no automation logic.** It relays debugger commands and posts back replies —
+  that's all. Every snapshot, click heuristic and page model lives in the server, so the app can get
+  smarter without you ever reinstalling the extension. Input arrives as *real* browser events, not
+  the synthetic kind a content script is limited to.
+- **Pairing is loopback-only.** A remote attacker can't pair because the request has to originate on
+  the machine; the relay's blast radius is the tab it drives. The token is never logged.
+- **Or don't use your browser at all.** With no extension the driver launches its own throwaway
+  profile, logged out of everything — the private option, still there and still the default for
+  unattended casts.
+- **Reads describe what happened.** A click reports its effect, and form fields are read back and
+  confirmed, so the agent stops re-reading the page to guess whether anything landed.
+
+Browser access is an admin capability. `NL_BROWSER_DRIVER=1` extends it to sandboxed accounts —
+worth a deliberate decision, since the browser inherits this machine's network position and your
+profile's logins.
 
 ## Three models, one turn — the model trio
 
@@ -546,6 +688,12 @@ that shows every running hive round-by-round, and a **build console**.
   build moving without you re-prompting each round.
 - **You see everything.** Live per-round fitness, the files each mind is writing, the tool calls, the
   shared-memory writes — swarm work is transparent, not a spinner.
+- **Sub-chats.** Branch a side thread off any conversation (up to five, one level deep) as tabs
+  across the top. The family shares one workspace, so a side question doesn't lose the build.
+- **Attach an image.** Drop a screenshot or a picture into a message and it is turned into text and
+  searchable regions server-side — so the model reads what's in it whether or not it has vision.
+- **Manage the built-in model from the window.** A panel shows the weights, a download button, a live
+  progress bar, and one click to serve it.
 - **It sits in the tray.** A system-tray icon and native toasts on Windows; it lights up the moment
   the server has something to show.
 
@@ -600,13 +748,18 @@ veil events <id> --follow
 ```
 
 Casts made this way run detached, stay bounded (`--minutes` / `--minds`), never post publicly, and are
-graded by the engine's own smoke gate and judge. A dedicated **MCP bridge** — wiring the hive in as
-tools a chat client calls directly — is **planned but not yet built**; there is no `veil mcp` command
-today, so drive it as a shell command for now.
+graded by the engine's own smoke gate and judge.
+
+**The MCP relationship runs the other way today.** veil is an MCP *client*: `mcp_discover` reads the
+server configs already on your machine (Claude Desktop, Cursor, VS Code) and probes for local AI
+runtimes, and `mcp_call` runs their tools inside a veil turn — config scanning is read-only and never
+returns env values, which is where secrets live. Exposing the hive *as* an MCP server, so another
+client lists `cast` among its tools, is **planned and not yet built**: there is no `veil mcp` command,
+so drive it as a shell command for now.
 
 ## How it works
 
-Three pieces, each its own repo, that snap together:
+Four pieces, each published on its own, that snap together:
 
 ```
   ┌─────────────────────────────────────────────────────────────┐
@@ -619,6 +772,8 @@ Three pieces, each its own repo, that snap together:
   │     │  bulk-load clean facts; scouts fetch pre-cleaned docs  │
   │     │                                                        │
   │  nl-rag                  the knowledge substrate (doc packs) │
+  │                                                              │
+  │  the-veil-12b            the model, served in-process        │
   └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -634,7 +789,9 @@ compiled to one `neuron` binary the engine calls for every recall and observe. I
 loop an *oscillation*: perception becomes graph, reasoning becomes graph traversal, and each
 prompt is rebuilt from a trust-weighted recall instead of carried as flat text — so a small local
 model gets a large-model floor to stand on, cheaper in tokens and richer in context. Fetched and
-built for you on first run (needs [Rust](https://rustup.rs)); reused after that.
+built for you on first run (needs [Rust](https://rustup.rs)); reused after that. Its semantic cortex
+is published separately as
+**[gary-neuron-emergent](https://huggingface.co/gary23w/gary-neuron-emergent)**.
 
 **[nl-rag](https://github.com/gary23w/nl-rag)** — the knowledge. A curated repository of canonical
 documentation (languages, web, databases, security, ops…) pulled and normalized into clean,
@@ -645,6 +802,11 @@ HTML — and you can bulk-load a pack straight into hive memory:
 ```sh
 neuron import packs/rust/pack.facts --scope knowledge     # from a cloned nl-rag
 ```
+
+**[the-veil-12b](https://huggingface.co/gary23w/the-veil-12b)** — the model. Published as GGUF and
+served by the server itself, so the fourth piece needs no runtime of its own: `veil model pull` and
+the app is self-contained. See [the built-in model](#the-built-in-model--nothing-to-install). Any
+other OpenAI-compatible endpoint still works exactly as before — this is the floor, not a lock-in.
 
 Optionally, **hyperspace grounding** (`NL_HYPERSPACE=1`) settles the most relevant memory into a
 warm in-RAM field before each call, so a typical round does *zero* database subprocess calls for
@@ -805,6 +967,11 @@ src/
                                                    downloaded GGUF (-Dbuiltin, default true) — store,
                                                    loopback engine endpoint, embedded inference, and
                                                    the verified weights downloader
+    gemma4.zig             the Gemma-4 wire format, rendered here instead of by the local runtime
+    browser/               the browser driver: its own profile (launch, cdp) or YOUR Chrome/Edge
+                           through the extension (ext, ext_api), behind one session model + the
+                           per-machine local-host daemon that keeps a session alive across calls
+    mcp/{client,discovery}.zig  find and call the MCP servers already installed on this machine
     run.zig  agi.zig  oscillation.zig  rsi.zig  vcs.zig  tools.zig  writer.zig …  the moment loop,
                                                    the Veil, the self-improvement faculties, the
                                                    micro-VCS for concurrent minds
@@ -812,11 +979,19 @@ src/
 desk/                      veil-desk, the native desktop dashboard — compiled INTO `veil` as the
                            "desk" module (-Dapp, default true), not a separate shipped binary
 docs/                      the annotated-source case file (a static site, home-built md parser)
+extension/                 the Chrome/Edge extension — a thin CDP relay so the veil can drive the
+                           browser you are already signed into (load unpacked; nothing to build)
 examples/embedded/         the device-operator worked example
+harness/TESTING.md         the house test rules — read before adding a test
 web/public/                the control-plane UI — index.html, app.js, styles.css, models.json,
                            embedded into the binary at build time (no bundler, no build step)
+models.yaml                the ONE model catalog → generated into web/public/models.json
 bin/neuron[.exe]           the neuron-db memory engine (bundled / built on first run)
 ```
+
+Build knobs worth knowing: `-Dapp=false` (no desktop GUI), `-Dbuiltin=false` (no embedded inference),
+`-Dvulkan=false` (CPU-only built-in engine, ~50 MB smaller binary). Each one skips fetching its
+dependency entirely rather than compiling it unused.
 
 ## Release
 
@@ -845,7 +1020,15 @@ sh scripts/build-official.sh --host-only  # skip the cross-compiled server matri
 
 It stages into a private prefix, so it never disturbs `zig-out` — you can cut a release while the app
 is running. `NO_BOOTSTRAP=1` skips the dependency step (supply `ZIG=` / `NEURON=` yourself).
-`veil doctor` prints server + token health.
+`veil doctor` prints server + token health; `veil doctor --runtime` adds what the app has actually
+been doing — learned tool behavior, schedule fail-streaks, per-model token and latency usage — and
+reads the on-disk ledgers directly, so it works with the server down.
+
+**Related projects:** [neuron-db](https://github.com/gary23w/neuron-db) (the memory engine) ·
+[nl-rag](https://github.com/gary23w/nl-rag) (the knowledge packs) ·
+[the-veil-12b](https://huggingface.co/gary23w/the-veil-12b) (the built-in model) ·
+[gary-neuron-emergent](https://huggingface.co/gary23w/gary-neuron-emergent) (neuron-db's semantic
+cortex).
 
 ## License
 

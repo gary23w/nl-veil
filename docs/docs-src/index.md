@@ -36,6 +36,9 @@ The per-file sheets are grouped by module; this is what each group is for.
 | `plan/` | entitlements, neuron plans, and the billing seam |
 | `worker/chat/` | the server-side chat brain: the agentic turn loop, its REST handlers, its tool surface, context window and plan board |
 | `worker/control/` · `deploy/` · `neuron/` | the swarm control plane — deploy, supervise, stream, steer, and the fail-open memory bridge |
+| `worker/browser/` | the browser driver — its own throwaway profile, or the user's real Chrome/Edge through the extension relay, behind one session model |
+| `worker/mcp/` | the foreign tool surface: find the MCP servers already installed on this machine, and call them |
+| the built-in engine | `builtin`, `builtin_endpoint`, `llamaeng`, `modelpull`, `gemma4` — [the-veil-12b](https://huggingface.co/gary23w/the-veil-12b) served in-process from a downloaded GGUF, with no separate model runtime |
 | `worker/` | the hive runtime — the moment loop, the Veil, self-improvement, crawling, the micro-VCS for concurrent minds, scheduled tasks |
 | `desk/` | the native dashboard: chat, casts, monitoring. Compiled **into** `veil` rather than shipped as a second binary |
 
