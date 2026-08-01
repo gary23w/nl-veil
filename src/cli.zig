@@ -186,9 +186,9 @@ fn cmdVersion(ctx: *Ctx) u8 {
 }
 
 fn cmdDoctor(ctx: *Ctx, args: []const []const u8) u8 {
-    var growth = false;
-    for (args) |a| if (std.mem.eql(u8, a, "--growth")) {
-        growth = true;
+    var runtime = false;
+    for (args) |a| if (std.mem.eql(u8, a, "--runtime")) {
+        runtime = true;
     };
     out("veil doctor\n", .{});
     out("  data dir : {s}\n", .{ctx.data});
@@ -210,7 +210,7 @@ fn cmdDoctor(ctx: *Ctx, args: []const []const u8) u8 {
     } else {
         out("  server   : DOWN on :{d} (run `veil` to start it)\n", .{ctx.port});
     }
-    if (growth) growthReport(ctx);
+    if (runtime) runtimeReport(ctx);
     return rc;
 }
 
@@ -247,10 +247,9 @@ fn bucketFor(list: []MetricStat, n: *usize, key: []const u8) ?*MetricStat {
 }
 
 /// PURE fold of an llm.jsonl body into `agg` (row shape documented in worker/metrics.zig). Split out of
-/// growthReport so it can be TESTED: the report writes to stdout, so while this lived inline nothing
+/// runtimeReport so it can be TESTED: the report writes to stdout, so while this lived inline nothing
 /// could assert a single number it printed and an arithmetic regression would have been invisible to the
-/// oracle. 0079 shipped it verified-but-unguarded and named this as the follow-up (0080). Malformed rows
-/// are SKIPPED, not fatal — one corrupt line must not blank the whole report.
+/// oracle. Malformed rows are SKIPPED, not fatal — one corrupt line must not blank the whole report.
 fn foldMetricsJsonl(gpa: std.mem.Allocator, body: []const u8, agg: *MetricAgg) void {
     var lit = std.mem.splitScalar(u8, body, '\n');
     while (lit.next()) |raw_ln| {
@@ -278,16 +277,16 @@ fn foldMetricsJsonl(gpa: std.mem.Allocator, body: []const u8, agg: *MetricAgg) v
     }
 }
 
-/// `doctor --growth` — the app's own runtime ledgers folded into one worker-readable health view:
+/// `doctor --runtime` — the app's own runtime ledgers folded into one operator-readable health view:
 /// the engine's LEARNED tool behavior (toolperf digest), schedule fail-streaks (the outcome ledger
 /// on each task file), and a per-model LLM usage rollup. Reads {data} directly on purpose — the
 /// report works with the server down, and nothing here re-derives what the engine already learned.
-fn growthReport(ctx: *Ctx) void {
+fn runtimeReport(ctx: *Ctx) void {
     const gpa = ctx.gpa;
-    out("  -- growth --\n", .{});
+    out("  -- runtime --\n", .{});
 
     // Tools: reuse the engine's own digest (EWMA latency + fail rates; only NOTABLE tools appear).
-    // null filter: the operator's growth report speaks for the whole machine, not one turn's advertised belt.
+    // null filter: the operator's report speaks for the whole machine, not one turn's advertised belt.
     if (toolperf.digest(gpa, ctx.io, ctx.data, null)) |d| {
         defer gpa.free(d);
         out("  tools    : {s}\n", .{d});
@@ -962,7 +961,7 @@ fn cmdHelp() u8 {
         \\  plugins reload               rescan <data>/plugins + <data>/themes and swap the live registry (admin)
         \\
         \\MISC
-        \\  doctor [--growth]            check server + token health; --growth folds the runtime
+        \\  doctor [--runtime]           check server + token health; --runtime folds the runtime
         \\                               ledgers into app health (learned tool behavior, schedule
         \\                               fail-streaks, per-model usage) — works with the server down
         \\  desktop                      open the app window (same as a bare `veil`, but detached)

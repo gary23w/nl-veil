@@ -9,7 +9,7 @@
 #
 #   .\scripts\check.ps1            run the gates: catalog sync, server build, src tests, desk tests
 #   .\scripts\check.ps1 -Full      also build the default target (GUI merged in -- slow, raylib)
-#   .\scripts\check.ps1 -Scan      no builds: print growth signals (drift, coverage gaps, TODOs)
+#   .\scripts\check.ps1 -Scan      no builds: print drift signals (twins, coverage gaps, TODOs)
 param(
     [switch]$Scan,
     [switch]$Full,
@@ -98,14 +98,14 @@ function Invoke-ZigTests([string]$label, [string]$workdir, [int]$timeout, [strin
     return Invoke-Gate "standalone test exe ($label)" $texe @() $workdir $timeout $note
 }
 
-# ---------------------------------------------------------------- scan: growth signals, no builds
+# ---------------------------------------------------------------- scan: drift signals, no builds
 if ($Scan) {
-    Write-Host "== growth signals ==" -ForegroundColor Cyan
+    Write-Host "== drift signals ==" -ForegroundColor Cyan
     $signals = 0
 
     # 0) in-flight work: dirty tracked files touched in the last 20 min are probably someone ELSE's
-    #    mid-feature edits (the owner or a resident swarm shares this tree). Their reds are not
-    #    yours -- report, don't fix (see CLAUDE.md hard rules).
+    #    mid-feature edits (the owner may share this tree with you). Their reds are not yours --
+    #    report, don't fix (see CLAUDE.md hard rules).
     $hot = @()
     foreach ($d in @(git -C $repo diff --name-only HEAD 2>$null)) {
         $p = Join-Path $repo ($d -replace '/', '\')
@@ -384,7 +384,7 @@ if ($Scan) {
     }
 
     Write-Host ""
-    Write-Host ("scan done: {0} actionable signal(s). Cross-check harness/LEDGER.md open items." -f $signals) -ForegroundColor Cyan
+    Write-Host ("scan done: {0} actionable signal(s)." -f $signals) -ForegroundColor Cyan
     exit 0
 }
 

@@ -57,8 +57,11 @@ screenshot*.png
 # release bundles produced by scripts/build-release.* (build output, not source)
 dist/
 
-# stray local agent/editor dirs
+# stray local agent/editor dirs. Local AI tooling stays local: skills, prompts and any
+# self-improvement scaffolding are a workstation concern, never part of the shipped repo.
 .codex/
+.claude/
+.agents/
 
 # release build staging (scripts/build-official.sh) — never committed
 .release-stage/

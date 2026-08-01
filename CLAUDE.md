@@ -1,9 +1,10 @@
 # nl-veil — worker constitution
 
 One binary: `veil` — a Zig 0.16 hive-mind orchestration engine (server + CLI + desktop GUI in one
-process). This file is the constitution for ANY AI worker in this tree. Read it first, then the tail
-of `harness/LEDGER.md`. When prompted to "grow / fix / upgrade" with no specific task attached,
-follow the growth loop in `.claude/skills/grow/SKILL.md` (`/grow`).
+process). This file is the working agreement for anyone — human or AI — changing this tree: how to
+build it, how to prove a change, and the rules that keep the app intact. Read it first. There is no
+self-improvement loop here: work comes from the owner or from a filed issue, one reviewed change at
+a time.
 
 ## Build & verify — the oracle
 
@@ -13,7 +14,7 @@ follow the growth loop in `.claude/skills/grow/SKILL.md` (`/grow`).
   `.zig-cache` goes stale against it: builds "succeed" while installing yesterday's exe. If a change
   ever seems ignored, grep the built BINARY for a string you just added; if it's absent, delete
   `C:\zig-nlveil` and rebuild.
-- The oracle: `scripts\check.ps1` — local mirror of the CI `check` job. `-Scan` prints growth
+- The oracle: `scripts\check.ps1` — local mirror of the CI `check` job. `-Scan` prints repo drift
   signals without building; `-Full` adds the slow default-GUI build (CI covers it otherwise).
   **No green, no done.** Gates, individually:
   1. `python scripts/gen-models-json.py --check` (models.yaml ↔ web/public/models.json sync)
@@ -28,36 +29,37 @@ follow the growth loop in `.claude/skills/grow/SKILL.md` (`/grow`).
 - Tests are OPT-IN: Zig only collects `test` blocks from files reachable from `src/tests.zig`
   (and `desk/src/tests.zig`) through @import chains. A new module's tests silently do not run until
   something in that graph references it — register new test-bearing files in tests.zig (`-Scan`
-  names any that fell outside it). **Read `harness/TESTING.md` before writing tests**, and paste it
-  into any agent you delegate tests to: allocator rules (a leak is a bug — 13 real ones found so
-  far), the temp-dir and subprocess patterns, clock anchoring, and how to prove a property rather
-  than a spelling. Every rule there was paid for by a real failure.
+  names any that fell outside it). **Read `harness/TESTING.md` before writing tests**: allocator
+  rules (a leak is a bug — 13 real ones found so far), the temp-dir and subprocess patterns, clock
+  anchoring, and how to prove a property rather than a spelling. Every rule there was paid for by a
+  real failure.
 - Known local flakes: Windows Defender can break test-runner IPC (the failure names no test, just
   `failed command: ...test.exe --listen=-`); check.ps1 self-heals by rerunning that exact exe
   standalone. The flake is NONDETERMINISTIC — a rerun may pass the runner directly.
-- The desk suite is HERMETIC — do not accept a hang as normal there. This file used to say its net
-  test "needs a live server on :8787" and that "the earlier tests are the verdict when only that one
-  hangs", citing an open item that ledger 0006 had already CLOSED: `desk/src/netcli.zig` early-
+- The desk suite is HERMETIC — do not accept a hang as normal there. `desk/src/netcli.zig` early-
   returns without `../data/.desktop_key`, and since the bounded-httpc rework every call carries a
-  hard timeout, so the hang premise is gone. Left standing, that caveat trained a worker to wave
-  through a REAL hang as the expected one. What IS true and worth knowing: when a server happens to
-  be up, that test casts a 1-minute mock swarm at it — deliberate (the exact door the chat uses),
-  but it does side-effect a running instance.
+  hard timeout, so nothing in that suite may block. What IS true and worth knowing: when a server
+  happens to be up, that test casts a 1-minute mock swarm at it — deliberate (the exact door the
+  chat uses), but it does side-effect a running instance.
 - Oracle honesty caveats: background task runners may silently RE-EXECUTE a script that exits
   nonzero, truncating its output file — a retried run can mask the first verdict, so treat the
   exit code + the check-logs directory as authoritative, not a mid-run read of task output. The
   verdict chain judges each gate by the LAST Boolean it emitted and prints a magenta `[h13]` trace
-  when a gate returns anything else — if you see that trace, capture it in the ledger (H13).
+  when a gate returns anything else — a run that prints it has a gate whose verdict is not to be
+  trusted; report it rather than reading the summary line.
 
 ## Hard rules
 
-- Grow by accretion. One increment per session, the smallest change that lands VERIFIED. Never gut
+- Change by accretion. One increment at a time, the smallest change that lands VERIFIED. Never gut
   or wholesale-rewrite a working file; never delete user assets (binaries, PNGs, data) to "clean up".
+- No self-improvement machinery. Nothing in this repo may point the engine's swarm, governor, or
+  proposal faculties at this tree, and no automated loop may edit the oracle, the workflows, the
+  tests, or its own instructions. The app is the product; the repo is not its work item.
 - A live desktop app may share this tree. Re-read any file immediately before editing it, and stage
   only files you changed.
-- A red oracle is not automatically YOUR red. The owner (or a resident swarm) may be mid-feature in
-  this tree: before fixing a compile error you didn't cause, check `git status` and file mtimes —
-  a file modified minutes ago that you never touched is in-flight work. Report it, don't "fix" it.
+- A red oracle is not automatically YOUR red. The owner may be mid-feature in this tree: before
+  fixing a compile error you didn't cause, check `git status` and file mtimes — a file modified
+  minutes ago that you never touched is in-flight work. Report it, don't "fix" it.
 - `src/worker/httpc.zig` ↔ `desk/src/httpc.zig` are twins: byte-for-byte identical BELOW the `//!`
   header block (header prose may differ per package). Change one → mirror the other in the same
   commit (`check.ps1 -Scan` verifies).
@@ -67,8 +69,7 @@ follow the growth loop in `.claude/skills/grow/SKILL.md` (`/grow`).
 - Commit messages are plain and written as the repo owner — no AI attribution or co-author lines.
 - Docs and commits describe mechanisms in this repo's own vocabulary — never by comparison to
   external products.
-- Don't hardcode use-cases into engine behavior; behavior emerges from live signals
-  (`harness/HORIZON.md`, Principles).
+- Don't hardcode use-cases into engine behavior; behavior emerges from live signals.
 
 ## Map
 
@@ -83,9 +84,7 @@ follow the growth loop in `.claude/skills/grow/SKILL.md` (`/grow`).
   (own build.zig + tests.zig). `src/plug/` — the Lua plugin/theme extension layer. `docs/` — the
   annotated-source case-file site; `docs/docs-src/` mirrors `src/` one .md per module — feed it
   when you add or rename modules.
-- `harness/` — LEDGER.md (growth journal + open items, the cross-worker memory), TESTING.md (the
-  house test rules; read before writing any test), HORIZON.md (the long arc), and SELF-LANE.md (the
-  designed-not-wired self lane and its safety floor — owner's call, H10).
+- `harness/TESTING.md` — the house test rules; read before writing any test.
 - `scripts/check.ps1` — the oracle, and `scripts/check.sh` its POSIX twin, which is what CI runs.
   A gate added to one and not the other means local green and CI red; `-Scan` compares them.
 - `src/worker/fakehttp.zig` — TEST-ONLY canned loopback server (`local_models`, `llm`). Reach for it

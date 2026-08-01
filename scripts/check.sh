@@ -1,6 +1,6 @@
 #!/bin/sh
 # check.sh -- the POSIX twin of scripts/check.ps1: the acceptance oracle's gates, one definition
-# of done on every platform (CI's check job runs exactly these steps). The rich growth -Scan
+# of done on every platform (CI's check job runs exactly these steps). The rich -Scan
 # (test-graph reachability, docs mirror, in-flight banner) lives in check.ps1; --scan here covers
 # the cheap signals only.
 #
@@ -59,7 +59,7 @@ gate() { # gate <name> <cmd...>
 }
 
 if [ "${1:-}" = "--scan" ]; then
-  echo "== growth signals (lite; the full scan is check.ps1 -Scan) =="
+  echo "== drift signals (lite; the full scan is check.ps1 -Scan) =="
   # twin drift: identical BELOW the //! header block (header prose differs per package by design)
   a=$(grep -v '^//!' src/worker/httpc.zig)
   b=$(grep -v '^//!' desk/src/httpc.zig)

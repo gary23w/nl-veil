@@ -420,7 +420,7 @@ test "every llm.jsonl reader admits more than the writer's rotation bound lets t
 
     // The wiring, second. This is the half that was actually broken: the bound and the limit can agree
     // perfectly while a reader passes its own literal and goes to zero on its own schedule. Two readers
-    // exist — this file's endpoint and the CLI growth report — and both must name the shared constant.
+    // exist — this file's endpoint and the CLI runtime report — and both must name the shared constant.
     const sources = [_]struct { name: []const u8, src: []const u8 }{
         .{ .name = "worker/metrics.zig", .src = @embedFile("metrics.zig") },
         .{ .name = "cli.zig", .src = @embedFile("../cli.zig") },
