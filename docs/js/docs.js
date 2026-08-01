@@ -1,14 +1,14 @@
-/* FILE NL-VEIL — document viewer + inventory.
-   The contents sheet is built from the manifest below; every row and
-   every board item opens the real markdown source from docs-src/,
-   parsed by the home-built parser and typed onto bond paper. */
+/* nl-veil docs — the source-document index and its reader.
+   The manifest below is the contents of the tree; every row and every node on
+   the architecture map opens the real markdown under docs-src/, parsed by the
+   home-built parser and rendered in the app's own reading surface. */
 (function () {
   'use strict';
 
-  /* ---------------- the contents of file ---------------- */
+  /* ---------------- the contents of the tree ---------------- */
   const GROUPS = [
-    { key: '', label: 'CASE SUMMARY', note: 'start here', docs: [
-      { p: 'index', c: 'IX-00', t: 'Module index — the contents of the file', s: 'docs-src' },
+    { key: '', label: 'OVERVIEW', note: 'start here', docs: [
+      { p: 'index', c: 'IX-00', t: 'Module index — the contents of the tree', s: 'docs-src' },
       { p: 'main', c: 'MN-01', t: 'Entry point — CLI dispatch, the route table, server or app mode', s: 'main.zig' }
     ]},
     { key: 'guide/', label: 'GUIDE — RUNNING THE THING', note: 'not per-file', docs: [
@@ -77,7 +77,16 @@
       { p: 'worker/browser/launch', c: 'BR-04', t: 'Launch — browser discovery and headless start', s: 'browser/launch.zig' },
       { p: 'worker/browser/host', c: 'BR-05', t: 'Host — the local-host daemon and its client side', s: 'browser/host.zig' },
       { p: 'worker/browser/broker', c: 'BR-06', t: 'Broker — loopback broker for invented browser tools', s: 'browser/broker.zig' },
-      { p: 'worker/browser/util', c: 'BR-07', t: 'Util — raw-thread-safe browser helpers', s: 'browser/util.zig' }
+      { p: 'worker/browser/util', c: 'BR-07', t: 'Util — raw-thread-safe browser helpers', s: 'browser/util.zig' },
+      { p: 'worker/browser/ext', c: 'BR-08', t: 'Ext — the CDP relay through the user’s own Chrome/Edge', s: 'browser/ext.zig' },
+      { p: 'worker/browser/ext_api', c: 'BR-09', t: 'Ext API — the extension’s routes and its loopback-only pairing', s: 'browser/ext_api.zig' }
+    ]},
+    { key: 'worker/model', label: 'WORKER · MODEL — THE BUILT-IN ENGINE', note: 'no runtime to install', docs: [
+      { p: 'worker/builtin', c: 'BI-01', t: 'Builtin — the contracts: sentinel base, per-boot bearer, weights store', s: 'builtin.zig' },
+      { p: 'worker/builtin_endpoint', c: 'BI-02', t: 'Builtin endpoint — the loopback engine surface, native + OpenAI dialects', s: 'builtin_endpoint.zig' },
+      { p: 'worker/llamaeng', c: 'BI-03', t: 'Llamaeng — embedded inference behind the Engine interface', s: 'llamaeng.zig' },
+      { p: 'worker/modelpull', c: 'BI-04', t: 'Modelpull — resumable, sha-verified weights download and import', s: 'modelpull.zig' },
+      { p: 'worker/gemma4', c: 'BI-05', t: 'Gemma4 — the wire format, rendered here and pinned byte-for-byte', s: 'gemma4.zig' }
     ]},
     { key: 'worker/mcp/', label: 'WORKER · MCP — THE FOREIGN TOOLS', docs: [
       { p: 'worker/mcp/discovery', c: 'MC-01', t: 'Discovery — local MCP and AI-runtime discovery', s: 'mcp/discovery.zig' },
@@ -152,40 +161,131 @@
   const title = document.getElementById('docviewTitle');
   const closeBtn = document.getElementById('docviewClose');
   const tagChip = document.getElementById('docviewTag');
+  const pathChip = document.getElementById('docviewPath');
   const paper = document.getElementById('docviewPaper');
   if (!dialog || !body) return;
 
   let lastFocus = null;
-  let current = null;      // doc entry currently on the paper
+  let current = null;      // the doc on screen
   let fetchSeq = 0;        // ignore stale fetches
   const cache = {};        // path -> markdown source
 
-  /* ---------------- build the inventory sheet ---------------- */
+  function esc(s) {
+    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+
+  /* ---------------- the index ---------------- */
   const mount = document.getElementById('invMount');
+  const rows = [];   // { d, li, groupLi }
+  const groupEls = [];
+
   if (mount) {
     GROUPS.forEach((g) => {
       const cap = document.createElement('li');
-      cap.className = 'inv-group';
-      cap.id = 'inv-' + (g.key ? g.key.replace(/\W+/g, '') : 'file');
-      cap.innerHTML = (g.key ? '<code>' + g.key + '</code> ' : '') + g.label +
-        (g.note ? '<span class="inv-group-note">' + g.note + '</span>' : '');
+      cap.className = 'idx-group';
+      cap.id = 'idx-' + (g.key ? g.key.replace(/\W+/g, '') : 'top');
+      cap.innerHTML = (g.key ? '<code>' + esc(g.key) + '</code>' : '') + esc(g.label) +
+        (g.note ? '<span class="idx-group-note">' + esc(g.note) + '</span>' : '');
       mount.appendChild(cap);
+      const entry = { el: cap, rows: [] };
+      groupEls.push(entry);
+
       g.docs.forEach((d) => {
         const li = document.createElement('li');
         const btn = document.createElement('button');
-        btn.className = 'inv-row';
+        btn.type = 'button';
+        btn.className = 'idx-row';
         btn.dataset.doc = d.p;
-        btn.innerHTML = '<span class="inv-no">' + d.c + '</span>' +
-          '<span class="inv-title">' + d.t + '</span>' +
-          '<span class="inv-date">' + d.s + '</span>';
         btn.addEventListener('click', () => open(d.p));
         li.appendChild(btn);
         mount.appendChild(li);
+        const row = { d, li, btn, group: entry, hay: (d.c + ' ' + d.t + ' ' + d.s + ' ' + d.p + ' ' + g.label).toLowerCase() };
+        paintRow(row, '');
+        entry.rows.push(row);
+        rows.push(row);
       });
     });
   }
 
-  /* ---------------- the viewer ---------------- */
+  /** Row markup, with the query highlighted in the title when there is one. */
+  function paintRow(row, q) {
+    const d = row.d;
+    row.btn.innerHTML =
+      '<span class="idx-no">' + esc(d.c) + '</span>' +
+      '<span class="idx-title">' + mark(d.t, q) + '</span>' +
+      '<span class="idx-src">' + mark(d.s, q) + '</span>';
+  }
+
+  function mark(text, q) {
+    const safe = esc(text);
+    if (!q) return safe;
+    const i = safe.toLowerCase().indexOf(q);
+    if (i === -1) return safe;
+    return safe.slice(0, i) + '<mark>' + safe.slice(i, i + q.length) + '</mark>' + safe.slice(i + q.length);
+  }
+
+  /* ---------------- filter ---------------- */
+  const search = document.getElementById('idxSearch');
+  const countEl = document.getElementById('idxCount');
+  const statDocs = document.getElementById('statDocs');
+  if (statDocs) statDocs.textContent = String(FLAT.length);
+
+  function setCount(n) {
+    if (!countEl) return;
+    countEl.textContent = n === FLAT.length
+      ? FLAT.length + ' documents'
+      : n + ' of ' + FLAT.length + ' documents';
+  }
+  setCount(FLAT.length);
+
+  function applyFilter() {
+    const q = (search ? search.value : '').trim().toLowerCase();
+    let shown = 0;
+    groupEls.forEach((g) => {
+      let any = false;
+      g.rows.forEach((row) => {
+        const hit = !q || row.hay.indexOf(q) !== -1;
+        row.li.hidden = !hit;
+        if (hit) { any = true; shown++; paintRow(row, q); }
+      });
+      g.el.hidden = !any;
+    });
+    setCount(shown);
+    let empty = document.getElementById('idxEmpty');
+    if (!shown) {
+      if (!empty && mount) {
+        empty = document.createElement('li');
+        empty.id = 'idxEmpty';
+        empty.className = 'idx-empty';
+        mount.appendChild(empty);
+      }
+      if (empty) { empty.hidden = false; empty.textContent = 'No module matches “' + q + '”.'; }
+    } else if (empty) empty.hidden = true;
+  }
+
+  if (search) {
+    search.addEventListener('input', applyFilter);
+    search.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') { search.value = ''; applyFilter(); }
+      // Enter on a single match opens it — the fastest path from thought to page
+      if (e.key === 'Enter') {
+        const hit = rows.filter((r) => !r.li.hidden);
+        if (hit.length === 1) open(hit[0].d.p);
+      }
+    });
+    // "/" focuses the filter from anywhere, like the app's command surfaces
+    document.addEventListener('keydown', (e) => {
+      if (e.key !== '/' || e.metaKey || e.ctrlKey || e.altKey) return;
+      const t = e.target;
+      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
+      if (dialog.open) return;
+      e.preventDefault();
+      search.focus();
+      search.select();
+    });
+  }
+
+  /* ---------------- the reader ---------------- */
   function clearPaper() {
     body.querySelectorAll(':scope > *:not(#docviewTitle)').forEach((n) => n.remove());
   }
@@ -215,12 +315,13 @@
     current = doc;
     setHash(doc.p);
     if (tagChip) tagChip.textContent = doc.c;
+    if (pathChip) pathChip.textContent = doc.s;
     title.textContent = 'Source document ' + doc.c + ': ' + doc.t;
 
     clearPaper();
     const wait = document.createElement('p');
     wait.className = 'docview-wait';
-    wait.textContent = 'RETRIEVING ' + doc.c + ' FROM THE FILE ';
+    wait.innerHTML = '<span class="spin"></span> loading ' + esc(doc.c) + '…';
     body.appendChild(wait);
 
     const seq = ++fetchSeq;
@@ -245,12 +346,10 @@
     clearPaper();
     const holder = document.createElement('div');
     holder.innerHTML = window.NVMarkdown.render(src);
-    // adopt children so the per-line entrance animation sees them as blocks
     while (holder.firstChild) body.appendChild(holder.firstChild);
     wireLinks(doc);
     appendNav(doc);
-    dialog.scrollTop = 0;
-    paper.scrollTop = 0;
+    if (paper) paper.scrollTop = 0;
     if (anchor) {
       const target = body.querySelector('#' + CSS.escape(anchor));
       if (target) target.scrollIntoView({ block: 'start' });
@@ -263,26 +362,22 @@
     div.className = 'docview-err';
     const isFile = location.protocol === 'file:';
     div.innerHTML =
-      '<p class="doc-head">RETRIEVAL FAILURE — ' + doc.c + '<br>THE PAGE IS NOT WHERE THE INDEX SAYS IT IS</p>' +
-      '<p>The reading room could not produce <code>docs-src/' + doc.p + '.md</code> (' + String(err && err.message || err) + ').</p>' +
+      '<h3>' + esc(doc.c) + ' could not be loaded</h3>' +
+      '<p><code>docs-src/' + esc(doc.p) + '.md</code> did not come back (' + esc(String(err && err.message || err)) + ').</p>' +
       (isFile
-        ? '<p>This copy of the file is being read straight off the shelf (<code>file://</code>), and the browser will not fetch loose pages that way. Serve the folder and try again:</p>' +
+        ? '<p>This page is open straight off the disk (<code>file://</code>), and the browser will not fetch loose files that way. Serve the folder instead:</p>' +
           '<pre class="md-code"><code>cd docs' + String.fromCharCode(10) + 'python -m http.server 8080</code></pre>' +
-          '<p>then visit <code>http://localhost:8080/</code>.</p>'
-        : '<p>Check that the <code>docs-src/</code> folder was deployed beside this page, then pull the string again.</p>') +
-      '<p class="hand doc-margin">the index never lies twice. try once more. &mdash;g.</p>';
+          '<p>then open <code>http://localhost:8080/</code>.</p>'
+        : '<p>Check that <code>docs-src/</code> was deployed beside this page.</p>');
     body.appendChild(div);
     appendNav(doc);
   }
 
-  /* rendered markdown: route internal links back through the viewer */
+  /* rendered markdown: route internal links back through the reader */
   function wireLinks(doc) {
     const baseDir = doc.p.indexOf('/') !== -1 ? doc.p.slice(0, doc.p.lastIndexOf('/') + 1) : '';
     body.querySelectorAll('a[data-md]').forEach((a) => {
-      a.addEventListener('click', (e) => {
-        e.preventDefault();
-        open(resolve(baseDir, a.dataset.md));
-      });
+      a.addEventListener('click', (e) => { e.preventDefault(); open(resolve(baseDir, a.dataset.md)); });
     });
     body.querySelectorAll('a[data-mod]').forEach((a) => {
       a.addEventListener('click', (e) => {
@@ -314,16 +409,10 @@
   }
 
   function jumpToGroup(key) {
-    const el = document.getElementById('inv-' + key.replace(/\W+/g, ''));
-    const sheet = document.querySelector('.inv-sheet');
-    if (el) {
-      el.scrollIntoView({ block: 'center', behavior: 'smooth' });
-      if (sheet) {
-        sheet.classList.remove('flash');
-        void sheet.offsetWidth;
-        sheet.classList.add('flash');
-      }
-    }
+    // a filter in force would hide the group we are jumping to
+    if (search && search.value) { search.value = ''; applyFilter(); }
+    const el = document.getElementById('idx-' + key.replace(/\W+/g, ''));
+    if (el) el.scrollIntoView({ block: 'center', behavior: 'smooth' });
   }
 
   function appendNav(doc) {
@@ -334,7 +423,7 @@
       const b = document.createElement('button');
       b.type = 'button';
       if (d) {
-        b.innerHTML = dir < 0 ? '&larr; ' + d.c : d.c + ' &rarr;';
+        b.innerHTML = dir < 0 ? '&larr; ' + esc(d.c) : esc(d.c) + ' &rarr;';
         b.title = d.t;
         b.addEventListener('click', () => open(d.p));
       } else b.disabled = true;
@@ -343,15 +432,14 @@
     nav.appendChild(mk(prev, -1));
     const pos = document.createElement('span');
     pos.className = 'dv-pos';
-    pos.textContent = 'SHEET ' + (doc.idx + 1) + ' OF ' + FLAT.length;
+    pos.textContent = (doc.idx + 1) + ' of ' + FLAT.length;
     nav.appendChild(pos);
     nav.appendChild(mk(next, 1));
     body.appendChild(nav);
   }
 
-  // Cleanup after the dialog is dismissed. Idempotent — safe to call from the
-  // several paths that can close it (button, backdrop, Escape) since not every
-  // browser fires the dialog 'close' event on a programmatic .close().
+  // Cleanup after the dialog is dismissed. Idempotent — not every browser fires
+  // 'close' on a programmatic .close(), and Escape goes through 'cancel'.
   function afterClosed() {
     current = null;
     setHash('');
@@ -364,13 +452,17 @@
   }
 
   closeBtn.addEventListener('click', close);
-  dialog.addEventListener('click', (e) => {
-    if (e.target === dialog) close(); // backdrop click
-  });
-  // Escape dismisses a modal dialog natively without routing through close();
-  // 'cancel' fires for it, 'close' fires where supported. Both land on cleanup.
+  dialog.addEventListener('click', (e) => { if (e.target === dialog) close(); });
   dialog.addEventListener('cancel', () => setTimeout(afterClosed, 0));
   dialog.addEventListener('close', afterClosed);
+
+  // ← / → step through the tree while the reader is open
+  dialog.addEventListener('keydown', (e) => {
+    if (!current || e.metaKey || e.ctrlKey || e.altKey) return;
+    if (e.target && (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA')) return;
+    if (e.key === 'ArrowLeft' && FLAT[current.idx - 1]) { open(FLAT[current.idx - 1].p); e.preventDefault(); }
+    if (e.key === 'ArrowRight' && FLAT[current.idx + 1]) { open(FLAT[current.idx + 1].p); e.preventDefault(); }
+  });
 
   /* ---------------- deep links ---------------- */
   let suppressHash = false;
@@ -393,5 +485,5 @@
     b.addEventListener('click', () => open(b.dataset.doc));
   });
 
-  window.CCDocs = { open, close, docs: FLAT };
+  window.VeilDocs = { open: open, close: close, docs: FLAT };
 })();

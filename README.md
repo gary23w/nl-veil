@@ -2,7 +2,7 @@
 
 # the veil
 
-<sub>NEURON-LOOPS · ENGINEERING ARCHIVE · FILE NL-VEIL · **THE CASE STAYS OPEN** — read the whole thing twice, then browse the annotated source as a case file at [the docs site](https://gary23w.github.io/nl-veil/).</sub>
+<sub>NEURON-LOOPS · NL-VEIL · **ONE BINARY, MANY MINDS, ONE SHARED MEMORY** — read the whole thing twice, then browse the annotated source of every module at [the docs site](https://gary23w.github.io/nl-veil/).</sub>
 
 <p>
   <a href="https://github.com/gary23w/nl-veil/actions/workflows/release.yml"><img alt="build" src="https://github.com/gary23w/nl-veil/actions/workflows/release.yml/badge.svg"></a>
@@ -47,8 +47,9 @@ Python, no Node, no Docker, no cloud account, no database service.
 | [**Themes & plugins**](#make-it-your-own--themes--plugins) | Lua, hot-reloaded, across web + desktop + CLI ([PLUGINS.md](PLUGINS.md)) |
 | [**Scheduled tasks**](#scheduled-tasks) · [**the desktop**](#the-desktop--veil-desk) · [**the fleet hub**](#the-fleet-hub--many-swarms-one-console) | cron-ish runs that are real conversations, a native dashboard, one console over every swarm |
 
-Browse the annotated source as a case file at **[the docs site](https://gary23w.github.io/nl-veil/)**
-(`docs/`).
+Browse the annotated source of every module at **[the docs site](https://gary23w.github.io/nl-veil/)**
+(`docs/`) — an interactive architecture map and ~100 generated source documents, in the same design
+system the desktop app compiles in.
 
 ## One server, three faces
 
@@ -978,7 +979,8 @@ src/
     locs/atlas.zig         the source atlas — points scouts at nl-rag packs
 desk/                      veil-desk, the native desktop dashboard — compiled INTO `veil` as the
                            "desk" module (-Dapp, default true), not a separate shipped binary
-docs/                      the annotated-source case file (a static site, home-built md parser)
+docs/                      the docs site: architecture map + annotated source (static, home-built
+                           md parser, the desk's own palette from desk/src/theme.zig)
 extension/                 the Chrome/Edge extension — a thin CDP relay so the veil can drive the
                            browser you are already signed into (load unpacked; nothing to build)
 examples/embedded/         the device-operator worked example
