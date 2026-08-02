@@ -145,6 +145,22 @@ pub fn build(b: *std.Build) void {
         // desk/src/main.zig runs on std.heap.c_allocator, and raylib is a C library: the merged binary links
         // libc. (The server-only build does not.)
         exe.root_module.link_libc = true;
+
+        // LINUX: hand the final link to the SYSTEM linker instead of LLD.
+        //
+        // raylib does the right thing — it calls linkSystemLibrary("GL"/"X11"/"Xrandr"/…) — but Zig 0.16
+        // resolves those to absolute paths and archives them INTO libraylib.a, so the static library ends up
+        // carrying `/usr/lib/x86_64-linux-gnu/libGL.so` as an archive MEMBER. LLD only warns about that
+        // ("neither ET_REL nor LLVM bitcode") and links fine, but Zig promotes any unexpected LLD stderr to
+        // a hard error, so `zig build` printed a compile failure while still exiting 0. That took down the
+        // linux-x86_64 release bundle as well as the --full acceptance gate; it was invisible for a while
+        // because check.sh read the zero exit as success (fixed separately).
+        //
+        // The system linker accepts a .so sitting in an archive without editorialising, which is all that is
+        // needed here. Scoped as tightly as it can be: Linux only, GUI build only. Windows and macOS keep
+        // LLD, and -Dapp=false never reaches this block because it links no raylib at all. ubuntu-latest
+        // ships cc, and the workflow already installs the GL/X11 dev packages this needs.
+        if (target.result.os.tag == .linux) exe.use_lld = false;
     }
     // DELIBERATELY NOT `exe.subsystem = .Windows`, even though desk/build.zig sets it for veil-desk. `veil`
     // is also the CLI: a GUI-subsystem binary makes cmd.exe/PowerShell stop waiting for it and throws away
