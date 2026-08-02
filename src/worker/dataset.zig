@@ -700,13 +700,26 @@ fn redact(gpa: std.mem.Allocator, data: []const u8) ?[]u8 {
         if (data[i] == '@') {
             var s = i;
             while (s > 0 and (isTokenChar(data[s - 1]) or data[s - 1] == '.' or data[s - 1] == '%' or data[s - 1] == '+')) s -= 1;
+            // NEVER WALK INTO A JSON ESCAPE. This operates on already-encoded JSON, where a newline is
+            // the two bytes `\` `n`. `n` is a token char, so the left-walk happily ate it and left a
+            // bare `\` in front of the placeholder — an invalid escape that made the whole record
+            // unparseable. It happened for real: a captured Python snippet containing
+            //     ...```python\n@app.route(\"/...\")
+            // became ...```python\[redacted-email](\"... and broke line 586 of a 880-line set, in
+            // sft.jsonl, raw.jsonl and tools.jsonl alike. One corrupt line is worse than the leak it
+            // was fixing, because a line-oriented reader loses the record entirely.
+            if (s > 0 and data[s - 1] == '\\') s += 1;
             var e = i + 1;
             var dot = false;
             while (e < data.len and (isTokenChar(data[e]) or data[e] == '.')) : (e += 1) {
                 if (data[e] == '.') dot = true;
             }
+            // A decorator or attribute access is not an email: `@app.route(` has a dotted "domain" and
+            // reads exactly like one. Requiring that it is not immediately called keeps Python and JS
+            // source — which this set is FULL of, it being a coding assistant's traffic — intact.
+            const called = e < data.len and data[e] == '(';
             // needs a local part, a dotted domain and a plausible length — otherwise it is prose
-            if (s < i and dot and e > i + 3 and e - i <= 64 and (i - s) <= out.items.len) {
+            if (s < i and dot and !called and e > i + 3 and e - i <= 64 and (i - s) <= out.items.len) {
                 out.shrinkRetainingCapacity(out.items.len - (i - s));
                 out.appendSlice(gpa, "[redacted-email]") catch {
                     out.deinit(gpa);
@@ -1216,4 +1229,26 @@ test "redact strips the memory block, keys and emails before anything is written
     try std.testing.expect(redact(gpa, clean) == null);
     const hexy = "{\"id\":\"36a7f6a6f5a9448496de641cf64bd375\",\"sk-\":\"short\"}"; // hash + too-short prefix
     try std.testing.expect(redact(gpa, hexy) == null);
+
+    // THE ESCAPE-BOUNDARY REGRESSION. This exact shape corrupted line 586 of a real 880-line set:
+    // a Python snippet whose JSON encoding puts `\` `n` immediately before an `@`. `n` is a token
+    // char, so the left-walk ate it, left a bare `\` in front of the placeholder, and made the
+    // record unparseable in sft.jsonl, raw.jsonl and tools.jsonl at once. A decorator is also not
+    // an email. Both must survive byte-for-byte.
+    const code = "{\"messages\":[{\"role\":\"assistant\",\"content\":\"```python\\n@app.route(\\\"/health\\\")\\ndef h(): pass\"}]}";
+    try std.testing.expect(redact(gpa, code) == null); // nothing to scrub -> returned untouched
+    { // and the input really was valid JSON, so "unchanged" means "still valid"
+        const pc = try std.json.parseFromSlice(std.json.Value, gpa, code, .{});
+        defer pc.deinit();
+    }
+
+    // A REAL email still goes, even sitting right after an escape-heavy run.
+    const mixed = "{\"c\":\"line\\nreach me: real.person@example.com\\n@app.get(\\\"/x\\\")\"}";
+    const fixed = redact(gpa, mixed) orelse return error.EmailNotRedacted;
+    defer gpa.free(fixed);
+    try std.testing.expect(std.mem.indexOf(u8, fixed, "real.person@example.com") == null);
+    try std.testing.expect(std.mem.indexOf(u8, fixed, "[redacted-email]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fixed, "@app.get(") != null); // decorator survived
+    const pf = try std.json.parseFromSlice(std.json.Value, gpa, fixed, .{}); // still parseable
+    defer pf.deinit();
 }
