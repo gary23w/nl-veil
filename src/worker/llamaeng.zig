@@ -474,6 +474,10 @@ fn ensureLoadedLocked() !void {
     g.ctx = c;
     g.n_slots_live = n;
     g.gpu_layers_live = ngl;
+    // PUBLISH THE WINDOW THAT ACTUALLY FIT. The ladder above may have walked g.n_ctx well below the
+    // configured value, and callers that size a prompt off the static model catalog have no way to learn
+    // that — they would budget a turn against a window this box never allocated. See builtin.serving_ctx.
+    builtin_mod.setServingCtx(g.n_ctx);
     for (g.slots[0..MAX_SLOTS]) |*sl| {
         sl.toks.clearRetainingCapacity();
         sl.used_s = 0;
@@ -498,6 +502,7 @@ fn unloadLocked() void {
     g.ctx = null;
     g.model = null;
     g.n_slots_live = 0;
+    builtin_mod.setServingCtx(0); // nothing is served now — readers fall back to the catalog
     for (g.slots[0..MAX_SLOTS]) |*sl| {
         sl.toks.clearAndFree(g.gpa);
         sl.used_s = 0;
