@@ -5600,10 +5600,21 @@ pub const Chat = struct {
             jb.appendSlice(self.gpa, "\"") catch return;
         }
         jb.appendSlice(self.gpa, "}\n") catch return;
-        const f = Io.Dir.cwd().createFile(self.io, path, .{ .truncate = false }) catch return;
+        // Dir.statFile, NOT File.stat: the first version of this used the open handle's stat, which FAILS here
+        // at runtime — so every archive file was created and then left at 0 bytes while the ring went on
+        // evicting the user's history. Verified against the live tree: 0-byte .hist beside a full .jsonl.
+        // This is the same statFile → createFile(truncate=false) → writePositionalAll sequence persistAppendMsg
+        // has always used, which demonstrably works.
+        const size: u64 = if (Io.Dir.cwd().statFile(self.io, path, .{})) |st| st.size else |_| 0;
+        const f = Io.Dir.cwd().createFile(self.io, path, .{ .truncate = false }) catch |e| {
+            std.log.warn("chat archive: cannot open {s}: {t}", .{ path, e });
+            return;
+        };
         defer f.close(self.io);
-        const st = f.stat(self.io) catch return;
-        f.writePositionalAll(self.io, jb.items, st.size) catch {};
+        // LOUD on failure: a silent archive is indistinguishable from a working one until the history is
+        // already gone — which is exactly how the 0-byte bug survived a release.
+        f.writePositionalAll(self.io, jb.items, size) catch |e|
+            std.log.warn("chat archive: write failed for {s}: {t}", .{ path, e });
     }
 
     /// Append ONE message line to the conv file. Returns false when the caller must do the full persistConv
@@ -14420,4 +14431,33 @@ test "cast_conv and sc_conv are the SAME size — the comment that says so, enfo
     // Both must also still hold a real conv id. 64 is the working assumption everywhere that copies
     // one; a shrink below that would start silently dropping ids rather than erroring.
     try std.testing.expect(c.cast_conv.len >= 64);
+}
+
+test "append-at-end idiom: repeated positional appends GROW the file (the 0-byte archive bug)" {
+    // THE BUG THIS PINS: persistArchiveMsg first sized its append with the OPEN HANDLE's stat
+    // (`f.stat(io)`), which fails at runtime here — so every write was skipped by its `catch return`
+    // and the archive sat at 0 bytes while the render ring went on evicting the user's history.
+    // Nothing errored, nothing logged; the loss was invisible until the transcript was already gone.
+    // This exercises the exact sequence the fixed code uses (Dir.statFile -> createFile(truncate=false)
+    // -> writePositionalAll) against a REAL file, so a silent regression fails the suite instead.
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{ .environ = llm.osEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const path = "zig-archive-append-tmp.hist";
+    Io.Dir.cwd().deleteFile(io, path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    for ([_][]const u8{ "{\"r\":0,\"t\":\"one\"}\n", "{\"r\":1,\"t\":\"two\"}\n", "{\"r\":1,\"t\":\"three\"}\n" }) |row| {
+        const size: u64 = if (Io.Dir.cwd().statFile(io, path, .{})) |st| st.size else |_| 0;
+        const f = try Io.Dir.cwd().createFile(io, path, .{ .truncate = false });
+        defer f.close(io);
+        try f.writePositionalAll(io, row, size);
+    }
+
+    const got = try Io.Dir.cwd().readFileAlloc(io, path, std.testing.allocator, .limited(4096));
+    defer std.testing.allocator.free(got);
+    // all three rows present, in order, nothing overwritten
+    try std.testing.expectEqualStrings("{\"r\":0,\"t\":\"one\"}\n{\"r\":1,\"t\":\"two\"}\n{\"r\":1,\"t\":\"three\"}\n", got);
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, got, "\n"));
 }
