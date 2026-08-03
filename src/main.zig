@@ -656,7 +656,14 @@ pub fn main(init: std.process.Init) !void {
         // many requests one socket may serve before it is recycled, and keepalive=60 still reaps idle ones.
         // A stuck socket therefore costs at most one thread for at most a minute, out of 128 — instead of
         // every client paying a handshake on every poll. Tunable for an operator who hits the old bug.
-        .timeout = .{ .request = 15, .keepalive = 60, .request_count = keepalive_requests },
+        // KEEPALIVE 60 -> 5. In the BLOCKING worker model an idle keep-alive socket owns a pool thread for the
+        // whole idle window, so `keepalive` is not a politeness setting — it is how long ONE client can hold
+        // 1/128th of the server's total admission. Measured on this machine: once live connections reach
+        // thread_pool.count the NEXT connection does not queue, it HANGS until a timeout (~15-25s), which is
+        // exactly the "server wedged/slow" the desk reports. At 60s a burst of pollers plus the browser
+        // extension's 25s long-poll and 30s CDP relays can sit on the whole pool for a minute; at 5s the same
+        // sockets recycle 12x faster, and a localhost/LAN handshake costs ~1ms. request_count still recycles.
+        .timeout = .{ .request = 15, .keepalive = 5, .request_count = keepalive_requests },
         // Body cap: httpz defaults to 1 MiB, which 413-rejects a chat message carrying an image attachment
         // (base64 of a normal screenshot easily exceeds 1 MiB) BEFORE the handler runs. Lift it to 16 MiB —
         // above the desk's 8 MiB raw-image read limit × ~1.4 base64 + JSON/header headroom. Loopback-only.
@@ -666,6 +673,13 @@ pub fn main(init: std.process.Init) !void {
         // casts (each also leaving a live worker behind) — new casts then hang + return curl 000. Give admission
         // real headroom so a handful of slow spawns can't wedge the pool. (The worker-CPU amplifier is bounded
         // separately by the live-swarm cap in deployCore + the worker's unreachable-LLM backoff.)
+        // In blocking mode this is not "how much parallelism we want", it is the HARD CEILING on concurrent
+        // connections: one thread owns one socket for that socket's whole life. Measured by holding N sockets
+        // open and counting requests to the first stall — the stall lands at exactly (held + in-flight) ==
+        // count, every time, and the request over the line HANGS 15-25s instead of queueing or being refused.
+        // Left at 128 deliberately: each worker charges ~30 MB of commit (its buffer + stack), so 512 pushed
+        // this process from 4.5 GB to 16.9 GB of commit charge for headroom the keepalive fix above already
+        // buys far more cheaply. Raise it only with that cost in mind.
         .thread_pool = .{ .count = 128 },
     }, &app);
     defer {
