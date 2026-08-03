@@ -1866,6 +1866,11 @@ pub const Chat = struct {
         } else if (std.mem.eql(u8, kind, "file_pull")) {
             const id = scRawField(line, "id") orelse return false;
             self.answerFilePull(dd, conv, id, line);
+        } else if (std.mem.eql(u8, kind, "tool_cancel")) {
+            // the server abandoned this call's wait — kill the local run / drop it from the queue (same
+            // contract as the foreground handler; the executor is shared, so a background cancel matters)
+            const id = scRawField(line, "id") orelse return false;
+            self.cancelDelegated(dd, id);
         } else if (std.mem.eql(u8, kind, "done")) {
             return true;
         }
@@ -2134,6 +2139,14 @@ pub const Chat = struct {
             const id = scRawField(line, "id") orelse return;
             const tool = scRawField(line, "tool") orelse return;
             self.startDelegatedTool(dd, self.sc_conv[0..self.sc_conv_len], id, tool, line);
+            return;
+        }
+        if (std.mem.eql(u8, kind, "tool_cancel")) {
+            // CLIENT MODE: the server ABANDONED its wait for this call (user Stop / turn gone). Kill the local
+            // subprocess and clear the chip — without this a canceled poll kept running its full 180s here and
+            // the status line showed "running poll..." long after the turn had ended.
+            const id = scRawField(line, "id") orelse return;
+            self.cancelDelegated(dd, id);
             return;
         }
         if (std.mem.eql(u8, kind, "file_sync")) {
@@ -2430,6 +2443,43 @@ pub const Chat = struct {
     /// status and post a heartbeat ack every DELEG_HEARTBEAT_S (for the running id AND any queued ones, so a
     /// queued retry isn't timed out by the server while it waits its turn). On exit/timeout/flood: read the
     /// sinks, post the result, clean up, and start the next queued request. No-op when nothing is running.
+    /// Handle a {kind:"tool_cancel"} frame: the server stopped waiting for `id` (user Stop, turn over), so
+    /// finishing the local run has no reader — kill it, clean its sinks, clear the status chip, and drop any
+    /// queued request with the same id. Deliberately posts NOTHING back: the awaiting turn is gone, and a late
+    /// /tool_result row would just be noise in a dead conversation's channel.
+    fn cancelDelegated(self: *Chat, dd: []const u8, id: []const u8) void {
+        if (self.deleg) |*p| {
+            if (std.mem.eql(u8, p.idStr(), id)) {
+                var exit_code: ?u32 = null;
+                if (!procExited(&p.child, &exit_code)) {
+                    p.child.kill(self.io);
+                    if (p.child.id != null) {
+                        if (p.child.wait(self.io)) |_| {} else |_| {} // reap — a killed child must not zombie
+                    }
+                }
+                var ob: [360]u8 = undefined;
+                var eb: [360]u8 = undefined;
+                if (std.fmt.bufPrint(&ob, "{s}.out", .{p.baseStr()})) |outp| Io.Dir.cwd().deleteFile(self.io, outp) catch {} else |_| {}
+                if (std.fmt.bufPrint(&eb, "{s}.err", .{p.baseStr()})) |errp| Io.Dir.cwd().deleteFile(self.io, errp) catch {} else |_| {}
+                Io.Dir.cwd().deleteFile(self.io, p.args_file[0..p.af_len]) catch {};
+                const fg = self.isForeground(p.convStr());
+                self.deleg = null;
+                if (fg) self.setStatus("tool canceled (turn stopped)");
+                self.delegDequeue(dd); // a queued request for a LIVE turn may still be waiting its slot
+                return;
+            }
+        }
+        // not the running one — purge a queued twin so it never launches into a dead turn
+        for (&self.deleg_q) |*slot| {
+            const q = slot.* orelse continue;
+            const qid = scRawField(q.line, "id") orelse continue;
+            if (std.mem.eql(u8, qid, id)) {
+                self.gpa.free(q.line);
+                slot.* = null;
+            }
+        }
+    }
+
     fn pumpDelegated(self: *Chat, dd: []const u8) void {
         const p = if (self.deleg) |*pp| pp else {
             self.delegDequeue(dd);
@@ -4167,6 +4217,10 @@ pub const Chat = struct {
         var pb: [700]u8 = undefined;
         const path = std.fmt.bufPrint(&pb, "{s}/.veil-desk/chats/{s}.jsonl", .{ dd, id }) catch return;
         Io.Dir.cwd().deleteFile(self.io, path) catch {};
+        // the append-only archive twin goes with its conversation — delete means delete
+        if (std.fmt.bufPrint(&pb, "{s}/.veil-desk/chats/{s}.hist", .{ dd, id })) |hp| {
+            Io.Dir.cwd().deleteFile(self.io, hp) catch {};
+        } else |_| {}
         // Deleting a PRIMARY cascades to its sub-chats' LOCAL files too (the server route already cascades
         // its side): a leftover local "<id>__sN.jsonl" would re-merge as a phantom tab on the next refresh.
         if (store_mod.branchConvParts(id) == null) {
@@ -4174,6 +4228,9 @@ pub const Chat = struct {
             while (n <= store_mod.MAX_BRANCHES) : (n += 1) {
                 if (std.fmt.bufPrint(&pb, "{s}/.veil-desk/chats/{s}__s{d}.jsonl", .{ dd, id, n })) |bp| {
                     Io.Dir.cwd().deleteFile(self.io, bp) catch {};
+                } else |_| {}
+                if (std.fmt.bufPrint(&pb, "{s}/.veil-desk/chats/{s}__s{d}.hist", .{ dd, id, n })) |bh| {
+                    Io.Dir.cwd().deleteFile(self.io, bh) catch {};
                 } else |_| {}
             }
         }
@@ -5518,6 +5575,35 @@ pub const Chat = struct {
         // when the ring evicted (rows shifted) or the file doesn't exist yet (fresh conv needs its title header).
         if (evicted or !self.persistAppendMsg(dd, idb[0..idn], role, text[0..tn], img))
             self.persistConv(dd, idb[0..idn]);
+        // ARCHIVE, unconditionally: the ring mirror above is REWRITTEN on eviction, so past its capacity the
+        // user's transcript was being destroyed on disk — "the chat slowly disappears and leaves no trace".
+        // The .hist twin is append-only and never rewritten: every committed message survives there whatever
+        // the ring does. Not .jsonl on purpose (the sidebar lists *.jsonl; the archive must not read as a
+        // phantom conversation), and never loaded into the ring — it is the user's readable record first,
+        // a future in-app history pager's source second.
+        self.persistArchiveMsg(dd, idb[0..idn], role, text[0..tn], img);
+    }
+
+    /// Append one message row to the conversation's append-only archive ({id}.hist beside {id}.jsonl — same
+    /// row shape, no title header). Best-effort: an archive miss must never disturb the turn.
+    fn persistArchiveMsg(self: *Chat, dd: []const u8, conv_id: []const u8, role: store_mod.ChatRole, text: []const u8, img: []const u8) void {
+        var pb: [700]u8 = undefined;
+        const path = std.fmt.bufPrint(&pb, "{s}/.veil-desk/chats/{s}.hist", .{ dd, conv_id }) catch return;
+        var jb: std.ArrayListUnmanaged(u8) = .empty;
+        defer jb.deinit(self.gpa);
+        jb.print(self.gpa, "{{\"r\":{d},\"t\":\"", .{@intFromEnum(role)}) catch return;
+        escJson(&jb, self.gpa, text);
+        jb.appendSlice(self.gpa, "\"") catch return;
+        if (img.len > 0) {
+            jb.appendSlice(self.gpa, ",\"img\":\"") catch return;
+            escJson(&jb, self.gpa, img);
+            jb.appendSlice(self.gpa, "\"") catch return;
+        }
+        jb.appendSlice(self.gpa, "}\n") catch return;
+        const f = Io.Dir.cwd().createFile(self.io, path, .{ .truncate = false }) catch return;
+        defer f.close(self.io);
+        const st = f.stat(self.io) catch return;
+        f.writePositionalAll(self.io, jb.items, st.size) catch {};
     }
 
     /// Append ONE message line to the conv file. Returns false when the caller must do the full persistConv

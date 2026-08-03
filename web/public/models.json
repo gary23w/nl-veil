@@ -904,6 +904,12 @@
       "label": "The Veil 12B",
       "provider": "ollama",
       "hosting": "local"
+    },
+    {
+      "id": "deepseek-v4-pro:fim",
+      "label": "DeepSeek V4 Pro FIM (beta completions)",
+      "provider": "deepseek",
+      "hosting": "hosted"
     }
   ],
   "defaults": {

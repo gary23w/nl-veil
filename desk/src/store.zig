@@ -281,7 +281,12 @@ pub const Settings = struct {
 
 // ------------------------------------------------------------------------------------ chat state
 
-pub const MAX_CHAT_MSGS = 64;
+// 128, up from 64: the ring is the user's ONLY scrollback (the renderer draws from it), and an agentic turn
+// mints tool notes and thoughts fast enough that 64 evicted the conversation's start mid-session — the
+// reported "my chat slowly disappears" bug. RAM cost ~13KB/slot (ChatMsg), so doubling buys real scrollback
+// for ~830KB. The full transcript additionally survives on disk in the append-only <conv>.hist archive
+// (chat.zig persistArchiveMsg) — eviction now trims only what is RENDERED, never what is KEPT.
+pub const MAX_CHAT_MSGS = 128;
 pub const MAX_CONVS = 32;
 pub const MAX_CASTS = 6;
 pub const CAST_TAIL = 40;
