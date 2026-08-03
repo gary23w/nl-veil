@@ -263,14 +263,27 @@ pub fn sandboxAllowed(name: []const u8) bool {
 /// browser_console, browser_network, browser_eval, browser_close, pixel_capture, pixel_ingest, recall_hive);
 /// (3) the MCP pair, empirically the top hallucination magnet above; (4) scheduling + credential fetch, which
 /// need precision a small model does not have. Mid and large tiers are untouched and keep the full belt.
+///
+/// A LATER PASS dropped three more, measured against the window this tier is actually served. The built-in
+/// engine's fit ladder lands around 9216 tokens on a consumer card, and the 20-tool belt was 3,599 of them —
+/// 39% of the whole window spent on schema before a single word of conversation. read_url and fetch_json went
+/// because web_fetch already covers both and run_python covers any header/JSON nuance either had: three verbs
+/// that fetch a URL are a CHOICE burden on a 12B, not merely bytes, and this tier's whole failure mode is
+/// picking wrong among near-twins. stop_process went because a chat-tier small model never backgrounds the
+/// process it would stop. 346 tokens, no capability lost — execute() still dispatches all three by name.
+///
+/// The four browser verbs STAY despite costing 1,120 tokens, the largest block on the belt. In the live
+/// session that motivated this pass they are the one thing that worked: the model drove browser_navigate +
+/// browser_read to a real page, noticed the content was thin, and moved on. Reclaiming that 12% would trade
+/// the tier's only demonstrated capability for window it has other ways to find.
 const COMPACT_TOOLS = [_][]const u8{
-    // research
-    "web_search",     "web_fetch",  "read_url",   "fetch_json",
+    // research (web_fetch is the ONE fetch verb — see the note above on read_url/fetch_json)
+    "web_search",     "web_fetch",
     // files
      "read_file",      "write_file", "edit_file",
     "list_dir",       "delete_file",
     // code
-      "run_python", "run_tests",  "stop_process",
+      "run_python", "run_tests",
     // memory + documents (one recall verb, not two)
     "recall",         "observe",    "read_doc",   "pixel_search",
     // the browser, reduced to the four verbs that actually drive a page
@@ -782,6 +795,159 @@ test "credentialLookup finds the right secretive entry by words" {
     try std.testing.expect(credentialLookup(gpa, data, "stripe billing") == null);
 }
 
+/// The DURABLE half of `recall`. The user's cross-conversation facts live in memories.jsonl — a store the
+/// associative memory has never indexed — so `recall{"query":"user age"}` answered "(nothing recalled yet)"
+/// while `- [fact] User is 33 years old` sat in that same turn's system prompt. Observed live: the veil told
+/// the user it had no record of their age and no record of their email, with both facts in its own context.
+/// recall is the tool the doctrine sends the model to FIRST, so its empty answer reads as authoritative and
+/// overrides the block — the model believes the tool, not the prompt. Joining the two stores at the tool is
+/// the fix; telling the prompt to try harder is not.
+///
+/// Secretive entries surface MASKED, exactly as the YOUR MEMORY block renders them: recall confirms the
+/// credential EXISTS (so the model stops denying it) without ever putting the value in a tool result.
+/// Returns gpa-owned bytes; a zero-length result means no match and must not be freed by the caller.
+pub fn durableRecall(gpa: std.mem.Allocator, data: []const u8, q: []const u8) []u8 {
+    const M = struct { cat: []const u8 = "", text: []const u8 = "" };
+    const Hit = struct { line: []u8, score: usize, len: usize };
+    var hits: std.ArrayListUnmanaged(Hit) = .empty;
+    defer {
+        for (hits.items) |h| gpa.free(h.line);
+        hits.deinit(gpa);
+    }
+    var it = std.mem.splitScalar(u8, data, '\n');
+    while (it.next()) |raw| {
+        const ln = std.mem.trim(u8, raw, " \r\t");
+        if (ln.len == 0 or ln[0] != '{') continue;
+        const e = std.json.parseFromSlice(M, gpa, ln, .{ .ignore_unknown_fields = true }) catch continue;
+        defer e.deinit();
+        const tx = std.mem.trim(u8, e.value.text, " \r\n\t");
+        if (tx.len == 0) continue;
+        var score: usize = 0;
+        var wit = std.mem.tokenizeAny(u8, q, " \t,.:;?!\"'");
+        while (wit.next()) |w| {
+            if (w.len < 3 or isStopWord(w)) continue;
+            if (wordStartMatch(tx, w)) score += 1;
+        }
+        if (score == 0) continue;
+        // Same masking rule as the prompt block — the value never rides a tool result.
+        const shown: []u8 = if (secretiveDurable(e.value.cat, tx)) blk: {
+            const masked = maskSecretTokens(gpa, tx);
+            if (!std.mem.eql(u8, masked, tx)) break :blk masked;
+            if (masked.len > 0) gpa.free(masked);
+            const cut = std.mem.indexOfScalar(u8, tx, ':') orelse @min(tx.len, 40);
+            break :blk std.fmt.allocPrint(gpa, "{s}: [withheld]", .{tx[0..cut]}) catch continue;
+        } else gpa.dupe(u8, tx) catch continue;
+        defer gpa.free(shown);
+        const line = (if (e.value.cat.len > 0)
+            std.fmt.allocPrint(gpa, "- [{s}] {s}", .{ e.value.cat, shown })
+        else
+            std.fmt.allocPrint(gpa, "- {s}", .{shown})) catch continue;
+        hits.append(gpa, .{ .line = line, .score = score, .len = tx.len }) catch {
+            gpa.free(line);
+            break;
+        };
+    }
+    if (hits.items.len == 0) return gpa.dupe(u8, "") catch @constCast(""[0..0]);
+    // Best-scoring first, SHORTEST wins a tie. The length tiebreak is load-bearing, not cosmetic: in this
+    // store the personal facts a user asks about are terse ("User is 33 years old", "user's email address:
+    // …") and the procedural notes that share their vocabulary are long paragraphs. On the live store a
+    // score-1 query for the user's age tied six ways, and without this the answer ranked below three
+    // workflow notes and fell off the end of the list.
+    std.mem.sort(Hit, hits.items, {}, struct {
+        fn lt(_: void, a: Hit, b: Hit) bool {
+            if (a.score != b.score) return a.score > b.score;
+            return a.len < b.len;
+        }
+    }.lt);
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(gpa);
+    out.appendSlice(gpa, "from your durable memory of this user:\n") catch {};
+    for (hits.items[0..@min(hits.items.len, DURABLE_RECALL_HITS)]) |h| {
+        out.appendSlice(gpa, h.line) catch break;
+        out.append(gpa, '\n') catch break;
+    }
+    return out.toOwnedSlice(gpa) catch @constCast(""[0..0]);
+}
+
+const DURABLE_RECALL_HITS = 6; // best-scoring durable facts merged into one recall answer
+
+/// True if `w` occurs in `hay` (case-insensitive) starting at a WORD BOUNDARY. A plain substring test — how
+/// this scored at first — let "age" match "eng*age*ment" and "mess*age*", so on the live store the query
+/// "user age" ranked two unrelated workflow notes ABOVE `User is 33 years old` and the real fact fell off the
+/// end of the list. Only the START is anchored, so plurals and possessives still match ("email" → "emails",
+/// "user" → "user's") — which is most of the value of substring matching without the false positives.
+fn wordStartMatch(hay: []const u8, w: []const u8) bool {
+    var i: usize = 0;
+    while (std.ascii.findIgnoreCasePos(hay, i, w)) |at| {
+        if (at == 0) return true;
+        const prev = hay[at - 1];
+        if (!std.ascii.isAlphanumeric(prev) and prev != '_') return true;
+        i = at + 1;
+    }
+    return false;
+}
+
+test "wordStartMatch anchors the start and still allows plurals" {
+    try std.testing.expect(wordStartMatch("User is 33 years old", "user"));
+    try std.testing.expect(wordStartMatch("user's email address: a@b.c", "email"));
+    try std.testing.expect(wordStartMatch("Do not use markdown in emails", "email")); // plural
+    try std.testing.expect(wordStartMatch("posting high-value topics", "value")); // after a hyphen
+    // the exact false positives that buried the real answer
+    try std.testing.expect(!wordStartMatch("User wants to create engagement", "age"));
+    try std.testing.expect(!wordStartMatch("POST form data (name, email, message)", "age"));
+    try std.testing.expect(!wordStartMatch("preferred deploy region is us-west-2", "ion"));
+}
+
+/// Words that match a durable fact by accident. "what is my email" must not score every entry that happens to
+/// contain "the"; without this a 3-char floor alone lets "you"/"can"/"and" carry a query.
+fn isStopWord(w: []const u8) bool {
+    const stops = [_][]const u8{ "the", "and", "for", "was", "are", "you", "your", "our", "his", "her", "its", "with", "from", "that", "this", "what", "when", "where", "who", "how", "why", "have", "has", "had", "any", "all", "can", "did", "does", "not", "but", "get", "got", "out", "use", "used", "about", "there", "their", "them", "then", "than", "some", "such", "into", "over", "under", "know", "need", "want", "please", "tell", "give" };
+    for (stops) |s| if (std.ascii.eqlIgnoreCase(s, w)) return true;
+    return false;
+}
+
+test "durableRecall answers the questions the associative store cannot" {
+    const gpa = std.testing.allocator;
+    // shaped like the live store that produced the failure: terse personal facts sharing vocabulary with
+    // long procedural notes, including the two that "age" substring-matched their way to the top of
+    const data =
+        \\{"cat":"fact","text":"User is 33 years old"}
+        \\{"cat":"login","text":"user's email address: someone@example.com"}
+        \\{"cat":"preference","text":"favorite language is Zig"}
+        \\{"cat":"key","text":"Discourse API key for a forum: aaaa1111bbbb2222cccc3333"}
+        \\{"cat":"preference","text":"User wants to create engagement — i.e. posting high-value topics and replies"}
+        \\{"cat":"fact","text":"Sending email to the user: POST form data (name, email, message, _subject fields) to the FormSubmit AJAX endpoint; no auth needed"}
+        \\{"cat":"fact","text":"User has an X account; already logged in on their local browser"}
+        \\
+    ;
+    // the two live failures: "how old am I?" and "what is my email?" both answered "(nothing recalled yet)"
+    const age = durableRecall(gpa, data, "user age"); // the query the model actually sent
+    defer if (age.len > 0) gpa.free(age);
+    try std.testing.expect(std.mem.indexOf(u8, age, "33 years old") != null);
+    const old = durableRecall(gpa, data, "how old am I");
+    defer if (old.len > 0) gpa.free(old);
+    try std.testing.expect(std.mem.indexOf(u8, old, "33 years old") != null);
+    const mail = durableRecall(gpa, data, "what is my email address");
+    defer if (mail.len > 0) gpa.free(mail);
+    try std.testing.expect(std.mem.indexOf(u8, mail, "someone@example.com") != null);
+    // the answer must RANK, not merely appear: a tie against the long notes has to resolve toward the fact
+    try std.testing.expect(std.mem.indexOf(u8, mail, "someone@example.com").? <
+        (std.mem.indexOf(u8, mail, "FormSubmit") orelse mail.len));
+    // a credential match confirms the entry EXISTS but never carries the value
+    const key = durableRecall(gpa, data, "discourse api key");
+    defer if (key.len > 0) gpa.free(key);
+    try std.testing.expect(std.mem.indexOf(u8, key, "Discourse API key") != null);
+    try std.testing.expect(std.mem.indexOf(u8, key, "aaaa1111bbbb2222cccc3333") == null);
+    // no match stays no match — recall must not start answering everything
+    const miss = durableRecall(gpa, data, "kubernetes cluster topology");
+    defer if (miss.len > 0) gpa.free(miss);
+    try std.testing.expectEqual(@as(usize, 0), miss.len);
+    // stop words alone never score a hit
+    const stop = durableRecall(gpa, data, "what are the things that you know");
+    defer if (stop.len > 0) gpa.free(stop);
+    try std.testing.expectEqual(@as(usize, 0), stop.len);
+}
+
 /// The swarm-shared skill library lives in its own neuron-db scope (in the per-swarm mind.sqlite), so every
 /// mind reads + writes the SAME skills and can build on each other's learned techniques.
 pub const SKILL_SCOPE = "skills";
@@ -922,7 +1088,7 @@ pub const MAX_TOOL_PARAMS = 4 * 1024;
 
 /// The OpenAI `tools` array contents (comma-separated function defs, no outer brackets).
 pub const SCHEMA =
-    \\{"type":"function","function":{"name":"run_python","description":"Run a short Python script (no GUI) in the build workdir and get its stdout/stderr. Use it to compute, transform data, or generate files. API keys are NOT available to the script.","parameters":{"type":"object","properties":{"code":{"type":"string","description":"the Python source to execute"}},"required":["code"]}}},
+    \\{"type":"function","function":{"name":"run_python","description":"Run Python (no GUI) in the build workdir; returns stdout/stderr. This is your general-purpose EXECUTOR and the DEFAULT whenever no other tool fits, because it is the only way you can execute anything: HTTP and API calls with your own headers/auth/POST body (requests works, the network is up), computation, data wrangling, generating files. Provider API keys are stripped from the environment, but a credential written into the code itself is used as-is.","parameters":{"type":"object","properties":{"code":{"type":"string","description":"the Python source to execute"}},"required":["code"]}}},
     \\{"type":"function","function":{"name":"stop_process","description":"KILL a process YOU started (and its children) by pid — the background server, fuzzer, watcher or build you launched with run_python and no longer want. Ending a turn does NOT reap what a script spawned, so a run left behind keeps holding the machine and its ports. Use it when the user says stop, when you are done watching something, or before relaunching a service on the same port.","parameters":{"type":"object","properties":{"pid":{"type":"integer","description":"the process id to terminate, together with its child tree"}},"required":["pid"]}}},
     \\{"type":"function","function":{"name":"write_file","description":"Write a UTF-8 text file at a relative path inside the build workdir (creates parent dirs). To GROW a long document (e.g. add the next scene to a chapter) pass mode:\"append\" with ONLY the new text — it is concatenated onto the existing file, so you never resend (or truncate) prior content. mode:\"overwrite\" (default) replaces the file. To CHANGE an existing file, prefer edit_file (never re-emit a large file).","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"mode":{"type":"string","enum":["overwrite","append"]}},"required":["path","content"]}}},
     \\{"type":"function","function":{"name":"edit_file","description":"Make a SURGICAL edit to an EXISTING file WITHOUT resending the whole file — use this (NOT write_file) to change a file that already exists, especially a large one (write_file re-emits the whole file and truncates big ones). PREFERRED anchors: reads prefix every line with a tag like 42:abc:def — copy that tag as the op's anchor (add end = the range's LAST-line tag to cover several lines). Tags are verified against the CURRENT file and the batch is ATOMIC: all ops apply or none do, and a stale-tag error hands you FRESH tags — retry the whole batch with those (no re-read needed). Plain text anchors (a snippet copied VERBATIM, unique in the file) also work. op is: replace (swap the anchored line/range for text), insert_before / insert_after (add text around the anchor; anchor 0: = file start, EOF = file end), delete (remove the anchored lines).","parameters":{"type":"object","properties":{"path":{"type":"string"},"ops":{"type":"array","items":{"type":"object","properties":{"op":{"type":"string","enum":["replace","insert_before","insert_after","delete"]},"anchor":{"type":"string"},"end":{"type":"string"},"text":{"type":"string"}},"required":["op","anchor"]}}},"required":["path","ops"]}}},
@@ -1025,7 +1191,7 @@ pub const MCP_SCHEMA =
 /// and CHAT_ONLY_DEFS below, and the test there fails on any UNDECLARED difference — so an accidentally stale
 /// copy is caught, while an intentional adaptation has to be written down.
 pub const CHAT_SCHEMA =
-    \\{"type":"function","function":{"name":"run_python","description":"Run a short Python script (no GUI) in the build workdir and get its stdout/stderr. Use it to compute, transform data, or generate files. API keys are NOT available to the script.","parameters":{"type":"object","properties":{"code":{"type":"string","description":"the Python source to execute"}},"required":["code"]}}},
+    \\{"type":"function","function":{"name":"run_python","description":"Run Python (no GUI) in the build workdir; returns stdout/stderr. This is your general-purpose EXECUTOR and the DEFAULT whenever no other tool fits, because it is the only way you can execute anything: HTTP and API calls with your own headers/auth/POST body (requests works, the network is up), computation, data wrangling, generating files. Provider API keys are stripped from the environment, but a credential written into the code itself is used as-is.","parameters":{"type":"object","properties":{"code":{"type":"string","description":"the Python source to execute"}},"required":["code"]}}},
     \\{"type":"function","function":{"name":"stop_process","description":"KILL a process YOU started (and its children) by pid — the background server, fuzzer, watcher or build you launched with run_python and no longer want. Ending a turn does NOT reap what a script spawned, so a run left behind keeps holding the machine and its ports. Use it when the user says stop, when you are done watching something, or before relaunching a service on the same port.","parameters":{"type":"object","properties":{"pid":{"type":"integer","description":"the process id to terminate, together with its child tree"}},"required":["pid"]}}},
     \\{"type":"function","function":{"name":"write_file","description":"Write a UTF-8 text file at a relative path inside the build workdir (creates parent dirs). To GROW a long document (e.g. add the next scene to a chapter) pass mode:\"append\" with ONLY the new text — it is concatenated onto the existing file, so you never resend (or truncate) prior content. mode:\"overwrite\" (default) replaces the file. To CHANGE an existing file, prefer edit_file (never re-emit a large file).","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"mode":{"type":"string","enum":["overwrite","append"]}},"required":["path","content"]}}},
     \\{"type":"function","function":{"name":"edit_file","description":"Make a SURGICAL edit to an EXISTING file WITHOUT resending the whole file — use this (NOT write_file) to change a file that already exists, especially a large one (write_file re-emits the whole file and truncates big ones). PREFERRED anchors: reads prefix every line with a tag like 42:abc:def — copy that tag as the op's anchor (add end = the range's LAST-line tag to cover several lines). Tags are verified against the CURRENT file and the batch is ATOMIC: all ops apply or none do, and a stale-tag error hands you FRESH tags — retry the whole batch with those (no re-read needed). Plain text anchors (a snippet copied VERBATIM, unique in the file) also work. op is: replace (swap the anchored line/range for text), insert_before / insert_after (add text around the anchor; anchor 0: = file start, EOF = file end), delete (remove the anchored lines).","parameters":{"type":"object","properties":{"path":{"type":"string"},"ops":{"type":"array","items":{"type":"object","properties":{"op":{"type":"string","enum":["replace","insert_before","insert_after","delete"]},"anchor":{"type":"string"},"end":{"type":"string"},"text":{"type":"string"}},"required":["op","anchor"]}}},"required":["path","ops"]}}},
@@ -1345,11 +1511,26 @@ fn executeInner(ctx: *ToolCtx, name: []const u8, args_json: []const u8) []u8 {
         // FAMILY-WIDE for sub-chats: a "chat:<parent>__sN" scope recalls across its whole family base
         // (primary + sibling branches); every other scope is its own base — behavior unchanged.
         const r = ctx.mem.assocAcross(cpaths.scopeFamilyBase(ctx.scope), p.value.query, Mem.SATURATE_HOPS, 8);
+        // DURABLE half: the user's cross-conversation facts live in memories.jsonl, which the associative
+        // store never indexed. Without this join recall denied facts that were in the same prompt — see
+        // durableRecall. Chat surfaces only (durable_path is empty for every swarm mind), so a mind's recall
+        // behaves exactly as before.
+        var dur: []u8 = ""[0..0];
+        if (ctx.durable_path.len > 0) {
+            if (std.Io.Dir.cwd().readFileAlloc(ctx.io, ctx.durable_path, gpa, .limited(256 << 10))) |data| {
+                defer gpa.free(data);
+                dur = durableRecall(gpa, data, p.value.query);
+            } else |_| {}
+        }
+        defer if (dur.len > 0) gpa.free(dur);
         if (r.len == 0) {
             gpa.free(r);
-            return dupe(gpa, "(nothing recalled yet)");
+            if (dur.len == 0) return dupe(gpa, "(nothing recalled yet)");
+            return dupe(gpa, dur);
         }
-        return r;
+        if (dur.len == 0) return r;
+        defer gpa.free(r);
+        return std.fmt.allocPrint(gpa, "{s}\n{s}", .{ dur, r }) catch dupe(gpa, dur);
     }
     if (std.mem.eql(u8, name, "share")) {
         const A = struct { fact: []const u8 = "" };
@@ -1994,7 +2175,40 @@ fn runPython(ctx: *ToolCtx, args_json: []const u8) []u8 {
     defer gpa.free(r.stdout);
     defer gpa.free(r.stderr);
     const exit = if (r.term == .exited) r.term.exited else @as(u8, 255);
-    return std.fmt.allocPrint(gpa, "exit={d}\nstdout:\n{s}\nstderr:\n{s}", .{ exit, clip(r.stdout, 4000), clip(r.stderr, 1500) }) catch dupe(gpa, "ran");
+    const head, const tail = clipEnds(r.stderr, 1500);
+    if (tail.len == 0)
+        return std.fmt.allocPrint(gpa, "exit={d}\nstdout:\n{s}\nstderr:\n{s}", .{ exit, clip(r.stdout, 4000), head }) catch dupe(gpa, "ran");
+    return std.fmt.allocPrint(gpa, "exit={d}\nstdout:\n{s}\nstderr:\n{s}\n  ... [middle frames omitted — the LAST line below is the actual error] ...\n{s}", .{ exit, clip(r.stdout, 4000), head, tail }) catch dupe(gpa, "ran");
+}
+
+/// Head+tail clip for captured stderr. A plain head clip — what this used to be — is exactly backwards for a
+/// Python traceback: frames print outermost-first and the ACTUAL exception is the LAST line. Measured on the
+/// live failure that killed a chat: a `requests` DNS error is 6156 bytes with the diagnosis
+/// ("ConnectionError: ... host='forum.<host>'") starting at byte 5804, so at clip(stderr, 1500) the model
+/// received urllib3 plumbing ending mid-frame at `File "C:\Users\gar` and never saw the hostname or the
+/// exception type. It generalised that into "the network isn't resolving on this belt" and refused every
+/// remaining step of the task — when the real fault was a subdomain it had invented itself and could have
+/// corrected in one retry. Same budget, both ends; head names the call site, tail names the failure.
+fn clipEnds(s: []const u8, n: usize) struct { []const u8, []const u8 } {
+    if (s.len <= n) return .{ s, ""[0..0] };
+    const tail_n = n - n / 4; // 3/4 to the tail — the exception line plus its immediate frame
+    return .{ s[0 .. n - tail_n], s[s.len - tail_n ..] };
+}
+
+test "clipEnds keeps the exception line a head clip would have thrown away" {
+    var buf: [6000]u8 = undefined;
+    @memset(&buf, 'x');
+    const diagnosis = "requests.exceptions.ConnectionError: Failed to resolve 'forum.example.invalid'";
+    @memcpy(buf[buf.len - diagnosis.len ..], diagnosis);
+    const head, const tail = clipEnds(&buf, 1500);
+    try std.testing.expect(head.len + tail.len <= 1500);
+    try std.testing.expect(std.mem.indexOf(u8, tail, diagnosis) != null);
+    // the old behaviour, for contrast: a head clip of the same budget never reaches it
+    try std.testing.expect(std.mem.indexOf(u8, clip(&buf, 1500), diagnosis) == null);
+    // short stderr is returned whole, with no tail and no omission marker
+    const h2, const t2 = clipEnds("boom", 1500);
+    try std.testing.expectEqualStrings("boom", h2);
+    try std.testing.expectEqual(@as(usize, 0), t2.len);
 }
 
 /// True if `n` is a built-in tool name. execute() checks built-ins FIRST and make_tool rejects these names, so

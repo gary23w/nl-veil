@@ -123,6 +123,31 @@ const St = struct {
 };
 var st: St = .{};
 
+/// The window the built-in engine ACTUALLY serves, in tokens. 0 = no built-in engine loaded (server built
+/// without -Dbuiltin, weights absent, or the load ladder has not finished), in which case every reader falls
+/// back to whatever it did before this existed.
+///
+/// Why it is published here rather than read from llamaeng: the load ladder DEGRADES the window to fit the
+/// machine (16384 → 12288 → 9216 → …), so the configured number is a request, not a fact, and the fact is
+/// only known after the model loads. Anything that sizes a prompt against the static model catalog is
+/// therefore budgeting against a window that may not exist on this box — on a card that lands at the 4096
+/// floor the catalog still claims 8k and the turn overflows. llamaeng is compiled in only under -Dbuiltin,
+/// so a plain atomic here is what lets a non-conditional caller ask the question at all.
+///
+/// Atomic rather than mutex-guarded: it is a single u32 written once per model load and read on the hot
+/// path of every turn, and it must be readable from a thread that is not allowed to take st.mutex.
+var serving_ctx: std.atomic.Value(u32) = .init(0);
+
+/// Publish the window the engine settled on. Called by the engine after its fit ladder lands.
+pub fn setServingCtx(tokens: u32) void {
+    serving_ctx.store(tokens, .release);
+}
+
+/// The live served window in tokens, or 0 when there is no built-in engine to ask.
+pub fn servingCtx() u32 {
+    return serving_ctx.load(.acquire);
+}
+
 fn lock() void {
     st.mutex.lockUncancelable(st.io);
 }

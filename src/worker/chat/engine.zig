@@ -25,6 +25,7 @@ const osc = @import("../oscillation.zig");
 const llm = @import("../llm.zig");
 const modelcfg = @import("modelcfg"); // a MODULE (src/worker/modelcfg.zig) — never a path import
 const cctx = @import("context.zig");
+const builtin_mod = @import("../builtin.zig"); // the built-in engine's sentinel + LIVE served-window publication
 const cplan = @import("plan.zig");
 const cync = @import("sync.zig");
 const toolperf = @import("toolperf.zig"); // per-machine tool latency/reliability learning (dynamic, emergent)
@@ -347,9 +348,9 @@ const SYSTEM_PROMPT =
 /// get_credential is deliberately NOT mentioned (the compact belt drops it): masked values stay masked, and a
 /// small model telling the user it cannot read a credential beats it fumbling a fetch-and-leak.
 const SYSTEM_PROMPT_COMPACT =
-    "You are veil, a helpful coding and research assistant. You have tools: web_search / web_fetch / read_url / " ++
-    "fetch_json for the live web; read_file / write_file / edit_file / list_dir / delete_file for files; " ++
-    "run_python / run_tests / stop_process to run code; recall / observe / read_doc / pixel_search for memory " ++
+    "You are veil, a helpful coding and research assistant. You have tools: web_search / web_fetch for the " ++
+    "live web; read_file / write_file / edit_file / list_dir / delete_file for files; " ++
+    "run_python / run_tests to run code; recall / observe / read_doc / pixel_search for memory " ++
     "and stored documents; browser_navigate / browser_read / browser_click / browser_type to drive a real " ++
     "browser page. Those are ALL your tools — call them by exactly those names. Use a tool when it genuinely " ++
     "helps, then reply in plain prose, grounded in what the tools actually returned.\n" ++
@@ -357,6 +358,12 @@ const SYSTEM_PROMPT_COMPACT =
     "tool call at a time. Do not try to delegate — you have no sub-agents; you are the one doing the work. If a " ++
     "tool errors, read the error and CHANGE something (arguments, tool, approach) — never repeat the identical " ++
     "call hoping for a different result.\n" ++
+    "run_python IS YOUR EXECUTOR — the DEFAULT whenever no other tool on the belt fits, because it is the only " ++
+    "way you can execute anything at all. Real Python 3, real network: HTTP with your own headers/auth/POST " ++
+    "body, APIs no dedicated tool covers, parsing, math, data and file work. Reach for it instead of telling " ++
+    "the user something is impossible. Read the LAST line of a traceback — that is the actual error; a " ++
+    "name-resolution failure means THAT hostname is wrong (check it against what you were told), not that the " ++
+    "network is down.\n" ++
     "GROUND YOURSELF — you have NO live knowledge of the current world. For anything time-sensitive (news, " ++
     "prices, versions, 'latest'/'today'/'now'), recall first and, if that is thin, web_search — then answer FROM " ++
     "what you find. NEVER fabricate current events, dates, statistics, or news.\n" ++
@@ -790,15 +797,41 @@ test "looksLikeBotChallenge: challenge stubs flag; real content and big pages do
     try std.testing.expect(!looksLikeBotChallenge(""));
 }
 
+/// True if `needle` occurs in `hay` delimited by non-identifier characters on both sides — so searching for
+/// the tool name "recall" does not fire on "recall_hive", and "poll" does not fire on "polling".
+fn namesVerb(hay: []const u8, needle: []const u8) bool {
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, hay, i, needle)) |at| {
+        const before_ok = at == 0 or !(std.ascii.isAlphanumeric(hay[at - 1]) or hay[at - 1] == '_');
+        const e = at + needle.len;
+        const after_ok = e >= hay.len or !(std.ascii.isAlphanumeric(hay[e]) or hay[e] == '_');
+        if (before_ok and after_ok) return true;
+        i = at + 1;
+    }
+    return false;
+}
+
 test "compact system prompt: paired with the compact belt — no unadvertised verbs, core verbs named" {
     // the recall_hive class, asserted at its source: a compact turn must never be TAUGHT a verb its belt
-    // doesn't advertise. Each of these appears in the FULL prompt's doctrine and none is in COMPACT_TOOLS.
-    for ([_][]const u8{ "recall_hive", "open_subchat", "swarm", "absorb", "cast", "get_credential", "mcp", "poll" }) |verb| {
-        if (std.mem.indexOf(u8, SYSTEM_PROMPT_COMPACT, verb) != null) {
+    // doesn't advertise. DERIVED from the belt rather than listed by hand — the hand-written deny-list this
+    // replaces named eight verbs and therefore proved nothing about the ninth. It went green while the
+    // durable-memory footer taught get_credential to a belt that had dropped it, and it would have gone green
+    // again when read_url / fetch_json / stop_process left the belt while the prompt still named them. Walk
+    // EVERY tool the full belt knows: any name the compact belt does not carry must not appear in its prompt.
+    var it = std.mem.splitSequence(u8, TURN_TOOLS_FULL, "\"name\":\"");
+    _ = it.next(); // before the first name
+    var checked: usize = 0;
+    while (it.next()) |seg| {
+        const end = std.mem.indexOfScalar(u8, seg, '"') orelse continue;
+        const verb = seg[0..end];
+        if (verb.len == 0 or tools.compactAllowed(verb)) continue;
+        checked += 1;
+        if (namesVerb(SYSTEM_PROMPT_COMPACT, verb)) {
             std.debug.print("\ncompact system prompt teaches '{s}' — its belt does not advertise that\n", .{verb});
             return error.CompactPromptTeachesUnadvertisedVerb;
         }
     }
+    try std.testing.expect(checked > 20); // the walk actually ran over a real belt, not an empty split
     // and the belt's own core IS taught by exact name
     for ([_][]const u8{ "web_search", "read_doc", "browser_navigate", "run_tests", "REMEMBER:" }) |need|
         try std.testing.expect(std.mem.indexOf(u8, SYSTEM_PROMPT_COMPACT, need) != null);
@@ -1548,7 +1581,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     }
     // DURABLE USER MEMORY: inject the user's cross-conversation facts (keys/logins/preferences) from the shared
     // memories.jsonl — the desk's "YOUR MEMORY" block, which a server-served conv never had.
-    injectDurableMemory(app, uid, &conv_buf);
+    injectDurableMemory(app, uid, &conv_buf, compact_belt);
     // TOOL-PERFORMANCE DIGEST: a compact, learned note on which tools are slow or flaky on THIS machine, so the
     // agent plans around them (waits out a cold browser, avoids a 404-ing endpoint) instead of relearning each
     // run. Fixed within this turn (computed once), so it lives in the stable prefix like durable memory. Absent
@@ -5799,10 +5832,54 @@ fn turnTokenBudget(environ: *const std.process.Environ.Map, base_url: []const u8
 /// LARGE WINDOWS ARE UNTOUCHED, deliberately: when the window can already hold the existing constants this
 /// returns WORKING_COMPACT_BYTES unchanged, so every model that works today keeps byte-identical behaviour.
 /// Only a window too small for them tightens, and never below a floor that still fits one real tool round.
+///
+/// The window comes from the LIVE ENGINE when there is one to ask (servingWindowTokens), and only then from
+/// the static catalog. The catalog states a model's nominal window; the built-in engine's fit ladder decides
+/// the real one at load time and can land anywhere from the configured value down to a 4096 floor depending
+/// on the card. Budgeting a turn against a window the box never allocated is how a prompt that "fits" is
+/// rejected by the engine that has to hold it.
+fn servingWindowTokens(base_url: []const u8) ?usize {
+    const b = std.mem.trim(u8, base_url, " \r\n\t");
+    // The sentinel is resolved to a loopback URL carrying PATH_PREFIX before a turn runs, so match both
+    // forms; anything else is a provider whose window this process does not serve and cannot know.
+    if (!builtin_mod.isSentinelBase(b) and std.mem.indexOf(u8, b, builtin_mod.PATH_PREFIX ++ "/") == null) return null;
+    const live = builtin_mod.servingCtx();
+    return if (live == 0) null else live; // 0 = not loaded yet ⇒ fall back to the catalog
+}
+
+test "the live served window is read for the built-in engine and for nothing else" {
+    const saved = builtin_mod.servingCtx();
+    defer builtin_mod.setServingCtx(saved);
+
+    // nothing loaded: every caller keeps the catalog path it had before this existed
+    builtin_mod.setServingCtx(0);
+    try std.testing.expect(servingWindowTokens("builtin") == null);
+    try std.testing.expect(servingWindowTokens("http://127.0.0.1:8791/builtin/v1") == null);
+
+    // the ladder landed at 9216 — the built-in's two URL forms must both see it
+    builtin_mod.setServingCtx(9216);
+    try std.testing.expectEqual(@as(?usize, 9216), servingWindowTokens("builtin"));
+    try std.testing.expectEqual(@as(?usize, 9216), servingWindowTokens("http://127.0.0.1:8791/builtin/v1"));
+    try std.testing.expectEqual(@as(?usize, 9216), servingWindowTokens(" builtin\n")); // trimmed
+
+    // …and NOTHING else may inherit it. A local Ollama shares the loopback host but not the engine, and a
+    // BYOK provider's window is not this process's business — both keep the static catalog.
+    try std.testing.expect(servingWindowTokens("http://127.0.0.1:11434/v1") == null);
+    try std.testing.expect(servingWindowTokens("http://localhost:1234/v1") == null);
+    try std.testing.expect(servingWindowTokens("https://api.openai.com/v1") == null);
+    try std.testing.expect(servingWindowTokens("https://api.anthropic.com/v1") == null);
+    try std.testing.expect(servingWindowTokens("") == null);
+
+    // and the budget itself: a BYOK model keeps WORKING_COMPACT_BYTES exactly, live window or not
+    try std.testing.expectEqual(cctx.WORKING_COMPACT_BYTES, workingBudgetBytes("https://api.anthropic.com/v1", "claude-opus-4-8", 20_000));
+    // while the built-in, told the truth about a 9216-token window, tightens below it
+    try std.testing.expect(workingBudgetBytes("http://127.0.0.1:8791/builtin/v1", "the-veil-12b", 20_000) < cctx.WORKING_COMPACT_BYTES);
+}
 fn workingBudgetBytes(base_url: []const u8, model: []const u8, fixed_bytes: usize) usize {
     const local = std.mem.indexOf(u8, base_url, "127.0.0.1") != null or
         std.mem.indexOf(u8, base_url, "localhost") != null;
-    const win_tokens: usize = @as(usize, modelcfg.senseModel(model, local).ctx_k) * 1024;
+    const win_tokens: usize = servingWindowTokens(base_url) orelse
+        @as(usize, modelcfg.senseModel(model, local).ctx_k) * 1024;
     // 3 bytes/token is deliberately pessimistic: measured 3.5 on this corpus (5577 tokens for 19639 bytes),
     // and under-estimating the window is the safe direction — it folds early rather than overflowing.
     const win_bytes = win_tokens * 3;
@@ -6854,6 +6931,35 @@ const CtlResult = enum { none, stop };
 // legacyMemoriesPath below.
 const MEM_INJECT_CAP = 96; // newest N durable memories injected (bounded prompt)
 
+const WITHHELD_FOOTER_FULL =
+    "(the [withheld] credential values above never ride in prompts — when, and only when, a task needs one, call get_credential with a few identifying words)\n";
+
+/// The compact twin. SYSTEM_PROMPT_COMPACT deliberately drops get_credential (see its doc comment) and the
+/// compact belt does not carry it, yet that same prompt asserts "Those are ALL your tools". Emitting the FULL
+/// footer to a small model therefore handed it a deadlock: a key exists, its value is withheld, and the only
+/// route to it is a tool that does not exist and whose name the model is trained to refuse on sight. Observed
+/// live — the veil spent five turns insisting it could not reach a credential the user had already pasted into
+/// the chat, and finished by claiming it had no browser and no network either. Asking is the honest route on
+/// this tier, and it is also what the tier's design intent already said should happen.
+const WITHHELD_FOOTER_COMPACT =
+    "(the [withheld] values above are stored but never ride in prompts, and nothing on your belt can read them — if a task needs one, ask the user to paste it; a value the user gives you in chat is yours to use in that task)\n";
+
+test "the withheld footer never names a tool the caller's belt lacks" {
+    // the exact live failure: the compact belt has no get_credential, so the compact footer must not name it
+    try std.testing.expect(std.mem.indexOf(u8, TURN_TOOLS_COMPACT, "\"get_credential\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, WITHHELD_FOOTER_COMPACT, "get_credential") == null);
+    // the full belt does carry it, so the full footer may (and should) point at it
+    try std.testing.expect(std.mem.indexOf(u8, TURN_TOOLS_FULL, "\"get_credential\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, WITHHELD_FOOTER_FULL, "get_credential") != null);
+    // and no footer may name any other off-belt verb
+    for ([_][]const u8{ "recall_hive", "cast", "open_subchat", "swarm", "absorb", "mcp_call" }) |verb| {
+        if (std.mem.indexOf(u8, WITHHELD_FOOTER_COMPACT, verb) != null) {
+            std.debug.print("compact withheld footer names off-belt verb: {s}\n", .{verb});
+            return error.OffBeltVerbInFooter;
+        }
+    }
+}
+
 fn memoriesPath(app: *App, uid: u64, buf: []u8) ?[]const u8 {
     return std.fmt.bufPrint(buf, "{s}/u{d}/.veil-desk/memories.jsonl", .{ app.data, uid }) catch null;
 }
@@ -6882,7 +6988,7 @@ fn readDurable(app: *App, uid: u64) ?[]u8 {
 
 /// Inject the user's durable memory as a "YOUR MEMORY" system message right after the recall block. Additive: an
 /// absent/empty store leaves conv_buf unchanged.
-fn injectDurableMemory(app: *App, uid: u64, conv_buf: *std.ArrayListUnmanaged(u8)) void {
+fn injectDurableMemory(app: *App, uid: u64, conv_buf: *std.ArrayListUnmanaged(u8), compact: bool) void {
     const gpa = app.gpa;
     const data = readDurable(app, uid) orelse return;
     defer gpa.free(data);
@@ -6932,7 +7038,14 @@ fn injectDurableMemory(app: *App, uid: u64, conv_buf: *std.ArrayListUnmanaged(u8
         any = true;
     }
     if (!any) return;
-    if (withheld > 0) block.appendSlice(gpa, "(the [withheld] credential values above never ride in prompts — when, and only when, a task needs one, call get_credential with a few identifying words)\n") catch {};
+    // The footer must name only tools the caller's belt ACTUALLY advertises. It used to name get_credential
+    // unconditionally — but SYSTEM_PROMPT_COMPACT deliberately drops that tool (see its doc comment) and the
+    // compact belt does not carry it, while that same prompt tells the model "Those are ALL your tools". A
+    // small model was therefore handed a deadlock: a key exists, it is withheld, fetch it with a tool that
+    // does not exist and whose name the model is trained to refuse. Observed live — the veil spent five turns
+    // insisting it could not reach a credential the user had already pasted into the chat. On the compact
+    // belt the honest instruction is to ask, which is also this tier's stated design intent.
+    if (withheld > 0) block.appendSlice(gpa, if (compact) WITHHELD_FOOTER_COMPACT else WITHHELD_FOOTER_FULL) catch {};
     conv_buf.appendSlice(gpa, ",{\"role\":\"system\",\"content\":") catch return;
     http.jstr(gpa, conv_buf, block.items) catch return;
     conv_buf.append(gpa, '}') catch return;
