@@ -36,6 +36,26 @@ struct llama_model * veil_ll_load(const char * path, int32_t n_gpu_layers) {
     return llama_model_load_from_file(path, p);
 }
 
+/* FREE VRAM on the first GPU-class device, in MiB (0 = no device, or the backend cannot say).
+ *
+ * Why the engine needs this: on Windows an over-budget VRAM allocation does NOT fail — the driver
+ * oversubscribes into shared system memory — so "did ggml_backend_alloc succeed?" is not a fit
+ * test. It succeeded right before a crash where five nvlddmkm errors killed the process. Measuring
+ * what is actually LEFT after the context exists is the only honest check, and it is what lets the
+ * engine leave headroom for the other tenants on the card (the desk's own GL context, the browser
+ * the veil drives, the desktop compositor). */
+size_t veil_ll_gpu_free_mb(void) {
+    size_t n = ggml_backend_dev_count();
+    for (size_t i = 0; i < n; i++) {
+        ggml_backend_dev_t d = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(d) != GGML_BACKEND_DEVICE_TYPE_GPU) continue;
+        size_t free_b = 0, total_b = 0;
+        ggml_backend_dev_memory(d, &free_b, &total_b);
+        return free_b / (1024 * 1024);
+    }
+    return 0;
+}
+
 /* Description of the first GPU-class compute device the runtime can actually see (empty when
  * none): what the status row shows so "is it on the GPU?" is never a guess. */
 int32_t veil_ll_gpu_desc(char * buf, size_t cap) {
@@ -70,13 +90,24 @@ void veil_ll_model_free(struct llama_model * m) {
 /* n_ctx_total is the WHOLE kv allocation shared by n_seq slots (the engine sizes it as
  * per-slot-window * slots). Decode threads and batch (prefill) threads split: decode is
  * memory-bandwidth-bound and wants ~physical cores; prefill is compute-bound and scales wider. */
-struct llama_context * veil_ll_ctx_new(struct llama_model * m, uint32_t n_ctx_total, uint32_t n_batch, int32_t n_threads, int32_t n_threads_batch, uint32_t n_seq) {
+/* kv_q8: store the K/V cache as q8_0 instead of f16, ~halving the cache's memory for a quality
+ * cost that is negligible at 8 bits. This is what makes a useful context window fit beside the
+ * weights on a 12GB card: at f16 the engine had to step 16384 -> 4096 to keep a safe VRAM reserve,
+ * and 4096 cannot even hold the harness's own ~6.4k-token prefix, so the model could not serve a
+ * single turn. Quantized V requires flash attention, so it is requested together (AUTO lets the
+ * backend refuse and fall back rather than fail the load). */
+struct llama_context * veil_ll_ctx_new(struct llama_model * m, uint32_t n_ctx_total, uint32_t n_batch, int32_t n_threads, int32_t n_threads_batch, uint32_t n_seq, bool kv_q8) {
     struct llama_context_params p = llama_context_default_params();
     p.n_ctx     = n_ctx_total;
     p.n_batch   = n_batch;
     p.n_seq_max = n_seq > 0 ? n_seq : 1;
     if (n_threads > 0)       p.n_threads       = n_threads;
     if (n_threads_batch > 0) p.n_threads_batch = n_threads_batch;
+    if (kv_q8) {
+        p.type_k = GGML_TYPE_Q8_0;
+        p.type_v = GGML_TYPE_Q8_0;
+        p.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
+    }
     return llama_init_from_model(m, p);
 }
 
@@ -159,6 +190,15 @@ bool veil_ll_is_eog(const struct llama_vocab * v, llama_token t) {
 
 int32_t veil_ll_piece(const struct llama_vocab * v, llama_token t, char * buf, int32_t cap) {
     return llama_token_to_piece(v, t, buf, cap, 0, true);
+}
+
+/* The model's transformer layer count — the ONLY meaningful unit for partial offload. Without it
+ * an offload "ladder" of 999/749/499 is a fiction: llama clamps n_gpu_layers to this number, so
+ * every one of those rungs means "all layers" and the ladder never actually steps down. Readable
+ * from a vocab-only load (hparams live in the GGUF header), so the engine knows it before it
+ * commits any weights. */
+int32_t veil_ll_n_layer(const struct llama_model * m) {
+    return llama_model_n_layer(m);
 }
 
 int32_t veil_ll_n_ctx_train(const struct llama_model * m) {
