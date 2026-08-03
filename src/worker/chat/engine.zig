@@ -287,7 +287,7 @@ const SYSTEM_PROMPT =
     "immediately -- same files, same memory, so its findings flow back here. Lighter than a hive.\n" ++
     "WAITING. Never guess whether something finished and never re-check blind -- poll watches a file, url, " ++
     "port, process, probe command, or your cast to completion in bounded steps and reports what it saw; on " ++
-    "timeout, poll again ONLY while the log shows progress — after 2-3 no-progress timeouts STOP waiting: act on " ++
+    "timeout, poll again ONLY while the log shows progress - after 2-3 no-progress timeouts STOP waiting: act on " ++
     "what you have, or tell the user it hasn't arrived.\n" ++
     "HOW YOU WORK A TASK. Your FIRST move on any non-trivial request is to BREAK IT DOWN into a concrete list of " ++
     "smaller subtasks -- however many it takes, a handful or dozens -- and show the user that plan. Then work the " ++
@@ -334,16 +334,19 @@ const SYSTEM_PROMPT =
     "us-west-2 -> `REMEMBER: [preference] deploys to us-west-2`). Facts already under YOUR MEMORY need no repeat. " ++
     "Credential VALUES are withheld from prompts -- YOUR MEMORY shows them masked as [withheld]; when a task " ++
     "actually needs one, fetch it with get_credential and use it directly in that call. Never repeat a fetched " ++
-    "value into replies, observe/share notes, REMEMBER lines, or files beyond the immediate use.";
+    "value into replies, observe/share notes, REMEMBER lines, or files beyond the immediate use.\n" ++
+    "PLAIN PUNCTUATION. Write with ASCII punctuation only: never em or en dashes (use a comma, a colon, or a " ++
+    "hyphen), never curly quotes, never the single-character ellipsis. This applies to FILES you write as much " ++
+    "as to replies: the engine folds the reply text, but a file keeps exactly what you typed.";
 
 /// The SMALL-tier twin of SYSTEM_PROMPT, paired with TURN_TOOLS_COMPACT the same way the full prompt pairs
-/// with the full belt. The full prompt is a 6KB orchestration curriculum — cast/steer_swarm/answer_swarm
-/// doctrine, "recall_hive first", open_subchat, poll — delivered to a model whose compact belt advertises NONE
+/// with the full belt. The full prompt is a 6KB orchestration curriculum - cast/steer_swarm/answer_swarm
+/// doctrine, "recall_hive first", open_subchat, poll - delivered to a model whose compact belt advertises NONE
 /// of those names. That is the recall_hive bug class at its source: the observed 12B never saw `cast` in its
 /// tools array, the PROMPT told it to cast ("do exactly that"), and knownToolName let the full-schema name
-/// through — so it spent four rounds failing to orchestrate a swarm instead of writing the file it was asked
+/// through - so it spent four rounds failing to orchestrate a swarm instead of writing the file it was asked
 /// for. This twin names ONLY tools the compact belt advertises, keeps the behavioral spine (ground yourself /
-/// act don't promise / build discipline / REMEMBER lines), and drops every delegation concept — a small model
+/// act don't promise / build discipline / REMEMBER lines), and drops every delegation concept - a small model
 /// works alone, one step at a time. Also ~4KB shorter, which a 12B feels on every single inference.
 ///
 /// get_credential is deliberately NOT mentioned (the compact belt drops it): masked values stay masked, and a
@@ -353,35 +356,37 @@ const SYSTEM_PROMPT_COMPACT =
     "live web; read_file / write_file / edit_file / list_dir / delete_file for files; " ++
     "run_python / run_tests to run code; recall / observe / read_doc / pixel_search for memory " ++
     "and stored documents; browser_navigate / browser_read / browser_click / browser_type to drive a real " ++
-    "browser page. Those are ALL your tools — call them by exactly those names. Use a tool when it genuinely " ++
+    "browser page. Those are ALL your tools - call them by exactly those names. Use a tool when it genuinely " ++
     "helps, then reply in plain prose, grounded in what the tools actually returned.\n" ++
     "HOW YOU WORK. Break a non-trivial request into a short list of steps and work them IN ORDER, yourself, one " ++
-    "tool call at a time. Do not try to delegate — you have no sub-agents; you are the one doing the work. If a " ++
-    "tool errors, read the error and CHANGE something (arguments, tool, approach) — never repeat the identical " ++
+    "tool call at a time. Do not try to delegate - you have no sub-agents; you are the one doing the work. If a " ++
+    "tool errors, read the error and CHANGE something (arguments, tool, approach) - never repeat the identical " ++
     "call hoping for a different result.\n" ++
-    "run_python IS YOUR EXECUTOR — the DEFAULT whenever no other tool on the belt fits, because it is the only " ++
+    "run_python IS YOUR EXECUTOR - the DEFAULT whenever no other tool on the belt fits, because it is the only " ++
     "way you can execute anything at all. Real Python 3, real network: HTTP with your own headers/auth/POST " ++
     "body, APIs no dedicated tool covers, parsing, math, data and file work. Reach for it instead of telling " ++
-    "the user something is impossible. Read the LAST line of a traceback — that is the actual error; a " ++
+    "the user something is impossible. Read the LAST line of a traceback - that is the actual error; a " ++
     "name-resolution failure means THAT hostname is wrong (check it against what you were told), not that the " ++
     "network is down.\n" ++
-    "GROUND YOURSELF — you have NO live knowledge of the current world. For anything time-sensitive (news, " ++
-    "prices, versions, 'latest'/'today'/'now'), recall first and, if that is thin, web_search — then answer FROM " ++
+    "GROUND YOURSELF - you have NO live knowledge of the current world. For anything time-sensitive (news, " ++
+    "prices, versions, 'latest'/'today'/'now'), recall first and, if that is thin, web_search - then answer FROM " ++
     "what you find. NEVER fabricate current events, dates, statistics, or news.\n" ++
     "STORED DOCUMENTS. recall answers TARGETED questions about an ingested document; for WHOLE-document work " ++
-    "(summarize, outline, review) page it in order with read_doc — recall fragments are NOT the document.\n" ++
-    "ACT, DON'T PROMISE — never end a reply promising future action ('I'll check...') without the tool call in " ++
+    "(summarize, outline, review) page it in order with read_doc - recall fragments are NOT the document.\n" ++
+    "ACT, DON'T PROMISE - never end a reply promising future action ('I'll check...') without the tool call in " ++
     "the SAME reply. After a change, VERIFY: run_tests or read the resource back before declaring success.\n" ++
-    "BUILD DISCIPLINE — write code to FILES with write_file/edit_file, do not paste whole files into chat. " ++
-    "read_file before you edit; once a file is right, move on — do not rewrite it next turn.\n" ++
+    "BUILD DISCIPLINE - write code to FILES with write_file/edit_file, do not paste whole files into chat. " ++
+    "read_file before you edit; once a file is right, move on - do not rewrite it next turn.\n" ++
     "DURABLE MEMORY. A personal fact about THIS user worth keeping across conversations gets a line, alongside " ++
     "your normal reply:\nREMEMBER: [category] the fact   (category: key, login, preference, or fact)\n" ++
     "To drop a wrong fact: FORGET: <a few words identifying it>. These lines are stripped from what the user " ++
-    "sees — emit them bare, no prose header.";
+    "sees, so emit them bare, no prose header.\n" ++
+    "PLAIN PUNCTUATION. ASCII only: no em or en dashes (use a comma or a hyphen), no curly quotes, no " ++
+    "single-character ellipsis. In replies AND in files you write.";
 
 /// The chat turn's tool surface = the shared mind-tool SCHEMA + the veil's ORCHESTRATION verbs (cast / steer /
 /// stop / status). The orchestration verbs are handled in-process by orchTool (deploy_service + app.sup), NOT by
-/// tools.execute — the swarm minds themselves never get these (a mind can't spawn sibling swarms). Comptime
+/// tools.execute - the swarm minds themselves never get these (a mind can't spawn sibling swarms). Comptime
 /// concatenation (both are comptime `\\` strings), joined by a comma into the "tools":[ … ] array body.
 const ORCH_TOOLS =
     \\{"type":"function","function":{"name":"cast","description":"Deploy a SWARM (a hive of AI minds) to work on a goal in parallel, in THIS conversation's build dir so its files co-exist with yours. Use for a big or parallelizable build/research task you want a team to carry out while you guide them. Returns a swarm id; watch it with swarm_status, guide it with steer_swarm, end it with stop_swarm.","parameters":{"type":"object","properties":{"goal":{"type":"string","description":"what the swarm should accomplish. LIVE CONTRACT: the engine parses VERIFY:/SMOKE:/PROBE: out of this text and SHELLS the rest of that line every round as the hive's acceptance score (VERIFY: build/tests, SMOKE: boot the deliverable, PROBE: health-check). The body must be a RUNNABLE command — 'VERIFY: npm test', not 'VERIFY: make the tests pass'. Never write these tokens as prose emphasis; omit them and the hive scores on goal coverage instead."},"minds":{"type":"integer","description":"how many minds (default 3)"},"minutes":{"type":"integer","description":"time budget (0 = server default)"},"mode":{"type":"string","enum":["cast","continuous"],"description":"cast = fast one-shot strike; continuous = sustained hive"},"files":{"type":"string","description":"declared deliverable files, comma/newline separated — adopted verbatim as the blueprint"}},"required":["goal"]}}},
@@ -731,6 +736,53 @@ test "compact belt: valid JSON, materially smaller, keeps the core verbs and dro
     // or hiding it would silently remove capability the model may still name from memory
     try std.testing.expect(knownToolName(TURN_TOOLS_COMPACT, "browser_eval"));
     try std.testing.expect(knownToolName(TURN_TOOLS_COMPACT, "cast"));
+}
+
+test "wmFold: watermark typography folds; code fences and chunk splits survive" {
+    var out: [512]u8 = undefined;
+    var st: WmState = .{};
+    // the headline case
+    var n = wmFold(&st, &out, "it works\u{2014}mostly", true);
+    try std.testing.expectEqualStrings("it works-mostly", out[0..n]);
+    // curly quotes, ellipsis, NBSP
+    st = .{};
+    n = wmFold(&st, &out, "\u{201C}don\u{2019}t\u{201D}\u{2026}\u{00A0}ok", true);
+    try std.testing.expectEqualStrings("\"don't\"... ok", out[0..n]);
+    // zero-width characters vanish (the real data-carrying vector)
+    st = .{};
+    n = wmFold(&st, &out, "he\u{200B}llo\u{FEFF} wor\u{200D}ld", true);
+    try std.testing.expectEqualStrings("hello world", out[0..n]);
+    // CHUNK SPLIT: an em dash cut across two deltas still folds (3 bytes: E2 80 94)
+    st = .{};
+    const em = "\u{2014}";
+    var w: usize = 0;
+    w += wmFold(&st, out[w..], "a" ++ em[0..1], false);
+    try std.testing.expectEqual(@as(usize, 1), w); // the partial lead byte is HELD, not emitted
+    w += wmFold(&st, out[w..], em[1..3] ++ "b", false);
+    try std.testing.expectEqualStrings("a-b", out[0..w]);
+    // FENCE: visible punctuation inside code is data and must survive verbatim...
+    st = .{};
+    n = wmFold(&st, &out, "```\nlet s = \u{201C}x\u{201D}; // a\u{2014}b\n```", true);
+    try std.testing.expectEqualStrings("```\nlet s = \u{201C}x\u{201D}; // a\u{2014}b\n```", out[0..n]);
+    // ...but an invisible character never belongs in code either
+    st = .{};
+    n = wmFold(&st, &out, "```\nlet x\u{200B} = 1;\n```", true);
+    try std.testing.expectEqualStrings("```\nlet x = 1;\n```", out[0..n]);
+    // and prose AFTER the fence closes folds again
+    st = .{};
+    n = wmFold(&st, &out, "```\na\u{2014}b\n```\nthen\u{2014}this", true);
+    try std.testing.expectEqualStrings("```\na\u{2014}b\n```\nthen-this", out[0..n]);
+    // plain ASCII is byte-identical (the common case must not churn)
+    st = .{};
+    n = wmFold(&st, &out, "ordinary text - already fine", true);
+    try std.testing.expectEqualStrings("ordinary text - already fine", out[0..n]);
+
+    // the owned wrapper returns null when there is nothing to change
+    const gpa = std.testing.allocator;
+    try std.testing.expect(wmScrubOwned(gpa, "clean ascii") == null);
+    const dirty = wmScrubOwned(gpa, "a\u{2014}b").?;
+    defer gpa.free(dirty);
+    try std.testing.expectEqualStrings("a-b", dirty);
 }
 
 test "scrubAccountIds: provider-error account tokens mask, prose survives" {
@@ -2109,6 +2161,14 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
 
         // Commit the settled answer as the assistant turn (durable + narrated) and thread it into the LLM context.
         var answer = inner.content;
+
+        // WATERMARK FOLD on the committed answer: the streamed deltas were folded at the edge, but the
+        // settled text takes its own path into the transcript, the .hist archive, memory, and the narrator —
+        // and a non-streamed reply (FIM, a hosted tool-call step) never passed the delta fold at all.
+        if (wmScrubOwned(gpa, answer)) |clean| {
+            gpa.free(answer);
+            answer = clean;
+        }
 
         // Strip a leaked CONTROL-TOKEN WRAPPER first: some models wrap the whole reply in their own sentinel
         // (`<DSML>…</DSML>`), which reaches the user as literal tag text. Bare wrappers only — tool-call markup
@@ -3868,9 +3928,116 @@ const InnerResult = struct {
 /// desk polls its event stream at ~30Hz) the reply flows continuously rather than arriving in visible chunks.
 const FLUSH_CHARS: usize = 12;
 
+/// Carry + fence state for the watermark fold across a STREAM's chunk boundaries.
+const WmState = struct {
+    carry: [4]u8 = undefined, // an incomplete trailing UTF-8 sequence held for the next chunk
+    carry_len: u8 = 0,
+    ticks: u8 = 0, // consecutive '`' seen — three toggles the fence
+    in_fence: bool = false,
+};
+
+/// Strip the TYPOGRAPHIC watermarks that make text read as machine-written — em/en dashes, curly quotes,
+/// the ellipsis glyph, exotic spaces — and delete zero-width characters outright.
+///
+/// Byte-level and single-pass: a chunk costs microseconds while the inference that produced it cost seconds,
+/// so this is free in practice. Three properties make it safe to run on every delta:
+///   - CHUNK-SPLIT SAFE. An em dash is three bytes and WILL arrive split across two deltas. An incomplete
+///     trailing sequence is held in `st.carry` and prepended to the next chunk; `final` flushes it as-is.
+///   - FENCE AWARE. Inside a ``` block only the INVISIBLE characters are removed: a code sample's punctuation
+///     is data, and rewriting it would corrupt what the user copies out.
+///   - NEVER GROWS. Every mapping is same-length or shorter (ellipsis 3→3 is the max), so `out` need only be
+///     src.len + 4 (the carry) and no allocation is ever needed.
+/// Deliberately NOT applied to: tool arguments, file contents (mechanically editing a write_file payload is
+/// the salvage-corruption class), or reasoning traces. This is about the REPLY the user reads.
+fn wmFold(st: *WmState, out: []u8, src: []const u8, final: bool) usize {
+    var w: usize = 0;
+    var i: usize = 0;
+    const carried = st.carry_len;
+    st.carry_len = 0;
+    while (i < @as(usize, carried) + src.len) {
+        const b = if (i < carried) st.carry[i] else src[i - carried];
+        if (b < 0x80) {
+            st.ticks = if (b == '`') st.ticks + 1 else 0;
+            if (st.ticks == 3) {
+                st.in_fence = !st.in_fence;
+                st.ticks = 0;
+            }
+            out[w] = b;
+            w += 1;
+            i += 1;
+            continue;
+        }
+        st.ticks = 0;
+        const len: usize = std.unicode.utf8ByteSequenceLength(b) catch 1;
+        const total = @as(usize, carried) + src.len;
+        if (i + len > total) { // incomplete tail
+            if (final) { // nothing more is coming — pass the bytes through untouched
+                while (i < total) : (i += 1) {
+                    out[w] = if (i < carried) st.carry[i] else src[i - carried];
+                    w += 1;
+                }
+                break;
+            }
+            while (i < total) : (i += 1) { // hold for the next chunk
+                st.carry[st.carry_len] = if (i < carried) st.carry[i] else src[i - carried];
+                st.carry_len += 1;
+            }
+            break;
+        }
+        var seq: [4]u8 = undefined;
+        var k: usize = 0;
+        while (k < len) : (k += 1) seq[k] = if (i + k < carried) st.carry[i + k] else src[i + k - carried];
+        const cp: u21 = std.unicode.utf8Decode(seq[0..len]) catch 0xFFFD;
+        i += len;
+
+        // zero-width / invisible: the actual data-carrying vector — removed EVERYWHERE, fences included
+        switch (cp) {
+            0x200B, 0x200C, 0x200D, 0x2060, 0xFEFF, 0x00AD => continue,
+            else => {},
+        }
+        if (st.in_fence) { // visible punctuation inside code is data — copy verbatim
+            @memcpy(out[w .. w + len], seq[0..len]);
+            w += len;
+            continue;
+        }
+        const rep: ?[]const u8 = switch (cp) {
+            0x2012, 0x2013, 0x2014, 0x2015, 0x2212 => "-", // figure/en/em/horizontal-bar/minus
+            0x2018, 0x2019, 0x201A, 0x201B => "'",
+            0x201C, 0x201D, 0x201E, 0x201F => "\"",
+            0x2026 => "...",
+            0x00A0, 0x2007, 0x2008, 0x2009, 0x200A, 0x202F, 0x205F, 0x3000 => " ",
+            0x2022 => "-", // bullet glyph mid-prose (markdown lists use ASCII '-')
+            0x00B7 => "-",
+            else => null,
+        };
+        if (rep) |r| {
+            @memcpy(out[w .. w + r.len], r);
+            w += r.len;
+        } else {
+            @memcpy(out[w .. w + len], seq[0..len]);
+            w += len;
+        }
+    }
+    return w;
+}
+
+/// Whole-string convenience over wmFold: scrub `src` into a gpa-owned copy. Used at the SETTLED answer, so
+/// what lands in the transcript, the .hist archive, and memory is clean too — not just the pixels.
+fn wmScrubOwned(gpa: std.mem.Allocator, src: []const u8) ?[]u8 {
+    const buf = gpa.alloc(u8, src.len + 4) catch return null;
+    var st: WmState = .{};
+    const n = wmFold(&st, buf, src, true);
+    if (n == src.len and std.mem.eql(u8, buf[0..n], src)) { // nothing to change — don't churn the caller's slice
+        gpa.free(buf);
+        return null;
+    }
+    if (gpa.realloc(buf, n)) |shrunk| return shrunk else |_| return buf[0..n];
+}
+
 const StreamCtx = struct {
     app: *App,
     conv_dir: []const u8,
+    wm: WmState = .{}, // watermark fold state for the CONTENT channel (carry + fence), see wmFold
     ctrl_cursor: usize = 0, // control.jsonl offset for the mid-stream abort check (chat Stop)
     streamed: bool = false,
     /// Wall-clock ms at which the FIRST delta of any kind landed, or 0 if nothing streamed. Feeds `fb_ms` on
@@ -3931,7 +4098,21 @@ fn streamOnDelta(cx: *anyopaque, kind: llm.DeltaKind, text: []const u8) void {
         return;
     }
     sc.streamed = true; // a real stream happened — so the fallback reasoning emit is skipped
-    scAccum(sc, kind == .reasoning, text);
+    if (kind == .reasoning) {
+        scAccum(sc, true, text);
+        return;
+    }
+    // WATERMARK FOLD on the content channel, at the streaming edge: the user must never SEE an em dash type
+    // itself out and then get silently rewritten at commit. Stack-buffered (never grows — see wmFold) and
+    // stateful across chunks, so a sequence split between two deltas still folds correctly.
+    var wb: [1024 + 4]u8 = undefined;
+    var off: usize = 0;
+    while (off < text.len) {
+        const take = @min(text.len - off, 1024);
+        const n = wmFold(&sc.wm, &wb, text[off .. off + take], false);
+        if (n > 0) scAccum(sc, false, wb[0..n]);
+        off += take;
+    }
 }
 
 fn scAccum(sc: *StreamCtx, is_reason: bool, text: []const u8) void {
