@@ -126,6 +126,12 @@ providers:
         label: DeepSeek V4 Pro
       - id: deepseek-chat
         label: DeepSeek Chat
+      # Appended (ORDER MATTERS — see the header). The ":fim" suffix is a ROUTING SIGNAL, not part of the
+      # provider's model id: llm.zig strips it and sends the request to DeepSeek's beta FIM/completions
+      # endpoint (POST {root}/beta/completions — prompt in, text out) instead of chat/completions. No tool
+      # calls on this path — the model answers in plain text; pick it for completion-style work.
+      - id: deepseek-v4-pro:fim
+        label: DeepSeek V4 Pro FIM (beta completions)
 
   - key: google
     label: Google Gemini

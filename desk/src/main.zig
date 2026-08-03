@@ -4176,10 +4176,16 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
     if (ui.chat_follow) ui.chat_scroll = max_scroll;
     if (ui.chat_scroll < 0) ui.chat_scroll = 0;
     if (ui.chat_scroll > max_scroll) ui.chat_scroll = max_scroll;
-    if (ui.chat_scroll >= max_scroll - 1) ui.chat_follow = true;
+    // Re-arm follow ONLY on user intent: a wheel-DOWN tick that lands at the bottom (the jump button and
+    // message-send re-arm elsewhere). The old rule — "position at bottom ⇒ follow" — re-armed itself whenever
+    // max_scroll moved under a parked position: streaming reflow and ring eviction change `total` every few
+    // frames mid-turn, so a reader who wheeled up got clamped to the shifting bottom for one frame and then
+    // dragged along with it — the reported rubber-band. Being AT the bottom is not the same as having ASKED
+    // to follow it.
+    if (wheel < 0 and t.hovering(view) and ui.chat_scroll >= max_scroll - 1) ui.chat_follow = true;
 
     // floating "scroll to bottom" (drawn after endScissorMode below): visible only while scrolled away from the
-    // bottom — follow force-re-arms at the bottom (the line above), so !chat_follow IS "away from bottom".
+    // bottom — follow re-arms only on a user's own wheel-down/jump/send now, so !chat_follow IS "reading back".
     const show_jump = !ui.chat_follow;
     const jump_r = t.Rect{ .x = view.x + view.width - 40, .y = view.y + view.height - 40, .width = 28, .height = 28 };
 

@@ -287,7 +287,8 @@ const SYSTEM_PROMPT =
     "immediately -- same files, same memory, so its findings flow back here. Lighter than a hive.\n" ++
     "WAITING. Never guess whether something finished and never re-check blind -- poll watches a file, url, " ++
     "port, process, probe command, or your cast to completion in bounded steps and reports what it saw; on " ++
-    "timeout, poll again.\n" ++
+    "timeout, poll again ONLY while the log shows progress — after 2-3 no-progress timeouts STOP waiting: act on " ++
+    "what you have, or tell the user it hasn't arrived.\n" ++
     "HOW YOU WORK A TASK. Your FIRST move on any non-trivial request is to BREAK IT DOWN into a concrete list of " ++
     "smaller subtasks -- however many it takes, a handful or dozens -- and show the user that plan. Then work the " ++
     "list, and for EACH subtask decide the best route: (a) DELEGATE TO A HIVE -- if a team building or " ++
@@ -730,6 +731,25 @@ test "compact belt: valid JSON, materially smaller, keeps the core verbs and dro
     // or hiding it would silently remove capability the model may still name from memory
     try std.testing.expect(knownToolName(TURN_TOOLS_COMPACT, "browser_eval"));
     try std.testing.expect(knownToolName(TURN_TOOLS_COMPACT, "cast"));
+}
+
+test "scrubAccountIds: provider-error account tokens mask, prose survives" {
+    var b: [420]u8 = undefined;
+    // the live shape: a suspension error quoting the org id and key alias
+    const got = scrubAccountIds(&b, "Your account org-4c484c356e734760be8bc089bdb59f40 <ak-fbf36yago7ti11bc3f7i> is suspended due to insufficient balance");
+    try std.testing.expect(std.mem.indexOf(u8, got, "org-4c48**") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "4c484c356e734760be8bc089bdb59f40") == null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "ak-fbf3**") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "fbf36yago7ti11bc3f7i") == null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "is suspended due to insufficient balance") != null);
+    // prose with an embedded prefix-looking word is untouched ("fork-lifting" ≠ a key)
+    var b2: [120]u8 = undefined;
+    const p2 = scrubAccountIds(&b2, "the fork-lifting task-force worked (rate limit)");
+    try std.testing.expectEqualStrings("the fork-lifting task-force worked (rate limit)", p2);
+    // a SHORT token (under 8 id chars) is left alone — masking "sk-test" style words costs more than it saves
+    var b3: [64]u8 = undefined;
+    const p3 = scrubAccountIds(&b3, "set sk-test as a dummy");
+    try std.testing.expectEqualStrings("set sk-test as a dummy", p3);
 }
 
 test "isMutatingTool: file mutations guard on truncation; reads never do" {
@@ -1906,6 +1926,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     var tools_spent: usize = 0;
     var no_ack_streak: u32 = 0; // turn-scoped client-absence evidence — see delegateTool / CLIENT_GONE_AFTER
     var dud_fetches: u32 = 0; // turn-scoped guessed-URL spiral evidence — see looksLikeNotFound / DUD_FETCH_STREAK
+    var poll_timeouts: u32 = 0; // turn-scoped stuck-in-a-wait evidence — see POLL_TIMEOUT_STREAK
     const tool_budget: usize = if (schedTaskOf(conv) != null) 60 else std.math.maxInt(usize);
     // TOOL-ECHO GUARD + network repeat ledger, at TURN scope. Both used to live inside the inner agentic
     // pass, which is re-entered on EVERY drive step — so the guards forgot all repeats each step, and a
@@ -2021,7 +2042,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
 
         // Run one agentic tool pass to a SETTLED (no-tool-call) answer.
         const mut_before = file_ledger.mutations;
-        const inner = runInnerAgentic(app, uid, conv, conv_dir, llm_dir, trio, &conv_buf, &ctx, &steer_cursor, &tool_obs, &tool_perf, tool_client, &no_ack_streak, &dud_fetches, &tools_spent, tool_budget, &echo_guard, &call_ledger, &file_ledger, foreign_mem.items, &foreign_warned, search_intent, &search_log, turn_tools);
+        const inner = runInnerAgentic(app, uid, conv, conv_dir, llm_dir, trio, &conv_buf, &ctx, &steer_cursor, &tool_obs, &tool_perf, tool_client, &no_ack_streak, &dud_fetches, &poll_timeouts, &tools_spent, tool_budget, &echo_guard, &call_ledger, &file_ledger, foreign_mem.items, &foreign_warned, search_intent, &search_log, turn_tools);
         // TRAJECTORY THREAD (fine weave): a pass that LANDED file changes mints one provenance-labeled
         // progress fact pairing the step's language with the engine-observed effect — the lexical thread
         // that lets a later step's recall hop from "what am I doing" to "what already happened here".
@@ -5245,6 +5266,31 @@ fn knownToolName(turn_tools: []const u8, name: []const u8) bool {
         std.mem.indexOf(u8, tools.SCHEMA, needle) != null;
 }
 
+/// Mask account-material tokens a provider error quotes back ("org-4c48…", "<ak-fbf3…>", "sk-…"): keep a
+/// 4-char stub so support conversations still work, star the rest. In-place into `buf`; returns the slice.
+/// Only prefixed token SHAPES are touched — the error's prose survives verbatim.
+fn scrubAccountIds(buf: []u8, msg: []const u8) []const u8 {
+    const n = @min(msg.len, buf.len);
+    @memcpy(buf[0..n], msg[0..n]);
+    const prefixes = [_][]const u8{ "org-", "ak-", "sk-", "key-" };
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        for (prefixes) |p| {
+            if (i + p.len >= n or !std.ascii.startsWithIgnoreCase(buf[i..n], p)) continue;
+            // token boundary before the prefix, so "fork-" or "mask-" prose can't match
+            if (i > 0 and (std.ascii.isAlphanumeric(buf[i - 1]) or buf[i - 1] == '_')) continue;
+            var j = i + p.len;
+            while (j < n and (std.ascii.isAlphanumeric(buf[j]) or buf[j] == '_')) j += 1;
+            if (j - (i + p.len) >= 8) { // real ids are long; keep 4 id chars then star the rest
+                for (buf[i + p.len + 4 .. j]) |*ch| ch.* = '*';
+            }
+            i = j - 1;
+            break;
+        }
+    }
+    return buf[0..n];
+}
+
 /// Case- and punctuation-insensitive tool-name equality: "WebSearch" ≡ "web_search" ≡ "web-search". Compares
 /// only alphanumerics, case-folded — the exact transformations small models apply to names they half-remember.
 fn toolNameEqLoose(a: []const u8, b: []const u8) bool {
@@ -5305,6 +5351,13 @@ fn looksLikeNotFound(body: []const u8) bool {
 /// Consecutive dud fetches (not-found or bot-challenge pages) that prove the model is GUESSING URLs. Three in
 /// a row earns the stop-constructing-URLs instruction on the result; one good fetch resets the streak.
 const DUD_FETCH_STREAK = 3;
+
+/// Consecutive poll TIMEOUTS after which further polls this turn are refused outright. Poll is a bounded wait,
+/// but its own doctrine ("a long wait is a chain of bounded polls") reads to a model as "poll forever", each
+/// timeout returns DIFFERENT text (the t+Ns sample log), so the identical-result echo guard never trips — and
+/// each poll blocks up to 180s. Observed live: a model polling a deploy that had already finished held the
+/// turn until the user typed "stop polling". Three timeouts with zero matches is not waiting, it is stuck.
+const POLL_TIMEOUT_STREAK = 3;
 
 /// Does a fetched body look like a bot-check interstitial rather than the page? Conservative on purpose: the
 /// markers are the stub pages' own words, checked only in the HEAD of a SMALL body — a real article that merely
@@ -5400,6 +5453,21 @@ fn delegateTool(app: *App, conv_dir: []const u8, id_in: []const u8, name: []cons
     if (awaitClientResult(app, conv_dir, id, ctrl_cursor, start_offset, CLIENT_ACK_TIMEOUT_S, CLIENT_TOOL_TIMEOUT_S, &acked, &stopped)) |result| {
         no_ack_streak.* = 0; // a real round-trip — the bridge is alive, forget any earlier silence
         return result;
+    }
+    // The wait is being ABANDONED (stop / crash / silence) — tell the client so, by id. Without this frame the
+    // desk keeps running the tool to its own timeout (a poll runs up to 180s), keeps showing its "running"
+    // chip, and its eventual result POST lands in a turn that no longer exists — observed live as a poll the
+    // user could not stop and a chip that never cleared ("why does it show the poll still running?").
+    {
+        var cv: std.ArrayListUnmanaged(u8) = .empty;
+        defer cv.deinit(gpa);
+        const built_cancel = cblk: {
+            cv.appendSlice(gpa, "{\"kind\":\"tool_cancel\",\"id\":") catch break :cblk false;
+            http.jstr(gpa, &cv, id) catch break :cblk false;
+            cv.append(gpa, '}') catch break :cblk false;
+            break :cblk true;
+        };
+        if (built_cancel) emitEvent(app, conv_dir, cv.items);
     }
     if (acked) no_ack_streak.* = 0 // the client picked it up and then died mid-run — present, just crashed
     else if (!stopped) no_ack_streak.* += 1; // pure silence counts toward absence (a stop is the user, not the bridge)
@@ -5910,6 +5978,8 @@ fn runInnerAgentic(
     // TURN-scoped consecutive dud fetches (not-found / bot-challenge pages) — the guessed-URL spiral counter;
     // see DUD_FETCH_STREAK at looksLikeNotFound. Owned by runTurn so the streak survives drive steps.
     dud_fetches: *u32,
+    // TURN-scoped consecutive poll timeouts — the stuck-in-a-wait counter; see POLL_TIMEOUT_STREAK.
+    poll_timeouts: *u32,
     tools_spent: *usize, // turn-scoped executed-call counter (shared across drive steps)
     tool_budget: usize, // ceiling for scheduled runs; maxInt for interactive chats (a human holds Stop)
     // REPEAT-CALL GUARDS, both TURN-scoped (owned by the drive loop — pass-local state forgot every repeat
@@ -6037,7 +6107,13 @@ fn runInnerAgentic(
         }
 
         if (!step.ok) {
-            emitKV(app, conv_dir, "error", "err", clipBytes(step.content, 400));
+            {
+                // Provider errors quote ACCOUNT MATERIAL back at us — observed live: a suspension error
+                // carrying the org id and an "<ak-…>" key alias landed verbatim in the durable event log and
+                // the desk transcript. The error's meaning survives masking; the identifiers don't need to.
+                var eb2: [420]u8 = undefined;
+                emitKV(app, conv_dir, "error", "err", scrubAccountIds(&eb2, clipBytes(step.content, 400)));
+            }
             return .{ .outcome = .hard_error, .content = empty };
         }
         // reasoning normally streams via the .reasoning deltas above. But if completeStream FELL BACK to a
@@ -6293,6 +6369,11 @@ fn runInnerAgentic(
                         name_fixed = real;
                     } else break :blk unknownToolResult(gpa, c.name, turn_tools);
                 }
+                // POLL BUDGET: after POLL_TIMEOUT_STREAK consecutive timeouts, further polls are answered
+                // instantly instead of blocking the turn another 180s each. The model is told the honest state
+                // and the way out; the streak resets on any poll that actually MATCHES (see intake below).
+                if (std.mem.eql(u8, run_name, "poll") and poll_timeouts.* >= POLL_TIMEOUT_STREAK)
+                    break :blk gpa.dupe(u8, "(NOT executed — poll budget for this turn is exhausted: the last 3 polls all timed out with nothing arriving. The thing you are waiting for is not coming on this turn's clock. STOP waiting: report the current state to the user plainly, or take a different action. If it genuinely needs longer, say so and end the turn — the user can ask again later or schedule a task.)") catch emptyRes();
                 // TRUNCATED MUTATION GUARD: `done_reason:"length"` with tool_calls present means the output
                 // budget ran out MID-CALL — and Ollama's constrained decoding closes the JSON anyway, so the
                 // last call arrives as VALID args whose string content was silently amputated. Executing that
@@ -6346,6 +6427,12 @@ fn runInnerAgentic(
                 } else if (result.len > 0 and result[0] != '(') {
                     dud_fetches.* = 0; // a real page — the model is fetching URLs that exist again
                 }
+            }
+            // POLL STREAK intake: a "-> timeout" verdict counts toward the budget; a match/up/done resets it.
+            // Keyed on the verdict string pollTool itself prints, so the delegated (desk) and server executors
+            // are covered identically.
+            if (std.mem.eql(u8, name_fixed orelse c.name, "poll")) {
+                if (std.mem.indexOf(u8, result, "-> timeout") != null) poll_timeouts.* += 1 else if (result.len > 0 and result[0] != '(') poll_timeouts.* = 0;
             }
             if (new_query.len > 0 and result.len > 0) {
                 if (std.fmt.allocPrint(gpa, "{s}\n(engine: this searched \"{s}\" — a focused rewrite of the query you gave, aimed at the same intent.)", .{ result, new_query })) |noted| {
