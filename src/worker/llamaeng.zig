@@ -45,8 +45,10 @@ extern fn veil_ll_log_quiet() void;
 extern fn veil_ll_load(path: [*:0]const u8, n_gpu_layers: i32) ?*Model;
 extern fn veil_ll_load_meta(path: [*:0]const u8) ?*Model;
 extern fn veil_ll_gpu_desc(buf: [*]u8, cap: usize) i32;
+extern fn veil_ll_gpu_free_mb() usize;
+extern fn veil_ll_n_layer(m: *const Model) i32;
 extern fn veil_ll_model_free(m: *Model) void;
-extern fn veil_ll_ctx_new(m: *Model, n_ctx_total: u32, n_batch: u32, n_threads: i32, n_threads_batch: i32, n_seq: u32) ?*Ctx;
+extern fn veil_ll_ctx_new(m: *Model, n_ctx_total: u32, n_batch: u32, n_threads: i32, n_threads_batch: i32, n_seq: u32, kv_q8: bool) ?*Ctx;
 extern fn veil_ll_ctx_free(c: *Ctx) void;
 extern fn veil_ll_vocab(m: *const Model) *const Vocab;
 extern fn veil_ll_tokenize(v: *const Vocab, text: [*]const u8, len: i32, toks: [*]i32, cap: i32, add_special: bool, parse_special: bool) i32;
@@ -118,6 +120,22 @@ const G = struct {
     /// NL_BUILTIN_GPU: auto (default, offload everything a device will take), off, or a layer count.
     gpu_layers: i32 = 999,
     gpu_layers_live: i32 = 0, // where the fit ladder actually landed (0 = CPU serving)
+    /// VRAM (MiB) the engine refuses to consume, left for the OTHER tenants on the card: the desk's
+    /// own GL context, the browser the veil drives for web tools, the desktop compositor. Sized
+    /// from a real failure — a 12GB card at ~370 MiB free took a driver kernel exception that
+    /// killed the process. NL_BUILTIN_VRAM_RESERVE_MB tunes it; 0 disables the check.
+    vram_reserve_mb: usize = 1536,
+    /// Store the KV cache at q8_0 rather than f16 — roughly half the memory for a negligible
+    /// quality cost, and the difference between a window that can hold a chat turn and one that
+    /// cannot. NL_BUILTIN_KV_F16=1 restores full precision for anyone who wants it.
+    kv_q8: bool = true,
+    n_layer: i32 = 0, // the model's real layer count (from the metadata probe) — the offload unit
+    weights_mb: usize = 0, // on-disk size, the pre-flight proxy for what the weights will cost in VRAM
+    /// The status SNAPSHOT and its own short-lived lock. info() must never queue behind a
+    /// generation: it shares no mutex with generate(), so a status poll cannot leak an http worker
+    /// thread while the GPU is busy. Published after every state change.
+    info_mu: std.Io.Mutex = .init,
+    info_snap: builtin_mod.Info = .{},
     // measured rates from the LAST generation (tenths of a token/s) — the status row's honest
     // "what does THIS device actually deliver", instead of anyone guessing from specs
     last_decode_tps10: u32 = 0,
@@ -155,6 +173,9 @@ pub fn configure(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process
     g.io = io; // before the first lock — the mutex parks on this io
     lock();
     defer unlock();
+    // publish the status snapshot on EVERY exit path (runs before unlock: LIFO), so a reader
+    // never has to take the generation mutex to learn what the engine is doing
+    defer publishInfoLocked();
     g.gpa = gpa;
     g.configured = true;
     if (environ.get("NL_BUILTIN_CTX")) |v| {
@@ -189,6 +210,15 @@ pub fn configure(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process
     if (environ.get("NL_BUILTIN_KEEPALIVE")) |v| {
         if (std.fmt.parseInt(i64, std.mem.trim(u8, v, " \r\n\t"), 10)) |n| {
             if (n >= 30) g.keepalive_s = n;
+        } else |_| {}
+    }
+    if (environ.get("NL_BUILTIN_KV_F16")) |v| {
+        const t = std.mem.trim(u8, v, " \r\n\t");
+        if (std.mem.eql(u8, t, "1") or std.ascii.eqlIgnoreCase(t, "true")) g.kv_q8 = false;
+    }
+    if (environ.get("NL_BUILTIN_VRAM_RESERVE_MB")) |v| {
+        if (std.fmt.parseInt(usize, std.mem.trim(u8, v, " \r\n\t"), 10)) |n| {
+            g.vram_reserve_mb = @min(n, 16384); // 0 = trust the driver's own allocation verdict
         } else |_| {}
     }
     if (environ.get("NL_BUILTIN_GPU")) |v| {
@@ -232,6 +262,9 @@ pub fn repoint(path: ?[]const u8) void {
     if (!g.configured) return;
     lock();
     defer unlock();
+    // publish the status snapshot on EVERY exit path (runs before unlock: LIFO), so a reader
+    // never has to take the generation mutex to learn what the engine is doing
+    defer publishInfoLocked();
     const new_path = path orelse "";
     const cur = g.path[0..g.path_len];
     if (std.mem.eql(u8, cur, new_path)) {
@@ -255,6 +288,9 @@ pub fn unload() void {
     if (!g.configured) return;
     lock();
     defer unlock();
+    // publish the status snapshot on EVERY exit path (runs before unlock: LIFO), so a reader
+    // never has to take the generation mutex to learn what the engine is doing
+    defer publishInfoLocked();
     unloadLocked();
     g.load_failed = false;
     g.meta = .{};
@@ -294,6 +330,14 @@ fn metaProbeLocked() void {
         g.meta.arch_len = @intCast(n);
     }
     g.meta.params_b = @intCast((veil_ll_n_params(m) + 500_000_000) / 1_000_000_000);
+    // layer count + on-disk size: the two numbers the offload budget needs BEFORE any weight is
+    // committed to the card. Both are free here — the probe already has the header open.
+    g.n_layer = veil_ll_n_layer(m);
+    g.weights_mb = blk: {
+        const path = g.path[0..g.path_len];
+        const s = std.Io.Dir.cwd().statFile(g.io, path, .{}) catch break :blk 0;
+        break :blk @intCast(s.size / (1024 * 1024));
+    };
     if (g.gpu_layers > 0) {
         const gn = veil_ll_gpu_desc(&g.meta.gpu, g.meta.gpu.len);
         g.meta.gpu_len = if (gn > 0) @intCast(gn) else 0;
@@ -324,8 +368,33 @@ fn ensureLoadedLocked() !void {
         var gbuf: [64]u8 = undefined;
         gpu_avail = g.gpu_layers > 0 and veil_ll_gpu_desc(&gbuf, gbuf.len) > 0;
     }
-    const ladder = [_]i32{ g.gpu_layers, @divTrunc(g.gpu_layers * 3, 4), @divTrunc(g.gpu_layers, 2), @divTrunc(g.gpu_layers, 4), 0 };
+    // THE LADDER IS IN REAL LAYERS. It used to be 999/749/499/249/0, which llama clamps to the
+    // model's layer count — so every rung above zero meant "all layers" and the ladder could only
+    // ever go all-or-nothing. A card that can hold two thirds of the model got nothing.
+    const total_layers: i32 = if (g.n_layer > 0) g.n_layer else 999;
+    const want: i32 = @min(g.gpu_layers, total_layers);
+    const ladder = [_]i32{ want, @divTrunc(want * 3, 4), @divTrunc(want, 2), @divTrunc(want, 4), 0 };
+
+    // PRE-FLIGHT BUDGET. The reserve check after context creation is too late on its own: the
+    // weights are committed first, and on Windows an over-budget commit does not fail — it
+    // oversubscribes into shared memory, which is the state the driver died in. So decide how much
+    // to offload from what is ACTUALLY free before asking for any of it. Skipped when the backend
+    // cannot report free memory (0), where the old try-and-see remains the only available test.
     var rung: usize = if (gpu_avail) 0 else ladder.len - 1;
+    if (gpu_avail and g.weights_mb > 0) {
+        const free_mb = veil_ll_gpu_free_mb();
+        if (free_mb > 0) {
+            const budget: usize = if (free_mb > g.vram_reserve_mb) free_mb - g.vram_reserve_mb else 0;
+            // fraction of the weights the budget can hold, in tenths (integer math, no float)
+            const frac10: usize = if (g.weights_mb == 0) 0 else @min(budget * 10 / g.weights_mb, 10);
+            const start: usize = if (frac10 >= 10) 0 else if (frac10 >= 7) 1 else if (frac10 >= 5) 2 else if (frac10 >= 2) 3 else 4;
+            if (start > 0) log.warn(
+                "{d} MiB free (reserve {d}) vs {d} MiB of weights — offloading {d}/{d} layers instead of all",
+                .{ free_mb, g.vram_reserve_mb, g.weights_mb, ladder[start], total_layers },
+            );
+            rung = start;
+        }
+    }
     const m: *Model, const ngl: i32 = blk: {
         while (rung < ladder.len) : (rung += 1) {
             const try_ngl = ladder[rung];
@@ -346,7 +415,33 @@ fn ensureLoadedLocked() !void {
     var win: u32 = g.n_ctx;
     const c: *Ctx = blk: {
         while (true) {
-            if (veil_ll_ctx_new(m, win * n, N_BATCH, g.n_threads, g.n_threads_batch, n)) |c| {
+            if (veil_ll_ctx_new(m, win * n, N_BATCH, g.n_threads, g.n_threads_batch, n, g.kv_q8)) |c| {
+                // A SUCCESSFUL ALLOCATION IS NOT A FIT. On Windows an over-budget VRAM request does
+                // not fail — the driver oversubscribes into shared system memory — so this branch
+                // was reached moments before a crash in which the display driver logged five
+                // nvlddmkm errors and killed the whole process. We are also not the card's only
+                // tenant: the desk's own GL context, the browser the veil drives for web tools, and
+                // the desktop compositor all need room. So MEASURE what is left and step down until
+                // a real reserve survives. CPU serving skips this — system RAM is not the scarce
+                // thing there, and free-VRAM reads mean nothing.
+                if (ngl > 0) {
+                    const free_mb = veil_ll_gpu_free_mb();
+                    if (free_mb > 0 and free_mb < g.vram_reserve_mb) {
+                        if (win > MIN_SERVING_CTX or n > 1) {
+                            veil_ll_ctx_free(c);
+                            if (n > 1) {
+                                n /= 2;
+                            } else {
+                                win = @max(MIN_SERVING_CTX, win / 1024 * 768); // 3/4, 1k-aligned
+                            }
+                            log.warn("only {d} MiB VRAM left after the kv (reserve {d}) — stepping down to {d} x {d} slot(s)", .{ free_mb, g.vram_reserve_mb, win, n });
+                            continue;
+                        }
+                        // already at the floor: serve anyway, but say so — a user on a small card
+                        // needs to know the machine is tight rather than be silently refused
+                        log.warn("serving with only {d} MiB VRAM free — close other GPU apps if the driver misbehaves", .{free_mb});
+                    }
+                }
                 g.n_ctx = win; // serve — and report through /api/show — the window that actually fit
                 break :blk c;
             }
@@ -361,7 +456,11 @@ fn ensureLoadedLocked() !void {
             // plug-and-play promise: a box that used to serve 8192 still serves 8192, it just arrives
             // there by stepping down instead of by the constant happening to suit it.
             if (win > MIN_SERVING_CTX) {
-                win = @max(MIN_SERVING_CTX, win / 2);
+                // 3/4 rather than 1/2: halving skips every useful size between 16384 and 8192, and
+                // the window a turn needs (the harness prefix plus room to answer) usually lands in
+                // that gap — a coarse ladder turns "slightly too big" into "half as much as the
+                // card could serve".
+                win = @max(MIN_SERVING_CTX, win / 1024 * 768);
                 log.warn("kv allocation did not fit at 1 slot — retrying with a {d}-token window", .{win});
                 continue;
             }
@@ -418,10 +517,25 @@ fn unloaderLoop() void {
     }
 }
 
+/// The status read, on its OWN lock over a published snapshot.
+///
+/// THIS USED TO TAKE THE GENERATION MUTEX, and that took the whole server down. generate() holds
+/// that mutex for an entire inference; /api/v1/models/builtin calls this; the desk polls that route
+/// every 10s and the web panel every 1.2s, each retried 3x. So while one generation ran long, every
+/// poll blocked and parked an httpz worker thread — the 128-thread pool exhausted and EVERY
+/// endpoint began timing out, including ones that never touch the engine (observed live: 13 minutes
+/// of total wedge before the driver killed the process). A status read must never be able to queue
+/// behind the work it is reporting on.
 pub fn info() builtin_mod.Info {
     if (!g.configured) return .{};
-    lock();
-    defer unlock();
+    g.info_mu.lockUncancelable(g.io);
+    defer g.info_mu.unlock(g.io);
+    return g.info_snap;
+}
+
+/// Rebuild the published snapshot. CALLER HOLDS THE GENERATION MUTEX (it reads engine state); the
+/// info lock is taken only for the microseconds of the copy, so a reader never waits on inference.
+fn publishInfoLocked() void {
     var out = g.meta;
     out.ctx_serving = g.n_ctx;
     out.gpu_layers = g.gpu_layers_live;
@@ -434,7 +548,9 @@ pub fn info() builtin_mod.Info {
         .ready
     else
         .cold;
-    return out;
+    g.info_mu.lockUncancelable(g.io);
+    defer g.info_mu.unlock(g.io);
+    g.info_snap = out;
 }
 
 fn vtInfo(_: *anyopaque) builtin_mod.Info {
@@ -457,6 +573,9 @@ pub fn generate(gpa: std.mem.Allocator, req: builtin_mod.GenReq) !builtin_mod.Ge
     if (!g.configured) return error.NoWeights;
     lock();
     defer unlock();
+    // publish the status snapshot on EVERY exit path (runs before unlock: LIFO), so a reader
+    // never has to take the generation mutex to learn what the engine is doing
+    defer publishInfoLocked();
     try ensureLoadedLocked();
     g.last_used_s = nowS(g.io);
     defer g.last_used_s = nowS(g.io);
