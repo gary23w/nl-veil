@@ -522,7 +522,7 @@ pub fn complete(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []
 /// A catalog id carrying the ":fim" ROUTING SUFFIX — DeepSeek's beta FIM/completions endpoint (prompt in,
 /// text out) instead of chat/completions. The suffix is ours, stripped before the wire (the provider knows
 /// only "deepseek-v4-pro"); the convention mirrors the catalog's existing ":free"/":provider" pin suffixes.
-fn isFimModel(model: []const u8) bool {
+pub fn isFimModel(model: []const u8) bool {
     return std.mem.endsWith(u8, model, ":fim");
 }
 

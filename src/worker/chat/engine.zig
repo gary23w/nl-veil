@@ -1957,6 +1957,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     // afk OUTRANKS the plan cap: an afk turn whose message decomposed into a plan must still run until Stop (it
     // walks the plan, then keeps driving free-form) — not halt at PLAN_STEPS_PER_TURN, which would violate afk.
     var max_steps: usize = if (afk) AFK_MAX_STEPS else if (has_plan) PLAN_STEPS_PER_TURN else if (armed) LOOP_MAX_STEPS else DRIVE_MAX;
+    var fim_nudged = false; // the one-shot "you narrated, you did not call" correction (raw-completion models)
     var idle_steps: usize = 0; // consecutive no-tool drive steps — the armed (non-afk) anti-spin bound (desk loop_idle)
     var verified_done = false; // TERMINAL BUILD-VERIFY fires at most once per turn (desk arc_final_verified)
     var swarm_timeout_nudged = false; // SWARM_TIMEOUT_MSG fires at most once per turn — after that a stuck hive can't hold the turn open forever
@@ -2321,6 +2322,22 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
                 // end a non-afk loop after TWO consecutive idle steps (that's a conversation, not work). AFK never
                 // ends on idle — persistence IS the feature — so its counter just resets.
                 idle_steps += 1;
+                // RAW-COMPLETION MODELS GET ONE CORRECTION FIRST. A FIM model has no tool_calls channel, so a
+                // call exists only if it WROTE one and the text recovery caught it; when recovery misses, the
+                // step is indistinguishable from "chose not to act" and the anti-spin bound ends the turn.
+                // Measured on one live conversation running the same task with both: 47.6% of FIM steps ran no
+                // tool vs 7.2% on flash, and 5 of 14 FIM turns ended having run nothing at all. So re-ask ONCE,
+                // naming the exact form, before the bound counts it. Bounded by `fim_nudged`: a model that
+                // ignores the correction still ends the turn, so this cannot spin.
+                if (idle_steps >= 2 and !fim_nudged and llm.isFimModel(trio.coding.model) and std.mem.trim(u8, inner.content, " \r\n\t").len > 0) {
+                    fim_nudged = true;
+                    idle_steps = 0;
+                    conv_buf.appendSlice(gpa, ",{\"role\":\"user\",\"content\":") catch break :outer;
+                    http.jstr(gpa, &conv_buf, "(engine: you DESCRIBED an action but did not CALL a tool, so nothing ran. Narration does not act. If you meant to act, write the call now as the last thing in your reply, exactly:\n<function=TOOL_NAME>\n<parameter=ARG_NAME>value</parameter>\n</function>\nand stop there. If you did not mean to act, answer the user in plain prose instead.)") catch break :outer;
+                    conv_buf.append(gpa, '}') catch break :outer;
+                    emitKV(app, conv_dir, "status", "text", "no tool ran — asking for the call itself");
+                    continue :outer;
+                }
                 if (idle_steps >= 2) {
                     if (!afk) {
                         // Idle over a RUNNING cast hive isn't idleness — it's the veil narrating "the hive is
