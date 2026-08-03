@@ -6308,8 +6308,18 @@ fn runInnerAgentic(
         // The transport then returns it as plain content with NO calls, so no tool runs, the markup leaks into the
         // reply, and the drive loop churns on it. Recover the call(s) from the markup + strip it from the content,
         // so the tool actually executes and the turn makes progress.
-        if (step.calls.len == 0 and cctx.looksLikeToolMarkup(step.content)) {
-            if (cctx.recoverMarkupCalls(gpa, step.content)) |rec| {
+        // PLAIN-TEXT fallback (recoverPlainCalls): a raw-completion model with no tool_calls channel writes
+        // its call as "browser_click\nref: 27" rather than markup, and every one of those became narration —
+        // the tool never ran and the turn re-described the same action. Gated on an EXACT advertised tool
+        // name, so prose cannot be mistaken for a call.
+        if (step.calls.len == 0) {
+            const rec_opt = blk_rec: {
+                if (cctx.looksLikeToolMarkup(step.content)) {
+                    if (cctx.recoverMarkupCalls(gpa, step.content)) |r| break :blk_rec r;
+                }
+                break :blk_rec cctx.recoverPlainCalls(gpa, step.content, turn_tools);
+            };
+            if (rec_opt) |rec| {
                 var built: std.ArrayListUnmanaged(llm.ToolCall) = .empty;
                 for (rec.calls) |rc| {
                     // MINT, never "": markup never carries an id, and an id-less call cannot round-trip the

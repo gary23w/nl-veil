@@ -455,6 +455,113 @@ fn recoverHermes(gpa: std.mem.Allocator, content: []const u8) ?MarkupRecovery {
     return .{ .stripped = stripped, .calls = owned };
 }
 
+/// Is `name` advertised in this turn's tools-array JSON? Exact key match — the gate that stops the PLAIN
+/// recovery below from reading prose as a tool call.
+fn toolAdvertised(turn_tools: []const u8, name: []const u8) bool {
+    if (name.len == 0 or name.len > 64) return false;
+    var nb: [96]u8 = undefined;
+    const needle = std.fmt.bufPrint(&nb, "\"name\":\"{s}\"", .{name}) catch return false;
+    return std.mem.indexOf(u8, turn_tools, needle) != null;
+}
+
+/// Recover a tool call written as PLAIN TEXT, in the shapes a raw-completion (FIM) model actually emits when
+/// it has no tool_calls channel. Observed live on deepseek-v4-pro:fim — all four in ONE conversation:
+///
+///     browser_read                                   (bare name, no args)
+///     browser_click \n ref: 27                       (name, then key: value lines)
+///     pixel_search \n query: Follow button \n k: 3
+///     Tool: pixel_search \n Arguments: {"query":…}    (labeled form)
+///
+/// None is the `<function=…>` markup the FIM prompt teaches, and none parses as markup — so every one of them
+/// silently became narration, the tool never ran, and the turn spun re-describing the same action. Rather than
+/// keep insisting on a grammar the model does not use, meet it where it is: the same reason recoverHermes and
+/// recoverDsml exist at all.
+///
+/// SAFETY — this must never turn prose into a call, so the bar is deliberately high:
+///   - the FIRST non-empty line, minus an optional "Tool:" label, must EXACTLY equal a tool this turn
+///     ADVERTISED. A sentence never does; a bare "browser_read" does.
+///   - argument lines stop at the first line that is not `key: value` (the model sometimes pastes a previous
+///     error underneath, which must not be swallowed as an argument).
+/// Owned exactly like recoverMarkupCalls, so the caller frees it the same way.
+pub fn recoverPlainCalls(gpa: std.mem.Allocator, content: []const u8, turn_tools: []const u8) ?MarkupRecovery {
+    if (turn_tools.len == 0) return null;
+    const body = std.mem.trim(u8, content, " \r\n\t");
+    if (body.len == 0 or body.len > 4096) return null; // a long reply is prose, not a bare call
+
+    var it = std.mem.splitScalar(u8, body, '\n');
+    const first_raw = it.next() orelse return null;
+    var name_line = std.mem.trim(u8, first_raw, " \r\t");
+    if (std.mem.startsWith(u8, name_line, "Tool:")) name_line = std.mem.trim(u8, name_line["Tool:".len..], " \r\t");
+    if (std.mem.endsWith(u8, name_line, ":")) name_line = std.mem.trim(u8, name_line[0 .. name_line.len - 1], " \r\t");
+    if (!toolAdvertised(turn_tools, name_line)) return null;
+
+    var args: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer args.deinit(gpa);
+    var wrote_any = false;
+    args.append(gpa, '{') catch return null;
+    while (it.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, " \r\t");
+        // A BLANK LINE ENDS THE ARGUMENTS. In every observed shape the args sit directly under the name;
+        // whatever follows a blank line is something else — the model pasting a previous error
+        // ("\n\nTool: Tool call failed: …") parsed as key "Tool" and rode into the call. Caught by the test.
+        if (line.len == 0) break;
+        // labeled JSON form: "Arguments: {…}" (or a bare object line) — adopt it verbatim when it parses
+        const jstart: ?usize = if (std.mem.startsWith(u8, line, "Arguments:"))
+            std.mem.indexOfScalar(u8, line, '{')
+        else if (line[0] == '{') @as(usize, 0) else null;
+        if (jstart) |js| {
+            const obj = std.mem.trim(u8, line[js..], " \r\t");
+            if (std.json.validate(gpa, obj) catch false) {
+                args.deinit(gpa);
+                const owned_obj = gpa.dupe(u8, obj) catch return null;
+                return finishPlain(gpa, name_line, owned_obj);
+            }
+            break;
+        }
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse break; // not key: value ⇒ the args ended
+        const key = std.mem.trim(u8, line[0..colon], " \r\t");
+        const value = std.mem.trim(u8, line[colon + 1 ..], " \r\t");
+        if (key.len == 0 or key.len > 64 or std.mem.indexOfScalar(u8, key, ' ') != null) break; // prose, not a key
+        if (wrote_any) args.append(gpa, ',') catch return null;
+        wrote_any = true;
+        appendJsonString(gpa, &args, key) catch return null;
+        args.append(gpa, ':') catch return null;
+        if (isBareScalar(value)) args.appendSlice(gpa, value) catch return null else appendJsonString(gpa, &args, value) catch return null;
+    }
+    args.append(gpa, '}') catch return null;
+    const owned_args = args.toOwnedSlice(gpa) catch return null;
+    return finishPlain(gpa, name_line, owned_args);
+}
+
+/// Package one recovered plain call; `args` ownership moves in. `stripped` is empty on purpose — the whole
+/// reply WAS the call, so there is no prose left to show the user.
+fn finishPlain(gpa: std.mem.Allocator, name: []const u8, args: []u8) ?MarkupRecovery {
+    const nm = gpa.dupe(u8, name) catch {
+        gpa.free(args);
+        return null;
+    };
+    var calls: std.ArrayListUnmanaged(RecoveredCall) = .empty;
+    calls.append(gpa, .{ .name = nm, .args = args }) catch {
+        calls.deinit(gpa);
+        gpa.free(args);
+        gpa.free(nm);
+        return null;
+    };
+    const owned = calls.toOwnedSlice(gpa) catch {
+        calls.deinit(gpa);
+        gpa.free(args);
+        gpa.free(nm);
+        return null;
+    };
+    const stripped = gpa.dupe(u8, "") catch {
+        gpa.free(owned[0].name);
+        gpa.free(owned[0].args);
+        gpa.free(owned);
+        return null;
+    };
+    return .{ .stripped = stripped, .calls = owned };
+}
+
 /// Args JSON from one hermes function region: each `<parameter=KEY>VALUE</parameter>` becomes `"KEY":VALUE`
 /// (bare when VALUE is a bare JSON scalar, else a quoted string). A missing closing tag takes the value up to
 /// the next parameter (or the region's end tags) rather than dropping the call.
@@ -778,4 +885,91 @@ test "recoverMarkupCalls: two hermes functions in one block; a missing </paramet
     try std.testing.expectEqualStrings("observe", rec.calls[1].name);
     // the unclosed fact value ends at the NEXT <parameter=, not at the block's end
     try std.testing.expectEqualStrings("{\"fact\":\"the user's name is Gary\"}", rec.calls[1].args);
+}
+
+test "recoverPlainCalls: the shapes a FIM model really emits become real calls; prose never does" {
+    const gpa = std.testing.allocator;
+    const TOOLS = "{\"type\":\"function\",\"function\":{\"name\":\"browser_read\"}}," ++
+        "{\"type\":\"function\",\"function\":{\"name\":\"browser_click\"}}," ++
+        "{\"type\":\"function\",\"function\":{\"name\":\"pixel_search\"}}";
+    // 1. bare name, no args
+    {
+        const r = recoverPlainCalls(gpa, "browser_read", TOOLS).?;
+        defer {
+            for (r.calls) |c| {
+                gpa.free(c.name);
+                gpa.free(c.args);
+            }
+            gpa.free(r.calls);
+            gpa.free(r.stripped);
+        }
+        try std.testing.expectEqual(@as(usize, 1), r.calls.len);
+        try std.testing.expectEqualStrings("browser_read", r.calls[0].name);
+        try std.testing.expectEqualStrings("{}", r.calls[0].args);
+        try std.testing.expectEqualStrings("", r.stripped);
+    }
+    // 2. name + key: value (numeric value stays a bare scalar, as the schema expects)
+    {
+        const r = recoverPlainCalls(gpa, "browser_click\nref: 27", TOOLS).?;
+        defer {
+            for (r.calls) |c| {
+                gpa.free(c.name);
+                gpa.free(c.args);
+            }
+            gpa.free(r.calls);
+            gpa.free(r.stripped);
+        }
+        try std.testing.expectEqualStrings("browser_click", r.calls[0].name);
+        try std.testing.expectEqualStrings("{\"ref\":27}", r.calls[0].args);
+    }
+    // 3. multiple key: value lines, string + number
+    {
+        const r = recoverPlainCalls(gpa, "pixel_search\nquery: Follow button\nk: 3", TOOLS).?;
+        defer {
+            for (r.calls) |c| {
+                gpa.free(c.name);
+                gpa.free(c.args);
+            }
+            gpa.free(r.calls);
+            gpa.free(r.stripped);
+        }
+        try std.testing.expectEqualStrings("{\"query\":\"Follow button\",\"k\":3}", r.calls[0].args);
+    }
+    // 4. the labeled form, JSON adopted verbatim
+    {
+        const r = recoverPlainCalls(gpa, "Tool: pixel_search\nArguments: {\"query\": \"Follow button\", \"k\": 3}", TOOLS).?;
+        defer {
+            for (r.calls) |c| {
+                gpa.free(c.name);
+                gpa.free(c.args);
+            }
+            gpa.free(r.calls);
+            gpa.free(r.stripped);
+        }
+        try std.testing.expectEqualStrings("pixel_search", r.calls[0].name);
+        try std.testing.expectEqualStrings("{\"query\": \"Follow button\", \"k\": 3}", r.calls[0].args);
+    }
+    // a pasted error under the args must NOT be swallowed as an argument
+    {
+        const r = recoverPlainCalls(gpa, "browser_click\nref: 54\n\nTool: Tool call failed: ref 54 is no longer valid", TOOLS).?;
+        defer {
+            for (r.calls) |c| {
+                gpa.free(c.name);
+                gpa.free(c.args);
+            }
+            gpa.free(r.calls);
+            gpa.free(r.stripped);
+        }
+        try std.testing.expectEqualStrings("{\"ref\":54}", r.calls[0].args);
+    }
+
+    // ---- prose is NEVER a call ----
+    try std.testing.expect(recoverPlainCalls(gpa, "I'm clicking the Follow button for @sureailabs (ref 45).", TOOLS) == null);
+    try std.testing.expect(recoverPlainCalls(gpa, "Let me follow @HBCoop_ next (ref 54).", TOOLS) == null);
+    try std.testing.expect(recoverPlainCalls(gpa, "browser_reader", TOOLS) == null); // near-miss name
+    try std.testing.expect(recoverPlainCalls(gpa, "write_file\npath: x", TOOLS) == null); // not advertised this turn
+    try std.testing.expect(recoverPlainCalls(gpa, "", TOOLS) == null);
+    try std.testing.expect(recoverPlainCalls(gpa, "browser_read", "") == null); // no belt ⇒ no recovery
+    // a real sentence that merely STARTS with a tool word is not a bare name line
+    try std.testing.expect(recoverPlainCalls(gpa, "browser_read is the tool I need here.", TOOLS) == null);
 }
