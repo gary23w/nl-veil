@@ -558,6 +558,10 @@ fn completeFim(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []c
         jstr(gpa, &body, prompt) catch break :blk false;
         // EVERY turn label is a stop — "\nUser:" alone let the model write turn after turn of "Assistant: …".
         // (DeepSeek allows up to 16 stop sequences; this uses 5.)
+        // Deliberately NOT stopped on "\nTool:", even though the model fabricates `Tool: {"ok":true,…}`
+        // results beneath its own calls: that same label IS its labelled call form ("Tool: pixel_search"), so
+        // a stop there would truncate the very call we are trying to recover. The fabrication is discarded
+        // downstream instead — recoverPlainCalls takes the FIRST call and ignores everything after it.
         body.print(gpa, ",\"max_tokens\":{d},\"temperature\":{d:.2},\"stop\":[\"\\nUser:\",\"\\nAssistant:\",\"\\nSystem:\",\"\\nTool result:\",\"\\n\\nAssistant:\"]}}", .{ @min(max_tokens, 8192), temperature }) catch break :blk false;
         break :blk true;
     };

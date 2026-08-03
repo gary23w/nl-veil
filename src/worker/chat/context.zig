@@ -486,15 +486,39 @@ fn toolAdvertised(turn_tools: []const u8, name: []const u8) bool {
 pub fn recoverPlainCalls(gpa: std.mem.Allocator, content: []const u8, turn_tools: []const u8) ?MarkupRecovery {
     if (turn_tools.len == 0) return null;
     const body = std.mem.trim(u8, content, " \r\n\t");
-    if (body.len == 0 or body.len > 4096) return null; // a long reply is prose, not a bare call
+    if (body.len == 0) return null;
 
-    var it = std.mem.splitScalar(u8, body, '\n');
-    const first_raw = it.next() orelse return null;
-    var name_line = std.mem.trim(u8, first_raw, " \r\t");
-    if (std.mem.startsWith(u8, name_line, "Tool:")) name_line = std.mem.trim(u8, name_line["Tool:".len..], " \r\t");
-    if (std.mem.endsWith(u8, name_line, ":")) name_line = std.mem.trim(u8, name_line[0 .. name_line.len - 1], " \r\t");
-    if (!toolAdvertised(turn_tools, name_line)) return null;
+    // FIND THE CALL ANYWHERE, not just at the top. The model narrates first and calls afterwards ("The
+    // bookmark button is ref 93. Let me click it now.\n\nbrowser_click\nref: 93"), so a first-line-only rule
+    // missed every real call in a live browser run. Scan for a line that is EXACTLY an advertised tool name.
+    // The exact-match bar is what stops a sentence being read as a call — a name mentioned mid-prose never
+    // occupies a line by itself.
+    //
+    // Take the FIRST such line, not the last: this model FABRICATES what comes after its call (a made-up
+    // `Tool: {"ok":true,…}` result, sometimes a second call built on that fiction). Only the first call
+    // reflects real state; everything past it is the model imagining the rest of the transcript.
+    var name_line: []const u8 = "";
+    var name_at: usize = 0; // byte offset of the name line
+    var args_at: usize = 0; // byte offset just past it
+    {
+        var pos: usize = 0;
+        while (pos < body.len) {
+            const nl = std.mem.indexOfScalarPos(u8, body, pos, '\n') orelse body.len;
+            var cand = std.mem.trim(u8, body[pos..nl], " \r\t");
+            if (std.mem.startsWith(u8, cand, "Tool:")) cand = std.mem.trim(u8, cand["Tool:".len..], " \r\t");
+            if (std.mem.endsWith(u8, cand, ":")) cand = std.mem.trim(u8, cand[0 .. cand.len - 1], " \r\t");
+            if (toolAdvertised(turn_tools, cand)) {
+                name_line = cand;
+                name_at = pos;
+                args_at = @min(nl + 1, body.len);
+                break; // FIRST call wins — see above
+            }
+            pos = nl + 1;
+        }
+    }
+    if (name_line.len == 0) return null;
 
+    var it = std.mem.splitScalar(u8, body[args_at..], '\n');
     var args: std.ArrayListUnmanaged(u8) = .empty;
     errdefer args.deinit(gpa);
     var wrote_any = false;
@@ -514,14 +538,36 @@ pub fn recoverPlainCalls(gpa: std.mem.Allocator, content: []const u8, turn_tools
             if (std.json.validate(gpa, obj) catch false) {
                 args.deinit(gpa);
                 const owned_obj = gpa.dupe(u8, obj) catch return null;
-                return finishPlain(gpa, name_line, owned_obj);
+                return finishPlain(gpa, name_line, owned_obj, body[0..name_at]);
             }
             break;
         }
         const colon = std.mem.indexOfScalar(u8, line, ':') orelse break; // not key: value ⇒ the args ended
         const key = std.mem.trim(u8, line[0..colon], " \r\t");
-        const value = std.mem.trim(u8, line[colon + 1 ..], " \r\t");
+        var value = std.mem.trim(u8, line[colon + 1 ..], " \r\t");
         if (key.len == 0 or key.len > 64 or std.mem.indexOfScalar(u8, key, ' ') != null) break; // prose, not a key
+        // MULTI-LINE VALUE: `code: import subprocess` continues over the following lines (observed live —
+        // run_python's whole script arrives this way). A continuation is any later line that is NOT itself a
+        // `key: value` header; it runs to the blank line that ends the arguments. Without this the script was
+        // silently truncated to its first line and the tool ran a fragment.
+        {
+            const val_start = (@intFromPtr(value.ptr) - @intFromPtr(body.ptr));
+            var val_end = val_start + value.len;
+            var probe = it; // copy the iterator so a non-continuation line is re-read by the main loop
+            while (probe.next()) |nxt_raw| {
+                const nxt = std.mem.trim(u8, nxt_raw, " \r\t");
+                if (nxt.len == 0) break; // blank line ends the value AND the args
+                const c2 = std.mem.indexOfScalar(u8, nxt, ':');
+                const is_header = c2 != null and blk_h: {
+                    const k2 = std.mem.trim(u8, nxt[0..c2.?], " \r\t");
+                    break :blk_h k2.len > 0 and k2.len <= 64 and std.mem.indexOfScalar(u8, k2, ' ') == null;
+                };
+                if (is_header) break; // the next argument — not a continuation
+                val_end = (@intFromPtr(nxt_raw.ptr) - @intFromPtr(body.ptr)) + nxt_raw.len;
+                it = probe; // consume it
+            }
+            value = std.mem.trim(u8, body[val_start..val_end], " \r\n\t");
+        }
         if (wrote_any) args.append(gpa, ',') catch return null;
         wrote_any = true;
         appendJsonString(gpa, &args, key) catch return null;
@@ -530,12 +576,13 @@ pub fn recoverPlainCalls(gpa: std.mem.Allocator, content: []const u8, turn_tools
     }
     args.append(gpa, '}') catch return null;
     const owned_args = args.toOwnedSlice(gpa) catch return null;
-    return finishPlain(gpa, name_line, owned_args);
+    return finishPlain(gpa, name_line, owned_args, body[0..name_at]);
 }
 
-/// Package one recovered plain call; `args` ownership moves in. `stripped` is empty on purpose — the whole
-/// reply WAS the call, so there is no prose left to show the user.
-fn finishPlain(gpa: std.mem.Allocator, name: []const u8, args: []u8) ?MarkupRecovery {
+/// Package one recovered plain call; `args` ownership moves in. `stripped` is the narration ABOVE the call
+/// ("Let me click it now.") — kept so the user still reads why the tool ran; empty when the reply was only
+/// the call.
+fn finishPlain(gpa: std.mem.Allocator, name: []const u8, args: []u8, prose: []const u8) ?MarkupRecovery {
     const nm = gpa.dupe(u8, name) catch {
         gpa.free(args);
         return null;
@@ -553,7 +600,7 @@ fn finishPlain(gpa: std.mem.Allocator, name: []const u8, args: []u8) ?MarkupReco
         gpa.free(nm);
         return null;
     };
-    const stripped = gpa.dupe(u8, "") catch {
+    const stripped = gpa.dupe(u8, std.mem.trim(u8, prose, " \r\n\t")) catch {
         gpa.free(owned[0].name);
         gpa.free(owned[0].args);
         gpa.free(owned);
@@ -970,6 +1017,54 @@ test "recoverPlainCalls: the shapes a FIM model really emits become real calls; 
     try std.testing.expect(recoverPlainCalls(gpa, "write_file\npath: x", TOOLS) == null); // not advertised this turn
     try std.testing.expect(recoverPlainCalls(gpa, "", TOOLS) == null);
     try std.testing.expect(recoverPlainCalls(gpa, "browser_read", "") == null); // no belt ⇒ no recovery
+    // ---- the LONG-TAIL browser run: call after prose, with a FABRICATED result underneath ----
+    {
+        const live = "The Noah post's bookmark button is ref 93. Let me click it now.\n\n" ++
+            "browser_click\nref: 93\n\nTool: {\"ok\":true,\"tag\":\"button\",\"changed\":true}";
+        const r = recoverPlainCalls(gpa, live, TOOLS).?;
+        defer {
+            for (r.calls) |c| {
+                gpa.free(c.name);
+                gpa.free(c.args);
+            }
+            gpa.free(r.calls);
+            gpa.free(r.stripped);
+        }
+        try std.testing.expectEqualStrings("browser_click", r.calls[0].name);
+        try std.testing.expectEqualStrings("{\"ref\":93}", r.calls[0].args); // the fabricated result is NOT an arg
+        // the narration above the call survives as the visible reply
+        try std.testing.expectEqualStrings("The Noah post's bookmark button is ref 93. Let me click it now.", r.stripped);
+    }
+    // the labelled form after prose resolves to the same call
+    {
+        const live = "Let me search the page.\n\nTool: pixel_search\nArguments: {\"query\": \"Follow\", \"k\": 3}";
+        const r = recoverPlainCalls(gpa, live, TOOLS).?;
+        defer {
+            for (r.calls) |c| {
+                gpa.free(c.name);
+                gpa.free(c.args);
+            }
+            gpa.free(r.calls);
+            gpa.free(r.stripped);
+        }
+        try std.testing.expectEqualStrings("pixel_search", r.calls[0].name);
+        try std.testing.expectEqualStrings("{\"query\": \"Follow\", \"k\": 3}", r.calls[0].args);
+        try std.testing.expectEqualStrings("Let me search the page.", r.stripped);
+    }
+    // MULTI-LINE value: run_python's script must arrive whole, not truncated to its first line
+    {
+        const live = "browser_read\ncode: import os\nprint(os.getcwd())\n# done";
+        const r = recoverPlainCalls(gpa, live, TOOLS).?;
+        defer {
+            for (r.calls) |c| {
+                gpa.free(c.name);
+                gpa.free(c.args);
+            }
+            gpa.free(r.calls);
+            gpa.free(r.stripped);
+        }
+        try std.testing.expectEqualStrings("{\"code\":\"import os\\nprint(os.getcwd())\\n# done\"}", r.calls[0].args);
+    }
     // a real sentence that merely STARTS with a tool word is not a bare name line
     try std.testing.expect(recoverPlainCalls(gpa, "browser_read is the tool I need here.", TOOLS) == null);
 }
