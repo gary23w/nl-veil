@@ -2,8 +2,13 @@
 //! compiled INTO it and runs in-process, so the release bundle is a single executable with no veil-desk.exe
 //! beside it.
 //!
-//! `-Dapp=false` builds the SERVER-ONLY binary: no raylib module, no lazyDependency fetch, nothing that
-//! touches GL/X11 — that is the build for a headless host or CI box. The default (`-Dapp=true`) is the
+//! `-Dapp=false` builds the SERVER-ONLY binary: no raylib module, no raylib fetch, nothing that touches
+//! GL/X11 — that is the build for a headless host or CI box. It does NOT imply a lean build: -Dbuiltin and
+//! -Dvulkan default TRUE independently, so `-Dapp=false` alone still fetches llama.cpp, the Khronos headers
+//! and ~50MB of pre-built Vulkan shaders. This line previously said "no lazyDependency fetch" flatly, which
+//! reads as "server-only needs nothing from the network" and is why a CI failure on exactly those two
+//! downloads looked like a broken build. Add -Dbuiltin=false for the genuinely lean, no-network build
+//! (that is what scripts/check.sh's server-only gate does). The default (`-Dapp=true`) is the
 //! shipping app. desk/ keeps its own build.zig and still produces a standalone veil-desk for development
 //! (`cd desk && zig build`, or `zig build desk` from here).
 

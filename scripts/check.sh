@@ -108,7 +108,19 @@ gate_webjs() {
     echo "SKIPPED: node not on PATH — web/public/app.js was NOT parsed"; fi
 }
 gate "web assets parse (node --check app.js)" gate_webjs
-gate_build "zig build server-only (-Dapp=false)" "$ZIG" build -Dapp=false $CACHE_ARGS --prefix "$PREFIX"
+# -Dbuiltin=false, and why. This gate answers ONE question — does the server still compile without the GUI?
+# `-Dapp=false` alone only skips raylib: -Dbuiltin and -Dvulkan both default TRUE, so this step also fetched
+# llama.cpp, the Khronos headers and ~50MB of pre-built Vulkan shaders from two GitHub hosts before it
+# compiled a line. That made the FIRST gate of every CI run depend on two large network transfers it never
+# uses, and CI duly died on exactly that:
+#     build.zig.zon:45: error: invalid HTTP response: HttpConnectionClosing   (veil-vulkan-shaders)
+#     build.zig.zon:55: error: invalid HTTP response: HttpConnectionClosing   (SPIRV-Headers)
+# while every later gate passed on the retry — a flaky download reported as a broken build.
+# Coverage is unchanged: build_options.builtin gates ONE construction site, and the `zig build default`
+# gate below compiles the whole thing WITH builtin + vulkan. This gate keeps the -Dapp=false path honest;
+# that one keeps the engine honest. Locally, warm deps hide the difference; on a cold runner it is the
+# difference between a fast signal and a coin flip.
+gate_build "zig build server-only (-Dapp=false)" "$ZIG" build -Dapp=false -Dbuiltin=false $CACHE_ARGS --prefix "$PREFIX"
 # `zig build test` can EXIT 0 after its test binary died without reporting a single result: the build
 # runner prints `failed command: "...test.exe" ... --listen=-` and returns success anyway. Taking that
 # as green means calling the suite passed while knowing nothing whatever about it -- the worst thing an

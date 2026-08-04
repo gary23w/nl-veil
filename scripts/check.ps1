@@ -424,7 +424,11 @@ if ($node) {
     Write-Host ">> web assets parse (node --check app.js)"
     Write-Host "   SKIPPED: node not on PATH -- web/public/app.js was NOT parsed" -ForegroundColor Yellow
 }
-$ok = (Confirm-Gate (Invoke-Gate "zig build server-only (-Dapp=false)" $zig @("build", "-Dapp=false", "--cache-dir", $cache, "--prefix", $prefix) $repo $TimeoutSec "")) -and $ok
+# -Dbuiltin=false here for the same reason as scripts/check.sh (see the comment there): -Dapp=false only
+# skips raylib, so without this the gate also pulls llama.cpp + ~50MB of Vulkan shaders it never uses, and
+# a flaky GitHub download reads as a broken build. The default-build gate below still covers builtin+vulkan.
+# These two scripts are twins on purpose — one definition of done — so they change together.
+$ok = (Confirm-Gate (Invoke-Gate "zig build server-only (-Dapp=false)" $zig @("build", "-Dapp=false", "-Dbuiltin=false", "--cache-dir", $cache, "--prefix", $prefix) $repo $TimeoutSec "")) -and $ok
 $ok = (Confirm-Gate (Invoke-ZigTests "src suite" $repo $TimeoutSec "")) -and $ok
 # The note here used to say the desk suite's net test "needs a live server on :8787" and to "treat
 # the earlier tests as the verdict" -- citing an item ledger 0006 had already CLOSED. 0062 corrected
