@@ -97,18 +97,40 @@ pub fn stallReport(now: i64, last_beat: i64, already_reported_at: i64) ?i64 {
     return stalled;
 }
 
-const Ctx = struct { io: Io };
+const Ctx = struct { io: Io, hang_path: [512]u8 = undefined, hang_len: usize = 0 };
 var ctx: Ctx = undefined;
 
 /// Spawn the watcher. Never fails the app: if the thread cannot start we simply have no watchdog.
-pub fn start(io: Io) void {
+/// `data_dir` is where the DURABLE stall record goes — see writeHangRecord for why that is not optional.
+pub fn start(io: Io, data_dir: []const u8) void {
     if (running.swap(true, .acq_rel)) return; // already started
     ctx = .{ .io = io };
+    if (std.fmt.bufPrint(&ctx.hang_path, "{s}/desk-hang.log", .{data_dir})) |p| {
+        ctx.hang_len = p.len;
+    } else |_| ctx.hang_len = 0;
     beat_ms.store(nowMs(io), .monotonic);
     _ = std.Thread.spawn(.{}, watch, .{}) catch {
         running.store(false, .release);
         log.warn("watchdog: could not start — a UI hang will go unreported", .{});
     };
+}
+
+/// Append the stall record straight to disk, opened and closed on the spot.
+///
+/// THIS IS THE WHOLE POINT, and the first version got it wrong. log.zig is a fixed ring drained by a separate
+/// flusher thread, so a line handed to log.warn only reaches the disk if the process lives long enough for the
+/// flusher to run. A watchdog exists precisely for the case where the process does NOT survive — the app was
+/// terminated mid-stall and the ring died with it, which is exactly what happened: a real freeze, a watchdog
+/// running, and not one line to show for it. Buffered evidence of a death is no evidence at all.
+///
+/// Best-effort and never fatal: if the write fails there is nothing sensible to do about it from in here.
+fn writeHangRecord(io: Io, text: []const u8) void {
+    if (ctx.hang_len == 0) return;
+    const path = ctx.hang_path[0..ctx.hang_len];
+    const size: u64 = if (Io.Dir.cwd().statFile(io, path, .{})) |st| st.size else |_| 0;
+    const f = Io.Dir.cwd().createFile(io, path, .{ .truncate = false }) catch return;
+    defer f.close(io);
+    f.writePositionalAll(io, text, size) catch {};
 }
 
 pub fn stop() void {
@@ -136,11 +158,19 @@ fn watch() void {
             reported_at = now;
             _ = stalls.fetchAdd(1, .monotonic);
             const p: Phase = @enumFromInt(phase_v.load(.monotonic));
-            // The single most useful line this program can print about a freeze.
+            // The single most useful line this program can print about a freeze. Written BOTH ways on purpose:
+            // to the ring (so it sits in context beside the surrounding activity when the app survives) and
+            // straight to disk (so it survives when it does not).
             log.warn("watchdog: UI FROZEN {d}ms in phase '{s}' (frame #{d}) — the window is not pumping messages; Windows closes it at ~5s of this", .{ stalled, p.name(), frames_at_stall });
+            var rb: [320]u8 = undefined;
+            if (std.fmt.bufPrint(&rb, "UI FROZEN {d}ms  phase='{s}'  frame=#{d}  stall_no={d}\n", .{ stalled, p.name(), frames_at_stall, stalls.load(.monotonic) })) |line| {
+                writeHangRecord(io, line);
+            } else |_| {}
         } else if (reported_at != 0 and now - last < STALL_MS) {
             const total = last - stall_start;
             log.warn("watchdog: UI resumed after {d}ms frozen", .{total});
+            var rb: [160]u8 = undefined;
+            if (std.fmt.bufPrint(&rb, "UI resumed after {d}ms frozen\n", .{total})) |line| writeHangRecord(io, line) else |_| {}
             reported_at = 0;
         }
     }
@@ -178,8 +208,10 @@ test "watchdog thread: notices a frozen caller, then notices recovery (real thre
     defer threaded.deinit();
     const io2 = threaded.io();
     const before = stallCount();
-    start(io2);
+    start(io2, ".");
     defer stop();
+    Io.Dir.cwd().deleteFile(io2, "./desk-hang.log") catch {};
+    defer Io.Dir.cwd().deleteFile(io2, "./desk-hang.log") catch {};
     beat(.draw_tab);
     // freeze the "frame loop": stop beating for longer than the threshold
     io2.sleep(.{ .nanoseconds = @as(u64, @intCast(STALL_MS)) * std.time.ns_per_ms + 1500 * std.time.ns_per_ms }, .awake) catch {};
@@ -191,4 +223,9 @@ test "watchdog thread: notices a frozen caller, then notices recovery (real thre
     beat(.idle_start);
     io2.sleep(.{ .nanoseconds = 500 * std.time.ns_per_ms }, .awake) catch {};
     try std.testing.expectEqual(after_resume, stallCount()); // a healthy loop is silent
+    // and the record must be ON DISK, not only in the ring the process takes to its grave
+    const rec = Io.Dir.cwd().readFileAlloc(io2, "./desk-hang.log", std.testing.allocator, .limited(4096)) catch "";
+    defer if (rec.len > 0) std.testing.allocator.free(rec);
+    try std.testing.expect(std.mem.indexOf(u8, rec, "UI FROZEN") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rec, "draw active tab") != null);
 }
