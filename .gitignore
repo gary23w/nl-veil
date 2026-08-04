@@ -74,3 +74,13 @@ dist/
 # runtime server config written next to the CWD when veil is launched from the repo root
 # (the real one lives in data/server-config.json; this copy is an artifact, not source)
 server-config.json
+
+# harness growth artifacts (examples/embedded) - growth period is over.
+harness/*
+# ...except the test doctrine, which is repo documentation and has been tracked since e13f8d1.
+# It stays tracked either way (.gitignore does not untrack), so this negation exists to make the
+# rule honest rather than leave a file the ignore claims to exclude but git keeps publishing.
+!harness/TESTING.md
+
+# local model development artifacts and build design
+model/*
