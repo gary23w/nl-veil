@@ -569,7 +569,18 @@ pub fn runApp(data_dir: ?[]const u8) !void {
     // "stopped interacting with Windows and was closed" and kills us (twice in one day on this machine).
     // The only witness possible is a thread that is NOT the frozen one, so start one; it costs two relaxed
     // atomic stores per frame and turns the next freeze into a log line naming the section it died in.
-    watchdog.start(chat_threaded.io());
+    {
+        // The stall record goes to {data}/desk-hang.log, written straight through on each stall — log.zig's
+        // ring only reaches disk if the process outlives its flusher, and a freeze is exactly the case where
+        // it may not (proven: a real hang, a running watchdog, and not one surviving line).
+        var wdb: [512]u8 = undefined;
+        store.lock();
+        const wdd = store.settings.dataDir();
+        const wdn = @min(wdd.len, wdb.len);
+        @memcpy(wdb[0..wdn], wdd[0..wdn]);
+        store.unlock();
+        watchdog.start(chat_threaded.io(), wdb[0..wdn]);
+    }
     defer watchdog.stop();
     while (true) {
         watchdog.beat(.idle_start);
