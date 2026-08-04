@@ -506,7 +506,6 @@ pub fn visionExtract(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, ta
 /// The agentic step: `messages_json` is the inside of "messages":[ … ] (caller-built, grows each turn);
 /// `tools_json` is the inside of "tools":[ … ]. Returns the assistant content OR parsed tool_calls.
 pub fn complete(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const u8, base_url: []const u8, key: []const u8, model: []const u8, messages_json: []const u8, tools_json: []const u8, max_tokens: u32, temperature: f32) Step {
-    if (isFimModel(model)) return completeFim(gpa, io, run_dir, tag, base_url, key, model, messages_json, tools_json, max_tokens, temperature);
     if (isOllama(base_url)) return completeOllamaNative(gpa, io, run_dir, tag, base_url, key, model, messages_json, tools_json, max_tokens, temperature);
     const mt = effTokens(base_url, model, max_tokens);
     const temp_frag = tempFragOwned(gpa, io, model, temperature); // learned-quirk aware (Kimi temp=1, etc.)
@@ -517,193 +516,6 @@ pub fn complete(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []
         std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}]{s},\"max_tokens\":{d}}}", .{ model, messages_json, temp_frag, mt }) catch return stepErr(gpa, "oom");
     defer gpa.free(body);
     return completeBody(gpa, io, run_dir, tag, base_url, key, model, body, mt);
-}
-
-/// A catalog id carrying the ":fim" ROUTING SUFFIX — DeepSeek's beta FIM/completions endpoint (prompt in,
-/// text out) instead of chat/completions. The suffix is ours, stripped before the wire (the provider knows
-/// only "deepseek-v4-pro"); the convention mirrors the catalog's existing ":free"/":provider" pin suffixes.
-pub fn isFimModel(model: []const u8) bool {
-    return std.mem.endsWith(u8, model, ":fim");
-}
-
-/// DeepSeek FIM (beta completions): POST {root}/beta/completions with a flattened PROMPT — the endpoint has
-/// no messages array, no roles, and NO STRUCTURED TOOL CALLS. Docs:
-/// https://api-docs.deepseek.com/api/create-completion
-///
-/// A raw-completion model needs its own agentic protocol, because the two things chat/completions gives us for
-/// free are both missing:
-///   1. TURN BOUNDARIES. The prompt ends with an "Assistant:" cue, and a completion model does not know to
-///      stop after ONE turn — it happily writes the next five, each labeled. (Observed live: a reply that was
-///      a wall of "Assistant: I'm scrolling through the profile…" narration.) Fixed on both sides: every turn
-///      label is a stop sequence, AND fimNormalize cuts at the first label the provider let through.
-///   2. TOOL CALLS. There is no tool_calls channel, so the model can only ever NARRATE actions — which is
-///      exactly what that wall of text was: it "used the browser" by describing it. Fixed by teaching it the
-///      Hermes text form the engine's markup recovery already parses (context.zig recoverHermes), so a call
-///      written as text becomes a real executed call.
-fn completeFim(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const u8, base_url: []const u8, key: []const u8, model: []const u8, messages_json: []const u8, tools_json: []const u8, max_tokens: u32, temperature: f32) Step {
-    const wire_model = model[0 .. model.len - ":fim".len];
-    var root = trimSlash(base_url);
-    if (std.mem.endsWith(u8, root, "/v1")) root = root[0 .. root.len - 3];
-    const url = std.fmt.allocPrint(gpa, "{s}/beta/completions", .{root}) catch return stepErr(gpa, "oom");
-    defer gpa.free(url);
-
-    const prompt = fimPromptOwned(gpa, messages_json, tools_json) catch return stepErr(gpa, "oom");
-    defer gpa.free(prompt);
-    var body: std.ArrayListUnmanaged(u8) = .empty;
-    defer body.deinit(gpa);
-    const built = blk: {
-        body.appendSlice(gpa, "{\"model\":") catch break :blk false;
-        jstr(gpa, &body, wire_model) catch break :blk false;
-        body.appendSlice(gpa, ",\"prompt\":") catch break :blk false;
-        jstr(gpa, &body, prompt) catch break :blk false;
-        // EVERY turn label is a stop — "\nUser:" alone let the model write turn after turn of "Assistant: …".
-        // (DeepSeek allows up to 16 stop sequences; this uses 5.)
-        // Deliberately NOT stopped on "\nTool:", even though the model fabricates `Tool: {"ok":true,…}`
-        // results beneath its own calls: that same label IS its labelled call form ("Tool: pixel_search"), so
-        // a stop there would truncate the very call we are trying to recover. The fabrication is discarded
-        // downstream instead — recoverPlainCalls takes the FIRST call and ignores everything after it.
-        body.print(gpa, ",\"max_tokens\":{d},\"temperature\":{d:.2},\"stop\":[\"\\nUser:\",\"\\nAssistant:\",\"\\nSystem:\",\"\\nTool result:\",\"\\n\\nAssistant:\"]}}", .{ @min(max_tokens, 8192), temperature }) catch break :blk false;
-        break :blk true;
-    };
-    if (!built) return stepErr(gpa, "oom");
-
-    const t0 = std.Io.Timestamp.now(io, .real).nanoseconds;
-    const r = postUrl(gpa, io, run_dir, tag, url, key, body.items, true, @min(max_tokens, 8192));
-    const t1 = std.Io.Timestamp.now(io, .real);
-    if (!r.ok) return .{ .content = r.content, .reasoning = gpa.dupe(u8, "") catch @constCast(""), .calls = &.{}, .ok = false };
-    defer gpa.free(r.content);
-
-    const Resp = struct {
-        choices: []const struct { text: ?[]const u8 = null, finish_reason: ?[]const u8 = null } = &.{},
-        @"error": ?struct { message: []const u8 = "" } = null,
-    };
-    const parsed = std.json.parseFromSlice(Resp, gpa, r.content, .{ .ignore_unknown_fields = true }) catch
-        return stepErr(gpa, std.fmt.allocPrint(gpa, "bad FIM response: {s}", .{r.content[0..@min(r.content.len, 300)]}) catch "unparseable FIM response");
-    defer parsed.deinit();
-    if (parsed.value.@"error") |e| return stepErr(gpa, std.fmt.allocPrint(gpa, "provider error: {s}", .{e.message}) catch "provider error");
-    if (parsed.value.choices.len == 0) return stepErr(gpa, "no choices in FIM response");
-    const ch = parsed.value.choices[0];
-    const text = fimNormalize(std.mem.trim(u8, ch.text orelse "", " \r\n\t"));
-    const ms: u64 = @intCast(@max(@divTrunc(t1.nanoseconds - t0, std.time.ns_per_ms), 0));
-    logCall(t1.toSeconds(), tag, model, base_url, ms, 0, 0, 0);
-    return .{
-        .content = gpa.dupe(u8, text) catch return stepErr(gpa, "oom"),
-        .reasoning = gpa.dupe(u8, "") catch @constCast(""),
-        .calls = &.{},
-        .ok = true,
-        .truncated = if (ch.finish_reason) |fr| std.mem.eql(u8, fr, "length") else false,
-    };
-}
-
-/// Trim a completion back to ONE assistant turn: drop a leading label the model echoed, and cut at the first
-/// later turn label (the stop sequences catch most, but a provider may return text past a stop, and a label
-/// can appear as "\n\n\nAssistant:" which no fixed stop string matches). Slices the input — no allocation.
-fn fimNormalize(raw: []const u8) []const u8 {
-    var t = std.mem.trimStart(u8, raw, " \r\n\t");
-    // the cue itself, echoed back
-    inline for (.{ "Assistant:", "assistant:" }) |lbl| {
-        if (std.mem.startsWith(u8, t, lbl)) t = std.mem.trimStart(u8, t[lbl.len..], " \t");
-    }
-    var cut = t.len;
-    for ([_][]const u8{ "\nAssistant:", "\nUser:", "\nSystem:", "\nTool result:", "\nassistant:", "\nuser:" }) |lbl| {
-        if (std.mem.indexOf(u8, t, lbl)) |at| {
-            if (at < cut) cut = at;
-        }
-    }
-    return std.mem.trim(u8, t[0..cut], " \r\n\t");
-}
-
-/// The tool protocol taught to a raw-completion model: the Hermes text form that context.zig's markup
-/// recovery already parses into real calls. Rendered from the turn's OWN advertised schema (never a static
-/// list — that is the recall_hive bug class), so a FIM turn can only ever be told about tools it may call.
-/// Empty when the turn carries no tools. Owned.
-fn fimToolsBlockOwned(gpa: std.mem.Allocator, tools_json: []const u8) ![]u8 {
-    if (tools_json.len == 0) return gpa.dupe(u8, "");
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer out.deinit(gpa);
-    try out.appendSlice(gpa,
-        \\TOOLS. You cannot emit structured tool calls on this endpoint, so to USE a tool you WRITE it, in exactly this form, as the last thing in your reply:
-        \\<function=TOOL_NAME>
-        \\<parameter=ARG_NAME>value</parameter>
-        \\</function>
-        \\Emit it and STOP — the result comes back as "Tool result:" and you continue from there. NEVER narrate an
-        \\action you did not write a call for ("I'm clicking the button" with no <function=…> block does NOTHING).
-        \\Write ONE call at a time. Your tools this turn:
-    );
-    const wrapped = try std.fmt.allocPrint(gpa, "[{s}]", .{tools_json});
-    defer gpa.free(wrapped);
-    const Fn = struct {
-        function: struct { name: []const u8 = "", description: []const u8 = "", parameters: std.json.Value = .null } = .{},
-    };
-    if (std.json.parseFromSlice([]const Fn, gpa, wrapped, .{ .ignore_unknown_fields = true })) |parsed| {
-        defer parsed.deinit();
-        for (parsed.value) |f| {
-            if (f.function.name.len == 0) continue;
-            try out.appendSlice(gpa, "\n- ");
-            try out.appendSlice(gpa, f.function.name);
-            try out.append(gpa, '(');
-            var first = true;
-            if (f.function.parameters == .object) {
-                if (f.function.parameters.object.get("properties")) |props| {
-                    if (props == .object) {
-                        for (props.object.keys()) |k| {
-                            if (!first) try out.appendSlice(gpa, ", ");
-                            try out.appendSlice(gpa, k);
-                            first = false;
-                        }
-                    }
-                }
-            }
-            try out.append(gpa, ')');
-            const d = f.function.description;
-            if (d.len > 0) {
-                try out.appendSlice(gpa, " — ");
-                try out.appendSlice(gpa, d[0..@min(d.len, 110)]);
-            }
-        }
-    } else |_| return gpa.dupe(u8, ""); // unparseable schema ⇒ teach no protocol rather than a wrong one
-    return out.toOwnedSlice(gpa);
-}
-
-/// Flatten an OpenAI messages-array body (the inside of "messages":[…]) into labeled plain text for the FIM
-/// prompt: "System: …\n\nUser: …\n\nAssistant: …", ending with the bare "Assistant:" cue the completion
-/// finishes. Tool rows fold in as "Tool result: …" so an agentic history still reads coherently. Owned.
-fn fimPromptOwned(gpa: std.mem.Allocator, messages_json: []const u8, tools_json: []const u8) ![]u8 {
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer out.deinit(gpa);
-    const wrapped = try std.fmt.allocPrint(gpa, "[{s}]", .{messages_json});
-    defer gpa.free(wrapped);
-    const Row = struct { role: []const u8 = "", content: ?[]const u8 = null };
-    if (std.json.parseFromSlice([]const Row, gpa, wrapped, .{ .ignore_unknown_fields = true })) |parsed| {
-        defer parsed.deinit();
-        for (parsed.value) |row| {
-            const c = std.mem.trim(u8, row.content orelse "", " \r\n\t");
-            if (c.len == 0) continue; // assistant tool_call shells carry no prose
-            const label: []const u8 = if (std.mem.eql(u8, row.role, "system"))
-                "System: "
-            else if (std.mem.eql(u8, row.role, "assistant"))
-                "Assistant: "
-            else if (std.mem.eql(u8, row.role, "tool"))
-                "Tool result: "
-            else
-                "User: ";
-            if (out.items.len > 0) try out.appendSlice(gpa, "\n\n");
-            try out.appendSlice(gpa, label);
-            try out.appendSlice(gpa, c);
-        }
-    } else |_| {
-        // unparseable history (should not happen — we built it): fall back to the raw bytes as one block
-        try out.appendSlice(gpa, messages_json);
-    }
-    // the tool protocol rides AFTER the history and before the cue — closest to the point of decision
-    const tb = try fimToolsBlockOwned(gpa, tools_json);
-    defer gpa.free(tb);
-    if (tb.len > 0) {
-        try out.appendSlice(gpa, "\n\n");
-        try out.appendSlice(gpa, tb);
-    }
-    try out.appendSlice(gpa, "\n\nAssistant:");
-    return out.toOwnedSlice(gpa);
 }
 
 fn completeOllamaNative(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const u8, base_url: []const u8, key: []const u8, model: []const u8, messages_json: []const u8, tools_json: []const u8, max_tokens: u32, temperature: f32) Step {
@@ -2244,9 +2056,6 @@ pub fn completeStream(
     // waiting out the whole generation. null ⇒ never aborts.
     should_abort: ?*const fn (ctx: *anyopaque) bool,
 ) Step {
-    // FIM models never stream here (the beta completions endpoint speaks a different frame shape) — route
-    // straight to the blocking path, which owns the FIM dispatch. The reply simply arrives in one piece.
-    if (isFimModel(model)) return complete(gpa, io, run_dir, tag, base_url, key, model, messages_json, tools_json, max_tokens, temperature);
     return streamAttempt(gpa, io, run_dir, tag, base_url, key, model, messages_json, tools_json, max_tokens, temperature, ctx, on_delta, should_abort) orelse
         complete(gpa, io, run_dir, tag, base_url, key, model, messages_json, tools_json, max_tokens, temperature);
 }
@@ -2761,64 +2570,6 @@ test "parseOllamaNative re-serializes an arguments OBJECT into a JSON-string Too
     // as "(no desk/CLI client picked up …)" — the wall that made local models' tools look broken.
     try std.testing.expect(step.calls[0].id.len > 2);
     try std.testing.expect(std.mem.startsWith(u8, step.calls[0].id, "tc"));
-}
-
-test "fimPromptOwned: labeled turns + trailing Assistant cue; tool rows fold in; call shells drop" {
-    const gpa = std.testing.allocator;
-    const msgs =
-        \\{"role":"system","content":"You are veil."},{"role":"user","content":"weather in Newmarket?"},
-        \\{"role":"assistant","content":"","tool_calls":[{"id":"tc1","type":"function","function":{"name":"web_search","arguments":"{}"}}]},
-        \\{"role":"tool","tool_call_id":"tc1","content":"24C sunny"},{"role":"assistant","content":"It is 24C."}
-    ;
-    const p = try fimPromptOwned(gpa, msgs, "");
-    defer gpa.free(p);
-    try std.testing.expect(std.mem.indexOf(u8, p, "System: You are veil.") != null);
-    try std.testing.expect(std.mem.indexOf(u8, p, "User: weather in Newmarket?") != null);
-    try std.testing.expect(std.mem.indexOf(u8, p, "Tool result: 24C sunny") != null);
-    try std.testing.expect(std.mem.indexOf(u8, p, "Assistant: It is 24C.") != null);
-    try std.testing.expect(std.mem.endsWith(u8, p, "\n\nAssistant:")); // the completion cue
-    // exactly TWO "Assistant:" occurrences — the real turn + the trailing cue; the empty-content
-    // tool_call shell contributed no ghost turn
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, p, "Assistant:"));
-
-    try std.testing.expect(isFimModel("deepseek-v4-pro:fim"));
-    try std.testing.expect(!isFimModel("deepseek-v4-pro"));
-    try std.testing.expect(!isFimModel("deepseek-chat"));
-}
-
-test "fimNormalize: one turn only — echoed cue dropped, later turn labels cut" {
-    // THE OBSERVED BUG: a completion model given an "Assistant:" cue writes turn after turn, each labeled,
-    // narrating actions it never took. Only the first turn is this reply.
-    const wall = "I'm navigating to the profile.\n\nAssistant: Let me look at the posts.\n\nAssistant: I'm scrolling.";
-    try std.testing.expectEqualStrings("I'm navigating to the profile.", fimNormalize(wall));
-    // an echoed leading cue is dropped
-    try std.testing.expectEqualStrings("hello there", fimNormalize("Assistant: hello there"));
-    try std.testing.expectEqualStrings("hello", fimNormalize("  \n Assistant:   hello\n\n"));
-    // a label no fixed stop string matches (extra blank lines) is still cut
-    try std.testing.expectEqualStrings("done.", fimNormalize("done.\n\n\nAssistant: more"));
-    // the model writing the USER's next turn is cut too
-    try std.testing.expectEqualStrings("the answer is 4", fimNormalize("the answer is 4\nUser: thanks"));
-    // ordinary prose that merely CONTAINS the word is untouched
-    try std.testing.expectEqualStrings("Ask your assistant: it knows.", fimNormalize("Ask your assistant: it knows."));
-    try std.testing.expectEqualStrings("", fimNormalize("   "));
-}
-
-test "fimToolsBlockOwned: renders the TURN's own schema as the Hermes form recovery parses" {
-    const gpa = std.testing.allocator;
-    const tools =
-        \\{"type":"function","function":{"name":"web_search","description":"search the web","parameters":{"type":"object","properties":{"query":{"type":"string"},"limit":{"type":"integer"}},"required":["query"]}}},
-        \\{"type":"function","function":{"name":"read_file","description":"read a file","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}}
-    ;
-    const b = try fimToolsBlockOwned(gpa, tools);
-    defer gpa.free(b);
-    try std.testing.expect(std.mem.indexOf(u8, b, "<function=TOOL_NAME>") != null); // the exact grammar
-    try std.testing.expect(std.mem.indexOf(u8, b, "<parameter=ARG_NAME>") != null);
-    try std.testing.expect(std.mem.indexOf(u8, b, "- web_search(query, limit)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, b, "- read_file(path)") != null);
-    // a turn with NO tools is taught no protocol (a FIM turn must not be told about tools it can't call)
-    const empty = try fimToolsBlockOwned(gpa, "");
-    defer gpa.free(empty);
-    try std.testing.expectEqual(@as(usize, 0), empty.len);
 }
 
 test "mintCallId: non-empty, tc-prefixed, and unique across calls" {

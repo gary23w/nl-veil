@@ -1957,7 +1957,6 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     // afk OUTRANKS the plan cap: an afk turn whose message decomposed into a plan must still run until Stop (it
     // walks the plan, then keeps driving free-form) — not halt at PLAN_STEPS_PER_TURN, which would violate afk.
     var max_steps: usize = if (afk) AFK_MAX_STEPS else if (has_plan) PLAN_STEPS_PER_TURN else if (armed) LOOP_MAX_STEPS else DRIVE_MAX;
-    var fim_nudged = false; // the one-shot "you narrated, you did not call" correction (raw-completion models)
     var idle_steps: usize = 0; // consecutive no-tool drive steps — the armed (non-afk) anti-spin bound (desk loop_idle)
     var verified_done = false; // TERMINAL BUILD-VERIFY fires at most once per turn (desk arc_final_verified)
     var swarm_timeout_nudged = false; // SWARM_TIMEOUT_MSG fires at most once per turn — after that a stuck hive can't hold the turn open forever
@@ -2165,7 +2164,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
 
         // WATERMARK FOLD on the committed answer: the streamed deltas were folded at the edge, but the
         // settled text takes its own path into the transcript, the .hist archive, memory, and the narrator —
-        // and a non-streamed reply (FIM, a hosted tool-call step) never passed the delta fold at all.
+        // and a non-streamed reply (a hosted tool-call step) never passed the delta fold at all.
         if (wmScrubOwned(gpa, answer)) |clean| {
             gpa.free(answer);
             answer = clean;
@@ -2312,28 +2311,6 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
 
         // ANTI-SPIN / FAST-PATH: a step that ran NO tools did no agentic work this pass.
         if (!inner.tools_ran) {
-            // RAW-COMPLETION CORRECTION, checked BEFORE either branch decides to end the turn. A FIM model has
-            // no tool_calls channel, so a call exists only if it WROTE one and the text recovery caught it;
-            // when recovery misses, the step is indistinguishable from a finished answer.
-            //
-            // This sits above the armed/unarmed split because the UNARMED path is where it actually kills a
-            // turn: with auto-loop OFF, `drive == 0` ends the turn on the FIRST tool-less step, so the armed
-            // idle-step counter (and the correction that used to live only there) was never reached. Observed
-            // live as the last message of three conversations — "I'll scroll down your feed to load more
-            // posts", "I need to find the post. Let me…" — each ending clean, mid-task, with no error.
-            //
-            // Gated three ways so it cannot spin or touch anything else: FIM only (the ':fim' id suffix), once
-            // per turn (`fim_nudged`), and only when the reply ANNOUNCES an action it did not take, so an
-            // ordinary FIM answer still ends the turn immediately.
-            if (!fim_nudged and llm.isFimModel(trio.coding.model) and looksLikeUnactedIntent(inner.content)) {
-                fim_nudged = true;
-                idle_steps = 0;
-                conv_buf.appendSlice(gpa, ",{\"role\":\"user\",\"content\":") catch break :outer;
-                http.jstr(gpa, &conv_buf, "(engine: you DESCRIBED an action but did not CALL a tool, so nothing ran and the user saw only your sentence. Narration does not act. If you meant to act, write the call NOW as the last thing in your reply, exactly:\n<function=TOOL_NAME>\n<parameter=ARG_NAME>value</parameter>\n</function>\nand stop there. If you did not mean to act, say so plainly instead.)") catch break :outer;
-                conv_buf.append(gpa, '}') catch break :outer;
-                emitKV(app, conv_dir, "status", "text", "no tool ran — asking for the call itself");
-                continue :outer;
-            }
             if (!armed) {
                 // OFF: a first-step no-plan answer with no tools is a complete one-shot reply (plain Q&A) — end now,
                 // skipping the wasted LOOP_QUESTION round-trip. (A drive>0 no-tools step falls through to the DONE
@@ -5440,23 +5417,6 @@ fn answerTool(app: *App, uid: u64, args: []const u8) []u8 {
     return gpa.dupe(u8, "{\"ok\":true,\"tool\":\"answer_swarm\",\"note\":\"answer delivered to the mind's inbox; it reads it on its next round\"}") catch emptyRes();
 }
 
-/// Does this reply ANNOUNCE an action it did not take? The raw-completion failure in one sentence: the model
-/// writes "Let me scroll down your feed" and runs nothing, and because a tool-less step reads as a finished
-/// answer the turn ends there — mid-task, with no error. Observed as the LAST message of three separate live
-/// conversations ("I'll scroll down your feed…", "I need to find the post. Let me…", "Let me look at the
-/// posts…").
-///
-/// Only used to decide whether a FIM turn has earned ONE corrective re-ask, so a false positive costs a single
-/// inference and a false negative costs what happens today. Deliberately narrow: first-person intent phrasing
-/// only, checked over a clipped head so a long essay that happens to contain "I'll" late is not swept in.
-fn looksLikeUnactedIntent(s: []const u8) bool {
-    const t = std.mem.trim(u8, s, " \r\n\t");
-    if (t.len == 0 or t.len > 1200) return false; // a long reply is an ANSWER, not an announcement
-    const markers = [_][]const u8{ "Let me ", "let me ", "I'll ", "I will ", "I'm going to", "I am going to", "Now let me", "Next, I'll", "I'm opening", "I'm clicking", "I'm scrolling", "I'm navigating", "I need to find" };
-    for (markers) |m| if (std.mem.indexOf(u8, t, m) != null) return true;
-    return false;
-}
-
 /// Tools whose half-executed arguments CORRUPT state (a truncated write lands a half file that reads as
 /// complete; a truncated delete could name a shorter-but-real path). Reads are deliberately absent: a cut-off
 /// search query just searches worse, and refusing it would cost a round for nothing.
@@ -6348,24 +6308,8 @@ fn runInnerAgentic(
         // The transport then returns it as plain content with NO calls, so no tool runs, the markup leaks into the
         // reply, and the drive loop churns on it. Recover the call(s) from the markup + strip it from the content,
         // so the tool actually executes and the turn makes progress.
-        // PLAIN-TEXT fallback (recoverPlainCalls): a raw-completion model with no tool_calls channel writes
-        // its call as "browser_click\nref: 27" rather than markup, and every one of those became narration —
-        // the tool never ran and the turn re-described the same action. Gated on an EXACT advertised tool
-        // name, so prose cannot be mistaken for a call.
-        if (step.calls.len == 0) {
-            const rec_opt = blk_rec: {
-                if (cctx.looksLikeToolMarkup(step.content)) {
-                    if (cctx.recoverMarkupCalls(gpa, step.content)) |r| break :blk_rec r;
-                }
-                // FIM ONLY. Markup recovery above is safe for everyone (that markup is unambiguous), but the
-                // PLAIN-text scrape reads a bare line that equals a tool name as a call — and a model WITH a
-                // real tool_calls channel has no reason to write one, so for those it is pure downside: a
-                // reply that lists tool names on their own lines would fire a phantom call. Confine the
-                // raw-completion machinery to raw-completion models.
-                if (!llm.isFimModel(model)) break :blk_rec null;
-                break :blk_rec cctx.recoverPlainCalls(gpa, step.content, turn_tools);
-            };
-            if (rec_opt) |rec| {
+        if (step.calls.len == 0 and cctx.looksLikeToolMarkup(step.content)) {
+            if (cctx.recoverMarkupCalls(gpa, step.content)) |rec| {
                 var built: std.ArrayListUnmanaged(llm.ToolCall) = .empty;
                 for (rec.calls) |rc| {
                     // MINT, never "": markup never carries an id, and an id-less call cannot round-trip the
@@ -8448,20 +8392,4 @@ test "the loop hard stop is reachable before MAX_ITERS, or it is dead code" {
     const t = std.testing;
     try t.expect(LOOP_STOP_REFUSALS > 1);
     try t.expect(ECHO_LIMIT > 1);
-}
-
-test "looksLikeUnactedIntent: announced-but-not-taken actions, from the live transcripts" {
-    // the three real last-messages of conversations that died mid-task on a FIM turn
-    try std.testing.expect(looksLikeUnactedIntent("I'll scroll down your feed to load more posts and spot tech content."));
-    try std.testing.expect(looksLikeUnactedIntent("I need to find the \"Switch to Linux\" post on the page. Let me read it."));
-    try std.testing.expect(looksLikeUnactedIntent("Let me look at the posts on this profile to find the right one."));
-    try std.testing.expect(looksLikeUnactedIntent("I'm clicking the Follow button for @sureailabs (ref 45)."));
-    // a real ANSWER must still end the turn immediately — no wasted correction round-trip
-    try std.testing.expect(!looksLikeUnactedIntent("The weather in Newmarket today is 24C and sunny."));
-    try std.testing.expect(!looksLikeUnactedIntent("Done for today. Here's the rundown: posted 3 replies, bookmarked 4 posts."));
-    try std.testing.expect(!looksLikeUnactedIntent("Yes, that is correct."));
-    try std.testing.expect(!looksLikeUnactedIntent(""));
-    // a long essay is an answer even if it contains the phrasing somewhere
-    const long = "I'll explain. " ++ ("The architecture separates the transport from the engine. " ** 40);
-    try std.testing.expect(!looksLikeUnactedIntent(long));
 }

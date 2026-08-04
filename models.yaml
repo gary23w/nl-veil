@@ -126,12 +126,16 @@ providers:
         label: DeepSeek V4 Pro
       - id: deepseek-chat
         label: DeepSeek Chat
-      # Appended (ORDER MATTERS — see the header). The ":fim" suffix is a ROUTING SIGNAL, not part of the
-      # provider's model id: llm.zig strips it and sends the request to DeepSeek's beta FIM/completions
-      # endpoint (POST {root}/beta/completions — prompt in, text out) instead of chat/completions. No tool
-      # calls on this path — the model answers in plain text; pick it for completion-style work.
-      - id: deepseek-v4-pro:fim
-        label: DeepSeek V4 Pro FIM (beta completions)
+      # NO ":fim" ENTRY HERE, deliberately. A `deepseek-v4-pro:fim` option shipped briefly and was removed:
+      # DeepSeek's /beta/completions is Fill-In-the-Middle, which its own guide describes as "commonly used
+      # for content completion, code completion" and NOT for chat — `prompt` is a code PREFIX and `suffix` is
+      # the code that follows, capped at 4K. Selecting it as a chat role meant feeding a flattened transcript
+      # to a code-completion endpoint that has no tool_calls channel, so the model could only ever NARRATE
+      # actions ("Let me click the button") while nothing ran, and it happily completed the rest of the
+      # transcript — inventing extra Assistant turns and fake tool results. deepseek-v4-pro above is the SAME
+      # model on /chat/completions with a real tool channel; use that for chat.
+      # If FIM is wanted, it belongs behind a code-completion feature that sends a real prompt/suffix pair,
+      # not in the model dropdown. Docs: https://api-docs.deepseek.com/guides/fim_completion/
 
   - key: google
     label: Google Gemini
