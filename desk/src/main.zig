@@ -15,6 +15,7 @@ const llm = @import("llm.zig");
 const tray_mod = @import("tray.zig");
 const catalog = @import("catalog.zig");
 const md = @import("mdutil.zig");
+const watchdog = @import("watchdog.zig");
 const log = @import("log.zig");
 const assets = @import("assets.zig");
 
@@ -564,7 +565,14 @@ pub fn runApp(data_dir: ?[]const u8) !void {
     var sim_mode = false;
 
     var auto_selected = false;
+    // FRAME WATCHDOG: a UI freeze leaves no panic, no dump and no stack — Windows just logs
+    // "stopped interacting with Windows and was closed" and kills us (twice in one day on this machine).
+    // The only witness possible is a thread that is NOT the frozen one, so start one; it costs two relaxed
+    // atomic stores per frame and turns the next freeze into a log line naming the section it died in.
+    watchdog.start(chat_threaded.io());
+    defer watchdog.stop();
     while (true) {
+        watchdog.beat(.idle_start);
         if (rl.windowShouldClose()) {
             _ = rl.saveFileText("data/desk-exit-reason.txt", "windowShouldClose (OS WM_CLOSE / no interactive desktop)");
             break;
@@ -789,6 +797,7 @@ pub fn runApp(data_dir: ?[]const u8) !void {
                 } else |_| {}
             }
         }
+        watchdog.mark(.input);
         handleWindowChrome();
         handleKeys(&store);
 
@@ -805,11 +814,20 @@ pub fn runApp(data_dir: ?[]const u8) !void {
         }
 
         rl.beginDrawing();
-        defer rl.endDrawing();
+        // GL SWAP is the LAST thing a frame does and the one place a stall means the graphics driver rather
+        // than our code — so mark it in the defer, which runs at the swap. On this machine that distinction
+        // is load-bearing: there is a confirmed nvoglv64.dll fault today and a hybrid AMD + NVIDIA setup.
+        defer {
+            watchdog.mark(.gl_swap);
+            rl.endDrawing();
+            watchdog.frameDone();
+        }
         rl.clearBackground(t.bg);
 
+        watchdog.mark(.draw_chrome);
         drawTitlebar(&store);
         drawTabbar(&store);
+        watchdog.mark(.draw_tab);
         const top = TITLE_H + TAB_H;
         const body = t.Rect{ .x = 0, .y = top, .width = @floatFromInt(rl.getScreenWidth()), .height = @floatFromInt(rl.getScreenHeight() - top) };
         switch (ui.tab) {
