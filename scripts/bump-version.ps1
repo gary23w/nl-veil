@@ -3,10 +3,16 @@
 #
 # Locations:
 #   build.zig.zon                 .version = "X"
+#   desk\build.zig.zon            .version = "X"   (the desk package's own manifest — it was missing from
+#                                 this list AND from check.sh's drift echo, so it silently sat at 1.0.0
+#                                 through every alpha; a stamp nothing checks is a stamp that drifts)
 #   src\main.zig                  const VERSION = "X"   (served at /api/v1/health + startup banner)
 #   bin\MANIFEST.txt              every literal occurrence of the old version
 #   .github\workflows\release.yml body_path: docs/release/RELEASE-vX.md
 #   docs\release\RELEASE-vX.md    stub created if missing (fill it before tagging)
+#
+# NOT here, on purpose: scripts\build-release.{sh,ps1} and scripts\build-official.sh all READ the literal
+# out of src\main.zig at run time, so they cannot drift and must not be stamped.
 #
 #   .\scripts\bump-version.ps1 1.1.0            apply
 #   .\scripts\bump-version.ps1 1.1.0 -DryRun    show what would change, write nothing
@@ -35,9 +41,17 @@ Write-Host "bump: $old -> $Version" -ForegroundColor Cyan
 
 $edits = @(
     @{ file = $zon;                                          find = '(\.version\s*=\s*")[^"]+(")';        repl = "`${1}$Version`${2}" },
+    @{ file = (Join-Path $repo "desk\build.zig.zon");        find = '(\.version\s*=\s*")[^"]+(")';        repl = "`${1}$Version`${2}" },
     @{ file = (Join-Path $repo "src\main.zig");              find = '(const VERSION\s*=\s*")[^"]+(")';    repl = "`${1}$Version`${2}" },
     @{ file = (Join-Path $repo "bin\MANIFEST.txt");          find = [regex]::Escape($old);                repl = $Version },
-    @{ file = (Join-Path $repo ".github\workflows\release.yml"); find = 'RELEASE-v[^\s]+\.md';            repl = "RELEASE-v$Version.md" }
+    @{ file = (Join-Path $repo ".github\workflows\release.yml"); find = 'RELEASE-v[^\s]+\.md';            repl = "RELEASE-v$Version.md" },
+    # The download links point at an EXPLICIT tag, not /releases/latest, and so they have to move with the
+    # version. /releases/latest was the obvious spelling and it was wrong: GitHub skips prereleases when
+    # resolving it, every app release so far has been one, and the link therefore resolved to whichever
+    # non-prerelease happened to be newest -- a `builtin-assets-*` blob with one irrelevant file in it. Every
+    # Download button on the README and the docs site sent people there. An explicit tag cannot do that.
+    @{ file = (Join-Path $repo "README.md");                 find = 'releases/tag/v[^\s")]+';             repl = "releases/tag/v$Version" },
+    @{ file = (Join-Path $repo "docs\index.html");           find = 'releases/tag/v[^\s")]+';             repl = "releases/tag/v$Version" }
 )
 
 $failed = $false

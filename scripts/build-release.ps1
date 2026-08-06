@@ -12,7 +12,14 @@
 # ============================================================================
 $ErrorActionPreference = 'Stop'
 $Root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
-$Version = if ($env:VERSION) { $env:VERSION } else { '1.0.0' }
+# Read the version from the BINARY'S OWN literal (same as build-official.sh) rather than hardcoding it: a
+# second hardcoded default drifts the moment src/main.zig is bumped for a release, and the artifacts this
+# script names would keep the old number. $env:VERSION still wins when set.
+$Version = if ($env:VERSION) { $env:VERSION } else {
+  $m = Select-String -Path (Join-Path $Root 'src/main.zig') -Pattern '^const VERSION = "(.*)";$' | Select-Object -First 1
+  if (-not $m) { throw 'could not read VERSION from src/main.zig' }
+  $m.Matches[0].Groups[1].Value
+}
 $Dist = Join-Path $Root 'dist'
 $Os = 'windows'; $Arch = 'x86_64'
 

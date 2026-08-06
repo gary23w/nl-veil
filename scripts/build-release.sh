@@ -23,7 +23,12 @@
 set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-VERSION=${VERSION:-1.0.0}
+# Read the version from the BINARY'S OWN literal (same as build-official.sh) rather than hardcoding it here.
+# A second hardcoded default is a drift bug waiting to happen: bump src/main.zig for a release and this script
+# goes on stamping the old number onto the artifacts it names. One source of truth, so a release cannot
+# disagree with itself. An explicit VERSION= in the environment still wins.
+VERSION=${VERSION:-$(sed -n 's/^const VERSION = "\(.*\)";$/\1/p' "$ROOT/src/main.zig" | head -1)}
+[ -n "$VERSION" ] || { echo "could not read VERSION from src/main.zig"; exit 1; }
 ZIG=${ZIG:-zig}
 DIST="$ROOT/dist"
 

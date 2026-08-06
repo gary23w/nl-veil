@@ -66,7 +66,10 @@ pub const std_options: std.Options = .{ .unexpected_error_tracing = false, .log_
 
 const log = std.log.scoped(.server);
 
-const VERSION = "1.0.0";
+// THE single source of release identity. scripts/build-official.sh seds this literal out of this file to
+// name every artifact (veil-v<VERSION>-<os>-<arch>.zip, veil-server-v<VERSION>-…), so the binary can never
+// report a version its own bundle disagrees with. Bump it here and the whole release follows.
+const VERSION = "1.0.1-beta-1";
 
 const ASSET_HTML = @embedFile("index.html");
 const ASSET_JS = @embedFile("app.js");

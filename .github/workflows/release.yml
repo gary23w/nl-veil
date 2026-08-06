@@ -53,10 +53,15 @@ jobs:
           # Each runner contributes the FULL native bundle for its own OS — the only way to ship veil-desk
           # (raylib links the platform GUI stack) and neuron (Rust) per platform. `xc: yes` additionally
           # cross-compiles the standalone SERVER for every target; one runner doing that is enough.
-          - { os: windows-latest, name: windows-x86_64, xc: 'no'  }
-          - { os: ubuntu-latest,  name: linux-x86_64,   xc: 'yes' }
-          - { os: macos-14,       name: macos-arm64,    xc: 'no'  }
-          - { os: macos-13,       name: macos-x86_64,   xc: 'no'  }
+          - { os: windows-latest,  name: windows-x86_64, xc: 'no'  }
+          - { os: ubuntu-latest,   name: linux-x86_64,   xc: 'yes' }
+          - { os: macos-14,        name: macos-arm64,    xc: 'no'  }
+          # macos-15-intel, NOT macos-13. GitHub retired the macOS 13 Intel runners, and a job asking for a
+          # label that no longer exists does not fail loudly — it queues until the run is cancelled. That is
+          # exactly what happened on every tag from alpha.6 through alpha.10: the other three bundles built
+          # and attached, this job was silently cancelled, and each release page shipped three bundles while
+          # its download table promised four. macos-15-intel is the current free-tier Intel label.
+          - { os: macos-15-intel,  name: macos-x86_64,   xc: 'no'  }
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout nl-veil
@@ -122,9 +127,9 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           # Bump this to the current release's notes on every tag (one notes file per release under docs/release/).
-          body_path: docs/release/RELEASE-v1.0.0-alpha.10.md
-          # ALPHA: ships a known default admin password (changeme) and the web UI is not yet at desk parity.
-          # Pre-release keeps it out of "Latest release" until v1.0.0 proper.
+          body_path: docs/release/RELEASE-v1.0.1-beta-1.md
+          # BETA: the web UI is not yet at desk parity, and the builds are unsigned. Pre-release keeps it out
+          # of "Latest release" until a signed stable.
           prerelease: true
           files: |
             bin/*.zip

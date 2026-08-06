@@ -214,11 +214,14 @@ if ($Scan) {
     $vZon  = (Select-String -Path (Join-Path $repo "build.zig.zon") -Pattern '\.version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
     $vMain = (Select-String -Path (Join-Path $repo "src\main.zig")  -Pattern 'VERSION\s*=\s*"([^"]+)"'   | Select-Object -First 1).Matches[0].Groups[1].Value
     $relNotes = (Select-String -Path (Join-Path $repo ".github\workflows\release.yml") -Pattern 'RELEASE-v([^\s]+)\.md' | Select-Object -First 1).Matches[0].Groups[1].Value
-    if ($vZon -ne $vMain) {
+    # desk\build.zig.zon is checked too (twin of the same addition in check.sh): it was in NEITHER drift echo
+    # nor bump-version.ps1's edit list, so it sat at 1.0.0 through every alpha while the root manifest moved.
+    $vDesk = (Select-String -Path (Join-Path $repo "desk\build.zig.zon") -Pattern '\.version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+    if ($vZon -ne $vMain -or $vDesk -ne $vMain) {
         $signals++
-        Write-Host "[version] build.zig.zon=$vZon vs src/main.zig=$vMain -- stamp both" -ForegroundColor Yellow
+        Write-Host "[version] build.zig.zon=$vZon desk/build.zig.zon=$vDesk vs src/main.zig=$vMain -- stamp all three" -ForegroundColor Yellow
     } else {
-        Write-Host "[version] $vZon (zon matches main.zig; release notes pinned at v$relNotes)" -ForegroundColor Green
+        Write-Host "[version] $vZon (zon + desk/zon match main.zig; release notes pinned at v$relNotes)" -ForegroundColor Green
     }
     # MANIFEST must always carry the current version (the notes pointer above deliberately lags
     # until the next bump; MANIFEST does not get that excuse).
@@ -226,6 +229,18 @@ if ($Scan) {
     if ((Test-Path $manifest) -and (-not (Select-String -Path $manifest -Pattern ([regex]::Escape($vZon)) -Quiet))) {
         $signals++
         Write-Host "[version] bin/MANIFEST.txt carries no '$vZon' stamp -- run scripts\bump-version.ps1" -ForegroundColor Yellow
+    }
+    # Download links (twin of the same check in check.sh). They name an explicit release tag because
+    # /releases/latest resolves by SKIPPING prereleases -- every app release so far has been one, so those
+    # buttons pointed at a `builtin-assets-*` blob rather than the app. Explicit is right, but it drifts.
+    $badLinks = @(Select-String -Path (Join-Path $repo "README.md"), (Join-Path $repo "docs\index.html") `
+        -Pattern 'releases/tag/v([^\s")]+)' -AllMatches |
+        ForEach-Object { $_.Matches } | Where-Object { $_.Groups[1].Value -ne $vMain })
+    if ($badLinks.Count -gt 0) {
+        $signals++
+        Write-Host "[links] $($badLinks.Count) download link(s) in README/docs point at a tag other than v$vMain" -ForegroundColor Yellow
+    } else {
+        Write-Host "[links] download links point at v$vMain" -ForegroundColor Green
     }
 
     # 4) docs mirror drift: docs/docs-src/ carries one .md per module; new/renamed modules rot it.
@@ -340,7 +355,12 @@ if ($Scan) {
     $shPath = Join-Path $repo "scripts\check.sh"
     $sh_names = @()
     if (Test-Path $shPath) {
-        $sh_names = (Select-String -Path $shPath -Pattern '^\s*gate "([^"]+)"' -AllMatches).Matches | ForEach-Object { $_.Groups[1].Value }
+        # gate_build too, not just gate. check.sh grew a STRICT variant (it refuses to read exit 0 as success
+        # when the log names a failed step), and the two build gates moved onto it. This pattern matched only
+        # the bare `gate "` spelling, so both build gates vanished from the sh side and the parity signal
+        # reported permanent drift between two files that agree -- a false red you learn to scroll past,
+        # which is exactly how the signal stops working.
+        $sh_names = (Select-String -Path $shPath -Pattern '^\s*gate(?:_build)? "([^"]+)"' -AllMatches).Matches | ForEach-Object { $_.Groups[1].Value }
     }
     $a = Gate-Keys $ps1_names
     $b = Gate-Keys $sh_names
