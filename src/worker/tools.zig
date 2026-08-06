@@ -1525,6 +1525,19 @@ fn executeInner(ctx: *ToolCtx, name: []const u8, args_json: []const u8) []u8 {
         defer if (dur.len > 0) gpa.free(dur);
         if (r.len == 0) {
             gpa.free(r);
+            // SEMANTIC RESCUE: the spread found no lexically-linked facts. Before declaring
+            // emptiness — an empty tool result reads as an authoritative "no" to the model and
+            // overrides its own context (the durableRecall lesson, one shelf up) — ask flat
+            // recall, whose semantic fallback + topic gate (neuron-db `semantic`/`semantic-db`)
+            // can resolve a paraphrase that shares NO words with the stored fact. A lexical-only
+            // neuron binary misses here identically, so this join is fail-open by construction.
+            const one = ctx.mem.recall(cpaths.scopeFamilyBase(ctx.scope), p.value.query);
+            defer if (one.len > 0) gpa.free(one);
+            const one_t = std.mem.trim(u8, one, " \r\n\t");
+            if (one_t.len > 0) {
+                if (dur.len == 0) return std.fmt.allocPrint(gpa, "recalled by MEANING (no exact-word match — verify it fits the ask):\n{s}", .{one_t}) catch dupe(gpa, "(nothing recalled yet)");
+                return std.fmt.allocPrint(gpa, "{s}\nrecalled by MEANING (no exact-word match — verify it fits the ask):\n{s}", .{ dur, one_t }) catch dupe(gpa, dur);
+            }
             if (dur.len == 0) return dupe(gpa, "(nothing recalled yet)");
             return dupe(gpa, dur);
         }
