@@ -6,7 +6,7 @@
 
 <p>
   <a href="https://github.com/gary23w/nl-veil/actions/workflows/release.yml"><img alt="build" src="https://github.com/gary23w/nl-veil/actions/workflows/release.yml/badge.svg"></a>
-  <a href="https://github.com/gary23w/nl-veil/releases/latest"><img alt="release" src="https://img.shields.io/badge/release-v1.0.0--alpha.10-A8241B"></a>
+  <a href="https://github.com/gary23w/nl-veil/releases"><img alt="release" src="https://img.shields.io/badge/release-v1.0.1--beta--1-A8241B"></a>
   <img alt="zig" src="https://img.shields.io/badge/zig-0.16-F7A41D?logo=zig&logoColor=white">
   <a href="https://huggingface.co/gary23w/the-veil-12b"><img alt="built-in model" src="https://img.shields.io/badge/built--in%20model-the--veil--12b-6E4A27?logo=huggingface&logoColor=white"></a>
   <a href="https://huggingface.co/gary23w/gary-neuron-emergent"><img alt="memory cortex" src="https://img.shields.io/badge/cortex-gary--neuron--emergent-6E4A27?logo=huggingface&logoColor=white"></a>
@@ -107,7 +107,7 @@ raylib is a *lazy* dependency, so `-Dapp=false` never fetches it at all.
 ## Install
 
 **Download it and run it — no toolchain, nothing to build.** Grab your platform's bundle from the
-**[latest release](https://github.com/gary23w/nl-veil/releases/latest)**, unzip, and run `veil`:
+**[latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.0.1-beta-1)**, unzip, and run `veil`:
 
 | You're on | Download | Then run |
 |---|---|---|
@@ -123,9 +123,9 @@ That single action starts the local server **and** opens the desktop app.
 > `install.ps1` inside is a *developer* script. The `veil-server-…` assets are the **headless** server
 > for remote boxes — no desktop app.
 
-> **Alpha builds are unsigned.** Windows shows *"Windows protected your PC"* → **More info → Run
+> **Beta builds are unsigned.** Windows shows *"Windows protected your PC"* → **More info → Run
 > anyway**. macOS says the developer can't be verified → **right-click → Open** (or
-> `xattr -dr com.apple.quarantine <folder>`). Signing certificates are planned for v1.0.0 proper.
+> `xattr -dr com.apple.quarantine <folder>`). Signing certificates are still on the list.
 
 <details><summary><b>Build from source instead</b> — contributors (needs Zig 0.16+)</summary>
 
@@ -237,7 +237,7 @@ step 5** — the rest is about letting other people in.
 
 ### 1. Download and unblock it
 
-Grab the bundle for your OS from the [latest release](https://github.com/gary23w/nl-veil/releases/latest)
+Grab the bundle for your OS from the [latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.0.1-beta-1)
 and unzip it somewhere you'll find again. Builds are unsigned, so:
 
 - **Windows** shows *"Windows protected your PC"* → **More info** → **Run anyway**.
@@ -273,7 +273,7 @@ On startup the server prints one complete URL per address this machine answers o
 (`src/main.zig:671-696`, using `src/config/lan.zig`):
 
 ```
-neuron-loops 1.0.0 on http://localhost:8787
+neuron-loops 1.0.1-beta-1 on http://localhost:8787
     open from another machine (phone, laptop) at:
       http://192.168.1.42:8787
 ```
@@ -997,7 +997,14 @@ dependency entirely rather than compiling it unused.
 
 ## Release
 
-Builds ship on the [Releases page](https://github.com/gary23w/nl-veil/releases/latest), one per
+**Current: [`v1.0.1-beta-1`](https://github.com/gary23w/nl-veil/releases/tag/v1.0.1-beta-1)** — the first
+beta, 38 commits past the last alpha. The veil brings its own model now (downloaded from Settings,
+GPU-accelerated, updated in place); long sessions hold together (the 15–25s freezes are gone, scrollback
+no longer destroys history, a waiting tool can't hold a turn open forever, local models can use tools
+again); replies come out in plain punctuation.
+[Full notes](docs/release/RELEASE-v1.0.1-beta-1.md).
+
+Builds ship on the [Releases page](https://github.com/gary23w/nl-veil/releases), one per
 platform. Unzip and run `veil` — that starts the server **and** opens the desktop app. No Python, no
 toolchain, no first-run build; the memory engine ships inside.
 

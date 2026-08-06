@@ -86,8 +86,17 @@ if [ "${1:-}" = "--scan" ]; then
   fi
   vz=$(sed -n 's/.*\.version = "\([^"]*\)".*/\1/p' build.zig.zon | head -1)
   vm=$(sed -n 's/.*VERSION = "\([^"]*\)".*/\1/p' src/main.zig | head -1)
-  if [ "$vz" = "$vm" ]; then echo "[version] $vz (zon matches main.zig)"; else echo "[version] zon=$vz main.zig=$vm -- stamp both (scripts/bump-version.ps1)"; fi
+  # desk/build.zig.zon is checked too: it was in NEITHER this echo nor bump-version.ps1's edit list, so it
+  # sat at 1.0.0 through every alpha while the root manifest moved. A stamp nothing checks is a stamp that
+  # drifts.
+  vd=$(sed -n 's/.*\.version = "\([^"]*\)".*/\1/p' desk/build.zig.zon | head -1)
+  if [ "$vz" = "$vm" ] && [ "$vd" = "$vm" ]; then echo "[version] $vz (zon + desk/zon match main.zig)"; else echo "[version] zon=$vz desk/zon=$vd main.zig=$vm -- stamp all three (scripts/bump-version.ps1)"; fi
   grep -q "$vz" bin/MANIFEST.txt || echo "[version] bin/MANIFEST.txt carries no '$vz' stamp"
+  # The docs' download links name an explicit release tag. They used to say /releases/latest, which GitHub
+  # resolves by SKIPPING prereleases -- and every app release so far has been one, so the buttons pointed at a
+  # `builtin-assets-*` blob instead of the app. An explicit tag is correct but has to move with the version.
+  bad=$(grep -roE 'releases/tag/v[^\s")]+' README.md docs/index.html | grep -v "releases/tag/v$vm\$" | wc -l | tr -d ' ')
+  if [ "$bad" = "0" ]; then echo "[links] download links point at v$vm"; else echo "[links] $bad download link(s) in README/docs point at a tag other than v$vm (scripts/bump-version.ps1)"; fi
   # Word-bounded on purpose: without \b this counted ten `\uXXXX` doc-comment hits as debt, and a
   # signal that always reports phantom work is one you learn to skip. Keep IDENTICAL to check.ps1's
   # pattern -- the oracle-parity signal compares GATES only, so scan drift is caught by nothing.
