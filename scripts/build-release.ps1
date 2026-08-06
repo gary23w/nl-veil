@@ -56,7 +56,7 @@ else {
   if ((Test-Path $core) -and (Get-Command cargo -ErrorAction SilentlyContinue)) {
     Say 'building the neuron memory engine (cargo --release)'
     Push-Location $core
-    cargo build --release --features "sqlite secure server trust"
+    cargo build --release --features "sqlite secure server trust semantic semantic-db fisher topics"
     Pop-Location
     $cand = Join-Path $core 'target\release\neuron.exe'
     if (Test-Path $cand) { $Neuron = $cand }

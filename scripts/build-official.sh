@@ -121,7 +121,7 @@ if [ -n "${NEURON:-}" ] && [ -f "$NEURON" ]; then neuron="$NEURON"
 elif [ -f "$ROOT/bin/neuron$EXE" ]; then neuron="$ROOT/bin/neuron$EXE"
 elif [ -d "$ROOT/../neuron-db/rust/neuron-core" ] && command -v cargo >/dev/null 2>&1; then
   say "building the neuron memory engine (cargo --release)"
-  ( cd "$ROOT/../neuron-db/rust/neuron-core" && cargo build --release --features "sqlite secure server trust" )
+  ( cd "$ROOT/../neuron-db/rust/neuron-core" && cargo build --release --features "sqlite secure server trust semantic semantic-db fisher topics" )
   cand="$ROOT/../neuron-db/rust/neuron-core/target/release/neuron$EXE"
   [ -f "$cand" ] && neuron="$cand"
 fi
