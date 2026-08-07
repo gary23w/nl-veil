@@ -108,6 +108,30 @@ const STUCK_SYSTEM =
 const STUCK_QUESTION =
     "Write that next instruction: 2-4 sentences, addressed to the worker as a command. If the blocker is a " ++
     "specific error or unknown, say to look THAT up by name first. Reply with ONLY the instruction.";
+
+/// AFK RE-DRIVE, WRITTEN BY THE PROMPTING ROLE. afk never accepts DONE, and what it posted back in DONE's
+/// place was AFK_DRIVE_TMPL — the identical sentence every cycle, no matter what the turn had just built,
+/// which is what the loop looked like from the outside ("keep going: re-verify the latest work end-to-end,
+/// then pick the most valuable next improvement"). The trio HAS a prompting slot for exactly this, and
+/// stuckStep already proves the pattern for the repeat case; this is its twin for the finished case.
+///
+/// It must ask a DIFFERENT question than the drive inference did. That one offered "next step, or DONE" and
+/// the model chose DONE, so re-asking it verbatim just gets DONE again — this one states that the work
+/// continues and asks what is genuinely most valuable NEXT, given what the transcript shows was just done.
+const AFK_NEXT_SYSTEM =
+    "You are reading the tail of an autonomous work loop whose worker has just declared the task finished. It " ++
+    "is not finished: this session runs until the human stops it, so there is always a next move. Look at what " ++
+    "was ACTUALLY just built or changed and name the single most valuable thing to do next — verify a specific " ++
+    "claim that has not been checked, harden a part that is thin, finish an edge the worker skipped, or extend " ++
+    "the work toward the goal. Be concrete about WHICH file, command, or behavior. Do not restate the goal, do " ++
+    "not congratulate, do not call tools, do not explain your reasoning.";
+const AFK_NEXT_QUESTION =
+    "Write that next instruction: 1-3 sentences, addressed to the worker as a command, naming the specific " ++
+    "target. Reply with ONLY the instruction.";
+/// What afk posts back when the prompting model cannot write one (dead backend, empty, tool markup, or it
+/// just said DONE again). Deliberately bare: a fixed paragraph pretending to be a considered next step is
+/// what this whole path is replacing, so the degraded case should look degraded.
+const AFK_KEEP_GOING = "keep going";
 /// SEARCH-QUERY FORMULATION (prompting). The swarm's scoutQuery text, kept deliberately close — it is the same
 /// job. Terms, not a sentence: a search engine matches documents, not questions.
 const SEARCH_QUERY_PROMPT =
@@ -2729,6 +2753,9 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
         // template. Freed at the end of the iteration, which is past every use of next_step below.
         var stuck_written: []u8 = &[_]u8{};
         defer if (stuck_written.len > 0) gpa.free(stuck_written);
+        // Same lifetime discipline for the afk re-drive instruction (see afkNextStep).
+        var afk_written: []u8 = &[_]u8{};
+        defer if (afk_written.len > 0) gpa.free(afk_written);
         // Same lifetime discipline for a mid-turn course correction (see the check below the DONE/repeat block).
         var course_written: ?[]u8 = null;
         defer if (course_written) |c| gpa.free(c);
@@ -2758,7 +2785,11 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
                         }
                     },
                 } else if (afk) {
-                    next_step = afk_msg; // afk never accepts DONE — re-verify + extend, re-grounded to the goal
+                    // afk never accepts DONE. The PROMPTING role writes what to do instead, from the transcript
+                    // tail that holds what was actually just built — the canned template is what a failed or
+                    // implausible write degrades to, not the first choice (same contract as stuckStep above).
+                    afk_written = afkNextStep(app, llm_dir, prompt, user_text, conv_buf.items) orelse &[_]u8{};
+                    next_step = if (afk_written.len > 0) afk_written else AFK_KEEP_GOING;
                 } else {
                     break :outer; // on: goal achieved, no hive in flight
                 }
@@ -7411,6 +7442,38 @@ fn stuckStep(app: *App, run_root: []const u8, p: Provider, goal: []const u8, rep
     if (t.len < 24 or t.len > 900) return null; // too vague to act on, or a plan rather than a step
     if (cctx.looksLikeToolMarkup(t)) return null; // it must write an INSTRUCTION, not emit a tool call
     if (nearlySame(t, repeated_step)) return null; // it just re-issued the step that is already stuck
+    return gpa.dupe(u8, t) catch null;
+}
+
+/// The afk re-drive instruction, written from the transcript tail by the PROMPTING role (see AFK_NEXT_SYSTEM).
+/// Mirrors stuckStep exactly — same context slice, same guards, same "null means fall back" contract; the
+/// caller posts AFK_KEEP_GOING when this returns null.
+fn afkNextStep(app: *App, run_root: []const u8, p: Provider, goal: []const u8, conv_items: []const u8) ?[]u8 {
+    const gpa = app.gpa;
+    var msgs: std.ArrayListUnmanaged(u8) = .empty;
+    defer msgs.deinit(gpa);
+    msgs.appendSlice(gpa, "{\"role\":\"system\",\"content\":") catch return null;
+    http.jstr(gpa, &msgs, AFK_NEXT_SYSTEM) catch return null;
+    msgs.appendSlice(gpa, "},") catch return null;
+    msgs.appendSlice(gpa, msgTail(conv_items, LOOP_CTX_BYTES)) catch return null;
+    var ask: std.ArrayListUnmanaged(u8) = .empty;
+    defer ask.deinit(gpa);
+    ask.appendSlice(gpa, "The goal: ") catch return null;
+    ask.appendSlice(gpa, clipBytes(goal, 400)) catch return null;
+    ask.append(gpa, '\n') catch return null;
+    ask.appendSlice(gpa, AFK_NEXT_QUESTION) catch return null;
+    msgs.appendSlice(gpa, ",{\"role\":\"user\",\"content\":") catch return null;
+    http.jstr(gpa, &msgs, ask.items) catch return null;
+    msgs.append(gpa, '}') catch return null;
+    const cm = meterBegin(app.io);
+    var step = llm.complete(gpa, app.io, run_root, "afknext", p.base_url, p.key, p.model, msgs.items, "", 256, 0.6);
+    defer step.deinit(gpa);
+    meterEnd(app, cm, "afknext", .prompting, p.model, step.ok);
+    if (!step.ok) return null;
+    const t = std.mem.trim(u8, step.content, " \r\n\t`*\"'");
+    if (t.len < 16 or t.len > 900) return null; // too vague to act on, or a plan rather than a step
+    if (cctx.looksLikeToolMarkup(t)) return null; // it must write an INSTRUCTION, not emit a tool call
+    if (loopIsDone(t)) return null; // it just said DONE again — the caller's plain nudge is more honest
     return gpa.dupe(u8, t) catch null;
 }
 

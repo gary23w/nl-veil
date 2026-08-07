@@ -72,6 +72,7 @@ const EXPECTED = [_]struct { label: []const u8, role: Role, review_gated: bool =
     // web_search of a research turn), so they belong on the cheap driver, not the coder.
     .{ .label = "searchq", .role = .prompting }, // rewrites a web_search query before it executes
     .{ .label = "stuck", .role = .prompting }, // writes the afk stuck-recovery instruction
+    .{ .label = "afknext", .role = .prompting }, // writes the afk re-drive instruction when the worker says DONE
     .{ .label = "planrec", .role = .prompting }, // settle-time plan reconcile: a cheap ledger-vs-tasks verdict, not reasoning
     .{ .label = "arbiter", .role = .prompting }, // streak-3 tool arbiter: which tool next — a routing verdict, not the task's reasoning
     // THINKING, both, and deliberately not the cheap driver. Each is a JUDGEMENT that decides what the whole
