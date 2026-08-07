@@ -260,6 +260,11 @@ pub const Worker = struct {
     best_pct: u32 = 0,
     best_tier: u8 = 0,
     best_passed: u32 = 0,
+    best_total: u32 = 0, // widest check DENOMINATOR seen — a suite that grew is a stricter bar, not a regression
+    champion_failures: []const u8 = "", // the best-known-good build's failure set — the behavioural diff's reference
+    champion_pct: u32 = 0,
+    champion_round: u32 = 0,
+    champion_set: bool = false,
     solved_rounds: u32 = 0,
     flat_rounds: u32 = 0,
     regress_rounds: u32 = 0,
@@ -277,6 +282,11 @@ pub const Worker = struct {
     habit_mine: bool = true, // NL_HABIT_MINE (on by default): mine recurring successful tool sequences into the habit quarantine (deterministic)
     habits: [24]HabitRec = [_]HabitRec{.{}} ** 24, // the run's habit table (bounded), folded per moment
     habit_n: u8 = 0,
+    tourney: bool = false, // opt-in (NL_TOURNAMENT): explore N independent candidates from one baseline when the chain is stuck
+    tourney_active: bool = false, // a tournament is running — it owns work/ until it lands a winner
+    tourney_idx: u8 = 0, // which candidate this round is producing
+    tourney_best: i8 = -1, // best candidate index so far (-1 = none stashed yet)
+    tourney_best_pct: u32 = 0,
     playbook_str: []const u8 = "",
     kindex_str: []const u8 = "",
     // MIND-FLOOR lesson stash: the newest still-unpaired hard failure, carried across rounds so a later
@@ -696,6 +706,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
     defer gpa.free(w.stop_path);
     defer if (w.last_bench_str.len > 0) gpa.free(@constCast(w.last_bench_str));
     defer if (w.last_bench.failures.len > 0) gpa.free(w.last_bench.failures);
+    defer if (w.champion_failures.len > 0) gpa.free(@constCast(w.champion_failures));
     defer if (w.now_str.len > 0) gpa.free(@constCast(w.now_str));
     defer if (w.playbook_str.len > 0) gpa.free(@constCast(w.playbook_str));
     defer if (w.kindex_str.len > 0) gpa.free(@constCast(w.kindex_str));
@@ -760,6 +771,13 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
     if (environ.get("NL_HABIT_MINE")) |v| {
         const t = std.mem.trim(u8, v, " \r\n\t");
         w.habit_mine = !(std.mem.eql(u8, t, "0") or std.ascii.eqlIgnoreCase(t, "false") or std.ascii.eqlIgnoreCase(t, "off") or std.ascii.eqlIgnoreCase(t, "no"));
+    }
+    // BEST-OF-N TOURNAMENT (opt-in, NL_TOURNAMENT): when the linear hill-climb is provably stuck, spend the next
+    // few rounds on independent branches from one frozen baseline and keep the best-scoring one. Default-off: it
+    // deliberately swaps work/ between rounds, so it is armed explicitly rather than inherited by every run.
+    if (environ.get("NL_TOURNAMENT")) |v| {
+        w.tourney = v.len > 0 and (v[0] == '1' or v[0] == 't' or v[0] == 'T' or v[0] == 'y' or v[0] == 'Y');
+        if (w.tourney) w.act("engine", 0, "mode", "tournament", "best-of-N tournament armed: on a stuck signal (invariant failures or a regression streak) the engine explores 3 independent candidates from one frozen baseline and lands the highest-scoring one.");
     }
     if (live) {
         const c = llm.capsSnapshot();
@@ -1543,6 +1561,14 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
         if (live and w.discourse) markDeliverableGaps(&w, goal, round);
         if (live and w.discourse) reconcileDeliverables(&w, goal, round);
         if (live) trackConvergence(&w, run_dir, goal, round);
+        // BEST-OF-N TOURNAMENT (opt-in): rank this round's candidate and either reset to the frozen baseline for
+        // the next branch or land the winner. Ordered AFTER trackConvergence so DELIVERY still sees (and can
+        // export) every candidate on its own merits; arming is checked last so a tournament starts on the NEXT
+        // round, never on the round whose build became its baseline.
+        if (live) {
+            tournamentStep(&w, round, run_dir);
+            tournamentArm(&w, round, run_dir);
+        }
         if (live and w.cap.exemplar and ((w.last_bench.status == .ok and w.last_bench.pct >= w.best_pct and w.last_bench.pct > 0) or round == 1 or @mod(round, DIGEST_EVERY) == 0)) promoteVerified(&w, run_dir);
         // PROMOTION COSTS A FULL CACHE-LINEAGE RESET, SO IT MUST BE PAID FOR IN SCORE, NOT IN FORM.
         // rsi.adaptCapacity promotes a tier after two rounds of "100% structured tool use, nothing narrated".
@@ -8995,6 +9021,153 @@ fn applyScoutRewards(w: *Worker, round: u32) void {
     }
 }
 
+/// A failing check's stable SIGNATURE: the head of the line with digits stripped, so a re-run whose timings,
+/// counts or line numbers moved still matches the same underlying break. Pure — unit-tested.
+fn failureSignature(line: []const u8, buf: []u8) []const u8 {
+    var n: usize = 0;
+    for (std.mem.trim(u8, line, " \r\t")) |c| {
+        if (n >= buf.len) break;
+        if (std.ascii.isDigit(c)) continue;
+        buf[n] = std.ascii.toLower(c);
+        n += 1;
+    }
+    return buf[0..n];
+}
+
+/// Does `haystack` (a champion's whole failure text) already contain this signature? Compares signature-to-
+/// signature so both sides are normalized the same way. Pure — unit-tested.
+fn championHasFailure(champion: []const u8, sig: []const u8) bool {
+    if (sig.len < 8) return true; // too short to attribute — never call it a new break
+    var it = std.mem.splitScalar(u8, champion, '\n');
+    var cbuf: [160]u8 = undefined;
+    while (it.next()) |ln| {
+        const csig = failureSignature(ln, &cbuf);
+        if (csig.len < 8) continue;
+        const a = sig[0..@min(sig.len, csig.len)];
+        const b = csig[0..@min(sig.len, csig.len)];
+        if (std.mem.eql(u8, a, b)) return true;
+    }
+    return false;
+}
+
+/// CHAMPION–CHALLENGER BEHAVIOURAL DIFF. The score is an AGGREGATE: a round that breaks one check while fixing
+/// another lands the same percentage, and every loop that watches pct alone — the governor, the convergence
+/// tracker, the tournament — reads that as "no change". So a self-edit or a refactor could silently trade
+/// working behaviour for new behaviour and nothing anywhere would say so.
+///
+/// The champion is the best-known-good build's failure set; every later round is the challenger. A failing
+/// signature the challenger has and the champion did NOT is a NEW break, attributable and reportable even when
+/// the percentage is flat or up. That is the behavioural diff the pass rate cannot express — and it needs no
+/// replay harness, because the checks already run every round. Records into the canary ledger, which until now
+/// only ever accumulated the governor's verdicts with nothing computing an outcome from them.
+fn challengerDiff(w: *Worker, round: u32) void {
+    if (!w.champion_set or w.champion_failures.len == 0) return;
+    const cur = w.last_bench.failures;
+    if (cur.len == 0) return;
+    var new_breaks: u32 = 0;
+    var first: []const u8 = "";
+    var it = std.mem.splitScalar(u8, cur, '\n');
+    var sbuf: [160]u8 = undefined;
+    while (it.next()) |ln| {
+        const t = std.mem.trim(u8, ln, " \r\t");
+        if (t.len < 8) continue;
+        const sig = failureSignature(t, &sbuf);
+        if (championHasFailure(w.champion_failures, sig)) continue;
+        new_breaks += 1;
+        if (first.len == 0) first = t;
+    }
+    if (new_breaks == 0) return;
+    // MASKED is the case worth shouting about: the aggregate says fine (or better) while something that used
+    // to work now does not. A drop already surfaces through the ordinary regression path.
+    const masked = w.last_bench.pct >= w.champion_pct;
+    const rec = std.fmt.allocPrint(w.gpa, "round {d} challenger: {d} new break(s) vs the champion from round {d} ({d}% -> {d}%{s}) | first: {s}", .{ round, new_breaks, w.champion_round, w.champion_pct, w.last_bench.pct, if (masked) ", MASKED by the aggregate" else "", clip(first, 160) }) catch return;
+    defer w.gpa.free(rec);
+    _ = w.mem.observe(tools.CANARY_SCOPE, rec);
+    w.act("engine", round, "challenger", if (masked) "a masked behavioural regression" else "new breaks vs the champion", std.fmt.allocPrint(w.a(), "{d} check(s) that passed in the champion build (round {d}, {d}%) now fail, at {d}%{s}. The pass rate cannot show this: it nets a break against a fix. First new break: {s}", .{ new_breaks, w.champion_round, w.champion_pct, w.last_bench.pct, if (masked) " — the aggregate score HID it" else "", clip(first, 200) }) catch "new breaks vs the champion");
+    w.emit("challenger", std.fmt.allocPrint(w.a(), ",\"round\":{d},\"new_breaks\":{d},\"masked\":{},\"champion_round\":{d},\"champion_pct\":{d},\"pct\":{d}", .{ round, new_breaks, masked, w.champion_round, w.champion_pct, w.last_bench.pct }) catch ",\"round\":0");
+}
+
+/// Promote the current build to CHAMPION — the reference every later round is diffed against. Called when the
+/// build reaches a new best, so the champion is always a best-known-good, never merely the previous round.
+fn recordChampion(w: *Worker, round: u32) void {
+    const dup = w.gpa.dupe(u8, w.last_bench.failures) catch return;
+    if (w.champion_failures.len > 0) w.gpa.free(@constCast(w.champion_failures));
+    w.champion_failures = dup;
+    w.champion_pct = w.last_bench.pct;
+    w.champion_round = round;
+    w.champion_set = true;
+}
+
+/// How many independent candidates a tournament explores before landing the best one.
+const TOURNEY_N: u8 = 3;
+
+/// BEST-OF-N TOURNAMENT (opt-in, NL_TOURNAMENT). The engine's hill-climb is a LINEAR chain: every round edits
+/// whatever the last round left, so when the chain gets stuck the swarm grinds the same local optimum. Nothing
+/// anywhere generated several independent attempts at the same thing and kept the best — minds parallelize
+/// across FILES, and the micro-VCS MERGES concurrent edits rather than letting them compete.
+///
+/// This arms only on a measured stuck signal (the zero-gradient sentinel: failing-check text byte-identical
+/// while the tree changes; or a regression streak), because those are exactly the rounds already being wasted.
+/// It then spends the next N rounds producing N candidates FROM THE SAME FROZEN BASELINE — after each round the
+/// candidate is stashed and the baseline restored, so candidate 2 does not inherit candidate 1's dead end — and
+/// lands the highest-scoring one. Scoring is the existing benchmark; no new judge, no model call.
+///
+/// HONEST LIMIT: restoring the baseline reverts the CONTENT of files it holds; a file a candidate newly created
+/// stays (copyBuild skips manifest paths absent from the source). So a candidate inherits its predecessors'
+/// new files but not their edits. That is the safe direction — never a deletion of work — and it means the
+/// branches are independent in their edits, which is where a local optimum actually lives.
+fn tournamentArm(w: *Worker, round: u32, run_dir: []const u8) void {
+    if (!w.tourney or w.tourney_active or w.operating or w.discourse or w.quick) return;
+    if (!w.last_bench.hasScore()) return; // nothing to rank candidates by
+    const stuck = w.fail_invariant_n >= 2 or w.regress_rounds >= 2;
+    if (!stuck) return;
+    if (copyBuild(w, run_dir, "work", ".tourney_base") == 0) return; // nothing to branch from
+    w.tourney_active = true;
+    w.tourney_idx = 0;
+    w.tourney_best = -1;
+    w.tourney_best_pct = 0;
+    w.act("engine", round, "tournament", "armed", std.fmt.allocPrint(w.a(), "the linear chain is stuck (invariant failures {d}, regressions {d}) — exploring {d} independent candidates from this round's build as a frozen baseline and keeping the best-scoring one", .{ w.fail_invariant_n, w.regress_rounds, TOURNEY_N }) catch "tournament armed");
+    w.emit("tournament", std.fmt.allocPrint(w.a(), ",\"round\":{d},\"event\":\"armed\",\"n\":{d},\"baseline_pct\":{d}", .{ round, TOURNEY_N, w.last_bench.pct }) catch ",\"round\":0");
+}
+
+/// One tournament step, once per round after the benchmark has scored this round's candidate: stash the
+/// candidate, rank it, then either reset to the baseline for the next branch or land the winner.
+fn tournamentStep(w: *Worker, round: u32, run_dir: []const u8) void {
+    if (!w.tourney_active) return;
+    var sub_buf: [24]u8 = undefined;
+    const sub = std.fmt.bufPrint(&sub_buf, ".tourney_c{d}", .{w.tourney_idx}) catch return;
+    const stashed = copyBuild(w, run_dir, "work", sub);
+    const pct = w.last_bench.pct;
+    if (stashed > 0 and (w.tourney_best < 0 or pct > w.tourney_best_pct)) {
+        w.tourney_best = @intCast(w.tourney_idx);
+        w.tourney_best_pct = pct;
+    }
+    w.act("engine", round, "tournament", "candidate scored", std.fmt.allocPrint(w.a(), "candidate {d}/{d} scored {d}% ({d} files stashed); best so far {d}%", .{ w.tourney_idx + 1, TOURNEY_N, pct, stashed, if (w.tourney_best >= 0) w.tourney_best_pct else pct }) catch "candidate scored");
+    w.emit("tournament", std.fmt.allocPrint(w.a(), ",\"round\":{d},\"event\":\"candidate\",\"idx\":{d},\"pct\":{d},\"best_pct\":{d}", .{ round, w.tourney_idx, pct, w.tourney_best_pct }) catch ",\"round\":0");
+    w.tourney_idx += 1;
+
+    if (w.tourney_idx < TOURNEY_N) {
+        _ = copyBuild(w, run_dir, ".tourney_base", "work"); // next branch starts from the same baseline
+        return;
+    }
+
+    // LAND THE WINNER. Same discipline as the DELIVERY restore: a stash that captured less than the live tree
+    // is not allowed to overwrite it — a tournament must never be a way to lose work.
+    w.tourney_active = false;
+    if (w.tourney_best < 0) return;
+    var wb: [24]u8 = undefined;
+    const wsub = std.fmt.bufPrint(&wb, ".tourney_c{d}", .{@as(u8, @intCast(w.tourney_best))}) catch return;
+    const win_n = buildFileCount(w, run_dir, wsub);
+    const live_n = buildFileCount(w, run_dir, "work");
+    if (win_n < live_n or snapshotTooLight(buildByteMass(w, run_dir, wsub), buildByteMass(w, run_dir, "work"))) {
+        w.act("engine", round, "tournament", "kept the live build", std.fmt.allocPrint(w.a(), "the winning candidate ({d}%) holds {d} deliverable files against the live build's {d} — landing it would discard work, so the live build stands", .{ w.tourney_best_pct, win_n, live_n }) catch "kept the live build");
+        return;
+    }
+    const landed = copyBuild(w, run_dir, wsub, "work");
+    w.act("engine", round, "tournament", "landed the winner", std.fmt.allocPrint(w.a(), "explored {d} independent candidates from one baseline; landed candidate {d} at {d}% ({d} files)", .{ TOURNEY_N, w.tourney_best + 1, w.tourney_best_pct, landed }) catch "landed the winner");
+    w.emit("tournament", std.fmt.allocPrint(w.a(), ",\"round\":{d},\"event\":\"landed\",\"idx\":{d},\"pct\":{d},\"files\":{d}", .{ round, w.tourney_best, w.tourney_best_pct, landed }) catch ",\"round\":0");
+}
+
 fn scoutQuery(w: *Worker, goal: []const u8) []const u8 {
     const gpa = w.gpa;
     const intent = if (w.goal_brief.len > 0) w.goal_brief else clip(goal, 200);
@@ -9123,8 +9296,20 @@ fn trackConvergence(w: *Worker, run_dir: []const u8, goal: []const u8, round: u3
         const best_strength = tierStrength(w.best_tier);
         const rigor_increase = cur_strength > best_strength;
         const same_or_stronger = cur_strength >= best_strength;
-        const improved = w.best_tier == 0 and w.best_pct == 0 or rigor_increase or (same_or_stronger and (b.passed > w.best_passed or (b.passed >= w.best_passed and b.pct > w.best_pct)));
-        const regressed = !rigor_increase and same_or_stronger and w.best_pct > 0 and b.pct + REGRESS_MARGIN < w.best_pct;
+        // DENOMINATOR GROWTH — the suite now asks MORE than it did (a new test joined the run), so the same build
+        // scores a lower percentage without having got worse. Read as a regression, that drop would trigger the
+        // DELIVERY restore and revert the very test that raised the bar: the engine would be structurally unable
+        // to accept a stricter suite, and the BREAKER lane could never pay off. A wider denominator is therefore
+        // treated exactly like a rigor increase — re-baseline against the harder measurement, never a regression.
+        const denom_grew = w.best_total > 0 and b.total > w.best_total;
+        if (b.total > w.best_total) w.best_total = b.total;
+        const improved = w.best_tier == 0 and w.best_pct == 0 or rigor_increase or denom_grew or (same_or_stronger and (b.passed > w.best_passed or (b.passed >= w.best_passed and b.pct > w.best_pct)));
+        const regressed = !rigor_increase and !denom_grew and same_or_stronger and w.best_pct > 0 and b.pct + REGRESS_MARGIN < w.best_pct;
+        // BEHAVIOURAL DIFF before the champion moves: compare THIS round against the previous best-known-good,
+        // so a break the aggregate score nets out against a fix is still named. (After recordChampion below the
+        // reference would be this very round, and the comparison would be vacuous.)
+        challengerDiff(w, round);
+        if (denom_grew) w.act("engine", round, "falsifier", "the bar moved", std.fmt.allocPrint(w.a(), "the suite grew to {d} checks (was {d}) — this round's {d}% is measured against a stricter bar, not a worse build; re-baselining rather than counting it a regression", .{ b.total, w.best_total, b.pct }) catch "the bar moved");
         // DELIVERY MUST NOT FREEZE WHEN THE SCORE CANNOT RANK ROUNDS. `improved` can fire only ONCE on a run
         // whose pct never leaves 0: the `best_tier == 0 and best_pct == 0` seed clause is true on round 1 and
         // false forever after, while every later comparison is 0 against 0. In cast-355797 that froze DELIVERY/
@@ -9139,6 +9324,7 @@ fn trackConvergence(w: *Worker, run_dir: []const u8, goal: []const u8, round: u3
             w.best_passed = b.passed;
             w.flat_rounds = 0;
             w.regress_rounds = 0;
+            recordChampion(w, round); // this build is the new best-known-good — every later round diffs against it
             if (same_or_stronger and copyBuild(w, run_dir, "work", "DELIVERY") > 0) {
                 w.best_snapshot = true;
                 w.best_mass = mass;
@@ -9165,7 +9351,11 @@ fn trackConvergence(w: *Worker, run_dir: []const u8, goal: []const u8, round: u3
             // round-1 snapshot lands on a much larger tree. Guard on FILE COUNT — a revert is a revert of
             // CONTENT, never a deletion of work — and then on BYTE MASS, because an equal-count snapshot of
             // stubs is the same deletion wearing the right number of filenames.
-            if (w.best_snapshot and w.regress_rounds >= RESTORE_AFTER) {
+            // ONE CONTROLLER AT A TIME. While a tournament is running it owns work/ (it swaps the tree between
+            // branches by design), so the DELIVERY restore must stand down — otherwise two controllers fight
+            // over the same directory and a branch gets overwritten mid-exploration. DELIVERY still tracks the
+            // best candidate through the export path above; only the revert is deferred until the tournament ends.
+            if (w.best_snapshot and w.regress_rounds >= RESTORE_AFTER and !w.tourney_active) {
                 const snap_n = buildFileCount(w, run_dir, "DELIVERY");
                 const live_n = buildFileCount(w, run_dir, "work");
                 if (snap_n < live_n) {
@@ -11157,6 +11347,92 @@ test "habitBump counts, and never lets a transient evict an established habit" {
         if (std.mem.eql(u8, h.seq[0..h.len], "a>b")) ab = h.count;
     }
     try std.testing.expectEqual(@as(u16, 2), ab); // the established habit survived
+}
+
+test "failureSignature normalizes away digits and case so a re-run matches the same underlying break" {
+    var a: [160]u8 = undefined;
+    var b: [160]u8 = undefined;
+    const s1 = failureSignature("FAILED test_auth.py::test_login - AssertionError at line 42 (0.31s)", &a);
+    const s2 = failureSignature("failed test_auth.py::test_login - AssertionError at line 87 (1.02s)", &b);
+    try std.testing.expectEqualStrings(s1, s2); // same break, different line/timing
+    const s3 = failureSignature("FAILED test_billing.py::test_invoice - KeyError", &b);
+    try std.testing.expect(!std.mem.eql(u8, s1, s3)); // a genuinely different break stays different
+}
+
+test "championHasFailure: a NEW break is named, a known one is not, and a too-short line is never attributed" {
+    const champion = "FAILED test_auth.py::test_login - AssertionError at line 42\nFAILED test_math.py::test_add - off by one";
+    var sb: [160]u8 = undefined;
+    // already failing in the champion (different line number) -> not new
+    try std.testing.expect(championHasFailure(champion, failureSignature("FAILED test_auth.py::test_login - AssertionError at line 91", &sb)));
+    // a break the champion never had -> NEW
+    try std.testing.expect(!championHasFailure(champion, failureSignature("FAILED test_billing.py::test_invoice - KeyError", &sb)));
+    // too short to attribute -> treated as known, never reported as a regression
+    try std.testing.expect(championHasFailure(champion, failureSignature("E  ", &sb)));
+}
+
+test "the behavioural diff runs against the PREVIOUS champion, not the round that just became one" {
+    // Ordering is the whole test: recordChampion fires on `improved`, so if the diff ran after it the reference
+    // would be this very round and the comparison would be vacuously empty on exactly the rounds that change most.
+    const SRC = @embedFile("run.zig");
+    const at = std.mem.indexOf(u8, SRC, "fn trackConvergence") orelse return error.TrackFnMissing;
+    const rest = SRC[at..];
+    const diff = std.mem.indexOf(u8, rest, "challengerDiff(w, round)") orelse return error.DiffNotWired;
+    const rec = std.mem.indexOf(u8, rest, "recordChampion(w, round)") orelse return error.ChampionNotWired;
+    try std.testing.expect(diff < rec);
+}
+
+test "a GROWN check denominator re-baselines instead of counting as a regression (the falsifier lane's floor)" {
+    // Without this the engine is structurally unable to accept a stricter suite: a newly added failing test
+    // lowers the percentage, trackConvergence reads that as a regression, and the DELIVERY restore reverts the
+    // very test that raised the bar — so the BREAKER lane could never pay off. Assert the rule is in the two
+    // expressions that decide it, since a refactor could drop it from either half and leave the other looking right.
+    const SRC = @embedFile("run.zig");
+    const at = std.mem.indexOf(u8, SRC, "const denom_grew =") orelse return error.DenomRuleMissing;
+    const rest = SRC[at..@min(at + 1400, SRC.len)];
+    const imp = std.mem.indexOf(u8, rest, "const improved =") orelse return error.ImprovedMissing;
+    const reg = std.mem.indexOf(u8, rest, "const regressed =") orelse return error.RegressedMissing;
+    const imp_line = rest[imp .. imp + (std.mem.indexOfScalarPos(u8, rest, imp, ';') orelse rest.len) - imp];
+    const reg_line = rest[reg .. reg + (std.mem.indexOfScalarPos(u8, rest, reg, ';') orelse rest.len) - reg];
+    // a wider bar counts as progress to re-baseline against...
+    if (std.mem.indexOf(u8, imp_line, "denom_grew") == null) return error.GrowthNotTreatedAsImprovement;
+    // ...and must never satisfy the regression test that arms the revert
+    if (std.mem.indexOf(u8, reg_line, "!denom_grew") == null) return error.GrowthStillCountsAsRegression;
+    // the BREAKER archetype is what produces that growth — it must exist, and must not be a fixer
+    const RSI = @embedFile("rsi.zig");
+    const bk = std.mem.indexOf(u8, RSI, ".key = \"breaker\"") orelse return error.BreakerArchetypeMissing;
+    const lane = RSI[bk..@min(bk + 700, RSI.len)];
+    try std.testing.expect(std.mem.indexOf(u8, lane, "FAILS") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lane, "Do NOT fix it") != null);
+}
+
+test "the tournament defers to no second controller and can never land a lighter build than it would overwrite" {
+    const SRC = @embedFile("run.zig");
+    // (1) While a tournament owns work/, the DELIVERY restore must stand down — two controllers swapping the
+    // same directory would overwrite a branch mid-exploration.
+    {
+        const at = std.mem.indexOf(u8, SRC, "w.best_snapshot and w.regress_rounds >= RESTORE_AFTER") orelse return error.RestoreGateMissing;
+        const line_end = std.mem.indexOfScalarPos(u8, SRC, at, '\n') orelse SRC.len;
+        if (std.mem.indexOf(u8, SRC[at..line_end], "!w.tourney_active") == null) return error.TwoControllersOverWorkdir;
+    }
+    // (2) Landing a winner reuses the SAME anti-shrink discipline as the DELIVERY restore: file count and the
+    // byte-mass floor. A tournament must never be a way to lose work.
+    {
+        const at = std.mem.indexOf(u8, SRC, "fn tournamentStep") orelse return error.StepFnMissing;
+        const rest = SRC[at..];
+        const stop = std.mem.indexOf(u8, rest, "\nfn scoutQuery") orelse rest.len;
+        const body = rest[0..stop];
+        try std.testing.expect(std.mem.indexOf(u8, body, "buildFileCount(") != null);
+        try std.testing.expect(std.mem.indexOf(u8, body, "snapshotTooLight(") != null);
+    }
+    // (3) Arming requires a real stuck signal and a score that can rank candidates — never an unconditional fork.
+    {
+        const at = std.mem.indexOf(u8, SRC, "fn tournamentArm") orelse return error.ArmFnMissing;
+        const rest = SRC[at..];
+        const stop = std.mem.indexOf(u8, rest, "\n/// One tournament step") orelse rest.len;
+        const body = rest[0..stop];
+        try std.testing.expect(std.mem.indexOf(u8, body, "fail_invariant_n") != null);
+        try std.testing.expect(std.mem.indexOf(u8, body, "hasScore()") != null);
+    }
 }
 
 test "the habit miner is wired at BOTH ends — per-moment record and end-of-run propose" {
