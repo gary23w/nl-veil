@@ -273,6 +273,7 @@ pub const Worker = struct {
     app_attach: bool = false, // opt-in generic-app LEARN mode (NL_APP_ATTACH): read-only attach to an arbitrary app
     idle_skip: bool = false, // opt-in (NL_IDLE_SKIP): a provably-idle non-lead assembler mind skips its LLM moment
     patch_autorevert: bool = false, // opt-in (NL_PATCH_SYSTEM_AUTOREVERT): the governor restores a self-mod's pre-image on a `rollback` verdict
+    lesson_credit: bool = true, // NL_LESSON_CREDIT (on by default): a verified fix reinforces the prior lesson that preceded it (strengthen-only)
     playbook_str: []const u8 = "",
     kindex_str: []const u8 = "",
     // MIND-FLOOR lesson stash: the newest still-unpaired hard failure, carried across rounds so a later
@@ -741,6 +742,14 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
     if (environ.get("NL_PATCH_SYSTEM_AUTOREVERT")) |v| {
         w.patch_autorevert = v.len > 0 and (v[0] == '1' or v[0] == 't' or v[0] == 'T' or v[0] == 'y' or v[0] == 'Y');
         if (w.patch_autorevert) w.act("engine", 0, "mode", "patch-autorevert", "patch auto-revert armed: a patch_system self-edit that the governor rules `rollback` (score regressed) is restored to its pre-edit state from the journaled pre-image.");
+    }
+    // LESSON OUTCOME CREDIT (on by default; NL_LESSON_CREDIT=0 disables): when a fail→fix flip is verified, the
+    // prior lesson recalled for that failing signature is reinforced, so a lesson that keeps preceding fixes ranks
+    // up in future RAG-on-failure recalls. Strengthen-only (never mints), engine-driven. The off switch is for A/B.
+    if (environ.get("NL_LESSON_CREDIT")) |v| {
+        const t = std.mem.trim(u8, v, " \r\n\t");
+        w.lesson_credit = !(std.mem.eql(u8, t, "0") or std.ascii.eqlIgnoreCase(t, "false") or std.ascii.eqlIgnoreCase(t, "off") or std.ascii.eqlIgnoreCase(t, "no"));
+        if (!w.lesson_credit) w.act("engine", 0, "mode", "lesson-credit-off", "outcome credit for recalled lessons DISABLED (NL_LESSON_CREDIT=0): a verified fix no longer reinforces the prior lesson that preceded it.");
     }
     if (live) {
         const c = llm.capsSnapshot();
@@ -2446,6 +2455,7 @@ fn applyLessonRecords(w: *Worker, round: u32, moment: *const Moment) void {
         if (!w.lfail_set) break;
         if (!std.mem.eql(u8, w.lfail.toolStr(), ok.toolStr())) continue;
         if (!lessonPair(w.lfail.argsStr(), ok.argsStr())) continue;
+        creditRecalledLesson(w, round, &w.lfail); // strengthen a prior lesson that preceded this cross-round fix
         mintLesson(w, round, &w.lfail, ok);
         w.lfail_set = false;
     }
@@ -2594,6 +2604,29 @@ fn mintLesson(w: *Worker, round: u32, fail: *const LessonRec, ok: *const LessonR
     var ab: [560]u8 = undefined;
     _ = w.mem.observe(tools.LESSON_SCOPE, atomizeForObserve(&ab, lesson));
     w.act("engine", round, "lesson", fail.toolStr(), lesson);
+}
+
+/// OUTCOME CREDIT for a lesson that helped (strengthen-only, engine-driven). A failure just paired with a later
+/// fix of the same tool — a real fail→fix flip. Any PRE-EXISTING verified lesson recalled for that failing
+/// signature was the knowledge that could have carried the fix, so reinforce it: a lesson that keeps preceding
+/// fixes surfaces first in future RAG-on-failure recalls, and one that never does simply fades. This never MINTS
+/// — reinforce only strengthens an existing node, and the node provably exists because we just recalled it — so
+/// the strengthen-only plasticity rule holds (a reward can't resurrect or invent a lesson). Engine-only, so a
+/// mind cannot inflate its own lessons. Runs BEFORE the fresh mint, so it credits prior knowledge, not the fix
+/// about to be written. Gated by NL_LESSON_CREDIT (on by default).
+fn creditRecalledLesson(w: *Worker, round: u32, fail: *const LessonRec) void {
+    if (!w.lesson_credit) return;
+    const gpa = w.gpa;
+    var lqb: [280]u8 = undefined;
+    const lq = std.fmt.bufPrint(&lqb, "{s} {s}", .{ fail.toolStr(), clip(fail.argsStr(), 200) }) catch fail.toolStr();
+    const recalled = w.mem.assoc(tools.LESSON_SCOPE, lq, 2, 1); // the top verified lesson for THIS failing call
+    defer gpa.free(recalled);
+    const t = std.mem.trim(u8, recalled, " \r\n\t");
+    if (t.len < 24) return; // nothing meaningful was on hand to credit
+    w.mem.reinforce(tools.LESSON_SCOPE, clip(t, 200), "worked");
+    var db: [280]u8 = undefined;
+    const desc = std.fmt.bufPrint(&db, "a prior verified lesson preceded this fix — reinforced it: {s}", .{clip(t, 180)}) catch "reinforced a prior verified lesson";
+    w.act("engine", round, "lesson_credit", fail.toolStr(), desc);
 }
 
 /// RSI CAPACITY — the model-capacity self-tuner (DEMOTE-ONLY). The engine does NOT trust the model's name; each
@@ -4565,6 +4598,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
                     // fail→fix INSIDE one moment — the dominant case; mint immediately (Mem locks writes)
                     var okr: LessonRec = .{};
                     okr.set(c.name, clip(c.args, 200), "");
+                    creditRecalledLesson(w, round, &mstash); // strengthen a prior lesson that preceded this fix
                     mintLesson(w, round, &mstash, &okr);
                     mstash_set = false;
                 } else if (mok_n < moks.len) {
@@ -10948,4 +10982,39 @@ test "every events.jsonl reader admits as much as the writer emits" {
     // Not vacuous: the readers are really there. A refactor that moves or renames them fails here
     // rather than passing on zero matches.
     try std.testing.expect(readers >= 3);
+}
+
+test "lesson outcome-credit is wired at both fix sites, is strengthen-only, and credits BEFORE minting" {
+    // Same shape as the isDecline/memoryView wiring tests: creditRecalledLesson can be correct and never
+    // called, in which case the whole outcome-credit loop is silently dead. Assert the wiring AND the two
+    // invariants a refactor could quietly break: it must never MINT (strengthen-only), and at the cross-round
+    // site it must run BEFORE the mint (else it credits the lesson just written, not the prior one that helped).
+    const SRC = @embedFile("run.zig");
+    // (1) the function strengthens (reinforce) and never mints (no .observe into a scope)
+    {
+        const at = std.mem.indexOf(u8, SRC, "fn creditRecalledLesson") orelse return error.CreditFnMissing;
+        const rest = SRC[at..];
+        const nf = std.mem.indexOf(u8, rest, "\nfn ") orelse rest.len;
+        const npf = std.mem.indexOf(u8, rest, "\npub fn ") orelse rest.len;
+        const body = rest[0..@min(nf, npf)];
+        try std.testing.expect(std.mem.indexOf(u8, body, "reinforce(") != null);
+        if (std.mem.indexOf(u8, body, ".observe(") != null) return error.CreditMustNotMint;
+    }
+    // (2) cross-round site: credit is wired, and precedes the mint
+    {
+        const at = std.mem.indexOf(u8, SRC, "fn applyLessonRecords") orelse return error.ApplyFnMissing;
+        const rest = SRC[at..];
+        const nf = std.mem.indexOf(u8, rest, "\nfn ") orelse rest.len;
+        const npf = std.mem.indexOf(u8, rest, "\npub fn ") orelse rest.len;
+        const body = rest[0..@min(nf, npf)];
+        const credit = std.mem.indexOf(u8, body, "creditRecalledLesson(") orelse return error.CrossRoundNotWired;
+        const mint = std.mem.indexOf(u8, body, "mintLesson(") orelse return error.MintMissing;
+        try std.testing.expect(credit < mint);
+    }
+    // (3) the in-moment path (the dominant fail→fix case) also credits
+    {
+        const at = std.mem.indexOf(u8, SRC, "INSIDE one moment") orelse return error.InMomentAnchorMissing;
+        const near = SRC[at..@min(at + 420, SRC.len)];
+        try std.testing.expect(std.mem.indexOf(u8, near, "creditRecalledLesson(") != null);
+    }
 }
