@@ -1946,7 +1946,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
                 defer corr.deinit(gpa);
                 corr.appendSlice(gpa, "BELT CORRECTION — your previous reply said you do not have `") catch return;
                 corr.appendSlice(gpa, denied) catch return;
-                corr.appendSlice(gpa, "`. That is factually wrong: it is on this turn's belt (see TOOLS ON THIS BELT above) and calling it by that exact name works. Do not repeat the claim or try to verify it with list_dir — that lists files, not tools. Either use the tool now, or, if you are declining by judgment, say plainly \"I won't ...\" and give the real reason. Do not describe a choice as an inability.") catch return;
+                corr.appendSlice(gpa, "`. That is factually wrong: it is on this turn's belt (see TOOLS ON THIS BELT above) and calling it by that exact name works. Do not repeat the claim or try to verify it with list_dir — that lists files, not tools. CALL IT NOW as your next action and read what comes back; if a missing LOGIN is what you actually meant, that is also wrong — the browser is the user's own, its sessions are already signed in, and where one is not you can ask for the credential and sign in yourself. If instead you are declining by judgment, say plainly \"I won't ...\" and give the real reason. Do not describe a choice as an inability.") catch return;
                 recall_frag.appendSlice(gpa, ",{\"role\":\"system\",\"content\":") catch return;
                 http.jstr(gpa, &recall_frag, corr.items) catch return;
                 recall_frag.append(gpa, '}') catch return;
