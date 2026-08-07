@@ -154,6 +154,16 @@ const TERMINAL_VERIFY_PROMPT = "Before calling this done, VERIFY the deliverable
 const LOOP_QUESTION =
     "What is the single next concrete step toward the goal? Reply with ONLY that next instruction, or reply " ++
     "exactly DONE if the goal is fully achieved.";
+/// The AFK drive question. afk was built as tier-1-plus-overrides: it asked "next step, or DONE", the model
+/// answered DONE, and the engine overrode that with a canned "keep going" — so every cycle the model reached a
+/// conclusion the loop then contradicted, and the only way to obey both was to invent more work. Observed live:
+/// posted, verified, posted again, verified again, forever. In afk the DONE branch simply should not be offered;
+/// a session the user opted into running until they stop it has no end state to ask about. Tier 1 keeps
+/// LOOP_QUESTION exactly as it was — its stop conditions are the whole point of that tier and they work.
+const LOOP_QUESTION_AFK =
+    "This session runs until the human stops it, so there is no finished state to report and DONE is not an " ++
+    "answer. Judge what has ALREADY been accomplished from the conversation above and do not redo or re-verify " ++
+    "it. What is the single most valuable next step — something not yet done? Reply with ONLY that instruction.";
 
 /// POST-ANSWER CRITIQUE (was REFLECT): the THINKING model reviews the answer the user has ALREADY been given and
 /// may APPEND a short correction as its own separate message. It can never rewrite what was said.
@@ -2731,7 +2741,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
         lq.appendSlice(gpa, "},") catch break :outer;
         lq.appendSlice(gpa, msgTail(conv_buf.items, LOOP_CTX_BYTES)) catch break :outer;
         lq.appendSlice(gpa, ",{\"role\":\"user\",\"content\":") catch break :outer;
-        http.jstr(gpa, &lq, LOOP_QUESTION) catch break :outer;
+        http.jstr(gpa, &lq, if (afk) LOOP_QUESTION_AFK else LOOP_QUESTION) catch break :outer;
         lq.append(gpa, '}') catch break :outer;
         const loop_cm = meterBegin(app.io);
         var next = llm.complete(gpa, app.io, llm_dir, "loop", prompt.base_url, prompt.key, prompt.model, lq.items, "", 512, 0.5);

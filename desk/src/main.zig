@@ -4614,7 +4614,12 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
     // (steerable) it SPLITS into two stacked buttons — POST (blue: send the typed text as a live steer the running
     // turn folds in) over STOP (red: abort + halt auto-loop), making steering an explicit, discoverable action.
     // A local-engine turn has no steer sink, so it shows Stop alone.
-    if (busy or loop_on) {
+    // A LIVE SERVER TURN always offers the control column, even when the local busy/loop flags happen to be
+    // clear. An afk turn is one long server-side turn, so those flags can read false while the veil is very
+    // much working — and then the composer showed a plain Send that cmdSend refused ("finish or Stop the
+    // current reply"), which is posting and steering silently disabled for the whole run. Steering a running
+    // turn is the one thing that must never be unreachable.
+    if (busy or loop_on or store.chat_server_turn) {
         const server_steerable = store.chat_server_turn;
         const shift = rl.isKeyDown(.left_shift) or rl.isKeyDown(.right_shift);
         const enter = (rl.isKeyPressed(.enter) or rl.isKeyPressed(.kp_enter)) and !shift and ui.focus == .c_input;
