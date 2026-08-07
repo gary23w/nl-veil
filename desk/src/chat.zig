@@ -529,7 +529,24 @@ const LOOP_SYSTEM =
 /// What auto-loop-afk sends when the driver declares DONE: the afk tier never accepts an end state, so
 /// "done" becomes a re-verify + extend drive and the conversation keeps working (user directive: afk
 /// goes forever — nothing but the user stops it).
-const AFK_DRIVE_MSG = "keep going: re-verify the latest work end-to-end, then pick the most valuable next improvement or extension toward the goal and do it.";
+const AFK_DRIVE_MSG = "keep going";
+
+/// AFK's own driver system prompt. afk used to run tier-1's driver verbatim — "name the next step, or output
+/// DONE" — and then override a DONE with a canned "re-verify the latest work end-to-end, then pick the most
+/// valuable next improvement". So every cycle the model reached a conclusion the loop immediately contradicted,
+/// and the only way to satisfy both was to invent more work: observed live, it posted, re-read the browser to
+/// verify, posted again, verified again, indefinitely. Two things were frozen underneath it — the goal never
+/// evolves, and compaction erases the evidence of what was already done — so the driver re-derived intent from
+/// scratch each pass. Removing the DONE branch removes the contradiction at its source; tier-1's LOOP_SYSTEM is
+/// untouched, because its stop conditions ARE that tier and they work.
+const LOOP_SYSTEM_AFK = LOOP_SYSTEM ++
+    "\nAFK OVERRIDE — read this last and let it win over anything above it that conflicts. This session runs " ++
+    "until the human stops it. There is NO finished state, so never output DONE and never treat the goal as " ++
+    "achieved. Equally: do not pad. Before composing, judge from the conversation what has ALREADY been done and " ++
+    "do NOT redo it, re-verify it, or re-check work that was already confirmed — that loop is the failure mode " ++
+    "here, not diligence. Pick something genuinely NOT YET DONE that advances the goal. If the obvious work is " ++
+    "finished, go WIDER: a related improvement, a harder case, a next stage the goal implies — say what is new " ++
+    "about it. If you truly cannot find anything new, say so plainly in one sentence instead of repeating a step.";
 
 // Recursive-thought (reflect) loop: ITERATIVE self-critique — keep re-reviewing the draft while each pass still
 // meaningfully changes it (that's how a careful reasoner converges: critique → fix → re-critique → … until it's
@@ -5895,7 +5912,7 @@ pub const Chat = struct {
             defer self.store.unlock();
             break :blk_sp self.store.settings.speed_mode;
         };
-        escJson(&msgs, self.gpa, if (kind == .loop_infer) LOOP_SYSTEM else if (kind == .consolidate) CONSOLIDATE_SYSTEM else if (tb.compact)
+        escJson(&msgs, self.gpa, if (kind == .loop_infer) (if (self.afkOn()) LOOP_SYSTEM_AFK else LOOP_SYSTEM) else if (kind == .consolidate) CONSOLIDATE_SYSTEM else if (tb.compact)
             (if (speed_now) SYSTEM_PROMPT_SPEED_COMPACT else SYSTEM_PROMPT_AUTONOMY_COMPACT)
         else
             (if (speed_now) SYSTEM_PROMPT_SPEED else SYSTEM_PROMPT_AUTONOMY));
