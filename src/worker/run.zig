@@ -272,6 +272,7 @@ pub const Worker = struct {
     operating: bool = false,
     app_attach: bool = false, // opt-in generic-app LEARN mode (NL_APP_ATTACH): read-only attach to an arbitrary app
     idle_skip: bool = false, // opt-in (NL_IDLE_SKIP): a provably-idle non-lead assembler mind skips its LLM moment
+    patch_autorevert: bool = false, // opt-in (NL_PATCH_SYSTEM_AUTOREVERT): the governor restores a self-mod's pre-image on a `rollback` verdict
     playbook_str: []const u8 = "",
     kindex_str: []const u8 = "",
     // MIND-FLOOR lesson stash: the newest still-unpaired hard failure, carried across rounds so a later
@@ -732,6 +733,14 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
     if (environ.get("NL_IDLE_SKIP")) |v| {
         w.idle_skip = v.len > 0 and (v[0] == '1' or v[0] == 't' or v[0] == 'T' or v[0] == 'y' or v[0] == 'Y');
         if (w.idle_skip) w.act("engine", 0, "mode", "idle-skip", "idle-skip armed: a non-lead assembler mind with no unbuilt/incomplete file, no inbox, and a non-failing benchmark skips its moment this round (re-armed every round from live build state; the lead always runs, so a build can never stall).");
+    }
+    // PATCH AUTO-REVERT (opt-in, NL_PATCH_SYSTEM_AUTOREVERT): when the governor rules `rollback` on a self-edit
+    // (the score regressed after it), restore the journaled pre-image automatically. Default-off — reverting the
+    // engine's own source from a score signal is powerful, so it is armed explicitly; the immediate post-write
+    // syntax verify (NL_PATCH_SYSTEM_VERIFY, on by default) is the always-on safety floor, this is the slower loop.
+    if (environ.get("NL_PATCH_SYSTEM_AUTOREVERT")) |v| {
+        w.patch_autorevert = v.len > 0 and (v[0] == '1' or v[0] == 't' or v[0] == 'T' or v[0] == 'y' or v[0] == 'Y');
+        if (w.patch_autorevert) w.act("engine", 0, "mode", "patch-autorevert", "patch auto-revert armed: a patch_system self-edit that the governor rules `rollback` (score regressed) is restored to its pre-edit state from the journaled pre-image.");
     }
     if (live) {
         const c = llm.capsSnapshot();

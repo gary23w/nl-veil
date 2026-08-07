@@ -1079,6 +1079,17 @@ pub const CANARY_SCOPE = "canary";
 /// Explicit autonomy stack snapshots: mission, strategy, execution, governor checks.
 pub const AUTONOMY_SCOPE = "autonomy";
 
+/// PRE-IMAGE JOURNAL for patch_system self-edits: one line per accepted mutating edit, carrying the round, the
+/// touched paths, a content-hash of each file's pre-edit bytes (or NEW for a fresh file), and the edit's
+/// success_criterion. The backup bytes live at {run_dir}/.patch_journal/objects/<hash>. This is the reader the
+/// governor's `rollback` verdict lacked — restoring the pre-image undoes a self-mod that made the score regress.
+pub const PATCH_JOURNAL_SCOPE = "patch_journal";
+
+/// GRADED OUTCOMES of patch_system self-edits: the governor binds each journaled edit's success_criterion to the
+/// measured score delta it produced (accepted / regressed / reverted), so the criterion is evaluated against a
+/// real number instead of being length-checked and dropped. This is the patch analogue of the WILL bet ledger.
+pub const PATCH_OUTCOME_SCOPE = "patch_outcome";
+
 /// The hive's shared SPATIAL MAP — discovered cells of a hidden grid, written by `probe`. When a space is too
 /// big for one mind to perceive at once, the minds partition it, each probes a DIFFERENT region, and the
 /// findings accumulate HERE as one shared map every mind can read. Injected in full each moment so the
@@ -3953,6 +3964,169 @@ fn stageFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
     return std.fmt.allocPrint(gpa, "staged {s} into the workdir ({d} bytes) — a hive cast from this conversation can now use it", .{ name, data.len }) catch dupe(gpa, "staged");
 }
 
+/// patch_system's POST-WRITE VERIFY is on by default; NL_PATCH_SYSTEM_VERIFY=0 (or false/off/no) disables it.
+/// The gap it closes: every pre-write gate in patchSystem is a string/ledger check, and after the bytes land
+/// NOTHING re-reads them — a self-edit that leaves the engine source un-parseable stands until the next human
+/// build. With verify on, a broken write is reverted in place and reported blocked. Fail-open by construction:
+/// a language whose checker is missing on this machine simply isn't gated (see patchVerifyError), never stuck.
+fn patchVerifyFlag(v: ?[]const u8) bool {
+    const raw = v orelse return true; // unset ⇒ verify ON (the safety floor is the default)
+    const t = std.mem.trim(u8, raw, " \r\n\t");
+    if (t.len == 0) return true;
+    return !(std.mem.eql(u8, t, "0") or std.ascii.eqlIgnoreCase(t, "false") or std.ascii.eqlIgnoreCase(t, "off") or std.ascii.eqlIgnoreCase(t, "no"));
+}
+fn patchVerifyOn(ctx: *ToolCtx) bool {
+    return patchVerifyFlag(ctx.environ.get("NL_PATCH_SYSTEM_VERIFY"));
+}
+
+/// Distill a `zig ast-check` stderr into one "line N: <msg>" verdict, stripping the scratch path. zig prints
+/// "<path>:L:C: error: <msg>"; the first such line is the verdict. null when stderr names no error at all —
+/// a missing or oddly-behaving zig must fail the gate OPEN, never reject a self-edit. Owned; caller frees.
+fn zigAstErrLine(gpa: std.mem.Allocator, stderr: []const u8) ?[]u8 {
+    var it = std.mem.splitScalar(u8, stderr, '\n');
+    while (it.next()) |raw| {
+        const t = std.mem.trimEnd(u8, raw, " \r\t");
+        const ei = std.mem.indexOf(u8, t, ": error: ") orelse continue;
+        const msg = std.mem.trim(u8, t[ei + ": error: ".len ..], " \r\t");
+        const head = t[0..ei]; // "<path>:L:C"
+        if (std.mem.lastIndexOfScalar(u8, head, ':')) |c2| {
+            if (std.mem.lastIndexOfScalar(u8, head[0..c2], ':')) |c1| {
+                if (std.fmt.parseInt(u64, head[c1 + 1 .. c2], 10) catch null) |lineno|
+                    return std.fmt.allocPrint(gpa, "line {d}: {s}", .{ lineno, clip(msg, 240) }) catch null;
+            }
+        }
+        return gpa.dupe(u8, clip(msg, 260)) catch null;
+    }
+    return null;
+}
+
+/// Real syntax/AstGen check for a candidate .zig body via `zig ast-check` on a run_dir scratch file — the gate
+/// the shared syntaxGateError lacks for .zig (it falls to the brace-balance heuristic). Single-file and cheap:
+/// it catches the syntax / parse / undeclared-identifier class that leaves the engine non-compiling, not full
+/// cross-module type errors (a per-patch `zig build` would be minutes). zig is found on PATH, or via NL_ZIG.
+/// null = passes, or zig could not run (fail-open). Owned verdict else.
+fn zigAstCheckError(ctx: *ToolCtx, source: []const u8) ?[]u8 {
+    const gpa = ctx.gpa;
+    if (source.len > 4 << 20) return null; // absurdly large — do not gate
+    const tmp = std.fmt.allocPrint(gpa, "{s}/.nlzchk-{d}.zig", .{ ctx.run_dir, chk_seq.fetchAdd(1, .monotonic) }) catch return null;
+    defer gpa.free(tmp);
+    std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = tmp, .data = source }) catch return null;
+    defer std.Io.Dir.cwd().deleteFile(ctx.io, tmp) catch {};
+    const zig = blk: {
+        if (ctx.environ.get("NL_ZIG")) |z| {
+            const t = std.mem.trim(u8, z, " \r\n\t");
+            if (t.len > 0) break :blk t;
+        }
+        break :blk "zig";
+    };
+    const argv = [_][]const u8{ zig, "ast-check", tmp };
+    // Same mutex-safety story as the py/js gates: this can run while a file mutex is held, so it is bounded.
+    const r = std.process.run(gpa, ctx.io, .{ .argv = &argv, .environ_map = ctx.environ, .stdout_limit = .limited(4096), .stderr_limit = .limited(16 << 10), .timeout = .{ .duration = .{ .raw = .fromSeconds(20), .clock = .awake } } }) catch return null;
+    defer gpa.free(r.stdout);
+    defer gpa.free(r.stderr);
+    return switch (r.term) {
+        .exited => |c| if (c == 0) null else zigAstErrLine(gpa, r.stderr),
+        else => null,
+    };
+}
+
+/// The post-write verifier for patch_system: real .zig ast-check, else the shared extension gate (.py/.js/.json
+/// and the brace heuristic for the rest). Deliberately SEPARATE from syntaxGateError so the workdir edit path is
+/// byte-for-byte unchanged — only self-mods to the engine source pick up the added .zig rigor. null = passes.
+fn patchVerifyError(ctx: *ToolCtx, npath: []const u8, source: []const u8, orig: []const u8) ?[]u8 {
+    if (std.mem.endsWith(u8, npath, ".zig")) return zigAstCheckError(ctx, source);
+    return syntaxGateError(ctx, npath, source, orig);
+}
+
+/// Store one pre-edit file image under {run_dir}/.patch_journal/objects/<wyhash-hex> and return the hex key
+/// (owned). The governor reconstructs the same path from w.run_dir (== ctx.run_dir) + this key, so the journal
+/// line itself carries no space-bearing absolute path. null on any I/O trouble — journaling is best-effort and
+/// never blocks a self-edit.
+fn patchJournalObject(ctx: *ToolCtx, data: []const u8) ?[]u8 {
+    const gpa = ctx.gpa;
+    const h = std.hash.Wyhash.hash(0x9e3779b97f4a7c15, data);
+    const hex = std.fmt.allocPrint(gpa, "{x}", .{h}) catch return null;
+    const dir = std.fmt.allocPrint(gpa, "{s}/.patch_journal/objects", .{ctx.run_dir}) catch {
+        gpa.free(hex);
+        return null;
+    };
+    defer gpa.free(dir);
+    _ = std.Io.Dir.cwd().createDirPathStatus(ctx.io, dir, .default_dir) catch {};
+    const p = std.fmt.allocPrint(gpa, "{s}/{s}", .{ dir, hex }) catch {
+        gpa.free(hex);
+        return null;
+    };
+    defer gpa.free(p);
+    std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = p, .data = data }) catch {
+        gpa.free(hex);
+        return null;
+    };
+    return hex;
+}
+
+/// Append an accepted patch_system self-edit to PATCH_JOURNAL_SCOPE. paths[i] pairs with pres[i]: a non-null pre
+/// is the file's pre-edit bytes (backed up as an object, key recorded), a null pre means a freshly-created file
+/// (recorded NEW → rollback deletes it). The line the governor reads:
+///   round=R op=OP hi=0|1 paths=a,b obj=HEX,NEW crit=<clip>
+/// Best-effort; a journaling failure never blocks the edit that already landed.
+fn journalPatch(ctx: *ToolCtx, op: []const u8, paths: []const []const u8, pres: []const ?[]const u8, crit: []const u8, high_impact: bool) void {
+    const gpa = ctx.gpa;
+    var line: std.ArrayListUnmanaged(u8) = .empty;
+    defer line.deinit(gpa);
+    const head = std.fmt.allocPrint(gpa, "round={d} op={s} hi={d} paths=", .{ ctx.round, op, @intFromBool(high_impact) }) catch return;
+    defer gpa.free(head);
+    line.appendSlice(gpa, head) catch return;
+    for (paths, 0..) |pth, i| {
+        if (i > 0) line.append(gpa, ',') catch return;
+        line.appendSlice(gpa, pth) catch return;
+    }
+    line.appendSlice(gpa, " obj=") catch return;
+    for (pres, 0..) |pre, i| {
+        if (i > 0) line.append(gpa, ',') catch return;
+        if (pre) |bytes| {
+            if (patchJournalObject(ctx, bytes)) |hex| {
+                defer gpa.free(hex);
+                line.appendSlice(gpa, hex) catch return;
+            } else line.appendSlice(gpa, "ERR") catch return;
+        } else line.appendSlice(gpa, "NEW") catch return;
+    }
+    const tail = std.fmt.allocPrint(gpa, " crit={s}", .{clip(crit, 120)}) catch return;
+    defer gpa.free(tail);
+    line.appendSlice(gpa, tail) catch return;
+    _ = ctx.mem.observe(PATCH_JOURNAL_SCOPE, line.items);
+}
+
+/// The file paths a `*** Begin Patch` envelope touches (Add/Update/Delete File: headers) — so patch mode can
+/// snapshot pre-images before applying and verify/restore after. Order-preserving, deduped, capped at 64, and
+/// each rel is passed through the same safeRel + path-allow guards the Python applier enforces (a rel that fails
+/// them is skipped here; the applier rejects it anyway). Appends owned dups into `out`.
+/// The rel path a single `*** (Add|Update|Delete) File: <rel>` header names, or null if the line is not one.
+/// The inline-for here only uses `return` (function exit), never loop control flow, so it stays comptime-clean.
+fn patchHeaderRel(ln: []const u8) ?[]const u8 {
+    inline for (.{ "*** Add File: ", "*** Update File: ", "*** Delete File: " }) |pfx| {
+        if (std.mem.startsWith(u8, ln, pfx)) return std.mem.trim(u8, ln[pfx.len..], " \r\t");
+    }
+    return null;
+}
+
+fn patchTouchedPaths(gpa: std.mem.Allocator, patch: []const u8, out: *std.ArrayListUnmanaged([]u8)) void {
+    var it = std.mem.splitScalar(u8, patch, '\n');
+    while (it.next()) |raw| {
+        const ln = std.mem.trim(u8, raw, " \r\t");
+        const rel = patchHeaderRel(ln) orelse continue;
+        if (rel.len == 0 or !safeRel(rel) or !patchSystemPathAllowed(rel)) continue;
+        if (out.items.len >= 64) break;
+        var seen = false;
+        for (out.items) |e| {
+            if (std.mem.eql(u8, e, rel)) {
+                seen = true;
+                break;
+            }
+        }
+        if (!seen) out.append(gpa, gpa.dupe(u8, rel) catch return) catch return;
+    }
+}
+
 fn patchSystem(ctx: *ToolCtx, args_json: []const u8) []u8 {
     const gpa = ctx.gpa;
     const A = struct {
@@ -4010,7 +4184,7 @@ fn patchSystem(ctx: *ToolCtx, args_json: []const u8) []u8 {
 
     if (std.mem.eql(u8, p.value.mode, "patch")) {
         if (std.mem.trim(u8, p.value.patch, " \r\n\t").len == 0) return dupe(gpa, "patch mode needs a non-empty patch");
-        return patchSystemPatch(ctx, root, p.value.patch);
+        return patchSystemPatch(ctx, root, p.value.patch, p.value.success_criterion, high_impact);
     }
 
     if (!safeRel(p.value.path)) return dupe(gpa, "bad path — use a path RELATIVE to your workdir (no leading / or \\, no '..'), e.g. index.html or css/style.css");
@@ -4026,19 +4200,46 @@ fn patchSystem(ctx: *ToolCtx, args_json: []const u8) []u8 {
     }
 
     if (std.mem.eql(u8, p.value.mode, "write")) {
+        // Snapshot the pre-image (null ⇒ the file is new) BEFORE the write, so a failed verify can restore it and
+        // the governor can roll it back later. 4MB cap covers every engine source file.
+        const had: ?[]u8 = std.Io.Dir.cwd().readFileAlloc(ctx.io, full, gpa, .limited(4 << 20)) catch null;
+        defer if (had) |h| gpa.free(h);
         if (std.fs.path.dirname(full)) |dir| _ = std.Io.Dir.cwd().createDirPathStatus(ctx.io, dir, .default_dir) catch {};
         std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = full, .data = p.value.content }) catch return dupe(gpa, "could not write file");
-        return std.fmt.allocPrint(gpa, "patch_system wrote {d} bytes to {s}", .{ p.value.content.len, p.value.path }) catch dupe(gpa, "patch_system wrote");
+        if (patchVerifyOn(ctx)) {
+            if (patchVerifyError(ctx, p.value.path, p.value.content, if (had) |h| h else "")) |err| {
+                defer gpa.free(err);
+                if (had) |h| {
+                    _ = writeWorkFileAtomic(ctx, full, h);
+                } else std.Io.Dir.cwd().deleteFile(ctx.io, full) catch {};
+                return std.fmt.allocPrint(gpa, "self-mod REVERTED: {s} would not parse after the write ({s}). The file is unchanged — fix the error and resubmit.", .{ p.value.path, clip(err, 240) }) catch dupe(gpa, "self-mod reverted (would not parse)");
+            }
+        }
+        const paths = [_][]const u8{p.value.path};
+        const pres = [_]?[]const u8{if (had) |h| h else null};
+        journalPatch(ctx, "write", &paths, &pres, p.value.success_criterion, high_impact);
+        return std.fmt.allocPrint(gpa, "patch_system wrote {d} bytes to {s} (verified)", .{ p.value.content.len, p.value.path }) catch dupe(gpa, "patch_system wrote");
     }
 
     if (std.mem.eql(u8, p.value.mode, "replace")) {
         if (p.value.find.len == 0) return dupe(gpa, "replace mode needs non-empty find");
-        const data = std.Io.Dir.cwd().readFileAlloc(ctx.io, full, gpa, .limited(256 << 10)) catch return dupe(gpa, "not found");
+        // 4MB read: the pre-image must be the WHOLE file (a smaller cap would restore a truncated copy on revert).
+        const data = std.Io.Dir.cwd().readFileAlloc(ctx.io, full, gpa, .limited(4 << 20)) catch return dupe(gpa, "not found");
         defer gpa.free(data);
         const out = replaceOne(gpa, data, p.value.find, p.value.replace) orelse return dupe(gpa, "find text missing or ambiguous (need exactly one match)");
         defer gpa.free(out);
         std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = full, .data = out }) catch return dupe(gpa, "could not write file");
-        return std.fmt.allocPrint(gpa, "patch_system replaced 1 match in {s}", .{p.value.path}) catch dupe(gpa, "patch_system replaced");
+        if (patchVerifyOn(ctx)) {
+            if (patchVerifyError(ctx, p.value.path, out, data)) |err| {
+                defer gpa.free(err);
+                _ = writeWorkFileAtomic(ctx, full, data);
+                return std.fmt.allocPrint(gpa, "self-mod REVERTED: {s} would not parse after the replace ({s}). The file is unchanged.", .{ p.value.path, clip(err, 240) }) catch dupe(gpa, "self-mod reverted (would not parse)");
+            }
+        }
+        const paths = [_][]const u8{p.value.path};
+        const pres = [_]?[]const u8{data};
+        journalPatch(ctx, "replace", &paths, &pres, p.value.success_criterion, high_impact);
+        return std.fmt.allocPrint(gpa, "patch_system replaced 1 match in {s} (verified)", .{p.value.path}) catch dupe(gpa, "patch_system replaced");
     }
 
     return dupe(gpa, "patch_system mode must be read/write/replace/patch");
@@ -4503,8 +4704,59 @@ fn deleteFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
     return std.fmt.allocPrint(gpa, "deleted {s}", .{p.value.path}) catch dupe(gpa, "deleted");
 }
 
-fn patchSystemPatch(ctx: *ToolCtx, root: []const u8, patch: []const u8) []u8 {
+const PatchSnap = struct { rel: []u8, pre: ?[]u8 };
+
+/// Read the current bytes of every path the patch touches, so a failed apply/verify can be rolled back. A rel
+/// that does not exist (an Add) snapshots as pre=null. Caller frees each .rel and .pre.
+fn snapshotPatchTargets(ctx: *ToolCtx, root: []const u8, patch: []const u8) std.ArrayListUnmanaged(PatchSnap) {
     const gpa = ctx.gpa;
+    var rels: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (rels.items) |r| gpa.free(r);
+        rels.deinit(gpa);
+    }
+    patchTouchedPaths(gpa, patch, &rels);
+    var snaps: std.ArrayListUnmanaged(PatchSnap) = .empty;
+    for (rels.items) |rel| {
+        const full = std.fmt.allocPrint(gpa, "{s}/{s}", .{ root, rel }) catch continue;
+        defer gpa.free(full);
+        const pre: ?[]u8 = std.Io.Dir.cwd().readFileAlloc(ctx.io, full, gpa, .limited(4 << 20)) catch null;
+        snaps.append(gpa, .{ .rel = gpa.dupe(u8, rel) catch continue, .pre = pre }) catch {
+            if (pre) |b| gpa.free(b);
+        };
+    }
+    return snaps;
+}
+
+fn freePatchSnaps(gpa: std.mem.Allocator, snaps: *std.ArrayListUnmanaged(PatchSnap)) void {
+    for (snaps.items) |s| {
+        gpa.free(s.rel);
+        if (s.pre) |b| gpa.free(b);
+    }
+    snaps.deinit(gpa);
+}
+
+/// Restore every snapshotted file to its pre-edit state: write the pre-image back, or delete a file that did not
+/// exist before (pre=null). Used both when the Python applier fails part-way and when post-apply verify rejects.
+fn restorePatchTargets(ctx: *ToolCtx, root: []const u8, snaps: []const PatchSnap) void {
+    const gpa = ctx.gpa;
+    for (snaps) |s| {
+        const full = std.fmt.allocPrint(gpa, "{s}/{s}", .{ root, s.rel }) catch continue;
+        defer gpa.free(full);
+        if (s.pre) |bytes| {
+            _ = writeWorkFileAtomic(ctx, full, bytes);
+        } else std.Io.Dir.cwd().deleteFile(ctx.io, full) catch {};
+    }
+}
+
+fn patchSystemPatch(ctx: *ToolCtx, root: []const u8, patch: []const u8, crit: []const u8, high_impact: bool) []u8 {
+    const gpa = ctx.gpa;
+    const verify = patchVerifyOn(ctx);
+    // Snapshot BEFORE applying: the Python runner applies file-by-file and can bad()-exit part-way, so even a
+    // failed multi-file patch may have half-landed. With snapshots we can put the tree back either way.
+    var snaps = if (verify) snapshotPatchTargets(ctx, root, patch) else std.ArrayListUnmanaged(PatchSnap).empty;
+    defer freePatchSnaps(gpa, &snaps);
+
     var env = ctx.environ.clone(gpa) catch return dupe(gpa, "oom");
     forcePyUtf8(&env);
     defer env.deinit();
@@ -4515,9 +4767,37 @@ fn patchSystemPatch(ctx: *ToolCtx, root: []const u8, patch: []const u8) []u8 {
         return if (deps.isSpawnMissing(e)) deps.hint(gpa, "python") else dupe(gpa, "patch_system patch runner failed");
     defer gpa.free(r.stdout);
     defer gpa.free(r.stderr);
-    if (r.term == .exited and r.term.exited == 0 and std.mem.trim(u8, r.stdout, " \r\n\t").len > 0)
-        return dupe(gpa, clip(std.mem.trim(u8, r.stdout, " \r\n\t"), 5000));
-    return std.fmt.allocPrint(gpa, "patch failed\nstdout:\n{s}\nstderr:\n{s}", .{ clip(r.stdout, 2500), clip(r.stderr, 1500) }) catch dupe(gpa, "patch failed");
+    const applied = r.term == .exited and r.term.exited == 0 and std.mem.trim(u8, r.stdout, " \r\n\t").len > 0;
+    if (!applied) {
+        if (verify) restorePatchTargets(ctx, root, snaps.items); // undo any partial application
+        return std.fmt.allocPrint(gpa, "patch failed\nstdout:\n{s}\nstderr:\n{s}", .{ clip(r.stdout, 2500), clip(r.stderr, 1500) }) catch dupe(gpa, "patch failed");
+    }
+
+    if (verify) {
+        // Verify every touched file that still exists (a Delete removed its target — nothing to parse).
+        for (snaps.items) |s| {
+            const full = std.fmt.allocPrint(gpa, "{s}/{s}", .{ root, s.rel }) catch continue;
+            defer gpa.free(full);
+            const now = std.Io.Dir.cwd().readFileAlloc(ctx.io, full, gpa, .limited(4 << 20)) catch continue;
+            defer gpa.free(now);
+            if (patchVerifyError(ctx, s.rel, now, if (s.pre) |b| b else "")) |err| {
+                defer gpa.free(err);
+                restorePatchTargets(ctx, root, snaps.items);
+                return std.fmt.allocPrint(gpa, "self-mod REVERTED: {s} would not parse after the patch ({s}). Every file the patch touched was restored to its previous state.", .{ s.rel, clip(err, 220) }) catch dupe(gpa, "self-mod reverted (would not parse)");
+            }
+        }
+        // Journal the whole patch as one entry so the governor can roll all its files back together.
+        var paths: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer paths.deinit(gpa);
+        var pres: std.ArrayListUnmanaged(?[]const u8) = .empty;
+        defer pres.deinit(gpa);
+        for (snaps.items) |s| {
+            paths.append(gpa, s.rel) catch {};
+            pres.append(gpa, if (s.pre) |b| b else null) catch {};
+        }
+        journalPatch(ctx, "patch", paths.items, pres.items, crit, high_impact);
+    }
+    return dupe(gpa, clip(std.mem.trim(u8, r.stdout, " \r\n\t"), 5000));
 }
 
 /// SSRF guard: only http(s), and reject obvious local/internal targets (loopback, link-local cloud metadata,
@@ -7466,4 +7746,47 @@ test "localCoversQuery gates the RAG prepend: on-topic passes, fiction matched o
     // genuinely on-topic hits still pass — the RAG-first policy keeps its exhibit when it has earned it
     const on_topic = "quantum inference on variational circuits scales with qubit count; machine learning hybrids train the ansatz classically; see the arXiv survey papers";
     try std.testing.expect(localCoversQuery(on_topic, query));
+}
+
+test "patchVerifyFlag: unset/empty default the post-write verify ON; only an explicit off disables it" {
+    try std.testing.expect(patchVerifyFlag(null));
+    try std.testing.expect(patchVerifyFlag(""));
+    try std.testing.expect(patchVerifyFlag("1"));
+    try std.testing.expect(patchVerifyFlag("true"));
+    try std.testing.expect(!patchVerifyFlag("0"));
+    try std.testing.expect(!patchVerifyFlag("false"));
+    try std.testing.expect(!patchVerifyFlag("OFF"));
+}
+
+test "patchTouchedPaths lists a patch envelope's Add/Update/Delete targets, dedups, and drops unsafe/blocked paths" {
+    const gpa = std.testing.allocator;
+    const patch =
+        "*** Begin Patch\n" ++
+        "*** Update File: src/worker/tools.zig\n" ++
+        "@@\n-old\n+new\n" ++
+        "*** Add File: src/worker/new.zig\n" ++
+        "+hello\n" ++
+        "*** Delete File: src/worker/tools.zig\n" ++ // same target again -> deduped, not counted twice
+        "*** Update File: /etc/passwd\n" ++ // absolute -> dropped by safeRel
+        "*** Update File: .git/config\n" ++ // blocked prefix -> dropped by patchSystemPathAllowed
+        "*** End Patch\n";
+    var out: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (out.items) |e| gpa.free(e);
+        out.deinit(gpa);
+    }
+    patchTouchedPaths(gpa, patch, &out);
+    try std.testing.expectEqual(@as(usize, 2), out.items.len);
+    try std.testing.expectEqualStrings("src/worker/tools.zig", out.items[0]);
+    try std.testing.expectEqualStrings("src/worker/new.zig", out.items[1]);
+}
+
+test "zigAstErrLine distills a zig ast-check verdict to line N: msg, and fails OPEN when stderr names no error" {
+    const gpa = std.testing.allocator;
+    const stderr = "/tmp/x/.nlzchk-3.zig:42:9: error: expected ';' after statement\n    foo()\n        ^\n";
+    const v = zigAstErrLine(gpa, stderr) orelse return error.ExpectedVerdict;
+    defer gpa.free(v);
+    try std.testing.expectEqualStrings("line 42: expected ';' after statement", v);
+    // a zig that printed no "error:" line (missing, wrong flag, note-only) must NEVER reject an edit
+    try std.testing.expect(zigAstErrLine(gpa, "note: some unrelated info\n") == null);
 }
