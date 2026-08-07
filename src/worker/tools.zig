@@ -1019,6 +1019,11 @@ pub const LESSON_SCOPE = "lessons";
 pub const LESSON_PROPOSED_SCOPE = "lessons-proposed";
 pub const SKILL_PROPOSED_SCOPE = "skills-proposed";
 
+/// QUARANTINE for the deterministic habit miner: recurring successful tool SEQUENCES a mind executed together,
+/// counted across the run (zero model calls). A candidate reusable procedure — surfaced for review/promotion the
+/// same way the judge's lesson/skill proposals are, never auto-run and never injected into a prompt.
+pub const HABIT_PROPOSED_SCOPE = "habits-proposed";
+
 /// The swarm's FITNESS history — one "round N: P/T (pct%)" line per round, written by the engine's benchmark.
 /// This is the measurable spine of recursive self-improvement: improvement is a NUMBER that must climb, not a
 /// vibe. The deliverable is scored each round (real tests > compiles > artifact-presence) and that score is fed
@@ -1872,6 +1877,13 @@ fn executeInner(ctx: *ToolCtx, name: []const u8, args_json: []const u8) []u8 {
         for (nm) |ch| if (!((ch >= 'a' and ch <= 'z') or (ch >= '0' and ch <= '9') or ch == '_')) return dupe(gpa, "rejected: name must be snake_case [a-z0-9_]");
         if (isBuiltinTool(nm)) return dupe(gpa, "rejected: that name shadows a built-in tool");
         if (p.value.body.len == 0 or p.value.body.len > MAX_TOOL_BODY) return dupe(gpa, "rejected: body empty or >8KB");
+        // DRY-RUN the body as Python before it enters the registry, so a syntax error surfaces NOW instead of at
+        // the tool's first (possibly much later) call. Reuses the edit paths' compile gate; fails OPEN when no
+        // python is on the machine (a py-less host can still author tools — they just aren't pre-checked).
+        if (pyCompileError(ctx, p.value.body, "")) |perr| {
+            defer gpa.free(perr);
+            return std.fmt.allocPrint(gpa, "rejected: the tool body does not compile as Python ({s}). A broken body would only fail at first call — fix it and resubmit.", .{clip(perr, 220)}) catch dupe(gpa, "rejected: body does not compile as Python");
+        }
         const pj = std.json.Stringify.valueAlloc(gpa, p.value.params, .{}) catch return dupe(gpa, "rejected: bad params json");
         defer gpa.free(pj);
         if (pj.len < 2 or pj[0] != '{' or pj.len > MAX_TOOL_PARAMS) return dupe(gpa, "rejected: params must be a JSON object <=4KB");
@@ -7789,4 +7801,17 @@ test "zigAstErrLine distills a zig ast-check verdict to line N: msg, and fails O
     try std.testing.expectEqualStrings("line 42: expected ';' after statement", v);
     // a zig that printed no "error:" line (missing, wrong flag, note-only) must NEVER reject an edit
     try std.testing.expect(zigAstErrLine(gpa, "note: some unrelated info\n") == null);
+}
+
+test "make_tool dry-runs the body: the py-compile gate precedes the TOOL_SCOPE registration" {
+    // The whole point of the dry-run is to reject a broken body BEFORE it is stored — if the compile gate ever
+    // moved after the observe, a syntax error would enter the registry and only surface at first call again.
+    const SRC = @embedFile("tools.zig");
+    const at = std.mem.indexOf(u8, SRC, "if (std.mem.eql(u8, name, \"make_tool\"))") orelse return error.MakeToolMissing;
+    // Bound the search at the registration itself rather than a byte window: a fixed window that stops short
+    // would fail for the wrong reason (and one that overshoots could read a LATER branch's calls as this one's).
+    const rest = SRC[at..];
+    const reg = std.mem.indexOf(u8, rest, "observe(TOOL_SCOPE") orelse return error.RegMissing;
+    const before_reg = rest[0..reg];
+    if (std.mem.indexOf(u8, before_reg, "pyCompileError(ctx, p.value.body") == null) return error.DryRunNotBeforeRegistration;
 }

@@ -274,6 +274,9 @@ pub const Worker = struct {
     idle_skip: bool = false, // opt-in (NL_IDLE_SKIP): a provably-idle non-lead assembler mind skips its LLM moment
     patch_autorevert: bool = false, // opt-in (NL_PATCH_SYSTEM_AUTOREVERT): the governor restores a self-mod's pre-image on a `rollback` verdict
     lesson_credit: bool = true, // NL_LESSON_CREDIT (on by default): a verified fix reinforces the prior lesson that preceded it (strengthen-only)
+    habit_mine: bool = true, // NL_HABIT_MINE (on by default): mine recurring successful tool sequences into the habit quarantine (deterministic)
+    habits: [24]HabitRec = [_]HabitRec{.{}} ** 24, // the run's habit table (bounded), folded per moment
+    habit_n: u8 = 0,
     playbook_str: []const u8 = "",
     kindex_str: []const u8 = "",
     // MIND-FLOOR lesson stash: the newest still-unpaired hard failure, carried across rounds so a later
@@ -750,6 +753,13 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
         const t = std.mem.trim(u8, v, " \r\n\t");
         w.lesson_credit = !(std.mem.eql(u8, t, "0") or std.ascii.eqlIgnoreCase(t, "false") or std.ascii.eqlIgnoreCase(t, "off") or std.ascii.eqlIgnoreCase(t, "no"));
         if (!w.lesson_credit) w.act("engine", 0, "mode", "lesson-credit-off", "outcome credit for recalled lessons DISABLED (NL_LESSON_CREDIT=0): a verified fix no longer reinforces the prior lesson that preceded it.");
+    }
+    // HABIT MINING (on by default; NL_HABIT_MINE=0 disables): the deterministic counterpart to the LLM judge —
+    // count recurring successful tool sequences per mind and, at end of run, propose the frequent ones into the
+    // habit quarantine as candidate reusable procedures. Zero model calls; never auto-runs anything.
+    if (environ.get("NL_HABIT_MINE")) |v| {
+        const t = std.mem.trim(u8, v, " \r\n\t");
+        w.habit_mine = !(std.mem.eql(u8, t, "0") or std.ascii.eqlIgnoreCase(t, "false") or std.ascii.eqlIgnoreCase(t, "off") or std.ascii.eqlIgnoreCase(t, "no"));
     }
     if (live) {
         const c = llm.capsSnapshot();
@@ -1353,6 +1363,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
             if (mi.scout and moment.skills == 0 and moment.files == 0)
                 _ = w.mem.observe(mi.scope, "scout: found no new external technique this round; team proceeds with current knowledge");
             applyLessonRecords(&w, round, &moment); // cross-mind/cross-round fail→fix pairing (single-threaded here)
+            recordHabit(&w, &moment); // fold this moment's successful-call window into the run's habit table
             mi.facts = moment.facts;
             total_files += moment.files;
             if (gpa.dupe(u8, moment.stance)) |st| (mi.stances.append(gpa, st) catch gpa.free(st)) else |_| {}
@@ -1765,6 +1776,7 @@ fn writeDone(w: *Worker, reason: []const u8) void {
     if (!w.judged) {
         w.judged = true;
         rsi.runJudge(w);
+        proposeHabits(w); // deterministic counterpart to the LLM judge: propose recurring tool sequences
     }
     const dp = std.fmt.allocPrint(w.gpa, "{s}/DONE", .{w.run_dir}) catch return;
     defer w.gpa.free(dp);
@@ -2627,6 +2639,109 @@ fn creditRecalledLesson(w: *Worker, round: u32, fail: *const LessonRec) void {
     var db: [280]u8 = undefined;
     const desc = std.fmt.bufPrint(&db, "a prior verified lesson preceded this fix — reinforced it: {s}", .{clip(t, 180)}) catch "reinforced a prior verified lesson";
     w.act("engine", round, "lesson_credit", fail.toolStr(), desc);
+}
+
+/// One recurring successful tool sequence and how often a mind ran it this run.
+const HabitRec = struct { seq: [72]u8 = [_]u8{0} ** 72, len: u8 = 0, count: u16 = 0 };
+
+/// Navigation tools — a window of only these is browsing, not a reusable procedure worth proposing.
+fn isNavTool(name: []const u8) bool {
+    return std.mem.eql(u8, name, "read_file") or std.mem.eql(u8, name, "list_dir") or
+        std.mem.eql(u8, name, "recall_hive") or std.mem.eql(u8, name, "read_url");
+}
+
+/// Is a 2/3-tool window worth counting as a habit? It needs >= 2 DISTINCT tools (a>a>a is a retry loop, not a
+/// procedure) and must not be pure navigation. c == "" marks a trailing 2-gram. Pure — unit-tested.
+fn habitInteresting(a: []const u8, b: []const u8, c: []const u8) bool {
+    if (a.len == 0 or b.len == 0) return false;
+    const distinct = !std.mem.eql(u8, a, b) or (c.len > 0 and !std.mem.eql(u8, c, a) and !std.mem.eql(u8, c, b));
+    if (!distinct) return false;
+    if (isNavTool(a) and isNavTool(b) and (c.len == 0 or isNavTool(c))) return false;
+    return true;
+}
+
+/// Count one habit key into a bounded table: bump an existing entry, add a new one, or — when full — overwrite
+/// the least-frequent entry ONLY if it is itself a one-off, so an established habit is never evicted by a
+/// transient. Pure over its arguments; unit-tested.
+fn habitBump(habits: []HabitRec, n: *u8, key: []const u8) void {
+    if (key.len == 0 or key.len > 72) return;
+    var i: usize = 0;
+    while (i < n.*) : (i += 1) {
+        if (habits[i].len == key.len and std.mem.eql(u8, habits[i].seq[0..habits[i].len], key)) {
+            if (habits[i].count < 65535) habits[i].count += 1;
+            return;
+        }
+    }
+    if (n.* < habits.len) {
+        const r = &habits[n.*];
+        @memcpy(r.seq[0..key.len], key);
+        r.len = @intCast(key.len);
+        r.count = 1;
+        n.* += 1;
+        return;
+    }
+    var mi: usize = 0;
+    var mc: u16 = 65535;
+    i = 0;
+    while (i < n.*) : (i += 1) {
+        if (habits[i].count < mc) {
+            mc = habits[i].count;
+            mi = i;
+        }
+    }
+    if (mc <= 1) {
+        const r = &habits[mi];
+        @memcpy(r.seq[0..key.len], key);
+        r.len = @intCast(key.len);
+        r.count = 1;
+    }
+}
+
+/// HABIT MINING (deterministic, zero model calls): fold this moment's ordered successful-call window into the
+/// run's habit table. Single-threaded (called from the post-join per-moment loop), so no locking. moment.oks is
+/// already per-mind, in call order, and success-filtered — the exact granularity a reusable procedure lives at.
+fn recordHabit(w: *Worker, moment: *const Moment) void {
+    if (!w.habit_mine or moment.ok_n < 2) return;
+    var kb: [72]u8 = undefined;
+    var i: usize = 0;
+    while (i + 1 < moment.ok_n) : (i += 1) {
+        const a = moment.oks[i].toolStr();
+        const b = moment.oks[i + 1].toolStr();
+        if (i + 2 < moment.ok_n) {
+            const c = moment.oks[i + 2].toolStr();
+            if (habitInteresting(a, b, c)) {
+                const key = std.fmt.bufPrint(&kb, "{s}>{s}>{s}", .{ a, b, c }) catch continue;
+                habitBump(&w.habits, &w.habit_n, key);
+            }
+        } else if (habitInteresting(a, b, "")) {
+            const key = std.fmt.bufPrint(&kb, "{s}>{s}", .{ a, b }) catch continue;
+            habitBump(&w.habits, &w.habit_n, key);
+        }
+    }
+}
+
+/// END-OF-RUN: propose the habits that recurred enough to be worth formalizing (>= 3 times) into the quarantine
+/// scope, capped at 5. Like the judge's proposals these are candidates only — a human/review turns a recurring
+/// sequence into a runnable recipe; nothing here auto-registers or auto-runs one.
+fn proposeHabits(w: *Worker) void {
+    if (!w.habit_mine) return;
+    var proposed: usize = 0;
+    var i: usize = 0;
+    while (i < w.habit_n and proposed < 5) : (i += 1) {
+        const h = &w.habits[i];
+        if (h.count < 3) continue;
+        const line = std.fmt.allocPrint(w.gpa, "habit: {s} (a mind ran this sequence {d}x this run) | evidence: recurring successful tool sequence", .{ h.seq[0..h.len], h.count }) catch continue;
+        defer w.gpa.free(line);
+        _ = w.mem.observe(tools.HABIT_PROPOSED_SCOPE, line);
+        proposed += 1;
+    }
+    if (proposed > 0) {
+        var db: [200]u8 = undefined;
+        const desc = std.fmt.bufPrint(&db, "mined {d} recurring successful tool sequence(s) into the habit quarantine — candidate reusable procedures for review", .{proposed}) catch "mined habits";
+        w.act("engine", 0, "habit", "procedural patterns", desc);
+        var eb: [48]u8 = undefined;
+        w.emit("habit", std.fmt.bufPrint(&eb, ",\"proposed\":{d}", .{proposed}) catch ",\"proposed\":0");
+    }
 }
 
 /// RSI CAPACITY — the model-capacity self-tuner (DEMOTE-ONLY). The engine does NOT trust the model's name; each
@@ -11016,5 +11131,46 @@ test "lesson outcome-credit is wired at both fix sites, is strengthen-only, and 
         const at = std.mem.indexOf(u8, SRC, "INSIDE one moment") orelse return error.InMomentAnchorMissing;
         const near = SRC[at..@min(at + 420, SRC.len)];
         try std.testing.expect(std.mem.indexOf(u8, near, "creditRecalledLesson(") != null);
+    }
+}
+
+test "habitInteresting requires >=2 distinct non-navigation tools" {
+    try std.testing.expect(!habitInteresting("write_file", "write_file", "")); // a>a is a retry, not a procedure
+    try std.testing.expect(!habitInteresting("read_file", "list_dir", "recall_hive")); // pure navigation
+    try std.testing.expect(habitInteresting("write_file", "run_tests", "")); // real 2-step procedure
+    try std.testing.expect(habitInteresting("read_file", "write_file", "run_tests")); // nav + real work is fine
+    try std.testing.expect(!habitInteresting("", "run_tests", "")); // empty slot
+}
+
+test "habitBump counts, and never lets a transient evict an established habit" {
+    var habits: [3]HabitRec = [_]HabitRec{.{}} ** 3;
+    var n: u8 = 0;
+    habitBump(&habits, &n, "a>b");
+    habitBump(&habits, &n, "a>b");
+    habitBump(&habits, &n, "c>d");
+    habitBump(&habits, &n, "e>f");
+    try std.testing.expectEqual(@as(u8, 3), n);
+    // table full; a>b has count 2, the others 1. A NEW key overwrites a count==1 entry, never the count==2 one.
+    habitBump(&habits, &n, "g>h");
+    var ab: u16 = 0;
+    for (habits[0..n]) |h| {
+        if (std.mem.eql(u8, h.seq[0..h.len], "a>b")) ab = h.count;
+    }
+    try std.testing.expectEqual(@as(u16, 2), ab); // the established habit survived
+}
+
+test "the habit miner is wired at BOTH ends — per-moment record and end-of-run propose" {
+    const SRC = @embedFile("run.zig");
+    // per-moment fold, right beside the lesson pairing
+    {
+        const at = std.mem.indexOf(u8, SRC, "applyLessonRecords(&w, round, &moment);") orelse return error.PairingMissing;
+        const near = SRC[at..@min(at + 240, SRC.len)];
+        try std.testing.expect(std.mem.indexOf(u8, near, "recordHabit(&w, &moment)") != null);
+    }
+    // end-of-run proposal, in the same one-shot block as the judge
+    {
+        const at = std.mem.indexOf(u8, SRC, "rsi.runJudge(w);") orelse return error.JudgeCallMissing;
+        const near = SRC[at..@min(at + 160, SRC.len)];
+        try std.testing.expect(std.mem.indexOf(u8, near, "proposeHabits(w)") != null);
     }
 }
