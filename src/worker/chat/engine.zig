@@ -89,7 +89,6 @@ const AFK_MAX_STEPS: usize = 100_000;
 /// What loop=AFK injects as the next drive step when the driver declares DONE — the afk tier never accepts an end
 /// state, so "done" becomes a re-verify + extend (desk AFK_DRIVE_MSG). RE-GROUNDED to the goal at runtime so the
 /// persistent loop can't drift off onto an unrelated task. Only the user's Stop ends afk.
-const AFK_DRIVE_TMPL = "Keep going toward the goal: \"{s}\". Re-verify the latest work end-to-end, then pick the single most valuable next improvement or extension TOWARD THAT GOAL and do it now.";
 /// What an AFK loop injects when its next step just REPEATS the last one (afk skips the repeat-guard that ends a
 /// non-afk loop, so instead of churning the same failing step it steps back, re-grounds, and researches the blocker
 /// — the light server-side form of the desk's stuck->research escalation, using the model's own recall/search tools.
@@ -147,6 +146,12 @@ const SEARCH_QUERY_PROMPT =
 // written — the gap only surfaced as webpack errors at deploy time (observed live, c6a5a520a). A whole-project
 // build/compile catches missing-reference gaps that spot-checks structurally cannot.
 const TERMINAL_VERIFY_PROMPT = "Before calling this done, VERIFY the deliverable actually works AS A WHOLE: if the project has its own build/test entrypoint (a build script, a compiler, a test suite), RUN IT — a full build catches files that import or reference files never actually written, which spot-checking one flow misses. Otherwise run the code directly (run_tests / run_python). If any file the goal requires — or any file the written files import/include — is missing or empty, write it NOW (write_file). Verifying one slice does not verify the whole. If everything is present and works, give your FINAL summary to the user with no further tool calls — do not rewrite files that are already correct.";
+/// The AFK twin. Identical evidence demand, opposite ending: the tier-1 text closes with "give your FINAL
+/// summary to the user with no further tool calls", which lands one step after LOOP_QUESTION_AFK has said
+/// there is no finished state and DONE is not an answer. That sandwich is the contradiction an afk turn
+/// could not resolve. The check itself stays — a model can announce a build it did not finish in either
+/// tier — only the instruction about what to do once it passes changes.
+const TERMINAL_VERIFY_PROMPT_AFK = "Before calling this done, VERIFY the deliverable actually works AS A WHOLE: if the project has its own build/test entrypoint (a build script, a compiler, a test suite), RUN IT — a full build catches files that import or reference files never actually written, which spot-checking one flow misses. Otherwise run the code directly (run_tests / run_python). If any file the goal requires — or any file the written files import/include — is missing or empty, write it NOW (write_file). Verifying one slice does not verify the whole. If everything is present and works, say so in one line, then state what is still THIN or missing and continue with the next most valuable step — do not rewrite files that are already correct, and do not stop.";
 
 /// The single question the drive inference answers between settled steps: it either names the next concrete
 /// step (which becomes a synthetic user turn) or replies DONE. Carries the LOOP_SYSTEM intent inline rather than
@@ -1956,18 +1961,25 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     // as fresh prefill on every inference). Additive: empty/failed recall changes nothing.
     var recall_frag: std.ArrayListUnmanaged(u8) = .empty;
     defer recall_frag.deinit(gpa);
+    // THE GOAL ANCHOR, hoisted to turn scope. From the SECOND server turn onward `user_text` is not the
+    // user's goal at all — it is the desk's own kick sentence ("Auto-loop armed: continue driving toward the
+    // goal…"), because that is what the desk posts to re-arm. Every downstream consumer that thinks it is
+    // reading the goal was reading the engine's own re-drive text, which is why an afk session appeared to
+    // stop evolving: the anchor it re-grounded to WAS the anchor text. This resolution already existed and
+    // was already correct — it was just scoped to the recall block below and freed before the drive loop.
+    var goal_owned: ?[]u8 = null;
+    defer if (goal_owned) |g| gpa.free(g);
+    if (continuationShaped(user_text)) goal_owned = firstUserGoal(app, conv_dir);
+    // The real goal for everything that steers: the pinned first user message on a continuation-shaped turn,
+    // else what the user actually just said. NOT for the hippocampus observe — the message the user really
+    // sent is what belongs in memory.
+    const goal_text: []const u8 = if (goal_owned) |g| g else user_text;
     {
         // RESUME CUE: a continuation-shaped turn ("continue", the desk's auto-loop arm) carries no recall
         // cue of its own — keyed on the literal word, recall surfaces nothing and the resumed turn starts
         // unanchored (observed: a restart's "continue" re-scaffolded the whole build). Key it on the
         // conversation's pinned GOAL instead: the memories of the actual work come back.
-        var goal_owned: ?[]u8 = null;
-        defer if (goal_owned) |g| gpa.free(g);
-        var recall_query: []const u8 = user_text;
-        if (continuationShaped(user_text)) {
-            goal_owned = firstUserGoal(app, conv_dir);
-            if (goal_owned) |g| recall_query = g;
-        }
+        const recall_query: []const u8 = goal_text;
         const recalled = ctx.mem.recall(mem_scope, recall_query);
         defer gpa.free(recalled);
         if (recalled.len > 0) {
@@ -2283,8 +2295,10 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     var verify_buf: std.ArrayListUnmanaged(u8) = .empty;
     defer verify_buf.deinit(gpa);
     const verify_prompt: []const u8 = blk_vp: {
-        if (brief.done_when.len == 0) break :blk_vp TERMINAL_VERIFY_PROMPT;
-        verify_buf.appendSlice(gpa, TERMINAL_VERIFY_PROMPT) catch break :blk_vp TERMINAL_VERIFY_PROMPT;
+        // tier test inline: `afk` is declared with the loop-mode block below this point
+        const vbase = if (loop >= LOOP_AFK) TERMINAL_VERIFY_PROMPT_AFK else TERMINAL_VERIFY_PROMPT;
+        if (brief.done_when.len == 0) break :blk_vp vbase;
+        verify_buf.appendSlice(gpa, vbase) catch break :blk_vp vbase;
         verify_buf.appendSlice(gpa, "\nThis turn is not done until EVERY one of these holds — check each one and name any that does not:\n") catch break :blk_vp TERMINAL_VERIFY_PROMPT;
         for (brief.done_when) |c| {
             if (verify_buf.items.len > BRIEF_MAX_BYTES) break;
@@ -2298,7 +2312,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     // ---- AUTO-LOOP DRIVE: settle one answer, then either take the next PLAN subtask (deterministic) or infer the
     // next free-form step, and drive again until the plan/goal is done, a repeat, or the step cap. ----
     // `prev_drive` seeds the repeat guard with the user's own request so a driver that merely echoes it stops.
-    var prev_drive: []u8 = gpa.dupe(u8, user_text) catch &[_]u8{};
+    var prev_drive: []u8 = gpa.dupe(u8, goal_text) catch &[_]u8{};
     defer if (prev_drive.len > 0) gpa.free(prev_drive);
 
     // POST-ANSWER CRITIQUE source: the turn's first substantial answer, HELD (not critiqued) here and reviewed
@@ -2337,12 +2351,16 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     var idle_steps: usize = 0; // consecutive no-tool drive steps — the armed (non-afk) anti-spin bound (desk loop_idle)
     var verified_done = false; // TERMINAL BUILD-VERIFY fires at most once per turn (desk arc_final_verified)
     var swarm_timeout_nudged = false; // SWARM_TIMEOUT_MSG fires at most once per turn — after that a stuck hive can't hold the turn open forever
+    // A hive past its deadline that never went terminal. awaitConvCast returns .timeout instantly in that
+    // state and can never return .finished, so there is nothing left to await: afk stops asking, this turn.
+    var cast_abandoned = false;
     // afk re-drive / stuck messages, re-grounded to THIS turn's goal (the user message that started the loop) so the
     // persistent loop can't drift onto an unrelated task. Fixed stack buffers (no alloc/free on the hot path).
-    var afk_buf: [800]u8 = undefined;
     var stuck_buf: [800]u8 = undefined;
-    const goal_clip = clipBytes(user_text, 300);
-    const afk_msg = std.fmt.bufPrint(&afk_buf, AFK_DRIVE_TMPL, .{goal_clip}) catch "Keep going toward the goal — re-verify the latest work, then do the single most valuable next improvement.";
+    const goal_clip = clipBytes(goal_text, 300);
+    // AFK_DRIVE_TMPL is gone with its last reader: the "re-verify the latest work end-to-end, then pick the
+    // most valuable next improvement" treadmill is what afkNextStep replaced, and leaving it live at one
+    // stuck-hive site is how it kept reappearing.
     const afk_stuck_msg = std.fmt.bufPrint(&stuck_buf, AFK_STUCK_TMPL, .{goal_clip}) catch "You repeated the last step — try a DIFFERENT approach; recall_hive / web_search the actual blocker first.";
     if (armed) emitKV(app, conv_dir, "status", "text", if (afk) "auto-loop (afk): driving toward the goal" else "auto-loop: driving toward the goal");
     var steer_cursor = ctrl_cursor; // moving cursor over control.jsonl for stop + mid-turn steer messages
@@ -2736,7 +2754,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
         defer lq.deinit(gpa);
         lq.appendSlice(gpa, "{\"role\":\"system\",\"content\":") catch break :outer;
         var gb: [1700]u8 = undefined;
-        const goal_line = std.fmt.bufPrint(&gb, "You drive an agentic work loop. THE GOAL of this conversation: {s}\n(Only the most recent part of the conversation follows.)", .{clipBytes(user_text, 1400)}) catch "You drive an agentic work loop; only the most recent part of the conversation follows.";
+        const goal_line = std.fmt.bufPrint(&gb, "You drive an agentic work loop. THE GOAL of this conversation: {s}\n(Only the most recent part of the conversation follows.)", .{clipBytes(goal_text, 1400)}) catch "You drive an agentic work loop; only the most recent part of the conversation follows.";
         http.jstr(gpa, &lq, goal_line) catch break :outer;
         lq.appendSlice(gpa, "},") catch break :outer;
         lq.appendSlice(gpa, msgTail(conv_buf.items, LOOP_CTX_BYTES)) catch break :outer;
@@ -2779,7 +2797,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
             } else if (armed) {
                 // ARMED (on or afk): never accept DONE while this conversation's cast hive is still working —
                 // await it (cheap, stop-checked), then gather its results instead of settling over them.
-                if (awaitConvCast(app, uid, conv, conv_dir, steer_cursor, tool_client)) |w| switch (w) {
+                if (if (cast_abandoned) null else awaitConvCast(app, uid, conv, conv_dir, steer_cursor, tool_client)) |w| switch (w) {
                     .stopped => {
                         finishTurn(app, conv_dir, usage_t0);
                         return;
@@ -2788,7 +2806,16 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
                     .timeout => {
                         if (swarm_timeout_nudged) {
                             if (!afk) break :outer; // nudged once already — a stuck hive can't hold the turn forever
-                            next_step = afk_msg;
+                            // THE CAST-CONTINUE SPIN. awaitConvCast returns .timeout INSTANTLY once the hive is
+                            // past its deadline (no sleep, no probe), and a hive that never goes terminal stays
+                            // live forever — so in afk this was: DONE -> timeout in ~0ms -> canned drive text ->
+                            // a full agentic pass -> DONE -> … at full inference cost, over a swarm nobody stops.
+                            // Tier 1 escapes with the break above; afk cannot break, so it churned. Past the
+                            // deadline the await can never return .finished either, so there was nothing to wait
+                            // for: abandon the hive for the rest of this turn and drive on the written step.
+                            cast_abandoned = true;
+                            afk_written = afkNextStep(app, llm_dir, prompt, goal_text, conv_buf.items) orelse &[_]u8{};
+                            next_step = if (afk_written.len > 0) afk_written else AFK_KEEP_GOING;
                         } else {
                             swarm_timeout_nudged = true;
                             next_step = SWARM_TIMEOUT_MSG;
@@ -2798,7 +2825,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
                     // afk never accepts DONE. The PROMPTING role writes what to do instead, from the transcript
                     // tail that holds what was actually just built — the canned template is what a failed or
                     // implausible write degrades to, not the first choice (same contract as stuckStep above).
-                    afk_written = afkNextStep(app, llm_dir, prompt, user_text, conv_buf.items) orelse &[_]u8{};
+                    afk_written = afkNextStep(app, llm_dir, prompt, goal_text, conv_buf.items) orelse &[_]u8{};
                     next_step = if (afk_written.len > 0) afk_written else AFK_KEEP_GOING;
                 } else {
                     break :outer; // on: goal achieved, no hive in flight
@@ -2811,7 +2838,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
                 // afk: don't churn the same step — re-ground + research the blocker. PROMPTING writes the actual
                 // instruction from the transcript tail, which at this exact moment holds the failing command and
                 // its error; AFK_STUCK_TMPL is what a failed/implausible write degrades to, not the first choice.
-                stuck_written = stuckStep(app, llm_dir, prompt, user_text, trimmed, conv_buf.items) orelse &[_]u8{};
+                stuck_written = stuckStep(app, llm_dir, prompt, goal_text, trimmed, conv_buf.items) orelse &[_]u8{};
                 next_step = if (stuck_written.len > 0) stuck_written else afk_stuck_msg;
             } else if (armed) {
                 // ARMED repeat while the hive runs = "the hive is working" narrated twice — that's a wait, not
@@ -2852,7 +2879,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
             const rev = trio.independentReviewer();
             const course_p = if (rev) |r| r.provider else think;
             const course_role: Role = if (rev) |r| r.role else .thinking;
-            if (courseCheck(app, llm_dir, course_p, course_role, user_text, &brief, next_step, conv_buf.items)) |corrected| {
+            if (courseCheck(app, llm_dir, course_p, course_role, goal_text, &brief, next_step, conv_buf.items)) |corrected| {
                 course_written = corrected;
                 next_step = corrected;
                 // The user SEES the redirect. A silent correction is the worst version of this feature: the
@@ -2901,7 +2928,13 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     // otherwise be dropped forever — the next turn re-snapshots the control cursor past it. Drain once more:
     // drainChatControl persists each pending steer as a durable user message, so the NEXT turn replays it.
     salvageSteers(app, conv_dir, &steer_cursor);
-    if (has_plan) emitPlanClosing(app, conv_dir, plan);
+    // NOT IN AFK. This writes a role:"assistant" end-state claim into the durable transcript — "Plan complete
+    // — worked all N subtasks." or "Worked D of N planned subtasks this turn. Say \"continue\" to do the rest."
+    // In afk there is no turn the user sees and no user to say continue, and the desk's re-arm posts directly
+    // underneath it, so the history the next drive step reads alternates a completion claim in the model's own
+    // voice with a re-drive. (afk also never reaches the plan-complete branch that would demote has_plan, so
+    // this fired at the end of every planned afk turn.)
+    if (has_plan and !afk) emitPlanClosing(app, conv_dir, plan);
     // POST-ANSWER CRITIQUE, review half. It runs HERE, in the same deferred phase as the rolling-summary refresh
     // below and for the same reason: the answer was delivered and read long before this point, so the cost lands
     // where the user is not waiting on a blank chat. It can only ADD a message — the answer above is already

@@ -2141,10 +2141,15 @@ pub const Chat = struct {
             // for a server-served conv the local stopLoop (which clears it) never runs, so without this the send
             // column stays stuck on "Stop" after the reply and the user has to click Stop before they can send
             // again. The server drove to completion regardless of these flags; clearing them only fixes the UI.
+            // …EXCEPT AFK, WHICH ONLY THE USER ENDS. The server exits an afk turn on its own for reasons that
+            // are not completion — a single failed/empty drive inference breaks its loop ("even afk", by that
+            // code's own comment) — and a {done} then disarmed a session the user was promised runs forever.
+            // Worse, clearing chat_loop in the same breath stopped the desk's local maybeLoop from picking the
+            // work back up, so one transient provider hiccup silently ended an unattended run. Keep afk armed;
+            // clear the tier-1 flag only when afk is off, which is the case the UI comment above describes.
             {
                 self.store.lock();
-                self.store.chat_loop = false;
-                self.store.chat_loop_afk = false;
+                if (!self.store.chat_loop_afk) self.store.chat_loop = false;
                 self.store.unlock();
             }
             self.sc_serving = false; // no longer server-served; the local maybeLoop may drive a future turn
@@ -6092,7 +6097,12 @@ pub const Chat = struct {
             msgs.appendSlice(self.gpa, ",{\"role\":\"user\",\"content\":\"The cast has finished. The files listed above are WHATEVER the hive actually produced - their names may NOT match what the goal asked for (a file called COORDINATOR_PLAN.md or research.py might be the real deliverable, or a goal-named file might be missing). INVENTORY the files, judge which ones actually answer the user's original request, and compose your answer STRICTLY from their real content shown above - never invent content and never claim a file exists that isn't listed. If the goal asked for specific files that aren't present, say so plainly and point to the odd-named files that cover (or fail to cover) that need. TRUST THE SCORE: when the [cast] result above says 100%, the engine's own benchmark has ALREADY verified every deliverable file is present and structurally whole (it parses each format and fails cut-off files), so do NOT spend turns re-reading files just to re-verify existence or completeness - compose the answer now; read a file only when the content shown above is genuinely insufficient for the user's request. A score under 100% means something IS missing or broken - name it and fix or finish it. Do not cast again.\"}") catch return;
         }
         if (kind == .loop_infer) {
-            msgs.appendSlice(self.gpa, ",{\"role\":\"user\",\"content\":\"Output the next message to send now (or exactly DONE if the goal is already complete). Reply with only that message text.\"}") catch return;
+            // The closing ask is the LAST and most recency-weighted message in this request, so offering DONE
+            // here outranks LOOP_SYSTEM_AFK's "never output DONE" sitting in the system slot far above it.
+            msgs.appendSlice(self.gpa, if (self.afkOn())
+                ",{\"role\":\"user\",\"content\":\"Output the next message to send now. There is no finished state in this session, so DONE is not an answer — name something not yet done. Reply with only that message text.\"}"
+            else
+                ",{\"role\":\"user\",\"content\":\"Output the next message to send now (or exactly DONE if the goal is already complete). Reply with only that message text.\"}") catch return;
         }
         if (kind == .consolidate) {
             msgs.appendSlice(self.gpa, ",{\"role\":\"user\",\"content\":\"Consolidation step. From the conversation above, output the REMEMBER:/FORGET: lines for any durable facts about ME (keys, logins, credentials, environment/setup, stable preferences) that I shared or changed and that are not already in YOUR MEMORY. One directive per line, no other text. If there is nothing new or changed, output exactly NONE.\"}") catch return;
@@ -7104,7 +7114,12 @@ pub const Chat = struct {
         self.last_user_len = @min(text.len, self.last_user.len);
         @memcpy(self.last_user[0..self.last_user_len], text[0..self.last_user_len]);
         self.tool_iters = 0;
-        self.act_nudges = 0; // each loop step re-earns its follow-through nudges + verification
+        // Per-step reset in tier 1 only. The act-follow-through nudge is capped at 2 PER ARC, and resetting
+        // that cap on every drive step turns "twice per arc" into "twice per step, forever" — which in afk is
+        // forever full stop. That is the `cast  continue` the user sees stacked down the transcript: the nudge
+        // appends a .cast_note reading "continue" (main.zig renders .cast_note as "cast"), and it fires again
+        // two steps later, and again. In afk the cap stays ARC-scoped like the other arc_* flags.
+        if (!afk) self.act_nudges = 0; // each loop step re-earns its follow-through nudges + verification
         self.arc_acted = false; // ...and re-earns loop continuation by ACTING (announce-only steps end it)
         self.arc_mutated = false;
         self.verify_done = false;
