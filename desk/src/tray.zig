@@ -58,6 +58,14 @@ pub const Tray = struct {
     pub fn takeMenuAction(t: *Tray) MenuAction {
         return if (t.inited) t.impl.takeMenuAction() else .none;
     }
+    /// Whether the window may be HIDDEN to this tray — i.e. whether a real, live icon exists to bring it
+    /// back. Not the same as `inited`: PosixTray.init returns true while every one of its methods is a
+    /// no-op, so trusting `inited` would strand a Linux/macOS user behind an invisible window with no icon
+    /// and no menu. False ⇒ the close button keeps its old meaning and quits.
+    pub fn canHide(t: *Tray) bool {
+        if (!t.inited) return false;
+        return if (builtin.os.tag == .windows) WindowsTray.g_add_ok else false;
+    }
     pub const Diag = struct { reg: u16, hwnd: bool, add: bool, err: u32 };
     pub fn diag(_: *Tray) Diag {
         return if (builtin.os.tag == .windows)
@@ -81,6 +89,17 @@ const WindowsTray = struct {
     const WM_RBUTTONUP: u32 = 0x0205;
     const WM_CONTEXTMENU: u32 = 0x007B;
     const WM_NULL: u32 = 0x0000;
+    // NOTIFYICON_VERSION_4 (adopted in init) changes what an ACTIVATION sends: the shell delivers
+    // NIN_SELECT / NIN_KEYSELECT, not WM_LBUTTONUP. Only the button-up codes were handled, so clicking the
+    // icon has never restored anything — right-click worked only because WM_CONTEXTMENU is itself a v4
+    // message. Harmless while the window was always on screen; the whole way back once it can be hidden.
+    const NIN_SELECT: u32 = 0x0400; // WM_USER + 0
+    const NIN_KEYSELECT: u32 = 0x0401; // WM_USER + 1
+    // Messages on the tray's OWN top-level window (it is a real WS_OVERLAPPEDWINDOW, parent=null), all of
+    // which used to fall through to DefWindowProcW — fine when the app died with its desk, load-bearing now.
+    const WM_CLOSE: u32 = 0x0010;
+    const WM_QUERYENDSESSION: u32 = 0x0011;
+    const WM_ENDSESSION: u32 = 0x0016;
     const PM_REMOVE: u32 = 0x0001;
     const NIM_ADD: u32 = 0;
     const NIM_MODIFY: u32 = 1;
@@ -198,6 +217,7 @@ const WindowsTray = struct {
     extern "user32" fn AppendMenuW(hMenu: ?*anyopaque, flags: u32, itemId: usize, text: ?[*:0]const u16) callconv(.winapi) i32;
     extern "user32" fn GetCursorPos(lpPoint: *POINT) callconv(.winapi) i32;
     extern "user32" fn SetForegroundWindow(hwnd: ?HWND) callconv(.winapi) i32;
+    extern "user32" fn RegisterWindowMessageW(lpString: [*:0]const u16) callconv(.winapi) u32;
     extern "user32" fn TrackPopupMenuEx(hMenu: ?*anyopaque, flags: u32, x: i32, y: i32, hwnd: ?HWND, tpm: ?*anyopaque) callconv(.winapi) u32;
     extern "user32" fn PostMessageW(hwnd: ?HWND, msg: u32, wParam: usize, lParam: isize) callconv(.winapi) i32;
     extern "gdi32" fn CreateDIBSection(hdc: ?*anyopaque, pbmi: *const BITMAPINFO, usage: u32, bits: *?*anyopaque, hSection: ?*anyopaque, offset: u32) callconv(.winapi) ?*anyopaque;
@@ -214,14 +234,17 @@ const WindowsTray = struct {
     var g_hwnd_ok: bool = false;
     var g_add_ok: bool = false;
     var g_err: u32 = 0;
+    var g_taskbar_created: u32 = 0; // the shell's "notification area re-created" broadcast; see wndProc
     extern "kernel32" fn GetLastError() callconv(.winapi) u32;
 
     const class_name = std.unicode.utf8ToUtf16LeStringLiteral("VeilDeskTrayWnd");
-    const menu_open = std.unicode.utf8ToUtf16LeStringLiteral("Open");
+    const menu_open = std.unicode.utf8ToUtf16LeStringLiteral("Open veil-desk");
     const menu_settings = std.unicode.utf8ToUtf16LeStringLiteral("Settings");
     const menu_notifications = std.unicode.utf8ToUtf16LeStringLiteral("Notifications");
     const menu_refresh = std.unicode.utf8ToUtf16LeStringLiteral("Refresh now");
-    const menu_quit = std.unicode.utf8ToUtf16LeStringLiteral("Quit");
+    // The close button no longer stops anything, so this menu is the only place the real quit is
+    // discoverable — it should say what it actually does.
+    const menu_quit = std.unicode.utf8ToUtf16LeStringLiteral("Quit veil (stops the server)");
 
     fn queueMenuAction(action: MenuAction) void {
         if (g_menu_action == .none) g_menu_action = action;
@@ -373,6 +396,7 @@ const WindowsTray = struct {
         wc.hInstance = hinst;
         wc.lpszClassName = class_name;
         g_reg = RegisterClassExW(&wc); // idempotent-ish; ignore "already registered"
+        g_taskbar_created = RegisterWindowMessageW(std.unicode.utf8ToUtf16LeStringLiteral("TaskbarCreated"));
         // Match the canonical Win32 tray recipe: a REAL overlapped window created then hidden (SW_HIDE) —
         // a proper window is a more reliable icon host than a zero-size style-0 one.
         const WS_OVERLAPPEDWINDOW: u32 = 0x00CF0000;
@@ -473,8 +497,12 @@ const WindowsTray = struct {
     fn wndProc(hwnd: ?HWND, msg: u32, wParam: usize, lParam: isize) callconv(.winapi) isize {
         if (msg == CALLBACK_MSG) {
             const ev: u32 = @intCast(@as(usize, @bitCast(lParam)) & 0xFFFF);
-            if (ev == WM_LBUTTONDBLCLK or ev == WM_LBUTTONUP) {
+            if (ev == WM_LBUTTONDBLCLK or ev == WM_LBUTTONUP or ev == NIN_SELECT or ev == NIN_KEYSELECT) {
                 g_restore = true;
+                // The shell grants foreground rights to the icon's owner when it forwards the click.
+                // Claiming them HERE is what lets the desk actually raise a frame later instead of just
+                // flashing in the taskbar; worst case it is a no-op.
+                _ = SetForegroundWindow(hwnd);
                 return 0;
             }
             if (ev == WM_RBUTTONUP or ev == WM_CONTEXTMENU) {
@@ -482,6 +510,41 @@ const WindowsTray = struct {
                 return 0;
             }
             return 0;
+        }
+        // The shell re-creates the notification area on an explorer.exe restart and every icon is dropped.
+        // Cosmetic when the window was always visible; now it would leave a hidden desk reachable only
+        // through Task Manager, so re-add on the broadcast. uFlags is restored first because setOnline and
+        // notify overwrite it with NIF_TIP / NIF_INFO.
+        if (g_taskbar_created != 0 and msg == g_taskbar_created) {
+            if (g_self) |s| {
+                s.nid.uFlags = NIF_ICON | NIF_TIP | NIF_MESSAGE;
+                s.live = Shell_NotifyIconW(NIM_ADD, &s.nid) != 0;
+                g_add_ok = s.live;
+                if (s.live) {
+                    s.nid.uVersionOrTimeout = NOTIFYICON_VERSION_4;
+                    _ = Shell_NotifyIconW(NIM_SETVERSION, &s.nid);
+                }
+            }
+            return 0;
+        }
+        switch (msg) {
+            // A polite close request aimed at this process — `taskkill /PID` without /F, a shutdown script,
+            // an updater asking apps to close — arrives as WM_CLOSE on every top-level window. Ours is one.
+            // DefWindowProcW would DESTROY the tray window, taking the icon with it and leaving a hidden
+            // desk with no way back; and a hidden desk is exactly when this matters. Treat it as the quit
+            // it plainly is.
+            WM_CLOSE => {
+                queueMenuAction(.quit);
+                return 0;
+            },
+            // "May I end?" — not "I am ending". A session end can still be cancelled by another app, so
+            // consent without acting; WM_ENDSESSION below is the one that commits.
+            WM_QUERYENDSESSION => return 1,
+            WM_ENDSESSION => {
+                if (wParam != 0) queueMenuAction(.quit);
+                return 0;
+            },
+            else => {},
         }
         return DefWindowProcW(hwnd, msg, wParam, lParam);
     }
