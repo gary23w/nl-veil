@@ -1396,7 +1396,7 @@ fn projectBrowserRead(gpa: std.mem.Allocator, result: []const u8) ?[]u8 {
     var b: std.ArrayListUnmanaged(u8) = .empty;
     errdefer b.deinit(gpa);
     {
-        const hdr = std.fmt.allocPrint(gpa, "page: {s} | {s} | {d} interactive elements\n", .{ d.title, d.url, d.count }) catch return null;
+        const hdr = std.fmt.allocPrint(gpa, "page: {s} | {s} | {d} interactive elements\n(unlabelled) = the page gives this element no text at all; (dup N) = N elements share that exact label. For either, choosing by label is a guess — use coordinates (browser_click_at) or pixel_search rather than picking one and hoping.\n", .{ d.title, d.url, d.count }) catch return null;
         defer gpa.free(hdr);
         b.appendSlice(gpa, hdr) catch return null;
     }
@@ -1409,7 +1409,29 @@ fn projectBrowserRead(gpa: std.mem.Allocator, result: []const u8) ?[]u8 {
                 wrote_header = true;
             }
             const label = if (e.text.len > 0) e.text else e.name;
-            const line = std.fmt.allocPrint(gpa, "  [{d}] {s}{s}{s}\n", .{ e.ref, e.tag, if (label.len > 0) " " else "", clipBytes(label, 90) }) catch return null;
+            // MAKE AMBIGUITY VISIBLE. Measured on the live compose page (175 elements): 17 carry NO
+            // label at all (blank text AND name — the extractor has nothing else to give: no href, no
+            // aria-label) and 63 more share a duplicate one, eleven of them all reading "More". Rendered
+            // plainly they look like 175 distinct choices, so the model picks confidently and lands
+            // somewhere random — which is exactly how c6a75df8b clicked off the composer onto a trending
+            // page. Naming the ambiguity does not invent information; it tells the model when its next
+            // pick is a coin flip, so it can reach for coordinates or a visual read instead of guessing.
+            var dupes: usize = 0;
+            if (label.len > 0) {
+                for (d.elements) |o| {
+                    const ol = if (o.text.len > 0) o.text else o.name;
+                    if (ol.len > 0 and std.mem.eql(u8, ol, label)) dupes += 1;
+                }
+            }
+            // the markers stay TERSE and are explained once in the header — spelling the warning out per
+            // element cost more bytes than the boilerplate this projection exists to remove (caught by the
+            // size assertion in the projection test, on a page where every label was identical)
+            const line = if (label.len == 0)
+                std.fmt.allocPrint(gpa, "  [{d}] {s} (unlabelled)\n", .{ e.ref, e.tag }) catch return null
+            else if (dupes > 1)
+                std.fmt.allocPrint(gpa, "  [{d}] {s} {s} (dup {d})\n", .{ e.ref, e.tag, clipBytes(label, 90), dupes }) catch return null
+            else
+                std.fmt.allocPrint(gpa, "  [{d}] {s} {s}\n", .{ e.ref, e.tag, clipBytes(label, 90) }) catch return null;
             defer gpa.free(line);
             b.appendSlice(gpa, line) catch return null;
         }
@@ -6771,6 +6793,16 @@ fn runInnerAgentic(
             if (echo_blocked) {
                 echo_slot.?.count +|= 1;
                 loop_refusals +|= 1; // see LOOP HARD STOP above; checked after this call's result lands
+            } else {
+                // CHANGED ITS MIND ⇒ forgive the accrued refusals. loop_refusals counts refusals across the
+                // WHOLE turn, so a model that hit the guard, read the warning, and moved to a genuinely
+                // different call was still carrying the old strikes into its recovery — and the third one
+                // ended the turn mid-recovery. Observed live (c6a75df8b): after three identical browser_reads
+                // the model said "the loop guard is firing and it's right, I'll try a different ref instead of
+                // retrying read" — the correct response — and the turn was killed anyway. This call is NOT
+                // refused, which is exactly the evidence that the loop broke; the hard stop still fires for a
+                // model that keeps driving refused signatures, because those never reach this branch.
+                loop_refusals = 0;
             }
             // QUERY FORMULATION (prompting): chat used to hand web_search the model's query verbatim — the swarm
             // has had a formulation step for a while (run.zig scoutQuery) and the chat side had none at all.
