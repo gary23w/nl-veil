@@ -81,6 +81,10 @@ fn writeCrashReport(msg: []const u8, ra: ?usize) void {
 
 const WIN_W = 1220;
 const WIN_H = 820;
+/// Idle tick while the desk is hidden (5 Hz). Not a target-FPS value — the hidden path skips EndDrawing
+/// and paces itself — and it sits well inside the watchdog's stall window, so `beat(.idle_start)` keeps
+/// catching a genuine freeze while the desk is away.
+const HIDDEN_SLEEP_MS: u64 = 200;
 const TITLE_H = 34;
 const TAB_H = 38;
 
@@ -280,7 +284,13 @@ const Ui = struct {
     drag_grab_y: f32 = 0,
     resizing: bool = false,
     file_menu: bool = false,
+    // THE SPLIT: close_req ends the PROCESS (and with it the in-process server) and is now written by
+    // exactly two things — File>Quit and tray Quit. hide_req only puts the window away; the titlebar X and
+    // an OS close gesture raise it, and `hidden` is the state the loop's idle path reads. Before this, all
+    // four exits meant the same thing, so closing the desk took the server down with it.
     close_req: bool = false,
+    hide_req: bool = false,
+    hidden: bool = false,
     // manual maximize/restore (the window is undecorated, so we drive it ourselves): on maximize we save the
     // current rect and grow to fill the monitor; on restore we write the saved rect back.
     win_max: bool = false,
@@ -545,6 +555,14 @@ pub fn runApp(data_dir: ?[]const u8) !void {
     var tray: tray_mod.Tray = .{};
     tray.init("veil-desk");
     defer tray.deinit();
+    // Nothing may hide the window unless a live icon exists to bring it back. A tray that failed to
+    // register — or the POSIX stub, whose init reports success while every method is a no-op — keeps the
+    // old behavior, where the close button quits.
+    const can_hide = tray.canHide();
+    if (!can_hide) {
+        const d = tray.diag();
+        log.warn("tray icon unavailable (reg={d} hwnd={} add={} err={d}) — the close button quits the app, as before", .{ d.reg, d.hwnd, d.add, d.err });
+    }
 
     {
         store.lock();
@@ -584,13 +602,30 @@ pub fn runApp(data_dir: ?[]const u8) !void {
     defer watchdog.stop();
     while (true) {
         watchdog.beat(.idle_start);
-        if (rl.windowShouldClose()) {
-            _ = rl.saveFileText("data/desk-exit-reason.txt", "windowShouldClose (OS WM_CLOSE / no interactive desktop)");
+        // Read the close flag ONCE: it is a one-frame edge, cleared at the tail of the next
+        // PollInputEvents, so it must be consumed in the same iteration that observed it.
+        const os_close = rl.windowShouldClose();
+        // An OS close aimed at an ALREADY-hidden window is the only close left that can mean "end this
+        // process" — `taskkill /PID` without /F, a shutdown script, an updater. Without this branch the
+        // hide below would swallow it and nothing short of /F could stop the app.
+        if (os_close and ui.hidden) {
+            exitReason(&store, "external close request while hidden");
             break;
         }
         if (ui.close_req) {
-            _ = rl.saveFileText("data/desk-exit-reason.txt", "ui.close_req (X button / File>quit / tray quit)");
+            exitReason(&store, "ui.close_req (tray Quit / File>Quit)");
             break;
+        }
+        // The close GESTURE — titlebar X, Alt+F4, taskbar Close — puts the desk away and leaves the
+        // server running. With no tray icon to bring it back, it still means quit.
+        if (os_close or ui.hide_req) {
+            ui.hide_req = false;
+            if (can_hide) {
+                hideDesk(&store, &tray, gpa);
+            } else {
+                exitReason(&store, "close gesture with no tray icon to return to");
+                break;
+            }
         }
         store.lock();
         const online0 = store.server_online;
@@ -807,6 +842,23 @@ pub fn runApp(data_dir: ?[]const u8) !void {
                     }
                 } else |_| {}
             }
+        }
+        // HIDDEN IDLE PATH. Everything above still runs while the desk is away — the store snapshot, the
+        // theme/font reconcile (so reopening is instant), the tray pump that carries Open/Quit, and the
+        // headless SIM.txt + console-approval probes. Everything below is input, layout and drawing for a
+        // window nobody can see, so it is skipped: no GL, no swap, no stale mouse dragging an invisible
+        // window. pollInputEvents is what EndDrawing would have called — it drains the message queue and
+        // refreshes the close flag, which is how an external close still reaches the branch above.
+        if (ui.hidden) {
+            rl.pollInputEvents();
+            watchdog.frameDone();
+            io.sleep(.{ .nanoseconds = HIDDEN_SLEEP_MS * std.time.ns_per_ms }, .awake) catch {
+                // The sleep is the ONLY pacing on this path (no EndDrawing, so no WaitTime). Swallowing an
+                // error here would turn the idle desk into a 100%-CPU spin, so fall back to the frame
+                // pacer rather than trusting it.
+                rl.waitTime(@as(f64, @floatFromInt(HIDDEN_SLEEP_MS)) / 1000.0);
+            };
+            continue;
         }
         watchdog.mark(.input);
         handleWindowChrome();
@@ -1072,7 +1124,9 @@ fn drawTitlebar(store: *Store) void {
     if (t.winButton(minb, t.z("_", .{}), false)) rl.minimizeWindow();
     // "[]" = go fullscreen; "><" = shrink back to the previous size (glyphs are ASCII — foldAscii drops Unicode).
     if (t.winButton(maxb, if (ui.win_max) t.z("><", .{}) else t.z("[]", .{}), false)) toggleMaximize();
-    if (t.winButton(clsb, t.z("x", .{}), true)) ui.close_req = true;
+    // The X now HIDES the desk to the tray and leaves the server running; quitting is File>Quit or
+    // tray>Quit. Flag it for the loop head rather than hiding inline — this runs inside beginDrawing.
+    if (t.winButton(clsb, t.z("x", .{}), true)) ui.hide_req = true;
 }
 
 fn drawFileMenu(store: *Store) void {
@@ -1450,6 +1504,66 @@ fn autoSelect(store: *Store) bool {
     return have;
 }
 
+// ------------------------------------------------------------------- hide / show / exit reason
+
+/// Write the exit reason beside the rest of the desk's state. The two original writes used a CWD-relative
+/// path while runApp holds an absolute data dir, so launched from anywhere but the repo root they landed
+/// somewhere else or failed silently.
+fn exitReason(store: *Store, why: [:0]const u8) void {
+    var pb: [700]u8 = undefined;
+    store.lock();
+    const dd = store.settings.dataDir();
+    const n = @min(dd.len, pb.len - 32);
+    @memcpy(pb[0..n], dd[0..n]);
+    store.unlock();
+    var full: [768]u8 = undefined;
+    const path = std.fmt.bufPrintZ(&full, "{s}/desk-exit-reason.txt", .{pb[0..n]}) catch return;
+    _ = rl.saveFileText(path, why);
+    log.info("desk exiting: {s}", .{why});
+}
+
+var hide_hinted = false;
+
+/// Put the desk away without ending the process. The server, the workers and the tray keep running.
+fn hideDesk(store: *Store, tray: *tray_mod.Tray, gpa: std.mem.Allocator) void {
+    if (ui.hidden) return;
+    // Stale interaction state must not survive the hide, or the window comes back mid-drag with a menu open.
+    ui.dragging = false;
+    ui.resizing = false;
+    ui.file_menu = false;
+    // MANDATORY before hiding: a minimized window sends PollInputEvents down the blocking glfwWaitEvents
+    // branch, which would starve the idle loop and feed the watchdog false stalls.
+    if (rl.isWindowMinimized()) rl.clearWindowState(.{ .window_minimized = true });
+    ui.hidden = true;
+    rl.setWindowState(.{ .window_hidden = true });
+    log.info("desk hidden to tray — server still running", .{});
+    // The first hide is the one moment the app can look like it died: the window is gone from the screen,
+    // the taskbar and Alt-Tab at once, and Windows 11 parks new tray icons in the overflow flyout, so a
+    // successful NIM_ADD does not prove the user can SEE the icon. Say where it went, once per session.
+    if (!hide_hinted) {
+        hide_hinted = true;
+        tray.notify(gpa, "veil is still running", "Click the tray icon to reopen the desk. Right-click > Quit to stop the server.", 0);
+    }
+    _ = store;
+}
+
+/// Bring the desk back — from hidden OR merely minimized, since the tray icon is the way back from both.
+fn showDesk() void {
+    if (!ui.hidden and !rl.isWindowMinimized()) return;
+    // clearWindowState(hidden) is the ONLY un-hide; restoreWindow never shows a hidden window. Doing it in
+    // the other order would let SW_RESTORE reveal the window behind raylib's back while the HIDDEN flag
+    // stayed set, desyncing the next hide into a silent no-op.
+    if (ui.hidden) rl.clearWindowState(.{ .window_hidden = true });
+    rl.restoreWindow();
+    rl.setWindowFocused(); // the shell's show is SW_SHOWNA and does not activate
+    ui.hidden = false;
+    ui.dragging = false;
+    ui.resizing = false;
+    ui.file_menu = false;
+    ui.hot_frames = 60; // come back at full frame rate, not the idle pacer
+    log.info("desk reopened from tray", .{});
+}
+
 // -------------------------------------------------------------------------------- tray pump
 
 fn pumpTray(store: *Store, tray: *tray_mod.Tray, gpa: std.mem.Allocator) void {
@@ -1471,13 +1585,13 @@ fn pumpTray(store: *Store, tray: *tray_mod.Tray, gpa: std.mem.Allocator) void {
         }
     }
     store.unlock();
-    if (tray.takeRestoreRequest()) rl.restoreWindow();
+    if (tray.takeRestoreRequest()) showDesk();
 
     while (true) {
         switch (tray.takeMenuAction()) {
             .none => break,
             .open_settings => {
-                rl.restoreWindow();
+                showDesk();
                 ui.tab = .settings;
                 ui.focus = .none;
             },
