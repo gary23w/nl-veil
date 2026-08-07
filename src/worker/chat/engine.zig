@@ -1970,10 +1970,15 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     var goal_owned: ?[]u8 = null;
     defer if (goal_owned) |g| gpa.free(g);
     if (continuationShaped(user_text)) goal_owned = firstUserGoal(app, conv_dir);
-    // The real goal for everything that steers: the pinned first user message on a continuation-shaped turn,
-    // else what the user actually just said. NOT for the hippocampus observe — the message the user really
-    // sent is what belongs in memory.
-    const goal_text: []const u8 = if (goal_owned) |g| g else user_text;
+    // The real goal for everything that steers — AFK ONLY. Recall has substituted the pinned goal on a
+    // continuation-shaped turn for a long time, but that is ADDITIVE and hedged: it widens what gets
+    // remembered and cannot change what the turn does. Substituting it into the STEERING inputs replaces
+    // the thing the drive picker, the course check and the repeat guard reason about, and in tier 0/1 a
+    // user who simply types "continue" would silently have their message swapped for a goal pinned turns
+    // ago. Tier 1 keeps reading user_text exactly as before; only afk, whose "user_text" is the desk's own
+    // kick sentence rather than anything a human wrote, gets the substitution. NOT for the hippocampus
+    // observe either — the message the user really sent is what belongs in memory.
+    const goal_text: []const u8 = if (loop >= LOOP_AFK) (if (goal_owned) |g| g else user_text) else user_text;
     {
         // RESUME CUE: a continuation-shaped turn ("continue", the desk's auto-loop arm) carries no recall
         // cue of its own — keyed on the literal word, recall surfaces nothing and the resumed turn starts
