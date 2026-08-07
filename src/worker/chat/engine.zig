@@ -541,6 +541,37 @@ fn buildTurnTools(gpa: std.mem.Allocator, ctx: *const tools.ToolCtx, compact: bo
     return out;
 }
 
+/// One plain-prose line naming EVERY tool in `belt` (the "tools":[…] array body), in belt order —
+/// served ONLY with the compact prompt. Derived by walking the belt's "name":"…" fields (the same
+/// walk the prompt/belt guard tests do), so it can never drift from what is actually advertised:
+/// the base variant, granted recipes, and plugin schemas all land here because the caller hands in
+/// the FINAL belt string. Why it exists: a small model "checks its belt" by re-skimming 3KB of
+/// schema JSON — observed live (c6a751a54), the 12B ran list_dir to look for the browser verbs,
+/// read the empty directory as proof, and denied a browser it was holding. A denial now has to
+/// contradict one plain line sitting in its own system prompt. Turn-stable exactly like the belt
+/// it mirrors, so the provider's prompt-prefix cache is untouched. Caller frees; null on OOM or an
+/// empty belt (serve the prompt unchanged rather than a torn line).
+fn beltManifest(gpa: std.mem.Allocator, belt: []const u8) ?[]u8 {
+    var names: std.ArrayListUnmanaged(u8) = .empty;
+    defer names.deinit(gpa);
+    var count: usize = 0;
+    var i: usize = 0;
+    const key = "\"name\":\"";
+    while (std.mem.indexOfPos(u8, belt, i, key)) |at| {
+        const start = at + key.len;
+        const end = std.mem.indexOfScalarPos(u8, belt, start, '"') orelse break;
+        // only string-valued "name" fields match this key: a schema PROPERTY named name appears as
+        // `"name":{`, and description text carries escaped quotes, so the walk is exact — the same
+        // fact the hand-enumeration guard test relies on.
+        if (count > 0) names.appendSlice(gpa, ", ") catch return null;
+        names.appendSlice(gpa, belt[start..end]) catch return null;
+        count += 1;
+        i = end;
+    }
+    if (count == 0) return null;
+    return std.fmt.allocPrint(gpa, "\nTOOLS ON THIS BELT ({d}): {s}. That line is the complete belt: a tool named on it EXISTS and is callable by exactly that name; a name not on it is not available this turn.", .{ count, names.items }) catch null;
+}
+
 /// io-based wall clock — the SAME source the worker stamps its event `t` with (std time under io, never a raw
 /// clock primitive). Seconds are fine: the P0-4 reader only maxes `ts` for a conv's `updated`, so ties are OK.
 fn nowSecs(io: std.Io) i64 {
@@ -682,6 +713,30 @@ test "turn tools: both caps variants are valid JSON arrays, and the sandboxed on
     try std.testing.expect(std.mem.indexOf(u8, TURN_TOOLS_SANDBOXED, "\"browser_navigate\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, TURN_TOOLS_SANDBOXED, "\"get_credential\"") == null);
     try std.testing.expect(TURN_TOOLS_SANDBOXED.len < TURN_TOOLS_FULL.len);
+}
+
+test "belt manifest: names EVERY tool a compact belt serves, with a true count, nothing hand-enumerated" {
+    const gpa = std.testing.allocator;
+    inline for (.{ TURN_TOOLS_COMPACT, TURN_TOOLS_SANDBOXED_COMPACT }) |variant| {
+        const m = beltManifest(gpa, variant) orelse return error.TestUnexpectedResult;
+        defer gpa.free(m);
+        // walk the belt's "name":"…" fields — the exact walk the manifest itself performs and the
+        // hand-enumeration guard below performs — and require every served name on the line
+        var count: usize = 0;
+        var i: usize = 0;
+        while (std.mem.indexOfPos(u8, variant, i, "\"name\":\"")) |at| {
+            const start = at + "\"name\":\"".len;
+            const end = std.mem.indexOfScalarPos(u8, variant, start, '"') orelse break;
+            try std.testing.expect(std.mem.indexOf(u8, m, variant[start..end]) != null);
+            count += 1;
+            i = end;
+        }
+        try std.testing.expect(count > 0);
+        // the count in the header is the belt's true def count, not an approximation
+        var head: [64]u8 = undefined;
+        const expect_head = try std.fmt.bufPrint(&head, "\nTOOLS ON THIS BELT ({d}): ", .{count});
+        try std.testing.expect(std.mem.startsWith(u8, m, expect_head));
+    }
 }
 
 test "compact belt: valid JSON, materially smaller, keeps the core verbs and drops the decoys" {
@@ -1586,7 +1641,12 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     {
         var dstamp: [16]u8 = undefined;
         const sys_base: []const u8 = if (compact_belt) SYSTEM_PROMPT_COMPACT else SYSTEM_PROMPT;
-        const dated = std.fmt.allocPrint(gpa, "{s}\nTODAY (UTC): {s}. Any time-sensitive search query, date, or claim must be grounded in THIS date — never a guessed one.", .{ sys_base, tools.dateStamp(app.io, &dstamp) }) catch null;
+        // BELT MANIFEST — compact tier ONLY: the one-line tool index (see beltManifest). Derived from
+        // `turn_tools` AFTER grants and plugin schemas merged above, so every def the provider will
+        // see is named on the line; the full tier reads its belt fine and pays nothing.
+        const manifest: ?[]u8 = if (compact_belt) beltManifest(gpa, turn_tools) else null;
+        defer if (manifest) |m| gpa.free(m);
+        const dated = std.fmt.allocPrint(gpa, "{s}{s}\nTODAY (UTC): {s}. Any time-sensitive search query, date, or claim must be grounded in THIS date — never a guessed one.", .{ sys_base, manifest orelse "", tools.dateStamp(app.io, &dstamp) }) catch null;
         defer if (dated) |d| gpa.free(d);
         http.jstr(gpa, &conv_buf, dated orelse sys_base) catch return;
     }
