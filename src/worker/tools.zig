@@ -223,19 +223,22 @@ pub const Caps = enum { full, sandboxed };
 /// sandboxed user keeps every bit of it. What they lose is the ability to act on the machine.
 const SANDBOX_TOOLS = [_][]const u8{
     // research
-    "web_search", "web_fetch", "fetch_json", "read_url",
+    "web_search",    "web_fetch",           "fetch_json", "read_url",
     // hive / memory — the whole surface, intentionally
-    "recall", "recall_hive", "read_doc", "observe", "share", "note_stance", "save_skill", "journal",
-    "set_directive", "probe", "add_task", "complete_task", "send_message", "propose_plan_change",
+    "recall",        "recall_hive",         "read_doc",   "observe",
+    "share",         "note_stance",         "save_skill", "journal",
+    "set_directive", "probe",               "add_task",   "complete_task",
+    "send_message",  "propose_plan_change",
     // bounded observation of files/urls/ports/processes — read-only watching (its 'command' kind
     // self-gates on caps inside pollTool, so a sandboxed caller keeps the observational kinds)
     "poll",
     // files, jailed to the conversation's own workdir
-    "write_file", "edit_file", "read_file", "list_dir", "delete_file",
+          "write_file",
+    "edit_file",     "read_file",           "list_dir",   "delete_file",
     // local retrieval over this conversation's own attachments; renders nothing, touches no network
     "pixel_search",
     // read-only swarm observation (each is uid-checked by its handler)
-    "swarm_status", "swarm_asks", "stop_swarm",
+     "swarm_status",        "swarm_asks", "stop_swarm",
 };
 
 /// Is `name` runnable by a sandboxed caller? Exposed so the HTTP tool endpoint can share this exact
@@ -278,16 +281,22 @@ pub fn sandboxAllowed(name: []const u8) bool {
 /// the tier's only demonstrated capability for window it has other ways to find.
 const COMPACT_TOOLS = [_][]const u8{
     // research (web_fetch is the ONE fetch verb — see the note above on read_url/fetch_json)
-    "web_search",     "web_fetch",
+    "web_search",   "web_fetch",
     // files
-     "read_file",      "write_file", "edit_file",
-    "list_dir",       "delete_file",
+    "read_file",    "write_file",
+    "edit_file",    "list_dir",
+    "delete_file",
     // code
-      "run_python", "run_tests",
+     "run_python",
+    "run_tests",
     // memory + documents (one recall verb, not two)
-    "recall",         "observe",    "read_doc",   "pixel_search",
+       "recall",
+    "observe",      "read_doc",
+    "pixel_search",
     // the browser, reduced to the four verbs that actually drive a page
-     "browser_navigate", "browser_read", "browser_click", "browser_type",
+    "browser_navigate",
+    "browser_read", "browser_click",
+    "browser_type",
 };
 
 /// Is `name` in the small-tier belt? Twin of sandboxAllowed, same reason: one list, shared predicate.
@@ -1146,7 +1155,7 @@ pub const FULL_SCHEMA = SCHEMA ++ ",\n" ++ ASK_VEIL_TOOL;
 /// NL_BROWSER_ALLOWLIST. Comma-joined, no outer brackets, like SCHEMA. Each line is its own entry for the
 /// newline-split tool droppers.
 pub const BROWSER_SCHEMA =
-    \\{"type":"function","function":{"name":"browser_navigate","description":"Open (or reuse) a real web browser ON THE USER'S OWN MACHINE (a local browser, started on demand) and navigate it to a URL, then return the page's title and final URL. When information is hard to get by plain crawling — a login-walled dashboard, a JS-heavy SPA, an interactive page, data behind a form — say so and REACH FOR THIS instead of giving up: web_search/web_fetch/read_url/deep_crawl fetch static text, this drives the user's live browser. It is the user's OWN browser carrying their OWN signed-in sessions: a site they are logged into (X/Twitter, GitHub, mail, a dashboard) opens ALREADY LOGGED IN AS THEM, so usually there is nothing to sign in to. And a signed-OUT site is not a dead end either — you can sign in: ask the user for the credential, or use one they have already stored with you, and browser_type it into that site's OWN login form. So NEVER say you cannot reach a site because you have no login, no account, or no auth tool: navigate, READ the page, and find out what is actually there. After navigating, call browser_read to see the page, then browser_click/browser_type to interact. Type a credential ONLY into the login form of the site it belongs to, never into a page that merely asks for it, and do not click irreversible actions (pay/submit/delete) without explicit human approval.","parameters":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}}},
+    \\{"type":"function","function":{"name":"browser_navigate","description":"Open (or reuse) a real web browser ON THE USER'S OWN MACHINE (a local browser, started on demand) and navigate it to a URL, then return the page's title and final URL. When information is hard to get by plain crawling — a login-walled dashboard, a JS-heavy SPA, an interactive page, data behind a form — say so and REACH FOR THIS instead of giving up: web_search/web_fetch/read_url/deep_crawl fetch static text, this drives the user's live browser. It is the user's OWN browser carrying their OWN signed-in sessions: a site they are logged into (X/Twitter, GitHub, mail, a dashboard) opens ALREADY LOGGED IN AS THEM, so usually there is nothing to sign in to. And a signed-OUT site is not a dead end either — you can sign in: ask the user for the credential, or use one they have already stored with you, and browser_type it into that site's OWN login form. So NEVER say you cannot reach a site because you have no login, no account, or no auth tool: navigate, READ the page, and find out what is actually there. After navigating, call browser_read to see the page, then browser_click/browser_type to interact. Type a credential ONLY into the login form of the site it belongs to, never into a page that merely asks for it without explicit human approval or instruction.","parameters":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}}},
     \\{"type":"function","function":{"name":"browser_read","description":"Read the current browser page: returns its title, a clipped text excerpt, and the list of interactive elements each tagged with a numeric ref (for browser_click / browser_type). An element with `edit:true` is a text field you can browser_type into — this includes comment boxes and chat composers, which are editable divs rather than <input>, so look for the one whose `text` label matches the field you want (e.g. 'Comment as ...', 'Write something', 'Message'). Call this after navigate or after any click/type to see the new state. If the page yields little readable text (blank, canvas/SPA, or walled), the result ALSO carries a `visual` block with screenshot-tile image paths and recovered text — use it; you don't need to call pixel_ingest yourself for a normal read. If the result carries a `challenge` block (a CAPTCHA / 'verify you are human' prompt), STOP and relay its `instructions` to the user verbatim — never try to solve or bypass verification.","parameters":{"type":"object","properties":{},"required":[]}}},
     \\{"type":"function","function":{"name":"browser_click","description":"Click the interactive element identified by the ref number from a prior browser_read. Clicks are real, trusted browser input (not synthetic), so sites accept them. The result reports the click's EFFECT: `navigated` (the url changed — read the new page), `changed` (anything on the page moved at all), `dialog` (a modal/pop-up opened — read it next), and `dtext` (how much visible text changed). Use them instead of re-reading to guess: if `changed` is false the click hit nothing useful — pick a DIFFERENT ref or coordinates, do NOT read-and-retry the same one; if `dialog` is true a panel opened, so browser_read now. REFS DIE ON NAVIGATION: when a result says `navigated`:true or shows a different `url`, you are on a NEW page and every ref from the previous browser_read is meaningless — never pass one again, browser_read first and use only refs from that newest read. If the url is not the page you meant to be on, say so and navigate back rather than hunting for your target among the new page's refs. Do not click irreversible controls (pay, place order, delete, confirm) without explicit human approval.","parameters":{"type":"object","properties":{"ref":{"type":"integer","description":"the element ref from browser_read"}},"required":["ref"]}}},
     \\{"type":"function","function":{"name":"browser_type","description":"Type text into the field identified by the ref from a prior browser_read — an input, a textarea, OR an editable element marked `edit:true` (a comment box, chat composer, or search box; modern apps build these as contenteditable/role=textbox divs, not <input>, and those now carry a ref too). Set submit=true to press Enter / submit afterwards (e.g. a search box, or to post a comment). The result reports the EFFECT, like a click: `changed` (the page moved — with submit off this means your text landed in the field; if it is false the text did NOT stick, so you targeted the wrong ref), `dtext` (how much visible text changed), and for submit `navigated`. Use these to confirm a post went through instead of re-reading or pixel-searching. REFS DIE ON NAVIGATION: if the result says `navigated`:true or a different `url`, every ref from the previous browser_read is now meaningless — browser_read again and use only the newest refs. Typing into a ref whose tag is `button` or `a` does not enter text, it activates the control (that is how a click-through happens), so if you meant to enter text pick a ref listed as EDITABLE. You MAY type a credential when signing the user in — into the login form of the site it belongs to, and only there; never into a page that merely asks for one, and never echo it back into a reply, a note, or a file.","parameters":{"type":"object","properties":{"ref":{"type":"integer"},"text":{"type":"string"},"submit":{"type":"boolean","description":"press Enter / submit the form after typing (default false)"}},"required":["ref","text"]}}},
@@ -1293,7 +1302,6 @@ test "CHAT_SCHEMA stays a verbatim subset of SCHEMA, apart from the adaptations 
     // Not vacuous: most of the block really is shared, so the rule above is doing real work.
     try std.testing.expect(verbatim >= 10);
 }
-
 
 /// The SCOUT's tool set — a RESEARCH-ONLY subset of SCHEMA. The build tools (run_python, write_file) are
 /// deliberately ABSENT so the learner mind STRUCTURALLY cannot drift into building: an imperative "do not build"
@@ -4629,13 +4637,13 @@ test "sandboxAllowed: every host-reaching tool is refused, the whole hive surfac
     // allowed. Naming the dangerous ones explicitly means adding one to the dispatcher without a
     // tiering decision breaks a test rather than opening a hole quietly.
     const denied = [_][]const u8{
-        "run_python",      "run_tests",        "patch_system",  "make_tool",      "propose_change",
-        "simulate_change", "stage_delivery",   "osint_scan",    "host_status",    "host_command",
-        "host_explore",    "browser_navigate", "browser_read",  "browser_click",  "browser_type",
-        "browser_eval",    "browser_close",    "pixel_ingest",  "pixel_capture",  "mcp_discover",
-        "mcp_call",        "get_credential",   "deep_crawl",    "stage_file",     "ask_veil",
-        "browser_console", "browser_network",
-        "browser_click_at", "browser_type_text", "browser_key", "browser_scroll",
+        "run_python",      "run_tests",        "patch_system",     "make_tool",         "propose_change",
+        "simulate_change", "stage_delivery",   "osint_scan",       "host_status",       "host_command",
+        "host_explore",    "browser_navigate", "browser_read",     "browser_click",     "browser_type",
+        "browser_eval",    "browser_close",    "pixel_ingest",     "pixel_capture",     "mcp_discover",
+        "mcp_call",        "get_credential",   "deep_crawl",       "stage_file",        "ask_veil",
+        "browser_console", "browser_network",  "browser_click_at", "browser_type_text", "browser_key",
+        "browser_scroll",
     };
     for (denied) |n| {
         if (sandboxAllowed(n)) {
@@ -4647,10 +4655,10 @@ test "sandboxAllowed: every host-reaching tool is refused, the whole hive surfac
     // The hive mind is the product: a sandboxed user keeps ALL of it. If a future change tiers one of
     // these as admin-only, that is a product regression and this test is the place it should surface.
     const kept = [_][]const u8{
-        "recall",        "recall_hive",  "read_doc",     "observe",       "share",
-        "note_stance",   "save_skill",   "journal",      "set_directive", "probe",
-        "add_task",      "complete_task", "send_message", "web_search",   "web_fetch",
-        "read_file",     "write_file",   "edit_file",    "list_dir",      "delete_file",
+        "recall",       "recall_hive",   "read_doc",     "observe",       "share",
+        "note_stance",  "save_skill",    "journal",      "set_directive", "probe",
+        "add_task",     "complete_task", "send_message", "web_search",    "web_fetch",
+        "read_file",    "write_file",    "edit_file",    "list_dir",      "delete_file",
         "pixel_search",
     };
     for (kept) |n| {
@@ -4818,8 +4826,8 @@ test "sandboxAllowed is an allowlist: an unknown name is refused" {
     // a tool and call it by that new name. A denylist would never see it; this pins the polarity.
     try std.testing.expect(!sandboxAllowed("totally_made_up_tool"));
     try std.testing.expect(!sandboxAllowed(""));
-    try std.testing.expect(!sandboxAllowed("run_python "));  // no trimming, no near-miss matching
-    try std.testing.expect(!sandboxAllowed("RUN_PYTHON"));   // case-sensitive by design
+    try std.testing.expect(!sandboxAllowed("run_python ")); // no trimming, no near-miss matching
+    try std.testing.expect(!sandboxAllowed("RUN_PYTHON")); // case-sensitive by design
 }
 
 test "urlAllowed: numeric spellings of loopback and private space are blocked too" {
@@ -6660,8 +6668,8 @@ pub fn reservedBusName(p: []const u8) bool {
     var base = p;
     if (std.mem.lastIndexOfAny(u8, p, "/\\")) |i| base = p[i + 1 ..];
     const reserved = [_][]const u8{
-        "commands.jsonl", "commands.json",          "telemetry.json",       "staged.jsonl",
-        "explore.jsonl",  "explore_results.jsonl",  "explore_results.json", "score.json",
+        "commands.jsonl", "commands.json",         "telemetry.json",       "staged.jsonl",
+        "explore.jsonl",  "explore_results.jsonl", "explore_results.json", "score.json",
         "verbs.json",     "app.json",
     };
     for (reserved) |r| if (std.ascii.eqlIgnoreCase(base, r)) return true;
