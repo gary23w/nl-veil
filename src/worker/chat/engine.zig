@@ -861,6 +861,54 @@ test "belt denial: catches the live lie, spares an honest 'won't', and never fir
     try std.testing.expect(beltDenial(gpa, "I don't have cast on this belt.", belt) == null);
 }
 
+test "browser_read projection: EVERY ref survives, boilerplate does not, and non-browser results pass through" {
+    const gpa = std.testing.allocator;
+    // a page whose editable field sits deep enough that byte-offset clipping would elide it — the
+    // measured live failure (x.com: composer at 11%, search box at 70%, clip kept neither reliably)
+    var payload: std.ArrayListUnmanaged(u8) = .empty;
+    defer payload.deinit(gpa);
+    try payload.appendSlice(gpa, "{\"url\":\"https://x.com/home\",\"title\":\"Home / X\",\"count\":180,\"elements\":[");
+    for (0..180) |i| {
+        if (i > 0) try payload.append(gpa, ',');
+        const editable = (i == 25 or i == 150); // composer near the head, search box deep in the middle
+        const el = try std.fmt.allocPrint(
+            gpa,
+            "{{\"ref\":{d},\"tag\":\"button\",\"type\":\"button\",\"name\":\"\",\"edit\":{s},\"text\":\"{s}\"}}",
+            .{ i + 1, if (editable) "true" else "false", if (i == 25) "Post text" else if (i == 150) "Search query" else "Skip to home timeline" },
+        );
+        defer gpa.free(el);
+        try payload.appendSlice(gpa, el);
+    }
+    try payload.appendSlice(gpa, "],\"text\":\"timeline prose\",\"textLen\":14}");
+
+    const proj = clipToolResult(gpa, payload.items);
+    defer if (proj.ptr != payload.items.ptr) gpa.free(proj);
+    try std.testing.expect(proj.ptr != payload.items.ptr); // it projected, not passed through
+
+    // THE PROPERTY: every ref in the payload is still addressable afterwards. A ref table must never be
+    // truncated by position — the model cannot tell a dropped ref from an absent element, and answers
+    // with a confidently wrong one (measured: it said ref 8 for a search box that was really 154).
+    for (1..181) |r| {
+        var needle: [16]u8 = undefined;
+        try std.testing.expect(std.mem.indexOf(u8, proj, try std.fmt.bufPrint(&needle, "[{d}]", .{r})) != null);
+    }
+    // editable fields are called out, and the projection is materially smaller than the raw payload
+    try std.testing.expect(std.mem.indexOf(u8, proj, "EDITABLE") != null);
+    try std.testing.expect(std.mem.indexOf(u8, proj, "Post text") != null);
+    try std.testing.expect(std.mem.indexOf(u8, proj, "Search query") != null);
+    try std.testing.expect(proj.len * 2 < payload.items.len);
+
+    // a NON-browser result is untouched by the projection and still takes the ordinary clip path
+    const plain = "npm test output, no elements array here";
+    try std.testing.expect(clipToolResult(gpa, plain).ptr == plain.ptr);
+    const big = try gpa.alloc(u8, TOOL_RESULT_KEEP + 4096);
+    defer gpa.free(big);
+    @memset(big, 'x');
+    const clipped = clipToolResult(gpa, big);
+    defer gpa.free(clipped);
+    try std.testing.expect(std.mem.indexOf(u8, clipped, "elided from the middle") != null);
+}
+
 test "compact belt: valid JSON, materially smaller, keeps the core verbs and drops the decoys" {
     const gpa = std.testing.allocator;
 
@@ -1310,9 +1358,79 @@ const WORKING_MIN_BUDGET_BYTES: usize = 6 * 1024;
 /// 2048 tokens at the small tier (turnTokenBudget); at the same pessimistic 3 bytes/token that is ~6 KB.
 const turnOutputReserveBytes: usize = 6 * 1024;
 
+/// PROJECT a browser_read payload instead of truncating it: keep EVERY interactive ref, drop the
+/// per-element JSON boilerplate. Returns null when `result` is not a browser page-state payload.
+///
+/// Why this exists, measured on a live x.com read (18,317 chars, 187 elements, exactly TWO of them
+/// editable): the model needs the refs, and the middle-elision clip below deletes them by position.
+/// Asked "which ref is the search box" (it sits 70% in), the model answered 154 from the full payload,
+/// 154 from this projection — and **8** from the clipped one. Not "NONE": a confident WRONG ref it
+/// would then have typed into. Truncating a ref table by byte offset is worse than useless, because the
+/// thing it drops is indistinguishable, to the reader, from the thing it keeps.
+///
+/// The projection is 64% smaller than the raw payload (6.5KB vs 18.3KB) AND lossless in refs, so this
+/// is not a quality/size trade — the boilerplate was pure cost. Editable fields are listed first and
+/// labelled: they are what typing needs, and there are almost never more than a handful.
+fn projectBrowserRead(gpa: std.mem.Allocator, result: []const u8) ?[]u8 {
+    const t = std.mem.trim(u8, result, " \r\n\t");
+    if (t.len == 0 or t[0] != '{') return null;
+    if (std.mem.indexOf(u8, t, "\"elements\":[") == null) return null;
+    const P = struct {
+        url: []const u8 = "",
+        title: []const u8 = "",
+        count: u32 = 0,
+        text: []const u8 = "",
+        elements: []const struct {
+            ref: u32 = 0,
+            tag: []const u8 = "",
+            type: []const u8 = "",
+            name: []const u8 = "",
+            edit: bool = false,
+            text: []const u8 = "",
+        } = &.{},
+    };
+    const p = std.json.parseFromSlice(P, gpa, t, .{ .ignore_unknown_fields = true }) catch return null;
+    defer p.deinit();
+    const d = p.value;
+    if (d.elements.len == 0) return null;
+    var b: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer b.deinit(gpa);
+    {
+        const hdr = std.fmt.allocPrint(gpa, "page: {s} | {s} | {d} interactive elements\n", .{ d.title, d.url, d.count }) catch return null;
+        defer gpa.free(hdr);
+        b.appendSlice(gpa, hdr) catch return null;
+    }
+    for ([_]bool{ true, false }) |want_edit| {
+        var wrote_header = false;
+        for (d.elements) |e| {
+            if (e.edit != want_edit) continue;
+            if (!wrote_header) {
+                b.appendSlice(gpa, if (want_edit) "EDITABLE (browser_type into these refs):\n" else "CLICKABLE:\n") catch return null;
+                wrote_header = true;
+            }
+            const label = if (e.text.len > 0) e.text else e.name;
+            const line = std.fmt.allocPrint(gpa, "  [{d}] {s}{s}{s}\n", .{ e.ref, e.tag, if (label.len > 0) " " else "", clipBytes(label, 90) }) catch return null;
+            defer gpa.free(line);
+            b.appendSlice(gpa, line) catch return null;
+        }
+    }
+    if (d.text.len > 0) {
+        b.appendSlice(gpa, "PAGE TEXT:\n") catch return null;
+        b.appendSlice(gpa, clipBytes(d.text, BROWSER_TEXT_KEEP)) catch return null;
+    }
+    return b.toOwnedSlice(gpa) catch null;
+}
+const BROWSER_TEXT_KEEP: usize = 3 * 1024; // the prose half of a page read; refs are never clipped
+
 /// Clip an oversized tool result to head + elision note + tail (UTF-8-boundary safe). Returns `result`
 /// unchanged (same pointer) when it already fits; otherwise a NEW gpa string (caller frees whichever it holds).
+/// A browser page-state payload takes the lossless projection above INSTEAD — see projectBrowserRead for why
+/// byte-offset truncation of a ref table produces confidently wrong clicks.
 fn clipToolResult(gpa: std.mem.Allocator, result: []const u8) []u8 {
+    if (projectBrowserRead(gpa, result)) |proj| {
+        if (proj.len < result.len) return proj;
+        gpa.free(proj);
+    }
     if (result.len <= TOOL_RESULT_KEEP) return @constCast(result);
     const head = clipBytes(result, TOOL_RESULT_HEAD);
     var tstart = result.len - TOOL_RESULT_TAIL;
