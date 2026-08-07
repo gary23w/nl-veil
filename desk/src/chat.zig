@@ -742,6 +742,11 @@ pub const Chat = struct {
     arc_goal_len: usize = 0,
     loop_repeat_streak: u32 = 0, // consecutive near-identical loop steps — afk stall breaker (afk never stops, so
     console_fail_streak: u32 = 0, //   these ESCALATE a change-of-approach nudge instead of looping a failing step forever)
+    // Consecutive DEGENERATE drive inferences (empty, or a tool-call fragment instead of an instruction). The
+    // bare "continue" rescue for those is safe in tier 1 ONLY because the repeat guard below stops the streak —
+    // and afk skips that guard by contract, so the rescue became the spin the user saw: "cast: continue" posted
+    // after every veil turn, forever, each one carrying no direction so the next inference degenerates too.
+    loop_rescue_streak: u32 = 0,
     // ESCALATION LADDER (user directive: issue → try-fix → CANNOT fix → research → cast a swarm). arc_stuck is the
     // shared rung counter every stall signal feeds; it climbs rung 1 (change-approach nudge) → 2 (force recall_hive/
     // web_search on the ACTUAL error) → 3 (arm a research cast). Cleared only at arc boundaries + on a real success,
@@ -7015,6 +7020,7 @@ pub const Chat = struct {
             self.setBusy(false);
             return;
         }
+        var degenerate = false;
         if (text.len == 0) {
             // An EMPTY inference (model hiccup, dead stream, null next-step) must not disconnect the loop —
             // the loop is the inference fail-safe (user directive). Substitute a plain "continue" so the veil
@@ -7022,6 +7028,7 @@ pub const Chat = struct {
             // the nearlySame repeat-guard below ends the streak — so the rescue is bounded, not a spin.
             if (self.fireTerminalVerify(dd)) return;
             text = "continue";
+            degenerate = true;
         } else if (stepIsToolMarkup(text)) {
             // The drive inference answered with a TOOL-CALL FRAGMENT, not an instruction (observed live: a
             // "tool\nread_file" step committed as a user message, which the NEXT turn read back as a confusing
@@ -7029,6 +7036,25 @@ pub const Chat = struct {
             // substitute a plain "continue"; the nearlySame repeat guard below bounds the streak exactly as it
             // bounds the empty-inference rescue.
             text = "continue";
+            degenerate = true;
+        }
+        // …EXCEPT IN AFK, WHERE THAT GUARD DOES NOT EXIST. Both rescues above are explicitly safe because the
+        // nearlySame check further down stops a repeat — and afk skips it by contract ("the repeat-guard is
+        // skipped"), so the bounded rescue became an unbounded one: observed live as "cast: continue" posted
+        // after every veil turn indefinitely. It is self-reinforcing, because a bare "continue" carries no
+        // direction, so the veil answers with a promise, so the NEXT inference has nothing to work from and
+        // degenerates again. Bound it here instead: a second consecutive degenerate drive re-grounds to the
+        // real goal, which is the one thing "continue" fails to say.
+        self.loop_rescue_streak = if (degenerate) self.loop_rescue_streak + 1 else 0;
+        if (degenerate and afk and self.loop_rescue_streak >= 2) {
+            self.loop_rescue_streak = 0;
+            self.escalateStuck(dd, "the auto-loop driver kept returning an empty or tool-markup step instead of an instruction");
+            var reb: [1800]u8 = undefined;
+            text = if (self.arc_goal_len > 0)
+                (std.fmt.bufPrint(&reb, "Your last few turns described what you were about to do without doing it. Take ONE concrete action now toward the goal: {s}. Name the action in one short sentence, then perform it in the SAME reply.", .{self.arc_goal[0..self.arc_goal_len]}) catch AFK_DRIVE_MSG)
+            else
+                "Your last few turns described what you were about to do without doing it. Take ONE concrete action now, and perform it in the SAME reply rather than announcing it.";
+            self.appendMsg(dd, .cast_note, "(auto-loop-afk: the driver stalled on empty steps — re-grounding to the goal)");
         }
         if (loopIsDone(text)) {
             // Don't take the model's word for "done" on a build it may have only ANNOUNCED — run the
