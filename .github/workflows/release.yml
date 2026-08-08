@@ -89,9 +89,16 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      # The feature list MUST match scripts/build-official.sh, build-release.sh and build-release.ps1.
+      # It is spelled out again here because this step builds neuron into a path build-official.sh cannot
+      # guess (actions/checkout puts neuron-db under $GITHUB_WORKSPACE, not beside the repo), then hands it
+      # over as NEURON= — and build-official.sh REUSES a supplied NEURON verbatim, so its own cargo line
+      # never runs in CI. That is how this drifted: the semantic tier was added to all three local scripts
+      # and not here, which would have shipped a lexically-only memory engine in every bundle while the
+      # release notes claimed paraphrase recall. scripts/check.sh --scan now compares all four spellings.
       - name: Build the neuron memory engine
         working-directory: neuron-db/rust/neuron-core
-        run: cargo build --release --features "sqlite secure server trust"
+        run: cargo build --release --features "sqlite secure server trust semantic semantic-db fisher topics"
 
       # ONE script on every runner (bash is present on the windows runner too). The runner already installed
       # zig/rust/raylib above, so skip the script's own bootstrap.
@@ -127,7 +134,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           # Bump this to the current release's notes on every tag (one notes file per release under docs/release/).
-          body_path: docs/release/RELEASE-v1.0.1-beta-1.md
+          body_path: docs/release/RELEASE-v1.0.1-beta-2.md
           # BETA: the web UI is not yet at desk parity, and the builds are unsigned. Pre-release keeps it out
           # of "Latest release" until a signed stable.
           prerelease: true

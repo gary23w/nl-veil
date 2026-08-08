@@ -51,7 +51,11 @@ $edits = @(
     # non-prerelease happened to be newest -- a `builtin-assets-*` blob with one irrelevant file in it. Every
     # Download button on the README and the docs site sent people there. An explicit tag cannot do that.
     @{ file = (Join-Path $repo "README.md");                 find = 'releases/tag/v[^\s")]+';             repl = "releases/tag/v$Version" },
-    @{ file = (Join-Path $repo "docs\index.html");           find = 'releases/tag/v[^\s")]+';             repl = "releases/tag/v$Version" }
+    @{ file = (Join-Path $repo "docs\index.html");           find = 'releases/tag/v[^\s")]+';             repl = "releases/tag/v$Version" },
+    # The shields.io badge needs its own entry: the badge path DOUBLES every literal hyphen
+    # (1.0.1-beta-2 -> v1.0.1--beta--2), so the releases/tag pattern above cannot see it. It was the one
+    # stamp this script missed on the beta-1 -> beta-2 bump.
+    @{ file = (Join-Path $repo "README.md");                 find = 'badge/release-v[^-]*(?:--[^-]*)*-A8241B'; repl = ("badge/release-v" + ($Version -replace '-','--') + "-A8241B") }
 )
 
 $failed = $false

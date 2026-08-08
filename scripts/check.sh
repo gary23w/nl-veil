@@ -97,6 +97,13 @@ if [ "${1:-}" = "--scan" ]; then
   # `builtin-assets-*` blob instead of the app. An explicit tag is correct but has to move with the version.
   bad=$(grep -roE 'releases/tag/v[^\s")]+' README.md docs/index.html | grep -v "releases/tag/v$vm\$" | wc -l | tr -d ' ')
   if [ "$bad" = "0" ]; then echo "[links] download links point at v$vm"; else echo "[links] $bad download link(s) in README/docs point at a tag other than v$vm (scripts/bump-version.ps1)"; fi
+  # All FOUR places that build neuron must ask for the same cargo features. CI builds it into a path
+  # build-official.sh cannot guess and passes it as NEURON=, which build-official.sh then reuses verbatim --
+  # so its own cargo line never runs in CI and a feature added there alone ships nothing. That is not
+  # hypothetical: the semantic tier landed in the three scripts and not in release.yml, which would have put
+  # a lexical-only memory engine in every published bundle.
+  nf=$(grep -hoE 'features "[^"]+"' scripts/build-official.sh scripts/build-release.sh scripts/build-release.ps1 .github/workflows/release.yml | sort -u | wc -l | tr -d ' ')
+  if [ "$nf" = "1" ]; then echo "[neuron] all 4 build sites request the same cargo features"; else echo "[neuron] $nf DIFFERENT cargo feature sets across build-official.sh / build-release.{sh,ps1} / release.yml -- a bundle would ship a different engine than you tested"; fi
   # Word-bounded on purpose: without \b this counted ten `\uXXXX` doc-comment hits as debt, and a
   # signal that always reports phantom work is one you learn to skip. Keep IDENTICAL to check.ps1's
   # pattern -- the oracle-parity signal compares GATES only, so scan drift is caught by nothing.

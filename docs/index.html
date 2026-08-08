@@ -3,10 +3,10 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>nl-veil — a local-first swarm intelligence engine</title>
-<meta name="description" content="nl-veil: one binary, many minds, one shared memory. Unzip it, run veil — the server comes up and the desktop app opens. Free for Windows, macOS and Linux, plus the annotated source of every module in the engine.">
-<meta property="og:title" content="nl-veil — one binary, many minds, one shared memory">
-<meta property="og:description" content="A local-first swarm intelligence engine written in Zig. One binary carries the server, the desktop app and the CLI; everything it learns stays in a folder next to it.">
+<title>the Veil — an agentic coding desktop app that runs a team of AI agents locally</title>
+<meta name="description" content="A free desktop app for building software with AI, running a whole team of agents on your own machine. Ships its own model — no API key, no account, no cloud.">
+<meta property="og:title" content="the Veil — agentic coding, on your machine">
+<meta property="og:description" content="A desktop app for building software with AI. Where most tools hand the job to one assistant, the Veil can split it across a swarm of agents on one shared memory. Ships its own model, so there is no key and no account, and everything it learns stays in a folder next to the binary.">
 <meta property="og:type" content="website">
 <meta name="color-scheme" content="light dark">
 <meta name="theme-color" content="#e9edf5" media="(prefers-color-scheme: light)">
@@ -68,11 +68,13 @@
     <div class="hero-grid">
       <div>
         <p class="hero-eyebrow">local-first &middot; one binary &middot; written in Zig</p>
-        <h1>One goal at the desk.<br><em>Many minds</em>, one shared memory.</h1>
+        <h1>Agentic coding, on your machine.<br><em>Many minds</em>, one shared memory.</h1>
         <p class="hero-lede">
-          nl-veil is a swarm intelligence engine that runs on your machine. Unzip it and run
-          <code>veil</code>: the server comes up, the desktop app opens, and everything the hive
-          learns stays in a <code>data/</code> folder next to the binary. Yours, on your disk.
+          <strong>the Veil</strong> is a desktop app for building software with AI. Unzip one file and run
+          <code>veil</code> &mdash; a native three-pane workspace opens, and you give it a goal. Where most
+          tools hand the job to a single assistant, this one can split it across a <em>swarm</em> of agents
+          working the same files in parallel. It ships its own model, so there is no key and no account, and
+          everything it learns stays in a <code>data/</code> folder next to the binary.
         </p>
         <div class="hero-cta">
           <a class="btn btn-solid btn-lg" href="#get">
@@ -141,7 +143,7 @@
           Windows <span class="dl-arch">x86-64</span>
         </span>
         <span class="dl-file">veil-&hellip;-windows-x86_64.zip</span>
-        <a class="btn btn-solid" href="https://github.com/gary23w/nl-veil/releases/tag/v1.0.1-beta-1" target="_blank" rel="noopener">Download</a>
+        <a class="btn btn-solid" href="https://github.com/gary23w/nl-veil/releases/tag/v1.0.1-beta-2" target="_blank" rel="noopener">Download</a>
       </div>
       <div class="dl-card" data-os="macarm">
         <span class="dl-os">
@@ -149,7 +151,7 @@
           macOS <span class="dl-arch">Apple Silicon</span>
         </span>
         <span class="dl-file">veil-&hellip;-macos-arm64.zip</span>
-        <a class="btn btn-solid" href="https://github.com/gary23w/nl-veil/releases/tag/v1.0.1-beta-1" target="_blank" rel="noopener">Download</a>
+        <a class="btn btn-solid" href="https://github.com/gary23w/nl-veil/releases/tag/v1.0.1-beta-2" target="_blank" rel="noopener">Download</a>
       </div>
       <div class="dl-card" data-os="macintel">
         <span class="dl-os">
@@ -157,7 +159,7 @@
           macOS <span class="dl-arch">Intel</span>
         </span>
         <span class="dl-file">veil-&hellip;-macos-x86_64.zip</span>
-        <a class="btn btn-solid" href="https://github.com/gary23w/nl-veil/releases/tag/v1.0.1-beta-1" target="_blank" rel="noopener">Download</a>
+        <a class="btn btn-solid" href="https://github.com/gary23w/nl-veil/releases/tag/v1.0.1-beta-2" target="_blank" rel="noopener">Download</a>
       </div>
       <div class="dl-card" data-os="linux">
         <span class="dl-os">
@@ -165,7 +167,7 @@
           Linux <span class="dl-arch">x86-64</span>
         </span>
         <span class="dl-file">veil-&hellip;-linux-x86_64.zip</span>
-        <a class="btn btn-solid" href="https://github.com/gary23w/nl-veil/releases/tag/v1.0.1-beta-1" target="_blank" rel="noopener">Download</a>
+        <a class="btn btn-solid" href="https://github.com/gary23w/nl-veil/releases/tag/v1.0.1-beta-2" target="_blank" rel="noopener">Download</a>
       </div>
     </div>
 
@@ -180,13 +182,17 @@
         is served by the server itself &mdash; no separate model runtime, no API key. Click <em>download the
         model</em> in the app (or run <code>veil model pull</code>) and the whole thing works offline. Point it
         at Ollama or any OpenAI-compatible endpoint instead whenever you would rather.</p>
-      <p><strong>What&rsquo;s in <code>v1.0.1-beta-1</code>.</strong> The first beta, 38 commits past the last alpha.
-        The veil now brings its own model &mdash; downloaded from Settings, GPU-accelerated where there is a card
-        (about 40&times; on an RTX 5070), updated in place without a restart. Long sessions hold together: the
-        15&ndash;25 second freezes are gone, scrollback no longer destroys your history as it scrolls, a waiting
-        tool can no longer hold a turn open forever, and local models can use tools again. Replies come out in
-        plain punctuation.
-        <a href="https://github.com/gary23w/nl-veil/blob/main/docs/release/RELEASE-v1.0.1-beta-1.md" target="_blank" rel="noopener">Full release notes &rarr;</a></p>
+      <p><strong>What&rsquo;s in <code>v1.0.1-beta-2</code>.</strong> The second beta, 19 commits on. Browser tasks
+        actually finish now: four instructions in the tool descriptions turned out to be <em>false</em>, and a model
+        reasoning correctly from them concluded the task was impossible. Page reads are projected rather than
+        truncated &mdash; 59% smaller and lossless in refs, where the old clip handed back a confidently wrong
+        element. AFK mode drives toward your goal instead of the loop&rsquo;s own re-arm text. On Windows, closing
+        the desk window hides it to the tray instead of taking the server down with it. And recall resolves a
+        paraphrase that shares no words with the stored fact.
+        <a href="https://github.com/gary23w/nl-veil/blob/main/docs/release/RELEASE-v1.0.1-beta-2.md" target="_blank" rel="noopener">Full release notes &rarr;</a></p>
+      <p class="dim">Previously in <code>v1.0.1-beta-1</code>: the built-in model, GPU inference, and the fixes that
+        stopped long sessions falling apart.
+        <a href="https://github.com/gary23w/nl-veil/blob/main/docs/release/RELEASE-v1.0.1-beta-1.md" target="_blank" rel="noopener">Notes &rarr;</a></p>
       <p class="dim">Building it yourself instead &mdash; needs Zig 0.16+:</p>
       <pre class="md-code"><code>git clone https://github.com/gary23w/nl-veil
 cd nl-veil

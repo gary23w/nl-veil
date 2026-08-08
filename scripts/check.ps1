@@ -242,6 +242,18 @@ if ($Scan) {
     } else {
         Write-Host "[links] download links point at v$vMain" -ForegroundColor Green
     }
+    # All FOUR neuron build sites must request the same cargo features (twin of check.sh). CI builds neuron
+    # into a path build-official.sh cannot guess and hands it over as NEURON=, which build-official.sh reuses
+    # verbatim -- so its own cargo line never runs in CI, and a feature added only there ships nothing.
+    $featSets = @(Select-String -Path (Join-Path $repo "scripts\build-official.sh"), (Join-Path $repo "scripts\build-release.sh"),
+        (Join-Path $repo "scripts\build-release.ps1"), (Join-Path $repo ".github\workflows\release.yml") `
+        -Pattern 'features "([^"]+)"' -AllMatches | ForEach-Object { $_.Matches } | ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique)
+    if ($featSets.Count -eq 1) {
+        Write-Host "[neuron] all 4 build sites request the same cargo features" -ForegroundColor Green
+    } else {
+        $signals++
+        Write-Host "[neuron] $($featSets.Count) DIFFERENT cargo feature sets across the build scripts and release.yml -- a bundle would ship a different engine than you tested" -ForegroundColor Yellow
+    }
 
     # 4) docs mirror drift: docs/docs-src/ carries one .md per module; new/renamed modules rot it.
     $missingDocs = @()
