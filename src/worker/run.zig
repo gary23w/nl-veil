@@ -260,6 +260,11 @@ pub const Worker = struct {
     best_pct: u32 = 0,
     best_tier: u8 = 0,
     best_passed: u32 = 0,
+    best_total: u32 = 0, // widest check DENOMINATOR seen — a suite that grew is a stricter bar, not a regression
+    champion_failures: []const u8 = "", // the best-known-good build's failure set — the behavioural diff's reference
+    champion_pct: u32 = 0,
+    champion_round: u32 = 0,
+    champion_set: bool = false,
     solved_rounds: u32 = 0,
     flat_rounds: u32 = 0,
     regress_rounds: u32 = 0,
@@ -272,6 +277,16 @@ pub const Worker = struct {
     operating: bool = false,
     app_attach: bool = false, // opt-in generic-app LEARN mode (NL_APP_ATTACH): read-only attach to an arbitrary app
     idle_skip: bool = false, // opt-in (NL_IDLE_SKIP): a provably-idle non-lead assembler mind skips its LLM moment
+    patch_autorevert: bool = false, // opt-in (NL_PATCH_SYSTEM_AUTOREVERT): the governor restores a self-mod's pre-image on a `rollback` verdict
+    lesson_credit: bool = true, // NL_LESSON_CREDIT (on by default): a verified fix reinforces the prior lesson that preceded it (strengthen-only)
+    habit_mine: bool = true, // NL_HABIT_MINE (on by default): mine recurring successful tool sequences into the habit quarantine (deterministic)
+    habits: [24]HabitRec = [_]HabitRec{.{}} ** 24, // the run's habit table (bounded), folded per moment
+    habit_n: u8 = 0,
+    tourney: bool = false, // opt-in (NL_TOURNAMENT): explore N independent candidates from one baseline when the chain is stuck
+    tourney_active: bool = false, // a tournament is running — it owns work/ until it lands a winner
+    tourney_idx: u8 = 0, // which candidate this round is producing
+    tourney_best: i8 = -1, // best candidate index so far (-1 = none stashed yet)
+    tourney_best_pct: u32 = 0,
     playbook_str: []const u8 = "",
     kindex_str: []const u8 = "",
     // MIND-FLOOR lesson stash: the newest still-unpaired hard failure, carried across rounds so a later
@@ -691,6 +706,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
     defer gpa.free(w.stop_path);
     defer if (w.last_bench_str.len > 0) gpa.free(@constCast(w.last_bench_str));
     defer if (w.last_bench.failures.len > 0) gpa.free(w.last_bench.failures);
+    defer if (w.champion_failures.len > 0) gpa.free(@constCast(w.champion_failures));
     defer if (w.now_str.len > 0) gpa.free(@constCast(w.now_str));
     defer if (w.playbook_str.len > 0) gpa.free(@constCast(w.playbook_str));
     defer if (w.kindex_str.len > 0) gpa.free(@constCast(w.kindex_str));
@@ -732,6 +748,36 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
     if (environ.get("NL_IDLE_SKIP")) |v| {
         w.idle_skip = v.len > 0 and (v[0] == '1' or v[0] == 't' or v[0] == 'T' or v[0] == 'y' or v[0] == 'Y');
         if (w.idle_skip) w.act("engine", 0, "mode", "idle-skip", "idle-skip armed: a non-lead assembler mind with no unbuilt/incomplete file, no inbox, and a non-failing benchmark skips its moment this round (re-armed every round from live build state; the lead always runs, so a build can never stall).");
+    }
+    // PATCH AUTO-REVERT (opt-in, NL_PATCH_SYSTEM_AUTOREVERT): when the governor rules `rollback` on a self-edit
+    // (the score regressed after it), restore the journaled pre-image automatically. Default-off — reverting the
+    // engine's own source from a score signal is powerful, so it is armed explicitly; the immediate post-write
+    // syntax verify (NL_PATCH_SYSTEM_VERIFY, on by default) is the always-on safety floor, this is the slower loop.
+    if (environ.get("NL_PATCH_SYSTEM_AUTOREVERT")) |v| {
+        w.patch_autorevert = v.len > 0 and (v[0] == '1' or v[0] == 't' or v[0] == 'T' or v[0] == 'y' or v[0] == 'Y');
+        if (w.patch_autorevert) w.act("engine", 0, "mode", "patch-autorevert", "patch auto-revert armed: a patch_system self-edit that the governor rules `rollback` (score regressed) is restored to its pre-edit state from the journaled pre-image.");
+    }
+    // LESSON OUTCOME CREDIT (on by default; NL_LESSON_CREDIT=0 disables): when a fail→fix flip is verified, the
+    // prior lesson recalled for that failing signature is reinforced, so a lesson that keeps preceding fixes ranks
+    // up in future RAG-on-failure recalls. Strengthen-only (never mints), engine-driven. The off switch is for A/B.
+    if (environ.get("NL_LESSON_CREDIT")) |v| {
+        const t = std.mem.trim(u8, v, " \r\n\t");
+        w.lesson_credit = !(std.mem.eql(u8, t, "0") or std.ascii.eqlIgnoreCase(t, "false") or std.ascii.eqlIgnoreCase(t, "off") or std.ascii.eqlIgnoreCase(t, "no"));
+        if (!w.lesson_credit) w.act("engine", 0, "mode", "lesson-credit-off", "outcome credit for recalled lessons DISABLED (NL_LESSON_CREDIT=0): a verified fix no longer reinforces the prior lesson that preceded it.");
+    }
+    // HABIT MINING (on by default; NL_HABIT_MINE=0 disables): the deterministic counterpart to the LLM judge —
+    // count recurring successful tool sequences per mind and, at end of run, propose the frequent ones into the
+    // habit quarantine as candidate reusable procedures. Zero model calls; never auto-runs anything.
+    if (environ.get("NL_HABIT_MINE")) |v| {
+        const t = std.mem.trim(u8, v, " \r\n\t");
+        w.habit_mine = !(std.mem.eql(u8, t, "0") or std.ascii.eqlIgnoreCase(t, "false") or std.ascii.eqlIgnoreCase(t, "off") or std.ascii.eqlIgnoreCase(t, "no"));
+    }
+    // BEST-OF-N TOURNAMENT (opt-in, NL_TOURNAMENT): when the linear hill-climb is provably stuck, spend the next
+    // few rounds on independent branches from one frozen baseline and keep the best-scoring one. Default-off: it
+    // deliberately swaps work/ between rounds, so it is armed explicitly rather than inherited by every run.
+    if (environ.get("NL_TOURNAMENT")) |v| {
+        w.tourney = v.len > 0 and (v[0] == '1' or v[0] == 't' or v[0] == 'T' or v[0] == 'y' or v[0] == 'Y');
+        if (w.tourney) w.act("engine", 0, "mode", "tournament", "best-of-N tournament armed: on a stuck signal (invariant failures or a regression streak) the engine explores 3 independent candidates from one frozen baseline and lands the highest-scoring one.");
     }
     if (live) {
         const c = llm.capsSnapshot();
@@ -1335,6 +1381,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
             if (mi.scout and moment.skills == 0 and moment.files == 0)
                 _ = w.mem.observe(mi.scope, "scout: found no new external technique this round; team proceeds with current knowledge");
             applyLessonRecords(&w, round, &moment); // cross-mind/cross-round fail→fix pairing (single-threaded here)
+            recordHabit(&w, &moment); // fold this moment's successful-call window into the run's habit table
             mi.facts = moment.facts;
             total_files += moment.files;
             if (gpa.dupe(u8, moment.stance)) |st| (mi.stances.append(gpa, st) catch gpa.free(st)) else |_| {}
@@ -1514,6 +1561,14 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
         if (live and w.discourse) markDeliverableGaps(&w, goal, round);
         if (live and w.discourse) reconcileDeliverables(&w, goal, round);
         if (live) trackConvergence(&w, run_dir, goal, round);
+        // BEST-OF-N TOURNAMENT (opt-in): rank this round's candidate and either reset to the frozen baseline for
+        // the next branch or land the winner. Ordered AFTER trackConvergence so DELIVERY still sees (and can
+        // export) every candidate on its own merits; arming is checked last so a tournament starts on the NEXT
+        // round, never on the round whose build became its baseline.
+        if (live) {
+            tournamentStep(&w, round, run_dir);
+            tournamentArm(&w, round, run_dir);
+        }
         if (live and w.cap.exemplar and ((w.last_bench.status == .ok and w.last_bench.pct >= w.best_pct and w.last_bench.pct > 0) or round == 1 or @mod(round, DIGEST_EVERY) == 0)) promoteVerified(&w, run_dir);
         // PROMOTION COSTS A FULL CACHE-LINEAGE RESET, SO IT MUST BE PAID FOR IN SCORE, NOT IN FORM.
         // rsi.adaptCapacity promotes a tier after two rounds of "100% structured tool use, nothing narrated".
@@ -1747,6 +1802,7 @@ fn writeDone(w: *Worker, reason: []const u8) void {
     if (!w.judged) {
         w.judged = true;
         rsi.runJudge(w);
+        proposeHabits(w); // deterministic counterpart to the LLM judge: propose recurring tool sequences
     }
     const dp = std.fmt.allocPrint(w.gpa, "{s}/DONE", .{w.run_dir}) catch return;
     defer w.gpa.free(dp);
@@ -2437,6 +2493,7 @@ fn applyLessonRecords(w: *Worker, round: u32, moment: *const Moment) void {
         if (!w.lfail_set) break;
         if (!std.mem.eql(u8, w.lfail.toolStr(), ok.toolStr())) continue;
         if (!lessonPair(w.lfail.argsStr(), ok.argsStr())) continue;
+        creditRecalledLesson(w, round, &w.lfail); // strengthen a prior lesson that preceded this cross-round fix
         mintLesson(w, round, &w.lfail, ok);
         w.lfail_set = false;
     }
@@ -2585,6 +2642,132 @@ fn mintLesson(w: *Worker, round: u32, fail: *const LessonRec, ok: *const LessonR
     var ab: [560]u8 = undefined;
     _ = w.mem.observe(tools.LESSON_SCOPE, atomizeForObserve(&ab, lesson));
     w.act("engine", round, "lesson", fail.toolStr(), lesson);
+}
+
+/// OUTCOME CREDIT for a lesson that helped (strengthen-only, engine-driven). A failure just paired with a later
+/// fix of the same tool — a real fail→fix flip. Any PRE-EXISTING verified lesson recalled for that failing
+/// signature was the knowledge that could have carried the fix, so reinforce it: a lesson that keeps preceding
+/// fixes surfaces first in future RAG-on-failure recalls, and one that never does simply fades. This never MINTS
+/// — reinforce only strengthens an existing node, and the node provably exists because we just recalled it — so
+/// the strengthen-only plasticity rule holds (a reward can't resurrect or invent a lesson). Engine-only, so a
+/// mind cannot inflate its own lessons. Runs BEFORE the fresh mint, so it credits prior knowledge, not the fix
+/// about to be written. Gated by NL_LESSON_CREDIT (on by default).
+fn creditRecalledLesson(w: *Worker, round: u32, fail: *const LessonRec) void {
+    if (!w.lesson_credit) return;
+    const gpa = w.gpa;
+    var lqb: [280]u8 = undefined;
+    const lq = std.fmt.bufPrint(&lqb, "{s} {s}", .{ fail.toolStr(), clip(fail.argsStr(), 200) }) catch fail.toolStr();
+    const recalled = w.mem.assoc(tools.LESSON_SCOPE, lq, 2, 1); // the top verified lesson for THIS failing call
+    defer gpa.free(recalled);
+    const t = std.mem.trim(u8, recalled, " \r\n\t");
+    if (t.len < 24) return; // nothing meaningful was on hand to credit
+    w.mem.reinforce(tools.LESSON_SCOPE, clip(t, 200), "worked");
+    var db: [280]u8 = undefined;
+    const desc = std.fmt.bufPrint(&db, "a prior verified lesson preceded this fix — reinforced it: {s}", .{clip(t, 180)}) catch "reinforced a prior verified lesson";
+    w.act("engine", round, "lesson_credit", fail.toolStr(), desc);
+}
+
+/// One recurring successful tool sequence and how often a mind ran it this run.
+const HabitRec = struct { seq: [72]u8 = [_]u8{0} ** 72, len: u8 = 0, count: u16 = 0 };
+
+/// Navigation tools — a window of only these is browsing, not a reusable procedure worth proposing.
+fn isNavTool(name: []const u8) bool {
+    return std.mem.eql(u8, name, "read_file") or std.mem.eql(u8, name, "list_dir") or
+        std.mem.eql(u8, name, "recall_hive") or std.mem.eql(u8, name, "read_url");
+}
+
+/// Is a 2/3-tool window worth counting as a habit? It needs >= 2 DISTINCT tools (a>a>a is a retry loop, not a
+/// procedure) and must not be pure navigation. c == "" marks a trailing 2-gram. Pure — unit-tested.
+fn habitInteresting(a: []const u8, b: []const u8, c: []const u8) bool {
+    if (a.len == 0 or b.len == 0) return false;
+    const distinct = !std.mem.eql(u8, a, b) or (c.len > 0 and !std.mem.eql(u8, c, a) and !std.mem.eql(u8, c, b));
+    if (!distinct) return false;
+    if (isNavTool(a) and isNavTool(b) and (c.len == 0 or isNavTool(c))) return false;
+    return true;
+}
+
+/// Count one habit key into a bounded table: bump an existing entry, add a new one, or — when full — overwrite
+/// the least-frequent entry ONLY if it is itself a one-off, so an established habit is never evicted by a
+/// transient. Pure over its arguments; unit-tested.
+fn habitBump(habits: []HabitRec, n: *u8, key: []const u8) void {
+    if (key.len == 0 or key.len > 72) return;
+    var i: usize = 0;
+    while (i < n.*) : (i += 1) {
+        if (habits[i].len == key.len and std.mem.eql(u8, habits[i].seq[0..habits[i].len], key)) {
+            if (habits[i].count < 65535) habits[i].count += 1;
+            return;
+        }
+    }
+    if (n.* < habits.len) {
+        const r = &habits[n.*];
+        @memcpy(r.seq[0..key.len], key);
+        r.len = @intCast(key.len);
+        r.count = 1;
+        n.* += 1;
+        return;
+    }
+    var mi: usize = 0;
+    var mc: u16 = 65535;
+    i = 0;
+    while (i < n.*) : (i += 1) {
+        if (habits[i].count < mc) {
+            mc = habits[i].count;
+            mi = i;
+        }
+    }
+    if (mc <= 1) {
+        const r = &habits[mi];
+        @memcpy(r.seq[0..key.len], key);
+        r.len = @intCast(key.len);
+        r.count = 1;
+    }
+}
+
+/// HABIT MINING (deterministic, zero model calls): fold this moment's ordered successful-call window into the
+/// run's habit table. Single-threaded (called from the post-join per-moment loop), so no locking. moment.oks is
+/// already per-mind, in call order, and success-filtered — the exact granularity a reusable procedure lives at.
+fn recordHabit(w: *Worker, moment: *const Moment) void {
+    if (!w.habit_mine or moment.ok_n < 2) return;
+    var kb: [72]u8 = undefined;
+    var i: usize = 0;
+    while (i + 1 < moment.ok_n) : (i += 1) {
+        const a = moment.oks[i].toolStr();
+        const b = moment.oks[i + 1].toolStr();
+        if (i + 2 < moment.ok_n) {
+            const c = moment.oks[i + 2].toolStr();
+            if (habitInteresting(a, b, c)) {
+                const key = std.fmt.bufPrint(&kb, "{s}>{s}>{s}", .{ a, b, c }) catch continue;
+                habitBump(&w.habits, &w.habit_n, key);
+            }
+        } else if (habitInteresting(a, b, "")) {
+            const key = std.fmt.bufPrint(&kb, "{s}>{s}", .{ a, b }) catch continue;
+            habitBump(&w.habits, &w.habit_n, key);
+        }
+    }
+}
+
+/// END-OF-RUN: propose the habits that recurred enough to be worth formalizing (>= 3 times) into the quarantine
+/// scope, capped at 5. Like the judge's proposals these are candidates only — a human/review turns a recurring
+/// sequence into a runnable recipe; nothing here auto-registers or auto-runs one.
+fn proposeHabits(w: *Worker) void {
+    if (!w.habit_mine) return;
+    var proposed: usize = 0;
+    var i: usize = 0;
+    while (i < w.habit_n and proposed < 5) : (i += 1) {
+        const h = &w.habits[i];
+        if (h.count < 3) continue;
+        const line = std.fmt.allocPrint(w.gpa, "habit: {s} (a mind ran this sequence {d}x this run) | evidence: recurring successful tool sequence", .{ h.seq[0..h.len], h.count }) catch continue;
+        defer w.gpa.free(line);
+        _ = w.mem.observe(tools.HABIT_PROPOSED_SCOPE, line);
+        proposed += 1;
+    }
+    if (proposed > 0) {
+        var db: [200]u8 = undefined;
+        const desc = std.fmt.bufPrint(&db, "mined {d} recurring successful tool sequence(s) into the habit quarantine — candidate reusable procedures for review", .{proposed}) catch "mined habits";
+        w.act("engine", 0, "habit", "procedural patterns", desc);
+        var eb: [48]u8 = undefined;
+        w.emit("habit", std.fmt.bufPrint(&eb, ",\"proposed\":{d}", .{proposed}) catch ",\"proposed\":0");
+    }
 }
 
 /// RSI CAPACITY — the model-capacity self-tuner (DEMOTE-ONLY). The engine does NOT trust the model's name; each
@@ -4556,6 +4739,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
                     // fail→fix INSIDE one moment — the dominant case; mint immediately (Mem locks writes)
                     var okr: LessonRec = .{};
                     okr.set(c.name, clip(c.args, 200), "");
+                    creditRecalledLesson(w, round, &mstash); // strengthen a prior lesson that preceded this fix
                     mintLesson(w, round, &mstash, &okr);
                     mstash_set = false;
                 } else if (mok_n < moks.len) {
@@ -8837,6 +9021,153 @@ fn applyScoutRewards(w: *Worker, round: u32) void {
     }
 }
 
+/// A failing check's stable SIGNATURE: the head of the line with digits stripped, so a re-run whose timings,
+/// counts or line numbers moved still matches the same underlying break. Pure — unit-tested.
+fn failureSignature(line: []const u8, buf: []u8) []const u8 {
+    var n: usize = 0;
+    for (std.mem.trim(u8, line, " \r\t")) |c| {
+        if (n >= buf.len) break;
+        if (std.ascii.isDigit(c)) continue;
+        buf[n] = std.ascii.toLower(c);
+        n += 1;
+    }
+    return buf[0..n];
+}
+
+/// Does `haystack` (a champion's whole failure text) already contain this signature? Compares signature-to-
+/// signature so both sides are normalized the same way. Pure — unit-tested.
+fn championHasFailure(champion: []const u8, sig: []const u8) bool {
+    if (sig.len < 8) return true; // too short to attribute — never call it a new break
+    var it = std.mem.splitScalar(u8, champion, '\n');
+    var cbuf: [160]u8 = undefined;
+    while (it.next()) |ln| {
+        const csig = failureSignature(ln, &cbuf);
+        if (csig.len < 8) continue;
+        const a = sig[0..@min(sig.len, csig.len)];
+        const b = csig[0..@min(sig.len, csig.len)];
+        if (std.mem.eql(u8, a, b)) return true;
+    }
+    return false;
+}
+
+/// CHAMPION–CHALLENGER BEHAVIOURAL DIFF. The score is an AGGREGATE: a round that breaks one check while fixing
+/// another lands the same percentage, and every loop that watches pct alone — the governor, the convergence
+/// tracker, the tournament — reads that as "no change". So a self-edit or a refactor could silently trade
+/// working behaviour for new behaviour and nothing anywhere would say so.
+///
+/// The champion is the best-known-good build's failure set; every later round is the challenger. A failing
+/// signature the challenger has and the champion did NOT is a NEW break, attributable and reportable even when
+/// the percentage is flat or up. That is the behavioural diff the pass rate cannot express — and it needs no
+/// replay harness, because the checks already run every round. Records into the canary ledger, which until now
+/// only ever accumulated the governor's verdicts with nothing computing an outcome from them.
+fn challengerDiff(w: *Worker, round: u32) void {
+    if (!w.champion_set or w.champion_failures.len == 0) return;
+    const cur = w.last_bench.failures;
+    if (cur.len == 0) return;
+    var new_breaks: u32 = 0;
+    var first: []const u8 = "";
+    var it = std.mem.splitScalar(u8, cur, '\n');
+    var sbuf: [160]u8 = undefined;
+    while (it.next()) |ln| {
+        const t = std.mem.trim(u8, ln, " \r\t");
+        if (t.len < 8) continue;
+        const sig = failureSignature(t, &sbuf);
+        if (championHasFailure(w.champion_failures, sig)) continue;
+        new_breaks += 1;
+        if (first.len == 0) first = t;
+    }
+    if (new_breaks == 0) return;
+    // MASKED is the case worth shouting about: the aggregate says fine (or better) while something that used
+    // to work now does not. A drop already surfaces through the ordinary regression path.
+    const masked = w.last_bench.pct >= w.champion_pct;
+    const rec = std.fmt.allocPrint(w.gpa, "round {d} challenger: {d} new break(s) vs the champion from round {d} ({d}% -> {d}%{s}) | first: {s}", .{ round, new_breaks, w.champion_round, w.champion_pct, w.last_bench.pct, if (masked) ", MASKED by the aggregate" else "", clip(first, 160) }) catch return;
+    defer w.gpa.free(rec);
+    _ = w.mem.observe(tools.CANARY_SCOPE, rec);
+    w.act("engine", round, "challenger", if (masked) "a masked behavioural regression" else "new breaks vs the champion", std.fmt.allocPrint(w.a(), "{d} check(s) that passed in the champion build (round {d}, {d}%) now fail, at {d}%{s}. The pass rate cannot show this: it nets a break against a fix. First new break: {s}", .{ new_breaks, w.champion_round, w.champion_pct, w.last_bench.pct, if (masked) " — the aggregate score HID it" else "", clip(first, 200) }) catch "new breaks vs the champion");
+    w.emit("challenger", std.fmt.allocPrint(w.a(), ",\"round\":{d},\"new_breaks\":{d},\"masked\":{},\"champion_round\":{d},\"champion_pct\":{d},\"pct\":{d}", .{ round, new_breaks, masked, w.champion_round, w.champion_pct, w.last_bench.pct }) catch ",\"round\":0");
+}
+
+/// Promote the current build to CHAMPION — the reference every later round is diffed against. Called when the
+/// build reaches a new best, so the champion is always a best-known-good, never merely the previous round.
+fn recordChampion(w: *Worker, round: u32) void {
+    const dup = w.gpa.dupe(u8, w.last_bench.failures) catch return;
+    if (w.champion_failures.len > 0) w.gpa.free(@constCast(w.champion_failures));
+    w.champion_failures = dup;
+    w.champion_pct = w.last_bench.pct;
+    w.champion_round = round;
+    w.champion_set = true;
+}
+
+/// How many independent candidates a tournament explores before landing the best one.
+const TOURNEY_N: u8 = 3;
+
+/// BEST-OF-N TOURNAMENT (opt-in, NL_TOURNAMENT). The engine's hill-climb is a LINEAR chain: every round edits
+/// whatever the last round left, so when the chain gets stuck the swarm grinds the same local optimum. Nothing
+/// anywhere generated several independent attempts at the same thing and kept the best — minds parallelize
+/// across FILES, and the micro-VCS MERGES concurrent edits rather than letting them compete.
+///
+/// This arms only on a measured stuck signal (the zero-gradient sentinel: failing-check text byte-identical
+/// while the tree changes; or a regression streak), because those are exactly the rounds already being wasted.
+/// It then spends the next N rounds producing N candidates FROM THE SAME FROZEN BASELINE — after each round the
+/// candidate is stashed and the baseline restored, so candidate 2 does not inherit candidate 1's dead end — and
+/// lands the highest-scoring one. Scoring is the existing benchmark; no new judge, no model call.
+///
+/// HONEST LIMIT: restoring the baseline reverts the CONTENT of files it holds; a file a candidate newly created
+/// stays (copyBuild skips manifest paths absent from the source). So a candidate inherits its predecessors'
+/// new files but not their edits. That is the safe direction — never a deletion of work — and it means the
+/// branches are independent in their edits, which is where a local optimum actually lives.
+fn tournamentArm(w: *Worker, round: u32, run_dir: []const u8) void {
+    if (!w.tourney or w.tourney_active or w.operating or w.discourse or w.quick) return;
+    if (!w.last_bench.hasScore()) return; // nothing to rank candidates by
+    const stuck = w.fail_invariant_n >= 2 or w.regress_rounds >= 2;
+    if (!stuck) return;
+    if (copyBuild(w, run_dir, "work", ".tourney_base") == 0) return; // nothing to branch from
+    w.tourney_active = true;
+    w.tourney_idx = 0;
+    w.tourney_best = -1;
+    w.tourney_best_pct = 0;
+    w.act("engine", round, "tournament", "armed", std.fmt.allocPrint(w.a(), "the linear chain is stuck (invariant failures {d}, regressions {d}) — exploring {d} independent candidates from this round's build as a frozen baseline and keeping the best-scoring one", .{ w.fail_invariant_n, w.regress_rounds, TOURNEY_N }) catch "tournament armed");
+    w.emit("tournament", std.fmt.allocPrint(w.a(), ",\"round\":{d},\"event\":\"armed\",\"n\":{d},\"baseline_pct\":{d}", .{ round, TOURNEY_N, w.last_bench.pct }) catch ",\"round\":0");
+}
+
+/// One tournament step, once per round after the benchmark has scored this round's candidate: stash the
+/// candidate, rank it, then either reset to the baseline for the next branch or land the winner.
+fn tournamentStep(w: *Worker, round: u32, run_dir: []const u8) void {
+    if (!w.tourney_active) return;
+    var sub_buf: [24]u8 = undefined;
+    const sub = std.fmt.bufPrint(&sub_buf, ".tourney_c{d}", .{w.tourney_idx}) catch return;
+    const stashed = copyBuild(w, run_dir, "work", sub);
+    const pct = w.last_bench.pct;
+    if (stashed > 0 and (w.tourney_best < 0 or pct > w.tourney_best_pct)) {
+        w.tourney_best = @intCast(w.tourney_idx);
+        w.tourney_best_pct = pct;
+    }
+    w.act("engine", round, "tournament", "candidate scored", std.fmt.allocPrint(w.a(), "candidate {d}/{d} scored {d}% ({d} files stashed); best so far {d}%", .{ w.tourney_idx + 1, TOURNEY_N, pct, stashed, if (w.tourney_best >= 0) w.tourney_best_pct else pct }) catch "candidate scored");
+    w.emit("tournament", std.fmt.allocPrint(w.a(), ",\"round\":{d},\"event\":\"candidate\",\"idx\":{d},\"pct\":{d},\"best_pct\":{d}", .{ round, w.tourney_idx, pct, w.tourney_best_pct }) catch ",\"round\":0");
+    w.tourney_idx += 1;
+
+    if (w.tourney_idx < TOURNEY_N) {
+        _ = copyBuild(w, run_dir, ".tourney_base", "work"); // next branch starts from the same baseline
+        return;
+    }
+
+    // LAND THE WINNER. Same discipline as the DELIVERY restore: a stash that captured less than the live tree
+    // is not allowed to overwrite it — a tournament must never be a way to lose work.
+    w.tourney_active = false;
+    if (w.tourney_best < 0) return;
+    var wb: [24]u8 = undefined;
+    const wsub = std.fmt.bufPrint(&wb, ".tourney_c{d}", .{@as(u8, @intCast(w.tourney_best))}) catch return;
+    const win_n = buildFileCount(w, run_dir, wsub);
+    const live_n = buildFileCount(w, run_dir, "work");
+    if (win_n < live_n or snapshotTooLight(buildByteMass(w, run_dir, wsub), buildByteMass(w, run_dir, "work"))) {
+        w.act("engine", round, "tournament", "kept the live build", std.fmt.allocPrint(w.a(), "the winning candidate ({d}%) holds {d} deliverable files against the live build's {d} — landing it would discard work, so the live build stands", .{ w.tourney_best_pct, win_n, live_n }) catch "kept the live build");
+        return;
+    }
+    const landed = copyBuild(w, run_dir, wsub, "work");
+    w.act("engine", round, "tournament", "landed the winner", std.fmt.allocPrint(w.a(), "explored {d} independent candidates from one baseline; landed candidate {d} at {d}% ({d} files)", .{ TOURNEY_N, w.tourney_best + 1, w.tourney_best_pct, landed }) catch "landed the winner");
+    w.emit("tournament", std.fmt.allocPrint(w.a(), ",\"round\":{d},\"event\":\"landed\",\"idx\":{d},\"pct\":{d},\"files\":{d}", .{ round, w.tourney_best, w.tourney_best_pct, landed }) catch ",\"round\":0");
+}
+
 fn scoutQuery(w: *Worker, goal: []const u8) []const u8 {
     const gpa = w.gpa;
     const intent = if (w.goal_brief.len > 0) w.goal_brief else clip(goal, 200);
@@ -8965,8 +9296,20 @@ fn trackConvergence(w: *Worker, run_dir: []const u8, goal: []const u8, round: u3
         const best_strength = tierStrength(w.best_tier);
         const rigor_increase = cur_strength > best_strength;
         const same_or_stronger = cur_strength >= best_strength;
-        const improved = w.best_tier == 0 and w.best_pct == 0 or rigor_increase or (same_or_stronger and (b.passed > w.best_passed or (b.passed >= w.best_passed and b.pct > w.best_pct)));
-        const regressed = !rigor_increase and same_or_stronger and w.best_pct > 0 and b.pct + REGRESS_MARGIN < w.best_pct;
+        // DENOMINATOR GROWTH — the suite now asks MORE than it did (a new test joined the run), so the same build
+        // scores a lower percentage without having got worse. Read as a regression, that drop would trigger the
+        // DELIVERY restore and revert the very test that raised the bar: the engine would be structurally unable
+        // to accept a stricter suite, and the BREAKER lane could never pay off. A wider denominator is therefore
+        // treated exactly like a rigor increase — re-baseline against the harder measurement, never a regression.
+        const denom_grew = w.best_total > 0 and b.total > w.best_total;
+        if (b.total > w.best_total) w.best_total = b.total;
+        const improved = w.best_tier == 0 and w.best_pct == 0 or rigor_increase or denom_grew or (same_or_stronger and (b.passed > w.best_passed or (b.passed >= w.best_passed and b.pct > w.best_pct)));
+        const regressed = !rigor_increase and !denom_grew and same_or_stronger and w.best_pct > 0 and b.pct + REGRESS_MARGIN < w.best_pct;
+        // BEHAVIOURAL DIFF before the champion moves: compare THIS round against the previous best-known-good,
+        // so a break the aggregate score nets out against a fix is still named. (After recordChampion below the
+        // reference would be this very round, and the comparison would be vacuous.)
+        challengerDiff(w, round);
+        if (denom_grew) w.act("engine", round, "falsifier", "the bar moved", std.fmt.allocPrint(w.a(), "the suite grew to {d} checks (was {d}) — this round's {d}% is measured against a stricter bar, not a worse build; re-baselining rather than counting it a regression", .{ b.total, w.best_total, b.pct }) catch "the bar moved");
         // DELIVERY MUST NOT FREEZE WHEN THE SCORE CANNOT RANK ROUNDS. `improved` can fire only ONCE on a run
         // whose pct never leaves 0: the `best_tier == 0 and best_pct == 0` seed clause is true on round 1 and
         // false forever after, while every later comparison is 0 against 0. In cast-355797 that froze DELIVERY/
@@ -8981,6 +9324,7 @@ fn trackConvergence(w: *Worker, run_dir: []const u8, goal: []const u8, round: u3
             w.best_passed = b.passed;
             w.flat_rounds = 0;
             w.regress_rounds = 0;
+            recordChampion(w, round); // this build is the new best-known-good — every later round diffs against it
             if (same_or_stronger and copyBuild(w, run_dir, "work", "DELIVERY") > 0) {
                 w.best_snapshot = true;
                 w.best_mass = mass;
@@ -9007,7 +9351,11 @@ fn trackConvergence(w: *Worker, run_dir: []const u8, goal: []const u8, round: u3
             // round-1 snapshot lands on a much larger tree. Guard on FILE COUNT — a revert is a revert of
             // CONTENT, never a deletion of work — and then on BYTE MASS, because an equal-count snapshot of
             // stubs is the same deletion wearing the right number of filenames.
-            if (w.best_snapshot and w.regress_rounds >= RESTORE_AFTER) {
+            // ONE CONTROLLER AT A TIME. While a tournament is running it owns work/ (it swaps the tree between
+            // branches by design), so the DELIVERY restore must stand down — otherwise two controllers fight
+            // over the same directory and a branch gets overwritten mid-exploration. DELIVERY still tracks the
+            // best candidate through the export path above; only the revert is deferred until the tournament ends.
+            if (w.best_snapshot and w.regress_rounds >= RESTORE_AFTER and !w.tourney_active) {
                 const snap_n = buildFileCount(w, run_dir, "DELIVERY");
                 const live_n = buildFileCount(w, run_dir, "work");
                 if (snap_n < live_n) {
@@ -10939,4 +11287,166 @@ test "every events.jsonl reader admits as much as the writer emits" {
     // Not vacuous: the readers are really there. A refactor that moves or renames them fails here
     // rather than passing on zero matches.
     try std.testing.expect(readers >= 3);
+}
+
+test "lesson outcome-credit is wired at both fix sites, is strengthen-only, and credits BEFORE minting" {
+    // Same shape as the isDecline/memoryView wiring tests: creditRecalledLesson can be correct and never
+    // called, in which case the whole outcome-credit loop is silently dead. Assert the wiring AND the two
+    // invariants a refactor could quietly break: it must never MINT (strengthen-only), and at the cross-round
+    // site it must run BEFORE the mint (else it credits the lesson just written, not the prior one that helped).
+    const SRC = @embedFile("run.zig");
+    // (1) the function strengthens (reinforce) and never mints (no .observe into a scope)
+    {
+        const at = std.mem.indexOf(u8, SRC, "fn creditRecalledLesson") orelse return error.CreditFnMissing;
+        const rest = SRC[at..];
+        const nf = std.mem.indexOf(u8, rest, "\nfn ") orelse rest.len;
+        const npf = std.mem.indexOf(u8, rest, "\npub fn ") orelse rest.len;
+        const body = rest[0..@min(nf, npf)];
+        try std.testing.expect(std.mem.indexOf(u8, body, "reinforce(") != null);
+        if (std.mem.indexOf(u8, body, ".observe(") != null) return error.CreditMustNotMint;
+    }
+    // (2) cross-round site: credit is wired, and precedes the mint
+    {
+        const at = std.mem.indexOf(u8, SRC, "fn applyLessonRecords") orelse return error.ApplyFnMissing;
+        const rest = SRC[at..];
+        const nf = std.mem.indexOf(u8, rest, "\nfn ") orelse rest.len;
+        const npf = std.mem.indexOf(u8, rest, "\npub fn ") orelse rest.len;
+        const body = rest[0..@min(nf, npf)];
+        const credit = std.mem.indexOf(u8, body, "creditRecalledLesson(") orelse return error.CrossRoundNotWired;
+        const mint = std.mem.indexOf(u8, body, "mintLesson(") orelse return error.MintMissing;
+        try std.testing.expect(credit < mint);
+    }
+    // (3) the in-moment path (the dominant fail→fix case) also credits
+    {
+        const at = std.mem.indexOf(u8, SRC, "INSIDE one moment") orelse return error.InMomentAnchorMissing;
+        const near = SRC[at..@min(at + 420, SRC.len)];
+        try std.testing.expect(std.mem.indexOf(u8, near, "creditRecalledLesson(") != null);
+    }
+}
+
+test "habitInteresting requires >=2 distinct non-navigation tools" {
+    try std.testing.expect(!habitInteresting("write_file", "write_file", "")); // a>a is a retry, not a procedure
+    try std.testing.expect(!habitInteresting("read_file", "list_dir", "recall_hive")); // pure navigation
+    try std.testing.expect(habitInteresting("write_file", "run_tests", "")); // real 2-step procedure
+    try std.testing.expect(habitInteresting("read_file", "write_file", "run_tests")); // nav + real work is fine
+    try std.testing.expect(!habitInteresting("", "run_tests", "")); // empty slot
+}
+
+test "habitBump counts, and never lets a transient evict an established habit" {
+    var habits: [3]HabitRec = [_]HabitRec{.{}} ** 3;
+    var n: u8 = 0;
+    habitBump(&habits, &n, "a>b");
+    habitBump(&habits, &n, "a>b");
+    habitBump(&habits, &n, "c>d");
+    habitBump(&habits, &n, "e>f");
+    try std.testing.expectEqual(@as(u8, 3), n);
+    // table full; a>b has count 2, the others 1. A NEW key overwrites a count==1 entry, never the count==2 one.
+    habitBump(&habits, &n, "g>h");
+    var ab: u16 = 0;
+    for (habits[0..n]) |h| {
+        if (std.mem.eql(u8, h.seq[0..h.len], "a>b")) ab = h.count;
+    }
+    try std.testing.expectEqual(@as(u16, 2), ab); // the established habit survived
+}
+
+test "failureSignature normalizes away digits and case so a re-run matches the same underlying break" {
+    var a: [160]u8 = undefined;
+    var b: [160]u8 = undefined;
+    const s1 = failureSignature("FAILED test_auth.py::test_login - AssertionError at line 42 (0.31s)", &a);
+    const s2 = failureSignature("failed test_auth.py::test_login - AssertionError at line 87 (1.02s)", &b);
+    try std.testing.expectEqualStrings(s1, s2); // same break, different line/timing
+    const s3 = failureSignature("FAILED test_billing.py::test_invoice - KeyError", &b);
+    try std.testing.expect(!std.mem.eql(u8, s1, s3)); // a genuinely different break stays different
+}
+
+test "championHasFailure: a NEW break is named, a known one is not, and a too-short line is never attributed" {
+    const champion = "FAILED test_auth.py::test_login - AssertionError at line 42\nFAILED test_math.py::test_add - off by one";
+    var sb: [160]u8 = undefined;
+    // already failing in the champion (different line number) -> not new
+    try std.testing.expect(championHasFailure(champion, failureSignature("FAILED test_auth.py::test_login - AssertionError at line 91", &sb)));
+    // a break the champion never had -> NEW
+    try std.testing.expect(!championHasFailure(champion, failureSignature("FAILED test_billing.py::test_invoice - KeyError", &sb)));
+    // too short to attribute -> treated as known, never reported as a regression
+    try std.testing.expect(championHasFailure(champion, failureSignature("E  ", &sb)));
+}
+
+test "the behavioural diff runs against the PREVIOUS champion, not the round that just became one" {
+    // Ordering is the whole test: recordChampion fires on `improved`, so if the diff ran after it the reference
+    // would be this very round and the comparison would be vacuously empty on exactly the rounds that change most.
+    const SRC = @embedFile("run.zig");
+    const at = std.mem.indexOf(u8, SRC, "fn trackConvergence") orelse return error.TrackFnMissing;
+    const rest = SRC[at..];
+    const diff = std.mem.indexOf(u8, rest, "challengerDiff(w, round)") orelse return error.DiffNotWired;
+    const rec = std.mem.indexOf(u8, rest, "recordChampion(w, round)") orelse return error.ChampionNotWired;
+    try std.testing.expect(diff < rec);
+}
+
+test "a GROWN check denominator re-baselines instead of counting as a regression (the falsifier lane's floor)" {
+    // Without this the engine is structurally unable to accept a stricter suite: a newly added failing test
+    // lowers the percentage, trackConvergence reads that as a regression, and the DELIVERY restore reverts the
+    // very test that raised the bar — so the BREAKER lane could never pay off. Assert the rule is in the two
+    // expressions that decide it, since a refactor could drop it from either half and leave the other looking right.
+    const SRC = @embedFile("run.zig");
+    const at = std.mem.indexOf(u8, SRC, "const denom_grew =") orelse return error.DenomRuleMissing;
+    const rest = SRC[at..@min(at + 1400, SRC.len)];
+    const imp = std.mem.indexOf(u8, rest, "const improved =") orelse return error.ImprovedMissing;
+    const reg = std.mem.indexOf(u8, rest, "const regressed =") orelse return error.RegressedMissing;
+    const imp_line = rest[imp .. imp + (std.mem.indexOfScalarPos(u8, rest, imp, ';') orelse rest.len) - imp];
+    const reg_line = rest[reg .. reg + (std.mem.indexOfScalarPos(u8, rest, reg, ';') orelse rest.len) - reg];
+    // a wider bar counts as progress to re-baseline against...
+    if (std.mem.indexOf(u8, imp_line, "denom_grew") == null) return error.GrowthNotTreatedAsImprovement;
+    // ...and must never satisfy the regression test that arms the revert
+    if (std.mem.indexOf(u8, reg_line, "!denom_grew") == null) return error.GrowthStillCountsAsRegression;
+    // the BREAKER archetype is what produces that growth — it must exist, and must not be a fixer
+    const RSI = @embedFile("rsi.zig");
+    const bk = std.mem.indexOf(u8, RSI, ".key = \"breaker\"") orelse return error.BreakerArchetypeMissing;
+    const lane = RSI[bk..@min(bk + 700, RSI.len)];
+    try std.testing.expect(std.mem.indexOf(u8, lane, "FAILS") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lane, "Do NOT fix it") != null);
+}
+
+test "the tournament defers to no second controller and can never land a lighter build than it would overwrite" {
+    const SRC = @embedFile("run.zig");
+    // (1) While a tournament owns work/, the DELIVERY restore must stand down — two controllers swapping the
+    // same directory would overwrite a branch mid-exploration.
+    {
+        const at = std.mem.indexOf(u8, SRC, "w.best_snapshot and w.regress_rounds >= RESTORE_AFTER") orelse return error.RestoreGateMissing;
+        const line_end = std.mem.indexOfScalarPos(u8, SRC, at, '\n') orelse SRC.len;
+        if (std.mem.indexOf(u8, SRC[at..line_end], "!w.tourney_active") == null) return error.TwoControllersOverWorkdir;
+    }
+    // (2) Landing a winner reuses the SAME anti-shrink discipline as the DELIVERY restore: file count and the
+    // byte-mass floor. A tournament must never be a way to lose work.
+    {
+        const at = std.mem.indexOf(u8, SRC, "fn tournamentStep") orelse return error.StepFnMissing;
+        const rest = SRC[at..];
+        const stop = std.mem.indexOf(u8, rest, "\nfn scoutQuery") orelse rest.len;
+        const body = rest[0..stop];
+        try std.testing.expect(std.mem.indexOf(u8, body, "buildFileCount(") != null);
+        try std.testing.expect(std.mem.indexOf(u8, body, "snapshotTooLight(") != null);
+    }
+    // (3) Arming requires a real stuck signal and a score that can rank candidates — never an unconditional fork.
+    {
+        const at = std.mem.indexOf(u8, SRC, "fn tournamentArm") orelse return error.ArmFnMissing;
+        const rest = SRC[at..];
+        const stop = std.mem.indexOf(u8, rest, "\n/// One tournament step") orelse rest.len;
+        const body = rest[0..stop];
+        try std.testing.expect(std.mem.indexOf(u8, body, "fail_invariant_n") != null);
+        try std.testing.expect(std.mem.indexOf(u8, body, "hasScore()") != null);
+    }
+}
+
+test "the habit miner is wired at BOTH ends — per-moment record and end-of-run propose" {
+    const SRC = @embedFile("run.zig");
+    // per-moment fold, right beside the lesson pairing
+    {
+        const at = std.mem.indexOf(u8, SRC, "applyLessonRecords(&w, round, &moment);") orelse return error.PairingMissing;
+        const near = SRC[at..@min(at + 240, SRC.len)];
+        try std.testing.expect(std.mem.indexOf(u8, near, "recordHabit(&w, &moment)") != null);
+    }
+    // end-of-run proposal, in the same one-shot block as the judge
+    {
+        const at = std.mem.indexOf(u8, SRC, "rsi.runJudge(w);") orelse return error.JudgeCallMissing;
+        const near = SRC[at..@min(at + 160, SRC.len)];
+        try std.testing.expect(std.mem.indexOf(u8, near, "proposeHabits(w)") != null);
+    }
 }
