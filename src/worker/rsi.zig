@@ -41,6 +41,7 @@ const ARCHETYPES = [_]Archetype{
     .{ .key = "capability-builder", .lane = "CAPABILITY-BUILDER — find the ONE capability gap blocking the benchmark; research the technique if needed, then AUTHOR it with make_tool (Python reading ARGS, printing one JSON line) so the team gains a permanent, callable tool, and verify it. Your output is a NEW TOOL, not a one-off script.", .research = false },
     .{ .key = "inventor", .lane = "INVENTOR — the current approach is stuck; do NOT iterate the failing path. Devise a DIFFERENT method (new algorithm/decomposition, or a new tool via make_tool) and prototype it.", .research = false },
     .{ .key = "analyst", .lane = "ANALYST — tear open the target artifact/problem (a bug, a failing test, a design, a dataset): reproduce it, isolate the exact mechanism, and report the concrete ROOT CAUSE + the minimal fix. Diagnose precisely; do NOT rewrite it yourself.", .research = false },
+    .{ .key = "breaker", .lane = "BREAKER (falsifier) — the pass rate measures only what the suite already asks. Your job is to make it ask MORE: find behaviour the current tests do NOT cover, and write a REAL test that FAILS against the build as it stands (an edge case, a boundary, an error path, a wrong-input case). Do NOT fix it — a failing test you wrote is a success, and the team's next round is what makes it pass. Never weaken or delete an existing test, and never write a test that asserts something already covered.", .research = false },
     .{ .key = "outreach", .lane = "OUTREACH — turn the team's result into clear external communication: a concise release note / social post / message that states what was done and why it matters. Write for the audience, grounded ONLY in what the team actually produced.", .research = false },
 };
 
@@ -300,7 +301,89 @@ pub fn rsiGovernance(w: *Worker, round: u32, prev_pct: u32, tok0_in: u64, tok0_o
     defer gpa.free(gov);
     _ = w.mem.observe(tools.AUTONOMY_SCOPE, gov);
 
+    // Give the governor's verdict a reader. Until now `accept`/`rollback` were written to CANARY/AUTONOMY and
+    // consulted by nothing. patchGovernanceFeedback binds the latest journaled self-edit's success_criterion to
+    // THIS round's measured delta (so the criterion is graded, not dropped), and — when NL_PATCH_SYSTEM_AUTOREVERT
+    // is armed — restores the pre-image on a `rollback` verdict.
+    patchGovernanceFeedback(w, round, decision, score_delta);
+
     w.emit("rsi", std.fmt.allocPrint(w.a(), ",\"round\":{d},\"decision\":\"{s}\",\"score_delta\":{d},\"tokens\":{d},\"calls\":{d},\"utility_milli\":{d},\"simulations\":{d},\"trials\":{d},\"confidence_milli\":{d},\"mean_delta_milli\":{d},\"proposal\":\"{s}\"", .{ round, decision, score_delta, din + dout, dcalls, utility_milli, sims_n, tc.trials, tc.confidence_milli, tc.mean_delta_milli, w.esc(clip(if (latest.len > 0) latest else "(none)", 220)) }) catch ",\"round\":0");
+}
+
+/// The value of a `key=...` field up to the next space (or end of line). "" if the key is absent.
+fn patchField(line: []const u8, key: []const u8) []const u8 {
+    const at = std.mem.indexOf(u8, line, key) orelse return "";
+    const rest = line[at + key.len ..];
+    const end = std.mem.indexOfScalar(u8, rest, ' ') orelse rest.len;
+    return rest[0..end];
+}
+
+/// The value of a trailing `key=...` field to end-of-line (for the free-text crit=, which may contain spaces).
+fn patchFieldToEnd(line: []const u8, key: []const u8) []const u8 {
+    const at = std.mem.indexOf(u8, line, key) orelse return "";
+    return std.mem.trim(u8, line[at + key.len ..], " \r\n\t");
+}
+
+/// Close the loop on a patch_system self-edit: bind its success_criterion to the score delta the governor just
+/// measured (PATCH_OUTCOME_SCOPE — the patch analogue of the WILL bet ledger), and, when auto-revert is armed,
+/// restore the pre-image on a `rollback` verdict. Only a self-edit journaled THIS round is graded — that is the
+/// round its effect shows in the score, and it makes the grading fire exactly once per edit.
+fn patchGovernanceFeedback(w: *Worker, round: u32, decision: []const u8, score_delta: i32) void {
+    const gpa = w.gpa;
+    const journal = w.mem.list(tools.PATCH_JOURNAL_SCOPE);
+    defer gpa.free(journal);
+    const latest = lastNonEmptyLine(journal);
+    if (latest.len == 0) return;
+    const jr = std.fmt.parseInt(u32, patchField(latest, "round="), 10) catch return;
+    if (jr != round) return;
+    const crit = patchFieldToEnd(latest, "crit=");
+    const paths = patchField(latest, "paths=");
+    const unit: []const u8 = if (w.last_bench.status == .ok) "bench" else "facts";
+    const outcome = std.fmt.allocPrint(gpa, "round {d} jround={d} decision={s} score_delta={d} unit={s} paths={s} crit={s}", .{ round, jr, decision, score_delta, unit, clip(paths, 120), clip(if (crit.len > 0) crit else "(none)", 140) }) catch return;
+    defer gpa.free(outcome);
+    _ = w.mem.observe(tools.PATCH_OUTCOME_SCOPE, outcome);
+    w.emit("patch_outcome", std.fmt.allocPrint(w.a(), ",\"round\":{d},\"decision\":\"{s}\",\"score_delta\":{d},\"unit\":\"{s}\",\"paths\":\"{s}\"", .{ round, decision, score_delta, unit, w.esc(clip(paths, 120)) }) catch ",\"round\":0");
+    if (std.mem.eql(u8, decision, "rollback") and w.patch_autorevert) applyPatchRollback(w, round, latest);
+}
+
+/// Restore every file in a journal line to its pre-edit state: delete a file that was newly created (obj=NEW),
+/// or write the backed-up pre-image (obj=<wyhash-hex> under {run_dir}/.patch_journal/objects/) back over it. A
+/// file whose backup failed to capture (obj=ERR) is left as-is — there is nothing to restore it to.
+fn applyPatchRollback(w: *Worker, round: u32, line: []const u8) void {
+    const gpa = w.gpa;
+    if (w.patch_root.len == 0) return;
+    const paths = patchField(line, "paths=");
+    const objs = patchField(line, "obj=");
+    var pit = std.mem.splitScalar(u8, paths, ',');
+    var oit = std.mem.splitScalar(u8, objs, ',');
+    var restored: u32 = 0;
+    while (pit.next()) |rel_raw| {
+        const obj = std.mem.trim(u8, oit.next() orelse "", " ");
+        const rel = std.mem.trim(u8, rel_raw, " ");
+        if (rel.len == 0) continue;
+        const full = std.fmt.allocPrint(gpa, "{s}/{s}", .{ w.patch_root, rel }) catch continue;
+        defer gpa.free(full);
+        if (std.mem.eql(u8, obj, "NEW")) {
+            std.Io.Dir.cwd().deleteFile(w.io, full) catch {};
+            restored += 1;
+        } else if (obj.len == 0 or std.mem.eql(u8, obj, "ERR")) {
+            continue;
+        } else {
+            const objpath = std.fmt.allocPrint(gpa, "{s}/.patch_journal/objects/{s}", .{ w.run_dir, obj }) catch continue;
+            defer gpa.free(objpath);
+            const bytes = std.Io.Dir.cwd().readFileAlloc(w.io, objpath, gpa, .limited(4 << 20)) catch continue;
+            defer gpa.free(bytes);
+            std.Io.Dir.cwd().writeFile(w.io, .{ .sub_path = full, .data = bytes }) catch continue;
+            restored += 1;
+        }
+    }
+    if (restored > 0) {
+        const rec = std.fmt.allocPrint(gpa, "round {d} REVERTED paths={s} reason=governor-rollback", .{ round, clip(paths, 160) }) catch return;
+        defer gpa.free(rec);
+        _ = w.mem.observe(tools.PATCH_OUTCOME_SCOPE, rec);
+        w.act("engine", round, "patch_rollback", "governor reverted a self-mod", std.fmt.allocPrint(w.a(), "the score regressed after a patch_system self-edit; restored {d} file(s) to their pre-edit state ({s})", .{ restored, clip(paths, 160) }) catch "reverted");
+        w.emit("patch_rollback", std.fmt.allocPrint(w.a(), ",\"round\":{d},\"restored\":{d},\"paths\":\"{s}\"", .{ round, restored, w.esc(clip(paths, 160)) }) catch ",\"round\":0");
+    }
 }
 
 pub fn distillRsiMemory(w: *Worker, goal: []const u8, round: u32) void {
@@ -1044,6 +1127,28 @@ test "the retrospective actually CALLS isDecline — a unit test alone would not
     // ...and the dead exact-match it replaced must not creep back: it can only ever fire on the bare word,
     // which the length gate already rejects, so its presence means someone restored the blind spot.
     try std.testing.expect(std.mem.indexOf(u8, body, "eqlIgnoreCase(rule, \"none\")") == null);
+}
+
+test "patchField/patchFieldToEnd read journal-line fields, including a crit that carries spaces" {
+    const line = "round=7 op=write hi=1 paths=src/a.zig,src/b.zig obj=deadbeef,NEW crit=tests still pass after the change";
+    try std.testing.expectEqualStrings("7", patchField(line, "round="));
+    try std.testing.expectEqualStrings("write", patchField(line, "op="));
+    try std.testing.expectEqualStrings("src/a.zig,src/b.zig", patchField(line, "paths="));
+    try std.testing.expectEqualStrings("deadbeef,NEW", patchField(line, "obj="));
+    try std.testing.expectEqualStrings("tests still pass after the change", patchFieldToEnd(line, "crit="));
+    try std.testing.expectEqualStrings("", patchField(line, "missing="));
+}
+
+test "rsiGovernance actually CALLS patchGovernanceFeedback — the accept/rollback verdict must reach a reader" {
+    // Same counterfactual shape as the isDecline wiring test above: patchGovernanceFeedback can be defined,
+    // correct and unit-tested, while the governor never calls it — in which case CANARY/AUTONOMY go back to
+    // being write-only telemetry and the rollback verdict does nothing. Assert the call site is present.
+    const SRC = @embedFile("rsi.zig");
+    const at = std.mem.indexOf(u8, SRC, "pub fn rsiGovernance") orelse return error.GovFnMissing;
+    const rest = SRC[at..];
+    const stop = std.mem.indexOf(u8, rest, nl_marker ++ "fn ") orelse rest.len;
+    const body = rest[0..stop];
+    if (std.mem.indexOf(u8, body, "patchGovernanceFeedback(") == null) return error.GovernorVerdictHasNoReader;
 }
 
 const nl_marker = "\n";
