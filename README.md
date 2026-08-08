@@ -2,11 +2,11 @@
 
 # the veil
 
-<sub>NEURON-LOOPS · NL-VEIL · **ONE BINARY, MANY MINDS, ONE SHARED MEMORY** — read the whole thing twice, then browse the annotated source of every module at [the docs site](https://gary23w.github.io/nl-veil/).</sub>
+<sub>NEURON-LOOPS · NL-VEIL — **an agentic coding desktop app that runs a whole team of AI agents on your machine, and remembers.** One binary, many minds, one shared memory. Browse the annotated source of every module at [the docs site](https://gary23w.github.io/nl-veil/).</sub>
 
 <p>
   <a href="https://github.com/gary23w/nl-veil/actions/workflows/release.yml"><img alt="build" src="https://github.com/gary23w/nl-veil/actions/workflows/release.yml/badge.svg"></a>
-  <a href="https://github.com/gary23w/nl-veil/releases"><img alt="release" src="https://img.shields.io/badge/release-v1.0.1--beta--1-A8241B"></a>
+  <a href="https://github.com/gary23w/nl-veil/releases"><img alt="release" src="https://img.shields.io/badge/release-v1.0.1--beta--2-A8241B"></a>
   <img alt="zig" src="https://img.shields.io/badge/zig-0.16-F7A41D?logo=zig&logoColor=white">
   <a href="https://huggingface.co/gary23w/the-veil-12b"><img alt="built-in model" src="https://img.shields.io/badge/built--in%20model-the--veil--12b-6E4A27?logo=huggingface&logoColor=white"></a>
   <a href="https://huggingface.co/gary23w/gary-neuron-emergent"><img alt="memory cortex" src="https://img.shields.io/badge/cortex-gary--neuron--emergent-6E4A27?logo=huggingface&logoColor=white"></a>
@@ -15,19 +15,33 @@
   <a href="https://github.com/gary23w/nl-veil/stargazers"><img alt="stars" src="https://img.shields.io/github/stars/gary23w/nl-veil?style=social"></a>
 </p>
 
-**A hive mind you talk to.** A swarm of autonomous AI minds works a goal together — researching,
-building, remembering, **learning from its own mistakes** — while one unified consciousness, **the
-Veil**, integrates the whole hive into a single first-person "I" that speaks for it and steers it.
+### What this actually is
 
-**It brings its own model.** The server serves
-**[the-veil-12b](https://huggingface.co/gary23w/the-veil-12b)** *in-process* — no Ollama, no llama
-runtime, no API key, nothing to install beside it. Click **download the model** in the app (or
-`veil model pull`) and the whole thing works offline. Point it at Ollama or a hosted/BYOK endpoint
-instead whenever you'd rather; **any** OpenAI-compatible endpoint works.
+**A desktop app for agentic coding, called the Veil.** You download one file, run it, and a native
+window opens: a three-pane workspace where you give an AI a goal and watch it do the work. Your
+conversations down the left, the work itself in the middle — the chat, or the files it is writing, or
+live token and latency metrics — and on the right what the agents are doing and what the thing
+remembers. Drag the dividers to whatever widths suit you (they persist), collapse a side you don't
+need, branch a side question into its own tab without losing the build. Six tabs across the top:
+**Dashboard, Chat, Swarm, Hub, Tasks, Settings.** It is the place you work, not a sidebar bolted onto
+something else.
 
-**One Zig binary is the whole thing**: the server, the native desktop app, the web UI, the inference
-engine, the memory engine, and the `veil` command line. Download it, run it, and you're in. No
-Python, no Node, no Docker, no cloud account, no database service.
+**The difference is what's behind the window.** Ask most tools for a feature and one assistant writes
+it. Ask the Veil and it can **split the job across a swarm** — a handful of specialist agents, each
+owning real files, building and critiquing in parallel against one shared workdir with its own
+version control, reconciled back into a single answer. You talk to one voice; a team is doing the
+work behind it.
+
+**And it remembers.** Not chat history — a memory engine that accumulates what it learns about your
+code and your preferences, keeps a playbook of fixes it has *verified* by running commands on this
+machine, and carries all of it into the next session. The same problem stops getting re-solved.
+
+**Nothing to set up, and nothing leaves.** One Zig binary carries the whole thing: the desktop app,
+the server behind it, a web UI, the inference engine, the memory engine, and the `veil` command line.
+No Python, no Node, no Docker, no cloud account, no database service, no API key — it will
+**[download a 12B model](https://huggingface.co/gary23w/the-veil-12b) and run it itself**, offline, on
+your GPU. Point it at Ollama or any OpenAI-compatible endpoint instead whenever you'd rather. Your
+code, your keys and everything it learns stay in a folder next to the binary.
 
 > ⭐ **If the veil is useful to you, [star it on GitHub](https://github.com/gary23w/nl-veil).** It's a
 > solo project — a star genuinely helps it reach the next person who'd get something out of it.
@@ -107,7 +121,7 @@ raylib is a *lazy* dependency, so `-Dapp=false` never fetches it at all.
 ## Install
 
 **Download it and run it — no toolchain, nothing to build.** Grab your platform's bundle from the
-**[latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.0.1-beta-1)**, unzip, and run `veil`:
+**[latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.0.1-beta-2)**, unzip, and run `veil`:
 
 | You're on | Download | Then run |
 |---|---|---|
@@ -237,7 +251,7 @@ step 5** — the rest is about letting other people in.
 
 ### 1. Download and unblock it
 
-Grab the bundle for your OS from the [latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.0.1-beta-1)
+Grab the bundle for your OS from the [latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.0.1-beta-2)
 and unzip it somewhere you'll find again. Builds are unsigned, so:
 
 - **Windows** shows *"Windows protected your PC"* → **More info** → **Run anyway**.
@@ -583,6 +597,26 @@ answer a verification prompt — through a deliberately tiny **Chrome/Edge exten
   unattended casts.
 - **Reads describe what happened.** A click reports its effect, and form fields are read back and
   confirmed, so the agent stops re-reading the page to guess whether anything landed.
+- **A page read is projected, never truncated.** Ordinary tool results get clipped head-and-tail, but a
+  page state is a *ref table* — byte-offset elision deletes elements the model then cannot see, and
+  nothing distinguishes a dropped ref from an absent one. Measured on a live 18,317-character read: from
+  the clipped payload the model named a confidently **wrong** ref for the search box, one it would then
+  have typed into. The projection keeps every interactive ref and drops the JSON boilerplate repeated
+  once per element — 59% smaller and lossless in refs, so it is not a size/quality trade.
+- **It is told what the page cannot tell it.** Navigating invalidates every ref, and typing into a
+  `button` or `a` activates it instead of entering text; both are now stated in the tool descriptions.
+  Elements the extractor has no label for are marked `(unlabelled)`, duplicates `(dup N)` — on one real
+  compose page, 17 of 175 elements carried no label and eleven separate ones all read "More".
+
+> **A note on the tool descriptions, because it cost a week.** A *browser logic bomb* is an instruction
+> that is internally consistent and locally reasonable, and from which a correct model derives that the
+> task is impossible. `browser_navigate` said "a login-walled dashboard — reach for this"; `browser_type`
+> said "never type credentials". Valid conclusion: *I cannot get in.* The model then defended it by
+> denying it had a browser at all, reciting its own tool list back as proof of absence. Three fixes lost
+> that argument before anyone checked the premise, and deserved to — on the belt as written, the model
+> was right. The browser is the user's own and already signed in; that was simply never stated. **Tool
+> descriptions are not documentation. They are the model's model of reality, and a wall written into one
+> is indistinguishable, from the inside, from a wall in the world.**
 
 Browser access is an admin capability. `NL_BROWSER_DRIVER=1` extends it to sandboxed accounts —
 worth a deliberate decision, since the browser inherits this machine's network position and your
@@ -687,6 +721,14 @@ that shows every running hive round-by-round, and a **build console**.
   something and the turn casts a hive, watches it, and folds the deliverables back into the
   conversation — with an **auto-loop** tier (armed from the desk, driven server-side) that keeps a long
   build moving without you re-prompting each round.
+- **AFK: run until you stop it.** A second tier for leaving the machine. It never asks whether the goal
+  is complete (a session you opted into running indefinitely has no end state to ask about), the
+  **prompting model writes each re-drive** from what the transcript shows was just built rather than
+  reposting a canned sentence, it stays anchored to your original goal instead of to the loop's own
+  re-arm text, and it re-grounds itself if a drive step comes back empty twice running. A transient
+  provider error no longer ends a run you were promised only you could end, and the steering column
+  stays reachable for the whole turn. The ordinary auto-loop tier is unchanged — its stop conditions
+  *are* the tier.
 - **You see everything.** Live per-round fitness, the files each mind is writing, the tool calls, the
   shared-memory writes — swarm work is transparent, not a spinner.
 - **Sub-chats.** Branch a side thread off any conversation (up to five, one level deep) as tabs
@@ -695,8 +737,14 @@ that shows every running hive round-by-round, and a **build console**.
   searchable regions server-side — so the model reads what's in it whether or not it has vision.
 - **Manage the built-in model from the window.** A panel shows the weights, a download button, a live
   progress bar, and one click to serve it.
-- **It sits in the tray.** A system-tray icon and native toasts on Windows; it lights up the moment
-  the server has something to show.
+- **It sits in the tray — and closing the window doesn't kill the server.** A system-tray icon and
+  native toasts on Windows; it lights up the moment the server has something to show. The desk and the
+  server are *one process*, so the titlebar **X hides the window** and leaves everything running — the
+  turn in flight, the chat workers, the web UI on `:8787`. Only **File → Quit** or **tray → Quit** ends
+  the process. While hidden the loop skips input, layout and drawing entirely and idles at 5 Hz, so a
+  parked desk costs nothing. *(Windows only, and only when a live tray icon actually exists to bring the
+  window back — Linux and macOS keep the old quit-on-close behaviour rather than hiding a window behind
+  an icon that isn't there.)*
 
 The desktop is compiled **into** `veil`, so the released binary is the whole app — double-click and
 you're in, server and window together. Same from source:
@@ -730,6 +778,23 @@ model's own claims:
   app — and a **judge** that grades the arc's ground-truth trace, not its self-narrative.
 - **Strengthen-only plasticity**: outcome feedback can reinforce a memory that keeps working, but it
   can never *mint* one from a reward alone — so a finished goal can't be resurrected by its own signal.
+- **Lessons are graded on whether they helped.** At the moment a failure resolves into a verified fix,
+  the lesson that was recalled *for that failure* is reinforced — so one that keeps preceding fixes
+  surfaces first and one that never does simply fades. It runs before the fresh mint, crediting prior
+  knowledge rather than the fix just written, and it is engine-driven, so a mind cannot inflate its own.
+- **Recurring successes become candidate procedure.** The engine counts repeated successful tool
+  *sequences* per mind — zero extra model calls, folded from records it already keeps — and proposes the
+  frequent ones into a quarantine. Nothing auto-registers, auto-runs, or reaches a prompt; promotion is
+  a reviewed step like every other proposal.
+- **A round that breaks one check while fixing another is visible.** The score is an aggregate, so that
+  round used to read as "no change" to every loop watching it. The best-known-good build's failure set
+  is now the champion and each later round the challenger, so a new break is reported even when the
+  aggregate is flat or rising.
+- **Self-edits are verified after the write, not just before it.** Every gate around `patch_system` ran
+  *before* the edit landed, so a change that left the source un-parseable stood until the next human
+  build. A post-write `zig ast-check` (or the shared syntax gate for other languages) now reverts a bad
+  write in place from a pre-image and reports it blocked. Authored tools are compiled the same way
+  before they can enter the registry, instead of failing at their first call many rounds later.
 
 The engine stays a fixed floor. What it learns lives in memory, never in an `if` branch.
 
@@ -793,6 +858,14 @@ model gets a large-model floor to stand on, cheaper in tokens and richer in cont
 built for you on first run (needs [Rust](https://rustup.rs)); reused after that. Its semantic cortex
 is published separately as
 **[gary-neuron-emergent](https://huggingface.co/gary23w/gary-neuron-emergent)**.
+
+**It resolves paraphrases.** Recall returning nothing reads to a model as an authoritative *no* and
+overrides what is sitting in its own context, so an empty spreading-activation pass no longer ends the
+lookup: it falls through to a semantic pass with a topic gate, which can match a question sharing **no
+words** with the stored fact. Released bundles build `neuron` with that tier compiled in. Measured
+through the chat stack on isolated conversations with identical seeds and phrasing, grounded answers
+went **0/3 → 2/3 with one partial** — turn-start recall now injects bridges like *"machine that routes
+customer orders" → "the dispatch gateway listens on port 7141"* that a lexical lookup never surfaced.
 
 **[nl-rag](https://github.com/gary23w/nl-rag)** — the knowledge. A curated repository of canonical
 documentation (languages, web, databases, security, ops…) pulled and normalized into clean,
@@ -997,12 +1070,14 @@ dependency entirely rather than compiling it unused.
 
 ## Release
 
-**Current: [`v1.0.1-beta-1`](https://github.com/gary23w/nl-veil/releases/tag/v1.0.1-beta-1)** — the first
-beta, 38 commits past the last alpha. The veil brings its own model now (downloaded from Settings,
-GPU-accelerated, updated in place); long sessions hold together (the 15–25s freezes are gone, scrollback
-no longer destroys history, a waiting tool can't hold a turn open forever, local models can use tools
-again); replies come out in plain punctuation.
-[Full notes](docs/release/RELEASE-v1.0.1-beta-1.md).
+**Current: [`v1.0.1-beta-2`](https://github.com/gary23w/nl-veil/releases/tag/v1.0.1-beta-2)** — the
+second beta. Browser tasks actually finish: four instructions in the tool descriptions were *false*, and
+a model reasoning correctly from them concluded the task was impossible. Page reads are projected rather
+than truncated (59% smaller, lossless in refs), AFK mode drives toward your goal instead of its own
+re-arm text, closing the desk window hides it to the tray instead of killing the server, and recall
+resolves a paraphrase that shares no words with the stored fact.
+[Full notes](docs/release/RELEASE-v1.0.1-beta-2.md) ·
+[beta-1](docs/release/RELEASE-v1.0.1-beta-1.md) — the built-in model, and long sessions holding together.
 
 Builds ship on the [Releases page](https://github.com/gary23w/nl-veil/releases), one per
 platform. Unzip and run `veil` — that starts the server **and** opens the desktop app. No Python, no
