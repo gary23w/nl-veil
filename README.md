@@ -244,6 +244,37 @@ no restart. An install manifest beside the weights records what is installed and
 > template — verified byte-for-byte against the model's own chat template, which measured 27/30 on
 > the harness drills against 18/30 through the runtime's renderer (`src/worker/gemma4.zig`).
 
+### The belt manifest — why a smaller belt scores higher
+
+A tool array is JSON, and on the compact tier it is still ~3 KB of nested schema sitting far behind
+the conversation. Asked whether it has a browser, a 12B does not re-read that JSON — it answers from
+impression. Observed live (`c6a751a54`): the model ran `list_dir` hunting for its browser tools *in
+the filesystem*, read the empty directory as proof, and denied a browser it was holding.
+
+So the compact tier appends one generated line naming the belt it was actually handed
+(`beltManifest`, `src/worker/chat/engine.zig`) — every tool by exact name, plus a **WON'T, NOT CAN'T**
+rule that separates declining by judgment from claiming a capability is absent. It is derived from
+the final belt string after grants and plugin schemas merge, so it can never drift from what the
+provider sees, and it is turn-stable so prompt-prefix caching still holds.
+
+Measured on `the-veil-12b` over 110 held-out drills across five sets:
+
+| serving configuration | score | invented tool names |
+|---|---|---|
+| 20-tool belt, full doctrine, no manifest | 92/111 — 82.9% | 6 |
+| **17-tool compact belt + manifest + date stamp** | **97/110 — 88.2%** | **2** |
+
+The trimmed belt and the shorter doctrine contribute alongside the manifest, so the 5.3-point gain
+belongs to the combination. What points at the manifest specifically is the invented-name column —
+naming the belt in prose removes the model's reason to guess — and the same comparison on a later
+checkpoint moved invented names from 11 to 1. The counter-intuitive part is worth stating plainly:
+**the smaller belt scored higher.** Fewer tools, described in words, beat more tools described only
+in schema.
+
+The manifest is deliberately **compact-tier only**. Frontier models read a 49-tool array without
+help, and the line costs tokens on every turn; extending it upward would need its own measurement on
+a large model rather than an assumption borrowed from a 12B.
+
 ## Walkthrough: run it, add people, put it on your network
 
 Written for someone who is not a developer. **If you only want it on your own machine, stop after
