@@ -873,6 +873,40 @@ test "belt manifest: names EVERY tool a compact belt serves, with a true count, 
     }
 }
 
+test "the-veil-12b is SERVED a manifest: model id -> small tier -> compact belt -> manifest" {
+    // Each link in this chain is tested somewhere; nothing tested them TOGETHER, so breaking
+    // any one of them would have been silent. The chain is what decides whether the shipped
+    // 12B is ever told what it is holding:
+    //   senseModel(id).tier == .small  ->  compact_belt  ->  beltManifest(turn_tools)
+    //
+    // What it is worth, measured on the-veil-12b over 110 held-out drills: the compact belt
+    // WITH the manifest scored 97/110 with 2 invented tool names, against 92/111 with 6 for
+    // the 20-tool full-doctrine config that carries none. On a later checkpoint the same
+    // before/after moved invented names 11 -> 1. Invented names are the failure with the
+    // worst user-visible cost -- the harness rejects the name and the turn is simply lost.
+    const gpa = std.testing.allocator;
+
+    // link 1: the shipped id tiers small on BOTH paths. tier_local only widens what counts
+    // as small, so neither value may promote this model out of the compact tier.
+    inline for (.{ true, false }) |local| {
+        try std.testing.expectEqual(modelcfg.Tier.small, modelcfg.senseModel("the-veil-12b", local).tier);
+    }
+
+    // link 2: the belt that tier selects yields a manifest naming its exact tools
+    const m = beltManifest(gpa, TURN_TOOLS_COMPACT) orelse return error.TestUnexpectedResult;
+    defer gpa.free(m);
+    try std.testing.expect(std.mem.startsWith(u8, m, "\nTOOLS ON THIS BELT ("));
+    for ([_][]const u8{ "read_file", "run_python", "web_search", "recall", "browser_navigate" }) |name| {
+        try std.testing.expect(std.mem.indexOf(u8, m, name) != null);
+    }
+    // the rule that stops a policy refusal hardening into a capability denial
+    try std.testing.expect(std.mem.indexOf(u8, m, "WON'T, NOT CAN'T") != null);
+
+    // link 3: a tool the compact belt does NOT serve must not appear on the line, or the
+    // manifest asserts the exact falsehood it exists to prevent
+    try std.testing.expect(std.mem.indexOf(u8, m, "stop_process") == null);
+}
+
 test "belt denial: catches the live lie, spares an honest 'won't', and never fires on a clean reply" {
     const gpa = std.testing.allocator;
     const belt = TURN_TOOLS_COMPACT;
