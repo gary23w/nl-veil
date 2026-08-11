@@ -72,6 +72,7 @@ test {
     _ = @import("plug/lua.zig"); // embedded Lua sandbox: whitelist, budgets, json bridge
     _ = @import("plug/theme.zig"); // shared theme workspace: parse/seed/scan/json
     _ = @import("plug/plugins.zig"); // plugin registry: manifests, hooks (policy/prompt/tool), MCP bridge
+    _ = @import("worker/net.zig"); // cached offline probe: the hosted fast-fail behind "Internet is offline"
     _ = @import("worker/oscillation.zig");
     _ = @import("worker/ragingest.zig"); // local-file → neuron-db distillation (offline "absorb the book")
     _ = @import("worker/ragmirror.zig"); // local knowledge-pack mirror: url→disk resolve + atlas extension
