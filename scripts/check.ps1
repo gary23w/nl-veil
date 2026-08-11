@@ -363,7 +363,7 @@ if ($Scan) {
         }
         return $out | Sort-Object -Unique
     }
-    $ps1_names = (Select-String -Path $PSCommandPath -Pattern 'Invoke-(?:Gate|ZigTests) "([^"]+)"' -AllMatches).Matches | ForEach-Object { $_.Groups[1].Value }
+    $ps1_names = (Select-String -Path $PSCommandPath -Pattern 'Invoke-(?:Gate|ZigTests|XTests) "([^"]+)"' -AllMatches).Matches | ForEach-Object { $_.Groups[1].Value }
     $shPath = Join-Path $repo "scripts\check.sh"
     $sh_names = @()
     if (Test-Path $shPath) {
@@ -462,6 +462,21 @@ if ($node) {
 # These two scripts are twins on purpose — one definition of done — so they change together.
 $ok = (Confirm-Gate (Invoke-Gate "zig build server-only (-Dapp=false)" $zig @("build", "-Dapp=false", "-Dbuiltin=false", "--cache-dir", $cache, "--prefix", $prefix) $repo $TimeoutSec "")) -and $ok
 $ok = (Confirm-Gate (Invoke-ZigTests "src suite" $repo $TimeoutSec "")) -and $ok
+# CROSS-COMPILE THE TESTS FOR LINUX (twin of the same gate in check.sh). The local gate is ONE OS; CI is
+# Linux; a platform-conditional construct that compiles here can fail there. Not hypothetical:
+# `.{ .block = .global }` exists only in Environ's Windows branch, so a fully green Windows run pushed a red
+# CI — and the break was inside a TEST block, which a cross-compiled BUILD would never have caught. The run
+# steps legitimately fail here (foreign binary); only a real `file.zig:LINE:COL: error:` is a failure.
+function Invoke-XTests([string]$label) {
+    $out = & $zig build test -Dtarget=x86_64-linux --cache-dir $cache 2>&1 | Out-String
+    $errs = [regex]::Matches($out, '(?m)^.*\.zig:\d+:\d+: error:.*$')
+    if ($errs.Count -gt 0) {
+        $shown = ($errs | Select-Object -First 8 | ForEach-Object { "   > " + $_.Value.Trim() }) -join "`n"
+        return @{ name = $label; ok = $false; detail = "the test graph does not COMPILE for linux -- CI will fail on exactly this`n$shown" }
+    }
+    return @{ name = $label; ok = $true; detail = "compiles for x86_64-linux (run steps skipped: foreign target)" }
+}
+$ok = (Confirm-Gate (Invoke-XTests "tests cross-compile (linux)")) -and $ok
 # The note here used to say the desk suite's net test "needs a live server on :8787" and to "treat
 # the earlier tests as the verdict" -- citing an item ledger 0006 had already CLOSED. 0062 corrected
 # that in CLAUDE.md and MISSED this copy, which is the worse of the two: it prints at the exact

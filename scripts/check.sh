@@ -179,6 +179,22 @@ zig_tests() { # zig_tests <cmd...> -- forwards output, returns a verdict backed 
   "$exe"
 }
 gate "zig build test (src suite)" zig_tests "$ZIG" build test $CACHE_ARGS
+# CROSS-COMPILE THE TESTS FOR LINUX. The local gate is ONE OS; CI is Linux; and a platform-conditional
+# construct that compiles here can fail there. That is not hypothetical — `.{ .block = .global }` exists only
+# in Environ's Windows branch (GlobalBlock has it, PosixBlock does not), so a fully green Windows run pushed a
+# red CI, and the failure was in a TEST block, which an ordinary cross-compiled BUILD would never have caught.
+# The run steps legitimately fail here (a Linux binary will not exec on Windows) and are ignored; a real
+# `file.zig:LINE:COL: error:` is the thing this hunts.
+gate_xtests() {
+  out=$("$ZIG" build test -Dtarget=x86_64-linux $CACHE_ARGS 2>&1)
+  if echo "$out" | grep -qE '\.zig:[0-9]+:[0-9]+: error:'; then
+    echo "$out" | grep -E '\.zig:[0-9]+:[0-9]+: error:' | head -8
+    echo "   the test graph does not COMPILE for linux — CI will fail on exactly this"
+    return 1
+  fi
+  echo "compiles for x86_64-linux (run steps skipped: foreign target)"
+}
+gate "tests cross-compile (linux)" gate_xtests
 [ -d desk ] || { echo "no desk/ package"; exit 1; }
 gate_desk() { ( cd desk && zig_tests "$ZIG" build test $CACHE_ARGS ); }
 gate "zig build test (desk suite)" gate_desk
