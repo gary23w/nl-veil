@@ -2463,6 +2463,12 @@ pub const Chat = struct {
             self.setStatus(std.fmt.bufPrint(&stbuf, "running {s} on this machine...", .{tool[0..@min(tool.len, 48)]}) catch "running tool locally...");
         }
         log.info("delegated: launched {s} (id={s})", .{ tool[0..@min(tool.len, 48)], id[0..@min(id.len, 60)] });
+        // The Veil console pane is the user's window into what the veil is DOING on their machine, and until
+        // now it only ever showed RUN: shell output — so during an ordinary workflow, where every action is a
+        // delegated tool, it sat empty behind a "(the veil types here)" placeholder while the desk log filled
+        // with the very lines the user was looking for.
+        var cb: [160]u8 = undefined;
+        self.store.consoleAppend(true, std.fmt.bufPrint(&cb, "> {s}\n", .{tool[0..@min(tool.len, 64)]}) catch "> tool\n");
     }
 
     /// Poll the in-flight delegated tool each tick WITHOUT blocking. While it runs: tick the elapsed-seconds
@@ -2586,6 +2592,17 @@ pub const Chat = struct {
         }
         if (self.isForeground(conv)) self.setStatus(""); // don't clear the foreground's status for a background tool
         log.info("delegated: {s} finished in {d}s ({d}b out, {d}b err)", .{ tn[0..tnn], elapsed, out.len, stderr.len });
+        // ...and its outcome, so the Veil pane reads as a transcript of work rather than a list of starts.
+        // Sizes, not bodies: a read_file result is megabytes and this ring is 16KB, so pasting payloads here
+        // would evict the history the pane exists to show.
+        {
+            var cb: [192]u8 = undefined;
+            const line = if (stderr.len > 0)
+                std.fmt.bufPrint(&cb, "  {s} -> {d}s, {d}b out, {d}b ERR\n", .{ tn[0..tnn], elapsed, out.len, stderr.len }) catch "  done\n"
+            else
+                std.fmt.bufPrint(&cb, "  {s} -> {d}s, {d}b\n", .{ tn[0..tnn], elapsed, out.len }) catch "  done\n";
+            self.store.consoleAppend(true, line);
+        }
         self.delegDequeue(dd); // a queued retry (already acked) runs now
     }
 
@@ -4769,6 +4786,7 @@ pub const Chat = struct {
         var fast_reasoning = false;
         var leftw: u16 = 230;
         var rightw: u16 = 320;
+        var conh: u16 = 280;
         var cfa: [64]u8 = undefined;
         var cfa_n: usize = 0;
         var unified = true;
@@ -4802,6 +4820,7 @@ pub const Chat = struct {
             fast_reasoning = s.fast_reasoning;
             leftw = s.chat_left_w;
             rightw = s.chat_right_w;
+            conh = s.chat_con_h;
             unified = s.chat_unified;
             think_cfg = s.chat_think;
             prompt_cfg = s.chat_prompt;
@@ -4837,7 +4856,7 @@ pub const Chat = struct {
         // BROKEN toggle wrote `local_brain:true` on every idle frame (it read the checkbox's click flag as
         // the new value), so every install with that build got silently pinned local and could never turn
         // server mode on. A fresh key on each break keeps a bad persisted state from surviving it.
-        jb.print(self.gpa, "\",\"left\":{},\"right\":{},\"shell_allow\":{},\"speed\":{},\"srv_brain\":{},\"dyslexia\":{},\"font_scale\":{d},\"font_bold\":{},\"narrator\":{},\"browser_headful\":{},\"fast_reasoning\":{},\"leftw\":{d},\"rightw\":{d}", .{ lopen, ropen, shell_allow, speed, server_chat, dyslexia, font_scale, font_bold, narrator, browser_headful, fast_reasoning, leftw, rightw }) catch return;
+        jb.print(self.gpa, "\",\"left\":{},\"right\":{},\"shell_allow\":{},\"speed\":{},\"srv_brain\":{},\"dyslexia\":{},\"font_scale\":{d},\"font_bold\":{},\"narrator\":{},\"browser_headful\":{},\"fast_reasoning\":{},\"leftw\":{d},\"rightw\":{d},\"conh\":{d}", .{ lopen, ropen, shell_allow, speed, server_chat, dyslexia, font_scale, font_bold, narrator, browser_headful, fast_reasoning, leftw, rightw, conh }) catch return;
         // MODEL TRIO: the "use one model for all three" flag + the thinking/prompting role overrides. Role keys
         // are NOT written here — they live in the OS secret store (secrets.zig), keyed by provider slug.
         jb.print(self.gpa, ",\"unified\":{}", .{unified}) catch return;
@@ -4948,7 +4967,11 @@ pub const Chat = struct {
             if (v >= 120 and v <= 640) s.chat_left_w = @intCast(v);
         }
         if (jInt(data, "rightw")) |v| {
-            if (v >= 180 and v <= 700) s.chat_right_w = @intCast(v);
+            if (v >= 180 and v <= 1100) s.chat_right_w = @intCast(v);
+        }
+        // console height (absent = keep the default); bounds mirror CHAT_CON_MIN/CHAT_CON_MAX in main.zig
+        if (jInt(data, "conh")) |v| {
+            if (v >= 120 and v <= 900) s.chat_con_h = @intCast(v);
         }
         // SERVER CHAT is the default and the primary path: the brain runs in the backend and delegates every tool
         // call to THIS client's harness (`veil exec-tool`), so the veil acts on the user's machine while the desk
