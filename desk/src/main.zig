@@ -125,7 +125,7 @@ const RightTab = enum { activity, memory }; // the right pane's inner tabs (Swar
 const SchedInner = enum { tasks, build }; // the Tasks tab's inner tabs (task list | builder form)
 const SwarmInner = enum { live, deploy }; // the Swarm tab's inner tabs (live view | deploy form)
 const ChatsInner = enum { chats, sched }; // the chat LEFT pane's inner tabs (conversations | scheduled tasks)
-const PaneDrag = enum { none, left, right }; // which side-panel divider is being drag-resized (else none)
+const PaneDrag = enum { none, left, right, console }; // which divider is being drag-resized (else none)
 
 /// UI-thread-only interaction state (the Store holds the machine's state; this holds the cursor's).
 const Ui = struct {
@@ -2210,7 +2210,32 @@ const CHAT_STRIP_W: f32 = 24;
 const CHAT_LEFT_MIN: f32 = 150;
 const CHAT_LEFT_MAX: f32 = 460;
 const CHAT_RIGHT_MIN: f32 = 210;
-const CHAT_RIGHT_MAX: f32 = 560;
+// 560 was too narrow to run a shell in: the console lives in this column, and at 560px a `dir` listing or a
+// deep build path wraps or clips (the user's prompt line read ">...nl-veil/data/u1/_chat/builds/c6a7af5f").
+// The center pane keeps its own @max(28, ...) floor, so a wide right pane cannot squeeze it negative.
+const CHAT_RIGHT_MAX: f32 = 1100;
+const CHAT_CON_MIN: f32 = 120; // below this the tabs + input leave no scrollback rows at all
+const CHAT_CON_MAX: f32 = 900;
+
+/// The gap above the console, in one place: the divider hit-test and the final layout must agree on it or the
+/// grip sits a few px off the seam it is supposed to grab.
+fn con_gapFor(con_h: f32, pad: f32) f32 {
+    return if (con_h > 0) pad else 0;
+}
+
+/// A draggable HORIZONTAL divider: a thin grip line at (y) over [x, x+w]. The twin of drawPaneGrip for the
+/// activity/console seam.
+fn drawPaneGripH(x: f32, y: f32, w: f32, active: bool) void {
+    const c = if (active) t.blue else t.border;
+    const a: u8 = if (active) 230 else 80;
+    t.fillRect(@intFromFloat(x + 2), @intFromFloat(y - 1), @intFromFloat(w - 4), 2, t.withAlpha(c, a));
+    if (active) {
+        var i: i32 = -1;
+        while (i <= 1) : (i += 1) {
+            rl.drawCircle(@intFromFloat(x + w / 2 + @as(f32, @floatFromInt(i)) * 6), @intFromFloat(y), 1.7, t.blue);
+        }
+    }
+}
 
 /// A draggable pane divider: a thin grip line at (x) over [y, y+h]. Brightens when the divider is hot or
 /// being dragged. Drawn AFTER the panes so their fills don't overpaint it.
@@ -2353,10 +2378,43 @@ fn drawChat(store: *Store, body: t.Rect) void {
     const left_w: f32 = if (left_open) left_w_open else CHAT_STRIP_W;
     const right_w: f32 = if (right_open) right_w_open else CHAT_STRIP_W;
     const left = t.Rect{ .x = pad, .y = yv, .width = left_w, .height = ph };
-    // The right column stacks the swarm-activity panel over a micro-console (only when the pane is open and
-    // there's room). The console gets ~40% of the height, clamped to a sane band.
-    const con_h: f32 = if (right_open and ph > 380) @min(280, ph * 0.42) else 0;
-    const con_gap: f32 = if (con_h > 0) pad else 0;
+    // The right column stacks the swarm-activity panel over a micro-console. The height is the USER'S, from
+    // the horizontal grip between the two; it was a hardcoded min(280, 42%) before, which is why the shell was
+    // unusable. Clamped against the live pane so a height saved on a big monitor cannot leave zero room for
+    // the activity panel on a small one — ACT_MIN is what the panel above always keeps.
+    const ACT_MIN: f32 = 90;
+    const con_room: f32 = @max(0, ph - ACT_MIN - pad); // the tallest console this pane can currently afford
+    var con_h: f32 = 0;
+    if (right_open and ph > 380) {
+        const want = std.math.clamp(@as(f32, @floatFromInt(store.settings.chat_con_h)), CHAT_CON_MIN, CHAT_CON_MAX);
+        con_h = @min(want, con_room);
+        if (con_h < CHAT_CON_MIN) con_h = 0; // no room for a usable console: give the height back to activity
+    }
+    // HORIZONTAL DIVIDER between the activity panel and the console. Same contract as the two vertical grips
+    // above: commit to the store every frame while held (so this frame's layout uses the new height and the
+    // next re-seeds from it), flush to disk on release.
+    if (ui.pane_drag == .console and con_h == 0) ui.pane_drag = .none;
+    var c_active = false;
+    if (con_h > 0) {
+        const my = rl.getMousePosition().y;
+        const div_y = yv + ph - con_h - con_gapFor(con_h, pad);
+        const hot = t.hovering(.{ .x = body.width - pad - right_w, .y = div_y - 3, .width = right_w, .height = 6 }) and ui.pane_drag == .none;
+        c_active = hot or ui.pane_drag == .console;
+        if (c_active) t.wantCursor(.resize_ns);
+        if (hot and m_press) ui.pane_drag = .console;
+        if (ui.pane_drag == .console) {
+            if (m_down) {
+                con_h = std.math.clamp(yv + ph - my, CHAT_CON_MIN, @min(CHAT_CON_MAX, con_room));
+                store.lock();
+                store.settings.chat_con_h = @intFromFloat(con_h);
+                store.unlock();
+            } else {
+                ui.pane_drag = .none;
+                store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
+            }
+        }
+    }
+    const con_gap: f32 = con_gapFor(con_h, pad);
     const right = t.Rect{ .x = body.width - pad - right_w, .y = yv, .width = right_w, .height = ph - con_h - con_gap };
     const console = t.Rect{ .x = right.x, .y = right.y + right.height + con_gap, .width = right_w, .height = con_h };
     // Final safety net: even with both panes collapsed to strips, an extreme window must never feed a
@@ -2417,6 +2475,7 @@ fn drawChat(store: *Store, body: t.Rect) void {
     // resize grips over the pane inner edges — drawn last so the pane fills don't overpaint them
     if (left_open) drawPaneGrip(pad + left_w, yv, ph, l_active);
     if (right_open) drawPaneGrip(body.width - pad - right_w, yv, ph, r_active);
+    if (con_h > 0) drawPaneGripH(console.x, console.y - con_gap / 2, console.width, c_active);
 }
 
 /// Push a just-run command into the You-shell history ring (skipping an immediate repeat — the arrow-up +

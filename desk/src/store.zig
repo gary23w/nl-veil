@@ -133,6 +133,10 @@ pub const Settings = struct {
     // chat pane widths — user drag-resizable, persisted (defaults match CHAT_LEFT_W/CHAT_RIGHT_W in main.zig)
     chat_left_w: u16 = 230,
     chat_right_w: u16 = 320,
+    // Micro-console height, drag-resizable on the horizontal grip above it. It used to be a hardcoded
+    // min(280, 42% of the pane) with no way to change it, which is what made the shell unusable: a terminal
+    // you cannot make taller than 280px, in a column you cannot widen past 560px, is a peephole.
+    chat_con_h: u16 = 280,
     shell_always_allow: bool = false, // "Bypass" chosen once → the veil's RUN: shell commands skip the approval prompt
     // SPEED MODE (default ON): the chat BUILDS projects itself with its file tools, and casts are quick
     // research sub-agents capped at 2 minutes. OFF = the autonomy posture: the chat may deploy long
