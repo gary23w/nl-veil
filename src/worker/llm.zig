@@ -8,6 +8,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const httpc = @import("httpc.zig");
+const net = @import("net.zig"); // cached "is there internet?" — consulted ONLY on the hosted path
 const rate = @import("rate.zig");
 const fakehttp = @import("fakehttp.zig"); // TEST ONLY: the canned gateway the H11 test at the bottom dials
 const gemma4 = @import("gemma4.zig"); // engine-side wire format, used when a backend fails the name-binding probe
@@ -386,6 +387,12 @@ fn callTimeoutS(local: bool, budget_tokens: u32) u32 {
 fn post(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const u8, base_url: []const u8, key: []const u8, body: []const u8, budget_tokens: u32) Reply {
     const url = std.fmt.allocPrint(gpa, "{s}/chat/completions", .{trimSlash(base_url)}) catch return oom(gpa);
     defer gpa.free(url);
+    // OFFLINE FAST-FAIL, hosted only. Every call below is individually well-bounded (--connect-timeout 20),
+    // but a turn makes many of them and each one rediscovers a dead uplink on its own dime — dozens of
+    // correct 20s timeouts that read as a hung application with nothing on screen explaining why. One cached
+    // 2s probe collapses that into a sentence. LOCAL IS NEVER ASKED: loopback works with the uplink down, and
+    // making the built-in model wait on an internet probe would invent an outage it does not have.
+    if (!isLocal(base_url) and net.offline(io, gpa, null)) return err(gpa, net.MSG);
     // HOSTED-provider pacing: honor any active per-host 429 cooldown + the optional RPM cap before sending.
     // Local backends never rate-limit, so they skip it (and keep their long, retry-free timeout).
     if (!isLocal(base_url)) rate.acquire(io, base_url);
@@ -2079,6 +2086,11 @@ fn streamAttempt(
 ) ?Step {
     const native = isOllama(base_url);
     const local = isLocal(base_url);
+    // OFFLINE, hosted only: skip the streamed attempt entirely rather than spawn a curl that will spend 20s
+    // failing to connect. Returning null is this function's existing "fall back to complete()" signal, and
+    // complete()'s post() carries the same offline check — so the turn arrives at net.MSG in one cached 2s
+    // probe instead of a stream timeout plus a POST timeout. Local is never asked (loopback works offline).
+    if (!local and net.offline(io, gpa, null)) return null;
     // Anchored before the body is built, so the metered latency covers what the CALLER waited for — a streamed
     // reply has no single response timestamp to subtract from.
     const call_t0 = std.Io.Timestamp.now(io, .real).nanoseconds;
