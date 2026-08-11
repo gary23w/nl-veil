@@ -507,7 +507,12 @@ pub fn runApp(data_dir: ?[]const u8) !void {
     // Borderless: we draw our own title bar (drag / File / minimize / close). Resizable stays on so the
     // grip in the corner can drive setWindowSize. 60fps focused so scrolling/typing/hover feel instant; we
     // drop to a low idle FPS when the window is in the background (heat control) below.
-    rl.setConfigFlags(.{ .window_resizable = true, .window_undecorated = true });
+    // window_always_run is the other half of the minimized-hang fix (see the idle path in the frame loop).
+    // Without it raylib's PollInputEvents spins on `while (minimized) glfwWaitEvents()` and BLOCKS, so
+    // skipping the draw alone would only move the stall from EndDrawing into the poll — same frozen thread,
+    // same Not Responding, different line number. hideDesk already had to clear the minimized state before
+    // hiding for exactly this reason; with the flag set, that is belt-and-braces rather than load-bearing.
+    rl.setConfigFlags(.{ .window_resizable = true, .window_undecorated = true, .window_always_run = true });
     rl.setTraceLogLevel(.warning);
     rl.initWindow(WIN_W, WIN_H, "veil-desk");
     // A WINDOW IS NOT GUARANTEED. A virtual machine, a Remote Desktop session, or a box running the
@@ -849,7 +854,18 @@ pub fn runApp(data_dir: ?[]const u8) !void {
         // window nobody can see, so it is skipped: no GL, no swap, no stale mouse dragging an invisible
         // window. pollInputEvents is what EndDrawing would have called — it drains the message queue and
         // refreshes the close flag, which is how an external close still reaches the branch above.
-        if (ui.hidden) {
+        //
+        // MINIMIZED TAKES THE SAME PATH, and this is the whole "veil hangs and crashes" bug. `hidden` is
+        // OUR tray state; a minimized window is the compositor's, and it will not service a present for a
+        // window it does not intend to show — so EndDrawing blocks inside the driver for as long as that
+        // lasts. data/desk-hang.log: 684 stalls, 100% of them phase='GL endDrawing (driver)', the frame
+        // counter frozen at one number across all of them, the longest 72 MINUTES before the swap returned.
+        // A thread parked in SwapBuffers is not pumping the message queue, so Windows marks the window Not
+        // Responding and closes it: seven Application Hang (1002) events and ZERO 1000 faults. Nothing was
+        // crashing — it was waiting on a present nobody was going to service. Checked every frame rather
+        // than latched on an event, because occlusion and display sleep leave the same state and there is
+        // no restore message to hook.
+        if (ui.hidden or rl.isWindowMinimized()) {
             rl.pollInputEvents();
             watchdog.frameDone();
             io.sleep(.{ .nanoseconds = HIDDEN_SLEEP_MS * std.time.ns_per_ms }, .awake) catch {
