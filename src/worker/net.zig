@@ -40,11 +40,17 @@ const TTL_MS: i64 = 8_000;
 
 var mu: std.Io.Mutex = .init; // Io.Mutex, like rate.zig — std.Thread.Mutex is gone in this Zig
 var checked_at_ms: i64 = 0; // 0 = never probed
-var last_offline: bool = false;
+var last_verdict: Verdict = .online;
 
 fn nowMs(io: Io) i64 {
     return @intCast(@divTrunc(Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_ms));
 }
+
+/// What a probe was able to establish. `unknown` is a real answer and not a synonym for online: it means
+/// the probe never got to ask (no curl, a spawn with no environment, a URL curl rejected before dialling).
+/// Callers map it to "carry on" — see offline() — but tests must be able to tell it apart from a genuine
+/// verdict, or they would silently pass on a box where the probe never ran.
+pub const Verdict = enum { online, offline, unknown };
 
 /// True when the machine looks to have NO working egress. Cached for TTL_MS.
 ///
@@ -52,11 +58,16 @@ fn nowMs(io: Io) i64 {
 /// false "offline" is far more damaging than a false "online" — it refuses work the user could have had,
 /// whereas guessing online merely costs the one timeout we would have paid anyway.
 pub fn offline(io: Io, gpa: std.mem.Allocator, environ: ?*const std.process.Environ.Map) bool {
+    return probe(io, gpa, environ) == .offline;
+}
+
+/// The cached probe itself. Same contract as offline(), but does not collapse `unknown` into `online`.
+pub fn probe(io: Io, gpa: std.mem.Allocator, environ: ?*const std.process.Environ.Map) Verdict {
     const now = nowMs(io);
     mu.lockUncancelable(io);
     if (checked_at_ms != 0 and now -| checked_at_ms < TTL_MS) {
         defer mu.unlock(io);
-        return last_offline;
+        return last_verdict;
     }
     mu.unlock(io);
 
@@ -94,13 +105,12 @@ pub fn offline(io: Io, gpa: std.mem.Allocator, environ: ?*const std.process.Envi
         };
         if (!network_evidence) probe_unusable = true;
     }
-    if (probe_unusable and !any_reachable) any_reachable = true; // unknown ⇒ assume online, per the bias above
 
     mu.lockUncancelable(io);
     defer mu.unlock(io);
     checked_at_ms = now;
-    last_offline = !any_reachable;
-    return last_offline;
+    last_verdict = if (any_reachable) .online else if (probe_unusable) .unknown else .offline;
+    return last_verdict;
 }
 
 /// The one sentence every caller shows. Kept here so the wording cannot drift between the model path and
@@ -121,29 +131,32 @@ pub fn invalidate(io: Io) void {
 /// real process environ from the Io (src/main.zig), and WITHOUT one the child dies in ~20ms — which is the
 /// exact false signal the exit-code gate above exists to reject, so the tests must not reproduce it by
 /// accident and call it a pass.
-/// Tests only: the override map. The spawn environment comes from the Io (`.environ = .{ .block = .global }`,
-/// mirroring production), NOT from here — with an environ-less Io the curl child dies in ~20ms having never
-/// touched the network, which is the exact false signal the exit-code gate rejects. These tests must not
-/// reproduce that by accident and then call the pass meaningful.
+/// Tests only: the override map (the probe URL). The SPAWN environment comes from the Io, and there is no
+/// portable way to hand a test Io the real process environ — Environ.Block is GlobalBlock on Windows (which
+/// has `.global`) and PosixBlock elsewhere (which does not). That platform split is what turned this file
+/// red on Linux CI after a green Windows gate. So: inherit where the language lets us, and where it does not,
+/// the probe comes back `.unknown` and the test SKIPS rather than asserting on a probe that never ran.
+const test_environ: std.process.Environ = if (builtin.os.tag == .windows) .{ .block = .global } else .empty;
+
 fn probeOverride(gpa: std.mem.Allocator, url: []const u8) !std.process.Environ.Map {
     var m = std.process.Environ.Map.init(gpa);
     if (url.len > 0) try m.put("NL_NET_PROBE_URL", url);
     return m;
 }
 
-test "offline(): the verdict is cached within the TTL" {
+test "the verdict is cached within the TTL" {
     const gpa = std.testing.allocator;
     var env = try probeOverride(gpa, "");
     defer env.deinit();
-    var threaded = std.Io.Threaded.init(gpa, .{ .environ = .{ .block = .global } });
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = test_environ });
     defer threaded.deinit();
     const io = threaded.io();
 
     invalidate(io);
-    const first = offline(io, gpa, &env);
+    const first = probe(io, gpa, &env);
     const t0 = nowMs(io);
     var i: usize = 0;
-    while (i < 3) : (i += 1) try std.testing.expectEqual(first, offline(io, gpa, &env));
+    while (i < 3) : (i += 1) try std.testing.expectEqual(first, probe(io, gpa, &env));
     try std.testing.expect(nowMs(io) -| t0 < 500); // cache hits, not fresh probes
     invalidate(io);
 }
@@ -161,37 +174,38 @@ test "a blackholed uplink reads as offline, inside the probe ceiling" {
     const gpa = std.testing.allocator;
     var env = try probeOverride(gpa, "https://192.0.2.1");
     defer env.deinit();
-    var threaded = std.Io.Threaded.init(gpa, .{ .environ = .{ .block = .global } });
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = test_environ });
     defer threaded.deinit();
     const io = threaded.io();
 
     invalidate(io);
     const t0 = nowMs(io);
-    const verdict = offline(io, gpa, &env);
+    const v = probe(io, gpa, &env);
     const ms = nowMs(io) -| t0;
     invalidate(io);
-    try std.testing.expect(verdict);
+    if (v == .unknown) return error.SkipZigTest; // no curl reachable from this test env — nothing was measured
+    try std.testing.expectEqual(Verdict.offline, v);
     try std.testing.expect(ms < 8000); // must resolve on the 2s ceiling, not curl's default
 }
 
 test "a curl failure that is NOT network evidence must NOT report an outage (fail-open)" {
-    // THE REGRESSION THIS PINS. The first cut of this file treated any non-zero curl exit as "the internet is
-    // down", so an environ-less spawn — a child that died in 20ms having never touched the network — reported
-    // a perfectly online machine as offline and would have refused hosted work outright. A false offline is
-    // strictly worse than a false online: one denies the user work they could have had, the other costs the
-    // single timeout we were going to pay anyway. `htp://` makes curl exit 1 (unsupported protocol) before it
-    // touches the network, which is emphatically not a verdict on the uplink. Note the probe's real URLs are
-    // IP LITERALS, so exit 6 (couldn't resolve) can never come from a broken resolver on a healthy link —
-    // which is why 6 is safe to count as evidence.
+    // THE REGRESSION THIS PINS. The first cut treated any non-zero curl exit as "the internet is down", so an
+    // environ-less spawn — a child that died in 20ms having never touched the network — reported a perfectly
+    // online machine as offline and would have refused hosted work outright. A false offline is strictly worse
+    // than a false online: one denies the user work they could have had, the other costs the single timeout we
+    // were going to pay anyway. `htp://` makes curl exit 1 (unsupported protocol) BEFORE it touches the
+    // network. Note the real probe URLs are IP LITERALS, so exit 6 (couldn't resolve) can never come from a
+    // broken resolver on a healthy link — which is why 6 is safe to count as evidence.
     const gpa = std.testing.allocator;
     var env = try probeOverride(gpa, "htp://unsupported-scheme");
     defer env.deinit();
-    var threaded = std.Io.Threaded.init(gpa, .{ .environ = .{ .block = .global } });
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = test_environ });
     defer threaded.deinit();
     const io = threaded.io();
 
     invalidate(io);
-    const verdict = offline(io, gpa, &env);
+    const v = probe(io, gpa, &env);
     invalidate(io);
-    try std.testing.expect(!verdict);
+    try std.testing.expect(v != .offline); // .online or .unknown are both fine; .offline is the bug
+    try std.testing.expect(!offline(io, gpa, &env)); // and the bool mapping must agree
 }
