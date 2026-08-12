@@ -143,7 +143,7 @@
           Windows <span class="dl-arch">x86-64</span>
         </span>
         <span class="dl-file">veil-&hellip;-windows-x86_64.zip</span>
-        <a class="btn btn-solid" href="https://github.com/gary23w/nl-veil/releases/tag/v1.0.1-beta-2" target="_blank" rel="noopener">Download</a>
+        <a class="btn btn-solid" href="https://github.com/gary23w/nl-veil/releases/tag/v1.0.1-beta-3" target="_blank" rel="noopener">Download</a>
       </div>
       <div class="dl-card" data-os="macarm">
         <span class="dl-os">
@@ -151,7 +151,7 @@
           macOS <span class="dl-arch">Apple Silicon</span>
         </span>
         <span class="dl-file">veil-&hellip;-macos-arm64.zip</span>
-        <a class="btn btn-solid" href="https://github.com/gary23w/nl-veil/releases/tag/v1.0.1-beta-2" target="_blank" rel="noopener">Download</a>
+        <a class="btn btn-solid" href="https://github.com/gary23w/nl-veil/releases/tag/v1.0.1-beta-3" target="_blank" rel="noopener">Download</a>
       </div>
       <div class="dl-card" data-os="macintel">
         <span class="dl-os">
@@ -159,7 +159,7 @@
           macOS <span class="dl-arch">Intel</span>
         </span>
         <span class="dl-file">veil-&hellip;-macos-x86_64.zip</span>
-        <a class="btn btn-solid" href="https://github.com/gary23w/nl-veil/releases/tag/v1.0.1-beta-2" target="_blank" rel="noopener">Download</a>
+        <a class="btn btn-solid" href="https://github.com/gary23w/nl-veil/releases/tag/v1.0.1-beta-3" target="_blank" rel="noopener">Download</a>
       </div>
       <div class="dl-card" data-os="linux">
         <span class="dl-os">
@@ -167,7 +167,7 @@
           Linux <span class="dl-arch">x86-64</span>
         </span>
         <span class="dl-file">veil-&hellip;-linux-x86_64.zip</span>
-        <a class="btn btn-solid" href="https://github.com/gary23w/nl-veil/releases/tag/v1.0.1-beta-2" target="_blank" rel="noopener">Download</a>
+        <a class="btn btn-solid" href="https://github.com/gary23w/nl-veil/releases/tag/v1.0.1-beta-3" target="_blank" rel="noopener">Download</a>
       </div>
     </div>
 
@@ -182,17 +182,17 @@
         is served by the server itself &mdash; no separate model runtime, no API key. Click <em>download the
         model</em> in the app (or run <code>veil model pull</code>) and the whole thing works offline. Point it
         at Ollama or any OpenAI-compatible endpoint instead whenever you would rather.</p>
-      <p><strong>What&rsquo;s in <code>v1.0.1-beta-2</code>.</strong> The second beta, 19 commits on. Browser tasks
-        actually finish now: four instructions in the tool descriptions turned out to be <em>false</em>, and a model
-        reasoning correctly from them concluded the task was impossible. Page reads are projected rather than
-        truncated &mdash; 59% smaller and lossless in refs, where the old clip handed back a confidently wrong
-        element. AFK mode drives toward your goal instead of the loop&rsquo;s own re-arm text. On Windows, closing
-        the desk window hides it to the tray instead of taking the server down with it. And recall resolves a
-        paraphrase that shares no words with the stored fact.
-        <a href="https://github.com/gary23w/nl-veil/blob/main/docs/release/RELEASE-v1.0.1-beta-2.md" target="_blank" rel="noopener">Full release notes &rarr;</a></p>
-      <p class="dim">Previously in <code>v1.0.1-beta-1</code>: the built-in model, GPU inference, and the fixes that
-        stopped long sessions falling apart.
-        <a href="https://github.com/gary23w/nl-veil/blob/main/docs/release/RELEASE-v1.0.1-beta-1.md" target="_blank" rel="noopener">Notes &rarr;</a></p>
+      <p><strong>What&rsquo;s in <code>v1.0.1-beta-3</code>.</strong> The third beta, about the desktop app around the
+        model. The &ldquo;crashes&rdquo; were hangs &mdash; a minimized window parking the GPU present call, now fixed.
+        The in-app shell is drag-resizable and its Veil pane shows every tool call the AI makes. The chat says
+        <em>&ldquo;Internet is offline&rdquo;</em> instead of freezing when the uplink drops, and local models are
+        unaffected. A one-click <strong>role picker</strong> hands the veil a full doctrine (writer, SEO, automation,
+        legal, security). The browser stops refusing the posts and submits you asked for. And two 30B local models
+        join the picker &mdash; NVIDIA Nemotron 3.5 Lightning and Meta Muse Glimmer.
+        <a href="https://github.com/gary23w/nl-veil/blob/main/docs/release/RELEASE-v1.0.1-beta-3.md" target="_blank" rel="noopener">Full release notes &rarr;</a></p>
+      <p class="dim">Earlier: <code>beta-2</code> made the browser finish the job, and <code>beta-1</code> brought the
+        built-in model and GPU inference.
+        <a href="https://github.com/gary23w/nl-veil/blob/main/docs/release/RELEASE-v1.0.1-beta-2.md" target="_blank" rel="noopener">beta-2 notes &rarr;</a></p>
       <p class="dim">Building it yourself instead &mdash; needs Zig 0.16+:</p>
       <pre class="md-code"><code>git clone https://github.com/gary23w/nl-veil
 cd nl-veil
