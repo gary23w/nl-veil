@@ -18,6 +18,7 @@ const md = @import("mdutil.zig");
 const watchdog = @import("watchdog.zig");
 const log = @import("log.zig");
 const assets = @import("assets.zig");
+const roles_mod = @import("roles.zig");
 
 const Store = store_mod.Store;
 const Tab = store_mod.Tab;
@@ -108,7 +109,7 @@ fn tbThemeRect() t.Rect {
 }
 
 const InnerTab = enum { console, details, files };
-const DdKind = enum { none, provider, model, style, minutes, stack, mode, chat_provider, chat_byok, chat_model, think_provider, think_byok, think_model, prompt_provider, prompt_byok, prompt_model, sched_model };
+const DdKind = enum { none, provider, model, style, minutes, stack, mode, chat_provider, chat_byok, chat_model, think_provider, think_byok, think_model, prompt_provider, prompt_byok, prompt_model, sched_model, chat_role };
 
 /// catalog.providers index of the BUILT-IN provider — the Settings one-click select writes it into
 /// chat_byok. Comptime so a catalog edit that drops or renames the provider fails the build here
@@ -2468,6 +2469,11 @@ fn drawChat(store: *Store, body: t.Rect) void {
         }
     }
 
+    // While the role-picker list is open, block clicks to everything under it (composer, panes) so a click on
+    // an option can't leak through to the widget beneath — same overlay discipline as the Settings/deploy
+    // dropdowns. flushChatRoleDropdown clears the block before drawing the list so its own rows stay clickable.
+    t.setBlockClicks(ui.open_dd == .chat_role);
+    defer t.setBlockClicks(false); // never let it leak into the next tab's frame
     drawChatLeft(store, left, left_open, convs[0..conv_n], active[0..active_n], now_s);
     drawChatCenter(store, center, msgs[0..msg_n], inflight, busy, status[0..status_n], cast_live, conv_title, convs[0..conv_n], active[0..active_n]);
     drawChatRight(store, right, right_open, casts[0..cast_n], tail[0..tail_n], plan[0..plan_n]);
@@ -2476,6 +2482,30 @@ fn drawChat(store: *Store, body: t.Rect) void {
     if (left_open) drawPaneGrip(pad + left_w, yv, ph, l_active);
     if (right_open) drawPaneGrip(body.width - pad - right_w, yv, ph, r_active);
     if (con_h > 0) drawPaneGripH(console.x, console.y - con_gap / 2, console.width, c_active);
+    flushChatRoleDropdown(store); // the role list, on top of everything (no-op unless .chat_role is open)
+}
+
+/// The role-picker's option list, drawn over the whole Chat tab. Mirrors flushChatDropdown: unblock so the
+/// rows are clickable, draw the list at the anchor rect, and on a pick SEND the role's doctrine as the next
+/// message — the AI then operates under it from turn one. No-op unless the chat_role dropdown is open.
+fn flushChatRoleDropdown(store: *Store) void {
+    if (ui.open_dd != .chat_role) return;
+    const list = roles_mod.all();
+    if (list.len == 0) {
+        ui.open_dd = .none;
+        return;
+    }
+    var labels: [32][]const u8 = undefined;
+    const count = @min(list.len, labels.len);
+    for (0..count) |i| labels[i] = list[i].label;
+    t.setBlockClicks(false); // the list's own rows must be clickable even though the form under it is blocked
+    const chosen = drawList(ui.dd_rect, labels[0..count], count) orelse return; // `count` = no current selection
+    ui.open_dd = .none;
+    if (chosen >= count) return;
+    // Hand the doctrine to the conversation as its next message; the turn starts immediately. Fits the .send
+    // buffer by construction — roles.zig's test asserts every prompt <= ChatCommand.text (see MAX_PROMPT).
+    store.pushChatCmd(store_mod.mkChatCmd(.send, "", list[chosen].prompt));
+    ui.chat_follow = true;
 }
 
 /// Push a just-run command into the You-shell history ring (skipping an immediate repeat — the arrow-up +
@@ -4606,6 +4636,31 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
             store.pushNotif("Auto-loop off", "stopping after the current turn", 1);
         }
     }
+    // ROLE PICKER anchor. Lives on the LEFT of the status row, which is empty while idle (the status text
+    // only occupies it when busy / has a status). Shown only when idle and not looping, so it never fights
+    // the working line and never fires mid-turn. Clicking opens the list (flushChatRoleDropdown, drawn on
+    // top at the end of drawChat); picking a role SENDS its doctrine as the next message and the turn starts.
+    if (!busy and !loop_on and status.len == 0 and roles_mod.all().len > 0) {
+        const rlbl = t.z("+ give the veil a role", .{});
+        const rw_lbl: f32 = @floatFromInt(t.measure(rlbl, 12));
+        const ra = t.Rect{ .x = r.x + 2, .y = sy - 4, .width = rw_lbl + 34, .height = 19 };
+        const open = ui.open_dd == .chat_role;
+        const rhot = t.hovering(ra);
+        const rcol = if (open or rhot) t.blue else t.comment;
+        t.text(rlbl, @intFromFloat(ra.x + 6), @intFromFloat(sy), 12, rcol);
+        t.text(t.z("v", .{}), @intFromFloat(ra.x + ra.width - 14), @intFromFloat(sy + 1), 12, rcol);
+        // Raw rl input (like the `selector` widget), so the anchor toggles even while its own list holds the
+        // block-clicks overlay open. can_toggle mirrors selector: only this anchor may act while it is open.
+        const can_toggle = ui.open_dd == .none or open;
+        if (can_toggle and rhot) t.wantCursor(.pointing_hand);
+        if (can_toggle and rhot and rl.isMouseButtonPressed(.left)) {
+            ui.open_dd = if (open) .none else .chat_role;
+            ui.dd_rect = .{ .x = ra.x, .y = ra.y + ra.height, .width = @max(260, ra.width), .height = ra.height };
+            ui.dd_scroll = 0;
+        }
+    } else if (ui.open_dd == .chat_role) {
+        ui.open_dd = .none; // the row went busy/looping out from under an open list — drop it
+    }
     sy += status_h;
 
     // input row — a growing/scrolling text area; the GRAB STRIP above it drag-resizes the row (crafting
@@ -5470,6 +5525,7 @@ fn flushDropdown() void {
     switch (ui.open_dd) {
         .chat_provider, .chat_byok, .chat_model, .think_provider, .think_byok, .think_model, .prompt_provider, .prompt_byok, .prompt_model => return, // owned by flushChatDropdown (Settings tab)
         .sched_model => return, // owned by flushSchedDropdown (Tasks tab) — never rendered from the deploy form
+        .chat_role => return, // owned by flushChatRoleDropdown (Chat tab composer)
         else => {},
     }
     // Build the option labels + current index for the open kind.
@@ -5529,7 +5585,7 @@ fn flushDropdown() void {
             }
             current = ui.d_mode;
         },
-        .none, .chat_provider, .chat_byok, .chat_model, .think_provider, .think_byok, .think_model, .prompt_provider, .prompt_byok, .prompt_model, .sched_model => return,
+        .none, .chat_provider, .chat_byok, .chat_model, .think_provider, .think_byok, .think_model, .prompt_provider, .prompt_byok, .prompt_model, .sched_model, .chat_role => return,
     }
     const chosen = drawList(ui.dd_rect, labels[0..count], current);
     if (chosen) |ci| {
@@ -5550,7 +5606,7 @@ fn flushDropdown() void {
             .minutes => ui.d_minutes = ci,
             .stack => ui.d_stack = ci,
             .mode => ui.d_mode = ci,
-            .none, .chat_provider, .chat_byok, .chat_model, .think_provider, .think_byok, .think_model, .prompt_provider, .prompt_byok, .prompt_model, .sched_model => {},
+            .none, .chat_provider, .chat_byok, .chat_model, .think_provider, .think_byok, .think_model, .prompt_provider, .prompt_byok, .prompt_model, .sched_model, .chat_role => {},
         }
         ui.open_dd = .none;
     }
