@@ -4232,6 +4232,9 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
     const chip_row_h: f32 = if (ui.c_attach.tex != null) 56 else 0;
     const input_h: f32 = 66 + ui.input_extra + chip_row_h;
     const status_h: f32 = 22;
+    // A slim row reserved BELOW the input for the role picker. Always reserved (not gated on the picker being
+    // visible) so the transcript height doesn't jump as busy/idle toggles; the anchor itself is idle-only.
+    const role_h: f32 = 22;
     const tab_h: f32 = 26;
     // Chat | Metrics | Files inner tabs (Metrics = per-turn perf graphs; Files = this chat's own build dir)
     const tl_chat = t.z("Chat", .{});
@@ -4333,7 +4336,7 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
         drawChatFiles(store, .{ .x = r.x, .y = r.y + tab_h + 6, .width = r.width, .height = r.height - tab_h - 6 });
         return;
     }
-    const view = t.Rect{ .x = r.x, .y = r.y + tab_h + 6, .width = r.width, .height = r.height - input_h - status_h - 14 - tab_h - 6 };
+    const view = t.Rect{ .x = r.x, .y = r.y + tab_h + 6, .width = r.width, .height = r.height - input_h - status_h - role_h - 14 - tab_h - 6 };
     t.panelBordered(view, t.bg_dark, t.border);
     // The transcript reads as a surface rather than a void. Drawn on the panel, BEFORE the messages and
     // outside the scroll scissor, so it stays pinned to the frame instead of sliding with the text — the
@@ -4636,31 +4639,6 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
             store.pushNotif("Auto-loop off", "stopping after the current turn", 1);
         }
     }
-    // ROLE PICKER anchor. Lives on the LEFT of the status row, which is empty while idle (the status text
-    // only occupies it when busy / has a status). Shown only when idle and not looping, so it never fights
-    // the working line and never fires mid-turn. Clicking opens the list (flushChatRoleDropdown, drawn on
-    // top at the end of drawChat); picking a role SENDS its doctrine as the next message and the turn starts.
-    if (!busy and !loop_on and status.len == 0 and roles_mod.all().len > 0) {
-        const rlbl = t.z("+ give the veil a role", .{});
-        const rw_lbl: f32 = @floatFromInt(t.measure(rlbl, 12));
-        const ra = t.Rect{ .x = r.x + 2, .y = sy - 4, .width = rw_lbl + 34, .height = 19 };
-        const open = ui.open_dd == .chat_role;
-        const rhot = t.hovering(ra);
-        const rcol = if (open or rhot) t.blue else t.comment;
-        t.text(rlbl, @intFromFloat(ra.x + 6), @intFromFloat(sy), 12, rcol);
-        t.text(t.z("v", .{}), @intFromFloat(ra.x + ra.width - 14), @intFromFloat(sy + 1), 12, rcol);
-        // Raw rl input (like the `selector` widget), so the anchor toggles even while its own list holds the
-        // block-clicks overlay open. can_toggle mirrors selector: only this anchor may act while it is open.
-        const can_toggle = ui.open_dd == .none or open;
-        if (can_toggle and rhot) t.wantCursor(.pointing_hand);
-        if (can_toggle and rhot and rl.isMouseButtonPressed(.left)) {
-            ui.open_dd = if (open) .none else .chat_role;
-            ui.dd_rect = .{ .x = ra.x, .y = ra.y + ra.height, .width = @max(260, ra.width), .height = ra.height };
-            ui.dd_scroll = 0;
-        }
-    } else if (ui.open_dd == .chat_role) {
-        ui.open_dd = .none; // the row went busy/looping out from under an open list — drop it
-    }
     sy += status_h;
 
     // input row — a growing/scrolling text area; the GRAB STRIP above it drag-resizes the row (crafting
@@ -4790,6 +4768,31 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
             ui.c_attach.clear();
             ui.chat_follow = true;
         }
+    }
+
+    // ROLE PICKER anchor — BELOW the input, in the row reserved by role_h. Idle-only (not busy, not looping,
+    // no status) so it never fires mid-turn. Clicking opens the list (flushChatRoleDropdown, drawn on top at
+    // the end of drawChat); picking a role SENDS its doctrine as the next message and the turn starts. The
+    // list auto-flips ABOVE the anchor since it sits near the pane bottom (drawList handles the cramped case).
+    const role_y = sy + input_h + 3;
+    if (!busy and !loop_on and status.len == 0 and roles_mod.all().len > 0) {
+        const rlbl = t.z("+ give the veil a role", .{});
+        const rw_lbl: f32 = @floatFromInt(t.measure(rlbl, 12));
+        const ra = t.Rect{ .x = r.x + 2, .y = role_y, .width = rw_lbl + 16, .height = role_h - 4 };
+        const open = ui.open_dd == .chat_role;
+        const rhot = t.hovering(ra);
+        // Raw rl input (like the `selector` widget), so the anchor toggles even while its own list holds the
+        // block-clicks overlay open. can_toggle mirrors selector: only this anchor may act while it is open.
+        const can_toggle = ui.open_dd == .none or open;
+        t.text(rlbl, @intFromFloat(ra.x + 6), @intFromFloat(role_y + 2), 12, if (open or rhot) t.blue else t.comment);
+        if (can_toggle and rhot) t.wantCursor(.pointing_hand);
+        if (can_toggle and rhot and rl.isMouseButtonPressed(.left)) {
+            ui.open_dd = if (open) .none else .chat_role;
+            ui.dd_rect = .{ .x = ra.x, .y = ra.y, .width = @max(260, ra.width), .height = ra.height };
+            ui.dd_scroll = 0;
+        }
+    } else if (ui.open_dd == .chat_role) {
+        ui.open_dd = .none; // the row went busy/looping out from under an open list — drop it
     }
 }
 
