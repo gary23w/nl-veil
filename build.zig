@@ -477,4 +477,5 @@ fn addDeskAssets(b: *std.Build, mod: *std.Build.Module) void {
     mod.addAnonymousImport("desk_icon48_png", .{ .root_source_file = b.path("desk/assets/icon48x48.png") });
     mod.addAnonymousImport("desk_opendyslexic_regular_ttf", .{ .root_source_file = b.path("desk/assets/fonts/OpenDyslexic3-Regular.ttf") });
     mod.addAnonymousImport("desk_opendyslexic_bold_ttf", .{ .root_source_file = b.path("desk/assets/fonts/OpenDyslexic3-Bold.ttf") });
+    mod.addAnonymousImport("desk_roles_json", .{ .root_source_file = b.path("desk/roles.json") }); // the prebuilt chat-role catalog (desk/src/roles.zig)
 }
