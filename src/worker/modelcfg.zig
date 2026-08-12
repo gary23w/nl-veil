@@ -572,6 +572,23 @@ test "senseModel: MoE totals, decimals, uppercase B, millions" {
     try std.testing.expectEqual(Tier.small, senseModel("Mistral-Small-24B-Instruct-2501", false).tier);
 }
 
+test "senseModel: the two 30B agentic locals tier MID, and a version decimal never reads as the size" {
+    // Both ids carry a VERSION decimal ahead of the real size -- "nemotron-3.5-..." then the ":30b" tag.
+    // If the 3.5 were read as the parameter count these would tier SMALL and be served the 12B's compact
+    // doctrine, which is the wrong prompt for a 30B. Pinned because the shape is easy to regress.
+    try std.testing.expectEqual(@as(u32, 30), senseModel("nemotron-3.5-lightning:30b", true).params_b);
+    try std.testing.expectEqual(Tier.mid, senseModel("nemotron-3.5-lightning:30b", true).tier);
+    try std.testing.expectEqual(@as(u32, 30), senseModel("muse-glimmer:30b", true).params_b);
+    try std.testing.expectEqual(Tier.mid, senseModel("muse-glimmer:30b", true).tier);
+    // Nemotron is 30B TOTAL / 3B ACTIVE. The catalog tiers on the TOTAL (the same rule the
+    // qwen3.5-397b-a17b case above pins), so an active-count suffix must not pull it down to small.
+    try std.testing.expectEqual(Tier.mid, senseModel("nemotron-3.5-lightning:30b-a3b", true).tier);
+    // ctx_k is deliberately unstated in models.yaml (see the comment there): both fall to the mid default,
+    // the fold-early direction workingBudgetBytes wants for an Ollama window this process cannot read.
+    try std.testing.expectEqual(@as(u32, 32), senseModel("nemotron-3.5-lightning:30b", true).ctx_k);
+    try std.testing.expectEqual(@as(u32, 32), senseModel("muse-glimmer:30b", true).ctx_k);
+}
+
 test "senseModel: ctx window caps the tier; light markers read as mid; minimax is not mini" {
     const m8k = senseModel("moonshot-v1-8k", false);
     try std.testing.expectEqual(Tier.small, m8k.tier); // frontier params, 8k window → the budgets must fit the window

@@ -89,6 +89,29 @@ providers:
       # the compact prompt+belt pairing a 12B needs -- no params_b/tier pin required.
       - id: the-veil-12b
         label: The Veil 12B
+      # Two 30B agentic locals, appended per the ORDER MATTERS note. Both carry "30b" in the id, so
+      # paramsTenthsFromId reads 30 and senseModel tiers them MID -- fuller doctrine than the 12B's compact
+      # tier, short of the frontier treatment. That is the intent; no params_b/tier pin needed.
+      #
+      # ctx_k IS DELIBERATELY NOT STATED, though both cards advertise a big window (Nemotron 1M, Muse
+      # Glimmer 128K). servingWindowTokens() answers only for the BUILT-IN engine and returns null for
+      # Ollama by design ("a provider whose window this process does not serve and cannot know"), so a
+      # stated ctx_k here would be the ONLY input to workingBudgetBytes -- no runtime override, no cap.
+      # Ollama serves its own num_ctx, far below either card's maximum unless the user raises it, so
+      # claiming the datasheet number would tell the engine "roomy, do not tighten" while the runtime
+      # silently truncates. engine.zig is explicit that the other direction is the safe one: "under-
+      # estimating the window is the safe direction -- it folds early rather than overflowing." Omitting
+      # takes the mid-tier default (32K): conservative, and what every other local entry already gets.
+      #
+      # NVIDIA Nemotron 3.5 Lightning -- 30B total / 3B active MoE, tool calling, no vision. TOTAL params
+      # are what the catalog reads (see the qwen3.5-397b-a17b test), which is the tiering wanted here too.
+      - id: nemotron-3.5-lightning:30b
+        label: Nemotron 3.5 Lightning 30B
+      # Meta Muse Glimmer -- 30B, tool calling. The card also advertises a perception encoder, but the veil
+      # routes images through OCR + pixel-RAG and never asks a model to describe a picture, so its vision
+      # is not surfaced here and nothing downstream changes.
+      - id: muse-glimmer:30b
+        label: Muse Glimmer 30B
 
   # Cloudflare Workers AI via its OpenAI-compatible endpoint. Needs BOTH an account id (in the URL) and a
   # token; blank sends the "cloudflare" sentinel so a server configured with NL_CF_ACCOUNT_ID +

@@ -904,6 +904,18 @@
       "label": "The Veil 12B",
       "provider": "ollama",
       "hosting": "local"
+    },
+    {
+      "id": "nemotron-3.5-lightning:30b",
+      "label": "Nemotron 3.5 Lightning 30B",
+      "provider": "ollama",
+      "hosting": "local"
+    },
+    {
+      "id": "muse-glimmer:30b",
+      "label": "Muse Glimmer 30B",
+      "provider": "ollama",
+      "hosting": "local"
     }
   ],
   "defaults": {
