@@ -2,7 +2,7 @@
 
 **File:** `src/worker/oscillation.zig`  
 **Module:** `worker`  
-**Description:** The worker's single gateway to neuron-db — the read/write round-trip (observe, recall, chain, reinforce, assoc) plus the operator preamble + baseline tables.
+**Description:** The worker's single gateway to neuron-db — the read/write round-trip (observe, recall, recallScored, chain, reinforce, assoc) plus the operator preamble + baseline tables. observe's argv stays deliberately flag-free: consolidation contradiction marking is the new neuron binary's own default, because an unknown flag on an older binary would be stored as fact text (capability rides the binary, never the argv).
 
 ---
 

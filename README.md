@@ -578,6 +578,15 @@ veil chat — conversation cli7f3a1c
 > what are you working on?
 ```
 
+What the model sees each turn is governed, not accreted: every context block (memory, tool digests,
+corrections, plugin hooks…) bids into a [prompt workspace](https://gary23w.github.io/nl-veil/#doc=worker/chat/workspace)
+with a fixed render order, per-channel byte budgets, and a **provenance receipt** on every admitted
+block — and each turn's admit/drop record lands in `workspace.jsonl`, so "why did it say that" has a
+queryable answer. Recalled memory arrives **scored** (numbers, not vibes), a fact that contradicts a
+stored sibling arrives marked `[CONTESTED]` with both sides shown, and a sentinel-gated second model
+audits doubtful memory before the answering model reads it — annotations only, nothing is silently
+deleted.
+
 ## The tool belt
 
 A turn is only as useful as what it can actually touch. The engine ships **~58 tools**, all executed

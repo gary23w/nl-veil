@@ -30,6 +30,12 @@ The build tools the loop's calls run route through the SAME workdir a hive cast 
 
 Between drive steps and before each tool the loop drains `control.jsonl`: `{"op":"stop"}` ends the turn promptly; `{"op":"steer","text":...}` folds the guidance in as a user message so a running turn can be redirected without restarting it.
 
+## Context through the workspace
+
+Every non-transcript block the turn injects — durable memory, the tool digest, the trust belt, image OCR, relevance recall, belt corrections, family context, plugin hooks, the file ledger — bids into the [prompt workspace](#doc=worker/chat/workspace) instead of appending ad hoc: fixed render order per channel (byte-compatible with the prompt-prefix-cache layout), per-channel byte budgets with whole-block lowest-score-first drops, a provenance receipt on each admitted block, and one decision line per turn in `{conv}/workspace.jsonl`.
+
+Recall itself is scored: the neuron CLI's `recallscored` returns top-k facts **with numbers**, the top hit's coverage rides the bid as measured confidence, facts the store marked contested arrive labeled with the disagreeing sibling, and a sentinel-gated `memverify` completion on the thinking role annotates doubtful facts before the answering model reads them (`NL_MEM_VERIFY=0` disables; verdicts never delete). An older neuron binary degrades to the legacy prose recall byte-identically.
+
 ## Concurrency & lifecycle
 
 - One in-flight turn per conversation. `tryBeginTurn` claims the slot (so `postMessage` can answer `409` before persisting anything); `spawnTurn` fires the turn on a raw detached thread and owns releasing the slot on every completion path.
