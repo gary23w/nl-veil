@@ -6,7 +6,7 @@
 
 <p>
   <a href="https://github.com/gary23w/nl-veil/actions/workflows/release.yml"><img alt="build" src="https://github.com/gary23w/nl-veil/actions/workflows/release.yml/badge.svg"></a>
-  <a href="https://github.com/gary23w/nl-veil/releases"><img alt="release" src="https://img.shields.io/badge/release-v1.0.1--beta--3-A8241B"></a>
+  <a href="https://github.com/gary23w/nl-veil/releases"><img alt="release" src="https://img.shields.io/badge/release-v1.0.1--beta--4-A8241B"></a>
   <img alt="zig" src="https://img.shields.io/badge/zig-0.16-F7A41D?logo=zig&logoColor=white">
   <a href="https://huggingface.co/gary23w/the-veil-12b"><img alt="built-in model" src="https://img.shields.io/badge/built--in%20model-the--veil--12b-6E4A27?logo=huggingface&logoColor=white"></a>
   <a href="https://huggingface.co/gary23w/gary-neuron-emergent"><img alt="memory cortex" src="https://img.shields.io/badge/cortex-gary--neuron--emergent-6E4A27?logo=huggingface&logoColor=white"></a>
@@ -121,7 +121,7 @@ raylib is a *lazy* dependency, so `-Dapp=false` never fetches it at all.
 ## Install
 
 **Download it and run it — no toolchain, nothing to build.** Grab your platform's bundle from the
-**[latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.0.1-beta-3)**, unzip, and run `veil`:
+**[latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.0.1-beta-4)**, unzip, and run `veil`:
 
 | You're on | Download | Then run |
 |---|---|---|
@@ -282,7 +282,7 @@ step 5** — the rest is about letting other people in.
 
 ### 1. Download and unblock it
 
-Grab the bundle for your OS from the [latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.0.1-beta-3)
+Grab the bundle for your OS from the [latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.0.1-beta-4)
 and unzip it somewhere you'll find again. Builds are unsigned, so:
 
 - **Windows** shows *"Windows protected your PC"* → **More info** → **Run anyway**.
@@ -1110,16 +1110,16 @@ dependency entirely rather than compiling it unused.
 
 ## Release
 
-**Current: [`v1.0.1-beta-3`](https://github.com/gary23w/nl-veil/releases/tag/v1.0.1-beta-3)** — the
-third beta, about the desktop app around the model. The "crashes" were hangs (a minimized window parking
-the GPU present call) and are fixed; the in-app shell is resizable and its Veil pane now shows every tool
-call; the chat says **"Internet is offline"** instead of freezing when the uplink drops (local models
-unaffected); a one-click **role picker** hands the veil a full doctrine; the browser stops refusing the
-posts and submits you asked for; and two 30B local models join the picker — Nemotron 3.5 Lightning and
-Muse Glimmer.
-[Full notes](docs/release/RELEASE-v1.0.1-beta-3.md) ·
-[beta-2](docs/release/RELEASE-v1.0.1-beta-2.md) — the browser finishing the job ·
-[beta-1](docs/release/RELEASE-v1.0.1-beta-1.md) — the built-in model.
+**Current: [`v1.0.1-beta-4`](https://github.com/gary23w/nl-veil/releases/tag/v1.0.1-beta-4)** — the
+fourth beta, about what the model is *allowed to see*. Every block of chat context passes through a
+**prompt workspace** (fixed order, byte budgets, a provenance receipt on every admitted block), and each
+turn's admit/drop record lands in `workspace.jsonl` — "why did it say that" has a queryable answer.
+Recalled memory arrives **scored** (numbers per fact), a fact that contradicts a stored one arrives
+marked **[CONTESTED]** with both sides shown, and a sentinel-gated second model audits doubtful memory
+before the answer is written — annotations only, nothing silently deleted.
+[Full notes](docs/release/RELEASE-v1.0.1-beta-4.md) ·
+[beta-3](docs/release/RELEASE-v1.0.1-beta-3.md) — the desktop app around the model ·
+[beta-2](docs/release/RELEASE-v1.0.1-beta-2.md) — the browser finishing the job.
 
 Builds ship on the [Releases page](https://github.com/gary23w/nl-veil/releases), one per
 platform. Unzip and run `veil` — that starts the server **and** opens the desktop app. No Python, no

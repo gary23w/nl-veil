@@ -1,6 +1,6 @@
 .{
     .name = .veil,
-    .version = "1.0.1-beta-3",
+    .version = "1.0.1-beta-4",
     .fingerprint = 0xd137d40acdb7c43e,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{

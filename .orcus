@@ -1,0 +1,57 @@
+# .orcus - this repository's contract with the Orcus git lab.
+#
+# Replaces .github. Published there as a point-in-time snapshot: upstream history
+# is not carried, so the mirror holds a single commit. Living in the source tree
+# (rather than lab-side) means every republish keeps this identity by construction.
+version: 1
+
+repo:
+  name: nl-veil
+  description: >-
+    An agentic coding desktop app that runs a whole team of AI agents on your
+    machine, and remembers. One binary, many minds, one shared memory.
+  language: Zig
+  color: "#ec915c"
+  topics: [zig, agents, local-first, memory, desktop]
+  status: active
+  updated: 2026-08-15
+  # The releases INDEX, not /releases/latest and not a pinned tag: every veil
+  # release is a prerelease, which /releases/latest silently skips, and the
+  # index always lists the newest one first.
+  releases: https://github.com/gary23w/nl-veil/releases
+
+git:
+  default_branch: main
+  mirror: true
+  clone:
+    http: true
+    push: false
+  # Snapshot, not a migration: the repository with full history lives elsewhere.
+  upstream: snapshot
+
+network:
+  origins:
+    - https://0rcus.vercel.app/git/r/nl-veil.git
+  write:
+    enabled: false
+    transport: null
+  peers: []
+
+features:
+  code: true
+  posts: true       # markdown in the repo publishes as posts
+  activity: true
+  clone_url: true
+  releases: true    # render the releases link beside the source downloads
+
+publish:
+  # Present in the repository and in every download; simply not worth a rendered
+  # page each. Fonts and icons render as binary stubs, build output is noise.
+  exclude:
+    - "**/*.woff2"
+    - "**/*.ttf"
+    - "**/*.ico"
+    - "**/*.png"
+    - zig-out/**
+    - .zig-cache/**
+    - "**/zig-cache/**"
