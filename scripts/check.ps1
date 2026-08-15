@@ -468,13 +468,22 @@ $ok = (Confirm-Gate (Invoke-ZigTests "src suite" $repo $TimeoutSec "")) -and $ok
 # CI — and the break was inside a TEST block, which a cross-compiled BUILD would never have caught. The run
 # steps legitimately fail here (foreign binary); only a real `file.zig:LINE:COL: error:` is a failure.
 function Invoke-XTests([string]$label) {
+    # Bool out, row appended, header printed -- the SAME contract as every other gate. The first
+    # version returned a @{name;ok;detail} hashtable nothing rendered: Confirm-Gate saw zero
+    # booleans, judged the gate failed, and -Full said NOT GREEN while every printed row was PASS
+    # -- the exact H13 symptom, produced by the gate that shipped alongside the H13 guard.
+    Write-Host ">> $label"
     $out = & $zig build test -Dtarget=x86_64-linux --cache-dir $cache 2>&1 | Out-String
     $errs = [regex]::Matches($out, '(?m)^.*\.zig:\d+:\d+: error:.*$')
     if ($errs.Count -gt 0) {
-        $shown = ($errs | Select-Object -First 8 | ForEach-Object { "   > " + $_.Value.Trim() }) -join "`n"
-        return @{ name = $label; ok = $false; detail = "the test graph does not COMPILE for linux -- CI will fail on exactly this`n$shown" }
+        Write-Host "   FAIL -- the test graph does not COMPILE for linux; CI will fail on exactly this" -ForegroundColor Red
+        $errs | Select-Object -First 8 | ForEach-Object { Write-Host ("   > " + $_.Value.Trim()) -ForegroundColor Red }
+        $script:results += [pscustomobject]@{ gate = $label; status = "FAIL"; log = ""; errlog = "" }
+        return $false
     }
-    return @{ name = $label; ok = $true; detail = "compiles for x86_64-linux (run steps skipped: foreign target)" }
+    Write-Host "   PASS (compiles for x86_64-linux; run steps skipped: foreign target)" -ForegroundColor Green
+    $script:results += [pscustomobject]@{ gate = $label; status = "PASS"; log = ""; errlog = "" }
+    return $true
 }
 $ok = (Confirm-Gate (Invoke-XTests "tests cross-compile (linux)")) -and $ok
 # The note here used to say the desk suite's net test "needs a live server on :8787" and to "treat
