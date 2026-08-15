@@ -2023,28 +2023,108 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
         // unanchored (observed: a restart's "continue" re-scaffolded the whole build). Key it on the
         // conversation's pinned GOAL instead: the memories of the actual work come back.
         const recall_query: []const u8 = goal_text;
-        const recalled = ctx.mem.recall(mem_scope, recall_query);
-        defer gpa.free(recalled);
-        if (recalled.len > 0) {
-            scrubUtf8(recalled); // observed facts are already scrubbed, but a fetched-byte tail could slip in
+        // SCORED RECALL first (a neuron binary with `recallscored`): numbers cross the seam as numbers —
+        // the top hit's coverage rides the workspace bid as MEASURED confidence (rendered in the receipt,
+        // recorded in the decision log), facts are numbered so the verifier below can cite them, and
+        // consolidation's --check marks surface inline as CONTESTED with the disagreeing sibling's text.
+        // An older binary (unknown verb → exit 2 → "") or an empty scope falls through to the legacy
+        // prose path, byte-identical to before.
+        const rs_raw = ctx.mem.recallScored(mem_scope, recall_query, 6);
+        defer gpa.free(rs_raw);
+        var scored_ok = false;
+        if (rs_raw.len > 0) scored: {
+            scrubUtf8(rs_raw);
+            const parsed = std.json.parseFromSlice(ScoredRecall, gpa, rs_raw, .{ .ignore_unknown_fields = true }) catch break :scored;
+            defer parsed.deinit();
+            const hits = parsed.value.hits;
+            if (hits.len == 0) break :scored;
+            scored_ok = true;
             var mem_content: std.ArrayListUnmanaged(u8) = .empty;
             defer mem_content.deinit(gpa);
             mem_content.appendSlice(gpa, if (sched_task != null)
-                "TASK MEMORY — lessons, outcomes, and findings from PREVIOUS RUNS of this scheduled task. USE them: prefer sources/approaches that worked, skip recorded pitfalls, keep stated assumptions, and improve on the last run instead of starting from zero:\n"
+                "TASK MEMORY — lessons, outcomes, and findings from PREVIOUS RUNS of this scheduled task, numbered, strongest match first. USE them: prefer sources/approaches that worked, skip recorded pitfalls, keep stated assumptions, and improve on the last run instead of starting from zero:\n"
             else
-                "RELEVANT MEMORY (recalled from this conversation's memory — earlier turns, tool findings). Treat as grounded context:\n") catch return;
-            // Clipped like every other memory injection (the durable-memory and lesson blocks below clip at
-            // 700/500, the image OCR at 2800). Recall is unbounded by construction — it grows with the
-            // conversation's own fact count — and this fragment rides in front of the recency window on EVERY
-            // inference of the turn.
-            const shown = clipBytes(recalled, 1500);
-            mem_content.appendSlice(gpa, shown) catch return;
-            var nfacts: u32 = 0;
-            var fit = std.mem.splitScalar(u8, shown, '\n');
-            while (fit.next()) |fl| {
-                if (std.mem.trim(u8, fl, " \r\t").len > 0) nfacts += 1;
+                "RELEVANT MEMORY — facts recalled from this conversation's memory (earlier turns, tool findings), numbered, strongest match first. Treat as grounded context:\n") catch return;
+            var contested_n: u32 = 0;
+            for (hits, 1..) |h, num| {
+                var nb2: [12]u8 = undefined;
+                mem_content.appendSlice(gpa, std.fmt.bufPrint(&nb2, "{d}. ", .{num}) catch "- ") catch return;
+                mem_content.appendSlice(gpa, h.fact) catch return;
+                if (h.contested) {
+                    contested_n += 1;
+                    mem_content.appendSlice(gpa, " [CONTESTED — a stored fact disagrees: \"") catch return;
+                    mem_content.appendSlice(gpa, clipBytes(h.with orelse "", 160)) catch return;
+                    mem_content.appendSlice(gpa, "\"]") catch return;
+                }
+                mem_content.append(gpa, '\n') catch return;
             }
-            ws.bid(.recall, mem_scope, mem_content.items, 0.60, 0, nfacts);
+            // The workspace cap bounds the whole block (header + numbered facts + contested notes) at the
+            // same order as the legacy 1500-byte fact clip; the receipt says so when it bites.
+            const top_conf: f32 = @floatCast(hits[0].coverage);
+            ws.bidConf(.recall, mem_scope, mem_content.items, 0.60, 1800, @intCast(hits.len), top_conf);
+
+            // TIER-2 VERIFIER, sentinel-gated (NL_MEM_VERIFY=0 disables): contested marks or a weak top
+            // hit trigger ONE bounded no-tools completion on the THINKING role to audit the block BEFORE
+            // the main inference reads it — decorrelated whenever the trio routes thinking to a different
+            // model. Verdicts ANNOTATE, never delete: dropping memory on a model's say-so is the
+            // recall-pollution class inverted. A doubted fact gets a caution note bid directly after the
+            // recall block (Kind order), and the workspace log records the whole decision.
+            if (memSentinel(hits.len, contested_n, top_conf) and !envDisabled(environ, "NL_MEM_VERIFY")) {
+                var vmsgs: std.ArrayListUnmanaged(u8) = .empty;
+                defer vmsgs.deinit(gpa);
+                const vbuilt = blk_v: {
+                    vmsgs.appendSlice(gpa, "{\"role\":\"system\",\"content\":") catch break :blk_v false;
+                    http.jstr(gpa, &vmsgs, "You audit MEMORY RECALLED for an assistant's next turn. Some facts may be wrong, stale, contradicted (CONTESTED entries show the disagreeing stored fact), or irrelevant to the request. Reply with ONLY compact JSON: {\"doubt\":[{\"i\":<fact number>,\"why\":\"<short reason>\"}]} — an empty list when the block is fine. Doubt sparingly; never doubt a fact merely for being brief.") catch break :blk_v false;
+                    vmsgs.appendSlice(gpa, "},{\"role\":\"user\",\"content\":") catch break :blk_v false;
+                    var uc: std.ArrayListUnmanaged(u8) = .empty;
+                    defer uc.deinit(gpa);
+                    uc.appendSlice(gpa, mem_content.items) catch break :blk_v false;
+                    uc.appendSlice(gpa, "\nREQUEST THIS MEMORY MUST SERVE: ") catch break :blk_v false;
+                    uc.appendSlice(gpa, clipBytes(goal_text, 600)) catch break :blk_v false;
+                    uc.appendSlice(gpa, "\n\nWhich fact numbers, if any, deserve caution?") catch break :blk_v false;
+                    http.jstr(gpa, &vmsgs, uc.items) catch break :blk_v false;
+                    vmsgs.append(gpa, '}') catch break :blk_v false;
+                    break :blk_v true;
+                };
+                if (vbuilt) {
+                    const vp = trio.pick(.thinking);
+                    const vm_cm = meterBegin(app.io);
+                    var vstep = llm.complete(gpa, app.io, run_root, "memverify", vp.base_url, vp.key, vp.model, vmsgs.items, "", 384, 0.1);
+                    defer vstep.deinit(gpa);
+                    meterEnd(app, vm_cm, "memverify", .thinking, vp.model, vstep.ok);
+                    if (vstep.ok) {
+                        if (verifierNote(gpa, vstep.content, hits.len)) |note| {
+                            defer gpa.free(note);
+                            ws.bid(.verifier, "memverify", note, 0.92, 700, 0);
+                        }
+                    }
+                }
+            }
+        }
+        if (!scored_ok) {
+            const recalled = ctx.mem.recall(mem_scope, recall_query);
+            defer gpa.free(recalled);
+            if (recalled.len > 0) {
+                scrubUtf8(recalled); // observed facts are already scrubbed, but a fetched-byte tail could slip in
+                var mem_content: std.ArrayListUnmanaged(u8) = .empty;
+                defer mem_content.deinit(gpa);
+                mem_content.appendSlice(gpa, if (sched_task != null)
+                    "TASK MEMORY — lessons, outcomes, and findings from PREVIOUS RUNS of this scheduled task. USE them: prefer sources/approaches that worked, skip recorded pitfalls, keep stated assumptions, and improve on the last run instead of starting from zero:\n"
+                else
+                    "RELEVANT MEMORY (recalled from this conversation's memory — earlier turns, tool findings). Treat as grounded context:\n") catch return;
+                // Clipped like every other memory injection (the durable-memory and lesson blocks below clip at
+                // 700/500, the image OCR at 2800). Recall is unbounded by construction — it grows with the
+                // conversation's own fact count — and this fragment rides in front of the recency window on EVERY
+                // inference of the turn.
+                const shown = clipBytes(recalled, 1500);
+                mem_content.appendSlice(gpa, shown) catch return;
+                var nfacts: u32 = 0;
+                var fit = std.mem.splitScalar(u8, shown, '\n');
+                while (fit.next()) |fl| {
+                    if (std.mem.trim(u8, fl, " \r\t").len > 0) nfacts += 1;
+                }
+                ws.bid(.recall, mem_scope, mem_content.items, 0.60, 0, nfacts);
+            }
         }
     }
     // BELT CORRECTION (compact tier): the previous reply claimed a belt tool is missing. The manifest sits
@@ -3712,6 +3792,83 @@ fn lastAssistantNote(app: *App, conv_dir: []const u8) ?[]u8 {
         }
     }
     return best;
+}
+
+/// Wire shape of `neuron --json recallscored` (contested facts carry the disagreeing sibling in
+/// `with`). Shared by the turn's parse and the test below so the contract drifts loudly, not silently.
+const ScoredHit = struct { fact: []const u8 = "", coverage: f64 = 0, overlap: u32 = 0, exact: u32 = 0, idx: u32 = 0, contested: bool = false, with: ?[]const u8 = null };
+const ScoredRecall = struct { hits: []const ScoredHit = &.{} };
+
+test "ScoredRecall parses the neuron CLI's recallscored wire shape verbatim" {
+    const gpa = std.testing.allocator;
+    // exact bytes a live `neuron --json recallscored` run produced (a contested pair + a clean hit)
+    const wire = "{\"hits\":[{\"fact\":\"the api port is 8080\",\"coverage\":1.0000,\"overlap\":2,\"exact\":2,\"idx\":0,\"contested\":true,\"with\":\"the api port is 9090\"},{\"fact\":\"the deploy uses docker\",\"coverage\":0.6667,\"overlap\":2,\"exact\":2,\"idx\":2,\"contested\":false,\"with\":null}]}";
+    const p = try std.json.parseFromSlice(ScoredRecall, gpa, wire, .{ .ignore_unknown_fields = true });
+    defer p.deinit();
+    try std.testing.expectEqual(@as(usize, 2), p.value.hits.len);
+    try std.testing.expect(p.value.hits[0].contested);
+    try std.testing.expectEqualStrings("the api port is 9090", p.value.hits[0].with.?);
+    try std.testing.expect(!p.value.hits[1].contested);
+    try std.testing.expect(p.value.hits[1].with == null);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), p.value.hits[0].coverage, 0.0001);
+}
+
+/// Sentinel for the tier-2 memory verifier: fire on any contested fact, or a weak top hit backing a
+/// non-empty block. Pure and cheap — the always-on statistical gate deciding when the expensive
+/// decorrelated check is worth one completion.
+fn memSentinel(nhits: usize, contested: u32, top_conf: f32) bool {
+    if (nhits == 0) return false;
+    return contested > 0 or top_conf < 0.35;
+}
+
+/// Parse the memory-verifier's verdict ({"doubt":[{"i":N,"why":"…"}]}, possibly wrapped in prose)
+/// into the caution note bid into the context. Null when nothing is doubted or the reply is
+/// unusable — fail-open: a garbled verdict must never block the turn or invent a caution. An index
+/// outside 1..=nhits is itself a hallucination and is dropped.
+fn verifierNote(gpa: std.mem.Allocator, reply: []const u8, nhits: usize) ?[]u8 {
+    const open = std.mem.indexOfScalar(u8, reply, '{') orelse return null;
+    const close = std.mem.lastIndexOfScalar(u8, reply, '}') orelse return null;
+    if (close <= open) return null;
+    const D = struct { i: u32 = 0, why: []const u8 = "" };
+    const V = struct { doubt: []const D = &.{} };
+    const p = std.json.parseFromSlice(V, gpa, reply[open .. close + 1], .{ .ignore_unknown_fields = true }) catch return null;
+    defer p.deinit();
+    if (p.value.doubt.len == 0) return null;
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(gpa);
+    out.appendSlice(gpa, "MEMORY VERIFIER — a second model audited the RELEVANT MEMORY block above; treat these entries with caution:") catch return null;
+    var any = false;
+    for (p.value.doubt) |d| {
+        if (d.i == 0 or d.i > nhits) continue;
+        out.appendSlice(gpa, "\n- fact #") catch return null;
+        var ib: [8]u8 = undefined;
+        out.appendSlice(gpa, std.fmt.bufPrint(&ib, "{d}", .{d.i}) catch "?") catch return null;
+        if (d.why.len > 0) {
+            out.appendSlice(gpa, ": ") catch return null;
+            out.appendSlice(gpa, clipBytes(d.why, 140)) catch return null;
+        }
+        any = true;
+    }
+    if (!any) return null;
+    return gpa.dupe(u8, out.items) catch null;
+}
+
+test "memSentinel: contested or a weak top hit fires; a clean strong block stays quiet" {
+    try std.testing.expect(!memSentinel(0, 0, 0.0)); // no facts, nothing to audit
+    try std.testing.expect(memSentinel(3, 1, 0.9)); // contested → fire
+    try std.testing.expect(memSentinel(2, 0, 0.2)); // weak top hit → fire
+    try std.testing.expect(!memSentinel(4, 0, 0.8)); // strong, uncontested → quiet
+}
+
+test "verifierNote: builds the caution note, drops invented indexes, null on none/garbage" {
+    const gpa = std.testing.allocator;
+    const note = verifierNote(gpa, "Sure — my audit: {\"doubt\":[{\"i\":2,\"why\":\"contradicted by a newer fact\"},{\"i\":9,\"why\":\"out of range\"}]}", 3).?;
+    defer gpa.free(note);
+    try std.testing.expect(std.mem.indexOf(u8, note, "fact #2: contradicted by a newer fact") != null);
+    try std.testing.expect(std.mem.indexOf(u8, note, "#9") == null); // invented index dropped
+    try std.testing.expect(verifierNote(gpa, "{\"doubt\":[]}", 3) == null);
+    try std.testing.expect(verifierNote(gpa, "no json here", 3) == null);
+    try std.testing.expect(verifierNote(gpa, "{\"doubt\":[{\"i\":9,\"why\":\"x\"}]}", 3) == null); // only invented → null
 }
 
 /// SUB-CHAT FAMILY CONTEXT, bid into the varying workspace channel (never the stable prefix). A branch
