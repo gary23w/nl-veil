@@ -30,8 +30,10 @@ pub const Kind = enum {
     tool_digest,
     tool_belt,
     image,
-    // varying channel (per-message)
+    // varying channel (per-message); verifier sits directly after recall so the audit renders
+    // adjacent to the block it audits
     recall,
+    verifier,
     correction,
     family,
     plugin,
@@ -41,7 +43,7 @@ pub const Kind = enum {
     pub fn channel(k: Kind) Channel {
         return switch (k) {
             .durable_memory, .tool_digest, .tool_belt, .image => .prefix,
-            .recall, .correction, .family, .plugin => .varying,
+            .recall, .verifier, .correction, .family, .plugin => .varying,
             .ledger => .suffix,
         };
     }
@@ -76,6 +78,7 @@ const Bid = struct {
     score: f32, // drop priority under budget pressure (higher survives); NOT a truth claim
     cap: usize, // per-item clip; 0 = none (the call site already bounded it)
     n: u32, // item count inside the block when the site knows it (facts, files); 0 = unknown
+    conf: f32, // MEASURED confidence (0..1) when the source provides one (scored recall); < 0 = none
 };
 
 const Decision = struct {
@@ -143,13 +146,19 @@ pub const Workspace = struct {
     /// Best-effort like every context path: an empty text or OOM silently drops the bid — the turn must
     /// never fail because a context garnish couldn't be recorded.
     pub fn bid(self: *Workspace, kind: Kind, src: []const u8, text: []const u8, score: f32, cap: usize, n: u32) void {
+        self.bidConf(kind, src, text, score, cap, n, -1);
+    }
+
+    /// bid() carrying a MEASURED confidence (0..1) — for sources with real numbers (scored recall).
+    /// Confidence rides the receipt and the decision log; score stays the packing priority.
+    pub fn bidConf(self: *Workspace, kind: Kind, src: []const u8, text: []const u8, score: f32, cap: usize, n: u32, conf: f32) void {
         if (text.len == 0) return;
         const tx = self.gpa.dupe(u8, text) catch return;
         const s = self.gpa.dupe(u8, src) catch {
             self.gpa.free(tx);
             return;
         };
-        self.bids.append(self.gpa, .{ .kind = kind, .src = s, .text = tx, .score = score, .cap = cap, .n = n }) catch {
+        self.bids.append(self.gpa, .{ .kind = kind, .src = s, .text = tx, .score = score, .cap = cap, .n = n, .conf = conf }) catch {
             self.gpa.free(tx);
             self.gpa.free(s);
         };
@@ -233,14 +242,18 @@ pub const Workspace = struct {
             defer content.deinit(gpa);
             try content.appendSlice(gpa, kept);
             // The receipt: a one-line provenance stamp the model can cite ("per [provenance recall: …]").
-            // Truthful fields only — source handle, item count when known, bytes, whether clipped.
-            var rb: [160]u8 = undefined;
-            const src_show = clipUtf8(b.src, 48);
-            const receipt = if (b.n > 0)
-                std.fmt.bufPrint(&rb, "\n[provenance {s}: {s}, {d} items, {d}B{s}]", .{ b.kind.name(), src_show, b.n, kept.len, if (decisions[i].clipped) ", clipped" else "" }) catch ""
-            else
-                std.fmt.bufPrint(&rb, "\n[provenance {s}: {s}, {d}B{s}]", .{ b.kind.name(), src_show, kept.len, if (decisions[i].clipped) ", clipped" else "" }) catch "";
-            try content.appendSlice(gpa, receipt);
+            // Truthful fields only — source handle, item count when known, measured confidence when the
+            // source carries one, bytes, whether clipped.
+            var rb: [48]u8 = undefined;
+            try content.appendSlice(gpa, "\n[provenance ");
+            try content.appendSlice(gpa, b.kind.name());
+            try content.appendSlice(gpa, ": ");
+            try content.appendSlice(gpa, clipUtf8(b.src, 48));
+            if (b.n > 0) try content.appendSlice(gpa, std.fmt.bufPrint(&rb, ", {d} items", .{b.n}) catch "");
+            if (b.conf >= 0) try content.appendSlice(gpa, std.fmt.bufPrint(&rb, ", conf {d:.2}", .{b.conf}) catch "");
+            try content.appendSlice(gpa, std.fmt.bufPrint(&rb, ", {d}B", .{kept.len}) catch "");
+            if (decisions[i].clipped) try content.appendSlice(gpa, ", clipped");
+            try content.append(gpa, ']');
 
             try out.appendSlice(gpa, ",{\"role\":\"system\",\"content\":");
             try appendJsonString(gpa, &out, content.items);
@@ -260,12 +273,14 @@ pub const Workspace = struct {
         try out.appendSlice(gpa, std.fmt.bufPrint(&hb, ",\"budgets\":{{\"prefix\":{d},\"varying\":{d},\"suffix\":{d}}},\"bids\":[", .{ PREFIX_BUDGET_BYTES, VARYING_BUDGET_BYTES, SUFFIX_BUDGET_BYTES }) catch return error.OutOfMemory);
         for (self.bids.items, 0..) |b, i| {
             if (i > 0) try out.append(gpa, ',');
-            var ib: [96]u8 = undefined;
+            var ib: [128]u8 = undefined;
+            var cb: [16]u8 = undefined;
             try out.appendSlice(gpa, "{\"kind\":");
             try appendJsonString(gpa, &out, b.kind.name());
             try out.appendSlice(gpa, ",\"src\":");
             try appendJsonString(gpa, &out, clipUtf8(b.src, 96));
-            try out.appendSlice(gpa, std.fmt.bufPrint(&ib, ",\"score\":{d:.2},\"n\":{d},\"bytes\":{d},\"admitted\":{},\"clipped\":{}}}", .{ b.score, b.n, decisions[i].bytes, decisions[i].admitted, decisions[i].clipped }) catch return error.OutOfMemory);
+            const conf_s: []const u8 = if (b.conf >= 0) (std.fmt.bufPrint(&cb, "{d:.2}", .{b.conf}) catch "null") else "null";
+            try out.appendSlice(gpa, std.fmt.bufPrint(&ib, ",\"score\":{d:.2},\"conf\":{s},\"n\":{d},\"bytes\":{d},\"admitted\":{},\"clipped\":{}}}", .{ b.score, conf_s, b.n, decisions[i].bytes, decisions[i].admitted, decisions[i].clipped }) catch return error.OutOfMemory);
         }
         try out.appendSlice(gpa, "]}");
         return out.toOwnedSlice(gpa);
@@ -382,6 +397,22 @@ test "pack: per-item cap clips UTF-8 safely and the receipt says so" {
     const content = parsed.value.array.items[0].object.get("content").?.string;
     try t.expect(std.mem.startsWith(u8, content, "abc\n[provenance image:")); // backed off to 3 clean bytes
     try t.expect(std.mem.indexOf(u8, content, ", clipped]") != null);
+}
+
+test "pack: measured confidence rides the receipt and the log; verifier renders after recall" {
+    const gpa = t.allocator;
+    var ws = Workspace.init(gpa);
+    defer ws.deinit();
+    ws.bid(.verifier, "memverify", "MEMORY VERIFIER — caution on fact #2", 0.92, 0, 0);
+    ws.bidConf(.recall, "hive:chat:c7", "RELEVANT MEMORY:\n1. the port is 8080", 0.60, 0, 2, 0.82);
+    var p = ws.pack("conv-c7", 5);
+    defer p.deinit(gpa);
+    const rc = std.mem.indexOf(u8, p.varying, "RELEVANT MEMORY").?;
+    const vf = std.mem.indexOf(u8, p.varying, "MEMORY VERIFIER").?;
+    try t.expect(rc < vf); // fixed order: the audit renders right after the block it audits
+    try t.expect(std.mem.indexOf(u8, p.varying, ", conf 0.82,") != null); // receipt carries the number
+    try t.expect(std.mem.indexOf(u8, p.log, "\"conf\":0.82") != null);
+    try t.expect(std.mem.indexOf(u8, p.log, "\"conf\":null") != null); // the verifier bid carries none
 }
 
 test "pack: empty workspace yields empty fragments and an empty-bids log" {

@@ -438,6 +438,19 @@ pub const Mem = struct {
         return out;
     }
 
+    /// Top-k SCORED recall via the CLI `recallscored` verb: raw JSON
+    /// {"hits":[{fact,coverage,overlap,exact,idx,contested,with}…]} for the caller to parse — numbers
+    /// cross this seam as numbers instead of prose. "" on ANY failure, which deliberately includes an
+    /// OLDER binary without the verb (unknown command → exit 2 → null) and an empty scope (exit 3),
+    /// so callers fall back to the legacy `recall` path unchanged. Caller frees.
+    pub fn recallScored(self: Mem, scope: []const u8, query: []const u8, k: u32) []u8 {
+        var kb: [12]u8 = undefined;
+        const ks = std.fmt.bufPrint(&kb, "{d}", .{k}) catch "6";
+        const out = self.run(&.{ "--json", "recallscored", scope, query, "--k", ks }) orelse
+            return self.gpa.dupe(u8, "") catch @constCast("");
+        return out;
+    }
+
     pub const ImportStats = struct { stored: u32 = 0, evicted: u64 = 0 };
 
     /// Bulk-load a fact pack (.facts/.jsonl) into `scope` via the neuron CLI `import`. Returns the stored count

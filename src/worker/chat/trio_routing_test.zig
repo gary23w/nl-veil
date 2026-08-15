@@ -67,6 +67,10 @@ const EXPECTED = [_]struct { label: []const u8, role: Role, review_gated: bool =
     .{ .label = "ctxsum", .role = .thinking },
     .{ .label = "compact", .role = .thinking },
     .{ .label = "lesson", .role = .thinking },
+    // The sentinel-gated memory-block audit: a JUDGEMENT about whether recalled facts deserve caution,
+    // and deliberately the role most likely to be a DIFFERENT model than the coder that will consume
+    // the block — a same-weights checker shares the generator's blind spots.
+    .{ .label = "memverify", .role = .thinking },
     // Both of these write a PROMPT for the next step rather than answering or reasoning about the task, which
     // is what the prompting role is for — and both are hot paths (the reformulator can fire on every
     // web_search of a research turn), so they belong on the cheap driver, not the coder.
