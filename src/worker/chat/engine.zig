@@ -25,6 +25,7 @@ const osc = @import("../oscillation.zig");
 const llm = @import("../llm.zig");
 const modelcfg = @import("modelcfg"); // a MODULE (src/worker/modelcfg.zig) — never a path import
 const cctx = @import("context.zig");
+const wsp = @import("workspace.zig"); // prompt workspace: typed bids -> fixed-order scored admission + decision log
 const builtin_mod = @import("../builtin.zig"); // the built-in engine's sentinel + LIVE served-window publication
 const cplan = @import("plan.zig");
 const cync = @import("sync.zig");
@@ -1987,14 +1988,17 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     }
     conv_buf.append(gpa, '}') catch return;
 
-    // HIPPOCAMPUS (recall): pull the facts most relevant to THIS user text from the conversation's own neuron-db
-    // — earlier turns + tool findings, including ones evicted from the visible history. Built into a standalone
-    // fragment and handed to assembleHistory, which places it AFTER the stable prefix (system + durable memory +
-    // summary + goal) and right before the recency window: recall varies with every message, and injecting it
-    // early invalidated the provider's prompt-prefix cache for everything behind it (the whole window re-billed
-    // as fresh prefill on every inference). Additive: empty/failed recall changes nothing.
-    var recall_frag: std.ArrayListUnmanaged(u8) = .empty;
-    defer recall_frag.deinit(gpa);
+    // PROMPT WORKSPACE: every non-transcript context block this turn (durable memory, tool digest/belt, image
+    // OCR, recall, corrections, family, plugin hooks, the file ledger) is a BID — typed, provenance-tagged,
+    // scored — packed ONCE into three channels under per-channel byte budgets, with the admit/drop record
+    // appended to {conv}/workspace.jsonl. Channel placement preserves the cache discipline the direct appends
+    // had: prefix blocks are turn-stable and render right after the system prompt; varying blocks land AFTER
+    // the stable prefix (system + durable memory + summary + goal) and right before the recency window — they
+    // change with every message, and injecting them early invalidated the provider's prompt-prefix cache for
+    // everything behind them (the whole window re-billed as fresh prefill on every inference); the ledger
+    // rides after the window. Additive: an empty workspace changes nothing.
+    var ws = wsp.Workspace.init(gpa);
+    defer ws.deinit();
     // THE GOAL ANCHOR, hoisted to turn scope. From the SECOND server turn onward `user_text` is not the
     // user's goal at all — it is the desk's own kick sentence ("Auto-loop armed: continue driving toward the
     // goal…"), because that is what the desk posts to re-arm. Every downstream consumer that thinks it is
@@ -2033,10 +2037,14 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
             // 700/500, the image OCR at 2800). Recall is unbounded by construction — it grows with the
             // conversation's own fact count — and this fragment rides in front of the recency window on EVERY
             // inference of the turn.
-            mem_content.appendSlice(gpa, clipBytes(recalled, 1500)) catch return;
-            recall_frag.appendSlice(gpa, ",{\"role\":\"system\",\"content\":") catch return;
-            http.jstr(gpa, &recall_frag, mem_content.items) catch return;
-            recall_frag.append(gpa, '}') catch return;
+            const shown = clipBytes(recalled, 1500);
+            mem_content.appendSlice(gpa, shown) catch return;
+            var nfacts: u32 = 0;
+            var fit = std.mem.splitScalar(u8, shown, '\n');
+            while (fit.next()) |fl| {
+                if (std.mem.trim(u8, fl, " \r\t").len > 0) nfacts += 1;
+            }
+            ws.bid(.recall, mem_scope, mem_content.items, 0.60, 0, nfacts);
         }
     }
     // BELT CORRECTION (compact tier): the previous reply claimed a belt tool is missing. The manifest sits
@@ -2054,15 +2062,13 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
                 corr.appendSlice(gpa, "BELT CORRECTION — your previous reply said you do not have `") catch return;
                 corr.appendSlice(gpa, denied) catch return;
                 corr.appendSlice(gpa, "`. That is factually wrong: it is on this turn's belt (see TOOLS ON THIS BELT above) and calling it by that exact name works. Do not repeat the claim or try to verify it with list_dir — that lists files, not tools. CALL IT NOW as your next action and read what comes back; if a missing LOGIN is what you actually meant, that is also wrong — the browser is the user's own, its sessions are already signed in, and where one is not you can ask for the credential and sign in yourself. If instead you are declining by judgment, say plainly \"I won't ...\" and give the real reason. Do not describe a choice as an inability.") catch return;
-                recall_frag.appendSlice(gpa, ",{\"role\":\"system\",\"content\":") catch return;
-                http.jstr(gpa, &recall_frag, corr.items) catch return;
-                recall_frag.append(gpa, '}') catch return;
+                ws.bid(.correction, "belt-manifest", corr.items, 0.95, 0, 0);
             }
         }
     }
     // SUB-CHAT FAMILY CONTEXT: a branch re-anchors on the primary (live goal + latest progress); a primary
     // lists its live branches. Varies per turn → rides the recall-fragment channel, never the stable prefix.
-    injectFamilyContext(app, conv, base, &recall_frag);
+    injectFamilyContext(app, conv, base, &ws);
     // PLUGIN PROMPT HOOKS: any loaded plugin's veil.on_prompt(fn) may add system-prompt text for this turn
     // (a house style, a compliance reminder, project context). Rides the per-turn recall channel — NEVER the
     // stable prefix — so the provider prompt-prefix cache is untouched (same discipline as recall above).
@@ -2074,25 +2080,19 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
             defer wrapped.deinit(gpa);
             wrapped.appendSlice(gpa, "PLUGIN CONTEXT (added by an installed extension):\n") catch {};
             wrapped.appendSlice(gpa, clipBytes(ptext, 3500)) catch {};
-            recall_frag.appendSlice(gpa, ",{\"role\":\"system\",\"content\":") catch return;
-            http.jstr(gpa, &recall_frag, wrapped.items) catch return;
-            recall_frag.append(gpa, '}') catch return;
+            ws.bid(.plugin, "plugin:on_prompt", wrapped.items, 0.50, 0, 0);
         }
     }
     // DURABLE USER MEMORY: inject the user's cross-conversation facts (keys/logins/preferences) from the shared
     // memories.jsonl — the desk's "YOUR MEMORY" block, which a server-served conv never had.
-    injectDurableMemory(app, uid, &conv_buf, compact_belt);
+    injectDurableMemory(app, uid, &ws, compact_belt);
     // TOOL-PERFORMANCE DIGEST: a compact, learned note on which tools are slow or flaky on THIS machine, so the
     // agent plans around them (waits out a cold browser, avoids a 404-ing endpoint) instead of relearning each
     // run. Fixed within this turn (computed once), so it lives in the stable prefix like durable memory. Absent
     // until enough samples accrue — a fresh machine sees nothing.
     if (toolperf.digest(gpa, app.io, app.data, turn_tools)) |dg| {
         defer gpa.free(dg);
-        if (dg.len > 0) {
-            conv_buf.appendSlice(gpa, ",{\"role\":\"system\",\"content\":") catch return;
-            http.jstr(gpa, &conv_buf, dg) catch return;
-            conv_buf.append(gpa, '}') catch return;
-        }
+        if (dg.len > 0) ws.bid(.tool_digest, "toolperf", dg, 0.55, 0, 0);
     }
     // TOOL BELT: the positive half of the same learning — the tools ranked RELIABLE-FIRST by lived
     // outcome success on this machine, blended with the neuron-db trust floor's earned cross-session
@@ -2104,11 +2104,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
         defer if (tl.len > 0) gpa.free(tl);
         if (toolperf.belt(gpa, app.io, app.data, tl, turn_tools)) |bl| {
             defer gpa.free(bl);
-            if (bl.len > 0) {
-                conv_buf.appendSlice(gpa, ",{\"role\":\"system\",\"content\":") catch return;
-                http.jstr(gpa, &conv_buf, bl) catch return;
-                conv_buf.append(gpa, '}') catch return;
-            }
+            if (bl.len > 0) ws.bid(.tool_belt, "toolperf+trust", bl, 0.55, 0, 0);
         }
     }
     // ATTACHED IMAGE (vision-as-text): the desk can attach ONE raster image this turn (image_b64 = STANDARD
@@ -2138,34 +2134,42 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
         } else {
             note.appendSlice(gpa, "ATTACHED IMAGE — the user attached an image this turn, but no text could be extracted from it (OCR unavailable, or the image carries no readable text).") catch break :attach;
         }
-        appendMsgObj(gpa, &conv_buf, "system", note.items, 3200);
+        ws.bid(.image, "pixelrag", note.items, 0.85, 3200, 0);
     }
 
-    // BOUNDED HISTORY (chat_context): instead of replaying the entire transcript (which overflowed the model
-    // window on long chats and hit an 8 MiB read cliff), project it into a fixed budget — a rolling summary of
-    // scrolled-out turns + the pinned goal + the recall fragment + a recency window of the newest turns.
-    assembleHistory(app, conv_dir, user_text, &conv_buf, recall_frag.items);
-
-    // GROUND-TRUTH PREFIX (fine-needle weave, step 0): if previous turns already wrote files, say so up
-    // front as engine fact — loaded once per turn (turn-stable, so it lives cache-safe at the prefix tail).
+    // GROUND-TRUTH LEDGER (fine-needle weave, step 0): if previous turns already wrote files, say so as
+    // engine fact — loaded once per turn. Bid into the suffix channel (renders after the recency window).
     // Without this, a "continue" turn re-discovers its own build with list_dir/read_file probes.
     if (file_ledger.files.items.len > 0) {
         var gt: std.ArrayListUnmanaged(u8) = .empty;
         defer gt.deinit(gpa);
         ledgerBlock(gpa, &file_ledger, &gt);
-        if (gt.items.len > 0) {
-            // Scratch-build then append in ONE shot: an OOM mid-append must skip the block cleanly, never
-            // strand a partial JSON object in conv_buf or abort the turn without its {done} frame.
-            var frag: std.ArrayListUnmanaged(u8) = .empty;
-            defer frag.deinit(gpa);
-            _ = blk_gt: {
-                frag.appendSlice(gpa, ",{\"role\":\"system\",\"content\":") catch break :blk_gt false;
-                http.jstr(gpa, &frag, std.mem.trim(u8, gt.items, " \n")) catch break :blk_gt false;
-                frag.append(gpa, '}') catch break :blk_gt false;
-                conv_buf.appendSlice(gpa, frag.items) catch break :blk_gt false;
-                break :blk_gt true;
-            };
-        }
+        if (gt.items.len > 0)
+            ws.bid(.ledger, "file-ledger", std.mem.trim(u8, gt.items, " \n"), 0.90, 0, @intCast(@min(file_ledger.files.items.len, std.math.maxInt(u32))));
+    }
+
+    // PACK THE WORKSPACE: one deterministic admission pass over every bid above — fixed render order,
+    // per-channel byte budgets, whole-block drops (lowest score first), a provenance receipt on each
+    // block — then splice the channels around the bounded history and append the decision line to
+    // {conv}/workspace.jsonl (best-effort: the turn never fails on its own audit trail).
+    var ws_packed = ws.pack(conv, nowSecs(app.io));
+    defer ws_packed.deinit(gpa);
+    conv_buf.appendSlice(gpa, ws_packed.prefix) catch {};
+
+    // BOUNDED HISTORY (chat_context): instead of replaying the entire transcript (which overflowed the model
+    // window on long chats and hit an 8 MiB read cliff), project it into a fixed budget — a rolling summary of
+    // scrolled-out turns + the pinned goal + the varying workspace channel + a recency window of the newest turns.
+    assembleHistory(app, conv_dir, user_text, &conv_buf, ws_packed.varying);
+    conv_buf.appendSlice(gpa, ws_packed.suffix) catch {};
+
+    if (ws_packed.log.len > 0) {
+        if (std.fmt.allocPrint(gpa, "{s}\n", .{ws_packed.log})) |wl| {
+            defer gpa.free(wl);
+            if (std.fmt.allocPrint(gpa, "{s}/workspace.jsonl", .{conv_dir})) |wp| {
+                defer gpa.free(wp);
+                http.appendFile(app.io, gpa, wp, wl) catch {};
+            } else |_| {}
+        } else |_| {}
     }
 
     // HIPPOCAMPUS (observe): the user's own turn is durable knowledge — store it so a later turn can recall it.
@@ -3710,13 +3714,13 @@ fn lastAssistantNote(app: *App, conv_dir: []const u8) ?[]u8 {
     return best;
 }
 
-/// SUB-CHAT FAMILY CONTEXT, appended to the per-turn recall fragment (the varying channel — never the
-/// stable prefix). A branch turn re-anchors on the PRIMARY live each turn: its goal plus its latest
-/// progress, so the branch follows one angle without losing the trunk — and it stays current as the
-/// primary moves, unlike a one-shot seed at branch creation. A primary with live branches gets them
-/// listed. Memory itself is shared structurally (scopeFamilyBase across-recall); this block is the
-/// CONVERSATIONAL half of "they must know the primary chat context".
-fn injectFamilyContext(app: *App, conv: []const u8, base: []const u8, recall_frag: *std.ArrayListUnmanaged(u8)) void {
+/// SUB-CHAT FAMILY CONTEXT, bid into the varying workspace channel (never the stable prefix). A branch
+/// turn re-anchors on the PRIMARY live each turn: its goal plus its latest progress, so the branch
+/// follows one angle without losing the trunk — and it stays current as the primary moves, unlike a
+/// one-shot seed at branch creation. A primary with live branches gets them listed. Memory itself is
+/// shared structurally (scopeFamilyBase across-recall); this block is the CONVERSATIONAL half of "they
+/// must know the primary chat context".
+fn injectFamilyContext(app: *App, conv: []const u8, base: []const u8, ws: *wsp.Workspace) void {
     const gpa = app.gpa;
     var block: std.ArrayListUnmanaged(u8) = .empty;
     defer block.deinit(gpa);
@@ -3766,9 +3770,7 @@ fn injectFamilyContext(app: *App, conv: []const u8, base: []const u8, recall_fra
             block.appendSlice(gpa, ". Their findings are already in this conversation's shared memory (recall), and their files land in this same workspace.") catch return;
     }
     if (block.items.len == 0) return;
-    recall_frag.appendSlice(gpa, ",{\"role\":\"system\",\"content\":") catch return;
-    http.jstr(gpa, recall_frag, block.items) catch return;
-    recall_frag.append(gpa, '}') catch return;
+    ws.bid(.family, "chat-family", block.items, 0.70, 0, 0);
 }
 
 fn firstUserGoal(app: *App, conv_dir: []const u8) ?[]u8 {
@@ -7754,7 +7756,7 @@ fn readDurable(app: *App, uid: u64) ?[]u8 {
 
 /// Inject the user's durable memory as a "YOUR MEMORY" system message right after the recall block. Additive: an
 /// absent/empty store leaves conv_buf unchanged.
-fn injectDurableMemory(app: *App, uid: u64, conv_buf: *std.ArrayListUnmanaged(u8), compact: bool) void {
+fn injectDurableMemory(app: *App, uid: u64, ws: *wsp.Workspace, compact: bool) void {
     const gpa = app.gpa;
     const data = readDurable(app, uid) orelse return;
     defer gpa.free(data);
@@ -7774,6 +7776,7 @@ fn injectDurableMemory(app: *App, uid: u64, conv_buf: *std.ArrayListUnmanaged(u8
     const M = struct { cat: []const u8 = "", text: []const u8 = "" };
     var any = false;
     var withheld: usize = 0;
+    var injected: u32 = 0;
     for (slices.items[from..]) |ln| {
         const p = std.json.parseFromSlice(M, gpa, ln, .{ .ignore_unknown_fields = true }) catch continue;
         defer p.deinit();
@@ -7802,6 +7805,7 @@ fn injectDurableMemory(app: *App, uid: u64, conv_buf: *std.ArrayListUnmanaged(u8
         } else block.appendSlice(gpa, tx) catch break;
         block.append(gpa, '\n') catch break;
         any = true;
+        injected += 1;
     }
     if (!any) return;
     // The footer must name only tools the caller's belt ACTUALLY advertises. It used to name get_credential
@@ -7812,9 +7816,7 @@ fn injectDurableMemory(app: *App, uid: u64, conv_buf: *std.ArrayListUnmanaged(u8
     // insisting it could not reach a credential the user had already pasted into the chat. On the compact
     // belt the honest instruction is to ask, which is also this tier's stated design intent.
     if (withheld > 0) block.appendSlice(gpa, if (compact) WITHHELD_FOOTER_COMPACT else WITHHELD_FOOTER_FULL) catch {};
-    conv_buf.appendSlice(gpa, ",{\"role\":\"system\",\"content\":") catch return;
-    http.jstr(gpa, conv_buf, block.items) catch return;
-    conv_buf.append(gpa, '}') catch return;
+    ws.bid(.durable_memory, "memories.jsonl", block.items, 0.90, 0, injected);
 }
 
 /// True if `fact` (trimmed) is already stored — exact text match against the durable store (dedup).
@@ -8120,7 +8122,7 @@ fn seedLines(app: *App, conv_buf: *std.ArrayListUnmanaged(u8), bytes: []const u8
 /// of turns that have scrolled out of the recency window, the pinned original goal, and the recency window itself.
 /// Replaces "replay the whole transcript". Best-effort: any read/parse/summary failure degrades to less context,
 /// never a crash — the turn still runs on the system prompt + recall + whatever seeded.
-fn assembleHistory(app: *App, conv_dir: []const u8, user_text: []const u8, conv_buf: *std.ArrayListUnmanaged(u8), recall_frag: []const u8) void {
+fn assembleHistory(app: *App, conv_dir: []const u8, user_text: []const u8, conv_buf: *std.ArrayListUnmanaged(u8), varying_frag: []const u8) void {
     const gpa = app.gpa;
     const mpath = std.fmt.allocPrint(gpa, "{s}/messages.jsonl", .{conv_dir}) catch return;
     defer gpa.free(mpath);
@@ -8153,9 +8155,10 @@ fn assembleHistory(app: *App, conv_dir: []const u8, user_text: []const u8, conv_
     // PINNED GOAL: the conversation's first user message anchors the arc even after it scrolls out of the window.
     if (view.goal_line.len > 0) seedLines(app, conv_buf, view.goal_line, cctx.GOAL_PIN_CAP);
 
-    // RELEVANCE RECALL (varies per message): placed here — after the stable prefix, before the window — so the
-    // provider's prompt-prefix cache keeps hitting on system + memory + summary + goal across inferences.
-    if (recall_frag.len > 0) conv_buf.appendSlice(gpa, recall_frag) catch {};
+    // VARYING WORKSPACE CHANNEL (recall, corrections, family, plugin — varies per message): placed here —
+    // after the stable prefix, before the window — so the provider's prompt-prefix cache keeps hitting on
+    // system + memory + summary + goal across inferences.
+    if (varying_frag.len > 0) conv_buf.appendSlice(gpa, varying_frag) catch {};
 
     // RECENCY WINDOW: replay the newest complete turns verbatim (includes the just-appended user message).
     seedLines(app, conv_buf, view.window, cctx.HISTORY_WINDOW_BYTES);

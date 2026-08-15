@@ -44,6 +44,7 @@ test {
     _ = @import("worker/chat/toolperf.zig");
     _ = @import("worker/chat/tools.zig"); // the shared tool endpoint: the admin-only capability gate
     _ = @import("worker/chat/trio_routing_test.zig"); // label->role routing guard (reads engine.zig as source)
+    _ = @import("worker/chat/workspace.zig"); // prompt workspace: fixed-order scored admission + decision log
     _ = @import("plan/billing_seam.zig"); // the upgrade pitch advertises what the pro row actually grants
     _ = @import("plan/entitlements.zig"); // the plan -> caps wall
     _ = @import("plan/neurons.zig"); // the metered-AI spend ledger
