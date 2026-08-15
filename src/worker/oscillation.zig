@@ -370,6 +370,11 @@ pub const Mem = struct {
         // survived because its only consumer (run.zig's mock path) reads `if (facts > 0) facts else
         // round` and the fallback made the always-0 invisible. It also silently disabled a test's
         // liveness probe, which is how it finally surfaced (ledger 0063).
+        // Consolidation contradiction marking rides INSIDE the new CLI's observe (its default), so this
+        // argv must stay flag-free: an older binary would store an unknown flag as part of the FACT TEXT
+        // (the pollution class this file exists to prevent). New binary = marks land in the
+        // {scope}::contested sidecar for scored recall; old binary = no marks, and no recallscored to
+        // read them either. jsonUint's field scan tolerates both output shapes.
         const out = self.run(&.{ "--json", "observe", scope, clean }) orelse return 0;
         defer self.gpa.free(out);
         return jsonUint(out, "\"wrote\":");
