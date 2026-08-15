@@ -68,7 +68,8 @@
       { p: 'worker/chat/paths', c: 'CH-06', t: 'Paths — conversation id to build-tree mapping', s: 'chat/paths.zig' },
       { p: 'worker/chat/plan', c: 'CH-07', t: 'Plan board — the durable per-conversation plan', s: 'chat/plan.zig' },
       { p: 'worker/chat/sync', c: 'CH-08', t: 'Workdir sync — the shared protocol pieces', s: 'chat/sync.zig' },
-      { p: 'worker/chat/toolperf', c: 'CH-09', t: 'Tool perf — per-machine learned tool behavior', s: 'chat/toolperf.zig' }
+      { p: 'worker/chat/toolperf', c: 'CH-09', t: 'Tool perf — per-machine learned tool behavior', s: 'chat/toolperf.zig' },
+      { p: 'worker/chat/workspace', c: 'CH-10', t: 'Prompt workspace — scored admission, provenance receipts, decision log', s: 'chat/workspace.zig' }
     ]},
     { key: 'worker/browser/', label: 'WORKER · BROWSER — THE DRIVER', docs: [
       { p: 'worker/browser/manager', c: 'BR-01', t: 'Manager — the process-global browser-session registry', s: 'browser/manager.zig' },
