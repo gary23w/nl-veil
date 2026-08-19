@@ -346,6 +346,14 @@ pub const Worker = struct {
     // until they are grounded. This is the anti-hallucination gate: a swarm that would otherwise ship a
     // fabricated specific (a version, a URL, a phone number) is driven to web_search it or keep it marked.
     ungrounded: bool = false,
+    // Run-wide live-fetch ledger for the attempted-and-failed backstop (markDeliverableGaps): tried
+    // counts LIVE attempts (a RAG-first interception is NOT one — see classifyFetch), ok counts those
+    // that returned real live content. tried>0 && ok==0 = the swarm reached for external grounding and
+    // got none, the state where a weak model fabricates from memory. Atomics: moments run concurrently
+    // in one Io.Group and increment from moment threads (the same reason last_progress is atomic); the
+    // engine-driven scout fetches count here too — in the observed failure they were the ONLY attempts.
+    fetch_tried: std.atomic.Value(u32) = .init(0),
+    fetch_ok: std.atomic.Value(u32) = .init(0),
     stop_now: bool = false,
     stop_why: []const u8 = "completed",
     space: []const u8 = "",
@@ -4806,7 +4814,12 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
                     gpa.free(cap);
                 }
             }
-            if (mi.scout and (std.mem.eql(u8, c.name, "web_search") or std.mem.eql(u8, c.name, "read_url") or std.mem.eql(u8, c.name, "fetch_json") or std.mem.eql(u8, c.name, "web_fetch"))) web_calls += 1;
+            if (mi.scout and isFetchTool(c.name)) web_calls += 1;
+            // RUN-WIDE GROUNDING LEDGER (the attempted-and-failed backstop in markDeliverableGaps).
+            // deep_crawl is live web work too — a run that grounded through a crawl must not read as
+            // "never fetched" (it stays out of isFetchTool, whose other caller is the scout web_calls
+            // counter with its own semantics).
+            if (isFetchTool(c.name) or std.mem.eql(u8, c.name, "deep_crawl")) noteFetch(w, result);
             if (std.mem.eql(u8, c.name, "read_url") or std.mem.eql(u8, c.name, "fetch_json") or std.mem.eql(u8, c.name, "web_fetch")) {
                 if (urlFromArgs(c.args)) |u| {
                     if (fetched_url.len > 0) gpa.free(@constCast(fetched_url));
@@ -4884,6 +4897,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
         qargs.appendSlice(gpa, "}") catch {};
         const sres = tools.execute(&ctx, "web_search", qargs.items);
         defer gpa.free(sres);
+        noteFetch(w, sres); // engine-driven fetches feed the grounding ledger too — see noteFetch
         w.act(mi.name, round, "scout_search", qstr, clip(sres, 200));
         const topic_src = if (w.goal_brief.len > 0) w.goal_brief else qstr;
         if (resultOnTopic(topic_src, sres)) {
@@ -4895,6 +4909,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
                 uargs.appendSlice(gpa, "}") catch {};
                 const page = tools.execute(&ctx, "read_url", uargs.items);
                 defer gpa.free(page);
+                noteFetch(w, page);
                 const dom = urlDomain(url) orelse "web";
                 // the trust class MUST equal what class_of derives from the note tag (first token, lowercased),
                 // so tag notes `[src:<dom>] …` and reward the same `src:<dom>` (a mismatch makes trust a no-op).
@@ -5979,6 +5994,54 @@ fn fetchSucceeded(result: []const u8) bool {
     const fail_prefixes = [_][]const u8{ "blocked", "bad ", "oom", "read_url is disabled", "osint_scan is disabled" };
     for (fail_prefixes) |p| if (std.mem.startsWith(u8, t, p)) return false;
     return true;
+}
+
+const FetchOutcome = enum { intercepted, live_ok, live_fail };
+
+/// Classify one fetch RESULT for the grounding ledger (w.fetch_tried/fetch_ok). Three outcomes, and the
+/// distinction is what keeps the backstop's scoping honest:
+///   intercepted — the RAG-first policy answered a web_search from the LOCAL store and the query never
+///                 went live. Neither an attempt nor a success: counting cache service as a "failed
+///                 attempt" would arm the backstop on runs that needed no live data at all (the
+///                 over-trigger attempted-and-failed scoping exists to avoid).
+///   live_fail   — the web WAS tried and returned nothing/blocked/error. This includes the
+///                 tools.RAG_WEB_EMPTY_MARK shape (local hits shown, live half empty), which also
+///                 starts with "LOCAL RAG" — telling those two apart is the whole job here, and the
+///                 marker is a pub const in tools.zig so the message and this classifier move together.
+///   live_ok     — real live content landed (a LOCAL-RAG block carrying a "--- WEB RESULTS ---" section
+///                 counts: the web half is genuine).
+fn classifyFetch(result: []const u8) FetchOutcome {
+    const t = std.mem.trim(u8, result, " \r\n\t");
+    if (std.mem.startsWith(u8, t, tools.RAG_WEB_EMPTY_MARK)) return .live_fail;
+    if (std.mem.startsWith(u8, t, "LOCAL RAG") and std.mem.indexOf(u8, t, "--- WEB RESULTS ---") == null) return .intercepted;
+    return if (fetchSucceeded(result)) .live_ok else .live_fail;
+}
+
+/// Fold one fetch result into the run-wide grounding ledger. Called from BOTH fetch surfaces: the
+/// moment tool loop AND the engine-driven scout searches (run.zig's own web_search/read_url calls) —
+/// in the observed fabrication run the scout path held the only attempts, so a tool-loop-only ledger
+/// read "never tried" and the backstop stayed dark.
+fn noteFetch(w: *Worker, result: []const u8) void {
+    switch (classifyFetch(result)) {
+        .intercepted => {},
+        .live_ok => {
+            _ = w.fetch_tried.fetchAdd(1, .monotonic);
+            _ = w.fetch_ok.fetchAdd(1, .monotonic);
+        },
+        .live_fail => _ = w.fetch_tried.fetchAdd(1, .monotonic),
+    }
+}
+
+fn isFetchTool(name: []const u8) bool {
+    return std.mem.eql(u8, name, "web_search") or std.mem.eql(u8, name, "read_url") or
+        std.mem.eql(u8, name, "fetch_json") or std.mem.eql(u8, name, "web_fetch");
+}
+
+/// The attempted-and-failed scope for the grounding backstop: research was reached for (>=1 live fetch
+/// attempt) and NONE returned live content, on an internet run. Pure so the scoping is locked by test —
+/// it must NOT fire when no fetch was tried (a task needing none) nor when any fetch succeeded.
+fn attemptedAndFailed(internet: bool, fetch_tried: u32, fetch_ok: u32) bool {
+    return internet and fetch_tried > 0 and fetch_ok == 0;
 }
 
 fn extractFact(gpa: std.mem.Allocator, monologue: []const u8, goal: []const u8, round: u32) []u8 {
@@ -7729,13 +7792,52 @@ fn markIncomplete(w: *Worker, round: u32) void {
         w.act("engine", round, "incomplete", "built but still a FIRST PART — a builder will keep appending until finished", w.incomplete_str);
 }
 
+/// True when at least one blueprint deliverable file exists in work/ with real content — the
+/// "a deliverable was produced" half of the attempted-and-failed backstop when the goal names no paths.
+fn anyDeliverableBuilt(w: *Worker) bool {
+    const gpa = w.gpa;
+    if (w.blueprint.len == 0) return false;
+    var it = std.mem.splitScalar(u8, w.blueprint, '\n');
+    while (it.next()) |ln| {
+        const bp = bpPath(ln) orelse continue;
+        const fp = std.fmt.allocPrint(gpa, "{s}/work/{s}", .{ w.run_dir, bp }) catch continue;
+        defer gpa.free(fp);
+        const data = std.Io.Dir.cwd().readFileAlloc(w.io, fp, gpa, .limited(4 << 10)) catch "";
+        defer if (data.len > 0) gpa.free(data);
+        if (std.mem.trim(u8, data, " \r\n\t").len > 40 and !truncPending(w, bp)) return true;
+    }
+    return false;
+}
+
+/// Set the per-round grounding directive (injected via strategy_str) for the attempted-and-failed
+/// backstop — no specific files named, because a fabricated specific carries no UNVERIFIED marker to
+/// point at. Refined-retry is the instruction, since the failure was a fetch that returned nothing.
+fn setBackstopDirective(w: *Worker, round: u32) void {
+    const gpa = w.gpa;
+    w.act("engine", round, "ungrounded", "this run reached for external facts and every live fetch failed — the deliverable's specifics are unverified", "attempted-and-failed backstop");
+    const gd = gpa.dupe(u8,
+        "GROUNDING REQUIRED — this run tried to fetch external facts and EVERY live fetch came back empty, yet the deliverable states specifics. Those specifics are UNVERIFIED and this run will NOT finish until they are grounded. THIS round: web_search with REFINED queries (fewer, different words), then read_url the best result to fetch the real value. If a value genuinely cannot be fetched, write it as UNVERIFIED. Do NOT state any specific (a version, date, URL, email, phone number, price) from memory — a fabricated specific is a failure.") catch return;
+    if (w.strategy_str.len > 0) gpa.free(@constCast(w.strategy_str));
+    w.strategy_str = gd;
+}
+
 fn markDeliverableGaps(w: *Worker, goal: []const u8, round: u32) void {
     const gpa = w.gpa;
+    // ATTEMPTED-AND-FAILED backstop signal (see w.fetch_tried/fetch_ok): the swarm reached for external
+    // grounding (>=1 live fetch call) and NOT ONE returned live content. Self-scoping — a task needing no
+    // fetch never tries, a task that fetched successfully has fetch_ok > 0 — so it fires only on the exact
+    // pathology where a weak model fabricates a specific after its fetches came up empty. Internet-only.
+    const attempted_failed = attemptedAndFailed(w.internet, w.fetch_tried.load(.monotonic), w.fetch_ok.load(.monotonic));
+
     var n: u32 = 0;
     const tree = extractGoalPaths(gpa, goal, &n);
     defer gpa.free(@constCast(tree));
     if (n == 0) {
+        // No goal-named deliverable paths — nothing to mark missing, but the backstop still guards a
+        // blueprint-produced deliverable (e.g. a "research and write it up" cast that names no file).
         w.deliverable_missing = false;
+        w.ungrounded = attempted_failed and anyDeliverableBuilt(w);
+        if (w.ungrounded) setBackstopDirective(w, round);
         return;
     }
     var missing: std.ArrayListUnmanaged(u8) = .empty;
@@ -7748,6 +7850,7 @@ fn markDeliverableGaps(w: *Worker, goal: []const u8, round: u32) void {
     var unverified: std.ArrayListUnmanaged(u8) = .empty;
     defer unverified.deinit(gpa);
     var unv_n: u32 = 0;
+    var present_n: u32 = 0; // required files that exist with content (the "a deliverable was produced" test)
     var it = std.mem.splitScalar(u8, tree, '\n');
     while (it.next()) |ln| {
         const bp = bpPath(ln) orelse continue;
@@ -7757,6 +7860,7 @@ fn markDeliverableGaps(w: *Worker, goal: []const u8, round: u32) void {
         defer if (data.len > 0) gpa.free(data);
         const t = std.mem.trim(u8, data, " \r\n\t");
         if (t.len > 40 and !truncPending(w, bp)) {
+            present_n += 1;
             if (w.internet and std.ascii.indexOfIgnoreCase(t, "UNVERIFIED") != null) {
                 if (unv_n > 0) unverified.appendSlice(gpa, ", ") catch {};
                 unverified.appendSlice(gpa, bp) catch {};
@@ -7769,7 +7873,9 @@ fn markDeliverableGaps(w: *Worker, goal: []const u8, round: u32) void {
         miss_n += 1;
     }
     w.deliverable_missing = miss_n > 0;
-    w.ungrounded = unv_n > 0;
+    // ungrounded = a marked UNVERIFIED fact (the honest case), OR the attempted-and-failed backstop once
+    // at least one required file exists (the confident-fabrication case the token gate cannot see).
+    w.ungrounded = unv_n > 0 or (attempted_failed and present_n > 0);
     if (miss_n == 0) {
         // MISSING files take priority (write them first); grounding is the next-highest directive once
         // every required file at least exists. A fabricated specific is worse than an admitted gap, so
@@ -7780,6 +7886,8 @@ fn markDeliverableGaps(w: *Worker, goal: []const u8, round: u32) void {
             const gd = std.fmt.allocPrint(gpa, "GROUNDING REQUIRED — these deliverables still contain UNVERIFIED external facts: {s}. This run will NOT finish while any UNVERIFIED remains. THIS round: web_search / read_url to fetch each unverified value from a real source, then replace UNVERIFIED with the fetched value and record its URL in sources. Do NOT invent a value from memory — a fabricated specific (a version, a URL, an email, a phone number) is a failure; fetch it or leave it UNVERIFIED.", .{unv}) catch return;
             if (w.strategy_str.len > 0) gpa.free(@constCast(w.strategy_str));
             w.strategy_str = gd;
+        } else if (attempted_failed and present_n > 0) {
+            setBackstopDirective(w, round); // fabrication with no UNVERIFIED marker — the token gate is blind here
         }
         return;
     }
@@ -10625,6 +10733,37 @@ test "assignSlot: a team-3 internet cast reserves mind 1 as the scout, and the t
     try std.testing.expectEqualStrings("sources.md", s2); // qa (rank 1, scout skipped) builds file 1
     // Every declared file has a builder: the union of the non-scout assignments covers the blueprint.
     try std.testing.expect(s0.len > 0 and s2.len > 0 and !std.mem.eql(u8, s0, s2));
+}
+
+test "grounding backstop scope: fires ONLY when a live fetch was tried and none succeeded, internet on" {
+    // The whole point of "attempted and failed" scoping: no false positive on a task that needed no
+    // fetch (never tried), or one that fetched successfully.
+    try std.testing.expect(attemptedAndFailed(true, 3, 0)); // tried 3, grounded 0 → the pathology
+    try std.testing.expect(attemptedAndFailed(true, 1, 0)); // one failed attempt is enough
+    try std.testing.expect(!attemptedAndFailed(true, 0, 0)); // never tried → not our case (needed no fetch)
+    try std.testing.expect(!attemptedAndFailed(true, 5, 1)); // one live fetch landed → grounded
+    try std.testing.expect(!attemptedAndFailed(false, 3, 0)); // offline can't fetch → UNVERIFIED is honest
+}
+
+test "classifyFetch: interception is NEITHER tried nor failed; web-empty IS a failed live attempt" {
+    // The three-way split IS the scoping. A RAG-first short-circuit (the query never went live) must
+    // count as NOTHING — scoring it as a failed attempt would arm the backstop on a run that needed no
+    // live data (the over-trigger this design exists to avoid)…
+    const local_only = "LOCAL RAG (nl-rag + hive) answered this — checked FIRST per policy; cite these:\n" ++ ("f" ** 200);
+    try std.testing.expectEqual(FetchOutcome.intercepted, classifyFetch(local_only));
+    // …while the RAG_WEB_EMPTY shape ALSO starts with "LOCAL RAG" but means the web WAS tried and gave
+    // nothing — the exact result the observed fabrication followed. It must score as a failed attempt;
+    // the marker is a tools.zig pub const so the message and this classifier cannot drift apart.
+    const web_empty = tools.RAG_WEB_EMPTY_MARK ++ " for this query):\n" ++ ("f" ** 200);
+    try std.testing.expectEqual(FetchOutcome.live_fail, classifyFetch(web_empty));
+    // local hits + a real web section = genuine live grounding
+    const local_plus_web = "LOCAL RAG (nl-rag + hive) — checked first:\nsome local\n\n--- WEB RESULTS ---\n" ++ ("w" ** 200);
+    try std.testing.expectEqual(FetchOutcome.live_ok, classifyFetch(local_plus_web));
+    try std.testing.expectEqual(FetchOutcome.live_ok, classifyFetch("x" ** 200)); // plain real content
+    // empty / error-shaped results are failed live attempts
+    try std.testing.expectEqual(FetchOutcome.live_fail, classifyFetch("(no results for this query.)"));
+    try std.testing.expectEqual(FetchOutcome.live_fail, classifyFetch("blocked by robots"));
+    try std.testing.expectEqual(FetchOutcome.live_fail, classifyFetch("short")); // under the length floor
 }
 
 test "assignSlot: same-basename siblings advance independently, and a nested mid-chunk file stays frontier work" {

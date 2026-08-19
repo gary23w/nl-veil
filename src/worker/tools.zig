@@ -5953,6 +5953,12 @@ pub fn searchWeb(io: std.Io, gpa: std.mem.Allocator, environ: *const std.process
     return enriched;
 }
 
+/// Marker prefix for a web_search whose LIVE half returned nothing (local hits shown instead). run.zig's
+/// grounding ledger (classifyFetch) keys on this exact prefix to score the call as a FAILED LIVE ATTEMPT —
+/// distinct from the "LOCAL RAG … answered this" short-circuit, where the query never went live at all.
+/// Change the message and the classifier together, or the backstop mis-counts.
+pub const RAG_WEB_EMPTY_MARK = "LOCAL RAG (live web returned nothing";
+
 /// Freshness cues in a query mean the LOCAL RAG must NOT short-circuit the web: a "latest/current/today/news"
 /// question needs live sources even when the hive holds solid background on the topic. Everything else is
 /// stable knowledge the RAG database can legitimately answer without a web round-trip.
@@ -6032,7 +6038,7 @@ fn webSearch(ctx: *ToolCtx, args_json: []const u8) []u8 {
         // A fetch that came back empty is the exact moment a weak model fabricates: it falls back to its
         // own memory and states a guessed specific as fact (observed live — an empty Zig-version search
         // became a confidently WRONG "0.14.0"). Say plainly that the gap is NOT to be filled from memory.
-        if (local.items.len > 0) return std.fmt.allocPrint(gpa, "LOCAL RAG (live web returned nothing for this query):\n{s}\n\nThe live web gave no result. Do NOT fill any missing specific (a version, date, URL, email, phone) from memory — REFINE the query and web_search again, or write the fact as UNVERIFIED. A guessed specific is a failure.", .{clip(local.items, 3600)}) catch dupe(gpa, "local");
+        if (local.items.len > 0) return std.fmt.allocPrint(gpa, RAG_WEB_EMPTY_MARK ++ " for this query):\n{s}\n\nThe live web gave no result. Do NOT fill any missing specific (a version, date, URL, email, phone) from memory — REFINE the query and web_search again, or write the fact as UNVERIFIED. A guessed specific is a failure.", .{clip(local.items, 3600)}) catch dupe(gpa, "local");
         return dupe(gpa, "(no results for this query.) Do NOT answer from memory — REFINE the query and web_search again (fewer/different words), or if the fact cannot be fetched write it as UNVERIFIED rather than guessing. A fabricated specific (version, date, URL, email, phone) is worse than an admitted gap.");
     }
     // Prepend local hits ONLY when they actually cover this query — the same bar the short-circuit uses.
