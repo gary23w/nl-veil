@@ -38,6 +38,11 @@ const cctx = @import("chat/context.zig");
 const log = std.log.scoped(.worker);
 
 const MindSpec = struct { name: []const u8 = "mind", role: []const u8 = "", duty: []const u8 = "", lead: bool = false };
+
+/// The scout's browser belt: the four load-bearing verbs (navigate/read/click/type), filtered from the full
+/// BROWSER_SCHEMA by the same compactAllowed set the small tier uses. A module const so the comptime filter
+/// folds to one static string, spliced into the scout's live schema when the browser driver is on.
+const SCOUT_BROWSER_SCHEMA = ",\n" ++ tools.compactSchema(tools.BROWSER_SCHEMA);
 const Manifest = struct {
     swarm: []const u8 = "swarm",
     provider: []const u8 = "mock",
@@ -80,8 +85,28 @@ const Manifest = struct {
 };
 
 /// One tracked tool-call signature for the per-mind loop guard: sig = hash(name+args),
-/// res = hash of the last result, count = consecutive identical call+result repeats.
-pub const GuardRec = struct { sig: u64 = 0, res: u64 = 0, count: u8 = 0 };
+/// res = hash of the last result, count = consecutive identical call+result repeats. `probe` marks a
+/// side-effect-free read-class signature (read_file/list_dir): between rounds its count is capped back to
+/// one-below-limit so a wedged read re-executes ONCE per round. Teammates mutate the shared workdir in
+/// parallel, so "returned the identical result last round" says nothing about THIS round — and a refusal
+/// never executes, so without the probe the guard could never observe the change that should disarm it:
+/// "it will not return anything different" was a self-fulfilling prophecy (the REVIEW/QA lane reads the
+/// CURRENT build with the same call every round; six stable rounds wedged it blind for the rest of the run).
+pub const GuardRec = struct { sig: u64 = 0, res: u64 = 0, count: u8 = 0, probe: bool = false };
+
+/// The guard's refusal thresholds (identical call + identical result repeats before refusing). Read-class
+/// tools degrade later — a mind mid-edit legitimately re-reads its file for SEARCH/REPLACE lines (the
+/// c6a5937fe lesson); module-level so the between-rounds probe decay and the tests agree on the numbers.
+pub const GUARD_LIMIT: u8 = 3;
+pub const GUARD_LIMIT_READ: u8 = 6;
+
+/// Consecutive refusal-bearing turns that end a MOMENT early — the swarm-side twin of the chat engine's
+/// LOOP_STOP_REFUSALS. A turn whose calls drew a guard refusal is one strike; a refusal-free turn that
+/// executed something clears the streak; the third straight strike settles the moment honestly. Refusing a
+/// call is not ending a loop: a mind that keeps driving refused signatures burns a full inference per turn
+/// to receive the identical refusal bytes again, and for a small local model a growing run of identical
+/// (call, refusal) pairs in conv is a repetition attractor, not a corrective.
+pub const MOMENT_STOP_STRIKES: u8 = 3;
 
 pub const MindState = struct {
     name: []const u8,
@@ -91,7 +116,8 @@ pub const MindState = struct {
     lane: []const u8 = "",
     lane_owned: bool = false,
     // TOOL-LOOP GUARD: identical calls that keep returning identical results are a loop, not work. Mind-local
-    // (moments for one mind are sequential), survives rounds so a cross-round echo is caught too.
+    // (moments for one mind are sequential), survives rounds so a cross-round echo is caught too; probe
+    // (read-class) slots decay one execution's worth between rounds — see GuardRec.
     guard: [24]GuardRec = @splat(.{}),
     scout: bool = false,
     stances: std.ArrayListUnmanaged([]const u8) = .empty,
@@ -302,6 +328,18 @@ pub const Worker = struct {
     gateway_model: []const u8 = "",
     gw_base: []const u8 = "",
     gw_key: []const u8 = "",
+    // LOCAL fallback rung (completeAdaptive): when a CLOUD primary+gateway call fails with a network/offline
+    // error, a local model keeps the mind working. The observed dead rounds were a cloud-only swarm whose
+    // gateway was ALSO cloud, so a blip stalled every mind — this rung is the missing offline lane. Resolved
+    // once in run(); local_model == "" disables it (a swarm already running locally needs no local rung).
+    local_base: []const u8 = "",
+    local_key: []const u8 = "",
+    local_model: []const u8 = "",
+    // Web-browser driver offered to this run's minds — the scout gets the four core verbs (navigate/read/
+    // click/type), full/operate minds the full set. Default ON when internet is up: sessions are created
+    // lazily on the first browser_* call, so an unused belt costs nothing and a machine with no browser
+    // degrades to a graceful per-call error. NL_BROWSER_DRIVER=0/false turns it off.
+    browser: bool = false,
     digest_str: []const u8 = "",
     state_str: []const u8 = "",
     // STRUCTURED PROGRESS CHECKPOINT — a compact, engine-tracked ground-truth record of the LAST round
@@ -882,6 +920,20 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
     w.gw_base = if (m.gateway_base_url.len > 0) m.gateway_base_url else base_url;
     w.gw_key = if (m.gateway_key.len > 0) m.gateway_key else if (m.gateway_base_url.len > 0) "gateway-local" else key;
     if (m.gateway_model.len > 0) w.act("engine", 0, "gateway", m.gateway_model, std.fmt.allocPrint(gpa, "mechanical engine calls (digest/retro/gap/flare/classify/screen) routed through the gateway model{s}{s}; the reasoning minds keep the main model", .{ if (m.gateway_base_url.len > 0) " @ " else "", if (m.gateway_base_url.len > 0) m.gateway_base_url else "" }) catch m.gateway_model);
+    // LOCAL fallback endpoint. Explicit env wins; the base defaults to Ollama's OpenAI-compatible port and
+    // the model to the published built-in weights (the-veil-12b) — but ONLY when the primary is a CLOUD
+    // model, since a local primary needs no local rung. isLocal() on the resolved base keeps a local call
+    // exempt from the offline gate, so this rung actually runs with the uplink down.
+    w.local_base = if (environ.get("NL_LOCAL_BASE_URL")) |u| (if (u.len > 0) u else "http://127.0.0.1:11434/v1") else "http://127.0.0.1:11434/v1";
+    w.local_key = if (environ.get("NL_LOCAL_KEY")) |k| (if (k.len > 0) k else "ollama") else "ollama";
+    w.local_model = if (environ.get("NL_LOCAL_MODEL")) |lm| lm else (if (llm.isLocal(base_url)) "" else "the-veil-12b");
+    if (w.local_model.len > 0) w.act("engine", 0, "local_fallback", w.local_model, std.fmt.allocPrint(gpa, "offline lane armed: if the cloud model is unreachable, minds fall back to {s} @ {s} so a network blip stops burning dead rounds", .{ w.local_model, w.local_base }) catch w.local_model);
+    // The browser driver: default ON when online (lazy sessions, graceful failure — see the field doc),
+    // NL_BROWSER_DRIVER=0/false to disable. This is what lets the SCOUT actually render a page.
+    w.browser = blk: {
+        const v = environ.get("NL_BROWSER_DRIVER") orelse break :blk m.internet;
+        break :blk v.len > 0 and !std.mem.eql(u8, v, "0") and !std.ascii.eqlIgnoreCase(v, "false");
+    };
     w.pop_on = m.veil_population;
     if (w.pop_on) w.act("engine", 0, "population", "enabled", "the veil may BIRTH a new sub-mind when the hive lacks a perspective and RETIRE a redundant one, within engine-enforced bounds (min/max/cooldown/cap)");
     w.mem.wmtx = &w.db_mtx;
@@ -1290,6 +1342,17 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
         w.round_seed_sources = 0;
         w.round_independent_sources = 0;
         w.round_source_diversity = 0;
+        // PROBE DECAY (single-threaded, before this round's moments spawn — see GuardRec.probe): teammates
+        // mutated the shared workdir last round, so a wedged read-class signature may genuinely return
+        // something NEW now — but a refused call never executes, so the guard on its own can never observe
+        // the change that should disarm it. Cap wedged probe slots to one-below-limit: exactly ONE probe
+        // execution per round — a changed result disarms the slot (count restarts at 1), an identical one
+        // re-wedges it for the rest of the round. Costs at most one cheap local read per wedged signature.
+        for (minds.items) |*mi| {
+            for (&mi.guard) |*g| {
+                if (g.probe and g.count >= GUARD_LIMIT_READ) g.count = GUARD_LIMIT_READ - 1;
+            }
+        }
         if (live) netProbe(&w, round, probe_url);
         {
             const ns = formatNow(gpa, w.nowSecs());
@@ -3869,7 +3932,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     var had_reject = false; // this mind's work was refused this round (edit/salvage reject) — a NEGATIVE affect signal
     const workdir = std.fmt.allocPrint(gpa, "{s}/work", .{w.run_dir}) catch (gpa.dupe(u8, w.run_dir) catch @panic("out of memory"));
     defer gpa.free(workdir);
-    var ctx = tools.ToolCtx{ .gpa = gpa, .io = w.io, .environ = environ, .run_dir = w.run_dir, .workdir = workdir, .scope = mi.scope, .mind = mi.name, .round = round, .mem = w.mem, .files_written = &files, .observed = &observed, .skills_saved = &skills_saved, .directives_set = &directives_set, .tools_made = &tools_made, .space = w.space, .share_obs = mi.scout, .internet = w.internet, .discourse = w.discourse, .blueprint = w.blueprint, .egress_allow = (environ.get("NL_EGRESS_ALLOWLIST") orelse ""), .gw_base = w.gw_base, .gw_key = w.gw_key, .gw_model = w.gateway_model, .fmtx = &w.files_mtx, .vcs_enabled = live and !w.quick and mi.team > 1, .anchored_reads = !w.discourse, .operating = w.operating, .app_attach = w.app_attach, .reject_notes = &w.reject_notes, .patch_root = w.patch_root };
+    var ctx = tools.ToolCtx{ .gpa = gpa, .io = w.io, .environ = environ, .run_dir = w.run_dir, .workdir = workdir, .scope = mi.scope, .mind = mi.name, .round = round, .mem = w.mem, .files_written = &files, .observed = &observed, .skills_saved = &skills_saved, .directives_set = &directives_set, .tools_made = &tools_made, .space = w.space, .share_obs = mi.scout, .internet = w.internet, .browser = w.browser, .discourse = w.discourse, .blueprint = w.blueprint, .egress_allow = (environ.get("NL_EGRESS_ALLOWLIST") orelse ""), .gw_base = w.gw_base, .gw_key = w.gw_key, .gw_model = w.gateway_model, .fmtx = &w.files_mtx, .vcs_enabled = live and !w.quick and mi.team > 1, .anchored_reads = !w.discourse, .operating = w.operating, .app_attach = w.app_attach, .reject_notes = &w.reject_notes, .patch_root = w.patch_root };
     var mem_sink = tools.MemSink{ .gpa = gpa };
     defer mem_sink.deinit();
     const normalize_mem = w.cap.tier != .author;
@@ -3989,10 +4052,21 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     else
         gpa.dupe(u8, "") catch @constCast("");
     defer gpa.free(lane_clause);
+    // The scout's escalation ladder: web_search is the FIRST rung, not the only one. When a search returns
+    // SERP-collision noise or thin results (the observed failure — obituary/press pages crowding out a CEO),
+    // do NOT conclude "no data exists" after one sweep. Refine the query, then reach for the richer tools:
+    // deep_crawl a candidate site, osint_scan a homepage for contact/identity leads, and — when a page is
+    // JS-rendered or interactive (LinkedIn, a people-directory, a live SERP) — browser_navigate + browser_read
+    // to actually render it. Only mark a fact UNVERIFIED after that ladder comes up empty. Browser verbs are
+    // named only when the driver is on, so the scout never reaches for a tool it lacks.
+    const scout_escalate = if (w.browser and w.internet)
+        " ESCALATE, do not give up: if web_search returns noise or thin results, REFINE the query and try deep_crawl (crawl a candidate site), osint_scan (pull contact/identity leads from a homepage), and browser_navigate + browser_read for JS-rendered or interactive pages (LinkedIn, directories, a live SERP). Only after that ladder is exhausted may you record a fact as UNVERIFIED — never conclude 'no data exists' from a single search."
+    else
+        " ESCALATE, do not give up: if web_search returns noise or thin results, REFINE the query and try deep_crawl (crawl a candidate site) and osint_scan (pull contact/identity leads from a homepage) before concluding anything. Only after that ladder is exhausted may you record a fact as UNVERIFIED — never conclude 'no data exists' from a single search.";
     const scout_clause = if (mi.scout and w.last_gap_str.len > 0)
-        std.fmt.allocPrint(gpa, " YOU ARE THE SCOUT THIS MOMENT: the hive may have a preloaded corpus, but it is NOT complete. Research THESE KNOWN GAPS specifically (web_search then read_url/fetch_json), do NOT re-derive what's already in hive knowledge — {s}{s} — then share/observe what you find back to the hive and save_skill the technique. Do NOT write_file or run_python.", .{ clip(w.last_gap_str, 400), w.last_src_str }) catch (gpa.dupe(u8, "") catch @constCast(""))
+        std.fmt.allocPrint(gpa, " YOU ARE THE SCOUT THIS MOMENT: the hive may have a preloaded corpus, but it is NOT complete. Research THESE KNOWN GAPS specifically (web_search then read_url/fetch_json), do NOT re-derive what's already in hive knowledge — {s}{s} —{s} then share/observe what you find back to the hive and save_skill the technique. Do NOT write_file or run_python.", .{ clip(w.last_gap_str, 400), w.last_src_str, scout_escalate }) catch (gpa.dupe(u8, "") catch @constCast(""))
     else if (mi.scout)
-        gpa.dupe(u8, " YOU ARE THE SCOUT THIS MOMENT: you MUST call web_search and then read_url/fetch_json to learn something the team does NOT yet know for this goal, then save_skill it (name it 'scout:<topic>') AND observe/share the key fact. Do NOT write_file or run_python — building is your teammates' job; if you write a file you have failed your role.") catch @constCast("")
+        std.fmt.allocPrint(gpa, " YOU ARE THE SCOUT THIS MOMENT: you MUST call web_search and then read_url/fetch_json to learn something the team does NOT yet know for this goal, then save_skill it (name it 'scout:<topic>') AND observe/share the key fact.{s} Do NOT write_file or run_python — building is your teammates' job; if you write a file you have failed your role.", .{scout_escalate}) catch @constCast("")
     else
         gpa.dupe(u8, "") catch @constCast("");
     defer gpa.free(scout_clause);
@@ -4455,13 +4529,17 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     defer if (base_owned) gpa.free(@constCast(base_schema));
     const authored_defs = if (mi.scout or w.cap.lean_schema) (gpa.dupe(u8, "") catch @constCast("")) else buildAuthoredSchema(gpa, w.mem);
     defer gpa.free(authored_defs);
-    // Web-browser driver tools (Feature 2) are injected only when the operator enabled NL_BROWSER_DRIVER, and
-    // only for full/operate tiers online (not the lean/scout research schemas) — they act on the live web.
-    const browser_on = blk: {
-        const v = environ.get("NL_BROWSER_DRIVER") orelse break :blk false;
-        break :blk v.len > 0 and !std.mem.eql(u8, v, "0") and !std.ascii.eqlIgnoreCase(v, "false");
-    };
-    const browser_defs: []const u8 = if (browser_on and w.internet and (gate.schema == .full or gate.schema == .operate)) ",\n" ++ tools.BROWSER_SCHEMA ++ ",\n" ++ tools.PIXEL_SCHEMA else "";
+    // Web-browser driver tools. Full/operate tiers get the full set + pixel; the SCOUT now gets the four
+    // load-bearing verbs (navigate/read/click/type via compactSchema) — its whole job is web reach, and a
+    // keyless search + reader proxy cannot render a JS page or click through an interactive SERP, which is
+    // exactly where the observed run gave up ("SERP hijacked → no data exists"). Gated on w.browser (the
+    // one resolved decision, default-on online) so the belt and browserEnabled agree. Sessions are lazy.
+    const browser_on = w.browser and w.internet;
+    const browser_defs: []const u8 = if (browser_on and (gate.schema == .full or gate.schema == .operate))
+        ",\n" ++ tools.BROWSER_SCHEMA ++ ",\n" ++ tools.PIXEL_SCHEMA
+    else if (browser_on and gate.schema == .scout)
+        SCOUT_BROWSER_SCHEMA
+    else "";
     // MCP find-and-use tools: injected when NL_MCP is set (separate opt-in from the browser driver).
     const mcp_on = blk: {
         const v = environ.get("NL_MCP") orelse break :blk false;
@@ -4490,8 +4568,26 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     var mstash_set = false;
     const conv_limit = scaledClip(w, w.cap.conv_cap);
     const op_turns: u32 = if (operate) @max(w.cap.max_turns, 6) else w.cap.max_turns;
+    // LOOP HARD STOP (moment scope — see MOMENT_STOP_STRIKES): resolved at each turn boundary, so the mind
+    // always sees the refusal feedback between strikes, and a turn that kept driving ANY refused signature
+    // counts even when its other calls executed — only a genuinely refusal-free turn clears the streak.
+    var refused_turns: u8 = 0;
+    var turn_refused = false;
+    var turn_executed = false;
     while (turn < op_turns) : (turn += 1) {
         if (w.stopRequested()) break;
+        if (turn_refused) refused_turns +|= 1 else if (turn_executed) refused_turns = 0;
+        turn_refused = false;
+        turn_executed = false;
+        if (refused_turns >= MOMENT_STOP_STRIKES) {
+            // Settling honestly beats grinding: every further turn would burn a full inference to append the
+            // identical refusal bytes to conv again. The canned monologue also skips the settle-summary
+            // inference — its content would be narrated from a conv of refusals, not from work.
+            w.act(mi.name, round, "loop_stop", "", "guard-refused calls three turns straight — settling the moment early instead of grinding the refusal loop");
+            gpa.free(monologue);
+            monologue = gpa.dupe(u8, "(loop guard: I cut this moment short — my repeated identical calls were refused every turn and could not make progress. The real results I already collected are above; next moment I will take a DIFFERENT action.)") catch @constCast("");
+            break;
+        }
         // HARD WALL-CLOCK: a round-boundary-only budget check lets one long moment (slow provider, deep tool
         // chain) sail far past the deadline. Break at the deadline mid-moment.
         if (w.deadline_s != 0 and w.nowSecs() >= w.deadline_s) break;
@@ -4719,14 +4815,16 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
             // personas.ts corruption). They degrade at a higher threshold, and the refusal names the
             // productive escape hatch instead of leaving the mind with nothing to emit.
             const read_class = std.mem.eql(u8, c.name, "read_file") or std.mem.eql(u8, c.name, "list_dir");
-            const guard_limit: u8 = if (read_class) 6 else 3;
+            const guard_limit: u8 = if (read_class) GUARD_LIMIT_READ else GUARD_LIMIT;
             if (gslot != null and gslot.?.count >= guard_limit) {
                 gslot.?.count +|= 1;
                 guard_blocked = true;
+                turn_refused = true; // strike bookkeeping for the moment's loop stop (see MOMENT_STOP_STRIKES)
                 w.act(mi.name, round, "loop_guard", c.name, "identical call repeated with the identical result — refused without executing");
                 result = gpa.dupe(u8, "[loop guard] REFUSED: you have made this exact call many times and it returned the same thing every time. It will not return anything different. Use the result you already have, or take a DIFFERENT action — different arguments, a different tool, or write your deliverable now. If you were re-reading a file to copy lines for a SEARCH/REPLACE edit, stop re-reading: reply with the file's relative path on its own line, then ONE fenced code block holding the COMPLETE corrected file.") catch @constCast("");
             } else {
                 result = tools.execute(&ctx, c.name, c.args);
+                turn_executed = true; // a genuine execution this turn — eligible to clear the refusal streak
                 if (retriableToolFail(c.name, result)) {
                     w.act(mi.name, round, "retry", c.name, clip(result, 160));
                     const r2 = tools.execute(&ctx, c.name, c.args);
@@ -4758,7 +4856,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
                         }
                         if (g.count < victim.count) victim = g;
                     }
-                    victim.* = .{ .sig = sig, .res = rh, .count = 1 };
+                    victim.* = .{ .sig = sig, .res = rh, .count = 1, .probe = read_class };
                 }
             }
             defer gpa.free(result);
@@ -6042,6 +6140,14 @@ fn isFetchTool(name: []const u8) bool {
 /// it must NOT fire when no fetch was tried (a task needing none) nor when any fetch succeeded.
 fn attemptedAndFailed(internet: bool, fetch_tried: u32, fetch_ok: u32) bool {
     return internet and fetch_tried > 0 and fetch_ok == 0;
+}
+
+/// Does the local fallback rung apply? A CLOUD primary call failed with a retryable/offline error and a
+/// local model is configured. Pure so the scoping is locked by test: never fires on success, on a local
+/// primary (no rung to add), on an unset local model, or on a non-retryable (fatal) error.
+fn localRungApplies(local_model: []const u8, base_url: []const u8, failed_ok: bool, failed_content: []const u8) bool {
+    if (failed_ok) return false;
+    return local_model.len > 0 and !llm.isLocal(base_url) and isRetryable(failed_content);
 }
 
 fn extractFact(gpa: std.mem.Allocator, monologue: []const u8, goal: []const u8, round: u32) []u8 {
@@ -8551,7 +8657,8 @@ fn completeAdaptive(w: *Worker, mi: *MindState, round: u32, messages_json: []con
         const why = if (!rest.ok) fallbackReason(rest.content) else "resting model returned no action — needs deeper reasoning";
         w.act(mi.name, round, "escalate", why, std.fmt.allocPrint(w.a(), "RESTING on the gateway model ({s}) was insufficient [{s}] — ESCALATING this moment to the primary ({s}) for real compute", .{ w.gateway_model, if (rest.ok) "no action" else clip(rest.content, 100), w.model }) catch "escalate");
         rest.deinit(w.gpa);
-        return llm.complete(w.gpa, w.io, w.run_dir, mi.scope, w.base_url, w.key, w.model, messages_json, tools_json, max_tokens, temperature);
+        // The escalation to the primary can itself hit an offline uplink — route it through the local rung.
+        return localRung(w, mi, round, messages_json, tools_json, max_tokens, temperature, llm.complete(w.gpa, w.io, w.run_dir, mi.scope, w.base_url, w.key, w.model, messages_json, tools_json, max_tokens, temperature));
     }
 
     var step = llm.complete(w.gpa, w.io, w.run_dir, mi.scope, w.base_url, w.key, w.model, messages_json, tools_json, max_tokens, temperature);
@@ -8565,7 +8672,26 @@ fn completeAdaptive(w: *Worker, mi: *MindState, round: u32, messages_json: []con
         }
         fb.deinit(w.gpa);
     }
-    return step;
+    // LOCAL RUNG last: gateway may be cloud too (the observed dead-round case — a cloud primary AND a cloud
+    // gateway both offline). A local model has no uplink to lose, so it keeps the mind working through a blip.
+    return localRung(w, mi, round, messages_json, tools_json, max_tokens, temperature, step);
+}
+
+/// Final fallback rung: a CLOUD call failed with a retryable/offline error, so try the LOCAL model
+/// (Ollama / built-in the-veil-12b), which works with no uplink. Takes ownership of `failed`: returns a
+/// fresh ok step (freeing `failed`), or `failed` unchanged when no local rung applies or it also failed.
+/// Inert when the primary is itself local (no rung to add) or local_model is unset.
+fn localRung(w: *Worker, mi: *MindState, round: u32, messages_json: []const u8, tools_json: []const u8, max_tokens: u32, temperature: f32, failed: llm.Step) llm.Step {
+    if (!localRungApplies(w.local_model, w.base_url, failed.ok, failed.content)) return failed;
+    w.act(mi.name, round, "local_fallback", fallbackReason(failed.content), std.fmt.allocPrint(w.a(), "the cloud model failed [{s}] and the uplink may be down — falling back to the LOCAL model ({s} @ {s}) so the mind keeps working offline", .{ clip(failed.content, 100), w.local_model, w.local_base }) catch "local fallback");
+    var lb = llm.complete(w.gpa, w.io, w.run_dir, mi.scope, w.local_base, w.local_key, w.local_model, messages_json, tools_json, max_tokens, temperature);
+    if (lb.ok) {
+        var f = failed;
+        f.deinit(w.gpa);
+        return lb;
+    }
+    lb.deinit(w.gpa);
+    return failed;
 }
 
 const HANG_CHECK_S: u32 = 30;
@@ -10745,6 +10871,31 @@ test "grounding backstop scope: fires ONLY when a live fetch was tried and none 
     try std.testing.expect(!attemptedAndFailed(false, 3, 0)); // offline can't fetch → UNVERIFIED is honest
 }
 
+test "scout browser subset is exactly the four load-bearing verbs (navigate/read/click/type)" {
+    // The scout gets compactSchema(BROWSER_SCHEMA) — the reduced belt, not the full 12-verb set, so its
+    // lean research schema stays lean. Lock the membership so a future belt change is a visible test break.
+    const s = tools.compactSchema(tools.BROWSER_SCHEMA);
+    try std.testing.expect(std.mem.indexOf(u8, s, "\"browser_navigate\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "\"browser_read\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "\"browser_click\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "\"browser_type\"") != null);
+    // the heavy verbs stay OFF the scout belt
+    try std.testing.expect(std.mem.indexOf(u8, s, "\"browser_eval\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "\"browser_console\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "\"browser_network\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "\"browser_type_text\"") == null);
+}
+
+test "localRungApplies: fires only on a cloud primary's retryable failure with a local model set" {
+    const offline = "Internet is offline — no working network connection"; // isRetryable via 'connection'
+    try std.testing.expect(localRungApplies("the-veil-12b", "https://api.deepseek.com/v1", false, offline));
+    try std.testing.expect(localRungApplies("the-veil-12b", "https://api.deepseek.com/v1", false, "rate limit hit"));
+    try std.testing.expect(!localRungApplies("the-veil-12b", "https://api.deepseek.com/v1", true, "")); // it succeeded
+    try std.testing.expect(!localRungApplies("", "https://api.deepseek.com/v1", false, offline)); // no local model
+    try std.testing.expect(!localRungApplies("the-veil-12b", "http://127.0.0.1:11434/v1", false, offline)); // primary already local
+    try std.testing.expect(!localRungApplies("the-veil-12b", "https://api.deepseek.com/v1", false, "invalid api key")); // fatal, not retryable
+}
+
 test "classifyFetch: interception is NEITHER tried nor failed; web-empty IS a failed live attempt" {
     // The three-way split IS the scoping. A RAG-first short-circuit (the query never went live) must
     // count as NOTHING — scoring it as a failed attempt would arm the backstop on a run that needed no
@@ -11037,6 +11188,19 @@ test "salvage gates catch the c6a5937fe corruption shapes: narration + path line
     // real file bodies stay committable: code, and a doc that merely starts with a heading
     try std.testing.expect(!salvageLeadConversational("import x from 'y'\nconst a = 1\nexport default a"));
     try std.testing.expect(!salvageLeadConversational("# Setup\n\nInstall the dependencies, then run the dev server."));
+}
+
+test "the moment loop stop and probe decay stay reachable, or they are dead code" {
+    // The moment-scope hard stop must fire inside an author-tier moment (MAX_TURNS) to exist at all —
+    // mini/extractor profiles run 2-3 turns and are already bounded by their cap; the stop is for the
+    // 6-turn regimes where a wedged mind otherwise burns half its moment receiving the same refusal.
+    try std.testing.expect(@as(u32, MOMENT_STOP_STRIKES) < MAX_TURNS);
+    // A single refused turn is a nudge, never a moment-ender (the chat engine's floor, mirrored).
+    try std.testing.expect(MOMENT_STOP_STRIKES > 1);
+    // Read-class refusal must stay laxer than the general threshold (the c6a5937fe mid-edit re-read
+    // lesson), and both must allow at least one warned repeat before refusing.
+    try std.testing.expect(GUARD_LIMIT_READ > GUARD_LIMIT);
+    try std.testing.expect(GUARD_LIMIT > 1);
 }
 
 test "salvage gates catch the c6a616d35 corruption shapes: truncated page, html-into-js, gutting write" {
