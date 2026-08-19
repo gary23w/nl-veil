@@ -21,6 +21,55 @@ const toolperf = @import("worker/chat/toolperf.zig");
 
 const VEIL_EXE = if (builtin.os.tag == .windows) "veil.exe" else "veil";
 
+// WINDOWS console + handle plumbing for a CLI that prints UTF-8 and spawns a detached daemon
+// (see dispatch/spawnDetached). Same extern pattern as the engine's raw-thread Sleep shim.
+const win = if (builtin.os.tag == .windows) struct {
+    extern "kernel32" fn SetConsoleOutputCP(cp: u32) callconv(.c) i32;
+    extern "kernel32" fn SetConsoleCP(cp: u32) callconv(.c) i32;
+    extern "kernel32" fn GetStdHandle(n: u32) callconv(.c) ?*anyopaque;
+    extern "kernel32" fn GetHandleInformation(h: *anyopaque, flags: *u32) callconv(.c) i32;
+    extern "kernel32" fn SetHandleInformation(h: *anyopaque, mask: u32, flags: u32) callconv(.c) i32;
+    const STD: [3]u32 = .{ 0xFFFFFFF6, 0xFFFFFFF5, 0xFFFFFFF4 }; // STD_INPUT(-10), STD_OUTPUT(-11), STD_ERROR(-12)
+    const FLAG_INHERIT: u32 = 1;
+} else struct {};
+
+/// Spawn a child DETACHED from this CLI's console world: stdio ignored, no console window, and — on
+/// Windows — with this process's std handles temporarily marked non-inheritable. Zig's spawn passes
+/// bInheritHandles=TRUE (the child's NUL stdio rides that flag), which drags along EVERY inheritable
+/// handle in this process — including the pipe/console handles the SHELL gave us. A daemon that
+/// inherits the caller's stdout write-end holds it open for its whole life, so `veil list | anything`,
+/// `$(veil …)`, or a CI step waits on EOF forever AFTER the CLI exits (observed live: the pipeline
+/// unblocked the instant the daemon was killed). Flags are restored to their observed state so a later
+/// spawn that wants inherited stdio still works.
+fn spawnDetached(io: Io, argv: []const []const u8, cwd_path: []const u8) bool {
+    var saved: [3]u32 = .{ 0, 0, 0 };
+    var hs: [3]?*anyopaque = .{ null, null, null };
+    if (builtin.os.tag == .windows) {
+        for (win.STD, 0..) |id, i| {
+            const h = win.GetStdHandle(id) orelse continue;
+            var fl: u32 = 0;
+            if (win.GetHandleInformation(h, &fl) == 0) continue;
+            hs[i] = h;
+            saved[i] = fl & win.FLAG_INHERIT;
+            _ = win.SetHandleInformation(h, win.FLAG_INHERIT, 0);
+        }
+    }
+    defer if (builtin.os.tag == .windows) {
+        for (hs, 0..) |h, i| {
+            if (h) |hh| _ = win.SetHandleInformation(hh, win.FLAG_INHERIT, saved[i]);
+        }
+    };
+    _ = std.process.spawn(io, .{
+        .argv = argv,
+        .cwd = .{ .path = cwd_path },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+        .create_no_window = true,
+    }) catch return false;
+    return true;
+}
+
 /// Everything a subcommand needs: the resolved data dir (for the bearer key), the server port, and io/gpa.
 pub const Ctx = struct {
     gpa: std.mem.Allocator,
@@ -70,6 +119,14 @@ pub fn isCommand(sub: []const u8) bool {
 /// that needs it talks over HTTP (auto-starting a detached daemon first).
 pub fn dispatch(ctx: *Ctx, sub: []const u8, args: []const []const u8) u8 {
     stdout_io = ctx.io;
+    // WINDOWS: this CLI prints UTF-8 (em dashes, arrows); a legacy conhost at cp437/cp1252 renders that
+    // as mojibake ("ΓÇö"). Opt the console into UTF-8 for output AND input (`veil chat` reads stdin).
+    // Deliberately not restored on exit: Windows Terminal is UTF-8 already, and an interrupted
+    // interactive verb would skip any restore anyway — a legacy console that cares can `chcp` back.
+    if (builtin.os.tag == .windows) {
+        _ = win.SetConsoleOutputCP(65001);
+        _ = win.SetConsoleCP(65001);
+    }
     ctx.loadToken();
     if (std.mem.eql(u8, sub, "help") or std.mem.eql(u8, sub, "--help") or std.mem.eql(u8, sub, "-h"))
         return cmdHelp();
@@ -154,12 +211,13 @@ fn ensureServer(ctx: *Ctx) bool {
     out("starting the veil server on :{d}...\n", .{ctx.port});
     // --server-only: a bare `veil` now also opens the desk (the one-click default), which a CLI verb must never
     // do — `veil chat` auto-starting the server should not pop a GUI window.
-    _ = std.process.spawn(ctx.io, .{ .argv = &.{ bin, "--server-only" }, .cwd = .{ .path = ctx.home }, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore }) catch return false;
+    if (!spawnDetached(ctx.io, &.{ bin, "--server-only" }, ctx.home)) return false;
     var tries: u32 = 0;
     while (tries < 30) : (tries += 1) {
         ctx.io.sleep(.{ .nanoseconds = 500 * std.time.ns_per_ms }, .awake) catch {};
         if (serverUp(ctx)) {
             ctx.loadToken(); // the server just minted/refreshed .desktop_key on boot — pick it up
+            out("server is up.\n", .{});
             return true;
         }
     }
@@ -700,10 +758,10 @@ fn cmdDesktop(ctx: *Ctx) u8 {
     // Detached, exactly like the old spawn: the CLI returns immediately and the app owns its own lifetime.
     // No ensureServer here — app mode brings its own server up in-process (and binds the same port, so an
     // already-running server would make the new instance's listen fail rather than double-bind).
-    _ = std.process.spawn(ctx.io, .{ .argv = &.{eb[0..n]}, .cwd = .{ .path = ctx.home }, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore }) catch {
+    if (!spawnDetached(ctx.io, &.{eb[0..n]}, ctx.home)) {
         std.debug.print("could not launch the desktop\n", .{});
         return 1;
-    };
+    }
     out("launched the veil desktop\n", .{});
     return 0;
 }
@@ -1545,11 +1603,19 @@ fn renderConvFrames(ctx: *Ctx, bytes: []const u8) void {
 // `veil events <id> > log`); errors and usage notes stay on std.debug.print's stderr. Threading io
 // through ~50 pure-output call sites buys nothing in a single-threaded CLI, hence the file-scope copy.
 var stdout_io: ?std.Io = null;
+var out_buf: [4096]u8 = undefined;
+var out_writer: ?std.Io.File.Writer = null;
 
+/// One PERSISTENT stdout writer for the whole process. Recreating the writer per call looked harmless,
+/// but a fresh File.Writer starts at position 0: a console ignores file positions, a REDIRECTED stdout
+/// does not — `veil list > swarms.txt` kept only the LAST print, every call overwriting the file from
+/// the top (observed live on the cold-start path: the "starting the veil server" line and the table
+/// header vanished; the final row survived). One writer, one advancing position, flushed per call so
+/// progress lines appear while the CLI waits on the daemon.
 pub fn out(comptime fmt: []const u8, args: anytype) void {
     const io = stdout_io orelse return std.debug.print(fmt, args);
-    var buf: [1024]u8 = undefined;
-    var w = std.Io.File.stdout().writer(io, &buf);
+    if (out_writer == null) out_writer = std.Io.File.stdout().writer(io, &out_buf);
+    const w = &out_writer.?;
     w.interface.print(fmt, args) catch return;
     w.interface.flush() catch {};
 }
