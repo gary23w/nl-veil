@@ -59,12 +59,14 @@ const MAX_ITERS: usize = 24;
 /// hard stop below can be checked against it — the two only work as a pair.
 const ECHO_LIMIT: u8 = 3;
 
-/// How many ALREADY-REFUSED tool calls end the turn outright (see `loop_refusals` in runInnerAgentic).
-/// The echo guard refuses one signature once it has returned the identical result 3 times; this counts
-/// those refusals across the whole turn, so a model cycling between tools — which never drives a single
-/// signature hard enough to matter — still terminates instead of grinding to MAX_ITERS. Three is
-/// deliberately generous: reaching it takes at least ~12 calls that all returned identical results with
-/// the in-band warnings ignored every time, so a model making any real progress never reaches it.
+/// How many consecutive refusal-bearing INFERENCES end the turn outright (see `loop_refusals` in
+/// runInnerAgentic). The echo guard refuses one signature once it has returned the identical result 3
+/// times; an inference whose batch contains any such refusal (or a cross-batch ledger repeat) is one
+/// strike, and only a refusal-free inference that executed real work clears the streak — so a model
+/// cycling between tools, or padding one dead signature with calls that still execute, terminates
+/// instead of grinding to MAX_ITERS. Three is deliberately generous: strikes land at most one per
+/// inference, so the model sees the refusal feedback between every strike and ignores it three
+/// inferences running before the turn is cut.
 const LOOP_STOP_REFUSALS: u32 = 3;
 
 /// Hard ceiling on AUTO-LOOP drive steps in one turn when the loop is OFF (loop=0). Kept low (6): a higher cap
@@ -3278,8 +3280,12 @@ fn dedupableTool(name: []const u8) bool {
 /// hash(name+args), res = hash of the last result, count = consecutive identical call+result repeats. Unlike
 /// the network ledger above this covers EVERY tool — a stateful tool whose result CHANGED resets its count,
 /// so legitimate re-reads after writes never trip it; only true echo loops (identical call, identical bytes,
-/// over and over) are warned and then refused.
-const EchoRec = struct { sig: u64 = 0, res: u64 = 0, count: u8 = 0 };
+/// over and over) are warned and then refused. That changed-result reset needs the call to EXECUTE, which a
+/// wedged slot (count past the limit) never does again — the refusal's "it will not return anything
+/// different" would otherwise be self-fulfilling. So `probe` marks side-effect-free file reads, and a landed
+/// mutation caps wedged probe slots back to one-below-limit: one real execution to observe whether the world
+/// actually changed (see PROBE RE-OPEN in runInnerAgentic).
+const EchoRec = struct { sig: u64 = 0, res: u64 = 0, count: u8 = 0, probe: bool = false };
 
 // ------------------------------------------------------------------ file ledger (the fine-needle memory weave)
 
@@ -6828,9 +6834,17 @@ fn runInnerAgentic(
     // every edit rejected for a malformed anchor, the deliverable already written and working, and the
     // desk sat there looking hung until the round cap.
     //
-    // This counts only calls the echo guard ALREADY refused, so it cannot fire on a model that is making
-    // progress — reaching it means at least LOOP_STOP_REFUSALS * echo_limit calls returned identical
-    // results and the warnings were ignored every time. Frontier models on working paths never see it.
+    // Counted per ITERATION, not per refused call: an inference whose batch contained any identical-call
+    // refusal (echo guard, or a cross-batch ledger repeat) is one strike; an inference that refused
+    // nothing and executed something clears the streak. The earlier shape — every non-refused CALL
+    // zeroed the count — quietly disarmed the stop for the very loops it was built for: a ledger-refused
+    // search spiral cleared its own strikes (a dedupable call executes exactly once, so it is never
+    // echo_blocked and every repeat took the clearing branch), and the c6a6df468 cycle survived whenever
+    // one member returned nondeterministic bytes (test timings, tracebacks) and so kept "executing".
+    // Per-iteration strikes close both while keeping the c6a75df8b forgiveness intact: a model that read
+    // the refusal and genuinely moved on produces a refusal-free next pass, which clears it. Reaching the
+    // stop still means the warnings were ignored across LOOP_STOP_REFUSALS consecutive inferences —
+    // a model making real progress never sees it.
     var loop_refusals: u32 = 0;
 
     // Everything already in conv_buf when this pass begins (system + bounded history + prior drive steps). This
@@ -7000,6 +7014,13 @@ fn runInnerAgentic(
         // turn may not sit between an assistant tool_calls turn and its results (same rule as pending_steer).
         var post_note: std.ArrayListUnmanaged(u8) = .empty;
         defer post_note.deinit(gpa);
+        // LOOP STRIKE state for THIS inference's batch (see loop_refusals above): did any call take an
+        // identical-call refusal, and did any call genuinely execute? Resolved once at the batch end.
+        var iter_refused = false;
+        var iter_executed = false;
+        // Ledger length when this batch began: a repeat whose FIRST occurrence sits in this same batch was
+        // emitted before any "do NOT re-run" feedback existed, so it must not strike (see the guard below).
+        const ledger_at_batch = call_ledger.items.len;
         for (step.calls, 0..) |c, ci| {
             // COOPERATIVE CONTROL (between tool calls): a single inference can request many tools, each taking
             // seconds — checking only per-inference lets a Stop (or a steer) wait minutes. A stop aborts with the
@@ -7033,10 +7054,12 @@ fn runInnerAgentic(
             // answered from the ledger — the model is told to use the result it already has and move on.
             const call_h = std.hash.Fnv1a_64.hash(c.name) ^ std.hash.Fnv1a_64.hash(c.args);
             var repeated = false;
+            var repeated_prior = false; // first occurrence was in an EARLIER batch — repeated after seeing feedback
             if (dedupableTool(c.name)) {
-                for (call_ledger.items) |h| {
+                for (call_ledger.items, 0..) |h, hi| {
                     if (h == call_h) {
                         repeated = true;
+                        repeated_prior = hi < ledger_at_batch;
                         break;
                     }
                 }
@@ -7062,20 +7085,14 @@ fn runInnerAgentic(
             // count and never trips this.
             const echo_limit: u8 = ECHO_LIMIT;
             const echo_blocked = echo_slot != null and echo_slot.?.count >= echo_limit;
-            if (echo_blocked) {
-                echo_slot.?.count +|= 1;
-                loop_refusals +|= 1; // see LOOP HARD STOP above; checked after this call's result lands
-            } else {
-                // CHANGED ITS MIND ⇒ forgive the accrued refusals. loop_refusals counts refusals across the
-                // WHOLE turn, so a model that hit the guard, read the warning, and moved to a genuinely
-                // different call was still carrying the old strikes into its recovery — and the third one
-                // ended the turn mid-recovery. Observed live (c6a75df8b): after three identical browser_reads
-                // the model said "the loop guard is firing and it's right, I'll try a different ref instead of
-                // retrying read" — the correct response — and the turn was killed anyway. This call is NOT
-                // refused, which is exactly the evidence that the loop broke; the hard stop still fires for a
-                // model that keeps driving refused signatures, because those never reach this branch.
-                loop_refusals = 0;
-            }
+            if (echo_blocked) echo_slot.?.count +|= 1;
+            // STRIKE MARK (resolved per ITERATION at the batch end — see loop_refusals above): an
+            // identical-call refusal marks this whole inference as a loop pass. Echo refusals always count;
+            // ledger repeats count only when the first occurrence was in an EARLIER batch — a same-batch
+            // duplicate was emitted before the model could see any "do NOT re-run" feedback, and striking it
+            // would cut down dup-batching models that are otherwise progressing. Budget refusals and plugin
+            // vetoes are neither loop evidence nor progress: they touch neither flag, freezing the streak.
+            if (echo_blocked or repeated_prior) iter_refused = true;
             // QUERY FORMULATION (prompting): chat used to hand web_search the model's query verbatim — the swarm
             // has had a formulation step for a while (run.zig scoutQuery) and the chat side had none at all.
             // Gated on the call actually being about to EXECUTE (the three guard conditions below are the ones
@@ -7305,6 +7322,7 @@ fn runInnerAgentic(
             // identical repeat the model gets an in-band warning appended to the result so it self-corrects
             // with context (the refusal above only fires once the warnings were ignored).
             if (executed) {
+                iter_executed = true; // real work happened this inference — eligible to clear the loop streak at batch end
                 const rh = std.hash.Fnv1a_64.hash(result[0..@min(result.len, 4096)]);
                 if (echo_slot) |g| {
                     if (g.res == rh) {
@@ -7330,7 +7348,9 @@ fn runInnerAgentic(
                         }
                         if (g.count < victim.count) victim = g;
                     }
-                    victim.* = .{ .sig = call_h, .res = rh, .count = 1 };
+                    // probe: side-effect-free file reads may be re-opened by a landed mutation (PROBE RE-OPEN below)
+                    const probe = std.mem.eql(u8, c.name, "read_file") or std.mem.eql(u8, c.name, "list_dir");
+                    victim.* = .{ .sig = call_h, .res = rh, .count = 1, .probe = probe };
                 }
             }
             // A fetched credential value must never land in the event stream (events.jsonl outlives the turn).
@@ -7378,7 +7398,9 @@ fn runInnerAgentic(
             // above already carries "tool write_file: wrote {path} — …" (batched — an inline spawn per
             // write would re-serialize big write batches), and WITHIN the turn the woven ledger block is
             // the engine-exact source of file truth.
+            var file_mutated = false;
             if (parseFileMutation(c.name, result)) |m| {
+                file_mutated = true;
                 // Normalize separators BEFORE persisting: files.jsonl must hold '/'-paths so ledgerLoad's
                 // fail-safe (backslash ⇒ unparseable ⇒ partial) never triggers on our own lines.
                 var pbuf: [300]u8 = undefined;
@@ -7435,6 +7457,22 @@ fn runInnerAgentic(
                 }
             }
 
+            // PROBE RE-OPEN: state on disk just changed — a landed write/edit, or a shell command that may
+            // have touched anything. A read-class signature the echo guard already wedged was refused on the
+            // claim "it will not return anything different", and a refused call never executes, so the guard
+            // could never observe the change that falsifies its own claim (the model is then blocked from
+            // re-reading the very file it just rewrote — the read-after-write cycle BUILD DISCIPLINE demands,
+            // and the blindness behind the c6a5937fe apology-into-file corruption class). Cap wedged probe
+            // slots back to one-below-limit: exactly ONE probe execution — a changed result disarms the slot
+            // (count restarts at 1), an identical one re-wedges it on the next call. Cost: at most one cheap
+            // local read per landed mutation. Only probe-flagged (side-effect-free read) slots ever re-open;
+            // a wedged mutating signature stays refused.
+            if (executed and (file_mutated or std.mem.eql(u8, c.name, "host_command"))) {
+                for (echo_guard) |*g| {
+                    if (g.probe and g.count >= ECHO_LIMIT) g.count = ECHO_LIMIT - 1;
+                }
+            }
+
             // Build the whole tool-result object in a scratch list, then append it to conv_buf in ONE shot. A
             // mid-object OOM must never leave conv_buf as a partial/unterminated object — that malformed JSON would
             // ride into the next completion (a 400) instead of a clean hard_error. On any failure: free + hard_error.
@@ -7457,6 +7495,13 @@ fn runInnerAgentic(
             if (result.len > 0) gpa.free(result); // OOM fallback in execute() can hand back a static "" — don't free that
             if (!obj_ok) return .{ .outcome = .hard_error, .content = empty };
         }
+        // LOOP STRIKE (iteration boundary — see loop_refusals above): one refusal-bearing inference is one
+        // strike; an inference that refused nothing AND executed something clears the streak. Per-iteration
+        // resolution guarantees the model saw the refusal feedback between strikes (a whole batch of
+        // duplicates costs at most one), clearing only on a clean pass is the c6a75df8b forgiveness in its
+        // precise form, and a batch that neither refused nor executed (all budget-refused/vetoed) freezes
+        // the streak rather than feeding either side.
+        if (iter_refused) loop_refusals +|= 1 else if (iter_executed) loop_refusals = 0;
         // WITHIN-TURN COMPACTION (step boundary): if this pass's working growth has crossed the budget, compress it
         // into a progress note so a long/afk turn can keep going without overflowing the model window.
         compactWorking(app, run_root, think.base_url, think.key, think.model, conv_buf, base_len, ctx, tool_obs,
@@ -9030,16 +9075,21 @@ test "the working budget tightens for a small window and leaves a roomy one alon
 }
 
 test "the loop hard stop is reachable before MAX_ITERS, or it is dead code" {
-    // The echo guard refuses ONE signature after ECHO_LIMIT identical results; the hard stop ends the turn
-    // after LOOP_STOP_REFUSALS such refusals. The two only work as a pair, and the pair only works if the
-    // stop can actually be reached inside a turn's round budget. A live loop (conv c6a6df468) cycled
-    // edit_file -> run_python -> run_tests -> read_file and ran to MAX_ITERS because nothing counted
-    // refusals ACROSS signatures; if someone later raises either constant past the round cap, the stop
-    // silently stops firing and that hang comes back with no test failing.
+    // The echo guard refuses ONE signature after ECHO_LIMIT identical results; the hard stop ends the
+    // turn after LOOP_STOP_REFUSALS consecutive refusal-bearing inferences. The two only work as a pair,
+    // and the pair only works if the stop can actually be reached inside a turn's round budget. A live
+    // loop (conv c6a6df468) cycled edit_file -> run_python -> run_tests -> read_file and ran to
+    // MAX_ITERS because nothing counted refusals ACROSS signatures; the per-call forgiveness reset that
+    // followed re-opened it from the other side (any executing call zeroed the strikes, so a ledger-
+    // refused search spiral — never echo_blocked, since a dedupable call executes exactly once — or one
+    // nondeterministic member in the cycle kept the stop disarmed to MAX_ITERS). Strikes are per
+    // ITERATION now, cleared only by a refusal-free pass that executed; if someone later raises either
+    // constant past the round cap, the stop silently stops firing and that hang comes back with no test
+    // failing.
     //
-    // Worst case is one refusal per distinct signature: each needs ECHO_LIMIT calls to arm plus one more
-    // to be refused, so the stop needs LOOP_STOP_REFUSALS * (ECHO_LIMIT + 1) rounds of headroom.
-    const worst_case_rounds: usize = @as(usize, LOOP_STOP_REFUSALS) * (@as(usize, ECHO_LIMIT) + 1);
+    // Worst case for one signature: ECHO_LIMIT arming passes (one identical call each), then
+    // LOOP_STOP_REFUSALS refused passes before the pre-inference check fires.
+    const worst_case_rounds: usize = @as(usize, ECHO_LIMIT) + @as(usize, LOOP_STOP_REFUSALS);
     if (worst_case_rounds >= MAX_ITERS) {
         std.debug.print("\nloop hard stop needs up to {d} rounds but MAX_ITERS is {d}: the turn hits the " ++
             "round cap first and the hard stop never fires.\n", .{ worst_case_rounds, MAX_ITERS });
