@@ -227,8 +227,8 @@ const SANDBOX_TOOLS = [_][]const u8{
     // hive / memory — the whole surface, intentionally
     "recall",        "recall_hive",         "read_doc",   "observe",
     "share",         "note_stance",         "save_skill", "journal",
-    "set_directive", "probe",               "add_task",   "complete_task",
-    "send_message",  "propose_plan_change",
+    "set_directive", "probe",               "add_task",   "claim_task",
+    "complete_task", "send_message",        "propose_plan_change",
     // bounded observation of files/urls/ports/processes — read-only watching (its 'command' kind
     // self-gates on caps inside pollTool, so a sandboxed caller keeps the observational kinds)
     "poll",
@@ -1139,7 +1139,8 @@ pub const SCHEMA =
     \\{"type":"function","function":{"name":"set_directive","description":"IMPROVE HOW YOUR SWARM WORKS. Write a concise process directive — a lesson about a better way to operate — into the swarm's shared, self-authored operating PLAYBOOK. It is injected into every mind's instructions from now on, so this is how the swarm improves its own process over time. Use it when you notice what's working or what's failing (e.g. 'read a file before rewriting it', 'one mind owns each section', 'verify code by running it'). Phrase it as an imperative rule. Don't repeat a directive already in the playbook.","parameters":{"type":"object","properties":{"directive":{"type":"string","description":"one concise imperative process rule for the swarm to follow"}},"required":["directive"]}}},
     \\{"type":"function","function":{"name":"propose_plan_change","description":"Propose a change to the shared PROJECT PLAN (the forward contract every piece is built to) with a clear rationale — e.g. the arc isn't landing, research revealed a better structure, two pieces need a different hand-off. The engine folds sound proposals into its next plan revision. The CANON RATCHET protects finished work: any fact a built piece already used cannot change, so you can only refine the plan for pieces NOT yet built.","parameters":{"type":"object","properties":{"rationale":{"type":"string","description":"why the plan should change and what it should become for the unbuilt pieces"}},"required":["rationale"]}}},
     \\{"type":"function","function":{"name":"send_message","description":"Send a message to a teammate mind (or 'all' to broadcast) on the swarm bus.","parameters":{"type":"object","properties":{"to":{"type":"string"},"text":{"type":"string"}},"required":["to","text"]}}},
-    \\{"type":"function","function":{"name":"add_task","description":"Add a task to the shared swarm board, assigned to a mind (or 'all').","parameters":{"type":"object","properties":{"assignee":{"type":"string"},"task":{"type":"string"}},"required":["assignee","task"]}}},
+    \\{"type":"function","function":{"name":"add_task","description":"Add a task to the shared swarm board, assigned to a mind (or 'all' = anyone may claim it). Name the deliverable file when the task has one — a task with a file is exclusively ownable, so no two minds build the same thing.","parameters":{"type":"object","properties":{"assignee":{"type":"string"},"task":{"type":"string"},"file":{"type":"string","description":"the task's deliverable file (relative path), when it has one"}},"required":["assignee","task"]}}},
+    \\{"type":"function","function":{"name":"claim_task","description":"Claim an OPEN board task exclusively BEFORE building it (first claim wins; the board shows ids). If it is already owned you are told by whom — never duplicate an owned task, claim a different open one. Complete what you claim with complete_task.","parameters":{"type":"object","properties":{"id":{"type":"integer"}},"required":["id"]}}},
     \\{"type":"function","function":{"name":"complete_task","description":"Mark a board task done by its id, with a short result.","parameters":{"type":"object","properties":{"id":{"type":"integer"},"result":{"type":"string"}},"required":["id"]}}},
     \\{"type":"function","function":{"name":"stage_delivery","description":"When the goal asks you to PUBLISH/push/deploy/save the result somewhere external (GitHub, a website, an S3/GCS bucket, SSH, a durable directory) AND you judge the deliverable complete, call this to PACKAGE it for handoff. You CANNOT publish directly — the swarm holds no credentials by design. This stages the workdir + writes a delivery manifest the operator (a human, or a privileged broker outside this sandbox) reviews and then approves to actually publish. Do the work first, then stage once.","parameters":{"type":"object","properties":{"target":{"type":"string","description":"where it should go, e.g. 'github:owner/repo', 'bucket:my-bucket/prefix', 'website', 'ssh:host:/path', 'local-durable'"},"summary":{"type":"string","description":"one-line summary of what is being delivered and why it's complete"}},"required":["target","summary"]}}},
     \\{"type":"function","function":{"name":"make_tool","description":"AUTHOR A NEW TOOL when your current tools can't do a task — do NOT give up with 'my tools are limited'. Give it a snake_case name, a one-line description, a JSON-Schema 'params' object, and a Python 'body'. The body reads its inputs from a global dict ARGS and MUST print exactly one JSON line as its result (e.g. print(json.dumps({\"valid\":true}))). It runs sandboxed: no API keys, cwd=workdir, pure-stdlib. Once made it is callable by name by you AND every teammate for the rest of the run. Research the technique first (web_search/read_url) if you don't know it, then implement it here. Do NOT remake a tool already listed in 'Authored tools'.","parameters":{"type":"object","properties":{"name":{"type":"string","description":"snake_case, 3-32 chars [a-z0-9_]"},"description":{"type":"string"},"params":{"type":"object","description":"JSON-Schema object for the tool's arguments"},"body":{"type":"string","description":"Python; read inputs from the ARGS dict, print ONE JSON result line"}},"required":["name","description","params","body"]}}},
@@ -1820,13 +1821,29 @@ fn executeInner(ctx: *ToolCtx, name: []const u8, args_json: []const u8) []u8 {
         return std.fmt.allocPrint(gpa, "sent to {s}", .{p.value.to}) catch dupe(gpa, "sent");
     }
     if (std.mem.eql(u8, name, "add_task")) {
-        const A = struct { assignee: []const u8 = "all", task: []const u8 = "" };
+        const A = struct { assignee: []const u8 = "all", task: []const u8 = "", file: []const u8 = "" };
         const p = std.json.parseFromSlice(A, gpa, args_json, .{ .ignore_unknown_fields = true }) catch return dupe(gpa, "bad args");
         defer p.deinit();
         lockFiles(ctx);
         defer unlockFiles(ctx);
-        const id = commons.addTask(gpa, ctx.io, ctx.run_dir, ctx.mind, p.value.assignee, p.value.task);
+        const id = commons.addTaskFile(gpa, ctx.io, ctx.run_dir, ctx.mind, p.value.assignee, p.value.task, p.value.file);
         return std.fmt.allocPrint(gpa, "task #{d} added for {s}", .{ id, p.value.assignee }) catch dupe(gpa, "task added");
+    }
+    if (std.mem.eql(u8, name, "claim_task")) {
+        const A = struct { id: u32 = 0 };
+        const p = std.json.parseFromSlice(A, gpa, args_json, .{ .ignore_unknown_fields = true }) catch return dupe(gpa, "bad args");
+        defer p.deinit();
+        lockFiles(ctx);
+        defer unlockFiles(ctx);
+        switch (commons.claimTask(gpa, ctx.io, ctx.run_dir, p.value.id, ctx.mind)) {
+            .ok => return std.fmt.allocPrint(gpa, "claimed #{d} — it is yours; build it, then complete_task", .{p.value.id}) catch dupe(gpa, "claimed"),
+            .already => |owner| {
+                defer gpa.free(owner);
+                return std.fmt.allocPrint(gpa, "#{d} is already owned by {s} — do NOT duplicate their work; claim a different open task", .{ p.value.id, owner }) catch dupe(gpa, "already claimed");
+            },
+            .done_already => return std.fmt.allocPrint(gpa, "#{d} is already done — pick an open task from the TASK BOARD", .{p.value.id}) catch dupe(gpa, "already done"),
+            .no_such => return std.fmt.allocPrint(gpa, "no task #{d} on the board — add_task first, or read the TASK BOARD block for real ids", .{p.value.id}) catch dupe(gpa, "no such task"),
+        }
     }
     if (std.mem.eql(u8, name, "complete_task")) {
         const A = struct { id: u32 = 0, result: []const u8 = "" };
@@ -2269,7 +2286,7 @@ pub fn isBuiltinTool(n: []const u8) bool {
     // families were listed only as their exact verbs, so "mcp_lookup" or "browser_summary" slipped through
     // as well. Keep this in sync with the dispatch chain in execute(); the test below reads execute()'s
     // source and fails if the two ever disagree again.
-    const builtins = [_][]const u8{ "run_python", "write_file", "edit_file", "read_file", "absorb", "stage_file", "patch_system", "list_dir", "run_tests", "delete_file", "web_fetch", "web_search", "fetch_json", "read_url", "osint_scan", "deep_crawl", "observe", "recall", "recall_hive", "read_doc", "poll", "stop_process", "share", "probe", "note_stance", "save_skill", "journal", "set_directive", "send_message", "add_task", "complete_task", "stage_delivery", "make_tool", "propose_change", "simulate_change", "propose_plan_change", "ask_veil", "host_status", "host_command", "host_explore", "get_credential" };
+    const builtins = [_][]const u8{ "run_python", "write_file", "edit_file", "read_file", "absorb", "stage_file", "patch_system", "list_dir", "run_tests", "delete_file", "web_fetch", "web_search", "fetch_json", "read_url", "osint_scan", "deep_crawl", "observe", "recall", "recall_hive", "read_doc", "poll", "stop_process", "share", "probe", "note_stance", "save_skill", "journal", "set_directive", "send_message", "add_task", "claim_task", "complete_task", "stage_delivery", "make_tool", "propose_change", "simulate_change", "propose_plan_change", "ask_veil", "host_status", "host_command", "host_explore", "get_credential" };
     for (builtins) |b| if (std.mem.eql(u8, b, n)) return true;
     // PREFIX families: execute() routes these with startsWith, so every suffix is reserved, not just the
     // verbs that happen to exist today.
