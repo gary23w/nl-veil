@@ -6029,8 +6029,11 @@ fn webSearch(ctx: *ToolCtx, args_json: []const u8) []u8 {
     defer gpa.free(@constCast(out));
     const web = std.mem.trim(u8, out, " \r\n\t");
     if (web.len == 0) {
-        if (local.items.len > 0) return std.fmt.allocPrint(gpa, "LOCAL RAG (checked first; live web backends are unavailable right now):\n{s}", .{clip(local.items, 3600)}) catch dupe(gpa, "local");
-        return dupe(gpa, "(no results: all search backends unavailable — try again later)");
+        // A fetch that came back empty is the exact moment a weak model fabricates: it falls back to its
+        // own memory and states a guessed specific as fact (observed live — an empty Zig-version search
+        // became a confidently WRONG "0.14.0"). Say plainly that the gap is NOT to be filled from memory.
+        if (local.items.len > 0) return std.fmt.allocPrint(gpa, "LOCAL RAG (live web returned nothing for this query):\n{s}\n\nThe live web gave no result. Do NOT fill any missing specific (a version, date, URL, email, phone) from memory — REFINE the query and web_search again, or write the fact as UNVERIFIED. A guessed specific is a failure.", .{clip(local.items, 3600)}) catch dupe(gpa, "local");
+        return dupe(gpa, "(no results for this query.) Do NOT answer from memory — REFINE the query and web_search again (fewer/different words), or if the fact cannot be fetched write it as UNVERIFIED rather than guessing. A fabricated specific (version, date, URL, email, phone) is worse than an admitted gap.");
     }
     // Prepend local hits ONLY when they actually cover this query — the same bar the short-circuit uses.
     // assoc() is spreading activation: it returns SOMETHING for nearly any query, and unfiltered that

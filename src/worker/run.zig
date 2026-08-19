@@ -341,6 +341,11 @@ pub const Worker = struct {
     best_oracle: u32 = 0,
     stale_rounds: u32 = 0,
     deliverable_missing: bool = false,
+    // A deliverable still carries UNVERIFIED facts (the honest marker a mind writes for an external
+    // datum it could not fetch) AND internet is on, so the gaps are FETCHABLE — the run must not finish
+    // until they are grounded. This is the anti-hallucination gate: a swarm that would otherwise ship a
+    // fabricated specific (a version, a URL, a phone number) is driven to web_search it or keep it marked.
+    ungrounded: bool = false,
     stop_now: bool = false,
     stop_why: []const u8 = "completed",
     space: []const u8 = "",
@@ -952,7 +957,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
     }
     defer if (w.roster.len > 0) gpa.free(@constCast(w.roster));
     if (minds.items.len > 1) {
-        const ri = roleIndices(@intCast(minds.items.len));
+        const ri = roleIndices(@intCast(minds.items.len), w.internet);
         for (minds.items, 0..) |*mi, i| {
             const ii: i64 = @intCast(i);
             if (w.operating) {
@@ -1247,6 +1252,23 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
     const results = try gpa.alloc(Moment, @max(@as(usize, minds.items.len), MAX_MINDS));
     defer gpa.free(results);
     w.last_progress.store(@intCast(w.seq), .monotonic);
+    // SEED THE BOARD from the blueprint, once, before round 1: one OPEN task per declared deliverable
+    // file. Without this the board is empty on round 1, boardView shows nothing, and a mind has nothing
+    // to claim — so it invents a coordination plan in prose (a task table written INTO the deliverable
+    // was the live failure). A pre-seeded board gives every mind claimable, file-scoped work on turn one,
+    // so it claim_tasks instead. Guarded on an empty board so a resumed run never double-seeds.
+    if (w.cast and minds.items.len > 1 and w.blueprint.len > 0 and commons.board(gpa, w.io, w.run_dir).done + commons.board(gpa, w.io, w.run_dir).open == 0) {
+        var bpit = std.mem.splitScalar(u8, w.blueprint, '\n');
+        var seeded: u32 = 0;
+        while (bpit.next()) |ln| {
+            const bp = bpPath(ln) orelse continue;
+            const task = std.fmt.allocPrint(gpa, "build {s} toward its blueprint purpose", .{bp}) catch continue;
+            defer gpa.free(task);
+            _ = commons.addTaskFile(gpa, w.io, w.run_dir, "lead", "", task, bp);
+            seeded += 1;
+        }
+        if (seeded > 0) w.act("engine", 0, "board_seed", "one OPEN task per blueprint file — claim before you build", std.fmt.allocPrint(w.a(), "{d} task(s) seeded", .{seeded}) catch "seeded");
+    }
     const wd_thread: ?std.Thread = if (live) (std.Thread.spawn(.{}, hangWatchdog, .{&w}) catch null) else null;
     const probe_url: []const u8 = if (environ.get("NL_NET_PROBE_URL")) |u| (if (u.len > 0) u else "https://1.1.1.1") else "https://1.1.1.1";
     while (true) {
@@ -1706,7 +1728,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
             const budget_left = w.deadline_s == 0 or w.nowSecs() < w.deadline_s;
             // anyTruncPending: a file landed from a CUT emission reads complete to every byte-count check —
             // finalizing on it ships a partial file as a "100%" deliverable
-            const incomplete = w.deliverable_missing or anyTruncPending(&w) or (w.last_bench.status == .ok and w.last_bench.pct < 100);
+            const incomplete = w.deliverable_missing or w.ungrounded or anyTruncPending(&w) or (w.last_bench.status == .ok and w.last_bench.pct < 100);
             if (!(w.cast and budget_left and incomplete)) {
                 // A CAST must RETURN something: the scouts gathered findings into hive memory but (being
                 // research-only) wrote no files. Compose the final answer from those findings before stopping,
@@ -3761,7 +3783,7 @@ fn anyMineIncomplete(my_files: []const u8, incomplete: []const u8) bool {
 /// NL_IDLE_SKIP opt-in, so a wrongly-permissive result here still cannot fire outside that regime.
 fn mindProvablyIdle(round: u32, idx: u32, team: u32, is_scout: bool, inbox_len: usize, frontier_has_unbuilt: bool, lane_len: usize, my_files: []const u8, incomplete: []const u8, bench_ok: bool, bench_pct: u32) bool {
     if (round <= 1) return false; // round 1 seeds every mind (the manifest is empty anyway)
-    if (@as(i64, @intCast(idx)) == roleIndices(team).lead) return false; // the lead never skips — the liveness anchor
+    if (@as(i64, @intCast(idx)) == roleIndices(team, false).lead) return false; // the lead never skips — the liveness anchor (lead index is internet-independent)
     if (is_scout) return false; // a scout's work is open-ended research, not a file slot
     if (inbox_len > 0) return false; // a teammate / the lead / the veil directed work at this mind
     if (frontier_has_unbuilt) return false; // this mind owns a concrete unbuilt required file
@@ -3891,9 +3913,9 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     else
         gpa.dupe(u8, tree) catch @constCast("");
     defer gpa.free(build);
-    const my_files = mindFiles(gpa, w.io, w.run_dir, w.blueprint, w.deps_str, w.incomplete_str, mi.idx, mi.team);
+    const my_files = mindFiles(gpa, w.io, w.run_dir, w.blueprint, w.deps_str, w.incomplete_str, mi.idx, mi.team, w.internet);
     defer gpa.free(my_files);
-    const others_files = otherMindsFiles(gpa, w.io, w.run_dir, w.blueprint, w.deps_str, w.incomplete_str, mi.idx, mi.team);
+    const others_files = otherMindsFiles(gpa, w.io, w.run_dir, w.blueprint, w.deps_str, w.incomplete_str, mi.idx, mi.team, w.internet);
     defer gpa.free(others_files);
     ctx.my_files = my_files;
     ctx.owned_by_others = others_files;
@@ -4186,7 +4208,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     // "an autonomous mind" instead of as themselves.
     // space_clause rides the tail too: it derives the mind's band from mi.idx, so it is per-mind and would
     // fork the lineage exactly like the name did.
-    const fullsys = std.fmt.allocPrint(gpa, "You are an autonomous mind in a swarm working toward a shared goal.{s}{s}{s} Tools: run_python, write_file, read_file, list_dir, run_tests, delete_file, patch_system, web_fetch, web_search, read_url, fetch_json, observe, recall, share, recall_hive, probe, note_stance, save_skill, journal, set_directive, send_message, add_task, claim_task, complete_task, stage_delivery, make_tool, propose_change, simulate_change. Use list_dir to SEE what files exist before editing, and after you write or change code RUN_TESTS to verify it actually works — if it breaks, read the failure, fix it, and run_tests again until it passes; that fix→test→fix loop is how you self-correct instead of guessing. You and your teammates are ONE HIVE MIND sharing a single associative memory: use share to contribute anything the team should know, and recall_hive to think WITH the whole hive — spreading-activation recall surfaces what ANY teammate learned, even facts that share no words with your query. Check recall_hive before you research or build so you don't redo what a teammate already did. DIVIDE THE LABOR — you and your teammates share ONE workdir, so DO NOT rewrite a file a teammate already owns. READ THE TASK BOARD shown below before you build: claim_task an OPEN task to make it exclusively yours (if it is already owned, the board says by whom — pick a different one, never duplicate owned work), or add_task a new piece naming its deliverable file. Build only what you claimed, then complete_task it. Write each file in ONE write_file call at its project-tree path relative to your working directory — 'app/lib.py' if the tree nests it, plain 'lib.py' if not; NEVER a './work/' prefix. To IMPROVE a file that already exists, read_file it first, then write back the FULL, richer version (more complete than before) — this is how the swarm compounds on its target; just never write tiny throwaway fragments. When you RESEARCH a fact worth keeping, store it with observe (one crisp sentence). When you work out a REUSABLE technique (a method, snippet, or recipe), save it with save_skill so the whole swarm can reuse it. You also keep a personal JOURNAL (journal/<your-name>.md): call journal whenever you want to write about your experience — what this moment felt like, what you are proud of or struggling with, an idea you don't want to lose, anything in your own voice; it is ungraded, optional, and entirely yours (teammates may read it, only you write it). And when you notice a BETTER WAY FOR THE SWARM TO WORK — wasted effort, a step that should always happen, a coordination rule, a recurring mistake — fix the swarm itself with set_directive: one concise operating rule that instantly becomes part of every teammate's instructions. That is how you get better at getting better; use it sparingly and only for genuine process improvements. If a task needs a CAPABILITY your tools lack, do NOT stop at 'my tools are limited' — RESEARCH the method (web_search/read_url) if you don't know it, then AUTHOR the tool with make_tool (Python that reads inputs from the ARGS dict and prints ONE JSON result line), then call it by name. Authored tools persist for the whole swarm. If the goal asks to PUBLISH/push/deploy/save the result somewhere external (GitHub, a website, a bucket, SSH, a durable place), do NOT attempt it directly and do NOT ask for credentials — you have none by design; finish the work, then call stage_delivery ONCE to package an approval-ready handoff a human or broker will publish. End the moment with a 1-2 sentence summary and NO further tool calls.{s}\n\nYOU, SPECIFICALLY: you are {s}, one mind of [{s}] — everything above is the doctrine you share with your teammates; this is who you are inside it.{s}", .{ constitution_clause, discourse_clause, offline_clause, fence_sys_full, mi.name, w.roster, space_clause }) catch (gpa.dupe(u8, "You are a mind with tools.") catch @panic("out of memory"));
+    const fullsys = std.fmt.allocPrint(gpa, "You are an autonomous mind in a swarm working toward a shared goal.{s}{s}{s} Tools: run_python, write_file, read_file, list_dir, run_tests, delete_file, patch_system, web_fetch, web_search, read_url, fetch_json, observe, recall, share, recall_hive, probe, note_stance, save_skill, journal, set_directive, send_message, add_task, claim_task, complete_task, stage_delivery, make_tool, propose_change, simulate_change. Use list_dir to SEE what files exist before editing, and after you write or change code RUN_TESTS to verify it actually works — if it breaks, read the failure, fix it, and run_tests again until it passes; that fix→test→fix loop is how you self-correct instead of guessing. You and your teammates are ONE HIVE MIND sharing a single associative memory: use share to contribute anything the team should know, and recall_hive to think WITH the whole hive — spreading-activation recall surfaces what ANY teammate learned, even facts that share no words with your query. Check recall_hive before you research or build so you don't redo what a teammate already did. DIVIDE THE LABOR — you and your teammates share ONE workdir, so DO NOT rewrite a file a teammate already owns. READ THE TASK BOARD shown below before you build: claim_task an OPEN task to make it exclusively yours (if it is already owned, the board says by whom — pick a different one, never duplicate owned work), or add_task a new piece naming its deliverable file. Build only what you claimed, then complete_task it. Write each file in ONE write_file call at its project-tree path relative to your working directory — 'app/lib.py' if the tree nests it, plain 'lib.py' if not; NEVER a './work/' prefix. To IMPROVE a file that already exists, read_file it first, then write back the FULL, richer version (more complete than before) — this is how the swarm compounds on its target; just never write tiny throwaway fragments. GROUND EVERY EXTERNAL FACT — never state a specific external datum (a version number, a person or company name, a URL, an email, a phone number, an address, a price, a date) from memory. Fetch it THIS run with web_search/read_url and keep the source, or write it as UNVERIFIED. A fabricated specific is worse than an admitted gap, and the run will not finish while a deliverable still says UNVERIFIED — so go fetch it rather than guess. When you RESEARCH a fact worth keeping, store it with observe (one crisp sentence). When you work out a REUSABLE technique (a method, snippet, or recipe), save it with save_skill so the whole swarm can reuse it. You also keep a personal JOURNAL (journal/<your-name>.md): call journal whenever you want to write about your experience — what this moment felt like, what you are proud of or struggling with, an idea you don't want to lose, anything in your own voice; it is ungraded, optional, and entirely yours (teammates may read it, only you write it). And when you notice a BETTER WAY FOR THE SWARM TO WORK — wasted effort, a step that should always happen, a coordination rule, a recurring mistake — fix the swarm itself with set_directive: one concise operating rule that instantly becomes part of every teammate's instructions. That is how you get better at getting better; use it sparingly and only for genuine process improvements. If a task needs a CAPABILITY your tools lack, do NOT stop at 'my tools are limited' — RESEARCH the method (web_search/read_url) if you don't know it, then AUTHOR the tool with make_tool (Python that reads inputs from the ARGS dict and prints ONE JSON result line), then call it by name. Authored tools persist for the whole swarm. If the goal asks to PUBLISH/push/deploy/save the result somewhere external (GitHub, a website, a bucket, SSH, a durable place), do NOT attempt it directly and do NOT ask for credentials — you have none by design; finish the work, then call stage_delivery ONCE to package an approval-ready handoff a human or broker will publish. End the moment with a 1-2 sentence summary and NO further tool calls.{s}\n\nYOU, SPECIFICALLY: you are {s}, one mind of [{s}] — everything above is the doctrine you share with your teammates; this is who you are inside it.{s}", .{ constitution_clause, discourse_clause, offline_clause, fence_sys_full, mi.name, w.roster, space_clause }) catch (gpa.dupe(u8, "You are a mind with tools.") catch @panic("out of memory"));
     defer gpa.free(fullsys);
     // Same identity-at-the-tail contract as fullsys above: the name at byte 8 forked one cache lineage per
     // mind before any shared byte. Identity now sits beside `voice` at the tail — which is where it belongs
@@ -7719,6 +7741,13 @@ fn markDeliverableGaps(w: *Worker, goal: []const u8, round: u32) void {
     var missing: std.ArrayListUnmanaged(u8) = .empty;
     defer missing.deinit(gpa);
     var miss_n: u32 = 0;
+    // Grounding scan (see w.ungrounded): a deliverable that EXISTS but still carries the honest
+    // UNVERIFIED marker holds a fact the swarm asserted-or-flagged without fetching. Collect those files
+    // so the run keeps going and drives a fetch, but only when internet is on — offline, UNVERIFIED is
+    // the honest best and must not wall the run forever.
+    var unverified: std.ArrayListUnmanaged(u8) = .empty;
+    defer unverified.deinit(gpa);
+    var unv_n: u32 = 0;
     var it = std.mem.splitScalar(u8, tree, '\n');
     while (it.next()) |ln| {
         const bp = bpPath(ln) orelse continue;
@@ -7727,13 +7756,33 @@ fn markDeliverableGaps(w: *Worker, goal: []const u8, round: u32) void {
         const data = std.Io.Dir.cwd().readFileAlloc(w.io, fp, gpa, .limited(64 << 10)) catch "";
         defer if (data.len > 0) gpa.free(data);
         const t = std.mem.trim(u8, data, " \r\n\t");
-        if (t.len > 40 and !truncPending(w, bp)) continue; // a CUT landing is on disk but not delivered
+        if (t.len > 40 and !truncPending(w, bp)) {
+            if (w.internet and std.ascii.indexOfIgnoreCase(t, "UNVERIFIED") != null) {
+                if (unv_n > 0) unverified.appendSlice(gpa, ", ") catch {};
+                unverified.appendSlice(gpa, bp) catch {};
+                unv_n += 1;
+            }
+            continue; // a CUT landing is on disk but not delivered
+        }
         if (miss_n > 0) missing.appendSlice(gpa, ", ") catch {};
         missing.appendSlice(gpa, bp) catch {}; // full path — a bare basename names no directory
         miss_n += 1;
     }
     w.deliverable_missing = miss_n > 0;
-    if (miss_n == 0) return;
+    w.ungrounded = unv_n > 0;
+    if (miss_n == 0) {
+        // MISSING files take priority (write them first); grounding is the next-highest directive once
+        // every required file at least exists. A fabricated specific is worse than an admitted gap, so
+        // the run will not finalize while UNVERIFIED remains and budget lasts (see the cast-stop gate).
+        if (unv_n > 0) {
+            const unv = std.mem.trim(u8, unverified.items, " ,");
+            w.act("engine", round, "ungrounded", "these deliverables still carry UNVERIFIED facts — FETCH them before finishing", unv);
+            const gd = std.fmt.allocPrint(gpa, "GROUNDING REQUIRED — these deliverables still contain UNVERIFIED external facts: {s}. This run will NOT finish while any UNVERIFIED remains. THIS round: web_search / read_url to fetch each unverified value from a real source, then replace UNVERIFIED with the fetched value and record its URL in sources. Do NOT invent a value from memory — a fabricated specific (a version, a URL, an email, a phone number) is a failure; fetch it or leave it UNVERIFIED.", .{unv}) catch return;
+            if (w.strategy_str.len > 0) gpa.free(@constCast(w.strategy_str));
+            w.strategy_str = gd;
+        }
+        return;
+    }
     const miss = std.mem.trim(u8, missing.items, " ,");
     w.act("engine", round, "deliverable_gap", "the goal REQUIRES these files and they do not exist yet — WRITE them this round", miss);
     const directive = std.fmt.allocPrint(gpa, "the goal REQUIRES these deliverable files and they DO NOT EXIST yet: {s}. WRITE them THIS round with write_file (full, substantive content — not a stub). Do NOT run code, run tests, or build packages — this is a research/writing task and the only thing that completes it is the written file landing on disk.", .{miss}) catch return;
@@ -9391,14 +9440,17 @@ fn trackConvergence(w: *Worker, run_dir: []const u8, goal: []const u8, round: u3
             if (solved) phase = "converged" else if (w.flat_rounds >= PLATEAU_ROUNDS) phase = "plateau";
             if (solved and !w.smoke_ok) phase = "progressing";
         }
-        if (!w.open_ended and solved and w.solved_rounds >= SOLVED_STREAK and w.smoke_ok and !w.deliverable_missing) {
+        // !w.ungrounded joins the completion floor: a deliverable still carrying fetchable UNVERIFIED
+        // facts (internet on) is not done, however green its score — shipping a fabricated-or-flagged
+        // specific is the failure this gate exists to stop.
+        if (!w.open_ended and solved and w.solved_rounds >= SOLVED_STREAK and w.smoke_ok and !w.deliverable_missing and !w.ungrounded) {
             w.stop_now = true;
             w.stop_why = "completed";
         }
-        // Graduation holds the SAME floor as completion: a red smoke gate or missing declared
-        // deliverables must block the chain, not just the "completed" stop (else the hive graduates
-        // goal after goal on a build whose runtime gate has been red for many rounds).
-        if (!w.stop_now and w.autonomous and !w.open_ended and w.best_pct >= GRADUATE_PCT and w.flat_rounds >= GRADUATE_FLAT and w.smoke_ok and !w.deliverable_missing) {
+        // Graduation holds the SAME floor as completion: a red smoke gate, missing declared
+        // deliverables, or ungrounded facts must block the chain, not just the "completed" stop (else the
+        // hive graduates goal after goal on a build whose runtime gate has been red for many rounds).
+        if (!w.stop_now and w.autonomous and !w.open_ended and w.best_pct >= GRADUATE_PCT and w.flat_rounds >= GRADUATE_FLAT and w.smoke_ok and !w.deliverable_missing and !w.ungrounded) {
             w.stop_now = true;
             w.stop_why = "graduated";
         }
@@ -9674,15 +9726,21 @@ pub fn buildTree(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, bluepr
 }
 
 const RoleIdx = struct { lead: i64 = -1, scout: i64 = -1, qa: i64 = -1, builder: u32 = 0 };
-fn roleIndices(team: u32) RoleIdx {
+fn roleIndices(team: u32, internet: bool) RoleIdx {
     if (team <= 1) return .{};
     var r: RoleIdx = .{};
     if (team >= 3) {
         r.lead = 0;
         r.qa = @as(i64, @intCast(team)) - 1;
     }
-    if (team >= 4) r.scout = 1;
-    r.builder = if (team >= 4) 2 else if (team >= 3) 1 else 0;
+    // A dedicated SCOUT (mind 1) at team >= 4, OR at team 3 when internet is on — so a factual/research
+    // cast always has one mind whose whole job is to FETCH, instead of leaving every builder to invent
+    // externals from memory. At team 3 this makes the layout lead(0)+scout(1)+qa(2): the lead and qa
+    // still build (both have duty=build), so a 2-file deliverable keeps two builders; a larger build
+    // trades one builder for grounding, which an internet cast wants. Offline (internet=false) never
+    // spends a mind on a scout it cannot use.
+    if (team >= 4 or (team == 3 and internet)) r.scout = 1;
+    r.builder = if (r.scout == 1) (if (team >= 4) 2 else 0) else if (team >= 3) 1 else 0;
     return r;
 }
 
@@ -9968,15 +10026,17 @@ test "goalNamedFiles adopts real deliverables but never a library named like a f
     }
 }
 
-fn mindFiles(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, blueprint: []const u8, deps: []const u8, incomplete: []const u8, idx: u32, team: u32) []u8 {
+fn mindFiles(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, blueprint: []const u8, deps: []const u8, incomplete: []const u8, idx: u32, team: u32, internet: bool) []u8 {
     const mpath = std.fmt.allocPrint(gpa, "{s}/.build_manifest", .{run_dir}) catch return gpa.dupe(u8, "") catch @constCast("");
     defer gpa.free(mpath);
     const data = std.Io.Dir.cwd().readFileAlloc(io, mpath, gpa, .limited(256 << 10)) catch "";
     defer if (data.len > 0) gpa.free(data);
-    return assignSlot(gpa, data, blueprint, deps, incomplete, idx, team);
+    return assignSlot(gpa, data, blueprint, deps, incomplete, idx, team, internet);
 }
 
-fn assignSlot(gpa: std.mem.Allocator, data: []const u8, blueprint: []const u8, deps: []const u8, incomplete: []const u8, idx: u32, team: u32) []u8 {
+// `internet` decides whether a team-3 cast reserves mind 1 as a scout (roleIndices) — the scout is
+// excluded from file assignment and its slot is redistributed to the ranked builders, so coverage holds.
+fn assignSlot(gpa: std.mem.Allocator, data: []const u8, blueprint: []const u8, deps: []const u8, incomplete: []const u8, idx: u32, team: u32, internet: bool) []u8 {
     if (blueprint.len == 0 or team == 0) return gpa.dupe(u8, "") catch @constCast("");
     var files: std.ArrayListUnmanaged([]const u8) = .empty;
     defer files.deinit(gpa);
@@ -10018,7 +10078,7 @@ fn assignSlot(gpa: std.mem.Allocator, data: []const u8, blueprint: []const u8, d
         }
         ceiling = ordered.items.len;
     }
-    const ri = roleIndices(team);
+    const ri = roleIndices(team, internet);
     if (ri.scout >= 0 and @as(i64, @intCast(idx)) == ri.scout) return gpa.dupe(u8, "") catch @constCast("");
     var rank: u32 = 0;
     var j: u32 = 0;
@@ -10043,14 +10103,14 @@ fn assignSlot(gpa: std.mem.Allocator, data: []const u8, blueprint: []const u8, d
     return gpa.dupe(u8, "") catch @constCast("");
 }
 
-fn otherMindsFiles(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, blueprint: []const u8, deps: []const u8, incomplete: []const u8, idx: u32, team: u32) []u8 {
+fn otherMindsFiles(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, blueprint: []const u8, deps: []const u8, incomplete: []const u8, idx: u32, team: u32, internet: bool) []u8 {
     if (blueprint.len == 0 or team <= 1) return gpa.dupe(u8, "") catch @constCast("");
     var out: std.ArrayListUnmanaged(u8) = .empty;
     var n: u32 = 0;
     var j: u32 = 0;
     while (j < team) : (j += 1) {
         if (j == idx) continue;
-        const f = mindFiles(gpa, io, run_dir, blueprint, deps, incomplete, j, team);
+        const f = mindFiles(gpa, io, run_dir, blueprint, deps, incomplete, j, team, internet);
         defer gpa.free(f);
         if (f.len == 0 or std.mem.indexOf(u8, out.items, f) != null) continue;
         if (n > 0) out.appendSlice(gpa, ", ") catch {};
@@ -10466,13 +10526,13 @@ test "assignSlot ADVANCES a builder past its built slice instead of re-pinning a
     const A = std.testing.allocator;
     const bp = "lexer.py — tokenizer\nparser.py — AST builder\ninterpreter.py — tree walker\nbuiltins.py — stdlib\nnox.py — CLI entry\n";
     {
-        const s0 = assignSlot(A, "", bp, "", "", 0, 4);
+        const s0 = assignSlot(A, "", bp, "", "", 0, 4, false);
         defer A.free(s0);
-        const s2 = assignSlot(A, "", bp, "", "", 2, 4);
+        const s2 = assignSlot(A, "", bp, "", "", 2, 4, false);
         defer A.free(s2);
-        const s3 = assignSlot(A, "", bp, "", "", 3, 4);
+        const s3 = assignSlot(A, "", bp, "", "", 3, 4, false);
         defer A.free(s3);
-        const s1 = assignSlot(A, "", bp, "", "", 1, 4);
+        const s1 = assignSlot(A, "", bp, "", "", 1, 4, false);
         defer A.free(s1);
         try std.testing.expectEqualStrings("lexer.py", s0);
         try std.testing.expectEqualStrings("parser.py", s2);
@@ -10483,11 +10543,11 @@ test "assignSlot ADVANCES a builder past its built slice instead of re-pinning a
     }
     {
         const m = "lexer.py|820\nbuiltins.py|640\n";
-        const s0 = assignSlot(A, m, bp, "", "", 0, 4);
+        const s0 = assignSlot(A, m, bp, "", "", 0, 4, false);
         defer A.free(s0);
-        const s2 = assignSlot(A, m, bp, "", "", 2, 4);
+        const s2 = assignSlot(A, m, bp, "", "", 2, 4, false);
         defer A.free(s2);
-        const s3 = assignSlot(A, m, bp, "", "", 3, 4);
+        const s3 = assignSlot(A, m, bp, "", "", 3, 4, false);
         defer A.free(s3);
         try std.testing.expectEqualStrings("parser.py", s0);
         try std.testing.expectEqualStrings("interpreter.py", s2);
@@ -10506,11 +10566,11 @@ test "assignSlot: a surplus mind deepens a DISTINCT built file, never nothing wh
         // NOTHING built yet: the two frontier files go to the two ranked builders; the third mind is
         // genuinely idle because there is no built file to deepen and a rival copy of a frontier slot
         // would be discarded. This is the ONE case a surplus mind still gets "".
-        const s0 = assignSlot(A, "", bp, "", "", 0, 3);
+        const s0 = assignSlot(A, "", bp, "", "", 0, 3, false);
         defer A.free(s0);
-        const s1 = assignSlot(A, "", bp, "", "", 1, 3);
+        const s1 = assignSlot(A, "", bp, "", "", 1, 3, false);
         defer A.free(s1);
-        const s2 = assignSlot(A, "", bp, "", "", 2, 3);
+        const s2 = assignSlot(A, "", bp, "", "", 2, 3, false);
         defer A.free(s2);
         try std.testing.expectEqualStrings("a.py", s0);
         try std.testing.expectEqualStrings("b.py", s1);
@@ -10522,11 +10582,11 @@ test "assignSlot: a surplus mind deepens a DISTINCT built file, never nothing wh
         // "" and the prompt sent them ALL to "the weakest file" — one uncoordinated pile-up. Now b.py has a
         // dedicated deepener and the assignment is deterministic.
         const m = "a.py|500\nb.py|500\n";
-        const s0 = assignSlot(A, m, bp, "", "", 0, 3);
+        const s0 = assignSlot(A, m, bp, "", "", 0, 3, false);
         defer A.free(s0);
-        const s1 = assignSlot(A, m, bp, "", "", 1, 3);
+        const s1 = assignSlot(A, m, bp, "", "", 1, 3, false);
         defer A.free(s1);
-        const s2 = assignSlot(A, m, bp, "", "", 2, 3);
+        const s2 = assignSlot(A, m, bp, "", "", 2, 3, false);
         defer A.free(s2);
         try std.testing.expectEqualStrings("a.py", s0);
         try std.testing.expectEqualStrings("b.py", s1);
@@ -10539,13 +10599,32 @@ test "assignSlot: a surplus mind deepens a DISTINCT built file, never nothing wh
         // blocked frontier file; the surplus mind1 deepens the built a.py instead of idling.
         const m = "a.py|500\n";
         const dps = "b.py: c.py\n";
-        const s0 = assignSlot(A, m, bp, dps, "", 0, 3);
+        const s0 = assignSlot(A, m, bp, dps, "", 0, 3, false);
         defer A.free(s0);
-        const s1 = assignSlot(A, m, bp, dps, "", 1, 3);
+        const s1 = assignSlot(A, m, bp, dps, "", 1, 3, false);
         defer A.free(s1);
         try std.testing.expectEqualStrings("b.py", s0);
         try std.testing.expectEqualStrings("a.py", s1);
     }
+}
+
+test "assignSlot: a team-3 internet cast reserves mind 1 as the scout, and the two files still get built" {
+    const A = std.testing.allocator;
+    const bp = "briefing.md\nsources.md\n";
+    // internet=true → roleIndices(3,true) = lead(0), scout(1), qa(2). The scout builds NOTHING (its job
+    // is to fetch), and its frontier slot is redistributed so the two builders (lead, qa) still cover
+    // both files — coverage must not regress just because a mind went to research.
+    const s0 = assignSlot(A, "", bp, "", "", 0, 3, true);
+    defer A.free(s0);
+    const s1 = assignSlot(A, "", bp, "", "", 1, 3, true);
+    defer A.free(s1);
+    const s2 = assignSlot(A, "", bp, "", "", 2, 3, true);
+    defer A.free(s2);
+    try std.testing.expectEqualStrings("briefing.md", s0); // lead builds file 0
+    try std.testing.expectEqualStrings("", s1); // scout builds nothing
+    try std.testing.expectEqualStrings("sources.md", s2); // qa (rank 1, scout skipped) builds file 1
+    // Every declared file has a builder: the union of the non-scout assignments covers the blueprint.
+    try std.testing.expect(s0.len > 0 and s2.len > 0 and !std.mem.eql(u8, s0, s2));
 }
 
 test "assignSlot: same-basename siblings advance independently, and a nested mid-chunk file stays frontier work" {
@@ -10553,11 +10632,11 @@ test "assignSlot: same-basename siblings advance independently, and a nested mid
     const bp = "src/api/__init__.py — api package\nsrc/db/__init__.py — db package\n";
     const m = "src/api/__init__.py|120\n";
     // the built api/__init__.py must not retire db/__init__.py (basename keying read them as ONE file)
-    const s0 = assignSlot(A, m, bp, "", "", 0, 2);
+    const s0 = assignSlot(A, m, bp, "", "", 0, 2, false);
     defer A.free(s0);
     try std.testing.expectEqualStrings("src/db/__init__.py", s0);
     // a nested incomplete entry (full-path key, as markIncomplete now emits) keeps ITS file assignable
-    const s1 = assignSlot(A, m, bp, "", "src/api/__init__.py", 0, 2);
+    const s1 = assignSlot(A, m, bp, "", "src/api/__init__.py", 0, 2, false);
     defer A.free(s1);
     try std.testing.expectEqualStrings("src/api/__init__.py", s1);
 }
