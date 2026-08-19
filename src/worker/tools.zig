@@ -406,6 +406,11 @@ pub const ToolCtx = struct {
     owned_by_others: []const u8 = "",
     share_obs: bool = false,
     internet: bool = true,
+    /// The swarm worker's browser decision (run.zig w.browser), threaded so browserEnabled honors ONE
+    /// source of truth instead of re-reading NL_BROWSER_DRIVER — the schema that advertises the tool and
+    /// the gate that dispatches it must agree. Default false: a chat ToolCtx that leaves it unset falls
+    /// through to the env/caps check exactly as before (no chat-path change).
+    browser: bool = false,
     discourse: bool = false,
     one_slot: bool = false,
     slot_path: []const u8 = "",
@@ -2057,6 +2062,7 @@ fn runRecipe(ctx: *ToolCtx, rec: *const recipes.Recipe, args_json: []const u8) [
 /// its profile's cookies, which is not something to hand out by default.
 fn browserEnabled(ctx: *ToolCtx) bool {
     if (ctx.caps == .full) return true;
+    if (ctx.browser) return true; // the swarm worker's resolved decision (run.zig w.browser)
     const v = ctx.environ.get("NL_BROWSER_DRIVER") orelse return false;
     return v.len > 0 and !std.mem.eql(u8, v, "0") and !std.ascii.eqlIgnoreCase(v, "false");
 }
