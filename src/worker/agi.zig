@@ -781,6 +781,12 @@ pub fn resetForNewGoal(w: *Worker, run_dir: []const u8, goal: []const u8) void {
     w.best_knowledge = 0;
     w.best_snapshot = false;
     w.tests_seeded = false;
+    // The grounding ledger is per-goal: a live fetch that grounded goal 1 says nothing about goal 2's
+    // deliverable, and carrying fetch_ok forward would let a chained goal ship fabricated specifics
+    // under goal 1's credit (the attempted-and-failed backstop reads these).
+    w.fetch_tried.store(0, .monotonic);
+    w.fetch_ok.store(0, .monotonic);
+    w.ungrounded = false;
 }
 
 test "willOf extracts the MY WILL directive (the prediction the self is held to) and tolerates absence" {
