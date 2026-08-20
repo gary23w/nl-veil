@@ -6760,6 +6760,40 @@ fn workingBudgetBytes(base_url: []const u8, model: []const u8, fixed_bytes: usiz
     return @max(WORKING_MIN_BUDGET_BYTES, @min(cctx.WORKING_COMPACT_BYTES, available));
 }
 
+/// The exact head of an assistant object as this engine serializes it. Shared by the tool-call turn builder
+/// and reasoningSpliceOffset so the splice lands right after `"assistant"`, byte-for-byte in step.
+const ASSISTANT_OBJ_HEAD = ",{\"role\":\"assistant\"";
+
+/// Where to splice a `,"reasoning_content":...` into the LIVE conv_buf: right after the head of the most
+/// recent assistant object, but ONLY when that object is a tool-call turn that has not already echoed its
+/// reasoning. Read from the current buffer (not a saved offset) so compactWorking rewriting the span cannot
+/// stale it. null ⇒ nothing to heal (no tool-call turn, or already echoed). Pure — tested.
+fn reasoningSpliceOffset(buf: []const u8) ?usize {
+    const a0 = std.mem.lastIndexOf(u8, buf, ASSISTANT_OBJ_HEAD) orelse return null;
+    const obj = buf[a0..]; // from this assistant object to the end (its tool_calls + the tool results after it)
+    if (std.mem.indexOf(u8, obj, "\"tool_calls\"") == null) return null; // a plain turn (e.g. a compaction summary)
+    if (std.mem.indexOf(u8, obj, "\"reasoning_content\"") != null) return null; // already carries it
+    return a0 + ASSISTANT_OBJ_HEAD.len;
+}
+
+test "reasoningSpliceOffset finds the tool-call turn head, skips plain + already-echoed turns" {
+    // A tool-call turn with no reasoning_content: splice right after the head.
+    const b1 = "{\"role\":\"user\",\"content\":\"hi\"},{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{}]},{\"role\":\"tool\",\"content\":\"r\"}";
+    const off = reasoningSpliceOffset(b1).?;
+    try std.testing.expectEqualStrings(",\"content\":", b1[off .. off + 11]); // lands between "assistant" and ,"content"
+    // Already echoed ⇒ no splice (would double it).
+    const b2 = "{\"role\":\"assistant\",\"reasoning_content\":\"t\",\"tool_calls\":[{}]},{\"role\":\"tool\",\"content\":\"r\"}";
+    try std.testing.expect(reasoningSpliceOffset(b2) == null);
+    // No tool-call turn at all (a plain assistant answer) ⇒ nothing to heal.
+    const b3 = "{\"role\":\"user\",\"content\":\"hi\"},{\"role\":\"assistant\",\"content\":\"done\"}";
+    try std.testing.expect(reasoningSpliceOffset(b3) == null);
+    // The LAST assistant object wins: an older summary turn must not shadow the real tool-call turn.
+    const b4 = "{\"role\":\"assistant\",\"content\":\"summary\"},{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{}]},{\"role\":\"tool\",\"content\":\"r\"}";
+    const off4 = reasoningSpliceOffset(b4).?;
+    try std.testing.expect(std.mem.indexOfPos(u8, b4, off4, "\"tool_calls\"") != null);
+    try std.testing.expect(off4 > std.mem.indexOf(u8, b4, "summary").?); // past the summary turn
+}
+
 fn runInnerAgentic(
     app: *App,
     uid: u64,
@@ -6864,6 +6898,14 @@ fn runInnerAgentic(
     // is that caller-static variant (plus any granted recipe schemas) resolved ONCE in runTurn and passed in, so
     // every drive pass advertises the SAME bytes (grants are turn-stable; see buildTurnTools).
 
+    // THINKING-MODE reasoning echo-back (self-heal). DeepSeek's thinking mode 400s a tool-call round whose
+    // assistant turn omits reasoning_content ('...must be passed back'), while the classic reasoner 400s the
+    // OPPOSITE way — so there is no safe universal default. Build assistant turns WITHOUT it; on that exact
+    // error, learn the quirk for this model, splice the saved reasoning into the offending turn, and retry.
+    // Thereafter every turn echoes it inline (reasoningEchoFor): one failed round-trip per model per session.
+    var asst_reasoning: []u8 = empty; // the last assistant tool-call turn's reasoning, duped to outlive the
+    defer if (asst_reasoning.len > 0) gpa.free(asst_reasoning); // step (the buffer has no reasoning to recover)
+    var reasoning_healed = false; // at most one heal attempt per pass — never spin if the retry still fails
     var iter: usize = 0;
     while (iter < MAX_ITERS) : (iter += 1) {
         // COOPERATIVE CONTROL (before each inference): a stop aborts with whatever narration we have; a steer is
@@ -6917,6 +6959,24 @@ fn runInnerAgentic(
         }
 
         if (!step.ok) {
+            // THINKING-MODE HEAL: this request was rejected because the prior assistant tool-call turn omitted
+            // reasoning_content. Learn the quirk, splice the saved reasoning into that turn, and retry the same
+            // inference on the corrected history — once. Only reachable on inference >=2, so the prior turn (and
+            // its saved reasoning) exists; later turns echo inline, so this fires at most once per pass.
+            if (!reasoning_healed and asst_reasoning.len > 0 and llm.isReasoningEchoError(step.content)) {
+                // Locate the splice in the LIVE buffer (compactWorking may have moved the turn since it was
+                // built), then insert reasoning_content into it, learn the quirk, and retry the same inference.
+                if (reasoningSpliceOffset(conv_buf.items)) |off| {
+                    reasoning_healed = true;
+                    llm.learnReasoningEcho(app.io, model);
+                    var frag: std.ArrayListUnmanaged(u8) = .empty;
+                    defer frag.deinit(gpa);
+                    frag.appendSlice(gpa, ",\"reasoning_content\":") catch {};
+                    http.jstr(gpa, &frag, asst_reasoning) catch {};
+                    conv_buf.insertSlice(gpa, off, frag.items) catch {};
+                    continue; // re-drains control, re-infers on the corrected conv_buf
+                }
+            }
             {
                 // Provider errors quote ACCOUNT MATERIAL back at us — observed live: a suspension error
                 // carrying the org id and an "<ak-…>" key alias landed verbatim in the durable event log and
@@ -6990,7 +7050,20 @@ fn runInnerAgentic(
         }
 
         // append the assistant tool_call turn to the running context (standard OpenAI tool_calls shape) ...
-        conv_buf.appendSlice(gpa, ",{\"role\":\"assistant\",\"content\":") catch return .{ .outcome = .hard_error, .content = empty };
+        // Record where this turn starts + dup its reasoning, so the heal above can splice reasoning_content in
+        // if the NEXT inference is rejected for its absence. Freed on replace (and by the defer at pass exit).
+        // Dup this turn's reasoning so the heal can splice it back if the NEXT inference is rejected for its
+        // absence (the buffer itself carries no reasoning to recover). Freed on replace + by the pass defer.
+        if (asst_reasoning.len > 0) gpa.free(asst_reasoning);
+        asst_reasoning = gpa.dupe(u8, step.reasoning) catch empty;
+        conv_buf.appendSlice(gpa, ASSISTANT_OBJ_HEAD) catch return .{ .outcome = .hard_error, .content = empty };
+        // Echo reasoning_content inline once the model is known to require it (learned via the heal). BEFORE
+        // content, so this path and the splice (asst_turn_at + ASST_HEAD.len) insert at the same offset.
+        if (step.reasoning.len > 0 and llm.reasoningEchoFor(app.io, model)) {
+            conv_buf.appendSlice(gpa, ",\"reasoning_content\":") catch return .{ .outcome = .hard_error, .content = empty };
+            http.jstr(gpa, conv_buf, step.reasoning) catch return .{ .outcome = .hard_error, .content = empty };
+        }
+        conv_buf.appendSlice(gpa, ",\"content\":") catch return .{ .outcome = .hard_error, .content = empty };
         http.jstr(gpa, conv_buf, step.content) catch return .{ .outcome = .hard_error, .content = empty };
         conv_buf.appendSlice(gpa, ",\"tool_calls\":[") catch return .{ .outcome = .hard_error, .content = empty };
         for (step.calls, 0..) |c, i| {

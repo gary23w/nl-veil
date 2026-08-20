@@ -1277,7 +1277,17 @@ fn largeToolCallVerdict(raw: []const u8) bool {
 // again. A GENERAL mechanism seeded with the temperature rules — add detectQuirk cases as constraints surface.
 
 const TempRule = enum { keep, force, drop };
-const Quirk = struct { temp: TempRule = .keep, temp_val: f32 = 1.0 };
+const Quirk = struct {
+    temp: TempRule = .keep,
+    temp_val: f32 = 1.0,
+    // Echo the assistant's reasoning_content back on a tool-call turn. Default OFF: the classic
+    // deepseek-reasoner 400s if reasoning_content is present in the history, while DeepSeek's newer
+    // thinking mode 400s if it is ABSENT on an assistant turn that carried a tool_call ('reasoning_content
+    // in the thinking mode must be passed back'). No safe universal default — so it is LEARNED per model
+    // from that exact error and remembered, exactly like the temperature rules. The echo itself happens at
+    // the engine's message-build layer (it owns the reasoning text), gated on reasoningEchoFor().
+    reasoning_echo: bool = false,
+};
 
 const QuirkSlot = struct { hash: u64 = 0, q: Quirk = .{} };
 var quirk_tbl: [128]QuirkSlot = @splat(.{});
@@ -1289,7 +1299,8 @@ fn learnQuirk(io: std.Io, model: []const u8, q: Quirk) void {
     quirk_mtx.lockUncancelable(io);
     defer quirk_mtx.unlock(io);
     for (&quirk_tbl) |*e| if (e.hash == h) {
-        e.q = q;
+        e.q.temp = q.temp; // merge: never clobber a learned reasoning_echo when a temp rule lands (or vice versa)
+        e.q.temp_val = q.temp_val;
         return;
     };
     for (&quirk_tbl) |*e| if (e.hash == 0) {
@@ -1306,6 +1317,41 @@ fn quirkFor(io: std.Io, model: []const u8) Quirk {
     defer quirk_mtx.unlock(io);
     for (&quirk_tbl) |*e| if (e.hash == h) return e.q;
     return .{};
+}
+
+/// Learn that THIS model requires reasoning_content to be echoed back on tool-call turns (DeepSeek thinking
+/// mode). Merges into any existing slot so a temperature rule already learned for the model survives. The
+/// engine calls this the moment the provider returns the "must be passed back" error, then retries.
+pub fn learnReasoningEcho(io: std.Io, model: []const u8) void {
+    if (model.len == 0) return;
+    const h = std.hash.Wyhash.hash(0x9e37, model);
+    quirk_mtx.lockUncancelable(io);
+    defer quirk_mtx.unlock(io);
+    for (&quirk_tbl) |*e| if (e.hash == h) {
+        e.q.reasoning_echo = true;
+        return;
+    };
+    for (&quirk_tbl) |*e| if (e.hash == 0) {
+        e.* = .{ .hash = h, .q = .{ .reasoning_echo = true } };
+        return;
+    };
+    quirk_tbl[0] = .{ .hash = h, .q = .{ .reasoning_echo = true } };
+}
+
+/// Does this model need its reasoning echoed back on tool-call turns? (Learned; false until proven.)
+pub fn reasoningEchoFor(io: std.Io, model: []const u8) bool {
+    return quirkFor(io, model).reasoning_echo;
+}
+
+/// Is this provider error the thinking-mode "reasoning_content must be passed back" constraint? The engine
+/// checks this at its message-build layer (llm.zig cannot heal it — the reasoning text was dropped upstream,
+/// not mangled in the body). Case-insensitive; both key phrases sit near the front of the real error.
+pub fn isReasoningEchoError(msg: []const u8) bool {
+    var lb: [512]u8 = undefined;
+    const n = @min(msg.len, lb.len);
+    const m = std.ascii.lowerString(lb[0..n], msg[0..n]);
+    return std.mem.indexOf(u8, m, "reasoning_content") != null and
+        (std.mem.indexOf(u8, m, "passed back") != null or std.mem.indexOf(u8, m, "thinking mode") != null);
 }
 
 /// Read a PARAM-CONSTRAINT quirk out of a provider's error message (case-insensitive). null = not a
@@ -2539,6 +2585,33 @@ test "self-healing quirks: detect temperature constraints, rewrite the body, ext
     // the model id rides out of the request body for the learn step
     try std.testing.expectEqualStrings("kimi-k3", bodyModel("{\"model\":\"kimi-k3\",\"messages\":[]}").?);
     try std.testing.expect(bodyModel("{\"messages\":[]}") == null);
+}
+
+test "reasoning-echo quirk: detected from the thinking-mode error, learned per model, merges with temp" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // The exact DeepSeek phrasing, and a JSON-wrapped variant, both trip the predicate; unrelated errors do not.
+    try std.testing.expect(isReasoningEchoError("The reasoning_content in the thinking mode must be passed back to the API."));
+    try std.testing.expect(isReasoningEchoError("{\"error\":{\"message\":\"reasoning_content must be passed back\"}}"));
+    try std.testing.expect(!isReasoningEchoError("rate limit exceeded, please retry"));
+    try std.testing.expect(!isReasoningEchoError("temperature is not supported with this model"));
+
+    // Unknown until learned; learning flips it on for THAT model only.
+    try std.testing.expect(!reasoningEchoFor(io, "reasoner-x"));
+    learnReasoningEcho(io, "reasoner-x");
+    try std.testing.expect(reasoningEchoFor(io, "reasoner-x"));
+    try std.testing.expect(!reasoningEchoFor(io, "reasoner-y"));
+
+    // Merge both directions: a temp rule learned after the echo must not clobber it, and vice versa.
+    learnQuirk(io, "reasoner-x", .{ .temp = .force, .temp_val = 1.0 });
+    try std.testing.expect(reasoningEchoFor(io, "reasoner-x")); // echo survived the temp write
+    try std.testing.expectEqual(TempRule.force, quirkFor(io, "reasoner-x").temp);
+    learnReasoningEcho(io, "kimi-merge");
+    learnQuirk(io, "kimi-merge", .{ .temp = .drop });
+    try std.testing.expect(reasoningEchoFor(io, "kimi-merge"));
+    try std.testing.expectEqual(TempRule.drop, quirkFor(io, "kimi-merge").temp);
 }
 
 test "jstr sanitizes invalid UTF-8 and stays valid JSON" {
