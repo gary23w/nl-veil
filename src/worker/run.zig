@@ -657,6 +657,22 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
     dataset.configure(gpa, io, environ, "");
     dataset.setSource(.swarm);
 
+    // DURABLE provider quirks, shared with the server: point llm.zig's self-healing table at the same
+    // {engine home}/data store main.zig's resolvePaths yields (NEURON_LOOPS_DATA overrides it the same
+    // way there — and this worker inherits the server's env) BEFORE the first live call, so a constraint
+    // ANY process ever learned is pre-applied instead of re-paying its failed round-trip here.
+    {
+        var data_buf: [4096 + 8]u8 = undefined;
+        var data_dir: []const u8 = if (environ.get("NEURON_LOOPS_DATA")) |d| d else "";
+        if (data_dir.len == 0) {
+            if (engineHome(gpa, io)) |home| {
+                defer gpa.free(@constCast(home));
+                data_dir = std.fmt.bufPrint(&data_buf, "{s}/data", .{home}) catch "";
+            } else |_| {}
+        }
+        if (data_dir.len > 0) llm.initQuirkStore(io, data_dir);
+    }
+
     const mani_path = try std.fmt.allocPrint(gpa, "{s}/swarm.json", .{run_dir});
     defer gpa.free(mani_path);
     const mani_raw = std.Io.Dir.cwd().readFileAlloc(io, mani_path, gpa, .limited(256 << 10)) catch {

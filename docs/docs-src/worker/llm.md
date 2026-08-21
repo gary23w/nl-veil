@@ -20,6 +20,7 @@ Every model call the worker makes goes through this client. It loads no models: 
 - `Caps` + `capsSnapshot()` + `probeCapabilities(...)` — the startup backend probe (native tool support, thinking, context length); `recordLargeToolWall(...)`
 - `isLocal(base_url)` — local endpoint detection; `fenceWrites(base_url, model)` — whether file-sized tool calls from this backend/model cannot be trusted and writes must be fenced
 - `jstr(gpa, list, s)` — JSON string escaper that sanitizes invalid UTF-8 (borrowed by commons.zig and others)
+- `initQuirkStore(io, dir)` — points the learned provider-quirk table at its durable `{dir}/provider_quirks.jsonl` and loads every prior lesson; called at boot by main.zig (server/CLI) and run.zig (each swarm worker) against the same data dir
 
 ## Dependencies
 
@@ -33,7 +34,7 @@ Called from every model-facing path in the worker: `run.zig` mind moments, the c
 
 ## Notable Implementation Details
 
-- Probe-first: a probed capability always wins over the port/model-name heuristics; unprobed backends fall back to heuristics (tested). Per-model quirks self-heal — e.g. a temperature-constraint error rewrites the body and retries.
+- Probe-first: a probed capability always wins over the port/model-name heuristics; unprobed backends fall back to heuristics (tested). Per-model quirks self-heal — e.g. a temperature-constraint error rewrites the body and retries — and the lessons are durable: each learn writes through to `provider_quirks.jsonl` in the data dir, so neither a server restart nor a fresh swarm worker re-pays a failed round-trip a previous process already paid (never-lose merge: file fields only fill gaps, RAM lessons stay authoritative).
 - Local **thinking** models get a max_tokens floor (2048) because hidden reasoning eats the budget before the answer; a plain relay model keeps the caller's value verbatim, so it never stalls generating filler.
 - The per-call wall-clock cap is DERIVED from the output-token budget instead of one flat constant — a flat 90s cap structurally killed exactly the largest, most valuable generations (documented in-file from a real run).
 - Ollama-native handling: `num_ctx` is pinned in options, argument objects are re-serialized into JSON-string tool calls, and the probed model context bounds the engine budget.

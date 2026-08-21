@@ -394,6 +394,11 @@ pub fn main(init: std.process.Init) !void {
         if (d.len > 0) paths.data = try gpa.dupe(u8, d);
     }
     _ = std.Io.Dir.cwd().createDirPathStatus(io, paths.data, .default_dir) catch {};
+    // DURABLE provider quirks: load what any previous process learned (and persist future lessons) before
+    // any surface — chat engine, sched, tools — can dispatch an LLM call. A swarm worker does the same in
+    // run.zig against the same path (`worker` short-circuits above, before paths resolve), so server and
+    // worker lessons compound instead of each process re-paying a known model's failed round-trip.
+    @import("worker/llm.zig").initQuirkStore(io, paths.data);
 
     // The one place the port is resolved (CLI client + server bind share it): NL_PORT else 8787.
     const cli_port: u16 = if (init.environ_map.get("NL_PORT")) |v|
