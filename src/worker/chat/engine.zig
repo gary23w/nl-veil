@@ -64,10 +64,19 @@ const ECHO_LIMIT: u8 = 3;
 /// times; an inference whose batch contains any such refusal (or a cross-batch ledger repeat) is one
 /// strike, and only a refusal-free inference that executed real work clears the streak — so a model
 /// cycling between tools, or padding one dead signature with calls that still execute, terminates
-/// instead of grinding to MAX_ITERS. Three is deliberately generous: strikes land at most one per
-/// inference, so the model sees the refusal feedback between every strike and ignores it three
-/// inferences running before the turn is cut.
-const LOOP_STOP_REFUSALS: u32 = 3;
+/// instead of grinding to MAX_ITERS. Generous on purpose: strikes land at most one per inference, so the
+/// model sees the refusal feedback between every strike and ignores it that many inferences running
+/// before the turn is cut.
+///
+/// FOUR, NOT THREE, AND THE FOURTH IS LOAD-BEARING. At three this sat in exact lockstep with the failure-streak
+/// escalation: a pure echo-grind accrues its first strike and its first streak point on the SAME inference, so
+/// `fail_streak` reached 3 — the round that spends a real completion on `toolArbiter` for a concrete way out —
+/// on the very inference that pushed `loop_refusals` to the kill threshold. The advice was generated, appended
+/// to a result the model would never be asked about, and thrown away with the turn. The engine paid for the one
+/// piece of genuinely new information it had to offer and then hung up before saying it. The fourth strike buys
+/// exactly one inference in which the model can read the arbiter's suggestion and act on it; if it grinds on
+/// anyway, that inference is a refusal too and the turn still ends. See the threshold-spacing test.
+const LOOP_STOP_REFUSALS: u32 = 4;
 
 /// Hard ceiling on AUTO-LOOP drive steps in one turn when the loop is OFF (loop=0). Kept low (6): a higher cap
 /// lets a thorough model "verify" and re-read forever after a fix, while 6 still fits a build + a couple of
@@ -99,6 +108,16 @@ const AFK_MAX_STEPS: usize = 100_000;
 /// stuckStep). A static nudge fires exactly when the loop is CONFIRMED stuck, which is the one moment a generic
 /// "try something different" is worth least and the one moment the tail contains the actual blocker.
 const AFK_STUCK_TMPL = "You just repeated the previous step — that is not making progress. STOP repeating it: re-read the goal, and try a DIFFERENT approach. If you're blocked, first recall_hive / web_search the ACTUAL error or unknown, then act on what you learn. Goal: \"{s}\".";
+/// What the LOOP HARD STOP writes when it cuts a turn (see loop_refusals). THIRD PERSON, DELIBERATELY.
+///
+/// This note used to read "(engine: I stopped this turn. …)" and was concatenated onto the model's own narration,
+/// which the caller commits as the assistant's durable message. Replay then handed it to the NEXT turn verbatim
+/// and unmarked, so the model read a first-person admission of being stuck as its own prior words — and each cut
+/// turn appended another copy. Ask such a run "are you stuck?" and it is looking at a growing column of what
+/// appear to be its own confessions sitting directly under the question; fixating is the correct reading of that
+/// transcript. Nothing here says "I" or "my": the engine narrates what the ENGINE did, the row is stored as
+/// `role:"system"` / `kind:"engine"` (see the .stopped arm), and only the newest survives replay (see seedLines).
+const LOOP_STOP_NOTE = "[engine: this turn was cut short by the loop guard — the same tool calls kept returning identical results, so more rounds could not make progress. Whatever is already written to the workdir is real: re-read it before redoing that work, and take a different approach.]";
 /// STUCK-RECOVERY WRITER (prompting). Reads the same bounded transcript tail the drive picker rides and names the
 /// concrete way around the blocker it can see, instead of the template's abstract encouragement.
 const STUCK_SYSTEM =
@@ -2009,7 +2028,14 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     // was already correct — it was just scoped to the recall block below and freed before the drive loop.
     var goal_owned: ?[]u8 = null;
     defer if (goal_owned) |g| gpa.free(g);
-    if (continuationShaped(user_text)) goal_owned = firstUserGoal(app, conv_dir);
+    // A META-QUESTION IS NEVER THE GOAL (see metaQuestionShaped). Unlike the continuation case below, this
+    // substitution is NOT afk-only: a tier-0/1 user who types "are you stuck?" in the middle of a build is asking
+    // ABOUT the work, not replacing it, and every steering surface must keep pointing at the work. Nothing is
+    // hidden from the model — the question is still delivered verbatim as the user turn it was, and still gets
+    // answered; only the GOAL ANCHOR is held steady. The tier-0/1 caution in the note below is about silently
+    // swapping a user's real instruction ("continue"), which this cannot do: a question is not an instruction.
+    const meta_q = metaQuestionShaped(user_text);
+    if (continuationShaped(user_text) or meta_q) goal_owned = firstUserGoal(app, conv_dir);
     // The real goal for everything that steers — AFK ONLY. Recall has substituted the pinned goal on a
     // continuation-shaped turn for a long time, but that is ADDITIVE and hedged: it widens what gets
     // remembered and cannot change what the turn does. Substituting it into the STEERING inputs replaces
@@ -2018,7 +2044,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     // ago. Tier 1 keeps reading user_text exactly as before; only afk, whose "user_text" is the desk's own
     // kick sentence rather than anything a human wrote, gets the substitution. NOT for the hippocampus
     // observe either — the message the user really sent is what belongs in memory.
-    const goal_text: []const u8 = if (loop >= LOOP_AFK) (if (goal_owned) |g| g else user_text) else user_text;
+    const goal_text: []const u8 = if (meta_q or loop >= LOOP_AFK) (if (goal_owned) |g| g else user_text) else user_text;
     {
         // RESUME CUE: a continuation-shaped turn ("continue", the desk's auto-loop arm) carries no recall
         // cue of its own — keyed on the literal word, recall surfaces nothing and the resumed turn starts
@@ -2672,7 +2698,17 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
                     appendMsg(app, conv_dir, "assistant", shown, "veil", nowSecs(app.io));
                     emitAssistant(app, conv_dir, shown);
                 }
+                // The ENGINE's account of the stop is stored as its own `role:"system"` / `kind:"engine"` row —
+                // never merged into the assistant message above. Replay renders a system row as a system turn
+                // (seedLines), so the next turn reads it as a machine event rather than as the model's own
+                // confession, and only the NEWEST engine row survives replay, so a streak of cut turns cannot
+                // pile up into a wall of failure notices. The user still SEES it: the emit below is unchanged.
+                if (inner.engine_note.len > 0) {
+                    appendMsg(app, conv_dir, "system", inner.engine_note, "engine", nowSecs(app.io));
+                    emitEngineNote(app, conv_dir, inner.engine_note);
+                }
                 gpa.free(inner.content);
+                gpa.free(inner.engine_note);
                 finishTurn(app, conv_dir, usage_t0);
                 return;
             },
@@ -2959,6 +2995,17 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
                 break :outer; // off: goal achieved (verified, or nothing was built)
             }
         } else if (is_repeat) {
+            // A STUCK-SITE RE-ANCHOR WAS TRIED HERE AND REMOVED — the note is worth more than the code was.
+            // The idea was to re-read firstUserGoal on a repeat and steer by it instead of `goal_text`, on the
+            // theory that goal_text might be the desk's kick sentence or a meta-question. It is measurably the
+            // wrong place. `anchor` is consumed only in the afk branch below, and on an afk turn goal_text has
+            // ALREADY been substituted to the pinned goal (continuationShaped covers the kick sentence), so the
+            // re-anchor was a no-op in the case it was written for. In the remaining case — an afk turn the user
+            // opened with a real instruction — goal_text is that instruction while firstUserGoal is the
+            // conversation's FIRST message, which in a long multi-topic thread is stale: the re-anchor would have
+            // dragged the loop back to an abandoned topic, and paid a messages.jsonl read per repeat to do it.
+            // Goal poisoning is fixed where it starts (metaQuestionShaped, at the goal_text derivation), not by
+            // stacking a second and staler anchor at the recovery site.
             if (afk) {
                 // afk: don't churn the same step — re-ground + research the blocker. PROMPTING writes the actual
                 // instruction from the transcript tail, which at this exact moment holds the failing command and
@@ -3770,6 +3817,74 @@ fn continuationShaped(text: []const u8) bool {
     return false;
 }
 
+/// Does this call's outcome count toward the same-tool FAILURE STREAK (the nudge at 2, the arbiter at 3)?
+///
+/// A GUARD REFUSAL COUNTS. The streak block used to sit inside `if (executed)`, which made the only
+/// approach-changing escalation in the engine unreachable for the one failure mode it was built for: an
+/// echo-refused call never executes, so a model grinding the same call accrued no streak, was never shown the
+/// option space, never heard the arbiter, and simply collected refusals until the loop guard killed the turn.
+/// The grind switched off the machinery for breaking grinds. Gated exactly like the loop strike (`echo_blocked or
+/// repeated_prior`), so a SAME-BATCH duplicate still does not count — the model had not yet seen feedback to
+/// ignore, and striking it would punish dup-batching models that are otherwise making progress.
+fn streakEligible(executed: bool, echo_blocked: bool, repeated_prior: bool) bool {
+    return executed or echo_blocked or repeated_prior;
+}
+
+/// A short META-QUESTION about the RUN ITSELF — "are you stuck?", "what are you doing?", "still there?". Such a
+/// message is a perfectly good thing to ANSWER, and it reaches the model as a user turn either way; what it is NOT
+/// is the conversation's goal. Letting it become one is how a single "are you stuck?" turned every re-grounding
+/// surface into a re-injection of the fixation: the drive picker announced "THE GOAL of this conversation: are you
+/// stuck exactly?", the stuck template said "re-read the goal" and pointed back at the same question, the course
+/// check graded progress against it, and recall keyed on it and surfaced nothing. The model then spent its cycles
+/// on the meta-question because the engine kept telling it that WAS the job.
+///
+/// NARROW ON PURPOSE, and narrower than it first looks like it should be. This predicate SUPPRESSES a message's
+/// claim to be the goal, so a false positive silently steers the turn by an older goal instead — the same class of
+/// harm the fix exists to remove, merely pointed the other way. A first cut matched open-ended prefixes ("why is
+/// this", "why is it", "are we", "status", "did you get") and swallowed ordinary work: "why is this test
+/// failing?", "are we handling null bytes in the parser?", "status of the migration?", "did you get the CSV export
+/// working?" were all read as meta. So:
+///   * every head is boundary-checked, exactly as continuationShaped does it, or "are website builds cached?"
+///     matches the head "are we" on its first six bytes;
+///   * heads must be specific to the ASSISTANT or the RUN, never a generic sentence opener; and
+///   * forms too short to carry a subject at all ("status?", "progress?") are matched WHOLE, never as prefixes,
+///     so "statuses of the queued jobs?" and "status of the migration?" stay the goal they are.
+/// Anything without a trailing '?', anything over 120 bytes, and any question carrying real work is left alone.
+fn metaQuestionShaped(text: []const u8) bool {
+    const t = std.mem.trim(u8, text, " \r\n\t`*\"'");
+    if (t.len == 0 or t.len > 120) return false;
+    if (t[t.len - 1] != '?') return false;
+    var lb: [120]u8 = undefined;
+    const lower = std.ascii.lowerString(&lb, t);
+    // Drop the '?' and any space before it so a head can match to end-of-string.
+    const body = std.mem.trim(u8, lower[0 .. lower.len - 1], " ");
+    if (body.len == 0) return false;
+    // WHOLE-MESSAGE forms: no subject, so only an exact match is safe.
+    for ([_][]const u8{
+        "status",   "status update", "progress", "any progress", "any update",
+        "you good", "still there",   "you there", "hello",       "you alive",
+    }) |exact| if (std.mem.eql(u8, body, exact)) return true;
+    // PHRASAL heads: each names the assistant or the run, and each is boundary-checked.
+    const heads = [_][]const u8{
+        "are you stuck",      "are you ok",           "are you okay",        "are you there",
+        "are you alive",      "are you still",        "are you done",        "are you working",
+        "are you looping",    "are you lost",         "are you making progress",
+        "you stuck",          "u stuck",              "r u stuck",
+        "what are you doing", "what are you working", "what are you up to",
+        "what happened",      "what's going on",      "whats going on",      "what is going on",
+        "why are you",        "why is this taking",   "why is it taking",    "why is this so slow",
+        "how is it going",    "how's it going",       "hows it going",
+        "is it stuck",        "is this stuck",        "did you get stuck",   "any progress",
+    };
+    for (heads) |h| {
+        if (!std.mem.startsWith(u8, body, h)) continue;
+        // word boundary — "are website builds cached?" must not match a head that is its byte-prefix
+        if (body.len > h.len and std.ascii.isAlphanumeric(body[h.len])) continue;
+        return true;
+    }
+    return false;
+}
+
 /// The conversation's first user message (the pinned goal), parsed from messages.jsonl's head — the right
 /// recall cue for a continuation-shaped turn. Uses the same bounded head read as assembleHistory (a
 /// .limited readFileAlloc would FAIL outright on a long conversation's file). gpa-owned, or null.
@@ -4541,6 +4656,15 @@ const InnerResult = struct {
     // no agentic work in flight to continue, so the drive loop's LOOP_QUESTION "are you done?" completion is pure
     // wasted latency (it delayed {done}/usage + the turn-lock release by a full round-trip on every simple Q&A).
     tools_ran: bool = false,
+    /// The ENGINE's own account of why this pass ended (today: the loop-guard hard stop), kept STRICTLY apart
+    /// from `content`. `content` is committed as the assistant's durable message, so an engine note folded into
+    /// it is stored in the model's voice and replayed next turn as something the model itself said. That is the
+    /// observed "are you stuck?" spiral: the user asks, the guard kills the turn, and a first-person "I stopped
+    /// this turn…" confession lands in the transcript directly under the question — one more copy per killed
+    /// turn, until the model is reading a wall of its own apparent admissions and can do nothing but ruminate on
+    /// them. Routed to a `role:"system"` / `kind:"engine"` row instead. gpa-owned when non-empty; the caller
+    /// frees it (a zero-length default is a safe no-op free).
+    engine_note: []u8 = &[_]u8{},
 };
 
 /// Batch streamed deltas to ~this many chars per emitted frame. One frame per model TOKEN produces thousands of
@@ -6940,12 +7064,12 @@ fn runInnerAgentic(
         // the observed case the deliverable was already written and working while the model kept retrying).
         if (loop_refusals >= LOOP_STOP_REFUSALS) {
             emitKV(app, conv_dir, "status", "text", "loop guard: stopped this turn — the same calls kept returning the same results");
-            const note = "(engine: I stopped this turn. The same tool calls kept returning identical results and the loop guard refused them repeatedly, so further rounds could not make progress. Anything already written to the workdir is listed above and is real — re-read it before redoing the work.)";
-            const combined = if (last_content.len > 0)
-                std.fmt.allocPrint(gpa, "{s}\n\n{s}", .{ last_content, note }) catch gpa.dupe(u8, note) catch empty
-            else
-                gpa.dupe(u8, note) catch empty;
-            return .{ .outcome = .stopped, .content = combined, .tools_ran = any_tool };
+            return .{
+                .outcome = .stopped,
+                .content = gpa.dupe(u8, last_content) catch empty,
+                .tools_ran = any_tool,
+                .engine_note = gpa.dupe(u8, LOOP_STOP_NOTE) catch empty,
+            };
         }
 
         // STREAMING: the model's reply + reasoning type out via streamOnDelta as {kind:token|reasoning,delta}
@@ -7367,20 +7491,28 @@ fn runInnerAgentic(
                     result = noted;
                 } else |_| {}
             }
+            const dt = nowMillis(app.io) - t_call;
+            const ok = result.len > 0 and result[0] != '(' and std.mem.indexOf(u8, result, "\"ok\":false") == null;
+            const outcome_bad = !ok or (std.mem.startsWith(u8, result, "exit=") and !std.mem.startsWith(u8, result, "exit=0"));
             // TOOL-PERFORMANCE LEARNING: record only genuinely-executed calls (dedup/budget guards never ran the
             // tool, so counting them would smear its stats). `ok` mirrors the observe gate — a real result, not
             // an engine error string or an `"ok":false` payload.
-            if (executed) {
-                const dt = nowMillis(app.io) - t_call;
-                const ok = result.len > 0 and result[0] != '(' and std.mem.indexOf(u8, result, "\"ok\":false") == null;
-                // FAILURE-STREAK DELIBERATION NUDGE: the tool RAN but the OUTCOME failed — engine-refusal
-                // (`(…`), an "ok":false payload, or a non-zero `exit=` result (the run_python/run_tests
-                // contract; toolperf's `ok` deliberately counts those as tool-healthy). Two failed outcomes
-                // of the SAME tool in a row means one approach is being ground instead of weighed — append
-                // the option space to the failing result, at the exact moment it is being ignored. The
-                // model still chooses; the engine only makes the choice visible.
-                const outcome_bad = !ok or (std.mem.startsWith(u8, result, "exit=") and !std.mem.startsWith(u8, result, "exit=0"));
-                tool_perf.record(c.name, ok, !outcome_bad, if (dt > 0) @intCast(dt) else 0);
+            if (executed) tool_perf.record(c.name, ok, !outcome_bad, if (dt > 0) @intCast(dt) else 0);
+            // FAILURE-STREAK DELIBERATION NUDGE: the OUTCOME failed — engine-refusal (`(…`), an "ok":false
+            // payload, or a non-zero `exit=` result (the run_python/run_tests contract; toolperf's `ok`
+            // deliberately counts those as tool-healthy). Two failed outcomes of the SAME tool in a row means
+            // one approach is being ground instead of weighed — append the option space to the failing result,
+            // at the exact moment it is being ignored. The model still chooses; the engine only makes the
+            // choice visible.
+            //
+            // A GUARD REFUSAL IS A FAILED OUTCOME. This whole block used to sit inside `if (executed)`, which
+            // made it unreachable for exactly the runs that need it most: an echo-refused call never executes,
+            // so a model grinding one identical call accrued no streak, was never shown the option space, and
+            // never heard the arbiter — it just collected refusals until the loop guard killed the turn. The
+            // ONE mechanism built to break a grind was switched off by the grind itself. Refusal evidence now
+            // counts, gated exactly like the loop strike above (`echo_blocked or repeated_prior`): a same-batch
+            // duplicate still does not count, because the model had not yet seen any feedback to ignore.
+            if (streakEligible(executed, echo_blocked, repeated_prior)) {
                 const th = std.hash.Fnv1a_64.hash(c.name);
                 if (outcome_bad) {
                     if (th == fail_streak_tool) fail_streak +|= 1 else {
@@ -8363,6 +8495,13 @@ fn emitUserRole(app: *App, conv_dir: []const u8, content: []const u8) void {
 fn emitAssistant(app: *App, conv_dir: []const u8, content: []const u8) void {
     emitRoleMessage(app, conv_dir, "assistant", content);
 }
+/// `{"kind":"message","role":"system",..}` — an ENGINE-authored row (the loop-guard stop note), on the wire as
+/// what it is. Announcing it as "assistant" is not a cosmetic mislabel: the desk folds an incoming message by
+/// role, so an engine note arriving as the assistant is stored in the DESK's own transcript as the model's turn
+/// and re-fed from there — re-creating, one layer out, the forged-confession loop the server-side split fixed.
+fn emitEngineNote(app: *App, conv_dir: []const u8, content: []const u8) void {
+    emitRoleMessage(app, conv_dir, "system", content);
+}
 fn emitRoleMessage(app: *App, conv_dir: []const u8, role: []const u8, content: []const u8) void {
     const gpa = app.gpa;
     var ev: std.ArrayListUnmanaged(u8) = .empty;
@@ -8408,9 +8547,22 @@ fn appendMsgObj(gpa: std.mem.Allocator, conv_buf: *std.ArrayListUnmanaged(u8), r
 /// Replay a run of stored messages.jsonl lines (`bytes`) into conv_buf as OpenAI message objects. Each stored line
 /// is parsed as JSON (content is UNescaped raw text) and re-emitted via appendMsgObj — round-tripping the escaped-
 /// on-disk form through jstr again would double-escape it. `cap` clips each message's content.
-fn seedLines(app: *App, conv_buf: *std.ArrayListUnmanaged(u8), bytes: []const u8, cap: usize) void {
-    const gpa = app.gpa;
-    const M = struct { role: []const u8 = "", content: []const u8 = "" };
+fn seedLines(gpa: std.mem.Allocator, conv_buf: *std.ArrayListUnmanaged(u8), bytes: []const u8, cap: usize) void {
+    const M = struct { role: []const u8 = "", content: []const u8 = "", kind: []const u8 = "" };
+    // ENGINE ROWS DO NOT ACCUMULATE. Each loop-guard kill writes one "this turn was cut" row; a streak of cut
+    // turns used to replay every one of them, so the window filled with an escalating pile of failure notices
+    // that crowded out the actual work and read as a spiralling emergency. The newest row carries everything
+    // the older ones said, so only it survives replay. Counted first, then skipped on the emit pass.
+    var engine_total: usize = 0;
+    var count_it = std.mem.splitScalar(u8, bytes, '\n');
+    while (count_it.next()) |raw| {
+        const ln = std.mem.trim(u8, raw, " \r\t");
+        if (ln.len == 0) continue;
+        const p = std.json.parseFromSlice(M, gpa, ln, .{ .ignore_unknown_fields = true }) catch continue;
+        defer p.deinit();
+        if (p.value.content.len > 0 and std.mem.eql(u8, p.value.kind, "engine")) engine_total += 1;
+    }
+    var engine_seen: usize = 0;
     var it = std.mem.splitScalar(u8, bytes, '\n');
     while (it.next()) |raw| {
         const ln = std.mem.trim(u8, raw, " \r\t");
@@ -8418,10 +8570,47 @@ fn seedLines(app: *App, conv_buf: *std.ArrayListUnmanaged(u8), bytes: []const u8
         const p = std.json.parseFromSlice(M, gpa, ln, .{ .ignore_unknown_fields = true }) catch continue;
         defer p.deinit();
         if (p.value.content.len == 0) continue;
-        // stored role is already an OpenAI role ("user"/"assistant"); anything else falls back to user.
-        const role: []const u8 = if (std.mem.eql(u8, p.value.role, "assistant")) "assistant" else "user";
+        if (std.mem.eql(u8, p.value.kind, "engine")) {
+            engine_seen += 1;
+            if (engine_seen < engine_total) continue; // keep only the newest
+        }
+        // stored role is already an OpenAI role ("user"/"assistant"/"system"); anything else falls back to user.
+        // `system` is load-bearing, not cosmetic: it is how an ENGINE-authored row (a loop-guard stop note) is
+        // replayed as a machine event instead of as the assistant's own words. Mid-conversation system turns are
+        // already an established shape here — the rolling summary is injected exactly this way.
+        const role: []const u8 = if (std.mem.eql(u8, p.value.role, "assistant"))
+            "assistant"
+        else if (std.mem.eql(u8, p.value.role, "system"))
+            "system"
+        else
+            "user";
         appendMsgObj(gpa, conv_buf, role, p.value.content, cap);
     }
+}
+
+/// Drop ENGINE-authored rows from a summary span, compacting into `dest` (always shrinks; `span` may alias it).
+///
+/// seedLines keeps only the newest engine row in the REPLAY window, but the rolling summary reads the span that
+/// scrolled PAST that window — so every stop note the window dropped was still handed to the summarizer, which is
+/// told to preserve "open threads". The accumulation the replay cap removes would come straight back condensed
+/// and permanent: a summary narrating a run that keeps getting cut short, re-read at the top of every later turn,
+/// long after the window forgot the individual notices. An engine note is a transient machine event about ONE
+/// turn; it is not part of the conversation's durable narrative and must not be summarized into it.
+fn dropEngineRows(dest: []u8, span: []const u8) []const u8 {
+    var w: usize = 0;
+    var it = std.mem.splitScalar(u8, span, '\n');
+    while (it.next()) |ln| {
+        if (ln.len == 0) continue;
+        if (std.mem.indexOf(u8, ln, "\"kind\":\"engine\"") != null) continue;
+        if (w > 0) {
+            dest[w] = '\n';
+            w += 1;
+        }
+        // leftward compaction only (w never exceeds this line's own offset), so copyForwards is the right move
+        std.mem.copyForwards(u8, dest[w .. w + ln.len], ln);
+        w += ln.len;
+    }
+    return dest[0..w];
 }
 
 /// Assemble the prior-conversation context into conv_buf under a bounded budget (chat_context): a rolling summary
@@ -8459,7 +8648,7 @@ fn assembleHistory(app: *App, conv_dir: []const u8, user_text: []const u8, conv_
     }
 
     // PINNED GOAL: the conversation's first user message anchors the arc even after it scrolls out of the window.
-    if (view.goal_line.len > 0) seedLines(app, conv_buf, view.goal_line, cctx.GOAL_PIN_CAP);
+    if (view.goal_line.len > 0) seedLines(gpa, conv_buf, view.goal_line, cctx.GOAL_PIN_CAP);
 
     // VARYING WORKSPACE CHANNEL (recall, corrections, family, plugin — varies per message): placed here —
     // after the stable prefix, before the window — so the provider's prompt-prefix cache keeps hitting on
@@ -8467,7 +8656,7 @@ fn assembleHistory(app: *App, conv_dir: []const u8, user_text: []const u8, conv_
     if (varying_frag.len > 0) conv_buf.appendSlice(gpa, varying_frag) catch {};
 
     // RECENCY WINDOW: replay the newest complete turns verbatim (includes the just-appended user message).
-    seedLines(app, conv_buf, view.window, cctx.HISTORY_WINDOW_BYTES);
+    seedLines(gpa, conv_buf, view.window, cctx.HISTORY_WINDOW_BYTES);
 
     // SAFETY NET: an EMPTY window means the newest line (the just-appended current user message) is itself larger
     // than the recency window and fell out — so the live question would ride only on the fallible rolling summary
@@ -8545,7 +8734,9 @@ fn refreshSummary(app: *App, conv_dir: []const u8, run_root: []const u8, base_ur
 
     const span_buf = gpa.alloc(u8, cctx.SUMMARY_SPAN_CAP) catch return;
     defer gpa.free(span_buf);
-    const span = cctx.readSpanTailTrimmed(app.io, mpath, span_from, target, span_buf) orelse return;
+    const raw_span = cctx.readSpanTailTrimmed(app.io, mpath, span_from, target, span_buf) orelse return;
+    // engine stop-notes are per-turn machine events, never durable narrative — see dropEngineRows
+    const span = dropEngineRows(span_buf, raw_span);
     if (span.len == 0) return;
 
     const updated = summarizeInto(app, run_root, base_url, key, model, summary, span) orelse return; // LLM call, no lock held
@@ -8773,6 +8964,128 @@ test "continuation-shaped turns: resume phrasings match, real instructions do no
     try std.testing.expect(!continuationShaped("nextjs app router setup"));
     try std.testing.expect(!continuationShaped("proceedings review"));
     try std.testing.expect(continuationShaped("next, wire the feed api"));
+}
+
+test "the loop-stop note speaks as the ENGINE, never in the model's first person" {
+    // The spiral this guards: the note is committed to the durable transcript and replayed to the NEXT turn. In
+    // the model's voice it reads as the model's own admission of being stuck, sitting right under whatever the
+    // user just asked — so a "are you stuck?" turn is answered by a transcript that appears to agree, and the run
+    // ruminates instead of working. Any first-person pronoun here re-opens that door.
+    try std.testing.expect(std.mem.startsWith(u8, LOOP_STOP_NOTE, "[engine:"));
+    for ([_][]const u8{ "I ", "I'", " my ", " me ", " I." }) |first_person|
+        try std.testing.expect(std.mem.indexOf(u8, LOOP_STOP_NOTE, first_person) == null);
+    // it still has to DO its job: say the turn was cut, and that finished work on disk is real
+    try std.testing.expect(std.mem.indexOf(u8, LOOP_STOP_NOTE, "loop guard") != null);
+    try std.testing.expect(std.mem.indexOf(u8, LOOP_STOP_NOTE, "workdir") != null);
+}
+
+test "replay: an engine row stays a system turn, and only the NEWEST engine row survives" {
+    const gpa = std.testing.allocator;
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(gpa);
+    // three cut turns in a row, interleaved with real work — the exact shape a spiral writes
+    const stored =
+        \\{"role":"user","content":"build the parser","kind":"user","ts":1}
+        \\{"role":"system","content":"[engine: cut #1]","kind":"engine","ts":2}
+        \\{"role":"user","content":"are you stuck exactly?","kind":"user","ts":3}
+        \\{"role":"system","content":"[engine: cut #2]","kind":"engine","ts":4}
+        \\{"role":"assistant","content":"real narration","kind":"veil","ts":5}
+        \\{"role":"system","content":"[engine: cut #3]","kind":"engine","ts":6}
+    ;
+    seedLines(gpa, &buf, stored, 4096);
+    const out = buf.items;
+    // the pile does NOT accumulate: the two older cut notices are gone, the newest is kept
+    try std.testing.expect(std.mem.indexOf(u8, out, "cut #1") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "cut #2") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "cut #3") != null);
+    // and the survivor is a SYSTEM turn — never the assistant's own words
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"role\":\"system\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"role\":\"assistant\",\"content\":\"[engine:") == null);
+    // ordinary rows are untouched by any of this
+    try std.testing.expect(std.mem.indexOf(u8, out, "build the parser") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "are you stuck exactly?") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "real narration") != null);
+}
+
+test "a meta-question about the run is never mistaken for the goal" {
+    // "are you stuck?" used to BECOME goal_text, so the drive picker announced it as "THE GOAL of this
+    // conversation", the stuck template told the model to re-read it, and recall keyed on it. The engine was
+    // instructing the model to work on the meta-question, then the loop guard killed it for not progressing.
+    try std.testing.expect(metaQuestionShaped("are you stuck?"));
+    try std.testing.expect(metaQuestionShaped("are you stuck exactly?"));
+    try std.testing.expect(metaQuestionShaped("  Are you stuck?  "));
+    try std.testing.expect(metaQuestionShaped("why is this taking so long?"));
+    try std.testing.expect(metaQuestionShaped("what are you doing?"));
+    try std.testing.expect(metaQuestionShaped("what happened?"));
+    try std.testing.expect(metaQuestionShaped("status?"));
+    try std.testing.expect(metaQuestionShaped("still there?"));
+    try std.testing.expect(metaQuestionShaped("how's it going?"));
+    // NOT meta: real work that happens to be phrased as a question keeps being the goal
+    try std.testing.expect(!metaQuestionShaped("why does the parser drop CRLF on windows — can you fix it and add a test?"));
+    try std.testing.expect(!metaQuestionShaped("can you add a login page with NextAuth?"));
+    // NOT meta — the false positives a first cut of this predicate actually had. Each of these is ordinary work
+    // whose FIRST BYTES collide with a meta phrase; matching one silently steers the turn by a stale goal, which
+    // is the same harm this predicate exists to prevent, merely pointed the other way.
+    try std.testing.expect(!metaQuestionShaped("why is this test failing?"));
+    try std.testing.expect(!metaQuestionShaped("why is it returning 404?"));
+    try std.testing.expect(!metaQuestionShaped("status of the migration?"));
+    try std.testing.expect(!metaQuestionShaped("statuses of the queued jobs?"));
+    try std.testing.expect(!metaQuestionShaped("why did you drop the index on users?"));
+    try std.testing.expect(!metaQuestionShaped("are we handling null bytes in the parser?"));
+    try std.testing.expect(!metaQuestionShaped("did you get the CSV export working?"));
+    try std.testing.expect(!metaQuestionShaped("are website builds cached?")); // byte-prefix of "are we"
+    try std.testing.expect(!metaQuestionShaped("are workers restarted on deploy?"));
+    // NOT meta: no question mark at all
+    try std.testing.expect(!metaQuestionShaped("are you stuck"));
+    try std.testing.expect(!metaQuestionShaped("add a login page"));
+    try std.testing.expect(!metaQuestionShaped(""));
+    // a real instruction is never swallowed, which is what the tier-0/1 caution is about
+    try std.testing.expect(!metaQuestionShaped("continue"));
+}
+
+test "the loop-stop and escalation thresholds leave a round for the arbiter to be READ" {
+    // A pure echo-grind accrues its first loop strike and its first failure-streak point on the SAME inference,
+    // so fail_streak and loop_refusals advance in lockstep. The arbiter spends a real completion at fail_streak
+    // == 3; if the turn is cut at loop_refusals == 3 the advice is generated and discarded unread. There must be
+    // at least one inference left AFTER the arbiter round. Locked so the two constants cannot silently re-collide.
+    const ARBITER_AT: u32 = 3;
+    try std.testing.expect(LOOP_STOP_REFUSALS > ARBITER_AT);
+    // and the whole ladder still has to fit inside one pass
+    try std.testing.expect(@as(usize, ECHO_LIMIT) + LOOP_STOP_REFUSALS < MAX_ITERS);
+}
+
+test "engine stop-notes are never laundered into the rolling summary" {
+    // seedLines caps the REPLAY window at the newest engine row, but the summary reads the span that scrolled
+    // past it — so without this filter the notices come back condensed and permanent ("the run keeps getting
+    // cut short"), which is the accumulation the replay cap exists to stop, wearing a different hat.
+    var buf: [1024]u8 = undefined;
+    const span =
+        \\{"role":"user","content":"build the parser","kind":"user","ts":1}
+        \\{"role":"system","content":"[engine: cut #1]","kind":"engine","ts":2}
+        \\{"role":"assistant","content":"wrote parser.zig","kind":"veil","ts":3}
+        \\{"role":"system","content":"[engine: cut #2]","kind":"engine","ts":4}
+    ;
+    const kept = dropEngineRows(&buf, span);
+    try std.testing.expect(std.mem.indexOf(u8, kept, "cut #1") == null);
+    try std.testing.expect(std.mem.indexOf(u8, kept, "cut #2") == null);
+    // the real conversation survives intact, still one record per line
+    try std.testing.expect(std.mem.indexOf(u8, kept, "build the parser") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kept, "wrote parser.zig") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, kept, "\n"));
+    // a span with nothing to drop is returned unharmed
+    const clean = "{\"role\":\"user\",\"content\":\"hi\",\"kind\":\"user\",\"ts\":1}";
+    var b2: [256]u8 = undefined;
+    try std.testing.expectEqualStrings(clean, dropEngineRows(&b2, clean));
+}
+
+test "a guard-refused call still feeds the failure streak that breaks a grind" {
+    // The spiral's dead end: refused calls never execute, so the nudge/arbiter that exist to force a DIFFERENT
+    // approach were gated off by the very condition that needed them. Refusal evidence counts now.
+    try std.testing.expect(streakEligible(true, false, false)); // ordinary executed call
+    try std.testing.expect(streakEligible(false, true, false)); // echo-refused — the spiral case
+    try std.testing.expect(streakEligible(false, false, true)); // ledger repeat from an EARLIER batch
+    // a same-batch duplicate is NOT evidence: the model could not yet have seen feedback to ignore
+    try std.testing.expect(!streakEligible(false, false, false));
 }
 
 test "looksCredentialed: credential keys drop the cue; ordinary cues pass" {
