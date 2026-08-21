@@ -778,10 +778,17 @@ fn clip(s: []const u8) []const u8 {
 /// schemas with real newlines, so a verbatim splice put ONE record across 20 lines and every
 /// line-oriented reader (jq, HuggingFace `load_dataset("json")`, a plain `for line in f`) choked on
 /// it. Found by reading back a real captured turn, not by a unit test — the fixtures were all
-/// single-line. A raw newline/CR/tab can only appear BETWEEN tokens (inside a JSON string they are
-/// already escaped, and a literal control byte there would be invalid JSON anyway), so folding them
-/// to a single space outside string context preserves the value exactly while making the record a
-/// line. Byte fidelity inside strings — the part a trainer actually reads — is untouched.
+/// single-line. Control bytes get one of two treatments, because JSON gives them two meanings:
+///
+///   * BETWEEN tokens a control byte is layout, never value, and `\u00XX` is not even legal there —
+///     so every byte under 0x20 folds to the one whitespace that cannot split a line, a space.
+///   * INSIDE a string it is value, and a raw one is illegal JSON. "already-valid" does not hold on
+///     the `recordTool` path: `ToolRun.args_json` is verbatim model output, so a model that emits a
+///     literal newline or a stray 0x01 inside an argument string used to be copied through here
+///     byte-for-byte — malformed JSON, and for a newline a record split across two lines, which a
+///     fine-tuning loader rejects or skips silently. `\u00XX` is the only encoding that keeps the
+///     byte AND the line, and it matches every other escaper in the tree (gateway/http.zig `jstr`,
+///     cli.zig `jstr`, plug/plugins.zig, and `jstr` below).
 fn appendOneLine(list: *std.ArrayListUnmanaged(u8), json: []const u8) !void {
     const gpa = st.gpa;
     var in_str = false;
@@ -789,11 +796,16 @@ fn appendOneLine(list: *std.ArrayListUnmanaged(u8), json: []const u8) !void {
     while (i < json.len) : (i += 1) {
         const ch = json[i];
         if (in_str) {
-            try list.append(gpa, ch);
             if (ch == '\\' and i + 1 < json.len) {
+                try list.append(gpa, ch);
                 i += 1;
                 try list.append(gpa, json[i]); // an escaped byte can never close the string
-            } else if (ch == '"') in_str = false;
+            } else if (ch < 0x20) {
+                try list.print(gpa, "\\u{x:0>4}", .{ch}); // value preserved, line preserved
+            } else {
+                try list.append(gpa, ch);
+                if (ch == '"') in_str = false;
+            }
             continue;
         }
         switch (ch) {
@@ -802,7 +814,7 @@ fn appendOneLine(list: *std.ArrayListUnmanaged(u8), json: []const u8) !void {
                 try list.append(gpa, ch);
             },
             '\n', '\r', '\t' => try list.append(gpa, ' '),
-            else => try list.append(gpa, ch),
+            else => try list.append(gpa, if (ch < 0x20) ' ' else ch), // any other C0: layout too
         }
     }
 }
@@ -1100,6 +1112,62 @@ test "every record is ONE physical line even when the request body is pretty-pri
     const rp = try std.json.parseFromSlice(std.json.Value, gpa, std.mem.trim(u8, raw, " \r\n"), .{});
     defer rp.deinit();
     try std.testing.expect(rp.value.object.get("request").?.object.get("messages") != null);
+}
+
+test "a tool arg carrying literal control bytes still writes one valid JSON line" {
+    // `ToolRun.args_json` is VERBATIM model output, not the engine's own JSON, so appendOneLine's
+    // "already-valid" precondition does not hold on this path. A model that emits a literal newline,
+    // tab or 0x01 inside an argument string used to have those bytes spliced straight through: bytes
+    // under 0x20 are illegal inside a JSON string, and a raw newline additionally splits the record
+    // in two. Either way the fine-tuning loader rejects the line or skips it silently.
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-dataset-ctlbytes-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, root, .default_dir) catch {};
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    try env.put("NL_SETS_DIR", root ++ "/sets");
+    configure(gpa, io, &env, root);
+    defer {
+        stop() catch {};
+        st.configured = false;
+        st.armed.store(false, .release);
+    }
+    const id = try start("ctlbytes");
+
+    // literal 0x0a / 0x09 / 0x01 INSIDE the argument string (not the two-char JSON escapes), and a
+    // newline BETWEEN tokens, which is layout and must still fold to a space
+    recordTool(.{
+        .name = "shell",
+        .args_json = "{\"cmd\":\"echo a\nb\tc\x01d\",\n \"n\":1}",
+        .result = "out\nerr\x01done", // the same bytes down the jstr path
+    });
+
+    var pbuf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&pbuf, "{s}/sets/{s}/tools.jsonl", .{ root, id });
+    const rec = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 20));
+    defer gpa.free(rec);
+    const line = std.mem.trim(u8, rec, " \r\n");
+
+    // ONE physical line: the raw newline inside the argument did not split the record
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, rec, "\n"));
+    try std.testing.expect(std.mem.endsWith(u8, rec, "\n"));
+    // and not one bare control byte reached the file
+    for (line) |ch| try std.testing.expect(ch >= 0x20);
+    try std.testing.expect(std.mem.indexOf(u8, line, "\\u0001") != null); // written as \u00XX
+
+    // it parses, and the argument bytes come back EXACTLY as the model emitted them — an escaper
+    // that dropped or mangled them would quietly corrupt what the set exists to teach
+    const p = try std.json.parseFromSlice(std.json.Value, gpa, line, .{});
+    defer p.deinit();
+    const args = p.value.object.get("args").?.object;
+    try std.testing.expectEqualStrings("echo a\nb\tc\x01d", args.get("cmd").?.string);
+    try std.testing.expectEqual(@as(i64, 1), args.get("n").?.integer); // the folded newline kept it JSON
+    try std.testing.expectEqualStrings("out\nerr\x01done", p.value.object.get("result").?.string);
 }
 
 test "a pre-rendered prompt call is kept in raw but never faked into an sft example" {
