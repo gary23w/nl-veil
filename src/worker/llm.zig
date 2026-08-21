@@ -517,10 +517,21 @@ pub fn complete(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []
     const mt = effTokens(base_url, model, max_tokens);
     const temp_frag = tempFragOwned(gpa, io, model, temperature); // learned-quirk aware (Kimi temp=1, etc.)
     defer gpa.free(temp_frag);
+    // Learned-quirk pre-echo (the effTemp analog for the reasoning echo): once a model has demanded the
+    // echo, every request pre-splices "" into any bare assistant turn BEFORE dispatch — no failed
+    // round-trip, at every call site. Callers holding real reasoning text have already echoed it
+    // verbatim inline; this fills only what they left bare.
+    const msgs_eff: []const u8 = blk: {
+        if (reasoningEchoFor(io, model)) {
+            if (withReasoningEcho(gpa, messages_json, "")) |spliced| break :blk spliced;
+        }
+        break :blk messages_json;
+    };
+    defer if (msgs_eff.ptr != messages_json.ptr) gpa.free(@constCast(msgs_eff));
     const body = if (tools_json.len > 0)
-        std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"tools\":[{s}]{s},\"max_tokens\":{d}}}", .{ model, messages_json, tools_json, temp_frag, mt }) catch return stepErr(gpa, "oom")
+        std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"tools\":[{s}]{s},\"max_tokens\":{d}}}", .{ model, msgs_eff, tools_json, temp_frag, mt }) catch return stepErr(gpa, "oom")
     else
-        std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}]{s},\"max_tokens\":{d}}}", .{ model, messages_json, temp_frag, mt }) catch return stepErr(gpa, "oom");
+        std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}]{s},\"max_tokens\":{d}}}", .{ model, msgs_eff, temp_frag, mt }) catch return stepErr(gpa, "oom");
     defer gpa.free(body);
     return completeBody(gpa, io, run_dir, tag, base_url, key, model, body, mt);
 }
@@ -1570,6 +1581,25 @@ fn completeBody(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []
     return completeBodyH(gpa, io, run_dir, tag, base_url, key, model, body, budget_tokens, true);
 }
 
+/// TRANSPORT-LEVEL echo heal — the universal backstop beneath EVERY llm call site in the engine (chat,
+/// swarm, aux, and any future caller), the reasoning-echo twin of healParamError above: detect the
+/// thinking-mode "must be passed back" rejection, LEARN the quirk for this model, splice the "" echo into
+/// every bare assistant turn of the request body (withReasoningEcho works on the whole body — the
+/// assistant objects inside "messages":[…] carry the same byte shape, and jstr-escaped string values can
+/// never fake a turn head), and retry ONCE. Callers that hold real reasoning text still pre-echo it
+/// VERBATIM at build time — required, because the current round's echo is validated unmodified — while
+/// this backstop repairs bare PRESENCE for everything else (replayed plain history, aux msgTail slices,
+/// turns shaped for another model's quirks). null = not this constraint, or nothing bare to splice — the
+/// error surfaces unchanged. Learning is deliberately unconditional on the splice landing: even a failed
+/// retry leaves every later dispatch to this model pre-splicing (see complete()).
+fn healEchoError(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const u8, base_url: []const u8, key: []const u8, model: []const u8, body: []const u8, budget_tokens: u32, err_text: []const u8) ?Step {
+    if (!isReasoningEchoError(err_text)) return null;
+    learnReasoningEcho(io, model);
+    const healed = withReasoningEcho(gpa, body, "") orelse return null;
+    defer gpa.free(healed);
+    return completeBodyH(gpa, io, run_dir, tag, base_url, key, model, healed, budget_tokens, false); // retry once, never re-heal
+}
+
 fn completeBodyH(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const u8, base_url: []const u8, key: []const u8, model: []const u8, body: []const u8, budget_tokens: u32, heal_ok: bool) Step {
     const t0 = std.Io.Timestamp.now(io, .real).nanoseconds;
     const r = post(gpa, io, run_dir, tag, base_url, key, body, budget_tokens);
@@ -1579,6 +1609,10 @@ fn completeBodyH(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: [
         // HTTP-level error (some providers return the constraint here, not in a JSON error field) — try to heal.
         if (heal_ok) {
             if (healParamError(gpa, io, run_dir, tag, base_url, key, model, body, budget_tokens, r.content)) |s| {
+                gpa.free(r.content);
+                return s;
+            }
+            if (healEchoError(gpa, io, run_dir, tag, base_url, key, model, body, budget_tokens, r.content)) |s| {
                 gpa.free(r.content);
                 return s;
             }
@@ -1647,6 +1681,7 @@ fn completeBodyH(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: [
         // a JSON error field (HTTP 200 with an {"error":…} body, as Kimi returns) — try to heal the constraint.
         if (heal_ok) {
             if (healParamError(gpa, io, run_dir, tag, base_url, key, model, body, budget_tokens, e.message)) |s| return s;
+            if (healEchoError(gpa, io, run_dir, tag, base_url, key, model, body, budget_tokens, e.message)) |s| return s;
         }
         return stepErr(gpa, std.fmt.allocPrint(gpa, "provider error: {s}", .{e.message}) catch "provider error");
     }
@@ -1839,19 +1874,27 @@ const StreamState = struct {
     /// through the degeneration filter; content passes straight through.
     fn fire(st: *StreamState, gpa: std.mem.Allocator, kind: DeltaKind, text: []const u8) void {
         if (text.len == 0) return;
-        if (kind == .reasoning) return st.fireReasoning(gpa, text);
+        if (kind == .reasoning) {
+            // VERBATIM accumulation, BEFORE any display filtering: the assembled reasoning is what the
+            // engine echoes back to a thinking-mode endpoint, and those validate the echo UNMODIFIED —
+            // a condensed echo (the repeat marker standing in for swallowed lines) is rejected exactly
+            // like a missing one ("must be passed back"). The degeneration filter below still governs
+            // what the USER sees stream by.
+            st.reasoning.appendSlice(gpa, text) catch {};
+            return st.fireReasoning(gpa, text);
+        }
         st.forward(gpa, kind, text);
     }
 
-    /// The raw emit: callback + accumulate. st.reasoning mirrors what was FORWARDED (the condensed stream),
-    /// so every downstream consumer of the assembled reasoning — the engine's non-streamed fallback emit
-    /// included — inherits the filtering.
+    /// The raw emit: callback + accumulate. st.content mirrors the forwarded content; st.reasoning is
+    /// accumulated VERBATIM in fire() instead (the echo channel must be byte-exact), so the display
+    /// filter's markers and swallowed repeats never contaminate it.
     fn forward(st: *StreamState, gpa: std.mem.Allocator, kind: DeltaKind, text: []const u8) void {
         if (text.len == 0) return;
         st.on_delta(st.ctx, kind, text);
         switch (kind) {
             .content => st.content.appendSlice(gpa, text) catch {},
-            .reasoning => st.reasoning.appendSlice(gpa, text) catch {},
+            .reasoning => {}, // verbatim-accumulated at fire(); forwarding here is display-only
             .tool_progress => {}, // status-only; emitted directly from accumToolCall, never accumulated
         }
     }
@@ -2261,6 +2304,13 @@ fn streamAttempt(
     const native_msgs: ?[]u8 = if (native) (nativeToolArgs(gpa, messages_json) catch return null) else null;
     defer if (native_msgs) |m| gpa.free(m);
     const msgs = native_msgs orelse messages_json;
+    // Learned-quirk pre-echo, the streamed twin of complete()'s: without it every streamed call to an
+    // echo-demanding model would 400 mid-stream, fail the attempt, and pay the full non-streamed
+    // fallback — a permanent one-extra-request tax. Hosted path only (the native transport has no echo
+    // constraint); usually a no-op, since the engine pre-heals its conv once the quirk is learned.
+    const echo_msgs: ?[]u8 = if (!native and reasoningEchoFor(io, model)) withReasoningEcho(gpa, messages_json, "") else null;
+    defer if (echo_msgs) |m| gpa.free(m);
+    const hosted_msgs = echo_msgs orelse messages_json;
 
     const body = blk: {
         if (native) {
@@ -2273,9 +2323,9 @@ fn streamAttempt(
         }
         const mt = budget_tokens;
         break :blk (if (tools_json.len > 0)
-            std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"tools\":[{s}],\"stream\":true,\"stream_options\":{{\"include_usage\":true}}{s},\"max_tokens\":{d}}}", .{ model, messages_json, tools_json, temp_frag, mt })
+            std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"tools\":[{s}],\"stream\":true,\"stream_options\":{{\"include_usage\":true}}{s},\"max_tokens\":{d}}}", .{ model, hosted_msgs, tools_json, temp_frag, mt })
         else
-            std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"stream\":true,\"stream_options\":{{\"include_usage\":true}}{s},\"max_tokens\":{d}}}", .{ model, messages_json, temp_frag, mt })) catch return null;
+            std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"stream\":true,\"stream_options\":{{\"include_usage\":true}}{s},\"max_tokens\":{d}}}", .{ model, hosted_msgs, temp_frag, mt })) catch return null;
     };
     defer gpa.free(body);
 
@@ -2784,6 +2834,21 @@ test "withReasoningEcho heals EVERY bare assistant turn — newest gets the save
     try std.testing.expect(withReasoningEcho(gpa, m, "t2") == null);
 }
 
+test "withReasoningEcho on a FULL request body: splices inside messages, leaves model/tools untouched" {
+    // The transport-level heal (healEchoError) and pre-apply operate on the whole body, not a bare conv
+    // slice — the assistant objects inside "messages":[…] carry the same byte shape, and jstr-escaped
+    // string values cannot fake a turn head.
+    const gpa = std.testing.allocator;
+    const body = "{\"model\":\"deepseek-chat\",\"messages\":[{\"role\":\"system\",\"content\":\"s\"},{\"role\":\"user\",\"content\":\"hi\"},{\"role\":\"assistant\",\"content\":\"done\"},{\"role\":\"user\",\"content\":\"next\"}],\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"t\",\"description\":\"a tool\",\"parameters\":{}}}],\"max_tokens\":100}";
+    const healed = withReasoningEcho(gpa, body, "").?;
+    defer gpa.free(healed);
+    try std.testing.expect(std.mem.indexOf(u8, healed, ",{\"role\":\"assistant\",\"reasoning_content\":\"\",\"content\":\"done\"}") != null);
+    try std.testing.expect(std.mem.startsWith(u8, healed, "{\"model\":\"deepseek-chat\""));
+    try std.testing.expect(std.mem.endsWith(u8, healed, ",\"max_tokens\":100}"));
+    // Idempotent on the healed body — the pre-apply must not grow requests turn over turn.
+    try std.testing.expect(withReasoningEcho(gpa, healed, "") == null);
+}
+
 test "nextMissingEchoOffset walks every bare assistant turn — plain history turns included" {
     // bare tool-call turn, then a bare PLAIN turn (matched too — the newer enforcement rejects any
     // assistant message lacking the field), then an echoed tool-call turn (skipped), then a second
@@ -3284,8 +3349,10 @@ test "reasoning degeneration: repeats condense behind one marker, resume live on
     try std.testing.expect(std.mem.indexOf(u8, seen, "(reasoning repeating - condensed...)") != null);
     try std.testing.expect(std.mem.indexOf(u8, seen, "Found it - the CIFFC page has the numbers.") != null); // resumed
     try std.testing.expect(!st.runaway); // 24 repeats is a recoverable loop, not a runaway
-    // st.reasoning (the assembled channel) carries the CONDENSED stream — downstream consumers inherit it
-    try std.testing.expect(st.reasoning.items.len < 24 * L.len);
+    // st.reasoning (the assembled ECHO channel) carries the stream VERBATIM — thinking-mode endpoints
+    // validate the passback unmodified, so the display filter must never contaminate it.
+    try std.testing.expect(st.reasoning.items.len >= 24 * L.len);
+    try std.testing.expect(std.mem.indexOf(u8, st.reasoning.items, "(reasoning repeating - condensed...)") == null);
 }
 
 test "reasoning degeneration: fragment-split lines still detected; runaway trips the breaker" {
