@@ -8655,7 +8655,10 @@ fn completeAdaptive(w: *Worker, mi: *MindState, round: u32, messages_json: []con
         const noop = rest.ok and rest.content.len == 0 and rest.calls.len == 0;
         if (rest.ok and !noop) return rest;
         const why = if (!rest.ok) fallbackReason(rest.content) else "resting model returned no action — needs deeper reasoning";
-        w.act(mi.name, round, "escalate", why, std.fmt.allocPrint(w.a(), "RESTING on the gateway model ({s}) was insufficient [{s}] — ESCALATING this moment to the primary ({s}) for real compute", .{ w.gateway_model, if (rest.ok) "no action" else clip(rest.content, 100), w.model }) catch "escalate");
+        // stack buffer, not w.a(): this runs on the parallel moment threads and the round arena is not
+        // thread-safe (act copies the message before returning)
+        var ebuf: [512]u8 = undefined;
+        w.act(mi.name, round, "escalate", why, std.fmt.bufPrint(&ebuf, "RESTING on the gateway model ({s}) was insufficient [{s}] — ESCALATING this moment to the primary ({s}) for real compute", .{ w.gateway_model, if (rest.ok) "no action" else clip(rest.content, 100), w.model }) catch "escalate");
         rest.deinit(w.gpa);
         // The escalation to the primary can itself hit an offline uplink — route it through the local rung.
         return localRung(w, mi, round, messages_json, tools_json, max_tokens, temperature, llm.complete(w.gpa, w.io, w.run_dir, mi.scope, w.base_url, w.key, w.model, messages_json, tools_json, max_tokens, temperature));
@@ -8664,7 +8667,10 @@ fn completeAdaptive(w: *Worker, mi: *MindState, round: u32, messages_json: []con
     var step = llm.complete(w.gpa, w.io, w.run_dir, mi.scope, w.base_url, w.key, w.model, messages_json, tools_json, max_tokens, temperature);
     if (step.ok) return step;
     if (has_fallback and isRetryable(step.content)) {
-        w.act(mi.name, round, "fallback", fallbackReason(step.content), std.fmt.allocPrint(w.a(), "the primary model ({s}) failed [{s}] — SELF-HEALING by falling back to the gateway model ({s}) so the mind keeps working", .{ w.model, clip(step.content, 100), w.gateway_model }) catch "fallback");
+        // stack buffer, not w.a(): this runs on the parallel moment threads and the round arena is not
+        // thread-safe (act copies the message before returning)
+        var fbuf: [512]u8 = undefined;
+        w.act(mi.name, round, "fallback", fallbackReason(step.content), std.fmt.bufPrint(&fbuf, "the primary model ({s}) failed [{s}] — SELF-HEALING by falling back to the gateway model ({s}) so the mind keeps working", .{ w.model, clip(step.content, 100), w.gateway_model }) catch "fallback");
         var fb = llm.complete(w.gpa, w.io, w.run_dir, mi.scope, w.gw_base, w.gw_key, w.gateway_model, messages_json, tools_json, max_tokens, temperature);
         if (fb.ok) {
             step.deinit(w.gpa);
@@ -8683,7 +8689,10 @@ fn completeAdaptive(w: *Worker, mi: *MindState, round: u32, messages_json: []con
 /// Inert when the primary is itself local (no rung to add) or local_model is unset.
 fn localRung(w: *Worker, mi: *MindState, round: u32, messages_json: []const u8, tools_json: []const u8, max_tokens: u32, temperature: f32, failed: llm.Step) llm.Step {
     if (!localRungApplies(w.local_model, w.base_url, failed.ok, failed.content)) return failed;
-    w.act(mi.name, round, "local_fallback", fallbackReason(failed.content), std.fmt.allocPrint(w.a(), "the cloud model failed [{s}] and the uplink may be down — falling back to the LOCAL model ({s} @ {s}) so the mind keeps working offline", .{ clip(failed.content, 100), w.local_model, w.local_base }) catch "local fallback");
+    // stack buffer, not w.a(): this runs on the parallel moment threads and the round arena is not
+    // thread-safe (act copies the message before returning)
+    var lbuf: [512]u8 = undefined;
+    w.act(mi.name, round, "local_fallback", fallbackReason(failed.content), std.fmt.bufPrint(&lbuf, "the cloud model failed [{s}] and the uplink may be down — falling back to the LOCAL model ({s} @ {s}) so the mind keeps working offline", .{ clip(failed.content, 100), w.local_model, w.local_base }) catch "local fallback");
     var lb = llm.complete(w.gpa, w.io, w.run_dir, mi.scope, w.local_base, w.local_key, w.local_model, messages_json, tools_json, max_tokens, temperature);
     if (lb.ok) {
         var f = failed;
