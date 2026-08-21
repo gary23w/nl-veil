@@ -4539,7 +4539,8 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
         ",\n" ++ tools.BROWSER_SCHEMA ++ ",\n" ++ tools.PIXEL_SCHEMA
     else if (browser_on and gate.schema == .scout)
         SCOUT_BROWSER_SCHEMA
-    else "";
+    else
+        "";
     // MCP find-and-use tools: injected when NL_MCP is set (separate opt-in from the browser driver).
     const mcp_on = blk: {
         const v = environ.get("NL_MCP") orelse break :blk false;
@@ -4555,6 +4556,16 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     var llm_fatal = false;
     var turn: u32 = 0;
     var cap_warned = false;
+    // THINKING-MODE reasoning echo-back (self-heal) — the chat engine's fix wired into the mind loop.
+    // DeepSeek-style thinking endpoints 400 a tool-calling round whose assistant turn omits its
+    // reasoning_content ("must be passed back"), while the classic reasoner 400s on its PRESENCE — no safe
+    // default, so it is learned per model and remembered (llm.reasoningEchoFor), exactly like the
+    // temperature quirks. The mind loop was the surface the chat-side fix missed: fence_writes only covers
+    // backends LEARNED to need the text protocol; every hosted thinking model takes the structured
+    // tool_calls branch below and sent the turn back with its reasoning dropped.
+    var asst_reasoning: []u8 = @constCast(""); // the last structured tool-call turn's reasoning, duped —
+    defer if (asst_reasoning.len > 0) gpa.free(asst_reasoning); // the conv carries none to recover
+    var reasoning_healed = false; // at most one heal per moment — never spin if the retry still fails
     // MIND FLOOR state (all mind-local — moments run in parallel threads, so nothing here touches the
     // shared Worker; records ride out on the Moment for the single-threaded pairing pass):
     var act_nudged = false; //   one "you announced but didn't act" corrective turn per moment
@@ -4599,9 +4610,19 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
             cap_warned = true;
             conv.appendSlice(gpa, ",{\"role\":\"user\",\"content\":\"NOTE: your working context for this moment is nearly full. Finish NOW — make your single most important remaining action this turn (write/append your file, or your final tool call); the next turn may be your last this moment.\"}") catch {};
         }
-        var step = completeAdaptive(w, mi, round, conv.items, live_schema, w.max_tokens_eff, w.cap.temperature);
+        var step = completeAdaptive(w, mi, round, conv.items, live_schema, w.max_tokens_eff, w.cap.temperature, asst_reasoning);
         defer step.deinit(gpa);
         if (!step.ok) {
+            // THINKING-MODE HEAL: this request was rejected because the prior assistant tool-call turn
+            // omitted reasoning_content. Learn the quirk, splice the saved reasoning into that turn, and
+            // retry the inference — once per moment; later turns echo inline. The retry spends a turn slot,
+            // the same price the loop's other recovery continues already pay.
+            if (!reasoning_healed and llm.isReasoningEchoError(step.content) and
+                healReasoningEcho(w, mi, round, &conv, asst_reasoning))
+            {
+                reasoning_healed = true;
+                continue;
+            }
             if (isFatalLlm(step.content)) llm_fatal = true;
             if (step.content.len > 0) w.act(mi.name, round, "thinking", "", clip(step.content, 1400));
             gpa.free(monologue);
@@ -4617,7 +4638,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
                 defer rconv.deinit(gpa);
                 rconv.appendSlice(gpa, conv.items) catch {};
                 rconv.appendSlice(gpa, ",{\"role\":\"user\",\"content\":\"Your previous tool call could not be parsed. Do NOT call any tool — reply with plain text only. To CHANGE an EXISTING file, put its relative path on its own line, then one or more edit blocks copied EXACTLY in this form:\\n<<<<<<< SEARCH\\n(the exact current lines, copied verbatim)\\n=======\\n(the new lines)\\n>>>>>>> REPLACE\\nTo CREATE a NEW file, put its relative path on its own line, then a single fenced code block with the COMPLETE file. No other prose.\"}") catch {};
-                var rep = completeAdaptive(w, mi, round, rconv.items, "", w.max_tokens_eff, w.cap.temperature);
+                var rep = completeAdaptive(w, mi, round, rconv.items, "", w.max_tokens_eff, w.cap.temperature, asst_reasoning);
                 defer rep.deinit(gpa);
                 if (rep.ok and rep.content.len > 0) {
                     gpa.free(monologue);
@@ -4631,7 +4652,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
                 defer rconv.deinit(gpa);
                 rconv.appendSlice(gpa, conv.items) catch {};
                 rconv.appendSlice(gpa, ",{\"role\":\"user\",\"content\":\"Your previous tool call could not be parsed. Do NOT call any tool. Reply with ONLY your single host action on one line, in the form: <verb> <target> — use the verb you intended and the EXACT identifier (pid/name/ip/unit/path) shown verbatim in the device state above; never invent an identifier. No prose, no explanation — just the one action line.\"}") catch {};
-                var rep = completeAdaptive(w, mi, round, rconv.items, "", w.max_tokens_eff, w.cap.temperature);
+                var rep = completeAdaptive(w, mi, round, rconv.items, "", w.max_tokens_eff, w.cap.temperature, asst_reasoning);
                 defer rep.deinit(gpa);
                 if (rep.ok and rep.content.len > 0) {
                     if (rep.reasoning.len > 0) w.act(mi.name, round, "thinking", "", clip(rep.reasoning, 600));
@@ -4774,7 +4795,24 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
             llm.jstr(gpa, &conv, note.items) catch {};
             conv.append(gpa, '}') catch {};
         } else {
-            conv.appendSlice(gpa, ",{\"role\":\"assistant\",\"content\":") catch {};
+            // Dup this turn's reasoning so the heal above can splice it back if the NEXT inference is
+            // rejected for its absence. Freed on replace + by the moment defer.
+            if (asst_reasoning.len > 0) gpa.free(asst_reasoning);
+            asst_reasoning = gpa.dupe(u8, step.reasoning) catch @constCast("");
+            conv.appendSlice(gpa, llm.ASSISTANT_OBJ_HEAD) catch {};
+            // Echo reasoning_content inline once the model is known to require it (learned via the heal).
+            // BEFORE content, so this path and the splice (llm.reasoningSpliceOffset) insert at the same offset.
+            // Gated on the PRIMARY alone, deliberately: a FALLBACK rung whose model needs the echo gets it
+            // spliced into a dispatch-time copy instead (completeRung) — building it in here whenever ANY
+            // rung requires it would 400 a classic-reasoner primary on the echo's PRESENCE. Echoed even when
+            // this turn has NO reasoning text (a turn a non-thinking fallback served, or a thinking turn
+            // that emitted none): the constraint is on the field's presence, and one bare turn would 400
+            // the next primary call with the once-per-moment heal already spent.
+            if (llm.reasoningEchoFor(w.io, w.model)) {
+                conv.appendSlice(gpa, ",\"reasoning_content\":") catch {};
+                llm.jstr(gpa, &conv, step.reasoning) catch {};
+            }
+            conv.appendSlice(gpa, ",\"content\":") catch {};
             llm.jstr(gpa, &conv, step.content) catch {};
             conv.appendSlice(gpa, ",\"tool_calls\":[") catch {};
             for (step.calls, 0..) |c, i| {
@@ -4970,8 +5008,18 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     if (monologue.len == 0) {
         gpa.free(monologue);
         conv.appendSlice(gpa, ",{\"role\":\"user\",\"content\":\"Stop using tools. In ONE sentence, summarize the concrete progress you made this moment.\"}") catch {};
-        var fin = completeAdaptive(w, mi, round, conv.items, "", 160, -1);
+        var fin = completeAdaptive(w, mi, round, conv.items, "", 160, -1, asst_reasoning);
         defer fin.deinit(gpa);
+        // This settle call can be the FIRST inference after a tool round (the loop exited at a cap right
+        // after the round), so on a fresh process it is the one place left that can trip the thinking-mode
+        // echo constraint unhealed. Same heal as the loop: splice + retry once, else the canned monologue.
+        if (!fin.ok and !reasoning_healed and llm.isReasoningEchoError(fin.content) and
+            healReasoningEcho(w, mi, round, &conv, asst_reasoning))
+        {
+            reasoning_healed = true;
+            fin.deinit(gpa);
+            fin = completeAdaptive(w, mi, round, conv.items, "", 160, -1, asst_reasoning);
+        }
         monologue = if (fin.ok and fin.content.len > 0)
             (gpa.dupe(u8, fin.content) catch @constCast(""))
         else
@@ -5153,7 +5201,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
                     defer if (cmsg.len > 0) gpa.free(@constCast(cmsg));
                     llm.jstr(gpa, &rconv, if (cmsg.len > 0) cmsg else "Reply with ONLY your complete file as one fenced code block led by its relative path.") catch {};
                     rconv.append(gpa, '}') catch {};
-                    var rep = completeAdaptive(w, mi, round, rconv.items, "", w.max_tokens_eff, w.cap.temperature);
+                    var rep = completeAdaptive(w, mi, round, rconv.items, "", w.max_tokens_eff, w.cap.temperature, asst_reasoning);
                     defer rep.deinit(gpa);
                     if (rep.ok and rep.content.len > 0) {
                         if (bufedit.parseNarratedSlot(gpa, rep.content, salvage_slot)) |n2| {
@@ -7921,8 +7969,7 @@ fn anyDeliverableBuilt(w: *Worker) bool {
 fn setBackstopDirective(w: *Worker, round: u32) void {
     const gpa = w.gpa;
     w.act("engine", round, "ungrounded", "this run reached for external facts and every live fetch failed — the deliverable's specifics are unverified", "attempted-and-failed backstop");
-    const gd = gpa.dupe(u8,
-        "GROUNDING REQUIRED — this run tried to fetch external facts and EVERY live fetch came back empty, yet the deliverable states specifics. Those specifics are UNVERIFIED and this run will NOT finish until they are grounded. THIS round: web_search with REFINED queries (fewer, different words), then read_url the best result to fetch the real value. If a value genuinely cannot be fetched, write it as UNVERIFIED. Do NOT state any specific (a version, date, URL, email, phone number, price) from memory — a fabricated specific is a failure.") catch return;
+    const gd = gpa.dupe(u8, "GROUNDING REQUIRED — this run tried to fetch external facts and EVERY live fetch came back empty, yet the deliverable states specifics. Those specifics are UNVERIFIED and this run will NOT finish until they are grounded. THIS round: web_search with REFINED queries (fewer, different words), then read_url the best result to fetch the real value. If a value genuinely cannot be fetched, write it as UNVERIFIED. Do NOT state any specific (a version, date, URL, email, phone number, price) from memory — a fabricated specific is a failure.") catch return;
     if (w.strategy_str.len > 0) gpa.free(@constCast(w.strategy_str));
     w.strategy_str = gd;
 }
@@ -8621,6 +8668,24 @@ fn isToolParseError(msg: []const u8) bool {
     return false;
 }
 
+/// THINKING-MODE HEAL, the splice half (shared by the mind loop's inference and the settle-summary call):
+/// learn the reasoning-echo quirk for this worker's primary model and splice reasoning_content into EVERY
+/// bare structured tool-call turn of `conv` — the newest gets the saved `reasoning`, older ones (and a
+/// newest with none saved, e.g. authored by a non-thinking fallback rung) the empty echo, because the
+/// thinking-mode constraint is on the field's PRESENCE and any single bare turn re-400s the whole request.
+/// true ⇒ spliced, caller retries the inference; false ⇒ nothing to heal (no bare tool-call turn) — the
+/// error surfaces exactly as before. llm.zig owns the quirk storage + the error predicate + the byte-exact
+/// splice; this owns the conv bytes, because the mind loop owns the reasoning text.
+fn healReasoningEcho(w: *Worker, mi: *MindState, round: u32, conv: *std.ArrayListUnmanaged(u8), reasoning: []const u8) bool {
+    if (llm.nextMissingEchoOffset(conv.items, 0) == null) return false;
+    llm.learnReasoningEcho(w.io, w.model); // learn FIRST: even an OOM below leaves later turns echoing inline
+    const healed = llm.withReasoningEcho(w.gpa, conv.items, reasoning) orelse return false;
+    conv.deinit(w.gpa);
+    conv.* = .fromOwnedSlice(healed);
+    w.act(mi.name, round, "self_heal", "reasoning_echo", "thinking mode demands reasoning_content passed back on tool-call turns — spliced it into every bare turn, learned the quirk for this model, retrying");
+    return true;
+}
+
 /// SELF-HEALING REASONING CALL — the mind detects when its primary (paid) model is rate-limited / overloaded /
 /// transiently failing and FALLS BACK to the gateway model + endpoint (the local, never-rate-limited model in a hybrid
 /// setup) so the swarm keeps thinking instead of losing the turn. The fallback is degraded (a weaker model) but alive;
@@ -8638,7 +8703,54 @@ fn fallbackReason(content: []const u8) []const u8 {
     return "primary transient failure";
 }
 
-fn completeAdaptive(w: *Worker, mi: *MindState, round: u32, messages_json: []const u8, tools_json: []const u8, max_tokens: u32, temperature: f32) llm.Step {
+/// One FALLBACK-RUNG dispatch (resting / gateway / local), with the thinking-mode reasoning-echo quirk
+/// handled for the rung's OWN model. The conv bytes are built for the PRIMARY's learned quirks — the turn
+/// builder echoes reasoning_content inline only when w.model needs it — so a rung landing on a
+/// thinking-mode endpoint behind a non-thinking primary (a deepseek-thinking gateway, say) 400s the whole
+/// tool round ("must be passed back"), and before this helper that 400 was discarded on the fallback path:
+/// llm.learnReasoningEcho never ran for the fallback model and every fallback call on a tool round
+/// silently lost the turn. Two halves, mirroring the primary's heal: a rung whose model already LEARNED
+/// the quirk gets the echo spliced into a dispatch-time COPY (the caller's conv must stay primary-shaped —
+/// the classic reasoner 400s on the echo's PRESENCE, so neither a blanket echo nor an echo-if-any-rung
+/// gate in the turn builder is safe); a rung that 400s fresh LEARNS the quirk for the model that actually
+/// erred — never the primary, which healReasoningEcho would have wrongly tagged — and retries once,
+/// spliced. `reasoning` may be empty: a non-thinking primary's tool-call turn has no reasoning text, and
+/// the constraint is on the field's presence.
+///
+/// Two accepted limits, both inherited from the existing quirk design: the quirk table keys on the model
+/// NAME alone (like the temperature rules), so a same-named model with the OPPOSITE quirk at a different
+/// base would alias; and only the echo-ABSENCE direction heals — a rung that rejects the echo's PRESENCE
+/// in a conv a thinking primary already echoed into (classic-reasoner-as-gateway) has no strip path,
+/// because that rejection's error text is unknown and the realistic fallback rungs (local models) simply
+/// ignore the extra field.
+fn completeRung(w: *Worker, mi: *MindState, round: u32, base: []const u8, key: []const u8, model: []const u8, messages_json: []const u8, tools_json: []const u8, max_tokens: u32, temperature: f32, reasoning: []const u8) llm.Step {
+    if (llm.reasoningEchoFor(w.io, model)) {
+        if (llm.withReasoningEcho(w.gpa, messages_json, reasoning)) |spliced| {
+            defer w.gpa.free(spliced);
+            return llm.complete(w.gpa, w.io, w.run_dir, mi.scope, base, key, model, spliced, tools_json, max_tokens, temperature);
+        }
+    }
+    var step = llm.complete(w.gpa, w.io, w.run_dir, mi.scope, base, key, model, messages_json, tools_json, max_tokens, temperature);
+    if (!step.ok and llm.isReasoningEchoError(step.content)) {
+        llm.learnReasoningEcho(w.io, model); // learn FIRST, keyed on THIS rung's model — even a failed retry leaves later dispatches pre-splicing
+        if (llm.withReasoningEcho(w.gpa, messages_json, reasoning)) |spliced| {
+            defer w.gpa.free(spliced);
+            // Stack buffer, NOT w.a(): moments run in parallel threads and the round scratch arena is not
+            // thread-safe (see the concurrent-meta-group note; act copies the message before returning).
+            var mbuf: [256]u8 = undefined;
+            w.act(mi.name, round, "self_heal", "reasoning_echo", std.fmt.bufPrint(&mbuf, "the fallback rung's model ({s}) demands reasoning_content passed back on tool-call turns — spliced it into this dispatch, learned the quirk for that model, retrying the rung", .{model}) catch "reasoning echo on fallback rung");
+            var retry = llm.complete(w.gpa, w.io, w.run_dir, mi.scope, base, key, model, spliced, tools_json, max_tokens, temperature);
+            if (retry.ok) {
+                step.deinit(w.gpa);
+                return retry;
+            }
+            retry.deinit(w.gpa);
+        }
+    }
+    return step;
+}
+
+fn completeAdaptive(w: *Worker, mi: *MindState, round: u32, messages_json: []const u8, tools_json: []const u8, max_tokens: u32, temperature: f32, reasoning: []const u8) llm.Step {
     const has_fallback = !std.mem.eql(u8, w.gateway_model, w.model) or !std.mem.eql(u8, w.gw_base, w.base_url);
 
     // RESTING IS FOR SMALL CALLS ONLY, and the budget test is what makes it safe now that casts carry a real
@@ -8651,7 +8763,7 @@ fn completeAdaptive(w: *Worker, mi: *MindState, round: u32, messages_json: []con
     // calls resting (their intended target) and keeps every max_tokens_eff moment on the primary.
     // This cannot be gated inside agi.restingNow — that has no view of an individual call's budget.
     if (w.resting and has_fallback and max_tokens <= 1024) {
-        var rest = llm.complete(w.gpa, w.io, w.run_dir, mi.scope, w.gw_base, w.gw_key, w.gateway_model, messages_json, tools_json, max_tokens, temperature);
+        var rest = completeRung(w, mi, round, w.gw_base, w.gw_key, w.gateway_model, messages_json, tools_json, max_tokens, temperature, reasoning);
         const noop = rest.ok and rest.content.len == 0 and rest.calls.len == 0;
         if (rest.ok and !noop) return rest;
         const why = if (!rest.ok) fallbackReason(rest.content) else "resting model returned no action — needs deeper reasoning";
@@ -8661,7 +8773,7 @@ fn completeAdaptive(w: *Worker, mi: *MindState, round: u32, messages_json: []con
         w.act(mi.name, round, "escalate", why, std.fmt.bufPrint(&ebuf, "RESTING on the gateway model ({s}) was insufficient [{s}] — ESCALATING this moment to the primary ({s}) for real compute", .{ w.gateway_model, if (rest.ok) "no action" else clip(rest.content, 100), w.model }) catch "escalate");
         rest.deinit(w.gpa);
         // The escalation to the primary can itself hit an offline uplink — route it through the local rung.
-        return localRung(w, mi, round, messages_json, tools_json, max_tokens, temperature, llm.complete(w.gpa, w.io, w.run_dir, mi.scope, w.base_url, w.key, w.model, messages_json, tools_json, max_tokens, temperature));
+        return localRung(w, mi, round, messages_json, tools_json, max_tokens, temperature, reasoning, llm.complete(w.gpa, w.io, w.run_dir, mi.scope, w.base_url, w.key, w.model, messages_json, tools_json, max_tokens, temperature));
     }
 
     var step = llm.complete(w.gpa, w.io, w.run_dir, mi.scope, w.base_url, w.key, w.model, messages_json, tools_json, max_tokens, temperature);
@@ -8671,7 +8783,7 @@ fn completeAdaptive(w: *Worker, mi: *MindState, round: u32, messages_json: []con
         // thread-safe (act copies the message before returning)
         var fbuf: [512]u8 = undefined;
         w.act(mi.name, round, "fallback", fallbackReason(step.content), std.fmt.bufPrint(&fbuf, "the primary model ({s}) failed [{s}] — SELF-HEALING by falling back to the gateway model ({s}) so the mind keeps working", .{ w.model, clip(step.content, 100), w.gateway_model }) catch "fallback");
-        var fb = llm.complete(w.gpa, w.io, w.run_dir, mi.scope, w.gw_base, w.gw_key, w.gateway_model, messages_json, tools_json, max_tokens, temperature);
+        var fb = completeRung(w, mi, round, w.gw_base, w.gw_key, w.gateway_model, messages_json, tools_json, max_tokens, temperature, reasoning);
         if (fb.ok) {
             step.deinit(w.gpa);
             return fb;
@@ -8680,20 +8792,20 @@ fn completeAdaptive(w: *Worker, mi: *MindState, round: u32, messages_json: []con
     }
     // LOCAL RUNG last: gateway may be cloud too (the observed dead-round case — a cloud primary AND a cloud
     // gateway both offline). A local model has no uplink to lose, so it keeps the mind working through a blip.
-    return localRung(w, mi, round, messages_json, tools_json, max_tokens, temperature, step);
+    return localRung(w, mi, round, messages_json, tools_json, max_tokens, temperature, reasoning, step);
 }
 
 /// Final fallback rung: a CLOUD call failed with a retryable/offline error, so try the LOCAL model
 /// (Ollama / built-in the-veil-12b), which works with no uplink. Takes ownership of `failed`: returns a
 /// fresh ok step (freeing `failed`), or `failed` unchanged when no local rung applies or it also failed.
 /// Inert when the primary is itself local (no rung to add) or local_model is unset.
-fn localRung(w: *Worker, mi: *MindState, round: u32, messages_json: []const u8, tools_json: []const u8, max_tokens: u32, temperature: f32, failed: llm.Step) llm.Step {
+fn localRung(w: *Worker, mi: *MindState, round: u32, messages_json: []const u8, tools_json: []const u8, max_tokens: u32, temperature: f32, reasoning: []const u8, failed: llm.Step) llm.Step {
     if (!localRungApplies(w.local_model, w.base_url, failed.ok, failed.content)) return failed;
     // stack buffer, not w.a(): this runs on the parallel moment threads and the round arena is not
     // thread-safe (act copies the message before returning)
     var lbuf: [512]u8 = undefined;
     w.act(mi.name, round, "local_fallback", fallbackReason(failed.content), std.fmt.bufPrint(&lbuf, "the cloud model failed [{s}] and the uplink may be down — falling back to the LOCAL model ({s} @ {s}) so the mind keeps working offline", .{ clip(failed.content, 100), w.local_model, w.local_base }) catch "local fallback");
-    var lb = llm.complete(w.gpa, w.io, w.run_dir, mi.scope, w.local_base, w.local_key, w.local_model, messages_json, tools_json, max_tokens, temperature);
+    var lb = completeRung(w, mi, round, w.local_base, w.local_key, w.local_model, messages_json, tools_json, max_tokens, temperature, reasoning);
     if (lb.ok) {
         var f = failed;
         f.deinit(w.gpa);
@@ -11635,7 +11747,7 @@ test "the prompt block actually CALLS memoryView — a unit test alone would not
     const src = @embedFile("run.zig");
     const marker = "YOUR SWARM'S OPERATING " ++ "PLAYBOOK";
     const at = std.mem.indexOf(u8, src, marker) orelse return error.PlaybookPromptBlockMissing;
-    const around = src[at -| 700 .. @min(src.len, at + 400)];
+    const around = src[at -| 700..@min(src.len, at + 400)];
     if (std.mem.indexOf(u8, around, "memoryView") == null) {
         std.log.warn("run.zig: the playbook prompt block no longer calls memoryView — its overflow is back to dropping rules by age", .{});
         return error.PlaybookSelectorNotWired;

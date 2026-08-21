@@ -1285,7 +1285,8 @@ const Quirk = struct {
     // thinking mode 400s if it is ABSENT on an assistant turn that carried a tool_call ('reasoning_content
     // in the thinking mode must be passed back'). No safe universal default — so it is LEARNED per model
     // from that exact error and remembered, exactly like the temperature rules. The echo itself happens at
-    // the engine's message-build layer (it owns the reasoning text), gated on reasoningEchoFor().
+    // each agentic loop's message-build layer (chat engine + swarm mind loop — each owns its reasoning
+    // text), gated on reasoningEchoFor().
     reasoning_echo: bool = false,
 };
 
@@ -1320,8 +1321,9 @@ fn quirkFor(io: std.Io, model: []const u8) Quirk {
 }
 
 /// Learn that THIS model requires reasoning_content to be echoed back on tool-call turns (DeepSeek thinking
-/// mode). Merges into any existing slot so a temperature rule already learned for the model survives. The
-/// engine calls this the moment the provider returns the "must be passed back" error, then retries.
+/// mode). Merges into any existing slot so a temperature rule already learned for the model survives. Both
+/// agentic loops (chat engine, swarm mind loop) call this the moment the provider returns the "must be
+/// passed back" error, then retry.
 pub fn learnReasoningEcho(io: std.Io, model: []const u8) void {
     if (model.len == 0) return;
     const h = std.hash.Wyhash.hash(0x9e37, model);
@@ -1343,15 +1345,94 @@ pub fn reasoningEchoFor(io: std.Io, model: []const u8) bool {
     return quirkFor(io, model).reasoning_echo;
 }
 
-/// Is this provider error the thinking-mode "reasoning_content must be passed back" constraint? The engine
-/// checks this at its message-build layer (llm.zig cannot heal it — the reasoning text was dropped upstream,
-/// not mangled in the body). Case-insensitive; both key phrases sit near the front of the real error.
+/// Is this provider error the thinking-mode "reasoning_content must be passed back" constraint? The chat
+/// engine and the swarm mind loop check this at their message-build layers (llm.zig cannot heal it — the
+/// reasoning text was dropped upstream, not mangled in the body). Case-insensitive; both key phrases sit
+/// near the front of the real error.
 pub fn isReasoningEchoError(msg: []const u8) bool {
     var lb: [512]u8 = undefined;
     const n = @min(msg.len, lb.len);
     const m = std.ascii.lowerString(lb[0..n], msg[0..n]);
     return std.mem.indexOf(u8, m, "reasoning_content") != null and
         (std.mem.indexOf(u8, m, "passed back") != null or std.mem.indexOf(u8, m, "thinking mode") != null);
+}
+
+/// The exact head of an assistant object as BOTH agentic loops serialize it (the chat engine's tool-call
+/// turn builder and the swarm mind loop's structured branch). Shared with reasoningSpliceOffset so the
+/// reasoning_content splice lands right after `"assistant"`, byte-for-byte in step with the builders —
+/// if a builder's serialization changes, this must change with it (the splice searches these exact bytes).
+pub const ASSISTANT_OBJ_HEAD = ",{\"role\":\"assistant\"";
+
+/// Where to splice a `,"reasoning_content":...` into a LIVE conversation buffer: right after the head of
+/// the most recent assistant object, but ONLY when that object is a tool-call turn that has not already
+/// echoed its reasoning. Read from the current buffer (not a saved offset) so mid-loop buffer rewrites
+/// (the chat engine's compactWorking) cannot stale it. null ⇒ nothing to heal (no tool-call turn, or
+/// already echoed). Pure — tested.
+pub fn reasoningSpliceOffset(buf: []const u8) ?usize {
+    const a0 = std.mem.lastIndexOf(u8, buf, ASSISTANT_OBJ_HEAD) orelse return null;
+    const obj = buf[a0..]; // from this assistant object to the end (its tool_calls + the tool results after it)
+    if (std.mem.indexOf(u8, obj, "\"tool_calls\"") == null) return null; // a plain turn (e.g. a compaction summary)
+    if (std.mem.indexOf(u8, obj, "\"reasoning_content\"") != null) return null; // already carries it
+    return a0 + ASSISTANT_OBJ_HEAD.len;
+}
+
+/// The next assistant TOOL-CALL object at or after `from` that has not echoed its reasoning: returns the
+/// splice offset (right after the object head). Each object's extent runs to the next raw `,{"role":`
+/// head (or the buffer end) — raw head bytes cannot occur inside a JSON string value because jstr escapes
+/// every quote, so this walks true turn boundaries only. reasoningSpliceOffset locates the NEWEST turn;
+/// this walks ALL of them, because a moment served by a fallback rung accumulates one bare turn per round
+/// (the builders echo inline only for their own model's learned quirk) and a thinking endpoint rejects
+/// the request for ANY bare tool-call turn, not just the newest — a newest-only heal re-400s forever from
+/// the second bare turn on. Pure — tested.
+pub fn nextMissingEchoOffset(buf: []const u8, from: usize) ?usize {
+    var pos = from;
+    while (pos < buf.len) {
+        const a0 = std.mem.indexOfPos(u8, buf, pos, ASSISTANT_OBJ_HEAD) orelse return null;
+        const body = a0 + ASSISTANT_OBJ_HEAD.len;
+        const end = std.mem.indexOfPos(u8, buf, body, ",{\"role\":") orelse buf.len;
+        const obj = buf[a0..end];
+        if (std.mem.indexOf(u8, obj, "\"tool_calls\"") != null and
+            std.mem.indexOf(u8, obj, "\"reasoning_content\"") == null) return body;
+        pos = end;
+    }
+    return null;
+}
+
+/// Build a COPY of `conv` with `,"reasoning_content":...` spliced into EVERY bare assistant tool-call
+/// turn (nextMissingEchoOffset): the newest bare turn gets `reasoning`, older ones get the empty echo —
+/// their reasoning text is gone (each loop saves only the newest turn's), and the thinking-mode
+/// constraint is on the field's PRESENCE, so an empty echo still satisfies it. That also covers a turn
+/// authored by a non-thinking model, which never had reasoning to begin with. null ⇒ nothing to splice
+/// (no bare tool-call turn) — send the original. Serves both the in-place heals (the caller swaps its
+/// conv for the copy) and a single dispatch to a FALLBACK rung whose model needs the echo while the conv
+/// was built for the primary's quirks — there the caller's conv must stay primary-shaped (the classic
+/// reasoner 400s on the echo's PRESENCE, so the echo cannot simply be built in for everyone). Pure — tested.
+pub fn withReasoningEcho(gpa: std.mem.Allocator, conv: []const u8, reasoning: []const u8) ?[]u8 {
+    var last: usize = 0; // offset of the NEWEST bare turn — the one the saved reasoning belongs to
+    var scan: usize = 0;
+    var any = false;
+    while (nextMissingEchoOffset(conv, scan)) |off| {
+        last = off;
+        scan = off;
+        any = true;
+    }
+    if (!any) return null;
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    blk: {
+        var prev: usize = 0;
+        scan = 0;
+        while (nextMissingEchoOffset(conv, scan)) |off| {
+            out.appendSlice(gpa, conv[prev..off]) catch break :blk;
+            out.appendSlice(gpa, ",\"reasoning_content\":") catch break :blk;
+            jstr(gpa, &out, if (off == last) reasoning else "") catch break :blk;
+            prev = off;
+            scan = off;
+        }
+        out.appendSlice(gpa, conv[prev..]) catch break :blk;
+        return out.toOwnedSlice(gpa) catch break :blk;
+    }
+    out.deinit(gpa);
+    return null;
 }
 
 /// Read a PARAM-CONSTRAINT quirk out of a provider's error message (case-insensitive). null = not a
@@ -2612,6 +2693,94 @@ test "reasoning-echo quirk: detected from the thinking-mode error, learned per m
     learnQuirk(io, "kimi-merge", .{ .temp = .drop });
     try std.testing.expect(reasoningEchoFor(io, "kimi-merge"));
     try std.testing.expectEqual(TempRule.drop, quirkFor(io, "kimi-merge").temp);
+}
+
+test "reasoningSpliceOffset finds the tool-call turn head, skips plain + already-echoed turns" {
+    // A tool-call turn with no reasoning_content: splice right after the head.
+    const b1 = "{\"role\":\"user\",\"content\":\"hi\"},{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{}]},{\"role\":\"tool\",\"content\":\"r\"}";
+    const off = reasoningSpliceOffset(b1).?;
+    try std.testing.expectEqualStrings(",\"content\":", b1[off .. off + 11]); // lands between "assistant" and ,"content"
+    // Already echoed ⇒ no splice (would double it). The leading user turn matters: it gives the assistant
+    // object its head comma, so this genuinely exercises the already-carries-it branch (not head-not-found).
+    const b2 = "{\"role\":\"user\",\"content\":\"hi\"},{\"role\":\"assistant\",\"reasoning_content\":\"t\",\"tool_calls\":[{}]},{\"role\":\"tool\",\"content\":\"r\"}";
+    try std.testing.expect(reasoningSpliceOffset(b2) == null);
+    // No tool-call turn at all (a plain assistant answer) ⇒ nothing to heal.
+    const b3 = "{\"role\":\"user\",\"content\":\"hi\"},{\"role\":\"assistant\",\"content\":\"done\"}";
+    try std.testing.expect(reasoningSpliceOffset(b3) == null);
+    // The LAST assistant object wins: an older summary turn must not shadow the real tool-call turn.
+    const b4 = "{\"role\":\"assistant\",\"content\":\"summary\"},{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{}]},{\"role\":\"tool\",\"content\":\"r\"}";
+    const off4 = reasoningSpliceOffset(b4).?;
+    try std.testing.expect(std.mem.indexOfPos(u8, b4, off4, "\"tool_calls\"") != null);
+    try std.testing.expect(off4 > std.mem.indexOf(u8, b4, "summary").?); // past the summary turn
+    // The swarm mind loop's exact serialization (tool_call_id results) splices the same way.
+    const b5 = "{\"role\":\"user\",\"content\":\"go\"},{\"role\":\"assistant\",\"content\":\"on it\",\"tool_calls\":[{\"id\":\"a\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{}\"}}]},{\"role\":\"tool\",\"tool_call_id\":\"a\",\"content\":\"data\"}";
+    const off5 = reasoningSpliceOffset(b5).?;
+    try std.testing.expectEqualStrings(",\"content\":", b5[off5 .. off5 + 11]);
+    // A tool RESULT that mentions the key as escaped text must not read as "already echoed": the JSON
+    // string escaping (\" not ") keeps the byte search from matching inside content — pinned here.
+    const b6 = "{\"role\":\"user\",\"content\":\"hi\"},{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{}]},{\"role\":\"tool\",\"content\":\"docs say \\\"reasoning_content\\\" is required\"}";
+    try std.testing.expect(reasoningSpliceOffset(b6) != null);
+}
+
+test "withReasoningEcho splices a dispatch-time copy for a fallback rung, empty reasoning included" {
+    const gpa = std.testing.allocator;
+    const conv = "{\"role\":\"user\",\"content\":\"go\"},{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{}]},{\"role\":\"tool\",\"content\":\"r\"}";
+    // The failing setup: the tool-call turn came from a NON-thinking primary, so there is no reasoning
+    // text — the thinking-mode constraint is on the field's PRESENCE, and an empty echo must still land.
+    const empty_echo = withReasoningEcho(gpa, conv, "").?;
+    defer gpa.free(empty_echo);
+    try std.testing.expect(std.mem.indexOf(u8, empty_echo, ",{\"role\":\"assistant\",\"reasoning_content\":\"\",\"content\":\"\"") != null);
+    // With reasoning text, the echo carries it JSON-encoded, and every byte around the splice survives.
+    const spliced = withReasoningEcho(gpa, conv, "thought \"x\"").?;
+    defer gpa.free(spliced);
+    try std.testing.expect(std.mem.indexOf(u8, spliced, "\"reasoning_content\":\"thought \\\"x\\\"\"") != null);
+    try std.testing.expect(std.mem.startsWith(u8, spliced, "{\"role\":\"user\",\"content\":\"go\"},{\"role\":\"assistant\""));
+    try std.testing.expect(std.mem.endsWith(u8, spliced, ",{\"role\":\"tool\",\"content\":\"r\"}"));
+    // Already echoed / no tool-call turn ⇒ null: the caller dispatches the original conv unchanged.
+    try std.testing.expect(withReasoningEcho(gpa, spliced, "t") == null);
+    try std.testing.expect(withReasoningEcho(gpa, "{\"role\":\"user\",\"content\":\"hi\"},{\"role\":\"assistant\",\"content\":\"done\"}", "t") == null);
+}
+
+test "withReasoningEcho heals EVERY bare tool-call turn — newest gets the saved reasoning, older the empty echo" {
+    const gpa = std.testing.allocator;
+    // Two consecutive fallback-served tool rounds: both assistant turns landed bare (the builder echoes
+    // inline only for the primary's quirk). A newest-only heal would leave turn 1 bare and re-400 forever.
+    const conv = "{\"role\":\"user\",\"content\":\"go\"}" ++
+        ",{\"role\":\"assistant\",\"content\":\"a\",\"tool_calls\":[{\"id\":\"1\"}]},{\"role\":\"tool\",\"tool_call_id\":\"1\",\"content\":\"r1\"}" ++
+        ",{\"role\":\"assistant\",\"content\":\"b\",\"tool_calls\":[{\"id\":\"2\"}]},{\"role\":\"tool\",\"tool_call_id\":\"2\",\"content\":\"r2\"}";
+    const spliced = withReasoningEcho(gpa, conv, "t2").?;
+    defer gpa.free(spliced);
+    try std.testing.expect(std.mem.indexOf(u8, spliced, "\"reasoning_content\":\"\",\"content\":\"a\"") != null); // older turn: empty echo
+    try std.testing.expect(std.mem.indexOf(u8, spliced, "\"reasoning_content\":\"t2\",\"content\":\"b\"") != null); // newest turn: the saved reasoning
+    // Idempotent: a healed buffer has nothing left to splice.
+    try std.testing.expect(withReasoningEcho(gpa, spliced, "t2") == null);
+    // Mixed buffer: an already-echoed turn is left alone, only the bare one is healed.
+    const mixed = "{\"role\":\"user\",\"content\":\"go\"}" ++
+        ",{\"role\":\"assistant\",\"reasoning_content\":\"kept\",\"content\":\"a\",\"tool_calls\":[{\"id\":\"1\"}]},{\"role\":\"tool\",\"tool_call_id\":\"1\",\"content\":\"r1\"}" ++
+        ",{\"role\":\"assistant\",\"content\":\"b\",\"tool_calls\":[{\"id\":\"2\"}]},{\"role\":\"tool\",\"tool_call_id\":\"2\",\"content\":\"r2\"}";
+    const m = withReasoningEcho(gpa, mixed, "t2").?;
+    defer gpa.free(m);
+    try std.testing.expect(std.mem.indexOf(u8, m, "\"reasoning_content\":\"kept\",\"content\":\"a\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, m, "\"reasoning_content\":\"t2\",\"content\":\"b\"") != null);
+    try std.testing.expect(withReasoningEcho(gpa, m, "t2") == null);
+}
+
+test "nextMissingEchoOffset walks every bare tool-call turn and only those" {
+    // bare tool-call turn, then a PLAIN turn (skipped), then an echoed tool-call turn (skipped),
+    // then a second bare tool-call turn.
+    const buf = "{\"role\":\"user\",\"content\":\"go\"}" ++
+        ",{\"role\":\"assistant\",\"content\":\"a\",\"tool_calls\":[{}]},{\"role\":\"tool\",\"content\":\"r\"}" ++
+        ",{\"role\":\"assistant\",\"content\":\"plain\"}" ++
+        ",{\"role\":\"assistant\",\"reasoning_content\":\"t\",\"content\":\"c\",\"tool_calls\":[{}]},{\"role\":\"tool\",\"content\":\"r\"}" ++
+        ",{\"role\":\"assistant\",\"content\":\"d\",\"tool_calls\":[{}]},{\"role\":\"tool\",\"content\":\"r\"}";
+    const o1 = nextMissingEchoOffset(buf, 0).?;
+    try std.testing.expectEqualStrings(",\"content\":\"a\"", buf[o1 .. o1 + 14]);
+    const o2 = nextMissingEchoOffset(buf, o1).?;
+    try std.testing.expectEqualStrings(",\"content\":\"d\"", buf[o2 .. o2 + 14]);
+    try std.testing.expect(nextMissingEchoOffset(buf, o2) == null);
+    // A tool result quoting the key as ESCAPED text does not mark the turn as echoed.
+    const esc = "{\"role\":\"user\",\"content\":\"hi\"},{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{}]},{\"role\":\"tool\",\"content\":\"docs say \\\"reasoning_content\\\" is required\"}";
+    try std.testing.expect(nextMissingEchoOffset(esc, 0) != null);
 }
 
 test "jstr sanitizes invalid UTF-8 and stays valid JSON" {
