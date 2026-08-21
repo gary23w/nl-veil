@@ -8670,7 +8670,7 @@ fn isToolParseError(msg: []const u8) bool {
 
 /// THINKING-MODE HEAL, the splice half (shared by the mind loop's inference and the settle-summary call):
 /// learn the reasoning-echo quirk for this worker's primary model and splice reasoning_content into EVERY
-/// bare structured tool-call turn of `conv` — the newest gets the saved `reasoning`, older ones (and a
+/// bare assistant turn of `conv` (tool-call and plain alike — see llm.nextMissingEchoOffset) — the newest gets the saved `reasoning`, older ones (and a
 /// newest with none saved, e.g. authored by a non-thinking fallback rung) the empty echo, because the
 /// thinking-mode constraint is on the field's PRESENCE and any single bare turn re-400s the whole request.
 /// true ⇒ spliced, caller retries the inference; false ⇒ nothing to heal (no bare tool-call turn) — the

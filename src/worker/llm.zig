@@ -1376,41 +1376,47 @@ pub fn reasoningSpliceOffset(buf: []const u8) ?usize {
     return a0 + ASSISTANT_OBJ_HEAD.len;
 }
 
-/// The next assistant TOOL-CALL object at or after `from` that has not echoed its reasoning: returns the
-/// splice offset (right after the object head). Each object's extent runs to the next raw `,{"role":`
-/// head (or the buffer end) — raw head bytes cannot occur inside a JSON string value because jstr escapes
-/// every quote, so this walks true turn boundaries only. reasoningSpliceOffset locates the NEWEST turn;
-/// this walks ALL of them, because a moment served by a fallback rung accumulates one bare turn per round
-/// (the builders echo inline only for their own model's learned quirk) and a thinking endpoint rejects
-/// the request for ANY bare tool-call turn, not just the newest — a newest-only heal re-400s forever from
-/// the second bare turn on. Pure — tested.
+/// The next assistant object at or after `from` that has not echoed its reasoning: returns the splice
+/// offset (right after the object head). Each object's extent runs to the next raw `,{"role":` head (or
+/// the buffer end) — raw head bytes cannot occur inside a JSON string value because jstr escapes every
+/// quote, so this walks true turn boundaries only. EVERY assistant turn counts, not just tool-call
+/// turns: the newer thinking-mode enforcement rejects a request when ANY assistant message lacks the
+/// field — PLAIN replayed-history turns included (the multi-turn failure opencode hit in
+/// anomalyco/opencode#24104; their landed fix injects the echo on all assistant history messages). A
+/// slice that STARTS with an assistant object (msgTail strips the leading comma) is matched too.
+/// Pure — tested.
 pub fn nextMissingEchoOffset(buf: []const u8, from: usize) ?usize {
     var pos = from;
     while (pos < buf.len) {
-        const a0 = std.mem.indexOfPos(u8, buf, pos, ASSISTANT_OBJ_HEAD) orelse return null;
-        const body = a0 + ASSISTANT_OBJ_HEAD.len;
+        var a0: usize = undefined;
+        var body: usize = undefined;
+        if (pos == 0 and std.mem.startsWith(u8, buf, ASSISTANT_OBJ_HEAD[1..])) {
+            a0 = 0;
+            body = ASSISTANT_OBJ_HEAD.len - 1;
+        } else if (std.mem.indexOfPos(u8, buf, pos, ASSISTANT_OBJ_HEAD)) |i| {
+            a0 = i;
+            body = i + ASSISTANT_OBJ_HEAD.len;
+        } else return null;
         const end = std.mem.indexOfPos(u8, buf, body, ",{\"role\":") orelse buf.len;
         const obj = buf[a0..end];
-        if (std.mem.indexOf(u8, obj, "\"tool_calls\"") != null and
-            std.mem.indexOf(u8, obj, "\"reasoning_content\"") == null) return body;
+        if (std.mem.indexOf(u8, obj, "\"reasoning_content\"") == null) return body;
         pos = end;
     }
     return null;
 }
 
-/// Build a COPY of `conv` with `,"reasoning_content":...` spliced into EVERY bare assistant tool-call
-/// turn (nextMissingEchoOffset): the newest bare turn gets `reasoning`, older ones the minimal echo —
-/// their reasoning text is gone (each loop saves only the newest turn's). The minimal echo is a single
-/// SPACE, never "": thinking-mode gateways commonly gate the field on TRUTHINESS, not key presence (a
-/// Python `if not msg.get("reasoning_content")`, a Jinja `{% if %}` in the chat template), for which the
-/// empty string reads as ABSENT — an ""-echoed request re-400s exactly like a bare one, with the heal
-/// unable to see anything left to fix. A space is present AND truthy while adding no meaning. That also
-/// covers a turn authored by a non-thinking model, which never had reasoning to begin with, and a tool
-/// round whose stream carried no reasoning deltas. null ⇒ nothing to splice
-/// (no bare tool-call turn) — send the original. Serves both the in-place heals (the caller swaps its
-/// conv for the copy) and a single dispatch to a FALLBACK rung whose model needs the echo while the conv
-/// was built for the primary's quirks — there the caller's conv must stay primary-shaped (the classic
-/// reasoner 400s on the echo's PRESENCE, so the echo cannot simply be built in for everyone). Pure — tested.
+/// Build a COPY of `conv` with `,"reasoning_content":...` spliced into EVERY bare assistant turn
+/// (nextMissingEchoOffset — plain turns included, see its doc): the newest bare turn gets `reasoning`
+/// VERBATIM (even when empty), every other one the EMPTY echo — their reasoning text is gone (each loop
+/// saves only the newest turn's, and replayed history never had it). "" is the faithful filler, not a
+/// placeholder guess: DeepSeek itself returns `reasoning_content: ""` on some turns and expects exactly
+/// that passed back (opencode #24146 removed its SDK's truthy guards for this very reason, and #24250
+/// injects "" on all replayed assistant history — both landed against the live API). null ⇒ nothing to
+/// splice (no bare assistant turn) — send the original. Serves both the in-place heals (the caller swaps
+/// its conv for the copy) and a single dispatch to a FALLBACK rung whose model needs the echo while the
+/// conv was built for the primary's quirks — there the caller's conv must stay primary-shaped (the
+/// classic reasoner 400s on the echo's PRESENCE, so the echo cannot simply be built in for everyone).
+/// Pure — tested.
 pub fn withReasoningEcho(gpa: std.mem.Allocator, conv: []const u8, reasoning: []const u8) ?[]u8 {
     var last: usize = 0; // offset of the NEWEST bare turn — the one the saved reasoning belongs to
     var scan: usize = 0;
@@ -1428,7 +1434,7 @@ pub fn withReasoningEcho(gpa: std.mem.Allocator, conv: []const u8, reasoning: []
         while (nextMissingEchoOffset(conv, scan)) |off| {
             out.appendSlice(gpa, conv[prev..off]) catch break :blk;
             out.appendSlice(gpa, ",\"reasoning_content\":") catch break :blk;
-            jstr(gpa, &out, if (off == last and reasoning.len > 0) reasoning else " ") catch break :blk;
+            jstr(gpa, &out, if (off == last) reasoning else "") catch break :blk;
             prev = off;
             scan = off;
         }
@@ -2730,23 +2736,31 @@ test "withReasoningEcho splices a dispatch-time copy for a fallback rung, empty 
     const gpa = std.testing.allocator;
     const conv = "{\"role\":\"user\",\"content\":\"go\"},{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{}]},{\"role\":\"tool\",\"content\":\"r\"}";
     // The failing setup: the tool-call turn came from a NON-thinking primary, so there is no reasoning
-    // text — the echo must still land, and as the truthy SPACE, never "" (gateways that gate the field on
-    // truthiness read an empty echo as absent and re-400 the healed request).
+    // text — the echo must still land, as the verbatim "" (DeepSeek itself returns "" and expects it
+    // passed back exactly; see the fn doc).
     const empty_echo = withReasoningEcho(gpa, conv, "").?;
     defer gpa.free(empty_echo);
-    try std.testing.expect(std.mem.indexOf(u8, empty_echo, ",{\"role\":\"assistant\",\"reasoning_content\":\" \",\"content\":\"\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, empty_echo, ",{\"role\":\"assistant\",\"reasoning_content\":\"\",\"content\":\"\"") != null);
     // With reasoning text, the echo carries it JSON-encoded, and every byte around the splice survives.
     const spliced = withReasoningEcho(gpa, conv, "thought \"x\"").?;
     defer gpa.free(spliced);
     try std.testing.expect(std.mem.indexOf(u8, spliced, "\"reasoning_content\":\"thought \\\"x\\\"\"") != null);
     try std.testing.expect(std.mem.startsWith(u8, spliced, "{\"role\":\"user\",\"content\":\"go\"},{\"role\":\"assistant\""));
     try std.testing.expect(std.mem.endsWith(u8, spliced, ",{\"role\":\"tool\",\"content\":\"r\"}"));
-    // Already echoed / no tool-call turn ⇒ null: the caller dispatches the original conv unchanged.
+    // Already echoed ⇒ null: the caller dispatches the original conv unchanged.
     try std.testing.expect(withReasoningEcho(gpa, spliced, "t") == null);
-    try std.testing.expect(withReasoningEcho(gpa, "{\"role\":\"user\",\"content\":\"hi\"},{\"role\":\"assistant\",\"content\":\"done\"}", "t") == null);
+    // A PLAIN assistant turn is spliced too — the newer enforcement rejects any bare assistant message
+    // (replayed history is plain), so presence must be repaired everywhere, newest still verbatim.
+    const plain = withReasoningEcho(gpa, "{\"role\":\"user\",\"content\":\"hi\"},{\"role\":\"assistant\",\"content\":\"done\"}", "t").?;
+    defer gpa.free(plain);
+    try std.testing.expect(std.mem.indexOf(u8, plain, ",{\"role\":\"assistant\",\"reasoning_content\":\"t\",\"content\":\"done\"}") != null);
+    // A slice that STARTS with an assistant object (msgTail strips the leading comma) is healed too.
+    const headless = withReasoningEcho(gpa, "{\"role\":\"assistant\",\"content\":\"a\",\"tool_calls\":[{}]},{\"role\":\"tool\",\"content\":\"r\"}", "t").?;
+    defer gpa.free(headless);
+    try std.testing.expect(std.mem.startsWith(u8, headless, "{\"role\":\"assistant\",\"reasoning_content\":\"t\",\"content\":\"a\""));
 }
 
-test "withReasoningEcho heals EVERY bare tool-call turn — newest gets the saved reasoning, older the space echo" {
+test "withReasoningEcho heals EVERY bare assistant turn — newest gets the saved reasoning, older the empty echo" {
     const gpa = std.testing.allocator;
     // Two consecutive fallback-served tool rounds: both assistant turns landed bare (the builder echoes
     // inline only for the primary's quirk). A newest-only heal would leave turn 1 bare and re-400 forever.
@@ -2755,7 +2769,7 @@ test "withReasoningEcho heals EVERY bare tool-call turn — newest gets the save
         ",{\"role\":\"assistant\",\"content\":\"b\",\"tool_calls\":[{\"id\":\"2\"}]},{\"role\":\"tool\",\"tool_call_id\":\"2\",\"content\":\"r2\"}";
     const spliced = withReasoningEcho(gpa, conv, "t2").?;
     defer gpa.free(spliced);
-    try std.testing.expect(std.mem.indexOf(u8, spliced, "\"reasoning_content\":\" \",\"content\":\"a\"") != null); // older turn: the minimal space echo
+    try std.testing.expect(std.mem.indexOf(u8, spliced, "\"reasoning_content\":\"\",\"content\":\"a\"") != null); // older turn: the empty echo
     try std.testing.expect(std.mem.indexOf(u8, spliced, "\"reasoning_content\":\"t2\",\"content\":\"b\"") != null); // newest turn: the saved reasoning
     // Idempotent: a healed buffer has nothing left to splice.
     try std.testing.expect(withReasoningEcho(gpa, spliced, "t2") == null);
@@ -2770,9 +2784,10 @@ test "withReasoningEcho heals EVERY bare tool-call turn — newest gets the save
     try std.testing.expect(withReasoningEcho(gpa, m, "t2") == null);
 }
 
-test "nextMissingEchoOffset walks every bare tool-call turn and only those" {
-    // bare tool-call turn, then a PLAIN turn (skipped), then an echoed tool-call turn (skipped),
-    // then a second bare tool-call turn.
+test "nextMissingEchoOffset walks every bare assistant turn — plain history turns included" {
+    // bare tool-call turn, then a bare PLAIN turn (matched too — the newer enforcement rejects any
+    // assistant message lacking the field), then an echoed tool-call turn (skipped), then a second
+    // bare tool-call turn.
     const buf = "{\"role\":\"user\",\"content\":\"go\"}" ++
         ",{\"role\":\"assistant\",\"content\":\"a\",\"tool_calls\":[{}]},{\"role\":\"tool\",\"content\":\"r\"}" ++
         ",{\"role\":\"assistant\",\"content\":\"plain\"}" ++
@@ -2781,8 +2796,15 @@ test "nextMissingEchoOffset walks every bare tool-call turn and only those" {
     const o1 = nextMissingEchoOffset(buf, 0).?;
     try std.testing.expectEqualStrings(",\"content\":\"a\"", buf[o1 .. o1 + 14]);
     const o2 = nextMissingEchoOffset(buf, o1).?;
-    try std.testing.expectEqualStrings(",\"content\":\"d\"", buf[o2 .. o2 + 14]);
-    try std.testing.expect(nextMissingEchoOffset(buf, o2) == null);
+    try std.testing.expectEqualStrings(",\"content\":\"plain\"", buf[o2 .. o2 + 18]);
+    const o3 = nextMissingEchoOffset(buf, o2).?;
+    try std.testing.expectEqualStrings(",\"content\":\"d\"", buf[o3 .. o3 + 14]);
+    try std.testing.expect(nextMissingEchoOffset(buf, o3) == null);
+    // A slice STARTING with a bare assistant object (msgTail strips the leading comma) is matched at 0.
+    const at0 = "{\"role\":\"assistant\",\"content\":\"x\"},{\"role\":\"user\",\"content\":\"next\"}";
+    const o0 = nextMissingEchoOffset(at0, 0).?;
+    try std.testing.expectEqualStrings(",\"content\":\"x\"", at0[o0 .. o0 + 14]);
+    try std.testing.expect(nextMissingEchoOffset(at0, o0) == null);
     // A tool result quoting the key as ESCAPED text does not mark the turn as echoed.
     const esc = "{\"role\":\"user\",\"content\":\"hi\"},{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{}]},{\"role\":\"tool\",\"content\":\"docs say \\\"reasoning_content\\\" is required\"}";
     try std.testing.expect(nextMissingEchoOffset(esc, 0) != null);
