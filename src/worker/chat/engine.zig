@@ -6766,15 +6766,15 @@ fn workingBudgetBytes(base_url: []const u8, model: []const u8, fixed_bytes: usiz
 // quirk storage and the error predicate — owns the shared byte-format invariant too. Each loop still owns
 // its own fix, because each owns its reasoning text.
 
-/// AUX-CALL dispatch (loop picker / rescue / lesson / course / summary / stuck / afknext) with the
-/// thinking-mode reasoning-echo quirk handled for the AUX model. These payloads embed msgTail slices of
-/// conv_buf, so structured tool_calls turns ride along shaped for the CODING model's learned quirk — an
-/// aux model on a thinking-mode endpoint 400s the whole call when a bare turn rides in ("must be passed
-/// back"), and before this helper every such aux call silently lost its result (worse for the drive
-/// picker, whose failure ends the TURN). Mirrors run.zig's completeRung: pre-splice when the quirk is
-/// already learned for THIS model; on a fresh echo-400, learn it for the model that actually erred and
-/// retry once, spliced. Aux slices hold no saved reasoning, so every echo is the minimal space echo
-/// (see llm.withReasoningEcho on why never ""). Aux calls advertise no tools, hence the fixed "".
+/// AUX-CALL dispatch (loop picker / rescue / lesson / course / summary / stuck / afknext / reflect) with
+/// the thinking-mode reasoning-echo quirk handled for the AUX model. These payloads embed msgTail slices
+/// of conv_buf (or build their own assistant turns), so assistant turns ride along shaped for the CODING
+/// model's learned quirk — an aux model on a thinking-mode endpoint 400s the whole call when a bare turn
+/// rides in ("must be passed back"), and before this helper every such aux call silently lost its result
+/// (worse for the drive picker, whose failure ends the TURN). Mirrors run.zig's completeRung: pre-splice
+/// when the quirk is already learned for THIS model; on a fresh echo-400, learn it for the model that
+/// actually erred and retry once, spliced. Aux slices hold no saved reasoning, so every echo is the
+/// verbatim "" (see llm.withReasoningEcho). Aux calls advertise no tools, hence the fixed "".
 fn completeAux(app: *App, dir: []const u8, tag: []const u8, base_url: []const u8, key: []const u8, model: []const u8, messages_json: []const u8, max_tokens: u32, temperature: f32) llm.Step {
     const gpa = app.gpa;
     if (llm.reasoningEchoFor(app.io, model)) {
@@ -6884,7 +6884,20 @@ fn runInnerAgentic(
 
     // Everything already in conv_buf when this pass begins (system + bounded history + prior drive steps). This
     // pass's tool-call/result growth is measured against it so within-turn compaction can bound just the growth.
-    const base_len = conv_buf.items.len;
+    var base_len = conv_buf.items.len;
+    // THINKING-MODE PREFIX ECHO: once the echo quirk is learned for this model, heal the PREFIX before
+    // the first inference. Seeded history and prior passes' settled answers are PLAIN assistant turns,
+    // and the newer enforcement rejects ANY assistant message lacking reasoning_content — not just
+    // tool-call turns (the replayed-history failure of anomalyco/opencode#24104; the landed fix there
+    // injects the "" echo on all assistant history messages). base_len follows the healed length, so
+    // within-pass compaction keeps bounding exactly this pass's growth.
+    if (llm.reasoningEchoFor(app.io, model)) {
+        if (llm.withReasoningEcho(gpa, conv_buf.items, "")) |healed| {
+            conv_buf.deinit(gpa);
+            conv_buf.* = .fromOwnedSlice(healed);
+            base_len = conv_buf.items.len;
+        }
+    }
 
     // The browser (+ pixel) and MCP tools ride on every chat turn — the "client-side by default" model: a
     // client's own machine can drive a browser and reach its installed MCP servers, so the chat should always
@@ -6906,7 +6919,10 @@ fn runInnerAgentic(
     // Thereafter every turn echoes it inline (reasoningEchoFor): one failed round-trip per model per session.
     var asst_reasoning: []u8 = empty; // the last assistant tool-call turn's reasoning, duped to outlive the
     defer if (asst_reasoning.len > 0) gpa.free(asst_reasoning); // step (the buffer has no reasoning to recover)
-    var reasoning_healed = false; // at most one heal attempt per pass — never spin if the retry still fails
+    // Heals are BOUNDED per pass, not one-shot: a mid-pass compaction or append can mint a NEW bare
+    // assistant turn after a heal, and each heal removes every bare turn it can see — so re-healing on
+    // fresh bare state is progress, not a spin. A 400 with nothing bare left falls through to the error.
+    var reasoning_heals: u32 = 0;
     var iter: usize = 0;
     while (iter < MAX_ITERS) : (iter += 1) {
         // COOPERATIVE CONTROL (before each inference): a stop aborts with whatever narration we have; a steer is
@@ -6960,33 +6976,34 @@ fn runInnerAgentic(
         }
 
         if (!step.ok) {
-            // THINKING-MODE HEAL: this request was rejected because a prior assistant tool-call turn omitted
-            // reasoning_content. Learn the quirk, splice reasoning_content into EVERY bare tool-call turn of
-            // THIS pass's working span (the LIVE buffer past base_len — compactWorking may have moved turns
-            // since they were built) — the newest gets the saved reasoning, older ones the minimal space
-            // echo (see llm.withReasoningEcho on why never "") — and retry the same inference on the corrected
-            // history, once per pass; later turns echo inline. asst_reasoning may be empty (a turn whose
-            // model emitted no reasoning): the empty echo still heals, so no length gate here. CLAMPED to
-            // base_len.. deliberately: a bare turn in the prefix belongs to a prior drive pass whose request
-            // already succeeded, and splicing there would shift the prefix under the saved base_len — the
-            // next compactWorking would then cut the final prefix object mid-JSON. If a prior-pass turn IS
-            // the offender (inconsistent enforcement across requests), the retry fails cleanly instead.
-            if (!reasoning_healed and llm.isReasoningEchoError(step.content)) {
-                if (llm.nextMissingEchoOffset(conv_buf.items[base_len..], 0) != null) {
-                    reasoning_healed = true;
-                    llm.learnReasoningEcho(app.io, model); // learn FIRST: even an OOM below leaves later turns echoing inline
-                    if (llm.withReasoningEcho(gpa, conv_buf.items[base_len..], asst_reasoning)) |healed| {
-                        defer gpa.free(healed);
-                        // Atomic swap: conv_buf OUTLIVES this pass (the drive loop reuses it), so a partial
-                        // in-place rewrite on OOM must not be able to corrupt it — either the whole healed
-                        // buffer lands or the old one stays.
-                        if (std.mem.concat(gpa, u8, &.{ conv_buf.items[0..base_len], healed })) |joined| {
-                            conv_buf.deinit(gpa);
-                            conv_buf.* = .fromOwnedSlice(joined);
-                        } else |_| {}
-                        continue; // re-drains control, re-infers on the corrected conv_buf
-                    }
-                }
+            // THINKING-MODE HEAL: this request was rejected because an assistant turn somewhere in it
+            // omitted reasoning_content — the newest tool-call turn, an older one, or a PLAIN turn in the
+            // PREFIX (seeded history / a prior pass's settled answer: the newer enforcement rejects any
+            // bare assistant message, not just tool-call turns — opencode#24104). Learn the quirk, splice
+            // the echo into EVERY bare assistant turn of the WHOLE live buffer — the newest gets the
+            // saved reasoning verbatim (asst_reasoning may be ""), all others the "" echo — and retry the
+            // same inference. Prefix and span are healed as separate pieces so base_len can follow the
+            // prefix's growth and the span/prefix boundary stays on a turn edge for compactWorking.
+            if (reasoning_heals < 3 and llm.isReasoningEchoError(step.content)) heal: {
+                const pre = conv_buf.items[0..base_len];
+                const span = conv_buf.items[base_len..];
+                const hp = llm.withReasoningEcho(gpa, pre, "");
+                defer if (hp) |p| gpa.free(p);
+                const hs = llm.withReasoningEcho(gpa, span, asst_reasoning);
+                defer if (hs) |s2| gpa.free(s2);
+                if (hp == null and hs == null) break :heal; // nothing bare anywhere — surface the error below
+                reasoning_heals += 1;
+                llm.learnReasoningEcho(app.io, model); // learn FIRST: even an OOM below leaves later turns echoing inline
+                // Atomic swap: conv_buf OUTLIVES this pass (the drive loop reuses it), so a partial
+                // in-place rewrite on OOM must not be able to corrupt it — either the whole healed
+                // buffer lands or the old one stays.
+                const new_base = if (hp) |p| p.len else base_len;
+                if (std.mem.concat(gpa, u8, &.{ if (hp) |p| p else pre, if (hs) |s2| s2 else span })) |joined| {
+                    conv_buf.deinit(gpa);
+                    conv_buf.* = .fromOwnedSlice(joined);
+                    base_len = new_base;
+                } else |_| break :heal;
+                continue; // re-drains control, re-infers on the corrected conv_buf
             }
             {
                 // Provider errors quote ACCOUNT MATERIAL back at us — observed live: a suspension error
@@ -7069,14 +7086,13 @@ fn runInnerAgentic(
         asst_reasoning = gpa.dupe(u8, step.reasoning) catch empty;
         conv_buf.appendSlice(gpa, llm.ASSISTANT_OBJ_HEAD) catch return .{ .outcome = .hard_error, .content = empty };
         // Echo reasoning_content inline once the model is known to require it (learned via the heal). BEFORE
-        // content, so this path and the splice (llm.reasoningSpliceOffset) insert at the same offset. Echoed
-        // even when this turn carries NO reasoning text (a tool-continuation round often streams none), and
-        // then as the truthy SPACE, never "": gateways gate the field on truthiness, so an ""-echoed turn
-        // 400s the next inference like a bare one — with nothing bare left, the heal cannot see it, and the
-        // error surfaced to the desk (the observed persistent "must be passed back" failure).
+        // content, so this path and the splice (llm.withReasoningEcho) insert at the same offset. Echoed even
+        // when this turn carries NO reasoning text (a tool-continuation round often streams none), and then
+        // VERBATIM as "": DeepSeek itself returns "" on such turns and expects exactly that passed back —
+        // the constraint is the field's presence on every assistant turn, not its truthiness (opencode#24146).
         if (llm.reasoningEchoFor(app.io, model)) {
             conv_buf.appendSlice(gpa, ",\"reasoning_content\":") catch return .{ .outcome = .hard_error, .content = empty };
-            http.jstr(gpa, conv_buf, if (step.reasoning.len > 0) step.reasoning else " ") catch return .{ .outcome = .hard_error, .content = empty };
+            http.jstr(gpa, conv_buf, step.reasoning) catch return .{ .outcome = .hard_error, .content = empty };
         }
         conv_buf.appendSlice(gpa, ",\"content\":") catch return .{ .outcome = .hard_error, .content = empty };
         http.jstr(gpa, conv_buf, step.content) catch return .{ .outcome = .hard_error, .content = empty };
@@ -7887,7 +7903,7 @@ fn critiqueAnswer(app: *App, run_root: []const u8, base_url: []const u8, key: []
     // A small output cap is part of the contract, not a saving: a correction that needs more room than this is a
     // rewrite, and it also bounds the abstain path, which is most calls.
     const reflect_cm = meterBegin(app.io);
-    var step = llm.complete(gpa, app.io, run_root, "reflect", base_url, key, model, msgs.items, "", 320, 0.3);
+    var step = completeAux(app, run_root, "reflect", base_url, key, model, msgs.items, 320, 0.3);
     defer step.deinit(gpa);
     meterEnd(app, reflect_cm, "reflect", .thinking, model, step.ok);
     if (!step.ok) return null;
@@ -8656,7 +8672,13 @@ fn compactWorking(app: *App, run_root: []const u8, base_url: []const u8, key: []
     const kept: ?[]u8 = if (splice) (std.fmt.allocPrint(gpa, ",{s}", .{tail}) catch return) else null;
     defer if (kept) |k| gpa.free(k);
     conv_buf.shrinkRetainingCapacity(base_len);
+    const note_at = conv_buf.items.len;
     appendMsgObj(gpa, conv_buf, "assistant", note, cctx.SUMMARY_INJECT_CAP);
+    // Under a learned echo quirk the folded note must carry reasoning_content like every assistant turn
+    // (the enforcement is not tool-call-only); bare, it would 400 the next inference and spend a heal.
+    // An OOM leaves it bare — the in-pass heal then repairs it at the cost of that one round-trip.
+    if (conv_buf.items.len > note_at and llm.reasoningEchoFor(app.io, model))
+        conv_buf.insertSlice(gpa, note_at + llm.ASSISTANT_OBJ_HEAD.len, ",\"reasoning_content\":\"\"") catch {};
     // One shot, so an OOM here drops the tail (the old behaviour) instead of stranding a dangling comma.
     if (kept) |k| conv_buf.appendSlice(gpa, k) catch {};
 }
