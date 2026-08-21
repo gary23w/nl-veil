@@ -1399,10 +1399,14 @@ pub fn nextMissingEchoOffset(buf: []const u8, from: usize) ?usize {
 }
 
 /// Build a COPY of `conv` with `,"reasoning_content":...` spliced into EVERY bare assistant tool-call
-/// turn (nextMissingEchoOffset): the newest bare turn gets `reasoning`, older ones get the empty echo —
-/// their reasoning text is gone (each loop saves only the newest turn's), and the thinking-mode
-/// constraint is on the field's PRESENCE, so an empty echo still satisfies it. That also covers a turn
-/// authored by a non-thinking model, which never had reasoning to begin with. null ⇒ nothing to splice
+/// turn (nextMissingEchoOffset): the newest bare turn gets `reasoning`, older ones the minimal echo —
+/// their reasoning text is gone (each loop saves only the newest turn's). The minimal echo is a single
+/// SPACE, never "": thinking-mode gateways commonly gate the field on TRUTHINESS, not key presence (a
+/// Python `if not msg.get("reasoning_content")`, a Jinja `{% if %}` in the chat template), for which the
+/// empty string reads as ABSENT — an ""-echoed request re-400s exactly like a bare one, with the heal
+/// unable to see anything left to fix. A space is present AND truthy while adding no meaning. That also
+/// covers a turn authored by a non-thinking model, which never had reasoning to begin with, and a tool
+/// round whose stream carried no reasoning deltas. null ⇒ nothing to splice
 /// (no bare tool-call turn) — send the original. Serves both the in-place heals (the caller swaps its
 /// conv for the copy) and a single dispatch to a FALLBACK rung whose model needs the echo while the conv
 /// was built for the primary's quirks — there the caller's conv must stay primary-shaped (the classic
@@ -1424,7 +1428,7 @@ pub fn withReasoningEcho(gpa: std.mem.Allocator, conv: []const u8, reasoning: []
         while (nextMissingEchoOffset(conv, scan)) |off| {
             out.appendSlice(gpa, conv[prev..off]) catch break :blk;
             out.appendSlice(gpa, ",\"reasoning_content\":") catch break :blk;
-            jstr(gpa, &out, if (off == last) reasoning else "") catch break :blk;
+            jstr(gpa, &out, if (off == last and reasoning.len > 0) reasoning else " ") catch break :blk;
             prev = off;
             scan = off;
         }
@@ -2726,10 +2730,11 @@ test "withReasoningEcho splices a dispatch-time copy for a fallback rung, empty 
     const gpa = std.testing.allocator;
     const conv = "{\"role\":\"user\",\"content\":\"go\"},{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{}]},{\"role\":\"tool\",\"content\":\"r\"}";
     // The failing setup: the tool-call turn came from a NON-thinking primary, so there is no reasoning
-    // text — the thinking-mode constraint is on the field's PRESENCE, and an empty echo must still land.
+    // text — the echo must still land, and as the truthy SPACE, never "" (gateways that gate the field on
+    // truthiness read an empty echo as absent and re-400 the healed request).
     const empty_echo = withReasoningEcho(gpa, conv, "").?;
     defer gpa.free(empty_echo);
-    try std.testing.expect(std.mem.indexOf(u8, empty_echo, ",{\"role\":\"assistant\",\"reasoning_content\":\"\",\"content\":\"\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, empty_echo, ",{\"role\":\"assistant\",\"reasoning_content\":\" \",\"content\":\"\"") != null);
     // With reasoning text, the echo carries it JSON-encoded, and every byte around the splice survives.
     const spliced = withReasoningEcho(gpa, conv, "thought \"x\"").?;
     defer gpa.free(spliced);
@@ -2741,7 +2746,7 @@ test "withReasoningEcho splices a dispatch-time copy for a fallback rung, empty 
     try std.testing.expect(withReasoningEcho(gpa, "{\"role\":\"user\",\"content\":\"hi\"},{\"role\":\"assistant\",\"content\":\"done\"}", "t") == null);
 }
 
-test "withReasoningEcho heals EVERY bare tool-call turn — newest gets the saved reasoning, older the empty echo" {
+test "withReasoningEcho heals EVERY bare tool-call turn — newest gets the saved reasoning, older the space echo" {
     const gpa = std.testing.allocator;
     // Two consecutive fallback-served tool rounds: both assistant turns landed bare (the builder echoes
     // inline only for the primary's quirk). A newest-only heal would leave turn 1 bare and re-400 forever.
@@ -2750,7 +2755,7 @@ test "withReasoningEcho heals EVERY bare tool-call turn — newest gets the save
         ",{\"role\":\"assistant\",\"content\":\"b\",\"tool_calls\":[{\"id\":\"2\"}]},{\"role\":\"tool\",\"tool_call_id\":\"2\",\"content\":\"r2\"}";
     const spliced = withReasoningEcho(gpa, conv, "t2").?;
     defer gpa.free(spliced);
-    try std.testing.expect(std.mem.indexOf(u8, spliced, "\"reasoning_content\":\"\",\"content\":\"a\"") != null); // older turn: empty echo
+    try std.testing.expect(std.mem.indexOf(u8, spliced, "\"reasoning_content\":\" \",\"content\":\"a\"") != null); // older turn: the minimal space echo
     try std.testing.expect(std.mem.indexOf(u8, spliced, "\"reasoning_content\":\"t2\",\"content\":\"b\"") != null); // newest turn: the saved reasoning
     // Idempotent: a healed buffer has nothing left to splice.
     try std.testing.expect(withReasoningEcho(gpa, spliced, "t2") == null);

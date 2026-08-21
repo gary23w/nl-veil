@@ -2723,7 +2723,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
             emitKV(app, conv_dir, "status", "text", "recovering: asking for a plain-text answer");
             const rp = trio.coding; // the rescue finishes the answer stream's own job — coding role (see trio_routing_test)
             const rcm = meterBegin(app.io);
-            var rs = llm.complete(gpa, app.io, llm_dir, "rescue", rp.base_url, rp.key, rp.model, rmsgs.items, "", 1024, 0.4);
+            var rs = completeAux(app, llm_dir, "rescue", rp.base_url, rp.key, rp.model, rmsgs.items, 1024, 0.4);
             defer rs.deinit(gpa);
             meterEnd(app, rcm, "rescue", .coding, rp.model, rs.ok);
             if (!rs.ok) break :rescue;
@@ -2887,7 +2887,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
         http.jstr(gpa, &lq, if (afk) LOOP_QUESTION_AFK else LOOP_QUESTION) catch break :outer;
         lq.append(gpa, '}') catch break :outer;
         const loop_cm = meterBegin(app.io);
-        var next = llm.complete(gpa, app.io, llm_dir, "loop", prompt.base_url, prompt.key, prompt.model, lq.items, "", 512, 0.5);
+        var next = completeAux(app, llm_dir, "loop", prompt.base_url, prompt.key, prompt.model, lq.items, 512, 0.5);
         defer next.deinit(gpa);
         meterEnd(app, loop_cm, "loop", .prompting, prompt.model, next.ok);
 
@@ -3125,7 +3125,7 @@ fn schedLearn(app: *App, ctx: *tools.ToolCtx, mem_scope: []const u8, uid: u64, t
     msgs.appendSlice(gpa, msgTail(conv_buf.items, SUMMARY_CTX_BYTES)) catch return;
     msgs.appendSlice(gpa, ",{\"role\":\"user\",\"content\":\"This scheduled task will run again. In ONE or TWO sentences, state the single most useful lesson from THIS run for the next run — a faster path, a source that worked, a pitfall to skip, or an assumption to keep. Reply with ONLY the lesson.\"}") catch return;
     const lesson_cm = meterBegin(app.io);
-    var next = llm.complete(gpa, app.io, run_root, "lesson", base_url, key, model, msgs.items, "", 256, 0.3);
+    var next = completeAux(app, run_root, "lesson", base_url, key, model, msgs.items, 256, 0.3);
     defer next.deinit(gpa);
     meterEnd(app, lesson_cm, "lesson", .thinking, model, next.ok);
     if (!next.ok) return;
@@ -4975,7 +4975,7 @@ fn courseCheck(app: *App, run_root: []const u8, p: Provider, role: Role, goal: [
     msgs.append(gpa, '}') catch return null;
 
     const cm = meterBegin(app.io);
-    var step = llm.complete(gpa, app.io, run_root, "course", p.base_url, p.key, p.model, msgs.items, "", 384, 0.2);
+    var step = completeAux(app, run_root, "course", p.base_url, p.key, p.model, msgs.items, 384, 0.2);
     defer step.deinit(gpa);
     meterEnd(app, cm, "course", role, p.model, step.ok);
     if (!step.ok) return null;
@@ -6766,6 +6766,35 @@ fn workingBudgetBytes(base_url: []const u8, model: []const u8, fixed_bytes: usiz
 // quirk storage and the error predicate — owns the shared byte-format invariant too. Each loop still owns
 // its own fix, because each owns its reasoning text.
 
+/// AUX-CALL dispatch (loop picker / rescue / lesson / course / summary / stuck / afknext) with the
+/// thinking-mode reasoning-echo quirk handled for the AUX model. These payloads embed msgTail slices of
+/// conv_buf, so structured tool_calls turns ride along shaped for the CODING model's learned quirk — an
+/// aux model on a thinking-mode endpoint 400s the whole call when a bare turn rides in ("must be passed
+/// back"), and before this helper every such aux call silently lost its result (worse for the drive
+/// picker, whose failure ends the TURN). Mirrors run.zig's completeRung: pre-splice when the quirk is
+/// already learned for THIS model; on a fresh echo-400, learn it for the model that actually erred and
+/// retry once, spliced. Aux slices hold no saved reasoning, so every echo is the minimal space echo
+/// (see llm.withReasoningEcho on why never ""). Aux calls advertise no tools, hence the fixed "".
+fn completeAux(app: *App, dir: []const u8, tag: []const u8, base_url: []const u8, key: []const u8, model: []const u8, messages_json: []const u8, max_tokens: u32, temperature: f32) llm.Step {
+    const gpa = app.gpa;
+    if (llm.reasoningEchoFor(app.io, model)) {
+        if (llm.withReasoningEcho(gpa, messages_json, "")) |spliced| {
+            defer gpa.free(spliced);
+            return llm.complete(gpa, app.io, dir, tag, base_url, key, model, spliced, "", max_tokens, temperature);
+        }
+    }
+    var step = llm.complete(gpa, app.io, dir, tag, base_url, key, model, messages_json, "", max_tokens, temperature);
+    if (!step.ok and llm.isReasoningEchoError(step.content)) {
+        llm.learnReasoningEcho(app.io, model); // learn FIRST, keyed on THIS model — even a failed retry leaves later dispatches pre-splicing
+        if (llm.withReasoningEcho(gpa, messages_json, "")) |spliced| {
+            defer gpa.free(spliced);
+            step.deinit(gpa);
+            return llm.complete(gpa, app.io, dir, tag, base_url, key, model, spliced, "", max_tokens, temperature);
+        }
+    }
+    return step;
+}
+
 fn runInnerAgentic(
     app: *App,
     uid: u64,
@@ -6934,8 +6963,8 @@ fn runInnerAgentic(
             // THINKING-MODE HEAL: this request was rejected because a prior assistant tool-call turn omitted
             // reasoning_content. Learn the quirk, splice reasoning_content into EVERY bare tool-call turn of
             // THIS pass's working span (the LIVE buffer past base_len — compactWorking may have moved turns
-            // since they were built) — the newest gets the saved reasoning, older ones the empty echo, since
-            // the constraint is on the field's PRESENCE — and retry the same inference on the corrected
+            // since they were built) — the newest gets the saved reasoning, older ones the minimal space
+            // echo (see llm.withReasoningEcho on why never "") — and retry the same inference on the corrected
             // history, once per pass; later turns echo inline. asst_reasoning may be empty (a turn whose
             // model emitted no reasoning): the empty echo still heals, so no length gate here. CLAMPED to
             // base_len.. deliberately: a bare turn in the prefix belongs to a prior drive pass whose request
@@ -7041,11 +7070,13 @@ fn runInnerAgentic(
         conv_buf.appendSlice(gpa, llm.ASSISTANT_OBJ_HEAD) catch return .{ .outcome = .hard_error, .content = empty };
         // Echo reasoning_content inline once the model is known to require it (learned via the heal). BEFORE
         // content, so this path and the splice (llm.reasoningSpliceOffset) insert at the same offset. Echoed
-        // even when this turn carries NO reasoning text: the constraint is on the field's presence, and one
-        // bare turn would 400 the next inference with the once-per-pass heal already spent.
+        // even when this turn carries NO reasoning text (a tool-continuation round often streams none), and
+        // then as the truthy SPACE, never "": gateways gate the field on truthiness, so an ""-echoed turn
+        // 400s the next inference like a bare one — with nothing bare left, the heal cannot see it, and the
+        // error surfaced to the desk (the observed persistent "must be passed back" failure).
         if (llm.reasoningEchoFor(app.io, model)) {
             conv_buf.appendSlice(gpa, ",\"reasoning_content\":") catch return .{ .outcome = .hard_error, .content = empty };
-            http.jstr(gpa, conv_buf, step.reasoning) catch return .{ .outcome = .hard_error, .content = empty };
+            http.jstr(gpa, conv_buf, if (step.reasoning.len > 0) step.reasoning else " ") catch return .{ .outcome = .hard_error, .content = empty };
         }
         conv_buf.appendSlice(gpa, ",\"content\":") catch return .{ .outcome = .hard_error, .content = empty };
         http.jstr(gpa, conv_buf, step.content) catch return .{ .outcome = .hard_error, .content = empty };
@@ -7598,7 +7629,7 @@ fn summarizeTurn(app: *App, run_root: []const u8, base_url: []const u8, key: []c
     http.jstr(gpa, &msgs, "In 1-3 sentences, tell the user what you accomplished this turn and what (if anything) remains. Do not call any tools.") catch return null;
     msgs.append(gpa, '}') catch return null;
     const summary_cm = meterBegin(app.io);
-    var step = llm.complete(gpa, app.io, run_root, "summary", base_url, key, model, msgs.items, "", 1024, 0.5);
+    var step = completeAux(app, run_root, "summary", base_url, key, model, msgs.items, 1024, 0.5);
     defer step.deinit(gpa);
     meterEnd(app, summary_cm, "summary", .thinking, model, step.ok);
     if (!step.ok) return null;
@@ -7777,7 +7808,7 @@ fn stuckStep(app: *App, run_root: []const u8, p: Provider, goal: []const u8, rep
     http.jstr(gpa, &msgs, ask.items) catch return null;
     msgs.append(gpa, '}') catch return null;
     const stuck_cm = meterBegin(app.io);
-    var step = llm.complete(gpa, app.io, run_root, "stuck", p.base_url, p.key, p.model, msgs.items, "", 256, 0.6);
+    var step = completeAux(app, run_root, "stuck", p.base_url, p.key, p.model, msgs.items, 256, 0.6);
     defer step.deinit(gpa);
     meterEnd(app, stuck_cm, "stuck", .prompting, p.model, step.ok);
     if (!step.ok) return null;
@@ -7809,7 +7840,7 @@ fn afkNextStep(app: *App, run_root: []const u8, p: Provider, goal: []const u8, c
     http.jstr(gpa, &msgs, ask.items) catch return null;
     msgs.append(gpa, '}') catch return null;
     const cm = meterBegin(app.io);
-    var step = llm.complete(gpa, app.io, run_root, "afknext", p.base_url, p.key, p.model, msgs.items, "", 256, 0.6);
+    var step = completeAux(app, run_root, "afknext", p.base_url, p.key, p.model, msgs.items, 256, 0.6);
     defer step.deinit(gpa);
     meterEnd(app, cm, "afknext", .prompting, p.model, step.ok);
     if (!step.ok) return null;
