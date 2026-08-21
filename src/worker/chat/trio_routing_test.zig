@@ -577,6 +577,71 @@ fn resolve(
 // the audit
 // ---------------------------------------------------------------------------
 
+/// The per-site audit body, shared by the direct `llm.*` sites and the completeAux wrapper's call sites
+/// (same tag/base_url/key/model contract, at wrapper argument positions): enforce the literal tag, the
+/// known-label set (T2), and the label→role provider resolution (T1); count the site for T3.
+fn auditSite(
+    src: []const u8,
+    spans: []const FnSpan,
+    seen: []usize,
+    total: *usize,
+    callee: []const u8,
+    at: usize,
+    tag: []const u8,
+    base_a: []const u8,
+    key_a: []const u8,
+    model_a: []const u8,
+) !void {
+    if (tag.len < 2 or tag[0] != '"' or tag[tag.len - 1] != '"') {
+        // A computed tag would make the label unknowable to any reader, this audit included.
+        std.debug.print("trio routing: {s} at byte {d} has a non-literal tag `{s}`\n", .{ callee, at, tag });
+        return error.ParseFailed;
+    }
+    const label = tag[1 .. tag.len - 1];
+
+    // T2 — EXHAUSTIVENESS. A label nobody declared above is a new call whose routing was never
+    // decided. Fail loudly rather than let it inherit whatever provider happened to be in scope.
+    var idx: ?usize = null;
+    for (EXPECTED, 0..) |e, i| {
+        if (std.mem.eql(u8, e.label, label)) idx = i;
+    }
+    if (idx == null) {
+        std.debug.print(
+            "trio routing: UNKNOWN LABEL \"{s}\" ({s} at byte {d}).\n" ++
+                "  A new labeled LLM call must declare its role in EXPECTED in this file, and must take\n" ++
+                "  its provider from ModelTrio.pick(.<role>) — not from trio.thinking/trio.prompting directly.\n",
+            .{ label, callee, at },
+        );
+        return error.Unresolvable;
+    }
+    const e = EXPECTED[idx.?];
+    seen[idx.?] += 1;
+    total.* += 1;
+
+    const span = spanAt(spans, at) orelse return error.ParseFailed;
+    // Chosen at runtime by independentReviewer(): no single role to resolve to. Counted as seen so
+    // the coverage check below still demands it exist, then checked properly by its own test.
+    if (e.review_gated) return;
+    const got = resolve(src, spans, span, base_a, key_a, model_a, 0) catch |err| {
+        std.debug.print(
+            "trio routing: label \"{s}\" ({s}, in fn `{s}`) — {t}\n" ++
+                "  provider triple as written: ({s}, {s}, {s})\n",
+            .{ label, callee, span.name, err, base_a, key_a, model_a },
+        );
+        return err;
+    };
+
+    // T1 — the mapping itself.
+    if (got != e.role) {
+        std.debug.print(
+            "trio routing: MISROUTE — label \"{s}\" must run on the {s} model, but its provider\n" ++
+                "  resolves to {s} (in fn `{s}`, triple: {s}, {s}, {s}).\n",
+            .{ label, @tagName(e.role), @tagName(got), span.name, base_a, key_a, model_a },
+        );
+        return error.Unresolvable;
+    }
+}
+
 test "trio routing: every labeled LLM call in the chat engine reaches its role's provider" {
     const alloc = std.testing.allocator;
     const src = ENGINE_SRC;
@@ -596,6 +661,11 @@ test "trio routing: every labeled LLM call in the chat engine reaches its role's
         while (std.mem.indexOfPos(u8, src, pos, needle)) |at| {
             pos = at + needle.len;
             if (!isCodeAt(src, at)) continue; // a mention in the engine's own commentary
+            // completeAux's own dispatches forward a caller-chosen tag + triple (non-literal by design);
+            // the routing decision lives at each completeAux call site, audited below.
+            if (spanAt(spans.items, at)) |sp| {
+                if (std.mem.eql(u8, sp.name, "completeAux")) continue;
+            }
 
             const open = at + needle.len - 1;
             var abuf: [32][]const u8 = undefined;
@@ -607,56 +677,39 @@ test "trio routing: every labeled LLM call in the chat engine reaches its role's
                 std.debug.print("trio routing: llm.{s} at byte {d} has {d} args — the (run_dir, tag, base_url, key, model) prefix moved\n", .{ callee, at, an });
                 return error.ParseFailed;
             }
+            var dbuf: [64]u8 = undefined;
+            const disp = try std.fmt.bufPrint(&dbuf, "llm.{s}", .{callee});
+            try auditSite(src, spans.items, &seen, &total, disp, at, abuf[ARG_TAG], abuf[ARG_BASE], abuf[ARG_KEY], abuf[ARG_MODEL]);
+        }
+    }
 
-            const tag = abuf[ARG_TAG];
-            if (tag.len < 2 or tag[0] != '"' or tag[tag.len - 1] != '"') {
-                // A computed tag would make the label unknowable to any reader, this audit included.
-                std.debug.print("trio routing: llm.{s} at byte {d} has a non-literal tag `{s}`\n", .{ callee, at, tag });
+    // The completeAux WRAPPER (the aux-call reasoning-echo heal) carries the same literal-tag +
+    // provider-triple contract at wrapper positions (app, dir, tag, base_url, key, model, ...): its call
+    // sites are audited exactly like direct llm.* sites, so a wrapper call can neither invent a label
+    // nor misroute a role — and its internal forwarding dispatches are skipped above.
+    {
+        const W_TAG = 2;
+        const W_BASE = 3;
+        const W_KEY = 4;
+        const W_MODEL = 5;
+        const needle = "completeAux(";
+        var pos: usize = 0;
+        while (std.mem.indexOfPos(u8, src, pos, needle)) |at| {
+            pos = at + needle.len;
+            if (!isCodeAt(src, at)) continue;
+            const sp = spanAt(spans.items, at) orelse return error.ParseFailed;
+            if (std.mem.eql(u8, sp.name, "completeAux")) continue; // the declaration itself
+            const open = at + needle.len - 1;
+            var abuf: [32][]const u8 = undefined;
+            const an = splitArgs(src, open, &abuf) orelse {
+                std.debug.print("trio routing: could not parse the argument list of completeAux at byte {d}\n", .{at});
+                return error.ParseFailed;
+            };
+            if (an <= W_MODEL) {
+                std.debug.print("trio routing: completeAux at byte {d} has {d} args — the (app, dir, tag, base_url, key, model) prefix moved\n", .{ at, an });
                 return error.ParseFailed;
             }
-            const label = tag[1 .. tag.len - 1];
-
-            // T2 — EXHAUSTIVENESS. A label nobody declared above is a new call whose routing was never
-            // decided. Fail loudly rather than let it inherit whatever provider happened to be in scope.
-            var idx: ?usize = null;
-            for (EXPECTED, 0..) |e, i| {
-                if (std.mem.eql(u8, e.label, label)) idx = i;
-            }
-            if (idx == null) {
-                std.debug.print(
-                    "trio routing: UNKNOWN LABEL \"{s}\" (llm.{s} at byte {d}).\n" ++
-                        "  A new labeled LLM call must declare its role in EXPECTED in this file, and must take\n" ++
-                        "  its provider from ModelTrio.pick(.<role>) — not from trio.thinking/trio.prompting directly.\n",
-                    .{ label, callee, at },
-                );
-                return error.Unresolvable;
-            }
-            const e = EXPECTED[idx.?];
-            seen[idx.?] += 1;
-            total += 1;
-
-            const span = spanAt(spans.items, at) orelse return error.ParseFailed;
-            // Chosen at runtime by independentReviewer(): no single role to resolve to. Counted as seen so
-            // the coverage check below still demands it exist, then checked properly by its own test.
-            if (e.review_gated) continue;
-            const got = resolve(src, spans.items, span, abuf[ARG_BASE], abuf[ARG_KEY], abuf[ARG_MODEL], 0) catch |err| {
-                std.debug.print(
-                    "trio routing: label \"{s}\" (llm.{s}, in fn `{s}`) — {t}\n" ++
-                        "  provider triple as written: ({s}, {s}, {s})\n",
-                    .{ label, callee, span.name, err, abuf[ARG_BASE], abuf[ARG_KEY], abuf[ARG_MODEL] },
-                );
-                return err;
-            };
-
-            // T1 — the mapping itself.
-            if (got != e.role) {
-                std.debug.print(
-                    "trio routing: MISROUTE — label \"{s}\" must run on the {s} model, but its provider\n" ++
-                        "  resolves to {s} (in fn `{s}`, triple: {s}, {s}, {s}).\n",
-                    .{ label, @tagName(e.role), @tagName(got), span.name, abuf[ARG_BASE], abuf[ARG_KEY], abuf[ARG_MODEL] },
-                );
-                return error.Unresolvable;
-            }
+            try auditSite(src, spans.items, &seen, &total, "completeAux", at, abuf[W_TAG], abuf[W_BASE], abuf[W_KEY], abuf[W_MODEL]);
         }
     }
 
