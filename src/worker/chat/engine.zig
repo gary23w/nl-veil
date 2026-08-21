@@ -6760,39 +6760,11 @@ fn workingBudgetBytes(base_url: []const u8, model: []const u8, fixed_bytes: usiz
     return @max(WORKING_MIN_BUDGET_BYTES, @min(cctx.WORKING_COMPACT_BYTES, available));
 }
 
-/// The exact head of an assistant object as this engine serializes it. Shared by the tool-call turn builder
-/// and reasoningSpliceOffset so the splice lands right after `"assistant"`, byte-for-byte in step.
-const ASSISTANT_OBJ_HEAD = ",{\"role\":\"assistant\"";
-
-/// Where to splice a `,"reasoning_content":...` into the LIVE conv_buf: right after the head of the most
-/// recent assistant object, but ONLY when that object is a tool-call turn that has not already echoed its
-/// reasoning. Read from the current buffer (not a saved offset) so compactWorking rewriting the span cannot
-/// stale it. null ⇒ nothing to heal (no tool-call turn, or already echoed). Pure — tested.
-fn reasoningSpliceOffset(buf: []const u8) ?usize {
-    const a0 = std.mem.lastIndexOf(u8, buf, ASSISTANT_OBJ_HEAD) orelse return null;
-    const obj = buf[a0..]; // from this assistant object to the end (its tool_calls + the tool results after it)
-    if (std.mem.indexOf(u8, obj, "\"tool_calls\"") == null) return null; // a plain turn (e.g. a compaction summary)
-    if (std.mem.indexOf(u8, obj, "\"reasoning_content\"") != null) return null; // already carries it
-    return a0 + ASSISTANT_OBJ_HEAD.len;
-}
-
-test "reasoningSpliceOffset finds the tool-call turn head, skips plain + already-echoed turns" {
-    // A tool-call turn with no reasoning_content: splice right after the head.
-    const b1 = "{\"role\":\"user\",\"content\":\"hi\"},{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{}]},{\"role\":\"tool\",\"content\":\"r\"}";
-    const off = reasoningSpliceOffset(b1).?;
-    try std.testing.expectEqualStrings(",\"content\":", b1[off .. off + 11]); // lands between "assistant" and ,"content"
-    // Already echoed ⇒ no splice (would double it).
-    const b2 = "{\"role\":\"assistant\",\"reasoning_content\":\"t\",\"tool_calls\":[{}]},{\"role\":\"tool\",\"content\":\"r\"}";
-    try std.testing.expect(reasoningSpliceOffset(b2) == null);
-    // No tool-call turn at all (a plain assistant answer) ⇒ nothing to heal.
-    const b3 = "{\"role\":\"user\",\"content\":\"hi\"},{\"role\":\"assistant\",\"content\":\"done\"}";
-    try std.testing.expect(reasoningSpliceOffset(b3) == null);
-    // The LAST assistant object wins: an older summary turn must not shadow the real tool-call turn.
-    const b4 = "{\"role\":\"assistant\",\"content\":\"summary\"},{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{}]},{\"role\":\"tool\",\"content\":\"r\"}";
-    const off4 = reasoningSpliceOffset(b4).?;
-    try std.testing.expect(std.mem.indexOfPos(u8, b4, off4, "\"tool_calls\"") != null);
-    try std.testing.expect(off4 > std.mem.indexOf(u8, b4, "summary").?); // past the summary turn
-}
+// The assistant-object head + reasoning_content splice locator now live in llm.zig
+// (llm.ASSISTANT_OBJ_HEAD / llm.reasoningSpliceOffset, tested there): the swarm's mind loop turned out to
+// send the SAME structured tool_calls turn and needs the SAME heal, so llm.zig — which already owns the
+// quirk storage and the error predicate — owns the shared byte-format invariant too. Each loop still owns
+// its own fix, because each owns its reasoning text.
 
 fn runInnerAgentic(
     app: *App,
@@ -6959,22 +6931,32 @@ fn runInnerAgentic(
         }
 
         if (!step.ok) {
-            // THINKING-MODE HEAL: this request was rejected because the prior assistant tool-call turn omitted
-            // reasoning_content. Learn the quirk, splice the saved reasoning into that turn, and retry the same
-            // inference on the corrected history — once. Only reachable on inference >=2, so the prior turn (and
-            // its saved reasoning) exists; later turns echo inline, so this fires at most once per pass.
-            if (!reasoning_healed and asst_reasoning.len > 0 and llm.isReasoningEchoError(step.content)) {
-                // Locate the splice in the LIVE buffer (compactWorking may have moved the turn since it was
-                // built), then insert reasoning_content into it, learn the quirk, and retry the same inference.
-                if (reasoningSpliceOffset(conv_buf.items)) |off| {
+            // THINKING-MODE HEAL: this request was rejected because a prior assistant tool-call turn omitted
+            // reasoning_content. Learn the quirk, splice reasoning_content into EVERY bare tool-call turn of
+            // THIS pass's working span (the LIVE buffer past base_len — compactWorking may have moved turns
+            // since they were built) — the newest gets the saved reasoning, older ones the empty echo, since
+            // the constraint is on the field's PRESENCE — and retry the same inference on the corrected
+            // history, once per pass; later turns echo inline. asst_reasoning may be empty (a turn whose
+            // model emitted no reasoning): the empty echo still heals, so no length gate here. CLAMPED to
+            // base_len.. deliberately: a bare turn in the prefix belongs to a prior drive pass whose request
+            // already succeeded, and splicing there would shift the prefix under the saved base_len — the
+            // next compactWorking would then cut the final prefix object mid-JSON. If a prior-pass turn IS
+            // the offender (inconsistent enforcement across requests), the retry fails cleanly instead.
+            if (!reasoning_healed and llm.isReasoningEchoError(step.content)) {
+                if (llm.nextMissingEchoOffset(conv_buf.items[base_len..], 0) != null) {
                     reasoning_healed = true;
-                    llm.learnReasoningEcho(app.io, model);
-                    var frag: std.ArrayListUnmanaged(u8) = .empty;
-                    defer frag.deinit(gpa);
-                    frag.appendSlice(gpa, ",\"reasoning_content\":") catch {};
-                    http.jstr(gpa, &frag, asst_reasoning) catch {};
-                    conv_buf.insertSlice(gpa, off, frag.items) catch {};
-                    continue; // re-drains control, re-infers on the corrected conv_buf
+                    llm.learnReasoningEcho(app.io, model); // learn FIRST: even an OOM below leaves later turns echoing inline
+                    if (llm.withReasoningEcho(gpa, conv_buf.items[base_len..], asst_reasoning)) |healed| {
+                        defer gpa.free(healed);
+                        // Atomic swap: conv_buf OUTLIVES this pass (the drive loop reuses it), so a partial
+                        // in-place rewrite on OOM must not be able to corrupt it — either the whole healed
+                        // buffer lands or the old one stays.
+                        if (std.mem.concat(gpa, u8, &.{ conv_buf.items[0..base_len], healed })) |joined| {
+                            conv_buf.deinit(gpa);
+                            conv_buf.* = .fromOwnedSlice(joined);
+                        } else |_| {}
+                        continue; // re-drains control, re-infers on the corrected conv_buf
+                    }
                 }
             }
             {
@@ -7056,10 +7038,12 @@ fn runInnerAgentic(
         // absence (the buffer itself carries no reasoning to recover). Freed on replace + by the pass defer.
         if (asst_reasoning.len > 0) gpa.free(asst_reasoning);
         asst_reasoning = gpa.dupe(u8, step.reasoning) catch empty;
-        conv_buf.appendSlice(gpa, ASSISTANT_OBJ_HEAD) catch return .{ .outcome = .hard_error, .content = empty };
+        conv_buf.appendSlice(gpa, llm.ASSISTANT_OBJ_HEAD) catch return .{ .outcome = .hard_error, .content = empty };
         // Echo reasoning_content inline once the model is known to require it (learned via the heal). BEFORE
-        // content, so this path and the splice (asst_turn_at + ASST_HEAD.len) insert at the same offset.
-        if (step.reasoning.len > 0 and llm.reasoningEchoFor(app.io, model)) {
+        // content, so this path and the splice (llm.reasoningSpliceOffset) insert at the same offset. Echoed
+        // even when this turn carries NO reasoning text: the constraint is on the field's presence, and one
+        // bare turn would 400 the next inference with the once-per-pass heal already spent.
+        if (llm.reasoningEchoFor(app.io, model)) {
             conv_buf.appendSlice(gpa, ",\"reasoning_content\":") catch return .{ .outcome = .hard_error, .content = empty };
             http.jstr(gpa, conv_buf, step.reasoning) catch return .{ .outcome = .hard_error, .content = empty };
         }
