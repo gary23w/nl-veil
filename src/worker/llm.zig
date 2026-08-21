@@ -1341,8 +1341,15 @@ fn largeToolCallVerdict(raw: []const u8) bool {
 // Some BYOK models reject a request PARAMETER our default request carries — e.g. Kimi's kimi-k3 accepts only
 // temperature=1, and some reasoning models reject `temperature` outright. On such a provider error we read
 // the constraint out of the error text, rewrite the request to satisfy it, retry ONCE, and LEARN the quirk
-// (per model, process-global) so every later request pre-applies it and never pays the failed round-trip
-// again. A GENERAL mechanism seeded with the temperature rules — add detectQuirk cases as constraints surface.
+// (per model) so every later request pre-applies it and never pays the failed round-trip again.
+//
+// Lessons are DURABLE: every learn writes the table through to a small JSONL store and initQuirkStore reads
+// it back at process start, so neither a server restart nor a fresh swarm worker re-pays a round-trip the
+// engine has already paid once — both process kinds point at the same {data dir} file, so their lessons
+// compound. A GENERAL mechanism seeded with the temperature rules — these constraint classes keep appearing
+// across vendors (DeepSeek's reasoning_content passback, Anthropic thinking blocks, OpenAI Responses
+// reasoning items), so new ones cost one detectQuirk (or predicate) case plus one Quirk field, and the
+// store absorbs the field with no migration (see QuirkRec).
 
 const TempRule = enum { keep, force, drop };
 const Quirk = struct {
@@ -1358,25 +1365,58 @@ const Quirk = struct {
     reasoning_echo: bool = false,
 };
 
-const QuirkSlot = struct { hash: u64 = 0, q: Quirk = .{} };
+const QuirkSlot = struct {
+    hash: u64 = 0,
+    q: Quirk = .{},
+    // The model NAME rides in the slot purely so the table can be SERIALIZED: the durable store keys on
+    // the name (the hash is an in-process detail — a reseeded hash would orphan a hash-keyed file). A
+    // name too long for the buffer keeps its RAM slot but is never persisted (name_len stays 0): skipping
+    // beats truncating, which would re-load the lesson under a WRONG key.
+    name: [120]u8 = @splat(0),
+    name_len: u8 = 0,
+};
 var quirk_tbl: [128]QuirkSlot = @splat(.{});
 var quirk_mtx: std.Io.Mutex = .init;
+
+// The durable half: {data dir}/provider_quirks.jsonl, pointed at once per process by initQuirkStore.
+// len=0 (unit tests, init never ran, over-long path) is exactly the historical RAM-only behaviour, and
+// every touch of the store is BEST-EFFORT: a missing, torn, or read-only file can cost re-learning a
+// lesson — it can never break inference.
+const QUIRK_STORE_BASENAME = "provider_quirks.jsonl";
+var quirk_store: [1024]u8 = undefined;
+var quirk_store_len: usize = 0;
+
+fn slotSetName(e: *QuirkSlot, model: []const u8) void {
+    e.name_len = 0;
+    if (model.len == 0 or model.len > e.name.len) return;
+    @memcpy(e.name[0..model.len], model);
+    e.name_len = @intCast(model.len);
+}
+
+/// The table slot for `model` (caller holds quirk_mtx): the existing one, else the first free one, else
+/// recycle slot 0 rather than lose the newest lesson.
+fn slotForLocked(model: []const u8, h: u64) *QuirkSlot {
+    for (&quirk_tbl) |*e| if (e.hash == h) return e;
+    for (&quirk_tbl) |*e| if (e.hash == 0) {
+        e.* = .{ .hash = h };
+        slotSetName(e, model);
+        return e;
+    };
+    quirk_tbl[0] = .{ .hash = h };
+    slotSetName(&quirk_tbl[0], model);
+    return &quirk_tbl[0];
+}
 
 fn learnQuirk(io: std.Io, model: []const u8, q: Quirk) void {
     if (model.len == 0) return;
     const h = std.hash.Wyhash.hash(0x9e37, model);
     quirk_mtx.lockUncancelable(io);
     defer quirk_mtx.unlock(io);
-    for (&quirk_tbl) |*e| if (e.hash == h) {
-        e.q.temp = q.temp; // merge: never clobber a learned reasoning_echo when a temp rule lands (or vice versa)
-        e.q.temp_val = q.temp_val;
-        return;
-    };
-    for (&quirk_tbl) |*e| if (e.hash == 0) {
-        e.* = .{ .hash = h, .q = q };
-        return;
-    };
-    quirk_tbl[0] = .{ .hash = h, .q = q }; // table full — recycle slot 0 rather than lose the newest lesson
+    const e = slotForLocked(model, h);
+    const changed = e.q.temp != q.temp or e.q.temp_val != q.temp_val;
+    e.q.temp = q.temp; // merge: never clobber a learned reasoning_echo when a temp rule lands (or vice versa)
+    e.q.temp_val = q.temp_val;
+    if (changed) saveQuirksLocked(io); // only a NEW lesson touches the disk — a heal storm re-learning one rule writes once
 }
 
 fn quirkFor(io: std.Io, model: []const u8) Quirk {
@@ -1388,6 +1428,90 @@ fn quirkFor(io: std.Io, model: []const u8) Quirk {
     return .{};
 }
 
+/// The wire shape of ONE durable-store line. Every field except `model` defaults and unknown fields are
+/// ignored on parse, so a new constraint class is one added field here: an old engine skips it, a new
+/// engine reads an old file — the store never needs a migration. `temp` travels as the tag name (not the
+/// enum's integer) so a reordered TempRule can't silently reassign every persisted rule.
+const QuirkRec = struct { model: []const u8 = "", temp: []const u8 = "keep", temp_val: f32 = 1.0, reasoning_echo: bool = false };
+
+/// Fold one on-disk record into the RAM table (caller holds quirk_mtx). File fields never CLOBBER a live
+/// RAM lesson — this process learned from a fresher provider error than anything on disk — they fill gaps:
+/// a temp rule lands only where RAM still says .keep, and reasoning_echo only ever turns ON. That same
+/// never-lose merge is what makes the save path safe when several processes share the store (see
+/// saveQuirksLocked).
+fn mergeQuirkLocked(model: []const u8, q: Quirk) void {
+    const h = std.hash.Wyhash.hash(0x9e37, model);
+    const e = slotForLocked(model, h);
+    if (e.q.temp == .keep) {
+        e.q.temp = q.temp;
+        e.q.temp_val = q.temp_val;
+    }
+    if (q.reasoning_echo) e.q.reasoning_echo = true;
+}
+
+/// Merge the durable store's parseable lines into the table (caller holds quirk_mtx). Best-effort by
+/// design: a missing file is a fresh install, a torn or hand-mangled line is skipped, and either way the
+/// lines that DO parse still land.
+fn loadQuirksLocked(io: std.Io) void {
+    if (quirk_store_len == 0) return;
+    const gpa = std.heap.page_allocator;
+    const raw = std.Io.Dir.cwd().readFileAlloc(io, quirk_store[0..quirk_store_len], gpa, .limited(256 << 10)) catch return;
+    defer gpa.free(raw);
+    var it = std.mem.splitScalar(u8, raw, '\n');
+    while (it.next()) |line_raw| {
+        const line = std.mem.trim(u8, line_raw, " \r\t");
+        if (line.len == 0) continue;
+        const p = std.json.parseFromSlice(QuirkRec, gpa, line, .{ .ignore_unknown_fields = true }) catch continue;
+        defer p.deinit();
+        if (p.value.model.len == 0) continue;
+        mergeQuirkLocked(p.value.model, .{
+            .temp = std.meta.stringToEnum(TempRule, p.value.temp) orelse .keep,
+            .temp_val = p.value.temp_val,
+            .reasoning_echo = p.value.reasoning_echo,
+        });
+    }
+}
+
+/// Write the whole table through to the durable store (caller holds quirk_mtx; no-op when uninitialized).
+/// Re-reads the file FIRST so the processes sharing one store (the server + every swarm worker) accumulate
+/// each other's lessons instead of clobbering them — mergeQuirkLocked keeps this process's RAM authoritative
+/// per field. The table is tiny (<=128 lines), so a full rewrite beats append-plus-dedup bookkeeping, and a
+/// failed write just leaves the previous file to re-learn from.
+fn saveQuirksLocked(io: std.Io) void {
+    if (quirk_store_len == 0) return;
+    loadQuirksLocked(io);
+    const gpa = std.heap.page_allocator;
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(gpa);
+    for (&quirk_tbl) |*e| {
+        if (e.hash == 0 or e.name_len == 0) continue;
+        out.appendSlice(gpa, "{\"model\":") catch return;
+        jstr(gpa, &out, e.name[0..e.name_len]) catch return;
+        var tail: [96]u8 = undefined;
+        const t = std.fmt.bufPrint(&tail, ",\"temp\":\"{s}\",\"temp_val\":{d},\"reasoning_echo\":{s}}}\n", .{
+            @tagName(e.q.temp), e.q.temp_val, if (e.q.reasoning_echo) "true" else "false",
+        }) catch return;
+        out.appendSlice(gpa, t) catch return;
+    }
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = quirk_store[0..quirk_store_len], .data = out.items }) catch {};
+}
+
+/// Point the learned-quirk table at its durable file ({dir}/provider_quirks.jsonl) and load every lesson
+/// any previous process saved — the step that makes the self-healing STICK: without it each process pays
+/// one failed round-trip per model per constraint all over again. Called once at boot by BOTH process
+/// kinds that dispatch LLM calls (the server for the chat engine + sched, each swarm worker in run.zig),
+/// pointed at the same data dir so their lessons compound. Unit tests never call it, so learn/lookup in
+/// tests stays RAM-only exactly as before.
+pub fn initQuirkStore(io: std.Io, dir: []const u8) void {
+    quirk_mtx.lockUncancelable(io);
+    defer quirk_mtx.unlock(io);
+    quirk_store_len = 0;
+    const path = std.fmt.bufPrint(&quirk_store, "{s}/" ++ QUIRK_STORE_BASENAME, .{dir}) catch return;
+    quirk_store_len = path.len;
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, dir, .default_dir) catch {};
+    loadQuirksLocked(io);
+}
+
 /// Learn that THIS model requires reasoning_content to be echoed back on tool-call turns (DeepSeek thinking
 /// mode). Merges into any existing slot so a temperature rule already learned for the model survives. Both
 /// agentic loops (chat engine, swarm mind loop) call this the moment the provider returns the "must be
@@ -1397,15 +1521,10 @@ pub fn learnReasoningEcho(io: std.Io, model: []const u8) void {
     const h = std.hash.Wyhash.hash(0x9e37, model);
     quirk_mtx.lockUncancelable(io);
     defer quirk_mtx.unlock(io);
-    for (&quirk_tbl) |*e| if (e.hash == h) {
-        e.q.reasoning_echo = true;
-        return;
-    };
-    for (&quirk_tbl) |*e| if (e.hash == 0) {
-        e.* = .{ .hash = h, .q = .{ .reasoning_echo = true } };
-        return;
-    };
-    quirk_tbl[0] = .{ .hash = h, .q = .{ .reasoning_echo = true } };
+    const e = slotForLocked(model, h);
+    const changed = !e.q.reasoning_echo;
+    e.q.reasoning_echo = true;
+    if (changed) saveQuirksLocked(io);
 }
 
 /// Does this model need its reasoning echoed back on tool-call turns? (Learned; false until proven.)
@@ -2894,6 +3013,71 @@ test "reasoning-echo quirk: detected from the thinking-mode error, learned per m
     learnQuirk(io, "kimi-merge", .{ .temp = .drop });
     try std.testing.expect(reasoningEchoFor(io, "kimi-merge"));
     try std.testing.expectEqual(TempRule.drop, quirkFor(io, "kimi-merge").temp);
+}
+
+test "quirk store: lessons survive a restart — saved on learn, loaded at init, merged per model" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const root = "zig-llm-quirkstore-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+
+    // The table + store handle are process globals the other quirk tests share: run this test on a clean
+    // table, and put everything back (store OFF included) so no other test starts persisting or loses a
+    // lesson it learned earlier.
+    const saved_tbl = quirk_tbl;
+    const saved_store_len = quirk_store_len;
+    defer {
+        quirk_tbl = saved_tbl;
+        quirk_store_len = saved_store_len;
+    }
+    quirk_tbl = @splat(.{});
+
+    // init with no file yet: creates the dir, loads nothing, arms persistence.
+    initQuirkStore(io, root);
+    try std.testing.expectEqual(TempRule.keep, quirkFor(io, "persist-x").temp);
+
+    // Each learn writes through — the file exists and carries the model NAME (the durable key), not a hash.
+    learnQuirk(io, "persist-x", .{ .temp = .force, .temp_val = 1.0 });
+    learnReasoningEcho(io, "persist-x");
+    learnQuirk(io, "persist-y", .{ .temp = .drop });
+    {
+        const raw = try std.Io.Dir.cwd().readFileAlloc(io, root ++ "/" ++ QUIRK_STORE_BASENAME, gpa, .limited(64 << 10));
+        defer gpa.free(raw);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "\"persist-x\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "\"force\"") != null);
+    }
+
+    // "RESTART": wipe RAM, re-init from the same dir — every lesson is back, merged per model.
+    quirk_tbl = @splat(.{});
+    initQuirkStore(io, root);
+    try std.testing.expectEqual(TempRule.force, quirkFor(io, "persist-x").temp);
+    try std.testing.expectEqual(@as(f32, 1.0), quirkFor(io, "persist-x").temp_val);
+    try std.testing.expect(reasoningEchoFor(io, "persist-x"));
+    try std.testing.expectEqual(TempRule.drop, quirkFor(io, "persist-y").temp);
+    try std.testing.expect(!reasoningEchoFor(io, "persist-y"));
+
+    // A fresh lesson beats the stale file field, but never loses a field only the file carries: relearn
+    // persist-x's temp rule as .drop — after another restart both the new rule AND the old echo survive.
+    learnQuirk(io, "persist-x", .{ .temp = .drop });
+    quirk_tbl = @splat(.{});
+    initQuirkStore(io, root);
+    try std.testing.expectEqual(TempRule.drop, quirkFor(io, "persist-x").temp);
+    try std.testing.expect(reasoningEchoFor(io, "persist-x"));
+
+    // Corrupt and FUTURE lines never break a load (best-effort contract): junk is skipped, a line with an
+    // unknown field — a constraint class this build predates — still lands its known fields.
+    const dir2 = root ++ "/fwd";
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, dir2, .default_dir) catch {};
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = dir2 ++ "/" ++ QUIRK_STORE_BASENAME, .data = "not json at all\n" ++
+        "{\"model\":\"persist-z\",\"temp\":\"force\",\"temp_val\":1,\"reasoning_echo\":true,\"max_tokens_cap\":4096}\n" });
+    quirk_tbl = @splat(.{});
+    initQuirkStore(io, dir2);
+    try std.testing.expectEqual(TempRule.force, quirkFor(io, "persist-z").temp);
+    try std.testing.expect(reasoningEchoFor(io, "persist-z"));
 }
 
 test "reasoningSpliceOffset finds the tool-call turn head, skips plain + already-echoed turns" {
