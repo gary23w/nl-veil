@@ -533,7 +533,64 @@ pub fn complete(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []
     else
         std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}]{s},\"max_tokens\":{d}}}", .{ model, msgs_eff, temp_frag, mt }) catch return stepErr(gpa, "oom");
     defer gpa.free(body);
-    return completeBody(gpa, io, run_dir, tag, base_url, key, model, body, mt);
+    var step = completeBody(gpa, io, run_dir, tag, base_url, key, model, body, mt);
+    // MALFORMED-BODY RECOVERY: the provider rejected our REQUEST as invalid JSON — a conversation turn was
+    // serialized broken somewhere upstream (an unterminated content string is the observed shape). Rather
+    // than surface a hard error, truncate the messages to the last INTACT turn and retry once. A degraded
+    // turn (missing the corrupt tail) beats a dead one, and it holds for ANY provider that validates bodies.
+    // The corrupt region is dumped to {run_dir}/.malformed-body-{tag} for root-causing (never sent anywhere).
+    if (!step.ok and isMalformedBodyError(step.content)) {
+        const safe = safeMessagePrefix(gpa, msgs_eff);
+        if (safe.len > 0 and safe.len < msgs_eff.len) {
+            dumpMalformed(io, run_dir, tag, msgs_eff, safe.len);
+            const body2 = if (tools_json.len > 0)
+                std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"tools\":[{s}]{s},\"max_tokens\":{d}}}", .{ model, safe, tools_json, temp_frag, mt }) catch return step
+            else
+                std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}]{s},\"max_tokens\":{d}}}", .{ model, safe, temp_frag, mt }) catch return step;
+            defer gpa.free(body2);
+            std.log.warn("llm[{s}/{s}] MALFORMED request body healed: {d} -> {d} msg bytes (dropped a corrupt turn)", .{ tag, model, msgs_eff.len, safe.len });
+            var step2 = completeBody(gpa, io, run_dir, tag, base_url, key, model, body2, mt);
+            if (step2.ok) {
+                step.deinit(gpa);
+                return step2;
+            }
+            step2.deinit(gpa);
+        }
+    }
+    return step;
+}
+
+/// The valid message prefix (validMessagePrefixLen) further trimmed so it never ENDS on an assistant turn
+/// that carries tool_calls: a tool-call turn with its results dropped by the truncation is itself a 400
+/// ("assistant tool_calls must be followed by tool messages"), so back up past any such trailing turn to
+/// the previous boundary. Bounded loop — at most the whole array. Pure — tested.
+fn safeMessagePrefix(gpa: std.mem.Allocator, msgs: []const u8) []const u8 {
+    var plen = validMessagePrefixLen(gpa, msgs);
+    while (plen > 0) {
+        // start of the last object in msgs[0..plen]
+        const head = ",{\"role\":";
+        const s = std.mem.lastIndexOf(u8, msgs[0..plen], head);
+        const obj_start = if (s) |i| i + 1 else 0; // +1 skips the joining comma; 0 for the first object
+        const obj = msgs[obj_start..plen];
+        const is_asst = std.mem.startsWith(u8, obj, "{\"role\":\"assistant\"");
+        if (is_asst and std.mem.indexOf(u8, obj, "\"tool_calls\"") != null) {
+            plen = if (s) |i| i else 0; // drop this dangling tool-call turn, end before its comma
+            continue;
+        }
+        break;
+    }
+    return msgs[0..plen];
+}
+
+/// Best-effort dump of a malformed messages payload for offline root-causing — the corrupt turn plus a
+/// little context around the truncation point. io-tolerant: a write failure is silently ignored (never
+/// blocks the heal). The file is local to the run dir; nothing leaves the machine.
+fn dumpMalformed(io: std.Io, run_dir: []const u8, tag: []const u8, msgs: []const u8, cut: usize) void {
+    var pbuf: [1024]u8 = undefined;
+    const path = std.fmt.bufPrint(&pbuf, "{s}/.malformed-body-{s}", .{ run_dir, if (tag.len > 0) tag else "chat" }) catch return;
+    const lo = if (cut > 400) cut - 400 else 0;
+    const hi = @min(msgs.len, cut + 800);
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = msgs[lo..hi] }) catch {};
 }
 
 fn completeOllamaNative(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const u8, base_url: []const u8, key: []const u8, model: []const u8, messages_json: []const u8, tools_json: []const u8, max_tokens: u32, temperature: f32) Step {
@@ -1366,6 +1423,52 @@ pub fn isReasoningEchoError(msg: []const u8) bool {
     const m = std.ascii.lowerString(lb[0..n], msg[0..n]);
     return std.mem.indexOf(u8, m, "reasoning_content") != null and
         (std.mem.indexOf(u8, m, "passed back") != null or std.mem.indexOf(u8, m, "thinking mode") != null);
+}
+
+/// Is this the provider telling us OUR OWN request body is not valid JSON? (DeepSeek: "Failed to parse the
+/// request body as JSON: messages[7].?: expected `,` or `}` at line 1 column 18060".) It means an assistant
+/// or user turn in the conversation buffer was serialized MALFORMED — an unterminated content string, most
+/// often — so the whole request is rejected. Distinct from a bad RESPONSE (our own "bad LLM response"
+/// prefix): this is the provider parsing the REQUEST. Case-insensitive; the two spellings providers use are
+/// "parse the request body" and the bare "invalid json" / "expected , or }" a stricter gateway returns.
+pub fn isMalformedBodyError(msg: []const u8) bool {
+    var lb: [512]u8 = undefined;
+    const n = @min(msg.len, lb.len);
+    const m = std.ascii.lowerString(lb[0..n], msg[0..n]);
+    if (std.mem.indexOf(u8, m, "parse the request body") != null) return true;
+    if (std.mem.indexOf(u8, m, "invalid json") != null or std.mem.indexOf(u8, m, "invalid_json") != null) return true;
+    // "expected ',' or '}'" plus a messages[..] cursor is DeepSeek's exact phrasing for a broken turn.
+    return std.mem.indexOf(u8, m, "messages[") != null and std.mem.indexOf(u8, m, "expected") != null;
+}
+
+/// Does `[msgs]` parse as a JSON array? Wraps the messages-array CONTENT in brackets and validates. The
+/// wrap alloc is the price of using the real parser — brace-counting cannot be trusted here, because an
+/// UNTERMINATED content string mid-array leaves the remaining braces free to rebalance coincidentally
+/// (observed live: a broken turn's tail happened to re-close inside the trailing "tools" array, so a
+/// structural scan declared the whole broken body "valid"). Only a real parse is sound.
+fn messagesArrayParses(gpa: std.mem.Allocator, msgs: []const u8) bool {
+    const doc = std.fmt.allocPrint(gpa, "[{s}]", .{msgs}) catch return false;
+    defer gpa.free(doc);
+    var parsed = std.json.parseFromSlice(std.json.Value, gpa, doc, .{}) catch return false;
+    parsed.deinit();
+    return true;
+}
+
+/// The largest PREFIX of a serialized messages array (`{...},{...},…` — the inside of "messages":[ … ])
+/// that is well-formed JSON, in bytes. Candidate cut points are the turn boundaries (`,{"role":` — a raw,
+/// unescaped head, which a properly-escaped string value can never contain), tested LARGEST-first with the
+/// real JSON parser; the first prefix that parses wins. Returns msgs.len when the whole array is already
+/// clean. 0 when not even the first turn parses. O(turns) parses — only ever run on the malformed-body heal
+/// path, which is rare. Needs an allocator for the parse. Tested against a real captured corruption.
+pub fn validMessagePrefixLen(gpa: std.mem.Allocator, msgs: []const u8) usize {
+    if (messagesArrayParses(gpa, msgs)) return msgs.len;
+    // Walk boundaries from the end backward: the last `,{"role":` whose preceding prefix parses is the cut.
+    var end = msgs.len;
+    while (std.mem.lastIndexOf(u8, msgs[0..end], ",{\"role\":")) |at| {
+        if (messagesArrayParses(gpa, msgs[0..at])) return at;
+        end = at; // shrink the search window past this failed boundary
+    }
+    return 0; // not even the first turn is well-formed
 }
 
 /// The exact head of an assistant object as BOTH agentic loops serialize it (the chat engine's tool-call
@@ -2726,6 +2829,44 @@ test "self-healing quirks: detect temperature constraints, rewrite the body, ext
     // the model id rides out of the request body for the learn step
     try std.testing.expectEqualStrings("kimi-k3", bodyModel("{\"model\":\"kimi-k3\",\"messages\":[]}").?);
     try std.testing.expect(bodyModel("{\"messages\":[]}") == null);
+}
+
+test "malformed-body recovery: detect the error, truncate to the last intact turn, never end on a dangling tool-call" {
+    // The provider complaint that means OUR request body is broken (DeepSeek's exact phrasing + variants).
+    try std.testing.expect(isMalformedBodyError("Failed to parse the request body as JSON: messages[7].?: expected `,` or `}` at line 1 column 18060"));
+    try std.testing.expect(isMalformedBodyError("{\"error\":{\"message\":\"invalid json in request\"}}"));
+    try std.testing.expect(!isMalformedBodyError("rate limit exceeded"));
+    try std.testing.expect(!isMalformedBodyError("The reasoning_content in the thinking mode must be passed back to the API."));
+
+    const gpa = std.testing.allocator;
+    // A clean array returns its whole length (send untouched).
+    const clean = "{\"role\":\"user\",\"content\":\"hi\"},{\"role\":\"assistant\",\"content\":\"ok\"}";
+    try std.testing.expectEqual(clean.len, validMessagePrefixLen(gpa, clean));
+
+    // The observed corruption: a user turn whose content string is UNTERMINATED, then more turns — and the
+    // trailing turn's braces even rebalance (the live failure had the tail re-close inside "tools", fooling
+    // a brace-counter). The real-parser cut must still stop at the last INTACT turn (the assistant).
+    const broken = "{\"role\":\"user\",\"content\":\"first\"}" ++
+        ",{\"role\":\"assistant\",\"content\":\"done\"}" ++
+        ",{\"role\":\"user\",\"content\":\"gain root on " ++ // <- no closing quote/brace
+        ",{\"role\":\"assistant\",\"content\":\"next\"}";
+    const plen = validMessagePrefixLen(gpa, broken);
+    const kept = broken[0..plen];
+    try std.testing.expect(std.mem.endsWith(u8, kept, "\"content\":\"done\"}")); // stops at the last intact turn
+    try std.testing.expect(std.mem.indexOf(u8, kept, "gain root") == null); // the corrupt turn is gone
+    // And it is a complete, parseable array once wrapped.
+    const doc = std.fmt.allocPrint(gpa, "[{s}]", .{kept}) catch unreachable;
+    defer gpa.free(doc);
+    var parsed = std.json.parseFromSlice(std.json.Value, gpa, doc, .{}) catch unreachable;
+    parsed.deinit();
+
+    // safeMessagePrefix additionally refuses to end on an assistant tool_calls turn whose results were cut.
+    const dangling = "{\"role\":\"user\",\"content\":\"q\"}" ++
+        ",{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"1\"}]}" ++
+        ",{\"role\":\"user\",\"content\":\"unterminated ";
+    const safe = safeMessagePrefix(gpa, dangling);
+    try std.testing.expect(std.mem.endsWith(u8, safe, "\"content\":\"q\"}")); // dropped the dangling tool-call turn too
+    try std.testing.expect(std.mem.indexOf(u8, safe, "tool_calls") == null);
 }
 
 test "reasoning-echo quirk: detected from the thinking-mode error, learned per model, merges with temp" {
