@@ -514,6 +514,16 @@ pub fn postMessage(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     // live via /events instead of blocking its poll until the whole (possibly multi-step) turn finishes. The turn
     // writes frames to events.jsonl as it runs. spawnTurn owns releasing the per-conv slot (via turnThread / its
     // inline paths) on every completion path.
+    // Create the conversation directory HERE rather than leaving it to the turn thread, because the 202 below
+    // hands the caller an events_url and that URL must work the moment they are given it. runTurn does create it,
+    // but on a detached thread the handler has already raced past — so a client that polls immediately (any
+    // automated one; a human is far too slow to notice) can get a 404 from the very URL the server just told it
+    // to use. Seen in an unattended run: {"ok":false,"err":"not found"} arriving where the first event frame was
+    // expected. Best-effort — runTurn's own createDirPathStatus still covers a failure here.
+    if (std.fmt.allocPrint(res.arena, "{s}/u{d}/_chat/convs/{s}", .{ app.data, u.id, seg })) |cdir| {
+        _ = std.Io.Dir.cwd().createDirPathStatus(app.io, cdir, .default_dir) catch {};
+    } else |_| {}
+
     chat_engine.spawnTurn(app, u.id, seg, trio, text, loop_mode, b.tool_client, b.image_b64, b.fast, b.trace);
 
     res.status = 202;
