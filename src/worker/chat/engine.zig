@@ -127,6 +127,23 @@ const LOOP_STOP_NOTE = "[engine: this turn was cut short by the loop guard — t
 /// MILLION input tokens in a single turn, roughly 4.5x this. Set to 0 to disable (NL_TURN_TOKEN_CEILING=0).
 const TURN_TOKEN_CEILING_DEFAULT: u64 = 400_000;
 
+/// How many times one turn may cross the spend ceiling and KEEP GOING before it settles for the human.
+///
+/// The ceiling used to end the turn outright, which is correct about the spend and wrong about the work: the
+/// user came back to a run that had stopped mid-task and had to type "continue" to restart something the
+/// engine could have carried itself. Three re-groundings covers the long research-and-write turns this
+/// actually bites (each segment restarts from a distilled continuation state, so it is three fresh compact
+/// contexts, not three more rounds of the same bloated one) while keeping the worst case a bounded 4x the
+/// ceiling rather than the open-ended spend the ceiling exists to prevent. NL_TURN_CONTINUE_MAX overrides;
+/// 0 restores the settle-and-wait behaviour exactly.
+const TURN_CONTINUE_MAX_DEFAULT: u32 = 3;
+
+/// The user turn the engine writes to itself when it rolls past the spend ceiling. Addressed to the model as
+/// an instruction because that is the slot it occupies; the CONTINUATION STATE it refers to arrived in the
+/// system turn immediately above it. Deliberately short — it is a handover, and everything worth saying about
+/// where the work stands has already been said there, grounded, by the engine.
+const CONTINUE_SEGMENT_MSG = "Continue this work from the CONTINUATION STATE above. It is the engine's record of what you already established, what is already on disk, and what you already ruled out — treat all of it as done and do NOT redo it. Begin at the NEXT step it names. Your earlier working context is gone, so rely on that record and on re-reading files you need rather than repeating the searches that produced it.";
+
 /// What the spend ceiling writes when it settles a turn. Third person and engine-attributed for the same reason
 /// LOOP_STOP_NOTE is: it is committed as a system/engine row, never in the model's voice, so the next turn reads
 /// a machine event rather than an apparent confession of failure.
@@ -2737,13 +2754,31 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     // ABSOLUTE ceiling for this turn, not a delta: tokensSnapshot is thread-local and each turn owns its thread
     // (spawnTurn), so usage_t0 + budget is exactly "this turn has spent enough" even with turns running
     // concurrently for other conversations. Operator-tunable; 0 disables the backstop entirely.
-    const token_ceiling: u64 = blk: {
-        const cap = if (ctx.environ.get("NL_TURN_TOKEN_CEILING")) |v|
-            std.fmt.parseInt(u64, std.mem.trim(u8, v, " \r\n\t"), 10) catch TURN_TOKEN_CEILING_DEFAULT
-        else
-            TURN_TOKEN_CEILING_DEFAULT;
-        break :blk if (cap == 0) 0 else usage_t0.in + cap;
-    };
+    const token_cap: u64 = if (ctx.environ.get("NL_TURN_TOKEN_CEILING")) |v|
+        std.fmt.parseInt(u64, std.mem.trim(u8, v, " \r\n\t"), 10) catch TURN_TOKEN_CEILING_DEFAULT
+    else
+        TURN_TOKEN_CEILING_DEFAULT;
+    // VAR, and re-anchored per SEGMENT (see the ceiling arm below). The ceiling is an absolute thread
+    // reading, not a delta, so a turn that rolls on past one must move its own goalposts or the very next
+    // inference re-trips it instantly and the roll becomes a spin.
+    var token_ceiling: u64 = if (token_cap == 0) 0 else usage_t0.in + token_cap;
+    // How many times ONE turn may re-ground and keep going after the spend ceiling settles a segment.
+    //
+    // Rolling on is only affordable because a segment RESET is not a continuation of the expensive thing.
+    // The ceiling exists because every round re-uploads the whole working context and that context grows as
+    // it goes — the measured runaway was 1.83M input tokens in a single turn, and the note the engine writes
+    // says so in as many words ("each further round re-sends all of it"). A segment boundary drops that span
+    // entirely and re-seeds from the distilled continuation state, so the next segment restarts SMALL and its
+    // rounds are cheap again. Rolling on without the reset would just buy more of the runaway.
+    //
+    // Bounded anyway, because a compact context is not the same thing as a terminating task: worst case is
+    // (1 + max) * NL_TURN_TOKEN_CEILING, visible in the usage frame at every boundary, and every segment
+    // re-checks Stop. 0 restores exactly the old behaviour — settle and wait for the human.
+    const max_continues: u32 = if (ctx.environ.get("NL_TURN_CONTINUE_MAX")) |v|
+        std.fmt.parseInt(u32, std.mem.trim(u8, v, " \r\n\t"), 10) catch TURN_CONTINUE_MAX_DEFAULT
+    else
+        TURN_CONTINUE_MAX_DEFAULT;
+    var continues: u32 = 0;
     // TOOL-ECHO GUARD + network repeat ledger, at TURN scope. Both used to live inside the inner agentic
     // pass, which is re-entered on EVERY drive step — so the guards forgot all repeats each step, and a
     // stuck turn re-listed the same directory step after step while the context ballooned (observed live:
@@ -2994,6 +3029,56 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
                     // lines commit exactly the row they commit today.
                     appendMsg(app, conv_dir, "system", row, "engine", nowSecs(app.io));
                     emitEngineNote(app, conv_dir, row);
+
+                    // ROLL ON. The spend ceiling settles a SEGMENT, not the conversation: with budget left it
+                    // re-grounds the turn on what it just established and keeps working, instead of parking a
+                    // half-done task until the human notices and types "continue".
+                    //
+                    // The whole thing turns on the RESET two lines down. conv_buf is truncated back to the
+                    // assembled prefix, so the enormous working span that tripped the ceiling is gone and the
+                    // next segment opens on the same small context a fresh turn would get, plus the distilled
+                    // state. That is why this is affordable and why it is not simply "raise the ceiling": the
+                    // ceiling fires on a context that GREW, and the fix for a grown context is to drop it, not
+                    // to allow more of it. Each segment then re-anchors its own full allowance.
+                    //
+                    // The loop guard is deliberately NOT rolled on. Its pathology is repetition — the same
+                    // calls returning the same results — and handing that a fresh context to repeat itself in
+                    // is the one response guaranteed not to help. It still settles for the human, as today.
+                    //
+                    // A failed distillation does NOT roll (handoff.len == 0): rolling on with nothing to
+                    // re-ground from is just the restart-from-scratch this whole change exists to stop, only
+                    // now without a human in the loop to notice it happening.
+                    const ceiling_cut = !std.mem.eql(u8, inner.engine_note, LOOP_STOP_NOTE);
+                    if (ceiling_cut and continues < max_continues and handoff.len > 0 and
+                        !stopRequestedSince(app, conv_dir, steer_cursor)) roll: {
+                        // Built COMPLETE in scratch first, and only then spliced. Every failure here breaks
+                        // :roll and falls into the settle-and-return below — today's exact behaviour — so a
+                        // half-written re-seed can never be dispatched, and `inner` is freed on one path only.
+                        var seed: std.ArrayListUnmanaged(u8) = .empty;
+                        defer seed.deinit(gpa);
+                        // The state as a SYSTEM turn (an engine record, never the model's own voice — the
+                        // LOOP_STOP_NOTE rule), then one user turn telling it to carry on from there. The
+                        // same shape the next turn would have been handed, minus the wait for a human.
+                        seed.appendSlice(gpa, ",{\"role\":\"system\",\"content\":") catch break :roll;
+                        http.jstr(gpa, &seed, row) catch break :roll;
+                        seed.appendSlice(gpa, "},{\"role\":\"user\",\"content\":") catch break :roll;
+                        http.jstr(gpa, &seed, CONTINUE_SEGMENT_MSG) catch break :roll;
+                        seed.appendSlice(gpa, "}") catch break :roll;
+                        // Drop the span that tripped the ceiling. The seed is orders of magnitude smaller than
+                        // what was just dropped, so the append reuses retained capacity rather than growing.
+                        conv_buf.shrinkRetainingCapacity(assembled_len);
+                        conv_buf.appendSlice(gpa, seed.items) catch break :roll;
+                        // A fresh allowance for the fresh context, and room in the drive loop to spend it —
+                        // a plain turn's DRIVE_MAX of 6 would otherwise end the roll before the budget does.
+                        if (token_cap != 0) token_ceiling = llm.tokensSnapshot().in + token_cap;
+                        max_steps = @max(max_steps, drive + 1 + LOOP_MAX_STEPS);
+                        continues += 1;
+                        var sb2: [192]u8 = undefined;
+                        emitKV(app, conv_dir, "status", "text", std.fmt.bufPrint(&sb2, "spend ceiling reached — re-grounding on what is established and continuing ({d}/{d})", .{ continues, max_continues }) catch "continuing from the continuation state");
+                        gpa.free(inner.content);
+                        gpa.free(inner.engine_note);
+                        continue :outer;
+                    }
                 }
                 gpa.free(inner.content);
                 gpa.free(inner.engine_note);
@@ -9593,6 +9678,39 @@ test "a fused handoff rides the ENGINE row, so a streak of cut turns still repla
     try std.testing.expect(std.mem.indexOf(u8, kept, "CONTINUATION STATE") == null);
     try std.testing.expect(std.mem.indexOf(u8, kept, "research WAL mode") != null);
     try std.testing.expect(std.mem.indexOf(u8, kept, "wrote notes.md") != null);
+}
+
+test "rolling past the spend ceiling stays bounded, and hands the next segment an engine record it can act on" {
+    // WORST-CASE SPEND is the whole reason this is allowed to roll at all. The ceiling is a runaway backstop
+    // (the measured runaway was 1.83M input tokens in ONE turn); rolling on turns that open-ended number into
+    // (1 + max) ceilings, which is a number an operator can reason about and an env var can change.
+    try std.testing.expectEqual(@as(u32, 3), TURN_CONTINUE_MAX_DEFAULT);
+    const worst = (1 + @as(u64, TURN_CONTINUE_MAX_DEFAULT)) * TURN_TOKEN_CEILING_DEFAULT;
+    try std.testing.expectEqual(@as(u64, 1_600_000), worst);
+    // ...and it must stay BELOW the runaway that motivated the ceiling, or the backstop has been undone.
+    try std.testing.expect(worst < 1_825_951);
+
+    // The re-seed message has to do two jobs the state block cannot do for itself: forbid the redo (the
+    // failure being fixed is a turn that restarted and re-paid for work it had already done), and say the
+    // working context is GONE so the model reaches for files instead of its own vanished scrollback.
+    try std.testing.expect(std.mem.indexOf(u8, CONTINUE_SEGMENT_MSG, "CONTINUATION STATE") != null);
+    try std.testing.expect(std.mem.indexOf(u8, CONTINUE_SEGMENT_MSG, "do NOT redo") != null);
+    try std.testing.expect(std.mem.indexOf(u8, CONTINUE_SEGMENT_MSG, "NEXT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, CONTINUE_SEGMENT_MSG, "working context is gone") != null);
+
+    // It is the ENGINE's handover, not the assistant's: a first-person re-seed would replay to the model as
+    // its own prior words, the same confession-spiral LOOP_STOP_NOTE documents one layer up.
+    for ([_][]const u8{ "I ", "I'", " my ", " me " }) |fp|
+        try std.testing.expect(std.mem.indexOf(u8, CONTINUE_SEGMENT_MSG, fp) == null);
+
+    // The roll re-seeds with the FUSED row (note + continuation state), so whatever the distillation produced
+    // reaches the next segment through the same bytes the next TURN would have replayed. Same text, one path.
+    const gpa = std.testing.allocator;
+    var b: std.ArrayListUnmanaged(u8) = .empty;
+    defer b.deinit(gpa);
+    const row = handoffRow(gpa, TOKEN_CEILING_NOTE, "ESTABLISHED: sqlite WAL is default-off.\nNEXT: write notes.md.", HANDOFF_MAX_BYTES, &b);
+    try std.testing.expect(std.mem.indexOf(u8, row, "CONTINUATION STATE") != null);
+    try std.testing.expect(std.mem.indexOf(u8, row, "NEXT: write notes.md.") != null);
 }
 
 test "file ledger: mutation parsing, upsert, args-path extraction, and the woven ground-truth block" {
