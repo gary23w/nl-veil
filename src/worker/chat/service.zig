@@ -412,6 +412,7 @@ pub fn postMessage(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         // client, and every API caller who has never heard of this field, gets the better reasoning without
         // changing anything. Opting OUT is the deliberate act, which is the right way round for a quality knob.
         fast: bool = false,
+        trace: bool = false,
     };
     // TWO different failures, both the CALLER's: `orelse` catches an absent/empty body, and the `catch`
     // catches a body that parsed as JSON but had a field of the wrong TYPE ({"loop":"x"}, {"fast":"yes"}).
@@ -513,7 +514,7 @@ pub fn postMessage(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     // live via /events instead of blocking its poll until the whole (possibly multi-step) turn finishes. The turn
     // writes frames to events.jsonl as it runs. spawnTurn owns releasing the per-conv slot (via turnThread / its
     // inline paths) on every completion path.
-    chat_engine.spawnTurn(app, u.id, seg, trio, text, loop_mode, b.tool_client, b.image_b64, b.fast);
+    chat_engine.spawnTurn(app, u.id, seg, trio, text, loop_mode, b.tool_client, b.image_b64, b.fast, b.trace);
 
     res.status = 202;
     const events_url = try std.fmt.allocPrint(res.arena, "/api/v1/chat/convs/{s}/events?from=0", .{seg});
@@ -730,7 +731,9 @@ pub fn convFiles(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
             // Normalize to forward slashes: the client uses this string as a query parameter and as a
             // display path, and a Windows walker hands back backslashes.
             const norm = try res.arena.dupe(u8, ent.path);
-            for (norm) |*c| if (c.* == '\\') { c.* = '/'; };
+            for (norm) |*c| if (c.* == '\\') {
+                c.* = '/';
+            };
             try http.jstr(app.gpa, &arr, norm);
             const tail = try std.fmt.allocPrint(res.arena, ",\"size\":{d}}}", .{st.size});
             try arr.appendSlice(app.gpa, tail);
@@ -949,9 +952,9 @@ test "safeSeg's twin in chat/tools.zig has not drifted from this one" {
     // other is a hole, so the copies are compared behaviourally rather than by eye.
     const tools_safeSeg = @import("tools.zig").safeSegForTest;
     const CASES = [_][]const u8{
-        "c0ffee",           "  c0ffee\n", "a_b-c",  "../u2/_chat",
-        "..",               "/etc/passwd", "with space", "",
-        "a" ** 64, "a" ** 65, "tab\there", "semi;colon",
+        "c0ffee",  "  c0ffee\n",  "a_b-c",      "../u2/_chat",
+        "..",      "/etc/passwd", "with space", "",
+        "a" ** 64, "a" ** 65,     "tab\there",  "semi;colon",
     };
     for (CASES) |c| try std.testing.expectEqualStrings(safeSeg(c), tools_safeSeg(c));
 }
