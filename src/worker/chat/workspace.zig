@@ -31,7 +31,9 @@ pub const Kind = enum {
     tool_belt,
     image,
     // varying channel (per-message); verifier sits directly after recall so the audit renders
-    // adjacent to the block it audits
+    // adjacent to the block it audits. `continuation` leads the channel: when a previous unit of work on
+    // this thread was cut short, where it got to outranks anything recall can offer about it.
+    continuation,
     recall,
     verifier,
     correction,
@@ -43,7 +45,7 @@ pub const Kind = enum {
     pub fn channel(k: Kind) Channel {
         return switch (k) {
             .durable_memory, .tool_digest, .tool_belt, .image => .prefix,
-            .recall, .verifier, .correction, .family, .plugin => .varying,
+            .continuation, .recall, .verifier, .correction, .family, .plugin => .varying,
             .ledger => .suffix,
         };
     }

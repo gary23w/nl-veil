@@ -34,6 +34,7 @@ const deploy_service = @import("../deploy/service.zig");
 const sched = @import("../sched.zig"); // mutual import (sched spawns turns here); Zig resolves it lazily
 const metrics = @import("../metrics.zig"); // per-turn LLM usage lines behind the desk Dashboard
 const cpaths = @import("paths.zig"); // conv → build-tree mapping (scheduled runs live under _sched/{task}/runs/)
+const continuity = @import("../continuity.zig"); // durable resume anchors, shared with the swarm + sched
 
 // Raw-thread sleep (supervisor.zig's threadSleepMs twin): the chat turn runs on a raw detached std.Thread
 // (spawnTurn), where io.sleep throws and a swallowed error busy-spins a core. Win32 Sleep on Windows.
@@ -2240,6 +2241,19 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
         // unanchored (observed: a restart's "continue" re-scaffolded the whole build). Key it on the
         // conversation's pinned GOAL instead: the memories of the actual work come back.
         const recall_query: []const u8 = goal_text;
+        // CONTINUATION ANCHOR, ahead of recall and scored above it. When the previous unit of work on this
+        // thread was cut short, where it actually got to beats anything top-k can say about it — that is the
+        // whole failure this fixes, and the RESUME CUE directly above is the same problem solved as far as a
+        // query-keyed read can solve it. This read asks no question at all (see continuity.read).
+        //
+        // It costs a spawn only when an anchor EXISTS: every normal completion clears its own, so a healthy
+        // conversation reads an empty scope and bids nothing, and Workspace.bid drops empty text without
+        // registering a block — the packed fragment and the decision log are byte-identical to today.
+        {
+            const cont = continuity.read(gpa, ctx.mem, mem_scope, continuity.READ_CAP_BYTES);
+            defer gpa.free(cont);
+            ws.bid(.continuation, mem_scope, cont, 0.75, continuity.READ_CAP_BYTES, 0);
+        }
         // SCORED RECALL first (a neuron binary with `recallscored`): numbers cross the seam as numbers —
         // the top hit's coverage rides the workspace bid as MEASURED confidence (rendered in the receipt,
         // recorded in the decision log), facts are numbered so the verifier below can cite them, and
@@ -2961,6 +2975,14 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
                         defer ground.deinit(gpa);
                         ledgerBlock(gpa, &file_ledger, &ground);
                         handoff = turnHandoff(app, llm_dir, think.base_url, think.key, think.model, search_intent, ground.items, conv_buf.items, assembled_len) orelse &[_]u8{};
+                        // AND DURABLY, under the conversation's own memory scope. The fused row above serves
+                        // the next turn of THIS transcript, which is enough right up until the next unit of
+                        // work reads a different one — and a scheduled run always does, because sched hands
+                        // every run a fresh conv_dir, so its next run opens an empty messages.jsonl and never
+                        // sees the row at all. The anchor is addressed to the WORK instead of the transcript,
+                        // costs no second inference (this is the same distillation, banked), and supersedes
+                        // rather than appends, so a task that hits the ceiling every run still has exactly one.
+                        continuity.press(ctx.mem, mem_scope, if (std.mem.eql(u8, inner.engine_note, LOOP_STOP_NOTE)) .loop_guard else .ceiling, handoff);
                     }
                     var hrow: std.ArrayListUnmanaged(u8) = .empty;
                     defer hrow.deinit(gpa);
@@ -3399,6 +3421,11 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     // desk stays in its rendering state until {done}, so it naturally waits for this rather than sending early. Only
     // this path refreshes; Stop/error/empty end promptly via finishTurn (and the summary catches up next turn).
     emitUsage(app, conv_dir, usage_t0);
+    // A turn that REACHED here is a turn that finished, so any anchor a previous cut left is spent — drop it
+    // before the next turn can read a continuation that no longer describes anything outstanding. This is what
+    // keeps the capability invisible in ordinary use: an anchor exists only between a real cut and the work
+    // being picked back up, so a healthy conversation never reads one and never renders the block.
+    continuity.clear(ctx.mem, mem_scope);
     refreshSummary(app, conv_dir, llm_dir, think.base_url, think.key, think.model, hist_win);
     // NO {done} here: it is emitted by signalDone after the caller releases the conversation slot, so the frame
     // that tells a client "the turn is over" is not followed by a 409 when the client believes it.
