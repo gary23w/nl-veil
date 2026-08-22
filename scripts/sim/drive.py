@@ -67,6 +67,16 @@ def watch(conv, sink, turn_idx, start_off, budget_s=900):
             errors.append("HARNESS: event poll failed: %s" % e)
             time.sleep(1.0)
             continue
+        # A non-200 body is an API ERROR, not event lines. Parsing it as events silently turned
+        # {"ok":false,"err":"not found"} into a phantom "event" with no kind — masking a real server
+        # race instead of surfacing it. Retry rather than poison the trace.
+        if st != 200:
+            if st == 404:
+                time.sleep(0.25)
+                continue
+            errors.append("HARNESS: events HTTP %s: %s" % (st, content[:120]))
+            time.sleep(0.5)
+            continue
         nxt = hdrs.get("X-Next-Offset")
         if nxt:
             off = int(nxt)
