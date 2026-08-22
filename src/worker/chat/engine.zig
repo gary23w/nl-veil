@@ -130,6 +130,52 @@ const TURN_TOKEN_CEILING_DEFAULT: u64 = 400_000;
 /// LOOP_STOP_NOTE is: it is committed as a system/engine row, never in the model's voice, so the next turn reads
 /// a machine event rather than an apparent confession of failure.
 const TOKEN_CEILING_NOTE = "[engine: this turn hit its spend ceiling and was settled early — it had gathered a lot of context and each further round re-sends all of it. What is already written to the workdir is real. If more work is needed, ask for the next piece as a new turn rather than repeating this one.]";
+/// CONTINUATION-STATE WRITER (thinking). Deliberately NOT summarizeWorkingSpan's prompt.
+///
+/// That one compresses a working log so the SAME turn can keep going — its reader still holds the verbatim tail
+/// the note was spliced around. This reader holds nothing. A cut turn's conv_buf dies with the turn and
+/// refreshSummary does not run on that path, so the next turn rebuilt from the rolling summary plus the recency
+/// window and found the original request, a possibly-empty partial, and a notice that a machine event happened.
+/// It then did the only rational thing with that: started over, re-read, re-fetched, re-derived, and hit the
+/// same ceiling the same way. Measured on the runaway that motivated the ceiling: 1,825,951 input tokens in a
+/// single turn, all of it discarded.
+///
+/// The two fields that break that loop are the two a compression prompt has no reason to write. RULED OUT keeps
+/// the next turn off the approaches this one already burned the budget disproving; NEXT makes it open on a move
+/// instead of on orientation. Same reason STUCK_SYSTEM is not a generic nudge.
+const HANDOFF_SYSTEM =
+    "You are writing the CONTINUATION STATE for a task whose turn was cut off by the engine before it " ++
+    "finished. Another turn will pick this up with NONE of the working context you are reading — only what you " ++
+    "write here. Write for that reader, not as a progress report. Four things, in this order and nothing else. " ++
+    "ESTABLISHED: the concrete facts this turn actually determined — exact values, versions, paths, error " ++
+    "strings, API shapes — never that something was 'looked into' or 'investigated'. ON DISK: the files that " ++
+    "exist and what each now contains; if an ENGINE GROUND TRUTH block appears below, that list is " ++
+    "authoritative and yours must not contradict it. RULED OUT: approaches, sources or commands already tried " ++
+    "that did not work, and why, so the next turn does not repeat them. NEXT: the single concrete action to " ++
+    "take first. State what IS, never what you will do. Do not apologize, do not restate the request, do not " ++
+    "call tools.";
+const HANDOFF_QUESTION =
+    "Write the continuation state now, under 180 words total, using exactly the labels ESTABLISHED / ON DISK / " ++
+    "RULED OUT / NEXT. Omit a label entirely if there is genuinely nothing true to put under it. Reply with " ++
+    "ONLY those lines.";
+
+/// What introduces the continuation state INSIDE the engine's stop row. Third person, and explicit that the
+/// engine wrote it from the turn's own working log — for the same reason LOOP_STOP_NOTE is third person. The row
+/// is committed as role:"system" / kind:"engine" and replayed to the next turn; a first-person progress note
+/// sitting there reads to the model as its own prior words, which is the confession spiral that note documents.
+const HANDOFF_HEADER = "\n\nCONTINUATION STATE — written by the engine from this turn's own working log, not the assistant's message to you. This work is ALREADY DONE: treat ON DISK as real, do NOT redo anything under RULED OUT, and begin at NEXT rather than starting over.\n";
+
+/// What separates the head and tail of the cut turn's working log when it does not fit whole (see handoffSpan).
+const HANDOFF_ELISION = "\n…[middle rounds of this turn elided — the head above is already a condensed progress note and the tail below is verbatim]…\n";
+
+/// Ceiling on the rendered continuation state. summarizeWorkingSpan-class output is clipped at
+/// cctx.SUMMARY_INJECT_CAP (6 KB), which is 21% of a roomy 28 KB recency window and 75% of the 8 KB floor window
+/// a tightened local model gets (see historyWindowBytes) — a handoff that size crowds out the conversation it
+/// exists to continue. Every replayed byte is also re-uploaded on EVERY inference of every later turn until the
+/// window rolls past it, the argument BRIEF_MAX_BYTES (1200) and ledgerBlock (~1400) both make. 1400 is ~220
+/// words: room for four labels. The caller tightens it AGAIN against the actual window (hist_win / 8).
+const HANDOFF_MAX_BYTES: usize = 1400;
+
 /// STUCK-RECOVERY WRITER (prompting). Reads the same bounded transcript tail the drive picker rides and names the
 /// concrete way around the blocker it can see, instead of the template's abstract encouragement.
 const STUCK_SYSTEM =
@@ -1485,6 +1531,19 @@ const TOOL_PREVIEW_BYTES: usize = 2000;
 /// Bounded-context sizes for the cheap auxiliary inferences (drive-loop step picker / round-cap summary).
 const LOOP_CTX_BYTES: usize = 14 * 1024;
 const SUMMARY_CTX_BYTES: usize = 18 * 1024;
+
+/// The cut turn's working log, as HEAD + TAIL, for the continuation state (see handoffSpan). Both ends, weighted
+/// to the tail, because compaction has already shaped this span: compactWorking folds the older part into one
+/// <= cctx.SUMMARY_INJECT_CAP progress note and keeps the newest WORKING_KEEP_TAIL_BYTES (32 KB) verbatim. A
+/// 12 KB tail therefore lands ENTIRELY INSIDE that verbatim tail and never reaches the fold note — tail-only
+/// would see the frontier and nothing of the turn's early arc, which on a research turn is exactly the half the
+/// next turn re-does. The head is 6 KB and is already a distillation, so it is nearly free.
+///
+/// NOT summarizeWorkingSpan's stock clipBytes(span, 200 KB), which is wrong twice over here: clipBytes keeps the
+/// HEAD, so an oversized span would lose the NEWEST work, and 200 KB is ~51k tokens — 13% of the whole 400k
+/// ceiling, spent at the exact moment the engine declared the turn too expensive. 18 KB is ~4.5k, ~1.1% of it.
+const HANDOFF_CTX_HEAD_BYTES: usize = 6 * 1024;
+const HANDOFF_CTX_TAIL_BYTES: usize = 12 * 1024;
 
 /// The LARGEST suffix of a serialized message list (comma-joined {"role":…} objects) that fits `want` bytes
 /// AND starts on a clean, VALID boundary — the "recent context" slice for cheap auxiliary inferences, which
@@ -2873,9 +2932,46 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
                 // (seedLines), so the next turn reads it as a machine event rather than as the model's own
                 // confession, and only the NEWEST engine row survives replay, so a streak of cut turns cannot
                 // pile up into a wall of failure notices. The user still SEES it: the emit below is unchanged.
+                // CONTINUATION HANDOFF, FUSED INTO THAT ROW — never written beside it.
+                //
+                // Everything a cut turn GATHERED — files read, pages fetched, greps, command output, decisions,
+                // dead ends — lives in conv_buf, which dies at the return below, and refreshSummary is not on
+                // this path (see the normal-completion tail). So the next turn's assembleHistory replayed the
+                // original request, a possibly-empty partial, and a notice that a machine event happened. The
+                // model then did the only rational thing available: it started over, re-read and re-fetched what
+                // it already had, and hit the same ceiling the same way. One bounded distillation of the turn's
+                // own working log turns that notice into a continuation — ~5k input tokens, about 1.25% of the
+                // ceiling this path just tripped, and the first post-hoc tokens this path has ever spent. It
+                // runs BEFORE finishTurn so the user sees the cost in the turn's usage frame rather than paying
+                // it invisibly, which is the objection the ceiling comment itself raises about unseen spend.
+                //
+                // ENGINE-CUT ONLY. `engine_note` is non-empty at exactly two returns — the loop guard and the
+                // spend ceiling — and defaults empty at the three user-Stop returns. A user who pressed Stop
+                // asked to stop SPENDING; buying them another 90-second inference is the opposite of that, and
+                // the stopRequestedSince re-check covers a Stop that landed in the microseconds since the cut
+                // (llm.complete blocks and has no abort hook, unlike the streamed turn call).
                 if (inner.engine_note.len > 0) {
-                    appendMsg(app, conv_dir, "system", inner.engine_note, "engine", nowSecs(app.io));
-                    emitEngineNote(app, conv_dir, inner.engine_note);
+                    var handoff: []u8 = &[_]u8{};
+                    defer if (handoff.len > 0) gpa.free(handoff);
+                    if (!stopRequestedSince(app, conv_dir, steer_cursor)) {
+                        emitKV(app, conv_dir, "status", "text", "settling: writing what this turn established so the next one continues from it");
+                        // Engine ground truth, so ON DISK is a fact the engine verified rather than a claim the
+                        // model makes about its own writes.
+                        var ground: std.ArrayListUnmanaged(u8) = .empty;
+                        defer ground.deinit(gpa);
+                        ledgerBlock(gpa, &file_ledger, &ground);
+                        handoff = turnHandoff(app, llm_dir, think.base_url, think.key, think.model, search_intent, ground.items, conv_buf.items, assembled_len) orelse &[_]u8{};
+                    }
+                    var hrow: std.ArrayListUnmanaged(u8) = .empty;
+                    defer hrow.deinit(gpa);
+                    // Tightened against the ACTUAL window: 1400 B is 5% of a roomy history window and 17% of the
+                    // 8 KB floor a small local model gets, where a handoff must not crowd out the conversation.
+                    const row = handoffRow(gpa, inner.engine_note, handoff, @max(512, @min(HANDOFF_MAX_BYTES, hist_win / 8)), &hrow);
+                    // Best-effort, like every summary in this file: a Stop, an empty span, a refused, degenerate
+                    // or markup completion, or any OOM leaves `row` bound to inner.engine_note and these two
+                    // lines commit exactly the row they commit today.
+                    appendMsg(app, conv_dir, "system", row, "engine", nowSecs(app.io));
+                    emitEngineNote(app, conv_dir, row);
                 }
                 gpa.free(inner.content);
                 gpa.free(inner.engine_note);
@@ -9199,6 +9295,110 @@ fn summarizeWorkingSpan(app: *App, run_root: []const u8, base_url: []const u8, k
     return gpa.dupe(u8, clipBytes(t, cctx.SUMMARY_INJECT_CAP)) catch null;
 }
 
+/// The bounded slice of a CUT turn's working log the continuation state is written from: the oldest
+/// HANDOFF_CTX_HEAD_BYTES, an elision marker, then the newest HANDOFF_CTX_TAIL_BYTES. Never more than their sum
+/// plus the marker; the whole log when it already fits, with no marker to confuse the writer.
+///
+/// A raw byte slice — a torn object, a leading comma, a head glued to a tail — is legal here ONLY because the
+/// caller hands it to a completion that jstr-escapes the whole payload into ONE user message, where it is just
+/// characters in a string. That is the same property that lets compactWorking pass `older`, a comma-joined
+/// fragment that is not valid JSON on its own. Do NOT copy this shape to the msgTail sites that splice real
+/// message objects (the drive picker, schedLearn, courseCheck): there an orphan tool result is a provider 400.
+///
+/// Empty log renders nothing; an OOM mid-render leaves a shorter payload, which still distills.
+fn handoffSpan(gpa: std.mem.Allocator, work: []const u8, out: *std.ArrayListUnmanaged(u8)) void {
+    if (work.len == 0) return;
+    const head = clipBytes(work, HANDOFF_CTX_HEAD_BYTES);
+    const tail = msgTail(work, HANDOFF_CTX_TAIL_BYTES);
+    // msgTail returns the WHOLE input when no valid boundary lands in its window, so the two ends can overlap
+    // or even each be the entire log. Sending it once is both cheaper and correct; only split when they don't.
+    if (head.len + tail.len >= work.len) {
+        out.appendSlice(gpa, work) catch return;
+        return;
+    }
+    out.appendSlice(gpa, head) catch return;
+    out.appendSlice(gpa, HANDOFF_ELISION) catch return;
+    out.appendSlice(gpa, tail) catch return;
+}
+
+/// One no-tools completion that distills a turn the ENGINE CUT into the state the next turn needs to continue
+/// from, rather than restart from. Grounded, not merely summarized: `objective` aims it at what the turn was
+/// FOR (the planner's objective, else the user's own words), and `ground` is the engine's own file ledger, so
+/// ON DISK is verified rather than claimed. gpa-owned text (<= HANDOFF_MAX_BYTES) or null on ANY failure — the
+/// caller then commits exactly the bare stop note it commits today.
+///
+/// llm.complete rather than completeAux, deliberately and for summarizeWorkingSpan's reason: this payload
+/// carries NO assistant turns, so the thinking-mode reasoning-echo quirk cannot bite it.
+fn turnHandoff(app: *App, run_root: []const u8, base_url: []const u8, key: []const u8, model: []const u8, objective: []const u8, ground: []const u8, conv_items: []const u8, assembled_len: usize) ?[]u8 {
+    const gpa = app.gpa;
+    // THE TURN's base, not the pass's. runInnerAgentic's base_len is set at PASS entry, so on drive step >= 1 —
+    // where the ceiling routinely trips at iter 0 — the pass's own span is EMPTY and every byte of the turn's
+    // work sits behind it. assembled_len is the caller's freeze line and covers every drive step.
+    //
+    // It can be a few bytes STALE: the pass-entry reasoning-echo heal rewrites the whole buffer and updates only
+    // base_len. Heals only ever GROW the buffer so the offset stays in range (@min is belt and braces), and a
+    // stale offset merely prepends a few hundred bytes of prefix TEXT to the log — harmless where the slice
+    // rides as escaped characters, which is precisely what it would not be in compactWorking.
+    const work = conv_items[@min(assembled_len, conv_items.len)..];
+    var span: std.ArrayListUnmanaged(u8) = .empty;
+    defer span.deinit(gpa);
+    handoffSpan(gpa, work, &span);
+    if (span.items.len == 0) return null; // nothing gathered — an empty prompt buys nothing but latency
+
+    var msgs: std.ArrayListUnmanaged(u8) = .empty;
+    defer msgs.deinit(gpa);
+    msgs.appendSlice(gpa, "{\"role\":\"system\",\"content\":") catch return null;
+    http.jstr(gpa, &msgs, HANDOFF_SYSTEM) catch return null;
+    msgs.appendSlice(gpa, "},{\"role\":\"user\",\"content\":") catch return null;
+    var uc: std.ArrayListUnmanaged(u8) = .empty;
+    defer uc.deinit(gpa);
+    uc.appendSlice(gpa, "WHAT THIS TURN WAS FOR: ") catch return null;
+    uc.appendSlice(gpa, clipBytes(objective, 600)) catch return null;
+    if (ground.len > 0) uc.appendSlice(gpa, ground) catch return null; // ledgerBlock self-caps at ~1.4 KB
+    uc.appendSlice(gpa, "\n\nWORKING LOG OF THIS TURN (assistant tool calls + tool results as JSON):\n") catch return null;
+    uc.appendSlice(gpa, span.items) catch return null;
+    uc.appendSlice(gpa, "\n\n") catch return null;
+    uc.appendSlice(gpa, HANDOFF_QUESTION) catch return null;
+    http.jstr(gpa, &msgs, uc.items) catch return null;
+    msgs.append(gpa, '}') catch return null;
+
+    const ho_cm = meterBegin(app.io);
+    var step = llm.complete(gpa, app.io, run_root, "handoff", base_url, key, model, msgs.items, "", 768, 0.3);
+    defer step.deinit(gpa);
+    // Metered even when it fails: a success rate read off the stream would otherwise be 100% by construction.
+    meterEnd(app, ho_cm, "handoff", .thinking, model, step.ok);
+    if (!step.ok) return null;
+    // appendMsg ESCAPES but does not VALIDATE, and http.jstr passes invalid UTF-8 through raw — while seedLines
+    // silently drops a row it cannot parse. Unscrubbed, one bad byte would delete the handoff AND the stop note
+    // it rides in, leaving the next turn with strictly less than it has today.
+    scrubUtf8(step.content);
+    const t = std.mem.trim(u8, step.content, " \r\n\t");
+    // A degenerate or markup "continuation state" continues nothing and costs a replay slot on every later turn.
+    if (t.len < 24 or cctx.looksLikeToolMarkup(t)) return null;
+    return gpa.dupe(u8, clipBytes(t, HANDOFF_MAX_BYTES)) catch null;
+}
+
+/// Merge the engine's stop note and the cut turn's continuation state into the ONE role:"system"/kind:"engine"
+/// row the .stopped arm commits, bounded by `cap`. Returns a slice of `out`, or `note` UNCHANGED when there is
+/// nothing to merge or the build failed — so a failed distillation writes byte-for-byte today's row.
+///
+/// ONE ROW, NOT TWO, and that is the entire accumulation story. seedLines replays only the NEWEST kind:"engine"
+/// row, so a handoff written BESIDE the note would evict it (or be evicted by it, depending on write order), and
+/// cut #2's bare fallback would silently delete cut #1's rich state. Written INSIDE, the newest row is strictly
+/// richer than today's on success and identical on failure, and a streak of cut turns still collapses to exactly
+/// one row with no de-duplication logic of its own. Giving it a NEW kind would escape the newest-only rule in
+/// the wrong direction: it would also escape dropEngineRows and be folded, condensed and permanent, into the
+/// rolling summary — the "a run that keeps getting cut short, re-read at the top of every later turn" pathology
+/// that filter exists to stop.
+fn handoffRow(gpa: std.mem.Allocator, note: []const u8, handoff: []const u8, cap: usize, out: *std.ArrayListUnmanaged(u8)) []const u8 {
+    if (handoff.len == 0) return note;
+    // Scratch-built whole, then committed in one shot by the caller: a partial merge is never written.
+    out.appendSlice(gpa, note) catch return note;
+    out.appendSlice(gpa, HANDOFF_HEADER) catch return note;
+    out.appendSlice(gpa, clipBytes(handoff, cap)) catch return note;
+    return out.items;
+}
+
 /// If this pass's working growth (everything appended after `base_len`) exceeds WORKING_COMPACT_BYTES, replace its
 /// OLDER part with a single compressed progress note — the newest WORKING_KEEP_TAIL_BYTES stay verbatim — so the
 /// loop can continue bounded without deleting the results the model is actively working from. Called at a STEP
@@ -9257,6 +9457,115 @@ fn compactWorking(app: *App, run_root: []const u8, base_url: []const u8, key: []
         conv_buf.insertSlice(gpa, note_at + llm.ASSISTANT_OBJ_HEAD.len, ",\"reasoning_content\":\"\"") catch {};
     // One shot, so an OOM here drops the tail (the old behaviour) instead of stranding a dangling comma.
     if (kept) |k| conv_buf.appendSlice(gpa, k) catch {};
+}
+
+test "the handoff span keeps BOTH ends of a cut turn, and renders nothing from nothing" {
+    // A cut turn's span is already folded: [<=6 KB progress note][~32 KB verbatim tail]. Bounding it by the tail
+    // alone would hand the writer the last few rounds and drop the note describing everything before them,
+    // which is precisely the work the next turn re-does.
+    const gpa = std.testing.allocator;
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(gpa);
+
+    // nothing gathered -> nothing rendered, so turnHandoff skips the call outright
+    handoffSpan(gpa, "", &out);
+    try std.testing.expectEqual(@as(usize, 0), out.items.len);
+
+    // a short turn rides whole, with no elision marker to confuse the writer
+    out.clearRetainingCapacity();
+    const short = ",{\"role\":\"assistant\",\"content\":\"read parser.zig\"}";
+    handoffSpan(gpa, short, &out);
+    try std.testing.expectEqualStrings(short, out.items);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "elided") == null);
+
+    // an oversized turn keeps the OLDEST bytes (the fold note) AND the NEWEST bytes (the frontier)
+    out.clearRetainingCapacity();
+    var big: std.ArrayListUnmanaged(u8) = .empty;
+    defer big.deinit(gpa);
+    try big.appendSlice(gpa, ",{\"role\":\"assistant\",\"content\":\"FOLDNOTE scaffolded the crate\"}");
+    while (big.items.len < HANDOFF_CTX_HEAD_BYTES + HANDOFF_CTX_TAIL_BYTES + 8 * 1024)
+        try big.appendSlice(gpa, ",{\"role\":\"assistant\",\"content\":\"padding round\"}");
+    try big.appendSlice(gpa, ",{\"role\":\"assistant\",\"content\":\"FRONTIER ran the failing test\"}");
+    handoffSpan(gpa, big.items, &out);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "FOLDNOTE") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "FRONTIER") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "elided") != null);
+    // ...and it is BOUNDED. This payload is billed as fresh uncached prefill on the thinking provider — a
+    // toolless request reuses no tools-bearing cached prefix, and the turn's own calls ran on coding.
+    try std.testing.expect(out.items.len <= HANDOFF_CTX_HEAD_BYTES + HANDOFF_CTX_TAIL_BYTES + HANDOFF_ELISION.len);
+}
+
+test "a failed handoff writes byte-for-byte today's row, and a good one only ever extends it" {
+    // The degradation contract compactWorking states and this must match: a failed distillation leaves the
+    // caller's state exactly as it was. Anything else turns a spend backstop into a new failure mode.
+    const gpa = std.testing.allocator;
+
+    var b1: std.ArrayListUnmanaged(u8) = .empty;
+    defer b1.deinit(gpa);
+    try std.testing.expectEqualStrings(TOKEN_CEILING_NOTE, handoffRow(gpa, TOKEN_CEILING_NOTE, "", HANDOFF_MAX_BYTES, &b1));
+    try std.testing.expectEqual(@as(usize, 0), b1.items.len); // no orphan header, nothing scratched
+
+    var b2: std.ArrayListUnmanaged(u8) = .empty;
+    defer b2.deinit(gpa);
+    const row = handoffRow(gpa, TOKEN_CEILING_NOTE, "ESTABLISHED: WAL is default-on in v3.7+.\nNEXT: write notes.md.", HANDOFF_MAX_BYTES, &b2);
+    // the machine event still leads the row — today's text is a prefix, never rewritten
+    try std.testing.expect(std.mem.startsWith(u8, row, TOKEN_CEILING_NOTE));
+    try std.testing.expect(std.mem.indexOf(u8, row, "WAL is default-on") != null);
+
+    // the cap is the ENGINE's, not the writer's restraint: this rides in every inference until it scrolls out
+    var b3: std.ArrayListUnmanaged(u8) = .empty;
+    defer b3.deinit(gpa);
+    const huge = "x" ** (4 * 1024);
+    const capped = handoffRow(gpa, TOKEN_CEILING_NOTE, huge, 1024, &b3);
+    // The cap bounds the STATE, not the row: the note and its header are fixed overhead the engine always
+    // pays, and the 4 KB of state above it is clipped to 1024 before it can ride into every later inference.
+    try std.testing.expectEqual(TOKEN_CEILING_NOTE.len + HANDOFF_HEADER.len + 1024, capped.len);
+
+    // ENGINE VOICE, the LOOP_STOP_NOTE rule one layer out: the row replays as a system turn, and a first-person
+    // account of the turn's work would read to the next turn as the model's own admission.
+    for ([_][]const u8{ "I ", "I'", " my ", " me ", " I." }) |first_person|
+        try std.testing.expect(std.mem.indexOf(u8, HANDOFF_HEADER, first_person) == null);
+    // ...and it still has to DO its job: name the provenance, and say what must not be repeated.
+    try std.testing.expect(std.mem.indexOf(u8, HANDOFF_HEADER, "written by the engine") != null);
+    try std.testing.expect(std.mem.indexOf(u8, HANDOFF_HEADER, "RULED OUT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, HANDOFF_HEADER, "NEXT") != null);
+}
+
+test "a fused handoff rides the ENGINE row, so a streak of cut turns still replays exactly one" {
+    // FUSED rather than written beside the note, and this is why. A second kind:"engine" row would make the two
+    // annihilate each other on replay; a row under any OTHER kind would lose BOTH protections at once —
+    // accumulating one copy per cut turn in the window AND being folded permanently into the rolling summary.
+    const gpa = std.testing.allocator;
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(gpa);
+    const stored =
+        \\{"role":"user","content":"research WAL mode and write notes","kind":"user","ts":1}
+        \\{"role":"system","content":"[engine: cut] CONTINUATION STATE established #1","kind":"engine","ts":2}
+        \\{"role":"assistant","content":"wrote notes.md","kind":"veil","ts":3}
+        \\{"role":"system","content":"[engine: cut] CONTINUATION STATE established #2","kind":"engine","ts":4}
+        \\{"role":"system","content":"[engine: cut] CONTINUATION STATE established #3","kind":"engine","ts":5}
+    ;
+    seedLines(gpa, &buf, stored, 4096);
+    const out = buf.items;
+    // no pile-up: the newest fused row carries what the older ones said, so only it survives
+    try std.testing.expect(std.mem.indexOf(u8, out, "established #1") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "established #2") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "established #3") != null);
+    // and it is still a SYSTEM turn — engine-attributed progress, never the model's own prior words
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"role\":\"system\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"role\":\"assistant\",\"content\":\"[engine:") == null);
+    // ordinary rows are untouched by any of this
+    try std.testing.expect(std.mem.indexOf(u8, out, "research WAL mode") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "wrote notes.md") != null);
+
+    // Fusing also kept it OUT of the durable narrative. A per-turn continuation state is a transient machine
+    // event; condensing a run that keeps getting cut short into a permanent summary of itself is the exact
+    // accumulation dropEngineRows exists to stop, wearing a different hat.
+    var db: [1024]u8 = undefined;
+    const kept = dropEngineRows(&db, stored);
+    try std.testing.expect(std.mem.indexOf(u8, kept, "CONTINUATION STATE") == null);
+    try std.testing.expect(std.mem.indexOf(u8, kept, "research WAL mode") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kept, "wrote notes.md") != null);
 }
 
 test "file ledger: mutation parsing, upsert, args-path extraction, and the woven ground-truth block" {
