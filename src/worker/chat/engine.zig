@@ -7574,7 +7574,9 @@ fn runInnerAgentic(
                 emitKV(app, conv_dir, "status", "text", std.fmt.bufPrint(&nb, "steer received — skipped {d} queued tool call(s)", .{skipped}) catch "steer received");
                 break;
             }
-            emitToolState(app, conv_dir, c.name, "start", "");
+            // args on the START frame, withheld entirely when they look credentialed (same test the memory
+            // observe path uses) so a token in a header never reaches the event log
+            emitToolState(app, conv_dir, c.name, "start", "", if (looksCredentialed(c.args)) "" else c.args, null, null);
             // REPEAT-CALL GUARD (see call_ledger above): an exact repeat of an idempotent network call is
             // answered from the ledger — the model is told to use the result it already has and move on.
             const call_h = std.hash.Fnv1a_64.hash(c.name) ^ std.hash.Fnv1a_64.hash(c.args);
@@ -7893,7 +7895,12 @@ fn runInnerAgentic(
                 }
             }
             // A fetched credential value must never land in the event stream (events.jsonl outlives the turn).
-            emitToolState(app, conv_dir, c.name, "done", if (std.mem.eql(u8, c.name, "get_credential")) "(credential value withheld from the event log)" else clipBytes(result, TOOL_PREVIEW_BYTES));
+            // duration + outcome on the DONE frame, so a slow or failing tool is visible in the trace itself
+            // rather than only by correlating against the separate llm/status streams. `ok` mirrors the read
+            // the engine already makes for perf learning: a real result, not an engine refusal string or an
+            // "ok":false payload.
+            const trace_ok = result.len > 0 and result[0] != '(' and std.mem.indexOf(u8, result, "\"ok\":false") == null;
+            emitToolState(app, conv_dir, c.name, "done", if (std.mem.eql(u8, c.name, "get_credential")) "(credential value withheld from the event log)" else clipBytes(result, TOOL_PREVIEW_BYTES), "", @intCast(nowMillis(app.io) - t_call), trace_ok);
 
             // HIPPOCAMPUS (observe): a SUCCESSFUL tool finding is durable knowledge. Gate out engine error strings
             // — "(...)" notes and `"ok":false` payloads — and never observe assistant reply content (confab fix).
@@ -8824,8 +8831,23 @@ fn emitRoleMessage(app: *App, conv_dir: []const u8, role: []const u8, content: [
     emitEvent(app, conv_dir, ev.items);
 }
 
-/// {"kind":"tool","tool":<name>,"state":<state>[,"preview":<preview>]}
-fn emitToolState(app: *App, conv_dir: []const u8, name: []const u8, state: []const u8, preview: []const u8) void {
+/// Bytes of a tool call's ARGUMENTS carried on the trace frame. Generous enough to show a real path, query or
+/// patch header, bounded so a big write_file body does not flood the event log.
+const TOOL_ARGS_TRACE_BYTES: usize = 600;
+
+/// {"kind":"tool","tool":<name>,"state":<state>[,"args":..][,"ms":N][,"ok":bool][,"preview":..]}
+///
+/// ARGS ARE THE POINT. The frame used to carry only a name and a preview of the result, which makes the trace
+/// unable to answer the first question anyone debugging tool use actually has: what did it ASK for? "list_dir
+/// started / list_dir done" says nothing about which directory, so a run that re-reads one file eight times is
+/// indistinguishable in the trace from one that reads eight different files, and a malformed argument is
+/// invisible until it surfaces as a confusing result. An automated analysis cannot group calls by signature at
+/// all. Duration and outcome ride the done frame for the same reason — a slow or failing tool should be visible
+/// as such without correlating against the separate llm/status streams.
+///
+/// Credentials never travel: the caller passes "" for args on any call whose arguments look credentialed, the
+/// same test the observe path already applies, and get_credential's result is withheld as before.
+fn emitToolState(app: *App, conv_dir: []const u8, name: []const u8, state: []const u8, preview: []const u8, args: []const u8, ms: ?u64, ok: ?bool) void {
     const gpa = app.gpa;
     var ev: std.ArrayListUnmanaged(u8) = .empty;
     defer ev.deinit(gpa);
@@ -8833,6 +8855,16 @@ fn emitToolState(app: *App, conv_dir: []const u8, name: []const u8, state: []con
     http.jstr(gpa, &ev, name) catch return;
     ev.appendSlice(gpa, ",\"state\":") catch return;
     http.jstr(gpa, &ev, state) catch return;
+    if (args.len > 0) {
+        ev.appendSlice(gpa, ",\"args\":") catch return;
+        http.jstr(gpa, &ev, clipBytes(args, TOOL_ARGS_TRACE_BYTES)) catch return;
+    }
+    if (ms) |m| {
+        const t = std.fmt.allocPrint(gpa, ",\"ms\":{d}", .{m}) catch return;
+        defer gpa.free(t);
+        ev.appendSlice(gpa, t) catch return;
+    }
+    if (ok) |o| ev.appendSlice(gpa, if (o) ",\"ok\":true" else ",\"ok\":false") catch return;
     if (preview.len > 0) {
         ev.appendSlice(gpa, ",\"preview\":") catch return;
         http.jstr(gpa, &ev, preview) catch return;
