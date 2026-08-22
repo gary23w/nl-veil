@@ -2045,13 +2045,19 @@ pub const Chat = struct {
             if (std.mem.eql(u8, role, "user")) return; // the user message is already in the transcript locally
             self.scCommitReason(dd); // seal the streamed thinking as a .thought chip
             self.scClearStream(); // discard the live reply PREVIEW — the message content below is authoritative
+            // An ENGINE-authored row (role:"system" — the server's loop-guard stop note) is NOT the model
+            // speaking. This path used to fold EVERY non-user role into a .veil bubble, which stored the engine's
+            // words in the desk transcript as the model's own turn and re-fed them from there — the same forged-
+            // confession loop the server fixed, re-created one layer out. The history loader already decodes an
+            // unknown role to .cast_note; the live path now agrees with it instead of contradicting it.
+            const in_role: store_mod.ChatRole = if (std.mem.eql(u8, role, "system")) .cast_note else .veil;
             if (scRawField(line, "content")) |raw| {
                 var buf: [store_mod.STREAM_CAP]u8 = undefined;
                 const content = scUnescape(raw, &buf);
                 // no observe: the desk observing the server veil's replies re-creates the confabulation loop the
                 // server side already fixed (its own replies recalled later as "grounded context") — and each
                 // observe is a subprocess spawn on the streaming worker thread.
-                if (content.len > 0) self.appendMsgFull(dd, .veil, content, false, "");
+                if (content.len > 0) self.appendMsgFull(dd, in_role, content, false, "");
             }
             return;
         }
