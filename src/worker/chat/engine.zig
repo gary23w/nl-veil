@@ -2267,7 +2267,12 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     // BOUNDED HISTORY (chat_context): instead of replaying the entire transcript (which overflowed the model
     // window on long chats and hit an 8 MiB read cliff), project it into a fixed budget — a rolling summary of
     // scrolled-out turns + the pinned goal + the varying workspace channel + a recency window of the newest turns.
-    assembleHistory(app, conv_dir, user_text, &conv_buf, ws_packed.varying);
+    // The window is sized for the model that CONSUMES this prompt (coding), against the REAL tool array — not a
+    // tier estimate, which would overflow on exactly the turns that granted a recipe. refreshSummary below is
+    // handed the same number so both agree on where the window starts.
+    const hist_win = historyWindowBytes(trio.coding.base_url, trio.coding.model, turn_tools.len);
+    warnIfPromptCannotFit(trio.coding.base_url, trio.coding.model, turn_tools.len, hist_win);
+    assembleHistory(app, conv_dir, user_text, &conv_buf, ws_packed.varying, hist_win);
     conv_buf.appendSlice(gpa, ws_packed.suffix) catch {};
 
     if (ws_packed.log.len > 0) {
@@ -2302,7 +2307,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     defer {
         // ONE subprocess for the whole batch (observeBatch imports a temp pack) instead of a neuron.exe spawn
         // per note — a tool-heavy turn used to pay dozens of serialized ~300ms launches on its tail.
-        _ = ctx.mem.observeBatch(mem_scope, tool_obs.items);
+        memBank(app, &ctx, mem_scope, tool_obs.items);
         for (tool_obs.items) |note| gpa.free(note);
         tool_obs.deinit(gpa);
     }
@@ -2645,25 +2650,51 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
         // progress fact pairing the step's language with the engine-observed effect — the lexical thread
         // that lets a later step's recall hop from "what am I doing" to "what already happened here".
         // Mechanical composition (step text + ledger delta), batched via tool_obs like every other note.
-        if (file_ledger.mutations > mut_before and tool_obs.items.len < 200) {
+        // NOT FILE-GATED ANY MORE. This block used to require `file_ledger.mutations > mut_before`, which meant
+        // a step banked a trajectory fact only if it WROTE something. Research, debugging, reading and deciding
+        // banked nothing — and that is precisely the class of work with no other durable home: the file ledger
+        // records only files, and the confabulation rule (correctly) forbids observing the assistant's own reply.
+        // So the work least recoverable from anywhere else was the work never written down, and a later turn
+        // whose window had rolled past it saw the original goal with no evidence any of it had happened.
+        //
+        // The flush was nested INSIDE the same condition, so a research-heavy turn also never populated its
+        // partition mid-turn and every step's weave recall abstained for the whole turn.
+        //
+        // What gets banked is still an ENGINE-OBSERVED EVENT, never a model claim: either the ledger delta this
+        // step actually landed, or the tools it actually ran. Nothing here records what the model SAID it did.
+        if (drive > 0 and tool_obs.items.len < 200) {
             const step_label: []const u8 = if (task_idx) |ti| plan[ti].text else if (prev_drive.len > 0) prev_drive else user_text;
-            var tail_buf: [220]u8 = undefined;
-            var tl: usize = 0;
-            const from = file_ledger.files.items.len -| 4;
-            for (file_ledger.files.items[from..]) |f| {
-                const add = std.fmt.bufPrint(tail_buf[tl..], "{s} ", .{f.path}) catch break;
-                tl += add.len;
+            const landed = file_ledger.mutations - mut_before;
+            if (landed > 0) {
+                var tail_buf: [220]u8 = undefined;
+                var tl: usize = 0;
+                const from = file_ledger.files.items.len -| 4;
+                for (file_ledger.files.items[from..]) |f| {
+                    const add = std.fmt.bufPrint(tail_buf[tl..], "{s} ", .{f.path}) catch break;
+                    tl += add.len;
+                }
+                // "this turn": file_ledger.mutations is turn-local (a fresh FileLedger each turn) while
+                // .files is conversation-cumulative — phrasing this as a conversation total would be a lie.
+                if (std.fmt.allocPrint(gpa, "progress: step \"{s}\" landed {d} file change(s) this turn — {s}", .{ clipBytes(step_label, 140), landed, tail_buf[0..tl] })) |note| {
+                    atomizeNoteInPlace(note);
+                    tool_obs.append(gpa, note) catch gpa.free(note);
+                } else |_| {}
+            } else if (inner.tools_ran) {
+                // NON-FILE WORK: the step ran tools and settled without writing. The findings themselves are
+                // already queued as their own notes; this one records that the step HAPPENED and what it was
+                // about, so a later recall can hop from "what am I doing" to "this was already looked into"
+                // instead of finding nothing and starting the investigation over.
+                if (std.fmt.allocPrint(gpa, "progress: step \"{s}\" ran tools and settled without writing files this turn", .{clipBytes(step_label, 140)})) |note| {
+                    atomizeNoteInPlace(note);
+                    tool_obs.append(gpa, note) catch gpa.free(note);
+                } else |_| {}
             }
-            if (std.fmt.allocPrint(gpa, "progress: step \"{s}\" landed {d} file change(s) — {s}", .{ clipBytes(step_label, 140), file_ledger.mutations - mut_before, tail_buf[0..tl] })) |note| {
-                atomizeNoteInPlace(note);
-                tool_obs.append(gpa, note) catch gpa.free(note);
-            } else |_| {}
             // MID-TURN FLUSH (thread the loom NOW): populate the conversation's neuron-db partition after a
-            // step that landed work (one batched spawn) so the NEXT step's weave recall can surface what
-            // this step just did and learned. Without it the partition stayed empty until turn exit and
-            // every step's conv recall abstained — the within-turn threads never existed.
+            // step (one batched spawn) so the NEXT step's weave recall can surface what this step just did and
+            // learned. Without it the partition stayed empty until turn exit and every step's conv recall
+            // abstained — the within-turn threads never existed.
             if (tool_obs.items.len > 0) {
-                _ = ctx.mem.observeBatch(mem_scope, tool_obs.items);
+                memBank(app, &ctx, mem_scope, tool_obs.items);
                 for (tool_obs.items) |n2| gpa.free(n2);
                 tool_obs.clearRetainingCapacity();
             }
@@ -3133,7 +3164,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     // desk stays in its rendering state until {done}, so it naturally waits for this rather than sending early. Only
     // this path refreshes; Stop/error/empty end promptly via finishTurn (and the summary catches up next turn).
     emitUsage(app, conv_dir, usage_t0);
-    refreshSummary(app, conv_dir, llm_dir, think.base_url, think.key, think.model);
+    refreshSummary(app, conv_dir, llm_dir, think.base_url, think.key, think.model, hist_win);
     emitEvent(app, conv_dir, "{\"kind\":\"done\"}");
 }
 
@@ -3816,6 +3847,29 @@ fn continuationShaped(text: []const u8) bool {
     }
     return false;
 }
+
+/// Bank a batch of ENGINE-OBSERVED facts into neuron-db, and notice when they do not land.
+///
+/// Every deposit site used to discard the return (`_ = ctx.mem.observeBatch(...)`), so a store that was absent,
+/// tamper-tripped, or erroring looked exactly like a healthy one with nothing to say. That silence is not a
+/// cosmetic gap: the compaction path drops bytes out of the context window on the stated grounds that older
+/// detail "already lives in neuron-db recall", so a store that quietly accepts nothing turns a bounded context
+/// into permanent data loss with no alarm attached — which is how it stayed dead long enough to be designed
+/// around.
+///
+/// The shortfall is measured, not the zero. observeBatch also returns 0 when every note was rejected by the fact
+/// hygiene filter (too few identifying characters to be a usable memory), which is ordinary and not a fault, so
+/// comparing `stored` against `queued` is what distinguishes "nothing worth keeping" from "nothing got through".
+/// The message deliberately says only that the store did not accept the records: never the database path, and
+/// never the state of the tamper tripwire, which would make this a probe for it.
+fn memBank(app: *App, ctx: *tools.ToolCtx, scope: []const u8, notes: []const []const u8) void {
+    _ = app;
+    if (notes.len == 0) return;
+    const stored = ctx.mem.observeBatch(scope, notes);
+    if (stored >= notes.len) return;
+    memlog.warn("memory: the store accepted {d} of {d} record(s) queued this step — recall will be thinner than the context that was dropped for it", .{ stored, notes.len });
+}
+const memlog = std.log.scoped(.chatmem);
 
 /// Does this call's outcome count toward the same-tool FAILURE STREAK (the nudge at 2, the arbiter at 3)?
 ///
@@ -6869,6 +6923,68 @@ test "the live served window is read for the built-in engine and for nothing els
     // while the built-in, told the truth about a 9216-token window, tightens below it
     try std.testing.expect(workingBudgetBytes("http://127.0.0.1:8791/builtin/v1", "the-veil-12b", 20_000) < cctx.WORKING_COMPACT_BYTES);
 }
+/// Floor for the scaled recency window. Below this a turn cannot see its own immediate past — the last question
+/// and its answer — and the model re-asks what it just resolved, so shrinking past it trades one context failure
+/// for a worse one.
+const HISTORY_WINDOW_MIN_BYTES: usize = 8 * 1024;
+/// Measured size of the assembled system blocks (SYSTEM_PROMPT_COMPACT measures ~2.8 KB; the full prompt and the
+/// per-turn directives push it to roughly this). An estimate, used only to size a budget DOWN.
+const SYSTEM_BLOCKS_EST_BYTES: usize = 3 * 1024;
+
+/// Bytes of RECENCY WINDOW that may be replayed, for a prompt CONSUMED by `model` at `base_url`.
+///
+/// cctx.HISTORY_WINDOW_BYTES is a flat 28 KiB written against a 32k-token model, and nothing ever related it to
+/// the window actually being served. On the built-in 12B serving 8192 tokens (~24.5 KB at the pessimistic 3
+/// bytes/token this file uses elsewhere) the replayed history ALONE is larger than the entire context, so the
+/// prompt is over the line before a single tool result — the provider rejects it outright (`in:0, out:0`) and the
+/// turn surfaces as "(no reply — the model returned an empty or malformed response this turn)".
+///
+/// HONEST ABOUT WHAT THIS DOES NOT FIX: on that same 12B the rest of the prefix — tool schemas (~13 KB, the
+/// dominant term and larger than everything else combined), the injected summary, the goal pin, and the output
+/// reserve — already exceeds the window with a ZERO-byte history. So this returns its floor there and the prompt
+/// still does not fit. Scaling the window is necessary and not sufficient; closing the remainder means serving a
+/// smaller tool belt to tiny windows, which is a product decision, not a budgeting one. The caller logs the
+/// shortfall so that overflow is diagnosed rather than silent.
+///
+/// `tools_bytes` is the REAL serialized tool array, never a tier estimate — the belt already varies with recipe
+/// grants and plugin schemas, and estimating it would overflow on exactly the turns that granted something.
+///
+/// Quantized DOWN to 4 KiB: `covered` persists across turns, so a window that wobbled by a few hundred bytes
+/// because the belt gained one grant would re-open an uncovered band every time it shrank.
+fn historyWindowBytes(base_url: []const u8, model: []const u8, tools_bytes: usize) usize {
+    const local = std.mem.indexOf(u8, base_url, "127.0.0.1") != null or
+        std.mem.indexOf(u8, base_url, "localhost") != null;
+    const win_tokens: usize = servingWindowTokens(base_url) orelse
+        @as(usize, modelcfg.senseModel(model, local).ctx_k) * 1024;
+    const win_bytes = win_tokens * 3; // same deliberate pessimism as workingBudgetBytes — under-estimate and fold early
+    // everything the prompt must hold before one byte of replayed history
+    const other = SYSTEM_BLOCKS_EST_BYTES + (cctx.SUMMARY_INJECT_CAP + 256) + cctx.GOAL_PIN_CAP +
+        turnOutputReserveBytes + tools_bytes + WORKING_MIN_BUDGET_BYTES;
+    if (win_bytes <= other) return HISTORY_WINDOW_MIN_BYTES;
+    const avail = win_bytes - other;
+    if (avail >= cctx.HISTORY_WINDOW_BYTES) return cctx.HISTORY_WINDOW_BYTES; // roomy: today's behaviour, byte-identical
+    return @max(HISTORY_WINDOW_MIN_BYTES, (avail / (4 * 1024)) * (4 * 1024));
+}
+
+/// Say so when the assembled prompt cannot fit the served window even at the smallest history this engine will
+/// replay. Until now that condition produced no signal at all: the request went out, the provider rejected it
+/// whole, and the turn ended "(no reply — the model returned an empty or malformed response this turn)" — a
+/// message that describes the model as having misbehaved when in fact it was never given a prompt it could read.
+/// One line naming the shortfall and the term responsible turns a mystery into arithmetic.
+fn warnIfPromptCannotFit(base_url: []const u8, model: []const u8, tools_bytes: usize, hist_win: usize) void {
+    const local = std.mem.indexOf(u8, base_url, "127.0.0.1") != null or
+        std.mem.indexOf(u8, base_url, "localhost") != null;
+    const win_tokens: usize = servingWindowTokens(base_url) orelse
+        @as(usize, modelcfg.senseModel(model, local).ctx_k) * 1024;
+    const win_bytes = win_tokens * 3;
+    const need = SYSTEM_BLOCKS_EST_BYTES + (cctx.SUMMARY_INJECT_CAP + 256) + cctx.GOAL_PIN_CAP +
+        turnOutputReserveBytes + tools_bytes + WORKING_MIN_BUDGET_BYTES + hist_win;
+    if (need <= win_bytes) return;
+    memlog.warn("context: this turn's prompt needs ~{d} KB but {s} serves ~{d} KB — over by ~{d} KB with history already at its {d} KB floor; the tool schemas alone are ~{d} KB. Expect the provider to reject the request (it surfaces as an empty reply).", .{
+        need / 1024, model, win_bytes / 1024, (need - win_bytes) / 1024, hist_win / 1024, tools_bytes / 1024,
+    });
+}
+
 fn workingBudgetBytes(base_url: []const u8, model: []const u8, fixed_bytes: usize) usize {
     const local = std.mem.indexOf(u8, base_url, "127.0.0.1") != null or
         std.mem.indexOf(u8, base_url, "localhost") != null;
@@ -8617,18 +8733,22 @@ fn dropEngineRows(dest: []u8, span: []const u8) []const u8 {
 /// of turns that have scrolled out of the recency window, the pinned original goal, and the recency window itself.
 /// Replaces "replay the whole transcript". Best-effort: any read/parse/summary failure degrades to less context,
 /// never a crash — the turn still runs on the system prompt + recall + whatever seeded.
-fn assembleHistory(app: *App, conv_dir: []const u8, user_text: []const u8, conv_buf: *std.ArrayListUnmanaged(u8), varying_frag: []const u8) void {
+fn assembleHistory(app: *App, conv_dir: []const u8, user_text: []const u8, conv_buf: *std.ArrayListUnmanaged(u8), varying_frag: []const u8, win_bytes: usize) void {
     const gpa = app.gpa;
     const mpath = std.fmt.allocPrint(gpa, "{s}/messages.jsonl", .{conv_dir}) catch return;
     defer gpa.free(mpath);
 
     const head_buf = gpa.alloc(u8, cctx.HEAD_READ_BYTES) catch return;
     defer gpa.free(head_buf);
-    const tail_buf = gpa.alloc(u8, cctx.HISTORY_WINDOW_BYTES) catch return;
+    // `win_bytes` — NOT cctx.HISTORY_WINDOW_BYTES. This allocation is the ONLY thing that sizes the window:
+    // computeView ignores its window_bytes argument entirely and derives everything from the tail slice it is
+    // handed. refreshSummary must allocate the SAME size or the two disagree about where the window starts, and
+    // the band between them belongs to neither the summary nor the replay — see historyWindowBytes.
+    const tail_buf = gpa.alloc(u8, win_bytes) catch return;
     defer gpa.free(tail_buf);
 
     const ht = cctx.readHeadTail(app.io, mpath, head_buf, tail_buf) orelse return; // no history yet → nothing to seed
-    const view = cctx.computeView(ht.head, ht.tail, ht.size, cctx.HISTORY_WINDOW_BYTES);
+    const view = cctx.computeView(ht.head, ht.tail, ht.size, win_bytes);
 
     // ROLLING SUMMARY: when older turns have scrolled past the recency window, inject the condensed running summary
     // of them so continuity survives beyond the window + relevance recall. CRITICAL PATH: only the PERSISTED summary
@@ -8660,7 +8780,8 @@ fn assembleHistory(app: *App, conv_dir: []const u8, user_text: []const u8, conv_
 
     // SAFETY NET: an EMPTY window means the newest line (the just-appended current user message) is itself larger
     // than the recency window and fell out — so the live question would ride only on the fallible rolling summary
-    // (and be lost entirely if that summary call fails or the message exceeds SUMMARY_SPAN_CAP). Seed the current
+    // (and be delayed for turns if that summary call fails, since the catch-up drains at most
+    // SUMMARY_CHUNKS_PER_TURN per completed turn). Seed the current
     // message verbatim (clipped) so the model always sees the actual question it must answer.
     if (view.window.len == 0) appendMsgObj(gpa, conv_buf, "user", user_text, cctx.CURRENT_MSG_PIN_CAP);
 }
@@ -8694,16 +8815,20 @@ fn loadSummary(app: *App, conv_dir: []const u8) []u8 {
 /// which is the whole point. Re-reads the (now-grown) transcript for a fresh view. Best-effort: any failure leaves
 /// the prior summary intact (the next turn retries). The ctxsum LLM call runs OUTSIDE the context.json lock so it
 /// never blocks a concurrent loadSummary; two overlapping refreshes just race to persist and the later (wider) wins.
-fn refreshSummary(app: *App, conv_dir: []const u8, run_root: []const u8, base_url: []const u8, key: []const u8, model: []const u8) void {
+fn refreshSummary(app: *App, conv_dir: []const u8, run_root: []const u8, base_url: []const u8, key: []const u8, model: []const u8, win_bytes: usize) void {
     const gpa = app.gpa;
     const mpath = std.fmt.allocPrint(gpa, "{s}/messages.jsonl", .{conv_dir}) catch return;
     defer gpa.free(mpath);
     const head_buf = gpa.alloc(u8, cctx.HEAD_READ_BYTES) catch return;
     defer gpa.free(head_buf);
-    const tail_buf = gpa.alloc(u8, cctx.HISTORY_WINDOW_BYTES) catch return;
+    // MUST match assembleHistory's tail_buf exactly (see historyWindowBytes). base_url/key/model above are the
+    // SUMMARIZING model; `win_bytes` is sized for the model that CONSUMES the assembled prompt. On the common
+    // single-provider setup those are the same model and the distinction is invisible — which is exactly why
+    // sizing the window from the parameters already here would be a bug that never showed up in testing.
+    const tail_buf = gpa.alloc(u8, win_bytes) catch return;
     defer gpa.free(tail_buf);
     const ht = cctx.readHeadTail(app.io, mpath, head_buf, tail_buf) orelse return;
-    const view = cctx.computeView(ht.head, ht.tail, ht.size, cctx.HISTORY_WINDOW_BYTES);
+    const view = cctx.computeView(ht.head, ht.tail, ht.size, win_bytes);
     if (!view.gap) return; // the window still covers everything → nothing has dropped that needs summarizing
 
     const cpath = std.fmt.allocPrint(gpa, "{s}/context.json", .{conv_dir}) catch return;
@@ -8729,26 +8854,57 @@ fn refreshSummary(app: *App, conv_dir: []const u8, run_root: []const u8, base_ur
 
     // is there newly-dropped history to fold in? the summary should cover [goal_end, window_start)
     const target = view.window_start;
-    const span_from = @max(covered, view.goal_end);
-    if (target <= span_from) return; // already covered → nothing to do
+    var cursor = @max(covered, view.goal_end);
+    if (target <= cursor) return; // already covered → nothing to do
 
-    const span_buf = gpa.alloc(u8, cctx.SUMMARY_SPAN_CAP) catch return;
+    const span_buf = gpa.alloc(u8, cctx.SUMMARY_CHUNK_BYTES) catch return;
     defer gpa.free(span_buf);
-    const raw_span = cctx.readSpanTailTrimmed(app.io, mpath, span_from, target, span_buf) orelse return;
-    // engine stop-notes are per-turn machine events, never durable narrative — see dropEngineRows
-    const span = dropEngineRows(span_buf, raw_span);
-    if (span.len == 0) return;
 
-    const updated = summarizeInto(app, run_root, base_url, key, model, summary, span) orelse return; // LLM call, no lock held
-    defer gpa.free(updated);
-    ctx_json_mtx.lockUncancelable(app.io);
-    defer ctx_json_mtx.unlock(app.io);
-    persistSummary(app, cpath, target, updated); // best-effort
+    // OLDEST-FIRST CATCH-UP. Fold [cursor, target) forward one line-aligned chunk at a time, persisting after
+    // EACH one, so `covered` only ever names bytes a summarizer actually read.
+    //
+    // The single shot this replaces read the NEWEST 256 KiB of the span and then persisted covered = target
+    // regardless of how much it had read. Everything older was discarded AND marked covered: absent from the
+    // window, absent from the summary, and unreachable by any later pass. That is silent permanent deletion
+    // reported as success, and it is what made a long chat lose its own middle and start the work over.
+    //
+    // Bounded per turn because this runs before the {done} frame and inside the conversation's turn slot; the
+    // next completed turn resumes at exactly this cursor. A `break` leaves the cursor un-advanced and
+    // un-persisted, so a failed chunk is retried rather than skipped.
+    var chunks: usize = 0;
+    while (cursor < target and chunks < cctx.SUMMARY_CHUNKS_PER_TURN) : (chunks += 1) {
+        const hs = cctx.readSpanHeadTrimmed(app.io, mpath, cursor, target, span_buf) orelse break;
+        // Take `next` BEFORE dropEngineRows: it compacts IN PLACE into span_buf, so hs.bytes.len afterwards is
+        // the filtered length, not the file bytes consumed. Advancing the ledger by that would skip real records.
+        const next = cursor + hs.consumed;
+        // engine stop-notes are per-turn machine events, never durable narrative — see dropEngineRows
+        const span = dropEngineRows(span_buf, hs.bytes);
+        if (span.len == 0) {
+            // The whole chunk was engine notes. Nothing to summarize, but these bytes ARE accounted for — the
+            // old code's bare `return` here would pin the cursor and stall every later catch-up behind it.
+            ctx_json_mtx.lockUncancelable(app.io);
+            defer ctx_json_mtx.unlock(app.io);
+            persistSummary(app, cpath, next, summary);
+            cursor = next;
+            continue;
+        }
+        const updated = summarizeInto(app, run_root, base_url, key, model, summary, span, hs.clipped) orelse break; // LLM call, NO lock held
+        if (summary.len > 0) gpa.free(summary); // the fold REPLACES the prior summary...
+        summary = updated; // ...and becomes the next chunk's prior summary; the outer defer frees the last one
+        {
+            // Lock only around the file write — never across the completion above, which would block the next
+            // turn's loadSummary for as long as the model takes.
+            ctx_json_mtx.lockUncancelable(app.io);
+            defer ctx_json_mtx.unlock(app.io);
+            persistSummary(app, cpath, next, summary); // covered advances ONLY over bytes just summarized
+        }
+        cursor = next;
+    }
 }
 
 /// One no-tools completion that rewrites the running summary to incorporate a span of just-dropped messages.
 /// gpa-owned new summary (clipped) or null on failure. Kept deterministic (low temp) and short.
-fn summarizeInto(app: *App, run_root: []const u8, base_url: []const u8, key: []const u8, model: []const u8, prior_summary: []const u8, span_json: []const u8) ?[]u8 {
+fn summarizeInto(app: *App, run_root: []const u8, base_url: []const u8, key: []const u8, model: []const u8, prior_summary: []const u8, span_json: []const u8, clipped: bool) ?[]u8 {
     const gpa = app.gpa;
     var msgs: std.ArrayListUnmanaged(u8) = .empty;
     defer msgs.deinit(gpa);
@@ -8761,6 +8917,9 @@ fn summarizeInto(app: *App, run_root: []const u8, base_url: []const u8, key: []c
     uc.appendSlice(gpa, if (prior_summary.len > 0) prior_summary else "(none yet)") catch return null;
     uc.appendSlice(gpa, "\n\nOlder conversation messages now scrolling out of the live window (JSON lines, oldest to newest):\n") catch return null;
     uc.appendSlice(gpa, span_json) catch return null;
+    // A chunk cut mid-record (one stored line longer than the chunk) ends in a fragment. Say so, or the model
+    // summarizes half a message as a whole one and states its truncated content as fact.
+    if (clipped) uc.appendSlice(gpa, "\n(The LAST record above is CUT OFF mid-message — summarize only what is actually there, and do not infer how it ends.)") catch return null;
     uc.appendSlice(gpa, "\n\nRewrite the running summary to incorporate these messages. Keep it under 250 words.") catch return null;
     http.jstr(gpa, &msgs, uc.items) catch return null;
     msgs.append(gpa, '}') catch return null;
@@ -8837,7 +8996,7 @@ fn compactWorking(app: *App, run_root: []const u8, base_url: []const u8, key: []
     // assoc recall can bring it back the moment a later step needs it. Without this, a compacted finding
     // was unreachable for the REST OF THE TURN: gone from the window, not yet in memory.
     if (tool_obs.items.len > 0) {
-        _ = ctx.mem.observeBatch(ctx.scope, tool_obs.items);
+        memBank(app, ctx, ctx.scope, tool_obs.items);
         for (tool_obs.items) |note| gpa.free(note);
         tool_obs.clearRetainingCapacity();
     }
@@ -9041,6 +9200,27 @@ test "a meta-question about the run is never mistaken for the goal" {
     try std.testing.expect(!metaQuestionShaped(""));
     // a real instruction is never swallowed, which is what the tier-0/1 caution is about
     try std.testing.expect(!metaQuestionShaped("continue"));
+}
+
+test "the recency window is sized to the model that CONSUMES the prompt, and never below its floor" {
+    const t = std.testing;
+    // A roomy hosted model keeps today's behaviour byte-for-byte — this must not perturb anything that works.
+    try t.expectEqual(cctx.HISTORY_WINDOW_BYTES, historyWindowBytes("https://api.anthropic.com/v1", "claude-opus-4-8", 13 * 1024));
+    try t.expectEqual(cctx.HISTORY_WINDOW_BYTES, historyWindowBytes("https://api.example.com", "deepseek-v4-pro", 8 * 1024));
+
+    // A small local window tightens rather than replaying 28 KB into a context that cannot hold it.
+    const tight = historyWindowBytes("http://127.0.0.1:11434", "the-veil-12b", 13 * 1024);
+    try t.expect(tight < cctx.HISTORY_WINDOW_BYTES);
+    try t.expect(tight >= HISTORY_WINDOW_MIN_BYTES); // never below the floor: a turn must see its own last exchange
+    try t.expectEqual(@as(usize, 0), tight % (4 * 1024)); // quantized, so a one-grant belt change cannot wobble it
+
+    // A bigger tool belt leaves less room for history — the belt is the dominant term on a small window.
+    const lean = historyWindowBytes("http://127.0.0.1:11434", "the-veil-12b", 2 * 1024);
+    const fat = historyWindowBytes("http://127.0.0.1:11434", "the-veil-12b", 20 * 1024);
+    try t.expect(lean >= fat);
+
+    // Pathological input must not underflow into a huge window (the failure that would replay the whole file).
+    try t.expect(historyWindowBytes("http://127.0.0.1:11434", "the-veil-12b", 10 * 1024 * 1024) == HISTORY_WINDOW_MIN_BYTES);
 }
 
 test "the loop-stop and escalation thresholds leave a round for the arbiter to be READ" {
