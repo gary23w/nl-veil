@@ -35,10 +35,26 @@ pub const CURRENT_MSG_PIN_CAP: usize = 64 * 1024;
 /// The rolling summary injected into context is clipped to this (a runaway summary is still bounded).
 pub const SUMMARY_INJECT_CAP: usize = 6 * 1024;
 
-/// Max middle-span bytes fed to ONE summary update. If the newly-dropped span exceeds this (e.g. the first time a
-/// long chat rolls past the window), only the newest SUMMARY_SPAN_CAP of the span is summarized — the closest-to-
-/// window history is the most relevant, and older detail already lives in neuron-db recall.
-pub const SUMMARY_SPAN_CAP: usize = 256 * 1024;
+/// Max bytes fed to ONE summary-update completion.
+///
+/// This replaces a 256 KiB cap that was applied to the NEWEST end of the uncovered span, with the older remainder
+/// discarded and the coverage cursor advanced past it anyway. The justification given was that "older detail
+/// already lives in neuron-db recall" — but recall never held the assistant's own record of the work (the
+/// confabulation rule forbids observing assistant replies), so the discarded span was the one thing nothing else
+/// retained. A long chat quietly lost its own middle and, seeing the original goal with no evidence of progress,
+/// correctly started over.
+///
+/// The span is now drained oldest-first in chunks this size (see readSpanHeadTrimmed), so nothing is dropped —
+/// only deferred. Sized at ~one recency window: with the prior summary (<= SUMMARY_INJECT_CAP) and the prompt,
+/// one chunk is ~10k tokens, which fits any model the thinking role plausibly runs on. 256 KiB was ~64k tokens in
+/// a single request; under oldest-first draining, a request the model always rejects is a cursor that never moves.
+pub const SUMMARY_CHUNK_BYTES: usize = 32 * 1024;
+
+/// Chunks one COMPLETED turn folds in. The catch-up runs on the turn thread before the {done} frame and inside
+/// the per-conversation turn slot, so each chunk is post-answer latency the user waits through and a window in
+/// which the next post for this conversation is refused as busy. Three (~96 KiB of backlog per completed turn)
+/// drains a normal gap immediately and a pathological one over a handful of turns.
+pub const SUMMARY_CHUNKS_PER_TURN: usize = 3;
 
 /// In-turn working growth (assistant tool_call turns + full tool results appended during the loop) beyond the
 /// assembled base before the caller compacts it into a progress note. Lets an afk turn run long without the
@@ -77,25 +93,50 @@ pub fn readHeadTail(io: std.Io, path: []const u8, head_buf: []u8, tail_buf: []u8
     return .{ .head = head_buf[0..head_n], .tail = tail_buf[0..tail_n], .size = size };
 }
 
-/// Read the NEWEST bytes of the file span [from, to) into buf, then trim any leading partial line so the result
-/// begins on a clean JSON-line boundary. If the span is larger than buf, only its newest buf.len bytes are read
-/// (older detail is covered by recall / the prior summary). Returns null on error / empty / degenerate span.
-pub fn readSpanTailTrimmed(io: std.Io, path: []const u8, from: usize, to: usize, buf: []u8) ?[]const u8 {
-    if (to <= from) return null;
-    const start: usize = if (to - from > buf.len) to - buf.len else from;
-    const want = to - start; // <= buf.len
+/// One line-aligned chunk taken from the OLDEST end of an uncovered span. See readSpanHeadTrimmed.
+pub const HeadSpan = struct {
+    /// Bytes read starting EXACTLY at `from` (never front-trimmed), ending just past a '\n' unless `clipped`.
+    bytes: []const u8,
+    /// File bytes accounted for — always == bytes.len and always >= 1. `from + consumed` is the caller's next
+    /// `covered`: the ledger advances by this and by nothing else.
+    consumed: usize,
+    /// The chunk had to be cut mid-record: one stored line is longer than `buf`. The remainder is NOT lost — the
+    /// next call resumes at `from + consumed`, mid-line, and re-aligns at that line's '\n'. The flag exists so the
+    /// summarizer can be told the last record it sees is a fragment rather than a whole message.
+    clipped: bool,
+};
+
+/// Read the OLDEST bytes of the span [from, to) into `buf`, trimmed BACK to end on a clean line boundary.
+///
+/// This replaced a tail-reading twin, and the direction is the whole point. That one kept the NEWEST bytes of an
+/// oversized span and silently discarded the older remainder — safe only if the caller then admitted it had
+/// covered less than it asked for. The caller did the opposite, advancing its `covered` cursor to the far end of a
+/// span it had only partly read, so everything older than the cap was discarded AND marked summarized: absent from
+/// the window, absent from the summary, and unreachable by any later pass. Reading from the OLDEST end instead
+/// lets the caller advance `covered` by exactly `consumed` and come back for the rest, so a long backlog drains
+/// over several turns instead of collapsing in one lossy jump.
+///
+/// `from` is a boundary the caller already owns (a prior `covered`, or goal_end), so nothing is trimmed off the
+/// FRONT — front-trimming here would re-introduce the silent drop this exists to remove. Returns null on read
+/// error or a degenerate span; on every non-null return `consumed >= 1`, so `from += consumed` cannot spin.
+pub fn readSpanHeadTrimmed(io: std.Io, path: []const u8, from: usize, to: usize, buf: []u8) ?HeadSpan {
+    if (to <= from or buf.len == 0) return null;
+    const want = @min(to - from, buf.len);
     const f = std.Io.Dir.cwd().openFile(io, path, .{}) catch return null;
     defer f.close(io);
-    const n = f.readPositionalAll(io, buf[0..want], start) catch return null;
+    const n = f.readPositionalAll(io, buf[0..want], from) catch return null;
+    if (n == 0) return null; // truncated or racing file — consumed==0 would spin the caller's loop
     const raw = buf[0..n];
-    // The caller passes `from` as a clean line boundary (a prior window_start / goal_end). We only skip bytes when
-    // the span exceeded the cap (start > from) — THEN the read likely began mid-line, so drop to the first
-    // newline. When start == from the first line is already whole and must NOT be trimmed.
-    if (start > from) {
-        if (std.mem.indexOfScalar(u8, raw, '\n')) |nl| return raw[nl + 1 ..];
-        return null; // one giant partial line, no boundary — nothing clean to summarize
-    }
-    return raw;
+    // Reached the span's end. `to` is itself a line boundary (a computeView window_start), so this read is already
+    // whole — trimming here would drop the final line and pin `covered` one record short of the truth, forever.
+    if (from + n >= to) return .{ .bytes = raw, .consumed = n, .clipped = false };
+    // Cut short by the cap, so the read almost certainly ends mid-line: trim back to just past the last newline.
+    if (std.mem.lastIndexOfScalar(u8, raw, '\n')) |nl| return .{ .bytes = raw[0 .. nl + 1], .consumed = nl + 1, .clipped = false };
+    // NO newline anywhere in a full buffer: ONE record is longer than the chunk. Returning null here would pin
+    // `covered` and re-read this same record every turn forever. Consume what was read — the summarizer sees a
+    // truncated record, which is honest and bounded — and say it was cut. `covered` then sits mid-line, which is
+    // self-healing: the next chunk starts mid-record and re-aligns at that record's newline.
+    return .{ .bytes = raw, .consumed = n, .clipped = true };
 }
 
 // --------------------------------------------------------------------------------------- recency-window view
@@ -609,7 +650,7 @@ test "estTokens: rough proxy divides by BYTES_PER_TOKEN" {
     try std.testing.expectEqual(@as(usize, 0), estTokens(3));
 }
 
-test "readHeadTail + readSpanTailTrimmed: positioned reads over a temp file" {
+test "readHeadTail + readSpanHeadTrimmed: positioned reads over a temp file" {
     const gpa = std.testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -630,12 +671,63 @@ test "readHeadTail + readSpanTailTrimmed: positioned reads over a temp file" {
     try std.testing.expect(ht.tail.len == 40); // filled the small tail buffer
     try std.testing.expectEqualStrings(content[content.len - 40 ..], ht.tail);
 
-    // read the span covering the middle line region and trim to a clean boundary
+    // read the span covering the middle line region; it ends on a clean boundary and reports what it consumed
     const first_nl = std.mem.indexOfScalar(u8, content, '\n').?;
     const second_nl = std.mem.indexOfScalarPos(u8, content, first_nl + 1, '\n').?;
     var span_buf: [200]u8 = undefined;
-    const span = readSpanTailTrimmed(io, path, first_nl + 1, second_nl + 1, &span_buf) orelse return error.NoSpan;
-    try std.testing.expectEqualStrings(content[first_nl + 1 .. second_nl + 1], span);
+    const span = readSpanHeadTrimmed(io, path, first_nl + 1, second_nl + 1, &span_buf) orelse return error.NoSpan;
+    try std.testing.expectEqualStrings(content[first_nl + 1 .. second_nl + 1], span.bytes);
+    try std.testing.expectEqual(span.bytes.len, span.consumed);
+    try std.testing.expect(!span.clipped);
+}
+
+test "the summary cursor advances by bytes actually read, and can never stall" {
+    // The ledger contract, which is the whole fix: `covered` moves by `consumed` and by nothing else, and every
+    // non-null return consumes at least one byte. A helper that could return 0 — or that front-trimmed, the way
+    // the tail-reading version silently did when a span overflowed its buffer — either spins the catch-up loop
+    // forever or drops records the cursor then claims to have covered.
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const path = "zig-chatctx-head-tmp.jsonl";
+    const dir = std.Io.Dir.cwd();
+    const content = "{\"a\":1}\n{\"b\":2}\n{\"c\":3}\n";
+    try dir.writeFile(io, .{ .sub_path = path, .data = content });
+    defer dir.deleteFile(io, path) catch {};
+
+    // A chunk smaller than the span stops on a line boundary — never mid-record, never front-trimmed.
+    var small: [12]u8 = undefined;
+    const c1 = readSpanHeadTrimmed(io, path, 0, content.len, &small) orelse return error.NoSpan;
+    try std.testing.expectEqualStrings("{\"a\":1}\n", c1.bytes); // NOT the newest bytes — the OLDEST
+    try std.testing.expectEqual(@as(usize, 8), c1.consumed);
+    try std.testing.expect(!c1.clipped);
+
+    // Draining the whole file is lossless: every byte is consumed exactly once, in order.
+    var cursor: usize = 0;
+    var seen: std.ArrayListUnmanaged(u8) = .empty;
+    defer seen.deinit(gpa);
+    var guard: usize = 0;
+    while (cursor < content.len and guard < 100) : (guard += 1) {
+        const c = readSpanHeadTrimmed(io, path, cursor, content.len, &small) orelse break;
+        try std.testing.expect(c.consumed >= 1); // the anti-stall invariant
+        try seen.appendSlice(gpa, c.bytes);
+        cursor += c.consumed;
+    }
+    try std.testing.expectEqual(content.len, cursor);
+    try std.testing.expectEqualStrings(content, seen.items); // nothing dropped, nothing duplicated
+
+    // A single record LONGER than the chunk must still make progress rather than pin the cursor forever.
+    const longline = "{\"x\":\"" ++ "y" ** 64 ++ "\"}\n";
+    try dir.writeFile(io, .{ .sub_path = path, .data = longline });
+    const big = readSpanHeadTrimmed(io, path, 0, longline.len, &small) orelse return error.NoSpan;
+    try std.testing.expect(big.clipped); // reported as a fragment so the summarizer is not misled
+    try std.testing.expectEqual(@as(usize, small.len), big.consumed);
+    try std.testing.expect(big.consumed >= 1);
+
+    // degenerate spans yield null rather than a zero-consumed advance
+    try std.testing.expect(readSpanHeadTrimmed(io, path, 5, 5, &small) == null);
+    try std.testing.expect(readSpanHeadTrimmed(io, "zig-chatctx-missing.jsonl", 0, 10, &small) == null);
 }
 
 test "readHeadTail: null on a missing file" {
