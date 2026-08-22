@@ -66,6 +66,11 @@ const EXPECTED = [_]struct { label: []const u8, role: Role, review_gated: bool =
     .{ .label = "summary", .role = .thinking },
     .{ .label = "ctxsum", .role = .thinking },
     .{ .label = "compact", .role = .thinking },
+    // THINKING, beside compact/ctxsum/summary and for the same reason: it distills context rather than
+    // answering the user or writing the next step's prompt. It fires only when the ENGINE cuts a turn, so it
+    // is the coldest labeled call in the file — and also the one whose output the next turn reads first,
+    // which argues for the reasoning model, not the cheap driver.
+    .{ .label = "handoff", .role = .thinking },
     .{ .label = "lesson", .role = .thinking },
     // The sentinel-gated memory-block audit: a JUDGEMENT about whether recalled facts deserve caution,
     // and deliberately the role most likely to be a DIFFERENT model than the coder that will consume
