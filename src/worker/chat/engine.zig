@@ -525,16 +525,18 @@ fn joinDefs(comptime parts: []const []const u8) []const u8 {
 ///
 /// This does NOT remove capability: execute() dispatches the full SCHEMA regardless, so a small model that
 /// names a dropped tool from memory still runs it (knownToolName relies on that).
+// terseSchema over compactSchema: the small tier keeps every verb the belt already served and pays a large
+// model's prose for none of them. See tools.TERSE_DESC — the membership lever is spent, this is the one left.
 const TURN_TOOLS_COMPACT = joinDefs(&.{
-    tools.compactSchema(tools.CHAT_SCHEMA),
-    tools.compactSchema(ORCH_TOOLS),
-    tools.compactSchema(EXTRA_TOOLS),
+    tools.terseSchema(tools.compactSchema(tools.CHAT_SCHEMA)),
+    tools.terseSchema(tools.compactSchema(ORCH_TOOLS)),
+    tools.terseSchema(tools.compactSchema(EXTRA_TOOLS)),
 });
 
 const TURN_TOOLS_SANDBOXED_COMPACT = joinDefs(&.{
-    tools.compactSchema(tools.sandboxSchema(tools.CHAT_SCHEMA)),
-    tools.compactSchema(tools.sandboxSchema(ORCH_TOOLS)),
-    tools.compactSchema(tools.sandboxSchema(EXTRA_TOOLS)),
+    tools.terseSchema(tools.compactSchema(tools.sandboxSchema(tools.CHAT_SCHEMA))),
+    tools.terseSchema(tools.compactSchema(tools.sandboxSchema(ORCH_TOOLS))),
+    tools.terseSchema(tools.compactSchema(tools.sandboxSchema(EXTRA_TOOLS))),
 });
 
 /// Resolve THIS turn's granted recipe set (I3): for an admin (.full) the whole registry; for a sandboxed
@@ -1002,6 +1004,75 @@ test "browser_read projection: EVERY ref survives, boilerplate does not, and non
     const clipped = clipToolResult(gpa, big);
     defer gpa.free(clipped);
     try std.testing.expect(std.mem.indexOf(u8, clipped, "elided from the middle") != null);
+}
+
+test "the terse belt halves the small tier's schema bytes without hiding a single verb" {
+    const gpa = std.testing.allocator;
+    // WHAT THIS PROTECTS: the small tier's belt is what pushes its prompt past an 8k window, and the cheap way
+    // to shrink it — dropping verbs — is the wrong way. The browser four cannot go (worker/run.zig splices the
+    // same comptime filter into every scout mind, and beltDenial needs three to see the family), and hiding
+    // tools from a 12B is the failure the streak-2 nudge exists to paper over. So the bytes come out of the
+    // PROSE, and this test holds that line: same capabilities, far fewer bytes, and no description that
+    // advertises a verb the tier cannot call.
+    var terse: std.ArrayListUnmanaged(u8) = .empty;
+    defer terse.deinit(gpa);
+    try terse.appendSlice(gpa, "[");
+    try terse.appendSlice(gpa, TURN_TOOLS_COMPACT);
+    try terse.appendSlice(gpa, "]");
+    const p = try std.json.parseFromSlice(std.json.Value, gpa, terse.items, .{});
+    defer p.deinit();
+    const defs = p.value.array;
+
+    // EVERY tool the belt served before is still served — the saving costs no capability at all.
+    const must = [_][]const u8{
+        "web_search",       "web_fetch",    "read_file",     "write_file",   "edit_file",
+        "list_dir",         "delete_file",  "run_python",    "run_tests",    "recall",
+        "observe",          "read_doc",     "pixel_search",  "browser_read", "browser_navigate",
+        "browser_click",    "browser_type",
+    };
+    for (must) |name| {
+        var found = false;
+        for (defs.items) |d| {
+            const fnobj = d.object.get("function").?.object;
+            if (std.mem.eql(u8, fnobj.get("name").?.string, name)) found = true;
+        }
+        if (!found) {
+            std.debug.print("terse belt dropped a verb the small tier still needs: {s}\n", .{name});
+            return error.TerseBeltDroppedAVerb;
+        }
+    }
+    try std.testing.expectEqual(must.len, defs.items.len); // and added none
+
+    // NO DESCRIPTION NAMES AN OFF-BELT VERB. Five of the replaced descriptions did (read_url, deep_crawl,
+    // pixel_ingest, pixel_capture, absorb, recall_hive, patch_system) — the belt taught a tier to reach for
+    // tools it cannot call, which burns an agentic round on an unknown-tool refusal every time it lands.
+    const hidden = [_][]const u8{
+        "read_url",  "deep_crawl",  "pixel_ingest", "pixel_capture", "absorb",
+        "recall_hive", "patch_system", "open_subchat", "fetch_json",  "mcp_call",
+    };
+    for (defs.items) |d| {
+        const fnobj = d.object.get("function").?.object;
+        const desc = fnobj.get("description").?.string;
+        for (hidden) |h| if (std.mem.indexOf(u8, desc, h) != null) {
+            std.debug.print("belt description for {s} names off-belt verb {s}\n", .{ fnobj.get("name").?.string, h });
+            return error.BeltDescriptionNamesHiddenVerb;
+        };
+    }
+
+    // The browser workflow a small model skips is taught where it is needed: read yields the refs, and the two
+    // verbs that consume them say so.
+    for (defs.items) |d| {
+        const fnobj = d.object.get("function").?.object;
+        const nm = fnobj.get("name").?.string;
+        if (std.mem.eql(u8, nm, "browser_click") or std.mem.eql(u8, nm, "browser_type"))
+            try std.testing.expect(std.mem.indexOf(u8, fnobj.get("description").?.string, "browser_read") != null);
+    }
+
+    // MATERIALLY SMALLER, and locked so the prose cannot creep back. The pre-terse belt measured 13,489 B.
+    try std.testing.expect(TURN_TOOLS_COMPACT.len < 9 * 1024);
+    try std.testing.expect(TURN_TOOLS_COMPACT.len * 2 < TURN_TOOLS_FULL.len);
+    // the sandboxed twin rides the same projection
+    try std.testing.expect(TURN_TOOLS_SANDBOXED_COMPACT.len < TURN_TOOLS_SANDBOXED.len);
 }
 
 test "compact belt: valid JSON, materially smaller, keeps the core verbs and drops the decoys" {
@@ -6929,7 +7000,14 @@ test "the live served window is read for the built-in engine and for nothing els
 const HISTORY_WINDOW_MIN_BYTES: usize = 8 * 1024;
 /// Measured size of the assembled system blocks (SYSTEM_PROMPT_COMPACT measures ~2.8 KB; the full prompt and the
 /// per-turn directives push it to roughly this). An estimate, used only to size a budget DOWN.
-const SYSTEM_BLOCKS_EST_BYTES: usize = 3 * 1024;
+const SYSTEM_BLOCKS_EST_BYTES: usize = 4 * 1024;
+/// Allowance for the PROMPT WORKSPACE (recall, durable memory, the tool digest, the belt line, the ledger),
+/// which the first cut of this budget omitted entirely — a real error, not a rounding one. workspace.zig budgets
+/// PREFIX 12 KiB + VARYING 8 KiB + SUFFIX 2 KiB = 22.5 KiB of ceiling, and a live turn on this machine admitted
+/// 6,225 B of it. The ceiling is a bound on the pathological stack, not a forecast, so budgeting against it would
+/// peg every small model at the history floor for a stack it will not build; this is the measured-typical figure,
+/// rounded up. It is an ESTIMATE, and it is why warnIfPromptCannotFit reports "~" sizes rather than exact ones.
+const WORKSPACE_EST_BYTES: usize = 8 * 1024;
 
 /// Bytes of RECENCY WINDOW that may be replayed, for a prompt CONSUMED by `model` at `base_url`.
 ///
@@ -6958,8 +7036,8 @@ fn historyWindowBytes(base_url: []const u8, model: []const u8, tools_bytes: usiz
         @as(usize, modelcfg.senseModel(model, local).ctx_k) * 1024;
     const win_bytes = win_tokens * 3; // same deliberate pessimism as workingBudgetBytes — under-estimate and fold early
     // everything the prompt must hold before one byte of replayed history
-    const other = SYSTEM_BLOCKS_EST_BYTES + (cctx.SUMMARY_INJECT_CAP + 256) + cctx.GOAL_PIN_CAP +
-        turnOutputReserveBytes + tools_bytes + WORKING_MIN_BUDGET_BYTES;
+    const other = SYSTEM_BLOCKS_EST_BYTES + WORKSPACE_EST_BYTES + (cctx.SUMMARY_INJECT_CAP + 256) +
+        cctx.GOAL_PIN_CAP + turnOutputReserveBytes + tools_bytes + WORKING_MIN_BUDGET_BYTES;
     if (win_bytes <= other) return HISTORY_WINDOW_MIN_BYTES;
     const avail = win_bytes - other;
     if (avail >= cctx.HISTORY_WINDOW_BYTES) return cctx.HISTORY_WINDOW_BYTES; // roomy: today's behaviour, byte-identical
@@ -6977,8 +7055,8 @@ fn warnIfPromptCannotFit(base_url: []const u8, model: []const u8, tools_bytes: u
     const win_tokens: usize = servingWindowTokens(base_url) orelse
         @as(usize, modelcfg.senseModel(model, local).ctx_k) * 1024;
     const win_bytes = win_tokens * 3;
-    const need = SYSTEM_BLOCKS_EST_BYTES + (cctx.SUMMARY_INJECT_CAP + 256) + cctx.GOAL_PIN_CAP +
-        turnOutputReserveBytes + tools_bytes + WORKING_MIN_BUDGET_BYTES + hist_win;
+    const need = SYSTEM_BLOCKS_EST_BYTES + WORKSPACE_EST_BYTES + (cctx.SUMMARY_INJECT_CAP + 256) +
+        cctx.GOAL_PIN_CAP + turnOutputReserveBytes + tools_bytes + WORKING_MIN_BUDGET_BYTES + hist_win;
     if (need <= win_bytes) return;
     memlog.warn("context: this turn's prompt needs ~{d} KB but {s} serves ~{d} KB — over by ~{d} KB with history already at its {d} KB floor; the tool schemas alone are ~{d} KB. Expect the provider to reject the request (it surfaces as an empty reply).", .{
         need / 1024, model, win_bytes / 1024, (need - win_bytes) / 1024, hist_win / 1024, tools_bytes / 1024,
@@ -7649,7 +7727,11 @@ fn runInnerAgentic(
                     const option_space: []const u8 = if (std.mem.indexOf(u8, turn_tools, "\"name\":\"cast\"") != null)
                         "files: write_file/edit_file/read_file/list_dir; waiting or watching anything: poll; web: web_fetch/read_url/fetch_json; stored docs: read_doc/recall_hive; a side-thread: open_subchat; a team: cast"
                     else
-                        "files: write_file/edit_file/read_file/list_dir; web: web_search/web_fetch/read_url/fetch_json; run code: run_python/run_tests; stored docs: read_doc; memory: recall";
+                        // read_url and fetch_json were dropped from the small belt in an earlier pass and never
+                        // cleaned up here, so this offered a struggling 12B two verbs it cannot call — at the
+                        // exact moment it is hunting for any new verb to try. Replaced with the browser pair,
+                        // which the tier DOES serve and which is the real answer to "web_fetch didn't work".
+                        "files: write_file/edit_file/read_file/list_dir; web: web_search/web_fetch; a page needing JS or a login: browser_navigate then browser_read; run code: run_python/run_tests; stored docs: read_doc; memory: recall";
                     const nudged = std.fmt.allocPrint(gpa, "{s}\n(engine: {s} has produced a FAILED outcome {d} times in a row. STOP and weigh your options before the next call. Is there a dedicated tool for this job — {s}? Pick the SIMPLEST tool that does it, or fix the exact error shown above — never re-run the same approach unchanged.)", .{ result, c.name, fail_streak, option_space }) catch result;
                     if (nudged.ptr != result.ptr) {
                         gpa.free(result);
@@ -7926,7 +8008,15 @@ fn toolArbiter(app: *App, run_root: []const u8, p: Provider, intent: []const u8,
         ask.appendSlice(gpa, "\n\n") catch return null;
         ask.appendSlice(gpa, clipBytes(belt, 500)) catch return null;
     }
-    ask.appendSlice(gpa, "\n\nAVAILABLE TOOL FAMILIES: files (write_file/edit_file/read_file/list_dir/delete_file), waiting/watching (poll), web (web_fetch/read_url/web_search/fetch_json), stored docs & memory (read_doc/recall_hive/recall), side-thread (open_subchat), a team (cast), code (run_python/run_tests). Your recommendation:") catch return null;
+    // TIER-VARIED, because this is served to compact turns too. It named poll, read_url, fetch_json,
+    // recall_hive, open_subchat and cast to a belt that serves none of them — advice the model cannot act on,
+    // handed to it on the streak-3 escalation, i.e. precisely when it is out of ideas and most likely to try
+    // whatever it is told. The `cast` needle is the same ADVERTISED check the streak-2 nudge uses.
+    const has_orch = if (tools_json) |tj| std.mem.indexOf(u8, tj, "\"name\":\"cast\"") != null else true;
+    ask.appendSlice(gpa, if (has_orch)
+        "\n\nAVAILABLE TOOL FAMILIES: files (write_file/edit_file/read_file/list_dir/delete_file), waiting/watching (poll), web (web_fetch/read_url/web_search/fetch_json), stored docs & memory (read_doc/recall_hive/recall), side-thread (open_subchat), a team (cast), code (run_python/run_tests). Your recommendation:"
+    else
+        "\n\nAVAILABLE TOOL FAMILIES: files (write_file/edit_file/read_file/list_dir/delete_file), web (web_search/web_fetch), a page needing JS or a login (browser_navigate, then browser_read for refs, then browser_click/browser_type), stored docs & memory (read_doc/recall/observe), images (pixel_search), code (run_python/run_tests). Your recommendation:") catch return null;
     var msgs: std.ArrayListUnmanaged(u8) = .empty;
     defer msgs.deinit(gpa);
     msgs.appendSlice(gpa, "{\"role\":\"system\",\"content\":") catch return null;
