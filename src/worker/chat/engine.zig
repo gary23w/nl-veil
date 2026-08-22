@@ -118,6 +118,18 @@ const AFK_STUCK_TMPL = "You just repeated the previous step — that is not maki
 /// transcript. Nothing here says "I" or "my": the engine narrates what the ENGINE did, the row is stored as
 /// `role:"system"` / `kind:"engine"` (see the .stopped arm), and only the newest survives replay (see seedLines).
 const LOOP_STOP_NOTE = "[engine: this turn was cut short by the loop guard — the same tool calls kept returning identical results, so more rounds could not make progress. Whatever is already written to the workdir is real: re-read it before redoing that work, and take a different approach.]";
+
+/// Cumulative INPUT tokens ONE turn may spend before the engine settles it. See the check in runInnerAgentic.
+///
+/// Deliberately generous — this is a runaway backstop, not a budget. A thorough research turn that fetches a
+/// dozen pages and writes a real document lands well under it; the measured runaway that motivated it was 1.83
+/// MILLION input tokens in a single turn, roughly 4.5x this. Set to 0 to disable (NL_TURN_TOKEN_CEILING=0).
+const TURN_TOKEN_CEILING_DEFAULT: u64 = 400_000;
+
+/// What the spend ceiling writes when it settles a turn. Third person and engine-attributed for the same reason
+/// LOOP_STOP_NOTE is: it is committed as a system/engine row, never in the model's voice, so the next turn reads
+/// a machine event rather than an apparent confession of failure.
+const TOKEN_CEILING_NOTE = "[engine: this turn hit its spend ceiling and was settled early — it had gathered a lot of context and each further round re-sends all of it. What is already written to the workdir is real. If more work is needed, ask for the next piece as a new turn rather than repeating this one.]";
 /// STUCK-RECOVERY WRITER (prompting). Reads the same bounded transcript tail the drive picker rides and names the
 /// concrete way around the blocker it can see, instead of the template's abstract encouragement.
 const STUCK_SYSTEM =
@@ -665,10 +677,14 @@ fn beltDenial(gpa: std.mem.Allocator, reply: []const u8, belt: []const u8) ?[]co
         const root = n[0 .. std.mem.indexOfScalar(u8, n, '_') orelse continue];
         if (root.len < 4) continue; // too short to be distinctive in prose
         var fam: usize = 0;
-        for (names.items) |m| if (std.mem.startsWith(u8, m, root) and m.len > root.len and m[root.len] == '_') { fam += 1; };
+        for (names.items) |m| if (std.mem.startsWith(u8, m, root) and m.len > root.len and m[root.len] == '_') {
+            fam += 1;
+        };
         if (fam >= 3) {
             var seen = false;
-            for (roots.items) |r| if (std.mem.eql(u8, r, root)) { seen = true; };
+            for (roots.items) |r| if (std.mem.eql(u8, r, root)) {
+                seen = true;
+            };
             if (!seen) roots.append(gpa, root) catch return null;
         }
     }
@@ -686,7 +702,9 @@ fn beltDenial(gpa: std.mem.Allocator, reply: []const u8, belt: []const u8) ?[]co
                 const sentence = if (std.mem.lastIndexOfAny(u8, win, ".!?")) |b| win[b + 1 ..] else win;
                 const after = hay[@min(at + needle.len, hay.len)..@min(at + needle.len + 24, hay.len)];
                 var negated = false;
-                for (neg) |m| if (std.ascii.indexOfIgnoreCase(sentence, m) != null) { negated = true; };
+                for (neg) |m| if (std.ascii.indexOfIgnoreCase(sentence, m) != null) {
+                    negated = true;
+                };
                 if (negated) {
                     for (cue) |c| {
                         if (std.ascii.indexOfIgnoreCase(sentence, c) != null or std.ascii.indexOfIgnoreCase(after, c) != null) return true;
@@ -1025,10 +1043,10 @@ test "the terse belt halves the small tier's schema bytes without hiding a singl
 
     // EVERY tool the belt served before is still served — the saving costs no capability at all.
     const must = [_][]const u8{
-        "web_search",       "web_fetch",    "read_file",     "write_file",   "edit_file",
-        "list_dir",         "delete_file",  "run_python",    "run_tests",    "recall",
-        "observe",          "read_doc",     "pixel_search",  "browser_read", "browser_navigate",
-        "browser_click",    "browser_type",
+        "web_search",    "web_fetch",    "read_file",    "write_file",   "edit_file",
+        "list_dir",      "delete_file",  "run_python",   "run_tests",    "recall",
+        "observe",       "read_doc",     "pixel_search", "browser_read", "browser_navigate",
+        "browser_click", "browser_type",
     };
     for (must) |name| {
         var found = false;
@@ -1047,8 +1065,8 @@ test "the terse belt halves the small tier's schema bytes without hiding a singl
     // pixel_ingest, pixel_capture, absorb, recall_hive, patch_system) — the belt taught a tier to reach for
     // tools it cannot call, which burns an agentic round on an unknown-tool refusal every time it lands.
     const hidden = [_][]const u8{
-        "read_url",  "deep_crawl",  "pixel_ingest", "pixel_capture", "absorb",
-        "recall_hive", "patch_system", "open_subchat", "fetch_json",  "mcp_call",
+        "read_url",    "deep_crawl",   "pixel_ingest", "pixel_capture", "absorb",
+        "recall_hive", "patch_system", "open_subchat", "fetch_json",    "mcp_call",
     };
     for (defs.items) |d| {
         const fnobj = d.object.get("function").?.object;
@@ -1097,8 +1115,8 @@ test "compact belt: valid JSON, materially smaller, keeps the core verbs and dro
 
     // the core belt survives: research, files, code, memory, and the four browser verbs that drive a page
     for ([_][]const u8{
-        "\"web_search\"", "\"web_fetch\"",       "\"read_file\"",   "\"write_file\"",    "\"edit_file\"",
-        "\"list_dir\"",   "\"run_python\"",      "\"run_tests\"",   "\"recall\"",        "\"observe\"",
+        "\"web_search\"", "\"web_fetch\"",        "\"read_file\"",    "\"write_file\"",    "\"edit_file\"",
+        "\"list_dir\"",   "\"run_python\"",       "\"run_tests\"",    "\"recall\"",        "\"observe\"",
         "\"read_doc\"",   "\"browser_navigate\"", "\"browser_read\"", "\"browser_click\"", "\"browser_type\"",
     }) |keep| {
         if (std.mem.indexOf(u8, TURN_TOOLS_COMPACT, keep) == null) {
@@ -1110,7 +1128,7 @@ test "compact belt: valid JSON, materially smaller, keeps the core verbs and dro
     // and the decoys are gone. mcp_call/mcp_discover lead this list on evidence: a 12B asked to "use the web
     // browser" reached for them twice while browser_navigate sat in the same array.
     for ([_][]const u8{
-        "\"mcp_call\"", "\"mcp_discover\"",  "\"cast\"",        "\"steer_swarm\"", "\"open_subchat\"",
+        "\"mcp_call\"", "\"mcp_discover\"",  "\"cast\"",         "\"steer_swarm\"", "\"open_subchat\"",
         "\"absorb\"",   "\"schedule_task\"", "\"browser_eval\"", "\"browser_key\"", "\"recall_hive\"",
     }) |gone| {
         if (std.mem.indexOf(u8, TURN_TOOLS_COMPACT, gone) != null) {
@@ -1667,7 +1685,22 @@ fn emitUsage(app: *App, conv_dir: []const u8, t0: llm.TokUsage) void {
 /// summary refresh, THEN done inline (so {done} still comes last), instead of calling this.
 fn finishTurn(app: *App, conv_dir: []const u8, t0: llm.TokUsage) void {
     emitUsage(app, conv_dir, t0);
-    emitEvent(app, conv_dir, "{\"kind\":\"done\"}");
+    // The {done} frame is NOT emitted here — see signalDone. It used to be, and that made `done` a lie: the
+    // frame went out from inside runTurn while the per-conversation slot was still held, and the slot is only
+    // released by the caller AFTER every deferred teardown (the neuron-db flush is a subprocess spawn, plus the
+    // toolperf merge and ledger persist). A client that trusts `done` and posts the next turn immediately gets
+    // 409 "a turn is already running". A human REPL never notices, because a person takes longer to type than
+    // the teardown takes to run — which is exactly why the interactive debugger never surfaced it and an
+    // unattended run hit it on turn after turn (measured: a 0.5s refusal window after a tool-using turn).
+}
+
+/// Tell the client the turn is over — strictly AFTER the conversation slot has been released, so `done` means
+/// what every client already assumes it means: the next turn will be accepted.
+fn signalDone(app: *App, uid: u64, conv: []const u8) void {
+    const gpa = app.gpa;
+    const dir = std.fmt.allocPrint(gpa, "{s}/u{d}/_chat/convs/{s}", .{ app.data, uid, conv }) catch return;
+    defer gpa.free(dir);
+    emitEvent(app, dir, "{\"kind\":\"done\"}");
 }
 
 /// Append `obj` (a complete, already-escaped single-line JSON object) as one line to events.jsonl.
@@ -1694,6 +1727,28 @@ fn emitKV(app: *App, conv_dir: []const u8, kind: []const u8, field: []const u8, 
     http.jstr(gpa, &ev, value) catch return;
     ev.append(gpa, '}') catch return;
     emitEvent(app, conv_dir, ev.items);
+}
+
+threadlocal var trace_enabled: bool = false;
+
+fn traceFrame(app: *App, module: []const u8, function: []const u8, phase: []const u8, ok: ?bool, ms: ?u64) void {
+    if (!trace_enabled or llm_frame_dir_len == 0) return;
+    const gpa = app.gpa;
+    var ev: std.ArrayListUnmanaged(u8) = .empty;
+    defer ev.deinit(gpa);
+    ev.appendSlice(gpa, "{\"kind\":\"trace\",\"phase\":") catch return;
+    http.jstr(gpa, &ev, phase) catch return;
+    ev.appendSlice(gpa, ",\"module\":") catch return;
+    http.jstr(gpa, &ev, module) catch return;
+    ev.appendSlice(gpa, ",\"function\":") catch return;
+    http.jstr(gpa, &ev, function) catch return;
+    if (ok) |value| ev.appendSlice(gpa, if (value) ",\"ok\":true" else ",\"ok\":false") catch return;
+    if (ms) |value| {
+        var b: [48]u8 = undefined;
+        ev.appendSlice(gpa, std.fmt.bufPrint(&b, ",\"ms\":{d}", .{value}) catch return) catch return;
+    }
+    ev.appendSlice(gpa, "}") catch return;
+    emitEvent(app, llm_frame_dir[0..llm_frame_dir_len], ev.items);
 }
 
 // ---- PER-CALL MODEL ATTRIBUTION ON THE EVENT STREAM ---------------------------------------------------------
@@ -1828,7 +1883,7 @@ fn renderLlmFrame(gpa: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), labe
 
 /// Run one full agentic turn for `conv` (already safeSeg'd, non-empty). Blocks the calling httpz worker thread
 /// to completion (casts/deploys block the same way); on return the whole turn is durable in messages/events.jsonl.
-pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text: []const u8, loop: u8, tool_client_req: bool, image_b64: []const u8, fast: bool) void {
+pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text: []const u8, loop: u8, tool_client_req: bool, image_b64: []const u8, fast: bool, trace_req: bool) void {
     const gpa = app.gpa;
 
     // TOOL DELEGATION IS ADMIN-ONLY, and the check belongs HERE rather than at the delegation branch.
@@ -1869,6 +1924,10 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     // every exit path so a recycled thread can never append a stray frame to a finished conversation.
     armLlmFrames(conv_dir);
     defer disarmLlmFrames();
+    trace_enabled = trace_req;
+    defer trace_enabled = false;
+    traceFrame(app, "worker.chat.engine", "runTurn", "enter", null, null);
+    defer traceFrame(app, "worker.chat.engine", "runTurn", "exit", true, null);
 
     // ---- HIPPOCAMPUS scope: this conversation's own durable neuron-db partition (user turns + tool findings).
     // SCHEDULED RUNS get a TASK-scoped partition instead: every run of "scheduled_{taskid}_{stamp}" shares
@@ -1913,8 +1972,8 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
 
     const environ = app.sup.parent_env orelse {
         emitKV(app, conv_dir, "error", "err", "server env unavailable");
-        emitEvent(app, conv_dir, "{\"kind\":\"done\"}"); // the desk disarms only on {done}; an error alone would hang it
-        return;
+        return; // {done} follows from signalDone once the slot is released — see finishTurn
+
     };
 
     // USAGE: snapshot the process token counters BEFORE any LLM work (plan decomposition, history summary, drive,
@@ -2602,6 +2661,16 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     var dud_fetches: u32 = 0; // turn-scoped guessed-URL spiral evidence — see looksLikeNotFound / DUD_FETCH_STREAK
     var poll_timeouts: u32 = 0; // turn-scoped stuck-in-a-wait evidence — see POLL_TIMEOUT_STREAK
     const tool_budget: usize = if (schedTaskOf(conv) != null) 60 else std.math.maxInt(usize);
+    // ABSOLUTE ceiling for this turn, not a delta: tokensSnapshot is thread-local and each turn owns its thread
+    // (spawnTurn), so usage_t0 + budget is exactly "this turn has spent enough" even with turns running
+    // concurrently for other conversations. Operator-tunable; 0 disables the backstop entirely.
+    const token_ceiling: u64 = blk: {
+        const cap = if (ctx.environ.get("NL_TURN_TOKEN_CEILING")) |v|
+            std.fmt.parseInt(u64, std.mem.trim(u8, v, " \r\n\t"), 10) catch TURN_TOKEN_CEILING_DEFAULT
+        else
+            TURN_TOKEN_CEILING_DEFAULT;
+        break :blk if (cap == 0) 0 else usage_t0.in + cap;
+    };
     // TOOL-ECHO GUARD + network repeat ledger, at TURN scope. Both used to live inside the inner agentic
     // pass, which is re-entered on EVERY drive step — so the guards forgot all repeats each step, and a
     // stuck turn re-listed the same directory step after step while the context ballooned (observed live:
@@ -2639,8 +2708,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
         // across steps. No-op on the first step (nothing past the assembled prefix yet).
         // Budget keyed on the CODING model + this turn's tool array: coding is what consumes conv_buf, and
         // the schemas ride in the same window. `think` here is only who WRITES the fold.
-        compactWorking(app, llm_dir, think.base_url, think.key, think.model, &conv_buf, assembled_len, &ctx, &tool_obs,
-            workingBudgetBytes(trio.coding.base_url, trio.coding.model, assembled_len + turn_tools.len));
+        compactWorking(app, llm_dir, think.base_url, think.key, think.model, &conv_buf, assembled_len, &ctx, &tool_obs, workingBudgetBytes(trio.coding.base_url, trio.coding.model, assembled_len + turn_tools.len));
 
         // PLAN STEP: when a plan is active, take the next pending subtask and inject it as this step's working turn
         // (so the agentic pass works THAT subtask, route-hinted). No plan → drive step 0 works the user's message
@@ -2716,7 +2784,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
 
         // Run one agentic tool pass to a SETTLED (no-tool-call) answer.
         const mut_before = file_ledger.mutations;
-        const inner = runInnerAgentic(app, uid, conv, conv_dir, llm_dir, trio, &conv_buf, &ctx, &steer_cursor, &tool_obs, &tool_perf, tool_client, &no_ack_streak, &dud_fetches, &poll_timeouts, &tools_spent, tool_budget, &echo_guard, &call_ledger, &file_ledger, foreign_mem.items, &foreign_warned, search_intent, &search_log, turn_tools);
+        const inner = runInnerAgentic(app, uid, conv, conv_dir, llm_dir, trio, &conv_buf, &ctx, &steer_cursor, &tool_obs, &tool_perf, tool_client, &no_ack_streak, &dud_fetches, &poll_timeouts, &tools_spent, tool_budget, token_ceiling, &echo_guard, &call_ledger, &file_ledger, foreign_mem.items, &foreign_warned, search_intent, &search_log, turn_tools);
         // TRAJECTORY THREAD (fine weave): a pass that LANDED file changes mints one provenance-labeled
         // progress fact pairing the step's language with the engine-observed effect — the lexical thread
         // that lets a later step's recall hop from "what am I doing" to "what already happened here".
@@ -3236,7 +3304,8 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     // this path refreshes; Stop/error/empty end promptly via finishTurn (and the summary catches up next turn).
     emitUsage(app, conv_dir, usage_t0);
     refreshSummary(app, conv_dir, llm_dir, think.base_url, think.key, think.model, hist_win);
-    emitEvent(app, conv_dir, "{\"kind\":\"done\"}");
+    // NO {done} here: it is emitted by signalDone after the caller releases the conversation slot, so the frame
+    // that tells a client "the turn is over" is not followed by a 409 when the client believes it.
 }
 
 /// The scheduled task's LEARNING step, run once at a run's NORMAL completion. Two writes into the task's own
@@ -3986,20 +4055,19 @@ fn metaQuestionShaped(text: []const u8) bool {
     if (body.len == 0) return false;
     // WHOLE-MESSAGE forms: no subject, so only an exact match is safe.
     for ([_][]const u8{
-        "status",   "status update", "progress", "any progress", "any update",
-        "you good", "still there",   "you there", "hello",       "you alive",
+        "status",   "status update", "progress",  "any progress", "any update",
+        "you good", "still there",   "you there", "hello",        "you alive",
     }) |exact| if (std.mem.eql(u8, body, exact)) return true;
     // PHRASAL heads: each names the assistant or the run, and each is boundary-checked.
     const heads = [_][]const u8{
-        "are you stuck",      "are you ok",           "are you okay",        "are you there",
-        "are you alive",      "are you still",        "are you done",        "are you working",
-        "are you looping",    "are you lost",         "are you making progress",
-        "you stuck",          "u stuck",              "r u stuck",
-        "what are you doing", "what are you working", "what are you up to",
-        "what happened",      "what's going on",      "whats going on",      "what is going on",
-        "why are you",        "why is this taking",   "why is it taking",    "why is this so slow",
-        "how is it going",    "how's it going",       "hows it going",
-        "is it stuck",        "is this stuck",        "did you get stuck",   "any progress",
+        "are you stuck",       "are you ok",      "are you okay",            "are you there",
+        "are you alive",       "are you still",   "are you done",            "are you working",
+        "are you looping",     "are you lost",    "are you making progress", "you stuck",
+        "u stuck",             "r u stuck",       "what are you doing",      "what are you working",
+        "what are you up to",  "what happened",   "what's going on",         "whats going on",
+        "what is going on",    "why are you",     "why is this taking",      "why is it taking",
+        "why is this so slow", "how is it going", "how's it going",          "hows it going",
+        "is it stuck",         "is this stuck",   "did you get stuck",       "any progress",
     };
     for (heads) |h| {
         if (!std.mem.startsWith(u8, body, h)) continue;
@@ -4701,13 +4769,15 @@ pub const TurnArgs = struct {
     /// FAST MODE: this turn opted out of the advanced-reasoning passes (see the Body field in chat/service.zig).
     /// False = the default = advanced.
     fast: bool,
+    trace: bool,
 };
 
 /// Detached-thread entry: run the whole turn, then free the owned args. Any failure inside runTurn is already
 /// caught + surfaced as an event, so this thread returns cleanly (never propagates an error that could abort it).
 fn turnThread(args: *TurnArgs) void {
-    runTurn(args.app, args.uid, args.conv, args.trio, args.text, args.loop, args.tool_client, args.image_b64, args.fast);
+    runTurn(args.app, args.uid, args.conv, args.trio, args.text, args.loop, args.tool_client, args.image_b64, args.fast, args.trace);
     endTurn(args.app.io, args.conv); // release the per-conv turn lock (before freeing the blob `conv` points into)
+    signalDone(args.app, args.uid, args.conv); // ...and only now is the turn genuinely over for the client
     if (llm.isLocal(args.trio.coding.base_url)) releaseLocal(args.app.io); // release the machine-sized local slot (admission keys on the coding/base model)
     const gpa = args.app.gpa;
     gpa.free(args.blob);
@@ -4719,7 +4789,7 @@ fn turnThread(args: *TurnArgs) void {
 /// block the client's /events poll for the whole turn). On an
 /// allocation or thread-spawn failure it runs the turn INLINE (blocking the caller) rather than drop it — the
 /// caller's arg slices are still valid at that point. The turn writes its frames to events.jsonl either way.
-pub fn spawnTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, text: []const u8, loop: u8, tool_client: bool, image_b64: []const u8, fast: bool) void {
+pub fn spawnTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, text: []const u8, loop: u8, tool_client: bool, image_b64: []const u8, fast: bool, trace: bool) void {
     const gpa = app.gpa;
     const c = trio.coding;
     const t = trio.thinking;
@@ -4734,15 +4804,17 @@ pub fn spawnTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, text: [
     // must release it. The detached/inline turnThread paths release in turnThread; the two alloc-failure inline
     // paths run the turn directly, so they release explicitly. Local-slot release keys on the coding/base model.
     const args = gpa.create(TurnArgs) catch {
-        runTurn(app, uid, conv, trio, text, loop, tool_client, image_b64, fast);
+        runTurn(app, uid, conv, trio, text, loop, tool_client, image_b64, fast, trace);
         endTurn(app.io, conv);
+        signalDone(app, uid, conv);
         if (llm.isLocal(c.base_url)) releaseLocal(app.io);
         return;
     };
     const blob = gpa.alloc(u8, total) catch {
         gpa.destroy(args);
-        runTurn(app, uid, conv, trio, text, loop, tool_client, image_b64, fast);
+        runTurn(app, uid, conv, trio, text, loop, tool_client, image_b64, fast, trace);
         endTurn(app.io, conv);
+        signalDone(app, uid, conv);
         if (llm.isLocal(c.base_url)) releaseLocal(app.io);
         return;
     };
@@ -4756,7 +4828,7 @@ pub fn spawnTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, text: [
         .thinking = .{ .base_url = dupInto(blob, &o, t.base_url), .key = dupInto(blob, &o, t.key), .model = dupInto(blob, &o, t.model) },
         .prompting = .{ .base_url = dupInto(blob, &o, p.base_url), .key = dupInto(blob, &o, p.key), .model = dupInto(blob, &o, p.model) },
     };
-    args.* = .{ .app = app, .uid = uid, .blob = blob, .conv = cv, .trio = owned, .text = tx, .loop = loop, .tool_client = tool_client, .image_b64 = ib, .fast = fast };
+    args.* = .{ .app = app, .uid = uid, .blob = blob, .conv = cv, .trio = owned, .text = tx, .loop = loop, .tool_client = tool_client, .image_b64 = ib, .fast = fast, .trace = trace };
     if (std.Thread.spawn(.{}, turnThread, .{args})) |th| {
         th.detach();
     } else |_| {
@@ -5777,7 +5849,7 @@ fn openSubchatTool(app: *App, uid: u64, conv: []const u8, conv_dir: []const u8, 
     // A sub-chat runs on the DEFAULTS, exactly as this call site already does for loop and tool_client:
     // it works unattended on a branch nobody is watching, which is precisely where advanced reasoning
     // earns its cost. The parent's fast-mode choice was about the parent's own latency.
-    spawnTurn(app, uid, bid, trio, goal, 0, false, "", false);
+    spawnTurn(app, uid, bid, trio, goal, 0, false, "", false, false);
     return std.fmt.allocPrint(gpa, "{{\"ok\":true,\"tool\":\"open_subchat\",\"sub\":\"s{d}\",\"conv\":\"{s}\",\"note\":\"sub-chat s{d} opened and its first turn is RUNNING server-side on that goal. It shares this chat's workspace and memory — its findings become recallable here (recall) as it works. Tell the user it opened as tab s{d}; check its progress later via recall or by switching to the tab.\"}}", .{ free_n, bid, free_n, free_n }) catch emptyRes();
 }
 
@@ -7094,6 +7166,8 @@ fn workingBudgetBytes(base_url: []const u8, model: []const u8, fixed_bytes: usiz
 /// actually erred and retry once, spliced. Aux slices hold no saved reasoning, so every echo is the
 /// verbatim "" (see llm.withReasoningEcho). Aux calls advertise no tools, hence the fixed "".
 fn completeAux(app: *App, dir: []const u8, tag: []const u8, base_url: []const u8, key: []const u8, model: []const u8, messages_json: []const u8, max_tokens: u32, temperature: f32) llm.Step {
+    traceFrame(app, "worker.chat.engine", "completeAux", "enter", null, null);
+    defer traceFrame(app, "worker.chat.engine", "completeAux", "exit", true, null);
     const gpa = app.gpa;
     if (llm.reasoningEchoFor(app.io, model)) {
         if (llm.withReasoningEcho(gpa, messages_json, "")) |spliced| {
@@ -7136,7 +7210,11 @@ fn runInnerAgentic(
     // TURN-scoped consecutive poll timeouts — the stuck-in-a-wait counter; see POLL_TIMEOUT_STREAK.
     poll_timeouts: *u32,
     tools_spent: *usize, // turn-scoped executed-call counter (shared across drive steps)
-    tool_budget: usize, // ceiling for scheduled runs; maxInt for interactive chats (a human holds Stop)
+    tool_budget: usize, // tool-CALL ceiling for scheduled runs; maxInt for interactive chats
+    /// Absolute cumulative-input-token mark at which this turn settles, or 0 for no ceiling. The tool-call
+    /// budget above cannot bound cost — a turn re-uploads its whole context every round, so spend grows with
+    /// CONTEXT, not with call count. See the check below.
+    token_ceiling: u64,
     // REPEAT-CALL GUARDS, both TURN-scoped (owned by the drive loop — pass-local state forgot every repeat
     // when the next drive step re-entered this function, so a stuck turn re-ran the same exploration step
     // after step). `echo_guard` covers EVERY tool by (name,args)→result-hash: identical call + identical
@@ -7266,13 +7344,38 @@ fn runInnerAgentic(
             };
         }
 
+        // SPEND CEILING — checked in the same place and for the same reason as the loop stop: before paying for
+        // another inference. Every round re-uploads the whole working context, so a research turn that keeps
+        // fetching and grepping does not cost the sum of its answers, it costs the sum of its CONTEXT, which
+        // grows as it goes. Measured on ONE "research WAL mode and write notes" turn: 118 model calls, 78 tool
+        // calls, 1,825,951 input tokens — 80% of an entire five-scenario simulation, in a single turn.
+        //
+        // Nothing stopped it, because the only ceiling in the engine is a tool-CALL count applied to scheduled
+        // runs alone (see tool_budget), reasoning that an interactive chat is safe because "a human holds Stop".
+        // That is untrue of an API caller, of an afk auto-loop, and of an unattended run — and it is barely true
+        // of a watching human, who cannot stop a cost they have no way to see accruing. A call count is also the
+        // wrong unit: that turn would have sailed through a 100-call budget while still spending 1.8M tokens.
+        if (token_ceiling > 0 and llm.tokensSnapshot().in >= token_ceiling) {
+            const spent = llm.tokensSnapshot().in;
+            var sb: [160]u8 = undefined;
+            emitKV(app, conv_dir, "status", "text", std.fmt.bufPrint(&sb, "spend ceiling reached (~{d}k input tokens this turn) — settling with what is already gathered", .{spent / 1000}) catch "spend ceiling reached — settling");
+            return .{
+                .outcome = .stopped,
+                .content = gpa.dupe(u8, last_content) catch empty,
+                .tools_ran = any_tool,
+                .engine_note = gpa.dupe(u8, TOKEN_CEILING_NOTE) catch empty,
+            };
+        }
+
         // STREAMING: the model's reply + reasoning type out via streamOnDelta as {kind:token|reasoning,delta}
         // frames. The returned Step is the SAME accumulated shape complete() gives (content + reasoning +
         // tool_calls), so everything below is unchanged — and completeStream falls back to complete() itself
         // on any streaming trouble, so a backend that can't stream still works (on_delta just never fires).
         var sctx = StreamCtx{ .app = app, .conv_dir = conv_dir, .ctrl_cursor = steer_cursor.* };
         var chat_cm = meterBegin(app.io);
+        traceFrame(app, "worker.llm", "completeStream", "enter", null, null);
         var step = llm.completeStream(gpa, app.io, run_root, "chat", base_url, key, model, conv_buf.items, turn_tools, turnTokenBudget(ctx.environ, base_url, model), 0.7, &sctx, streamOnDelta, streamShouldAbort);
+        traceFrame(app, "worker.llm", "completeStream", "exit", step.ok, null);
         defer step.deinit(gpa);
         streamFlush(&sctx); // emit the last buffered <FLUSH_CHARS chunk so the tail of the reply/reasoning isn't lost
         // AFTER streamFlush, deliberately: the desk treats a delta that follows a non-delta frame as an inference
@@ -7550,6 +7653,7 @@ fn runInnerAgentic(
             var executed = false; // did the tool genuinely run (vs a dedup/budget guard)? gates perf learning
             var name_fixed: ?[]const u8 = null; // set when a miscapitalized name auto-corrected (WebSearch→web_search)
             const t_call = nowMillis(app.io);
+            traceFrame(app, "worker.tools", c.name, "enter", null, null);
             var result = if (echo_blocked)
                 // HONEST REFUSALS: these used to say "the result is above". Compaction may have folded that
                 // span into a progress note, so the engine was telling the model to use data it had deleted —
@@ -7631,6 +7735,7 @@ fn runInnerAgentic(
                 break :blk orchTool(app, uid, ctx, conv, conv_dir, steer_cursor.*, trio, run_name, run_args, tool_client) orelse
                     (if (tool_client and !std.mem.eql(u8, run_name, "get_credential")) delegateTool(app, conv_dir, c.id, run_name, run_args, steer_cursor.*, no_ack_streak) else tools.execute(ctx, run_name, run_args));
             };
+            traceFrame(app, "worker.tools", c.name, "exit", null, null);
             scrubUtf8(result); // fetched bytes may be invalid UTF-8; must be valid before it rides in JSON
             // A reformulated search must SAY so in its own result. The transcript records the query the model
             // asked for, so without this it would read results for a search it never made and have no way to
@@ -7938,8 +8043,7 @@ fn runInnerAgentic(
         if (iter_refused) loop_refusals +|= 1 else if (iter_executed) loop_refusals = 0;
         // WITHIN-TURN COMPACTION (step boundary): if this pass's working growth has crossed the budget, compress it
         // into a progress note so a long/afk turn can keep going without overflowing the model window.
-        compactWorking(app, run_root, think.base_url, think.key, think.model, conv_buf, base_len, ctx, tool_obs,
-            workingBudgetBytes(base_url, model, base_len + turn_tools.len));
+        compactWorking(app, run_root, think.base_url, think.key, think.model, conv_buf, base_len, ctx, tool_obs, workingBudgetBytes(base_url, model, base_len + turn_tools.len));
         // GROUND-TRUTH CONFLICT SPLICE — after compaction (never folded into a summary), before any steer
         // (the user's live instruction stays last, i.e. most salient).
         if (post_note.items.len > 0)
@@ -9536,10 +9640,10 @@ test "recon can only LOOK: no probe on the whitelist can change anything" {
     // whitelist is the only thing standing between "plan this task" and a planning pass writing files
     // before the user has even seen a plan. Every one of these must be absent.
     const mutating = [_][]const u8{
-        "write_file",    "edit_file",   "delete_file", "run_python",   "run_tests",
-        "host_command",  "make_tool",   "patch_system", "cast",        "stop_swarm",
-        "browser_click", "browser_type", "browser_navigate", "observe", "share",
-        "get_credential", "stage_delivery", "propose_change", "open_subchat", "send_message",
+        "write_file",     "edit_file",      "delete_file",      "run_python",   "run_tests",
+        "host_command",   "make_tool",      "patch_system",     "cast",         "stop_swarm",
+        "browser_click",  "browser_type",   "browser_navigate", "observe",      "share",
+        "get_credential", "stage_delivery", "propose_change",   "open_subchat", "send_message",
     };
     for (RECON_TOOLS) |probe| {
         for (mutating) |bad| {
@@ -9650,7 +9754,7 @@ test "every AUXILIARY completion bounds its prompt — only the real turn sends 
 
     // ...and the streamed turn DOES still send the whole transcript. If this ever stops being true the
     // rule above has been satisfied by crippling the actual conversation, which is not the intent.
-    try std.testing.expect(std.mem.indexOf(u8, SRC, "completeStream(" ) != null);
+    try std.testing.expect(std.mem.indexOf(u8, SRC, "completeStream(") != null);
 }
 
 /// The subtask numbers a planrec reply marks complete, from "done: 1, 2". Returns a slice of `out`.
