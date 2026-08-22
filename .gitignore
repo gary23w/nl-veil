@@ -84,3 +84,6 @@ harness/*
 
 # local model development artifacts and build design
 model/*
+
+# various debugger / profiler / runtime artifacts that are not source
+debug.ps1
