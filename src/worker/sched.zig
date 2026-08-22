@@ -824,7 +824,7 @@ fn launchRun(app: *App, alloc: std.mem.Allocator, uid: u64, t: *Task, now: i64) 
     // nobody watching it start, which is exactly where looking before planning and re-checking course pay
     // for themselves. Fast mode is a choice about a latency a waiting human can feel; there is no human
     // waiting here.
-    chat_engine.spawnTurn(app, uid, conv, trio, text, 1, false, "", false); // tool_client=false: a scheduled run executes tools server-side (no client attached); no image attachment
+    chat_engine.spawnTurn(app, uid, conv, trio, text, 1, false, "", false, false); // tool_client=false: a scheduled run executes tools server-side (no client attached); no image attachment
 
     // Bookkeeping AFTER the spawn is committed, under the sched lock with a FRESH re-load: a concurrent
     // update (rename, toggle, prompt edit) between the caller's read and this save must not be clobbered by
