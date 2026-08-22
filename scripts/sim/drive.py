@@ -181,8 +181,30 @@ def run_scenario(name, turns, model, base_url, loop=0, conv=None):
     return summary
 
 
+def preflight():
+    """Refuse to start against a dead server.
+
+    A 38-turn run once executed end to end with the server down: every POST refused, every turn
+    logged as failed, and the graders — which read disk state rather than answers — reported EARNED
+    on pristine fixtures. The graders are fixed, but the run should never have been attempted. Ten
+    minutes of connection-refused is not data.
+    """
+    try:
+        st, _h, _b = req("GET", "/models.json", timeout=8)
+        if st == 200:
+            return True
+    except Exception as e:
+        print("PREFLIGHT: cannot reach %s (%s)" % (SERVER, type(e).__name__), flush=True)
+        return False
+    print("PREFLIGHT: %s answered HTTP %s for /models.json" % (SERVER, st), flush=True)
+    return False
+
+
 if __name__ == "__main__":
     import importlib.util
+    if not preflight():
+        print("aborting: start the server first", flush=True)
+        raise SystemExit(2)
     spec = importlib.util.spec_from_file_location("scen", sys.argv[1])
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
