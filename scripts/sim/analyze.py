@@ -26,6 +26,7 @@ def scan(path):
     tool_sig = collections.defaultdict(list)   # (turn,name,args) -> results
     errors, statuses = [], []
     llm_fail, llm_ok = 0, 0
+    slow, failed = [], collections.Counter()
     kinds = collections.Counter()
     turns = set()
     for line in io.open(path, encoding="utf-8", errors="replace"):
@@ -54,11 +55,19 @@ def scan(path):
                 llm_fail += 1
             else:
                 llm_ok += 1
-        if k == "tool":
-            nm = str(d.get("name") or d.get("tool") or "?")
-            args = json.dumps(d.get("args"), sort_keys=True) if d.get("args") is not None else ""
-            res = str(d.get("result") or d.get("ok") or "")[:200]
-            tool_sig[(t, nm, hashlib.md5(args.encode()).hexdigest()[:8])].append(res)
+        if k == "tool" and str(d.get("state")) == "done":
+            if d.get("ms") is not None:
+                slow.append((int(d["ms"]), str(d.get("tool"))))
+            if d.get("ok") is False:
+                failed[str(d.get("tool"))] += 1
+        if k == "tool" and str(d.get("state")) == "start":
+            # args ride the START frame, so a repeated call is now identifiable by SIGNATURE rather than by
+            # name alone. Before that, every call hashed to the same empty string and eight re-reads of one
+            # file looked identical to eight reads of different files — the distinction that matters most
+            # when judging whether a run is making progress or spinning.
+            nm = str(d.get("tool") or "?")
+            args = str(d.get("args") or "")
+            tool_sig[(t, nm, args[:120])].append(args)
     print("\n===== %s  (%d turns, %d event kinds) =====" % (name, len(turns), len(kinds)))
     print("  kinds:", dict(kinds))
     print("  llm calls: ok=%d fail=%d" % (llm_ok, llm_fail))
@@ -70,10 +79,15 @@ def scan(path):
     # identical call+args repeated within one turn
     rep = {k: v for k, v in tool_sig.items() if len(v) > 1}
     if rep:
-        print("  REPEATED IDENTICAL CALLS (turn, tool, argshash) -> count:")
-        for k, v in sorted(rep.items(), key=lambda x: -len(x[1]))[:8]:
-            same = len(set(v)) == 1
-            print("    %s -> %dx  identical_results=%s" % (k, len(v), same))
+        print("  REPEATED IDENTICAL CALLS (same tool AND same args in one turn):")
+        for (turn, nm, args), v in sorted(rep.items(), key=lambda x: -len(x[1]))[:8]:
+            print("    turn %s  %-14s x%-3d %s" % (turn, nm, len(v), args[:90]))
+    if slow:
+        print("  SLOWEST TOOL CALLS:")
+        for ms, nm in sorted(slow, reverse=True)[:5]:
+            print("    %6dms  %s" % (ms, nm))
+    if failed:
+        print("  FAILED TOOL CALLS: %s" % dict(failed))
     if errors:
         print("  ERRORS:")
         for t, e in errors[:8]:
