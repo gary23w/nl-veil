@@ -210,21 +210,34 @@ pub fn renderPrompt(
     errdefer w.deinit(gpa);
     try w.appendSlice(gpa, BOS);
 
-    // ---- system turn: system text, then every tool declaration, in one turn
-    var system_text: []const u8 = "";
+    // ---- system turn: EVERY system message, then every tool declaration, in one turn
+    //
+    // This used to take the FIRST system message and `break`, on the stated assumption that "the leading
+    // system block is one message by the time it reaches here". That is not true of the caller. The chat
+    // system prompt is message 0, but assembleHistory injects the rolling summary as its OWN system
+    // message, the prompt workspace splices system blocks of its own, and a loop-guard stop note is stored
+    // and replayed as a system row. Combined with the `continue` in the body loop below, every one of
+    // those was discarded — so on the built-in engine a long conversation ran without its own summary and
+    // without the engine's notes, and nothing reported it. The turn still succeeded; it was just amnesiac,
+    // which is the failure mode hardest to notice from the outside.
+    //
+    // Gemma has exactly one system turn, so the blocks are concatenated into it in order rather than
+    // emitted separately.
+    var system_join: std.ArrayListUnmanaged(u8) = .empty;
+    defer system_join.deinit(gpa);
     for (parsed_msgs.value.array.items) |m| {
         const o = switch (m) {
             .object => |x| x,
             else => continue,
         };
         const role = if (o.get("role")) |r| (if (r == .string) r.string else "") else "";
-        if (std.mem.eql(u8, role, "system")) {
-            if (o.get("content")) |c| if (c == .string) {
-                system_text = c.string;
-            };
-            break; // the leading system block is one message by the time it reaches here
-        }
+        if (!std.mem.eql(u8, role, "system")) continue;
+        const c = o.get("content") orelse continue;
+        if (c != .string or c.string.len == 0) continue;
+        if (system_join.items.len > 0) try system_join.appendSlice(gpa, "\n\n");
+        try system_join.appendSlice(gpa, c.string);
     }
+    const system_text: []const u8 = system_join.items;
     const have_tools = parsed_tools != null and parsed_tools.?.value.array.items.len > 0;
     if (system_text.len > 0 or have_tools) {
         try w.appendSlice(gpa, "<|turn>system\n");
@@ -609,4 +622,26 @@ test "renderPrompt replays OpenAI arguments-as-STRING as a native object" {
     const got = try renderPrompt(gpa, msgs, "");
     defer gpa.free(got);
     try std.testing.expect(std.mem.indexOf(u8, got, "call:recall{query:<|\"|>ports<|\"|>}") != null);
+}
+
+test "EVERY system message reaches the prompt, not just the first" {
+    // The engine sends more than one. The chat system prompt is message 0, but assembleHistory injects
+    // the rolling summary as its own `system` message, the prompt workspace splices system blocks, and a
+    // loop-guard stop note is stored and replayed as a system row. The renderer used to capture message 0
+    // and `break`, then `continue` past every other system message in the body loop — so on the built-in
+    // engine all of that was silently dropped. Silently is the problem: the turn still succeeds, it just
+    // runs without its own memory of the conversation.
+    const gpa = std.testing.allocator;
+    const msgs =
+        "{\"role\":\"system\",\"content\":\"BASE PROMPT\"}," ++
+        "{\"role\":\"system\",\"content\":\"ROLLING SUMMARY: the user is porting a parser.\"}," ++
+        "{\"role\":\"user\",\"content\":\"carry on\"}," ++
+        "{\"role\":\"system\",\"content\":\"[engine: the previous turn was cut short.]\"}";
+    const got = try renderPrompt(gpa, msgs, "");
+    defer gpa.free(got);
+    try std.testing.expect(std.mem.indexOf(u8, got, "BASE PROMPT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "ROLLING SUMMARY") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "[engine: the previous turn was cut short.]") != null);
+    // and exactly one system turn is opened — the blocks are folded together, not scattered
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, got, "<|turn>system\n"));
 }
