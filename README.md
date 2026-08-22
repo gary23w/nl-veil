@@ -121,7 +121,7 @@ raylib is a *lazy* dependency, so `-Dapp=false` never fetches it at all.
 ## Install
 
 **Download it and run it — no toolchain, nothing to build.** Grab your platform's bundle from the
-**[latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.0.1-beta-4)**, unzip, and run `veil`:
+**[latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.0.1-beta-5)**, unzip, and run `veil`:
 
 | You're on | Download | Then run |
 |---|---|---|
@@ -282,7 +282,7 @@ step 5** — the rest is about letting other people in.
 
 ### 1. Download and unblock it
 
-Grab the bundle for your OS from the [latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.0.1-beta-4)
+Grab the bundle for your OS from the [latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.0.1-beta-5)
 and unzip it somewhere you'll find again. Builds are unsigned, so:
 
 - **Windows** shows *"Windows protected your PC"* → **More info** → **Run anyway**.
@@ -1110,16 +1110,17 @@ dependency entirely rather than compiling it unused.
 
 ## Release
 
-**Current: [`v1.0.1-beta-4`](https://github.com/gary23w/nl-veil/releases/tag/v1.0.1-beta-4)** — the
-fourth beta, about what the model is *allowed to see*. Every block of chat context passes through a
-**prompt workspace** (fixed order, byte budgets, a provenance receipt on every admitted block), and each
-turn's admit/drop record lands in `workspace.jsonl` — "why did it say that" has a queryable answer.
-Recalled memory arrives **scored** (numbers per fact), a fact that contradicts a stored one arrives
-marked **[CONTESTED]** with both sides shown, and a sentinel-gated second model audits doubtful memory
-before the answer is written — annotations only, nothing silently deleted.
-[Full notes](docs/release/RELEASE-v1.0.1-beta-4.md) ·
-[beta-3](docs/release/RELEASE-v1.0.1-beta-3.md) — the desktop app around the model ·
-[beta-2](docs/release/RELEASE-v1.0.1-beta-2.md) — the browser finishing the job.
+**Current: [`v1.0.1-beta-5`](https://github.com/gary23w/nl-veil/releases/tag/v1.0.1-beta-5)** — the
+fifth beta, about whether you can *trust what the model did*. A long conversation no longer silently
+loses its own middle (the rolling summary drains oldest-first and never marks unread history as covered),
+a guard-killed turn no longer forges a first-person "I am stuck" note the next turn ruminates on, and an
+interactive turn gains a **spend ceiling** so a runaway can't burn millions of tokens unnoticed. Tool
+traces now carry the **arguments** a call was given plus its duration and outcome. Underneath is a new
+unattended **simulation harness** (`scripts/sim/`) that grades the model against files on disk — never
+against its own account of itself — including grading its own tests by mutations it never saw.
+[Full notes](docs/release/RELEASE-v1.0.1-beta-5.md) ·
+[beta-4](docs/release/RELEASE-v1.0.1-beta-4.md) — the governed prompt workspace ·
+[beta-3](docs/release/RELEASE-v1.0.1-beta-3.md) — the desktop app around the model.
 
 Builds ship on the [Releases page](https://github.com/gary23w/nl-veil/releases), one per
 platform. Unzip and run `veil` — that starts the server **and** opens the desktop app. No Python, no
