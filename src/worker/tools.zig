@@ -305,6 +305,86 @@ pub fn compactAllowed(name: []const u8) bool {
     return false;
 }
 
+/// SMALL-TIER DESCRIPTIONS. The other half of fitting a small window — and the half that costs nothing.
+///
+/// The membership lever (COMPACT_TOOLS) is spent: the belt is already 17 of ~70 verbs, and the only block left
+/// big enough to matter is the browser, which cannot go. Cutting all four makes SCOUT_BROWSER_SCHEMA
+/// (worker/run.zig) a bare ",\n" that is still spliced, handing every scout mind a malformed tools array; cutting
+/// below three disables beltDenial's family-level correction. Meanwhile the belt's REAL cost is prose written for
+/// a large model: measured on the shipped gemma4 tokenizer, the four browser defs are 82-89% description, and
+/// descriptions are ~64% of the whole belt. Rewriting them terser takes the belt roughly in half while removing
+/// no capability at all — which is strictly better for a 12B than hiding verbs from it, the failure the
+/// failure-streak nudge exists to paper over ("offered a 12B four tools its belt hides").
+///
+/// Rules for entries here, learned from the descriptions being replaced: say what the tool DOES and when to reach
+/// for it, in one clause; teach the workflow a small model gets wrong (browser_read yields the refs that
+/// browser_click and browser_type consume); and NEVER name a verb the small belt does not serve — five of the old
+/// descriptions advertised read_url, deep_crawl, pixel_ingest, pixel_capture, absorb, recall_hive and
+/// patch_system to a tier that has none of them, which is the same unadvertised-verb bug the compact system
+/// prompt has a test for.
+const TERSE_DESC = [_]struct { name: []const u8, desc: []const u8 }{
+    // research
+    .{ .name = "web_search", .desc = "Search the web. Returns titles, URLs and snippets." },
+    .{ .name = "web_fetch", .desc = "Fetch a URL and return its readable text. Use this before answering about any page." },
+    // files
+    .{ .name = "read_file", .desc = "Read a file in the workdir. For a large file pass start_line/end_line and read a slice." },
+    .{ .name = "write_file", .desc = "Create or overwrite a file in the workdir with the full content you supply." },
+    .{ .name = "edit_file", .desc = "Replace one exact block of text in a file. Copy the old text VERBATIM from a read_file result, including indentation." },
+    .{ .name = "list_dir", .desc = "List the files and folders in the workdir." },
+    .{ .name = "delete_file", .desc = "Delete a file from the workdir." },
+    // code
+    .{ .name = "run_python", .desc = "Run a Python script in the workdir. Returns stdout, stderr and the exit code." },
+    .{ .name = "run_tests", .desc = "Run the project's tests and return the result." },
+    // memory + documents
+    .{ .name = "recall", .desc = "Look up facts remembered earlier in this conversation." },
+    .{ .name = "observe", .desc = "Remember one durable fact so later turns can recall it." },
+    .{ .name = "read_doc", .desc = "Read a stored document." },
+    .{ .name = "pixel_search", .desc = "Search the text found inside images attached to this conversation." },
+    // browser — read yields the refs the other two consume; say so, because that is the step a small model skips
+    .{ .name = "browser_navigate", .desc = "Open a URL in the real browser. Use when a page needs JavaScript or a login; otherwise prefer web_fetch." },
+    .{ .name = "browser_read", .desc = "Read the current browser page as text. Interactive elements come back numbered as refs — you need these before clicking or typing." },
+    .{ .name = "browser_click", .desc = "Click an element on the current page by its ref from browser_read." },
+    .{ .name = "browser_type", .desc = "Type text into a field on the current page by its ref from browser_read." },
+};
+
+/// The small-tier DESCRIPTION projection: swap each def's description for its TERSE_DESC entry and leave the
+/// `"parameters"` object byte-identical. Composed over compactSchema, never applied to the source blocks — editing
+/// CHAT_SCHEMA in place would change the belt for every mid/large model and trip the verbatim drift guard.
+/// comptime-only, so both belts stay static strings and prefix caching is unaffected. A def whose name has no
+/// entry passes through untouched, so adding a tool to COMPACT_TOOLS without a terse description degrades to
+/// today's text rather than breaking.
+pub fn terseSchema(comptime block: []const u8) []const u8 {
+    @setEvalBranchQuota(1_000_000);
+    comptime var out: []const u8 = "";
+    comptime {
+        var it = std.mem.splitScalar(u8, block, '\n');
+        while (it.next()) |raw| {
+            const line = std.mem.trim(u8, raw, " \t\r,");
+            if (line.len == 0) continue;
+            var emit: []const u8 = line;
+            const nkey = "\"name\":\"";
+            if (std.mem.indexOf(u8, line, nkey)) |at| {
+                const rest = line[at + nkey.len ..];
+                if (std.mem.indexOfScalar(u8, rest, '"')) |end| {
+                    const nm = rest[0..end];
+                    for (TERSE_DESC) |t| {
+                        if (!std.mem.eql(u8, t.name, nm)) continue;
+                        const dkey = "\"description\":\"";
+                        const ds = std.mem.indexOf(u8, line, dkey) orelse break;
+                        const vstart = ds + dkey.len;
+                        // the description value always ends at the parameters key — verified across every belt def
+                        const de = std.mem.indexOfPos(u8, line, vstart, "\",\"parameters\"") orelse break;
+                        emit = line[0..vstart] ++ t.desc ++ line[de..];
+                        break;
+                    }
+                }
+            }
+            out = if (out.len == 0) emit else out ++ ",\n" ++ emit;
+        }
+    }
+    return out;
+}
+
 /// The small-tier projection of a schema block — DERIVED from compactAllowed exactly as sandboxSchema is
 /// derived from sandboxAllowed (see the drift argument there; it applies verbatim). comptime-only, so the
 /// variant is a static string and picking between belts costs a turn nothing.
