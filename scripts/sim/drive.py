@@ -132,7 +132,9 @@ def watch(conv, sink, turn_idx, start_off, budget_s=900):
 def send(conv, text, model, base_url, loop=0, fast=False):
     body = {"text": text, "base_url": base_url, "model": model, "api_key": API_KEY,
             "loop": loop, "tool_client": False, "fast": fast, "trace": True}
-    return req("POST", "/api/v1/chat/convs/%s/messages" % conv, body, timeout=60)
+    # 180s, not 60: the POST only has to be ACCEPTED, but a server already working another
+    # conversation can be slow to get there, and a timeout here loses the whole scenario.
+    return req("POST", "/api/v1/chat/convs/%s/messages" % conv, body, timeout=180)
 
 
 def run_scenario(name, turns, model, base_url, loop=0, conv=None):
