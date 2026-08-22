@@ -50,6 +50,39 @@ def req(method, path, body=None, timeout=60):
         return e.code, dict(e.headers or {}), e.read().decode("utf-8", "replace")
 
 
+def conv_state(conv):
+    """Per-turn context mechanics, read straight from the conversation store.
+
+    Answer-correctness alone cannot tell a REASONING failure from a CONTINUITY failure. These are the
+    numbers that distinguish them: how big the durable log has grown, how much of it the rolling
+    summary claims to cover, and therefore whether the turn that just ran was reading history
+    verbatim or reading a summary of it. A recall miss at the exact turn `covered` jumps is a
+    context bug; the same miss with a healthy window is a reasoning bug.
+    """
+    base = os.path.join(REPO, "data", "u1", "_chat", "convs", conv)
+    out = {}
+    try:
+        out["messages_bytes"] = os.path.getsize(os.path.join(base, "messages.jsonl"))
+    except OSError:
+        out["messages_bytes"] = 0
+    try:
+        out["events_bytes"] = os.path.getsize(os.path.join(base, "events.jsonl"))
+    except OSError:
+        out["events_bytes"] = 0
+    try:
+        cj = json.load(io.open(os.path.join(base, "context.json"), encoding="utf-8"))
+        out["covered"] = cj.get("covered", 0)
+        out["summary_len"] = len(cj.get("summary", "") or "")
+    except Exception:
+        out["covered"] = 0
+        out["summary_len"] = 0
+    # HISTORY_WINDOW_BYTES is 28 KiB: past that, the oldest turns stop being replayed verbatim and
+    # continuity depends entirely on the summary.
+    out["window_rolled"] = out["messages_bytes"] > 28 * 1024
+    out["uncovered_bytes"] = max(0, out["messages_bytes"] - 28 * 1024 - out["covered"])
+    return out
+
+
 def watch(conv, sink, turn_idx, start_off, budget_s=900):
     """Stream one turn's events to `sink`, returning a per-turn summary."""
     off, done, t0 = start_off, False, time.time()
@@ -168,14 +201,22 @@ def run_scenario(name, turns, model, base_url, loop=0, conv=None):
             r = watch(conv, sink, i, off)
             off = r["next_off"]
             ans = r["answer"].strip()
-            print("    %.1fs  kinds=%s  tools=%d  answer=%dch%s" % (
-                r["secs"], r["kinds"], len(r["tools"]), len(ans),
-                ("  ERRORS=%s" % r["errors"][:2]) if r["errors"] else ""), flush=True)
+            r["ctx"] = conv_state(conv)   # read the store BEFORE the print that reports it
+            c = r["ctx"]
+            print("    %.1fs  tools=%-3d answer=%-5dch  log=%dKB covered=%dKB%s%s" % (
+                r["secs"], len(r["tools"]), len(ans),
+                c["messages_bytes"] // 1024, c["covered"] // 1024,
+                "  WINDOW-ROLLED" if c["window_rolled"] else "",
+                ("  ERRORS=%s" % r["errors"][:1]) if r["errors"] else ""), flush=True)
             if ans:
                 print("    > %s" % ans[:220].replace("\n", " "), flush=True)
             r.pop("events", None)
             r["answer"] = ans[:4000]
             summary["turns"].append(r)
+            # write after EVERY turn: a 150-turn run that dies at turn 120 must still be gradeable,
+            # and an end-of-scenario-only write throws away everything on any abort
+            with open(os.path.join(OUT, "summary-%s.json" % name), "w", encoding="utf-8") as sf:
+                json.dump(summary, sf, indent=1, ensure_ascii=False)
     with open(os.path.join(OUT, "summary-%s.json" % name), "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=1, ensure_ascii=False)
     return summary
