@@ -4106,7 +4106,7 @@ pub const Chat = struct {
         // Re-focusing a conversation that has been running in the BACKGROUND: reclaim its slot and force a fresh
         // server re-mirror below, so the transcript the desk shows is the server's current truth (the desk never
         // rendered it while backgrounded) and the live poller re-attaches if the turn is still going.
-        const was_bg = self.bgRemove(id);
+        _ = self.bgRemove(id); // side effect only: the return fed the old `remirror` gate
         {
             self.store.lock();
             defer self.store.unlock();
@@ -4120,7 +4120,7 @@ pub const Chat = struct {
         self.releaseServerCastDisplay("detached (left the conversation)"); // a server-cast display cannot span a conversation switch
         self.resetArcFlags(); // a stale arc_mutated/fail pair must not leak a verify turn or lesson across chats
         self.mirror_live = false; // stale liveness from a previous select must never arm a watch on THIS conv
-        self.loadMsgs(dd, id, was_bg);
+        self.loadMsgs(dd, id);
         { // re-anchor the loop's durable goal to THIS conversation's first message
             self.store.lock();
             defer self.store.unlock();
@@ -5321,16 +5321,24 @@ pub const Chat = struct {
         return std.fmt.bufPrint(buf, "{s}/.veil-desk/chats/{s}.jsonl", .{ dd, id }) catch null;
     }
 
-    fn loadMsgs(self: *Chat, dd: []const u8, id: []const u8, remirror: bool) void {
+    fn loadMsgs(self: *Chat, dd: []const u8, id: []const u8) void {
         var pb: [700]u8 = undefined;
         const path = convPath(dd, id, &pb) orelse return;
-        // SCHEDULED runs live server-side and GROW there (a run may still be streaming, or finished after the
-        // mirror was cut) — a once-mirrored snapshot showed the prompt with no reply and read as "the task
-        // never executed". Re-mirror on EVERY select so the view is the server's current truth; the local copy
-        // is refreshed in place (best-effort — a down server just shows the last mirror). `remirror` forces the
-        // same refresh for a conversation returning from the BACKGROUND (the desk never rendered it while it ran
-        // there, so its local copy is stale) — and sets mirror_live, so the poller re-attaches if it's still going.
-        if (remirror or std.mem.startsWith(u8, id, "scheduled_")) _ = self.mirrorServerConv(dd, id);
+        // ANY conversation can live server-side and GROW there — a run may still be streaming, or have finished
+        // after the mirror was cut — and a once-mirrored snapshot then shows the prompt with no reply and reads
+        // as "the task never executed". Re-mirror on EVERY select so the view is the server's current truth; the
+        // local copy is refreshed in place (best-effort — a down server just shows the last mirror), and
+        // mirror_live is set so the poller re-attaches if the turn is still going. The old `remirror` flag
+        // forced this for a conversation returning from the BACKGROUND; that case is covered by making it
+        // unconditional, which is what it wanted anyway.
+        //
+        // This used to be gated on the id starting with "scheduled_", which is a NAME standing in for a
+        // property. Any conversation driven through the chat API — a simulation harness, a remote client, a
+        // second desk — grows server-side under an ordinary id, and every one of them was frozen at whatever
+        // the first mirror caught. Observed live: a challenge run mirrored at 924 bytes on its first turn and
+        // never updated again while the server's copy passed 400 KB, so the run was invisible to the person
+        // watching it. mirrorServerConv's shrink guard is what makes the unconditional call safe.
+        _ = self.mirrorServerConv(dd, id);
         const data = Io.Dir.cwd().readFileAlloc(self.io, path, self.gpa, .limited(2 << 20)) catch blk: {
             // No local file: a SERVER-born conversation (a scheduled_* run merged into the sidebar by
             // refreshConvs). Mirror it down once, then load through the unchanged local path — every
@@ -5397,6 +5405,12 @@ pub const Chat = struct {
         var img_vals: [16][]const u8 = undefined; // escaped "img" path (into old_data)
         var img_n: usize = 0;
         var old_data: ?[]u8 = null;
+        // How many messages the LOCAL mirror already holds. A re-mirror must never SHRINK a conversation:
+        // turns can run on the local engine against a reachable server (refreshConvs' sort-key comment calls
+        // that combination ordinary, not exotic), so the local file can legitimately hold messages the server
+        // never saw. Re-mirroring on every select — which is what makes a live server-side run visible at all —
+        // would otherwise silently delete them.
+        var local_msgs: usize = 0;
         defer if (old_data) |d| self.gpa.free(d);
         {
             var pb0: [700]u8 = undefined;
@@ -5405,17 +5419,23 @@ pub const Chat = struct {
                     old_data = d;
                     var lines = std.mem.splitScalar(u8, d, '\n');
                     while (lines.next()) |ln| {
-                        if (img_n >= img_keys.len) break;
                         const trimmed = std.mem.trim(u8, ln, " \r\t");
                         if (trimmed.len < 2 or trimmed[0] != '{') continue;
                         var role0: u8 = 2;
                         var t0: []const u8 = "";
                         var im0: []const u8 = "";
+                        var had_r = false;
                         var c0: usize = 0;
                         while (scan.nextJsonPair(trimmed, &c0)) |p| {
-                            if (std.mem.eql(u8, p.key, "r")) role0 = if (p.raw.len > 0 and p.raw[0] == '0') 0 else 2 else if (p.is_str and std.mem.eql(u8, p.key, "t")) t0 = p.raw else if (p.is_str and std.mem.eql(u8, p.key, "img")) im0 = p.raw;
+                            if (std.mem.eql(u8, p.key, "r")) {
+                                had_r = true;
+                                role0 = if (p.raw.len > 0 and p.raw[0] == '0') 0 else 2;
+                            } else if (p.is_str and std.mem.eql(u8, p.key, "t")) t0 = p.raw else if (p.is_str and std.mem.eql(u8, p.key, "img")) im0 = p.raw;
                         }
-                        if (role0 == 0 and im0.len > 0) {
+                        // the {"title"} header has no "r" — only real message rows count
+                        if (had_r) local_msgs += 1;
+                        // the image table is bounded; running out of slots must NOT stop the count above
+                        if (role0 == 0 and im0.len > 0 and img_n < img_keys.len) {
                             img_keys[img_n] = t0;
                             img_vals[img_n] = im0;
                             img_n += 1;
@@ -5450,6 +5470,7 @@ pub const Chat = struct {
         jb.appendSlice(self.gpa, "{\"title\":\"") catch return false;
         if (title_n > 0) escJson(&jb, self.gpa, titleb[0..title_n]);
         jb.appendSlice(self.gpa, "\"}\n") catch return false;
+        var srv_msgs: usize = 0;
         var cur = arr + "\"messages\":[".len;
         while (scan.nextJsonObj(resp.body, &cur)) |obj| {
             var role: u8 = 2; // default: anything that isn't a user/assistant turn folds in as a .cast_note
@@ -5463,6 +5484,7 @@ pub const Chat = struct {
                 }
             }
             if (raw.len == 0) continue;
+            srv_msgs += 1;
             jb.print(self.gpa, "{{\"r\":{d},\"t\":\"", .{role}) catch return false;
             jb.appendSlice(self.gpa, raw) catch return false; // still-escaped server JSON, byte-compatible with loadMsgs
             jb.append(self.gpa, '"') catch return false;
@@ -5483,8 +5505,12 @@ pub const Chat = struct {
         }
         var pb: [700]u8 = undefined;
         const path = convPath(dd, id, &pb) orelse return false;
+        // THE SHRINK GUARD. The server knowing FEWER messages than the local mirror does not mean the extra
+        // ones are gone — it means they were never the server's to know. Keep the local file and report
+        // success: the caller reads it, `mirror_live` is already set, and nothing is lost either way.
+        if (old_data != null and srv_msgs < local_msgs) return true;
         Io.Dir.cwd().writeFile(self.io, .{ .sub_path = path, .data = jb.items }) catch return false;
-        log.info("chat: mirrored server conv {s} ({d}b)", .{ id, jb.items.len });
+        log.info("chat: mirrored server conv {s} ({d}b, {d} msg)", .{ id, jb.items.len, srv_msgs });
         return true;
     }
 
