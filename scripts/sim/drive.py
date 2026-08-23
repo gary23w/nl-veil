@@ -8,7 +8,7 @@ records EVERYTHING to JSONL so a long-tail run can be analysed after the fact.
 The API key is taken from the VEIL_API_KEY environment variable and is never written to
 disk, never logged, and never echoed into a trace file.
 """
-import json, os, sys, time, urllib.request, urllib.error, uuid, re
+import io, json, os, sys, time, urllib.request, urllib.error, uuid, re
 # the console here is cp1252; a single unicode arrow in a model answer used to abort the whole suite
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -21,6 +21,7 @@ REPO = os.environ.get("VEIL_REPO",
     os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")))
 OUT = os.environ.get("SIM_OUT", ".")
 API_KEY = os.environ.get("VEIL_API_KEY", "")
+RESUME = "--resume" in sys.argv or os.environ.get("SIM_RESUME") == "1"
 
 with open(os.path.join(REPO, "data", ".desktop_key"), "r", encoding="utf-8") as f:
     TOKEN = f.read().strip()
@@ -73,9 +74,14 @@ def conv_state(conv):
         cj = json.load(io.open(os.path.join(base, "context.json"), encoding="utf-8"))
         out["covered"] = cj.get("covered", 0)
         out["summary_len"] = len(cj.get("summary", "") or "")
-    except Exception:
+    except Exception as e:
+        # DO NOT swallow this. A bare `except` here hid a NameError (io was not imported) for an
+        # entire 100-turn run, reporting covered=0 throughout while context.json on disk said
+        # 257815. Silent zeros are worse than a missing field: they look like a real measurement and
+        # they pointed at an engine bug that did not exist.
         out["covered"] = 0
         out["summary_len"] = 0
+        out["ctx_read_error"] = "%s: %s" % (type(e).__name__, e)
     # HISTORY_WINDOW_BYTES is 28 KiB: past that, the oldest turns stop being replayed verbatim and
     # continuity depends entirely on the summary.
     out["window_rolled"] = out["messages_bytes"] > 28 * 1024
@@ -175,9 +181,28 @@ def run_scenario(name, turns, model, base_url, loop=0, conv=None):
     path = os.path.join(OUT, "trace-%s.jsonl" % name)
     summary = {"scenario": name, "conv": conv, "model": model, "turns": []}
     off = 0
+    # RESUME. A multi-hour run will be interrupted — a server restart, a session ending, a machine
+    # sleeping. Without this the only options are losing hours of work or replaying turns against a
+    # conversation that already contains them, which corrupts the very state being measured. The
+    # per-turn summary write is what makes this possible: it is the checkpoint.
+    done = 0
+    spath = os.path.join(OUT, "summary-%s.json" % name)
+    if RESUME and os.path.exists(spath):
+        try:
+            prev = json.load(open(spath, encoding="utf-8"))
+            if prev.get("conv") == conv:
+                summary = prev
+                done = len([t for t in prev.get("turns", []) if (t.get("answer") or "").strip()])
+                off = max((t.get("next_off", 0) for t in prev.get("turns", [])), default=0)
+                print("  RESUME: %d turn(s) already done, continuing at %d (event offset %d)"
+                      % (done, done + 1, off), flush=True)
+        except Exception as e:
+            print("  RESUME: could not read checkpoint (%s) — starting fresh" % type(e).__name__, flush=True)
     print("\n=== SCENARIO %s  conv=%s  (%d turns) ===" % (name, conv, len(turns)), flush=True)
-    with open(path, "w", encoding="utf-8") as sink:
+    with open(path, "a" if RESUME else "w", encoding="utf-8") as sink:
         for i, t in enumerate(turns, 1):
+            if i <= done:
+                continue
             prompt = t["text"] if isinstance(t, dict) else t
             tl = t.get("loop", loop) if isinstance(t, dict) else loop
             print("  [turn %d/%d] %s" % (i, len(turns), prompt[:90].replace("\n", " ")), flush=True)
