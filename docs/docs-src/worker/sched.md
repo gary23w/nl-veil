@@ -10,6 +10,8 @@
 
 A task is one JSON file at `{data}/u{uid}/_sched/{id}.json`. When it comes due, the scheduler thread mints a brand-new chat conversation named `scheduled_{id}_{MMDDHHMM}` and fires one normal server chat turn at it via the SAME engine entry points the `/messages` route uses (`tryBeginTurn` + `spawnTurn`). The run therefore persists under `_chat/convs/`, streams events, shows up in the conversation list, and can be continued by hand afterwards. The scheduler owns nothing about how the turn runs — only WHEN the first message is posted.
 
+**A fresh conversation per run is why [resume anchors](#doc=worker/continuity) exist.** The next run's `assembleHistory` opens an empty `messages.jsonl` and a `context.json` that does not exist, so the engine row a cut turn commits is addressed to a transcript nobody will read — a task that kept hitting the spend ceiling restarted from zero every single run, forever. The engine's memory scope for a scheduled run is `sched:{taskid}`, stable across runs while `conv_dir` is not, so the continuation state pressed under `resume:sched:{taskid}` is read back by the NEXT run and it picks up where the last one was cut.
+
 ## The task model (wire contract)
 
 | field | meaning |
