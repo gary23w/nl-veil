@@ -6,7 +6,7 @@
 
 <p>
   <a href="https://github.com/gary23w/nl-veil/actions/workflows/release.yml"><img alt="build" src="https://github.com/gary23w/nl-veil/actions/workflows/release.yml/badge.svg"></a>
-  <a href="https://github.com/gary23w/nl-veil/releases"><img alt="release" src="https://img.shields.io/badge/release-v1.0.1--beta--4-A8241B"></a>
+  <a href="https://github.com/gary23w/nl-veil/releases"><img alt="release" src="https://img.shields.io/badge/release-v1.0.1--beta--6-A8241B"></a>
   <img alt="zig" src="https://img.shields.io/badge/zig-0.16-F7A41D?logo=zig&logoColor=white">
   <a href="https://huggingface.co/gary23w/the-veil-12b"><img alt="built-in model" src="https://img.shields.io/badge/built--in%20model-the--veil--12b-6E4A27?logo=huggingface&logoColor=white"></a>
   <a href="https://huggingface.co/gary23w/gary-neuron-emergent"><img alt="memory cortex" src="https://img.shields.io/badge/cortex-gary--neuron--emergent-6E4A27?logo=huggingface&logoColor=white"></a>
@@ -121,7 +121,7 @@ raylib is a *lazy* dependency, so `-Dapp=false` never fetches it at all.
 ## Install
 
 **Download it and run it — no toolchain, nothing to build.** Grab your platform's bundle from the
-**[latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.0.1-beta-5)**, unzip, and run `veil`:
+**[latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.0.1-beta-6)**, unzip, and run `veil`:
 
 | You're on | Download | Then run |
 |---|---|---|
@@ -282,7 +282,7 @@ step 5** — the rest is about letting other people in.
 
 ### 1. Download and unblock it
 
-Grab the bundle for your OS from the [latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.0.1-beta-5)
+Grab the bundle for your OS from the [latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.0.1-beta-6)
 and unzip it somewhere you'll find again. Builds are unsigned, so:
 
 - **Windows** shows *"Windows protected your PC"* → **More info** → **Run anyway**.
@@ -705,6 +705,13 @@ conversation named `scheduled_*` and fires **one ordinary chat turn** at it — 
 its events, shows up in the conversation list, and can be continued by hand afterwards. Manage them with
 `veil sched` (admin-gated):
 
+Because every run gets a *new* conversation, a run that was cut short used to leave nothing the next one
+could read, and a task that kept hitting the spend ceiling restarted from zero every time. Since
+`v1.0.1-beta-6` the engine banks what a cut run established as a **resume anchor** against the task
+itself rather than against the transcript, so the next run reads it back and picks up from the step it
+names. A run that finishes cleanly clears its own anchor, so this is invisible until something is
+actually left unfinished.
+
 ```sh
 veil sched add --name nightly --prompt "summarize today's repo changes" --kind daily --at 22:00
 veil sched add --name watch   --prompt "check the build and report" --kind every --every 30
@@ -1027,6 +1034,9 @@ what changed is that the dangerous verbs are now refused inside a turn, not just
 | `NL_ADMIN_EMAIL` / `NL_ADMIN_PASSWORD` | the admin account. Defaults to `admin@neuron-loops.local` with a password generated on first run and written to `data/admin-password.txt`; set `NL_ADMIN_PASSWORD` to pin your own and no file is written |
 | `NL_MAX_TURNS` | how many chat turns run at once, server-wide (default 64, ceiling 256). Size it to the rate limit of the provider key everyone shares |
 | `NL_MAX_TURNS_PER_USER` | how many of those one account may hold (default: an eighth of capacity). This is what stops one busy user starving everyone else |
+| `NL_TURN_TOKEN_CEILING` | input tokens one turn **segment** may spend before the engine compacts its working context and continues (default 400000; `0` disables the ceiling). A runaway backstop, not a budget — a thorough research turn lands well under it |
+| `NL_TURN_CONTINUE_MAX` | how many times one turn may compact and keep going (default 3). **`0` restores beta-5's behaviour exactly**: the turn settles at the ceiling and waits for you |
+| `NL_TURN_CONTINUE_HARD_MAX` | the ceiling on the *earned* allowance (default 10). A segment that wrote a file or made a call it had not made before buys one more pass, up to this; a segment that only re-read its own context buys nothing, so a spinning turn still settles at `NL_TURN_CONTINUE_MAX` |
 | `NL_KEEPALIVE_REQUESTS` | requests one connection serves before recycling (default 200). Drop to 1 if you hit a stuck-socket worker thread |
 | `NL_DEFAULT_MODEL` / `NL_DEFAULT_BASE_URL` | **seeds** the default model on a fresh install, for unattended provisioning. Afterwards set it in **Admin → Default model** — that persists to `data/server-config.json` and wins over the environment, so a stale launch script cannot undo the admin on the next restart |
 | `NL_OPEN_REGISTRATION` | let people sign themselves up. Off by default; the admin creates accounts from the Admin tab instead |
@@ -1073,6 +1083,8 @@ src/
                                                    window, plan board, client file-sync, tool
                                                    timings, and conversation paths
     sched.zig              scheduled tasks (each run is a server chat conversation)
+    continuity.zig         resume anchors — what a cut unit of work established, banked in
+                                                   neuron-db so the next run continues it
     control/{supervisor,writer,fanout}.zig  swarm processes, the control bus, event streaming
     deploy/service.zig     the cast/deploy door + swarm files, bundle, archive, lifecycle
     neuron/client.zig      the neuron-db memory bridge (fail-open)
@@ -1110,17 +1122,20 @@ dependency entirely rather than compiling it unused.
 
 ## Release
 
-**Current: [`v1.0.1-beta-5`](https://github.com/gary23w/nl-veil/releases/tag/v1.0.1-beta-5)** — the
-fifth beta, about whether you can *trust what the model did*. A long conversation no longer silently
-loses its own middle (the rolling summary drains oldest-first and never marks unread history as covered),
-a guard-killed turn no longer forges a first-person "I am stuck" note the next turn ruminates on, and an
-interactive turn gains a **spend ceiling** so a runaway can't burn millions of tokens unnoticed. Tool
-traces now carry the **arguments** a call was given plus its duration and outcome. Underneath is a new
-unattended **simulation harness** (`scripts/sim/`) that grades the model against files on disk — never
-against its own account of itself — including grading its own tests by mutations it never saw.
-[Full notes](docs/release/RELEASE-v1.0.1-beta-5.md) ·
-[beta-4](docs/release/RELEASE-v1.0.1-beta-4.md) — the governed prompt workspace ·
-[beta-3](docs/release/RELEASE-v1.0.1-beta-3.md) — the desktop app around the model.
+**Current: [`v1.0.1-beta-6`](https://github.com/gary23w/nl-veil/releases/tag/v1.0.1-beta-6)** — the
+sixth beta, about **continuity**. beta-5's spend ceiling stopped a runaway turn but ended it outright,
+throwing away everything it had gathered, so the next turn started over and usually hit the same wall
+the same way. Now a turn that outgrows its budget distils what the stretch established (*established /
+on disk / ruled out / next*), drops the bloated context, and **keeps going on its own** — the allowance
+is earned by segments that actually wrote a file or made a new call. The same record is banked durably
+in neuron-db as a **resume anchor**, so a scheduled task, which gets a brand-new conversation every run,
+resumes yesterday's work instead of restarting it. That whole feature was silently dead on hosted
+reasoning models, which spent their entire budget on hidden reasoning and returned nothing; the client
+now learns the model and raises the floor by itself. In the desktop, selecting a conversation someone
+else is driving refreshes it instead of showing a frozen snapshot.
+[Full notes](docs/release/RELEASE-v1.0.1-beta-6.md) ·
+[beta-5](docs/release/RELEASE-v1.0.1-beta-5.md) — trusting what the model did ·
+[beta-4](docs/release/RELEASE-v1.0.1-beta-4.md) — the governed prompt workspace.
 
 Builds ship on the [Releases page](https://github.com/gary23w/nl-veil/releases), one per
 platform. Unzip and run `veil` — that starts the server **and** opens the desktop app. No Python, no

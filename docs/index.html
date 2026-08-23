@@ -143,7 +143,7 @@
           Windows <span class="dl-arch">x86-64</span>
         </span>
         <span class="dl-file">veil-&hellip;-windows-x86_64.zip</span>
-        <a class="btn btn-solid" href="https://github.com/gary23w/nl-veil/releases/tag/v1.0.1-beta-5" target="_blank" rel="noopener">Download</a>
+        <a class="btn btn-solid" href="https://github.com/gary23w/nl-veil/releases/tag/v1.0.1-beta-6" target="_blank" rel="noopener">Download</a>
       </div>
       <div class="dl-card" data-os="macarm">
         <span class="dl-os">
@@ -151,7 +151,7 @@
           macOS <span class="dl-arch">Apple Silicon</span>
         </span>
         <span class="dl-file">veil-&hellip;-macos-arm64.zip</span>
-        <a class="btn btn-solid" href="https://github.com/gary23w/nl-veil/releases/tag/v1.0.1-beta-5" target="_blank" rel="noopener">Download</a>
+        <a class="btn btn-solid" href="https://github.com/gary23w/nl-veil/releases/tag/v1.0.1-beta-6" target="_blank" rel="noopener">Download</a>
       </div>
       <div class="dl-card" data-os="macintel">
         <span class="dl-os">
@@ -159,7 +159,7 @@
           macOS <span class="dl-arch">Intel</span>
         </span>
         <span class="dl-file">veil-&hellip;-macos-x86_64.zip</span>
-        <a class="btn btn-solid" href="https://github.com/gary23w/nl-veil/releases/tag/v1.0.1-beta-5" target="_blank" rel="noopener">Download</a>
+        <a class="btn btn-solid" href="https://github.com/gary23w/nl-veil/releases/tag/v1.0.1-beta-6" target="_blank" rel="noopener">Download</a>
       </div>
       <div class="dl-card" data-os="linux">
         <span class="dl-os">
@@ -167,7 +167,7 @@
           Linux <span class="dl-arch">x86-64</span>
         </span>
         <span class="dl-file">veil-&hellip;-linux-x86_64.zip</span>
-        <a class="btn btn-solid" href="https://github.com/gary23w/nl-veil/releases/tag/v1.0.1-beta-5" target="_blank" rel="noopener">Download</a>
+        <a class="btn btn-solid" href="https://github.com/gary23w/nl-veil/releases/tag/v1.0.1-beta-6" target="_blank" rel="noopener">Download</a>
       </div>
     </div>
 
@@ -182,18 +182,23 @@
         is served by the server itself &mdash; no separate model runtime, no API key. Click <em>download the
         model</em> in the app (or run <code>veil model pull</code>) and the whole thing works offline. Point it
         at Ollama or any OpenAI-compatible endpoint instead whenever you would rather.</p>
-      <p><strong>What&rsquo;s in <code>v1.0.1-beta-5</code>.</strong> The fifth beta, about whether you can
-        <em>trust what the model did</em>. A long conversation no longer silently loses its own middle &mdash; the
-        rolling summary drains oldest-first and never marks unread history as covered &mdash; a guard-killed turn no
-        longer forges a first-person &ldquo;I am stuck&rdquo; note the next turn ruminates on, and an interactive turn
-        gains a <strong>spend ceiling</strong> so a runaway can&rsquo;t burn millions of tokens unnoticed. Tool traces
-        now carry the <strong>arguments</strong> a call was given, plus its duration and outcome. Underneath is a new
-        unattended <strong>simulation harness</strong> that grades the model against files on disk &mdash; never against
-        its own account of itself &mdash; including grading its own tests by mutations it never saw.
-        <a href="https://github.com/gary23w/nl-veil/blob/main/docs/release/RELEASE-v1.0.1-beta-5.md" target="_blank" rel="noopener">Full release notes &rarr;</a></p>
-      <p class="dim">Earlier: <code>beta-4</code> put every block of chat context through a governed prompt workspace
-        with receipts and budgets, and <code>beta-3</code> added the desktop app around the model.
-        <a href="https://github.com/gary23w/nl-veil/blob/main/docs/release/RELEASE-v1.0.1-beta-4.md" target="_blank" rel="noopener">beta-4 notes &rarr;</a></p>
+      <p><strong>What&rsquo;s in <code>v1.0.1-beta-6</code>.</strong> The sixth beta, about
+        <em>continuity</em>. beta-5 gave a runaway turn a spend ceiling, which stopped the spend and ended the work:
+        everything the turn had gathered died with it, so the next turn started over and usually hit the same wall the
+        same way. Now a turn that outgrows its budget <strong>distils what the stretch established</strong> &mdash;
+        what is settled, what is on disk, what it ruled out, what comes next &mdash; drops the bloated context, and
+        <strong>keeps going on its own</strong>, with the allowance earned by passes that actually wrote a file or made
+        a new call. The same record is banked durably in neuron-db as a <strong>resume anchor</strong>, so a scheduled
+        task &mdash; which opens a brand-new conversation every run &mdash; resumes instead of restarting. That whole
+        feature was silently dead on hosted reasoning models, which spend their budget on hidden reasoning and return
+        an empty answer; the client now recognises the signature, raises the floor and remembers the model. And in the
+        desktop, selecting a conversation something else is driving refreshes it instead of showing a frozen snapshot.
+        <a href="https://github.com/gary23w/nl-veil/blob/main/docs/release/RELEASE-v1.0.1-beta-6.md" target="_blank" rel="noopener">Full release notes &rarr;</a></p>
+      <p class="dim">Earlier: <code>beta-5</code> was about trusting what the model did &mdash; a long chat that stops
+        losing its own middle, a spend ceiling on a runaway turn, and traces that show what each tool was actually
+        asked &mdash; and <code>beta-4</code> put every block of chat context through a governed prompt workspace with
+        receipts and budgets.
+        <a href="https://github.com/gary23w/nl-veil/blob/main/docs/release/RELEASE-v1.0.1-beta-5.md" target="_blank" rel="noopener">beta-5 notes &rarr;</a></p>
       <p class="dim">Building it yourself instead &mdash; needs Zig 0.16+:</p>
       <pre class="md-code"><code>git clone https://github.com/gary23w/nl-veil
 cd nl-veil

@@ -9727,14 +9727,28 @@ test "a fused handoff rides the ENGINE row, so a streak of cut turns still repla
 }
 
 test "rolling past the spend ceiling stays bounded, and hands the next segment an engine record it can act on" {
-    // WORST-CASE SPEND is the whole reason this is allowed to roll at all. The ceiling is a runaway backstop
-    // (the measured runaway was 1.83M input tokens in ONE turn); rolling on turns that open-ended number into
-    // (1 + max) ceilings, which is a number an operator can reason about and an env var can change.
+    // WORST-CASE SPEND is the whole reason this is allowed to roll at all, and after the allowance became
+    // EARNED there are two worst cases, not one. Pinning only the flat cap (which is what this test did when
+    // the cap WAS the bound) now asserts a guarantee the engine no longer offers: the hard max is 10, so the
+    // true ceiling-times-passes figure is 4.4M, not the 1.6M a reader of the old assertion would take away.
+    //
+    // The invariant that still protects an operator is the SPINNING one. A segment extends the allowance only
+    // by writing a file or making a call it had not made before (seg_files / seg_calls); a turn producing
+    // neither earns nothing and settles at the flat cap. So a turn that is going in circles — the shape the
+    // ceiling was built for, measured at 1,825,951 input tokens in ONE turn — still cannot outspend it.
     try std.testing.expectEqual(@as(u32, 3), TURN_CONTINUE_MAX_DEFAULT);
-    const worst = (1 + @as(u64, TURN_CONTINUE_MAX_DEFAULT)) * TURN_TOKEN_CEILING_DEFAULT;
-    try std.testing.expectEqual(@as(u64, 1_600_000), worst);
-    // ...and it must stay BELOW the runaway that motivated the ceiling, or the backstop has been undone.
-    try std.testing.expect(worst < 1_825_951);
+    const spinning_worst = (1 + @as(u64, TURN_CONTINUE_MAX_DEFAULT)) * TURN_TOKEN_CEILING_DEFAULT;
+    try std.testing.expectEqual(@as(u64, 1_600_000), spinning_worst);
+    try std.testing.expect(spinning_worst < 1_825_951);
+
+    // And the PRODUCTIVE bound is stated outright rather than left to be discovered from a passing test: a
+    // turn that keeps landing real work may spend this much, deliberately, and NL_TURN_CONTINUE_HARD_MAX is
+    // the knob. Asserted so that moving the default is a decision someone makes here, not a silent drift.
+    try std.testing.expectEqual(@as(u32, 10), TURN_CONTINUE_HARD_MAX_DEFAULT);
+    const productive_worst = (1 + @as(u64, TURN_CONTINUE_HARD_MAX_DEFAULT)) * TURN_TOKEN_CEILING_DEFAULT;
+    try std.testing.expectEqual(@as(u64, 4_400_000), productive_worst);
+    // Earning can only ever RAISE the allowance from the flat cap toward the hard bound, never below it.
+    try std.testing.expect(TURN_CONTINUE_HARD_MAX_DEFAULT >= TURN_CONTINUE_MAX_DEFAULT);
 
     // The re-seed message has to do two jobs the state block cannot do for itself: forbid the redo (the
     // failure being fixed is a turn that restarted and re-paid for work it had already done), and say the
