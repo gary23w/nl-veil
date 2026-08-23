@@ -138,6 +138,19 @@ const TURN_TOKEN_CEILING_DEFAULT: u64 = 400_000;
 /// 0 restores the settle-and-wait behaviour exactly.
 const TURN_CONTINUE_MAX_DEFAULT: u32 = 3;
 
+/// The hard bound that a PRODUCTIVE turn may extend its continue allowance to.
+///
+/// Three was the right number for the case that motivated it — a long research-and-write turn — and the wrong
+/// number for the case that actually needs it most: an unattended run working a hard problem, where the task is
+/// genuinely long and every segment is genuinely getting somewhere. A flat cap cannot tell those apart from a
+/// turn that is spinning, so it cut both at the same arbitrary place.
+///
+/// So the allowance is earned rather than fixed: a segment that wrote a file or made a call it had not made
+/// before buys one more, up to this bound. A segment that produced neither buys nothing, and a spinning turn
+/// still settles at TURN_CONTINUE_MAX_DEFAULT exactly as before. Worst case is bounded by this number times the
+/// per-segment ceiling and is visible in the usage frame at every boundary; every segment still re-checks Stop.
+const TURN_CONTINUE_HARD_MAX_DEFAULT: u32 = 10;
+
 /// The user turn the engine writes to itself when it rolls past the spend ceiling. Addressed to the model as
 /// an instruction because that is the slot it occupies; the CONTINUATION STATE it refers to arrived in the
 /// system turn immediately above it. Deliberately short — it is a handover, and everything worth saying about
@@ -147,7 +160,18 @@ const CONTINUE_SEGMENT_MSG = "Continue this work from the CONTINUATION STATE abo
 /// What the spend ceiling writes when it settles a turn. Third person and engine-attributed for the same reason
 /// LOOP_STOP_NOTE is: it is committed as a system/engine row, never in the model's voice, so the next turn reads
 /// a machine event rather than an apparent confession of failure.
-const TOKEN_CEILING_NOTE = "[engine: this turn hit its spend ceiling and was settled early — it had gathered a lot of context and each further round re-sends all of it. What is already written to the workdir is real. If more work is needed, ask for the next piece as a new turn rather than repeating this one.]";
+///
+/// It must not be addressed to a human. The earlier wording ended "ask for the next piece as a new turn", which
+/// assumes someone is sitting there to ask — and this note is precisely what an unattended run hits at 3am. Worse,
+/// it is the row the NEXT reader is grounded on, so it was telling an automatic continuation not to continue.
+///
+/// It must also not read as an alarm, because it is not one. What actually happened is the compactor doing its job:
+/// distil the findings, release the span that grew, restart small. Describing that as "hit its ceiling and was
+/// settled early" told every reader — the model on the next turn, and the human reading over its shoulder — that
+/// something had broken, and a model that believes the run is damaged starts over instead of continuing. The
+/// wording states the mechanism and that the work is intact, which is true whether the reader is a person, the
+/// desk's idle re-prompt, or a scheduled driver.
+const TOKEN_CEILING_NOTE = "engine: the working context for this stretch was COMPACTED.";
 /// CONTINUATION-STATE WRITER (thinking). Deliberately NOT summarizeWorkingSpan's prompt.
 ///
 /// That one compresses a working log so the SAME turn can keep going — its reader still holds the verbatim tail
@@ -2779,6 +2803,17 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     else
         TURN_CONTINUE_MAX_DEFAULT;
     var continues: u32 = 0;
+    // Continue allowance EARNED by segments that produced something, and the marks the next boundary compares
+    // against to decide that. Files written and distinct network calls are the two signals that survive a
+    // segment reset — both are turn-scoped ledgers, so a segment that only re-read its own context moves
+    // neither and earns nothing.
+    var earned: u32 = 0;
+    var seg_files: usize = 0;
+    var seg_calls: usize = 0;
+    const continue_hard_max: u32 = if (ctx.environ.get("NL_TURN_CONTINUE_HARD_MAX")) |v|
+        std.fmt.parseInt(u32, std.mem.trim(u8, v, " \r\n\t"), 10) catch TURN_CONTINUE_HARD_MAX_DEFAULT
+    else
+        TURN_CONTINUE_HARD_MAX_DEFAULT;
     // TOOL-ECHO GUARD + network repeat ledger, at TURN scope. Both used to live inside the inner agentic
     // pass, which is re-entered on EVERY drive step — so the guards forgot all repeats each step, and a
     // stuck turn re-listed the same directory step after step while the context ballooned (observed live:
@@ -3049,8 +3084,19 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
                     // re-ground from is just the restart-from-scratch this whole change exists to stop, only
                     // now without a human in the loop to notice it happening.
                     const ceiling_cut = !std.mem.eql(u8, inner.engine_note, LOOP_STOP_NOTE);
-                    if (ceiling_cut and continues < max_continues and handoff.len > 0 and
-                        !stopRequestedSince(app, conv_dir, steer_cursor)) roll: {
+                    // Did the segment that just ended actually produce anything? Written files and
+                    // never-before-made calls are progress; burning the ceiling re-reading what it already had
+                    // is not. Only the former extends the allowance.
+                    const seg_progress = file_ledger.files.items.len > seg_files or
+                        call_ledger.items.len > seg_calls;
+                    if (seg_progress and max_continues + earned < continue_hard_max) earned += 1;
+                    seg_files = file_ledger.files.items.len;
+                    seg_calls = call_ledger.items.len;
+                    // 0 still restores the old settle-and-wait behaviour exactly, earned or not.
+                    const allowance: u32 = if (max_continues == 0) 0 else @min(max_continues + earned, continue_hard_max);
+                    if (ceiling_cut and continues < allowance and handoff.len > 0 and
+                        !stopRequestedSince(app, conv_dir, steer_cursor))
+                    roll: {
                         // Built COMPLETE in scratch first, and only then spliced. Every failure here breaks
                         // :roll and falls into the settle-and-return below — today's exact behaviour — so a
                         // half-written re-seed can never be dispatched, and `inner` is freed on one path only.
@@ -3074,7 +3120,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
                         max_steps = @max(max_steps, drive + 1 + LOOP_MAX_STEPS);
                         continues += 1;
                         var sb2: [192]u8 = undefined;
-                        emitKV(app, conv_dir, "status", "text", std.fmt.bufPrint(&sb2, "spend ceiling reached — re-grounding on what is established and continuing ({d}/{d})", .{ continues, max_continues }) catch "continuing from the continuation state");
+                        emitKV(app, conv_dir, "status", "text", std.fmt.bufPrint(&sb2, "context compacted — carrying forward what is established and continuing (pass {d}/{d})", .{ continues, allowance }) catch "continuing from the compacted state");
                         gpa.free(inner.content);
                         gpa.free(inner.engine_note);
                         continue :outer;
@@ -7566,7 +7612,7 @@ fn runInnerAgentic(
         if (token_ceiling > 0 and llm.tokensSnapshot().in >= token_ceiling) {
             const spent = llm.tokensSnapshot().in;
             var sb: [160]u8 = undefined;
-            emitKV(app, conv_dir, "status", "text", std.fmt.bufPrint(&sb, "spend ceiling reached (~{d}k input tokens this turn) — settling with what is already gathered", .{spent / 1000}) catch "spend ceiling reached — settling");
+            emitKV(app, conv_dir, "status", "text", std.fmt.bufPrint(&sb, "compacting context (~{d}k input tokens gathered this stretch) — distilling what was established", .{spent / 1000}) catch "compacting context — distilling what was established");
             return .{
                 .outcome = .stopped,
                 .content = gpa.dupe(u8, last_content) catch empty,
