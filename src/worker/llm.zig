@@ -308,6 +308,11 @@ fn isOllama(base_url: []const u8) bool {
 /// Floor on max_tokens for a LOCAL **thinking** model: its hidden reasoning eats the budget before the answer,
 /// so a small-budget call would come back empty. Give those calls room to think AND answer.
 const LOCAL_MIN_TOKENS: u32 = 2048;
+/// Floor for a model LEARNED to starve its answer behind hidden reasoning, local or hosted. Measured against
+/// a real handoff distillation: the reasoning alone ran ~2.8k tokens and the answer only appeared once the
+/// budget passed 8k - at 768, 2048 and 4096 the content came back EMPTY with finish_reason "length" every
+/// time. 2048 (the local floor) would not have been enough, which is why this is its own, larger number.
+const REASONING_MIN_TOKENS: u32 = 8192;
 const NATIVE_THINK_TOKENS: u32 = 24576;
 const NATIVE_CTX: u32 = 32768;
 
@@ -339,9 +344,19 @@ pub fn fenceWrites(base_url: []const u8, model: []const u8) bool {
     return caps.probed and caps.caps_listed and !caps.tools_ok_large;
 }
 
-/// The effective max_tokens: a LOCAL thinking model gets the floor (room to reason); everything else (hosted, or
-/// a local NON-thinking relay) uses the caller's value verbatim, so the relay generates only what it needs.
-fn effTokens(base_url: []const u8, model: []const u8, max_tokens: u32) u32 {
+/// The effective max_tokens: a model that needs room to reason gets a floor; a plain relay gets the caller's
+/// value verbatim, so it generates only what it needs.
+///
+/// The `isLocal and isThinking` test used to be the whole rule, and it was wrong in both halves. HOSTED
+/// reasoning models are now ordinary, and they starve exactly like local ones - the doc comment on isLocal has
+/// always said "a THINKING model spends part of its token budget on hidden reasoning, so tiny max_tokens calls
+/// return empty", and then the fix was gated on the endpoint being local. Meanwhile isThinking is a NAME
+/// heuristic; it answered false for a hosted model that was visibly streaming reasoning_content. Measured
+/// consequence: the engine's continuation-state distillation asks for 768 tokens, got empty content on 10 of
+/// 11 turns, and every one of those turns committed a bare "context was COMPACTED" note carrying no state -
+/// so the next turn restarted from nothing. The learned flag is what closes both halves.
+fn effTokens(io: std.Io, base_url: []const u8, model: []const u8, max_tokens: u32) u32 {
+    if (reasoningBudgetFor(io, model)) return @max(max_tokens, REASONING_MIN_TOKENS);
     return if (isLocal(base_url) and isThinking(model)) @max(max_tokens, LOCAL_MIN_TOKENS) else max_tokens;
 }
 
@@ -470,7 +485,7 @@ pub fn chatTemp(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []
     msgs.appendSlice(gpa, "},{\"role\":\"user\",\"content\":") catch return oom(gpa);
     jstr(gpa, &msgs, user) catch return oom(gpa);
     msgs.appendSlice(gpa, "}") catch return oom(gpa);
-    const mt = effTokens(base_url, model, max_tokens);
+    const mt = effTokens(io, base_url, model, max_tokens);
     const temp_frag = tempFragOwned(gpa, io, model, temperature); // learned-quirk aware (Kimi temp=1, etc.)
     defer gpa.free(temp_frag);
     const body = std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}]{s},\"max_tokens\":{d}}}", .{ model, msgs.items, temp_frag, mt }) catch return oom(gpa);
@@ -501,7 +516,7 @@ pub fn visionExtract(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, ta
     msgs.appendSlice(gpa, "},{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,") catch return oom(gpa);
     msgs.appendSlice(gpa, b64) catch return oom(gpa); // base64 alphabet is JSON-safe — no escaping needed
     msgs.appendSlice(gpa, "\"}}]}") catch return oom(gpa);
-    const mt = effTokens(base_url, model, max_tokens);
+    const mt = effTokens(io, base_url, model, max_tokens);
     const body = std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"max_tokens\":{d}}}", .{ model, msgs.items, mt }) catch return oom(gpa);
     defer gpa.free(body);
     var s = completeBody(gpa, io, run_dir, tag, base_url, key, model, body, mt);
@@ -514,7 +529,7 @@ pub fn visionExtract(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, ta
 /// `tools_json` is the inside of "tools":[ … ]. Returns the assistant content OR parsed tool_calls.
 pub fn complete(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const u8, base_url: []const u8, key: []const u8, model: []const u8, messages_json: []const u8, tools_json: []const u8, max_tokens: u32, temperature: f32) Step {
     if (isOllama(base_url)) return completeOllamaNative(gpa, io, run_dir, tag, base_url, key, model, messages_json, tools_json, max_tokens, temperature);
-    const mt = effTokens(base_url, model, max_tokens);
+    const mt = effTokens(io, base_url, model, max_tokens);
     const temp_frag = tempFragOwned(gpa, io, model, temperature); // learned-quirk aware (Kimi temp=1, etc.)
     defer gpa.free(temp_frag);
     // Learned-quirk pre-echo (the effTemp analog for the reasoning echo): once a model has demanded the
@@ -1363,6 +1378,11 @@ const Quirk = struct {
     // each agentic loop's message-build layer (chat engine + swarm mind loop — each owns its reasoning
     // text), gated on reasoningEchoFor().
     reasoning_echo: bool = false,
+    /// This model spends its whole completion budget on hidden reasoning and returns EMPTY content when the
+    /// budget is small. Learned from that exact signature (ok response, no content, reasoning present,
+    /// finish_reason "length"), never from the model NAME - the name heuristic in isThinking cannot keep up
+    /// with what providers ship, and it silently answered false for a model that was demonstrably reasoning.
+    reasoning_budget: bool = false,
 };
 
 const QuirkSlot = struct {
@@ -1432,7 +1452,7 @@ fn quirkFor(io: std.Io, model: []const u8) Quirk {
 /// ignored on parse, so a new constraint class is one added field here: an old engine skips it, a new
 /// engine reads an old file — the store never needs a migration. `temp` travels as the tag name (not the
 /// enum's integer) so a reordered TempRule can't silently reassign every persisted rule.
-const QuirkRec = struct { model: []const u8 = "", temp: []const u8 = "keep", temp_val: f32 = 1.0, reasoning_echo: bool = false };
+const QuirkRec = struct { model: []const u8 = "", temp: []const u8 = "keep", temp_val: f32 = 1.0, reasoning_echo: bool = false, reasoning_budget: bool = false };
 
 /// Fold one on-disk record into the RAM table (caller holds quirk_mtx). File fields never CLOBBER a live
 /// RAM lesson — this process learned from a fresher provider error than anything on disk — they fill gaps:
@@ -1447,6 +1467,7 @@ fn mergeQuirkLocked(model: []const u8, q: Quirk) void {
         e.q.temp_val = q.temp_val;
     }
     if (q.reasoning_echo) e.q.reasoning_echo = true;
+    if (q.reasoning_budget) e.q.reasoning_budget = true;
 }
 
 /// Merge the durable store's parseable lines into the table (caller holds quirk_mtx). Best-effort by
@@ -1468,6 +1489,7 @@ fn loadQuirksLocked(io: std.Io) void {
             .temp = std.meta.stringToEnum(TempRule, p.value.temp) orelse .keep,
             .temp_val = p.value.temp_val,
             .reasoning_echo = p.value.reasoning_echo,
+            .reasoning_budget = p.value.reasoning_budget,
         });
     }
 }
@@ -1487,9 +1509,10 @@ fn saveQuirksLocked(io: std.Io) void {
         if (e.hash == 0 or e.name_len == 0) continue;
         out.appendSlice(gpa, "{\"model\":") catch return;
         jstr(gpa, &out, e.name[0..e.name_len]) catch return;
-        var tail: [96]u8 = undefined;
-        const t = std.fmt.bufPrint(&tail, ",\"temp\":\"{s}\",\"temp_val\":{d},\"reasoning_echo\":{s}}}\n", .{
+        var tail: [160]u8 = undefined;
+        const t = std.fmt.bufPrint(&tail, ",\"temp\":\"{s}\",\"temp_val\":{d},\"reasoning_echo\":{s},\"reasoning_budget\":{s}}}\n", .{
             @tagName(e.q.temp), e.q.temp_val, if (e.q.reasoning_echo) "true" else "false",
+            if (e.q.reasoning_budget) "true" else "false",
         }) catch return;
         out.appendSlice(gpa, t) catch return;
     }
@@ -1530,6 +1553,25 @@ pub fn learnReasoningEcho(io: std.Io, model: []const u8) void {
 /// Does this model need its reasoning echoed back on tool-call turns? (Learned; false until proven.)
 pub fn reasoningEchoFor(io: std.Io, model: []const u8) bool {
     return quirkFor(io, model).reasoning_echo;
+}
+
+/// Learn that THIS model starves its own answer: it spends the whole completion budget on hidden reasoning
+/// and returns EMPTY content unless the budget is generous. Learned from the observed signature, never from
+/// the model name - see the Quirk field for why the name heuristic is not good enough.
+pub fn learnReasoningBudget(io: std.Io, model: []const u8) void {
+    if (model.len == 0) return;
+    const h = std.hash.Wyhash.hash(0x9e37, model);
+    quirk_mtx.lockUncancelable(io);
+    defer quirk_mtx.unlock(io);
+    const e = slotForLocked(model, h);
+    const changed = !e.q.reasoning_budget;
+    e.q.reasoning_budget = true;
+    if (changed) saveQuirksLocked(io);
+}
+
+/// Does this model need room to reason before it will answer at all? (Learned; false until proven.)
+pub fn reasoningBudgetFor(io: std.Io, model: []const u8) bool {
+    return quirkFor(io, model).reasoning_budget;
 }
 
 /// Is this provider error the thinking-mode "reasoning_content must be passed back" constraint? The chat
@@ -1650,6 +1692,24 @@ pub fn nextMissingEchoOffset(buf: []const u8, from: usize) ?usize {
 /// conv was built for the primary's quirks — there the caller's conv must stay primary-shaped (the
 /// classic reasoner 400s on the echo's PRESENCE, so the echo cannot simply be built in for everyone).
 /// Pure — tested.
+/// A COPY of `body` with its "max_tokens" value replaced. Used by the starved-reasoning heal to retry the
+/// same request with room to think. null when the field is absent or the copy fails - the caller then keeps
+/// the original result rather than inventing one.
+fn withMaxTokens(gpa: std.mem.Allocator, body: []const u8, n: u32) ?[]u8 {
+    const key = "\"max_tokens\":";
+    const at = std.mem.lastIndexOf(u8, body, key) orelse return null;
+    const vs = at + key.len;
+    var ve = vs;
+    while (ve < body.len and body[ve] >= '0' and body[ve] <= '9') ve += 1;
+    if (ve == vs) return null;
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(gpa);
+    out.appendSlice(gpa, body[0..vs]) catch return null;
+    out.print(gpa, "{d}", .{n}) catch return null;
+    out.appendSlice(gpa, body[ve..]) catch return null;
+    return out.toOwnedSlice(gpa) catch null;
+}
+
 pub fn withReasoningEcho(gpa: std.mem.Allocator, conv: []const u8, reasoning: []const u8) ?[]u8 {
     var last: usize = 0; // offset of the NEWEST bare turn — the one the saved reasoning belongs to
     var scan: usize = 0;
@@ -1925,6 +1985,32 @@ fn completeBodyH(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: [
     const content = gpa.dupe(u8, msg.content orelse "") catch return stepErr(gpa, "oom");
     const reasoning = gpa.dupe(u8, msg.reasoning orelse msg.reasoning_content orelse "") catch return stepErr(gpa, "oom");
     const trunc = if (parsed.value.choices[0].finish_reason) |fr| std.mem.eql(u8, fr, "length") else false;
+    // STARVED-REASONING HEAL - the third transport-level backstop, alongside healParamError and healEchoError.
+    //
+    // The signature is unambiguous and provider-agnostic: the call SUCCEEDED, the model produced hidden
+    // reasoning, it produced no answer at all, and it stopped because it ran out of budget. That is a model
+    // whose reasoning does not fit in what the caller asked for, and no amount of retrying at the same size
+    // will change it. Learn the model, raise the budget, retry ONCE.
+    //
+    // This is learned rather than named because the name test was already there and already wrong: the engine
+    // asked for 768 tokens to distil a turn's continuation state, the answer never fit behind the reasoning,
+    // and the empty result was indistinguishable from "the model had nothing to say" - so the engine committed
+    // a bare compaction note with no state and the next turn began again from nothing. Ten turns out of eleven.
+    if (heal_ok and calls.items.len == 0 and trunc and reasoning.len > 0 and
+        std.mem.trim(u8, content, " \r\n\t").len == 0)
+    {
+        learnReasoningBudget(io, model);
+        const raised = @max(budget_tokens *| 8, REASONING_MIN_TOKENS);
+        if (raised > budget_tokens) {
+            if (withMaxTokens(gpa, body, raised)) |bigger| {
+                defer gpa.free(bigger);
+                gpa.free(content);
+                gpa.free(reasoning);
+                calls.deinit(gpa);
+                return completeBodyH(gpa, io, run_dir, tag, base_url, key, model, bigger, raised, false);
+            }
+        }
+    }
     const step = Step{ .content = content, .reasoning = reasoning, .calls = calls.toOwnedSlice(gpa) catch &.{}, .ok = true, .truncated = trunc };
     recordDataset(gpa, tag, model, base_url, body, &step, @intCast(@max(call_ms, 0)), ds_in, ds_out, false);
     return step;
@@ -2518,7 +2604,7 @@ fn streamAttempt(
     const budget_tokens: u32 = if (native)
         (if (isThinking(model)) @max(max_tokens, NATIVE_THINK_TOKENS) else max_tokens)
     else
-        effTokens(base_url, model, max_tokens);
+        effTokens(io, base_url, model, max_tokens);
 
     // Ollama's native endpoint wants tool-call arguments as an OBJECT, not the OpenAI JSON string the conv
     // buffer carries (see nativeToolArgs — sending the string form gets the request rejected outright). This is
