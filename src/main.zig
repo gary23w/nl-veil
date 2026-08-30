@@ -31,6 +31,7 @@ const billing_seam = @import("plan/billing_seam.zig");
 const keys_api = @import("config/keys_api.zig");
 const local_models = @import("config/local_models.zig");
 const cf_oauth = @import("config/cf_oauth.zig");
+const cf_r2 = @import("config/cf_r2.zig");
 const server_config = @import("config/server_config.zig");
 const lan_mod = @import("config/lan.zig");
 const worker = @import("worker/run.zig");
@@ -633,7 +634,7 @@ pub fn main(init: std.process.Init) !void {
         log.info("built-in model engine: not compiled in (-Dbuiltin=false)", .{});
     }
 
-    var app = App{ .gpa = gpa, .io = io, .auth = &auth, .sup = &sup, .audit = &audit, .login_guard = &login_guard, .vault = &vault, .data = paths.data, .server_key = sup.server_key, .open_registration = open_reg, .cf_account_id = cf_account, .workers_ai_token = wai_token, .retention_days = retention_days, .production = production, .recipes = recipe_registry, .plugs = plug_registry, .ledger = &ledger, .keys = &api_keys, .cf_oauth_client_id = init.environ_map.get("NL_CF_OAUTH_CLIENT_ID") orelse cf_oauth.DEFAULT_CLIENT_ID, .cf_oauth_scopes = init.environ_map.get("NL_CF_OAUTH_SCOPES") orelse "account:read ai:write offline_access", .cf_oauth_redirect = cf_oauth_redirect, .cf_oauth_auth_url = init.environ_map.get("NL_CF_OAUTH_AUTH_URL") orelse "https://dash.cloudflare.com/oauth2/auth", .cf_oauth_token_url = init.environ_map.get("NL_CF_OAUTH_TOKEN_URL") orelse "https://dash.cloudflare.com/oauth2/token", .cf_oauth_accounts_url = init.environ_map.get("NL_CF_OAUTH_ACCOUNTS_URL") orelse "https://api.cloudflare.com/client/v4/accounts", .cfg = &server_cfg };
+    var app = App{ .gpa = gpa, .io = io, .auth = &auth, .sup = &sup, .audit = &audit, .login_guard = &login_guard, .vault = &vault, .data = paths.data, .server_key = sup.server_key, .open_registration = open_reg, .cf_account_id = cf_account, .workers_ai_token = wai_token, .retention_days = retention_days, .production = production, .recipes = recipe_registry, .plugs = plug_registry, .ledger = &ledger, .keys = &api_keys, .cf_oauth_client_id = init.environ_map.get("NL_CF_OAUTH_CLIENT_ID") orelse cf_oauth.DEFAULT_CLIENT_ID, .cf_oauth_scopes = init.environ_map.get("NL_CF_OAUTH_SCOPES") orelse http.CF_OAUTH_SCOPES_DEFAULT, .cf_oauth_redirect = cf_oauth_redirect, .cf_oauth_auth_url = init.environ_map.get("NL_CF_OAUTH_AUTH_URL") orelse "https://dash.cloudflare.com/oauth2/auth", .cf_oauth_token_url = init.environ_map.get("NL_CF_OAUTH_TOKEN_URL") orelse "https://dash.cloudflare.com/oauth2/token", .cf_oauth_accounts_url = init.environ_map.get("NL_CF_OAUTH_ACCOUNTS_URL") orelse "https://api.cloudflare.com/client/v4/accounts", .cfg = &server_cfg };
     // SCHEDULED TASKS run on their own background thread (the second one beside Supervisor.bgLoop, same ~5s
     // cadence): a due task spawns a full chat turn, which must never ride an httpz request thread. Spawned here
     // — not next to the sup.bgLoop spawn above — because it needs the fully-wired App; like sup, `app` lives on
@@ -757,6 +758,11 @@ pub fn main(init: std.process.Init) !void {
     router.get("/api/v1/oauth/cloudflare/status", cf_oauth.status, .{});
     router.get("/api/v1/oauth/cloudflare/models", cf_oauth.models, .{});
     router.post("/api/v1/oauth/cloudflare/logout", cf_oauth.logout, .{});
+    // The R2 chat/data backup a Cloudflare login provisions (config/cf_r2.zig): status card, manual
+    // pass, and the per-user auto switch. The background cadence rides the status poll above.
+    router.get("/api/v1/oauth/cloudflare/r2", cf_r2.r2Status, .{});
+    router.post("/api/v1/oauth/cloudflare/r2/sync", cf_r2.r2SyncNow, .{});
+    router.post("/api/v1/oauth/cloudflare/r2/auto", cf_r2.r2SetAuto, .{});
     router.get("/api/v1/swarms/:id/events", tail_fanout.swarmEvents, .{});
     router.get("/api/v1/swarms/:id/stream", tail_fanout.swarmStream, .{});
     router.get("/api/v1/swarms/:id/files", deploy_service.swarmFiles, .{});
@@ -1653,6 +1659,7 @@ const ROUTE_MODS = [_]struct { alias: []const u8, src: []const u8 }{
     .{ .alias = "keys_api", .src = @embedFile("config/keys_api.zig") },
     .{ .alias = "local_models", .src = @embedFile("config/local_models.zig") },
     .{ .alias = "cf_oauth", .src = @embedFile("config/cf_oauth.zig") },
+    .{ .alias = "cf_r2", .src = @embedFile("config/cf_r2.zig") },
     .{ .alias = "browser_ext_api", .src = @embedFile("worker/browser/ext_api.zig") },
 };
 

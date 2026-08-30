@@ -378,6 +378,13 @@ fn luma(c: Color) f32 {
     return 0.299 * @as(f32, @floatFromInt(c.r)) + 0.587 * @as(f32, @floatFromInt(c.g)) + 0.114 * @as(f32, @floatFromInt(c.b));
 }
 
+/// Is the ACTIVE palette a dark one? Read from the background's luma rather than the theme's own
+/// `dark` flag, so a custom palette pushed from the server classifies correctly too. For the rare
+/// widget that must pick its own colours (a vendor-branded button) instead of taking a theme var.
+pub fn isDarkPalette() bool {
+    return luma(bg) < 128;
+}
+
 // ---- design tokens: ONE spacing/sizing scale for the whole shell ----
 // Tabs draw against these instead of magic paddings, so spacing stays uniform.
 pub const PAD: f32 = 16; // outer page padding

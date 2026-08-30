@@ -18,6 +18,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 const http = @import("../../gateway/http.zig");
 const tools = @import("../tools.zig");
+const cf_oauth = @import("../../config/cf_oauth.zig"); // per-turn Cloudflare credentials for the cf_ tool family
+const cftools = @import("../cftools.zig"); // and the belt entries those tools are advertised by
 const recipes = @import("../recipes.zig"); // recipe tools: the per-turn granted set advertised in turn_tools + resolved onto ctx.grants
 const plugins = @import("../../plug/plugins.zig"); // user extensions: prompt/policy/tool hooks over the sandboxed Lua runtime
 const pixelrag = @import("../pixelrag.zig"); // browser-free image attachment ingest (OCR → pixel-RAG index)
@@ -677,12 +679,26 @@ fn buildTurnTools(gpa: std.mem.Allocator, ctx: *const tools.ToolCtx, compact: bo
         (if (compact) TURN_TOOLS_SANDBOXED_COMPACT else TURN_TOOLS_SANDBOXED)
     else
         (if (compact) TURN_TOOLS_COMPACT else TURN_TOOLS_FULL);
-    if (ctx.grants.len == 0) return base; // common case: no grants ⇒ the exact static string, zero allocation
+    // The cf_ family is advertised ONLY to a turn that actually holds Cloudflare credentials, so a user
+    // who never connected pays nothing for it and is never taught a verb that would refuse. Turn-stable
+    // like the grants below (a login does not change mid-turn), so the prompt-prefix cache is untouched.
+    const cf_on = ctx.cf_token.len > 0 and ctx.cf_account.len > 0;
+    if (ctx.grants.len == 0 and !cf_on) return base; // common case ⇒ the exact static string, zero allocation
     var b: std.ArrayListUnmanaged(u8) = .empty;
     b.appendSlice(gpa, base) catch {
         b.deinit(gpa);
         return base;
     };
+    if (cf_on) {
+        b.appendSlice(gpa, ",\n") catch {
+            b.deinit(gpa);
+            return base;
+        };
+        b.appendSlice(gpa, cftools.SCHEMA) catch {
+            b.deinit(gpa);
+            return base;
+        };
+    }
     for (ctx.grants) |r| {
         const sch = recipes.schemaFor(gpa, r.*);
         defer gpa.free(sch);
@@ -2105,6 +2121,19 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     const db = std.fmt.allocPrint(gpa, "{s}/hive.sqlite", .{base}) catch return;
     defer gpa.free(db);
     var durable_pb: [700]u8 = undefined; // backs ctx.durable_path for the turn (same lifetime pattern as db)
+    // CLOUDFLARE, resolved ONCE for the turn: cf_oauth.resolveToken re-seals a token inside 120s of
+    // expiry, so one resolve here covers a normal turn and the cf_ tools never each re-do the refresh
+    // dance. Null (not connected / refresh failed) leaves both fields blank, which is what un-advertises
+    // the family AND makes it refuse — the two must agree or the belt teaches a verb that cannot run.
+    var cf_tok: []const u8 = "";
+    var cf_acct: []const u8 = "";
+    if (cf_oauth.resolveToken(app, uid, gpa)) |cf| {
+        cf_tok = cf.key;
+        cf_acct = cf.account_id;
+        gpa.free(cf.base_url); // the belt tools build their own URLs off the account id
+    }
+    defer if (cf_tok.len > 0) gpa.free(cf_tok);
+    defer if (cf_acct.len > 0) gpa.free(cf_acct);
 
     var counters = [_]u32{0} ** 5;
     // Lives for the whole turn: `ctx.cancel` borrows it, and a tool may consult it minutes from here.
@@ -2134,6 +2163,9 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
         // get_credential's store: the chat veil acts AS the user, so it may fetch a withheld credential
         // value in the turn that needs it (values are masked out of every broadcast prompt).
         .durable_path = memoriesPath(app, uid, &durable_pb) orelse "",
+        // The cf_ family's authority for this turn (blank ⇒ unadvertised and refused).
+        .cf_token = cf_tok,
+        .cf_account = cf_acct,
         .mem = blk_mem: {
             var m = osc.Mem.init(gpa, app.io, app.sup.neuron_bin, db);
             // TRUST-WEIGHTED RANKING: the trust feature is compiled in; without this flag every assoc runs
