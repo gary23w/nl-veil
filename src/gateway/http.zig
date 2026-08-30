@@ -64,12 +64,35 @@ pub const App = struct {
     // fields are overridable from the environment in main() so a deployment registers its own client without a
     // rebuild. The redirect must match one registered on the OAuth client (localhost is allowed for it).
     cf_oauth_client_id: []const u8 = "",
-    cf_oauth_scopes: []const u8 = "account:read ai:write offline_access",
+    cf_oauth_scopes: []const u8 = CF_OAUTH_SCOPES_DEFAULT,
     cf_oauth_redirect: []const u8 = "http://localhost:8787/api/v1/oauth/cloudflare/callback",
     cf_oauth_auth_url: []const u8 = "https://dash.cloudflare.com/oauth2/auth",
     cf_oauth_token_url: []const u8 = "https://dash.cloudflare.com/oauth2/token",
     cf_oauth_accounts_url: []const u8 = "https://api.cloudflare.com/client/v4/accounts",
 };
+
+/// The consent this login asks for, ONE definition (main.zig's env fallback reads it too; the registered
+/// client must DECLARE every id here — see cf_oauth.DEFAULT_CLIENT_ID for the recipe).
+///
+/// REQUIRED vs OPTIONAL is set on the client, not here. Only four are required — account-settings.read,
+/// user-details.read and ai.read/ai.write, the minimum to identify the account and run Workers AI — so a
+/// user who just wants chat sees a short consent screen and can DECLINE the whole build-and-deploy half
+/// and still log in. A declined scope is not a crash: Cloudflare refuses that call and cftools hands the
+/// model Cloudflare's own sentence, which is the one a user can act on.
+///
+/// EVERY ID BELOW WAS PROBED LIVE against the registered client (2026-08-30) — Hydra rejects the whole
+/// authorize request naming the FIRST bad scope, so one wrong id here breaks login outright and guessing
+/// is not acceptable. Two lessons from that probe worth keeping: the slugs are Cloudflare's internal
+/// permission-group names, not a mechanical hyphenation of the dashboard label ("Workers AI" is ai.*,
+/// "Workers R2 Storage" is workers-r2.*, "Workers" is workers-scripts.*), and the colon-style bootstrap
+/// ids a first-party client uses (account:read, user:read) are REFUSED for a self-managed one.
+///
+/// PAGES IS page.read / page.write — SINGULAR. Four plural guesses (pages.read, pages.write,
+/// pages.metadata_read, pages-projects.write) were each refused before the catalog settled it, which is
+/// the whole argument for looking an id up instead of deriving it: Cloudflare's canonical catalog is
+/// mirrored at github.com/cloudflare/mcp src/auth/derived-oauth-scopes.json (id -> friendly name), and
+/// the authoritative live copy is an authenticated GET /client/v4/oauth/scopes.
+pub const CF_OAUTH_SCOPES_DEFAULT = "ai.read ai.write workers-r2.read workers-r2.write user-details.read account-settings.read offline_access workers-scripts.read workers-scripts.write workers-scripts.bind page.read page.write d1.read d1.write workers-kv-storage.read workers-kv-storage.write queues.read queues.write vectorize.read vectorize.write workers-routes.read workers-routes.write workers-tail.read workers-observability.read";
 
 pub fn metered(app: *App, u: User) bool {
     return app.production and app.ledger != null and !app.auth.isAdmin(u);

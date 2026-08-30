@@ -922,11 +922,19 @@ pub const Poller = struct {
     }
 
     /// Open a URL in the OS browser (best-effort). The Cloudflare consent page — the ONE place the desk opens
-    /// an external URL. `explorer.exe <url>` / `open <url>` / `xdg-open <url>`.
+    /// an external URL. `open <url>` (macOS) / `xdg-open <url>` (elsewhere).
+    ///
+    /// WINDOWS: `rundll32 url.dll,FileProtocolHandler <url>`, NOT `explorer.exe <url>`. Explorer's own
+    /// argument parsing rejects a URL carrying a querystring — and the OAuth consent URL is nothing but
+    /// querystring (client_id, redirect_uri, PKCE challenge, state) — so it silently fell back to opening
+    /// a File Explorer window instead of the browser: the login's first click, dead on the biggest
+    /// platform. FileProtocolHandler hands the URL to the shell's protocol association (the real default
+    /// browser), takes it as a plain argv element (no cmd re-quoting), is a GUI-subsystem binary (no
+    /// console flash), and our URLs are fully percent-encoded so its one known quirk (spaces) can't bite.
     fn openUrl(self: *Poller, url: []const u8) void {
         log.info("poller.openUrl {s}", .{url[0..@min(url.len, 80)]});
         const argv: []const []const u8 = switch (builtin.os.tag) {
-            .windows => &.{ "explorer.exe", url },
+            .windows => &.{ "rundll32", "url.dll,FileProtocolHandler", url },
             .macos => &.{ "open", url },
             else => &.{ "xdg-open", url },
         };
@@ -1216,15 +1224,40 @@ pub const Poller = struct {
         const connected = std.mem.indexOf(u8, resp.body, "\"connected\":true") != null;
         var abuf: [64]u8 = undefined;
         const account = valueForKey(resp.body, "account_id", &abuf);
+        // The profile (status carries it since the login started fetching it): prefer the user's own
+        // name, fall back to the account's display name — the Settings card and the chat chip show it.
+        var ubuf: [96]u8 = undefined;
+        var nbuf: [96]u8 = undefined;
+        const user_name = valueForKey(resp.body, "user_name", &ubuf);
+        const acct_name = valueForKey(resp.body, "account_name", &nbuf);
+        const display = if (user_name.len > 0) user_name else acct_name;
+        var just_connected = false;
         self.store.lock();
-        defer self.store.unlock();
         self.store.cf_oauth_seen = true;
         self.store.cf_oauth_configured = configured;
+        // The TRANSITION a login this session makes: pending (we opened the browser) → connected.
+        // Flagged for the UI thread, which defaults the chat onto Workers AI exactly once.
+        if (connected and !self.store.cf_oauth_connected and self.store.cf_oauth_pending) {
+            self.store.cf_just_connected = true;
+            just_connected = true;
+        }
         self.store.cf_oauth_connected = connected;
         if (connected) self.store.cf_oauth_pending = false; // the browser grant landed
         const n = @min(account.len, self.store.cf_oauth_account.len);
         @memcpy(self.store.cf_oauth_account[0..n], account[0..n]);
         self.store.cf_oauth_account_len = n;
+        const dn = @min(display.len, self.store.cf_oauth_name.len);
+        @memcpy(self.store.cf_oauth_name[0..dn], display[0..dn]);
+        self.store.cf_oauth_name_len = dn;
+        self.store.unlock();
+        if (just_connected) {
+            var msg: [128]u8 = undefined;
+            const body = if (display.len > 0)
+                (std.fmt.bufPrint(&msg, "signed in as {s}", .{display}) catch @as([]const u8, "signed in"))
+            else
+                @as([]const u8, "signed in");
+            self.store.pushNotif("Connected to Cloudflare", body, 1);
+        }
     }
 
     /// Fetch the connected account's live Workers AI model list and publish it to the store (the Settings model

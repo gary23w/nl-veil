@@ -506,11 +506,32 @@ test "models.yaml parses: provider order pins the desk's persisted dropdown indi
     // why this list is spelled out rather than derived; it fails the build the moment order changes,
     // which is the only warning anyone gets.
     //
-    // workers-ai was commented out of models.yaml deliberately, so it is absent here and everything
+    // workers-ai was commented out of models.yaml deliberately, so it went absent and everything
     // after it moved down one. Any desk config persisted BEFORE that edit with byok >= 3 now points a
-    // slot left; a desk that has since re-saved is self-consistent again.
-    const expect = [_][]const u8{ "anthropic", "openai", "ollama", "groq", "deepseek", "google", "mock", "huggingface", "zai", "tokengo", "openrouter", "moonshot", "builtin" };
+    // slot left; a desk that has since re-saved is self-consistent again. Its RETURN (the Cloudflare
+    // login shipping for real) therefore appends it at the END — restoring the old slot would shift
+    // every provider after ollama a second time, breaking exactly the configs that had re-saved.
+    const expect = [_][]const u8{ "anthropic", "openai", "ollama", "groq", "deepseek", "google", "mock", "huggingface", "zai", "tokengo", "openrouter", "moonshot", "builtin", "workers-ai" };
     for (expect, 0..) |k, i| try std.testing.expectEqualStrings(k, providers[i].key);
+}
+
+test "workers-ai provider: {account}-templated base, all three credential paths declared" {
+    const p = for (providers) |pr| {
+        if (std.mem.eql(u8, pr.key, "workers-ai")) break pr;
+    } else unreachable;
+    // needs_key + needs_account drive the pasted-token UI; keyless keeps the server-creds sentinel
+    // path deployable; the {account} placeholder is what routes a blank base through the OAuth path.
+    try std.testing.expect(p.needs_key and p.needs_account and p.keyless and !p.local);
+    try std.testing.expect(std.mem.indexOf(u8, p.base_url, "{account}") != null);
+    try std.testing.expect(p.models.len >= 1);
+    // the catalog default model must exist in the seed list, or "default to Workers AI on login"
+    // would pick a model the offline menu cannot even show
+    const has_default = for (p.models) |m| {
+        if (std.mem.eql(u8, m.id, defaults.cf_model)) break true;
+    } else false;
+    try std.testing.expect(has_default);
+    // a placeholder-bearing base must never resolve as a BYOK provider (cf goes through OAuth)
+    try std.testing.expect(providerForBase(p.base_url) == null);
 }
 
 test "builtin provider: sentinel base, keyless+local, serves exactly the-veil-12b" {
@@ -623,14 +644,13 @@ test "models.yaml parses: fields, flags, models, quoted scalars, defaults" {
     // local/keyless flags drive the server's deploy logic
     try std.testing.expect(isKeyless("ollama") and isLocal("ollama"));
     try std.testing.expect(isKeyless("mock") and !isKeyless("anthropic") and !isKeyless("nope"));
-    // workers-ai is commented out of models.yaml, so isKeyless says NO for it — and that is load-bearing,
-    // not incidental: deploy/service.zig asks exactly this question before falling back to the keyless
-    // server-credential path, so a provider the operator removed can never be silently offered.
-    try std.testing.expect(!isKeyless("workers-ai"));
-    // Quoted scalars survive as model ids. This used to assert the @cf ids at providers[3]; workers-ai —
-    // the only entry carrying them and the only {account} template — is commented out of models.yaml, so
-    // there is no live provider left to check them on. defaults.cf_model below still exercises the quoted
-    // "@cf/…" scalar path through the defaults block, which is what the parser assertion was really for.
+    // workers-ai is BACK in models.yaml (appended LAST, for the Cloudflare login), so isKeyless says YES
+    // again — deploy/service.zig asks exactly this question before falling back to the keyless
+    // server-credential path, and the "cloudflare" sentinel fallback is part of the provider's contract.
+    try std.testing.expect(isKeyless("workers-ai"));
+    // Quoted scalars survive as model ids: workers-ai's bootstrap entry carries the "@cf/…" id and the
+    // {account} template again (its shape is pinned in its own test above); groq holds the slot the old
+    // position-based assertion pointed at.
     try std.testing.expectEqualStrings("groq", providers[3].key);
     // defaults
     try std.testing.expectEqualStrings("gpt-oss:20b", defaults.local_model);

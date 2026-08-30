@@ -121,6 +121,16 @@ const BUILTIN_IDX: u8 = blk: {
     @compileError("models.yaml no longer ships a 'builtin' provider");
 };
 
+/// catalog.providers index of Cloudflare Workers AI — the on-login default (applyCfConnectedDefault)
+/// writes it into chat_byok. Same comptime guard as BUILTIN_IDX: a catalog edit that drops the
+/// provider fails the build here instead of silently retargeting the login's one-click default.
+const WORKERS_AI_IDX: u8 = blk: {
+    for (catalog.providers, 0..) |p, i| {
+        if (std.mem.eql(u8, p.key, "workers-ai")) break :blk @intCast(i);
+    }
+    @compileError("models.yaml no longer ships a 'workers-ai' provider");
+};
+
 const ChatInner = enum { chat, metrics, files }; // the Chat center-pane inner tabs
 const RightTab = enum { activity, memory }; // the right pane's inner tabs (Swarm activity | Memory)
 const SchedInner = enum { tasks, build }; // the Tasks tab's inner tabs (task list | builder form)
@@ -880,6 +890,7 @@ pub fn runApp(data_dir: ?[]const u8) !void {
         watchdog.mark(.input);
         handleWindowChrome();
         handleKeys(&store);
+        applyCfConnectedDefault(&store);
 
         // DROP-TO-ATTACH: a file dropped onto the Chat tab becomes the next send's image attachment (v1 = one
         // image). isFileDropped is per-frame global state, so poll it here (not focus-gated); the FilePathList is
@@ -1920,7 +1931,7 @@ fn drawDashboard(store: *Store, body: t.Rect) void {
 
     // right column: CLIENT panel, then the per-model table, then the 14-day bars filling the rest
     const rx = x + left_w + t.PAD;
-    const client_h: f32 = 150;
+    const client_h: f32 = 172; // one row taller since the cloudflare line joined the census
     drawClientPanel(store, .{ .x = rx, .y = y, .width = right_w, .height = client_h });
     const bars_h: f32 = 118;
     const table_r = t.Rect{ .x = rx, .y = y + client_h + t.GAP, .width = right_w, .height = @max(90, bottom - y - client_h - bars_h - 2 * t.GAP) };
@@ -1969,6 +1980,37 @@ fn refreshMemStat() void {
     }
 }
 
+/// Consume the poller's pending→connected Cloudflare flag: the ONE moment a login this session landed.
+/// Defaults the chat onto Workers AI (the user asked for exactly this by logging in) following the "Use
+/// built-in for chat" write pattern — settings under lock, then .save_settings + a toast outside it.
+/// The model is the live list's first entry when the poller has already fetched it, else the catalog's
+/// bootstrap default; either way the Settings dropdown swaps to the live list as it lands.
+fn applyCfConnectedDefault(store: *Store) void {
+    var model: [96]u8 = undefined;
+    var model_len: usize = 0;
+    {
+        store.lock();
+        defer store.unlock();
+        if (!store.cf_just_connected) return;
+        store.cf_just_connected = false;
+        const mid: []const u8 = if (store.cf_model_count > 0)
+            store.cf_models[0][0..store.cf_model_lens[0]]
+        else
+            catalog.defaults.cf_model;
+        const s = &store.settings;
+        s.chat_kind = 1;
+        s.chat_byok = WORKERS_AI_IDX;
+        model_len = @min(mid.len, s.chat_model.len);
+        @memcpy(s.chat_model[0..model_len], mid[0..model_len]);
+        s.chat_model_len = @intCast(model_len);
+        @memcpy(model[0..model_len], mid[0..model_len]);
+    }
+    store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
+    var body: [128]u8 = undefined;
+    const msg = std.fmt.bufPrint(&body, "{s} - switch any time in Settings", .{model[0..model_len]}) catch "switch any time in Settings";
+    store.pushNotif("Chat: Workers AI", msg, 1);
+}
+
 /// CLIENT — what this machine and session look like right now: OS/arch, cores, physical memory, the desk's
 /// uptime, and which server this client is pointed at. The "how is my client running" panel.
 fn drawClientPanel(store: *Store, r: t.Rect) void {
@@ -1979,6 +2021,10 @@ fn drawClientPanel(store: *Store, r: t.Rect) void {
     var host: [64]u8 = undefined;
     var host_n: usize = 0;
     var port: u16 = 0;
+    var cf_connected = false;
+    var cf_configured = false;
+    var cf_name: [96]u8 = undefined;
+    var cf_name_n: usize = 0;
     {
         store.lock();
         defer store.unlock();
@@ -1986,6 +2032,14 @@ fn drawClientPanel(store: *Store, r: t.Rect) void {
         host_n = @min(h.len, host.len);
         @memcpy(host[0..host_n], h[0..host_n]);
         port = store.settings.port;
+        cf_connected = store.cf_oauth_connected;
+        cf_configured = store.cf_oauth_configured;
+        cf_name_n = @min(store.cf_oauth_name_len, cf_name.len);
+        @memcpy(cf_name[0..cf_name_n], store.cf_oauth_name[0..cf_name_n]);
+        if (cf_name_n == 0) {
+            cf_name_n = @min(store.cf_oauth_account_len, cf_name.len);
+            @memcpy(cf_name[0..cf_name_n], store.cf_oauth_account[0..cf_name_n]);
+        }
     }
     const up: u64 = @intFromFloat(@max(0, rl.getTime()));
     // core count can't change mid-session — one syscall ever, not one per frame
@@ -2008,6 +2062,15 @@ fn drawClientPanel(store: *Store, r: t.Rect) void {
     clientRow(r, yy, "desk uptime", t.z("{d}h {d}m", .{ up / 3600, (up % 3600) / 60 }));
     yy += lh;
     clientRow(r, yy, "server", t.z("{s}:{d}", .{ if (host_n > 0) host[0..host_n] else "127.0.0.1", port }));
+    yy += lh;
+    // The Cloudflare login, as a client fact: connected shows WHO (profile name, else account id).
+    // Only "not connected" when the server actually offers the login — an unconfigured server's
+    // dashboard says nothing about a button that does not exist.
+    if (cf_connected) {
+        clientRow(r, yy, "cloudflare", if (cf_name_n > 0) cf_name[0..cf_name_n] else "connected");
+    } else if (cf_configured) {
+        clientRow(r, yy, "cloudflare", "not connected (Settings)");
+    }
 }
 
 fn clientRow(r: t.Rect, y: f32, label: []const u8, value: []const u8) void {
@@ -2904,6 +2967,78 @@ fn fmtConvWhen(mtime_s: i64, now_s: i64, tz: i64, buf: []u8) []const u8 {
     return std.fmt.bufPrint(buf, "{s} {d}", .{ mons[cal.month.numeric() - 1], cal.day_index + 1 }) catch "";
 }
 
+/// The Cloudflare login button. The ORANGE is the identity, so the PLATE wears it — exactly the call
+/// the web app's .cf-btn makes, which is what keeps one button across the two clients. It used to draw
+/// the near-black "Deploy to Cloudflare" badge instead, brand-fixed in both palettes, and a fixed black
+/// slab is a hole punched in a light theme — it read as a dead rectangle, not as a button.
+/// The palette moves ONE thing: the dark scheme gets the deeper orange, because the full-strength brand
+/// colour glares against a dark form. NOT t.buttonSolid — that picks the label colour from the fill's
+/// luma, and this orange sits right on its threshold, so the label is stated here instead of computed.
+fn cfBrandButton(r: t.Rect, label: [:0]const u8, enabled: bool) bool {
+    const dark = t.isDarkPalette();
+    const base = if (dark) t.Color{ .r = 0xdb, .g = 0x73, .b = 0x14, .a = 255 } else t.Color{ .r = 0xf6, .g = 0x82, .b = 0x1f, .a = 255 };
+    const lift = if (dark) t.Color{ .r = 0xf0, .g = 0x82, .b = 0x1f, .a = 255 } else t.Color{ .r = 0xff, .g = 0x94, .b = 0x36, .a = 255 };
+    const hot = enabled and t.hovering(r) and ui.open_dd == .none;
+    // Disabled keeps the shape but drops to a wash, the way every other disabled control here does.
+    const fill = if (!enabled) t.withAlpha(base, 90) else if (hot) lift else base;
+    const line = if (!enabled) t.border else t.Color{ .r = 0xc9, .g = 0x66, .b = 0x0f, .a = 255 };
+    t.panelBordered(r, fill, line);
+    const fs: i32 = 14;
+    const tw: f32 = @floatFromInt(t.measure(label, fs));
+    const on_brand = t.Color{ .r = 0xff, .g = 0xff, .b = 0xff, .a = 255 }; // white on orange — the vendor's own pairing
+    t.text(label, @intFromFloat(r.x + (r.width - tw) / 2), @intFromFloat(r.y + (r.height - @as(f32, @floatFromInt(fs))) / 2), fs, if (enabled) on_brand else t.comment);
+    if (hot) t.wantCursor(.pointing_hand);
+    return hot and rl.isMouseButtonPressed(.left);
+}
+
+/// The Cloudflare profile card, pinned to the BOTTOM of the chat left pane — its own box below the
+/// chats list (it used to be a chip squeezed into the composer's role row). Disconnected it is the
+/// login; connected it names the profile and jumps to Settings. Returns the height it reserved so
+/// the list above shrinks around it; an unconfigured server reserves nothing — no dead affordance.
+fn drawCfProfileCard(store: *Store, r: t.Rect) f32 {
+    var cfc = false;
+    var cfp = false;
+    var cfg = false;
+    var nb: [96]u8 = undefined;
+    var nn: usize = 0;
+    {
+        store.lock();
+        defer store.unlock();
+        cfc = store.cf_oauth_connected;
+        cfp = store.cf_oauth_pending;
+        cfg = store.cf_oauth_configured;
+        nn = @min(store.cf_oauth_name_len, nb.len);
+        @memcpy(nb[0..nn], store.cf_oauth_name[0..nn]);
+        if (nn == 0) {
+            nn = @min(store.cf_oauth_account_len, nb.len);
+            @memcpy(nb[0..nn], store.cf_oauth_account[0..nn]);
+        }
+    }
+    if (!cfg) return 0;
+    const foot_h: f32 = 48;
+    const ca = t.Rect{ .x = r.x + 6, .y = r.y + r.height - foot_h + 4, .width = r.width - 12, .height = foot_h - 10 };
+    const chot = t.hovering(ca) and ui.open_dd == .none;
+    t.panelBordered(ca, if (chot) t.bg_hl else t.bg, t.border);
+    if (cfc) {
+        t.text(t.z("cloudflare", .{}), @intFromFloat(ca.x + 10), @intFromFloat(ca.y + 6), 10, t.comment);
+        const who: [:0]const u8 = if (nn > 0) t.z("{s}", .{nb[0..nn]}) else t.z("connected", .{});
+        t.textClip(who, @intFromFloat(ca.x + 10), @intFromFloat(ca.y + 19), 12, if (chot) t.blue else t.fg_dim, @intFromFloat(ca.width - 20));
+    } else if (cfp) {
+        // Pending stays CLICKABLE: an abandoned browser grant never clears the flag (there is no
+        // timeout), so a dead card would wedge the login for the session. Re-issuing the command
+        // just mints a fresh consent URL — idempotent server-side.
+        t.textClip(t.z("waiting for cloudflare...", .{}), @intFromFloat(ca.x + 10), @intFromFloat(ca.y + 6), 12, t.orange, @intFromFloat(ca.width - 20));
+        t.text(t.z("click to retry", .{}), @intFromFloat(ca.x + 10), @intFromFloat(ca.y + 21), 10, t.comment);
+    } else {
+        t.textClip(t.z("+ log in with cloudflare", .{}), @intFromFloat(ca.x + 10), @intFromFloat(ca.y + (ca.height - 12) / 2), 12, if (chot) t.blue else t.fg_dim, @intFromFloat(ca.width - 20));
+    }
+    if (chot) t.wantCursor(.pointing_hand);
+    if (chot and rl.isMouseButtonPressed(.left)) {
+        if (cfc) ui.tab = .settings else store.pushCmd(store_mod.mkCmd(.oauth_cf_login, "", ""));
+    }
+    return foot_h;
+}
+
 fn drawChatLeft(store: *Store, r: t.Rect, open: bool, convs: []const store_mod.ConvRow, active: []const u8, now_s: i64) void {
     t.panelBordered(r, t.bg_dark, t.border);
     if (!open) {
@@ -2925,8 +3060,13 @@ fn drawChatLeft(store: *Store, r: t.Rect, open: bool, convs: []const store_mod.C
             ui.c_renaming = false;
         }
     }
+    // The profile card claims the pane's bottom edge first (on BOTH inner tabs — it is a pane
+    // fixture, not a list row); everything below lays out inside what is left.
+    const foot_h = drawCfProfileCard(store, r);
     if (ui.chats_inner == .sched) {
-        drawChatsSchedList(store, r);
+        var rs = r;
+        rs.height -= foot_h;
+        drawChatsSchedList(store, rs);
         return;
     }
 
@@ -2942,7 +3082,7 @@ fn drawChatLeft(store: *Store, r: t.Rect, open: bool, convs: []const store_mod.C
     }
     const rows = shown[0..shown_n];
 
-    const list = t.Rect{ .x = r.x + 1, .y = r.y + 38, .width = r.width - 2, .height = r.height - 42 };
+    const list = t.Rect{ .x = r.x + 1, .y = r.y + 38, .width = r.width - 2, .height = r.height - 42 - foot_h };
     const row_h: f32 = 42;
     const head_h: f32 = 22; // a tier heading, inserted ABOVE the first row of each group
     // Dating needs a wall clock, and the UI thread's only one is the poller's. Before its first pass (now_s
@@ -2973,7 +3113,7 @@ fn drawChatLeft(store: *Store, r: t.Rect, open: bool, convs: []const store_mod.C
     if (ui.conv_scroll > max_scroll) ui.conv_scroll = max_scroll;
     rl.beginScissorMode(@intFromFloat(list.x), @intFromFloat(list.y), @intFromFloat(list.width), @intFromFloat(list.height));
     defer rl.endScissorMode();
-    const bot = r.y + r.height - 8;
+    const bot = r.y + r.height - 8 - foot_h;
     var yy: f32 = r.y + 42 - ui.conv_scroll;
     var prev_tier: ?ConvTier = null;
     for (rows) |*cv| {
@@ -2996,7 +3136,10 @@ fn drawChatLeft(store: *Store, r: t.Rect, open: bool, convs: []const store_mod.C
         }
         const rr = t.Rect{ .x = r.x + 5, .y = yy, .width = r.width - 10, .height = row_h - 6 };
         const is_active = std.mem.eql(u8, cv.idStr(), active);
-        const hot = t.hovering(rr);
+        // A row straddling the list edge is scissor-clipped to pixels the user can't see, but its
+        // hit rect still extends past `bot` — right over the profile card. Hovering must mean the
+        // VISIBLE list, or a click on the card also selects the hidden row beneath it.
+        const hot = t.hovering(rr) and t.hovering(list);
         if (is_active) t.panel(rr, t.bg_sel) else if (hot) t.panel(rr, t.bg_hl);
 
         if (is_active and ui.c_renaming) {
@@ -4794,6 +4937,8 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
     } else if (ui.open_dd == .chat_role) {
         ui.open_dd = .none; // the row went busy/looping out from under an open list — drop it
     }
+    // (The Cloudflare login/profile used to share this row as a chip; it now lives as a card
+    // pinned under the chats list — drawCfProfileCard — where it stays visible mid-turn too.)
 }
 
 /// A small labeled stat readout (label above, big value below) — compact, borderless, for the Metrics row.
@@ -6919,7 +7064,8 @@ fn drawChatsSchedList(store: *Store, r: t.Rect) void {
             continue;
         }
         const rr = t.Rect{ .x = r.x + 5, .y = yy, .width = r.width - 10, .height = row_h - 6 };
-        const hot = t.hovering(rr);
+        // Same reason as the conv rows: a clipped row's hit rect reaches under the profile card.
+        const hot = t.hovering(rr) and t.hovering(list);
         if (hot) t.panel(rr, t.bg_hl);
         t.textClip(row.nameStr(), @intFromFloat(rr.x + 8), @intFromFloat(rr.y + 5), 13, if (row.enabled) t.fg else t.fg_dim, @intFromFloat(rr.width - 52));
         var dueb: [48]u8 = undefined;
@@ -6929,7 +7075,10 @@ fn drawChatsSchedList(store: *Store, r: t.Rect) void {
         if (line.len > 0) t.textClip(line, @intFromFloat(rr.x + 8), @intFromFloat(rr.y + 22), 11, t.comment, @intFromFloat(rr.width - 52));
         const runb = t.Rect{ .x = rr.x + rr.width - 40, .y = rr.y + (rr.height - 22) / 2, .width = 36, .height = 22 };
         const run_hot = t.hovering(runb);
-        if (t.buttonGhost(runb, t.z("run", .{}), t.blue, online)) store.pushCmd(store_mod.mkCmd(.sched_run, row.idStr(), ""));
+        // The chip exists only while fully inside the viewport: a clipped edge row's chip is
+        // invisible (scissored) yet clickable — through the profile card below, or the tab strip above.
+        const run_in = runb.y >= list.y and runb.y + runb.height <= list.y + list.height;
+        if (run_in and t.buttonGhost(runb, t.z("run", .{}), t.blue, online)) store.pushCmd(store_mod.mkCmd(.sched_run, row.idStr(), ""));
         if (hot and !run_hot) t.wantCursor(.pointing_hand);
         if (hot and !run_hot and rl.isMouseButtonPressed(.left)) {
             if (row.last_conv_len > 0) {
@@ -7979,31 +8128,44 @@ fn drawSettings(store: *Store, body: t.Rect) void {
         y += 58;
     }
 
-    // LOG IN WITH CLOUDFLARE (OAuth) — the primary path when the provider needs a Cloudflare account. Grants
-    // Workers AI access once via the browser; the token lives server-side and auto-refreshes. The manual
-    // account-id + token fields below remain as a fallback.
-    if (chat_kind == 1 and catalog.providers[@min(chat_byok, catalog.providers.len - 1)].needs_account) {
-        var cf_configured = false;
-        var cf_connected = false;
-        var cf_pending = false;
-        var cf_seen = false;
-        var acctbuf: [64]u8 = undefined;
-        var acct_len: usize = 0;
-        {
-            store.lock();
-            cf_configured = store.cf_oauth_configured;
-            cf_connected = store.cf_oauth_connected;
-            cf_pending = store.cf_oauth_pending;
-            cf_seen = store.cf_oauth_seen;
-            acct_len = @min(store.cf_oauth_account_len, acctbuf.len);
-            @memcpy(acctbuf[0..acct_len], store.cf_oauth_account[0..acct_len]);
-            store.unlock();
-        }
+    // LOG IN WITH CLOUDFLARE (OAuth) — one browser grant buys Workers AI, the live model list, and the
+    // R2 chat backup; the token lives server-side and auto-refreshes. Drawn ALWAYS, like the web app's
+    // Settings section: this is a top-level account feature, not a provider-specific field, and hiding
+    // it behind the workers-ai dropdown selection made the whole login look unbuilt. The manual
+    // account-id + token fields below remain the provider-specific fallback.
+    var cf_configured = false;
+    var cf_connected = false;
+    var cf_pending = false;
+    var cf_seen = false;
+    var acctbuf: [64]u8 = undefined;
+    var acct_len: usize = 0;
+    var namebuf: [96]u8 = undefined;
+    var name_len: usize = 0;
+    {
+        store.lock();
+        cf_configured = store.cf_oauth_configured;
+        cf_connected = store.cf_oauth_connected;
+        cf_pending = store.cf_oauth_pending;
+        cf_seen = store.cf_oauth_seen;
+        acct_len = @min(store.cf_oauth_account_len, acctbuf.len);
+        @memcpy(acctbuf[0..acct_len], store.cf_oauth_account[0..acct_len]);
+        name_len = @min(store.cf_oauth_name_len, namebuf.len);
+        @memcpy(namebuf[0..name_len], store.cf_oauth_name[0..name_len]);
+        store.unlock();
+    }
+    {
+        // Its own air, top and bottom: flush against the model row above and the account-id field
+        // below, the block read as one more form field instead of the account feature it is.
+        y += 12;
         flabel(x, y, "CLOUDFLARE LOGIN");
-        y += 14;
+        y += 16;
         if (cf_connected) {
-            t.text(t.z("connected", .{}), @intFromFloat(x), @intFromFloat(y + 8), 14, t.green);
-            if (acct_len > 0) t.text(t.z("account {s}", .{acctbuf[0..acct_len]}), @intFromFloat(x + 90), @intFromFloat(y + 10), 12, t.comment);
+            // "connected — {who}": the profile name the login fetched, the account id as the detail line.
+            if (name_len > 0)
+                t.text(t.z("connected - {s}", .{namebuf[0..name_len]}), @intFromFloat(x), @intFromFloat(y + 8), 14, t.green)
+            else
+                t.text(t.z("connected", .{}), @intFromFloat(x), @intFromFloat(y + 8), 14, t.green);
+            if (acct_len > 0) t.text(t.z("account {s}", .{acctbuf[0..acct_len]}), @intFromFloat(x), @intFromFloat(y + 26), 12, t.comment);
             const dl = t.z("Disconnect", .{});
             const dw = t.btnW(dl, t.BTN_MD);
             if (t.button(.{ .x = x + colw - dw, .y = y, .width = dw, .height = t.BTN_MD }, dl, t.red, true)) {
@@ -8011,18 +8173,28 @@ fn drawSettings(store: *Store, body: t.Rect) void {
             }
             y += 44;
         } else if (cf_configured) {
+            // The login is the headline act, so it wears the vendor's own button (cfBrandButton),
+            // a size up from the form buttons around it.
             const ll = t.z("Log in with Cloudflare", .{});
-            const lw = t.btnW(ll, t.BTN_MD) + 20;
-            if (t.button(.{ .x = x, .y = y, .width = lw, .height = t.BTN_MD }, ll, t.blue, !cf_pending)) {
+            const lh: f32 = 40;
+            const lw = t.btnW(ll, lh) + 28;
+            // Enabled even while pending — an abandoned browser tab never clears the flag, so a
+            // disabled button here would wedge the login until restart. Clicking again just re-opens
+            // a fresh consent URL.
+            if (cfBrandButton(.{ .x = x, .y = y, .width = lw, .height = lh }, ll, true)) {
                 store.pushCmd(store_mod.mkCmd(.oauth_cf_login, "", ""));
             }
-            const sub: [:0]const u8 = if (cf_pending) t.z("waiting for the grant in your browser...", .{}) else t.z("opens Cloudflare in your browser - one click, no token to paste", .{});
-            t.text(sub, @intFromFloat(x + lw + 12), @intFromFloat(y + 10), 12, if (cf_pending) t.orange else t.comment);
-            y += 44;
+            const sub: [:0]const u8 = if (cf_pending) t.z("waiting for the grant in your browser... (click again to retry)", .{}) else t.z("opens Cloudflare in your browser - one click, no token to paste", .{});
+            t.text(sub, @intFromFloat(x + lw + 12), @intFromFloat(y + 13), 12, if (cf_pending) t.orange else t.comment);
+            y += lh + 10;
         } else if (cf_seen) {
-            t.text(t.z("Cloudflare login isn't set up on this server - paste a token below instead.", .{}), @intFromFloat(x), @intFromFloat(y + 6), 12, t.comment);
+            t.text(t.z("not set up on this server - set NL_CF_OAUTH_CLIENT_ID (or pick Workers AI below and paste a token)", .{}), @intFromFloat(x), @intFromFloat(y + 6), 12, t.comment);
+            y += 30;
+        } else {
+            t.text(t.z("checking the server...", .{}), @intFromFloat(x), @intFromFloat(y + 6), 12, t.comment);
             y += 30;
         }
+        y += 12;
     }
 
     // Cloudflare account id (only when the BYOK provider needs one) — built into the Workers AI base_url.

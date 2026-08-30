@@ -32,6 +32,8 @@ const httpz = @import("httpz");
 const http = @import("../gateway/http.zig");
 const chat_engine = @import("chat/engine.zig");
 const cpaths = @import("chat/paths.zig"); // conv → build-tree mapping: a run builds in _sched/{task}/runs/{stamp}
+const cf_oauth = @import("../config/cf_oauth.zig"); // a task owner's Cloudflare login covers their scheduled runs too
+const modelcfg = @import("modelcfg"); // a MODULE (this dir's modelcfg.zig) — never a path import
 
 const App = http.App;
 const badReq = http.badReq;
@@ -728,11 +730,31 @@ fn resolveProvider(app: *App, alloc: std.mem.Allocator, uid: u64, t: *const Task
     var base = t.base_url;
     var key = t.api_key;
     var model = t.model;
+    // A task that EXPLICITLY targets Workers AI (a "@cf/" model, or a Cloudflare /ai/ base) with no key
+    // rides the owner's Cloudflare login, exactly as the same request would in chat (resolveRole) and in a
+    // cast (deploySwarm). This was the one turn path a login did not cover: the task saved fine and every
+    // run then failed with a blank key.
+    if (key.len == 0 and (std.mem.startsWith(u8, model, "@cf/") or
+        (std.mem.indexOf(u8, base, "api.cloudflare.com") != null and std.mem.indexOf(u8, base, "/ai/") != null)))
+    {
+        if (cf_oauth.resolveToken(app, uid, alloc)) |cf| {
+            key = cf.key;
+            base = cf.base_url;
+            if (model.len == 0) model = modelcfg.defaults.cf_model;
+        }
+    }
     if (key.len == 0 and base.len == 0) {
-        if (app.cf_account_id.len > 0 and app.workers_ai_token.len > 0) {
+        if (cf_oauth.resolveToken(app, uid, alloc)) |cf| {
+            // The owner's Cloudflare login outranks the server backbone — the SAME order the cast
+            // path's workers-ai branch resolves (deploy/service.zig): a user who connected their own
+            // account runs (and is billed) on it everywhere, chat and cast and schedule alike.
+            base = cf.base_url;
+            key = cf.key;
+            if (model.len == 0 or !std.mem.startsWith(u8, model, "@cf/")) model = modelcfg.defaults.cf_model;
+        } else if (app.cf_account_id.len > 0 and app.workers_ai_token.len > 0) {
             base = std.fmt.allocPrint(alloc, "https://api.cloudflare.com/client/v4/accounts/{s}/ai/v1", .{app.cf_account_id}) catch t.base_url;
             key = app.workers_ai_token;
-            if (model.len == 0 or !std.mem.startsWith(u8, model, "@cf/")) model = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
+            if (model.len == 0 or !std.mem.startsWith(u8, model, "@cf/")) model = modelcfg.defaults.cf_model;
         } else if (app.vault.resolve(uid, "workers-ai", alloc)) |rk| {
             key = rk.key;
             if (rk.base_url.len > 0) base = rk.base_url;

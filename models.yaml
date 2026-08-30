@@ -113,22 +113,9 @@ providers:
       - id: muse-glimmer:30b
         label: Muse Glimmer 30B
 
-  # Cloudflare Workers AI via its OpenAI-compatible endpoint. Needs BOTH an account id (in the URL) and a
-  # token; blank sends the "cloudflare" sentinel so a server configured with NL_CF_ACCOUNT_ID +
-  # NL_WORKERS_AI_TOKEN uses its own included credentials (that server-side fallback is why keyless=true).
-  # - key: workers-ai
-  #   label: Cloudflare Workers AI
-  #   base: https://api.cloudflare.com/client/v4/accounts/{account}/ai/v1
-  #   needs_key: true
-  #   needs_account: true
-  #   keyless: true
-  #   models:
-  #     - id: "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
-  #       label: Llama 3.3 70B (fast)
-  #     - id: "@cf/meta/llama-3.1-8b-instruct"
-  #       label: Llama 3.1 8B
-  #     - id: "@cf/qwen/qwen2.5-coder-32b-instruct"
-  #       label: Qwen2.5 Coder 32B
+  # workers-ai used to sit HERE. It was commented out while nothing could use it, and the desk persists
+  # provider indices (see ORDER MATTERS above), so it could not come back to this slot — it now lives at
+  # the very END of the list, which appends a fresh index instead of shifting every provider below.
 
   - key: groq
     label: Groq
@@ -327,3 +314,29 @@ providers:
     models:
       - id: the-veil-12b
         label: The Veil 12B (built-in)
+
+  # Cloudflare Workers AI via its OpenAI-compatible endpoint — the provider "Log in with Cloudflare"
+  # serves. Three credential paths, in the order the server tries them: the user's OAuth login
+  # (cf_oauth.resolveToken — no pasted key, base+token resolved from the sealed vault), a pasted API
+  # token + account id (needs_key/needs_account: the {account} placeholder in the base), or the blank
+  # "cloudflare" sentinel a server configured with NL_CF_ACCOUNT_ID + NL_WORKERS_AI_TOKEN swaps for its
+  # own included credentials (that server-side fallback is why keyless=true). Workers AI has a FREE
+  # daily allocation (10k neurons/day as of 2026) — no paid plan needed for the base tier.
+  #
+  # THE MODEL LIST IS DELIBERATELY NOT HERE. Workers AI's catalog is fetched LIVE from the signed-in
+  # account (GET /api/v1/oauth/cloudflare/models -> Cloudflare's /ai/models/search) and swapped into
+  # every menu; a yaml copy would only ever be a stale shadow of it. The single entry below is the
+  # BOOTSTRAP default (defaults.cf_model) so the picker has one honest row before login and the
+  # server-creds sentinel path has a model to force — it is not a catalog.
+  # Re-added at the END, per the ORDER MATTERS note — its old slot (after ollama) is gone for good,
+  # an index once shifted must never shift back.
+  - key: workers-ai
+    label: Cloudflare Workers AI
+    base: https://api.cloudflare.com/client/v4/accounts/{account}/ai/v1
+    needs_key: true
+    needs_account: true
+    keyless: true
+    models:
+      - id: "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
+        label: Llama 3.3 70B (log in to see your live list)
+        ctx_k: 24

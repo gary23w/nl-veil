@@ -22,6 +22,7 @@ const deps = @import("deps.zig");
 const ragmirror = @import("ragmirror.zig");
 const recipes = @import("recipes.zig"); // recipe tools: DATA sequences over already-allowed tools (Feature: granted recipes)
 const dataset = @import("dataset.zig"); // training-set capture — the tool-execution half of a set
+const cftools = @import("cftools.zig"); // the cf_ family: a connected Cloudflare account's own tool belt
 const cpaths = @import("chat/paths.zig"); // sub-chat family base for recall (chat:<parent>__sN → chat:<parent>)
 
 /// Injected into an authored tool's Python body ONLY when NL_BROWSER_DRIVER is enabled: a `browser(action,
@@ -546,6 +547,13 @@ pub const ToolCtx = struct {
     // so a granted recipe can never do more than the caller could by hand. Defaulted empty so every non-chat
     // construction site (swarm minds, CLI, exec-tool, desk) is untouched: no grants ⇒ the feature is inert.
     grants: []const *const recipes.Recipe = &.{},
+    // CLOUDFLARE (cf_ family): the per-turn resolved credentials for the user's OWN connected account —
+    // set ONLY by the chat surfaces, which resolve them once per turn through cf_oauth.resolveToken (it
+    // auto-refreshes). Blank everywhere else, and blank means the family is neither advertised nor
+    // dispatchable: a swarm mind or a CLI caller structurally cannot reach the user's cloud. Same shape
+    // and same reason as durable_path above.
+    cf_token: []const u8 = "",
+    cf_account: []const u8 = "",
     // Recipe recursion depth. A recipe step may not name another recipe (refused at run time, I5), so this is
     // 0 or 1 in practice; it is a belt-and-braces backstop against any future path that could re-enter
     // runRecipe, guaranteeing one level only regardless of how the step was reached.
@@ -1576,6 +1584,9 @@ fn executeInner(ctx: *ToolCtx, name: []const u8, args_json: []const u8) []u8 {
     if (std.mem.startsWith(u8, name, "browser_")) return browserDispatch(ctx, name, args_json);
     if (std.mem.startsWith(u8, name, "pixel_")) return pixelDispatch(ctx, name, args_json);
     if (std.mem.startsWith(u8, name, "mcp_")) return mcpDispatch(ctx, name, args_json);
+    if (std.mem.startsWith(u8, name, "cf_")) {
+        if (cftools.dispatch(.{ .gpa = gpa, .io = ctx.io, .scratch = ctx.run_dir, .workdir = ctx.workdir, .token = ctx.cf_token, .account = ctx.cf_account }, name, args_json)) |r| return r;
+    }
     if (std.mem.eql(u8, name, "propose_change")) return proposeChange(ctx, args_json);
     if (std.mem.eql(u8, name, "simulate_change")) return simulateChange(ctx, args_json);
     if (std.mem.eql(u8, name, "get_credential")) return getCredential(ctx, args_json);
@@ -2376,7 +2387,7 @@ pub fn isBuiltinTool(n: []const u8) bool {
     for (builtins) |b| if (std.mem.eql(u8, b, n)) return true;
     // PREFIX families: execute() routes these with startsWith, so every suffix is reserved, not just the
     // verbs that happen to exist today.
-    const families = [_][]const u8{ "browser_", "pixel_", "mcp_" };
+    const families = [_][]const u8{ "browser_", "pixel_", "mcp_", "cf_" };
     for (families) |f| if (std.mem.startsWith(u8, n, f)) return true;
     return false;
 }
