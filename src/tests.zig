@@ -12,6 +12,7 @@ test {
     _ = @import("cli.zig");
     _ = @import("cli/hub.zig"); // broadcast body escaping: a pasted CRLF must not break the JSON
     _ = @import("config/cf_oauth.zig");
+    _ = @import("config/cf_r2.zig"); // the R2 backup: gated routes, object-key charset, state defaults
     _ = @import("config/key_vault.zig"); // registered DIRECTLY: reaching the root through another
     // module is not proof of collection — lazy analysis silently dropped desk/assets.zig's tests
     // the same way (ledger 0029).
@@ -55,6 +56,7 @@ test {
     _ = @import("worker/commons.zig"); // swarm bus + task board (bus delivery, board fold, escape traps)
     _ = @import("worker/browser/launch.zig"); // direct, per ledger 0029
     _ = @import("worker/browser/util.zig");
+    _ = @import("worker/cftools.zig"); // the cf_ belt: path/URL jails, the no-account refusal, schema↔dispatch agreement
     _ = @import("worker/crawl.zig");
     _ = @import("worker/dataset.zig"); // training-set capture: the sft/raw/tools record shapes + the marker switch
     _ = @import("worker/deps.zig");

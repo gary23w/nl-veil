@@ -763,6 +763,48 @@ table.data td.num { text-align: right; font-variant-numeric: tabular-nums; }
 .syn-function { color: var(--syn-function); }
 .syn-default  { color: var(--syn-default); }
 
+/* ---------------- inline reasoning (<think> blocks) ----------------
+   A reasoning model that writes its thinking into the answer gets ONE quiet, collapsed
+   block — not pages of deliberation stacked on top of the reply (see splitThinking in
+   app.js). Native <details>, and the same hand-drawn triangle as .trio-help below:
+   list-style:none drops the built-in marker in every engine, and a glyph would depend on
+   a font the reader may not have. Every colour is a semantic alias, so both palettes
+   follow along with no theme-specific rule. */
+.msg-body .think {
+  margin: 0 0 12px;
+  border-left: 2px solid color-mix(in srgb, var(--role-thought) 60%, transparent);
+  border-radius: 0 var(--radius) var(--radius) 0;
+  background: var(--code-bg);
+}
+.msg-body .think > summary {
+  display: flex; align-items: center; gap: 7px;
+  padding: 6px 10px;
+  cursor: pointer;
+  list-style: none;
+  color: var(--text-muted);
+  font-size: calc(var(--fs-small) * var(--text-scale));
+}
+.msg-body .think > summary::-webkit-details-marker { display: none; }
+.msg-body .think > summary::before {
+  content: "";
+  flex: 0 0 auto;
+  width: 0; height: 0;
+  border-left: 5px solid currentColor;
+  border-top: 4px solid transparent;
+  border-bottom: 4px solid transparent;
+  transition: transform 120ms ease;
+}
+.msg-body .think[open] > summary::before { transform: rotate(90deg); }
+.msg-body .think > summary:hover { color: var(--text-secondary); }
+.msg-body .think > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.msg-body .think-body {
+  padding: 0 12px 8px 12px;
+  color: var(--text-muted);
+  font-size: calc(var(--fs-small) * var(--text-scale));
+}
+.msg-body .think-body p { margin: 0 0 8px; }
+.msg-body .think-body > *:last-child { margin-bottom: 0; }
+
 /* ---------------- markdown tables ----------------
    The desk gives tables their own horizontal pan rather than squashing the
    prose column (main.zig:3048); same choice here. */
@@ -888,6 +930,74 @@ table.data td.num { text-align: right; font-variant-numeric: tabular-nums; }
   font-size: calc(var(--fs-micro) * var(--text-scale));
   min-height: 1em;
 }
+
+/* ============================================================ cloudflare
+   The login button wears the brand: the PLATE is Cloudflare orange with a white cloud and label —
+   the vendor's own pairing, and the same button the desk draws (cfBrandButton, desk/src/main.zig),
+   so one identity reads across both clients. This was briefly the near-black "Deploy to Cloudflare"
+   slab instead, brand-fixed in both themes; against a light form that is a hole, not a button.
+   The palette moves exactly one thing — the dark scheme takes the deeper orange, because
+   full-strength brand orange glares against a dark surface. Everything else here uses the vars. */
+.cf-btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+  min-height: var(--field-h);
+  padding: 0 18px;
+  border-radius: var(--radius-btn);
+  background: #f6821f;
+  border: 1px solid #c9660f;
+  color: #fff;
+  font-weight: 650;
+  white-space: nowrap;
+  transition: background .13s ease, border-color .13s ease;
+}
+:root[data-theme="dark"] .cf-btn { background: #db7314; }
+.cf-btn:hover { background: #ff9436; }
+:root[data-theme="dark"] .cf-btn:hover { background: #f0821f; }
+.cf-btn:active { transform: translateY(1px); }
+.cf-btn:disabled { opacity: .5; cursor: default; }
+.cf-btn:disabled:hover { background: #f6821f; }
+:root[data-theme="dark"] .cf-btn:disabled:hover { background: #db7314; }
+/* the glyph rides `color`, so it is white on the orange plate without a second declaration */
+.cf-btn svg { width: 19px; height: 19px; flex: 0 0 auto; }
+
+/* The cloud glyph's BASE size. Without it an unsized inline SVG stretches to its container —
+   the Settings identity row rendered a half-page cloud. Contexts with their own svg rule
+   (.cf-btn, .cf-card) still win on specificity. */
+.cf-cloud { width: 1.1em; height: 1.1em; flex: 0 0 auto; vertical-align: -0.15em; }
+.set-row b .cf-cloud { color: #f6821f; }   /* the identity row's cloud wears the brand */
+
+/* the sidebar profile card: pinned under the conversation list — the login when signed out,
+   the orange cloud + profile name once connected (click → Settings) */
+.cf-card {
+  flex: 0 0 auto;
+  margin-top: auto;               /* stays on the pane's bottom edge even when the list is short */
+  display: flex; align-items: center; gap: 8px;
+  width: 100%;
+  padding: 10px 12px;
+  border: 0; border-top: 1px solid var(--border);
+  color: var(--text-muted);
+  font-size: calc(var(--fs-small) * var(--text-scale));
+  text-align: left;
+  transition: color .13s ease, background .13s ease;
+}
+.cf-card svg { width: 15px; height: 15px; flex: 0 0 auto; color: #f6821f; }
+.cf-card:hover { background: var(--surface-hover); color: var(--text); }
+.cf-card.on { color: var(--text-secondary); }
+.cf-card.pending { color: var(--warn); }
+.cf-card .ellip { min-width: 0; }
+
+/* settings row: the auto checkbox + sync button stack right of the R2 status */
+.cf-r2-controls { display: flex; align-items: center; gap: 10px; flex: 0 0 auto; }
+.cf-r2-controls label { display: inline-flex; align-items: center; gap: 5px; margin: 0;
+  text-transform: none; letter-spacing: 0; font-size: calc(var(--fs-small) * var(--text-scale)); }
+.cf-r2-controls input[type=checkbox] { width: auto; min-height: 0; }
+
+/* dashboard panel: three small stats while connected, one pitch row while not */
+.cf-dash-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: var(--gap); padding: 14px; }
+.cf-dash-row { display: flex; align-items: center; justify-content: space-between;
+  gap: var(--gap); padding: 14px; flex-wrap: wrap; }
+.cf-dash-row .muted { flex: 1 1 260px; }
 
 .composer-chips { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 8px; }
 .chip {
