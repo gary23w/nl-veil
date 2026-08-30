@@ -6,7 +6,7 @@
 
 <p>
   <a href="https://github.com/gary23w/nl-veil/actions/workflows/release.yml"><img alt="build" src="https://github.com/gary23w/nl-veil/actions/workflows/release.yml/badge.svg"></a>
-  <a href="https://github.com/gary23w/nl-veil/releases"><img alt="release" src="https://img.shields.io/badge/release-v1.0.1--beta--6-A8241B"></a>
+  <a href="https://github.com/gary23w/nl-veil/releases"><img alt="release" src="https://img.shields.io/badge/release-v1.0.1--beta--7-A8241B"></a>
   <img alt="zig" src="https://img.shields.io/badge/zig-0.16-F7A41D?logo=zig&logoColor=white">
   <a href="https://huggingface.co/gary23w/the-veil-12b"><img alt="built-in model" src="https://img.shields.io/badge/built--in%20model-the--veil--12b-6E4A27?logo=huggingface&logoColor=white"></a>
   <a href="https://huggingface.co/gary23w/gary-neuron-emergent"><img alt="memory cortex" src="https://img.shields.io/badge/cortex-gary--neuron--emergent-6E4A27?logo=huggingface&logoColor=white"></a>
@@ -50,6 +50,7 @@ code, your keys and everything it learns stay in a folder next to the binary.
 
 | | |
 |---|---|
+| [**Log in with Cloudflare**](#log-in-with-cloudflare) | one click: your account's live Workers AI models, an automatic R2 backup of your chats, and an agent that can deploy to your own account |
 | [**The built-in model**](#the-built-in-model--nothing-to-install) | `the-veil-12b` served in-process from a downloaded GGUF — no external runtime, no key, works offline |
 | [**The chat brain in the server**](#the-chat-brain-runs-in-the-server) | one agentic turn loop, server-side; the web app, the desktop and `veil chat` are thin clients of it |
 | [**The model trio**](#three-models-one-turn--the-model-trio) | every LLM call is labelled and routed — coding / thinking / prompting — so a cheap model can carry the bulk |
@@ -64,6 +65,108 @@ code, your keys and everything it learns stay in a folder next to the binary.
 Browse the annotated source of every module at **[the docs site](https://gary23w.github.io/nl-veil/)**
 (`docs/`) — an interactive architecture map and ~100 generated source documents, in the same design
 system the desktop app compiles in.
+
+## Log in with Cloudflare
+
+**One button, and the veil gains a cloud.** Click *Log in with Cloudflare* — in the web app's Settings,
+under the chat composer, on the Dashboard, or in the desktop's Settings — approve the consent screen in
+your browser, and you are connected. No token to paste, nothing to configure.
+
+It is **your** account, not ours. The veil is open source and every copy ships the same public client id,
+the way `wrangler` and `gh` do; the token that comes back is minted for *your* Cloudflare account and
+lands in *your* local server's sealed vault. It never reaches the maintainer, and there is no nl-veil
+server in the middle — Cloudflare redirects the browser to `localhost`, which is the machine already in
+front of you.
+
+### What you get
+
+| | |
+|---|---|
+| **Workers AI, live-synced** | Your account's real model catalogue is fetched from Cloudflare and replaces the Workers AI group in every model picker. The repo ships exactly one model id as a bootstrap default — the list you pick from is always your account's, never a stale copy in a file. |
+| **Chat on the free tier** | Workers AI has a free daily allowance (10,000 neurons/day as of 2026) — **no paid plan and no card for the base tier**. Logging in points chat at it automatically; one click in Settings puts you back on local or BYOK. |
+| **R2 chat backup** | The first login provisions an `nl-veil` bucket in your account and mirrors your conversations and durable memories into it, incrementally, in the background. Your data stays local too — this is a copy, not a move. R2 is 10 GB free with no egress fees, but must be **activated once** on your Cloudflare dashboard; until then the card says so in Cloudflare's own words. |
+| **An agent that can deploy** | With the build scopes granted, the assistant can write a Worker and ship it to a live `workers.dev` URL, read and write R2, query D1, and reach the rest of the API — see [the `cf_` tool belt](#the-cf_-tool-belt). |
+| **Everywhere a turn runs** | Chat, swarm casts and scheduled tasks all resolve the same login, so a task that fires at 3am uses it too. |
+
+### What it asks for, and what you can refuse
+
+The consent screen asks for **four required** permissions — the minimum to know which account you are and
+to run inference:
+
+```
+Workers AI Read + Write      run models, list your catalogue
+Account Settings Read        resolve your account id
+User Details Read            your name / email, to show "signed in as ..."
+```
+
+Everything else is **optional and declinable right on the consent screen** — Workers Scripts, R2, D1, KV,
+Pages, Queues, Vectorize, Routes, Tail, Observability. Decline them and you still log in and chat; a tool
+that later needs one simply refuses with Cloudflare's own explanation. Grant them and the agent can build.
+
+**Never requested at all:** DNS, zones, WAF and security posture, billing, or account membership. A tool
+here can ship an app and spend your Workers AI allowance; it cannot repoint your domain, weaken your
+security, or add anyone to your account.
+
+Disconnect any time — Settings → **Disconnect**. That forgets the credential locally; the R2 bucket and
+everything in it stay in your Cloudflare account, because they were always yours.
+
+### The `cf_` tool belt
+
+When — and only when — a turn holds Cloudflare credentials, six tools join the assistant's belt. A user
+who never connected is never even shown them.
+
+| tool | what it does |
+|---|---|
+| `cf_deploy_worker` | Ship an ES-module Worker from the workspace and get back a live `https://<name>.<you>.workers.dev` URL |
+| `cf_r2_list` | List your buckets, or the objects inside one |
+| `cf_r2_put` / `cf_r2_get` | Move files between the workspace and R2 |
+| `cf_d1_query` | Run SQL against a D1 (serverless SQLite) database |
+| `cf_api` | Any other v4 endpoint — Pages, KV, Queues, Vectorize, routes, logs. Write `{account_id}` in the path and it is filled in |
+
+Try it in one sentence: *"write a Worker that returns the current time as JSON and deploy it."*
+
+Credentials are resolved **once per turn** and handed to the tools; blank means the family is neither
+advertised nor callable, so swarm minds and the CLI structurally cannot reach your cloud. File arguments
+are jailed to the workspace, and `cf_api` refuses any path that would send your token anywhere other than
+`api.cloudflare.com`.
+
+### Running your own OAuth client (optional)
+
+The shipped client id works out of the box. You only need your own if you are forking the veil or want a
+different scope set. Register one at **Manage Account → OAuth clients → Create client**: response type
+*Code*; grant types *Authorization Code* **and** *Refresh Token* (without the second, `offline_access` is
+refused and logins die at the first token expiry); token auth *None (PKCE)*; redirect
+`http://localhost:8787/api/v1/oauth/cloudflare/callback`. Then:
+
+```sh
+NL_CF_OAUTH_CLIENT_ID=<your-public-client-id>   # overrides the compiled-in default
+NL_CF_OAUTH_SCOPES="..."                        # must match what your client declares
+# optional, sane defaults shown:
+NL_CF_OAUTH_REDIRECT=http://localhost:8787/api/v1/oauth/cloudflare/callback
+NL_CF_OAUTH_AUTH_URL=https://dash.cloudflare.com/oauth2/auth
+NL_CF_OAUTH_TOKEN_URL=https://dash.cloudflare.com/oauth2/token
+```
+
+A warning worth the ink: **scope ids are Cloudflare's internal permission-group slugs, not hyphenated
+dashboard labels.** "Workers AI" is `ai.*`, "Workers" is `workers-scripts.*`, and "Pages" is `page.*` —
+*singular*. One wrong id rejects the whole authorize request, so look them up in the catalogue
+(`GET /client/v4/oauth/scopes`, or Cloudflare's mirror in `cloudflare/mcp`) rather than deriving them.
+
+### The HTTP surface
+
+```
+POST /api/v1/oauth/cloudflare/start      mint the consent URL (PKCE + CSRF state)
+GET  /api/v1/oauth/cloudflare/callback   the browser lands here; the token is sealed server-side
+GET  /api/v1/oauth/cloudflare/status     connected? as whom? (never returns the token)
+GET  /api/v1/oauth/cloudflare/models     your account's live Workers AI catalogue
+POST /api/v1/oauth/cloudflare/logout     forget the credential
+GET  /api/v1/oauth/cloudflare/r2         backup status: bucket, files, bytes, last sync
+POST /api/v1/oauth/cloudflare/r2/sync    run a backup pass now
+POST /api/v1/oauth/cloudflare/r2/auto    turn the automatic backup on or off
+```
+
+The token is stored per user, auto-refreshed, and **never returned to any client** — the UIs only ever
+see the connection status and your profile.
 
 ## One server, three faces
 
@@ -121,7 +224,7 @@ raylib is a *lazy* dependency, so `-Dapp=false` never fetches it at all.
 ## Install
 
 **Download it and run it — no toolchain, nothing to build.** Grab your platform's bundle from the
-**[latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.0.1-beta-6)**, unzip, and run `veil`:
+**[latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.0.1-beta-7)**, unzip, and run `veil`:
 
 | You're on | Download | Then run |
 |---|---|---|
@@ -282,7 +385,7 @@ step 5** — the rest is about letting other people in.
 
 ### 1. Download and unblock it
 
-Grab the bundle for your OS from the [latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.0.1-beta-6)
+Grab the bundle for your OS from the [latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.0.1-beta-7)
 and unzip it somewhere you'll find again. Builds are unsigned, so:
 
 - **Windows** shows *"Windows protected your PC"* → **More info** → **Run anyway**.
@@ -724,38 +827,16 @@ Kinds are `once` (fires at a set time), `every` (`--every MIN`), and `daily` (`-
 local wall clock). An overdue task — server was down, laptop asleep — runs **once** on wake and
 reschedules from now; it never backfills a run per missed interval.
 
-## Log in with Cloudflare (Workers AI)
+## Workers AI as your provider
 
-Instead of pasting a Cloudflare API token, a user can grant Workers AI access once through the browser.
-In the desktop **Settings**, pick the Cloudflare provider and click **Log in with Cloudflare**: the
-system browser opens Cloudflare's consent page, and on grant the server exchanges the code
-(Authorization Code + **PKCE**, a public client — no secret), resolves the account, and keeps the token
-(auto-refreshed) in the server's sealed vault. Chat and casts then run Workers AI with no pasted key.
-The manual account-id + token fields stay as a fallback.
+Cloudflare Workers AI is a normal provider in the model catalogue, and the OAuth login above is the easy
+way in — see **[Log in with Cloudflare](#log-in-with-cloudflare)** for the whole integration: the live
+model sync, the R2 chat backup, the `cf_` deploy tools, and the scopes.
 
-This uses Cloudflare's **self-managed OAuth clients**, so a deployment registers its own client once:
-
-1. In the Cloudflare dashboard: **Manage Account → OAuth clients → Create client**. Choose **Public
-   client (Authorization Code + PKCE)**, allow **localhost** redirect URIs, and add the redirect
-   `http://localhost:8787/api/v1/oauth/cloudflare/callback` (match your `NL_PORT`). Select the scopes
-   your app needs — at least account read, Workers AI, and offline access (a refresh token). The exact
-   scope strings are shown in the dashboard's scope picker (or `wrangler login --scopes-list`).
-2. To let **any** user log in to their **own** Cloudflare account, verify ownership of the client's URL
-   domain and make the client public; a client used only within your own account needs no verification.
-3. Point the server at the client — only the public `client_id` is baked in:
-
-```sh
-NL_CF_OAUTH_CLIENT_ID=<your-public-client-id>          # required; the feature is off until set
-NL_CF_OAUTH_SCOPES="account:read ai:write offline_access"   # override to match your client's scopes
-# optional overrides (sane defaults shown):
-NL_CF_OAUTH_REDIRECT=http://localhost:8787/api/v1/oauth/cloudflare/callback
-NL_CF_OAUTH_AUTH_URL=https://dash.cloudflare.com/oauth2/auth
-NL_CF_OAUTH_TOKEN_URL=https://dash.cloudflare.com/oauth2/token
-```
-
-The flow is exposed as `POST /api/v1/oauth/cloudflare/start` (returns the consent URL), the browser
-callback `GET …/callback`, `GET …/status`, and `POST …/logout`. The token is stored per user and never
-returned to the client; the desktop only ever sees the connection status + account id.
+The manual route still works if you would rather not connect an account: pick **Cloudflare Workers AI**
+in Settings, paste your **account id** and a **Workers AI API token**, and it behaves like any other BYOK
+provider. A server operator can also set `NL_CF_ACCOUNT_ID` + `NL_WORKERS_AI_TOKEN` to give every user on
+that instance a shared Workers AI backbone with no login at all.
 
 ## The desktop — veil-desk
 
@@ -1122,20 +1203,19 @@ dependency entirely rather than compiling it unused.
 
 ## Release
 
-**Current: [`v1.0.1-beta-6`](https://github.com/gary23w/nl-veil/releases/tag/v1.0.1-beta-6)** — the
-sixth beta, about **continuity**. beta-5's spend ceiling stopped a runaway turn but ended it outright,
-throwing away everything it had gathered, so the next turn started over and usually hit the same wall
-the same way. Now a turn that outgrows its budget distils what the stretch established (*established /
-on disk / ruled out / next*), drops the bloated context, and **keeps going on its own** — the allowance
-is earned by segments that actually wrote a file or made a new call. The same record is banked durably
-in neuron-db as a **resume anchor**, so a scheduled task, which gets a brand-new conversation every run,
-resumes yesterday's work instead of restarting it. That whole feature was silently dead on hosted
-reasoning models, which spent their entire budget on hidden reasoning and returned nothing; the client
-now learns the model and raises the floor by itself. In the desktop, selecting a conversation someone
-else is driving refreshes it instead of showing a frozen snapshot.
-[Full notes](docs/release/RELEASE-v1.0.1-beta-6.md) ·
-[beta-5](docs/release/RELEASE-v1.0.1-beta-5.md) — trusting what the model did ·
-[beta-4](docs/release/RELEASE-v1.0.1-beta-4.md) — the governed prompt workspace.
+**Current: [`v1.0.1-beta-7`](https://github.com/gary23w/nl-veil/releases/tag/v1.0.1-beta-7)** — the
+seventh beta, and the one where the veil gets a cloud: **[Log in with Cloudflare](#log-in-with-cloudflare)**.
+One click connects your *own* Cloudflare account, and from that moment the model picker fills with your
+account's live Workers AI catalogue, your conversations back themselves up to an R2 bucket the veil
+provisions for you, and — if you grant the optional build scopes — the assistant can write a Worker and
+put it on the internet at a real URL. Workers AI has a free daily allowance, so none of that needs a paid
+plan. The consent screen asks four required permissions and lets you decline the rest; DNS, billing and
+security posture are never requested at all. Scheduled runs resolve the same login, token refresh is
+serialised now that more callers share one credential, and on Windows the consent URL finally opens in
+your browser instead of File Explorer.
+[Full notes](docs/release/RELEASE-v1.0.1-beta-7.md) ·
+[beta-6](docs/release/RELEASE-v1.0.1-beta-6.md) — a long turn continues instead of starting over ·
+[beta-5](docs/release/RELEASE-v1.0.1-beta-5.md) — trusting what the model did.
 
 Builds ship on the [Releases page](https://github.com/gary23w/nl-veil/releases), one per
 platform. Unzip and run `veil` — that starts the server **and** opens the desktop app. No Python, no
