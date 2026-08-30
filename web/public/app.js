@@ -45,6 +45,18 @@ const S = {
   poll: null,
   healthPoll: null,     // the 8s status-chip timer; one per session, never two
   settings: null,       // filled by loadSettings() at boot
+  // cloudflare login (see the "cloudflare" section): status is server truth, polled;
+  // models is the LIVE Workers AI list synced from the connected account, never a local copy.
+  cf: {
+    seen: false,        // has /oauth/cloudflare/status ever answered?
+    configured: false,  // does this server have an OAuth client registered?
+    connected: false,
+    pending: false,     // a consent tab is open; poll fast until it lands
+    account_id: '', account_name: '', email: '', user_name: '',
+    models: [],         // live "@cf/..." ids from the account (empty until connected)
+    r2: null,           // last /oauth/cloudflare/r2 answer, or null
+  },
+  cfPendingPoll: null,  // the fast poll while a consent tab is open
 };
 
 const LS = {
@@ -252,6 +264,13 @@ const api = {
   adminModerate:(e,a) => jpost('/api/v1/admin/users/moderate', { email: e, action: a }),
   adminRecipes: () => jget('/api/v1/admin/recipes'),
   adminRecipeGrant: (uid, name, granted) => jpost('/api/v1/admin/users/' + encodeURIComponent(uid) + '/recipes/' + encodeURIComponent(name), { granted }),
+  cfStart:  ()  => jpost('/api/v1/oauth/cloudflare/start', {}),
+  cfStatus: ()  => jget('/api/v1/oauth/cloudflare/status', 8000),
+  cfModels: ()  => jget('/api/v1/oauth/cloudflare/models', 20000),
+  cfLogout: ()  => jpost('/api/v1/oauth/cloudflare/logout', {}),
+  cfR2:     ()  => jget('/api/v1/oauth/cloudflare/r2', 8000),
+  cfR2Sync: ()  => jpost('/api/v1/oauth/cloudflare/r2/sync', {}),
+  cfR2Auto: (on) => jpost('/api/v1/oauth/cloudflare/r2/auto', { auto: !!on }),
 };
 
 /* ============================================================ theme
@@ -364,6 +383,384 @@ function themeIcon() {
   return currentTheme() === 'dark'
     ? '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="4.5"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M19.1 4.9l-1.4 1.4M6.3 17.7l-1.4 1.4"/></svg>'
     : '<svg viewBox="0 0 24 24"><path d="M20.5 14.5A8.5 8.5 0 0 1 9.5 3.5a8.5 8.5 0 1 0 11 11z"/></svg>';
+}
+
+/* ============================================================ cloudflare
+   "Log in with Cloudflare" — the server owns the whole OAuth flow (src/config/cf_oauth.zig);
+   this client only opens the consent tab and polls status. One login buys three things at once:
+     - Workers AI as the chat provider, with the MODEL LIST SYNCED LIVE from the account
+       (/oauth/cloudflare/models) — the static catalog only ever shows the one bootstrap default;
+     - an R2 backup bucket ("nl-veil") the server provisions in the USER'S account and mirrors
+       their chats/memories/tasks into (src/config/cf_r2.zig);
+     - a profile (account name, user name/email) every surface can show as "signed in as".
+   Three surfaces render from the same S.cf state: the Settings section, the chat sidebar's
+   profile card, and the Dashboard panel. */
+
+const CF_DEFAULT_MODEL = '@cf/meta/llama-3.3-70b-instruct-fp8-fast';
+
+function cfDisplayName() {
+  const c = S.cf;
+  return c.user_name || c.account_name || (c.email ? c.email.split('@')[0] : '') ||
+    (c.account_id ? c.account_id.slice(0, 8) + '…' : 'Cloudflare');
+}
+
+/** The Cloudflare cloud, as an inline glyph (currentColor so the card and button tint it).
+    The cf-cloud class carries a base size: an unsized inline SVG grows to fill its container,
+    which is how the Settings identity row once drew a half-page cloud. */
+function cfCloudSvg() {
+  return '<svg class="cf-cloud" viewBox="0 0 24 24" fill="currentColor" stroke="none" aria-hidden="true">'
+    + '<path d="M18.8 16.5H6.6a3.9 3.9 0 0 1-.5-7.77 5.6 5.6 0 0 1 10.72-1.28 4.55 4.55 0 0 1 1.98 9.05z"/></svg>';
+}
+
+/** Refresh S.cf from the server; returns the fresh state. The CONNECTED TRANSITION (a pending
+    login landing) is detected here and is the one moment settings are defaulted onto Workers AI. */
+async function refreshCfStatus() {
+  let j = null;
+  try { j = await api.cfStatus(); } catch (e) { return S.cf; }
+  const was = S.cf.connected;
+  // "Was a login in flight?" — the in-memory flag, or the stored marker a same-tab consent trip
+  // (or an accidental reload mid-flow) left behind. Ten-minute shelf life, same as the fast poll's.
+  const storedAt = +LS.get('veil.cfPending', '0') || 0;
+  const wasPending = S.cf.pending || (storedAt > 0 && Date.now() - storedAt < 600000);
+  S.cf.seen = true;
+  S.cf.configured = !!j.configured;
+  S.cf.connected = !!j.connected;
+  S.cf.account_id = j.account_id || '';
+  S.cf.account_name = j.account_name || '';
+  S.cf.email = j.email || '';
+  S.cf.user_name = j.user_name || '';
+  if (S.cf.connected) {
+    S.cf.pending = false;
+    LS.set('veil.cfPending', '');
+    stopCfPendingPoll();
+    if (!S.cf.models.length) refreshCfModels();
+    if (!S.cf.r2) refreshCfR2();
+  } else {
+    S.cf.models = [];
+    S.cf.r2 = null;
+  }
+  if (!was && S.cf.connected && wasPending) onCfConnected();
+  syncCfSurfaces();
+  return S.cf;
+}
+
+/** The account's LIVE Workers AI model list — this is the only source the menus trust while
+    connected; models.yaml/models.json deliberately carry a single bootstrap entry. */
+async function refreshCfModels() {
+  try {
+    const j = await api.cfModels();
+    S.cf.models = (j.connected && Array.isArray(j.models)) ? j.models : [];
+  } catch (e) { /* keep whatever we had */ }
+  if (S.tab === 'settings') drawRolePanels();
+  syncCfSurfaces();
+}
+
+async function refreshCfR2() {
+  try { S.cf.r2 = await api.cfR2(); } catch (e) { S.cf.r2 = null; }
+  syncCfSurfaces();
+}
+
+/** Open the consent tab. No 'noopener': the callback page pings window.opener so this tab can
+    react the moment the grant lands (the pending poll remains the source of truth). */
+async function cfLogin() {
+  try {
+    const j = await api.cfStart();
+    if (!j.authorize_url) throw new Error('no authorize_url in the reply');
+    // The await above left the click's gesture stack, so Safari (macOS/iOS) may refuse the popup and
+    // hand back null. A blocked popup must not fake a "waiting" state over a tab that never opened —
+    // fall through to same-tab navigation; the callback page says how to get back, and the status
+    // poll notices the grant the moment this tab returns.
+    // A login-in-flight marker that survives navigation/reload (the same-tab fallback leaves this
+    // page entirely): refreshCfStatus reads it so the one-time on-login defaulting still fires when
+    // the user comes back already-connected. Cleared on connect, timeout, logout, sign-out.
+    LS.set('veil.cfPending', String(Date.now()));
+    const win = window.open(j.authorize_url, '_blank');
+    if (!win) { location.href = j.authorize_url; return; }
+    S.cf.pending = true;
+    syncCfSurfaces();
+    startCfPendingPoll();
+    toast('Continue in the Cloudflare tab', 'Grant access there, then come back — this page notices on its own.', 'ok');
+  } catch (e) {
+    if (e.status === 501) {
+      toast('Cloudflare login is not set up on this server',
+        'The operator must register a Cloudflare OAuth client (NL_CF_OAUTH_CLIENT_ID). You can still paste a Workers AI token under Provider keys.', 'err');
+    } else {
+      toast('Could not start the Cloudflare login', e.message, 'err');
+    }
+  }
+}
+
+async function cfLogout() {
+  if (!confirm('Disconnect Cloudflare? Chats stay local; the R2 bucket and everything in it stay in your Cloudflare account.')) return;
+  try { await api.cfLogout(); } catch (e) {}
+  S.cf.connected = false;
+  S.cf.pending = false;
+  LS.set('veil.cfPending', '');
+  S.cf.account_id = ''; S.cf.account_name = ''; S.cf.email = ''; S.cf.user_name = '';
+  S.cf.models = [];
+  S.cf.r2 = null;
+  // If the settings were riding Workers AI they now point at a provider with no credential;
+  // leave them — the composer's own setup nudge says what to do — but repaint everything.
+  syncCfSurfaces();
+  if (S.tab === 'settings') renderSettings(el('view'));
+  toast('Cloudflare disconnected', '', 'ok');
+}
+
+/** The one-time login transition: default the chat onto Workers AI (the user asked for this by
+    logging in), fetch the live list, kick the first R2 status read. Never runs on a mere page
+    load of an already-connected account — only when a pending consent lands. */
+async function onCfConnected() {
+  toast('Connected to Cloudflare', 'Signed in as ' + cfDisplayName(), 'ok');
+  await refreshCfModels();
+  const live = S.cf.models;
+  const pick = live.includes(CF_DEFAULT_MODEL) ? CF_DEFAULT_MODEL : (live[0] || CF_DEFAULT_MODEL);
+  S.settings.model = pick;
+  S.settings.base_url = '';   // blank base + "@cf/" model routes through the OAuth token server-side
+  S.settings.api_key = '';
+  saveSettings();
+  updateCharCount();
+  syncSetupState();
+  if (S.tab === 'settings') renderSettings(el('view'));
+  toast('Chat now runs on Workers AI', pick + ' — switch any time in Settings.', 'ok');
+  refreshCfR2();
+}
+
+function startCfPendingPoll() {
+  stopCfPendingPoll();
+  let ticks = 0;
+  S.cfPendingPoll = setInterval(async () => {
+    ticks++;
+    if (ticks > 240) {   // 10 min and the flow is dead — stop saying "waiting"
+      S.cf.pending = false;
+      LS.set('veil.cfPending', '');
+      stopCfPendingPoll();
+      syncCfSurfaces();
+      return;
+    }
+    if (!S.cf.pending) return stopCfPendingPoll();
+    await refreshCfStatus();
+  }, 2500);
+}
+
+/** Stops the TIMER only. The pending flag is owned by the states that end a flow — the connected
+    branch of refreshCfStatus, the timeout tick above, logout, sign-out — because clearing it here
+    too used to kill the flag the very moment cfLogin set it, which silently disabled the fast poll
+    AND the wasPending transition gate: onCfConnected never fired for a web login. */
+function stopCfPendingPoll() {
+  if (S.cfPendingPoll) { clearInterval(S.cfPendingPoll); S.cfPendingPoll = null; }
+}
+
+/* The callback page pings its opener the moment the grant lands (cf_oauth.zig page()) — react
+   immediately instead of waiting out the poll interval. Data is a fixed tag, never trusted input. */
+addEventListener('message', (e) => { if (e.data === 'nl-cf-oauth') refreshCfStatus(); });
+
+/** Repaint every surface that shows Cloudflare state, wherever the user happens to be. Each is
+    null-guarded — only the surfaces currently in the DOM repaint. */
+function syncCfSurfaces() {
+  syncCfChip();
+  refreshCfPanel();
+  renderCfDash();
+}
+
+/* ---------------- the sidebar profile card (below the conversation list) ---------------- */
+
+function syncCfChip() {
+  const chip = el('cfChip');
+  if (!chip) return;
+  // An unconfigured server has no login to offer — the card stays out of the sidebar entirely.
+  if (!S.cf.configured) { chip.classList.add('hide'); return; }
+  chip.classList.remove('hide');
+  if (S.cf.connected) {
+    chip.className = 'cf-card on';
+    chip.innerHTML = cfCloudSvg() + '<span class="ellip">' + esc(cfDisplayName()) + '</span>';
+    chip.title = 'Cloudflare: connected as ' + cfDisplayName() + ' — open Settings';
+  } else if (S.cf.pending) {
+    chip.className = 'cf-card pending';
+    chip.innerHTML = cfCloudSvg() + '<span>waiting for Cloudflare…</span>';
+    chip.title = 'Finish the grant in the Cloudflare tab';
+  } else {
+    chip.className = 'cf-card';
+    chip.innerHTML = cfCloudSvg() + '<span>Log in with Cloudflare</span>';
+    chip.title = 'Workers AI models + R2 chat backup, one login';
+  }
+}
+
+function onCfChipClick() {
+  if (S.cf.connected) return setTab('settings');
+  if (!S.cf.pending) cfLogin();
+}
+
+/* ---------------- the Settings section ---------------- */
+
+function cfPanelHtml() {
+  const c = S.cf;
+  // Connected is checked FIRST (the desk orders the same way): an operator can retire the OAuth
+  // client while users' vault credentials keep refreshing, and a connected account must always be
+  // able to see itself — and disconnect — regardless of whether NEW logins are on offer.
+  if (c.seen && !c.configured && !c.connected) {
+    return `<div class="set-row">
+      <div><b>Not set up on this server</b>
+        <div class="muted">The operator hasn't registered a Cloudflare OAuth client
+          (<span class="mono">NL_CF_OAUTH_CLIENT_ID</span>). You can still use Workers AI by pasting an
+          API token under Provider keys with provider <span class="mono">workers-ai</span>.</div>
+      </div>
+    </div>`;
+  }
+  if (!c.connected) {
+    return `<div class="set-row">
+      <div><b>One login, three things</b>
+        <div class="muted">Workers AI as your chat brain (free daily allowance, no card for the base tier),
+          your account's <b>live model list</b> synced straight from Cloudflare, and an automatic
+          <b>R2 backup</b> of your chats into your own account (10 GB free). Nothing moves off this
+          machine except that backup, and it lands in <i>your</i> bucket.</div>
+      </div>
+      <button class="cf-btn" id="cfLoginBtn" ${c.pending ? 'disabled' : ''}>${cfCloudSvg()}
+        <span>${c.pending ? 'Waiting for the grant…' : 'Log in with Cloudflare'}</span></button>
+    </div>`;
+  }
+  const who = esc(cfDisplayName());
+  const mail = c.email ? `<span class="mono">${esc(c.email)}</span> · ` : '';
+  const acct = c.account_name && c.account_name !== cfDisplayName()
+    ? esc(c.account_name) + ' · ' : '';
+  const models = c.models.length
+    ? `${c.models.length} Workers AI models synced live from your account`
+    : 'syncing your model list from Cloudflare…';
+  const r2 = S.cf.r2;
+  let r2Line = 'checking…';
+  let r2Err = '';
+  if (r2) {
+    if (r2.bucket_ok) {
+      r2Line = `bucket <span class="mono">${esc(r2.bucket)}</span> — ` +
+        (r2.files ? `${r2.files} files, ${fmtBytes(r2.bytes || 0)}` : 'first backup pending') +
+        (r2.last_ok ? ` · last sync ${esc(fmtWhen(r2.last_ok))}` : '') +
+        (r2.busy ? ' · syncing now…' : '') +
+        (r2.skipped ? ` · ${r2.skipped} file${r2.skipped > 1 ? 's' : ''} too large to back up` : '');
+    } else {
+      r2Line = 'no bucket yet';
+      r2Err = r2.last_error
+        ? esc(r2.last_error) + ' — R2 is free (10 GB) but must be activated once on your Cloudflare dashboard.'
+        : 'the first sync will create it';
+    }
+  }
+  return `
+    <div class="set-row">
+      <div><b>${cfCloudSvg()} ${who}</b>
+        <div class="muted">${mail}${acct}account <span class="mono">${esc(c.account_id)}</span></div>
+      </div>
+      <button class="btn btn-sm btn-danger" id="cfOutBtn">Disconnect</button>
+    </div>
+    <div class="set-row">
+      <div><b>Workers AI</b><div class="muted">${models}</div></div>
+      <button class="btn btn-sm btn-solid" id="cfUseBtn">Use for chat</button>
+    </div>
+    <div class="set-row">
+      <div><b>R2 chat backup</b>
+        <div class="muted">${r2Line}</div>
+        ${r2Err ? `<div class="muted" style="color:var(--orange)">${r2Err}</div>` : ''}
+      </div>
+      <div class="cf-r2-controls">
+        <label class="muted"><input type="checkbox" id="cfR2Auto" ${!r2 || r2.auto ? 'checked' : ''}> auto</label>
+        <button class="btn btn-sm" id="cfR2Sync" ${r2 && r2.busy ? 'disabled' : ''}>Sync now</button>
+      </div>
+    </div>`;
+}
+
+/** Repaint the Settings panel in place (same pattern as refreshInstallCard) — but only when the
+    markup actually changed: the 30s status tick calls this unconditionally, and rebuilding identical
+    innerHTML under the reader swallows in-flight clicks and drops focus (same reasoning as
+    paintEmpty's guard on the transcript). */
+function refreshCfPanel() {
+  const host = el('cfPanel');
+  if (!host) return;
+  const html = cfPanelHtml();
+  if (host._cfHtml === html) return;
+  host._cfHtml = html;
+  host.innerHTML = html;
+  const login = el('cfLoginBtn');
+  if (login) login.addEventListener('click', cfLogin);
+  const out = el('cfOutBtn');
+  if (out) out.addEventListener('click', cfLogout);
+  const use = el('cfUseBtn');
+  if (use) use.addEventListener('click', () => {
+    const live = S.cf.models;
+    const pick = live.includes(CF_DEFAULT_MODEL) ? CF_DEFAULT_MODEL : (live[0] || CF_DEFAULT_MODEL);
+    S.settings.model = pick;
+    S.settings.base_url = '';
+    S.settings.api_key = '';
+    saveSettings();
+    updateCharCount();
+    syncSetupState();
+    drawRolePanels();
+    toast('Chat set to Workers AI', pick, 'ok');
+  });
+  const syncBtn = el('cfR2Sync');
+  if (syncBtn) syncBtn.addEventListener('click', async () => {
+    try {
+      await api.cfR2Sync();
+      toast('Backup started', 'Syncing your chats to R2 in the background.', 'ok');
+      setTimeout(refreshCfR2, 3000);
+    } catch (e) { toast('Could not start the backup', e.message, 'err'); }
+  });
+  const auto = el('cfR2Auto');
+  if (auto) auto.addEventListener('change', async (e) => {
+    const want = e.target.checked;
+    // Optimistic: a concurrent repaint must render the user's choice, not the stale pre-toggle state.
+    const prev = S.cf.r2 ? S.cf.r2.auto : !want;
+    if (S.cf.r2) S.cf.r2.auto = want;
+    try {
+      await api.cfR2Auto(want);
+      toast('Auto-backup ' + (want ? 'on' : 'off'), '', 'ok');
+    } catch (err) {
+      if (S.cf.r2) S.cf.r2.auto = prev;
+      refreshCfPanel();
+      toast('Could not change auto-backup', err.message, 'err');
+    }
+  });
+}
+
+/* ---------------- the Dashboard panel ---------------- */
+
+function renderCfDash() {
+  const host = el('cfDash');
+  const head = el('cfDashHead');
+  if (!host || !head) return;
+  const c = S.cf;
+  // No login on offer and none active → the dashboard says nothing about Cloudflare at all.
+  const hidden = c.seen && !c.configured && !c.connected;
+  head.classList.toggle('hide', hidden);
+  host.classList.toggle('hide', hidden);
+  if (hidden) return;
+  if (!c.connected) {
+    const html = `<div class="cf-dash-row">
+      <div class="muted">Not connected. One login: Workers AI models (live-synced), plus an automatic
+        R2 backup of your chats into your own Cloudflare account.</div>
+      <button class="cf-btn" id="cfDashLogin" ${c.pending ? 'disabled' : ''}>${cfCloudSvg()}
+        <span>${c.pending ? 'Waiting…' : 'Log in with Cloudflare'}</span></button>
+    </div>`;
+    if (host._cfHtml !== html) {   // same click-swallowing guard as the Settings panel
+      host._cfHtml = html;
+      host.innerHTML = html;
+      const b = el('cfDashLogin');
+      if (b) b.addEventListener('click', cfLogin);
+    }
+    return;
+  }
+  const r2 = c.r2;
+  const r2Bit = r2
+    ? (r2.bucket_ok
+      ? `${r2.files || 0} files · ${fmtBytes(r2.bytes || 0)}${r2.busy ? ' · syncing…' : (r2.last_ok ? ' · ' + esc(fmtWhen(r2.last_ok)) : '')}`
+      : (r2.last_error ? 'needs R2 activated on your account' : 'first sync pending'))
+    : '…';
+  const html = `
+    <div class="cf-dash-grid">
+      <div class="stat"><b class="ellip">${esc(cfDisplayName())}</b><span>signed in</span></div>
+      <div class="stat"><b>${c.models.length || '…'}</b><span>live models</span></div>
+      <div class="stat"><b class="ellip">${r2Bit}</b><span>R2 backup</span></div>
+    </div>`;
+  if (host._cfHtml !== html) {   // tracked on BOTH branches, or a logout would skip its repaint
+    host._cfHtml = html;
+    host.innerHTML = html;
+  }
 }
 
 /* ============================================================ boot */
@@ -552,6 +949,12 @@ function onSignedOut() {
   S.convsLoaded = false;   // same reasoning: the next account's history is unknown, not empty
   S.localUp = null;
   _probedModel = null;     // the cached backend probe described the PREVIOUS account's model
+  // Cloudflare state is per-account too: the connection, profile, live model list and backup
+  // status all belong to the credential the next sign-in may not hold.
+  stopCfPendingPoll();
+  LS.set('veil.cfPending', '');
+  S.cf = { seen: false, configured: false, connected: false, pending: false,
+    account_id: '', account_name: '', email: '', user_name: '', models: [], r2: null };
   renderAuth('Signed out.', 'ok');
 }
 
@@ -688,6 +1091,8 @@ function enterApp(user) {
   // so every logout cycle doubled the health traffic for the rest of the tab's life.
   pollHealth();
   if (!S.healthPoll) S.healthPoll = setInterval(pollHealth, 8000);
+  // Cloudflare state, once per entry; pollHealth keeps it fresh on a slow cadence after.
+  refreshCfStatus();
 }
 
 function stopHealthPoll() {
@@ -740,6 +1145,8 @@ function setTab(id) {
 const LOCAL_PROBE_MS = 60000;
 let _localProbeAt = 0;
 let _probedModel = null;   // which model the cached probe answer describes (see syncSetupState)
+const CF_STATUS_MS = 30000; // cloudflare status cadence riding the health tick (fast poll is separate)
+let _cfStatusAt = 0;
 
 async function probeLocalBackend() {
   if (Date.now() - _localProbeAt < LOCAL_PROBE_MS) return;
@@ -770,6 +1177,12 @@ async function pollHealth() {
   // and nothing re-probes it because there is no longer anything local to probe.
   const local = modelIsLocal();
   if (S.online && local) await probeLocalBackend();
+  // Cloudflare status rides the same tick, well throttled: this is also what arms the
+  // server-side R2 auto-backup (the server throttles the actual passes to 15 min).
+  if (S.online && Date.now() - _cfStatusAt > CF_STATUS_MS) {
+    _cfStatusAt = Date.now();
+    refreshCfStatus();
+  }
 
   let cls = 'on', text = S.fleet.minds + ' minds', why = '';
   if (!S.online) {
@@ -870,6 +1283,9 @@ async function renderDashboard(host) {
       <button class="btn btn-sm btn-ghost" id="actRefresh">Refresh</button></div>
     <div class="panel" id="activityBody"><div class="empty">looking…</div></div>
 
+    <div class="section-head" id="cfDashHead"><h2>Cloudflare</h2></div>
+    <div class="panel" id="cfDash"><div class="empty">checking…</div></div>
+
     <div class="section-head"><h2>LLM breakdown</h2></div>
     ${models.length ? `<div class="table-wrap"><table class="data">
       <thead><tr><th>model</th><th class="num">calls</th><th class="num">in</th><th class="num">out</th><th class="num">tok/s</th></tr></thead>
@@ -899,6 +1315,8 @@ async function renderDashboard(host) {
 
   el('actRefresh').addEventListener('click', renderActivity);
   renderActivity();   // fired after the shell exists, so it can paint into it
+  renderCfDash();     // paints from S.cf as it stands; the status polls repaint it after
+  if (S.cf.connected && !S.cf.r2) refreshCfR2();
 }
 
 /* ============================================================ chat */
@@ -925,6 +1343,7 @@ function renderChat(host) {
           </button>
         </div>
         <div class="scroller" id="convScroll"><div class="empty">loading…</div></div>
+        <button class="cf-card hide" id="cfChip" type="button"></button>
       </aside>
 
       <div class="rail-grip" id="railGrip" role="separator" aria-orientation="vertical"
@@ -1005,6 +1424,8 @@ function renderChat(host) {
   });
   el('steerBtn').addEventListener('click', () => steerTurn());
   el('stopBtn').addEventListener('click', () => sendControl('stop'));
+  el('cfChip').addEventListener('click', onCfChipClick);
+  syncCfChip();
   el('attachBtn').addEventListener('click', () => el('fileInput').click());
   el('fileInput').addEventListener('change', (e) => { if (e.target.files[0]) attachImage(e.target.files[0]); });
 
@@ -1801,8 +2222,9 @@ function paintTyped(body) {
   const revealed = S.stream.text.slice(0, S.stream.shown);
   // Render the revealed prefix as markdown so fences, lists and tables form as
   // they arrive — mdRender tolerates a half-finished fence by design, which is
-  // exactly the streaming case.
-  const html = mdRender(revealed) + (S.stream.shown < S.stream.text.length ? '<span class="caret"></span>' : '');
+  // exactly the streaming case. renderBody adds the same tolerance for a <think>
+  // block whose closing tag has not arrived yet: it stays open and keeps filling.
+  const html = renderBody(revealed, true) + (S.stream.shown < S.stream.text.length ? '<span class="caret"></span>' : '');
   if (body._html !== html) {
     body._html = html;
     body.innerHTML = html;
@@ -1862,11 +2284,72 @@ function resumeFollowing(host) {
   host._parkedAt = undefined;
 }
 
+/* ---------------- inline reasoning ----------------
+   A hosted reasoning model (qwen, deepseek-style) often puts its thinking INSIDE the answer as
+   <think>…</think> rather than in the separate `reasoning` stream field that onFrame deliberately
+   keeps out of the transcript. Rendered as prose that is a literal "<think>" line followed by pages
+   of deliberation sitting on top of the reply — which is what the chat was showing. Lift each
+   reasoning run into a quiet block of its own so the ANSWER is what the transcript reads as.
+   Same robustness contract as mdRender: this runs against a growing string on every frame, so
+   half-arrived input (an opener whose closer has not streamed yet) degrades to "the rest is still
+   thinking" and never throws. */
+
+const THINK_TAG = /<\s*(\/?)\s*think(?:ing)?\s*>/gi;
+
+/** Split content into alternating answer/thinking runs, in order. */
+function splitThinking(src) {
+  const s = String(src == null ? '' : src);
+  if (s.indexOf('<') < 0) return [{ think: false, text: s }];   // the overwhelming majority of messages
+  const segs = [];
+  const push = (think, text) => {
+    if (!text) return;
+    const prev = segs[segs.length - 1];
+    if (prev && prev.think === think) prev.text += text;        // merge runs the tags split apart
+    else segs.push({ think, text });
+  };
+  let last = 0, inThink = false, sawOpen = false, m;
+  THINK_TAG.lastIndex = 0;   // a /g regex carries state between calls; this one is shared
+  while ((m = THINK_TAG.exec(s)) !== null) {
+    const closer = !!m[1];
+    // A closer with no opener before it: the provider put the opening tag in the prompt rather than
+    // the completion, so everything up to here WAS reasoning. Reclassify it instead of letting a
+    // whole thinking pass masquerade as the answer.
+    const stray = closer && !inThink && !sawOpen;
+    if (stray) segs.forEach((g) => { g.think = true; });
+    push(stray ? true : inThink, s.slice(last, m.index));
+    last = THINK_TAG.lastIndex;
+    inThink = !closer;
+    if (!closer) sawOpen = true;
+  }
+  push(inThink, s.slice(last));
+  return segs.length ? segs : [{ think: false, text: '' }];
+}
+
+/** One reasoning run, as a native <details> — no JS to wire, and the summary is keyboard-operable.
+    Open while the turn streams (a model that is still only thinking must not look like dead air),
+    collapsed once the message lands, because by then the answer is what you came for. */
+function thinkHtml(text, live) {
+  const body = text.trim();
+  if (!body) return '';
+  const words = (body.match(/\S+/g) || []).length;
+  return '<details class="think"' + (live ? ' open' : '') + '>'
+    + '<summary>thinking<span class="muted"> · ' + words + (words === 1 ? ' word' : ' words') + '</span></summary>'
+    + '<div class="think-body">' + mdRender(body) + '</div>'
+    + '</details>';
+}
+
+/** A message body: answer runs as markdown, reasoning runs as their own blocks. */
+function renderBody(src, live) {
+  const segs = splitThinking(src);
+  if (segs.length === 1 && !segs[0].think) return mdRender(segs[0].text);
+  return segs.map((g) => (g.think ? thinkHtml(g.text, live) : mdRender(g.text))).join('');
+}
+
 function renderMsg(m) {
   const role = m.role === 'user' ? 'user' : 'assistant';
   return `<div class="msg ${role}">
     <div class="msg-role">${role === 'user' ? 'you' : 'veil'}${m.ts ? ' <span class="muted">· ' + esc(fmtWhen(m.ts)) + '</span>' : ''}</div>
-    <div class="msg-body">${mdRender(m.content || '')}</div>
+    <div class="msg-body">${renderBody(m.content || '', false)}</div>
   </div>`;
 }
 
@@ -3476,6 +3959,9 @@ function renderSettings(host) {
         </div>
       </div>
 
+      <div class="section-head"><h2>Cloudflare</h2></div>
+      <div class="panel set-panel" id="cfPanel"><div class="muted">checking…</div></div>
+
       <div class="section-head"><h2>Provider keys</h2></div>
       <div class="panel set-panel">
         <div class="muted" style="margin-bottom:10px">
@@ -3555,6 +4041,10 @@ function renderSettings(host) {
   // Redraw once the machine has answered about its own Ollama, so the local
   // group reflects what is pulled rather than what is merely catalogued.
   loadLocalModels().then(() => { if (S.tab === 'settings') drawRolePanels(); });
+  // Cloudflare: paint what we know now, then refresh (status + backup) for this visit.
+  refreshCfPanel();
+  refreshCfStatus();
+  if (S.cf.connected) refreshCfR2();
 }
 
 function getScale() { return parseFloat(LS.get('veil.textScale', '1')) || 1; }
@@ -3585,7 +4075,14 @@ function providerBase(key) {
 }
 
 function modelById(id) {
-  return (S.models && S.models.models || []).find((m) => m.id === id) || null;
+  const m = (S.models && S.models.models || []).find((x) => x.id === id) || null;
+  if (m) return m;
+  // Live-synced Workers AI models are catalog members while connected: picking one must resolve
+  // provider workers-ai (blank sentinel base, no key needed) exactly like a static entry would.
+  if (S.cf.connected && S.cf.models.includes(id)) {
+    return { id: id, label: id, provider: 'workers-ai', hosting: 'hosted' };
+  }
+  return null;
 }
 
 /** Group the catalog by provider, hosting-local first so an offline user sees
@@ -3597,8 +4094,18 @@ function modelById(id) {
     stall that reads like an app bug. Anything installed but not in the catalog
     is offered too — the user's own machine is authoritative about itself. */
 function catalogOptions(selected) {
-  const models = ((S.models && S.models.models) || []).slice();
-  if (!models.length) return '';
+  let models = ((S.models && S.models.models) || []).slice();
+  if (!models.length && !(S.cf.connected && S.cf.models.length)) return '';
+
+  // A CONNECTED Cloudflare account's live model list REPLACES the workers-ai group wholesale.
+  // The static catalog carries exactly one bootstrap entry for this provider on purpose — the
+  // real list is the account's own, synced from Cloudflare, and a file copy would only go stale.
+  if (S.cf.connected && S.cf.models.length) {
+    models = models.filter((m) => m.provider !== 'workers-ai');
+    for (const id of S.cf.models) {
+      models.push({ id: id, label: id.replace(/^@cf\//, ''), provider: 'workers-ai', hosting: 'hosted' });
+    }
+  }
 
   const installed = S.localModels && S.localModels.installed;
   if (installed) {
@@ -3684,7 +4191,11 @@ function drawRolePanels() {
   const host = el('rolePanels');
   if (!host) return;
   const roles = S.settings.oneModel ? [ROLES[0]] : ROLES;
-  const loaded = !!(S.models && S.models.models && S.models.models.length);
+  // The picker renders from the static catalog OR the live Workers AI list — catalogOptions handles
+  // both, so the gate must too: a failed models.json fetch must not hide the picker from a connected
+  // user whose live list is sitting right there.
+  const loaded = !!(S.models && S.models.models && S.models.models.length) ||
+    (S.cf.connected && S.cf.models.length > 0);
   const locked = usingServerDefault();
   // Disabled rather than hidden: the reader can still see WHAT they are getting,
   // and the fields explain themselves the moment the switch goes off.

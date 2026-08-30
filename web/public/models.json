@@ -2,7 +2,7 @@
   "providers": [
     {
       "key": "workers-ai",
-      "label": "Cloudflare Workers AI (included — no key)",
+      "label": "Cloudflare Workers AI",
       "kind": "openai-compatible",
       "base_url": "cloudflare",
       "needs_key": false
@@ -129,27 +129,7 @@
       "context": 24000,
       "tools": "reliable",
       "cost": "low",
-      "note": "Cloudflare Workers AI — the included inference backbone (no BYOK key). Strong, fast 70B tool-caller served on Cloudflare's edge; the recommended default for most swarms. Billed to the platform Cloudflare account."
-    },
-    {
-      "id": "@cf/meta/llama-3.1-8b-instruct",
-      "label": "Llama 3.1 8B (Workers AI)",
-      "provider": "workers-ai",
-      "hosting": "hosted",
-      "context": 8000,
-      "tools": "partial",
-      "cost": "low",
-      "note": "Cloudflare Workers AI — cheapest/fastest included tier (no key). Good for simple single-tool minds; prefer the 70B for complex multi-tool swarms."
-    },
-    {
-      "id": "@cf/qwen/qwen2.5-coder-32b-instruct",
-      "label": "Qwen2.5-Coder 32B (Workers AI)",
-      "provider": "workers-ai",
-      "hosting": "hosted",
-      "context": 32000,
-      "tools": "reliable",
-      "cost": "low",
-      "note": "Cloudflare Workers AI — strong coder/tool-caller (no key). Best Workers-AI pick for code-heavy or structured-output minds."
+      "note": "Cloudflare Workers AI — the bootstrap default. This is the ONLY Workers AI model listed offline: log in with Cloudflare and this group is replaced by your account's live model list, synced from Cloudflare."
     },
     {
       "id": "claude-opus-4-8",

@@ -1,12 +1,14 @@
 //! cf_oauth.zig — "Log in with Cloudflare" for Workers AI, via Cloudflare's self-managed OAuth clients.
 //!
-//! FLOW (Authorization Code + PKCE, public client — no secret): the desk calls POST .../start; we mint a
-//! CSRF `state` + a PKCE verifier/challenge, remember them, and hand back the Cloudflare consent URL. The desk
-//! opens the system browser to it. The user grants access; Cloudflare redirects the browser to
-//! GET .../callback?code&state on THIS server; we match the state, exchange the code (+ verifier) for an
-//! access + refresh token, resolve the account id, and seal the bundle in the key vault under one uid. The
-//! desk polls .../status and, once connected, drives Workers AI with no pasted key — the chat/cast paths
-//! resolve the (auto-refreshed) token from the vault.
+//! FLOW (Authorization Code + PKCE, public client — no secret): a client (desk or web app) calls POST
+//! .../start; we mint a CSRF `state` + a PKCE verifier/challenge, remember them, and hand back the Cloudflare
+//! consent URL. The client opens the browser to it. The user grants access; Cloudflare redirects the browser
+//! to GET .../callback?code&state on THIS server; we match the state, exchange the code (+ verifier) for an
+//! access + refresh token, resolve the account (id AND display name) plus the user's own name/email, seal the
+//! bundle in the key vault under one uid, and write the non-secret profile beside the user's data. Clients
+//! poll .../status (which carries the profile) and, once connected, drive Workers AI with no pasted key —
+//! the chat/cast/sched paths resolve the (auto-refreshed) token from the vault. A successful login also
+//! kicks cf_r2 (the R2 chat/data backup) into provisioning the user's bucket.
 //!
 //! Config is env-overridable (main.zig) so a deployment registers its OWN OAuth client and bakes only its
 //! public client_id in. Disabled (start returns 501) until cf_oauth_client_id is set.
@@ -15,15 +17,25 @@ const std = @import("std");
 const httpz = @import("httpz");
 const http = @import("../gateway/http.zig");
 const key_vault = @import("key_vault.zig");
+const cf_r2 = @import("cf_r2.zig");
 const App = http.App;
 const requireUser = http.requireUser;
 
-/// Compiled-in default OAuth client id, so "Log in with Cloudflare" works out of the box with no env var —
-/// set this to the project's own PUBLIC OAuth client (register it once in the Cloudflare dashboard:
-/// Manage Account → OAuth clients → Create client → Public/PKCE, verify the client URL's domain to make it
-/// public, add the redirect http://localhost:8787/api/v1/oauth/cloudflare/callback). NL_CF_OAUTH_CLIENT_ID
-/// still overrides it. Empty here = the login stays "not set up" until an env var or this constant is filled.
-pub const DEFAULT_CLIENT_ID = "";
+/// Compiled-in default OAuth client id, so "Log in with Cloudflare" works out of the box with no env var.
+/// This is the project's own registered client ("nl-veil", registered 2026-08-30 in the project account) —
+/// a PUBLIC IDENTIFIER, not a secret: every open-source CLI with a browser login (wrangler, gh, Claude
+/// Code) ships its client id in the open exactly like this. Users authorize their OWN Cloudflare accounts
+/// through it; the id only names the app on the consent screen and pins the redirect allowlist.
+///
+/// The registration recipe, should it ever need re-creating (dashboard → Manage Account → OAuth clients):
+/// response_type Code; grant types Authorization Code AND Refresh Token (without the second, the
+/// offline_access scope is refused and logins die at first token expiry); token auth method None (PKCE);
+/// redirect http://localhost:8787/api/v1/oauth/cloudflare/callback; scopes exactly the six catalog
+/// permissions in http.CF_OAUTH_SCOPES_DEFAULT. The client starts PRIVATE (only the owning account can
+/// authorize — fine for testing); flip visibility to public (one-time DNS TXT domain verification,
+/// permanent) before telling the world. A scope change after launch forces every connected user through
+/// consent again. NL_CF_OAUTH_CLIENT_ID still overrides this constant.
+pub const DEFAULT_CLIENT_ID = "80bc327e23e901c0f92273853011e007";
 
 /// Vault provider slot for the sealed OAuth bundle — distinct from the "workers-ai" slot a manually pasted
 /// BYOK key would use, so the two never collide.
@@ -147,7 +159,20 @@ fn pctEncode(gpa: std.mem.Allocator, list: *std.ArrayListUnmanaged(u8), s: []con
 /// refresh token) goes in a scratch file passed with --data-binary @file, never on the argv; a Bearer token, if
 /// any, rides a curl config file (-K), also never on the argv. Returns the response body (gpa-owned) or null.
 /// A random suffix keeps concurrent flows from sharing scratch paths.
+///
+/// pub, with the content type as a parameter, because this is the ONE Cloudflare HTTP path in the process:
+/// cf_r2 reuses it for bucket/object calls (JSON and raw octet-stream bodies) rather than growing a second
+/// curl wrapper with its own secret-handling mistakes.
+pub fn apiCall(app: *App, method: []const u8, url: []const u8, body: []const u8, bearer: []const u8, content_type: []const u8) ?[]u8 {
+    return curlCallCt(app, method, url, body, bearer, content_type);
+}
+
+/// The token/consent legs all speak forms; keep their call sites one argument shorter.
 fn curlCall(app: *App, method: []const u8, url: []const u8, form_body: []const u8, bearer: []const u8) ?[]u8 {
+    return curlCallCt(app, method, url, form_body, bearer, "application/x-www-form-urlencoded");
+}
+
+fn curlCallCt(app: *App, method: []const u8, url: []const u8, form_body: []const u8, bearer: []const u8, content_type: []const u8) ?[]u8 {
     const gpa = app.gpa;
     const io = app.io;
     var sfx: [8]u8 = undefined;
@@ -177,8 +202,11 @@ fn curlCall(app: *App, method: []const u8, url: []const u8, form_body: []const u
             cfg.appendSlice(gpa, bearer) catch return null;
             cfg.appendSlice(gpa, "\"\n") catch return null;
         }
-        if (form_body.len > 0)
-            cfg.appendSlice(gpa, "header = \"Content-Type: application/x-www-form-urlencoded\"\n") catch return null;
+        if (form_body.len > 0) {
+            cfg.appendSlice(gpa, "header = \"Content-Type: ") catch return null;
+            cfg.appendSlice(gpa, content_type) catch return null;
+            cfg.appendSlice(gpa, "\"\n") catch return null;
+        }
         std.Io.Dir.cwd().writeFile(io, .{ .sub_path = cfg_path, .data = cfg.items }) catch return null;
         wrote_cfg = true;
     }
@@ -249,26 +277,138 @@ fn exchange(app: *App, alloc: std.mem.Allocator, grant: []const u8, code: []cons
 }
 
 const AccountsResp = struct {
-    result: []const struct { id: []const u8 = "" } = &.{},
+    result: []const struct { id: []const u8 = "", name: []const u8 = "" } = &.{},
     success: bool = false,
 };
 
-/// Resolve the user's Cloudflare account id with the access token (first account). Empty on failure.
-fn fetchAccountId(app: *App, alloc: std.mem.Allocator, access: []const u8) []const u8 {
+const AccountInfo = struct { id: []const u8 = "", name: []const u8 = "" };
+
+/// Resolve the user's Cloudflare account (first account: id + display name) with the access token.
+/// Empty fields on failure — the id is the load-bearing one, the name is presentation.
+fn fetchAccount(app: *App, alloc: std.mem.Allocator, access: []const u8) AccountInfo {
     var ub: [600]u8 = undefined;
-    const url = std.fmt.bufPrint(&ub, "{s}?per_page=1", .{app.cf_oauth_accounts_url}) catch return "";
-    const raw = curlCall(app, "GET", url, "", access) orelse return "";
+    const url = std.fmt.bufPrint(&ub, "{s}?per_page=1", .{app.cf_oauth_accounts_url}) catch return .{};
+    const raw = curlCall(app, "GET", url, "", access) orelse return .{};
     defer app.gpa.free(raw);
-    const parsed = std.json.parseFromSlice(AccountsResp, app.gpa, raw, .{ .ignore_unknown_fields = true }) catch return "";
+    const parsed = std.json.parseFromSlice(AccountsResp, app.gpa, raw, .{ .ignore_unknown_fields = true }) catch return .{};
     defer parsed.deinit();
-    if (parsed.value.result.len == 0) return "";
-    return alloc.dupe(u8, parsed.value.result[0].id) catch "";
+    if (parsed.value.result.len == 0) return .{};
+    return .{
+        .id = alloc.dupe(u8, parsed.value.result[0].id) catch "",
+        .name = alloc.dupe(u8, parsed.value.result[0].name) catch "",
+    };
+}
+
+/// The API root the accounts URL hangs off ("https://api.cloudflare.com/client/v4"), so /user can be
+/// derived instead of configured twice. Falls back to the accounts URL itself if the suffix is absent.
+fn apiRoot(app: *App) []const u8 {
+    const suffix = "/accounts";
+    const u = app.cf_oauth_accounts_url;
+    if (std.mem.endsWith(u8, u, suffix)) return u[0 .. u.len - suffix.len];
+    return u;
+}
+
+const UserResp = struct {
+    result: struct { email: []const u8 = "", first_name: ?[]const u8 = null, last_name: ?[]const u8 = null } = .{},
+    success: bool = false,
+};
+
+const UserInfo = struct { email: []const u8 = "", name: []const u8 = "" };
+
+/// The user's own email + display name via GET /user. Needs the user-details.read scope; a token
+/// granted without it (older consent, trimmed client) just yields empty fields — profile display
+/// degrades to the account name, nothing else depends on this.
+fn fetchUserInfo(app: *App, alloc: std.mem.Allocator, access: []const u8) UserInfo {
+    var ub: [600]u8 = undefined;
+    const url = std.fmt.bufPrint(&ub, "{s}/user", .{apiRoot(app)}) catch return .{};
+    const raw = curlCall(app, "GET", url, "", access) orelse return .{};
+    defer app.gpa.free(raw);
+    const parsed = std.json.parseFromSlice(UserResp, app.gpa, raw, .{ .ignore_unknown_fields = true }) catch return .{};
+    defer parsed.deinit();
+    const r = parsed.value.result;
+    const first = r.first_name orelse "";
+    const last = r.last_name orelse "";
+    const name = if (first.len > 0 and last.len > 0)
+        std.fmt.allocPrint(alloc, "{s} {s}", .{ first, last }) catch ""
+    else if (first.len > 0)
+        alloc.dupe(u8, first) catch ""
+    else
+        alloc.dupe(u8, last) catch "";
+    return .{ .email = alloc.dupe(u8, r.email) catch "", .name = name };
+}
+
+// ------------------------------------------------------------------------------------ profile (non-secret)
+
+/// What the UIs show for "signed in as": account id/name + the user's name/email. NOT a credential —
+/// the tokens stay sealed in the vault; this is presentation data and lives as plain JSON in the
+/// user's own data dir, written at login, deleted at logout.
+pub const Profile = struct {
+    account_id: []const u8 = "",
+    account_name: []const u8 = "",
+    email: []const u8 = "",
+    user_name: []const u8 = "",
+};
+
+fn profilePath(app: *App, uid: u64, buf: []u8) ?[]const u8 {
+    return std.fmt.bufPrint(buf, "{s}/u{d}/cf_profile.json", .{ app.data, uid }) catch null;
+}
+
+fn writeProfile(app: *App, uid: u64, p: Profile) void {
+    var pb: [600]u8 = undefined;
+    const path = profilePath(app, uid, &pb) orelse return;
+    // the user dir may not exist yet — a brand-new account can log into Cloudflare before its first turn
+    var db: [600]u8 = undefined;
+    if (std.fmt.bufPrint(&db, "{s}/u{d}", .{ app.data, uid })) |dir| {
+        _ = std.Io.Dir.cwd().createDirPathStatus(app.io, dir, .default_dir) catch {};
+    } else |_| {}
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(app.gpa);
+    out.appendSlice(app.gpa, "{\"account_id\":") catch return;
+    http.jstr(app.gpa, &out, p.account_id) catch return;
+    out.appendSlice(app.gpa, ",\"account_name\":") catch return;
+    http.jstr(app.gpa, &out, p.account_name) catch return;
+    out.appendSlice(app.gpa, ",\"email\":") catch return;
+    http.jstr(app.gpa, &out, p.email) catch return;
+    out.appendSlice(app.gpa, ",\"user_name\":") catch return;
+    http.jstr(app.gpa, &out, p.user_name) catch return;
+    out.append(app.gpa, '}') catch return;
+    std.Io.Dir.cwd().writeFile(app.io, .{ .sub_path = path, .data = out.items }) catch {};
+}
+
+/// The stored profile for `uid`, or null when none exists (never logged in, or logged out). `alloc`
+/// owns the strings.
+pub fn readProfile(app: *App, uid: u64, alloc: std.mem.Allocator) ?Profile {
+    var pb: [600]u8 = undefined;
+    const path = profilePath(app, uid, &pb) orelse return null;
+    const raw = std.Io.Dir.cwd().readFileAlloc(app.io, path, app.gpa, .limited(16384)) catch return null;
+    defer app.gpa.free(raw);
+    const parsed = std.json.parseFromSlice(Profile, app.gpa, raw, .{ .ignore_unknown_fields = true }) catch return null;
+    defer parsed.deinit();
+    return .{
+        .account_id = alloc.dupe(u8, parsed.value.account_id) catch return null,
+        .account_name = alloc.dupe(u8, parsed.value.account_name) catch "",
+        .email = alloc.dupe(u8, parsed.value.email) catch "",
+        .user_name = alloc.dupe(u8, parsed.value.user_name) catch "",
+    };
+}
+
+fn deleteProfile(app: *App, uid: u64) void {
+    var pb: [600]u8 = undefined;
+    const path = profilePath(app, uid, &pb) orelse return;
+    std.Io.Dir.cwd().deleteFile(app.io, path) catch {};
 }
 
 /// Build the Workers AI OpenAI-compatible base_url for an account id.
 fn workersAiBase(alloc: std.mem.Allocator, account_id: []const u8) []const u8 {
     return std.fmt.allocPrint(alloc, "https://api.cloudflare.com/client/v4/accounts/{s}/ai/v1", .{account_id}) catch "";
 }
+
+/// Refreshes are SERIALIZED: chat turns, casts, scheduled runs, the model-list fetch and the R2 sync
+/// thread can all hit the expiry window together, and two concurrent refresh grants with one stored
+/// refresh_token means the loser fails — and under refresh-token-rotation-with-reuse-detection can
+/// revoke the whole grant. One mutex, held across the exchange; the winner re-seals, the vault write
+/// drops its own resolve-cache entry, and everyone queued behind re-reads the fresh bundle.
+var refresh_mtx: std.Io.Mutex = .init;
 
 /// The public entry the chat + cast paths use: return the CURRENT Workers AI access token + base_url for `uid`,
 /// refreshing (and re-sealing) if it's within REFRESH_SKEW_S of expiry. null when the user isn't logged in via
@@ -277,22 +417,35 @@ pub fn resolveToken(app: *App, uid: u64, alloc: std.mem.Allocator) ?struct { key
     var scratch = std.heap.ArenaAllocator.init(app.gpa);
     defer scratch.deinit();
     const sa = scratch.allocator();
-    const b = app.vault.resolveOAuth(uid, CF_PROVIDER, sa) orelse return null;
+    var b = app.vault.resolveOAuth(uid, CF_PROVIDER, sa) orelse return null;
     if (b.refresh_token.len == 0) return null; // not an OAuth bundle
 
     var access = b.key;
     var account = b.account_id;
     if (nowS(app.io) + REFRESH_SKEW_S >= b.expires_at) {
-        // refresh in place: the refresh token may or may not rotate; keep the old one if the response omits it.
-        if (exchange(app, sa, "refresh_token", "", "", b.refresh_token)) |fresh| {
-            access = fresh.key;
-            const new_refresh = if (fresh.refresh_token.len > 0) fresh.refresh_token else b.refresh_token;
-            if (account.len == 0) account = fetchAccountId(app, sa, access);
-            const base = workersAiBase(sa, account);
-            app.vault.putOAuth(uid, CF_PROVIDER, access, new_refresh, fresh.expires_at, account, base) catch {};
-        } else {
-            // refresh failed (revoked / offline) — surface as not-connected so the caller falls back cleanly.
-            return null;
+        refresh_mtx.lockUncancelable(app.io);
+        defer refresh_mtx.unlock(app.io);
+        // Re-read after acquiring: a caller we queued behind may have refreshed already (putOAuth drops
+        // the vault's cached entry, so this observes the fresh bundle, not a stale cache).
+        b = app.vault.resolveOAuth(uid, CF_PROVIDER, sa) orelse return null;
+        access = b.key;
+        account = b.account_id;
+        if (nowS(app.io) + REFRESH_SKEW_S >= b.expires_at) {
+            // refresh in place: the refresh token may or may not rotate; keep the old one if the response omits it.
+            if (exchange(app, sa, "refresh_token", "", "", b.refresh_token)) |fresh| {
+                access = fresh.key;
+                const new_refresh = if (fresh.refresh_token.len > 0) fresh.refresh_token else b.refresh_token;
+                if (account.len == 0) account = fetchAccount(app, sa, access).id;
+                const base = workersAiBase(sa, account);
+                app.vault.putOAuth(uid, CF_PROVIDER, access, new_refresh, fresh.expires_at, account, base) catch {};
+            } else if (nowS(app.io) < b.expires_at) {
+                // Refresh failed (rate blip / offline) but the token in hand is inside the skew window and
+                // still LIVE — use it rather than failing a turn over a refresh that was merely early.
+            } else {
+                // refresh failed and the token is genuinely expired (revoked / offline) — surface as
+                // not-connected so the caller falls back cleanly.
+                return null;
+            }
         }
     }
     if (account.len == 0) return null;
@@ -306,14 +459,21 @@ pub fn resolveToken(app: *App, uid: u64, alloc: std.mem.Allocator) ?struct { key
 // ------------------------------------------------------------------------------------ live model list
 
 /// The Workers AI catalog changes fast, so the model list is fetched LIVE from the user's account rather
-/// than hardcoded. Cached in-process (single desktop user) with a short TTL; the cache dies on restart, so
-/// every server start refetches — "dynamic collection every time the machine turns on and connects".
+/// than hardcoded. Cached in-process with a short TTL; the cache dies on restart, so every server start
+/// refetches — "dynamic collection every time the machine turns on and connects". A FEW slots keyed by
+/// uid, not one: the web app polls this for every signed-in user, and a single shared slot would make two
+/// concurrent users evict each other every 15 minutes forever.
 const MODELS_TTL_S: i64 = 900; // 15 min
+const MC_SLOTS = 4;
+const McSlot = struct { uid: u64 = 0, len: usize = 0, at: i64 = 0, buf: [16384]u8 = undefined };
 var models_mtx: std.Io.Mutex = .init;
-var mc_uid: u64 = 0;
-var mc_buf: [16384]u8 = undefined; // the built JSON array of model-name strings
-var mc_len: usize = 0;
-var mc_at: i64 = 0;
+var mc: [MC_SLOTS]McSlot = @splat(.{});
+
+/// Caller holds models_mtx. The slot for `uid`, or null.
+fn mcFind(uid: u64) ?*McSlot {
+    for (&mc) |*s| if (s.uid == uid and s.len > 0) return s;
+    return null;
+}
 
 /// GET the account's text-generation Workers AI models and build a JSON array of their names
 /// (e.g. `["@cf/meta/llama-3.3-70b-instruct-fp8-fast", …]`). null when not connected or the fetch fails.
@@ -356,22 +516,30 @@ fn modelsJson(app: *App, uid: u64, alloc: std.mem.Allocator) ?[]const u8 {
     {
         models_mtx.lockUncancelable(app.io);
         defer models_mtx.unlock(app.io);
-        if (mc_uid == uid and mc_len > 0 and now - mc_at < MODELS_TTL_S)
-            return alloc.dupe(u8, mc_buf[0..mc_len]) catch null;
+        if (mcFind(uid)) |s| if (now - s.at < MODELS_TTL_S)
+            return alloc.dupe(u8, s.buf[0..s.len]) catch null;
     }
     const fresh = fetchModelsList(app, uid, alloc) orelse {
         models_mtx.lockUncancelable(app.io);
         defer models_mtx.unlock(app.io);
-        if (mc_uid == uid and mc_len > 0) return alloc.dupe(u8, mc_buf[0..mc_len]) catch null;
+        if (mcFind(uid)) |s| return alloc.dupe(u8, s.buf[0..s.len]) catch null;
         return null;
     };
     models_mtx.lockUncancelable(app.io);
     defer models_mtx.unlock(app.io);
-    if (fresh.len <= mc_buf.len) {
-        @memcpy(mc_buf[0..fresh.len], fresh);
-        mc_len = fresh.len;
-        mc_uid = uid;
-        mc_at = now;
+    if (fresh.len <= mc[0].buf.len) {
+        // reuse this uid's slot, else the oldest
+        var slot: *McSlot = mcFind(uid) orelse blk: {
+            var oldest = &mc[0];
+            for (&mc) |*s| if (s.at < oldest.at) {
+                oldest = s;
+            };
+            break :blk oldest;
+        };
+        @memcpy(slot.buf[0..fresh.len], fresh);
+        slot.len = fresh.len;
+        slot.uid = uid;
+        slot.at = now;
     }
     return fresh;
 }
@@ -452,16 +620,26 @@ pub fn callback(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const a = arena.allocator();
 
     const tok = exchange(app, a, "authorization_code", code, verifier, "") orelse return page(res, false, "token exchange failed — check the client_id / redirect URI registered on Cloudflare");
-    const account = fetchAccountId(app, a, tok.key);
-    if (account.len == 0) return page(res, false, "could not read your Cloudflare account (the token may lack account:read)");
-    const base = workersAiBase(a, account);
-    app.vault.putOAuth(pend.uid, CF_PROVIDER, tok.key, tok.refresh_token, tok.expires_at, account, base) catch
+    const account = fetchAccount(app, a, tok.key);
+    if (account.id.len == 0) return page(res, false, "could not read your Cloudflare account (the token may lack account-settings.read)");
+    const base = workersAiBase(a, account.id);
+    app.vault.putOAuth(pend.uid, CF_PROVIDER, tok.key, tok.refresh_token, tok.expires_at, account.id, base) catch
         return page(res, false, "could not store the credential");
-    return page(res, true, account);
+    // Presentation data beside the sealed credential: the account's display name plus the user's own
+    // name/email (user:read — degrades to empties if the grant lacks it). Written before the R2 kick
+    // so the first status poll after this redirect already carries the profile.
+    const uinfo = fetchUserInfo(app, a, tok.key);
+    writeProfile(app, pend.uid, .{ .account_id = account.id, .account_name = account.name, .email = uinfo.email, .user_name = uinfo.name });
+    // Cook the R2 backup bucket in the background (bucket create if missing + first sync). Best-effort:
+    // an account without the R2 subscription just records why in the r2 status, login still succeeds.
+    cf_r2.kickSync(app, pend.uid);
+    return page(res, true, if (account.name.len > 0) account.name else account.id);
 }
 
-/// GET /api/v1/oauth/cloudflare/status — the desk polls this: is the feature configured, and is THIS user
-/// connected (and to which account)? Never returns the token.
+/// GET /api/v1/oauth/cloudflare/status — clients poll this: is the feature configured, and is THIS user
+/// connected (and as whom)? Carries the non-secret profile (account name, user name/email) so every
+/// surface can say "signed in as …" from one call. Never returns the token. A status poll from a
+/// connected user is also the heartbeat the R2 auto-backup rides (throttled inside cf_r2).
 pub fn status(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const u = requireUser(app, req, res) orelse return;
     var arena = std.heap.ArenaAllocator.init(app.gpa);
@@ -478,28 +656,83 @@ pub fn status(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
             expires_at = b.expires_at;
         }
     }
+    var account_name: []const u8 = "";
+    var email: []const u8 = "";
+    var user_name: []const u8 = "";
+    if (connected) {
+        if (readProfile(app, u.id, a)) |p| {
+            account_name = p.account_name;
+            email = p.email;
+            user_name = p.user_name;
+        }
+        cf_r2.maybeAutoSync(app, u.id);
+    }
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(app.gpa);
+    try out.print(app.gpa, "{{\"ok\":true,\"configured\":{},\"connected\":{},\"account_id\":\"{s}\",\"expires_at\":{d},\"account_name\":", .{ configured, connected, account, expires_at });
+    try http.jstr(app.gpa, &out, account_name);
+    try out.appendSlice(app.gpa, ",\"email\":");
+    try http.jstr(app.gpa, &out, email);
+    try out.appendSlice(app.gpa, ",\"user_name\":");
+    try http.jstr(app.gpa, &out, user_name);
+    try out.append(app.gpa, '}');
     res.content_type = .JSON;
-    res.body = try std.fmt.allocPrint(res.arena, "{{\"ok\":true,\"configured\":{},\"connected\":{},\"account_id\":\"{s}\",\"expires_at\":{d}}}", .{ configured, connected, account, expires_at });
+    res.body = try res.arena.dupe(u8, out.items);
 }
 
-/// POST /api/v1/oauth/cloudflare/logout — forget this user's stored Cloudflare credential.
+/// POST /api/v1/oauth/cloudflare/logout — forget this user's stored Cloudflare credential and the
+/// profile beside it. The R2 sync bookkeeping stays: the bucket is the USER'S (in their account), and
+/// keeping the manifest means a later re-login resumes an incremental backup instead of re-uploading
+/// everything.
 pub fn logout(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const u = requireUser(app, req, res) orelse return;
     app.vault.del(u.id, CF_PROVIDER);
+    deleteProfile(app, u.id);
+    // Drop the cached model list too: within its TTL (and forever via the stale-fallback path) the
+    // models route would otherwise keep answering connected:true with the departed account's list.
+    {
+        models_mtx.lockUncancelable(app.io);
+        defer models_mtx.unlock(app.io);
+        for (&mc) |*s| if (s.uid == u.id) {
+            s.* = .{};
+        };
+    }
     try res.json(.{ .ok = true, .disconnected = true }, .{});
 }
 
-/// Render the post-callback browser page (the only HTML this module returns).
+/// HTML-escape `s` into an alloc-owned copy. The callback page splices two UNTRUSTED strings into its
+/// markup — the raw `error` query param (the route is public: any crafted link reaches it, no session
+/// needed) and the Cloudflare account display name (arbitrary text an account admin sets) — and this
+/// page executes on the same origin the authenticated web client calls its APIs from. Unescaped, either
+/// is a reflected XSS running with the victim's session cookie on every same-origin fetch.
+fn htmlEsc(alloc: std.mem.Allocator, s: []const u8) []const u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    for (s) |c| switch (c) {
+        '&' => out.appendSlice(alloc, "&amp;") catch return "",
+        '<' => out.appendSlice(alloc, "&lt;") catch return "",
+        '>' => out.appendSlice(alloc, "&gt;") catch return "",
+        '"' => out.appendSlice(alloc, "&quot;") catch return "",
+        '\'' => out.appendSlice(alloc, "&#39;") catch return "",
+        else => out.append(alloc, c) catch return "",
+    };
+    return out.items;
+}
+
+/// Render the post-callback browser page (the only HTML this module returns). The tab may have been
+/// opened by the WEB app (window.open) or the DESK (system browser): the script pokes an opener if one
+/// exists so the web app can react instantly, and both clients' status polls remain the source of truth.
 fn page(res: *httpz.Response, ok: bool, detail: []const u8) !void {
     res.content_type = .HTML;
     res.status = if (ok) 200 else 400;
     const title = if (ok) "Connected to Cloudflare" else "Cloudflare login failed";
-    const msg = if (ok) "You're connected. You can close this tab and return to veil-desk." else "Something went wrong.";
+    const msg = if (ok) "You're connected. You can close this tab and return to the veil." else "Something went wrong.";
     res.body = try std.fmt.allocPrint(res.arena,
         \\<!doctype html><meta charset="utf-8"><title>{s}</title>
         \\<div style="font:16px/1.5 system-ui,sans-serif;max-width:32rem;margin:16vh auto;padding:0 1rem;color:#1a1b26">
         \\<h2 style="color:{s}">{s}</h2><p>{s}</p><p style="color:#565f89;font-size:14px">{s}</p></div>
-    , .{ title, if (ok) "#2ac3de" else "#f7768e", title, msg, detail });
+        \\<script>try{{if(window.opener)window.opener.postMessage('nl-cf-oauth','*');}}catch(e){{}}
+        \\if({s})setTimeout(function(){{try{{window.close();}}catch(e){{}}}},1500);</script>
+    , .{ title, if (ok) "#2ac3de" else "#f7768e", title, msg, htmlEsc(res.arena, detail), if (ok) "true" else "false" });
 }
 
 test "pkce challenge is base64url sha256 of the verifier" {
@@ -508,6 +741,15 @@ test "pkce challenge is base64url sha256 of the verifier" {
     pkceChallenge(verifier, &chal);
     // RFC 7636 appendix B expected challenge
     try std.testing.expectEqualStrings("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM", &chal);
+}
+
+test "htmlEsc neutralizes every markup-significant byte (the callback page's XSS gate)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try std.testing.expectEqualStrings("&lt;script&gt;x&lt;/script&gt;", htmlEsc(a, "<script>x</script>"));
+    try std.testing.expectEqualStrings("a &amp; b &quot;c&quot; &#39;d&#39;", htmlEsc(a, "a & b \"c\" 'd'"));
+    try std.testing.expectEqualStrings("plain-account-name", htmlEsc(a, "plain-account-name"));
 }
 
 test "pctEncode leaves unreserved, encodes the rest" {

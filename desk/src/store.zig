@@ -853,6 +853,12 @@ pub const Store = struct {
     cf_oauth_pending: bool = false, //    a login was started; waiting for the browser callback to complete
     cf_oauth_account: [64]u8 = undefined, // the connected account id (for display)
     cf_oauth_account_len: usize = 0,
+    cf_oauth_name: [96]u8 = undefined, // "signed in as": the user's name, else the account's display name
+    cf_oauth_name_len: usize = 0,
+    // Set by the poller EXACTLY on the pending→connected transition (a login this session landing);
+    // the UI thread consumes it once per frame loop: defaults the chat onto Workers AI + toasts.
+    // Never set on a mere boot with an existing connection — that would override a user's later choice.
+    cf_just_connected: bool = false,
     // Live Workers AI model list, fetched from the connected account (the catalog changes fast). The model
     // dropdown uses these for the Cloudflare provider when non-empty; empty → catalog defaults.
     cf_models: [MAX_CF_MODELS][96]u8 = undefined,
