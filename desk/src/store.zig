@@ -22,7 +22,7 @@ const SpinLock = struct {
 
 pub const Tab = enum { dashboard, chat, swarm, hub, scheduled, settings }; // deploy = the Swarm tab's inner form
 
-pub const CmdKind = enum { none, select, say, set_goal, stop, deploy, delete, open_folder, refresh_now, open_file, sched_create, sched_update, sched_toggle, sched_delete, sched_run, oauth_cf_login, oauth_cf_logout, builtin_pull, builtin_cancel, builtin_import, builtin_remove, builtin_check, dataset_start, dataset_stop };
+pub const CmdKind = enum { none, select, say, set_goal, stop, deploy, delete, open_folder, refresh_now, open_file, sched_create, sched_update, sched_toggle, sched_delete, sched_run, oauth_cf_login, oauth_cf_logout, open_url, builtin_pull, builtin_cancel, builtin_import, builtin_remove, builtin_check, dataset_start, dataset_stop };
 
 /// A UI→poller command. Fixed-size, copied by value into the ring, so no cross-thread allocation.
 pub const Command = struct {
@@ -864,6 +864,16 @@ pub const Store = struct {
     cf_models: [MAX_CF_MODELS][96]u8 = undefined,
     cf_model_lens: [MAX_CF_MODELS]u8 = undefined,
     cf_model_count: usize = 0,
+    // --- R2 backup status (poller writes from GET /oauth/cloudflare/r2 while connected; the chat profile
+    // card and the Dashboard read). A snapshot, not a log: bucket present?, a pass running?, when the
+    // last clean pass finished (0 = never), how many files are mirrored, and the API's own error text.
+    cf_r2_seen: bool = false,
+    cf_r2_bucket_ok: bool = false,
+    cf_r2_busy: bool = false,
+    cf_r2_last_ok: i64 = 0,
+    cf_r2_files: u64 = 0,
+    cf_r2_err: [96]u8 = undefined,
+    cf_r2_err_len: usize = 0,
 
     // --- built-in model status (poller writes from GET /api/v1/models/builtin; Settings tab reads) ---
     // One snapshot of the server's own engine: whether the binary carries it (-Dbuiltin), whether the

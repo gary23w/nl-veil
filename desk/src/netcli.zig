@@ -249,6 +249,13 @@ pub fn oauthCfLogout(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u
     return httpReq(io, gpa, "POST", port, "/api/v1/oauth/cloudflare/logout", token, "{}", 8);
 }
 
+/// GET /api/v1/oauth/cloudflare/r2 — the R2 backup snapshot ({bucket_ok,busy,last_ok,files,last_error,…})
+/// the chat profile card renders under the account name. Polled only while connected.
+pub fn oauthCfR2(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8) ?Resp {
+    log.trace("netcli.oauthCfR2 port={d}", .{port});
+    return httpReq(io, gpa, "GET", port, "/api/v1/oauth/cloudflare/r2", token, null, 6);
+}
+
 /// GET /api/v1/models/builtin — the built-in engine snapshot (compiled?, weights, transfer progress)
 /// the Settings tab renders. Cheap authed GET beside the other polls.
 pub fn builtinStatus(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8) ?Resp {
