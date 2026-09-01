@@ -67,6 +67,7 @@ pub const Poller = struct {
     narr_until_s: i64 = 0, // estimated end of the current utterance — the next waits (no overlapping voices)
     last_cf_s: i64 = 0, // Cloudflare OAuth status poll throttle (reset to 0 to poll on the next tick)
     last_cfm_s: i64 = 0, // Cloudflare live-models fetch throttle (only while connected; 0 = fetch next tick)
+    last_r2_s: i64 = 0, // R2 backup snapshot throttle (only while connected; the card's "backed up 2m ago")
     last_bi_s: i64 = 0, // built-in model status poll throttle (0 = poll next tick; verbs reset it)
     last_ds_s: i64 = 0, // training-set capture poll throttle (fast while recording so counts climb live)
     // built-in transition memory (poller-local): a transfer that lands or fails raises ONE toast,
@@ -156,6 +157,8 @@ pub const Poller = struct {
                 .sched_run => self.doSchedRun(c.idStr()),
                 .oauth_cf_login => self.doOauthCfLogin(),
                 .oauth_cf_logout => self.doOauthCfLogout(),
+                // a "live ↗" on a Cloudflare deploy chip: the URL rides Command.text, the browser opens it
+                .open_url => if (std.mem.startsWith(u8, c.textStr(), "https://")) self.openUrl(c.textStr()),
                 .builtin_pull => self.doBuiltinVerb(.pull),
                 .builtin_cancel => self.doBuiltinVerb(.cancel),
                 .builtin_import => self.doBuiltinVerb(.import),
@@ -691,6 +694,12 @@ pub const Poller = struct {
             if (online and connected and now_s - self.last_cfm_s >= 60) {
                 self.last_cfm_s = now_s;
                 self.refreshCfModels();
+            }
+            // R2 backup snapshot — the profile card's second line. 20s: a pass runs at most every 15 min,
+            // so this is about catching "backing up…" while it is true, not about freshness of the totals.
+            if (online and connected and now_s - self.last_r2_s >= 20) {
+                self.last_r2_s = now_s;
+                self.refreshCfR2();
             }
         }
 
@@ -1292,6 +1301,32 @@ pub const Poller = struct {
         @memcpy(self.store.cf_models[0..n], names[0..n]);
         @memcpy(self.store.cf_model_lens[0..n], lens[0..n]);
         self.store.cf_model_count = n;
+    }
+
+    /// GET /oauth/cloudflare/r2 → the store's cf_r2_* snapshot. Substring/int reads like the other
+    /// status polls (the server writes compact JSON with fixed keys).
+    fn refreshCfR2(self: *Poller) void {
+        var tbuf: [128]u8 = undefined;
+        const tok = self.tokenSnap(&tbuf);
+        const resp = netcli.oauthCfR2(self.io, self.gpa, self.port(), tok) orelse return;
+        defer if (resp.body.len > 0) self.gpa.free(resp.body);
+        if (resp.status != 200) return;
+        const bucket_ok = std.mem.indexOf(u8, resp.body, "\"bucket_ok\":true") != null;
+        const busy = std.mem.indexOf(u8, resp.body, "\"busy\":true") != null;
+        const last_ok: i64 = @intCast(intForKey(resp.body, "last_ok") orelse 0);
+        const files: u64 = intForKey(resp.body, "files") orelse 0;
+        var eb: [96]u8 = undefined;
+        const err = valueForKey(resp.body, "last_error", &eb);
+        self.store.lock();
+        defer self.store.unlock();
+        self.store.cf_r2_seen = true;
+        self.store.cf_r2_bucket_ok = bucket_ok;
+        self.store.cf_r2_busy = busy;
+        self.store.cf_r2_last_ok = last_ok;
+        self.store.cf_r2_files = files;
+        const en = @min(err.len, self.store.cf_r2_err.len);
+        @memcpy(self.store.cf_r2_err[0..en], err[0..en]);
+        self.store.cf_r2_err_len = en;
     }
 
     fn notifyTransitions(self: *Poller, online: bool, swarms: []const scan.SwarmSummary, sel: []const u8, sel_metrics: scan.Metrics) void {

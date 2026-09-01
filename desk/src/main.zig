@@ -1137,6 +1137,14 @@ fn drawTitlebar(store: *Store) void {
     store.lock();
     const online = store.server_online;
     const minds = store.fleet_minds;
+    const cf_on = store.cf_oauth_connected;
+    var cfn: [96]u8 = undefined;
+    var cfn_n: usize = @min(store.cf_oauth_name_len, cfn.len);
+    @memcpy(cfn[0..cfn_n], store.cf_oauth_name[0..cfn_n]);
+    if (cfn_n == 0) {
+        cfn_n = @min(store.cf_oauth_account_len, cfn.len);
+        @memcpy(cfn[0..cfn_n], store.cf_oauth_account[0..cfn_n]);
+    }
     store.unlock();
     // Down is an ALARM state, not a shade of grey: the muted "offline" read as a stale-but-fine chip while
     // every request was actually failing — say "server down" in red so a dead control plane is unmissable.
@@ -1145,6 +1153,15 @@ fn drawTitlebar(store: *Store) void {
     const lx = sw - @as(f32, @floatFromInt(lw)) - 154;
     t.statusDot(@intFromFloat(lx - 11), TITLE_H / 2, if (online) t.green else t.red);
     t.text(label, @intFromFloat(lx), (TITLE_H - 12) / 2, 12, if (online) t.green else t.red);
+    // The Cloudflare mark: an orange dot and who you are, to the left of the server status, while
+    // connected — the account is a standing fact about this session, so it lives in the chrome.
+    if (cf_on) {
+        const who: []const u8 = if (cfn_n > 0) cfn[0..cfn_n] else "cloudflare";
+        const max_w: f32 = 180;
+        const cx = lx - 11 - 22 - max_w;
+        t.statusDot(@intFromFloat(cx - 11), TITLE_H / 2, CF_ORANGE);
+        t.textClip(who, @intFromFloat(cx), (TITLE_H - 12) / 2, 12, t.fg_dim, @intFromFloat(max_w));
+    }
 
     const minb = t.Rect{ .x = sw - 138, .y = 0, .width = 46, .height = TITLE_H };
     const maxb = t.Rect{ .x = sw - 92, .y = 0, .width = 46, .height = TITLE_H };
@@ -2995,12 +3012,42 @@ fn cfBrandButton(r: t.Rect, label: [:0]const u8, enabled: bool) bool {
 /// chats list (it used to be a chip squeezed into the composer's role row). Disconnected it is the
 /// login; connected it names the profile and jumps to Settings. Returns the height it reserved so
 /// the list above shrinks around it; an unconfigured server reserves nothing — no dead affordance.
-fn drawCfProfileCard(store: *Store, r: t.Rect) f32 {
+/// The line beside a MODEL dropdown. For Cloudflare Workers AI while connected it says the list is the
+/// account's own, live, and how big — so thirty rows read as "yours", not as a file's guess.
+fn drawModelsHint(store: *Store, p: *const @TypeOf(catalog.providers[0]), x: f32, y: f32) void {
+    if (p.needs_account) {
+        store.lock();
+        const connected = store.cf_oauth_connected;
+        const n = store.cf_model_count;
+        store.unlock();
+        if (connected and n > 0) {
+            t.text(t.z("{d} models - live from your Cloudflare account", .{n}), @intFromFloat(x), @intFromFloat(y), 11, CF_ORANGE);
+            return;
+        }
+    }
+    t.text(t.z("models available on {s}", .{p.label}), @intFromFloat(x), @intFromFloat(y), 11, t.comment);
+}
+
+/// "2m ago" for a card that must stay one glance long.
+fn agoStr(buf: []u8, secs: i64) []const u8 {
+    const s = @max(secs, 0);
+    if (s < 60) return "just now";
+    if (s < 3600) return std.fmt.bufPrint(buf, "{d}m ago", .{@divTrunc(s, 60)}) catch "recently";
+    if (s < 86400) return std.fmt.bufPrint(buf, "{d}h ago", .{@divTrunc(s, 3600)}) catch "recently";
+    return std.fmt.bufPrint(buf, "{d}d ago", .{@divTrunc(s, 86400)}) catch "recently";
+}
+
+fn drawCfProfileCard(store: *Store, r: t.Rect, now_s: i64) f32 {
     var cfc = false;
     var cfp = false;
     var cfg = false;
     var nb: [96]u8 = undefined;
     var nn: usize = 0;
+    var r2_seen = false;
+    var r2_ok = false;
+    var r2_busy = false;
+    var r2_last: i64 = 0;
+    var r2_err_n: usize = 0;
     {
         store.lock();
         defer store.unlock();
@@ -3013,9 +3060,27 @@ fn drawCfProfileCard(store: *Store, r: t.Rect) f32 {
             nn = @min(store.cf_oauth_account_len, nb.len);
             @memcpy(nb[0..nn], store.cf_oauth_account[0..nn]);
         }
+        r2_seen = store.cf_r2_seen;
+        r2_ok = store.cf_r2_bucket_ok;
+        r2_busy = store.cf_r2_busy;
+        r2_last = store.cf_r2_last_ok;
+        r2_err_n = store.cf_r2_err_len;
     }
     if (!cfg) return 0;
-    const foot_h: f32 = 48;
+    // The R2 line under the name: what the backup is doing, in one glance. Nothing when nothing is true.
+    var agob: [24]u8 = undefined;
+    var r2b: [64]u8 = undefined;
+    var r2_line: []const u8 = "";
+    if (cfc and r2_seen) {
+        if (r2_busy) {
+            r2_line = "backing up to R2...";
+        } else if (r2_ok) {
+            r2_line = if (r2_last > 0) (std.fmt.bufPrint(&r2b, "backed up to R2 {s}", .{agoStr(&agob, now_s - r2_last)}) catch "backed up to R2") else "first R2 backup pending";
+        } else if (r2_err_n > 0) {
+            r2_line = "backup: activate R2 on your dashboard";
+        }
+    }
+    const foot_h: f32 = if (r2_line.len > 0) 62 else 48;
     const ca = t.Rect{ .x = r.x + 6, .y = r.y + r.height - foot_h + 4, .width = r.width - 12, .height = foot_h - 10 };
     const chot = t.hovering(ca) and ui.open_dd == .none;
     t.panelBordered(ca, if (chot) t.bg_hl else t.bg, t.border);
@@ -3023,6 +3088,7 @@ fn drawCfProfileCard(store: *Store, r: t.Rect) f32 {
         t.text(t.z("cloudflare", .{}), @intFromFloat(ca.x + 10), @intFromFloat(ca.y + 6), 10, t.comment);
         const who: [:0]const u8 = if (nn > 0) t.z("{s}", .{nb[0..nn]}) else t.z("connected", .{});
         t.textClip(who, @intFromFloat(ca.x + 10), @intFromFloat(ca.y + 19), 12, if (chot) t.blue else t.fg_dim, @intFromFloat(ca.width - 20));
+        if (r2_line.len > 0) t.textClip(r2_line, @intFromFloat(ca.x + 10), @intFromFloat(ca.y + 34), 10, if (r2_busy) CF_ORANGE else t.comment, @intFromFloat(ca.width - 20));
     } else if (cfp) {
         // Pending stays CLICKABLE: an abandoned browser grant never clears the flag (there is no
         // timeout), so a dead card would wedge the login for the session. Re-issuing the command
@@ -3062,7 +3128,7 @@ fn drawChatLeft(store: *Store, r: t.Rect, open: bool, convs: []const store_mod.C
     }
     // The profile card claims the pane's bottom edge first (on BOTH inner tabs — it is a pane
     // fixture, not a list row); everything below lays out inside what is left.
-    const foot_h = drawCfProfileCard(store, r);
+    const foot_h = drawCfProfileCard(store, r, now_s);
     if (ui.chats_inner == .sched) {
         var rs = r;
         rs.height -= foot_h;
@@ -4210,6 +4276,12 @@ fn toolName(text: []const u8) ?[]const u8 {
 
 /// A human one-liner for a tool name (the collapsed chip label).
 fn toolFriendly(name: []const u8) [:0]const u8 {
+    if (std.mem.eql(u8, name, "cf_deploy_worker")) return t.z("deployed to Cloudflare", .{});
+    if (std.mem.eql(u8, name, "cf_r2_put")) return t.z("saved to R2", .{});
+    if (std.mem.eql(u8, name, "cf_r2_get")) return t.z("fetched from R2", .{});
+    if (std.mem.eql(u8, name, "cf_r2_list")) return t.z("listed R2", .{});
+    if (std.mem.eql(u8, name, "cf_d1_query")) return t.z("queried D1", .{});
+    if (std.mem.eql(u8, name, "cf_api")) return t.z("called Cloudflare", .{});
     if (std.mem.eql(u8, name, "web_search")) return t.z("searched the web", .{});
     if (std.mem.eql(u8, name, "web_fetch")) return t.z("fetched a page", .{});
     if (std.mem.eql(u8, name, "fetch_json")) return t.z("fetched data", .{});
@@ -4235,12 +4307,59 @@ fn tokCostOf(text: []const u8) usize {
 
 /// Draw the collapsed tool line — NO background or border: a colored marker, the tool NAME, and a view/hide
 /// affordance. The token cost lives in the expanded dropdown (see drawChatCenter). Returns true on click.
+/// The orange the vendor's mark wears everywhere in the desk (the brand button, chip markers, the live link,
+/// the titlebar dot). One constant so the shade never drifts between surfaces.
+const CF_ORANGE = t.Color{ .r = 0xf6, .g = 0x82, .b = 0x1f, .a = 255 };
+
+/// The live workers.dev URL inside a Cloudflare deploy's result text, or null. cf_deploy_worker answers
+/// "… live at https://<name>.<sub>.workers.dev …" — that URL is the whole point of the call.
+fn liveUrlIn(text: []const u8) ?[]const u8 {
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, text, i, "https://")) |at| {
+        var end = at;
+        while (end < text.len and !std.ascii.isWhitespace(text[end]) and text[end] != ')' and text[end] != '"' and text[end] != '\'' and text[end] != '>' and text[end] != ',') end += 1;
+        const url = text[at..end];
+        if (std.mem.indexOf(u8, url, ".workers.dev") != null) return url;
+        i = end;
+        if (i >= text.len) break;
+    }
+    return null;
+}
+
+/// "open live" beside the copy chip of an expanded Cloudflare deploy — hands the URL to the browser.
+fn openChip(x: f32, y: f32) bool {
+    const r = t.Rect{ .x = x, .y = y, .width = 58, .height = 17 };
+    const hot = t.hovering(r);
+    t.text(t.z("open live", .{}), @intFromFloat(x + 2), @intFromFloat(y + 2), 11, if (hot) CF_ORANGE else t.comment);
+    if (hot) t.wantCursor(.pointing_hand);
+    return hot and rl.isMouseButtonPressed(.left);
+}
+
 fn toolChip(view: t.Rect, y0: f32, name: []const u8, expanded: bool) bool {
+    return toolChipEx(view, y0, name, expanded, null, null);
+}
+
+/// The collapsed tool row. A Cloudflare tool (cf_*) wears the orange marker so a transcript reads "this
+/// step touched your account" at a glance, and a deploy that returned a live URL grows a "live >" action
+/// at the right that hands the URL to the browser — the moment a Worker went on the internet deserves a
+/// real control, not a hunt through the expanded JSON. The action owns its own click: pressing it never
+/// also toggles the row.
+fn toolChipEx(view: t.Rect, y0: f32, name: []const u8, expanded: bool, live: ?[]const u8, store: ?*Store) bool {
     const r = t.Rect{ .x = view.x + 12, .y = y0 + 4, .width = view.width - 24, .height = 20 };
-    const hot = t.hovering(r) and t.hovering(view);
-    t.fillRect(@intFromFloat(r.x + 2), @intFromFloat(y0 + 11), 6, 6, t.blue); // small marker dot
+    const is_cf = std.mem.startsWith(u8, name, "cf_");
+    const has_live = live != null and store != null;
+    const open_r = t.Rect{ .x = r.x + r.width - 34 - 62, .y = y0 + 3, .width = 56, .height = 18 };
+    const open_hot = has_live and t.hovering(open_r) and t.hovering(view);
+    const hot = t.hovering(r) and t.hovering(view) and !open_hot;
+    t.fillRect(@intFromFloat(r.x + 2), @intFromFloat(y0 + 11), 6, 6, if (is_cf) CF_ORANGE else t.blue); // small marker dot
     const nm = t.zs(name); // the actual tool called (read_file, write_file, web_search, …)
     t.text(nm, @intFromFloat(r.x + 16), @intFromFloat(y0 + 8), 12, if (hot or expanded) t.fg else t.fg_dim);
+    if (has_live) {
+        t.panelBordered(open_r, if (open_hot) CF_ORANGE else t.bg, CF_ORANGE);
+        t.text(t.z("live >", .{}), @intFromFloat(open_r.x + 9), @intFromFloat(open_r.y + 3), 10, if (open_hot) t.bg else CF_ORANGE);
+        if (open_hot) t.wantCursor(.pointing_hand);
+        if (open_hot and rl.isMouseButtonPressed(.left)) store.?.pushCmd(store_mod.mkCmd(.open_url, "", live.?));
+    }
     t.text(if (expanded) t.z("hide", .{}) else t.z("view", .{}), @intFromFloat(r.x + r.width - 34), @intFromFloat(y0 + 9), 10, if (hot) t.blue else t.comment);
     if (hot) t.wantCursor(.pointing_hand);
     return hot and rl.isMouseButtonPressed(.left);
@@ -4629,9 +4748,13 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
                     copyToClipboard(m.textStr());
                     markCopied();
                 }
+                // …and a Cloudflare deploy's live URL is one click from the browser
+                if (liveUrlIn(m.textStr())) |url| {
+                    if (openChip(view.x + view.width - 196, y0 + 3)) store.pushCmd(store_mod.mkCmd(.open_url, "", url));
+                }
                 const hdr = t.Rect{ .x = view.x + 2, .y = y0, .width = view.width - 132, .height = 20 };
                 if (t.hovering(hdr) and t.hovering(view) and rl.isMouseButtonPressed(.left)) rowSetOpen(m.uid, false);
-            } else if (toolChip(view, y0, tn, false)) {
+            } else if (toolChipEx(view, y0, tn, false, liveUrlIn(m.textStr()), store)) {
                 rowSetOpen(m.uid, true);
             }
             continue;
@@ -4660,6 +4783,27 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
     if (cast_live) yy = renderCastLive(view, yy, status, true);
     if (msgs.len == 0 and !busy and stream.len == 0) {
         t.text(t.z("talk to the veil - it casts the hive when a task needs real work", .{}), @intFromFloat(view.x + 14), @intFromFloat(view.y + 14), 13, t.comment);
+        // The one-click on-ramp, right where a first-timer is looking: when the server offers the
+        // Cloudflare login and this user has not taken it yet, say what it buys and let them click.
+        var cfg = false;
+        var cfc = false;
+        var cfp = false;
+        {
+            store.lock();
+            defer store.unlock();
+            cfg = store.cf_oauth_configured;
+            cfc = store.cf_oauth_connected;
+            cfp = store.cf_oauth_pending;
+        }
+        if (cfg and !cfc) {
+            const lbl: [:0]const u8 = if (cfp) t.z("waiting for cloudflare... (click to retry)", .{}) else t.z("+ log in with cloudflare - free workers ai, your live model list, r2 backup", .{});
+            const lw: f32 = @floatFromInt(t.measure(lbl, 12));
+            const lr = t.Rect{ .x = view.x + 12, .y = view.y + 36, .width = lw + 8, .height = 18 };
+            const lhot = t.hovering(lr) and t.hovering(view);
+            t.text(lbl, @intFromFloat(lr.x + 2), @intFromFloat(lr.y + 2), 12, if (cfp) t.orange else if (lhot) CF_ORANGE else t.fg_dim);
+            if (lhot) t.wantCursor(.pointing_hand);
+            if (lhot and rl.isMouseButtonPressed(.left)) store.pushCmd(store_mod.mkCmd(.oauth_cf_login, "", ""));
+        }
     }
     // TEXT SELECTION: drag over the message text to select; the highlight + cached copy text are computed from the
     // line geometry captured above. A plain click (no drag) clears the selection. Ctrl+C (handled in handleKeys)
@@ -8123,8 +8267,7 @@ fn drawSettings(store: *Store, body: t.Rect) void {
     } else {
         const model_disp: []const u8 = if (cmn > 0) cmb[0..cmn] else "(pick a model)";
         selector(.{ .x = x, .y = y, .width = half, .height = 48 }, t.z("MODEL", .{}), model_disp, .chat_model);
-        const hint = t.z("models available on {s}", .{catalog.providers[@min(chat_byok, catalog.providers.len - 1)].label});
-        t.text(hint, @intFromFloat(x + half + 10), @intFromFloat(y + 18), 11, t.comment);
+        drawModelsHint(store, &catalog.providers[@min(chat_byok, catalog.providers.len - 1)], x + half + 10, y + 18);
         y += 58;
     }
 
@@ -8318,7 +8461,7 @@ fn chatRolePanel(store: *Store, x: f32, y_in: f32, colw: f32, half: f32, ol_n: u
     selector(.{ .x = x, .y = y, .width = half, .height = 48 }, t.z("MODEL", .{}), model_disp, dd_model);
     if (kind == 1) {
         const p = &catalog.providers[@min(byok, catalog.providers.len - 1)];
-        t.text(t.z("models available on {s}", .{p.label}), @intFromFloat(x + half + 10), @intFromFloat(y + 18), 11, t.comment);
+        drawModelsHint(store, p, x + half + 10, y + 18);
     } else if (kind == 0) {
         const hint = if (ol_n > 0) t.z("{d} models installed on this machine", .{ol_n}) else t.z("Ollama not reachable - showing common models", .{});
         t.text(hint, @intFromFloat(x + half + 10), @intFromFloat(y + 18), 11, t.comment);

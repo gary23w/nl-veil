@@ -2085,6 +2085,15 @@ pub const Chat = struct {
                 (if (scRawField(line, "preview")) |raw| scUnescape(raw, &pvb) else "")
             else
                 "";
+            // A Cloudflare deploy that came back with a live URL is worth a toast, not just a chip — the
+            // moment a Worker goes on the internet is the moment the user wants the address in hand.
+            if (std.mem.eql(u8, state, "done") and std.mem.startsWith(u8, tool, "cf_deploy")) {
+                if (std.mem.indexOf(u8, preview, "https://")) |at| {
+                    var end = at;
+                    while (end < preview.len and !std.ascii.isWhitespace(preview[end]) and preview[end] != ')' and preview[end] != ',') end += 1;
+                    self.store.pushNotif("Live on Cloudflare", preview[at..end], 1);
+                }
+            }
             var nb: [440]u8 = undefined;
             const note = if (preview.len > 0)
                 std.fmt.bufPrint(&nb, "[tool:{s}] {s} — {s}", .{ tool[0..@min(tool.len, 96)], state[0..@min(state.len, 16)], preview[0..@min(preview.len, 220)] }) catch "[tool]"

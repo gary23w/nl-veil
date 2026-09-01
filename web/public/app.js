@@ -558,8 +558,70 @@ addEventListener('message', (e) => { if (e.data === 'nl-cf-oauth') refreshCfStat
     null-guarded — only the surfaces currently in the DOM repaint. */
 function syncCfSurfaces() {
   syncCfChip();
+  syncCfTopbar();
   refreshCfPanel();
   renderCfDash();
+  // The first-run nudge offers the login, so it has to hear when the login's availability
+  // (or the connection) changes — it paints BEFORE the first status poll lands, and paintEmpty
+  // only repaints when the markup actually differs, so this is cheap and exact.
+  syncSetupState();
+}
+
+/** The orange cloud in the topbar status chip: present exactly while connected, named on hover. */
+function syncCfTopbar() {
+  const n = el('statusCf');
+  if (!n) return;
+  if (S.cf.connected) {
+    n.className = 'status-cf';
+    n.innerHTML = cfCloudSvg();
+    n.title = 'Cloudflare: signed in as ' + cfDisplayName();
+  } else {
+    n.className = 'hide';
+    n.innerHTML = '';
+  }
+}
+
+/** "backed up 2m ago" — the R2 line under the profile name. '' when there is nothing true to say. */
+function cfBackupLine() {
+  const r2 = S.cf.r2;
+  if (!S.cf.connected || !r2) return '';
+  if (r2.busy) return 'backing up…';
+  if (r2.bucket_ok) return r2.last_ok ? 'backed up ' + fmtAgo(r2.last_ok) : 'first backup pending';
+  if (r2.last_error) return 'backup needs R2 activated';
+  return '';
+}
+
+function fmtAgo(ts) {
+  const s = Math.max(0, Math.floor(Date.now() / 1000) - (ts | 0));
+  if (s < 60) return 'just now';
+  if (s < 3600) return Math.floor(s / 60) + 'm ago';
+  if (s < 86400) return Math.floor(s / 3600) + 'h ago';
+  return Math.floor(s / 86400) + 'd ago';
+}
+
+const _cfLiveSeen = new Set();
+/** A Cloudflare deploy frame that carries a live URL → one toast with the URL (deduped per URL). */
+function cfToastLive(f) {
+  if (!f || f.state !== 'done' || !isCfTool(f.tool)) return;
+  const url = cfLiveUrl({ tool: f.tool, state: f.state, preview: f.preview });
+  if (!url || _cfLiveSeen.has(url)) return;
+  _cfLiveSeen.add(url);
+  toast('Live on Cloudflare', url, 'ok');
+}
+
+/** Point chat at Workers AI: the best live model if the list has landed, else the bootstrap default.
+    Shared by the Settings button and the first-run nudge so both make the identical choice. */
+function cfUseForChat() {
+  const live = S.cf.models || [];
+  const pick = live.includes(CF_DEFAULT_MODEL) ? CF_DEFAULT_MODEL : (live[0] || CF_DEFAULT_MODEL);
+  S.settings.model = pick;
+  S.settings.base_url = '';
+  S.settings.api_key = '';
+  saveSettings();
+  updateCharCount();
+  syncSetupState();
+  if (S.tab === 'settings') drawRolePanels();
+  toast('Chat set to Workers AI', pick, 'ok');
 }
 
 /* ---------------- the sidebar profile card (below the conversation list) ---------------- */
@@ -572,8 +634,10 @@ function syncCfChip() {
   chip.classList.remove('hide');
   if (S.cf.connected) {
     chip.className = 'cf-card on';
-    chip.innerHTML = cfCloudSvg() + '<span class="ellip">' + esc(cfDisplayName()) + '</span>';
-    chip.title = 'Cloudflare: connected as ' + cfDisplayName() + ' — open Settings';
+    const sub = cfBackupLine();
+    chip.innerHTML = cfCloudSvg() + '<span class="cf-card-text"><span class="ellip">' + esc(cfDisplayName()) + '</span>'
+      + (sub ? '<span class="cf-card-sub ellip">' + esc(sub) + '</span>' : '') + '</span>';
+    chip.title = 'Cloudflare: connected as ' + cfDisplayName() + (sub ? ' · ' + sub : '') + ' — open Settings';
   } else if (S.cf.pending) {
     chip.className = 'cf-card pending';
     chip.innerHTML = cfCloudSvg() + '<span>waiting for Cloudflare…</span>';
@@ -681,18 +745,7 @@ function refreshCfPanel() {
   const out = el('cfOutBtn');
   if (out) out.addEventListener('click', cfLogout);
   const use = el('cfUseBtn');
-  if (use) use.addEventListener('click', () => {
-    const live = S.cf.models;
-    const pick = live.includes(CF_DEFAULT_MODEL) ? CF_DEFAULT_MODEL : (live[0] || CF_DEFAULT_MODEL);
-    S.settings.model = pick;
-    S.settings.base_url = '';
-    S.settings.api_key = '';
-    saveSettings();
-    updateCharCount();
-    syncSetupState();
-    drawRolePanels();
-    toast('Chat set to Workers AI', pick, 'ok');
-  });
+  if (use) use.addEventListener('click', cfUseForChat);
   const syncBtn = el('cfR2Sync');
   if (syncBtn) syncBtn.addEventListener('click', async () => {
     try {
@@ -1058,7 +1111,7 @@ function enterApp(user) {
     <header class="topbar">
       <div class="brand">the veil <small>${esc(user.email || '')}</small></div>
       <div class="grow"></div>
-      <div class="status-chip"><i class="status-dot" id="statusDot"></i><span id="statusText">checking…</span></div>
+      <div class="status-chip"><i class="status-dot" id="statusDot"></i><span id="statusText">checking…</span><span id="statusCf" class="hide"></span></div>
       <button class="icon-btn" id="themeBtn" title="Toggle light / dark" aria-label="Toggle theme">${themeIcon()}</button>
       <button class="icon-btn" id="outBtn" title="Sign out" aria-label="Sign out">
         <svg viewBox="0 0 24 24"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"/></svg>
@@ -1203,6 +1256,7 @@ async function pollHealth() {
   if (dot) dot.className = 'status-dot ' + cls;
   if (txt) txt.textContent = text;
   if (chip) chip.title = why;
+  syncCfTopbar();
 }
 
 /* ============================================================ dashboard */
@@ -2012,9 +2066,22 @@ function setupHintHtml() {
   const need = missingKeyProvider();
   const steps = [];
 
-  steps.push(model
-    ? '<li class="done">Model: <span class="mono">' + esc(model) + '</span></li>'
-    : '<li class="now">Pick a model in <button class="linkbtn" data-goto="settings">Settings</button></li>');
+  // With no model, the Cloudflare login is the shortest path there is — one click, free Workers AI,
+  // the model list filled from the account — so it leads. Connected-but-unpicked (a user who
+  // declined the auto-default, or switched away) gets the one-click "use it" instead.
+  if (model) {
+    steps.push('<li class="done">Model: <span class="mono">' + esc(model) + '</span></li>');
+  } else if (S.cf.connected) {
+    steps.push('<li class="now"><button class="linkbtn cf-link" data-cf-use>' + cfCloudSvg()
+      + 'Use Workers AI</button> — you are signed in as ' + esc(cfDisplayName())
+      + ' · or pick a model in <button class="linkbtn" data-goto="settings">Settings</button></li>');
+  } else if (S.cf.configured && !S.cf.pending) {
+    steps.push('<li class="now"><button class="linkbtn cf-link" data-cf-login>' + cfCloudSvg()
+      + 'Log in with Cloudflare</button> — one click, free Workers AI, your live model list'
+      + ' · or pick a model in <button class="linkbtn" data-goto="settings">Settings</button></li>');
+  } else {
+    steps.push('<li class="now">Pick a model in <button class="linkbtn" data-goto="settings">Settings</button></li>');
+  }
 
   // Only speak about keys when there is something true to say. A local model needs
   // none, and an unknown endpoint is not ours to guess at.
@@ -2155,7 +2222,7 @@ function hostActivityHtml() {
   if (running.length) {
     const t = running[running.length - 1];
     const secs = t.started ? Math.round((Date.now() - t.started) / 1000) : 0;
-    bits.push('<span class="spin"></span><b>' + esc(t.tool) + '</b>'
+    bits.push('<span class="spin"></span>' + (isCfTool(t.tool) ? cfCloudSvg() : '') + '<b>' + esc(t.tool) + '</b>'
       + (cleanPreview(t.preview) ? ' <span class="muted ellip">' + esc(cleanPreview(t.preview)) + '</span>' : '')
       + (secs > 1 ? ' <span class="muted">' + secs + 's</span>' : ''));
   } else if (S.stream.status) {
@@ -2377,6 +2444,19 @@ function cleanPreview(s) {
     return t;
 }
 
+/** Is this one of the Cloudflare tools (cftools.zig's cf_ family)? They render as Cloudflare
+    events — orange cloud, orange rule — so a user can watch their own account being driven. */
+function isCfTool(name) { return /^cf_/.test(String(name || '')); }
+
+/** The live URL a Cloudflare deploy returned, or ''. cf_deploy_worker answers "live at https://
+    <name>.<sub>.workers.dev"; that URL is the whole point of the call, so it gets its own link
+    beside the chip instead of being buried in a 2 KB preview. */
+function cfLiveUrl(t) {
+  if (!t || !isCfTool(t.tool) || t.state !== 'done') return '';
+  const m = /https:\/\/[a-z0-9.-]+\.workers\.dev[^\s"'<>)]*/i.exec(String(t.preview || ''));
+  return m ? m[0] : '';
+}
+
 /** A tool chip carries its own state and elapsed time — the point is that the
     user can see the host working, not just that something is happening. */
 function toolChip(t, idx) {
@@ -2384,15 +2464,21 @@ function toolChip(t, idx) {
   const mark = t.state === 'done' ? '✓' : (t.state === 'error' ? '✗' : '');
   const secs = t.started && t.ended ? Math.round((t.ended - t.started) / 1000) : 0;
   const open = S.openTool === idx;
+  const cf = isCfTool(t.tool);
+  const live = cfLiveUrl(t);
   // A button, not a div: this is clickable, so it should be reachable by keyboard
   // and announced as an action rather than as decoration.
-  return '<button class="tool-chip ' + cls + (open ? ' open' : '') + '" data-tool-idx="' + idx + '"'
+  return '<button class="tool-chip ' + cls + (cf ? ' cf' : '') + (open ? ' open' : '') + '" data-tool-idx="' + idx + '"'
     + ' aria-expanded="' + (open ? 'true' : 'false') + '" title="Show what this returned">'
+    + (cf ? cfCloudSvg() : '')
     + (mark ? '<i class="tool-mark">' + mark + '</i>' : '<i class="tool-mark spin"></i>')
     + '<b>' + esc(t.tool) + '</b>'
     + (cleanPreview(t.preview) ? '<span class="ellip">' + esc(cleanPreview(t.preview)) + '</span>' : '')
     + (secs > 1 ? '<span class="muted">' + secs + 's</span>' : '')
-    + '</button>';
+    + '</button>'
+    // The deploy's payoff, as a real link: a Worker just went on the internet and this opens it.
+    + (live ? '<a class="tool-live" href="' + esc(live) + '" target="_blank" rel="noopener noreferrer" title="' + esc(live) + '">'
+        + cfCloudSvg() + 'live ↗</a>' : '');
 }
 
 /** The opened tool's output, under the strip. The event frame carries a bounded
@@ -2585,6 +2671,10 @@ function syncSetupState() {
 document.addEventListener('click', (e) => {
   const t = e.target.closest ? e.target.closest('[data-goto]') : null;
   if (t) setTab(t.dataset.goto);
+  const cfl = e.target.closest ? e.target.closest('[data-cf-login]') : null;
+  if (cfl) cfLogin();
+  const cfu = e.target.closest ? e.target.closest('[data-cf-use]') : null;
+  if (cfu) cfUseForChat();
 });
 
 /** Start a turn.
@@ -2979,6 +3069,7 @@ function applyFrame(f) {
       } else {
         S.stream.tools.push({ tool: f.tool, state: f.state, preview: f.preview || '', started: Date.now(), ended: 0 });
       }
+      cfToastLive(f);           // a Worker going live is worth a toast, not just a chip
       scheduleType();           // keeps the elapsed counter and spinner ticking
       return true;
     }
@@ -4130,7 +4221,12 @@ function catalogOptions(selected) {
   });
   let html = '<option value="">— custom / not listed —</option>';
   for (const k of keys) {
-    html += `<optgroup label="${esc(providerLabel(k))}">`;
+    // The Workers AI group is the account's own catalogue while connected — say so where the
+    // eye lands, so a user knows those 30 models are theirs, not a file's guess.
+    const glabel = (k === 'workers-ai' && S.cf.connected && S.cf.models.length)
+      ? providerLabel(k) + ' · live from your account (' + S.cf.models.length + ')'
+      : providerLabel(k);
+    html += `<optgroup label="${esc(glabel)}">`;
     for (const m of byProv.get(k)) {
       const tags = [];
       if (m.context) tags.push(Math.round(m.context / 1000) + 'k');

@@ -985,6 +985,40 @@ table.data td.num { text-align: right; font-variant-numeric: tabular-nums; }
 .cf-card.on { color: var(--text-secondary); }
 .cf-card.pending { color: var(--warn); }
 .cf-card .ellip { min-width: 0; }
+/* two-line card once connected: the name, and the R2 backup state beneath it */
+.cf-card-text { display: flex; flex-direction: column; min-width: 0; line-height: 1.25; }
+.cf-card-sub { font-size: .86em; color: var(--text-muted); }
+
+/* a login in flight breathes: the cloud pulses until the grant lands (or the user retries) */
+@keyframes cf-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .3; } }
+.cf-card.pending svg, .cf-btn:disabled svg { animation: cf-pulse 1.2s ease-in-out infinite; }
+
+/* the topbar mark: an orange cloud beside the status text while connected */
+.status-cf { display: inline-flex; align-items: center; margin-left: 2px; }
+.status-cf svg { width: 13px; height: 13px; color: #f6821f; }
+
+/* CLOUDFLARE TOOL EVENTS. A cf_ chip wears the cloud and an orange rule, so a transcript reads
+   "this step touched your account" at a glance; a deploy that returned a URL grows a solid orange
+   "live" link beside it — the moment a Worker went on the internet deserves a real control. */
+.tool-chip.cf { border-color: color-mix(in srgb, #f6821f 50%, var(--border)); }
+.tool-chip.cf .cf-cloud { width: 12px; height: 12px; align-self: center; color: #f6821f; }
+.tool-chip.cf.done { border-color: color-mix(in srgb, #f6821f 60%, var(--border)); }
+.tool-live {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 3px 10px;
+  border-radius: var(--radius-pill);
+  background: #f6821f; color: #fff;
+  font-size: calc(var(--fs-micro) * var(--text-scale));
+  font-weight: 650; text-decoration: none; white-space: nowrap;
+}
+.tool-live .cf-cloud { width: 12px; height: 12px; color: #fff; }
+.tool-live:hover { filter: brightness(1.07); }
+.host-activity .cf-cloud { width: 12px; height: 12px; color: #f6821f; vertical-align: -2px; margin-right: 2px; }
+
+/* the first-run nudge's Cloudflare actions read as the brand, not as a generic link */
+.setup-steps .cf-link { color: #f6821f; font-weight: 650; display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }
+.setup-steps .cf-link .cf-cloud { width: 13px; height: 13px; }
+
 
 /* settings row: the auto checkbox + sync button stack right of the R2 status */
 .cf-r2-controls { display: flex; align-items: center; gap: 10px; flex: 0 0 auto; }
