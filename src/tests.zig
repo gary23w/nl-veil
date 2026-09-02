@@ -14,6 +14,7 @@ test {
     _ = @import("config/cf_oauth.zig");
     _ = @import("config/cf_r2.zig"); // the R2 backup: gated routes, object-key charset, state defaults
     _ = @import("config/cf_tunnel.zig"); // the tunnel: gated routes, token-free state, the permission explanation
+    _ = @import("worker/wsock.zig"); // the loopback client's blocking round trip: IPv4 literals, the sockaddr layout
     _ = @import("config/key_vault.zig"); // registered DIRECTLY: reaching the root through another
     // module is not proof of collection — lazy analysis silently dropped desk/assets.zig's tests
     // the same way (ledger 0029).
