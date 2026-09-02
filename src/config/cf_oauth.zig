@@ -14,6 +14,7 @@
 //! public client_id in. Disabled (start returns 501) until cf_oauth_client_id is set.
 
 const std = @import("std");
+const bu = @import("../worker/browser/util.zig"); // sleepMs: a raw-thread sleep, no Io park
 const httpz = @import("httpz");
 const http = @import("../gateway/http.zig");
 const key_vault = @import("key_vault.zig");
@@ -408,12 +409,40 @@ fn workersAiBase(alloc: std.mem.Allocator, account_id: []const u8) []const u8 {
 /// refresh_token means the loser fails — and under refresh-token-rotation-with-reuse-detection can
 /// revoke the whole grant. One mutex, held across the exchange; the winner re-seals, the vault write
 /// drops its own resolve-cache entry, and everyone queued behind re-reads the fresh bundle.
-var refresh_mtx: std.Io.Mutex = .init;
+/// ONE refresh in flight at a time, and NOBODY QUEUES BEHIND IT WITH A LIVE TOKEN. This was a mutex: every
+/// caller inside the skew window took it and, finding the token still due, ran its own 30 s exchange. When
+/// Cloudflare's token endpoint went slow on 2026-09-02, every token consumer - three resolveRole calls per
+/// chat message, the desk's status/tunnel/r2 polls - formed a queue of 30 s attempts: the desk timed out
+/// for four minutes and a chat turn's POST was answered after 210 s. The token they were all waiting for
+/// was still valid the whole time.
+var refreshing: std.atomic.Value(bool) = .init(false);
+/// Wall time of the last refresh that FAILED (0 = none). While it is recent, callers with a live token use
+/// it instead of hammering an endpoint that just said no; an expired token still forces a fresh attempt.
+var refresh_fail_s: std.atomic.Value(i64) = .init(0);
+const REFRESH_RETRY_S: i64 = 45;
+/// How long an EXPIRED caller waits for another thread's in-flight refresh before re-reading the vault.
+const REFRESH_WAIT_MS: u32 = 35_000;
+
+/// What resolveToken hands out: the live access token, the account's Workers AI base and the account id.
+pub const Token = struct { key: []const u8, base_url: []const u8, account_id: []const u8 };
+
+const RefreshPlan = enum { use, refresh, wait };
+
+/// The decision, pure so it is testable: given the clock, the token's expiry, when a refresh last failed and
+/// whether one is in flight - use what we hold, run a refresh ourselves, or (expired only) wait for the one
+/// in flight.
+fn refreshPlan(now: i64, expires_at: i64, last_fail: i64, busy: bool) RefreshPlan {
+    if (now + REFRESH_SKEW_S < expires_at) return .use; // not due yet
+    const live = now < expires_at;
+    if (live and last_fail > 0 and now - last_fail < REFRESH_RETRY_S) return .use; // it just failed; do not pile on
+    if (busy) return if (live) .use else .wait;
+    return .refresh;
+}
 
 /// The public entry the chat + cast paths use: return the CURRENT Workers AI access token + base_url for `uid`,
 /// refreshing (and re-sealing) if it's within REFRESH_SKEW_S of expiry. null when the user isn't logged in via
 /// OAuth (caller falls back to a pasted key / server env). `alloc` owns the returned strings.
-pub fn resolveToken(app: *App, uid: u64, alloc: std.mem.Allocator) ?struct { key: []const u8, base_url: []const u8, account_id: []const u8 } {
+pub fn resolveToken(app: *App, uid: u64, alloc: std.mem.Allocator) ?Token {
     var scratch = std.heap.ArenaAllocator.init(app.gpa);
     defer scratch.deinit();
     const sa = scratch.allocator();
@@ -422,38 +451,83 @@ pub fn resolveToken(app: *App, uid: u64, alloc: std.mem.Allocator) ?struct { key
 
     var access = b.key;
     var account = b.account_id;
-    if (nowS(app.io) + REFRESH_SKEW_S >= b.expires_at) {
-        refresh_mtx.lockUncancelable(app.io);
-        defer refresh_mtx.unlock(app.io);
-        // Re-read after acquiring: a caller we queued behind may have refreshed already (putOAuth drops
-        // the vault's cached entry, so this observes the fresh bundle, not a stale cache).
-        b = app.vault.resolveOAuth(uid, CF_PROVIDER, sa) orelse return null;
-        access = b.key;
-        account = b.account_id;
-        if (nowS(app.io) + REFRESH_SKEW_S >= b.expires_at) {
-            // refresh in place: the refresh token may or may not rotate; keep the old one if the response omits it.
-            if (exchange(app, sa, "refresh_token", "", "", b.refresh_token)) |fresh| {
-                access = fresh.key;
-                const new_refresh = if (fresh.refresh_token.len > 0) fresh.refresh_token else b.refresh_token;
-                if (account.len == 0) account = fetchAccount(app, sa, access).id;
-                const base = workersAiBase(sa, account);
-                app.vault.putOAuth(uid, CF_PROVIDER, access, new_refresh, fresh.expires_at, account, base) catch {};
-            } else if (nowS(app.io) < b.expires_at) {
-                // Refresh failed (rate blip / offline) but the token in hand is inside the skew window and
-                // still LIVE — use it rather than failing a turn over a refresh that was merely early.
-            } else {
-                // refresh failed and the token is genuinely expired (revoked / offline) — surface as
-                // not-connected so the caller falls back cleanly.
-                return null;
+    const now0 = nowS(app.io);
+    switch (refreshPlan(now0, b.expires_at, refresh_fail_s.load(.monotonic), refreshing.load(.acquire))) {
+        .use => {},
+        .wait => {
+            // EXPIRED, and another thread is refreshing right now: wait for it (bounded, on a raw-thread
+            // sleep - never a park on the Io runtime), then take whatever it produced.
+            var waited: u32 = 0;
+            while (refreshing.load(.acquire) and waited < REFRESH_WAIT_MS) : (waited += 100) bu.sleepMs(100);
+            b = app.vault.resolveOAuth(uid, CF_PROVIDER, sa) orelse return null;
+            if (nowS(app.io) >= b.expires_at) return null; // still expired: not connected, the caller falls back
+            access = b.key;
+            account = b.account_id;
+        },
+        .refresh => {
+            if (refreshing.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) {
+                // Lost the race to another refresher. A live token is used as is; an expired one waits.
+                if (now0 < b.expires_at) return finishToken(alloc, access, account);
+                var waited: u32 = 0;
+                while (refreshing.load(.acquire) and waited < REFRESH_WAIT_MS) : (waited += 100) bu.sleepMs(100);
+                b = app.vault.resolveOAuth(uid, CF_PROVIDER, sa) orelse return null;
+                if (nowS(app.io) >= b.expires_at) return null;
+                return finishToken(alloc, b.key, b.account_id);
             }
-        }
+            defer refreshing.store(false, .release);
+            // Re-read after claiming: a refresh may have landed between our first read and the claim (putOAuth
+            // drops the vault's cached entry, so this observes the fresh bundle, not a stale cache).
+            b = app.vault.resolveOAuth(uid, CF_PROVIDER, sa) orelse return null;
+            access = b.key;
+            account = b.account_id;
+            if (nowS(app.io) + REFRESH_SKEW_S >= b.expires_at) {
+                // refresh in place: the refresh token may or may not rotate; keep the old one if the response omits it.
+                if (exchange(app, sa, "refresh_token", "", "", b.refresh_token)) |fresh| {
+                    access = fresh.key;
+                    const new_refresh = if (fresh.refresh_token.len > 0) fresh.refresh_token else b.refresh_token;
+                    if (account.len == 0) account = fetchAccount(app, sa, access).id;
+                    const base = workersAiBase(sa, account);
+                    app.vault.putOAuth(uid, CF_PROVIDER, access, new_refresh, fresh.expires_at, account, base) catch {};
+                    refresh_fail_s.store(0, .monotonic);
+                } else {
+                    refresh_fail_s.store(nowS(app.io), .monotonic);
+                    // Refresh failed (rate blip / offline). Inside the skew window the token in hand is still
+                    // LIVE: use it rather than failing a turn over a refresh that was merely early. Genuinely
+                    // expired (revoked / offline): surface as not-connected so the caller falls back cleanly.
+                    if (nowS(app.io) >= b.expires_at) return null;
+                }
+            }
+        },
     }
+    if (account.len == 0) return null;
+    return finishToken(alloc, access, account);
+}
+
+fn finishToken(alloc: std.mem.Allocator, access: []const u8, account: []const u8) ?Token {
     if (account.len == 0) return null;
     return .{
         .key = alloc.dupe(u8, access) catch return null,
         .base_url = alloc.dupe(u8, workersAiBase(alloc, account)) catch return null,
         .account_id = alloc.dupe(u8, account) catch "",
     };
+}
+
+test "refreshPlan: a live token never waits, a failed refresh backs off, only an expired token waits" {
+    const exp: i64 = 10_000;
+    // far from expiry: use, whatever else is going on
+    try std.testing.expectEqual(RefreshPlan.use, refreshPlan(exp - REFRESH_SKEW_S - 1, exp, 0, false));
+    try std.testing.expectEqual(RefreshPlan.use, refreshPlan(exp - REFRESH_SKEW_S - 1, exp, 0, true));
+    // due but live, nobody refreshing, no recent failure: refresh
+    try std.testing.expectEqual(RefreshPlan.refresh, refreshPlan(exp - 60, exp, 0, false));
+    // due but live, someone else refreshing: use the live token, do not queue
+    try std.testing.expectEqual(RefreshPlan.use, refreshPlan(exp - 60, exp, 0, true));
+    // due but live, the endpoint failed 10 s ago: use, do not pile on
+    try std.testing.expectEqual(RefreshPlan.use, refreshPlan(exp - 60, exp, exp - 70, false));
+    // the backoff has passed: refresh again
+    try std.testing.expectEqual(RefreshPlan.refresh, refreshPlan(exp - 60, exp, exp - 60 - REFRESH_RETRY_S - 1, false));
+    // expired: a refresh is mandatory - wait for the one in flight, else run it (a recent failure does not excuse it)
+    try std.testing.expectEqual(RefreshPlan.wait, refreshPlan(exp + 1, exp, 0, true));
+    try std.testing.expectEqual(RefreshPlan.refresh, refreshPlan(exp + 1, exp, exp - 5, false));
 }
 
 // ------------------------------------------------------------------------------------ live model list
