@@ -21,16 +21,33 @@ pub fn ms(n: u64) void {
         const interval: std.os.windows.LARGE_INTEGER = -@as(i64, @intCast(n * 10_000));
         _ = std.os.windows.ntdll.NtDelayExecution(.FALSE, &interval);
     } else {
-        std.Thread.sleep(n * std.time.ns_per_ms);
+        // libc nanosleep, the shape src/worker/browser/util.zig uses: it ports across linux and macOS, where the
+        // raw linux binding wants a different timespec than posix.timespec (which IS c.timespec)
+        const ts: std.posix.timespec = .{ .sec = @intCast(n / 1000), .nsec = @intCast((n % 1000) * std.time.ns_per_ms) };
+        _ = std.c.nanosleep(&ts, null);
     }
 }
 
-/// Wall-clock milliseconds (Windows: RtlGetSystemTimePrecise; elsewhere the Io clock is used by the callers).
+/// Wall-clock milliseconds on Windows (RtlGetSystemTimePrecise). Elsewhere this returns 0, which the heartbeat
+/// readers treat as "not measured": the silent-worker line is a Windows diagnosis for a Windows hang.
 pub fn nowMs() i64 {
     if (builtin.os.tag == .windows) {
         return @intCast(@divTrunc(std.os.windows.ntdll.RtlGetSystemTimePrecise(), 10_000));
     }
     return 0;
+}
+
+test "ms sleeps for about the time asked and never hangs; nowMs is monotonic where it is measured" {
+    const t0 = nowMs();
+    ms(15);
+    const t1 = nowMs();
+    if (builtin.os.tag == .windows) {
+        try std.testing.expect(t1 - t0 >= 10); // the tick can round a 15 ms sleep down slightly
+        try std.testing.expect(t1 - t0 < 2_000);
+    } else {
+        try std.testing.expectEqual(@as(i64, 0), t1);
+    }
+    ms(0);
 }
 
 /// A worker loop has gone silent for longer than this and the UI should say so instead of showing its last
