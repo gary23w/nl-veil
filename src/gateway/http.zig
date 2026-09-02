@@ -98,10 +98,14 @@ pub const App = struct {
 /// the authoritative live copy is an authenticated GET /client/v4/oauth/scopes.
 /// TUNNEL SCOPES (2026-09-02, all optional, declared on the client the same day): argotunnel.* is
 /// "Cloudflare Tunnel" (the dashboard labels it "Argo Tunnel (Legacy)"), dns.* / zone.read give the
-/// tunnel its hostname, access.* / access-org.read put an owner-only Access policy in front of it.
+/// tunnel its hostname, zone-access.* / access-org.read put an owner-only Access policy in front of it.
+/// ZONE-access, probed live on 2026-09-02: the dashboard row "Access: Apps and Policies" registers the
+/// zone-level ids, and the account-level access.read / access.write are refused by Hydra outright - so
+/// cf_tunnel creates its Access application under /zones/{zone}/access/apps, which a named tunnel always
+/// has a zone for.
 /// A login that pre-dates them simply lacks them; config/cf_tunnel.zig turns the resulting refusal
 /// into "log in again to grant the tunnel permissions".
-pub const CF_OAUTH_SCOPES_DEFAULT = "ai.read ai.write workers-r2.read workers-r2.write user-details.read account-settings.read offline_access workers-scripts.read workers-scripts.write workers-scripts.bind page.read page.write d1.read d1.write workers-kv-storage.read workers-kv-storage.write queues.read queues.write vectorize.read vectorize.write workers-routes.read workers-routes.write workers-tail.read workers-observability.read argotunnel.read argotunnel.write dns.read dns.write zone.read access.read access.write access-org.read";
+pub const CF_OAUTH_SCOPES_DEFAULT = "ai.read ai.write workers-r2.read workers-r2.write user-details.read account-settings.read offline_access workers-scripts.read workers-scripts.write workers-scripts.bind page.read page.write d1.read d1.write workers-kv-storage.read workers-kv-storage.write queues.read queues.write vectorize.read vectorize.write workers-routes.read workers-routes.write workers-tail.read workers-observability.read argotunnel.read argotunnel.write dns.read dns.write zone.read zone-access.read zone-access.write access-org.read";
 
 pub fn metered(app: *App, u: User) bool {
     return app.production and app.ledger != null and !app.auth.isAdmin(u);

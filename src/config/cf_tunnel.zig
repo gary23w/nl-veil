@@ -407,7 +407,9 @@ fn provisionNamed(app: *App, a: std.mem.Allocator, uid: u64, st: *State, tok: To
         const O = struct { success: bool = false, result: ?struct { auth_domain: []const u8 = "" } = null };
         const o = std.json.parseFromSliceLeaky(O, a, oraw, .{ .ignore_unknown_fields = true }) catch break :access;
         if (!o.success or o.result == null or o.result.?.auth_domain.len == 0) break :access;
-        const aurl = std.fmt.allocPrint(a, "{s}/accounts/{s}/access/apps", .{ root, acct }) catch break :access;
+        // ZONE-level Access apps: the login carries zone-access.* (the account-level access.* ids are not
+        // grantable to this client - probed live), and a named tunnel always has a zone.
+        const aurl = std.fmt.allocPrint(a, "{s}/zones/{s}/access/apps", .{ root, st.zone_id }) catch break :access;
         const abody = std.fmt.allocPrint(a, "{{\"name\":\"veil ({s})\",\"domain\":\"{s}\",\"type\":\"self_hosted\",\"session_duration\":\"24h\",\"app_launcher_visible\":false}}", .{ st.hostname, st.hostname }) catch break :access;
         const araw = apiJson(app, "POST", aurl, abody, tok.key) orelse break :access;
         const A = struct { success: bool = false, result: ?struct { id: []const u8 = "" } = null };
@@ -417,7 +419,7 @@ fn provisionNamed(app: *App, a: std.mem.Allocator, uid: u64, st: *State, tok: To
             break :access;
         }
         st.access_app_id = ap.result.?.id;
-        const purl = std.fmt.allocPrint(a, "{s}/accounts/{s}/access/apps/{s}/policies", .{ root, acct, st.access_app_id }) catch break :access;
+        const purl = std.fmt.allocPrint(a, "{s}/zones/{s}/access/apps/{s}/policies", .{ root, st.zone_id, st.access_app_id }) catch break :access;
         var eb: std.ArrayListUnmanaged(u8) = .empty;
         eb.appendSlice(a, "{\"name\":\"owner only\",\"decision\":\"allow\",\"precedence\":1,\"include\":[{\"email\":{\"email\":") catch break :access;
         http.jstr(a, &eb, email) catch break :access;
@@ -450,7 +452,7 @@ fn deprovision(app: *App, a: std.mem.Allocator, st: *State, tok: Tok) void {
     const root = app.cf_api_root;
     const acct = tok.account_id;
     if (st.access_app_id.len > 0) {
-        if (std.fmt.allocPrint(a, "{s}/accounts/{s}/access/apps/{s}", .{ root, acct, st.access_app_id })) |u| {
+        if (std.fmt.allocPrint(a, "{s}/zones/{s}/access/apps/{s}", .{ root, st.zone_id, st.access_app_id })) |u| {
             if (apiJson(app, "DELETE", u, "", tok.key)) |r| app.gpa.free(r);
         } else |_| {}
     }
