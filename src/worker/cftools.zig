@@ -37,11 +37,27 @@ pub const Ctx = struct {
     workdir: []const u8,
     token: []const u8,
     account: []const u8,
+    /// The v4 root every URL below hangs off. Defaults to the real API; a caller may substitute a
+    /// LOOPBACK stand-in (main.zig honours NL_CF_API_ROOT only for 127.0.0.1/localhost) so the belt
+    /// can be driven by scripts/sim/cfworld.py without touching an account. Never anything else: the
+    /// OAuth token is minted for api.cloudflare.com, and any other host would simply be handed it.
+    api_root: []const u8 = API,
 };
 
-/// The Cloudflare v4 API root. Not configurable: the OAuth token is minted for this host, so pointing
-/// the tools somewhere else could only ever leak it.
-const API = "https://api.cloudflare.com/client/v4";
+/// The Cloudflare v4 API root. The one host the bearer may be sent to — see Ctx.api_root for the only
+/// exception, and isLoopbackRoot for the rule that keeps it an exception.
+pub const API = "https://api.cloudflare.com/client/v4";
+
+/// True for a root a stand-in may live on: plain http on the loopback address, nothing else. This is the
+/// gate main.zig applies to NL_CF_API_ROOT, and the reason an override can never leak the token — the
+/// only place it can be pointed is a process on the same machine as the user.
+pub fn isLoopbackRoot(root: []const u8) bool {
+    if (root.len < 18 or root.len > 200) return false;
+    const ok = std.mem.startsWith(u8, root, "http://127.0.0.1:") or std.mem.startsWith(u8, root, "http://localhost:");
+    if (!ok) return false;
+    for (root) |c| if (c <= 0x20 or c == '@' or c == '\\' or c == '#' or c == '?') return false;
+    return std.mem.indexOfPos(u8, root, 7, "://") == null;
+}
 
 const MAX_BODY = 8 << 20; // response cap — a listing or a script, never a data lake
 const MAX_UPLOAD = 24 << 20; // one object/script upload; R2's REST cap is far higher, this is ours
@@ -185,7 +201,7 @@ fn deployWorker(ctx: Ctx, args_json: []const u8) []u8 {
     var part_b: [980]u8 = undefined;
     const part = std.fmt.bufPrint(&part_b, "worker.mjs=@{s};type=application/javascript+module", .{full}) catch return dupe(gpa, "oom");
     var url_b: [400]u8 = undefined;
-    const url = std.fmt.bufPrint(&url_b, API ++ "/accounts/{s}/workers/scripts/{s}", .{ ctx.account, name }) catch return dupe(gpa, "oom");
+    const url = std.fmt.bufPrint(&url_b, "{s}/accounts/{s}/workers/scripts/{s}", .{ ctx.api_root, ctx.account, name }) catch return dupe(gpa, "oom");
 
     const raw = call(ctx, "PUT", url, "", "", &.{ "-F", meta, "-F", part });
     const body = raw orelse return dupe(gpa, "deploy: could not reach the Cloudflare API");
@@ -198,12 +214,12 @@ fn deployWorker(ctx: Ctx, args_json: []const u8) []u8 {
     // Uploaded. Enable the workers.dev route and resolve the account's subdomain so the answer is a URL
     // rather than "it worked, go find it". Both legs are best-effort: the script IS deployed either way.
     var sub_url_b: [400]u8 = undefined;
-    if (std.fmt.bufPrint(&sub_url_b, API ++ "/accounts/{s}/workers/scripts/{s}/subdomain", .{ ctx.account, name })) |su| {
+    if (std.fmt.bufPrint(&sub_url_b, "{s}/accounts/{s}/workers/scripts/{s}/subdomain", .{ ctx.api_root, ctx.account, name })) |su| {
         if (call(ctx, "POST", su, "{\"enabled\":true}", "application/json", &.{})) |r| gpa.free(r);
     } else |_| {}
     var acct_sub: []const u8 = "";
     var sub_buf: [128]u8 = undefined;
-    if (std.fmt.bufPrint(&sub_url_b, API ++ "/accounts/{s}/workers/subdomain", .{ctx.account})) |su| {
+    if (std.fmt.bufPrint(&sub_url_b, "{s}/accounts/{s}/workers/subdomain", .{ ctx.api_root, ctx.account })) |su| {
         if (call(ctx, "GET", su, "", "", &.{})) |r| {
             defer gpa.free(r);
             const S = struct { result: struct { subdomain: []const u8 = "" } = .{} };
@@ -233,9 +249,9 @@ fn r2List(ctx: Ctx, args_json: []const u8) []u8 {
     if (bucket.len > 0 and !safeRel(bucket)) return dupe(gpa, "bad bucket name");
     var url_b: [700]u8 = undefined;
     const url = if (bucket.len == 0)
-        std.fmt.bufPrint(&url_b, API ++ "/accounts/{s}/r2/buckets", .{ctx.account}) catch return dupe(gpa, "oom")
+        std.fmt.bufPrint(&url_b, "{s}/accounts/{s}/r2/buckets", .{ ctx.api_root, ctx.account }) catch return dupe(gpa, "oom")
     else
-        std.fmt.bufPrint(&url_b, API ++ "/accounts/{s}/r2/buckets/{s}/objects?per_page=100&prefix={s}", .{ ctx.account, bucket, p.value.prefix }) catch return dupe(gpa, "oom");
+        std.fmt.bufPrint(&url_b, "{s}/accounts/{s}/r2/buckets/{s}/objects?per_page=100&prefix={s}", .{ ctx.api_root, ctx.account, bucket, p.value.prefix }) catch return dupe(gpa, "oom");
     return answer(ctx, call(ctx, "GET", url, "", "", &.{}), "r2 list");
 }
 
@@ -265,7 +281,7 @@ fn r2Put(ctx: Ctx, args_json: []const u8) []u8 {
     if (data.len == 0) return dupe(gpa, "nothing to upload — give either file or text");
 
     var url_b: [700]u8 = undefined;
-    const url = std.fmt.bufPrint(&url_b, API ++ "/accounts/{s}/r2/buckets/{s}/objects/{s}", .{ ctx.account, bucket, key }) catch return dupe(gpa, "oom");
+    const url = std.fmt.bufPrint(&url_b, "{s}/accounts/{s}/r2/buckets/{s}/objects/{s}", .{ ctx.api_root, ctx.account, bucket, key }) catch return dupe(gpa, "oom");
     const raw = call(ctx, "PUT", url, data, "application/octet-stream", &.{});
     const body = raw orelse return dupe(gpa, "r2 put: could not reach the Cloudflare API");
     defer gpa.free(body);
@@ -292,7 +308,7 @@ fn r2Get(ctx: Ctx, args_json: []const u8) []u8 {
     const full = joinWork(ctx, rel, &fb) orelse return dupe(gpa, "file must be a relative path inside the workspace");
 
     var url_b: [700]u8 = undefined;
-    const url = std.fmt.bufPrint(&url_b, API ++ "/accounts/{s}/r2/buckets/{s}/objects/{s}", .{ ctx.account, bucket, key }) catch return dupe(gpa, "oom");
+    const url = std.fmt.bufPrint(&url_b, "{s}/accounts/{s}/r2/buckets/{s}/objects/{s}", .{ ctx.api_root, ctx.account, bucket, key }) catch return dupe(gpa, "oom");
     const raw = call(ctx, "GET", url, "", "", &.{}) orelse return dupe(gpa, "r2 get: could not reach the Cloudflare API");
     defer gpa.free(raw);
     // A miss comes back as the v4 error envelope; a hit is the object's own bytes.
@@ -327,7 +343,7 @@ fn d1Query(ctx: Ctx, args_json: []const u8) []u8 {
     body.append(gpa, '}') catch return dupe(gpa, "oom");
 
     var url_b: [700]u8 = undefined;
-    const url = std.fmt.bufPrint(&url_b, API ++ "/accounts/{s}/d1/database/{s}/query", .{ ctx.account, db }) catch return dupe(gpa, "oom");
+    const url = std.fmt.bufPrint(&url_b, "{s}/accounts/{s}/d1/database/{s}/query", .{ ctx.api_root, ctx.account, db }) catch return dupe(gpa, "oom");
     return answer(ctx, call(ctx, "POST", url, body.items, "application/json", &.{}), "d1 query");
 }
 
@@ -375,7 +391,7 @@ fn genericApi(ctx: Ctx, args_json: []const u8) []u8 {
     if (!ok) return dupe(gpa, "method must be GET, POST, PUT, PATCH or DELETE");
 
     var url_b: [900]u8 = undefined;
-    const url = std.fmt.bufPrint(&url_b, API ++ "{s}", .{path}) catch return dupe(gpa, "path too long");
+    const url = std.fmt.bufPrint(&url_b, "{s}{s}", .{ ctx.api_root, path }) catch return dupe(gpa, "path too long");
     var mbuf: [8]u8 = undefined;
     const mup = std.ascii.upperString(mbuf[0..method.len], method);
     return answer(ctx, call(ctx, mup, url, p.value.body, "application/json", &.{}), "cf_api");

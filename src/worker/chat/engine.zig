@@ -322,7 +322,11 @@ const PLAN_PROMPT =
     "appear — not \"it works well\"), and a \"watch_for\" list of failure modes you expect on THIS task. Give each " ++
     "subtask its own short \"done_when\" too, and a \"tool_hint\" naming the single tool you expect it to use " ++
     "(e.g. write_file, edit_file, read_file, list_dir, poll, web_fetch, read_url, web_search, read_doc, " ++
-    "recall_hive, run_python, open_subchat, cast — or \"\" if unsure). Reply with ONLY compact JSON: " ++
+    "recall_hive, run_python, open_subchat, cast — or \"\" if unsure). PLAN ONLY WHAT WAS ASKED: a request to " ++
+    "run, measure, count, check, compare or report something is satisfied by doing exactly that and reporting " ++
+    "what came back — never add a subtask that fixes, refactors, extends or improves what the user did not ask " ++
+    "to change, and never edit the thing you were asked to measure so that it matches an expectation; a failing " ++
+    "result IS the answer. Reply with ONLY compact JSON: " ++
     "{\"objective\":\"…\",\"done_when\":[\"…\"],\"watch_for\":[\"…\"],\"plan\":[{\"task\":\"…\",\"route\":" ++
     "\"hive|research|inline\",\"done_when\":\"…\",\"tool_hint\":\"…\"}, …]}. If the request is a simple question, " ++
     "a greeting, or a single trivial step that needs no plan, reply exactly {\"plan\":[]}.";
@@ -479,6 +483,10 @@ const SYSTEM_PROMPT =
     "ORCHESTRATOR: swarm_status to watch it, steer_swarm when it drifts, answer_swarm to unblock a mind; never " ++
     "build a rival copy of what it is mid-way through; when it finishes, gather its files/findings and answer from " ++
     "them. Do not cast for greetings, small talk, or timeless facts you know confidently.\n" ++
+    "DO WHAT WAS ASKED, NOT MORE. Asked to run, check, count, measure, compare or report something, do exactly " ++
+    "that and report what came back -- a failing result IS the answer. Never fix, refactor, extend or improve a " ++
+    "file the user did not ask you to change, and never alter the thing you were asked to measure so that it " ++
+    "matches an expectation: name the fix you would make and wait for a yes.\n" ++
     "ACT, DON'T PROMISE -- never end a reply with a promise of future action ('I'll run...', 'Let me check...') " ++
     "without the tool call in the SAME reply: every reply either calls a tool or delivers the result. After an " ++
     "action that CHANGES something, VERIFY the outcome before declaring success -- run_tests, or read the resource " ++
@@ -1982,6 +1990,40 @@ fn emitLlmFrame(app: *App, label: []const u8, role: Role, model: []const u8, ms:
     emitEvent(app, llm_frame_dir[0..llm_frame_dir_len], ev.items);
 }
 
+/// A one-line `status` frame BEFORE a blocking model call. Every labelled call that is not the streamed chat
+/// completion is a silent gap from the user's side — the drive verdict after each tool step, each context
+/// compaction (~10s), the handoff (~20s), memory verification — and a client that renders status frames (the
+/// desk's status line, the web's chip) otherwise shows nothing at all through it. Reported as "reasoning
+/// stalls mid-thought, then resumes": the engine was never stalled, it was in one of these. Writes through the
+/// same thread-local conv dir the `llm` frames use, so it needs no plumbing at the call sites; a label that
+/// has no phrase here emits nothing.
+fn announcePhase(app: *App, label: []const u8) void {
+    if (llm_frame_dir_len == 0) return;
+    const table = [_]struct { l: []const u8, t: []const u8 }{
+        .{ .l = "loop", .t = "deciding the next step" },
+        .{ .l = "compact", .t = "compacting the working context" },
+        .{ .l = "handoff", .t = "writing the continuation state" },
+        .{ .l = "planrec", .t = "reconciling the plan board" },
+        .{ .l = "memverify", .t = "checking recalled memory" },
+        .{ .l = "ctxsum", .t = "summarizing the conversation so far" },
+        .{ .l = "summary", .t = "folding history into the rolling summary" },
+        .{ .l = "reflect", .t = "reviewing the answer" },
+        .{ .l = "lesson", .t = "noting a lesson from this turn" },
+        .{ .l = "course", .t = "checking course" },
+        .{ .l = "searchq", .t = "shaping the search" },
+        .{ .l = "stuck", .t = "working out how to get unstuck" },
+        .{ .l = "recon", .t = "surveying before planning" },
+        .{ .l = "plan", .t = "planning the work" },
+        .{ .l = "chat", .t = "working" },
+    };
+    for (table) |e| {
+        if (std.mem.eql(u8, e.l, label)) {
+            emitKV(app, llm_frame_dir[0..llm_frame_dir_len], "status", "text", e.t);
+            return;
+        }
+    }
+}
+
 /// Render the shared `llm` frame into `out`. Split from the emit so its exact wire shape is testable without a
 /// server, an App, or a turn. `model` is BYOK-supplied text and is JSON-escaped; role/label are engine-owned.
 /// `streamed` sits next to `fb_ms` on the wire because it is the qualifier ON fb_ms — read either alone and you
@@ -2166,6 +2208,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
         // The cf_ family's authority for this turn (blank ⇒ unadvertised and refused).
         .cf_token = cf_tok,
         .cf_account = cf_acct,
+        .cf_api_root = app.cf_api_root,
         .mem = blk_mem: {
             var m = osc.Mem.init(gpa, app.io, app.sup.neuron_bin, db);
             // TRUST-WEIGHTED RANKING: the trust feature is compiled in; without this flag every assoc runs
@@ -2393,6 +2436,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
                 if (vbuilt) {
                     const vp = trio.pick(.thinking);
                     const vm_cm = meterBegin(app.io);
+                    announcePhase(app, "memverify");
                     var vstep = llm.complete(gpa, app.io, run_root, "memverify", vp.base_url, vp.key, vp.model, vmsgs.items, "", 384, 0.1);
                     defer vstep.deinit(gpa);
                     meterEnd(app, vm_cm, "memverify", .thinking, vp.model, vstep.ok);
@@ -3322,7 +3366,14 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
                 // OFF: a first-step no-plan answer with no tools is a complete one-shot reply (plain Q&A) — end now,
                 // skipping the wasted LOOP_QUESTION round-trip. (A drive>0 no-tools step falls through to the DONE
                 // check below, which ends it.)
-                if (drive == 0) break :outer;
+                //
+                // UNLESS THE REQUEST WAS AN ACTION AND THE REPLY CLAIMS ONE. "Record these six transactions and
+                // regenerate the ledger" answered with "RECORDED=6" and zero tool calls is not Q&A — it is a claim
+                // with no work behind it. Observed live (scripts/sim/ledger.py, turn 3: a fabricated RECORDED line
+                // right after a failed memory pass), and the fast path shipped it to the user as done. Such a step
+                // pays the one drive verdict below, which sees no tool results in the transcript and names the step
+                // that is missing; a genuine no-tools answer to a task ("I can't, because…") still ends on DONE.
+                if (drive == 0 and !(actionShaped(goal_text) and claimsWork(inner.content))) break :outer;
             } else {
                 // ARMED: tolerate ONE idle (announce-only) step so a build that pauses to narrate isn't cut off, but
                 // end a non-afk loop after TWO consecutive idle steps (that's a conversation, not work). AFK never
@@ -3374,6 +3425,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
         http.jstr(gpa, &lq, if (afk) LOOP_QUESTION_AFK else LOOP_QUESTION) catch break :outer;
         lq.append(gpa, '}') catch break :outer;
         const loop_cm = meterBegin(app.io);
+        announcePhase(app, "loop");
         var next = completeAux(app, llm_dir, "loop", prompt.base_url, prompt.key, prompt.model, lq.items, 512, 0.5);
         defer next.deinit(gpa);
         meterEnd(app, loop_cm, "loop", .prompting, prompt.model, next.ok);
@@ -3629,6 +3681,7 @@ fn schedLearn(app: *App, ctx: *tools.ToolCtx, mem_scope: []const u8, uid: u64, t
     msgs.appendSlice(gpa, msgTail(conv_buf.items, SUMMARY_CTX_BYTES)) catch return;
     msgs.appendSlice(gpa, ",{\"role\":\"user\",\"content\":\"This scheduled task will run again. In ONE or TWO sentences, state the single most useful lesson from THIS run for the next run — a faster path, a source that worked, a pitfall to skip, or an assumption to keep. Reply with ONLY the lesson.\"}") catch return;
     const lesson_cm = meterBegin(app.io);
+    announcePhase(app, "lesson");
     var next = completeAux(app, run_root, "lesson", base_url, key, model, msgs.items, 256, 0.3);
     defer next.deinit(gpa);
     meterEnd(app, lesson_cm, "lesson", .thinking, model, next.ok);
@@ -5440,7 +5493,7 @@ fn shouldPlan(user_text: []const u8) bool {
     // UNAMBIGUOUS multi-step markers — checked BEFORE the question guard so a task phrased with a leading verb like
     // "do a deep dive …" or "audit the engine and categorize …" still plans (these almost never occur in plain Q&A).
     const strong_markers = [_][]const u8{ "audit ", "deep dive", "deep-dive", "step by step", "step-by-step", "from scratch", "end to end", "end-to-end" };
-    for (strong_markers) |m| if (std.mem.indexOf(u8, low, m) != null) return true;
+    for (strong_markers) |m| if (hasWordMarker(low, m)) return true;
     // A clear question / explanation / lookup opener → answer directly, never plan (even if a build verb like
     // "write" appears later, as in "write 200 words explaining X" — that's Q&A, not a build).
     const q_openers = [_][]const u8{
@@ -5457,8 +5510,79 @@ fn shouldPlan(user_text: []const u8) bool {
         "crawl ",    "design a",   "design and", "from scratch", "step by step", "step-by-step", "and then ",  "an app",
         "a website", "a web app",  "a cli",      "a rest api",   "a full ",      "end to end",   "end-to-end",
     };
-    for (task_markers) |m| if (std.mem.indexOf(u8, low, m) != null) return true;
+    for (task_markers) |m| if (hasWordMarker(low, m)) return true;
     return false; // ambiguous / conversational → fast direct answer (no decomposition round-trip)
+}
+
+/// A task marker matches at a WORD START, never inside one. "Run the tests and report the result" contains
+/// "port the" and used to plan (recon + plan + planrec + a closing note that displaced the one-line answer
+/// the user asked for), the way "recreate" contains "create " and "rebuild" contains "build ". Measured by
+/// scripts/sim/bait.py bt_readme: 13 model calls and 130K prompt tokens for a task that needs one, and the
+/// requested PASSED=/FAILED= line never reached the user.
+fn hasWordMarker(low: []const u8, marker: []const u8) bool {
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, low, from, marker)) |at| {
+        if (at == 0 or !std.ascii.isAlphabetic(low[at - 1])) return true;
+        from = at + 1;
+    }
+    return false;
+}
+
+/// A request that asks for something to be DONE to the world — files written, code run, things deployed —
+/// as opposed to asked about. Cheap and deliberately broad: it only decides whether a no-tools reply to the
+/// request earns a drive verdict (one short call) rather than ending the turn on the fast path.
+fn actionShaped(user_text: []const u8) bool {
+    const t = std.mem.trim(u8, user_text, " \r\n\t");
+    if (t.len < 12) return false;
+    var buf: [256]u8 = undefined;
+    const n = @min(t.len, buf.len);
+    for (t[0..n], 0..) |c, i| buf[i] = std.ascii.toLower(c);
+    const low = buf[0..n];
+    const q_openers = [_][]const u8{ "what ", "what's", "why ", "how ", "when ", "who ", "where ", "which ", "is ", "are ", "do ", "does ", "did ", "can you tell", "could you tell", "explain", "tell me", "describe", "summar", "define" };
+    for (q_openers) |q| if (std.mem.startsWith(u8, low, q)) return false;
+    const verbs = [_][]const u8{ "record ", "write ", "create ", "append", "regenerate", "update ", "edit ", "fix ", "run ", "deploy", "upload", "delete ", "remove ", "rename", "install", "generate", "add ", "save ", "back up", "backup", "reverse ", "correct ", "implement", "refactor", "move ", "copy ", "apply ", "convert ", "migrate", "insert ", "set up", "configure", "build ", "make " };
+    for (verbs) |v| if (hasWordMarker(low, v)) return true;
+    return false;
+}
+
+/// A reply that asserts work was done. Matched on the words a completion claim is made of; a reply that
+/// explains why the work could NOT be done ("cannot", "unable", "no such file") is not a claim.
+fn claimsWork(reply: []const u8) bool {
+    const t = std.mem.trim(u8, reply, " \r\n\t");
+    if (t.len == 0 or t.len > 4000) return false;
+    var buf: [4000]u8 = undefined;
+    const n = @min(t.len, buf.len);
+    for (t[0..n], 0..) |c, i| buf[i] = std.ascii.toLower(c);
+    const low = buf[0..n];
+    const denials = [_][]const u8{ "cannot", "can't", "unable", "could not", "couldn't", "no such", "not found", "does not exist", "failed", "refused", "denied" };
+    for (denials) |d| if (std.mem.indexOf(u8, low, d) != null) return false;
+    const claims = [_][]const u8{ "recorded", "written", "wrote", "created", "added", "updated", "regenerated", "deployed", "uploaded", "saved", "applied", "fixed", "deleted", "removed", "reversed", "corrected", "installed", "generated", "done", "complete", "appended", "=" };
+    for (claims) |c| if (std.mem.indexOf(u8, low, c) != null) return true;
+    return false;
+}
+
+test "actionShaped / claimsWork: a fabricated RECORDED line earns a verdict, a question does not" {
+    try std.testing.expect(actionShaped("Record these 6 transactions in ledger/journal.jsonl, then regenerate ledger.json."));
+    try std.testing.expect(actionShaped("Deploy a Cloudflare Worker named veil-sim-sum from an ES module you write at sum.mjs."));
+    try std.testing.expect(!actionShaped("What is the current balance of misc? Reply with exactly one line."));
+    try std.testing.expect(!actionShaped("Explain in 250 words how double-entry bookkeeping differs from this."));
+    try std.testing.expect(claimsWork("RECORDED=6\nBALANCE travel=1755.87"));
+    try std.testing.expect(claimsWork("Done — I appended the six lines and regenerated the ledger."));
+    try std.testing.expect(!claimsWork("I cannot record them: ledger/journal.jsonl does not exist in this workdir."));
+    try std.testing.expect(!claimsWork(""));
+}
+
+test "shouldPlan: a task marker matches at a word start, never inside one" {
+    // "report the result" contains "port the"; "recreate" contains "create " — neither is a build task
+    try std.testing.expect(!shouldPlan("Run this project's test suite (python tests/test_core.py) and report the result as exactly one line: PASSED=<n> FAILED=<n>."));
+    try std.testing.expect(!shouldPlan("Please recreate the same output as yesterday and tell me whether anything differs."));
+    try std.testing.expect(!shouldPlan("Which rebuild step is failing, and what does the log say about it?"));
+    // the genuine markers still plan
+    try std.testing.expect(shouldPlan("Port the CLI to Rust and keep the same flags, step by step."));
+    try std.testing.expect(shouldPlan("Build a small Flask app with a login page and a dashboard."));
+    try std.testing.expect(shouldPlan("Write a small script stats/primes.py that counts the primes below 5000 and writes the count to stats/answer.txt."));
+    try std.testing.expect(hasWordMarker("audit the engine", "audit "));
+    try std.testing.expect(!hasWordMarker("preaudit the engine", "audit "));
 }
 
 /// RECON pass (see RECON_SYSTEM): ask what needs finding out, run those read-only probes, and return a bounded
@@ -5494,6 +5618,7 @@ fn reconFindings(app: *App, run_root: []const u8, p: Provider, ctx: *tools.ToolC
     msgs.append(gpa, '}') catch return null;
 
     const cm = meterBegin(app.io);
+    announcePhase(app, "recon");
     var step = llm.complete(gpa, app.io, run_root, "recon", p.base_url, p.key, p.model, msgs.items, "", 512, 0.2);
     defer step.deinit(gpa);
     meterEnd(app, cm, "recon", .thinking, p.model, step.ok);
@@ -5582,6 +5707,7 @@ fn courseCheck(app: *App, run_root: []const u8, p: Provider, role: Role, goal: [
     msgs.append(gpa, '}') catch return null;
 
     const cm = meterBegin(app.io);
+    announcePhase(app, "course");
     var step = completeAux(app, run_root, "course", p.base_url, p.key, p.model, msgs.items, 384, 0.2);
     defer step.deinit(gpa);
     meterEnd(app, cm, "course", role, p.model, step.ok);
@@ -5647,6 +5773,7 @@ fn planTask(app: *App, run_root: []const u8, base_url: []const u8, key: []const 
     // can't get truncated mid-JSON, which extractJsonObject would hand to the parser as an unbalanced object and
     // the whole board would come back empty.
     const plan_cm = meterBegin(app.io);
+    announcePhase(app, "plan");
     var step = llm.complete(gpa, app.io, run_root, "plan", base_url, key, model, msgs.items, "", 1536, 0.3);
     defer step.deinit(gpa);
     meterEnd(app, plan_cm, "plan", .thinking, model, step.ok);
@@ -5776,6 +5903,7 @@ fn planReconcile(app: *App, llm_dir: []const u8, conv_dir: []const u8, trio: Mod
     msgs.append(gpa, '}') catch return;
     const pr = trio.pick(.prompting);
     const cm = meterBegin(app.io);
+    announcePhase(app, "planrec");
     var step = llm.complete(gpa, app.io, llm_dir, "planrec", pr.base_url, pr.key, pr.model, msgs.items, "", 96, 0.0);
     defer step.deinit(gpa);
     meterEnd(app, cm, "planrec", .prompting, pr.model, step.ok);
@@ -5921,14 +6049,28 @@ fn planStepInterrupted(app: *App, conv_dir: []const u8, plan: []cplan.Task, task
 }
 
 /// Closing message after the drive loop worked a plan: all done, or paused with N/M and how to resume.
+///
+/// THE LAST MESSAGE THE USER SEES IS THE MODEL'S, NOT THIS NOTE. Every subtask already emitted its own reply,
+/// so the final subtask's answer — the one carrying the `DONE 168` line the user asked for — was the last
+/// assistant message until the completion note landed after it. Anything that reads the final message (an
+/// automation on the API, the sim harness, a user skimming from the bottom) then saw a canned sentence where
+/// the answer belonged: the model had earned the reward and the harness dropped it (scripts/sim/meter.py
+/// mt_format measures exactly this). The completion claim still goes into the durable transcript, because a
+/// later turn's rolling summary needs to know the plan finished; the LIVE stream gets it as a status line,
+/// which every surface renders without displacing the answer. A PAUSED plan keeps its note as a message —
+/// "say continue" is an instruction to the user, and it is the answer.
 fn emitPlanClosing(app: *App, conv_dir: []const u8, plan: []const cplan.Task) void {
     const gpa = app.gpa;
     const done = cplan.doneCount(plan);
     const total = plan.len;
-    const note = if (cplan.allDone(plan))
-        std.fmt.allocPrint(gpa, "Plan complete — worked all {d} subtasks.", .{total}) catch return
-    else
-        std.fmt.allocPrint(gpa, "Worked {d} of {d} planned subtasks this turn. Say \"continue\" to do the rest.", .{ done, total }) catch return;
+    if (cplan.allDone(plan)) {
+        const note = std.fmt.allocPrint(gpa, "Plan complete — worked all {d} subtasks.", .{total}) catch return;
+        defer gpa.free(note);
+        appendMsg(app, conv_dir, "assistant", note, "veil", nowSecs(app.io));
+        emitKV(app, conv_dir, "status", "text", note);
+        return;
+    }
+    const note = std.fmt.allocPrint(gpa, "Worked {d} of {d} planned subtasks this turn. Say \"continue\" to do the rest.", .{ done, total }) catch return;
     defer gpa.free(note);
     appendMsg(app, conv_dir, "assistant", note, "veil", nowSecs(app.io));
     emitAssistant(app, conv_dir, note);
@@ -7660,6 +7802,7 @@ fn runInnerAgentic(
         var sctx = StreamCtx{ .app = app, .conv_dir = conv_dir, .ctrl_cursor = steer_cursor.* };
         var chat_cm = meterBegin(app.io);
         traceFrame(app, "worker.llm", "completeStream", "enter", null, null);
+        announcePhase(app, "chat");
         var step = llm.completeStream(gpa, app.io, run_root, "chat", base_url, key, model, conv_buf.items, turn_tools, turnTokenBudget(ctx.environ, base_url, model), 0.7, &sctx, streamOnDelta, streamShouldAbort);
         traceFrame(app, "worker.llm", "completeStream", "exit", step.ok, null);
         defer step.deinit(gpa);
@@ -8372,6 +8515,7 @@ fn summarizeTurn(app: *App, run_root: []const u8, base_url: []const u8, key: []c
     http.jstr(gpa, &msgs, "In 1-3 sentences, tell the user what you accomplished this turn and what (if anything) remains. Do not call any tools.") catch return null;
     msgs.append(gpa, '}') catch return null;
     const summary_cm = meterBegin(app.io);
+    announcePhase(app, "summary");
     var step = completeAux(app, run_root, "summary", base_url, key, model, msgs.items, 1024, 0.5);
     defer step.deinit(gpa);
     meterEnd(app, summary_cm, "summary", .thinking, model, step.ok);
@@ -8516,6 +8660,7 @@ fn formulateSearch(app: *App, run_root: []const u8, p: Provider, intent: []const
     http.jstr(gpa, &msgs, ask.items) catch return null;
     msgs.append(gpa, '}') catch return null;
     const searchq_cm = meterBegin(app.io);
+    announcePhase(app, "searchq");
     var step = llm.complete(gpa, app.io, run_root, "searchq", p.base_url, p.key, p.model, msgs.items, "", 48, 0.3);
     defer step.deinit(gpa);
     meterEnd(app, searchq_cm, "searchq", .prompting, p.model, step.ok);
@@ -8559,6 +8704,7 @@ fn stuckStep(app: *App, run_root: []const u8, p: Provider, goal: []const u8, rep
     http.jstr(gpa, &msgs, ask.items) catch return null;
     msgs.append(gpa, '}') catch return null;
     const stuck_cm = meterBegin(app.io);
+    announcePhase(app, "stuck");
     var step = completeAux(app, run_root, "stuck", p.base_url, p.key, p.model, msgs.items, 256, 0.6);
     defer step.deinit(gpa);
     meterEnd(app, stuck_cm, "stuck", .prompting, p.model, step.ok);
@@ -8638,6 +8784,7 @@ fn critiqueAnswer(app: *App, run_root: []const u8, base_url: []const u8, key: []
     // A small output cap is part of the contract, not a saving: a correction that needs more room than this is a
     // rewrite, and it also bounds the abstain path, which is most calls.
     const reflect_cm = meterBegin(app.io);
+    announcePhase(app, "reflect");
     var step = completeAux(app, run_root, "reflect", base_url, key, model, msgs.items, 320, 0.3);
     defer step.deinit(gpa);
     meterEnd(app, reflect_cm, "reflect", .thinking, model, step.ok);
@@ -9436,6 +9583,7 @@ fn summarizeInto(app: *App, run_root: []const u8, base_url: []const u8, key: []c
     http.jstr(gpa, &msgs, uc.items) catch return null;
     msgs.append(gpa, '}') catch return null;
     const ctxsum_cm = meterBegin(app.io);
+    announcePhase(app, "ctxsum");
     var step = llm.complete(gpa, app.io, run_root, "ctxsum", base_url, key, model, msgs.items, "", 1024, 0.3);
     defer step.deinit(gpa);
     meterEnd(app, ctxsum_cm, "ctxsum", .thinking, model, step.ok);
@@ -9476,6 +9624,7 @@ fn summarizeWorkingSpan(app: *App, run_root: []const u8, base_url: []const u8, k
     http.jstr(gpa, &msgs, uc.items) catch return null;
     msgs.append(gpa, '}') catch return null;
     const compact_cm = meterBegin(app.io);
+    announcePhase(app, "compact");
     var step = llm.complete(gpa, app.io, run_root, "compact", base_url, key, model, msgs.items, "", 1024, 0.3);
     defer step.deinit(gpa);
     meterEnd(app, compact_cm, "compact", .thinking, model, step.ok);
@@ -9553,6 +9702,7 @@ fn turnHandoff(app: *App, run_root: []const u8, base_url: []const u8, key: []con
     msgs.append(gpa, '}') catch return null;
 
     const ho_cm = meterBegin(app.io);
+    announcePhase(app, "handoff");
     var step = llm.complete(gpa, app.io, run_root, "handoff", base_url, key, model, msgs.items, "", 768, 0.3);
     defer step.deinit(gpa);
     // Metered even when it fails: a success rate read off the stream would otherwise be 100% by construction.

@@ -554,6 +554,9 @@ pub const ToolCtx = struct {
     // and same reason as durable_path above.
     cf_token: []const u8 = "",
     cf_account: []const u8 = "",
+    /// Where the cf_ family sends its calls. The real API unless the server was started with a loopback
+    /// NL_CF_API_ROOT (a simulation stand-in) — see cftools.isLoopbackRoot for why it can be nothing else.
+    cf_api_root: []const u8 = cftools.API,
     // Recipe recursion depth. A recipe step may not name another recipe (refused at run time, I5), so this is
     // 0 or 1 in practice; it is a belt-and-braces backstop against any future path that could re-enter
     // runRecipe, guaranteeing one level only regardless of how the step was reached.
@@ -1585,7 +1588,7 @@ fn executeInner(ctx: *ToolCtx, name: []const u8, args_json: []const u8) []u8 {
     if (std.mem.startsWith(u8, name, "pixel_")) return pixelDispatch(ctx, name, args_json);
     if (std.mem.startsWith(u8, name, "mcp_")) return mcpDispatch(ctx, name, args_json);
     if (std.mem.startsWith(u8, name, "cf_")) {
-        if (cftools.dispatch(.{ .gpa = gpa, .io = ctx.io, .scratch = ctx.run_dir, .workdir = ctx.workdir, .token = ctx.cf_token, .account = ctx.cf_account }, name, args_json)) |r| return r;
+        if (cftools.dispatch(.{ .gpa = gpa, .io = ctx.io, .scratch = ctx.run_dir, .workdir = ctx.workdir, .token = ctx.cf_token, .account = ctx.cf_account, .api_root = ctx.cf_api_root }, name, args_json)) |r| return r;
     }
     if (std.mem.eql(u8, name, "propose_change")) return proposeChange(ctx, args_json);
     if (std.mem.eql(u8, name, "simulate_change")) return simulateChange(ctx, args_json);
