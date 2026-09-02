@@ -31,6 +31,7 @@ const billing_seam = @import("plan/billing_seam.zig");
 const keys_api = @import("config/keys_api.zig");
 const local_models = @import("config/local_models.zig");
 const cf_oauth = @import("config/cf_oauth.zig");
+const cftools = @import("worker/cftools.zig"); // isLoopbackRoot — the NL_CF_API_ROOT gate
 const cf_r2 = @import("config/cf_r2.zig");
 const server_config = @import("config/server_config.zig");
 const lan_mod = @import("config/lan.zig");
@@ -642,6 +643,21 @@ pub fn main(init: std.process.Init) !void {
     if (std.Thread.spawn(.{}, sched.bgLoop, .{&app})) |t| t.detach() else |_| {}
     log.info("billing: {s} (NL_PRODUCTION)", .{if (production) "PRODUCTION — non-admins metered by neuron plan" else "BETA — unmetered full use"});
     if (!open_reg) log.info("registration: CLOSED (private beta) — set NL_OPEN_REGISTRATION=1 to open public signups", .{});
+    // NL_CF_API_ROOT: a stand-in for api.cloudflare.com, for the simulation suite (scripts/sim/cfworld.py).
+    // Honoured for a loopback address only — the belt sends the user's real bearer, and the only host
+    // besides Cloudflare that may ever see it is a process on this machine. Anything else is ignored and
+    // said so, rather than silently pointing a credential at a stranger.
+    if (init.environ_map.get("NL_CF_API_ROOT")) |root| {
+        const r = std.mem.trim(u8, root, " \r\n\t");
+        if (r.len > 0) {
+            if (cftools.isLoopbackRoot(r)) {
+                app.cf_api_root = r;
+                log.warn("Cloudflare tool belt: pointed at the LOOPBACK stand-in {s} (NL_CF_API_ROOT) — no call reaches api.cloudflare.com", .{r});
+            } else {
+                log.err("NL_CF_API_ROOT ignored: {s} is not a loopback http root; the belt stays on api.cloudflare.com", .{r});
+            }
+        }
+    }
     if (cf_account.len > 0 and wai_token.len > 0) log.info("Workers AI: ENABLED (backbone) — provider \"workers-ai\" runs on the Cloudflare account's inference endpoint", .{}) else log.info("Workers AI: not configured (set NL_CF_ACCOUNT_ID + NL_WORKERS_AI_TOKEN to enable the backbone)", .{});
 
     const port = cli_port; // resolved once above (NL_PORT else 8787), shared with the CLI client

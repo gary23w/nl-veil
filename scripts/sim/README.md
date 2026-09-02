@@ -161,3 +161,25 @@ cheat by the agent.
 `_run_tests` now counts executed tests and treats "ran nothing" as NO_DATA rather than green. The
 general rule, which applies to the system under test and the instrument equally: **a status code is
 not evidence of work.** Count what actually ran.
+
+## Running on the Cloudflare login (no key needed)
+
+A veil signed in to Cloudflare can run every suite here on the account's own Workers AI. A `@cf/...`
+model with a BLANK `base_url` and a BLANK key resolves through the login (OAuth-first in `sched.zig`),
+so nothing has to be exported:
+
+```bash
+python scripts/sim/meter.py scenarios /tmp/mt.py     # the new suites default to @cf/deepseek-ai/deepseek-v4-flash-0731
+SIM_MODEL=@cf/openai/gpt-oss-120b SIM_BASE_URL= python scripts/sim/drive.py scripts/sim/rc_scenarios.py
+```
+
+`SIM_MODEL` / `SIM_BASE_URL` outrank a scenario module's own `MODEL` / `BASE_URL` in `drive.py`, which is how
+the older suites (which hardcode the DeepSeek API) run on the login. `challenge.py` defaults to the login
+too. Ids that contain a `.` (kimi-k2.7, glm-5.3) cannot be used inside a conversation id.
+
+## The local-only instruments
+
+The capture-the-reward worlds (`challenge.py`, `world/`), and the newer instruments built on the same
+principle — the meter, the bait, the Cloudflare world — are kept OUT of the tree on purpose (see
+`.git/info/exclude`): they are the measuring apparatus, and an agent under test can read the repo. Their
+documentation lives beside them in `scripts/sim/INSTRUMENTS.md` and `scripts/sim/CHALLENGES.md`.

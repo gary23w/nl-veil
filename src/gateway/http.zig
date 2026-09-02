@@ -69,6 +69,10 @@ pub const App = struct {
     cf_oauth_auth_url: []const u8 = "https://dash.cloudflare.com/oauth2/auth",
     cf_oauth_token_url: []const u8 = "https://dash.cloudflare.com/oauth2/token",
     cf_oauth_accounts_url: []const u8 = "https://api.cloudflare.com/client/v4/accounts",
+    /// Where the cf_ tool belt sends its calls. Overridable from NL_CF_API_ROOT in main(), but ONLY to a
+    /// loopback address (cftools.isLoopbackRoot): the belt carries the user's OAuth bearer, and a
+    /// simulation stand-in on the same machine is the one place that may receive it besides Cloudflare.
+    cf_api_root: []const u8 = "https://api.cloudflare.com/client/v4",
 };
 
 /// The consent this login asks for, ONE definition (main.zig's env fallback reads it too; the registered

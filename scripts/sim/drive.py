@@ -275,11 +275,18 @@ if __name__ == "__main__":
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     only = sys.argv[2] if len(sys.argv) > 2 else None
+    # SIM_MODEL / SIM_BASE_URL outrank the module. The older suites hardcode the DeepSeek API; on a veil
+    # signed in to Cloudflare, SIM_MODEL=@cf/... with SIM_BASE_URL set EMPTY runs them on the login's
+    # Workers AI with no key anywhere (blank base + blank key resolve through OAuth in sched.zig).
+    model = os.environ.get("SIM_MODEL") or mod.MODEL
+    base_url = os.environ["SIM_BASE_URL"] if "SIM_BASE_URL" in os.environ else mod.BASE_URL
+    if model != mod.MODEL or base_url != mod.BASE_URL:
+        print("model override: %s @ %s" % (model, base_url or "(cloudflare login)"), flush=True)
     allsum = []
     for s in mod.SCENARIOS:
         if only and s["name"] != only:
             continue
-        allsum.append(run_scenario(s["name"], s["turns"], mod.MODEL, mod.BASE_URL, s.get("loop", 0), s.get("conv")))
+        allsum.append(run_scenario(s["name"], s["turns"], model, base_url, s.get("loop", 0), s.get("conv")))
     with open(os.path.join(OUT, "ALL.json"), "w", encoding="utf-8") as f:
         json.dump(allsum, f, indent=1, ensure_ascii=False)
     print("\nwrote %d scenario summaries to %s" % (len(allsum), OUT))

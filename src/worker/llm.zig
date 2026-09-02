@@ -572,7 +572,100 @@ pub fn complete(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []
             step2.deinit(gpa);
         }
     }
+    // TRANSIENT-FAILURE RETRY: an HTTP 200 with an empty `choices` array, a rate-limit / overload error, or a
+    // transport failure is the provider hiccuping, not the request being wrong. Measured on Workers AI
+    // (scripts/sim/cfworld.py cf_deploy, ledger.py turn 1): one such reply ended a 17-tool turn one step short
+    // of its answer, and the whole turn's context had to be paid again to redo it. One retry after a short
+    // pause is the cheapest insurance there is — it fires only on a failure, never on the healthy path, and
+    // the streamed chat path reaches it too (streamAttempt falls back to complete on a broken stream).
+    if (!step.ok and isTransientLlmError(step.content)) {
+        std.log.warn("llm[{s}/{s}] transient provider failure ({s}) — retrying once", .{ tag, model, step.content[0..@min(step.content.len, 80)] });
+        io.sleep(.{ .nanoseconds = 1500 * std.time.ns_per_ms }, .awake) catch {};
+        var again = completeBody(gpa, io, run_dir, tag, base_url, key, model, body, mt);
+        if (again.ok) {
+            step.deinit(gpa);
+            return again;
+        }
+        again.deinit(gpa);
+    }
     return step;
+}
+
+/// curl --retry writes the body of EVERY attempt to stdout: a failed first attempt's error envelope followed
+/// by the retry's real answer, back to back, and a parser fed the pair sees garbage after the first object.
+/// Observed on Workers AI as `{"errors":[{"message":"AiError: could not route request …","code":4002}],…}`
+/// immediately followed by `{"id":…,"choices":[…]}` — the provider HAD answered, and the turn (750 seconds
+/// of context in one measured case) was thrown away as "bad LLM response". The answer is the last complete
+/// top-level object; everything before it is the history of attempts. String-aware, so a brace inside a
+/// content string cannot split an object.
+fn lastTopLevelJson(body: []const u8) []const u8 {
+    var depth: usize = 0;
+    var in_str = false;
+    var esc = false;
+    var start: usize = 0;
+    var last_start: ?usize = null;
+    var last_end: usize = body.len;
+    var i: usize = 0;
+    while (i < body.len) : (i += 1) {
+        const c = body[i];
+        if (in_str) {
+            if (esc) {
+                esc = false;
+            } else if (c == '\\') {
+                esc = true;
+            } else if (c == '"') {
+                in_str = false;
+            }
+            continue;
+        }
+        switch (c) {
+            '"' => in_str = true,
+            '{' => {
+                if (depth == 0) start = i;
+                depth += 1;
+            },
+            '}' => {
+                if (depth > 0) {
+                    depth -= 1;
+                    if (depth == 0) {
+                        last_start = start;
+                        last_end = i + 1;
+                    }
+                }
+            },
+            else => {},
+        }
+    }
+    if (last_start) |ls| {
+        if (ls > 0) return body[ls..last_end];
+    }
+    return body;
+}
+
+test "lastTopLevelJson: a curl --retry pair yields the retry's answer, a lone body is untouched" {
+    const pair = "{\"errors\":[{\"message\":\"AiError: could not route request\",\"code\":4002}],\"success\":false}{\"id\":\"x\",\"choices\":[{\"message\":{\"content\":\"PONG\"}}]}";
+    try std.testing.expect(std.mem.startsWith(u8, lastTopLevelJson(pair), "{\"id\":\"x\""));
+    try std.testing.expect(std.mem.endsWith(u8, lastTopLevelJson(pair), "}}]}"));
+    try std.testing.expectEqualStrings("{\"a\":\"}{\"}", lastTopLevelJson("{\"a\":\"}{\"}"));
+    try std.testing.expectEqualStrings("{}", lastTopLevelJson("{}"));
+    try std.testing.expectEqualStrings("not json at all", lastTopLevelJson("not json at all"));
+}
+
+/// The failure texts worth one retry: the provider answered, but with nothing (empty `choices`), or with a
+/// capacity complaint, or the transport dropped. A 4xx about the REQUEST (bad model, bad key, malformed
+/// body) is deliberately not on this list — repeating it would only repeat the answer.
+fn isTransientLlmError(msg: []const u8) bool {
+    const needles = [_][]const u8{ "no choices in LLM response", "bad LLM response", "could not route", "curl exit", "429", "rate limit", "rate_limit", "ratelimit", "overloaded", "capacity", "temporar", "try again", "502", "503", "504", "timed out", "timeout", "Too Many Requests", "server error", "internal error", "upstream" };
+    for (needles) |n| if (std.mem.indexOf(u8, msg, n) != null) return true;
+    return false;
+}
+
+test "isTransientLlmError: provider hiccups retry, request errors do not" {
+    try std.testing.expect(isTransientLlmError("no choices in LLM response"));
+    try std.testing.expect(isTransientLlmError("provider error: 429 Too Many Requests"));
+    try std.testing.expect(isTransientLlmError("curl exit: (56) Recv failure"));
+    try std.testing.expect(!isTransientLlmError("provider error: Authentication Fails, Your api key: ****546c is invalid"));
+    try std.testing.expect(!isTransientLlmError("provider error: model not found"));
 }
 
 /// The valid message prefix (validMessagePrefixLen) further trimmed so it never ENDS on an assistant turn
@@ -1928,7 +2021,7 @@ fn completeBodyH(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: [
         } = null,
         @"error": ?struct { message: []const u8 = "" } = null,
     };
-    const parsed = std.json.parseFromSlice(Resp, gpa, r.content, .{ .ignore_unknown_fields = true }) catch
+    const parsed = std.json.parseFromSlice(Resp, gpa, lastTopLevelJson(r.content), .{ .ignore_unknown_fields = true }) catch
         return stepErr(gpa, std.fmt.allocPrint(gpa, "bad LLM response: {s}", .{r.content[0..@min(r.content.len, 300)]}) catch "unparseable response");
     defer parsed.deinit();
     var ds_in: u64 = 0; // this call's token counts, hoisted for the dataset record at the tail
