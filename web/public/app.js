@@ -272,7 +272,8 @@ const api = {
   cfR2Sync: ()  => jpost('/api/v1/oauth/cloudflare/r2/sync', {}),
   cfR2Auto: (on) => jpost('/api/v1/oauth/cloudflare/r2/auto', { auto: !!on }),
   cfTunnel: () => jget('/api/v1/oauth/cloudflare/tunnel', 8000),
-  cfTunnelSet: (on) => jpost('/api/v1/oauth/cloudflare/tunnel', { on: !!on }),
+  cfTunnelSet: (on, useDomain, hostname) => jpost('/api/v1/oauth/cloudflare/tunnel',
+    on ? { on: true, use_domain: !!useDomain, hostname: String(hostname || '') } : { on: false }),
 };
 
 /* ============================================================ theme
@@ -485,15 +486,24 @@ function cfTunnelRowHtml() {
   let line;
   if (!tn.admin) line = 'only the server owner can open a tunnel';
   else if (live && tn.access) line = 'live — only your Cloudflare email can open it (Cloudflare Access)';
+  else if (live && !tn.use_domain) line = 'live — a confidential address only you are shown; your veil login is the gate';
   else if (live) line = 'live — protected by your veil login';
   else if (busy) line = esc(tn.state) + '…';
   else if (tn.last_error) line = `<span style="color:var(--red, #e5484d)">${esc(tn.last_error)}</span>`;
   else line = 'off — flip the switch to publish this veil at a Cloudflare URL through your account';
   const mode = live && tn.mode === 'quick'
-    ? ' <span class="muted">(a temporary trycloudflare.com address — add a domain to your Cloudflare account for a permanent one)</span>' : '';
+    ? ' <span class="muted">(changes on every start — tick "use my domain" for a permanent address on one of your domains)</span>' : '';
+  const dom = S.cfTunDomain === undefined ? !!tn.use_domain : S.cfTunDomain;
+  const host = S.cfTunHost === undefined ? (tn.want_hostname || '') : S.cfTunHost;
+  const lock = (tn.on || live || busy || !tn.admin) ? 'disabled' : '';
   return `<div class="set-row">
       <div><b>Public URL <span class="muted">(Cloudflare Tunnel)</span></b>
         <div class="muted">${line}${mode}</div>
+        <div class="cf-tunnel-choice">
+          <label class="muted"><input type="checkbox" id="cfTunDomain" ${dom ? 'checked' : ''} ${lock}> use my domain</label>
+          <input type="text" id="cfTunHost" class="${dom ? '' : 'hide'}" value="${esc(host)}" placeholder="veil.example.com (blank = veil.<first domain>)" ${lock}>
+          ${dom ? '' : '<span class="muted">default: a confidential trycloudflare.com address, nothing on your domains</span>'}
+        </div>
         <div class="cf-tunnel-box">
           <input type="text" readonly id="cfTunnelUrl" value="${esc(tn.url || '')}" placeholder="no url yet">
           <button class="btn btn-sm" id="cfTunnelCopy" ${tn.url ? '' : 'disabled'}>Copy</button>
@@ -803,7 +813,9 @@ function refreshCfPanel() {
   if (tun) tun.addEventListener('change', async (e) => {
     const want = e.target.checked;
     try {
-      await api.cfTunnelSet(want);
+      const dom = el('cfTunDomain') ? el('cfTunDomain').checked : false;
+      const host = el('cfTunHost') ? el('cfTunHost').value.trim() : '';
+      await api.cfTunnelSet(want, dom, host);
       if (S.cf.tunnel) { S.cf.tunnel.on = want; S.cf.tunnel.state = want ? 'starting' : 'off'; if (!want) S.cf.tunnel.url = ''; }
       toast(want ? 'Opening the tunnel' : 'Tunnel closed',
         want ? 'Provisioning through your Cloudflare account — the URL appears here in a moment.' : '', 'ok');
@@ -814,6 +826,10 @@ function refreshCfPanel() {
       toast('Could not change the tunnel', err.message, 'err');
     }
   });
+  const domBox = el('cfTunDomain');
+  if (domBox) domBox.addEventListener('change', (e) => { S.cfTunDomain = e.target.checked; refreshCfPanel(); });
+  const hostBox = el('cfTunHost');
+  if (hostBox) hostBox.addEventListener('input', (e) => { S.cfTunHost = e.target.value; });
   const copy = el('cfTunnelCopy');
   if (copy) copy.addEventListener('click', () => {
     const u = el('cfTunnelUrl');

@@ -212,6 +212,9 @@ const Ui = struct {
     s_url: Field = .{},
     s_ckey: Field = .{},
     s_cfacct: Field = .{}, // Cloudflare account id (chat BYOK, when the provider needs one)
+    s_tunhost: Field = .{}, // Cloudflare tunnel: the hostname on one of the user's domains ("use my domain")
+    tun_domain: bool = false, // the "use my domain" toggle (seeded once from the server's remembered choice)
+    tun_seeded: bool = false,
     s_tkey: Field = .{}, // MODEL TRIO: thinking-role api key entry (non-unified panel)
     s_pkey: Field = .{}, // MODEL TRIO: prompting-role api key entry (non-unified panel)
     s_seeded: bool = false, // provider fields copied from the store once (after the chat thread loads)
@@ -315,7 +318,7 @@ const Ui = struct {
     log_follow: bool = true,
     details_scroll: f32 = 0, // swarm Details tab: the goal + config + blueprint can outgrow the panel
 
-    const Focus = enum { none, chat, d_name, d_key, d_cfacct, d_goal, d_gateway, c_input, c_rename, s_model, s_url, s_ckey, s_cfacct, s_tkey, s_pkey, s_host, s_port, con_input, sc_name, sc_prompt, sc_details, sc_base, sc_model, sc_key };
+    const Focus = enum { none, chat, d_name, d_key, d_cfacct, d_goal, d_gateway, c_input, c_rename, s_model, s_url, s_ckey, s_cfacct, s_tunhost, s_tkey, s_pkey, s_host, s_port, con_input, sc_name, sc_prompt, sc_details, sc_base, sc_model, sc_key };
     // Per chat-table horizontal-scroll offset (px), keyed by a content hash so it survives vertical scroll +
     // stream-settle. A tiny FIFO (see tblScrollOff): a new table evicts the oldest.
     const TblHScroll = struct { id: u64 = 0, off: f32 = 0 };
@@ -1769,6 +1772,7 @@ fn focusedField() ?*Ui.Field {
         .s_url => &ui.s_url,
         .s_ckey => &ui.s_ckey,
         .s_cfacct => &ui.s_cfacct,
+        .s_tunhost => &ui.s_tunhost,
         .s_tkey => &ui.s_tkey,
         .s_pkey => &ui.s_pkey,
         .s_host => &ui.s_host,
@@ -3055,6 +3059,9 @@ fn drawCfTunnelRows(store: *Store, x: f32, y0: f32, colw: f32) f32 {
     var un: usize = 0;
     var eb: [160]u8 = undefined;
     var en: usize = 0;
+    var use_domain = false;
+    var whb: [128]u8 = undefined;
+    var whn: usize = 0;
     {
         store.lock();
         defer store.unlock();
@@ -3064,6 +3071,9 @@ fn drawCfTunnelRows(store: *Store, x: f32, y0: f32, colw: f32) f32 {
         busy = store.cf_tun_busy;
         admin = store.cf_tun_admin;
         access = store.cf_tun_access;
+        use_domain = store.cf_tun_use_domain;
+        whn = @min(store.cf_tun_want_host_len, whb.len);
+        @memcpy(whb[0..whn], store.cf_tun_want_host[0..whn]);
         sn = @min(store.cf_tun_state_len, sb.len);
         @memcpy(sb[0..sn], store.cf_tun_state[0..sn]);
         un = @min(store.cf_tun_url_len, ub.len);
@@ -3081,13 +3091,25 @@ fn drawCfTunnelRows(store: *Store, x: f32, y0: f32, colw: f32) f32 {
     const sw_label: [:0]const u8 = if (is_on) t.z("Tunnel: ON", .{}) else t.z("Tunnel: OFF", .{});
     const sw = t.btnW(sw_label, t.BTN_MD);
     const sw_color = if (live) t.green else if (busy) t.orange else t.fg_dim;
+    // seed the toggle and the hostname field ONCE from the server's remembered choice
+    if (seen and !ui.tun_seeded) {
+        ui.tun_domain = use_domain;
+        setField(&ui.s_tunhost, whb[0..whn]);
+        ui.tun_seeded = true;
+    }
     if (t.button(.{ .x = x, .y = y, .width = sw, .height = t.BTN_MD }, sw_label, sw_color, admin and !busy)) {
-        store.pushCmd(store_mod.mkCmd(if (is_on) .cf_tunnel_off else .cf_tunnel_on, "", ""));
+        if (is_on) {
+            store.pushCmd(store_mod.mkCmd(.cf_tunnel_off, "", ""));
+        } else {
+            store.pushCmd(store_mod.mkCmd(.cf_tunnel_on, if (ui.tun_domain) "domain" else "quick", ui.s_tunhost.buf[0..ui.s_tunhost.len]));
+        }
     }
     const line: [:0]const u8 = if (!admin)
         t.z("only the server owner can open a tunnel", .{})
     else if (live and access)
         t.z("live - only your Cloudflare email can open it (Access)", .{})
+    else if (live and !use_domain)
+        t.z("live - a confidential address only you are shown; your veil login is the gate", .{})
     else if (live)
         t.z("live - protected by your veil login", .{})
     else if (busy)
@@ -3098,6 +3120,15 @@ fn drawCfTunnelRows(store: *Store, x: f32, y0: f32, colw: f32) f32 {
         t.z("off - flip to publish this veil at a Cloudflare URL through your account", .{});
     const line_color = if (en > 0 and !live and !busy) t.red else t.comment;
     t.textClip(line, @intFromFloat(x + sw + 12), @intFromFloat(y + 8), 12, line_color, @intFromFloat(colw - sw - 12));
+    y += t.BTN_MD + 8;
+    // THE CHOICE: confidential (default) or one of the user's domains. The toggle is a button that reads as a
+    // checkbox; the hostname field appears only when a domain is wanted, and both travel with the next flip.
+    const dl: [:0]const u8 = if (ui.tun_domain) t.z("[x] use my domain", .{}) else t.z("[ ] use my domain (default: a confidential trycloudflare.com address)", .{});
+    const dw = t.btnW(dl, t.BTN_MD);
+    if (t.button(.{ .x = x, .y = y, .width = dw, .height = t.BTN_MD }, dl, if (ui.tun_domain) t.blue else t.fg_dim, admin and !busy and !is_on)) ui.tun_domain = !ui.tun_domain;
+    if (ui.tun_domain) {
+        textField(.{ .x = x + dw + t.GAP, .y = y, .width = colw - dw - t.GAP, .height = t.FIELD_H }, &ui.s_tunhost, ui.focus == .s_tunhost, "hostname on one of your Cloudflare domains, e.g. veil.example.com (blank = veil.<first domain>)", .s_tunhost);
+    }
     y += t.BTN_MD + 8;
     const cl = t.z("Copy", .{});
     const cw = t.btnW(cl, t.BTN_MD);

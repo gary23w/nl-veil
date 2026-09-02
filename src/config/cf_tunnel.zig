@@ -1,11 +1,13 @@
 //! Cloudflare Tunnel — this veil, reachable at a Cloudflare URL, through the user's OWN account.
 //!
 //! One switch. Behind it: the official `cloudflared` connector (found on PATH, or fetched once from
-//! Cloudflare's GitHub release into {data}/bin and hash-logged), a NAMED tunnel provisioned on the signed-in
-//! account through the v4 API (tunnel → remotely-managed ingress → a CNAME on one of the account's zones → a
-//! Cloudflare Access application that admits only the login's own email), and the connector running as a
-//! managed child with the tunnel token in its ENVIRONMENT — never on an argv, never in a file. An account
-//! with no zone gets a quick tunnel (a temporary trycloudflare.com address) and the status says so.
+//! Cloudflare's GitHub release into {data}/bin and hash-logged) running as a managed child. BY DEFAULT the
+//! address is CONFIDENTIAL: a quick tunnel, a random unlisted trycloudflare.com hostname that changes on every
+//! start and puts no record on any domain the user owns — the veil is a personal harness, and a URL nobody can
+//! guess or look up is the right default for one. Only when the user asks for "use my domain" is a NAMED tunnel
+//! provisioned on the signed-in account through the v4 API (tunnel → remotely-managed ingress → a CNAME on one
+//! of the account's zones → a Cloudflare Access application that admits only the login's own email), with the
+//! tunnel token in the connector's ENVIRONMENT — never on an argv, never in a file.
 //!
 //! SECURITY — what makes exposing a local server acceptable, and where each rule lives:
 //!   * owner-only. The switch is behind requireAdmin and provisions for the owner's login only. A tunnel
@@ -44,6 +46,7 @@ pub const TOKEN_PROVIDER = "cf-tunnel";
 const RELEASE_BASE = "https://github.com/cloudflare/cloudflared/releases/latest/download/";
 const STATE_FILE = "cf_tunnel.json";
 const LOG_FILE = "cf_tunnel.log";
+const PID_FILE = "cf_tunnel.pid";
 /// cloudflared's own line for a connector that is serving — the moment the URL is real.
 const LIVE_MARK = "Registered tunnel connection";
 /// How long a connector may take to register before the switch is declared failed.
@@ -54,6 +57,10 @@ const LOG_CAP: usize = 512 * 1024;
 /// vault, and this file is readable by anything that can read the data dir.
 pub const State = struct {
     want_on: bool = false,
+    /// The user's choice: false (default) = a confidential trycloudflare.com address; true = a hostname on one
+    /// of the account's zones (`want_hostname`, or veil.<first zone> when blank).
+    use_domain: bool = false,
+    want_hostname: []const u8 = "",
     mode: []const u8 = "", // "named" | "quick"
     tunnel_id: []const u8 = "",
     tunnel_name: []const u8 = "",
@@ -149,6 +156,22 @@ fn statePath(app: *App, uid: u64, buf: []u8) ?[]const u8 {
 
 fn logPath(app: *App, uid: u64, buf: []u8) ?[]const u8 {
     return std.fmt.bufPrint(buf, "{s}/u{d}/" ++ LOG_FILE, .{ app.data, uid }) catch null;
+}
+
+fn pidPath(app: *App, uid: u64, buf: []u8) ?[]const u8 {
+    return std.fmt.bufPrint(buf, "{s}/u{d}/" ++ PID_FILE, .{ app.data, uid }) catch null;
+}
+
+/// A hostname the user typed: lowercase letters, digits, dots and hyphens, at least one dot, no oddities.
+fn hostnameOk(h: []const u8) bool {
+    if (h.len < 3 or h.len > 253 or h[0] == '.' or h[h.len - 1] == '.' or h[0] == '-') return false;
+    var dots: usize = 0;
+    for (h) |c| {
+        const ok = (c >= 'a' and c <= 'z') or (c >= '0' and c <= '9') or c == '-' or c == '.';
+        if (!ok) return false;
+        if (c == '.') dots += 1;
+    }
+    return dots >= 1 and std.mem.indexOf(u8, h, "..") == null;
 }
 
 pub fn readState(app: *App, uid: u64, a: std.mem.Allocator) State {
@@ -294,8 +317,9 @@ fn provisionNamed(app: *App, a: std.mem.Allocator, uid: u64, st: *State, tok: To
     const root = app.cf_api_root;
     const acct = tok.account_id;
 
-    // ---- 1. a zone to live on. None → quick tunnel (the caller handles it).
-    if (st.zone_id.len == 0) {
+    // ---- 1. the zone: the one the requested hostname belongs to, else the account's first. A hostname on
+    // no zone of this account is an error the user can act on, never a silent fallback.
+    if (st.zone_id.len == 0 or (st.want_hostname.len > 0 and !std.mem.endsWith(u8, st.want_hostname, st.zone_name))) {
         const url = std.fmt.allocPrint(a, "{s}/zones?account.id={s}&status=active&per_page=50", .{ root, acct }) catch return null;
         const raw = apiJson(app, "GET", url, "", tok.key) orelse {
             st.last_error = "could not reach the Cloudflare API";
@@ -311,11 +335,27 @@ fn provisionNamed(app: *App, a: std.mem.Allocator, uid: u64, st: *State, tok: To
             return null;
         }
         if (z.result.len == 0) {
-            st.mode = "quick";
-            return null; // not an error: the caller falls back to a quick tunnel
+            st.last_error = "this Cloudflare account has no domain (zone) - add one, or switch off 'use my domain' for a confidential address";
+            return null;
         }
-        st.zone_id = z.result[0].id;
-        st.zone_name = z.result[0].name;
+        var pick: ?usize = null;
+        if (st.want_hostname.len > 0) {
+            for (z.result, 0..) |zn, i| {
+                if (std.mem.eql(u8, st.want_hostname, zn.name) or (st.want_hostname.len > zn.name.len + 1 and
+                    std.mem.endsWith(u8, st.want_hostname, zn.name) and st.want_hostname[st.want_hostname.len - zn.name.len - 1] == '.'))
+                    pick = i;
+            }
+            if (pick == null) {
+                st.last_error = std.fmt.allocPrint(a, "{s} is not on any domain of this Cloudflare account ({d} zone(s) checked)", .{ st.want_hostname, z.result.len }) catch "the hostname is not on any domain of this account";
+                return null;
+            }
+        } else pick = 0;
+        st.zone_id = z.result[pick.?].id;
+        st.zone_name = z.result[pick.?].name;
+        st.hostname = "";
+        st.dns_record_id = "";
+        st.access_app_id = "";
+        st.access_policy_id = "";
     }
 
     // ---- 2. the tunnel itself
@@ -341,9 +381,9 @@ fn provisionNamed(app: *App, a: std.mem.Allocator, uid: u64, st: *State, tok: To
         st.created_at = nowS(app.io);
     }
 
-    // ---- 3. a hostname: veil.<zone>, or veil-<hex>.<zone> when that name is taken by something else
+    // ---- 3. a hostname: the one asked for, else veil.<zone>, else veil-<hex>.<zone> when that is taken
     if (st.hostname.len == 0) {
-        const want = std.fmt.allocPrint(a, "veil.{s}", .{st.zone_name}) catch return null;
+        const want = if (st.want_hostname.len > 0) st.want_hostname else (std.fmt.allocPrint(a, "veil.{s}", .{st.zone_name}) catch return null);
         const url = std.fmt.allocPrint(a, "{s}/zones/{s}/dns_records?name={s}", .{ root, st.zone_id, want }) catch return null;
         var taken = false;
         if (apiJson(app, "GET", url, "", tok.key)) |raw| {
@@ -502,7 +542,10 @@ fn startChild(app: *App, a: std.mem.Allocator, uid: u64, st: *State, token: ?[]c
     defer env.deinit();
     var argv: std.ArrayListUnmanaged([]const u8) = .empty;
     defer argv.deinit(app.gpa);
-    argv.appendSlice(app.gpa, &.{ st.binary, "tunnel", "--no-autoupdate", "--logfile", logp }) catch return "oom";
+    var pb2: [700]u8 = undefined;
+    const pidp = pidPath(app, uid, &pb2) orelse return "data dir path too long";
+    std.Io.Dir.cwd().deleteFile(io, pidp) catch {};
+    argv.appendSlice(app.gpa, &.{ st.binary, "tunnel", "--no-autoupdate", "--logfile", logp, "--pidfile", pidp }) catch return "oom";
     if (token) |t| {
         // THE TOKEN RIDES THE ENVIRONMENT. `--token` on the argv would show it to every process on the
         // machine (ps, Task Manager, the agent's own run_python); cloudflared reads TUNNEL_TOKEN itself.
@@ -561,20 +604,72 @@ fn startChild(app: *App, a: std.mem.Allocator, uid: u64, st: *State, token: ?[]c
     return "cloudflared did not register a connection within 90s - see cf_tunnel.log in the user's data dir";
 }
 
-fn killChild(io: std.Io) void {
+/// The connector's pid from its pidfile, or null.
+fn readPid(app: *App, uid: u64) ?u32 {
+    var pb: [700]u8 = undefined;
+    const pidp = pidPath(app, uid, &pb) orelse return null;
+    const raw = std.Io.Dir.cwd().readFileAlloc(app.io, pidp, app.gpa, .limited(64)) catch return null;
+    defer app.gpa.free(raw);
+    return std.fmt.parseInt(u32, std.mem.trim(u8, raw, " \r\n\t"), 10) catch null;
+}
+
+/// Is a process with this pid alive? tasklist on Windows, kill -0 elsewhere.
+fn pidAlive(app: *App, pid: u32) bool {
+    var b: [24]u8 = undefined;
+    const ps = std.fmt.bufPrint(&b, "{d}", .{pid}) catch return false;
+    if (builtin.os.tag == .windows) {
+        var fb: [40]u8 = undefined;
+        const filt = std.fmt.bufPrint(&fb, "PID eq {d}", .{pid}) catch return false;
+        const r = std.process.run(app.gpa, app.io, .{ .argv = &.{ "tasklist", "/FI", filt, "/NH" }, .stdout_limit = .limited(8 << 10) }) catch return false;
+        defer app.gpa.free(r.stdout);
+        defer app.gpa.free(r.stderr);
+        return std.mem.indexOf(u8, r.stdout, "cloudflared") != null;
+    }
+    return runs(app, &.{ "kill", "-0", ps });
+}
+
+/// OFF MEANS OFF, VERIFIED. Zig's Windows kill issues NtTerminateProcess and ignores a refusal; observed live,
+/// "off" was reported while the connector kept serving the URL. So the stop kills by PID from the pidfile
+/// (taskkill /T /F, or kill -TERM then -KILL), keeps the in-process kill as well, and then POLLS until the
+/// process is gone. Returns the pid still alive, or null when the connector is verifiably dead.
+fn killChild(app: *App, uid: u64) ?u32 {
+    const io = app.io;
+    const pid = readPid(app, uid);
     mu.lockUncancelable(io);
-    const had = live.child != null;
     if (live.child) |*c| c.kill(io);
     mu.unlock(io);
-    if (had) {
-        // let the waiter observe the exit before the slot is cleared (bounded: kill reaps on its own)
-        var waited: usize = 0;
-        while (!exited.load(.monotonic) and waited < 50) : (waited += 1) io.sleep(.{ .nanoseconds = 100 * std.time.ns_per_ms }, .awake) catch {};
+    if (pid) |p| {
+        var b: [24]u8 = undefined;
+        const ps = std.fmt.bufPrint(&b, "{d}", .{p}) catch "0";
+        if (builtin.os.tag == .windows) {
+            _ = runs(app, &.{ "taskkill", "/PID", ps, "/T", "/F" });
+        } else {
+            _ = runs(app, &.{ "kill", "-TERM", ps });
+        }
     }
+    var still: ?u32 = null;
+    if (pid) |p| {
+        var tries: usize = 0;
+        while (tries < 50 and pidAlive(app, p)) : (tries += 1) {
+            if (tries == 20 and builtin.os.tag != .windows) {
+                var b: [24]u8 = undefined;
+                _ = runs(app, &.{ "kill", "-KILL", std.fmt.bufPrint(&b, "{d}", .{p}) catch "0" });
+            }
+            io.sleep(.{ .nanoseconds = 100 * std.time.ns_per_ms }, .awake) catch {};
+        }
+        if (pidAlive(app, p)) still = p;
+    }
+    var waited: usize = 0;
+    while (!exited.load(.monotonic) and live.child != null and waited < 30) : (waited += 1) io.sleep(.{ .nanoseconds = 100 * std.time.ns_per_ms }, .awake) catch {};
     mu.lockUncancelable(io);
     defer mu.unlock(io);
     live.child = null;
     live.url_len = 0;
+    if (still == null) {
+        var pb: [700]u8 = undefined;
+        if (pidPath(app, uid, &pb)) |pp| std.Io.Dir.cwd().deleteFile(io, pp) catch {};
+    }
+    return still;
 }
 
 // ------------------------------------------------------------------------------------------ on / off
@@ -626,37 +721,34 @@ pub fn turnOn(app: *App, uid: u64) void {
     }
     writeState(app, uid, st);
 
+    // a connector left over from a previous server instance must not run beside the new one
+    if (readPid(app, uid)) |old| if (pidAlive(app, old)) {
+        _ = killChild(app, uid);
+    };
+
     setPhase(io, .provisioning);
     var token: ?[]const u8 = null;
-    if (!std.mem.eql(u8, st.mode, "quick")) {
+    if (st.use_domain) {
+        st.mode = "named";
         if (provisionNamed(app, a, uid, &st, .{ .key = tok.key, .base_url = tok.base_url, .account_id = tok.account_id }, prof.email)) |t| {
             token = t;
             app.vault.put(uid, TOKEN_PROVIDER, t, "") catch |e| log.warn("tunnel token could not be sealed into the vault ({t}); it is not persisted", .{e});
-        } else if (st.last_error.len > 0) {
+        } else {
+            if (st.last_error.len == 0) st.last_error = "provisioning the tunnel on your account failed";
             writeState(app, uid, st);
             setErr(io, st.last_error);
             return;
         }
-        // a named tunnel that already exists: the token is in the vault from the first provisioning
-        if (token == null and std.mem.eql(u8, st.mode, "named")) {
-            if (app.vault.resolve(uid, TOKEN_PROVIDER, a)) |r| token = r.key;
-        }
-    }
-    if (token == null and !std.mem.eql(u8, st.mode, "quick")) {
-        st.last_error = "no tunnel token - flip the switch off and on to re-provision";
-        writeState(app, uid, st);
-        setErr(io, st.last_error);
-        return;
-    }
-    if (std.mem.eql(u8, st.mode, "quick")) {
+    } else {
+        // THE DEFAULT: a confidential address. No tunnel, no DNS, nothing on any domain the user owns - a
+        // random trycloudflare.com hostname that only the owner is ever shown, and that changes each start.
+        st.mode = "quick";
         st.url = "";
-        st.hostname = "";
-        log.warn("Cloudflare tunnel: the account has no zone (domain), so this is a QUICK tunnel with a temporary trycloudflare.com address and no Access policy - the veil login is the only gate", .{});
     }
     writeState(app, uid, st);
 
     if (startChild(app, a, uid, &st, token)) |err| {
-        killChild(io);
+        _ = killChild(app, uid);
         st.last_error = err;
         writeState(app, uid, st);
         setErr(io, err);
@@ -673,20 +765,27 @@ pub fn turnOn(app: *App, uid: u64) void {
         live.mode_len = ml;
     }
     setUrl(io, st.url);
-    log.info("Cloudflare tunnel: {s}  ({s}{s})", .{ st.url, st.mode, if (st.access_policy_id.len > 0) ", Access: owner only" else ", veil login only" });
+    log.info("Cloudflare tunnel: {s}  ({s}{s})", .{ st.url, if (std.mem.eql(u8, st.mode, "quick")) "confidential address" else st.hostname, if (st.access_policy_id.len > 0) ", Access: owner only" else ", veil login only" });
 }
 
 /// Stop the connector; with `delete`, also remove the tunnel, its DNS record and its Access app from the
 /// account and forget the sealed token.
 pub fn turnOff(app: *App, uid: u64, delete: bool) void {
     const io = app.io;
-    killChild(io);
+    const still = killChild(app, uid);
     var arena = std.heap.ArenaAllocator.init(app.gpa);
     defer arena.deinit();
     const a = arena.allocator();
     var st = readState(app, uid, a);
     st.want_on = false;
     st.last_error = "";
+    if (still) |p| {
+        // never say "off" over a connector that is still serving the URL
+        st.last_error = std.fmt.allocPrint(a, "could not stop cloudflared (pid {d}) - end that process yourself; the URL stays reachable until it is gone", .{p}) catch "could not stop cloudflared";
+        writeState(app, uid, st);
+        setErr(io, st.last_error);
+        return;
+    }
     if (delete) {
         if (cf_oauth.resolveToken(app, uid, a)) |tok| deprovision(app, a, &st, .{ .key = tok.key, .base_url = tok.base_url, .account_id = tok.account_id });
         app.vault.del(uid, TOKEN_PROVIDER);
@@ -744,7 +843,10 @@ pub fn bootAsync(app: *App, forced: bool) void {
 
 /// Stop the connector on shutdown so it never outlives the server it proxies to.
 pub fn shutdown(app: *App) void {
-    killChild(app.io);
+    mu.lockUncancelable(app.io);
+    const uid = live.uid;
+    mu.unlock(app.io);
+    if (uid != 0) _ = killChild(app, uid);
 }
 
 // ------------------------------------------------------------------------------------------ routes
@@ -782,8 +884,10 @@ pub fn tunnelStatus(app: *App, req: *httpz.Request, res: *httpz.Response) !void 
     }
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(app.gpa);
-    try out.print(app.gpa, "{{\"ok\":true,\"connected\":{},\"admin\":{},\"state\":\"{s}\",\"on\":{},\"busy\":{},\"live\":{},\"access\":{},\"since\":{d},\"open_registration\":{},\"url\":", .{ connected, admin, phaseName(phase), st.want_on, busy, phase == .live, access, since, app.open_registration });
+    try out.print(app.gpa, "{{\"ok\":true,\"connected\":{},\"admin\":{},\"state\":\"{s}\",\"on\":{},\"busy\":{},\"live\":{},\"access\":{},\"since\":{d},\"open_registration\":{},\"use_domain\":{},\"url\":", .{ connected, admin, phaseName(phase), st.want_on, busy, phase == .live, access, since, app.open_registration, st.use_domain });
     try http.jstr(app.gpa, &out, url);
+    try out.appendSlice(app.gpa, ",\"want_hostname\":");
+    try http.jstr(app.gpa, &out, if (admin) st.want_hostname else "");
     try out.appendSlice(app.gpa, ",\"hostname\":");
     try http.jstr(app.gpa, &out, if (admin) st.hostname else "");
     try out.appendSlice(app.gpa, ",\"mode\":");
@@ -799,7 +903,7 @@ pub fn tunnelStatus(app: *App, req: *httpz.Request, res: *httpz.Response) !void 
     res.body = try res.arena.dupe(u8, out.items);
 }
 
-const SetReq = struct { on: bool, delete: bool = false };
+const SetReq = struct { on: bool, delete: bool = false, use_domain: ?bool = null, hostname: ?[]const u8 = null };
 
 /// POST /api/v1/oauth/cloudflare/tunnel {on[, delete]} — the switch. Owner only. Answers at once; the work
 /// runs on its own thread and the status poll reports the phases and then the URL.
@@ -810,7 +914,20 @@ pub fn tunnelSet(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         if (app.open_registration) return badReq(res, "open registration is on: close it (NL_OPEN_REGISTRATION=0) before exposing this server");
         var arena = std.heap.ArenaAllocator.init(app.gpa);
         defer arena.deinit();
-        if (cf_oauth.resolveToken(app, u.id, arena.allocator()) == null) return badReq(res, "not connected to Cloudflare - log in with Cloudflare first");
+        const a = arena.allocator();
+        if (cf_oauth.resolveToken(app, u.id, a) == null) return badReq(res, "not connected to Cloudflare - log in with Cloudflare first");
+        // the choice rides with the flip and is remembered: confidential (default) or one of the user's domains
+        var st = readState(app, u.id, a);
+        if (body.use_domain) |ud| st.use_domain = ud;
+        if (body.hostname) |h| {
+            const t = std.mem.trim(u8, h, " \r\n\t");
+            if (t.len > 0 and !hostnameOk(t)) return badReq(res, "hostname must be lowercase letters, digits, dots and hyphens, like veil.example.com");
+            if (!std.mem.eql(u8, t, st.want_hostname)) {
+                st.want_hostname = t;
+                st.hostname = ""; // re-derive the effective hostname from the new request
+            }
+        }
+        writeState(app, u.id, st);
         {
             mu.lockUncancelable(app.io);
             defer mu.unlock(app.io);
@@ -865,7 +982,14 @@ test "state round-trips through its JSON with defaults, and carries no token fie
     try std.testing.expectEqualStrings("veil.example.com", parsed.value.hostname);
     try std.testing.expectEqualStrings("", parsed.value.tunnel_id);
     try std.testing.expect(!@hasField(State, "token"));
+    try std.testing.expect(!parsed.value.use_domain); // confidential by default
     try std.testing.expect(releaseAsset() != null or builtin.os.tag == .freestanding);
+    try std.testing.expect(hostnameOk("veil.example.com"));
+    try std.testing.expect(hostnameOk("veil-2.sub.example.co.uk"));
+    try std.testing.expect(!hostnameOk("Veil.example.com"));
+    try std.testing.expect(!hostnameOk("localhost"));
+    try std.testing.expect(!hostnameOk("a..b"));
+    try std.testing.expect(!hostnameOk("-x.example.com"));
 }
 
 test "the permission explanation names the fix, other errors are quoted verbatim" {
