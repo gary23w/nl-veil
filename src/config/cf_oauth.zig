@@ -563,11 +563,27 @@ fn fetchModelsList(app: *App, uid: u64, alloc: std.mem.Allocator) ?[]const u8 {
     const raw = curlCall(app, "GET", url, "", tok.key) orelse return null;
     defer app.gpa.free(raw);
     const ModelsResp = struct {
-        result: []const struct { name: []const u8 = "" } = &.{},
+        result: []const struct {
+            name: []const u8 = "",
+            properties: ?[]const struct { property_id: []const u8 = "", value: []const u8 = "" } = null,
+        } = &.{},
     };
     const parsed = std.json.parseFromSlice(ModelsResp, app.gpa, raw, .{ .ignore_unknown_fields = true }) catch return null;
     defer parsed.deinit();
     if (parsed.value.result.len == 0) return null; // no models parsed → let the caller keep the catalog defaults
+    // THE CONTEXT WINDOW RIDES ALONG. The catalog states it per model (properties[].context_window), and the
+    // engine's compaction budget is sized from it: the id heuristic read "flash" as a small model and gave
+    // deepseek-v4-flash a 32k window, against the catalog's 1,310,720 - so the working span was folded after
+    // almost every step (67 compactions in one C1 run, 71% of its model time). See windowTokensFor.
+    for (parsed.value.result) |m| {
+        const props = m.properties orelse continue;
+        for (props) |p| {
+            if (std.mem.eql(u8, p.property_id, "context_window")) {
+                const v = std.fmt.parseInt(u32, std.mem.trim(u8, p.value, " \t"), 10) catch continue;
+                rememberWindow(app.io, m.name, v);
+            }
+        }
+    }
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(app.gpa);
     out.append(app.gpa, '[') catch return null;
@@ -585,6 +601,68 @@ fn fetchModelsList(app: *App, uid: u64, alloc: std.mem.Allocator) ?[]const u8 {
 
 /// Cached model-list JSON array for `uid`. Serves a fresh cache; else refetches (and on a fetch failure,
 /// falls back to a stale cache if one exists). alloc-owned copy, or null when there's nothing to serve.
+// ------------------------------------------------------------------------------- catalog context windows
+const WIN_SLOTS = 96;
+const WinSlot = struct { name: [120]u8 = undefined, len: usize = 0, tokens: u32 = 0 };
+var win_mtx: std.Io.Mutex = .init;
+var wins: [WIN_SLOTS]WinSlot = @splat(.{});
+
+fn rememberWindow(io: std.Io, name: []const u8, tokens: u32) void {
+    if (name.len == 0 or name.len > 120 or tokens == 0) return;
+    win_mtx.lockUncancelable(io);
+    defer win_mtx.unlock(io);
+    var free: ?usize = null;
+    for (&wins, 0..) |*w, i| {
+        if (w.len == 0) {
+            if (free == null) free = i;
+            continue;
+        }
+        if (std.mem.eql(u8, w.name[0..w.len], name)) {
+            w.tokens = tokens;
+            return;
+        }
+    }
+    const i = free orelse return; // table full: the models we did keep still answer
+    @memcpy(wins[i].name[0..name.len], name);
+    wins[i].len = name.len;
+    wins[i].tokens = tokens;
+}
+
+fn windowFromTable(io: std.Io, model: []const u8) ?u32 {
+    win_mtx.lockUncancelable(io);
+    defer win_mtx.unlock(io);
+    for (&wins) |*w| {
+        if (w.len == model.len and std.mem.eql(u8, w.name[0..w.len], model)) return w.tokens;
+    }
+    return null;
+}
+
+/// The context window (tokens) the Workers AI catalog states for `model`, or null when the catalog does not
+/// carry it. Reads the table filled by the last catalog fetch; on a miss it runs the (15-minute-cached) fetch
+/// once, so the first turn of a session pays one small API call instead of a whole conversation of folding.
+pub fn windowTokensFor(app: *App, uid: u64, model: []const u8) ?u32 {
+    if (!std.mem.startsWith(u8, model, "@cf/")) return null;
+    if (windowFromTable(app.io, model)) |w| return w;
+    var arena = std.heap.ArenaAllocator.init(app.gpa);
+    defer arena.deinit();
+    _ = modelsJson(app, uid, arena.allocator());
+    return windowFromTable(app.io, model);
+}
+
+test "windowTokensFor: the table remembers a model's window and answers only for it" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    // the table is process-global; use names no catalog will ever carry
+    rememberWindow(io, "@cf/test/window-probe-a", 1_310_720);
+    rememberWindow(io, "@cf/test/window-probe-b", 32_768);
+    rememberWindow(io, "@cf/test/window-probe-a", 1_000_000); // an update replaces, never duplicates
+    try std.testing.expectEqual(@as(?u32, 1_000_000), windowFromTable(io, "@cf/test/window-probe-a"));
+    try std.testing.expectEqual(@as(?u32, 32_768), windowFromTable(io, "@cf/test/window-probe-b"));
+    try std.testing.expect(windowFromTable(io, "@cf/test/window-probe-c") == null);
+    try std.testing.expect(windowFromTable(io, "@cf/test/window-probe-") == null); // prefix is not a match
+}
+
 fn modelsJson(app: *App, uid: u64, alloc: std.mem.Allocator) ?[]const u8 {
     const now = nowS(app.io);
     {

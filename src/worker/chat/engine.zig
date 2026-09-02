@@ -1934,6 +1934,20 @@ fn disarmLlmFrames() void {
     llm_frame_dir_len = 0;
 }
 
+/// The App of the turn running on this thread, for hooks that fire from inside llm.zig (which has no App).
+threadlocal var turn_app: ?*App = null;
+/// The coding model's catalog window for the turn on this thread (see workingBudgetBytes); the within-turn
+/// compaction reads it from here because the pass runs on the turn's thread.
+threadlocal var turn_win_hint: ?usize = null;
+
+/// llm.zig's retry ladder reports each wait here: "provider busy (HTTP 429): retrying in 20s (2/3)" lands
+/// as a status frame on the running turn, so the desk shows the pause and its reason instead of silence.
+fn llmRetryStatus(text: []const u8) void {
+    const app = turn_app orelse return;
+    if (llm_frame_dir_len == 0) return;
+    emitKV(app, llm_frame_dir[0..llm_frame_dir_len], "status", "text", text);
+}
+
 /// One LLM call, measured from the engine's side of the transport: wall time, this thread's token delta, and
 /// (streaming only) the moment the first delta landed. Taken before the call, closed out after it.
 const CallMeter = struct {
@@ -1999,7 +2013,7 @@ fn emitLlmFrame(app: *App, label: []const u8, role: Role, model: []const u8, ms:
     const gpa = app.gpa;
     var ev: std.ArrayListUnmanaged(u8) = .empty;
     defer ev.deinit(gpa);
-    renderLlmFrame(gpa, &ev, label, role, model, ms, fb_ms, streamed, tin, tout, ok, ts) catch return;
+    renderLlmFrame(gpa, &ev, label, role, model, ms, fb_ms, streamed, tin, tout, ok, ts, if (ok) "" else llm.lastError()) catch return;
     emitEvent(app, llm_frame_dir[0..llm_frame_dir_len], ev.items);
 }
 
@@ -2135,7 +2149,7 @@ test "every announced phase has a text, and the pulse never names a label it doe
 /// server, an App, or a turn. `model` is BYOK-supplied text and is JSON-escaped; role/label are engine-owned.
 /// `streamed` sits next to `fb_ms` on the wire because it is the qualifier ON fb_ms — read either alone and you
 /// read a number whose meaning you don't know.
-fn renderLlmFrame(gpa: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), label: []const u8, role: Role, model: []const u8, ms: u64, fb_ms: u64, streamed: bool, tin: u64, tout: u64, ok: bool, ts: i64) !void {
+fn renderLlmFrame(gpa: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), label: []const u8, role: Role, model: []const u8, ms: u64, fb_ms: u64, streamed: bool, tin: u64, tout: u64, ok: bool, ts: i64, err_text: []const u8) !void {
     try out.appendSlice(gpa, "{\"kind\":\"llm\",\"model\":");
     try http.jstr(gpa, out, model);
     try out.appendSlice(gpa, ",\"role\":");
@@ -2143,8 +2157,29 @@ fn renderLlmFrame(gpa: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), labe
     try out.appendSlice(gpa, ",\"label\":");
     try http.jstr(gpa, out, label);
     var b: [240]u8 = undefined;
-    const tail = try std.fmt.bufPrint(&b, ",\"ms\":{d},\"fb_ms\":{d},\"streamed\":{s},\"in\":{d},\"out\":{d},\"ok\":{s},\"ts\":{d}}}", .{ ms, fb_ms, if (streamed) "true" else "false", tin, tout, if (ok) "true" else "false", ts });
-    try out.appendSlice(gpa, tail);
+    const mid = try std.fmt.bufPrint(&b, ",\"ms\":{d},\"fb_ms\":{d},\"streamed\":{s},\"in\":{d},\"out\":{d},\"ok\":{s}", .{ ms, fb_ms, if (streamed) "true" else "false", tin, tout, if (ok) "true" else "false" });
+    try out.appendSlice(gpa, mid);
+    // A failed call names its reason (the head of the client's error) so a failure can be correlated with
+    // what ran before it from the events alone - see scripts/sim/failures.py.
+    if (!ok and err_text.len > 0) {
+        try out.appendSlice(gpa, ",\"err\":");
+        try http.jstr(gpa, out, err_text[0..@min(err_text.len, 160)]);
+    }
+    var b2: [48]u8 = undefined;
+    try out.appendSlice(gpa, try std.fmt.bufPrint(&b2, ",\"ts\":{d}}}", .{ts}));
+}
+
+test "a failed llm frame carries the error head; a good one carries no err field" {
+    const gpa = std.testing.allocator;
+    var o: std.ArrayListUnmanaged(u8) = .empty;
+    defer o.deinit(gpa);
+    try renderLlmFrame(gpa, &o, "loop", .prompting, "m", 2200, 2200, false, 0, 0, false, 9, "HTTP 429: rate limited");
+    try std.testing.expect(std.mem.indexOf(u8, o.items, ",\"ok\":false,\"err\":\"HTTP 429: rate limited\",\"ts\":9}") != null);
+    var g: std.ArrayListUnmanaged(u8) = .empty;
+    defer g.deinit(gpa);
+    try renderLlmFrame(gpa, &g, "loop", .prompting, "m", 1, 1, false, 0, 0, true, 9, "stale text is ignored when ok");
+    try std.testing.expect(std.mem.indexOf(u8, g.items, "\"err\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, g.items, ",\"ok\":true,\"ts\":9}") != null);
 }
 
 /// Run one full agentic turn for `conv` (already safeSeg'd, non-empty). Blocks the calling httpz worker thread
@@ -2327,6 +2362,14 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     defer disarmLlmFrames();
     pulseStart(app, conv_dir);
     defer pulseStop();
+    // The retry ladder in llm.zig reports each wait through this hook as a status frame on THIS turn.
+    llm.retry_notify = &llmRetryStatus;
+    turn_app = app;
+    defer turn_app = null;
+    // The coding model's real window when the Workers AI catalog states one - see workingBudgetBytes.
+    const win_hint: ?usize = if (cf_oauth.windowTokensFor(app, uid, trio.coding.model)) |w| @as(usize, w) else null;
+    turn_win_hint = win_hint;
+    defer turn_win_hint = null;
     trace_enabled = trace_req;
     defer trace_enabled = false;
     traceFrame(app, "worker.chat.engine", "runTurn", "enter", null, null);
@@ -3183,7 +3226,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
         // across steps. No-op on the first step (nothing past the assembled prefix yet).
         // Budget keyed on the CODING model + this turn's tool array: coding is what consumes conv_buf, and
         // the schemas ride in the same window. `think` here is only who WRITES the fold.
-        compactWorking(app, llm_dir, think.base_url, think.key, think.model, &conv_buf, assembled_len, &ctx, &tool_obs, workingBudgetBytes(trio.coding.base_url, trio.coding.model, assembled_len + turn_tools.len));
+        compactWorking(app, llm_dir, think.base_url, think.key, think.model, &conv_buf, assembled_len, &ctx, &tool_obs, workingBudgetBytes(trio.coding.base_url, trio.coding.model, assembled_len + turn_tools.len, win_hint));
 
         // PLAN STEP: when a plan is active, take the next pending subtask and inject it as this step's working turn
         // (so the agentic pass works THAT subtask, route-hinted). No plan → drive step 0 works the user's message
@@ -5237,7 +5280,7 @@ test "llm frame: the shared wire shape, parsed as a consumer would parse it" {
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(gpa);
-    try renderLlmFrame(gpa, &out, "chat", .coding, "kimi-k3", 18450, 1240, true, 92214, 1204, true, 1784165341);
+    try renderLlmFrame(gpa, &out, "chat", .coding, "kimi-k3", 18450, 1240, true, 92214, 1204, true, 1784165341, "");
 
     // events.jsonl is line-delimited JSON: emitEvent adds the newline, so the object itself must contain none.
     try std.testing.expect(std.mem.indexOfScalar(u8, out.items, '\n') == null);
@@ -5265,7 +5308,7 @@ test "llm frame: the shared wire shape, parsed as a consumer would parse it" {
     }) |c| {
         var o2: std.ArrayListUnmanaged(u8) = .empty;
         defer o2.deinit(gpa);
-        try renderLlmFrame(gpa, &o2, "plan", c.r, "m", 1, 1, false, 0, 0, true, 5);
+        try renderLlmFrame(gpa, &o2, "plan", c.r, "m", 1, 1, false, 0, 0, true, 5, "");
         const p2 = try std.json.parseFromSlice(Frame, gpa, o2.items, .{});
         defer p2.deinit();
         try std.testing.expectEqualStrings(c.name, p2.value.role);
@@ -5275,7 +5318,7 @@ test "llm frame: the shared wire shape, parsed as a consumer would parse it" {
     // returns no usage block, so its token counts are honestly zero rather than absent.
     var o3: std.ArrayListUnmanaged(u8) = .empty;
     defer o3.deinit(gpa);
-    try renderLlmFrame(gpa, &o3, "searchq", .prompting, "cheap-driver", 900, 900, false, 0, 0, false, 42);
+    try renderLlmFrame(gpa, &o3, "searchq", .prompting, "cheap-driver", 900, 900, false, 0, 0, false, 42, "");
     const p3 = try std.json.parseFromSlice(Frame, gpa, o3.items, .{});
     defer p3.deinit();
     try std.testing.expectEqual(@as(?bool, false), p3.value.ok);
@@ -5292,7 +5335,7 @@ test "llm frame: the shared wire shape, parsed as a consumer would parse it" {
     // would end the string early and corrupt every reader of the whole file from that byte on.
     var o4: std.ArrayListUnmanaged(u8) = .empty;
     defer o4.deinit(gpa);
-    try renderLlmFrame(gpa, &o4, "loop", .prompting, "we\"ird\\model\nname", 3, 3, false, 1, 2, true, 7);
+    try renderLlmFrame(gpa, &o4, "loop", .prompting, "we\"ird\\model\nname", 3, 3, false, 1, 2, true, 7, "");
     const p4 = try std.json.parseFromSlice(Frame, gpa, o4.items, .{});
     defer p4.deinit();
     try std.testing.expectEqualStrings("we\"ird\\model\nname", p4.value.model);
@@ -7773,10 +7816,12 @@ test "the live served window is read for the built-in engine and for nothing els
     try std.testing.expect(servingWindowTokens("https://api.anthropic.com/v1") == null);
     try std.testing.expect(servingWindowTokens("") == null);
 
-    // and the budget itself: a BYOK model keeps WORKING_COMPACT_BYTES exactly, live window or not
-    try std.testing.expectEqual(cctx.WORKING_COMPACT_BYTES, workingBudgetBytes("https://api.anthropic.com/v1", "claude-opus-4-8", 20_000));
+    // and the budget itself: a BYOK model is sized from its OWN window, live window or not - never below the
+    // stock 24 KB and never above the span cap (a 200k model lands on the cap)
+    const byok = workingBudgetBytes("https://api.anthropic.com/v1", "claude-opus-4-8", 20_000, null);
+    try std.testing.expect(byok >= cctx.WORKING_COMPACT_BYTES and byok <= WORKING_SPAN_MAX_BYTES);
     // while the built-in, told the truth about a 9216-token window, tightens below it
-    try std.testing.expect(workingBudgetBytes("http://127.0.0.1:8791/builtin/v1", "the-veil-12b", 20_000) < cctx.WORKING_COMPACT_BYTES);
+    try std.testing.expect(workingBudgetBytes("http://127.0.0.1:8791/builtin/v1", "the-veil-12b", 20_000, null) < cctx.WORKING_COMPACT_BYTES);
 }
 /// Floor for the scaled recency window. Below this a turn cannot see its own immediate past — the last question
 /// and its answer — and the model re-asks what it just resolved, so shrinking past it trades one context failure
@@ -7847,10 +7892,20 @@ fn warnIfPromptCannotFit(base_url: []const u8, model: []const u8, tools_bytes: u
     });
 }
 
-fn workingBudgetBytes(base_url: []const u8, model: []const u8, fixed_bytes: usize) usize {
+/// The most working span a turn carries before compaction folds it, however roomy the window. 96 KB is ~30k
+/// tokens: a dozen tool results between folds instead of one, at a prompt cost the window can afford, against
+/// a compaction that costs a full auxiliary call. Measured before this existed (C1, 2026-09-02): the budget
+/// was a flat 24 KB on a 1.3M-token model, compaction fired after a median of ONE chat call, and the 67
+/// compactions were 71% of the run's model time - most of them re-summarising the previous note.
+const WORKING_SPAN_MAX_BYTES: usize = 96 * 1024;
+
+/// `win_hint` is the model's window in tokens when something authoritative states it - the Workers AI
+/// catalog's context_window (cf_oauth.windowTokensFor) - and null to fall back to the id heuristic, which
+/// read "flash" as a small model and gave deepseek-v4-flash 32k against the catalog's 1,310,720.
+fn workingBudgetBytes(base_url: []const u8, model: []const u8, fixed_bytes: usize, win_hint: ?usize) usize {
     const local = std.mem.indexOf(u8, base_url, "127.0.0.1") != null or
         std.mem.indexOf(u8, base_url, "localhost") != null;
-    const win_tokens: usize = servingWindowTokens(base_url) orelse
+    const win_tokens: usize = servingWindowTokens(base_url) orelse win_hint orelse
         @as(usize, modelcfg.senseModel(model, local).ctx_k) * 1024;
     // 3 bytes/token is deliberately pessimistic: measured 3.5 on this corpus (5577 tokens for 19639 bytes),
     // and under-estimating the window is the safe direction — it folds early rather than overflowing.
@@ -7858,7 +7913,8 @@ fn workingBudgetBytes(base_url: []const u8, model: []const u8, fixed_bytes: usiz
     const reserve = @as(usize, turnOutputReserveBytes) + fixed_bytes;
     if (win_bytes <= reserve) return WORKING_MIN_BUDGET_BYTES;
     const available = win_bytes - reserve;
-    if (available >= WORKING_HARD_FOLD_BYTES) return cctx.WORKING_COMPACT_BYTES; // roomy: today's behaviour
+    // roomy: a third of what is free, never below the stock 24 KB and never above the span cap
+    if (available >= WORKING_HARD_FOLD_BYTES) return std.math.clamp(available / 3, cctx.WORKING_COMPACT_BYTES, WORKING_SPAN_MAX_BYTES);
     return @max(WORKING_MIN_BUDGET_BYTES, @min(cctx.WORKING_COMPACT_BYTES, available));
 }
 
@@ -8763,7 +8819,7 @@ fn runInnerAgentic(
         if (iter_refused) loop_refusals +|= 1 else if (iter_executed) loop_refusals = 0;
         // WITHIN-TURN COMPACTION (step boundary): if this pass's working growth has crossed the budget, compress it
         // into a progress note so a long/afk turn can keep going without overflowing the model window.
-        compactWorking(app, run_root, think.base_url, think.key, think.model, conv_buf, base_len, ctx, tool_obs, workingBudgetBytes(base_url, model, base_len + turn_tools.len));
+        compactWorking(app, run_root, think.base_url, think.key, think.model, conv_buf, base_len, ctx, tool_obs, workingBudgetBytes(base_url, model, base_len + turn_tools.len, turn_win_hint));
         // GROUND-TRUTH CONFLICT SPLICE — after compaction (never folded into a summary), before any steer
         // (the user's live instruction stays last, i.e. most salient).
         if (post_note.items.len > 0)
@@ -10966,18 +11022,25 @@ test "the working budget tightens for a small window and leaves a roomy one alon
     const t = std.testing;
     // ROOMY: a large-window model must behave byte-identically to before this existed. Only a window too
     // small for the stock constants is allowed to change anything.
-    try t.expectEqual(cctx.WORKING_COMPACT_BYTES, workingBudgetBytes("https://api.example.com", "deepseek-v4-pro", 8 * 1024));
+    const roomy = workingBudgetBytes("https://api.example.com", "deepseek-v4-pro", 8 * 1024, null);
+    try t.expect(roomy >= cctx.WORKING_COMPACT_BYTES and roomy <= WORKING_SPAN_MAX_BYTES);
+    // THE CATALOG WINS OVER THE ID: without it, "flash" reads as a 32k model and the span stays near the stock
+    // 24 KB; with the catalog's 1.3M tokens the span rises to the cap.
+    const cf = "https://api.cloudflare.com/client/v4/accounts/x/ai/v1";
+    const guessed = workingBudgetBytes(cf, "@cf/deepseek-ai/deepseek-v4-flash-0731", 40 * 1024, null);
+    try t.expect(guessed < 32 * 1024);
+    try t.expectEqual(WORKING_SPAN_MAX_BYTES, workingBudgetBytes(cf, "@cf/deepseek-ai/deepseek-v4-flash-0731", 40 * 1024, 1_310_720));
 
     // TIGHT: the built-in 12B serves 8192 tokens. Its fixed prefix in a real turn (conv c6a6e014f) was
     // ~19 KB -- ~6 KB of system blocks plus a 13 KB 20-tool schema array -- which together with the answer
     // reserve already exceeds the window. The budget must collapse to the floor instead of sitting at 24 KB,
     // which is what let the span grow past the window before compaction could ever trigger.
-    const tight = workingBudgetBytes("http://127.0.0.1:11434", "the-veil-12b", 19 * 1024);
+    const tight = workingBudgetBytes("http://127.0.0.1:11434", "the-veil-12b", 19 * 1024, null);
     try t.expect(tight < cctx.WORKING_COMPACT_BYTES);
     try t.expectEqual(WORKING_MIN_BUDGET_BYTES, tight);
     // Never zero however hostile the input -- a zero budget folds every round and the model spends the turn
     // re-reading what the previous fold deleted.
-    try t.expect(workingBudgetBytes("http://127.0.0.1:11434", "the-veil-12b", 10 * 1024 * 1024) > 0);
+    try t.expect(workingBudgetBytes("http://127.0.0.1:11434", "the-veil-12b", 10 * 1024 * 1024, null) > 0);
     // A fold on a tightened budget must actually SHRINK the span: the kept tail has to be under the trigger.
     // At the stock 24 KB trigger / 32 KB tail it is not, which is affordable only when the window dwarfs both.
     try t.expect(@max(2 * 1024, tight / 2) < tight);

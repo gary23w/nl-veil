@@ -17,7 +17,102 @@ const dataset = @import("dataset.zig"); // training-set capture — inert unless
 pub const Reply = struct {
     content: []u8,
     ok: bool,
+    /// The HTTP status of the reply (0 when the transport never got one). Carried so a 429 or a 5xx is
+    /// named as such instead of surfacing as whatever the error body happened to parse as.
+    status: u16 = 0,
 };
+
+/// A status frame per retry wait, when the engine registers one: the desk then shows "provider busy (HTTP
+/// 429): retrying in 20s (2/3)" instead of a silent pause. llm.zig has no conversation of its own.
+pub var retry_notify: ?*const fn (text: []const u8) void = null;
+
+fn notify(text: []const u8) void {
+    if (retry_notify) |f| f(text);
+}
+
+/// The head of the last error this thread's client produced, for the llm frame of a failed call. The frame
+/// carried only ok=false, and a desk-hosted server has no captured stderr, so a swallowed auxiliary failure
+/// (a loop verdict that came back in 2 s with nothing) left no reason anywhere. Each entry point clears it.
+threadlocal var last_err_buf: [160]u8 = undefined;
+threadlocal var last_err_len: usize = 0;
+
+fn noteErr(msg: []const u8) void {
+    const n = @min(msg.len, last_err_buf.len);
+    @memcpy(last_err_buf[0..n], msg[0..n]);
+    last_err_len = n;
+}
+
+pub fn lastError() []const u8 {
+    return last_err_buf[0..last_err_len];
+}
+
+pub fn clearLastError() void {
+    last_err_len = 0;
+}
+
+/// The waits between transient-failure retries, in seconds: three tries, a minute in all. A rate limit that
+/// outlasts this is reported; the turn then continues or ends as it did before.
+const RETRY_WAITS_S = [_]u64{ 10, 20, 30 };
+
+/// The body and status curl appended as "\n__VEILSTAT__<code>": the body's length and the code (0 if absent).
+fn splitStat(content: []const u8) struct { body_len: usize, code: u16 } {
+    const at = std.mem.lastIndexOf(u8, content, STREAM_STAT) orelse return .{ .body_len = content.len, .code = 0 };
+    const digits = content[at + STREAM_STAT.len ..];
+    var end: usize = 0;
+    while (end < digits.len and std.ascii.isDigit(digits[end])) end += 1;
+    if (end == 0) return .{ .body_len = content.len, .code = 0 };
+    return .{ .body_len = at, .code = std.fmt.parseInt(u16, digits[0..end], 10) catch 0 };
+}
+
+/// The first line of an error, clipped, for a status frame.
+fn shortErr(msg: []const u8) []const u8 {
+    const nl = std.mem.indexOfAny(u8, msg, "\r\n") orelse msg.len;
+    return msg[0..@min(nl, 72)];
+}
+
+/// Workers AI's OpenAI-compatible endpoint, where `chat_template_kwargs.thinking=false` is honoured.
+fn isWorkersAi(base_url: []const u8) bool {
+    return std.mem.indexOf(u8, base_url, "api.cloudflare.com") != null and std.mem.indexOf(u8, base_url, "/ai/") != null;
+}
+
+/// THINKING OFF FOR THE AUXILIARY CALLS. On deepseek-v4-flash through Workers AI, a compaction note capped at
+/// 3k tokens cost a median 8,192 output tokens and 78 seconds - the model reasoned for minutes to write a
+/// summary - and 67 such calls were 71% of one C1 run's model time. Probed 2026-09-02 on the account:
+/// `chat_template_kwargs: {"thinking": false}` yields zero reasoning characters and an intact answer (71
+/// completion tokens instead of 173, 1.6 s instead of 2.6 s); `reasoning_effort` and `thinking.type` change
+/// nothing. The chat turn keeps its reasoning; so do the plan and the survey before it, which are one call a
+/// turn and benefit from it. Everything else - compaction, verdict, handoff, memory checks, summaries - is
+/// a bounded distillation job that does not.
+fn thinkingOffFor(tag: []const u8, base_url: []const u8) bool {
+    if (!isWorkersAi(base_url)) return false;
+    return !(std.mem.eql(u8, tag, "chat") or std.mem.eql(u8, tag, "plan") or std.mem.eql(u8, tag, "recon"));
+}
+
+const THINK_OFF_FRAG = ",\"chat_template_kwargs\":{\"thinking\":false}";
+
+test "splitStat: the status suffix is peeled off the body, and a body without one is whole" {
+    const a = splitStat("{\"choices\":[]}\n__VEILSTAT__429");
+    try std.testing.expectEqual(@as(u16, 429), a.code);
+    try std.testing.expectEqual(@as(usize, 14), a.body_len);
+    const b = splitStat("{\"choices\":[]}");
+    try std.testing.expectEqual(@as(u16, 0), b.code);
+    try std.testing.expectEqual(@as(usize, 14), b.body_len);
+    const c = splitStat("\n__VEILSTAT__200");
+    try std.testing.expectEqual(@as(u16, 200), c.code);
+    try std.testing.expectEqual(@as(usize, 0), c.body_len);
+}
+
+test "thinkingOffFor: auxiliary tags on Workers AI only; the chat, plan and recon keep their reasoning" {
+    const cf = "https://api.cloudflare.com/client/v4/accounts/abc/ai/v1";
+    try std.testing.expect(thinkingOffFor("compact", cf));
+    try std.testing.expect(thinkingOffFor("loop", cf));
+    try std.testing.expect(thinkingOffFor("memverify", cf));
+    try std.testing.expect(!thinkingOffFor("chat", cf));
+    try std.testing.expect(!thinkingOffFor("plan", cf));
+    try std.testing.expect(!thinkingOffFor("recon", cf));
+    try std.testing.expect(!thinkingOffFor("compact", "https://api.deepseek.com/v1"));
+    try std.testing.expect(!thinkingOffFor("compact", "http://127.0.0.1:11434/v1"));
+}
 
 /// PROCESS-WIDE TOKEN METER. The provider reports exact prompt/completion token counts in every response's
 /// `usage` block; we fold them in at the single call choke-point (completeBody) for REAL per-round/run cost.
@@ -459,14 +554,25 @@ fn postUrl(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const
     // change exists to save — it would reintroduce the 90s wall under a different name. Idle detection is only
     // meaningful where bytes flow continuously, i.e. the streamed path (streamAttempt), where it IS armed.
     if (!local) av.appendSlice(gpa, &.{ "--retry", "1", "--retry-delay", "1", "--retry-connrefused", "--retry-all-errors", "--retry-max-time", "3" }) catch return oom(gpa);
-    av.appendSlice(gpa, &.{ "-K", cfgpath, "--data-binary", data_at, url }) catch return oom(gpa);
+    av.appendSlice(gpa, &.{ "-K", cfgpath, "--data-binary", data_at, "-w", STREAM_STAT ++ "%{http_code}", url }) catch return oom(gpa);
     const run = std.process.run(gpa, io, .{ .argv = av.items, .stdout_limit = .limited(8 << 20) }) catch return err(gpa, "curl failed to run");
     defer gpa.free(run.stderr);
     if (run.term != .exited or run.term.exited != 0) {
         defer gpa.free(run.stdout);
         return err(gpa, std.fmt.allocPrint(gpa, "curl exit: {s}", .{run.stderr[0..@min(run.stderr.len, 200)]}) catch "curl nonzero exit");
     }
-    return .{ .content = run.stdout, .ok = true };
+    // THE STATUS IS PART OF THE ANSWER. Without it a 429 reached the engine as its error body - on Workers AI
+    // an envelope with no `choices`, reported as "no choices in LLM response" - and nothing backed off: the
+    // next call two seconds later failed the same way and the turn died. Now a 4xx/5xx is named, and a
+    // 429/503 puts the host into the cooldown every turn observes (rate.acquire) before anyone retries.
+    const stat = splitStat(run.stdout);
+    if (stat.code >= 400) {
+        defer gpa.free(run.stdout);
+        if (stat.code == 429 or stat.code == 503 or stat.code == 529) rate.note429(io, url, 0);
+        return .{ .content = std.fmt.allocPrint(gpa, "HTTP {d}: {s}", .{ stat.code, run.stdout[0..@min(stat.body_len, 300)] }) catch @constCast("HTTP error"), .ok = false, .status = stat.code };
+    }
+    const trimmed = if (stat.body_len < run.stdout.len) (gpa.realloc(run.stdout, stat.body_len) catch run.stdout[0..stat.body_len]) else run.stdout;
+    return .{ .content = trimmed, .ok = true, .status = stat.code };
 }
 
 /// One-shot system+user completion → the assistant text. Uses the backend's default sampling.
@@ -478,6 +584,7 @@ pub fn chat(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []cons
 /// The mechanical classifiers (the emotional-flare read, the constitution screens) pass 0 so their verdicts
 /// are DETERMINISTIC: the same hive state yields the same label instead of resampling a fresh emotion.
 pub fn chatTemp(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const u8, base_url: []const u8, key: []const u8, model: []const u8, system: []const u8, user: []const u8, max_tokens: u32, temperature: f32) Reply {
+    clearLastError();
     var msgs: std.ArrayListUnmanaged(u8) = .empty;
     defer msgs.deinit(gpa);
     msgs.appendSlice(gpa, "{\"role\":\"system\",\"content\":") catch return oom(gpa);
@@ -488,7 +595,8 @@ pub fn chatTemp(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []
     const mt = effTokens(io, base_url, model, max_tokens);
     const temp_frag = tempFragOwned(gpa, io, model, temperature); // learned-quirk aware (Kimi temp=1, etc.)
     defer gpa.free(temp_frag);
-    const body = std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}]{s},\"max_tokens\":{d}}}", .{ model, msgs.items, temp_frag, mt }) catch return oom(gpa);
+    const think_frag: []const u8 = if (thinkingOffFor(tag, base_url)) THINK_OFF_FRAG else "";
+    const body = std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}]{s}{s},\"max_tokens\":{d}}}", .{ model, msgs.items, temp_frag, think_frag, mt }) catch return oom(gpa);
     defer gpa.free(body);
     var s = completeBody(gpa, io, run_dir, tag, base_url, key, model, body, mt);
     defer s.deinit(gpa);
@@ -528,10 +636,12 @@ pub fn visionExtract(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, ta
 /// The agentic step: `messages_json` is the inside of "messages":[ … ] (caller-built, grows each turn);
 /// `tools_json` is the inside of "tools":[ … ]. Returns the assistant content OR parsed tool_calls.
 pub fn complete(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const u8, base_url: []const u8, key: []const u8, model: []const u8, messages_json: []const u8, tools_json: []const u8, max_tokens: u32, temperature: f32) Step {
+    clearLastError();
     if (isOllama(base_url)) return completeOllamaNative(gpa, io, run_dir, tag, base_url, key, model, messages_json, tools_json, max_tokens, temperature);
     const mt = effTokens(io, base_url, model, max_tokens);
     const temp_frag = tempFragOwned(gpa, io, model, temperature); // learned-quirk aware (Kimi temp=1, etc.)
     defer gpa.free(temp_frag);
+    const think_frag: []const u8 = if (thinkingOffFor(tag, base_url)) THINK_OFF_FRAG else "";
     // Learned-quirk pre-echo (the effTemp analog for the reasoning echo): once a model has demanded the
     // echo, every request pre-splices "" into any bare assistant turn BEFORE dispatch — no failed
     // round-trip, at every call site. Callers holding real reasoning text have already echoed it
@@ -544,9 +654,9 @@ pub fn complete(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []
     };
     defer if (msgs_eff.ptr != messages_json.ptr) gpa.free(@constCast(msgs_eff));
     const body = if (tools_json.len > 0)
-        std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"tools\":[{s}]{s},\"max_tokens\":{d}}}", .{ model, msgs_eff, tools_json, temp_frag, mt }) catch return stepErr(gpa, "oom")
+        std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"tools\":[{s}]{s}{s},\"max_tokens\":{d}}}", .{ model, msgs_eff, tools_json, temp_frag, think_frag, mt }) catch return stepErr(gpa, "oom")
     else
-        std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}]{s},\"max_tokens\":{d}}}", .{ model, msgs_eff, temp_frag, mt }) catch return stepErr(gpa, "oom");
+        std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}]{s}{s},\"max_tokens\":{d}}}", .{ model, msgs_eff, temp_frag, think_frag, mt }) catch return stepErr(gpa, "oom");
     defer gpa.free(body);
     var step = completeBody(gpa, io, run_dir, tag, base_url, key, model, body, mt);
     // MALFORMED-BODY RECOVERY: the provider rejected our REQUEST as invalid JSON — a conversation turn was
@@ -559,9 +669,9 @@ pub fn complete(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []
         if (safe.len > 0 and safe.len < msgs_eff.len) {
             dumpMalformed(io, run_dir, tag, msgs_eff, safe.len);
             const body2 = if (tools_json.len > 0)
-                std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"tools\":[{s}]{s},\"max_tokens\":{d}}}", .{ model, safe, tools_json, temp_frag, mt }) catch return step
+                std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"tools\":[{s}]{s}{s},\"max_tokens\":{d}}}", .{ model, safe, tools_json, temp_frag, think_frag, mt }) catch return step
             else
-                std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}]{s},\"max_tokens\":{d}}}", .{ model, safe, temp_frag, mt }) catch return step;
+                std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}]{s}{s},\"max_tokens\":{d}}}", .{ model, safe, temp_frag, think_frag, mt }) catch return step;
             defer gpa.free(body2);
             std.log.warn("llm[{s}/{s}] MALFORMED request body healed: {d} -> {d} msg bytes (dropped a corrupt turn)", .{ tag, model, msgs_eff.len, safe.len });
             var step2 = completeBody(gpa, io, run_dir, tag, base_url, key, model, body2, mt);
@@ -578,15 +688,25 @@ pub fn complete(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []
     // of its answer, and the whole turn's context had to be paid again to redo it. One retry after a short
     // pause is the cheapest insurance there is — it fires only on a failure, never on the healthy path, and
     // the streamed chat path reaches it too (streamAttempt falls back to complete on a broken stream).
-    if (!step.ok and isTransientLlmError(step.content)) {
-        std.log.warn("llm[{s}/{s}] transient provider failure ({s}) — retrying once", .{ tag, model, step.content[0..@min(step.content.len, 80)] });
-        io.sleep(.{ .nanoseconds = 1500 * std.time.ns_per_ms }, .awake) catch {};
-        var again = completeBody(gpa, io, run_dir, tag, base_url, key, model, body, mt);
+    // THE LADDER: 10, 20, 30 seconds. A single 1.5 s retry was no match for a rate limit that had just tripped
+    // (C1, 2026-09-02: three compaction calls failed after minutes of work and the next chat call failed two
+    // seconds later, three times, each one ending the turn). Each wait is announced as a status frame, and a
+    // 429 has already cooled the host down for every other turn (postUrl -> rate.note429).
+    var attempt: usize = 0;
+    while (!step.ok and attempt < RETRY_WAITS_S.len and isTransientLlmError(step.content)) : (attempt += 1) {
+        const wait_s = RETRY_WAITS_S[attempt];
+        var nb: [240]u8 = undefined;
+        const note = std.fmt.bufPrint(&nb, "provider busy ({s}): retrying in {d}s ({d}/{d})", .{ shortErr(step.content), wait_s, attempt + 1, RETRY_WAITS_S.len }) catch "provider busy: retrying";
+        std.log.warn("llm[{s}/{s}] {s}", .{ tag, model, note });
+        notify(note);
+        io.sleep(.{ .nanoseconds = wait_s * std.time.ns_per_s }, .awake) catch {};
+        const again = completeBody(gpa, io, run_dir, tag, base_url, key, model, body, mt);
         if (again.ok) {
             step.deinit(gpa);
             return again;
         }
-        again.deinit(gpa);
+        step.deinit(gpa);
+        step = again;
     }
     return step;
 }
@@ -655,8 +775,8 @@ test "lastTopLevelJson: a curl --retry pair yields the retry's answer, a lone bo
 /// capacity complaint, or the transport dropped. A 4xx about the REQUEST (bad model, bad key, malformed
 /// body) is deliberately not on this list — repeating it would only repeat the answer.
 fn isTransientLlmError(msg: []const u8) bool {
-    const needles = [_][]const u8{ "no choices in LLM response", "bad LLM response", "could not route", "curl exit", "429", "rate limit", "rate_limit", "ratelimit", "overloaded", "capacity", "temporar", "try again", "502", "503", "504", "timed out", "timeout", "Too Many Requests", "server error", "internal error", "upstream" };
-    for (needles) |n| if (std.mem.indexOf(u8, msg, n) != null) return true;
+    const needles = [_][]const u8{ "no choices in LLM response", "bad LLM response", "could not route", "curl exit", "429", "rate limit", "rate_limit", "ratelimit", "rate-limit", "overloaded", "capacity", "temporar", "try again", "HTTP 5", "502", "503", "504", "too many", "timed out", "timeout", "Too Many Requests", "server error", "internal error", "upstream" };
+    for (needles) |n| if (std.ascii.indexOfIgnoreCase(msg, n) != null) return true;
     return false;
 }
 
@@ -664,6 +784,10 @@ test "isTransientLlmError: provider hiccups retry, request errors do not" {
     try std.testing.expect(isTransientLlmError("no choices in LLM response"));
     try std.testing.expect(isTransientLlmError("provider error: 429 Too Many Requests"));
     try std.testing.expect(isTransientLlmError("curl exit: (56) Recv failure"));
+    try std.testing.expect(isTransientLlmError("HTTP 429: {\"success\":false,\"errors\":[{\"code\":3040,\"message\":\"rate limited\"}]}"));
+    try std.testing.expect(isTransientLlmError("HTTP 503: upstream unavailable"));
+    try std.testing.expect(isTransientLlmError("provider error 3040: Too many requests"));
+    try std.testing.expect(!isTransientLlmError("HTTP 400: {\"errors\":[{\"code\":5006,\"message\":\"invalid parameter\"}]}"));
     try std.testing.expect(!isTransientLlmError("provider error: Authentication Fails, Your api key: ****546c is invalid"));
     try std.testing.expect(!isTransientLlmError("provider error: model not found"));
 }
@@ -2020,6 +2144,9 @@ fn completeBodyH(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: [
             prompt_tokens_details: ?struct { cached_tokens: u64 = 0 } = null,
         } = null,
         @"error": ?struct { message: []const u8 = "" } = null,
+        // Cloudflare's envelope: {"success":false,"errors":[{"code":N,"message":"..."}]} - no `error`, no
+        // `choices`, and until now reported as "no choices in LLM response".
+        errors: ?[]const struct { code: i64 = 0, message: []const u8 = "" } = null,
     };
     const parsed = std.json.parseFromSlice(Resp, gpa, lastTopLevelJson(r.content), .{ .ignore_unknown_fields = true }) catch
         return stepErr(gpa, std.fmt.allocPrint(gpa, "bad LLM response: {s}", .{r.content[0..@min(r.content.len, 300)]}) catch "unparseable response");
@@ -2060,6 +2187,9 @@ fn completeBodyH(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: [
         }
         return stepErr(gpa, std.fmt.allocPrint(gpa, "provider error: {s}", .{e.message}) catch "provider error");
     }
+    if (parsed.value.errors) |es| if (es.len > 0) {
+        return stepErr(gpa, std.fmt.allocPrint(gpa, "provider error {d}: {s}", .{ es[0].code, es[0].message[0..@min(es[0].message.len, 200)] }) catch "provider error");
+    };
     if (parsed.value.choices.len == 0) return stepErr(gpa, "no choices in LLM response");
     const msg = parsed.value.choices[0].message;
 
@@ -3036,9 +3166,11 @@ fn oom(gpa: std.mem.Allocator) Reply {
     return .{ .content = gpa.dupe(u8, "out of memory") catch @constCast("oom"), .ok = false };
 }
 fn err(gpa: std.mem.Allocator, msg: []const u8) Reply {
+    noteErr(msg);
     return .{ .content = gpa.dupe(u8, msg) catch @constCast("error"), .ok = false };
 }
 fn stepErr(gpa: std.mem.Allocator, msg: []const u8) Step {
+    noteErr(msg);
     return .{ .content = gpa.dupe(u8, msg) catch @constCast("error"), .reasoning = gpa.dupe(u8, "") catch @constCast(""), .calls = &.{}, .ok = false };
 }
 
