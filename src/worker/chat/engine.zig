@@ -3592,7 +3592,10 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
             if (trimmed.len == 0) break :ground;
             const facts_text: ?[]u8 = factsLedgerText(app, workdir);
             defer if (facts_text) |f| gpa.free(f);
-            const worked_before = facts_text != null or std.mem.indexOf(u8, conv_buf.items, "\"role\":\"tool\"") != null;
+            // the file ledger (loaded per conversation, bootstrapped from the workdir) is the durable signal: the
+            // assembled history carries user and assistant turns only, so at the start of a turn it shows no tool
+            // (ledger run J: the state questions went unnudged for exactly that reason)
+            const worked_before = facts_text != null or file_ledger.files.items.len > 0 or std.mem.indexOf(u8, conv_buf.items, "\"role\":\"tool\"") != null;
             if (!worked_before) break :ground;
             const stray = ungroundedNumber(trimmed, goal_text, tool_obs.items, facts_text orelse "");
             if (stray == null and !asksAboutNow(goal_text)) break :ground;
