@@ -1363,11 +1363,12 @@ pub const Poller = struct {
         const on = std.mem.indexOf(u8, resp.body, "\"on\":true") != null;
         const admin = std.mem.indexOf(u8, resp.body, "\"admin\":true") != null;
         const access = std.mem.indexOf(u8, resp.body, "\"access\":true") != null;
+        const published = std.mem.indexOf(u8, resp.body, "\"published\":true") != null;
         const use_domain = std.mem.indexOf(u8, resp.body, "\"use_domain\":true") != null;
         var hb: [128]u8 = undefined;
         const want_host = valueForKey(resp.body, "want_hostname", &hb);
         const live = std.mem.eql(u8, state, "live");
-        const busy = std.mem.eql(u8, state, "installing") or std.mem.eql(u8, state, "provisioning") or std.mem.eql(u8, state, "starting");
+        const busy = std.mem.eql(u8, state, "installing") or std.mem.eql(u8, state, "provisioning") or std.mem.eql(u8, state, "starting") or std.mem.eql(u8, state, "publishing");
         var went_live = false;
         var failed = false;
         {
@@ -1382,6 +1383,7 @@ pub const Poller = struct {
             self.store.cf_tun_busy = busy;
             self.store.cf_tun_admin = admin;
             self.store.cf_tun_access = access;
+            self.store.cf_tun_published = published;
             self.store.cf_tun_use_domain = use_domain;
             const hn = @min(want_host.len, self.store.cf_tun_want_host.len);
             @memcpy(self.store.cf_tun_want_host[0..hn], want_host[0..hn]);

@@ -883,6 +883,7 @@ pub const Store = struct {
     cf_tun_busy: bool = false,
     cf_tun_admin: bool = false,
     cf_tun_access: bool = false,
+    cf_tun_published: bool = false,
     cf_tun_use_domain: bool = false,
     cf_tun_want_host: [128]u8 = undefined,
     cf_tun_want_host_len: usize = 0,

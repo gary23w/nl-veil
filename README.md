@@ -141,6 +141,11 @@ this server; the URL lands in the box (Copy / Open), the desk shows the same row
 survives a restart. On a headless box, `NL_TUNNEL=1` (or `veil --tunnel`) turns it on at boot and the URL is
 printed in the log when the connector registers.
 
+The URL appears only once Cloudflare's own resolver has published it, usually within ten seconds of the
+connector registering. That short wait is deliberate: a lookup made before the name exists leaves it
+unresolvable on that network for half an hour (the domain's negative-cache TTL), so nothing on your machine,
+not even the status poll, gets to ask first.
+
 Tick **use my domain** and it becomes a named tunnel **through your own account** instead: created on the
 account, pointed at this server, given the hostname you typed on one of your domains (or `veil.<your first
 domain>`), and put behind a **Cloudflare Access** policy that admits only your own email when your account has

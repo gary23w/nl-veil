@@ -3053,6 +3053,7 @@ fn drawCfTunnelRows(store: *Store, x: f32, y0: f32, colw: f32) f32 {
     var busy = false;
     var admin = false;
     var access = false;
+    var published = false;
     var sb: [24]u8 = undefined;
     var sn: usize = 0;
     var ub: [200]u8 = undefined;
@@ -3071,6 +3072,7 @@ fn drawCfTunnelRows(store: *Store, x: f32, y0: f32, colw: f32) f32 {
         busy = store.cf_tun_busy;
         admin = store.cf_tun_admin;
         access = store.cf_tun_access;
+        published = store.cf_tun_published;
         use_domain = store.cf_tun_use_domain;
         whn = @min(store.cf_tun_want_host_len, whb.len);
         @memcpy(whb[0..whn], store.cf_tun_want_host[0..whn]);
@@ -3112,6 +3114,8 @@ fn drawCfTunnelRows(store: *Store, x: f32, y0: f32, colw: f32) f32 {
         t.z("live - a confidential address only you are shown; your veil login is the gate", .{})
     else if (live)
         t.z("live - protected by your veil login", .{})
+    else if (busy and std.mem.eql(u8, sb[0..sn], "publishing"))
+        t.z("registered - waiting for Cloudflare to publish the address (a few seconds)...", .{})
     else if (busy)
         t.z("{s}...", .{sb[0..sn]})
     else if (en > 0)
@@ -3150,6 +3154,10 @@ fn drawCfTunnelRows(store: *Store, x: f32, y0: f32, colw: f32) f32 {
         store.pushCmd(store_mod.mkCmd(.open_url, "", ub[0..un]));
     }
     y += t.FIELD_H + 8;
+    if (live and !published) {
+        t.textClip(t.z("Cloudflare's resolver has not published this address yet - give it a minute before opening it", .{}), @intFromFloat(x), @intFromFloat(y), 11, t.orange, @intFromFloat(colw));
+        y += 16;
+    }
     return y;
 }
 

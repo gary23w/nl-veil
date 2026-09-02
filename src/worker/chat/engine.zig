@@ -1841,6 +1841,7 @@ fn signalDone(app: *App, uid: u64, conv: []const u8) void {
 
 /// Append `obj` (a complete, already-escaped single-line JSON object) as one line to events.jsonl.
 fn emitEvent(app: *App, conv_dir: []const u8, obj: []const u8) void {
+    if (turn_pulse) |p| p.last_ms.store(nowMillis(app.io), .release);
     const gpa = app.gpa;
     const path = std.fmt.allocPrint(gpa, "{s}/events.jsonl", .{conv_dir}) catch return;
     defer gpa.free(path);
@@ -1961,6 +1962,7 @@ fn meterBegin(io: std.Io) CallMeter {
 /// streaming site is true only when deltas really landed: llm.completeStream silently falls back to a blocking
 /// complete() on any streaming trouble, and a hardcoded `true` at that site would then be a lie.
 fn meterEnd(app: *App, m: CallMeter, label: []const u8, role: Role, model: []const u8, ok: bool) void {
+    if (turn_pulse) |p| p.phase.store(PHASE_NONE, .release); // the announced call is over
     const r = meterReport(m, nowMillis(app.io));
     const t1 = llm.tokensSnapshot();
     emitLlmFrame(
@@ -2008,31 +2010,125 @@ fn emitLlmFrame(app: *App, label: []const u8, role: Role, model: []const u8, ms:
 /// stalls mid-thought, then resumes": the engine was never stalled, it was in one of these. Writes through the
 /// same thread-local conv dir the `llm` frames use, so it needs no plumbing at the call sites; a label that
 /// has no phrase here emits nothing.
-fn announcePhase(app: *App, label: []const u8) void {
-    if (llm_frame_dir_len == 0) return;
-    const table = [_]struct { l: []const u8, t: []const u8 }{
-        .{ .l = "loop", .t = "deciding the next step" },
-        .{ .l = "compact", .t = "compacting the working context" },
-        .{ .l = "handoff", .t = "writing the continuation state" },
-        .{ .l = "planrec", .t = "reconciling the plan board" },
-        .{ .l = "memverify", .t = "checking recalled memory" },
-        .{ .l = "ctxsum", .t = "summarizing the conversation so far" },
-        .{ .l = "summary", .t = "folding history into the rolling summary" },
-        .{ .l = "reflect", .t = "reviewing the answer" },
-        .{ .l = "lesson", .t = "noting a lesson from this turn" },
-        .{ .l = "course", .t = "checking course" },
-        .{ .l = "searchq", .t = "shaping the search" },
-        .{ .l = "stuck", .t = "working out how to get unstuck" },
-        .{ .l = "recon", .t = "surveying before planning" },
-        .{ .l = "plan", .t = "planning the work" },
-        .{ .l = "chat", .t = "working" },
-    };
-    for (table) |e| {
-        if (std.mem.eql(u8, e.l, label)) {
-            emitKV(app, llm_frame_dir[0..llm_frame_dir_len], "status", "text", e.t);
-            return;
+/// The phases a turn announces as `{"kind":"status","text":...}` frames, by the label of the model call
+/// that runs them. Shared by announcePhase (the frame at the start) and the pulse (the frames while it runs).
+const PHASES = [_]struct { l: []const u8, t: []const u8 }{
+    .{ .l = "loop", .t = "deciding the next step" },
+    .{ .l = "compact", .t = "compacting the working context" },
+    .{ .l = "handoff", .t = "writing the continuation state" },
+    .{ .l = "planrec", .t = "reconciling the plan board" },
+    .{ .l = "memverify", .t = "checking recalled memory" },
+    .{ .l = "ctxsum", .t = "summarizing the conversation so far" },
+    .{ .l = "summary", .t = "folding history into the rolling summary" },
+    .{ .l = "reflect", .t = "reviewing the answer" },
+    .{ .l = "lesson", .t = "noting a lesson from this turn" },
+    .{ .l = "course", .t = "checking course" },
+    .{ .l = "searchq", .t = "shaping the search" },
+    .{ .l = "stuck", .t = "working out how to get unstuck" },
+    .{ .l = "recon", .t = "surveying before planning" },
+    .{ .l = "plan", .t = "planning the work" },
+    .{ .l = "chat", .t = "working" },
+};
+const PHASE_NONE: u8 = 255;
+
+fn phaseIndex(label: []const u8) u8 {
+    for (PHASES, 0..) |e, i| if (std.mem.eql(u8, e.l, label)) return @intCast(i);
+    return PHASE_NONE;
+}
+
+// ---- THE PULSE: a status frame whenever the turn has been silent for a while ----
+//
+// A turn goes quiet in three places: a blocking auxiliary model call (compact, plan, the loop verdict), the
+// streamed chat call while the model is generating a TOOL CALL (no token deltas are emitted for those), and
+// a long tool execution. From the desk every one of them looks the same: the reply chunks down, then
+// nothing - which is what was reported. announcePhase names a phase as it begins; the pulse keeps the line
+// alive while it runs, with the phase and the seconds it has taken. From the sim driver's side it is the
+// difference between "working" and "stalled": its stall rule is "no events for 240 s", and a healthy
+// seven-minute turn with one long compaction call in it was ending whole runs at the next POST.
+//
+// One thread per turn, started beside armLlmFrames and joined on every exit path. emitEvent on the turn's
+// thread bumps `last_ms`; the pulse thread writes its own frames without bumping it, so the seconds it
+// reports are real silence, not time since its own last pulse.
+const PULSE_AFTER_S: i64 = 15;
+
+const Pulse = struct {
+    app: *App,
+    dir: [1024]u8 = undefined,
+    dir_len: usize = 0,
+    /// Wall-clock ms of the last frame the turn's thread wrote, any kind.
+    last_ms: std.atomic.Value(i64),
+    /// Index into PHASES of the announced phase still running, or PHASE_NONE.
+    phase: std.atomic.Value(u8) = .init(PHASE_NONE),
+    phase_since_ms: std.atomic.Value(i64) = .init(0),
+    stop: std.atomic.Value(bool) = .init(false),
+    thread: ?std.Thread = null,
+
+    fn run(p: *Pulse) void {
+        const io = p.app.io;
+        var pulsed_ms: i64 = 0;
+        while (!p.stop.load(.acquire)) {
+            io.sleep(.{ .nanoseconds = 250 * std.time.ns_per_ms }, .awake) catch {};
+            if (p.stop.load(.acquire)) return;
+            const now = nowMillis(io);
+            const last = p.last_ms.load(.acquire);
+            if (now - @max(last, pulsed_ms) < PULSE_AFTER_S * 1000) continue;
+            const ph = p.phase.load(.acquire);
+            const named = ph < PHASES.len;
+            const since = if (named) p.phase_since_ms.load(.acquire) else last;
+            var b: [200]u8 = undefined;
+            const text = std.fmt.bufPrint(&b, "still {s} ({d}s)", .{ if (named) PHASES[ph].t else "working", @divTrunc(now - since, 1000) }) catch continue;
+            emitKV(p.app, p.dir[0..p.dir_len], "status", "text", text);
+            pulsed_ms = now;
         }
     }
+};
+
+/// The running turn's pulse on this thread, or null (frames off, spawn failed, or no turn).
+threadlocal var turn_pulse: ?*Pulse = null;
+
+fn pulseStart(app: *App, conv_dir: []const u8) void {
+    if (llm_frame_dir_len == 0 or turn_pulse != null or conv_dir.len == 0) return;
+    const p = app.gpa.create(Pulse) catch return;
+    p.* = .{ .app = app, .last_ms = .init(nowMillis(app.io)) };
+    if (conv_dir.len > p.dir.len) {
+        app.gpa.destroy(p);
+        return;
+    }
+    @memcpy(p.dir[0..conv_dir.len], conv_dir);
+    p.dir_len = conv_dir.len;
+    p.thread = std.Thread.spawn(.{}, Pulse.run, .{p}) catch {
+        app.gpa.destroy(p);
+        return;
+    };
+    turn_pulse = p;
+}
+
+fn pulseStop() void {
+    const p = turn_pulse orelse return;
+    turn_pulse = null;
+    p.stop.store(true, .release);
+    if (p.thread) |t| t.join();
+    p.app.gpa.destroy(p);
+}
+
+fn announcePhase(app: *App, label: []const u8) void {
+    if (llm_frame_dir_len == 0) return;
+    const idx = phaseIndex(label);
+    if (idx == PHASE_NONE) return;
+    if (turn_pulse) |p| {
+        p.phase_since_ms.store(nowMillis(app.io), .release);
+        p.phase.store(idx, .release);
+    }
+    emitKV(app, llm_frame_dir[0..llm_frame_dir_len], "status", "text", PHASES[idx].t);
+}
+
+test "every announced phase has a text, and the pulse never names a label it does not know" {
+    try std.testing.expect(phaseIndex("compact") != PHASE_NONE);
+    try std.testing.expect(phaseIndex("chat") != PHASE_NONE);
+    try std.testing.expectEqual(PHASE_NONE, phaseIndex("nope"));
+    try std.testing.expectEqual(PHASE_NONE, phaseIndex(""));
+    for (PHASES) |e| try std.testing.expect(e.t.len > 0 and e.l.len > 0);
+    try std.testing.expect(PHASES.len < PHASE_NONE);
 }
 
 /// Render the shared `llm` frame into `out`. Split from the emit so its exact wire shape is testable without a
@@ -2094,6 +2190,8 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     // every exit path so a recycled thread can never append a stray frame to a finished conversation.
     armLlmFrames(conv_dir);
     defer disarmLlmFrames();
+    pulseStart(app, conv_dir);
+    defer pulseStop();
     trace_enabled = trace_req;
     defer trace_enabled = false;
     traceFrame(app, "worker.chat.engine", "runTurn", "enter", null, null);

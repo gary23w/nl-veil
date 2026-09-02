@@ -51,6 +51,11 @@ const PID_FILE = "cf_tunnel.pid";
 const LIVE_MARK = "Registered tunnel connection";
 /// How long a connector may take to register before the switch is declared failed.
 const START_BUDGET_S: i64 = 90;
+/// How long the URL is held back waiting for Cloudflare's resolver to publish the fresh hostname.
+const PUBLISH_BUDGET_S: i64 = 90;
+/// Cloudflare's public DNS-over-HTTPS endpoint, asked DIRECTLY so the machine's own resolver never sees the
+/// name before it exists (see awaitPublished).
+const DOH_URL = "https://cloudflare-dns.com/dns-query";
 const LOG_CAP: usize = 512 * 1024;
 
 /// Everything the account side knows about this server's tunnel. Ids and names only — the token is in the
@@ -77,7 +82,7 @@ pub const State = struct {
     created_at: i64 = 0,
 };
 
-pub const Phase = enum { off, installing, provisioning, starting, live, err };
+pub const Phase = enum { off, installing, provisioning, starting, publishing, live, err };
 
 /// The one live connector this process runs (a tunnel exposes the whole server, so there is one).
 const Live = struct {
@@ -87,6 +92,8 @@ const Live = struct {
     started_at: i64 = 0,
     busy: bool = false,
     access: bool = false,
+    /// Whether Cloudflare's resolver had published the hostname when the URL was shown (see awaitPublished).
+    published: bool = false,
     url: [200]u8 = undefined,
     url_len: usize = 0,
     err: [200]u8 = undefined,
@@ -118,6 +125,7 @@ fn phaseName(p: Phase) []const u8 {
         .installing => "installing",
         .provisioning => "provisioning",
         .starting => "starting",
+        .publishing => "publishing",
         .live => "live",
         .err => "error",
     };
@@ -513,6 +521,58 @@ fn deprovision(app: *App, a: std.mem.Allocator, st: *State, tok: Tok) void {
 }
 
 // ------------------------------------------------------------------------------------------ the child
+/// The hostname the world will ask DNS for: the named hostname, or the quick tunnel's trycloudflare host.
+fn publicHost(st: *const State) []const u8 {
+    if (std.mem.eql(u8, st.mode, "named") and st.hostname.len > 0) return st.hostname;
+    return hostOf(st.url);
+}
+
+/// `https://host[/...]` -> `host`; "" when there is no host.
+fn hostOf(url: []const u8) []const u8 {
+    const rest = if (std.mem.startsWith(u8, url, "https://")) url["https://".len..] else if (std.mem.startsWith(u8, url, "http://")) url["http://".len..] else url;
+    const end = std.mem.indexOfAny(u8, rest, "/:?#") orelse rest.len;
+    return rest[0..end];
+}
+
+/// The dns-json verdict: NOERROR (Status 0) with at least one answer means published. NXDOMAIN is Status 3.
+fn dohSaysPublished(a: std.mem.Allocator, body: []const u8) bool {
+    const Reply = struct { Status: i64 = -1, Answer: ?[]const struct { data: []const u8 = "" } = null };
+    const rep = std.json.parseFromSliceLeaky(Reply, a, body, .{ .ignore_unknown_fields = true }) catch return false;
+    if (rep.Status != 0) return false;
+    const ans = rep.Answer orelse return false;
+    return ans.len > 0;
+}
+
+/// Ask Cloudflare's own resolver (DNS over HTTPS) whether `host` is published. Never the machine's resolver.
+fn publishedAtCloudflare(app: *App, a: std.mem.Allocator, host: []const u8) bool {
+    const url = std.fmt.allocPrint(a, DOH_URL ++ "?name={s}&type=A", .{host}) catch return false;
+    const r = std.process.run(app.gpa, app.io, .{ .argv = &.{ "curl", "-sS", "--max-time", "10", "-H", "accept: application/dns-json", url }, .stdout_limit = .limited(16 << 10) }) catch return false;
+    defer app.gpa.free(r.stdout);
+    defer app.gpa.free(r.stderr);
+    if (!(r.term == .exited and r.term.exited == 0)) return false;
+    return dohSaysPublished(a, r.stdout);
+}
+
+/// Wait, up to PUBLISH_BUDGET_S, for Cloudflare's resolver to publish the hostname. Returns whether it did;
+/// after the budget the URL is shown anyway, flagged `published:false`.
+///
+/// WHY: a quick tunnel's hostname is minted when the connector registers and reaches Cloudflare's
+/// authoritative servers some seconds later. Any query from this network in that window - the owner's
+/// browser, a phone on the same wifi - gets NXDOMAIN from the local resolver, which then caches the miss
+/// for trycloudflare.com's negative TTL: 1800 seconds. Measured on the dev machine: a probe 4 s after
+/// registration left the address unreachable for half an hour; the next address, published 9 s in and
+/// asked by nobody until then, resolved everywhere at once. So nothing asks until Cloudflare says yes.
+fn awaitPublished(app: *App, a: std.mem.Allocator, host: []const u8) bool {
+    if (host.len == 0) return false;
+    const t0 = nowS(app.io);
+    while (nowS(app.io) - t0 < PUBLISH_BUDGET_S) {
+        if (exited.load(.monotonic)) return false;
+        if (publishedAtCloudflare(app, a, host)) return true;
+        app.io.sleep(.{ .nanoseconds = 3000 * std.time.ns_per_ms }, .awake) catch {};
+    }
+    return false;
+}
+
 fn waiter(io: std.Io) void {
     if (live.child) |*c| {
         _ = c.wait(io) catch {};
@@ -520,7 +580,7 @@ fn waiter(io: std.Io) void {
     exited.store(true, .monotonic);
     mu.lockUncancelable(io);
     defer mu.unlock(io);
-    if (live.phase == .live or live.phase == .starting) {
+    if (live.phase == .live or live.phase == .starting or live.phase == .publishing) {
         live.phase = .err;
         const m = "cloudflared exited - see cf_tunnel.log in the user's data dir";
         @memcpy(live.err[0..m.len], m);
@@ -755,17 +815,29 @@ pub fn turnOn(app: *App, uid: u64) void {
         return;
     }
     writeState(app, uid, st);
+    // HOLD THE ADDRESS BACK until Cloudflare's own resolver publishes it. The first DNS query from this
+    // network decides whether the URL works for the next half hour (see awaitPublished) - so nothing, not
+    // the status poll, not the owner's browser, gets to ask before Cloudflare answers.
+    setPhase(io, .publishing);
+    const published = awaitPublished(app, a, publicHost(&st));
+    if (exited.load(.monotonic)) {
+        st.last_error = "cloudflared exited while the address was being published - see cf_tunnel.log in the user's data dir";
+        writeState(app, uid, st);
+        setErr(io, st.last_error);
+        return;
+    }
     {
         mu.lockUncancelable(io);
         defer mu.unlock(io);
         live.phase = .live;
+        live.published = published;
         live.access = st.access_policy_id.len > 0;
         const ml = @min(st.mode.len, live.mode.len);
         @memcpy(live.mode[0..ml], st.mode[0..ml]);
         live.mode_len = ml;
     }
     setUrl(io, st.url);
-    log.info("Cloudflare tunnel: {s}  ({s}{s})", .{ st.url, if (std.mem.eql(u8, st.mode, "quick")) "confidential address" else st.hostname, if (st.access_policy_id.len > 0) ", Access: owner only" else ", veil login only" });
+    log.info("Cloudflare tunnel: {s}  ({s}{s}{s})", .{ st.url, if (std.mem.eql(u8, st.mode, "quick")) "confidential address" else st.hostname, if (st.access_policy_id.len > 0) ", Access: owner only" else ", veil login only", if (published) "" else "; NOT yet published by Cloudflare's resolver - give it a minute" });
 }
 
 /// Stop the connector; with `delete`, also remove the tunnel, its DNS record and its Access app from the
@@ -867,10 +939,12 @@ pub fn tunnelStatus(app: *App, req: *httpz.Request, res: *httpz.Response) !void 
     var access = false;
     var since: i64 = 0;
     var busy = false;
+    var published = false;
     {
         mu.lockUncancelable(app.io);
         defer mu.unlock(app.io);
         phase = live.phase;
+        published = live.published;
         url = a.dupe(u8, live.url[0..live.url_len]) catch "";
         err = a.dupe(u8, live.err[0..live.err_len]) catch "";
         access = live.access;
@@ -884,7 +958,7 @@ pub fn tunnelStatus(app: *App, req: *httpz.Request, res: *httpz.Response) !void 
     }
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(app.gpa);
-    try out.print(app.gpa, "{{\"ok\":true,\"connected\":{},\"admin\":{},\"state\":\"{s}\",\"on\":{},\"busy\":{},\"live\":{},\"access\":{},\"since\":{d},\"open_registration\":{},\"use_domain\":{},\"url\":", .{ connected, admin, phaseName(phase), st.want_on, busy, phase == .live, access, since, app.open_registration, st.use_domain });
+    try out.print(app.gpa, "{{\"ok\":true,\"connected\":{},\"admin\":{},\"state\":\"{s}\",\"on\":{},\"busy\":{},\"live\":{},\"published\":{},\"access\":{},\"since\":{d},\"open_registration\":{},\"use_domain\":{},\"url\":", .{ connected, admin, phaseName(phase), st.want_on, busy, phase == .live, phase == .live and published, access, since, app.open_registration, st.use_domain });
     try http.jstr(app.gpa, &out, url);
     try out.appendSlice(app.gpa, ",\"want_hostname\":");
     try http.jstr(app.gpa, &out, if (admin) st.want_hostname else "");
@@ -918,11 +992,16 @@ pub fn tunnelSet(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         if (cf_oauth.resolveToken(app, u.id, a) == null) return badReq(res, "not connected to Cloudflare - log in with Cloudflare first");
         // the choice rides with the flip and is remembered: confidential (default) or one of the user's domains
         var st = readState(app, u.id, a);
-        if (body.use_domain) |ud| st.use_domain = ud;
+        var changed = false;
+        if (body.use_domain) |ud| {
+            changed = changed or ud != st.use_domain;
+            st.use_domain = ud;
+        }
         if (body.hostname) |h| {
             const t = std.mem.trim(u8, h, " \r\n\t");
             if (t.len > 0 and !hostnameOk(t)) return badReq(res, "hostname must be lowercase letters, digits, dots and hyphens, like veil.example.com");
             if (!std.mem.eql(u8, t, st.want_hostname)) {
+                changed = true;
                 st.want_hostname = t;
                 st.hostname = ""; // re-derive the effective hostname from the new request
             }
@@ -932,8 +1011,17 @@ pub fn tunnelSet(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
             mu.lockUncancelable(app.io);
             defer mu.unlock(app.io);
             if (live.busy) return badReq(res, "a switch flip is already in progress");
+            // ALREADY ON with the same choice: say so, do not restart it. A restart would mint a new address
+            // and drop every open session for nothing - and the old URL was on display while it happened.
+            const running = live.phase == .live or live.phase == .starting or live.phase == .publishing;
+            if (running and !changed) {
+                try res.json(.{ .ok = true, .on = true, .state = phaseName(live.phase), .already = true }, .{});
+                return;
+            }
             live.phase = .installing;
             live.err_len = 0;
+            live.url_len = 0; // nothing of the previous address may show while the next one is minted
+            live.published = false;
         }
         const th = std.Thread.spawn(.{}, onThread, .{ app, u.id }) catch {
             setErr(app.io, "could not start the tunnel worker thread");
@@ -972,6 +1060,24 @@ test "every tunnel route is gated: an anonymous caller gets 401 and nothing runs
         try tunnelSet(&ta.app, web.req, web.res);
         try web.expectStatus(401);
     }
+}
+
+test "the resolver verdict: published means NOERROR with an answer; NXDOMAIN and empty answers are not" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try std.testing.expect(dohSaysPublished(a, "{\"Status\":0,\"TC\":false,\"Question\":[{\"name\":\"x.trycloudflare.com\",\"type\":1}],\"Answer\":[{\"name\":\"x.trycloudflare.com\",\"type\":1,\"TTL\":300,\"data\":\"104.16.230.132\"}]}"));
+    try std.testing.expect(!dohSaysPublished(a, "{\"Status\":3,\"TC\":false,\"Question\":[{\"name\":\"x.trycloudflare.com\",\"type\":1}],\"Authority\":[{\"name\":\"trycloudflare.com\",\"type\":6,\"TTL\":1800,\"data\":\"soa\"}]}"));
+    try std.testing.expect(!dohSaysPublished(a, "{\"Status\":0,\"Answer\":[]}"));
+    try std.testing.expect(!dohSaysPublished(a, "not json"));
+    try std.testing.expectEqualStrings("a-b-c.trycloudflare.com", hostOf("https://a-b-c.trycloudflare.com"));
+    try std.testing.expectEqualStrings("veil.example.com", hostOf("https://veil.example.com/api/v1/health"));
+    try std.testing.expectEqualStrings("", hostOf(""));
+    // the quick tunnel asks for ITS host even when a named hostname lingers from an earlier provision
+    var st: State = .{ .mode = "quick", .hostname = "veil.example.com", .url = "https://q.trycloudflare.com" };
+    try std.testing.expectEqualStrings("q.trycloudflare.com", publicHost(&st));
+    st.mode = "named";
+    try std.testing.expectEqualStrings("veil.example.com", publicHost(&st));
 }
 
 test "state round-trips through its JSON with defaults, and carries no token field" {
