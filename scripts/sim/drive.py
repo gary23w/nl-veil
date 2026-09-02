@@ -89,6 +89,10 @@ def conv_state(conv):
     return out
 
 
+# A turn that outlives budget_s is reported; one that outlives HARD_CAP_S is abandoned (and the run with it).
+HARD_CAP_S = int(os.environ.get("SIM_TURN_CAP", "3600"))
+
+
 def watch(conv, sink, turn_idx, start_off, budget_s=900):
     """Stream one turn's events to `sink`, returning a per-turn summary."""
     off, done, t0 = start_off, False, time.time()
@@ -97,8 +101,13 @@ def watch(conv, sink, turn_idx, start_off, budget_s=900):
     llm_calls = []
     last_progress = time.time()
     while not done:
-        if time.time() - t0 > budget_s:
+        if time.time() - t0 > budget_s and "HARNESS: turn exceeded %ds budget" % budget_s not in errors:
+            # A FINDING, not an exit. Leaving a running turn made every later POST a 409 and lost the rest of
+            # the run (ledger run 4: turn 9 ran 27 min, the driver left at 15, turns 10-15 were never asked).
             errors.append("HARNESS: turn exceeded %ds budget" % budget_s)
+            print("    (turn %d is past the %ds budget - still running; waiting for {done})" % (turn_idx, budget_s), flush=True)
+        if time.time() - t0 > HARD_CAP_S:
+            errors.append("HARNESS: turn abandoned at the %ds hard cap" % HARD_CAP_S)
             break
         try:
             st, hdrs, content = req("GET", "/api/v1/chat/convs/%s/events?from=%d" % (conv, off), timeout=30)
@@ -210,8 +219,8 @@ def run_scenario(name, turns, model, base_url, loop=0, conv=None):
             try:
                 st, _, body = send(conv, prompt, model, base_url, loop=tl)
                 waited = 0.0
-                while st == 409 and waited < 120:
-                    time.sleep(0.5); waited += 0.5
+                while st == 409 and waited < HARD_CAP_S:
+                    time.sleep(2.0); waited += 2.0
                     st, _, body = send(conv, prompt, model, base_url, loop=tl)
                 if waited:
                     print("    (waited %.1fs for the conv slot after {done})" % waited, flush=True)
