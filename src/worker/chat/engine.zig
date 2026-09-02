@@ -289,8 +289,11 @@ const LOOP_QUESTION =
     "What is the single next concrete step toward the goal? The goal is what the user ASKED FOR, not what " ++
     "would make the result look better: a request to run, check, count, measure, compare or report something " ++
     "is fully achieved once that result has been reported, even when the result is a failure, and a next step " ++
-    "must never fix, refactor or modify anything the user did not ask to change. Reply with ONLY that next " ++
-    "instruction, or reply exactly DONE if the goal is fully achieved.";
+    "must never fix, refactor or modify anything the user did not ask to change. A CLAIM OF WORK IS NOT WORK: " ++
+    "if the goal required files to change or commands to run and the conversation above shows no tool result " ++
+    "for it, the goal is NOT achieved whatever the assistant said - name the concrete step (the file to write, " ++
+    "the command to run). Reply with ONLY that next instruction, or reply exactly DONE if the goal is fully " ++
+    "achieved.";
 /// The AFK drive question. afk was built as tier-1-plus-overrides: it asked "next step, or DONE", the model
 /// answered DONE, and the engine overrode that with a canned "keep going" — so every cycle the model reached a
 /// conclusion the loop then contradicted, and the only way to obey both was to invent more work. Observed live:
@@ -3142,7 +3145,17 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
                     defer hrow.deinit(gpa);
                     // Tightened against the ACTUAL window: 1400 B is 5% of a roomy history window and 17% of the
                     // 8 KB floor a small local model gets, where a handoff must not crowd out the conversation.
-                    const row = handoffRow(gpa, inner.engine_note, handoff, @max(512, @min(HANDOFF_MAX_BYTES, hist_win / 8)), &hrow);
+                    // THE LEDGER POINTER GOES FIRST, before the cap can clip it: a next turn that knows where the
+                    // facts are does not need them in the row, and the row is what a "Continue." turn is given.
+                    var hf: std.ArrayListUnmanaged(u8) = .empty;
+                    defer hf.deinit(gpa);
+                    const fl = factsLedgerLines(app, ctx.workdir);
+                    if (fl > 0) {
+                        var fb2: [320]u8 = undefined;
+                        hf.appendSlice(gpa, std.fmt.bufPrint(&fb2, "FACTS LEDGER: {s} in the workdir holds {d} lines of concrete values already established (ids, amounts, tokens, statuses). read_file it BEFORE re-querying anything.\n", .{ FACTS_LEDGER_NAME, fl }) catch "") catch {};
+                        hf.appendSlice(gpa, handoff) catch {};
+                    }
+                    const row = handoffRow(gpa, inner.engine_note, if (fl > 0) hf.items else handoff, @max(512, @min(HANDOFF_MAX_BYTES, hist_win / 8)), &hrow);
                     // Best-effort, like every summary in this file: a Stop, an empty span, a refused, degenerate
                     // or markup completion, or any OOM leaves `row` bound to inner.engine_note and these two
                     // lines commit exactly the row they commit today.
@@ -9622,24 +9635,24 @@ fn summarizeWorkingSpan(app: *App, run_root: []const u8, base_url: []const u8, k
     var msgs: std.ArrayListUnmanaged(u8) = .empty;
     defer msgs.deinit(gpa);
     msgs.appendSlice(gpa, "{\"role\":\"system\",\"content\":") catch return null;
-    http.jstr(gpa, &msgs, "You compress the working log of an in-progress task so it can continue without exceeding the context window. Preserve concrete progress: files created/edited, commands run and their key results, decisions made, and what remains. Output ONLY the compressed progress note.") catch return null;
+    http.jstr(gpa, &msgs, "You compress the working log of an in-progress task so it can continue without exceeding the context window. Write two sections. PROGRESS (at most 150 words): files created/edited, commands run and their key results, decisions made, what remains. FACTS: every concrete value the tool results established - identifiers, names, amounts, dates, tokens, statuses, URLs, error strings - one per line as key: value (from <call>), and every FACT already listed in an earlier note within this log, kept verbatim. Facts were paid for with calls a summary cannot replay; a fact dropped here is bought again. Output ONLY the note.") catch return null;
     msgs.appendSlice(gpa, "},{\"role\":\"user\",\"content\":") catch return null;
     var uc: std.ArrayListUnmanaged(u8) = .empty;
     defer uc.deinit(gpa);
     uc.appendSlice(gpa, "Working log so far (assistant tool calls + tool results as JSON):\n") catch return null;
     uc.appendSlice(gpa, clipBytes(span_json, 200 * 1024)) catch return null; // bound the summarizer's own input
-    uc.appendSlice(gpa, "\n\nWrite the compressed progress note (<= 200 words).") catch return null;
+    uc.appendSlice(gpa, "\n\nWrite the note: PROGRESS, then FACTS. The FACTS list may run long (up to 150 lines); never drop a fact to save space.") catch return null;
     http.jstr(gpa, &msgs, uc.items) catch return null;
     msgs.append(gpa, '}') catch return null;
     const compact_cm = meterBegin(app.io);
     announcePhase(app, "compact");
-    var step = llm.complete(gpa, app.io, run_root, "compact", base_url, key, model, msgs.items, "", 1024, 0.3);
+    var step = llm.complete(gpa, app.io, run_root, "compact", base_url, key, model, msgs.items, "", 3072, 0.3);
     defer step.deinit(gpa);
     meterEnd(app, compact_cm, "compact", .thinking, model, step.ok);
     if (!step.ok) return null;
     const t = std.mem.trim(u8, step.content, " \r\n\t");
     if (t.len == 0) return null;
-    return gpa.dupe(u8, clipBytes(t, cctx.SUMMARY_INJECT_CAP)) catch null;
+    return gpa.dupe(u8, clipBytes(t, WORKING_NOTE_CAP)) catch null;
 }
 
 /// The bounded slice of a CUT turn's working log the continuation state is written from: the oldest
@@ -9747,6 +9760,94 @@ fn handoffRow(gpa: std.mem.Allocator, note: []const u8, handoff: []const u8, cap
     return out.items;
 }
 
+/// The working-span note's own cap. Wider than SUMMARY_INJECT_CAP (6 KB) because the note now carries a FACTS
+/// list: on the first completed C1 run, 230 of 416 paid world calls were re-purchases and 202 of them spanned a
+/// compaction or handoff - a 200-word note could not hold the ~150 values the turn had bought, so the agent
+/// bought them again at ~15k prompt tokens per call. 12 KB (~3k tokens) re-uploaded per inference is cheap
+/// against that.
+const WORKING_NOTE_CAP: usize = 12 * 1024;
+/// The engine-kept facts ledger in the build workdir (see factsLedgerAppend): a dotfile the agent may read.
+const FACTS_LEDGER_NAME = ".veil-facts.md";
+const FACTS_LEDGER_HEAD = "# facts ledger (engine-kept). Every concrete value that tool results established in this conversation, one per line, deduplicated. READ THIS before re-querying anything: each line was paid for.\n";
+const FACTS_LEDGER_CAP: usize = 96 * 1024;
+
+/// The body of a compaction note's FACTS section (whatever follows a line that is just "FACTS", under any
+/// heading style), or null when the note has none.
+fn factsSection(note: []const u8) ?[]const u8 {
+    var it = std.mem.splitScalar(u8, note, '\n');
+    var pos: usize = 0;
+    while (it.next()) |line| {
+        const t = std.mem.trim(u8, line, " \t\r#*-:");
+        if (t.len >= 5 and t.len <= 12 and std.ascii.eqlIgnoreCase(t[0..5], "facts")) {
+            const after = pos + line.len;
+            return if (after < note.len) note[after + 1 ..] else note[note.len..];
+        }
+        pos += line.len + 1;
+    }
+    return null;
+}
+
+fn hasLine(hay: []const u8, line: []const u8) bool {
+    var it = std.mem.splitScalar(u8, hay, '\n');
+    while (it.next()) |l| if (std.mem.eql(u8, std.mem.trim(u8, l, " \t\r"), line)) return true;
+    return false;
+}
+
+/// Append the note's FACTS lines to {workdir}/.veil-facts.md - deduplicated, bounded, header on first write.
+/// Best-effort: an unreadable or full ledger changes nothing.
+fn factsLedgerAppend(app: *App, workdir: []const u8, note: []const u8) void {
+    if (workdir.len == 0) return;
+    const body = factsSection(note) orelse return;
+    const gpa = app.gpa;
+    var pb: [1024]u8 = undefined;
+    const path = std.fmt.bufPrint(&pb, "{s}/{s}", .{ workdir, FACTS_LEDGER_NAME }) catch return;
+    const existing: ?[]u8 = std.Io.Dir.cwd().readFileAlloc(app.io, path, gpa, .limited(FACTS_LEDGER_CAP)) catch null;
+    defer if (existing) |e| gpa.free(e);
+    const have: []const u8 = existing orelse "";
+    if (have.len >= FACTS_LEDGER_CAP - 1024) return;
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(gpa);
+    out.appendSlice(gpa, if (have.len > 0) have else FACTS_LEDGER_HEAD) catch return;
+    if (out.items.len > 0 and out.items[out.items.len - 1] != '\n') out.append(gpa, '\n') catch return;
+    var added: usize = 0;
+    var it = std.mem.splitScalar(u8, body, '\n');
+    while (it.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r-*");
+        if (line.len < 4 or line.len > 400) continue;
+        if (std.ascii.startsWithIgnoreCase(line, "progress")) break; // a PROGRESS section after FACTS ends the list
+        if (hasLine(out.items, line)) continue;
+        if (out.items.len + line.len + 1 > FACTS_LEDGER_CAP) break;
+        out.appendSlice(gpa, line) catch return;
+        out.append(gpa, '\n') catch return;
+        added += 1;
+    }
+    if (added == 0) return;
+    std.Io.Dir.cwd().writeFile(app.io, .{ .sub_path = path, .data = out.items }) catch {};
+}
+
+/// How many fact lines the ledger holds (0 when absent) - the number the pointer quotes.
+fn factsLedgerLines(app: *App, workdir: []const u8) usize {
+    if (workdir.len == 0) return 0;
+    var pb: [1024]u8 = undefined;
+    const path = std.fmt.bufPrint(&pb, "{s}/{s}", .{ workdir, FACTS_LEDGER_NAME }) catch return 0;
+    const data = std.Io.Dir.cwd().readFileAlloc(app.io, path, app.gpa, .limited(FACTS_LEDGER_CAP)) catch return 0;
+    defer app.gpa.free(data);
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, data, '\n');
+    while (it.next()) |l| {
+        if (l.len > 3 and l[0] != '#') n += 1;
+    }
+    return n;
+}
+
+test "factsSection / hasLine: the FACTS list is found under any heading style, and never invented" {
+    try std.testing.expectEqualStrings("a: 1\nb: 2", factsSection("PROGRESS: did things\nFACTS:\na: 1\nb: 2").?);
+    try std.testing.expectEqualStrings("x: y\n", factsSection("## Facts\nx: y\n").?);
+    try std.testing.expect(factsSection("PROGRESS: nothing learned; the facts are unclear") == null);
+    try std.testing.expect(hasLine("# head\na: 1\nb: 2\n", "b: 2"));
+    try std.testing.expect(!hasLine("# head\na: 1\n", "a: 12"));
+}
+
 /// If this pass's working growth (everything appended after `base_len`) exceeds WORKING_COMPACT_BYTES, replace its
 /// OLDER part with a single compressed progress note — the newest WORKING_KEEP_TAIL_BYTES stay verbatim — so the
 /// loop can continue bounded without deleting the results the model is actively working from. Called at a STEP
@@ -9791,13 +9892,25 @@ fn compactWorking(app: *App, run_root: []const u8, base_url: []const u8, key: []
     if (older.len == 0) return; // nothing older than the tail — nothing to summarize
     const note = summarizeWorkingSpan(app, run_root, base_url, key, model, older) orelse return;
     defer gpa.free(note);
+    // THE FACTS OUTLIVE THE NOTE. The note is re-summarized on every later fold and replaced outright at the
+    // turn boundary, so a value in it decays with each pass and is gone by the next turn. The ledger file is
+    // engine-written, deduplicated and append-only: a place the next fold, the next turn and the model's own
+    // read_file can all reach for the price of one read. Measured before it existed: 202 of 230 re-purchases
+    // in a C1 run spanned exactly this boundary.
+    factsLedgerAppend(app, ctx.workdir, note);
+    const fl = factsLedgerLines(app, ctx.workdir);
+    const noted: []const u8 = if (fl > 0)
+        (std.fmt.allocPrint(gpa, "FACTS LEDGER: {s} in the workdir holds {d} lines of values already established - read_file it before re-querying anything.\n{s}", .{ FACTS_LEDGER_NAME, fl, note }) catch note)
+    else
+        note;
+    defer if (noted.ptr != note.ptr) gpa.free(@constCast(noted));
     // `tail` points INTO conv_buf: shrinking only retains the bytes, and appending the note writes straight over
     // them (a grow would reallocate outright). Copy it out — with its joining comma — BEFORE either happens.
     const kept: ?[]u8 = if (splice) (std.fmt.allocPrint(gpa, ",{s}", .{tail}) catch return) else null;
     defer if (kept) |k| gpa.free(k);
     conv_buf.shrinkRetainingCapacity(base_len);
     const note_at = conv_buf.items.len;
-    appendMsgObj(gpa, conv_buf, "assistant", note, cctx.SUMMARY_INJECT_CAP);
+    appendMsgObj(gpa, conv_buf, "assistant", noted, WORKING_NOTE_CAP);
     // Under a learned echo quirk the folded note must carry reasoning_content like every assistant turn
     // (the enforcement is not tool-call-only); bare, it would 400 the next inference and spend a heal.
     // An OOM leaves it bare — the in-pass heal then repairs it at the cost of that one round-trip.
