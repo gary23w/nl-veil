@@ -2149,7 +2149,138 @@ fn renderLlmFrame(gpa: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), labe
 
 /// Run one full agentic turn for `conv` (already safeSeg'd, non-empty). Blocks the calling httpz worker thread
 /// to completion (casts/deploys block the same way); on return the whole turn is durable in messages/events.jsonl.
-pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text: []const u8, loop: u8, tool_client_req: bool, image_b64: []const u8, fast: bool, trace_req: bool) void {
+// ---- large pastes: spill to a file, hand the model a pointer ----
+//
+// Ledger run 4, turn 9 (2026-09-02): the user pasted 300 bank rows (14 KB) with "record the ops rows". The
+// rows existed only in the user message, so the model's only way to use them was to retype them into a tool
+// call - a python script with the CSV embedded, then a write_file of the CSV. Every such completion was cut at
+// the 8,192-token output cap, the cut call did not parse, the engine's rescue re-asked in plain text, the loop
+// verdict said continue, and the cycle ran five times: 27 minutes, 26 model calls, 285k input tokens, and the
+// turn ended in a failed completion. Turn 10, the second export, did the same. A paste saved to a file before
+// the first model call costs one read_file window or one run_python, and every later prompt in the
+// conversation carries a pointer instead of the paste.
+const PASTE_SPILL_BYTES: usize = 6 * 1024;
+const PASTE_SPILL_LINES: usize = 20;
+const PASTE_HEAD_BYTES: usize = 1536;
+const PASTE_HEAD_LINES: usize = 12;
+const PASTE_TAIL_BYTES: usize = 400;
+const PASTE_TAIL_LINES: usize = 4;
+
+fn countLines(text: []const u8) usize {
+    var n: usize = 0;
+    for (text) |c| {
+        if (c == '\n') n += 1;
+    }
+    return n + @intFromBool(text.len > 0 and text[text.len - 1] != '\n');
+}
+
+/// Big AND line-shaped: a wall of prose under the size floor is a request; hundreds of lines is data.
+fn looksLikePaste(text: []const u8) bool {
+    return text.len >= PASTE_SPILL_BYTES and countLines(text) >= PASTE_SPILL_LINES;
+}
+
+/// Comma-separated with a consistent column count across the LAST rows: the rows are the bulk of a paste and
+/// the instructions sit at the ends, and an instruction line can carry commas of its own, so the verdict is
+/// read off the tail. Names the file .csv so the model reaches for the right tool.
+fn csvLike(text: []const u8) bool {
+    var cols: ?usize = null;
+    var rows: usize = 0;
+    var end = text.len;
+    while (end > 0 and rows < 8) {
+        const start = if (std.mem.lastIndexOfScalar(u8, text[0 .. end - 1], '\n')) |nl| nl + 1 else 0;
+        const line = std.mem.trim(u8, text[start..end], " \r\n\t");
+        end = start;
+        if (line.len == 0) continue;
+        const c = std.mem.count(u8, line, ",");
+        if (c == 0) return rows >= 4; // an instruction below the rows ends the data; before them, no data at all
+        if (cols) |k| {
+            if (k != c) return false;
+        } else cols = c;
+        rows += 1;
+    }
+    return rows >= 4;
+}
+
+/// The first `max_lines` lines or `max_bytes` bytes, whichever ends first, cut on a line boundary.
+fn headOf(text: []const u8, max_lines: usize, max_bytes: usize) []const u8 {
+    var end: usize = 0;
+    var lines: usize = 0;
+    while (end < text.len and lines < max_lines) {
+        const nl = std.mem.indexOfScalarPos(u8, text, end, '\n') orelse text.len;
+        if (nl + 1 > max_bytes and end > 0) break;
+        end = @min(nl + 1, text.len);
+        lines += 1;
+    }
+    return text[0..@min(end, @max(max_bytes, end))];
+}
+
+/// The last `max_lines` lines or `max_bytes` bytes, whichever is shorter, starting on a line boundary.
+fn tailOf(text: []const u8, max_lines: usize, max_bytes: usize) []const u8 {
+    var start = text.len;
+    var lines: usize = 0;
+    while (start > 0 and lines < max_lines and text.len - start < max_bytes) {
+        const prev = std.mem.lastIndexOfScalar(u8, text[0 .. start - 1], '\n') orelse {
+            start = 0;
+            break;
+        };
+        start = prev + 1;
+        lines += 1;
+    }
+    return text[start..];
+}
+
+/// Render what the model (and the transcript) sees in place of the paste.
+fn pastePointer(gpa: std.mem.Allocator, text: []const u8, rel_path: []const u8) ?[]u8 {
+    const head = headOf(text, PASTE_HEAD_LINES, PASTE_HEAD_BYTES);
+    const tail = tailOf(text[head.len..], PASTE_TAIL_LINES, PASTE_TAIL_BYTES);
+    const lines = countLines(text);
+    return std.fmt.allocPrint(gpa, "{s}\n[... {d} lines, {d} bytes in total. The complete pasted input is saved verbatim at `{s}` in the workdir. Work from that FILE - read_file with a line range, or run_python reading it. Do not retype it into a tool call: it would not fit one completion. ...]\n{s}", .{ std.mem.trimEnd(u8, head, "\r\n"), lines, text.len, rel_path, std.mem.trimStart(u8, tail, "\r\n") }) catch null;
+}
+
+/// Spill `text` to <workdir>/inbox/paste-<stamp>.<csv|txt> and return the pointer text, or null when the
+/// message is not a paste (small, or not line-shaped) or the file could not be written (then the turn runs
+/// as before, with the paste in the prompt).
+fn spillPaste(app: *App, gpa: std.mem.Allocator, workdir: []const u8, text: []const u8, now_s: i64) ?[]u8 {
+    if (!looksLikePaste(text)) return null;
+    var rb: [64]u8 = undefined;
+    const rel = std.fmt.bufPrint(&rb, "inbox/paste-{d}.{s}", .{ now_s, if (csvLike(text)) "csv" else "txt" }) catch return null;
+    const dir = std.fmt.allocPrint(gpa, "{s}/inbox", .{workdir}) catch return null;
+    defer gpa.free(dir);
+    _ = std.Io.Dir.cwd().createDirPathStatus(app.io, dir, .default_dir) catch return null;
+    const path = std.fmt.allocPrint(gpa, "{s}/{s}", .{ workdir, rel }) catch return null;
+    defer gpa.free(path);
+    std.Io.Dir.cwd().writeFile(app.io, .{ .sub_path = path, .data = text }) catch return null;
+    return pastePointer(gpa, text, rel);
+}
+
+test "a paste is spilled by size AND shape: a long request stays a request, 300 rows are data" {
+    const gpa = std.testing.allocator;
+    // under the byte floor: never, however many lines
+    try std.testing.expect(!looksLikePaste("a\n" ** 100));
+    // big but one paragraph: a request, not data
+    const wall = "word " ** 2000;
+    try std.testing.expect(!looksLikePaste(wall));
+    // the shape that cost 27 minutes: an instruction, then hundreds of comma rows
+    var big: std.ArrayListUnmanaged(u8) = .empty;
+    defer big.deinit(gpa);
+    try big.appendSlice(gpa, "Here is the bank export, 300 rows (row,date,account,vendor,amount,status). Record ONLY ops rows.\nReply with exactly two lines.\n\n");
+    var i: usize = 1;
+    while (i <= 300) : (i += 1) try big.print(gpa, "{d},2026-08-{d:0>2},ops,Vendor {d},-{d}.50,CLEARED\n", .{ i, 1 + i % 28, i, 100 + i });
+    try std.testing.expect(looksLikePaste(big.items));
+    try std.testing.expect(csvLike(big.items));
+    try std.testing.expect(!csvLike(wall));
+    const ptr = pastePointer(gpa, big.items, "inbox/paste-1.csv").?;
+    defer gpa.free(ptr);
+    // the instruction survives at the head, the file is named, the middle is gone, the tail is kept
+    try std.testing.expect(std.mem.indexOf(u8, ptr, "Record ONLY ops rows.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ptr, "`inbox/paste-1.csv`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ptr, "150,2026-08") == null);
+    try std.testing.expect(std.mem.indexOf(u8, ptr, "300,2026-08") != null);
+    try std.testing.expect(ptr.len < 3000);
+    try std.testing.expectEqual(@as(usize, 303), countLines(big.items));
+}
+
+pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text_raw: []const u8, loop: u8, tool_client_req: bool, image_b64: []const u8, fast: bool, trace_req: bool) void {
     const gpa = app.gpa;
 
     // TOOL DELEGATION IS ADMIN-ONLY, and the check belongs HERE rather than at the delegation branch.
@@ -2235,6 +2366,24 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     }
 
     // ---- record the user's message BEFORE anything else, so it's durable even if the LLM call dies ----
+    // ---- build root / workdir, hoisted above the transcript append so a large paste can be spilled there first ----
+    var rrb: [700]u8 = undefined;
+    const run_root_m = cpaths.buildRootFromChatBase(&rrb, base, conv);
+    if (run_root_m.len == 0) return;
+    const run_root = gpa.dupe(u8, run_root_m) catch return;
+    defer gpa.free(run_root);
+    const workdir = std.fmt.allocPrint(gpa, "{s}/work", .{run_root}) catch return;
+    defer gpa.free(workdir);
+    _ = std.Io.Dir.cwd().createDirPathStatus(app.io, workdir, .default_dir) catch {};
+
+    // A LARGE PASTE IS DATA, NOT A REQUEST. It is saved to inbox/ in the workdir before anything else happens,
+    // and the turn - transcript, prompt, plan, recall - works from a pointer: the head and tail of the paste
+    // (where the instructions live) and the file's name. See spillPaste for the 27-minute turn this replaces.
+    const spilled = spillPaste(app, gpa, workdir, user_text_raw, nowSecs(app.io));
+    defer if (spilled) |sp| gpa.free(sp);
+    const user_text: []const u8 = spilled orelse user_text_raw;
+    if (spilled != null) emitKV(app, conv_dir, "status", "text", "saved the pasted data to inbox/ in the workdir; working from the file");
+
     appendMsg(app, conv_dir, "user", user_text, "user", nowSecs(app.io));
     emitUserRole(app, conv_dir, user_text); // {"kind":"message","role":"user","content":..}
 
@@ -2250,14 +2399,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
 
     // ---- ToolCtx: byte-for-byte the chat_tools.runMindTool construction (per-uid store, builds/{conv} tree;
     // a SCHEDULED run's tree lives under its task's permanent _sched/{task}/runs/{stamp} dir — see paths.zig) ----
-    var rrb: [700]u8 = undefined;
-    const run_root_m = cpaths.buildRootFromChatBase(&rrb, base, conv);
-    if (run_root_m.len == 0) return;
-    const run_root = gpa.dupe(u8, run_root_m) catch return;
-    defer gpa.free(run_root);
-    const workdir = std.fmt.allocPrint(gpa, "{s}/work", .{run_root}) catch return;
-    defer gpa.free(workdir);
-    _ = std.Io.Dir.cwd().createDirPathStatus(app.io, workdir, .default_dir) catch {};
+    // (run_root and workdir were computed above, before the transcript append, so a paste could be spilled)
     // LLM SCRATCH DIR — the CONV dir, never the build root. llm.zig keys its per-call scratch
     // (.curlcfg-<tag>, .llmreq-<tag>.json, .stream-<tag>.sse) by (dir, tag), and a SUB-CHAT FAMILY
     // shares run_root: two concurrent family turns both labeled "chat" would collide on the same
