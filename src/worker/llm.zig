@@ -85,10 +85,37 @@ fn isWorkersAi(base_url: []const u8) bool {
 /// a bounded distillation job that does not.
 fn thinkingOffFor(tag: []const u8, base_url: []const u8) bool {
     if (!isWorkersAi(base_url)) return false;
-    return !(std.mem.eql(u8, tag, "chat") or std.mem.eql(u8, tag, "plan") or std.mem.eql(u8, tag, "recon"));
+    // The loop verdict keeps its reasoning: with it off (ledger run H, turn 12) the verdict ECHOED the answer
+    // ("TRAVEL_TOTAL=-2892.08") instead of DONE/CONTINUE, the parser read that as continue, and a finished
+    // turn ran 70 more seconds and produced a second, unasked answer.
+    return !(std.mem.eql(u8, tag, "chat") or std.mem.eql(u8, tag, "plan") or std.mem.eql(u8, tag, "recon") or std.mem.eql(u8, tag, "loop"));
 }
 
 const THINK_OFF_FRAG = ",\"chat_template_kwargs\":{\"thinking\":false}";
+
+/// The engine sets this for ONE next call on this thread: the continuation after a reply was cut at the
+/// output cap before it answered. On Workers AI that call runs without reasoning, so the answer comes out
+/// of the context the model already has instead of another minute of thought that the cap cuts again.
+pub threadlocal var think_off_once: bool = false;
+
+fn thinkFragFor(tag: []const u8, base_url: []const u8) []const u8 {
+    if (think_off_once and isWorkersAi(base_url)) {
+        think_off_once = false;
+        return THINK_OFF_FRAG;
+    }
+    return if (thinkingOffFor(tag, base_url)) THINK_OFF_FRAG else "";
+}
+
+test "thinkFragFor: the one-shot override applies to the next Workers AI call only, then clears" {
+    const cf = "https://api.cloudflare.com/client/v4/accounts/abc/ai/v1";
+    think_off_once = true;
+    try std.testing.expectEqualStrings(THINK_OFF_FRAG, thinkFragFor("chat", cf));
+    try std.testing.expectEqualStrings("", thinkFragFor("chat", cf));
+    think_off_once = true;
+    try std.testing.expectEqualStrings("", thinkFragFor("chat", "https://api.deepseek.com/v1")); // not consumed off Workers AI
+    try std.testing.expect(think_off_once);
+    think_off_once = false;
+}
 
 test "splitStat: the status suffix is peeled off the body, and a body without one is whole" {
     const a = splitStat("{\"choices\":[]}\n__VEILSTAT__429");
@@ -105,7 +132,8 @@ test "splitStat: the status suffix is peeled off the body, and a body without on
 test "thinkingOffFor: auxiliary tags on Workers AI only; the chat, plan and recon keep their reasoning" {
     const cf = "https://api.cloudflare.com/client/v4/accounts/abc/ai/v1";
     try std.testing.expect(thinkingOffFor("compact", cf));
-    try std.testing.expect(thinkingOffFor("loop", cf));
+    try std.testing.expect(!thinkingOffFor("loop", cf));
+    try std.testing.expect(thinkingOffFor("planrec", cf));
     try std.testing.expect(thinkingOffFor("memverify", cf));
     try std.testing.expect(!thinkingOffFor("chat", cf));
     try std.testing.expect(!thinkingOffFor("plan", cf));
@@ -595,7 +623,7 @@ pub fn chatTemp(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []
     const mt = effTokens(io, base_url, model, max_tokens);
     const temp_frag = tempFragOwned(gpa, io, model, temperature); // learned-quirk aware (Kimi temp=1, etc.)
     defer gpa.free(temp_frag);
-    const think_frag: []const u8 = if (thinkingOffFor(tag, base_url)) THINK_OFF_FRAG else "";
+    const think_frag: []const u8 = thinkFragFor(tag, base_url);
     const body = std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}]{s}{s},\"max_tokens\":{d}}}", .{ model, msgs.items, temp_frag, think_frag, mt }) catch return oom(gpa);
     defer gpa.free(body);
     var s = completeBody(gpa, io, run_dir, tag, base_url, key, model, body, mt);
@@ -641,7 +669,7 @@ pub fn complete(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []
     const mt = effTokens(io, base_url, model, max_tokens);
     const temp_frag = tempFragOwned(gpa, io, model, temperature); // learned-quirk aware (Kimi temp=1, etc.)
     defer gpa.free(temp_frag);
-    const think_frag: []const u8 = if (thinkingOffFor(tag, base_url)) THINK_OFF_FRAG else "";
+    const think_frag: []const u8 = thinkFragFor(tag, base_url);
     // Learned-quirk pre-echo (the effTemp analog for the reasoning echo): once a model has demanded the
     // echo, every request pre-splices "" into any bare assistant turn BEFORE dispatch — no failed
     // round-trip, at every call site. Callers holding real reasoning text have already echoed it
@@ -2821,6 +2849,7 @@ fn streamAttempt(
     // stream_options.include_usage so the terminal chunk still carries the token meter). ----
     const temp_frag = tempFragOwned(gpa, io, model, temperature); // learned-quirk aware (streamed path)
     defer gpa.free(temp_frag);
+    const think_frag: []const u8 = thinkFragFor(tag, base_url);
 
     // The output budget this request actually asks for — hoisted out of the body builder because it also sizes
     // the deadline (callTimeoutS): the streamed path must not be capped shorter than the tokens it requested.
@@ -2854,9 +2883,9 @@ fn streamAttempt(
         }
         const mt = budget_tokens;
         break :blk (if (tools_json.len > 0)
-            std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"tools\":[{s}],\"stream\":true,\"stream_options\":{{\"include_usage\":true}}{s},\"max_tokens\":{d}}}", .{ model, hosted_msgs, tools_json, temp_frag, mt })
+            std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"tools\":[{s}],\"stream\":true,\"stream_options\":{{\"include_usage\":true}}{s}{s},\"max_tokens\":{d}}}", .{ model, hosted_msgs, tools_json, temp_frag, think_frag, mt })
         else
-            std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"stream\":true,\"stream_options\":{{\"include_usage\":true}}{s},\"max_tokens\":{d}}}", .{ model, hosted_msgs, temp_frag, mt })) catch return null;
+            std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"stream\":true,\"stream_options\":{{\"include_usage\":true}}{s}{s},\"max_tokens\":{d}}}", .{ model, hosted_msgs, temp_frag, think_frag, mt })) catch return null;
     };
     defer gpa.free(body);
 

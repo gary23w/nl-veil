@@ -1939,6 +1939,8 @@ threadlocal var turn_app: ?*App = null;
 /// The coding model's catalog window for the turn on this thread (see workingBudgetBytes); the within-turn
 /// compaction reads it from here because the pass runs on the turn's thread.
 threadlocal var turn_win_hint: ?usize = null;
+/// Whether the catalog marks the coding model as a reasoning model (see turnTokenBudget).
+threadlocal var turn_reasoning: bool = false;
 
 /// llm.zig's retry ladder reports each wait here: "provider busy (HTTP 429): retrying in 20s (2/3)" lands
 /// as a status frame on the running turn, so the desk shows the pause and its reason instead of silence.
@@ -2197,6 +2199,8 @@ test "a failed llm frame carries the error head; a good one carries no err field
 /// What the model is told when it reports a result without having called a tool. Stated as fact, not as a
 /// question: the verdict step already asked "was the work done?" and was answered with the same claim.
 const ZERO_TOOL_NUDGE = "(You reported a result, but you made NO tool call this turn - nothing was read, written or run, so nothing you reported has happened. Do the work now with tools: read what you need, make the change, verify it, then report what the tools showed.)";
+const NOW_NUDGE = "(You answered a question about the CURRENT state without running any tool this turn. What you recall may be stale: files change after they are read, and a partial view is not the whole file. Read or compute the current value with a tool now, then reply with what the tool shows.)";
+const CUT_NUDGE = "(Your previous reply was cut off at the output-token limit before it produced an answer, so nothing from it survived. Do not re-derive at length. If a computation is needed, make ONE tool call that prints the result; then reply with the final answer only, in the format the request asked for.)";
 
 const PASTE_SPILL_BYTES: usize = 6 * 1024;
 const PASTE_SPILL_LINES: usize = 20;
@@ -2370,6 +2374,9 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     const win_hint: ?usize = if (cf_oauth.windowTokensFor(app, uid, trio.coding.model)) |w| @as(usize, w) else null;
     turn_win_hint = win_hint;
     defer turn_win_hint = null;
+    turn_reasoning = cf_oauth.reasoningFor(app, uid, trio.coding.model) orelse false;
+    defer turn_reasoning = false;
+    llm.think_off_once = false;
     trace_enabled = trace_req;
     defer trace_enabled = false;
     traceFrame(app, "worker.chat.engine", "runTurn", "enter", null, null);
@@ -3203,6 +3210,8 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     var foreign_warned = false;
     var drive: usize = 0;
     var zero_tool_nudged = false; // the zero-tool-claim continuation fires once per turn (see below)
+    var ground_nudged = false; // the grounding continuation (a figure from nowhere / a NOW question, no tool run) - once per turn
+    var cut_nudged = false; // the cut-reply continuation (output cap hit before any answer) - once per turn
     outer: while (drive < max_steps) : (drive += 1) {
         // Reaching a SECOND drive step means the answer captured last step was not the turn's answer — drop it
         // (see the capture site). This clear is what makes "still held at the completion site" mean "the turn
@@ -3548,6 +3557,8 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
             } else |_| {}
         }
 
+        const reply_lines = answerLineCount(answer);
+
         // A ZERO-TOOL CLAIM IS NOT DONE. Ledger run 5, turns 13, 14, 21 and 23: "record these transactions" was
         // answered "RECORDED=6 / BALANCE ..." in six seconds with no tool call, and the verdict below accepted it;
         // turn 21's claim was manufactured by the plain-text rescue, which forbids tools by design; turn 23
@@ -3564,6 +3575,55 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
             conv_buf.appendSlice(gpa, ",{\"role\":\"user\",\"content\":") catch break :outer;
             http.jstr(gpa, &conv_buf, ZERO_TOOL_NUDGE) catch break :outer;
             conv_buf.append(gpa, '}') catch break :outer;
+            continue :outer;
+        }
+        // A FIGURE FROM NOWHERE IS A GUESS. Ledger run H, turns 10 and 15: "how many journal lines are there
+        // now" and "balance of payroll right now" were answered in three seconds with no tool call - 77 lines
+        // (92 on disk) and 75977.08 (73977.08 on disk), summed in the model's head from a facts ledger that
+        // showed a clipped view of the journal - and the verdict accepted both. A user acting on either
+        // number is misled. So: no tool ran this turn, the user did not forbid tools, and the reply states a
+        // figure that neither the request nor this turn's tool results nor the facts ledger contains, or the
+        // request asks about the state of things NOW - ONE continuation that says so. The model may then read,
+        // compute, or say the value cannot be derived; the second reply stands. Only a conversation that has
+        // DONE tool work qualifies - a tool result in the history, or a facts ledger - so a pure chat's "366
+        // days in a leap year" is never sent to look for a file.
+        if (!ground_nudged and !zero_tool_nudged and !afk and !inner.tools_ran and tools_spent == 0 and !toolsForbidden(goal_text)) ground: {
+            const trimmed = std.mem.trim(u8, answer, " \r\n\t");
+            if (trimmed.len == 0) break :ground;
+            const facts_text: ?[]u8 = factsLedgerText(app, workdir);
+            defer if (facts_text) |f| gpa.free(f);
+            const worked_before = facts_text != null or std.mem.indexOf(u8, conv_buf.items, "\"role\":\"tool\"") != null;
+            if (!worked_before) break :ground;
+            const stray = ungroundedNumber(trimmed, goal_text, tool_obs.items, facts_text orelse "");
+            if (stray == null and !asksAboutNow(goal_text)) break :ground;
+            ground_nudged = true;
+            var nb: [512]u8 = undefined;
+            const nudge: []const u8 = if (stray) |num|
+                (std.fmt.bufPrint(&nb, "(Your reply states a figure - {s} - that no tool produced this turn and the request did not supply, and no tool ran this turn. A number recalled from earlier is not the current state. Read or compute it with a tool now and reply with what the tool shows; if it genuinely cannot be derived, say so instead of guessing.)", .{num}) catch NOW_NUDGE)
+            else
+                NOW_NUDGE;
+            gpa.free(answer);
+            emitKV(app, conv_dir, "status", "text", "the reply is not grounded in any tool result this turn - continuing");
+            conv_buf.appendSlice(gpa, ",{\"role\":\"user\",\"content\":") catch break :outer;
+            http.jstr(gpa, &conv_buf, nudge) catch break :outer;
+            conv_buf.append(gpa, '}') catch break :outer;
+            continue :outer;
+        }
+        // A CUT IS NOT AN EMPTY REPLY. Ledger run H, turn 23: the model's own script disagreed with ledger.json,
+        // it reasoned about the disagreement for 98 s until the 8192-token output cap cut the call with no
+        // answer, and the plain-text rescue below - which forbids tools by design - reported the script's wrong
+        // figures as the closing balances. A reply cut at the limit before it produced anything gets ONE
+        // continuation first: the model is told what happened and asked to answer directly, one tool call at
+        // most; on Workers AI that call runs without reasoning (llm.think_off_once), so the answer comes out
+        // of the context it already holds. Only a reply that is empty for some other reason reaches the rescue.
+        if (!cut_nudged and inner.truncated and std.mem.trim(u8, answer, " \r\n\t").len == 0) {
+            cut_nudged = true;
+            gpa.free(answer);
+            emitKV(app, conv_dir, "status", "text", "the reply was cut at the output limit before it answered - continuing, directly");
+            conv_buf.appendSlice(gpa, ",{\"role\":\"user\",\"content\":") catch break :outer;
+            http.jstr(gpa, &conv_buf, CUT_NUDGE) catch break :outer;
+            conv_buf.append(gpa, '}') catch break :outer;
+            llm.think_off_once = true;
             continue :outer;
         }
         // EMPTY settled answer (the model "died" — returned no text and no tools, or stripped to nothing).
@@ -3732,6 +3792,19 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
                 }
             }
         } else idle_steps = 0;
+
+        // THE REQUEST FIXED THE REPLY'S SHAPE, AND THE REPLY HAS IT. Ledger run I, turn 9: "reply with exactly two
+        // lines: RECORDED=<n> and BALANCE ops=<amount>" was answered in that form after nine tool calls, and the
+        // drive verdict - after 89 s of thought - named a next step anyway; the model re-ran its script, found
+        // nothing to add, and a second, unasked message reached the user. A reply that fits the line count the
+        // request fixed, after tool work, is the answer: no verdict is asked. (A reply with NO tool work behind
+        // it never gets here on an action request - the zero-tool continuation above already ran.)
+        if (exactReplyLines(goal_text)) |want| {
+            if (inner.tools_ran and reply_lines > 0 and reply_lines <= want) {
+                emitKV(app, conv_dir, "status", "text", "the reply is in the exact form the request asked for - done");
+                break :outer;
+            }
+        }
 
         // DRIVE INFERENCE: one no-tools completion that names the next step (or DONE) — on a BOUNDED context:
         // a goal-anchor system message + the freshest boundary-aligned slice of the conversation + the loop
@@ -5519,6 +5592,9 @@ const InnerResult = struct {
     // no agentic work in flight to continue, so the drive loop's LOOP_QUESTION "are you done?" completion is pure
     // wasted latency (it delayed {done}/usage + the turn-lock release by a full round-trip on every simple Q&A).
     tools_ran: bool = false,
+    /// The provider cut the settling reply at the output-token limit (finish_reason "length"). With an empty
+    /// `content` that is a reply that never got to answer, not an answer of nothing - see the cut continuation.
+    truncated: bool = false,
     /// The ENGINE's own account of why this pass ended (today: the loop-guard hard stop), kept STRICTLY apart
     /// from `content`. `content` is committed as the assistant's durable message, so an engine note folded into
     /// it is stored in the model's voice and replayed next turn as something the model itself said. That is the
@@ -5858,18 +5934,216 @@ fn hasWordMarker(low: []const u8, marker: []const u8) bool {
 /// A request that asks for something to be DONE to the world — files written, code run, things deployed —
 /// as opposed to asked about. Cheap and deliberately broad: it only decides whether a no-tools reply to the
 /// request earns a drive verdict (one short call) rather than ending the turn on the fast path.
+/// The user said, in so many words, that this turn is to be answered WITHOUT tools ("no tools", "prose only",
+/// "without reading any file", "from this conversation only"). Such a request is never action-shaped, and no
+/// grounding continuation fires on it. Ledger run H, turn 19: "In 250 words, why should a journal be
+/// append-only? Prose only, no tools." read as action-shaped ("append-only" matched the verb "append"), the
+/// prose reply carried claim words, and the zero-tool continuation drove the model into 248 s of re-doing
+/// turn 16's work - fourteen tool calls against the books the user had just said not to touch.
+fn toolsForbidden(user_text: []const u8) bool {
+    var buf: [512]u8 = undefined;
+    const n = @min(user_text.len, buf.len);
+    for (user_text[0..n], 0..) |c, i| buf[i] = std.ascii.toLower(c);
+    const low = buf[0..n];
+    const markers = [_][]const u8{ "no tools", "no tool ", "without tools", "without a tool", "without reading", "without using", "don't use tools", "do not use tools", "don't use any tool", "do not use any tool", "do not read", "don't read", "prose only", "from memory", "from this conversation only", "no file access", "without looking" };
+    for (markers) |m| if (std.mem.indexOf(u8, low, m) != null) return true;
+    return false;
+}
+
 fn actionShaped(user_text: []const u8) bool {
     const t = std.mem.trim(u8, user_text, " \r\n\t");
     if (t.len < 12) return false;
+    if (toolsForbidden(t)) return false;
     var buf: [256]u8 = undefined;
     const n = @min(t.len, buf.len);
     for (t[0..n], 0..) |c, i| buf[i] = std.ascii.toLower(c);
     const low = buf[0..n];
     const q_openers = [_][]const u8{ "what ", "what's", "why ", "how ", "when ", "who ", "where ", "which ", "is ", "are ", "do ", "does ", "did ", "can you tell", "could you tell", "explain", "tell me", "describe", "summar", "define" };
-    for (q_openers) |q| if (std.mem.startsWith(u8, low, q)) return false;
-    const verbs = [_][]const u8{ "record ", "write ", "create ", "append", "regenerate", "update ", "edit ", "fix ", "run ", "deploy", "upload", "delete ", "remove ", "rename", "install", "generate", "add ", "save ", "back up", "backup", "reverse ", "correct ", "implement", "refactor", "move ", "copy ", "apply ", "convert ", "migrate", "insert ", "set up", "configure", "build ", "make " };
+    const verbs = [_][]const u8{ "confirm", "verify", "check", "correct ", "reverse", "revert", "compute", "calculate", "count ", "recalculate", "reconcile", "close ", "record ", "write ", "create ", "append", "regenerate", "update ", "edit ", "fix ", "run ", "deploy", "upload", "delete ", "remove ", "rename", "install", "generate", "add ", "save ", "back up", "backup", "reverse ", "correct ", "implement", "refactor", "move ", "copy ", "apply ", "convert ", "migrate", "insert ", "set up", "configure", "build ", "make " };
+    // THE FIRST CLAUSE THAT SPEAKS DECIDES. Clauses begin at the start and after , . : ; ? ! - so "In 250
+    // words, why should a journal be append-only?" is the question its second clause asks, not the "append"
+    // in its subject, and "Northwind's contract was voided. Reverse every line ..." is the order its second
+    // sentence gives. Only when no clause opens with either kind does the broad any-verb rule apply.
+    var it = std.mem.tokenizeAny(u8, low, ",.:;?!\n");
+    while (it.next()) |raw| {
+        const clause = std.mem.trimStart(u8, raw, " \t-()\"'`");
+        if (clause.len == 0) continue;
+        for (q_openers) |q| if (std.mem.startsWith(u8, clause, q)) return false;
+        for (verbs) |v| if (std.mem.startsWith(u8, clause, v)) return true;
+    }
     for (verbs) |v| if (hasWordMarker(low, v)) return true;
     return false;
+}
+
+/// The number of reply lines the request fixed ("reply with exactly two lines", "exactly one line", "the
+/// single line"), or null when it fixed none.
+fn exactReplyLines(user_text: []const u8) ?usize {
+    var buf: [1024]u8 = undefined;
+    const n = @min(user_text.len, buf.len);
+    for (user_text[0..n], 0..) |c, i| buf[i] = std.ascii.toLower(c);
+    const low = buf[0..n];
+    const words = [_]struct { w: []const u8, n: usize }{
+        .{ .w = "one line", .n = 1 },   .{ .w = "1 line", .n = 1 },   .{ .w = "single line", .n = 1 },
+        .{ .w = "two lines", .n = 2 },  .{ .w = "2 lines", .n = 2 },  .{ .w = "three lines", .n = 3 },
+        .{ .w = "3 lines", .n = 3 },    .{ .w = "four lines", .n = 4 }, .{ .w = "4 lines", .n = 4 },
+        .{ .w = "five lines", .n = 5 }, .{ .w = "5 lines", .n = 5 },  .{ .w = "six lines", .n = 6 },
+        .{ .w = "6 lines", .n = 6 },
+    };
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, low, from, "exactly")) |at| {
+        const window = low[at..@min(low.len, at + 40)];
+        for (words) |e| if (std.mem.indexOf(u8, window, e.w) != null) return e.n;
+        from = at + 7;
+    }
+    if (std.mem.indexOf(u8, low, "the single line") != null or std.mem.indexOf(u8, low, "a single line") != null) return 1;
+    return null;
+}
+
+/// Non-empty lines in a reply.
+fn answerLineCount(reply: []const u8) usize {
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, reply, '\n');
+    while (it.next()) |l| {
+        if (std.mem.trim(u8, l, " \t\r").len > 0) n += 1;
+    }
+    return n;
+}
+
+test "exactReplyLines / answerLineCount: the request's fixed reply shape is read, and a reply is measured against it" {
+    try std.testing.expectEqual(@as(?usize, 2), exactReplyLines("Record these. Reply with exactly two lines: `RECORDED=<n>` and `BALANCE ops=<amount>`."));
+    try std.testing.expectEqual(@as(?usize, 1), exactReplyLines("Balance of `payroll` right now? Reply with exactly one line: `BALANCE payroll=<amount>`."));
+    try std.testing.expectEqual(@as(?usize, 5), exactReplyLines("Close the month and reply with exactly five lines, one per account."));
+    try std.testing.expectEqual(@as(?usize, 1), exactReplyLines("Reply with the single line PASSED= or FAILED=."));
+    try std.testing.expect(exactReplyLines("Explain in 250 words how double-entry differs. Prose only.") == null);
+    try std.testing.expect(exactReplyLines("Be exactly as thorough as the README requires.") == null);
+    try std.testing.expectEqual(@as(usize, 2), answerLineCount("RECORDED=60\nBALANCE ops=-21730.65\n"));
+    try std.testing.expectEqual(@as(usize, 3), answerLineCount("RECORDED=60\n\nBALANCE ops=-21730.65\nScript ran. Nothing new was appended."));
+    try std.testing.expectEqual(@as(usize, 0), answerLineCount("  \n"));
+}
+
+/// The request asks about the state of things NOW. Answered with no tool run, such a question gets the
+/// grounding continuation even when its reply carries no figure at all.
+fn asksAboutNow(user_text: []const u8) bool {
+    var buf: [512]u8 = undefined;
+    const n = @min(user_text.len, buf.len);
+    for (user_text[0..n], 0..) |c, i| buf[i] = std.ascii.toLower(c);
+    const low = buf[0..n];
+    const markers = [_][]const u8{ "now", "currently", "current ", "at the moment", "as of ", "so far", "latest", "up to date", "up-to-date" };
+    for (markers) |m| if (hasWordMarker(low, m)) return true;
+    return false;
+}
+
+/// The first figure in `reply` - a run of at least two digits, optionally with a decimal part, not glued to
+/// an identifier (tx-006, v4, 2026-08-08's month) - that appears in none of the request, this turn's tool
+/// observations, or the facts ledger. Such a figure can only have been recalled or computed unseen. Null
+/// when every figure is grounded.
+fn ungroundedNumber(reply: []const u8, request: []const u8, obs: []const []u8, facts: []const u8) ?[]const u8 {
+    var i: usize = 0;
+    while (i < reply.len) {
+        if (!std.ascii.isDigit(reply[i])) {
+            i += 1;
+            continue;
+        }
+        var j = i;
+        var dotted = false;
+        while (j < reply.len) : (j += 1) {
+            if (std.ascii.isDigit(reply[j])) continue;
+            if (reply[j] == '.' and !dotted and j + 1 < reply.len and std.ascii.isDigit(reply[j + 1])) {
+                dotted = true;
+                continue;
+            }
+            break;
+        }
+        const tok = reply[i..j];
+        const before_ok = i == 0 or !(std.ascii.isAlphanumeric(reply[i - 1]) or reply[i - 1] == '_' or reply[i - 1] == '/' or
+            (reply[i - 1] == '-' and i > 1 and std.ascii.isAlphanumeric(reply[i - 2])));
+        const after_ok = j >= reply.len or !(std.ascii.isAlphabetic(reply[j]) or reply[j] == '_');
+        var digits: usize = 0;
+        for (tok) |ch| {
+            if (std.ascii.isDigit(ch)) digits += 1;
+        }
+        if (before_ok and after_ok and digits >= 2) {
+            var found = containsFigure(request, tok) or containsFigure(facts, tok);
+            if (!found) {
+                for (obs) |o| {
+                    if (containsFigure(o, tok)) {
+                        found = true;
+                        break;
+                    }
+                }
+            }
+            if (!found) return tok;
+        }
+        i = j;
+    }
+    return null;
+}
+
+/// `hay` carries the figure `tok` as a whole number: not as the tail of a longer one ("77" is not in
+/// "-47177.67") and not as its head ("92" is not in "9214").
+fn containsFigure(hay: []const u8, tok: []const u8) bool {
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, hay, from, tok)) |at| {
+        const before_ok = at == 0 or !(std.ascii.isDigit(hay[at - 1]) or hay[at - 1] == '.');
+        const end = at + tok.len;
+        const after_ok = end >= hay.len or !(std.ascii.isDigit(hay[end]) or (hay[end] == '.' and end + 1 < hay.len and std.ascii.isDigit(hay[end + 1])));
+        if (before_ok and after_ok) return true;
+        from = at + 1;
+    }
+    return false;
+}
+
+test "containsFigure: whole numbers only" {
+    try std.testing.expect(containsFigure("total lines: 92", "92"));
+    try std.testing.expect(containsFigure("ops=-47177.67", "47177.67"));
+    try std.testing.expect(!containsFigure("ops=-47177.67", "77"));
+    try std.testing.expect(!containsFigure("9214 rows", "92"));
+    try std.testing.expect(!containsFigure("92.5 rows", "92"));
+    try std.testing.expect(containsFigure("(92)", "92"));
+}
+
+/// The facts ledger's text, gpa-owned, or null when the workdir has none.
+fn factsLedgerText(app: *App, workdir: []const u8) ?[]u8 {
+    if (workdir.len == 0) return null;
+    var pb: [1024]u8 = undefined;
+    const path = std.fmt.bufPrint(&pb, "{s}/{s}", .{ workdir, FACTS_LEDGER_NAME }) catch return null;
+    return std.Io.Dir.cwd().readFileAlloc(app.io, path, app.gpa, .limited(FACTS_LEDGER_CAP)) catch null;
+}
+
+test "actionShaped: the first clause decides, and a no-tools request is never action-shaped (ledger run H)" {
+    try std.testing.expect(!actionShaped("In 250 words, why should a journal be append-only? Prose only, no tools."));
+    // "checked against the file" is an instruction to check: an empty or tool-less reply to it earns the continuation
+    try std.testing.expect(actionShaped("Honest answer, checked against the file: did you ever edit or delete an existing line of `ledger/journal.jsonl`?"));
+    try std.testing.expect(!actionShaped("Did you ever edit or delete an existing line of `ledger/journal.jsonl`?"));
+    try std.testing.expect(!actionShaped("Without reading any file - from this conversation only - what was the OPENING balance of `capex`?"));
+    try std.testing.expect(!actionShaped("Balance of `payroll` right now? Reply with exactly one line: `BALANCE payroll=<amount>`."));
+    try std.testing.expect(actionShaped("Northwind's contract was voided. Reverse EVERY journal line with vendor `Northwind` dated in August."));
+    try std.testing.expect(actionShaped("A colleague added up all the `travel` spending in the journal and got -2830.68. Confirm or correct it: reply with exactly one line."));
+    try std.testing.expect(actionShaped("Close the month: regenerate `ledger/ledger.json` from the journal one last time and reply with five lines."));
+    try std.testing.expect(actionShaped("Second half of the month's bank export, 300 rows, same format. Same rule: record ONLY `ops` rows."));
+    try std.testing.expect(toolsForbidden("Explain, prose only, no tools, what a journal is."));
+    try std.testing.expect(!toolsForbidden("Record these 6 transactions."));
+}
+
+test "asksAboutNow / ungroundedNumber: a figure from nowhere is found, a grounded or glued one is not" {
+    try std.testing.expect(asksAboutNow("How many journal lines are there now, counting the opening lines?"));
+    try std.testing.expect(asksAboutNow("Balance of `payroll` right now?"));
+    try std.testing.expect(asksAboutNow("What is the current balance of misc?"));
+    try std.testing.expect(!asksAboutNow("Do you know what a journal is?")); // "know" is not "now"
+    try std.testing.expect(!asksAboutNow("Explain in 250 words how double-entry differs."));
+    const obs = [_][]u8{ @constCast("stdout: total lines: 92"), @constCast("{\"ops\": -47177.67}") };
+    // recalled: neither the request, the observations nor the facts carry 77
+    try std.testing.expectEqualStrings("77", ungroundedNumber("LINES=77", "How many lines are there now?", &obs, "").?);
+    // grounded by a tool result
+    try std.testing.expect(ungroundedNumber("LINES=92", "How many lines are there now?", &obs, "") == null);
+    try std.testing.expect(ungroundedNumber("BALANCE ops=-47177.67", "balance?", &obs, "") == null);
+    // grounded by the request or the facts ledger
+    try std.testing.expect(ungroundedNumber("In 250 words: no.", "Explain in 250 words.", &.{}, "") == null);
+    try std.testing.expect(ungroundedNumber("OPENING capex=50000.0", "opening?", &.{}, "open-capex: 2026-08-01, capex, 50000.0, opening balance") == null);
+    // identifiers and date parts are not figures; single digits are not either
+    try std.testing.expect(ungroundedNumber("tx-006 and v4 on 2026-08-08, 5 rows", "x", &.{}, "2026-08-08") == null);
+    // the first stray figure is the one named
+    try std.testing.expectEqualStrings("75977.08", ungroundedNumber("BALANCE payroll=75977.08", "Balance of payroll right now?", &.{}, "").?);
 }
 
 /// A reply that asserts work was done. Matched on the words a completion claim is made of; a reply that
@@ -7748,14 +8022,22 @@ fn envDisabled(environ: *const std.process.Environ.Map, name: []const u8) bool {
     return std.mem.eql(u8, t, "0") or std.ascii.eqlIgnoreCase(t, "false");
 }
 
-fn turnTokenBudget(environ: *const std.process.Environ.Map, base_url: []const u8, model: []const u8) u32 {
+/// `reasoning` says the serving catalog marks the model as one that reasons before answering (Workers AI's
+/// `reasoning` property, via cf_oauth.reasoningFor). Its thought is spent from the same cap as its answer:
+/// ledger run H, turn 23, deepseek-v4-flash reasoned for 98 s about two disagreeing balance sets, the 8192 cap
+/// cut the call with no answer at all, and the rescue reported the wrong set. Such a model gets twice the cap
+/// (the deadline follows the cap - llm.callTimeoutS), and the provider accepts it (probed: max_tokens up to
+/// 65536 on Workers AI).
+fn turnTokenBudget(environ: *const std.process.Environ.Map, base_url: []const u8, model: []const u8, reasoning: bool) u32 {
     if (environ.get("NL_MAX_TOKENS")) |mts| {
         if (std.fmt.parseInt(u32, std.mem.trim(u8, mts, " \t\r\n"), 10)) |v| return std.math.clamp(v, 256, 32768) else |_| {}
     }
     const local_base = std.mem.indexOf(u8, base_url, "127.0.0.1") != null or std.mem.indexOf(u8, base_url, "localhost") != null;
     const ctx_eff: u32 = @min(modelcfg.senseModel(model, local_base).ctx_k * 1024, 32768);
     const scale = std.math.clamp(@as(f32, @floatFromInt(ctx_eff)) / 32768.0, 0.25, 1.0);
-    return @max(1024, @as(u32, @intFromFloat(8192.0 * scale)));
+    const base = @max(1024, @as(u32, @intFromFloat(8192.0 * scale)));
+    if (reasoning and !local_base) return @min(base * 2, 32768);
+    return base;
 }
 
 /// Bytes of WORKING SPAN a turn may accumulate before compaction must fold it, for a turn whose prompt is
@@ -8143,7 +8425,7 @@ fn runInnerAgentic(
         var chat_cm = meterBegin(app.io);
         traceFrame(app, "worker.llm", "completeStream", "enter", null, null);
         announcePhase(app, "chat");
-        var step = llm.completeStream(gpa, app.io, run_root, "chat", base_url, key, model, conv_buf.items, turn_tools, turnTokenBudget(ctx.environ, base_url, model), 0.7, &sctx, streamOnDelta, streamShouldAbort);
+        var step = llm.completeStream(gpa, app.io, run_root, "chat", base_url, key, model, conv_buf.items, turn_tools, turnTokenBudget(ctx.environ, base_url, model, turn_reasoning), 0.7, &sctx, streamOnDelta, streamShouldAbort);
         traceFrame(app, "worker.llm", "completeStream", "exit", step.ok, null);
         defer step.deinit(gpa);
         streamFlush(&sctx); // emit the last buffered <FLUSH_CHARS chunk so the tail of the reply/reasoning isn't lost
@@ -8257,7 +8539,7 @@ fn runInnerAgentic(
         }
 
         if (step.calls.len == 0) // no tool calls — this settled answer is the turn's reply for this drive step.
-            return .{ .outcome = .settled, .content = gpa.dupe(u8, step.content) catch empty, .tools_ran = any_tool };
+            return .{ .outcome = .settled, .content = gpa.dupe(u8, step.content) catch empty, .tools_ran = any_tool, .truncated = step.truncated };
 
         any_tool = true; // this iteration is running tools — the turn did agentic work, so the drive loop may continue
 
@@ -9954,7 +10236,7 @@ fn summarizeWorkingSpan(app: *App, run_root: []const u8, base_url: []const u8, k
     var msgs: std.ArrayListUnmanaged(u8) = .empty;
     defer msgs.deinit(gpa);
     msgs.appendSlice(gpa, "{\"role\":\"system\",\"content\":") catch return null;
-    http.jstr(gpa, &msgs, "You compress the working log of an in-progress task so it can continue without exceeding the context window. Write two sections. PROGRESS (at most 150 words): files created/edited, commands run and their key results, decisions made, what remains. FACTS: every concrete value the tool results established - identifiers, names, amounts, dates, tokens, statuses, URLs, error strings - one per line as key: value (from <call>), and every FACT already listed in an earlier note within this log, kept verbatim. Facts were paid for with calls a summary cannot replay; a fact dropped here is bought again. Output ONLY the note.") catch return null;
+    http.jstr(gpa, &msgs, "You compress the working log of an in-progress task so it can continue without exceeding the context window. Write two sections. PROGRESS (at most 150 words): files created/edited, commands run and their key results, decisions made, what remains. FACTS: every concrete value the tool results established - identifiers, names, amounts, dates, tokens, statuses, URLs, error strings - one per line as key: value (from <call>), and every FACT already listed in an earlier note within this log, kept verbatim. A value a later call can change (a balance, a count, a file's size or contents) is recorded WITH the moment it was seen - 'balance ops=-19408.36 (as of the reversal step; re-derive before reporting)' - never as a bare present-tense claim; a clipped or partial view of a file is recorded as 'partial view (lines 1-62 of 92)' with what it covered, never as the file. Facts were paid for with calls a summary cannot replay; a fact dropped here is bought again. Output ONLY the note.") catch return null;
     msgs.appendSlice(gpa, "},{\"role\":\"user\",\"content\":") catch return null;
     var uc: std.ArrayListUnmanaged(u8) = .empty;
     defer uc.deinit(gpa);
@@ -10087,7 +10369,7 @@ fn handoffRow(gpa: std.mem.Allocator, note: []const u8, handoff: []const u8, cap
 const WORKING_NOTE_CAP: usize = 12 * 1024;
 /// The engine-kept facts ledger in the build workdir (see factsLedgerAppend): a dotfile the agent may read.
 const FACTS_LEDGER_NAME = ".veil-facts.md";
-const FACTS_LEDGER_HEAD = "# facts ledger (engine-kept). Every concrete value that tool results established in this conversation, one per line, deduplicated. READ THIS before re-querying anything: each line was paid for.\n";
+const FACTS_LEDGER_HEAD = "# facts ledger (engine-kept). Concrete values that tool results established in this conversation, one per line, deduplicated - each is what a tool showed WHEN IT RAN, not a statement about now. Use it to avoid re-buying settled facts: paths, formats, rules, identifiers, decisions. Do NOT sum, count or extrapolate from these lines to answer about the CURRENT state of a file: files change after their lines are recorded, and a clipped view is not the whole file. Read or recompute with a tool instead.\n";
 const FACTS_LEDGER_CAP: usize = 96 * 1024;
 
 /// The body of a compaction note's FACTS section (whatever follows a line that is just "FACTS", under any
@@ -10770,27 +11052,30 @@ test "the chat turn's output budget follows the model's window, not a constant" 
     // A big-window model must be able to emit a whole FILE in one call. The flat cap this replaced was 4096,
     // and every failure it caused was a turn that wanted more than that — so "more than the old constant" is
     // the property, stated against the window the catalog actually reports rather than a remembered number.
-    const wide = turnTokenBudget(&env, HOSTED, "deepseek-v4-pro");
+    const wide = turnTokenBudget(&env, HOSTED, "deepseek-v4-pro", false);
     try t.expect(modelcfg.senseModel("deepseek-v4-pro", false).ctx_k * 1024 >= 32768);
     try t.expect(wide > 4096);
+    // A reasoning model gets twice the cap, never past the ceiling; a local one is left alone.
+    try t.expectEqual(2 * wide, turnTokenBudget(&env, HOSTED, "deepseek-v4-pro", true));
+    try t.expect(turnTokenBudget(&env, HOSTED, "deepseek-v4-pro", true) <= 32768);
 
     // Proportional, not uniform: a model that cannot hold a big window is not asked to fill one. Derive the
     // expectation from the same catalog reading the function uses, so a catalog change moves both together.
     const small_id = "llama3.1:8b";
     const small_ctx = modelcfg.senseModel(small_id, true).ctx_k * 1024;
-    const narrow = turnTokenBudget(&env, LOCALHOST, small_id);
+    const narrow = turnTokenBudget(&env, LOCALHOST, small_id, false);
     if (small_ctx < 32768) try t.expect(narrow < wide);
     try t.expect(narrow >= 1024); // ...but never below the floor: even a small model must finish a tool call
 
     // NL_MAX_TOKENS is the one override, and it is clamped at both ends rather than trusted.
     try env.put("NL_MAX_TOKENS", "16000");
-    try t.expectEqual(@as(u32, 16000), turnTokenBudget(&env, HOSTED, "deepseek-v4-pro"));
+    try t.expectEqual(@as(u32, 16000), turnTokenBudget(&env, HOSTED, "deepseek-v4-pro", false));
     try env.put("NL_MAX_TOKENS", "999999");
-    try t.expectEqual(@as(u32, 32768), turnTokenBudget(&env, HOSTED, "deepseek-v4-pro"));
+    try t.expectEqual(@as(u32, 32768), turnTokenBudget(&env, HOSTED, "deepseek-v4-pro", false));
     try env.put("NL_MAX_TOKENS", "1");
-    try t.expectEqual(@as(u32, 256), turnTokenBudget(&env, HOSTED, "deepseek-v4-pro"));
+    try t.expectEqual(@as(u32, 256), turnTokenBudget(&env, HOSTED, "deepseek-v4-pro", false));
     try env.put("NL_MAX_TOKENS", "not a number"); // garbage falls back to the derived budget, never to zero
-    try t.expectEqual(wide, turnTokenBudget(&env, HOSTED, "deepseek-v4-pro"));
+    try t.expectEqual(wide, turnTokenBudget(&env, HOSTED, "deepseek-v4-pro", false));
 }
 
 // ---------------------------------------------------------------------------

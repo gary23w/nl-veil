@@ -581,6 +581,8 @@ fn fetchModelsList(app: *App, uid: u64, alloc: std.mem.Allocator) ?[]const u8 {
             if (std.mem.eql(u8, p.property_id, "context_window")) {
                 const v = std.fmt.parseInt(u32, std.mem.trim(u8, p.value, " \t"), 10) catch continue;
                 rememberWindow(app.io, m.name, v);
+            } else if (std.mem.eql(u8, p.property_id, "reasoning")) {
+                rememberProp(app.io, m.name, null, std.mem.eql(u8, std.mem.trim(u8, p.value, " \t"), "true"));
             }
         }
     }
@@ -603,12 +605,14 @@ fn fetchModelsList(app: *App, uid: u64, alloc: std.mem.Allocator) ?[]const u8 {
 /// falls back to a stale cache if one exists). alloc-owned copy, or null when there's nothing to serve.
 // ------------------------------------------------------------------------------- catalog context windows
 const WIN_SLOTS = 96;
-const WinSlot = struct { name: [120]u8 = undefined, len: usize = 0, tokens: u32 = 0 };
+/// One catalog entry the engine cares about: the window (0 = not stated) and whether the model reasons.
+const WinSlot = struct { name: [120]u8 = undefined, len: usize = 0, tokens: u32 = 0, reasoning: bool = false };
 var win_mtx: std.Io.Mutex = .init;
 var wins: [WIN_SLOTS]WinSlot = @splat(.{});
 
-fn rememberWindow(io: std.Io, name: []const u8, tokens: u32) void {
-    if (name.len == 0 or name.len > 120 or tokens == 0) return;
+/// Record what the catalog states for `name`; a null field leaves the slot's value alone.
+fn rememberProp(io: std.Io, name: []const u8, tokens: ?u32, reasoning: ?bool) void {
+    if (name.len == 0 or name.len > 120) return;
     win_mtx.lockUncancelable(io);
     defer win_mtx.unlock(io);
     var free: ?usize = null;
@@ -618,23 +622,52 @@ fn rememberWindow(io: std.Io, name: []const u8, tokens: u32) void {
             continue;
         }
         if (std.mem.eql(u8, w.name[0..w.len], name)) {
-            w.tokens = tokens;
+            if (tokens) |t| w.tokens = t;
+            if (reasoning) |r| w.reasoning = r;
             return;
         }
     }
     const i = free orelse return; // table full: the models we did keep still answer
     @memcpy(wins[i].name[0..name.len], name);
     wins[i].len = name.len;
-    wins[i].tokens = tokens;
+    wins[i].tokens = tokens orelse 0;
+    wins[i].reasoning = reasoning orelse false;
+}
+
+fn rememberWindow(io: std.Io, name: []const u8, tokens: u32) void {
+    if (tokens == 0) return;
+    rememberProp(io, name, tokens, null);
 }
 
 fn windowFromTable(io: std.Io, model: []const u8) ?u32 {
     win_mtx.lockUncancelable(io);
     defer win_mtx.unlock(io);
     for (&wins) |*w| {
-        if (w.len == model.len and std.mem.eql(u8, w.name[0..w.len], model)) return w.tokens;
+        if (w.len == model.len and std.mem.eql(u8, w.name[0..w.len], model)) return if (w.tokens == 0) null else w.tokens;
     }
     return null;
+}
+
+fn reasoningFromTable(io: std.Io, model: []const u8) ?bool {
+    win_mtx.lockUncancelable(io);
+    defer win_mtx.unlock(io);
+    for (&wins) |*w| {
+        if (w.len == model.len and std.mem.eql(u8, w.name[0..w.len], model)) return w.reasoning;
+    }
+    return null;
+}
+
+/// Whether the Workers AI catalog marks `model` as a reasoning model (its `reasoning` property), or null when
+/// the catalog does not carry the model. Same table and same one-time fetch as windowTokensFor. The engine
+/// doubles such a model's output cap: reasoning is spent from the same cap as the answer (ledger run H, turn
+/// 23: 98 s of thought, cut at 8192 tokens, no answer).
+pub fn reasoningFor(app: *App, uid: u64, model: []const u8) ?bool {
+    if (!std.mem.startsWith(u8, model, "@cf/")) return null;
+    if (reasoningFromTable(app.io, model)) |r| return r;
+    var arena = std.heap.ArenaAllocator.init(app.gpa);
+    defer arena.deinit();
+    _ = modelsJson(app, uid, arena.allocator());
+    return reasoningFromTable(app.io, model);
 }
 
 /// The context window (tokens) the Workers AI catalog states for `model`, or null when the catalog does not
@@ -661,6 +694,14 @@ test "windowTokensFor: the table remembers a model's window and answers only for
     try std.testing.expectEqual(@as(?u32, 32_768), windowFromTable(io, "@cf/test/window-probe-b"));
     try std.testing.expect(windowFromTable(io, "@cf/test/window-probe-c") == null);
     try std.testing.expect(windowFromTable(io, "@cf/test/window-probe-") == null); // prefix is not a match
+    // the reasoning flag rides the same slot, and a reasoning-only entry states no window
+    rememberProp(io, "@cf/test/window-probe-a", null, true);
+    try std.testing.expectEqual(@as(?bool, true), reasoningFromTable(io, "@cf/test/window-probe-a"));
+    try std.testing.expectEqual(@as(?u32, 1_000_000), windowFromTable(io, "@cf/test/window-probe-a"));
+    rememberProp(io, "@cf/test/window-probe-r", null, true);
+    try std.testing.expectEqual(@as(?bool, true), reasoningFromTable(io, "@cf/test/window-probe-r"));
+    try std.testing.expect(windowFromTable(io, "@cf/test/window-probe-r") == null);
+    try std.testing.expect(reasoningFromTable(io, "@cf/test/window-probe-none") == null);
 }
 
 fn modelsJson(app: *App, uid: u64, alloc: std.mem.Allocator) ?[]const u8 {
