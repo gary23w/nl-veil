@@ -47,6 +47,10 @@ pub fn hello(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
 /// 127.0.0.0/8 or ::1 is off-box by definition, and a proxy in front of the server cannot forge it because
 /// this reads the SOCKET, not a header (X-Forwarded-For is attacker-controlled and is deliberately ignored).
 fn fromLoopback(req: *httpz.Request) bool {
+    // A Cloudflare Tunnel (config/cf_tunnel.zig) or any reverse proxy delivers the whole internet to this
+    // socket from 127.0.0.1. The headers they add cannot be stripped by the remote party, so carrying one
+    // means "not local" whatever the peer address says.
+    if (http.viaProxy(req)) return false;
     return switch (req.address) {
         // The WHOLE 127.0.0.0/8 block, not just 127.0.0.1 — every address in it is loopback-only by RFC 1122,
         // and a client that bound 127.0.0.2 is no less on-box.

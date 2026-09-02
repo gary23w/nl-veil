@@ -981,6 +981,10 @@ table.data td.num { text-align: right; font-variant-numeric: tabular-nums; }
   transition: color .13s ease, background .13s ease;
 }
 .cf-card svg { width: 15px; height: 15px; flex: 0 0 auto; color: #f6821f; }
+/* the tunnel's URL box: the address in the brand orange, monospace, in its own field with Copy / Open */
+.cf-tunnel-box { display: flex; gap: 6px; align-items: center; margin-top: 6px; max-width: 560px; }
+.cf-tunnel-box input { flex: 1; min-width: 0; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; padding: 5px 8px; border: 1px solid var(--border, rgba(128,128,128,.35)); border-radius: 6px; background: transparent; color: #f6821f; }
+.cf-switch { display: flex; align-items: center; gap: 6px; white-space: nowrap; }
 .cf-card:hover { background: var(--surface-hover); color: var(--text); }
 .cf-card.on { color: var(--text-secondary); }
 .cf-card.pending { color: var(--warn); }

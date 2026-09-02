@@ -14,6 +14,14 @@ const authErr = http.authErr;
 const Creds = struct { email: []const u8, password: []const u8 };
 
 pub fn register(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
+    // NEVER through a tunnel or proxy, whatever the flag says. A Cloudflare Tunnel makes this server
+    // reachable from the whole internet at a loopback socket; open registration there would hand accounts
+    // to anyone who found the URL. The tunnel also refuses to start while registration is open (cf_tunnel);
+    // this is the second lock on the same door.
+    if (http.viaProxy(req)) {
+        res.status = 403;
+        return res.json(.{ .ok = false, .err = "registration is not available through a tunnel or proxy" }, .{});
+    }
     if (!app.open_registration) {
         res.status = 403;
         return res.json(.{ .ok = false, .err = "registration is closed — neuron-loops is in private beta" }, .{});
@@ -25,18 +33,20 @@ pub fn register(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
 }
 
 pub fn login(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
-    if (!app.login_guard.allowed(req.address)) {
+    if (!app.login_guard.allowed(http.clientAddress(req))) {
         res.status = 429;
         return res.json(.{ .ok = false, .err = "too many failed attempts — try again later" }, .{});
     }
     const body = (req.json(Creds) catch return badReq(res, "malformed JSON body")) orelse return badReq(res, "missing email/password");
     const token = app.auth.login(body.email, body.password) catch |e| {
-        app.login_guard.fail(req.address);
+        app.login_guard.fail(http.clientAddress(req));
         return authErr(res, e);
     };
-    app.login_guard.success(req.address);
+    app.login_guard.success(http.clientAddress(req));
     defer app.gpa.free(token);
-    const cookie = try std.fmt.allocPrint(res.arena, "{s}={s}; HttpOnly; SameSite=Strict; Path=/; Max-Age=2592000", .{ COOKIE, token });
+    // Secure when the visitor came through Cloudflare (the edge speaks HTTPS to them); never on a plain
+    // local http origin, where a Secure cookie would simply not be stored and every login would fail.
+    const cookie = try std.fmt.allocPrint(res.arena, "{s}={s}; HttpOnly; SameSite=Strict; Path=/; Max-Age=2592000{s}", .{ COOKIE, token, if (http.viaProxy(req)) "; Secure" else "" });
     res.header("Set-Cookie", cookie);
     try res.json(.{ .ok = true }, .{});
 }

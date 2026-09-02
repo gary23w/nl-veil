@@ -271,6 +271,8 @@ const api = {
   cfR2:     ()  => jget('/api/v1/oauth/cloudflare/r2', 8000),
   cfR2Sync: ()  => jpost('/api/v1/oauth/cloudflare/r2/sync', {}),
   cfR2Auto: (on) => jpost('/api/v1/oauth/cloudflare/r2/auto', { auto: !!on }),
+  cfTunnel: () => jget('/api/v1/oauth/cloudflare/tunnel', 8000),
+  cfTunnelSet: (on) => jpost('/api/v1/oauth/cloudflare/tunnel', { on: !!on }),
 };
 
 /* ============================================================ theme
@@ -435,9 +437,11 @@ async function refreshCfStatus() {
     stopCfPendingPoll();
     if (!S.cf.models.length) refreshCfModels();
     if (!S.cf.r2) refreshCfR2();
+    refreshCfTunnel();
   } else {
     S.cf.models = [];
     S.cf.r2 = null;
+    S.cf.tunnel = null;
   }
   if (!was && S.cf.connected && wasPending) onCfConnected();
   syncCfSurfaces();
@@ -458,6 +462,46 @@ async function refreshCfModels() {
 async function refreshCfR2() {
   try { S.cf.r2 = await api.cfR2(); } catch (e) { S.cf.r2 = null; }
   syncCfSurfaces();
+}
+
+/** The tunnel snapshot. While a flip is in flight (installing / provisioning / starting) it re-polls
+    every 3s so the URL lands in the box the moment cloudflared registers. */
+async function refreshCfTunnel() {
+  try { S.cf.tunnel = await api.cfTunnel(); } catch (e) { S.cf.tunnel = null; }
+  clearTimeout(S.cfTunnelTimer);
+  if (S.cf.tunnel && /^(installing|provisioning|starting)$/.test(S.cf.tunnel.state || '')) {
+    S.cfTunnelTimer = setTimeout(refreshCfTunnel, 3000);
+  }
+  syncCfSurfaces();
+}
+
+/** The PUBLIC URL row: a switch, one line of state, the URL in its own box with Copy / Open. The server
+    owns every decision (owner-only, registration closed, provisioning through the account). */
+function cfTunnelRowHtml() {
+  const tn = S.cf.tunnel;
+  if (!tn) return `<div class="set-row"><div><b>Public URL <span class="muted">(Cloudflare Tunnel)</span></b><div class="muted">checking…</div></div></div>`;
+  const busy = /^(installing|provisioning|starting)$/.test(tn.state || '');
+  const live = tn.state === 'live';
+  let line;
+  if (!tn.admin) line = 'only the server owner can open a tunnel';
+  else if (live && tn.access) line = 'live — only your Cloudflare email can open it (Cloudflare Access)';
+  else if (live) line = 'live — protected by your veil login';
+  else if (busy) line = esc(tn.state) + '…';
+  else if (tn.last_error) line = `<span style="color:var(--red, #e5484d)">${esc(tn.last_error)}</span>`;
+  else line = 'off — flip the switch to publish this veil at a Cloudflare URL through your account';
+  const mode = live && tn.mode === 'quick'
+    ? ' <span class="muted">(a temporary trycloudflare.com address — add a domain to your Cloudflare account for a permanent one)</span>' : '';
+  return `<div class="set-row">
+      <div><b>Public URL <span class="muted">(Cloudflare Tunnel)</span></b>
+        <div class="muted">${line}${mode}</div>
+        <div class="cf-tunnel-box">
+          <input type="text" readonly id="cfTunnelUrl" value="${esc(tn.url || '')}" placeholder="no url yet">
+          <button class="btn btn-sm" id="cfTunnelCopy" ${tn.url ? '' : 'disabled'}>Copy</button>
+          ${tn.url ? `<a class="btn btn-sm" href="${esc(tn.url)}" target="_blank" rel="noopener">Open</a>` : ''}
+        </div>
+      </div>
+      <label class="muted cf-switch"><input type="checkbox" id="cfTunnelOn" ${tn.on || live || busy ? 'checked' : ''} ${tn.admin && !busy ? '' : 'disabled'}> tunnel</label>
+    </div>`;
 }
 
 /** Open the consent tab. No 'noopener': the callback page pings window.opener so this tab can
@@ -726,7 +770,8 @@ function cfPanelHtml() {
         <label class="muted"><input type="checkbox" id="cfR2Auto" ${!r2 || r2.auto ? 'checked' : ''}> auto</label>
         <button class="btn btn-sm" id="cfR2Sync" ${r2 && r2.busy ? 'disabled' : ''}>Sync now</button>
       </div>
-    </div>`;
+    </div>
+    ${cfTunnelRowHtml()}`;
 }
 
 /** Repaint the Settings panel in place (same pattern as refreshInstallCard) — but only when the
@@ -753,6 +798,27 @@ function refreshCfPanel() {
       toast('Backup started', 'Syncing your chats to R2 in the background.', 'ok');
       setTimeout(refreshCfR2, 3000);
     } catch (e) { toast('Could not start the backup', e.message, 'err'); }
+  });
+  const tun = el('cfTunnelOn');
+  if (tun) tun.addEventListener('change', async (e) => {
+    const want = e.target.checked;
+    try {
+      await api.cfTunnelSet(want);
+      if (S.cf.tunnel) { S.cf.tunnel.on = want; S.cf.tunnel.state = want ? 'starting' : 'off'; if (!want) S.cf.tunnel.url = ''; }
+      toast(want ? 'Opening the tunnel' : 'Tunnel closed',
+        want ? 'Provisioning through your Cloudflare account — the URL appears here in a moment.' : '', 'ok');
+      refreshCfPanel();
+      setTimeout(refreshCfTunnel, 1500);
+    } catch (err) {
+      e.target.checked = !want;
+      toast('Could not change the tunnel', err.message, 'err');
+    }
+  });
+  const copy = el('cfTunnelCopy');
+  if (copy) copy.addEventListener('click', () => {
+    const u = el('cfTunnelUrl');
+    if (!u || !u.value) return;
+    navigator.clipboard.writeText(u.value).then(() => toast('Copied', u.value, 'ok'), () => { u.select(); });
   });
   const auto = el('cfR2Auto');
   if (auto) auto.addEventListener('change', async (e) => {

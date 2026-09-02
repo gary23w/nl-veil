@@ -96,7 +96,12 @@ pub const App = struct {
 /// the whole argument for looking an id up instead of deriving it: Cloudflare's canonical catalog is
 /// mirrored at github.com/cloudflare/mcp src/auth/derived-oauth-scopes.json (id -> friendly name), and
 /// the authoritative live copy is an authenticated GET /client/v4/oauth/scopes.
-pub const CF_OAUTH_SCOPES_DEFAULT = "ai.read ai.write workers-r2.read workers-r2.write user-details.read account-settings.read offline_access workers-scripts.read workers-scripts.write workers-scripts.bind page.read page.write d1.read d1.write workers-kv-storage.read workers-kv-storage.write queues.read queues.write vectorize.read vectorize.write workers-routes.read workers-routes.write workers-tail.read workers-observability.read";
+/// TUNNEL SCOPES (2026-09-02, all optional, declared on the client the same day): argotunnel.* is
+/// "Cloudflare Tunnel" (the dashboard labels it "Argo Tunnel (Legacy)"), dns.* / zone.read give the
+/// tunnel its hostname, access.* / access-org.read put an owner-only Access policy in front of it.
+/// A login that pre-dates them simply lacks them; config/cf_tunnel.zig turns the resulting refusal
+/// into "log in again to grant the tunnel permissions".
+pub const CF_OAUTH_SCOPES_DEFAULT = "ai.read ai.write workers-r2.read workers-r2.write user-details.read account-settings.read offline_access workers-scripts.read workers-scripts.write workers-scripts.bind page.read page.write d1.read d1.write workers-kv-storage.read workers-kv-storage.write queues.read queues.write vectorize.read vectorize.write workers-routes.read workers-routes.write workers-tail.read workers-observability.read argotunnel.read argotunnel.write dns.read dns.write zone.read access.read access.write access-org.read";
 
 pub fn metered(app: *App, u: User) bool {
     return app.production and app.ledger != null and !app.auth.isAdmin(u);
@@ -136,6 +141,40 @@ pub fn apiKeyFromReq(req: *httpz.Request) ?[]const u8 {
     const bearer = "Bearer ";
     const tok = if (std.mem.startsWith(u8, h, bearer)) std.mem.trim(u8, h[bearer.len..], " ") else std.mem.trim(u8, h, " ");
     return if (std.mem.startsWith(u8, tok, "nlk_")) tok else null;
+}
+
+/// True when the request reached this process through a reverse proxy or a Cloudflare Tunnel rather than
+/// straight from its socket peer. A tunnel's connector runs ON this machine, so every tunneled request has a
+/// loopback peer address — and every decision that used to mean "on this machine" (the browser relay's
+/// pair, the login guard's buckets) would have applied to the whole internet the moment a tunnel came up.
+/// The headers cloudflared and every proxy add cannot be REMOVED by a remote client, so their presence is a
+/// safe reason to deny locality; a local client that adds them only makes itself less trusted.
+pub fn viaProxy(req: *httpz.Request) bool {
+    return req.header("cf-connecting-ip") != null or req.header("x-forwarded-for") != null or req.header("cf-ray") != null;
+}
+
+/// The address to rate-limit by: the visitor's real IP when Cloudflare carried it, else the socket peer.
+/// Through a tunnel every visitor shares one loopback peer, and a guard bucketed on that would lock the
+/// owner out on the first stranger's three bad passwords.
+pub fn clientAddress(req: *httpz.Request) std.Io.net.IpAddress {
+    if (req.header("cf-connecting-ip")) |raw| {
+        const t = std.mem.trim(u8, raw, " \t");
+        if (std.Io.net.IpAddress.parse(t, 0)) |a| return a else |_| {}
+    }
+    return req.address;
+}
+
+test "viaProxy / clientAddress: a tunneled request is never local, and is bucketed on its real IP" {
+    var web = httpz.testing.init(.{});
+    defer web.deinit();
+    web.req.address = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 40000 } };
+    try std.testing.expect(!viaProxy(web.req));
+    try std.testing.expectEqual(@as(u8, 127), clientAddress(web.req).ip4.bytes[0]);
+    web.header("cf-connecting-ip", "203.0.113.9");
+    try std.testing.expect(viaProxy(web.req));
+    const a = clientAddress(web.req);
+    try std.testing.expectEqual(@as(u8, 203), a.ip4.bytes[0]);
+    try std.testing.expectEqual(@as(u8, 9), a.ip4.bytes[3]);
 }
 
 pub fn requireAdmin(app: *App, req: *httpz.Request, res: *httpz.Response) ?User {

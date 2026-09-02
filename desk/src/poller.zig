@@ -68,6 +68,7 @@ pub const Poller = struct {
     last_cf_s: i64 = 0, // Cloudflare OAuth status poll throttle (reset to 0 to poll on the next tick)
     last_cfm_s: i64 = 0, // Cloudflare live-models fetch throttle (only while connected; 0 = fetch next tick)
     last_r2_s: i64 = 0, // R2 backup snapshot throttle (only while connected; the card's "backed up 2m ago")
+    last_tun_s: i64 = 0, // Cloudflare Tunnel snapshot throttle (3s while a flip is in flight, else 15s)
     last_bi_s: i64 = 0, // built-in model status poll throttle (0 = poll next tick; verbs reset it)
     last_ds_s: i64 = 0, // training-set capture poll throttle (fast while recording so counts climb live)
     // built-in transition memory (poller-local): a transfer that lands or fails raises ONE toast,
@@ -157,6 +158,8 @@ pub const Poller = struct {
                 .sched_run => self.doSchedRun(c.idStr()),
                 .oauth_cf_login => self.doOauthCfLogin(),
                 .oauth_cf_logout => self.doOauthCfLogout(),
+                .cf_tunnel_on => self.doCfTunnel(true),
+                .cf_tunnel_off => self.doCfTunnel(false),
                 // a "live ↗" on a Cloudflare deploy chip: the URL rides Command.text, the browser opens it
                 .open_url => if (std.mem.startsWith(u8, c.textStr(), "https://")) self.openUrl(c.textStr()),
                 .builtin_pull => self.doBuiltinVerb(.pull),
@@ -700,6 +703,20 @@ pub const Poller = struct {
             if (online and connected and now_s - self.last_r2_s >= 20) {
                 self.last_r2_s = now_s;
                 self.refreshCfR2();
+            }
+            // Cloudflare Tunnel snapshot — 3s while a switch flip is in flight (the URL appears within
+            // seconds of provisioning), 15s otherwise.
+            if (online and connected) {
+                const tun_busy = blk: {
+                    self.store.lock();
+                    defer self.store.unlock();
+                    break :blk self.store.cf_tun_busy;
+                };
+                const tun_every: i64 = if (tun_busy) 3 else 15;
+                if (now_s - self.last_tun_s >= tun_every) {
+                    self.last_tun_s = now_s;
+                    self.refreshCfTunnel();
+                }
             }
         }
 
@@ -1327,6 +1344,83 @@ pub const Poller = struct {
         const en = @min(err.len, self.store.cf_r2_err.len);
         @memcpy(self.store.cf_r2_err[0..en], err[0..en]);
         self.store.cf_r2_err_len = en;
+    }
+
+    /// GET /oauth/cloudflare/tunnel → the store's tunnel snapshot. Notifies on the two transitions a person
+    /// waits for: the URL going live, and a flip failing.
+    fn refreshCfTunnel(self: *Poller) void {
+        var tbuf: [128]u8 = undefined;
+        const tok = self.tokenSnap(&tbuf);
+        const resp = netcli.oauthCfTunnel(self.io, self.gpa, self.port(), tok) orelse return;
+        defer if (resp.body.len > 0) self.gpa.free(resp.body);
+        if (resp.status != 200) return;
+        var sb: [24]u8 = undefined;
+        const state = valueForKey(resp.body, "state", &sb);
+        var ub: [200]u8 = undefined;
+        const url = valueForKey(resp.body, "url", &ub);
+        var eb: [160]u8 = undefined;
+        const err = valueForKey(resp.body, "last_error", &eb);
+        const on = std.mem.indexOf(u8, resp.body, "\"on\":true") != null;
+        const admin = std.mem.indexOf(u8, resp.body, "\"admin\":true") != null;
+        const access = std.mem.indexOf(u8, resp.body, "\"access\":true") != null;
+        const live = std.mem.eql(u8, state, "live");
+        const busy = std.mem.eql(u8, state, "installing") or std.mem.eql(u8, state, "provisioning") or std.mem.eql(u8, state, "starting");
+        var went_live = false;
+        var failed = false;
+        {
+            self.store.lock();
+            defer self.store.unlock();
+            const was_state = self.store.cf_tun_state[0..self.store.cf_tun_state_len];
+            went_live = live and !self.store.cf_tun_live and self.store.cf_tun_seen;
+            failed = std.mem.eql(u8, state, "error") and !std.mem.eql(u8, was_state, "error") and self.store.cf_tun_seen;
+            self.store.cf_tun_seen = true;
+            self.store.cf_tun_on = on;
+            self.store.cf_tun_live = live;
+            self.store.cf_tun_busy = busy;
+            self.store.cf_tun_admin = admin;
+            self.store.cf_tun_access = access;
+            const sn = @min(state.len, self.store.cf_tun_state.len);
+            @memcpy(self.store.cf_tun_state[0..sn], state[0..sn]);
+            self.store.cf_tun_state_len = sn;
+            const un = @min(url.len, self.store.cf_tun_url.len);
+            @memcpy(self.store.cf_tun_url[0..un], url[0..un]);
+            self.store.cf_tun_url_len = un;
+            const en = @min(err.len, self.store.cf_tun_err.len);
+            @memcpy(self.store.cf_tun_err[0..en], err[0..en]);
+            self.store.cf_tun_err_len = en;
+        }
+        if (went_live) self.store.pushNotif("Tunnel live", if (url.len > 0) url else "your veil is reachable through Cloudflare", 1);
+        if (failed) self.store.pushNotif("Tunnel failed", if (err.len > 0) err else "see Settings for the reason", 2);
+    }
+
+    /// POST /oauth/cloudflare/tunnel {on}: the switch. The server answers at once and works in the
+    /// background; the fast poll above shows the state, then the URL.
+    fn doCfTunnel(self: *Poller, on: bool) void {
+        var tbuf: [128]u8 = undefined;
+        const tok = self.tokenSnap(&tbuf);
+        const resp = netcli.oauthCfTunnelSet(self.io, self.gpa, self.port(), tok, on) orelse {
+            self.store.pushNotif("Cloudflare tunnel", "server unreachable - is it running?", 2);
+            return;
+        };
+        defer if (resp.body.len > 0) self.gpa.free(resp.body);
+        if (resp.status < 200 or resp.status >= 300) {
+            var eb: [160]u8 = undefined;
+            const err = valueForKey(resp.body, "err", &eb);
+            self.store.pushNotif("Cloudflare tunnel", if (err.len > 0) err else "the server refused the switch", 2);
+            return;
+        }
+        {
+            self.store.lock();
+            defer self.store.unlock();
+            self.store.cf_tun_on = on;
+            self.store.cf_tun_busy = on;
+            if (!on) {
+                self.store.cf_tun_live = false;
+                self.store.cf_tun_url_len = 0;
+                self.store.cf_tun_state_len = 0;
+            }
+        }
+        self.last_tun_s = 0; // poll promptly so the state line moves at once
     }
 
     fn notifyTransitions(self: *Poller, online: bool, swarms: []const scan.SwarmSummary, sel: []const u8, sel_metrics: scan.Metrics) void {
