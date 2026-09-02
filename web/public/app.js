@@ -470,7 +470,7 @@ async function refreshCfR2() {
 async function refreshCfTunnel() {
   try { S.cf.tunnel = await api.cfTunnel(); } catch (e) { S.cf.tunnel = null; }
   clearTimeout(S.cfTunnelTimer);
-  if (S.cf.tunnel && /^(installing|provisioning|starting)$/.test(S.cf.tunnel.state || '')) {
+  if (S.cf.tunnel && /^(installing|provisioning|starting|publishing)$/.test(S.cf.tunnel.state || '')) {
     S.cfTunnelTimer = setTimeout(refreshCfTunnel, 3000);
   }
   syncCfSurfaces();
@@ -481,13 +481,14 @@ async function refreshCfTunnel() {
 function cfTunnelRowHtml() {
   const tn = S.cf.tunnel;
   if (!tn) return `<div class="set-row"><div><b>Public URL <span class="muted">(Cloudflare Tunnel)</span></b><div class="muted">checking…</div></div></div>`;
-  const busy = /^(installing|provisioning|starting)$/.test(tn.state || '');
+  const busy = /^(installing|provisioning|starting|publishing)$/.test(tn.state || '');
   const live = tn.state === 'live';
   let line;
   if (!tn.admin) line = 'only the server owner can open a tunnel';
   else if (live && tn.access) line = 'live — only your Cloudflare email can open it (Cloudflare Access)';
   else if (live && !tn.use_domain) line = 'live — a confidential address only you are shown; your veil login is the gate';
   else if (live) line = 'live — protected by your veil login';
+  else if (tn.state === 'publishing') line = 'registered — waiting for Cloudflare to publish the address (a few seconds)…';
   else if (busy) line = esc(tn.state) + '…';
   else if (tn.last_error) line = `<span style="color:var(--red, #e5484d)">${esc(tn.last_error)}</span>`;
   else line = 'off — flip the switch to publish this veil at a Cloudflare URL through your account';
@@ -509,6 +510,7 @@ function cfTunnelRowHtml() {
           <button class="btn btn-sm" id="cfTunnelCopy" ${tn.url ? '' : 'disabled'}>Copy</button>
           ${tn.url ? `<a class="btn btn-sm" href="${esc(tn.url)}" target="_blank" rel="noopener">Open</a>` : ''}
         </div>
+        ${live && tn.published === false ? '<div class="muted" style="color:var(--orange, #e8a33d)">Cloudflare\'s resolver has not published this address yet — give it a minute before opening it.</div>' : ''}
       </div>
       <label class="muted cf-switch"><input type="checkbox" id="cfTunnelOn" ${tn.on || live || busy ? 'checked' : ''} ${tn.admin && !busy ? '' : 'disabled'}> tunnel</label>
     </div>`;
