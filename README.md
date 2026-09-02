@@ -133,16 +133,19 @@ are jailed to the workspace, and `cf_api` refuses any path that would send your 
 ### Public URL - the tunnel switch
 
 Once you are logged in with Cloudflare, Settings gains a **Public URL (Cloudflare Tunnel)** row with a
-switch and a box. Flip the switch and the veil publishes itself at a Cloudflare URL **through your own
-account**: it finds or fetches Cloudflare's official `cloudflared` connector, creates a named tunnel on your
-account, points it at this server, gives it a hostname on one of your domains (`veil.<your zone>`), and puts
-a **Cloudflare Access** policy in front of it that admits only your own email when your account has a Zero
-Trust organization. The URL lands in the box (Copy / Open); the desk shows the same row, and the switch
-position survives a restart. On a headless box, `NL_TUNNEL=1` (or `veil --tunnel`) turns it on at boot and
-the URL is printed in the log when the connector registers.
+switch and a box. Flip the switch and the veil is reachable at a Cloudflare URL. By default that address is
+**confidential**: a random, unlisted `trycloudflare.com` hostname that changes on every start and puts nothing
+on any domain you own - the veil is a personal harness, and a URL nobody can guess or look up is the right
+default for one. The switch finds or fetches Cloudflare's official `cloudflared` connector and runs it against
+this server; the URL lands in the box (Copy / Open), the desk shows the same row, and the switch position
+survives a restart. On a headless box, `NL_TUNNEL=1` (or `veil --tunnel`) turns it on at boot and the URL is
+printed in the log when the connector registers.
 
-An account with no domain on Cloudflare gets a *quick* tunnel instead: a temporary `trycloudflare.com`
-address, no Access policy, and the status says so.
+Tick **use my domain** and it becomes a named tunnel **through your own account** instead: created on the
+account, pointed at this server, given the hostname you typed on one of your domains (or `veil.<your first
+domain>`), and put behind a **Cloudflare Access** policy that admits only your own email when your account has
+a Zero Trust organization. That address is permanent and public in the DNS sense, which is exactly why it is a
+choice and not the default.
 
 What keeps that safe to do:
 

@@ -158,8 +158,8 @@ pub const Poller = struct {
                 .sched_run => self.doSchedRun(c.idStr()),
                 .oauth_cf_login => self.doOauthCfLogin(),
                 .oauth_cf_logout => self.doOauthCfLogout(),
-                .cf_tunnel_on => self.doCfTunnel(true),
-                .cf_tunnel_off => self.doCfTunnel(false),
+                .cf_tunnel_on => self.doCfTunnel(true, std.mem.eql(u8, c.idStr(), "domain"), c.textStr()),
+                .cf_tunnel_off => self.doCfTunnel(false, false, ""),
                 // a "live ↗" on a Cloudflare deploy chip: the URL rides Command.text, the browser opens it
                 .open_url => if (std.mem.startsWith(u8, c.textStr(), "https://")) self.openUrl(c.textStr()),
                 .builtin_pull => self.doBuiltinVerb(.pull),
@@ -1363,6 +1363,9 @@ pub const Poller = struct {
         const on = std.mem.indexOf(u8, resp.body, "\"on\":true") != null;
         const admin = std.mem.indexOf(u8, resp.body, "\"admin\":true") != null;
         const access = std.mem.indexOf(u8, resp.body, "\"access\":true") != null;
+        const use_domain = std.mem.indexOf(u8, resp.body, "\"use_domain\":true") != null;
+        var hb: [128]u8 = undefined;
+        const want_host = valueForKey(resp.body, "want_hostname", &hb);
         const live = std.mem.eql(u8, state, "live");
         const busy = std.mem.eql(u8, state, "installing") or std.mem.eql(u8, state, "provisioning") or std.mem.eql(u8, state, "starting");
         var went_live = false;
@@ -1379,6 +1382,10 @@ pub const Poller = struct {
             self.store.cf_tun_busy = busy;
             self.store.cf_tun_admin = admin;
             self.store.cf_tun_access = access;
+            self.store.cf_tun_use_domain = use_domain;
+            const hn = @min(want_host.len, self.store.cf_tun_want_host.len);
+            @memcpy(self.store.cf_tun_want_host[0..hn], want_host[0..hn]);
+            self.store.cf_tun_want_host_len = hn;
             const sn = @min(state.len, self.store.cf_tun_state.len);
             @memcpy(self.store.cf_tun_state[0..sn], state[0..sn]);
             self.store.cf_tun_state_len = sn;
@@ -1395,10 +1402,16 @@ pub const Poller = struct {
 
     /// POST /oauth/cloudflare/tunnel {on}: the switch. The server answers at once and works in the
     /// background; the fast poll above shows the state, then the URL.
-    fn doCfTunnel(self: *Poller, on: bool) void {
+    fn doCfTunnel(self: *Poller, on: bool, use_domain: bool, hostname: []const u8) void {
         var tbuf: [128]u8 = undefined;
         const tok = self.tokenSnap(&tbuf);
-        const resp = netcli.oauthCfTunnelSet(self.io, self.gpa, self.port(), tok, on) orelse {
+        var body: [320]u8 = undefined;
+        const hn = @min(hostname.len, 200);
+        const req_body: []const u8 = if (on)
+            (std.fmt.bufPrint(&body, "{{\"on\":true,\"use_domain\":{},\"hostname\":\"{s}\"}}", .{ use_domain, hostname[0..hn] }) catch "{\"on\":true}")
+        else
+            "{\"on\":false}";
+        const resp = netcli.oauthCfTunnelSet(self.io, self.gpa, self.port(), tok, req_body) orelse {
             self.store.pushNotif("Cloudflare tunnel", "server unreachable - is it running?", 2);
             return;
         };

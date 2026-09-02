@@ -985,6 +985,8 @@ table.data td.num { text-align: right; font-variant-numeric: tabular-nums; }
 .cf-tunnel-box { display: flex; gap: 6px; align-items: center; margin-top: 6px; max-width: 560px; }
 .cf-tunnel-box input { flex: 1; min-width: 0; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; padding: 5px 8px; border: 1px solid var(--border, rgba(128,128,128,.35)); border-radius: 6px; background: transparent; color: #f6821f; }
 .cf-switch { display: flex; align-items: center; gap: 6px; white-space: nowrap; }
+.cf-tunnel-choice { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 6px; }
+.cf-tunnel-choice input[type=text] { flex: 1; min-width: 220px; font-size: 12px; padding: 4px 8px; border: 1px solid var(--border, rgba(128,128,128,.35)); border-radius: 6px; background: transparent; color: inherit; }
 .cf-card:hover { background: var(--surface-hover); color: var(--text); }
 .cf-card.on { color: var(--text-secondary); }
 .cf-card.pending { color: var(--warn); }

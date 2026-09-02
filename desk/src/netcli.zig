@@ -265,9 +265,9 @@ pub fn oauthCfTunnel(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u
 
 /// POST /api/v1/oauth/cloudflare/tunnel {on} — flip the switch. The reply is immediate; provisioning and
 /// the URL ride the status poll.
-pub fn oauthCfTunnelSet(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8, on: bool) ?Resp {
-    log.trace("netcli.oauthCfTunnelSet port={d} on={}", .{ port, on });
-    return httpReq(io, gpa, "POST", port, "/api/v1/oauth/cloudflare/tunnel", token, if (on) "{\"on\":true}" else "{\"on\":false}", 20);
+pub fn oauthCfTunnelSet(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8, body: []const u8) ?Resp {
+    log.trace("netcli.oauthCfTunnelSet port={d}", .{port});
+    return httpReq(io, gpa, "POST", port, "/api/v1/oauth/cloudflare/tunnel", token, body, 20);
 }
 
 /// GET /api/v1/models/builtin — the built-in engine snapshot (compiled?, weights, transfer progress)
