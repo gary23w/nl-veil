@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const nap = @import("nap.zig");
 const Io = std.Io;
 const store_mod = @import("store.zig");
 const scan = @import("scan.zig");
@@ -1006,6 +1007,7 @@ pub const Chat = struct {
 
         var tick: u32 = 0;
         while (!self.stop.load(.monotonic)) {
+            self.store.chat_beat_ms.store(nap.nowMs(), .monotonic); // heartbeat: the UI reads this (see nap.zig)
             var db: [512]u8 = undefined;
             const dd = self.dataDir(&db);
             self.drainCommands(dd);
@@ -1041,13 +1043,14 @@ pub const Chat = struct {
             if (self.turn != .idle or self.sc_active) {
                 var extra: u8 = 0;
                 while (extra < 2) : (extra += 1) {
-                    self.io.sleep(.{ .nanoseconds = 33 * std.time.ns_per_ms }, .awake) catch {};
+                    nap.ms(33); // NOT io.sleep: see nap.zig for why this thread must not park on the runtime
+                    self.store.chat_beat_ms.store(nap.nowMs(), .monotonic);
                     self.pumpStream(dd);
                     self.pumpServerChat(dd);
                 }
-                self.io.sleep(.{ .nanoseconds = 34 * std.time.ns_per_ms }, .awake) catch {};
+                nap.ms(34);
             } else {
-                self.io.sleep(.{ .nanoseconds = 100 * std.time.ns_per_ms }, .awake) catch {};
+                nap.ms(100);
             }
         }
         llm.abort(&self.stream, self.io);

@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const nap = @import("nap.zig");
 const rl = @import("raylib");
 const t = @import("theme.zig");
 const store_mod = @import("store.zig");
@@ -882,12 +883,7 @@ pub fn runApp(data_dir: ?[]const u8) !void {
         if (ui.hidden or rl.isWindowMinimized()) {
             rl.pollInputEvents();
             watchdog.frameDone();
-            io.sleep(.{ .nanoseconds = HIDDEN_SLEEP_MS * std.time.ns_per_ms }, .awake) catch {
-                // The sleep is the ONLY pacing on this path (no EndDrawing, so no WaitTime). Swallowing an
-                // error here would turn the idle desk into a 100%-CPU spin, so fall back to the frame
-                // pacer rather than trusting it.
-                rl.waitTime(@as(f64, @floatFromInt(HIDDEN_SLEEP_MS)) / 1000.0);
-            };
+            nap.ms(HIDDEN_SLEEP_MS); // NOT io.sleep: the UI thread must never park on the runtime (nap.zig)
             continue;
         }
         watchdog.mark(.input);
@@ -2367,8 +2363,23 @@ fn drawChat(store: *Store, body: t.Rect) void {
     const stream_draft = store.stream_draft;
     const busy = store.chat_busy;
     var status: [96]u8 = undefined;
-    const status_n: usize = store.chat_status_len;
+    var status_n: usize = store.chat_status_len;
     @memcpy(status[0..status_n], store.chat_status[0..status_n]);
+    // A SILENT WORKER SAYS SO. The chat thread writes a heartbeat every tick; when it stops, the last status
+    // ("working.") would otherwise stay on screen indefinitely - which is exactly what a wedged desk looked like.
+    {
+        const beat = store.chat_beat_ms.load(.monotonic);
+        const silent = if (beat > 0) nap.nowMs() - beat else 0;
+        if (silent > nap.SILENT_MS) {
+            if (std.fmt.bufPrint(&status, "chat thread silent for {d}s - the desk's worker is stuck; restart the desk (the server is unaffected)", .{@divTrunc(silent, 1000)})) |txt| {
+                status_n = txt.len;
+            } else |_| {
+                const short = "chat thread silent";
+                @memcpy(status[0..short.len], short);
+                status_n = short.len;
+            }
+        }
+    }
     var casts: [store_mod.MAX_CASTS]store_mod.CastRow = undefined;
     const cast_n = store.cast_count;
     @memcpy(casts[0..cast_n], store.casts[0..cast_n]);

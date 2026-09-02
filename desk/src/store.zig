@@ -777,6 +777,10 @@ pub const Store = struct {
     goto_conv: [64]u8 = undefined, // POLLER→RENDER hand-off: open this conversation in Chat (a run-now's minted
     goto_conv_len: u8 = 0, //         scheduled_* conv); the render loop consumes it once per set
     chat_status: [96]u8 = [_]u8{0} ** 96, // "thinking…" / "casting…" / "watching r3 42%"
+    /// Heartbeats: wall-clock ms of each worker loop's last tick (nap.nowMs), written every iteration and read by
+    /// the UI thread, so a wedged worker shows as "silent for Ns" instead of a frozen status. 0 = not started.
+    chat_beat_ms: std.atomic.Value(i64) = .init(0),
+    poll_beat_ms: std.atomic.Value(i64) = .init(0),
     chat_status_len: u8 = 0,
     // Chat FILES inner tab — files produced inside THIS chat's own build dir ({conv}/work). The chat worker scans
     // + publishes here (mirrors the swarm-file viewer's `files` channel, but scoped to the conversation).

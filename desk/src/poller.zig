@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const nap = @import("nap.zig");
 const Io = std.Io;
 const store_mod = @import("store.zig");
 const scan = @import("scan.zig");
@@ -87,13 +88,15 @@ pub const Poller = struct {
     pub fn run(self: *Poller) void {
         log.trace("poller.run starting", .{});
         while (!self.stop.load(.monotonic)) {
+            self.store.poll_beat_ms.store(nap.nowMs(), .monotonic); // heartbeat (see nap.zig)
             self.syncHost();
             self.drainCommands();
             self.refresh();
             // ~1s cadence, but wake early to service commands responsively (10x100ms polls of the stop flag)
             var i: u8 = 0;
             while (i < 10 and !self.stop.load(.monotonic)) : (i += 1) {
-                self.io.sleep(.{ .nanoseconds = 100 * std.time.ns_per_ms }, .awake) catch {};
+                nap.ms(100); // NOT io.sleep: see nap.zig
+                self.store.poll_beat_ms.store(nap.nowMs(), .monotonic);
                 if (self.hasPendingCmd()) break;
             }
         }
