@@ -2159,6 +2159,10 @@ fn renderLlmFrame(gpa: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), labe
 // turn ended in a failed completion. Turn 10, the second export, did the same. A paste saved to a file before
 // the first model call costs one read_file window or one run_python, and every later prompt in the
 // conversation carries a pointer instead of the paste.
+/// What the model is told when it reports a result without having called a tool. Stated as fact, not as a
+/// question: the verdict step already asked "was the work done?" and was answered with the same claim.
+const ZERO_TOOL_NUDGE = "(You reported a result, but you made NO tool call this turn - nothing was read, written or run, so nothing you reported has happened. Do the work now with tools: read what you need, make the change, verify it, then report what the tools showed.)";
+
 const PASTE_SPILL_BYTES: usize = 6 * 1024;
 const PASTE_SPILL_LINES: usize = 20;
 const PASTE_HEAD_BYTES: usize = 1536;
@@ -3155,6 +3159,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     defer foreign_mem.deinit(gpa);
     var foreign_warned = false;
     var drive: usize = 0;
+    var zero_tool_nudged = false; // the zero-tool-claim continuation fires once per turn (see below)
     outer: while (drive < max_steps) : (drive += 1) {
         // Reaching a SECOND drive step means the answer captured last step was not the turn's answer — drop it
         // (see the capture site). This clear is what makes "still held at the completion site" mean "the turn
@@ -3500,6 +3505,24 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
             } else |_| {}
         }
 
+        // A ZERO-TOOL CLAIM IS NOT DONE. Ledger run 5, turns 13, 14, 21 and 23: "record these transactions" was
+        // answered "RECORDED=6 / BALANCE ..." in six seconds with no tool call, and the verdict below accepted it;
+        // turn 21's claim was manufactured by the plain-text rescue, which forbids tools by design; turn 23
+        // spent 677 s in that rescue and failed. So, before any model judgement and before the claim reaches
+        // the transcript: an action-shaped request, no tool run this whole turn, and a reply that claims work
+        // (or says nothing) gets ONE deterministic continuation that states the fact. The verdict decides only
+        // once the model has been told.
+        if (!zero_tool_nudged and !afk and !inner.tools_ran and tools_spent == 0 and actionShaped(goal_text) and
+            (claimsWork(answer) or std.mem.trim(u8, answer, " \r\n\t").len == 0))
+        {
+            zero_tool_nudged = true;
+            gpa.free(answer);
+            emitKV(app, conv_dir, "status", "text", "the reply claims work, but no tool ran this turn - continuing");
+            conv_buf.appendSlice(gpa, ",{\"role\":\"user\",\"content\":") catch break :outer;
+            http.jstr(gpa, &conv_buf, ZERO_TOOL_NUDGE) catch break :outer;
+            conv_buf.append(gpa, '}') catch break :outer;
+            continue :outer;
+        }
         // EMPTY settled answer (the model "died" — returned no text and no tools, or stripped to nothing).
         // ONE plain-text rescue before surrendering: re-ask with NO tools advertised — the model cannot emit
         // another malformed call, only prose. Small models earn this pass constantly: observed live, a 12B
