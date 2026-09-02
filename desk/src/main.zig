@@ -3037,6 +3037,91 @@ fn agoStr(buf: []u8, secs: i64) []const u8 {
     return std.fmt.bufPrint(buf, "{d}d ago", .{@divTrunc(s, 86400)}) catch "recently";
 }
 
+/// PUBLIC URL (CLOUDFLARE TUNNEL) — the rows under a connected login in Settings: the switch, one line
+/// of state, and the URL in its own box with Copy / Open. The server owns every decision (owner-only,
+/// registration closed, provisioning through the account); this only shows the snapshot and sends the
+/// flip. The switch is disabled while a flip is in flight so it cannot be double-sent.
+fn drawCfTunnelRows(store: *Store, x: f32, y0: f32, colw: f32) f32 {
+    var y = y0;
+    var seen = false;
+    var on = false;
+    var live = false;
+    var busy = false;
+    var admin = false;
+    var access = false;
+    var sb: [24]u8 = undefined;
+    var sn: usize = 0;
+    var ub: [200]u8 = undefined;
+    var un: usize = 0;
+    var eb: [160]u8 = undefined;
+    var en: usize = 0;
+    {
+        store.lock();
+        defer store.unlock();
+        seen = store.cf_tun_seen;
+        on = store.cf_tun_on;
+        live = store.cf_tun_live;
+        busy = store.cf_tun_busy;
+        admin = store.cf_tun_admin;
+        access = store.cf_tun_access;
+        sn = @min(store.cf_tun_state_len, sb.len);
+        @memcpy(sb[0..sn], store.cf_tun_state[0..sn]);
+        un = @min(store.cf_tun_url_len, ub.len);
+        @memcpy(ub[0..un], store.cf_tun_url[0..un]);
+        en = @min(store.cf_tun_err_len, eb.len);
+        @memcpy(eb[0..en], store.cf_tun_err[0..en]);
+    }
+    flabel(x, y, "PUBLIC URL (CLOUDFLARE TUNNEL)");
+    y += 16;
+    if (!seen) {
+        t.text(t.z("checking...", .{}), @intFromFloat(x), @intFromFloat(y + 6), 12, t.comment);
+        return y + 30;
+    }
+    const is_on = on or live or busy;
+    const sw_label: [:0]const u8 = if (is_on) t.z("Tunnel: ON", .{}) else t.z("Tunnel: OFF", .{});
+    const sw = t.btnW(sw_label, t.BTN_MD);
+    const sw_color = if (live) t.green else if (busy) t.orange else t.fg_dim;
+    if (t.button(.{ .x = x, .y = y, .width = sw, .height = t.BTN_MD }, sw_label, sw_color, admin and !busy)) {
+        store.pushCmd(store_mod.mkCmd(if (is_on) .cf_tunnel_off else .cf_tunnel_on, "", ""));
+    }
+    const line: [:0]const u8 = if (!admin)
+        t.z("only the server owner can open a tunnel", .{})
+    else if (live and access)
+        t.z("live - only your Cloudflare email can open it (Access)", .{})
+    else if (live)
+        t.z("live - protected by your veil login", .{})
+    else if (busy)
+        t.z("{s}...", .{sb[0..sn]})
+    else if (en > 0)
+        t.z("{s}", .{eb[0..en]})
+    else
+        t.z("off - flip to publish this veil at a Cloudflare URL through your account", .{});
+    const line_color = if (en > 0 and !live and !busy) t.red else t.comment;
+    t.textClip(line, @intFromFloat(x + sw + 12), @intFromFloat(y + 8), 12, line_color, @intFromFloat(colw - sw - 12));
+    y += t.BTN_MD + 8;
+    const cl = t.z("Copy", .{});
+    const cw = t.btnW(cl, t.BTN_MD);
+    const ol = t.z("Open", .{});
+    const ow = t.btnW(ol, t.BTN_MD);
+    const box = t.Rect{ .x = x, .y = y, .width = colw - cw - ow - 2 * t.GAP, .height = t.FIELD_H };
+    t.panelBordered(box, t.bg, t.border);
+    if (un > 0)
+        t.textClip(t.z("{s}", .{ub[0..un]}), @intFromFloat(box.x + 8), @intFromFloat(box.y + (box.height - 12) / 2), 12, CF_ORANGE, @intFromFloat(box.width - 16))
+    else
+        t.text(t.z("no url yet", .{}), @intFromFloat(box.x + 8), @intFromFloat(box.y + (box.height - 12) / 2), 12, t.comment);
+    if (t.button(.{ .x = box.x + box.width + t.GAP, .y = y, .width = cw, .height = t.BTN_MD }, cl, t.blue, un > 0)) {
+        var cb: [201]u8 = undefined;
+        @memcpy(cb[0..un], ub[0..un]);
+        cb[un] = 0;
+        rl.setClipboardText(cb[0..un :0]);
+    }
+    if (t.button(.{ .x = box.x + box.width + t.GAP + cw + t.GAP, .y = y, .width = ow, .height = t.BTN_MD }, ol, t.blue, un > 0)) {
+        store.pushCmd(store_mod.mkCmd(.open_url, "", ub[0..un]));
+    }
+    y += t.FIELD_H + 8;
+    return y;
+}
+
 fn drawCfProfileCard(store: *Store, r: t.Rect, now_s: i64) f32 {
     var cfc = false;
     var cfp = false;
@@ -8315,6 +8400,7 @@ fn drawSettings(store: *Store, body: t.Rect) void {
                 store.pushCmd(store_mod.mkCmd(.oauth_cf_logout, "", ""));
             }
             y += 44;
+            y = drawCfTunnelRows(store, x, y, colw);
         } else if (cf_configured) {
             // The login is the headline act, so it wears the vendor's own button (cfBrandButton),
             // a size up from the form buttons around it.

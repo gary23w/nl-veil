@@ -33,6 +33,7 @@ const local_models = @import("config/local_models.zig");
 const cf_oauth = @import("config/cf_oauth.zig");
 const cftools = @import("worker/cftools.zig"); // isLoopbackRoot — the NL_CF_API_ROOT gate
 const cf_r2 = @import("config/cf_r2.zig");
+const cf_tunnel = @import("config/cf_tunnel.zig");
 const server_config = @import("config/server_config.zig");
 const lan_mod = @import("config/lan.zig");
 const worker = @import("worker/run.zig");
@@ -324,6 +325,7 @@ pub fn main(init: std.process.Init) !void {
     // behaves exactly like --server-only.
     var desktop_mode = HAS_GUI;
     var desk_requested = false; // an explicit --desk, so a server-only build can say why it did nothing
+    var tunnel_forced = false; // --tunnel: bring the Cloudflare tunnel up at boot (config/cf_tunnel.zig)
     // A real threaded io instead of the default init.io. httpz runs a pool of ~32 worker threads that
     // correctly BLOCK on a condition variable when there is no work — but the default init.io busy-SPINS
     // those blocking waits on Windows, pinning ~10 CPU cores with the server completely idle (0 swarms, no
@@ -380,12 +382,14 @@ pub fn main(init: std.process.Init) !void {
                 desktop_mode = HAS_GUI;
             }
             if (isServerOnly(sub)) desktop_mode = false;
+            if (std.mem.eql(u8, sub, "--tunnel")) tunnel_forced = true;
             while (it.next()) |arg| {
                 if (std.mem.eql(u8, arg, "--desk")) {
                     desk_requested = true;
                     desktop_mode = HAS_GUI;
                 }
                 if (isServerOnly(arg)) desktop_mode = false;
+                if (std.mem.eql(u8, arg, "--tunnel")) tunnel_forced = true;
                 cli_args.append(gpa, try gpa.dupe(u8, arg)) catch {};
             }
         }
@@ -612,6 +616,7 @@ pub fn main(init: std.process.Init) !void {
     // it just reports compiled:false and resolution says unavailable.
     builtin_state.init(io, init.environ_map, paths.data);
     modelpull.configure(gpa, io, init.environ_map);
+    cf_tunnel.configure(init.environ_map, cli_port);
 
     // ---- TRAINING-SET CAPTURE ("build dataset") ----
     // Inert until a set is opened. Configured here so the sets root exists before the first turn,
@@ -779,6 +784,10 @@ pub fn main(init: std.process.Init) !void {
     router.get("/api/v1/oauth/cloudflare/r2", cf_r2.r2Status, .{});
     router.post("/api/v1/oauth/cloudflare/r2/sync", cf_r2.r2SyncNow, .{});
     router.post("/api/v1/oauth/cloudflare/r2/auto", cf_r2.r2SetAuto, .{});
+    // Cloudflare Tunnel (config/cf_tunnel.zig): the snapshot any login may read, the switch only the owner
+    // may flip. The URL it publishes is this server, so the guards live in the module, not here.
+    router.get("/api/v1/oauth/cloudflare/tunnel", cf_tunnel.tunnelStatus, .{});
+    router.post("/api/v1/oauth/cloudflare/tunnel", cf_tunnel.tunnelSet, .{});
     router.get("/api/v1/swarms/:id/events", tail_fanout.swarmEvents, .{});
     router.get("/api/v1/swarms/:id/stream", tail_fanout.swarmStream, .{});
     router.get("/api/v1/swarms/:id/files", deploy_service.swarmFiles, .{});
@@ -891,6 +900,13 @@ pub fn main(init: std.process.Init) !void {
     if (desk_requested and !HAS_GUI)
         log.warn("--desk ignored: this is the SERVER-ONLY build (-Dapp=false), which has no GUI compiled in. The server itself is up (see the URL above) — open it in a browser, or use the standard build.", .{});
 
+    // Cloudflare Tunnel at boot: a switch left on comes back on; NL_TUNNEL=1 / --tunnel forces it. The URL
+    // is logged when the connector registers. Asynchronous - the API must never delay the listener.
+    const tunnel_env = blk: {
+        if (init.environ_map.get("NL_TUNNEL")) |v| break :blk (v.len > 0 and !std.mem.eql(u8, v, "0"));
+        break :blk false;
+    };
+    cf_tunnel.bootAsync(&app, tunnel_forced or tunnel_env);
     // ---- SERVER-ONLY: today's behaviour, unchanged. listen() blocks main until the process is stopped. ----
     if (!desktop_mode or !HAS_GUI) return server.listen();
 
@@ -1663,6 +1679,7 @@ const MAIN_SRC = @embedFile("main.zig");
 
 const ROUTE_MODS = [_]struct { alias: []const u8, src: []const u8 }{
     .{ .alias = "auth_api", .src = @embedFile("auth/auth_api.zig") },
+    .{ .alias = "cf_tunnel", .src = @embedFile("config/cf_tunnel.zig") },
     .{ .alias = "deploy_service", .src = @embedFile("worker/deploy/service.zig") },
     .{ .alias = "tail_fanout", .src = @embedFile("worker/control/fanout.zig") },
     .{ .alias = "control_writer", .src = @embedFile("worker/control/writer.zig") },

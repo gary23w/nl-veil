@@ -130,6 +130,39 @@ advertised nor callable, so swarm minds and the CLI structurally cannot reach yo
 are jailed to the workspace, and `cf_api` refuses any path that would send your token anywhere other than
 `api.cloudflare.com`.
 
+### Public URL - the tunnel switch
+
+Once you are logged in with Cloudflare, Settings gains a **Public URL (Cloudflare Tunnel)** row with a
+switch and a box. Flip the switch and the veil publishes itself at a Cloudflare URL **through your own
+account**: it finds or fetches Cloudflare's official `cloudflared` connector, creates a named tunnel on your
+account, points it at this server, gives it a hostname on one of your domains (`veil.<your zone>`), and puts
+a **Cloudflare Access** policy in front of it that admits only your own email when your account has a Zero
+Trust organization. The URL lands in the box (Copy / Open); the desk shows the same row, and the switch
+position survives a restart. On a headless box, `NL_TUNNEL=1` (or `veil --tunnel`) turns it on at boot and
+the URL is printed in the log when the connector registers.
+
+An account with no domain on Cloudflare gets a *quick* tunnel instead: a temporary `trycloudflare.com`
+address, no Access policy, and the status says so.
+
+What keeps that safe to do:
+
+- **owner only** - the switch is admin-only, and it exposes the whole server, so no ordinary user can open one.
+- **registration stays closed** - the tunnel refuses to start while open registration is on, and the server
+  refuses registration on any request that arrived through a tunnel or proxy, whatever the flag says.
+- **no "localhost trust" for tunneled traffic** - the connector delivers the internet to this server from
+  127.0.0.1, so every decision that used to mean "this caller is on the machine" also requires the request not
+  to carry the headers a tunnel adds, and the login guard rate-limits on the visitor's real address.
+- **the tunnel token stays sealed** - it lives in the vault and reaches `cloudflared` through its environment,
+  never on a command line or in a file.
+- **Access when possible** - with a Zero Trust organization on the account, Cloudflare's own login page stands
+  in front of the veil's; without one, the veil's rate-limited login is the gate, and the status line says
+  which of the two you have.
+- **off means off** - the connector is stopped and reaped; `{"on":false,"delete":true}` on the API also removes
+  the tunnel, its DNS record and its Access app from your account.
+
+The login asks for the tunnel, DNS, zone and Access scopes as *optional* permissions. A login that predates
+them simply lacks them; the switch then says so and asks you to log in with Cloudflare again.
+
 ### Running your own OAuth client (optional)
 
 The shipped client id works out of the box. You only need your own if you are forking the veil or want a

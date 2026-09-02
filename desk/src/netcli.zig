@@ -256,6 +256,20 @@ pub fn oauthCfR2(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8) ?
     return httpReq(io, gpa, "GET", port, "/api/v1/oauth/cloudflare/r2", token, null, 6);
 }
 
+/// GET /api/v1/oauth/cloudflare/tunnel — the tunnel snapshot (state, url, last error) the Settings card
+/// renders. Cheap authed GET beside the R2 poll.
+pub fn oauthCfTunnel(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8) ?Resp {
+    log.trace("netcli.oauthCfTunnel port={d}", .{port});
+    return httpReq(io, gpa, "GET", port, "/api/v1/oauth/cloudflare/tunnel", token, null, 6);
+}
+
+/// POST /api/v1/oauth/cloudflare/tunnel {on} — flip the switch. The reply is immediate; provisioning and
+/// the URL ride the status poll.
+pub fn oauthCfTunnelSet(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8, on: bool) ?Resp {
+    log.trace("netcli.oauthCfTunnelSet port={d} on={}", .{ port, on });
+    return httpReq(io, gpa, "POST", port, "/api/v1/oauth/cloudflare/tunnel", token, if (on) "{\"on\":true}" else "{\"on\":false}", 20);
+}
+
 /// GET /api/v1/models/builtin — the built-in engine snapshot (compiled?, weights, transfer progress)
 /// the Settings tab renders. Cheap authed GET beside the other polls.
 pub fn builtinStatus(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8) ?Resp {

@@ -22,7 +22,7 @@ const SpinLock = struct {
 
 pub const Tab = enum { dashboard, chat, swarm, hub, scheduled, settings }; // deploy = the Swarm tab's inner form
 
-pub const CmdKind = enum { none, select, say, set_goal, stop, deploy, delete, open_folder, refresh_now, open_file, sched_create, sched_update, sched_toggle, sched_delete, sched_run, oauth_cf_login, oauth_cf_logout, open_url, builtin_pull, builtin_cancel, builtin_import, builtin_remove, builtin_check, dataset_start, dataset_stop };
+pub const CmdKind = enum { none, select, say, set_goal, stop, deploy, delete, open_folder, refresh_now, open_file, sched_create, sched_update, sched_toggle, sched_delete, sched_run, oauth_cf_login, oauth_cf_logout, open_url, builtin_pull, builtin_cancel, builtin_import, builtin_remove, builtin_check, dataset_start, dataset_stop, cf_tunnel_on, cf_tunnel_off };
 
 /// A UI→poller command. Fixed-size, copied by value into the ring, so no cross-thread allocation.
 pub const Command = struct {
@@ -874,6 +874,21 @@ pub const Store = struct {
     cf_r2_files: u64 = 0,
     cf_r2_err: [96]u8 = undefined,
     cf_r2_err_len: usize = 0,
+    // --- Cloudflare Tunnel (poller writes from GET /oauth/cloudflare/tunnel; the Settings card reads).
+    // The switch position the server reports, whether cloudflared has a registered connection, whether a
+    // flip is in flight, whether THIS login may flip it (server owner), the public URL, and the last error.
+    cf_tun_seen: bool = false,
+    cf_tun_on: bool = false,
+    cf_tun_live: bool = false,
+    cf_tun_busy: bool = false,
+    cf_tun_admin: bool = false,
+    cf_tun_access: bool = false,
+    cf_tun_state: [24]u8 = undefined,
+    cf_tun_state_len: usize = 0,
+    cf_tun_url: [200]u8 = undefined,
+    cf_tun_url_len: usize = 0,
+    cf_tun_err: [160]u8 = undefined,
+    cf_tun_err_len: usize = 0,
 
     // --- built-in model status (poller writes from GET /api/v1/models/builtin; Settings tab reads) ---
     // One snapshot of the server's own engine: whether the binary carries it (-Dbuiltin), whether the
