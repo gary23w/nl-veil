@@ -280,9 +280,17 @@ const TERMINAL_VERIFY_PROMPT_AFK = "Before calling this done, VERIFY the deliver
 /// The single question the drive inference answers between settled steps: it either names the next concrete
 /// step (which becomes a synthetic user turn) or replies DONE. Carries the LOOP_SYSTEM intent inline rather than
 /// swapping the system prompt (a server-turn simplification of desk's dedicated LOOP_SYSTEM driver turn).
+// THE GOAL IS WHAT THE USER ASKED FOR. Measured by scripts/sim/bait.py bt_readme: asked to run the suite and
+// report, the agent answered PASSED=10 FAILED=2 - correct - and this verdict then judged the goal unmet because
+// tests were failing, drove a read / edit_file / re-run, and the user got PASSED=12 FAILED=0 over a code base
+// it never asked to change. The verdict decides what "achieved" means for every tool-using step, so the
+// discipline has to live here, not only in the agent's own prompt.
 const LOOP_QUESTION =
-    "What is the single next concrete step toward the goal? Reply with ONLY that next instruction, or reply " ++
-    "exactly DONE if the goal is fully achieved.";
+    "What is the single next concrete step toward the goal? The goal is what the user ASKED FOR, not what " ++
+    "would make the result look better: a request to run, check, count, measure, compare or report something " ++
+    "is fully achieved once that result has been reported, even when the result is a failure, and a next step " ++
+    "must never fix, refactor or modify anything the user did not ask to change. Reply with ONLY that next " ++
+    "instruction, or reply exactly DONE if the goal is fully achieved.";
 /// The AFK drive question. afk was built as tier-1-plus-overrides: it asked "next step, or DONE", the model
 /// answered DONE, and the engine overrode that with a canned "keep going" — so every cycle the model reached a
 /// conclusion the loop then contradicted, and the only way to obey both was to invent more work. Observed live:
