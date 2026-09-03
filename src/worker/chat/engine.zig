@@ -2374,9 +2374,21 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     const win_hint: ?usize = if (cf_oauth.windowTokensFor(app, uid, trio.coding.model)) |w| @as(usize, w) else null;
     turn_win_hint = win_hint;
     defer turn_win_hint = null;
-    turn_reasoning = cf_oauth.reasoningFor(app, uid, trio.coding.model) orelse false;
+    // the catalog's word, or the client's own observation of reasoning in this model's replies
+    turn_reasoning = (cf_oauth.reasoningFor(app, uid, trio.coding.model) orelse false) or llm.modelReasons(app.io, trio.coding.model);
     defer turn_reasoning = false;
     llm.think_off_once = false;
+    // A trace per turn of what the budget was sized from, so a tiny fold is explained by the record instead
+    // of guessed at (a GLM conversation folded 6 KB at a time for a morning before this line existed).
+    {
+        var tb: [220]u8 = undefined;
+        const local_coding = std.mem.indexOf(u8, trio.coding.base_url, "127.0.0.1") != null or std.mem.indexOf(u8, trio.coding.base_url, "localhost") != null;
+        const win_tok: usize = win_hint orelse @as(usize, modelcfg.senseModel(trio.coding.model, local_coding).ctx_k) * 1024;
+        if (std.fmt.bufPrint(&tb, "context window {d} tokens ({s}); reasoning model: {s}; working span budget up to {d} KB", .{
+            win_tok, @as([]const u8, if (win_hint != null) "catalog" else "id heuristic"), @as([]const u8, if (turn_reasoning) "yes" else "no"),
+            workingBudgetBytes(trio.coding.base_url, trio.coding.model, 0, win_hint) / 1024,
+        })) |t| emitKV(app, conv_dir, "trace", "text", t) else |_| {}
+    }
     trace_enabled = trace_req;
     defer trace_enabled = false;
     traceFrame(app, "worker.chat.engine", "runTurn", "enter", null, null);

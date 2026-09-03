@@ -70,51 +70,138 @@ fn shortErr(msg: []const u8) []const u8 {
     return msg[0..@min(nl, 72)];
 }
 
-/// Workers AI's OpenAI-compatible endpoint, where `chat_template_kwargs.thinking=false` is honoured.
-fn isWorkersAi(base_url: []const u8) bool {
-    return std.mem.indexOf(u8, base_url, "api.cloudflare.com") != null and std.mem.indexOf(u8, base_url, "/ai/") != null;
+/// REASONING OFF FOR THE AUXILIARY CALLS - LEARNED, NEVER HARDCODED. A compaction note, a loop verdict, a
+/// memory check are bounded distillation jobs; a model that reasons for minutes before writing one spends
+/// the turn's wall clock and its output cap on thought nobody reads (C1: 67 compactions, 72% of model time;
+/// a GLM conversation on 2026-09-03: 60-186 s per fold, the last cut at 8192). The knob that silences
+/// reasoning is not universal - measured: deepseek-v4-flash reads `chat_template_kwargs.thinking=false` and
+/// ignores everything else; glm-5.3-flash reads `enable_thinking=false` and ignores `thinking` and
+/// `reasoning_effort`; OpenAI-style APIs take `reasoning_effort` and reject keys they do not know. So it is
+/// LEARNED per model, the way the temperature rules are: once a model has been SEEN reasoning
+/// (Quirk.reasons), each auxiliary call sends the next candidate; a reply that comes back without reasoning
+/// confirms the knob (persisted); a reply with reasoning, or a rejection, moves to the next; after the last
+/// one the model is left to reason (.none, never persisted, so a later provider feature gets its trial
+/// again). A learned knob that stops working is dropped the same way. The answer, the plan, the survey and
+/// the verdict keep their reasoning.
+const ReasonOff = enum { unknown, template, effort, disabled, none };
+const ReasonOffCandidate = struct { knob: ReasonOff, frag: []const u8 };
+/// One trial each, in this order. `template` carries both chat-template keys at once: a Jinja template
+/// reads the variable it knows and ignores the other (DeepSeek: thinking; GLM, Qwen: enable_thinking).
+const REASON_OFF_CANDIDATES = [_]ReasonOffCandidate{
+    .{ .knob = .template, .frag = ",\"chat_template_kwargs\":{\"thinking\":false,\"enable_thinking\":false}" },
+    .{ .knob = .effort, .frag = ",\"reasoning_effort\":\"low\"" },
+    .{ .knob = .disabled, .frag = ",\"thinking\":{\"type\":\"disabled\"}" },
+};
+
+fn reasonOffFrag(knob: ReasonOff) []const u8 {
+    for (REASON_OFF_CANDIDATES) |c| if (c.knob == knob) return c.frag;
+    return "";
 }
 
-/// THINKING OFF FOR THE AUXILIARY CALLS. On deepseek-v4-flash through Workers AI, a compaction note capped at
-/// 3k tokens cost a median 8,192 output tokens and 78 seconds - the model reasoned for minutes to write a
-/// summary - and 67 such calls were 71% of one C1 run's model time. Probed 2026-09-02 on the account:
-/// `chat_template_kwargs: {"thinking": false}` yields zero reasoning characters and an intact answer (71
-/// completion tokens instead of 173, 1.6 s instead of 2.6 s); `reasoning_effort` and `thinking.type` change
-/// nothing. The chat turn keeps its reasoning; so do the plan and the survey before it, which are one call a
-/// turn and benefit from it. Everything else - compaction, verdict, handoff, memory checks, summaries - is
-/// a bounded distillation job that does not.
-fn thinkingOffFor(tag: []const u8, base_url: []const u8) bool {
-    if (!isWorkersAi(base_url)) return false;
-    // The loop verdict keeps its reasoning: with it off (ledger run H, turn 12) the verdict ECHOED the answer
-    // ("TRAVEL_TOTAL=-2892.08") instead of DONE/CONTINUE, the parser read that as continue, and a finished
-    // turn ran 70 more seconds and produced a second, unasked answer.
-    return !(std.mem.eql(u8, tag, "chat") or std.mem.eql(u8, tag, "plan") or std.mem.eql(u8, tag, "recon") or std.mem.eql(u8, tag, "loop"));
+fn reasonOffIndex(knob: ReasonOff) u8 {
+    for (REASON_OFF_CANDIDATES, 0..) |c, k| if (c.knob == knob) return @intCast(k);
+    return REASON_OFF_CANDIDATES.len;
 }
 
-const THINK_OFF_FRAG = ",\"chat_template_kwargs\":{\"thinking\":false}";
+/// The calls that keep their reasoning: the answer itself, the plan and the survey before it, and the verdict
+/// that judges the answer (with reasoning off it echoed the answer instead of DONE - ledger run H, turn 12).
+fn keepsReasoning(tag: []const u8) bool {
+    return std.mem.eql(u8, tag, "chat") or std.mem.eql(u8, tag, "plan") or std.mem.eql(u8, tag, "recon") or std.mem.eql(u8, tag, "loop");
+}
 
 /// The engine sets this for ONE next call on this thread: the continuation after a reply was cut at the
-/// output cap before it answered. On Workers AI that call runs without reasoning, so the answer comes out
-/// of the context the model already has instead of another minute of thought that the cap cuts again.
+/// output cap before it answered, which should come out of the context the model already holds.
 pub threadlocal var think_off_once: bool = false;
 
-fn thinkFragFor(tag: []const u8, base_url: []const u8) []const u8 {
-    if (think_off_once and isWorkersAi(base_url)) {
-        think_off_once = false;
-        return THINK_OFF_FRAG;
-    }
-    return if (thinkingOffFor(tag, base_url)) THINK_OFF_FRAG else "";
+const ReasonOffPick = struct { frag: []const u8 = "", knob: ReasonOff = .unknown, trial: bool = false };
+
+/// What this call sends to silence reasoning, if anything: nothing for a call that keeps its reasoning or a
+/// model never seen reasoning; the learned knob; or the next candidate, on trial.
+fn reasonOffFor(io: std.Io, tag: []const u8, model: []const u8) ReasonOffPick {
+    const once = think_off_once;
+    think_off_once = false;
+    if (keepsReasoning(tag) and !once) return .{};
+    const q = quirkFor(io, model);
+    if (!q.reasons) return .{};
+    return switch (q.reason_off) {
+        .unknown => blk: {
+            if (q.reason_off_trial >= REASON_OFF_CANDIDATES.len) break :blk ReasonOffPick{};
+            const c = REASON_OFF_CANDIDATES[q.reason_off_trial];
+            break :blk ReasonOffPick{ .frag = c.frag, .knob = c.knob, .trial = true };
+        },
+        .none => ReasonOffPick{},
+        else => |k| ReasonOffPick{ .frag = reasonOffFrag(k), .knob = k, .trial = false },
+    };
 }
 
-test "thinkFragFor: the one-shot override applies to the next Workers AI call only, then clears" {
-    const cf = "https://api.cloudflare.com/client/v4/accounts/abc/ai/v1";
+/// The reply to a call that carried `pick`: a silent reply confirms a trial; a reasoning reply or a rejection
+/// moves past the knob, on trial or learned.
+fn observeReasonOff(io: std.Io, model: []const u8, pick: ReasonOffPick, ok: bool, had_reasoning: bool) void {
+    if (pick.knob == .unknown or model.len == 0) return;
+    const h = std.hash.Wyhash.hash(0x9e37, model);
+    quirk_mtx.lockUncancelable(io);
+    defer quirk_mtx.unlock(io);
+    const e = slotForLocked(model, h);
+    if (ok and !had_reasoning) {
+        if (pick.trial) {
+            e.q.reason_off = pick.knob;
+            saveQuirksLocked(io);
+        }
+        return; // confirmed, or the learned knob still works
+    }
+    const next = reasonOffIndex(pick.knob) + 1;
+    e.q.reason_off_trial = next;
+    e.q.reason_off = if (next >= REASON_OFF_CANDIDATES.len) .none else .unknown;
+    if (!pick.trial) saveQuirksLocked(io); // a persisted knob that stopped working is forgotten on disk too
+}
+
+/// This model has been seen reasoning: the trials may begin, and the engine doubles its output cap.
+fn noteReasons(io: std.Io, model: []const u8) void {
+    if (model.len == 0) return;
+    const h = std.hash.Wyhash.hash(0x9e37, model);
+    quirk_mtx.lockUncancelable(io);
+    defer quirk_mtx.unlock(io);
+    const e = slotForLocked(model, h);
+    if (e.q.reasons) return;
+    e.q.reasons = true;
+    saveQuirksLocked(io);
+}
+
+pub fn modelReasons(io: std.Io, model: []const u8) bool {
+    return quirkFor(io, model).reasons;
+}
+
+test "reasonOffFor / observeReasonOff: learned from a silent reply, dropped when reasoning returns, never sent to a model not seen reasoning" {
+    const saved_tbl = quirk_tbl;
+    defer quirk_tbl = saved_tbl;
+    quirk_tbl = @splat(.{});
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const m = "test/reasoner";
+    try std.testing.expectEqualStrings("", reasonOffFor(io, "compact", m).frag); // never seen reasoning: nothing
+    noteReasons(io, m);
+    try std.testing.expect(modelReasons(io, m));
+    const p1 = reasonOffFor(io, "compact", m);
+    try std.testing.expect(p1.trial and p1.knob == .template);
+    observeReasonOff(io, m, p1, true, true); // reasoning came back: next candidate
+    const p2 = reasonOffFor(io, "compact", m);
+    try std.testing.expect(p2.trial and p2.knob == .effort);
+    observeReasonOff(io, m, p2, true, false); // silent: learned
+    const p3 = reasonOffFor(io, "compact", m);
+    try std.testing.expect(!p3.trial and p3.knob == .effort);
+    try std.testing.expectEqualStrings(",\"reasoning_effort\":\"low\"", p3.frag);
+    try std.testing.expectEqualStrings("", reasonOffFor(io, "chat", m).frag); // the answer keeps its reasoning
+    try std.testing.expectEqualStrings("", reasonOffFor(io, "loop", m).frag);
     think_off_once = true;
-    try std.testing.expectEqualStrings(THINK_OFF_FRAG, thinkFragFor("chat", cf));
-    try std.testing.expectEqualStrings("", thinkFragFor("chat", cf));
-    think_off_once = true;
-    try std.testing.expectEqualStrings("", thinkFragFor("chat", "https://api.deepseek.com/v1")); // not consumed off Workers AI
-    try std.testing.expect(think_off_once);
-    think_off_once = false;
+    try std.testing.expect(reasonOffFor(io, "chat", m).knob == .effort); // the one-shot override applies the learned knob
+    try std.testing.expect(!think_off_once);
+    observeReasonOff(io, m, p3, false, false); // rejected: forgotten, on to the next
+    const p4 = reasonOffFor(io, "compact", m);
+    try std.testing.expect(p4.trial and p4.knob == .disabled);
+    observeReasonOff(io, m, p4, true, true); // the last candidate failed: the model is left to reason
+    try std.testing.expectEqualStrings("", reasonOffFor(io, "compact", m).frag);
+    try std.testing.expectEqualStrings("", reasonOffFor(io, "compact", "test/plain").frag);
 }
 
 test "splitStat: the status suffix is peeled off the body, and a body without one is whole" {
@@ -127,19 +214,6 @@ test "splitStat: the status suffix is peeled off the body, and a body without on
     const c = splitStat("\n__VEILSTAT__200");
     try std.testing.expectEqual(@as(u16, 200), c.code);
     try std.testing.expectEqual(@as(usize, 0), c.body_len);
-}
-
-test "thinkingOffFor: auxiliary tags on Workers AI only; the chat, plan and recon keep their reasoning" {
-    const cf = "https://api.cloudflare.com/client/v4/accounts/abc/ai/v1";
-    try std.testing.expect(thinkingOffFor("compact", cf));
-    try std.testing.expect(!thinkingOffFor("loop", cf));
-    try std.testing.expect(thinkingOffFor("planrec", cf));
-    try std.testing.expect(thinkingOffFor("memverify", cf));
-    try std.testing.expect(!thinkingOffFor("chat", cf));
-    try std.testing.expect(!thinkingOffFor("plan", cf));
-    try std.testing.expect(!thinkingOffFor("recon", cf));
-    try std.testing.expect(!thinkingOffFor("compact", "https://api.deepseek.com/v1"));
-    try std.testing.expect(!thinkingOffFor("compact", "http://127.0.0.1:11434/v1"));
 }
 
 /// PROCESS-WIDE TOKEN METER. The provider reports exact prompt/completion token counts in every response's
@@ -623,11 +697,23 @@ pub fn chatTemp(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []
     const mt = effTokens(io, base_url, model, max_tokens);
     const temp_frag = tempFragOwned(gpa, io, model, temperature); // learned-quirk aware (Kimi temp=1, etc.)
     defer gpa.free(temp_frag);
-    const think_frag: []const u8 = thinkFragFor(tag, base_url);
+    const pick = reasonOffFor(io, tag, model);
+    const think_frag: []const u8 = pick.frag;
     const body = std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}]{s}{s},\"max_tokens\":{d}}}", .{ model, msgs.items, temp_frag, think_frag, mt }) catch return oom(gpa);
     defer gpa.free(body);
     var s = completeBody(gpa, io, run_dir, tag, base_url, key, model, body, mt);
     defer s.deinit(gpa);
+    if (s.ok and s.reasoning.len > 0) noteReasons(io, model);
+    if (pick.knob != .unknown) {
+        observeReasonOff(io, model, pick, s.ok, s.reasoning.len > 0);
+        if (!s.ok and think_frag.len > 0) {
+            if (std.mem.replaceOwned(u8, gpa, body, think_frag, "")) |bare| {
+                defer gpa.free(bare);
+                s.deinit(gpa);
+                s = completeBody(gpa, io, run_dir, tag, base_url, key, model, bare, mt);
+            } else |_| {}
+        }
+    }
     if (!s.ok) return err(gpa, s.content);
     return .{ .content = gpa.dupe(u8, s.content) catch return oom(gpa), .ok = true };
 }
@@ -669,7 +755,8 @@ pub fn complete(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []
     const mt = effTokens(io, base_url, model, max_tokens);
     const temp_frag = tempFragOwned(gpa, io, model, temperature); // learned-quirk aware (Kimi temp=1, etc.)
     defer gpa.free(temp_frag);
-    const think_frag: []const u8 = thinkFragFor(tag, base_url);
+    const pick = reasonOffFor(io, tag, model);
+    const think_frag: []const u8 = pick.frag;
     // Learned-quirk pre-echo (the effTemp analog for the reasoning echo): once a model has demanded the
     // echo, every request pre-splices "" into any bare assistant turn BEFORE dispatch — no failed
     // round-trip, at every call site. Callers holding real reasoning text have already echoed it
@@ -687,6 +774,20 @@ pub fn complete(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []
         std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}]{s}{s},\"max_tokens\":{d}}}", .{ model, msgs_eff, temp_frag, think_frag, mt }) catch return stepErr(gpa, "oom");
     defer gpa.free(body);
     var step = completeBody(gpa, io, run_dir, tag, base_url, key, model, body, mt);
+    // THE REPLY TEACHES THE KNOB. A reply with reasoning marks the model as one that reasons (the trials may
+    // begin); the reply to a call that carried a candidate or a learned knob confirms or retires it; and a call
+    // a provider REJECTED for the knob is retried once without it, so a trial never costs the answer.
+    if (step.ok and step.reasoning.len > 0) noteReasons(io, model);
+    if (pick.knob != .unknown) {
+        observeReasonOff(io, model, pick, step.ok, step.reasoning.len > 0);
+        if (!step.ok and think_frag.len > 0) {
+            if (std.mem.replaceOwned(u8, gpa, body, think_frag, "")) |bare| {
+                defer gpa.free(bare);
+                step.deinit(gpa);
+                step = completeBody(gpa, io, run_dir, tag, base_url, key, model, bare, mt);
+            } else |_| {}
+        }
+    }
     // MALFORMED-BODY RECOVERY: the provider rejected our REQUEST as invalid JSON — a conversation turn was
     // serialized broken somewhere upstream (an unterminated content string is the observed shape). Rather
     // than surface a hard error, truncate the messages to the last INTACT turn and retry once. A degraded
@@ -1628,6 +1729,13 @@ const Quirk = struct {
     /// finish_reason "length"), never from the model NAME - the name heuristic in isThinking cannot keep up
     /// with what providers ship, and it silently answered false for a model that was demonstrably reasoning.
     reasoning_budget: bool = false,
+    /// This model has been SEEN reasoning (reasoning_content in a reply) - learned from observation, never
+    /// from the name or a catalog alone. It starts the reasoning-off trials and doubles the output cap.
+    reasons: bool = false,
+    /// The knob that silences this model's reasoning on auxiliary calls (see reasonOffFor); `.unknown` while
+    /// the candidates are on trial, `.none` once every candidate failed (RAM only).
+    reason_off: ReasonOff = .unknown,
+    reason_off_trial: u8 = 0,
 };
 
 const QuirkSlot = struct {
@@ -1697,7 +1805,7 @@ fn quirkFor(io: std.Io, model: []const u8) Quirk {
 /// ignored on parse, so a new constraint class is one added field here: an old engine skips it, a new
 /// engine reads an old file — the store never needs a migration. `temp` travels as the tag name (not the
 /// enum's integer) so a reordered TempRule can't silently reassign every persisted rule.
-const QuirkRec = struct { model: []const u8 = "", temp: []const u8 = "keep", temp_val: f32 = 1.0, reasoning_echo: bool = false, reasoning_budget: bool = false };
+const QuirkRec = struct { model: []const u8 = "", temp: []const u8 = "keep", temp_val: f32 = 1.0, reasoning_echo: bool = false, reasoning_budget: bool = false, reasons: bool = false, reason_off: []const u8 = "unknown" };
 
 /// Fold one on-disk record into the RAM table (caller holds quirk_mtx). File fields never CLOBBER a live
 /// RAM lesson — this process learned from a fresher provider error than anything on disk — they fill gaps:
@@ -1713,6 +1821,8 @@ fn mergeQuirkLocked(model: []const u8, q: Quirk) void {
     }
     if (q.reasoning_echo) e.q.reasoning_echo = true;
     if (q.reasoning_budget) e.q.reasoning_budget = true;
+    if (q.reasons) e.q.reasons = true;
+    if (q.reason_off != .unknown and q.reason_off != .none and e.q.reason_off == .unknown) e.q.reason_off = q.reason_off;
 }
 
 /// Merge the durable store's parseable lines into the table (caller holds quirk_mtx). Best-effort by
@@ -1735,6 +1845,8 @@ fn loadQuirksLocked(io: std.Io) void {
             .temp_val = p.value.temp_val,
             .reasoning_echo = p.value.reasoning_echo,
             .reasoning_budget = p.value.reasoning_budget,
+            .reasons = p.value.reasons,
+            .reason_off = std.meta.stringToEnum(ReasonOff, p.value.reason_off) orelse .unknown,
         });
     }
 }
@@ -1754,10 +1866,12 @@ fn saveQuirksLocked(io: std.Io) void {
         if (e.hash == 0 or e.name_len == 0) continue;
         out.appendSlice(gpa, "{\"model\":") catch return;
         jstr(gpa, &out, e.name[0..e.name_len]) catch return;
-        var tail: [160]u8 = undefined;
-        const t = std.fmt.bufPrint(&tail, ",\"temp\":\"{s}\",\"temp_val\":{d},\"reasoning_echo\":{s},\"reasoning_budget\":{s}}}\n", .{
+        var tail: [240]u8 = undefined;
+        const t = std.fmt.bufPrint(&tail, ",\"temp\":\"{s}\",\"temp_val\":{d},\"reasoning_echo\":{s},\"reasoning_budget\":{s},\"reasons\":{s},\"reason_off\":\"{s}\"}}\n", .{
             @tagName(e.q.temp), e.q.temp_val, if (e.q.reasoning_echo) "true" else "false",
             if (e.q.reasoning_budget) "true" else "false",
+            if (e.q.reasons) "true" else "false",
+            if (e.q.reason_off == .none) "unknown" else @tagName(e.q.reason_off),
         }) catch return;
         out.appendSlice(gpa, t) catch return;
     }
@@ -2802,8 +2916,11 @@ pub fn completeStream(
     // waiting out the whole generation. null ⇒ never aborts.
     should_abort: ?*const fn (ctx: *anyopaque) bool,
 ) Step {
-    return streamAttempt(gpa, io, run_dir, tag, base_url, key, model, messages_json, tools_json, max_tokens, temperature, ctx, on_delta, should_abort) orelse
-        complete(gpa, io, run_dir, tag, base_url, key, model, messages_json, tools_json, max_tokens, temperature);
+    if (streamAttempt(gpa, io, run_dir, tag, base_url, key, model, messages_json, tools_json, max_tokens, temperature, ctx, on_delta, should_abort)) |step| {
+        if (step.ok and step.reasoning.len > 0) noteReasons(io, model); // the answer is where reasoning is usually first seen
+        return step;
+    }
+    return complete(gpa, io, run_dir, tag, base_url, key, model, messages_json, tools_json, max_tokens, temperature);
 }
 
 /// The streaming body. Returns a Step on a clean stream, or null to signal "fall back to complete()".
@@ -2849,7 +2966,8 @@ fn streamAttempt(
     // stream_options.include_usage so the terminal chunk still carries the token meter). ----
     const temp_frag = tempFragOwned(gpa, io, model, temperature); // learned-quirk aware (streamed path)
     defer gpa.free(temp_frag);
-    const think_frag: []const u8 = thinkFragFor(tag, base_url);
+    const pick = reasonOffFor(io, tag, model);
+    const think_frag: []const u8 = pick.frag;
 
     // The output budget this request actually asks for — hoisted out of the body builder because it also sizes
     // the deadline (callTimeoutS): the streamed path must not be capped shorter than the tokens it requested.
