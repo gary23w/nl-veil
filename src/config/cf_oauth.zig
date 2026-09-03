@@ -551,6 +551,51 @@ fn mcFind(uid: u64) ?*McSlot {
 
 /// GET the account's text-generation Workers AI models and build a JSON array of their names
 /// (e.g. `["@cf/meta/llama-3.3-70b-instruct-fp8-fast", …]`). null when not connected or the fetch fails.
+/// The catalog's shape, as much of it as the engine reads. `value` is whatever the catalog puts there - a
+/// string for context_window and reasoning, a LIST for price - so it is read as a JSON value: typing it as
+/// a string failed the whole parse for every paid model, and with it the windows, the reasoning flags and
+/// the model list itself (found 2026-09-03: a GLM conversation folding 6 KB at a time).
+const CatalogResp = struct {
+    result: []const struct {
+        name: []const u8 = "",
+        properties: ?[]const struct { property_id: []const u8 = "", value: std.json.Value = .null } = null,
+    } = &.{},
+};
+
+test "the catalog parse survives a list-valued property and reads the window and the reasoning flag" {
+    const sample =
+        \\{"result":[{"name":"@cf/zai-org/glm-5.3-flash","properties":[{"property_id":"context_window","value":"1310720"},
+        \\{"property_id":"reasoning","value":"true"},{"property_id":"price","value":[{"unit":"per M input tokens","price":0.44,"currency":"USD"}]}]},
+        \\{"name":"@cf/meta/llama-3.3-70b","properties":[{"property_id":"context_window","value":131072},{"property_id":"reasoning","value":false}]},
+        \\{"name":"@cf/x/no-props"}],"success":true,"errors":[],"result_info":{"count":3}}
+    ;
+    const parsed = try std.json.parseFromSlice(CatalogResp, std.testing.allocator, sample, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 3), parsed.value.result.len);
+    var win: ?u32 = null;
+    var reasons: ?bool = null;
+    for (parsed.value.result[0].properties.?) |p| {
+        if (std.mem.eql(u8, p.property_id, "context_window")) win = switch (p.value) {
+            .string => |x| std.fmt.parseInt(u32, x, 10) catch null,
+            .integer => |n| @intCast(n),
+            else => null,
+        };
+        if (std.mem.eql(u8, p.property_id, "reasoning")) reasons = switch (p.value) {
+            .string => |x| std.mem.eql(u8, x, "true"),
+            .bool => |b| b,
+            else => null,
+        };
+    }
+    try std.testing.expectEqual(@as(?u32, 1_310_720), win);
+    try std.testing.expectEqual(@as(?bool, true), reasons);
+    // the second model states its window as a number and its flag as a bool
+    for (parsed.value.result[1].properties.?) |p| {
+        if (std.mem.eql(u8, p.property_id, "context_window")) try std.testing.expectEqual(@as(i64, 131072), p.value.integer);
+        if (std.mem.eql(u8, p.property_id, "reasoning")) try std.testing.expect(!p.value.bool);
+    }
+    try std.testing.expect(parsed.value.result[2].properties == null);
+}
+
 fn fetchModelsList(app: *App, uid: u64, alloc: std.mem.Allocator) ?[]const u8 {
     var scratch = std.heap.ArenaAllocator.init(app.gpa);
     defer scratch.deinit();
@@ -562,13 +607,7 @@ fn fetchModelsList(app: *App, uid: u64, alloc: std.mem.Allocator) ?[]const u8 {
     const url = std.fmt.bufPrint(&ub, "{s}/{s}/ai/models/search?task=Text%20Generation&hide_experimental=true&per_page=100", .{ app.cf_oauth_accounts_url, tok.account_id }) catch return null;
     const raw = curlCall(app, "GET", url, "", tok.key) orelse return null;
     defer app.gpa.free(raw);
-    const ModelsResp = struct {
-        result: []const struct {
-            name: []const u8 = "",
-            properties: ?[]const struct { property_id: []const u8 = "", value: []const u8 = "" } = null,
-        } = &.{},
-    };
-    const parsed = std.json.parseFromSlice(ModelsResp, app.gpa, raw, .{ .ignore_unknown_fields = true }) catch return null;
+    const parsed = std.json.parseFromSlice(CatalogResp, app.gpa, raw, .{ .ignore_unknown_fields = true }) catch return null;
     defer parsed.deinit();
     if (parsed.value.result.len == 0) return null; // no models parsed → let the caller keep the catalog defaults
     // THE CONTEXT WINDOW RIDES ALONG. The catalog states it per model (properties[].context_window), and the
@@ -579,13 +618,23 @@ fn fetchModelsList(app: *App, uid: u64, alloc: std.mem.Allocator) ?[]const u8 {
         const props = m.properties orelse continue;
         for (props) |p| {
             if (std.mem.eql(u8, p.property_id, "context_window")) {
-                const v = std.fmt.parseInt(u32, std.mem.trim(u8, p.value, " \t"), 10) catch continue;
+                const v: u32 = switch (p.value) {
+                    .string => |x| std.fmt.parseInt(u32, std.mem.trim(u8, x, " \t"), 10) catch continue,
+                    .integer => |n| if (n > 0 and n <= std.math.maxInt(u32)) @intCast(n) else continue,
+                    else => continue,
+                };
                 rememberWindow(app.io, m.name, v);
             } else if (std.mem.eql(u8, p.property_id, "reasoning")) {
-                rememberProp(app.io, m.name, null, std.mem.eql(u8, std.mem.trim(u8, p.value, " \t"), "true"));
+                const r: bool = switch (p.value) {
+                    .string => |x| std.mem.eql(u8, std.mem.trim(u8, x, " \t"), "true"),
+                    .bool => |b| b,
+                    else => continue,
+                };
+                rememberProp(app.io, m.name, null, r);
             }
         }
     }
+    wins_filled_at = nowSeconds(app.io);
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(app.gpa);
     out.append(app.gpa, '[') catch return null;
@@ -639,6 +688,23 @@ fn rememberWindow(io: std.Io, name: []const u8, tokens: u32) void {
     rememberProp(io, name, tokens, null);
 }
 
+/// When the table was last filled from the catalog (unix seconds; 0 = never). A miss refreshes the catalog
+/// at most once per MODELS_TTL_S: the names cache alone (modelsJson) does not fill the table, so a warm
+/// cache used to leave every window unknown until it expired.
+var wins_filled_at: i128 = 0;
+
+fn nowSeconds(io: std.Io) i128 {
+    return @divTrunc(std.Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_s);
+}
+
+fn ensureCatalog(app: *App, uid: u64) void {
+    const now = nowSeconds(app.io);
+    if (wins_filled_at != 0 and now - wins_filled_at < MODELS_TTL_S) return;
+    var arena = std.heap.ArenaAllocator.init(app.gpa);
+    defer arena.deinit();
+    _ = fetchModelsList(app, uid, arena.allocator());
+}
+
 fn windowFromTable(io: std.Io, model: []const u8) ?u32 {
     win_mtx.lockUncancelable(io);
     defer win_mtx.unlock(io);
@@ -664,9 +730,7 @@ fn reasoningFromTable(io: std.Io, model: []const u8) ?bool {
 pub fn reasoningFor(app: *App, uid: u64, model: []const u8) ?bool {
     if (!std.mem.startsWith(u8, model, "@cf/")) return null;
     if (reasoningFromTable(app.io, model)) |r| return r;
-    var arena = std.heap.ArenaAllocator.init(app.gpa);
-    defer arena.deinit();
-    _ = modelsJson(app, uid, arena.allocator());
+    ensureCatalog(app, uid);
     return reasoningFromTable(app.io, model);
 }
 
@@ -676,9 +740,7 @@ pub fn reasoningFor(app: *App, uid: u64, model: []const u8) ?bool {
 pub fn windowTokensFor(app: *App, uid: u64, model: []const u8) ?u32 {
     if (!std.mem.startsWith(u8, model, "@cf/")) return null;
     if (windowFromTable(app.io, model)) |w| return w;
-    var arena = std.heap.ArenaAllocator.init(app.gpa);
-    defer arena.deinit();
-    _ = modelsJson(app, uid, arena.allocator());
+    ensureCatalog(app, uid);
     return windowFromTable(app.io, model);
 }
 
