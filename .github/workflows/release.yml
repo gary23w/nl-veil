@@ -135,8 +135,6 @@ jobs:
         with:
           # Bump this to the current release's notes on every tag (one notes file per release under docs/release/).
           body_path: docs/release/RELEASE-v1.1.0.md
-          # BETA: the web UI is not yet at desk parity, and the builds are unsigned. Pre-release keeps it out
-          # of "Latest release" until a signed stable.
           # A tag with a hyphen in it (v1.0.1-beta-7, v2.0.0-rc.1) is a prerelease; a bare version
           # (v1.1.0) is not. This was hardcoded `true` through every alpha and beta, which was correct
           # for all of them and wrong the day the first stable tag shipped: v1.1.0 published as a
