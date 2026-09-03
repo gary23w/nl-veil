@@ -6,7 +6,7 @@
 
 <p>
   <a href="https://github.com/gary23w/nl-veil/actions/workflows/release.yml"><img alt="build" src="https://github.com/gary23w/nl-veil/actions/workflows/release.yml/badge.svg"></a>
-  <a href="https://github.com/gary23w/nl-veil/releases"><img alt="release" src="https://img.shields.io/badge/release-v1.0.1--beta--7-A8241B"></a>
+  <a href="https://github.com/gary23w/nl-veil/releases"><img alt="release" src="https://img.shields.io/badge/release-v1.1.0-A8241B"></a>
   <img alt="zig" src="https://img.shields.io/badge/zig-0.16-F7A41D?logo=zig&logoColor=white">
   <a href="https://huggingface.co/gary23w/the-veil-12b"><img alt="built-in model" src="https://img.shields.io/badge/built--in%20model-the--veil--12b-6E4A27?logo=huggingface&logoColor=white"></a>
   <a href="https://huggingface.co/gary23w/gary-neuron-emergent"><img alt="memory cortex" src="https://img.shields.io/badge/cortex-gary--neuron--emergent-6E4A27?logo=huggingface&logoColor=white"></a>
@@ -38,9 +38,12 @@ machine, and carries all of it into the next session. The same problem stops get
 
 **Nothing to set up, and nothing leaves.** One Zig binary carries the whole thing: the desktop app,
 the server behind it, a web UI, the inference engine, the memory engine, and the `veil` command line.
-No Python, no Node, no Docker, no cloud account, no database service, no API key — it will
+Nothing to install first — no Docker, no cloud account, no database service, no API key — it will
 **[download a 12B model](https://huggingface.co/gary23w/the-veil-12b) and run it itself**, offline, on
-your GPU. Point it at Ollama or any OpenAI-compatible endpoint instead whenever you'd rather. Your
+your GPU. One honest dependency: the agent's **tool belt shells out to Python** (`list_dir`, `run_tests`,
+`web_search`, `deep_crawl`, and its own executor `run_python`) and to Node for a JavaScript syntax check,
+so without `python` on `PATH` the agent can chat but cannot do much work — it tells you exactly which
+tool wanted what. Point it at Ollama or any OpenAI-compatible endpoint instead whenever you'd rather. Your
 code, your keys and everything it learns stay in a folder next to the binary.
 
 > ⭐ **If the veil is useful to you, [star it on GitHub](https://github.com/gary23w/nl-veil).** It's a
@@ -103,9 +106,15 @@ Everything else is **optional and declinable right on the consent screen** — W
 Pages, Queues, Vectorize, Routes, Tail, Observability. Decline them and you still log in and chat; a tool
 that later needs one simply refuses with Cloudflare's own explanation. Grant them and the agent can build.
 
-**Never requested at all:** DNS, zones, WAF and security posture, billing, or account membership. A tool
-here can ship an app and spend your Workers AI allowance; it cannot repoint your domain, weaken your
-security, or add anyone to your account.
+**DNS, zone and Access scopes are requested — optional and declinable like the rest.** The tunnel needs them
+to put this veil on a hostname you own: `argotunnel`, `dns.read`/`dns.write`, `zone.read`, and
+`zone-access.read`/`zone-access.write` with `access-org.read`. Decline them and everything except a custom
+domain still works — the tunnel falls back to a random `trycloudflare.com` address, which is the default
+anyway. Grant them and you are granting real DNS write on your zones, which is what putting a name on a
+tunnel requires; the consent screen names each one.
+
+**Never requested at all:** billing and payment, WAF and security-rule configuration, or the ability to add
+members to your account.
 
 Disconnect any time — Settings → **Disconnect**. That forgets the credential locally; the R2 bucket and
 everything in it stay in your Cloudflare account, because they were always yours.
@@ -265,7 +274,7 @@ raylib is a *lazy* dependency, so `-Dapp=false` never fetches it at all.
 ## Install
 
 **Download it and run it — no toolchain, nothing to build.** Grab your platform's bundle from the
-**[latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.0.1-beta-7)**, unzip, and run `veil`:
+**[latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.1.0)**, unzip, and run `veil`:
 
 | You're on | Download | Then run |
 |---|---|---|
@@ -281,7 +290,7 @@ That single action starts the local server **and** opens the desktop app.
 > `install.ps1` inside is a *developer* script. The `veil-server-…` assets are the **headless** server
 > for remote boxes — no desktop app.
 
-> **Beta builds are unsigned.** Windows shows *"Windows protected your PC"* → **More info → Run
+> **The builds are unsigned.** Windows shows *"Windows protected your PC"* → **More info → Run
 > anyway**. macOS says the developer can't be verified → **right-click → Open** (or
 > `xattr -dr com.apple.quarantine <folder>`). Signing certificates are still on the list.
 
@@ -292,12 +301,12 @@ These installers **clone the repo and build it**, so they need [Zig 0.16+](https
 
 **macOS / Linux**
 ```sh
-curl -fsSL https://raw.githubusercontent.com/gary23w/nl-veil/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/gary23w/neuron-loops/main/scripts/install.sh | sh
 ```
 
 **Windows** (PowerShell)
 ```powershell
-iwr -useb https://raw.githubusercontent.com/gary23w/nl-veil/main/install.ps1 | iex
+iwr -useb https://raw.githubusercontent.com/gary23w/neuron-loops/main/scripts/install.ps1 | iex
 ```
 
 or by hand:
@@ -426,7 +435,7 @@ step 5** — the rest is about letting other people in.
 
 ### 1. Download and unblock it
 
-Grab the bundle for your OS from the [latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.0.1-beta-7)
+Grab the bundle for your OS from the [latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.1.0)
 and unzip it somewhere you'll find again. Builds are unsigned, so:
 
 - **Windows** shows *"Windows protected your PC"* → **More info** → **Run anyway**.
@@ -462,7 +471,7 @@ On startup the server prints one complete URL per address this machine answers o
 (`src/main.zig:671-696`, using `src/config/lan.zig`):
 
 ```
-neuron-loops 1.0.1-beta-1 on http://localhost:8787
+neuron-loops 1.1.0 on http://localhost:8787
     open from another machine (phone, laptop) at:
       http://192.168.1.42:8787
 ```
@@ -1244,19 +1253,27 @@ dependency entirely rather than compiling it unused.
 
 ## Release
 
-**Current: [`v1.0.1-beta-7`](https://github.com/gary23w/nl-veil/releases/tag/v1.0.1-beta-7)** — the
-seventh beta, and the one where the veil gets a cloud: **[Log in with Cloudflare](#log-in-with-cloudflare)**.
-One click connects your *own* Cloudflare account, and from that moment the model picker fills with your
-account's live Workers AI catalogue, your conversations back themselves up to an R2 bucket the veil
-provisions for you, and — if you grant the optional build scopes — the assistant can write a Worker and
-put it on the internet at a real URL. Workers AI has a free daily allowance, so none of that needs a paid
-plan. The consent screen asks four required permissions and lets you decline the rest; DNS, billing and
-security posture are never requested at all. Scheduled runs resolve the same login, token refresh is
-serialised now that more callers share one credential, and on Windows the consent URL finally opens in
-your browser instead of File Explorer.
-[Full notes](docs/release/RELEASE-v1.0.1-beta-7.md) ·
-[beta-6](docs/release/RELEASE-v1.0.1-beta-6.md) — a long turn continues instead of starting over ·
-[beta-5](docs/release/RELEASE-v1.0.1-beta-5.md) — trusting what the model did.
+**Current: [`v1.1.0`](https://github.com/gary23w/nl-veil/releases/tag/v1.1.0)** — the
+first stable release. Everything before it — `v1.0.0-alpha.1` through `v1.0.1-beta-7` — went out under a
+prerelease label; this is the first build published without one. Three things earned it. **[A public
+URL](#public-url---the-tunnel-switch)**: one switch and the veil is reachable at a Cloudflare address
+through your own account — confidential by default, a random `trycloudflare.com` hostname that changes on
+every start and puts nothing on a domain you own, with your own domain behind a Cloudflare Access policy
+as the explicit alternative; the address is revealed only once Cloudflare's own resolver has published it,
+because a lookup made before the name exists leaves it unresolvable on that network for half an hour.
+**Two ways the process could stop answering, both gone**: the desk's worker threads no longer park on the
+Io runtime's thread alert — one bit shared by everything else on the thread, which froze the window
+mid-turn while the server was healthy — and in the server one keep-alive client no longer pins an httpz
+worker and stalls the next socket behind it, where about one new connection in twelve had been waiting
+12.5–13 s for its first byte. **And the turn loop got stricter with itself**: a claim of work with no tool
+call behind it is not done, a figure that came from nowhere is read off disk before it is stated, a reply
+cut at the output cap is continued instead of guessed at, and the facts a long turn paid for survive the
+compaction that used to discard them — each one found by an unattended run graded against what was
+actually on disk, not by reading code. [Log in with Cloudflare](#log-in-with-cloudflare) shipped in beta-7
+and the tunnel is built on it; both are documented in full above.
+[Full notes](docs/release/RELEASE-v1.1.0.md) ·
+[beta-7](docs/release/RELEASE-v1.0.1-beta-7.md) — the veil gets a cloud ·
+[beta-6](docs/release/RELEASE-v1.0.1-beta-6.md) — a long turn continues instead of starting over.
 
 Builds ship on the [Releases page](https://github.com/gary23w/nl-veil/releases), one per
 platform. Unzip and run `veil` — that starts the server **and** opens the desktop app. No Python, no

@@ -52,7 +52,7 @@
       <a href="#memory">Memory</a>
     </nav>
     <span class="grow"></span>
-    <span class="chip"><span class="chip-dot"></span>v1.0.1 beta</span>
+    <span class="chip"><span class="chip-dot"></span>v1.1.0</span>
     <button class="icon-btn" id="themeBtn" type="button" title="Toggle theme" aria-label="Toggle theme"></button>
     <a class="icon-btn" href="https://github.com/gary23w/nl-veil" target="_blank" rel="noopener" title="Source on GitHub" aria-label="Source on GitHub">
       <svg viewBox="0 0 24 24"><path d="M9 19c-5 1.5-5-2.5-7-3m14 6v-3.9a3.4 3.4 0 0 0-.9-2.6c3-.3 6.2-1.5 6.2-6.7A5.2 5.2 0 0 0 20 4.8a4.9 4.9 0 0 0-.1-3.6s-1.1-.3-3.7 1.4a12.6 12.6 0 0 0-6.6 0C7 .9 5.9 1.2 5.9 1.2A4.9 4.9 0 0 0 5.8 4.8a5.2 5.2 0 0 0-1.4 3.6c0 5.2 3.2 6.4 6.2 6.7a3.4 3.4 0 0 0-.9 2.6V22"/></svg>
@@ -143,7 +143,7 @@
           Windows <span class="dl-arch">x86-64</span>
         </span>
         <span class="dl-file">veil-&hellip;-windows-x86_64.zip</span>
-        <a class="btn btn-solid" href="https://github.com/gary23w/nl-veil/releases/tag/v1.0.1-beta-6" target="_blank" rel="noopener">Download</a>
+        <a class="btn btn-solid" href="https://github.com/gary23w/nl-veil/releases/tag/v1.1.0" target="_blank" rel="noopener">Download</a>
       </div>
       <div class="dl-card" data-os="macarm">
         <span class="dl-os">
@@ -151,7 +151,7 @@
           macOS <span class="dl-arch">Apple Silicon</span>
         </span>
         <span class="dl-file">veil-&hellip;-macos-arm64.zip</span>
-        <a class="btn btn-solid" href="https://github.com/gary23w/nl-veil/releases/tag/v1.0.1-beta-6" target="_blank" rel="noopener">Download</a>
+        <a class="btn btn-solid" href="https://github.com/gary23w/nl-veil/releases/tag/v1.1.0" target="_blank" rel="noopener">Download</a>
       </div>
       <div class="dl-card" data-os="macintel">
         <span class="dl-os">
@@ -159,7 +159,7 @@
           macOS <span class="dl-arch">Intel</span>
         </span>
         <span class="dl-file">veil-&hellip;-macos-x86_64.zip</span>
-        <a class="btn btn-solid" href="https://github.com/gary23w/nl-veil/releases/tag/v1.0.1-beta-6" target="_blank" rel="noopener">Download</a>
+        <a class="btn btn-solid" href="https://github.com/gary23w/nl-veil/releases/tag/v1.1.0" target="_blank" rel="noopener">Download</a>
       </div>
       <div class="dl-card" data-os="linux">
         <span class="dl-os">
@@ -167,7 +167,7 @@
           Linux <span class="dl-arch">x86-64</span>
         </span>
         <span class="dl-file">veil-&hellip;-linux-x86_64.zip</span>
-        <a class="btn btn-solid" href="https://github.com/gary23w/nl-veil/releases/tag/v1.0.1-beta-6" target="_blank" rel="noopener">Download</a>
+        <a class="btn btn-solid" href="https://github.com/gary23w/nl-veil/releases/tag/v1.1.0" target="_blank" rel="noopener">Download</a>
       </div>
     </div>
 
@@ -175,30 +175,54 @@
       <p><strong>Take the <code>veil-&hellip;</code> archive</strong> &mdash; not &ldquo;Source code (zip)&rdquo;, which GitHub staples to every release and which needs a compiler, and not <code>veil-server-&hellip;</code>, the headless build for remote boxes with no desktop app.</p>
       <div class="note-warn">
         <svg viewBox="0 0 24 24"><path d="M12 9v4M12 17h.01M10.3 3.9L1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/></svg>
-        <span>The beta binaries aren&rsquo;t signed yet, so the machine will object once: Windows &rarr; <em>More info &rarr; Run anyway</em>; macOS &rarr; right-click &rarr; <em>Open</em>. Signing certificates are on the list.</span>
+        <span>The binaries aren&rsquo;t signed yet, so the machine will object once: Windows &rarr; <em>More info &rarr; Run anyway</em>; macOS &rarr; right-click &rarr; <em>Open</em>. Signing certificates are on the list.</span>
       </div>
       <p><strong>The model comes too.</strong> The inference engine is compiled into the binary, so
         <a href="https://huggingface.co/gary23w/the-veil-12b" target="_blank" rel="noopener">the-veil-12b</a>
         is served by the server itself &mdash; no separate model runtime, no API key. Click <em>download the
         model</em> in the app (or run <code>veil model pull</code>) and the whole thing works offline. Point it
         at Ollama or any OpenAI-compatible endpoint instead whenever you would rather.</p>
-      <p><strong>What&rsquo;s in <code>v1.0.1-beta-6</code>.</strong> The sixth beta, about
-        <em>continuity</em>. beta-5 gave a runaway turn a spend ceiling, which stopped the spend and ended the work:
-        everything the turn had gathered died with it, so the next turn started over and usually hit the same wall the
-        same way. Now a turn that outgrows its budget <strong>distils what the stretch established</strong> &mdash;
-        what is settled, what is on disk, what it ruled out, what comes next &mdash; drops the bloated context, and
-        <strong>keeps going on its own</strong>, with the allowance earned by passes that actually wrote a file or made
-        a new call. The same record is banked durably in neuron-db as a <strong>resume anchor</strong>, so a scheduled
-        task &mdash; which opens a brand-new conversation every run &mdash; resumes instead of restarting. That whole
-        feature was silently dead on hosted reasoning models, which spend their budget on hidden reasoning and return
-        an empty answer; the client now recognises the signature, raises the floor and remembers the model. And in the
-        desktop, selecting a conversation something else is driving refreshes it instead of showing a frozen snapshot.
-        <a href="https://github.com/gary23w/nl-veil/blob/main/docs/release/RELEASE-v1.0.1-beta-6.md" target="_blank" rel="noopener">Full release notes &rarr;</a></p>
-      <p class="dim">Earlier: <code>beta-5</code> was about trusting what the model did &mdash; a long chat that stops
-        losing its own middle, a spend ceiling on a runaway turn, and traces that show what each tool was actually
-        asked &mdash; and <code>beta-4</code> put every block of chat context through a governed prompt workspace with
-        receipts and budgets.
-        <a href="https://github.com/gary23w/nl-veil/blob/main/docs/release/RELEASE-v1.0.1-beta-5.md" target="_blank" rel="noopener">beta-5 notes &rarr;</a></p>
+      <p><strong>What&rsquo;s in <code>v1.1.0</code>.</strong> The first stable release. Everything before it
+        &mdash; <code>v1.0.0-alpha.1</code> through <code>v1.0.1-beta-7</code> &mdash; went out labelled a
+        prerelease; this is the first build published without that label. Two things earned it, and the second one
+        is the reason the first was worth doing. <strong>A public URL.</strong> Log in with your own Cloudflare
+        account, flip one switch, and this veil is reachable at a Cloudflare address with no port forwarded and no
+        router touched. The default is <em>confidential</em>: an unlisted <code>trycloudflare.com</code> hostname,
+        shown only to the owner, minted fresh on every start, putting nothing on a domain you own. <em>Use my
+        domain</em> is the explicit alternative &mdash; a named tunnel behind a Cloudflare Access policy that
+        admits your login&rsquo;s own email. The address is withheld until Cloudflare&rsquo;s own resolver answers
+        for it, because a lookup made before the name exists is cached as a miss for the negative TTL of
+        <strong>1800 seconds</strong>: a probe four seconds early left one address unreachable from that machine
+        for half an hour while 1.1.1.1 resolved it fine. The costs are stated where you flip it &mdash; the switch
+        is owner-only, the tunnel refuses to start while open registration is on, registration is refused on
+        anything that arrived through a tunnel whatever the flag says, and <em>off</em> is verified rather than
+        assumed. A login made before this release is asked to sign in again, because the tunnel needs scopes the
+        old consent never requested.</p>
+      <p><strong>And the parking.</strong> Putting a local server on the internet is only worth doing if it stays
+        up, and two things underneath it did not. The desktop app&rsquo;s worker threads slept on the Io
+        runtime&rsquo;s per-thread alert, which everything else on that thread also uses to wake mutex and
+        condition waiters; one stray alert parked the chat and poller threads for good, and the pane froze
+        mid-turn with the server perfectly healthy and <em>&ldquo;working.&rdquo;</em> still on screen. They sleep
+        through a non-alertable wait now, and a silent worker says so instead of leaving the last status frozen.
+        In the server, every accepted socket was dealt to one worker&rsquo;s private queue, and a worker runs one
+        connection for that connection&rsquo;s whole life &mdash; so a keep-alive client polling twice a second
+        pinned its worker and the next socket sat behind it while 127 others idled. Measured on an idle server:
+        about <strong>one new connection in twelve took 12.5&ndash;13 s to its first byte</strong>, while
+        keep-alive connections never stalled, which is exactly why it hid for so long. One shared dispatch queue,
+        and the same 75-second idle probe reports 0 stalls, worst 87 ms. The turn loop got stricter with itself
+        too: a claim of work with no tool call behind it is not done, a figure that came from nowhere is read off
+        the disk before it is stated, a reply cut at the output cap is continued rather than re-asked, a paste too
+        large to retype is written to a file first, and the verdict judges the goal you set instead of editing code
+        you never asked it to change.
+        <a href="https://github.com/gary23w/neuron-loops/blob/main/docs/release/RELEASE-v1.1.0.md" target="_blank" rel="noopener">Full release notes &rarr;</a></p>
+      <p class="dim">Earlier: <code>beta-7</code> is where the Cloudflare login arrived &mdash; one click connects
+        your <em>own</em> account, and from then on the model picker carries your account&rsquo;s live Workers AI
+        catalogue instead of a list shipped in the binary, your conversations and durable memories mirror
+        incrementally into an R2 bucket the veil provisions for you, and, if you grant the optional build scopes,
+        the assistant can write a Worker and put it on the internet at a real URL. The token is minted for your
+        account and sealed on your machine; there is no server of ours in the middle. <code>beta-6</code> before it
+        made a long turn continue instead of starting over.
+        <a href="https://github.com/gary23w/neuron-loops/blob/main/docs/release/RELEASE-v1.0.1-beta-7.md" target="_blank" rel="noopener">beta-7 notes &rarr;</a></p>
       <p class="dim">Building it yourself instead &mdash; needs Zig 0.16+:</p>
       <pre class="md-code"><code>git clone https://github.com/gary23w/nl-veil
 cd nl-veil
@@ -391,7 +415,7 @@ zig build run</code></pre>
 
 <footer class="foot">
   <div class="wrap foot-inner">
-    <span class="chip"><span class="chip-dot"></span>v1.0.1 beta &middot; open source, MIT</span>
+    <span class="chip"><span class="chip-dot"></span>v1.1.0 &middot; open source, MIT</span>
     <span class="dim" style="font-size:var(--fs-small)">Built by <a href="https://github.com/gary23w" target="_blank" rel="noopener">gary23w</a></span>
     <nav class="foot-links">
       <a href="https://github.com/gary23w/nl-veil" target="_blank" rel="noopener">nl-veil on GitHub</a>

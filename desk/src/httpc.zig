@@ -18,6 +18,7 @@
 //! client read to EOF with no time bound, so a keep-alive server blocked the chat thread forever.)
 
 const std = @import("std");
+const wsock = @import("wsock.zig");
 const builtin = @import("builtin");
 const Io = std.Io;
 
@@ -63,6 +64,25 @@ pub fn request(io: Io, gpa: std.mem.Allocator, req: Req) Result {
     // io.async degrades to inline-on-caller: the freeze. Bonus: in that degraded inline case the flag is
     // already set when the timer leg runs on the caller, so it returns at once instead of sleeping the
     // whole timeout after the request already completed.
+    // WINDOWS, LOOPBACK OR AN IPv4 LITERAL: one blocking socket with SO_RCVTIMEO / SO_SNDTIMEO instead of the
+    // race below. The race parks the calling thread on the runtime's per-thread alert, and that alert is what
+    // wedged the desk's worker threads on 2026-09-02 - see wsock.zig. A DNS name keeps the portable path.
+    if (builtin.os.tag == .windows) {
+        if (wsock.ip4Of(req.host)) |ip| {
+            switch (wsock.roundTrip(gpa, ip, req.port, req_bytes, req.timeout_s, req.cap)) {
+                .ok => |raw| {
+                    defer gpa.free(raw);
+                    var r = Io.Reader.fixed(raw);
+                    const resp = readResponse(&r, gpa, req.cap) catch return .failed;
+                    return .{ .ok = resp };
+                },
+                .refused => return .refused,
+                .timed_out => return .timed_out,
+                .failed => return .failed,
+            }
+        }
+    }
+
     const Race = union(enum) { rt: Inner, timer: void };
     var rt_done: std.atomic.Value(bool) = .init(false);
     var sbuf: [2]Race = undefined;

@@ -87,3 +87,29 @@ model/*
 
 # various debugger / profiler / runtime artifacts that are not source
 debug.ps1
+
+# THE CAPTURE-THE-REWARD CHALLENGE SUITE — local only, never committed.
+#
+# The worlds are the MEASURING INSTRUMENT, not the product. Publishing them would also publish every future
+# run of them into a repo that an agent under test can read, which is the one thing that would make the
+# measurements worthless: an instrument the subject can study is no longer measuring the subject.
+#
+# These patterns were enforced only by .git/info/exclude, which is per-clone and version-controlled by
+# nothing — so the protection lived exactly as long as one working copy and would have been silently absent
+# on a fresh clone. Duplicated here so it travels with the repository. The exclude file stays as-is; a rule
+# in both places is harmless, and losing this one is not.
+#
+# Names only ever appear here, never contents. If even the names should stay private, move the whole set
+# under one ignored directory (scripts/sim/_local/) and replace this block with that single path.
+scripts/sim/challenge.py
+scripts/sim/CHALLENGES.md
+scripts/sim/world/
+scripts/sim/extreme.py
+scripts/sim/gauntlet.py
+scripts/sim/meter.py
+scripts/sim/bait.py
+scripts/sim/cfworld.py
+scripts/sim/INSTRUMENTS.md
+scripts/sim/ledger.py
+scripts/sim/failures.py
+scripts/sim/tests/
