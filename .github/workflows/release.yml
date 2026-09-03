@@ -134,7 +134,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           # Bump this to the current release's notes on every tag (one notes file per release under docs/release/).
-          body_path: docs/release/RELEASE-v1.0.1-beta-7.md
+          body_path: docs/release/RELEASE-v1.1.0.md
           # BETA: the web UI is not yet at desk parity, and the builds are unsigned. Pre-release keeps it out
           # of "Latest release" until a signed stable.
           prerelease: true
