@@ -1073,6 +1073,31 @@ pub const Chat = struct {
         return buf[0..n];
     }
 
+    /// The server account whose per-user tree this desk works in — read off the live build dir when a build has
+    /// bound one ("u1/_chat/builds/…"), else the local admin, "u1", the default every build path here assumes.
+    fn uidPrefix(self: *Chat) []const u8 {
+        if (self.build_dir_len > 0) {
+            const bd = self.build_dir[0..self.build_dir_len];
+            if (std.mem.indexOfScalar(u8, bd, '/')) |sl| {
+                if (sl > 1 and bd[0] == 'u') return bd[0..sl];
+            }
+        }
+        return "u1";
+    }
+
+    /// The durable store this desk reads and edits — THE SERVER'S. The server keeps one per account,
+    /// {data}/u{uid}/.veil-desk/memories.jsonl, and copies the pre-split global file into it once at startup
+    /// (main.zig migrateLegacyMemories); from then on every REMEMBER:/FORGET: a server-driven turn applies lands
+    /// there and only there. This desk kept reading and writing the global file, so the Memory tab showed a
+    /// snapshot frozen at the migration, a card deleted here was still in the prompt next turn, and a fact the
+    /// veil had just recorded never appeared — two stores under one name (observed live, c6aaa98f2). One store
+    /// now: the per-user file whenever it exists, the legacy file only until the server has created it.
+    fn memoriesPath(self: *Chat, dd: []const u8, buf: []u8) ?[]const u8 {
+        const mine = std.fmt.bufPrint(buf, "{s}/{s}/.veil-desk/memories.jsonl", .{ dd, self.uidPrefix() }) catch return null;
+        if (Io.Dir.cwd().statFile(self.io, mine, .{})) |_| return mine else |_| {}
+        return std.fmt.bufPrint(buf, "{s}/.veil-desk/memories.jsonl", .{dd}) catch null;
+    }
+
     fn nowS(self: *Chat) i64 {
         return @intCast(@divTrunc(Io.Timestamp.now(self.io, .real).nanoseconds, std.time.ns_per_s));
     }
@@ -2252,13 +2277,7 @@ pub const Chat = struct {
     /// a tool always runs in ITS conversation's workdir, not whichever conv happens to be on screen.
     fn buildRelFor(self: *Chat, conv: []const u8, buf: []u8) []const u8 {
         if (conv.len == 0) return "";
-        var uid: []const u8 = "u1";
-        if (self.build_dir_len > 0) {
-            const bd = self.build_dir[0..self.build_dir_len];
-            if (std.mem.indexOfScalar(u8, bd, '/')) |sl| {
-                if (sl > 1 and bd[0] == 'u') uid = bd[0..sl];
-            }
-        }
+        const uid: []const u8 = self.uidPrefix();
         return std.fmt.bufPrint(buf, "{s}/_chat/builds/{s}", .{ uid, conv }) catch "";
     }
 
@@ -4348,13 +4367,7 @@ pub const Chat = struct {
         if (conv_own.len == 0) return "";
         // a SUB-CHAT shares its primary's build tree (LOCAL TWIN of server paths.zig branchRoot)
         const conv = store_mod.branchConvRoot(conv_own);
-        var uid: []const u8 = "u1";
-        if (self.build_dir_len > 0) {
-            const bd = self.build_dir[0..self.build_dir_len];
-            if (std.mem.indexOfScalar(u8, bd, '/')) |sl| {
-                if (sl > 1 and bd[0] == 'u') uid = bd[0..sl];
-            }
-        }
+        const uid: []const u8 = self.uidPrefix();
         if (schedConvParts(conv)) |p| {
             return std.fmt.bufPrint(buf, "{s}/_sched/{s}/runs/{s}", .{ uid, p.tid, p.stamp }) catch "";
         }
@@ -4434,7 +4447,7 @@ pub const Chat = struct {
     /// Read memories.jsonl → publish rows into Store.chat_mem for the Memory tab. Cheap; on load + after any change.
     fn refreshMemory(self: *Chat, dd: []const u8) void {
         var pb: [700]u8 = undefined;
-        const path = std.fmt.bufPrint(&pb, "{s}/.veil-desk/memories.jsonl", .{dd}) catch return;
+        const path = self.memoriesPath(dd, &pb) orelse return;
         const data = Io.Dir.cwd().readFileAlloc(self.io, path, self.gpa, .limited(256 << 10)) catch {
             self.store.lock();
             defer self.store.unlock();
@@ -4446,7 +4459,7 @@ pub const Chat = struct {
         var n: usize = 0;
         var it = std.mem.splitScalar(u8, data, '\n');
         while (it.next()) |line| {
-            const ln = std.mem.trim(u8, line, " \r\t");
+            const ln = memLine(line);
             if (ln.len < 5 or ln[0] != '{') continue;
             var row: store_mod.MemRow = .{};
             if (llm.jsonUnescape(self.gpa, ln, "text")) |tx| {
@@ -4520,7 +4533,7 @@ pub const Chat = struct {
         if (cat.len == 0) cat = "fact";
         if (cat.len > 20) cat = cat[0..20];
         var pb: [700]u8 = undefined;
-        const path = std.fmt.bufPrint(&pb, "{s}/.veil-desk/memories.jsonl", .{dd}) catch return;
+        const path = self.memoriesPath(dd, &pb) orelse return;
         const existing: ?[]u8 = Io.Dir.cwd().readFileAlloc(self.io, path, self.gpa, .limited(256 << 10)) catch null;
         defer if (existing) |e| self.gpa.free(e);
         const ex: []const u8 = existing orelse "";
@@ -4598,7 +4611,7 @@ pub const Chat = struct {
         const match = std.mem.trim(u8, match_in, " \r\n\t");
         if (match.len < 2) return;
         var pb: [700]u8 = undefined;
-        const path = std.fmt.bufPrint(&pb, "{s}/.veil-desk/memories.jsonl", .{dd}) catch return;
+        const path = self.memoriesPath(dd, &pb) orelse return;
         const data = Io.Dir.cwd().readFileAlloc(self.io, path, self.gpa, .limited(256 << 10)) catch return;
         defer self.gpa.free(data);
         var out: std.ArrayListUnmanaged(u8) = .empty;
@@ -4606,7 +4619,7 @@ pub const Chat = struct {
         var removed = false;
         var it = std.mem.splitScalar(u8, data, '\n');
         while (it.next()) |line| {
-            const ln = std.mem.trim(u8, line, " \r\t");
+            const ln = memLine(line);
             if (ln.len == 0) continue;
             var drop = false;
             if (llm.jsonUnescape(self.gpa, ln, "text")) |tx| {
@@ -4637,20 +4650,18 @@ pub const Chat = struct {
         var first = true;
         var it = std.mem.splitScalar(u8, text, '\n');
         while (it.next()) |line| {
-            const ln = std.mem.trim(u8, line, " \r\t");
-            if (std.ascii.startsWithIgnoreCase(ln, "REMEMBER:")) {
-                const spec = parseRememberBody(std.mem.trim(u8, ln["REMEMBER:".len..], " \t"));
-                if (spec.fact.len >= 2) {
-                    self.storeMemory(dd, spec.cat, spec.fact);
-                    self.mem_saved_n += 1;
-                }
-                continue; // strip
-            }
-            if (std.ascii.startsWithIgnoreCase(ln, "FORGET:")) {
-                const m = std.mem.trim(u8, ln["FORGET:".len..], " \t");
-                if (m.len >= 2) {
-                    self.forgetMemory(dd, m);
-                    self.mem_forgot_n += 1;
+            if (memoryDirective(line)) |d| {
+                if (d.forget) {
+                    if (d.body.len >= 2) {
+                        self.forgetMemory(dd, d.body);
+                        self.mem_forgot_n += 1;
+                    }
+                } else {
+                    const spec = parseRememberBody(d.body);
+                    if (spec.fact.len >= 2) {
+                        self.storeMemory(dd, spec.cat, spec.fact);
+                        self.mem_saved_n += 1;
+                    }
                 }
                 continue; // strip
             }
@@ -7844,7 +7855,7 @@ pub const Chat = struct {
     ///     as a durable "key" memory so the veil can recall + use it.
     fn ensurePatUsable(self: *Chat, dd: []const u8, side: []const u8) void {
         var mp: [700]u8 = undefined;
-        const path = std.fmt.bufPrint(&mp, "{s}/.veil-desk/memories.jsonl", .{dd}) catch return;
+        const path = self.memoriesPath(dd, &mp) orelse return;
         const data_opt: ?[]u8 = Io.Dir.cwd().readFileAlloc(self.io, path, self.gpa, .limited(256 << 10)) catch null;
         defer if (data_opt) |d| self.gpa.free(d);
         const data = data_opt orelse "";
@@ -8336,13 +8347,7 @@ pub const Chat = struct {
             self.publishPlan(0); // and never show the previous conv's board meanwhile
         }
         // uid default mirrors chatBuildRel: desktop admin is u1 on localhost; a build-dir binding overrides.
-        var uid: []const u8 = "u1";
-        if (self.build_dir_len > 0) {
-            const bd = self.build_dir[0..self.build_dir_len];
-            if (std.mem.indexOfScalar(u8, bd, '/')) |sl| {
-                if (sl > 1 and bd[0] == 'u') uid = bd[0..sl];
-            }
-        }
+        const uid: []const u8 = self.uidPrefix();
         var pb: [700]u8 = undefined;
         const path = std.fmt.bufPrint(&pb, "{s}/{s}/_chat/convs/{s}/plan.jsonl", .{ dd, uid, conv }) catch return;
         const size: u64 = if (Io.Dir.cwd().statFile(self.io, path, .{})) |st| st.size else |_| {
@@ -8924,6 +8929,87 @@ fn personalFact(fact: []const u8) ?[]const u8 {
 /// Drop a trailing "intro to the (now-stripped) directives" line — a short line ending in ':' that announces a
 /// save, e.g. "**Saved preferences:**" or "I've remembered:". Only touches the LAST line and only when it clearly
 /// reads as such an intro, so real prose ending in a colon (a list header with content under it) is left alone.
+/// One line of memories.jsonl, trimmed — and freed of a UTF-8 byte-order mark, which an editor or a PowerShell
+/// `Out-File` leaves ahead of the first record. Behind it the OLDEST memory failed every `ln[0] == '{'` gate here
+/// (invisible to the tab, the prompt block and FORGET:), and the forget rewrite copied it through unparsed, so the
+/// mark survived every rewrite. Twin of the engine's durableLine.
+fn memLine(raw: []const u8) []const u8 {
+    const ln = std.mem.trim(u8, raw, " \r\t");
+    if (std.mem.startsWith(u8, ln, "\xEF\xBB\xBF")) return std.mem.trimStart(u8, ln[3..], " \r\t");
+    return ln;
+}
+
+const MemoryDirective = struct { forget: bool, body: []const u8 };
+
+/// The REMEMBER:/FORGET: directive a reply line carries, or null for prose. The keyword must OPEN the line — but
+/// after whatever list marker, blockquote or emphasis the model dressed it in (`- REMEMBER: …`, `**FORGET:** …`,
+/// a code span): the exact-prefix match used to reject those, which left the directive in the shown reply and the
+/// store unchanged. Twin of the engine's memoryDirective.
+fn memoryDirective(line: []const u8) ?MemoryDirective {
+    const ln = std.mem.trimStart(u8, std.mem.trim(u8, line, " \r\t"), "-*>`_ \t");
+    const forget = std.ascii.startsWithIgnoreCase(ln, "FORGET:");
+    if (!forget and !std.ascii.startsWithIgnoreCase(ln, "REMEMBER:")) return null;
+    const kw_len: usize = if (forget) "FORGET:".len else "REMEMBER:".len;
+    var body = std.mem.trim(u8, ln[kw_len..], " \t`");
+    body = std.mem.trimStart(u8, body, "*_ \t");
+    if (std.mem.endsWith(u8, body, "**")) body = std.mem.trimEnd(u8, body[0 .. body.len - 2], " \t");
+    return .{ .forget = forget, .body = body };
+}
+
+test "the Memory tab reads the store the server writes: the per-user file once it exists, else the legacy one; a byte-order mark hides nothing; a dressed directive lands" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{ .environ = llm.osEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dd = "zig-memtab-tmp";
+    Io.Dir.cwd().deleteTree(io, dd) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dd) catch {};
+    _ = Io.Dir.cwd().createDirPathStatus(io, dd ++ "/.veil-desk", .default_dir) catch {};
+    const legacy = dd ++ "/.veil-desk/memories.jsonl";
+    const mine = dd ++ "/u1/.veil-desk/memories.jsonl";
+    Io.Dir.cwd().writeFile(io, .{ .sub_path = legacy, .data = "\xEF\xBB\xBF{\"cat\":\"fact\",\"text\":\"User is 33 years old\"}\n" }) catch unreachable;
+    var store = std.testing.allocator.create(Store) catch unreachable;
+    defer std.testing.allocator.destroy(store);
+    store.* = .{};
+    @memcpy(store.settings.data_dir[0..dd.len], dd);
+    store.settings.data_dir_len = dd.len;
+    var chat = std.testing.allocator.create(Chat) catch unreachable;
+    defer std.testing.allocator.destroy(chat);
+    chat.* = .{ .io = io, .gpa = std.testing.allocator, .store = store };
+
+    // before the server has split the store: the legacy file is the store, and its BOM'd first line is a memory
+    chat.refreshMemory(dd);
+    try std.testing.expectEqual(@as(usize, 1), store.chat_mem_count);
+    try std.testing.expectEqualStrings("User is 33 years old", store.chat_mem[0].textStr());
+
+    // the server has split it: its per-user file is now THE store, and what the tab shows
+    _ = Io.Dir.cwd().createDirPathStatus(io, dd ++ "/u1/.veil-desk", .default_dir) catch {};
+    Io.Dir.cwd().writeFile(io, .{ .sub_path = mine, .data = "\xEF\xBB\xBF{\"cat\":\"fact\",\"text\":\"User's name is Gary\"}\n{\"cat\":\"fact\",\"text\":\"Gary is 34 years old\"}\n" }) catch unreachable;
+    chat.refreshMemory(dd);
+    try std.testing.expectEqual(@as(usize, 2), store.chat_mem_count);
+    try std.testing.expectEqualStrings("User's name is Gary", store.chat_mem[0].textStr());
+    try std.testing.expectEqualStrings("Gary is 34 years old", store.chat_mem[1].textStr());
+
+    // the tab's delete edits THAT file — and leaves the legacy backup exactly as it was
+    chat.forgetMemory(dd, "Gary is 34 years old");
+    try std.testing.expectEqual(@as(usize, 1), store.chat_mem_count);
+    const after = Io.Dir.cwd().readFileAlloc(io, mine, std.testing.allocator, .limited(64 << 10)) catch unreachable;
+    defer std.testing.allocator.free(after);
+    try std.testing.expect(after.len > 0 and after[0] == '{'); // the rewrite drops the mark
+    try std.testing.expect(std.mem.indexOf(u8, after, "34 years old") == null);
+    const legacy_after = Io.Dir.cwd().readFileAlloc(io, legacy, std.testing.allocator, .limited(64 << 10)) catch unreachable;
+    defer std.testing.allocator.free(legacy_after);
+    try std.testing.expect(std.mem.indexOf(u8, legacy_after, "33 years old") != null);
+
+    // a directive the veil dresses in markdown still lands, in the same file, and is stripped from the shown reply
+    const shown = chat.processMemory(dd, "- **REMEMBER:** [preference] deploys to us-west-2\nNoted, deploying there from now on.");
+    try std.testing.expectEqualStrings("Noted, deploying there from now on.", shown);
+    try std.testing.expectEqual(@as(usize, 2), store.chat_mem_count);
+    const with = Io.Dir.cwd().readFileAlloc(io, mine, std.testing.allocator, .limited(64 << 10)) catch unreachable;
+    defer std.testing.allocator.free(with);
+    try std.testing.expect(std.mem.indexOf(u8, with, "\"deploys to us-west-2\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, legacy_after, "us-west-2") == null);
+}
+
 fn stripDanglingMemoryIntro(text: []const u8) []const u8 {
     const nl = std.mem.lastIndexOfScalar(u8, text, '\n');
     const last_raw = if (nl) |i| text[i + 1 ..] else text;

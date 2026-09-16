@@ -292,8 +292,11 @@ const LOOP_QUESTION =
     "must never fix, refactor or modify anything the user did not ask to change. A CLAIM OF WORK IS NOT WORK: " ++
     "if the goal required files to change or commands to run and the conversation above shows no tool result " ++
     "for it, the goal is NOT achieved whatever the assistant said - name the concrete step (the file to write, " ++
-    "the command to run). Reply with ONLY that next instruction, or reply exactly DONE if the goal is fully " ++
-    "achieved.";
+    "the command to run). A DURABLE-MEMORY CHANGE IS NEVER A STEP: REMEMBER:/FORGET: lines are applied by the " ++
+    "engine the moment the assistant writes them, and an engine note in the conversation confirms it — never name " ++
+    "remembering or forgetting a fact, or editing the memory store, as the next step; if that is all that " ++
+    "remains, the goal is achieved. Reply with ONLY that next instruction, or reply exactly DONE if the goal is " ++
+    "fully achieved.";
 /// The AFK drive question. afk was built as tier-1-plus-overrides: it asked "next step, or DONE", the model
 /// answered DONE, and the engine overrode that with a canned "keep going" — so every cycle the model reached a
 /// conclusion the loop then contradicted, and the only way to obey both was to invent more work. Observed live:
@@ -2201,6 +2204,10 @@ test "a failed llm frame carries the error head; a good one carries no err field
 const ZERO_TOOL_NUDGE = "(You reported a result, but you made NO tool call this turn - nothing was read, written or run, so nothing you reported has happened. Do the work now with tools: read what you need, make the change, verify it, then report what the tools showed.)";
 const NOW_NUDGE = "(You answered a question about the CURRENT state without running any tool this turn. What you recall may be stale: files change after they are read, and a partial view is not the whole file. Read or compute the current value with a tool now, then reply with what the tool shows.)";
 const CUT_NUDGE = "(Your previous reply was cut off at the output-token limit before it produced an answer, so nothing from it survived. Do not re-derive at length. If a computation is needed, make ONE tool call that prints the result; then reply with the final answer only, in the format the request asked for.)";
+/// What the drive loop posts, once per turn, when the step picker names a durable-memory change and this turn has
+/// recorded none: the model is asked for the bare lines the engine applies — never handed the picker's prose as a
+/// user instruction (see the memory rule under the drive inference in runTurn).
+const MEMORY_STEP_NUDGE = "(The durable-memory change below has not been recorded. Record it now by replying with ONLY the bare directive lines, one per line — `REMEMBER: [category] the fact` and/or `FORGET: <a few words identifying the stale fact>` — no prose, no tools, no file edits: the engine applies these lines itself and strips them from what the user sees. The memory store is the engine's, not a file for you to edit.)";
 
 const PASTE_SPILL_BYTES: usize = 6 * 1024;
 const PASTE_SPILL_LINES: usize = 20;
@@ -3230,6 +3237,11 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     defer foreign_mem.deinit(gpa);
     var foreign_warned = false;
     var drive: usize = 0;
+    // DURABLE MEMORY, THIS TURN: directives applied so far (settle path + picker path) and whether the picker has
+    // already been sent once to record a change it named — both gate the "a memory directive is never a drive
+    // step" rule under the drive inference below.
+    var mem_applied_turn: usize = 0;
+    var mem_step_nudged = false;
     var zero_tool_nudged = false; // the zero-tool-claim continuation fires once per turn (see below)
     var ground_nudged = false; // the grounding continuation (a figure from nowhere / a NOW question, no tool run) - once per turn
     var cut_nudged = false; // the cut-reply continuation (output cap hit before any answer) - once per turn
@@ -3711,9 +3723,23 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
         // memories.jsonl) and STRIP them so they never leak as literal text — the desk's processMemory, ported.
         // Runs BEFORE reflect so the self-critique sees the clean prose. A reply that was ONLY directives strips to
         // empty → show a short confirmation instead of committing a blank message.
+        //
+        // AND THE CHANGE IS AN ENGINE-OBSERVED EVENT (mem_row, threaded in right under the reply below). Stripping
+        // left NO trace of the update in the working context, and the YOUR MEMORY block is assembled once per turn,
+        // so every later reader of the turn — the next pass, the drive verdict — saw a stale fact beside a reply
+        // that never mentioned changing it, and concluded the change had not happened. Observed live (c6aaa98f2):
+        // "I am now 34 years old" was answered with the right FORGET:/REMEMBER: pair and applied here; the armed
+        // loop's step picker then named that same directive as the NEXT STEP, it was fed back as a user turn, the
+        // picker escalated to hand-editing memories.jsonl, and the turn closed with a terminal build-verify over a
+        // "deliverable" — four extra messages about a fact the store already held. Files have the ledger for this;
+        // memory now has this row: the engine states what it did, so nothing is inferred from silence.
+        var mem_row: ?[]u8 = null;
+        defer if (mem_row) |r| gpa.free(r);
         {
             var mem_saved: usize = 0;
-            if (processMemoryDirectives(app, uid, answer, &mem_saved)) |stripped| {
+            var mem_note: std.ArrayListUnmanaged(u8) = .empty;
+            defer mem_note.deinit(gpa);
+            if (processMemoryDirectives(app, uid, answer, &mem_saved, &mem_note)) |stripped| {
                 if (std.mem.trim(u8, stripped, " \r\n\t").len == 0 and mem_saved > 0) {
                     if (gpa.dupe(u8, "(noted — saved to your memory)")) |note| {
                         gpa.free(stripped);
@@ -3727,6 +3753,13 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
                     gpa.free(answer);
                     answer = stripped;
                 }
+            }
+            if (mem_saved > 0) {
+                mem_applied_turn += mem_saved;
+                mem_row = memoryUpdateRow(gpa, mem_note.items);
+                var sb3: [96]u8 = undefined;
+                const plural: []const u8 = if (mem_saved == 1) "" else "s";
+                emitKV(app, conv_dir, "status", "text", std.fmt.bufPrint(&sb3, "memory updated — {d} directive{s} applied", .{ mem_saved, plural }) catch "memory updated");
             }
         }
 
@@ -3755,6 +3788,13 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
         conv_buf.appendSlice(gpa, ",{\"role\":\"assistant\",\"content\":") catch break :outer;
         http.jstr(gpa, &conv_buf, answer) catch break :outer;
         conv_buf.append(gpa, '}') catch break :outer;
+        // The engine's memory row rides directly under the reply that earned it — a system turn, never the model's
+        // voice — so the drive verdict's tail and every later pass read the update as a fact of this turn.
+        if (mem_row) |row| {
+            conv_buf.appendSlice(gpa, ",{\"role\":\"system\",\"content\":") catch break :outer;
+            http.jstr(gpa, &conv_buf, row) catch break :outer;
+            conv_buf.append(gpa, '}') catch break :outer;
+        }
 
         // PLAN ADVANCE: mark this subtask done + move on. The next iteration picks the next pending subtask; the
         // free-form drive inference below is SKIPPED (the plan is the driver).
@@ -3858,13 +3898,51 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
         // A failed/empty drive inference always ends the turn (even afk — we can't determine a next step, and a
         // dead backend would spin). Otherwise decide by loop mode.
         if (!next.ok or trimmed.len == 0) break :outer;
-        const is_done = loopIsDone(next.content);
+        // A MEMORY DIRECTIVE IS NEVER A DRIVE STEP. REMEMBER:/FORGET: lines are applied by the engine the moment
+        // the assistant writes them (the settle path above), and the store is the engine's file, not a deliverable.
+        // A picker that names one is saying either "that change was not recorded" or — far more often — that it
+        // did not SEE it recorded, the case the mem_row above now covers. Observed live (c6aaa98f2, armed loop):
+        // the picker proposed "FORGET: User is 33 years old, then REMEMBER: [fact] User is 34 years old" as the
+        // step after the pass that had applied exactly that; posted as a user turn it read as an instruction, the
+        // model answered it with a hallucinated file write, and the next proposal was to hand-edit memories.jsonl
+        // — which it did, reading the store's plaintext credentials into the transcript to "confirm" a line.
+        // So: any bare directive lines the picker wrote are applied here directly; then, if this turn has already
+        // recorded a change (or has been asked to, once), the proposal counts as DONE — the drive question offers
+        // no third reading of "the remaining step is one the engine performs". Only a turn that has recorded
+        // NOTHING gets one engine-framed step asking the model for the bare lines, never the picker's prose.
+        var mem_written: []u8 = &[_]u8{};
+        defer if (mem_written.len > 0) gpa.free(mem_written);
+        var mem_step_done = false;
+        if (memoryDirectiveShaped(trimmed)) {
+            var n: usize = 0;
+            var note: std.ArrayListUnmanaged(u8) = .empty;
+            defer note.deinit(gpa);
+            if (processMemoryDirectives(app, uid, trimmed, &n, &note)) |s| gpa.free(s);
+            if (n > 0) {
+                mem_applied_turn += n;
+                if (memoryUpdateRow(gpa, note.items)) |row| {
+                    defer gpa.free(row);
+                    appendMsgObj(gpa, &conv_buf, "system", row, row.len);
+                }
+            }
+            if (n > 0 or mem_applied_turn > 0 or mem_step_nudged) {
+                mem_step_done = true;
+                emitKV(app, conv_dir, "status", "text", "the proposed step is a memory update the engine has already applied — done");
+            } else {
+                mem_step_nudged = true;
+                mem_written = std.fmt.allocPrint(gpa, "{s}\n{s}", .{ MEMORY_STEP_NUDGE, trimmed }) catch &[_]u8{};
+                emitKV(app, conv_dir, "status", "text", "recording the memory change the step picker named");
+            }
+        }
+        const is_done = loopIsDone(next.content) or mem_step_done;
         const is_repeat = nearlySame(trimmed, prev_drive) or cctx.looksLikeToolMarkup(trimmed);
 
         // Choose the next synthetic drive step, or break, honoring: TERMINAL VERIFY (an armed loop never accepts a
         // bare DONE right after building — one completeness check first), re-ground (afk anchors to the goal), and
         // stuck-recovery (afk re-grounds + researches on a repeat instead of churning).
-        var next_step: []const u8 = trimmed;
+        // An engine-framed memory step (mem_written) replaces the picker's text — and, not being the model's own
+        // choice, is exempt from the course check below by the same pointer test as the other engine steering.
+        var next_step: []const u8 = if (mem_written.len > 0) mem_written else trimmed;
         // Holds a WRITTEN stuck-recovery instruction for this iteration (see stuckStep); empty means the static
         // template. Freed at the end of the iteration, which is past every use of next_step below.
         var stuck_written: []u8 = &[_]u8{};
@@ -9604,6 +9682,37 @@ const CtlResult = enum { none, stop };
 // legacyMemoriesPath below.
 const MEM_INJECT_CAP = 96; // newest N durable memories injected (bounded prompt)
 
+const UTF8_BOM = "\xEF\xBB\xBF";
+
+/// One line of the durable store, trimmed — and freed of a UTF-8 byte-order mark. A BOM'd first line (an editor or
+/// a PowerShell `Out-File` puts one there) failed the `ln[0] == '{'` gate in every reader below, so the OLDEST
+/// memory in the store — this user's name, as it happened — was invisible to the prompt, to dedup and to FORGET:,
+/// and the forget rewrite copied the unparsed line through verbatim, so the mark outlived every rewrite.
+fn durableLine(raw: []const u8) []const u8 {
+    const ln = std.mem.trim(u8, raw, " \r\t");
+    if (std.mem.startsWith(u8, ln, UTF8_BOM)) return std.mem.trimStart(u8, ln[UTF8_BOM.len..], " \r\t");
+    return ln;
+}
+
+/// Append a durable fact as it may be SHOWN in a prompt: a credential value masked to [withheld], a short
+/// unmaskable secret reduced to its name (the head up to the colon). One policy for the YOUR MEMORY block and the
+/// engine's memory-update row. True when something was withheld.
+fn appendFactShown(gpa: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), cat: []const u8, tx: []const u8) bool {
+    if (!tools.secretiveDurable(cat, tx)) {
+        out.appendSlice(gpa, tx) catch {};
+        return false;
+    }
+    const masked = tools.maskSecretTokens(gpa, tx);
+    defer if (masked.len > 0) gpa.free(masked);
+    if (std.mem.eql(u8, masked, tx)) {
+        // nothing maskable (a short secret): show only the entry's name — head up to the colon
+        const cut = std.mem.indexOfScalar(u8, tx, ':') orelse @min(tx.len, 40);
+        out.appendSlice(gpa, tx[0..cut]) catch {};
+        out.appendSlice(gpa, ": [withheld]") catch {};
+    } else out.appendSlice(gpa, masked) catch {};
+    return true;
+}
+
 const WITHHELD_FOOTER_FULL =
     "(the [withheld] credential values above never ride in prompts — when, and only when, a task needs one, call get_credential with a few identifying words)\n";
 
@@ -9670,7 +9779,7 @@ fn injectDurableMemory(app: *App, uid: u64, ws: *wsp.Workspace, compact: bool) v
     defer slices.deinit(gpa);
     var it = std.mem.splitScalar(u8, data, '\n');
     while (it.next()) |raw| {
-        const ln = std.mem.trim(u8, raw, " \r\t");
+        const ln = durableLine(raw);
         if (ln.len > 0 and ln[0] == '{') slices.append(gpa, ln) catch break;
     }
     if (slices.items.len == 0) return;
@@ -9697,17 +9806,7 @@ fn injectDurableMemory(app: *App, uid: u64, ws: *wsp.Workspace, compact: bool) v
         // CREDENTIAL VALUES never ride the broadcast prompt (observed: two live keys shipped to a
         // third-party provider on EVERY call of every conversation). The entry stays visible — value
         // masked — so the model knows it exists; get_credential fetches it in the turn that needs it.
-        if (tools.secretiveDurable(p.value.cat, tx)) {
-            const masked = tools.maskSecretTokens(gpa, tx);
-            defer if (masked.len > 0) gpa.free(masked);
-            if (std.mem.eql(u8, masked, tx)) {
-                // nothing maskable (a short secret): show only the entry's name — head up to the colon
-                const cut = std.mem.indexOfScalar(u8, tx, ':') orelse @min(tx.len, 40);
-                block.appendSlice(gpa, tx[0..cut]) catch break;
-                block.appendSlice(gpa, ": [withheld]") catch break;
-            } else block.appendSlice(gpa, masked) catch break;
-            withheld += 1;
-        } else block.appendSlice(gpa, tx) catch break;
+        if (appendFactShown(gpa, &block, p.value.cat, tx)) withheld += 1;
         block.append(gpa, '\n') catch break;
         any = true;
         injected += 1;
@@ -9732,7 +9831,7 @@ fn durableMemoryHas(app: *App, uid: u64, fact: []const u8) bool {
     const M = struct { text: []const u8 = "" };
     var it = std.mem.splitScalar(u8, data, '\n');
     while (it.next()) |raw| {
-        const ln = std.mem.trim(u8, raw, " \r\t");
+        const ln = durableLine(raw);
         if (ln.len == 0 or ln[0] != '{') continue;
         const p = std.json.parseFromSlice(M, gpa, ln, .{ .ignore_unknown_fields = true }) catch continue;
         defer p.deinit();
@@ -9786,7 +9885,7 @@ fn forgetDurableMemory(app: *App, uid: u64, match_in: []const u8) void {
     const M = struct { text: []const u8 = "" };
     var it = std.mem.splitScalar(u8, data, '\n');
     while (it.next()) |raw| {
-        const ln = std.mem.trim(u8, raw, " \r\t");
+        const ln = durableLine(raw);
         if (ln.len == 0) continue;
         var drop = false;
         if (ln[0] == '{') {
@@ -9805,6 +9904,134 @@ fn forgetDurableMemory(app: *App, uid: u64, match_in: []const u8) void {
     if (removed) std.Io.Dir.cwd().writeFile(app.io, .{ .sub_path = path, .data = out.items }) catch {};
 }
 
+const MemoryDirective = struct { forget: bool, body: []const u8 };
+
+/// The REMEMBER:/FORGET: directive a reply line carries, or null for prose. The keyword must OPEN the line — but
+/// after whatever list marker, blockquote or emphasis the model dressed it in (`- REMEMBER: …`, `**FORGET:** …`,
+/// a code span): the exact-prefix match used to reject those, which left the directive in the shown reply and the
+/// store unchanged — a memory that looked saved and was not. Case-insensitive on the keyword, as before.
+fn memoryDirective(line: []const u8) ?MemoryDirective {
+    const ln = std.mem.trimStart(u8, std.mem.trim(u8, line, " \r\t"), "-*>`_ \t");
+    const forget = std.ascii.startsWithIgnoreCase(ln, "FORGET:");
+    if (!forget and !std.ascii.startsWithIgnoreCase(ln, "REMEMBER:")) return null;
+    const kw_len: usize = if (forget) "FORGET:".len else "REMEMBER:".len;
+    var body = std.mem.trim(u8, ln[kw_len..], " \t`");
+    body = std.mem.trimStart(u8, body, "*_ \t");
+    if (std.mem.endsWith(u8, body, "**")) body = std.mem.trimEnd(u8, body[0 .. body.len - 2], " \t");
+    return .{ .forget = forget, .body = body };
+}
+
+/// A step-picker proposal whose substance is the durable-memory protocol: it names a REMEMBER:/FORGET: line or
+/// the engine's own store file. Case-sensitive on the protocol tokens — prose "don't forget: run the tests" is a
+/// step; the tokens as the prompt teaches them are not.
+fn memoryDirectiveShaped(step: []const u8) bool {
+    return std.mem.indexOf(u8, step, "REMEMBER:") != null or std.mem.indexOf(u8, step, "FORGET:") != null or
+        std.mem.indexOf(u8, step, "memories.jsonl") != null;
+}
+
+/// The engine's account of a durable-memory change, for the working context (see the settle path in runTurn).
+/// Third person, like every engine row: it is stored beside the reply, never inside it. gpa-owned.
+fn memoryUpdateRow(gpa: std.mem.Allocator, note: []const u8) ?[]u8 {
+    const what: []const u8 = if (note.len > 0) note else "directives applied";
+    return std.fmt.allocPrint(gpa, "[engine: durable memory updated — {s}. The store on disk already holds this change; the YOUR MEMORY block above was captured before it. Recording these facts needs no further step and no file edit.]", .{what}) catch null;
+}
+
+test "durable store lines: a byte-order mark hides no memory, and a dressed directive is still a directive" {
+    // the live store's first line — BOM'd — starts with '{' only once the mark is gone, so every reader's
+    // `ln[0] == '{'` gate admits it
+    const first = "\xEF\xBB\xBF{\"cat\":\"fact\",\"text\":\"User's name is Gary\"}\r";
+    try std.testing.expectEqualStrings("{\"cat\":\"fact\",\"text\":\"User's name is Gary\"}", durableLine(first));
+    try std.testing.expectEqualStrings("{\"a\":1}", durableLine("  {\"a\":1}\t"));
+    try std.testing.expectEqualStrings("", durableLine("\xEF\xBB\xBF"));
+    // directives: bare, list-marked, emphasised, in code spans — one parse, one body
+    const bare = memoryDirective("REMEMBER: [fact] Gary is 34 years old") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!bare.forget);
+    try std.testing.expectEqualStrings("[fact] Gary is 34 years old", bare.body);
+    const listed = memoryDirective("- **FORGET:** user is 33 years old") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(listed.forget);
+    try std.testing.expectEqualStrings("user is 33 years old", listed.body);
+    const coded = memoryDirective("`REMEMBER: [preference] deploys to us-west-2`") orelse return error.TestUnexpectedResult;
+    const spec = parseRemember(coded.body);
+    try std.testing.expectEqualStrings("preference", spec.cat);
+    try std.testing.expectEqualStrings("deploys to us-west-2", spec.fact);
+    const quoted = memoryDirective("> forget: the old forum password") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(quoted.forget);
+    try std.testing.expectEqualStrings("the old forum password", quoted.body);
+    // prose stays prose: the keyword must open the line
+    try std.testing.expect(memoryDirective("Happy birthday, Gary. 34 suits you.") == null);
+    try std.testing.expect(memoryDirective("I will remember: the deploy is at five.") == null);
+    try std.testing.expect(memoryDirective("(noted — saved to your memory)") == null);
+}
+
+test "a memory directive is never a drive step: memory-shaped proposals are recognised, work steps are not, and the engine's row withholds credentials" {
+    // the two live proposals (c6aaa98f2) that drove a turn into re-recording a fact the store already held
+    try std.testing.expect(memoryDirectiveShaped("FORGET: User is 33 years old, then REMEMBER: [fact] User is 34 years old"));
+    try std.testing.expect(memoryDirectiveShaped("Update the durable memory file (memories.jsonl): delete the line \"[fact] User is 33 years old\" and add \"[fact] User is 34 years old\", then confirm the write succeeded."));
+    try std.testing.expect(memoryDirectiveShaped("REMEMBER: [preference] deploys to us-west-2"));
+    // ordinary work — including prose that merely says forget, and the picker's own end token
+    try std.testing.expect(!memoryDirectiveShaped("Write tests/test_core.py covering the parser, then run them."));
+    try std.testing.expect(!memoryDirectiveShaped("Don't forget: run the migration before the deploy."));
+    try std.testing.expect(!memoryDirectiveShaped("DONE"));
+    // the picker is told the rule in the question it answers, and the engine-framed step asks for bare lines only
+    try std.testing.expect(std.mem.indexOf(u8, LOOP_QUESTION, "REMEMBER:/FORGET:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, MEMORY_STEP_NUDGE, "REMEMBER: [category]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, MEMORY_STEP_NUDGE, "FORGET:") != null);
+    // the row: names a plain fact, masks a credential value the way YOUR MEMORY does, never the value itself
+    const gpa = std.testing.allocator;
+    var note: std.ArrayListUnmanaged(u8) = .empty;
+    defer note.deinit(gpa);
+    try std.testing.expect(!appendFactShown(gpa, &note, "fact", "Gary is 34 years old"));
+    try note.appendSlice(gpa, "; ");
+    try std.testing.expect(appendFactShown(gpa, &note, "key", "GitHub personal access token: ghp_abc123abc123abc123abc123abc123"));
+    try std.testing.expectEqualStrings("Gary is 34 years old; GitHub personal access token: [withheld]", note.items);
+    const row = memoryUpdateRow(gpa, note.items) orelse return error.TestUnexpectedResult;
+    defer gpa.free(row);
+    try std.testing.expect(std.mem.startsWith(u8, row, "[engine: durable memory updated"));
+    try std.testing.expect(std.mem.indexOf(u8, row, "ghp_") == null);
+    try std.testing.expect(std.mem.indexOf(u8, row, "Gary is 34 years old") != null);
+}
+
+test "REMEMBER:/FORGET: against the user's store: the stale fact goes, the new one lands once, a byte-order mark neither hides a line nor survives the rewrite, and the shown reply is clean" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-durmem-tmp";
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    var ta = try http.testApp(gpa, io, root);
+    defer ta.deinit();
+    const app = &ta.app;
+    var pb: [700]u8 = undefined;
+    const path = memoriesPath(app, 1, &pb) orelse return error.TestUnexpectedResult;
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, std.fs.path.dirname(path).?, .default_dir) catch {};
+    // the live shape: an editor's byte-order mark ahead of the oldest memory, then the fact about to go stale
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "\xEF\xBB\xBF{\"cat\":\"fact\",\"text\":\"User's name is Gary\"}\n{\"cat\":\"fact\",\"text\":\"User is 33 years old\"}\n" }) catch return error.TestUnexpectedResult;
+    // the BOM'd line is a memory like any other — dedup sees it
+    try std.testing.expect(durableMemoryHas(app, 1, "User's name is Gary"));
+    var saved: usize = 0;
+    var note: std.ArrayListUnmanaged(u8) = .empty;
+    defer note.deinit(gpa);
+    const reply = "FORGET: user is 33 years old\n- **REMEMBER:** [fact] Gary is 34 years old\nHappy birthday, Gary. 34 suits you.";
+    const shown = processMemoryDirectives(app, 1, reply, &saved, &note) orelse return error.TestUnexpectedResult;
+    defer gpa.free(shown);
+    try std.testing.expectEqual(@as(usize, 2), saved);
+    try std.testing.expectEqualStrings("Happy birthday, Gary. 34 suits you.", shown);
+    try std.testing.expectEqualStrings("forgot \"user is 33 years old\"; remembered [fact] Gary is 34 years old", note.items);
+    // the store on disk: the stale fact gone, the new one in, the oldest memory kept, the mark gone with the rewrite
+    const data = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(64 << 10)) catch return error.TestUnexpectedResult;
+    defer gpa.free(data);
+    try std.testing.expect(data.len > 0 and data[0] == '{');
+    try std.testing.expect(std.mem.indexOf(u8, data, "33 years old") == null);
+    try std.testing.expect(std.mem.indexOf(u8, data, "\"User's name is Gary\"") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, data, "\"Gary is 34 years old\""));
+    // and a second, identical REMEMBER: lands nothing — the dedup reads the same store it writes
+    var again: usize = 0;
+    if (processMemoryDirectives(app, 1, "REMEMBER: [fact] Gary is 34 years old", &again, null)) |s| gpa.free(s);
+    const data2 = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(64 << 10)) catch return error.TestUnexpectedResult;
+    defer gpa.free(data2);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, data2, "\"Gary is 34 years old\""));
+}
+
 /// Parse a REMEMBER: body: an optional leading `[category]` then the fact. Returns cat+fact (cat defaults "fact").
 fn parseRemember(body_in: []const u8) struct { cat: []const u8, fact: []const u8 } {
     const body = std.mem.trim(u8, body_in, " \t");
@@ -9819,8 +10046,11 @@ fn parseRemember(body_in: []const u8) struct { cat: []const u8, fact: []const u8
 
 /// Act on a reply's REMEMBER:/FORGET: lines (store/forget in the shared durable memory) and return the reply with
 /// those lines STRIPPED — the desk's processMemory ported. Returns an owned copy when it changed anything, else
-/// null (caller keeps the original). `saved` receives the number of directives applied.
-fn processMemoryDirectives(app: *App, uid: u64, text: []const u8, saved: *usize) ?[]u8 {
+/// null (caller keeps the original). `saved` receives the number of directives applied; `note`, when given,
+/// collects the engine's account of them ("forgot \"words\"; remembered [cat] fact") with credential values
+/// masked the way the YOUR MEMORY block masks them — it is prompt-bound (memoryUpdateRow), never a place a
+/// stripped secret may resurface.
+fn processMemoryDirectives(app: *App, uid: u64, text: []const u8, saved: *usize, note: ?*std.ArrayListUnmanaged(u8)) ?[]u8 {
     const gpa = app.gpa;
     saved.* = 0;
     if (std.mem.indexOf(u8, text, "REMEMBER:") == null and std.mem.indexOf(u8, text, "FORGET:") == null) return null;
@@ -9829,20 +10059,31 @@ fn processMemoryDirectives(app: *App, uid: u64, text: []const u8, saved: *usize)
     var first = true;
     var it = std.mem.splitScalar(u8, text, '\n');
     while (it.next()) |line| {
-        const ln = std.mem.trim(u8, line, " \r\t");
-        if (std.ascii.startsWithIgnoreCase(ln, "REMEMBER:")) {
-            const spec = parseRemember(ln["REMEMBER:".len..]);
-            if (spec.fact.len >= 2) {
-                storeDurableMemory(app, uid, spec.cat, spec.fact);
-                saved.* += 1;
-            }
-            continue; // strip
-        }
-        if (std.ascii.startsWithIgnoreCase(ln, "FORGET:")) {
-            const m = std.mem.trim(u8, ln["FORGET:".len..], " \t");
-            if (m.len >= 2) {
-                forgetDurableMemory(app, uid, m);
-                saved.* += 1;
+        if (memoryDirective(line)) |d| {
+            if (d.forget) {
+                if (d.body.len >= 2) {
+                    forgetDurableMemory(app, uid, d.body);
+                    saved.* += 1;
+                    if (note) |nb| {
+                        if (nb.items.len > 0) nb.appendSlice(gpa, "; ") catch {};
+                        nb.appendSlice(gpa, "forgot \"") catch {};
+                        _ = appendFactShown(gpa, nb, "fact", d.body);
+                        nb.append(gpa, '"') catch {};
+                    }
+                }
+            } else {
+                const spec = parseRemember(d.body);
+                if (spec.fact.len >= 2) {
+                    storeDurableMemory(app, uid, spec.cat, spec.fact);
+                    saved.* += 1;
+                    if (note) |nb| {
+                        if (nb.items.len > 0) nb.appendSlice(gpa, "; ") catch {};
+                        nb.appendSlice(gpa, "remembered [") catch {};
+                        nb.appendSlice(gpa, std.mem.trim(u8, spec.cat, " \r\n\t[]")) catch {};
+                        nb.appendSlice(gpa, "] ") catch {};
+                        _ = appendFactShown(gpa, nb, spec.cat, spec.fact);
+                    }
+                }
             }
             continue; // strip
         }
