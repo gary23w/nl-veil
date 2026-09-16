@@ -47,10 +47,6 @@ pub const Tray = struct {
         log.trace("tray.notify title={s} accent={d}", .{ title, accent });
         if (t.inited) t.impl.notify(gpa, title, body, accent);
     }
-    /// Drain the tray window's message queue (Windows). Call once per UI frame.
-    pub fn pump(t: *Tray) void {
-        if (t.inited) t.impl.pump();
-    }
     /// True (once) if the user double-clicked the tray icon and wants the window restored.
     pub fn takeRestoreRequest(t: *Tray) bool {
         return if (t.inited) t.impl.takeRestoreRequest() else false;
@@ -469,13 +465,23 @@ const WindowsTray = struct {
         utf16z(&self.nid.szInfo, body);
         _ = Shell_NotifyIconW(NIM_MODIFY, &self.nid);
     }
-    fn pump(self: *WindowsTray) void {
-        var msg: MSG = undefined;
-        while (PeekMessageW(&msg, self.hwnd, 0, 0, PM_REMOVE) != 0) {
-            _ = TranslateMessage(&msg);
-            _ = DispatchMessageW(&msg);
-        }
-    }
+    // NO PER-FRAME PUMP HERE - AND NEVER A WINDOW-FILTERED PeekMessage ON THE UI THREAD.
+    //
+    // The tray window is created on the UI thread (init runs there), so the unfiltered PeekMessageW(NULL, ...)
+    // loop raylib runs every frame (EndDrawing -> PollInputEvents -> glfwPollEvents; rl.pollInputEvents on the
+    // hidden path) already retrieves this window's messages, and DispatchMessageW routes them to wndProc below.
+    //
+    // Until 2026-09-16 the frame loop ALSO drained this window with `PeekMessageW(&msg, self.hwnd, 0, 0,
+    // PM_REMOVE)` once per frame, and that filtered peek is what made Windows call the desk "Not Responding"
+    // while it was drawing at 60 fps. Windows' hung-app clock (a window is "hung" 5 s after its thread last
+    // read the queue) is only credited by the unfiltered poll, and with a window-filtered peek running each
+    // frame that credit stops: IsHungAppWindow(glfw window) went TRUE whenever no message happened to arrive
+    // for 5 s, DWM swapped in a "veil-desk (Not Responding)" ghost within 50 ms, the ghost ate every click, so
+    // the real window never received the input that would have un-hung it - a hang with the frame loop alive,
+    // the watchdog silent and the server fine. Reproduced outside this program: a 60 fps PeekMessageW(NULL)
+    // loop with a GL swap stays responsive indefinitely; add one filtered peek on a second window of the same
+    // thread each frame and Windows flags it ~5 s after the last message. Posting any message (even WM_NULL)
+    // un-hung it for exactly 5 s, which is how the diagnosis was confirmed. watchdog.zig now logs this state.
     fn setNotifyEnabled(self: *WindowsTray, enabled: bool) void {
         self.notify_enabled = enabled;
     }
@@ -576,9 +582,6 @@ const PosixTray = struct {
         _ = title;
         _ = body;
         _ = accent;
-    }
-    fn pump(self: *PosixTray) void {
-        _ = self;
     }
     fn takeRestoreRequest(self: *PosixTray) bool {
         _ = self;
