@@ -8,7 +8,7 @@
 
 ## Purpose Summary
 
-Rsync-lite over the existing delegation channel instead of a real file server (SMB/WebDAV would mean a new port, its own auth surface, OS mounts, and idle chatter). A sync happens only at the two moments state actually crosses the machine boundary — a cast needs the client's files (client→server), a finished hive's files need to reach the client (server→client) — and each moment costs one manifest round-trip plus only the files whose content hash differs. A same-disk install (desk + server sharing the data dir) is detected by a probe token in the manifest exchange and short-circuits to zero transfers. No daemon, no watcher, no polling: idle cost is exactly zero on both sides.
+Rsync-lite over the existing delegation channel instead of a real file server (SMB/WebDAV would mean a new port, its own auth surface, OS mounts, and idle chatter). A sync happens only at the moments state actually crosses the machine boundary — a cast needs the client's files (client→server), a finished hive's files need to reach the client (server→client), and a `cf_` call, which always runs server-side, needs the one file it uploads or downloads carried across (see [engine](#doc=worker/chat/engine)) — and each moment costs one manifest round-trip plus only the files whose content hash differs. A same-disk install (desk + server sharing the data dir) is detected by a probe token in the manifest exchange and short-circuits to zero transfers. No daemon, no watcher, no polling: idle cost is exactly zero on both sides.
 
 ## Key Exports
 
