@@ -38,6 +38,7 @@ test {
     _ = @import("worker/builtin.zig"); // built-in engine facade: sentinel resolution + weights-store election
     _ = @import("worker/builtin_endpoint.zig"); // the engine's loopback dialect surface, tested on a mock engine
     _ = @import("worker/modelpull.zig"); // weights downloader: repo resolve, resume, sha verify — via fakehttp
+    _ = @import("worker/fakehttp.zig"); // the test stand-in itself: every server on a port of its own
     _ = @import("worker/chat/context.zig");
     _ = @import("worker/chat/engine.zig");
     _ = @import("worker/chat/overlay.zig"); // recall overlay: the per-thought working field, refractory + firing
