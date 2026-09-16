@@ -45,6 +45,14 @@ Now the ceiling settles a **segment**, not the chat:
 
 The same distillation is also pressed into neuron-db as a durable [resume anchor](#doc=worker/continuity), which is what carries a cut across a surface whose next unit of work opens a DIFFERENT transcript — a [scheduled run](#doc=worker/sched) gets a fresh `conv_dir` every time, so the engine row alone would never be read. `continuity.read` bids on the workspace's `continuation` channel while the turn is assembled; `continuity.clear` runs on every normal completion, so a healthy conversation carries no anchor and its prompt is byte-identical to before.
 
+## A chat without end — the context plan
+
+One `ContextPlan` per turn sizes the whole projection of the transcript, from two models: the coding model *consumes* the prompt (its live served window, else the catalog's `context_window`, else the id heuristic; its capacity is `modelcfg.senseModel`'s tier), and the thinking model *writes every fold*. `planCore` is the arithmetic, on plain numbers; `contextPlan` resolves the two models. The plan is threaded into both `assembleHistory` and `refreshSummary`, which must agree on where the recency window starts or the band between them belongs to neither — the bug the single `historyWindowBytes` was written to close, and which the plan closes structurally.
+
+What the plan carries: `hist_win` (the recency window — tightened for a small window as before, and now *scaled up* to `cctx.historyWindowCap` for a mid or large reader when the window still holds a full stock working span beside it, so a 32k model keeps the window it had and a 128k frontier model replays 64 KiB), `summary_cap` (the rolling summary's injected and stored size — the smaller of what the reader holds and what the summarizer can write back), `facts_budget` (the digest ledger's projection), `chunk_bytes` (what one fold reads, sized to the summarizer's window rather than the flat 32 KiB an 8k local model could never take), and `shape` (the words, FACTS lines and completion budget the fold is asked for). A trace line per turn records all of it, so a chat that forgets is diagnosed from what it was allowed to hold.
+
+Every fold (`summarizeInto`, label `ctxsum`, thinking role) now writes two sections — SUMMARY, then FACTS — and `refreshSummary` appends the FACTS to `{conv}/digest.jsonl` (`digestAppend`) before the summary that mentions them is rewritten for the last time. `assembleHistory` projects that ledger for the live question (`injectFactsLedger` → `cctx.selectFacts`) right after the summary, under `facts_budget`, with no model call. A fold that writes no FACTS line is the pre-ledger fold exactly; an empty summary is a failed fold, so the cursor stays put and the chunk is retried. The digest ledger rides the R2 backup beside `messages.jsonl` and `context.json`. See [context](#doc=worker/chat/context) for the ledger's projection rule and every budget's derivation.
+
 ## Context through the workspace
 
 Every non-transcript block the turn injects — durable memory, the tool digest, the trust belt, image OCR, relevance recall, belt corrections, family context, plugin hooks, the file ledger — bids into the [prompt workspace](#doc=worker/chat/workspace) instead of appending ad hoc: fixed render order per channel (byte-compatible with the prompt-prefix-cache layout), per-channel byte budgets with whole-block lowest-score-first drops, a provenance receipt on each admitted block, and one decision line per turn in `{conv}/workspace.jsonl`.
@@ -61,7 +69,7 @@ Recall itself is scored: the neuron CLI's `recallscored` returns top-k facts **w
 
 - `worker/tools` — the tool surface the loop calls (write/read/edit/search/shell/…)
 - `worker/llm` — the model call machinery (streaming completions)
-- `worker/chat/context` — the recency window + pinned goal + rolling summary that keeps the prompt bounded
+- `worker/chat/context` — the recency window + pinned goal + rolling summary + digest ledger that keep the prompt bounded at any conversation length, and the capacity-scaled budgets the `ContextPlan` is built from
 - `worker/continuity` — durable resume anchors: press on a cut, read at assembly, clear on a clean finish
 - `worker/chat/plan` — task decomposition into routed subtasks the drive loop walks
 - `worker/deploy/service` — casting a hive for the conversation from inside a turn

@@ -2907,9 +2907,18 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     // The window is sized for the model that CONSUMES this prompt (coding), against the REAL tool array — not a
     // tier estimate, which would overflow on exactly the turns that granted a recipe. refreshSummary below is
     // handed the same number so both agree on where the window starts.
-    const hist_win = historyWindowBytes(trio.coding.base_url, trio.coding.model, turn_tools.len);
-    warnIfPromptCannotFit(trio.coding.base_url, trio.coding.model, turn_tools.len, hist_win);
-    assembleHistory(app, conv_dir, user_text, &conv_buf, ws_packed.varying, hist_win);
+    const ctx_plan = contextPlan(app, uid, trio, turn_tools.len, win_hint);
+    const hist_win = ctx_plan.hist_win;
+    warnIfPromptCannotFit(trio.coding.model, turn_tools.len, ctx_plan);
+    {
+        // The projection this turn was sized to, on the record beside the working-span trace above: a chat that
+        // forgets is diagnosed from what it was allowed to hold, not guessed at.
+        var tb: [200]u8 = undefined;
+        if (std.fmt.bufPrint(&tb, "context: history window {d} KB, summary {d} KB, facts {d} KB; a fold reads {d} KB and writes up to {d} words", .{
+            ctx_plan.hist_win / 1024, ctx_plan.summary_cap / 1024, ctx_plan.facts_budget / 1024, ctx_plan.chunk_bytes / 1024, ctx_plan.shape.words,
+        })) |t| emitKV(app, conv_dir, "trace", "text", t) else |_| {}
+    }
+    assembleHistory(app, conv_dir, user_text, &conv_buf, ws_packed.varying, ctx_plan);
     conv_buf.appendSlice(gpa, ws_packed.suffix) catch {};
 
     if (ws_packed.log.len > 0) {
@@ -4056,7 +4065,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     // keeps the capability invisible in ordinary use: an anchor exists only between a real cut and the work
     // being picked back up, so a healthy conversation never reads one and never renders the block.
     continuity.clear(ctx.mem, mem_scope);
-    refreshSummary(app, conv_dir, llm_dir, think.base_url, think.key, think.model, hist_win);
+    refreshSummary(app, conv_dir, llm_dir, think.base_url, think.key, think.model, ctx_plan);
     // NO {done} here: it is emitted by signalDone after the caller releases the conversation slot, so the frame
     // that tells a client "the turn is over" is not followed by a 409 when the client believes it.
 }
@@ -8135,6 +8144,89 @@ const SYSTEM_BLOCKS_EST_BYTES: usize = 4 * 1024;
 /// rounded up. It is an ESTIMATE, and it is why warnIfPromptCannotFit reports "~" sizes rather than exact ones.
 const WORKSPACE_EST_BYTES: usize = 8 * 1024;
 
+/// Everything one turn's context projection is sized by, computed ONCE per turn from two models: the one that
+/// CONSUMES the prompt (what must fit — its window and capacity) and the one that SUMMARIZES (what one fold can
+/// read and write back). Threaded into assembleHistory and refreshSummary so the two can never disagree about
+/// where the recency window starts — the band-between-them bug historyWindowBytes was written to close.
+const ContextPlan = struct {
+    /// recency window bytes — assembleHistory's and refreshSummary's tail_buf, the ONE thing that sizes the window
+    hist_win: usize,
+    /// the rolling summary's size, injected AND stored: the smaller of what the reader holds and the writer can write
+    summary_cap: usize,
+    /// the FACTS FROM EARLIER TURNS block — the digest ledger's projection for this turn
+    facts_budget: usize,
+    /// bytes one fold reads from the uncovered span
+    chunk_bytes: usize,
+    /// the words / FACTS lines / completion budget the fold is asked for
+    shape: cctx.FoldShape,
+    /// the consumer's window in bytes, for the trace and the fit warning
+    win_bytes: usize,
+};
+
+/// A model's window in tokens and its capacity, from the best source there is: the LIVE served window for the
+/// built-in engine, else what the catalog states (`hint`), else the id heuristic. Capacity is modelcfg's tier —
+/// a small window caps it and a catalog window never promotes it: an 8B with a 128k window is still an 8B.
+const WindowOf = struct { tokens: usize, cap: cctx.Capacity };
+fn windowOf(base_url: []const u8, model: []const u8, hint: ?usize) WindowOf {
+    const local = std.mem.indexOf(u8, base_url, "127.0.0.1") != null or std.mem.indexOf(u8, base_url, "localhost") != null;
+    const sense = modelcfg.senseModel(model, local);
+    const tokens: usize = servingWindowTokens(base_url) orelse hint orelse @as(usize, sense.ctx_k) * 1024;
+    return .{ .tokens = tokens, .cap = @enumFromInt(@intFromEnum(sense.tier)) };
+}
+
+/// The plan from plain numbers — the whole of the budget arithmetic, so it is tested with plain numbers.
+///
+/// The recency window has two regimes. TIGHTENING (as before): everything the prompt must hold before one byte
+/// of replayed history — system blocks, the workspace, the summary and facts blocks at their caps, the goal pin,
+/// the output reserve, the REAL tool array and a minimal working span — is subtracted from the window, and what
+/// is left is the window, quantized down to 4 KiB and never below its floor. SCALING UP: a reader of capacity
+/// mid or large is replayed more than the stock 28 KiB only when the window still holds a FULL stock working
+/// span (cctx.WORKING_COMPACT_BYTES) beside the larger history — so a 32k model keeps the window it had, a 64k
+/// model reads more, and a 128k frontier model reaches cctx.historyWindowCap. More verbatim history is fewer
+/// folds for the same conversation, and the folds were the C1 run's dominant cost.
+fn planCore(win_tokens: usize, cap: cctx.Capacity, tools_bytes: usize, sum_win_tokens: usize, sum_cap: cctx.Capacity) ContextPlan {
+    // 3 bytes/token is deliberately pessimistic (measured 3.5 on this corpus): under-estimate the window and
+    // fold early rather than overflow.
+    const win_bytes = win_tokens * 3;
+    const sum_win_bytes = sum_win_tokens * 3;
+    const summary_cap = @min(cctx.summaryInjectCap(win_bytes, cap), cctx.summaryInjectCap(sum_win_bytes, sum_cap));
+    const facts_budget = cctx.factsBudget(win_bytes, cap);
+    const other = SYSTEM_BLOCKS_EST_BYTES + WORKSPACE_EST_BYTES + (summary_cap + 256) + (facts_budget + 256) +
+        cctx.GOAL_PIN_CAP + turnOutputReserveBytes + tools_bytes + WORKING_MIN_BUDGET_BYTES;
+    const hist_win: usize = blk: {
+        if (win_bytes <= other) break :blk HISTORY_WINDOW_MIN_BYTES;
+        const avail = win_bytes - other;
+        if (avail < cctx.HISTORY_WINDOW_BYTES) break :blk @max(HISTORY_WINDOW_MIN_BYTES, (avail / (4 * 1024)) * (4 * 1024));
+        // roomy: the stock window — and beyond it only with a full working span still free beside the history
+        const ceiling = cctx.historyWindowCap(cap);
+        const other_up = other - WORKING_MIN_BUDGET_BYTES + cctx.WORKING_COMPACT_BYTES;
+        if (ceiling <= cctx.HISTORY_WINDOW_BYTES or win_bytes <= other_up) break :blk cctx.HISTORY_WINDOW_BYTES;
+        const avail_up = win_bytes - other_up;
+        break :blk std.math.clamp((avail_up / (4 * 1024)) * (4 * 1024), cctx.HISTORY_WINDOW_BYTES, ceiling);
+    };
+    // the fold is bounded by the SMALLER capacity: it reads a summary sized for the reader and must write it
+    // back inside the summarizer's own window
+    const fold_cap: cctx.Capacity = @enumFromInt(@min(@intFromEnum(cap), @intFromEnum(sum_cap)));
+    return .{
+        .hist_win = hist_win,
+        .summary_cap = summary_cap,
+        .facts_budget = facts_budget,
+        .chunk_bytes = cctx.summaryChunkBytes(sum_win_bytes, summary_cap),
+        .shape = cctx.foldShape(fold_cap, summary_cap),
+        .win_bytes = win_bytes,
+    };
+}
+
+/// The plan for this turn: the coding model consumes the prompt (its catalog window rides in as `win_hint`), the
+/// thinking model writes every fold.
+fn contextPlan(app: *App, uid: u64, trio: ModelTrio, tools_bytes: usize, win_hint: ?usize) ContextPlan {
+    const think = trio.pick(.thinking);
+    const c = windowOf(trio.coding.base_url, trio.coding.model, win_hint);
+    const s_hint: ?usize = if (cf_oauth.windowTokensFor(app, uid, think.model)) |w| @as(usize, w) else null;
+    const s = windowOf(think.base_url, think.model, s_hint);
+    return planCore(c.tokens, c.cap, tools_bytes, s.tokens, s.cap);
+}
+
 /// Bytes of RECENCY WINDOW that may be replayed, for a prompt CONSUMED by `model` at `base_url`.
 ///
 /// cctx.HISTORY_WINDOW_BYTES is a flat 28 KiB written against a 32k-token model, and nothing ever related it to
@@ -8155,19 +8247,12 @@ const WORKSPACE_EST_BYTES: usize = 8 * 1024;
 ///
 /// Quantized DOWN to 4 KiB: `covered` persists across turns, so a window that wobbled by a few hundred bytes
 /// because the belt gained one grant would re-open an uncovered band every time it shrank.
+///
+/// Now a view of planCore for a caller that knows only the consuming model (the tests): the same model is taken
+/// as its own summarizer. The turn itself builds the whole ContextPlan (contextPlan).
 fn historyWindowBytes(base_url: []const u8, model: []const u8, tools_bytes: usize) usize {
-    const local = std.mem.indexOf(u8, base_url, "127.0.0.1") != null or
-        std.mem.indexOf(u8, base_url, "localhost") != null;
-    const win_tokens: usize = servingWindowTokens(base_url) orelse
-        @as(usize, modelcfg.senseModel(model, local).ctx_k) * 1024;
-    const win_bytes = win_tokens * 3; // same deliberate pessimism as workingBudgetBytes — under-estimate and fold early
-    // everything the prompt must hold before one byte of replayed history
-    const other = SYSTEM_BLOCKS_EST_BYTES + WORKSPACE_EST_BYTES + (cctx.SUMMARY_INJECT_CAP + 256) +
-        cctx.GOAL_PIN_CAP + turnOutputReserveBytes + tools_bytes + WORKING_MIN_BUDGET_BYTES;
-    if (win_bytes <= other) return HISTORY_WINDOW_MIN_BYTES;
-    const avail = win_bytes - other;
-    if (avail >= cctx.HISTORY_WINDOW_BYTES) return cctx.HISTORY_WINDOW_BYTES; // roomy: today's behaviour, byte-identical
-    return @max(HISTORY_WINDOW_MIN_BYTES, (avail / (4 * 1024)) * (4 * 1024));
+    const w = windowOf(base_url, model, null);
+    return planCore(w.tokens, w.cap, tools_bytes, w.tokens, w.cap).hist_win;
 }
 
 /// Say so when the assembled prompt cannot fit the served window even at the smallest history this engine will
@@ -8175,17 +8260,12 @@ fn historyWindowBytes(base_url: []const u8, model: []const u8, tools_bytes: usiz
 /// whole, and the turn ended "(no reply — the model returned an empty or malformed response this turn)" — a
 /// message that describes the model as having misbehaved when in fact it was never given a prompt it could read.
 /// One line naming the shortfall and the term responsible turns a mystery into arithmetic.
-fn warnIfPromptCannotFit(base_url: []const u8, model: []const u8, tools_bytes: usize, hist_win: usize) void {
-    const local = std.mem.indexOf(u8, base_url, "127.0.0.1") != null or
-        std.mem.indexOf(u8, base_url, "localhost") != null;
-    const win_tokens: usize = servingWindowTokens(base_url) orelse
-        @as(usize, modelcfg.senseModel(model, local).ctx_k) * 1024;
-    const win_bytes = win_tokens * 3;
-    const need = SYSTEM_BLOCKS_EST_BYTES + WORKSPACE_EST_BYTES + (cctx.SUMMARY_INJECT_CAP + 256) +
-        cctx.GOAL_PIN_CAP + turnOutputReserveBytes + tools_bytes + WORKING_MIN_BUDGET_BYTES + hist_win;
-    if (need <= win_bytes) return;
+fn warnIfPromptCannotFit(model: []const u8, tools_bytes: usize, plan: ContextPlan) void {
+    const need = SYSTEM_BLOCKS_EST_BYTES + WORKSPACE_EST_BYTES + (plan.summary_cap + 256) + (plan.facts_budget + 256) +
+        cctx.GOAL_PIN_CAP + turnOutputReserveBytes + tools_bytes + WORKING_MIN_BUDGET_BYTES + plan.hist_win;
+    if (need <= plan.win_bytes) return;
     memlog.warn("context: this turn's prompt needs ~{d} KB but {s} serves ~{d} KB — over by ~{d} KB with history already at its {d} KB floor; the tool schemas alone are ~{d} KB. Expect the provider to reject the request (it surfaces as an empty reply).", .{
-        need / 1024, model, win_bytes / 1024, (need - win_bytes) / 1024, hist_win / 1024, tools_bytes / 1024,
+        need / 1024, model, plan.win_bytes / 1024, (need - plan.win_bytes) / 1024, plan.hist_win / 1024, tools_bytes / 1024,
     });
 }
 
@@ -10029,22 +10109,22 @@ fn dropEngineRows(dest: []u8, span: []const u8) []const u8 {
 /// of turns that have scrolled out of the recency window, the pinned original goal, and the recency window itself.
 /// Replaces "replay the whole transcript". Best-effort: any read/parse/summary failure degrades to less context,
 /// never a crash — the turn still runs on the system prompt + recall + whatever seeded.
-fn assembleHistory(app: *App, conv_dir: []const u8, user_text: []const u8, conv_buf: *std.ArrayListUnmanaged(u8), varying_frag: []const u8, win_bytes: usize) void {
+fn assembleHistory(app: *App, conv_dir: []const u8, user_text: []const u8, conv_buf: *std.ArrayListUnmanaged(u8), varying_frag: []const u8, plan: ContextPlan) void {
     const gpa = app.gpa;
     const mpath = std.fmt.allocPrint(gpa, "{s}/messages.jsonl", .{conv_dir}) catch return;
     defer gpa.free(mpath);
 
     const head_buf = gpa.alloc(u8, cctx.HEAD_READ_BYTES) catch return;
     defer gpa.free(head_buf);
-    // `win_bytes` — NOT cctx.HISTORY_WINDOW_BYTES. This allocation is the ONLY thing that sizes the window:
+    // `plan.hist_win` — NOT cctx.HISTORY_WINDOW_BYTES. This allocation is the ONLY thing that sizes the window:
     // computeView ignores its window_bytes argument entirely and derives everything from the tail slice it is
     // handed. refreshSummary must allocate the SAME size or the two disagree about where the window starts, and
     // the band between them belongs to neither the summary nor the replay — see historyWindowBytes.
-    const tail_buf = gpa.alloc(u8, win_bytes) catch return;
+    const tail_buf = gpa.alloc(u8, plan.hist_win) catch return;
     defer gpa.free(tail_buf);
 
     const ht = cctx.readHeadTail(app.io, mpath, head_buf, tail_buf) orelse return; // no history yet → nothing to seed
-    const view = cctx.computeView(ht.head, ht.tail, ht.size, win_bytes);
+    const view = cctx.computeView(ht.head, ht.tail, ht.size, plan.hist_win);
 
     // ROLLING SUMMARY: when older turns have scrolled past the recency window, inject the condensed running summary
     // of them so continuity survives beyond the window + relevance recall. CRITICAL PATH: only the PERSISTED summary
@@ -10059,8 +10139,11 @@ fn assembleHistory(app: *App, conv_dir: []const u8, user_text: []const u8, conv_
             defer sc.deinit(gpa);
             sc.appendSlice(gpa, "CONVERSATION SUMMARY (older turns of THIS conversation, condensed — everything before the messages shown below). Treat as grounded context:\n") catch {};
             sc.appendSlice(gpa, sum) catch {};
-            if (sc.items.len > 0) appendMsgObj(gpa, conv_buf, "system", sc.items, cctx.SUMMARY_INJECT_CAP + 256);
+            if (sc.items.len > 0) appendMsgObj(gpa, conv_buf, "system", sc.items, plan.summary_cap + 256);
         }
+        // THE DIGEST LEDGER: the facts every fold banked, projected for this turn — the layer that reaches back
+        // further than any rewritten summary can (see cctx "the transcript ledger").
+        injectFactsLedger(app, conv_dir, user_text, view.goal_line, conv_buf, plan.facts_budget);
     }
 
     // PINNED GOAL: the conversation's first user message anchors the arc even after it scrolls out of the window.
@@ -10080,6 +10163,48 @@ fn assembleHistory(app: *App, conv_dir: []const u8, user_text: []const u8, conv_
     // SUMMARY_CHUNKS_PER_TURN per completed turn). Seed the current
     // message verbatim (clipped) so the model always sees the actual question it must answer.
     if (view.window.len == 0) appendMsgObj(gpa, conv_buf, "user", user_text, cctx.CURRENT_MSG_PIN_CAP);
+}
+
+/// Append one fold's FACTS to {conv_dir}/digest.jsonl — the append-only half of the transcript ledger. `from`/`to`
+/// are the messages.jsonl bytes the fold covered, so a record can always be traced to the turns it came from.
+/// Best-effort: a failed append loses this record's lines from the ledger and nothing else (they are still in the
+/// summary that was just written).
+fn digestAppend(app: *App, conv_dir: []const u8, from: usize, to: usize, facts: []const u8) void {
+    const gpa = app.gpa;
+    var rec: std.ArrayListUnmanaged(u8) = .empty;
+    defer rec.deinit(gpa);
+    cctx.digestRecord(gpa, &rec, from, to, nowSecs(app.io), facts) catch return;
+    const dpath = std.fmt.allocPrint(gpa, "{s}/{s}", .{ conv_dir, cctx.DIGEST_FILE }) catch return;
+    defer gpa.free(dpath);
+    http.appendFile(app.io, gpa, dpath, rec.items) catch {};
+}
+
+/// What introduces the digest ledger's projection. Third person, and explicit about what a line IS: something
+/// established when it was recorded, which a later turn may since have changed.
+const FACTS_BLOCK_HEADER = "FACTS FROM EARLIER TURNS (engine-kept ledger of what THIS conversation established before the messages shown below - decisions, preferences, names, paths, values; each line is what was true when it was recorded, so re-check with a tool anything that can change):\n";
+
+/// CRITICAL PATH, no model call: project the digest ledger for this turn — the newest lines plus the lines closest
+/// to the live question and the pinned goal, under the plan's budget — and seed it as one system turn right after
+/// the rolling summary, where the dropped middle is covered. A conversation with no ledger yet seeds nothing, so
+/// a short chat's prompt is byte-identical to before this existed.
+fn injectFactsLedger(app: *App, conv_dir: []const u8, user_text: []const u8, goal_line: []const u8, conv_buf: *std.ArrayListUnmanaged(u8), budget: usize) void {
+    const gpa = app.gpa;
+    if (budget == 0) return;
+    const dpath = std.fmt.allocPrint(gpa, "{s}/{s}", .{ conv_dir, cctx.DIGEST_FILE }) catch return;
+    defer gpa.free(dpath);
+    const buf = gpa.alloc(u8, cctx.DIGEST_SCAN_BYTES) catch return;
+    defer gpa.free(buf);
+    const tail = cctx.readTailTrimmed(app.io, dpath, buf) orelse return;
+    // the cue: what is being asked now, and what the whole conversation is for
+    const cue = std.fmt.allocPrint(gpa, "{s}\n{s}", .{ user_text, goal_line }) catch return;
+    defer gpa.free(cue);
+    const block = cctx.selectFacts(gpa, tail, cue, budget) orelse return;
+    defer gpa.free(block);
+    var sc: std.ArrayListUnmanaged(u8) = .empty;
+    defer sc.deinit(gpa);
+    sc.appendSlice(gpa, FACTS_BLOCK_HEADER) catch return;
+    sc.appendSlice(gpa, block) catch return;
+    appendMsgObj(gpa, conv_buf, "system", sc.items, budget + FACTS_BLOCK_HEADER.len + 64);
 }
 
 /// Serializes context.json reads/writes across the (rare) case of a deferred refreshSummary on one turn's thread
@@ -10111,20 +10236,20 @@ fn loadSummary(app: *App, conv_dir: []const u8) []u8 {
 /// which is the whole point. Re-reads the (now-grown) transcript for a fresh view. Best-effort: any failure leaves
 /// the prior summary intact (the next turn retries). The ctxsum LLM call runs OUTSIDE the context.json lock so it
 /// never blocks a concurrent loadSummary; two overlapping refreshes just race to persist and the later (wider) wins.
-fn refreshSummary(app: *App, conv_dir: []const u8, run_root: []const u8, base_url: []const u8, key: []const u8, model: []const u8, win_bytes: usize) void {
+fn refreshSummary(app: *App, conv_dir: []const u8, run_root: []const u8, base_url: []const u8, key: []const u8, model: []const u8, plan: ContextPlan) void {
     const gpa = app.gpa;
     const mpath = std.fmt.allocPrint(gpa, "{s}/messages.jsonl", .{conv_dir}) catch return;
     defer gpa.free(mpath);
     const head_buf = gpa.alloc(u8, cctx.HEAD_READ_BYTES) catch return;
     defer gpa.free(head_buf);
     // MUST match assembleHistory's tail_buf exactly (see historyWindowBytes). base_url/key/model above are the
-    // SUMMARIZING model; `win_bytes` is sized for the model that CONSUMES the assembled prompt. On the common
+    // SUMMARIZING model; `plan.hist_win` is sized for the model that CONSUMES the assembled prompt. On the common
     // single-provider setup those are the same model and the distinction is invisible — which is exactly why
     // sizing the window from the parameters already here would be a bug that never showed up in testing.
-    const tail_buf = gpa.alloc(u8, win_bytes) catch return;
+    const tail_buf = gpa.alloc(u8, plan.hist_win) catch return;
     defer gpa.free(tail_buf);
     const ht = cctx.readHeadTail(app.io, mpath, head_buf, tail_buf) orelse return;
-    const view = cctx.computeView(ht.head, ht.tail, ht.size, win_bytes);
+    const view = cctx.computeView(ht.head, ht.tail, ht.size, plan.hist_win);
     if (!view.gap) return; // the window still covers everything → nothing has dropped that needs summarizing
 
     const cpath = std.fmt.allocPrint(gpa, "{s}/context.json", .{conv_dir}) catch return;
@@ -10153,7 +10278,7 @@ fn refreshSummary(app: *App, conv_dir: []const u8, run_root: []const u8, base_ur
     var cursor = @max(covered, view.goal_end);
     if (target <= cursor) return; // already covered → nothing to do
 
-    const span_buf = gpa.alloc(u8, cctx.SUMMARY_CHUNK_BYTES) catch return;
+    const span_buf = gpa.alloc(u8, plan.chunk_bytes) catch return; // sized to what the SUMMARIZER can read (see cctx.summaryChunkBytes)
     defer gpa.free(span_buf);
 
     // OLDEST-FIRST CATCH-UP. Fold [cursor, target) forward one line-aligned chunk at a time, persisting after
@@ -10184,9 +10309,15 @@ fn refreshSummary(app: *App, conv_dir: []const u8, run_root: []const u8, base_ur
             cursor = next;
             continue;
         }
-        const updated = summarizeInto(app, run_root, base_url, key, model, summary, span, hs.clipped) orelse break; // LLM call, NO lock held
+        const fold = summarizeInto(app, run_root, base_url, key, model, summary, span, hs.clipped, plan) orelse break; // LLM call, NO lock held
+        // THE FACTS OUTLIVE THE SUMMARY: what this chunk established goes to the append-only digest ledger before
+        // the summary that mentions it is rewritten for the last time (see cctx "the transcript ledger").
+        if (fold.facts) |f| {
+            defer gpa.free(f);
+            digestAppend(app, conv_dir, cursor, next, f);
+        }
         if (summary.len > 0) gpa.free(summary); // the fold REPLACES the prior summary...
-        summary = updated; // ...and becomes the next chunk's prior summary; the outer defer frees the last one
+        summary = fold.summary; // ...and becomes the next chunk's prior summary; the outer defer frees the last one
         {
             // Lock only around the file write — never across the completion above, which would block the next
             // turn's loadSummary for as long as the model takes.
@@ -10198,14 +10329,25 @@ fn refreshSummary(app: *App, conv_dir: []const u8, run_root: []const u8, base_ur
     }
 }
 
-/// One no-tools completion that rewrites the running summary to incorporate a span of just-dropped messages.
-/// gpa-owned new summary (clipped) or null on failure. Kept deterministic (low temp) and short.
-fn summarizeInto(app: *App, run_root: []const u8, base_url: []const u8, key: []const u8, model: []const u8, prior_summary: []const u8, span_json: []const u8, clipped: bool) ?[]u8 {
+/// One fold's result: the rewritten running summary, and the durable facts the folded span established (null
+/// when the model wrote none — an older or smaller model may answer with the summary alone, which is exactly the
+/// pre-ledger behaviour). Both gpa-owned.
+const SummaryFold = struct { summary: []u8, facts: ?[]u8 };
+
+/// One no-tools completion that rewrites the running summary to incorporate a span of just-dropped messages AND
+/// lists the durable facts that span established. The summary is clipped to the plan's cap; the facts are the
+/// cleaned FACTS lines. Null on failure — and an EMPTY summary is a failure, so the cursor stays put and the chunk
+/// is retried rather than marked covered by nothing. Kept deterministic (low temp).
+fn summarizeInto(app: *App, run_root: []const u8, base_url: []const u8, key: []const u8, model: []const u8, prior_summary: []const u8, span_json: []const u8, clipped: bool, plan: ContextPlan) ?SummaryFold {
     const gpa = app.gpa;
     var msgs: std.ArrayListUnmanaged(u8) = .empty;
     defer msgs.deinit(gpa);
+    // The shape is the plan's: a small summarizer is asked for a short, faithful summary and a handful of facts, a
+    // frontier one for a summary long enough to use the room its reader has.
+    const sys = std.fmt.allocPrint(gpa, "You maintain the memory of a long assistant/user conversation so older turns can be dropped from the live context without losing continuity. Write two sections. SUMMARY (under {d} words): the updated running summary - faithful and concise; keep the goal, every decision, what was finished, what is still open, and the user's stated preferences and constraints; preserve concrete file names and identifiers. FACTS: the concrete, durable things THESE messages established that a later turn may need - decisions, user preferences and constraints, names, paths, identifiers, versions, values, what was delivered - one per line as key: value, at most {d} lines, never a guess and never a restatement of the running summary. Output ONLY the two sections: SUMMARY first, then a line that says FACTS, then the lines.", .{ plan.shape.words, plan.shape.facts_lines }) catch return null;
+    defer gpa.free(sys);
     msgs.appendSlice(gpa, "{\"role\":\"system\",\"content\":") catch return null;
-    http.jstr(gpa, &msgs, "You maintain a running summary of a long assistant/user conversation so older turns can be dropped from the live context without losing continuity. Be faithful and concise; preserve concrete facts, decisions, file names, and open threads. Output ONLY the updated summary, no preamble.") catch return null;
+    http.jstr(gpa, &msgs, sys) catch return null;
     msgs.appendSlice(gpa, "},{\"role\":\"user\",\"content\":") catch return null;
     var uc: std.ArrayListUnmanaged(u8) = .empty;
     defer uc.deinit(gpa);
@@ -10216,18 +10358,22 @@ fn summarizeInto(app: *App, run_root: []const u8, base_url: []const u8, key: []c
     // A chunk cut mid-record (one stored line longer than the chunk) ends in a fragment. Say so, or the model
     // summarizes half a message as a whole one and states its truncated content as fact.
     if (clipped) uc.appendSlice(gpa, "\n(The LAST record above is CUT OFF mid-message — summarize only what is actually there, and do not infer how it ends.)") catch return null;
-    uc.appendSlice(gpa, "\n\nRewrite the running summary to incorporate these messages. Keep it under 250 words.") catch return null;
+    uc.appendSlice(gpa, "\n\nRewrite the running summary to incorporate these messages, then list the FACTS.") catch return null;
     http.jstr(gpa, &msgs, uc.items) catch return null;
     msgs.append(gpa, '}') catch return null;
     const ctxsum_cm = meterBegin(app.io);
     announcePhase(app, "ctxsum");
-    var step = llm.complete(gpa, app.io, run_root, "ctxsum", base_url, key, model, msgs.items, "", 1024, 0.3);
+    var step = llm.complete(gpa, app.io, run_root, "ctxsum", base_url, key, model, msgs.items, "", plan.shape.max_tokens, 0.3);
     defer step.deinit(gpa);
     meterEnd(app, ctxsum_cm, "ctxsum", .thinking, model, step.ok);
     if (!step.ok) return null;
-    const t = std.mem.trim(u8, step.content, " \r\n\t");
-    if (t.len == 0) return null;
-    return gpa.dupe(u8, clipBytes(t, cctx.SUMMARY_INJECT_CAP)) catch null;
+    // One bad byte would make the digest record unparsable at every later read: scrub before splitting.
+    scrubUtf8(step.content);
+    const note = cctx.splitNote(std.mem.trim(u8, step.content, " \r\n\t"));
+    if (note.summary.len == 0) return null;
+    const summary = gpa.dupe(u8, clipBytes(note.summary, plan.summary_cap)) catch return null;
+    const facts: ?[]u8 = if (note.facts) |f| cctx.cleanFactLines(gpa, f, plan.shape.facts_lines) else null;
+    return .{ .summary = summary, .facts = facts };
 }
 
 /// Persist {covered, summary} to context.json as one atomic overwrite (whole line built first). Best-effort.
@@ -10390,17 +10536,7 @@ const FACTS_LEDGER_CAP: usize = 96 * 1024;
 /// The body of a compaction note's FACTS section (whatever follows a line that is just "FACTS", under any
 /// heading style), or null when the note has none.
 fn factsSection(note: []const u8) ?[]const u8 {
-    var it = std.mem.splitScalar(u8, note, '\n');
-    var pos: usize = 0;
-    while (it.next()) |line| {
-        const t = std.mem.trim(u8, line, " \t\r#*-:");
-        if (t.len >= 5 and t.len <= 12 and std.ascii.eqlIgnoreCase(t[0..5], "facts")) {
-            const after = pos + line.len;
-            return if (after < note.len) note[after + 1 ..] else note[note.len..];
-        }
-        pos += line.len + 1;
-    }
-    return null;
+    return cctx.splitNote(note).facts; // one heading rule for the working note and the fold reply
 }
 
 fn hasLine(hay: []const u8, line: []const u8) bool {
@@ -10409,8 +10545,45 @@ fn hasLine(hay: []const u8, line: []const u8) bool {
     return false;
 }
 
-/// Append the note's FACTS lines to {workdir}/.veil-facts.md - deduplicated, bounded, header on first write.
-/// Best-effort: an unreadable or full ledger changes nothing.
+/// The ledger after `body`'s usable lines are appended to `have` under `cap`: deduplicated, the header written on
+/// first use, and when the ledger is FULL the oldest lines make room. It used to refuse new lines at the cap, so a
+/// long conversation's ledger went silent at 96 KB and every fact after that was bought again — the newest facts
+/// are the ones the next fold and the next turn need, and the oldest have had the most turns to be read. Null
+/// when nothing new was added (the caller then leaves the file untouched).
+fn mergeFactLines(gpa: std.mem.Allocator, have: []const u8, body: []const u8, cap: usize) ?[]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(gpa);
+    out.appendSlice(gpa, if (have.len > 0) have else FACTS_LEDGER_HEAD) catch return null;
+    if (out.items.len > 0 and out.items[out.items.len - 1] != '\n') out.append(gpa, '\n') catch return null;
+    // eviction never touches the header line
+    const body_start: usize = if (std.mem.startsWith(u8, out.items, "# "))
+        (if (std.mem.indexOfScalar(u8, out.items, '\n')) |nl| nl + 1 else out.items.len)
+    else
+        0;
+    var added: usize = 0;
+    var it = std.mem.splitScalar(u8, body, '\n');
+    while (it.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r-*");
+        if (line.len < 4 or line.len > 400) continue;
+        if (std.ascii.startsWithIgnoreCase(line, "progress")) break; // a PROGRESS section after FACTS ends the list
+        if (hasLine(out.items, line)) continue;
+        while (out.items.len + line.len + 1 > cap and out.items.len > body_start) {
+            const nl = std.mem.indexOfScalarPos(u8, out.items, body_start, '\n') orelse break;
+            const drop = nl + 1 - body_start;
+            std.mem.copyForwards(u8, out.items[body_start .. out.items.len - drop], out.items[nl + 1 ..]);
+            out.shrinkRetainingCapacity(out.items.len - drop);
+        }
+        if (out.items.len + line.len + 1 > cap) break; // the header alone fills the cap: nothing can fit
+        out.appendSlice(gpa, line) catch return null;
+        out.append(gpa, '\n') catch return null;
+        added += 1;
+    }
+    if (added == 0) return null;
+    return out.toOwnedSlice(gpa) catch null;
+}
+
+/// Append the note's FACTS lines to {workdir}/.veil-facts.md — see mergeFactLines for the shape and the eviction
+/// rule. Best-effort: an unreadable ledger changes nothing.
 fn factsLedgerAppend(app: *App, workdir: []const u8, note: []const u8) void {
     if (workdir.len == 0) return;
     const body = factsSection(note) orelse return;
@@ -10419,26 +10592,9 @@ fn factsLedgerAppend(app: *App, workdir: []const u8, note: []const u8) void {
     const path = std.fmt.bufPrint(&pb, "{s}/{s}", .{ workdir, FACTS_LEDGER_NAME }) catch return;
     const existing: ?[]u8 = std.Io.Dir.cwd().readFileAlloc(app.io, path, gpa, .limited(FACTS_LEDGER_CAP)) catch null;
     defer if (existing) |e| gpa.free(e);
-    const have: []const u8 = existing orelse "";
-    if (have.len >= FACTS_LEDGER_CAP - 1024) return;
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    defer out.deinit(gpa);
-    out.appendSlice(gpa, if (have.len > 0) have else FACTS_LEDGER_HEAD) catch return;
-    if (out.items.len > 0 and out.items[out.items.len - 1] != '\n') out.append(gpa, '\n') catch return;
-    var added: usize = 0;
-    var it = std.mem.splitScalar(u8, body, '\n');
-    while (it.next()) |raw| {
-        const line = std.mem.trim(u8, raw, " \t\r-*");
-        if (line.len < 4 or line.len > 400) continue;
-        if (std.ascii.startsWithIgnoreCase(line, "progress")) break; // a PROGRESS section after FACTS ends the list
-        if (hasLine(out.items, line)) continue;
-        if (out.items.len + line.len + 1 > FACTS_LEDGER_CAP) break;
-        out.appendSlice(gpa, line) catch return;
-        out.append(gpa, '\n') catch return;
-        added += 1;
-    }
-    if (added == 0) return;
-    std.Io.Dir.cwd().writeFile(app.io, .{ .sub_path = path, .data = out.items }) catch {};
+    const merged = mergeFactLines(gpa, existing orelse "", body, FACTS_LEDGER_CAP) orelse return;
+    defer gpa.free(merged);
+    std.Io.Dir.cwd().writeFile(app.io, .{ .sub_path = path, .data = merged }) catch {};
 }
 
 /// How many fact lines the ledger holds (0 when absent) - the number the pointer quotes.
@@ -10462,6 +10618,29 @@ test "factsSection / hasLine: the FACTS list is found under any heading style, a
     try std.testing.expect(factsSection("PROGRESS: nothing learned; the facts are unclear") == null);
     try std.testing.expect(hasLine("# head\na: 1\nb: 2\n", "b: 2"));
     try std.testing.expect(!hasLine("# head\na: 1\n", "a: 12"));
+}
+
+test "the workdir facts ledger evicts its OLDEST lines when full, keeps its header, and never goes silent" {
+    const gpa = std.testing.allocator;
+    // a fresh ledger gets the header and the lines; a trailing PROGRESS section ends the list
+    const first = mergeFactLines(gpa, "", "- a: 1\n- b: 2\nPROGRESS: ignored", 4096) orelse return error.NoMerge;
+    defer gpa.free(first);
+    try std.testing.expect(std.mem.startsWith(u8, first, FACTS_LEDGER_HEAD));
+    try std.testing.expect(std.mem.endsWith(u8, first, "a: 1\nb: 2\n"));
+    try std.testing.expect(std.mem.indexOf(u8, first, "ignored") == null);
+    // a repeat adds nothing, so the file is left untouched
+    try std.testing.expect(mergeFactLines(gpa, first, "a: 1", 4096) == null);
+    // full: the newest line lands and the OLDEST body line makes room; the header is never evicted
+    const cap = first.len + "c: 3\n".len; // room for exactly one more line
+    const grown = mergeFactLines(gpa, first, "c: 3", cap) orelse return error.NoMerge;
+    defer gpa.free(grown);
+    try std.testing.expect(std.mem.endsWith(u8, grown, "a: 1\nb: 2\nc: 3\n"));
+    const evicted = mergeFactLines(gpa, grown, "d: 4", cap) orelse return error.NoMerge;
+    defer gpa.free(evicted);
+    try std.testing.expect(std.mem.startsWith(u8, evicted, FACTS_LEDGER_HEAD));
+    try std.testing.expect(std.mem.indexOf(u8, evicted, "a: 1") == null);
+    try std.testing.expect(std.mem.endsWith(u8, evicted, "b: 2\nc: 3\nd: 4\n"));
+    try std.testing.expect(evicted.len <= cap);
 }
 
 /// If this pass's working growth (everything appended after `base_len`) exceeds WORKING_COMPACT_BYTES, replace its
@@ -10861,11 +11040,17 @@ test "a meta-question about the run is never mistaken for the goal" {
     try std.testing.expect(!metaQuestionShaped("continue"));
 }
 
-test "the recency window is sized to the model that CONSUMES the prompt, and never below its floor" {
+test "the recency window is sized to the model that CONSUMES the prompt: up with a frontier window, never below its floor" {
     const t = std.testing;
-    // A roomy hosted model keeps today's behaviour byte-for-byte — this must not perturb anything that works.
-    try t.expectEqual(cctx.HISTORY_WINDOW_BYTES, historyWindowBytes("https://api.anthropic.com/v1", "claude-opus-4-8", 13 * 1024));
-    try t.expectEqual(cctx.HISTORY_WINDOW_BYTES, historyWindowBytes("https://api.example.com", "deepseek-v4-pro", 8 * 1024));
+    // A 32k model keeps the window it had: the scale-up needs a full stock working span free beside the history.
+    try t.expectEqual(cctx.HISTORY_WINDOW_BYTES, historyWindowBytes("https://api.example.com", "some-32k-model", 8 * 1024));
+    // A frontier model with a 128k window replays more than twice that — and no more than its capacity ceiling.
+    const wide = historyWindowBytes("https://api.anthropic.com/v1", "claude-opus-4-8", 13 * 1024);
+    try t.expect(wide > cctx.HISTORY_WINDOW_BYTES);
+    try t.expectEqual(cctx.historyWindowCap(.large), wide);
+    try t.expectEqual(cctx.historyWindowCap(.large), historyWindowBytes("https://api.example.com", "deepseek-v4-pro", 8 * 1024));
+    // A SMALL model with a huge window is still a small model: it keeps the stock window it can follow.
+    try t.expectEqual(cctx.HISTORY_WINDOW_BYTES, historyWindowBytes("https://api.example.com", "llama-3.1-8b-128k", 8 * 1024));
 
     // A small local window tightens rather than replaying 28 KB into a context that cannot hold it.
     const tight = historyWindowBytes("http://127.0.0.1:11434", "the-veil-12b", 13 * 1024);
@@ -10880,6 +11065,43 @@ test "the recency window is sized to the model that CONSUMES the prompt, and nev
 
     // Pathological input must not underflow into a huge window (the failure that would replay the whole file).
     try t.expect(historyWindowBytes("http://127.0.0.1:11434", "the-veil-12b", 10 * 1024 * 1024) == HISTORY_WINDOW_MIN_BYTES);
+}
+
+test "the context plan follows BOTH models: the reader sizes what is held, the summarizer sizes what a fold reads" {
+    const t = std.testing;
+    // modelcfg.Tier and cctx.Capacity must agree on their integers — the plan converts between them by value.
+    try t.expectEqual(@intFromEnum(modelcfg.Tier.small), @intFromEnum(cctx.Capacity.small));
+    try t.expectEqual(@intFromEnum(modelcfg.Tier.mid), @intFromEnum(cctx.Capacity.mid));
+    try t.expectEqual(@intFromEnum(modelcfg.Tier.large), @intFromEnum(cctx.Capacity.large));
+
+    // a frontier reader with a frontier summarizer: the biggest projection this engine builds
+    const big = planCore(128 * 1024, .large, 13 * 1024, 128 * 1024, .large);
+    try t.expectEqual(cctx.historyWindowCap(.large), big.hist_win);
+    try t.expectEqual(@as(usize, 16 * 1024), big.summary_cap);
+    try t.expectEqual(@as(usize, 12 * 1024), big.facts_budget);
+    try t.expectEqual(cctx.SUMMARY_CHUNK_BYTES, big.chunk_bytes);
+    try t.expectEqual(@as(usize, 900), big.shape.words);
+
+    // the same reader, but the folds run on an 8k local model: the summary is sized to what THAT model can write
+    // back, the chunk to what it can read, and the shape to the smaller capacity...
+    const mixed = planCore(128 * 1024, .large, 13 * 1024, 8 * 1024, .small);
+    try t.expectEqual(cctx.summaryInjectCap(8 * 1024 * 3, .small), mixed.summary_cap);
+    try t.expect(mixed.summary_cap < big.summary_cap);
+    try t.expect(mixed.chunk_bytes < big.chunk_bytes);
+    try t.expect(mixed.chunk_bytes + 4 * mixed.summary_cap + cctx.SUMMARY_PROMPT_OVERHEAD_BYTES <= 8 * 1024 * 3);
+    try t.expectEqual(@as(usize, 200), mixed.shape.words);
+    // ...while the READER's window still sizes the history and the facts it holds
+    try t.expectEqual(big.hist_win, mixed.hist_win);
+    try t.expectEqual(big.facts_budget, mixed.facts_budget);
+
+    // the built-in 12B reading and writing: every cap at its floor, the window at its floor, and the fold still fits
+    const tiny = planCore(8 * 1024, .small, 9 * 1024, 8 * 1024, .small);
+    try t.expectEqual(HISTORY_WINDOW_MIN_BYTES, tiny.hist_win);
+    try t.expectEqual(cctx.SUMMARY_INJECT_MIN, tiny.summary_cap);
+    try t.expectEqual(cctx.FACTS_BUDGET_MIN, tiny.facts_budget);
+    try t.expect(tiny.chunk_bytes >= cctx.SUMMARY_CHUNK_MIN_BYTES);
+    try t.expect(tiny.chunk_bytes + 4 * tiny.summary_cap + cctx.SUMMARY_PROMPT_OVERHEAD_BYTES <= 8 * 1024 * 3);
+    try t.expect(tiny.shape.max_tokens <= 4096);
 }
 
 test "the loop-stop and escalation thresholds leave a round for the arbiter to be READ" {
