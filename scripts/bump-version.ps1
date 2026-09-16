@@ -9,6 +9,8 @@
 #   src\main.zig                  const VERSION = "X"   (served at /api/v1/health + startup banner)
 #   bin\MANIFEST.txt              every literal occurrence of the old version
 #   .github\workflows\release.yml body_path: docs/release/RELEASE-vX.md
+#   README.md                     download links, the shields badge, the sample startup banner
+#   docs\index.html               download links, the topbar and footer version chips
 #   docs\release\RELEASE-vX.md    stub created if missing (fill it before tagging)
 #
 # NOT here, on purpose: scripts\build-release.{sh,ps1} and scripts\build-official.sh all READ the literal
@@ -55,7 +57,12 @@ $edits = @(
     # The shields.io badge needs its own entry: the badge path DOUBLES every literal hyphen
     # (1.0.1-beta-2 -> v1.0.1--beta--2), so the releases/tag pattern above cannot see it. It was the one
     # stamp this script missed on the beta-1 -> beta-2 bump.
-    @{ file = (Join-Path $repo "README.md");                 find = 'badge/release-v[^-]*(?:--[^-]*)*-A8241B'; repl = ("badge/release-v" + ($Version -replace '-','--') + "-A8241B") }
+    @{ file = (Join-Path $repo "README.md");                 find = 'badge/release-v[^-]*(?:--[^-]*)*-A8241B'; repl = ("badge/release-v" + ($Version -replace '-','--') + "-A8241B") },
+    # The site's two version chips (topbar + footer) and the README's sample startup banner. None of the
+    # patterns above can see them, so the 1.1.0 -> 1.1.1 bump stamped every download link and left the site
+    # announcing v1.1.0 in two places while it linked to v1.1.1.
+    @{ file = (Join-Path $repo "docs\index.html");           find = '(chip-dot"></span>v)\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?'; repl = "`${1}$Version" },
+    @{ file = (Join-Path $repo "README.md");                 find = '(neuron-loops )\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?( on http)'; repl = "`${1}$Version`${2}" }
 )
 
 $failed = $false

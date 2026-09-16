@@ -1,6 +1,6 @@
 #!/bin/sh
 # nl-veil one-command installer — Linux / macOS
-#   curl -fsSL https://raw.githubusercontent.com/gary23w/nl-veil/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/gary23w/nl-veil/main/scripts/install.sh | sh
 #
 # What it does (and nothing more): put the repo at $VEIL_HOME (default ~/nl-veil), link the
 # `veil` command into ~/.local/bin, and tell you the next two commands. Zig 0.16+ is the one
