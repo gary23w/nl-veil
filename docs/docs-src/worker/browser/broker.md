@@ -13,7 +13,7 @@ An authored tool runs as a Python subprocess with API keys blanked and no egress
 ## Key Exports
 
 - `Info` — `{ port, token }` handed to callers that need to reach the broker.
-- `ensure(gpa, io, env) ?Info` — lazily start the broker (idempotent, process-global); returns port + token, or null if no port in the range would bind. Pins the `gpa`/`io`/`env` the dispatched manager ops use.
+- `ensure(gpa, io, env) ?Info` — lazily start the broker (idempotent, process-global); returns port + token, or null if it could not listen at all. Pins the `gpa`/`io`/`env` the dispatched manager ops use.
 
 ## Dependencies
 
@@ -28,10 +28,11 @@ Imported by `worker/tools.zig` (as `browser_broker`) for the make_tool injection
 ## Notable Implementation Details
 
 - Binds loopback-only and checks a per-process token, so nothing off-box can reach it. The token is splitmix64-generated hex — deliberately not crypto-grade, since it only separates this process's broker from a stray local caller; the loopback bind is the real boundary.
-- Port 0 gives no way to read the assigned port back from `std.Io.net.Server`, so it scans the fixed high-port range 43110..43142 and uses the first that binds.
+- It listens on a loopback port the OS assigns (port 0, read back with `server.socket.address.getPort()`), because no caller needs a fixed one: `Info` carries the port into the authored tool's env (`NL_BROWSER_BROKER`) and into the local-host daemon's discovery file. It used to scan 43110..43142 for the first port that would bind. On Windows the first always binds, since std's listen shares a held port instead of failing (see `worker/portprobe.zig`), so every broker on the machine sat on 43110.
+- The one test starts four listeners through the same `listenLoopback` that `ensure` uses and requires four distinct ports. Against the old scan it found one. Registered directly in `src/tests.zig`.
 - A single-request-at-a-time HTTP/1.1 server on one dedicated accept thread — browser ops serialize in the manager anyway.
 - Requests: POST body parsed as `{token,key,action,params}` with a 4 MiB length cap; bad token / missing key / bad JSON return `{"ok":false,...}`. Actions starting with `mcp` go to the discovery/client layer; everything else to `manager.dispatch`.
 
 ---
 
-*Case file grounded in the module's `//!` header and public API.*
+*Case file grounded in the module's `//!` header, public API, and its test.*
