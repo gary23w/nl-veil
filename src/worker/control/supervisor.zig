@@ -27,8 +27,13 @@ const winproc = if (builtin.os.tag == .windows) struct {
     extern "kernel32" fn Sleep(ms: u32) callconv(.c) void;
 } else struct {};
 
-/// Sleep `ms` from a RAW OS thread (the background loop is a std.Thread, NOT an Io-managed task — io.sleep
-/// throws there, and swallowing that error turned the loop into a 100%-CPU spin that starved the http pool).
+/// Sleep `ms` on a thread the Io runtime did not spawn: bgLoop (a detached std.Thread) and remove's rmTree
+/// retries (an httpz worker, from adminKill and swarmDelete). Never io.sleep there. On Windows io.sleep parks the
+/// thread on the runtime's per-thread alert (NtWaitForAlertByThreadId), and on such a thread a wake the runtime
+/// did not ask for is `unreachable` — undefined behaviour in the ReleaseFast build. It does not throw (Zig 0.16.0,
+/// measured 2026-09-16); the alert is the hazard, and alerts are sticky, so one stray alert lands in the next park
+/// (desk/src/nap.zig has the 2026-09-02 desk freeze it caused). Win32 Sleep is non-alertable. Elsewhere io.sleep
+/// does not park, so it stays.
 fn threadSleepMs(io: std.Io, ms: u64) void {
     if (builtin.os.tag == .windows) {
         winproc.Sleep(@intCast(ms));
@@ -413,7 +418,7 @@ pub const Supervisor = struct {
         var i: usize = 0;
         while (i < 10) : (i += 1) {
             if (self.rmTree(run_dir)) break;
-            self.io.sleep(.{ .nanoseconds = 300 * std.time.ns_per_ms }, .awake) catch {};
+            threadSleepMs(self.io, 300); // an httpz worker thread: never io.sleep (see threadSleepMs)
         }
     }
 

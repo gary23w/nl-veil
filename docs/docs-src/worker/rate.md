@@ -19,7 +19,8 @@ Two mechanisms, one table. When a provider returns 429/503, ALL in-flight turns 
 
 ## Dependencies
 
-- `std` only — `std.Io.Mutex` guards the process-global table; wall-clock ms drives both the cooldown and the bucket refill.
+- `std` — `std.Io.Mutex` guards the process-global table; wall-clock ms drives both the cooldown and the bucket refill.
+- `browser/util.zig` — `sleepMs` for `acquire`'s waits (up to 30 s each). Not `io.sleep`: on Windows that parks a plain thread (the chat turn's) on the Io runtime's per-thread alert, and a stray alert there is undefined behaviour in the ReleaseFast build.
 
 ## Usage Context
 

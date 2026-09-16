@@ -10,6 +10,7 @@
 //! the default (no RPM cap, no active cooldown) `acquire` is a lock + two comparisons — no added latency.
 
 const std = @import("std");
+const bu = @import("browser/util.zig"); // sleepMs: a raw-thread sleep, no Io park (see acquire)
 
 const MAX_HOSTS = 24;
 const COOLDOWN_CAP_MS: i64 = 120_000; // never honor a back-off longer than 2 minutes
@@ -93,6 +94,14 @@ fn decide(h: *Host, now: i64, limit: i32) Decision {
 /// Block until this host is clear to send: past any 429 cooldown and (if NL_RATE_RPM > 0) holding a bucket token,
 /// then consume a token. Bounded — one call never sleeps longer than ACQUIRE_WAIT_CAP_MS per wait, and gives up
 /// after a fixed number of waits (returning anyway) so a mis-set clock or huge cooldown can't wedge a turn.
+///
+/// The waits sleep on the OS (bu.sleepMs), never io.sleep: acquire runs on the chat turn's thread, a plain
+/// std.Thread, for up to ACQUIRE_WAIT_CAP_MS a wait. On Windows io.sleep parks that thread on the Io runtime's
+/// per-thread alert (NtWaitForAlertByThreadId), and on a thread the runtime did not spawn a wake it did not ask
+/// for is `unreachable` — undefined behaviour in the ReleaseFast build. Alerts are sticky, so one stray alert lands
+/// in the next park (desk/src/nap.zig has the 2026-09-02 desk freeze it caused). kernel32 Sleep is non-alertable.
+/// It cannot be canceled either, and nothing asks it to: the swarm's minds reach acquire from Io tasks that
+/// nothing cancels.
 pub fn acquire(io: std.Io, base_url: []const u8) void {
     const host = hostOf(base_url);
     if (host.len == 0) return;
@@ -110,7 +119,7 @@ pub fn acquire(io: std.Io, base_url: []const u8) void {
         }
         if (wait_ms <= 0) return;
         if (wait_ms > ACQUIRE_WAIT_CAP_MS) wait_ms = ACQUIRE_WAIT_CAP_MS;
-        io.sleep(.{ .nanoseconds = @as(u64, @intCast(wait_ms)) * std.time.ns_per_ms }, .awake) catch return;
+        bu.sleepMs(@intCast(wait_ms));
     }
 }
 

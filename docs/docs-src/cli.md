@@ -23,6 +23,7 @@ One dispatcher for every CLI verb: swarms (`cast`/`deploy`/`list`/`stop`/`rm`/`e
 ## Dependencies
 
 - `worker/httpc.zig` — the socket HTTP client every call rides (no curl, no argv secrets)
+- `worker/browser/util.zig` — `sleepMs` for every sleep here (the autostart wait, the event follows, the `model` watches). Not `io.sleep`: on Windows that parks the CLI's main thread on the Io runtime's per-thread alert, and a stray alert there is undefined behaviour in the ReleaseFast build.
 - `cli/exec_tool.zig` — the shared tool executor (`exec-tool`, `sync-*` verbs; delegated tool runs)
 - `cli/chat.zig` / `cli/hub.zig` — the substantial subcommands, kept in sibling files with thin entry points here
 - `worker/chat/sync.zig` — safe-root/safe-path checks + manifest/read responses for workdir sync frames

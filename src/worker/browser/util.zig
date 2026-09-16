@@ -5,10 +5,17 @@ const builtin = @import("builtin");
 
 extern "kernel32" fn Sleep(dwMilliseconds: u32) callconv(.winapi) void;
 
-/// Raw-thread-safe millisecond sleep. std.Io.sleep THROWS on a thread that is not an Io-managed task — e.g. an
-/// httpz request-worker thread (the /api/v1/chat/tool path) or the broker's accept thread — and swallowing that
-/// error turned every browser wait loop into a busy-spin that never actually waited (so a session/daemon never
-/// had time to come up). This uses the OS sleep directly, so it behaves identically on any thread.
+/// Raw-thread-safe millisecond sleep: the OS sleep directly, so it behaves identically on any thread and no thread
+/// alert can end it. The browser layer's wait loops use it, and so does the rest of the tree wherever it sleeps on
+/// a thread the Io runtime did not spawn.
+///
+/// Not std.Io.sleep: on Windows that parks the thread on the runtime's per-thread alert (NtWaitForAlertByThreadId),
+/// and on a thread the runtime did not spawn — an httpz request worker (the /api/v1/chat/tool path), the broker's
+/// accept thread, a chat turn — a wake the runtime did not ask for is `unreachable`. With an alert pending,
+/// io.sleep panicked in a Debug build and returned at once in ReleaseFast, while kernel32 Sleep (a non-alertable
+/// NtDelayExecution) slept its full time and left the alert pending (Zig 0.16.0, measured 2026-09-16). Alerts are
+/// sticky, so one stray alert lands in the next park; desk/src/nap.zig has the 2026-09-02 desk freeze it caused.
+/// io.sleep does not throw on such a thread in this std, and with no alert it waits its full time.
 pub fn sleepMs(ms: u64) void {
     if (builtin.os.tag == .windows) {
         Sleep(@intCast(@min(ms, @as(u64, std.math.maxInt(u32)))));
@@ -79,9 +86,10 @@ test "sleepMs waits on a RAW thread — the whole reason this helper exists" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    // std.Io.sleep THROWS on a thread that is not an Io-managed task (an httpz request worker, the broker's
-    // accept thread). This is that thread: spawned raw, with no io in scope, exactly like the callers in
-    // host.zig / launch.zig / session.zig. Timed from the parent so the raw thread stays raw.
+    // The callers run on threads the Io runtime did not spawn (an httpz request worker, the broker's accept
+    // thread), where std.Io.sleep is the wrong sleep (see sleepMs). This is that thread: spawned raw, with no io
+    // in scope, exactly like the callers in host.zig / launch.zig / session.zig. Timed from the parent so the
+    // raw thread stays raw.
     const t0 = nowMs(io);
     const th = try std.Thread.spawn(.{}, struct {
         fn go() void {
@@ -93,6 +101,39 @@ test "sleepMs waits on a RAW thread — the whole reason this helper exists" {
 
     try std.testing.expect(el >= 30); // spawn+join overhead only ever inflates this
     try std.testing.expect(el < 5000);
+}
+
+test "sleepMs: a thread alert left pending neither ends the wait nor is taken by it" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest; // the alert park is io.sleep's Windows backend
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // The property every caller on a plain thread sleeps here for (see sleepMs). A raw thread alerts itself, as
+    // a stray unpark would, then sleeps. io.sleep in this spot panics in the Debug test build ("reached
+    // unreachable code" in Threaded.zig) and returns at once in ReleaseFast, taking the alert with it. After the
+    // sleep a zero-timeout NtWaitForAlertByThreadId takes the alert back: STATUS_ALERTED is the positive control
+    // that it was pending for the whole sleep, so a full clock cannot come from an alert that never landed.
+    const Probe = struct {
+        el: i64 = -1,
+        drained: std.os.windows.NTSTATUS = .SUCCESS,
+        fn go(p: *@This(), tio: std.Io) void {
+            const nt = std.os.windows.ntdll;
+            _ = nt.NtAlertThreadByThreadId(std.Thread.getCurrentId());
+            const t0 = nowMs(tio);
+            sleepMs(150);
+            p.el = nowMs(tio) - t0;
+            const no_wait: std.os.windows.LARGE_INTEGER = 0;
+            p.drained = nt.NtWaitForAlertByThreadId(null, &no_wait);
+        }
+    };
+    var p: Probe = .{};
+    const th = try std.Thread.spawn(.{}, Probe.go, .{ &p, io });
+    th.join();
+
+    try std.testing.expect(p.drained == .ALERTED);
+    try std.testing.expect(p.el >= 100); // io.sleep lands at ~0; Sleep's tick rounding never takes 150 below 100
+    try std.testing.expect(p.el < 5000);
 }
 
 test "sleepMs: sub-tick sleeps still wait, and repeated calls accumulate" {

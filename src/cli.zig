@@ -15,6 +15,11 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
 const httpc = @import("worker/httpc.zig");
+// sleepMs for every sleep in this file, never io.sleep: the CLI runs on the process's main thread, which the Io
+// runtime did not spawn, and on Windows io.sleep parks such a thread on the runtime's per-thread alert, where a wake
+// the runtime did not ask for is `unreachable` — undefined behaviour in the ReleaseFast build (desk/src/nap.zig has
+// the 2026-09-02 desk freeze a stray alert caused). kernel32 Sleep is non-alertable.
+const bu = @import("worker/browser/util.zig");
 const exec_tool = @import("cli/exec_tool.zig");
 const cync = @import("worker/chat/sync.zig");
 const toolperf = @import("worker/chat/toolperf.zig");
@@ -214,7 +219,7 @@ fn ensureServer(ctx: *Ctx) bool {
     if (!spawnDetached(ctx.io, &.{ bin, "--server-only" }, ctx.home)) return false;
     var tries: u32 = 0;
     while (tries < 30) : (tries += 1) {
-        ctx.io.sleep(.{ .nanoseconds = 500 * std.time.ns_per_ms }, .awake) catch {};
+        bu.sleepMs(500);
         if (serverUp(ctx)) {
             ctx.loadToken(); // the server just minted/refreshed .desktop_key on boot — pick it up
             out("server is up.\n", .{});
@@ -619,7 +624,7 @@ fn followEvents(ctx: *Ctx, id: []const u8) u8 {
         var pb: [200]u8 = undefined;
         const path = std.fmt.bufPrint(&pb, "/api/v1/swarms/{s}/events?from={d}", .{ id, from }) catch return 1;
         const resp = call(ctx, "GET", path, null, 8, false) catch {
-            ctx.io.sleep(.{ .nanoseconds = 500 * std.time.ns_per_ms }, .awake) catch {};
+            bu.sleepMs(500);
             idle += 1;
             continue;
         };
@@ -635,7 +640,7 @@ fn followEvents(ctx: *Ctx, id: []const u8) u8 {
         } else {
             idle += 1;
         }
-        ctx.io.sleep(.{ .nanoseconds = 500 * std.time.ns_per_ms }, .awake) catch {};
+        bu.sleepMs(500);
     }
     return 0;
 }
@@ -936,7 +941,7 @@ fn cmdModel(ctx: *Ctx, args: []const []const u8) u8 {
                 out("verdict: {s}\n", .{us});
                 return 0;
             }
-            ctx.io.sleep(.{ .nanoseconds = std.time.ns_per_s }, .awake) catch {};
+            bu.sleepMs(std.time.ms_per_s);
         }
         out("check is still running — `veil model status` will show the verdict\n", .{});
         return 0;
@@ -1022,7 +1027,7 @@ fn modelWatch(ctx: *Ctx) u8 {
             out("done — the built-in engine now serves {s}\n", .{if (o.get("file")) |v| (if (v == .string) v.string else "") else ""});
             return 0;
         }
-        ctx.io.sleep(.{ .nanoseconds = std.time.ns_per_s }, .awake) catch {};
+        bu.sleepMs(std.time.ms_per_s);
     }
 }
 
@@ -1424,7 +1429,7 @@ pub fn followConv(ctx: *Ctx, conv: []const u8) void {
         var pb: [220]u8 = undefined;
         const path = std.fmt.bufPrint(&pb, "/api/v1/chat/convs/{s}/events?from={d}", .{ conv, from }) catch return;
         const resp = call(ctx, "GET", path, null, 8, false) catch {
-            ctx.io.sleep(.{ .nanoseconds = 300 * std.time.ns_per_ms }, .awake) catch {};
+            bu.sleepMs(300);
             idle += 1;
             continue;
         };
@@ -1448,7 +1453,7 @@ pub fn followConv(ctx: *Ctx, conv: []const u8) void {
                 if (std.mem.indexOf(u8, use, "\"kind\":\"done\"") != null) return;
             } else idle += 1; // only a partial line has arrived — nothing consumed, nothing rendered
         } else idle += 1;
-        ctx.io.sleep(.{ .nanoseconds = 250 * std.time.ns_per_ms }, .awake) catch {};
+        bu.sleepMs(250);
     }
 }
 
