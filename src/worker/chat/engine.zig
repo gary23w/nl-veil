@@ -6921,16 +6921,152 @@ fn swarmMinutes(app: *App, run_dir: []const u8) i64 {
     return std.math.clamp(parsed.value.minutes, 1, 60);
 }
 
+/// Test helper: move `path`'s mtime `secs` behind the real clock swarmTerminal compares against.
+fn backdateMtime(io: std.Io, path: []const u8, secs: i64) !void {
+    const f = try std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write });
+    defer f.close(io);
+    const now_ns = std.Io.Timestamp.now(io, .real).nanoseconds;
+    try f.setTimestamps(io, .{ .modify_timestamp = .{ .new = .fromNanoseconds(now_ns - @as(i96, secs) * std.time.ns_per_s) } });
+}
+
+test "cast file sync across a re-cast: the new run is pushed once it finishes, never while its worker is still spawning" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var ta = try http.testApp(gpa, io, "zig-engine-recast-sync-tmp");
+    defer ta.deinit();
+    const app = &ta.app;
+    const supervisor = @import("../control/supervisor.zig");
+    const uid: u64 = 7;
+    const conv = "c6a57f852";
+
+    // The pair a real cast joins: castSwarm spawns into {data}/{buildRootRel}, runTurn hands the hook the store dir.
+    var relb: [128]u8 = undefined;
+    var runb: [256]u8 = undefined;
+    const run_dir = try std.fmt.bufPrint(&runb, "{s}/{s}", .{ ta.root, cpaths.buildRootRel(&relb, uid, conv) });
+    var convb: [256]u8 = undefined;
+    const conv_dir = try std.fmt.bufPrint(&convb, "{s}/u{d}/_chat/convs/{s}", .{ ta.root, uid, conv });
+    const F = struct {
+        fn put(io_: std.Io, dir: []const u8, name: []const u8, data: []const u8) !void {
+            var b: [512]u8 = undefined;
+            const p = try std.fmt.bufPrint(&b, "{s}/{s}", .{ dir, name });
+            if (std.fs.path.dirname(p)) |parent| _ = try std.Io.Dir.cwd().createDirPathStatus(io_, parent, .default_dir);
+            try std.Io.Dir.cwd().writeFile(io_, .{ .sub_path = p, .data = data });
+        }
+        fn has(io_: std.Io, dir: []const u8, name: []const u8) !bool {
+            var b: [512]u8 = undefined;
+            std.Io.Dir.cwd().access(io_, try std.fmt.bufPrint(&b, "{s}/{s}", .{ dir, name }), .{}) catch return false;
+            return true;
+        }
+        /// How many times `needle` occurs in the conversation's event stream (the frames a client receives).
+        fn frames(gpa_: std.mem.Allocator, io_: std.Io, dir: []const u8, needle: []const u8) !usize {
+            var b: [512]u8 = undefined;
+            const p = try std.fmt.bufPrint(&b, "{s}/events.jsonl", .{dir});
+            const raw = std.Io.Dir.cwd().readFileAlloc(io_, p, gpa_, .limited(1 << 20)) catch return 0;
+            defer gpa_.free(raw);
+            return std.mem.count(u8, raw, needle);
+        }
+    };
+    // No client answers here, and an unanswered manifest request holds a push for SYNC_WAIT_S. A stop already in
+    // the conversation's control file ends that wait at once; the push then sends every file, as it does whenever
+    // the client never answers.
+    try F.put(io, conv_dir, "control.jsonl", "{\"op\":\"stop\"}\n");
+
+    // The first cast finished an hour ago. Its entry is keyed by the run dir's basename, as a reattach adopts it,
+    // so resolve(conv) returns it after the re-cast below too, the stale-entry case.
+    const now = std.Io.Timestamp.now(io, .real).toSeconds();
+    var first: supervisor.Swarm = .{ .id = conv, .uid = uid, .name = "cast-first", .run_dir = run_dir, .model = "m", .minds = 3, .created = now - 3600, .state = .stopped };
+    try ta.sup.swarms.put(gpa, conv, &first);
+    defer ta.sup.swarms.deinit(gpa);
+    try F.put(io, run_dir, "swarm.json", "{\"minutes\":4}");
+    var mb: [300]u8 = undefined;
+    try backdateMtime(io, try std.fmt.bufPrint(&mb, "{s}/swarm.json", .{run_dir}), 3600);
+    try F.put(io, run_dir, "work/first.md", "what the first hive built");
+    try F.put(io, run_dir, "DONE", "completed");
+    maybeSyncCastFiles(app, uid, conv, conv_dir, 0);
+    try std.testing.expectEqual(@as(usize, 1), try F.frames(gpa, io, conv_dir, "\"kind\":\"file_sync\""));
+    try std.testing.expect(try F.has(io, run_dir, ".filesync_done"));
+    maybeSyncCastFiles(app, uid, conv, conv_dir, 0); // the same run again: its marker holds
+    try std.testing.expectEqual(@as(usize, 1), try F.frames(gpa, io, conv_dir, "\"kind\":\"file_sync\""));
+
+    // Re-cast into the conversation in deploySwarm's order: reset the run dir, write the new manifest, spawn.
+    var arena = std.heap.ArenaAllocator.init(gpa); // the reset allocates into deploySwarm's per-cast arena
+    defer arena.deinit();
+    deploy_service.resetCastLifecycle(app, arena.allocator(), run_dir);
+    try std.testing.expect(!try F.has(io, run_dir, ".filesync_done"));
+    try F.put(io, run_dir, "swarm.json", "{\"minutes\":4}");
+
+    // Its worker hasn't written worker.pid yet: no DONE, no live pid, and the entry resolve returns is an hour old.
+    // The run is spawning, not finished, so nothing is pushed and nothing is marked.
+    maybeSyncCastFiles(app, uid, conv, conv_dir, 0);
+    try std.testing.expectEqual(@as(usize, 1), try F.frames(gpa, io, conv_dir, "\"kind\":\"file_sync\""));
+    try std.testing.expect(!try F.has(io, run_dir, ".filesync_done"));
+
+    // The re-cast finishes, and its files reach the client.
+    try F.put(io, run_dir, "work/second.md", "what the re-cast built");
+    try F.put(io, run_dir, "DONE", "completed");
+    maybeSyncCastFiles(app, uid, conv, conv_dir, 0);
+    try std.testing.expectEqual(@as(usize, 1), try F.frames(gpa, io, conv_dir, "\"path\":\"second.md\""));
+    try std.testing.expect(try F.has(io, run_dir, ".filesync_done"));
+}
+
+test "swarmTerminal: a run with no live worker is young by the later of its entry and its manifest, and DONE outranks both" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var ta = try http.testApp(gpa, io, "zig-engine-spawn-age-tmp");
+    defer ta.deinit();
+    const app = &ta.app;
+    const cwd = std.Io.Dir.cwd();
+    var rb: [256]u8 = undefined;
+    const run_dir = try std.fmt.bufPrint(&rb, "{s}/u7/_chat/builds/c1", .{ta.root});
+    _ = try cwd.createDirPathStatus(io, run_dir, .default_dir);
+    var mb: [300]u8 = undefined;
+    const manifest = try std.fmt.bufPrint(&mb, "{s}/swarm.json", .{run_dir});
+    var db: [300]u8 = undefined;
+    const done = try std.fmt.bufPrint(&db, "{s}/DONE", .{run_dir});
+    const now = std.Io.Timestamp.now(io, .real).toSeconds();
+    const old = now - 3600; // an earlier cast's entry, far past the spawn grace
+
+    // No worker.pid anywhere below, so only DONE and the two ages decide.
+    try cwd.writeFile(io, .{ .sub_path = manifest, .data = "{}" });
+    try std.testing.expect(!swarmTerminal(app, run_dir, old)); // manifest just written: a re-cast still spawning
+    try backdateMtime(io, manifest, 3600);
+    try std.testing.expect(swarmTerminal(app, run_dir, old)); // both an hour old: its worker died or never came up
+    try std.testing.expect(!swarmTerminal(app, run_dir, now)); // a fresh entry keeps its grace over an old manifest
+    try cwd.deleteFile(io, manifest);
+    try std.testing.expect(swarmTerminal(app, run_dir, old)); // no manifest (cleanCastMeta took it): the entry decides
+    try cwd.writeFile(io, .{ .sub_path = manifest, .data = "{}" });
+    try cwd.writeFile(io, .{ .sub_path = done, .data = "completed" });
+    try std.testing.expect(swarmTerminal(app, run_dir, now)); // a run that finished inside its grace is finished
+}
+
+/// When `run_dir`'s swarm.json was last written, in unix seconds (0 when it can't be stat'd). deploySwarm writes the
+/// manifest right before every spawn, so in a run dir that casts reuse it dates the run the dir holds now.
+fn manifestWrittenAt(app: *App, run_dir: []const u8) i64 {
+    var pb: [1280]u8 = undefined;
+    const p = std.fmt.bufPrint(&pb, "{s}/swarm.json", .{run_dir}) catch return 0;
+    const st = std.Io.Dir.cwd().statFile(app.io, p, .{}) catch return 0;
+    return st.mtime.toSeconds();
+}
+
 /// Is a swarm terminal RIGHT NOW? DONE marker or a dead worker pid — the same fresh predicate statusTool reports
 /// (sw.state lags the supervisor's ~10s reconcile, so never trust it for liveness). A very young swarm whose
-/// worker.pid hasn't landed yet reads as alive (the spawn takes a moment to write it).
-fn swarmTerminal(app: *App, run_dir: []const u8, created: i64) bool {
+/// worker.pid hasn't landed yet reads as alive (the spawn takes a moment to write it). Its age counts from the later
+/// of the entry's `created` and the run dir's manifest write: casts into one conversation reuse its run dir and every
+/// earlier cast keeps its registry entry, so the entry a caller holds (an earlier cast's id, or whichever entry
+/// resolve matched) can predate the run now in the dir. By `created` alone that run read as finished until its worker
+/// wrote a pid, and maybeSyncCastFiles marked it synced before it had built anything.
+fn swarmTerminal(app: *App, run_dir: []const u8, entry_created: i64) bool {
     var pb: [1280]u8 = undefined;
     if (std.fmt.bufPrint(&pb, "{s}/DONE", .{run_dir})) |dp| {
         if (std.Io.Dir.cwd().access(app.io, dp, .{})) |_| return true else |_| {}
     } else |_| {}
     const ps = app.sup.pidStatus(run_dir);
     if (ps.alive) return false;
+    const created = @max(entry_created, manifestWrittenAt(app, run_dir));
     return nowSecs(app.io) - created > 20; // no live pid: terminal unless the swarm is still spawning
 }
 
@@ -8032,7 +8168,7 @@ fn maybeSyncCastFiles(app: *App, uid: u64, conv: []const u8, conv_dir: []const u
         const done = std.fmt.bufPrint(&db, "{s}/DONE", .{run_dir}) catch return;
         _ = std.Io.Dir.cwd().access(app.io, done, .{}) catch return; // never sync a half-written run
     }
-    // Dedup marker lives in the RUN dir: a re-cast resets that dir, so the fresh run re-syncs naturally.
+    // Dedup marker lives in the RUN dir: deploy_service.resetCastLifecycle drops it before a re-cast spawns there.
     var mb: [1400]u8 = undefined;
     const marker = std.fmt.bufPrint(&mb, "{s}/.filesync_done", .{run_dir}) catch return;
     if (std.Io.Dir.cwd().access(app.io, marker, .{})) |_| return else |_| {}
