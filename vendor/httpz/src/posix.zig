@@ -28,6 +28,10 @@ const native_os = builtin.os.tag;
 pub const CLOEXEC = if (native_os == .windows) 0x10000 else SOCK.CLOEXEC;
 pub const NONBLOCK = if (native_os == .windows) 0x20000 else SOCK.NONBLOCK;
 
+/// Windows only. winsock2.h defines it as ((int)(~SO_REUSEADDR)) and std's ws2_32 bindings do not declare it.
+/// As a c_int it is negative, which is why `setsockopt` bit-casts option names on Windows.
+pub const SO_EXCLUSIVEADDRUSE: u32 = ~@as(u32, std.os.windows.ws2_32.SO.REUSEADDR);
+
 pub fn socket(domain: u32, socket_type: u32, protocol: u32) !socket_t {
     if (native_os == .windows) {
         // These flags are not actually part of the Windows API, instead they are converted here for compatibility
@@ -198,7 +202,7 @@ pub fn setsockopt(fd: socket_t, level: i32, optname: u32, opt: []const u8) !void
             opt_ptr = @ptrCast(&ms_buf);
             opt_len = @sizeOf(u32);
         }
-        const rc = windows.ws2_32.setsockopt(fd, level, @intCast(optname), opt_ptr, opt_len);
+        const rc = windows.ws2_32.setsockopt(fd, level, @bitCast(optname), opt_ptr, opt_len);
         if (rc == windows.ws2_32.SOCKET_ERROR) {
             switch (windows.ws2_32.WSAGetLastError()) {
                 .WSANOTINITIALISED => unreachable,
