@@ -45,7 +45,7 @@ The full operator walkthrough is on [running a server](guide/server.md).
 
 `--server-only`, or a `-Dapp=false` build, ends in `server.listen()`, which blocks until the process is stopped.
 
-Otherwise the two swap places: raylib's window creation and event pump are main-thread-only, so the GUI takes the main thread and `httpz` gets a background one. The desk is not a child process any more — `desk.runApp()` **returning** is the shutdown signal that a watcher thread used to derive from a child exit. On Windows the process first joins a kill-on-close job object, so workers, the neuron binary and the browser host are reaped even after a hard kill where no `defer` runs.
+Otherwise the two swap places: raylib's window creation and event pump are main-thread-only, so the GUI takes the main thread and `httpz` gets a background one. The desk is not a child process any more — `desk.runApp()` **returning** is the shutdown signal that a watcher thread used to derive from a child exit. On Windows the process first joins a kill-on-close job object, so workers, the neuron binary and the browser host are reaped even after a hard kill where no `defer` runs. On that return, the Cloudflare tunnel's connector is stopped first (`cf_tunnel.shutdown`), then the listener, then the process exits. On macOS and Linux nothing else stops the connector at exit. Server mode's `defer` makes the same call when `listen()` returns.
 
 If the HTTP thread cannot be spawned at all, it falls back to a blocking `listen()` on this thread rather than opening a window onto no backend.
 

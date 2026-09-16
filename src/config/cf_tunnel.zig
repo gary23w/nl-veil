@@ -36,6 +36,7 @@ const http = @import("../gateway/http.zig");
 const App = http.App;
 const cf_oauth = @import("cf_oauth.zig");
 const modelpull = @import("../worker/modelpull.zig");
+const fakehttp = @import("../worker/fakehttp.zig"); // TEST ONLY: the stand-in v4 API the provisioning tests dial
 const requireUser = http.requireUser;
 const requireAdmin = http.requireAdmin;
 const badReq = http.badReq;
@@ -182,6 +183,14 @@ fn hostnameOk(h: []const u8) bool {
     return dots >= 1 and std.mem.indexOf(u8, h, "..") == null;
 }
 
+/// Is `host` the zone's apex or a name under it? Matched at a label boundary, never as a bare suffix:
+/// `veil.badexample.com` is not on `example.com`.
+fn onZone(host: []const u8, zone: []const u8) bool {
+    if (zone.len == 0) return false;
+    if (std.mem.eql(u8, host, zone)) return true;
+    return host.len > zone.len + 1 and std.mem.endsWith(u8, host, zone) and host[host.len - zone.len - 1] == '.';
+}
+
 pub fn readState(app: *App, uid: u64, a: std.mem.Allocator) State {
     var pb: [700]u8 = undefined;
     const path = statePath(app, uid, &pb) orelse return .{};
@@ -209,8 +218,13 @@ fn hex4(io: std.Io, buf: *[8]u8) []const u8 {
 }
 
 // ------------------------------------------------------------------------------------------ the API
-fn apiJson(app: *App, method: []const u8, url: []const u8, body: []const u8, bearer: []const u8) ?[]u8 {
-    return cf_oauth.apiCall(app, method, url, body, bearer, "application/json");
+/// One v4 call. The reply is copied into `a` and curl's gpa copy freed here: the ids parsed out of a reply point
+/// INTO its bytes (std.json leaves an unescaped string where it found it), so the reply must live exactly as long
+/// as the state those ids are written to - the caller's arena.
+fn apiJson(app: *App, a: std.mem.Allocator, method: []const u8, url: []const u8, body: []const u8, bearer: []const u8) ?[]u8 {
+    const raw = cf_oauth.apiCall(app, method, url, body, bearer, "application/json") orelse return null;
+    defer app.gpa.free(raw);
+    return a.dupe(u8, raw) catch null;
 }
 
 const Envelope = struct {
@@ -325,11 +339,12 @@ fn provisionNamed(app: *App, a: std.mem.Allocator, uid: u64, st: *State, tok: To
     const root = app.cf_api_root;
     const acct = tok.account_id;
 
-    // ---- 1. the zone: the one the requested hostname belongs to, else the account's first. A hostname on
-    // no zone of this account is an error the user can act on, never a silent fallback.
-    if (st.zone_id.len == 0 or (st.want_hostname.len > 0 and !std.mem.endsWith(u8, st.want_hostname, st.zone_name))) {
+    // ---- 1. the zone: the one the requested hostname belongs to (the most specific, when one zone sits inside
+    // another), else the account's first. A hostname on no zone of this account is an error the user can act
+    // on, never a silent fallback.
+    if (st.zone_id.len == 0 or (st.want_hostname.len > 0 and !onZone(st.want_hostname, st.zone_name))) {
         const url = std.fmt.allocPrint(a, "{s}/zones?account.id={s}&status=active&per_page=50", .{ root, acct }) catch return null;
-        const raw = apiJson(app, "GET", url, "", tok.key) orelse {
+        const raw = apiJson(app, a, "GET", url, "", tok.key) orelse {
             st.last_error = "could not reach the Cloudflare API";
             return null;
         };
@@ -349,21 +364,19 @@ fn provisionNamed(app: *App, a: std.mem.Allocator, uid: u64, st: *State, tok: To
         var pick: ?usize = null;
         if (st.want_hostname.len > 0) {
             for (z.result, 0..) |zn, i| {
-                if (std.mem.eql(u8, st.want_hostname, zn.name) or (st.want_hostname.len > zn.name.len + 1 and
-                    std.mem.endsWith(u8, st.want_hostname, zn.name) and st.want_hostname[st.want_hostname.len - zn.name.len - 1] == '.'))
-                    pick = i;
+                if (onZone(st.want_hostname, zn.name) and (pick == null or zn.name.len > z.result[pick.?].name.len)) pick = i;
             }
             if (pick == null) {
                 st.last_error = std.fmt.allocPrint(a, "{s} is not on any domain of this Cloudflare account ({d} zone(s) checked)", .{ st.want_hostname, z.result.len }) catch "the hostname is not on any domain of this account";
                 return null;
             }
         } else pick = 0;
+        // A MOVE to another zone. The old hostname's DNS record and Access app live on the old zone, and nothing
+        // would ever name them again: they come off the account before the zone id they are filed under goes.
+        retireHostname(app, a, st, tok);
         st.zone_id = z.result[pick.?].id;
         st.zone_name = z.result[pick.?].name;
         st.hostname = "";
-        st.dns_record_id = "";
-        st.access_app_id = "";
-        st.access_policy_id = "";
     }
 
     // ---- 2. the tunnel itself
@@ -372,7 +385,7 @@ fn provisionNamed(app: *App, a: std.mem.Allocator, uid: u64, st: *State, tok: To
         st.tunnel_name = std.fmt.allocPrint(a, "veil-{s}", .{hex4(app.io, &hb)}) catch return null;
         const url = std.fmt.allocPrint(a, "{s}/accounts/{s}/cfd_tunnel", .{ root, acct }) catch return null;
         const body = std.fmt.allocPrint(a, "{{\"name\":\"{s}\",\"config_src\":\"cloudflare\"}}", .{st.tunnel_name}) catch return null;
-        const raw = apiJson(app, "POST", url, body, tok.key) orelse {
+        const raw = apiJson(app, a, "POST", url, body, tok.key) orelse {
             st.last_error = "could not reach the Cloudflare API";
             return null;
         };
@@ -394,27 +407,38 @@ fn provisionNamed(app: *App, a: std.mem.Allocator, uid: u64, st: *State, tok: To
         const want = if (st.want_hostname.len > 0) st.want_hostname else (std.fmt.allocPrint(a, "veil.{s}", .{st.zone_name}) catch return null);
         const url = std.fmt.allocPrint(a, "{s}/zones/{s}/dns_records?name={s}", .{ root, st.zone_id, want }) catch return null;
         var taken = false;
-        if (apiJson(app, "GET", url, "", tok.key)) |raw| {
+        var ours: []const u8 = ""; // a record for `want` that already points at this tunnel, from an earlier run
+        if (apiJson(app, a, "GET", url, "", tok.key)) |raw| {
             const D = struct { success: bool = false, result: []const struct { id: []const u8 = "", content: []const u8 = "" } = &.{} };
             if (std.json.parseFromSliceLeaky(D, a, raw, .{ .ignore_unknown_fields = true })) |d| {
                 for (d.result) |rec| {
-                    if (std.mem.indexOf(u8, rec.content, st.tunnel_id) != null) {
-                        st.dns_record_id = rec.id; // ours from an earlier run
-                    } else taken = true;
+                    if (std.mem.indexOf(u8, rec.content, st.tunnel_id) != null) ours = rec.id else taken = true;
                 }
             } else |_| {}
+        }
+        // A HOSTNAME CHANGE: tunnelSet clears the hostname when the request moves, so ids still in the state
+        // belong to the OLD name, and steps 5 and 6 create a record and an Access app only where no id is held.
+        // Unless the lookup just found that very record under the new name (the name did not really change),
+        // both come off the account here - the old name stops pointing at this tunnel, and the new one gets its
+        // own record and its own Access app instead of borrowing the old name's.
+        if (st.dns_record_id.len > 0 or st.access_app_id.len > 0) {
+            const same = !taken and ours.len > 0 and std.mem.eql(u8, ours, st.dns_record_id);
+            if (!same) retireHostname(app, a, st, tok);
         }
         if (taken) {
             var hb: [8]u8 = undefined;
             st.hostname = std.fmt.allocPrint(a, "veil-{s}.{s}", .{ hex4(app.io, &hb)[0..4], st.zone_name }) catch return null;
-        } else st.hostname = want;
+        } else {
+            st.hostname = want;
+            if (ours.len > 0) st.dns_record_id = ours;
+        }
     }
 
     // ---- 4. ingress: the hostname → this server, everything else → 404
     {
         const url = std.fmt.allocPrint(a, "{s}/accounts/{s}/cfd_tunnel/{s}/configurations", .{ root, acct, st.tunnel_id }) catch return null;
         const body = std.fmt.allocPrint(a, "{{\"config\":{{\"ingress\":[{{\"hostname\":\"{s}\",\"service\":\"http://127.0.0.1:{d}\"}},{{\"service\":\"http_status:404\"}}]}}}}", .{ st.hostname, server_port }) catch return null;
-        const raw = apiJson(app, "PUT", url, body, tok.key) orelse {
+        const raw = apiJson(app, a, "PUT", url, body, tok.key) orelse {
             st.last_error = "could not reach the Cloudflare API";
             return null;
         };
@@ -429,7 +453,7 @@ fn provisionNamed(app: *App, a: std.mem.Allocator, uid: u64, st: *State, tok: To
     if (st.dns_record_id.len == 0) {
         const url = std.fmt.allocPrint(a, "{s}/zones/{s}/dns_records", .{ root, st.zone_id }) catch return null;
         const body = std.fmt.allocPrint(a, "{{\"type\":\"CNAME\",\"name\":\"{s}\",\"content\":\"{s}.cfargotunnel.com\",\"proxied\":true,\"ttl\":1,\"comment\":\"veil tunnel\"}}", .{ st.hostname, st.tunnel_id }) catch return null;
-        const raw = apiJson(app, "POST", url, body, tok.key) orelse {
+        const raw = apiJson(app, a, "POST", url, body, tok.key) orelse {
             st.last_error = "could not reach the Cloudflare API";
             return null;
         };
@@ -451,7 +475,7 @@ fn provisionNamed(app: *App, a: std.mem.Allocator, uid: u64, st: *State, tok: To
     // Zero Trust organization simply reports "protected by your veil login" instead.
     if (st.access_app_id.len == 0 and email.len > 0) access: {
         const ourl = std.fmt.allocPrint(a, "{s}/accounts/{s}/access/organizations", .{ root, acct }) catch break :access;
-        const oraw = apiJson(app, "GET", ourl, "", tok.key) orelse break :access;
+        const oraw = apiJson(app, a, "GET", ourl, "", tok.key) orelse break :access;
         const O = struct { success: bool = false, result: ?struct { auth_domain: []const u8 = "" } = null };
         const o = std.json.parseFromSliceLeaky(O, a, oraw, .{ .ignore_unknown_fields = true }) catch break :access;
         if (!o.success or o.result == null or o.result.?.auth_domain.len == 0) break :access;
@@ -459,7 +483,7 @@ fn provisionNamed(app: *App, a: std.mem.Allocator, uid: u64, st: *State, tok: To
         // grantable to this client - probed live), and a named tunnel always has a zone.
         const aurl = std.fmt.allocPrint(a, "{s}/zones/{s}/access/apps", .{ root, st.zone_id }) catch break :access;
         const abody = std.fmt.allocPrint(a, "{{\"name\":\"veil ({s})\",\"domain\":\"{s}\",\"type\":\"self_hosted\",\"session_duration\":\"24h\",\"app_launcher_visible\":false}}", .{ st.hostname, st.hostname }) catch break :access;
-        const araw = apiJson(app, "POST", aurl, abody, tok.key) orelse break :access;
+        const araw = apiJson(app, a, "POST", aurl, abody, tok.key) orelse break :access;
         const A = struct { success: bool = false, result: ?struct { id: []const u8 = "" } = null };
         const ap = std.json.parseFromSliceLeaky(A, a, araw, .{ .ignore_unknown_fields = true }) catch break :access;
         if (!ap.success or ap.result == null) {
@@ -472,14 +496,14 @@ fn provisionNamed(app: *App, a: std.mem.Allocator, uid: u64, st: *State, tok: To
         eb.appendSlice(a, "{\"name\":\"owner only\",\"decision\":\"allow\",\"precedence\":1,\"include\":[{\"email\":{\"email\":") catch break :access;
         http.jstr(a, &eb, email) catch break :access;
         eb.appendSlice(a, "}}]}") catch break :access;
-        const praw = apiJson(app, "POST", purl, eb.items, tok.key) orelse break :access;
+        const praw = apiJson(app, a, "POST", purl, eb.items, tok.key) orelse break :access;
         const pp = std.json.parseFromSliceLeaky(A, a, praw, .{ .ignore_unknown_fields = true }) catch break :access;
         if (pp.success and pp.result != null) st.access_policy_id = pp.result.?.id;
     }
 
     // ---- 7. the connector's token
     const turl = std.fmt.allocPrint(a, "{s}/accounts/{s}/cfd_tunnel/{s}/token", .{ root, acct, st.tunnel_id }) catch return null;
-    const traw = apiJson(app, "GET", turl, "", tok.key) orelse {
+    const traw = apiJson(app, a, "GET", turl, "", tok.key) orelse {
         st.last_error = "could not reach the Cloudflare API";
         return null;
     };
@@ -495,26 +519,41 @@ fn provisionNamed(app: *App, a: std.mem.Allocator, uid: u64, st: *State, tok: To
     return k.result;
 }
 
+/// Take the current hostname off the account: its Access application, then its DNS record, both filed under
+/// `st.zone_id`. Best-effort like `deprovision` - a refusal is logged with the API's words and never stops the
+/// caller - and the ids are forgotten either way, so provisioning makes both anew for whatever name comes next.
+fn retireHostname(app: *App, a: std.mem.Allocator, st: *State, tok: Tok) void {
+    const root = app.cf_api_root;
+    if (st.zone_id.len > 0) {
+        if (st.access_app_id.len > 0) {
+            if (std.fmt.allocPrint(a, "{s}/zones/{s}/access/apps/{s}", .{ root, st.zone_id, st.access_app_id })) |u| {
+                const msg = if (apiJson(app, a, "DELETE", u, "", tok.key)) |r| firstError(a, r) else "could not reach the Cloudflare API";
+                if (msg.len > 0) log.warn("the Access application {s} was not removed from the account ({s})", .{ st.access_app_id, msg });
+            } else |_| {}
+        }
+        if (st.dns_record_id.len > 0) {
+            if (std.fmt.allocPrint(a, "{s}/zones/{s}/dns_records/{s}", .{ root, st.zone_id, st.dns_record_id })) |u| {
+                const msg = if (apiJson(app, a, "DELETE", u, "", tok.key)) |r| firstError(a, r) else "could not reach the Cloudflare API";
+                if (msg.len > 0) log.warn("the DNS record {s} was not removed from the account ({s})", .{ st.dns_record_id, msg });
+            } else |_| {}
+        }
+    }
+    st.dns_record_id = "";
+    st.access_app_id = "";
+    st.access_policy_id = "";
+}
+
 /// Tear the account side down (delete). Best-effort, in dependency order; the state is cleared regardless.
 fn deprovision(app: *App, a: std.mem.Allocator, st: *State, tok: Tok) void {
+    retireHostname(app, a, st, tok);
     const root = app.cf_api_root;
     const acct = tok.account_id;
-    if (st.access_app_id.len > 0) {
-        if (std.fmt.allocPrint(a, "{s}/zones/{s}/access/apps/{s}", .{ root, st.zone_id, st.access_app_id })) |u| {
-            if (apiJson(app, "DELETE", u, "", tok.key)) |r| app.gpa.free(r);
-        } else |_| {}
-    }
-    if (st.dns_record_id.len > 0 and st.zone_id.len > 0) {
-        if (std.fmt.allocPrint(a, "{s}/zones/{s}/dns_records/{s}", .{ root, st.zone_id, st.dns_record_id })) |u| {
-            if (apiJson(app, "DELETE", u, "", tok.key)) |r| app.gpa.free(r);
-        } else |_| {}
-    }
     if (st.tunnel_id.len > 0) {
         if (std.fmt.allocPrint(a, "{s}/accounts/{s}/cfd_tunnel/{s}/connections", .{ root, acct, st.tunnel_id })) |u| {
-            if (apiJson(app, "DELETE", u, "", tok.key)) |r| app.gpa.free(r);
+            _ = apiJson(app, a, "DELETE", u, "", tok.key);
         } else |_| {}
         if (std.fmt.allocPrint(a, "{s}/accounts/{s}/cfd_tunnel/{s}", .{ root, acct, st.tunnel_id })) |u| {
-            if (apiJson(app, "DELETE", u, "", tok.key)) |r| app.gpa.free(r);
+            _ = apiJson(app, a, "DELETE", u, "", tok.key);
         } else |_| {}
     }
     st.* = .{};
@@ -525,6 +564,13 @@ fn deprovision(app: *App, a: std.mem.Allocator, st: *State, tok: Tok) void {
 fn publicHost(st: *const State) []const u8 {
     if (std.mem.eql(u8, st.mode, "named") and st.hostname.len > 0) return st.hostname;
     return hostOf(st.url);
+}
+
+/// Does Cloudflare Access stand in front of the address being served? Only a named tunnel's hostname has an
+/// Access application. A quick tunnel keeps the named ids in its state for the next "use my domain" flip, and
+/// they say nothing about a trycloudflare.com address, so a policy id alone must never claim protection.
+fn accessGuarded(st: *const State) bool {
+    return std.mem.eql(u8, st.mode, "named") and st.access_policy_id.len > 0;
 }
 
 /// `https://host[/...]` -> `host`; "" when there is no host.
@@ -831,13 +877,13 @@ pub fn turnOn(app: *App, uid: u64) void {
         defer mu.unlock(io);
         live.phase = .live;
         live.published = published;
-        live.access = st.access_policy_id.len > 0;
+        live.access = accessGuarded(&st);
         const ml = @min(st.mode.len, live.mode.len);
         @memcpy(live.mode[0..ml], st.mode[0..ml]);
         live.mode_len = ml;
     }
     setUrl(io, st.url);
-    log.info("Cloudflare tunnel: {s}  ({s}{s}{s})", .{ st.url, if (std.mem.eql(u8, st.mode, "quick")) "confidential address" else st.hostname, if (st.access_policy_id.len > 0) ", Access: owner only" else ", veil login only", if (published) "" else "; NOT yet published by Cloudflare's resolver - give it a minute" });
+    log.info("Cloudflare tunnel: {s}  ({s}{s}{s})", .{ st.url, if (std.mem.eql(u8, st.mode, "quick")) "confidential address" else st.hostname, if (accessGuarded(&st)) ", Access: owner only" else ", veil login only", if (published) "" else "; NOT yet published by Cloudflare's resolver - give it a minute" });
 }
 
 /// Stop the connector; with `delete`, also remove the tunnel, its DNS record and its Access app from the
@@ -913,7 +959,11 @@ pub fn bootAsync(app: *App, forced: bool) void {
     th.detach();
 }
 
-/// Stop the connector on shutdown so it never outlives the server it proxies to.
+/// Stop the connector when the server shuts down in order, so it does not outlive the server it proxies to.
+/// main calls it when the desk window closes (app mode) and when `listen` returns (server-only). The switch
+/// position is left alone: a tunnel that was on comes back at the next boot. A server that is KILLED runs none
+/// of this; its connector is reaped by the next turnOn through the pidfile, or, in app mode on Windows, dies with
+/// the kill-on-close job the whole process tree lives in (unless NL_NO_JOB_OBJECT is set).
 pub fn shutdown(app: *App) void {
     mu.lockUncancelable(app.io);
     const uid = live.uid;
@@ -1022,6 +1072,7 @@ pub fn tunnelSet(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
             live.err_len = 0;
             live.url_len = 0; // nothing of the previous address may show while the next one is minted
             live.published = false;
+            live.access = false; // nor its protection: turnOn says again once the new address is live
         }
         const th = std.Thread.spawn(.{}, onThread, .{ app, u.id }) catch {
             setErr(app.io, "could not start the tunnel worker thread");
@@ -1037,7 +1088,9 @@ pub fn tunnelSet(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
 
 // ---------------------------------------------------------------------------
 // tests — see harness/TESTING.md (Handlers). The properties worth pinning: the routes are gated, the
-// state file round-trips its defaults, and the token never appears in the state.
+// state file round-trips its defaults, the token never appears in the state, Access is never claimed for an
+// address it does not guard, and - against a stand-in API (worker/fakehttp.zig) - a hostname change moves the
+// DNS record and the Access app with it.
 // ---------------------------------------------------------------------------
 
 test "every tunnel route is gated: an anonymous caller gets 401 and nothing runs" {
@@ -1109,4 +1162,159 @@ test "the permission explanation names the fix, other errors are quoted verbatim
     try std.testing.expectEqualStrings("creating the tunnel failed: tunnel name already exists", other);
     try std.testing.expectEqualStrings("", firstError(a, "{\"success\":true,\"errors\":[],\"result\":{}}"));
     try std.testing.expectEqualStrings("nope", firstError(a, "{\"success\":false,\"errors\":[{\"code\":1,\"message\":\"nope\"}]}"));
+}
+
+test "Access is claimed only for a named tunnel's hostname, and a hostname is on a zone only at a label boundary" {
+    // a quick tunnel started after a named one: the named policy id is still in the state, and guards nothing here
+    var st: State = .{ .mode = "quick", .url = "https://q.trycloudflare.com", .hostname = "veil.example.com", .access_app_id = "app-1", .access_policy_id = "pol-1" };
+    try std.testing.expect(!accessGuarded(&st));
+    st.mode = "named";
+    try std.testing.expect(accessGuarded(&st));
+    st.access_policy_id = ""; // an app whose policy was never made admits nobody, but it is not "owner only" either
+    try std.testing.expect(!accessGuarded(&st));
+
+    try std.testing.expect(onZone("veil.example.com", "example.com"));
+    try std.testing.expect(onZone("example.com", "example.com"));
+    try std.testing.expect(onZone("a.b.example.co.uk", "example.co.uk"));
+    try std.testing.expect(!onZone("veil.badexample.com", "example.com")); // a suffix, not a subdomain
+    try std.testing.expect(!onZone("example.com.evil.net", "example.com"));
+    try std.testing.expect(!onZone("veil.example.com", ""));
+}
+
+/// TEST ONLY. The replies every provisioning scenario below shares.
+const StandIn = struct {
+    const w = fakehttp.wire;
+    const deleted = w("{\"success\":true,\"errors\":[],\"result\":{\"id\":\"gone\"}}");
+    const ingress = w("{\"success\":true,\"errors\":[],\"result\":{}}");
+    const token = w("{\"success\":true,\"errors\":[],\"result\":\"tunnel-token\"}");
+    const no_records = w("{\"success\":true,\"errors\":[],\"result\":[]}");
+    /// What a route the scenario did not expect gets - including GET access/organizations where a scenario
+    /// lists no route for it, which reads exactly like an account without a Zero Trust organization.
+    const refused = w("{\"success\":false,\"errors\":[{\"code\":7003,\"message\":\"no such route in the stand-in\"}]}");
+};
+
+test "a hostname change on the same zone retires the old DNS record and Access app and provisions both for the new name" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var ta = try http.testApp(gpa, io, "zig-cftun-rename-tmp");
+    defer ta.deinit();
+    if (!runs(&ta.app, &.{ "curl", "--version" })) return error.SkipZigTest; // every v4 call rides curl
+
+    const w = fakehttp.wire;
+    const routes = [_]fakehttp.Route{
+        .{ .method = "GET", .path = "/zones/z1/dns_records?name=chat.example.com", .reply = StandIn.no_records },
+        .{ .method = "DELETE", .path = "/zones/z1/access/apps/app-old", .reply = StandIn.deleted },
+        .{ .method = "DELETE", .path = "/zones/z1/dns_records/rec-old", .reply = StandIn.deleted },
+        .{ .method = "PUT", .path = "/cfd_tunnel/t1/configurations", .reply = StandIn.ingress },
+        .{ .method = "POST", .path = "/zones/z1/dns_records", .reply = w("{\"success\":true,\"errors\":[],\"result\":{\"id\":\"rec-new\"}}") },
+        .{ .method = "GET", .path = "/accounts/acct/access/organizations", .reply = w("{\"success\":true,\"errors\":[],\"result\":{\"auth_domain\":\"team.cloudflareaccess.com\"}}") },
+        .{ .method = "POST", .path = "/access/apps/app-new/policies", .reply = w("{\"success\":true,\"errors\":[],\"result\":{\"id\":\"pol-new\"}}") },
+        .{ .method = "POST", .path = "/zones/z1/access/apps", .reply = w("{\"success\":true,\"errors\":[],\"result\":{\"id\":\"app-new\"}}") },
+        .{ .method = "GET", .path = "/cfd_tunnel/t1/token", .reply = StandIn.token },
+    };
+    var srv: fakehttp.Server = undefined;
+    try srv.startRouted(io, &routes, StandIn.refused);
+    var running = true;
+    defer if (running) srv.stop();
+    var rb: [64]u8 = undefined;
+    ta.app.cf_api_root = try std.fmt.bufPrint(&rb, "http://127.0.0.1:{d}/client/v4", .{srv.port});
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    // What tunnelSet leaves when chat.example.com replaces veil.example.com: the hostname cleared, every id kept.
+    var st: State = .{ .use_domain = true, .want_hostname = "chat.example.com", .mode = "named", .tunnel_id = "t1", .zone_id = "z1", .zone_name = "example.com", .dns_record_id = "rec-old", .access_app_id = "app-old", .access_policy_id = "pol-old" };
+    const token = provisionNamed(&ta.app, arena.allocator(), 1, &st, .{ .key = "k", .base_url = "", .account_id = "acct" }, "owner@example.com");
+    srv.stop();
+    running = false;
+
+    try std.testing.expectEqualStrings("tunnel-token", token orelse return error.TestUnexpectedResult);
+    try std.testing.expectEqualStrings("chat.example.com", st.hostname);
+    try std.testing.expectEqualStrings("https://chat.example.com", st.url);
+    // The new name has a record and an Access app of its own. Before, both ids survived the change: no CNAME
+    // was made for chat.example.com, and the status claimed Access for a name no Access app covered.
+    try std.testing.expectEqualStrings("rec-new", st.dns_record_id);
+    try std.testing.expectEqualStrings("app-new", st.access_app_id);
+    try std.testing.expectEqualStrings("pol-new", st.access_policy_id);
+    try std.testing.expect(accessGuarded(&st));
+    // the old name came off the account before the new record was made, and the zone was not listed again
+    const retired = srv.firstCall("DELETE", "/zones/z1/dns_records/rec-old") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(srv.firstCall("DELETE", "/zones/z1/access/apps/app-old") != null);
+    try std.testing.expect(retired < (srv.firstCall("POST", "/zones/z1/dns_records") orelse return error.TestUnexpectedResult));
+    try std.testing.expectEqual(@as(usize, 0), srv.countCalls("GET", "/zones?"));
+}
+
+test "a move to another zone retires the old name on the OLD zone, and asking by name for the hostname in use changes nothing" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var ta = try http.testApp(gpa, io, "zig-cftun-move-tmp");
+    defer ta.deinit();
+    if (!runs(&ta.app, &.{ "curl", "--version" })) return error.SkipZigTest;
+    const w = fakehttp.wire;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const tok: Tok = .{ .key = "k", .base_url = "", .account_id = "acct" };
+    var rb: [64]u8 = undefined;
+
+    // ---- veil.example.com -> veil.other.org, a zone of its own on the same account (no Zero Trust org)
+    {
+        const routes = [_]fakehttp.Route{
+            .{ .method = "GET", .path = "/zones?account.id=acct", .reply = w("{\"success\":true,\"errors\":[],\"result\":[{\"id\":\"z1\",\"name\":\"example.com\"},{\"id\":\"z2\",\"name\":\"other.org\"}]}") },
+            .{ .method = "DELETE", .path = "/zones/z1/access/apps/app-old", .reply = StandIn.deleted },
+            .{ .method = "DELETE", .path = "/zones/z1/dns_records/rec-old", .reply = StandIn.deleted },
+            .{ .method = "GET", .path = "/zones/z2/dns_records?name=veil.other.org", .reply = StandIn.no_records },
+            .{ .method = "PUT", .path = "/cfd_tunnel/t1/configurations", .reply = StandIn.ingress },
+            .{ .method = "POST", .path = "/zones/z2/dns_records", .reply = w("{\"success\":true,\"errors\":[],\"result\":{\"id\":\"rec-2\"}}") },
+            .{ .method = "GET", .path = "/cfd_tunnel/t1/token", .reply = StandIn.token },
+        };
+        var srv: fakehttp.Server = undefined;
+        try srv.startRouted(io, &routes, StandIn.refused);
+        var running = true;
+        defer if (running) srv.stop();
+        ta.app.cf_api_root = try std.fmt.bufPrint(&rb, "http://127.0.0.1:{d}/client/v4", .{srv.port});
+        var st: State = .{ .use_domain = true, .want_hostname = "veil.other.org", .mode = "named", .tunnel_id = "t1", .zone_id = "z1", .zone_name = "example.com", .hostname = "", .dns_record_id = "rec-old", .access_app_id = "app-old", .access_policy_id = "pol-old" };
+        const token = provisionNamed(&ta.app, arena.allocator(), 1, &st, tok, "owner@example.com");
+        srv.stop();
+        running = false;
+
+        try std.testing.expect(token != null);
+        try std.testing.expectEqualStrings("z2", st.zone_id);
+        try std.testing.expectEqualStrings("other.org", st.zone_name);
+        try std.testing.expectEqualStrings("veil.other.org", st.hostname);
+        try std.testing.expectEqualStrings("rec-2", st.dns_record_id);
+        // the old zone's Access app is gone and the new zone has none: the status must not claim one
+        try std.testing.expectEqualStrings("", st.access_app_id);
+        try std.testing.expect(!accessGuarded(&st));
+        try std.testing.expectEqual(@as(usize, 2), srv.countCalls("DELETE", "/zones/z1/"));
+        try std.testing.expectEqual(@as(usize, 0), srv.countCalls("DELETE", "/zones/z2/"));
+    }
+
+    // ---- want_hostname moved from "" to veil.example.com, the name the tunnel already has: nothing churns
+    {
+        const routes = [_]fakehttp.Route{
+            .{ .method = "GET", .path = "/zones/z1/dns_records?name=veil.example.com", .reply = w("{\"success\":true,\"errors\":[],\"result\":[{\"id\":\"rec-1\",\"content\":\"t1.cfargotunnel.com\"}]}") },
+            .{ .method = "PUT", .path = "/cfd_tunnel/t1/configurations", .reply = StandIn.ingress },
+            .{ .method = "GET", .path = "/cfd_tunnel/t1/token", .reply = StandIn.token },
+        };
+        var srv: fakehttp.Server = undefined;
+        try srv.startRouted(io, &routes, StandIn.refused);
+        var running = true;
+        defer if (running) srv.stop();
+        ta.app.cf_api_root = try std.fmt.bufPrint(&rb, "http://127.0.0.1:{d}/client/v4", .{srv.port});
+        var st: State = .{ .use_domain = true, .want_hostname = "veil.example.com", .mode = "named", .tunnel_id = "t1", .zone_id = "z1", .zone_name = "example.com", .hostname = "", .dns_record_id = "rec-1", .access_app_id = "app-1", .access_policy_id = "pol-1" };
+        const token = provisionNamed(&ta.app, arena.allocator(), 1, &st, tok, "owner@example.com");
+        srv.stop();
+        running = false;
+
+        try std.testing.expect(token != null);
+        try std.testing.expectEqualStrings("veil.example.com", st.hostname);
+        try std.testing.expectEqualStrings("rec-1", st.dns_record_id);
+        try std.testing.expectEqualStrings("app-1", st.access_app_id);
+        try std.testing.expectEqualStrings("pol-1", st.access_policy_id);
+        try std.testing.expectEqual(@as(usize, 0), srv.countCalls("DELETE", ""));
+        try std.testing.expectEqual(@as(usize, 0), srv.countCalls("POST", ""));
+    }
 }
