@@ -1898,9 +1898,10 @@ pub const Chat = struct {
         }
     }
 
-    /// Service ONE background conversation's frame: run its delegated tools / sync answers so the server turn
-    /// keeps moving, and report whether this frame was the turn's {done}. Deliberately does NOT render (no
-    /// tokens/messages/status) — a background turn is invisible until the user switches back and re-mirrors it.
+    /// Service ONE background conversation's frame: run its delegated tools / sync answers and land its pushed
+    /// files so the server turn keeps moving, and report whether this frame was the turn's {done}. Deliberately
+    /// does NOT render (no tokens/messages/status) — a background turn is invisible until the user switches back
+    /// and re-mirrors it.
     fn serviceBgFrame(self: *Chat, dd: []const u8, conv: []const u8, line_raw: []const u8) bool {
         const line = std.mem.trim(u8, line_raw, " \r\n\t");
         if (line.len == 0) return false;
@@ -1909,6 +1910,11 @@ pub const Chat = struct {
             const id = scRawField(line, "id") orelse return false;
             const tool = scRawField(line, "tool") orelse return false;
             self.startDelegatedTool(dd, conv, id, tool, line);
+        } else if (std.mem.eql(u8, kind, "file_sync")) {
+            // a finished hive's output, or a cf_ download, pushed down for THIS conversation. Frames are serviced
+            // in order, so it lands in its workdir before the tool_request or file_pull read-back that follows;
+            // skipped, the server's read-back found nothing and the model was told the file never arrived.
+            self.applyFileSync(dd, conv, line);
         } else if (std.mem.eql(u8, kind, "sync_request")) {
             const id = scRawField(line, "id") orelse return false;
             self.answerSyncRequest(dd, conv, id, line);
@@ -1927,7 +1933,7 @@ pub const Chat = struct {
         } else if (std.mem.eql(u8, kind, "done")) {
             return true;
         }
-        return false; // token/message/status/tool/error/file_sync — not serviced in the background
+        return false; // token/message/status/tool/error — not serviced in the background
     }
 
     /// Poll every active BACKGROUND turn and service its delegated frames, so conversations the user switched
@@ -2234,7 +2240,7 @@ pub const Chat = struct {
         if (std.mem.eql(u8, kind, "file_sync")) {
             // CLIENT MODE: a finished hive's output file, pushed down by the server so this machine has it. Frames
             // are processed in order, so these land BEFORE the delegated read_file that gathers them.
-            self.applyFileSync(dd, line);
+            self.applyFileSync(dd, self.sc_conv[0..self.sc_conv_len], line);
             return;
         }
         if (std.mem.eql(u8, kind, "sync_request")) {
@@ -2253,12 +2259,14 @@ pub const Chat = struct {
         // any other kind: not rendered.
     }
 
-    /// Materialize one server-pushed hive file ({kind:"file_sync",path,content}) into this conv's local build
-    /// workdir — emitted after a cast completes so delegated file tools (and the Files tab) see the swarm's
-    /// output on THIS machine, not just the server's disk. Path is workdir-relative and sanitized; nested
-    /// parents are created. On a local (same-disk) install this rewrites identical bytes — harmless, the run
-    /// is already terminal when the server emits these.
-    fn applyFileSync(self: *Chat, dd: []const u8, line: []const u8) void {
+    /// Materialize one server-pushed file ({kind:"file_sync",path,content}) into the ORIGIN conversation's
+    /// workdir: a finished hive's output (emitted after a cast completes) or a cf_ download, pushed so delegated
+    /// file tools (and the Files tab) see it on THIS machine, not just the server's disk. `conv` is the
+    /// conversation the frame came from, whichever one is on screen, and the directory is its delegatedWorkdir:
+    /// the one its delegated tools run in and answerFilePull reads back from. Path is workdir-relative and
+    /// sanitized; nested parents are created. A same-disk install normally gets no pushes (the sync probe
+    /// short-circuits them); one that still arrives rewrites identical bytes, which is harmless.
+    fn applyFileSync(self: *Chat, dd: []const u8, conv: []const u8, line: []const u8) void {
         var pb: [512]u8 = undefined;
         const rawp = scRawField(line, "path") orelse return;
         const path = scUnescape(rawp, &pb);
@@ -2267,34 +2275,36 @@ pub const Chat = struct {
             return;
         }
         const rawc = scRawField(line, "content") orelse return;
+        var wdb: [820]u8 = undefined;
+        const wd = self.delegatedWorkdir(conv, dd, &wdb);
+        // delegatedWorkdir hands back the data dir ITSELF for a conv with no build tree. A tool may run there; a
+        // pushed file must never be written there, among the desk's own .veil-desk/ state.
+        if (wd.ptr == dd.ptr) return;
         const cbuf = self.gpa.alloc(u8, rawc.len + 1) catch return; // decoded is never longer than the escaped raw
         defer self.gpa.free(cbuf);
         const content = scUnescape(rawc, cbuf);
-        var relb: [180]u8 = undefined;
-        const rel = self.chatBuildRel(&relb);
-        if (rel.len == 0) return;
-        var fb: [1100]u8 = undefined;
-        const full = std.fmt.bufPrint(&fb, "{s}/{s}/work/{s}", .{ dd, rel, path }) catch return;
+        var fb: [1240]u8 = undefined;
+        const full = std.fmt.bufPrint(&fb, "{s}/{s}", .{ wd, path }) catch return;
         if (std.fs.path.dirname(full)) |parent| _ = Io.Dir.cwd().createDirPathStatus(self.io, parent, .default_dir) catch {};
         Io.Dir.cwd().writeFile(self.io, .{ .sub_path = full, .data = content }) catch {
             log.warn("file_sync: could not write {s}", .{path[0..@min(path.len, 120)]});
             return;
         };
         log.info("file_sync: wrote {s} ({d}b)", .{ path[0..@min(path.len, 120)], content.len });
-        // the workdir just gained hive files — bind the console/git to it if this conv had none yet
-        if (self.build_dir_len == 0) self.syncBuildDir(dd);
+        // The workdir just gained files: bind the console/git to it if nothing is bound yet, but only when it IS
+        // the on-screen chat's workdir. syncBuildDir binds whichever chat is on screen, so a push for a
+        // backgrounded chat must not trigger it. A sub-chat family shares one tree, so the primary's push still
+        // binds a sub-chat on screen.
+        if (self.build_dir_len == 0) {
+            var ob: [180]u8 = undefined;
+            var sb: [180]u8 = undefined;
+            if (std.mem.eql(u8, self.buildRelFor(conv, &ob), self.chatBuildRel(&sb))) self.syncBuildDir(dd);
+        }
     }
 
-    /// The server-relative build root ({uid}/_chat/builds/{conv}) for an EXPLICIT conversation — the origin-conv
-    /// twin of chatBuildRel (which resolves the on-screen active conv). Used by the delegated-tool + sync paths so
-    /// a tool always runs in ITS conversation's workdir, not whichever conv happens to be on screen.
-    fn buildRelFor(self: *Chat, conv: []const u8, buf: []u8) []const u8 {
-        if (conv.len == 0) return "";
-        const uid: []const u8 = self.uidPrefix();
-        return std.fmt.bufPrint(buf, "{s}/_chat/builds/{s}", .{ uid, conv }) catch "";
-    }
-
-    /// Resolve `conv`'s delegated workdir (the same path launchDelegated roots tools at), creating it.
+    /// Resolve `conv`'s delegated workdir ("{dd}/{buildRelFor conv}/work"), creating it: the ONE directory that
+    /// conversation's delegated tools run in, its sync answers manifest and read, and its pushed files land in.
+    /// Falls back to `dd` itself when the conv has no build tree.
     fn delegatedWorkdir(self: *Chat, conv: []const u8, dd: []const u8, buf: []u8) []const u8 {
         var relb: [180]u8 = undefined;
         const rel = self.buildRelFor(conv, &relb);
@@ -2412,17 +2422,11 @@ pub const Chat = struct {
     /// caller needn't heap-unescape). Rooted at this conv's build workdir — the SAME path the server would
     /// use — so files the tool writes land where the Files tab reads them.
     fn launchDelegated(self: *Chat, dd: []const u8, conv: []const u8, id: []const u8, tool: []const u8, line: []const u8) void {
-        // 1) workdir = {dd}/{uid}/_chat/builds/{conv}/work (created on demand). Falls back to dd if unresolvable.
-        //    Rooted at the ORIGIN conversation's build dir (buildRelFor conv), not the on-screen one, so a tool
-        //    always writes into its own conversation's tree even if another chat is in focus.
-        var relb: [180]u8 = undefined;
-        const rel = self.buildRelFor(conv, &relb);
+        // 1) workdir = the ORIGIN conversation's delegatedWorkdir (created on demand; dd if unresolvable), not the
+        //    on-screen one's, so a tool always writes into its own conversation's tree even if another chat is in
+        //    focus.
         var wdb: [820]u8 = undefined;
-        const workdir = if (rel.len > 0)
-            (std.fmt.bufPrint(&wdb, "{s}/{s}/work", .{ dd, rel }) catch dd)
-        else
-            dd;
-        _ = Io.Dir.cwd().createDirPathStatus(self.io, workdir, .default_dir) catch {};
+        const workdir = self.delegatedWorkdir(conv, dd, &wdb);
 
         // 2) unescape the tool args (a write_file payload can be large → heap) and write them to a temp file that
         //    `veil exec-tool --args-file` reads. Off the argv: large + may contain quotes/newlines.
@@ -4370,13 +4374,21 @@ pub const Chat = struct {
 
     // ---------------------------------------------------------------------- chat Files tab (this chat's own dir)
 
-    /// The data-relative build dir for THIS conversation ("u{uid}/_chat/builds/{conv}", or the task tree
-    /// "u{uid}/_sched/{task}/runs/{stamp}" for a scheduled run's conv); "" if no active conv. The uid is taken
-    /// from the leading "uN" segment of build_dir (set when a build tool ran) — defaults to u1, which is the
-    /// desktop's admin user on localhost.
+    /// The data-relative build dir for THIS (on-screen) conversation: buildRelFor the active conv, "" if none.
     fn chatBuildRel(self: *Chat, buf: []u8) []const u8 {
         var cb: [64]u8 = undefined;
-        const conv_own = self.convScope(&cb);
+        return self.buildRelFor(self.convScope(&cb), buf);
+    }
+
+    /// The data-relative build dir for an EXPLICIT conversation: "u{uid}/_chat/builds/{conv}", the primary's tree
+    /// for a sub-chat, or the task tree "u{uid}/_sched/{task}/runs/{stamp}" for a scheduled run's conv; "" for no
+    /// conv. The LOCAL TWIN of the server's chat/paths.zig buildRootFromChatBase, and the ONE desk mapping:
+    /// chatBuildRel (the on-screen chat: Files tab, console) and delegatedWorkdir (a conversation's delegated
+    /// tools, sync answers and pushed files) both resolve through it. The delegated paths once had their own copy,
+    /// which missed both the scheduled-run and the sub-chat redirect. The uid is taken from the leading "uN"
+    /// segment of build_dir (set when a build tool ran) — defaults to u1, which is the desktop's admin user on
+    /// localhost.
+    fn buildRelFor(self: *Chat, conv_own: []const u8, buf: []u8) []const u8 {
         if (conv_own.len == 0) return "";
         // a SUB-CHAT shares its primary's build tree (LOCAL TWIN of server paths.zig branchRoot)
         const conv = store_mod.branchConvRoot(conv_own);
@@ -11488,6 +11500,183 @@ test "safeSyncPath accepts workdir-relative files and rejects escapes" {
     try std.testing.expect(!safeSyncPath("a\\b"));
     try std.testing.expect(!safeSyncPath(""));
     try std.testing.expect(!safeSyncPath("a//b"));
+}
+
+/// Put `id` on screen the way a conversation switch writes the store, without the rest of the switch (transcript
+/// load, server mirror, console rebind): the file_sync tests need only which chat the user is looking at.
+fn testScreenConv(chat: *Chat, id: []const u8) void {
+    chat.store.lock();
+    defer chat.store.unlock();
+    @memcpy(chat.store.conv_active[0..id.len], id);
+    chat.store.conv_active_len = @intCast(id.len);
+}
+
+test "file_sync: a backgrounded chat's pushed file lands in ITS workdir, where the file_pull read-back looks, never the on-screen chat's" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{ .environ = llm.osEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dd = "zig-filesync-bg-tmp";
+    Io.Dir.cwd().deleteTree(io, dd) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dd) catch {};
+    // the on-screen chat already has a workdir and no console binding, so a rebind for the wrong chat would show
+    _ = Io.Dir.cwd().createDirPathStatus(io, dd ++ "/u1/_chat/builds/cfront/work", .default_dir) catch {};
+    var store = std.testing.allocator.create(Store) catch unreachable;
+    defer std.testing.allocator.destroy(store);
+    store.* = .{};
+    @memcpy(store.settings.data_dir[0..dd.len], dd);
+    store.settings.data_dir_len = dd.len;
+    var chat = std.testing.allocator.create(Chat) catch unreachable;
+    defer std.testing.allocator.destroy(chat);
+    chat.* = .{ .io = io, .gpa = std.testing.allocator, .store = store };
+    testScreenConv(chat, "cfront");
+
+    // escaped the way the server's writer escapes it (http.jstr): quotes, backslashes, newlines, tabs; UTF-8 raw
+    const frame = "{\"kind\":\"file_sync\",\"path\":\"report/fires.md\",\"content\":\"# Fires\\n\\t\\\"contained\\\" per C:\\\\ops \xc2\xb7 ok\\n\"}";
+    const want = "# Fires\n\t\"contained\" per C:\\ops \xc2\xb7 ok\n";
+    try std.testing.expect(!chat.serviceBgFrame(dd, "cback", frame)); // serviced, and not the turn's {done}
+    const landed = try Io.Dir.cwd().readFileAlloc(io, dd ++ "/u1/_chat/builds/cback/work/report/fires.md", std.testing.allocator, .limited(64 << 10));
+    defer std.testing.allocator.free(landed);
+    try std.testing.expectEqualStrings(want, landed);
+    // The server confirms a carried file by reading it back through file_pull, and answerFilePull serves that from
+    // delegatedWorkdir: the bytes have to be THERE, not merely somewhere on this disk.
+    var wdb: [820]u8 = undefined;
+    var rpb: [900]u8 = undefined;
+    const readback_path = try std.fmt.bufPrint(&rpb, "{s}/report/fires.md", .{chat.delegatedWorkdir("cback", dd, &wdb)});
+    const readback = try Io.Dir.cwd().readFileAlloc(io, readback_path, std.testing.allocator, .limited(64 << 10));
+    defer std.testing.allocator.free(readback);
+    try std.testing.expectEqualStrings(want, readback);
+    try std.testing.expect(!fileExists(io, dd ++ "/u1/_chat/builds/cfront/work/report/fires.md"));
+    try std.testing.expect(chat.build_dir_len == 0); // a push for a chat off screen leaves the console binding alone
+
+    // A backgrounded SUB-CHAT of the on-screen chat builds in the family tree, as it does on the server. Its push
+    // lands in the primary's workdir, which IS the on-screen chat's, so the unbound console binds to it.
+    try std.testing.expect(!chat.serviceBgFrame(dd, "cfront__s1", "{\"kind\":\"file_sync\",\"path\":\"notes.md\",\"content\":\"branch output\"}"));
+    const family = try Io.Dir.cwd().readFileAlloc(io, dd ++ "/u1/_chat/builds/cfront/work/notes.md", std.testing.allocator, .limited(64 << 10));
+    defer std.testing.allocator.free(family);
+    try std.testing.expectEqualStrings("branch output", family);
+    try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().openDir(io, dd ++ "/u1/_chat/builds/cfront__s1", .{}));
+    try std.testing.expectEqualStrings(dd ++ "/u1/_chat/builds/cfront/work", chat.build_dir[0..chat.build_dir_len]);
+}
+
+test "file_sync: a foreground push lands in the frame's conversation too, and binds the console only to the on-screen chat's workdir" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{ .environ = llm.osEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dd = "zig-filesync-fg-tmp";
+    Io.Dir.cwd().deleteTree(io, dd) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dd) catch {};
+    var store = std.testing.allocator.create(Store) catch unreachable;
+    defer std.testing.allocator.destroy(store);
+    store.* = .{};
+    @memcpy(store.settings.data_dir[0..dd.len], dd);
+    store.settings.data_dir_len = dd.len;
+    var chat = std.testing.allocator.create(Chat) catch unreachable;
+    defer std.testing.allocator.destroy(chat);
+    chat.* = .{ .io = io, .gpa = std.testing.allocator, .store = store };
+    testScreenConv(chat, "cfg");
+    @memcpy(chat.sc_conv[0.."cfg".len], "cfg");
+    chat.sc_conv_len = "cfg".len;
+
+    // the ordinary foreground turn: its conversation is the one on screen, so the push lands in that chat's workdir
+    // and the unbound console binds to the directory that just appeared
+    chat.renderScFrame(dd, "{\"kind\":\"file_sync\",\"path\":\"app/main.py\",\"content\":\"print(\\\"hi\\\")\\n\"}");
+    const main_py = try Io.Dir.cwd().readFileAlloc(io, dd ++ "/u1/_chat/builds/cfg/work/app/main.py", std.testing.allocator, .limited(64 << 10));
+    defer std.testing.allocator.free(main_py);
+    try std.testing.expectEqualStrings("print(\"hi\")\n", main_py);
+    try std.testing.expectEqualStrings(dd ++ "/u1/_chat/builds/cfg/work", chat.build_dir[0..chat.build_dir_len]);
+
+    // The FRAME's conversation decides, not the screen's. The two agree during a live foreground turn, so pull them
+    // apart to see which one the push follows: another chat on screen, with a workdir and no console binding.
+    chat.build_dir_len = 0;
+    _ = Io.Dir.cwd().createDirPathStatus(io, dd ++ "/u1/_chat/builds/cother/work", .default_dir) catch {};
+    testScreenConv(chat, "cother");
+    chat.renderScFrame(dd, "{\"kind\":\"file_sync\",\"path\":\"app/util.py\",\"content\":\"X = 1\\n\"}");
+    const util_py = try Io.Dir.cwd().readFileAlloc(io, dd ++ "/u1/_chat/builds/cfg/work/app/util.py", std.testing.allocator, .limited(64 << 10));
+    defer std.testing.allocator.free(util_py);
+    try std.testing.expectEqualStrings("X = 1\n", util_py);
+    try std.testing.expect(!fileExists(io, dd ++ "/u1/_chat/builds/cother/work/app/util.py"));
+    try std.testing.expect(chat.build_dir_len == 0);
+}
+
+test "file_sync: a path that leaves the workdir writes nothing, foreground or background, and a push with no conversation never lands in the data dir" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{ .environ = llm.osEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dd = "zig-filesync-unsafe-tmp";
+    Io.Dir.cwd().deleteTree(io, dd) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dd) catch {};
+    _ = Io.Dir.cwd().createDirPathStatus(io, dd, .default_dir) catch {};
+    var store = std.testing.allocator.create(Store) catch unreachable;
+    defer std.testing.allocator.destroy(store);
+    store.* = .{};
+    @memcpy(store.settings.data_dir[0..dd.len], dd);
+    store.settings.data_dir_len = dd.len;
+    var chat = std.testing.allocator.create(Chat) catch unreachable;
+    defer std.testing.allocator.destroy(chat);
+    chat.* = .{ .io = io, .gpa = std.testing.allocator, .store = store };
+    testScreenConv(chat, "cscreen");
+    @memcpy(chat.sc_conv[0.."cscreen".len], "cscreen");
+    chat.sc_conv_len = "cscreen".len;
+
+    // Escapes that would still land INSIDE dd if the guard were gone, so a broken guard fails this test instead of
+    // writing outside the test's tree. Absolute and drive-letter paths are pinned by safeSyncPath's own test.
+    const unsafe = [_][]const u8{
+        "{\"kind\":\"file_sync\",\"path\":\"../escape.md\",\"content\":\"x\"}",
+        "{\"kind\":\"file_sync\",\"path\":\"work/../../escape.md\",\"content\":\"x\"}",
+        "{\"kind\":\"file_sync\",\"path\":\"..\\\\escape.md\",\"content\":\"x\"}", // a backslash separator
+        "{\"kind\":\"file_sync\",\"path\":\"\",\"content\":\"x\"}",
+    };
+    for (unsafe) |frame| {
+        chat.renderScFrame(dd, frame);
+        try std.testing.expect(!chat.serviceBgFrame(dd, "cback", frame));
+    }
+    // a safe path with no conversation to land in: delegatedWorkdir's fallback for that is the data dir itself
+    chat.sc_conv_len = 0;
+    const orphan = "{\"kind\":\"file_sync\",\"path\":\"settings.json\",\"content\":\"{}\"}";
+    chat.renderScFrame(dd, orphan);
+    try std.testing.expect(!chat.serviceBgFrame(dd, "", orphan));
+
+    // nothing at all under dd: no file, and no workdir made for a push that was refused
+    var d = try Io.Dir.cwd().openDir(io, dd, .{ .iterate = true });
+    defer d.close(io);
+    var it = d.iterate();
+    if (try it.next(io)) |ent| {
+        std.debug.print("a refused file_sync still wrote {s}/{s}\n", .{ dd, ent.name });
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "one conversation, one build tree: the desk resolves every conv id to the directory the server's paths.zig does, on screen or off" {
+    const cpaths = @import("chatpaths"); // the server's own mapping, wired into the desk TEST build only
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{ .environ = llm.osEnviron() });
+    defer threaded.deinit();
+    const store = std.testing.allocator.create(Store) catch unreachable;
+    defer std.testing.allocator.destroy(store);
+    store.* = .{};
+    var chat = std.testing.allocator.create(Chat) catch unreachable;
+    defer std.testing.allocator.destroy(chat);
+    chat.* = .{ .io = threaded.io(), .gpa = std.testing.allocator, .store = store };
+    const ids = [_][]const u8{
+        "c6a57f852", // an ordinary chat
+        "c42__s3", // a sub-chat: its primary's tree
+        "scheduled_news-0715174857_07151753", // a scheduled run: its task's tree
+        "scheduled_news-0715174857_07151753__s1", // a sub-chat of that run: the run's task tree
+        "scheduled_notes", // hand-named, no run stamp: an ordinary tree
+        "c42__s9", // past MAX_BRANCHES: not a sub-chat, so its own tree
+    };
+    for (ids) |id| {
+        // the engine roots a desk-delegated turn's workdir at buildRootFromChatBase over "{data}/u{uid}/_chat"
+        var sb: [256]u8 = undefined;
+        const server = cpaths.buildRootFromChatBase(&sb, "data/u1/_chat", id);
+        var ob: [180]u8 = undefined;
+        const off_screen = chat.buildRelFor(id, &ob);
+        var jb: [256]u8 = undefined;
+        try std.testing.expectEqualStrings(server, try std.fmt.bufPrint(&jb, "data/{s}", .{off_screen}));
+        // and the on-screen resolver (Files tab, console) names the same tree for that chat
+        testScreenConv(chat, id);
+        var cb: [180]u8 = undefined;
+        try std.testing.expectEqualStrings(off_screen, chat.chatBuildRel(&cb));
+    }
 }
 
 fn scRawField(s: []const u8, key: []const u8) ?[]const u8 {
