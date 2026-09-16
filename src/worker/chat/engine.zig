@@ -28,6 +28,7 @@ const llm = @import("../llm.zig");
 const modelcfg = @import("modelcfg"); // a MODULE (src/worker/modelcfg.zig) — never a path import
 const cctx = @import("context.zig");
 const wsp = @import("workspace.zig"); // prompt workspace: typed bids -> fixed-order scored admission + decision log
+const ovl = @import("overlay.zig"); // recall overlay: the working field settled around every thought
 const builtin_mod = @import("../builtin.zig"); // the built-in engine's sentinel + LIVE served-window publication
 const cplan = @import("plan.zig");
 const cync = @import("sync.zig");
@@ -2884,7 +2885,8 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     }
     // DURABLE USER MEMORY: inject the user's cross-conversation facts (keys/logins/preferences) from the shared
     // memories.jsonl — the desk's "YOUR MEMORY" block, which a server-served conv never had.
-    injectDurableMemory(app, uid, &ws, compact_belt);
+    const durable_shown = injectDurableMemory(app, uid, &ws, compact_belt);
+    defer if (durable_shown) |d| gpa.free(d);
     // TOOL-PERFORMANCE DIGEST: a compact, learned note on which tools are slow or flaky on THIS machine, so the
     // agent plans around them (waits out a cold browser, avoids a 404-ing endpoint) instead of relearning each
     // run. Fixed within this turn (computed once), so it lives in the stable prefix like durable memory. Absent
@@ -3283,6 +3285,36 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     var foreign_mem: std.ArrayListUnmanaged(u8) = .empty;
     defer foreign_mem.deinit(gpa);
     var foreign_warned = false;
+    // RECALL OVERLAY (overlay.zig): a per-turn working field of this conversation's memory, the durable notes as
+    // the prompt shows them and the file ledger, grown from every finding as it lands, settled around the live
+    // cue before EVERY model call of the turn and rendered as a removable last block. Seeding is the one
+    // subprocess it spends; strengthening what fired is spent at turn exit. NL_MEM_OVERLAY=0 disables;
+    // NL_MEM_OVERLAY_BYTES sizes the block; NL_HYPERSPACE_CAP sizes the field (the swarm's knob, shared).
+    var overlay: ?ovl.Overlay = null;
+    defer if (overlay) |*o| o.deinit();
+    if (!envDisabled(environ, "NL_MEM_OVERLAY")) {
+        overlay = ovl.Overlay.init(gpa, envUsize(environ, "NL_HYPERSPACE_CAP", ovl.DEFAULT_CAP));
+        const o = &overlay.?;
+        o.budget = envUsize(environ, "NL_MEM_OVERLAY_BYTES", ovl.DEFAULT_BUDGET);
+        o.setGoal(goal_text);
+        const wide = ctx.mem.assocAcross(cpaths.scopeFamilyBase(mem_scope), goal_text, osc.Mem.SATURATE_HOPS, 48);
+        defer if (wide.len > 0) gpa.free(wide);
+        if (wide.len > 0) {
+            scrubUtf8(wide);
+            _ = o.seedBlock(wide, .conv);
+        }
+        if (durable_shown) |d| _ = o.seedBlock(d, .durable);
+        var lb: std.ArrayListUnmanaged(u8) = .empty;
+        defer lb.deinit(gpa);
+        ledgerBlock(gpa, &file_ledger, &lb);
+        _ = o.seedBlock(lb.items, .ledger);
+    }
+    // Declared AFTER the deinit defer, so it runs BEFORE it: the fired store-backed lines are strengthened while
+    // the field still exists, and the turn's accounting is logged in one line.
+    defer if (overlay) |*o| {
+        const strengthened = o.strengthenFired(ctx.mem, mem_scope);
+        memlog.info("memory overlay: {d} renders, {d} lines shown, {d} fired, {d} inhibited, {d} strengthened in the store", .{ o.renders, o.lines_shown, o.fired_total, o.inhibited_total, strengthened });
+    };
     var drive: usize = 0;
     // DURABLE MEMORY, THIS TURN: directives applied so far (settle path + picker path) and whether the picker has
     // already been sent once to record a change it named — both gate the "a memory directive is never a drive
@@ -3347,6 +3379,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
                     var stept: std.ArrayListUnmanaged(u8) = .empty;
                     defer stept.deinit(gpa);
                     stept.appendSlice(gpa, instr) catch break :outer;
+                    if (overlay) |*o| o.noteThought(instr);
                     if (weave.step.len > 0) stept.appendSlice(gpa, weave.step) catch {};
                     conv_buf.appendSlice(gpa, ",{\"role\":\"user\",\"content\":") catch break :outer;
                     http.jstr(gpa, &conv_buf, stept.items) catch break :outer;
@@ -3391,7 +3424,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
 
         // Run one agentic tool pass to a SETTLED (no-tool-call) answer.
         const mut_before = file_ledger.mutations;
-        const inner = runInnerAgentic(app, uid, conv, conv_dir, llm_dir, trio, &conv_buf, &ctx, &steer_cursor, &tool_obs, &tool_perf, tool_client, &no_ack_streak, &dud_fetches, &poll_timeouts, &tools_spent, tool_budget, token_ceiling, &echo_guard, &call_ledger, &file_ledger, foreign_mem.items, &foreign_warned, search_intent, &search_log, turn_tools);
+        const inner = runInnerAgentic(app, uid, conv, conv_dir, llm_dir, trio, &conv_buf, &ctx, &steer_cursor, &tool_obs, &tool_perf, tool_client, &no_ack_streak, &dud_fetches, &poll_timeouts, &tools_spent, tool_budget, token_ceiling, &echo_guard, &call_ledger, &file_ledger, foreign_mem.items, &foreign_warned, search_intent, &search_log, turn_tools, if (overlay) |*o| o else null);
         // TRAJECTORY THREAD (fine weave): a pass that LANDED file changes mints one provenance-labeled
         // progress fact pairing the step's language with the engine-observed effect — the lexical thread
         // that lets a later step's recall hop from "what am I doing" to "what already happened here".
@@ -4129,6 +4162,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
             var stept: std.ArrayListUnmanaged(u8) = .empty;
             defer stept.deinit(gpa);
             stept.appendSlice(gpa, next_step) catch break :outer;
+            if (overlay) |*o| o.noteThought(next_step);
             if (weave.step.len > 0) stept.appendSlice(gpa, weave.step) catch {};
             conv_buf.appendSlice(gpa, ",{\"role\":\"user\",\"content\":") catch break :outer;
             http.jstr(gpa, &conv_buf, stept.items) catch break :outer;
@@ -8164,6 +8198,12 @@ fn scanToolChannel(app: *App, conv_dir: []const u8, id: []const u8, cursor: *usi
 /// wall-clock deadline from the budget it asked for, so the deadline widens with the request.
 /// An operator kill switch that DEFAULTS ON: only an explicit "0"/"false" turns the feature off. An unset
 /// variable must never read as disabled — that is how a reasoning upgrade silently fails to ship.
+/// A positive integer knob from the environment, or `default` when unset or unparsable.
+fn envUsize(environ: *const std.process.Environ.Map, name: []const u8, default: usize) usize {
+    const v = environ.get(name) orelse return default;
+    return std.fmt.parseInt(usize, std.mem.trim(u8, v, " \t\r\n"), 10) catch default;
+}
+
 fn envDisabled(environ: *const std.process.Environ.Map, name: []const u8) bool {
     const v = environ.get(name) orelse return false;
     const t = std.mem.trim(u8, v, " \t\r\n");
@@ -8507,6 +8547,7 @@ fn runInnerAgentic(
     // This turn's advertised tools array — the caller's static CAPS variant plus any granted recipe schemas,
     // built ONCE per turn in runTurn (turn-stable, byte-identical across drive passes → prefix-cache safe).
     turn_tools: []const u8,
+    overlay: ?*ovl.Overlay, // the recall overlay: settled before every model call, removed right after (overlay.zig)
 ) InnerResult {
     const gpa = app.gpa;
     // Bind the coding/base triple to the names this body already uses (the main agentic stream is the CODING
@@ -8640,11 +8681,22 @@ fn runInnerAgentic(
         // frames. The returned Step is the SAME accumulated shape complete() gives (content + reasoning +
         // tool_calls), so everything below is unchanged — and completeStream falls back to complete() itself
         // on any streaming trouble, so a backend that can't stream still works (on_delta just never fires).
+        // RECALL OVERLAY: settle the turn's working field around what the model is doing right now and ride the
+        // result as the LAST message of this one request — removed the instant the model has answered, so it
+        // never enters the transcript, a compaction, a summary, the store, or the next round's upload.
+        const pre_overlay_len = conv_buf.items.len;
+        if (overlay) |o| {
+            if (o.render()) |blk| {
+                defer gpa.free(blk);
+                appendMsgObj(gpa, conv_buf, "system", blk, blk.len);
+            }
+        }
         var sctx = StreamCtx{ .app = app, .conv_dir = conv_dir, .ctrl_cursor = steer_cursor.* };
         var chat_cm = meterBegin(app.io);
         traceFrame(app, "worker.llm", "completeStream", "enter", null, null);
         announcePhase(app, "chat");
         var step = llm.completeStream(gpa, app.io, run_root, "chat", base_url, key, model, conv_buf.items, turn_tools, turnTokenBudget(ctx.environ, base_url, model, turn_reasoning), 0.7, &sctx, streamOnDelta, streamShouldAbort);
+        conv_buf.shrinkRetainingCapacity(pre_overlay_len); // the overlay was for that inference alone
         traceFrame(app, "worker.llm", "completeStream", "exit", step.ok, null);
         defer step.deinit(gpa);
         streamFlush(&sctx); // emit the last buffered <FLUSH_CHARS chunk so the tail of the reply/reasoning isn't lost
@@ -8773,6 +8825,17 @@ fn runInnerAgentic(
             last_content = gpa.dupe(u8, step.content) catch empty;
         }
 
+        // RECALL OVERLAY, the firing half: what the model just said and is about to call is the next cue, and a
+        // shown line whose distinctive stems appear in it has been USED — its streak resets, it feeds the next
+        // cue, and it is queued for strengthening in the store at turn end.
+        if (overlay) |o| {
+            o.noteThought(step.content);
+            _ = o.observeFiring(step.content);
+            for (step.calls) |c| {
+                o.noteCall(c.name, c.args);
+                _ = o.observeFiring(c.args);
+            }
+        }
         // append the assistant tool_call turn to the running context (standard OpenAI tool_calls shape) ...
         // Record where this turn starts + dup its reasoning, so the heal above can splice reasoning_content in
         // if the NEXT inference is rejected for its absence. Freed on replace (and by the defer at pass exit).
@@ -9208,6 +9271,7 @@ fn runInnerAgentic(
                 };
                 if (std.fmt.allocPrint(gpa, "tool {s} {s}: {s}", .{ c.name, args_cue, clipBytes(result, 200) })) |note| {
                     atomizeNoteInPlace(note); // ONE fact per finding — the store's sentence atomizer must not shred it
+                    if (overlay) |o| o.noteFinding(note); // into the working field NOW: recallable next round, no subprocess
                     tool_obs.append(gpa, note) catch gpa.free(note);
                 } else |_| {}
             }
@@ -9301,6 +9365,7 @@ fn runInnerAgentic(
             // re-uploaded on EVERY later inference of the turn, so one giant build/test dump otherwise taxes the
             // whole rest of the conversation (a first-order slowness source on hosted models).
             const kept = clipToolResult(gpa, result);
+            if (overlay) |o| o.noteResult(kept);
             var toolobj: std.ArrayListUnmanaged(u8) = .empty;
             defer toolobj.deinit(gpa);
             const obj_ok = blk: {
@@ -9820,10 +9885,12 @@ fn readDurable(app: *App, uid: u64) ?[]u8 {
 }
 
 /// Inject the user's durable memory as a "YOUR MEMORY" system message right after the recall block. Additive: an
-/// absent/empty store leaves conv_buf unchanged.
-fn injectDurableMemory(app: *App, uid: u64, ws: *wsp.Workspace, compact: bool) void {
+/// absent/empty store leaves conv_buf unchanged. Returns the rendered block (gpa-owned; values already masked)
+/// so the recall overlay can seed from the SAME text the prompt shows — one masking policy — or null when
+/// nothing was injected.
+fn injectDurableMemory(app: *App, uid: u64, ws: *wsp.Workspace, compact: bool) ?[]u8 {
     const gpa = app.gpa;
-    const data = readDurable(app, uid) orelse return;
+    const data = readDurable(app, uid) orelse return null;
     defer gpa.free(data);
     // gather non-empty JSON lines, keep the NEWEST cap (append order = oldest first)
     var slices: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -9833,11 +9900,11 @@ fn injectDurableMemory(app: *App, uid: u64, ws: *wsp.Workspace, compact: bool) v
         const ln = durableLine(raw);
         if (ln.len > 0 and ln[0] == '{') slices.append(gpa, ln) catch break;
     }
-    if (slices.items.len == 0) return;
+    if (slices.items.len == 0) return null;
     const from = slices.items.len -| MEM_INJECT_CAP;
     var block: std.ArrayListUnmanaged(u8) = .empty;
     defer block.deinit(gpa);
-    block.appendSlice(gpa, "YOUR MEMORY (durable facts this user asked you to keep across conversations — keys, logins, preferences, environment). Use them; do not re-REMEMBER what's already here:\n") catch return;
+    block.appendSlice(gpa, "YOUR MEMORY (durable facts this user asked you to keep across conversations — keys, logins, preferences, environment). Use them; do not re-REMEMBER what's already here:\n") catch return null;
     const M = struct { cat: []const u8 = "", text: []const u8 = "" };
     var any = false;
     var withheld: usize = 0;
@@ -9862,7 +9929,7 @@ fn injectDurableMemory(app: *App, uid: u64, ws: *wsp.Workspace, compact: bool) v
         any = true;
         injected += 1;
     }
-    if (!any) return;
+    if (!any) return null;
     // The footer must name only tools the caller's belt ACTUALLY advertises. It used to name get_credential
     // unconditionally — but SYSTEM_PROMPT_COMPACT deliberately drops that tool (see its doc comment) and the
     // compact belt does not carry it, while that same prompt tells the model "Those are ALL your tools". A
@@ -9872,6 +9939,7 @@ fn injectDurableMemory(app: *App, uid: u64, ws: *wsp.Workspace, compact: bool) v
     // belt the honest instruction is to ask, which is also this tier's stated design intent.
     if (withheld > 0) block.appendSlice(gpa, if (compact) WITHHELD_FOOTER_COMPACT else WITHHELD_FOOTER_FULL) catch {};
     ws.bid(.durable_memory, "memories.jsonl", block.items, 0.90, 0, injected);
+    return block.toOwnedSlice(gpa) catch null;
 }
 
 /// True if `fact` (trimmed) is already stored — exact text match against the durable store (dedup).
@@ -10017,6 +10085,21 @@ test "an applied memory batch is announced on the wire: the status line the user
     try std.testing.expect(std.mem.indexOf(u8, ev, "{\"kind\":\"status\",\"text\":\"memory updated — 2 directives applied\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, ev, "{\"kind\":\"status\",\"text\":\"memory updated — 1 directive applied\"}") != null);
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, ev, "{\"kind\":\"memory\",\"text\":\"updated\"}"));
+}
+
+test "the recall overlay rides one inference and leaves the working context byte-identical" {
+    const gpa = std.testing.allocator;
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(gpa);
+    try buf.appendSlice(gpa, "{\"role\":\"system\",\"content\":\"sys\"},{\"role\":\"user\",\"content\":\"hi\"}");
+    const before = try gpa.dupe(u8, buf.items);
+    defer gpa.free(before);
+    const pre = buf.items.len;
+    appendMsgObj(gpa, &buf, "system", ovl.HEADER, ovl.HEADER.len);
+    try std.testing.expect(buf.items.len > pre);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "RECALL OVERLAY") != null);
+    buf.shrinkRetainingCapacity(pre);
+    try std.testing.expectEqualStrings(before, buf.items);
 }
 
 test "durable store lines: a byte-order mark hides no memory, and a dressed directive is still a directive" {

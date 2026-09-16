@@ -40,6 +40,7 @@ test {
     _ = @import("worker/modelpull.zig"); // weights downloader: repo resolve, resume, sha verify — via fakehttp
     _ = @import("worker/chat/context.zig");
     _ = @import("worker/chat/engine.zig");
+    _ = @import("worker/chat/overlay.zig"); // recall overlay: the per-thought working field, refractory + firing
     _ = @import("worker/chat/paths.zig");
     _ = @import("worker/chat/plan.zig");
     _ = @import("worker/chat/service.zig");

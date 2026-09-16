@@ -554,6 +554,17 @@ pub const Mem = struct {
         return self.gpa.dupe(u8, out[s..@min(p, out.len)]) catch @constCast("");
     }
 
+    /// Strengthen-only plasticity: bump the strength of every stored fact CONTAINING `match`; never mints.
+    /// The chat overlay's Hebbian half — a recalled fact the model demonstrably USED ranks higher in every
+    /// later recall. A short match would bump half the scope, so one is refused. Write-locked; best-effort.
+    pub fn strengthen(self: Mem, scope: []const u8, match: []const u8) void {
+        const m = std.mem.trim(u8, match, " \r\n\t");
+        if (m.len < 8) return;
+        self.lockW();
+        defer self.unlockW();
+        if (self.run(&.{ "strengthen", scope, m })) |o| self.gpa.free(o);
+    }
+
     pub fn reinforce(self: Mem, scope: []const u8, topic: []const u8, feeling: []const u8) void {
         self.lockW();
         defer self.unlockW();
