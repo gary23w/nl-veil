@@ -369,12 +369,15 @@ fn writeKeysEnv(app: *App, arena: std.mem.Allocator, run_dir: []const u8, eff_ke
 }
 
 /// Reset a reused run dir's LIFECYCLE files before a re-cast spawns into it: drop STOP/DONE/control.jsonl/
-/// worker.pid and rotate events.jsonl to events.prev.jsonl (replacing any older rotation, so exactly one
-/// previous run stays inspectable). Deliberately narrower than supervisor.cleanCastMeta — that also deletes
+/// worker.pid, the ask files and the chat engine's `.filesync_done`, and rotate events.jsonl to events.prev.jsonl
+/// (replacing any older rotation, so exactly one previous run stays inspectable). `.filesync_done` means this dir's
+/// run was already pushed to a client-mode client (engine.zig maybeSyncCastFiles); left in place, it made every
+/// later cast in the conversation skip that push, so a desk or `veil chat` that doesn't share the server's data dir
+/// never received those files. Deliberately narrower than supervisor.cleanCastMeta — that also deletes
 /// swarm.json (fine, deploy rewrites it) but ALSO mind.sqlite, the minds/ dirs, and .usage; a re-cast should
 /// KEEP the conversation's accumulated hive memory. Never touches work/ or any other user file.
-fn resetCastLifecycle(app: *App, arena: std.mem.Allocator, run_dir: []const u8) void {
-    const drops = [_][]const u8{ "STOP", "DONE", "control.jsonl", "worker.pid", "asks.jsonl", "veil_answered.jsonl" };
+pub fn resetCastLifecycle(app: *App, arena: std.mem.Allocator, run_dir: []const u8) void {
+    const drops = [_][]const u8{ "STOP", "DONE", "control.jsonl", "worker.pid", "asks.jsonl", "veil_answered.jsonl", ".filesync_done" };
     for (drops) |f| {
         const p = std.fmt.allocPrint(arena, "{s}/{s}", .{ run_dir, f }) catch continue;
         std.Io.Dir.cwd().deleteFile(app.io, p) catch {};
