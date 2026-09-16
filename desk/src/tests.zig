@@ -25,4 +25,7 @@ test {
     _ = @import("store.zig");
     _ = @import("theme.zig");
     _ = @import("watchdog.zig"); // the stall-detection timing rules, plus one real-thread, real-clock freeze and recovery
+    // Registered EXPLICITLY although httpc.zig imports it: its tests ran only because that import happened to
+    // be analysed (the assets.zig lesson above). The twin of src/worker/wsock.zig; the loopback socket client.
+    _ = @import("wsock.zig");
 }

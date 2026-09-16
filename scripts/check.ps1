@@ -209,6 +209,18 @@ if ($Scan) {
             Write-Host "[twins] httpc.zig twins in sync (below-header contract holds)" -ForegroundColor Green
         }
     }
+    #    wsock.zig is the stricter twin: the WHOLE files are identical, header included (one header speaks
+    #    for both packages). Nothing compared that pair before, so an edit to one copy raised no signal at
+    #    all. Keep this and check.sh's twin of it on the same rule.
+    $a = Join-Path $repo "src\worker\wsock.zig"; $b = Join-Path $repo "desk\src\wsock.zig"
+    if ((Test-Path $a) -and (Test-Path $b)) {
+        if ((Get-FileHash $a).Hash -ne (Get-FileHash $b).Hash) {
+            $signals++
+            Write-Host "[twins] wsock.zig twins differ (whole-file contract broken) -- make the two copies identical" -ForegroundColor Yellow
+        } else {
+            Write-Host "[twins] wsock.zig twins identical (whole-file contract holds)" -ForegroundColor Green
+        }
+    }
 
     # 3) version stamp drift across the hand-stamped locations.
     $vZon  = (Select-String -Path (Join-Path $repo "build.zig.zon") -Pattern '\.version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
