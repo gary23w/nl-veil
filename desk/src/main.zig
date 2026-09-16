@@ -5955,8 +5955,9 @@ fn flushDropdown() void {
         .chat_role => return, // owned by flushChatRoleDropdown (Chat tab composer)
         else => {},
     }
-    // Build the option labels + current index for the open kind.
-    var labels: [16][]const u8 = undefined;
+    // Build the option labels + current index for the open kind. The provider and model loops below write
+    // unguarded, which is safe only because catalog.zig refuses to compile a catalog bigger than this array.
+    var labels: [catalog.DEPLOY_MENU_ROWS][]const u8 = undefined;
     var count: usize = 0;
     var current: usize = 0;
     const prov = &catalog.providers[ui.d_provider];
@@ -6048,9 +6049,9 @@ fn flushSchedDropdown() void {
     if (ui.open_dd != .sched_model) return;
     // label backing storage lives for the whole call (drawList borrows these slices) — same stack-buffer
     // idiom flushChatDropdown uses for its live Cloudflare list.
-    var namebuf: [128][96]u8 = undefined;
-    var labels: [128][]const u8 = undefined;
-    var pmap: [128]struct { p: usize, m: usize } = undefined;
+    var namebuf: [catalog.TASKS_MENU_ROWS][96]u8 = undefined;
+    var labels: [catalog.TASKS_MENU_ROWS][]const u8 = undefined;
+    var pmap: [catalog.TASKS_MENU_ROWS]struct { p: usize, m: usize } = undefined;
     labels[0] = "(your chat model - default)";
     var count: usize = 1;
     var current: usize = 0;
@@ -8668,7 +8669,7 @@ fn flushChatDropdown(store: *Store) void {
     @memcpy(cf_lens[0..cf_n], store.cf_model_lens[0..cf_n]);
     store.unlock();
 
-    var labels: [64][]const u8 = undefined;
+    var labels: [catalog.CHAT_MENU_ROWS][]const u8 = undefined;
     var count: usize = 0;
     var current: usize = 0;
     var byok_idx: [16]usize = undefined;

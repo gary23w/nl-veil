@@ -27,6 +27,29 @@ pub const providers = modelcfg.providers;
 /// Model defaults (local + Cloudflare) sourced from models.yaml, for the "no model chosen" fallbacks.
 pub const defaults = modelcfg.defaults;
 
+/// ROW CAPACITY of the desk's model menus — main.zig builds each list into a fixed stack array this long.
+/// Settings and Tasks stop drawing at the last row, so an oversized catalog silently loses whatever models.yaml
+/// lists LAST (Workers AI first, then the built-in engine); the Swarm deploy menu has no stop at all and would write
+/// past its array. So the comptime block below refuses to compile a catalog that outgrows any of them, in
+/// every desk build, not just under `zig build test`. scripts/sync-models.py grows the catalog on a schedule:
+/// these are the limits its KEEP lives inside.
+pub const DEPLOY_MENU_ROWS = 32; // Swarm deploy: "default (your chat model)" + every provider, or one provider's models
+pub const CHAT_MENU_ROWS = 64; // Settings: one provider's models
+pub const TASKS_MENU_ROWS = 128; // Tasks override: its "(your chat model - default)" row + EVERY provider's models
+
+comptime {
+    var tasks_rows: usize = 1;
+    for (providers) |p| {
+        tasks_rows += p.models.len;
+        if (p.models.len > @min(DEPLOY_MENU_ROWS, CHAT_MENU_ROWS))
+            @compileError(std.fmt.comptimePrint("models.yaml: '{s}' lists {d} models, more than a desk model menu holds ({d})", .{ p.key, p.models.len, @min(DEPLOY_MENU_ROWS, CHAT_MENU_ROWS) }));
+    }
+    if (providers.len + 1 > DEPLOY_MENU_ROWS)
+        @compileError(std.fmt.comptimePrint("models.yaml: {d} providers + the default row outgrow the Swarm deploy menu ({d})", .{ providers.len, DEPLOY_MENU_ROWS }));
+    if (tasks_rows > TASKS_MENU_ROWS)
+        @compileError(std.fmt.comptimePrint("models.yaml: {d} Tasks menu rows (every model + the default row), more than it holds ({d})", .{ tasks_rows, TASKS_MENU_ROWS }));
+}
+
 /// Resolve a provider's base_url. If the template carries the "{account}" placeholder (Cloudflare Workers AI),
 /// substitute the account id into `out` and return that slice; with no account id, return the "cloudflare"
 /// sentinel so the server falls back to its own included/env credentials. Non-templated URLs pass through.
