@@ -8421,10 +8421,10 @@ fn carryWrittenFile(app: *App, conv_dir: []const u8, workdir: []const u8, ctrl_c
     if (!built) return cfText(gpa, "(engine: {s} landed in the server's copy of the workdir, but it could not be sent to the user's machine — out of memory)", .{rel});
     emitEvent(app, conv_dir, ev.items);
 
-    // READ IT BACK. file_sync is fire-and-forget: a client that is not writing pushed files for this
-    // conversation (the desk skips them for a conversation that is not on screen) would otherwise leave the model
-    // reporting a file that is not there. Clients handle frames in order, so this answer is read from the disk
-    // after the push was applied.
+    // READ IT BACK. file_sync is fire-and-forget, with no answer: a client whose write failed, or one that does not
+    // apply this conversation's pushes (desks before the background-sync fix skipped them for a conversation that
+    // was not on screen), would otherwise leave the model reporting a file that is not there. Clients handle frames
+    // in order, so this answer is read from the disk after the push was applied.
     var want: std.ArrayListUnmanaged(u8) = .empty;
     defer want.deinit(gpa);
     http.jstr(gpa, &want, sp) catch return null;
@@ -8479,8 +8479,8 @@ const TestSyncClient = struct {
     io: std.Io,
     conv_dir: []const u8,
     folder: []const u8,
-    /// false = a client that answers sync requests but drops pushed files, as the desk does for a conversation
-    /// that is not the one on screen
+    /// false = a client that answers sync requests but never writes a pushed file (a failed write, or a desk from
+    /// before the background-sync fix, which skipped pushes for a conversation that was not on screen)
     apply_pushes: bool = true,
     stopping: std.atomic.Value(bool) = .init(false),
     thread: ?std.Thread = null,
