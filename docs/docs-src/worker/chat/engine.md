@@ -90,7 +90,7 @@ When the chat call still fails with its provider's budget spent (`llm.retryExhau
 
 - One in-flight turn per conversation. `tryBeginTurn` claims the slot (so `postMessage` can answer `409` before persisting anything); `spawnTurn` fires the turn on a raw detached thread and owns releasing the slot on every completion path.
 - The turn runs off the httpz worker thread and writes frames to `events.jsonl` as it goes, so the client streams live via `/events` instead of blocking on one long response.
-- Raw-thread sleeps (`sleepMsRaw`, Win32 `Sleep` on Windows) because `io.sleep` throws on a non-Io thread and a swallowed error would busy-spin a core.
+- Raw-thread sleeps (`sleepMsRaw`, Win32 `Sleep` on Windows) because `io.sleep` throws on a non-Io thread and a swallowed error would busy-spin a core. The turn's pulse thread (`Pulse.run`) sleeps through it too: on Windows `io.sleep` parks a plain thread on the runtime's per-thread alert, and a stray alert there is undefined behaviour in the ReleaseFast build.
 
 ## Dependencies
 

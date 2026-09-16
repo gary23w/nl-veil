@@ -26,6 +26,7 @@ One switch makes this server reachable at a Cloudflare URL. Turning it on finds 
 - `httpz` + `../gateway/http.zig` — `App` (`cf_api_root`, `open_registration`, vault, auth), `requireUser`, `requireAdmin`, `badReq`, `jstr`
 - `cf_oauth.zig` — `resolveToken` (bearer + account id), `readProfile` (the email Access admits), `apiCall` (curl with the bearer in a `-K` file), `CF_PROVIDER`
 - `../worker/modelpull.zig` — `sha256HexOfFile` for a fetched connector
+- `../worker/browser/util.zig` — `sleepMs` for every wait on the tunnel's plain threads (the log watch, the publish probe, the stop poll, the boot delay). Not `io.sleep`: on Windows that parks the thread on the Io runtime's per-thread alert, and a stray alert there is undefined behaviour in the ReleaseFast build.
 - External processes: `cloudflared`, `curl` (release download and the DNS-over-HTTPS probe), `tar` for the macOS archive, `tasklist`/`taskkill` on Windows and `kill` elsewhere
 
 ## Usage Context
