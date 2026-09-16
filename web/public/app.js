@@ -394,7 +394,8 @@ function themeIcon() {
      - Workers AI as the chat provider, with the MODEL LIST SYNCED LIVE from the account
        (/oauth/cloudflare/models) — the static catalog only ever shows the one bootstrap default;
      - an R2 backup bucket ("nl-veil") the server provisions in the USER'S account and mirrors
-       their chats/memories/tasks into (src/config/cf_r2.zig);
+       their chats and durable memories into (src/config/cf_r2.zig) — never the scheduled-task
+       files, which hold real provider keys on disk;
      - a profile (account name, user name/email) every surface can show as "signed in as".
    Three surfaces render from the same S.cf state: the Settings section, the chat sidebar's
    profile card, and the Dashboard panel. */
