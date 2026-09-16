@@ -1,0 +1,102 @@
+name: models-sync
+
+# Daily: pull each opted-in provider's newest models from models.dev into the `# >>> synced` blocks of
+# models.yaml (and their mirror in web/public/models.json), run the acceptance gates, and open or refresh ONE
+# pull request. What qualifies, and what is never touched, lives in scripts/sync-models.py. Nothing lands on
+# main without a merge, and nothing reaches users before the next release: both binaries embed the catalog
+# at comptime.
+#
+# NO API KEYS: the job reads no provider secret and sends no credential anywhere. models.dev proposes a model and
+# a free public source must confirm it — the provider's own GET /models where that answers without a key, else
+# its docs page, LiteLLM's open catalog or a public model page (the `sync:` lines in models.yaml).
+#
+# ONE-TIME SETUP: Settings -> Actions -> General -> Workflow permissions -> tick "Allow GitHub Actions to
+# create and approve pull requests". Without it the branch still pushes but `gh pr create` is refused.
+
+on:
+  schedule:
+    - cron: '41 6 * * *' # daily 06:41 UTC, off the hour, where scheduled runs queue longest
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: models-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      BRANCH: bot/models-sync
+      TITLE: 'models: sync the newest models from models.dev'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Sync from models.dev
+        run: |
+          python3 scripts/sync-models.py --summary "$RUNNER_TEMP/models-sync.md"
+          cat "$RUNNER_TEMP/models-sync.md" >> "$GITHUB_STEP_SUMMARY"
+
+      # changed: the result differs from main. fresh: the sync branch already carries exactly this result, so
+      # there is nothing to push. That keeps a quiet day from force-pushing, and a sync PR someone CLOSED
+      # stays closed until upstream actually moves (reject a model for good in scripts/sync-models.ignore).
+      - name: Compare with main and the sync branch
+        id: diff
+        run: |
+          if git diff --quiet -- models.yaml web/public/models.json; then changed=false; else changed=true; fi
+          fresh=false
+          if git fetch --quiet --depth=1 origin "$BRANCH" 2>/dev/null \
+            && git diff --quiet FETCH_HEAD -- models.yaml web/public/models.json; then fresh=true; fi
+          echo "changed=$changed fresh=$fresh"
+          echo "changed=$changed" >> "$GITHUB_OUTPUT"
+          echo "fresh=$fresh" >> "$GITHUB_OUTPUT"
+
+      # The desk suite links raylib, so its GL/X11 headers come first (the same list release.yml installs).
+      - name: Linux desktop deps (raylib GL/X11/wayland)
+        if: steps.diff.outputs.changed == 'true' && steps.diff.outputs.fresh == 'false'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgl1-mesa-dev libx11-dev libxrandr-dev \
+            libxinerama-dev libxcursor-dev libxi-dev libwayland-dev libxkbcommon-dev
+
+      - uses: mlugg/setup-zig@v2
+        if: steps.diff.outputs.changed == 'true' && steps.diff.outputs.fresh == 'false'
+        with: { version: 0.16.0 }
+
+      # A pull request made with this job's token triggers no other workflow, so nothing would gate it after
+      # it opens. The gates run here instead, and a sync that breaks one never becomes a PR: the run goes red.
+      - name: acceptance gates (scripts/check.sh)
+        if: steps.diff.outputs.changed == 'true' && steps.diff.outputs.fresh == 'false'
+        run: sh scripts/check.sh
+
+      - name: Open or refresh the pull request
+        if: steps.diff.outputs.changed == 'true' && steps.diff.outputs.fresh == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git switch -C "$BRANCH"
+          git add models.yaml web/public/models.json
+          git commit -m "$TITLE"
+          git push --force origin "$BRANCH"
+          body="$RUNNER_TEMP/models-sync.md"
+          printf '\nGates: `sh scripts/check.sh` passed on [the run that pushed this](%s).\n' \
+            "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" >> "$body"
+          if [ "$(gh pr list --head "$BRANCH" --state open --json number --jq length)" = 0 ]; then
+            gh pr create --base main --head "$BRANCH" --title "$TITLE" --body-file "$body"
+          else
+            gh pr edit "$BRANCH" --body-file "$body"
+          fi
+
+      - name: Close the sync PR once main already matches
+        if: steps.diff.outputs.changed == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "$(gh pr list --head "$BRANCH" --state open --json number --jq length)" != 0 ]; then
+            gh pr close "$BRANCH" --comment 'main already carries this sync result.'
+          fi

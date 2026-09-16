@@ -1,0 +1,8 @@
+# Models the daily sync (scripts/sync-models.py) must never add to models.yaml.
+#
+# One per line: <provider key> <model id>. Either may be an fnmatch glob; * also matches across "/".
+# Anything after a # is a comment — say why, so the next reader does not un-ignore it.
+# Rejecting a synced model frees its slot: the next run fills it with the next-newest release.
+
+# A policy classifier (it labels content against a written safety policy), not a chat brain.
+* openai/gpt-oss-safeguard-*

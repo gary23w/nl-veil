@@ -560,10 +560,16 @@ test "moonshot (Kimi) provider: first-party API, kimi-k3 flagship first, OpenAI-
     try std.testing.expect(p.needs_key and !p.keyless and !p.local and !p.needs_account);
     try std.testing.expectEqualStrings("kimi-k3", p.models[0].id); // flagship = the provider's default model
     try std.testing.expectEqualStrings("Kimi K3 (flagship, 1M ctx)", p.models[0].label);
-    // exactly the four ids the live API serves (GET /v1/models, 2026-07-17) — the catalog once listed the
-    // legacy moonshot-v1-* line and kimi-k2.5, which the API rejects with "Not found the model or Permission
-    // denied"; a catalog entry that can't complete a request is worse than none.
-    try std.testing.expectEqual(@as(usize, 4), p.models.len);
+    // the four hand-written ids the live API serves (GET /v1/models, 2026-07-17) lead the list. The catalog once
+    // listed the legacy moonshot-v1-* line and kimi-k2.5, which the API rejects with "Not found the model or
+    // Permission denied"; a catalog entry that can't complete a request is worse than none. That used to be
+    // pinned as a count of exactly 4, but scripts/sync-models.py now appends newer releases after these, so
+    // the dead ids are pinned out by name instead.
+    try std.testing.expect(p.models.len >= 4);
+    for (p.models) |m| {
+        try std.testing.expect(!std.mem.startsWith(u8, m.id, "moonshot-v1-"));
+        try std.testing.expect(!std.mem.eql(u8, m.id, "kimi-k2.5"));
+    }
     // a dotted id survives the bare-scalar parse (no quoting needed)
     try std.testing.expectEqualStrings("kimi-k2.7-code", p.models[1].id);
     try std.testing.expectEqualStrings("kimi-k2.7-code-highspeed", p.models[2].id);
