@@ -26,6 +26,7 @@ Every model call the worker makes goes through this client. It loads no models: 
 
 - `worker/httpc` — the in-process raw-socket HTTP client for loopback backends
 - `worker/rate` — rate limiting
+- `worker/browser/util.zig` — `sleepMs` for the stream tail loop's 20 ms poll and `retryWait`'s quarter-second slices. Not `io.sleep`: on Windows that parks a plain thread (the chat turn's) on the Io runtime's per-thread alert, and a stray alert there is undefined behaviour in the ReleaseFast build. The poll keeps its pace (~31 ms a lap at the default timer tick, either sleep).
 - `curl` (child process) — hosted TLS transport only; key via `-K` config file
 
 ## Usage Context
