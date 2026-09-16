@@ -8,7 +8,7 @@
 
 ## Purpose Summary
 
-Spawning curl.exe put the bearer token and full JSON body on the command line (readable by any same-user process on Windows), and the spawn pattern — a self-built binary forking curl to POST bearer JSON at localhost on a few-second cadence — is exactly what Defender's behavior/ML models flag; it killed the app on unexcluded machines. In-process sockets have no argv, no child, and no per-call cost. Unlike the earlier raw-socket client that trusted `Connection: close` and read to EOF unbounded, this one parses real HTTP framing AND races the whole round trip against a sleeper, so `timeout_s` is a hard ceiling exactly like `curl --max-time`. Anything non-loopback (hosted TLS providers, web fetches) stays on curl.
+Spawning curl.exe put the bearer token and full JSON body on the command line (readable by any same-user process on Windows), and the spawn pattern — a self-built binary forking curl to POST bearer JSON at localhost on a few-second cadence — is exactly what Defender's behavior/ML models flag; it killed the app on unexcluded machines. In-process sockets have no argv, no child, and no per-call cost. Unlike the earlier raw-socket client that trusted `Connection: close` and read to EOF unbounded, this one parses real HTTP framing AND bounds the whole round trip, so `timeout_s` is a hard ceiling exactly like `curl --max-time`: on Windows a loopback or IPv4-literal request runs on one socket under one deadline (`wsock.zig`), and anything else races against a sleeper. Anything non-loopback (hosted TLS providers, web fetches) stays on curl.
 
 ## Key Exports
 
@@ -22,7 +22,7 @@ Spawning curl.exe put the bearer token and full JSON body on the command line (r
 ## Dependencies
 
 - `std` — `std.Io` sockets, `Io.Select` for the timeout race.
-- [`wsock.zig`](#doc=worker/wsock) — on Windows, a loopback or IPv4-literal host goes through one blocking Winsock socket with send/receive timeouts instead of the `Io` race (the 2026-09-02 thread-parking fix); a DNS name keeps the portable path.
+- [`wsock.zig`](#doc=worker/wsock) — on Windows, a loopback or IPv4-literal host goes through one blocking Winsock socket under one wall-clock deadline covering connect, send and receive, instead of the `Io` race (the 2026-09-02 thread-parking fix); a DNS name keeps the portable path.
 
 ## Usage Context
 

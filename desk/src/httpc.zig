@@ -10,11 +10,13 @@
 //! JSON at localhost on the poller's cadence — is exactly what Defender's behavior/ML models flag. In-process
 //! sockets have no argv and no child process.
 //!
-//! Timeout is a HARD ceiling. This client parses real HTTP framing — status line, headers, Content-Length or
-//! chunked — so a well-behaved reply completes without waiting for close, and races the whole round trip
-//! against an Io sleeper (`Io.Select`): `timeout_s` bounds connect+send+recv like curl --max-time.
-//! Cancellation reaches a blocked read on every backend (on Windows the Threaded Io cancels the pending AFD
-//! receive), so a wedged server surfaces as `.timed_out`, not a frozen thread. (A predecessor raw-socket
+//! Timeout is a HARD ceiling on the whole round trip, like curl --max-time. This client parses real HTTP
+//! framing — status line, headers, Content-Length or chunked — so a well-behaved reply completes without
+//! waiting for close. On Windows a loopback or IPv4-literal request (the desk's own server, or a veil named
+//! by address) runs on one blocking socket under one wall-clock deadline covering connect, send and receive
+//! (wsock.zig). Anything else races the round trip against an Io sleeper (`Io.Select`), and cancellation
+//! reaches a blocked read on every backend (on Windows the Threaded Io cancels the pending AFD receive).
+//! Either way a wedged server surfaces as `.timed_out`, not a frozen thread. (A predecessor raw-socket
 //! client read to EOF with no time bound, so a keep-alive server blocked the chat thread forever.)
 
 const std = @import("std");
@@ -64,9 +66,10 @@ pub fn request(io: Io, gpa: std.mem.Allocator, req: Req) Result {
     // io.async degrades to inline-on-caller: the freeze. Bonus: in that degraded inline case the flag is
     // already set when the timer leg runs on the caller, so it returns at once instead of sleeping the
     // whole timeout after the request already completed.
-    // WINDOWS, LOOPBACK OR AN IPv4 LITERAL: one blocking socket with SO_RCVTIMEO / SO_SNDTIMEO instead of the
-    // race below. The race parks the calling thread on the runtime's per-thread alert, and that alert is what
-    // wedged the desk's worker threads on 2026-09-02 - see wsock.zig. A DNS name keeps the portable path.
+    // WINDOWS, LOOPBACK OR AN IPv4 LITERAL: one blocking socket under one deadline (a select-bounded connect, then
+    // SO_SNDTIMEO / SO_RCVTIMEO set to the time left) instead of the race below. The race parks the calling thread
+    // on the runtime's per-thread alert, and that alert is what wedged the desk's worker threads on 2026-09-02 -
+    // see wsock.zig. A DNS name keeps the portable path.
     if (builtin.os.tag == .windows) {
         if (wsock.ip4Of(req.host)) |ip| {
             switch (wsock.roundTrip(gpa, ip, req.port, req_bytes, req.timeout_s, req.cap)) {
