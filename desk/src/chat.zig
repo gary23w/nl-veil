@@ -1920,6 +1920,10 @@ pub const Chat = struct {
             // contract as the foreground handler; the executor is shared, so a background cancel matters)
             const id = scRawField(line, "id") orelse return false;
             self.cancelDelegated(dd, id);
+        } else if (std.mem.eql(u8, kind, "memory")) {
+            // the store is global, not this conversation's: a background turn's REMEMBER:/FORGET: shows in the
+            // Memory tab as it lands, the same as a foreground one
+            self.refreshMemory(dd);
         } else if (std.mem.eql(u8, kind, "done")) {
             return true;
         }
@@ -2173,8 +2177,17 @@ pub const Chat = struct {
             self.recordLlmFrame(line);
             return;
         }
+        if (std.mem.eql(u8, kind, "memory")) {
+            // The server applied REMEMBER:/FORGET: directives mid-turn: re-read the store it writes NOW, so the
+            // Memory tab (and the desk-brain's YOUR MEMORY block) show the change as it happens. The tab used to
+            // load once at startup and after its own edits only — a fact the veil had just kept stayed invisible
+            // until the next restart, however many turns went by, and the card the user watched for never came.
+            self.refreshMemory(dd);
+            return;
+        }
         if (std.mem.eql(u8, kind, "done")) {
             self.recordServerMetric(); // one perf sample per server turn — keeps the Metrics tab live server-side
+            self.refreshMemory(dd); // a memory frame missed mid-turn (a reconnect, a cursor skip) is caught up here
             self.scClearStream(); // any unsealed preview is stale now
             self.setServerActive(false);
             self.setBusy(false);
@@ -9008,6 +9021,50 @@ test "the Memory tab reads the store the server writes: the per-user file once i
     defer std.testing.allocator.free(with);
     try std.testing.expect(std.mem.indexOf(u8, with, "\"deploys to us-west-2\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, legacy_after, "us-west-2") == null);
+}
+
+test "the Memory tab follows the server: a memory frame re-reads the store mid-turn, foreground or background, and {done} catches up" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{ .environ = llm.osEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dd = "zig-memframe-tmp";
+    Io.Dir.cwd().deleteTree(io, dd) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dd) catch {};
+    _ = Io.Dir.cwd().createDirPathStatus(io, dd ++ "/u1/.veil-desk", .default_dir) catch {};
+    const mine = dd ++ "/u1/.veil-desk/memories.jsonl";
+    const l1 = "{\"cat\":\"fact\",\"text\":\"User's name is Gary\"}\n";
+    const l2 = "{\"cat\":\"fact\",\"text\":\"Gary is 34 years old\"}\n";
+    const l3 = "{\"cat\":\"preference\",\"text\":\"deploys to us-west-2\"}\n";
+    const l4 = "{\"cat\":\"login\",\"text\":\"forum user is gary\"}\n";
+    Io.Dir.cwd().writeFile(io, .{ .sub_path = mine, .data = l1 }) catch unreachable;
+    var store = std.testing.allocator.create(Store) catch unreachable;
+    defer std.testing.allocator.destroy(store);
+    store.* = .{};
+    @memcpy(store.settings.data_dir[0..dd.len], dd);
+    store.settings.data_dir_len = dd.len;
+    var chat = std.testing.allocator.create(Chat) catch unreachable;
+    defer std.testing.allocator.destroy(chat);
+    chat.* = .{ .io = io, .gpa = std.testing.allocator, .store = store };
+    chat.refreshMemory(dd);
+    try std.testing.expectEqual(@as(usize, 1), store.chat_mem_count);
+
+    // the server writes a second fact (the engine's REMEMBER: path) — the tab does not poll the file...
+    Io.Dir.cwd().writeFile(io, .{ .sub_path = mine, .data = l1 ++ l2 }) catch unreachable;
+    try std.testing.expectEqual(@as(usize, 1), store.chat_mem_count);
+    // ...it re-reads on the server's memory frame, foreground
+    chat.renderScFrame(dd, "{\"kind\":\"memory\",\"text\":\"updated\"}");
+    try std.testing.expectEqual(@as(usize, 2), store.chat_mem_count);
+    try std.testing.expectEqualStrings("Gary is 34 years old", store.chat_mem[1].textStr());
+
+    // and for a conversation the user switched away from (the store is global, not the conversation's)
+    Io.Dir.cwd().writeFile(io, .{ .sub_path = mine, .data = l1 ++ l2 ++ l3 }) catch unreachable;
+    try std.testing.expect(!chat.serviceBgFrame(dd, "cbg", "{\"kind\":\"memory\",\"text\":\"updated\"}"));
+    try std.testing.expectEqual(@as(usize, 3), store.chat_mem_count);
+
+    // a frame missed mid-turn is caught up by the turn's {done}
+    Io.Dir.cwd().writeFile(io, .{ .sub_path = mine, .data = l1 ++ l2 ++ l3 ++ l4 }) catch unreachable;
+    chat.renderScFrame(dd, "{\"kind\":\"done\"}");
+    try std.testing.expectEqual(@as(usize, 4), store.chat_mem_count);
 }
 
 fn stripDanglingMemoryIntro(text: []const u8) []const u8 {
