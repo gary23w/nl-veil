@@ -22,9 +22,19 @@ pub const Reply = struct {
     status: u16 = 0,
 };
 
-/// A status frame per retry wait, when the engine registers one: the desk then shows "provider busy (HTTP
-/// 429): retrying in 20s (2/3)" instead of a silent pause. llm.zig has no conversation of its own.
+/// A status frame per retry wait, when the engine registers one: the desk then shows "provider failed (HTTP
+/// 429: rate limited): retrying in 20s (4/10)" instead of a silent pause. llm.zig has no conversation of its own.
 pub var retry_notify: ?*const fn (text: []const u8) void = null;
+
+/// The engine's chance to hand a retry a FRESH credential for the endpoint. An OAuth access token that
+/// expires mid-turn answers every retry made with the key the turn started with the same way (Cloudflare:
+/// HTTP 401, code 10000 "Authentication error"); the token re-resolved - refreshed - is the only retry that
+/// can land. Returns a gpa-owned key that DIFFERS from `key`, or null (same credential, or none to give).
+pub var retry_rekey: ?*const fn (gpa: std.mem.Allocator, base_url: []const u8, key: []const u8) ?[]const u8 = null;
+
+/// Polled between the slices of a retry wait: true ends the ladder at once (a chat Stop) and the failure
+/// surfaces, instead of the wait running out first.
+pub var retry_abort: ?*const fn () bool = null;
 
 fn notify(text: []const u8) void {
     if (retry_notify) |f| f(text);
@@ -50,9 +60,207 @@ pub fn clearLastError() void {
     last_err_len = 0;
 }
 
-/// The waits between transient-failure retries, in seconds: three tries, a minute in all. A rate limit that
-/// outlasts this is reported; the turn then continues or ends as it did before.
-const RETRY_WAITS_S = [_]u64{ 10, 20, 30 };
+/// THE RETRY BUDGET OF A CHAT TURN. A hosted model call that fails - with ANY error the provider or the
+/// transport returns - is retried, up to RETRY_MAX times in a row, and only then does the failure surface
+/// (the chat call's failure ends the turn; an auxiliary call's failure degrades as it always did). The count
+/// is per provider (base_url + model) and per turn: a provider's consecutive failures spend it, a reply from
+/// that provider restores it, and the turn's other providers keep their own. So a provider that is down for
+/// good costs one ladder (five minutes and a bit) before every later call to it fails at once, a hiccup costs
+/// one wait, and a misconfigured auxiliary model cannot spend the coding model's retries.
+///
+/// The gate used to be "transient errors only, three tries": an HTTP 401 (Cloudflare code 10000
+/// "Authentication error" - an access token that expired mid-turn) read as a request error and ended the
+/// turn on its first reply, though the token's next resolve would have answered. Now every failure is
+/// retried, and the engine may re-resolve the credential before each retry (retry_rekey).
+///
+/// Armed by the engine for each turn (armRetries). A thread without a budget - the swarm's workers, a
+/// one-shot chat() - keeps the transient-only ladder below, whose failover lives in its callers; and a LOCAL
+/// endpoint keeps it too, on every thread: a loopback server is running or it is not, five minutes of
+/// retries cannot start it, and the honest connect error is the answer the user needs at once.
+pub const RETRY_MAX: u32 = 10;
+/// The wait before retry n, in seconds: quick for a blip, then slower for a rate limit or an outage that
+/// needs a minute to clear; 320 s in all.
+const RETRY_WAITS_S = [RETRY_MAX]u64{ 5, 10, 15, 20, 30, 30, 45, 45, 60, 60 };
+/// The unarmed ladder: three transient-only tries, a minute in all - the ladder every caller had before
+/// the turn budget existed.
+const RETRY_WAITS_TRANSIENT_S = [_]u64{ 10, 20, 30 };
+
+const RetrySlot = struct { provider: u64, left: u32 };
+/// Providers seen by the turn on this thread: a trio is three, a vision model a fourth; the oldest slot is
+/// reused past eight.
+const RETRY_SLOTS = 8;
+threadlocal var retry_armed: bool = false;
+threadlocal var retry_slots: [RETRY_SLOTS]RetrySlot = undefined;
+threadlocal var retry_slots_n: usize = 0;
+
+/// Arm this thread's retry budget for a turn: every provider starts with RETRY_MAX retries.
+pub fn armRetries() void {
+    retry_armed = true;
+    retry_slots_n = 0;
+}
+
+/// Disarm at turn exit, so a recycled thread never carries one turn's spent budget into the next.
+pub fn disarmRetries() void {
+    retry_armed = false;
+    retry_slots_n = 0;
+}
+
+fn providerId(base_url: []const u8, model: []const u8) u64 {
+    var h = std.hash.Wyhash.init(0x9e37);
+    h.update(base_url);
+    h.update(&[_]u8{0});
+    h.update(model);
+    return h.final();
+}
+
+/// The provider's slot on this thread, made with a full budget on first sight.
+fn retrySlot(base_url: []const u8, model: []const u8) *RetrySlot {
+    const id = providerId(base_url, model);
+    for (retry_slots[0..retry_slots_n]) |*s| if (s.provider == id) return s;
+    var at = retry_slots_n;
+    if (at < RETRY_SLOTS) {
+        retry_slots_n += 1;
+    } else {
+        std.mem.copyForwards(RetrySlot, retry_slots[0 .. RETRY_SLOTS - 1], retry_slots[1..RETRY_SLOTS]);
+        at = RETRY_SLOTS - 1;
+    }
+    retry_slots[at] = .{ .provider = id, .left = RETRY_MAX };
+    return &retry_slots[at];
+}
+
+/// Whether the budget applies to this call: an armed thread, a hosted endpoint.
+fn retryBudgeted(base_url: []const u8) bool {
+    return retry_armed and !isLocal(base_url);
+}
+
+/// A reply from the provider restores its budget: the count is of failures IN A ROW.
+fn noteProviderOk(base_url: []const u8, model: []const u8) void {
+    if (!retryBudgeted(base_url)) return;
+    retrySlot(base_url, model).left = RETRY_MAX;
+}
+
+/// The retries this provider has left on this thread; RETRY_MAX where no budget applies.
+pub fn retriesLeft(base_url: []const u8, model: []const u8) u32 {
+    if (!retryBudgeted(base_url)) return RETRY_MAX;
+    return retrySlot(base_url, model).left;
+}
+
+/// True when this provider spent its whole budget on this turn: the failure the caller holds is the one
+/// that came after RETRY_MAX retries, and an error frame should say so.
+pub fn retryExhausted(base_url: []const u8, model: []const u8) bool {
+    return retryBudgeted(base_url) and retrySlot(base_url, model).left == 0;
+}
+
+const RetryPlan = struct { wait_s: u64, n: u32, of: u32 };
+
+/// Whether to retry a failed call, and how long to wait first. Budgeted: any failure, while the provider has
+/// retries left, each one spending one (the wait climbs the ladder with the provider's position on it, so a
+/// call that inherits a half-spent budget waits the longer waits). Unbudgeted: a transient failure, up to
+/// three times per call. `attempt` counts this call's retries so far.
+fn retryPlan(base_url: []const u8, model: []const u8, attempt: usize, err_text: []const u8) ?RetryPlan {
+    if (retryBudgeted(base_url)) {
+        const slot = retrySlot(base_url, model);
+        if (slot.left == 0) return null;
+        const used = RETRY_MAX - slot.left;
+        slot.left -= 1;
+        return .{ .wait_s = RETRY_WAITS_S[used], .n = used + 1, .of = RETRY_MAX };
+    }
+    if (attempt >= RETRY_WAITS_TRANSIENT_S.len or !isTransientLlmError(err_text)) return null;
+    return .{ .wait_s = RETRY_WAITS_TRANSIENT_S[attempt], .n = @intCast(attempt + 1), .of = RETRY_WAITS_TRANSIENT_S.len };
+}
+
+/// Sleep out a retry wait in quarter-second slices, asking retry_abort between them, so a chat Stop ends the
+/// wait within a slice instead of after a minute. False when aborted: the ladder stops and the failure surfaces.
+fn retryWait(io: std.Io, wait_s: u64) bool {
+    var left_ms: u64 = wait_s * 1000;
+    while (left_ms > 0) {
+        if (retry_abort) |f| if (f()) return false;
+        const slice: u64 = @min(left_ms, 250);
+        io.sleep(.{ .nanoseconds = slice * std.time.ns_per_ms }, .awake) catch break;
+        left_ms -= slice;
+    }
+    if (retry_abort) |f| if (f()) return false;
+    return true;
+}
+
+test "retryPlan: a budgeted provider retries any error ten times in a row, a reply restores it, providers are separate, local and unarmed keep the transient ladder" {
+    const saved_armed = retry_armed;
+    const saved_n = retry_slots_n;
+    defer {
+        retry_armed = saved_armed;
+        retry_slots_n = saved_n;
+    }
+    const auth = "HTTP 401: {\"result\":null,\"success\":false,\"errors\":[{\"code\":10000,\"message\":\"Authentication error\"}],\"messages\":[]}";
+    const cf = "https://api.cloudflare.com/client/v4/accounts/abc/ai/v1";
+    // unarmed: the three transient tries, and a request error is not retried at all
+    disarmRetries();
+    try std.testing.expect(retryPlan(cf, "m", 0, auth) == null);
+    const t0 = retryPlan(cf, "m", 0, "HTTP 429: rate limited").?;
+    try std.testing.expectEqual(@as(u64, 10), t0.wait_s);
+    try std.testing.expectEqual(@as(u32, 3), t0.of);
+    try std.testing.expectEqual(@as(u64, 30), retryPlan(cf, "m", 2, "HTTP 503: upstream").?.wait_s);
+    try std.testing.expect(retryPlan(cf, "m", 3, "HTTP 503: upstream") == null);
+    try std.testing.expectEqual(RETRY_MAX, retriesLeft(cf, "m"));
+    // armed: the 401 is retried, ten times, climbing the ladder
+    armRetries();
+    var i: u32 = 0;
+    while (i < RETRY_MAX) : (i += 1) {
+        const p = retryPlan(cf, "m", 0, auth).?; // attempt 0 every time: the budget, not the call, decides
+        try std.testing.expectEqual(RETRY_WAITS_S[i], p.wait_s);
+        try std.testing.expectEqual(i + 1, p.n);
+        try std.testing.expectEqual(RETRY_MAX, p.of);
+        try std.testing.expectEqual(RETRY_MAX - i - 1, retriesLeft(cf, "m"));
+    }
+    try std.testing.expect(retryPlan(cf, "m", 0, auth) == null);
+    try std.testing.expect(retryExhausted(cf, "m"));
+    // another model on the same host has its own budget, untouched
+    try std.testing.expectEqual(RETRY_MAX, retriesLeft(cf, "other"));
+    try std.testing.expect(!retryExhausted(cf, "other"));
+    try std.testing.expectEqual(@as(u64, 5), retryPlan(cf, "other", 0, "curl exit: (56)").?.wait_s);
+    // a reply restores the spent provider
+    noteProviderOk(cf, "m");
+    try std.testing.expectEqual(RETRY_MAX, retriesLeft(cf, "m"));
+    try std.testing.expect(!retryExhausted(cf, "m"));
+    // a local endpoint never draws on the budget, armed or not
+    try std.testing.expect(retryPlan("http://127.0.0.1:11434/v1", "m", 0, "connect refused") == null);
+    try std.testing.expectEqual(@as(u64, 10), retryPlan("http://localhost:1234/v1", "m", 0, "local model call timed out").?.wait_s);
+    try std.testing.expect(!retryExhausted("http://localhost:1234/v1", "m"));
+    // a ninth provider takes the oldest slot; the eight others keep theirs
+    var k: usize = 0;
+    while (k < RETRY_SLOTS) : (k += 1) {
+        var mb: [16]u8 = undefined;
+        _ = retryPlan(cf, std.fmt.bufPrint(&mb, "m{d}", .{k}) catch unreachable, 0, auth);
+    }
+    try std.testing.expectEqual(RETRY_SLOTS, retry_slots_n);
+    try std.testing.expectEqual(RETRY_MAX - 1, retriesLeft(cf, "m7"));
+    try std.testing.expectEqual(RETRY_MAX - 1, retriesLeft(cf, "m1")); // still here (the eviction above took the oldest)
+    try std.testing.expectEqual(RETRY_SLOTS, retry_slots_n);
+    disarmRetries();
+    try std.testing.expectEqual(@as(usize, 0), retry_slots_n);
+}
+
+test "retryWait: a Stop ends the wait at once, a clear hook sleeps it out" {
+    const Hooks = struct {
+        var stop: bool = false;
+        fn abort() bool {
+            return stop;
+        }
+    };
+    const saved = retry_abort;
+    defer retry_abort = saved;
+    retry_abort = &Hooks.abort;
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    Hooks.stop = true;
+    const t0 = std.Io.Timestamp.now(io, .real).nanoseconds;
+    try std.testing.expect(!retryWait(io, 60));
+    try std.testing.expect(std.Io.Timestamp.now(io, .real).nanoseconds - t0 < 5 * std.time.ns_per_s);
+    Hooks.stop = false;
+    try std.testing.expect(retryWait(io, 0));
+    retry_abort = null;
+    try std.testing.expect(retryWait(io, 0));
+}
 
 /// The body and status curl appended as "\n__VEILSTAT__<code>": the body's length and the code (0 if absent).
 fn splitStat(content: []const u8) struct { body_len: usize, code: u16 } {
@@ -68,6 +276,32 @@ fn splitStat(content: []const u8) struct { body_len: usize, code: u16 } {
 fn shortErr(msg: []const u8) []const u8 {
     const nl = std.mem.indexOfAny(u8, msg, "\r\n") orelse msg.len;
     return msg[0..@min(nl, 72)];
+}
+
+/// The head of an error for a status frame: the HTTP status and the provider's own message when the body
+/// carries one - "HTTP 401: Authentication error" for Cloudflare's envelope, whose 72 raw bytes end before
+/// the message begins - else the first line, clipped.
+fn errHead(buf: []u8, msg: []const u8) []const u8 {
+    if (std.mem.startsWith(u8, msg, "HTTP ")) status: {
+        const colon = std.mem.indexOfScalar(u8, msg, ':') orelse break :status;
+        const body = msg[colon + 1 ..];
+        const key = "\"message\":\"";
+        const at = std.mem.indexOf(u8, body, key) orelse break :status;
+        const val = body[at + key.len ..];
+        const end = std.mem.indexOfScalar(u8, val, '"') orelse break :status;
+        if (end == 0 or std.mem.indexOfScalar(u8, val[0..end], '\\') != null) break :status;
+        return std.fmt.bufPrint(buf, "{s}: {s}", .{ msg[0..colon], val[0..@min(end, 96)] }) catch break :status;
+    }
+    return shortErr(msg);
+}
+
+test "errHead: a provider envelope's message is named, anything else is the first line" {
+    var b: [160]u8 = undefined;
+    try std.testing.expectEqualStrings("HTTP 401: Authentication error", errHead(&b, "HTTP 401: {\"result\":null,\"success\":false,\"errors\":[{\"code\":10000,\"message\":\"Authentication error\"}],\"messages\":[]}"));
+    try std.testing.expectEqualStrings("HTTP 429: Too many requests", errHead(&b, "HTTP 429: {\"error\":{\"message\":\"Too many requests\",\"type\":\"rate\"}}"));
+    try std.testing.expectEqualStrings("HTTP 503: upstream unavailable", errHead(&b, "HTTP 503: upstream unavailable\nsecond line"));
+    try std.testing.expectEqualStrings("curl exit: (56) Recv failure", errHead(&b, "curl exit: (56) Recv failure"));
+    try std.testing.expectEqualStrings("HTTP 500: {\"message\":\"\"}", errHead(&b, "HTTP 500: {\"message\":\"\"}")); // an empty message: the raw head
 }
 
 /// REASONING OFF FOR THE AUXILIARY CALLS - LEARNED, NEVER HARDCODED. A compaction note, a loop verdict, a
@@ -811,32 +1045,39 @@ pub fn complete(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []
             step2.deinit(gpa);
         }
     }
-    // TRANSIENT-FAILURE RETRY: an HTTP 200 with an empty `choices` array, a rate-limit / overload error, or a
-    // transport failure is the provider hiccuping, not the request being wrong. Measured on Workers AI
-    // (scripts/sim/cfworld.py cf_deploy, ledger.py turn 1): one such reply ended a 17-tool turn one step short
-    // of its answer, and the whole turn's context had to be paid again to redo it. One retry after a short
-    // pause is the cheapest insurance there is — it fires only on a failure, never on the healthy path, and
-    // the streamed chat path reaches it too (streamAttempt falls back to complete on a broken stream).
-    // THE LADDER: 10, 20, 30 seconds. A single 1.5 s retry was no match for a rate limit that had just tripped
-    // (C1, 2026-09-02: three compaction calls failed after minutes of work and the next chat call failed two
-    // seconds later, three times, each one ending the turn). Each wait is announced as a status frame, and a
-    // 429 has already cooled the host down for every other turn (postUrl -> rate.note429).
+    // FAILURE RETRY: a failed call is retried after a wait, and the wait is announced as a status frame. On a
+    // thread with a turn budget (see RETRY_MAX) EVERY failure is retried - an HTTP 200 with an empty `choices`
+    // array, a rate limit, a transport drop, and just as much an authentication error or a rejected request:
+    // the provider's verdict on a request is not final while its credential can be re-resolved (retry_rekey)
+    // and its outage can end, and a turn that dies on the first "no" pays its whole context again to redo the
+    // work (measured on Workers AI: one such reply ended a 17-tool turn one step short of its answer; C1,
+    // 2026-09-02: three compaction calls failed after minutes of work and the next chat call failed two
+    // seconds later, three times, each one ending the turn). The streamed chat path reaches this too
+    // (streamAttempt falls back to complete on a broken stream). A 429 has already cooled the host down for
+    // every other turn (postUrl -> rate.note429), and a Stop pressed during a wait ends the ladder at once.
     var attempt: usize = 0;
-    while (!step.ok and attempt < RETRY_WAITS_S.len and isTransientLlmError(step.content)) : (attempt += 1) {
-        const wait_s = RETRY_WAITS_S[attempt];
+    var fresh_key: ?[]const u8 = null; // a re-resolved credential, kept for the rest of this call's retries
+    defer if (fresh_key) |k| gpa.free(k);
+    while (!step.ok) : (attempt += 1) {
+        const plan = retryPlan(base_url, model, attempt, step.content) orelse break;
+        var hb: [128]u8 = undefined;
         var nb: [240]u8 = undefined;
-        const note = std.fmt.bufPrint(&nb, "provider busy ({s}): retrying in {d}s ({d}/{d})", .{ shortErr(step.content), wait_s, attempt + 1, RETRY_WAITS_S.len }) catch "provider busy: retrying";
+        const note = std.fmt.bufPrint(&nb, "provider failed ({s}): retrying in {d}s ({d}/{d})", .{ errHead(&hb, step.content), plan.wait_s, plan.n, plan.of }) catch "provider failed: retrying";
         std.log.warn("llm[{s}/{s}] {s}", .{ tag, model, note });
         notify(note);
-        io.sleep(.{ .nanoseconds = wait_s * std.time.ns_per_s }, .awake) catch {};
-        const again = completeBody(gpa, io, run_dir, tag, base_url, key, model, body, mt);
-        if (again.ok) {
-            step.deinit(gpa);
-            return again;
+        if (!retryWait(io, plan.wait_s)) break; // stopped: the failure surfaces now
+        if (retry_rekey) |f| {
+            if (f(gpa, base_url, fresh_key orelse key)) |k| {
+                if (fresh_key) |old| gpa.free(old);
+                fresh_key = k;
+                std.log.warn("llm[{s}/{s}] retrying with a re-resolved credential", .{ tag, model });
+            }
         }
+        const again = completeBody(gpa, io, run_dir, tag, base_url, fresh_key orelse key, model, body, mt);
         step.deinit(gpa);
         step = again;
     }
+    if (step.ok) noteProviderOk(base_url, model);
     return step;
 }
 
@@ -900,9 +1141,11 @@ test "lastTopLevelJson: a curl --retry pair yields the retry's answer, a lone bo
     try std.testing.expectEqualStrings("not json at all", lastTopLevelJson("not json at all"));
 }
 
-/// The failure texts worth one retry: the provider answered, but with nothing (empty `choices`), or with a
-/// capacity complaint, or the transport dropped. A 4xx about the REQUEST (bad model, bad key, malformed
-/// body) is deliberately not on this list — repeating it would only repeat the answer.
+/// The failure texts the UNBUDGETED ladder retries (a thread without a turn budget, or a local endpoint -
+/// see RETRY_MAX): the provider answered, but with nothing (empty `choices`), or with a capacity complaint,
+/// or the transport dropped. A 4xx about the REQUEST (bad model, bad key, malformed body) is deliberately
+/// not on this list — repeating it there would only repeat the answer. A turn's budget retries these and
+/// everything else alike.
 fn isTransientLlmError(msg: []const u8) bool {
     const needles = [_][]const u8{ "no choices in LLM response", "bad LLM response", "could not route", "curl exit", "429", "rate limit", "rate_limit", "ratelimit", "rate-limit", "overloaded", "capacity", "temporar", "try again", "HTTP 5", "502", "503", "504", "too many", "timed out", "timeout", "Too Many Requests", "server error", "internal error", "upstream" };
     for (needles) |n| if (std.ascii.indexOfIgnoreCase(msg, n) != null) return true;
@@ -2918,6 +3161,7 @@ pub fn completeStream(
 ) Step {
     if (streamAttempt(gpa, io, run_dir, tag, base_url, key, model, messages_json, tools_json, max_tokens, temperature, ctx, on_delta, should_abort)) |step| {
         if (step.ok and step.reasoning.len > 0) noteReasons(io, model); // the answer is where reasoning is usually first seen
+        if (step.ok) noteProviderOk(base_url, model); // a streamed reply counts: the provider's failures in a row are over
         return step;
     }
     return complete(gpa, io, run_dir, tag, base_url, key, model, messages_json, tools_json, max_tokens, temperature);
