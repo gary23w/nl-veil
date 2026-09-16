@@ -90,6 +90,7 @@ const Fact = struct {
     r: f32 = 1.0, // radial: 0 = central hub (general), 1 = boundary leaf (specific)
     act: f32 = 0.0, // settled activation this pack
     deg: f32 = 0.0, // link-degree (Σ overlap with the rest of the field)
+    measured: bool = false, // deg/r were computed by a settle; a fact observed since has no degree yet, not a zero one
 };
 
 fn packLess(f: []const Fact, a: usize, b: usize) bool {
@@ -104,7 +105,6 @@ pub const Field = struct {
     cap: usize = DEFAULT_MAX_FACTS, // per-hardware field size (NL_HYPERSPACE_CAP); bounds RAM + settle cost
     warm: bool = false, // has been seeded from the store at least once
     deg_dirty: bool = true, // facts changed since the last hierarchy compute -> recompute degree/radial
-    settled: bool = false, // a settle() has run -> deg/r are meaningful for focus-independent eviction
 
     pub fn init(gpa: std.mem.Allocator) Field {
         return .{ .gpa = gpa };
@@ -120,18 +120,25 @@ pub const Field = struct {
     }
 
     /// Free fact at index k and drop its dedupe key (both, or the field leaks / mis-dedupes after eviction).
+    /// Ordered removal keeps the facts in arrival order, so index 0 is always the oldest — eviction depends on it.
+    /// (A swap-removal moved the NEWEST fact into the freed slot, and from the second pre-settle eviction on the
+    /// "oldest" victim was a fact that had just arrived.)
     fn evictAt(self: *Field, k: usize) void {
         const f = self.facts.items[k];
         _ = self.seen.remove(fnv(f.text));
         self.gpa.free(f.text);
         self.gpa.free(f.stems);
-        _ = self.facts.swapRemove(k); // order is irrelevant — pack() re-sorts
+        _ = self.facts.orderedRemove(k);
         self.deg_dirty = true;
     }
 
     /// Absorb ONE fact into the field the instant the swarm creates it in-process (zero subprocess). Deduped by
     /// content hash. At capacity it evicts a FOCUS-INDEPENDENT victim — the least-connected (most peripheral)
-    /// fact, so the general skeleton hubs survive — never a victim chosen by a stale previous focus's activation.
+    /// MEASURED fact, so the general skeleton hubs survive — never a victim chosen by a stale previous focus's
+    /// activation. A fact observed since the last settle reads deg 0 because nothing has measured it, not because
+    /// it is peripheral; ranked by that 0, each new fact was evicted the moment the next one arrived, so a burst
+    /// of findings between two settles kept only its last. With no measured fact (before the first settle, or once
+    /// a burst has displaced every measured one) the oldest fact goes, and the oldest wins a tie.
     pub fn observeLine(self: *Field, raw: []const u8) void {
         const trimmed = std.mem.trim(u8, raw, " \t\r\n");
         if (trimmed.len < 12) return; // skip fragments / headers
@@ -139,14 +146,12 @@ pub const Field = struct {
         const key = fnv(line);
         if (self.seen.contains(key)) return;
         if (self.facts.items.len >= self.cap) {
-            var victim: usize = 0;
-            if (self.settled) {
-                var lo: f32 = std.math.floatMax(f32);
-                for (self.facts.items, 0..) |fa, i| if (fa.deg < lo) {
-                    lo = fa.deg;
-                    victim = i;
-                };
-            } // else: pre-settle deg/r are 0 — evict the oldest (index 0) instead of a meaningless argmin
+            var victim: usize = 0; // nothing measured: the oldest
+            var lo: f32 = std.math.floatMax(f32);
+            for (self.facts.items, 0..) |fa, i| if (fa.measured and fa.deg < lo) {
+                lo = fa.deg;
+                victim = i;
+            };
             self.evictAt(victim);
         }
         const text = self.gpa.dupe(u8, line) catch return;
@@ -196,6 +201,7 @@ pub const Field = struct {
                     d += @floatFromInt(interCount(fa.stems, fb.stems));
                 }
                 fa.deg = d;
+                fa.measured = true; // deg/r now meaningful -> focus-independent eviction may rank this fact by them
                 if (d > maxdeg) maxdeg = d;
             }
             for (n) |*fa| fa.r = 1.0 - (fa.deg / maxdeg); // hubs -> center, leaves -> boundary
@@ -230,7 +236,6 @@ pub const Field = struct {
             };
             for (n, 0..) |*fa, i| fa.act = tmp[i] / mx;
         }
-        self.settled = true; // deg/r now meaningful -> focus-independent eviction may use them
     }
 
     /// Pack the settled field densely into `budget` bytes: rank by activation (+ a skeleton boost), greedily fill
@@ -344,4 +349,64 @@ test "eviction stays bounded, frees victims, and keeps the dedupe set consistent
     }
     try std.testing.expect(f.facts.items.len <= DEFAULT_MAX_FACTS);
     try std.testing.expect(f.seen.count() == f.facts.items.len); // evicted keys were removed, no unbounded growth
+}
+
+test "a full field that has never settled forgets its oldest facts first and keeps the rest in arrival order" {
+    const gpa = std.testing.allocator; // counts: every evicted fact must be freed
+    var f = Field.init(gpa);
+    defer f.deinit();
+    f.cap = MIN_FACTS;
+    const extra = 5;
+    var buf: [96]u8 = undefined;
+    var i: usize = 0;
+    while (i < MIN_FACTS + extra) : (i += 1) f.observeLine(try std.fmt.bufPrint(&buf, "arrival order fact number {d} about widgets and sprockets", .{i}));
+    try std.testing.expectEqual(MIN_FACTS, f.facts.items.len);
+    try std.testing.expect(f.seen.count() == f.facts.items.len);
+    // exactly the newest MIN_FACTS, oldest first: a swap-removal kept facts 1..4 here and evicted 15..18
+    for (f.facts.items, extra..) |fa, want| {
+        try std.testing.expectEqualStrings(try std.fmt.bufPrint(&buf, "arrival order fact number {d} about widgets and sprockets", .{want}), fa.text);
+    }
+}
+
+test "after a settle, a fact observed since is never evicted for a degree nobody measured: the least-connected measured fact goes, the oldest of a tie first" {
+    const gpa = std.testing.allocator;
+    const H = struct {
+        fn holds(field: *const Field, text: []const u8) bool {
+            for (field.facts.items) |fa| if (std.mem.eql(u8, fa.text, text)) return true;
+            return false;
+        }
+    };
+    var f = Field.init(gpa);
+    defer f.deinit();
+    f.cap = MIN_FACTS;
+    // a connected field (every hub shares six stems with every other) with one isolated leaf mid-field
+    var buf: [96]u8 = undefined;
+    var i: usize = 0;
+    while (i < MIN_FACTS - 1) : (i += 1) {
+        if (i == 5) f.observeLine("isolated quasar spectroscopy observation");
+        f.observeLine(try std.fmt.bufPrint(&buf, "connected hub fact {d} shares widgets gadgets sprockets", .{i}));
+    }
+    try std.testing.expectEqual(MIN_FACTS, f.facts.items.len);
+    gpa.free(f.pack("widgets gadgets", 400)); // the settle that measures every degree
+    // a burst of findings before the next settle: none may displace another on its unmeasured 0
+    const fresh = [_][]const u8{
+        "fresh finding one about the deploy pipeline region",
+        "fresh finding two about the deploy pipeline region",
+        "fresh finding three about the deploy pipeline region",
+    };
+    for (fresh) |fr| f.observeLine(fr);
+    try std.testing.expectEqual(MIN_FACTS, f.facts.items.len);
+    try std.testing.expect(f.seen.count() == f.facts.items.len);
+    for (fresh) |fr| try std.testing.expect(H.holds(&f, fr));
+    try std.testing.expect(!H.holds(&f, "isolated quasar spectroscopy observation")); // least connected: first out
+    try std.testing.expect(!H.holds(&f, "connected hub fact 0 shares widgets gadgets sprockets")); // then the tied hubs, oldest first
+    try std.testing.expect(!H.holds(&f, "connected hub fact 1 shares widgets gadgets sprockets"));
+    try std.testing.expect(H.holds(&f, "connected hub fact 2 shares widgets gadgets sprockets"));
+    // the shelter lasts only until a settle measures the newcomers: then they compete on degree like any fact —
+    // the fresh trio (degree 10 each) is now the least-connected cluster against the hubs (72), and its oldest goes
+    gpa.free(f.pack("widgets gadgets", 400));
+    f.observeLine("a fourth arrival names the quarterly budget review");
+    try std.testing.expect(!H.holds(&f, fresh[0]));
+    try std.testing.expect(H.holds(&f, fresh[1]) and H.holds(&f, fresh[2]));
+    try std.testing.expect(H.holds(&f, "a fourth arrival names the quarterly budget review"));
 }

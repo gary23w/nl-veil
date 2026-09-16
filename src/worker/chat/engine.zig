@@ -293,11 +293,16 @@ const LOOP_QUESTION =
     "must never fix, refactor or modify anything the user did not ask to change. A CLAIM OF WORK IS NOT WORK: " ++
     "if the goal required files to change or commands to run and the conversation above shows no tool result " ++
     "for it, the goal is NOT achieved whatever the assistant said - name the concrete step (the file to write, " ++
-    "the command to run). A DURABLE-MEMORY CHANGE IS NEVER A STEP: REMEMBER:/FORGET: lines are applied by the " ++
-    "engine the moment the assistant writes them, and an engine note in the conversation confirms it — never name " ++
-    "remembering or forgetting a fact, or editing the memory store, as the next step; if that is all that " ++
-    "remains, the goal is achieved. Reply with ONLY that next instruction, or reply exactly DONE if the goal is " ++
-    "fully achieved.";
+    "the command to run). " ++ LOOP_MEMORY_RULE ++ "; if that is all that remains, the goal is achieved. Reply " ++
+    "with ONLY that next instruction, or reply exactly DONE if the goal is fully achieved.";
+/// A MEMORY DIRECTIVE IS NEVER A DRIVE STEP, as both drive questions state it (the engine's own check sits under
+/// the drive inference and runs in every loop mode). Each question closes the rule for its tier: tier 1 counts a
+/// memory change that is all that remains as the goal achieved; afk has no achieved state, so there it is simply
+/// something already done. One constant, because the afk question once went without the rule its twin had.
+const LOOP_MEMORY_RULE =
+    "A DURABLE-MEMORY CHANGE IS NEVER A STEP: REMEMBER:/FORGET: lines are applied by the engine the moment the " ++
+    "assistant writes them, and an engine note in the conversation confirms it — never name remembering or " ++
+    "forgetting a fact, or editing the memory store, as the next step";
 /// The AFK drive question. afk was built as tier-1-plus-overrides: it asked "next step, or DONE", the model
 /// answered DONE, and the engine overrode that with a canned "keep going" — so every cycle the model reached a
 /// conclusion the loop then contradicted, and the only way to obey both was to invent more work. Observed live:
@@ -307,7 +312,8 @@ const LOOP_QUESTION =
 const LOOP_QUESTION_AFK =
     "This session runs until the human stops it, so there is no finished state to report and DONE is not an " ++
     "answer. Judge what has ALREADY been accomplished from the conversation above and do not redo or re-verify " ++
-    "it. What is the single most valuable next step — something not yet done? Reply with ONLY that instruction.";
+    "it. What is the single most valuable next step — something not yet done? " ++ LOOP_MEMORY_RULE ++ "; a " ++
+    "change the engine has confirmed is already done. Reply with ONLY that instruction.";
 
 /// POST-ANSWER CRITIQUE (was REFLECT): the THINKING model reviews the answer the user has ALREADY been given and
 /// may APPEND a short correction as its own separate message. It can never rewrite what was said.
@@ -2885,8 +2891,8 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     }
     // DURABLE USER MEMORY: inject the user's cross-conversation facts (keys/logins/preferences) from the shared
     // memories.jsonl — the desk's "YOUR MEMORY" block, which a server-served conv never had.
-    const durable_shown = injectDurableMemory(app, uid, &ws, compact_belt);
-    defer if (durable_shown) |d| gpa.free(d);
+    const durable_lines = injectDurableMemory(app, uid, &ws, compact_belt);
+    defer if (durable_lines) |d| gpa.free(d);
     // TOOL-PERFORMANCE DIGEST: a compact, learned note on which tools are slow or flaky on THIS machine, so the
     // agent plans around them (waits out a cold browser, avoids a 404-ing endpoint) instead of relearning each
     // run. Fixed within this turn (computed once), so it lives in the stable prefix like durable memory. Absent
@@ -3303,7 +3309,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
             scrubUtf8(wide);
             _ = o.seedBlock(wide, .conv);
         }
-        if (durable_shown) |d| _ = o.seedBlock(d, .durable);
+        if (durable_lines) |d| _ = o.seedBlock(d, .durable);
         var lb: std.ArrayListUnmanaged(u8) = .empty;
         defer lb.deinit(gpa);
         ledgerBlock(gpa, &file_ledger, &lb);
@@ -9798,18 +9804,6 @@ const CtlResult = enum { none, stop };
 // legacyMemoriesPath below.
 const MEM_INJECT_CAP = 96; // newest N durable memories injected (bounded prompt)
 
-const UTF8_BOM = "\xEF\xBB\xBF";
-
-/// One line of the durable store, trimmed — and freed of a UTF-8 byte-order mark. A BOM'd first line (an editor or
-/// a PowerShell `Out-File` puts one there) failed the `ln[0] == '{'` gate in every reader below, so the OLDEST
-/// memory in the store — this user's name, as it happened — was invisible to the prompt, to dedup and to FORGET:,
-/// and the forget rewrite copied the unparsed line through verbatim, so the mark outlived every rewrite.
-fn durableLine(raw: []const u8) []const u8 {
-    const ln = std.mem.trim(u8, raw, " \r\t");
-    if (std.mem.startsWith(u8, ln, UTF8_BOM)) return std.mem.trimStart(u8, ln[UTF8_BOM.len..], " \r\t");
-    return ln;
-}
-
 /// Append a durable fact as it may be SHOWN in a prompt: a credential value masked to [withheld], a short
 /// unmaskable secret reduced to its name (the head up to the colon). One policy for the YOUR MEMORY block and the
 /// engine's memory-update row. True when something was withheld.
@@ -9885,9 +9879,10 @@ fn readDurable(app: *App, uid: u64) ?[]u8 {
 }
 
 /// Inject the user's durable memory as a "YOUR MEMORY" system message right after the recall block. Additive: an
-/// absent/empty store leaves conv_buf unchanged. Returns the rendered block (gpa-owned; values already masked)
-/// so the recall overlay can seed from the SAME text the prompt shows — one masking policy — or null when
-/// nothing was injected.
+/// absent/empty store leaves conv_buf unchanged. Returns the block's memory LINES (gpa-owned; values already
+/// masked) so the recall overlay can seed from the SAME text the prompt shows — one masking policy — or null when
+/// nothing was injected. Only the lines: the header and the withheld-credentials footer frame the block but are not
+/// memories, and while the whole block was seeded each was a [durable] fact the overlay could offer as a recollection.
 fn injectDurableMemory(app: *App, uid: u64, ws: *wsp.Workspace, compact: bool) ?[]u8 {
     const gpa = app.gpa;
     const data = readDurable(app, uid) orelse return null;
@@ -9897,7 +9892,7 @@ fn injectDurableMemory(app: *App, uid: u64, ws: *wsp.Workspace, compact: bool) ?
     defer slices.deinit(gpa);
     var it = std.mem.splitScalar(u8, data, '\n');
     while (it.next()) |raw| {
-        const ln = durableLine(raw);
+        const ln = tools.durableLine(raw);
         if (ln.len > 0 and ln[0] == '{') slices.append(gpa, ln) catch break;
     }
     if (slices.items.len == 0) return null;
@@ -9905,6 +9900,7 @@ fn injectDurableMemory(app: *App, uid: u64, ws: *wsp.Workspace, compact: bool) ?
     var block: std.ArrayListUnmanaged(u8) = .empty;
     defer block.deinit(gpa);
     block.appendSlice(gpa, "YOUR MEMORY (durable facts this user asked you to keep across conversations — keys, logins, preferences, environment). Use them; do not re-REMEMBER what's already here:\n") catch return null;
+    const lines_from = block.items.len;
     const M = struct { cat: []const u8 = "", text: []const u8 = "" };
     var any = false;
     var withheld: usize = 0;
@@ -9930,6 +9926,7 @@ fn injectDurableMemory(app: *App, uid: u64, ws: *wsp.Workspace, compact: bool) ?
         injected += 1;
     }
     if (!any) return null;
+    const lines_to = block.items.len;
     // The footer must name only tools the caller's belt ACTUALLY advertises. It used to name get_credential
     // unconditionally — but SYSTEM_PROMPT_COMPACT deliberately drops that tool (see its doc comment) and the
     // compact belt does not carry it, while that same prompt tells the model "Those are ALL your tools". A
@@ -9939,7 +9936,7 @@ fn injectDurableMemory(app: *App, uid: u64, ws: *wsp.Workspace, compact: bool) ?
     // belt the honest instruction is to ask, which is also this tier's stated design intent.
     if (withheld > 0) block.appendSlice(gpa, if (compact) WITHHELD_FOOTER_COMPACT else WITHHELD_FOOTER_FULL) catch {};
     ws.bid(.durable_memory, "memories.jsonl", block.items, 0.90, 0, injected);
-    return block.toOwnedSlice(gpa) catch null;
+    return gpa.dupe(u8, block.items[lines_from..lines_to]) catch null;
 }
 
 /// True if `fact` (trimmed) is already stored — exact text match against the durable store (dedup).
@@ -9950,7 +9947,7 @@ fn durableMemoryHas(app: *App, uid: u64, fact: []const u8) bool {
     const M = struct { text: []const u8 = "" };
     var it = std.mem.splitScalar(u8, data, '\n');
     while (it.next()) |raw| {
-        const ln = durableLine(raw);
+        const ln = tools.durableLine(raw);
         if (ln.len == 0 or ln[0] != '{') continue;
         const p = std.json.parseFromSlice(M, gpa, ln, .{ .ignore_unknown_fields = true }) catch continue;
         defer p.deinit();
@@ -10004,7 +10001,7 @@ fn forgetDurableMemory(app: *App, uid: u64, match_in: []const u8) void {
     const M = struct { text: []const u8 = "" };
     var it = std.mem.splitScalar(u8, data, '\n');
     while (it.next()) |raw| {
-        const ln = durableLine(raw);
+        const ln = tools.durableLine(raw);
         if (ln.len == 0) continue;
         var drop = false;
         if (ln[0] == '{') {
@@ -10102,13 +10099,52 @@ test "the recall overlay rides one inference and leaves the working context byte
     try std.testing.expectEqualStrings(before, buf.items);
 }
 
+test "the overlay seeds the durable memory lines alone: the YOUR MEMORY header and the withheld footer stay prompt framing, never [durable] facts" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-durseed-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    var ta = try http.testApp(gpa, io, root);
+    defer ta.deinit();
+    const app = &ta.app;
+    var pb: [700]u8 = undefined;
+    const path = memoriesPath(app, 1, &pb) orelse return error.TestUnexpectedResult;
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, std.fs.path.dirname(path).?, .default_dir) catch {};
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "{\"cat\":\"fact\",\"text\":\"Gary is 34 years old\"}\n{\"cat\":\"key\",\"text\":\"GitHub personal access token: ghp_abc123abc123abc123abc123abc123\"}\n" }) catch return error.TestUnexpectedResult;
+    for ([_]bool{ false, true }) |compact| {
+        var ws = wsp.Workspace.init(gpa);
+        defer ws.deinit();
+        const lines = injectDurableMemory(app, 1, &ws, compact) orelse return error.TestUnexpectedResult;
+        defer gpa.free(lines);
+        // the prompt is unchanged: the workspace is still bid the whole block, framing and all
+        try std.testing.expectEqual(@as(usize, 1), ws.bids.items.len);
+        const block = ws.bids.items[0].text;
+        try std.testing.expect(std.mem.startsWith(u8, block, "YOUR MEMORY ("));
+        try std.testing.expect(std.mem.endsWith(u8, block, if (compact) WITHHELD_FOOTER_COMPACT else WITHHELD_FOOTER_FULL));
+        // the seed is exactly the entries, as the block shows them — the value still masked
+        try std.testing.expectEqualStrings("- [fact] Gary is 34 years old\n- [key] GitHub personal access token: [withheld]\n", lines);
+        try std.testing.expect(std.mem.indexOf(u8, block, lines) != null);
+        // so the field holds the two memories, and no line of framing can come back as a recollection
+        var o = ovl.Overlay.init(gpa, 64);
+        defer o.deinit();
+        try std.testing.expectEqual(@as(u32, 2), o.seedBlock(lines, .durable));
+        for (o.field.facts.items) |f| {
+            try std.testing.expect(std.mem.indexOf(u8, f.text, "YOUR MEMORY") == null);
+            try std.testing.expect(std.mem.indexOf(u8, f.text, "never ride in prompts") == null);
+        }
+    }
+}
+
 test "durable store lines: a byte-order mark hides no memory, and a dressed directive is still a directive" {
     // the live store's first line — BOM'd — starts with '{' only once the mark is gone, so every reader's
     // `ln[0] == '{'` gate admits it
     const first = "\xEF\xBB\xBF{\"cat\":\"fact\",\"text\":\"User's name is Gary\"}\r";
-    try std.testing.expectEqualStrings("{\"cat\":\"fact\",\"text\":\"User's name is Gary\"}", durableLine(first));
-    try std.testing.expectEqualStrings("{\"a\":1}", durableLine("  {\"a\":1}\t"));
-    try std.testing.expectEqualStrings("", durableLine("\xEF\xBB\xBF"));
+    try std.testing.expectEqualStrings("{\"cat\":\"fact\",\"text\":\"User's name is Gary\"}", tools.durableLine(first));
+    try std.testing.expectEqualStrings("{\"a\":1}", tools.durableLine("  {\"a\":1}\t"));
+    try std.testing.expectEqualStrings("", tools.durableLine("\xEF\xBB\xBF"));
     // directives: bare, list-marked, emphasised, in code spans — one parse, one body
     const bare = memoryDirective("REMEMBER: [fact] Gary is 34 years old") orelse return error.TestUnexpectedResult;
     try std.testing.expect(!bare.forget);
@@ -10138,8 +10174,14 @@ test "a memory directive is never a drive step: memory-shaped proposals are reco
     try std.testing.expect(!memoryDirectiveShaped("Write tests/test_core.py covering the parser, then run them."));
     try std.testing.expect(!memoryDirectiveShaped("Don't forget: run the migration before the deploy."));
     try std.testing.expect(!memoryDirectiveShaped("DONE"));
-    // the picker is told the rule in the question it answers, and the engine-framed step asks for bare lines only
-    try std.testing.expect(std.mem.indexOf(u8, LOOP_QUESTION, "REMEMBER:/FORGET:") != null);
+    // the picker is told the rule in the question it answers, in either loop mode — each closing it for its own
+    // tier (afk has no achieved state to declare) — and the engine-framed step asks for bare lines only
+    try std.testing.expect(std.mem.indexOf(u8, LOOP_MEMORY_RULE, "REMEMBER:/FORGET:") != null);
+    for ([_][]const u8{ LOOP_QUESTION, LOOP_QUESTION_AFK }) |question| {
+        try std.testing.expect(std.mem.indexOf(u8, question, LOOP_MEMORY_RULE) != null);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, LOOP_QUESTION, "if that is all that remains, the goal is achieved") != null);
+    try std.testing.expect(std.mem.indexOf(u8, LOOP_QUESTION_AFK, "goal is achieved") == null);
     try std.testing.expect(std.mem.indexOf(u8, MEMORY_STEP_NUDGE, "REMEMBER: [category]") != null);
     try std.testing.expect(std.mem.indexOf(u8, MEMORY_STEP_NUDGE, "FORGET:") != null);
     // the row: names a plain fact, masks a credential value the way YOUR MEMORY does, never the value itself
