@@ -345,6 +345,9 @@ pub fn main(init: std.process.Init) !void {
     var threaded = std.Io.Threaded.init(gpa, .{ .environ = environ, .async_limit = .limited(512) });
     defer threaded.deinit();
     const io = threaded.io();
+    // The offline probe's callers (llm.zig) hold no environment, so hand it NL_NET_PROBE_URL now, before any
+    // thread can probe: the server and the `worker` subprocess below both make hosted model calls through it.
+    @import("worker/net.zig").useEnviron(init.environ_map);
 
     // Collect the subcommand + its remaining argv up front. `worker` short-circuits to the worker entry (that
     // is how the supervisor spawns a mind); a recognized CLI verb (cli.isCommand) runs the command-line client
