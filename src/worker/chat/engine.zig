@@ -8024,9 +8024,9 @@ fn maybeSyncCastFiles(app: *App, uid: u64, conv: []const u8, conv_dir: []const u
         if (!swarmTerminal(app, sw.run_dir, sw.created)) return; // sync once it finishes
         run_dir = copyTo(&run_buf, sw.run_dir) orelse return; // sw points into the registry; copy before slow IO
     } else {
-        // No registry entry: the server restarted after the cast, or this is a sub-chat, whose id never names its
-        // cast's run dir (the cast builds in the primary's tree) — fall back to the run dir the cast spawned with
-        // (castRunDirFromConvDir), and require its terminal DONE marker before syncing anything.
+        // No registry entry names this conversation's cast (e.g. reattach skipped its dir after a restart) — fall back
+        // to the run dir the cast spawned with (castRunDirFromConvDir), and require its terminal DONE marker before
+        // syncing anything.
         run_dir = castRunDirFromConvDir(&run_buf, conv_dir, conv) orelse return;
         var db: [1400]u8 = undefined;
         const done = std.fmt.bufPrint(&db, "{s}/DONE", .{run_dir}) catch return;
