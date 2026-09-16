@@ -1144,16 +1144,21 @@ fn drawTitlebar(store: *Store) void {
         @memcpy(cfn[0..cfn_n], store.cf_oauth_account[0..cfn_n]);
     }
     store.unlock();
+    // A SILENT POLLER SAYS SO, here: it is the thread that keeps this chip and the Cloudflare mark current, so
+    // while it is quiet both would go on showing its last reading, "online" included. The notice replaces them.
+    var pbuf: [96]u8 = undefined;
+    const poll_silent = silentNotice(&pbuf, SILENT_POLL_FMT, nap.nowMs(), store.poll_beat_ms.load(.monotonic));
     // Down is an ALARM state, not a shade of grey: the muted "offline" read as a stale-but-fine chip while
     // every request was actually failing — say "server down" in red so a dead control plane is unmissable.
-    const label = if (online) t.z("online   {d} minds", .{minds}) else t.z("server down", .{});
+    const label = if (poll_silent) |txt| t.zs(txt) else if (online) t.z("online   {d} minds", .{minds}) else t.z("server down", .{});
+    const label_c = if (poll_silent != null) t.orange else if (online) t.green else t.red;
     const lw = t.measure(label, 12);
     const lx = sw - @as(f32, @floatFromInt(lw)) - 154;
-    t.statusDot(@intFromFloat(lx - 11), TITLE_H / 2, if (online) t.green else t.red);
-    t.text(label, @intFromFloat(lx), (TITLE_H - 12) / 2, 12, if (online) t.green else t.red);
+    t.statusDot(@intFromFloat(lx - 11), TITLE_H / 2, label_c);
+    t.text(label, @intFromFloat(lx), (TITLE_H - 12) / 2, 12, label_c);
     // The Cloudflare mark: an orange dot and who you are, to the left of the server status, while
     // connected — the account is a standing fact about this session, so it lives in the chrome.
-    if (cf_on) {
+    if (cf_on and poll_silent == null) {
         const who: []const u8 = if (cfn_n > 0) cfn[0..cfn_n] else "cloudflare";
         const max_w: f32 = 180;
         const cx = lx - 11 - 22 - max_w;
@@ -2331,6 +2336,21 @@ fn drawPaneGrip(x: f32, y: f32, h: f32, active: bool) void {
     }
 }
 
+/// The silent-worker notices (nap.zig's heartbeats): the chat thread's replaces the chat status line, the
+/// poller's replaces the titlebar's server chip, which only the poller keeps current. `{d}` is whole seconds.
+const SILENT_CHAT_FMT = "chat thread silent for {d}s - restart the desk";
+const SILENT_POLL_FMT = "poller thread silent for {d}s - restart the desk";
+
+/// Format a silent-worker notice into `buf` (a pointer to a byte array) once the heartbeat `beat_ms` has been
+/// quiet past nap.SILENT_MS at `now_ms`; null while the worker is live. The comptime check proves the line fits
+/// with the widest number an i64 prints, so it always renders whole. v1.1.0's chat notice did not: 98 bytes
+/// plus digits into a 96-byte buffer, so bufPrint failed on every frame and only a short fallback ever showed.
+fn silentNotice(buf: anytype, comptime fmt: []const u8, now_ms: i64, beat_ms: i64) ?[]const u8 {
+    comptime std.debug.assert(std.fmt.count(fmt, .{@as(i64, std.math.minInt(i64))}) <= @typeInfo(@TypeOf(buf.*)).array.len);
+    const silent = nap.silentMs(now_ms, beat_ms) orelse return null;
+    return std.fmt.bufPrint(buf, fmt, .{@divTrunc(silent, 1000)}) catch unreachable; // proven to fit, above
+}
+
 /// The Chat tab: three panes. Left = conversations (create/select/rename/delete, collapsible), center =
 /// the message stream + input, right = live swarm-cast activity (collapsible). Pane open state persists
 /// via the chat settings file.
@@ -2361,24 +2381,12 @@ fn drawChat(store: *Store, body: t.Rect) void {
     @memcpy(sreason_buf[0..sreason_n], store.stream_reason[0..sreason_n]);
     const stream_draft = store.stream_draft;
     const busy = store.chat_busy;
-    var status: [96]u8 = undefined;
+    var status: @TypeOf(store.chat_status) = undefined; // sized FROM the store field, like the buffers above
     var status_n: usize = store.chat_status_len;
     @memcpy(status[0..status_n], store.chat_status[0..status_n]);
-    // A SILENT WORKER SAYS SO. The chat thread writes a heartbeat every tick; when it stops, the last status
+    // A SILENT WORKER SAYS SO. The chat thread stamps a heartbeat every tick; when it stops, the last status
     // ("working.") would otherwise stay on screen indefinitely - which is exactly what a wedged desk looked like.
-    {
-        const beat = store.chat_beat_ms.load(.monotonic);
-        const silent = if (beat > 0) nap.nowMs() - beat else 0;
-        if (silent > nap.SILENT_MS) {
-            if (std.fmt.bufPrint(&status, "chat thread silent for {d}s - the desk's worker is stuck; restart the desk (the server is unaffected)", .{@divTrunc(silent, 1000)})) |txt| {
-                status_n = txt.len;
-            } else |_| {
-                const short = "chat thread silent";
-                @memcpy(status[0..short.len], short);
-                status_n = short.len;
-            }
-        }
-    }
+    if (silentNotice(&status, SILENT_CHAT_FMT, nap.nowMs(), store.chat_beat_ms.load(.monotonic))) |txt| status_n = txt.len;
     var casts: [store_mod.MAX_CASTS]store_mod.CastRow = undefined;
     const cast_n = store.cast_count;
     @memcpy(casts[0..cast_n], store.casts[0..cast_n]);
@@ -9084,4 +9092,20 @@ test "fmtConvWhen: today is a clock, this week is a weekday, older is a date" {
     const utc_late = day0 + 23 * 3600; // 23:00 UTC
     try std.testing.expectEqualStrings("23:00", fmtConvWhen(utc_late, utc_late, 0, &b));
     try std.testing.expectEqualStrings("01:00", fmtConvWhen(utc_late, utc_late, 2 * 3600, &b));
+}
+
+test "silentNotice: the whole line renders in the real buffers, and nothing replaces a live worker's status" {
+    // Clock-anchored like the tests above: both readings are parameters. The v1.1.0 line overflowed its 96-byte
+    // buffer on every frame, which only a test of the rendered TEXT could have caught.
+    const t0: i64 = 5 * 86_400_000; // five days of uptime, on nap.nowMs's scale
+    var status: @FieldType(Store, "chat_status") = undefined; // drawChat's buffer type
+    try std.testing.expect(silentNotice(&status, SILENT_CHAT_FMT, t0 + 900, t0) == null); // ticked 0.9 s ago
+    try std.testing.expect(silentNotice(&status, SILENT_CHAT_FMT, t0 + 30_000, t0 + 45_000) == null); // in a declared bound
+    try std.testing.expect(silentNotice(&status, SILENT_CHAT_FMT, t0 + 60_000, 0) == null); // not started
+    try std.testing.expectEqualStrings("chat thread silent for 7s - restart the desk", silentNotice(&status, SILENT_CHAT_FMT, t0 + 7_400, t0).?);
+    var tb: [96]u8 = undefined; // drawTitlebar's buffer
+    try std.testing.expectEqualStrings("poller thread silent for 3600s - restart the desk", silentNotice(&tb, SILENT_POLL_FMT, t0 + 3_600_000, t0).?);
+    // the widest silence a heartbeat can produce still fits, digits and all
+    const wide = silentNotice(&status, SILENT_CHAT_FMT, std.math.maxInt(i64), 1).?;
+    try std.testing.expect(std.mem.endsWith(u8, wide, "s - restart the desk"));
 }

@@ -2,7 +2,7 @@
 
 **File:** `desk/src/netcli.zig`  
 **Module:** `desk`  
-**Description:** In-process HTTP/1.1 client for the local veil server (127.0.0.1): unauthenticated fleet GET plus authenticated deploy/cast/chat-tool/delete calls, each raced against a hard timeout so a wedged server never hangs the UI.
+**Description:** In-process HTTP/1.1 client for the local veil server (127.0.0.1): unauthenticated fleet GET plus authenticated deploy/cast/chat-tool/delete calls, each under a hard timeout so a wedged server never hangs the UI.
 
 ---
 
@@ -23,7 +23,8 @@ netcli.zig is the desk app's typed façade over the low-level httpc socket clien
 
 - httpc.zig (httpc.request, Resp, and the Result union that drives triage; httpc is the actual socket/HTTP-framing/timeout engine)
 - log.zig (trace/dbg/warn/err structured logging)
-- std / std.Io (Io.sleep for backoff, allocator, string ops)
+- nap.zig (`nap.ms` for the retry backoff, and `expect`/`beat` to declare each attempt's ceiling on the calling worker's heartbeat)
+- std / std.Io (the Io handed through to httpc, allocator, string ops)
 
 ## Usage Context
 
@@ -31,7 +32,7 @@ Called from the veil-desk UI/poller layer. `fleet` fires on every poller refresh
 
 ## Notable Implementation Details
 
-The load-bearing logic is the retry/triage in the private `httpReq`, keyed off idempotency (`idempotent = method != "POST"`). It loops up to `MAX_ATTEMPTS = 3` with linear backoff (120ms, 240ms via `io.sleep`) and maps httpc's Result: `.ok` returns the Resp; `.refused` and `.timed_out` fail fast to null (server down / wedged — retrying only multiplies the stall); `.failed` (reset/short/unparseable reply, read as a momentarily starved server pool) is the only retryable case, and even then ONLY for GET/DELETE. A POST is one-shot: an empty reply might mean the server already processed the side effect, so a retry could deploy a duplicate swarm — after a `.failed` POST, `httpReq` returns null immediately. Timeouts are hard ceilings enforced inside httpc (round trip raced against an Io sleeper via Io.Select), not here; netcli just picks the per-endpoint budget (6/15/15/45/15s). Design constraint driving the whole file: this is the third-generation client — raw-socket-read-to-EOF hung the chat ("casting hangs"), the curl-subprocess fix leaked the bearer token + JSON body onto an argv and tripped Defender's ML kill heuristics, so this in-process version keeps curl's hard-ceiling semantics while keeping secrets off any command line. `delete` formats its path into a 160-byte stack buffer and returns null on bufPrint overflow (an over-long id is silently dropped). The bottom test is best-effort: it reads `../data/.desktop_key`, hits :8787, and skips harmlessly if the key or server is absent — asserting only that calls return bounded (never hang).
+The load-bearing logic is the retry/triage in the private `httpReq`, keyed off idempotency (`idempotent = method != "POST"`). It loops up to `MAX_ATTEMPTS = 3` with linear backoff (120ms, 240ms through `nap.ms`, never `io.sleep`: the poller and chat threads call this, and a plain thread parked on the runtime's alert is the 2026-09-02 freeze) and maps httpc's Result: `.ok` returns the Resp; `.refused` and `.timed_out` fail fast to null (server down / wedged — retrying only multiplies the stall); `.failed` (reset/short/unparseable reply, read as a momentarily starved server pool) is the only retryable case, and even then ONLY for GET/DELETE. A POST is one-shot: an empty reply might mean the server already processed the side effect, so a retry could deploy a duplicate swarm — after a `.failed` POST, `httpReq` returns null immediately. Timeouts are hard ceilings enforced inside httpc (on Windows, for the loopback default or a host given as an IPv4 literal, one Winsock socket under one deadline in wsock.zig; for a DNS name, the round trip raced against an Io sleeper via Io.Select), not here; netcli just picks the per-endpoint budget (6/15/15/45/15s). It does declare that budget, though: before each attempt `nap.expect(timeout_s * 1000)` moves the calling worker's heartbeat to the end of the ceiling, and a deferred `nap.beat()` ends the bound on return, so a poll that runs into its timeout against a slow server does not read as a stuck poller or chat thread (on a thread that adopted no heartbeat, such as a test block, both are no-ops). Design constraint driving the whole file: this is the third-generation client — raw-socket-read-to-EOF hung the chat ("casting hangs"), the curl-subprocess fix leaked the bearer token + JSON body onto an argv and tripped Defender's ML kill heuristics, so this in-process version keeps curl's hard-ceiling semantics while keeping secrets off any command line. `delete` formats its path into a 160-byte stack buffer and returns null on bufPrint overflow (an over-long id is silently dropped). The bottom test is best-effort: it reads `../data/.desktop_key`, hits :8787, and skips harmlessly if the key or server is absent — asserting only that calls return bounded (never hang).
 
 ---
 
