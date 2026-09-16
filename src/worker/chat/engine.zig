@@ -2106,6 +2106,12 @@ fn phaseIndex(label: []const u8) u8 {
 // One thread per turn, started beside armLlmFrames and joined on every exit path. emitEvent on the turn's
 // thread bumps `last_ms`; the pulse thread writes its own frames without bumping it, so the seconds it
 // reports are real silence, not time since its own last pulse.
+//
+// The pulse sleeps through sleepMsRaw, never io.sleep. On Windows io.sleep parks the thread on the runtime's
+// per-thread alert (NtWaitForAlertByThreadId), and on a plain std.Thread like this one a wake the runtime did
+// not ask for is `unreachable` - undefined behaviour in the ReleaseFast build. Alerts are sticky, so one stray
+// alert lands in the next park (desk/src/nap.zig has the 2026-09-02 desk freeze it caused), and on io.sleep
+// this loop would park four times a second for the whole turn. Win32 Sleep is non-alertable: no alert can end it.
 const PULSE_AFTER_S: i64 = 15;
 
 const Pulse = struct {
@@ -2124,7 +2130,7 @@ const Pulse = struct {
         const io = p.app.io;
         var pulsed_ms: i64 = 0;
         while (!p.stop.load(.acquire)) {
-            io.sleep(.{ .nanoseconds = 250 * std.time.ns_per_ms }, .awake) catch {};
+            sleepMsRaw(io, 250);
             if (p.stop.load(.acquire)) return;
             const now = nowMillis(io);
             const last = p.last_ms.load(.acquire);

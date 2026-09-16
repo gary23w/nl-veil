@@ -21,6 +21,7 @@ One model, one context, single-flight: `generate` holds the engine mutex for the
 - `src/worker/llamashim.c` — the scalar/pointer-only C facade (build.zig `addLlamaCpp`)
 - the `llama_cpp` lazy dependency (build.zig.zon, hash-pinned) — ggml + llama, CPU backend only
 - `worker/builtin.zig` — the interface types
+- `worker/browser/util.zig` — `sleepMs`, the unloader thread's once-a-minute wait. Not `io.sleep`: on Windows that parks a plain thread on the Io runtime's per-thread alert, and a stray alert there is undefined behaviour in the ReleaseFast build.
 
 ## Usage Context
 
