@@ -279,7 +279,7 @@ fn keySafe(rel: []const u8) bool {
 }
 
 /// The per-conversation files worth keeping. events.jsonl is deliberately absent (see module doc).
-const CONV_FILES = [_][]const u8{ "messages.jsonl", "context.json", "brief.json", "plan.jsonl", "files.jsonl" };
+const CONV_FILES = [_][]const u8{ "messages.jsonl", "context.json", "digest.jsonl", "brief.json", "plan.jsonl", "files.jsonl" };
 
 /// Collect every candidate relpath (relative to {data}/u{uid}) into `list` (arena-owned strings).
 fn collectCandidates(app: *App, uid: u64, a: std.mem.Allocator, list: *std.ArrayListUnmanaged([]const u8)) void {
