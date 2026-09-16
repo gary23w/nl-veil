@@ -19,6 +19,14 @@
 #   needs_account  the base URL carries an {account} placeholder (Cloudflare Workers AI)
 #   keyless        the SERVER accepts a deploy without a key (local endpoints / server-side creds)
 #   local          the provider runs on the user's machine (no internet egress)
+#   sync           models.dev/<provider id> [confirming sources]: the daily models-sync workflow
+#                  (scripts/sync-models.py) keeps the provider's newest releases in a "# >>> synced" block at the
+#                  END of its model list, rewritten on every run; everything above it is hand-written and the
+#                  sync never touches it. No API key is ever used: a model is added only once a FREE source
+#                  confirms it — the provider's own /models if that answers without a key, otherwise its docs
+#                  page (as models.dev links it) or a source listed after the models.dev one: litellm/<provider>
+#                  (LiteLLM's open catalog) or the URL of a public model page (quote the line: URLs hold colons).
+#                  Keep a synced model by moving it above the block; reject one in scripts/sync-models.ignore.
 #
 # Per-model OPTIONAL capacity metadata (drives the size-adaptive prompts — see modelcfg.senseModel):
 #   params_b       parameter count in billions (rounded)
@@ -36,6 +44,7 @@ providers:
     label: Anthropic (Claude)
     base: https://api.anthropic.com/v1
     needs_key: true
+    sync: models.dev/anthropic litellm/anthropic
     models:
       - id: claude-opus-4-8
         label: Claude Opus 4.8
@@ -45,11 +54,18 @@ providers:
         label: Claude Sonnet 5
       - id: claude-haiku-4-5
         label: Claude Haiku 4.5
+      # >>> synced from models.dev by scripts/sync-models.py — rewritten every run; move an entry above this line to keep it
+      - id: claude-fable-5-1
+        label: Claude Fable 5.1
+      - id: claude-opus-5
+        label: Claude Opus 5
+      # <<< synced
 
   - key: openai
     label: OpenAI (GPT)
     base: https://api.openai.com/v1
     needs_key: true
+    sync: models.dev/openai litellm/openai
     models:
       - id: gpt-5
         label: GPT-5
@@ -61,6 +77,16 @@ providers:
         label: GPT-4.1 nano
       - id: o4-mini
         label: o4-mini
+      # >>> synced from models.dev by scripts/sync-models.py — rewritten every run; move an entry above this line to keep it
+      - id: gpt-6-astra
+        label: GPT-6 Astra
+      - id: gpt-5.6
+        label: GPT-5.6
+      - id: gpt-5.6-luna
+        label: GPT-5.6 Luna
+      - id: gpt-5.6-sol
+        label: GPT-5.6 Sol
+      # <<< synced
 
   - key: ollama
     label: Ollama (local - no key)
@@ -121,14 +147,22 @@ providers:
     label: Groq
     base: https://api.groq.com/openai/v1
     needs_key: true
+    sync: models.dev/groq litellm/groq
     models:
       - id: llama-3.3-70b-versatile
         label: Llama 3.3 70B versatile
+      # >>> synced from models.dev by scripts/sync-models.py — rewritten every run; move an entry above this line to keep it
+      - id: qwen/qwen3.8-27b
+        label: Qwen3.8 27B
+      - id: qwen/qwen3.6-27b
+        label: Qwen3.6 27B
+      # <<< synced
 
   - key: deepseek
     label: DeepSeek
     base: https://api.deepseek.com/v1
     needs_key: true
+    sync: models.dev/deepseek litellm/deepseek
     models:
       - id: deepseek-v4-flash
         label: DeepSeek V4 Flash
@@ -151,6 +185,7 @@ providers:
     label: Google Gemini
     base: https://generativelanguage.googleapis.com/v1beta/openai
     needs_key: true
+    sync: models.dev/google litellm/gemini
     models:
       - id: gemini-3.5-flash
         label: Gemini 3.5 Flash
@@ -158,6 +193,16 @@ providers:
         label: Gemini 3.1 Pro (preview)
       - id: gemini-2.5-flash
         label: Gemini 2.5 Flash
+      # >>> synced from models.dev by scripts/sync-models.py — rewritten every run; move an entry above this line to keep it
+      - id: gemini-3.8-flash
+        label: Gemini 3.8 Flash
+      - id: gemini-3.7-flash
+        label: Gemini 3.7 Flash
+      - id: gemini-3.5-flash-lite
+        label: Gemini 3.5 Flash Lite
+      - id: gemini-3.6-flash
+        label: Gemini 3.6 Flash
+      # <<< synced
 
   - key: mock
     label: Mock (dry run - no calls)
@@ -178,6 +223,7 @@ providers:
     label: Hugging Face (Inference Providers)
     base: https://router.huggingface.co/v1
     needs_key: true
+    sync: models.dev/huggingface
     models:
       - id: openai/gpt-oss-120b
         label: GPT-OSS 120B
@@ -197,6 +243,16 @@ providers:
         label: Qwen2.5 Coder 32B
       - id: mistralai/Mistral-Small-24B-Instruct-2501
         label: Mistral Small 24B
+      # >>> synced from models.dev by scripts/sync-models.py — rewritten every run; move an entry above this line to keep it
+      - id: deepseek-ai/DeepSeek-V4.1-Flash
+        label: DeepSeek V4.1 Flash
+      - id: deepseek-ai/DeepSeek-V4-Flash-Vision-Exp
+        label: DeepSeek V4 Flash Vision Exp
+      - id: Qwen/Qwen3.8-27B
+        label: Qwen3.8 27B
+      - id: Qwen/Qwen3.8-2.4T-A95B
+        label: Qwen3.8 2.4T A95B
+      # <<< synced
 
   # Z.AI (Zhipu) GLM family — OpenAI-compatible chat/completions at /api/paas/v4, Bearer-auth. Flows through
   # the standard BYOK path (like DeepSeek/Groq); glm-4.5-flash is the free tier. Docs: https://docs.z.ai
@@ -204,6 +260,7 @@ providers:
     label: Z.AI (GLM)
     base: https://api.z.ai/api/paas/v4
     needs_key: true
+    sync: models.dev/zai litellm/zai
     models:
       - id: glm-5.2
         label: GLM-5.2
@@ -215,6 +272,12 @@ providers:
         label: GLM-4.5 Air
       - id: glm-4.5-flash
         label: GLM-4.5 Flash (free)
+      # >>> synced from models.dev by scripts/sync-models.py — rewritten every run; move an entry above this line to keep it
+      - id: glm-5.3-flash
+        label: GLM-5.3-Flash
+      - id: glm-5.3
+        label: GLM-5.3
+      # <<< synced
 
   # TokenGO (API host: api.thorbase.com) — OpenAI-compatible aggregator running discounted self-operated
   # inference for Moonshot / Z.AI / DeepSeek / Qwen / MiniMax. Bearer auth; model ids are vendor/model slugs.
@@ -223,6 +286,7 @@ providers:
     label: TokenGO
     base: https://api.thorbase.com/v1
     needs_key: true
+    sync: "models.dev/tokengo https://www.tokengo.com/models"
     models:
       - id: z-ai/glm-5.2
         label: GLM 5.2
@@ -244,6 +308,14 @@ providers:
         label: DeepSeek V3.2
       - id: deepseek/deepseek-v3.1
         label: DeepSeek V3.1
+      # >>> synced from models.dev by scripts/sync-models.py — rewritten every run; move an entry above this line to keep it
+      - id: z-ai/glm-5.3-flash
+        label: GLM-5.3-Flash
+      - id: z-ai/glm-5.3
+        label: GLM-5.3
+      - id: moonshotai/kimi-k3
+        label: Kimi K3
+      # <<< synced
 
   # OpenRouter — one key, hundreds of models across every vendor, OpenAI-compatible (Bearer auth). The headline
   # is openrouter/free: OpenRouter's OWN rotating free-tier router — it selects a currently-free model at random
@@ -255,6 +327,7 @@ providers:
     label: OpenRouter
     base: https://openrouter.ai/api/v1
     needs_key: true
+    sync: models.dev/openrouter
     models:
       # the rotating router can hand back anything from an 8B to a frontier model — pin the compact
       # prompt tier so the weakest draw still works (a large draw just gets the leaner doctrine)
@@ -277,6 +350,16 @@ providers:
         label: Kimi K2
       - id: anthropic/claude-sonnet-4.5
         label: Claude Sonnet 4.5
+      # >>> synced from models.dev by scripts/sync-models.py — rewritten every run; move an entry above this line to keep it
+      - id: deepseek/deepseek-v4.1-flash
+        label: DeepSeek V4.1 Flash
+      - id: openai/gpt-6-astra
+        label: GPT-6 Astra
+      - id: openai/gpt-6-astra-pro
+        label: GPT-6 Astra Pro
+      - id: qwen/qwen3.8-max-0902
+        label: Qwen3.8 Max 0902
+      # <<< synced
 
   # Moonshot AI (Kimi) — the FIRST-party Kimi API, OpenAI-compatible chat/completions with Bearer auth (so it
   # flows through the standard BYOK path like DeepSeek/Z.AI). kimi-k3 is the flagship (2.8T params, 1M-token
@@ -288,6 +371,7 @@ providers:
     label: Kimi (Moonshot AI)
     base: https://api.moonshot.ai/v1
     needs_key: true
+    sync: models.dev/moonshotai litellm/moonshot
     models:
       - id: kimi-k3
         label: Kimi K3 (flagship, 1M ctx)

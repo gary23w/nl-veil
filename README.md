@@ -1243,7 +1243,8 @@ examples/embedded/         the device-operator worked example
 harness/TESTING.md         the house test rules — read before adding a test
 web/public/                the control-plane UI — index.html, app.js, styles.css, models.json,
                            embedded into the binary at build time (no bundler, no build step)
-models.yaml                the ONE model catalog → generated into web/public/models.json
+models.yaml                the ONE model catalog → generated into web/public/models.json; newer
+                           releases arrive as a daily PR (scripts/sync-models.py, models-sync.yml)
 bin/neuron[.exe]           the neuron-db memory engine (bundled / built on first run)
 ```
 

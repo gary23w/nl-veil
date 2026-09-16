@@ -896,6 +896,231 @@
       "label": "Muse Glimmer 30B",
       "provider": "ollama",
       "hosting": "local"
+    },
+    {
+      "id": "claude-fable-5-1",
+      "label": "Claude Fable 5.1",
+      "provider": "anthropic",
+      "hosting": "hosted",
+      "context": 1000000,
+      "note": "Released 2026-09-01. 1,000K context. Tool calling, reasoning, image / pdf input. $10 in / $50 out per MTok. Listed automatically from models.dev.",
+      "synced": "models.dev"
+    },
+    {
+      "id": "claude-opus-5",
+      "label": "Claude Opus 5",
+      "provider": "anthropic",
+      "hosting": "hosted",
+      "context": 1000000,
+      "note": "Released 2026-07-24. 1,000K context. Tool calling, reasoning, image / pdf input. $5 in / $25 out per MTok. Listed automatically from models.dev.",
+      "synced": "models.dev"
+    },
+    {
+      "id": "gpt-6-astra",
+      "label": "GPT-6 Astra",
+      "provider": "openai",
+      "hosting": "hosted",
+      "context": 1050000,
+      "note": "Released 2026-09-04. 1,050K context. Tool calling, reasoning, image / pdf input. $10 in / $50 out per MTok. Listed automatically from models.dev.",
+      "synced": "models.dev"
+    },
+    {
+      "id": "gpt-5.6",
+      "label": "GPT-5.6",
+      "provider": "openai",
+      "hosting": "hosted",
+      "context": 1050000,
+      "note": "Released 2026-07-09. 1,050K context. Tool calling, reasoning, image / pdf input. $4 in / $20 out per MTok. Listed automatically from models.dev.",
+      "synced": "models.dev"
+    },
+    {
+      "id": "gpt-5.6-luna",
+      "label": "GPT-5.6 Luna",
+      "provider": "openai",
+      "hosting": "hosted",
+      "context": 1050000,
+      "note": "Released 2026-07-09. 1,050K context. Tool calling, reasoning, image / pdf input. $0.2 in / $1.2 out per MTok. Listed automatically from models.dev.",
+      "synced": "models.dev"
+    },
+    {
+      "id": "gpt-5.6-sol",
+      "label": "GPT-5.6 Sol",
+      "provider": "openai",
+      "hosting": "hosted",
+      "context": 1050000,
+      "note": "Released 2026-07-09. 1,050K context. Tool calling, reasoning, image / pdf input. $4 in / $20 out per MTok. Listed automatically from models.dev.",
+      "synced": "models.dev"
+    },
+    {
+      "id": "qwen/qwen3.8-27b",
+      "label": "Qwen3.8 27B",
+      "provider": "groq",
+      "hosting": "hosted",
+      "context": 131042,
+      "note": "Released 2026-08-14. 131K context. Tool calling, reasoning, image input. $0.8 in / $4 out per MTok. Listed automatically from models.dev.",
+      "synced": "models.dev"
+    },
+    {
+      "id": "qwen/qwen3.6-27b",
+      "label": "Qwen3.6 27B",
+      "provider": "groq",
+      "hosting": "hosted",
+      "context": 131072,
+      "note": "Released 2026-04-22. 131K context. Tool calling, reasoning, image input. $0.6 in / $3 out per MTok. Listed automatically from models.dev.",
+      "synced": "models.dev"
+    },
+    {
+      "id": "gemini-3.8-flash",
+      "label": "Gemini 3.8 Flash",
+      "provider": "google",
+      "hosting": "hosted",
+      "context": 1048576,
+      "note": "Released 2026-09-02. 1,048K context. Tool calling, reasoning, image / video / audio / pdf input. $0.75 in / $3.75 out per MTok. Listed automatically from models.dev.",
+      "synced": "models.dev"
+    },
+    {
+      "id": "gemini-3.7-flash",
+      "label": "Gemini 3.7 Flash",
+      "provider": "google",
+      "hosting": "hosted",
+      "context": 1048576,
+      "note": "Released 2026-08-13. 1,048K context. Tool calling, reasoning, image / video / audio / pdf input. $0.75 in / $3.75 out per MTok. Listed automatically from models.dev.",
+      "synced": "models.dev"
+    },
+    {
+      "id": "gemini-3.5-flash-lite",
+      "label": "Gemini 3.5 Flash Lite",
+      "provider": "google",
+      "hosting": "hosted",
+      "context": 1048576,
+      "note": "Released 2026-07-21. 1,048K context. Tool calling, reasoning, image / video / audio / pdf input. $0.3 in / $2.5 out per MTok. Listed automatically from models.dev.",
+      "synced": "models.dev"
+    },
+    {
+      "id": "gemini-3.6-flash",
+      "label": "Gemini 3.6 Flash",
+      "provider": "google",
+      "hosting": "hosted",
+      "context": 1048576,
+      "note": "Released 2026-07-21. 1,048K context. Tool calling, reasoning, image / video / audio / pdf input. $0.75 in / $3.75 out per MTok. Listed automatically from models.dev.",
+      "synced": "models.dev"
+    },
+    {
+      "id": "deepseek-ai/DeepSeek-V4.1-Flash",
+      "label": "DeepSeek V4.1 Flash",
+      "provider": "huggingface",
+      "hosting": "hosted",
+      "context": 1048576,
+      "note": "Released 2026-09-10. 1,048K context. Tool calling, reasoning, image input. $0.3 in / $1.2 out per MTok. Listed automatically from models.dev.",
+      "synced": "models.dev"
+    },
+    {
+      "id": "deepseek-ai/DeepSeek-V4-Flash-Vision-Exp",
+      "label": "DeepSeek V4 Flash Vision Exp",
+      "provider": "huggingface",
+      "hosting": "hosted",
+      "context": 1048576,
+      "note": "Released 2026-08-21. 1,048K context. Tool calling, reasoning, image input. $0.44 in / $1.32 out per MTok. Listed automatically from models.dev.",
+      "synced": "models.dev"
+    },
+    {
+      "id": "Qwen/Qwen3.8-27B",
+      "label": "Qwen3.8 27B",
+      "provider": "huggingface",
+      "hosting": "hosted",
+      "context": 262144,
+      "note": "Released 2026-08-14. 262K context. Tool calling, reasoning, image input. $0.4 in / $3 out per MTok. Listed automatically from models.dev.",
+      "synced": "models.dev"
+    },
+    {
+      "id": "Qwen/Qwen3.8-2.4T-A95B",
+      "label": "Qwen3.8 2.4T A95B",
+      "provider": "huggingface",
+      "hosting": "hosted",
+      "context": 262144,
+      "note": "Released 2026-08-12. 262K context. Tool calling, reasoning. $2.5 in / $6.25 out per MTok. Listed automatically from models.dev.",
+      "synced": "models.dev"
+    },
+    {
+      "id": "glm-5.3-flash",
+      "label": "GLM-5.3-Flash",
+      "provider": "zai",
+      "hosting": "hosted",
+      "context": 1000000,
+      "note": "Released 2026-08-26. 1,000K context. Tool calling, reasoning, image / video / pdf input. $0.07 in / $0.25 out per MTok. Listed automatically from models.dev.",
+      "synced": "models.dev"
+    },
+    {
+      "id": "glm-5.3",
+      "label": "GLM-5.3",
+      "provider": "zai",
+      "hosting": "hosted",
+      "context": 1000000,
+      "note": "Released 2026-08-14. 1,000K context. Tool calling, reasoning. $1.4 in / $4.4 out per MTok. Listed automatically from models.dev.",
+      "synced": "models.dev"
+    },
+    {
+      "id": "z-ai/glm-5.3-flash",
+      "label": "GLM-5.3-Flash",
+      "provider": "tokengo",
+      "hosting": "hosted",
+      "context": 1000000,
+      "note": "Released 2026-08-26. 1,000K context. Tool calling, reasoning, image / video / pdf input. $0.07 in / $0.03 out per MTok. Listed automatically from models.dev.",
+      "synced": "models.dev"
+    },
+    {
+      "id": "z-ai/glm-5.3",
+      "label": "GLM-5.3",
+      "provider": "tokengo",
+      "hosting": "hosted",
+      "context": 1000000,
+      "note": "Released 2026-08-14. 1,000K context. Tool calling, reasoning. $1.4 in / $4.4 out per MTok. Listed automatically from models.dev.",
+      "synced": "models.dev"
+    },
+    {
+      "id": "moonshotai/kimi-k3",
+      "label": "Kimi K3",
+      "provider": "tokengo",
+      "hosting": "hosted",
+      "context": 1048576,
+      "note": "Released 2026-07-16. 1,048K context. Tool calling, reasoning, image / video input. $3 in / $15 out per MTok. Listed automatically from models.dev.",
+      "synced": "models.dev"
+    },
+    {
+      "id": "deepseek/deepseek-v4.1-flash",
+      "label": "DeepSeek V4.1 Flash",
+      "provider": "openrouter",
+      "hosting": "hosted",
+      "context": 1048576,
+      "note": "Released 2026-09-10. 1,048K context. Tool calling, reasoning, image input. $0.15 in / $0.6 out per MTok. Listed automatically from models.dev.",
+      "synced": "models.dev"
+    },
+    {
+      "id": "openai/gpt-6-astra",
+      "label": "GPT-6 Astra",
+      "provider": "openrouter",
+      "hosting": "hosted",
+      "context": 1050000,
+      "note": "Released 2026-09-04. 1,050K context. Tool calling, reasoning, image / pdf input. $10 in / $50 out per MTok. Listed automatically from models.dev.",
+      "synced": "models.dev"
+    },
+    {
+      "id": "openai/gpt-6-astra-pro",
+      "label": "GPT-6 Astra Pro",
+      "provider": "openrouter",
+      "hosting": "hosted",
+      "context": 1050000,
+      "note": "Released 2026-09-04. 1,050K context. Tool calling, reasoning, pdf / image input. $10 in / $50 out per MTok. Listed automatically from models.dev.",
+      "synced": "models.dev"
+    },
+    {
+      "id": "qwen/qwen3.8-max-0902",
+      "label": "Qwen3.8 Max 0902",
+      "provider": "openrouter",
+      "hosting": "hosted",
+      "context": 1000000,
+      "note": "Released 2026-09-02. 1,000K context. Tool calling, reasoning, image / video input. $2 in / $6 out per MTok. Listed automatically from models.dev.",
+      "synced": "models.dev"
     }
   ],
   "defaults": {
