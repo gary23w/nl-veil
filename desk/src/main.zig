@@ -617,7 +617,7 @@ pub fn runApp(data_dir: ?[]const u8) !void {
         const wdn = @min(wdd.len, wdb.len);
         @memcpy(wdb[0..wdn], wdd[0..wdn]);
         store.unlock();
-        watchdog.start(chat_threaded.io(), wdb[0..wdn]);
+        watchdog.start(chat_threaded.io(), wdb[0..wdn], rl.getWindowHandle());
     }
     defer watchdog.stop();
     while (true) {
@@ -714,8 +714,7 @@ pub fn runApp(data_dir: ?[]const u8) !void {
             const an = t.kbTakeAnnouncement(&ab);
             if (an > 0) store.pushNarr(ab[0..an]);
         }
-        tray.pump();
-        pumpTray(&store, &tray, gpa);
+        pumpTray(&store, &tray, gpa); // the tray window's messages arrive through raylib's own poll (tray.zig says why)
         // Cheap per-frame apply: pick up a theme the async loadSettings landed after boot, or a titlebar
         // cycle. No JSON re-read here (the workspace was merged once at boot in syncThemeFromStore); this is
         // just an id match against the already-loaded registry.

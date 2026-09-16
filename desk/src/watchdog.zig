@@ -21,6 +21,7 @@
 //! AMD + NVIDIA setup) — not our code. Anything else names our code and narrows it to one section.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const log = @import("log.zig");
 
@@ -97,14 +98,26 @@ pub fn stallReport(now: i64, last_beat: i64, already_reported_at: i64) ?i64 {
     return stalled;
 }
 
-const Ctx = struct { io: Io, hang_path: [512]u8 = undefined, hang_len: usize = 0 };
+const Ctx = struct { io: Io, hang_path: [512]u8 = undefined, hang_len: usize = 0, hwnd: ?*anyopaque = null };
 var ctx: Ctx = undefined;
+
+/// How many times Windows has declared the window "not responding" WHILE the frame loop was alive. The other
+/// kind of hang this file watches for (see watch): the OS stops crediting the thread's message poll, ghosts the
+/// window, and the frame counter keeps climbing the whole time.
+var os_hung_episodes: std.atomic.Value(u32) = .init(0);
+
+pub fn osHungEpisodes() u32 {
+    return os_hung_episodes.load(.monotonic);
+}
 
 /// Spawn the watcher. Never fails the app: if the thread cannot start we simply have no watchdog.
 /// `data_dir` is where the DURABLE stall record goes — see writeHangRecord for why that is not optional.
-pub fn start(io: Io, data_dir: []const u8) void {
+/// `hwnd` is the main window's native handle (rl.getWindowHandle) or null: with it, on Windows, the watcher
+/// also asks the OS whether IT considers the window hung (IsHungAppWindow), which is a different failure from
+/// a frozen frame loop and invisible to the heartbeat.
+pub fn start(io: Io, data_dir: []const u8, hwnd: ?*anyopaque) void {
     if (running.swap(true, .acq_rel)) return; // already started
-    ctx = .{ .io = io };
+    ctx = .{ .io = io, .hwnd = hwnd };
     if (std.fmt.bufPrint(&ctx.hang_path, "{s}/desk-hang.log", .{data_dir})) |p| {
         ctx.hang_len = p.len;
     } else |_| ctx.hang_len = 0;
@@ -141,15 +154,60 @@ fn nowMs(io: Io) i64 {
     return @intCast(@divTrunc(Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_ms));
 }
 
+/// Windows' own verdict on the window: TRUE once the owning thread has gone ~5 s without a credited read of
+/// its message queue. That is NOT the same as our heartbeat going stale — the frame loop can be drawing at
+/// 60 fps and still be "not responding" here (2026-09-16: a window-filtered PeekMessage in the tray pump
+/// stopped the OS crediting raylib's unfiltered poll; DWM then ghosted the window and swallowed every click).
+/// Off Windows there is no such verdict and this is always false.
+fn osSaysHung() bool {
+    if (builtin.os.tag != .windows) return false;
+    const hwnd = ctx.hwnd orelse return false;
+    return user32.IsHungAppWindow(hwnd) != 0;
+}
+
+const user32 = if (builtin.os.tag == .windows) struct {
+    extern "user32" fn IsHungAppWindow(hwnd: *anyopaque) callconv(.winapi) i32;
+} else struct {
+    fn IsHungAppWindow(_: *anyopaque) i32 {
+        return 0;
+    }
+};
+
 fn watch() void {
     const io = ctx.io;
     var reported_at: i64 = 0;
     var stall_start: i64 = 0;
     var frames_at_stall: u64 = 0;
+    // the OS-verdict episode: when it began and the frame count then; frames_prev tells a live loop the OS
+    // disowns (this branch) from a genuinely frozen one (the heartbeat branch below already covers that)
+    var os_hung_since: i64 = 0;
+    var frames_at_os_hung: u64 = 0;
+    var frames_prev: u64 = frames.load(.monotonic);
     while (running.load(.acquire)) {
         io.sleep(.{ .nanoseconds = SAMPLE_MS * std.time.ns_per_ms }, .awake) catch return;
         const now = nowMs(io);
         const last = beat_ms.load(.monotonic);
+        {
+            const frames_now = frames.load(.monotonic);
+            const loop_alive = frames_now != frames_prev;
+            frames_prev = frames_now;
+            const hung = osSaysHung();
+            if (hung and loop_alive and os_hung_since == 0) {
+                os_hung_since = now;
+                frames_at_os_hung = frames_now;
+                _ = os_hung_episodes.fetchAdd(1, .monotonic);
+                log.warn("watchdog: Windows reports the window NOT RESPONDING while the frame loop is alive (frame #{d} and counting) — the OS is not crediting the message poll; DWM will ghost the window and eat clicks. See tray.zig.", .{frames_now});
+                var rb: [320]u8 = undefined;
+                if (std.fmt.bufPrint(&rb, "OS SAYS NOT RESPONDING, frame loop alive  frame=#{d}  episode_no={d}\n", .{ frames_now, os_hung_episodes.load(.monotonic) })) |line| {
+                    writeHangRecord(io, line);
+                } else |_| {}
+            } else if (!hung and os_hung_since != 0) {
+                log.warn("watchdog: Windows credits the window again after {d}ms ({d} frames drawn meanwhile)", .{ now - os_hung_since, frames_now - frames_at_os_hung });
+                var rb: [160]u8 = undefined;
+                if (std.fmt.bufPrint(&rb, "OS credits the window again after {d}ms ({d} frames drawn meanwhile)\n", .{ now - os_hung_since, frames_now - frames_at_os_hung })) |line| writeHangRecord(io, line) else |_| {}
+                os_hung_since = 0;
+            }
+        }
         if (stallReport(now, last, reported_at)) |stalled| {
             if (reported_at == 0) {
                 stall_start = last;
@@ -208,7 +266,7 @@ test "watchdog thread: notices a frozen caller, then notices recovery (real thre
     defer threaded.deinit();
     const io2 = threaded.io();
     const before = stallCount();
-    start(io2, ".");
+    start(io2, ".", null);
     defer stop();
     Io.Dir.cwd().deleteFile(io2, "./desk-hang.log") catch {};
     defer Io.Dir.cwd().deleteFile(io2, "./desk-hang.log") catch {};
