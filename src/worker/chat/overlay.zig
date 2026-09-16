@@ -16,9 +16,10 @@
 //!   * GROWN in-process as the turn produces findings — every tool-result note the engine mints for the store
 //!     enters the field the moment it exists, so a finding is recallable in the very next round, compaction or
 //!     not, and no subprocess is spent;
-//!   * SETTLED before EVERY model call around a live CUE — the goal, the model's last narration, its last tool
-//!     call, the last result, and the facts it most recently used — so the associative wave runs from what the
-//!     model is doing right now, not from what the user asked at the top of the turn;
+//!   * SETTLED before EVERY round's chat-model call (runInnerAgentic's streamed call; the auxiliary verdict,
+//!     compaction and planning calls go without it) around a live CUE — the goal, the model's last narration,
+//!     its last tool call, the last result, and the facts it most recently used — so the associative wave runs
+//!     from what the model is doing right now, not from what the user asked at the top of the turn;
 //!   * RENDERED as one small advisory block appended as the LAST message of that one request and removed from
 //!     the working context the instant the model has answered. An overlay in the literal sense: it never enters
 //!     the transcript, is never observed, never compacted, never re-uploaded on a later round.

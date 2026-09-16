@@ -73,8 +73,9 @@ pub fn clearLastError() void {
 /// turn on its first reply, though the token's next resolve would have answered. Now every failure is
 /// retried, and the engine may re-resolve the credential before each retry (retry_rekey).
 ///
-/// Armed by the engine for each turn (armRetries). A thread without a budget - the swarm's workers, a
-/// one-shot chat() - keeps the transient-only ladder below, whose failover lives in its callers; and a LOCAL
+/// Armed by the engine for each turn (armRetries). A thread without a budget - the swarm's workers - keeps the
+/// transient-only ladder below, whose failover lives in its callers (a one-shot chat() goes through
+/// completeBody and reaches neither ladder); and a LOCAL
 /// endpoint keeps it too, on every thread: a loopback server is running or it is not, five minutes of
 /// retries cannot start it, and the honest connect error is the answer the user needs at once.
 pub const RETRY_MAX: u32 = 10;

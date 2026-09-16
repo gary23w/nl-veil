@@ -59,6 +59,33 @@ Every non-transcript block the turn injects — durable memory, the tool digest,
 
 Recall itself is scored: the neuron CLI's `recallscored` returns top-k facts **with numbers**, the top hit's coverage rides the bid as measured confidence, facts the store marked contested arrive labeled with the disagreeing sibling, and a sentinel-gated `memverify` completion on the thinking role annotates doubtful facts before the answering model reads them (`NL_MEM_VERIFY=0` disables; verdicts never delete). An older neuron binary degrades to the legacy prose recall byte-identically.
 
+## The recall overlay
+
+Unlike the blocks above, the [recall overlay](#doc=worker/chat/overlay) never bids into the workspace: it is a per-turn `hyperspace.Field` of this conversation's memory that rides one inference at a time.
+
+- **Built before the drive loop**, unless `NL_MEM_OVERLAY` is `0`/`false`. `NL_HYPERSPACE_CAP` sizes the field (default `DEFAULT_CAP` = 256 here) and `NL_MEM_OVERLAY_BYTES` the rendered lines (default 900). The goal heads every cue. The seed is one `assocAcross` pull (k = 48) around the goal over the conversation's recall family (`scopeFamilyBase`) — the overlay's only seed subprocess — plus the YOUR MEMORY block and the file ledger. `injectDurableMemory` returns the block it bid, so the overlay seeds from the same masked text the prompt shows.
+- **Rendered around the streamed chat call.** `runInnerAgentic` settles the field (`render()`), appends the block to `conv_buf` as the last `role:"system"` message, and shrinks `conv_buf` back to its prior length the moment `llm.completeStream` returns, so the block never reaches the transcript, a compaction or a later upload (a test pins the working context byte-identical). No auxiliary call carries it.
+- **Fed from engine-held strings.** The model's narration and each tool call (`noteThought`, `noteCall`, with `observeFiring` on both to catch a line the model used), each finding note the moment it is minted for the store (`noteFinding` — recallable next round, no subprocess), the head of each tool result (`noteResult`), and each drive step or plan subtask instruction (`noteThought`).
+- **At turn exit** the fired `[conv]` lines are strengthened in the conversation's partition (`strengthenFired` → `Mem.strengthen`, at most 8 spawns), then one `chatmem` log line records renders, lines shown, fired, inhibited and strengthened.
+
+## Durable memory is an engine-observed event
+
+A reply's `REMEMBER:`/`FORGET:` lines are applied to the user's store (`{data}/u{uid}/.veil-desk/memories.jsonl`) and stripped from the reply before reflect (`processMemoryDirectives`); a reply that was only directives shows `(noted — saved to your memory)`. Stripping used to leave no trace of the change in the working context, and the YOUR MEMORY block is assembled once per turn, so every later reader of the turn saw a stale fact beside a reply that never mentioned changing it: the step picker named the directive itself as the next step and escalated to hand-editing the store. Now:
+
+- **The engine says what it did.** Each applied batch threads a `role:"system"` row into `conv_buf` directly under the reply (`memoryUpdateRow`: `[engine: durable memory updated — forgot "…"; remembered [cat] …`, then that the store already holds the change and needs no further step), with credential values masked by `appendFactShown`, the policy the YOUR MEMORY block uses. `emitMemoryUpdated` writes a status frame (`memory updated — N directive(s) applied`) and one `{"kind":"memory","text":"updated"}` frame from both apply sites; the desk re-reads its Memory tab's store on that frame.
+- **A memory directive is never a drive step.** A step-picker proposal naming `REMEMBER:`, `FORGET:` or `memories.jsonl` (`memoryDirectiveShaped`, case-sensitive) has its bare directive lines applied directly. It counts as DONE once the turn has recorded a change or has already been asked to once; a turn that has recorded nothing gets one engine-framed step (`MEMORY_STEP_NUDGE`: reply with only the bare lines — no prose, tools or file edits) with the proposal appended under it, never the proposal as the instruction. `LOOP_QUESTION`, the non-AFK drive question, states the rule.
+- **Dressing and a byte-order mark hide nothing.** `memoryDirective` finds the keyword after list markers, blockquotes, emphasis and code spans (`- **FORGET:** …`), though it must still open the line. The engine's store readers (`injectDurableMemory`, `durableMemoryHas`, `forgetDurableMemory`) all go through `durableLine`, which strips a UTF-8 BOM — behind one, the oldest memory was invisible to the prompt, to dedup and to `FORGET:`, and the forget rewrite kept the mark.
+
+## A failed model call: ten retries, then the chat stops
+
+`runTurn` arms the per-turn retry budget in [llm](#doc=worker/llm) (`llm.armRetries()`, disarmed at exit) and registers the three hooks its ladder calls. Each reads thread-locals the turn sets (`turn_app`, `turn_uid`, `turn_ctrl_cursor`), so it acts only on a turn's own thread.
+
+- `retry_notify` → `llmRetryStatus`: each wait lands on the turn as a status frame (`provider failed (HTTP 401: Authentication error): retrying in 20s (4/10)`), account ids scrubbed (`scrubAccountIds`) as in the error frame.
+- `retry_abort` → `llmRetryAbort`: polled between the quarter-second slices of a wait; a `{"op":"stop"}` in `control.jsonl` past the turn's cursor ends the ladder at once.
+- `retry_rekey` → `llmRetryRekey`: for a Workers AI endpoint (`api.cloudflare.com` and `/ai/` in the base URL) it re-resolves the user's Cloudflare login through `cf_oauth.resolveToken`, which refreshes an access token at or near expiry, and hands the key over only when it is for the same endpoint and differs from the key that failed — the retry that can land on a mid-turn 401. Anything else returns null and the retry goes out unchanged.
+
+When the chat call still fails with its provider's budget spent (`llm.retryExhausted`), the error frame reads `gave up after 10 retries — <head>` (`llm.RETRY_MAX`) and the turn ends.
+
 ## Concurrency & lifecycle
 
 - One in-flight turn per conversation. `tryBeginTurn` claims the slot (so `postMessage` can answer `409` before persisting anything); `spawnTurn` fires the turn on a raw detached thread and owns releasing the slot on every completion path.
@@ -68,7 +95,9 @@ Recall itself is scored: the neuron CLI's `recallscored` returns top-k facts **w
 ## Dependencies
 
 - `worker/tools` — the tool surface the loop calls (write/read/edit/search/shell/…)
-- `worker/llm` — the model call machinery (streaming completions)
+- `worker/llm` — the model call machinery (streaming completions), and the per-turn retry budget the turn arms
+- `worker/chat/overlay` — the recall overlay rendered around each chat call
+- `config/cf_oauth` — the Cloudflare login, including the re-resolved token a retry hands over
 - `worker/chat/context` — the recency window + pinned goal + rolling summary + digest ledger that keep the prompt bounded at any conversation length, and the capacity-scaled budgets the `ContextPlan` is built from
 - `worker/continuity` — durable resume anchors: press on a cut, read at assembly, clear on a clean finish
 - `worker/chat/plan` — task decomposition into routed subtasks the drive loop walks

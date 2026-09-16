@@ -30,11 +30,11 @@ The per-file sheets are grouped by module; this is what each group is for.
 |---|---|
 | `gateway/` | HTTP ingress — the shared `App` context, the auth guard every handler calls, the JSON/file helpers. The route table itself is registered in `main.zig` |
 | `auth/` | accounts, sessions, API keys, and the login guard that rate-limits brute force |
-| `config/` | the encrypted key vault, the key API, admin-owned runtime settings, and address discovery |
+| `config/` | the encrypted key vault, the key API, admin-owned runtime settings, address discovery, and the Cloudflare side — the login, the R2 chat backup and the public-URL tunnel |
 | `admin/` | the admin surface — users, moderation, the instance-wide default model and provider key, audit |
 | `obs/` | the audit log — structured event recording |
 | `plan/` | entitlements, neuron plans, and the billing seam |
-| `worker/chat/` | the server-side chat brain: the agentic turn loop, its REST handlers, its tool surface, context window and plan board |
+| `worker/chat/` | the server-side chat brain: the agentic turn loop, its REST handlers, its tool surface, the context window and its facts ledger, the recall overlay, the prompt workspace and the plan board |
 | `worker/control/` · `deploy/` · `neuron/` | the swarm control plane — deploy, supervise, stream, steer, and the fail-open memory bridge |
 | `worker/browser/` | the browser driver — its own throwaway profile, or the user's real Chrome/Edge through the extension relay, behind one session model |
 | `worker/mcp/` | the foreign tool surface: find the MCP servers already installed on this machine, and call them |

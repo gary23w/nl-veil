@@ -8939,9 +8939,6 @@ fn personalFact(fact: []const u8) ?[]const u8 {
     return null; // general knowledge → hive-only (unchanged)
 }
 
-/// Drop a trailing "intro to the (now-stripped) directives" line — a short line ending in ':' that announces a
-/// save, e.g. "**Saved preferences:**" or "I've remembered:". Only touches the LAST line and only when it clearly
-/// reads as such an intro, so real prose ending in a colon (a list header with content under it) is left alone.
 /// One line of memories.jsonl, trimmed — and freed of a UTF-8 byte-order mark, which an editor or a PowerShell
 /// `Out-File` leaves ahead of the first record. Behind it the OLDEST memory failed every `ln[0] == '{'` gate here
 /// (invisible to the tab, the prompt block and FORGET:), and the forget rewrite copied it through unparsed, so the
@@ -9067,6 +9064,9 @@ test "the Memory tab follows the server: a memory frame re-reads the store mid-t
     try std.testing.expectEqual(@as(usize, 4), store.chat_mem_count);
 }
 
+/// Drop a trailing "intro to the (now-stripped) directives" line — a short line ending in ':' that announces a
+/// save, e.g. "**Saved preferences:**" or "I've remembered:". Only touches the LAST line and only when it clearly
+/// reads as such an intro, so real prose ending in a colon (a list header with content under it) is left alone.
 fn stripDanglingMemoryIntro(text: []const u8) []const u8 {
     const nl = std.mem.lastIndexOfScalar(u8, text, '\n');
     const last_raw = if (nl) |i| text[i + 1 ..] else text;

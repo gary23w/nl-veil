@@ -3287,7 +3287,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     var foreign_warned = false;
     // RECALL OVERLAY (overlay.zig): a per-turn working field of this conversation's memory, the durable notes as
     // the prompt shows them and the file ledger, grown from every finding as it lands, settled around the live
-    // cue before EVERY model call of the turn and rendered as a removable last block. Seeding is the one
+    // cue before EVERY round's streamed chat call of the turn and rendered as a removable last block. Seeding is the one
     // subprocess it spends; strengthening what fired is spent at turn exit. NL_MEM_OVERLAY=0 disables;
     // NL_MEM_OVERLAY_BYTES sizes the block; NL_HYPERSPACE_CAP sizes the field (the swarm's knob, shared).
     var overlay: ?ovl.Overlay = null;
@@ -8196,14 +8196,14 @@ fn scanToolChannel(app: *App, conv_dir: []const u8, id: []const u8, cursor: *usi
 ///
 /// Raising this also buys the time to spend it, at no extra cost: llm.callTimeoutS derives each call's
 /// wall-clock deadline from the budget it asked for, so the deadline widens with the request.
-/// An operator kill switch that DEFAULTS ON: only an explicit "0"/"false" turns the feature off. An unset
-/// variable must never read as disabled — that is how a reasoning upgrade silently fails to ship.
 /// A positive integer knob from the environment, or `default` when unset or unparsable.
 fn envUsize(environ: *const std.process.Environ.Map, name: []const u8, default: usize) usize {
     const v = environ.get(name) orelse return default;
     return std.fmt.parseInt(usize, std.mem.trim(u8, v, " \t\r\n"), 10) catch default;
 }
 
+/// An operator kill switch that DEFAULTS ON: only an explicit "0"/"false" turns the feature off. An unset
+/// variable must never read as disabled — that is how a reasoning upgrade silently fails to ship.
 fn envDisabled(environ: *const std.process.Environ.Map, name: []const u8) bool {
     const v = environ.get(name) orelse return false;
     const t = std.mem.trim(u8, v, " \t\r\n");
@@ -8547,7 +8547,7 @@ fn runInnerAgentic(
     // This turn's advertised tools array — the caller's static CAPS variant plus any granted recipe schemas,
     // built ONCE per turn in runTurn (turn-stable, byte-identical across drive passes → prefix-cache safe).
     turn_tools: []const u8,
-    overlay: ?*ovl.Overlay, // the recall overlay: settled before every model call, removed right after (overlay.zig)
+    overlay: ?*ovl.Overlay, // the recall overlay: settled before every round's chat call, removed right after (overlay.zig)
 ) InnerResult {
     const gpa = app.gpa;
     // Bind the coding/base triple to the names this body already uses (the main agentic stream is the CODING

@@ -17,8 +17,9 @@
 //! minimum, but the deploy half is declared OPTIONAL: a user who only wants chat declines it on the
 //! consent screen and still logs in. A declined scope is not a crash — Cloudflare refuses the call and
 //! `answer()` hands the model Cloudflare's own words, which is exactly the sentence a user needs to see.
-//! Deliberately never requested at all: DNS, zones, security posture, billing, memberships. A tool here
-//! can ship an app and spend the user's money; it cannot repoint their domain or disable their WAF.
+//! Deliberately never requested at all: security posture (WAF), billing, memberships. DNS, zone and Access
+//! scopes ARE requested since the tunnel (cf_tunnel.zig), optional like the rest, and cf_api has no path
+//! allowlist: a user who grants them lets a tool here write DNS records. It still cannot disable their WAF.
 //!
 //! TRANSPORT. curl, exactly as cf_oauth does it, and for the same reason: the bearer rides a curl config
 //! file (-K) and request bodies ride a scratch file, so no secret and no payload ever lands on the argv
