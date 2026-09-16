@@ -87,8 +87,10 @@ pub const Poller = struct {
 
     pub fn run(self: *Poller) void {
         log.trace("poller.run starting", .{});
+        nap.adopt(&self.store.poll_beat_ms); // this thread's heartbeat; the titlebar reads it (nap.zig)
+        defer nap.adopt(null);
         while (!self.stop.load(.monotonic)) {
-            self.store.poll_beat_ms.store(nap.nowMs(), .monotonic); // heartbeat (see nap.zig)
+            nap.beat();
             self.syncHost();
             self.drainCommands();
             self.refresh();
@@ -96,7 +98,7 @@ pub const Poller = struct {
             var i: u8 = 0;
             while (i < 10 and !self.stop.load(.monotonic)) : (i += 1) {
                 nap.ms(100); // NOT io.sleep: see nap.zig
-                self.store.poll_beat_ms.store(nap.nowMs(), .monotonic);
+                nap.beat();
                 if (self.hasPendingCmd()) break;
             }
         }

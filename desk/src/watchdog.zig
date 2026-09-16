@@ -24,6 +24,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
 const log = @import("log.zig");
+const nap = @import("nap.zig");
 
 /// Frame-loop sections, coarse enough that instrumenting them costs nothing and fine enough to separate
 /// "stuck in the graphics driver" from "stuck in our own drawing or input handling".
@@ -184,7 +185,9 @@ fn watch() void {
     var frames_at_os_hung: u64 = 0;
     var frames_prev: u64 = frames.load(.monotonic);
     while (running.load(.acquire)) {
-        io.sleep(.{ .nanoseconds = SAMPLE_MS * std.time.ns_per_ms }, .awake) catch return;
+        // NOT io.sleep: this is a plain std.Thread, the kind a stray thread alert can park for good (nap.zig) -
+        // and a watchdog that hangs is exactly the one that never reports. stop() is seen at the next sample.
+        nap.ms(SAMPLE_MS);
         const now = nowMs(io);
         const last = beat_ms.load(.monotonic);
         {
