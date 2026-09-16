@@ -1890,3 +1890,100 @@ test "the homepage only references assets the router actually serves" {
     // If a rewrite ever inlines everything, this floor fails loudly rather than passing on zero.
     try std.testing.expect(refs >= 4);
 }
+
+/// TEST: httpz's `listen()` on a thread of its own, with the outcome kept. A listen that wrongly succeeds on a
+/// held port then fails the test below, instead of leaving the runner blocked inside httpz's accept loop.
+const ListenAttempt = struct {
+    server: *httpz.Server(void),
+    err: ?anyerror = null,
+    done: std.atomic.Value(bool) = .init(false),
+
+    fn run(self: *ListenAttempt) void {
+        self.server.listen() catch |e| {
+            self.err = e;
+        };
+        self.done.store(true, .release);
+    }
+};
+
+test "the listen port: a second server cannot share it, and a stopped server's port is free again at once" {
+    // ServerThread.run's "is another veil already running?" never fired on Windows. httpz set SO_REUSEADDR, which
+    // on Windows lets a second socket bind a port a listener holds, so a second veil came up on 8787 with no error
+    // while the first kept answering (measured). vendor/httpz now binds with SO_EXCLUSIVEADDRUSE there. The second
+    // half guards the restart SO_REUSEADDR is usually kept for: the server closed its last connection itself, so
+    // that connection sits in TIME_WAIT on the server's side of the port, and the port must still bind at once.
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // A port nobody holds: the OS picks it, the probe lets go of it, the first server takes it.
+    const port = blk: {
+        const any: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+        var probe = try any.listen(io, .{ .mode = .stream, .protocol = .tcp });
+        defer probe.deinit(io);
+        break :blk probe.socket.address.getPort();
+    };
+
+    var first = try httpz.Server(void).init(io, gpa, .{ .address = .localhost(port) }, {});
+    defer first.deinit();
+    const first_thread = try first.listenInNewThread();
+    if (first._listener == null) {
+        // Another process took the port between the probe and this bind. Nothing here says anything about sharing.
+        first_thread.join();
+        return error.SkipZigTest;
+    }
+    var first_running = true;
+    defer if (first_running) {
+        first.stop();
+        first_thread.join();
+    };
+
+    {
+        var second = try httpz.Server(void).init(io, gpa, .{ .address = .localhost(port) }, {});
+        defer second.deinit();
+        var attempt: ListenAttempt = .{ .server = &second };
+        const t = try std.Thread.spawn(.{}, ListenAttempt.run, .{&attempt});
+        const deadline = std.Io.Timestamp.now(io, .awake).nanoseconds + 5 * std.time.ns_per_s;
+        while (!attempt.done.load(.acquire) and std.Io.Timestamp.now(io, .awake).nanoseconds < deadline) threadSleepMs(io, 5);
+        if (!attempt.done.load(.acquire)) {
+            // Still inside listen() after 5 s: it bound the held port and is serving it.
+            second.stop();
+            t.join();
+            std.debug.print("\na second server listened on 127.0.0.1:{d} while the first one held it\n", .{port});
+            return error.SecondServerSharedThePort;
+        }
+        t.join();
+        try std.testing.expectEqual(@as(?anyerror, error.AddressInUse), attempt.err);
+    }
+
+    // One request that asks the server to close. Reading to EOF waits for the server's FIN, so the server closes
+    // first and the connection ends in TIME_WAIT on its side.
+    {
+        const addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(port) };
+        const conn = try addr.connect(io, .{ .mode = .stream });
+        defer conn.close(io);
+        var wbuf: [256]u8 = undefined;
+        var wr = conn.writer(io, &wbuf);
+        try wr.interface.writeAll("GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+        try wr.interface.flush();
+        var rbuf: [1024]u8 = undefined;
+        var rd = conn.reader(io, &rbuf);
+        _ = try rd.interface.discardRemaining();
+    }
+    // httpz's handler closes the socket a moment before it takes the connection off its list, and stop() closes
+    // every socket still on that list. Stopping inside that moment closes this socket twice, which prints a
+    // WSAENOTSOCK stack trace in Debug without failing anything. Give the handler that moment first.
+    threadSleepMs(io, 100);
+    first.stop();
+    first_thread.join();
+    first_running = false;
+
+    var again = try httpz.Server(void).init(io, gpa, .{ .address = .localhost(port) }, {});
+    defer again.deinit();
+    const again_thread = try again.listenInNewThread();
+    const rebound = again._listener != null;
+    if (rebound) again.stop();
+    again_thread.join();
+    try std.testing.expect(rebound);
+}
