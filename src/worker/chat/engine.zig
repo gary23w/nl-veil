@@ -3757,9 +3757,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
             if (mem_saved > 0) {
                 mem_applied_turn += mem_saved;
                 mem_row = memoryUpdateRow(gpa, mem_note.items);
-                var sb3: [96]u8 = undefined;
-                const plural: []const u8 = if (mem_saved == 1) "" else "s";
-                emitKV(app, conv_dir, "status", "text", std.fmt.bufPrint(&sb3, "memory updated — {d} directive{s} applied", .{ mem_saved, plural }) catch "memory updated");
+                emitMemoryUpdated(app, conv_dir, mem_saved);
             }
         }
 
@@ -3924,6 +3922,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
                     defer gpa.free(row);
                     appendMsgObj(gpa, &conv_buf, "system", row, row.len);
                 }
+                emitMemoryUpdated(app, conv_dir, n);
             }
             if (n > 0 or mem_applied_turn > 0 or mem_step_nudged) {
                 mem_step_done = true;
@@ -9934,6 +9933,38 @@ fn memoryDirectiveShaped(step: []const u8) bool {
 fn memoryUpdateRow(gpa: std.mem.Allocator, note: []const u8) ?[]u8 {
     const what: []const u8 = if (note.len > 0) note else "directives applied";
     return std.fmt.allocPrint(gpa, "[engine: durable memory updated — {s}. The store on disk already holds this change; the YOUR MEMORY block above was captured before it. Recording these facts needs no further step and no file edit.]", .{what}) catch null;
+}
+
+/// Announce an applied batch of directives to every client: the status line the user reads, and a `memory`
+/// frame the desk acts on — it re-reads the store for its Memory tab the moment this lands. The tab used to
+/// load the store once at startup and after its own edits only, so a fact the veil had just kept stayed
+/// invisible until the next restart: the server had written, and nothing on the wire said so.
+fn emitMemoryUpdated(app: *App, conv_dir: []const u8, applied: usize) void {
+    var sb: [96]u8 = undefined;
+    const plural: []const u8 = if (applied == 1) "" else "s";
+    emitKV(app, conv_dir, "status", "text", std.fmt.bufPrint(&sb, "memory updated — {d} directive{s} applied", .{ applied, plural }) catch "memory updated");
+    emitKV(app, conv_dir, "memory", "text", "updated");
+}
+
+test "an applied memory batch is announced on the wire: the status line the user reads, and the memory frame the desk re-reads its store on" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-memwire-tmp";
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    var ta = try http.testApp(gpa, io, root);
+    defer ta.deinit();
+    const conv_dir = root ++ "/conv";
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, conv_dir, .default_dir) catch {};
+    emitMemoryUpdated(&ta.app, conv_dir, 2);
+    emitMemoryUpdated(&ta.app, conv_dir, 1);
+    const ev = std.Io.Dir.cwd().readFileAlloc(io, conv_dir ++ "/events.jsonl", gpa, .limited(64 << 10)) catch return error.TestUnexpectedResult;
+    defer gpa.free(ev);
+    // the exact frames, so the desk's `kind == "memory"` branch and the user's status line are both pinned
+    try std.testing.expect(std.mem.indexOf(u8, ev, "{\"kind\":\"status\",\"text\":\"memory updated — 2 directives applied\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ev, "{\"kind\":\"status\",\"text\":\"memory updated — 1 directive applied\"}") != null);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, ev, "{\"kind\":\"memory\",\"text\":\"updated\"}"));
 }
 
 test "durable store lines: a byte-order mark hides no memory, and a dressed directive is still a directive" {
