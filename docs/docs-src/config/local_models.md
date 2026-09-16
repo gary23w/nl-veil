@@ -29,6 +29,7 @@ Registered on the server router in main.zig as `/api/v1/models/local`; clients u
 - `?port=` overrides Ollama's default 11434 for a non-standard install, bounded to a real port number; anything else falls back to the default rather than erroring.
 - 3-second timeout: a live Ollama answers `/api/tags` in milliseconds, and a picker must not hang on a dead port.
 - Something answering on the port that is not Ollama (unparseable reply) reports reachable with nothing installed — more honest than a parse error the user can do nothing about.
+- Tests run the handler against a canned `worker/fakehttp.zig` stand-in reached through `?port=`. One test also takes over the default 11434, but only when `worker/portprobe.zig` finds it unheld. On Windows the stand-in's own listen cannot tell, because it shares a held port instead of failing, and would take a live Ollama's loopback traffic. A test pins that back-off on four OS-assigned held ports: zero takeovers. Before the probe it took all four.
 
 ---
 

@@ -33,6 +33,8 @@ test {
     _ = @import("worker/browser/session.zig"); // the CDP/extension driver: click-effect fingerprint diff
     _ = @import("worker/browser/ext.zig"); // the extension relay: command lifecycle + honest liveness
     _ = @import("worker/browser/ext_api.zig"); // who may pair, who may relay
+    _ = @import("worker/browser/broker.zig"); // the tool-call broker: every listener on a port of its own
+    _ = @import("worker/portprobe.zig"); // is a port held: the Windows answer std listen and SO_REUSEADDR cannot give
     _ = @import("worker/pixelrag.zig"); // doc-id safety, fact sanitising, query→tile scoring
     _ = @import("worker/bufedit.zig");
     _ = @import("worker/builtin.zig"); // built-in engine facade: sentinel resolution + weights-store election
