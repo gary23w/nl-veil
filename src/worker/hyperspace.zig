@@ -9,7 +9,7 @@ const Mem = oscillation.Mem;
 pub const DEFAULT_MAX_FACTS: usize = 160;
 pub const MIN_FACTS: usize = 16;
 pub const MAX_FACTS_CAP: usize = 4096;
-const MAX_FACT_LEN: usize = 400; // hard byte cap per stored fact so a pathological long fact can't bloat the bound
+pub const MAX_FACT_LEN: usize = 400; // hard byte cap per stored fact so a pathological long fact can't bloat the bound
 const MAX_STEMS: usize = 24; // significant stems kept per fact
 const SETTLE_ITERS: u32 = 4; // spreading-activation passes (converges fast on a bounded field)
 
@@ -41,7 +41,7 @@ fn isStop(w: []const u8) bool {
 
 /// Extract the sorted, unique stem-hashes of a fact (lowercased alnum tokens, length 4..40, stop-words dropped,
 /// capped). Sorted so overlap is a linear merge. Caller owns the returned slice.
-fn stemHashes(gpa: std.mem.Allocator, text: []const u8) []u64 {
+pub fn stemHashes(gpa: std.mem.Allocator, text: []const u8) []u64 {
     var set: std.ArrayListUnmanaged(u64) = .empty;
     defer set.deinit(gpa);
     var lb: [40]u8 = undefined;
@@ -66,7 +66,7 @@ fn stemHashes(gpa: std.mem.Allocator, text: []const u8) []u64 {
 }
 
 /// Intersection size of two SORTED stem-hash arrays — the cheap similarity kernel of the field.
-fn interCount(a: []const u64, b: []const u64) u32 {
+pub fn interCount(a: []const u64, b: []const u64) u32 {
     var i: usize = 0;
     var j: usize = 0;
     var c: u32 = 0;
