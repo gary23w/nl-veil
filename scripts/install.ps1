@@ -1,5 +1,5 @@
 # nl-veil one-command installer — Windows PowerShell
-#   iwr -useb https://raw.githubusercontent.com/gary23w/nl-veil/main/install.ps1 | iex
+#   iwr -useb https://raw.githubusercontent.com/gary23w/nl-veil/main/scripts/install.ps1 | iex
 #
 # What it does (and nothing more): put the repo at $env:VEIL_HOME (default ~\nl-veil), add it to
 # your user PATH so `veil` works in any new terminal, and tell you the next two commands. Zig 0.16+

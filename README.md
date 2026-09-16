@@ -6,7 +6,7 @@
 
 <p>
   <a href="https://github.com/gary23w/nl-veil/actions/workflows/release.yml"><img alt="build" src="https://github.com/gary23w/nl-veil/actions/workflows/release.yml/badge.svg"></a>
-  <a href="https://github.com/gary23w/nl-veil/releases"><img alt="release" src="https://img.shields.io/badge/release-v1.1.0-A8241B"></a>
+  <a href="https://github.com/gary23w/nl-veil/releases"><img alt="release" src="https://img.shields.io/badge/release-v1.1.1-A8241B"></a>
   <img alt="zig" src="https://img.shields.io/badge/zig-0.16-F7A41D?logo=zig&logoColor=white">
   <a href="https://huggingface.co/gary23w/the-veil-12b"><img alt="built-in model" src="https://img.shields.io/badge/built--in%20model-the--veil--12b-6E4A27?logo=huggingface&logoColor=white"></a>
   <a href="https://huggingface.co/gary23w/gary-neuron-emergent"><img alt="memory cortex" src="https://img.shields.io/badge/cortex-gary--neuron--emergent-6E4A27?logo=huggingface&logoColor=white"></a>
@@ -56,6 +56,7 @@ code, your keys and everything it learns stay in a folder next to the binary.
 | [**Log in with Cloudflare**](#log-in-with-cloudflare) | one click: your account's live Workers AI models, an automatic R2 backup of your chats, and an agent that can deploy to your own account |
 | [**The built-in model**](#the-built-in-model--nothing-to-install) | `the-veil-12b` served in-process from a downloaded GGUF — no external runtime, no key, works offline |
 | [**The chat brain in the server**](#the-chat-brain-runs-in-the-server) | one agentic turn loop, server-side; the web app, the desktop and `veil chat` are thin clients of it |
+| [**A chat without end**](#a-long-conversation-keeps-its-past) | every summary fold banks its facts in an append-only ledger, and memory is settled around every round of a turn as an advisory overlay that never enters the transcript |
 | [**The model trio**](#three-models-one-turn--the-model-trio) | every LLM call is labelled and routed — coding / thinking / prompting — so a cheap model can carry the bulk |
 | [**Your own browser**](#it-can-use-your-browser) | drive the Chrome/Edge you're already signed into, through a tiny extension — or a private throwaway profile |
 | [**The tool belt**](#the-tool-belt) | ~58 tools: files, shell, tests, web, deep crawl, memory, images/OCR, MCP servers, tool authoring |
@@ -88,7 +89,7 @@ front of you.
 | **Workers AI, live-synced** | Your account's real model catalogue is fetched from Cloudflare and replaces the Workers AI group in every model picker. The repo ships exactly one model id as a bootstrap default — the list you pick from is always your account's, never a stale copy in a file. |
 | **Chat on the free tier** | Workers AI has a free daily allowance (10,000 neurons/day as of 2026) — **no paid plan and no card for the base tier**. Logging in points chat at it automatically; one click in Settings puts you back on local or BYOK. |
 | **R2 chat backup** | The first login provisions an `nl-veil` bucket in your account and mirrors your conversations and durable memories into it, incrementally, in the background. Your data stays local too — this is a copy, not a move. R2 is 10 GB free with no egress fees, but must be **activated once** on your Cloudflare dashboard; until then the card says so in Cloudflare's own words. |
-| **An agent that can deploy** | With the build scopes granted, the assistant can write a Worker and ship it to a live `workers.dev` URL, read and write R2, query D1, and reach the rest of the API — see [the `cf_` tool belt](#the-cf_-tool-belt). |
+| **An agent that can deploy** | With the build scopes granted, the assistant can write a Worker and ship it to a live `workers.dev` URL, read and write R2, query D1, and reach the rest of the API — today from the web app and scheduled tasks; see [the `cf_` tool belt](#the-cf_-tool-belt) for why not yet from the desktop. |
 | **Everywhere a turn runs** | Chat, swarm casts and scheduled tasks all resolve the same login, so a task that fires at 3am uses it too. |
 
 ### What it asks for, and what you can refuse
@@ -109,8 +110,8 @@ that later needs one simply refuses with Cloudflare's own explanation. Grant the
 **DNS, zone and Access scopes are requested — optional and declinable like the rest.** The tunnel needs them
 to put this veil on a hostname you own: `argotunnel`, `dns.read`/`dns.write`, `zone.read`, and
 `zone-access.read`/`zone-access.write` with `access-org.read`. Decline them and everything except a custom
-domain still works — the tunnel falls back to a random `trycloudflare.com` address, which is the default
-anyway. Grant them and you are granting real DNS write on your zones, which is what putting a name on a
+domain still works — the default tunnel is a random `trycloudflare.com` address that needs none of them
+(tick **use my domain** without them and the switch says so and asks you to log in again). Grant them and you are granting real DNS write on your zones, which is what putting a name on a
 tunnel requires; the consent screen names each one.
 
 **Never requested at all:** billing and payment, WAF and security-rule configuration, or the ability to add
@@ -123,6 +124,11 @@ everything in it stay in your Cloudflare account, because they were always yours
 
 When — and only when — a turn holds Cloudflare credentials, six tools join the assistant's belt. A user
 who never connected is never even shown them.
+
+**Where they run today: turns the server executes itself — the web app and scheduled tasks.** The desktop
+app and `veil chat` hand tool calls to a client-side executor, which holds no Cloudflare credentials, so from
+there a `cf_` call answers that it is not connected; and a non-admin account is shown the family but its
+sandbox refuses every call. Both are known gaps, not the design.
 
 | tool | what it does |
 |---|---|
@@ -148,10 +154,10 @@ on any domain you own - the veil is a personal harness, and a URL nobody can gue
 default for one. The switch finds or fetches Cloudflare's official `cloudflared` connector and runs it against
 this server; the URL lands in the box (Copy / Open), the desk shows the same row, and the switch position
 survives a restart. On a headless box, `NL_TUNNEL=1` (or `veil --tunnel`) turns it on at boot and the URL is
-printed in the log when the connector registers.
+printed in the log once it is published.
 
-The URL appears only once Cloudflare's own resolver has published it, usually within ten seconds of the
-connector registering. That short wait is deliberate: a lookup made before the name exists leaves it
+The URL appears once Cloudflare's own resolver has published it, usually within ten seconds of the
+connector registering, or after a 90-second budget flagged as not yet published. That short wait is deliberate: a lookup made before the name exists leaves it
 unresolvable on that network for half an hour (the domain's negative-cache TTL), so nothing on your machine,
 not even the status poll, gets to ask first.
 
@@ -244,12 +250,12 @@ them holds state the others can't see.
 
 **(a) The web app.** `web/public/{index.html,app.js,styles.css,models.json}` — no bundler, no build
 step, no framework. `index.html` is a single `<div id="app"></div>`; the entire UI renders from
-`app.js`. The four files are embedded into the binary at compile time (`build.zig:71-74`) and served
+`app.js`. The four files are embedded into the binary at compile time (`build.zig:76-79`) and served
 by `staticIndex` / `staticJs` / `staticCss` / `staticModels` (`src/main.zig`, the route table). Tabs:
 **Dashboard, Chat, Tasks, Swarms, Admin** (admins only), **Settings**.
 
 **(b) The desktop window.** `desk/*.zig`, compiled **into the same binary** via `-Dapp` (default true,
-`build.zig:82`). In app mode the GUI runs on the main thread and the HTTP server on a background
+`build.zig:121`). In app mode the GUI runs on the main thread and the HTTP server on a background
 thread (`src/main.zig`, "APP MODE") — one process, no child to spawn, no second executable in the
 bundle.
 raylib is a *lazy* dependency, so `-Dapp=false` never fetches it at all.
@@ -274,7 +280,7 @@ raylib is a *lazy* dependency, so `-Dapp=false` never fetches it at all.
 ## Install
 
 **Download it and run it — no toolchain, nothing to build.** Grab your platform's bundle from the
-**[latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.1.0)**, unzip, and run `veil`:
+**[latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.1.1)**, unzip, and run `veil`:
 
 | You're on | Download | Then run |
 |---|---|---|
@@ -301,12 +307,12 @@ These installers **clone the repo and build it**, so they need [Zig 0.16+](https
 
 **macOS / Linux**
 ```sh
-curl -fsSL https://raw.githubusercontent.com/gary23w/neuron-loops/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/gary23w/nl-veil/main/scripts/install.sh | sh
 ```
 
 **Windows** (PowerShell)
 ```powershell
-iwr -useb https://raw.githubusercontent.com/gary23w/neuron-loops/main/scripts/install.ps1 | iex
+iwr -useb https://raw.githubusercontent.com/gary23w/nl-veil/main/scripts/install.ps1 | iex
 ```
 
 or by hand:
@@ -335,7 +341,7 @@ terminal and your terminal is left alone.
 
 > **It listens on every network interface by default.** `NL_BIND` is unset → the server binds
 > `0.0.0.0`, which means anyone who can reach this machine on port 8787 can open the login page
-> (`src/main.zig:427-439`). That is the point — a phone on the sofa should be able to open it — but
+> (`src/main.zig:475-487`). That is the point — a phone on the sofa should be able to open it — but
 > it is worth knowing before you leave it running on a café wifi. `NL_BIND=127.0.0.1` pins it to this
 > machine only. See [the walkthrough](#walkthrough-run-it-add-people-put-it-on-your-network).
 
@@ -435,7 +441,7 @@ step 5** — the rest is about letting other people in.
 
 ### 1. Download and unblock it
 
-Grab the bundle for your OS from the [latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.1.0)
+Grab the bundle for your OS from the [latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.1.1)
 and unzip it somewhere you'll find again. Builds are unsigned, so:
 
 - **Windows** shows *"Windows protected your PC"* → **More info** → **Run anyway**.
@@ -468,10 +474,10 @@ So if you care about the banner, **start it from a terminal instead** — when a
 ### 3. Find the URL
 
 On startup the server prints one complete URL per address this machine answers on
-(`src/main.zig:671-696`, using `src/config/lan.zig`):
+(`src/main.zig:861-889`, using `src/config/lan.zig`):
 
 ```
-neuron-loops 1.1.0 on http://localhost:8787
+neuron-loops 1.1.1 on http://localhost:8787
     open from another machine (phone, laptop) at:
       http://192.168.1.42:8787
 ```
@@ -479,7 +485,7 @@ neuron-loops 1.1.0 on http://localhost:8787
 If you missed the banner, ask the OS for the address instead — `ipconfig` (Windows), `ifconfig` or
 `ip addr` (macOS/Linux) — and use `http://<that-address>:8787`.
 
-The port is **8787** unless you set `NL_PORT` (`src/main.zig:369-373`). It is the one place the port is
+The port is **8787** unless you set `NL_PORT` (`src/main.zig:409-413`). It is the one place the port is
 resolved, so the CLI and the server always agree.
 
 ### 4. Log in as the admin
@@ -526,7 +532,7 @@ the next restart (`src/config/server_config.zig`).
 
 **Admin → provider key** (`POST /api/v1/admin/keys`). It is stored sealed in the same vault as
 everyone else's keys, under a reserved uid 0 that no real account can hold
-(`src/worker/chat/service.zig:30`, `:65-76`).
+(`src/worker/chat/service.zig:31`, `:89-100`).
 
 The trade is worth stating outright, because it is a billing decision:
 
@@ -739,6 +745,36 @@ queryable answer. Recalled memory arrives **scored** (numbers, not vibes), a fac
 stored sibling arrives marked `[CONTESTED]` with both sides shown, and a sentinel-gated second model
 audits doubtful memory before the answering model reads it — annotations only, nothing is silently
 deleted.
+
+### A long conversation keeps its past
+
+Every fold of the rolling summary also appends the concrete facts it established — decisions, names,
+paths, values — to an append-only `digest.jsonl` beside the transcript, and each turn projects that
+ledger back for the live question with no model call: the newest lines, then the ones closest to what is
+being asked. The summary, the facts block and the verbatim window are all sized to the window and capacity
+of the model that reads them and the model that writes the folds, so a 32k model keeps the history it had,
+a large model with a 128k window replays 64 KB verbatim, and a small local summarizer is never handed a
+fold it cannot hold
+([context](https://gary23w.github.io/nl-veil/#doc=worker/chat/context)).
+
+Inside a turn, a [recall overlay](https://gary23w.github.io/nl-veil/#doc=worker/chat/overlay) keeps a small
+working field of the conversation's memory, your durable notes and the file ledger, grows it with every
+finding the moment it exists, and settles it around what the model is doing right now before **every**
+round of the turn's tool loop (the auxiliary verdict, compaction and planning calls go without it). It
+reaches the model as one advisory block that is removed the instant the model answers — never
+written to the transcript, a summary or the store. A line shown three times and never used is set aside for
+the next four calls; a line the model does use is strengthened in the store at the end of the turn.
+`NL_MEM_OVERLAY=0` turns it off, `NL_MEM_OVERLAY_BYTES` sizes the block (900 by default).
+
+When the veil keeps or drops a durable memory about you (`REMEMBER:` / `FORGET:`), the turn records that
+under its reply and announces it on the event stream, so the desktop's Memory tab refreshes on the spot
+and the change is never mistaken for a step still to do.
+
+**A provider failure costs a wait, not the turn.** In a chat turn, any failed call to a hosted endpoint is
+retried up to ten times in a row — 5 s growing to 60 s apart, about five minutes in all — counted per
+provider, with the Cloudflare token re-resolved before each try. Each wait shows as a status line, and
+**Stop** ends it at once. Local endpoints and the swarm's workers keep the short ladder for transient
+errors only.
 
 ## The tool belt
 
@@ -1134,7 +1170,7 @@ full first-login sequence is [step 4](#4-log-in-as-the-admin).
 
 A default model nobody can afford to call is not a default. **Admin → provider key** stores one
 instance-wide key (`POST /api/v1/admin/keys`), sealed in the same vault as everyone else's under a
-reserved uid that no account can hold (`SERVER_KEY_UID = 0`, `src/worker/chat/service.zig:30`).
+reserved uid that no account can hold (`SERVER_KEY_UID = 0`, `src/worker/chat/service.zig:31`).
 
 It is the **last** resort in the resolution ladder — an explicitly-supplied key wins, then the user's
 own vaulted key, then this one — so an account that brings its own billing is never silently switched
@@ -1196,9 +1232,10 @@ second control plane. Today the console operates the local server's fleet.
 ## Project layout
 
 ```
-install.sh  install.ps1    one-command installers (no Python)
-scripts/                   the release build scripts (build-release.sh / build-release.ps1)
-veil  veil.cmd             the `veil` front-door shim → the compiled binary
+scripts/                   install.sh / install.ps1 (the from-source installers), veil / veil.cmd (the
+                           `veil` front-door shim → the compiled binary), build-official.sh and
+                           build-release.* (the release builders), check.ps1 / check.sh (the acceptance
+                           oracle), bump-version.ps1 (every version stamp at once), sync-models.py
 build.zig                  the Zig build (server + CLI + desktop; -Dapp=false = server-only)
 src/
   main.zig                 entry point: CLI dispatch, then the server + control plane (auth, routes)
@@ -1208,11 +1245,13 @@ src/
   auth/  config/  admin/   accounts + API keys, the encrypted key vault, the admin API
     config/lan.zig         which addresses this machine is reachable at (the startup banner's URLs)
     config/server_config.zig  admin-owned runtime settings → data/server-config.json
+    config/cf_{oauth,r2,tunnel}.zig  Log in with Cloudflare, the R2 chat backup, the public-URL tunnel
   worker/                  the hive and the server-side brain:
-    chat/{engine,service,tools,context,plan,sync,toolperf,paths}.zig  the chat brain — the agentic
-                                                   turn loop, its REST handlers, tools, context
-                                                   window, plan board, client file-sync, tool
-                                                   timings, and conversation paths
+    chat/{engine,service,tools,context,overlay,workspace,plan,sync,toolperf,paths}.zig  the chat
+                                                   brain — the agentic turn loop, its REST handlers,
+                                                   tools, context window and facts ledger, the recall
+                                                   overlay, the prompt workspace, plan board, client
+                                                   file-sync, tool timings, and conversation paths
     sched.zig              scheduled tasks (each run is a server chat conversation)
     continuity.zig         resume anchors — what a cut unit of work established, banked in
                                                    neuron-db so the next run continues it
@@ -1254,15 +1293,31 @@ dependency entirely rather than compiling it unused.
 
 ## Release
 
-**Current: [`v1.1.0`](https://github.com/gary23w/nl-veil/releases/tag/v1.1.0)** — the
+**Current: [`v1.1.1`](https://github.com/gary23w/nl-veil/releases/tag/v1.1.1)** — a point release
+about memory and staying power. **[A chat without end](#a-long-conversation-keeps-its-past)**: every fold
+of the rolling summary also banks the facts it established in an append-only ledger that each turn
+projects back for the live question, and the summary, the facts and the verbatim window are sized to the
+models that read and write them — where every fold used to replace the summary with a fresh 250-word
+rewrite and lose whatever the rewrite left out. **The recall overlay**: memory is settled around what the
+model is doing before every round of a turn, not only at its start, and offered as an advisory block
+that never enters the transcript; a line the model ignores rotates out, a line it uses is strengthened in
+the store. **Memory you can see**: a `REMEMBER:` / `FORGET:` the veil applies is recorded as an event
+rather than re-driven as a step, and the desktop's Memory tab reads the per-user store the server
+actually writes and refreshes the moment it changes. **Staying power**: a failed model call in a chat
+turn is retried ten times over about five minutes, with the Cloudflare token re-resolved between tries
+and Stop ending the wait, and Windows no longer disowns the live desk window as *Not Responding*. The
+model menus now follow a daily, keyless models.dev sync.
+[Full notes](docs/release/RELEASE-v1.1.1.md).
+
+**Before it: [`v1.1.0`](docs/release/RELEASE-v1.1.0.md)** — the
 first stable release. Everything before it — `v1.0.0-alpha.1` through `v1.0.1-beta-7` — went out under a
-prerelease label; this is the first build published without one. Three things earned it. **[A public
-URL](#public-url---the-tunnel-switch)**: one switch and the veil is reachable at a Cloudflare address
-through your own account — confidential by default, a random `trycloudflare.com` hostname that changes on
+prerelease label; it was the first build published without one. Three things earned it. **[A public
+URL](#public-url---the-tunnel-switch)**: one switch and the veil is reachable at a Cloudflare address —
+confidential by default, a random `trycloudflare.com` hostname that changes on
 every start and puts nothing on a domain you own, with your own domain behind a Cloudflare Access policy
 as the explicit alternative; the address is revealed only once Cloudflare's own resolver has published it,
 because a lookup made before the name exists leaves it unresolvable on that network for half an hour.
-**Two ways the process could stop answering, both gone**: the desk's worker threads no longer park on the
+**Two ways the process could stop answering, both gone**: the desk's worker loops no longer sleep on the
 Io runtime's thread alert — one bit shared by everything else on the thread, which froze the window
 mid-turn while the server was healthy — and in the server one keep-alive client no longer pins an httpz
 worker and stalls the next socket behind it, where about one new connection in twelve had been waiting
@@ -1272,13 +1327,14 @@ cut at the output cap is continued instead of guessed at, and the facts a long t
 compaction that used to discard them — each one found by an unattended run graded against what was
 actually on disk, not by reading code. [Log in with Cloudflare](#log-in-with-cloudflare) shipped in beta-7
 and the tunnel is built on it; both are documented in full above.
-[Full notes](docs/release/RELEASE-v1.1.0.md) ·
+[v1.1.0 notes](docs/release/RELEASE-v1.1.0.md) ·
 [beta-7](docs/release/RELEASE-v1.0.1-beta-7.md) — the veil gets a cloud ·
 [beta-6](docs/release/RELEASE-v1.0.1-beta-6.md) — a long turn continues instead of starting over.
 
 Builds ship on the [Releases page](https://github.com/gary23w/nl-veil/releases), one per
-platform. Unzip and run `veil` — that starts the server **and** opens the desktop app. No Python, no
-toolchain, no first-run build; the memory engine ships inside.
+platform. Unzip and run `veil` — that starts the server **and** opens the desktop app. No toolchain and
+no first-run build, and the memory engine ships inside; the one thing it does not bring is the Python the
+agent's tool belt shells out to (see [What this actually is](#what-this-actually-is)).
 
 | asset | what it is |
 |---|---|
