@@ -26,7 +26,7 @@ Both binaries consume this file: the server imports it directly (the yaml rides 
 
 ## Usage Context
 
-Registered as the named module `modelcfg` in both builds. Importers: `worker/chat/service.zig`, `worker/deploy/service.zig`, `worker/run.zig`, and `desk/src/catalog.zig` (re-export for every desk model menu — chat Settings, Swarm deploy, Tasks model override).
+Registered as the named module `modelcfg` in both builds. Importers: `worker/chat/service.zig`, `worker/chat/engine.zig`, `worker/deploy/service.zig`, `worker/run.zig`, `worker/sched.zig`, `src/tests.zig`, and `desk/src/catalog.zig` (re-export for every desk model menu — chat Settings, Swarm deploy, Tasks model override).
 
 ## Notable Implementation Details
 
@@ -35,6 +35,7 @@ Registered as the named module `modelcfg` in both builds. Importers: `worker/cha
 - `senseModel` is signal-driven, never a per-model hardcode: yaml-stated capacity wins, else params/ctx are parsed from the id itself ("8b", "1.5b", "8x7b" MoE totals, "135m", "128k"), else the provider's `local` flag (unnamed local models assume small — never drown them), else light-variant naming ("mini"/"nano"/"flash"/… as whole bounded segments, so "minimax" never reads as "mini"), else hosted-unknown = large.
 - A small context window CAPS the tier regardless of params — the budgets must fit the window; an explicit yaml `tier:` pin wins over every inference (e.g. the rotating free-model router).
 - The embedded catalog itself is the test fixture — CI fails on a bad models.yaml edit.
+- **The end of a provider's model list may be machine-kept.** A provider opts in to the daily models.dev sync (`scripts/sync-models.py`, run by `.github/workflows/models-sync.yml`) with `sync: models.dev/<id> [confirming sources]`. `Provider` has no field for that key: the parser skips it as it skips any provider key it does not recognize, and the `# >>> synced` / `# <<< synced` markers are full-line comments to it, so the entries between them are ordinary models. The script rewrites only that block at the end of the provider's `models:` list (at most its 4 newest qualifying models, stating `ctx_k` only for a window under 128K) and never a hand-written entry, so `models[0]`, the model a provider switch selects, never moves; it reads and sends no API key. Because the sync may append after the four hand-written Kimi ids, the moonshot test pins the dead legacy ids out by name instead of counting exactly four models.
 
 ---
 

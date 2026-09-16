@@ -25,6 +25,7 @@ Performs a single bounded HTTP/1.1 round trip to 127.0.0.1:<port> without spawni
 - std
 - std.Io (Io.Select racing, Io.net.IpAddress loopback connect/stream, Io.Reader framing, Io.Writer.Allocating request building, io.sleep)
 - std.ascii (case-insensitive header/host matching)
+- wsock.zig — on Windows, a loopback or IPv4-literal host goes through one blocking Winsock socket with send/receive timeouts instead of the Io race (the 2026-09-02 thread-parking fix); a DNS name keeps the portable path (desk/src/wsock.zig is the twin of src/worker/wsock.zig)
 - TWIN: src/worker/httpc.zig — byte-for-byte duplicate in the separate server package; bug fixes must be applied to both
 
 ## Usage Context

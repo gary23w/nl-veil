@@ -41,7 +41,9 @@
       { p: 'config/cf_oauth', c: 'CF-03', t: 'Log in with Cloudflare — PKCE public client, vault-sealed tokens', s: 'cf_oauth.zig' },
       { p: 'config/lan', c: 'CF-04', t: 'LAN addresses — ipconfig/ifconfig parse for the startup URL', s: 'lan.zig' },
       { p: 'config/local_models', c: 'CF-05', t: 'Installed Ollama models — loopback /api/tags relay', s: 'local_models.zig' },
-      { p: 'config/server_config', c: 'CF-06', t: 'Admin runtime defaults — model trio + browser preference, JSON-persisted', s: 'server_config.zig' }
+      { p: 'config/server_config', c: 'CF-06', t: 'Admin runtime defaults — model trio + browser preference, JSON-persisted', s: 'server_config.zig' },
+      { p: 'config/cf_r2', c: 'CF-07', t: 'R2 backup — incremental chat + memory mirror into a bucket the user owns', s: 'cf_r2.zig' },
+      { p: 'config/cf_tunnel', c: 'CF-08', t: 'Cloudflare Tunnel — the public-URL switch: quick by default, named + Access on request', s: 'cf_tunnel.zig' }
     ]},
     { key: 'plug/', label: 'PLUG — THE EXTENSION LAYER', docs: [
       { p: 'plug/plugins', c: 'PG-01', t: 'Plugin registry — Lua manifests, tool/policy/prompt hooks, swap-on-reload', s: 'plugins.zig' },
@@ -130,7 +132,11 @@
       { p: 'worker/ragingest', c: 'WK-24', t: 'Ragingest — offline local-file RAG ingest into the hive', s: 'ragingest.zig' },
       { p: 'worker/ragmirror', c: 'WK-25', t: 'Ragmirror — local nl-rag pack mirror + atlas extension', s: 'ragmirror.zig' },
       { p: 'worker/ocr', c: 'WK-26', t: 'OCR — OS-native shims: vision as text', s: 'ocr.zig' },
-      { p: 'worker/pixelrag', c: 'WK-27', t: 'Pixelrag — screenshot-tile ingest and retrieval', s: 'pixelrag.zig' }
+      { p: 'worker/pixelrag', c: 'WK-27', t: 'Pixelrag — screenshot-tile ingest and retrieval', s: 'pixelrag.zig' },
+      { p: 'worker/cftools', c: 'WK-28', t: 'Cftools — the cf_ belt: deploy a Worker, R2, D1, any v4 endpoint', s: 'cftools.zig' },
+      { p: 'worker/net', c: 'WK-29', t: 'Net — cached offline probe behind the hosted fast-fail', s: 'net.zig' },
+      { p: 'worker/wsock', c: 'WK-30', t: 'Wsock — blocking Winsock round trip under httpc on Windows', s: 'wsock.zig' },
+      { p: 'worker/dataset', c: 'WK-31', t: 'Dataset — every LLM call and tool run captured as a fine-tuning set', s: 'dataset.zig' }
     ]},
     { key: 'desk/', label: 'DESK — THE NATIVE DASHBOARD (veil-desk)', note: 'zig + raylib', docs: [
       { p: 'desk/main', c: 'DK-01', t: 'Entry point — borderless raylib window, render loop, tabs', s: 'main.zig' },
@@ -150,7 +156,11 @@
       { p: 'desk/log', c: 'DK-15', t: 'Logger — ring buffer to veil-desk.log + the F12 overlay', s: 'log.zig' },
       { p: 'desk/gitvc', c: 'DK-16', t: 'Gitvc — git + GitHub operations for the chat', s: 'gitvc.zig' },
       { p: 'desk/assets', c: 'DK-17', t: 'Assets — icons + OpenDyslexic embedded in the exe', s: 'assets.zig' },
-      { p: 'desk/runner', c: 'DK-18', t: 'Runner — the engine door to the server; loopback vtable', s: 'runner.zig' }
+      { p: 'desk/runner', c: 'DK-18', t: 'Runner — the engine door to the server; loopback vtable', s: 'runner.zig' },
+      { p: 'desk/roles', c: 'DK-19', t: 'Roles — the prebuilt chat-role catalog, embedded from roles.json', s: 'roles.zig' },
+      { p: 'desk/watchdog', c: 'DK-20', t: 'Watchdog — UI-hang witness: stale frames + the OS hung-window verdict', s: 'watchdog.zig' },
+      { p: 'desk/wsock', c: 'DK-21', t: 'Wsock — blocking Winsock round trip, twin of the server copy', s: 'wsock.zig' },
+      { p: 'desk/nap', c: 'DK-22', t: 'Nap — alert-free sleep + heartbeat clock for desk threads', s: 'nap.zig' }
     ]}
   ];
 

@@ -21,7 +21,8 @@ Spawning curl.exe put the bearer token and full JSON body on the command line (r
 
 ## Dependencies
 
-- `std` only — `std.Io` sockets, `Io.Select` for the timeout race.
+- `std` — `std.Io` sockets, `Io.Select` for the timeout race.
+- [`wsock.zig`](#doc=worker/wsock) — on Windows, a loopback or IPv4-literal host goes through one blocking Winsock socket with send/receive timeouts instead of the `Io` race (the 2026-09-02 thread-parking fix); a DNS name keeps the portable path.
 
 ## Usage Context
 

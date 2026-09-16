@@ -24,5 +24,5 @@ test {
     _ = @import("secrets.zig");
     _ = @import("store.zig");
     _ = @import("theme.zig");
-    _ = @import("watchdog.zig"); // the stall-detection timing rules, without threads or a clock
+    _ = @import("watchdog.zig"); // the stall-detection timing rules, plus one real-thread, real-clock freeze and recovery
 }

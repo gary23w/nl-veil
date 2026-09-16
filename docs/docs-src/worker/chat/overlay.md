@@ -2,7 +2,7 @@
 
 **File:** `src/worker/chat/overlay.zig`
 **Module:** `worker/chat`
-**Description:** The recall overlay — a per-turn working field of the conversation's memory, settled by spreading activation around what the model is doing **right now**, rendered as one advisory block before every model call and removed the instant the model has answered.
+**Description:** The recall overlay — a per-turn working field of the conversation's memory, settled by spreading activation around what the model is doing **right now**, rendered as one advisory block before every round's chat-model call and removed the instant the model has answered.
 
 ---
 
@@ -18,7 +18,7 @@ The overlay reuses the swarm's in-process activation field ([hyperspace](#doc=wo
 |---|---|---|
 | turn start | the field is seeded: the conversation's own partition (one wide associative pull around the goal), the durable memory exactly as the prompt shows it (credential values already masked), the file ledger | 1 |
 | every finding | the note the engine mints for the store enters the field the moment it exists — recallable in the very next round, compaction or not | 0 |
-| every model call | the field settles around the live **cue** — goal, last narration, last tool call, last result head, recently fired lines — and the block is appended as the LAST message of that request only, then removed | 0 |
+| every round's chat-model call (not the auxiliary verdict, compaction or planning calls) | the field settles around the live **cue** — goal, last narration, last tool call, last result head, recently fired lines — and the block is appended as the LAST message of that request only, then removed | 0 |
 | turn end | every fired store-backed line is strengthened in the store, so a fact that helped ranks higher next time | ≤ 8 |
 
 ## Advisory by construction

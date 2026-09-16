@@ -16,11 +16,13 @@
 //! WHEN: a successful OAuth callback kicks the first sync (cf_oauth.callback), and every status poll
 //! from a connected client re-arms a throttled background pass (maybeAutoSync, 15-min cadence) — so
 //! backup rides the polling that already exists instead of needing its own daemon. "Sync now" is a
-//! POST away. Each pass is INCREMENTAL: a jsonl manifest of relpath -> size uploaded lasts across
-//! restarts, and only files whose size moved re-upload (the tree is append-heavy jsonl, where any
-//! change moves the size).
+//! POST away. Each pass is INCREMENTAL: a jsonl manifest of relpath -> size (plus a content hash for the
+//! JSON files rewritten in place, see needsHash) lasts across restarts, and only files whose size or hash
+//! moved re-upload. The size test assumes append-only jsonl; memories.jsonl is rewritten whole by a FORGET,
+//! so a same-length rewrite between passes is missed until the next size change.
 //!
-//! WHAT SYNCS: per-conversation messages.jsonl / context.json / brief.json / plan.jsonl / files.jsonl,
+//! WHAT SYNCS: per-conversation messages.jsonl / context.json / digest.jsonl / brief.json / plan.jsonl /
+//! files.jsonl,
 //! and the durable memories. NOT events.jsonl (huge, replayable), NOT build workdirs (that is code,
 //! and it can be gigabytes), NOT anything from the sealed vault, and NOT the scheduled-task
 //! definitions ({data}/u{uid}/_sched/*.json): the ON-DISK task files carry the REAL per-task
@@ -42,7 +44,7 @@ const badReq = http.badReq;
 pub const BUCKET = "nl-veil";
 
 const STATE_FILE = ".cf_r2.json"; // {data}/u{uid}/.cf_r2.json — status the UIs read
-const MANIFEST_FILE = ".cf_r2_manifest.jsonl"; // relpath -> size at last successful upload
+const MANIFEST_FILE = ".cf_r2_manifest.jsonl"; // relpath -> size (+ hash where needsHash) at last successful upload
 const AUTO_SYNC_S: i64 = 900; // background cadence once any client is polling status
 const MAX_FILE_BYTES: u64 = 8 << 20; // one object cap (REST upload limit is 300 MB; chats never near it)
 const MAX_PASS_FILES: usize = 32; // per-pass upload caps: a huge backlog drains over
@@ -52,7 +54,8 @@ const MAX_PASS_BYTES: u64 = 32 << 20; // several passes instead of camping a thr
 
 const State = struct {
     auto: bool = true, // auto-backup on status polls; "Sync now" always works
-    bucket_ok: bool = false, // bucket confirmed present (sticky — clears only on error 100xx re-create)
+    bucket_ok: bool = false, // bucket confirmed present (sticky and persisted; nothing clears it yet, so a bucket
+    // deleted on Cloudflare's side, or a login to another account, is not re-created)
     last_sync: i64 = 0, // when a pass last RAN
     last_ok: i64 = 0, // when a pass last finished with zero failures
     files: u64 = 0, // manifest totals after the last pass

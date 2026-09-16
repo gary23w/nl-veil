@@ -1,7 +1,8 @@
 //! tray.zig — the OS system-tray presence + native notifications. On Windows it owns a real
 //! Shell_NotifyIcon icon anchored to a HIDDEN message window we create (GetConsoleWindow is null under
-//! the Windows GUI subsystem, so it can't host the icon). A per-frame `pump()` drains that window's
-//! message queue so tray clicks reach us (double-click → restore the app). Linux/macOS degrade to no-op
+//! the Windows GUI subsystem, so it can't host the icon). That window lives on the UI thread, so raylib's own
+//! unfiltered message poll delivers tray clicks to wndProc (a click restores the app); there is deliberately no
+//! tray pump (WindowsTray says why a window-filtered peek must never come back). Linux/macOS degrade to no-op
 //! stubs; the always-present in-app toast (drawn by the UI) is the cross-platform floor.
 
 const std = @import("std");
@@ -221,7 +222,7 @@ const WindowsTray = struct {
     extern "gdi32" fn DeleteObject(obj: ?*anyopaque) callconv(.winapi) i32;
     extern "kernel32" fn GetModuleHandleW(name: ?[*:0]const u16) callconv(.winapi) ?*anyopaque;
 
-    // module-level state read by the WndProc (runs on the main thread inside pump()).
+    // module-level state read by the WndProc (runs on the UI thread, dispatched from raylib's message poll).
     var g_restore: bool = false;
     var g_menu_action: MenuAction = .none;
     var g_self: ?*WindowsTray = null;
