@@ -1939,18 +1939,55 @@ fn disarmLlmFrames() void {
 
 /// The App of the turn running on this thread, for hooks that fire from inside llm.zig (which has no App).
 threadlocal var turn_app: ?*App = null;
+/// The user of the turn on this thread, for the credential re-resolve a retry may ask for (llmRetryRekey).
+threadlocal var turn_uid: u64 = 0;
+/// The turn's control.jsonl cursor (runTurn's ctrl_cursor), for the Stop check the retry waits poll.
+threadlocal var turn_ctrl_cursor: ?usize = null;
 /// The coding model's catalog window for the turn on this thread (see workingBudgetBytes); the within-turn
 /// compaction reads it from here because the pass runs on the turn's thread.
 threadlocal var turn_win_hint: ?usize = null;
 /// Whether the catalog marks the coding model as a reasoning model (see turnTokenBudget).
 threadlocal var turn_reasoning: bool = false;
 
-/// llm.zig's retry ladder reports each wait here: "provider busy (HTTP 429): retrying in 20s (2/3)" lands
-/// as a status frame on the running turn, so the desk shows the pause and its reason instead of silence.
+/// llm.zig's retry ladder reports each wait here: "provider failed (HTTP 401: Authentication error): retrying
+/// in 20s (4/10)" lands as a status frame on the running turn, so the desk shows the pause and its reason
+/// instead of silence. Scrubbed like the error frame: the head of a provider error can quote account material.
 fn llmRetryStatus(text: []const u8) void {
     const app = turn_app orelse return;
     if (llm_frame_dir_len == 0) return;
-    emitKV(app, llm_frame_dir[0..llm_frame_dir_len], "status", "text", text);
+    var sb: [300]u8 = undefined;
+    emitKV(app, llm_frame_dir[0..llm_frame_dir_len], "status", "text", scrubAccountIds(&sb, text));
+}
+
+/// llm.zig's retry ladder polls this between the slices of a wait: a chat Stop ends the ladder at once - the
+/// same control.jsonl predicate the streaming abort and the between-tool checks read.
+fn llmRetryAbort() bool {
+    const app = turn_app orelse return false;
+    const cursor = turn_ctrl_cursor orelse return false;
+    if (llm_frame_dir_len == 0) return false;
+    return stopRequestedSince(app, llm_frame_dir[0..llm_frame_dir_len], cursor);
+}
+
+/// llm.zig's retry ladder asks this for a fresh credential before each retry. Only the Cloudflare login has
+/// one to give: its access token is re-resolved - refreshed once it has expired, which is the 401 that used
+/// to end long turns (code 10000 "Authentication error" on a token the turn resolved an hour before) - and
+/// handed back when it differs from the key the failed call used. Any other endpoint, or the same token,
+/// is null, and the retry goes out as it was.
+fn llmRetryRekey(gpa: std.mem.Allocator, base_url: []const u8, key: []const u8) ?[]const u8 {
+    const app = turn_app orelse return null;
+    if (turn_uid == 0) return null;
+    // the same test chat/service.zig's resolveRole applies before it resolves a token for a role
+    const looks_cf = std.mem.indexOf(u8, base_url, "api.cloudflare.com") != null and std.mem.indexOf(u8, base_url, "/ai/") != null;
+    if (!looks_cf) return null;
+    const tok = cf_oauth.resolveToken(app, turn_uid, gpa) orelse return null;
+    defer gpa.free(tok.base_url);
+    defer if (tok.account_id.len > 0) gpa.free(tok.account_id);
+    const same_endpoint = std.mem.eql(u8, std.mem.trimEnd(u8, tok.base_url, "/"), std.mem.trimEnd(u8, base_url, "/"));
+    if (!same_endpoint or std.mem.eql(u8, tok.key, key)) {
+        gpa.free(tok.key);
+        return null;
+    }
+    return tok.key;
 }
 
 /// One LLM call, measured from the engine's side of the transport: wall time, this thread's token delta, and
@@ -2373,10 +2410,18 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     defer disarmLlmFrames();
     pulseStart(app, conv_dir);
     defer pulseStop();
-    // The retry ladder in llm.zig reports each wait through this hook as a status frame on THIS turn.
+    // The retry ladder in llm.zig reports each wait through the first hook as a status frame on THIS turn, asks
+    // the second whether a Stop landed during a wait, and the third for a fresh credential before a retry; the
+    // turn's budget of retries is armed here and disarmed with the thread (see llm.RETRY_MAX).
     llm.retry_notify = &llmRetryStatus;
+    llm.retry_abort = &llmRetryAbort;
+    llm.retry_rekey = &llmRetryRekey;
+    llm.armRetries();
+    defer llm.disarmRetries();
     turn_app = app;
     defer turn_app = null;
+    turn_uid = uid;
+    defer turn_uid = 0;
     // The coding model's real window when the Workers AI catalog states one - see workingBudgetBytes.
     const win_hint: ?usize = if (cf_oauth.windowTokensFor(app, uid, trio.coding.model)) |w| @as(usize, w) else null;
     turn_win_hint = win_hint;
@@ -2424,6 +2469,8 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
 
     // ---- COOPERATIVE-STOP cursor: only control.jsonl ops written AFTER this byte offset count for THIS turn ----
     const ctrl_cursor = controlLen(app, conv_dir);
+    turn_ctrl_cursor = ctrl_cursor; // the retry waits read the same cursor (llmRetryAbort)
+    defer turn_ctrl_cursor = null;
     // PUBLISH it, immediately and before any other work: /control answers "will this op be read?" by comparing
     // the offset its line landed at against this number. Until it is published that endpoint reports "no", which
     // is the truth — a cursor snapshotted later than an op is a cursor that skips it.
@@ -8653,8 +8700,13 @@ fn runInnerAgentic(
                 // Provider errors quote ACCOUNT MATERIAL back at us — observed live: a suspension error
                 // carrying the org id and an "<ak-…>" key alias landed verbatim in the durable event log and
                 // the desk transcript. The error's meaning survives masking; the identifiers don't need to.
+                // A failure that came after the turn's whole retry budget says so, so the user reads why the
+                // chat stopped and not only what the provider last said.
                 var eb2: [420]u8 = undefined;
-                emitKV(app, conv_dir, "error", "err", scrubAccountIds(&eb2, clipBytes(step.content, 400)));
+                const head = scrubAccountIds(&eb2, clipBytes(step.content, 400));
+                var xb: [480]u8 = undefined;
+                const text = if (llm.retryExhausted(base_url, model)) std.fmt.bufPrint(&xb, "gave up after {d} retries — {s}", .{ llm.RETRY_MAX, head }) catch head else head;
+                emitKV(app, conv_dir, "error", "err", text);
             }
             return .{ .outcome = .hard_error, .content = empty };
         }
