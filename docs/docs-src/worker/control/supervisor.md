@@ -14,6 +14,7 @@ The supervisor is the control plane's process manager. A cast/deploy is launched
 
 - Spawn a detached worker for a cast and record it in the registry.
 - Re-adopt swarms found in the data dir on boot (the "N swarms re-adopted" line at startup).
+- Resolve a swarm from any id a caller holds (`resolve`). A spawn-time hex id names exactly its swarm. A run-dir basename (a re-adopted key, or the desk's Swarm tab) or a conversation id names the run dir: the conversation's build root, a sub-chat's being its primary's. Re-casts leave several entries on one dir, and the newest wins.
 - Report the live fleet (`/api/v1/fleet`, `/api/v1/swarms`).
 - A raw-thread sleep helper for loops that run outside the Io scheduler.
 

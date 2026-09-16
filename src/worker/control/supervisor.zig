@@ -284,19 +284,29 @@ pub const Supervisor = struct {
         return self.swarms.get(id);
     }
 
-    /// get(), but tolerant of the two id forms in the wild: the registry key (the spawn-time hex id for a
-    /// live swarm) OR the run-dir BASENAME (what a server restart re-adopts a dir as, and what the desktop
-    /// Swarm tab shows/sends for a chat cast building in `_chat/builds/{conv}`). Callers that mutate must
-    /// use the returned swarm's own `.id` — it may differ from the id they passed.
+    /// get(), but tolerant of every id form in the wild: the registry key (the spawn-time hex id for a live
+    /// swarm) OR any id that names the swarm's RUN DIR (idMatchesRunDir) — its basename (what a server restart
+    /// re-adopts a dir as, and what the desktop Swarm tab sends for a chat cast), or the conversation whose build
+    /// root castSwarm spawned it into, a sub-chat naming its family's. One run dir can carry several entries:
+    /// every re-cast into a conversation or its family registers a fresh hex id on the SAME dir, and the old
+    /// entries stay. The NEWEST registration is the dir's current worker (deploySwarm reset the dir's lifecycle
+    /// files when it spawned), so a run-dir id resolves to it, even when that id is also a re-adopted dir's key;
+    /// a spawn id still names exactly its own swarm. Callers that mutate must use the returned swarm's own `.id`
+    /// — it may differ from the id they passed.
     pub fn resolve(self: *Supervisor, id: []const u8) ?*Swarm {
         self.mu.lockUncancelable(self.io);
         defer self.mu.unlock(self.io);
-        if (self.swarms.get(id)) |s| return s;
+        if (self.swarms.get(id)) |s| {
+            if (!idMatchesRunDir(s.run_dir, id)) return s; // a spawn id, not a name for the dir it builds in
+        }
+        var newest: ?*Swarm = null;
         var it = self.swarms.valueIterator();
         while (it.next()) |sp| {
-            if (idMatchesRunDir(sp.*.run_dir, id)) return sp.*;
+            const s = sp.*;
+            if (!idMatchesRunDir(s.run_dir, id)) continue;
+            if (newest == null or s.created > newest.?.created) newest = s;
         }
-        return null;
+        return newest;
     }
 
     pub fn stop(self: *Supervisor, id: []const u8) void {
@@ -892,19 +902,26 @@ pub const Supervisor = struct {
     }
 };
 
-/// True when `id` names this run dir by its BASENAME (either slash form) — the alternate swarm-id form a
-/// re-adopted dir gets and the desktop Swarm tab sends for chat casts. Hand-rolled, not
-/// std.fs.path.basename: that splits only on '/' under POSIX, while run_dir strings are fmt-joined with
-/// '/' onto native base paths, so a Windows-written dir carries both separator forms on any host.
+/// True when `id` names this run dir: by its BASENAME (either slash form) — the alternate swarm-id form a
+/// re-adopted dir gets and the desktop Swarm tab sends for chat casts — or as a conversation id, through the
+/// build-root mapping castSwarm spawns every chat cast with (paths.zig buildRootRel). A sub-chat
+/// ("<primary>__sN") builds in its primary's tree, so its id names the FAMILY's run dir and matches exactly what
+/// the primary's id matches. Hand-rolled, not std.fs.path.basename: that splits only on '/' under POSIX, while
+/// run_dir strings are fmt-joined with '/' onto native base paths, so a Windows-written dir carries both
+/// separator forms on any host.
 fn idMatchesRunDir(run_dir: []const u8, id: []const u8) bool {
     if (id.len == 0) return false;
     const trimmed = std.mem.trimEnd(u8, run_dir, "/\\");
     const base = if (std.mem.lastIndexOfAny(u8, trimmed, "/\\")) |i| trimmed[i + 1 ..] else trimmed;
     if (std.mem.eql(u8, base, id)) return true;
+    // From here the id stands for its build family's root, as buildRootRel applies it: a sub-chat's primary,
+    // every other id itself.
+    const root = cpaths.branchRoot(id);
+    if (root.len != id.len and std.mem.eql(u8, base, root)) return true;
     // A SCHEDULED run's cast builds under `.../_sched/{task}/runs/{stamp}` (paths.zig), so its basename is the
     // bare stamp, not the conv id. Match the mapped tail instead, tolerant of either slash form in run_dir.
     var tb: [160]u8 = undefined;
-    const tail = cpaths.schedRunTail(&tb, id) orelse return false;
+    const tail = cpaths.schedRunTail(&tb, root) orelse return false;
     if (trimmed.len < tail.len) return false;
     const cand = trimmed[trimmed.len - tail.len ..];
     for (cand, tail) |c, t| {
@@ -941,6 +958,105 @@ test "idMatchesRunDir: basename hits on both slash forms, misses on substrings a
     try std.testing.expect(idMatchesRunDir("data\\u1\\_sched\\news-0715\\runs\\07171400", "scheduled_news-0715_07171400"));
     try std.testing.expect(!idMatchesRunDir("data/u1/_sched/news-0715/runs/07171400", "scheduled_news-0715_07179999"));
     try std.testing.expect(!idMatchesRunDir("data/u1/_sched/xnews-0715/runs/07171400", "scheduled_news-0715_07171400"));
+}
+
+test "a conversation id names exactly the run dirs castSwarm spawns its build family's casts into, in either slash form" {
+    // Two derivations of one dir must meet: castSwarm (deploy/service.zig) spawns a conversation's cast with
+    // run_dir = {data}/{buildRootRel(uid, conv)}, and resolve has only the conv id to find it again. For every pair
+    // of convs, one's id must name the other's spawn dir exactly when buildRootRel sends both to the same dir: in
+    // the fmt-joined form castSwarm registers, and in the backslash form a re-adopted Windows dir carries.
+    const convs = [_][]const u8{
+        "c6a57f852", // ordinary: builds/{conv}
+        "c6a57f852__s1", // its sub-chats share that tree
+        "c6a57f852__s5",
+        "c6a57f852__s6", // out of range: an ordinary conv with its own dir
+        "c6a57f8521", // a neighbour whose id extends the primary's
+        "c6a57f8521__s2",
+        "scheduled_news-0715174857_07151753", // a scheduled run: _sched/{task}/runs/{stamp}
+        "scheduled_news-0715174857_07151753__s1", // its sub-chat: both redirects at once
+        "scheduled_news-0715174857_07151800", // the same task's next run
+        "scheduled_notes", // hand-named: an ordinary conv
+    };
+    for (convs) |a| {
+        var ra: [256]u8 = undefined;
+        const root_a = cpaths.buildRootRel(&ra, 7, a);
+        try std.testing.expect(root_a.len > 0);
+        var fb: [300]u8 = undefined;
+        const spawned = try std.fmt.bufPrint(&fb, "C:/nl/data/{s}", .{root_a});
+        var bb: [300]u8 = undefined;
+        const adopted = bb[0..spawned.len];
+        for (spawned, adopted) |c, *d| d.* = if (c == '/') '\\' else c;
+        for (convs) |b| {
+            var rb: [256]u8 = undefined;
+            const same = std.mem.eql(u8, root_a, cpaths.buildRootRel(&rb, 7, b));
+            if (idMatchesRunDir(spawned, b) != same or idMatchesRunDir(adopted, b) != same) {
+                std.debug.print("id {s} vs the dir castSwarm spawns {s}'s cast into: same dir = {s}\n", .{ b, a, if (same) "yes" else "no" });
+                return error.TestUnexpectedResult;
+            }
+        }
+    }
+}
+
+test "resolve: a conversation's id finds the newest cast on its family's run dir, whichever order the registry yields them in" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    var sup = Supervisor.init(gpa, threaded.io(), "");
+    defer sup.swarms.deinit(gpa);
+    try sup.swarms.ensureTotalCapacity(gpa, 8); // one slot layout for every pass below: no growth, no rehash
+    const mk = struct {
+        fn swarm(id: []const u8, run_dir: []const u8, created: i64, state: State) Swarm {
+            return .{ .id = id, .uid = 7, .name = "cast", .run_dir = run_dir, .model = "mock", .minds = 3, .created = created, .state = state };
+        }
+    }.swarm;
+
+    // castSwarm's dir for the primary AND every sub-chat of it: {data}/{buildRootRel(7, conv)}
+    const family = "C:/nl/data/u7/_chat/builds/c6a57f852";
+    const keys = [_][]const u8{ "5f0c2a9e41d7b3a6", "e83b17c4d2a09f55" };
+    // Two casts on the family dir, the primary's (an hour old, finished) and a sub-chat's re-cast (running), beside
+    // a neighbour family's cast newer than both and a scheduled run's. The passes swap which key holds the newer
+    // cast. Slot order depends on the keys alone, so in one pass the stale cast comes first, which is exactly
+    // where a first-match scan returns it.
+    var stale_came_first = false;
+    for (0..2) |pass| {
+        sup.swarms.clearRetainingCapacity();
+        var cast_a = mk(keys[0], family, 0, .stopped);
+        var cast_b = mk(keys[1], family, 0, .stopped);
+        const newest = if (pass == 0) &cast_a else &cast_b;
+        const stale = if (pass == 0) &cast_b else &cast_a;
+        stale.created = 1_700_000_000;
+        newest.created = 1_700_003_600;
+        newest.state = .running;
+        var neighbour = mk("0a1b2c3d4e5f6071", "C:/nl/data/u7/_chat/builds/c6a57f8521", 1_700_009_000, .running);
+        var sched_run = mk("9d8c7b6a5f4e3d2c", "C:/nl/data/u7/_sched/news-0715174857/runs/07151753", 1_700_001_000, .running);
+        for ([_]*Swarm{ &cast_a, &cast_b, &neighbour, &sched_run }) |s| try sup.swarms.put(gpa, s.id, s);
+        var vit = sup.swarms.valueIterator();
+        while (vit.next()) |sp| {
+            if (sp.* == stale) stale_came_first = true;
+            if (sp.* == stale or sp.* == newest) break;
+        }
+
+        for ([_][]const u8{ "c6a57f852", "c6a57f852__s1", "c6a57f852__s5" }) |conv| {
+            try std.testing.expectEqual(@as(?*Swarm, newest), sup.resolve(conv));
+        }
+        try std.testing.expectEqual(@as(?*Swarm, stale), sup.resolve(stale.id)); // a spawn id names its own swarm, however old
+        try std.testing.expectEqual(@as(?*Swarm, &neighbour), sup.resolve("c6a57f8521__s2"));
+        try std.testing.expectEqual(@as(?*Swarm, &sched_run), sup.resolve("scheduled_news-0715174857_07151753__s1"));
+        try std.testing.expectEqual(@as(?*Swarm, null), sup.resolve("c6a57f852__s6")); // not a branch: its own dir holds no cast
+        try std.testing.expectEqual(@as(?*Swarm, null), sup.resolve("c6a57f85__s1")); // a primary id that only prefixes the family's
+    }
+    try std.testing.expect(stale_came_first);
+
+    // After a restart, reattach keys the family dir by its basename, the conv id itself (with PowerShell's
+    // backslashes), and a re-cast then lands beside it. The re-adopted KEY must not shadow the newer cast.
+    sup.swarms.clearRetainingCapacity();
+    var adopted = mk("c6a57f852", "C:\\nl\\data\\u7\\_chat\\builds\\c6a57f852", 1_700_000_000, .stopped);
+    var recast = mk("3e2d1c0b9a887766", family, 1_700_000_600, .running);
+    try sup.swarms.put(gpa, adopted.id, &adopted);
+    try sup.swarms.put(gpa, recast.id, &recast);
+    try std.testing.expectEqual(@as(?*Swarm, &recast), sup.resolve("c6a57f852"));
+    try std.testing.expectEqual(@as(?*Swarm, &recast), sup.resolve("c6a57f852__s3"));
+    try std.testing.expectEqual(@as(?*Swarm, &adopted), sup.get("c6a57f852")); // the exact-key read is unchanged
 }
 
 test "readTail: whole small file; only the last bytes of a big one; null for a missing path" {

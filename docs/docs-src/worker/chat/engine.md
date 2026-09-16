@@ -17,7 +17,7 @@
     control.jsonl    // cooperative control ops the client appends (stop / steer)
 ```
 
-The build tools the loop's calls run route through the SAME workdir a hive cast for this conversation spawns in (`{data}/u{uid}/_chat/builds/{conv}`), so chat and a cast co-edit one tree with one micro-VCS history. Ownership is structural: every path is built from the caller's own `uid`, so a turn can only ever touch its own conversation.
+The build tools the loop's calls run route through the SAME workdir a hive cast for this conversation spawns in, the conversation's [build root](#doc=worker/chat/paths): `{data}/u{uid}/_chat/builds/{conv}`, the primary's `builds/{primary}` for a sub-chat `{primary}__sN` (one family workspace), or `{data}/u{uid}/_sched/{task}/runs/{stamp}` for a scheduled run. So chat and a cast co-edit one tree with one micro-VCS history, and the armed loop's wait on a running hive finds the cast from the conversation id alone: the supervisor's `resolve` maps the id onto that root, sub-chats included, and returns the newest cast there. Ownership is structural: every path is built from the caller's own `uid`, so a turn can only ever touch its own conversation.
 
 ## The turn loop
 
