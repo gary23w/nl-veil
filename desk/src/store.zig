@@ -777,8 +777,10 @@ pub const Store = struct {
     goto_conv: [64]u8 = undefined, // POLLER→RENDER hand-off: open this conversation in Chat (a run-now's minted
     goto_conv_len: u8 = 0, //         scheduled_* conv); the render loop consumes it once per set
     chat_status: [96]u8 = [_]u8{0} ** 96, // "thinking…" / "casting…" / "watching r3 42%"
-    /// Heartbeats: wall-clock ms of each worker loop's last tick (nap.nowMs), written every iteration and read by
-    /// the UI thread, so a wedged worker shows as "silent for Ns" instead of a frozen status. 0 = not started.
+    /// Heartbeats (nap.zig): the nap.nowMs reading up to which each worker is accounted for - its last
+    /// tick, or the end of a request ceiling it declared before a call that may block. Only the worker writes
+    /// its own; the UI reads chat_beat_ms for the chat status line and poll_beat_ms for the titlebar, so a wedged
+    /// worker shows as "silent for Ns" instead of a frozen status. 0 = not started.
     chat_beat_ms: std.atomic.Value(i64) = .init(0),
     poll_beat_ms: std.atomic.Value(i64) = .init(0),
     chat_status_len: u8 = 0,

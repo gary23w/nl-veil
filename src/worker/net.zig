@@ -9,48 +9,77 @@
 //! hung — with nothing on screen ever naming the cause. Death by a thousand timeouts.
 //!
 //! So: probe ONCE, cache the verdict briefly, and let callers turn a multi-minute grind into one sentence.
+//! And probe once AT A TIME: a swarm round's minds reach their model calls together, so an expired verdict
+//! used to send every one of them off to spawn its own curls. The first caller probes; the rest wait for its
+//! verdict on a raw-thread sleep, never a park on the Io runtime (cf_oauth.zig's token refresh, same shape).
 //!
 //! LOCAL BACKENDS MUST NEVER CONSULT THIS. A built-in or Ollama model is loopback and works perfectly with
 //! the uplink down; making it wait on an internet probe would invent an outage it does not have. Callers
 //! gate on `llm.isLocal(base_url)` BEFORE asking, and the probe itself never touches loopback.
 //!
-//! CURL, not httpc, and that is not a style choice. httpc.zig is a LOOPBACK client on Windows: its own header
-//! says "no connect timeout option: this Zig's Windows backend panics on one … loopback connects resolve
-//! immediately either way", and pointing it at a real external IP does exactly that — netConnectIpWindows
-//! panics inside io.vtable.netConnectIp. Every real egress path in this engine already shells out to curl for
-//! this reason. The TTL keeps it to at most one spawn per TTL_MS, far below the per-tool curl spawns already
-//! happening, so the Defender spawn-heuristic concern that motivated the curl-free twins does not apply here.
+//! CURL, not httpc, and that is not a style choice. The probe is an HTTPS request, and httpc speaks plain HTTP
+//! to loopback-class endpoints only: on Windows its portable path panics dialing a real external address
+//! (netConnectIpWindows, inside io.vtable.netConnectIp), and the wsock.zig path that now carries IPv4 literals
+//! there has no TLS. Every real egress path in this engine already shells out to curl. The TTL and the single
+//! flight keep it to one probe per TTL_MS (one curl, two when the first host fails), far below the per-call
+//! curl spawns already happening, so the Defender spawn-heuristic concern behind the curl-free twins does not
+//! apply here.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
 const depprobe = @import("deps.zig"); // aliased like run.zig: tells "curl is missing" apart from "network down"
+const bu = @import("browser/util.zig"); // sleepMs: a raw-thread sleep, no Io park
 
 /// Where to knock. Two anycast resolvers — IP literals, so a dead DNS resolver cannot masquerade as a dead
 /// uplink — and reaching EITHER proves egress. NL_NET_PROBE_URL overrides for locked-down networks that
 /// blackhole both, where a fixed pair would report a permanent false outage. (run.zig's swarm probe reads the
-/// same variable; one knob for one question.)
+/// same variable; one knob for one question.) The model-call path holds no environment of its own, so the
+/// process hands its variable over once at startup: see useEnviron.
 const PROBE_URLS = [_][]const u8{ "https://1.1.1.1", "https://8.8.8.8" };
 /// A TCP handshake to a reachable anycast address is single-digit ms. 2s is generous for a slow link and
-/// still an order of magnitude under the 20s each caller would otherwise burn alone.
+/// still an order of magnitude under the 20s each caller would otherwise burn alone. curl's --max-time and
+/// --connect-timeout both carry it.
 const PROBE_TIMEOUT_S: u32 = 2;
+const PROBE_TIMEOUT_ARG = std.fmt.comptimePrint("{d}", .{PROBE_TIMEOUT_S});
 /// How long a verdict stands. Long enough that a turn's many calls share one probe; short enough that
 /// plugging the cable back in is noticed within a step or two rather than needing a restart.
 const TTL_MS: i64 = 8_000;
+/// How long a caller waits on someone else's probe before carrying on without a verdict: every host at its full
+/// ceiling, plus room for the spawns.
+const PROBE_WAIT_MS: u64 = @as(u64, PROBE_URLS.len) * PROBE_TIMEOUT_S * 1000 + 2_000;
 
-var mu: std.Io.Mutex = .init; // Io.Mutex, like rate.zig — std.Thread.Mutex is gone in this Zig
-var checked_at_ms: i64 = 0; // 0 = never probed
-var last_verdict: Verdict = .online;
+// Process-wide cache, all atomics: nothing in this module ever parks a thread.
+var checked_at_ms = std.atomic.Value(i64).init(0); // when the standing verdict's probe started; 0 = never probed
+var last_verdict = std.atomic.Value(Verdict).init(.online);
+var probing = std.atomic.Value(bool).init(false); // the single flight: set while ONE caller runs the curls
+/// How many probes this process has started — the single-flight test counts them.
+var probes_run = std.atomic.Value(u32).init(0);
+
+/// NL_NET_PROBE_URL as the process environment had it at startup (useEnviron); empty = the anycast pair.
+var env_url_buf: [512]u8 = undefined;
+var env_url_len: usize = 0;
 
 fn nowMs(io: Io) i64 {
     return @intCast(@divTrunc(Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_ms));
 }
 
 /// What a probe was able to establish. `unknown` is a real answer and not a synonym for online: it means
-/// the probe never got to ask (no curl, a spawn with no environment, a URL curl rejected before dialling).
-/// Callers map it to "carry on" — see offline() — but tests must be able to tell it apart from a genuine
-/// verdict, or they would silently pass on a box where the probe never ran.
-pub const Verdict = enum { online, offline, unknown };
+/// the probe never got to ask (no curl, a spawn with no environment, a URL curl rejected before dialling),
+/// or that another caller's probe outlived the wait for it. Callers map it to "carry on" — see offline() —
+/// but tests must be able to tell it apart from a genuine verdict, or they would silently pass on a box where
+/// the probe never ran.
+pub const Verdict = enum(u8) { online, offline, unknown };
+
+/// Take NL_NET_PROBE_URL from the PROCESS environment. src/main.zig calls this once at startup, before any
+/// thread can probe: the probe's production callers (llm.zig) hold no environment and pass null, so until this
+/// existed the override was never read outside tests. A value longer than the buffer is ignored, not truncated.
+pub fn useEnviron(environ: *const std.process.Environ.Map) void {
+    const url = environ.get("NL_NET_PROBE_URL") orelse "";
+    if (url.len > env_url_buf.len) return;
+    @memcpy(env_url_buf[0..url.len], url);
+    env_url_len = url.len;
+}
 
 /// True when the machine looks to have NO working egress. Cached for TTL_MS.
 ///
@@ -62,21 +91,29 @@ pub fn offline(io: Io, gpa: std.mem.Allocator, environ: ?*const std.process.Envi
 }
 
 /// The cached probe itself. Same contract as offline(), but does not collapse `unknown` into `online`.
+/// `environ` is an override map for tests; production passes null and gets what useEnviron captured.
 pub fn probe(io: Io, gpa: std.mem.Allocator, environ: ?*const std.process.Environ.Map) Verdict {
-    const now = nowMs(io);
-    mu.lockUncancelable(io);
-    if (checked_at_ms != 0 and now -| checked_at_ms < TTL_MS) {
-        defer mu.unlock(io);
-        return last_verdict;
+    if (fresh(io)) |v| return v;
+    // Expired. ONE caller probes. A caller that finds a probe running waits for that verdict instead of spawning
+    // curls of its own — bounded, on a raw-thread sleep — and carries on without one if the probe outlives it.
+    if (probing.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) {
+        var waited: u64 = 0;
+        while (probing.load(.acquire) and waited < PROBE_WAIT_MS) : (waited += 25) bu.sleepMs(25);
+        if (probing.load(.acquire)) return .unknown;
+        return last_verdict.load(.acquire);
     }
-    mu.unlock(io);
+    defer probing.store(false, .release);
+    // Look again after claiming: another caller's probe may have landed between the first look and the claim.
+    if (fresh(io)) |v| return v;
+    _ = probes_run.fetchAdd(1, .monotonic);
+    const now = nowMs(io);
 
     var any_reachable = false;
     var probe_unusable = false; // curl absent ⇒ we learned NOTHING; never report that as an outage
-    const override = if (environ) |e| e.get("NL_NET_PROBE_URL") orelse "" else "";
+    const override = if (environ) |e| e.get("NL_NET_PROBE_URL") orelse "" else env_url_buf[0..env_url_len];
     const urls: []const []const u8 = if (override.len > 0) &.{override} else &PROBE_URLS;
     for (urls) |u| {
-        const argv = [_][]const u8{ "curl", "-sS", "-I", "--max-time", "2", "--connect-timeout", "2", u };
+        const argv = [_][]const u8{ "curl", "-sS", "-I", "--max-time", PROBE_TIMEOUT_ARG, "--connect-timeout", PROBE_TIMEOUT_ARG, u };
         const r = std.process.run(gpa, io, .{ .argv = &argv, .stdout_limit = .limited(8 << 10), .stderr_limit = .limited(2 << 10) }) catch |e| {
             // A MISSING curl is not a network signal (run.zig's probe makes the same distinction). Treat the
             // whole probe as unusable rather than let a toolchain gap masquerade as an outage and refuse work.
@@ -106,11 +143,17 @@ pub fn probe(io: Io, gpa: std.mem.Allocator, environ: ?*const std.process.Enviro
         if (!network_evidence) probe_unusable = true;
     }
 
-    mu.lockUncancelable(io);
-    defer mu.unlock(io);
-    checked_at_ms = now;
-    last_verdict = if (any_reachable) .online else if (probe_unusable) .unknown else .offline;
-    return last_verdict;
+    const v: Verdict = if (any_reachable) .online else if (probe_unusable) .unknown else .offline;
+    last_verdict.store(v, .release); // the verdict before its timestamp: a reader never pairs a fresh time with an old answer
+    checked_at_ms.store(now, .release);
+    return v;
+}
+
+/// The standing verdict while it is younger than TTL_MS, else null.
+fn fresh(io: Io) ?Verdict {
+    const at = checked_at_ms.load(.acquire);
+    if (at == 0 or nowMs(io) -| at >= TTL_MS) return null;
+    return last_verdict.load(.acquire);
 }
 
 /// The one sentence every caller shows. Kept here so the wording cannot drift between the model path and
@@ -121,10 +164,8 @@ pub const MSG = "Internet is offline — this machine has no working network con
 
 /// Force the next `offline()` to re-probe. For tests, and for the moment a caller learns the truth the hard
 /// way (a real connect failure) and wants the cache to reflect it rather than wait out the TTL.
-pub fn invalidate(io: Io) void {
-    mu.lockUncancelable(io);
-    defer mu.unlock(io);
-    checked_at_ms = 0;
+pub fn invalidate() void {
+    checked_at_ms.store(0, .release);
 }
 
 /// Tests only: a spawn environment with enough in it for a curl child to actually run. Production gets the
@@ -152,13 +193,13 @@ test "the verdict is cached within the TTL" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    invalidate(io);
+    invalidate();
     const first = probe(io, gpa, &env);
     const t0 = nowMs(io);
     var i: usize = 0;
     while (i < 3) : (i += 1) try std.testing.expectEqual(first, probe(io, gpa, &env));
     try std.testing.expect(nowMs(io) -| t0 < 500); // cache hits, not fresh probes
-    invalidate(io);
+    invalidate();
 }
 
 test "MSG names the offline condition and the local-model escape hatch" {
@@ -178,11 +219,11 @@ test "a blackholed uplink reads as offline, inside the probe ceiling" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    invalidate(io);
+    invalidate();
     const t0 = nowMs(io);
     const v = probe(io, gpa, &env);
     const ms = nowMs(io) -| t0;
-    invalidate(io);
+    invalidate();
     if (v == .unknown) return error.SkipZigTest; // no curl reachable from this test env — nothing was measured
     try std.testing.expectEqual(Verdict.offline, v);
     try std.testing.expect(ms < 8000); // must resolve on the 2s ceiling, not curl's default
@@ -203,9 +244,42 @@ test "a curl failure that is NOT network evidence must NOT report an outage (fai
     defer threaded.deinit();
     const io = threaded.io();
 
-    invalidate(io);
+    invalidate();
     const v = probe(io, gpa, &env);
-    invalidate(io);
+    invalidate();
     try std.testing.expect(v != .offline); // .online or .unknown are both fine; .offline is the bug
     try std.testing.expect(!offline(io, gpa, &env)); // and the bool mapping must agree
+}
+
+test "one probe at a time: callers that arrive while it runs share its verdict instead of starting their own" {
+    // Four callers at once against an expired verdict — a swarm round reaching its model calls together. The
+    // blackholed override keeps the one probe running its full 2 s ceiling, so the other three arrive while it
+    // is still out and must wait for it rather than each spawning curls of their own.
+    const gpa = std.testing.allocator;
+    var env = try probeOverride(gpa, "https://192.0.2.1");
+    defer env.deinit();
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = test_environ });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const Caller = struct {
+        fn run(io_: Io, gpa_: std.mem.Allocator, env_: *const std.process.Environ.Map, out: *Verdict) void {
+            out.* = probe(io_, gpa_, env_);
+        }
+    };
+    invalidate();
+    const before = probes_run.load(.monotonic);
+    var verdicts: [4]Verdict = undefined;
+    var threads: [4]std.Thread = undefined;
+    var spawned: usize = 0;
+    defer for (threads[0..spawned]) |t| t.join();
+    for (&threads, &verdicts) |*t, *v| {
+        t.* = try std.Thread.spawn(.{}, Caller.run, .{ io, gpa, &env, v });
+        spawned += 1;
+    }
+    for (threads) |t| t.join();
+    spawned = 0; // joined: the deferred join has nothing left to do
+    invalidate();
+    try std.testing.expectEqual(@as(u32, 1), probes_run.load(.monotonic) - before);
+    for (verdicts[1..]) |v| try std.testing.expectEqual(verdicts[0], v);
 }

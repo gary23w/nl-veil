@@ -15,10 +15,12 @@
 //! client trusted `Connection: close` and read to EOF with NO time bound, so a server that kept the
 //! socket alive blocked the chat thread forever. This client (a) parses real HTTP framing — status
 //! line, headers, Content-Length or chunked — so a well-behaved reply completes without waiting for
-//! close, and (b) races the whole round trip against an Io sleeper (`Io.Select`), cancelling the loser:
-//! `timeout_s` is a hard ceiling exactly like curl --max-time. Cancellation reaches a blocked read on
-//! every backend (on Windows the Threaded Io cancels the pending AFD receive), so a wedged server
-//! surfaces as `.timed_out` instead of a frozen thread.
+//! close, and (b) bounds the whole round trip: `timeout_s` is a hard ceiling exactly like curl --max-time.
+//! On Windows a loopback or IPv4-literal request runs on one blocking socket under one wall-clock deadline
+//! covering connect, send and receive (wsock.zig). Anything else races against an Io sleeper (`Io.Select`),
+//! cancelling the loser, and cancellation reaches a blocked read on every backend (on Windows the Threaded
+//! Io cancels the pending AFD receive). Either way a wedged server surfaces as `.timed_out` instead of a
+//! frozen thread.
 
 const std = @import("std");
 const wsock = @import("wsock.zig");
@@ -67,9 +69,10 @@ pub fn request(io: Io, gpa: std.mem.Allocator, req: Req) Result {
     // io.async degrades to inline-on-caller: the freeze. Bonus: in that degraded inline case the flag is
     // already set when the timer leg runs on the caller, so it returns at once instead of sleeping the
     // whole timeout after the request already completed.
-    // WINDOWS, LOOPBACK OR AN IPv4 LITERAL: one blocking socket with SO_RCVTIMEO / SO_SNDTIMEO instead of the
-    // race below. The race parks the calling thread on the runtime's per-thread alert, and that alert is what
-    // wedged the desk's worker threads on 2026-09-02 - see wsock.zig. A DNS name keeps the portable path.
+    // WINDOWS, LOOPBACK OR AN IPv4 LITERAL: one blocking socket under one deadline (a select-bounded connect, then
+    // SO_SNDTIMEO / SO_RCVTIMEO set to the time left) instead of the race below. The race parks the calling thread
+    // on the runtime's per-thread alert, and that alert is what wedged the desk's worker threads on 2026-09-02 -
+    // see wsock.zig. A DNS name keeps the portable path.
     if (builtin.os.tag == .windows) {
         if (wsock.ip4Of(req.host)) |ip| {
             switch (wsock.roundTrip(gpa, ip, req.port, req_bytes, req.timeout_s, req.cap)) {

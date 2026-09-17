@@ -84,6 +84,13 @@ if [ "${1:-}" = "--scan" ]; then
   else
     echo "[twins] httpc.zig twin BODIES differ -- mirror them"
   fi
+  # wsock.zig is the stricter twin: the WHOLE files are identical, header included (one header speaks for both
+  # packages). Nothing compared that pair before. Same rule as check.ps1's twin of this check.
+  if cmp -s src/worker/wsock.zig desk/src/wsock.zig; then
+    echo "[twins] wsock.zig twins identical (whole-file contract holds)"
+  else
+    echo "[twins] wsock.zig twins differ -- make the two copies identical"
+  fi
   vz=$(sed -n 's/.*\.version = "\([^"]*\)".*/\1/p' build.zig.zon | head -1)
   vm=$(sed -n 's/.*VERSION = "\([^"]*\)".*/\1/p' src/main.zig | head -1)
   # desk/build.zig.zon is checked too: it was in NEITHER this echo nor bump-version.ps1's edit list, so it
