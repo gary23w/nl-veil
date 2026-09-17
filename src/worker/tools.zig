@@ -852,6 +852,20 @@ fn getCredential(ctx: *ToolCtx, args_json: []const u8) []u8 {
     return dupe(gpa, "no stored credential matches that description — check YOUR MEMORY's withheld entries or ask the user");
 }
 
+const UTF8_BOM = "\xEF\xBB\xBF";
+
+/// One line of the durable store (memories.jsonl), trimmed — and freed of a UTF-8 byte-order mark. A BOM'd first
+/// line (an editor or a PowerShell `Out-File` puts one there) failed the `ln[0] == '{'` gate in every reader, so the
+/// OLDEST memory in the store — this user's name, as it happened — was invisible to the prompt, to dedup, to
+/// FORGET:, to get_credential and to recall, and the forget rewrite copied the unparsed line through verbatim, so
+/// the mark outlived every rewrite. Every reader of the store goes through this one helper: the chat engine's
+/// (prompt, dedup, forget) and the two tools below.
+pub fn durableLine(raw: []const u8) []const u8 {
+    const ln = std.mem.trim(u8, raw, " \r\t");
+    if (std.mem.startsWith(u8, ln, UTF8_BOM)) return std.mem.trimStart(u8, ln[UTF8_BOM.len..], " \r\t");
+    return ln;
+}
+
 /// Best-matching secretive entry from raw memories.jsonl bytes for a word query (gpa-owned; null = no match).
 /// Score = number of 3+ char query words found in the entry text (case-insensitive); newest wins ties.
 pub fn credentialLookup(gpa: std.mem.Allocator, data: []const u8, q: []const u8) ?[]u8 {
@@ -860,7 +874,7 @@ pub fn credentialLookup(gpa: std.mem.Allocator, data: []const u8, q: []const u8)
     var best_score: usize = 0;
     var it = std.mem.splitScalar(u8, data, '\n');
     while (it.next()) |raw| {
-        const ln = std.mem.trim(u8, raw, " \r\t");
+        const ln = durableLine(raw);
         if (ln.len == 0 or ln[0] != '{') continue;
         const e = std.json.parseFromSlice(M, gpa, ln, .{ .ignore_unknown_fields = true }) catch continue;
         defer e.deinit();
@@ -921,7 +935,7 @@ pub fn durableRecall(gpa: std.mem.Allocator, data: []const u8, q: []const u8) []
     }
     var it = std.mem.splitScalar(u8, data, '\n');
     while (it.next()) |raw| {
-        const ln = std.mem.trim(u8, raw, " \r\t");
+        const ln = durableLine(raw);
         if (ln.len == 0 or ln[0] != '{') continue;
         const e = std.json.parseFromSlice(M, gpa, ln, .{ .ignore_unknown_fields = true }) catch continue;
         defer e.deinit();
@@ -1051,6 +1065,27 @@ test "durableRecall answers the questions the associative store cannot" {
     const stop = durableRecall(gpa, data, "what are the things that you know");
     defer if (stop.len > 0) gpa.free(stop);
     try std.testing.expectEqual(@as(usize, 0), stop.len);
+}
+
+test "get_credential and recall read a byte-order-marked store: the mark hides the oldest memory from neither tool" {
+    const gpa = std.testing.allocator;
+    // the live shape: an editor's BOM (and CRLF) ahead of the OLDEST line, which here is the credential
+    const data = "\xEF\xBB\xBF{\"cat\":\"key\",\"text\":\"GitHub personal access token: ghp_abc123abc123abc123abc123abc123\"}\r\n" ++
+        "{\"cat\":\"fact\",\"text\":\"User is 34 years old\"}\r\n";
+    try std.testing.expectEqualStrings("{\"cat\":\"key\",\"text\":\"GitHub personal access token: ghp_abc123abc123abc123abc123abc123\"}", durableLine(data[0..std.mem.indexOfScalar(u8, data, '\n').?]));
+    try std.testing.expectEqualStrings("", durableLine("\xEF\xBB\xBF \r"));
+    // get_credential finds the value behind the mark
+    const cred = credentialLookup(gpa, data, "github token") orelse return error.TestExpectedResult;
+    defer gpa.free(cred);
+    try std.testing.expect(std.mem.indexOf(u8, cred, "ghp_abc123abc123abc123abc123abc123") != null);
+    // recall confirms the same entry exists, masked as ever, beside the unmarked line
+    const rec = durableRecall(gpa, data, "github token");
+    defer if (rec.len > 0) gpa.free(rec);
+    try std.testing.expect(std.mem.indexOf(u8, rec, "- [key] GitHub personal access token: [withheld]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rec, "ghp_") == null);
+    const age = durableRecall(gpa, data, "user age");
+    defer if (age.len > 0) gpa.free(age);
+    try std.testing.expect(std.mem.indexOf(u8, age, "34 years old") != null);
 }
 
 /// The swarm-shared skill library lives in its own neuron-db scope (in the per-swarm mind.sqlite), so every

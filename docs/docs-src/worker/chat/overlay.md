@@ -16,8 +16,8 @@ The overlay reuses the swarm's in-process activation field ([hyperspace](#doc=wo
 
 | moment | what happens | subprocesses |
 |---|---|---|
-| turn start | the field is seeded: the conversation's own partition (one wide associative pull around the goal), the durable memory exactly as the prompt shows it (credential values already masked), the file ledger | 1 |
-| every finding | the note the engine mints for the store enters the field the moment it exists — recallable in the very next round, compaction or not | 0 |
+| turn start | the field is seeded: the conversation's own partition (one wide associative pull around the goal), the durable memory's lines exactly as the prompt shows them (credential values already masked; the YOUR MEMORY header and the withheld-credentials footer are framing, not facts, and stay out), the file ledger | 1 |
+| every finding | the note the engine mints for the store enters the field the moment it exists — recallable in the very next round, compaction or not. A full field evicts a fact a settle has already measured before a finding that has not been through one, so a round's findings all survive to the next render unless that one round outnumbers the field itself | 0 |
 | every round's chat-model call (not the auxiliary verdict, compaction or planning calls) | the field settles around the live **cue** — goal, last narration, last tool call, last result head, recently fired lines — and the block is appended as the LAST message of that request only, then removed | 0 |
 | turn end | every fired store-backed line is strengthened in the store, so a fact that helped ranks higher next time | ≤ 8 |
 
