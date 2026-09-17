@@ -29,11 +29,11 @@ pub const Poller = struct {
     // last tick. During a cast the file grows, but only in bursts — between bursts (most ticks) this is a no-op,
     // which is what stops the desktop from pegging a core re-parsing a multi-MB log every second.
     ev_cache_size: u64 = 0,
-    ev_cache_sel: [64]u8 = undefined,
+    ev_cache_sel: [96]u8 = undefined, // = Store.selected capacity
     ev_cache_sel_len: usize = 0,
     ev_cache_n: usize = 0,
     ev_cache_metrics: scan.Metrics = .{},
-    prev_live_ids: [scan.MAX_SWARMS][64]u8 = undefined,
+    prev_live_ids: [scan.MAX_SWARMS][96]u8 = undefined, // = scan.SwarmSummary.id capacity: a clamped copy never matches its own id
     prev_live_lens: [scan.MAX_SWARMS]u8 = [_]u8{0} ** scan.MAX_SWARMS,
     prev_live_n: usize = 0,
     prev_stopped_marked: [scan.MAX_SWARMS]bool = [_]bool{false} ** scan.MAX_SWARMS,
@@ -81,7 +81,7 @@ pub const Poller = struct {
 
     // notification de-dup state (poller-local)
     grad_warned: bool = false,
-    stopped_ids: [scan.MAX_SWARMS][64]u8 = undefined,
+    stopped_ids: [scan.MAX_SWARMS][96]u8 = undefined, // full id width, as prev_live_ids
     stopped_lens: [scan.MAX_SWARMS]u8 = [_]u8{0} ** scan.MAX_SWARMS,
     stopped_n: usize = 0,
 
@@ -773,11 +773,11 @@ pub const Poller = struct {
         }
 
         // 3) selected swarm tail
-        var selbuf: [64]u8 = undefined;
+        var selbuf: [96]u8 = undefined; // = Store.selected capacity; a [64] here panicked on a wider selection
         var sel_len: usize = 0;
         {
             self.store.lock();
-            sel_len = self.store.selected_len;
+            sel_len = @min(self.store.selected_len, selbuf.len);
             @memcpy(selbuf[0..sel_len], self.store.selected[0..sel_len]);
             self.store.unlock();
         }
@@ -1851,4 +1851,78 @@ test "a steer pasted with a control byte still builds a control body the reader 
     const p2 = try std.json.parseFromSlice(std.json.Value, gpa, jb.items, .{});
     defer p2.deinit();
     try std.testing.expectEqualStrings("a\nb c", p2.value.object.get("text").?.string);
+}
+
+test "a run whose id is wider than 64 bytes is selected, tailed from its own dir, and announced finished once" {
+    // A roster id, the selection and a command id are all 96 bytes wide, but refresh copied the selection
+    // into [64]u8 buffers (selbuf, ev_cache_sel): a ReleaseSafe bounds panic on this thread the first tick
+    // after such a run was selected. The live and stopped memories were [64]u8 too, clamped, so a wide id
+    // never matched its own copy: its finished notice was lost and stopped_ids gained a duplicate per tick.
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dd = "zig-wideid-tmp";
+    Io.Dir.cwd().deleteTree(io, dd) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dd) catch {};
+
+    // A chat cast's run dir under a 64-byte conversation id, the longest the server's safeSeg accepts.
+    // listSwarms builds the 80-byte roster id from the real directory; the test only names what it expects.
+    const want = "u1/_chat/builds/" ++ ("c" ** 64);
+    try std.testing.expect(want.len > 64);
+    const ev_path = dd ++ "/" ++ want ++ "/events.jsonl";
+    const ev_lines = "{\"kind\":\"round\",\"round\":1}\n{\"kind\":\"score\",\"round\":1,\"passed\":1,\"total\":2,\"pct\":50}\n";
+    _ = try Io.Dir.cwd().createDirPathStatus(io, dd ++ "/" ++ want, .default_dir);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = ev_path, .data = ev_lines });
+
+    const s = try gpa.create(Store); // Store is far too big for a test stack frame
+    defer gpa.destroy(s);
+    s.* = .{};
+    @memcpy(s.settings.data_dir[0..dd.len], dd);
+    s.settings.data_dir_len = dd.len;
+    s.settings.narrator = false; // a notice also queues speech, and the next tick would hand it to the OS TTS
+    const p = try gpa.create(Poller);
+    defer gpa.destroy(p);
+    p.* = .{ .io = io, .gpa = gpa, .store = s };
+    defer p.log_buf.deinit(gpa);
+    // Every tick stays on the filesystem: the fleet GET reads as polled an hour from now, so none comes due
+    // mid-test, and the server reads as offline, which gates every other request. A veil server running on
+    // this machine is never contacted.
+    p.last_fleet_s = Io.Timestamp.now(io, .real).toSeconds() + 3600;
+
+    // tick 1: the roster walk finds the run, live, before anything is selected
+    p.refresh();
+    try std.testing.expectEqual(@as(usize, 1), s.swarm_count);
+    try std.testing.expectEqualStrings(want, s.swarms[0].idStr());
+    try std.testing.expect(s.swarms[0].live);
+
+    // tick 2: select it as a roster click or autoSelect does, then tail it
+    s.pushCmd(store_mod.mkCmd(.select, want, ""));
+    p.drainCommands();
+    p.refresh();
+    try std.testing.expectEqualStrings(want, s.selected[0..s.selected_len]);
+    try std.testing.expectEqual(@as(usize, 2), s.event_count); // read from THIS run's events.jsonl, not a cut path
+    try std.testing.expectEqual(@as(i32, 50), s.metrics.pct);
+    try std.testing.expectEqualStrings(want, p.ev_cache_sel[0..p.ev_cache_sel_len]); // so a quiet tick reuses the parse
+
+    // ticks 3 and 4: the run stops, then stays stopped
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = ev_path, .data = ev_lines ++ "{\"kind\":\"stopped\",\"reason\":\"done\"}\n" });
+    p.refresh();
+    p.refresh();
+    var finished: usize = 0;
+    {
+        s.lock();
+        defer s.unlock();
+        var i: usize = 0;
+        while (i < s.notif_count) : (i += 1) {
+            const n = &s.notifs[(s.notif_head + i) % s.notifs.len];
+            if (!std.mem.eql(u8, n.titleStr(), "Swarm finished")) continue;
+            finished += 1;
+            try std.testing.expectEqualStrings(want, n.bodyStr());
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), finished);
+    try std.testing.expectEqual(@as(usize, 1), p.stopped_n); // recorded once, not once per stopped tick
+    // and the ticks really stayed off the network: the fleet GET neither counted a miss nor adopted a success
+    try std.testing.expect(p.miss_streak == 0 and !s.server_online);
 }

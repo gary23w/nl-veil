@@ -1538,10 +1538,10 @@ fn setDataDir(store: *Store, dd: []const u8) void {
 fn autoSelect(store: *Store) bool {
     store.lock();
     const have = store.swarm_count > 0;
-    var id: [64]u8 = undefined;
+    var id: [96]u8 = undefined; // = scan.SwarmSummary.id capacity; a [64] here panicked on a wider roster id
     var idn: usize = 0;
     if (have and store.selected_len == 0) {
-        idn = store.swarms[0].id_len;
+        idn = @min(store.swarms[0].id_len, id.len);
         @memcpy(id[0..idn], store.swarms[0].id[0..idn]);
     }
     store.unlock();
@@ -9108,4 +9108,30 @@ test "silentNotice: the whole line renders in the real buffers, and nothing repl
     // the widest silence a heartbeat can produce still fits, digits and all
     const wide = silentNotice(&status, SILENT_CHAT_FMT, std.math.maxInt(i64), 1).?;
     try std.testing.expect(std.mem.endsWith(u8, wide, "s - restart the desk"));
+}
+
+test "autoSelect hands the poller the newest run's whole id, even one wider than 64 bytes" {
+    // The bug this pins: autoSelect copied swarms[0].id into a [64]u8, but a roster id fills up to
+    // scan.SwarmSummary.id's 96 bytes (a chat cast's "u<uid>/_chat/builds/<conv>" carries a server conv
+    // id of up to 64). The desk ships ReleaseSafe, so a wider id leading the roster with nothing selected
+    // was a bounds panic on the render thread, under the store lock, on the first frame it appeared.
+    const gpa = std.testing.allocator;
+    const s = try gpa.create(Store); // Store is far too big for a test stack frame
+    defer gpa.destroy(s);
+    s.* = .{};
+    // The widest id the roster can hold, sized from the field itself rather than a remembered 96.
+    const row = &s.swarms[0];
+    row.* = .{};
+    const prefix = "u1/_chat/builds/";
+    @memcpy(row.id[0..prefix.len], prefix);
+    @memset(row.id[prefix.len..], 'c');
+    row.id_len = @intCast(row.id.len);
+    s.swarm_count = 1;
+    try std.testing.expect(row.idStr().len > 64);
+
+    try std.testing.expect(autoSelect(s));
+    const cmd = s.popCmd() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(store_mod.CmdKind.select, cmd.kind);
+    try std.testing.expectEqualStrings(row.idStr(), cmd.idStr()); // whole, not cut at 64
+    try std.testing.expect(s.popCmd() == null); // one call, one select
 }
