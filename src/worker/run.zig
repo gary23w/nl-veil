@@ -40,6 +40,7 @@ const ragmirror = @import("ragmirror.zig");
 const toolchain = @import("toolchain.zig");
 const lineage = @import("lineage.zig");
 const cctx = @import("chat/context.zig");
+const cync = @import("chat/sync.zig"); // the chat engine's synced marker, which a worker entering a run dir drops
 
 const log = std.log.scoped(.worker);
 
@@ -693,20 +694,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
     defer parsed.deinit();
     const m = parsed.value;
 
-    const pid_path = try std.fmt.allocPrint(gpa, "{s}/worker.pid", .{run_dir});
-    defer gpa.free(pid_path);
-    {
-        const s = try std.fmt.allocPrint(gpa, "{d}", .{currentPid()});
-        defer gpa.free(s);
-        std.Io.Dir.cwd().writeFile(io, .{ .sub_path = pid_path, .data = s }) catch {};
-    }
-    {
-        // A reused run dir (respawn, manual restart-to-resume, re-cast) must not inherit the previous run's
-        // terminal marker — a stale DONE would make the supervisor read this fresh worker as already-stopped.
-        const done_path = try std.fmt.allocPrint(gpa, "{s}/DONE", .{run_dir});
-        defer gpa.free(done_path);
-        std.Io.Dir.cwd().deleteFile(io, done_path) catch {};
-    }
+    try claimRunDir(gpa, io, run_dir);
 
     {
         const wd = try std.fmt.allocPrint(gpa, "{s}/work", .{run_dir});
@@ -1905,6 +1893,30 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
     @import("browser/manager.zig").closeAll(gpa, io);
     w.emit("stopped", std.fmt.allocPrint(w.a(), ",\"reason\":\"{s}\",\"rounds\":{d}", .{ stop_reason, round }) catch ",\"rounds\":0");
     writeDone(&w, stop_reason);
+}
+
+/// Claim `run_dir` for this worker at startup: write worker.pid FIRST, then drop what a previous worker in the dir
+/// left behind. A reused run dir (a crash respawn, which relaunches into it with nothing reset; a manual
+/// restart-to-resume; a re-cast) can still hold:
+///   - DONE, which would make the supervisor read this fresh worker as already stopped;
+///   - the chat engine's synced marker (chat/sync.zig SYNCED_MARKER). A client-mode client that was pushed the
+///     previous worker's files (say by a tool call between a crash and its respawn) would otherwise never be
+///     pushed this worker's.
+/// The order is load-bearing. A push that read the previous worker's dead pid can still write its marker after this
+/// drop, so maybeSyncCastFiles re-reads the pid once its marker is down, finds this worker live, and takes it back.
+pub fn claimRunDir(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8) !void {
+    const pid_path = try std.fmt.allocPrint(gpa, "{s}/worker.pid", .{run_dir});
+    defer gpa.free(pid_path);
+    {
+        const s = try std.fmt.allocPrint(gpa, "{d}", .{currentPid()});
+        defer gpa.free(s);
+        std.Io.Dir.cwd().writeFile(io, .{ .sub_path = pid_path, .data = s }) catch {};
+    }
+    for ([_][]const u8{ "DONE", cync.SYNCED_MARKER }) |name| {
+        const p = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ run_dir, name });
+        defer gpa.free(p);
+        std.Io.Dir.cwd().deleteFile(io, p) catch {};
+    }
 }
 
 /// Terminal marker, written beside the final "stopped" event on EVERY clean exit: <run_dir>/DONE holds the
