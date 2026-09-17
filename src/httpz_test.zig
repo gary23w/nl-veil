@@ -1,4 +1,5 @@
-//! Tests for local patches in vendor/httpz's blocking worker, the one veil's server runs on Windows.
+//! Tests for local patches in vendor/httpz's workers: the blocking worker veil's server runs on Windows, and the
+//! nonblocking worker it runs everywhere else.
 //!
 //! 1. server.stop() closes each connection socket exactly once. Upstream's stop() closed every socket still on
 //!    the worker's list, and a handler closed its socket a moment before taking it off that list. A stop()
@@ -10,9 +11,13 @@
 //! 2. A request body cut short by the client's FIN closes the connection at once. Before, the worker went
 //!    straight back to a recv that returned 0 and spun a thread at 100% CPU until the request deadline, and
 //!    forever on a keep-alive request. A stopping server's shutdown reads as the same EOF.
+//! 3. A stopped server leaves none of its threads running. The nonblocking worker freed its thread pool in
+//!    deinit() without stopping it, and ThreadPool.deinit only freed the pool's arena, so the pool's threads
+//!    stayed parked on a condition variable inside freed memory. On Linux a later futex wait there faulted, and
+//!    the test run aborted in whichever test came next.
 //!
-//! Windows only. Elsewhere httpz runs its nonblocking worker, which has no socket hook, and the client below
-//! is Winsock.
+//! 1 and 2 are Windows only: elsewhere httpz runs its nonblocking worker, which has no socket hook, and their
+//! client is Winsock. 3 is Linux only, because it counts the process's threads in /proc/self/task.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -240,6 +245,56 @@ test "httpz: a request body cut short by the client's FIN closes the connection 
     try rec.awaitCloses(1, 5000);
     try std.testing.expectEqual(@as(usize, 1), rec.count(.closed, null));
     try std.testing.expectEqual(@as(usize, 0), rec.count(.close_failed, null));
+}
+
+test "httpz: a stopped server leaves none of its threads running, its nonblocking workers' thread pools included" {
+    if (comptime builtin.os.tag != .linux or httpz.blockingMode()) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server = try httpz.Server(void).init(io, gpa, .{
+        .address = .localhost(0),
+        .workers = .{ .count = 2 },
+        .thread_pool = .{ .count = 4 },
+    }, {});
+    defer server.deinit();
+    var router = try server.router(.{});
+    router.get("/", hello, .{});
+
+    const before = try threadCount(io);
+    const thread = try server.listenInNewThread();
+    if (server._listener == null) {
+        thread.join();
+        return error.ListenFailed;
+    }
+    // Serving: the listen thread, two event loops, and two pools of four.
+    try std.testing.expect(try threadCount(io) >= before + 1 + 2 + 2 * 4);
+    server.stop();
+    thread.join();
+
+    // listen() returns only after it has deinit'ed its workers, so every thread the server started should be gone.
+    // A joined thread's /proc entry can outlive join() by a moment, so the count gets a second to settle. A pool
+    // thread left parked never exits, and then the count stays above where it started.
+    var after = try threadCount(io);
+    var waits: usize = 0;
+    while (after > before and waits < 100) : (waits += 1) {
+        io.sleep(.{ .nanoseconds = 10 * std.time.ns_per_ms }, .awake) catch {};
+        after = try threadCount(io);
+    }
+    if (after > before) std.debug.print("\n{d} thread(s) outlived the stopped server\n", .{after - before});
+    try std.testing.expect(after <= before);
+}
+
+/// Linux: the process's live threads, one /proc/self/task entry each.
+fn threadCount(io: std.Io) !usize {
+    var dir = try std.Io.Dir.cwd().openDir(io, "/proc/self/task", .{ .iterate = true });
+    defer dir.close(io);
+    var it = dir.iterate();
+    var n: usize = 0;
+    while (try it.next(io)) |_| n += 1;
+    return n;
 }
 
 fn hello(_: *httpz.Request, res: *httpz.Response) !void {
