@@ -119,6 +119,8 @@ data/
 
 `NEURON_LOOPS_DATA` overrides the location of `data/` entirely.
 
+A call to a hosted model gives curl its API key in a small config file inside `data/`, next to the call's request body. The call deletes the file when curl exits. On start, the server removes any such file older than 15 minutes, which is what a killed process leaves. Releases up to 1.1.1 never deleted these files, so each conversation that used a hosted model kept one. If `data/` sits in a synced or backed-up folder, a long-lived provider key has likely been copied along with it. Rotate that key.
+
 ---
 
 Next: [accounts and the sandbox](accounts.md) · [architecture](architecture.md) · the entry point, [main](../main.md)
