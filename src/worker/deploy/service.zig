@@ -141,9 +141,8 @@ pub fn deploySwarm(app: *App, arena: std.mem.Allocator, u: http.User, body: Depl
     if (local_model and !app.auth.isAdmin(u))
         return failCap("local models (Ollama or the built-in engine) are admin-only and don't run in the hosted environment — choose Cloudflare Workers AI or bring your own API key");
 
-    var rnd: [8]u8 = undefined;
-    app.io.random(&rnd);
-    const id = std.fmt.allocPrint(arena, "{s}", .{std.fmt.bytesToHex(rnd, .lower)}) catch return failSrv("out of memory");
+    const spawn_id = app.sup.newSpawnId(); // a deploy's run dir is named by it, which is how reattach and retention know one
+    const id = arena.dupe(u8, &spawn_id) catch return failSrv("out of memory");
     // run_dir is the override (a chat conversation dir) when the cast asked to build in place, else the default
     // per-swarm folder. Either way `{run_dir}/work` is the deliverable dir the worker uses — the worker needs no
     // change, it just inherits whichever run_dir we spawn it with.
