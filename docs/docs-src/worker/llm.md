@@ -23,6 +23,7 @@ Every model call the worker makes goes through this client. It loads no models: 
 - `initQuirkStore(io, dir)` — points the learned provider-quirk table at its durable `{dir}/provider_quirks.jsonl` and loads every prior lesson; called at boot by main.zig (server/CLI) and run.zig (each swarm worker) against the same data dir
 - `isKeyCfgName(name)` + `KEY_CFG_STALE_S` — which file names are the curl key configs older builds wrote (either transport, per call or per tag) and how old one must be before nothing can still need it; `Supervisor.sweepKeyScratch` reads both
 - `isCallBodyName(name)` — which file names are a request body or stream sink that one call wrote under its own name, never a tag's replay copy; `Supervisor.sweepKeyScratch` removes the stranded ones past `KEY_CFG_STALE_S`, and `Supervisor.cleanCastMeta` leaves them alone
+- `runCurl(gpa, io, argv, cfg, stdout_limit)` + `KEY_CFG_MAX` — `std.process.run` for a curl whose argv says `-K -`: spawn it with a stdin pipe, write `cfg` into the pipe and close it (`keyToCurl`), then collect stdout and stderr until it exits. The caller keeps `cfg` within `KEY_CFG_MAX` (4096 bytes, what the pipe holds with no reader), because `keyToCurl` asserts it. `postUrl` runs here, and so does every Cloudflare call (`cf_oauth.curl`)
 
 ## Dependencies
 
@@ -33,7 +34,7 @@ Every model call the worker makes goes through this client. It loads no models: 
 
 ## Usage Context
 
-Called from every model-facing path in the worker: `run.zig` mind moments, the chat engine's turn loop, and helper passes in `tools.zig`. `commons.zig` imports it just for `jstr`. `metrics.zig` drains the per-role buckets at the turn's usage choke-point.
+Called from every model-facing path in the worker: `run.zig` mind moments, the chat engine's turn loop, and helper passes in `tools.zig`. `commons.zig` imports it just for `jstr`. `metrics.zig` drains the per-role buckets at the turn's usage choke-point. `config/cf_oauth.zig` imports it just for `runCurl` and `KEY_CFG_MAX`.
 
 ## Notable Implementation Details
 

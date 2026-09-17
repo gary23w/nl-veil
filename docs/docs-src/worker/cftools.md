@@ -22,7 +22,7 @@ A Cloudflare login connects the user's own account; this family lets the assista
 
 ## Dependencies
 
-- `std` only; Cloudflare is reached by spawning `curl`, which must be on PATH
+- `../config/cf_oauth.zig` — `curl`, the one Cloudflare transport in the process; this file passes it the run dir, `.cfapi-body-`, 120 s, 8 MiB and any multipart parts. Cloudflare is reached by spawning `curl`, which must be on PATH. Its tests also use `cf_oauth.ScratchWatch`
 
 ## Usage Context
 
@@ -39,7 +39,7 @@ The same-disk probe skips both transfers when the desk shares the server's data 
 
 ## Notable Implementation Details
 
-- Transport matches `cf_oauth`: the bearer rides a curl config file (`-K`) and a request body a scratch file (`--data-binary @file`), both in the run dir under a random 16-hex suffix and deleted when the call returns, so no secret or payload reaches the argv. Each call has a 120 s `--max-time`.
+- Transport is `cf_oauth.curl`, shared with the login, R2 and tunnel calls. The bearer rides the config curl reads from its stdin (`-K -`), so no file holds it, not even while curl runs, and nothing secret reaches the argv. A body rides the same config (`data-raw`, escaped) when the whole config fits the 4096-byte pipe: a `cf_api` body carrying a Worker secret, a D1 query. A body too big for that, or holding NUL or 0x1A, is written to `{run dir}/.cfapi-body-{16 hex}` while its call runs and then deleted: a `cf_r2_put` upload, a large `cf_api` payload. Before, the config was a file too (`.cfapi-cfg-*`, bearer included), and so was every body (`.cfapi-body-*`), each for up to the whole 120 s `--max-time`. A test drives three verbs against a 127.0.0.1 stand-in and looks through the run dir at the moment curl starts, while curl waits on the reply, and after the call: no file holds the token or the Worker secret, the small bodies wrote no file, and the upload's one body file is gone once the call returns.
 - Size caps: 8 MiB for a response, 24 MiB for an uploaded script or object. A response over the cap fails the call, and the failure reads as "could not reach the Cloudflare API" — so `cf_r2_put` can store an object that `cf_r2_get` cannot fetch back (anything over 8 MiB).
 - `safeRel` refuses an empty path, one over 400 bytes, a leading `/` or `\`, any `..`, a drive letter and control characters, before the path is joined. Bucket names, object keys and `database_id` pass the same check; `cf_r2_list`'s `prefix` is not checked, nothing is URL-encoded, and a bucket listing asks for `per_page=100` without paging further.
 - `cf_api` keeps the bearer on the API host rather than restricting what it does there: the path must start with a single `/` and contain no `://`, `@`, spaces or control characters, and it is appended to the root (tested against `https://`, `//`, `@` and space tricks). `{account_id}` is filled in; the method must be GET, POST, PUT, PATCH or DELETE. There is no path allowlist — a call reaches whatever the login's grant covers, which, since the tunnel scopes joined the default scope set, can include DNS, tunnel and zone-level Access writes the user granted.

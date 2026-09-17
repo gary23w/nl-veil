@@ -14,7 +14,10 @@
 //! public client_id in. Disabled (start returns 501) until cf_oauth_client_id is set.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const bu = @import("../worker/browser/util.zig"); // sleepMs: a raw-thread sleep, no Io park
+const llm = @import("../worker/llm.zig"); // runCurl + KEY_CFG_MAX: curl reads a call's secrets from its stdin
+const fakehttp = @import("../worker/fakehttp.zig"); // TEST ONLY: the stand-in the transport tests dial
 const httpz = @import("httpz");
 const http = @import("../gateway/http.zig");
 const key_vault = @import("key_vault.zig");
@@ -156,77 +159,141 @@ fn pctEncode(gpa: std.mem.Allocator, list: *std.ArrayListUnmanaged(u8), s: []con
 
 // ------------------------------------------------------------------------------------ outbound HTTPS (curl)
 
-/// One outbound HTTPS call to Cloudflare via curl. The request BODY (which may hold the short-lived code or the
-/// refresh token) goes in a scratch file passed with --data-binary @file, never on the argv; a Bearer token, if
-/// any, rides a curl config file (-K), also never on the argv. Returns the response body (gpa-owned) or null.
-/// A random suffix keeps concurrent flows from sharing scratch paths.
-///
-/// pub, with the content type as a parameter, because this is the ONE Cloudflare HTTP path in the process:
-/// cf_r2 reuses it for bucket/object calls (JSON and raw octet-stream bodies) rather than growing a second
-/// curl wrapper with its own secret-handling mistakes.
+/// One call from this server's own Cloudflare code, through `curl`. pub, with the content type as a parameter,
+/// because cf_r2 reuses it for bucket/object calls (JSON and raw octet-stream bodies) and cf_tunnel for its v4
+/// calls, rather than growing a second curl wrapper with its own secret-handling mistakes.
 pub fn apiCall(app: *App, method: []const u8, url: []const u8, body: []const u8, bearer: []const u8, content_type: []const u8) ?[]u8 {
-    return curlCallCt(app, method, url, body, bearer, content_type);
+    return curl(appCurl(app), method, url, body, bearer, content_type);
 }
 
 /// The token/consent legs all speak forms; keep their call sites one argument shorter.
 fn curlCall(app: *App, method: []const u8, url: []const u8, form_body: []const u8, bearer: []const u8) ?[]u8 {
-    return curlCallCt(app, method, url, form_body, bearer, "application/x-www-form-urlencoded");
+    return curl(appCurl(app), method, url, form_body, bearer, "application/x-www-form-urlencoded");
 }
 
-fn curlCallCt(app: *App, method: []const u8, url: []const u8, form_body: []const u8, bearer: []const u8, content_type: []const u8) ?[]u8 {
-    const gpa = app.gpa;
-    const io = app.io;
+/// The server's own calls: a body that rides a file goes in the data dir, and a call gets 30 s and a 1 MiB answer.
+fn appCurl(app: *App) CurlOpts {
+    return .{ .gpa = app.gpa, .io = app.io, .scratch = app.data, .body_prefix = ".cfoauth-body-", .max_time_s = 30, .stdout_limit = 1 << 20 };
+}
+
+/// How one Cloudflare call runs (`curl`). Each caller brings its own: this file and `apiCall` (appCurl), and the cf_
+/// tool belt (cftools.call: the run dir, 120 s, 8 MiB).
+pub const CurlOpts = struct {
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    /// Where a body curl's config cannot carry is written while its call runs: `{scratch}/{body_prefix}{16 hex}`.
+    scratch: []const u8,
+    body_prefix: []const u8,
+    max_time_s: u32,
+    stdout_limit: usize,
+    /// More argv, for what may sit on the process table: never a secret (cftools' multipart -F parts).
+    extra: []const []const u8 = &.{},
+};
+
+/// One outbound HTTPS call to Cloudflare through curl. This file's token legs, `apiCall` (cf_r2, cf_tunnel) and the
+/// cf_ tool belt (cftools.call) all send theirs here, so the secret handling exists once. Returns the response body
+/// (gpa-owned), or null: curl could not run or answered nothing, or the call was refused before it started (below).
+///
+/// THE BEARER NEVER TOUCHES DISK. It rides the config curl reads from its stdin (`-K -`, llm.runCurl): never the argv,
+/// and no file, not even while curl runs. It used to ride a config FILE for the call's whole life, up to 120 s:
+/// `{data}/.cfoauth-cfg-*`, and a run dir's `.cfapi-cfg-*`, inside a data dir that is often a synced folder. A sync
+/// client could upload one mid-call, deleting a synced file only sends the cloud copy to the recycle bin, and a
+/// process killed mid-call left it where it was.
+///
+/// A BODY RIDES THE SAME CONFIG (cfgData) whenever curl reads it back byte for byte and the whole config still fits
+/// the pipe (llm.KEY_CFG_MAX). The token exchange's form, which carries the refresh token, or the code and its
+/// verifier, always does: it used to sit in `{data}/.cfoauth-body-*` for the call's life. Only a body too big for the
+/// pipe, or holding NUL or 0x1A, goes to a file, `{scratch}/{body_prefix}{16 hex}`, the call's own and deleted when it
+/// returns: an upload (cf_r2's objects, cf_r2_put's bytes, a large cf_api payload), never the bearer. A bearer or
+/// content type the config cannot carry (cfgHeader), or a bearer too long for the pipe, fails the call before a file
+/// is written or a connection made: a secret never falls back to a file.
+pub fn curl(o: CurlOpts, method: []const u8, url: []const u8, body: []const u8, bearer: []const u8, content_type: []const u8) ?[]u8 {
+    const gpa = o.gpa;
+    const io = o.io;
+    var cfg: std.ArrayListUnmanaged(u8) = .empty;
+    defer cfg.deinit(gpa);
+    if (bearer.len > 0 and !(cfgHeader(gpa, &cfg, "Authorization: Bearer ", bearer) catch return null)) return null;
+    if (body.len > 0 and content_type.len > 0 and !(cfgHeader(gpa, &cfg, "Content-Type: ", content_type) catch return null)) return null;
+    if (cfg.items.len > llm.KEY_CFG_MAX) return null; // runCurl's precondition: the pipe holds the config whole
+    const in_file = body.len > 0 and !(cfgData(gpa, &cfg, body) catch return null);
+
     var sfx: [8]u8 = undefined;
     io.random(&sfx);
     const tag = std.fmt.bytesToHex(sfx, .lower);
-
-    var body_path_buf: [600]u8 = undefined;
-    var cfg_path_buf: [600]u8 = undefined;
-    const body_path = std.fmt.bufPrint(&body_path_buf, "{s}/.cfoauth-body-{s}", .{ app.data, tag }) catch return null;
-    const cfg_path = std.fmt.bufPrint(&cfg_path_buf, "{s}/.cfoauth-cfg-{s}", .{ app.data, tag }) catch return null;
-    var wrote_body = false;
-    var wrote_cfg = false;
-    defer if (wrote_body) std.Io.Dir.cwd().deleteFile(io, body_path) catch {};
-    defer if (wrote_cfg) std.Io.Dir.cwd().deleteFile(io, cfg_path) catch {};
-
-    if (form_body.len > 0) {
-        std.Io.Dir.cwd().writeFile(io, .{ .sub_path = body_path, .data = form_body }) catch return null;
-        wrote_body = true;
-    }
-    // curl config file carries the auth header + a content-type, so no secret lands on the argv.
-    {
-        var cfg: std.ArrayListUnmanaged(u8) = .empty;
-        defer cfg.deinit(gpa);
-        cfg.appendSlice(gpa, "silent\nshow-error\n") catch return null;
-        if (bearer.len > 0) {
-            cfg.appendSlice(gpa, "header = \"Authorization: Bearer ") catch return null;
-            cfg.appendSlice(gpa, bearer) catch return null;
-            cfg.appendSlice(gpa, "\"\n") catch return null;
-        }
-        if (form_body.len > 0) {
-            cfg.appendSlice(gpa, "header = \"Content-Type: ") catch return null;
-            cfg.appendSlice(gpa, content_type) catch return null;
-            cfg.appendSlice(gpa, "\"\n") catch return null;
-        }
-        std.Io.Dir.cwd().writeFile(io, .{ .sub_path = cfg_path, .data = cfg.items }) catch return null;
-        wrote_cfg = true;
-    }
-
-    var data_at_buf: [610]u8 = undefined;
+    var body_path_buf: [700]u8 = undefined;
+    const body_path = std.fmt.bufPrint(&body_path_buf, "{s}/{s}{s}", .{ o.scratch, o.body_prefix, tag }) catch return null;
+    var data_at_buf: [710]u8 = undefined;
     const data_at = std.fmt.bufPrint(&data_at_buf, "@{s}", .{body_path}) catch return null;
+    // Armed before the write, so a half-written body goes too. It runs once curl has exited: runCurl waits for it.
+    defer if (in_file) std.Io.Dir.cwd().deleteFile(io, body_path) catch {};
+    if (in_file) std.Io.Dir.cwd().writeFile(io, .{ .sub_path = body_path, .data = body }) catch return null;
+
+    var max_time_buf: [12]u8 = undefined;
+    const max_time = std.fmt.bufPrint(&max_time_buf, "{d}", .{o.max_time_s}) catch return null;
     var av: std.ArrayListUnmanaged([]const u8) = .empty;
     defer av.deinit(gpa);
-    av.appendSlice(gpa, &.{ "curl", "-sS", "--max-time", "30", "-X", method, "-K", cfg_path }) catch return null;
-    if (form_body.len > 0) av.appendSlice(gpa, &.{ "--data-binary", data_at }) catch return null;
+    av.appendSlice(gpa, &.{ "curl", "-sS", "--max-time", max_time, "-X", method, "-K", "-" }) catch return null;
+    if (in_file) av.appendSlice(gpa, &.{ "--data-binary", data_at }) catch return null;
+    av.appendSlice(gpa, o.extra) catch return null;
     av.append(gpa, url) catch return null;
 
-    const run = std.process.run(gpa, io, .{ .argv = av.items, .stdout_limit = .limited(1 << 20) }) catch return null;
+    if (builtin.is_test) if (test_before_curl) |hold| hold();
+    const run = llm.runCurl(gpa, io, av.items, cfg.items, o.stdout_limit) catch return null;
     gpa.free(run.stderr);
     if (run.stdout.len == 0) {
         gpa.free(run.stdout);
         return null;
     }
     return run.stdout;
+}
+
+/// TEST SEAM: runs on the calling thread once a Cloudflare call has written everything it writes, just before its curl
+/// starts (`curl`): the moment a config file would already be on disk. pub: cftools' tests hold the belt's calls here.
+pub var test_before_curl: if (builtin.is_test) ?*const fn () void else void = if (builtin.is_test) null else {};
+
+/// Append `header = "<name><value>"` to a curl config. False, with nothing appended, for a value holding a byte below
+/// 0x20 or DEL: curl puts a header value on the wire as it reads it, so a line break would split the header, and NUL
+/// or 0x1A would cut the config short (cfgEscape).
+fn cfgHeader(gpa: std.mem.Allocator, cfg: *std.ArrayListUnmanaged(u8), comptime name: []const u8, value: []const u8) error{OutOfMemory}!bool {
+    for (value) |c| if (c < 0x20 or c == 0x7F) return false;
+    try cfg.appendSlice(gpa, "header = \"" ++ name);
+    try cfgEscape(gpa, cfg, value);
+    try cfg.appendSlice(gpa, "\"\n");
+    return true;
+}
+
+/// Append `data-raw = "<body>"` to a curl config when curl reads `body` back byte for byte and the whole config still
+/// fits the pipe (llm.KEY_CFG_MAX). False, with the config as it was, otherwise: the call sends the body from a file.
+/// `data-raw`, NOT `data-binary`: data-binary reads a value that starts with @ as a file name, and curl 8.5, 8.17 and
+/// 8.21 each uploaded that file's contents instead of the body (measured 2026-09-17).
+fn cfgData(gpa: std.mem.Allocator, cfg: *std.ArrayListUnmanaged(u8), body: []const u8) error{OutOfMemory}!bool {
+    if (body.len > llm.KEY_CFG_MAX) return false; // escaping only lengthens it
+    for (body) |c| if (c == 0 or c == 0x1A) return false; // no escape carries either (cfgEscape)
+    const mark = cfg.items.len;
+    try cfg.appendSlice(gpa, "data-raw = \"");
+    try cfgEscape(gpa, cfg, body);
+    try cfg.appendSlice(gpa, "\"\n");
+    if (cfg.items.len <= llm.KEY_CFG_MAX) return true;
+    cfg.shrinkRetainingCapacity(mark);
+    return false;
+}
+
+/// `value` as the inside of a quoted curl config value, the way curl's config reader unquotes it: `\\` and `\"` for
+/// themselves, `\t` `\n` `\r` `\v` for tab, line feed, CR and VT. The escapes keep a value ONE value. A raw line feed
+/// ends it, and curl reads what follows as more options: a body could add a header, or a second URL, and curl sends
+/// the config's bearer to that URL too (measured on curl 8.5, 8.17 and 8.21). NUL and 0x1A have no escape: curl stops
+/// reading a line at NUL, and on Windows it reads its config in text mode, where 0x1A ends it. The callers refuse both.
+fn cfgEscape(gpa: std.mem.Allocator, cfg: *std.ArrayListUnmanaged(u8), value: []const u8) error{OutOfMemory}!void {
+    for (value) |c| switch (c) {
+        '\\' => try cfg.appendSlice(gpa, "\\\\"),
+        '"' => try cfg.appendSlice(gpa, "\\\""),
+        '\t' => try cfg.appendSlice(gpa, "\\t"),
+        '\n' => try cfg.appendSlice(gpa, "\\n"),
+        '\r' => try cfg.appendSlice(gpa, "\\r"),
+        0x0B => try cfg.appendSlice(gpa, "\\v"),
+        // every other byte reads back as itself: the rest of the range below 0x20, and 0x7F-0xFF (all three curls)
+        else => try cfg.append(gpa, c),
+    };
 }
 
 // ------------------------------------------------------------------------------------ token exchange + resolve
@@ -1031,4 +1098,376 @@ test "pending store round-trips state->verifier and is single-use" {
     try std.testing.expectEqual(@as(u64, 7), got.uid);
     try std.testing.expectEqualStrings("VERIFIERXYZ", vbuf[0..got.verifier_len]);
     try std.testing.expect(takePending(io, "STATE123", &vbuf) == null); // consumed
+}
+
+// ---------------------------------------------------------------------------
+// No Cloudflare secret touches disk (`curl`). These drive the REAL curl against a loopback stand-in and look through
+// every file under the call's scratch dir while the call is in flight (ScratchWatch): at test_before_curl, with all the
+// call writes on disk and its curl about to start, and from the stand-in, with curl connected and waiting on the
+// reply. Then once more after the call has returned.
+// ---------------------------------------------------------------------------
+
+/// Never real credentials; distinctive, so a byte search for each is exact.
+const TEST_BEARER = "cfat-test-bearer-3d1f-not-a-real-token";
+const TEST_REFRESH = "cfrt-test-refresh-9a2e-not-a-real-token";
+const TEST_CODE = "cfac-test-code-51b7-not-a-real-code";
+const TEST_VERIFIER = "cfpv-test-verifier-c84d-not-a-real-verifier";
+/// What the stand-in token endpoint answers with: the tokens a real exchange brings back.
+const TEST_FRESH_ACCESS = "cfat-test-fresh-access-6e0b-not-a-real-token";
+const TEST_FRESH_REFRESH = "cfrt-test-fresh-refresh-2c5a-not-a-real-token";
+
+/// TEST ONLY. Looks through every file under one dir for secrets while Cloudflare calls are in flight: at
+/// test_before_curl (`atSeam`) and at the stand-in (`onWire`, for fakehttp.Server.startWatched). It counts each kind of
+/// look and the most files named like a call's body (`body_prefix`) one look found, and keeps the first file a look
+/// could not clear: one holding a secret, or one it could not read. pub: cftools' tests watch the belt's calls with it.
+pub const ScratchWatch = struct {
+    var io_: std.Io = undefined;
+    var dir: []const u8 = "";
+    var body_prefix: []const u8 = "";
+    var secrets: []const []const u8 = &.{};
+    var at_seam: std.atomic.Value(u32) = .init(0);
+    var on_wire: std.atomic.Value(u32) = .init(0);
+    var bodies: std.atomic.Value(u32) = .init(0);
+    var found: std.atomic.Value(u32) = .init(0);
+    var found_name: [256]u8 = undefined;
+    var found_len: usize = 0;
+
+    pub fn arm(io: std.Io, dir_path: []const u8, prefix: []const u8, watched: []const []const u8) void {
+        io_ = io;
+        dir = dir_path;
+        body_prefix = prefix;
+        secrets = watched;
+        at_seam.store(0, .monotonic);
+        on_wire.store(0, .monotonic);
+        bodies.store(0, .monotonic);
+        found.store(0, .monotonic);
+        found_len = 0;
+        test_before_curl = atSeam;
+    }
+    pub fn disarm() void {
+        test_before_curl = null;
+    }
+    fn atSeam() void {
+        _ = at_seam.fetchAdd(1, .monotonic);
+        keepMost(look());
+    }
+    /// The stand-in's hook.
+    pub fn onWire() void {
+        _ = on_wire.fetchAdd(1, .monotonic);
+        keepMost(look());
+    }
+    fn keepMost(n: u32) void {
+        var cur = bodies.load(.monotonic);
+        while (n > cur) cur = bodies.cmpxchgWeak(cur, n, .monotonic, .monotonic) orelse break;
+    }
+    /// One pass over the dir: notes what it cannot clear, and returns how many body files it saw.
+    fn look() u32 {
+        const gpa = std.testing.allocator;
+        var d = std.Io.Dir.cwd().openDir(io_, dir, .{ .iterate = true }) catch {
+            note("<the dir would not open>");
+            return 0;
+        };
+        defer d.close(io_);
+        var walker = d.walk(gpa) catch {
+            note("<the dir would not walk>");
+            return 0;
+        };
+        defer walker.deinit();
+        var n: u32 = 0;
+        while (true) {
+            const next = walker.next(io_) catch {
+                note("<the dir would not list>");
+                return n;
+            };
+            const ent = next orelse break;
+            if (ent.kind != .file) continue;
+            if (std.mem.startsWith(u8, ent.basename, body_prefix)) n += 1;
+            const data = ent.dir.readFileAlloc(io_, ent.basename, gpa, .limited(64 << 20)) catch {
+                note(ent.path); // a file the look cannot read is one it cannot clear
+                continue;
+            };
+            defer gpa.free(data);
+            for (secrets) |s| {
+                if (std.mem.indexOf(u8, data, s) != null) note(ent.path);
+            }
+        }
+        return n;
+    }
+    fn note(name: []const u8) void {
+        if (found.fetchAdd(1, .monotonic) > 0) return;
+        found_len = @min(name.len, found_name.len);
+        @memcpy(found_name[0..found_len], name[0..found_len]);
+    }
+    /// Fails if a look found a secret on disk (or could not rule one out), if the looks were not exactly `seam` at the
+    /// seam and `wire` on the wire (one each per call that reached curl and the stand-in), or if the most body files a
+    /// look saw was not `want_bodies`. Read only once the stand-in has stopped: its serve thread looks too.
+    pub fn expect(seam: u32, wire: u32, want_bodies: u32) !void {
+        if (found.load(.monotonic) > 0) {
+            std.debug.print("\na secret was on disk while its call ran: {s}/{s}\n", .{ dir, found_name[0..found_len] });
+            return error.SecretOnDiskMidCall;
+        }
+        if (at_seam.load(.monotonic) != seam or on_wire.load(.monotonic) != wire) {
+            std.debug.print("\nthe mid-call looks ran {d} at the seam (want {d}), {d} on the wire (want {d})\n", .{ at_seam.load(.monotonic), seam, on_wire.load(.monotonic), wire });
+            return error.MidCallLooks;
+        }
+        if (bodies.load(.monotonic) != want_bodies) {
+            std.debug.print("\na look mid-call saw {d} body file(s), want {d}\n", .{ bodies.load(.monotonic), want_bodies });
+            return error.BodyFiles;
+        }
+    }
+    /// One more look once the call has returned: fails on a secret as `expect` does, and returns the body files left.
+    pub fn leftAfter() !u32 {
+        const n = look();
+        if (found.load(.monotonic) > 0) {
+            std.debug.print("\na secret is on disk after its call: {s}/{s}\n", .{ dir, found_name[0..found_len] });
+            return error.SecretOnDiskAfterCall;
+        }
+        return n;
+    }
+    /// Whether curl runs on this machine. Without it no call dials, so a test that needs the wire skips.
+    pub fn curlRuns(gpa: std.mem.Allocator, io: std.Io) bool {
+        const r = std.process.run(gpa, io, .{ .argv = &.{ "curl", "--version" }, .stdout_limit = .limited(16 << 10) }) catch return false;
+        gpa.free(r.stdout);
+        gpa.free(r.stderr);
+        return r.term == .exited and r.term.exited == 0;
+    }
+};
+
+/// TEST ONLY. The head and the body of the request a stand-in captured. fakehttp keeps each head line without its
+/// "\n", so the head ends at the first "\r\r".
+fn splitRequest(req: []const u8) struct { head: []const u8, body: []const u8 } {
+    const end = std.mem.indexOf(u8, req, "\r\r") orelse return .{ .head = req, .body = "" };
+    return .{ .head = req[0..end], .body = req[end + 2 ..] };
+}
+
+test "a body rides curl's stdin config byte for byte, and no body can add a header or a URL to the call" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    if (!ScratchWatch.curlRuns(gpa, io)) return error.SkipZigTest;
+    const root = "zig-cfoauth-cfgbody-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, root, .default_dir) catch {};
+    // What `data-binary` would upload in place of a body that starts with @ and names this file.
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/decoy.txt", .data = "DECOY-FILE-CONTENTS" });
+    // Every byte curl's config can carry, once each: all but NUL and 0x1A.
+    var every: [254]u8 = undefined;
+    var n: usize = 0;
+    for (1..256) |b| {
+        if (b == 0x1A) continue;
+        every[n] = @intCast(b);
+        n += 1;
+    }
+
+    const Case = enum { injection, at_file, every_byte, token_form };
+    for ([_]Case{ .injection, .at_file, .every_byte, .token_form }) |c| {
+        var srv: fakehttp.Server = undefined;
+        try srv.startWatched(io, &.{}, fakehttp.wire("{\"success\":true}"), ScratchWatch.onWire);
+        var running = true;
+        defer if (running) srv.stop();
+        ScratchWatch.arm(io, root, ".cftest-body-", &.{ TEST_BEARER, TEST_REFRESH });
+        defer ScratchWatch.disarm();
+        const body = switch (c) {
+            // Unescaped, the line feeds would end the value: curl would send an extra header and dial a second URL, on
+            // this same stand-in, carrying the bearer there too.
+            .injection => try std.fmt.allocPrint(gpa, "x\"\nheader = \"X-Injected: yes\"\nurl = \"http://127.0.0.1:{d}/injected\"\n#", .{srv.port}),
+            .at_file => try gpa.dupe(u8, "@" ++ root ++ "/decoy.txt"),
+            .every_byte => try gpa.dupe(u8, &every),
+            .token_form => try gpa.dupe(u8, "grant_type=refresh_token&client_id=test-client&refresh_token=" ++ TEST_REFRESH),
+        };
+        defer gpa.free(body);
+        var ub: [64]u8 = undefined;
+        const url = try std.fmt.bufPrint(&ub, "http://127.0.0.1:{d}/client/v4/call", .{srv.port});
+        const r = curl(.{ .gpa = gpa, .io = io, .scratch = root, .body_prefix = ".cftest-body-", .max_time_s = 30, .stdout_limit = 1 << 20 }, "POST", url, body, TEST_BEARER, "application/x-www-form-urlencoded");
+        defer if (r) |x| gpa.free(x);
+        srv.stop(); // joins the serve thread: request(), the call log and the watch are only safe to read after it
+        running = false;
+
+        try std.testing.expect(r != null);
+        // One request, to the URL on the argv, with one extra header: the bearer...
+        if (srv.call_count != 1 or srv.countCalls("POST", "/injected") != 0) {
+            std.debug.print("\n[{t}] the body added a request: {d} calls\n", .{ c, srv.call_count });
+            return error.BodyAddedARequest;
+        }
+        const sent = splitRequest(srv.request());
+        try std.testing.expect(std.mem.indexOf(u8, sent.head, "Authorization: Bearer " ++ TEST_BEARER) != null);
+        if (std.mem.indexOf(u8, sent.head, "X-Injected") != null) {
+            std.debug.print("\n[{t}] the body added a header\n", .{c});
+            return error.BodyAddedAHeader;
+        }
+        // ...and the body as it was meant, byte for byte: a leading @ is two bytes of body, not the file they name.
+        if (!std.mem.eql(u8, body, sent.body)) {
+            std.debug.print("\n[{t}] the body arrived changed: {d} bytes, wanted {d}: {s}\n", .{ c, sent.body.len, body.len, sent.body[0..@min(sent.body.len, 64)] });
+            return error.BodyChanged;
+        }
+        // It rode the config: no body file at the seam or on the wire, and no file held the bearer or the refresh token.
+        try ScratchWatch.expect(1, 1, 0);
+        try std.testing.expectEqual(@as(u32, 0), try ScratchWatch.leftAfter());
+    }
+}
+
+test "a body curl's config cannot carry goes whole from a file that never holds the bearer and leaves with its call" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    if (!ScratchWatch.curlRuns(gpa, io)) return error.SkipZigTest;
+    const root = "zig-cfoauth-filebody-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, root, .default_dir) catch {};
+
+    const Case = enum { escapes_past_the_pipe, past_the_pipe, nul, ctrl_z };
+    for ([_]Case{ .escapes_past_the_pipe, .past_the_pipe, .nul, .ctrl_z }) |c| {
+        const body = switch (c) {
+            // short enough raw, but every byte doubles when escaped, so the config would pass KEY_CFG_MAX
+            .escapes_past_the_pipe => blk: {
+                const b = try gpa.alloc(u8, llm.KEY_CFG_MAX / 2 + 16);
+                @memset(b, '"');
+                break :blk b;
+            },
+            .past_the_pipe => blk: {
+                const b = try gpa.alloc(u8, 16 << 10);
+                for (b, 0..) |*x, i| x.* = @truncate(i *% 31);
+                break :blk b;
+            },
+            .nul => try gpa.dupe(u8, "an object\x00with a NUL in it"),
+            .ctrl_z => try gpa.dupe(u8, "an object\x1awith 0x1A in it"),
+        };
+        defer gpa.free(body);
+        var srv: fakehttp.Server = undefined;
+        try srv.startWatched(io, &.{}, fakehttp.wire("{\"success\":true}"), ScratchWatch.onWire);
+        var running = true;
+        defer if (running) srv.stop();
+        ScratchWatch.arm(io, root, ".cftest-body-", &.{TEST_BEARER});
+        defer ScratchWatch.disarm();
+        var ub: [64]u8 = undefined;
+        const url = try std.fmt.bufPrint(&ub, "http://127.0.0.1:{d}/client/v4/objects/k", .{srv.port});
+        const r = curl(.{ .gpa = gpa, .io = io, .scratch = root, .body_prefix = ".cftest-body-", .max_time_s = 30, .stdout_limit = 1 << 20 }, "PUT", url, body, TEST_BEARER, "application/octet-stream");
+        defer if (r) |x| gpa.free(x);
+        srv.stop();
+        running = false;
+
+        try std.testing.expect(r != null);
+        const sent = splitRequest(srv.request());
+        try std.testing.expect(std.mem.indexOf(u8, sent.head, "Authorization: Bearer " ++ TEST_BEARER) != null);
+        if (!std.mem.eql(u8, body, sent.body)) {
+            std.debug.print("\n[{t}] the body arrived changed: {d} bytes, wanted {d}\n", .{ c, sent.body.len, body.len });
+            return error.BodyChanged;
+        }
+        // The body was on disk while curl ran, in a file of its own that held no bearer, and it is gone now.
+        try ScratchWatch.expect(1, 1, 1);
+        try std.testing.expectEqual(@as(u32, 0), try ScratchWatch.leftAfter());
+    }
+}
+
+test "a header value curl's config cannot carry fails the call before curl starts, and leaves nothing on disk" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-cfoauth-refused-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, root, .default_dir) catch {};
+
+    const long_bearer = try gpa.alloc(u8, llm.KEY_CFG_MAX); // with its header around it, the config passes the pipe
+    defer gpa.free(long_bearer);
+    @memset(long_bearer, 'k');
+    const Case = struct { what: []const u8, bearer: []const u8, content_type: []const u8 };
+    const cases = [_]Case{
+        .{ .what = "a line break in the bearer", .bearer = TEST_BEARER ++ "\nurl = \"http://127.0.0.1:9/elsewhere\"", .content_type = "application/json" },
+        .{ .what = "DEL in the bearer", .bearer = TEST_BEARER ++ "\x7f", .content_type = "application/json" },
+        .{ .what = "a bearer too long for the pipe", .bearer = long_bearer, .content_type = "application/json" },
+        .{ .what = "a line break in the content type", .bearer = TEST_BEARER, .content_type = "application/json\r\nX-Injected: yes" },
+    };
+    for (cases) |c| {
+        var srv: fakehttp.Server = undefined;
+        try srv.startWatched(io, &.{}, fakehttp.wire("{\"success\":true}"), ScratchWatch.onWire);
+        var running = true;
+        defer if (running) srv.stop();
+        ScratchWatch.arm(io, root, ".cftest-body-", &.{TEST_BEARER});
+        defer ScratchWatch.disarm();
+        var ub: [64]u8 = undefined;
+        const url = try std.fmt.bufPrint(&ub, "http://127.0.0.1:{d}/client/v4/call", .{srv.port});
+        // a body past the pipe too: the call would write it to a file, if it got that far
+        const body = try gpa.alloc(u8, 16 << 10);
+        defer gpa.free(body);
+        @memset(body, 'b');
+        const r = curl(.{ .gpa = gpa, .io = io, .scratch = root, .body_prefix = ".cftest-body-", .max_time_s = 30, .stdout_limit = 1 << 20 }, "POST", url, body, c.bearer, c.content_type);
+        defer if (r) |x| gpa.free(x);
+        srv.stop();
+        running = false;
+
+        if (r != null or srv.conns.load(.monotonic) != 0) {
+            std.debug.print("\n[{s}] the call went ahead: answer={} connections={d}\n", .{ c.what, r != null, srv.conns.load(.monotonic) });
+            return error.CallNotRefused;
+        }
+        try ScratchWatch.expect(0, 0, 0); // it never reached the point where its curl starts
+        try std.testing.expectEqual(@as(u32, 0), try ScratchWatch.leftAfter());
+    }
+}
+
+test "a token exchange and a bearer call keep every secret off disk: the refresh token, the code and its verifier, the tokens that come back, and the bearer" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-cfoauth-exchange-tmp";
+    var ta = try http.testApp(gpa, io, root);
+    defer ta.deinit();
+    if (!ScratchWatch.curlRuns(gpa, io)) return error.SkipZigTest;
+    ta.app.cf_oauth_client_id = "test-client";
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const tokens = fakehttp.wire("{\"access_token\":\"" ++ TEST_FRESH_ACCESS ++ "\",\"refresh_token\":\"" ++ TEST_FRESH_REFRESH ++ "\",\"expires_in\":3600,\"token_type\":\"bearer\"}");
+    const accounts = fakehttp.wire("{\"success\":true,\"result\":[{\"id\":\"acct-7\",\"name\":\"Test Account\"}]}");
+    const Leg = enum { refresh, code, account };
+    for ([_]Leg{ .refresh, .code, .account }) |leg| {
+        var srv: fakehttp.Server = undefined;
+        try srv.startWatched(io, &.{}, if (leg == .account) accounts else tokens, ScratchWatch.onWire);
+        var running = true;
+        defer if (running) srv.stop();
+        // The whole data dir, since that is where these calls' scratch goes.
+        ScratchWatch.arm(io, root, ".cfoauth-body-", &.{ TEST_BEARER, TEST_REFRESH, TEST_CODE, TEST_VERIFIER, TEST_FRESH_ACCESS, TEST_FRESH_REFRESH });
+        defer ScratchWatch.disarm();
+        var tb: [80]u8 = undefined;
+        ta.app.cf_oauth_token_url = try std.fmt.bufPrint(&tb, "http://127.0.0.1:{d}/oauth2/token", .{srv.port});
+        var ab: [80]u8 = undefined;
+        ta.app.cf_oauth_accounts_url = try std.fmt.bufPrint(&ab, "http://127.0.0.1:{d}/client/v4/accounts", .{srv.port});
+        switch (leg) {
+            .refresh => {
+                const b = exchange(&ta.app, a, "refresh_token", "", "", TEST_REFRESH) orelse return error.ExchangeFailed;
+                try std.testing.expectEqualStrings(TEST_FRESH_ACCESS, b.key);
+                try std.testing.expectEqualStrings(TEST_FRESH_REFRESH, b.refresh_token);
+            },
+            .code => {
+                const b = exchange(&ta.app, a, "authorization_code", TEST_CODE, TEST_VERIFIER, "") orelse return error.ExchangeFailed;
+                try std.testing.expectEqualStrings(TEST_FRESH_ACCESS, b.key);
+            },
+            .account => try std.testing.expectEqualStrings("acct-7", fetchAccount(&ta.app, a, TEST_BEARER).id),
+        }
+        srv.stop();
+        running = false;
+
+        // Each leg's secret reached the wire: the form in the body, the bearer in the head. A secret that never got to
+        // curl would pass every disk check below and fail every real login.
+        const sent = splitRequest(srv.request());
+        const Seen = struct { in: []const u8, want: []const u8 };
+        const seen: Seen = switch (leg) {
+            .refresh => .{ .in = sent.body, .want = "grant_type=refresh_token&client_id=test-client&refresh_token=" ++ TEST_REFRESH },
+            .code => .{ .in = sent.body, .want = "code=" ++ TEST_CODE ++ "&code_verifier=" ++ TEST_VERIFIER },
+            .account => .{ .in = sent.head, .want = "Authorization: Bearer " ++ TEST_BEARER },
+        };
+        if (std.mem.indexOf(u8, seen.in, seen.want) == null) {
+            std.debug.print("\n[{t}] the stand-in never saw {s}: {s}\n", .{ leg, seen.want, srv.request() });
+            return error.SecretNeverSent;
+        }
+        try ScratchWatch.expect(1, 1, 0);
+        try std.testing.expectEqual(@as(u32, 0), try ScratchWatch.leftAfter());
+    }
 }
