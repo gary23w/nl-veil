@@ -21,7 +21,7 @@ A signed-in user's conversations and durable memories are copied into a bucket i
 ## Dependencies
 
 - `httpz` + `../gateway/http.zig` — `App` (data dir, vault, `cf_oauth_accounts_url`), `requireUser`, `badReq`, `jstr`
-- `cf_oauth.zig` — `resolveToken` (auto-refreshed bearer + account id), `CF_PROVIDER`, and `apiCall`, the one curl path to Cloudflare (bearer in a `-K` config file, body in a scratch file, 30 s `--max-time`)
+- `cf_oauth.zig` — `resolveToken` (auto-refreshed bearer + account id), `CF_PROVIDER`, and `apiCall`, the server's calls through the one Cloudflare transport (`cf_oauth.curl`, 30 s `--max-time`). The bearer rides the config curl reads from its stdin, so it is never on disk. An object small enough to fit beside it in that config rides there too. A bigger one is written to `{data}/.cfoauth-body-{16 hex}` while its PUT runs, then deleted
 
 ## Usage Context
 
