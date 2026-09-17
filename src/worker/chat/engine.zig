@@ -7213,7 +7213,7 @@ fn swarmTerminal(app: *App, run_dir: []const u8, entry_created: i64) bool {
 /// — so the conv id alone finds it, including a cast from an earlier turn or from another chat of the same family
 /// (armed-loop semantics: the loop shouldn't settle over ANY running hive in this conversation's workspace).
 fn liveConvCast(app: *App, uid: u64, conv: []const u8) ?struct { run_dir: []const u8, deadline: i64 } {
-    const sw = app.sup.resolve(conv) orelse return null;
+    const sw = app.sup.resolve(uid, conv) orelse return null;
     if (sw.uid != uid) return null;
     if (swarmTerminal(app, sw.run_dir, sw.created)) return null;
     return .{ .run_dir = sw.run_dir, .deadline = sw.created + swarmMinutes(app, sw.run_dir) * 60 + SWARM_WAIT_GRACE_S };
@@ -7246,7 +7246,7 @@ fn awaitConvCast(app: *App, uid: u64, conv: []const u8, conv_dir: []const u8, ct
             if (stopRequestedSince(app, conv_dir, ctrl_cursor)) return .stopped;
             sleepMsRaw(app.io, 250);
         }
-        const sw = app.sup.resolve(conv) orelse {
+        const sw = app.sup.resolve(uid, conv) orelse {
             if (tool_client) maybeSyncCastFiles(app, uid, conv, conv_dir, ctrl_cursor);
             return .finished;
         };
@@ -7679,7 +7679,7 @@ fn steerTool(app: *App, uid: u64, args: []const u8) []u8 {
     defer p.deinit();
     const a = p.value;
     if (a.id.len == 0) return orchErr(gpa, "steer_swarm: an id is required (from cast/swarm_status)");
-    const sw = app.sup.resolve(a.id) orelse return orchErr(gpa, "steer_swarm: no such swarm — check the id");
+    const sw = app.sup.resolve(uid, a.id) orelse return orchErr(gpa, "steer_swarm: no such swarm — check the id");
     if (sw.uid != uid) return orchErr(gpa, "steer_swarm: that swarm isn't yours");
 
     var line: std.ArrayListUnmanaged(u8) = .empty;
@@ -7711,7 +7711,7 @@ fn stopTool(app: *App, uid: u64, args: []const u8) []u8 {
     const p = std.json.parseFromSlice(A, gpa, args, .{ .ignore_unknown_fields = true }) catch return orchErr(gpa, "stop_swarm: could not parse args JSON");
     defer p.deinit();
     if (p.value.id.len == 0) return orchErr(gpa, "stop_swarm: an id is required");
-    const sw = app.sup.resolve(p.value.id) orelse return orchErr(gpa, "stop_swarm: no such swarm");
+    const sw = app.sup.resolve(uid, p.value.id) orelse return orchErr(gpa, "stop_swarm: no such swarm");
     if (sw.uid != uid) return orchErr(gpa, "stop_swarm: that swarm isn't yours");
     app.sup.stop(sw.id);
     return gpa.dupe(u8, "{\"ok\":true,\"tool\":\"stop_swarm\",\"state\":\"stopping\",\"note\":\"stop requested (cooperative; effective at the swarm's next round). files + findings are kept.\"}") catch emptyRes();
@@ -7732,7 +7732,7 @@ fn statusTool(app: *App, uid: u64, conv_dir: []const u8, ctrl_cursor: usize, arg
     // The friendlier miss matters most to a small model: a bare "no such swarm" after a successful cast reads
     // as the swarm having DIED, and the observed response was to re-poll and then flail into other tools. Say
     // what a valid id looks like and what to do instead — copied verbatim, not retyped, or stop polling.
-    var sw = app.sup.resolve(p.value.id) orelse return orchErr(gpa, "swarm_status: no swarm has that exact id — pass the `id` string cast returned, copied VERBATIM (do not retype or shorten it). If you have not cast a swarm in this conversation, do not poll; continue the work with your own tools.");
+    var sw = app.sup.resolve(uid, p.value.id) orelse return orchErr(gpa, "swarm_status: no swarm has that exact id — pass the `id` string cast returned, copied VERBATIM (do not retype or shorten it). If you have not cast a swarm in this conversation, do not poll; continue the work with your own tools.");
     if (sw.uid != uid) return orchErr(gpa, "swarm_status: that swarm isn't yours");
 
     // WAIT while running: probe every ~2s (stop-checked every 250ms), bounded per call. A finished/dead swarm
@@ -7753,7 +7753,7 @@ fn statusTool(app: *App, uid: u64, conv_dir: []const u8, ctrl_cursor: usize, arg
             var sb: [96]u8 = undefined;
             emitKV(app, conv_dir, "status", "text", std.fmt.bufPrint(&sb, "hive still working — watching it ({d}s)", .{waited}) catch "watching the hive");
         }
-        sw = app.sup.resolve(p.value.id) orelse break; // re-resolve: the registry entry can be replaced/removed
+        sw = app.sup.resolve(uid, p.value.id) orelse break; // re-resolve: the registry entry can be replaced/removed
         if (sw.uid != uid) return orchErr(gpa, "swarm_status: that swarm isn't yours");
     }
 
@@ -7919,7 +7919,7 @@ fn asksTool(app: *App, uid: u64, args: []const u8) []u8 {
     const p = std.json.parseFromSlice(A, gpa, args, .{ .ignore_unknown_fields = true }) catch return orchErr(gpa, "swarm_asks: could not parse args JSON");
     defer p.deinit();
     if (p.value.id.len == 0) return orchErr(gpa, "swarm_asks: an id is required");
-    const sw = app.sup.resolve(p.value.id) orelse return orchErr(gpa, "swarm_asks: no such swarm");
+    const sw = app.sup.resolve(uid, p.value.id) orelse return orchErr(gpa, "swarm_asks: no such swarm");
     if (sw.uid != uid) return orchErr(gpa, "swarm_asks: that swarm isn't yours");
 
     const askpath = std.fmt.allocPrint(gpa, "{s}/asks.jsonl", .{sw.run_dir}) catch return orchErr(gpa, "swarm_asks: out of memory");
@@ -7975,7 +7975,7 @@ fn answerTool(app: *App, uid: u64, args: []const u8) []u8 {
     const a = p.value;
     if (a.id.len == 0 or a.ask_id.len == 0 or a.mind.len == 0 or std.mem.trim(u8, a.text, " \r\n\t").len == 0)
         return orchErr(gpa, "answer_swarm: id, ask_id, mind, and text are all required");
-    const sw = app.sup.resolve(a.id) orelse return orchErr(gpa, "answer_swarm: no such swarm");
+    const sw = app.sup.resolve(uid, a.id) orelse return orchErr(gpa, "answer_swarm: no such swarm");
     if (sw.uid != uid) return orchErr(gpa, "answer_swarm: that swarm isn't yours");
 
     var line: std.ArrayListUnmanaged(u8) = .empty;
@@ -8467,12 +8467,12 @@ fn pullRequest(app: *App, conv_dir: []const u8, ctrl_cursor: usize, root: []cons
 fn maybeSyncCastFiles(app: *App, uid: u64, conv: []const u8, conv_dir: []const u8, ctrl_cursor: usize) void {
     var run_buf: [1280]u8 = undefined;
     var run_dir: []const u8 = "";
-    if (app.sup.resolve(conv)) |sw| {
+    if (app.sup.resolve(uid, conv)) |sw| {
         if (sw.uid != uid) return;
         if (!swarmTerminal(app, sw.run_dir, sw.created)) return; // sync once it finishes
         run_dir = copyTo(&run_buf, sw.run_dir) orelse return; // sw points into the registry; copy before slow IO
     } else {
-        // No registry entry names this conversation's cast (e.g. reattach skipped its dir after a restart) — fall back
+        // No registry entry names this conversation's cast (e.g. reattach could not list the data dir after a restart) — fall back
         // to the run dir the cast spawned with (castRunDirFromConvDir), and require its terminal DONE marker before
         // syncing anything.
         run_dir = castRunDirFromConvDir(&run_buf, conv_dir, conv) orelse return;

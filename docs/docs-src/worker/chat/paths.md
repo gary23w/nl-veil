@@ -18,7 +18,7 @@ Ordinary conversations build under `u{uid}/_chat/builds/{conv}`. A scheduled run
 - `SchedParts`, `schedParts(conv)` — parse `scheduled_{taskid}_{stamp}`; the stamp must be a trailing all-digit run timestamp, so a hand-named `scheduled_notes` keeps its ordinary build dir rather than surprise-redirecting into `_sched/`.
 - `buildRootRel(buf, uid, conv)` — the data-relative build root for either shape; empty on overflow.
 - `buildRootFromChatBase(buf, chat_base, conv)` — the same mapping composed from an absolute `.../u{d}/_chat` base (what the engine's call sites hold); swaps the `/_chat` tail for the task tree on scheduled runs only.
-- `schedRunTail(buf, conv)` — the `_sched/{tid}/runs/{stamp}` tail a redirected run dir always ends with; what the supervisor's id↔run-dir matcher needs, since a redirected cast run_dir's basename is the bare stamp, not the conv id.
+- `schedRunOfDir(run_dir)` — the scheduled mapping read backwards: the task id and stamp of the run conversation whose build root a `.../_sched/{tid}/runs/{stamp}` dir is (either slash form), null for any other dir. The supervisor names and matches a scheduled run dir by that conversation id, because the dir's basename is the bare stamp every task that ran in that minute shares.
 
 ## Dependencies
 

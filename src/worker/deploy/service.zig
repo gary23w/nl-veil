@@ -968,9 +968,10 @@ pub fn adminBilling(app: *App, req: *httpz.Request, res: *httpz.Response) !void 
 pub fn swarmDelete(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const u = requireUser(app, req, res) orelse return;
     const id = req.param("id") orelse return badReq(res, "no id");
-    // resolve(), not get(): the desktop Swarm tab addresses a LIVE cast by its run-dir BASENAME while the
-    // registry keys it by the spawn-time hex id — get() would 404 the mismatch. Mutate via the swarm's OWN id.
-    const sw = app.sup.resolve(id) orelse return notFound(res);
+    // resolve(), not get(): the desktop Swarm tab addresses a LIVE cast by a name of its run dir (a chat cast's
+    // basename, a scheduled run's conversation) while the registry keys it by the spawn-time hex id — get() would 404
+    // the mismatch. Mutate via the swarm's OWN id.
+    const sw = app.sup.resolve(u.id, id) orelse return notFound(res);
     if (sw.uid != u.id) return unauth(res);
     app.sup.remove(sw.id);
     try res.json(.{ .ok = true, .deleted = true }, .{});
