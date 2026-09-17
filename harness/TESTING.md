@@ -26,8 +26,10 @@ those failures. Read this before adding tests; hand it to any agent you ask to w
   have caught: `appendSlice(gpa, std.fmt.allocPrint(gpa, ...))` copies the formatted slice and
   orphans the original. Capture it and `defer gpa.free(...)`, or use a stack `bufPrint` for small
   fixed formats. `scripts\check.ps1 -Scan` flags the pattern repo-wide.
-- Plain `.append()` of an allocPrint *slice* transfers ownership and is fine — only `appendSlice`
-  copies-and-orphans (0009).
+- Plain `.append()` of an allocPrint *slice* transfers ownership and is fine — `appendSlice`
+  copies-and-orphans (0009), and so does any helper that keeps its own copy of the message it is
+  handed: `err()`/`stepErr()` in llm.zig leaked this way at seven sites (1b438fa, aeb6ac7). `-Scan`
+  knows those helpers by name, so a new helper that copies its message goes on its list.
 - If a struct has no `deinit`, give it one rather than writing a test-only drain helper (0017).
 
 ## Touching the filesystem
