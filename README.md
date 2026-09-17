@@ -89,7 +89,7 @@ front of you.
 | **Workers AI, live-synced** | Your account's real model catalogue is fetched from Cloudflare and replaces the Workers AI group in every model picker. The repo ships exactly one model id as a bootstrap default — the list you pick from is always your account's, never a stale copy in a file. |
 | **Chat on the free tier** | Workers AI has a free daily allowance (10,000 neurons/day as of 2026) — **no paid plan and no card for the base tier**. Logging in points chat at it automatically; one click in Settings puts you back on local or BYOK. |
 | **R2 chat backup** | The first login provisions an `nl-veil` bucket in your account and mirrors your conversations and durable memories into it, incrementally, in the background. Your data stays local too — this is a copy, not a move. R2 is 10 GB free with no egress fees, but must be **activated once** on your Cloudflare dashboard; until then the card says so in Cloudflare's own words. |
-| **An agent that can deploy** | With the build scopes granted, the assistant can write a Worker and ship it to a live `workers.dev` URL, read and write R2, query D1, and reach the rest of the API — today from the web app and scheduled tasks; see [the `cf_` tool belt](#the-cf_-tool-belt) for why not yet from the desktop. |
+| **An agent that can deploy** | With the build scopes granted, the assistant can write a Worker and ship it to a live `workers.dev` URL, read and write R2, query D1, and reach the rest of the API — from the web app, the desktop, `veil chat` and scheduled tasks, on the admin account; see [the `cf_` tool belt](#the-cf_-tool-belt). |
 | **Everywhere a turn runs** | Chat, swarm casts and scheduled tasks all resolve the same login, so a task that fires at 3am uses it too. |
 
 ### What it asks for, and what you can refuse
@@ -123,12 +123,20 @@ everything in it stay in your Cloudflare account, because they were always yours
 ### The `cf_` tool belt
 
 When — and only when — a turn holds Cloudflare credentials, six tools join the assistant's belt. A user
-who never connected is never even shown them.
+who never connected is never even shown them. The belt belongs to the admin account: a normal account's
+turns run [sandboxed](#everyone-else-is-sandboxed), and deploying code or writing to a cloud account is
+outside that sandbox, so a non-admin who connects Cloudflare still chats on its Workers AI but is not shown
+the belt.
 
-**Where they run today: turns the server executes itself — the web app and scheduled tasks.** The desktop
-app and `veil chat` hand tool calls to a client-side executor, which holds no Cloudflare credentials, so from
-there a `cf_` call answers that it is not connected; and a non-admin account is shown the family but its
-sandbox refuses every call. Both are known gaps, not the design.
+**They work from every surface: the web app, scheduled tasks, the desktop app and `veil chat`.** A `cf_`
+call always runs in the server, the one process that holds your token. The desktop and `veil chat` run
+their other tools on your machine, so the one file a call touches crosses over instead: the file a deploy
+or an upload sends is fetched from your workdir first, and a download is written back into it and read
+back to confirm it arrived. If your file cannot be fetched, nothing is sent to Cloudflare; the server's
+older copy is never sent in its place. When the desktop shares the server's data folder (one machine, the
+usual install), nothing is copied at all. A client on another disk (`veil chat` in its own folder, or a
+desktop on another machine) can carry text files up to 512 KB that way. A larger or binary file is
+refused before an upload, and after a download the result says it did not reach your machine.
 
 | tool | what it does |
 |---|---|
@@ -141,8 +149,9 @@ sandbox refuses every call. Both are known gaps, not the design.
 Try it in one sentence: *"write a Worker that returns the current time as JSON and deploy it."*
 
 Credentials are resolved **once per turn** and handed to the tools; blank means the family is neither
-advertised nor callable, so swarm minds and the CLI structurally cannot reach your cloud. File arguments
-are jailed to the workspace, and `cf_api` refuses any path that would send your token anywhere other than
+advertised nor callable, so swarm minds and the client-side tool executor structurally cannot reach your
+cloud, and the token never rides a tool call out to the desktop or `veil chat`. File arguments are jailed
+to the workspace, and `cf_api` refuses any path that would send your token anywhere other than
 `api.cloudflare.com`.
 
 ### Public URL - the tunnel switch
@@ -1192,7 +1201,8 @@ part of it. Without a default, a brand-new account has to configure a model befo
 The web app is multi-user, and **a normal account is not trusted with the host**. Its turns run a
 restricted tool surface: the conversation's own workspace, research, and the *entire* hive-memory
 surface — but no code execution, no host commands, no engine self-modification, no tool authoring, no
-browser or MCP drive, and no casting swarms or scheduling runs (both execute outside the sandbox).
+browser or MCP drive, no casting swarms or scheduling runs (both execute outside the sandbox), and no
+[`cf_` tool belt](#the-cf_-tool-belt) (deploying to a cloud account is outside it too).
 The admin account keeps the full surface. Files were always confined to the conversation's workdir;
 what changed is that the dangerous verbs are now refused inside a turn, not just on the tool endpoint.
 

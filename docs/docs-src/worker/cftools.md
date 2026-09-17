@@ -12,10 +12,11 @@ A Cloudflare login connects the user's own account; this family lets the assista
 
 ## Key Exports
 
-- `Ctx` — the slice of `ToolCtx` the belt needs (allocator, io, scratch dir, workdir jail, token, account, `api_root`), passed explicitly so this file never imports `tools.zig`
+- `Ctx` — the slice of `ToolCtx` the belt needs (allocator, io, scratch dir, workdir jail, token, account, `api_root`), passed explicitly so this file never imports `tools.zig`; `wrote` is an optional receipt `cf_r2_get` sets once a download has landed in the workdir
 - `API` — `https://api.cloudflare.com/client/v4`, the default root and the host the bearer is minted for
 - `isLoopbackRoot` — the check `main.zig` applies to `NL_CF_API_ROOT`: only an `http://127.0.0.1:` or `http://localhost:` root may replace `API`
-- `safeRel` — the jail for every file argument: a relative path inside the workdir (tested)
+- `MAX_REL` / `safeRel` — the jail for every file argument: a relative path inside the workdir, at most 400 bytes (tested)
+- `FileUse` / `fileUse` — the one workspace file a call touches and which way: `reads` for `cf_deploy_worker`'s module and `cf_r2_put`'s `file`, `writes` for `cf_r2_get`'s destination, `none` otherwise, including arguments the verb refuses before opening anything. It reads the path through the same helpers the verbs use (`deploySource`, `putSource`, `getDest`); tests run the real verbs against a loopback stand-in and check that the file named is the one uploaded or written
 - `dispatch` — route a `cf_` call; null for any other name, so the caller's own chain continues (tested)
 - `SCHEMA` — the six function definitions: `cf_deploy_worker`, `cf_r2_list`, `cf_r2_put`, `cf_r2_get`, `cf_d1_query`, `cf_api`; a test pins that it parses and names exactly the verbs `dispatch` routes
 
@@ -25,7 +26,16 @@ A Cloudflare login connects the user's own account; this family lets the assista
 
 ## Usage Context
 
-`engine.runTurn` calls `cf_oauth.resolveToken` once per turn and sets `ToolCtx.cf_token`, `cf_account` and `cf_api_root`; `buildTurnTools` appends `SCHEMA` only when token and account are both non-empty. No other `ToolCtx` construction sets them, so swarm minds, the CLI and `veil exec-tool` can neither see nor run the family. `tools.zig`'s dispatcher (`executeInner`) hands every `cf_`-prefixed name to `dispatch` with the run dir as scratch, after the sandbox gate — whose allowlist names no `cf_` verb, so a non-admin (`.sandboxed`) turn is refused there — and `isBuiltinTool` reserves the whole `cf_` prefix against recipes and authored tools. A call therefore runs with credentials only in a server-side admin turn (the web client's turns, scheduled tasks); a client-mode turn (`tool_client:true`, which the desk and the CLI chat send) delegates each call to `veil exec-tool`, whose context carries no Cloudflare credentials, so `dispatch` answers "not connected". `main.zig` uses `isLoopbackRoot` to accept or reject `NL_CF_API_ROOT`, which `scripts/sim/cfworld.py` points at a loopback stand-in. The web client renders `cf_` calls as Cloudflare steps and links the URL a deploy returns; the desk gives each verb a chip label.
+`engine.runTurn` calls `cf_oauth.resolveToken` once per turn and sets `ToolCtx.cf_token`, `cf_account` and `cf_api_root`. No other `ToolCtx` construction sets them, so swarm minds and `veil exec-tool` can neither see nor run the family. `buildTurnTools` appends the belt only when token and account are both non-empty; for a `.sandboxed` (non-admin) turn it appends `tools.sandboxSchema(SCHEMA)`, which is derived from the same allowlist the sandbox gate in `tools.zig`'s `executeInner` checks. That allowlist names no `cf_` verb, so a non-admin turn is neither shown the family nor able to run it (tested). `executeInner` hands every `cf_`-prefixed name to `dispatch` with the run dir as scratch, and `isBuiltinTool` reserves the whole prefix against recipes and authored tools.
+
+Every call runs in the server process. A server-side turn (the web client, scheduled tasks) reaches `dispatch` through `tools.execute`. A client-mode turn (`tool_client:true`, which the desk and `veil chat` send, honoured for an admin only) routes the family to `engine.cfClientTool` instead of delegating it, because the client executor holds no Cloudflare credentials. There `fileUse` names the one file the call touches, and it crosses the machine boundary over the [sync](#doc=worker/chat/sync) channel:
+
+- **Upload** (`reads`): before the call the engine pulls the client's copy into the server's copy of the conversation workdir. If the client does not answer, or answers without the file, the call is refused and nothing is sent to Cloudflare. The server's copy, possibly older, is never uploaded instead.
+- **Download** (`writes`): after the call sets `Ctx.wrote`, the engine pushes the file to the client (`file_sync`) and reads it back (`file_pull`). A download that does not arrive byte-identical is reported as not on the user's machine.
+
+The same-disk probe skips both transfers when the desk shares the server's data folder, so binary and large files work there exactly as in a server-side turn. Only a client on another disk is held to the channel's limits: text, at most `cync.FILE_CAP` (512 KiB).
+
+`main.zig` uses `isLoopbackRoot` to accept or reject `NL_CF_API_ROOT`, which `scripts/sim/cfworld.py` points at a loopback stand-in. The web client renders `cf_` calls as Cloudflare steps and links the URL a deploy returns; the desk gives each verb a chip label.
 
 ## Notable Implementation Details
 
@@ -35,7 +45,7 @@ A Cloudflare login connects the user's own account; this family lets the assista
 - `cf_api` keeps the bearer on the API host rather than restricting what it does there: the path must start with a single `/` and contain no `://`, `@`, spaces or control characters, and it is appended to the root (tested against `https://`, `//`, `@` and space tricks). `{account_id}` is filled in; the method must be GET, POST, PUT, PATCH or DELETE. There is no path allowlist — a call reaches whatever the login's grant covers, which, since the tunnel scopes joined the default scope set, can include DNS, tunnel and zone-level Access writes the user granted.
 - `isLoopbackRoot` also requires 18–200 bytes and rejects whitespace, `@`, `\`, `#`, `?` and a second `://`, so an override can only point the token at a process on the same machine.
 - `cf_deploy_worker`: the name is at most 63 characters of `a-z`, `0-9`, `-` and `_`; the upload is one multipart PUT whose metadata sets `main_module` to `worker.mjs` (compatibility date defaulting to `2026-01-01`) and whose only module is the workspace file — its path rides the argv through `-F`, the token does not. Enabling the `workers.dev` route and reading the account subdomain are best-effort; without the subdomain, the reply says the script is deployed and points at the dashboard.
-- A successful answer comes back as raw JSON for the model to read; a v4 envelope with `success:false` and an error becomes "`… FAILED — Cloudflare says: <message>`". `cf_r2_get` writes any body that is not such an envelope into the workspace as the object's bytes, at `file` or else at the key.
+- A successful answer comes back as raw JSON for the model to read; a v4 envelope with `success:false` and an error becomes "`… FAILED — Cloudflare says: <message>`". `cf_r2_get` writes any body that is not such an envelope into the workspace as the object's bytes, at `file` or else at the key, creating the destination's folders first (a key is path-shaped, and its folders need not exist), and only then sets `Ctx.wrote`.
 
 ---
 

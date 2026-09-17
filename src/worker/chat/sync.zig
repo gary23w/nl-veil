@@ -3,9 +3,10 @@
 //! which call the same functions — one implementation, no per-client twins).
 //!
 //! Design: rsync-lite over the existing delegation channel, instead of a real file server (SMB/WebDAV would
-//! mean a new port, its own auth surface, OS mounts, and idle chatter). A sync happens only at the two
-//! moments state actually crosses the machine boundary — a cast needs the client's files (client→server), a
-//! finished hive's files need to reach the client (server→client) — and each moment costs ONE manifest
+//! mean a new port, its own auth surface, OS mounts, and idle chatter). A sync happens only at the moments
+//! state actually crosses the machine boundary — a cast needs the client's files (client→server), a finished
+//! hive's files need to reach the client (server→client), and a cf_ call, which runs server-side, needs the
+//! one file it uploads or downloads carried across (engine.cfClientTool) — and each moment costs ONE manifest
 //! round-trip plus only the files whose content hash differs. A same-disk install (desk + server on one
 //! machine sharing the data dir) is detected by a probe token in the manifest exchange and short-circuits to
 //! ZERO transfers. No daemon, no watcher, no polling: idle cost is exactly zero on both sides.
