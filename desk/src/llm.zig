@@ -90,6 +90,75 @@ const TOTAL_TIMEOUT_SLACK_S = 15;
 /// block. A config is two header lines around the key, so only a key over ~4 KB is refused.
 const KEY_CFG_MAX = 4096;
 
+// The four below MIRROR src/worker/llm.zig's strayCfgByte / cfgHeader / cfgEscape / chatCfg — the desk is its own
+// module and shares no source with the server, as KEY_CFG_MAX and keyToCurl above already do. A fix to either copy
+// belongs in both.
+
+/// Where `value` holds a byte a curl config value cannot carry, and which byte: `at` is its index. Enough for a message
+/// that tells the user where to look without quoting any of the key (chat.zig), and the shape gitvc's strayTokenByte
+/// answers a GitHub token in.
+pub const StrayCfgByte = struct { at: usize, byte: u8 };
+
+/// The first byte of `value` that a curl config value cannot carry — below 0x20, or DEL — or null when every byte can.
+/// curl puts a header value on the wire as it reads it, so a line break would split the header, and NUL or 0x1A would
+/// cut the config short whatever the escaping (cfgEscape). Every other byte rides escaped, which is the shape an API
+/// key needs: keys are not one charset (`sk-…`, `hf_…`, a custom URL's own), so an allowlist would refuse real ones.
+/// pub: chat.zig refuses such a key at the Settings pane too, rather than saving one every call then refuses.
+pub fn strayCfgByte(value: []const u8) ?StrayCfgByte {
+    for (value, 0..) |c, i| if (c < 0x20 or c == 0x7F) return .{ .at = i, .byte = c };
+    return null;
+}
+
+/// Append `header = "<name><value>"` to a curl config. False, with nothing appended, for a value holding a byte
+/// strayCfgByte refuses.
+///
+/// THE REFUSAL is what stops a value adding an option, and the escaping is what keeps the value well formed. curl's
+/// config is line-oriented, so only a line feed or CR can begin a line of its own, and strayCfgByte has already
+/// refused both by the time cfgEscape runs. What escaping the rest buys is a value that survives as itself: an
+/// unescaped `"` would end this value early and leave the rest of it as a bare word on the same line, which curl
+/// rejects or folds into the header — a malformed request, not an injected one.
+fn cfgHeader(gpa: std.mem.Allocator, cfg: *std.ArrayListUnmanaged(u8), comptime name: []const u8, value: []const u8) error{OutOfMemory}!bool {
+    if (strayCfgByte(value) != null) return false;
+    try cfg.appendSlice(gpa, "header = \"" ++ name);
+    try cfgEscape(gpa, cfg, value);
+    try cfg.appendSlice(gpa, "\"\n");
+    return true;
+}
+
+/// `value` as the inside of a quoted curl config value, the way curl's config reader unquotes it: `\\` and `\"` for
+/// themselves, `\t` `\n` `\r` `\v` for tab, line feed, CR and VT. The escapes keep a value ONE value. A raw `"` ends
+/// it, and a raw line feed ends the line, after which curl reads the rest as more options: a value could add a header,
+/// or a second URL, and curl dials that URL with this config's bearer too (measured on curl 8.5, 8.17 and 8.21). NUL
+/// and 0x1A have no escape: curl stops reading a line at NUL, and on Windows it reads its config in text mode, where
+/// 0x1A ends it. cfgHeader refuses both.
+fn cfgEscape(gpa: std.mem.Allocator, cfg: *std.ArrayListUnmanaged(u8), value: []const u8) error{OutOfMemory}!void {
+    for (value) |c| switch (c) {
+        '\\' => try cfg.appendSlice(gpa, "\\\\"),
+        '"' => try cfg.appendSlice(gpa, "\\\""),
+        '\t' => try cfg.appendSlice(gpa, "\\t"),
+        '\n' => try cfg.appendSlice(gpa, "\\n"),
+        '\r' => try cfg.appendSlice(gpa, "\\r"),
+        0x0B => try cfg.appendSlice(gpa, "\\v"),
+        // every other byte reads back as itself: the rest of the range below 0x20, and 0x7F-0xFF (all three curls)
+        else => try cfg.append(gpa, c),
+    };
+}
+
+/// The config a chat call hands curl over its stdin (keyToCurl): the bearer, when there is a key, escaped so the KEY
+/// STAYS ONE HEADER VALUE, and the JSON content type. `error.StrayKeyByte` for a key cfgHeader refuses — unescaped, a
+/// `"` in a key would end the value and a line feed the line, and curl would read the rest of the key as more options:
+/// a second `url =`, which it dials carrying this bearer, or a `data-binary = "@<path>"`, which uploads that file. The
+/// key comes from the user (the Settings pane's Save, `::key`) and nothing else holds it to a charset. Caller frees.
+fn chatCfg(gpa: std.mem.Allocator, key: []const u8) error{ OutOfMemory, StrayKeyByte }![]u8 {
+    var cfg: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer cfg.deinit(gpa);
+    if (key.len > 0) {
+        if (!try cfgHeader(gpa, &cfg, "Authorization: Bearer ", key)) return error.StrayKeyByte;
+    }
+    try cfg.appendSlice(gpa, "header = \"Content-Type: application/json\"\n");
+    return cfg.toOwnedSlice(gpa);
+}
+
 /// Hand a spawned curl its config (`header = "Authorization: Bearer <key>"` ...) over stdin, `-K -` on its argv, and
 /// close the pipe. The key never touches disk. A config FILE sat in the caller's scratch dir, inside the data dir: a
 /// folder that is often synced, where a sync client could upload it while the call ran (a streamed call can run 15
@@ -203,8 +272,8 @@ fn setErr(s: *Stream, msg: []const u8) void {
 
 /// Kick off one streaming chat completion. `messages_json` is the inside of "messages":[ … ] (caller-built
 /// and escaped). Scratch files live under `dir` (the .veil-desk sidecar). Returns false when the call cannot
-/// start: a scratch file or the spawn failed, curl was gone before it read its config, or the key is too long to
-/// hand curl (KEY_CFG_MAX).
+/// start: a scratch file or the spawn failed, curl was gone before it read its config, or the key is one curl's
+/// config cannot carry — a key holding a control byte (chatCfg) or one too long to hand curl (KEY_CFG_MAX).
 pub fn start(s: *Stream, io: Io, gpa: std.mem.Allocator, dir: []const u8, prov: Provider, messages_json: []const u8, max_tokens: u32, now_s: i64) bool {
     log.trace("llm.start dir={s} model={s} msgs_len={d} max_tokens={d}", .{ dir, prov.model, messages_json.len, max_tokens });
     // ONE CALL PER STREAM. A start over a call that was never ended ends it here: its curl is killed and
@@ -215,12 +284,13 @@ pub fn start(s: *Stream, io: Io, gpa: std.mem.Allocator, dir: []const u8, prov: 
     s.* = .{ .started_s = now_s, .last_growth_s = now_s, .native = native };
 
     // Engine convention: the key is never on the argv (visible in process lists), and it is never in a file either:
-    // curl reads its config from stdin (keyToCurl). Built first, so a key too long for the pipe refuses the call
-    // before it writes a thing.
-    const cfg = if (prov.key.len > 0)
-        std.fmt.allocPrint(gpa, "header = \"Authorization: Bearer {s}\"\nheader = \"Content-Type: application/json\"\n", .{prov.key}) catch return false
-    else
-        gpa.dupe(u8, "header = \"Content-Type: application/json\"\n") catch return false;
+    // curl reads its config from stdin (keyToCurl). Built first, so a key curl's config cannot carry — one that could
+    // add curl an option of its own (chatCfg), or one too long for the pipe — refuses the call before it writes a thing.
+    const cfg = chatCfg(gpa, prov.key) catch |e| {
+        // The reason, never the key: this line goes to the desk log.
+        if (e == error.StrayKeyByte) log.err("chat llm: the API key holds a control byte, which a curl config value cannot carry — the call is refused", .{});
+        return false;
+    };
     defer gpa.free(cfg);
     if (cfg.len > KEY_CFG_MAX) {
         log.err("chat llm: the API key is too long to hand curl (a {d}-byte config; the pipe takes {d})", .{ cfg.len, KEY_CFG_MAX });
@@ -1418,6 +1488,74 @@ test "a desk start with a key too long to hand curl refuses the call before it w
     try std.testing.expect(s.child == null);
     try std.testing.expectEqual(@as(u32, 0), sv.seen.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), try expectNoKeyOnDisk(gpa, io, root, TEST_KEY)); // no body, no sink
+}
+
+test "a desk key that would add curl an option of its own never reaches curl, and a key of punctuation still does" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = osEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-desk-llm-keycfg-inject-tmp";
+    Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = Io.Dir.cwd().createDirPathStatus(io, root, .default_dir) catch {};
+
+    var sv: Standin = undefined;
+    try sv.start(io, TEST_ANSWER, false);
+    var sv_up = true;
+    defer if (sv_up) sv.stop();
+
+    // Unescaped, this key's line feeds end the config's header line, and curl reads what follows as options of its
+    // own: a second `url`, which it dials carrying the very bearer the config set, and a `#` commenting out the
+    // stray closing quote. Aimed at the same stand-in, so the dial it would add is one this test can see.
+    const injected = try std.fmt.allocPrint(gpa, "sk-inject\"\nurl = \"http://127.0.0.1:{d}/injected\"\n#", .{sv.port});
+    defer gpa.free(injected);
+    // The punctuation real keys carry, plus the two bytes a config value escapes. It must still reach the wire, byte
+    // for byte: the guard refuses BYTES curl cannot carry, not shapes, because keys are not one charset.
+    const punctuation = "sk-proj_a\"b\\c-d.e/f+g=h~i";
+    var ub: [64]u8 = undefined;
+    const base = try std.fmt.bufPrint(&ub, "http://127.0.0.1:{d}/v1", .{sv.port});
+
+    var s: Stream = .{};
+    defer s.deinit(gpa);
+    defer abort(&s, io);
+
+    // The injected key: refused before the spawn, so nothing dials — injected URL or real one — and no scratch lands.
+    try std.testing.expect(!start(&s, io, gpa, root, .{ .base_url = base, .key = injected, .model = "keycfg-model" }, TEST_MSGS, 16, 0));
+    try std.testing.expect(s.child == null);
+    try std.testing.expectEqual(@as(u32, 0), sv.seen.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), try expectNoKeyOnDisk(gpa, io, root, injected)); // no body, no sink
+
+    // The punctuation key: the call streams clean, and the header carries the key exactly as it was handed over.
+    try std.testing.expect(start(&s, io, gpa, root, .{ .base_url = base, .key = punctuation, .model = "keycfg-model" }, TEST_MSGS, 16, 0));
+    try pollToEnd(&s, io, gpa);
+    finish(&s, io);
+    sv.stop(); // joins the serve thread: request() is only complete once it has
+    sv_up = false;
+    try std.testing.expect(!s.failed);
+    try std.testing.expectEqualStrings("streamed", s.content.items);
+    try std.testing.expectEqual(@as(u32, 1), sv.seen.load(.acquire));
+    if (std.mem.indexOf(u8, sv.request(), "Authorization: Bearer " ++ punctuation) == null) {
+        std.debug.print("\nthe punctuation key did not reach the wire whole:\n{s}\n", .{sv.request()});
+        return error.KeyChangedOnTheWire;
+    }
+}
+
+test "the key guard refuses exactly the bytes a curl config value cannot carry, and no others" {
+    // The RANGE, not a spelling. Below 0x20 and DEL are the bytes curl would either put on the wire as it read them,
+    // splitting the header, or stop reading the config at; every other byte rides escaped, which is what an API key
+    // needs, since keys are not one charset. A guard that refused more would refuse keys providers really issue —
+    // and this is the predicate the Settings pane's Save uses too (chat.zig cmdSaveKey), so it is what a user meets.
+    var one: [1]u8 = undefined;
+    for (0..256) |b| {
+        one[0] = @intCast(b);
+        const stray = strayCfgByte(&one);
+        if (b < 0x20 or b == 0x7F) try std.testing.expectEqual(@as(?StrayCfgByte, .{ .at = 0, .byte = one[0] }), stray) else try std.testing.expect(stray == null);
+    }
+    // It reports the FIRST stray byte and where it sits, in a key that otherwise looks ordinary...
+    try std.testing.expectEqual(@as(?StrayCfgByte, .{ .at = 11, .byte = '\n' }), strayCfgByte("sk-proj_abc\nurl = \"http://127.0.0.1/x\""));
+    // ...and the two bytes a config value escapes are not stray: cfgHeader carries them.
+    try std.testing.expect(strayCfgByte("sk-proj_a\"b\\c") == null);
 }
 
 test "handing curl its key never waits on curl: the longest config a desk call sends goes whole into a child that never reads" {
