@@ -316,20 +316,54 @@ if ($Scan) {
         Write-Host "[markers] check.sh uses a DIFFERENT marker pattern -- the two scans would report different debt" -ForegroundColor Yellow
     }
 
-    # 6) allocPrint-append leaks: appendSlice COPIES the formatted slice, so a gpa-backed
-    #    allocPrint result passed inline is never freed -- a slow per-call bleed in a long-lived
-    #    server. Found live in writer (ledger 0004) and commons (0009); arena/ta-backed variants
-    #    are fine and are not matched.
-    # appendSlice COPIES; plain .append() of the slice pointer transfers ownership (freed by the
-    # consumer) and is NOT a leak -- match appendSlice only.
-    $leaks = @(Get-ChildItem (Join-Path $repo "src"), (Join-Path $repo "desk\src") -Recurse -Filter *.zig |
-        Select-String -CaseSensitive -Pattern 'appendSlice\([^,]+,\s*std\.fmt\.allocPrint\(gpa[,)]')
+    # 6) allocPrint-into-copy leaks: a call that COPIES its argument leaves a gpa-backed allocPrint
+    #    result passed inline with no owner, so it is never freed -- a slow per-call bleed in a
+    #    long-lived server. appendSlice copies (found live in writer, ledger 0004, and commons, 0009),
+    #    and so does every error helper listed below: each keeps its own copy of the message it is
+    #    handed. llm.zig's err()/stepErr() leaked that way at seven sites (1b438fa, aeb6ac7) while this
+    #    rule matched appendSlice alone and reported none of them. The fix is always the same shape:
+    #        const why = std.fmt.allocPrint(gpa, ...) catch return stepErr(gpa, "<static>");
+    #        defer gpa.free(why);
+    #        return stepErr(gpa, why);
+    #    NOT leaks, and not matched: plain .append() of the slice transfers ownership (the consumer frees
+    #    it), and an arena/ta-backed allocPrint is freed with its arena.
+    #    A name belongs in this list only if EVERY fn of that name in src/ and desk/src/ copies the
+    #    slice and keeps none of the caller's. deploy/service.zig's failBad/failCap/failSrv STORE the
+    #    slice they are handed, so they stay out.
+    $copyingCallees = @(
+        'appendSlice',                              # std ArrayList: copies the slice in
+        'err', 'stepErr', 'noteErr',                # worker/llm.zig: dupe, dupe, memcpy
+        'fail', 'failPlugin',                       # worker/modelpull.zig: memcpy; plug/plugins.zig: dupe into the registry arena
+        'setErr', 'setErrLocked', 'setLastError',   # config/cf_tunnel.zig + desk llm.zig, worker/llamaeng.zig, plug/lua.zig: memcpy
+        'errJson', 'orchErr', 'editRejectMsg',      # browser/manager.zig + mcp/client.zig + mcp/discovery.zig, chat/engine.zig, worker/tools.zig: format a new string
+        'badReq', 'capErr', 'serverErr',            # gateway/http.zig: serialized into the response
+        'noteReject', 'noteWriteReject',            # worker/run.zig, worker/tools.zig: appendSlice into the reject notes
+        'failCast', 'consoleLaunchFailed'           # desk chat.zig: copied into the store
+    )
+    # The match is the allocPrint call itself, and a lookbehind walks back to the callee: that keeps the
+    # scan to a literal search per file, about what the old per-line rule cost. Leading with the list of
+    # names instead matches the same sites and costs ~10x that.
+    # The arguments ahead of the formatted one hold no top-level comma, paren, semicolon or line break
+    # (one level of (...) is allowed), so a match cannot leave the call's own argument list -- but a call
+    # split across lines still matches, which the per-line Select-String this replaced could not see.
+    $leakPattern = '(?<=(?<call>\b(?:' + ($copyingCallees -join '|') + '))\(\s*(?>(?:[^,()\r\n;]|\([^()\r\n]*\))+,\s*)*(?:try\s+)?)std\.fmt\.allocPrint\(gpa[,)]'
+    $leaks = @()
+    foreach ($zf in Get-ChildItem (Join-Path $repo "src"), (Join-Path $repo "desk\src") -Recurse -Filter *.zig) {
+        $text = [IO.File]::ReadAllText($zf.FullName)
+        foreach ($m in [regex]::Matches($text, $leakPattern)) {
+            # a call written out in a // comment is prose, not a site (string literals blanked first: "http://")
+            $call = $m.Groups['call'].Index
+            $bol = $text.LastIndexOf([char]10, [Math]::Max($call - 1, 0)) + 1
+            if (($text.Substring($bol, $call - $bol) -replace '"(?:[^"\\]|\\.)*"', '""').Contains('//')) { continue }
+            $leaks += ("{0}:{1}" -f $zf.FullName.Substring($repo.Length + 1), $text.Substring(0, $m.Index).Split([char]10).Count)
+        }
+    }
     if ($leaks.Count -gt 0) {
         $signals += $leaks.Count
-        Write-Host ("[leaks] {0} inline allocPrint(gpa)-into-append site(s) (each leaks per call; capture + defer free):" -f $leaks.Count) -ForegroundColor Yellow
-        $leaks | ForEach-Object { Write-Host ("    {0}:{1}" -f $_.Path.Substring($repo.Length + 1), $_.LineNumber) }
+        Write-Host ("[leaks] {0} inline allocPrint(gpa)-into-copy site(s) (each leaks per call; capture + defer free):" -f $leaks.Count) -ForegroundColor Yellow
+        $leaks | ForEach-Object { Write-Host "    $_" }
     } else {
-        Write-Host "[leaks] no inline allocPrint(gpa)-into-append sites" -ForegroundColor Green
+        Write-Host "[leaks] no inline allocPrint(gpa)-into-copy sites" -ForegroundColor Green
     }
 
     # 6b) the built-in palettes are mirrored BY HAND into the web stylesheet — plug/theme.zig says so
