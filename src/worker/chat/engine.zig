@@ -8358,10 +8358,18 @@ fn maybeSyncCastFiles(app: *App, uid: u64, conv: []const u8, conv_dir: []const u
     }
     // Dedup marker lives in the RUN dir: deploy_service.resetCastLifecycle drops it before a re-cast spawns there.
     var mb: [1400]u8 = undefined;
-    const marker = std.fmt.bufPrint(&mb, "{s}/.filesync_done", .{run_dir}) catch return;
+    const marker = std.fmt.bufPrint(&mb, "{s}/{s}", .{ run_dir, cync.SYNCED_MARKER }) catch return;
     if (std.Io.Dir.cwd().access(app.io, marker, .{})) |_| return else |_| {}
     // Marker FIRST: a sync that trips a persistent walk error must not re-fire before every future tool call.
     std.Io.Dir.cwd().writeFile(app.io, .{ .sub_path = marker, .data = "" }) catch {};
+    // Then check for a live worker. One entering this dir (a crash respawn, a re-cast) drops the marker right after it
+    // writes worker.pid (run.zig claimRunDir), and one that came up after the verdict above may have dropped it before
+    // this write, leaving a marker that would hide everything that worker builds. Its pid is on disk by now, so a live
+    // worker means: take the marker back, and push once its run ends.
+    if (app.sup.pidStatus(run_dir).alive) {
+        std.Io.Dir.cwd().deleteFile(app.io, marker) catch {};
+        return;
+    }
 
     var wb: [1400]u8 = undefined;
     const work = std.fmt.bufPrint(&wb, "{s}/work", .{run_dir}) catch return;
@@ -8422,6 +8430,144 @@ fn copyTo(buf: []u8, s: []const u8) ?[]const u8 {
     if (s.len > buf.len) return null;
     @memcpy(buf[0..s.len], s);
     return buf[0..s.len];
+}
+
+/// Test fixture for maybeSyncCastFiles. No client answers in these tests, and an unanswered manifest request holds a
+/// push for SYNC_WAIT_S. A stop already in the conversation's control file ends that wait at once, and the push then
+/// sends every file, as it does whenever the client never answers.
+const CastSyncProbe = struct {
+    /// A worker.pid that names no process on any OS: Windows pids stay far below it, Linux caps them at 2^22.
+    const DEAD_PID = "999999999";
+
+    fn put(io: std.Io, dir: []const u8, name: []const u8, data: []const u8) !void {
+        var b: [512]u8 = undefined;
+        const p = try std.fmt.bufPrint(&b, "{s}/{s}", .{ dir, name });
+        if (std.fs.path.dirname(p)) |parent| _ = try std.Io.Dir.cwd().createDirPathStatus(io, parent, .default_dir);
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = p, .data = data });
+    }
+    fn remove(io: std.Io, dir: []const u8, name: []const u8) !void {
+        var b: [512]u8 = undefined;
+        try std.Io.Dir.cwd().deleteFile(io, try std.fmt.bufPrint(&b, "{s}/{s}", .{ dir, name }));
+    }
+    fn has(io: std.Io, dir: []const u8, name: []const u8) !bool {
+        var b: [512]u8 = undefined;
+        std.Io.Dir.cwd().access(io, try std.fmt.bufPrint(&b, "{s}/{s}", .{ dir, name }), .{}) catch return false;
+        return true;
+    }
+    fn pidIn(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8) !u32 {
+        var b: [512]u8 = undefined;
+        const p = try std.fmt.bufPrint(&b, "{s}/worker.pid", .{run_dir});
+        const raw = try std.Io.Dir.cwd().readFileAlloc(io, p, gpa, .limited(64));
+        defer gpa.free(raw);
+        return std.fmt.parseInt(u32, std.mem.trim(u8, raw, " \r\n\t"), 10);
+    }
+    /// How many times `needle` occurs in the conversation's event stream, which carries every frame a client is sent.
+    fn frames(gpa: std.mem.Allocator, io: std.Io, conv_dir: []const u8, needle: []const u8) !usize {
+        var b: [512]u8 = undefined;
+        const p = try std.fmt.bufPrint(&b, "{s}/events.jsonl", .{conv_dir});
+        const raw = std.Io.Dir.cwd().readFileAlloc(io, p, gpa, .limited(1 << 20)) catch |e| switch (e) {
+            error.FileNotFound => return 0, // nothing emitted yet
+            else => return e,
+        };
+        defer gpa.free(raw);
+        return std.mem.count(u8, raw, needle);
+    }
+};
+
+test "cast file sync across a crash respawn: what the respawned worker builds reaches the client, whatever the crash gap pushed" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var ta = try http.testApp(gpa, io, "zig-engine-respawn-sync-tmp");
+    defer ta.deinit();
+    const app = &ta.app;
+    const fanout = @import("../control/fanout.zig");
+    defer fanout.dropTestSwarms(app.sup, gpa);
+    const worker_run = @import("../run.zig");
+    const P = CastSyncProbe;
+    const uid: u64 = 7;
+    const conv = "c3f9e2a17";
+
+    // The pair a real cast joins: castSwarm spawns into {data}/{buildRootRel}, runTurn hands the hook the store dir.
+    var relb: [128]u8 = undefined;
+    var runb: [256]u8 = undefined;
+    const run_dir = try std.fmt.bufPrint(&runb, "{s}/{s}", .{ ta.root, cpaths.buildRootRel(&relb, uid, conv) });
+    var convb: [256]u8 = undefined;
+    const conv_dir = try std.fmt.bufPrint(&convb, "{s}/u{d}/_chat/convs/{s}", .{ ta.root, uid, conv });
+    try P.put(io, conv_dir, "control.jsonl", "{\"op\":\"stop\"}\n");
+
+    // The cast's first worker built one file and crashed: no DONE, and its worker.pid names a process that is gone.
+    try fanout.addTestSwarm(app.sup, gpa, "5eed0c457", uid, run_dir);
+    try P.put(io, run_dir, "worker.pid", P.DEAD_PID);
+    try P.put(io, run_dir, "work/first.md", "built before the crash");
+
+    // No live worker holds the dir, so the run reads as finished: a client-mode tool call in the crash gap pushes what
+    // is there and marks the run.
+    maybeSyncCastFiles(app, uid, conv, conv_dir, 0);
+    try std.testing.expectEqual(@as(usize, 1), try P.frames(gpa, io, conv_dir, "\"kind\":\"file_sync\""));
+    try std.testing.expect(try P.has(io, run_dir, cync.SYNCED_MARKER));
+
+    // Supervisor.respawn relaunches `veil worker <run_dir>` into the same dir with nothing reset, and that worker's
+    // startup claims the dir. Nothing is pushed while it runs.
+    try worker_run.claimRunDir(gpa, io, run_dir);
+    try std.testing.expect(!try P.has(io, run_dir, cync.SYNCED_MARKER));
+    app.sup.test_live_pid = try P.pidIn(gpa, io, run_dir); // the pid the claim wrote belongs to a live worker
+    maybeSyncCastFiles(app, uid, conv, conv_dir, 0);
+    try std.testing.expectEqual(@as(usize, 1), try P.frames(gpa, io, conv_dir, "\"kind\":\"file_sync\""));
+    try std.testing.expect(!try P.has(io, run_dir, cync.SYNCED_MARKER));
+
+    // It builds more and exits cleanly, leaving the dir as writeDone does: DONE written, worker.pid gone.
+    try P.put(io, run_dir, "work/second.md", "built by the respawned worker");
+    try P.put(io, run_dir, "DONE", "completed");
+    try P.remove(io, run_dir, "worker.pid");
+    maybeSyncCastFiles(app, uid, conv, conv_dir, 0);
+    try std.testing.expectEqual(@as(usize, 1), try P.frames(gpa, io, conv_dir, "\"path\":\"second.md\""));
+    try std.testing.expect(try P.has(io, run_dir, cync.SYNCED_MARKER));
+    maybeSyncCastFiles(app, uid, conv, conv_dir, 0); // finished for good: its marker holds
+    try std.testing.expectEqual(@as(usize, 1), try P.frames(gpa, io, conv_dir, "\"path\":\"second.md\""));
+}
+
+test "cast file sync never leaves its marker over a live worker: a marker written as a worker claims the run dir is taken back" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var ta = try http.testApp(gpa, io, "zig-engine-claim-sync-tmp");
+    defer ta.deinit();
+    const app = &ta.app;
+    const fanout = @import("../control/fanout.zig");
+    defer fanout.dropTestSwarms(app.sup, gpa);
+    const P = CastSyncProbe;
+    const uid: u64 = 7;
+    const conv = "c8b04d6e2";
+
+    var relb: [128]u8 = undefined;
+    var runb: [256]u8 = undefined;
+    const run_dir = try std.fmt.bufPrint(&runb, "{s}/{s}", .{ ta.root, cpaths.buildRootRel(&relb, uid, conv) });
+    var convb: [256]u8 = undefined;
+    const conv_dir = try std.fmt.bufPrint(&convb, "{s}/u{d}/_chat/convs/{s}", .{ ta.root, uid, conv });
+    try P.put(io, conv_dir, "control.jsonl", "{\"op\":\"stop\"}\n");
+
+    // A new worker is claiming a finished run's dir right now: its pid is written, DONE not yet dropped (claimRunDir's
+    // order). The hook reads DONE as finished and writes its marker, which then meets a live worker. The race in
+    // claimRunDir's comment ends in the same place: a verdict read before the claim, a marker written after its drop.
+    try fanout.addTestSwarm(app.sup, gpa, "0a1b2c3d4", uid, run_dir);
+    try P.put(io, run_dir, "work/old.md", "the finished run's file");
+    try P.put(io, run_dir, "DONE", "completed");
+    try P.put(io, run_dir, "worker.pid", "4242");
+    app.sup.test_live_pid = 4242;
+    maybeSyncCastFiles(app, uid, conv, conv_dir, 0);
+    try std.testing.expect(!try P.has(io, run_dir, cync.SYNCED_MARKER));
+    try std.testing.expectEqual(@as(usize, 0), try P.frames(gpa, io, conv_dir, "\"kind\":\"sync_request\""));
+    try std.testing.expectEqual(@as(usize, 0), try P.frames(gpa, io, conv_dir, "\"kind\":\"file_sync\""));
+
+    // That worker finishes, leaving DONE and no worker.pid as writeDone does: only now is the run pushed and marked.
+    try P.put(io, run_dir, "work/new.md", "the new worker's file");
+    try P.remove(io, run_dir, "worker.pid");
+    maybeSyncCastFiles(app, uid, conv, conv_dir, 0);
+    try std.testing.expectEqual(@as(usize, 1), try P.frames(gpa, io, conv_dir, "\"path\":\"new.md\""));
+    try std.testing.expect(try P.has(io, run_dir, cync.SYNCED_MARKER));
 }
 
 /// Emit files under `work` as file_sync frames (recursive, bounded; dot-entries and binaries skipped — a NUL

@@ -13,6 +13,7 @@ Rsync-lite over the existing delegation channel instead of a real file server (S
 ## Key Exports
 
 - Caps: `FILE_CAP` (512 KiB per file — an oversized file is skipped, not clipped), `TOTAL_CAP` (4 MiB per batch), `MAX_FILES` (64), `MAX_DEPTH` (4), `PROBE_NAME` (`.sync_probe`).
+- `SYNCED_MARKER` (`.filesync_done`) — the server→client push's once-per-run mark in a cast's run dir. The engine writes it when it pushes a finished run's files and skips the push while it stands. A worker that starts in the dir (a crash respawn, a re-cast) drops it right after writing `worker.pid` (run.zig `claimRunDir`), so what that worker builds is pushed when it ends.
 - Wire shapes: `Entry` (`{p,s,h}` — path, size, FNV-1a-64 hex hash), `ManifestResp`, `PulledFile` (`{p,c}`), `PullResp`.
 - `hashHex(bytes, out)` — FNV-1a 64 as 16 lowercase hex chars; non-crypto on purpose (drift detection between two copies of the user's own files, not an adversary — and it hashes at memory speed).
 - `safeSyncPath(p)` — the shared checker every side applies: workdir-relative, forward slashes only, no `.`/`..` segments, no drive letters or ADS colons.
