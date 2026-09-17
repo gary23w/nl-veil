@@ -535,33 +535,102 @@ pub const Supervisor = struct {
         }
     }
 
+    /// Re-adopt every run dir under `data_dir` that holds a manifest (listRunDirs says which dirs are run dirs).
     pub fn reattach(self: *Supervisor, data_dir: []const u8) usize {
-        const out = self.findManifests(data_dir) orelse return 0;
-        defer self.gpa.free(out);
+        var runs = self.listRunDirs(data_dir);
+        defer runs.deinit(self.gpa);
         var n: usize = 0;
-        var it = std.mem.tokenizeAny(u8, out, "\r\n");
-        while (it.next()) |raw| {
-            const mpath = std.mem.trim(u8, raw, " \t");
-            if (mpath.len == 0) continue;
-            if (self.adoptOne(mpath)) n += 1 else |_| {}
+        for (runs.list.items) |run| {
+            if (self.adoptOne(run.uid, run.path)) n += 1 else |_| {}
         }
         return n;
     }
 
-    fn findManifests(self: *Supervisor, data_dir: []const u8) ?[]u8 {
-        if (builtin.os.tag == .windows) {
-            const cmd = std.fmt.allocPrint(self.gpa, "if (Test-Path -LiteralPath '{s}') {{ Get-ChildItem -LiteralPath '{s}' -Filter swarm.json -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object {{ $_.FullName }} }}", .{ data_dir, data_dir }) catch return null;
-            defer self.gpa.free(cmd);
-            const argv = [_][]const u8{ "powershell", "-NoProfile", "-Command", cmd };
-            const res = std.process.run(self.gpa, self.io, .{ .argv = &argv }) catch return null;
-            self.gpa.free(res.stderr);
-            return res.stdout;
-        } else {
-            const argv = [_][]const u8{ "find", data_dir, "-name", "swarm.json", "-type", "f" };
-            const res = std.process.run(self.gpa, self.io, .{ .argv = &argv }) catch return null;
-            self.gpa.free(res.stderr);
-            return res.stdout;
+    /// A fresh spawn id: 8 random bytes in lowercase hex. deploySwarm names a deploy's run dir by it, and listRunDirs
+    /// knows a deploy's run dir among an account's other dirs by that shape (isSpawnId).
+    pub fn newSpawnId(self: *Supervisor) [16]u8 {
+        var rnd: [8]u8 = undefined;
+        self.io.random(&rnd);
+        return std.fmt.bytesToHex(rnd, .lower);
+    }
+
+    /// A run dir listRunDirs found: the account whose dir it sits in, and its path.
+    const RunDir = struct { uid: u64, path: []const u8 };
+
+    const RunDirs = struct {
+        list: std.ArrayListUnmanaged(RunDir) = .empty,
+
+        fn add(runs: *RunDirs, gpa: std.mem.Allocator, uid: u64, path: []const u8) void {
+            const owned = gpa.dupe(u8, path) catch return;
+            runs.list.append(gpa, .{ .uid = uid, .path = owned }) catch gpa.free(owned);
         }
+
+        fn deinit(runs: *RunDirs, gpa: std.mem.Allocator) void {
+            for (runs.list.items) |run| gpa.free(run.path);
+            runs.list.deinit(gpa);
+        }
+    };
+
+    /// Every dir under `data_dir` that the server spawns workers in, found only where deploySwarm puts one:
+    ///   u{uid}/{spawn id}                    a deploy, or a cast with no conversation (newSpawnId)
+    ///   u{uid}/_chat/builds/{conv}           a conversation's casts (chat/paths.zig buildRootRel)
+    ///   u{uid}/_sched/{task}/runs/{stamp}    a scheduled run's casts (buildRootRel, read back by schedRunOfDir)
+    /// Each path is spelled `{data_dir}/{rel}`, as a spawn spells its run dir. The walk never goes below a run dir: its
+    /// work/ tree holds the hive's deliverables, where write_file puts any name at any depth, so a swarm.json or an
+    /// events.jsonl there is a file of the run's, not another run. Listed recursively, such a folder became a phantom
+    /// swarm on restart (for the account of the last "u<digits>" folder in its path) and retention deleted or stripped
+    /// it. A
+    /// conversation's own dir (u{uid}/_chat/convs/{conv}) keeps an events.jsonl too, and it is no run dir either.
+    /// Symlinks are not followed.
+    fn listRunDirs(self: *Supervisor, data_dir: []const u8) RunDirs {
+        const io = self.io;
+        var runs: RunDirs = .{};
+        var root = std.Io.Dir.cwd().openDir(io, data_dir, .{ .iterate = true }) catch return runs;
+        defer root.close(io);
+        var accounts = root.iterate();
+        while (accounts.next(io) catch null) |account| {
+            if (!maybeDir(account.kind)) continue;
+            const uid = accountUid(account.name) orelse continue;
+            var adir = root.openDir(io, account.name, .{ .iterate = true }) catch continue;
+            defer adir.close(io);
+            var entries = adir.iterate();
+            while (entries.next(io) catch null) |entry| {
+                if (!maybeDir(entry.kind)) continue;
+                var pb: [1024]u8 = undefined; // remove() copies a run dir into 1024 bytes: never list one it would clip
+                if (isSpawnId(entry.name)) {
+                    const path = std.fmt.bufPrint(&pb, "{s}/{s}/{s}", .{ data_dir, account.name, entry.name }) catch continue;
+                    runs.add(self.gpa, uid, path);
+                } else if (std.mem.eql(u8, entry.name, "_chat")) {
+                    var builds = adir.openDir(io, "_chat/builds", .{ .iterate = true }) catch continue;
+                    defer builds.close(io);
+                    var convs = builds.iterate();
+                    while (convs.next(io) catch null) |conv| {
+                        if (!maybeDir(conv.kind)) continue;
+                        const path = std.fmt.bufPrint(&pb, "{s}/{s}/_chat/builds/{s}", .{ data_dir, account.name, conv.name }) catch continue;
+                        runs.add(self.gpa, uid, path);
+                    }
+                } else if (std.mem.eql(u8, entry.name, "_sched")) {
+                    var sched = adir.openDir(io, "_sched", .{ .iterate = true }) catch continue;
+                    defer sched.close(io);
+                    var tasks = sched.iterate();
+                    while (tasks.next(io) catch null) |task| {
+                        if (!maybeDir(task.kind)) continue;
+                        var tb: [320]u8 = undefined;
+                        const runs_rel = std.fmt.bufPrint(&tb, "{s}/runs", .{task.name}) catch continue;
+                        var stamps_dir = sched.openDir(io, runs_rel, .{ .iterate = true }) catch continue;
+                        defer stamps_dir.close(io);
+                        var stamps = stamps_dir.iterate();
+                        while (stamps.next(io) catch null) |stamp| {
+                            if (!maybeDir(stamp.kind)) continue;
+                            const path = std.fmt.bufPrint(&pb, "{s}/{s}/_sched/{s}/runs/{s}", .{ data_dir, account.name, task.name, stamp.name }) catch continue;
+                            if (cpaths.schedRunOfDir(path) == null) continue; // no run stamp: no scheduled run built here
+                            runs.add(self.gpa, uid, path);
+                        }
+                    }
+                }
+            }
+        }
+        return runs;
     }
 
     pub fn maybeGc(self: *Supervisor, data_dir: []const u8, days: u32) void {
@@ -573,37 +642,23 @@ pub const Supervisor = struct {
         if (n > 0) log.info("retention: pruned {d} run dir(s) inactive >= {d}d", .{ n, days });
     }
 
+    /// Retention: prune each run dir (listRunDirs) whose own events.jsonl was last written more than `days` days ago and
+    /// that no running entry holds. rmTree decides how much of a dir goes. Returns how many were pruned.
     pub fn pruneOldRuns(self: *Supervisor, data_dir: []const u8, days: u32) usize {
-        const list = self.findInactiveRunDirs(data_dir, days) orelse return 0;
-        defer self.gpa.free(list);
+        var runs = self.listRunDirs(data_dir);
+        defer runs.deinit(self.gpa);
+        const now_ns = std.Io.Timestamp.now(self.io, .real).nanoseconds;
+        const idle_ns = @as(i96, days) * std.time.ns_per_day;
         var pruned: usize = 0;
-        var it = std.mem.tokenizeAny(u8, list, "\r\n");
-        while (it.next()) |raw| {
-            const ev = std.mem.trim(u8, raw, " \r\n\t");
-            if (ev.len == 0) continue;
-            const run_dir = std.fs.path.dirname(ev) orelse continue;
-            if (self.runDirIsLive(run_dir)) continue;
-            if (self.rmTree(run_dir)) pruned += 1;
+        for (runs.list.items) |run| {
+            var pb: [1100]u8 = undefined;
+            const ev = std.fmt.bufPrint(&pb, "{s}/events.jsonl", .{run.path}) catch continue;
+            const st = std.Io.Dir.cwd().statFile(self.io, ev, .{}) catch continue;
+            if (now_ns - st.mtime.nanoseconds <= idle_ns) continue;
+            if (self.runDirIsLive(run.path)) continue;
+            if (self.rmTree(run.path)) pruned += 1;
         }
         return pruned;
-    }
-
-    fn findInactiveRunDirs(self: *Supervisor, data_dir: []const u8, days: u32) ?[]u8 {
-        if (builtin.os.tag == .windows) {
-            const cmd = std.fmt.allocPrint(self.gpa, "if (Test-Path -LiteralPath '{s}') {{ Get-ChildItem -LiteralPath '{s}' -Filter events.jsonl -Recurse -File -ErrorAction SilentlyContinue | Where-Object {{ $_.LastWriteTime -lt (Get-Date).AddDays(-{d}) }} | ForEach-Object {{ $_.FullName }} }}", .{ data_dir, data_dir, days }) catch return null;
-            defer self.gpa.free(cmd);
-            const argv = [_][]const u8{ "powershell", "-NoProfile", "-Command", cmd };
-            const res = std.process.run(self.gpa, self.io, .{ .argv = &argv }) catch return null;
-            self.gpa.free(res.stderr);
-            return res.stdout;
-        } else {
-            const ds = std.fmt.allocPrint(self.gpa, "+{d}", .{days}) catch return null;
-            defer self.gpa.free(ds);
-            const argv = [_][]const u8{ "find", data_dir, "-name", "events.jsonl", "-type", "f", "-mtime", ds };
-            const res = std.process.run(self.gpa, self.io, .{ .argv = &argv }) catch return null;
-            self.gpa.free(res.stderr);
-            return res.stdout;
-        }
     }
 
     fn runDirIsLive(self: *Supervisor, run_dir: []const u8) bool {
@@ -612,7 +667,7 @@ pub const Supervisor = struct {
         var it = self.swarms.valueIterator();
         while (it.next()) |sp| {
             const s = sp.*;
-            if ((s.state == .running or s.state == .starting) and std.mem.eql(u8, s.run_dir, run_dir)) return true;
+            if ((s.state == .running or s.state == .starting) and sameRunDir(s.run_dir, run_dir)) return true;
         }
         return false;
     }
@@ -683,12 +738,13 @@ pub const Supervisor = struct {
     const MindManifest = struct { name: []const u8 = "" };
     const Manifest = struct { swarm: []const u8 = "swarm", model: []const u8 = "mock", encrypted: bool = false, minds: []const MindManifest = &.{} };
 
-    /// Re-adopt the run dir holding the manifest at `mani_path` under the key adoptKey picks. error.AlreadyTracked
-    /// only when an entry already tracks that very dir: a dir that merely shares a name with a tracked one is another
-    /// run, and skipping it left a live worker there unsupervised and unreachable by any id.
-    fn adoptOne(self: *Supervisor, mani_path: []const u8) !void {
-        const run_dir = std.fs.path.dirname(mani_path) orelse return error.BadPath;
-        const uid = parseUidFromPath(run_dir) orelse return error.NoUid;
+    /// Re-adopt `run_dir`, a run dir of account `uid` holding a manifest, under the key adoptKey picks. The account is
+    /// the one whose dir listRunDirs found it in, never a "u<digits>" name further down the path, which a conversation
+    /// id can be. error.AlreadyTracked only when an entry already tracks that very dir: a dir that merely shares a name
+    /// with a tracked one is another run, and skipping it left a live worker there unsupervised and unreachable by any id.
+    fn adoptOne(self: *Supervisor, uid: u64, run_dir: []const u8) !void {
+        var mb: [1100]u8 = undefined;
+        const mani_path = try std.fmt.bufPrint(&mb, "{s}/swarm.json", .{run_dir});
         const data = try std.Io.Dir.cwd().readFileAlloc(self.io, mani_path, self.gpa, .limited(256 << 10));
         defer self.gpa.free(data);
         const parsed = try std.json.parseFromSlice(Manifest, self.gpa, data, .{ .ignore_unknown_fields = true });
@@ -899,8 +955,8 @@ pub const Supervisor = struct {
         };
     }
 
-    /// One run dir under two spellings: casts fmt-join it with '/' onto the native data path, while reattach adopts it
-    /// from the OS's own listing, so a Windows dir can be registered in both slash forms.
+    /// One run dir under two spellings: a spawn and reattach fmt-join it with '/' onto the native data path, while
+    /// Windows spells the same dir with backslashes, so an entry and a caller can hold it in different slash forms.
     fn sameRunDir(a: []const u8, b: []const u8) bool {
         if (a.len != b.len) return false;
         for (a, b) |x, y| {
@@ -995,16 +1051,6 @@ pub const Supervisor = struct {
         }
     }
 
-    fn parseUidFromPath(p: []const u8) ?u64 {
-        var it = std.mem.splitAny(u8, p, "/\\");
-        var uid: ?u64 = null;
-        while (it.next()) |seg| {
-            if (seg.len >= 2 and seg[0] == 'u' and std.ascii.isDigit(seg[1]))
-                uid = std.fmt.parseInt(u64, seg[1..], 10) catch uid;
-        }
-        return uid;
-    }
-
     pub const Load = struct { swarms: usize = 0, live_swarms: usize = 0, live_minds: usize = 0 };
 
     pub fn load(self: *Supervisor) Load {
@@ -1071,6 +1117,30 @@ fn runDirBase(run_dir: []const u8) []const u8 {
     return if (std.mem.lastIndexOfAny(u8, trimmed, "/\\")) |i| trimmed[i + 1 ..] else trimmed;
 }
 
+/// The user id an account dir holds runs for: the server names it "u" and the decimal id ("u1", "u42").
+fn accountUid(name: []const u8) ?u64 {
+    if (name.len < 2 or name[0] != 'u') return null;
+    for (name[1..]) |c| {
+        if (!std.ascii.isDigit(c)) return null;
+    }
+    return std.fmt.parseInt(u64, name[1..], 10) catch null;
+}
+
+/// A deploy's run dir name: a spawn id as Supervisor.newSpawnId mints it, 16 lowercase hex digits.
+fn isSpawnId(name: []const u8) bool {
+    if (name.len != 16) return false;
+    for (name) |c| {
+        if (!std.ascii.isDigit(c) and (c < 'a' or c > 'f')) return false;
+    }
+    return true;
+}
+
+/// A directory entry that may be a directory: a real one, or one whose type the filesystem did not report (a walk then
+/// opens it and finds out). A symlink is not followed.
+fn maybeDir(kind: std.Io.File.Kind) bool {
+    return kind == .directory or kind == .unknown;
+}
+
 /// Read at most `buf.len` bytes from the END of the file at `path` (positional read at size-buf.len).
 /// Returns the bytes read, or null on any error — callers treat null as "no data", never as a crash signal.
 /// The slice may begin mid-line when the file was longer than the buffer.
@@ -1106,7 +1176,7 @@ test "a conversation id names exactly the run dirs castSwarm spawns its build fa
     // Two derivations of one dir must meet: castSwarm (deploy/service.zig) spawns a conversation's cast with
     // run_dir = {data}/{buildRootRel(uid, conv)}, and resolve has only the conv id to find it again. For every pair
     // of convs, one's id must name the other's spawn dir exactly when buildRootRel sends both to the same dir: in
-    // the fmt-joined form castSwarm registers, and in the backslash form a re-adopted Windows dir carries.
+    // the fmt-joined form castSwarm registers, and in the backslash form Windows spells the same dir with.
     const convs = [_][]const u8{
         "c6a57f852", // ordinary: builds/{conv}
         "c6a57f852__s1", // its sub-chats share that tree
@@ -1193,7 +1263,7 @@ test "resolve: a conversation's id finds the newest cast on its family's run dir
     }
     try std.testing.expect(stale_came_first);
 
-    // After a restart, reattach keys the family dir by its basename, the conv id itself (with PowerShell's
+    // After a restart, reattach keys the family dir by its basename, the conv id itself (spelled here with
     // backslashes), and a re-cast then lands beside it. The re-adopted KEY must not shadow the newer cast.
     sup.swarms.clearRetainingCapacity();
     var adopted = mk("c6a57f852", "C:\\nl\\data\\u7\\_chat\\builds\\c6a57f852", 1_700_000_000, .stopped);
@@ -1207,7 +1277,8 @@ test "resolve: a conversation's id finds the newest cast on its family's run dir
 
 test "reattach adopts every run dir, whatever other dir shares its name, and each dir's names reach only that dir" {
     const gpa = std.testing.allocator;
-    // reattach lists the manifests through a real PowerShell (Windows) or find, which an empty environment cannot start
+    // reattach walks the data dir itself, but a listing that shelled out again must fail on what it lists, not on a
+    // child that an empty environment cannot start
     var threaded = std.Io.Threaded.init(gpa, .{ .environ = @import("../../gateway/http.zig").testEnviron() });
     defer threaded.deinit();
     const io = threaded.io();
@@ -1436,8 +1507,8 @@ test "relaunchPending vouches for a dead worker exactly when reconcile will rela
     }
     try std.testing.expect(sup.relaunchPending(run_dir));
 
-    // Every entry on the dir counts, in either slash form: a cast joins its run dir with '/', while reattach adopts a
-    // Windows dir with backslashes. An earlier cast's stopped entry beside it masks nothing.
+    // Every entry on the dir counts, in either slash form: a cast joins its run dir with '/', while Windows spells the
+    // same dir with backslashes. An earlier cast's stopped entry beside it masks nothing.
     var adopted: [run_dir.len]u8 = undefined;
     for (run_dir, &adopted) |c, *d| d.* = if (c == '/') '\\' else c;
     cast.run_dir = &adopted;
@@ -1490,4 +1561,165 @@ test "a crash whose relaunch cannot launch opens its breaker instead of reading 
     try std.testing.expect(overflow.breaker_open);
     try std.testing.expect(overflow.state == .crashed and overflow.child == null);
     try std.testing.expect(!sup.relaunchPending(run_dir));
+}
+
+test "reattach adopts the run dirs the server spawns and no manifest a hive wrote into a run's work tree" {
+    const gpa = std.testing.allocator;
+    // Nothing here starts a child, but a listing that shelled out again must fail on what it lists, not on a child that
+    // an empty environment cannot start.
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = @import("../../gateway/http.zig").testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-supervisor-worktree-adopt-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    var sup = Supervisor.init(gpa, io, "");
+    defer @import("fanout.zig").dropTestSwarms(&sup, gpa);
+
+    // The walk knows a deploy's run dir by the shape of the id deploySwarm names it with.
+    for (0..64) |_| try std.testing.expect(isSpawnId(&sup.newSpawnId()));
+
+    // A run dir of each shape the server spawns a worker in, each holding the manifest deploySwarm wrote: a deploy's
+    // u{uid}/{spawn id}, and castSwarm's build roots for conversations and a scheduled run (paths.zig buildRootRel).
+    // One conversation's id is "u9", a name any conversation may take, and the dir is still account 7's.
+    var deploy_buf: [32]u8 = undefined;
+    var rel_bufs: [3][96]u8 = undefined;
+    const runs = [_][]const u8{
+        try std.fmt.bufPrint(&deploy_buf, "u7/{s}", .{&sup.newSpawnId()}),
+        cpaths.buildRootRel(&rel_bufs[0], 7, "c6a57f852"),
+        cpaths.buildRootRel(&rel_bufs[1], 7, "u9"),
+        cpaths.buildRootRel(&rel_bufs[2], 7, "scheduled_news-0715174857_07151753"),
+    };
+    // A mind's write_file takes any workdir-relative path, and swarm.json is no reserved name, so a hive can leave a
+    // manifest anywhere in its deliverables, {run_dir}/work: at their root, in a site folder, or in folders that spell
+    // out a run dir of every shape, another account's included.
+    const planted = [_][]const u8{ "/work", "/work/site", "/work/u9", "/work/u7/fedcba9876543210", "/work/u7/_chat/builds/c1", "/work/u7/_sched/digest-0715174901/runs/07151800" };
+    for (runs) |run| {
+        for ([_][]const u8{""} ++ planted) |sub| {
+            var db: [256]u8 = undefined;
+            const dir = try std.fmt.bufPrint(&db, root ++ "/{s}{s}", .{ run, sub });
+            _ = try std.Io.Dir.cwd().createDirPathStatus(io, dir, .default_dir);
+            var mb: [280]u8 = undefined;
+            try std.Io.Dir.cwd().writeFile(io, .{
+                .sub_path = try std.fmt.bufPrint(&mb, "{s}/swarm.json", .{dir}),
+                .data = "{\"swarm\":\"cast\",\"model\":\"mock\",\"minds\":[{\"name\":\"nova\"}]}",
+            });
+        }
+    }
+
+    const adopted = sup.reattach(root);
+    const all = try sup.listAll();
+    defer gpa.free(all);
+    errdefer for (all) |s| std.debug.print("adopted {s} for account {d}\n", .{ s.run_dir, s.uid });
+    try std.testing.expectEqual(@as(usize, runs.len), adopted);
+    try std.testing.expectEqual(runs.len, all.len);
+    // Each run dir is adopted once, for the account it sits under, in whatever spelling the adoption gives its path.
+    for (runs) |run| {
+        var hits: usize = 0;
+        for (all) |s| {
+            if (s.run_dir.len <= run.len) continue;
+            const cut = s.run_dir.len - run.len;
+            if (!Supervisor.sameRunDir(s.run_dir[cut..], run) or (s.run_dir[cut - 1] != '/' and s.run_dir[cut - 1] != '\\')) continue;
+            try std.testing.expectEqual(@as(u64, 7), s.uid);
+            hits += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 1), hits);
+    }
+    const other_account = try sup.listForUser(9);
+    defer gpa.free(other_account);
+    try std.testing.expectEqual(@as(usize, 0), other_account.len);
+    try std.testing.expectEqual(@as(usize, 0), sup.reattach(root)); // a second pass finds nothing new
+}
+
+test "retention prunes only the idle run dirs the server spawned, never a work-tree folder holding an events.jsonl, a conversation or a live run" {
+    const gpa = std.testing.allocator;
+    // as in the reattach test above: a listing that shelled out again must fail on what it lists
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = @import("../../gateway/http.zig").testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-supervisor-worktree-prune-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+
+    var dir_bufs: [3][128]u8 = undefined;
+    var rel_bufs: [3][96]u8 = undefined;
+    const idle_deploy = root ++ "/u7/1111111111111111";
+    const busy_deploy = root ++ "/u7/2222222222222222";
+    const live_deploy = root ++ "/u7/3333333333333333";
+    const idle_cast = try std.fmt.bufPrint(&dir_bufs[0], root ++ "/{s}", .{cpaths.buildRootRel(&rel_bufs[0], 7, "c6a57f852")});
+    const busy_cast = try std.fmt.bufPrint(&dir_bufs[1], root ++ "/{s}", .{cpaths.buildRootRel(&rel_bufs[1], 7, "c7b68a963")});
+    const idle_sched = try std.fmt.bufPrint(&dir_bufs[2], root ++ "/{s}", .{cpaths.buildRootRel(&rel_bufs[2], 7, "scheduled_news-0715174857_07151753")});
+    const conv = root ++ "/u7/_chat/convs/c6a57f852";
+
+    // Every file in the tree: whether it was last written 30 days ago, far outside a 14-day window, and whether
+    // retention keeps it. A hive's files are named like a run's own bookkeeping, since write_file reserves no name.
+    const File = struct { dir: []const u8, name: []const u8, idle: bool = true, kept: bool };
+    const files = [_]File{
+        // an idle deploy goes whole
+        .{ .dir = idle_deploy, .name = "events.jsonl", .kept = false },
+        .{ .dir = idle_deploy, .name = "swarm.json", .kept = false },
+        .{ .dir = idle_deploy, .name = "work/index.html", .kept = false },
+        // a deploy still writing events keeps the idle events.jsonl its hive left in a data folder
+        .{ .dir = busy_deploy, .name = "events.jsonl", .idle = false, .kept = true },
+        .{ .dir = busy_deploy, .name = "work/data/events.jsonl", .kept = true },
+        .{ .dir = busy_deploy, .name = "work/data/swarm.json", .kept = true },
+        .{ .dir = busy_deploy, .name = "work/data/rows.csv", .kept = true },
+        // an idle deploy whose worker the registry holds as running
+        .{ .dir = live_deploy, .name = "events.jsonl", .kept = true },
+        // an idle conversation cast loses only its own bookkeeping; its hive's files of the same names stay
+        .{ .dir = idle_cast, .name = "events.jsonl", .kept = false },
+        .{ .dir = idle_cast, .name = "swarm.json", .kept = false },
+        .{ .dir = idle_cast, .name = "DONE", .kept = false },
+        .{ .dir = idle_cast, .name = "work/logs/events.jsonl", .kept = true },
+        .{ .dir = idle_cast, .name = "work/logs/swarm.json", .kept = true },
+        .{ .dir = idle_cast, .name = "work/logs/DONE", .kept = true },
+        // a conversation cast still running keeps a folder of old logs among files named like cast bookkeeping
+        .{ .dir = busy_cast, .name = "events.jsonl", .idle = false, .kept = true },
+        .{ .dir = busy_cast, .name = "work/logs/events.jsonl", .kept = true },
+        .{ .dir = busy_cast, .name = "work/logs/control.jsonl", .kept = true },
+        .{ .dir = busy_cast, .name = "work/logs/mind.sqlite", .kept = true },
+        .{ .dir = busy_cast, .name = "work/logs/keys.env", .kept = true },
+        .{ .dir = busy_cast, .name = "work/logs/minds/nova.md", .kept = true },
+        // an idle scheduled run, like a conversation cast
+        .{ .dir = idle_sched, .name = "events.jsonl", .kept = false },
+        .{ .dir = idle_sched, .name = "swarm.json", .kept = false },
+        .{ .dir = idle_sched, .name = "work/report/events.jsonl", .kept = true },
+        .{ .dir = idle_sched, .name = "work/report/report.md", .kept = true },
+        // a conversation idle as long is no run dir
+        .{ .dir = conv, .name = "events.jsonl", .kept = true },
+        .{ .dir = conv, .name = "messages.jsonl", .kept = true },
+    };
+    const now_ns = std.Io.Timestamp.now(io, .real).nanoseconds;
+    for (files) |f| {
+        var pb: [320]u8 = undefined;
+        const path = try std.fmt.bufPrint(&pb, "{s}/{s}", .{ f.dir, f.name });
+        _ = try std.Io.Dir.cwd().createDirPathStatus(io, std.fs.path.dirname(path).?, .default_dir);
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "{}\n" });
+        if (!f.idle) continue;
+        const file = try std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write });
+        defer file.close(io);
+        try file.setTimestamps(io, .{ .modify_timestamp = .{ .new = .fromNanoseconds(now_ns - 30 * std.time.ns_per_day) } });
+    }
+
+    var sup = Supervisor.init(gpa, io, "");
+    defer sup.swarms.deinit(gpa);
+    // the live run's entry spells its dir with the other separator, as a dir can be registered in either
+    var live_dir: [live_deploy.len]u8 = undefined;
+    for (live_deploy, &live_dir) |c, *d| d.* = if (c == '/') '\\' else c;
+    var live: Swarm = .{ .id = "3333333333333333", .uid = 7, .name = "cast", .run_dir = &live_dir, .model = "mock", .minds = 1, .created = 0, .state = .running };
+    try sup.swarms.put(gpa, live.id, &live);
+
+    const pruned = sup.pruneOldRuns(root, 14);
+    var wrong: usize = 0;
+    for (files) |f| {
+        var pb: [320]u8 = undefined;
+        const path = try std.fmt.bufPrint(&pb, "{s}/{s}", .{ f.dir, f.name });
+        const kept = if (std.Io.Dir.cwd().access(io, path, .{})) |_| true else |_| false;
+        if (kept == f.kept) continue;
+        std.debug.print("retention {s} {s}\n", .{ if (kept) "left" else "deleted", path });
+        wrong += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 0), wrong);
+    try std.testing.expectEqual(@as(usize, 3), pruned); // the idle deploy, conversation cast and scheduled run
+    try std.testing.expectEqual(@as(usize, 0), sup.pruneOldRuns(root, 14)); // nothing idle is left to prune
 }

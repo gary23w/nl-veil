@@ -98,7 +98,7 @@ Everything a new account can and cannot do is on its own page: [accounts and the
 | `NL_MAX_TURNS` | chat turns running at once, server-wide (default 64, hard ceiling 256) |
 | `NL_MAX_TURNS_PER_USER` | how many one account may hold (default: an eighth of capacity) |
 | `NL_KEEPALIVE_REQUESTS` | requests one connection serves before recycling (default 200) |
-| `NL_RETENTION_DAYS` | prune run directories inactive this long (default 14; 0 disables) |
+| `NL_RETENTION_DAYS` | prune swarm run directories inactive this long (default 14; 0 disables). A chat's or scheduled task's build keeps its files, and conversations are never pruned |
 | `NL_RATE_RPM` | optional per-provider requests/minute cap for hosted traffic (unset/0 = unlimited) |
 | `NL_PRODUCTION` | meter non-admins against their neuron plan instead of unmetered beta use |
 
