@@ -1,10 +1,10 @@
 //! llm.zig — the desktop's chat-model client. ONE interface (base_url + key + model, OpenAI-compatible
 //! /chat/completions) behind which every provider plugs: local Ollama, a BYOK cloud provider, or a custom
 //! endpoint URL. Transport mirrors the engine's convention (src/worker/llm.zig): the key rides in a curl
-//! CONFIG FILE (never on argv), the body in a request file, and curl does the HTTP — TLS for hosted
-//! providers without betting on std.http in this Zig. Streaming is filesystem-first: curl -N writes the
-//! SSE stream to a scratch file and the chat thread TAILS it, appending deltas to the Store. Runs on the
-//! CHAT thread only.
+//! CONFIG FILE (never on argv) that is the call's own and deleted once its curl has exited, the body in a
+//! request file, and curl does the HTTP — TLS for hosted providers without betting on std.http in this Zig.
+//! Streaming is filesystem-first: curl -N writes the SSE stream to a scratch file and the chat thread TAILS
+//! it, appending deltas to the Store. Runs on the CHAT thread only.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -37,6 +37,10 @@ pub const Stream = struct {
     child: ?std.process.Child = null,
     out_path: [300]u8 = [_]u8{0} ** 300,
     out_path_len: u16 = 0,
+    // This call's curl config (keyCfgPath), the one file holding the API key. Set once curl is running;
+    // reap() deletes it after curl is gone and zeroes the length.
+    cfg_path: [KEY_CFG_PATH_CAP]u8 = [_]u8{0} ** KEY_CFG_PATH_CAP,
+    cfg_path_len: u16 = 0,
     offset: usize = 0, // bytes of the stream file already consumed
     carry: std.ArrayListUnmanaged(u8) = .empty, // partial trailing line held between polls (grows as needed)
     native: bool = false, // Ollama native /api/chat (NDJSON lines), not OpenAI SSE
@@ -60,6 +64,9 @@ pub const Stream = struct {
     pub fn outPath(s: *const Stream) []const u8 {
         return s.out_path[0..s.out_path_len];
     }
+    /// Frees the buffers and resets the Stream. End the call first (finish/abort): this has no io, so a
+    /// curl still running here keeps going, and its config stays on disk until the chat thread's key sweep
+    /// finds it stale.
     pub fn deinit(s: *Stream, gpa: std.mem.Allocator) void {
         s.content.deinit(gpa);
         s.reasoning.deinit(gpa);
@@ -76,6 +83,84 @@ const FIRST_BYTE_TIMEOUT_S = 300;
 const FIRST_BYTE_PATIENT_S = 900; // while a cast runs: queued-behind-the-hive is normal, not a failure
 const STALL_TIMEOUT_S = 300;
 const TOTAL_TIMEOUT_S = 900;
+/// How far past TOTAL_TIMEOUT_S (curl's own --max-time) checkTimeouts lets a call run before it ends the call itself.
+const TOTAL_TIMEOUT_SLACK_S = 15;
+
+// ---- the API key's file ----
+
+/// The name every call's curl config starts with. The config holds the API key (`header = "Authorization: Bearer
+/// <key>"`) and sits in the caller's scratch dir, inside the data dir: a folder that is often synced or backed up.
+/// Builds before 2026-09-17 wrote exactly this name, one per dir, and never deleted it.
+const KEY_CFG = ".chatcurlcfg";
+
+/// Room for a call's config path. start() refuses a scratch dir too long for it rather than write a config it
+/// could not later delete by name.
+const KEY_CFG_PATH_CAP = 768;
+
+/// A call's own curl config, `{dir}/.chatcurlcfg-{16 hex}`, formatted into `buf`; null when it does not fit.
+///
+/// PER CALL, NOT PER DIR. A call deletes its config once its curl has exited (reap), so the name must be that
+/// call's alone. Under one fixed name, a call ending could delete the file another call in the same dir had just
+/// written, before that call's curl read it: curl then exits 26 and sends nothing. So a call only ever deletes its
+/// own config, and the startup sweep only configs older than any call can run.
+fn keyCfgPath(io: Io, dir: []const u8, buf: []u8) ?[]const u8 {
+    var sfx: [8]u8 = undefined;
+    io.random(&sfx);
+    const hex = std.fmt.bytesToHex(sfx, .lower);
+    return std.fmt.bufPrint(buf, "{s}/" ++ KEY_CFG ++ "-{s}", .{ dir, &hex }) catch null;
+}
+
+/// Whether a file `name` is a curl config a desk call wrote: a call's own (keyCfgPath), or the one fixed name
+/// earlier builds left in each dir.
+pub fn isKeyCfgName(name: []const u8) bool {
+    if (!std.mem.startsWith(u8, name, KEY_CFG)) return false;
+    return name.len == KEY_CFG.len or name[KEY_CFG.len] == '-';
+}
+
+/// How long after its last write a curl config counts as stranded (sweepKeyCfgs). A config lives as long as its
+/// call, and checkTimeouts ends every call by TOTAL_TIMEOUT_S + TOTAL_TIMEOUT_SLACK_S, so an older one was left by
+/// a desk that died mid-call, or by a build before 2026-09-17. A younger one may belong to a live call (another
+/// desk on the same data dir) whose curl has not read it yet, and a sweep must never take that one.
+pub const KEY_CFG_STALE_S: i64 = 20 * 60;
+
+/// Remove the stranded curl configs at the top level of `dir_path`: files isKeyCfgName names that were last
+/// written more than KEY_CFG_STALE_S before `now_ns`. Nothing below the top level is read. Returns how many it
+/// removed.
+pub fn sweepKeyCfgs(io: Io, gpa: std.mem.Allocator, dir_path: []const u8, now_ns: i96) usize {
+    var dir = Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch return 0;
+    defer dir.close(io);
+    // Names first, THEN deletes: a dir changed mid-iteration can skip an entry.
+    var names: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (names.items) |n| gpa.free(n);
+        names.deinit(gpa);
+    }
+    var it = dir.iterate();
+    while (it.next(io) catch null) |ent| {
+        // Anything but a dir. Zig lists every Windows reparse point as a symlink, and a synced folder's
+        // placeholder file can be one.
+        if (ent.kind == .directory or !isKeyCfgName(ent.name)) continue;
+        const dup = gpa.dupe(u8, ent.name) catch continue;
+        names.append(gpa, dup) catch {
+            gpa.free(dup);
+            continue;
+        };
+    }
+    const stale_ns = @as(i96, KEY_CFG_STALE_S) * std.time.ns_per_s;
+    var removed: usize = 0;
+    for (names.items) |n| {
+        const st = dir.statFile(io, n, .{ .follow_symlinks = false }) catch continue;
+        if (now_ns - st.mtime.nanoseconds <= stale_ns) continue;
+        dir.deleteFile(io, n) catch continue;
+        removed += 1;
+    }
+    return removed;
+}
+
+/// The program start() runs. TEST ONLY: under `zig build test` start() runs `test_curl` instead, so a test can
+/// name a program no PATH holds and reach the exit where curl never launches. A shipped build always runs CURL.
+const CURL = "curl";
+var test_curl: []const u8 = CURL;
 
 // MUST equal the engine's NATIVE_CTX (src/worker/llm.zig). In Ollama a different num_ctx is a different
 // runner: without parity every chat↔swarm alternation forces a full model reload (measured tens of
@@ -111,8 +196,13 @@ fn setErr(s: *Stream, msg: []const u8) void {
 
 /// Kick off one streaming chat completion. `messages_json` is the inside of "messages":[ … ] (caller-built
 /// and escaped). Scratch files live under `dir` (the .veil-desk sidecar). Returns false on spawn failure.
+/// The call's curl config holds the key until finish() or abort() ends the call.
 pub fn start(s: *Stream, io: Io, gpa: std.mem.Allocator, dir: []const u8, prov: Provider, messages_json: []const u8, max_tokens: u32, now_s: i64) bool {
     log.trace("llm.start dir={s} model={s} msgs_len={d} max_tokens={d}", .{ dir, prov.model, messages_json.len, max_tokens });
+    // ONE CALL PER STREAM. A start over a call that was never ended ends it here: its curl is killed and
+    // reaped, and only then is its config deleted. Resetting the struct alone would drop that child, and its
+    // curl would keep the key's file on disk while writing on into the sink this call truncates below.
+    reap(s, io);
     const native = isLocalOllama(prov.base_url);
     s.* = .{ .started_s = now_s, .last_growth_s = now_s, .native = native };
 
@@ -123,8 +213,11 @@ pub fn start(s: *Stream, io: Io, gpa: std.mem.Allocator, dir: []const u8, prov: 
     defer gpa.free(url);
     const reqpath = std.fmt.allocPrint(gpa, "{s}/.chatreq.json", .{dir}) catch return false;
     defer gpa.free(reqpath);
-    const cfgpath = std.fmt.allocPrint(gpa, "{s}/.chatcurlcfg", .{dir}) catch return false;
-    defer gpa.free(cfgpath);
+    var cfg_buf: [KEY_CFG_PATH_CAP]u8 = undefined;
+    const cfgpath = keyCfgPath(io, dir, &cfg_buf) orelse {
+        log.err("chat llm: scratch dir path too long for a curl config: {s}", .{dir});
+        return false;
+    };
     const outpath = std.fmt.allocPrint(gpa, "{s}/.chatstream.sse", .{dir}) catch return false;
     defer gpa.free(outpath);
     {
@@ -148,29 +241,39 @@ pub fn start(s: *Stream, io: Io, gpa: std.mem.Allocator, dir: []const u8, prov: 
         return false;
     };
     // Engine convention: the key lives in a curl config file, never on the argv (visible in process lists).
+    // Written below, last of the scratch files.
     const cfg = if (prov.key.len > 0)
         std.fmt.allocPrint(gpa, "header = \"Authorization: Bearer {s}\"\nheader = \"Content-Type: application/json\"\n", .{prov.key}) catch return false
     else
         gpa.dupe(u8, "header = \"Content-Type: application/json\"\n") catch return false;
     defer gpa.free(cfg);
-    Io.Dir.cwd().writeFile(io, .{ .sub_path = cfgpath, .data = cfg }) catch {
-        log.err("chat llm: cannot write curl config", .{});
-        return false;
-    };
 
     const data_at = std.fmt.allocPrint(gpa, "@{s}", .{reqpath}) catch return false;
     defer gpa.free(data_at);
     var tt_buf: [16]u8 = undefined;
     const tt = std.fmt.bufPrint(&tt_buf, "{d}", .{TOTAL_TIMEOUT_S}) catch "900";
     // The stream sink (curl's stdout). createFile(truncate) clears any prior turn's stream (the
-    // stale-replay guard). Created last so no earlier error path leaks the handle.
+    // stale-replay guard). Closed on every return; curl holds its own inherited handle, and we read the file
+    // back independently.
     var sink = Io.Dir.cwd().createFile(io, outpath, .{ .truncate = true }) catch |e| {
         log.err("chat llm: cannot create stream sink: {t}", .{e});
         return false;
     };
+    defer sink.close(io);
+
+    // THE KEY LEAVES WITH THE CALL. The config is written last, right before curl starts, and this delete is
+    // armed before the write: a write that fails halfway, or a curl that never launches, leaves nothing. Once
+    // curl runs, the file is the call's, and reap() deletes it after curl has exited, whichever way the call
+    // ends. curl reads -K once, at startup, so nothing opens the file after that.
+    var launched = false;
+    defer if (!launched) Io.Dir.cwd().deleteFile(io, cfgpath) catch {};
+    Io.Dir.cwd().writeFile(io, .{ .sub_path = cfgpath, .data = cfg }) catch {
+        log.err("chat llm: cannot write curl config", .{});
+        return false;
+    };
     // -w appends STAT_MARK + the HTTP code after the transfer (000 on a failed connect) so poll() can see
     // curl exit; --connect-timeout bounds a black-hole endpoint even when nothing is listening slowly.
-    const argv: []const []const u8 = &.{ "curl", "-sS", "-N", "--connect-timeout", "20", "--max-time", tt, "-K", cfgpath, "--data-binary", data_at, "-w", STAT_MARK ++ "%{http_code}", url };
+    const argv: []const []const u8 = &.{ if (builtin.is_test) test_curl else CURL, "-sS", "-N", "--connect-timeout", "20", "--max-time", tt, "-K", cfgpath, "--data-binary", data_at, "-w", STAT_MARK ++ "%{http_code}", url };
     s.child = std.process.spawn(io, .{
         .argv = argv,
         .stdin = .ignore,
@@ -178,11 +281,12 @@ pub fn start(s: *Stream, io: Io, gpa: std.mem.Allocator, dir: []const u8, prov: 
         .stderr = .ignore,
         .create_no_window = true,
     }) catch |e| {
-        sink.close(io);
         log.err("chat llm: curl spawn failed: {t}", .{e});
         return false;
     };
-    sink.close(io); // curl holds its own inherited handle; we read the file back independently
+    @memcpy(s.cfg_path[0..cfgpath.len], cfgpath);
+    s.cfg_path_len = @intCast(cfgpath.len);
+    launched = true;
     log.info("chat llm: -> {s} model={s} native={} body={d}b key={d}b", .{ url, prov.model, native, body.len, prov.key.len });
     return true;
 }
@@ -354,7 +458,7 @@ fn checkTimeouts(s: *Stream, io: Io, now_s: i64, patient: bool) void {
     const first_allow: i64 = if (patient) FIRST_BYTE_PATIENT_S else FIRST_BYTE_TIMEOUT_S;
     const first_to = !s.saw_any and now_s - s.started_s > first_allow;
     const stall_to = s.saw_any and now_s - s.last_growth_s > STALL_TIMEOUT_S;
-    const total_to = now_s - s.started_s > TOTAL_TIMEOUT_S + 15;
+    const total_to = now_s - s.started_s > TOTAL_TIMEOUT_S + TOTAL_TIMEOUT_SLACK_S;
     if (first_to or stall_to or total_to) {
         log.trace("llm.checkTimeouts firing: first={} stall={} total={} elapsed_s={d}", .{ first_to, stall_to, total_to, now_s - s.started_s });
         abort(s, io);
@@ -618,25 +722,39 @@ pub fn jsonUnescape(gpa: std.mem.Allocator, obj: []const u8, key: []const u8) ?[
 }
 
 /// Kill the curl child (timeout / user abort). Child.kill terminates, reaps and cleans up in one call
-/// (idempotent) — calling wait() after it would assert on the cleared handle.
+/// (idempotent) — calling wait() after it would assert on the cleared handle. The call's curl config goes too.
 pub fn abort(s: *Stream, io: Io) void {
     log.trace("llm.abort has_child={}", .{s.child != null});
-    if (s.child) |*c| {
-        c.kill(io);
-        s.child = null;
-    }
+    reap(s, io);
 }
 
 /// Reap the child after a completion. `done` already means the content is complete, so we KILL rather
 /// than wait(): a blocking wait would hang the whole chat thread (up to the --max-time ceiling) if the
 /// endpoint holds the SSE connection open past its application-level [DONE] sentinel. kill() terminates
 /// AND reaps in one idempotent call, so a normally-exited curl is just reaped and a lingering one is cut.
+/// The call's curl config goes too.
 pub fn finish(s: *Stream, io: Io) void {
     log.trace("llm.finish content_len={d} reasoning_len={d} failed={}", .{ s.content.items.len, s.reasoning.items.len, s.failed });
+    reap(s, io);
+}
+
+/// End the call on disk: kill and reap curl, THEN delete its curl config. Every way a call ends comes here
+/// (finish after [DONE] or an error line, abort from poll's exit sentinel, a timeout, a Stop, desk shutdown,
+/// and start over an unended call). Child.kill blocks until the process is gone, so the delete never races a
+/// curl that is still starting and has not read its config yet. Idempotent.
+fn reap(s: *Stream, io: Io) void {
     if (s.child) |*c| {
         c.kill(io);
         s.child = null;
     }
+    if (s.cfg_path_len == 0) return;
+    const path = s.cfg_path[0..s.cfg_path_len];
+    Io.Dir.cwd().deleteFile(io, path) catch |e| switch (e) {
+        error.FileNotFound => {},
+        // Held open elsewhere (a scanner, a sync client) or denied: the next desk start's sweep takes it.
+        else => log.warn("chat llm: could not delete curl config {s}: {t}", .{ path, e }),
+    };
+    s.cfg_path_len = 0;
 }
 
 fn trimSlash(u: []const u8) []const u8 {
@@ -815,4 +933,405 @@ test "unescape handles quotes, newlines and surrogate pairs" {
     const got = jsonUnescape(gpa, "{\"content\":\"a \\\"q\\\" b\\nc \\ud83d\\ude00\"}", "content").?;
     defer gpa.free(got);
     try std.testing.expectEqualStrings("a \"q\" b\nc \xf0\x9f\x98\x80", got);
+}
+
+// ---- a call's key leaves with it ----
+//
+// The curl config is the one place a desk call puts the API key on disk, and the scratch dirs sit inside the data
+// dir, which is often a synced folder. Builds before 2026-09-17 wrote one `.chatcurlcfg` per dir and never deleted
+// it: a names-only listing of a live data dir found three, a month old. These tests drive the REAL curl child
+// through start/poll/finish/abort against a stand-in on 127.0.0.1, then read back every file the call left.
+
+/// The tests' waits: a plain-thread sleep that never parks on the Io runtime (see nap.zig).
+const nap = @import("nap.zig");
+
+/// Never a real credential; distinctive, so a byte search for it is exact.
+const TEST_KEY = "nlk_desk-chat-scratch-test-key-4b1d-not-a-real-credential";
+const TEST_MSGS = "{\"role\":\"user\",\"content\":\"hi\"}";
+const TEST_SSE = "data: {\"choices\":[{\"delta\":{\"content\":\"streamed\"}}]}\n\ndata: [DONE]\n\n";
+/// A clean streamed answer: "streamed", then [DONE].
+const TEST_ANSWER = std.fmt.comptimePrint("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {d}\r\n\r\n{s}", .{ TEST_SSE.len, TEST_SSE });
+
+/// TEST ONLY. A model endpoint on 127.0.0.1, at a port the OS assigns (a fixed port is shared rather than exclusive
+/// on Windows, and a wildcard listen raises a Windows Firewall prompt). It reads each request whole and keeps the
+/// first. Then it answers `reply` and closes, or, with `hold`, answers nothing and holds the connection open until
+/// stop(): an endpoint still working on the call.
+const Standin = struct {
+    io: Io,
+    server: Io.net.Server,
+    port: u16,
+    reply: []const u8,
+    hold: bool,
+    closing: std.atomic.Value(bool),
+    /// Requests read whole so far. The first is in `req` once this is 1, and nothing writes `req` after that.
+    seen: std.atomic.Value(u32),
+    req: [16 << 10]u8,
+    req_len: usize,
+    thread: std.Thread,
+
+    /// Starts in place: the serve thread holds a pointer to the struct, so it must not be copied.
+    fn start(sv: *Standin, io: Io, reply: []const u8, hold: bool) !void {
+        const addr = Io.net.IpAddress{ .ip4 = .loopback(0) };
+        sv.server = Io.net.IpAddress.listen(&addr, io, .{ .mode = .stream, .protocol = .tcp }) catch return error.SkipZigTest; // no loopback listener on this box
+        sv.io = io;
+        sv.port = sv.server.socket.address.getPort();
+        sv.reply = reply;
+        sv.hold = hold;
+        sv.closing = .init(false);
+        sv.seen = .init(0);
+        sv.req_len = 0;
+        sv.thread = std.Thread.spawn(.{}, serve, .{sv}) catch |e| {
+            sv.server.deinit(io);
+            return e;
+        };
+    }
+
+    fn serve(sv: *Standin) void {
+        while (true) {
+            const conn = sv.server.accept(sv.io) catch return;
+            defer conn.close(sv.io);
+            if (sv.closing.load(.acquire)) return; // stop()'s wake-up dial
+            const first = sv.seen.load(.acquire) == 0;
+            var rbuf: [4 << 10]u8 = undefined;
+            var rd = conn.reader(sv.io, &rbuf);
+            var clen: usize = 0;
+            while (true) {
+                const line = (rd.interface.takeDelimiter('\n') catch break) orelse break;
+                if (first) {
+                    sv.keep(line);
+                    sv.keep("\n");
+                }
+                if (contentLength(line)) |n| clen = n;
+                if (std.mem.trimEnd(u8, line, "\r").len == 0) break;
+            }
+            if (clen > 0) {
+                var body: [8 << 10]u8 = undefined;
+                const n = @min(clen, body.len);
+                if (rd.interface.readSliceAll(body[0..n])) {
+                    if (first) sv.keep(body[0..n]);
+                } else |_| {}
+            }
+            _ = sv.seen.fetchAdd(1, .release);
+            if (sv.hold) {
+                while (!sv.closing.load(.acquire)) nap.ms(5);
+                return;
+            }
+            var wbuf: [8 << 10]u8 = undefined;
+            var wr = conn.writer(sv.io, &wbuf);
+            wr.interface.writeAll(sv.reply) catch {};
+            wr.interface.flush() catch {};
+        }
+    }
+
+    fn keep(sv: *Standin, bytes: []const u8) void {
+        const n = @min(bytes.len, sv.req.len - sv.req_len);
+        @memcpy(sv.req[sv.req_len..][0..n], bytes[0..n]);
+        sv.req_len += n;
+    }
+
+    /// Waits up to ~30 s for `n` requests to arrive whole: a curl that read its config and sent its call.
+    fn awaitSeen(sv: *const Standin, n: u32) !void {
+        var waited: u32 = 0;
+        while (sv.seen.load(.acquire) < n) : (waited += 1) {
+            if (waited >= 3000) return error.StandinNeverCalled;
+            nap.ms(10);
+        }
+    }
+
+    /// The first request, head and body. Complete once awaitSeen(1) has returned.
+    fn request(sv: *const Standin) []const u8 {
+        return sv.req[0..sv.req_len];
+    }
+
+    /// Releases a held connection too. Dials its own port once, so a serve loop parked in accept wakes and exits.
+    fn stop(sv: *Standin) void {
+        sv.closing.store(true, .release);
+        const addr = Io.net.IpAddress{ .ip4 = .loopback(sv.port) };
+        if (Io.net.IpAddress.connect(&addr, sv.io, .{ .mode = .stream })) |c| c.close(sv.io) else |_| {}
+        sv.thread.join();
+        sv.server.deinit(sv.io);
+    }
+
+    /// `Content-Length: N` -> N, in any letter case. Anything else -> null.
+    fn contentLength(line: []const u8) ?usize {
+        const k = "content-length:";
+        if (line.len <= k.len) return null;
+        for (line[0..k.len], k) |a, b| if (std.ascii.toLower(a) != b) return null;
+        return std.fmt.parseInt(usize, std.mem.trim(u8, line[k.len..], " \t\r"), 10) catch null;
+    }
+};
+
+/// Polls a started call to its end as the chat thread does, with the clock held at the call's start. poll takes
+/// the time as a parameter, so no timeout fires: only the endpoint's answer, or curl exiting, ends the call.
+fn pollToEnd(s: *Stream, io: Io, gpa: std.mem.Allocator) !void {
+    var waited: u32 = 0;
+    while (!s.done) : (waited += 1) {
+        if (waited >= 3000) { // ~30 s
+            // A curl that exits before any transfer writes nothing, not even -w's exit sentinel: one that could
+            // not read its -K config exits 26 with an empty stdout (curl 8.17 and 8.21).
+            std.debug.print("\nthe call never ended: no answer and no exit sentinel from curl (saw_any={})\n", .{s.saw_any});
+            return error.CallNeverEnded;
+        }
+        poll(s, io, gpa, s.started_s, false);
+        if (!s.done) nap.ms(10);
+    }
+}
+
+/// Fails if any file in `dir_path` is a curl config or holds `key`. Returns how many files it read.
+fn expectNoKeyOnDisk(gpa: std.mem.Allocator, io: Io, dir_path: []const u8, key: []const u8) !usize {
+    var dir = try Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true });
+    defer dir.close(io);
+    var files: usize = 0;
+    var it = dir.iterate();
+    while (try it.next(io)) |ent| {
+        if (ent.kind != .file) continue;
+        files += 1;
+        if (isKeyCfgName(ent.name)) {
+            std.debug.print("\na curl config outlived its call: {s}/{s}\n", .{ dir_path, ent.name });
+            return error.KeyScratchLeft;
+        }
+        const data = try dir.readFileAlloc(io, ent.name, gpa, .limited(4 << 20));
+        defer gpa.free(data);
+        if (std.mem.indexOf(u8, data, key) != null) {
+            std.debug.print("\nthe API key is still on disk: {s}/{s}\n", .{ dir_path, ent.name });
+            return error.KeyOnDisk;
+        }
+    }
+    return files;
+}
+
+/// How many curl configs sit at the top of `dir_path`.
+fn countKeyCfgs(io: Io, dir_path: []const u8) !usize {
+    var dir = try Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true });
+    defer dir.close(io);
+    var n: usize = 0;
+    var it = dir.iterate();
+    while (try it.next(io)) |ent| {
+        if (isKeyCfgName(ent.name)) n += 1;
+    }
+    return n;
+}
+
+/// Fails unless the stand-in's first request carried the test key: curl read the config before it went.
+fn expectKeySent(sv: *const Standin) !void {
+    if (std.mem.indexOf(u8, sv.request(), "Authorization: Bearer " ++ TEST_KEY) != null) return;
+    std.debug.print("\nthe stand-in never saw the key:\n{s}\n", .{sv.request()});
+    return error.KeyNeverSent;
+}
+
+test "a desk call's key leaves with it: no curl config outlives an answer, an HTTP error, a dead transfer, a Stop or a timeout" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = osEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-desk-llm-keyscratch-tmp";
+    Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = Io.Dir.cwd().createDirPathStatus(io, root, .default_dir) catch {};
+
+    const oops = "{\"error\":{\"message\":\"boom\"}}";
+    const End = enum { answer, http_error, dead, stop, timeout };
+    const Case = struct { end: End, reply: []const u8 = "", hold: bool = false, err: []const u8 = "" };
+    const cases = [_]Case{
+        .{ .end = .answer, .reply = TEST_ANSWER },
+        .{ .end = .http_error, .reply = std.fmt.comptimePrint("HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ oops.len, oops }), .err = "boom" },
+        // read, then closed with nothing said: curl exits 52, and poll sees HTTP 000 and reaps it
+        .{ .end = .dead, .err = "could not reach" },
+        // the endpoint has the call and is still working on it when the user presses Stop...
+        .{ .end = .stop, .hold = true },
+        // ...or when the first-byte ceiling passes (poll takes the clock as a parameter, so nothing waits it out)
+        .{ .end = .timeout, .hold = true, .err = "no response" },
+    };
+    for (cases) |c| {
+        var sv: Standin = undefined;
+        try sv.start(io, c.reply, c.hold);
+        var sv_up = true;
+        defer if (sv_up) sv.stop();
+        var s: Stream = .{};
+        defer s.deinit(gpa);
+        defer abort(&s, io); // an expectation that fails below must not leave curl running
+        var ub: [64]u8 = undefined;
+        const base = try std.fmt.bufPrint(&ub, "http://127.0.0.1:{d}/v1", .{sv.port});
+        try std.testing.expect(start(&s, io, gpa, root, .{ .base_url = base, .key = TEST_KEY, .model = "keyscratch-model" }, TEST_MSGS, 16, Io.Timestamp.now(io, .real).toSeconds()));
+        switch (c.end) {
+            .answer, .http_error, .dead => {
+                try pollToEnd(&s, io, gpa);
+                finish(&s, io);
+            },
+            .stop => {
+                try sv.awaitSeen(1);
+                abort(&s, io);
+            },
+            .timeout => {
+                try sv.awaitSeen(1);
+                poll(&s, io, gpa, s.started_s + FIRST_BYTE_TIMEOUT_S + 1, false);
+                try std.testing.expect(s.done);
+                finish(&s, io);
+            },
+        }
+        try std.testing.expect(s.child == null);
+        if (c.end == .answer) {
+            try std.testing.expect(!s.failed);
+            try std.testing.expectEqualStrings("streamed", s.content.items);
+        } else if (c.err.len > 0) {
+            try std.testing.expect(s.failed);
+            if (std.mem.indexOf(u8, s.errStr(), c.err) == null) {
+                std.debug.print("\n[{t}] expected an error naming \"{s}\", got \"{s}\"\n", .{ c.end, c.err, s.errStr() });
+                return error.WrongEnding;
+            }
+        }
+        sv.stop();
+        sv_up = false;
+        // curl READ the config before it went: the key reached the wire. A delete that ran before curl started
+        // would pass the disk check below and fail every real call.
+        try expectKeySent(&sv);
+        // The request body and the stream sink stay, key-free, and nothing else: the count is also the proof the
+        // scan looked where the call wrote.
+        try std.testing.expectEqual(@as(usize, 2), try expectNoKeyOnDisk(gpa, io, root, TEST_KEY));
+    }
+}
+
+test "a desk call deletes only its own curl config: a sibling call's, written to the same dir, survives it" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = osEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-desk-llm-keyscratch-sibling-tmp";
+    Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = Io.Dir.cwd().createDirPathStatus(io, root, .default_dir) catch {};
+
+    // Another call in this dir has written its config, and its curl has not read it yet: the moment a config under
+    // one shared name would be deleted out from under it.
+    var sib_buf: [KEY_CFG_PATH_CAP]u8 = undefined;
+    const sibling = keyCfgPath(io, root, &sib_buf).?;
+    const sibling_cfg = "header = \"Authorization: Bearer the-sibling-call's-own-key\"\n";
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = sibling, .data = sibling_cfg });
+
+    var sv: Standin = undefined;
+    try sv.start(io, TEST_ANSWER, false);
+    var sv_up = true;
+    defer if (sv_up) sv.stop();
+    var s: Stream = .{};
+    defer s.deinit(gpa);
+    defer abort(&s, io);
+    var ub: [64]u8 = undefined;
+    const base = try std.fmt.bufPrint(&ub, "http://127.0.0.1:{d}/v1", .{sv.port});
+    try std.testing.expect(start(&s, io, gpa, root, .{ .base_url = base, .key = TEST_KEY, .model = "keyscratch-model" }, TEST_MSGS, 16, Io.Timestamp.now(io, .real).toSeconds()));
+    try pollToEnd(&s, io, gpa);
+    finish(&s, io);
+    sv.stop();
+    sv_up = false;
+    try std.testing.expect(!s.failed);
+    try std.testing.expectEqualStrings("streamed", s.content.items);
+    try expectKeySent(&sv);
+
+    // the sibling's config is exactly as its call wrote it...
+    const after = Io.Dir.cwd().readFileAlloc(io, sibling, gpa, .limited(1 << 16)) catch |e| {
+        std.debug.print("\nthe call removed a sibling call's config ({s}): {t}\n", .{ sibling, e });
+        return error.SiblingConfigGone;
+    };
+    defer gpa.free(after);
+    try std.testing.expectEqualStrings(sibling_cfg, after);
+    // ...and it is the only config left: this call's own went with it
+    try std.testing.expectEqual(@as(usize, 1), try countKeyCfgs(io, root));
+}
+
+test "a start over a call still running ends that call first, and the new call streams clean" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = osEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-desk-llm-keyscratch-restart-tmp";
+    Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = Io.Dir.cwd().createDirPathStatus(io, root, .default_dir) catch {};
+
+    var busy: Standin = undefined; // has the first call and is still working on it
+    try busy.start(io, "", true);
+    defer busy.stop();
+    var answering: Standin = undefined;
+    try answering.start(io, TEST_ANSWER, false);
+    defer answering.stop();
+    var s: Stream = .{};
+    defer s.deinit(gpa);
+    defer abort(&s, io);
+
+    const t0 = Io.Timestamp.now(io, .real).toSeconds();
+    var ub1: [64]u8 = undefined;
+    const busy_base = try std.fmt.bufPrint(&ub1, "http://127.0.0.1:{d}/v1", .{busy.port});
+    try std.testing.expect(start(&s, io, gpa, root, .{ .base_url = busy_base, .key = TEST_KEY, .model = "first-call" }, TEST_MSGS, 16, t0));
+    try busy.awaitSeen(1); // the first curl read its config and is waiting on the endpoint
+    try expectKeySent(&busy);
+    var first_buf: [KEY_CFG_PATH_CAP]u8 = undefined;
+    const first_cfg = first_buf[0..s.cfg_path_len];
+    @memcpy(first_cfg, s.cfg_path[0..s.cfg_path_len]);
+
+    // No finish and no abort: the next call starts over the running one.
+    var ub2: [64]u8 = undefined;
+    const answering_base = try std.fmt.bufPrint(&ub2, "http://127.0.0.1:{d}/v1", .{answering.port});
+    try std.testing.expect(start(&s, io, gpa, root, .{ .base_url = answering_base, .key = TEST_KEY, .model = "second-call" }, TEST_MSGS, 16, t0));
+    // The first call is over, config included; the second call's config is the only one on disk.
+    if (Io.Dir.cwd().access(io, first_cfg, .{})) |_| {
+        std.debug.print("\nthe call started over kept its config: {s}\n", .{first_cfg});
+        return error.KeyScratchLeft;
+    } else |_| {}
+    try std.testing.expectEqual(@as(usize, 1), try countKeyCfgs(io, root));
+
+    // The second call streams clean: a first curl still alive would be writing into this same sink.
+    try pollToEnd(&s, io, gpa);
+    finish(&s, io);
+    try std.testing.expect(!s.failed);
+    try std.testing.expectEqualStrings("streamed", s.content.items);
+    try std.testing.expectEqual(@as(usize, 2), try expectNoKeyOnDisk(gpa, io, root, TEST_KEY));
+}
+
+test "a start whose curl never launches leaves no curl config behind" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = osEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-desk-llm-keyscratch-nocurl-tmp";
+    Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = Io.Dir.cwd().createDirPathStatus(io, root, .default_dir) catch {};
+
+    // curl missing from PATH: every attempt writes a config under a fresh name, so each failed launch would leave
+    // one more key behind.
+    test_curl = "nl-veil-test-no-such-curl";
+    defer test_curl = CURL;
+    var s: Stream = .{};
+    defer s.deinit(gpa);
+    try std.testing.expect(!start(&s, io, gpa, root, .{ .base_url = "http://127.0.0.1:9/v1", .key = TEST_KEY, .model = "keyscratch-model" }, TEST_MSGS, 16, 0));
+    try std.testing.expect(s.child == null);
+    try std.testing.expectEqual(@as(u16, 0), s.cfg_path_len);
+    // The request body and the sink are there (the call got as far as launching curl, in this dir), and nothing else.
+    try std.testing.expectEqual(@as(usize, 2), try expectNoKeyOnDisk(gpa, io, root, TEST_KEY));
+}
+
+test "the key sweep knows every config name a desk call writes, and its age floor outlives any call" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // The sweep finds strays by isKeyCfgName alone, so a name keyCfgPath produces that it does not match is a key
+    // no sweep will ever remove.
+    var a_buf: [KEY_CFG_PATH_CAP]u8 = undefined;
+    var b_buf: [KEY_CFG_PATH_CAP]u8 = undefined;
+    const a = keyCfgPath(io, "some/dir", &a_buf).?;
+    const b = keyCfgPath(io, "some/dir", &b_buf).?;
+    try std.testing.expect(isKeyCfgName(std.fs.path.basename(a)));
+    // two calls in one dir never share a config
+    try std.testing.expect(!std.mem.eql(u8, a, b));
+    // the one fixed name earlier builds left in each dir
+    try std.testing.expect(isKeyCfgName(".chatcurlcfg"));
+    // and nothing that carries no key, or only begins like a config
+    for ([_][]const u8{ ".chatreq.json", ".chatstream.sse", ".chatcurlcfgrc", "chatcurlcfg-0123456789abcdef", ".ghcurlcfg", ".curlcfg-chat" }) |n| {
+        try std.testing.expect(!isKeyCfgName(n));
+    }
+    // A dir too long for the path buffer gets no name, so start() refuses the call before writing any key.
+    var small: [16]u8 = undefined;
+    try std.testing.expect(keyCfgPath(io, "a/scratch/dir/longer/than/that", &small) == null);
+    // A config younger than the longest call may belong to one still running.
+    try std.testing.expect(KEY_CFG_STALE_S > TOTAL_TIMEOUT_S + TOTAL_TIMEOUT_SLACK_S);
 }
