@@ -2262,7 +2262,10 @@ fn drawRoster(store: *Store, r: t.Rect) void {
             t.text(t.z("deleting...", .{}), @intFromFloat(rr.x + rr.width - 92), @intFromFloat(rr.y + 26), 11, t.red);
         } else {
             if (hot and t.buttonGhost(xb, t.z("x", .{}), t.red, true)) {
-                markDeleting(sw.idStr());
+                // A refused delete never leaves: its row stays selectable (Stop still reaches the hive), and the
+                // poller's notice says why.
+                var rb: [96]u8 = undefined;
+                if (scan.deleteRoute(sw.idStr(), &rb) != .refused) markDeleting(sw.idStr());
                 store.pushCmd(store_mod.mkCmd(.delete, sw.idStr(), ""));
             }
             const pct = sw.pct;
