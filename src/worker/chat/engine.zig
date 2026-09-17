@@ -2655,12 +2655,15 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     // ---- ToolCtx: byte-for-byte the chat_tools.runMindTool construction (per-uid store, builds/{conv} tree;
     // a SCHEDULED run's tree lives under its task's permanent _sched/{task}/runs/{stamp} dir — see paths.zig) ----
     // (run_root and workdir were computed above, before the transcript append, so a paste could be spilled)
-    // LLM SCRATCH DIR — the CONV dir, never the build root. llm.zig keys its per-call scratch
+    // LLM SCRATCH DIR — the CONV dir, never the build root. llm.zig used to key its per-call scratch
     // (.curlcfg-<tag>, .llmreq-<tag>.json, .stream-<tag>.sse) by (dir, tag), and a SUB-CHAT FAMILY
-    // shares run_root: two concurrent family turns both labeled "chat" would collide on the same
+    // shares run_root: two concurrent family turns both labeled "chat" collided on the same
     // files — observed live (c6a61ff12): s2's stream read s1's half-written .stream-chat.sse tail
     // and committed it as s2's reply, and the overwritten request body broke s1's thinking-mode
-    // reasoning_content echo-back. conv_dir is unique per conversation by construction.
+    // reasoning_content echo-back. conv_dir is unique per conversation by construction. Every
+    // call's scratch is its own now (llm.callPath), but the copies a finished call leaves for a
+    // replay (.llmreq-chat.json, .stream-chat.sse) are still per (dir, tag): this keeps them per
+    // conversation.
     const llm_dir = conv_dir;
     // RESTART RESUME: an empty ledger over a non-empty workdir (client restart, pre-ledger conversation)
     // seeds from a bounded disk survey — a "continue" turn then continues FROM the existing build instead

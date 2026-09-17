@@ -493,6 +493,13 @@ pub const Supervisor = struct {
 
         // Per-mind scratch (`.curlcfg-<mind>`, `.llmreq-<mind>.json`) is dynamically named, so sweep by prefix.
         // Collect names first, THEN delete — mutating a dir mid-iteration is asking for a skipped/aliased entry.
+        //
+        // EXCEPT A REQUEST BODY A CALL WROTE UNDER ITS OWN NAME (llm.isCallBodyName). This dir is not the cast's
+        // alone: the conversation's turns call memverify and rerank in it, and a second cast can run here, so such
+        // a body may belong to a call still running whose curl has not read it yet. That call takes its body along
+        // when it returns, and the startup sweep takes the ones killed processes left. A replay copy
+        // (`.llmreq-<tag>.json`) is no call's, so it goes. Configs all still go, per-call ones too: a stopped
+        // worker's in-flight configs hold its key, and nothing here tells them from a live call's.
         var dir = std.Io.Dir.cwd().openDir(self.io, run_dir, .{ .iterate = true }) catch return;
         defer dir.close(self.io);
         var names: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -504,6 +511,7 @@ pub const Supervisor = struct {
         while (it.next(self.io) catch null) |ent| {
             if (ent.kind != .file) continue;
             if (!std.mem.startsWith(u8, ent.name, ".curlcfg-") and !std.mem.startsWith(u8, ent.name, ".llmreq-")) continue;
+            if (llm.isCallBodyName(ent.name)) continue;
             const dup = self.gpa.dupe(u8, ent.name) catch continue;
             names.append(self.gpa, dup) catch {
                 self.gpa.free(dup);
@@ -662,7 +670,8 @@ pub const Supervisor = struct {
         return pruned;
     }
 
-    /// Remove the curl configs that outlived their calls: files llm.isKeyCfgName names, last written more than
+    /// Remove the call scratch that outlived its calls: curl configs (llm.isKeyCfgName) and the request bodies and
+    /// stream sinks each call writes under its own name (llm.isCallBodyName), last written more than
     /// llm.KEY_CFG_STALE_S ago, in the dirs llm calls write scratch to - each run dir listRunDirs finds and the top of
     /// its work/ tree (pixelrag's vision call writes there), and each conversation dir (the chat engine's). Nothing
     /// below those levels is read. Returns how many it removed.
@@ -673,16 +682,18 @@ pub const Supervisor = struct {
     /// dir only loses its cast bookkeeping (cleanCastMeta). A names-only listing of one live data dir on 2026-09-17
     /// found 111. The age floor is what makes the sweep safe beside live calls (an adopted worker's, another server
     /// process's on the same data dir): a younger config may still be waiting for its curl to read it.
+    /// A call's own body holds no key, and a killed call is the only one that leaves it too. No later call writes
+    /// over it, since each names its own, so the dirs would otherwise keep one body per call a kill cut short.
     pub fn sweepKeyScratch(self: *Supervisor, data_dir: []const u8) usize {
         const now_ns = std.Io.Timestamp.now(self.io, .real).nanoseconds;
         var removed: usize = 0;
         var runs = self.listRunDirs(data_dir);
         defer runs.deinit(self.gpa);
         for (runs.list.items) |run| {
-            removed += self.sweepKeyCfgs(run.path, now_ns);
+            removed += self.sweepScratchIn(run.path, now_ns);
             var pb: [1100]u8 = undefined;
             const work = std.fmt.bufPrint(&pb, "{s}/work", .{run.path}) catch continue;
-            removed += self.sweepKeyCfgs(work, now_ns);
+            removed += self.sweepScratchIn(work, now_ns);
         }
         var root = std.Io.Dir.cwd().openDir(self.io, data_dir, .{ .iterate = true }) catch return removed;
         defer root.close(self.io);
@@ -698,14 +709,14 @@ pub const Supervisor = struct {
                 if (!maybeDir(conv.kind)) continue;
                 var pb: [1100]u8 = undefined;
                 const conv_dir = std.fmt.bufPrint(&pb, "{s}/{s}/{s}", .{ data_dir, convs_rel, conv.name }) catch continue;
-                removed += self.sweepKeyCfgs(conv_dir, now_ns);
+                removed += self.sweepScratchIn(conv_dir, now_ns);
             }
         }
         return removed;
     }
 
     /// sweepKeyScratch for one dir, its top level only.
-    fn sweepKeyCfgs(self: *Supervisor, dir_path: []const u8, now_ns: i96) usize {
+    fn sweepScratchIn(self: *Supervisor, dir_path: []const u8, now_ns: i96) usize {
         var dir = std.Io.Dir.cwd().openDir(self.io, dir_path, .{ .iterate = true }) catch return 0;
         defer dir.close(self.io);
         // Collect names first, THEN delete, as cleanCastMeta does: a dir mutated mid-iteration can skip an entry.
@@ -716,7 +727,7 @@ pub const Supervisor = struct {
         }
         var it = dir.iterate();
         while (it.next(self.io) catch null) |ent| {
-            if (ent.kind != .file or !llm.isKeyCfgName(ent.name)) continue;
+            if (ent.kind != .file or !(llm.isKeyCfgName(ent.name) or llm.isCallBodyName(ent.name))) continue;
             const dup = self.gpa.dupe(u8, ent.name) catch continue;
             names.append(self.gpa, dup) catch {
                 self.gpa.free(dup);
@@ -1797,7 +1808,7 @@ test "retention prunes only the idle run dirs the server spawned, never a work-t
     try std.testing.expectEqual(@as(usize, 0), sup.pruneOldRuns(root, 14)); // nothing idle is left to prune
 }
 
-test "the key sweep removes the curl configs no running call can still need, from every dir a call writes them to, and nothing else" {
+test "the key sweep removes the curl configs and call bodies no running call can still need, from every dir a call writes them to, and nothing else" {
     const gpa = std.testing.allocator;
     // as in the reattach test above: a listing that shelled out again must fail on what it lists
     var threaded = std.Io.Threaded.init(gpa, .{ .environ = @import("../../gateway/http.zig").testEnviron() });
@@ -1826,14 +1837,22 @@ test "the key sweep removes the curl configs no running call can still need, fro
         // younger than the floor, so possibly a running call's whose curl has not read it: one just written, one a minute short
         .{ .dir = conv, .name = ".curlcfg-chat-fedcba9876543210", .age_s = 0, .kept = true },
         .{ .dir = conv, .name = ".streamcfg-chat-0f1e2d3c4b5a6978", .age_s = young, .kept = true },
-        // what carries no key stays, however old: a request body a replay starts from, the transcript
+        // a killed streamed call's own body and sink, past the floor; a running one's body, just written
+        .{ .dir = conv, .name = ".streamreq-chat-0123456789abcdef.json", .kept = false },
+        .{ .dir = conv, .name = ".stream-chat-0123456789abcdef.sse", .kept = false },
+        .{ .dir = conv, .name = ".streamreq-chat-fedcba9876543210.json", .age_s = 0, .kept = true },
+        // what no call owns stays, however old: the copies a replay starts from, the transcript
         .{ .dir = conv, .name = ".llmreq-loop.json", .kept = true },
+        .{ .dir = conv, .name = ".stream-chat.sse", .kept = true },
         .{ .dir = conv, .name = "messages.jsonl", .kept = true },
         // a conversation's build root: the family's memverify, a cast mind's etl, the vision call's work/ scratch
         .{ .dir = cast, .name = ".curlcfg-memverify", .kept = false },
         .{ .dir = cast, .name = ".curlcfg-etl-00112233445566ff", .kept = false },
+        .{ .dir = cast, .name = ".llmreq-etl-00112233445566ff.json", .kept = false },
+        .{ .dir = cast, .name = ".llmreq-memverify-0f1e2d3c4b5a6978.json", .age_s = young, .kept = true },
         .{ .dir = cast, .name = ".llmreq-memverify.json", .kept = true },
         .{ .dir = cast, .name = "work/.curlcfg-vision-aabbccddeeff0011", .kept = false },
+        .{ .dir = cast, .name = "work/.llmreq-vision-aabbccddeeff0011.json", .kept = false },
         .{ .dir = cast, .name = "work/index.html", .kept = true },
         // below the top of work/ is the hive's deliverables, never read, whatever a file there is called
         .{ .dir = cast, .name = "work/site/.curlcfg-notes", .kept = true },
@@ -1873,4 +1892,65 @@ test "the key sweep removes the curl configs no running call can still need, fro
     try std.testing.expectEqual(@as(usize, 0), wrong);
     try std.testing.expectEqual(swept, removed); // the count it reports is the files it took
     try std.testing.expectEqual(@as(usize, 0), sup.sweepKeyScratch(root)); // and a second pass finds nothing
+}
+
+test "retiring a conversation's cast leaves the request bodies of calls still running in its dir, and takes the rest of its scratch" {
+    const gpa = std.testing.allocator;
+    // as in the reattach test above: a listing that shelled out again must fail on what it lists
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = @import("../../gateway/http.zig").testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-supervisor-castscratch-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+
+    var dir_buf: [128]u8 = undefined;
+    var rel_buf: [96]u8 = undefined;
+    const cast = try std.fmt.bufPrint(&dir_buf, root ++ "/{s}", .{cpaths.buildRootRel(&rel_buf, 7, "c6a57f852")});
+
+    // The cast went idle a month ago, while the conversation it belongs to and a second cast in the same dir are
+    // calling models right now. Retention strips the cast through cleanCastMeta, as a stop does.
+    const File = struct { name: []const u8, idle: bool = true, kept: bool };
+    const files = [_]File{
+        // the cast's own bookkeeping goes
+        .{ .name = "events.jsonl", .kept = false },
+        .{ .name = "swarm.json", .kept = false },
+        .{ .name = "minds/planner/notes.md", .kept = false },
+        // scratch no running call reads goes, however new: a finished call's replay copy, a config an older build left
+        .{ .name = ".llmreq-planner.json", .idle = false, .kept = false },
+        .{ .name = ".curlcfg-planner", .kept = false },
+        // bodies of calls running now, under their calls' own names: their curls may not have read them yet
+        .{ .name = ".llmreq-memverify-0123456789abcdef.json", .idle = false, .kept = true },
+        .{ .name = ".llmreq-etl-fedcba9876543210.json", .idle = false, .kept = true },
+        .{ .name = ".llmreq-00112233445566ff.json", .idle = false, .kept = true },
+        // the deliverables
+        .{ .name = "work/index.html", .kept = true },
+    };
+    const now_ns = std.Io.Timestamp.now(io, .real).nanoseconds;
+    for (files) |f| {
+        var pb: [320]u8 = undefined;
+        const path = try std.fmt.bufPrint(&pb, "{s}/{s}", .{ cast, f.name });
+        _ = try std.Io.Dir.cwd().createDirPathStatus(io, std.fs.path.dirname(path).?, .default_dir);
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "{}\n" });
+        // a kept body row must be named the way a call names its own, or keeping it proves nothing
+        if (f.kept and std.mem.startsWith(u8, f.name, ".llmreq")) try std.testing.expect(llm.isCallBodyName(f.name));
+        if (!f.idle) continue;
+        const file = try std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write });
+        defer file.close(io);
+        try file.setTimestamps(io, .{ .modify_timestamp = .{ .new = .fromNanoseconds(now_ns - 30 * std.time.ns_per_day) } });
+    }
+
+    var sup = Supervisor.init(gpa, io, "");
+    defer sup.swarms.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), sup.pruneOldRuns(root, 14));
+    var wrong: usize = 0;
+    for (files) |f| {
+        var pb: [320]u8 = undefined;
+        const path = try std.fmt.bufPrint(&pb, "{s}/{s}", .{ cast, f.name });
+        const kept = if (std.Io.Dir.cwd().access(io, path, .{})) |_| true else |_| false;
+        if (kept == f.kept) continue;
+        std.debug.print("cast scratch {s} {s}\n", .{ if (kept) "left" else "deleted", path });
+        wrong += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 0), wrong);
 }
