@@ -984,7 +984,7 @@ pub const Chat = struct {
         var dbuf: [512]u8 = undefined;
         const dd0 = self.dataDir(&dbuf);
         self.ensureDirs(dd0);
-        self.sweepKeyScratch(dd0); // before any model call starts: a config a call left behind holds an API key
+        self.sweepKeyScratch(dd0); // before any model call or git tool runs: a file a call left behind holds a key
         // HIPPOCAMPUS: find the neuron binary + point at a chat-local sqlite so turns + cast findings persist as
         // recallable neurons (neurondb.zig). Silently disabled (memory ops no-op) if the binary isn't found.
         self.mind_bin = neurondb.findBin(self.gpa, self.io);
@@ -1038,8 +1038,9 @@ pub const Chat = struct {
             if (tick % 300 == 299) self.fetchOllamaModels();
             if (tick % 10 == 9) self.pumpJudge(dd); // ~1Hz: the decoupled learning pass (own stream, never blocks)
             if (!self.curated and tick > 900 and tick % 50 == 21) self.curateOnce(dd); // once, ~90s after startup
-            // ~5 min: a desk killed mid-call and relaunched within llm.KEY_CFG_STALE_S left a config the startup sweep
-            // had to keep (it could have been a live call's). This takes it once it is old enough.
+            // ~5 min: a desk killed mid-call and relaunched within the age floor (llm.KEY_CFG_STALE_S,
+            // gitvc.TOKEN_FILE_STALE_S) left a file the startup sweep had to keep (it could have been a live call's).
+            // This takes it once it is old enough.
             if (tick % 3000 == 1500) self.sweepKeyScratch(dd);
             tick +%= 1;
             // SMOOTHER STREAMING (~30Hz while a reply types out): pump the stream 2 EXTRA times at ~33ms so the text
@@ -1500,10 +1501,29 @@ pub const Chat = struct {
         return removed;
     }
 
-    /// sweepLlmScratch, logged. Runs as the chat thread starts and every ~5 minutes after.
+    /// Remove the GitHub token files the git tools (runGitTool) left in the sidecar, the one dir they write them to. A
+    /// call deletes its own file once its curl or git has exited, so what is left was stranded by a desk killed mid-call,
+    /// or by a build before 2026-09-17. gitvc.TOKEN_FILE_STALE_S keeps the sweep off a file a live call on another desk
+    /// sharing this data dir may still need. Returns how many it removed.
+    fn sweepGitScratch(io: Io, gpa: std.mem.Allocator, dd: []const u8) usize {
+        var sb: [600]u8 = undefined;
+        return gitvc.sweepTokenFiles(io, gpa, sideDir(dd, &sb), Io.Timestamp.now(io, .real).nanoseconds);
+    }
+
+    /// What one key sweep removed.
+    const KeySweep = struct { curl_configs: usize, token_files: usize };
+
+    /// Remove every stranded file a desk call left holding a key: the model calls' curl configs (sweepLlmScratch) and
+    /// the git tools' token files (sweepGitScratch).
+    fn sweepKeys(io: Io, gpa: std.mem.Allocator, dd: []const u8) KeySweep {
+        return .{ .curl_configs = sweepLlmScratch(io, gpa, dd), .token_files = sweepGitScratch(io, gpa, dd) };
+    }
+
+    /// sweepKeys, logged. Runs as the chat thread starts and every ~5 minutes after.
     fn sweepKeyScratch(self: *Chat, dd: []const u8) void {
-        const n = sweepLlmScratch(self.io, self.gpa, dd);
-        if (n > 0) log.info("key scratch: removed {d} stranded curl config(s)", .{n});
+        const swept = sweepKeys(self.io, self.gpa, dd);
+        if (swept.curl_configs > 0) log.info("key scratch: removed {d} stranded curl config(s)", .{swept.curl_configs});
+        if (swept.token_files > 0) log.info("key scratch: removed {d} stranded GitHub token file(s)", .{swept.token_files});
     }
 
     fn setStatus(self: *Chat, s: []const u8) void {
@@ -15134,4 +15154,66 @@ test "the startup key sweep takes stranded curl configs from every dir a desk mo
     try std.testing.expectEqual(@as(usize, 0), wrong);
     try std.testing.expectEqual(swept, removed); // the count it reports is the files it took
     try std.testing.expectEqual(@as(usize, 0), Chat.sweepLlmScratch(io, gpa, dd)); // and a second pass finds none
+}
+
+test "the key sweep takes stranded GitHub token files from the sidecar the git tools write to, beside the model calls' configs" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dd = "zig-chat-tokensweep-tmp";
+    Io.Dir.cwd().deleteTree(io, dd) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dd) catch {};
+
+    var bufs: [2][128]u8 = undefined;
+    const side = Chat.sideDir(dd, &bufs[0]); // the sidecar runGitTool hands repo_create and git_push
+    const judge_dir = Chat.llmScratchDir(dd, .judge, &bufs[1]).?;
+
+    // A minute past each floor, no call can still need the file.
+    const stale: i64 = gitvc.TOKEN_FILE_STALE_S + 60;
+    const File = struct { dir: []const u8, name: []const u8, age_s: i64 = stale, kept: bool };
+    const files = [_]File{
+        // a repo_create's config and a push's credentials, left by a desk killed mid-call
+        .{ .dir = side, .name = ".ghcurlcfg-0123456789abcdef", .kept = false },
+        .{ .dir = side, .name = ".gitcred-fedcba9876543210", .kept = false },
+        // the fixed name builds before 2026-09-17 used
+        .{ .dir = side, .name = ".gitcred", .kept = false },
+        // another desk's push, still running
+        .{ .dir = side, .name = ".gitcred-00112233445566ff", .age_s = 0, .kept = true },
+        // the stored token itself, however old
+        .{ .dir = side, .name = "github_pat.bin", .kept = true },
+        // a model call's config in the same dir goes too, by the model calls' own sweep and floor
+        .{ .dir = side, .name = ".chatcurlcfg-0123456789abcdef", .age_s = llm.KEY_CFG_STALE_S + 60, .kept = false },
+        // the git tools write to the sidecar's top level only
+        .{ .dir = judge_dir, .name = ".gitcred-0123456789abcdef", .kept = true },
+        .{ .dir = side, .name = "chats/.ghcurlcfg-0123456789abcdef", .kept = true },
+    };
+    const now_ns = Io.Timestamp.now(io, .real).nanoseconds;
+    for (files) |f| {
+        var pb: [256]u8 = undefined;
+        const path = try std.fmt.bufPrint(&pb, "{s}/{s}", .{ f.dir, f.name });
+        _ = try Io.Dir.cwd().createDirPathStatus(io, std.fs.path.dirname(path).?, .default_dir);
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "https://u:ghp_x@github.com\n" });
+        if (f.age_s == 0) continue;
+        const file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write });
+        defer file.close(io);
+        try file.setTimestamps(io, .{ .modify_timestamp = .{ .new = .{ .nanoseconds = now_ns - @as(i96, f.age_s) * std.time.ns_per_s } } });
+    }
+
+    const swept = Chat.sweepKeys(io, gpa, dd);
+    var wrong: usize = 0;
+    for (files) |f| {
+        var pb: [256]u8 = undefined;
+        const path = try std.fmt.bufPrint(&pb, "{s}/{s}", .{ f.dir, f.name });
+        const kept = if (Io.Dir.cwd().access(io, path, .{})) |_| true else |_| false;
+        if (kept == f.kept) continue;
+        std.debug.print("key sweep {s} {s}\n", .{ if (kept) "left" else "deleted", path });
+        wrong += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 0), wrong);
+    // the counts it reports are the files it took, each by its own sweep
+    try std.testing.expectEqual(@as(usize, 1), swept.curl_configs);
+    try std.testing.expectEqual(@as(usize, 3), swept.token_files);
+    const again = Chat.sweepKeys(io, gpa, dd);
+    try std.testing.expectEqual(@as(usize, 0), again.curl_configs + again.token_files); // and a second pass finds none
 }
