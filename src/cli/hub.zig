@@ -66,7 +66,8 @@ fn roster(ctx: *Ctx, call: cli.CallFn) u8 {
         defer ctx.gpa.free(state);
         const goal = cli.jsonStr(ctx.gpa, obj, "goal") orelse ctx.gpa.dupe(u8, "") catch continue;
         defer ctx.gpa.free(goal);
-        cli.out("{s: <18}  {s: <9}  {d: <6}  {s}\n", .{ id[0..@min(id.len, 18)], state[0..@min(state.len, 9)], cli.jsonNum(obj, "minds"), goal[0..@min(goal.len, 56)] });
+        // the id in full: `veil stop` / `veil rm` take it verbatim, and a re-adopted run's id can be a long conversation id
+        cli.out("{s: <18}  {s: <9}  {d: <6}  {s}\n", .{ id, state[0..@min(state.len, 9)], cli.jsonNum(obj, "minds"), goal[0..@min(goal.len, 56)] });
         any = true;
     }
     if (!any) cli.out("(the fleet is empty)\n", .{});
