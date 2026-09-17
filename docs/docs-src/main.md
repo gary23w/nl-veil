@@ -51,7 +51,9 @@ If the HTTP thread cannot be spawned at all, it falls back to a blocking `listen
 
 ## Failure behaviour
 
-Not uniform, and deliberately so. Warm-up steps that can degrade — the auth and API-key warms, the desktop key preload, the legacy memory migration, Ollama tuning, the job object — log and carry on. A failure that would leave a half-built server, such as path resolution or `httpz` init, propagates out of `main` as an error. In app mode a listener that cannot bind (usually another `veil` already holding the port) logs loudly and leaves the window open but backendless, because a mysteriously disconnected GUI is a worse outcome than a stated one.
+Not uniform, and deliberately so. Warm-up steps that can degrade — the auth and API-key warms, the desktop key preload, the legacy memory migration, Ollama tuning, the job object — log and carry on. A failure that would leave a half-built server, such as path resolution or `httpz` init, propagates out of `main` as an error. In app mode a listener that cannot bind (usually another `veil` already holding the port) logs loudly and leaves the window open but backendless, because a mysteriously disconnected GUI is a worse outcome than a stated one. With `--server-only` the listen error returns out of `main` and the process exits.
+
+On Windows that failure depends on a local patch in `vendor/httpz`: the listener binds with `SO_EXCLUSIVEADDRUSE` where upstream sets `SO_REUSEADDR`. On Windows `SO_REUSEADDR` let a second `veil` bind the port the first one held, so it came up without an error while the first kept answering. The second bind now fails with `AddressInUse`, or with `AccessDenied` when one server holds `0.0.0.0` and the other asks for `127.0.0.1`. A test at the bottom of `main.zig` checks both halves: a second listen on a held port fails, and a stopped server's port binds again at once.
 
 ## Dependencies
 
