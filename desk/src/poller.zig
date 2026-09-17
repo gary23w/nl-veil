@@ -412,17 +412,26 @@ pub const Poller = struct {
         }
     }
 
-    /// Delete a swarm. `rel` is the path relative to data ("name" or "u1/<hexid>"). Server-managed swarms
-    /// (rel has a '/') go through DELETE /api/v1/swarms/<hexid> so the worker is stopped + removed; a flat
-    /// CLI run is removed by deleting exactly its own dir. Only ever the one dir the user picked — never a
-    /// sweep.
+    /// Delete a swarm. `rel` is the roster id, its run dir relative to data ("name", "u1/<hexid>", a conversation's
+    /// build root). scan.deleteRoute decides how. A server run goes through DELETE /api/v1/swarms/<id>, so the
+    /// worker is stopped and its run removed, with an id the server resolves back to exactly this run dir: a
+    /// scheduled run's conversation, never its stamp, which every task that ran that minute shares. A run no server
+    /// id resolves to is refused with a notice. A flat CLI run is removed by deleting exactly its own dir. Only ever
+    /// the one dir the user picked — never a sweep.
     fn doDelete(self: *Poller, dd: []const u8, rel: []const u8) void {
         log.trace("poller.doDelete rel={s}", .{rel});
         if (rel.len == 0) return;
         self.last_roster_s = 0; // drop the row on the very next roster walk
-        const base = if (std.mem.lastIndexOfScalar(u8, rel, '/')) |sl| rel[sl + 1 ..] else rel;
-        if (std.mem.indexOfScalar(u8, rel, '/') != null) {
+        var ib: [96]u8 = undefined;
+        const route = scan.deleteRoute(rel, &ib);
+        if (route == .refused) {
+            log.info("delete {s} refused: no server id resolves to this run dir", .{rel});
+            self.store.pushNotif("Delete refused", "the server can't address this run - use Stop, or remove its folder by hand", 2);
+            return;
+        }
+        if (route == .server) {
             // server swarm → API delete (stops + removes)
+            const id = route.server;
             var tbuf: [128]u8 = undefined;
             var tlen: usize = 0;
             {
@@ -432,8 +441,8 @@ pub const Poller = struct {
                 @memcpy(tbuf[0..tlen], t[0..tlen]);
                 self.store.unlock();
             }
-            const resp = netcli.delete(self.io, self.gpa, self.port(), tbuf[0..tlen], base);
-            log.info("delete {s} basename={s} status={d} token={d}b", .{ rel, base, if (resp) |r| r.status else 0, tlen });
+            const resp = netcli.delete(self.io, self.gpa, self.port(), tbuf[0..tlen], id);
+            log.info("delete {s} id={s} status={d} token={d}b", .{ rel, id, if (resp) |r| r.status else 0, tlen });
             if (resp) |r| {
                 defer if (r.body.len > 0) self.gpa.free(r.body);
                 if (r.status == 200 or r.status == 204) {
@@ -442,6 +451,10 @@ pub const Poller = struct {
                 }
                 if (r.status == 401 or r.status == 403) {
                     self.store.pushNotif("Delete unauthorized", "set an API token in Settings", 2);
+                    return;
+                }
+                if (r.status == 404) {
+                    self.store.pushNotif("Delete failed", "the server is not tracking this run - use Stop", 2);
                     return;
                 }
             }
@@ -1851,6 +1864,48 @@ test "a steer pasted with a control byte still builds a control body the reader 
     const p2 = try std.json.parseFromSlice(std.json.Value, gpa, jb.items, .{});
     defer p2.deinit();
     try std.testing.expectEqualStrings("a\nb c", p2.value.object.get("text").?.string);
+}
+
+test "a delete no server id can reach is refused with a notice and touches nothing, and a CLI run is removed where it lies" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dd = "zig-delete-route-tmp";
+    Io.Dir.cwd().deleteTree(io, dd) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dd) catch {};
+    // A run outside any account dir, where the server never writes, so no id it resolves reaches it (the id rules are
+    // scan.zig's); and two flat CLI runs, one of them deleted.
+    for ([_][]const u8{ dd ++ "/proj/run1", dd ++ "/cli-run", dd ++ "/cli-run-2" }) |run| {
+        _ = try Io.Dir.cwd().createDirPathStatus(io, run, .default_dir);
+        var eb: [96]u8 = undefined;
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&eb, "{s}/events.jsonl", .{run}), .data = "{\"kind\":\"round\",\"round\":1}\n" });
+    }
+    const s = try gpa.create(Store); // Store is far too big for a test stack frame
+    defer gpa.destroy(s);
+    s.* = .{};
+    s.settings.narrator = false; // a notice also queues speech
+    s.settings.port = 1; // a request that slipped through meets a closed loopback port, never a veil server
+    const p = try gpa.create(Poller);
+    defer gpa.destroy(p);
+    p.* = .{ .io = io, .gpa = gpa, .store = s };
+    defer p.log_buf.deinit(gpa);
+
+    p.doDelete(dd, "proj/run1");
+    p.doDelete(dd, "cli-run");
+    {
+        s.lock();
+        defer s.unlock();
+        try std.testing.expectEqual(@as(usize, 2), s.notif_count);
+        const refused = &s.notifs[s.notif_head % s.notifs.len];
+        try std.testing.expectEqualStrings("Delete refused", refused.titleStr());
+        try std.testing.expect(std.mem.indexOf(u8, refused.bodyStr(), "Stop") != null); // it says what still works
+        try std.testing.expectEqualStrings("Deleted", s.notifs[(s.notif_head + 1) % s.notifs.len].titleStr());
+    }
+    // the refused run is untouched; the CLI run's dir is gone and its neighbour is not
+    _ = try Io.Dir.cwd().statFile(io, dd ++ "/proj/run1/events.jsonl", .{});
+    try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().statFile(io, dd ++ "/cli-run/events.jsonl", .{}));
+    _ = try Io.Dir.cwd().statFile(io, dd ++ "/cli-run-2/events.jsonl", .{});
 }
 
 test "a run whose id is wider than 64 bytes is selected, tailed from its own dir, and announced finished once" {
