@@ -6,6 +6,7 @@ const crypto = @import("../../config/key_vault.zig");
 const dataset = @import("../dataset.zig"); // training-set root, injected so a mind records into the same set
 const NeuronLedger = @import("../../plan/neurons.zig").NeuronLedger;
 const cpaths = @import("../chat/paths.zig"); // conv → build-tree mapping (scheduled runs → _sched/{task}/runs/)
+const llm = @import("../llm.zig"); // the curl key-config names and their age floor, for sweepKeyScratch
 
 const log = std.log.scoped(.supervisor);
 
@@ -659,6 +660,78 @@ pub const Supervisor = struct {
             if (self.rmTree(run.path)) pruned += 1;
         }
         return pruned;
+    }
+
+    /// Remove the curl configs that outlived their calls: files llm.isKeyCfgName names, last written more than
+    /// llm.KEY_CFG_STALE_S ago, in the dirs llm calls write scratch to - each run dir listRunDirs finds and the top of
+    /// its work/ tree (pixelrag's vision call writes there), and each conversation dir (the chat engine's). Nothing
+    /// below those levels is read. Returns how many it removed.
+    ///
+    /// SECURITY: every config holds an `Authorization: Bearer` line. llm.zig now deletes each one when its call ends,
+    /// so only a process killed mid-call leaves one - but earlier builds left one behind for every (dir, tag) that
+    /// ever called out, in dirs nothing wipes: a conversation dir lives as long as the conversation, and a chat build
+    /// dir only loses its cast bookkeeping (cleanCastMeta). A names-only listing of one live data dir on 2026-09-17
+    /// found 111. The age floor is what makes the sweep safe beside live calls (an adopted worker's, another server
+    /// process's on the same data dir): a younger config may still be waiting for its curl to read it.
+    pub fn sweepKeyScratch(self: *Supervisor, data_dir: []const u8) usize {
+        const now_ns = std.Io.Timestamp.now(self.io, .real).nanoseconds;
+        var removed: usize = 0;
+        var runs = self.listRunDirs(data_dir);
+        defer runs.deinit(self.gpa);
+        for (runs.list.items) |run| {
+            removed += self.sweepKeyCfgs(run.path, now_ns);
+            var pb: [1100]u8 = undefined;
+            const work = std.fmt.bufPrint(&pb, "{s}/work", .{run.path}) catch continue;
+            removed += self.sweepKeyCfgs(work, now_ns);
+        }
+        var root = std.Io.Dir.cwd().openDir(self.io, data_dir, .{ .iterate = true }) catch return removed;
+        defer root.close(self.io);
+        var accounts = root.iterate();
+        while (accounts.next(self.io) catch null) |account| {
+            if (!maybeDir(account.kind) or accountUid(account.name) == null) continue;
+            var rb: [320]u8 = undefined;
+            const convs_rel = std.fmt.bufPrint(&rb, "{s}/_chat/convs", .{account.name}) catch continue;
+            var convs = root.openDir(self.io, convs_rel, .{ .iterate = true }) catch continue;
+            defer convs.close(self.io);
+            var it = convs.iterate();
+            while (it.next(self.io) catch null) |conv| {
+                if (!maybeDir(conv.kind)) continue;
+                var pb: [1100]u8 = undefined;
+                const conv_dir = std.fmt.bufPrint(&pb, "{s}/{s}/{s}", .{ data_dir, convs_rel, conv.name }) catch continue;
+                removed += self.sweepKeyCfgs(conv_dir, now_ns);
+            }
+        }
+        return removed;
+    }
+
+    /// sweepKeyScratch for one dir, its top level only.
+    fn sweepKeyCfgs(self: *Supervisor, dir_path: []const u8, now_ns: i96) usize {
+        var dir = std.Io.Dir.cwd().openDir(self.io, dir_path, .{ .iterate = true }) catch return 0;
+        defer dir.close(self.io);
+        // Collect names first, THEN delete, as cleanCastMeta does: a dir mutated mid-iteration can skip an entry.
+        var names: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer {
+            for (names.items) |n| self.gpa.free(n);
+            names.deinit(self.gpa);
+        }
+        var it = dir.iterate();
+        while (it.next(self.io) catch null) |ent| {
+            if (ent.kind != .file or !llm.isKeyCfgName(ent.name)) continue;
+            const dup = self.gpa.dupe(u8, ent.name) catch continue;
+            names.append(self.gpa, dup) catch {
+                self.gpa.free(dup);
+                continue;
+            };
+        }
+        const stale_ns = @as(i96, llm.KEY_CFG_STALE_S) * std.time.ns_per_s;
+        var removed: usize = 0;
+        for (names.items) |n| {
+            const st = dir.statFile(self.io, n, .{}) catch continue;
+            if (now_ns - st.mtime.nanoseconds <= stale_ns) continue;
+            dir.deleteFile(self.io, n) catch continue;
+            removed += 1;
+        }
+        return removed;
     }
 
     fn runDirIsLive(self: *Supervisor, run_dir: []const u8) bool {
@@ -1722,4 +1795,82 @@ test "retention prunes only the idle run dirs the server spawned, never a work-t
     try std.testing.expectEqual(@as(usize, 0), wrong);
     try std.testing.expectEqual(@as(usize, 3), pruned); // the idle deploy, conversation cast and scheduled run
     try std.testing.expectEqual(@as(usize, 0), sup.pruneOldRuns(root, 14)); // nothing idle is left to prune
+}
+
+test "the key sweep removes the curl configs no running call can still need, from every dir a call writes them to, and nothing else" {
+    const gpa = std.testing.allocator;
+    // as in the reattach test above: a listing that shelled out again must fail on what it lists
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = @import("../../gateway/http.zig").testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-supervisor-keysweep-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+
+    var dir_bufs: [2][128]u8 = undefined;
+    var rel_bufs: [2][96]u8 = undefined;
+    const conv = root ++ "/u7/_chat/convs/c6a57f852";
+    const cast = try std.fmt.bufPrint(&dir_bufs[0], root ++ "/{s}", .{cpaths.buildRootRel(&rel_bufs[0], 7, "c6a57f852")});
+    const sched = try std.fmt.bufPrint(&dir_bufs[1], root ++ "/{s}", .{cpaths.buildRootRel(&rel_bufs[1], 7, "scheduled_news-0715174857_07151753")});
+    const deploy = root ++ "/u7/1111111111111111";
+
+    // Ages straddle the floor: a minute past it is a call that cannot still be running; a minute short of it may be.
+    const stale: i64 = llm.KEY_CFG_STALE_S + 60;
+    const young: i64 = llm.KEY_CFG_STALE_S - 60;
+    const File = struct { dir: []const u8, name: []const u8, age_s: i64 = stale, kept: bool };
+    const files = [_]File{
+        // a conversation dir, the chat engine's scratch: the per-tag configs earlier builds left, and a per-call one
+        .{ .dir = conv, .name = ".streamcfg-chat", .kept = false },
+        .{ .dir = conv, .name = ".curlcfg-loop", .kept = false },
+        .{ .dir = conv, .name = ".curlcfg-chat-0123456789abcdef", .kept = false },
+        // younger than the floor, so possibly a running call's whose curl has not read it: one just written, one a minute short
+        .{ .dir = conv, .name = ".curlcfg-chat-fedcba9876543210", .age_s = 0, .kept = true },
+        .{ .dir = conv, .name = ".streamcfg-chat-0f1e2d3c4b5a6978", .age_s = young, .kept = true },
+        // what carries no key stays, however old: a request body a replay starts from, the transcript
+        .{ .dir = conv, .name = ".llmreq-loop.json", .kept = true },
+        .{ .dir = conv, .name = "messages.jsonl", .kept = true },
+        // a conversation's build root: the family's memverify, a cast mind's etl, the vision call's work/ scratch
+        .{ .dir = cast, .name = ".curlcfg-memverify", .kept = false },
+        .{ .dir = cast, .name = ".curlcfg-etl-00112233445566ff", .kept = false },
+        .{ .dir = cast, .name = ".llmreq-memverify.json", .kept = true },
+        .{ .dir = cast, .name = "work/.curlcfg-vision-aabbccddeeff0011", .kept = false },
+        .{ .dir = cast, .name = "work/index.html", .kept = true },
+        // below the top of work/ is the hive's deliverables, never read, whatever a file there is called
+        .{ .dir = cast, .name = "work/site/.curlcfg-notes", .kept = true },
+        // a scheduled run, with an untagged config
+        .{ .dir = sched, .name = ".streamcfg-chat", .kept = false },
+        .{ .dir = sched, .name = ".curlcfg", .kept = false },
+        // a deploy, beside a dotfile that only begins like a config
+        .{ .dir = deploy, .name = ".curlcfg-planner", .kept = false },
+        .{ .dir = deploy, .name = ".curlcfgrc", .kept = true },
+    };
+    const now_ns = std.Io.Timestamp.now(io, .real).nanoseconds;
+    var swept: usize = 0;
+    for (files) |f| {
+        var pb: [320]u8 = undefined;
+        const path = try std.fmt.bufPrint(&pb, "{s}/{s}", .{ f.dir, f.name });
+        _ = try std.Io.Dir.cwd().createDirPathStatus(io, std.fs.path.dirname(path).?, .default_dir);
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "header = \"Authorization: Bearer x\"\n" });
+        if (!f.kept) swept += 1;
+        if (f.age_s == 0) continue;
+        const file = try std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write });
+        defer file.close(io);
+        try file.setTimestamps(io, .{ .modify_timestamp = .{ .new = .fromNanoseconds(now_ns - @as(i96, f.age_s) * std.time.ns_per_s) } });
+    }
+
+    var sup = Supervisor.init(gpa, io, "");
+    defer sup.swarms.deinit(gpa);
+    const removed = sup.sweepKeyScratch(root);
+    var wrong: usize = 0;
+    for (files) |f| {
+        var pb: [320]u8 = undefined;
+        const path = try std.fmt.bufPrint(&pb, "{s}/{s}", .{ f.dir, f.name });
+        const kept = if (std.Io.Dir.cwd().access(io, path, .{})) |_| true else |_| false;
+        if (kept == f.kept) continue;
+        std.debug.print("key sweep {s} {s}\n", .{ if (kept) "left" else "deleted", path });
+        wrong += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 0), wrong);
+    try std.testing.expectEqual(swept, removed); // the count it reports is the files it took
+    try std.testing.expectEqual(@as(usize, 0), sup.sweepKeyScratch(root)); // and a second pass finds nothing
 }
