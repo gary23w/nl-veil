@@ -4844,10 +4844,20 @@ pub const Chat = struct {
     /// Store the GitHub PAT (plaintext-local — this is a local, login-gated app). It goes to the local store the
     /// git tools read AND to a durable "key" memory the veil can recall + use directly (curl / authenticated
     /// remote). Entered via `::pat <token>` or the Settings pane. Never reaches settings.json or a tracked file.
+    /// A token with a byte no GitHub token has is refused: nothing is saved or remembered, and a token already stored
+    /// stays (gitvc.strayTokenByte).
     fn cmdSaveGithubPat(self: *Chat, dd: []const u8, pat: []const u8) void {
         var sb: [600]u8 = undefined;
         const side = sideDir(dd, &sb);
         const tok = std.mem.trim(u8, pat, " \r\n\t");
+        // The git tools would refuse it at every use (it could write curl options or credentials lines of its own), so a
+        // bad paste is caught here, while the user is still at it. The notice names the byte, never the token.
+        if (gitvc.strayTokenByte(tok)) |stray| {
+            var nb: [120]u8 = undefined;
+            const why = std.fmt.bufPrint(&nb, "it has {s} at character {d}; a GitHub token is only letters, digits and _", .{ stray.what, stray.at + 1 }) catch "a GitHub token is only letters, digits and _";
+            self.store.pushNotif("Token NOT saved", why, 2);
+            return;
+        }
         const ok = secrets.savePat(self.io, self.gpa, side, tok);
         // Mirror into memory so the veil can recall + use it directly (not just the git tools). Local app: the
         // token lives plaintext-local on purpose; data/ is git-untracked so it never leaves this machine.
@@ -14499,6 +14509,59 @@ test "findGithubToken locates a token and ignores a bare-prefix mention" {
     { // positional: the EARLIEST token wins across prefixes, so a redact-all loop never skips an earlier one
         const tok = findGithubToken("x ghp_earliest_fake_token_for_the_test y github_pat_later_fake_token_for_tests z").?;
         try std.testing.expect(std.mem.startsWith(u8, tok, "ghp_"));
+    }
+}
+
+test "::pat refuses a token with a byte no GitHub token has: nothing is saved or remembered, the token already stored stays, and the notice names the byte, never the token" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = llm.osEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dd = "zig-patsave-tmp";
+    const side = dd ++ "/.veil-desk";
+    Io.Dir.cwd().deleteTree(io, dd) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dd) catch {};
+    _ = try Io.Dir.cwd().createDirPathStatus(io, side, .default_dir);
+    const store = try gpa.create(Store);
+    defer gpa.destroy(store);
+    store.* = .{};
+    @memcpy(store.settings.data_dir[0..dd.len], dd);
+    store.settings.data_dir_len = dd.len;
+    const chat = try gpa.create(Chat);
+    defer gpa.destroy(chat);
+    chat.* = .{ .io = io, .gpa = gpa, .store = store };
+
+    // A well-formed token, pasted with whitespace around it, is saved and remembered. Fake and underscore-bearing, like
+    // findGithubToken's.
+    const good = "ghp_patsave_test_not_a_real_credential_01";
+    chat.cmdSaveGithubPat(dd, " " ++ good ++ "\r\n");
+    var pb: [256]u8 = undefined;
+    try std.testing.expectEqualStrings(good, pb[0..secrets.loadPat(io, gpa, side, &pb)]);
+    const memories = try Io.Dir.cwd().readFileAlloc(io, side ++ "/memories.jsonl", gpa, .limited(64 << 10));
+    defer gpa.free(memories);
+    try std.testing.expect(std.mem.indexOf(u8, memories, good) != null);
+
+    const Paste = struct { text: []const u8, named: []const u8 };
+    for ([_]Paste{
+        // one that would write a url of its own into repo_create's curl config
+        .{ .text = "ghp_patsave_test_injects\"\nurl = \"http://127.0.0.1:9/x", .named = "a quote at character 25" },
+        // quoted, as copied out of a JSON file or a shell line
+        .{ .text = "\"ghp_patsave_test_quoted\"", .named = "a quote at character 1" },
+        // wrapped across two lines
+        .{ .text = "ghp_patsave_test\r\nwrapped", .named = "a line break at character 17" },
+        // another service's key
+        .{ .text = "sk-patsave-test", .named = "a symbol at character 3" },
+    }, 0..) |paste, i| {
+        chat.cmdSaveGithubPat(dd, paste.text);
+        const notice = &store.notifs[(store.notif_head + store.notif_count - 1) % store.notifs.len];
+        if (!std.mem.eql(u8, notice.titleStr(), "Token NOT saved") or std.mem.indexOf(u8, notice.bodyStr(), paste.named) == null or std.mem.indexOf(u8, notice.bodyStr(), "patsave") != null) {
+            std.debug.print("\npaste {d}: expected \"Token NOT saved\" naming \"{s}\" and none of the token, got \"{s}\": \"{s}\"\n", .{ i, paste.named, notice.titleStr(), notice.bodyStr() });
+            return error.WrongNotice;
+        }
+        try std.testing.expectEqualStrings(good, pb[0..secrets.loadPat(io, gpa, side, &pb)]);
+        const after = try Io.Dir.cwd().readFileAlloc(io, side ++ "/memories.jsonl", gpa, .limited(64 << 10));
+        defer gpa.free(after);
+        try std.testing.expectEqualStrings(memories, after);
     }
 }
 

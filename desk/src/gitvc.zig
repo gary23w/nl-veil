@@ -239,6 +239,46 @@ fn isOwnName(name: []const u8, comptime kind: []const u8) bool {
     return true;
 }
 
+/// A byte no GitHub token has: its index in the token and what kind of byte it is, so a message can name the problem
+/// without echoing the token.
+pub const StrayByte = struct { at: usize, what: []const u8 };
+
+/// The first byte of `pat` that no GitHub token has, or null when there is none. A GitHub token is ASCII letters, digits
+/// and `_`: a `ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_` or `github_pat_` one, or the 40 hex of an older classic one.
+///
+/// The git tools write the token into text a child parses, and before 2026-09-17 nothing held it to that: `::pat` only
+/// trimmed the paste, and loadPat returns whatever github_pat.bin holds, trimmed. In repo_create's curl config the token
+/// is a quoted value. There a `"` ends the value, a `\` starts an escape (curl reads `\r` and `\n` as CR and LF, and
+/// sends a header holding them as is), and a line feed ends the line, so the rest of the token parses as curl options:
+/// a `url` of its own, which curl dials too, with the config's Authorization header, or a `data-binary = "@<path>"`,
+/// which uploads that file (curl 8.21, 8.17 and 8.5). In git_push's credentials file the token sits inside a URL line,
+/// and a line feed starts a credentials line of its own, which git answers the remote with when it is the first line
+/// that holds credentials for that remote (Git for Windows 2.52 and git 2.43). So a git tool refuses such a token before
+/// it writes anything, and `::pat` refuses to save one.
+pub fn strayTokenByte(pat: []const u8) ?StrayByte {
+    for (pat, 0..) |c, i| {
+        if (std.ascii.isAlphanumeric(c) or c == '_') continue;
+        // What the byte is, for the message. A classifier, not an escaper: every control byte is named by its value,
+        // as the range arm below names the rest of them.
+        return .{ .at = i, .what = switch (c) {
+            '"', '\'' => "a quote",
+            '\\' => "a backslash",
+            0x0a, 0x0d => "a line break", // LF, CR
+            ' ' => "a space",
+            0x09 => "a tab",
+            0x00...0x08, 0x0b, 0x0c, 0x0e...0x1f, 0x7f => "a control character", // the rest below 0x20, and DEL
+            0x80...0xff => "a non-ASCII character",
+            else => "a symbol",
+        } };
+    }
+    return null;
+}
+
+/// A git tool's answer to a token with a stray byte: what the byte is and where, never the token.
+fn refuseToken(gpa: std.mem.Allocator, stray: StrayByte) Res {
+    return res(gpa, false, "the stored GitHub token has {s} at character {d}, and a GitHub token is only letters, digits and _ — nothing was sent. Set it again with `::pat <token>`.", .{ stray.what, stray.at + 1 });
+}
+
 /// How long repo_create's curl may run (its --max-time). curl reads its config once, at startup.
 const REPO_CREATE_MAX_TIME_S = 25;
 
@@ -348,7 +388,7 @@ fn restamp(io: Io, path: []const u8) void {
 /// Create a GitHub repo via the REST API using the PAT. The token rides in a curl `-K` CONFIG FILE (auth header),
 /// NEVER on the argv: the call's own (tokenPath), written under `sidecar_dir` right before curl starts and deleted
 /// once curl has exited. Returns the parsed repo info (clone/html url) or an error message. `name` is used verbatim
-/// (caller sanitizes).
+/// (caller sanitizes). A token with a byte no GitHub token has is refused before anything is written (strayTokenByte).
 pub fn repoCreate(gpa: std.mem.Allocator, io: Io, sidecar_dir: []const u8, pat: []const u8, name: []const u8, private: bool) Res {
     // The claim in this message is the one thing here a user cannot check for themselves, so it says
     // what secrets.zig actually does: a plaintext file under the local data dir. What IS guaranteed —
@@ -356,6 +396,7 @@ pub fn repoCreate(gpa: std.mem.Allocator, io: Io, sidecar_dir: []const u8, pat: 
     // those are the properties gitvc genuinely enforces.
     if (pat.len == 0) return res(gpa, false, "no GitHub token configured — set one with `::pat <token>` (or the Settings pane) first. It is kept in a local file readable by your account, never written to the transcript and never sent over the wire.", .{});
     if (name.len == 0) return res(gpa, false, "a repository name is required.", .{});
+    if (strayTokenByte(pat)) |stray| return refuseToken(gpa, stray); // it would write curl options of its own (strayTokenByte)
     const gh = endpoints();
     var cfg_buf: [TOKEN_PATH_CAP]u8 = undefined;
     const cfg_path = tokenPath(io, sidecar_dir, CURL_CFG, &cfg_buf) orelse return res(gpa, false, "path too long", .{});
@@ -417,10 +458,12 @@ fn credentialHelperArg(buf: []u8, path: []const u8) ?[]const u8 {
 /// (`credential.helper=store --file='<path>'`, credentialHelperArg): the call's own (tokenPath), written under the
 /// absolute path of `sidecar_dir` right before git starts, kept young by a Lease while git runs, and deleted once git
 /// has exited — so the token never touches the argv, `.git/config`, or the transcript. Auto-commits nothing; caller
-/// commits first.
+/// commits first. A token with a byte no GitHub token has is refused before the repo or any file is touched
+/// (strayTokenByte).
 pub fn push(gpa: std.mem.Allocator, io: Io, workdir: []const u8, sidecar_dir: []const u8, owner: []const u8, repo: []const u8, user: []const u8, pat: []const u8, branch: []const u8) Res {
     if (!isRepo(io, gpa, workdir)) return res(gpa, false, "nothing to push — commit something first (git_commit).", .{});
     if (pat.len == 0) return res(gpa, false, "no GitHub token configured — set one with `::pat <token>` first.", .{});
+    if (strayTokenByte(pat)) |stray| return refuseToken(gpa, stray); // before the remote or a credentials line is written
     if (owner.len == 0 or repo.len == 0) return res(gpa, false, "no remote yet — run repo_create (or tell me the owner/repo) before pushing.", .{});
     const br = if (branch.len > 0) branch else "main";
     const gh = endpoints();
@@ -526,8 +569,9 @@ test "jsonStr extracts flat string fields and stops at the closing quote" {
 // mid-call left it for good. These tests run the REAL curl and git against a stand-in listening on 127.0.0.1 only, then
 // read back every file each call left in a real temp dir.
 
-/// Never a real credential; distinctive, so a byte search for it is exact.
-const TEST_PAT = "ghp_gitvc-token-scratch-test-not-a-real-credential";
+/// Never a real credential; distinctive, so a byte search for it is exact. Only bytes a GitHub token has, or the git
+/// tools refuse it (strayTokenByte).
+const TEST_PAT = "ghp_gitvc_token_scratch_test_not_a_real_credential";
 const TEST_CREATED_BODY = "{\"full_name\":\"me/scratch\",\"html_url\":\"https://github.com/me/scratch\",\"clone_url\":\"https://github.com/me/scratch.git\"}";
 /// GitHub made the repo.
 const TEST_CREATED = std.fmt.comptimePrint("HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ TEST_CREATED_BODY.len, TEST_CREATED_BODY });
@@ -1052,6 +1096,171 @@ test "git_push authenticates from either desk's data dir: git answers the remote
         // The credentials file left with the call.
         try std.testing.expectEqual(@as(usize, 0), try expectNoTokenOnDisk(gpa, io, side, TEST_PAT, ""));
     }
+    try std.testing.expectEqual(@as(usize, 0), wrong);
+}
+
+// ---- a token with a byte no GitHub token has ----
+//
+// The git tools write the stored token into a curl config and a git credentials file, and a byte GitHub never puts in a
+// token can end a value or a line there (strayTokenByte). These tests give repo_create and git_push such a token, with a
+// stand-in listening on 127.0.0.1 for every place it could reach, and then the same call with a well-formed one, which
+// does run the real curl and git.
+
+test "strayTokenByte passes every shape of GitHub token and names the first byte none has" {
+    // Fake, and none has the exact form GitHub's secret scanning looks for, so a push of this file trips no push
+    // protection (findGithubToken's test in chat.zig does the same).
+    for ([_][]const u8{
+        TEST_PAT,
+        "github_pat_11NOTAREAL0_not_a_real_token_for_tests",
+        "gho_not_a_real_token_0123456789ABCDEF",
+        "ghu_not_a_real_token_0123456789ABCDEF",
+        "ghs_not_a_real_token_0123456789ABCDEF",
+        "ghr_not_a_real_token_0123456789ABCDEF",
+        "0123456789abcdef0123456789abcdef01234567", // a classic token from before 2021
+    }) |tok| try std.testing.expect(strayTokenByte(tok) == null);
+
+    const Stray = struct { tok: []const u8, at: usize, what: []const u8 };
+    for ([_]Stray{
+        // bytes that end a quoted curl config value, a config line or a credentials line
+        .{ .tok = "ghp_abc\"\nurl = \"http://127.0.0.1:9/x", .at = 7, .what = "a quote" },
+        .{ .tok = "ghp_abc\\r\\nX-Injected: 1", .at = 7, .what = "a backslash" },
+        .{ .tok = "ghp_abc\nhttp://u:p@github.com", .at = 7, .what = "a line break" },
+        .{ .tok = "ghp_abc\r", .at = 7, .what = "a line break" },
+        .{ .tok = "ghp_abc\x00def", .at = 7, .what = "a control character" },
+        .{ .tok = "ghp_abc\x1adef", .at = 7, .what = "a control character" },
+        // what a paste brings along
+        .{ .tok = "'ghp_abc'", .at = 0, .what = "a quote" },
+        .{ .tok = "ghp_abc def", .at = 7, .what = "a space" },
+        .{ .tok = "ghp_abc\tdef", .at = 7, .what = "a tab" },
+        .{ .tok = "ghp_abc\x7fdef", .at = 7, .what = "a control character" },
+        .{ .tok = "ghp_abc\xc2\xa0def", .at = 7, .what = "a non-ASCII character" },
+        .{ .tok = "ghp_abc-def@github.com", .at = 7, .what = "a symbol" },
+        .{ .tok = "ghp_abc%0Adef", .at = 7, .what = "a symbol" },
+    }) |s| {
+        const got = strayTokenByte(s.tok) orelse return error.StrayByteMissed;
+        try std.testing.expectEqual(s.at, got.at);
+        try std.testing.expectEqualStrings(s.what, got.what);
+    }
+}
+
+test "repo_create refuses a stored token with a byte no GitHub token has: one that writes its own url into curl's config sends nothing there or to GitHub and leaves no file, and a well-formed token still reaches GitHub" {
+    const gpa = std.testing.allocator;
+    var threaded = testThreaded(gpa);
+    defer threaded.deinit();
+    const io = threaded.io();
+    const side = "zig-gitvc-stray-create-tmp";
+    Io.Dir.cwd().deleteTree(io, side) catch {};
+    defer Io.Dir.cwd().deleteTree(io, side) catch {};
+    _ = try Io.Dir.cwd().createDirPathStatus(io, side, .default_dir);
+    defer test_endpoints = TEST_NOWHERE;
+
+    // GitHub's API, where repo_create aims its call, and another listener on this box, where no call is aimed: it reads
+    // a request and closes.
+    var api: Standin = undefined;
+    try api.start(io, TEST_CREATED, null);
+    var api_up = true;
+    defer if (api_up) api.stop();
+    var elsewhere: Standin = undefined;
+    try elsewhere.start(io, "", null);
+    var elsewhere_up = true;
+    defer if (elsewhere_up) elsewhere.stop();
+    test_endpoints = api.aimed();
+
+    // The token's `"` ends the Authorization header's value, and its line feed ends the line. The rest is a line of its
+    // own, closed by the quote the config puts after the token: `url = "http://127.0.0.1:<elsewhere>/x"`.
+    var bad_buf: [128]u8 = undefined;
+    const bad = try std.fmt.bufPrint(&bad_buf, TEST_PAT ++ "\"\nurl = \"http://127.0.0.1:{d}/x", .{elsewhere.port});
+    const refused = repoCreate(gpa, io, side, bad, "scratch", true);
+    defer refused.deinit(gpa);
+    const refused_to_api = api.seen.load(.acquire);
+    const files_after_refusal = try expectNoTokenOnDisk(gpa, io, side, TEST_PAT, "");
+    // the same call, with a token of only a GitHub token's bytes
+    const created = repoCreate(gpa, io, side, TEST_PAT, "scratch", true);
+    defer created.deinit(gpa);
+    api.stop();
+    api_up = false;
+    elsewhere.stop();
+    elsewhere_up = false;
+
+    var wrong: usize = 0;
+    if (elsewhere.seen.load(.acquire) != 0) {
+        std.debug.print("\ncurl dialed the url the token wrote into its config, and sent it:\n{s}\n", .{elsewhere.request()});
+        wrong += 1;
+    }
+    // a plain refusal that names the byte, right after the token's good characters, and never the token
+    const named = std.fmt.comptimePrint("a quote at character {d}", .{TEST_PAT.len + 1});
+    if (refused.ok or refused_to_api != 0 or files_after_refusal != 0 or std.mem.indexOf(u8, refused.msg, named) == null or std.mem.indexOf(u8, refused.msg, TEST_PAT) != null) {
+        std.debug.print("\nexpected a refusal naming \"{s}\", with no request to GitHub and no file; got ok={} \"{s}\", {d} request(s), {d} file(s)\n", .{ named, refused.ok, refused.msg, refused_to_api, files_after_refusal });
+        wrong += 1;
+    }
+    if (!created.ok or api.seen.load(.acquire) != 1 or std.mem.indexOf(u8, api.request(), "Authorization: token " ++ TEST_PAT ++ "\r\n") == null) {
+        std.debug.print("\nthe well-formed token did not create the repo in one request that carried it: ok={} \"{s}\", {d} request(s), the first:\n{s}\n", .{ created.ok, created.msg, api.seen.load(.acquire), api.request() });
+        wrong += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 0), try expectNoTokenOnDisk(gpa, io, side, TEST_PAT, ""));
+    try std.testing.expectEqual(@as(usize, 0), wrong);
+}
+
+test "git_push refuses a stored token with a byte no GitHub token has before it touches the repo: one that writes its own credentials line never answers the remote, no file or remote is left, and a well-formed token still authenticates" {
+    const gpa = std.testing.allocator;
+    var threaded = testThreaded(gpa);
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-gitvc-stray-push-tmp";
+    const work = root ++ "/work";
+    const side = root ++ "/side";
+    defer Io.Dir.cwd().deleteTree(io, root) catch {};
+    try testRepo(gpa, io, root, work, side);
+    defer test_endpoints = TEST_NOWHERE;
+
+    var remote: Standin = undefined;
+    try remote.startChallenging(io, TEST_FORBIDDEN);
+    var remote_up = true;
+    defer if (remote_up) remote.stop();
+    test_endpoints = remote.aimed();
+
+    // The token's line feed ends the credentials file's line, which then names no user (it has no `@`). The rest is a
+    // line of its own for the same remote, with a password the token chose.
+    const chosen = "a_password_the_token_chose";
+    const chosen_auth = comptime basic: {
+        const pair = "gitvc-test:" ++ chosen;
+        var b64: [std.base64.standard.Encoder.calcSize(pair.len)]u8 = undefined;
+        break :basic "Basic " ++ std.base64.standard.Encoder.encode(&b64, pair);
+    };
+    const refused = push(gpa, io, work, side, "me", "scratch", "gitvc-test", TEST_PAT ++ "\nhttp://gitvc-test:" ++ chosen, "main");
+    defer refused.deinit(gpa);
+    const refused_to_remote = remote.seen.load(.acquire);
+    const files_after_refusal = try expectNoTokenOnDisk(gpa, io, side, TEST_PAT, "");
+    var cfg_buf: [128]u8 = undefined;
+    const config = try Io.Dir.cwd().readFileAlloc(io, try std.fmt.bufPrint(&cfg_buf, "{s}/.git/config", .{work}), gpa, .limited(1 << 16));
+    defer gpa.free(config);
+    const remote_set = std.mem.indexOf(u8, config, "[remote \"origin\"]") != null;
+    // the same push, with a token of only a GitHub token's bytes
+    const pushed = push(gpa, io, work, side, "me", "scratch", "gitvc-test", TEST_PAT, "main");
+    defer pushed.deinit(gpa);
+    remote.stop();
+    remote_up = false;
+
+    var wrong: usize = 0;
+    // The first credentials the remote saw are the well-formed token's. Had git run for the refused push, they would be
+    // the line the token wrote.
+    if (std.mem.eql(u8, remote.authorization(), chosen_auth)) {
+        std.debug.print("\ngit answered the remote with the credentials line the token wrote: {s}\n", .{chosen_auth});
+        wrong += 1;
+    } else if (!std.mem.eql(u8, remote.authorization(), TEST_BASIC_AUTH)) {
+        std.debug.print("\nthe remote's first credentials were not the well-formed token's: \"{s}\"\n", .{remote.authorization()});
+        wrong += 1;
+    }
+    const named = std.fmt.comptimePrint("a line break at character {d}", .{TEST_PAT.len + 1});
+    if (refused.ok or refused_to_remote != 0 or files_after_refusal != 0 or remote_set or std.mem.indexOf(u8, refused.msg, named) == null or std.mem.indexOf(u8, refused.msg, TEST_PAT) != null) {
+        std.debug.print("\nexpected a refusal naming \"{s}\", with no request to the remote, no file and no remote set; got ok={} \"{s}\", {d} request(s), {d} file(s), remote set={}\n", .{ named, refused.ok, refused.msg, refused_to_remote, files_after_refusal, remote_set });
+        wrong += 1;
+    }
+    if (pushed.ok or std.mem.indexOf(u8, pushed.msg, "403") == null) {
+        std.debug.print("\nthe well-formed token's push should end at the remote's 403: ok={} \"{s}\"\n", .{ pushed.ok, pushed.msg });
+        wrong += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 0), try expectNoTokenOnDisk(gpa, io, side, TEST_PAT, ""));
     try std.testing.expectEqual(@as(usize, 0), wrong);
 }
 
