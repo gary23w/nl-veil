@@ -11,6 +11,7 @@ const std = @import("std");
 const Io = std.Io;
 const log = @import("log.zig");
 const httpc = @import("httpc.zig");
+const nap = @import("nap.zig");
 
 pub const Resp = httpc.Resp;
 
@@ -42,13 +43,19 @@ fn httpReq(io: Io, gpa: std.mem.Allocator, method: []const u8, port: u16, path: 
 
     // POST has side effects (deploy/cast); only idempotent GET/DELETE are retried on a transient failure.
     const idempotent = !std.mem.eql(u8, method, "POST");
+    // HEARTBEAT (nap.zig): the poller and chat threads call this, and a slow server can hold each attempt up to
+    // its full ceiling. Declared per attempt, so the UI's silent-worker line waits for a real overrun instead of
+    // calling a thread stuck on every poll that ran into its timeout; the beat on the way out ends the bound.
+    defer nap.beat();
     var attempt: u8 = 0;
     while (attempt < MAX_ATTEMPTS) : (attempt += 1) {
         if (attempt > 0) {
             // Linear backoff (120ms, 240ms): long enough for a starved worker thread to free, short enough
-            // that a healthy call (which never reaches here) is unaffected.
-            io.sleep(.{ .nanoseconds = @as(u64, attempt) * 120 * std.time.ns_per_ms }, .awake) catch {};
+            // that a healthy call (which never reaches here) is unaffected. NOT io.sleep: this runs on the
+            // poller and chat threads, which must never park on the runtime (nap.zig).
+            nap.ms(@as(u64, attempt) * 120);
         }
+        nap.expect(@as(u64, timeout_s) * 1000);
 
         // `Connection: close` (inside httpc): the poller opens a fresh connection every few seconds, so we
         // want the server to CLOSE each one right after replying rather than hold it half-open (keep-alive ->

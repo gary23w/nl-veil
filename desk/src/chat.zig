@@ -1006,8 +1006,10 @@ pub const Chat = struct {
         self.fetchOllamaModels();
 
         var tick: u32 = 0;
+        nap.adopt(&self.store.chat_beat_ms); // this thread's heartbeat from here on; the UI reads it (nap.zig)
+        defer nap.adopt(null);
         while (!self.stop.load(.monotonic)) {
-            self.store.chat_beat_ms.store(nap.nowMs(), .monotonic); // heartbeat: the UI reads this (see nap.zig)
+            nap.beat();
             var db: [512]u8 = undefined;
             const dd = self.dataDir(&db);
             self.drainCommands(dd);
@@ -1044,7 +1046,7 @@ pub const Chat = struct {
                 var extra: u8 = 0;
                 while (extra < 2) : (extra += 1) {
                     nap.ms(33); // NOT io.sleep: see nap.zig for why this thread must not park on the runtime
-                    self.store.chat_beat_ms.store(nap.nowMs(), .monotonic);
+                    nap.beat();
                     self.pumpStream(dd);
                     self.pumpServerChat(dd);
                 }
@@ -1175,7 +1177,8 @@ pub const Chat = struct {
             llm.poll(&s, self.io, self.gpa, self.nowS(), true);
             if (s.done) break;
             if (self.nowS() - start_s > 10) break; // hard 10s wall cap — a slow/unreachable gateway must not wedge the UI
-            self.io.sleep(.{ .nanoseconds = 12 * std.time.ns_per_ms }, .awake) catch {};
+            nap.ms(12); // NOT io.sleep: the chat thread must never park on the runtime (nap.zig)
+            nap.beat(); // up to 10 s in here: still alive, not silent
         }
         llm.finish(&s, self.io);
         defer s.deinit(self.gpa);
@@ -1331,6 +1334,8 @@ pub const Chat = struct {
         const target = httpc.parseLoopbackUrl(root) orelse return;
         var pathbuf: [256]u8 = undefined;
         const path = std.fmt.bufPrint(&pathbuf, "{s}/api/tags", .{target.path}) catch return;
+        nap.expect(5_000); // the probe's own ceiling: a slow Ollama is not a stuck chat thread (nap.zig)
+        defer nap.beat();
         const resp = switch (httpc.request(self.io, self.gpa, .{
             .method = "GET",
             .port = target.port,
@@ -1422,6 +1427,8 @@ pub const Chat = struct {
         const target = httpc.parseLoopbackUrl(root) orelse return 0;
         var pathbuf: [256]u8 = undefined;
         const path = std.fmt.bufPrint(&pathbuf, "{s}/api/ps", .{target.path}) catch return 0;
+        nap.expect(4_000); // the probe's own ceiling (see fetchOllamaModels)
+        defer nap.beat();
         const resp = switch (httpc.request(self.io, self.gpa, .{
             .method = "GET",
             .port = target.port,
@@ -2783,7 +2790,7 @@ pub const Chat = struct {
         // waiter settles on the first matching id line. Bounded: 4 attempts, 250ms apart, on the chat thread.
         var attempt: usize = 0;
         while (attempt < 4) : (attempt += 1) {
-            if (attempt > 0) self.io.sleep(.{ .nanoseconds = 250 * std.time.ns_per_ms }, .awake) catch {};
+            if (attempt > 0) nap.ms(250); // NOT io.sleep: the chat thread must never park on the runtime (nap.zig)
             if (self.runner().chatToolResult(self.io, self.gpa, conv, w.buffered())) |resp| {
                 if (resp.body.len > 0) self.gpa.free(resp.body);
                 if (resp.status == 200 or resp.status == 202) return;

@@ -25,7 +25,8 @@ A hang leaves nothing to read afterwards: no panic, no dump (Windows dumps fault
 ## Dependencies
 
 - std (`std.atomic.Value`, `std.Thread.spawn`, `std.fmt.bufPrint`)
-- std.Io — `Io.Timestamp` on the real clock, `io.sleep`, and `Io.Dir` stat, create and positional write for the hang record
+- std.Io — `Io.Timestamp` on the real clock, and `Io.Dir` stat, create and positional write for the hang record
+- nap.zig — `nap.ms` for the 250 ms sampling sleep
 - builtin — `os.tag` picks the user32 `IsHungAppWindow` extern on Windows and a stub returning 0 elsewhere
 - log.zig — every record is also logged with `log.warn`
 
@@ -40,6 +41,7 @@ A hang leaves nothing to read afterwards: no panic, no dump (Windows dumps fault
 - **Written straight to disk.** Each record goes to `log.warn` and to `writeHangRecord`, which stats the file, opens it without truncating, writes at the current size and closes it on the spot. The first version used only log.zig's ring, which a flusher thread drains later, and a freeze that ended with the process killed left nothing. Write errors are ignored, a path that overflows the 512-byte buffer disables the file record, and the file lines carry no timestamp.
 - **One clock.** `beat` reads `Io.Timestamp.now(.real)` itself rather than taking a time from the caller: `rl.getTime` counts from raylib init, and mixing the two epochs gives a watchdog that never fires or never stops.
 - **Thresholds.** `STALL_MS` 4000 is just under the ~5 s after which Windows calls a window unresponsive, so the line lands first; `REPEAT_MS` 15000 turns a long freeze into a visible progression; `SAMPLE_MS` is 250.
+- **A sampler that cannot park.** The watcher is a plain `std.Thread`, the kind of thread a stray thread alert parked for good inside `io.sleep` on 2026-09-02 (see nap.zig), and a watchdog stuck that way is the one that never reports. It samples through `nap.ms`, a non-alertable wait; until 2026-09-16 it called `io.sleep(...) catch return`, and that `catch` could never fire on a thread with no cancelation to deliver. `stop()` is seen at the next sample.
 - **Reading the phase.** It names the last section the loop entered. `gl_swap` means the driver's buffer swap, not desk code (the header cites a confirmed nvoglv64.dll fault and hybrid AMD + NVIDIA graphics on the machine it was built on); any other phase narrows the stall to one section of desk code.
 - **Tests.** The `stallReport` rules; every `Phase` has a name and `gl_swap`'s mentions the driver; and a real thread on a real clock that must see a stall, fall silent after recovery, and leave `UI FROZEN` and `draw active tab` in `./desk-hang.log`. That test passes a null handle, so the OS-verdict branch has no test.
 

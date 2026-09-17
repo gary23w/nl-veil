@@ -15,6 +15,7 @@ test {
     _ = @import("log.zig");
     _ = @import("main.zig"); // the pure helpers under the drawing: formatters + index wrap
     _ = @import("mdutil.zig");
+    _ = @import("nap.zig"); // the non-alertable sleep, and the heartbeats behind the silent-worker lines
     _ = @import("netcli.zig");
     _ = @import("poller.zig"); // the server-reply parsers: user text can't imitate a field
     _ = @import("roles.zig"); // the prebuilt role catalog: roles.json parses, fits the send buffer, ids unique
@@ -25,4 +26,7 @@ test {
     _ = @import("store.zig");
     _ = @import("theme.zig");
     _ = @import("watchdog.zig"); // the stall-detection timing rules, plus one real-thread, real-clock freeze and recovery
+    // Registered EXPLICITLY although httpc.zig imports it: its tests ran only because that import happened to
+    // be analysed (the assets.zig lesson above). The twin of src/worker/wsock.zig; the loopback socket client.
+    _ = @import("wsock.zig");
 }
