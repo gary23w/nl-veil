@@ -831,9 +831,47 @@ fn callTimeoutS(local: bool, budget_tokens: u32) u32 {
     return @min(TIMEOUT_CEIL_S, @max(floor, derived));
 }
 
+/// How far past its own --max-time streamAttempt's tail loop waits for curl before giving up on it.
+const STREAM_WALL_SLACK_S = 30;
+
+/// The curl config a call's key rides in, by transport: postUrl writes the first, streamAttempt the second.
+const POST_CFG = ".curlcfg";
+const STREAM_CFG = ".streamcfg";
+
+/// A call's own curl config: `{dir}/{kind}-{tag}-{16 hex}`, or `{dir}/{kind}-{16 hex}` untagged.
+///
+/// PER CALL, NOT PER TAG. A tag is not unique among the calls running at once in one dir: every mind of a swarm runs
+/// its `etl` pass under that one tag, scouts share `scoutq` and `screen`, and a sub-chat family's concurrent turns
+/// share `memverify` and `rerank` in their one build root. A config each call deletes when it ends (postUrl,
+/// streamAttempt) must be that call's alone - deleting a shared `.curlcfg-etl` as one call finished could pull it
+/// out from under a sibling whose curl had not read it yet (curl exits 26 and that call fails), and a sibling on
+/// another provider could already read the wrong key out of it. The request body keeps its tag name: it holds no key.
+fn keyCfgPath(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, comptime kind: []const u8, tag: []const u8) ![]u8 {
+    var sfx: [8]u8 = undefined;
+    io.random(&sfx);
+    const hex = std.fmt.bytesToHex(sfx, .lower);
+    return std.fmt.allocPrint(gpa, "{s}/" ++ kind ++ "{s}{s}-{s}", .{ dir, if (tag.len > 0) "-" else "", tag, &hex });
+}
+
+/// Whether a file `name` is a curl config some call wrote: either transport, any tag, per call (keyCfgPath) or per
+/// tag, as builds before 2026-09-17 named them and left them behind.
+pub fn isKeyCfgName(name: []const u8) bool {
+    for ([_][]const u8{ POST_CFG, STREAM_CFG }) |kind| {
+        if (!std.mem.startsWith(u8, name, kind)) continue;
+        if (name.len == kind.len or name[kind.len] == '-') return true;
+    }
+    return false;
+}
+
+/// How long after its last write a curl config counts as stranded (Supervisor.sweepKeyScratch). A config lives as
+/// long as its call, and no call outlives TIMEOUT_CEIL_S plus STREAM_WALL_SLACK_S, so an older one belongs to a
+/// process that died mid-call. A younger one may be a live call's whose curl has not read it yet: a sweep must
+/// never take that one, whichever process made the call.
+pub const KEY_CFG_STALE_S: i64 = 15 * 60;
+
 /// POST a fully-formed request body to {base_url}/chat/completions. Returns the raw response JSON (caller
-/// frees) or an error message (ok=false). The key rides in a curl config file, never on the argv. `tag`
-/// makes the scratch request/config files per-caller so concurrent minds don't clobber each other.
+/// frees) or an error message (ok=false). The key rides in a curl config file, never on the argv, and that file
+/// is the call's own (keyCfgPath) and gone when the call returns. `tag` names the request body's scratch file.
 /// `budget_tokens` is the max_tokens/num_predict THIS body asked for — it sizes the deadline (see callTimeoutS).
 /// 0 means "unknown/tiny" and yields the historical floor.
 fn post(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const u8, base_url: []const u8, key: []const u8, body: []const u8, budget_tokens: u32) Reply {
@@ -873,11 +911,18 @@ fn postUrl(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const
     }
     const reqpath = std.fmt.allocPrint(gpa, "{s}/.llmreq{s}{s}.json", .{ run_dir, if (tag.len > 0) "-" else "", tag }) catch return oom(gpa);
     defer gpa.free(reqpath);
-    const cfgpath = std.fmt.allocPrint(gpa, "{s}/.curlcfg{s}{s}", .{ run_dir, if (tag.len > 0) "-" else "", tag }) catch return oom(gpa);
+    const cfgpath = keyCfgPath(gpa, io, run_dir, POST_CFG, tag) catch return oom(gpa);
     defer gpa.free(cfgpath);
     std.Io.Dir.cwd().writeFile(io, .{ .sub_path = reqpath, .data = body }) catch return err(gpa, "could not write llm request");
     const cfg = std.fmt.allocPrint(gpa, "header = \"Authorization: Bearer {s}\"\nheader = \"Content-Type: application/json\"\n", .{key}) catch return oom(gpa);
     defer gpa.free(cfg);
+    // THE KEY LEAVES WITH THE CALL. curl reads -K once, at startup, and its own --retry reuses what it read,
+    // so nothing opens this file again after the child exits - every retry above this call writes a fresh
+    // one. Armed BEFORE the write, so a half-written config goes too, and it runs on every return below:
+    // success, an HTTP status, a curl that died. The chat engine's scratch dir is the CONVERSATION dir,
+    // which nothing else ever wipes, so a config left here kept the key on disk for the conversation's life.
+    // The request body (.llmreq-<tag>.json) stays: it holds no key, and it is what a replay starts from.
+    defer std.Io.Dir.cwd().deleteFile(io, cfgpath) catch {};
     std.Io.Dir.cwd().writeFile(io, .{ .sub_path = cfgpath, .data = cfg }) catch return err(gpa, "could not write curl config");
 
     const data_at = std.fmt.allocPrint(gpa, "@{s}", .{reqpath}) catch return oom(gpa);
@@ -901,7 +946,10 @@ fn postUrl(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const
     defer gpa.free(run.stderr);
     if (run.term != .exited or run.term.exited != 0) {
         defer gpa.free(run.stdout);
-        return err(gpa, std.fmt.allocPrint(gpa, "curl exit: {s}", .{run.stderr[0..@min(run.stderr.len, 200)]}) catch "curl nonzero exit");
+        // err() keeps its own copy, so the formatted message is freed here rather than orphaned per failed call.
+        const why = std.fmt.allocPrint(gpa, "curl exit: {s}", .{run.stderr[0..@min(run.stderr.len, 200)]}) catch return err(gpa, "curl nonzero exit");
+        defer gpa.free(why);
+        return err(gpa, why);
     }
     // THE STATUS IS PART OF THE ANSWER. Without it a 429 reached the engine as its error body - on Workers AI
     // an envelope with no `choices`, reported as "no choices in LLM response" - and nothing backed off: the
@@ -3257,10 +3305,10 @@ fn streamAttempt(
     };
     defer gpa.free(body);
 
-    // ---- scratch files (per-tag, so concurrent callers don't clobber) ----
+    // ---- scratch files: the request body and sink per tag, the key config per call (keyCfgPath) ----
     const reqpath = std.fmt.allocPrint(gpa, "{s}/.streamreq{s}{s}.json", .{ run_dir, if (tag.len > 0) "-" else "", tag }) catch return null;
     defer gpa.free(reqpath);
-    const cfgpath = std.fmt.allocPrint(gpa, "{s}/.streamcfg{s}{s}", .{ run_dir, if (tag.len > 0) "-" else "", tag }) catch return null;
+    const cfgpath = keyCfgPath(gpa, io, run_dir, STREAM_CFG, tag) catch return null;
     defer gpa.free(cfgpath);
     const outpath = std.fmt.allocPrint(gpa, "{s}/.stream{s}{s}.sse", .{ run_dir, if (tag.len > 0) "-" else "", tag }) catch return null;
     defer gpa.free(outpath);
@@ -3272,6 +3320,11 @@ fn streamAttempt(
     else
         gpa.dupe(u8, "header = \"Content-Type: application/json\"\n") catch return null;
     defer gpa.free(cfg);
+    // Deleted on every exit, as in postUrl. ORDER IS LOAD-BEARING: this defer is declared before the child
+    // is spawned, so it runs AFTER `defer child.kill(io)` below - curl is dead and reaped before its config
+    // goes, never while it may still be starting. The tail loop reads only the .sse sink, and the fallback
+    // to complete() writes a .curlcfg of its own, so nothing needs this file once curl has exited.
+    defer std.Io.Dir.cwd().deleteFile(io, cfgpath) catch {};
     std.Io.Dir.cwd().writeFile(io, .{ .sub_path = cfgpath, .data = cfg }) catch return null;
 
     const data_at = std.fmt.allocPrint(gpa, "@{s}", .{reqpath}) catch return null;
@@ -3356,7 +3409,7 @@ fn streamAttempt(
     var last_fed: u8 = 0; // last body byte handed to feedStream — the left-context for a marker landing at vbuf[0]
     var aborted = false;
     var sentinel = false;
-    const wall: i64 = @as(i64, stream_max_s) + 30;
+    const wall: i64 = @as(i64, stream_max_s) + STREAM_WALL_SLACK_S;
     const t0 = std.Io.Timestamp.now(io, .real).toSeconds();
     while (true) {
         // COOPERATIVE ABORT (chat Stop): kill the in-flight stream promptly instead of waiting out generation. We
@@ -4624,6 +4677,232 @@ test "chat() sends what it claims to: the path, the model, and both message role
     try std.testing.expect(sys < usr);
     try std.testing.expect(std.mem.indexOf(u8, req, "\"role\":\"system\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, req, "\"role\":\"user\"") != null);
+}
+
+// ---------------------------------------------------------------------------
+// A call's key leaves with the call. The curl path is the one place the API key touches disk: a -K config
+// beside the request body. The chat engine's scratch dir is the conversation dir, which nothing wipes, so a
+// config that outlived its call kept the key for the conversation's whole life (a names-only listing of a live
+// data dir on 2026-09-17 found 111 of them). These drive the REAL curl child against a loopback stand-in and
+// then read back every file the call left.
+// ---------------------------------------------------------------------------
+
+/// Never a real credential; distinctive, so a byte search for it is exact.
+const SCRATCH_TEST_KEY = "nlk_scratch-test-key-7c1e-not-a-real-credential";
+
+/// Fails if any file in `dir_path` is a curl config or holds a byte of `key`. Returns how many files it read.
+fn expectNoKeyOnDisk(gpa: std.mem.Allocator, io: std.Io, dir_path: []const u8, key: []const u8) !usize {
+    var dir = try std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true });
+    defer dir.close(io);
+    var files: usize = 0;
+    var it = dir.iterate();
+    while (try it.next(io)) |ent| {
+        if (ent.kind != .file) continue;
+        files += 1;
+        if (std.mem.startsWith(u8, ent.name, ".curlcfg") or std.mem.startsWith(u8, ent.name, ".streamcfg")) {
+            std.debug.print("\na curl config outlived its call: {s}/{s}\n", .{ dir_path, ent.name });
+            return error.KeyScratchLeft;
+        }
+        const data = try dir.readFileAlloc(io, ent.name, gpa, .limited(4 << 20));
+        defer gpa.free(data);
+        if (std.mem.indexOf(u8, data, key) != null) {
+            std.debug.print("\nthe API key is still on disk: {s}/{s}\n", .{ dir_path, ent.name });
+            return error.KeyOnDisk;
+        }
+    }
+    return files;
+}
+
+test "a hosted call's key leaves with it: no curl config survives an answer, an HTTP error, or a dead transfer" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = if (builtin.os.tag == .windows) .{ .block = .global } else .{ .block = .{ .slice = std.mem.span(std.c.environ) } } });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const root = "zig-llm-keyscratch-post-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, root, .default_dir) catch {};
+
+    const body = "{\"model\":\"keyscratch-model\",\"messages\":[]}";
+    const Case = struct { tag: []const u8, reply: []const u8, ok: bool, status: u16 };
+    const cases = [_]Case{
+        .{ .tag = "answer", .reply = fakehttp.wire("{\"choices\":[{\"message\":{\"content\":\"ok\"}}]}"), .ok = true, .status = 200 },
+        .{ .tag = "status", .reply = std.fmt.comptimePrint("HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ "{\"error\":\"boom\"}".len, "{\"error\":\"boom\"}" }), .ok = false, .status = 500 },
+        // accepted, read, closed with no reply: curl exits nonzero (52) - the exit that never parses a status
+        .{ .tag = "dead", .reply = "", .ok = false, .status = 0 },
+    };
+    for (cases) |c| {
+        var srv: fakehttp.Server = undefined;
+        try srv.start(io, c.reply);
+        var ub: [96]u8 = undefined;
+        // 127.1 IS 127.0.0.1 to curl, but not to httpc.parseLoopbackUrl - so the call takes the curl path a hosted
+        // provider takes (the only path that writes a config), against a stand-in listening on loopback alone.
+        // local=false builds the hosted argv, curl's own --retry included.
+        const url = try std.fmt.bufPrint(&ub, "http://127.1:{d}/v1/chat/completions", .{srv.port});
+        const r = postUrl(gpa, io, root, c.tag, url, SCRATCH_TEST_KEY, body, false, 16);
+        defer gpa.free(r.content);
+        srv.stop(); // joins the serve thread; request() is only safe after it
+
+        try std.testing.expectEqual(c.ok, r.ok);
+        try std.testing.expectEqual(c.status, r.status);
+        // curl READ the config before it went: the key reached the wire. A delete that ran before curl started
+        // would pass the disk check below and fail every real call.
+        if (std.mem.indexOf(u8, srv.request(), "Authorization: Bearer " ++ SCRATCH_TEST_KEY) == null) {
+            std.debug.print("\n[{s}] the stand-in never saw the key: {s}\n", .{ c.tag, srv.request() });
+            return error.KeyNeverSent;
+        }
+        _ = try expectNoKeyOnDisk(gpa, io, root, SCRATCH_TEST_KEY);
+        // ...while the request body stays, key-free: it is what a replay starts from. Reading it back is also the
+        // proof the scan above looked at the dir this call wrote to.
+        var pb: [128]u8 = undefined;
+        const kept = try std.Io.Dir.cwd().readFileAlloc(io, try std.fmt.bufPrint(&pb, "{s}/.llmreq-{s}.json", .{ root, c.tag }), gpa, .limited(1 << 16));
+        defer gpa.free(kept);
+        try std.testing.expectEqualStrings(body, kept);
+    }
+}
+
+test "a streamed call's key leaves with it: a clean stream, a failed one that falls back, and a Stop" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = if (builtin.os.tag == .windows) .{ .block = .global } else .{ .block = .{ .slice = std.mem.span(std.c.environ) } } });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const root = "zig-llm-keyscratch-stream-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, root, .default_dir) catch {};
+
+    const Probe = struct {
+        stop: bool,
+        fn onDelta(ctx: *anyopaque, kind: DeltaKind, text: []const u8) void {
+            _ = ctx;
+            _ = kind;
+            _ = text;
+        }
+        fn shouldAbort(ctx: *anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.stop;
+        }
+    };
+    const answer = fakehttp.wire("{\"choices\":[{\"message\":{\"content\":\"fell back\"}}]}");
+    const Case = struct { tag: []const u8, stream: []const u8, stop: bool, content: []const u8, conns: u32 };
+    const cases = [_]Case{
+        .{ .tag = "clean", .stream = fakehttp.wire("data: {\"choices\":[{\"delta\":{\"content\":\"streamed\"}}]}\n\ndata: [DONE]\n\n"), .stop = false, .content = "streamed", .conns = 1 },
+        // an error line fails the stream, and complete() - the fallback - answers from the stand-in's second reply
+        .{ .tag = "fallback", .stream = fakehttp.wire("data: {\"error\":{\"message\":\"boom\"}}\n\n"), .stop = false, .content = "fell back", .conns = 2 },
+        // a chat Stop before a byte arrives: curl is killed mid-start, the partial (empty) reply comes back
+        .{ .tag = "stop", .stream = fakehttp.wire("data: [DONE]\n\n"), .stop = true, .content = "", .conns = 0 },
+    };
+    for (cases) |c| {
+        var srv: fakehttp.Server = undefined;
+        const routes = [_]fakehttp.Route{.{ .method = "POST", .path = "/chat/completions", .reply = c.stream, .times = 1 }};
+        try srv.startRouted(io, &routes, answer);
+        var ub: [64]u8 = undefined;
+        // Loopback on purpose: the streamed path has no in-process fast path, so this is the curl child and its
+        // .streamcfg exactly as a hosted stream runs them - without the offline probe a hosted base would make.
+        const base = try std.fmt.bufPrint(&ub, "http://127.0.0.1:{d}/v1", .{srv.port});
+        var probe = Probe{ .stop = c.stop };
+        var step = completeStream(gpa, io, root, c.tag, base, SCRATCH_TEST_KEY, "keyscratch-model", "{\"role\":\"user\",\"content\":\"hi\"}", "", 16, -1, &probe, Probe.onDelta, Probe.shouldAbort);
+        defer step.deinit(gpa);
+        srv.stop();
+
+        try std.testing.expect(step.ok);
+        try std.testing.expectEqualStrings(c.content, step.content);
+        if (!c.stop) {
+            try std.testing.expectEqual(c.conns, srv.conns.load(.monotonic));
+            if (std.mem.indexOf(u8, srv.request(), "Authorization: Bearer " ++ SCRATCH_TEST_KEY) == null) {
+                std.debug.print("\n[{s}] the stand-in never saw the key: {s}\n", .{ c.tag, srv.request() });
+                return error.KeyNeverSent;
+            }
+        }
+        _ = try expectNoKeyOnDisk(gpa, io, root, SCRATCH_TEST_KEY);
+        var pb: [128]u8 = undefined;
+        const kept = try std.Io.Dir.cwd().statFile(io, try std.fmt.bufPrint(&pb, "{s}/.streamreq-{s}.json", .{ root, c.tag }), .{});
+        try std.testing.expect(kept.size > 0);
+    }
+}
+
+test "a call deletes only its own curl config: a sibling's, written for the same dir and tag, survives it" {
+    // Two calls with one dir and one tag DO run at once: every mind of a swarm runs its `etl` pass under that tag,
+    // and a sub-chat family's concurrent turns share `memverify` and `rerank` in their build root. The sibling here
+    // has written its config the way any call names one and its curl has not read it yet - the moment a shared,
+    // per-tag config would be deleted out from under it.
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = if (builtin.os.tag == .windows) .{ .block = .global } else .{ .block = .{ .slice = std.mem.span(std.c.environ) } } });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const root = "zig-llm-keyscratch-sibling-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, root, .default_dir) catch {};
+
+    const sibling = try keyCfgPath(gpa, io, root, POST_CFG, "etl");
+    defer gpa.free(sibling);
+    const sibling_cfg = "header = \"Authorization: Bearer the-sibling-call's-own-key\"\n";
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = sibling, .data = sibling_cfg });
+
+    var srv: fakehttp.Server = undefined;
+    try srv.start(io, fakehttp.wire("{\"choices\":[{\"message\":{\"content\":\"ok\"}}]}"));
+    var ub: [96]u8 = undefined;
+    const url = try std.fmt.bufPrint(&ub, "http://127.1:{d}/v1/chat/completions", .{srv.port}); // the curl path (see above)
+    const r = postUrl(gpa, io, root, "etl", url, SCRATCH_TEST_KEY, "{\"model\":\"m\"}", false, 16);
+    defer gpa.free(r.content);
+    srv.stop();
+    try std.testing.expect(r.ok);
+    try std.testing.expect(std.mem.indexOf(u8, srv.request(), "Authorization: Bearer " ++ SCRATCH_TEST_KEY) != null);
+
+    // the sibling's config is exactly as its call wrote it...
+    const after = std.Io.Dir.cwd().readFileAlloc(io, sibling, gpa, .limited(1 << 16)) catch |e| {
+        std.debug.print("\nthe call removed a sibling call's config ({s}): {t}\n", .{ sibling, e });
+        return error.SiblingConfigGone;
+    };
+    defer gpa.free(after);
+    try std.testing.expectEqualStrings(sibling_cfg, after);
+    // ...and it is the only config left: this call's own went with it
+    var dir = try std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true });
+    defer dir.close(io);
+    var configs: usize = 0;
+    var it = dir.iterate();
+    while (try it.next(io)) |ent| {
+        if (ent.kind == .file and isKeyCfgName(ent.name)) configs += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), configs);
+}
+
+test "the stranded-config sweep knows every config a call writes, and its age floor outlives any call" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Supervisor.sweepKeyScratch finds strays by isKeyCfgName alone, so a config name keyCfgPath can produce that it
+    // does not match is a key no sweep will ever remove.
+    inline for (.{ POST_CFG, STREAM_CFG }) |kind| {
+        for ([_][]const u8{ "chat", "etl", "" }) |tag| {
+            const p = try keyCfgPath(gpa, io, "some/dir", kind, tag);
+            defer gpa.free(p);
+            if (!isKeyCfgName(std.fs.path.basename(p))) {
+                std.debug.print("\nthe sweep would never remove {s}\n", .{p});
+                return error.ConfigNameUnswept;
+            }
+        }
+    }
+    // the per-tag names the builds before this one left on disk
+    for ([_][]const u8{ ".curlcfg", ".curlcfg-memverify", ".streamcfg-chat" }) |n| try std.testing.expect(isKeyCfgName(n));
+    // and none of the scratch that carries no key: the request bodies a replay starts from, the stream sink
+    for ([_][]const u8{ ".llmreq-chat.json", ".streamreq-chat.json", ".stream-chat.sse", ".curlcfgrc", "curlcfg-chat" }) |n| try std.testing.expect(!isKeyCfgName(n));
+
+    // two calls with one dir and tag never share a config
+    const a = try keyCfgPath(gpa, io, "d", POST_CFG, "etl");
+    defer gpa.free(a);
+    const b = try keyCfgPath(gpa, io, "d", POST_CFG, "etl");
+    defer gpa.free(b);
+    try std.testing.expect(!std.mem.eql(u8, a, b));
+
+    // A config younger than the longest call may belong to a call still running: curl's cap, then the stream tail's slack.
+    try std.testing.expect(KEY_CFG_STALE_S > TIMEOUT_CEIL_S + STREAM_WALL_SLACK_S);
 }
 
 test "every exit from streamAttempt accounts for what the provider billed" {

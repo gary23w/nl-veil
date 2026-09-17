@@ -563,6 +563,11 @@ pub fn main(init: std.process.Init) !void {
         const swept = sup.pruneOldRuns(paths.data, retention_days);
         if (swept > 0) log.info("retention: pruned {d} stale run dir(s) at startup (>= {d}d inactive)", .{ swept, retention_days });
     }
+    // A curl config left by a call its process never finished holds that call's API key. Each call deletes its own
+    // now; this takes the ones a killed process left, and those earlier builds left in every conversation. Whatever
+    // NL_RETENTION_DAYS says: retention keeps conversations, and a key is not a deliverable.
+    const stale_cfgs = sup.sweepKeyScratch(paths.data);
+    if (stale_cfgs > 0) log.info("key scratch: removed {d} stranded curl config(s) at startup", .{stale_cfgs});
     // Swarm reconcile + retention GC run on a BACKGROUND thread, never on an httpz request thread — reconcile
     // can spawn a worker subprocess (respawn) which, inline in a /fleet or list handler, starves the pool and
     // wedges the server. Handlers now only read the in-memory roster.
