@@ -3305,6 +3305,41 @@ pub fn completeStream(
     return complete(gpa, io, run_dir, tag, base_url, key, model, messages_json, tools_json, max_tokens, temperature);
 }
 
+const winproc = if (builtin.os.tag == .windows) struct {
+    const STILL_ACTIVE: u32 = 259;
+    extern "kernel32" fn GetExitCodeProcess(h: std.os.windows.HANDLE, code: *u32) callconv(.winapi) c_int;
+} else struct {};
+
+/// Whether a streamed call's curl has exited, asked without blocking: std.process has no non-blocking wait. `code`
+/// gets curl's exit code when the OS reports one. The server twin of desk/src/chat.zig procExited.
+///
+/// Windows reads the exit code off the process handle and leaves the handle to Child.kill, which reaps an exited
+/// child as it always has. A failed read counts as still running, so the tail loop waits for the end marker as it
+/// did before rather than cut a live reply short. POSIX can only tell by reaping (waitpid WNOHANG), and then clears
+/// the Child the way Child.wait does, so the call's deferred Child.kill returns at once. Left set, kill() would
+/// signal a pid that is no longer a child: ESRCH, which std counts as a programmer bug and panics on in Debug.
+fn curlExited(io: std.Io, child: *std.process.Child, code: *?u32) bool {
+    const id = child.id orelse return true;
+    if (builtin.os.tag == .windows) {
+        var c: u32 = 0;
+        if (winproc.GetExitCodeProcess(id, &c) == 0 or c == winproc.STILL_ACTIVE) return false;
+        code.* = c;
+        return true;
+    } else {
+        var status: c_int = 0;
+        const r = std.c.waitpid(id, &status, std.c.W.NOHANG);
+        if (r == 0) return false; // still running
+        if (r < 0 and std.posix.errno(r) != .CHILD) return false; // interrupted: ask again next lap
+        if (r > 0 and std.posix.W.IFEXITED(@bitCast(status))) code.* = std.posix.W.EXITSTATUS(@bitCast(status));
+        for ([_]*?std.Io.File{ &child.stdin, &child.stdout, &child.stderr }) |pipe| {
+            if (pipe.*) |f| f.close(io);
+            pipe.* = null;
+        }
+        child.id = null;
+        return true;
+    }
+}
+
 /// The streaming body. Returns a Step on a clean stream, or null to signal "fall back to complete()".
 fn streamAttempt(
     gpa: std.mem.Allocator,
@@ -3479,7 +3514,7 @@ fn streamAttempt(
     var st = StreamState{ .native = native, .ctx = ctx, .on_delta = on_delta };
     defer st.deinit(gpa);
 
-    // ---- tail the sink until curl exits (STAT sentinel) or the stream self-completes ----
+    // ---- tail the sink until curl's end marker (STAT sentinel), curl's exit, or the stream self-completes ----
     // POSITIONAL read from a byte cursor — NOT a whole-file re-read every poll. curl only ever APPENDS to the
     // .sse scratch, so a growing `offset` stays valid; each poll reads just the new bytes into a reused buffer
     // and feeds them to feedStream (which keeps its own partial-line carry). This is O(total_bytes), not the old
@@ -3488,6 +3523,13 @@ fn streamAttempt(
     // a silently truncated partial. curl -w appends "\n__VEILSTAT__<http_code>"; we scan for the core MARK
     // "__VEILSTAT__" (never present in SSE/NDJSON data) so a body-terminating '\n' feeds with zero delay, and
     // hold back only a trailing suffix that is a strict prefix of MARK (a sentinel straddling a read boundary).
+    //
+    // CURL'S EXIT ENDS THE TAIL TOO, marker or not. Every transfer curl runs ends in that marker, a failed one
+    // included (a refused or timed-out connect leaves "\n__VEILSTAT__000"), but a curl that fails before its transfer
+    // writes nothing at all: a request body or -K config it cannot open exits 26 with an empty stdout (curl 8.5, 8.17
+    // and 8.21, measured 2026-09-17). Waiting on the marker alone held such a call silent for the whole wall, 270 s on
+    // a local base, before complete() ran. So each lap asks curlExited BEFORE it reads: once curl is gone, that read
+    // sees every byte curl wrote, and a lap that drains the sink without finding the marker ends the loop.
     //
     // THE POLL SLEEPS ON THE OS (bu.sleepMs), NEVER io.sleep. It runs on the chat turn's own thread (engine.zig
     // spawnTurn, a plain std.Thread), every 20 ms for the whole reply. On Windows io.sleep parks the thread on the
@@ -3506,6 +3548,7 @@ fn streamAttempt(
     var last_fed: u8 = 0; // last body byte handed to feedStream — the left-context for a marker landing at vbuf[0]
     var aborted = false;
     var sentinel = false;
+    var curl_code: ?u32 = null; // curl's exit code, once a lap has seen it go
     const wall: i64 = @as(i64, stream_max_s) + STREAM_WALL_SLACK_S;
     const t0 = std.Io.Timestamp.now(io, .real).toSeconds();
     while (true) {
@@ -3522,12 +3565,16 @@ fn streamAttempt(
             aborted = true;
             break;
         }
+        // Asked before this lap's read, never after it (CURL'S EXIT above): a curl gone by now wrote all it ever will.
+        const curl_gone = curlExited(io, &child, &curl_code);
         var f = std.Io.Dir.cwd().openFile(io, outpath, .{}) catch {
             // file not created yet — curl still connecting (or it died before writing)
+            if (curl_gone) break;
             if (std.Io.Timestamp.now(io, .real).toSeconds() - t0 > wall) break;
             bu.sleepMs(20); // 20ms: pick up new stream bytes fast for the desk's ~30Hz poll
             continue;
         };
+        var drained = false; // this lap's read reached the end of the sink
         {
             defer f.close(io);
             // Read ACTUAL bytes from the cursor — do NOT gate on f.length(): on Windows a freshly-opened read
@@ -3541,6 +3588,7 @@ fn streamAttempt(
                 vbuf.appendSlice(gpa, rbuf[0..n]) catch {};
                 offset += n;
             }
+            drained = n < rbuf.len;
         }
         // resolve vbuf (== last poll's carry ++ this poll's new bytes): feed body up to curl's end-marker, hold
         // back a straddled marker prefix. curl's real marker is ALWAYS newline-anchored ("\n__VEILSTAT__<code>")
@@ -3580,6 +3628,11 @@ fn streamAttempt(
                 const line = std.mem.trimEnd(u8, st.carry.items, "\r\n");
                 if (line.len > 0) handleStreamLine(&st, gpa, line);
             }
+            break;
+        }
+        if (curl_gone and drained) {
+            // No marker, and none is coming: curl never ran its transfer, or something killed it mid-reply.
+            std.log.scoped(.llm).warn("stream: curl exited without its end marker (exit {?d}, {d} bytes streamed)", .{ curl_code, offset });
             break;
         }
         if (std.Io.Timestamp.now(io, .real).toSeconds() - t0 > wall) break;
@@ -5297,6 +5350,91 @@ test "streamed calls running at once under one dir and tag each send their own b
     }
     try std.testing.expectEqual(@as(usize, 1), bodies_in);
     try std.testing.expectEqual(@as(usize, 1), replies_in);
+}
+
+test "a streamed call whose curl exits before its transfer falls back at once, not at the stream's wall" {
+    // A curl that fails at startup writes nothing to its stdout, not even the -w end marker every transfer leaves,
+    // failed ones included. The tail loop left only on that marker, a finished stream, a Stop, a reasoning runaway
+    // or its wall, so such a call sat silent for --max-time plus STREAM_WALL_SLACK_S before complete() ran.
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = if (builtin.os.tag == .windows) .{ .block = .global } else .{ .block = .{ .slice = std.mem.span(std.c.environ) } } });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const root = "zig-llm-deadcurl-stream-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, root, .default_dir) catch {};
+
+    // At the seam the call has written its request body and its sink, and its curl has not started. With the body
+    // gone, `--data-binary @file` cannot open it: curl exits 26 without dialing and without a byte on stdout (curl
+    // 8.5, 8.17 and 8.21, measured 2026-09-17; ~40 ms from spawn to exit on Windows).
+    const DropBody = struct {
+        var io_: std.Io = undefined;
+        var dropped: u32 = 0;
+        fn run() void {
+            var dir = std.Io.Dir.cwd().openDir(io_, root, .{ .iterate = true }) catch return;
+            defer dir.close(io_);
+            var name: [128]u8 = undefined;
+            var len: usize = 0;
+            var it = dir.iterate();
+            while (it.next(io_) catch null) |ent| {
+                if (ent.kind != .file or !std.mem.startsWith(u8, ent.name, STREAM_BODY ++ "-") or !isCallBodyName(ent.name)) continue;
+                if (ent.name.len > name.len) continue;
+                @memcpy(name[0..ent.name.len], ent.name);
+                len = ent.name.len;
+            }
+            if (len == 0) return;
+            dir.deleteFile(io_, name[0..len]) catch return;
+            dropped += 1;
+        }
+    };
+    DropBody.io_ = io;
+    DropBody.dropped = 0;
+    test_before_curl = DropBody.run;
+    defer test_before_curl = null;
+
+    // Every request gets the plain answer. The streamed curl has no body to send and never dials, so a request that
+    // arrives is the fallback's.
+    var srv: fakehttp.Server = undefined;
+    try srv.start(io, fakehttp.wire("{\"choices\":[{\"message\":{\"content\":\"fell back\"}}]}"));
+    var ub: [64]u8 = undefined;
+    // Plain 127.0.0.1: the streamed path has no in-process fast path, so this is its curl child. A local base has the
+    // longest wall there is, 240 s of --max-time plus the slack.
+    const base = try std.fmt.bufPrint(&ub, "http://127.0.0.1:{d}/v1", .{srv.port});
+
+    // A bound, not the verdict. The loop asks should_abort once a lap and sleeps 20 ms a lap (~31 ms at Windows'
+    // default timer tick), so LAP_CAP laps is 20-31 s: hundreds of times what a curl takes to start and fail, and
+    // at most an eighth of the wall. A loop that never notices curl is gone ends here as a Stop with nothing
+    // streamed and nothing sent, so the counts below fail in half a minute instead of holding the suite for 270 s.
+    const LAP_CAP = 1000;
+    const Probe = struct {
+        laps: u32 = 0,
+        fn onDelta(ctx: *anyopaque, kind: DeltaKind, text: []const u8) void {
+            _ = ctx;
+            _ = kind;
+            _ = text;
+        }
+        fn shouldAbort(ctx: *anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.laps += 1;
+            return self.laps > LAP_CAP;
+        }
+    };
+    var probe = Probe{};
+    var step = completeStream(gpa, io, root, "chat", base, SCRATCH_TEST_KEY, "deadcurl-model", "{\"role\":\"user\",\"content\":\"hi\"}", "", 16, -1, &probe, Probe.onDelta, Probe.shouldAbort);
+    defer step.deinit(gpa);
+    srv.stop(); // joins the serve thread; request() is only safe after it
+
+    // the call's own body went before its curl started, or no curl died here
+    try std.testing.expectEqual(@as(u32, 1), DropBody.dropped);
+    // The call went on to complete(): exactly one request reached the stand-in, and it was the plain call's.
+    if (srv.conns.load(.monotonic) != 1 or !std.mem.eql(u8, step.content, "fell back")) {
+        std.debug.print("\nthe call returned \"{s}\" after {d} laps of its tail loop (cap {d}); {d} requests reached the stand-in\n", .{ step.content, probe.laps, LAP_CAP, srv.conns.load(.monotonic) });
+        return error.WaitedOutADeadCurl;
+    }
+    try std.testing.expect(step.ok);
+    try std.testing.expect(std.mem.indexOf(u8, srv.request(), "\"stream\":true") == null);
 }
 
 test "the scratch sweeps know a call's own body from the copy a replay starts from" {
