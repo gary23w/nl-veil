@@ -10,6 +10,7 @@ const builtin = @import("builtin");
 const httpc = @import("httpc.zig");
 const net = @import("net.zig"); // cached "is there internet?" — consulted ONLY on the hosted path
 const rate = @import("rate.zig");
+const bu = @import("browser/util.zig"); // sleepMs: a raw-thread sleep, no Io park (see the tail loop in streamAttempt)
 const fakehttp = @import("fakehttp.zig"); // TEST ONLY: the canned gateway the H11 test at the bottom dials
 const gemma4 = @import("gemma4.zig"); // engine-side wire format, used when a backend fails the name-binding probe
 const dataset = @import("dataset.zig"); // training-set capture — inert unless a set is recording
@@ -172,12 +173,16 @@ fn retryPlan(base_url: []const u8, model: []const u8, attempt: usize, err_text: 
 
 /// Sleep out a retry wait in quarter-second slices, asking retry_abort between them, so a chat Stop ends the
 /// wait within a slice instead of after a minute. False when aborted: the ladder stops and the failure surfaces.
-fn retryWait(io: std.Io, wait_s: u64) bool {
+/// The slices sleep on the OS (bu.sleepMs), never io.sleep: a chat turn's ladder runs on the turn's plain
+/// std.Thread, where a stray thread alert in io.sleep's Windows park is undefined behaviour (see the tail loop in
+/// streamAttempt). An OS sleep cannot be canceled, which changes nothing here: retry_abort is how a wait ends
+/// early, and nothing cancels the Io tasks the swarm's minds call complete() from.
+fn retryWait(wait_s: u64) bool {
     var left_ms: u64 = wait_s * 1000;
     while (left_ms > 0) {
         if (retry_abort) |f| if (f()) return false;
         const slice: u64 = @min(left_ms, 250);
-        io.sleep(.{ .nanoseconds = slice * std.time.ns_per_ms }, .awake) catch break;
+        bu.sleepMs(slice);
         left_ms -= slice;
     }
     if (retry_abort) |f| if (f()) return false;
@@ -255,12 +260,12 @@ test "retryWait: a Stop ends the wait at once, a clear hook sleeps it out" {
     const io = threaded.io();
     Hooks.stop = true;
     const t0 = std.Io.Timestamp.now(io, .real).nanoseconds;
-    try std.testing.expect(!retryWait(io, 60));
+    try std.testing.expect(!retryWait(60));
     try std.testing.expect(std.Io.Timestamp.now(io, .real).nanoseconds - t0 < 5 * std.time.ns_per_s);
     Hooks.stop = false;
-    try std.testing.expect(retryWait(io, 0));
+    try std.testing.expect(retryWait(0));
     retry_abort = null;
-    try std.testing.expect(retryWait(io, 0));
+    try std.testing.expect(retryWait(0));
 }
 
 /// The body and status curl appended as "\n__VEILSTAT__<code>": the body's length and the code (0 if absent).
@@ -1066,7 +1071,7 @@ pub fn complete(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []
         const note = std.fmt.bufPrint(&nb, "provider failed ({s}): retrying in {d}s ({d}/{d})", .{ errHead(&hb, step.content), plan.wait_s, plan.n, plan.of }) catch "provider failed: retrying";
         std.log.warn("llm[{s}/{s}] {s}", .{ tag, model, note });
         notify(note);
-        if (!retryWait(io, plan.wait_s)) break; // stopped: the failure surfaces now
+        if (!retryWait(plan.wait_s)) break; // stopped: the failure surfaces now
         if (retry_rekey) |f| {
             if (f(gpa, base_url, fresh_key orelse key)) |k| {
                 if (fresh_key) |old| gpa.free(old);
@@ -3333,6 +3338,14 @@ fn streamAttempt(
     // a silently truncated partial. curl -w appends "\n__VEILSTAT__<http_code>"; we scan for the core MARK
     // "__VEILSTAT__" (never present in SSE/NDJSON data) so a body-terminating '\n' feeds with zero delay, and
     // hold back only a trailing suffix that is a strict prefix of MARK (a sentinel straddling a read boundary).
+    //
+    // THE POLL SLEEPS ON THE OS (bu.sleepMs), NEVER io.sleep. It runs on the chat turn's own thread (engine.zig
+    // spawnTurn, a plain std.Thread), every 20 ms for the whole reply. On Windows io.sleep parks the thread on the
+    // Io runtime's per-thread alert (NtWaitForAlertByThreadId), and on a thread the runtime did not spawn a wake it
+    // did not ask for is `unreachable`: a Debug build panics there, and in ReleaseFast one alert cut a 600 ms
+    // io.sleep to 116 ms. Alerts are sticky, so one stray alert lands in the next park (desk/src/nap.zig has the
+    // 2026-09-02 desk freeze it caused). kernel32 Sleep is non-alertable, and its 20 ms keeps the poll's pace: both
+    // sleeps took ~31 ms a lap at the default timer tick (measured 2026-09-16).
     const MARK = "__VEILSTAT__";
     const read_cap: usize = 256 << 10;
     const rbuf = gpa.alloc(u8, read_cap) catch return null;
@@ -3362,7 +3375,7 @@ fn streamAttempt(
         var f = std.Io.Dir.cwd().openFile(io, outpath, .{}) catch {
             // file not created yet — curl still connecting (or it died before writing)
             if (std.Io.Timestamp.now(io, .real).toSeconds() - t0 > wall) break;
-            io.sleep(.{ .nanoseconds = 20 * std.time.ns_per_ms }, .awake) catch {}; // 20ms: pick up new stream bytes fast for the desk's ~30Hz poll
+            bu.sleepMs(20); // 20ms: pick up new stream bytes fast for the desk's ~30Hz poll
             continue;
         };
         {
@@ -3420,7 +3433,7 @@ fn streamAttempt(
             break;
         }
         if (std.Io.Timestamp.now(io, .real).toSeconds() - t0 > wall) break;
-        io.sleep(.{ .nanoseconds = 20 * std.time.ns_per_ms }, .awake) catch {}; // 20ms: pick up new stream bytes fast for the desk's ~30Hz poll
+        bu.sleepMs(20); // 20ms: pick up new stream bytes fast for the desk's ~30Hz poll
     }
 
     // PROVIDER BACK-OFF: curl appended "\n__VEILSTAT__<code>" with the final HTTP status. On 429/503, record a

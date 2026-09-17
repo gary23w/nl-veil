@@ -17,6 +17,12 @@ const builtin = @import("builtin");
 const llm = @import("llm.zig");
 const modelcfg = @import("modelcfg"); // a MODULE (this dir's modelcfg.zig) — shared with the compiled-in desk
 const httpc = @import("httpc.zig");
+// Every sleep in this file is an OS sleep (bu.sleepMs, or hangWatchdog's rawSleep1s), never io.sleep. The round loop
+// is this worker process's main thread, which the Io runtime did not spawn, and on Windows io.sleep parks such a
+// thread on the runtime's per-thread alert, where a wake the runtime did not ask for is `unreachable` — undefined
+// behaviour in the ReleaseFast build (desk/src/nap.zig has the 2026-09-02 desk freeze a stray alert caused).
+// kernel32 Sleep is non-alertable.
+const bu = @import("browser/util.zig");
 const tools = @import("tools.zig");
 const dataset = @import("dataset.zig"); // training-set capture (this process records as `swarm`)
 const depprobe = @import("deps.zig"); // aliased: `deps` is already a local name for project-dependency strings all over this file
@@ -1856,7 +1862,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
                 // thread pool (new casts then hang at the 15s timeout). Back off (escalating, capped) so a dead
                 // endpoint can't peg a core — the failsafe below still halts the run after API_FAIL_MAX rounds.
                 const backoff_ms: u64 = @min(@as(u64, 700) * w.api_fail_streak, 5000);
-                io.sleep(.{ .nanoseconds = backoff_ms * std.time.ns_per_ms }, .awake) catch {};
+                bu.sleepMs(backoff_ms);
             } else {
                 w.api_fail_streak = 0;
             }
@@ -1887,7 +1893,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
             stop_reason = "time_budget";
             break;
         }
-        if (!live) io.sleep(.{ .nanoseconds = 600 * std.time.ns_per_ms }, .awake) catch {};
+        if (!live) bu.sleepMs(600);
     }
 
     w.wd_stop.store(true, .monotonic);
@@ -7252,7 +7258,7 @@ fn declaredSmoke(w: *Worker, run_dir: []const u8, round: u32) void {
             }
         }
         if (all_ok) break;
-        w.io.sleep(.{ .nanoseconds = 1000 * std.time.ns_per_ms }, .awake) catch {};
+        bu.sleepMs(1000);
     }
     // ALWAYS reap the tree — a leaked server keeps the port and the workdir's build locks hostage
     if (child.id) |h| {

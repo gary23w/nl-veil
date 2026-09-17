@@ -31,6 +31,7 @@
 //! `--tunnel`) turns it on at boot for a server that was configured by hand. Either way the URL is logged.
 const std = @import("std");
 const builtin = @import("builtin");
+const bu = @import("../worker/browser/util.zig"); // sleepMs: a raw-thread sleep, no Io park (see onThread)
 const httpz = @import("httpz");
 const http = @import("../gateway/http.zig");
 const App = http.App;
@@ -614,7 +615,7 @@ fn awaitPublished(app: *App, a: std.mem.Allocator, host: []const u8) bool {
     while (nowS(app.io) - t0 < PUBLISH_BUDGET_S) {
         if (exited.load(.monotonic)) return false;
         if (publishedAtCloudflare(app, a, host)) return true;
-        app.io.sleep(.{ .nanoseconds = 3000 * std.time.ns_per_ms }, .awake) catch {};
+        bu.sleepMs(3000);
     }
     return false;
 }
@@ -704,7 +705,7 @@ fn startChild(app: *App, a: std.mem.Allocator, uid: u64, st: *State, token: ?[]c
                 return "cloudflared could not authenticate with this tunnel token - flip the switch off and on to re-provision";
             }
         } else |_| {}
-        io.sleep(.{ .nanoseconds = 700 * std.time.ns_per_ms }, .awake) catch {};
+        bu.sleepMs(700);
     }
     if (exited.load(.monotonic)) return "cloudflared exited before registering - see cf_tunnel.log in the user's data dir";
     return "cloudflared did not register a connection within 90s - see cf_tunnel.log in the user's data dir";
@@ -761,12 +762,12 @@ fn killChild(app: *App, uid: u64) ?u32 {
                 var b: [24]u8 = undefined;
                 _ = runs(app, &.{ "kill", "-KILL", std.fmt.bufPrint(&b, "{d}", .{p}) catch "0" });
             }
-            io.sleep(.{ .nanoseconds = 100 * std.time.ns_per_ms }, .awake) catch {};
+            bu.sleepMs(100);
         }
         if (pidAlive(app, p)) still = p;
     }
     var waited: usize = 0;
-    while (!exited.load(.monotonic) and live.child != null and waited < 30) : (waited += 1) io.sleep(.{ .nanoseconds = 100 * std.time.ns_per_ms }, .awake) catch {};
+    while (!exited.load(.monotonic) and live.child != null and waited < 30) : (waited += 1) bu.sleepMs(100);
     mu.lockUncancelable(io);
     defer mu.unlock(io);
     live.child = null;
@@ -918,6 +919,13 @@ pub fn turnOff(app: *App, uid: u64, delete: bool) void {
     live.access = false;
 }
 
+/// The switch flip's own thread. Every wait on it - the connector's log (startChild), Cloudflare's resolver
+/// (awaitPublished), a connector being stopped (killChild) - sleeps through bu.sleepMs, never io.sleep, and so
+/// does bootThread's start delay. On Windows io.sleep parks the thread on the runtime's per-thread alert
+/// (NtWaitForAlertByThreadId), and on a plain std.Thread like this one a wake the runtime did not ask for is
+/// `unreachable` - undefined behaviour in the ReleaseFast build. Alerts are sticky, so one stray alert lands in
+/// the next park (desk/src/nap.zig has the 2026-09-02 desk freeze it caused). killChild also runs on an httpz
+/// worker (turnOff) and at shutdown, plain threads as well. kernel32 Sleep is non-alertable: no alert can end it.
 fn onThread(app: *App, uid: u64) void {
     turnOn(app, uid);
 }
@@ -938,7 +946,7 @@ fn ownerUid(app: *App) ?u64 {
 }
 
 fn bootThread(app: *App, forced: bool) void {
-    app.io.sleep(.{ .nanoseconds = 1500 * std.time.ns_per_ms }, .awake) catch {};
+    bu.sleepMs(1500); // a plain thread: never io.sleep (see onThread)
     const uid = ownerUid(app) orelse {
         if (forced) log.warn("NL_TUNNEL is set but no admin login is connected to Cloudflare - log in with Cloudflare first, then flip the switch (or restart)", .{});
         return;
