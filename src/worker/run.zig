@@ -1941,13 +1941,13 @@ fn writeDone(w: *Worker, reason: []const u8) void {
 }
 
 /// SECURITY/HYGIENE sweep at clean exit: the cast's key material must not outlive the run. `keys.env`
-/// and each mind's curl scratch (`.curlcfg-<mind>` embeds `Authorization: Bearer …`; `.llmreq-<mind>.json`
-/// can be 100KB+ of request dumps) sit in a CHAT-owned build dir that is never tree-wiped, so left alone
-/// they strand the API key (and real waste) until retention GC — supervisor.cleanCastMeta only runs on
+/// and each mind's curl scratch (older builds' `.curlcfg-<mind>` embeds `Authorization: Bearer …`;
+/// `.llmreq-<mind>.json` can be 100KB+ of request dumps) sit in a CHAT-owned build dir that is never tree-wiped,
+/// so left alone they strand the API key (and real waste) until retention GC — supervisor.cleanCastMeta only runs on
 /// stop/GC, not on natural completion. Mind names come from the run's own `minds/` dirs, so the sweep
-/// can never collide with the chat engine's live scratch (.curlcfg-chat/…) in the same dir. Nor with any
-/// running call's: each one's config and body carry a name of their own (llm.callPath), and
-/// `.llmreq-<mind>.json` is only the copy a finished call leaves for a replay, which no curl reads.
+/// can never collide with the chat engine's scratch (.llmreq-memverify.json/…) in the same dir. Nor with any
+/// running call's: its key is in no file (curl reads its config from stdin), its body carries a name of its own
+/// (llm.callPath), and `.llmreq-<mind>.json` is only the copy a finished call leaves for a replay, which no curl reads.
 fn sweepKeyScratch(w: *Worker) void {
     var buf: [1200]u8 = undefined;
     for ([_][]const u8{ "keys.env", "keys.env.enc" }) |f| {
