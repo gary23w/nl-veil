@@ -153,13 +153,6 @@ pub fn deploySwarm(app: *App, arena: std.mem.Allocator, u: http.User, body: Depl
         std.fmt.allocPrint(arena, "{s}/u{d}/{s}", .{ app.data, u.id, id })) catch return failSrv("out of memory");
     const workdir = std.fmt.allocPrint(arena, "{s}/work", .{run_dir}) catch return failSrv("out of memory");
 
-    // RE-CAST HYGIENE: a cast into a chat conversation dir REUSES the previous cast's run_dir
-    // (`_chat/builds/{conv}`), so its lifecycle files are still on disk. A leftover STOP would stop the new
-    // worker at its first boundary check, a leftover DONE would read the fresh spawn as already-finished,
-    // and the old events.jsonl would splice two runs into one stream. Reset lifecycle metadata ONLY —
-    // never work/ or any other user file — BEFORE the manifest write + spawn.
-    if (run_dir_override.len > 0) resetCastLifecycle(app, arena, run_dir);
-
     _ = std.Io.Dir.cwd().createDirPathStatus(app.io, workdir, .default_dir) catch {};
     for (body.minds) |m| {
         const md = std.fmt.allocPrint(arena, "{s}/minds/{s}", .{ run_dir, m.name }) catch return failSrv("out of memory");
@@ -256,6 +249,18 @@ pub fn deploySwarm(app: *App, arena: std.mem.Allocator, u: http.User, body: Depl
     // key the worker inherits, that becomes real egress). The desk always sends a base; a direct /cast API
     // caller may not.
     if (local_model and eff_base.len == 0) eff_base = "http://127.0.0.1:11434/v1";
+
+    // RE-CAST HYGIENE: a cast into a chat conversation dir REUSES the previous cast's run_dir
+    // (`_chat/builds/{conv}`), so its lifecycle files are still on disk. A leftover STOP would stop the new
+    // worker at its first boundary check, a leftover DONE would read the fresh spawn as already-finished,
+    // and the old events.jsonl would splice two runs into one stream. Reset lifecycle metadata ONLY —
+    // never work/ or any other user file — BEFORE the manifest write + spawn, but AFTER provider and key
+    // resolution: a re-cast refused there ("no model to run this on", no Cloudflare login, no built-in engine)
+    // leaves the previous run as it was, DONE and events.jsonl included. The reset also opens a window: until
+    // the manifest write, the dir holds the previous run's manifest with no DONE and no worker.pid, and a chat
+    // turn reading the dir can take that for a finished run. The re-cast need not come from that turn (an HTTP
+    // cast with `dir`, a sub-chat sibling's cast), so the window spans only the manifest build.
+    if (run_dir_override.len > 0) resetCastLifecycle(app, arena, run_dir);
 
     const mani_items = buildManifest(arena, body, eff_provider, workdir, eff_base, eff_model, body.encrypt and e.encrypted) catch return failSrv("out of memory");
     const mani_path = std.fmt.allocPrint(arena, "{s}/swarm.json", .{run_dir}) catch return failSrv("out of memory");
@@ -1210,4 +1215,82 @@ test "admin billing: only an admin, and a plan name it does not recognise is ref
         try web.expectStatus(200);
     }
     try std.testing.expectEqual(ent.Plan.pro, (ta.auth.whoami(user_tok) orelse return error.TestUnexpectedResult).plan);
+}
+
+test "a re-cast refused over its model or credentials keeps the previous run finished and synced; one that reaches its manifest write resets it" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var ta = try http.testApp(gpa, io, "zig-deploy-recast-tmp");
+    defer ta.deinit();
+    const cwd = std.Io.Dir.cwd();
+
+    // An ordinary free-plan account casting one mind: inside every plan cap, so both re-casts below clear the
+    // entitlement checks and are refused only where each one says.
+    const u: http.User = .{ .id = 7, .email = "caster@example.test", .pwhash = "", .plan = .free, .created = 0 };
+    try std.testing.expect(!ta.app.auth.isAdmin(u));
+    const conv = "c6a57f852";
+
+    // castSwarm builds a conversation's casts in {data}/{buildRootRel}. An earlier cast finished there: its manifest,
+    // its worker's DONE and event stream, and the marker the chat engine writes once it has pushed the run's files to
+    // a client-mode client (engine.zig maybeSyncCastFiles).
+    var relb: [128]u8 = undefined;
+    var runb: [256]u8 = undefined;
+    const run_dir = try std.fmt.bufPrint(&runb, "{s}/{s}", .{ ta.root, cpaths.buildRootRel(&relb, u.id, conv) });
+    const EVENTS = "{\"kind\":\"done\"}\n";
+    const PREV = [_]struct { name: []const u8, data: []const u8 }{
+        .{ .name = "swarm.json", .data = "{\"swarm\":\"cast-first\",\"minutes\":4,\"cast\":true}" },
+        .{ .name = "DONE", .data = "completed" },
+        .{ .name = ".filesync_done", .data = "" },
+        .{ .name = "events.jsonl", .data = EVENTS },
+    };
+    _ = try cwd.createDirPathStatus(io, run_dir, .default_dir);
+    var pb: [512]u8 = undefined;
+    for (PREV) |f| try cwd.writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&pb, "{s}/{s}", .{ run_dir, f.name }), .data = f.data });
+
+    var arena = std.heap.ArenaAllocator.init(gpa); // the per-cast arena the chat's cast tool hands castSwarm
+    defer arena.deinit();
+
+    // No Cloudflare login and no server Workers AI credentials: refused while resolving the model, before any
+    // manifest. The previous run must still read as finished and already synced, its event stream unrotated.
+    switch (castSwarm(&ta.app, arena.allocator(), u, .{ .goal = "rebuild the report", .minds = 1, .provider = "workers-ai", .dir = conv })) {
+        .ok => return error.TestUnexpectedResult,
+        .fail => |f| {
+            try std.testing.expectEqual(FailKind.server_error, f.kind);
+            try std.testing.expect(std.mem.startsWith(u8, f.msg, "Workers AI needs a Cloudflare login"));
+        },
+    }
+    var lost: usize = 0;
+    for (PREV) |f| {
+        const got = cwd.readFileAlloc(io, try std.fmt.bufPrint(&pb, "{s}/{s}", .{ run_dir, f.name }), gpa, .limited(1 << 16)) catch null;
+        defer if (got) |g| gpa.free(g);
+        if (got == null or !std.mem.eql(u8, got.?, f.data)) {
+            std.debug.print("\nthe refused re-cast took the previous run's {s}\n", .{f.name});
+            lost += 1;
+        }
+    }
+    if (cwd.access(io, try std.fmt.bufPrint(&pb, "{s}/events.prev.jsonl", .{run_dir}), .{})) |_| {
+        std.debug.print("\nthe refused re-cast rotated the previous run's events.jsonl\n", .{});
+        lost += 1;
+    } else |_| {}
+    try std.testing.expectEqual(@as(usize, 0), lost);
+    try std.testing.expectEqual(@as(usize, 0), ta.app.sup.activeSwarmsForUser(u.id)); // and nothing was spawned
+
+    // The control: the same re-cast with a key of its own clears resolution, and its manifest write fails because a
+    // directory stands where swarm.json goes. By then the reset has run, so deploySwarm does reset this dir, and
+    // before the manifest write. Nothing spawns here either.
+    var mb: [512]u8 = undefined;
+    const manifest = try std.fmt.bufPrint(&mb, "{s}/swarm.json", .{run_dir});
+    try cwd.deleteFile(io, manifest);
+    _ = try cwd.createDirPathStatus(io, manifest, .default_dir);
+    switch (castSwarm(&ta.app, arena.allocator(), u, .{ .goal = "rebuild the report", .minds = 1, .provider = "openai", .api_key = "sk-not-a-real-key", .base_url = "https://byok.invalid/v1", .dir = conv })) {
+        .ok => return error.TestUnexpectedResult,
+        .fail => |f| try std.testing.expectEqualStrings("could not write manifest", f.msg),
+    }
+    try std.testing.expectError(error.FileNotFound, cwd.access(io, try std.fmt.bufPrint(&pb, "{s}/DONE", .{run_dir}), .{}));
+    const rotated = try cwd.readFileAlloc(io, try std.fmt.bufPrint(&pb, "{s}/events.prev.jsonl", .{run_dir}), gpa, .limited(1 << 16));
+    defer gpa.free(rotated);
+    try std.testing.expectEqualStrings(EVENTS, rotated);
+    try std.testing.expectEqual(@as(usize, 0), ta.app.sup.activeSwarmsForUser(u.id));
 }
