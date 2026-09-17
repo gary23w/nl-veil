@@ -5490,6 +5490,160 @@ test "the scratch sweeps know a call's own body from the copy a replay starts fr
     try std.testing.expect(!std.mem.eql(u8, a, b));
 }
 
+test "a call in a chat build dir survives a cast there being stopped or pruned before its curl starts: its key and its own body still reach the wire, posted or streamed" {
+    // A chat build dir is not the cast's alone. The conversation's own turns call memverify, rerank and plan there,
+    // and a sub-chat's cast runs a worker beside the parent's, while a stop (Supervisor.remove) or retention
+    // (pruneOldRuns) strips a cast's bookkeeping and scratch from the same dir (cleanCastMeta). What such a call hands
+    // curl must outlast that until curl has read it: a body deleted first exits curl 26, as a key config did while the
+    // key still rode in a file. Here the retirement runs at the one moment it can hurt, with the call's scratch on disk
+    // and its curl not yet started, and each call dials a stand-in of its own, so what that stand-in received is what
+    // its curl read.
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = if (builtin.os.tag == .windows) .{ .block = .global } else .{ .block = .{ .slice = std.mem.span(std.c.environ) } } });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const sv = @import("control/supervisor.zig");
+
+    const root = "zig-llm-castretire-tmp";
+    const cast = root ++ "/u7/_chat/builds/c6a57f852"; // where castSwarm spawns a conversation's casts
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+
+    const Retirement = enum { stop, retention };
+    const Retire = struct {
+        var sup: *sv.Supervisor = undefined;
+        var io_: std.Io = undefined;
+        var how: Retirement = .stop;
+        var fired: u32 = 0;
+        var pruned: usize = 0;
+        var stripped = false; // the cast's bookkeeping was gone before the call's curl started
+        const cast_id = "5b8e0f3a2c7d4e19";
+        fn run() void {
+            fired += 1;
+            switch (how) {
+                .stop => sup.remove(cast_id),
+                .retention => pruned = sup.pruneOldRuns(root, 14),
+            }
+            stripped = gone(cast ++ "/swarm.json") and gone(cast ++ "/events.jsonl");
+        }
+        fn gone(path: []const u8) bool {
+            std.Io.Dir.cwd().access(io_, path, .{}) catch return true;
+            return false;
+        }
+        /// The cast as a stop or retention finds it: a manifest, a month-idle event log, a worker.pid naming no live
+        /// process (a stop kills nothing), a mind's notes, and the deliverables, which stay.
+        fn plant() !void {
+            const now_ns = std.Io.Timestamp.now(io_, .real).nanoseconds;
+            const files = [_]struct { name: []const u8, data: []const u8 }{
+                .{ .name = "swarm.json", .data = "{}\n" },
+                .{ .name = "events.jsonl", .data = "{}\n" },
+                .{ .name = "worker.pid", .data = "999999999" }, // no process on any OS (see supervisor's relaunch tests)
+                .{ .name = "minds/planner/notes.md", .data = "notes" },
+                .{ .name = "work/index.html", .data = "<p>the deliverable</p>" },
+            };
+            for (files) |f| {
+                var pb: [160]u8 = undefined;
+                const path = try std.fmt.bufPrint(&pb, cast ++ "/{s}", .{f.name});
+                _ = try std.Io.Dir.cwd().createDirPathStatus(io_, std.fs.path.dirname(path).?, .default_dir);
+                try std.Io.Dir.cwd().writeFile(io_, .{ .sub_path = path, .data = f.data });
+            }
+            const events = try std.Io.Dir.cwd().openFile(io_, cast ++ "/events.jsonl", .{ .mode = .read_write });
+            defer events.close(io_);
+            try events.setTimestamps(io_, .{ .modify_timestamp = .{ .new = .fromNanoseconds(now_ns - 30 * std.time.ns_per_day) } });
+        }
+    };
+    const Probe = struct {
+        fn onDelta(ctx: *anyopaque, kind: DeltaKind, text: []const u8) void {
+            _ = ctx;
+            _ = kind;
+            _ = text;
+        }
+    };
+
+    var sup = sv.Supervisor.init(gpa, io, "");
+    defer sup.swarms.deinit(gpa);
+    Retire.sup = &sup;
+    Retire.io_ = io;
+    test_before_curl = Retire.run;
+    defer test_before_curl = null;
+
+    const Transport = enum { post, stream };
+    for ([_]Transport{ .post, .stream }) |transport| {
+        for ([_]Retirement{ .stop, .retention }) |how| {
+            try Retire.plant();
+            const now = std.Io.Timestamp.now(io, .real).toSeconds();
+            var entry: sv.Swarm = .{ .id = Retire.cast_id, .uid = 7, .name = "cast", .run_dir = cast, .model = "mock", .minds = 1, .created = now, .state = .running };
+            // a stop finds the cast running; retention finds it idle, with no running entry to hold its dir
+            if (how == .stop) try sup.swarms.put(gpa, entry.id, &entry);
+            Retire.how = how;
+            Retire.fired = 0;
+            Retire.pruned = 0;
+            Retire.stripped = false;
+
+            var srv: fakehttp.Server = undefined;
+            var srv_up = false;
+            defer if (srv_up) srv.stop();
+            var ok = false;
+            var sent_own_body = false;
+            var reply: []const u8 = "";
+            var owned_reply: ?[]const u8 = null;
+            defer if (owned_reply) |c| gpa.free(c);
+            var step: ?Step = null;
+            defer if (step) |*s| s.deinit(gpa);
+            switch (transport) {
+                .post => {
+                    const body = "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"the prompt of the waiting call\"}]}";
+                    try srv.start(io, fakehttp.wire("{\"choices\":[{\"message\":{\"content\":\"ok\"}}]}"));
+                    srv_up = true;
+                    var ub: [96]u8 = undefined;
+                    // 127.1 is 127.0.0.1 to curl but not to httpc.parseLoopbackUrl: the curl path a hosted provider takes
+                    const url = try std.fmt.bufPrint(&ub, "http://127.1:{d}/v1/chat/completions", .{srv.port});
+                    const r = postUrl(gpa, io, cast, "memverify", url, SCRATCH_TEST_KEY, body, false, 16);
+                    owned_reply = r.content;
+                    srv.stop();
+                    srv_up = false;
+                    ok = r.ok;
+                    reply = r.content;
+                    sent_own_body = std.mem.endsWith(u8, srv.request(), body);
+                },
+                .stream => {
+                    const prompt = "the prompt of the waiting stream";
+                    // one streamed answer; a fallback to complete() gets the other and fails the answer check below
+                    const routes = [_]fakehttp.Route{.{ .method = "POST", .path = "/chat/completions", .reply = fakehttp.wire("data: {\"choices\":[{\"delta\":{\"content\":\"streamed\"}}]}\n\ndata: [DONE]\n\n"), .times = 1 }};
+                    try srv.startRouted(io, &routes, fakehttp.wire("{\"choices\":[{\"message\":{\"content\":\"fell back\"}}]}"));
+                    srv_up = true;
+                    var ub: [64]u8 = undefined;
+                    // plain 127.0.0.1: the streamed path has no in-process fast path, so this is its curl child and scratch
+                    const base = try std.fmt.bufPrint(&ub, "http://127.0.0.1:{d}/v1", .{srv.port});
+                    var ctx: u8 = 0;
+                    step = completeStream(gpa, io, cast, "chat", base, SCRATCH_TEST_KEY, "castretire-model", "{\"role\":\"user\",\"content\":\"" ++ prompt ++ "\"}", "", 16, -1, &ctx, Probe.onDelta, null);
+                    srv.stop();
+                    srv_up = false;
+                    ok = step.?.ok and std.mem.eql(u8, step.?.content, "streamed") and srv.conns.load(.monotonic) == 1;
+                    reply = step.?.content;
+                    sent_own_body = std.mem.indexOf(u8, srv.request(), prompt) != null;
+                },
+            }
+
+            // The retirement ran while the call waited for its curl, and did its job: that is the race being staged.
+            if (Retire.fired != 1 or !Retire.stripped or (how == .retention and Retire.pruned != 1)) {
+                std.debug.print("\n[{t} call, cast {t}] the cast was not retired under the waiting call: seam fired {d}x, bookkeeping gone {}, pruned {d}\n", .{ transport, how, Retire.fired, Retire.stripped, Retire.pruned });
+                return error.RetirementNotStaged;
+            }
+            // ...and took the cast alone: the deliverables stay
+            if (Retire.gone(cast ++ "/work/index.html")) return error.DeliverablesDeleted;
+            if (!ok) {
+                std.debug.print("\n[{t} call, cast {t}] the call failed: {s}\n", .{ transport, how, reply });
+                return error.CallFailedUnderRetirement;
+            }
+            if (std.mem.indexOf(u8, srv.request(), "Authorization: Bearer " ++ SCRATCH_TEST_KEY) == null or !sent_own_body) {
+                std.debug.print("\n[{t} call, cast {t}] the stand-in did not get the call's key and body: {s}\n", .{ transport, how, srv.request() });
+                return error.KeyOrBodyNeverSent;
+            }
+        }
+    }
+}
+
 test "every exit from streamAttempt accounts for what the provider billed" {
     // This path cannot be exercised without a live SSE provider, so the guard is structural. The bug
     // it protects: nine of streamAttempt's exits `return null` to fall back on complete(), and only
