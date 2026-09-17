@@ -1471,10 +1471,11 @@ pub const Chat = struct {
         return p;
     }
 
-    /// The dirs desk model calls (llm.start) keep their scratch in: the request body, the stream sink, and the
-    /// curl config that holds the API key. Each belongs to one Stream at a time, since those file names are fixed
-    /// per dir: the chat turn's (the sidecar itself), the background judge's and the act router's. The startup
-    /// sweep reads exactly these dirs, so every llm.start caller takes its dir from llmScratchDir.
+    /// The dirs desk model calls (llm.start) keep their scratch in: the request body and the stream sink (the API
+    /// key goes to curl's stdin, never here). Each belongs to one Stream at a time, since those file names are fixed
+    /// per dir: the chat turn's (the sidecar itself), the background judge's and the act router's. Older builds kept
+    /// the key's curl config here too, and the key sweep reads exactly these dirs, so every llm.start caller takes its
+    /// dir from llmScratchDir.
     const LlmScratch = enum { chat, judge, router };
 
     fn llmScratchDir(dd: []const u8, which: LlmScratch, buf: []u8) ?[]const u8 {
@@ -1484,11 +1485,11 @@ pub const Chat = struct {
         } catch null;
     }
 
-    /// Remove the curl configs model calls left in the LlmScratch dirs. Each holds an API key, in a data dir that
-    /// is often a synced folder. A call deletes its own config when its curl exits (llm.reap), so what is left was
-    /// stranded by a desk killed mid-call, or by a build before 2026-09-17, which left one in each dir for good.
-    /// llm.KEY_CFG_STALE_S keeps the sweep off a config a live call may not have read yet: this desk's own, or
-    /// another desk's on the same data dir. Returns how many it removed.
+    /// Remove the curl configs older builds' model calls left in the LlmScratch dirs. Each holds an API key, in a data
+    /// dir that is often a synced folder. No call writes one now (the key goes to curl's stdin), so each was stranded
+    /// by an older desk killed mid-call, or by a build before 2026-09-17, which left one in each dir for good.
+    /// llm.KEY_CFG_STALE_S keeps the sweep off a config a live call may not have read yet: an older desk build's, on
+    /// the same data dir. Returns how many it removed.
     fn sweepLlmScratch(io: Io, gpa: std.mem.Allocator, dd: []const u8) usize {
         const now_ns = Io.Timestamp.now(io, .real).nanoseconds;
         var removed: usize = 0;
