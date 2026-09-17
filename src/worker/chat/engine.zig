@@ -7068,9 +7068,11 @@ fn swarmTerminal(app: *App, run_dir: []const u8, created: i64) bool {
     return nowSecs(app.io) - created > 20; // no live pid: terminal unless the swarm is still spawning
 }
 
-/// This conversation's cast swarm, if one is LIVE. A chat cast always builds in _chat/builds/{conv}, and
-/// sup.resolve falls back to run-dir-basename matching — so the conv id alone finds it, including a cast from an
-/// earlier turn (armed-loop semantics: the loop shouldn't settle over ANY running hive in this conversation).
+/// This conversation's cast swarm, if one is LIVE. A chat cast builds in the conversation's build root (castSwarm →
+/// paths.zig buildRootRel: `_chat/builds/{conv}`, a sub-chat's primary's tree, a scheduled run's
+/// `_sched/{task}/runs/{stamp}`), and sup.resolve maps the conv id onto that root and returns the newest cast there
+/// — so the conv id alone finds it, including a cast from an earlier turn or from another chat of the same family
+/// (armed-loop semantics: the loop shouldn't settle over ANY running hive in this conversation's workspace).
 fn liveConvCast(app: *App, uid: u64, conv: []const u8) ?struct { run_dir: []const u8, deadline: i64 } {
     const sw = app.sup.resolve(conv) orelse return null;
     if (sw.uid != uid) return null;
@@ -7114,6 +7116,45 @@ fn awaitConvCast(app: *App, uid: u64, conv: []const u8, conv_dir: []const u8, ct
             return .finished;
         }
     }
+}
+
+test "an armed sub-chat turn waits on its family's running hive: liveConvCast finds the newest cast in the primary's build root" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const fanout = @import("../control/fanout.zig");
+    var ta = try http.testApp(gpa, io, "zig-subchat-cast-tmp");
+    defer ta.deinit();
+    defer fanout.dropTestSwarms(ta.app.sup, gpa);
+    const app = &ta.app;
+    const uid: u64 = 7;
+
+    // The run dir castSwarm spawns the sub-chat's cast into: {data}/{buildRootRel(uid, conv)}, the primary's tree.
+    var rb: [256]u8 = undefined;
+    var db: [320]u8 = undefined;
+    const run_dir = try std.fmt.bufPrint(&db, "{s}/{s}", .{ app.data, cpaths.buildRootRel(&rb, uid, "c6a57f852__s1") });
+    // Two casts on that dir: the primary's, an hour old, and the sub-chat's re-cast, spawned just now. Neither has a
+    // DONE or a worker.pid, so swarmTerminal reads the old one as dead and the new one as still spawning.
+    const now = nowSecs(io);
+    try fanout.addTestSwarm(app.sup, gpa, "5f0c2a9e41d7b3a6", uid, run_dir);
+    try fanout.addTestSwarm(app.sup, gpa, "e83b17c4d2a09f55", uid, run_dir);
+    const old = app.sup.swarms.get("5f0c2a9e41d7b3a6") orelse return error.TestUnexpectedResult;
+    old.created = now - 3600;
+    old.state = .stopped;
+    const fresh = app.sup.swarms.get("e83b17c4d2a09f55") orelse return error.TestUnexpectedResult;
+    fresh.created = now;
+
+    const sub = liveConvCast(app, uid, "c6a57f852__s1") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings(run_dir, sub.run_dir);
+    try std.testing.expect(sub.deadline > now); // the fresh cast's budget; the old cast's ran out long ago
+    // the whole family waits on the one hive: the primary's id reads the same cast
+    const primary = liveConvCast(app, uid, "c6a57f852") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings(sub.run_dir, primary.run_dir);
+    try std.testing.expectEqual(sub.deadline, primary.deadline);
+    // another family's sub-chat and another account find nothing
+    try std.testing.expect(liveConvCast(app, uid, "c6a57f8521__s1") == null);
+    try std.testing.expect(liveConvCast(app, uid + 1, "c6a57f852__s1") == null);
 }
 
 fn orchTool(app: *App, uid: u64, ctx: *tools.ToolCtx, conv: []const u8, conv_dir: []const u8, ctrl_cursor: usize, trio: ModelTrio, name: []const u8, args: []const u8, tool_client: bool) ?[]u8 {
