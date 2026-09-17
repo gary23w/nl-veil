@@ -86,6 +86,18 @@ A reply's `REMEMBER:`/`FORGET:` lines are applied to the user's store (`{data}/u
 
 When the chat call still fails with its provider's budget spent (`llm.retryExhausted`), the error frame reads `gave up after 10 retries — <head>` (`llm.RETRY_MAX`) and the turn ends.
 
+## A client-mode turn: which tools run on the client
+
+A turn posted with `tool_client:true` (the desk and `veil chat` send it, and `runTurn` honours it for an admin only) hands its mind tools to the client, so file, shell and code tools act on the user's machine. `delegateTool` emits a `tool_request` frame and waits on `/tool_result`. `clientRoute` names the exceptions: tools whose authority is a credential the server holds for the turn, which the client executor (`veil exec-tool`) is never handed.
+
+- **`get_credential` runs here.** Its store is the server's `memories.jsonl`.
+- **The `cf_` family runs here** (`cfClientTool`), because its token must never ride a `tool_request` frame. What crosses instead is the one file a call touches ([cftools](#doc=worker/cftools) `fileUse`), over the [sync](#doc=worker/chat/sync) channel.
+  - Upload: `stageClientFile` runs the same-disk probe. On another disk it pulls the client's copy into the server's copy of the workdir, skipping the pull when the manifest hash already matches. If the client does not answer or does not have the file, the call is refused with nothing sent to Cloudflare, and the server's older copy is never uploaded in its place.
+  - Download: once the verb sets `ToolCtx.cf_wrote`, `carryWrittenFile` pushes the file with `file_sync` and reads it back with `file_pull`. A file that is empty, binary, over `cync.FILE_CAP`, or not read back byte-identical gets an `(engine: …)` note that it is not on the user's machine. A push gets no answer of its own, so the read-back is what catches a write that failed or a client that did not apply it (desks before the background-sync fix skipped pushes for a conversation that was not on screen).
+  - Both keep `delegateTool`'s client-absence latch: a client that already proved absent this turn is not waited on again, silence counts toward the latch, and a Stop is not counted as absence.
+
+`syncExchange` and `pullRequest` parse the client's answer with `.allocate = .alloc_always`. The manifest's paths and hashes are read after the response buffer is freed, and `parseFromSlice`'s default hands back escape-free strings as slices into that buffer. Before this, a cast-time pull's diff compared freed bytes.
+
 ## Concurrency & lifecycle
 
 - One in-flight turn per conversation. `tryBeginTurn` claims the slot (so `postMessage` can answer `409` before persisting anything); `spawnTurn` fires the turn on a raw detached thread and owns releasing the slot on every completion path.
@@ -106,7 +118,7 @@ When the chat call still fails with its provider's budget spent (`llm.retryExhau
 
 ## Usage Context
 
-Entered only through `chat_service.postMessage`. ON by default; the kill switch `VEIL_CHAT_BACKEND=0` returns `501`, which a client treats as a signal to fall back to a local engine. Open to every authenticated user. The per-role gating this note used to anticipate has landed: `tools.execute` refuses on `ctx.caps == .sandboxed` as its first statement, before any tool-specific logic, so there is exactly one place a capability decision is made. Non-admins run `.sandboxed`, admins `.full`, and the turn's advertised tool schema is trimmed to match — a sandboxed caller is never offered a tool that could only come back as a refusal. Scheduled tasks (`sched.zig`) enter the same `tryBeginTurn` + `spawnTurn` path, so a scheduled run is a real conversation.
+Entered only through `chat_service.postMessage`. ON by default; the kill switch `VEIL_CHAT_BACKEND=0` returns `501`, which a client treats as a signal to fall back to a local engine. Open to every authenticated user. The per-role gating this note used to anticipate has landed: `tools.execute` refuses on `ctx.caps == .sandboxed` as its first statement, before any tool-specific logic, so there is exactly one place a capability decision is made. Non-admins run `.sandboxed`, admins `.full`, and the turn's advertised tool schema is trimmed to match — a sandboxed caller is never offered a tool that could only come back as a refusal. That includes the `cf_` belt a connected account adds: `buildTurnTools` projects it through the same allowlist (`CF_TOOLS_SANDBOXED`, empty today), and a test checks every name on a sandboxed belt against the gate. Scheduled tasks (`sched.zig`) enter the same `tryBeginTurn` + `spawnTurn` path, so a scheduled run is a real conversation.
 
 ---
 

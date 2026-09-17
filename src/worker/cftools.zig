@@ -6,11 +6,17 @@
 //! a Worker and ship it to a live URL, keep state in R2 / D1 / KV, and reach anything else on the REST
 //! surface through one generic escape hatch.
 //!
-//! CREDENTIALS. Nothing here resolves a token: the chat surfaces resolve ONE per turn (cf_oauth
-//! .resolveToken, which auto-refreshes) and hand the pair down on ToolCtx as cf_token + cf_account.
-//! Blank ⇒ the whole family is unadvertised AND refuses, so a swarm mind, the CLI and any non-chat
-//! caller are structurally unable to touch the user's cloud — the same shape `durable_path` uses to
-//! keep user credentials out of the hive.
+//! CREDENTIALS. Nothing here resolves a token: the chat engine resolves ONE per turn (cf_oauth
+//! .resolveToken, which auto-refreshes) and hands the pair down on ToolCtx as cf_token + cf_account.
+//! Blank ⇒ the whole family is unadvertised AND refuses, so a swarm mind, the client executor
+//! (`veil exec-tool`) and any non-chat caller are structurally unable to touch the user's cloud — the
+//! same shape `durable_path` uses to keep user credentials out of the hive.
+//!
+//! WHERE A CALL RUNS: in the server process, always — it is the only holder of the token. A turn the
+//! desk or `veil chat` drives hands its other tools to the user's machine, but never these: delegated,
+//! a call would have to carry the bearer through the event log to a process that holds no credential.
+//! What crosses the machine boundary instead is the one FILE a call touches (fileUse): the engine
+//! stages an upload's file into the server's copy of the workdir first, and carries a download back.
 //!
 //! SCOPES ARE THE USER'S TO GIVE. The registered OAuth client may ASK for build-and-deploy permissions
 //! (Workers, Pages, D1, KV, R2, Queues, Vectorize, Routes, Tail) on top of the identity + Workers AI
@@ -43,6 +49,10 @@ pub const Ctx = struct {
     /// can be driven by scripts/sim/cfworld.py without touching an account. Never anything else: the
     /// OAuth token is minted for api.cloudflare.com, and any other host would simply be handed it.
     api_root: []const u8 = API,
+    /// Receipt for a verb that WRITES a workspace file (cf_r2_get): set true once the bytes have landed.
+    /// A caller whose real workspace is another machine's disk reads it to know there is a file to carry
+    /// there — and that a failed call wrote nothing, so an older copy is never carried in its place.
+    wrote: ?*bool = null,
 };
 
 /// The Cloudflare v4 API root. The one host the bearer may be sent to — see Ctx.api_root for the only
@@ -65,11 +75,14 @@ const MAX_UPLOAD = 24 << 20; // one object/script upload; R2's REST cap is far h
 
 // ------------------------------------------------------------------------------------ path safety
 
+/// The longest file argument safeRel admits.
+pub const MAX_REL: usize = 400;
+
 /// The one rule for every file argument: a RELATIVE path inside the workdir. No absolute paths, no
 /// drive letters, no "..", no leading slash. A tool that ships files to the internet must never be
 /// able to name ~/.ssh/id_rsa, so this is checked before the path is joined, not after.
 pub fn safeRel(rel: []const u8) bool {
-    if (rel.len == 0 or rel.len > 400) return false;
+    if (rel.len == 0 or rel.len > MAX_REL) return false;
     if (rel[0] == '/' or rel[0] == '\\') return false;
     if (std.mem.indexOf(u8, rel, "..") != null) return false;
     if (rel.len > 1 and rel[1] == ':') return false; // C:\...
@@ -80,6 +93,77 @@ pub fn safeRel(rel: []const u8) bool {
 fn joinWork(ctx: Ctx, rel: []const u8, buf: []u8) ?[]const u8 {
     if (!safeRel(rel)) return null;
     return std.fmt.bufPrint(buf, "{s}/{s}", .{ ctx.workdir, rel }) catch null;
+}
+
+// ------------------------------------------------------------------------------------ file arguments
+
+// The argument shapes of the three verbs that touch a workspace file, and the ONE reading of which file
+// each touches. The verbs and fileUse both go through these, so the file a caller carries across a
+// machine boundary is the file the verb then opens — two readings would drift the first time one changed.
+const DeployArgs = struct { name: []const u8 = "", file: []const u8 = "", compatibility_date: []const u8 = "2026-01-01" };
+const PutArgs = struct { bucket: []const u8 = "", key: []const u8 = "", file: []const u8 = "", text: []const u8 = "" };
+const GetArgs = struct { bucket: []const u8 = "", key: []const u8 = "", file: []const u8 = "" };
+
+fn trimArg(s: []const u8) []const u8 {
+    return std.mem.trim(u8, s, " \r\n\t");
+}
+
+/// cf_deploy_worker uploads `file`.
+fn deploySource(a: DeployArgs) []const u8 {
+    return trimArg(a.file);
+}
+
+/// cf_r2_put uploads `file` when one is named; inline `text` touches no file.
+fn putSource(a: PutArgs) ?[]const u8 {
+    return if (a.file.len > 0) trimArg(a.file) else null;
+}
+
+/// cf_r2_get downloads into `file`, or into the object's own key when no file is named.
+fn getDest(a: GetArgs) []const u8 {
+    return if (a.file.len > 0) trimArg(a.file) else trimArg(a.key);
+}
+
+/// The one workspace file a `cf_` call touches, and which way. A caller whose workspace is not this
+/// process's disk — a client-mode chat turn, driven by the desk or `veil chat` — moves exactly that file
+/// across before the call (`reads`) or after it (`writes`).
+pub const FileUse = union(enum) {
+    /// touches no file: every other verb, inline `text`, and arguments the verb refuses before opening
+    /// anything (unparseable, empty, or failing safeRel)
+    none,
+    /// the call uploads this workspace file (cf_deploy_worker's module, cf_r2_put's `file`)
+    reads: []const u8,
+    /// the call downloads into this workspace file (cf_r2_get's destination)
+    writes: []const u8,
+};
+
+/// Which file `name` called with `args_json` touches. The path is copied into `buf`.
+pub fn fileUse(gpa: std.mem.Allocator, name: []const u8, args_json: []const u8, buf: *[MAX_REL]u8) FileUse {
+    const opts: std.json.ParseOptions = .{ .ignore_unknown_fields = true };
+    if (std.mem.eql(u8, name, "cf_deploy_worker")) {
+        const p = std.json.parseFromSlice(DeployArgs, gpa, args_json, opts) catch return .none;
+        defer p.deinit();
+        const rel = keepRel(deploySource(p.value), buf) orelse return .none;
+        return .{ .reads = rel };
+    }
+    if (std.mem.eql(u8, name, "cf_r2_put")) {
+        const p = std.json.parseFromSlice(PutArgs, gpa, args_json, opts) catch return .none;
+        defer p.deinit();
+        const rel = keepRel(putSource(p.value) orelse return .none, buf) orelse return .none;
+        return .{ .reads = rel };
+    }
+    if (std.mem.eql(u8, name, "cf_r2_get")) {
+        const p = std.json.parseFromSlice(GetArgs, gpa, args_json, opts) catch return .none;
+        defer p.deinit();
+        const rel = keepRel(getDest(p.value), buf) orelse return .none;
+        return .{ .writes = rel };
+    }
+    return .none;
+}
+
+fn keepRel(rel: []const u8, buf: *[MAX_REL]u8) ?[]const u8 {
+    if (!safeRel(rel)) return null; // the verb refuses this path before it opens anything
+    @memcpy(buf[0..rel.len], rel);
+    return buf[0..rel.len];
 }
 
 // ------------------------------------------------------------------------------------ transport
@@ -178,11 +262,10 @@ fn answer(ctx: Ctx, raw: ?[]u8, what: []const u8) []u8 {
 /// Modules format (main_module), which is what every current Worker template ships.
 fn deployWorker(ctx: Ctx, args_json: []const u8) []u8 {
     const gpa = ctx.gpa;
-    const A = struct { name: []const u8 = "", file: []const u8 = "", compatibility_date: []const u8 = "2026-01-01" };
-    const p = std.json.parseFromSlice(A, gpa, args_json, .{ .ignore_unknown_fields = true }) catch return dupe(gpa, "bad args");
+    const p = std.json.parseFromSlice(DeployArgs, gpa, args_json, .{ .ignore_unknown_fields = true }) catch return dupe(gpa, "bad args");
     defer p.deinit();
-    const name = std.mem.trim(u8, p.value.name, " \r\n\t");
-    const file = std.mem.trim(u8, p.value.file, " \r\n\t");
+    const name = trimArg(p.value.name);
+    const file = deploySource(p.value);
     if (name.len == 0 or file.len == 0) return dupe(gpa, "cf_deploy_worker needs name and file");
     // A script name lands in a URL and a hostname — keep it to what Cloudflare accepts there.
     if (name.len > 63) return dupe(gpa, "worker name is too long");
@@ -259,11 +342,10 @@ fn r2List(ctx: Ctx, args_json: []const u8) []u8 {
 /// Upload one workspace file (or inline text) to an R2 bucket.
 fn r2Put(ctx: Ctx, args_json: []const u8) []u8 {
     const gpa = ctx.gpa;
-    const A = struct { bucket: []const u8 = "", key: []const u8 = "", file: []const u8 = "", text: []const u8 = "" };
-    const p = std.json.parseFromSlice(A, gpa, args_json, .{ .ignore_unknown_fields = true }) catch return dupe(gpa, "bad args");
+    const p = std.json.parseFromSlice(PutArgs, gpa, args_json, .{ .ignore_unknown_fields = true }) catch return dupe(gpa, "bad args");
     defer p.deinit();
-    const bucket = std.mem.trim(u8, p.value.bucket, " \r\n\t");
-    const key = std.mem.trim(u8, p.value.key, " \r\n\t");
+    const bucket = trimArg(p.value.bucket);
+    const key = trimArg(p.value.key);
     if (bucket.len == 0 or key.len == 0) return dupe(gpa, "cf_r2_put needs bucket and key");
     if (!safeRel(bucket)) return dupe(gpa, "bad bucket name");
     if (!safeRel(key)) return dupe(gpa, "object key must look like a relative path (no .., no leading /)");
@@ -271,9 +353,9 @@ fn r2Put(ctx: Ctx, args_json: []const u8) []u8 {
     var data: []u8 = &.{};
     var owned = false;
     defer if (owned) gpa.free(data);
-    if (p.value.file.len > 0) {
+    if (putSource(p.value)) |src| {
         var fb: [900]u8 = undefined;
-        const full = joinWork(ctx, std.mem.trim(u8, p.value.file, " \r\n\t"), &fb) orelse return dupe(gpa, "file must be a relative path inside the workspace");
+        const full = joinWork(ctx, src, &fb) orelse return dupe(gpa, "file must be a relative path inside the workspace");
         data = std.Io.Dir.cwd().readFileAlloc(ctx.io, full, gpa, .limited(MAX_UPLOAD)) catch return dupe(gpa, "could not read that file from the workspace");
         owned = true;
     } else {
@@ -296,15 +378,14 @@ fn r2Put(ctx: Ctx, args_json: []const u8) []u8 {
 /// Download an R2 object into the workspace.
 fn r2Get(ctx: Ctx, args_json: []const u8) []u8 {
     const gpa = ctx.gpa;
-    const A = struct { bucket: []const u8 = "", key: []const u8 = "", file: []const u8 = "" };
-    const p = std.json.parseFromSlice(A, gpa, args_json, .{ .ignore_unknown_fields = true }) catch return dupe(gpa, "bad args");
+    const p = std.json.parseFromSlice(GetArgs, gpa, args_json, .{ .ignore_unknown_fields = true }) catch return dupe(gpa, "bad args");
     defer p.deinit();
-    const bucket = std.mem.trim(u8, p.value.bucket, " \r\n\t");
-    const key = std.mem.trim(u8, p.value.key, " \r\n\t");
+    const bucket = trimArg(p.value.bucket);
+    const key = trimArg(p.value.key);
     if (bucket.len == 0 or key.len == 0) return dupe(gpa, "cf_r2_get needs bucket and key");
     if (!safeRel(bucket)) return dupe(gpa, "bad bucket name");
     if (!safeRel(key)) return dupe(gpa, "object key must look like a relative path");
-    const rel = if (p.value.file.len > 0) std.mem.trim(u8, p.value.file, " \r\n\t") else key;
+    const rel = getDest(p.value);
     var fb: [900]u8 = undefined;
     const full = joinWork(ctx, rel, &fb) orelse return dupe(gpa, "file must be a relative path inside the workspace");
 
@@ -317,7 +398,11 @@ fn r2Get(ctx: Ctx, args_json: []const u8) []u8 {
         defer gpa.free(msg);
         return std.fmt.allocPrint(gpa, "r2 get FAILED — Cloudflare says: {s}", .{msg}) catch dupe(gpa, "r2 get failed");
     }
+    // A key is path-shaped ("2026/08/report.csv") and is the default destination, so its folders may not
+    // exist yet. safeRel already held the path inside the workdir, so every folder made here is too.
+    if (std.fs.path.dirname(full)) |parent| _ = std.Io.Dir.cwd().createDirPathStatus(ctx.io, parent, .default_dir) catch {};
     std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = full, .data = raw }) catch return dupe(gpa, "could not write that file into the workspace");
+    if (ctx.wrote) |w| w.* = true;
     return std.fmt.allocPrint(gpa, "wrote {d} bytes to {s} (from r2://{s}/{s})", .{ raw.len, rel, bucket, key }) catch dupe(gpa, "downloaded");
 }
 
@@ -508,5 +593,153 @@ test "the belt schema is well-formed JSON and names exactly the dispatched verbs
             if (std.mem.eql(u8, r, nm)) found = true;
         }
         try std.testing.expect(found);
+    }
+}
+
+// fileUse is only worth anything if the path it names is the path the verb then opens: a client-mode turn
+// stages THAT file onto this disk before an upload and carries THAT file back after a download. So these
+// tests do not compare fileUse against a spelling — they run the real verbs against a loopback stand-in and
+// look at what reached the wire and what landed on disk.
+
+/// Start a fakehttp stand-in on a port nobody else can hold. fakehttp.Server.start scans up from a fixed port,
+/// but on Windows a listen never refuses a port another process is already listening on (Zig 0.16 binds
+/// through AFD asking for address reuse), so two suites running at once answered each other's requests. A
+/// port-0 bind is always this listener's own.
+fn startStandIn(srv: anytype, io: std.Io, reply: []const u8) !void {
+    try srv.startAt(io, 0, reply);
+    srv.port = srv.server.socket.address.getPort();
+}
+
+fn testIo(gpa: std.mem.Allocator) std.Io.Threaded {
+    const builtin = @import("builtin");
+    // curl is spawned: it needs PATH, which an empty test environment does not carry (harness/TESTING.md)
+    return std.Io.Threaded.init(gpa, .{ .environ = if (builtin.os.tag == .windows) .{ .block = .global } else .{ .block = .{ .slice = std.mem.span(std.c.environ) } } });
+}
+
+test "fileUse names exactly the file each upload sends, and none for a call that opens no file" {
+    const gpa = std.testing.allocator;
+    const fakehttp = @import("fakehttp.zig");
+    var threaded = testIo(gpa);
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-cftools-reads-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, root ++ "/exports", .default_dir) catch {};
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, root ++ "/src", .default_dir) catch {};
+
+    var buf: [MAX_REL]u8 = undefined;
+    const none_cases = [_][2][]const u8{
+        .{ "cf_api", "{\"path\":\"/user\"}" },
+        .{ "cf_d1_query", "{\"database_id\":\"x\",\"sql\":\"select 1\"}" },
+        .{ "cf_r2_list", "{\"bucket\":\"b\"}" },
+        .{ "cf_r2_put", "{\"bucket\":\"b\",\"key\":\"k\",\"text\":\"inline\"}" }, // inline text opens nothing
+        .{ "cf_deploy_worker", "{\"name\":\"w\",\"file\":\"../../.ssh/id_rsa\"}" }, // refused before it is opened
+        .{ "cf_deploy_worker", "{\"name\":\"w\",\"file\":\" \"}" },
+        .{ "cf_r2_get", "not json" },
+        .{ "read_file", "{\"path\":\"x\"}" },
+    };
+    for (none_cases) |c| {
+        if (fileUse(gpa, c[0], c[1], &buf) != .none) {
+            std.debug.print("fileUse named a file for {s} {s}\n", .{ c[0], c[1] });
+            return error.TestUnexpectedResult;
+        }
+    }
+
+    // A decoy sits at the path a naive reading would take (the object KEY), so only the right file carries
+    // the marker onto the wire.
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/exports/report.csv", .data = "PUT-MARKER-5d1c" }) catch return error.TestUnexpectedResult;
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/src/sum.mjs", .data = "export default { fetch() {} } // DEPLOY-MARKER-a93e" }) catch return error.TestUnexpectedResult;
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/k.csv", .data = "DECOY" }) catch return error.TestUnexpectedResult;
+
+    const Case = struct { name: []const u8, args: []const u8, rel: []const u8, marker: []const u8 };
+    const cases = [_]Case{
+        .{ .name = "cf_r2_put", .args = "{\"bucket\":\"b\",\"key\":\"k.csv\",\"file\":\" exports/report.csv \",\"text\":\"a named file wins\"}", .rel = "exports/report.csv", .marker = "PUT-MARKER-5d1c" },
+        .{ .name = "cf_deploy_worker", .args = "{\"name\":\"sum\",\"file\":\"src/sum.mjs\"}", .rel = "src/sum.mjs", .marker = "DEPLOY-MARKER-a93e" },
+    };
+    for (cases) |c| {
+        switch (fileUse(gpa, c.name, c.args, &buf)) {
+            .reads => |rel| try std.testing.expectEqualStrings(c.rel, rel),
+            else => return error.TestUnexpectedResult,
+        }
+        var srv: fakehttp.Server = undefined;
+        startStandIn(&srv, io, fakehttp.wire("{\"success\":true,\"result\":{\"subdomain\":\"veil-sim\"}}")) catch return error.SkipZigTest;
+        var ub: [64]u8 = undefined;
+        const api = std.fmt.bufPrint(&ub, "http://127.0.0.1:{d}/client/v4", .{srv.port}) catch unreachable;
+        const r = dispatch(.{ .gpa = gpa, .io = io, .scratch = root, .workdir = root, .token = "t", .account = "acct", .api_root = api }, c.name, c.args).?;
+        gpa.free(r);
+        srv.stop(); // joins the serve thread; request() is only safe after it
+        if (srv.conns.load(.monotonic) == 0) return error.SkipZigTest; // no curl on this machine: nothing was sent
+        const sent = srv.request();
+        if (std.mem.indexOf(u8, sent, c.marker) == null) {
+            std.debug.print("{s} did not upload the file fileUse named ({s})\n", .{ c.name, c.rel });
+            return error.TestUnexpectedResult;
+        }
+        try std.testing.expect(std.mem.indexOf(u8, sent, "DECOY") == null);
+    }
+}
+
+test "a download lands where fileUse says, folders and all, and only a landed download sets the receipt" {
+    const gpa = std.testing.allocator;
+    const fakehttp = @import("fakehttp.zig");
+    var threaded = testIo(gpa);
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-cftools-writes-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, root ++ "/verify", .default_dir) catch {};
+    var buf: [MAX_REL]u8 = undefined;
+
+    const object = "day,region,requests\n2026-08-01,iad,812\n";
+    {
+        var srv: fakehttp.Server = undefined;
+        startStandIn(&srv, io, fakehttp.wire(object)) catch return error.SkipZigTest;
+        defer srv.stop();
+        var ub: [64]u8 = undefined;
+        const api = std.fmt.bufPrint(&ub, "http://127.0.0.1:{d}/client/v4", .{srv.port}) catch unreachable;
+        // with no `file` the key is the destination — and its folders exist nowhere yet
+        for ([_][2][]const u8{
+            .{ "{\"bucket\":\"b\",\"key\":\"2026/08/report.csv\"}", "2026/08/report.csv" },
+            .{ "{\"bucket\":\"b\",\"key\":\"2026/08/report.csv\",\"file\":\"verify/report.csv\"}", "verify/report.csv" },
+        }) |c| {
+            const rel = switch (fileUse(gpa, "cf_r2_get", c[0], &buf)) {
+                .writes => |w| w,
+                else => return error.TestUnexpectedResult,
+            };
+            try std.testing.expectEqualStrings(c[1], rel);
+            var wrote = false;
+            const r = dispatch(.{ .gpa = gpa, .io = io, .scratch = root, .workdir = root, .token = "t", .account = "acct", .api_root = api, .wrote = &wrote }, "cf_r2_get", c[0]).?;
+            defer gpa.free(r);
+            if (srv.conns.load(.monotonic) == 0) return error.SkipZigTest; // no curl: nothing was fetched
+            var pb: [600]u8 = undefined;
+            const full = std.fmt.bufPrint(&pb, "{s}/{s}", .{ root, rel }) catch unreachable;
+            const got = std.Io.Dir.cwd().readFileAlloc(io, full, gpa, .limited(1 << 16)) catch {
+                std.debug.print("cf_r2_get did not land at the path fileUse named ({s}): {s}\n", .{ rel, r });
+                return error.TestUnexpectedResult;
+            };
+            defer gpa.free(got);
+            try std.testing.expectEqualStrings(object, got);
+            try std.testing.expect(wrote);
+        }
+    }
+    // A miss comes back as the error envelope: nothing is written, the older copy stands, and the receipt
+    // stays unset — which is what keeps a caller from carrying that older copy anywhere as the download.
+    {
+        std.Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/verify/old.csv", .data = "an older copy" }) catch return error.TestUnexpectedResult;
+        var srv: fakehttp.Server = undefined;
+        startStandIn(&srv, io, fakehttp.wire("{\"success\":false,\"errors\":[{\"code\":10007,\"message\":\"The specified key does not exist.\"}]}")) catch return error.SkipZigTest;
+        defer srv.stop();
+        var ub: [64]u8 = undefined;
+        const api = std.fmt.bufPrint(&ub, "http://127.0.0.1:{d}/client/v4", .{srv.port}) catch unreachable;
+        var wrote = false;
+        const r = dispatch(.{ .gpa = gpa, .io = io, .scratch = root, .workdir = root, .token = "t", .account = "acct", .api_root = api, .wrote = &wrote }, "cf_r2_get", "{\"bucket\":\"b\",\"key\":\"gone.csv\",\"file\":\"verify/old.csv\"}").?;
+        defer gpa.free(r);
+        if (srv.conns.load(.monotonic) == 0) return error.SkipZigTest;
+        try std.testing.expect(std.mem.indexOf(u8, r, "FAILED") != null);
+        try std.testing.expect(!wrote);
+        const still = std.Io.Dir.cwd().readFileAlloc(io, root ++ "/verify/old.csv", gpa, .limited(1 << 16)) catch return error.TestUnexpectedResult;
+        defer gpa.free(still);
+        try std.testing.expectEqualStrings("an older copy", still);
     }
 }

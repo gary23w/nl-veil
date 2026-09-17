@@ -670,6 +670,14 @@ const TURN_TOOLS_SANDBOXED_COMPACT = joinDefs(&.{
     tools.terseSchema(tools.compactSchema(tools.sandboxSchema(EXTRA_TOOLS))),
 });
 
+/// The cf_ belt a SANDBOXED turn holding Cloudflare credentials is shown — derived from the sandbox
+/// allowlist exactly as TURN_TOOLS_SANDBOXED is, so what a non-admin is taught and what tools.execute's
+/// gate lets them run cannot drift apart. It is EMPTY today: no cf_ verb is on SANDBOX_TOOLS. Deploying
+/// code and writing to a cloud account are reserved for the server's admin, like casting and scheduling,
+/// so a non-admin who connected an account still chats on its Workers AI but is not shown six verbs that
+/// would each be refused. Putting a verb on the allowlist is the whole change that would advertise it.
+const CF_TOOLS_SANDBOXED = tools.sandboxSchema(cftools.SCHEMA);
+
 /// Resolve THIS turn's granted recipe set (I3): for an admin (.full) the whole registry; for a sandboxed
 /// caller the registry ∩ the user's tool_grants. Called ONCE per turn (turn-stable), so the granted tools'
 /// advertised schemas do not vary with message content — same prefix-cache discipline the two static
@@ -711,7 +719,9 @@ fn buildTurnTools(gpa: std.mem.Allocator, ctx: *const tools.ToolCtx, compact: bo
     // The cf_ family is advertised ONLY to a turn that actually holds Cloudflare credentials, so a user
     // who never connected pays nothing for it and is never taught a verb that would refuse. Turn-stable
     // like the grants below (a login does not change mid-turn), so the prompt-prefix cache is untouched.
-    const cf_on = ctx.cf_token.len > 0 and ctx.cf_account.len > 0;
+    // A sandboxed caller is shown only the verbs its gate admits (CF_TOOLS_SANDBOXED — none, today).
+    const cf_block: []const u8 = if (ctx.caps == .sandboxed) CF_TOOLS_SANDBOXED else cftools.SCHEMA;
+    const cf_on = ctx.cf_token.len > 0 and ctx.cf_account.len > 0 and cf_block.len > 0;
     if (ctx.grants.len == 0 and !cf_on) return base; // common case ⇒ the exact static string, zero allocation
     var b: std.ArrayListUnmanaged(u8) = .empty;
     b.appendSlice(gpa, base) catch {
@@ -723,7 +733,7 @@ fn buildTurnTools(gpa: std.mem.Allocator, ctx: *const tools.ToolCtx, compact: bo
             b.deinit(gpa);
             return base;
         };
-        b.appendSlice(gpa, cftools.SCHEMA) catch {
+        b.appendSlice(gpa, cf_block) catch {
             b.deinit(gpa);
             return base;
         };
@@ -1564,6 +1574,118 @@ test "buildTurnTools: grants extend the cached prefix, they never rewrite it" {
     const b = buildTurnTools(gpa, &ctx, false, &owned2);
     defer if (owned2) |o| gpa.free(o);
     try std.testing.expectEqualStrings(a, b);
+}
+
+test "a turn holding Cloudflare credentials is shown only the cf_ verbs its own gate would run" {
+    // The bug this pins: buildTurnTools appended the whole cf_ belt to ANY turn with a token, while a sandboxed
+    // (non-admin) turn's gate in tools.execute refuses every cf_ name — six verbs taught, six refusals, each a
+    // wasted agentic round. The property is agreement, not a list: every name a turn is shown must pass the gate
+    // that turn runs under.
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    var counters = [_]u32{0} ** 5;
+    var fmtx: std.Io.Mutex = .init;
+    var ctx = tools.ToolCtx{
+        .gpa = gpa,
+        .io = io,
+        .environ = &env,
+        .run_dir = ".",
+        .workdir = ".",
+        .scope = "t",
+        .mind = "t",
+        .round = 0,
+        .mem = osc.Mem.init(gpa, io, "", ""),
+        .files_written = &counters[0],
+        .observed = &counters[1],
+        .skills_saved = &counters[2],
+        .directives_set = &counters[3],
+        .tools_made = &counters[4],
+        .fmtx = &fmtx,
+        .cf_token = "tok",
+        .cf_account = "acct",
+    };
+
+    // An admin turn is shown every verb the belt defines, appended after the untouched static base.
+    for ([_]bool{ false, true }) |compact| {
+        ctx.caps = .full;
+        var owned: ?[]u8 = null;
+        const got = buildTurnTools(gpa, &ctx, compact, &owned);
+        defer if (owned) |o| gpa.free(o);
+        try std.testing.expect(owned != null);
+        try std.testing.expect(std.mem.startsWith(u8, got, if (compact) TURN_TOOLS_COMPACT else TURN_TOOLS_FULL));
+        var shown: usize = 0;
+        var i: usize = 0;
+        while (std.mem.indexOfPos(u8, cftools.SCHEMA, i, "\"name\":\"")) |at| {
+            const s = at + "\"name\":\"".len;
+            const e = std.mem.indexOfScalarPos(u8, cftools.SCHEMA, s, '"') orelse break;
+            var nb: [64]u8 = undefined;
+            const needle = try std.fmt.bufPrint(&nb, "\"name\":\"{s}\"", .{cftools.SCHEMA[s..e]});
+            try std.testing.expect(std.mem.indexOf(u8, got, needle) != null);
+            shown += 1;
+            i = e;
+        }
+        try std.testing.expectEqual(@as(usize, 6), shown);
+    }
+
+    // A sandboxed turn: every name on its belt passes the gate it runs under — and with no cf_ verb on the
+    // allowlist nothing is appended, so it is the static base itself, by pointer: zero allocation, exactly as
+    // for a caller who never connected.
+    inline for (.{ .{ false, TURN_TOOLS_SANDBOXED }, .{ true, TURN_TOOLS_SANDBOXED_COMPACT } }) |v| {
+        ctx.caps = .sandboxed;
+        var owned: ?[]u8 = null;
+        const got = buildTurnTools(gpa, &ctx, v[0], &owned);
+        defer if (owned) |o| gpa.free(o);
+        var i: usize = 0;
+        while (std.mem.indexOfPos(u8, got, i, "\"name\":\"")) |at| {
+            const s = at + "\"name\":\"".len;
+            const e = std.mem.indexOfScalarPos(u8, got, s, '"') orelse break;
+            if (!tools.sandboxAllowed(got[s..e])) {
+                std.debug.print("\na sandboxed turn is shown '{s}', which its gate refuses\n", .{got[s..e]});
+                return error.SandboxAdvertisesRefusedVerb;
+            }
+            i = e;
+        }
+        try std.testing.expect(owned == null);
+        try std.testing.expect(got.ptr == v[1].ptr);
+    }
+}
+
+test "a client-mode turn runs a tool whose credential only this server holds here, never on the client" {
+    // Every verb the cf_ belt defines — read from the belt itself, so a seventh verb cannot slip back into
+    // delegation — runs server-side with its file carried; the client executor holds no Cloudflare pair and
+    // answered every delegated call "not connected".
+    var i: usize = 0;
+    var seen: usize = 0;
+    while (std.mem.indexOfPos(u8, cftools.SCHEMA, i, "\"name\":\"")) |at| {
+        const s = at + "\"name\":\"".len;
+        const e = std.mem.indexOfScalarPos(u8, cftools.SCHEMA, s, '"') orelse break;
+        try std.testing.expectEqual(ClientRoute.cloudflare, clientRoute(cftools.SCHEMA[s..e]));
+        seen += 1;
+        i = e;
+    }
+    try std.testing.expectEqual(@as(usize, 6), seen);
+    try std.testing.expectEqual(ClientRoute.server, clientRoute("get_credential"));
+    // ...and the tools that exist to act on the user's machine still go there
+    for ([_][]const u8{ "write_file", "read_file", "list_dir", "run_python", "browser_navigate", "poll" }) |n|
+        try std.testing.expectEqual(ClientRoute.client, clientRoute(n));
+}
+
+test "syncPath: the channel's name for a file is the same file, or no name at all" {
+    var b: [cftools.MAX_REL]u8 = undefined;
+    try std.testing.expectEqualStrings("worker.mjs", syncPath("worker.mjs", &b).?);
+    try std.testing.expectEqualStrings("src/worker.mjs", syncPath("./src//worker.mjs", &b).?);
+    try std.testing.expectEqualStrings("a/b/c.txt", syncPath("a/./b/c.txt", &b).?);
+    // not carriable: the client would refuse these, so the engine must not ask
+    for ([_][]const u8{ "src\\worker.mjs", "a:b", ".", "./", "../x", "a/../b" }) |bad| {
+        if (syncPath(bad, &b)) |got| {
+            std.debug.print("syncPath carried \"{s}\" as \"{s}\"\n", .{ bad, got });
+            return error.TestUnexpectedResult;
+        }
+    }
 }
 
 test "schedTaskOf: extracts the task id from a run conv, null for ordinary convs" {
@@ -7913,7 +8035,9 @@ fn syncExchange(app: *App, conv_dir: []const u8, workdir: []const u8, ctrl_curso
     emitEvent(app, conv_dir, ev.items);
     const resp = awaitClientResult(app, conv_dir, id, ctrl_cursor, start_offset, SYNC_WAIT_S, SYNC_WAIT_S, null, null) orelse return null;
     defer gpa.free(resp);
-    const parsed = std.json.parseFromSlice(cync.ManifestResp, gpa, resp, .{ .ignore_unknown_fields = true }) catch return null;
+    // .alloc_always is load-bearing: parseFromSlice's default hands back every escape-free string as a slice
+    // INTO `resp`, which is freed on the way out — and the manifest's paths and hashes outlive this function.
+    const parsed = std.json.parseFromSlice(cync.ManifestResp, gpa, resp, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch return null;
     const shared = std.mem.eql(u8, std.mem.trim(u8, parsed.value.probe, " \r\n\t"), token);
     return .{ .shared = shared, .parsed = parsed };
 }
@@ -7973,30 +8097,7 @@ fn pullClientFilesRooted(app: *App, conv_dir: []const u8, workdir: []const u8, c
     if (want == 0) return 0;
 
     // pull the batch and materialize it into the server's workdir
-    var rnd: [8]u8 = undefined;
-    app.io.random(&rnd);
-    var idb: [24]u8 = undefined;
-    const id = std.fmt.bufPrint(&idb, "pull{s}", .{std.fmt.bytesToHex(rnd, .lower)}) catch return 0;
-    var ev: std.ArrayListUnmanaged(u8) = .empty;
-    defer ev.deinit(gpa);
-    const built = blk: {
-        ev.appendSlice(gpa, "{\"kind\":\"file_pull\",\"id\":") catch break :blk false;
-        http.jstr(gpa, &ev, id) catch break :blk false;
-        if (root.len > 0) {
-            ev.appendSlice(gpa, ",\"root\":") catch break :blk false;
-            http.jstr(gpa, &ev, root) catch break :blk false;
-        }
-        ev.appendSlice(gpa, ",\"paths\":[") catch break :blk false;
-        ev.appendSlice(gpa, paths.items) catch break :blk false;
-        ev.appendSlice(gpa, "]}") catch break :blk false;
-        break :blk true;
-    };
-    if (!built) return 0;
-    const start_offset = toolResultsLen(app, conv_dir);
-    emitEvent(app, conv_dir, ev.items);
-    const resp = awaitClientResult(app, conv_dir, id, ctrl_cursor, start_offset, SYNC_WAIT_S, SYNC_WAIT_S, null, null) orelse return 0;
-    defer gpa.free(resp);
-    const parsed = std.json.parseFromSlice(cync.PullResp, gpa, resp, .{ .ignore_unknown_fields = true }) catch return 0;
+    const parsed = pullRequest(app, conv_dir, ctrl_cursor, root, paths.items) orelse return 0;
     defer parsed.deinit();
     var got: usize = 0;
     for (parsed.value.files) |f| {
@@ -8012,6 +8113,40 @@ fn pullClientFilesRooted(app: *App, conv_dir: []const u8, workdir: []const u8, c
         emitKV(app, conv_dir, "status", "text", std.fmt.bufPrint(&sb, "pulled {d} file(s) from your machine", .{got}) catch "pulled your files");
     }
     return @intCast(got);
+}
+
+/// One file_pull round-trip: ask the client for `paths_json` (JSON strings, comma-joined — the inside of the
+/// array) from its conversation workdir, or from `root` when non-empty, and return its parsed answer. null =
+/// the frame could not be built, the client never answered (or a stop landed), or the answer was unreadable.
+/// Writes nothing: what to do with the bytes is the caller's call — a cast pull materializes every safe
+/// file, a cf_ read-back only compares.
+fn pullRequest(app: *App, conv_dir: []const u8, ctrl_cursor: usize, root: []const u8, paths_json: []const u8) ?std.json.Parsed(cync.PullResp) {
+    const gpa = app.gpa;
+    var rnd: [8]u8 = undefined;
+    app.io.random(&rnd);
+    var idb: [24]u8 = undefined;
+    const id = std.fmt.bufPrint(&idb, "pull{s}", .{std.fmt.bytesToHex(rnd, .lower)}) catch return null;
+    var ev: std.ArrayListUnmanaged(u8) = .empty;
+    defer ev.deinit(gpa);
+    const built = blk: {
+        ev.appendSlice(gpa, "{\"kind\":\"file_pull\",\"id\":") catch break :blk false;
+        http.jstr(gpa, &ev, id) catch break :blk false;
+        if (root.len > 0) {
+            ev.appendSlice(gpa, ",\"root\":") catch break :blk false;
+            http.jstr(gpa, &ev, root) catch break :blk false;
+        }
+        ev.appendSlice(gpa, ",\"paths\":[") catch break :blk false;
+        ev.appendSlice(gpa, paths_json) catch break :blk false;
+        ev.appendSlice(gpa, "]}") catch break :blk false;
+        break :blk true;
+    };
+    if (!built) return null;
+    const start_offset = toolResultsLen(app, conv_dir);
+    emitEvent(app, conv_dir, ev.items);
+    const resp = awaitClientResult(app, conv_dir, id, ctrl_cursor, start_offset, SYNC_WAIT_S, SYNC_WAIT_S, null, null) orelse return null;
+    defer gpa.free(resp);
+    // .alloc_always: the parsed paths and contents outlive `resp`, which is freed on the way out
+    return std.json.parseFromSlice(cync.PullResp, gpa, resp, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch null;
 }
 
 /// CLIENT MODE, hive done (server→client): a finished cast's files exist only in the SERVER's run dir, but every
@@ -8122,6 +8257,626 @@ fn emitRunDirFiles(app: *App, conv_dir: []const u8, abs_dir: []const u8, rel: []
             },
             else => {},
         }
+    }
+}
+
+// ------------------------------------------------------------------ CLIENT-MODE cf_ CALLS
+
+/// Where a CLIENT-MODE turn runs a mind tool (orchestration verbs never get here — orchTool answers them first).
+/// Delegation exists so file, shell and code tools act on the USER's machine. A tool whose authority is a
+/// credential this server holds for the turn cannot run there: the client executor is handed none
+/// (exec_tool.runTool builds its ToolCtx with no durable_path and no Cloudflare pair), so delegated, such a
+/// tool can only answer that it is not connected.
+///   .server      get_credential — its store is this server's memories.jsonl
+///   .cloudflare  the cf_ family — its token must never ride a tool_request frame into events.jsonl, so it
+///                runs here, and the one file a call touches crosses instead (cfClientTool)
+///   .client      everything else
+const ClientRoute = enum { client, server, cloudflare };
+
+fn clientRoute(name: []const u8) ClientRoute {
+    if (std.mem.eql(u8, name, "get_credential")) return .server;
+    if (std.mem.startsWith(u8, name, "cf_")) return .cloudflare; // the whole prefix is the family's (tools.isBuiltinTool)
+    return .client;
+}
+
+/// A cf_ call in a CLIENT-MODE turn. The call runs HERE, with this turn's credentials, while the workspace the
+/// model works in is the client's disk. So the one file the call touches (cftools.fileUse) crosses over:
+///
+///   reads   the client's current bytes are staged into this server's copy of the workdir before the upload
+///           (stageClientFile). If they cannot be, nothing is sent to Cloudflare — and the server's copy is
+///           never uploaded in their place: it can be an older version of a file the user has since changed.
+///   writes  the download lands in the server's copy, is pushed to the client, and is read back from there
+///           (carryWrittenFile). A file that did not arrive says so in the result.
+///
+/// Both directions start with the sync protocol's same-disk probe. When the desk and this server share one data
+/// directory — the usual install — both already read the same folder: nothing is transferred, and a binary or
+/// large file works exactly as it does in a server-side turn. Only a client on another disk (`veil chat` in its
+/// own folder, a remote desk) is limited to what the file channel carries: text, up to cync.FILE_CAP.
+fn cfClientTool(app: *App, ctx: *tools.ToolCtx, conv_dir: []const u8, ctrl_cursor: usize, name: []const u8, args: []const u8, no_ack_streak: *u32) []u8 {
+    const gpa = app.gpa;
+    // Not connected: the verb refuses on its own, and fetching a file for it first would be a wasted round trip.
+    if (ctx.cf_token.len == 0 or ctx.cf_account.len == 0) return tools.execute(ctx, name, args);
+    var rb: [cftools.MAX_REL]u8 = undefined;
+    switch (cftools.fileUse(gpa, name, args, &rb)) {
+        .none => return tools.execute(ctx, name, args),
+        .reads => |rel| {
+            if (stageClientFile(app, conv_dir, ctx.workdir, ctrl_cursor, rel, no_ack_streak)) |refusal| return refusal;
+            return tools.execute(ctx, name, args);
+        },
+        .writes => |rel| {
+            var wrote = false;
+            ctx.cf_wrote = &wrote;
+            const result = tools.execute(ctx, name, args);
+            ctx.cf_wrote = null;
+            if (!wrote) return result; // the download failed: there is nothing to carry, and nothing older may go in its place
+            const note = carryWrittenFile(app, conv_dir, ctx.workdir, ctrl_cursor, rel, no_ack_streak) orelse return result;
+            defer gpa.free(note);
+            const noted = std.fmt.allocPrint(gpa, "{s}\n{s}", .{ result, note }) catch return result;
+            gpa.free(result);
+            return noted;
+        },
+    }
+}
+
+const CfBridge = error{ ClientGone, Stopped, NoAnswer };
+
+/// The probe + manifest exchange a cf_ file transfer starts with, keeping the turn's client-absence latch the way
+/// delegateTool keeps it: a client that already proved absent this turn is not waited on again, silence counts
+/// toward the latch, and any answer clears it.
+fn cfSync(app: *App, conv_dir: []const u8, workdir: []const u8, ctrl_cursor: usize, no_ack_streak: *u32) CfBridge!SyncInfo {
+    if (no_ack_streak.* >= CLIENT_GONE_AFTER) return error.ClientGone;
+    if (syncExchange(app, conv_dir, workdir, ctrl_cursor, "")) |si| {
+        no_ack_streak.* = 0;
+        return si;
+    }
+    return cfSilence(app, conv_dir, ctrl_cursor, no_ack_streak);
+}
+
+/// A client round-trip came back empty-handed: a stop the user pressed, or silence that counts toward absence.
+fn cfSilence(app: *App, conv_dir: []const u8, ctrl_cursor: usize, no_ack_streak: *u32) CfBridge {
+    if (stopRequestedSince(app, conv_dir, ctrl_cursor)) return error.Stopped;
+    no_ack_streak.* += 1;
+    return error.NoAnswer;
+}
+
+fn cfText(gpa: std.mem.Allocator, comptime fmt: []const u8, args: anytype) []u8 {
+    return std.fmt.allocPrint(gpa, fmt, args) catch emptyRes();
+}
+
+/// Stage the client's copy of `rel` into `workdir` (this server's copy of the conversation workdir) for a cf_
+/// upload. null = staged: the server's copy now holds the client's bytes, or both sides read one directory.
+/// Otherwise a gpa-owned refusal for the model, and the caller must not make the call.
+fn stageClientFile(app: *App, conv_dir: []const u8, workdir: []const u8, ctrl_cursor: usize, rel: []const u8, no_ack_streak: *u32) ?[]u8 {
+    const gpa = app.gpa;
+    var si = cfSync(app, conv_dir, workdir, ctrl_cursor, no_ack_streak) catch |e| return cfStageRefusal(gpa, e, rel);
+    defer si.deinit();
+    if (si.shared) return null; // one directory: the call reads the client's file where it lies
+    var pb: [cftools.MAX_REL]u8 = undefined;
+    const sp = syncPath(rel, &pb) orelse
+        return cfText(gpa, "(nothing was sent to Cloudflare: \"{s}\" is not a path that can be fetched from the user's machine. Name the file as a plain workspace-relative path with forward slashes, like src/worker.mjs, and call again.)", .{rel});
+    var fb: [1700]u8 = undefined;
+    const full = std.fmt.bufPrint(&fb, "{s}/{s}", .{ workdir, sp }) catch return cfText(gpa, "(nothing was sent to Cloudflare: the workdir path for {s} is too long)", .{rel});
+    // The manifest carries a content hash per client file: when the server's copy already matches, there is
+    // nothing to transfer. (Absence from the manifest proves nothing — it lists at most cync.MAX_FILES — so a
+    // miss falls through to asking for the file by name.)
+    if (si.manifest()) |m| {
+        if (std.Io.Dir.cwd().readFileAlloc(app.io, full, gpa, .limited(cync.FILE_CAP)) catch null) |cur| {
+            defer gpa.free(cur);
+            var hb: [16]u8 = undefined;
+            if (clientHasFile(m, sp, cync.hashHex(cur, &hb))) return null;
+        }
+    }
+    var want: std.ArrayListUnmanaged(u8) = .empty;
+    defer want.deinit(gpa);
+    http.jstr(gpa, &want, sp) catch return cfText(gpa, "(nothing was sent to Cloudflare: out of memory asking for {s})", .{rel});
+    const parsed = pullRequest(app, conv_dir, ctrl_cursor, "", want.items) orelse
+        return cfStageRefusal(gpa, cfSilence(app, conv_dir, ctrl_cursor, no_ack_streak), rel);
+    defer parsed.deinit();
+    for (parsed.value.files) |f| {
+        // exactly the file asked for, within the channel's cap (as the cast pull holds it) — a reply naming any
+        // other path writes nothing
+        if (!std.mem.eql(u8, f.p, sp) or f.c.len == 0 or f.c.len > cync.FILE_CAP) continue;
+        if (std.fs.path.dirname(full)) |parent| _ = std.Io.Dir.cwd().createDirPathStatus(app.io, parent, .default_dir) catch {};
+        std.Io.Dir.cwd().writeFile(app.io, .{ .sub_path = full, .data = f.c }) catch
+            return cfText(gpa, "(nothing was sent to Cloudflare: {s} arrived from the user's machine but could not be written to the server's copy of the workdir)", .{rel});
+        var sb: [200]u8 = undefined;
+        emitKV(app, conv_dir, "status", "text", std.fmt.bufPrint(&sb, "pulled {s} from your machine for the Cloudflare call", .{clipBytes(sp, 120)}) catch "pulled a file from your machine for the Cloudflare call");
+        return null;
+    }
+    return cfText(gpa, "(nothing was sent to Cloudflare: {s} could not be read from the user's machine. Either it is not in this conversation's workdir there (check with list_dir), or it is binary or larger than {d} KB, which the desk/CLI file channel cannot carry.)", .{ rel, cync.FILE_CAP >> 10 });
+}
+
+fn cfStageRefusal(gpa: std.mem.Allocator, e: CfBridge, rel: []const u8) []u8 {
+    return switch (e) {
+        error.Stopped => cfText(gpa, "(STOP requested by the user — this call was canceled before anything was sent to Cloudflare. Do NOT retry it; acknowledge the stop and end the turn.)", .{}),
+        error.ClientGone => cfText(gpa, "(nothing was sent to Cloudflare: {s} is on the user's machine, and the desk/CLI stopped answering earlier this turn, so it could not be read from there. That is the tool bridge, not Cloudflare — tell the user it is not responding.)", .{rel}),
+        error.NoAnswer => cfText(gpa, "(nothing was sent to Cloudflare: {s} is on the user's machine, and the desk/CLI did not answer the request for it. That is the tool bridge, not Cloudflare — if it repeats, tell the user it is not responding.)", .{rel}),
+    };
+}
+
+/// After a cf_ download landed at `rel` in `workdir` (this server's copy): put the same bytes on the client's
+/// disk, then read them back from there. null = nothing to add (both sides read one directory, or the file
+/// read back byte-identical). Otherwise a gpa-owned "(engine: ...)" note: the download succeeded, but the file
+/// is not confirmed on the user's machine, and the model must not report it as there.
+fn carryWrittenFile(app: *App, conv_dir: []const u8, workdir: []const u8, ctrl_cursor: usize, rel: []const u8, no_ack_streak: *u32) ?[]u8 {
+    const gpa = app.gpa;
+    var si = cfSync(app, conv_dir, workdir, ctrl_cursor, no_ack_streak) catch |e| return cfCarryNote(gpa, e, rel);
+    defer si.deinit();
+    if (si.shared) return null; // the client reads the very folder the download landed in
+    var pb: [cftools.MAX_REL]u8 = undefined;
+    const sp = syncPath(rel, &pb) orelse
+        return cfText(gpa, "(engine: the download landed in the server's copy of the workdir, but \"{s}\" is not a path that can be carried to the user's machine — download it again with `file` set to a plain relative path with forward slashes.)", .{rel});
+    var fb: [1700]u8 = undefined;
+    const full = std.fmt.bufPrint(&fb, "{s}/{s}", .{ workdir, sp }) catch return cfText(gpa, "(engine: {s} landed in the server's copy of the workdir, but its path is too long to carry to the user's machine)", .{rel});
+    const data = std.Io.Dir.cwd().readFileAlloc(app.io, full, gpa, .limited(cync.FILE_CAP + 1)) catch
+        return cfText(gpa, "(engine: {s} landed in the server's copy of the workdir, but it is larger than {d} KB, which the desk/CLI file channel cannot carry — it is NOT on the user's machine.)", .{ rel, cync.FILE_CAP >> 10 });
+    defer gpa.free(data);
+    if (!carriable(data))
+        return cfText(gpa, "(engine: {s} landed in the server's copy of the workdir, but it is empty, binary or larger than {d} KB, which the desk/CLI file channel cannot carry — it is NOT on the user's machine.)", .{ rel, cync.FILE_CAP >> 10 });
+
+    var ev: std.ArrayListUnmanaged(u8) = .empty;
+    defer ev.deinit(gpa);
+    const built = blk: {
+        ev.appendSlice(gpa, "{\"kind\":\"file_sync\",\"path\":") catch break :blk false;
+        http.jstr(gpa, &ev, sp) catch break :blk false;
+        ev.appendSlice(gpa, ",\"content\":") catch break :blk false;
+        http.jstr(gpa, &ev, data) catch break :blk false;
+        ev.append(gpa, '}') catch break :blk false;
+        break :blk true;
+    };
+    if (!built) return cfText(gpa, "(engine: {s} landed in the server's copy of the workdir, but it could not be sent to the user's machine — out of memory)", .{rel});
+    emitEvent(app, conv_dir, ev.items);
+
+    // READ IT BACK. file_sync is fire-and-forget, with no answer: a client whose write failed, or one that does not
+    // apply this conversation's pushes (desks before the background-sync fix skipped them for a conversation that
+    // was not on screen), would otherwise leave the model reporting a file that is not there. Clients handle frames
+    // in order, so this answer is read from the disk after the push was applied.
+    var want: std.ArrayListUnmanaged(u8) = .empty;
+    defer want.deinit(gpa);
+    http.jstr(gpa, &want, sp) catch return null;
+    const parsed = pullRequest(app, conv_dir, ctrl_cursor, "", want.items) orelse
+        return cfCarryNote(gpa, cfSilence(app, conv_dir, ctrl_cursor, no_ack_streak), rel);
+    defer parsed.deinit();
+    for (parsed.value.files) |f| {
+        if (std.mem.eql(u8, f.p, sp) and std.mem.eql(u8, f.c, data)) return null; // arrived, byte for byte
+    }
+    return cfText(gpa, "(engine: {s} landed in the server's copy of the workdir and was sent to the user's machine, but it did not read back there, so it is NOT confirmed on their disk — do not report it as saved there.)", .{rel});
+}
+
+fn cfCarryNote(gpa: std.mem.Allocator, e: CfBridge, rel: []const u8) []u8 {
+    return switch (e) {
+        error.Stopped => cfText(gpa, "(engine: {s} landed in the server's copy of the workdir; the user's stop arrived before it could be carried to their machine.)", .{rel}),
+        error.ClientGone, error.NoAnswer => cfText(gpa, "(engine: {s} landed in the server's copy of the workdir, but the desk/CLI is not answering, so it is NOT on the user's machine — do not report it as saved there.)", .{rel}),
+    };
+}
+
+/// Can the file channel carry these bytes to the client and back unchanged? Text by the channel's own rule
+/// (cync.isTextContent), valid UTF-8 (a JSON string cannot hold anything else intact), within cync.FILE_CAP,
+/// and non-empty (the channel skips an empty file on the way back, so it could never be confirmed).
+fn carriable(data: []const u8) bool {
+    return data.len > 0 and data.len <= cync.FILE_CAP and cync.isTextContent(data) and std.unicode.utf8ValidateSlice(data);
+}
+
+/// `rel` as the sync channel names a file: "." and empty segments dropped, so "./src//worker.mjs" becomes
+/// "src/worker.mjs" — the same file on every OS. null when the rest is not a path the channel carries (a
+/// backslash, a drive or stream colon, "..") — cync.safeSyncPath has the final word, and the client applies it too.
+fn syncPath(rel: []const u8, buf: *[cftools.MAX_REL]u8) ?[]const u8 {
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, rel, '/');
+    while (it.next()) |seg| {
+        if (seg.len == 0 or std.mem.eql(u8, seg, ".")) continue;
+        const sep: usize = if (n > 0) 1 else 0;
+        if (n + sep + seg.len > buf.len) return null;
+        if (sep == 1) buf[n] = '/';
+        @memcpy(buf[n + sep ..][0..seg.len], seg);
+        n += sep + seg.len;
+    }
+    const out = buf[0..n];
+    return if (cync.safeSyncPath(out)) out else null;
+}
+
+/// TEST ONLY. The far end of the delegation channel, doing with the sync frames what the desk and `veil chat`
+/// do: answer sync_request with its folder's manifest and file_pull with the named files — through the same
+/// cync functions both real clients call — and write file_sync pushes into its folder. Its answers land in
+/// tool_results.jsonl in the exact line shape service.toolResult appends. A folder that IS the server's workdir
+/// is the same-disk install; any other folder is a client on another disk.
+const TestSyncClient = struct {
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    conv_dir: []const u8,
+    folder: []const u8,
+    /// false = a client that answers sync requests but never writes a pushed file (a failed write, or a desk from
+    /// before the background-sync fix, which skipped pushes for a conversation that was not on screen)
+    apply_pushes: bool = true,
+    stopping: std.atomic.Value(bool) = .init(false),
+    thread: ?std.Thread = null,
+
+    fn start(self: *TestSyncClient) !void {
+        self.thread = try std.Thread.spawn(.{}, loop, .{self});
+    }
+
+    fn stop(self: *TestSyncClient) void {
+        self.stopping.store(true, .release);
+        if (self.thread) |t| t.join();
+        self.thread = null;
+    }
+
+    fn loop(self: *TestSyncClient) void {
+        var from: usize = 0;
+        while (!self.stopping.load(.acquire)) {
+            from = self.pump(from);
+            sleepMsRaw(self.io, 15);
+        }
+    }
+
+    fn pump(self: *TestSyncClient, from: usize) usize {
+        var pb: [400]u8 = undefined;
+        const path = std.fmt.bufPrint(&pb, "{s}/events.jsonl", .{self.conv_dir}) catch return from;
+        const data = std.Io.Dir.cwd().readFileAlloc(self.io, path, self.gpa, .limited(64 << 20)) catch return from;
+        defer self.gpa.free(data);
+        if (data.len <= from) return from;
+        const end = from + 1 + (std.mem.lastIndexOfScalar(u8, data[from..], '\n') orelse return from);
+        var it = std.mem.splitScalar(u8, data[from..end], '\n');
+        while (it.next()) |ln| {
+            if (ln.len > 0) self.serve(ln);
+        }
+        return end;
+    }
+
+    fn serve(self: *TestSyncClient, line: []const u8) void {
+        const F = struct { kind: []const u8 = "", id: []const u8 = "", path: []const u8 = "", content: []const u8 = "" };
+        const p = std.json.parseFromSlice(F, self.gpa, line, .{ .ignore_unknown_fields = true }) catch return;
+        defer p.deinit();
+        const f = p.value;
+        if (std.mem.eql(u8, f.kind, "file_sync")) {
+            if (!self.apply_pushes or !cync.safeSyncPath(f.path)) return;
+            var fb: [700]u8 = undefined;
+            const full = std.fmt.bufPrint(&fb, "{s}/{s}", .{ self.folder, f.path }) catch return;
+            if (std.fs.path.dirname(full)) |parent| _ = std.Io.Dir.cwd().createDirPathStatus(self.io, parent, .default_dir) catch {};
+            std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = full, .data = f.content }) catch {};
+        } else if (std.mem.eql(u8, f.kind, "sync_request")) {
+            const resp = cync.manifestResponse(self.gpa, self.io, self.folder);
+            defer self.gpa.free(resp);
+            self.post(f.id, resp);
+        } else if (std.mem.eql(u8, f.kind, "file_pull")) {
+            const resp = cync.readResponse(self.gpa, self.io, self.folder, line);
+            defer self.gpa.free(resp);
+            self.post(f.id, resp);
+        }
+    }
+
+    fn post(self: *TestSyncClient, id: []const u8, result: []const u8) void {
+        var l: std.ArrayListUnmanaged(u8) = .empty;
+        defer l.deinit(self.gpa);
+        l.appendSlice(self.gpa, "{\"id\":") catch return;
+        http.jstr(self.gpa, &l, id) catch return;
+        l.appendSlice(self.gpa, ",\"result\":") catch return;
+        http.jstr(self.gpa, &l, result) catch return;
+        l.appendSlice(self.gpa, "}\n") catch return;
+        var pb: [400]u8 = undefined;
+        const path = std.fmt.bufPrint(&pb, "{s}/tool_results.jsonl", .{self.conv_dir}) catch return;
+        http.appendFile(self.io, self.gpa, path, l.items) catch {};
+    }
+};
+
+/// TEST ONLY. The turn's ToolCtx for a cf_ call, reduced to what the call reads: a server workdir, a run dir for
+/// curl's scratch files, and a Cloudflare pair pointed at `api` (a loopback stand-in).
+fn cfTestCtx(gpa: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, run_dir: []const u8, work: []const u8, api: []const u8, counters: *[5]u32, fmtx: *std.Io.Mutex) tools.ToolCtx {
+    return .{
+        .gpa = gpa,
+        .io = io,
+        .environ = env,
+        .run_dir = run_dir,
+        .workdir = work,
+        .scope = "t",
+        .mind = "t",
+        .round = 0,
+        .mem = osc.Mem.init(gpa, io, "", ""),
+        .files_written = &counters[0],
+        .observed = &counters[1],
+        .skills_saved = &counters[2],
+        .directives_set = &counters[3],
+        .tools_made = &counters[4],
+        .fmtx = fmtx,
+        .cf_token = "tok",
+        .cf_account = "acct",
+        .cf_api_root = api,
+    };
+}
+
+/// TEST ONLY. A fakehttp stand-in on a port of its own: on Windows a listen does not refuse a port another
+/// process holds (Zig 0.16 binds through AFD asking for address reuse), so fakehttp.Server.start's fixed-port
+/// scan let two suites running at once answer each other's requests. A port-0 bind cannot collide.
+fn startStandIn(srv: anytype, io: std.Io, reply: []const u8) !void {
+    try srv.startAt(io, 0, reply);
+    srv.port = srv.server.socket.address.getPort();
+}
+
+fn testFile(io: std.Io, gpa: std.mem.Allocator, path: []const u8) ?[]u8 {
+    return std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 20)) catch null;
+}
+
+fn testFrames(io: std.Io, gpa: std.mem.Allocator, conv_dir: []const u8, kind: []const u8) usize {
+    var pb: [400]u8 = undefined;
+    const path = std.fmt.bufPrint(&pb, "{s}/events.jsonl", .{conv_dir}) catch return 0;
+    const ev = testFile(io, gpa, path) orelse return 0;
+    defer gpa.free(ev);
+    var kb: [64]u8 = undefined;
+    const needle = std.fmt.bufPrint(&kb, "\"kind\":\"{s}\"", .{kind}) catch return 0;
+    return std.mem.count(u8, ev, needle);
+}
+
+test "a client-mode upload sends the client's bytes: nothing moves on a shared disk, and the server's older copy is never sent in their place" {
+    const gpa = std.testing.allocator;
+    const fakehttp = @import("../fakehttp.zig");
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-cfclient-up-tmp";
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    var ta = try http.testApp(gpa, io, root);
+    defer ta.deinit();
+    const app = &ta.app;
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    var counters = [_]u32{0} ** 5;
+    var fmtx: std.Io.Mutex = .init;
+    const deployed = fakehttp.wire("{\"success\":true,\"result\":{\"subdomain\":\"veil-sim\"}}");
+
+    // SHARED DISK — the desk and this server read one data directory. The probe round-trips, and the call
+    // reads the client's file where it lies: one sync_request, zero transfers.
+    {
+        const conv_dir = root ++ "/shared/conv";
+        const run_dir = root ++ "/shared/build";
+        const work = run_dir ++ "/work";
+        for ([_][]const u8{ conv_dir, work }) |d| _ = std.Io.Dir.cwd().createDirPathStatus(io, d, .default_dir) catch {};
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = work ++ "/sum.mjs", .data = "export default { fetch() {} } // SHARED-a1" });
+        var client = TestSyncClient{ .gpa = gpa, .io = io, .conv_dir = conv_dir, .folder = work };
+        try client.start();
+        defer client.stop();
+        var srv: fakehttp.Server = undefined;
+        startStandIn(&srv, io, deployed) catch return error.SkipZigTest;
+        var ub: [64]u8 = undefined;
+        var ctx = cfTestCtx(gpa, io, &env, run_dir, work, try std.fmt.bufPrint(&ub, "http://127.0.0.1:{d}/client/v4", .{srv.port}), &counters, &fmtx);
+        var streak: u32 = 0;
+        const r = cfClientTool(app, &ctx, conv_dir, 0, "cf_deploy_worker", "{\"name\":\"sum\",\"file\":\"sum.mjs\"}", &streak);
+        defer gpa.free(r);
+        srv.stop();
+        if (srv.conns.load(.monotonic) == 0) return error.SkipZigTest; // no curl on this machine: nothing was sent anywhere
+        try std.testing.expect(std.mem.indexOf(u8, r, "https://sum.veil-sim.workers.dev") != null);
+        try std.testing.expect(std.mem.indexOf(u8, srv.request(), "SHARED-a1") != null);
+        try std.testing.expectEqual(@as(usize, 1), testFrames(io, gpa, conv_dir, "sync_request"));
+        try std.testing.expectEqual(@as(usize, 0), testFrames(io, gpa, conv_dir, "file_pull"));
+    }
+
+    // SEPARATE DISKS — `veil chat` in its own folder, or a desk on another machine. The server's copy is an
+    // OLDER version of the file; the client's is the one the user means.
+    const conv_dir = root ++ "/apart/conv";
+    const run_dir = root ++ "/apart/build";
+    const work = run_dir ++ "/work";
+    const folder = root ++ "/apart/client";
+    for ([_][]const u8{ conv_dir, work ++ "/src", folder ++ "/src" }) |d| _ = std.Io.Dir.cwd().createDirPathStatus(io, d, .default_dir) catch {};
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = work ++ "/src/sum.mjs", .data = "// STALE-b0: the server's older copy" });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = folder ++ "/src/sum.mjs", .data = "export default { fetch() {} } // FRESH-b1" });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = work ++ "/old.mjs", .data = "// STALE-c0: only the server has this" });
+    var client = TestSyncClient{ .gpa = gpa, .io = io, .conv_dir = conv_dir, .folder = folder };
+    try client.start();
+    defer client.stop();
+
+    // the client's bytes are staged over the older copy and uploaded — named "./src/sum.mjs", which the channel
+    // carries as src/sum.mjs
+    {
+        var srv: fakehttp.Server = undefined;
+        startStandIn(&srv, io, deployed) catch return error.SkipZigTest;
+        var ub: [64]u8 = undefined;
+        var ctx = cfTestCtx(gpa, io, &env, run_dir, work, try std.fmt.bufPrint(&ub, "http://127.0.0.1:{d}/client/v4", .{srv.port}), &counters, &fmtx);
+        var streak: u32 = 0;
+        const r = cfClientTool(app, &ctx, conv_dir, 0, "cf_deploy_worker", "{\"name\":\"sum\",\"file\":\"./src/sum.mjs\"}", &streak);
+        defer gpa.free(r);
+        srv.stop();
+        if (srv.conns.load(.monotonic) == 0) return error.SkipZigTest;
+        const sent = srv.request();
+        try std.testing.expect(std.mem.indexOf(u8, sent, "FRESH-b1") != null);
+        try std.testing.expect(std.mem.indexOf(u8, sent, "STALE-b0") == null);
+        const staged = testFile(io, gpa, work ++ "/src/sum.mjs") orelse return error.TestUnexpectedResult;
+        defer gpa.free(staged);
+        try std.testing.expectEqualStrings("export default { fetch() {} } // FRESH-b1", staged);
+        try std.testing.expectEqual(@as(usize, 1), testFrames(io, gpa, conv_dir, "file_pull"));
+    }
+
+    // Deployed again with nothing changed: the manifest's hash already matches the server's copy, so the probe
+    // is the only round trip — no file is asked for twice. (This reads the manifest's paths and hashes after
+    // the exchange returns, which is what the parse's .alloc_always keeps alive.)
+    {
+        var srv: fakehttp.Server = undefined;
+        startStandIn(&srv, io, deployed) catch return error.SkipZigTest;
+        var ub: [64]u8 = undefined;
+        var ctx = cfTestCtx(gpa, io, &env, run_dir, work, try std.fmt.bufPrint(&ub, "http://127.0.0.1:{d}/client/v4", .{srv.port}), &counters, &fmtx);
+        var streak: u32 = 0;
+        const r = cfClientTool(app, &ctx, conv_dir, 0, "cf_deploy_worker", "{\"name\":\"sum\",\"file\":\"src/sum.mjs\"}", &streak);
+        defer gpa.free(r);
+        srv.stop();
+        try std.testing.expect(std.mem.indexOf(u8, srv.request(), "FRESH-b1") != null);
+        try std.testing.expectEqual(@as(usize, 2), testFrames(io, gpa, conv_dir, "sync_request"));
+        try std.testing.expectEqual(@as(usize, 1), testFrames(io, gpa, conv_dir, "file_pull"));
+    }
+
+    // The client has no such file, and the server still holds an older one: refused, and NOTHING reaches the API.
+    {
+        var srv: fakehttp.Server = undefined;
+        startStandIn(&srv, io, deployed) catch return error.SkipZigTest;
+        var ub: [64]u8 = undefined;
+        var ctx = cfTestCtx(gpa, io, &env, run_dir, work, try std.fmt.bufPrint(&ub, "http://127.0.0.1:{d}/client/v4", .{srv.port}), &counters, &fmtx);
+        var streak: u32 = 0;
+        const r = cfClientTool(app, &ctx, conv_dir, 0, "cf_deploy_worker", "{\"name\":\"old\",\"file\":\"old.mjs\"}", &streak);
+        defer gpa.free(r);
+        srv.stop();
+        try std.testing.expect(std.mem.startsWith(u8, r, "(nothing was sent to Cloudflare"));
+        try std.testing.expectEqual(@as(u32, 0), srv.conns.load(.monotonic));
+        try std.testing.expectEqual(@as(u32, 0), streak); // the client answered: present, just without the file
+    }
+}
+
+test "a client-mode download reaches the client's disk and reads back from it; what the channel cannot carry is said, not assumed" {
+    const gpa = std.testing.allocator;
+    const fakehttp = @import("../fakehttp.zig");
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-cfclient-down-tmp";
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    var ta = try http.testApp(gpa, io, root);
+    defer ta.deinit();
+    const app = &ta.app;
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    var counters = [_]u32{0} ** 5;
+    var fmtx: std.Io.Mutex = .init;
+    const conv_dir = root ++ "/conv";
+    const run_dir = root ++ "/build";
+    const work = run_dir ++ "/work";
+    const folder = root ++ "/client";
+    for ([_][]const u8{ conv_dir, work, folder }) |d| _ = std.Io.Dir.cwd().createDirPathStatus(io, d, .default_dir) catch {};
+    var client = TestSyncClient{ .gpa = gpa, .io = io, .conv_dir = conv_dir, .folder = folder };
+    try client.start();
+    defer client.stop();
+
+    // text: it lands in the server's copy, is pushed, and reads back byte-identical — so the result carries no note
+    {
+        const object = "day,region,requests\n2026-08-01,iad,812\n";
+        var srv: fakehttp.Server = undefined;
+        startStandIn(&srv, io, fakehttp.wire(object)) catch return error.SkipZigTest;
+        defer srv.stop();
+        var ub: [64]u8 = undefined;
+        var ctx = cfTestCtx(gpa, io, &env, run_dir, work, try std.fmt.bufPrint(&ub, "http://127.0.0.1:{d}/client/v4", .{srv.port}), &counters, &fmtx);
+        var streak: u32 = 0;
+        const r = cfClientTool(app, &ctx, conv_dir, 0, "cf_r2_get", "{\"bucket\":\"b\",\"key\":\"2026/08/report.csv\",\"file\":\"verify/report.csv\"}", &streak);
+        defer gpa.free(r);
+        if (srv.conns.load(.monotonic) == 0) return error.SkipZigTest;
+        try std.testing.expect(ctx.cf_wrote == null); // the receipt is armed for one call only
+        if (std.mem.indexOf(u8, r, "(engine:") != null) {
+            std.debug.print("\na delivered download carried a note: {s}\n", .{r});
+            return error.TestUnexpectedResult;
+        }
+        const there = testFile(io, gpa, folder ++ "/verify/report.csv") orelse return error.TestUnexpectedResult;
+        defer gpa.free(there);
+        try std.testing.expectEqualStrings(object, there);
+        try std.testing.expectEqual(@as(usize, 1), testFrames(io, gpa, conv_dir, "file_sync"));
+    }
+
+    // binary: it lands in the server's copy, is never pushed (a JSON string cannot hold it intact), and the
+    // result says it is not on the user's machine
+    {
+        var srv: fakehttp.Server = undefined;
+        startStandIn(&srv, io, fakehttp.wire("PK\x03\x04\x00\x00\x08\x00binary")) catch return error.SkipZigTest;
+        defer srv.stop();
+        var ub: [64]u8 = undefined;
+        var ctx = cfTestCtx(gpa, io, &env, run_dir, work, try std.fmt.bufPrint(&ub, "http://127.0.0.1:{d}/client/v4", .{srv.port}), &counters, &fmtx);
+        var streak: u32 = 0;
+        const r = cfClientTool(app, &ctx, conv_dir, 0, "cf_r2_get", "{\"bucket\":\"b\",\"key\":\"bundle.zip\"}", &streak);
+        defer gpa.free(r);
+        if (srv.conns.load(.monotonic) == 0) return error.SkipZigTest;
+        try std.testing.expect(std.mem.indexOf(u8, r, "NOT on the user's machine") != null);
+        const kept = testFile(io, gpa, work ++ "/bundle.zip") orelse return error.TestUnexpectedResult;
+        gpa.free(kept);
+        try std.testing.expect(testFile(io, gpa, folder ++ "/bundle.zip") == null);
+        try std.testing.expectEqual(@as(usize, 1), testFrames(io, gpa, conv_dir, "file_sync"));
+    }
+
+    // a failed download carries nothing — not even the older copy that sits at the destination
+    {
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = work ++ "/notes.txt", .data = "an older copy" });
+        var srv: fakehttp.Server = undefined;
+        startStandIn(&srv, io, fakehttp.wire("{\"success\":false,\"errors\":[{\"code\":10007,\"message\":\"The specified key does not exist.\"}]}")) catch return error.SkipZigTest;
+        defer srv.stop();
+        var ub: [64]u8 = undefined;
+        var ctx = cfTestCtx(gpa, io, &env, run_dir, work, try std.fmt.bufPrint(&ub, "http://127.0.0.1:{d}/client/v4", .{srv.port}), &counters, &fmtx);
+        var streak: u32 = 0;
+        const syncs_before = testFrames(io, gpa, conv_dir, "sync_request");
+        const r = cfClientTool(app, &ctx, conv_dir, 0, "cf_r2_get", "{\"bucket\":\"b\",\"key\":\"notes.txt\"}", &streak);
+        defer gpa.free(r);
+        if (srv.conns.load(.monotonic) == 0) return error.SkipZigTest;
+        try std.testing.expect(std.mem.indexOf(u8, r, "FAILED") != null);
+        try std.testing.expectEqual(syncs_before, testFrames(io, gpa, conv_dir, "sync_request"));
+        try std.testing.expect(testFile(io, gpa, folder ++ "/notes.txt") == null);
+    }
+
+    // a client that answers but drops the push: the read-back finds nothing there, and the result says so rather
+    // than letting the model report a file the user does not have
+    {
+        const conv2 = root ++ "/conv2";
+        const folder2 = root ++ "/client2";
+        for ([_][]const u8{ conv2, folder2 }) |d| _ = std.Io.Dir.cwd().createDirPathStatus(io, d, .default_dir) catch {};
+        var deaf = TestSyncClient{ .gpa = gpa, .io = io, .conv_dir = conv2, .folder = folder2, .apply_pushes = false };
+        try deaf.start();
+        defer deaf.stop();
+        var srv: fakehttp.Server = undefined;
+        startStandIn(&srv, io, fakehttp.wire("id,total\n1,48210.50\n")) catch return error.SkipZigTest;
+        defer srv.stop();
+        var ub: [64]u8 = undefined;
+        var ctx = cfTestCtx(gpa, io, &env, run_dir, work, try std.fmt.bufPrint(&ub, "http://127.0.0.1:{d}/client/v4", .{srv.port}), &counters, &fmtx);
+        var streak: u32 = 0;
+        const r = cfClientTool(app, &ctx, conv2, 0, "cf_r2_get", "{\"bucket\":\"b\",\"key\":\"totals.csv\"}", &streak);
+        defer gpa.free(r);
+        if (srv.conns.load(.monotonic) == 0) return error.SkipZigTest;
+        try std.testing.expect(std.mem.indexOf(u8, r, "NOT confirmed") != null);
+        try std.testing.expectEqual(@as(usize, 1), testFrames(io, gpa, conv2, "file_sync"));
+        try std.testing.expect(testFile(io, gpa, folder2 ++ "/totals.csv") == null);
+    }
+}
+
+test "a client-mode cf_ call that cannot reach the client refuses before Cloudflare hears anything" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-cfclient-gone-tmp";
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    var ta = try http.testApp(gpa, io, root);
+    defer ta.deinit();
+    const app = &ta.app;
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    var counters = [_]u32{0} ** 5;
+    var fmtx: std.Io.Mutex = .init;
+    const conv_dir = root ++ "/conv";
+    const run_dir = root ++ "/build";
+    const work = run_dir ++ "/work";
+    for ([_][]const u8{ conv_dir, work }) |d| _ = std.Io.Dir.cwd().createDirPathStatus(io, d, .default_dir) catch {};
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = work ++ "/sum.mjs", .data = "// a copy only the server has" });
+    // an unroutable root: a call that got this far would fail loudly rather than pass for a refusal
+    var ctx = cfTestCtx(gpa, io, &env, run_dir, work, "http://127.0.0.1:1/client/v4", &counters, &fmtx);
+    const args = "{\"name\":\"sum\",\"file\":\"sum.mjs\"}";
+
+    // Not connected: the verb's own refusal, without asking the client for anything first.
+    {
+        ctx.cf_token = "";
+        defer ctx.cf_token = "tok";
+        var streak: u32 = 0;
+        const r = cfClientTool(app, &ctx, conv_dir, 0, "cf_deploy_worker", args, &streak);
+        defer gpa.free(r);
+        try std.testing.expect(std.mem.indexOf(u8, r, "not connected") != null);
+        try std.testing.expectEqual(@as(usize, 0), testFrames(io, gpa, conv_dir, "sync_request"));
+    }
+    // The client already proved absent this turn: refused at once — no frame, no wait.
+    {
+        var streak: u32 = CLIENT_GONE_AFTER;
+        const r = cfClientTool(app, &ctx, conv_dir, 0, "cf_deploy_worker", args, &streak);
+        defer gpa.free(r);
+        try std.testing.expect(std.mem.startsWith(u8, r, "(nothing was sent to Cloudflare"));
+        try std.testing.expect(std.mem.indexOf(u8, r, "stopped answering") != null);
+        try std.testing.expectEqual(@as(usize, 0), testFrames(io, gpa, conv_dir, "sync_request"));
+    }
+    // A stop lands while it waits on a client that never answers: a canceled call — and a stop is the user, not
+    // evidence the client is gone.
+    {
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = conv_dir ++ "/control.jsonl", .data = "{\"op\":\"stop\"}\n" });
+        var streak: u32 = 0;
+        const r = cfClientTool(app, &ctx, conv_dir, 0, "cf_deploy_worker", args, &streak);
+        defer gpa.free(r);
+        try std.testing.expect(std.mem.startsWith(u8, r, "(STOP requested"));
+        try std.testing.expectEqual(@as(u32, 0), streak);
+        try std.testing.expectEqual(@as(usize, 1), testFrames(io, gpa, conv_dir, "sync_request"));
     }
 }
 
@@ -9047,9 +9802,12 @@ fn runInnerAgentic(
                 // in-process via deploy_service + app.sup, NOT the mind-tool executor. get_credential is also
                 // SERVER-side always: its store is the server's memories.jsonl, and the client executor has no
                 // durable_path — delegated, it refused every fetch (observed: a desk chat could not retrieve
-                // its Discourse key and built around the failure). Everything else executes as a mind tool: in
-                // CLIENT mode (a desk/CLI turn) it is DELEGATED to the client's harness so file/shell/code
-                // tools act on the USER's machine; otherwise it runs here (a hive/server turn).
+                // its Discourse key and built around the failure). The cf_ family is server-side for the same
+                // reason — the client executor holds no Cloudflare token, so every delegated call answered
+                // "not connected" — and its one file crosses the machine boundary instead (cfClientTool).
+                // Everything else executes as a mind tool: in CLIENT mode (a desk/CLI turn) it is DELEGATED to
+                // the client's harness so file/shell/code tools act on the USER's machine; otherwise it runs
+                // here (a hive/server turn). See clientRoute.
                 // A name that exists NOWHERE is answered here, instantly, with the real belt (see knownToolName).
                 // Delegated instead, a phantom name costs the full ack timeout and returns a bridge error the
                 // model misreads as its own tools being offline — which ends the turn on a false conclusion.
@@ -9079,7 +9837,11 @@ fn runInnerAgentic(
                 if (step.truncated and ci == step.calls.len - 1 and isMutatingTool(run_name))
                     break :blk gpa.dupe(u8, "(NOT executed: this call was CUT OFF by the output-token limit — done_reason=length — so its arguments are almost certainly incomplete, and running it would have written a truncated file that looks finished. Re-issue the SAME call with less content: write the file in smaller pieces (edit_file appends/patches), or shorten what you are writing. Do not assume anything was written.)") catch emptyRes();
                 break :blk orchTool(app, uid, ctx, conv, conv_dir, steer_cursor.*, trio, run_name, run_args, tool_client) orelse
-                    (if (tool_client and !std.mem.eql(u8, run_name, "get_credential")) delegateTool(app, conv_dir, c.id, run_name, run_args, steer_cursor.*, no_ack_streak) else tools.execute(ctx, run_name, run_args));
+                    (if (!tool_client) tools.execute(ctx, run_name, run_args) else switch (clientRoute(run_name)) {
+                        .client => delegateTool(app, conv_dir, c.id, run_name, run_args, steer_cursor.*, no_ack_streak),
+                        .server => tools.execute(ctx, run_name, run_args),
+                        .cloudflare => cfClientTool(app, ctx, conv_dir, steer_cursor.*, run_name, run_args, no_ack_streak),
+                    });
             };
             traceFrame(app, "worker.tools", c.name, "exit", null, null);
             scrubUtf8(result); // fetched bytes may be invalid UTF-8; must be valid before it rides in JSON

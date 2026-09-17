@@ -1454,8 +1454,9 @@ pub fn followConv(ctx: *Ctx, conv: []const u8) void {
 
 /// CLIENT MODE: the server delegated tool calls back to us. Run each with the shared executor (in this
 /// process, so file/shell/code act on the user's machine) and post the result so the blocked turn continues.
-/// Also materializes {kind:"file_sync"} frames — a finished hive's output pushed down so it exists HERE —
-/// in the same ordered pass, so a synced file always lands before the delegated tool that reads it.
+/// Also materializes {kind:"file_sync"} frames — a finished hive's output, or a cf_ download, pushed down so it
+/// exists HERE — in the same ordered pass, so a synced file always lands before the delegated tool (or the
+/// server's file_pull read-back) that reads it.
 fn runDelegatedTools(ctx: *Ctx, conv: []const u8, bytes: []const u8) void {
     var it = std.mem.splitScalar(u8, bytes, '\n');
     while (it.next()) |line| {
@@ -1526,7 +1527,8 @@ fn runDelegatedTools(ctx: *Ctx, conv: []const u8, bytes: []const u8) void {
     }
 }
 
-/// Write one server-pushed hive file into the CLI's workdir (the same "." the delegated tools run in).
+/// Write one server-pushed file — a finished hive's output, or a Cloudflare download the server fetched for a
+/// cf_ call — into the CLI's workdir (the same "." the delegated tools run in).
 fn applyFileSync(ctx: *Ctx, line: []const u8) void {
     const path = jsonStr(ctx.gpa, line, "path") orelse return;
     defer ctx.gpa.free(path);
@@ -1535,7 +1537,7 @@ fn applyFileSync(ctx: *Ctx, line: []const u8) void {
     defer ctx.gpa.free(content);
     if (std.fs.path.dirname(path)) |parent| _ = std.Io.Dir.cwd().createDirPathStatus(ctx.io, parent, .default_dir) catch {};
     std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = path, .data = content }) catch return;
-    std.debug.print("  [synced {s} from the hive — {d}b]\n", .{ path, content.len });
+    std.debug.print("  [synced {s} from the server — {d}b]\n", .{ path, content.len });
 }
 
 /// POST {"id":..,"ack":true} — tell the blocked server turn its tool was picked up and is running here, so
