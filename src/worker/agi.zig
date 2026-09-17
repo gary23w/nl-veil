@@ -753,7 +753,9 @@ pub fn resetForNewGoal(w: *Worker, run_dir: []const u8, goal: []const u8) void {
     if (w.blueprint.len > 0) gpa.free(@constCast(w.blueprint));
     w.blueprint = planProject(w, goal, w.veil_str);
     if (w.blueprint.len > 0) {
-        std.Io.Dir.cwd().writeFile(w.io, .{ .sub_path = std.fmt.allocPrint(gpa, "{s}/.blueprint", .{run_dir}) catch "", .data = w.blueprint }) catch {};
+        const bp_path = std.fmt.allocPrint(gpa, "{s}/.blueprint", .{run_dir}) catch "";
+        defer if (bp_path.len > 0) gpa.free(bp_path);
+        if (bp_path.len > 0) std.Io.Dir.cwd().writeFile(w.io, .{ .sub_path = bp_path, .data = w.blueprint }) catch {};
         w.act("engine", 0, "blueprint", "new project structure", w.blueprint);
     }
     // Re-interpret the CHAINED goal into a fresh brief. Without this the whole run steers by goal-0's brief
@@ -763,7 +765,9 @@ pub fn resetForNewGoal(w: *Worker, run_dir: []const u8, goal: []const u8) void {
     w.goal_brief = rsi.interpretGoal(w, goal);
     if (w.goal_brief.len > 0) {
         w.emit("intent", std.fmt.allocPrint(w.a(), ",\"goal\":\"{s}\",\"brief\":\"{s}\"", .{ w.esc(clip(goal, 200)), w.esc(clip(w.goal_brief, 1200)) }) catch ",\"brief\":\"\"");
-        std.Io.Dir.cwd().writeFile(w.io, .{ .sub_path = std.fmt.allocPrint(gpa, "{s}/.goal_brief", .{run_dir}) catch "", .data = w.goal_brief }) catch {};
+        const brief_path = std.fmt.allocPrint(gpa, "{s}/.goal_brief", .{run_dir}) catch "";
+        defer if (brief_path.len > 0) gpa.free(brief_path);
+        if (brief_path.len > 0) std.Io.Dir.cwd().writeFile(w.io, .{ .sub_path = brief_path, .data = w.goal_brief }) catch {};
     }
     if (w.last_bench.failures.len > 0) gpa.free(w.last_bench.failures);
     w.last_bench = .{};
@@ -837,4 +841,61 @@ test "selfMetric answers in TWO different units, and scoreWill refuses to compar
     const rw = std.mem.indexOf(u8, SRC, "fn recordWill") orelse return error.RecordWillMissing;
     const rw_body = SRC[rw..@min(rw + 700, SRC.len)];
     try std.testing.expect(std.mem.indexOf(u8, rw_body, "pending_will_bench") != null);
+}
+
+test "a goal reset writes the new .blueprint and .goal_brief into the run dir and keeps none of the paths it formats" {
+    // writeFile only borrows .sub_path, and both paths were formatted inline on gpa, so every goal
+    // reset leaked two strings. The allocator reports that; reading both files back is what proves
+    // the two writes ran at all, since a reset that returned early would pass the leak check too.
+    const gpa = std.testing.allocator;
+    const builtin = @import("builtin");
+    const fakehttp = @import("fakehttp.zig");
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = if (builtin.os.tag == .windows) .{ .block = .global } else .{ .block = .{ .slice = std.mem.span(std.c.environ) } } });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const root = "zig-agi-reset-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, root ++ "/work", .default_dir) catch {};
+
+    // interpretGoal's one gateway call gets this brief back
+    const brief = "Build the three named files so each runs on its own and the tests pass.";
+    var srv: fakehttp.Server = undefined;
+    srv.start(io, fakehttp.wire("{\"choices\":[{\"message\":{\"content\":\"" ++ brief ++ "\"}}]}")) catch return error.SkipZigTest;
+    defer srv.stop();
+    var ub: [64]u8 = undefined;
+    const base = try std.fmt.bufPrint(&ub, "http://127.0.0.1:{d}/v1", .{srv.port});
+
+    var w = Worker{
+        .gpa = gpa,
+        .io = io,
+        .scratch = std.heap.ArenaAllocator.init(gpa),
+        .run_dir = root,
+        .ev_path = root ++ "/events.jsonl",
+        .ctl_path = root ++ "/control.jsonl",
+        .stop_path = root ++ "/STOP",
+        .mem = @import("oscillation.zig").Mem.init(gpa, io, root ++ "/no-neuron.exe", root ++ "/hive.db"),
+        .base_url = base,
+        .key = "",
+        .model = "fake-model",
+        .gw_base = base,
+        .gateway_model = "fake-model",
+    };
+    defer w.scratch.deinit();
+
+    // a goal naming three files: planProject adopts them without a model call, so the brief is the one call
+    resetForNewGoal(&w, root, "Build app.py, util.py and test_app.py.");
+    defer gpa.free(@constCast(w.blueprint));
+    defer gpa.free(@constCast(w.goal_brief));
+    try std.testing.expect(std.mem.indexOf(u8, w.blueprint, "test_app.py") != null);
+    try std.testing.expectEqualStrings(brief, w.goal_brief);
+    try std.testing.expectEqual(@as(u32, 1), srv.conns.load(.monotonic));
+
+    const bp = try std.Io.Dir.cwd().readFileAlloc(io, root ++ "/.blueprint", gpa, .limited(1 << 16));
+    defer gpa.free(bp);
+    try std.testing.expectEqualStrings(w.blueprint, bp);
+    const gb = try std.Io.Dir.cwd().readFileAlloc(io, root ++ "/.goal_brief", gpa, .limited(1 << 16));
+    defer gpa.free(gb);
+    try std.testing.expectEqualStrings(w.goal_brief, gb);
 }

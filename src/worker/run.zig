@@ -842,7 +842,9 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
     }
     if (live) {
         const c = llm.capsSnapshot();
-        w.act("engine", 0, "caps", if (c.probed) "probed" else "heuristic", std.fmt.allocPrint(gpa, "ollama_native={} reasoning={} tools={} thinking={} tools_native_ok={} ctx={d} fence_writes={} ({s})", .{ c.ollama_native, c.reasoning, c.tools, c.thinking, c.tools_native_ok, c.ctx_tokens, w.fence_writes, if (c.probed and c.caps_listed) "backend handshake: /api/version + /api/show (capabilities[] + context_length are the model's own record)" else if (c.probed and !c.ollama_native) "backend handshake: OpenAI-style — a real tools-array completion measured whether tool_calls come back structured" else if (c.probed) "backend handshake: GET /api/version + a tiny reasoning probe (/api/show gave no capability list)" else "backend unreachable at startup — using the port/model-name heuristics" }) catch "caps");
+        const caps_note = std.fmt.allocPrint(gpa, "ollama_native={} reasoning={} tools={} thinking={} tools_native_ok={} ctx={d} fence_writes={} ({s})", .{ c.ollama_native, c.reasoning, c.tools, c.thinking, c.tools_native_ok, c.ctx_tokens, w.fence_writes, if (c.probed and c.caps_listed) "backend handshake: /api/version + /api/show (capabilities[] + context_length are the model's own record)" else if (c.probed and !c.ollama_native) "backend handshake: OpenAI-style — a real tools-array completion measured whether tool_calls come back structured" else if (c.probed) "backend handshake: GET /api/version + a tiny reasoning probe (/api/show gave no capability list)" else "backend unreachable at startup — using the port/model-name heuristics" }) catch null;
+        defer if (caps_note) |s| gpa.free(s);
+        w.act("engine", 0, "caps", if (c.probed) "probed" else "heuristic", caps_note orelse "caps");
     }
     if (live and w.fence_writes) w.act("engine", 0, "fence_writes", "on", if (llm.capsSnapshot().ollama_native)
         "LOCAL OLLAMA + THINKING model: write_file is STRIPPED from the build schema; the minds emit each file as a fenced code block and the narrated-write salvage commits it (works around Ollama's large-tool-call parser failure)"
@@ -880,8 +882,11 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
                 w.max_tokens_eff = std.math.clamp(v, 256, 32768);
             } else |_| {}
         }
-        if (live and (w.max_tokens_eff != 8192 or w.clip_scale < 1.0))
-            w.act("engine", 0, "budget", "ctx-scaled", std.fmt.allocPrint(gpa, "ctx={d} tier={s} -> max_tokens={d}, prompt-section scale={d:.2} (set NL_MAX_TOKENS to override the completion budget)", .{ ctx_eff, tier.label(), w.max_tokens_eff, w.clip_scale }) catch "budget");
+        if (live and (w.max_tokens_eff != 8192 or w.clip_scale < 1.0)) {
+            const budget_note = std.fmt.allocPrint(gpa, "ctx={d} tier={s} -> max_tokens={d}, prompt-section scale={d:.2} (set NL_MAX_TOKENS to override the completion budget)", .{ ctx_eff, tier.label(), w.max_tokens_eff, w.clip_scale }) catch null;
+            defer if (budget_note) |s| gpa.free(s);
+            w.act("engine", 0, "budget", "ctx-scaled", budget_note orelse "budget");
+        }
     }
     if (live) {
         // PREFLIGHT: every model call and web fetch shells out to curl — a missing curl fails as a cryptic
@@ -929,7 +934,11 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
     w.gateway_model = if (m.gateway_model.len > 0) m.gateway_model else model;
     w.gw_base = if (m.gateway_base_url.len > 0) m.gateway_base_url else base_url;
     w.gw_key = if (m.gateway_key.len > 0) m.gateway_key else if (m.gateway_base_url.len > 0) "gateway-local" else key;
-    if (m.gateway_model.len > 0) w.act("engine", 0, "gateway", m.gateway_model, std.fmt.allocPrint(gpa, "mechanical engine calls (digest/retro/gap/flare/classify/screen) routed through the gateway model{s}{s}; the reasoning minds keep the main model", .{ if (m.gateway_base_url.len > 0) " @ " else "", if (m.gateway_base_url.len > 0) m.gateway_base_url else "" }) catch m.gateway_model);
+    if (m.gateway_model.len > 0) {
+        const gw_note = std.fmt.allocPrint(gpa, "mechanical engine calls (digest/retro/gap/flare/classify/screen) routed through the gateway model{s}{s}; the reasoning minds keep the main model", .{ if (m.gateway_base_url.len > 0) " @ " else "", if (m.gateway_base_url.len > 0) m.gateway_base_url else "" }) catch null;
+        defer if (gw_note) |s| gpa.free(s);
+        w.act("engine", 0, "gateway", m.gateway_model, gw_note orelse m.gateway_model);
+    }
     // LOCAL fallback endpoint. Explicit env wins; the base defaults to Ollama's OpenAI-compatible port and
     // the model to the published built-in weights (the-veil-12b) — but ONLY when the primary is a CLOUD
     // model, since a local primary needs no local rung. isLocal() on the resolved base keeps a local call
@@ -937,7 +946,11 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
     w.local_base = if (environ.get("NL_LOCAL_BASE_URL")) |u| (if (u.len > 0) u else "http://127.0.0.1:11434/v1") else "http://127.0.0.1:11434/v1";
     w.local_key = if (environ.get("NL_LOCAL_KEY")) |k| (if (k.len > 0) k else "ollama") else "ollama";
     w.local_model = if (environ.get("NL_LOCAL_MODEL")) |lm| lm else (if (llm.isLocal(base_url)) "" else "the-veil-12b");
-    if (w.local_model.len > 0) w.act("engine", 0, "local_fallback", w.local_model, std.fmt.allocPrint(gpa, "offline lane armed: if the cloud model is unreachable, minds fall back to {s} @ {s} so a network blip stops burning dead rounds", .{ w.local_model, w.local_base }) catch w.local_model);
+    if (w.local_model.len > 0) {
+        const lane_note = std.fmt.allocPrint(gpa, "offline lane armed: if the cloud model is unreachable, minds fall back to {s} @ {s} so a network blip stops burning dead rounds", .{ w.local_model, w.local_base }) catch null;
+        defer if (lane_note) |s| gpa.free(s);
+        w.act("engine", 0, "local_fallback", w.local_model, lane_note orelse w.local_model);
+    }
     // The browser driver: default ON when online (lazy sessions, graceful failure — see the field doc),
     // NL_BROWSER_DRIVER=0/false to disable. This is what lets the SCOUT actually render a page.
     w.browser = blk: {
@@ -1107,7 +1120,9 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
         w.goal_brief = rsi.interpretGoal(&w, goal);
         if (w.goal_brief.len > 0) {
             w.emit("intent", std.fmt.allocPrint(w.a(), ",\"goal\":\"{s}\",\"brief\":\"{s}\"", .{ w.esc(clip(goal, 200)), w.esc(clip(w.goal_brief, 1200)) }) catch ",\"brief\":\"\"");
-            std.Io.Dir.cwd().writeFile(io, .{ .sub_path = std.fmt.allocPrint(gpa, "{s}/.goal_brief", .{run_dir}) catch "", .data = w.goal_brief }) catch {};
+            const brief_path = std.fmt.allocPrint(gpa, "{s}/.goal_brief", .{run_dir}) catch "";
+            defer if (brief_path.len > 0) gpa.free(brief_path);
+            if (brief_path.len > 0) std.Io.Dir.cwd().writeFile(io, .{ .sub_path = brief_path, .data = w.goal_brief }) catch {};
         }
     }
     defer if (w.goal_brief.len > 0) gpa.free(@constCast(w.goal_brief));
@@ -1171,7 +1186,9 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
             w.discourse = false; // named deliverables = a build — research alone can't satisfy them
             w.emit("blueprint", std.fmt.allocPrint(w.a(), ",\"files\":\"{s}\"", .{w.esc(clip(w.blueprint, 1600))}) catch ",\"files\":\"\"");
             w.act("engine", 0, "blueprint", "declared deliverables (caller-named, adopted verbatim)", w.blueprint);
-            std.Io.Dir.cwd().writeFile(io, .{ .sub_path = std.fmt.allocPrint(gpa, "{s}/.blueprint", .{run_dir}) catch "", .data = w.blueprint }) catch {};
+            const bp_path = std.fmt.allocPrint(gpa, "{s}/.blueprint", .{run_dir}) catch "";
+            defer if (bp_path.len > 0) gpa.free(bp_path);
+            if (bp_path.len > 0) std.Io.Dir.cwd().writeFile(io, .{ .sub_path = bp_path, .data = w.blueprint }) catch {};
         }
     }
     if (live and !w.discourse and !w.operating and !w.quick and w.blueprint.len == 0) { // quick: no blueprint -> never scaffolds a file tree over --embed
@@ -1179,7 +1196,9 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
         if (w.blueprint.len > 0) {
             w.emit("blueprint", std.fmt.allocPrint(w.a(), ",\"files\":\"{s}\"", .{w.esc(clip(w.blueprint, 1600))}) catch ",\"files\":\"\"");
             w.act("engine", 0, "blueprint", "project structure", w.blueprint);
-            std.Io.Dir.cwd().writeFile(io, .{ .sub_path = std.fmt.allocPrint(gpa, "{s}/.blueprint", .{run_dir}) catch "", .data = w.blueprint }) catch {};
+            const bp_path = std.fmt.allocPrint(gpa, "{s}/.blueprint", .{run_dir}) catch "";
+            defer if (bp_path.len > 0) gpa.free(bp_path);
+            if (bp_path.len > 0) std.Io.Dir.cwd().writeFile(io, .{ .sub_path = bp_path, .data = w.blueprint }) catch {};
         }
         w.doc_target = docTargetFromBlueprint(w.blueprint, goal);
         if (w.doc_target > 0) w.doc_files = docFileCount(w.blueprint);
@@ -1201,7 +1220,9 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
         if (w.blueprint.len > 0) {
             w.emit("blueprint", std.fmt.allocPrint(w.a(), ",\"files\":\"{s}\"", .{w.esc(clip(w.blueprint, 1600))}) catch ",\"files\":\"\"");
             w.act("engine", 0, "blueprint", "goal-named deliverables", w.blueprint);
-            std.Io.Dir.cwd().writeFile(io, .{ .sub_path = std.fmt.allocPrint(gpa, "{s}/.blueprint", .{run_dir}) catch "", .data = w.blueprint }) catch {};
+            const bp_path = std.fmt.allocPrint(gpa, "{s}/.blueprint", .{run_dir}) catch "";
+            defer if (bp_path.len > 0) gpa.free(bp_path);
+            if (bp_path.len > 0) std.Io.Dir.cwd().writeFile(io, .{ .sub_path = bp_path, .data = w.blueprint }) catch {};
         }
     }
     defer if (w.blueprint.len > 0) gpa.free(@constCast(w.blueprint));
@@ -7866,7 +7887,9 @@ fn establishPlan(w: *Worker, goal: []const u8) void {
     if (chosen.len < 40) return;
     w.plan_str = gpa.dupe(u8, clip(chosen, 4096)) catch "";
     w.mem.replace(tools.PLAN_SCOPE, w.plan_str);
-    std.Io.Dir.cwd().writeFile(w.io, .{ .sub_path = std.fmt.allocPrint(gpa, "{s}/.plan", .{w.run_dir}) catch "", .data = w.plan_str }) catch {};
+    const plan_path = std.fmt.allocPrint(gpa, "{s}/.plan", .{w.run_dir}) catch "";
+    defer if (plan_path.len > 0) gpa.free(plan_path);
+    if (plan_path.len > 0) std.Io.Dir.cwd().writeFile(w.io, .{ .sub_path = plan_path, .data = w.plan_str }) catch {};
     w.act("engine", 0, "plan", "project plan (deliberated: 2 drafts -> synthesis; forward contract for every parallel piece)", clip(chosen, 600));
 }
 
@@ -7881,7 +7904,9 @@ fn deriveDependencies(w: *Worker, goal: []const u8) void {
     if (!r.ok or r.content.len < 3) return;
     const s = std.mem.trim(u8, r.content, " \r\n\t");
     w.deps_str = gpa.dupe(u8, clip(s, 3000)) catch "";
-    std.Io.Dir.cwd().writeFile(w.io, .{ .sub_path = std.fmt.allocPrint(gpa, "{s}/.deps", .{w.run_dir}) catch "", .data = w.deps_str }) catch {};
+    const deps_path = std.fmt.allocPrint(gpa, "{s}/.deps", .{w.run_dir}) catch "";
+    defer if (deps_path.len > 0) gpa.free(deps_path);
+    if (deps_path.len > 0) std.Io.Dir.cwd().writeFile(w.io, .{ .sub_path = deps_path, .data = w.deps_str }) catch {};
     w.act("engine", 0, "deps", "AI-declared dependency graph — the engine schedules from this", clip(s, 500));
 }
 
@@ -7941,7 +7966,9 @@ fn revisePlan(w: *Worker, goal: []const u8, round: u32) void {
     if (w.plan_str.len > 0) gpa.free(@constCast(w.plan_str));
     w.plan_str = gpa.dupe(u8, clip(s, 4096)) catch "";
     w.mem.replace(tools.PLAN_SCOPE, w.plan_str);
-    std.Io.Dir.cwd().writeFile(w.io, .{ .sub_path = std.fmt.allocPrint(gpa, "{s}/.plan", .{w.run_dir}) catch "", .data = w.plan_str }) catch {};
+    const plan_path = std.fmt.allocPrint(gpa, "{s}/.plan", .{w.run_dir}) catch "";
+    defer if (plan_path.len > 0) gpa.free(plan_path);
+    if (plan_path.len > 0) std.Io.Dir.cwd().writeFile(w.io, .{ .sub_path = plan_path, .data = w.plan_str }) catch {};
     w.act("engine", round, "plan", "plan REVISED (canon ratchet held; forward strategy updated from what's built + learned)", clip(s, 500));
 }
 
@@ -8207,8 +8234,86 @@ fn consolidateState(w: *Worker, goal: []const u8, round: u32) void {
     if (w.state_str.len > 0) gpa.free(@constCast(w.state_str));
     w.state_str = gpa.dupe(u8, clip(s, 2400)) catch "";
     w.mem.replace(tools.STATE_SCOPE, w.state_str);
-    std.Io.Dir.cwd().writeFile(w.io, .{ .sub_path = std.fmt.allocPrint(gpa, "{s}/.state", .{w.run_dir}) catch "", .data = w.state_str }) catch {};
+    const state_path = std.fmt.allocPrint(gpa, "{s}/.state", .{w.run_dir}) catch "";
+    defer if (state_path.len > 0) gpa.free(state_path);
+    if (state_path.len > 0) std.Io.Dir.cwd().writeFile(w.io, .{ .sub_path = state_path, .data = w.state_str }) catch {};
     w.act("engine", round, "state", "shared project state", clip(s, 500));
+}
+
+test "planning writes .plan, .deps and .state into the run dir and keeps none of the paths it formats" {
+    // Each writer formatted its file's path inline on gpa for writeFile, which only borrows .sub_path:
+    // establishPlan and deriveDependencies leaked once per build, revisePlan every PLAN_EVERY rounds and
+    // consolidateState on every reflective round. The allocator reports a leak; the read-backs prove each
+    // write ran, since a writer that returned early would pass the leak check by never reaching it.
+    const gpa = std.testing.allocator;
+    const fakehttp = @import("fakehttp.zig");
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = if (builtin.os.tag == .windows) .{ .block = .global } else .{ .block = .{ .slice = std.mem.span(std.c.environ) } } });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const cwd = std.Io.Dir.cwd();
+
+    const root = "zig-plan-writers-tmp";
+    cwd.deleteTree(io, root) catch {};
+    defer cwd.deleteTree(io, root) catch {};
+    _ = cwd.createDirPathStatus(io, root ++ "/work", .default_dir) catch {};
+    // consolidateState reads the built pieces; revisePlan needs the manifest to call one of them built
+    const piece = "def helper():\n    return 42\n" ** 6;
+    try cwd.writeFile(io, .{ .sub_path = root ++ "/work/app.py", .data = piece });
+    try cwd.writeFile(io, .{ .sub_path = root ++ "/work/util.py", .data = piece });
+    try cwd.writeFile(io, .{ .sub_path = root ++ "/.build_manifest", .data = std.fmt.comptimePrint("app.py|{d}\n", .{piece.len}) });
+
+    // every gateway call gets this back, which clears each writer's 40-byte floor
+    const reply = "app.py is the entry point and calls the shared helpers that util.py holds.";
+    var srv: fakehttp.Server = undefined;
+    srv.start(io, fakehttp.wire("{\"choices\":[{\"message\":{\"content\":\"" ++ reply ++ "\"}}]}")) catch return error.SkipZigTest;
+    defer srv.stop();
+    var ub: [64]u8 = undefined;
+    const base = try std.fmt.bufPrint(&ub, "http://127.0.0.1:{d}/v1", .{srv.port});
+
+    var w = Worker{
+        .gpa = gpa,
+        .io = io,
+        .scratch = std.heap.ArenaAllocator.init(gpa),
+        .run_dir = root,
+        .ev_path = root ++ "/events.jsonl",
+        .ctl_path = root ++ "/control.jsonl",
+        .stop_path = root ++ "/STOP",
+        // no neuron binary: replace/recall fail soft, and the store is not what this test is about
+        .mem = Mem.init(gpa, io, root ++ "/no-neuron.exe", root ++ "/hive.db"),
+        .base_url = base,
+        .key = "",
+        .model = "fake-model",
+        .gw_base = base,
+        .gateway_model = "fake-model",
+        .blueprint = "app.py — the entry point\nutil.py — shared helpers",
+    };
+    defer w.scratch.deinit();
+    defer {
+        if (w.plan_str.len > 0) gpa.free(@constCast(w.plan_str));
+        if (w.deps_str.len > 0) gpa.free(@constCast(w.deps_str));
+        if (w.state_str.len > 0) gpa.free(@constCast(w.state_str));
+    }
+    const Disk = struct {
+        fn holds(dir_io: std.Io, file: []const u8, want: []const u8) !void {
+            const got = try std.Io.Dir.cwd().readFileAlloc(dir_io, file, std.testing.allocator, .limited(1 << 16));
+            defer std.testing.allocator.free(got);
+            try std.testing.expectEqualStrings(want, got);
+        }
+    };
+
+    const goal = "Build app.py and util.py.";
+    establishPlan(&w, goal); // two drafts and a synthesis: 3 calls
+    try Disk.holds(io, root ++ "/.plan", w.plan_str);
+    deriveDependencies(&w, goal); // 1 call
+    try Disk.holds(io, root ++ "/.deps", w.deps_str);
+    consolidateState(&w, goal, 1); // 1 call
+    try Disk.holds(io, root ++ "/.state", w.state_str);
+    try cwd.deleteFile(io, root ++ "/.plan"); // the next read can only find revisePlan's own write
+    revisePlan(&w, goal, PLAN_EVERY); // 1 call
+    try Disk.holds(io, root ++ "/.plan", w.plan_str);
+
+    try std.testing.expectEqualStrings(reply, w.plan_str);
+    try std.testing.expectEqual(@as(u32, 6), srv.conns.load(.monotonic));
 }
 
 fn psycheValence(text: []const u8) f32 {
