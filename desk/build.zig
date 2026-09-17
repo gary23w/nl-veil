@@ -73,6 +73,15 @@ pub fn build(b: *std.Build) void {
     });
     tests.root_module.addImport("raylib", raylib_dep.module("raylib"));
     tests.root_module.addImport("modelcfg", modelcfg);
+    // The SERVER's conversation -> build-tree mapping (src/worker/chat/paths.zig), wired into the tests ONLY:
+    // chat.zig's buildRelFor is its local twin, and a test holds the two to the same answers, so the tree the
+    // desk runs delegated tools and writes pushed files in cannot drift from the server's again.
+    const chatpaths = b.createModule(.{
+        .root_source_file = b.path("../src/worker/chat/paths.zig"),
+        .target = target,
+        .optimize = .Debug,
+    });
+    tests.root_module.addImport("chatpaths", chatpaths);
     // tests.zig pulls theme.zig, which reaches assets.zig — the test module needs the same embeds or the
     // @embedFile names do not resolve.
     addDeskAssets(b, tests.root_module);
