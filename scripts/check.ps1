@@ -480,12 +480,31 @@ if ($Scan) {
     #    fixed alone and the siblings stay broken, so this looks for the escape table anywhere in
     #    src/ and desk/src/ and requires the 0x20 branch near it. A NEW copy is caught wherever it
     #    lands -- which is the part a test in one module cannot do.
+    #    The `'\t' =>` anchor alone is not enough: it matches ANY switch with a tab arm. A byte
+    #    CLASSIFIER -- one mapping a byte to a human phrase for an error message ("a tab", "a quote"),
+    #    emitting no JSON at all -- came up as an actionable signal in desk/src/gitvc.zig on 2026-09-17,
+    #    and the session there worked around the oracle by spelling its control bytes 0x09 instead of
+    #    '\t'. A rule that edits unrelated code to stay quiet is worse than no rule.
+    #    So the anchor now also asks whether the switch PRODUCES escapes: a Zig string literal that
+    #    begins with an escaped backslash ("\\t", "\\\"", "\\\\", "\\n", "\\u{x:0>4}"), anywhere within
+    #    eight lines EITHER SIDE. Both halves of that matter:
+    #      - Either side, because three escapers here answer a tab with a SPACE, not "\\t" --
+    #        desk/main.jesc, desk/poller.appendEsc and desk/chat's writer. Requiring the produced "\\t"
+    #        in the forward window would have dropped two of the three copies this rule exists for.
+    #        Their escape productions ('"' and '\n') sit ABOVE the tab arm.
+    #      - Two backslashes, because a single one matches the PATTERN '\\' that a classifier's own
+    #        backslash arm carries, and prose in a nearby doc comment.
+    #    That keeps every one of the 20 escapers in src/ + desk/src/ under the rule (counted a second
+    #    way, from the productions rather than the tab arms: 0055) and drops only dataset.zig's
+    #    whitespace folder, which walks ALREADY-escaped JSON and produces no escape of its own.
     $noesc = @()
     foreach ($zf in Get-ChildItem -Path (Join-Path $repo "src"), (Join-Path $repo "desk\src") -Filter *.zig -Recurse -ErrorAction SilentlyContinue) {
         $lines = Get-Content -LiteralPath $zf.FullName -ErrorAction SilentlyContinue
         for ($i = 0; $i -lt $lines.Count; $i++) {
             if (-not $lines[$i].Contains("'\t' =>")) { continue }
+            $lo = [Math]::Max($i - 8, 0)
             $hi = [Math]::Min($i + 8, $lines.Count - 1)
+            if (($lines[$lo..$hi] -join "`n") -notmatch '"\\\\["\\nrtbfu]') { continue }
             $window = ($lines[$i..$hi] -join "`n")
             if ($window -notmatch '0x20') {
                 $noesc += ("{0}:{1}" -f $zf.FullName.Substring($repo.Length + 1), ($i + 1))
