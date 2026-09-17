@@ -12,8 +12,8 @@ test {
     _ = @import("cli.zig");
     _ = @import("cli/hub.zig"); // broadcast body escaping: a pasted CRLF must not break the JSON
     _ = @import("config/cf_oauth.zig");
-    _ = @import("config/cf_r2.zig"); // the R2 backup: gated routes, object-key charset, state defaults
-    _ = @import("config/cf_tunnel.zig"); // the tunnel: gated routes, token-free state, the permission explanation
+    _ = @import("config/cf_r2.zig"); // the R2 backup: gated routes, object-key charset, state defaults, per-account bucket, a deleted bucket re-created — via fakehttp
+    _ = @import("config/cf_tunnel.zig"); // the tunnel: gated routes, token-free state, the permission explanation, Access claims, hostname changes — via fakehttp
     _ = @import("worker/wsock.zig"); // the loopback client's blocking round trip: IPv4 literals, the sockaddr layout
     _ = @import("config/key_vault.zig"); // registered DIRECTLY: reaching the root through another
     // module is not proof of collection — lazy analysis silently dropped desk/assets.zig's tests
@@ -38,6 +38,7 @@ test {
     _ = @import("worker/builtin.zig"); // built-in engine facade: sentinel resolution + weights-store election
     _ = @import("worker/builtin_endpoint.zig"); // the engine's loopback dialect surface, tested on a mock engine
     _ = @import("worker/modelpull.zig"); // weights downloader: repo resolve, resume, sha verify — via fakehttp
+    _ = @import("worker/fakehttp.zig"); // the test stand-in itself: every server on a port of its own
     _ = @import("worker/chat/context.zig");
     _ = @import("worker/chat/engine.zig");
     _ = @import("worker/chat/overlay.zig"); // recall overlay: the per-thought working field, refractory + firing

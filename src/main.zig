@@ -713,6 +713,7 @@ pub fn main(init: std.process.Init) !void {
         .thread_pool = .{ .count = 128 },
     }, &app);
     defer {
+        cf_tunnel.shutdown(&app); // the public URL first: it must not outlive the server it fronts
         server.stop();
         server.deinit();
     }
@@ -942,6 +943,9 @@ pub fn main(init: std.process.Init) !void {
 
     // The window IS the app's lifetime (same contract the old DeskWatch enforced across the process boundary).
     log.info("desktop window closed — shutting down. Use --server-only to run the server without a GUI.", .{});
+    // The Cloudflare tunnel's connector first, so the public URL never fronts a server that is gone. On macOS and
+    // Linux nothing else ends it when this process exits: the kill-on-close job above is Windows-only.
+    cf_tunnel.shutdown(&app);
     server.stop(); // wake the listen thread so it unwinds instead of holding the port
     // Then exit outright rather than returning: main's `defer server.deinit()` would race the listen thread
     // that is still unwinding, and the job object (Windows) reaps the descendants on process exit anyway.
