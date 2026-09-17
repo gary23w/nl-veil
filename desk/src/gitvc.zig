@@ -10,8 +10,8 @@
 //!   * NEVER rides on an argv (visible in the process list) — repo creation puts it in a curl `-K` config file
 //!     (the exact trick llm.zig uses for the model key), the call's own and deleted once curl has exited;
 //!   * NEVER lands in `.git/config`'s remote URL or the transcript — push authenticates through a one-shot
-//!     `credential.helper store --file=<tmp>` credentials file, the call's own and deleted once git has exited,
-//!     while the persisted remote stays tokenless (`https://github.com/<owner>/<repo>.git`).
+//!     `credential.helper store --file='<absolute path>'` credentials file (credentialHelperArg), the call's own and
+//!     deleted once git has exited, while the persisted remote stays tokenless (`https://github.com/<owner>/<repo>.git`).
 //! Those two call files sit in the sidecar dir, inside the data dir, which is often a synced folder. A desk that dies
 //! mid-call never deletes its file, so the chat thread sweeps the stranded ones (sweepTokenFiles).
 //!
@@ -380,11 +380,44 @@ pub fn repoCreate(gpa: std.mem.Allocator, io: Io, sidecar_dir: []const u8, pat: 
     return res(gpa, false, "GitHub rejected the repo create: {s}", .{if (why.len > 0) why else "unknown error (check the token's `repo` scope)"});
 }
 
+/// Room for push's `-c credential.helper=...` argument: the fixed text, around a credentials file's path in which
+/// every byte could be a quote, written as four.
+const HELPER_ARG_CAP = "credential.helper=store --file=''".len + 4 * TOKEN_PATH_CAP;
+
+/// The `-c` argument that makes the credentials file at `path` push's only credential helper,
+/// `credential.helper=store --file='<path>'`, formatted into `buf`; null when it does not fit.
+///
+/// git runs a helper whose name does not begin with `!` as the command `git credential-store --file=<path> get`, through
+/// its shell (sh), in the `git -C` workdir. So `path` has to come through sh intact and name the file from the workdir.
+/// Builds before 2026-09-17 passed the sidecar path as the desk holds it, and neither a Windows desk nor a standalone
+/// one could authenticate a push (measured against a 127.0.0.1 stand-in that asks for credentials, with Git for Windows
+/// 2.52 and with git 2.43 under dash):
+/// - `path` is absolute: push resolves the sidecar before it names the file. The standalone desk's data dir is
+///   cwd-relative ("data"), and a relative path named a file inside the workdir, where there is none.
+/// - It is single-quoted, and an embedded `'` is written `'\''`. Unquoted, sh took each backslash in the in-process
+///   GUI's `{exe home}/data` for an escape ("fatal: unable to open C:Usersgarys..."), and a space, as in a
+///   "OneDrive - <org>" folder, split the word ("usage: git credential-store").
+/// - On Windows a backslash is written as a forward slash, which Windows reads the same way. Git for Windows 2.52 needs
+///   only the quotes: a single-quoted backslash path, UNC ones included, reached credential-store intact, so no test
+///   here can tell the two apart. The slash keeps the path from depending on how a shell hop treats a backslash.
+fn credentialHelperArg(buf: []u8, path: []const u8) ?[]const u8 {
+    var w: Io.Writer = .fixed(buf);
+    w.writeAll("credential.helper=store --file='") catch return null;
+    for (path) |c| switch (c) {
+        '\'' => w.writeAll("'\\''") catch return null, // close the quote, a quoted quote, reopen
+        '\\' => w.writeByte(if (builtin.os.tag == .windows) '/' else '\\') catch return null,
+        else => w.writeByte(c) catch return null,
+    };
+    w.writeByte('\'') catch return null;
+    return w.buffered();
+}
+
 /// Push the conversation's repo to `owner/repo`. The remote is (re)set TOKENLESS
 /// (`https://github.com/<owner>/<repo>.git`); the PAT is supplied through a one-shot git credentials file
-/// (`credential.helper store --file=<tmp>`): the call's own (tokenPath), written under `sidecar_dir` right before git
-/// starts, kept young by a Lease while git runs, and deleted once git has exited — so the token never touches the
-/// argv, `.git/config`, or the transcript. Auto-commits nothing; caller commits first.
+/// (`credential.helper=store --file='<path>'`, credentialHelperArg): the call's own (tokenPath), written under the
+/// absolute path of `sidecar_dir` right before git starts, kept young by a Lease while git runs, and deleted once git
+/// has exited — so the token never touches the argv, `.git/config`, or the transcript. Auto-commits nothing; caller
+/// commits first.
 pub fn push(gpa: std.mem.Allocator, io: Io, workdir: []const u8, sidecar_dir: []const u8, owner: []const u8, repo: []const u8, user: []const u8, pat: []const u8, branch: []const u8) Res {
     if (!isRepo(io, gpa, workdir)) return res(gpa, false, "nothing to push — commit something first (git_commit).", .{});
     if (pat.len == 0) return res(gpa, false, "no GitHub token configured — set one with `::pat <token>` first.", .{});
@@ -400,14 +433,17 @@ pub fn push(gpa: std.mem.Allocator, io: Io, workdir: []const u8, sidecar_dir: []
         const ad = git(gpa, io, workdir, &.{ "remote", "add", "origin", remote_url });
         gpa.free(ad.out);
     }
-    // the call's own credentials file. `credential.useHttpPath=false` so one entry covers the repo.
+    // the call's own credentials file, named by the sidecar's absolute path: git reads it from the workdir, through its
+    // shell (credentialHelperArg). `credential.useHttpPath=false` so one entry covers the repo.
+    var side_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const side_len = Io.Dir.cwd().realPathFile(io, sidecar_dir, &side_buf) catch |e| return res(gpa, false, "could not stage credentials: no absolute path for {s} ({t})", .{ sidecar_dir, e });
     var cred_buf: [TOKEN_PATH_CAP]u8 = undefined;
-    const cred_path = tokenPath(io, sidecar_dir, GIT_CRED, &cred_buf) orelse return res(gpa, false, "path too long", .{});
+    const cred_path = tokenPath(io, side_buf[0..side_len], GIT_CRED, &cred_buf) orelse return res(gpa, false, "path too long", .{});
     const un = if (user.len > 0) user else owner;
     const cred = std.fmt.allocPrint(gpa, "{s}://{s}:{s}@{s}\n", .{ gh.web_scheme, un, pat, gh.web_host }) catch return res(gpa, false, "oom", .{});
     defer gpa.free(cred);
-    var helper_buf: [TOKEN_PATH_CAP + 64]u8 = undefined;
-    const helper = std.fmt.bufPrint(&helper_buf, "credential.helper=store --file={s}", .{cred_path}) catch return res(gpa, false, "path too long", .{});
+    var helper_buf: [HELPER_ARG_CAP]u8 = undefined;
+    const helper = credentialHelperArg(&helper_buf, cred_path) orelse return res(gpa, false, "path too long", .{});
     // THE TOKEN LEAVES WITH THE CALL. The delete is armed before the write, so a write that fails halfway or a git that
     // never launches leaves nothing, and std.process.run returns only once git is gone.
     defer dropTokenFile(io, cred_path);
@@ -500,6 +536,15 @@ const TEST_REJECTED_BODY = "{\"message\":\"Repository creation failed.\"}";
 const TEST_REJECTED = std.fmt.comptimePrint("HTTP/1.1 422 Unprocessable Entity\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ TEST_REJECTED_BODY.len, TEST_REJECTED_BODY });
 /// The remote refuses a push outright, before git asks for credentials.
 const TEST_FORBIDDEN = "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+/// The remote wants credentials first, as GitHub does before it takes a push: git asks its credential helper, then asks
+/// the remote again with what the helper gave.
+const TEST_CHALLENGE = "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"GitHub\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+/// The Authorization header git sends once it has read a test push's credentials file: user `gitvc-test` and the token.
+const TEST_BASIC_AUTH = basic: {
+    const pair = "gitvc-test:" ++ TEST_PAT;
+    var b64: [std.base64.standard.Encoder.calcSize(pair.len)]u8 = undefined;
+    break :basic "Basic " ++ std.base64.standard.Encoder.encode(&b64, pair);
+};
 
 /// TEST ONLY. GitHub's API and git host on 127.0.0.1, at a port the OS assigns (a fixed port is shared rather than
 /// exclusive on Windows, and a wildcard listen raises a Windows Firewall prompt). It reads each request whole and keeps
@@ -511,11 +556,16 @@ const Standin = struct {
     port: u16,
     reply: []const u8,
     hook: ?Hook,
+    /// A request that carries no Authorization header is answered TEST_CHALLENGE instead of `reply`.
+    challenge: bool,
     closing: std.atomic.Value(bool),
     /// Requests read whole so far. The first is in `req` once this is 1, and nothing writes `req` after that.
     seen: std.atomic.Value(u32),
     req: [16 << 10]u8,
     req_len: usize,
+    /// The value of the first Authorization header a request carried. Complete once `stop` has returned.
+    auth: [512]u8,
+    auth_len: usize,
     api: [40]u8,
     api_len: usize,
     host: [24]u8,
@@ -526,15 +576,27 @@ const Standin = struct {
 
     /// Starts in place: the serve thread holds a pointer to the struct, so it must not be copied.
     fn start(sv: *Standin, io: Io, reply: []const u8, hook: ?Hook) !void {
+        return sv.open(io, reply, hook, false);
+    }
+
+    /// `start`, as a remote that wants credentials: a request without them is answered TEST_CHALLENGE, and one with them
+    /// `reply`.
+    fn startChallenging(sv: *Standin, io: Io, reply: []const u8) !void {
+        return sv.open(io, reply, null, true);
+    }
+
+    fn open(sv: *Standin, io: Io, reply: []const u8, hook: ?Hook, challenge: bool) !void {
         const addr = Io.net.IpAddress{ .ip4 = .loopback(0) };
         sv.server = Io.net.IpAddress.listen(&addr, io, .{ .mode = .stream, .protocol = .tcp }) catch return error.SkipZigTest; // no loopback listener on this box
         sv.io = io;
         sv.port = sv.server.socket.address.getPort();
         sv.reply = reply;
         sv.hook = hook;
+        sv.challenge = challenge;
         sv.closing = .init(false);
         sv.seen = .init(0);
         sv.req_len = 0;
+        sv.auth_len = 0;
         sv.api_len = (std.fmt.bufPrint(&sv.api, "http://127.0.0.1:{d}", .{sv.port}) catch unreachable).len;
         sv.host_len = (std.fmt.bufPrint(&sv.host, "127.0.0.1:{d}", .{sv.port}) catch unreachable).len;
         sv.thread = std.Thread.spawn(.{}, serve, .{sv}) catch |e| {
@@ -557,6 +619,7 @@ const Standin = struct {
             var rbuf: [4 << 10]u8 = undefined;
             var rd = conn.reader(sv.io, &rbuf);
             var clen: usize = 0;
+            var authorized = false;
             while (true) {
                 const line = (rd.interface.takeDelimiter('\n') catch break) orelse break;
                 if (first) {
@@ -564,6 +627,10 @@ const Standin = struct {
                     sv.keep("\n");
                 }
                 if (contentLength(line)) |n| clen = n;
+                if (headerValue(line, "authorization:")) |v| {
+                    authorized = true;
+                    sv.keepAuth(v);
+                }
                 if (std.mem.trimEnd(u8, line, "\r").len == 0) break;
             }
             if (clen > 0) {
@@ -577,7 +644,7 @@ const Standin = struct {
             if (sv.hook) |h| h.run(h.ctx);
             var wbuf: [8 << 10]u8 = undefined;
             var wr = conn.writer(sv.io, &wbuf);
-            wr.interface.writeAll(sv.reply) catch {};
+            wr.interface.writeAll(if (sv.challenge and !authorized) TEST_CHALLENGE else sv.reply) catch {};
             wr.interface.flush() catch {};
         }
     }
@@ -588,9 +655,21 @@ const Standin = struct {
         sv.req_len += n;
     }
 
+    fn keepAuth(sv: *Standin, value: []const u8) void {
+        if (sv.auth_len > 0) return;
+        const n = @min(value.len, sv.auth.len);
+        @memcpy(sv.auth[0..n], value[0..n]);
+        sv.auth_len = n;
+    }
+
     /// The first request, head and body. Complete once `seen` is 1.
     fn request(sv: *const Standin) []const u8 {
         return sv.req[0..sv.req_len];
+    }
+
+    /// The first Authorization header's value, "" when no request carried one. Read it after `stop`.
+    fn authorization(sv: *const Standin) []const u8 {
+        return sv.auth[0..sv.auth_len];
     }
 
     /// Dials its own port once, so a serve loop parked in accept wakes and exits.
@@ -604,10 +683,14 @@ const Standin = struct {
 
     /// `Content-Length: N` -> N, in any letter case. Anything else -> null.
     fn contentLength(line: []const u8) ?usize {
-        const k = "content-length:";
-        if (line.len <= k.len) return null;
-        for (line[0..k.len], k) |a, b| if (std.ascii.toLower(a) != b) return null;
-        return std.fmt.parseInt(usize, std.mem.trim(u8, line[k.len..], " \t\r"), 10) catch null;
+        return std.fmt.parseInt(usize, headerValue(line, "content-length:") orelse return null, 10) catch null;
+    }
+
+    /// The value on a header `line` named `name` (lowercase, with its colon), in any letter case. Another line -> null.
+    fn headerValue(line: []const u8, comptime name: []const u8) ?[]const u8 {
+        if (line.len < name.len) return null;
+        for (line[0..name.len], name) |a, b| if (std.ascii.toLower(a) != b) return null;
+        return std.mem.trim(u8, line[name.len..], " \t\r");
     }
 };
 
@@ -902,6 +985,74 @@ test "a push that runs past the age floor keeps its credentials file young: anot
     }
     // and once the push is over, its file goes with it
     try std.testing.expectEqual(@as(usize, 0), try expectNoTokenOnDisk(gpa, io, side, TEST_PAT, ""));
+}
+
+test "git_push authenticates from either desk's data dir: git answers the remote's challenge with the token from a cwd-relative dir and from absolute ones in the OS's separators with a space or a quote, and keeps a tokenless remote" {
+    const gpa = std.testing.allocator;
+    var threaded = testThreaded(gpa);
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-gitvc-auth-tmp";
+    Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer test_endpoints = TEST_NOWHERE;
+
+    // The data dirs the two desks hand the git tools. runGitTool puts the sidecar at `{data}/.veil-desk` (sideDir) and
+    // the workdir at `{data}/_chat/builds/{conv}/work`.
+    // - The standalone desk's is cwd-relative: desk/src/main.zig seedSettings settles on "data".
+    // - The in-process GUI's is `{exe home}/data` (src/main.zig resolvePaths): absolute, with the OS's separators up to
+    //   the home, so backslashes on Windows. The home can sit in a business OneDrive folder ("OneDrive - <org>"), with
+    //   a space, or under a user folder whose name has a quote.
+    var cwd_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const cwd = cwd_buf[0..try Io.Dir.cwd().realPathFile(io, ".", &cwd_buf)];
+    const sep = std.fs.path.sep_str;
+    var space_buf: [512]u8 = undefined;
+    var quote_buf: [512]u8 = undefined;
+    const Case = struct { desk: []const u8, data: []const u8 };
+    const cases = [_]Case{
+        .{ .desk = "standalone desk", .data = root ++ "/data" },
+        .{ .desk = "in-process GUI, a home with a space", .data = try std.fmt.bufPrint(&space_buf, "{s}" ++ sep ++ root ++ sep ++ "OneDrive - Contoso/data", .{cwd}) },
+        .{ .desk = "in-process GUI, a home with a quote", .data = try std.fmt.bufPrint(&quote_buf, "{s}" ++ sep ++ root ++ sep ++ "O'Brien/data", .{cwd}) },
+    };
+    var wrong: usize = 0;
+    for (cases) |c| {
+        var work_buf: [640]u8 = undefined;
+        var side_buf: [640]u8 = undefined;
+        const work = try std.fmt.bufPrint(&work_buf, "{s}/_chat/builds/c/work", .{c.data});
+        const side = try std.fmt.bufPrint(&side_buf, "{s}/.veil-desk", .{c.data});
+        try testRepo(gpa, io, c.data, work, side);
+
+        var sv: Standin = undefined;
+        try sv.startChallenging(io, TEST_FORBIDDEN);
+        var sv_up = true;
+        defer if (sv_up) sv.stop();
+        test_endpoints = sv.aimed();
+        const r = push(gpa, io, work, side, "me", "scratch", "gitvc-test", TEST_PAT, "main");
+        defer r.deinit(gpa);
+        sv.stop();
+        sv_up = false;
+        test_endpoints = TEST_NOWHERE;
+
+        // git read the call's credentials file and answered the challenge with the token, and the refusal that came back
+        // is what ended the push.
+        if (!std.mem.eql(u8, sv.authorization(), TEST_BASIC_AUTH) or r.ok or std.mem.indexOf(u8, r.msg, "403") == null) {
+            std.debug.print("\n[{s}, sidecar {s}] git did not answer the challenge with the token (Authorization: \"{s}\"). The push said ok={}: {s}\n", .{ c.desk, side, sv.authorization(), r.ok, r.msg });
+            wrong += 1;
+        }
+        // The remote git keeps is the tokenless url, and nothing in the repo's config holds the token.
+        var cfg_buf: [700]u8 = undefined;
+        const config = try Io.Dir.cwd().readFileAlloc(io, try std.fmt.bufPrint(&cfg_buf, "{s}/.git/config", .{work}), gpa, .limited(1 << 16));
+        defer gpa.free(config);
+        var url_buf: [96]u8 = undefined;
+        const url = try std.fmt.bufPrint(&url_buf, "url = http://{s}/me/scratch.git\n", .{sv.aimed().web_host});
+        if (std.mem.indexOf(u8, config, TEST_PAT) != null or std.mem.indexOf(u8, config, url) == null) {
+            std.debug.print("\n[{s}] the repo's config does not keep the tokenless remote ({s}):\n{s}\n", .{ c.desk, url, config });
+            wrong += 1;
+        }
+        // The credentials file left with the call.
+        try std.testing.expectEqual(@as(usize, 0), try expectNoTokenOnDisk(gpa, io, side, TEST_PAT, ""));
+    }
+    try std.testing.expectEqual(@as(usize, 0), wrong);
 }
 
 test "the token sweep takes stranded token files, and nothing a live call, the stored token or a model call may need" {
