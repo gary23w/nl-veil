@@ -28,8 +28,11 @@ those failures. Read this before adding tests; hand it to any agent you ask to w
   fixed formats. `scripts\check.ps1 -Scan` flags the pattern repo-wide.
 - Plain `.append()` of an allocPrint *slice* transfers ownership and is fine — `appendSlice`
   copies-and-orphans (0009), and so does any helper that keeps its own copy of the message it is
-  handed: `err()`/`stepErr()` in llm.zig leaked this way at seven sites (1b438fa, aeb6ac7). `-Scan`
-  knows those helpers by name, so a new helper that copies its message goes on its list.
+  handed: `err()`/`stepErr()` in llm.zig leaked this way at seven sites (1b438fa, aeb6ac7). So does
+  anything that only reads the slice and keeps none of it: `Worker.act` (escaped into its event line)
+  and `writeFile`'s `.sub_path` (opened, then dropped) leaked at fourteen sites in run.zig and agi.zig.
+  `-Scan` knows those callees by name and `.sub_path` by field, so a new callee or field that keeps
+  none of the slice goes on its list.
 - If a struct has no `deinit`, give it one rather than writing a test-only drain helper (0017).
 
 ## Touching the filesystem
