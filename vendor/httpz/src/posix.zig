@@ -188,6 +188,27 @@ pub fn close(fd: fd_t) void {
     }
 }
 
+/// `close` that reports a failure instead of swallowing it. Only Windows gets here with false (closesocket
+/// fails, e.g. WSAENOTSOCK on a handle that was already closed); on POSIX, EBADF already panics in `close`.
+/// NOTE: local patch to vendored httpz.
+pub fn tryClose(fd: fd_t) bool {
+    if (native_os == .windows) {
+        windows.closesocket(fd) catch return false;
+        return true;
+    }
+    close(fd);
+    return true;
+}
+
+/// Wakes a thread blocked in recv or send on a connected socket, without closing the socket. The shutdown comes
+/// first, so every call that starts after it fails at once. On Windows the shutdown does not wake a call that is
+/// already blocked (measured), so CancelIoEx then completes that call with WSAEINTR. NOTE: local patch to
+/// vendored httpz; see worker.zig `Connections`.
+pub fn wakeBlocked(sock: socket_t) void {
+    shutdown(sock, .both) catch {};
+    if (native_os == .windows) windows.cancelIo(sock);
+}
+
 pub fn setsockopt(fd: socket_t, level: i32, optname: u32, opt: []const u8) !void {
     if (native_os == .windows) {
         // Winsock takes SO_RCVTIMEO/SO_SNDTIMEO as a DWORD of milliseconds,
