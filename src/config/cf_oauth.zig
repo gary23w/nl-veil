@@ -16,7 +16,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const bu = @import("../worker/browser/util.zig"); // sleepMs: a raw-thread sleep, no Io park
-const llm = @import("../worker/llm.zig"); // runCurl + KEY_CFG_MAX: curl reads a call's secrets from its stdin
+const llm = @import("../worker/llm.zig"); // runCurl, KEY_CFG_MAX + the curl-config escaping: a call's secrets ride curl's stdin
 const fakehttp = @import("../worker/fakehttp.zig"); // TEST ONLY: the stand-in the transport tests dial
 const httpz = @import("httpz");
 const http = @import("../gateway/http.zig");
@@ -205,15 +205,15 @@ pub const CurlOpts = struct {
 /// verifier, always does: it used to sit in `{data}/.cfoauth-body-*` for the call's life. Only a body too big for the
 /// pipe, or holding NUL or 0x1A, goes to a file, `{scratch}/{body_prefix}{16 hex}`, the call's own and deleted when it
 /// returns: an upload (cf_r2's objects, cf_r2_put's bytes, a large cf_api payload), never the bearer. A bearer or
-/// content type the config cannot carry (cfgHeader), or a bearer too long for the pipe, fails the call before a file
+/// content type the config cannot carry (llm.cfgHeader), or a bearer too long for the pipe, fails the call before a file
 /// is written or a connection made: a secret never falls back to a file.
 pub fn curl(o: CurlOpts, method: []const u8, url: []const u8, body: []const u8, bearer: []const u8, content_type: []const u8) ?[]u8 {
     const gpa = o.gpa;
     const io = o.io;
     var cfg: std.ArrayListUnmanaged(u8) = .empty;
     defer cfg.deinit(gpa);
-    if (bearer.len > 0 and !(cfgHeader(gpa, &cfg, "Authorization: Bearer ", bearer) catch return null)) return null;
-    if (body.len > 0 and content_type.len > 0 and !(cfgHeader(gpa, &cfg, "Content-Type: ", content_type) catch return null)) return null;
+    if (bearer.len > 0 and !(llm.cfgHeader(gpa, &cfg, "Authorization: Bearer ", bearer) catch return null)) return null;
+    if (body.len > 0 and content_type.len > 0 and !(llm.cfgHeader(gpa, &cfg, "Content-Type: ", content_type) catch return null)) return null;
     if (cfg.items.len > llm.KEY_CFG_MAX) return null; // runCurl's precondition: the pipe holds the config whole
     const in_file = body.len > 0 and !(cfgData(gpa, &cfg, body) catch return null);
 
@@ -251,49 +251,20 @@ pub fn curl(o: CurlOpts, method: []const u8, url: []const u8, body: []const u8, 
 /// starts (`curl`): the moment a config file would already be on disk. pub: cftools' tests hold the belt's calls here.
 pub var test_before_curl: if (builtin.is_test) ?*const fn () void else void = if (builtin.is_test) null else {};
 
-/// Append `header = "<name><value>"` to a curl config. False, with nothing appended, for a value holding a byte below
-/// 0x20 or DEL: curl puts a header value on the wire as it reads it, so a line break would split the header, and NUL
-/// or 0x1A would cut the config short (cfgEscape).
-fn cfgHeader(gpa: std.mem.Allocator, cfg: *std.ArrayListUnmanaged(u8), comptime name: []const u8, value: []const u8) error{OutOfMemory}!bool {
-    for (value) |c| if (c < 0x20 or c == 0x7F) return false;
-    try cfg.appendSlice(gpa, "header = \"" ++ name);
-    try cfgEscape(gpa, cfg, value);
-    try cfg.appendSlice(gpa, "\"\n");
-    return true;
-}
-
 /// Append `data-raw = "<body>"` to a curl config when curl reads `body` back byte for byte and the whole config still
 /// fits the pipe (llm.KEY_CFG_MAX). False, with the config as it was, otherwise: the call sends the body from a file.
 /// `data-raw`, NOT `data-binary`: data-binary reads a value that starts with @ as a file name, and curl 8.5, 8.17 and
 /// 8.21 each uploaded that file's contents instead of the body (measured 2026-09-17).
 fn cfgData(gpa: std.mem.Allocator, cfg: *std.ArrayListUnmanaged(u8), body: []const u8) error{OutOfMemory}!bool {
     if (body.len > llm.KEY_CFG_MAX) return false; // escaping only lengthens it
-    for (body) |c| if (c == 0 or c == 0x1A) return false; // no escape carries either (cfgEscape)
+    for (body) |c| if (c == 0 or c == 0x1A) return false; // no escape carries either (llm.cfgEscape)
     const mark = cfg.items.len;
     try cfg.appendSlice(gpa, "data-raw = \"");
-    try cfgEscape(gpa, cfg, body);
+    try llm.cfgEscape(gpa, cfg, body);
     try cfg.appendSlice(gpa, "\"\n");
     if (cfg.items.len <= llm.KEY_CFG_MAX) return true;
     cfg.shrinkRetainingCapacity(mark);
     return false;
-}
-
-/// `value` as the inside of a quoted curl config value, the way curl's config reader unquotes it: `\\` and `\"` for
-/// themselves, `\t` `\n` `\r` `\v` for tab, line feed, CR and VT. The escapes keep a value ONE value. A raw line feed
-/// ends it, and curl reads what follows as more options: a body could add a header, or a second URL, and curl sends
-/// the config's bearer to that URL too (measured on curl 8.5, 8.17 and 8.21). NUL and 0x1A have no escape: curl stops
-/// reading a line at NUL, and on Windows it reads its config in text mode, where 0x1A ends it. The callers refuse both.
-fn cfgEscape(gpa: std.mem.Allocator, cfg: *std.ArrayListUnmanaged(u8), value: []const u8) error{OutOfMemory}!void {
-    for (value) |c| switch (c) {
-        '\\' => try cfg.appendSlice(gpa, "\\\\"),
-        '"' => try cfg.appendSlice(gpa, "\\\""),
-        '\t' => try cfg.appendSlice(gpa, "\\t"),
-        '\n' => try cfg.appendSlice(gpa, "\\n"),
-        '\r' => try cfg.appendSlice(gpa, "\\r"),
-        0x0B => try cfg.appendSlice(gpa, "\\v"),
-        // every other byte reads back as itself: the rest of the range below 0x20, and 0x7F-0xFF (all three curls)
-        else => try cfg.append(gpa, c),
-    };
 }
 
 // ------------------------------------------------------------------------------------ token exchange + resolve

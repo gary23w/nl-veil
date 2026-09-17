@@ -4784,7 +4784,21 @@ pub const Chat = struct {
     /// Save an api key under the SELECTED role's provider slot. `role` is ""/"think"/"prompt" (the panel the
     /// user clicked Save on). Keyed by the role's own (kind,byok) slug — so two roles on the same provider
     /// share that provider's one key — and mirrored into the role's in-memory key buffer for resolveProviderFor.
+    /// Trimmed, and refused outright for a key no curl config can carry (llm.strayCfgByte).
     fn cmdSaveKey(self: *Chat, dd: []const u8, role: []const u8, key: []const u8) void {
+        // A key is refused HERE as well as at the call (llm.chatCfg), as ::pat is beside its own tools: curl reads its
+        // config line by line, so a key holding a control byte could add curl an option of its own — a second `url =`,
+        // dialled with this key as its bearer. Saving one would only strand a key every call then refuses, so a bad
+        // paste is caught while the user is still at it. A paste picks up the surrounding whitespace far more often
+        // than it picks up anything else, so trim first (as the PAT entry does) and refuse only what is left. The
+        // notice names the byte and its place, never any part of the key.
+        const key_in = std.mem.trim(u8, key, " \r\n\t");
+        if (llm.strayCfgByte(key_in)) |stray| {
+            var nb: [140]u8 = undefined;
+            const why = std.fmt.bufPrint(&nb, "it has a control character (0x{x:0>2}) at character {d}; copy the key on its own, without the text around it", .{ stray.byte, stray.at + 1 }) catch "it has a control character inside it; copy the key on its own";
+            self.store.pushNotif("Key NOT saved", why, 2);
+            return;
+        }
         var sb: [600]u8 = undefined;
         const side = sideDir(dd, &sb);
         const slot: KeySlot = if (std.mem.eql(u8, role, "think")) .think else if (std.mem.eql(u8, role, "prompt")) .prompt else .base;
@@ -4812,25 +4826,25 @@ pub const Chat = struct {
             }
         }
         const slug = keySlug(kind, byok);
-        const ok = slug.len > 0 and secrets.saveFor(self.io, self.gpa, side, slug, key);
+        const ok = slug.len > 0 and secrets.saveFor(self.io, self.gpa, side, slug, key_in);
         if (ok) {
             self.store.lock();
             defer self.store.unlock();
             const s = &self.store.settings;
             switch (slot) {
                 .base => {
-                    const n = @min(key.len, s.chat_key.len);
-                    @memcpy(s.chat_key[0..n], key[0..n]);
+                    const n = @min(key_in.len, s.chat_key.len);
+                    @memcpy(s.chat_key[0..n], key_in[0..n]);
                     s.chat_key_len = @intCast(n);
                 },
                 .think => {
-                    const n = @min(key.len, s.chat_think.key.len);
-                    @memcpy(s.chat_think.key[0..n], key[0..n]);
+                    const n = @min(key_in.len, s.chat_think.key.len);
+                    @memcpy(s.chat_think.key[0..n], key_in[0..n]);
                     s.chat_think.key_len = @intCast(n);
                 },
                 .prompt => {
-                    const n = @min(key.len, s.chat_prompt.key.len);
-                    @memcpy(s.chat_prompt.key[0..n], key[0..n]);
+                    const n = @min(key_in.len, s.chat_prompt.key.len);
+                    @memcpy(s.chat_prompt.key[0..n], key_in[0..n]);
                     s.chat_prompt.key_len = @intCast(n);
                 },
             }
