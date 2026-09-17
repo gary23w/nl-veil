@@ -72,11 +72,17 @@ pub fn schedParts(conv: []const u8) ?SchedParts {
     const us = std.mem.lastIndexOfScalar(u8, rest, '_') orelse return null;
     if (us == 0) return null; // "_stamp" with an empty task id is not a run conv
     const stamp = rest[us + 1 ..];
-    if (stamp.len < 4) return null;
-    for (stamp) |c| {
-        if (c < '0' or c > '9') return null;
-    }
+    if (!isRunStamp(stamp)) return null;
     return .{ .tid = rest[0..us], .stamp = stamp };
+}
+
+/// A run timestamp as convIdFor mints it: at least 4 digits and nothing else.
+fn isRunStamp(s: []const u8) bool {
+    if (s.len < 4) return false;
+    for (s) |c| {
+        if (c < '0' or c > '9') return false;
+    }
+    return true;
 }
 
 /// The data-relative build ROOT for `conv`: "u{uid}/_sched/{tid}/runs/{stamp}" for a scheduled run,
@@ -104,12 +110,22 @@ pub fn buildRootFromChatBase(buf: []u8, chat_base: []const u8, conv: []const u8)
     return std.fmt.bufPrint(buf, "{s}/builds/{s}", .{ chat_base, root }) catch "";
 }
 
-/// The run-dir TAIL a scheduled conv's build root always ends with ("_sched/{tid}/runs/{stamp}") — what the
-/// supervisor's id↔run-dir matcher needs, since a redirected cast run_dir's basename is the bare stamp, not
-/// the conv id. null for ordinary convs.
-pub fn schedRunTail(buf: []u8, conv: []const u8) ?[]const u8 {
-    const p = schedParts(conv) orelse return null;
-    return std.fmt.bufPrint(buf, "_sched/{s}/runs/{s}", .{ p.tid, p.stamp }) catch null;
+/// The scheduled mapping read backwards: the parts of the run conversation whose build root `run_dir` is, when the
+/// dir ends in "_sched/{tid}/runs/{stamp}" (either slash form, on any host), so "scheduled_{tid}_{stamp}" is that
+/// conversation's id. null for every other dir, a stamp schedParts would refuse included. The supervisor needs it
+/// because a scheduled run dir's basename is the bare stamp, which every task that ran in that minute shares: only
+/// the conversation id names one run. The slices point into `run_dir`.
+pub fn schedRunOfDir(run_dir: []const u8) ?SchedParts {
+    var rest = std.mem.trimEnd(u8, run_dir, "/\\");
+    var segs: [4][]const u8 = undefined; // from the end: stamp, "runs", tid, "_sched"
+    for (&segs) |*seg| {
+        const cut = std.mem.lastIndexOfAny(u8, rest, "/\\");
+        seg.* = if (cut) |c| rest[c + 1 ..] else rest;
+        rest = if (cut) |c| rest[0..c] else "";
+    }
+    if (!std.mem.eql(u8, segs[3], "_sched") or !std.mem.eql(u8, segs[1], "runs")) return null;
+    if (segs[2].len == 0 or !isRunStamp(segs[0])) return null;
+    return .{ .tid = segs[2], .stamp = segs[0] };
 }
 
 // ---- tests ----
@@ -182,8 +198,54 @@ test "buildRootFromChatBase: swaps the /_chat tail for the task tree on schedule
     );
 }
 
-test "schedRunTail: the suffix a redirected run dir always carries" {
-    var b: [160]u8 = undefined;
-    try std.testing.expectEqualStrings("_sched/t/runs/07171200", schedRunTail(&b, "scheduled_t_07171200").?);
-    try std.testing.expect(schedRunTail(&b, "c42") == null);
+test "schedRunOfDir reads back the scheduled run conversation buildRootRel built a dir for, and nothing else" {
+    // Two derivations of one mapping: every conv's build root, in both slash forms and under a data prefix, reads back
+    // as exactly the run conversation it was built for, a sub-chat's as its scheduled primary's; every other root as none.
+    const convs = [_][]const u8{
+        "scheduled_daily-report-0301070500_03010705",
+        "scheduled_digest-0715174901_03010705", // another task, the same minute: one basename, two runs
+        "scheduled_news-0715174857_07151753__s2", // a scheduled run's sub-chat builds in that run's tree
+        "scheduled_a_b_1234", // a task id with an underscore in it
+        "c6a57f852",
+        "c6a57f852__s1",
+        "03010705", // an ordinary conversation named like a stamp
+        "scheduled_notes", // hand-named: an ordinary conversation
+    };
+    for (convs) |conv| {
+        var rb: [256]u8 = undefined;
+        const rel = buildRootRel(&rb, 7, conv);
+        var fb: [300]u8 = undefined;
+        const forward = try std.fmt.bufPrint(&fb, "C:/nl/data/{s}", .{rel});
+        var bb: [300]u8 = undefined;
+        const back = bb[0..forward.len];
+        for (forward, back) |c, *d| d.* = if (c == '/') '\\' else c;
+        const want = schedParts(branchRoot(conv));
+        for ([_][]const u8{ rel, forward, back }) |dir| {
+            const got = schedRunOfDir(dir);
+            errdefer std.debug.print("conv {s} builds in {s}, read back as task {s} stamp {s}\n", .{ conv, dir, if (got) |g| g.tid else "-", if (got) |g| g.stamp else "-" });
+            try std.testing.expectEqual(want == null, got == null);
+            if (want) |w| {
+                try std.testing.expectEqualStrings(w.tid, got.?.tid);
+                try std.testing.expectEqualStrings(w.stamp, got.?.stamp);
+            }
+        }
+    }
+    // Near misses that no conversation builds in.
+    for ([_][]const u8{
+        "u1/_sched/t/runs/0715x753", // not a stamp
+        "u1/_sched/t/runs/753", // too short to be one
+        "u1/_sched//runs/07151753", // no task
+        "u1/_sched/t/07151753", // not under runs/
+        "u1/sched/t/runs/07151753",
+        "u1/_sched/t/runs/07151753/work", // inside a run dir
+        "_sched/runs/07151753",
+        "07151753",
+        "",
+    }) |dir| {
+        errdefer std.debug.print("{s} read as a scheduled run\n", .{dir});
+        try std.testing.expect(schedRunOfDir(dir) == null);
+    }
+    const trailing = schedRunOfDir("u1/_sched/t/runs/07171200/").?; // a trailing separator is still the dir
+    try std.testing.expectEqualStrings("t", trailing.tid);
+    try std.testing.expectEqualStrings("07171200", trailing.stamp);
 }

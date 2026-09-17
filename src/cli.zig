@@ -550,7 +550,8 @@ fn cmdList(ctx: *Ctx) u8 {
         const goal = jsonStr(ctx.gpa, obj, "goal") orelse ctx.gpa.dupe(u8, "") catch continue;
         defer ctx.gpa.free(goal);
         const minds = jsonNum(obj, "minds");
-        out("{s: <18}  {s: <9}  {d: <8}  {s}\n", .{ id[0..@min(id.len, 18)], state[0..@min(state.len, 9)], minds, goal[0..@min(goal.len, 60)] });
+        // the id in full: `veil stop` / `veil rm` take it verbatim, and a re-adopted run's id can be a long conversation id
+        out("{s: <18}  {s: <9}  {d: <8}  {s}\n", .{ id, state[0..@min(state.len, 9)], minds, goal[0..@min(goal.len, 60)] });
         count += 1;
     }
     if (count == 0) out("(no swarms — deploy one with `veil cast \"<goal>\"`)\n", .{});

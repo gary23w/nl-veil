@@ -304,16 +304,19 @@ pub const Supervisor = struct {
         return self.swarms.get(id);
     }
 
-    /// get(), but tolerant of every id form in the wild: the registry key (the spawn-time hex id for a live
-    /// swarm) OR any id that names the swarm's RUN DIR (idMatchesRunDir) — its basename (what a server restart
-    /// re-adopts a dir as, and what the desktop Swarm tab sends for a chat cast), or the conversation whose build
-    /// root castSwarm spawned it into, a sub-chat naming its family's. One run dir can carry several entries:
-    /// every re-cast into a conversation or its family registers a fresh hex id on the SAME dir, and the old
-    /// entries stay. The NEWEST registration is the dir's current worker (deploySwarm reset the dir's lifecycle
-    /// files when it spawned), so a run-dir id resolves to it, even when that id is also a re-adopted dir's key;
-    /// a spawn id still names exactly its own swarm. Callers that mutate must use the returned swarm's own `.id`
-    /// — it may differ from the id they passed.
-    pub fn resolve(self: *Supervisor, id: []const u8) ?*Swarm {
+    /// get(), but tolerant of every id form in the wild, for the account `uid` asking: the registry key (the
+    /// spawn-time hex id for a live swarm) OR any id that names one of that account's RUN DIRS (idMatchesRunDir) —
+    /// a chat or deploy dir's basename (what a server restart re-adopts it as, and what the desktop Swarm tab sends),
+    /// or the conversation whose build root castSwarm spawned it into, a sub-chat naming its family's. A run-dir name
+    /// belongs to one account: conversation and task ids are minted from the clock, so two accounts can hold the
+    /// same one, and each must reach its own run. One run dir can carry several entries: every re-cast into a
+    /// conversation or its family registers a fresh hex id on the SAME dir, and the old entries stay. The NEWEST
+    /// registration is the dir's current worker (deploySwarm reset the dir's lifecycle files when it spawned), so a
+    /// run-dir id resolves to it, even when that id is also a re-adopted dir's key. A key that names no dir of its
+    /// own (a spawn id, or a re-adopted dir's account-qualified key, see adoptKey) still names exactly its own swarm,
+    /// whichever account owns it, so callers check the owner. Callers that mutate must use the returned swarm's own
+    /// `.id` — it may differ from the id they passed.
+    pub fn resolve(self: *Supervisor, uid: u64, id: []const u8) ?*Swarm {
         self.mu.lockUncancelable(self.io);
         defer self.mu.unlock(self.io);
         if (self.swarms.get(id)) |s| {
@@ -323,7 +326,7 @@ pub const Supervisor = struct {
         var it = self.swarms.valueIterator();
         while (it.next()) |sp| {
             const s = sp.*;
-            if (!idMatchesRunDir(s.run_dir, id)) continue;
+            if (s.uid != uid or !idMatchesRunDir(s.run_dir, id)) continue;
             if (newest == null or s.created > newest.?.created) newest = s;
         }
         return newest;
@@ -680,33 +683,75 @@ pub const Supervisor = struct {
     const MindManifest = struct { name: []const u8 = "" };
     const Manifest = struct { swarm: []const u8 = "swarm", model: []const u8 = "mock", encrypted: bool = false, minds: []const MindManifest = &.{} };
 
+    /// Re-adopt the run dir holding the manifest at `mani_path` under the key adoptKey picks. error.AlreadyTracked
+    /// only when an entry already tracks that very dir: a dir that merely shares a name with a tracked one is another
+    /// run, and skipping it left a live worker there unsupervised and unreachable by any id.
     fn adoptOne(self: *Supervisor, mani_path: []const u8) !void {
         const run_dir = std.fs.path.dirname(mani_path) orelse return error.BadPath;
-        const id = std.fs.path.basename(run_dir);
-        if (self.get(id) != null) return error.AlreadyTracked;
         const uid = parseUidFromPath(run_dir) orelse return error.NoUid;
         const data = try std.Io.Dir.cwd().readFileAlloc(self.io, mani_path, self.gpa, .limited(256 << 10));
         defer self.gpa.free(data);
         const parsed = try std.json.parseFromSlice(Manifest, self.gpa, data, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();
         const m = parsed.value;
-        const sw = try self.gpa.create(Swarm);
-        errdefer self.gpa.destroy(sw);
-        sw.* = .{
-            .id = try self.gpa.dupe(u8, id),
-            .uid = uid,
-            .name = try self.gpa.dupe(u8, m.swarm),
-            .run_dir = try self.gpa.dupe(u8, run_dir),
-            .model = try self.gpa.dupe(u8, m.model),
-            .minds = m.minds.len,
-            .created = std.Io.Timestamp.now(self.io, .real).toSeconds(),
-            .child = null,
-            .state = self.inferState(run_dir),
-            .encrypted = m.encrypted,
-        };
+        const state = self.inferState(run_dir);
+        const created = std.Io.Timestamp.now(self.io, .real).toSeconds();
+
         self.mu.lockUncancelable(self.io);
         defer self.mu.unlock(self.io);
+        var it = self.swarms.valueIterator();
+        while (it.next()) |sp| {
+            if (sameRunDir(sp.*.run_dir, run_dir)) return error.AlreadyTracked;
+        }
+        const sw = try self.gpa.create(Swarm);
+        errdefer self.gpa.destroy(sw);
+        const id = try self.adoptKey(uid, run_dir);
+        errdefer self.gpa.free(id);
+        const name = try self.gpa.dupe(u8, m.swarm);
+        errdefer self.gpa.free(name);
+        const rd = try self.gpa.dupe(u8, run_dir);
+        errdefer self.gpa.free(rd);
+        const model = try self.gpa.dupe(u8, m.model);
+        errdefer self.gpa.free(model);
+        sw.* = .{
+            .id = id,
+            .uid = uid,
+            .name = name,
+            .run_dir = rd,
+            .model = model,
+            .minds = m.minds.len,
+            .created = created,
+            .child = null,
+            .state = state,
+            .encrypted = m.encrypted,
+        };
         try self.swarms.put(self.gpa, sw.id, sw);
+    }
+
+    /// The key a re-adopted run dir registers under: the name clients already reach that dir by, when no other dir
+    /// holds it as a key. A scheduled run's name is its conversation id, "scheduled_{task}_{stamp}": its basename,
+    /// the stamp, is the minute the run started, so every task that ran in that minute shares it. Any other dir's
+    /// name is its basename (a deploy's spawn id, a conversation's id). A name can still be taken, because
+    /// conversation and task ids are minted from the clock and two accounts can hold the same one: the later dir
+    /// then gets its account appended, "{name}.u{uid}" (and a count after that, should even that be taken). No
+    /// conversation or spawn id contains a '.', so the qualified key names no run dir, and resolve answers it with
+    /// exactly this entry. Caller holds `mu`; the key is gpa-owned.
+    fn adoptKey(self: *Supervisor, uid: u64, run_dir: []const u8) ![]u8 {
+        const name = if (cpaths.schedRunOfDir(run_dir)) |run|
+            try std.fmt.allocPrint(self.gpa, "scheduled_{s}_{s}", .{ run.tid, run.stamp })
+        else
+            try self.gpa.dupe(u8, runDirBase(run_dir));
+        if (!self.swarms.contains(name)) return name;
+        defer self.gpa.free(name);
+        var n: u32 = 1;
+        while (true) : (n += 1) {
+            const key = if (n == 1)
+                try std.fmt.allocPrint(self.gpa, "{s}.u{d}", .{ name, uid })
+            else
+                try std.fmt.allocPrint(self.gpa, "{s}.u{d}.{d}", .{ name, uid, n });
+            if (!self.swarms.contains(key)) return key;
+            self.gpa.free(key);
+        }
     }
 
     fn inferState(self: *Supervisor, run_dir: []const u8) State {
@@ -999,35 +1044,31 @@ pub const Supervisor = struct {
     }
 };
 
-/// True when `id` names this run dir: by its BASENAME (either slash form) — the alternate swarm-id form a
-/// re-adopted dir gets and the desktop Swarm tab sends for chat casts — or as a conversation id, through the
-/// build-root mapping castSwarm spawns every chat cast with (paths.zig buildRootRel). A sub-chat
-/// ("<primary>__sN") builds in its primary's tree, so its id names the FAMILY's run dir and matches exactly what
-/// the primary's id matches. Hand-rolled, not std.fs.path.basename: that splits only on '/' under POSIX, while
-/// run_dir strings are fmt-joined with '/' onto native base paths, so a Windows-written dir carries both
-/// separator forms on any host.
+/// True when `id` names this run dir, among one account's dirs (resolve asks about the caller's entries only): a
+/// chat or deploy dir by its BASENAME (either slash form) — the key a re-adopted dir gets and the id the desktop
+/// Swarm tab sends — or any dir as a conversation id, through the build-root mapping castSwarm spawns every chat
+/// cast with (paths.zig buildRootRel). A sub-chat ("<primary>__sN") builds in its primary's tree, so its id names
+/// the FAMILY's run dir and matches exactly what the primary's id matches. A scheduled run's dir
+/// (`.../_sched/{task}/runs/{stamp}`) answers to its conversation id alone: its basename is the minute the run
+/// started, every task that ran in that minute has a dir by that name, so the bare stamp names no run.
 fn idMatchesRunDir(run_dir: []const u8, id: []const u8) bool {
     if (id.len == 0) return false;
-    const trimmed = std.mem.trimEnd(u8, run_dir, "/\\");
-    const base = if (std.mem.lastIndexOfAny(u8, trimmed, "/\\")) |i| trimmed[i + 1 ..] else trimmed;
-    if (std.mem.eql(u8, base, id)) return true;
-    // From here the id stands for its build family's root, as buildRootRel applies it: a sub-chat's primary,
-    // every other id itself.
+    // The id stands for its build family's root, as buildRootRel applies it: a sub-chat's primary, every other id itself.
     const root = cpaths.branchRoot(id);
-    if (root.len != id.len and std.mem.eql(u8, base, root)) return true;
-    // A SCHEDULED run's cast builds under `.../_sched/{task}/runs/{stamp}` (paths.zig), so its basename is the
-    // bare stamp, not the conv id. Match the mapped tail instead, tolerant of either slash form in run_dir.
-    var tb: [160]u8 = undefined;
-    const tail = cpaths.schedRunTail(&tb, root) orelse return false;
-    if (trimmed.len < tail.len) return false;
-    const cand = trimmed[trimmed.len - tail.len ..];
-    for (cand, tail) |c, t| {
-        const cn = if (c == '\\') '/' else c;
-        if (cn != t) return false;
+    if (cpaths.schedRunOfDir(run_dir)) |run| {
+        const conv = cpaths.schedParts(root) orelse return false;
+        return std.mem.eql(u8, conv.tid, run.tid) and std.mem.eql(u8, conv.stamp, run.stamp);
     }
-    // the char before the tail must be a separator (or the tail is the whole path) — no substring aliasing
-    const before = trimmed.len - tail.len;
-    return before == 0 or trimmed[before - 1] == '/' or trimmed[before - 1] == '\\';
+    const base = runDirBase(run_dir);
+    return std.mem.eql(u8, base, id) or (root.len != id.len and std.mem.eql(u8, base, root));
+}
+
+/// A run dir's last segment, in either slash form. Hand-rolled, not std.fs.path.basename: that splits only on '/'
+/// under POSIX, while run_dir strings are fmt-joined with '/' onto native base paths, so a Windows-written dir
+/// carries both separator forms on any host.
+fn runDirBase(run_dir: []const u8) []const u8 {
+    const trimmed = std.mem.trimEnd(u8, run_dir, "/\\");
+    return if (std.mem.lastIndexOfAny(u8, trimmed, "/\\")) |i| trimmed[i + 1 ..] else trimmed;
 }
 
 /// Read at most `buf.len` bytes from the END of the file at `path` (positional read at size-buf.len).
@@ -1055,6 +1096,10 @@ test "idMatchesRunDir: basename hits on both slash forms, misses on substrings a
     try std.testing.expect(idMatchesRunDir("data\\u1\\_sched\\news-0715\\runs\\07171400", "scheduled_news-0715_07171400"));
     try std.testing.expect(!idMatchesRunDir("data/u1/_sched/news-0715/runs/07171400", "scheduled_news-0715_07179999"));
     try std.testing.expect(!idMatchesRunDir("data/u1/_sched/xnews-0715/runs/07171400", "scheduled_news-0715_07171400"));
+    // ...and by nothing else: its basename is the minute it ran, which every task that ran then shares
+    try std.testing.expect(!idMatchesRunDir("data/u1/_sched/news-0715/runs/07171400", "07171400"));
+    try std.testing.expect(!idMatchesRunDir("data\\u1\\_sched\\news-0715\\runs\\07171400", "07171400"));
+    try std.testing.expect(!idMatchesRunDir("data/u1/_sched/news-0715/runs/07171400", "07171400__s1"));
 }
 
 test "a conversation id names exactly the run dirs castSwarm spawns its build family's casts into, in either slash form" {
@@ -1072,6 +1117,8 @@ test "a conversation id names exactly the run dirs castSwarm spawns its build fa
         "scheduled_news-0715174857_07151753", // a scheduled run: _sched/{task}/runs/{stamp}
         "scheduled_news-0715174857_07151753__s1", // its sub-chat: both redirects at once
         "scheduled_news-0715174857_07151800", // the same task's next run
+        "scheduled_digest-0715174901_07151753", // another task that ran in the same minute: a dir with the same basename
+        "07151753", // an ordinary conv named like that minute: builds/{conv}, never either scheduled run's dir
         "scheduled_notes", // hand-named: an ordinary conv
     };
     for (convs) |a| {
@@ -1134,13 +1181,15 @@ test "resolve: a conversation's id finds the newest cast on its family's run dir
         }
 
         for ([_][]const u8{ "c6a57f852", "c6a57f852__s1", "c6a57f852__s5" }) |conv| {
-            try std.testing.expectEqual(@as(?*Swarm, newest), sup.resolve(conv));
+            try std.testing.expectEqual(@as(?*Swarm, newest), sup.resolve(7, conv));
         }
-        try std.testing.expectEqual(@as(?*Swarm, stale), sup.resolve(stale.id)); // a spawn id names its own swarm, however old
-        try std.testing.expectEqual(@as(?*Swarm, &neighbour), sup.resolve("c6a57f8521__s2"));
-        try std.testing.expectEqual(@as(?*Swarm, &sched_run), sup.resolve("scheduled_news-0715174857_07151753__s1"));
-        try std.testing.expectEqual(@as(?*Swarm, null), sup.resolve("c6a57f852__s6")); // not a branch: its own dir holds no cast
-        try std.testing.expectEqual(@as(?*Swarm, null), sup.resolve("c6a57f85__s1")); // a primary id that only prefixes the family's
+        try std.testing.expectEqual(@as(?*Swarm, stale), sup.resolve(7, stale.id)); // a spawn id names its own swarm, however old
+        try std.testing.expectEqual(@as(?*Swarm, stale), sup.resolve(8, stale.id)); // whoever asks: the caller checks the owner
+        try std.testing.expectEqual(@as(?*Swarm, null), sup.resolve(8, "c6a57f852")); // but a conversation is one account's
+        try std.testing.expectEqual(@as(?*Swarm, &neighbour), sup.resolve(7, "c6a57f8521__s2"));
+        try std.testing.expectEqual(@as(?*Swarm, &sched_run), sup.resolve(7, "scheduled_news-0715174857_07151753__s1"));
+        try std.testing.expectEqual(@as(?*Swarm, null), sup.resolve(7, "c6a57f852__s6")); // not a branch: its own dir holds no cast
+        try std.testing.expectEqual(@as(?*Swarm, null), sup.resolve(7, "c6a57f85__s1")); // a primary id that only prefixes the family's
     }
     try std.testing.expect(stale_came_first);
 
@@ -1151,9 +1200,119 @@ test "resolve: a conversation's id finds the newest cast on its family's run dir
     var recast = mk("3e2d1c0b9a887766", family, 1_700_000_600, .running);
     try sup.swarms.put(gpa, adopted.id, &adopted);
     try sup.swarms.put(gpa, recast.id, &recast);
-    try std.testing.expectEqual(@as(?*Swarm, &recast), sup.resolve("c6a57f852"));
-    try std.testing.expectEqual(@as(?*Swarm, &recast), sup.resolve("c6a57f852__s3"));
+    try std.testing.expectEqual(@as(?*Swarm, &recast), sup.resolve(7, "c6a57f852"));
+    try std.testing.expectEqual(@as(?*Swarm, &recast), sup.resolve(7, "c6a57f852__s3"));
     try std.testing.expectEqual(@as(?*Swarm, &adopted), sup.get("c6a57f852")); // the exact-key read is unchanged
+}
+
+test "reattach adopts every run dir, whatever other dir shares its name, and each dir's names reach only that dir" {
+    const gpa = std.testing.allocator;
+    // reattach lists the manifests through a real PowerShell (Windows) or find, which an empty environment cannot start
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = @import("../../gateway/http.zig").testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-supervisor-adopt-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    const F = struct {
+        /// `run_dir` is the data-relative dir `rel`, in either slash form, under whatever prefix the listing gave it.
+        fn isRun(run_dir: []const u8, rel: []const u8) bool {
+            if (run_dir.len <= rel.len) return false;
+            const tail = run_dir[run_dir.len - rel.len ..];
+            for (tail, rel) |c, r| {
+                if (c != r and !(c == '\\' and r == '/')) return false;
+            }
+            const sep = run_dir[run_dir.len - rel.len - 1];
+            return sep == '/' or sep == '\\';
+        }
+    };
+
+    // The run dirs castSwarm spawned before a restart, {data}/{buildRootRel(uid, conv)}, each holding the manifest
+    // deploySwarm wrote: two tasks of one account that ran in the same minute, so both dirs are named 07151753, and two
+    // accounts whose desks minted the same conversation id in the same second.
+    const Run = struct { uid: u64, conv: []const u8 };
+    const runs = [_]Run{
+        .{ .uid = 7, .conv = "scheduled_news-0715174857_07151753" },
+        .{ .uid = 7, .conv = "scheduled_digest-0715174901_07151753" },
+        .{ .uid = 1, .conv = "c6a57f852" },
+        .{ .uid = 2, .conv = "c6a57f852" },
+    };
+    var rel_bufs: [runs.len][128]u8 = undefined;
+    var rels: [runs.len][]const u8 = undefined;
+    for (runs, &rel_bufs, &rels) |r, *rb, *rel| {
+        rel.* = cpaths.buildRootRel(rb, r.uid, r.conv);
+        var db: [200]u8 = undefined;
+        const dir = try std.fmt.bufPrint(&db, root ++ "/{s}", .{rel.*});
+        _ = try std.Io.Dir.cwd().createDirPathStatus(io, dir, .default_dir);
+        var mb: [220]u8 = undefined;
+        try std.Io.Dir.cwd().writeFile(io, .{
+            .sub_path = try std.fmt.bufPrint(&mb, "{s}/swarm.json", .{dir}),
+            .data = "{\"swarm\":\"cast\",\"model\":\"mock\",\"minds\":[{\"name\":\"nova\"}]}",
+        });
+    }
+
+    var sup = Supervisor.init(gpa, io, "");
+    defer @import("fanout.zig").dropTestSwarms(&sup, gpa);
+    try std.testing.expectEqual(@as(usize, runs.len), sup.reattach(root));
+    try std.testing.expectEqual(@as(usize, 0), sup.reattach(root)); // each dir is tracked once: a second pass adds nothing
+
+    // Every run dir has exactly one entry...
+    var entries: [runs.len]*Swarm = undefined;
+    for (rels, &entries) |rel, *entry| {
+        const all = try sup.listAll();
+        defer gpa.free(all);
+        var found: ?*Swarm = null;
+        for (all) |s| {
+            if (!F.isRun(s.run_dir, rel)) continue;
+            try std.testing.expect(found == null);
+            found = s;
+        }
+        entry.* = found orelse {
+            std.debug.print("{s} was not adopted\n", .{rel});
+            return error.TestUnexpectedResult;
+        };
+    }
+    // ...under a key that reaches it and only it. A scheduled run is keyed by its conversation, never by the stamp every
+    // task that ran that minute shares. Of the two accounts' conversations, whichever the listing reached first keeps the
+    // id and the other has its account appended.
+    for (entries) |entry| {
+        try std.testing.expectEqual(@as(?*Swarm, entry), sup.get(entry.id));
+        try std.testing.expectEqual(@as(?*Swarm, entry), sup.resolve(entry.uid, entry.id));
+    }
+    try std.testing.expectEqualStrings(runs[0].conv, entries[0].id);
+    try std.testing.expectEqualStrings(runs[1].conv, entries[1].id);
+    try std.testing.expectEqual(@as(?*Swarm, null), sup.get("07151753"));
+    const first: usize = if (std.mem.eql(u8, entries[2].id, "c6a57f852")) 2 else 3;
+    const later = 5 - first;
+    try std.testing.expectEqualStrings("c6a57f852", entries[first].id);
+    var qb: [32]u8 = undefined;
+    try std.testing.expectEqualStrings(try std.fmt.bufPrint(&qb, "c6a57f852.u{d}", .{runs[later].uid}), entries[later].id);
+    // the qualified key names that entry alone, even asked by the account whose conversation holds the bare id
+    try std.testing.expectEqual(@as(?*Swarm, entries[later]), sup.resolve(runs[first].uid, entries[later].id));
+
+    // Every conversation id (a sub-chat's too), asked by every account: it reaches that account's run of the
+    // conversation and nothing else. The bare stamp reaches no run at all, and each account lists its own runs.
+    for ([_]u64{ 1, 2, 7, 9 }) |uid| {
+        for (runs) |named| {
+            for ([_][]const u8{ "", "__s2" }) |suffix| {
+                var nb: [80]u8 = undefined;
+                const name = try std.fmt.bufPrint(&nb, "{s}{s}", .{ named.conv, suffix });
+                var want: ?*Swarm = null;
+                for (runs, entries) |r, entry| {
+                    if (r.uid == uid and std.mem.eql(u8, r.conv, named.conv)) want = entry;
+                }
+                const got = sup.resolve(uid, name);
+                errdefer std.debug.print("account {d} asked for {s} and reached {s}\n", .{ uid, name, if (got) |g| g.run_dir else "nothing" });
+                try std.testing.expectEqual(want, got);
+            }
+        }
+        try std.testing.expectEqual(@as(?*Swarm, null), sup.resolve(uid, "07151753"));
+        const listed = try sup.listForUser(uid);
+        defer gpa.free(listed);
+        var owned: usize = 0;
+        for (runs) |r| owned += @intFromBool(r.uid == uid);
+        try std.testing.expectEqual(owned, listed.len);
+    }
 }
 
 test "readTail: whole small file; only the last bytes of a big one; null for a missing path" {
