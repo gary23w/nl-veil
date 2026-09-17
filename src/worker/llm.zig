@@ -1324,7 +1324,11 @@ fn completeGemma4Raw(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, ta
     };
     const parsed = std.json.parseFromSlice(Gen, gpa, r.content, .{ .ignore_unknown_fields = true }) catch return null;
     defer parsed.deinit();
-    if (parsed.value.@"error") |e| return stepErr(gpa, std.fmt.allocPrint(gpa, "provider error: {s}", .{e}) catch "provider error");
+    if (parsed.value.@"error") |e| {
+        const why = std.fmt.allocPrint(gpa, "provider error: {s}", .{e}) catch return stepErr(gpa, "provider error");
+        defer gpa.free(why);
+        return stepErr(gpa, why);
+    }
     const text = parsed.value.response orelse return null;
 
     const ms: u64 = @intCast(@max(@divTrunc(t1.nanoseconds - t0, std.time.ns_per_ms), 0));
@@ -1484,8 +1488,11 @@ fn parseOllamaNative(gpa: std.mem.Allocator, base_url: []const u8, raw: []const 
         prompt_eval_count: ?u64 = 0,
         @"error": ?[]const u8 = null,
     };
-    const parsed = std.json.parseFromSlice(Resp, gpa, raw, .{ .ignore_unknown_fields = true }) catch
-        return stepErr(gpa, std.fmt.allocPrint(gpa, "bad Ollama response: {s}", .{raw[0..@min(raw.len, 300)]}) catch "unparseable response");
+    const parsed = std.json.parseFromSlice(Resp, gpa, raw, .{ .ignore_unknown_fields = true }) catch {
+        const why = std.fmt.allocPrint(gpa, "bad Ollama response: {s}", .{raw[0..@min(raw.len, 300)]}) catch return stepErr(gpa, "unparseable response");
+        defer gpa.free(why);
+        return stepErr(gpa, why);
+    };
     defer parsed.deinit();
     if (parsed.value.eval_count) |ec| {
         if (isLocal(base_url)) {
@@ -1503,7 +1510,11 @@ fn parseOllamaNative(gpa: std.mem.Allocator, base_url: []const u8, raw: []const 
         std.log.info("llm[{s}/{s}] {d}ms in={d} out={d}", .{ at.tag, at.model, at.ms, pin, ec });
         logCall(at.ts, at.tag, at.model, base_url, at.ms, pin, 0, ec);
     }
-    if (parsed.value.@"error") |e| return stepErr(gpa, std.fmt.allocPrint(gpa, "provider error: {s}", .{e}) catch "provider error");
+    if (parsed.value.@"error") |e| {
+        const why = std.fmt.allocPrint(gpa, "provider error: {s}", .{e}) catch return stepErr(gpa, "provider error");
+        defer gpa.free(why);
+        return stepErr(gpa, why);
+    }
     const msg = parsed.value.message orelse return stepErr(gpa, "no message in Ollama response");
 
     var calls: std.ArrayListUnmanaged(ToolCall) = .empty;
@@ -2587,8 +2598,11 @@ fn completeBodyH(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: [
         // `choices`, and until now reported as "no choices in LLM response".
         errors: ?[]const struct { code: i64 = 0, message: []const u8 = "" } = null,
     };
-    const parsed = std.json.parseFromSlice(Resp, gpa, lastTopLevelJson(r.content), .{ .ignore_unknown_fields = true }) catch
-        return stepErr(gpa, std.fmt.allocPrint(gpa, "bad LLM response: {s}", .{r.content[0..@min(r.content.len, 300)]}) catch "unparseable response");
+    const parsed = std.json.parseFromSlice(Resp, gpa, lastTopLevelJson(r.content), .{ .ignore_unknown_fields = true }) catch {
+        const why = std.fmt.allocPrint(gpa, "bad LLM response: {s}", .{r.content[0..@min(r.content.len, 300)]}) catch return stepErr(gpa, "unparseable response");
+        defer gpa.free(why);
+        return stepErr(gpa, why);
+    };
     defer parsed.deinit();
     var ds_in: u64 = 0; // this call's token counts, hoisted for the dataset record at the tail
     var ds_out: u64 = 0;
@@ -2624,10 +2638,14 @@ fn completeBodyH(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: [
             if (healParamError(gpa, io, run_dir, tag, base_url, key, model, body, budget_tokens, e.message)) |s| return s;
             if (healEchoError(gpa, io, run_dir, tag, base_url, key, model, body, budget_tokens, e.message)) |s| return s;
         }
-        return stepErr(gpa, std.fmt.allocPrint(gpa, "provider error: {s}", .{e.message}) catch "provider error");
+        const why = std.fmt.allocPrint(gpa, "provider error: {s}", .{e.message}) catch return stepErr(gpa, "provider error");
+        defer gpa.free(why);
+        return stepErr(gpa, why);
     }
     if (parsed.value.errors) |es| if (es.len > 0) {
-        return stepErr(gpa, std.fmt.allocPrint(gpa, "provider error {d}: {s}", .{ es[0].code, es[0].message[0..@min(es[0].message.len, 200)] }) catch "provider error");
+        const why = std.fmt.allocPrint(gpa, "provider error {d}: {s}", .{ es[0].code, es[0].message[0..@min(es[0].message.len, 200)] }) catch return stepErr(gpa, "provider error");
+        defer gpa.free(why);
+        return stepErr(gpa, why);
     };
     if (parsed.value.choices.len == 0) return stepErr(gpa, "no choices in LLM response");
     const msg = parsed.value.choices[0].message;
@@ -3623,10 +3641,13 @@ fn trimSlash(s: []const u8) []const u8 {
 fn oom(gpa: std.mem.Allocator) Reply {
     return .{ .content = gpa.dupe(u8, "out of memory") catch @constCast("oom"), .ok = false };
 }
+/// A failed Reply holding its OWN copy of `msg`. The caller still owns `msg`: a message formatted for the call
+/// is freed by the caller after this returns (`defer gpa.free(why)`), never passed in straight from allocPrint.
 fn err(gpa: std.mem.Allocator, msg: []const u8) Reply {
     noteErr(msg);
     return .{ .content = gpa.dupe(u8, msg) catch @constCast("error"), .ok = false };
 }
+/// The Step twin of err(): it copies `msg` too, so the same rule holds for a formatted message.
 fn stepErr(gpa: std.mem.Allocator, msg: []const u8) Step {
     noteErr(msg);
     return .{ .content = gpa.dupe(u8, msg) catch @constCast("error"), .reasoning = gpa.dupe(u8, "") catch @constCast(""), .calls = &.{}, .ok = false };
@@ -5036,4 +5057,125 @@ test "engine-side rendering is off unless BOTH signals say to take over" {
     parseShowCaps("{\"details\":{\"family\":\"llama\"}}");
     caps.name_binding_ok = false;
     try std.testing.expect(!takeOver(caps)); // broken, but we do not know this wire format
+}
+
+// ---------------------------------------------------------------------------
+// A failed call frees the message it formats. err() and stepErr() copy the message they are handed, so the
+// sites that passed a fresh `std.fmt.allocPrint(...)` straight in orphaned it: one allocation per failed call,
+// for as long as a provider kept answering with an error envelope or with bytes that do not parse. Each test
+// drives the real request path to exactly one such site, through the loopback stand-in, under
+// std.testing.allocator - which fails the test for any allocation still live when it ends.
+// ---------------------------------------------------------------------------
+
+/// The way a failing call reaches its site.
+const FailRoute = enum {
+    /// chat(): the OpenAI-style request, parsed by completeBodyH. A one-shot chat() reaches neither retry
+    /// ladder, and no reply below trips a heal, so one reply is one request.
+    openai,
+    /// complete() on a backend probed as Ollama: /api/chat, parsed by parseOllamaNative. complete() returns
+    /// this route before its retry ladder.
+    native,
+    /// complete() with tools, on a gemma4 backend that failed the name-binding probe: completeGemma4Raw posts
+    /// the engine-rendered prompt to /api/generate.
+    rendered,
+};
+
+const FAIL_TOOL = "{\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"description\":\"Read a file\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}}}}}";
+
+/// One call down `route` against a stand-in that answers `reply_body`. It must fail with exactly `want`, after ONE
+/// request to `path`: three sites write the same "provider error: " prefix, so the message alone does not say which
+/// one answered, and a second request would mean a retry, a heal or a fallback ran a site of its own.
+fn expectCallFails(route: FailRoute, comptime reply_body: []const u8, path: []const u8, want: []const u8) !void {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = if (builtin.os.tag == .windows) .{ .block = .global } else .{ .block = .{ .slice = std.mem.span(std.c.environ) } } });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const root = "zig-llm-failmsg-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, root, .default_dir) catch {};
+
+    // caps is process-wide: set the backend this route needs, and put the real one back after.
+    const saved = caps;
+    defer caps = saved;
+    caps = .{};
+    if (route != .openai) {
+        caps.probed = true;
+        caps.ollama_native = true;
+    }
+    if (route == .rendered) {
+        parseShowCaps("{\"details\":{\"family\":\"gemma4\"}}");
+        caps.name_binding_ok = false;
+    }
+
+    var srv: fakehttp.Server = undefined;
+    try srv.start(io, fakehttp.wire(reply_body));
+    var ub: [64]u8 = undefined;
+    const base = std.fmt.bufPrint(&ub, "http://127.0.0.1:{d}/v1", .{srv.port}) catch unreachable; // 25 bytes at most
+    const model = "failmsg-probe-model";
+    switch (route) {
+        .openai => {
+            const r = chat(gpa, io, root, "failmsg", base, "", model, "you are a test", "say something", 32);
+            defer gpa.free(r.content);
+            srv.stop(); // joins the serve thread: the call log is only safe to read after it
+            try std.testing.expect(!r.ok);
+            try std.testing.expectEqualStrings(want, r.content);
+        },
+        .native, .rendered => {
+            const msgs = "{\"role\":\"user\",\"content\":\"say something\"}";
+            var s = complete(gpa, io, root, "failmsg", base, "", model, msgs, if (route == .rendered) FAIL_TOOL else "", 32, -1);
+            defer s.deinit(gpa);
+            srv.stop();
+            try std.testing.expect(!s.ok);
+            try std.testing.expectEqualStrings(want, s.content);
+        },
+    }
+    try std.testing.expectEqual(@as(u32, 1), srv.conns.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 1), srv.countCalls("POST", path));
+}
+
+test "a failed call frees the message it formats: chat() on a reply that is not JSON" {
+    // a gateway's error page where the provider's JSON belongs
+    try expectCallFails(.openai, "<html>Bad Gateway</html>", "/v1/chat/completions", "bad LLM response: <html>Bad Gateway</html>");
+}
+
+test "a failed call frees the message it formats: chat() on an error envelope" {
+    try expectCallFails(
+        .openai,
+        "{\"error\":{\"message\":\"The model failmsg-probe-model does not exist\",\"type\":\"invalid_request_error\",\"code\":\"model_not_found\"}}",
+        "/v1/chat/completions",
+        "provider error: The model failmsg-probe-model does not exist",
+    );
+}
+
+test "a failed call frees the message it formats: chat() on a Cloudflare errors envelope" {
+    try expectCallFails(
+        .openai,
+        "{\"result\":null,\"success\":false,\"errors\":[{\"code\":5007,\"message\":\"No such model failmsg-probe-model or task\"}],\"messages\":[]}",
+        "/v1/chat/completions",
+        "provider error 5007: No such model failmsg-probe-model or task",
+    );
+}
+
+test "a failed call frees the message it formats: complete() on a native reply that is not JSON" {
+    try expectCallFails(.native, "<html>Bad Gateway</html>", "/api/chat", "bad Ollama response: <html>Bad Gateway</html>");
+}
+
+test "a failed call frees the message it formats: complete() on a native error reply" {
+    try expectCallFails(
+        .native,
+        "{\"error\":\"model 'failmsg-probe-model' not found, try pulling it first\"}",
+        "/api/chat",
+        "provider error: model 'failmsg-probe-model' not found, try pulling it first",
+    );
+}
+
+test "a failed call frees the message it formats: complete() on an engine-rendered error reply" {
+    try expectCallFails(
+        .rendered,
+        "{\"error\":\"model requires more system memory (12.3 GiB) than is available (8.0 GiB)\"}",
+        "/api/generate",
+        "provider error: model requires more system memory (12.3 GiB) than is available (8.0 GiB)",
+    );
 }
