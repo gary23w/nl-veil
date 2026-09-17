@@ -690,8 +690,22 @@ pub fn upgradeWebsocket(comptime H: type, req: *Request, res: *Response, ctx: an
     const http_conn = res.conn;
     const ws_worker: *websocket.server.Worker(H) = @ptrCast(@alignCast(http_conn.ws_worker));
 
+    // NOTE: local patch to vendored httpz. From createConn on, the websocket worker owns the socket and closes it
+    // itself, including when createConn or a later step fails (its errdefer, cleanupConn). httpz used to write a
+    // 500 to the closed socket after such a failure and then close it a second time. So httpz lets go first:
+    // nothing more gets written, nothing closes the socket twice, and in blocking mode the socket leaves the
+    // list stop() wakes.
+    const connections = if (http_conn.tracked) |node| node.owner else null;
+    res.written = true;
+    http_conn.handover = .disown;
+    http_conn.handOff();
+
     var hc = try ws_worker.createConn(http_conn.stream.socket.handle, http_conn.address, worker.timestamp(http_conn.io));
     errdefer ws_worker.cleanupConn(hc);
+    // Blocking mode: stop() sets `stopping`, then runs the websocket worker's shutdown. If that shutdown ran
+    // before createConn put hc on the worker's list, nothing would ever wake hc's read loop, and stop() would
+    // wait on it. Refusing here (the errdefer closes the socket) closes that window.
+    if (connections) |c| if (c.isStopping()) return error.ServerStopping;
 
     hc.handler = try H.init(&hc.conn, ctx);
 

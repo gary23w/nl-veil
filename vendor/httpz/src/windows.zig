@@ -139,7 +139,10 @@ pub fn recv(s: ws2_32.SOCKET, buf: []u8) RecvError!usize {
         .WSAENETDOWN => return error.NetworkSubsystemFailed,
         .WSAENOTCONN => return error.SocketNotConnected,
         .WSAESHUTDOWN => return 0,
-        .WSAEINTR, .WSAEINPROGRESS => unreachable,
+        // A stopping server canceled this blocked recv (posix.wakeBlocked). It gets the same error as the
+        // WSAECONNABORTED a closesocket from another thread produces. NOTE: local patch; this was `unreachable`.
+        .WSAEINTR => return error.ConnectionResetByPeer,
+        .WSAEINPROGRESS => unreachable,
         .WSAEINVAL, .WSAEFAULT => unreachable,
         .WSAENOTSOCK => unreachable,
         .WSAEOPNOTSUPP => unreachable,
@@ -173,7 +176,10 @@ pub fn send(s: ws2_32.SOCKET, bytes: []const u8) SendError!usize {
         .WSAEACCES => return error.AccessDenied,
         .WSAENOBUFS => return error.SystemResources,
         .WSAEMSGSIZE => return error.MessageTooBig,
-        .WSAEINTR, .WSAEINPROGRESS => unreachable,
+        // A stopping server canceled this blocked send (posix.wakeBlocked). It gets the same error as the
+        // WSAECONNABORTED a closesocket from another thread produces. NOTE: local patch; this was `unreachable`.
+        .WSAEINTR => return error.BrokenPipe,
+        .WSAEINPROGRESS => unreachable,
         .WSAEINVAL, .WSAEFAULT => unreachable,
         .WSAENOTSOCK => unreachable,
         .WSAEOPNOTSUPP => unreachable,
@@ -303,6 +309,13 @@ const OVERLAPPED = extern struct {
     hEvent: ?HANDLE,
 };
 
+/// Completes every I/O call pending on `s`, whichever thread made it, without closing the socket: a recv or send
+/// blocked on it returns WSAEINTR. NOTE: local patch to vendored httpz.
+pub fn cancelIo(s: ws2_32.SOCKET) void {
+    // FALSE with ERROR_NOT_FOUND only means that nothing was pending.
+    _ = kernel32.CancelIoEx(@ptrCast(s), null);
+}
+
 pub const HANDLE_FLAG_INHERIT = 1;
 pub const HANDLE_FLAG_PROTECT_FROM_CLOSE = 2;
 
@@ -341,5 +354,10 @@ const kernel32 = struct {
         hObject: HANDLE,
         dwMask: DWORD,
         dwFlags: DWORD,
+    ) callconv(.winapi) BOOL;
+
+    pub extern "kernel32" fn CancelIoEx(
+        hFile: HANDLE,
+        lpOverlapped: ?*OVERLAPPED,
     ) callconv(.winapi) BOOL;
 };

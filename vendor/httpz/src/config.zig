@@ -67,6 +67,32 @@ pub const Config = struct {
         large_buffer_count: ?u16 = null,
         large_buffer_size: ?u32 = null,
         retain_allocated_bytes: ?usize = null,
+        /// Blocking mode only, for tests. NOTE: local patch to vendored httpz.
+        socket_hook: ?*const SocketHook = null,
+    };
+
+    /// Reports what the blocking worker does with each socket it serves. It is a test hook: a test can act
+    /// inside an event to force one ordering of the race between stop()'s sweep and a handler thread. The hook
+    /// runs on the thread that did the thing, with no lock held, except for `.woken`, which runs under the
+    /// worker's socket lock and must not call into the server. NOTE: local patch to vendored httpz.
+    pub const SocketHook = struct {
+        ctx: *anyopaque,
+        event: *const fn (ctx: *anyopaque, event: SocketEvent, socket: posix.socket_t) void,
+    };
+
+    pub const SocketEvent = enum {
+        /// a handler thread took the socket
+        tracked,
+        /// stop() shut the socket down and canceled the call its handler was blocked in
+        woken,
+        /// its handler is about to close it, and the socket is still on stop()'s list
+        closing,
+        /// httpz closed it
+        closed,
+        /// httpz's close failed (on Windows: closesocket returned an error, e.g. WSAENOTSOCK)
+        close_failed,
+        /// it went to a new owner that closes it: res.disown()'s caller, or the websocket worker
+        handed_off,
     };
 
     pub const Request = struct {
