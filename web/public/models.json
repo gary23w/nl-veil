@@ -1092,7 +1092,7 @@
       "provider": "openrouter",
       "hosting": "hosted",
       "context": 1048576,
-      "note": "Released 2026-09-10. 1,048K context. Tool calling, reasoning, image input. $0.15 in / $0.6 out per MTok. Listed automatically from models.dev.",
+      "note": "Released 2026-09-10. 1,048K context. Tool calling, reasoning, image input. $0.3 in / $1.2 out per MTok. Listed automatically from models.dev.",
       "synced": "models.dev"
     },
     {
