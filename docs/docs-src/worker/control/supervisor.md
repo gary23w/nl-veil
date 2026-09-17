@@ -13,6 +13,7 @@ The supervisor is the control plane's process manager. A cast/deploy is launched
 ## Key surfaces
 
 - Spawn a detached worker for a cast and record it in the registry.
+- Relaunch a crashed worker (a dead `worker.pid`, no `DONE`) into the same run dir, up to `MAX_RESTARTS` times; the count starts over once `HEALTH_RESET_SECS` pass after a restart. A relaunch that cannot launch opens the circuit breaker, so the entry is left crashed rather than awaiting a relaunch that never comes. `relaunchPending(run_dir)` tells a caller that just read a dead pid whether a relaunch is coming, mirroring `shouldRestart` through one pure `restartPolicy` and reconcile's own probe. It vouches only from a probe or relaunch within `RELAUNCH_TRUST_SECS`, so a wedged loop can't keep a dead run open. The chat engine's hive waits ask it (`swarmTerminal`).
 - Re-adopt swarms found in the data dir on boot (the "N swarms re-adopted" line at startup).
 - Resolve a swarm from any id a caller holds (`resolve`). A spawn-time hex id names exactly its swarm. A run-dir basename (a re-adopted key, or the desk's Swarm tab) or a conversation id names the run dir: the conversation's build root, a sub-chat's being its primary's. Re-casts leave several entries on one dir, and the newest wins.
 - Report the live fleet (`/api/v1/fleet`, `/api/v1/swarms`).

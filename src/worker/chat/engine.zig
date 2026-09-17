@@ -7200,6 +7200,9 @@ fn swarmTerminal(app: *App, run_dir: []const u8, entry_created: i64) bool {
     } else |_| {}
     const ps = app.sup.pidStatus(run_dir);
     if (ps.alive) return false;
+    // A crash inside the restart budget is relaunched into this same dir, so a dead pid can be a run between workers.
+    // The supervisor vouches for that only from bookkeeping its loop refreshed recently: a wedged loop can't hold it open.
+    if (app.sup.relaunchPending(run_dir)) return false;
     const created = @max(entry_created, manifestWrittenAt(app, run_dir));
     return nowSecs(app.io) - created > 20; // no live pid: terminal unless the swarm is still spawning
 }
@@ -7760,11 +7763,132 @@ fn statusTool(app: *App, uid: u64, conv_dir: []const u8, ctrl_cursor: usize, arg
         const dp = std.fmt.bufPrint(&pb, "{s}/DONE", .{sw.run_dir}) catch break :blk false;
         if (std.Io.Dir.cwd().access(app.io, dp, .{})) |_| break :blk true else |_| break :blk false;
     };
-    const note = if (finished or !ps.alive)
+    // a dead worker the supervisor is relaunching into the same run dir (swarmTerminal's wait above) is not a done hive
+    const relaunching = !finished and !ps.alive and app.sup.relaunchPending(sw.run_dir);
+    const note = if (relaunching)
+        "NOT done: its worker died and the supervisor is relaunching it in the same run dir — call swarm_status again to keep waiting. do NOT gather its files or stop_swarm it for this"
+    else if (finished or !ps.alive)
         "the hive is done — read its deliverable files (list_dir/read_file) and fold the results in"
     else
         "still working; this call WAITS while the hive runs — call swarm_status again to keep watching, steer_swarm to guide it, or do other useful work meanwhile. do NOT stop_swarm just because it is still running";
     return std.fmt.allocPrint(gpa, "{{\"ok\":true,\"tool\":\"swarm_status\",\"id\":\"{s}\",\"state\":\"{s}\",\"minds\":{d},\"alive\":{s},\"finished\":{s},\"waited_s\":{d},\"note\":\"{s}\"}}", .{ sw.id, @tagName(sw.state), sw.minds, if (ps.alive) "true" else "false", if (finished) "true" else "false", waited, note }) catch emptyRes();
+}
+
+test "swarm waits treat a crashed worker the supervisor is relaunching as a live hive, and let go once it can't vouch for the relaunch" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var ta = try http.testApp(gpa, io, "zig-engine-relaunch-wait-tmp");
+    defer ta.deinit();
+    const app = &ta.app;
+    const fanout = @import("../control/fanout.zig");
+    defer fanout.dropTestSwarms(app.sup, gpa);
+    const uid: u64 = 7;
+    const conv = "c4e1a9b07";
+    const id = "7c1d0e5a93b2f846";
+
+    // The pair a real cast joins: castSwarm spawns into {data}/{buildRootRel}, and the turn's tools get the store dir.
+    var relb: [128]u8 = undefined;
+    var runb: [256]u8 = undefined;
+    const run_dir = try std.fmt.bufPrint(&runb, "{s}/{s}", .{ ta.root, cpaths.buildRootRel(&relb, uid, conv) });
+    var convb: [256]u8 = undefined;
+    const conv_dir = try std.fmt.bufPrint(&convb, "{s}/u{d}/_chat/convs/{s}", .{ ta.root, uid, conv });
+    const F = struct {
+        fn put(io_: std.Io, dir: []const u8, name: []const u8, data: []const u8) !void {
+            var b: [512]u8 = undefined;
+            const p = try std.fmt.bufPrint(&b, "{s}/{s}", .{ dir, name });
+            if (std.fs.path.dirname(p)) |parent| _ = try std.Io.Dir.cwd().createDirPathStatus(io_, parent, .default_dir);
+            try std.Io.Dir.cwd().writeFile(io_, .{ .sub_path = p, .data = data });
+        }
+        fn has(io_: std.Io, dir: []const u8, name: []const u8) !bool {
+            var b: [512]u8 = undefined;
+            std.Io.Dir.cwd().access(io_, try std.fmt.bufPrint(&b, "{s}/{s}", .{ dir, name }), .{}) catch return false;
+            return true;
+        }
+        /// How many times `needle` occurs in the conversation's event stream, which carries every frame a client is sent.
+        fn frames(gpa_: std.mem.Allocator, io_: std.Io, dir: []const u8, needle: []const u8) !usize {
+            var b: [512]u8 = undefined;
+            const raw = std.Io.Dir.cwd().readFileAlloc(io_, try std.fmt.bufPrint(&b, "{s}/events.jsonl", .{dir}), gpa_, .limited(1 << 20)) catch |e| switch (e) {
+                error.FileNotFound => return 0, // nothing emitted yet
+                else => return e,
+            };
+            defer gpa_.free(raw);
+            return std.mem.count(u8, raw, needle);
+        }
+        /// Move `name`'s mtime `secs` behind the real clock.
+        fn age(io_: std.Io, dir: []const u8, name: []const u8, secs: i64) !void {
+            var b: [512]u8 = undefined;
+            const f = try std.Io.Dir.cwd().openFile(io_, try std.fmt.bufPrint(&b, "{s}/{s}", .{ dir, name }), .{ .mode = .read_write });
+            defer f.close(io_);
+            const now_ns = std.Io.Timestamp.now(io_, .real).nanoseconds;
+            try f.setTimestamps(io_, .{ .modify_timestamp = .{ .new = .fromNanoseconds(now_ns - @as(i96, secs) * std.time.ns_per_s) } });
+        }
+        /// swarm_status on the cast, read back through the JSON parser: its DONE verdict and its note (copied into `buf`).
+        fn status(gpa_: std.mem.Allocator, app_: *App, uid_: u64, conv_dir_: []const u8, buf: []u8) !struct { finished: bool, note: []const u8 } {
+            const raw = statusTool(app_, uid_, conv_dir_, 0, "{\"id\":\"" ++ id ++ "\"}");
+            defer if (raw.len > 0) gpa_.free(raw);
+            const R = struct { finished: bool = true, note: []const u8 = "" };
+            const parsed = try std.json.parseFromSlice(R, gpa_, raw, .{ .ignore_unknown_fields = true });
+            defer parsed.deinit();
+            const n = @min(buf.len, parsed.value.note.len);
+            @memcpy(buf[0..n], parsed.value.note[0..n]);
+            return .{ .finished = parsed.value.finished, .note = buf[0..n] };
+        }
+    };
+    var note_buf: [512]u8 = undefined;
+    // Every wait below that happens ends at its first stop check instead of sleeping out its cap: a stop already sits in
+    // the conversation's control file.
+    try F.put(io, conv_dir, "control.jsonl", "{\"op\":\"stop\"}\n");
+
+    // A cast a minute into its 4-minute budget whose worker crashed: worker.pid names a process that is gone, and no DONE
+    // was written. The supervisor's loop probed the entry just now and it has restarts left, so the loop's next pass
+    // relaunches `veil worker <run_dir>` into this same dir.
+    try F.put(io, run_dir, "swarm.json", "{\"minutes\":4}");
+    try F.age(io, run_dir, "swarm.json", 60); // deploySwarm writes the manifest right before the spawn, a minute ago
+    try F.put(io, run_dir, "worker.pid", "999999999"); // no process on any OS: Windows pids stay far below it, Linux caps them at 2^22
+    try F.put(io, run_dir, "work/half.md", "built before the crash");
+    try fanout.addTestSwarm(app.sup, gpa, id, uid, run_dir);
+    const sw = app.sup.get(id) orelse return error.TestUnexpectedResult;
+    const now = nowSecs(io);
+    sw.created = now - 60; // past swarmTerminal's 20 s spawn grace
+    sw.last_check = now;
+
+    // Between workers, no wait reads the run as over.
+    try std.testing.expect(!swarmTerminal(app, run_dir, sw.created));
+    try std.testing.expect(liveConvCast(app, uid, conv) != null);
+    try std.testing.expectEqual(@as(?AwaitVerdict, .stopped), awaitConvCast(app, uid, conv, conv_dir, 0, false)); // it waited on the hive
+    const between = try F.status(gpa, app, uid, conv_dir, &note_buf);
+    try std.testing.expect(!between.finished);
+    try std.testing.expect(std.mem.startsWith(u8, between.note, "NOT done"));
+    maybeSyncCastFiles(app, uid, conv, conv_dir, 0); // a client-mode tool call in the gap pushes and marks nothing
+    try std.testing.expectEqual(@as(usize, 0), try F.frames(gpa, io, conv_dir, "\"kind\":\"file_sync\""));
+    try std.testing.expect(!try F.has(io, run_dir, ".filesync_done"));
+
+    // The relaunch could not launch, so respawn opened the breaker: nothing is coming back, and the run is over.
+    sw.state = .crashed;
+    sw.breaker_open = true;
+    try std.testing.expect(swarmTerminal(app, run_dir, sw.created));
+    try std.testing.expect(liveConvCast(app, uid, conv) == null);
+    try std.testing.expect(awaitConvCast(app, uid, conv, conv_dir, 0, false) == null);
+    const given_up = try F.status(gpa, app, uid, conv_dir, &note_buf);
+    try std.testing.expect(std.mem.startsWith(u8, given_up.note, "the hive is done"));
+
+    // The loop stopped keeping the entry (wedged, say): its last probe an hour ago vouches for nothing, so a supervisor
+    // that no longer runs cannot hold a dead run open.
+    sw.state = .running;
+    sw.breaker_open = false;
+    sw.last_check = now - 3600;
+    try std.testing.expect(swarmTerminal(app, run_dir, sw.created));
+    try std.testing.expect(liveConvCast(app, uid, conv) == null);
+
+    // Nor can a fresh entry over a worker that never wrote its pid: that is no crash the supervisor relaunches (its probe
+    // reads the dir as still running, and keeps the entry fresh doing so), so the spawn grace alone decides.
+    sw.last_check = now;
+    try std.testing.expect(!swarmTerminal(app, run_dir, sw.created)); // vouched for again
+    var pb: [300]u8 = undefined;
+    try std.Io.Dir.cwd().deleteFile(io, try std.fmt.bufPrint(&pb, "{s}/worker.pid", .{run_dir}));
+    try std.testing.expect(swarmTerminal(app, run_dir, sw.created));
 }
 
 /// Read the veil's answered-ledger for a swarm ({run_dir}/veil_answered.jsonl — one ask_id per line). gpa-owned
