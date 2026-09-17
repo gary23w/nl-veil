@@ -221,23 +221,35 @@ pub const Supervisor = struct {
         var md_buf: [256]u8 = undefined;
         var run_dir: []const u8 = "";
         var model: []const u8 = "";
-        {
+        const copied = blk: {
             self.mu.lockUncancelable(self.io);
             defer self.mu.unlock(self.io);
             const sw = self.swarms.get(id) orelse return;
-            run_dir = std.fmt.bufPrint(&rd_buf, "{s}", .{sw.run_dir}) catch return;
-            model = std.fmt.bufPrint(&md_buf, "{s}", .{sw.model}) catch return;
-        }
-        const launched = blk: {
+            run_dir = std.fmt.bufPrint(&rd_buf, "{s}", .{sw.run_dir}) catch break :blk false;
+            model = std.fmt.bufPrint(&md_buf, "{s}", .{sw.model}) catch break :blk false;
+            break :blk true;
+        };
+        var failure: []const u8 = "its run dir or model name overflows the relaunch buffers";
+        const launched = if (!copied) null else blk: {
             self.launch_mu.lockUncancelable(self.io); // serialize CreateProcess against concurrent spawns
             defer self.launch_mu.unlock(self.io);
-            break :blk self.launch(run_dir, model) catch return;
+            break :blk self.launch(run_dir, model) catch |err| {
+                failure = @errorName(err);
+                break :blk null;
+            };
         };
         const now = std.Io.Timestamp.now(self.io, .real).toSeconds();
         self.mu.lockUncancelable(self.io);
         defer self.mu.unlock(self.io);
         const sw = self.swarms.get(id) orelse return;
-        sw.child = launched.child;
+        const relaunched = launched orelse {
+            // A crash that will not be relaunched must not look like one that will. reconcile never probes a .crashed
+            // entry again, so with the breaker still closed it stayed "relaunching" forever (see relaunchPending).
+            sw.breaker_open = true;
+            log.warn("could not relaunch crashed swarm {s} ({s}) — circuit-breaker OPEN, leaving it crashed", .{ id, failure });
+            return;
+        };
+        sw.child = relaunched.child;
         sw.state = .running;
         sw.restarts += 1;
         sw.last_restart = now;
@@ -763,21 +775,95 @@ pub const Supervisor = struct {
         for (restart_ids.items) |rid| self.respawn(rid);
     }
 
+    /// The auto-restart policy as a pure function of an entry at `now`: a crashed worker is relaunched while its breaker
+    /// is closed and it has used fewer than MAX_RESTARTS restarts, a count that starts over once HEALTH_RESET_SECS pass
+    /// after the last one. shouldRestart applies the verdict and relaunchPending only reads it, so they cannot drift.
+    fn restartPolicy(s: *const Swarm, now: i64) struct { allow: bool, restarts: u32 } {
+        if (s.breaker_open) return .{ .allow = false, .restarts = s.restarts };
+        const restarts: u32 = if (s.last_restart != 0 and now - s.last_restart > HEALTH_RESET_SECS) 0 else s.restarts;
+        return .{ .allow = restarts < MAX_RESTARTS, .restarts = restarts };
+    }
+
     fn shouldRestart(_: *Supervisor, s: *Swarm, now: i64) bool {
         if (s.breaker_open) return false;
-        if (s.last_restart != 0 and now - s.last_restart > HEALTH_RESET_SECS) s.restarts = 0;
-        if (s.restarts >= MAX_RESTARTS) {
+        const policy = restartPolicy(s, now);
+        s.restarts = policy.restarts;
+        if (!policy.allow) {
             s.breaker_open = true;
             log.warn("circuit-breaker OPEN for swarm {s} after {d} restarts — leaving it crashed", .{ s.id, s.restarts });
+        }
+        return policy.allow;
+    }
+
+    /// How old an entry's last probe or relaunch may be before relaunchPending stops vouching for it. A loop that keeps
+    /// the entry re-probes it every RECHECK_SECS plus one ~5 s bgLoop sleep, so an older stamp means the loop is wedged
+    /// or stuck behind a slow pass, and its verdict is no evidence that a worker is coming back. The bound is generous
+    /// on purpose: a working loop settles a crash within one probe, so only a dead run under a stuck loop waits it out.
+    const RELAUNCH_TRUST_SECS: i64 = 6 * RECHECK_SECS;
+
+    /// Will reconcile put a worker back into `run_dir`? For a caller that just read the dir's worker.pid as dead and
+    /// must not call the run finished: respawn relaunches a crash inside the restart budget into the SAME dir, so a
+    /// run between workers looks like a finished one that never wrote DONE. True when an entry for the dir, probed or
+    /// relaunched within RELAUNCH_TRUST_SECS, is relaunching it (.crashed with its breaker closed: the reconcile pass
+    /// that marked it is launching the worker, and a launch that fails opens the breaker) or will (.running, where
+    /// restartPolicy allows the restart, or a relaunch stamped it and no probe has read it since, so its worker may
+    /// still be starting), and the dir, read by reconcile's own probe, holds that crash. A dir without a worker.pid
+    /// never qualifies: reconcile reads it as running and relaunches nothing, while each probe keeps the entry fresh.
+    /// A live pid answers true as well: the relaunch landed after the caller's read.
+    pub fn relaunchPending(self: *Supervisor, run_dir: []const u8) bool {
+        const now = std.Io.Timestamp.now(self.io, .real).toSeconds();
+        const vouched = blk: {
+            self.mu.lockUncancelable(self.io);
+            defer self.mu.unlock(self.io);
+            var it = self.swarms.valueIterator();
+            while (it.next()) |sp| {
+                const s = sp.*;
+                if (!sameRunDir(s.run_dir, run_dir) or now - s.last_check > RELAUNCH_TRUST_SECS) continue;
+                const relaunches = switch (s.state) {
+                    .crashed => !s.breaker_open,
+                    // respawn stamps last_check and last_restart with one `now`; any later probe moves last_check on
+                    .running, .starting => restartPolicy(s, now).allow or (s.last_restart != 0 and s.last_check == s.last_restart),
+                    .stopping, .stopped => false,
+                };
+                if (relaunches) break :blk true;
+            }
+            break :blk false;
+        };
+        if (!vouched) return false;
+        return switch (self.probeRun(run_dir)) {
+            .dead, .live => true,
+            .terminal, .unclaimed => false,
+        };
+    }
+
+    /// One run dir under two spellings: casts fmt-join it with '/' onto the native data path, while reattach adopts it
+    /// from the OS's own listing, so a Windows dir can be registered in both slash forms.
+    fn sameRunDir(a: []const u8, b: []const u8) bool {
+        if (a.len != b.len) return false;
+        for (a, b) |x, y| {
+            if (x == y) continue;
+            if ((x == '/' or x == '\\') and (y == '/' or y == '\\')) continue;
             return false;
         }
         return true;
     }
 
+    /// What a probe finds in a run dir: a terminal marker, no worker.pid yet, or its recorded worker alive or dead.
+    /// probeState maps it to reconcile's State, and relaunchPending reads the same verdict.
+    const Probe = enum { terminal, unclaimed, live, dead };
+
+    fn probeRun(self: *Supervisor, run_dir: []const u8) Probe {
+        if (self.hasTerminalMarker(run_dir)) return .terminal;
+        const pid = self.workerPid(run_dir) orelse return .unclaimed;
+        return if (self.pidAlive(pid)) .live else .dead;
+    }
+
     fn probeState(self: *Supervisor, run_dir: []const u8) State {
-        if (self.hasTerminalMarker(run_dir)) return .stopped;
-        const pid = self.workerPid(run_dir) orelse return .running;
-        return if (self.pidAlive(pid)) .running else .crashed;
+        return switch (self.probeRun(run_dir)) {
+            .terminal => .stopped,
+            .unclaimed, .live => .running,
+            .dead => .crashed,
+        };
     }
 
     /// Probe for a swarm already in .stopping: only pid-death or the worker's DONE marker confirms the stop.
@@ -961,4 +1047,161 @@ test "readTail: whole small file; only the last bytes of a big one; null for a m
 
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "0123456789abcdefghij" }); // 20 > 16
     try std.testing.expectEqualStrings("456789abcdefghij", readTail(io, path, &buf).?);
+}
+
+test "relaunchPending vouches for a dead worker exactly when reconcile will relaunch it, and only while the loop keeps the entry" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-supervisor-relaunch-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    const run_dir = root ++ "/u7/_chat/builds/c1";
+    _ = try std.Io.Dir.cwd().createDirPathStatus(io, run_dir, .default_dir);
+    const dead_pid = "999999999"; // no process on any OS: Windows pids stay far below it, Linux caps them at 2^22
+    const F = struct {
+        fn put(io_: std.Io, dir: []const u8, name: []const u8, data: []const u8) !void {
+            var b: [256]u8 = undefined;
+            try std.Io.Dir.cwd().writeFile(io_, .{ .sub_path = try std.fmt.bufPrint(&b, "{s}/{s}", .{ dir, name }), .data = data });
+        }
+        fn drop(io_: std.Io, dir: []const u8, name: []const u8) !void {
+            var b: [256]u8 = undefined;
+            try std.Io.Dir.cwd().deleteFile(io_, try std.fmt.bufPrint(&b, "{s}/{s}", .{ dir, name }));
+        }
+    };
+
+    var sup = Supervisor.init(gpa, io, "");
+    defer sup.swarms.deinit(gpa);
+    const now = std.Io.Timestamp.now(io, .real).toSeconds();
+    // A cast whose worker crashed: its worker.pid names a process that is gone, and it wrote no DONE.
+    try F.put(io, run_dir, "worker.pid", dead_pid);
+    var cast: Swarm = .{ .id = "5b8e0f3a2c7d4e19", .uid = 7, .name = "cast", .run_dir = run_dir, .model = "mock", .minds = 3, .created = now - 600 };
+    try sup.swarms.put(gpa, cast.id, &cast);
+
+    // The restart policy, derived here from its rule, against both of its readers: shouldRestart (what reconcile does
+    // at its probe) and relaunchPending. Every restart count to past the cap, with no restart yet, a recent one, and one
+    // long enough ago that the count starts over. Each entry was probed after any relaunch, so no worker is starting.
+    const recent = now - 60;
+    const healed = now - Supervisor.HEALTH_RESET_SECS - 60;
+    for (0..Supervisor.MAX_RESTARTS + 2) |n| {
+        for ([_]i64{ 0, recent, healed }) |last_restart| {
+            cast.state = .running;
+            cast.breaker_open = false;
+            cast.restarts = @intCast(n);
+            cast.last_restart = last_restart;
+            cast.last_check = now;
+            const want = n < Supervisor.MAX_RESTARTS or last_restart == healed;
+            var decided = cast; // shouldRestart stores its verdict in the entry, so it decides on a copy
+            try std.testing.expectEqual(want, sup.shouldRestart(&decided, now));
+            try std.testing.expectEqual(want, sup.relaunchPending(run_dir));
+        }
+    }
+
+    // The last restart the policy allows, not probed since (respawn stamps last_check and last_restart with one `now`):
+    // its worker may still be starting, and until it writes its own pid the dir holds the dead one it replaces.
+    cast.restarts = Supervisor.MAX_RESTARTS;
+    cast.last_restart = now - 30;
+    cast.last_check = cast.last_restart;
+    try std.testing.expect(sup.relaunchPending(run_dir));
+    cast.last_check = cast.last_restart + Supervisor.RECHECK_SECS; // probed since: that crash is one the policy refuses
+    try std.testing.expect(!sup.relaunchPending(run_dir));
+
+    // .crashed is what reconcile marks right before respawn launches the worker: pending until a breaker opens.
+    cast.restarts = 0;
+    cast.last_restart = 0;
+    cast.last_check = now;
+    cast.state = .crashed;
+    try std.testing.expect(sup.relaunchPending(run_dir));
+    cast.breaker_open = true;
+    try std.testing.expect(!sup.relaunchPending(run_dir));
+    cast.breaker_open = false;
+    for ([_]State{ .stopping, .stopped }) |asked_to_stop| {
+        cast.state = asked_to_stop;
+        try std.testing.expect(!sup.relaunchPending(run_dir));
+    }
+    cast.state = .running;
+
+    // Only bookkeeping the loop still keeps vouches: RELAUNCH_TRUST_SECS after the last probe or relaunch, it lapses.
+    const t = std.Io.Timestamp.now(io, .real).toSeconds();
+    cast.last_check = t - Supervisor.RELAUNCH_TRUST_SECS + 5;
+    try std.testing.expect(sup.relaunchPending(run_dir));
+    cast.last_check = t - Supervisor.RELAUNCH_TRUST_SECS - 5;
+    try std.testing.expect(!sup.relaunchPending(run_dir));
+    cast.last_check = t;
+
+    // The dir, read by reconcile's own probe. No worker.pid is no crash to relaunch: the probe reads the dir as running
+    // and each probe keeps the entry fresh, so vouching for it would hold the run open forever. A stop request, DONE,
+    // or a final "stopped" event ends the run instead.
+    try std.testing.expect(sup.relaunchPending(run_dir));
+    try F.drop(io, run_dir, "worker.pid");
+    try std.testing.expect(!sup.relaunchPending(run_dir));
+    try F.put(io, run_dir, "worker.pid", dead_pid);
+    const Marker = struct { name: []const u8, data: []const u8 };
+    const markers = [_]Marker{
+        .{ .name = "STOP", .data = "" },
+        .{ .name = "DONE", .data = "completed" },
+        .{ .name = "events.jsonl", .data = "{\"seq\":7,\"t\":0,\"kind\":\"stopped\",\"reason\":\"goal_met\"}\n" },
+    };
+    for (markers) |m| {
+        try F.put(io, run_dir, m.name, m.data);
+        try std.testing.expect(!sup.relaunchPending(run_dir));
+        try F.drop(io, run_dir, m.name);
+    }
+    try std.testing.expect(sup.relaunchPending(run_dir));
+
+    // Every entry on the dir counts, in either slash form: a cast joins its run dir with '/', while reattach adopts a
+    // Windows dir with backslashes. An earlier cast's stopped entry beside it masks nothing.
+    var adopted: [run_dir.len]u8 = undefined;
+    for (run_dir, &adopted) |c, *d| d.* = if (c == '/') '\\' else c;
+    cast.run_dir = &adopted;
+    var earlier: Swarm = .{ .id = "c1", .uid = 7, .name = "cast", .run_dir = run_dir, .model = "mock", .minds = 3, .created = now - 7200, .state = .stopped, .last_check = now };
+    try sup.swarms.put(gpa, earlier.id, &earlier);
+    try std.testing.expect(sup.relaunchPending(run_dir));
+
+    // No entry vouches for a dir it isn't on, even one whose name extends it.
+    const sibling = root ++ "/u7/_chat/builds/c10";
+    _ = try std.Io.Dir.cwd().createDirPathStatus(io, sibling, .default_dir);
+    try F.put(io, sibling, "worker.pid", dead_pid);
+    cast.state = .stopped;
+    var neighbour: Swarm = .{ .id = "0e4b6d8f2a1c3957", .uid = 7, .name = "cast", .run_dir = sibling, .model = "mock", .minds = 3, .created = now - 600, .last_check = now, .state = .running };
+    try sup.swarms.put(gpa, neighbour.id, &neighbour);
+    try std.testing.expect(!sup.relaunchPending(run_dir));
+    try std.testing.expect(sup.relaunchPending(sibling));
+}
+
+test "a crash whose relaunch cannot launch opens its breaker instead of reading as relaunching forever" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-supervisor-relaunch-fail-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+
+    var sup = Supervisor.init(gpa, io, "");
+    defer sup.swarms.deinit(gpa);
+    const now = std.Io.Timestamp.now(io, .real).toSeconds();
+
+    // Each crash stands as reconcile leaves one it queued for respawn: .crashed, breaker closed, probed this pass.
+    // The first cast's run dir is gone, so `veil worker <run_dir>` cannot start there: the child's working directory
+    // does not exist, and the launch fails before anything runs.
+    var gone: Swarm = .{ .id = "3a9c5e7f1b2d4086", .uid = 7, .name = "cast", .run_dir = root ++ "/missing/u7/_chat/builds/c2", .model = "mock", .minds = 1, .created = now - 600, .state = .crashed, .last_check = now };
+    try sup.swarms.put(gpa, gone.id, &gone);
+    sup.respawn(gone.id);
+    try std.testing.expect(gone.breaker_open);
+    try std.testing.expect(gone.state == .crashed and gone.child == null and gone.restarts == 0);
+
+    // The second's model name overflows respawn's copy, so it fails before any launch. Its dir holds the crash (a dead
+    // worker.pid), and relaunchPending vouched for it until respawn gave up.
+    const run_dir = root ++ "/u7/_chat/builds/c1";
+    _ = try std.Io.Dir.cwd().createDirPathStatus(io, run_dir, .default_dir);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = run_dir ++ "/worker.pid", .data = "999999999" });
+    var overflow: Swarm = .{ .id = "6d2f8a0c4e1b3957", .uid = 7, .name = "cast", .run_dir = run_dir, .model = "m" ** 300, .minds = 1, .created = now - 600, .state = .crashed, .last_check = now };
+    try sup.swarms.put(gpa, overflow.id, &overflow);
+    try std.testing.expect(sup.relaunchPending(run_dir));
+    sup.respawn(overflow.id);
+    try std.testing.expect(overflow.breaker_open);
+    try std.testing.expect(overflow.state == .crashed and overflow.child == null);
+    try std.testing.expect(!sup.relaunchPending(run_dir));
 }
