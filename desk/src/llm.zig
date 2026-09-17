@@ -28,9 +28,9 @@ pub fn osEnviron() std.process.Environ {
 }
 
 // curl appends this + the 3-digit HTTP code to the stream file after the transfer ends (even on a failed
-// connect, where the code is 000). It is our only observable "curl exited" signal — Child has no
-// non-blocking wait — and lets poll() distinguish a dead endpoint / HTTP error from a slow-but-alive one
-// in a single tick instead of blindly waiting out the first-byte ceiling.
+// connect, where the code is 000). It lets poll() distinguish a dead endpoint / HTTP error from a slow-but-alive
+// one in a single tick instead of blindly waiting out the first-byte ceiling. A curl that exits without writing
+// it (one that fails before its transfer, or is killed) poll() learns of from curlExited instead.
 const STAT_MARK = "\n__VEILSTAT__";
 
 pub const Stream = struct {
@@ -164,6 +164,11 @@ pub fn sweepKeyCfgs(io: Io, gpa: std.mem.Allocator, dir_path: []const u8, now_ns
 const CURL = "curl";
 var test_curl: []const u8 = CURL;
 
+/// TEST ONLY: start() runs this right before it spawns curl, once the request body and the stream sink are on disk.
+/// A test can take the body away there, so curl fails at startup: exit 26, and nothing on its stdout, not even -w's
+/// end marker. A shipped build never reads it.
+var test_before_curl: ?*const fn () void = null;
+
 // MUST equal the engine's NATIVE_CTX (src/worker/llm.zig). In Ollama a different num_ctx is a different
 // runner: without parity every chat↔swarm alternation forces a full model reload (measured tens of
 // seconds on a 20B), starving the chat AND slowing the cast. Same ctx → one shared runner, plain queueing.
@@ -264,6 +269,7 @@ pub fn start(s: *Stream, io: Io, gpa: std.mem.Allocator, dir: []const u8, prov: 
         return false;
     };
     defer sink.close(io);
+    if (builtin.is_test) if (test_before_curl) |f| f();
 
     // -w appends STAT_MARK + the HTTP code after the transfer (000 on a failed connect) so poll() can see
     // curl exit; --connect-timeout bounds a black-hole endpoint even when nothing is listening slowly.
@@ -289,13 +295,77 @@ pub fn start(s: *Stream, io: Io, gpa: std.mem.Allocator, dir: []const u8, prov: 
     return true;
 }
 
+const winproc = if (builtin.os.tag == .windows) struct {
+    const STILL_ACTIVE: u32 = 259;
+    extern "kernel32" fn GetExitCodeProcess(h: *anyopaque, code: *u32) callconv(.c) c_int;
+} else struct {};
+
+/// Whether a call's curl has exited, asked without blocking: std.process has no non-blocking wait. `code` gets
+/// curl's exit code when the OS reports one. The twin of chat.zig procExited and of the engine's curlExited
+/// (src/worker/llm.zig).
+///
+/// Windows reads the exit code off the process handle and leaves the handle to Child.kill (reap), which reaps an
+/// exited child as it always has. A failed read counts as still running, so poll() waits on the end marker and the
+/// ceilings as before rather than cut a live reply short. POSIX can only tell by reaping (waitpid WNOHANG), and then
+/// clears the Child the way Child.wait does, so reap()'s Child.kill returns at once. Left set, kill() would signal a
+/// pid that is no longer this process's child: ESRCH, which std counts as a programmer bug and panics on in Debug.
+fn curlExited(io: Io, child: *std.process.Child, code: *?u32) bool {
+    const id = child.id orelse return true;
+    if (builtin.os.tag == .windows) {
+        var c: u32 = 0;
+        if (winproc.GetExitCodeProcess(id, &c) == 0 or c == winproc.STILL_ACTIVE) return false;
+        code.* = c;
+        return true;
+    } else {
+        var status: c_int = 0;
+        const r = std.c.waitpid(id, &status, std.c.W.NOHANG);
+        if (r == 0) return false; // still running
+        if (r < 0 and std.posix.errno(r) != .CHILD) return false; // interrupted: ask again next poll
+        if (r > 0 and std.posix.W.IFEXITED(@bitCast(status))) code.* = std.posix.W.EXITSTATUS(@bitCast(status));
+        for ([_]*?Io.File{ &child.stdin, &child.stdout, &child.stderr }) |pipe| {
+            if (pipe.*) |f| f.close(io);
+            pipe.* = null;
+        }
+        child.id = null;
+        return true;
+    }
+}
+
+/// curl has exited without writing its end marker, so nothing more will reach the sink: it failed before its transfer
+/// (a request body it cannot open exits 26 with an empty stdout), or something outside the desk killed it. Ends the
+/// call now, failed, instead of leaving it to a ceiling minutes later.
+fn endCurlGone(s: *Stream, io: Io, exit_code: ?u32) void {
+    log.warn("chat llm: curl exited without its end marker (exit {?d}, {d} bytes streamed)", .{ exit_code, s.offset });
+    abort(s, io); // reap: on Windows the probe left the handle to Child.kill
+    const when = if (s.saw_any) "partway through the reply" else "before the model endpoint answered";
+    var eb: [200]u8 = undefined;
+    const msg = if (exit_code) |c|
+        std.fmt.bufPrint(&eb, "curl exited (code {d}) {s}", .{ c, when }) catch "curl exited early"
+    else
+        std.fmt.bufPrint(&eb, "curl stopped running {s}", .{when}) catch "curl stopped running";
+    setErr(s, msg);
+}
+
 /// Tail the stream file: consume any new bytes, folding deltas into s.content. Call ~10x/sec while a turn
 /// is in flight; `s.done` flips when the reply is complete (or failed — check s.failed / errStr()).
 /// `patient` = a cast is running on the same backend, so a long silent wait is queueing, not death.
+///
+/// CURL'S EXIT ENDS THE CALL TOO, marker or not. A curl that exits without its end marker (it failed before its
+/// transfer, or was killed) writes nothing more, and waiting on the marker alone held such a call for
+/// FIRST_BYTE_TIMEOUT_S, FIRST_BYTE_PATIENT_S or STALL_TIMEOUT_S. So each poll asks curlExited BEFORE it reads: once
+/// curl is gone, that read holds every byte curl wrote, and a read without the marker ends the call.
 pub fn poll(s: *Stream, io: Io, gpa: std.mem.Allocator, now_s: i64, patient: bool) void {
     if (s.done) return;
-    const data = Io.Dir.cwd().readFileAlloc(io, s.outPath(), gpa, .limited(8 << 20)) catch {
-        // file not created yet — curl still connecting (or it died before writing)
+    // Asked before the read, never after it (CURL'S EXIT above). A Stream with no Child has no curl to wait on.
+    var exit_code: ?u32 = null;
+    const curl_gone = if (s.child) |*c| curlExited(io, c, &exit_code) else true;
+    const data = Io.Dir.cwd().readFileAlloc(io, s.outPath(), gpa, .limited(8 << 20)) catch |e| {
+        // start() creates the sink before curl starts. With the sink gone and curl gone too, nothing will ever
+        // write to it. Any other failed read (a sink too big to read whole) leaves the call to its ceilings.
+        if (curl_gone and e == error.FileNotFound) {
+            endCurlGone(s, io, exit_code);
+            return;
+        }
         checkTimeouts(s, io, now_s, patient);
         return;
     };
@@ -322,7 +392,8 @@ pub fn poll(s: *Stream, io: Io, gpa: std.mem.Allocator, now_s: i64, patient: boo
         // plain-JSON body (backend ignored stream:true): complete once the object closes + carries a
         // terminal key — brace-end alone can be a partial write.
         tryWholeJson(s, gpa, body);
-        if (!s.done) checkTimeouts(s, io, now_s, patient);
+        if (s.done) return;
+        if (curl_gone) endCurlGone(s, io, exit_code) else checkTimeouts(s, io, now_s, patient);
         return;
     }
     if (s.done) return;
@@ -332,6 +403,11 @@ pub fn poll(s: *Stream, io: Io, gpa: std.mem.Allocator, now_s: i64, patient: boo
     // immediate, accurate error. Native uses the ollama-aware finish (content+thinking+recovery backstop).
     if (stat) |code| {
         if (s.native) finishNativeWhole(s, io, gpa, code, body) else finishBySentinel(s, io, gpa, code, body);
+        return;
+    }
+    // curl has exited WITHOUT the marker: this read was its last word.
+    if (curl_gone) {
+        endCurlGone(s, io, exit_code);
         return;
     }
     checkTimeouts(s, io, now_s, patient);
@@ -947,8 +1023,8 @@ const TEST_ANSWER = std.fmt.comptimePrint("HTTP/1.1 200 OK\r\nContent-Type: text
 /// TEST ONLY. A model endpoint on 127.0.0.1, at a port the OS assigns (a fixed port is shared rather than exclusive
 /// on Windows, and a wildcard listen raises a Windows Firewall prompt). It reads each request whole and keeps the
 /// first, and runs `look` if it has one: the call is in flight, curl waiting on the reply. Then it answers `reply`
-/// and closes, or, with `hold`, answers nothing and holds the connection open until stop(): an endpoint still working
-/// on the call.
+/// and closes, or, with `hold`, answers `reply` (often nothing) and holds the connection open until stop(): an
+/// endpoint still working on the call.
 const Standin = struct {
     io: Io,
     server: Io.net.Server,
@@ -1015,14 +1091,14 @@ const Standin = struct {
             // Before `seen` counts it, so a test that awaits the request finds the look done too.
             if (sv.look) |f| f();
             _ = sv.seen.fetchAdd(1, .release);
-            if (sv.hold) {
-                while (!sv.closing.load(.acquire)) nap.ms(5);
-                return;
-            }
             var wbuf: [8 << 10]u8 = undefined;
             var wr = conn.writer(sv.io, &wbuf);
             wr.interface.writeAll(sv.reply) catch {};
             wr.interface.flush() catch {};
+            if (sv.hold) {
+                while (!sv.closing.load(.acquire)) nap.ms(5);
+                return;
+            }
         }
     }
 
@@ -1070,9 +1146,10 @@ fn pollToEnd(s: *Stream, io: Io, gpa: std.mem.Allocator) !void {
     var waited: u32 = 0;
     while (!s.done) : (waited += 1) {
         if (waited >= 3000) { // ~30 s
-            // A curl that exits before any transfer writes nothing, not even -w's exit sentinel: one that could
-            // not read its -K config exits 26 with an empty stdout (curl 8.17 and 8.21).
-            std.debug.print("\nthe call never ended: no answer and no exit sentinel from curl (saw_any={})\n", .{s.saw_any});
+            // Neither an answer nor curl's exit ended it. A curl that exits before any transfer writes nothing, not
+            // even -w's end marker (a request body it cannot open exits 26 with an empty stdout), so poll() has to
+            // see that exit for itself (curlExited).
+            std.debug.print("\nthe call never ended: no answer, and no sign that curl exited (saw_any={})\n", .{s.saw_any});
             return error.CallNeverEnded;
         }
         poll(s, io, gpa, s.started_s, false);
@@ -1405,4 +1482,141 @@ test "the key sweep knows every config name older desk builds wrote, and its age
     }
     // A config younger than the longest call may belong to one still running (an older desk build's, on this data dir).
     try std.testing.expect(KEY_CFG_STALE_S > TOTAL_TIMEOUT_S + TOTAL_TIMEOUT_SLACK_S);
+}
+
+// ---- a call whose curl dies ends when curl does ----
+//
+// Every transfer curl runs ends in -w's end marker, a failed one included (a refused connect leaves code 000). A curl
+// that fails before its transfer writes nothing at all: a request body it cannot open exits 26 with an empty stdout
+// (curl 8.5, 8.17 and 8.21, measured 2026-09-17). A curl killed from outside never writes the marker either. These
+// tests drive the real curl child into both, against a stand-in on 127.0.0.1, and hand poll() a clock that never
+// moves past the call's start, so no ceiling can end the call.
+
+/// How a DeadCurl test's curl ends without writing its end marker.
+const DeadCurl = enum {
+    /// the call's request body is gone before its curl starts, so curl exits at startup without dialing
+    body_gone,
+    /// curl is killed while the endpoint has the call and is still working on it
+    killed_waiting,
+    /// curl is killed after part of the reply has streamed
+    killed_streaming,
+};
+
+/// TEST ONLY. The `test_before_curl` hook of a DeadCurl.body_gone call: deletes the call's request body, and counts
+/// the deletes, so a test can show the body really went.
+const DropBody = struct {
+    var io_: Io = undefined;
+    var path_buf: [256]u8 = undefined;
+    var path: []const u8 = "";
+    var dropped: u32 = 0;
+
+    /// Aims the hook at the request body start() writes into `root`.
+    fn arm(io: Io, root: []const u8) !void {
+        io_ = io;
+        path = try std.fmt.bufPrint(&path_buf, "{s}/.chatreq.json", .{root});
+        dropped = 0;
+    }
+    fn run() void {
+        Io.Dir.cwd().deleteFile(io_, path) catch return;
+        dropped += 1;
+    }
+};
+
+/// TEST ONLY. Ends the call's curl the way something outside the desk would (an antivirus, the OOM killer, Task
+/// Manager). The Stream keeps its Child, so only poll() can find out that curl is gone.
+fn killCurlOutside(s: *const Stream) void {
+    const id = (s.child orelse return).id orelse return;
+    if (builtin.os.tag == .windows) {
+        _ = std.os.windows.ntdll.NtTerminateProcess(id, @enumFromInt(1));
+    } else {
+        std.posix.kill(id, .KILL) catch {};
+    }
+}
+
+/// Runs one call in `root` whose curl ends `how`, polls it to its end with the clock held at its start, and checks
+/// that it ended failed, with an error naming curl, and with what streamed before curl died still in the Stream.
+fn expectDeadCurlCallEnds(gpa: std.mem.Allocator, io: Io, root: []const u8, how: DeadCurl) !void {
+    const reply: []const u8 = switch (how) {
+        // curl never dials: if it did after all, this clean answer comes back and the call does not fail
+        .body_gone => TEST_ANSWER,
+        .killed_waiting => "",
+        // no Content-Length, so the body runs until the connection closes, and the stand-in holds it open
+        .killed_streaming => "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\ndata: {\"choices\":[{\"delta\":{\"content\":\"part\"}}]}\n\n",
+    };
+    var sv: Standin = undefined;
+    try sv.start(io, reply, how != .body_gone);
+    var sv_up = true;
+    defer if (sv_up) sv.stop();
+    var s: Stream = .{};
+    defer s.deinit(gpa);
+    defer abort(&s, io); // an expectation that fails below must not leave curl running
+
+    try DropBody.arm(io, root);
+    if (how == .body_gone) test_before_curl = DropBody.run;
+    defer test_before_curl = null;
+
+    var ub: [64]u8 = undefined;
+    const base = try std.fmt.bufPrint(&ub, "http://127.0.0.1:{d}/v1", .{sv.port});
+    try std.testing.expect(start(&s, io, gpa, root, .{ .base_url = base, .key = TEST_KEY, .model = "deadcurl-model" }, TEST_MSGS, 16, 0));
+    switch (how) {
+        .body_gone => {},
+        .killed_waiting => {
+            try sv.awaitSeen(1);
+            killCurlOutside(&s);
+        },
+        .killed_streaming => {
+            try sv.awaitSeen(1);
+            var polls: u32 = 0;
+            while (!s.saw_any and !s.done) : (polls += 1) {
+                if (polls >= 3000) return error.ReplyNeverStreamed; // ~30 s
+                poll(&s, io, gpa, s.started_s, false);
+                nap.ms(10);
+            }
+            killCurlOutside(&s);
+        },
+    }
+    try pollToEnd(&s, io, gpa);
+    finish(&s, io);
+    sv.stop();
+    sv_up = false;
+
+    try std.testing.expect(s.child == null);
+    const want = if (how == .killed_streaming) "partway through the reply" else "before the model endpoint answered";
+    if (!s.failed or std.mem.indexOf(u8, s.errStr(), "curl") == null or std.mem.indexOf(u8, s.errStr(), want) == null) {
+        std.debug.print("\n[{t}] expected a failed call whose error names curl and \"{s}\": failed={}, error \"{s}\"\n", .{ how, want, s.failed, s.errStr() });
+        return error.WrongEnding;
+    }
+    switch (how) {
+        .body_gone => {
+            // the call's own body went before its curl started, and curl never sent the call
+            try std.testing.expectEqual(@as(u32, 1), DropBody.dropped);
+            try std.testing.expectEqual(@as(u32, 0), sv.seen.load(.acquire));
+        },
+        .killed_waiting => try std.testing.expectEqual(@as(u32, 1), sv.seen.load(.acquire)),
+        .killed_streaming => {
+            try std.testing.expectEqual(@as(u32, 1), sv.seen.load(.acquire));
+            try std.testing.expectEqualStrings("part", s.content.items);
+        },
+    }
+}
+
+test "a desk call whose curl dies without its end marker ends when curl does, not at the first-byte or stall ceiling" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = osEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-desk-llm-deadcurl-tmp";
+    Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = Io.Dir.cwd().createDirPathStatus(io, root, .default_dir) catch {};
+
+    // Every case runs, so one red run shows each way curl can die.
+    var red: u32 = 0;
+    for ([_]DeadCurl{ .body_gone, .killed_waiting, .killed_streaming }) |how| {
+        expectDeadCurlCallEnds(gpa, io, root, how) catch |e| {
+            std.debug.print("\n[{t}] {t}\n", .{ how, e });
+            red += 1;
+        };
+    }
+    try std.testing.expectEqual(@as(u32, 0), red);
 }
