@@ -19,12 +19,15 @@
 //! `git -C <workdir>` so no process-wide cwd is touched. The Veil drives it through first-class tools
 //! (repo_create / git_commit / git_push / git_status / git_log) rather than raw `RUN: git`, so the multi-step
 //! flow — create the remote BEFORE pushing — is encoded once instead of fumbled by a weak model each time.
+//! The tools run on the chat thread, so git never waits on a person for a credential: it asks no terminal and no askpass
+//! program (gitEnviron), and a push with nothing usable fails at once.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
 const log = @import("log.zig");
 const nap = @import("nap.zig");
+const llm = @import("llm.zig");
 
 /// One git/GitHub operation's result, folded back into the chat like any tool result. `msg` is gpa-owned.
 pub const Res = struct {
@@ -71,14 +74,54 @@ fn isRepo(io: Io, gpa: std.mem.Allocator, workdir: []const u8) bool {
     return true;
 }
 
-/// Run `git -C workdir <args...>` and capture combined output (bounded). No process-wide cwd is changed.
+/// TEST ONLY: once a test sets `test_git_environ`, a `zig build test` build starts git's environment from it instead of
+/// from the desk's own, so the test decides what git inherits. The shell that runs the tests can already turn git's
+/// prompts off: the PowerShell this repo's checks ran from on 2026-09-17 set GIT_TERMINAL_PROMPT=0 and an empty
+/// GIT_ASKPASS, and there a gitEnviron that dropped either one still passed every test. A shipped build always starts
+/// from the desk's own.
+var test_git_environ: ?*const std.process.Environ.Map = null;
+
+/// git's environment: the desk's own (llm.osEnviron), with both ways git has to ask a person for a credential turned off,
+/// so a push that finds none fails at once instead of waiting for an answer that never comes. git asks when its credential
+/// helper finds nothing, as when a push's credentials file is gone by the time git reads it. Builds before 2026-09-17
+/// passed the desk's environment unchanged (measured with git 2.43 in WSL and Git for Windows 2.52, spawned as
+/// std.process.run spawns git, against a 127.0.0.1 stand-in that asks for credentials, with a credential helper that
+/// finds none):
+/// - GIT_TERMINAL_PROMPT=0. On Linux and macOS git shares the desk's controlling terminal and asks for a username on
+///   /dev/tty, not on its stdin (the null device). With a terminal attached, git-remote-http held /dev/tty open and sat
+///   waiting on it until killed: a desk started from a terminal would block its chat thread there until someone typed.
+///   Now git gives up in milliseconds: "could not read Username for '<url>': terminal prompts disabled". On Windows git
+///   runs without a console (std.process.run's create_no_window), so its prompt already failed at once.
+/// - An empty GIT_ASKPASS. Before the terminal, git asks an askpass program: GIT_ASKPASS, else core.askPass, else
+///   SSH_ASKPASS, whatever GIT_TERMINAL_PROMPT says. On both OSes an askpass named any of those three ways was run and
+///   its answer went to the remote as credentials. The desk inherits whatever names one where it was started, such as an
+///   editor's terminal, and such a program is typically a dialog that waits for a person. git skips an askpass whose name
+///   is empty and then looks at neither of the other two: with GIT_ASKPASS empty, none of the three ran.
+/// This covers git's own questions only. A program git starts for a remote or a signature (ssh, gpg) has prompts of its
+/// own; the git tools push over HTTPS.
+fn gitEnviron(gpa: std.mem.Allocator) !std.process.Environ.Map {
+    var env = if (builtin.is_test and test_git_environ != null)
+        try test_git_environ.?.clone(gpa)
+    else
+        try std.process.Environ.createMap(llm.osEnviron(), gpa);
+    errdefer env.deinit();
+    try env.put("GIT_TERMINAL_PROMPT", "0");
+    try env.put("GIT_ASKPASS", "");
+    return env;
+}
+
+/// Run `git -C workdir <args...>` and capture combined output (bounded). No process-wide cwd is changed. git asks no one
+/// for a credential it lacks (gitEnviron).
 fn git(gpa: std.mem.Allocator, io: Io, workdir: []const u8, args: []const []const u8) struct { ok: bool, out: []u8 } {
     var av: std.ArrayListUnmanaged([]const u8) = .empty;
     defer av.deinit(gpa);
     av.appendSlice(gpa, &.{ endpoints().git, "-C", workdir }) catch return .{ .ok = false, .out = gpa.dupe(u8, "oom") catch @constCast("oom") };
     av.appendSlice(gpa, args) catch return .{ .ok = false, .out = gpa.dupe(u8, "oom") catch @constCast("oom") };
+    var env = gitEnviron(gpa) catch |e| return .{ .ok = false, .out = std.fmt.allocPrint(gpa, "git failed to run ({s})", .{@errorName(e)}) catch @constCast("oom") };
+    defer env.deinit();
     const r = std.process.run(gpa, io, .{
         .argv = av.items,
+        .environ_map = &env,
         .stdout_limit = .limited(64 << 10),
         .stderr_limit = .limited(16 << 10),
     }) catch |e| return .{ .ok = false, .out = std.fmt.allocPrint(gpa, "git failed to run ({s}) — is git installed and on PATH?", .{@errorName(e)}) catch @constCast("git not found") };
@@ -697,7 +740,7 @@ const Standin = struct {
 /// An Io that can spawn curl and git: with Threaded's empty default environment a child cannot even init Winsock on
 /// Windows (llm.osEnviron).
 fn testThreaded(gpa: std.mem.Allocator) std.Io.Threaded {
-    return std.Io.Threaded.init(gpa, .{ .environ = @import("llm.zig").osEnviron() });
+    return std.Io.Threaded.init(gpa, .{ .environ = llm.osEnviron() });
 }
 
 /// `{root}/work`, a repo with one commit to push, and `{root}/side`, an empty sidecar. Skips when git is missing.
@@ -1157,4 +1200,104 @@ test "every token file a git tool writes has a name the sweep knows, and the age
     // ...and a live push's credentials file, re-stamped every beat, stays younger than the floor through ten beats in a
     // row that failed to land.
     try std.testing.expect(TOKEN_FILE_STALE_S >= 10 * LEASE_BEAT_S);
+}
+
+// ---- a push asks no one for credentials ----
+//
+// git_push runs on the chat thread. When its credentials file gives git nothing, git asks a person: through an askpass
+// program, or on the terminal the desk was started from. Builds before 2026-09-17 let it, and on Linux or macOS a push
+// from a desk started in a terminal waited there for a username. This test runs the real git against a stand-in that asks
+// for credentials, with an askpass program ready to answer.
+
+/// Removes a running push's own credentials file when git's first request reaches the stand-in, before the remote asks
+/// for credentials: git finds nothing when it looks.
+const CredentialsGone = struct {
+    io: Io,
+    side: []const u8,
+    removed: bool = false,
+
+    fn run(ctx: *anyopaque) void {
+        const cg: *CredentialsGone = @ptrCast(@alignCast(ctx));
+        var name_buf: [64]u8 = undefined;
+        const name = ownCredFile(cg.io, cg.side, "", &name_buf) orelse return;
+        var pb: [256]u8 = undefined;
+        const path = std.fmt.bufPrint(&pb, "{s}/{s}", .{ cg.side, name }) catch return;
+        Io.Dir.cwd().deleteFile(cg.io, path) catch return;
+        cg.removed = true;
+    }
+};
+
+test "a push that finds no credentials fails at once: git asks no terminal, and no askpass program wherever one is named" {
+    const gpa = std.testing.allocator;
+    var threaded = testThreaded(gpa);
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-gitvc-noprompt-tmp";
+    const work = root ++ "/work";
+    const side = root ++ "/side";
+    defer Io.Dir.cwd().deleteTree(io, root) catch {};
+    try testRepo(gpa, io, root, work, side);
+    defer test_endpoints = TEST_NOWHERE;
+
+    // An askpass program that answers every question. Were git to ask it, its answer would reach the remote as credentials.
+    var cwd_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const cwd = cwd_buf[0..try Io.Dir.cwd().realPathFile(io, ".", &cwd_buf)];
+    var askpass_buf: [1024]u8 = undefined;
+    const askpass = try std.fmt.bufPrint(&askpass_buf, "{s}" ++ std.fs.path.sep_str ++ root ++ std.fs.path.sep_str ++ "askpass.sh", .{cwd});
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = askpass, .data = "#!/bin/sh\necho askpass-answered\n", .flags = .{ .permissions = .executable_file } });
+
+    // git inherits this process's environment, less anything the shell running the test set to turn its prompts off.
+    var inherited = try std.process.Environ.createMap(llm.osEnviron(), gpa);
+    defer inherited.deinit();
+    for ([_][]const u8{ "GIT_TERMINAL_PROMPT", "GIT_ASKPASS", "SSH_ASKPASS" }) |name| _ = inherited.swapRemove(name);
+    test_git_environ = &inherited;
+    defer test_git_environ = null;
+
+    // The three places git looks for an askpass program, in git's order, one at a time. The desk inherits the first and
+    // the last from where it was started (an editor's terminal, a desktop session), and git reads the second from its config.
+    const Named = enum { GIT_ASKPASS, @"core.askPass", SSH_ASKPASS };
+    var wrong: usize = 0;
+    for ([_]Named{ .GIT_ASKPASS, .@"core.askPass", .SSH_ASKPASS }) |named| {
+        _ = inherited.swapRemove("GIT_ASKPASS");
+        _ = inherited.swapRemove("SSH_ASKPASS");
+        const unset = git(gpa, io, work, &.{ "config", "--unset-all", "core.askPass" });
+        gpa.free(unset.out);
+        switch (named) {
+            .GIT_ASKPASS, .SSH_ASKPASS => try inherited.put(@tagName(named), askpass),
+            .@"core.askPass" => {
+                const set = git(gpa, io, work, &.{ "config", "core.askPass", askpass });
+                defer gpa.free(set.out);
+                if (!set.ok) {
+                    std.debug.print("\ncould not name the askpass program in the test repo's config: {s}\n", .{set.out});
+                    return error.TestRepoConfigFailed;
+                }
+            },
+        }
+
+        var gone: CredentialsGone = .{ .io = io, .side = side };
+        var sv: Standin = undefined;
+        try sv.open(io, TEST_FORBIDDEN, .{ .ctx = &gone, .run = CredentialsGone.run }, true);
+        var sv_up = true;
+        defer if (sv_up) sv.stop();
+        test_endpoints = sv.aimed();
+        const r = push(gpa, io, work, side, "me", "scratch", "gitvc-test", TEST_PAT, "main");
+        defer r.deinit(gpa);
+        sv.stop();
+        sv_up = false;
+        test_endpoints = TEST_NOWHERE;
+
+        if (!gone.removed) {
+            std.debug.print("\n[askpass in {t}] could not remove the push's credentials file when git's first request arrived\n", .{named});
+            return error.CredentialsNotRemoved;
+        }
+        // No credentials reached the remote, so the askpass program never answered, and git gave up without asking a
+        // terminal. Where git can reach one, as from a desk started in a terminal, asking does not fail: it waits, and this
+        // test with it.
+        if (sv.authorization().len != 0 or r.ok or std.mem.indexOf(u8, r.msg, "terminal prompts disabled") == null) {
+            std.debug.print("\n[askpass in {t}] git asked for credentials: the remote saw Authorization \"{s}\", and the push said ok={}: {s}\n", .{ named, sv.authorization(), r.ok, r.msg });
+            wrong += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 0), try expectNoTokenOnDisk(gpa, io, side, TEST_PAT, ""));
+    }
+    try std.testing.expectEqual(@as(usize, 0), wrong);
 }
