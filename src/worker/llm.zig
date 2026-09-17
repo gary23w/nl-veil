@@ -838,19 +838,68 @@ const STREAM_WALL_SLACK_S = 30;
 const POST_CFG = ".curlcfg";
 const STREAM_CFG = ".streamcfg";
 
-/// A call's own curl config: `{dir}/{kind}-{tag}-{16 hex}`, or `{dir}/{kind}-{16 hex}` untagged.
+/// The request body curl sends (`--data-binary @`), by transport, and the file a streamed reply lands in.
+const POST_BODY = ".llmreq";
+const STREAM_BODY = ".streamreq";
+const STREAM_SINK = ".stream";
+
+/// A call's own scratch file: `{dir}/{kind}-{tag}-{16 hex}{ext}`, or `{dir}/{kind}-{16 hex}{ext}` untagged. Every file
+/// a curl call hands curl is named here: its key config (keyCfgPath), its request body, a streamed call's sink.
 ///
 /// PER CALL, NOT PER TAG. A tag is not unique among the calls running at once in one dir: every mind of a swarm runs
 /// its `etl` pass under that one tag, scouts share `scoutq` and `screen`, and a sub-chat family's concurrent turns
-/// share `memverify` and `rerank` in their one build root. A config each call deletes when it ends (postUrl,
-/// streamAttempt) must be that call's alone - deleting a shared `.curlcfg-etl` as one call finished could pull it
-/// out from under a sibling whose curl had not read it yet (curl exits 26 and that call fails), and a sibling on
-/// another provider could already read the wrong key out of it. The request body keeps its tag name: it holds no key.
-fn keyCfgPath(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, comptime kind: []const u8, tag: []const u8) ![]u8 {
+/// share `memverify` and `rerank` in their one build root. curl reads its config and its body when it starts, so a
+/// shared file could change under a call before its curl got there. A sibling's body written over it: the call sent
+/// the sibling's prompt, and nothing failed. A shared config deleted as a sibling finished: curl exited 26. A shared
+/// sink: the call's tail loop could read a sibling's reply as its own.
+fn callPath(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, comptime kind: []const u8, tag: []const u8, comptime ext: []const u8) ![]u8 {
     var sfx: [8]u8 = undefined;
     io.random(&sfx);
     const hex = std.fmt.bytesToHex(sfx, .lower);
-    return std.fmt.allocPrint(gpa, "{s}/" ++ kind ++ "{s}{s}-{s}", .{ dir, if (tag.len > 0) "-" else "", tag, &hex });
+    return std.fmt.allocPrint(gpa, "{s}/" ++ kind ++ "{s}{s}-{s}" ++ ext, .{ dir, if (tag.len > 0) "-" else "", tag, &hex });
+}
+
+/// A call's own curl config (callPath). A config each call deletes when it ends (postUrl, streamAttempt) must be that
+/// call's alone: deleting a shared `.curlcfg-etl` as one call finished could pull it out from under a sibling whose
+/// curl had not read it yet, and a sibling on another provider could already read the wrong key out of it.
+fn keyCfgPath(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, comptime kind: []const u8, tag: []const u8) ![]u8 {
+    return callPath(gpa, io, dir, kind, tag, "");
+}
+
+/// The tag's copy of a finished call's request body, or of a streamed call's reply: `{dir}/{kind}-{tag}{ext}`, the
+/// file a replay starts from (keepLast). Every call under the tag leaves its own there, so it holds whichever
+/// finished last. No curl ever reads it.
+fn lastPath(gpa: std.mem.Allocator, dir: []const u8, comptime kind: []const u8, tag: []const u8, comptime ext: []const u8) ![]u8 {
+    return std.fmt.allocPrint(gpa, "{s}/" ++ kind ++ "{s}{s}" ++ ext, .{ dir, if (tag.len > 0) "-" else "", tag });
+}
+
+/// A call is over, its curl has exited: its own body (or sink) becomes the tag's copy. The rename replaces the old
+/// copy in one step, so a replay never opens a half-written body, however many siblings finish at once. When the
+/// rename fails (a reader holding the old copy open without delete sharing), the call's file is deleted instead:
+/// the copy is a convenience, and the dir must not keep one body per call.
+fn keepLast(io: std.Io, call_path: []const u8, last_path: []const u8) void {
+    const cwd = std.Io.Dir.cwd();
+    cwd.rename(call_path, cwd, last_path, io) catch cwd.deleteFile(io, call_path) catch {};
+}
+
+/// Whether a file `name` is a request body or stream sink one call wrote under its own name (callPath), never a tag's
+/// copy (lastPath). Such a file belongs to its call until the call returns and takes it along, so nothing else may
+/// delete it while that call can still be running (Supervisor.cleanCastMeta). One older than KEY_CFG_STALE_S was
+/// left by a process killed mid-call (Supervisor.sweepKeyScratch).
+pub fn isCallBodyName(name: []const u8) bool {
+    const Kind = struct { prefix: []const u8, ext: []const u8 };
+    const kinds = [_]Kind{ .{ .prefix = POST_BODY ++ "-", .ext = ".json" }, .{ .prefix = STREAM_BODY ++ "-", .ext = ".json" }, .{ .prefix = STREAM_SINK ++ "-", .ext = ".sse" } };
+    for (kinds) |k| {
+        // `{kind}-`, an optional `{tag}-`, 16 lowercase hex, the extension. Untagged, the kind's dash is the hex's.
+        if (name.len < k.prefix.len + 16 + k.ext.len) continue;
+        if (!std.mem.startsWith(u8, name, k.prefix) or !std.mem.endsWith(u8, name, k.ext)) continue;
+        const sfx = name[name.len - k.ext.len - 17 .. name.len - k.ext.len];
+        if (sfx[0] != '-') continue;
+        for (sfx[1..]) |c| {
+            if (!std.ascii.isDigit(c) and (c < 'a' or c > 'f')) break;
+        } else return true;
+    }
+    return false;
 }
 
 /// Whether a file `name` is a curl config some call wrote: either transport, any tag, per call (keyCfgPath) or per
@@ -863,15 +912,21 @@ pub fn isKeyCfgName(name: []const u8) bool {
     return false;
 }
 
-/// How long after its last write a curl config counts as stranded (Supervisor.sweepKeyScratch). A config lives as
-/// long as its call, and no call outlives TIMEOUT_CEIL_S plus STREAM_WALL_SLACK_S, so an older one belongs to a
-/// process that died mid-call. A younger one may be a live call's whose curl has not read it yet: a sweep must
-/// never take that one, whichever process made the call.
+/// How long after its last write a curl config, or a call's own body or sink (isCallBodyName), counts as stranded
+/// (Supervisor.sweepKeyScratch). Each lives as long as its call, and no call outlives TIMEOUT_CEIL_S plus
+/// STREAM_WALL_SLACK_S, so an older one belongs to a process that died mid-call. A younger one may be a live call's
+/// whose curl has not read it yet: a sweep must never take that one, whichever process made the call.
 pub const KEY_CFG_STALE_S: i64 = 15 * 60;
+
+/// TEST SEAM: runs on the calling thread once a curl call's scratch files are on disk, just before its curl starts
+/// (postUrl, streamAttempt). A test that holds concurrent calls here has every one's body written before any curl
+/// reads one: the moment a sibling's write to a shared file would already have landed.
+var test_before_curl: if (builtin.is_test) ?*const fn () void else void = if (builtin.is_test) null else {};
 
 /// POST a fully-formed request body to {base_url}/chat/completions. Returns the raw response JSON (caller
 /// frees) or an error message (ok=false). The key rides in a curl config file, never on the argv, and that file
-/// is the call's own (keyCfgPath) and gone when the call returns. `tag` names the request body's scratch file.
+/// is the call's own (keyCfgPath) and gone when the call returns. So is the body file curl sends; `tag` names the
+/// copy of it the call leaves for a replay (keepLast).
 /// `budget_tokens` is the max_tokens/num_predict THIS body asked for — it sizes the deadline (see callTimeoutS).
 /// 0 means "unknown/tiny" and yields the historical floor.
 fn post(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const u8, base_url: []const u8, key: []const u8, body: []const u8, budget_tokens: u32) Reply {
@@ -909,11 +964,21 @@ fn postUrl(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const
             .failed => return err(gpa, "local model call failed (connection dropped mid-reply)"),
         }
     }
-    const reqpath = std.fmt.allocPrint(gpa, "{s}/.llmreq{s}{s}.json", .{ run_dir, if (tag.len > 0) "-" else "", tag }) catch return oom(gpa);
+    const reqpath = callPath(gpa, io, run_dir, POST_BODY, tag, ".json") catch return oom(gpa);
     defer gpa.free(reqpath);
+    const lastpath = lastPath(gpa, run_dir, POST_BODY, tag, ".json") catch return oom(gpa);
+    defer gpa.free(lastpath);
     const cfgpath = keyCfgPath(gpa, io, run_dir, POST_CFG, tag) catch return oom(gpa);
     defer gpa.free(cfgpath);
-    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = reqpath, .data = body }) catch return err(gpa, "could not write llm request");
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = reqpath, .data = body }) catch {
+        std.Io.Dir.cwd().deleteFile(io, reqpath) catch {};
+        return err(gpa, "could not write llm request");
+    };
+    // THE BODY IS THE CALL'S OWN. Calls sharing this dir and tag run at once (callPath), and curl reads the body
+    // only when it starts: one .llmreq-<tag>.json for all of them let a sibling's write land first, and this call
+    // sent the sibling's prompt. When the call returns, curl has exited and its body becomes .llmreq-<tag>.json,
+    // the copy a replay starts from (keepLast).
+    defer keepLast(io, reqpath, lastpath);
     const cfg = std.fmt.allocPrint(gpa, "header = \"Authorization: Bearer {s}\"\nheader = \"Content-Type: application/json\"\n", .{key}) catch return oom(gpa);
     defer gpa.free(cfg);
     // THE KEY LEAVES WITH THE CALL. curl reads -K once, at startup, and its own --retry reuses what it read,
@@ -921,7 +986,7 @@ fn postUrl(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const
     // one. Armed BEFORE the write, so a half-written config goes too, and it runs on every return below:
     // success, an HTTP status, a curl that died. The chat engine's scratch dir is the CONVERSATION dir,
     // which nothing else ever wipes, so a config left here kept the key on disk for the conversation's life.
-    // The request body (.llmreq-<tag>.json) stays: it holds no key, and it is what a replay starts from.
+    // The body's copy stays: it holds no key, and it is what a replay starts from.
     defer std.Io.Dir.cwd().deleteFile(io, cfgpath) catch {};
     std.Io.Dir.cwd().writeFile(io, .{ .sub_path = cfgpath, .data = cfg }) catch return err(gpa, "could not write curl config");
 
@@ -942,6 +1007,7 @@ fn postUrl(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const
     // meaningful where bytes flow continuously, i.e. the streamed path (streamAttempt), where it IS armed.
     if (!local) av.appendSlice(gpa, &.{ "--retry", "1", "--retry-delay", "1", "--retry-connrefused", "--retry-all-errors", "--retry-max-time", "3" }) catch return oom(gpa);
     av.appendSlice(gpa, &.{ "-K", cfgpath, "--data-binary", data_at, "-w", STREAM_STAT ++ "%{http_code}", url }) catch return oom(gpa);
+    if (builtin.is_test) if (test_before_curl) |hold| hold();
     const run = std.process.run(gpa, io, .{ .argv = av.items, .stdout_limit = .limited(8 << 20) }) catch return err(gpa, "curl failed to run");
     defer gpa.free(run.stderr);
     if (run.term != .exited or run.term.exited != 0) {
@@ -3305,15 +3371,23 @@ fn streamAttempt(
     };
     defer gpa.free(body);
 
-    // ---- scratch files: the request body and sink per tag, the key config per call (keyCfgPath) ----
-    const reqpath = std.fmt.allocPrint(gpa, "{s}/.streamreq{s}{s}.json", .{ run_dir, if (tag.len > 0) "-" else "", tag }) catch return null;
+    // ---- scratch files, every one the call's own (callPath): the request body, the key config, the sink ----
+    const reqpath = callPath(gpa, io, run_dir, STREAM_BODY, tag, ".json") catch return null;
     defer gpa.free(reqpath);
+    const lastreq = lastPath(gpa, run_dir, STREAM_BODY, tag, ".json") catch return null;
+    defer gpa.free(lastreq);
     const cfgpath = keyCfgPath(gpa, io, run_dir, STREAM_CFG, tag) catch return null;
     defer gpa.free(cfgpath);
-    const outpath = std.fmt.allocPrint(gpa, "{s}/.stream{s}{s}.sse", .{ run_dir, if (tag.len > 0) "-" else "", tag }) catch return null;
+    const outpath = callPath(gpa, io, run_dir, STREAM_SINK, tag, ".sse") catch return null;
     defer gpa.free(outpath);
+    const lastout = lastPath(gpa, run_dir, STREAM_SINK, tag, ".sse") catch return null;
+    defer gpa.free(lastout);
 
-    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = reqpath, .data = body }) catch return null;
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = reqpath, .data = body }) catch {
+        std.Io.Dir.cwd().deleteFile(io, reqpath) catch {};
+        return null;
+    };
+    defer keepLast(io, reqpath, lastreq); // the body is the call's own until it returns, as in postUrl
     // Engine convention: the key rides a curl config file (-K), never the argv.
     const cfg = if (key.len > 0)
         std.fmt.allocPrint(gpa, "header = \"Authorization: Bearer {s}\"\nheader = \"Content-Type: application/json\"\n", .{key}) catch return null
@@ -3366,6 +3440,11 @@ fn streamAttempt(
     const argv: []const []const u8 = av.items;
 
     var sink = std.Io.Dir.cwd().createFile(io, outpath, .{ .truncate = true }) catch return null;
+    // The sink is the call's own too: in a shared one, a sibling's curl writes its reply where this call's tail loop
+    // reads. It becomes .stream-<tag>.sse once the call returns. Declared before `defer child.kill`, so it runs
+    // after curl is dead and reaped and nothing holds the file open.
+    defer keepLast(io, outpath, lastout);
+    if (builtin.is_test) if (test_before_curl) |hold| hold();
     var child = std.process.spawn(io, .{
         .argv = argv,
         .stdin = .ignore,
@@ -4903,6 +4982,338 @@ test "the stranded-config sweep knows every config a call writes, and its age fl
 
     // A config younger than the longest call may belong to a call still running: curl's cap, then the stream tail's slack.
     try std.testing.expect(KEY_CFG_STALE_S > TIMEOUT_CEIL_S + STREAM_WALL_SLACK_S);
+}
+
+// ---------------------------------------------------------------------------
+// A call's request body is its own. curl reads `--data-binary @file` when it starts, and calls sharing a dir and a
+// tag run at once in production: every swarm mind's `etl` pass, scouts' `scoutq` and `screen`, a sub-chat family's
+// `memverify` and `rerank` in its build root. One body file per (dir, tag) let a sibling's write land between a
+// call's write and its curl's read, and the call sent the sibling's prompt without anything failing.
+// ---------------------------------------------------------------------------
+
+/// TEST ONLY. Holds concurrent curl calls at test_before_curl until all `want` of them are there, so each has written
+/// its scratch before any curl starts: the moment a sibling's write to a shared file would already have landed. A
+/// call that returns without getting there (its write failed) is counted by `leave`, so the rest never wait for it.
+const CurlGate = struct {
+    var want: u32 = 0;
+    var in: std.atomic.Value(u32) = .init(0); // calls at the gate, or gone without reaching it
+    var parked: std.atomic.Value(u32) = .init(0); // calls that reached it
+    var open: std.atomic.Value(bool) = .init(false);
+    /// Runs on the last call in, while every other call is still held.
+    var look: ?*const fn () void = null;
+    threadlocal var reached: bool = false;
+
+    fn arm(n: u32, look_while_held: ?*const fn () void) void {
+        want = n;
+        in.store(0, .monotonic);
+        parked.store(0, .monotonic);
+        open.store(false, .monotonic);
+        look = look_while_held;
+        test_before_curl = hold;
+    }
+    fn disarm() void {
+        open.store(true, .monotonic); // a test failing before every call arrived must not leave its joins waiting
+        test_before_curl = null;
+        look = null;
+    }
+    fn hold() void {
+        reached = true;
+        _ = parked.fetchAdd(1, .monotonic);
+        arrive();
+        // bu.sleepMs, never io.sleep: these are plain threads (see the tail loop in streamAttempt)
+        var laps: u32 = 0;
+        while (!open.load(.monotonic) and laps < 5000) : (laps += 1) bu.sleepMs(1);
+    }
+    /// On each call's thread once its call has returned.
+    fn leave() void {
+        if (!reached) arrive();
+    }
+    fn arrive() void {
+        if (in.fetchAdd(1, .monotonic) + 1 < want) return;
+        if (look) |f| f();
+        open.store(true, .monotonic);
+    }
+};
+
+test "calls running at once under one dir and tag each send their own request body, and the tag keeps one whole body to replay" {
+    // Each call dials a stand-in of its own, so what a stand-in received is exactly what that call's curl read off
+    // disk. The gate holds every call until all of them have written their scratch.
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = if (builtin.os.tag == .windows) .{ .block = .global } else .{ .block = .{ .slice = std.mem.span(std.c.environ) } } });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const root = "zig-llm-bodyscratch-post-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, root, .default_dir) catch {};
+
+    const n = 3;
+    // One length for all three: a file shared by the calls holds exactly one of them at the end, never a splice.
+    const bodies = [n][]const u8{
+        "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"the prompt of call 0\"}]}",
+        "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"the prompt of call 1\"}]}",
+        "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"the prompt of call 2\"}]}",
+    };
+    var srvs: [n]fakehttp.Server = undefined;
+    var up: usize = 0;
+    defer for (srvs[0..up]) |*s| s.stop();
+    for (&srvs) |*s| {
+        try s.start(io, fakehttp.wire("{\"choices\":[{\"message\":{\"content\":\"ok\"}}]}"));
+        up += 1;
+    }
+
+    const Call = struct {
+        fn run(gpa_: std.mem.Allocator, io_: std.Io, url: []const u8, body: []const u8, out: *Reply) void {
+            defer CurlGate.leave();
+            // local=false: the hosted argv, curl's own --retry included (see "a hosted call's key leaves with it")
+            out.* = postUrl(gpa_, io_, root, "etl", url, SCRATCH_TEST_KEY, body, false, 16);
+        }
+    };
+    var ubufs: [n][64]u8 = undefined;
+    var replies: [n]Reply = undefined;
+    var threads: [n]std.Thread = undefined;
+    var spawned: usize = 0;
+    defer for (threads[0..spawned]) |t| t.join();
+    CurlGate.arm(n, null);
+    defer CurlGate.disarm();
+    for (&threads, 0..) |*t, i| {
+        // 127.1 is 127.0.0.1 to curl but not to httpc.parseLoopbackUrl, so each call takes the curl path
+        const url = try std.fmt.bufPrint(&ubufs[i], "http://127.1:{d}/v1/chat/completions", .{srvs[i].port});
+        t.* = try std.Thread.spawn(.{}, Call.run, .{ gpa, io, url, bodies[i], &replies[i] });
+        spawned += 1;
+    }
+    for (threads[0..spawned]) |t| t.join();
+    spawned = 0; // joined: the deferred join has nothing left to do
+    defer for (replies) |r| gpa.free(r.content);
+    for (srvs[0..up]) |*s| s.stop(); // joins each serve thread; request() is only safe after it
+    up = 0;
+
+    // every call was held with its scratch on disk, or the race below was never staged
+    try std.testing.expectEqual(@as(u32, n), CurlGate.parked.load(.monotonic));
+    for (&srvs, 0..) |*s, i| {
+        if (!replies[i].ok) {
+            std.debug.print("\ncall {d} failed: {s}\n", .{ i, replies[i].content });
+            return error.CallFailed;
+        }
+        // what this call's stand-in received ends with its own body, and so with nobody else's
+        if (!std.mem.endsWith(u8, s.request(), bodies[i])) {
+            std.debug.print("\ncall {d} did not send its own body: {s}\n", .{ i, s.request() });
+            return error.SentAnotherCallsBody;
+        }
+        try std.testing.expect(std.mem.indexOf(u8, s.request(), "Authorization: Bearer " ++ SCRATCH_TEST_KEY) != null);
+    }
+
+    // The calls took their own files along: of all the files left, one holds a body, whole, under the tag's name -
+    // the copy a replay starts from - and none holds the key.
+    _ = try expectNoKeyOnDisk(gpa, io, root, SCRATCH_TEST_KEY);
+    var dir = try std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true });
+    defer dir.close(io);
+    var holding: usize = 0;
+    var it = dir.iterate();
+    while (try it.next(io)) |ent| {
+        if (ent.kind != .file) continue;
+        const data = try dir.readFileAlloc(io, ent.name, gpa, .limited(1 << 16));
+        defer gpa.free(data);
+        if (std.mem.indexOf(u8, data, "the prompt of call") == null) continue;
+        holding += 1;
+        if (!std.mem.eql(u8, ent.name, ".llmreq-etl.json")) std.debug.print("\na call's body outlived it: {s}\n", .{ent.name});
+    }
+    try std.testing.expectEqual(@as(usize, 1), holding);
+    const copy = try std.Io.Dir.cwd().readFileAlloc(io, root ++ "/.llmreq-etl.json", gpa, .limited(1 << 16));
+    defer gpa.free(copy);
+    var whole: usize = 0;
+    for (bodies) |b| {
+        if (std.mem.eql(u8, copy, b)) whole += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), whole);
+}
+
+test "streamed calls running at once under one dir and tag each send their own body and read their own reply" {
+    // The streamed twin: the body curl sends, and the sink its reply streams into, where the call's tail loop reads.
+    // The chat engine streams from each conversation's own dir today, so this pins the call, not a caller.
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = if (builtin.os.tag == .windows) .{ .block = .global } else .{ .block = .{ .slice = std.mem.span(std.c.environ) } } });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const root = "zig-llm-bodyscratch-stream-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, root, .default_dir) catch {};
+
+    const n = 2;
+    const prompts = [n][]const u8{ "the prompt of stream 0", "the prompt of stream 1" };
+    const msgs = [n][]const u8{
+        "{\"role\":\"user\",\"content\":\"" ++ prompts[0] ++ "\"}",
+        "{\"role\":\"user\",\"content\":\"" ++ prompts[1] ++ "\"}",
+    };
+    const answers = [n][]const u8{ "the answer to stream 0", "the answer to stream 1" };
+    const routes = [n][1]fakehttp.Route{
+        .{.{ .method = "POST", .path = "/chat/completions", .reply = fakehttp.wire("data: {\"choices\":[{\"delta\":{\"content\":\"" ++ answers[0] ++ "\"}}]}\n\ndata: [DONE]\n\n"), .times = 1 }},
+        .{.{ .method = "POST", .path = "/chat/completions", .reply = fakehttp.wire("data: {\"choices\":[{\"delta\":{\"content\":\"" ++ answers[1] ++ "\"}}]}\n\ndata: [DONE]\n\n"), .times = 1 }},
+    };
+    var srvs: [n]fakehttp.Server = undefined;
+    var up: usize = 0;
+    defer for (srvs[0..up]) |*s| s.stop();
+    for (&srvs, 0..) |*s, i| {
+        // a fallback to complete() would be answered with this, and fail the answer check below
+        try s.startRouted(io, &routes[i], fakehttp.wire("{\"choices\":[{\"message\":{\"content\":\"fell back\"}}]}"));
+        up += 1;
+    }
+
+    // While every call is held, what the dir holds, told apart by content rather than by name: a request body holds
+    // its call's prompt, and a sink is still empty, since no curl has started.
+    const Look = struct {
+        var io_: std.Io = undefined;
+        var bodies: u32 = 0; // files holding a prompt
+        var sinks: u32 = 0; // empty files
+        var prompts_seen: u32 = 0; // bit i: some file holds prompt i
+        fn run() void {
+            var dir = std.Io.Dir.cwd().openDir(io_, root, .{ .iterate = true }) catch return;
+            defer dir.close(io_);
+            var it = dir.iterate();
+            while (it.next(io_) catch null) |ent| {
+                if (ent.kind != .file) continue;
+                const data = dir.readFileAlloc(io_, ent.name, std.testing.allocator, .limited(1 << 16)) catch continue;
+                defer std.testing.allocator.free(data);
+                if (data.len == 0) sinks += 1;
+                var holds_prompt = false;
+                for (prompts, 0..) |p, i| {
+                    if (std.mem.indexOf(u8, data, p) == null) continue;
+                    prompts_seen |= @as(u32, 1) << @intCast(i);
+                    holds_prompt = true;
+                }
+                if (holds_prompt) bodies += 1;
+            }
+        }
+    };
+    Look.io_ = io;
+    Look.bodies = 0;
+    Look.sinks = 0;
+    Look.prompts_seen = 0;
+
+    const Probe = struct {
+        fn onDelta(ctx: *anyopaque, kind: DeltaKind, text: []const u8) void {
+            _ = ctx;
+            _ = kind;
+            _ = text;
+        }
+    };
+    const Call = struct {
+        fn run(gpa_: std.mem.Allocator, io_: std.Io, base: []const u8, messages: []const u8, out: *Step) void {
+            defer CurlGate.leave();
+            var ctx: u8 = 0;
+            out.* = completeStream(gpa_, io_, root, "chat", base, SCRATCH_TEST_KEY, "bodyscratch-model", messages, "", 16, -1, &ctx, Probe.onDelta, null);
+        }
+    };
+    var ubufs: [n][64]u8 = undefined;
+    var steps: [n]Step = undefined;
+    var threads: [n]std.Thread = undefined;
+    var spawned: usize = 0;
+    defer for (threads[0..spawned]) |t| t.join();
+    CurlGate.arm(n, Look.run);
+    defer CurlGate.disarm();
+    for (&threads, 0..) |*t, i| {
+        // plain 127.0.0.1: the streamed path has no in-process fast path, so this is its curl child and scratch
+        const base = try std.fmt.bufPrint(&ubufs[i], "http://127.0.0.1:{d}/v1", .{srvs[i].port});
+        t.* = try std.Thread.spawn(.{}, Call.run, .{ gpa, io, base, msgs[i], &steps[i] });
+        spawned += 1;
+    }
+    for (threads[0..spawned]) |t| t.join();
+    spawned = 0;
+    defer for (&steps) |*s| s.deinit(gpa);
+    for (srvs[0..up]) |*s| s.stop();
+    up = 0;
+
+    try std.testing.expectEqual(@as(u32, n), CurlGate.parked.load(.monotonic));
+    for (&srvs, 0..) |*s, i| {
+        // the first request each stand-in saw carried this call's prompt and not the other's
+        const other = prompts[n - 1 - i];
+        if (std.mem.indexOf(u8, s.request(), prompts[i]) == null or std.mem.indexOf(u8, s.request(), other) != null) {
+            std.debug.print("\nstream {d} did not send its own body: {s}\n", .{ i, s.request() });
+            return error.SentAnotherCallsBody;
+        }
+    }
+    // Held together, the calls had a body and a sink each. A reply streamed into a sink two calls share can land
+    // before or after the other call's tail loop looks, so the answers below cannot be trusted to show a shared one.
+    if (Look.bodies != n or Look.sinks != n or Look.prompts_seen != (1 << n) - 1) {
+        std.debug.print("\nwhile held: {d} files held a prompt (prompts seen 0b{b}), {d} were empty sinks; {d} calls\n", .{ Look.bodies, Look.prompts_seen, Look.sinks, n });
+        return error.CallsSharedScratch;
+    }
+    for (&srvs, 0..) |*s, i| {
+        // one streamed request each, no fallback to complete(), and the reply this call read is its own stand-in's
+        try std.testing.expectEqual(@as(u32, 1), s.conns.load(.monotonic));
+        try std.testing.expect(steps[i].ok);
+        try std.testing.expectEqualStrings(answers[i], steps[i].content);
+    }
+
+    // The calls took their own files along: one file left holds a body and one a reply, under the tag's names, and
+    // none holds the key.
+    _ = try expectNoKeyOnDisk(gpa, io, root, SCRATCH_TEST_KEY);
+    var dir = try std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true });
+    defer dir.close(io);
+    var holding: usize = 0;
+    var it = dir.iterate();
+    while (try it.next(io)) |ent| {
+        if (ent.kind != .file) continue;
+        const data = try dir.readFileAlloc(io, ent.name, gpa, .limited(1 << 16));
+        defer gpa.free(data);
+        if (std.mem.indexOf(u8, data, "the prompt of stream") == null and std.mem.indexOf(u8, data, "the answer to stream") == null) continue;
+        holding += 1;
+        if (!std.mem.eql(u8, ent.name, ".streamreq-chat.json") and !std.mem.eql(u8, ent.name, ".stream-chat.sse")) std.debug.print("\na call's scratch outlived it: {s}\n", .{ent.name});
+    }
+    try std.testing.expectEqual(@as(usize, 2), holding);
+    const body_copy = try std.Io.Dir.cwd().readFileAlloc(io, root ++ "/.streamreq-chat.json", gpa, .limited(1 << 16));
+    defer gpa.free(body_copy);
+    const reply_copy = try std.Io.Dir.cwd().readFileAlloc(io, root ++ "/.stream-chat.sse", gpa, .limited(1 << 16));
+    defer gpa.free(reply_copy);
+    var bodies_in: usize = 0;
+    var replies_in: usize = 0;
+    for (prompts, answers) |p, a| {
+        if (std.mem.indexOf(u8, body_copy, p) != null) bodies_in += 1;
+        if (std.mem.indexOf(u8, reply_copy, a) != null) replies_in += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), bodies_in);
+    try std.testing.expectEqual(@as(usize, 1), replies_in);
+}
+
+test "the scratch sweeps know a call's own body from the copy a replay starts from" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Supervisor.sweepKeyScratch removes what isCallBodyName names once its process is gone, and cleanCastMeta
+    // leaves it alone while its call may run: every name callPath gives a body or a sink must be one...
+    const Kind = struct { kind: []const u8, ext: []const u8 };
+    inline for (.{ Kind{ .kind = POST_BODY, .ext = ".json" }, Kind{ .kind = STREAM_BODY, .ext = ".json" }, Kind{ .kind = STREAM_SINK, .ext = ".sse" } }) |k| {
+        for ([_][]const u8{ "etl", "memverify", "qa-lane", "" }) |tag| {
+            const own = try callPath(gpa, io, "some/dir", k.kind, tag, k.ext);
+            defer gpa.free(own);
+            const last = try lastPath(gpa, "some/dir", k.kind, tag, k.ext);
+            defer gpa.free(last);
+            if (!isCallBodyName(std.fs.path.basename(own)) or isKeyCfgName(std.fs.path.basename(own))) {
+                std.debug.print("\nnot known as a call's own body: {s}\n", .{own});
+                return error.CallBodyNameUnknown;
+            }
+            // ...and the tag's copy, which no call owns, never is
+            if (isCallBodyName(std.fs.path.basename(last))) {
+                std.debug.print("\na replay copy taken for a call's own body: {s}\n", .{last});
+                return error.ReplayCopyTakenForACallsBody;
+            }
+        }
+    }
+    // a config is the key sweep's alone, and neither a transport's other files nor a near miss is a call's own body
+    for ([_][]const u8{ ".curlcfg-etl-0123456789abcdef", ".streamcfg-chat-0123456789abcdef", ".streamreq-chat.json", ".stream-chat.sse", ".llmreq.json", ".llmreq-etl-0123456789ABCDEF.json", ".llmreq-etl-0123456789abcde.json", ".llmreq-etl_0123456789abcdef.json", ".llmreq-etl-0123456789abcdef.json.tmp", ".malformed-body-chat" }) |name| {
+        try std.testing.expect(!isCallBodyName(name));
+    }
+    // two calls with one dir and tag never share a body
+    const a = try callPath(gpa, io, "d", POST_BODY, "etl", ".json");
+    defer gpa.free(a);
+    const b = try callPath(gpa, io, "d", POST_BODY, "etl", ".json");
+    defer gpa.free(b);
+    try std.testing.expect(!std.mem.eql(u8, a, b));
 }
 
 test "every exit from streamAttempt accounts for what the provider billed" {
