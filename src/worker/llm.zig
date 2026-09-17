@@ -924,6 +924,78 @@ pub const KEY_CFG_MAX = 4096;
 /// A call whose curl config would pass KEY_CFG_MAX fails with this before it writes anything.
 const KEY_CFG_TOO_LONG = std.fmt.comptimePrint("the API key is too long to hand curl: its config would pass {d} bytes", .{KEY_CFG_MAX});
 
+/// A call whose key holds a byte a curl config value cannot carry fails with this, before it writes anything. It
+/// quotes no part of the key: this message reaches the run log and the chat transcript.
+const KEY_STRAY_BYTE = "the API key holds a control byte, which a curl config value cannot carry: re-copy the key on its own";
+
+/// Where `value` holds a byte a curl config value cannot carry, and which byte: `at` is its index. Enough for a message
+/// that tells the user where to look without quoting any of the key (desk chat.zig), and the shape gitvc's
+/// strayTokenByte answers a GitHub token in.
+pub const StrayCfgByte = struct { at: usize, byte: u8 };
+
+/// The first byte of `value` that a curl config value cannot carry — below 0x20, or DEL — or null when every byte can.
+/// curl puts a header value on the wire as it reads it, so a line break would split the header, and NUL or 0x1A would
+/// cut the config short whatever the escaping (cfgEscape). Every other byte rides escaped, which is the shape an API
+/// key needs: keys are not one charset (`sk-…`, `hf_…`, a custom URL's own), so an allowlist would refuse real ones.
+pub fn strayCfgByte(value: []const u8) ?StrayCfgByte {
+    for (value, 0..) |c, i| if (c < 0x20 or c == 0x7F) return .{ .at = i, .byte = c };
+    return null;
+}
+
+/// Append `header = "<name><value>"` to a curl config. False, with nothing appended, for a value holding a byte
+/// strayCfgByte refuses. cf_oauth's Cloudflare calls build their configs with this too.
+///
+/// THE REFUSAL is what stops a value adding an option, and the escaping is what keeps the value well formed. curl's
+/// config is line-oriented, so only a line feed or CR can begin a line of its own, and strayCfgByte has already
+/// refused both by the time cfgEscape runs. What escaping the rest buys is a value that survives as itself: an
+/// unescaped `"` would end this value early and leave the rest of it as a bare word on the same line, which curl
+/// rejects or folds into the header — a malformed request, not an injected one.
+pub fn cfgHeader(gpa: std.mem.Allocator, cfg: *std.ArrayListUnmanaged(u8), comptime name: []const u8, value: []const u8) error{OutOfMemory}!bool {
+    if (strayCfgByte(value) != null) return false;
+    try cfg.appendSlice(gpa, "header = \"" ++ name);
+    try cfgEscape(gpa, cfg, value);
+    try cfg.appendSlice(gpa, "\"\n");
+    return true;
+}
+
+/// `value` as the inside of a quoted curl config value, the way curl's config reader unquotes it: `\\` and `\"` for
+/// themselves, `\t` `\n` `\r` `\v` for tab, line feed, CR and VT. The escapes keep a value ONE value. A raw `"` ends
+/// it, and a raw line feed ends the line, after which curl reads the rest as more options: a value could add a header,
+/// or a second URL, and curl dials that URL with this config's bearer too (measured on curl 8.5, 8.17 and 8.21). NUL
+/// and 0x1A have no escape: curl stops reading a line at NUL, and on Windows it reads its config in text mode, where
+/// 0x1A ends it. The callers refuse both.
+pub fn cfgEscape(gpa: std.mem.Allocator, cfg: *std.ArrayListUnmanaged(u8), value: []const u8) error{OutOfMemory}!void {
+    for (value) |c| switch (c) {
+        '\\' => try cfg.appendSlice(gpa, "\\\\"),
+        '"' => try cfg.appendSlice(gpa, "\\\""),
+        '\t' => try cfg.appendSlice(gpa, "\\t"),
+        '\n' => try cfg.appendSlice(gpa, "\\n"),
+        '\r' => try cfg.appendSlice(gpa, "\\r"),
+        0x0B => try cfg.appendSlice(gpa, "\\v"),
+        // every other byte reads back as itself: the rest of the range below 0x20, and 0x7F-0xFF (all three curls)
+        else => try cfg.append(gpa, c),
+    };
+}
+
+/// Whether a call's config carries the bearer header when there is no key: postUrl always sent one and the streamed
+/// call only sends one with a key, a difference this guard does not get to change.
+const Bearer = enum { always, only_with_key };
+
+/// The config a chat call hands curl over its stdin (keyToCurl): the bearer, escaped so the KEY STAYS ONE HEADER
+/// VALUE, and the JSON content type. `error.StrayKeyByte` for a key cfgHeader refuses — unescaped, a `"` in a key
+/// would end the value and a line feed the line, and curl would read the rest of the key as more options: a second
+/// `url =`, which it dials carrying this bearer, or a `data-binary = "@<path>"`, which uploads that file. The key
+/// comes from the user (the key store, the desk's Settings pane) and nothing else holds it to a charset. Caller frees.
+fn chatCfg(gpa: std.mem.Allocator, key: []const u8, bearer: Bearer) error{ OutOfMemory, StrayKeyByte }![]u8 {
+    var cfg: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer cfg.deinit(gpa);
+    if (bearer == .always or key.len > 0) {
+        if (!try cfgHeader(gpa, &cfg, "Authorization: Bearer ", key)) return error.StrayKeyByte;
+    }
+    try cfg.appendSlice(gpa, "header = \"Content-Type: application/json\"\n");
+    return cfg.toOwnedSlice(gpa);
+}
+
 /// Hand a spawned curl its config (`header = "Authorization: Bearer <key>"` ...) over stdin, `-K -` on its argv, and
 /// close the pipe. The key never touches disk. A config FILE sat in the run dir or conversation dir, inside a data dir
 /// that is often a synced folder: a sync client could upload it while the call ran, and deleting a synced file sends
@@ -1016,9 +1088,12 @@ fn postUrl(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const
     // THE KEY NEVER TOUCHES DISK. curl reads this config from its stdin (keyToCurl), so the key is on no file, not
     // even while curl runs. A config file used to sit beside the body for the call's life: the chat engine's scratch
     // dir is the CONVERSATION dir, inside a data dir that is often a synced folder, and a sync client could copy the
-    // key out before the call deleted it. Built first, so a key too long for the pipe fails the call before it
-    // writes a thing.
-    const cfg = std.fmt.allocPrint(gpa, "header = \"Authorization: Bearer {s}\"\nheader = \"Content-Type: application/json\"\n", .{key}) catch return oom(gpa);
+    // key out before the call deleted it. Built first, so a key curl's config cannot carry — one that could add curl
+    // an option of its own (chatCfg), or one too long for the pipe — fails the call before it writes a thing.
+    const cfg = chatCfg(gpa, key, .always) catch |e| return switch (e) {
+        error.OutOfMemory => oom(gpa),
+        error.StrayKeyByte => err(gpa, KEY_STRAY_BYTE),
+    };
     defer gpa.free(cfg);
     if (cfg.len > KEY_CFG_MAX) return err(gpa, KEY_CFG_TOO_LONG);
     const reqpath = callPath(gpa, io, run_dir, POST_BODY, tag, ".json") catch return oom(gpa);
@@ -3470,11 +3545,10 @@ fn streamAttempt(
     defer gpa.free(body);
 
     // The key rides the config curl reads from its stdin once it runs (keyToCurl), never a file, as in postUrl. A key
-    // too long for the pipe returns before any scratch is written, and the fallback to complete() names the reason.
-    const cfg = if (key.len > 0)
-        std.fmt.allocPrint(gpa, "header = \"Authorization: Bearer {s}\"\nheader = \"Content-Type: application/json\"\n", .{key}) catch return null
-    else
-        gpa.dupe(u8, "header = \"Content-Type: application/json\"\n") catch return null;
+    // curl's config cannot carry — one that could add curl an option of its own (chatCfg), or one too long for the
+    // pipe — returns before any scratch is written, and the fallback to complete() names the reason: it reaches the
+    // same two refusals in postUrl, which answer with a message rather than a null.
+    const cfg = chatCfg(gpa, key, .only_with_key) catch return null;
     defer gpa.free(cfg);
     if (cfg.len > KEY_CFG_MAX) return null;
 
@@ -5198,6 +5272,93 @@ test "a key too long to hand curl in one pipe write fails the call before it wri
     var files: usize = 0;
     while (try it.next(io)) |_| files += 1;
     try std.testing.expectEqual(@as(usize, 0), files); // no body, no sink, no config
+}
+
+test "a key that would add curl an option of its own never reaches curl, and a key of punctuation still does" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = if (builtin.os.tag == .windows) .{ .block = .global } else .{ .block = .{ .slice = std.mem.span(std.c.environ) } } });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const root = "zig-llm-keycfg-inject-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, root, .default_dir) catch {};
+
+    var srv: fakehttp.Server = undefined;
+    try srv.start(io, fakehttp.wire("{\"choices\":[{\"message\":{\"content\":\"ok\"}}]}"));
+    var running = true;
+    defer if (running) srv.stop();
+
+    // Unescaped, this key's line feeds end the config's header line, and curl reads what follows as options of its
+    // own: a second `url`, which it dials carrying the very bearer the config set, and a `#` commenting out the
+    // stray closing quote. Aimed at the same stand-in, so the dial it would add is one this test can see.
+    const injected = try std.fmt.allocPrint(gpa, "sk-inject\"\nurl = \"http://127.0.0.1:{d}/injected\"\n#", .{srv.port});
+    defer gpa.free(injected);
+    // The punctuation real keys carry, plus the two bytes a config value escapes. It must still reach the wire, byte
+    // for byte: the guard refuses BYTES curl cannot carry, not shapes, because keys are not one charset.
+    const punctuation = "sk-proj_a\"b\\c-d.e/f+g=h~i";
+
+    var ub: [96]u8 = undefined;
+    const url = try std.fmt.bufPrint(&ub, "http://127.1:{d}/v1/chat/completions", .{srv.port}); // the curl path (see above)
+    var sb: [64]u8 = undefined;
+    const base = try std.fmt.bufPrint(&sb, "http://127.0.0.1:{d}/v1", .{srv.port});
+    const body = "{\"model\":\"keycfg-model\",\"messages\":[]}";
+    const Probe = struct {
+        fn onDelta(ctx: *anyopaque, kind: DeltaKind, text: []const u8) void {
+            _ = ctx;
+            _ = kind;
+            _ = text;
+        }
+    };
+    var ctx: u8 = 0;
+
+    // The injected key: refused by name, and the streamed attempt refuses it too (null, so the call falls back to
+    // the post that names the reason). Neither writes a file, and nothing dials — injected URL or real one.
+    const r = postUrl(gpa, io, root, "inject", url, injected, body, false, 16);
+    defer gpa.free(r.content);
+    var streamed = streamAttempt(gpa, io, root, "inject", base, injected, "keycfg-model", "{\"role\":\"user\",\"content\":\"hi\"}", "", 16, -1, &ctx, Probe.onDelta, null);
+    defer if (streamed) |*s| s.deinit(gpa);
+    try std.testing.expect(!r.ok);
+    try std.testing.expectEqualStrings(KEY_STRAY_BYTE, r.content);
+    try std.testing.expect(streamed == null);
+    try std.testing.expectEqual(@as(u32, 0), srv.conns.load(.monotonic));
+    {
+        var dir = try std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true });
+        defer dir.close(io);
+        var it = dir.iterate();
+        var files: usize = 0;
+        while (try it.next(io)) |_| files += 1;
+        try std.testing.expectEqual(@as(usize, 0), files); // no body, no sink, no config
+    }
+
+    // The punctuation key: one call, one request, and the header carries the key exactly as it was handed over.
+    const good = postUrl(gpa, io, root, "punct", url, punctuation, body, false, 16);
+    defer gpa.free(good.content);
+    srv.stop(); // joins the serve thread: request() and conns are only safe to read once it has
+    running = false;
+    try std.testing.expect(good.ok);
+    try std.testing.expectEqual(@as(u32, 1), srv.conns.load(.monotonic));
+    if (std.mem.indexOf(u8, srv.request(), "Authorization: Bearer " ++ punctuation) == null) {
+        std.debug.print("\nthe punctuation key did not reach the wire whole:\n{s}\n", .{srv.request()});
+        return error.KeyChangedOnTheWire;
+    }
+}
+
+test "the key guard refuses exactly the bytes a curl config value cannot carry, and no others" {
+    // The RANGE, not a spelling. Below 0x20 and DEL are the bytes curl would either put on the wire as it read them,
+    // splitting the header, or stop reading the config at; every other byte rides escaped, which is what an API key
+    // needs, since keys are not one charset. A guard that refused more would refuse keys providers really issue.
+    var one: [1]u8 = undefined;
+    for (0..256) |b| {
+        one[0] = @intCast(b);
+        const stray = strayCfgByte(&one);
+        if (b < 0x20 or b == 0x7F) try std.testing.expectEqual(@as(?StrayCfgByte, .{ .at = 0, .byte = one[0] }), stray) else try std.testing.expect(stray == null);
+    }
+    // It reports the FIRST stray byte and where it sits, in a key that otherwise looks ordinary...
+    try std.testing.expectEqual(@as(?StrayCfgByte, .{ .at = 11, .byte = '\n' }), strayCfgByte("sk-proj_abc\nurl = \"http://127.0.0.1/x\""));
+    // ...and the two bytes a config value escapes are not stray: cfgHeader carries them.
+    try std.testing.expect(strayCfgByte("sk-proj_a\"b\\c") == null);
 }
 
 test "the stranded-config sweep knows every config an older build wrote, and its age floor outlives any call" {
