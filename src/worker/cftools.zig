@@ -27,18 +27,22 @@
 //! scopes ARE requested since the tunnel (cf_tunnel.zig), optional like the rest, and cf_api has no path
 //! allowlist: a user who grants them lets a tool here write DNS records. It still cannot disable their WAF.
 //!
-//! TRANSPORT. curl, exactly as cf_oauth does it, and for the same reason: the bearer rides a curl config
-//! file (-K) and request bodies ride a scratch file, so no secret and no payload ever lands on the argv
-//! where another process could read it off the process table.
+//! TRANSPORT. cf_oauth.curl, the one Cloudflare transport in the process: the bearer rides the config curl
+//! reads from its stdin (`-K -`), and so does any body small enough to fit beside it. Neither touches disk,
+//! not even mid-call, and neither lands on the argv where another process could read it off the process
+//! table. Only a body too big for that pipe (an upload, a large cf_api payload) is written to a scratch file
+//! for its call's life.
 
 const std = @import("std");
+const cf_oauth = @import("../config/cf_oauth.zig"); // curl: the Cloudflare transport this belt shares
 
 /// Per-call context — the slice of ToolCtx this module needs, passed explicitly so cftools never has to
 /// import tools.zig (which imports this file).
 pub const Ctx = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
-    /// Scratch dir for curl body/config files — the run dir, which is per-run and already private.
+    /// Scratch dir for a request body too big for curl's stdin config (cf_oauth.curl) — the run dir, which is
+    /// per-run and already private. The bearer never goes here.
     scratch: []const u8,
     /// Jail for file arguments. A tool may only read/write inside it (see safeRel).
     workdir: []const u8,
@@ -172,59 +176,12 @@ fn dupe(gpa: std.mem.Allocator, s: []const u8) []u8 {
     return gpa.dupe(u8, s) catch @constCast(s[0..0]);
 }
 
-/// One outbound HTTPS call. `extra` carries additional curl argv (multipart -F parts, say) that is safe
-/// to expose — never a secret. The bearer always rides the -K config file. Returns the response body.
+/// One outbound HTTPS call, through cf_oauth.curl: the bearer, and a body that fits beside it, ride the config
+/// curl reads from its stdin, and a body too big for that goes to `{scratch}/.cfapi-body-{16 hex}` for the
+/// call's life. `extra` carries additional curl argv (multipart -F parts, say) that is safe to expose — never a
+/// secret. Returns the response body.
 fn call(ctx: Ctx, method: []const u8, url: []const u8, body: []const u8, content_type: []const u8, extra: []const []const u8) ?[]u8 {
-    const gpa = ctx.gpa;
-    var sfx: [8]u8 = undefined;
-    ctx.io.random(&sfx);
-    const tag = std.fmt.bytesToHex(sfx, .lower);
-
-    var body_pb: [700]u8 = undefined;
-    var cfg_pb: [700]u8 = undefined;
-    const body_path = std.fmt.bufPrint(&body_pb, "{s}/.cfapi-body-{s}", .{ ctx.scratch, tag }) catch return null;
-    const cfg_path = std.fmt.bufPrint(&cfg_pb, "{s}/.cfapi-cfg-{s}", .{ ctx.scratch, tag }) catch return null;
-    var wrote_body = false;
-    var wrote_cfg = false;
-    defer if (wrote_body) std.Io.Dir.cwd().deleteFile(ctx.io, body_path) catch {};
-    defer if (wrote_cfg) std.Io.Dir.cwd().deleteFile(ctx.io, cfg_path) catch {};
-
-    if (body.len > 0) {
-        std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = body_path, .data = body }) catch return null;
-        wrote_body = true;
-    }
-    {
-        var cfg: std.ArrayListUnmanaged(u8) = .empty;
-        defer cfg.deinit(gpa);
-        cfg.appendSlice(gpa, "silent\nshow-error\n") catch return null;
-        cfg.appendSlice(gpa, "header = \"Authorization: Bearer ") catch return null;
-        cfg.appendSlice(gpa, ctx.token) catch return null;
-        cfg.appendSlice(gpa, "\"\n") catch return null;
-        if (body.len > 0 and content_type.len > 0) {
-            cfg.appendSlice(gpa, "header = \"Content-Type: ") catch return null;
-            cfg.appendSlice(gpa, content_type) catch return null;
-            cfg.appendSlice(gpa, "\"\n") catch return null;
-        }
-        std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = cfg_path, .data = cfg.items }) catch return null;
-        wrote_cfg = true;
-    }
-
-    var data_at_buf: [710]u8 = undefined;
-    const data_at = std.fmt.bufPrint(&data_at_buf, "@{s}", .{body_path}) catch return null;
-    var av: std.ArrayListUnmanaged([]const u8) = .empty;
-    defer av.deinit(gpa);
-    av.appendSlice(gpa, &.{ "curl", "-sS", "--max-time", "120", "-X", method, "-K", cfg_path }) catch return null;
-    if (body.len > 0) av.appendSlice(gpa, &.{ "--data-binary", data_at }) catch return null;
-    av.appendSlice(gpa, extra) catch return null;
-    av.append(gpa, url) catch return null;
-
-    const run = std.process.run(gpa, ctx.io, .{ .argv = av.items, .stdout_limit = .limited(MAX_BODY) }) catch return null;
-    gpa.free(run.stderr);
-    if (run.stdout.len == 0) {
-        gpa.free(run.stdout);
-        return null;
-    }
-    return run.stdout;
+    return cf_oauth.curl(.{ .gpa = ctx.gpa, .io = ctx.io, .scratch = ctx.scratch, .body_prefix = ".cfapi-body-", .max_time_s = 120, .stdout_limit = MAX_BODY, .extra = extra }, method, url, body, ctx.token, content_type);
 }
 
 /// Cloudflare wraps every v4 answer in {success, errors[], result}. Pull the first error message out so a
@@ -279,7 +236,7 @@ fn deployWorker(ctx: Ctx, args_json: []const u8) []u8 {
     if (st.size > MAX_UPLOAD) return dupe(gpa, "worker script is too large to upload");
 
     // multipart: a metadata part naming the entry module, and the module itself. The file path is not a
-    // secret, so it may ride the argv; the token still does not (it is in the -K config).
+    // secret, so it may ride the argv; the token still does not (it rides curl's stdin config).
     var meta_b: [400]u8 = undefined;
     const meta = std.fmt.bufPrint(&meta_b, "metadata={{\"main_module\":\"worker.mjs\",\"compatibility_date\":\"{s}\"}};type=application/json", .{p.value.compatibility_date}) catch return dupe(gpa, "oom");
     var part_b: [980]u8 = undefined;
@@ -741,5 +698,68 @@ test "a download lands where fileUse says, folders and all, and only a landed do
         const still = std.Io.Dir.cwd().readFileAlloc(io, root ++ "/verify/old.csv", gpa, .limited(1 << 16)) catch return error.TestUnexpectedResult;
         defer gpa.free(still);
         try std.testing.expectEqualStrings("an older copy", still);
+    }
+}
+
+test "a cf_ call never puts the bearer on disk: a small body rides curl's stdin with it, and an upload's bytes ride a file of their own that leaves with the call" {
+    const gpa = std.testing.allocator;
+    const fakehttp = @import("fakehttp.zig");
+    const Watch = cf_oauth.ScratchWatch;
+    var threaded = testIo(gpa);
+    defer threaded.deinit();
+    const io = threaded.io();
+    if (!Watch.curlRuns(gpa, io)) return error.SkipZigTest;
+    const root = "zig-cftools-bearer-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, root ++ "/exports", .default_dir) catch {};
+    // An upload too big for curl's stdin pipe, so its bytes must ride a file.
+    const upload = try gpa.alloc(u8, 16 << 10);
+    defer gpa.free(upload);
+    for (upload, 0..) |*b, i| b.* = @truncate(i *% 7);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/exports/big.bin", .data = upload });
+
+    const token = "cfat-belt-test-token-8e4c-not-a-real-token";
+    const worker_secret = "worker-secret-value-4f2a-not-real";
+    const Case = struct { name: []const u8, args: []const u8, sent: []const u8, secrets: []const []const u8, bodies: u32 };
+    const cases = [_]Case{
+        // a body that is itself a secret: a Worker secret, set through the escape hatch
+        .{
+            .name = "cf_api",
+            .args =
+            \\{"method":"PUT","path":"/accounts/{account_id}/workers/scripts/w/secrets","body":"{\"name\":\"API_KEY\",\"text\":\"worker-secret-value-4f2a-not-real\",\"type\":\"secret_text\"}"}
+            ,
+            .sent = "{\"name\":\"API_KEY\",\"text\":\"" ++ worker_secret ++ "\",\"type\":\"secret_text\"}",
+            .secrets = &.{ token, worker_secret },
+            .bodies = 0,
+        },
+        .{ .name = "cf_d1_query", .args = "{\"database_id\":\"db1\",\"sql\":\"select 'd1-marker-77'\"}", .sent = "{\"sql\":\"select 'd1-marker-77'\"}", .secrets = &.{token}, .bodies = 0 },
+        .{ .name = "cf_r2_put", .args = "{\"bucket\":\"b\",\"key\":\"big.bin\",\"file\":\"exports/big.bin\"}", .sent = upload, .secrets = &.{token}, .bodies = 1 },
+    };
+    for (cases) |c| {
+        var srv: fakehttp.Server = undefined;
+        try srv.startWatched(io, &.{}, fakehttp.wire("{\"success\":true,\"result\":{}}"), Watch.onWire);
+        var running = true;
+        defer if (running) srv.stop();
+        Watch.arm(io, root, ".cfapi-body-", c.secrets);
+        defer Watch.disarm();
+        var ub: [64]u8 = undefined;
+        const api = std.fmt.bufPrint(&ub, "http://127.0.0.1:{d}/client/v4", .{srv.port}) catch unreachable;
+        const r = dispatch(.{ .gpa = gpa, .io = io, .scratch = root, .workdir = root, .token = token, .account = "acct", .api_root = api }, c.name, c.args).?;
+        defer gpa.free(r);
+        srv.stop();
+        running = false;
+
+        // The call reached the stand-in with its bearer and its whole body...
+        const req = srv.request();
+        const head_end = std.mem.indexOf(u8, req, "\r\r") orelse req.len;
+        if (std.mem.indexOf(u8, req[0..head_end], "Authorization: Bearer " ++ token) == null or !std.mem.endsWith(u8, req, c.sent)) {
+            std.debug.print("\n[{s}] the stand-in did not get the bearer and the body: {s}\n", .{ c.name, r });
+            return error.CallNotSent;
+        }
+        // ...and no file held the bearer (or the Worker secret) at the seam, on the wire, or after. A small body rode the
+        // config; the upload rode one body file, gone once the call returned.
+        try Watch.expect(1, 1, c.bodies);
+        try std.testing.expectEqual(@as(u32, 0), try Watch.leftAfter());
     }
 }

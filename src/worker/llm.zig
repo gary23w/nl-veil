@@ -918,8 +918,8 @@ pub const KEY_CFG_STALE_S: i64 = 15 * 60;
 /// creates the Windows pipe with a 4096-byte quota, and a Linux pipe holds 64 KB. So the write returns at once however
 /// slow curl is to start, and even if it dies before it reads (measured 2026-09-17: 4096 bytes into a suspended child
 /// returned in 0 ms; 4097 waited for the child to read). A config is two header lines around the key, so only a key
-/// over ~4 KB is refused (KEY_CFG_TOO_LONG).
-const KEY_CFG_MAX = 4096;
+/// over ~4 KB is refused (KEY_CFG_TOO_LONG). cf_oauth.curl, the Cloudflare calls' transport, holds its configs to it too.
+pub const KEY_CFG_MAX = 4096;
 
 /// A call whose curl config would pass KEY_CFG_MAX fails with this before it writes anything.
 const KEY_CFG_TOO_LONG = std.fmt.comptimePrint("the API key is too long to hand curl: its config would pass {d} bytes", .{KEY_CFG_MAX});
@@ -942,8 +942,9 @@ fn keyToCurl(io: std.Io, child: *std.process.Child, cfg: []const u8) bool {
 }
 
 /// std.process.run for a curl call whose config goes over stdin, which std.process.run ignores: spawn curl, hand it
-/// `cfg` (keyToCurl), then collect stdout (up to `stdout_limit` bytes) and stderr until it exits.
-fn runCurl(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8, cfg: []const u8, stdout_limit: usize) !std.process.RunResult {
+/// `cfg` (keyToCurl), then collect stdout (up to `stdout_limit` bytes) and stderr until it exits. The caller checks
+/// `cfg.len <= KEY_CFG_MAX` before it calls: keyToCurl asserts it. postUrl and cf_oauth.curl run their calls here.
+pub fn runCurl(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8, cfg: []const u8, stdout_limit: usize) !std.process.RunResult {
     var child = try std.process.spawn(io, .{ .argv = argv, .stdin = .pipe, .stdout = .pipe, .stderr = .pipe, .create_no_window = true });
     defer child.kill(io);
     if (!keyToCurl(io, &child, cfg)) return error.CurlTookNoConfig;
