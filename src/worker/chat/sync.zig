@@ -28,6 +28,11 @@ pub const MAX_DEPTH: usize = 4; // workdir-relative recursion bound
 /// sync_request; the client's manifest response echoes the file's content if IT can see one. A match means
 /// both sides read the same directory — no transfer can ever be needed for this conversation.
 pub const PROBE_NAME: []const u8 = ".sync_probe";
+/// The server→client push's once-per-run mark, in a cast's RUN dir (beside worker.pid and DONE, not in work/). The
+/// engine writes it when it pushes a finished run's files to a client-mode client and skips the push while it
+/// stands (engine.zig maybeSyncCastFiles). A worker that starts in the dir drops it right after writing its pid
+/// (run.zig claimRunDir): nothing that worker builds has been pushed yet.
+pub const SYNCED_MARKER: []const u8 = ".filesync_done";
 
 /// One manifest row: workdir-relative path, size, and FNV-1a-64 content hash (hex).
 pub const Entry = struct { p: []const u8 = "", s: u64 = 0, h: []const u8 = "" };

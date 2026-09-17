@@ -13,6 +13,7 @@ The worker process behind every swarm. It reads `<run_dir>/swarm.json` (provider
 ## Key Exports
 
 - `run(gpa, io, environ, run_dir, neuron_bin, cli_model)` — the process entry point.
+- `claimRunDir(gpa, io, run_dir)` — the startup claim `run` makes on its run dir: write `worker.pid` first, then drop what a previous worker left in a reused dir (a crash respawn relaunches into it with nothing reset): `DONE`, which would read this worker as already stopped, and the chat engine's synced marker (chat/sync.zig `SYNCED_MARKER`), which would keep a client-mode client from ever being pushed this worker's files. The pid goes first because the engine's push re-reads it after writing its marker and takes the marker back from a live worker.
 - `Worker` — the run-state god-object that `agi.zig` and `rsi.zig` operate on (emitters, memory handle, fitness trajectory, veil state, budgets).
 - `MindState` / `GuardRec` — per-mind state incl. the tool-loop guard (identical call+result repeats), persona, lane, scout flag.
 - `LANES` / `SCOUT_LANE` — pre-assigned work lanes so parallel minds diverge from moment 1; the scout lane learns instead of building.
