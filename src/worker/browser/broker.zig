@@ -10,8 +10,11 @@
 //! tool and its author share ONE browser session.
 //!
 //! It is a tiny single-request-at-a-time HTTP/1.1 server on a dedicated thread (browser ops serialize in the
-//! manager anyway). Port 0 gives no way to read the assigned port back from std.Io.net.Server, so it scans a
-//! small high-port range and uses the first that binds.
+//! manager anyway). It listens on a port the OS assigns (port 0, read back from the bound socket), because its
+//! callers never need a fixed one: `Info` carries the port into the tool's env and the local-host discovery
+//! file. It used to scan 43110..43142 for the first port that would bind, and on Windows the first port always
+//! binds: std's listen shares a held port instead of failing (worker/portprobe.zig), so every broker on the
+//! machine sat on 43110 and a tool call could land in another process's broker.
 
 const std = @import("std");
 const Io = std.Io;
@@ -19,9 +22,6 @@ const browser_mgr = @import("manager.zig");
 const mcp_discovery = @import("../mcp/discovery.zig");
 
 const log = std.log.scoped(.browser);
-
-const PORT_LO: u16 = 43110;
-const PORT_HI: u16 = 43142;
 
 var g_mu: std.Io.Mutex = .init;
 var g_started = false;
@@ -34,7 +34,7 @@ var g_env: *const std.process.Environ.Map = undefined;
 pub const Info = struct { port: u16, token: []const u8 };
 
 /// Lazily start the broker (idempotent, process-global). Returns its port + token, or null if it could not
-/// bind any port in the range. The manager ops it dispatches to use `gpa`/`io`/`env`, so those are pinned here.
+/// listen at all. The manager ops it dispatches to use `gpa`/`io`/`env`, so those are pinned here.
 pub fn ensure(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Map) ?Info {
     g_mu.lockUncancelable(io);
     defer g_mu.unlock(io);
@@ -43,14 +43,11 @@ pub fn ensure(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Ma
     var seed: u64 = @intFromPtr(env) ^ 0x5DEECE66D;
     fillHex(&g_token, &seed);
 
-    var port = PORT_LO;
-    const server: Io.net.Server = while (port <= PORT_HI) : (port += 1) {
-        const addr = Io.net.IpAddress{ .ip4 = .loopback(port) };
-        break Io.net.IpAddress.listen(&addr, io, .{ .mode = .stream, .protocol = .tcp }) catch continue;
-    } else {
-        log.warn("browser broker: no free port in {d}..{d}", .{ PORT_LO, PORT_HI });
+    const server = listenLoopback(io) catch |e| {
+        log.warn("browser broker: could not listen on loopback: {t}", .{e});
         return null;
     };
+    const port = server.socket.address.getPort();
 
     g_gpa = gpa;
     g_io = io;
@@ -66,6 +63,12 @@ pub fn ensure(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Ma
     };
     log.info("browser broker listening on 127.0.0.1:{d}", .{port});
     return .{ .port = g_port, .token = &g_token };
+}
+
+/// The broker's listener, on a loopback port the OS assigns: private to this process, on every OS.
+fn listenLoopback(io: Io) Io.net.IpAddress.ListenError!Io.net.Server {
+    const addr = Io.net.IpAddress{ .ip4 = .loopback(0) };
+    return Io.net.IpAddress.listen(&addr, io, .{ .mode = .stream, .protocol = .tcp });
 }
 
 fn acceptLoop(server: *Io.net.Server) void {
@@ -182,4 +185,30 @@ fn fillHex(out: []u8, seed: *u64) void {
             i += 1;
         }
     }
+}
+
+test "every broker listener gets a port of its own" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Several listeners at once, as when two veil processes (a server and a local-host daemon, or two
+    // servers) each start a broker. A shared port would hand one process's tool calls to the other.
+    const N = 4;
+    var servers: [N]Io.net.Server = undefined;
+    var open: usize = 0;
+    defer for (servers[0..open]) |*s| s.deinit(io);
+    for (&servers) |*s| {
+        s.* = try listenLoopback(io);
+        open += 1;
+    }
+    var distinct: usize = 0;
+    for (servers, 0..) |s, i| {
+        const p = s.socket.address.getPort();
+        try std.testing.expect(p != 0);
+        var seen_before = false;
+        for (servers[0..i]) |t| seen_before = seen_before or t.socket.address.getPort() == p;
+        distinct += @intFromBool(!seen_before);
+    }
+    try std.testing.expectEqual(N, distinct);
 }
