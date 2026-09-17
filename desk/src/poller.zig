@@ -29,11 +29,11 @@ pub const Poller = struct {
     // last tick. During a cast the file grows, but only in bursts — between bursts (most ticks) this is a no-op,
     // which is what stops the desktop from pegging a core re-parsing a multi-MB log every second.
     ev_cache_size: u64 = 0,
-    ev_cache_sel: [64]u8 = undefined,
+    ev_cache_sel: [96]u8 = undefined, // = Store.selected capacity
     ev_cache_sel_len: usize = 0,
     ev_cache_n: usize = 0,
     ev_cache_metrics: scan.Metrics = .{},
-    prev_live_ids: [scan.MAX_SWARMS][64]u8 = undefined,
+    prev_live_ids: [scan.MAX_SWARMS][96]u8 = undefined, // = scan.SwarmSummary.id capacity: a clamped copy never matches its own id
     prev_live_lens: [scan.MAX_SWARMS]u8 = [_]u8{0} ** scan.MAX_SWARMS,
     prev_live_n: usize = 0,
     prev_stopped_marked: [scan.MAX_SWARMS]bool = [_]bool{false} ** scan.MAX_SWARMS,
@@ -81,7 +81,7 @@ pub const Poller = struct {
 
     // notification de-dup state (poller-local)
     grad_warned: bool = false,
-    stopped_ids: [scan.MAX_SWARMS][64]u8 = undefined,
+    stopped_ids: [scan.MAX_SWARMS][96]u8 = undefined, // full id width, as prev_live_ids
     stopped_lens: [scan.MAX_SWARMS]u8 = [_]u8{0} ** scan.MAX_SWARMS,
     stopped_n: usize = 0,
 
@@ -412,17 +412,30 @@ pub const Poller = struct {
         }
     }
 
-    /// Delete a swarm. `rel` is the path relative to data ("name" or "u1/<hexid>"). Server-managed swarms
-    /// (rel has a '/') go through DELETE /api/v1/swarms/<hexid> so the worker is stopped + removed; a flat
-    /// CLI run is removed by deleting exactly its own dir. Only ever the one dir the user picked — never a
-    /// sweep.
+    /// Delete a swarm. `rel` is the roster id, its run dir relative to data ("name", "u1/<hexid>", a conversation's
+    /// build root). scan.deleteRoute decides how. A server run goes through DELETE /api/v1/swarms/<id>, so the
+    /// worker is stopped and its run removed, with an id the server resolves back to exactly this run dir: a
+    /// scheduled run's conversation, never its stamp, which every task that ran that minute shares. A run no server
+    /// id resolves to is refused with a notice. A flat CLI run is removed by deleting exactly its own dir. Only ever
+    /// the one dir the user picked — never a sweep. The row's "deleting..." mark (store.Deleting) ends here unless
+    /// the delete landed, so every other return hands the row back on the UI's next frame; the roster walk after a
+    /// landing ends that one (refresh).
     fn doDelete(self: *Poller, dd: []const u8, rel: []const u8) void {
         log.trace("poller.doDelete rel={s}", .{rel});
+        var landed = false;
+        defer self.store.deleteDone(rel, landed);
         if (rel.len == 0) return;
         self.last_roster_s = 0; // drop the row on the very next roster walk
-        const base = if (std.mem.lastIndexOfScalar(u8, rel, '/')) |sl| rel[sl + 1 ..] else rel;
-        if (std.mem.indexOfScalar(u8, rel, '/') != null) {
+        var ib: [96]u8 = undefined;
+        const route = scan.deleteRoute(rel, &ib);
+        if (route == .refused) {
+            log.info("delete {s} refused: no server id resolves to this run dir", .{rel});
+            self.store.pushNotif("Delete refused", "the server can't address this run - use Stop, or remove its folder by hand", 2);
+            return;
+        }
+        if (route == .server) {
             // server swarm → API delete (stops + removes)
+            const id = route.server;
             var tbuf: [128]u8 = undefined;
             var tlen: usize = 0;
             {
@@ -432,16 +445,21 @@ pub const Poller = struct {
                 @memcpy(tbuf[0..tlen], t[0..tlen]);
                 self.store.unlock();
             }
-            const resp = netcli.delete(self.io, self.gpa, self.port(), tbuf[0..tlen], base);
-            log.info("delete {s} basename={s} status={d} token={d}b", .{ rel, base, if (resp) |r| r.status else 0, tlen });
+            const resp = netcli.delete(self.io, self.gpa, self.port(), tbuf[0..tlen], id);
+            log.info("delete {s} id={s} status={d} token={d}b", .{ rel, id, if (resp) |r| r.status else 0, tlen });
             if (resp) |r| {
                 defer if (r.body.len > 0) self.gpa.free(r.body);
                 if (r.status == 200 or r.status == 204) {
                     self.store.pushNotif("Deleted", rel, 1);
+                    landed = true;
                     return;
                 }
                 if (r.status == 401 or r.status == 403) {
                     self.store.pushNotif("Delete unauthorized", "set an API token in Settings", 2);
+                    return;
+                }
+                if (r.status == 404) {
+                    self.store.pushNotif("Delete failed", "the server is not tracking this run - use Stop", 2);
                     return;
                 }
             }
@@ -455,6 +473,7 @@ pub const Poller = struct {
                 return;
             };
             self.store.pushNotif("Deleted", rel, 1);
+            landed = true;
         }
     }
 
@@ -759,8 +778,10 @@ pub const Poller = struct {
         // (a cast's progress/finish must show within a second); idle, the walk drops to every 5s. A deploy
         // or delete resets last_roster_s so its effect shows on the very next tick.
         var nsw = self.roster_cache_n;
+        var walked = false; // this tick publishes a fresh walk, not the cached rows
         if (self.roster_any_live or now_s - self.last_roster_s >= 5) {
             self.last_roster_s = now_s;
+            walked = true;
             nsw = scan.listSwarms(self.io, self.gpa, dd, &self.swarm_scratch, now_s, 45);
             self.roster_cache_n = nsw;
             self.roster_any_live = false;
@@ -773,11 +794,11 @@ pub const Poller = struct {
         }
 
         // 3) selected swarm tail
-        var selbuf: [64]u8 = undefined;
+        var selbuf: [96]u8 = undefined; // = Store.selected capacity; a [64] here panicked on a wider selection
         var sel_len: usize = 0;
         {
             self.store.lock();
-            sel_len = self.store.selected_len;
+            sel_len = @min(self.store.selected_len, selbuf.len);
             @memcpy(selbuf[0..sel_len], self.store.selected[0..sel_len]);
             self.store.unlock();
         }
@@ -836,6 +857,7 @@ pub const Poller = struct {
         }
 
         // 4) publish under lock
+        var leftover: store_mod.Deleting.Leftover = .{};
         {
             self.store.lock();
             self.store.server_online = online;
@@ -849,6 +871,9 @@ pub const Poller = struct {
             }
             @memcpy(self.store.swarms[0..nsw], self.swarm_scratch[0..nsw]);
             self.store.swarm_count = nsw;
+            // A walk ends the "deleting..." mark of every delete that landed before it, in the lock that publishes
+            // what the walk found: a deleted row and its mark leave together, never the mark first.
+            if (walked) leftover = self.store.deleting.walked(self.swarm_scratch[0..nsw]);
             if (sel_len > 0) {
                 @memcpy(self.store.events[0..ev_n], self.ev_scratch[0..ev_n]);
                 self.store.event_count = ev_n;
@@ -862,6 +887,15 @@ pub const Poller = struct {
             }
             self.store.last_refresh_s = now_s;
             self.store.unlock();
+        }
+        // A delete that answered but left its run on disk: the walk still lists it, and its row is back.
+        if (leftover.n > 0) {
+            var lb: [160]u8 = undefined;
+            const what = if (leftover.n == 1)
+                std.fmt.bufPrint(&lb, "{s} is still on disk", .{leftover.idStr()})
+            else
+                std.fmt.bufPrint(&lb, "{s} and {d} more are still on disk", .{ leftover.idStr(), leftover.n - 1 });
+            self.store.pushNotif("Delete incomplete", what catch leftover.idStr(), 2);
         }
 
         // 5) notifications on transitions (poller-local memory, so no lock)
@@ -1851,4 +1885,195 @@ test "a steer pasted with a control byte still builds a control body the reader 
     const p2 = try std.json.parseFromSlice(std.json.Value, gpa, jb.items, .{});
     defer p2.deinit();
     try std.testing.expectEqualStrings("a\nb c", p2.value.object.get("text").?.string);
+}
+
+test "a delete no server id can reach is refused with a notice and touches nothing, and a CLI run is removed where it lies" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dd = "zig-delete-route-tmp";
+    Io.Dir.cwd().deleteTree(io, dd) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dd) catch {};
+    // A run outside any account dir, where the server never writes, so no id it resolves reaches it (the id rules are
+    // scan.zig's); and two flat CLI runs, one of them deleted.
+    for ([_][]const u8{ dd ++ "/proj/run1", dd ++ "/cli-run", dd ++ "/cli-run-2" }) |run| {
+        _ = try Io.Dir.cwd().createDirPathStatus(io, run, .default_dir);
+        var eb: [96]u8 = undefined;
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&eb, "{s}/events.jsonl", .{run}), .data = "{\"kind\":\"round\",\"round\":1}\n" });
+    }
+    const s = try gpa.create(Store); // Store is far too big for a test stack frame
+    defer gpa.destroy(s);
+    s.* = .{};
+    s.settings.narrator = false; // a notice also queues speech
+    s.settings.port = 1; // a request that slipped through meets a closed loopback port, never a veil server
+    const p = try gpa.create(Poller);
+    defer gpa.destroy(p);
+    p.* = .{ .io = io, .gpa = gpa, .store = s };
+    defer p.log_buf.deinit(gpa);
+
+    p.doDelete(dd, "proj/run1");
+    p.doDelete(dd, "cli-run");
+    {
+        s.lock();
+        defer s.unlock();
+        try std.testing.expectEqual(@as(usize, 2), s.notif_count);
+        const refused = &s.notifs[s.notif_head % s.notifs.len];
+        try std.testing.expectEqualStrings("Delete refused", refused.titleStr());
+        try std.testing.expect(std.mem.indexOf(u8, refused.bodyStr(), "Stop") != null); // it says what still works
+        try std.testing.expectEqualStrings("Deleted", s.notifs[(s.notif_head + 1) % s.notifs.len].titleStr());
+    }
+    // the refused run is untouched; the CLI run's dir is gone and its neighbour is not
+    _ = try Io.Dir.cwd().statFile(io, dd ++ "/proj/run1/events.jsonl", .{});
+    try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().statFile(io, dd ++ "/cli-run/events.jsonl", .{}));
+    _ = try Io.Dir.cwd().statFile(io, dd ++ "/cli-run-2/events.jsonl", .{});
+}
+
+test "a failed delete gives its row back at once, and a landed one stays deleting until the walk that drops its row" {
+    // The bug this pins: the "deleting..." marks were the UI's own, and only a roster without the row ended one. A
+    // delete that failed (server unreachable, 401/403, 404, a local remove that failed) left its row in the roster, so
+    // the row stayed "deleting...", with no x and no click, until the desk restarted.
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dd = "zig-delete-mark-tmp";
+    Io.Dir.cwd().deleteTree(io, dd) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dd) catch {};
+    const ev = "{\"kind\":\"round\",\"round\":1}\n";
+    // a server deploy's run and two flat CLI runs
+    for ([_][]const u8{ dd ++ "/u1/0123abcd", dd ++ "/cli-run", dd ++ "/cli-run-2" }) |run| {
+        _ = try Io.Dir.cwd().createDirPathStatus(io, run, .default_dir);
+        var eb: [96]u8 = undefined;
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&eb, "{s}/events.jsonl", .{run}), .data = ev });
+    }
+    const s = try gpa.create(Store); // Store is far too big for a test stack frame
+    defer gpa.destroy(s);
+    s.* = .{};
+    @memcpy(s.settings.data_dir[0..dd.len], dd);
+    s.settings.data_dir_len = dd.len;
+    s.settings.narrator = false; // a notice also queues speech, and the next tick would hand it to the OS TTS
+    s.settings.port = 1; // the server delete meets a closed loopback port: unreachable, never a veil server
+    const p = try gpa.create(Poller);
+    defer gpa.destroy(p);
+    p.* = .{ .io = io, .gpa = gpa, .store = s };
+    defer p.log_buf.deinit(gpa);
+    // The ticks stay on the filesystem: the fleet GET reads as polled an hour from now, and the server reads as
+    // offline, which gates every other request.
+    p.last_fleet_s = Io.Timestamp.now(io, .real).toSeconds() + 3600;
+
+    p.refresh();
+    try std.testing.expectEqual(@as(usize, 3), s.swarm_count);
+
+    // the x on every row, as drawRoster queues it, then the poller's drain
+    for ([_][]const u8{ "u1/0123abcd", "cli-run", "cli-run-2" }) |id| s.pushDelete(id, true);
+    try std.testing.expectEqual(@as(usize, 3), s.deleting.n);
+    p.drainCommands();
+    // cli-run-2's delete landed, yet its run is back on disk before the next walk: a server that answered 200 and
+    // left the run behind (its remove kept failing, or it resolved another run dir)
+    _ = try Io.Dir.cwd().createDirPathStatus(io, dd ++ "/cli-run-2", .default_dir);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = dd ++ "/cli-run-2/events.jsonl", .data = ev });
+    {
+        s.lock();
+        defer s.unlock();
+        // nothing listens on port 1: that delete failed, and its row is back before any walk
+        try std.testing.expect(!s.deleting.has("u1/0123abcd"));
+        // both CLI deletes landed, and the published roster still lists their rows: so do their marks (no flash)
+        try std.testing.expect(s.deleting.has("cli-run") and s.deleting.has("cli-run-2"));
+        try std.testing.expectEqual(@as(usize, 3), s.swarm_count);
+    }
+
+    // A tick that republishes the cached rows, without a walk, ends no mark: those rows predate the deletes.
+    p.last_roster_s = Io.Timestamp.now(io, .real).toSeconds() + 3600;
+    p.roster_any_live = false;
+    p.refresh();
+    try std.testing.expectEqual(@as(usize, 3), s.swarm_count);
+    try std.testing.expect(s.deleting.has("cli-run") and s.deleting.has("cli-run-2"));
+
+    // The walk: cli-run is gone, and its mark leaves in the same publish; cli-run-2 is still listed, so its row is back.
+    p.last_roster_s = 0;
+    p.refresh();
+    s.lock();
+    defer s.unlock();
+    try std.testing.expectEqual(@as(usize, 2), s.swarm_count);
+    for (s.swarms[0..s.swarm_count]) |*sw| try std.testing.expect(!std.mem.eql(u8, sw.idStr(), "cli-run"));
+    try std.testing.expectEqual(@as(usize, 0), s.deleting.n);
+    const want = [_][]const u8{ "Delete failed", "Deleted", "Deleted", "Delete incomplete" };
+    try std.testing.expectEqual(want.len, s.notif_count);
+    for (want, 0..) |title, i| try std.testing.expectEqualStrings(title, s.notifs[(s.notif_head + i) % s.notifs.len].titleStr());
+    try std.testing.expectEqualStrings("cli-run-2 is still on disk", s.notifs[(s.notif_head + 3) % s.notifs.len].bodyStr());
+}
+
+test "a run whose id is wider than 64 bytes is selected, tailed from its own dir, and announced finished once" {
+    // A roster id, the selection and a command id are all 96 bytes wide, but refresh copied the selection
+    // into [64]u8 buffers (selbuf, ev_cache_sel): a ReleaseSafe bounds panic on this thread the first tick
+    // after such a run was selected. The live and stopped memories were [64]u8 too, clamped, so a wide id
+    // never matched its own copy: its finished notice was lost and stopped_ids gained a duplicate per tick.
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dd = "zig-wideid-tmp";
+    Io.Dir.cwd().deleteTree(io, dd) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dd) catch {};
+
+    // A chat cast's run dir under a 64-byte conversation id, the longest the server's safeSeg accepts.
+    // listSwarms builds the 80-byte roster id from the real directory; the test only names what it expects.
+    const want = "u1/_chat/builds/" ++ ("c" ** 64);
+    try std.testing.expect(want.len > 64);
+    const ev_path = dd ++ "/" ++ want ++ "/events.jsonl";
+    const ev_lines = "{\"kind\":\"round\",\"round\":1}\n{\"kind\":\"score\",\"round\":1,\"passed\":1,\"total\":2,\"pct\":50}\n";
+    _ = try Io.Dir.cwd().createDirPathStatus(io, dd ++ "/" ++ want, .default_dir);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = ev_path, .data = ev_lines });
+
+    const s = try gpa.create(Store); // Store is far too big for a test stack frame
+    defer gpa.destroy(s);
+    s.* = .{};
+    @memcpy(s.settings.data_dir[0..dd.len], dd);
+    s.settings.data_dir_len = dd.len;
+    s.settings.narrator = false; // a notice also queues speech, and the next tick would hand it to the OS TTS
+    const p = try gpa.create(Poller);
+    defer gpa.destroy(p);
+    p.* = .{ .io = io, .gpa = gpa, .store = s };
+    defer p.log_buf.deinit(gpa);
+    // Every tick stays on the filesystem: the fleet GET reads as polled an hour from now, so none comes due
+    // mid-test, and the server reads as offline, which gates every other request. A veil server running on
+    // this machine is never contacted.
+    p.last_fleet_s = Io.Timestamp.now(io, .real).toSeconds() + 3600;
+
+    // tick 1: the roster walk finds the run, live, before anything is selected
+    p.refresh();
+    try std.testing.expectEqual(@as(usize, 1), s.swarm_count);
+    try std.testing.expectEqualStrings(want, s.swarms[0].idStr());
+    try std.testing.expect(s.swarms[0].live);
+
+    // tick 2: select it as a roster click or autoSelect does, then tail it
+    s.pushCmd(store_mod.mkCmd(.select, want, ""));
+    p.drainCommands();
+    p.refresh();
+    try std.testing.expectEqualStrings(want, s.selected[0..s.selected_len]);
+    try std.testing.expectEqual(@as(usize, 2), s.event_count); // read from THIS run's events.jsonl, not a cut path
+    try std.testing.expectEqual(@as(i32, 50), s.metrics.pct);
+    try std.testing.expectEqualStrings(want, p.ev_cache_sel[0..p.ev_cache_sel_len]); // so a quiet tick reuses the parse
+
+    // ticks 3 and 4: the run stops, then stays stopped
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = ev_path, .data = ev_lines ++ "{\"kind\":\"stopped\",\"reason\":\"done\"}\n" });
+    p.refresh();
+    p.refresh();
+    var finished: usize = 0;
+    {
+        s.lock();
+        defer s.unlock();
+        var i: usize = 0;
+        while (i < s.notif_count) : (i += 1) {
+            const n = &s.notifs[(s.notif_head + i) % s.notifs.len];
+            if (!std.mem.eql(u8, n.titleStr(), "Swarm finished")) continue;
+            finished += 1;
+            try std.testing.expectEqualStrings(want, n.bodyStr());
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), finished);
+    try std.testing.expectEqual(@as(usize, 1), p.stopped_n); // recorded once, not once per stopped tick
+    // and the ticks really stayed off the network: the fleet GET neither counted a miss nor adopted a success
+    try std.testing.expect(p.miss_streak == 0 and !s.server_online);
 }

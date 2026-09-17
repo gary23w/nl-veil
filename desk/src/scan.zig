@@ -5,6 +5,7 @@
 //! Store. The UI thread never touches io.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const log = @import("log.zig");
 
@@ -549,54 +550,58 @@ fn jsonStrList(line: []const u8, key: []const u8, out: []u8) usize {
     return w;
 }
 
-/// Enumerate swarm run dirs under `data_dir`. A swarm is any dir with an events.jsonl — and crucially the
-/// server writes deploys ONE LEVEL DOWN under per-user accounts (data/u<uid>/<hexid>/), while the CLI
-/// writes flat (data/<name>/). So: if data/X has events.jsonl it's a swarm; otherwise if X is a plain
-/// container dir, descend one level and take each data/X/child that has events.jsonl. The stored `id` is
-/// the path RELATIVE to data_dir (so control/tail resolve correctly for both layouts); `name` is friendly.
+/// Enumerate swarm run dirs under `data_dir`, the Swarm tab's roster. A swarm is any dir with an events.jsonl.
+/// The CLI writes flat (data/<name>/). The server writes ONE LEVEL DOWN under per-user accounts
+/// (data/u<uid>/<hexid>/), and a conversation's cast deeper, in the conversation's build root (the server's
+/// chat/paths.zig buildRootRel): u<uid>/_chat/builds/<conv>, or u<uid>/_sched/<task>/runs/<stamp> for a
+/// scheduled run. So: if data/X has events.jsonl it's a swarm; otherwise X is a container, and each data/X/child
+/// that has one is taken, and so is each run under X/_chat/builds/ and X/_sched/<task>/runs/. The stored `id` is
+/// the path RELATIVE to data_dir (so control/tail resolve correctly for every layout); `name` is friendly.
+///
+/// `out` receives the NEWEST out.len runs by events.jsonl mtime, newest first, whatever order the directories
+/// list in. Each run dir the walk meets costs one stat, and only the runs kept are summarized (swarm.json, the
+/// 64KB tail, the goal brief), so a data dir holding more runs than `out` has rows reads no more tails than it
+/// shows. The walk once stopped at out.len rows in directory order and sorted afterwards: on NTFS a u<uid> dir
+/// lists its hex run dirs before _chat, so 64 old deploys hid every chat cast from the roster.
 pub fn listSwarms(io: Io, gpa: std.mem.Allocator, data_dir: []const u8, out: []SwarmSummary, now_s: i64, live_window_s: i64) usize {
     log.trace("scan.listSwarms data_dir={s}", .{data_dir});
+    if (out.len == 0) return 0;
     var dir = Io.Dir.cwd().openDir(io, data_dir, .{ .iterate = true }) catch return 0;
     defer dir.close(io);
+    var kept: NewestRuns = .{ .rows = out };
     var it = dir.iterate();
-    var n: usize = 0;
-    while (n < out.len) {
+    while (true) {
         const entry = (it.next(io) catch break) orelse break;
         if (entry.kind != .directory) continue;
         const name = entry.name;
         if (name.len == 0 or name[0] == '.' or name[0] == '_') continue; // skip dot/underscore sidecars
-        if (addSwarm(io, gpa, data_dir, name, out, &n, now_s, live_window_s)) continue;
+        if (kept.offer(io, data_dir, name)) continue;
         // no events.jsonl here → treat as a container (e.g. u<uid>/) and descend exactly one level.
         var nbuf: [512]u8 = undefined;
         const sub = std.fmt.bufPrint(&nbuf, "{s}/{s}", .{ data_dir, name }) catch continue;
         var sd = Io.Dir.cwd().openDir(io, sub, .{ .iterate = true }) catch continue;
         defer sd.close(io);
         var sit = sd.iterate();
-        while (n < out.len) {
+        while (true) {
             const ce = (sit.next(io) catch break) orelse break;
             if (ce.kind != .directory or ce.name.len == 0 or ce.name[0] == '.') continue;
             var rbuf: [96]u8 = undefined;
             const rel = std.fmt.bufPrint(&rbuf, "{s}/{s}", .{ name, ce.name }) catch continue;
-            if (addSwarm(io, gpa, data_dir, rel, out, &n, now_s, live_window_s)) continue;
-            // A chat CAST builds in u<uid>/_chat/builds/<conv>, one level deeper than a normal u<uid>/<hex>
-            // swarm — descend into _chat/builds/* so the chat can watch + collect its own casts (else it
-            // never sees the run dir and hangs on "watching").
+            if (kept.offer(io, data_dir, rel)) continue;
+            // A conversation's CAST builds in its build root, deeper than a u<uid>/<hex> swarm: a chat's in
+            // _chat/builds/<conv>, a scheduled run's in _sched/<task>/runs/<stamp>. Descend into both, so the
+            // roster shows every hive the server spawned and its row can stop it.
             if (std.mem.eql(u8, ce.name, "_chat")) {
-                var bbuf: [512]u8 = undefined;
-                const builds = std.fmt.bufPrint(&bbuf, "{s}/{s}/_chat/builds", .{ data_dir, name }) catch continue;
-                var bd = Io.Dir.cwd().openDir(io, builds, .{ .iterate = true }) catch continue;
-                defer bd.close(io);
-                var bit = bd.iterate();
-                while (n < out.len) {
-                    const be = (bit.next(io) catch break) orelse break;
-                    if (be.kind != .directory or be.name.len == 0 or be.name[0] == '.') continue;
-                    var r2: [96]u8 = undefined;
-                    const rel2 = std.fmt.bufPrint(&r2, "{s}/_chat/builds/{s}", .{ name, be.name }) catch continue;
-                    _ = addSwarm(io, gpa, data_dir, rel2, out, &n, now_s, live_window_s);
-                }
+                var bbuf: [96]u8 = undefined;
+                const builds = std.fmt.bufPrint(&bbuf, "{s}/builds", .{rel}) catch continue;
+                kept.offerChildren(io, data_dir, builds);
+            } else if (std.mem.eql(u8, ce.name, "_sched")) {
+                kept.offerSchedRuns(io, data_dir, rel);
             }
         }
     }
+    const n = kept.n;
+    for (out[0..n]) |*s| summarize(io, gpa, data_dir, s, now_s, live_window_s);
     // newest activity first
     std.mem.sort(SwarmSummary, out[0..n], {}, struct {
         fn lt(_: void, a: SwarmSummary, b: SwarmSummary) bool {
@@ -606,14 +611,81 @@ pub fn listSwarms(io: Io, gpa: std.mem.Allocator, data_dir: []const u8, out: []S
     return n;
 }
 
+/// The newest runs a roster walk has met, at most rows.len of them. Once the rows are full, a run takes the
+/// oldest row's place when it is newer and is dropped otherwise, so which runs are kept never depends on the
+/// order the walk meets them in. A row holds only its id and mtime until listSwarms summarizes it.
+const NewestRuns = struct {
+    rows: []SwarmSummary, // never empty (listSwarms returns before walking into no rows)
+    n: usize = 0,
+    oldest: usize = 0, // the oldest row's index, current whenever n == rows.len
+
+    /// Whether data_dir/rel is a run (holds an events.jsonl); a run is kept if it is among the newest met so
+    /// far. A rel longer than a row's id is not listed: clipped, the id would name a different dir.
+    fn offer(k: *NewestRuns, io: Io, data_dir: []const u8, rel: []const u8) bool {
+        if (rel.len > @typeInfo(@FieldType(SwarmSummary, "id")).array.len) return false;
+        var pb: [700]u8 = undefined;
+        const ev_path = std.fmt.bufPrint(&pb, "{s}/{s}/events.jsonl", .{ data_dir, rel }) catch return false;
+        const st = Io.Dir.cwd().statFile(io, ev_path, .{}) catch return false;
+        const mtime_s: i64 = @intCast(@divTrunc(st.mtime.nanoseconds, std.time.ns_per_s));
+        const slot = if (k.n < k.rows.len) k.n else blk: {
+            if (mtime_s <= k.rows[k.oldest].mtime_s) return true; // no newer than any kept run: dropped
+            break :blk k.oldest;
+        };
+        k.rows[slot] = .{ .mtime_s = mtime_s };
+        setBuf(&k.rows[slot].id, &k.rows[slot].id_len, rel);
+        if (k.n < k.rows.len) k.n += 1;
+        if (k.n == k.rows.len) {
+            var o: usize = 0;
+            for (k.rows[1..], 1..) |*r, i| {
+                if (r.mtime_s < k.rows[o].mtime_s) o = i;
+            }
+            k.oldest = o;
+        }
+        return true;
+    }
+
+    /// Offer each child dir of data_dir/parent as a run: the casts under a u<uid>/_chat/builds tree, or a
+    /// scheduled task's u<uid>/_sched/<task>/runs.
+    fn offerChildren(k: *NewestRuns, io: Io, data_dir: []const u8, parent: []const u8) void {
+        var pb: [640]u8 = undefined;
+        const path = std.fmt.bufPrint(&pb, "{s}/{s}", .{ data_dir, parent }) catch return;
+        var d = Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch return;
+        defer d.close(io);
+        var it = d.iterate();
+        while (true) {
+            const e = (it.next(io) catch break) orelse break;
+            if (e.kind != .directory or e.name.len == 0 or e.name[0] == '.') continue;
+            var rb: [96]u8 = undefined;
+            const rel = std.fmt.bufPrint(&rb, "{s}/{s}", .{ parent, e.name }) catch continue;
+            _ = k.offer(io, data_dir, rel);
+        }
+    }
+
+    /// Offer the runs of every scheduled task under data_dir/sched (a u<uid>/_sched dir): each <task>/runs/<stamp>.
+    /// The task definitions beside them (<task>.json) are files, and skipped.
+    fn offerSchedRuns(k: *NewestRuns, io: Io, data_dir: []const u8, sched: []const u8) void {
+        var pb: [640]u8 = undefined;
+        const path = std.fmt.bufPrint(&pb, "{s}/{s}", .{ data_dir, sched }) catch return;
+        var d = Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch return;
+        defer d.close(io);
+        var it = d.iterate();
+        while (true) {
+            const e = (it.next(io) catch break) orelse break;
+            if (e.kind != .directory or e.name.len == 0 or e.name[0] == '.') continue;
+            var rb: [96]u8 = undefined;
+            const runs = std.fmt.bufPrint(&rb, "{s}/{s}/runs", .{ sched, e.name }) catch continue;
+            k.offerChildren(io, data_dir, runs);
+        }
+    }
+};
+
 /// Find ONE run dir by where the server writes it, instead of walking the roster. Every account dir under
 /// `data_dir` ("u" and a user id) is checked for "<account>/<sub>/events.jsonl", once per non-empty `subs` entry: a
 /// path under the account, such as a cast's build tree ("_chat/builds/<conv>", "_sched/<task>/runs/<stamp>") or a
 /// default run dir ("<hexid>"). The newest such events.jsonl wins; its data-dir-relative id (the shape listSwarms
 /// stores) is copied into `out` and returned. "" while no run has started in any of them. chat.zig's cast watcher
-/// resolves its run here: it knows the path under the account but not the account, and listSwarms cannot promise
-/// to reach that path, since it never enters a scheduled run's _sched/ tree and stops at out.len rows taken in
-/// directory order.
+/// resolves its run here: it knows the path under the account but not the account, and a few stats answer that,
+/// where listSwarms weighs every run dir on disk and still keeps only the newest out.len.
 pub fn findRun(io: Io, data_dir: []const u8, subs: []const []const u8, out: []u8) []const u8 {
     log.trace("scan.findRun data_dir={s}", .{data_dir});
     var dir = Io.Dir.cwd().openDir(io, data_dir, .{ .iterate = true }) catch return "";
@@ -649,26 +721,75 @@ fn isAccountDir(name: []const u8) bool {
     return true;
 }
 
-/// If data_dir/rel has an events.jsonl, append a summary for it and return true; else false.
-fn addSwarm(io: Io, gpa: std.mem.Allocator, data_dir: []const u8, rel: []const u8, out: []SwarmSummary, n: *usize, now_s: i64, live_window_s: i64) bool {
-    const ev_path = std.fmt.allocPrint(gpa, "{s}/{s}/events.jsonl", .{ data_dir, rel }) catch return false;
-    defer gpa.free(ev_path);
-    const st = Io.Dir.cwd().statFile(io, ev_path, .{}) catch return false;
-    var s: SwarmSummary = .{};
-    setBuf(&s.id, &s.id_len, rel);
-    // friendly name: swarm.json "swarm", else the last path segment.
-    readSwarmName(io, gpa, data_dir, rel, &s);
+/// How veil-desk deletes a roster run (poller.zig doDelete; the Swarm tab marks a row "deleting..." unless it is
+/// refused): a flat CLI run by removing its own dir, a server run through DELETE /api/v1/swarms/<id> with the id
+/// serverSwarmId names it by, and a run no server id resolves to not at all. A flat row named like an account dir
+/// (a stray events.jsonl directly in u<uid>/) is refused too: removing it would remove the whole account.
+pub const DeleteRoute = union(enum) { local, server: []const u8, refused };
+
+pub fn deleteRoute(rel: []const u8, buf: []u8) DeleteRoute {
+    if (std.mem.indexOfScalar(u8, rel, '/') == null) return if (isAccountDir(rel)) .refused else .local;
+    return if (serverSwarmId(rel, buf)) |id| .{ .server = id } else .refused;
+}
+
+/// The id to delete a roster run by through the server: one Supervisor.resolve maps back to this run dir. The
+/// server writes runs under an account dir only, in three shapes (chat/paths.zig buildRootRel maps a
+/// conversation to the last two):
+///   u<uid>/<hexid>                      a deploy, or a cast fired with no conversation: its spawn id, the basename
+///   u<uid>/_chat/builds/<conv>          a conversation's casts: the conversation, the basename
+///   u<uid>/_sched/<task>/runs/<stamp>   a scheduled run's casts: its conversation, "scheduled_<task>_<stamp>"
+/// A scheduled run is never named by its basename. The stamp is the minute the run started (MMDDHHMM), every task
+/// that ran in that minute has a run dir by that name, and resolve answers a basename with the newest cast among
+/// all of them, so a delete could remove another task's run. The returned id is a slice of `rel` or of `buf`.
+/// null for any other shape, or an id outside the conversation-id charset ([A-Za-z0-9_-], every id the server
+/// mints, and one clean URL path segment).
+pub fn serverSwarmId(rel: []const u8, buf: []u8) ?[]const u8 {
+    var segs: [6][]const u8 = undefined;
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, rel, '/');
+    while (it.next()) |seg| : (n += 1) {
+        if (n == segs.len) return null;
+        segs[n] = seg;
+    }
+    if (n < 2 or !isAccountDir(segs[0])) return null;
+    const id = switch (n) {
+        2 => segs[1],
+        4 => if (std.mem.eql(u8, segs[1], "_chat") and std.mem.eql(u8, segs[2], "builds")) segs[3] else return null,
+        5 => if (std.mem.eql(u8, segs[1], "_sched") and segs[2].len > 0 and std.mem.eql(u8, segs[3], "runs") and isRunStamp(segs[4]))
+            std.fmt.bufPrint(buf, "scheduled_{s}_{s}", .{ segs[2], segs[4] }) catch return null
+        else
+            return null,
+        else => return null,
+    };
+    if (id.len == 0) return null;
+    for (id) |c| {
+        if (!std.ascii.isAlphanumeric(c) and c != '_' and c != '-') return null;
+    }
+    return id;
+}
+
+/// A scheduled run dir's name, as chat/paths.zig schedParts reads a run conversation's stamp: 4 or more digits.
+fn isRunStamp(name: []const u8) bool {
+    if (name.len < 4) return false;
+    for (name) |c| {
+        if (c < '0' or c > '9') return false;
+    }
+    return true;
+}
+
+/// Fill in a row listSwarms kept: its friendly name (swarm.json "swarm", else the last path segment), the latest
+/// score and stopped marker from its events.jsonl tail, whether it is live, and its goal brief.
+fn summarize(io: Io, gpa: std.mem.Allocator, data_dir: []const u8, s: *SwarmSummary, now_s: i64, live_window_s: i64) void {
+    const rel = s.idStr();
+    readSwarmName(io, gpa, data_dir, rel, s);
     if (s.name_len == 0) {
         const base = if (std.mem.lastIndexOfScalar(u8, rel, '/')) |sl| rel[sl + 1 ..] else rel;
         setBuf(&s.name, &s.name_len, base);
     }
-    s.mtime_s = @intCast(@divTrunc(st.mtime.nanoseconds, std.time.ns_per_s));
-    summarizeTail(io, gpa, ev_path, &s);
+    var pb: [700]u8 = undefined;
+    if (std.fmt.bufPrint(&pb, "{s}/{s}/events.jsonl", .{ data_dir, rel })) |ev_path| summarizeTail(io, gpa, ev_path, s) else |_| {}
     s.live = !s.stopped and (now_s - s.mtime_s) <= live_window_s;
-    readGoalBrief(io, gpa, data_dir, rel, &s);
-    out[n.*] = s;
-    n.* += 1;
-    return true;
+    readGoalBrief(io, gpa, data_dir, rel, s);
 }
 
 fn readSwarmName(io: Io, gpa: std.mem.Allocator, data_dir: []const u8, rel: []const u8, s: *SwarmSummary) void {
@@ -680,8 +801,12 @@ fn readSwarmName(io: Io, gpa: std.mem.Allocator, data_dir: []const u8, rel: []co
     if (jsonStr(data, "swarm", &nb)) |nm| setBuf(&s.name, &s.name_len, nm);
 }
 
+/// Test-only cost probe (harness/TESTING.md, "Cost: count it"): the events.jsonl tails summarizeTail has read.
+var tail_probe: u64 = 0;
+
 /// Roster summary: the latest score + stopped marker. Reads only the LAST 64KB of events.jsonl — the
-/// latest score and any "stopped" sit at the end, and this runs for EVERY run dir on disk every second.
+/// latest score and any "stopped" sit at the end, and this runs for every run the roster keeps, every second
+/// while one of them is live.
 fn summarizeTail(io: Io, gpa: std.mem.Allocator, ev_path: []const u8, s: *SwarmSummary) void {
     const CAP: u64 = 64 << 10;
     const st = Io.Dir.cwd().statFile(io, ev_path, .{}) catch return;
@@ -694,6 +819,7 @@ fn summarizeTail(io: Io, gpa: std.mem.Allocator, ev_path: []const u8, s: *SwarmS
     const f = Io.Dir.cwd().openFile(io, ev_path, .{}) catch return;
     defer f.close(io);
     const rn = f.readPositionalAll(io, buf, start) catch return;
+    if (builtin.is_test) tail_probe += 1;
     var data: []const u8 = buf[0..rn];
     if (start > 0) {
         const nl = std.mem.indexOfScalar(u8, data, '\n') orelse return;
@@ -1253,6 +1379,152 @@ fn ageFile(io: Io, path: []const u8, secs: i64) !void {
     defer f.close(io);
     const now = Io.Timestamp.now(io, .real).nanoseconds;
     try f.setTimestamps(io, .{ .modify_timestamp = .{ .new = .{ .nanoseconds = now - @as(i96, secs) * std.time.ns_per_s } } });
+}
+
+/// Write a run under the test data dir `dd`: `rel`/events.jsonl holding `events`, last written `age_s` seconds ago.
+fn writeTestRun(io: Io, dd: []const u8, rel: []const u8, events: []const u8, age_s: i64) !void {
+    var rb: [256]u8 = undefined;
+    const run = try std.fmt.bufPrint(&rb, "{s}/{s}", .{ dd, rel });
+    _ = try Io.Dir.cwd().createDirPathStatus(io, run, .default_dir);
+    var eb: [300]u8 = undefined;
+    const ev_path = try std.fmt.bufPrint(&eb, "{s}/events.jsonl", .{run});
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = ev_path, .data = events });
+    try ageFile(io, ev_path, age_s);
+}
+
+test "the roster lists every hive the server spawns: a scheduled run's cast beside chat casts, deploys and CLI runs" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dd = "zig-scan-roster-tmp";
+    Io.Dir.cwd().deleteTree(io, dd) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dd) catch {};
+    const running = "{\"seq\":1,\"kind\":\"score\",\"round\":2,\"passed\":1,\"total\":2,\"pct\":50}\n";
+    const finished = "{\"seq\":1,\"kind\":\"score\",\"round\":3,\"passed\":2,\"total\":2,\"pct\":100}\n{\"seq\":2,\"kind\":\"stopped\",\"reason\":\"complete\"}\n";
+    // One run in each place a hive runs, newest first, ages ten seconds apart or more so the order is exact. A
+    // scheduled task's cast runs in its run's build root, and two tasks that ran in the same minute share a stamp.
+    const runs = [_]struct { rel: []const u8, age_s: i64, events: []const u8 }{
+        .{ .rel = "u1/_sched/news-0715174857/runs/07151753", .age_s = 10, .events = running },
+        .{ .rel = "u1/_sched/digest-0715174901/runs/07151753", .age_s = 20, .events = finished },
+        .{ .rel = "u7/_sched/weekly-0717120000/runs/07171200", .age_s = 30, .events = running },
+        .{ .rel = "u1/_chat/builds/c6a57f852", .age_s = 40, .events = running },
+        .{ .rel = "u1/0123456789abcdef", .age_s = 300, .events = finished },
+        .{ .rel = "cli-run", .age_s = 600, .events = finished },
+    };
+    for (runs) |r| try writeTestRun(io, dd, r.rel, r.events, r.age_s);
+    // Trees that hold no run: a scheduled run and a chat that never cast, and a task's definition beside its runs.
+    _ = try Io.Dir.cwd().createDirPathStatus(io, dd ++ "/u1/_sched/news-0715174857/runs/07151800/work", .default_dir);
+    _ = try Io.Dir.cwd().createDirPathStatus(io, dd ++ "/u1/_chat/builds/c6a57f853/work", .default_dir);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = dd ++ "/u1/_sched/news-0715174857.json", .data = "{\"id\":\"news-0715174857\"}" });
+    const news = dd ++ "/u1/_sched/news-0715174857/runs/07151753";
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = news ++ "/swarm.json", .data = "{\"swarm\":\"cast-news\"}" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = news ++ "/.goal_brief", .data = "brief the morning news\n" });
+
+    var out: [MAX_SWARMS]SwarmSummary = undefined;
+    const n = listSwarms(io, std.testing.allocator, dd, &out, Io.Timestamp.now(io, .real).toSeconds(), 45);
+    errdefer for (out[0..n]) |*s| std.debug.print("  listed {s}\n", .{s.idStr()});
+    try std.testing.expectEqual(runs.len, n);
+    for (runs, out[0..n]) |r, *s| try std.testing.expectEqualStrings(r.rel, s.idStr());
+    // A scheduled cast's row reads like any other: name, score, liveness, goal.
+    try std.testing.expectEqualStrings("cast-news", out[0].nameStr());
+    try std.testing.expectEqualStrings("brief the morning news", out[0].goalStr());
+    try std.testing.expectEqual(@as(i64, 2), out[0].round);
+    try std.testing.expectEqual(@as(i32, 50), out[0].pct);
+    try std.testing.expect(out[0].live and !out[0].stopped);
+    try std.testing.expect(out[1].stopped and !out[1].live);
+    try std.testing.expectEqualStrings("07151753", out[1].nameStr()); // no swarm.json: the run dir's name
+}
+
+test "the roster keeps the newest runs whatever order the directories list in, and reads no dropped run's tail" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dd = "zig-scan-roster-cap-tmp";
+    Io.Dir.cwd().deleteTree(io, dd) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dd) catch {};
+    const ev = "{\"seq\":1,\"kind\":\"act\",\"tool\":\"observe\"}\n";
+    // MAX_SWARMS deploys, every one older than a chat cast and a scheduled cast. NTFS lists a dir in upcased name
+    // order, and a hex name sorts before "_chat" and "_sched" ('_' is 0x5F, past the digits and A-F), so a walk that
+    // stopped at MAX_SWARMS rows in directory order filled them all with deploys and dropped both casts. The deploys'
+    // ages are two seconds apart, so no two share a second however the clock ticks between writes.
+    var hb: [40]u8 = undefined;
+    for (0..MAX_SWARMS) |i| {
+        try writeTestRun(io, dd, try std.fmt.bufPrint(&hb, "u1/{x:0>16}", .{i}), ev, 3600 + 2 * @as(i64, @intCast(i)));
+    }
+    try writeTestRun(io, dd, "u1/_chat/builds/c6a57f852", ev, 120);
+    try writeTestRun(io, dd, "u1/_sched/news-0715174857/runs/07151753", ev, 60);
+
+    var out: [MAX_SWARMS]SwarmSummary = undefined;
+    const tails_before = tail_probe;
+    const n = listSwarms(io, std.testing.allocator, dd, &out, Io.Timestamp.now(io, .real).toSeconds(), 45);
+    const tails_read = tail_probe - tails_before;
+    errdefer for (out[0..n]) |*s| std.debug.print("  kept {s} mtime={d}\n", .{ s.idStr(), s.mtime_s });
+    try std.testing.expectEqual(@as(usize, MAX_SWARMS), n);
+    try std.testing.expectEqualStrings("u1/_sched/news-0715174857/runs/07151753", out[0].idStr());
+    try std.testing.expectEqualStrings("u1/_chat/builds/c6a57f852", out[1].idStr());
+    // the deploys fill the other rows newest first, down to the third oldest: the two oldest are the runs dropped
+    for (out[2..n], 0..) |*s, i| {
+        try std.testing.expectEqualStrings(try std.fmt.bufPrint(&hb, "u1/{x:0>16}", .{i}), s.idStr());
+    }
+    // Cost, counted: each of the MAX_SWARMS + 2 runs is weighed by a stat, and only the rows kept have their tails
+    // read. Summarizing every run the walk meets would read MAX_SWARMS + 2.
+    try std.testing.expectEqual(@as(u64, MAX_SWARMS), tails_read);
+}
+
+test "a roster run is deleted by an id the server maps back to its own run dir, never a scheduled run's shared stamp" {
+    var ib: [96]u8 = undefined;
+    // Every shape of run dir the server writes, and the id Supervisor.resolve finds it by.
+    const server_runs = [_]struct { rel: []const u8, id: []const u8 }{
+        .{ .rel = "u1/0123456789abcdef", .id = "0123456789abcdef" }, // a deploy: its spawn id
+        .{ .rel = "u1/_chat/builds/c6a57f852", .id = "c6a57f852" }, // a conversation's casts: the conversation
+        // Two tasks that ran in the same minute: one stamp, two run dirs. resolve would answer the stamp with either.
+        .{ .rel = "u1/_sched/news-0715174857/runs/07151753", .id = "scheduled_news-0715174857_07151753" },
+        .{ .rel = "u1/_sched/digest-0715174901/runs/07151753", .id = "scheduled_digest-0715174901_07151753" },
+        .{ .rel = "u12/_sched/t/runs/07171200", .id = "scheduled_t_07171200" },
+    };
+    for (server_runs) |r| {
+        const route = deleteRoute(r.rel, &ib);
+        errdefer std.debug.print("  {s} routed {t} {s}\n", .{ r.rel, route, if (route == .server) route.server else "" });
+        try std.testing.expect(route == .server);
+        try std.testing.expectEqualStrings(r.id, route.server);
+    }
+    // A flat CLI run is removed where it lies: no server ever tracked it.
+    try std.testing.expect(deleteRoute("cli-run", &ib) == .local);
+    // A run no server id resolves to is refused, never sent under a name that could reach some other run dir.
+    for ([_][]const u8{
+        "u1", // an account dir holding a stray events.jsonl: removing it "as a CLI run" would remove the account
+        "proj/run1", // outside an account dir, where the server never writes
+        "u1/_sched/news-0715174857/runs/0715x753", // not a stamp
+        "u1/_sched/news-0715174857/runs/753", // too short to be one
+        "u1/_sched//runs/07151753", // no task
+        "u1/_sched/news-0715174857/07151753", // not under runs/
+        "u1/_chat/c6a57f852", // not a build tree
+        "u1/_chat/builds/c6a57f852/work", // inside a run dir
+        "u1/_chat/builds/c6a57f852 (copy)", // not a conversation id, nor one URL path segment
+    }) |rel| {
+        errdefer std.debug.print("  {s} was not refused\n", .{rel});
+        try std.testing.expect(deleteRoute(rel, &ib) == .refused);
+    }
+
+    // Two derivations of one run dir must meet. castSwarm spawns a conversation's casts in {data}/{buildRootRel(uid,
+    // conv)}, computed by the server's own chat/paths.zig (wired into the desk TEST build only); the id the desk deletes
+    // that dir by must map back to the same dir.
+    const cpaths = @import("chatpaths");
+    for ([_][]const u8{
+        "c6a57f852",
+        "c6a57f852__s2", // a sub-chat casts in its primary's tree
+        "scheduled_news-0715174857_07151753",
+        "scheduled_news-0715174857_07151753__s1", // a scheduled run's sub-chat: both redirects at once
+        "scheduled_digest-0715174901_07151753", // another task, the same minute
+        "scheduled_notes", // hand-named with no stamp: an ordinary conversation
+    }) |conv| {
+        var rb: [128]u8 = undefined;
+        const rel = cpaths.buildRootRel(&rb, 7, conv);
+        const id = serverSwarmId(rel, &ib) orelse "";
+        errdefer std.debug.print("  conv {s} casts in {s}, deleted as \"{s}\"\n", .{ conv, rel, id });
+        var back: [128]u8 = undefined;
+        try std.testing.expectEqualStrings(rel, cpaths.buildRootRel(&back, 7, id));
+    }
 }
 
 test "parseEv surfaces act args, tick traces, and board/phase detail" {

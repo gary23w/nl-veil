@@ -425,50 +425,6 @@ const Ui = struct {
 
 var ui: Ui = .{};
 
-// UI-thread-only optimistic "deleting…" set: when the user clicks ✕ the row shows "deleting…" until the
-// poller's delete lands and the swarm drops out of the roster.
-var del_ids: [16][96]u8 = undefined;
-var del_lens: [16]u8 = [_]u8{0} ** 16;
-var del_n: usize = 0;
-fn markDeleting(id: []const u8) void {
-    if (isDeleting(id) or del_n >= del_ids.len) return;
-    const nn = @min(id.len, del_ids[del_n].len);
-    @memcpy(del_ids[del_n][0..nn], id[0..nn]);
-    del_lens[del_n] = @intCast(nn);
-    del_n += 1;
-}
-fn isDeleting(id: []const u8) bool {
-    var i: usize = 0;
-    while (i < del_n) : (i += 1) {
-        if (std.mem.eql(u8, del_ids[i][0..del_lens[i]], id)) return true;
-    }
-    return false;
-}
-/// Drop del-set entries whose swarm no longer appears in the roster — the delete finished.
-fn pruneDeleting(rows: []const scan.SwarmSummary) void {
-    var i: usize = 0;
-    while (i < del_n) {
-        const id = del_ids[i][0..del_lens[i]];
-        var present = false;
-        for (rows) |*sw| {
-            if (std.mem.eql(u8, sw.idStr(), id)) {
-                present = true;
-                break;
-            }
-        }
-        if (present) {
-            i += 1;
-        } else {
-            // swap-remove
-            del_n -= 1;
-            if (i != del_n) {
-                del_ids[i] = del_ids[del_n];
-                del_lens[i] = del_lens[del_n];
-            }
-        }
-    }
-}
-
 /// Entry point for the STANDALONE veil-desk binary (`cd desk && zig build`), kept for development: run the
 /// dashboard on its own against an already-running server. The shipped app does NOT come through here — the
 /// GUI is compiled into `veil` and src/main.zig calls runApp directly (see below).
@@ -1538,10 +1494,10 @@ fn setDataDir(store: *Store, dd: []const u8) void {
 fn autoSelect(store: *Store) bool {
     store.lock();
     const have = store.swarm_count > 0;
-    var id: [64]u8 = undefined;
+    var id: [96]u8 = undefined; // = scan.SwarmSummary.id capacity; a [64] here panicked on a wider roster id
     var idn: usize = 0;
     if (have and store.selected_len == 0) {
-        idn = store.swarms[0].id_len;
+        idn = @min(store.swarms[0].id_len, id.len);
         @memcpy(id[0..idn], store.swarms[0].id[0..idn]);
     }
     store.unlock();
@@ -2234,10 +2190,10 @@ fn drawRoster(store: *Store, r: t.Rect) void {
     const sel_n = store.selected_len;
     @memcpy(sel[0..sel_n], store.selected[0..sel_n]);
     const scanned = store.last_refresh_s > 0; // has the poller completed its first pass?
+    // The rows' "deleting..." marks, as of these rows: the poller ends a mark when its delete fails, and ends a
+    // landed one in the same publish that drops its row (store_mod.Deleting), so the copy never shows it early.
+    const dels = store.deleting;
     store.unlock();
-
-    // drop any "deleting…" ids that are no longer in the roster (the delete landed)
-    pruneDeleting(rows[0..n]);
 
     const row_h: f32 = 50;
     var yy: f32 = r.y + 6;
@@ -2246,7 +2202,7 @@ fn drawRoster(store: *Store, r: t.Rect) void {
         const sw = &rows[idx];
         const rr = t.Rect{ .x = r.x + 6, .y = yy, .width = r.width - 12, .height = row_h - 6 };
         const is_sel = std.mem.eql(u8, sw.idStr(), sel[0..sel_n]);
-        const deleting = isDeleting(sw.idStr());
+        const deleting = dels.has(sw.idStr());
         const hot = t.hovering(rr) and !deleting;
         if (is_sel) t.panel(rr, t.bg_sel) else if (hot) t.panel(rr, t.bg_hl);
         t.statusDot(@intFromFloat(rr.x + 14), @intFromFloat(rr.y + rr.height / 2), if (deleting) t.red else if (sw.live) t.green else if (sw.stopped) t.comment else t.yellow);
@@ -2262,8 +2218,10 @@ fn drawRoster(store: *Store, r: t.Rect) void {
             t.text(t.z("deleting...", .{}), @intFromFloat(rr.x + rr.width - 92), @intFromFloat(rr.y + 26), 11, t.red);
         } else {
             if (hot and t.buttonGhost(xb, t.z("x", .{}), t.red, true)) {
-                markDeleting(sw.idStr());
-                store.pushCmd(store_mod.mkCmd(.delete, sw.idStr(), ""));
+                // A refused delete never leaves: its row stays selectable (Stop still reaches the hive), and the
+                // poller's notice says why. Any other marks its row "deleting..." until the poller ends the mark.
+                var rb: [96]u8 = undefined;
+                store.pushDelete(sw.idStr(), scan.deleteRoute(sw.idStr(), &rb) != .refused);
             }
             const pct = sw.pct;
             const rt = if (pct >= 0) t.z("r{d}  {d}%", .{ sw.round, pct }) else t.z("r{d}", .{sw.round});
@@ -9108,4 +9066,30 @@ test "silentNotice: the whole line renders in the real buffers, and nothing repl
     // the widest silence a heartbeat can produce still fits, digits and all
     const wide = silentNotice(&status, SILENT_CHAT_FMT, std.math.maxInt(i64), 1).?;
     try std.testing.expect(std.mem.endsWith(u8, wide, "s - restart the desk"));
+}
+
+test "autoSelect hands the poller the newest run's whole id, even one wider than 64 bytes" {
+    // The bug this pins: autoSelect copied swarms[0].id into a [64]u8, but a roster id fills up to
+    // scan.SwarmSummary.id's 96 bytes (a chat cast's "u<uid>/_chat/builds/<conv>" carries a server conv
+    // id of up to 64). The desk ships ReleaseSafe, so a wider id leading the roster with nothing selected
+    // was a bounds panic on the render thread, under the store lock, on the first frame it appeared.
+    const gpa = std.testing.allocator;
+    const s = try gpa.create(Store); // Store is far too big for a test stack frame
+    defer gpa.destroy(s);
+    s.* = .{};
+    // The widest id the roster can hold, sized from the field itself rather than a remembered 96.
+    const row = &s.swarms[0];
+    row.* = .{};
+    const prefix = "u1/_chat/builds/";
+    @memcpy(row.id[0..prefix.len], prefix);
+    @memset(row.id[prefix.len..], 'c');
+    row.id_len = @intCast(row.id.len);
+    s.swarm_count = 1;
+    try std.testing.expect(row.idStr().len > 64);
+
+    try std.testing.expect(autoSelect(s));
+    const cmd = s.popCmd() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(store_mod.CmdKind.select, cmd.kind);
+    try std.testing.expectEqualStrings(row.idStr(), cmd.idStr()); // whole, not cut at 64
+    try std.testing.expect(s.popCmd() == null); // one call, one select
 }

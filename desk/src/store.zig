@@ -40,6 +40,196 @@ pub const Command = struct {
     }
 };
 
+/// The roster rows showing "deleting...": one mark per run whose ✕ queued a delete (Store.deleting). The UI thread
+/// marks a run in the same lock that queues its delete (Store.pushDelete), and only the poller ends a mark. A delete
+/// that does not land (server unreachable, unauthorized, not tracking the run, a local remove that failed, refused)
+/// ends it at once, so the row is back and clickable on the next frame. A delete that landed keeps it until the first
+/// roster walk after it (walked), which publishes the roster without the row in the same lock, so a deleted row
+/// never shows again without its mark. A delete still waiting in the command ring keeps its mark whatever the roster
+/// shows. The marks were once the UI's own and only a roster without the row ended one, so a failed delete left its
+/// row "deleting..." and unclickable until the desk restarted.
+pub const Deleting = struct {
+    // One slot per roster row: the old UI-side set held 16, and the 17th ✕ went unmarked.
+    ids: [scan.MAX_SWARMS][96]u8 = undefined, // 96 = scan.SwarmSummary.id = Command.id
+    lens: [scan.MAX_SWARMS]u8 = [_]u8{0} ** scan.MAX_SWARMS,
+    landed: [scan.MAX_SWARMS]bool = [_]bool{false} ** scan.MAX_SWARMS,
+    n: usize = 0,
+
+    /// What a walk found of the runs whose delete had landed: how many it still listed (the delete answered, but the
+    /// run is still on disk), and the first one's id.
+    pub const Leftover = struct {
+        n: usize = 0,
+        id: [96]u8 = undefined,
+        id_len: u8 = 0,
+
+        pub fn idStr(l: *const Leftover) []const u8 {
+            return l.id[0..l.id_len];
+        }
+    };
+
+    pub fn has(d: *const Deleting, id: []const u8) bool {
+        return d.find(id) != null;
+    }
+
+    fn find(d: *const Deleting, id: []const u8) ?usize {
+        for (0..d.n) |i| {
+            if (std.mem.eql(u8, d.ids[i][0..d.lens[i]], id)) return i;
+        }
+        return null;
+    }
+
+    /// Mark `id`. false when it is already marked, every slot is taken, or it is empty or wider than a roster id (a
+    /// clipped mark would never match its row).
+    pub fn mark(d: *Deleting, id: []const u8) bool {
+        if (id.len == 0 or id.len > d.ids[0].len or d.n == d.ids.len or d.find(id) != null) return false;
+        @memcpy(d.ids[d.n][0..id.len], id);
+        d.lens[d.n] = @intCast(id.len);
+        d.landed[d.n] = false;
+        d.n += 1;
+        return true;
+    }
+
+    /// The delete of `id` returned: a landing keeps the mark for the next walk, anything else ends it now.
+    pub fn done(d: *Deleting, id: []const u8, landed: bool) void {
+        const i = d.find(id) orelse return;
+        if (landed) d.landed[i] = true else d.remove(i);
+    }
+
+    /// A roster walk is being published as `rows`: end the mark of every delete that landed before it. A mark whose
+    /// delete has not returned stays, whether or not the walk listed its row.
+    pub fn walked(d: *Deleting, rows: []const scan.SwarmSummary) Leftover {
+        var left: Leftover = .{};
+        var i: usize = 0;
+        while (i < d.n) {
+            if (!d.landed[i]) {
+                i += 1;
+                continue;
+            }
+            const id = d.ids[i][0..d.lens[i]];
+            for (rows) |*r| {
+                if (!std.mem.eql(u8, r.idStr(), id)) continue;
+                if (left.n == 0) {
+                    @memcpy(left.id[0..id.len], id);
+                    left.id_len = d.lens[i];
+                }
+                left.n += 1;
+                break;
+            }
+            d.remove(i); // slot i now holds the last mark, which the loop checks next
+        }
+        return left;
+    }
+
+    fn remove(d: *Deleting, i: usize) void {
+        d.n -= 1;
+        if (i == d.n) return;
+        d.ids[i] = d.ids[d.n];
+        d.lens[i] = d.lens[d.n];
+        d.landed[i] = d.landed[d.n];
+    }
+};
+
+fn testRow(id: []const u8) scan.SwarmSummary {
+    var r: scan.SwarmSummary = .{};
+    @memcpy(r.id[0..id.len], id);
+    r.id_len = @intCast(id.len);
+    return r;
+}
+
+test "a deleting mark ends when its delete fails, or at the first walk after it lands, and never while it is queued" {
+    var d: Deleting = .{};
+    try std.testing.expect(d.mark("u1/aaaa"));
+    try std.testing.expect(d.mark("u1/bbbb"));
+    try std.testing.expect(d.mark("cli-run"));
+    try std.testing.expect(d.mark("u1/_chat/builds/c1"));
+
+    // A delete that failed hands its row back at once, with no walk in between.
+    d.done("u1/aaaa", false);
+    try std.testing.expect(!d.has("u1/aaaa"));
+    try std.testing.expect(d.has("u1/bbbb") and d.has("cli-run") and d.has("u1/_chat/builds/c1"));
+
+    // A delete that landed keeps its mark while the published roster still lists its row: no flash of the normal row.
+    d.done("cli-run", true);
+    d.done("u1/_chat/builds/c1", true);
+    try std.testing.expect(d.has("cli-run") and d.has("u1/_chat/builds/c1"));
+
+    // The walk after the landings. It no longer lists cli-run, but still lists the chat cast (answered, still on
+    // disk), and it lost u1/bbbb's row, whose delete is still queued.
+    const rows = [_]scan.SwarmSummary{ testRow("u1/_chat/builds/c1"), testRow("u1/cccc") };
+    const left = d.walked(&rows);
+    try std.testing.expect(!d.has("cli-run"));
+    try std.testing.expect(!d.has("u1/_chat/builds/c1"));
+    try std.testing.expect(d.has("u1/bbbb")); // a queued delete keeps its mark whatever the roster shows
+    try std.testing.expectEqual(@as(usize, 1), d.n);
+    try std.testing.expectEqual(@as(usize, 1), left.n);
+    try std.testing.expectEqualStrings("u1/_chat/builds/c1", left.idStr());
+
+    // A walk with nothing landed ends nothing. A report for a run that has no mark (a refused delete) changes nothing.
+    try std.testing.expectEqual(@as(usize, 0), d.walked(&rows).n);
+    d.done("proj/run1", false);
+    d.done("proj/run1", true);
+    try std.testing.expect(d.has("u1/bbbb"));
+    try std.testing.expectEqual(@as(usize, 1), d.n);
+
+    // Its delete lands; a walk that lists nothing (a data dir that would not open) still ends the mark.
+    d.done("u1/bbbb", true);
+    try std.testing.expectEqual(@as(usize, 0), d.walked(&.{}).n);
+    try std.testing.expectEqual(@as(usize, 0), d.n);
+}
+
+test "every roster row can be marked deleting, and a mark that could never match its row is refused" {
+    var d: Deleting = .{};
+    var nb: [16]u8 = undefined;
+    for (0..scan.MAX_SWARMS) |i| {
+        try std.testing.expect(d.mark(try std.fmt.bufPrint(&nb, "u1/{x:0>8}", .{i})));
+    }
+    try std.testing.expect(d.has("u1/00000000") and d.has(try std.fmt.bufPrint(&nb, "u1/{x:0>8}", .{scan.MAX_SWARMS - 1})));
+    try std.testing.expect(!d.mark("u1/one-more")); // every slot is taken
+    d.done("u1/00000005", false);
+    try std.testing.expect(d.mark("u1/one-more")); // and a failed delete's slot is free again
+    try std.testing.expect(d.has("u1/00000006")); // the swap-remove kept its neighbours
+    try std.testing.expect(!d.mark("u1/one-more")); // already marked
+
+    var e: Deleting = .{};
+    const widest = "u1/_chat/builds/" ++ ("c" ** 80); // a roster id fills all 96 bytes
+    try std.testing.expectEqual(@as(usize, 96), widest.len);
+    try std.testing.expect(e.mark(widest));
+    try std.testing.expect(e.has(widest));
+    try std.testing.expect(!e.mark(widest ++ "c")); // 97 bytes: no row has that id, and clipped it would name another run
+    try std.testing.expect(!e.mark(""));
+}
+
+test "a delete's mark and its command enter the Store together, or neither does" {
+    const gpa = std.testing.allocator;
+    const s = try gpa.create(Store); // Store is far too big for a test stack frame
+    defer gpa.destroy(s);
+    s.* = .{};
+
+    // A full ring drops the command, so the mark must not go in: nothing would ever end it.
+    for (0..CMD_RING - 1) |_| s.pushCmd(mkCmd(.refresh_now, "", ""));
+    s.pushDelete("u1/aaaa", true);
+    try std.testing.expect(!s.deleting.has("u1/aaaa"));
+
+    // Room for one: the command and its mark go in together.
+    _ = s.popCmd().?;
+    s.pushDelete("u1/aaaa", true);
+    try std.testing.expect(s.deleting.has("u1/aaaa"));
+    var last: ?Command = null;
+    while (s.popCmd()) |c| last = c;
+    try std.testing.expectEqual(CmdKind.delete, last.?.kind);
+    try std.testing.expectEqualStrings("u1/aaaa", last.?.idStr());
+
+    // A refused route is queued (its notice comes from the poller) but never marked.
+    s.pushDelete("proj/run1", false);
+    try std.testing.expect(!s.deleting.has("proj/run1"));
+    try std.testing.expectEqualStrings("proj/run1", s.popCmd().?.idStr());
+
+    // A mark that cannot go in queues no delete either.
+    s.pushDelete("u1/aaaa", true); // already marked
+    try std.testing.expect(s.popCmd() == null);
+    try std.testing.expectEqual(@as(usize, 1), s.deleting.n);
+}
+
 /// A poller→UI notification. Shown as an in-app toast AND handed to the OS tray (tray.zig).
 pub const Notif = struct {
     title: [64]u8 = [_]u8{0} ** 64,
@@ -722,6 +912,7 @@ pub const Store = struct {
     // --- roster (poller writes) ---
     swarms: [scan.MAX_SWARMS]scan.SwarmSummary = undefined,
     swarm_count: usize = 0,
+    deleting: Deleting = .{}, // rows showing "deleting...": the UI marks one with its delete, the poller ends it
 
     // --- selected swarm detail (poller writes when selection set) ---
     selected: [96]u8 = [_]u8{0} ** 96,
@@ -988,12 +1179,40 @@ pub const Store = struct {
         log.trace("store.pushCmd kind={t} id={s}", .{ c.kind, c.idStr() });
         s.lock();
         defer s.unlock();
+        _ = s.pushCmdLocked(c);
+    }
+
+    fn pushCmdLocked(s: *Store, c: Command) bool {
         if ((s.cmd_head + 1) % CMD_RING == s.cmd_tail) {
             log.trace("store.pushCmd DROPPED (ring full)", .{});
-            return;
+            return false;
         }
         s.cmds[s.cmd_head] = c;
         s.cmd_head = (s.cmd_head + 1) % CMD_RING;
+        return true;
+    }
+
+    /// UI thread: queue a delete of roster run `id`, and when `mark`, mark its row "deleting..." (Deleting). The mark
+    /// and the command go in under one lock or neither does: a mark whose command a full ring dropped would never end.
+    pub fn pushDelete(s: *Store, id: []const u8, mark: bool) void {
+        log.trace("store.pushDelete id={s} mark={}", .{ id, mark });
+        const c = mkCmd(.delete, id, "");
+        s.lock();
+        defer s.unlock();
+        if (mark and !s.deleting.mark(id)) {
+            log.trace("store.pushDelete DROPPED (unmarkable)", .{});
+            return;
+        }
+        if (!s.pushCmdLocked(c) and mark) s.deleting.done(id, false);
+    }
+
+    /// Poller thread: the delete of `id` returned, and `landed` says whether it removed the run. Ends the row's mark
+    /// unless it landed; the next roster walk ends a landed one (Deleting).
+    pub fn deleteDone(s: *Store, id: []const u8, landed: bool) void {
+        log.trace("store.deleteDone id={s} landed={}", .{ id, landed });
+        s.lock();
+        defer s.unlock();
+        s.deleting.done(id, landed);
     }
 
     /// Poller thread: pop the next command, or null. Caller must hold no lock (this takes it).
