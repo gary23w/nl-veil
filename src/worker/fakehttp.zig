@@ -5,9 +5,10 @@
 //! the primitive already existed, it just could not be reached. Shared rather than copied on
 //! purpose -- a second copy of a nine-line escaper is what ledger 0055 spent an entry undoing.
 //!
-//! Callers: config/local_models.zig (the Ollama probe), worker/llm.zig (the gateway call),
-//! worker/modelpull.zig (the weights download), and config/cf_tunnel.zig + config/cf_r2.zig, which
-//! start it ROUTED (`startRouted`) because one Cloudflare flow is many different calls.
+//! Callers: config/local_models.zig (the Ollama probe), worker/llm.zig (the gateway call, and the curl calls
+//! whose scratch dir it inspects mid-call through `startWatched`), worker/modelpull.zig (the weights download),
+//! and config/cf_tunnel.zig + config/cf_r2.zig, which start it ROUTED (`startRouted`) because one Cloudflare
+//! flow is many different calls.
 //!
 //! PORT 0, NOT A SCAN. `start` used to walk 47431 upward until a listen failed to fail - and on Windows it
 //! never fails: Zig 0.16 binds through AFD with BIND_INFO.Mode = .Passive, AFD's address-REUSE share type,
@@ -24,6 +25,10 @@ const builtin = @import("builtin");
 /// target contains `path`. `times` > 0 retires the route after that many answers, so "fails once, then
 /// succeeds" is two routes in that order; 0 answers for as long as the server runs.
 pub const Route = struct { method: []const u8, path: []const u8, reply: []const u8, times: u32 = 0 };
+
+/// TEST ONLY. Runs on the serve thread for each request once it has arrived whole, before its reply goes out
+/// (`startWatched`): the client is connected and waiting, so a test sees the world as it is mid-call.
+pub const OnRequest = *const fn () void;
 
 const MAX_ROUTES = 16;
 const MAX_CALLS = 32;
@@ -57,26 +62,35 @@ pub const Server = struct {
     calls: [MAX_CALLS][CALL_LEN]u8 = undefined,
     call_lens: [MAX_CALLS]usize = undefined,
     call_count: usize = 0,
+    /// `startWatched` only (null otherwise).
+    on_request: ?OnRequest = null,
 
     /// Starts in place: the serve thread holds a pointer to this struct, so it must not be copied. A fixed
     /// `port` is NOT exclusive on Windows (see the file header); port 0 takes one the OS assigns.
     pub fn startAt(self: *Server, io: std.Io, port: u16, reply: []const u8) !void {
-        return self.listenAt(io, port, reply, &.{});
+        return self.listenAt(io, port, reply, &.{}, null);
     }
 
     /// Starts on a private OS-assigned loopback port, read back into `port`.
     pub fn start(self: *Server, io: std.Io, reply: []const u8) !void {
-        self.listenAt(io, 0, reply, &.{}) catch return error.SkipZigTest; // no loopback listener on this box
+        self.listenAt(io, 0, reply, &.{}, null) catch return error.SkipZigTest; // no loopback listener on this box
     }
 
     /// Like `start`, but each request gets the reply of the first `routes` entry that matches it and has
     /// uses left (see Route); a request none matches gets `fallback`. `routes` must outlive the server.
     pub fn startRouted(self: *Server, io: std.Io, routes: []const Route, fallback: []const u8) !void {
         if (routes.len > MAX_ROUTES) return error.TooManyRoutes;
-        self.listenAt(io, 0, fallback, routes) catch return error.SkipZigTest;
+        self.listenAt(io, 0, fallback, routes, null) catch return error.SkipZigTest;
     }
 
-    fn listenAt(self: *Server, io: std.Io, port: u16, reply: []const u8, routes: []const Route) !void {
+    /// Like `startRouted` (empty `routes`: every request gets `fallback`), and `on_request` runs for each request
+    /// between its arrival and its reply (see OnRequest).
+    pub fn startWatched(self: *Server, io: std.Io, routes: []const Route, fallback: []const u8, on_request: OnRequest) !void {
+        if (routes.len > MAX_ROUTES) return error.TooManyRoutes;
+        self.listenAt(io, 0, fallback, routes, on_request) catch return error.SkipZigTest;
+    }
+
+    fn listenAt(self: *Server, io: std.Io, port: u16, reply: []const u8, routes: []const Route, on_request: ?OnRequest) !void {
         const addr = std.Io.net.IpAddress{ .ip4 = .loopback(port) };
         self.server = try std.Io.net.IpAddress.listen(&addr, io, .{ .mode = .stream, .protocol = .tcp });
         self.io = io;
@@ -93,6 +107,7 @@ pub const Server = struct {
         self.routes = routes;
         self.used = @splat(0);
         self.call_count = 0;
+        self.on_request = on_request;
         self.thread = std.Thread.spawn(.{}, serve, .{self}) catch |e| {
             self.server.deinit(io);
             return e;
@@ -144,6 +159,7 @@ pub const Server = struct {
                 self.call_lens[self.call_count] = call.len;
                 self.call_count += 1;
             }
+            if (self.on_request) |f| f();
             var wbuf: [8 << 10]u8 = undefined;
             var wr = conn.writer(self.io, &wbuf);
             wr.interface.writeAll(self.pick(call)) catch {};
