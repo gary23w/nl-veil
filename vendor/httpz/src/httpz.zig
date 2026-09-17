@@ -373,7 +373,17 @@ pub fn Server(comptime H: type) type {
                 try posix.setsockopt(listener, posix.IPPROTO.TCP, 1, &std.mem.toBytes(@as(c_int, 1)));
             }
 
-            try posix.setsockopt(listener, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
+            if (builtin.os.tag == .windows and !is_unix_socket) {
+                // Not SO_REUSEADDR on Windows: there it lets a second socket bind a port this listener already
+                // holds, and that listen succeeds. A second server then comes up on the same port with no error
+                // while Windows hands every connection to one of the two. SO_EXCLUSIVEADDRUSE makes the second
+                // bind fail with AddressInUse, or AccessDenied when this listener holds 0.0.0.0 and the other asks
+                // for one address. Restarts do not need SO_REUSEADDR on Windows: measured on Windows 11, an
+                // exclusive listener rebinds at once past TIME_WAIT connections and after a killed process.
+                try posix.setsockopt(listener, posix.SOL.SOCKET, posix.SO_EXCLUSIVEADDRUSE, &std.mem.toBytes(@as(c_int, 1)));
+            } else {
+                try posix.setsockopt(listener, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
+            }
 
             if (is_unix_socket == false and self._workers.len > 1) {
                 if (@hasDecl(posix.SO, "REUSEPORT_LB")) {
