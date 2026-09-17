@@ -1,6 +1,7 @@
 //! scan.zig — the filesystem data layer. veil-desk reads the veil server's run dirs under <home>/data
 //! directly (no HTTP/auth): each swarm is a subdir with events.jsonl, .goal_brief, .blueprint, and
-//! control.jsonl (the operator bus). Runs on the POLLER thread only; publishes into the mutex-guarded
+//! control.jsonl (the operator bus). Runs on the POLLER thread, and on the chat thread for the one run
+//! chat.zig's cast watcher follows (findRun, writeStop, writeControl); publishes into the mutex-guarded
 //! Store. The UI thread never touches io.
 
 const std = @import("std");
@@ -605,6 +606,49 @@ pub fn listSwarms(io: Io, gpa: std.mem.Allocator, data_dir: []const u8, out: []S
     return n;
 }
 
+/// Find ONE run dir by where the server writes it, instead of walking the roster. Every account dir under
+/// `data_dir` ("u" and a user id) is checked for "<account>/<sub>/events.jsonl", once per non-empty `subs` entry: a
+/// path under the account, such as a cast's build tree ("_chat/builds/<conv>", "_sched/<task>/runs/<stamp>") or a
+/// default run dir ("<hexid>"). The newest such events.jsonl wins; its data-dir-relative id (the shape listSwarms
+/// stores) is copied into `out` and returned. "" while no run has started in any of them. chat.zig's cast watcher
+/// resolves its run here: it knows the path under the account but not the account, and listSwarms cannot promise
+/// to reach that path, since it never enters a scheduled run's _sched/ tree and stops at out.len rows taken in
+/// directory order.
+pub fn findRun(io: Io, data_dir: []const u8, subs: []const []const u8, out: []u8) []const u8 {
+    log.trace("scan.findRun data_dir={s}", .{data_dir});
+    var dir = Io.Dir.cwd().openDir(io, data_dir, .{ .iterate = true }) catch return "";
+    defer dir.close(io);
+    var it = dir.iterate();
+    var found: usize = 0;
+    var newest: i96 = 0;
+    while (true) {
+        const entry = (it.next(io) catch break) orelse break;
+        if (entry.kind != .directory or !isAccountDir(entry.name)) continue;
+        for (subs) |sub| {
+            if (sub.len == 0) continue;
+            var pb: [700]u8 = undefined;
+            const ev_path = std.fmt.bufPrint(&pb, "{s}/{s}/{s}/events.jsonl", .{ data_dir, entry.name, sub }) catch continue;
+            const st = Io.Dir.cwd().statFile(io, ev_path, .{}) catch continue;
+            if (found > 0 and st.mtime.nanoseconds <= newest) continue;
+            const id = ev_path[data_dir.len + 1 .. ev_path.len - "/events.jsonl".len];
+            if (id.len > out.len) continue; // a clipped id would name a different dir
+            @memcpy(out[0..id.len], id);
+            found = id.len;
+            newest = st.mtime.nanoseconds;
+        }
+    }
+    return out[0..found];
+}
+
+/// An account dir the server writes a user's runs under: "u" and the decimal user id ("u1", "u42").
+fn isAccountDir(name: []const u8) bool {
+    if (name.len < 2 or name[0] != 'u') return false;
+    for (name[1..]) |c| {
+        if (c < '0' or c > '9') return false;
+    }
+    return true;
+}
+
 /// If data_dir/rel has an events.jsonl, append a summary for it and return true; else false.
 fn addSwarm(io: Io, gpa: std.mem.Allocator, data_dir: []const u8, rel: []const u8, out: []SwarmSummary, n: *usize, now_s: i64, live_window_s: i64) bool {
     const ev_path = std.fmt.allocPrint(gpa, "{s}/{s}/events.jsonl", .{ data_dir, rel }) catch return false;
@@ -1161,6 +1205,54 @@ test "listSwarms over the real repo data dir (best-effort)" {
         std.debug.print("  - {s}  r{d} {d}%  live={}\n", .{ out[i].idStr(), out[i].round, out[i].pct, out[i].live });
     }
     now = 0;
+}
+
+test "findRun finds a run only where the server writes one, the newest when two accounts hold it" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dd = "zig-scan-findrun-tmp";
+    Io.Dir.cwd().deleteTree(io, dd) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dd) catch {};
+    const tree = "_chat/builds/c42";
+    // One conversation's build tree with a started run in two accounts, and in dirs that only resemble one. The
+    // server writes runs under u<uid> and nowhere else, and the look-alikes stay the NEWEST runs on disk, so a
+    // lookup that searched them would return one.
+    for ([_][]const u8{ "u1", "u12", "u", "ux1", "bin", "_chat" }) |acct| {
+        var rb: [96]u8 = undefined;
+        const run = try std.fmt.bufPrint(&rb, dd ++ "/{s}/" ++ tree, .{acct});
+        _ = Io.Dir.cwd().createDirPathStatus(io, run, .default_dir) catch {};
+        var eb: [128]u8 = undefined;
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&eb, "{s}/events.jsonl", .{run}), .data = "{\"seq\":1,\"kind\":\"act\",\"tool\":\"observe\"}\n" });
+    }
+    try ageFile(io, dd ++ "/u1/" ++ tree ++ "/events.jsonl", 600);
+    try ageFile(io, dd ++ "/u12/" ++ tree ++ "/events.jsonl", 300);
+    var out: [96]u8 = undefined;
+    try std.testing.expectEqualStrings("u12/" ++ tree, findRun(io, dd, &.{tree}, &out));
+    // age u12's run past u1's: the verdict follows the ages, not the directory order
+    try ageFile(io, dd ++ "/u12/" ++ tree ++ "/events.jsonl", 900);
+    try std.testing.expectEqualStrings("u1/" ++ tree, findRun(io, dd, &.{tree}, &out));
+
+    // every non-empty sub is searched: the watcher passes a conv's tree AND a default run dir's hex id, and a cast
+    // fired with no conversation has an empty tree
+    _ = Io.Dir.cwd().createDirPathStatus(io, dd ++ "/u12/cafe01", .default_dir) catch {};
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = dd ++ "/u12/cafe01/events.jsonl", .data = "{\"seq\":1,\"kind\":\"act\",\"tool\":\"observe\"}\n" });
+    try std.testing.expectEqualStrings("u12/cafe01", findRun(io, dd, &.{ "", "cafe01" }, &out));
+
+    // a build tree whose run has not started (no events.jsonl yet) is not a run
+    _ = Io.Dir.cwd().createDirPathStatus(io, dd ++ "/u1/_chat/builds/c43/work", .default_dir) catch {};
+    try std.testing.expectEqualStrings("", findRun(io, dd, &.{"_chat/builds/c43"}, &out));
+    // an id longer than `out` is skipped, never clipped into the name of some other dir
+    var small: [8]u8 = undefined;
+    try std.testing.expectEqualStrings("", findRun(io, dd, &.{tree}, &small));
+}
+
+/// Move a file's modification time `secs` into the past, so a test orders files by age without sleeping.
+fn ageFile(io: Io, path: []const u8, secs: i64) !void {
+    const f = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write });
+    defer f.close(io);
+    const now = Io.Timestamp.now(io, .real).nanoseconds;
+    try f.setTimestamps(io, .{ .modify_timestamp = .{ .new = .{ .nanoseconds = now - @as(i96, secs) * std.time.ns_per_s } } });
 }
 
 test "parseEv surfaces act args, tick traces, and board/phase detail" {

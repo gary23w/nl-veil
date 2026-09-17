@@ -798,10 +798,10 @@ pub const Chat = struct {
     cast_hex_len: usize = 0,
     cast_rel: [96]u8 = [_]u8{0} ** 96, // resolved run path relative to data dir
     cast_rel_len: usize = 0,
-    cast_conv: [64]u8 = [_]u8{0} ** 64, // the conv this cast was fired for — its run dir is _chat/builds/<conv>
+    cast_conv: [64]u8 = [_]u8{0} ** 64, // the conv this cast was fired for — its run dir is that conv's build tree
     // (must match sc_conv[64]: startServerCastWatch copies sc_conv here, and a >40-byte conv id would
     //  otherwise silently no-op the server-cast display.)
-    cast_conv_len: usize = 0, // (chat casts build in the conv dir, so the run-dir basename is <conv>, not the hex)
+    cast_conv_len: usize = 0, // (castRunTail maps it: a sub-chat's tree is its primary's, a scheduled run's its task's)
     cast_deadline_s: i64 = 0,
     cast_minutes: u32 = CAST_MINUTES, // the time budget of the ACTIVE cast (AI-configurable; drives deadline + progress %)
     cast_stop_sent: bool = false,
@@ -925,7 +925,6 @@ pub const Chat = struct {
 
     // scratch (thread-owned)
     ev_scratch: [store_mod.CAST_TAIL]scan.Ev = undefined,
-    sw_scratch: [scan.MAX_SWARMS]scan.SwarmSummary = undefined,
     plan_scratch: [store_mod.MAX_PLAN]store_mod.PlanRow = undefined,
     file_scratch: [scan.MAX_FILES]scan.FileRow = undefined,
     mem_scratch: [12288]u8 = undefined, // durable-memory directive stripping (REMEMBER:/FORGET: removed from the answer)
@@ -7584,8 +7583,9 @@ pub const Chat = struct {
         self.arc_acted = true;
         const goal = spec.goal;
         // The conversation id doubles as the cast's build dir: the server points the hive's run_dir at this
-        // chat's `_chat/builds/{conv}` folder, so the cast builds in the SAME tree the chat's own build tools
-        // (and the desktop console) use — not a throwaway `{hex}/work` the chat can never see.
+        // chat's build tree (`_chat/builds/{conv}`; for a sub-chat its primary's, for a scheduled run its task's), so
+        // the cast builds in the SAME tree the chat's own build tools (and the desktop console) use — not a throwaway
+        // `{hex}/work` the chat can never see.
         var convb: [96]u8 = undefined;
         const conv = self.convScope(&convb);
         // Concurrent Veil: the veil's parallel attempt JOINS the hive here — both build in this SAME "{conv}"
@@ -7737,8 +7737,8 @@ pub const Chat = struct {
         self.cast_hex_len = @min(hex.len, self.cast_hex.len);
         @memcpy(self.cast_hex[0..self.cast_hex_len], hex[0..self.cast_hex_len]);
         self.cast_rel_len = 0;
-        // the cast builds in this conversation's dir (_chat/builds/<hive_dir>); remember it so watchCast can find
-        // the run dir (its basename is <hive_dir>).
+        // the cast builds in this conversation's build tree; remember the conv so watchCast can find the run dir where
+        // the server maps it (castRunTail: a sub-chat's is its primary's tree, so its name is not <hive_dir>).
         self.cast_conv_len = @min(hive_dir.len, self.cast_conv.len);
         @memcpy(self.cast_conv[0..self.cast_conv_len], hive_dir[0..self.cast_conv_len]);
         self.cast_deadline_s = self.nowS() + @as(i64, self.cast_minutes) * 60 + 120;
@@ -8257,7 +8257,7 @@ pub const Chat = struct {
     /// Arm a DISPLAY-ONLY watch on a swarm the SERVER veil just cast (its cast tool "start" frame). Mirrors the
     /// arming half of fireCast (fresh watch state + a CastRow) but leaves cast_active FALSE — the desk only renders
     /// the run into the Swarm pane; the server veil owns the lifecycle (timeout, stop, composing the answer via
-    /// swarm_status). Resolves the run dir by conv basename (build-in-place: _chat/builds/<conv>).
+    /// swarm_status). watchCast resolves the run dir from the conv (build-in-place: the conv's build tree, castRunTail).
     fn startServerCastWatch(self: *Chat) void {
         const conv = self.sc_conv[0..self.sc_conv_len];
         if (conv.len == 0 or conv.len > self.cast_conv.len) return; // no resolvable conv → nothing to watch
@@ -8268,9 +8268,9 @@ pub const Chat = struct {
         if (self.cast_server_owned) return;
         self.cast_server_owned = true;
         self.cast_active = false; // the desk does NOT run the local collect/compose lifecycle for this cast
-        self.cast_conv_len = conv.len; // watchCast matches the run-dir basename against <conv>
+        self.cast_conv_len = conv.len; // watchCast finds the run in this conv's build tree
         @memcpy(self.cast_conv[0..conv.len], conv);
-        self.cast_hex_len = 0; // resolve by conv basename, not a hex id (and so the orchestration-id inject stays off)
+        self.cast_hex_len = 0; // resolve by the conv's tree, not a hex id (and so the orchestration-id inject stays off)
         self.cast_rel_len = 0; // watchCast resolves the run dir on its next tick
         self.cast_ev_size = 0; // fresh watch state for this run
         self.cast_ev_start = 0;
@@ -8407,30 +8407,34 @@ pub const Chat = struct {
         self.store.plan_count = n;
     }
 
+    /// Where a cast fired for `conv` builds, as the path under its account dir: "_chat/builds/{root}", where a
+    /// sub-chat's root is its primary, or "_sched/{task}/runs/{stamp}" for a scheduled run's conv; "" for no conv.
+    /// The server's castSwarm spawns into "{data}/{paths.zig buildRootRel(uid, conv)}", which is "u{uid}/" followed
+    /// by this path, the tree chatBuildRel names for that chat on screen. The account is left to scan.findRun: the
+    /// desk only guesses its own uid (uidPrefix), and a cast in any account's tree must still be found.
+    fn castRunTail(conv: []const u8, buf: []u8) []const u8 {
+        if (conv.len == 0) return "";
+        const root = store_mod.branchConvRoot(conv); // a sub-chat builds in its primary's tree (as in chatBuildRel)
+        if (schedConvParts(root)) |p| return std.fmt.bufPrint(buf, "_sched/{s}/runs/{s}", .{ p.tid, p.stamp }) catch "";
+        return std.fmt.bufPrint(buf, "_chat/builds/{s}", .{root}) catch "";
+    }
+
     pub fn watchCast(self: *Chat, dd: []const u8) void {
         if (!self.cast_active and !self.cast_server_owned) return; // runs for a local cast OR a server-owned display
         const now = self.nowS();
-        // resolve the run dir once the scanner can see it (server writes u<uid>/<hex>)
+        // Resolve the run dir once its events.jsonl exists, in the place the server spawned the hive: the conv's build
+        // tree for a cast fired into a conversation, else the default u<uid>/<hex> dir. A sub-chat's tree is its
+        // primary's and a scheduled run's is its task's, so the run dir's name need not be the conv id at all.
         if (self.cast_rel_len == 0) {
-            const n = scan.listSwarms(self.io, self.gpa, dd, &self.sw_scratch, now, 45);
-            const hex = self.cast_hex[0..self.cast_hex_len];
-            const conv = self.cast_conv[0..self.cast_conv_len];
-            for (self.sw_scratch[0..n]) |*sw| {
-                const id = sw.idStr();
-                const base = if (std.mem.lastIndexOfScalar(u8, id, '/')) |sl| id[sl + 1 ..] else id;
-                // A chat cast builds in the conversation dir, so its run-dir basename is <conv>, NOT the hex id
-                // — match that first; fall back to the hex for any legacy path.
-                if ((conv.len > 0 and std.mem.eql(u8, base, conv)) or std.mem.eql(u8, base, hex)) {
-                    self.cast_rel_len = @min(id.len, self.cast_rel.len);
-                    @memcpy(self.cast_rel[0..self.cast_rel_len], id[0..self.cast_rel_len]);
-                    self.updateCastRow(.running, 0, -1, "", id);
-                    break;
-                }
-            }
-            if (self.cast_rel_len == 0) {
+            var tb: [96]u8 = undefined;
+            const tail = castRunTail(self.cast_conv[0..self.cast_conv_len], &tb);
+            const id = scan.findRun(self.io, dd, &.{ tail, self.cast_hex[0..self.cast_hex_len] }, &self.cast_rel);
+            if (id.len == 0) {
                 if (!self.cast_server_owned and now > self.cast_deadline_s) self.failCast(dd, "[cast] the run directory never appeared — check the server");
                 return;
             }
+            self.cast_rel_len = id.len;
+            self.updateCastRow(.running, 0, -1, "", id);
         }
         const rel = self.cast_rel[0..self.cast_rel_len];
         var ep_buf: [700]u8 = undefined;
@@ -12508,6 +12512,107 @@ test "epoch barrier: a cast finishing after a switch to a DIFFERENT conv injects
     // the on-screen transcript (no note, no digest) NOR its hippocampus — the .done Swarm row is the record.
     try std.testing.expect(!saw_note);
     try std.testing.expect(!saw_digest);
+}
+
+test "cast watch finds a conversation's cast where the server spawned it: a sub-chat's in its primary's tree, a scheduled run's in its task's, under any account" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{ .environ = llm.osEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dd = "zig-castwatch-tree-tmp";
+    Io.Dir.cwd().deleteTree(io, dd) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dd) catch {};
+    const started = "{\"seq\":1,\"kind\":\"act\",\"mind\":\"nova\",\"tool\":\"observe\",\"result\":\"looked around\"}\n"; // running, not stopped
+    var pb: [160]u8 = undefined;
+    // Runs no conversation below owns: a sibling chat's cast, and a cast by another task that fired in the same
+    // minute (a scheduled run's dir is named by its stamp alone). Then trees that hold files but no run: one named
+    // after the raw sub-chat id, and the default account's tree for a chat whose cast ran under another account.
+    for ([_][]const u8{ "u1/_chat/builds/c43", "u1/_sched/weather-0715174857/runs/07151753" }) |run| {
+        _ = Io.Dir.cwd().createDirPathStatus(io, try std.fmt.bufPrint(&pb, dd ++ "/{s}", .{run}), .default_dir) catch {};
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&pb, dd ++ "/{s}/events.jsonl", .{run}), .data = started });
+    }
+    for ([_][]const u8{ "u1/_chat/builds/c42__s3/work", "u1/_chat/builds/c9d/work" }) |tree| {
+        _ = Io.Dir.cwd().createDirPathStatus(io, try std.fmt.bufPrint(&pb, dd ++ "/{s}", .{tree}), .default_dir) catch {};
+    }
+
+    const Case = struct { conv: []const u8, run: []const u8 };
+    // `run`: where castSwarm spawned the conv's hive, "{data}/{paths.zig buildRootRel(uid, conv)}", under the data dir
+    const cases = [_]Case{
+        .{ .conv = "c42", .run = "u1/_chat/builds/c42" },
+        .{ .conv = "c42__s3", .run = "u1/_chat/builds/c42" },
+        .{ .conv = "scheduled_news-0715174857_07151753", .run = "u1/_sched/news-0715174857/runs/07151753" },
+        .{ .conv = "scheduled_news-0715174857_07151753__s1", .run = "u1/_sched/news-0715174857/runs/07151753" },
+        .{ .conv = "c9d__s2", .run = "u7/_chat/builds/c9d" }, // a user other than the u1 the desk assumes
+    };
+    const hex = "0f1e2d3c4b5a6978"; // the id the cast endpoint answered; the hive did not run in a dir by that name
+    const underAccount = struct {
+        fn f(rel: []const u8) []const u8 {
+            const sl = std.mem.indexOfScalar(u8, rel, '/') orelse return rel;
+            return rel[sl + 1 ..];
+        }
+    }.f;
+    const store = std.testing.allocator.create(Store) catch unreachable;
+    defer std.testing.allocator.destroy(store);
+    for (cases) |c| {
+        errdefer std.debug.print("cast watch case: conv {s}, hive spawned in {s}\n", .{ c.conv, c.run });
+        // the conv's build tree exists before its hive starts (the chat's own tools, or castSwarm's mkdir)
+        _ = Io.Dir.cwd().createDirPathStatus(io, try std.fmt.bufPrint(&pb, dd ++ "/{s}/work", .{c.run}), .default_dir) catch {};
+        Io.Dir.cwd().deleteFile(io, try std.fmt.bufPrint(&pb, dd ++ "/{s}/events.jsonl", .{c.run})) catch {};
+        Io.Dir.cwd().deleteFile(io, try std.fmt.bufPrint(&pb, dd ++ "/{s}/STOP", .{c.run})) catch {};
+        store.* = .{};
+        @memcpy(store.settings.data_dir[0..dd.len], dd);
+        store.settings.data_dir_len = dd.len;
+        @memcpy(store.conv_active[0..c.conv.len], c.conv);
+        store.conv_active_len = @intCast(c.conv.len);
+
+        // A cast the desk fired, in the state fireCast leaves once the server accepted it.
+        {
+            const chat = std.testing.allocator.create(Chat) catch unreachable;
+            defer std.testing.allocator.destroy(chat);
+            chat.* = .{ .io = io, .gpa = std.testing.allocator, .store = store };
+            // the chat's Files tab shows this same tree for the conv on screen (its account is the desk's guess, u1)
+            var fb: [180]u8 = undefined;
+            try std.testing.expectEqualStrings(underAccount(c.run), underAccount(chat.chatBuildRel(&fb)));
+            chat.pushCastRow("build the thing");
+            chat.cast_active = true;
+            chat.cast_epoch = chat.conv_epoch;
+            @memcpy(chat.cast_hex[0..hex.len], hex);
+            chat.cast_hex_len = hex.len;
+            @memcpy(chat.cast_conv[0..c.conv.len], c.conv);
+            chat.cast_conv_len = c.conv.len;
+            chat.cast_fired_s = chat.nowS();
+            chat.cast_deadline_s = chat.nowS() + 600;
+            chat.updateCastRow(.deploying, 0, -1, "worker starting...", hex);
+
+            chat.watchCast(dd); // the tree is there but its hive has not started: keep waiting
+            try std.testing.expectEqual(@as(usize, 0), chat.cast_rel_len);
+            try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&pb, dd ++ "/{s}/events.jsonl", .{c.run}), .data = started });
+            chat.watchCast(dd);
+            try std.testing.expectEqualStrings(c.run, chat.cast_rel[0..chat.cast_rel_len]);
+            try std.testing.expect(chat.cast_active); // watching it, not failed
+            const row = &store.casts[store.cast_count - 1];
+            try std.testing.expectEqual(store_mod.CastStatus.running, row.status);
+            try std.testing.expectEqualStrings(c.run, row.runStr());
+            // the row's Stop button sends the row's run id: the STOP has to land where the hive runs
+            var rb: [96]u8 = undefined;
+            const run_id = rb[0..row.run_len];
+            @memcpy(run_id, row.runStr());
+            chat.cmdStopCast(dd, run_id);
+            try std.testing.expect(fileExists(io, try std.fmt.bufPrint(&pb, dd ++ "/{s}/STOP", .{c.run})));
+        }
+        // A cast the SERVER veil fired in this conversation: the desk only displays it.
+        {
+            const chat = std.testing.allocator.create(Chat) catch unreachable;
+            defer std.testing.allocator.destroy(chat);
+            chat.* = .{ .io = io, .gpa = std.testing.allocator, .store = store };
+            @memcpy(chat.sc_conv[0..c.conv.len], c.conv);
+            chat.sc_conv_len = c.conv.len;
+            chat.startServerCastWatch(); // its cast tool's "start" frame
+            chat.watchCast(dd);
+            try std.testing.expectEqualStrings(c.run, chat.cast_rel[0..chat.cast_rel_len]);
+            try std.testing.expectEqualStrings(c.run, store.casts[store.cast_count - 1].runStr());
+            try std.testing.expect(chat.cast_server_owned); // still on display: the hive has not stopped
+        }
+    }
 }
 
 test "collect fizzle: a post-cast answer that only announces the repair re-enters as a tool turn" {
