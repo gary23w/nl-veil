@@ -14,13 +14,14 @@ store.zig defines `Store`, the one shared-state object the whole native app (Zig
 
 - `Store` — the mutex-guarded shared struct holding server/fleet status, swarm roster + selected-swarm detail, settings, chat conversations/messages/streaming buffers, casts, consoles, memory, proposals, metrics, and the three thread rings
 - `Store.pushCmd`/`popCmd` — UI→poller command ring (CMD_RING=32), drop-silently-when-full
+- `Store.pushDelete`/`deleteDone` — a Swarm-tab delete and its row's "deleting..." mark (`Deleting`, one slot per roster row): the UI queues the delete and marks the row under one lock, or does neither when the ring is full; the poller ends the mark when the delete does not land, and `Deleting.walked` ends a landed delete's mark in the lock that publishes the next roster walk, reporting any run that walk still found on disk
 - `Store.pushChatCmd`/`popChatCmd` — UI→chat-thread command ring (CHAT_CMD_RING=8), same drop discipline
 - `Store.pushNotif` — poller→UI notification ring (NOTIF_RING=8), overwrites oldest when full; also fed to the OS tray
 - `Store.pushMetric` — append a per-turn `TurnMetric` to the 60-slot performance ring for the chat Metrics tab
 - `Store.consoleAppend` — append to the You/Veil shell scrollback, compacting to newest ~half on overflow
 - `Store.lock`/`unlock` — take/release the internal spinlock around a manual critical section
 - `mkCmd`/`mkChatCmd` — free functions that pack (kind,id,text) slices into a fixed-size `Command`/`ChatCommand` value
-- Record types: `Command`, `ChatCommand`, `Notif`, `Settings`, `TurnMetric`, `OllamaModel`, `ChatMsg`, `ConvRow`, `CastRow`, `MemRow`, `PropRow`; enums `Tab`, `CmdKind`, `ChatCmdKind`, `ChatRole`, `CastStatus`
+- Record types: `Command`, `Deleting`, `ChatCommand`, `Notif`, `Settings`, `TurnMetric`, `OllamaModel`, `ChatMsg`, `ConvRow`, `CastRow`, `MemRow`, `PropRow`; enums `Tab`, `CmdKind`, `ChatCmdKind`, `ChatRole`, `CastStatus`
 
 ## Dependencies
 
