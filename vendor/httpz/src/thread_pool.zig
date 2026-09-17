@@ -91,6 +91,10 @@ pub fn ThreadPool(comptime F: anytype) type {
         }
 
         pub fn deinit(self: *Self) void {
+            // NOTE: local patch to vendored httpz. The arena holds the shared queue the threads park on, so they are
+            // joined first. Freeing it under them left each one waiting on a condition variable in freed memory,
+            // and on Linux a later futex wait there faulted. stop() is a no-op when the owner already stopped.
+            self.stop();
             self.arena.deinit();
         }
 

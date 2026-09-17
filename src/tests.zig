@@ -5,7 +5,7 @@
 test {
     _ = @import("auth/api_keys.zig"); // nlk_ key minting, hash-only retention, exact-match verify, revoke
     _ = @import("main.zig"); // the ROUTER audit: every admin path admin-gated, nothing else open by accident
-    _ = @import("httpz_test.zig"); // vendor/httpz: stop() closes each socket once; a body cut by FIN ends the connection
+    _ = @import("httpz_test.zig"); // vendor/httpz: stop() closes each socket once; a body cut by FIN ends the connection; a stopped server's threads are joined
     _ = @import("admin/admin_service.zig"); // god-mode routes: the auth sweep + its exhaustiveness guard
     _ = @import("auth/auth_api.zig"); // the front door: closed registration, login throttle, gated key routes
     _ = @import("auth/auth_core.zig"); // tool_grants persistence + the admin-email predicate

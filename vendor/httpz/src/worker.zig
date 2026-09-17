@@ -602,6 +602,11 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
         pub fn deinit(self: *Self) void {
             const allocator = self.allocator;
 
+            // NOTE: local patch to vendored httpz. run() returns without stopping the pool, so its threads may still
+            // be serving queued connections: join them before freeing the websocket state, the connections and the
+            // buffers they use. The blocking worker's listen() stops its pool the same way before returning.
+            self.thread_pool.stop();
+
             self.websocket.deinit();
             allocator.destroy(self.websocket);
 
