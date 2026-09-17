@@ -6,8 +6,8 @@
 #
 # Never touches a running app and never installs over zig-out/ (artifacts go to a throwaway
 # prefix). The test-runner IPC flake self-heals here too (see zig_tests, and its twin in check.ps1):
-# the build runner can exit 0 after the test binary died without reporting, and neither twin may
-# report green on a gate that produced no test verdict at all.
+# when the build runner loses its test process and fails without naming a test, the binaries it
+# named are rerun standalone for a verdict. A test gate that exited 0 already has one.
 #
 #   sh scripts/check.sh            gates: catalog sync, server build, src tests, desk tests
 #   sh scripts/check.sh --full     also build the default GUI target (needs GL/X11 deps)
@@ -37,8 +37,8 @@ fail=0
 # STRICT gates refuse to read a zero exit as success when the log says a step died. The zig build
 # runner has been observed printing "failed command: … zig build-exe" and a promoted LLD error and
 # STILL exiting 0 — which reported a broken Linux GUI build as PASS in CI. Only build gates set
-# this: the test gates legitimately print "failed command" on the IPC flake and then re-run the
-# binary standalone (see zig_tests), so a blanket check there would fail every green run.
+# this: a test gate prints "failed command" after every run whose tests wrote to stderr, pass or
+# fail (see zig_tests), so a blanket check there would fail every green run.
 GATE_STRICT=0
 gate_build() { GATE_STRICT=1; gate "$@"; GATE_STRICT=0; }
 
@@ -144,46 +144,54 @@ gate "web assets parse (node --check app.js)" gate_webjs
 # that one keeps the engine honest. Locally, warm deps hide the difference; on a cold runner it is the
 # difference between a fast signal and a coin flip.
 gate_build "zig build server-only (-Dapp=false)" "$ZIG" build -Dapp=false -Dbuiltin=false $CACHE_ARGS --prefix "$PREFIX"
-# `zig build test` can EXIT 0 after its test binary died without reporting a single result: the build
-# runner prints `failed command: "...test.exe" ... --listen=-` and returns success anyway. Taking that
-# as green means calling the suite passed while knowing nothing whatever about it -- the worst thing an
-# acceptance oracle can do, and it happened on BOTH test gates of a run that printed ALL GREEN. On this
-# machine Defender kills the test IPC and the very same binary passes standalone, so the honest move is
-# not to suppress it but to go get the evidence: rerun the exact exe the runner named and take ITS
-# verdict. A compile error names zig.exe, never a test.exe, so a real red cannot reach this path.
-zig_tests() { # zig_tests <cmd...> -- forwards output, returns a verdict backed by an actual test run
+# `zig build test`, and the one failure that is rerun standalone (twin of Invoke-ZigTests in check.ps1).
+# The EXIT CODE is the verdict: in Zig 0.16 a test run step succeeds only once its test process has
+# reported every test over the IPC channel and exited 0 (Step/Run.zig evalZigTest), so a gate that
+# exited 0 is never rerun. The runner's `failed command: ...test... --listen=-` line is NOT a failure
+# signal. The build runner prints a step's messages "no matter the result" once the step wrote to
+# stderr, and a run step always records its command, so the line follows any suite whose tests log.
+# Both of ours log warnings, so keying the rerun on that line reran both suites on every green run and
+# called it an IPC flake. (Measured 2026-09-17, filtered builds: one silent test printed no such line,
+# one test with a single std.log.warn printed one; both exited 0 with every test passing.)
+# The rerun is for a runner that LOST its test process: a nonzero exit whose output names no test
+# (`error: test process unexpectedly exited ...`, `error: unable to write stdin ...`) and whose failed
+# commands all name test binaries. On Windows that is the IPC flake blamed on Defender, where the same
+# binary passes standalone. Every test binary the runner named is rerun, since a suite that passed but
+# logged is named as well, and all of them must pass. Everything else keeps the runner's red: a named
+# test is a real result (every per-test message starts `error: '<test name>'`: failed, leaked, logged
+# errors, crashed, timed out), and a compile error's failed command names zig, never a test binary.
+zig_tests() { # zig_tests <cmd...> -- forwards output; exit 0 passes, a lost test process reruns standalone
   raw="${TMPDIR:-/tmp}/nlveil-zt.$$.log"
   "$@" >"$raw" 2>&1
   rc=$?
   cat "$raw"
-  # BOTH spellings of the runner's failure line. It used to match only the Windows one --
-  #   failed command: "C:\...\test.exe" "--cache-dir=..."
+  if [ "$rc" -eq 0 ]; then
+    rm -f "$raw"
+    return 0
+  fi
+  # BOTH spellings of the runner's failure line. Windows quotes the path and doubles its backslashes --
+  #   failed command: "C:\\...\\test.exe" "--cache-dir=..."
   # -- while Linux CI prints it unquoted and with no .exe:
   #   failed command: ./.zig-cache/o/HASH/test --cache-dir=... --seed=... --listen=-
-  # so on Linux `exe` came back empty, the function fell through to the runner's exit code, and
-  # that code was 0. Both test gates reported PASS having produced NO test verdict at all --
-  # exactly what this helper's header promises can never happen.
-  exe=$(sed -n \
+  exes=$(sed -n \
     -e 's/^failed command: "\([^"]*test\.exe\)".*/\1/p' \
     -e 's|^failed command: \([^" ][^ ]*/test\)\( .*\)\{0,1\}$|\1|p' \
-    "$raw" | head -1 | sed 's/\\\\/\\/g')
-  if [ -z "$exe" ]; then
-    # No named binary. If the runner ALSO printed a failure line, it died without a verdict and a
-    # zero exit is meaningless -- never let that read as green.
-    if grep -q '^failed command:' "$raw"; then
-      rm -f "$raw"
-      echo "   the runner reported a failed command but named no test binary --"
-      echo "   that is a gate with no verdict; refusing to call it green"
-      return 96
-    fi
-    rm -f "$raw"
+    "$raw" | sed 's/\\\\/\\/g')
+  cmds=$(grep -c '^failed command:' "$raw")
+  named=$(grep -c "^error: '" "$raw")
+  rm -f "$raw"
+  if [ "$named" -gt 0 ] || [ -z "$exes" ] || [ "$(printf '%s\n' "$exes" | wc -l | tr -d ' ')" -ne "$cmds" ]; then
     return "$rc"
   fi
-  rm -f "$raw"
-  echo "   build runner died without naming a test (IPC flake) -- rerunning it standalone:"
-  echo "   $exe"
-  [ -f "$exe" ] || { echo "   that exe is gone -- refusing to call this green"; return 97; }
-  "$exe"
+  echo "   build runner failed without naming a test (IPC flake?) -- rerunning standalone:"
+  while IFS= read -r exe; do
+    echo "   $exe"
+    [ -f "$exe" ] || { echo "   that exe is gone -- refusing to call this green"; return 97; }
+    "$exe" </dev/null || return $?
+  done <<EOF
+$(printf '%s\n' "$exes" | sort -u)
+EOF
+  return 0
 }
 gate "zig build test (src suite)" zig_tests "$ZIG" build test $CACHE_ARGS
 # CROSS-COMPILE THE TESTS FOR LINUX. The local gate is ONE OS; CI is Linux; and a platform-conditional
