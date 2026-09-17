@@ -17,9 +17,10 @@
 //! from a connected client re-arms a throttled background pass (maybeAutoSync, 15-min cadence) — so
 //! backup rides the polling that already exists instead of needing its own daemon. "Sync now" is a
 //! POST away. Each pass is INCREMENTAL: a jsonl manifest of relpath -> size (plus a content hash for the
-//! JSON files rewritten in place, see needsHash) lasts across restarts, and only files whose size or hash
-//! moved re-upload. The size test assumes append-only jsonl; memories.jsonl is rewritten whole by a FORGET,
-//! so a same-length rewrite between passes is missed until the next size change.
+//! files rewritten in place, see needsHash) lasts across restarts, and only files whose size or hash
+//! moved re-upload. The manifest describes ONE bucket in ONE account, so it starts over, and everything
+//! uploads anew, whenever the bucket turns out to be a different one: created again after it was deleted
+//! on Cloudflare's side, or confirmed under another account after a login to a different one (see runPass).
 //!
 //! WHAT SYNCS: per-conversation messages.jsonl / context.json / digest.jsonl / brief.json / plan.jsonl /
 //! files.jsonl,
@@ -37,6 +38,8 @@ const cf_oauth = @import("cf_oauth.zig");
 const App = http.App;
 const requireUser = http.requireUser;
 const badReq = http.badReq;
+const log = std.log.scoped(.cf_r2);
+const fakehttp = @import("../worker/fakehttp.zig"); // TEST ONLY: the stand-in R2 API the pass tests dial
 
 /// One bucket name for every user: the bucket lives in the USER'S Cloudflare account, so the account
 /// boundary is the isolation. Object keys are still prefixed u{uid}/ so two veil accounts sharing one
@@ -44,7 +47,7 @@ const badReq = http.badReq;
 pub const BUCKET = "nl-veil";
 
 const STATE_FILE = ".cf_r2.json"; // {data}/u{uid}/.cf_r2.json — status the UIs read
-const MANIFEST_FILE = ".cf_r2_manifest.jsonl"; // relpath -> size (+ hash where needsHash) at last successful upload
+const MANIFEST_FILE = ".cf_r2_manifest.jsonl"; // relpath -> size (+ hash where needsHash) at last successful upload, for the bucket in bucket_account
 const AUTO_SYNC_S: i64 = 900; // background cadence once any client is polling status
 const MAX_FILE_BYTES: u64 = 8 << 20; // one object cap (REST upload limit is 300 MB; chats never near it)
 const MAX_PASS_FILES: usize = 32; // per-pass upload caps: a huge backlog drains over
@@ -54,8 +57,8 @@ const MAX_PASS_BYTES: u64 = 32 << 20; // several passes instead of camping a thr
 
 const State = struct {
     auto: bool = true, // auto-backup on status polls; "Sync now" always works
-    bucket_ok: bool = false, // bucket confirmed present (sticky and persisted; nothing clears it yet, so a bucket
-    // deleted on Cloudflare's side, or a login to another account, is not re-created)
+    bucket_ok: bool = false, // bucket confirmed present in bucket_account; cleared by an upload that finds it gone
+    bucket_account: []const u8 = "", // the account it was confirmed in: a login to another one checks again
     last_sync: i64 = 0, // when a pass last RAN
     last_ok: i64 = 0, // when a pass last finished with zero failures
     files: u64 = 0, // manifest totals after the last pass
@@ -83,6 +86,7 @@ fn readState(app: *App, uid: u64, alloc: std.mem.Allocator) State {
     defer parsed.deinit();
     var s = parsed.value;
     s.last_error = alloc.dupe(u8, s.last_error) catch "";
+    s.bucket_account = alloc.dupe(u8, s.bucket_account) catch "";
     return s;
 }
 
@@ -95,7 +99,9 @@ fn writeState(app: *App, uid: u64, s: State) void {
     } else |_| {}
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(app.gpa);
-    out.print(app.gpa, "{{\"auto\":{},\"bucket_ok\":{},\"last_sync\":{d},\"last_ok\":{d},\"files\":{d},\"bytes\":{d},\"pending\":{},\"skipped\":{d},\"last_error\":", .{ s.auto, s.bucket_ok, s.last_sync, s.last_ok, s.files, s.bytes, s.pending, s.skipped }) catch return;
+    out.print(app.gpa, "{{\"auto\":{},\"bucket_ok\":{},\"last_sync\":{d},\"last_ok\":{d},\"files\":{d},\"bytes\":{d},\"pending\":{},\"skipped\":{d},\"bucket_account\":", .{ s.auto, s.bucket_ok, s.last_sync, s.last_ok, s.files, s.bytes, s.pending, s.skipped }) catch return;
+    http.jstr(app.gpa, &out, s.bucket_account) catch return;
+    out.appendSlice(app.gpa, ",\"last_error\":") catch return;
     http.jstr(app.gpa, &out, s.last_error) catch return;
     out.append(app.gpa, '}') catch return;
     std.Io.Dir.cwd().writeFile(app.io, .{ .sub_path = path, .data = out.items }) catch {};
@@ -215,54 +221,74 @@ fn parseResp(app: *App, raw: []const u8, alloc: std.mem.Allocator) ?struct { suc
     return .{ .success = parsed.value.success, .code = 0, .message = "" };
 }
 
-/// Make sure the user's backup bucket exists: confirm with a GET, else create it. Sticky on success.
-/// On failure records the API's own words (most commonly: R2 not activated on the account) so the
-/// status card can tell the user exactly what to click on Cloudflare's side.
-fn ensureBucket(app: *App, st: *State, account: []const u8, bearer: []const u8, alloc: std.mem.Allocator) bool {
-    if (st.bucket_ok) return true;
+/// What ensureBucket found: no usable bucket (st.last_error says why); the bucket the manifest describes; or
+/// one it does not - just created, so empty, or confirmed in another account than last time.
+const Bucket = enum { fail, same, fresh };
+
+/// Make sure the user's backup bucket exists in `account`: confirm with a GET, else create it. Confirmed once
+/// per account - `bucket_account` records which, so a login to a different Cloudflare account checks (and if
+/// need be creates) the bucket there instead of trusting a flag set for the old one - and cleared by runPass
+/// when an upload finds the bucket gone. On failure records the API's own words (most commonly: R2 not
+/// activated on the account) so the status card can tell the user exactly what to click on Cloudflare's side.
+fn ensureBucket(app: *App, st: *State, account: []const u8, bearer: []const u8, alloc: std.mem.Allocator) Bucket {
+    if (st.bucket_ok and std.mem.eql(u8, st.bucket_account, account)) return .same;
+    // Confirmed before under ANOTHER account: whatever this account's bucket holds, the manifest is not about
+    // it. A state from before bucket_account existed names no account, and keeps its manifest.
+    const moved = st.bucket_account.len > 0 and !std.mem.eql(u8, st.bucket_account, account);
+    st.bucket_ok = false; // nothing is confirmed for `account` until one of the calls below says so
     var ub: [700]u8 = undefined;
-    const url = std.fmt.bufPrint(&ub, "{s}/{s}/r2/buckets/" ++ BUCKET, .{ app.cf_oauth_accounts_url, account }) catch return false;
+    const url = std.fmt.bufPrint(&ub, "{s}/{s}/r2/buckets/" ++ BUCKET, .{ app.cf_oauth_accounts_url, account }) catch return .fail;
     if (cf_oauth.apiCall(app, "GET", url, "", bearer, "")) |raw| {
         defer app.gpa.free(raw);
-        if (parseResp(app, raw, alloc)) |r| if (r.success) {
-            st.bucket_ok = true;
-            st.last_error = "";
-            return true;
-        };
+        if (parseResp(app, raw, alloc)) |r| if (r.success) return confirmBucket(st, account, if (moved) .fresh else .same);
     }
-    const curl = std.fmt.bufPrint(&ub, "{s}/{s}/r2/buckets", .{ app.cf_oauth_accounts_url, account }) catch return false;
+    const curl = std.fmt.bufPrint(&ub, "{s}/{s}/r2/buckets", .{ app.cf_oauth_accounts_url, account }) catch return .fail;
     const raw = cf_oauth.apiCall(app, "POST", curl, "{\"name\":\"" ++ BUCKET ++ "\"}", bearer, "application/json") orelse {
         st.last_error = "could not reach the Cloudflare R2 API";
-        return false;
+        return .fail;
     };
     defer app.gpa.free(raw);
     const r = parseResp(app, raw, alloc) orelse {
         st.last_error = "unreadable answer from the Cloudflare R2 API";
-        return false;
+        return .fail;
     };
-    // 10004: a bucket by this name already exists (owned by this account) — that IS the bucket.
-    if (r.success or r.code == 10004) {
-        st.bucket_ok = true;
-        st.last_error = "";
-        return true;
-    }
+    if (r.success) return confirmBucket(st, account, .fresh); // a bucket created just now holds nothing
+    // 10004, and 10073 (BucketConflict, "Bucket name already exists" in R2's error table): a bucket by this
+    // name already exists in this account - that IS the bucket.
+    if (r.code == 10004 or r.code == 10073) return confirmBucket(st, account, if (moved) .fresh else .same);
     st.last_error = if (r.message.len > 0)
         std.fmt.allocPrint(alloc, "R2 bucket: {s}", .{r.message}) catch "R2 bucket create failed"
     else
         "R2 bucket create failed (is R2 activated on your Cloudflare account?)";
-    return false;
+    return .fail;
 }
 
+fn confirmBucket(st: *State, account: []const u8, found: Bucket) Bucket {
+    st.bucket_ok = true;
+    st.bucket_account = account;
+    st.last_error = "";
+    return found;
+}
+
+/// Cloudflare's answer for a call into a bucket that is not there: 10006 NoSuchBucket, "The specified bucket
+/// does not exist." The message is matched too, for a reply that carries it without the code.
+fn noSuchBucket(code: i64, message: []const u8) bool {
+    return code == 10006 or std.ascii.indexOfIgnoreCase(message, "bucket does not exist") != null;
+}
+
+const Put = enum { ok, failed, no_bucket };
+
 /// PUT one object. The key is u{uid}/{rel} — slashes are sent literally, exactly as the API expects.
-fn putObject(app: *App, account: []const u8, bearer: []const u8, uid: u64, rel: []const u8, data: []const u8) bool {
+fn putObject(app: *App, account: []const u8, bearer: []const u8, uid: u64, rel: []const u8, data: []const u8) Put {
     var ub: [1024]u8 = undefined;
-    const url = std.fmt.bufPrint(&ub, "{s}/{s}/r2/buckets/" ++ BUCKET ++ "/objects/u{d}/{s}", .{ app.cf_oauth_accounts_url, account, uid, rel }) catch return false;
-    const raw = cf_oauth.apiCall(app, "PUT", url, data, bearer, "application/octet-stream") orelse return false;
+    const url = std.fmt.bufPrint(&ub, "{s}/{s}/r2/buckets/" ++ BUCKET ++ "/objects/u{d}/{s}", .{ app.cf_oauth_accounts_url, account, uid, rel }) catch return .failed;
+    const raw = cf_oauth.apiCall(app, "PUT", url, data, bearer, "application/octet-stream") orelse return .failed;
     defer app.gpa.free(raw);
     var scratch = std.heap.ArenaAllocator.init(app.gpa);
     defer scratch.deinit();
-    const r = parseResp(app, raw, scratch.allocator()) orelse return false;
-    return r.success;
+    const r = parseResp(app, raw, scratch.allocator()) orelse return .failed;
+    if (r.success) return .ok;
+    return if (noSuchBucket(r.code, r.message)) .no_bucket else .failed;
 }
 
 // ---------------------------------------------------------------------------------- what syncs
@@ -310,8 +336,8 @@ fn collectCandidates(app: *App, uid: u64, a: std.mem.Allocator, list: *std.Array
 // ---------------------------------------------------------------------------------- the manifest
 
 /// What the manifest remembers per file: the size at the last successful upload, and — for the
-/// rewrite-in-place JSON files — a content hash, because a whole-file rewrite can land on the same
-/// byte length and size alone would call it unchanged forever.
+/// files rewritten in place (needsHash) — a content hash, because a whole-file rewrite can land on the
+/// same byte length and size alone would call it unchanged forever.
 const ManEntry = struct { sz: u64 = 0, h: u64 = 0 };
 
 /// relpath -> ManEntry, one JSON line each, arena-owned.
@@ -349,10 +375,14 @@ fn writeManifest(app: *App, uid: u64, map: *std.StringHashMapUnmanaged(ManEntry)
     std.Io.Dir.cwd().writeFile(app.io, .{ .sub_path = path, .data = out.items }) catch {};
 }
 
-/// Does this file need content-hash change detection? The jsonl files are append-only (any change
-/// moves the size); context.json and brief.json are rewritten whole and can keep their length.
+/// Does this file need content-hash change detection? A file that only grows moves its size with every
+/// change; a file rewritten whole can land on the same length. Rewritten whole: context.json and brief.json,
+/// plan.jsonl (the live plan board, overwritten on every status change) and memories.jsonl (a FORGET drops
+/// lines and writes the rest back). messages.jsonl and digest.jsonl only append; files.jsonl appends, and
+/// its one rewrite compacts it from past 128 KiB to a snapshot of at most 128 entries, so its size moves too.
 fn needsHash(rel: []const u8) bool {
-    return std.mem.endsWith(u8, rel, "/context.json") or std.mem.endsWith(u8, rel, "/brief.json");
+    return std.mem.endsWith(u8, rel, "/context.json") or std.mem.endsWith(u8, rel, "/brief.json") or
+        std.mem.endsWith(u8, rel, "/plan.jsonl") or std.mem.endsWith(u8, rel, "/memories.jsonl");
 }
 
 // ---------------------------------------------------------------------------------- one sync pass
@@ -371,24 +401,82 @@ pub fn syncUser(app: *App, uid: u64) void {
     st.last_sync = nowS(app.io);
     st.pending = false;
 
-    const tok = cf_oauth.resolveToken(app, uid, a) orelse {
-        st.last_error = "not connected to Cloudflare";
-        writeState(app, uid, st);
-        return;
+    if (cf_oauth.resolveToken(app, uid, a)) |tok| {
+        runPass(app, uid, &st, tok.account_id, tok.key, a);
+    } else st.last_error = "not connected to Cloudflare";
+    // The pass owns everything in `st` EXCEPT the auto switch — the user may have flipped it while the
+    // uploads ran (r2SetAuto writes the file mid-pass), and clobbering that choice would keep backing
+    // up against an explicit opt-out. Re-read and keep theirs.
+    st.auto = readState(app, uid, a).auto;
+    writeState(app, uid, st);
+}
+
+/// The pass once a token is in hand: the bucket, the uploads, and the totals and outcome, all into `st`.
+///
+/// A BUCKET CAN VANISH. Deleted on Cloudflare's side, it answers every upload with "no such bucket", and the
+/// manifest still lists everything that was in it. So the pass that meets that answer forgets the bucket and
+/// the manifest, confirms or creates the bucket again, and runs the uploads once more from an empty manifest -
+/// the backup recovers in the pass that noticed, instead of failing the same uploads every 15 minutes.
+fn runPass(app: *App, uid: u64, st: *State, account: []const u8, bearer: []const u8, a: std.mem.Allocator) void {
+    var man = loadManifest(app, uid, a);
+    var man_dirty = false;
+    var t: Tally = .{};
+    const confirmed = pass: for (0..2) |attempt| {
+        t = .{};
+        switch (ensureBucket(app, st, account, bearer, a)) {
+            .fail => break :pass false, // ensureBucket's own words are in st.last_error
+            .same => {},
+            .fresh => {
+                man.clearRetainingCapacity();
+                man_dirty = true;
+            },
+        }
+        st.pending = false;
+        t = uploadChanged(app, uid, st, account, bearer, &man, a);
+        if (t.uploads > 0) man_dirty = true;
+        if (!t.gone) break :pass true;
+        st.bucket_ok = false;
+        man.clearRetainingCapacity();
+        man_dirty = true;
+        if (attempt == 0) log.info("R2 backup: the {s} bucket is gone from the account - creating it again and uploading everything", .{BUCKET});
+    } else false;
+
+    if (man_dirty) writeManifest(app, uid, &man);
+    st.files = man.count();
+    st.bytes = blk: {
+        var sum: u64 = 0;
+        var it = man.valueIterator();
+        while (it.next()) |v| sum += v.sz;
+        break :blk sum;
     };
-    if (!ensureBucket(app, &st, tok.account_id, tok.key, a)) {
-        writeState(app, uid, st);
+    st.skipped = t.skipped;
+    if (!confirmed) {
+        if (t.gone) st.last_error = "R2 bucket: the bucket was reported missing again right after it was confirmed — will retry next pass";
         return;
     }
+    if (t.failures == 0) {
+        st.last_ok = nowS(app.io);
+        st.last_error = "";
+    } else {
+        st.last_error = std.fmt.allocPrint(a, "{d} upload(s) failed — will retry next pass", .{t.failures}) catch "some uploads failed";
+    }
+}
 
-    var man = loadManifest(app, uid, a);
+/// What one walk over the candidates did.
+const Tally = struct {
+    uploads: usize = 0,
+    failures: usize = 0,
+    skipped: u64 = 0, // candidates over MAX_FILE_BYTES
+    gone: bool = false, // an upload was refused because the bucket does not exist; the walk stopped there
+};
+
+/// Upload every candidate that changed since the manifest, within the per-pass caps, recording each success
+/// in `man`. Stops at the first "no such bucket": every upload after it would be refused the same way.
+fn uploadChanged(app: *App, uid: u64, st: *State, account: []const u8, bearer: []const u8, man: *std.StringHashMapUnmanaged(ManEntry), a: std.mem.Allocator) Tally {
+    var t: Tally = .{};
     var candidates: std.ArrayListUnmanaged([]const u8) = .empty;
     collectCandidates(app, uid, a, &candidates);
-
-    var uploads: usize = 0;
     var pass_bytes: u64 = 0;
-    var failures: usize = 0;
-    var skipped_big: u64 = 0;
     for (candidates.items) |rel| {
         if (!keySafe(rel)) continue;
         var fb: [900]u8 = undefined;
@@ -396,14 +484,14 @@ pub fn syncUser(app: *App, uid: u64) void {
         const fst = std.Io.Dir.cwd().statFile(app.io, full, .{}) catch continue; // absent → nothing to back up
         if (fst.size == 0) continue;
         if (fst.size > MAX_FILE_BYTES) {
-            skipped_big += 1; // counted and surfaced — a frozen backup must not read as a healthy one
+            t.skipped += 1; // counted and surfaced — a frozen backup must not read as a healthy one
             continue;
         }
         const prev = man.get(rel);
         const hashed = needsHash(rel);
-        // size-only fast path: append-heavy files whose size hasn't moved are unchanged
+        // size-only fast path: append-only files whose size hasn't moved are unchanged
         if (!hashed) if (prev) |p| if (p.sz == fst.size) continue;
-        if (uploads >= MAX_PASS_FILES or pass_bytes + fst.size > MAX_PASS_BYTES) {
+        if (t.uploads >= MAX_PASS_FILES or pass_bytes + fst.size > MAX_PASS_BYTES) {
             st.pending = true; // more work than one pass carries — the next pass continues
             continue;
         }
@@ -413,36 +501,21 @@ pub fn syncUser(app: *App, uid: u64) void {
             h = std.hash.Fnv1a_64.hash(data);
             if (prev) |p| if (p.sz == data.len and p.h == h) continue; // same length AND same content
         }
-        if (putObject(app, tok.account_id, tok.key, uid, rel, data)) {
-            const key = a.dupe(u8, rel) catch continue;
-            man.put(a, key, .{ .sz = data.len, .h = h }) catch {};
-            uploads += 1;
-            pass_bytes += data.len;
-        } else {
-            failures += 1;
+        switch (putObject(app, account, bearer, uid, rel, data)) {
+            .ok => {
+                const key = a.dupe(u8, rel) catch continue;
+                man.put(a, key, .{ .sz = data.len, .h = h }) catch {};
+                t.uploads += 1;
+                pass_bytes += data.len;
+            },
+            .failed => t.failures += 1,
+            .no_bucket => {
+                t.gone = true;
+                break;
+            },
         }
     }
-
-    if (uploads > 0) writeManifest(app, uid, &man);
-    st.files = man.count();
-    st.bytes = blk: {
-        var sum: u64 = 0;
-        var it = man.valueIterator();
-        while (it.next()) |v| sum += v.sz;
-        break :blk sum;
-    };
-    st.skipped = skipped_big;
-    if (failures == 0) {
-        st.last_ok = nowS(app.io);
-        st.last_error = "";
-    } else {
-        st.last_error = std.fmt.allocPrint(a, "{d} upload(s) failed — will retry next pass", .{failures}) catch "some uploads failed";
-    }
-    // The pass owns everything in `st` EXCEPT the auto switch — the user may have flipped it while the
-    // uploads ran (r2SetAuto writes the file mid-pass), and clobbering that choice would keep backing
-    // up against an explicit opt-out. Re-read and keep theirs.
-    st.auto = readState(app, uid, a).auto;
-    writeState(app, uid, st);
+    return t;
 }
 
 // ---------------------------------------------------------------------------------- HTTP handlers
@@ -547,4 +620,138 @@ test "state round-trips through its JSON, defaults included" {
     try std.testing.expect(!parsed.value.bucket_ok);
     try std.testing.expectEqual(@as(i64, 42), parsed.value.last_sync);
     try std.testing.expectEqualStrings("", parsed.value.last_error);
+    try std.testing.expectEqualStrings("", parsed.value.bucket_account); // a state from before it: no account named
+}
+
+test "change detection hashes the files rewritten in place and trusts size for the append-only ones" {
+    try std.testing.expect(needsHash("_chat/convs/web-1/context.json"));
+    try std.testing.expect(needsHash("_chat/convs/web-1/brief.json"));
+    try std.testing.expect(needsHash("_chat/convs/web-1/plan.jsonl")); // the plan board, overwritten on each status change
+    try std.testing.expect(needsHash(".veil-desk/memories.jsonl")); // a FORGET writes the survivors back whole
+    try std.testing.expect(!needsHash("_chat/convs/web-1/messages.jsonl"));
+    try std.testing.expect(!needsHash("_chat/convs/web-1/digest.jsonl"));
+    try std.testing.expect(!needsHash("_chat/convs/web-1/files.jsonl"));
+    // "no such bucket", by R2's code or by its words, and nothing else
+    try std.testing.expect(noSuchBucket(10006, ""));
+    try std.testing.expect(noSuchBucket(0, "The specified bucket does not exist."));
+    try std.testing.expect(!noSuchBucket(10007, "The specified key does not exist."));
+    try std.testing.expect(!noSuchBucket(10042, "Account not entitled to this feature."));
+}
+
+/// TEST ONLY. Every R2 call rides curl; a box without it skips the tests that dial the stand-in API.
+fn curlRuns(gpa: std.mem.Allocator, io: std.Io) bool {
+    const r = std.process.run(gpa, io, .{ .argv = &.{ "curl", "--version" }, .stdout_limit = .limited(16 << 10) }) catch return false;
+    gpa.free(r.stdout);
+    gpa.free(r.stderr);
+    return r.term == .exited and r.term.exited == 0;
+}
+
+test "the bucket is confirmed per account: the same login costs no call, another login checks its own account" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var ta = try http.testApp(gpa, io, "zig-cfr2-acct-tmp");
+    defer ta.deinit();
+    if (!curlRuns(gpa, io)) return error.SkipZigTest;
+
+    const w = fakehttp.wire;
+    const found = w("{\"success\":true,\"errors\":[],\"result\":{\"name\":\"nl-veil\"}}");
+    const missing = w("{\"success\":false,\"errors\":[{\"code\":10006,\"message\":\"The specified bucket does not exist.\"}]}");
+    const routes = [_]fakehttp.Route{
+        .{ .method = "GET", .path = "/accounts/acct-a/r2/buckets/nl-veil", .reply = found },
+        .{ .method = "GET", .path = "/accounts/acct-b/r2/buckets/nl-veil", .reply = found },
+        .{ .method = "POST", .path = "/accounts/acct-c/r2/buckets", .reply = w("{\"success\":false,\"errors\":[{\"code\":10042,\"message\":\"Account not entitled to this feature.\"}]}") },
+    };
+    var srv: fakehttp.Server = undefined;
+    try srv.startRouted(io, &routes, missing);
+    var running = true;
+    defer if (running) srv.stop();
+    var ub: [80]u8 = undefined;
+    ta.app.cf_oauth_accounts_url = try std.fmt.bufPrint(&ub, "http://127.0.0.1:{d}/client/v4/accounts", .{srv.port});
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var st: State = .{ .bucket_ok = true, .bucket_account = "acct-a" };
+    try std.testing.expectEqual(Bucket.same, ensureBucket(&ta.app, &st, "acct-a", "k", a));
+    // A login to another account: its bucket is checked there, and the manifest (about acct-a's) starts over.
+    try std.testing.expectEqual(Bucket.fresh, ensureBucket(&ta.app, &st, "acct-b", "k", a));
+    try std.testing.expect(st.bucket_ok);
+    try std.testing.expectEqualStrings("acct-b", st.bucket_account);
+    // A state written before bucket_account existed is checked once and keeps its manifest.
+    var legacy: State = .{ .bucket_ok = true };
+    try std.testing.expectEqual(Bucket.same, ensureBucket(&ta.app, &legacy, "acct-a", "k", a));
+    try std.testing.expectEqualStrings("acct-a", legacy.bucket_account);
+    // An account without R2: no bucket is claimed, and the account the manifest describes is not forgotten.
+    var other: State = .{ .bucket_ok = true, .bucket_account = "acct-a" };
+    try std.testing.expectEqual(Bucket.fail, ensureBucket(&ta.app, &other, "acct-c", "k", a));
+    try std.testing.expect(!other.bucket_ok);
+    try std.testing.expectEqualStrings("acct-a", other.bucket_account);
+    try std.testing.expect(std.mem.indexOf(u8, other.last_error, "not entitled") != null);
+
+    srv.stop();
+    running = false;
+    try std.testing.expectEqual(@as(usize, 1), srv.countCalls("GET", "/accounts/acct-a/")); // the legacy check, only
+    try std.testing.expectEqual(@as(usize, 1), srv.countCalls("GET", "/accounts/acct-b/"));
+    try std.testing.expectEqual(@as(usize, 1), srv.countCalls("POST", "/accounts/acct-c/r2/buckets"));
+}
+
+test "a bucket deleted on Cloudflare's side is created again in the pass that finds it gone, and everything uploads anew" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-cfr2-gone-tmp";
+    var ta = try http.testApp(gpa, io, root);
+    defer ta.deinit();
+    if (!curlRuns(gpa, io)) return error.SkipZigTest;
+
+    // One conversation and the memory store, both in the bucket's manifest; the conversation has grown since.
+    const cwd = std.Io.Dir.cwd();
+    _ = try cwd.createDirPathStatus(io, root ++ "/u1/_chat/convs/c1", .default_dir);
+    _ = try cwd.createDirPathStatus(io, root ++ "/u1/.veil-desk", .default_dir);
+    const msgs = "{\"role\":\"user\",\"content\":\"hi\"}\n{\"role\":\"assistant\",\"content\":\"hello\"}\n";
+    const mem = "{\"cat\":\"fact\",\"text\":\"User is 34 years old\"}\n";
+    try cwd.writeFile(io, .{ .sub_path = root ++ "/u1/_chat/convs/c1/messages.jsonl", .data = msgs });
+    try cwd.writeFile(io, .{ .sub_path = root ++ "/u1/.veil-desk/memories.jsonl", .data = mem });
+    var mb: [256]u8 = undefined;
+    try cwd.writeFile(io, .{ .sub_path = root ++ "/u1/" ++ MANIFEST_FILE, .data = try std.fmt.bufPrint(&mb, "{{\"p\":\"_chat/convs/c1/messages.jsonl\",\"sz\":34,\"h\":0}}\n{{\"p\":\".veil-desk/memories.jsonl\",\"sz\":{d},\"h\":{d}}}\n", .{ mem.len, std.hash.Fnv1a_64.hash(mem) }) });
+
+    const w = fakehttp.wire;
+    const missing = w("{\"success\":false,\"errors\":[{\"code\":10006,\"message\":\"The specified bucket does not exist.\"}]}");
+    const routes = [_]fakehttp.Route{
+        .{ .method = "PUT", .path = "/r2/buckets/nl-veil/objects/", .reply = missing, .times = 1 }, // deleted on Cloudflare's side
+        .{ .method = "GET", .path = "/r2/buckets/nl-veil", .reply = missing },
+        .{ .method = "POST", .path = "/accounts/acct/r2/buckets", .reply = w("{\"success\":true,\"errors\":[],\"result\":{\"name\":\"nl-veil\"}}") },
+        .{ .method = "PUT", .path = "/r2/buckets/nl-veil/objects/", .reply = w("{\"success\":true,\"errors\":[],\"result\":{}}") },
+    };
+    var srv: fakehttp.Server = undefined;
+    try srv.startRouted(io, &routes, missing);
+    var running = true;
+    defer if (running) srv.stop();
+    var ub: [80]u8 = undefined;
+    ta.app.cf_oauth_accounts_url = try std.fmt.bufPrint(&ub, "http://127.0.0.1:{d}/client/v4/accounts", .{srv.port});
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var st: State = .{ .bucket_ok = true, .bucket_account = "acct" };
+    runPass(&ta.app, 1, &st, "acct", "k", a);
+    srv.stop();
+    running = false;
+
+    try std.testing.expect(st.bucket_ok);
+    try std.testing.expectEqualStrings("acct", st.bucket_account);
+    try std.testing.expectEqualStrings("", st.last_error);
+    try std.testing.expect(st.last_ok > 0);
+    // Both files are in the new bucket: the unchanged memory store too, which the old manifest would have skipped.
+    try std.testing.expectEqual(@as(u64, 2), st.files);
+    try std.testing.expectEqual(@as(u64, msgs.len + mem.len), st.bytes);
+    try std.testing.expectEqual(@as(usize, 2), loadManifest(&ta.app, 1, a).count());
+    // the refused upload, then the check, the create and both uploads - in that order
+    try std.testing.expectEqual(@as(?usize, 0), srv.firstCall("PUT", "/objects/u1/_chat/convs/c1/messages.jsonl"));
+    try std.testing.expectEqual(@as(usize, 1), srv.countCalls("POST", "/r2/buckets"));
+    try std.testing.expectEqual(@as(usize, 3), srv.countCalls("PUT", "/objects/"));
+    try std.testing.expectEqual(@as(usize, 1), srv.countCalls("PUT", "/objects/u1/.veil-desk/memories.jsonl"));
 }

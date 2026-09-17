@@ -165,7 +165,8 @@ Tick **use my domain** and it becomes a named tunnel **through your own account*
 account, pointed at this server, given the hostname you typed on one of your domains (or `veil.<your first
 domain>`), and put behind a **Cloudflare Access** policy that admits only your own email when your account has
 a Zero Trust organization. That address is permanent and public in the DNS sense, which is exactly why it is a
-choice and not the default.
+choice and not the default. Type a different hostname later and the tunnel moves with it: the old name's DNS
+record and Access app come off your account, and the new name gets its own.
 
 What keeps that safe to do:
 
@@ -179,9 +180,10 @@ What keeps that safe to do:
   never on a command line or in a file.
 - **Access when possible** - with a Zero Trust organization on the account, Cloudflare's own login page stands
   in front of the veil's; without one, the veil's rate-limited login is the gate, and the status line says
-  which of the two you have.
-- **off means off** - the connector is stopped and reaped; `{"on":false,"delete":true}` on the API also removes
-  the tunnel, its DNS record and its Access app from your account.
+  which of the two you have. A confidential `trycloudflare.com` address never has Access, and never claims it.
+- **off means off** - the connector is stopped and reaped, and closing the desktop app stops it too (the switch
+  stays where you left it, so the tunnel comes back at the next start); `{"on":false,"delete":true}` on the API
+  also removes the tunnel, its DNS record and its Access app from your account.
 
 The login asks for the tunnel, DNS, zone and Access scopes as *optional* permissions. A login that predates
 them simply lacks them; the switch then says so and asks you to log in with Cloudflare again.
