@@ -11,7 +11,7 @@
 //!     { "tool":"kill_swarm",     "id":"<swarm-id>" }              // hard-kill; run dir kept
 //!     { "tool":"swarm_status",   "id":"<swarm-id>" }              // state/pid/round/phase/budget
 //!     { "tool":"swarm_findings", "id":"<swarm-id>" }
-//!   (swarm ids resolve as EITHER the registry key or the run-dir basename)
+//!   (swarm ids resolve as EITHER the registry key or a name of one of the caller's run dirs: see Supervisor.resolve)
 //!   -> { "ok":true, "tool":"...", "result":"..." }               // mind tool
 //!   -> { "ok":true, "tool":"list_swarms", "swarms":[ … ] }       // orchestration
 
@@ -198,7 +198,7 @@ fn listSwarms(app: *App, uid: u64, res: *httpz.Response) !void {
 
 fn stopSwarm(app: *App, uid: u64, id: []const u8, res: *httpz.Response) !void {
     if (id.len == 0) return badReq(res, "stop_swarm needs an id");
-    const sw = app.sup.resolve(id) orelse return notFound(res);
+    const sw = app.sup.resolve(uid, id) orelse return notFound(res);
     if (sw.uid != uid) return unauth(res);
     app.sup.stop(sw.id);
     // Honest response: the STOP file is COOPERATIVE — the worker acts on it at its next turn/round
@@ -208,7 +208,7 @@ fn stopSwarm(app: *App, uid: u64, id: []const u8, res: *httpz.Response) !void {
 
 fn killSwarm(app: *App, uid: u64, id: []const u8, res: *httpz.Response) !void {
     if (id.len == 0) return badReq(res, "kill_swarm needs an id");
-    const sw = app.sup.resolve(id) orelse return notFound(res);
+    const sw = app.sup.resolve(uid, id) orelse return notFound(res);
     if (sw.uid != uid) return unauth(res);
     _ = app.sup.kill(sw.id);
     try res.json(.{ .ok = true, .tool = "kill_swarm", .requested = true, .id = id, .state = "stopping", .note = "hard-kill requested (STOP written + worker process terminated); the run dir and its findings are kept — the supervisor confirms the death shortly" }, .{});
@@ -219,7 +219,7 @@ fn killSwarm(app: *App, uid: u64, id: []const u8, res: *httpz.Response) !void {
 /// whole multi-MB log), elapsed seconds vs the manifest's minutes budget, and the last lifecycle event.
 fn swarmStatus(app: *App, uid: u64, id: []const u8, res: *httpz.Response) !void {
     if (id.len == 0) return badReq(res, "swarm_status needs an id");
-    const sw = app.sup.resolve(id) orelse return notFound(res);
+    const sw = app.sup.resolve(uid, id) orelse return notFound(res);
     if (sw.uid != uid) return unauth(res);
     const pid_st = app.sup.pidStatus(sw.run_dir);
 
@@ -297,7 +297,7 @@ fn swarmStatus(app: *App, uid: u64, id: []const u8, res: *httpz.Response) !void 
 
 fn findings(app: *App, uid: u64, id: []const u8, res: *httpz.Response) !void {
     if (id.len == 0) return badReq(res, "swarm_findings needs an id");
-    const sw = app.sup.resolve(id) orelse return notFound(res);
+    const sw = app.sup.resolve(uid, id) orelse return notFound(res);
     if (sw.uid != uid) return unauth(res);
     // Prefer the lead synthesis; fall back to the tail of the raw event log.
     const syn_path = try std.fmt.allocPrint(res.arena, "{s}/work/synthesis.md", .{sw.run_dir});
