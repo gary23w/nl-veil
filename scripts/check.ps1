@@ -316,12 +316,14 @@ if ($Scan) {
         Write-Host "[markers] check.sh uses a DIFFERENT marker pattern -- the two scans would report different debt" -ForegroundColor Yellow
     }
 
-    # 6) allocPrint-into-copy leaks: a call that COPIES its argument leaves a gpa-backed allocPrint
-    #    result passed inline with no owner, so it is never freed -- a slow per-call bleed in a
-    #    long-lived server. appendSlice copies (found live in writer, ledger 0004, and commons, 0009),
-    #    and so does every error helper listed below: each keeps its own copy of the message it is
-    #    handed. llm.zig's err()/stepErr() leaked that way at seven sites (1b438fa, aeb6ac7) while this
-    #    rule matched appendSlice alone and reported none of them. The fix is always the same shape:
+    # 6) allocPrint-into-copy/borrow leaks: a call that COPIES its argument, or only reads it and keeps
+    #    none of it, leaves a gpa-backed allocPrint result passed inline with no owner, so it is never
+    #    freed -- a slow per-call bleed in a long-lived server. appendSlice copies (found live in writer,
+    #    ledger 0004, and commons, 0009), and so does every error helper listed below: each keeps its own
+    #    copy of the message it is handed. llm.zig's err()/stepErr() leaked that way at seven sites
+    #    (1b438fa, aeb6ac7) while this rule matched appendSlice alone and reported none of them, and
+    #    worker/run.zig's startup leaked four act() event notes before act joined the list. The fix is
+    #    always the same shape:
     #        const why = std.fmt.allocPrint(gpa, ...) catch return stepErr(gpa, "<static>");
     #        defer gpa.free(why);
     #        return stepErr(gpa, why);
@@ -338,20 +340,35 @@ if ($Scan) {
         'errJson', 'orchErr', 'editRejectMsg',      # browser/manager.zig + mcp/client.zig + mcp/discovery.zig, chat/engine.zig, worker/tools.zig: format a new string
         'badReq', 'capErr', 'serverErr',            # gateway/http.zig: serialized into the response
         'noteReject', 'noteWriteReject',            # worker/run.zig, worker/tools.zig: appendSlice into the reject notes
-        'failCast', 'consoleLaunchFailed'           # desk chat.zig: copied into the store
+        'failCast', 'consoleLaunchFailed',          # desk chat.zig: copied into the store
+        'act'                                       # worker/run.zig Worker.act: JSON-escapes each slice into its own event line
     )
-    # The match is the allocPrint call itself, and a lookbehind walks back to the callee: that keeps the
-    # scan to a literal search per file, about what the old per-line rule cost. Leading with the list of
-    # names instead matches the same sites and costs ~10x that.
+    # The same leak without a call to name: a field its consumer only reads, set inline in a struct
+    # literal. std.Io.Dir.writeFile opens .sub_path and keeps nothing, and `.sub_path =
+    # std.fmt.allocPrint(gpa, ...)` leaked that way at ten sites in worker/run.zig and agi.zig -- once per
+    # goal reset, per plan revision and per state consolidation -- while this rule saw only calls.
+    # A field name belongs in this list only if every struct that src/ and desk/src/ can set it on keeps
+    # none of the slice: no struct there or in the vendored packages declares a sub_path, and std.Io's
+    # only one (Dir.WriteFileOptions) is read by writeFile. .data stays out: main.zig's Paths.data owns
+    # the path it is set to.
+    $borrowingFields = @(
+        'sub_path'                                  # std.Io.Dir.WriteFileOptions: writeFile opens it and keeps nothing
+    )
+    # The match is the allocPrint call itself, and a lookbehind walks back to the callee or the field:
+    # that keeps the scan to a literal search per file, about what the old per-line rule cost. Leading
+    # with the list of names instead matches the same sites and costs ~10x that.
     # The arguments ahead of the formatted one hold no top-level comma, paren, semicolon or line break
     # (one level of (...) is allowed), so a match cannot leave the call's own argument list -- but a call
     # split across lines still matches, which the per-line Select-String this replaced could not see.
-    $leakPattern = '(?<=(?<call>\b(?:' + ($copyingCallees -join '|') + '))\(\s*(?>(?:[^,()\r\n;]|\([^()\r\n]*\))+,\s*)*(?:try\s+)?)std\.fmt\.allocPrint\(gpa[,)]'
+    # Both forms capture `call`, the position the // filter below measures from.
+    $callForm = '(?<call>\b(?:' + ($copyingCallees -join '|') + '))\(\s*(?>(?:[^,()\r\n;]|\([^()\r\n]*\))+,\s*)*'
+    $fieldForm = '(?<call>\.(?:' + ($borrowingFields -join '|') + '))\s*=\s*'
+    $leakPattern = '(?<=(?:' + $callForm + '|' + $fieldForm + ')(?:try\s+)?)std\.fmt\.allocPrint\(gpa[,)]'
     $leaks = @()
     foreach ($zf in Get-ChildItem (Join-Path $repo "src"), (Join-Path $repo "desk\src") -Recurse -Filter *.zig) {
         $text = [IO.File]::ReadAllText($zf.FullName)
         foreach ($m in [regex]::Matches($text, $leakPattern)) {
-            # a call written out in a // comment is prose, not a site (string literals blanked first: "http://")
+            # a call or field written out in a // comment is prose, not a site (string literals blanked first: "http://")
             $call = $m.Groups['call'].Index
             $bol = $text.LastIndexOf([char]10, [Math]::Max($call - 1, 0)) + 1
             if (($text.Substring($bol, $call - $bol) -replace '"(?:[^"\\]|\\.)*"', '""').Contains('//')) { continue }
@@ -360,10 +377,10 @@ if ($Scan) {
     }
     if ($leaks.Count -gt 0) {
         $signals += $leaks.Count
-        Write-Host ("[leaks] {0} inline allocPrint(gpa)-into-copy site(s) (each leaks per call; capture + defer free):" -f $leaks.Count) -ForegroundColor Yellow
+        Write-Host ("[leaks] {0} inline allocPrint(gpa)-into-copy/borrow site(s) (each leaks per call; capture + defer free):" -f $leaks.Count) -ForegroundColor Yellow
         $leaks | ForEach-Object { Write-Host "    $_" }
     } else {
-        Write-Host "[leaks] no inline allocPrint(gpa)-into-copy sites" -ForegroundColor Green
+        Write-Host "[leaks] no inline allocPrint(gpa)-into-copy/borrow sites" -ForegroundColor Green
     }
 
     # 6b) the built-in palettes are mirrored BY HAND into the web stylesheet — plug/theme.zig says so
