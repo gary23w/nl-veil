@@ -620,6 +620,84 @@ fn procExited(child: *std.process.Child, exit_code: *?u32) bool {
     }
 }
 
+/// TEST ONLY: once a test sets `test_console_environ`, a `zig build test` build starts a console command's
+/// environment from it instead of from the desk's own, so the test decides what the child inherits BEFORE
+/// consoleEnviron has its say. The shell that runs the tests can already turn git's prompts off — the
+/// PowerShell this repo's checks ran from on 2026-09-17 sets GIT_TERMINAL_PROMPT=0 and an empty GIT_ASKPASS —
+/// and there a consoleEnviron that set neither would still pass every test. A shipped build always starts from
+/// the desk's own. anyAskpassNamed reads it too, so one seam decides both halves.
+var test_console_environ: ?*const std.process.Environ.Map = null;
+
+/// A console command's environment: the desk's own (llm.osEnviron), with git's credential questions turned off
+/// PER DOOR, so a command that needs a credential it hasn't got fails in milliseconds instead of sitting on the
+/// deadline. The child inherits the desk's controlling terminal on Linux and macOS, so a git that asks holds
+/// /dev/tty open and waits there — in the terminal the DESK was started from, where nobody is looking — until
+/// the deadline kills it. Measured 2026-09-17 with git 2.43 in WSL, run as the console runs it (`sh -c`, under a
+/// pty, against a 127.0.0.1 stand-in that answers 401): before this change git printed "Username for
+/// 'http://…':" onto the pty and was still sitting there when its 8s bound killed it — the whole 60s or 300s of
+/// a real console command; with GIT_TERMINAL_PROMPT=0 it gave up in under a second. The knobs are git's, and
+/// gitvc.zig's gitEnviron gives the desk's OWN git children the same treatment; its doc comment holds the rest
+/// of the measurements, including what each one does on Windows.
+///
+/// - GIT_TERMINAL_PROMPT=0 on BOTH doors. Neither tab can answer a terminal prompt: a console command's stdin is
+///   the null device and its output is a sink file polled into the scrollback, so nothing is shown to answer and
+///   there is nowhere to type. The AI door additionally has nobody to ask. git now gives up at once — "could not
+///   read Username for '<url>': terminal prompts disabled" — which consoleCredentialNote turns into a line the
+///   reader can act on.
+/// - An empty GIT_ASKPASS on the AI door ONLY, which also stops git consulting core.askPass and SSH_ASKPASS
+///   (measured in gitEnviron: git skips an askpass whose name is empty and then looks at neither of the other
+///   two). An askpass is a DIALOG, and that is where the two doors genuinely differ. Nobody can answer for the
+///   model: a RUN: command would pop a credential dialog over the user's desktop, unasked and unexplained, and
+///   burn its 60s turn waiting for an answer the model cannot give. The You tab is a person's own console, and a
+///   person who configured an askpass and just typed `git push` there can answer the dialog it raises — so the
+///   You tab keeps whatever askpass the desk inherited, and keeps a credential path that works: in the same WSL
+///   run, a You-tab environment (prompts off, askpass named) ran the askpass and pushed its answer to the remote
+///   in under a second. The cost of keeping it is that a dialog which WAITS for its person, and which the tab
+///   cannot show is waiting, can still eat the 300s deadline; consoleCredentialNote says so when it does, which
+///   is the difference between this decision and a silent hang.
+///
+/// This covers git's own questions. A program git starts for a remote or a signature (ssh, gpg), and any other
+/// command that opens /dev/tty itself, still asks on the inherited terminal: std.process.spawn cannot put the
+/// child in its own session (it offers pgid, not setsid), so the console cannot take that terminal away.
+fn consoleEnviron(gpa: std.mem.Allocator, ai: bool) !std.process.Environ.Map {
+    var env = if (builtin.is_test and test_console_environ != null)
+        try test_console_environ.?.clone(gpa)
+    else
+        try std.process.Environ.createMap(llm.osEnviron(), gpa);
+    errdefer env.deinit();
+    try env.put("GIT_TERMINAL_PROMPT", "0");
+    if (ai) try env.put("GIT_ASKPASS", "");
+    return env;
+}
+
+/// git's report that it could not ask for a credential is real but jargon, and a You command that ran out its
+/// deadline with an askpass dialog waiting off-screen says nothing at all. Both doors get told which it was and
+/// what to do instead — a model retrying `git push` until the arc stalls wastes exactly what the user waiting on
+/// a dead 300s command does. Pure: the caller reads the environment (anyAskpassNamed) and the outcome.
+fn consoleCredentialNote(ai: bool, timed_out: bool, out: []const u8, err: []const u8, askpass_named: bool) ?[]const u8 {
+    // The phrase is git's own, and ONLY GIT_TERMINAL_PROMPT=0 produces it — so this fires on the failure the
+    // console itself arranged (consoleEnviron), never on a push that failed for its own reasons.
+    const REFUSED = "terminal prompts disabled";
+    if (std.mem.indexOf(u8, out, REFUSED) != null or std.mem.indexOf(u8, err, REFUSED) != null) {
+        return if (ai)
+            "(this console can ask no one for a credential, so git failed instead of waiting out the turn. " ++
+                "Use the git tools — git_commit / repo_create / git_push — which authenticate with the saved token; " ++
+                "a shell `git push` from here never can.)"
+        else
+            "(this console cannot ask you for a credential: its input is closed and its output is a file, so git was " ++
+                "told to fail rather than wait where you could not answer. Set up a credential helper for this repo, " ++
+                "or have the Veil push — its git tools use the token from `::pat`.)";
+    }
+    // The You tab's kept askpass (consoleEnviron), come due: a dialog it cannot show is waiting for a person who
+    // has no reason to know it opened. Only claimed where an askpass is actually named, and only on the door that
+    // keeps one.
+    if (!ai and timed_out and askpass_named)
+        return "(if it was waiting for a credential, the dialog your askpass program opened is still off-screen — " ++
+            "answer or close it, then run the command again. This console leaves that dialog alone because you are " ++
+            "the one who can answer it.)";
+    return null;
+}
+
 /// One in-flight micro-console command, run off the worker's blocking path (see pumpConsole). `ai` selects
 /// the tab: Veil (the AI's RUN: door, whose result folds back into the turn) vs You (the user's own shell).
 /// stdout and stderr go to SEPARATE sink files ("<base>.out"/".err") because Windows reopens each inherited
@@ -3229,8 +3307,15 @@ pub const Chat = struct {
             win_argv_ps = .{ "powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", apb[0..an] };
             break :blk &win_argv_ps;
         } else &posix_argv;
+        // Credential questions this console cannot answer are turned off in the CHILD's environment, per door
+        // (consoleEnviron) — without it a `git push` here waits out its whole deadline on a terminal nobody is
+        // watching. On OOM the child inherits the desk's environment unchanged: a command that runs and might
+        // hang beats a command that refuses to run.
+        var env: ?std.process.Environ.Map = consoleEnviron(self.gpa, ai) catch null;
+        defer if (env) |*e| e.deinit();
         const child = std.process.spawn(self.io, .{
             .argv = argv,
+            .environ_map = if (env) |*e| e else null,
             .cwd = if (cwd_dir) |d| .{ .dir = d } else .inherit,
             .stdin = .ignore,
             .stdout = .{ .file = of },
@@ -3335,6 +3420,25 @@ pub const Chat = struct {
         log.info("verify: the read-back FAILED mechanically — re-arming the verify gate", .{});
     }
 
+    /// Does the desk's environment name an askpass program — the credential dialog the You tab deliberately
+    /// keeps (consoleEnviron)? Only the two ENV names are visible here; git's own core.askPass lives in a repo's
+    /// config, so a dialog raised that way goes unremarked rather than wrongly claimed.
+    fn anyAskpassNamed(self: *Chat) bool {
+        const names = [_][]const u8{ "GIT_ASKPASS", "SSH_ASKPASS" };
+        if (builtin.is_test) {
+            if (test_console_environ) |m| {
+                for (names) |name| if (m.get(name)) |v| {
+                    if (v.len > 0) return true;
+                };
+                return false;
+            }
+        }
+        for (names) |name| {
+            if (std.process.Environ.containsUnempty(llm.osEnviron(), self.gpa, name) catch false) return true;
+        }
+        return false;
+    }
+
     /// Poll the in-flight micro-console command each tick WITHOUT blocking. While it runs, do nothing; once it
     /// finishes (natural exit) or must be stopped (deadline, Stop button, or output flood), read its captured
     /// output, append it + a status note to the scrollback, and — for the AI door — fold the result back and
@@ -3409,11 +3513,26 @@ pub const Chat = struct {
             .flooded => "(command produced too much output — stopped)\n",
         };
 
+        // A command that hit a credential question rides its own line out with the status note, so it reaches the
+        // scrollback AND (below) the model's fold. The environment lookup costs an allocation, so it is made only
+        // where its answer can matter: a You command that ran out its deadline (consoleCredentialNote).
+        var cnb: [768]u8 = undefined;
+        const note_all: []const u8 = if (consoleCredentialNote(
+            ai,
+            outcome == .timed_out,
+            out_slice,
+            err_slice,
+            !ai and outcome == .timed_out and self.anyAskpassNamed(),
+        )) |hint|
+            std.fmt.bufPrint(&cnb, "{s}{s}\n", .{ note, hint }) catch note
+        else
+            note;
+
         // Scrollback: stdout, then stderr, then the note (matches the old separate-stream append order).
         if (out_slice.len > 0) self.store.consoleAppend(ai, out_slice);
         if (err_slice.len > 0) self.store.consoleAppend(ai, err_slice);
         if (out_slice.len == 0 and err_slice.len == 0) self.store.consoleAppend(ai, "(no output)\n");
-        if (note.len > 0) self.store.consoleAppend(ai, note);
+        if (note_all.len > 0) self.store.consoleAppend(ai, note_all);
         self.setConsoleBusy(ai, false);
         log.info("console: {s} finished ({t}) — {d}b out, {d}b err", .{ if (ai) "veil" else "you", outcome, out_slice.len, err_slice.len });
 
@@ -3521,13 +3640,13 @@ pub const Chat = struct {
             // and keeps the HEAD up to a ~6KB body cap (rb minus the note), so anything past that is dropped from
             // the model's view — NOT readSink's 40KB sink. Detect at THIS layer and say so, or the model re-runs the
             // same dump thinking the file "didn't show".
-            const vis_budget = if (rb.len > note.len + 280) rb.len - note.len - 280 else 0;
+            const vis_budget = if (rb.len > note_all.len + 280) rb.len - note_all.len - 280 else 0;
             const vis_clipped = out_slice.len + err_slice.len > vis_budget;
-            var note_buf: [640]u8 = undefined;
+            var note_buf: [1408]u8 = undefined;
             const note_full = if (vis_clipped)
-                (std.fmt.bufPrint(&note_buf, "{s}(output was long and TRUNCATED — you are seeing only PART of it, roughly the first {d}KB. To read a file in full use TOOL: read_file {{\"path\":\"...\"}}; to run a command make it output less, e.g. Get-Content <file> -TotalCount 80.)\n", .{ note, vis_budget / 1024 }) catch note)
+                (std.fmt.bufPrint(&note_buf, "{s}(output was long and TRUNCATED — you are seeing only PART of it, roughly the first {d}KB. To read a file in full use TOOL: read_file {{\"path\":\"...\"}}; to run a command make it output less, e.g. Get-Content <file> -TotalCount 80.)\n", .{ note_all, vis_budget / 1024 }) catch note_all)
             else
-                note;
+                note_all;
             const result = composeConsoleResult(&rb, out_slice, err_slice, note_full);
             // RAG-ON-FAILURE: a failing command recalls the playbook against the COMMAND ITSELF (the
             // user's request rarely names the executable) — if a past verified fix covers this failure
@@ -15031,6 +15150,151 @@ test "micro-console: an AI RUN: command folds its output back as a [console] mes
     llm.abort(&ctx.chat.stream, ctx.io());
     ctx.chat.stream.deinit(std.testing.allocator);
     ctx.chat.turn = .idle;
+}
+
+// ---- the console asks nobody for a credential -------------------------------------------------------------
+//
+// A console command inherits the desk's controlling terminal on Linux and macOS, so a `git push` that needs a
+// credential used to wait on /dev/tty — in the terminal the DESK was started from — until its deadline killed
+// it, 60s on the AI door and 300s on the You tab. consoleEnviron turns git's questions off in the child, per
+// door. The askpass a desk inherits is a program that ANSWERS such a question, wherever it was named; these
+// tests seed one, because a build whose environment named none could not tell the doors apart.
+const ASKPASS_PROBE = "veil-askpass-probe";
+
+/// The desk's environment as a test decides it was started: an askpass named the way an editor's terminal or a
+/// desktop session names one (unless `askpass` is false), and git's terminal prompts NOT already off. Without
+/// this the checks run vacuously — the PowerShell this repo's checks ran from on 2026-09-17 sets both.
+fn seedConsoleEnviron(gpa: std.mem.Allocator, askpass: bool) !std.process.Environ.Map {
+    var env = try std.process.Environ.createMap(llm.osEnviron(), gpa);
+    errdefer env.deinit();
+    _ = env.swapRemove("GIT_TERMINAL_PROMPT");
+    _ = env.swapRemove("SSH_ASKPASS");
+    if (askpass) try env.put("GIT_ASKPASS", ASKPASS_PROBE) else _ = env.swapRemove("GIT_ASKPASS");
+    return env;
+}
+
+test "micro-console: both doors' commands run with git's terminal prompt off; only the AI door's loses the inherited askpass" {
+    const gpa = std.testing.allocator;
+    const dd = "zig-console-noprompt-tmp";
+    var ctx = ConsoleTestCtx.init(dd, true);
+    defer ctx.deinit(dd);
+    ctx.chat.cmdNewConv(dd); // the AI door folds its result into a conversation
+    var seeded = try seedConsoleEnviron(gpa, true);
+    defer seeded.deinit();
+    test_console_environ = &seeded;
+    defer test_console_environ = null;
+
+    // Ask the child itself what it got. POSIX `${X+SET}` answers "is it set at all", which `[$X]` alone cannot:
+    // on the AI door git must find GIT_ASKPASS SET AND EMPTY — merely unset would send git on to core.askPass
+    // and SSH_ASKPASS. On Windows an unset var survives batch expansion as the literal `%GIT_ASKPASS%`, so
+    // `A=[]` there already means set-and-empty.
+    const posix_probe = "echo \"T=[$GIT_TERMINAL_PROMPT] A=[$GIT_ASKPASS] P=[${GIT_ASKPASS+SET}]\"";
+    const you_cmd = if (builtin.os.tag == .windows)
+        "echo \"T=[$env:GIT_TERMINAL_PROMPT] A=[$env:GIT_ASKPASS]\""
+    else
+        posix_probe;
+    ctx.chat.consoleStart(dd, false, you_cmd);
+    ctx.drain(dd);
+    try std.testing.expect(ctx.chat.console == null);
+    // The You tab: prompts off (it can show no prompt and take no typing), askpass untouched — a person who
+    // configured one and typed `git push` here is the one who can answer its dialog.
+    try std.testing.expect(consoleScrollHas(ctx.store, false, "T=[0]"));
+    try std.testing.expect(consoleScrollHas(ctx.store, false, "A=[" ++ ASKPASS_PROBE ++ "]"));
+
+    const ai_cmd = if (builtin.os.tag == .windows)
+        "echo T=[%GIT_TERMINAL_PROMPT%] A=[%GIT_ASKPASS%]"
+    else
+        posix_probe;
+    ctx.chat.consoleStart(dd, true, ai_cmd);
+    ctx.drain(dd);
+    try std.testing.expect(ctx.chat.console == null);
+    // The AI door: nobody can answer for the model, so neither way of asking survives.
+    try std.testing.expect(consoleScrollHas(ctx.store, true, "T=[0]"));
+    try std.testing.expect(consoleScrollHas(ctx.store, true, "A=[]"));
+    try std.testing.expect(!consoleScrollHas(ctx.store, true, ASKPASS_PROBE));
+    if (builtin.os.tag != .windows) try std.testing.expect(consoleScrollHas(ctx.store, true, "P=[SET]"));
+    // tear down the follow-up turn's stream (foldConsoleAi started one against the dead endpoint)
+    llm.abort(&ctx.chat.stream, ctx.io());
+    ctx.chat.stream.deinit(gpa);
+    ctx.chat.turn = .idle;
+}
+
+test "consoleCredentialNote: a refused credential prompt is explained on both doors, and a You timeout claims a waiting dialog only where one is named" {
+    // git's own words for the question consoleEnviron turned off — the phrase only GIT_TERMINAL_PROMPT=0 makes
+    // it print (gitvc.zig's push test pins the same string against a real git).
+    const refused = "fatal: could not read Username for 'https://github.com/o/r.git': terminal prompts disabled\n";
+    const on_ai = consoleCredentialNote(true, false, "", refused, false) orelse return error.AiDoorExplainedNothing;
+    try std.testing.expect(std.mem.indexOf(u8, on_ai, "git_push") != null); // the door it CAN push through
+    const on_you = consoleCredentialNote(false, false, refused, "", false) orelse return error.YouDoorExplainedNothing;
+    try std.testing.expect(std.mem.indexOf(u8, on_you, "::pat") != null);
+    // Ordinary output is never dressed up as a credential failure, on either door.
+    try std.testing.expect(consoleCredentialNote(true, false, "Everything up-to-date\n", "", true) == null);
+    try std.testing.expect(consoleCredentialNote(false, false, "", "", true) == null);
+    // A timeout claims a waiting dialog only on the door that keeps an askpass, and only when one is named —
+    // otherwise the timeout stands on its own rather than blaming a dialog that cannot exist.
+    try std.testing.expect(consoleCredentialNote(false, true, "", "", false) == null);
+    try std.testing.expect(consoleCredentialNote(true, true, "", "", true) == null);
+    const waiting = consoleCredentialNote(false, true, "", "", true) orelse return error.TimeoutExplainedNothing;
+    try std.testing.expect(std.mem.indexOf(u8, waiting, "askpass") != null);
+}
+
+test "micro-console: the way out of a refused credential folds back to the MODEL, not only into the scrollback" {
+    const dd = "zig-console-credfold-tmp";
+    var ctx = ConsoleTestCtx.init(dd, true);
+    defer ctx.deinit(dd);
+    ctx.chat.cmdNewConv(dd); // an active conversation for the fold to append into
+    // Stands in for the git consoleEnviron just refused: its own words, from a command that exits at once. The
+    // model reads the fold, not the scrollback, so a note that reached only the scrollback would leave it
+    // re-running a `git push` that can never authenticate.
+    ctx.chat.consoleStart(dd, true, "echo fatal: could not read Username: terminal prompts disabled");
+    ctx.drain(dd);
+    try std.testing.expect(ctx.chat.console == null);
+    var folded_hint = false;
+    {
+        ctx.store.lock();
+        defer ctx.store.unlock();
+        var k: usize = 0;
+        while (k < ctx.store.msg_count) : (k += 1) {
+            const txt = ctx.store.msgs[k].textStr();
+            if (std.mem.indexOf(u8, txt, "[console]") != null and std.mem.indexOf(u8, txt, "git_push") != null) folded_hint = true;
+        }
+    }
+    try std.testing.expect(folded_hint);
+    // tear down the follow-up turn's stream (foldConsoleAi started one against the dead endpoint)
+    llm.abort(&ctx.chat.stream, ctx.io());
+    ctx.chat.stream.deinit(std.testing.allocator);
+    ctx.chat.turn = .idle;
+}
+
+test "micro-console: a You command that runs out its deadline says a credential dialog may be waiting, but only while an askpass is named" {
+    const gpa = std.testing.allocator;
+    const dd = "zig-console-askpass-timeout-tmp";
+    var ctx = ConsoleTestCtx.init(dd, false);
+    defer ctx.deinit(dd);
+    const longcmd = if (builtin.os.tag == .windows) "ping -n 20 127.0.0.1" else "sleep 20";
+
+    var with_askpass = try seedConsoleEnviron(gpa, true);
+    defer with_askpass.deinit();
+    test_console_environ = &with_askpass;
+    defer test_console_environ = null;
+    ctx.chat.consoleStart(dd, false, longcmd);
+    try std.testing.expect(ctx.chat.console != null);
+    ctx.chat.console.?.deadline_s = ctx.chat.nowS() - 1; // what the 300s wall does, without waiting for it
+    ctx.drain(dd);
+    try std.testing.expect(consoleScrollHas(ctx.store, false, "timed out"));
+    try std.testing.expect(consoleScrollHas(ctx.store, false, "off-screen"));
+
+    // Same timeout with no askpass named anywhere: the deadline is reported, and nothing is invented about it.
+    ctx.store.console_you_len = 0;
+    var no_askpass = try seedConsoleEnviron(gpa, false);
+    defer no_askpass.deinit();
+    test_console_environ = &no_askpass;
+    ctx.chat.consoleStart(dd, false, longcmd);
+    try std.testing.expect(ctx.chat.console != null);
+    ctx.chat.console.?.deadline_s = ctx.chat.nowS() - 1;
+    ctx.drain(dd);
+    try std.testing.expect(consoleScrollHas(ctx.store, false, "timed out"));
+    try std.testing.expect(!consoleScrollHas(ctx.store, false, "off-screen"));
 }
 
 test "prompt tiers: compact doctrine keeps every protocol surface the dispatcher parses" {
