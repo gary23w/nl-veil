@@ -34,6 +34,7 @@
 
 const std = @import("std");
 const builtin_mod = @import("builtin.zig");
+const bu = @import("browser/util.zig"); // sleepMs: a raw-thread sleep, no Io park
 
 const Model = opaque {};
 const Ctx = opaque {};
@@ -509,9 +510,20 @@ fn unloadLocked() void {
     }
 }
 
+/// The idle unloader: once a minute, drops the weights if nothing has generated for keepalive_s.
+///
+/// IT SLEEPS ON THE OS, NOT ON io.sleep. This is a plain std.Thread, and on Windows std.Io.Threaded
+/// sleeps by parking the thread on NtWaitForAlertByThreadId — the per-thread alert the runtime also
+/// wakes its mutex, condition and task waiters with. A thread the runtime did not spawn takes that
+/// sleep's uncancelable branch, where a wake before the timeout is `unreachable`: undefined behaviour
+/// in the ReleaseFast build. Alerts are sticky and shared by everything on the thread, so one stray
+/// alert lands in the next park (desk/src/nap.zig's header has the 2026-09-02 desk freeze that did
+/// exactly that), and a stack census of a live veil.exe on 2026-09-16 found this thread parked there.
+/// sleepMs is kernel32 Sleep, a non-alertable NtDelayExecution that no alert can end (libc nanosleep
+/// elsewhere).
 fn unloaderLoop() void {
     while (true) {
-        g.io.sleep(.{ .nanoseconds = 60 * std.time.ns_per_s }, .awake) catch {};
+        bu.sleepMs(60 * std.time.ms_per_s);
         lock();
         const idle = g.ctx != null and g.last_used_s > 0 and nowS(g.io) - g.last_used_s > g.keepalive_s;
         if (idle) {

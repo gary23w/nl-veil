@@ -15,7 +15,7 @@ The supervisor is the control plane's process manager. A cast/deploy is launched
 - Spawn a detached worker for a cast and record it in the registry.
 - Re-adopt swarms found in the data dir on boot (the "N swarms re-adopted" line at startup).
 - Report the live fleet (`/api/v1/fleet`, `/api/v1/swarms`).
-- A raw-thread sleep helper for loops that run outside the Io scheduler.
+- A raw-thread sleep helper (`threadSleepMs`, Win32 `Sleep` on Windows) for the waits on threads the Io runtime did not spawn: `bgLoop`'s cadence and `remove`'s rmTree retries on an httpz worker. Not `io.sleep`: on Windows that parks the thread on the runtime's per-thread alert, and a stray alert there is undefined behaviour in the ReleaseFast build.
 
 ## Dependencies
 
