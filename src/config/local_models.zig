@@ -101,6 +101,7 @@ fn writeOut(res: *httpz.Response, reachable: bool, port: u16, installed: []const
 const fakehttp = @import("../worker/fakehttp.zig");
 const FakeOllama = fakehttp.Server;
 const wire = fakehttp.wire;
+const portprobe = @import("../worker/portprobe.zig");
 
 /// TEST ONLY. The handler's answer, lifted out of the httpz test arena so an assertion can outlive it.
 const Answer = struct {
@@ -150,6 +151,16 @@ fn portOf(gpa: std.mem.Allocator, ans: Answer) !u16 {
     const p = try std.json.parseFromSlice(std.json.Value, gpa, ans.body, .{});
     defer p.deinit();
     return @intCast(p.value.object.get("port").?.integer);
+}
+
+/// TEST ONLY. Start `def` on `port` unless something already holds it: a real Ollama, or another test
+/// process's stand-in. The ask comes first because on Windows the listen cannot answer it: it shares a held
+/// port instead of failing (worker/portprobe.zig), and the stand-in would then take a live Ollama's loopback
+/// traffic for the rest of the test. True = `def` is serving there, and the caller stops it.
+fn takeOver(def: *FakeOllama, io: std.Io, port: u16, reply: []const u8) bool {
+    if (portprobe.held(io, port)) return false;
+    def.startAt(io, port, reply) catch return false;
+    return true;
 }
 
 /// TEST ONLY. A real account and a real session, through the same doors the server uses. Auth fails
@@ -313,9 +324,9 @@ test "the ?port override is bounded: only a real non-zero port wins, and anythin
     // than merely echoed it, and the run stops spraying the log with the stack dump Windows prints
     // for every refused connect — the noise check.sh warns buries real failures.
     var def: FakeOllama = undefined;
-    const own_default = if (def.startAt(io, OLLAMA_PORT, wire(
+    const own_default = takeOver(&def, io, OLLAMA_PORT, wire(
         \\{"models":[{"name":"answered-on-the-default-port:1"}]}
-    ))) |_| true else |_| false;
+    ));
     defer if (own_default) def.stop();
 
     // Everything a query string can carry that is NOT a port falls back to the module's own default,
@@ -328,4 +339,35 @@ test "the ?port override is bounded: only a real non-zero port wins, and anythin
         try std.testing.expectEqual(@as(u16, 200), ans.status);
         if (own_default) try expectAnswer(gpa, ans, true, &.{"answered-on-the-default-port:1"});
     }
+}
+
+test "the default-port takeover backs off a port another socket already holds" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // OS-assigned ports stand in for 11434 with something already on it (a real Ollama, or another test
+    // process's stand-in): the real default port is never touched here.
+    const N = 4;
+    var holders: [N]std.Io.net.Server = undefined;
+    var fakes: [N]FakeOllama = undefined;
+    var took: [N]bool = @splat(false);
+    var open: usize = 0;
+    for (&holders, &fakes, &took) |*h, *f, *t| {
+        const any = std.Io.net.IpAddress{ .ip4 = .loopback(0) };
+        h.* = std.Io.net.IpAddress.listen(&any, io, .{ .mode = .stream, .protocol = .tcp }) catch break;
+        open += 1;
+        t.* = takeOver(f, io, h.socket.address.getPort(), wire("{}"));
+    }
+    // Holders close BEFORE any stand-in stops: stop() wakes its serve loop by dialing its own port, and a
+    // stand-in wrongly sharing a port with a holder only receives that dial once the holder is gone.
+    for (holders[0..open]) |*h| h.deinit(io);
+    var taken: usize = 0;
+    for (fakes[0..open], took[0..open]) |*f, t| if (t) {
+        f.stop();
+        taken += 1;
+    };
+    try std.testing.expectEqual(N, open);
+    try std.testing.expectEqual(@as(usize, 0), taken);
 }

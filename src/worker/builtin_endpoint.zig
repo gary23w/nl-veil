@@ -28,6 +28,7 @@ const httpz = @import("httpz");
 const builtin_mod = @import("builtin.zig");
 const gemma4 = @import("gemma4.zig");
 const llm = @import("llm.zig");
+const portprobe = @import("portprobe.zig");
 
 const log = std.log.scoped(.builtin_endpoint);
 
@@ -72,11 +73,11 @@ pub fn start(gpa: std.mem.Allocator, io: std.Io, eng: builtin_mod.Engine, enviro
 }
 
 fn tryStart(gpa: std.mem.Allocator, io: std.Io, app: *EndpointApp, port: u16) bool {
-    // Probe-bind first: httpz's listen() only reports "port in use" from its own thread, far too
-    // late to try the next port. The tiny bind→close→bind race is acceptable on loopback.
-    const addr = std.Io.net.IpAddress{ .ip4 = .loopback(port) };
-    var probe = std.Io.net.IpAddress.listen(&addr, io, .{ .mode = .stream, .protocol = .tcp }) catch return false;
-    probe.deinit(io);
+    // Ask first: httpz's listen() only reports "port in use" from its own thread, far too late to
+    // try the next port. And the ask cannot be a probe LISTEN: on Windows std's listen and httpz's
+    // SO_REUSEADDR both share a held port instead of failing, so a second veil sat on the first
+    // one's 8788 (portprobe.zig). The tiny ask→bind race is acceptable on loopback.
+    if (portprobe.held(io, port)) return false;
 
     const server = gpa.create(httpz.Server(*EndpointApp)) catch return false;
     server.* = httpz.Server(*EndpointApp).init(io, gpa, .{
@@ -1110,4 +1111,40 @@ test "/v1/chat/completions answers the OpenAI shape with usage, and refuses imag
     try oaiChat(&app, web2.req, web2.res);
     const b2 = try web2.getBody();
     try std.testing.expect(std.mem.indexOf(u8, b2, "text-only") != null);
+}
+
+test "a pinned port another socket already holds is refused before anything binds it, and nothing is published" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var bbuf: [64]u8 = undefined;
+    _ = testBearer(io, &bbuf); // builtin_mod.init against THIS io: start() publishes its port through it
+    defer testBearerCleanup(io);
+    var mock = MockEng{};
+    defer mock.deinit();
+    mock.gpa = gpa;
+
+    // Ports the OS assigned, each held by a listener the way a second veil's endpoint holds its own. Never
+    // 8788 itself: that one may belong to the live app.
+    const N = 4;
+    var holders: [N]std.Io.net.Server = undefined;
+    var open: usize = 0;
+    defer for (holders[0..open]) |*h| h.deinit(io);
+    const server_before = g_server;
+    const port_before = builtin_mod.port();
+    var refused: usize = 0;
+    for (&holders) |*h| {
+        const any = std.Io.net.IpAddress{ .ip4 = .loopback(0) };
+        h.* = try std.Io.net.IpAddress.listen(&any, io, .{ .mode = .stream, .protocol = .tcp });
+        open += 1;
+        var env = std.process.Environ.Map.init(gpa);
+        defer env.deinit();
+        var pbuf: [8]u8 = undefined;
+        try env.put("NL_BUILTIN_PORT", std.fmt.bufPrint(&pbuf, "{d}", .{h.socket.address.getPort()}) catch unreachable);
+        if (start(gpa, io, mock.engine(), &env)) |_| {} else |e| refused += @intFromBool(e == error.NoFreePort);
+    }
+    try std.testing.expectEqual(N, refused);
+    try std.testing.expect(g_server == server_before); // no httpz server was built for a held port
+    try std.testing.expectEqual(port_before, builtin_mod.port()); // and no shared base was handed to a caller
 }

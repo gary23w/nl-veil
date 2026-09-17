@@ -12,7 +12,7 @@ A separate 127.0.0.1-only listener (not routes on the main server) because swarm
 
 ## Key Exports
 
-- `start` — bind (NL_BUILTIN_PORT or a small scan), serve from a detached thread, report the port into builtin.zig
+- `start` — bind (NL_BUILTIN_PORT or a scan of 8788..8797), serve from a detached thread, report the port into builtin.zig; `error.NoFreePort` when every candidate is held
 - `ChanMachine` — the streaming channel router (public for its tests)
 
 ## Dependencies
@@ -21,7 +21,13 @@ A separate 127.0.0.1-only listener (not routes on the main server) because swarm
 - `worker/builtin.zig` — the Engine interface + secret/port state
 - `worker/gemma4.zig` — rendering + completion parsing
 - `worker/llm.zig` — `jstr`
+- `worker/portprobe.zig` — whether a candidate port is already held, asked before each httpz server is built
 
 ## Usage Context
 
 Started from main.zig boot only when `-Dbuiltin` compiled the engine in; tests drive every handler against a mock Engine with no weights and no C.
+
+## Notable Implementation Details
+
+- `tryStart` asks `portprobe.held` before building each server, because httpz's `listen()` reports a bind failure only from its own thread, too late to try the next port. The ask used to be a throwaway std listen, and on Windows that listen, like httpz's `SO_REUSEADDR` bind, shares a held port instead of failing: a second veil's endpoint sat on the first one's 8788. The race between the ask and httpz's bind is accepted on loopback.
+- Test: four OS-assigned ports, each held by a std listener, each pinned through `NL_BUILTIN_PORT`. `start` must refuse all four with `error.NoFreePort`, leave `g_server` untouched and publish no port. With the old probe it refused none and built four servers on the held ports.
