@@ -123,6 +123,9 @@ pub const Supervisor = struct {
     bg_stop: std.atomic.Value(bool) = .init(false),
     gc_data_dir: []const u8 = "",
     gc_days: u32 = 0,
+    /// TEST ONLY: a pid that pidAlive reads as a live worker on every OS. A unit test cannot start a veil worker, and
+    /// on Windows only a live veil.exe image counts. 0, the default, matches no pid.
+    test_live_pid: if (builtin.is_test) u32 else void = if (builtin.is_test) 0 else {},
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, neuron_bin: []const u8) Supervisor {
         return .{ .gpa = gpa, .io = io, .neuron_bin = neuron_bin };
@@ -828,6 +831,9 @@ pub const Supervisor = struct {
     }
 
     fn pidAlive(self: *Supervisor, pid: u32) bool {
+        if (builtin.is_test) {
+            if (pid != 0 and pid == self.test_live_pid) return true;
+        }
         if (builtin.os.tag == .windows) {
             // Native check (no tasklist spawn): "alive" == a live veil worker. A recycled pid on an unrelated
             // app reads as NOT alive, so it can't become a phantom-running swarm or get force-killed.
