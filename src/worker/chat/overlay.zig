@@ -11,8 +11,8 @@
 //! The overlay is a per-turn WORKING FIELD (hyperspace.Field: a bounded in-RAM set of facts settled by
 //! spreading activation around a focus — the swarm's Lever 2, which the chat engine never used) that is:
 //!   * SEEDED once at turn start — the conversation's own store partition (one bulk pull, the only subprocess
-//!     the overlay spends per turn), the user's durable memory exactly as the prompt shows it (credential
-//!     values already masked), and the file ledger;
+//!     the overlay spends per turn), the user's durable memory lines exactly as the prompt shows them (credential
+//!     values already masked; the block's header and footer are framing, not facts), and the file ledger;
 //!   * GROWN in-process as the turn produces findings — every tool-result note the engine mints for the store
 //!     enters the field the moment it exists, so a finding is recallable in the very next round, compaction or
 //!     not, and no subprocess is spent;
@@ -531,6 +531,34 @@ test "a render spends zero subprocesses and stays within its budget, whatever th
     try std.testing.expect(b.len <= HEADER.len + o.budget);
     try std.testing.expect(o.lines_shown >= 1);
     try std.testing.expect(std.mem.indexOf(u8, b, "[found] inventory note") != null);
+}
+
+test "a full field keeps every finding of a round: each is recallable at the next render, not only the last" {
+    const gpa = std.testing.allocator;
+    var o = Overlay.init(gpa, hs.MIN_FACTS);
+    defer o.deinit();
+    o.setGoal("restock the widgets warehouse");
+    var buf: [128]u8 = undefined;
+    var i: usize = 0;
+    while (i < hs.MIN_FACTS) : (i += 1) {
+        _ = o.seedBlock(try std.fmt.bufPrint(&buf, "warehouse note {d}: the widgets warehouse restocks gadgets and sprockets weekly", .{i}), .conv);
+    }
+    try std.testing.expectEqual(hs.MIN_FACTS, o.field.facts.items.len);
+    gpa.free(o.render() orelse return error.TestUnexpectedResult); // the first round's settle
+    // one round, three tool calls deep: every finding lands in a full field before the next render
+    const findings = [_][]const u8{
+        "tool read_file inventory.csv: 412 widgets on hand, reorder point 500",
+        "tool web_fetch supplier catalog: sprockets ship from the Hamilton depot in three days",
+        "tool run_python forecast: gadgets demand rises eleven percent next quarter",
+    };
+    for (findings) |fd| o.noteFinding(fd);
+    try std.testing.expectEqual(hs.MIN_FACTS, o.field.facts.items.len);
+    for (findings) |fd| try std.testing.expect(o.field.seen.contains(fnv(fd)));
+    // and the next round, cued on the first of them, is offered it
+    o.noteThought("check inventory.csv against the reorder point");
+    const next = o.render() orelse return error.TestUnexpectedResult;
+    defer gpa.free(next);
+    try std.testing.expect(std.mem.indexOf(u8, next, "[found] tool read_file inventory.csv") != null);
 }
 
 test "a source tag rides beside the line, never inside its stems, and the overlay's keys are the field's own" {

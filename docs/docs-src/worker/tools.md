@@ -21,6 +21,7 @@ This is the tool layer between the model and the world. Schema constants (comma-
 - `fetchCached(...)` — the shared 7-day fetch cache + curl core (also serves the local rag mirror), shared by engine prefetch and mind fetches
 - Scope constants — `SKILL_SCOPE`, `PLAYBOOK_SCOPE`, `LESSON_SCOPE`, `KNOWLEDGE_SCOPE`, `TOOL_SCOPE`, `MAP_SCOPE`, `PLAN_SCOPE`, … (the neuron-db scope names for each memory kind)
 - Guards and helpers — `isBuiltinTool`, `egressAllowed`, `safeRel`, `reservedBusName`, `fileOwnedBy`, `convLocalFact`, `hasSecretToken`/`maskSecretTokens`/`credentialLookup`, `searchWeb`, `crawlSearchPrim`, `looksBlocked`
+- `durableLine(raw)` — one line of the user's durable memory store (`memories.jsonl`), trimmed and freed of a UTF-8 byte-order mark. Every reader of that store goes through it: `credentialLookup` (get_credential), `durableRecall` (recall's durable half) and the chat engine's prompt, dedup and forget paths. Behind a mark, the oldest memory was invisible to all of them
 
 ## Dependencies
 
