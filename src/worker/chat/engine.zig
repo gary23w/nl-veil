@@ -8171,10 +8171,10 @@ fn maybeSyncCastFiles(app: *App, uid: u64, conv: []const u8, conv_dir: []const u
         if (!swarmTerminal(app, sw.run_dir, sw.created)) return; // sync once it finishes
         run_dir = copyTo(&run_buf, sw.run_dir) orelse return; // sw points into the registry; copy before slow IO
     } else {
-        // Registry entry gone (server restarted after the cast) — fall back to the conventional run dir this
-        // conversation's casts always use, and require its terminal DONE marker before syncing anything.
-        const at = std.mem.lastIndexOf(u8, conv_dir, "/convs/") orelse return;
-        run_dir = std.fmt.bufPrint(&run_buf, "{s}/builds/{s}", .{ conv_dir[0..at], conv }) catch return;
+        // No registry entry names this conversation's cast (e.g. reattach skipped its dir after a restart) — fall back
+        // to the run dir the cast spawned with (castRunDirFromConvDir), and require its terminal DONE marker before
+        // syncing anything.
+        run_dir = castRunDirFromConvDir(&run_buf, conv_dir, conv) orelse return;
         var db: [1400]u8 = undefined;
         const done = std.fmt.bufPrint(&db, "{s}/DONE", .{run_dir}) catch return;
         _ = std.Io.Dir.cwd().access(app.io, done, .{}) catch return; // never sync a half-written run
@@ -8200,6 +8200,44 @@ fn maybeSyncCastFiles(app: *App, uid: u64, conv: []const u8, conv_dir: []const u
         var sb: [96]u8 = undefined;
         emitKV(app, conv_dir, "status", "text", std.fmt.bufPrint(&sb, "synced {d} hive file(s) to your workdir", .{sent}) catch "synced hive files");
     }
+}
+
+/// The run dir a conversation's cast was spawned with, recovered from the conversation's store dir alone
+/// (`{...}/_chat/convs/{conv}`) for when the supervisor registry cannot name it. castSwarm spawns into paths.zig's
+/// build root, so a sub-chat's cast lives in its primary's tree and a scheduled run's under
+/// `_sched/{task}/runs/{stamp}` — never in `builds/{conv}`, where their DONE would never appear. null when conv_dir
+/// has no `/convs/` segment or the dir overflows `buf`.
+fn castRunDirFromConvDir(buf: []u8, conv_dir: []const u8, conv: []const u8) ?[]const u8 {
+    const at = std.mem.lastIndexOf(u8, conv_dir, "/convs/") orelse return null;
+    const root = cpaths.buildRootFromChatBase(buf, conv_dir[0..at], conv);
+    return if (root.len > 0) root else null;
+}
+
+test "cast file sync with no registry entry looks where the cast was spawned: ordinary, sub-chat and scheduled convs" {
+    // Two derivations of one dir must meet: castSwarm (deploy/service.zig) spawns a conversation's cast with
+    // run_dir = {data}/{buildRootRel(uid, conv)}, while runTurn hands maybeSyncCastFiles only
+    // conv_dir = {data}/u{uid}/_chat/convs/{conv}.
+    const data = "C:/nl/data";
+    const uid: u64 = 7;
+    const convs = [_][]const u8{
+        "c6a57f852", // ordinary: builds/{conv}
+        "c6a57f852__s2", // sub-chat: the primary's tree
+        "scheduled_news-0715174857_07151753", // scheduled run: the task's _sched/{task}/runs/{stamp}
+        "scheduled_news-0715174857_07151753__s1", // a sub-chat of a scheduled run: both redirects at once
+    };
+    for (convs) |conv| {
+        var cb: [256]u8 = undefined;
+        const conv_dir = try std.fmt.bufPrint(&cb, "{s}/u{d}/_chat/convs/{s}", .{ data, uid, conv });
+        var rb: [256]u8 = undefined;
+        var sb: [300]u8 = undefined;
+        const spawned = try std.fmt.bufPrint(&sb, "{s}/{s}", .{ data, cpaths.buildRootRel(&rb, uid, conv) });
+        var fb: [1280]u8 = undefined;
+        try std.testing.expectEqualStrings(spawned, castRunDirFromConvDir(&fb, conv_dir, conv) orelse return error.TestUnexpectedResult);
+    }
+    var nb: [256]u8 = undefined;
+    try std.testing.expect(castRunDirFromConvDir(&nb, "C:/nl/data/u7/_chat/c6a57f852", "c6a57f852") == null); // not a conv store dir
+    var tiny: [16]u8 = undefined;
+    try std.testing.expect(castRunDirFromConvDir(&tiny, "C:/nl/data/u7/_chat/convs/c6a57f852", "c6a57f852") == null); // overflow: no torn dir
 }
 
 /// Bounded copy of `s` into `buf` (null when it doesn't fit) — for slices whose owner may mutate under us.
