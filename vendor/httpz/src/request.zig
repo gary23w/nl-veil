@@ -1143,7 +1143,15 @@ pub const State = struct {
 
     fn readBody(self: *State, source: anytype) !bool {
         const buf = self.body.?.data;
-        self.body_pos += try zig016HackRead(source, buf[self.body_pos..]);
+        const n = try zig016HackRead(source, buf[self.body_pos..]);
+        if (n == 0) {
+            // EOF before the whole body. This is the same busy-spin as parse()'s EOF, one phase later: returning
+            // `false` sent the blocking worker straight back to a recv that returns 0 at once. A keep-alive
+            // request never checks its deadline, so that loop never ended. A stopping server's shutdown (worker.zig
+            // Connections) reads as this EOF too. NOTE: local patch to vendored httpz.
+            return error.ConnectionClosed;
+        }
+        self.body_pos += n;
         return (self.body_pos == self.body_len);
     }
 
@@ -1209,7 +1217,8 @@ pub const State = struct {
         // try to read past what's currently available.
         const n = try zig016HackRead(source, ck.raw[ck.raw_len..]);
         if (n == 0) {
-            return false;
+            // EOF mid-body, see readBody. NOTE: local patch to vendored httpz.
+            return error.ConnectionClosed;
         }
         ck.raw_len += n;
         return try self.processChunked(req_arena);
