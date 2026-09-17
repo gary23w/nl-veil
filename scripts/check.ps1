@@ -73,29 +73,51 @@ function Invoke-Gate([string]$name, [string]$exe, [string[]]$argv, [string]$work
     return $true
 }
 
-# `zig build test` with a self-healing fallback. On this machine Defender can kill the build
-# runner's test IPC: the failure names no test, just `failed command: "...test.exe" ... --listen=-`,
-# while the same binary passes standalone. When that signature appears, rerun the exact exe the
-# runner named (fallback: newest test.exe in the cache) and take ITS verdict.
+# `zig build test`, and the one failure that is rerun standalone. The EXIT CODE is the verdict: in Zig
+# 0.16 a test run step succeeds only once its test process has reported every test over the IPC channel
+# and exited 0 (Step/Run.zig evalZigTest), so a gate that exited 0 is never rerun.
+# `failed command: "...test.exe" ... --listen=-` is NOT a failure signal. The build runner prints a
+# step's messages "no matter the result" once the step wrote to stderr, and a run step always records
+# its command, so the line follows any suite whose tests log. Both of ours log warnings, so keying the
+# rerun on that line reran both suites on every green run and called it an IPC flake. (Measured
+# 2026-09-17, filtered builds: one silent test printed no such line, one test with a single
+# std.log.warn printed one; both exited 0 with every test passing.)
+# The rerun is for a runner that LOST its test process: a nonzero exit whose output names no test
+# (`error: test process unexpectedly exited ...`, `error: unable to write stdin ...`) and whose failed
+# commands all name test binaries. That is the IPC flake TESTING.md blames on Defender, where the same
+# binary passes standalone. Every test exe the runner named is rerun, since a suite that passed but
+# logged is named as well, and all of them must pass. Everything else stays red: a timeout is a hang;
+# a named test is a real result (every per-test message starts `error: '<test name>'`: failed, leaked,
+# logged errors, crashed, timed out); a compile error's failed command names zig.exe, and rerunning a
+# cached test.exe would test yesterday's tree.
 function Invoke-ZigTests([string]$label, [string]$workdir, [int]$timeout, [string]$note) {
     $ok = Invoke-Gate "zig build test ($label)" $zig @("build", "test", "--cache-dir", $cache) $workdir $timeout $note
-    # NOT `if ($ok) { return $true }`. The runner can print this signature and still EXIT 0, so a gate
-    # that passed is no evidence the tests ran -- a full ALL GREEN run had it on both test gates. The
-    # signature decides whether we have a verdict, never the exit status.
-    # Only the exact IPC signature qualifies: the runner's failure names the compiled test.exe.
-    # A compile error names zig.exe instead -- no fallback there, that red is real (and running the
-    # NEWEST cached test.exe would silently test yesterday's tree).
-    $texe = $null
-    $m = $script:results[-1].log, $script:results[-1].errlog |
-        Where-Object { $_ -and (Test-Path $_) } |
-        ForEach-Object { Select-String -Path $_ -Pattern 'failed command: "([^"]+test\.exe)"' -ErrorAction SilentlyContinue } |
-        Select-Object -First 1
-    if (-not $m) { return $ok }
-    if ($m) { $texe = $m.Matches[0].Groups[1].Value -replace '\\\\', '\' }
-    if (-not ($texe -and (Test-Path $texe))) { return $false }
+    if ($ok) { return $true }
+    $row = $script:results[-1]
+    if ($row.status -notlike "FAIL*") { return $false }
+    $lines = @($row.log, $row.errlog | Select-Object -Unique | Where-Object { $_ -and (Test-Path $_) } |
+        ForEach-Object { Get-Content -LiteralPath $_ })
+    if (@($lines -match "^error: '").Count -gt 0) { return $false }
+    $cmds = @($lines -match '^failed command: ')
+    $texes = @($cmds | Where-Object { $_ -match '^failed command: "([^"]+test\.exe)"' } |
+        ForEach-Object { $_ -replace '^failed command: "([^"]+test\.exe)".*$', '$1' -replace '\\\\', '\' })
+    if ($texes.Count -eq 0 -or $texes.Count -ne $cmds.Count) { return $false }
+    $texes = @($texes | Select-Object -Unique)
+    foreach ($texe in $texes) {
+        if (-not (Test-Path -LiteralPath $texe)) {
+            Write-Host "   the runner named $texe, which is gone -- no verdict, not rerunning" -ForegroundColor Red
+            return $false
+        }
+    }
     Write-Host "   build-runner failed without naming a test (IPC flake?) -- retrying standalone:" -ForegroundColor Yellow
-    Write-Host "   $texe" -ForegroundColor Yellow
-    return Invoke-Gate "standalone test exe ($label)" $texe @() $workdir $timeout $note
+    $all = $true
+    for ($i = 0; $i -lt $texes.Count; $i++) {
+        Write-Host "   $($texes[$i])" -ForegroundColor Yellow
+        $name = "standalone test exe ($label)"
+        if ($i -gt 0) { $name += " #$($i + 1)" }
+        $all = (Invoke-Gate $name $texes[$i] @() $workdir $timeout $note) -and $all
+    }
+    return $all
 }
 
 # ---------------------------------------------------------------- scan: drift signals, no builds

@@ -222,9 +222,18 @@ correctly stayed quiet, and the quiet read as "my new guard is worthless" — on
 working check. Print the proof: `sed -i ... && echo "INJECTED: $(grep -c <marker> file)"`, then run.
 No injection count, no counterfactual — you tested the unmodified code and learned nothing.
 
-Two local quirks worth knowing:
+Two quirks worth knowing:
 
-- Windows Defender can kill the build runner's test IPC: the failure names no test, just
-  `failed command: ...test.exe --listen=-`. check.ps1 self-heals by rerunning that exact exe
-  standalone. A compile error names `zig.exe` instead and is a real red (0001, 0007).
-- `zig build test` sometimes prints that same line and still exits 0. Trust the **exit code**.
+- `zig build test` prints `failed command: ...test.exe ... --listen=-` whenever a test step wrote to
+  stderr, pass or fail. Zig 0.16's build runner shows a step's messages "no matter the result" and
+  appends the command it ran, and both suites log warnings, so a green run prints that line on both
+  gates. It is not a failure. Trust the **exit code**: a test step succeeds only after every test has
+  reported. Measured 2026-09-17 with filtered builds: a silent test printed no such line, a test with
+  one `std.log.warn` printed one, and both exited 0 (0007).
+- The build runner can lose its test process (blamed on Windows Defender here). That run exits
+  nonzero and names no test, only a runner error such as `error: unable to write stdin (...); test
+  process unexpectedly exited with code 3` and the exe in `failed command:`, while the same exe passes
+  standalone. Only then do check.ps1 and check.sh rerun every exe the runner named and take their
+  verdict. A named test stays red (`error: '<test name>' ...` covers failures, leaks, error logs,
+  crashes and timeouts). So do a check.ps1 timeout and a compile error, whose failed command names
+  `zig.exe` rather than a test binary (0001).
