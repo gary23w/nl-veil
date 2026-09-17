@@ -984,6 +984,7 @@ pub const Chat = struct {
         var dbuf: [512]u8 = undefined;
         const dd0 = self.dataDir(&dbuf);
         self.ensureDirs(dd0);
+        self.sweepKeyScratch(dd0); // before any model call starts: a config a call left behind holds an API key
         // HIPPOCAMPUS: find the neuron binary + point at a chat-local sqlite so turns + cast findings persist as
         // recallable neurons (neurondb.zig). Silently disabled (memory ops no-op) if the binary isn't found.
         self.mind_bin = neurondb.findBin(self.gpa, self.io);
@@ -1037,6 +1038,9 @@ pub const Chat = struct {
             if (tick % 300 == 299) self.fetchOllamaModels();
             if (tick % 10 == 9) self.pumpJudge(dd); // ~1Hz: the decoupled learning pass (own stream, never blocks)
             if (!self.curated and tick > 900 and tick % 50 == 21) self.curateOnce(dd); // once, ~90s after startup
+            // ~5 min: a desk killed mid-call and relaunched within llm.KEY_CFG_STALE_S left a config the startup sweep
+            // had to keep (it could have been a live call's). This takes it once it is old enough.
+            if (tick % 3000 == 1500) self.sweepKeyScratch(dd);
             tick +%= 1;
             // SMOOTHER STREAMING (~30Hz while a reply types out): pump the stream 2 EXTRA times at ~33ms so the text
             // renders continuously like the local client, WITHOUT changing the 100ms cadence of the tick-scheduled
@@ -1160,10 +1164,8 @@ pub const Chat = struct {
     /// for the call's duration — acceptable for a rare, bounded classify (cost/latency optimized later). Uses its
     /// OWN curl-scratch dir so it never clobbers the live chat stream's files.
     fn syncGatewayClassify(self: *Chat, dd: []const u8, prov: llm.Provider, msgs: []const u8, max_tokens: u32) ?[]u8 {
-        var sb: [600]u8 = undefined;
-        const side = sideDir(dd, &sb);
         var rb: [700]u8 = undefined;
-        const rdir = std.fmt.bufPrint(&rb, "{s}/router", .{side}) catch return null;
+        const rdir = llmScratchDir(dd, .router, &rb) orelse return null;
         _ = Io.Dir.cwd().createDirPathStatus(self.io, rdir, .default_dir) catch {};
         var s: llm.Stream = .{};
         if (!llm.start(&s, self.io, self.gpa, rdir, prov, msgs, max_tokens, self.nowS())) {
@@ -1467,6 +1469,41 @@ pub const Chat = struct {
     fn sideDir(dd: []const u8, buf: []u8) []const u8 {
         const p = std.fmt.bufPrint(buf, "{s}/.veil-desk", .{dd}) catch return dd;
         return p;
+    }
+
+    /// The dirs desk model calls (llm.start) keep their scratch in: the request body, the stream sink, and the
+    /// curl config that holds the API key. Each belongs to one Stream at a time, since those file names are fixed
+    /// per dir: the chat turn's (the sidecar itself), the background judge's and the act router's. The startup
+    /// sweep reads exactly these dirs, so every llm.start caller takes its dir from llmScratchDir.
+    const LlmScratch = enum { chat, judge, router };
+
+    fn llmScratchDir(dd: []const u8, which: LlmScratch, buf: []u8) ?[]const u8 {
+        return switch (which) {
+            .chat => std.fmt.bufPrint(buf, "{s}/.veil-desk", .{dd}),
+            .judge, .router => std.fmt.bufPrint(buf, "{s}/.veil-desk/{t}", .{ dd, which }),
+        } catch null;
+    }
+
+    /// Remove the curl configs model calls left in the LlmScratch dirs. Each holds an API key, in a data dir that
+    /// is often a synced folder. A call deletes its own config when its curl exits (llm.reap), so what is left was
+    /// stranded by a desk killed mid-call, or by a build before 2026-09-17, which left one in each dir for good.
+    /// llm.KEY_CFG_STALE_S keeps the sweep off a config a live call may not have read yet: this desk's own, or
+    /// another desk's on the same data dir. Returns how many it removed.
+    fn sweepLlmScratch(io: Io, gpa: std.mem.Allocator, dd: []const u8) usize {
+        const now_ns = Io.Timestamp.now(io, .real).nanoseconds;
+        var removed: usize = 0;
+        for (std.enums.values(LlmScratch)) |which| {
+            var b: [700]u8 = undefined;
+            const dir = llmScratchDir(dd, which, &b) orelse continue;
+            removed += llm.sweepKeyCfgs(io, gpa, dir, now_ns);
+        }
+        return removed;
+    }
+
+    /// sweepLlmScratch, logged. Runs as the chat thread starts and every ~5 minutes after.
+    fn sweepKeyScratch(self: *Chat, dd: []const u8) void {
+        const n = sweepLlmScratch(self.io, self.gpa, dd);
+        if (n > 0) log.info("key scratch: removed {d} stranded curl config(s)", .{n});
     }
 
     fn setStatus(self: *Chat, s: []const u8) void {
@@ -3607,7 +3644,7 @@ pub const Chat = struct {
         var mb: [96]u8 = undefined;
         const prov = self.judgeProvider(&bb, &kb, &mb);
         var jb: [640]u8 = undefined;
-        const jdir = std.fmt.bufPrint(&jb, "{s}/.veil-desk/judge", .{dd}) catch return;
+        const jdir = llmScratchDir(dd, .judge, &jb) orelse return;
         if (llm.start(&self.judge_stream, self.io, self.gpa, jdir, prov, msgs.items, JUDGE_MAX_TOKENS, now)) {
             self.judge_live = true;
             log.info("judge: pass started (model={s}, trace={d}b)", .{ prov.model, trace.len });
@@ -6217,8 +6254,11 @@ pub const Chat = struct {
             msgs.appendSlice(self.gpa, ",{\"role\":\"user\",\"content\":\"Consolidation step. From the conversation above, output the REMEMBER:/FORGET: lines for any durable facts about ME (keys, logins, credentials, environment/setup, stable preferences) that I shared or changed and that are not already in YOUR MEMORY. One directive per line, no other text. If there is nothing new or changed, output exactly NONE.\"}") catch return;
         }
         var sb: [600]u8 = undefined;
-        const side = sideDir(dd, &sb);
-        if (!llm.start(&self.stream, self.io, self.gpa, side, prov, msgs.items, tb.max_tokens, self.nowS())) {
+        const started = if (llmScratchDir(dd, .chat, &sb)) |scratch|
+            llm.start(&self.stream, self.io, self.gpa, scratch, prov, msgs.items, tb.max_tokens, self.nowS())
+        else
+            false;
+        if (!started) {
             self.store.pushNotif("Chat failed", "could not start the model call (is curl available?)", 2);
             // A .tool_follow, .reflect (or .collect) re-entry gets here with busy already true — clear it or the chat
             // wedges "busy" forever. turn is already .idle (set by the caller before re-entry).
@@ -15028,4 +15068,70 @@ test "append-at-end idiom: repeated positional appends GROW the file (the 0-byte
     // all three rows present, in order, nothing overwritten
     try std.testing.expectEqualStrings("{\"r\":0,\"t\":\"one\"}\n{\"r\":1,\"t\":\"two\"}\n{\"r\":1,\"t\":\"three\"}\n", got);
     try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, got, "\n"));
+}
+
+test "the startup key sweep takes stranded curl configs from every dir a desk model call writes to, and nothing a live call may need" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dd = "zig-chat-keysweep-tmp";
+    Io.Dir.cwd().deleteTree(io, dd) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dd) catch {};
+
+    var bufs: [3][128]u8 = undefined;
+    const chat_dir = Chat.llmScratchDir(dd, .chat, &bufs[0]).?;
+    const judge_dir = Chat.llmScratchDir(dd, .judge, &bufs[1]).?;
+    const router_dir = Chat.llmScratchDir(dd, .router, &bufs[2]).?;
+
+    // Ages straddle the floor: a minute past it, no call can still be running; a minute short of it, one may be.
+    const stale: i64 = llm.KEY_CFG_STALE_S + 60;
+    const young: i64 = llm.KEY_CFG_STALE_S - 60;
+    const File = struct { dir: []const u8, name: []const u8, age_s: i64 = stale, kept: bool };
+    const files = [_]File{
+        // the one fixed name builds before 2026-09-17 left, in every dir a call writes to
+        .{ .dir = chat_dir, .name = ".chatcurlcfg", .kept = false },
+        .{ .dir = judge_dir, .name = ".chatcurlcfg", .kept = false },
+        .{ .dir = router_dir, .name = ".chatcurlcfg", .kept = false },
+        // a call's own config, left by a desk killed mid-call
+        .{ .dir = chat_dir, .name = ".chatcurlcfg-0123456789abcdef", .kept = false },
+        .{ .dir = router_dir, .name = ".chatcurlcfg-fedcba9876543210", .kept = false },
+        // younger than the floor, so possibly a live call's (another desk on this data dir) whose curl has not
+        // read it yet: one just written, one a minute short of the floor
+        .{ .dir = judge_dir, .name = ".chatcurlcfg-00112233445566ff", .age_s = 0, .kept = true },
+        .{ .dir = chat_dir, .name = ".chatcurlcfg-8899aabbccddeeff", .age_s = young, .kept = true },
+        // what carries no key stays, however old: the request body, the stream sink, a name that only begins like one
+        .{ .dir = chat_dir, .name = ".chatreq.json", .kept = true },
+        .{ .dir = judge_dir, .name = ".chatstream.sse", .kept = true },
+        .{ .dir = router_dir, .name = ".chatcurlcfgrc", .kept = true },
+        // below a scratch dir's top level is no call's scratch, whatever a file there is called
+        .{ .dir = chat_dir, .name = "chats/.chatcurlcfg", .kept = true },
+    };
+    const now_ns = Io.Timestamp.now(io, .real).nanoseconds;
+    var swept: usize = 0;
+    for (files) |f| {
+        var pb: [256]u8 = undefined;
+        const path = try std.fmt.bufPrint(&pb, "{s}/{s}", .{ f.dir, f.name });
+        _ = try Io.Dir.cwd().createDirPathStatus(io, std.fs.path.dirname(path).?, .default_dir);
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "header = \"Authorization: Bearer x\"\n" });
+        if (!f.kept) swept += 1;
+        if (f.age_s == 0) continue;
+        const file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write });
+        defer file.close(io);
+        try file.setTimestamps(io, .{ .modify_timestamp = .{ .new = .{ .nanoseconds = now_ns - @as(i96, f.age_s) * std.time.ns_per_s } } });
+    }
+
+    const removed = Chat.sweepLlmScratch(io, gpa, dd);
+    var wrong: usize = 0;
+    for (files) |f| {
+        var pb: [256]u8 = undefined;
+        const path = try std.fmt.bufPrint(&pb, "{s}/{s}", .{ f.dir, f.name });
+        const kept = if (Io.Dir.cwd().access(io, path, .{})) |_| true else |_| false;
+        if (kept == f.kept) continue;
+        std.debug.print("key sweep {s} {s}\n", .{ if (kept) "left" else "deleted", path });
+        wrong += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 0), wrong);
+    try std.testing.expectEqual(swept, removed); // the count it reports is the files it took
+    try std.testing.expectEqual(@as(usize, 0), Chat.sweepLlmScratch(io, gpa, dd)); // and a second pass finds none
 }
