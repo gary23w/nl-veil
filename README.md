@@ -2,6 +2,37 @@
 
 # the veil
 
+**An AI coding team that remembers your project.**
+
+the Veil (nl-veil) is an open-source desktop app for building software with AI. Give it a task,
+let specialist agents share the work, and carry project memory
+into your next session. Use the built-in model, Ollama, or an OpenAI-compatible endpoint.
+
+**[Download the desktop app](https://github.com/gary23w/nl-veil/releases/latest)** ·
+**[Watch: install & connect Cloudflare AI](https://gary23w.github.io/nl-veil/demos/)** ·
+[Installation and requirements](#install) · [Try your first task](#try-your-first-task)
+
+Windows · macOS · Linux · MIT licensed. Local inference needs no provider account or API key;
+hosted providers have their own data handling and costs. The built-in model requires a separate
+download, and coding tools require Python on `PATH` (some checks also use Node).
+
+### Try your first task
+
+After [installing](#install), select a model and use a small project you can safely edit. Start with
+one concrete change:
+
+> Find one missing input-validation test in this project. Explain the expected behavior, add the
+> test, make the smallest fix if needed, and run the relevant tests. Report the files changed and
+> the actual test result. Remember the project's test command for our next session.
+
+Review the diff and test output. Then start a new conversation on the same project and ask:
+*"What test command did we use, and what did we change last time?"* This gives you a specific way
+to evaluate both the coding workflow and memory on your own code.
+
+**Trying it for the first time?** [Tell us what worked or where you got stuck](https://github.com/gary23w/nl-veil/issues/new).
+Include your OS, app version, model/provider, and expected versus actual behavior. Remove private
+code and credentials from anything you share.
+
 <sub>NEURON-LOOPS · NL-VEIL — **an agentic coding desktop app that runs a whole team of AI agents on your machine, and remembers.** One binary, many minds, one shared memory. Browse the annotated source of every module at [the docs site](https://gary23w.github.io/nl-veil/).</sub>
 
 <p>
@@ -40,7 +71,7 @@ work behind it.
 code and your preferences, keeps a playbook of fixes it has *verified* by running commands on this
 machine, and carries all of it into the next session. The same problem stops getting re-solved.
 
-**Nothing to set up, and nothing leaves.** One Zig binary carries the whole thing: the desktop app,
+**Local inference, with optional cloud connections.** One Zig binary carries the whole thing: the desktop app,
 the server behind it, a web UI, the inference engine, the memory engine, and the `veil` command line.
 Nothing to install first — no Docker, no cloud account, no database service, no API key — it will
 **[download a 12B model](https://huggingface.co/gary23w/the-veil-12b) and run it itself**, offline, on
@@ -48,7 +79,9 @@ your GPU. One honest dependency: the agent's **tool belt shells out to Python** 
 `web_search`, `deep_crawl`, and its own executor `run_python`) and to Node for a JavaScript syntax check,
 so without `python` on `PATH` the agent can chat but cannot do much work — it tells you exactly which
 tool wanted what. Point it at Ollama or any OpenAI-compatible endpoint instead whenever you'd rather. Your
-code, your keys and everything it learns stay in a folder next to the binary.
+local conversations, keys and memory are stored in a folder next to the binary. Hosted model calls,
+web tools, and optional Cloudflare backups send the data needed for those features to the services
+you connect.
 
 > ⭐ **If the veil is useful to you, [star it on GitHub](https://github.com/gary23w/nl-veil).** It's a
 > solo project — a star genuinely helps it reach the next person who'd get something out of it.
