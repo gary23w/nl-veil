@@ -33,3 +33,18 @@ Do not present this follow-up as completed until it has been run and checked.
 ## 6. Close with evidence
 
 Show the working interface and a short, accurate verification list. Invite viewers to try the brief with their own model. No fixed speed, cost or quality claims: results depend on the model, settings and task.
+
+## Observed rehearsal results — 19 September 2026
+
+Veil generated a 36 KB standalone HTML/CSS/JavaScript app in its conversation workspace. A copy was served locally for browser verification. The following were checked through the rendered interface:
+
+- The ticket queue initially contained 24 synthetic records.
+- Searching `VPN` narrowed the queue to ticket #1001.
+- Changing #1001 to Resolved and assigning it to Demo team survived a page reload.
+- Filtering Open excluded the resolved ticket and showed four open records.
+- Knowledge Base displayed six articles; searching `webhook` returned the matching article.
+- Analytics displayed priority and status distributions reflecting the changed ticket.
+
+The first output's analytics labels overstated the calculations. A follow-up to Veil changed “Resolved this week” to “Resolved tickets”, “Avg resolution time” to “Avg time to last update”, and “SLA met” to “Non-critical or completed”. A source comparison confirmed only these three label lines changed; a browser reload confirmed the corrected labels. These are label corrections, not implementation of SLA tracking.
+
+This was a functional smoke check, not an exhaustive accessibility, responsive-layout or production-readiness audit. The proposed SLA-risk feature above remains a future rehearsal prompt.
