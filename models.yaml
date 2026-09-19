@@ -273,6 +273,8 @@ providers:
       - id: glm-4.5-flash
         label: GLM-4.5 Flash (free)
       # >>> synced from models.dev by scripts/sync-models.py — rewritten every run; move an entry above this line to keep it
+      - id: glm-5.3-flashx
+        label: GLM-5.3-FlashX
       - id: glm-5.3-flash
         label: GLM-5.3-Flash
       - id: glm-5.3

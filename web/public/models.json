@@ -1042,12 +1042,21 @@
       "synced": "models.dev"
     },
     {
+      "id": "glm-5.3-flashx",
+      "label": "GLM-5.3-FlashX",
+      "provider": "zai",
+      "hosting": "hosted",
+      "context": 1000000,
+      "note": "Released 2026-09-18. 1,000K context. Tool calling, reasoning, image / video / pdf input. $0.37 in / $1.25 out per MTok. Listed automatically from models.dev.",
+      "synced": "models.dev"
+    },
+    {
       "id": "glm-5.3-flash",
       "label": "GLM-5.3-Flash",
       "provider": "zai",
       "hosting": "hosted",
       "context": 1000000,
-      "note": "Released 2026-08-26. 1,000K context. Tool calling, reasoning, image / video / pdf input. $0.07 in / $0.25 out per MTok. Listed automatically from models.dev.",
+      "note": "Released 2026-08-26. 1,000K context. Tool calling, reasoning, image / video / pdf input. $0.15 in / $0.5 out per MTok. Listed automatically from models.dev.",
       "synced": "models.dev"
     },
     {
@@ -1092,7 +1101,7 @@
       "provider": "openrouter",
       "hosting": "hosted",
       "context": 1048576,
-      "note": "Released 2026-09-10. 1,048K context. Tool calling, reasoning, image input. $0.3 in / $1.2 out per MTok. Listed automatically from models.dev.",
+      "note": "Released 2026-09-10. 1,048K context. Tool calling, reasoning, image input. $0.15 in / $0.6 out per MTok. Listed automatically from models.dev.",
       "synced": "models.dev"
     },
     {
