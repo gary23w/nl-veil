@@ -1,5 +1,10 @@
 # cf_tunnel
 
+**v1.1.3:** quick tunnels now require a `Registered tunnel connection` log entry before an assigned URL
+counts as connected. DNS publication is still checked afterward. Startup failures identify outbound UDP
+7844 (QUIC) or TCP 7844 (HTTP/2), with `cf_tunnel.log` as the diagnostic source. HTTPS reachability alone
+does not prove tunnel transport works; no inbound firewall rule is required for the tunnel.
+
 **File:** `src/config/cf_tunnel.zig`  
 **Module:** `config`  
 **Description:** The public-URL switch — the official `cloudflared` connector run as a managed child: a confidential quick tunnel by default, or a named tunnel with DNS and Access provisioned on the signed-in Cloudflare account.

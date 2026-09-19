@@ -51,6 +51,10 @@ const LOG_FILE = "cf_tunnel.log";
 const PID_FILE = "cf_tunnel.pid";
 /// cloudflared's own line for a connector that is serving — the moment the URL is real.
 const LIVE_MARK = "Registered tunnel connection";
+
+fn connectionRegistered(text: []const u8) bool {
+    return std.mem.indexOf(u8, text, LIVE_MARK) != null;
+}
 /// How long a connector may take to register before the switch is declared failed.
 const START_BUDGET_S: i64 = 90;
 /// How long the URL is held back waiting for Cloudflare's resolver to publish the fresh hostname.
@@ -688,7 +692,7 @@ fn startChild(app: *App, a: std.mem.Allocator, uid: u64, st: *State, token: ?[]c
         if (exited.load(.monotonic)) break;
         if (std.Io.Dir.cwd().readFileAlloc(io, logp, a, .limited(LOG_CAP))) |text| {
             if (token != null) {
-                if (std.mem.indexOf(u8, text, LIVE_MARK) != null) return null;
+                if (connectionRegistered(text)) return null;
             } else if (std.mem.indexOf(u8, text, ".trycloudflare.com")) |at| {
                 // walk back to the scheme, forward to the end of the host
                 var s = at;
@@ -696,7 +700,7 @@ fn startChild(app: *App, a: std.mem.Allocator, uid: u64, st: *State, token: ?[]c
                 var e = at;
                 while (e < text.len and text[e] != ' ' and text[e] != '|' and text[e] != '"' and text[e] != '\n' and text[e] != '\r') : (e += 1) {}
                 const url = text[s..e];
-                if (std.mem.startsWith(u8, url, "https://")) {
+                if (std.mem.startsWith(u8, url, "https://") and connectionRegistered(text)) {
                     st.url = a.dupe(u8, url) catch url;
                     return null;
                 }
@@ -707,8 +711,14 @@ fn startChild(app: *App, a: std.mem.Allocator, uid: u64, st: *State, token: ?[]c
         } else |_| {}
         bu.sleepMs(700);
     }
-    if (exited.load(.monotonic)) return "cloudflared exited before registering - see cf_tunnel.log in the user's data dir";
-    return "cloudflared did not register a connection within 90s - see cf_tunnel.log in the user's data dir";
+    if (exited.load(.monotonic)) return "cloudflared exited before connecting. Check cf_tunnel.log and OS app approval; allow cloudflared outbound TCP/UDP 7844. No inbound firewall rule is needed.";
+    return "Tunnel connection timed out. Check cf_tunnel.log; allow cloudflared outbound UDP 7844 (QUIC) or TCP 7844 (HTTP/2 fallback) in your firewall/VPN/network policy. HTTPS 443 alone is insufficient.";
+}
+
+test "a quick tunnel hostname alone does not establish Cloudflare connectivity" {
+    try std.testing.expect(!connectionRegistered("Your quick Tunnel has been created! https://example.trycloudflare.com\n"));
+    try std.testing.expect(!connectionRegistered("ERR failed to dial to edge with quic: timeout\n"));
+    try std.testing.expect(connectionRegistered("INF Registered tunnel connection connIndex=0 protocol=http2\n"));
 }
 
 /// The connector's pid from its pidfile, or null.

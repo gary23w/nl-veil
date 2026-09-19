@@ -6,7 +6,7 @@
 
 <p>
   <a href="https://github.com/gary23w/nl-veil/actions/workflows/release.yml"><img alt="build" src="https://github.com/gary23w/nl-veil/actions/workflows/release.yml/badge.svg"></a>
-  <a href="https://github.com/gary23w/nl-veil/releases"><img alt="release" src="https://img.shields.io/badge/release-v1.1.2-A8241B"></a>
+  <a href="https://github.com/gary23w/nl-veil/releases"><img alt="release" src="https://img.shields.io/badge/release-v1.1.3-A8241B"></a>
   <img alt="zig" src="https://img.shields.io/badge/zig-0.16-F7A41D?logo=zig&logoColor=white">
   <a href="https://huggingface.co/gary23w/the-veil-12b"><img alt="built-in model" src="https://img.shields.io/badge/built--in%20model-the--veil--12b-6E4A27?logo=huggingface&logoColor=white"></a>
   <a href="https://huggingface.co/gary23w/gary-neuron-emergent"><img alt="memory cortex" src="https://img.shields.io/badge/cortex-gary--neuron--emergent-6E4A27?logo=huggingface&logoColor=white"></a>
@@ -16,6 +16,10 @@
 </p>
 
 ### What this actually is
+
+**Desktop release updates:** official bundles check GitHub at startup. Use **Settings → App updates →
+Update & restart** to install a verified release without Git. See [updates, recovery and Cloudflare
+connectivity](docs/UPDATES.md) for first-install requirements and Windows/macOS network troubleshooting.
 
 **A desktop app for agentic coding, called the Veil.** You download one file, run it, and a native
 window opens: a three-pane workspace where you give an AI a goal and watch it do the work. Your
@@ -291,7 +295,7 @@ raylib is a *lazy* dependency, so `-Dapp=false` never fetches it at all.
 ## Install
 
 **Download it and run it — no toolchain, nothing to build.** Grab your platform's bundle from the
-**[latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.1.2)**, unzip, and run `veil`:
+**[latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.1.3)**, unzip, and run `veil`:
 
 | You're on | Download | Then run |
 |---|---|---|
@@ -452,7 +456,7 @@ step 5** — the rest is about letting other people in.
 
 ### 1. Download and unblock it
 
-Grab the bundle for your OS from the [latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.1.2)
+Grab the bundle for your OS from the [latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.1.3)
 and unzip it somewhere you'll find again. Builds are unsigned, so:
 
 - **Windows** shows *"Windows protected your PC"* → **More info** → **Run anyway**.
@@ -488,7 +492,7 @@ On startup the server prints one complete URL per address this machine answers o
 (`src/main.zig:861-889`, using `src/config/lan.zig`):
 
 ```
-neuron-loops 1.1.2 on http://localhost:8787
+neuron-loops 1.1.3 on http://localhost:8787
     open from another machine (phone, laptop) at:
       http://192.168.1.42:8787
 ```
@@ -1305,7 +1309,17 @@ dependency entirely rather than compiling it unused.
 
 ## Release
 
-**Current: [`v1.1.2`](https://github.com/gary23w/nl-veil/releases/tag/v1.1.2)** — a point release about
+**Current: [`v1.1.3`](https://github.com/gary23w/nl-veil/releases/tag/v1.1.3)** — desktop updates without
+Git, and release checks that exercise Cloudflare connectivity. Official bundles check GitHub at startup;
+**Settings → App updates → Update & restart** downloads and verifies the app and memory engine, preserves
+your data, and restarts with backups available for rollback. Install this release manually once to acquire
+the updater. Quick tunnels now wait for a confirmed Cloudflare connection before reporting success, and
+connection errors explain outbound port 7844. Native release checks exercise the packaged app, update
+helper and real HTTP/2 and QUIC tunnel round trips on Windows, both Mac architectures and Linux. The
+model catalog also includes the latest reviewed sync. [Full notes](docs/release/RELEASE-v1.1.3.md) ·
+[Updating and network troubleshooting](docs/UPDATES.md).
+
+**Before it: [`v1.1.2`](https://github.com/gary23w/nl-veil/releases/tag/v1.1.2)** — a point release about
 secrets on disk, and about work that reaches you. **No key becomes a file**: every build before this one
 wrote each model call's `Authorization: Bearer <key>` into a curl config beside your conversation and left
 it there — 111 of them were still on the machine this was found on, the oldest from July, in a folder that

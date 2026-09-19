@@ -22,6 +22,12 @@ Everything else in the file is private: the route handlers (`health`, `fleet`, t
 
 ## What `main` does, in order
 
+In v1.1.3, `--build-version` reports the executable's own release version without connecting to a server.
+The merged app also configures the desktop updater with that version and the original arguments.
+Its private `--veil-apply-update` helper entry returns before server/GUI initialization; the helper waits
+for shutdown, installs verified components and restarts. Windows app jobs allow explicit breakaway for
+that helper while ordinary children remain subject to kill-on-close cleanup.
+
 1. **Argv triage.** `worker` runs the swarm worker entry (this is how the supervisor spawns a mind). `browser-smoke`, `local-host` and the `*-smoke` verbs short-circuit to their own entry points because they need the real threaded io and process environ, not the thin CLI client. `--desk` arms desktop mode; `--server-only` (alias `--headless`) disarms it.
 2. **Paths.** The install root is the executable's directory — or the repository root, when the exe is sitting in `zig-out/bin`. `data/` hangs off it unless `NEURON_LOOPS_DATA` says otherwise. The port is resolved once here, `NL_PORT` else `8787`, and shared with the CLI client so the two can never disagree.
 3. **CLI dispatch.** If the first argument is a verb `cli.isCommand` recognizes, the command-line client runs and the process exits with its code. No server is booted in-process; a verb that needs one talks to it over HTTP.
