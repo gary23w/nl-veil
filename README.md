@@ -109,6 +109,17 @@ system the desktop app compiles in.
 
 ## Log in with Cloudflare
 
+**Frontier-scale reasoning models, through your own Cloudflare account.** Cloudflare describes
+[Kimi K2.6](https://developers.cloudflare.com/workers-ai/models/kimi-k2.6/) as a frontier-scale model
+with reasoning, multi-turn tool calling and a 262K-token context window. The Veil's
+[real build walkthrough](https://gary23w.github.io/nl-veil/demos/) used this model to build and refine
+a customer-support workspace.
+
+The [Workers Paid plan starts at $5 USD/month](https://developers.cloudflare.com/changelog/post/2026-07-28-models-require-workers-paid/)
+and includes 10,000 Neurons per day. Usage beyond that allowance is billed at the model's rates:
+the $5 plan is not unlimited AI usage. The Veil is MIT-licensed with no Veil subscription required;
+you pay your chosen provider directly. Local models remain an option.
+
 **One button, and the veil gains a cloud.** Click *Log in with Cloudflare* — in the web app's Settings,
 under the chat composer, on the Dashboard, or in the desktop's Settings — approve the consent screen in
 your browser, and you are connected. No token to paste, nothing to configure.
