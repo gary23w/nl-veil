@@ -1,0 +1,22 @@
+WEBVTT
+
+00:00:00.000 --> 00:00:06.000
+Use Cloudflare Workers AI inside the Veil. This tutorial combines real clean-profile app screens with instruction cards. Private authentication is not recorded.
+
+00:00:06.000 --> 00:00:14.000
+In the Veil, open Settings and scroll to Cloudflare login. Choose Log in with Cloudflare. The app opens Cloudflare in your browser; there is no token to paste.
+
+00:00:14.000 --> 00:00:22.000
+Sign in to Cloudflare in your browser and select your account. Passwords, email addresses, account IDs and authentication screens are deliberately omitted from this tutorial.
+
+00:00:22.000 --> 00:00:32.000
+Review the required identity, account and Workers AI permissions. Decline optional permissions you do not need. Optional R2 access enables chat backups and may require R2 activation. Complete the consent step yourself, then return to the Veil.
+
+00:00:32.000 --> 00:00:41.000
+After successful login, the Veil switches chat to Workers AI and fetches your account's model list. Verify the provider and model in Settings. Model availability and prices vary; some models require paid billing.
+
+00:00:41.000 --> 00:00:53.000
+A real demo request through the Veil, using Cloudflare's Llama 3.3 70B model, returned: Why not start by building a simple to-do list app to get familiar with coding and see your progress come to life. The response is typeset here to exclude account information.
+
+00:00:53.000 --> 00:01:02.000
+Cloudflare Workers AI processes prompts remotely. Its current free allowance is 10,000 neurons per day, with paid requirements for some models. Check current pricing and usage. You can disconnect in Settings, or switch to a local provider.

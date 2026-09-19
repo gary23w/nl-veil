@@ -1,0 +1,19 @@
+WEBVTT
+
+00:00:00.000 --> 00:00:06.000
+The Veil is an open-source desktop app for building software with AI. This walkthrough uses version 1.1.3 on Windows.
+
+00:00:06.000 --> 00:00:16.000
+Visit github.com/gary23w/nl-veil/releases/latest. Under Assets, choose the full desktop ZIP for your operating system. This recording uses version 1.1.3; newer versions may differ.
+
+00:00:16.000 --> 00:00:25.000
+Extract the full ZIP into a writable folder. Keep veil.exe, the bin folder and veil-install.txt together. Source code archives and veil-server files are different downloads.
+
+00:00:25.000 --> 00:00:34.000
+Double-click veil.exe. These release builds are unsigned. Follow your operating system's approval flow only for a release you trust; managed devices may require an administrator.
+
+00:00:34.000 --> 00:00:43.000
+Open Settings to choose your provider. Cloudflare AI needs an internet connection and an account. Local inference uses separately downloaded model weights. Coding tools need Python; some checks also need Node.
+
+00:00:43.000 --> 00:00:50.000
+Open Chat and send a small, specific request after selecting a working model. Watch the second tutorial for Cloudflare sign-in and a real example reply.

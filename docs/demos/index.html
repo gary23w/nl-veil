@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Get started with the Veil — download, run & connect Cloudflare AI</title>
+  <meta name="description" content="Two short tutorials: download and launch the Veil, then connect Cloudflare Workers AI and send your first prompt. Open-source AI coding for Windows, macOS and Linux.">
+  <meta property="og:title" content="From download to your first AI conversation — the Veil">
+  <meta property="og:description" content="Watch the installation and Cloudflare AI tutorials. Real app screens, clear steps, and a real example reply.">
+  <meta property="og:type" content="website">
+  <meta name="theme-color" content="#10141f">
+  <link rel="canonical" href="https://gary23w.github.io/nl-veil/demos/">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M16 1L20 12L31 16L20 20L16 31L12 20L1 16L12 12Z' fill='%23bd9bff'/%3E%3C/svg%3E">
+  <style>
+    :root{color-scheme:dark;--bg:#10141f;--panel:#1a2232;--text:#f4f5ff;--muted:#bdc6dc;--accent:#bd9bff;--cyan:#77dfdf;--line:#354057}
+    *{box-sizing:border-box}html{scroll-behavior:smooth;scroll-padding-top:30px}body{margin:0;background:var(--bg);color:var(--text);font:17px/1.65 system-ui,-apple-system,Segoe UI,sans-serif}a{color:var(--cyan);text-underline-offset:4px}a:hover{color:white}a:focus-visible,button:focus-visible,summary:focus-visible,video:focus-visible{outline:3px solid var(--cyan);outline-offset:6px}
+    .wrap{max-width:1180px;margin:auto;padding:0 28px}header{display:flex;justify-content:space-between;align-items:center;gap:20px;padding:27px 0;border-bottom:1px solid var(--line)}.brand{font-size:24px;font-weight:750;color:var(--text);text-decoration:none}.brand span{color:var(--accent)}nav{display:flex;gap:24px;font-size:15px}.hero{padding:80px 0 60px}.eyebrow{font-size:13px;letter-spacing:.16em;text-transform:uppercase;font-weight:750;color:var(--cyan)}h1{font-size:clamp(42px,6vw,76px);line-height:1.06;letter-spacing:-.045em;margin:20px 0 28px;max-width:1000px}h1 em{font-style:normal;color:var(--accent)}.lede{font-size:21px;color:var(--muted);max-width:740px}.actions{display:flex;flex-wrap:wrap;gap:14px;margin-top:30px}.button{display:inline-block;background:var(--accent);color:#151025;padding:13px 22px;border-radius:10px;text-decoration:none;font-weight:700}.button:hover{background:#d0baff;color:#151025}.button.secondary{background:transparent;border:1px solid var(--line);color:var(--text)}.small{font-size:14px;color:var(--muted)}.tutorial{padding:36px 0 55px;border-top:1px solid var(--line)}.section-top{display:flex;justify-content:space-between;gap:24px;align-items:baseline}h2{font-size:32px;line-height:1.2;letter-spacing:-.025em;margin:12px 0}h3{font-size:21px;margin:0 0 10px}.duration{color:var(--cyan);white-space:nowrap;font-size:14px}.intro{max-width:850px;color:var(--muted)}video{width:100%;aspect-ratio:16/9;display:block;background:#10141f;border:1px solid var(--line);border-radius:16px;margin-top:24px}.video-links{display:flex;flex-wrap:wrap;gap:22px;font-size:14px;margin:15px 0 26px}.steps{display:grid;grid-template-columns:repeat(3,1fr);gap:18px}.step{padding:24px;border:1px solid var(--line);border-radius:14px;background:var(--panel)}.step p{font-size:15px;color:var(--muted);margin:0}.n{color:var(--accent);font-size:13px;font-weight:700;display:block;margin-bottom:12px}.note{background:#202a3c;border-left:3px solid var(--cyan);padding:18px 22px;border-radius:0 10px 10px 0;font-size:15px;color:var(--muted);margin-top:24px}details{border-bottom:1px solid var(--line);padding:18px 0}summary{cursor:pointer;font-weight:650}details p,details ol{color:var(--muted);font-size:16px}code{font-family:ui-monospace,Consolas,monospace;font-size:.9em;overflow-wrap:anywhere}blockquote{margin:24px 0;padding:20px 24px;border-left:3px solid var(--accent);background:var(--panel);border-radius:0 12px 12px 0}footer{border-top:1px solid var(--line);padding:30px 0 48px;color:var(--muted);font-size:14px}.download-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:24px 0}.download-grid a{padding:18px;border:1px solid var(--line);border-radius:12px;text-decoration:none;font-weight:650}.download-grid small{display:block;color:var(--muted);font-weight:400}.skip{position:absolute;top:-100px}.skip:focus{top:0;background:var(--bg);padding:12px;z-index:2}
+    @media(max-width:760px){.wrap{padding:0 20px}.hero{padding:48px 0}.steps,.download-grid{grid-template-columns:1fr}.download-grid{grid-template-columns:1fr 1fr}nav{gap:14px;font-size:13px}.section-top{display:block}h2{font-size:27px}.lede{font-size:18px}.step{padding:20px}}@media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}}
+  </style>
+</head>
+<body>
+<a class="skip" href="#main">Skip to tutorials</a>
+<div class="wrap">
+  <header><a class="brand" href="../"><span>✦</span> the veil</a><nav aria-label="Main"><a href="#download">Install</a><a href="#cloudflare">Cloudflare AI</a><a href="https://github.com/gary23w/nl-veil">GitHub</a></nav></header>
+  <main id="main">
+    <section class="hero">
+      <div class="eyebrow">Two short tutorials. One place to start.</div>
+      <h1>From download to<br><em>your first AI conversation.</em></h1>
+      <p class="lede">An AI coding team that remembers your project. Get the Veil running, connect Cloudflare AI, and start with a simple prompt.</p>
+      <div class="actions"><a class="button" href="https://github.com/gary23w/nl-veil/releases/latest">Download the latest release ↗</a><a class="button secondary" href="#download">Watch the tutorials ↓</a></div>
+      <p class="small">Open source · MIT licensed · Windows, macOS & Linux</p>
+    </section>
+    <section class="tutorial" id="download" aria-labelledby="install-title">
+      <div class="eyebrow">Tutorial 01</div>
+      <div class="section-top"><h2 id="install-title">Download it. Open it. Get started.</h2><span class="duration">50 seconds · captioned</span></div>
+      <p class="intro">Follow the Windows installation walkthrough. The download page also includes builds for Apple Silicon, Intel Macs and Linux.</p>
+      <video controls playsinline preload="metadata" poster="download-and-run-poster.jpg" aria-label="Download and run the Veil tutorial"><source src="download-and-run.mp4" type="video/mp4"><track kind="captions" src="download-and-run.vtt" srclang="en" label="English"><p><a href="download-and-run.mp4">Download the tutorial video</a>.</p></video>
+      <div class="video-links"><a href="download-and-run.mp4" download>Download video</a><a href="download-and-run-transcript.txt">Read the full transcript</a></div>
+      <div class="steps">
+        <article class="step"><span class="n">01 / DOWNLOAD</span><h3>Choose the full desktop ZIP</h3><p>Open the <a href="https://github.com/gary23w/nl-veil/releases/latest">latest release</a>, expand Assets, and choose <code>veil-…-[your platform].zip</code>.</p></article>
+        <article class="step"><span class="n">02 / EXTRACT</span><h3>Keep the folder together</h3><p>On Windows, choose Extract All. Keep the app, <code>bin/</code> and <code>veil-install.txt</code> together in a writable folder.</p></article>
+        <article class="step"><span class="n">03 / OPEN</span><h3>Launch the Veil</h3><p>Open <code>veil.exe</code> on Windows. On macOS or Linux, run <code>./veil</code> from the extracted folder.</p></article>
+      </div>
+      <div class="note">The videos show v1.1.3. Builds are currently unsigned; follow your OS approval flow only for a release you trust. Managed devices may need administrator approval. Coding tools require Python, and some checks also require Node.</div>
+      <details><summary>Which download should I choose?</summary><div class="download-grid">
+        <a href="https://github.com/gary23w/nl-veil/releases/download/v1.1.3/veil-v1.1.3-windows-x86_64.zip">Windows<small>x86-64 · v1.1.3</small></a>
+        <a href="https://github.com/gary23w/nl-veil/releases/download/v1.1.3/veil-v1.1.3-macos-arm64.zip">macOS<small>Apple Silicon · v1.1.3</small></a>
+        <a href="https://github.com/gary23w/nl-veil/releases/download/v1.1.3/veil-v1.1.3-macos-x86_64.zip">macOS<small>Intel · v1.1.3</small></a>
+        <a href="https://github.com/gary23w/nl-veil/releases/download/v1.1.3/veil-v1.1.3-linux-x86_64.zip">Linux<small>x86-64 · v1.1.3</small></a>
+      </div><p>These links match the recorded version. Use the latest-release button above for newer versions. The <code>veil-server-*</code> files are headless builds; <code>veil-update-*</code> files are for the updater. GitHub's “Source code” downloads require a compiler.</p></details>
+    </section>
+    <section class="tutorial" id="cloudflare" aria-labelledby="cf-title">
+      <div class="eyebrow">Tutorial 02</div>
+      <div class="section-top"><h2 id="cf-title">Connect Cloudflare AI. Send your first prompt.</h2><span class="duration">62 seconds · captioned</span></div>
+      <p class="intro">Use Workers AI without downloading local model weights. You’ll need a Cloudflare account and an internet connection.</p>
+      <video controls playsinline preload="metadata" poster="cloudflare-ai-poster.jpg" aria-label="Connect Cloudflare Workers AI tutorial"><source src="cloudflare-ai.mp4" type="video/mp4"><track kind="captions" src="cloudflare-ai.vtt" srclang="en" label="English"><p><a href="cloudflare-ai.mp4">Download the Cloudflare tutorial</a>.</p></video>
+      <div class="video-links"><a href="cloudflare-ai.mp4" download>Download video</a><a href="cloudflare-ai-transcript.txt">Read the full transcript</a></div>
+      <div class="steps">
+        <article class="step"><span class="n">01 / CONNECT</span><h3>Log in with Cloudflare</h3><p>In Settings, scroll to Cloudflare login. Select <strong>Log in with Cloudflare</strong>, then sign in in your browser.</p></article>
+        <article class="step"><span class="n">02 / REVIEW</span><h3>Choose your permissions</h3><p>Review identity, account and Workers AI access. Decline optional deployment, storage or domain permissions you don’t need.</p></article>
+        <article class="step"><span class="n">03 / CHAT</span><h3>Pick a model and say hello</h3><p>Return to the Veil. Check Cloudflare Workers AI in Settings, choose an available model, then open Chat.</p></article>
+      </div>
+      <blockquote><strong>Try this:</strong> “In one short friendly sentence, suggest a first project for someone learning to build software.”</blockquote>
+      <details><summary>What did the real demo return?</summary><p>“Why not start by building a simple to-do list app to get familiar with coding and see your progress come to life.”</p><p>This reply was returned through the Veil’s chat service using Cloudflare’s <code>@cf/meta/llama-3.3-70b-instruct-fp8-fast</code> on 19 September 2026. The video typesets the reply to exclude private account information. The full test prompt also instructed the assistant not to use tools, memory, files or personal context.</p></details>
+      <details><summary>Is Cloudflare AI free?</summary><p>Cloudflare currently includes 10,000 neurons per day at no charge. Usage depends on the model and request; some models require paid billing. Check <a href="https://developers.cloudflare.com/workers-ai/platform/pricing/">Cloudflare’s current pricing</a> and your account usage. Pricing checked 19 September 2026.</p></details>
+      <details><summary>What happens to my data?</summary><p>Cloudflare AI processes your prompts remotely. Optional R2 access can enable backups of conversations and durable memories to your own Cloudflare account; R2 may need activation. Review the permissions before connecting. Disconnect through Settings when needed; existing R2 backups remain in your account.</p></details>
+      <details><summary>What if it does not connect?</summary><p>Finish the browser consent flow and return to the running app. Check that Settings shows Cloudflare connected, then choose an available Workers AI model. Quota or billing errors should be checked in your Cloudflare account. See the <a href="../UPDATES.md">connection guide</a> for more help. Cloudflare Tunnel is a separate feature and is not required for AI chat.</p></details>
+      <div class="note">Privacy-safe edited walkthroughs: real app screens from an empty demo profile, cropped to exclude account headers and local paths. Download, consent and post-login instructions use labeled cards. The private authentication flow is omitted; no successful new login is staged or implied.</div>
+    </section>
+    <section class="tutorial"><h2>Make your first project a small one.</h2><p class="intro">Try a reading list, a personal page, or one fix in an existing project. Review the result, then tell us what worked and where you got stuck.</p><div class="actions"><a class="button" href="https://github.com/gary23w/nl-veil/releases/latest">Get the Veil ↗</a><a class="button secondary" href="https://github.com/gary23w/nl-veil/issues/new">Share feedback</a></div></section>
+  </main>
+  <footer>the Veil (nl-veil) · <a href="../">Product & source documentation</a> · <a href="https://github.com/gary23w/nl-veil">Open source on GitHub</a><br>Videos have on-screen instructions and optional English captions. No audio is required.</footer>
+</div>
+</body>
+</html>
