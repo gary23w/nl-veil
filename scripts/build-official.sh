@@ -65,7 +65,7 @@ warn() { printf '\033[1;33m▌\033[0m %s\n' "$*"; }
 CACHE=${ZIG_CACHE:-}
 if [ -z "$CACHE" ]; then
   case "$OS" in
-    windows) CACHE="/c/nl-veil-zig-cache" ;;
+    windows) CACHE="C:/zig-nlveil" ;;
     *) CACHE="${TMPDIR:-/tmp}/nl-veil-zig-cache" ;;
   esac
 fi
@@ -100,20 +100,12 @@ mkdir -p "$STAGE"
 # strip by default now — no 16MB PDB rides along beside a 5MB exe.
 # ONE binary: the desktop GUI is compiled INTO veil (-Dapp, default on), so there is no separate
 # veil-desk to build or ship any more. The trade is that this build now needs the platform graphics
-# stack present — on a headless box the raylib link fails, and it would take the whole release with
-# it. So: try the real thing, and if it does not link, fall back to an explicitly server-only bundle
-# and SAY SO, rather than emitting something that silently has no window.
+# stack present. A desktop release must fail if the GUI does not link; a headless fallback cannot
+# replace an installed desktop. Standalone server artifacts are built separately below.
 say "building the app for $OS/$ARCH (ReleaseFast, stripped, GUI linked in)"
-HAVE_GUI=1
-( cd "$ROOT" && "$ZIG" build --release=fast --cache-dir "$CACHE" --prefix "$STAGE/server" ) || HAVE_GUI=0
-if [ "$HAVE_GUI" = 0 ]; then
-  warn "the GUI did not link here (no GL/X11 dev libs?) — retrying server-only"
-  rm -rf "$STAGE/server"
-  ( cd "$ROOT" && "$ZIG" build -Dapp=false --release=fast --cache-dir "$CACHE" --prefix "$STAGE/server" )
-fi
+( cd "$ROOT" && "$ZIG" build --release=fast --cache-dir "$CACHE" --prefix "$STAGE/server" )
 SERVER="$STAGE/server/bin/veil$EXE"
 [ -f "$SERVER" ] || { say "veil binary missing at $SERVER"; exit 1; }
-[ "$HAVE_GUI" = 1 ] || warn "THIS BUNDLE HAS NO DESKTOP — server + web UI only"
 
 # ---- 2. the neuron memory engine ----
 neuron=""
@@ -127,6 +119,9 @@ elif [ -d "$ROOT/../neuron-db/rust/neuron-core" ] && command -v cargo >/dev/null
 fi
 [ -n "$neuron" ] || warn "no neuron binary — memory features degrade; put one at bin/neuron$EXE"
 
+# An official desktop release must contain both native components. Never publish a degraded update.
+[ -n "$neuron" ] || { say "refusing incomplete desktop release"; exit 1; }
+
 # ---- 3. assemble the full one-click bundle ----
 NAME="veil-v$VERSION-$OS-$ARCH"
 B="$OUT/$NAME"
@@ -134,6 +129,11 @@ rm -rf "$B"
 mkdir -p "$B/bin"
 cp "$SERVER" "$B/veil$EXE"
 [ -n "$neuron" ] && cp "$neuron" "$B/bin/neuron$EXE"
+printf '%s\n' 'veil-bundle-v1' > "$B/veil-install.txt"
+# Raw assets avoid needing Git or archive tools on the user's machine. GitHub supplies SHA-256 digests
+# in the release API; the updater requires them and verifies size + digest before staging either file.
+cp "$SERVER" "$OUT/veil-update-v$VERSION-$OS-$ARCH-app"
+cp "$neuron" "$OUT/veil-update-v$VERSION-$OS-$ARCH-neuron"
 
 # Launcher. A bare `veil` now boots the server AND opens the desk (the one-click default), so the
 # launcher needs no flag at all — it exists purely so double-clicking works on every OS.
@@ -175,6 +175,17 @@ OTHER WAYS TO RUN
   veil list | stop <id>  fleet control
 
 Everything is local: your data lives in ./data, your keys stay on this machine.
+
+UPDATES (v1.1.3 and later)
+  Settings -> App updates -> Update & restart. Finish active work first.
+  No Git needed. Keep veil-install.txt and bin/neuron with the app in a writable folder.
+  The first installation of v1.1.3 is manual; future stable releases update from the desk.
+
+CLOUDFLARE
+  The connector needs outbound UDP or TCP 7844; HTTPS 443 alone is insufficient.
+  No inbound router/firewall rule is needed for a tunnel. OS approval of these unsigned
+  binaries is separate. Recovery and network guidance:
+  https://github.com/gary23w/nl-veil/blob/main/docs/UPDATES.md
 
 the veil — by gary23w
   author   https://github.com/gary23w
@@ -278,7 +289,7 @@ rm -rf "$STAGE"
 # binaries sitting in bin/ (veil-scratch.exe, veil-synapse.exe, ...) and the bundle DIRECTORY, which isn't a file.
 ( cd "$OUT"
   set --
-  for f in "veil-v$VERSION-$OS-$ARCH.tar.gz" "veil-v$VERSION-$OS-$ARCH.zip" server-only/veil-server-v"$VERSION"-* MANIFEST.txt; do
+  for f in "veil-v$VERSION-$OS-$ARCH.tar.gz" "veil-v$VERSION-$OS-$ARCH.zip" veil-update-v"$VERSION"-"$OS"-"$ARCH"-* server-only/veil-server-v"$VERSION"-* MANIFEST.txt; do
     [ -f "$f" ] && set -- "$@" "$f"
   done
   [ "$#" -gt 0 ] || exit 0

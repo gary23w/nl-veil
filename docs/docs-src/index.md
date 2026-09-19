@@ -19,6 +19,7 @@ So the table is gone. Close this sheet and read the inventory.
 |---|---|
 | [architecture](guide/architecture.md) | one server process; the web app, the native desk and the `veil` CLI as three clients of one `/api/v1` surface |
 | [running a server](guide/server.md) | install, first login, the network bind, the default model, the shared provider key, accounts |
+| [desktop updates](guide/updates.md) | Git-free release updates, recovery and Cloudflare outbound connectivity |
 | [accounts and the sandbox](guide/accounts.md) | what a non-admin account can and cannot do, and why the line is capability rather than path |
 | [main](main.md) | the entry point itself — CLI dispatch, subsystem wiring, the route table, server or app mode |
 

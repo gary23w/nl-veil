@@ -42,8 +42,10 @@ if ($env:NO_BOOTSTRAP -ne '1') {
 # straight into veil.exe, and a bare `veil` runs the window in-process.
 Say 'building the app (zig build - desktop GUI compiled in)'
 Push-Location $Root
-& $Zig build
+& $Zig build --cache-dir C:\zig-nlveil
+$BuildCode = $LASTEXITCODE
 Pop-Location
+if ($BuildCode -ne 0) { throw "app build failed (exit $BuildCode); refusing to package an older executable" }
 $Server = Join-Path $Root 'zig-out\bin\veil.exe'
 if (-not (Test-Path $Server)) { throw "veil binary not found at $Server" }
 
@@ -71,6 +73,10 @@ if (Test-Path $Out) { Remove-Item -Recurse -Force $Out }
 New-Item -ItemType Directory -Force -Path (Join-Path $Out 'bin') | Out-Null
 Copy-Item $Server (Join-Path $Out 'veil.exe')
 if ($Neuron) { Copy-Item $Neuron (Join-Path $Out 'bin\neuron.exe') }
+if (-not $Neuron) { throw 'refusing incomplete desktop release: neuron is required' }
+'veil-bundle-v1' | Set-Content -Encoding ascii (Join-Path $Out 'veil-install.txt')
+Copy-Item $Server (Join-Path $Dist "veil-update-v$Version-$Os-$Arch-app")
+Copy-Item $Neuron (Join-Path $Dist "veil-update-v$Version-$Os-$Arch-neuron")
 
 # A bare `veil.exe` IS the app now (window + server in one process) - no flag, no second binary to start.
 @"
@@ -87,6 +93,13 @@ It opens the desktop dashboard and runs its server on http://127.0.0.1:8787,
 both inside the one process.
 Configure a model on first run (a local Ollama, or a hosted/BYOK endpoint).
 Server-only:  veil.exe --server-only     (no window)
+
+Updates: Settings -> App updates -> Update & restart. Finish active work first.
+Keep veil-install.txt and bin/neuron.exe with the app in a writable folder. No Git needed.
+Install v1.1.3 manually once to acquire the updater.
+Cloudflare Tunnel needs outbound TCP or UDP 7844; no inbound exception is required.
+Unsigned-app launch approval is separate. Recovery and networking:
+https://github.com/gary23w/nl-veil/blob/main/docs/UPDATES.md
 
 https://github.com/gary23w/nl-veil
 "@ | Set-Content -Encoding ascii (Join-Path $Out 'README.txt')

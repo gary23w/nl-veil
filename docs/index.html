@@ -52,7 +52,7 @@
       <a href="#memory">Memory</a>
     </nav>
     <span class="grow"></span>
-    <span class="chip"><span class="chip-dot"></span>v1.1.2</span>
+    <span class="chip"><span class="chip-dot"></span>v1.1.3</span>
     <button class="icon-btn" id="themeBtn" type="button" title="Toggle theme" aria-label="Toggle theme"></button>
     <a class="icon-btn" href="https://github.com/gary23w/nl-veil" target="_blank" rel="noopener" title="Source on GitHub" aria-label="Source on GitHub">
       <svg viewBox="0 0 24 24"><path d="M9 19c-5 1.5-5-2.5-7-3m14 6v-3.9a3.4 3.4 0 0 0-.9-2.6c3-.3 6.2-1.5 6.2-6.7A5.2 5.2 0 0 0 20 4.8a4.9 4.9 0 0 0-.1-3.6s-1.1-.3-3.7 1.4a12.6 12.6 0 0 0-6.6 0C7 .9 5.9 1.2 5.9 1.2A4.9 4.9 0 0 0 5.8 4.8a5.2 5.2 0 0 0-1.4 3.6c0 5.2 3.2 6.4 6.2 6.7a3.4 3.4 0 0 0-.9 2.6V22"/></svg>
@@ -143,7 +143,7 @@
           Windows <span class="dl-arch">x86-64</span>
         </span>
         <span class="dl-file">veil-&hellip;-windows-x86_64.zip</span>
-        <a class="btn btn-solid" href="https://github.com/gary23w/nl-veil/releases/tag/v1.1.2" target="_blank" rel="noopener">Download</a>
+        <a class="btn btn-solid" href="https://github.com/gary23w/nl-veil/releases/tag/v1.1.3" target="_blank" rel="noopener">Download</a>
       </div>
       <div class="dl-card" data-os="macarm">
         <span class="dl-os">
@@ -151,7 +151,7 @@
           macOS <span class="dl-arch">Apple Silicon</span>
         </span>
         <span class="dl-file">veil-&hellip;-macos-arm64.zip</span>
-        <a class="btn btn-solid" href="https://github.com/gary23w/nl-veil/releases/tag/v1.1.2" target="_blank" rel="noopener">Download</a>
+        <a class="btn btn-solid" href="https://github.com/gary23w/nl-veil/releases/tag/v1.1.3" target="_blank" rel="noopener">Download</a>
       </div>
       <div class="dl-card" data-os="macintel">
         <span class="dl-os">
@@ -159,7 +159,7 @@
           macOS <span class="dl-arch">Intel</span>
         </span>
         <span class="dl-file">veil-&hellip;-macos-x86_64.zip</span>
-        <a class="btn btn-solid" href="https://github.com/gary23w/nl-veil/releases/tag/v1.1.2" target="_blank" rel="noopener">Download</a>
+        <a class="btn btn-solid" href="https://github.com/gary23w/nl-veil/releases/tag/v1.1.3" target="_blank" rel="noopener">Download</a>
       </div>
       <div class="dl-card" data-os="linux">
         <span class="dl-os">
@@ -167,7 +167,7 @@
           Linux <span class="dl-arch">x86-64</span>
         </span>
         <span class="dl-file">veil-&hellip;-linux-x86_64.zip</span>
-        <a class="btn btn-solid" href="https://github.com/gary23w/nl-veil/releases/tag/v1.1.2" target="_blank" rel="noopener">Download</a>
+        <a class="btn btn-solid" href="https://github.com/gary23w/nl-veil/releases/tag/v1.1.3" target="_blank" rel="noopener">Download</a>
       </div>
     </div>
 
@@ -175,14 +175,25 @@
       <p><strong>Take the <code>veil-&hellip;</code> archive</strong> &mdash; not &ldquo;Source code (zip)&rdquo;, which GitHub staples to every release and which needs a compiler, and not <code>veil-server-&hellip;</code>, the headless build for remote boxes with no desktop app.</p>
       <div class="note-warn">
         <svg viewBox="0 0 24 24"><path d="M12 9v4M12 17h.01M10.3 3.9L1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/></svg>
-        <span>The binaries aren&rsquo;t signed yet, so the machine will object once: Windows &rarr; <em>More info &rarr; Run anyway</em>; macOS &rarr; right-click &rarr; <em>Open</em>. Signing certificates are on the list.</span>
+        <span>The binaries aren&rsquo;t signed yet. Windows SmartScreen or macOS Gatekeeper may require launch approval; follow the OS approval flow for a release you trust. Managed devices may require an administrator. This is separate from Cloudflare network access.</span>
       </div>
       <p><strong>The model comes too.</strong> The inference engine is compiled into the binary, so
         <a href="https://huggingface.co/gary23w/the-veil-12b" target="_blank" rel="noopener">the-veil-12b</a>
         is served by the server itself &mdash; no separate model runtime, no API key. Click <em>download the
         model</em> in the app (or run <code>veil model pull</code>) and the whole thing works offline. Point it
         at Ollama or any OpenAI-compatible endpoint instead whenever you would rather.</p>
-      <p><strong>What&rsquo;s in <code>v1.1.2</code>.</strong> A point release about secrets on disk, and about
+      <p><strong>What&rsquo;s in <code>v1.1.3</code>.</strong> <strong>Update from the desktop, without Git.</strong>
+        Official bundles check GitHub at startup. In Settings, choose <em>App updates &rarr; Update &amp; restart</em>:
+        both the app and memory engine are downloaded, checksum-verified and replaced, with your data preserved
+        and the previous binaries kept for rollback. Install this release manually once to acquire the updater.</p>
+      <p><strong>Cloudflare connections are checked, not assumed.</strong> A quick-tunnel hostname is no longer
+        reported as connected before Cloudflare confirms the transport. Connection errors explain the outbound
+        port 7844 requirement for QUIC or HTTP/2; no blanket inbound firewall exception is needed. Native release
+        checks exercise the packaged app, update helper and real tunnel round trips on all four platforms.
+        OS launch approval remains separate, and these builds are still unsigned.
+        <a href="https://github.com/gary23w/nl-veil/blob/main/docs/release/RELEASE-v1.1.3.md" target="_blank" rel="noopener">v1.1.3 release notes &rarr;</a>
+        <a href="#doc=guide/updates">Updates and connection guide &rarr;</a></p>
+      <p><strong>Before it: <code>v1.1.2</code>.</strong> A point release about secrets on disk, and about
         work that reaches you. <strong>No key becomes a file.</strong> Curl takes its arguments from a config
         file, and that is how every secret here reached it: each model call wrote its
         <code>Authorization: Bearer &lt;key&gt;</code> into a small file beside your conversation and nothing
@@ -424,7 +435,7 @@ zig build run</code></pre>
 
 <footer class="foot">
   <div class="wrap foot-inner">
-    <span class="chip"><span class="chip-dot"></span>v1.1.2 &middot; open source, MIT</span>
+    <span class="chip"><span class="chip-dot"></span>v1.1.3 &middot; open source, MIT</span>
     <span class="dim" style="font-size:var(--fs-small)">Built by <a href="https://github.com/gary23w" target="_blank" rel="noopener">gary23w</a></span>
     <nav class="foot-links">
       <a href="https://github.com/gary23w/nl-veil" target="_blank" rel="noopener">nl-veil on GitHub</a>

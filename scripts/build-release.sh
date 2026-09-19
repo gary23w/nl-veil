@@ -30,6 +30,7 @@ ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 VERSION=${VERSION:-$(sed -n 's/^const VERSION = "\(.*\)";$/\1/p' "$ROOT/src/main.zig" | head -1)}
 [ -n "$VERSION" ] || { echo "could not read VERSION from src/main.zig"; exit 1; }
 ZIG=${ZIG:-zig}
+
 DIST="$ROOT/dist"
 
 case "$(uname -s)" in
@@ -45,6 +46,10 @@ case "$(uname -m)" in
 esac
 EXE=""
 [ "$OS" = windows ] && EXE=".exe"
+
+# Keep builds out of synced folders; Windows matches the local oracle.
+if [ "$OS" = windows ]; then CACHE=C:/zig-nlveil
+else CACHE=${ZIG_CACHE_DIR:-"${TMPDIR:-/tmp}/nl-veil-zig-cache"}; fi
 
 say() { printf '\033[1;31m▌\033[0m %s\n' "$*"; }
 
@@ -70,7 +75,7 @@ ZIG=${ZIG:-zig}
 # There is no separate veil-desk to build or bundle any more: `zig build` (-Dapp defaults to true) links
 # raylib and the desk sources straight into veil, and a bare `veil` runs the window in-process.
 say "building the app (zig build — desktop GUI compiled in)"
-( cd "$ROOT" && "$ZIG" build )
+( cd "$ROOT" && "$ZIG" build --cache-dir "$CACHE" )
 SERVER="$ROOT/zig-out/bin/veil$EXE"
 [ -f "$SERVER" ] || { say "veil binary not found at $SERVER"; exit 1; }
 
@@ -96,6 +101,10 @@ rm -rf "$OUT"
 mkdir -p "$OUT/bin"
 cp "$SERVER" "$OUT/veil$EXE"
 [ -n "$neuron" ] && cp "$neuron" "$OUT/bin/neuron$EXE"
+[ -n "$neuron" ] || { say 'refusing incomplete desktop release: neuron is required'; exit 1; }
+printf '%s\n' 'veil-bundle-v1' > "$OUT/veil-install.txt"
+cp "$SERVER" "$DIST/veil-update-v$VERSION-$OS-$ARCH-app"
+cp "$neuron" "$DIST/veil-update-v$VERSION-$OS-$ARCH-neuron"
 
 # launcher: a bare `veil` IS the app now (window + server in ONE process), so there is no flag to pass and
 # no second binary to start. Kept as a launcher anyway so the bundle has an obvious double-click target and
@@ -127,6 +136,13 @@ It starts the server on http://127.0.0.1:8787 and opens the desktop dashboard.
 Configure a model on first run (a local Ollama, or a hosted/BYOK endpoint).
 Server only (no window):  ./veil --server-only
 
+Updates: Settings -> App updates -> Update & restart. Finish active work first.
+Keep veil-install.txt and bin/neuron with the app in a writable folder. No Git needed.
+Install v1.1.3 manually once to acquire the updater.
+Cloudflare Tunnel needs outbound TCP or UDP 7844; no inbound exception is required.
+Unsigned-app launch approval is separate. Recovery and networking:
+https://github.com/gary23w/nl-veil/blob/main/docs/UPDATES.md
+
 https://github.com/gary23w/nl-veil
 TXT
 
@@ -149,7 +165,7 @@ if [ "${1:-}" = "--all" ]; then
     ztarget=${tgt%%:*}; rest=${tgt#*:}; xos=${rest%%:*}; rest=${rest#*:}; xarch=${rest%%:*}; xexe=${rest#*:}
     [ "$xos" = "$OS" ] && [ "$xarch" = "$ARCH" ] && continue
     say "  server → $xos/$xarch"
-    ( cd "$ROOT" && "$ZIG" build -Dtarget="$ztarget" ) || { say "  (skipped $xos/$xarch)"; continue; }
+    ( cd "$ROOT" && "$ZIG" build -Dapp=false -Dtarget="$ztarget" --cache-dir "$CACHE" ) || { say "  (skipped $xos/$xarch)"; continue; }
     xname="veil-server-v$VERSION-$xos-$xarch$xexe"
     cp "$ROOT/zig-out/bin/veil$xexe" "$DIST/$xname" 2>/dev/null || true
   done

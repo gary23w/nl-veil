@@ -6,6 +6,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const nap = @import("nap.zig");
+pub const updater = @import("updater.zig");
 const rl = @import("raylib");
 const t = @import("theme.zig");
 const store_mod = @import("store.zig");
@@ -455,6 +456,8 @@ pub fn runApp(data_dir: ?[]const u8) !void {
 
     var store = Store{};
     seedSettings(&store, gpa, io, data_dir);
+    if (data_dir != null) updater.start();
+    defer if (data_dir != null) updater.finish();
     ui.d_name.len = seedName(&ui.d_name.buf);
 
     var poller = poller_mod.Poller{ .io = io, .gpa = gpa, .store = &store };
@@ -578,6 +581,7 @@ pub fn runApp(data_dir: ?[]const u8) !void {
     defer watchdog.stop();
     while (true) {
         watchdog.beat(.idle_start);
+        if (updater.phase.load(.acquire) == .restart) break;
         // Read the close flag ONCE: it is a one-frame edge, cleared at the tail of the next
         // PollInputEvents, so it must be consumed in the same iteration that observed it.
         const os_close = rl.windowShouldClose();
@@ -7786,6 +7790,11 @@ fn drawSettings(store: *Store, body: t.Rect) void {
     const colw = @min(body.width - pad * 2, 720);
     t.text(t.z("Settings", .{}), @intFromFloat(x), @intFromFloat(y), 20, t.fg);
     y += 40;
+    y = settingSection(x, y, colw, "APP UPDATES");
+    y += @as(f32, @floatFromInt(drawMemText(updater.status(), x, y, 12, t.fg, colw))) * 16 + 12;
+    const update_phase = updater.phase.load(.acquire);
+    if (t.button(.{ .x = x, .y = y, .width = 180, .height = t.BTN_MD }, if (update_phase == .available) "Update & restart" else "Check for updates", t.red, update_phase == .available or update_phase == .current or update_phase == .failed)) updater.launch(update_phase == .available);
+    y += t.BTN_MD + 20;
     store.lock();
     const dd = store.settings.dataDir();
     var ddb: [512]u8 = undefined;

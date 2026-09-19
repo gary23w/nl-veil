@@ -113,3 +113,7 @@ scripts/sim/INSTRUMENTS.md
 scripts/sim/ledger.py
 scripts/sim/failures.py
 scripts/sim/tests/
+# Disposable release tests contain generated runtime credentials and must never be committed.
+.release-smoke/
+.release-check.json
+.veil-update-*/

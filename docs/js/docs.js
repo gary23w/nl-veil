@@ -18,7 +18,8 @@
       { p: 'guide/models', c: 'GD-04', t: 'The model trio — which call runs on coding, thinking or prompting, and how to choose', s: 'chat/engine.zig · llm.zig' },
       { p: 'guide/extensions', c: 'GD-05', t: 'Extending veil — themes and plugins across web, desk and CLI', s: 'plug/' },
       { p: 'guide/themes', c: 'GD-06', t: 'Authoring a theme — the 16 palette slots, mono_ui, the workspace', s: 'plug/theme.zig' },
-      { p: 'guide/plugins', c: 'GD-07', t: 'Writing a plugin — tools, policy + prompt hooks, MCP, the sandbox', s: 'plug/plugins.zig · plug/lua.zig' }
+      { p: 'guide/plugins', c: 'GD-07', t: 'Writing a plugin — tools, policy + prompt hooks, MCP, the sandbox', s: 'plug/plugins.zig · plug/lua.zig' },
+      { p: 'guide/updates', c: 'GD-08', t: 'Desktop updates — releases, recovery and Cloudflare connectivity', s: 'updater.zig · cf_tunnel.zig' }
     ]},
     { key: 'admin/', label: 'ADMIN — SYSTEM MANAGEMENT', docs: [
       { p: 'admin/admin_service', c: 'AD-01', t: 'Admin service — god-mode handlers, every action audited', s: 'admin_service.zig' }
@@ -161,7 +162,8 @@
       { p: 'desk/roles', c: 'DK-19', t: 'Roles — the prebuilt chat-role catalog, embedded from roles.json', s: 'roles.zig' },
       { p: 'desk/watchdog', c: 'DK-20', t: 'Watchdog — UI-hang witness: stale frames + the OS hung-window verdict', s: 'watchdog.zig' },
       { p: 'desk/wsock', c: 'DK-21', t: 'Wsock — blocking Winsock round trip, twin of the server copy', s: 'wsock.zig' },
-      { p: 'desk/nap', c: 'DK-22', t: 'Nap — alert-free sleep + heartbeat clock for desk threads', s: 'nap.zig' }
+      { p: 'desk/nap', c: 'DK-22', t: 'Nap — alert-free sleep + heartbeat clock for desk threads', s: 'nap.zig' },
+      { p: 'desk/updater', c: 'DK-23', t: 'Release updater — verified downloads, staged replacement and restart', s: 'updater.zig' }
     ]}
   ];
 

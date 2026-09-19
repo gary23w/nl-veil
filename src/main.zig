@@ -72,7 +72,7 @@ const log = std.log.scoped(.server);
 // THE single source of release identity. scripts/build-official.sh seds this literal out of this file to
 // name every artifact (veil-v<VERSION>-<os>-<arch>.zip, veil-server-v<VERSION>-…), so the binary can never
 // report a version its own bundle disagrees with. Bump it here and the whole release follows.
-const VERSION = "1.1.2";
+const VERSION = "1.1.3";
 
 const ASSET_HTML = @embedFile("index.html");
 const ASSET_JS = @embedFile("app.js");
@@ -305,7 +305,8 @@ fn ownProcessTree(environ: *std.process.Environ.Map) void {
     // job alive by holding a copy.
     const job = winapp.CreateJobObjectW(null, null) orelse return;
     var info: winapp.JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std.mem.zeroes(winapp.JOBOBJECT_EXTENDED_LIMIT_INFORMATION);
-    info.BasicLimitInformation.LimitFlags = winapp.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    // Only the updater explicitly requests CREATE_BREAKAWAY_FROM_JOB. Ordinary children remain owned.
+    info.BasicLimitInformation.LimitFlags = winapp.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | 0x00000800;
     if (winapp.SetInformationJobObject(job, winapp.JobObjectExtendedLimitInformation, @ptrCast(&info), @sizeOf(winapp.JOBOBJECT_EXTENDED_LIMIT_INFORMATION)) == 0) return;
     // Nested jobs are fine on Win8+; if we are already in a job that refuses nesting this just fails and we
     // fall back to the watcher path.
@@ -345,6 +346,18 @@ pub fn main(init: std.process.Init) !void {
     var threaded = std.Io.Threaded.init(gpa, .{ .environ = environ, .async_limit = .limited(512) });
     defer threaded.deinit();
     const io = threaded.io();
+    if (HAS_GUI) {
+        var update_args: std.ArrayList([]const u8) = .empty;
+        var update_it = try std.process.Args.Iterator.initAllocator(init.minimal.args, gpa);
+        defer update_it.deinit();
+        _ = update_it.skip();
+        while (update_it.next()) |arg| try update_args.append(gpa, try gpa.dupe(u8, arg));
+        if (update_args.items.len > 0 and std.mem.eql(u8, update_args.items[0], "--veil-apply-update")) {
+            if (update_args.items.len != 2) return error.InvalidUpdateArguments;
+            return desk.updater.apply(io, gpa, update_args.items[1]);
+        }
+        desk.updater.configure(io, gpa, VERSION, update_args.items);
+    }
     // The offline probe's callers (llm.zig) hold no environment, so hand it NL_NET_PROBE_URL now, before any
     // thread can probe: the server and the `worker` subprocess below both make hosted model calls through it.
     @import("worker/net.zig").useEnviron(init.environ_map);
@@ -359,6 +372,10 @@ pub fn main(init: std.process.Init) !void {
         defer it.deinit();
         _ = it.skip();
         if (it.next()) |sub| {
+            if (std.mem.eql(u8, sub, "--build-version")) {
+                try std.Io.File.stdout().writeStreamingAll(io, VERSION ++ "\n");
+                return;
+            }
             if (std.mem.eql(u8, sub, "worker")) {
                 const run_dir = try gpa.dupe(u8, it.next() orelse "");
                 const nbin = try gpa.dupe(u8, it.next() orelse "");
