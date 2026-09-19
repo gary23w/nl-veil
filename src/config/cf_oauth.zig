@@ -1025,7 +1025,7 @@ fn page(res: *httpz.Response, ok: bool, detail: []const u8) !void {
         \\<h2 style="color:{s}">{s}</h2><p>{s}</p><p style="color:#565f89;font-size:14px">{s}</p></div>
         \\<script>try{{if(window.opener)window.opener.postMessage('nl-cf-oauth','*');}}catch(e){{}}
         \\if({s})setTimeout(function(){{try{{window.close();}}catch(e){{}}}},1500);</script>
-    , .{ title, if (ok) "#2ac3de" else "#f7768e", title, msg, htmlEsc(res.arena, detail), if (ok) "true" else "false" });
+    , .{ title, if (ok) "#f6821f" else "#f7768e", title, msg, htmlEsc(res.arena, detail), if (ok) "true" else "false" });
 }
 
 test "pkce challenge is base64url sha256 of the verifier" {
