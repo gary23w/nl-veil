@@ -1,4 +1,15 @@
-# Onboarding tutorials
+# Screenshot walkthrough
+
+The public `index.html` now uses an accessible image slideshow instead of the legacy video players.
+It includes actual cropped Veil screenshots of setup, Cloudflare login, and the SignalDesk build rehearsal.
+The login arrow is an HTML/CSS annotation over an actual signed-out Settings capture.
+See `rehearsal.md` for the substantial project brief, presentation sequence and follow-up prompt.
+Build screenshots exclude the account header, profile sidebar and console paths by hard cropping before publication.
+The generated illustration experiment is not used in the public presentation.
+
+## Legacy video assets
+
+The files below remain for historical reference and are no longer embedded or linked by the demo page.
 
 - `download-and-run.mp4`: 50-second Windows installation walkthrough.
 - `cloudflare-ai.mp4`: 62-second Cloudflare Workers AI walkthrough.
