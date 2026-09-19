@@ -9,7 +9,7 @@ let specialist agents share the work, and carry project memory
 into your next session. Use the built-in model, Ollama, or an OpenAI-compatible endpoint.
 
 **[Download the desktop app](https://github.com/gary23w/nl-veil/releases/latest)** ·
-**[Watch: install & connect Cloudflare AI](https://gary23w.github.io/nl-veil/demos/)** ·
+**[Screenshot walkthrough: setup & build with Cloudflare AI](https://gary23w.github.io/nl-veil/demos/)** ·
 [Installation and requirements](#install) · [Try your first task](#try-your-first-task)
 
 Windows · macOS · Linux · MIT licensed. Local inference needs no provider account or API key;
