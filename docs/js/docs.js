@@ -19,6 +19,7 @@
       { p: 'guide/extensions', c: 'GD-05', t: 'Extending veil — themes and plugins across web, desk and CLI', s: 'plug/' },
       { p: 'guide/themes', c: 'GD-06', t: 'Authoring a theme — the 16 palette slots, mono_ui, the workspace', s: 'plug/theme.zig' },
       { p: 'guide/plugins', c: 'GD-07', t: 'Writing a plugin — tools, policy + prompt hooks, MCP, the sandbox', s: 'plug/plugins.zig · plug/lua.zig' },
+      { p: 'guide/desktop', c: 'GD-09', t: 'Desktop guide — settings, progress, streaming and code', s: 'desk/main.zig' },
       { p: 'guide/updates', c: 'GD-08', t: 'Desktop updates — releases, recovery and Cloudflare connectivity', s: 'updater.zig · cf_tunnel.zig' }
     ]},
     { key: 'admin/', label: 'ADMIN — SYSTEM MANAGEMENT', docs: [

@@ -10,6 +10,13 @@
 
 Provides the pure string-processing layer of the desktop chat pane's markdown renderer. It classifies markdown lines (horizontal rules, table separators), splits table rows into cells, converts LaTeX-ish math into readable unicode/ASCII, and flattens inline markdown (links, bold/italic/code, <br>) into plain text. It is deliberately kept free of raylib so it can be exercised with `zig test`, while the actual glyph drawing (renderMsg/renderTable) lives in main.zig and calls into these functions.
 
+## Code fences in v1.1.4
+
+`fenceOpen` and `fenceClose` recognize backtick and tilde fences and require a closing
+run at least as long as the opening run. Shorter nested examples stay inside the
+block. `codeChunk` selects UTF-8 boundaries for display-only soft wrapping; copying
+uses the original bytes, including indentation and line endings.
+
 ## Key Exports
 
 - `mdstarts(hay, needle)` — thin wrapper over std.mem.startsWith for prefix checks

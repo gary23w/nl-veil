@@ -10,6 +10,14 @@
 
 Spawning curl.exe put the bearer token and full JSON body on the command line (readable by any same-user process on Windows), and the spawn pattern — a self-built binary forking curl to POST bearer JSON at localhost on a few-second cadence — is exactly what Defender's behavior/ML models flag; it killed the app on unexcluded machines. In-process sockets have no argv, no child, and no per-call cost. Unlike the earlier raw-socket client that trusted `Connection: close` and read to EOF unbounded, this one parses real HTTP framing AND bounds the whole round trip, so `timeout_s` is a hard ceiling exactly like `curl --max-time`: on Windows a loopback or IPv4-literal request runs on one socket under one deadline (`wsock.zig`), and anything else races against a sleeper. Anything non-loopback (hosted TLS providers, web fetches) stays on curl.
 
+## Timeout completion race fixed in v1.1.4
+
+The portable client's timer now distinguishes a completed request from an expired
+deadline. If the completion flag arrives before the response is published, the
+caller keeps waiting for the response instead of reporting a timeout. An actual
+deadline still cancels and drains the race, freeing any late response body.
+Deterministic tests cover both event orders in the desk and server copies.
+
 ## Key Exports
 
 - `Resp { status, body }` — one reply; body is gpa-owned when non-empty

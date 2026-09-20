@@ -86,30 +86,33 @@ pub fn request(io: Io, gpa: std.mem.Allocator, req: Req) Result {
         }
     }
 
-    const Race = union(enum) { rt: Inner, timer: void };
     var rt_done: std.atomic.Value(bool) = .init(false);
     var sbuf: [2]Race = undefined;
     var sel = Io.Select(Race).init(io, &sbuf);
     sel.async(.rt, roundTripFlag, .{ io, gpa, req.host, req.port, req_bytes, req.cap, &rt_done });
     sel.async(.timer, sleeper, .{ io, req.timeout_s, &rt_done });
+    return awaitResult(gpa, &sel);
+}
 
-    const first = sel.await() catch { // our own task was cancelled — drain children, then bail
-        drain(gpa, &sel);
-        return .failed;
-    };
-    const out: Result = switch (first) {
-        .rt => |inner| switch (inner) {
+const TimerEnd = enum { completed, expired };
+const Race = union(enum) { rt: Inner, timer: Io.Cancelable!TimerEnd };
+
+fn awaitResult(gpa: std.mem.Allocator, sel: *Io.Select(Race)) Result {
+    // A timeout can race with an allocated response: always cancel and free the loser.
+    defer drain(gpa, sel);
+    while (true) switch (sel.await() catch return .failed) {
+        .rt => |inner| return switch (inner) {
             .ok => |resp| .{ .ok = resp },
             .refused => .refused,
             .failed => .failed,
         },
-        .timer => .timed_out,
+        // rt_done is stored before Select publishes the round-trip result. The timer can observe
+        // that flag and publish FIRST; its early exit is not a deadline. Wait for the response.
+        .timer => |end| switch (end catch return .failed) {
+            .completed => continue,
+            .expired => return .timed_out,
+        },
     };
-    // Cancel the loser and drain: on timeout the round trip may still COMPLETE (with an allocated
-    // body) between the timer firing and the cancel landing — that body must be freed, so use the
-    // result-returning cancel loop rather than cancelDiscard.
-    drain(gpa, &sel);
-    return out;
 }
 
 fn drain(gpa: std.mem.Allocator, sel: anytype) void {
@@ -122,14 +125,15 @@ fn drain(gpa: std.mem.Allocator, sel: anytype) void {
     };
 }
 
-fn sleeper(io: Io, seconds: u32, rt_done: *std.atomic.Value(bool)) void {
+fn sleeper(io: Io, seconds: u32, rt_done: *std.atomic.Value(bool)) Io.Cancelable!TimerEnd {
     var remaining_ms: u64 = @as(u64, seconds) * std.time.ms_per_s;
     while (remaining_ms > 0) {
-        if (rt_done.load(.acquire)) return; // round trip finished — release this worker now, not at deadline
+        if (rt_done.load(.acquire)) return .completed;
         const slice_ms: u64 = @min(remaining_ms, 200);
-        io.sleep(.{ .nanoseconds = slice_ms * std.time.ns_per_ms }, .awake) catch return;
+        try io.sleep(.{ .nanoseconds = slice_ms * std.time.ns_per_ms }, .awake);
         remaining_ms -= slice_ms;
     }
+    return .expired;
 }
 
 /// roundTrip + a completion flag the racing sleeper polls (see request). A wrapper so the flag store sits on
@@ -319,6 +323,41 @@ pub fn parseLoopbackUrl(url: []const u8) ?LoopbackUrl {
 // ---------------------------------------------------------------------------
 // tests — framing parser and URL splitter run on fixed buffers, no sockets
 // ---------------------------------------------------------------------------
+
+test "timer completion published before the HTTP response is not a timeout" {
+    const gpa = std.testing.allocator;
+    var threaded = Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var done: std.atomic.Value(bool) = .init(true);
+    var buf: [2]Race = undefined;
+    var sel = Io.Select(Race).init(io, &buf);
+    // Force the ordering between rt_done.store and Select's response publication, without sleeps.
+    try sel.queue.putOneUncancelable(io, .{ .timer = try sleeper(io, 240, &done) });
+    try sel.queue.putOneUncancelable(io, .{ .rt = .{ .ok = .{ .status = 200, .body = try gpa.dupe(u8, "fell back") } } });
+    const result = awaitResult(gpa, &sel);
+    switch (result) {
+        .ok => |resp| {
+            defer gpa.free(resp.body);
+            try std.testing.expectEqual(@as(u16, 200), resp.status);
+            try std.testing.expectEqualStrings("fell back", resp.body);
+        },
+        else => return error.FalseTimeout,
+    }
+}
+
+test "an expired HTTP timer wins and frees a late response" {
+    const gpa = std.testing.allocator;
+    var threaded = Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var done: std.atomic.Value(bool) = .init(false);
+    var buf: [2]Race = undefined;
+    var sel = Io.Select(Race).init(io, &buf);
+    try sel.queue.putOneUncancelable(io, .{ .timer = try sleeper(io, 0, &done) });
+    try sel.queue.putOneUncancelable(io, .{ .rt = .{ .ok = .{ .status = 200, .body = try gpa.dupe(u8, "late") } } });
+    try std.testing.expect(awaitResult(gpa, &sel) == .timed_out);
+}
 
 test "readResponse: Content-Length framing stops at the declared length (no EOF wait)" {
     const wire = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\n\r\n{\"ok\":true}TRAILING-GARBAGE-AFTER-BODY";

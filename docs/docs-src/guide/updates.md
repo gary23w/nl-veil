@@ -1,9 +1,11 @@
 # Desktop updates and Cloudflare connectivity
 
+In v1.1.3, use Settings → App updates; v1.1.4 groups it on the Updates page.
+
 Starting with **v1.1.3**, official desktop bundles check GitHub for stable releases at startup.
-Choose **Settings → App updates → Update & restart** after finishing active work. Git is not required.
+Choose **Settings → Updates → App updates → Update & restart** after finishing active work. Git is not required.
 The app verifies downloads, stages both native components, keeps backups and restarts without replacing
-your data. Install v1.1.3 manually once if you are coming from an older version.
+your data. Install v1.1.4 (or another current full bundle) manually once if you are coming from an older version.
 
 Keep the complete bundle in a writable folder, including `veil-install.txt` and the memory engine in
 `bin/`. Windows/macOS supply the curl executable used for HTTPS; Linux needs curl installed. Source
