@@ -1,0 +1,39 @@
+/* Walkthrough composition. Shared chrome, typography and themes live in ../css/. */
+.demo-page .hero-lede { max-width: 76ch; margin-bottom: 0; }
+.demo-page .demo-content { padding-top: 32px; }
+.stage { border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; background: var(--surface); }
+.slide { display: grid; grid-template-columns: minmax(240px, .8fr) minmax(0, 2fr); min-height: 490px; }
+.slide[hidden] { display: none; }
+.copy { padding: 28px; }
+.copy h2 { font-size: clamp(23px, 3vw, 30px); line-height: 1.2; letter-spacing: -.015em; margin: 12px 0 18px; }
+.copy p { margin-bottom: 16px; color: var(--text-secondary); }
+.step { font: 600 var(--fs-micro)/1.5 var(--font-mono); letter-spacing: .1em; color: var(--brand); }
+.screen { display: flex; align-items: center; padding: 24px; background: var(--surface-raised); border-left: 1px solid var(--border); min-width: 0; }
+.screen figure { width: 100%; }
+.screen img { display: block; max-width: 100%; max-height: 410px; width: auto; height: auto; margin: auto; border-radius: var(--radius); }
+.screen figcaption { font-size: var(--fs-small); color: var(--text-muted); margin-top: 14px; }
+.callout { position: relative; }
+.login-arrow { position: absolute; left: 10%; top: 47%; height: 25%; border-left: 4px solid #a54200; pointer-events: none; }
+.login-arrow::after { content: ''; position: absolute; bottom: -2px; left: -9px; border-left: 7px solid transparent; border-right: 7px solid transparent; border-top: 12px solid #a54200; }
+.login-label { position: absolute; left: 13%; top: 48%; background: var(--surface); color: var(--text); border: 1px solid var(--border); padding: 5px 9px; border-radius: var(--radius); font-size: var(--fs-small); }
+.settings-arrow { color: var(--accent); font-weight: 600; }
+.controls { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 16px; border-top: 1px solid var(--border); background: var(--surface-raised); }
+.dots { display: flex; gap: 6px; margin: auto; }
+.dots .btn { min-width: 34px; padding: 0 10px; }
+.dots .btn[aria-current=true] { background: var(--accent); color: var(--on-accent); }
+.caption { padding: 0 16px 16px; color: var(--text-secondary); font-size: var(--fs-small); background: var(--surface-raised); }
+.note { font-size: var(--fs-small); color: var(--text-muted); margin-top: 14px; }
+.actions { display: flex; gap: 10px; flex-wrap: wrap; margin: 24px 0; }
+.notes { display: grid; grid-template-columns: 1fr 1fr; gap: 32px; margin-top: 48px; border-top: 1px solid var(--border); padding-top: 32px; }
+.notes h2 { font-size: var(--fs-h1); margin-bottom: 14px; }
+.notes p { color: var(--text-secondary); margin: 14px 0; }
+.notes blockquote { border-left: 3px solid var(--brand); padding-left: 16px; color: var(--text-secondary); }
+@media (max-width: 760px) {
+  .slide { grid-template-columns: minmax(0, 1fr); min-height: 0; }
+  .copy { padding: 20px; }
+  .screen { border-left: 0; border-top: 1px solid var(--border); padding: 16px; }
+  .screen img { max-height: 360px; }
+  .notes { grid-template-columns: minmax(0, 1fr); gap: 20px; }
+  .dots { order: 3; width: 100%; justify-content: center; }
+  #play { margin-left: auto; }
+}
