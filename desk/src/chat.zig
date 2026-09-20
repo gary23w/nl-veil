@@ -1722,6 +1722,14 @@ pub const Chat = struct {
         const conv = self.convScope(&convb);
         if (conv.len == 0 or conv.len > self.sc_conv.len) return false; // no resolvable conv → local
 
+        // Provider, attachment and history preparation can block before the POST starts.
+        self.setBusy(true);
+        self.setStatus("Preparing context and connecting to your model...");
+        defer if (!self.sc_active) {
+            self.setBusy(false);
+            self.setStatus("");
+        };
+
         // Resolve the provider so BYOK carries server-side (the server falls back to its own config on blanks).
         var bb: [256]u8 = undefined;
         var kb: [192]u8 = undefined;
@@ -1849,7 +1857,7 @@ pub const Chat = struct {
         };
 
         self.setBusy(true);
-        self.setStatus("server turn running...");
+        self.setStatus("Request sent - waiting for the first progress update...");
         log.info("server chat: send conv={s} from={d} model={s}", .{ conv, from0, prov.model });
 
         // The send returns FAST: the server fires the turn on a background thread and replies 202 ("running"), so

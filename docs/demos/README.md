@@ -50,3 +50,9 @@ coordinates are specific to the reviewed 1220 × 820 capture; review new images 
 
 All thirteen scene images were visually reviewed, and both videos were fully decoded with FFmpeg.
 Browser inspection confirmed durations of 50 and 62 seconds and no media errors.
+
+## Current desktop navigation
+
+The screenshots above were captured on v1.1.3. In v1.1.4, provider setup and Cloudflare
+login are under **Settings → Models**, and app updates are under **Settings → Updates**.
+See the [desktop guide](../DESK-UI.md) for progress feedback, starter prompts, and code formatting.

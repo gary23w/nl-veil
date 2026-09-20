@@ -1,12 +1,14 @@
 # Desktop updates and release connectivity
 
+In v1.1.3, the updater is directly under Settings → App updates. In v1.1.4, use the Updates page.
+
 Starting with v1.1.3, official bundles check the latest stable GitHub release in the background when the desktop starts.
-Open **Settings → App updates → Update & restart** after finishing active work. The app downloads and
+Open **Settings → Updates → App updates → Update & restart** after finishing active work. The app downloads and
 verifies both native components, then closes and restarts. Git, Python, Node, archive utilities and
 package managers are not required for updates. HTTPS uses the OS `curl` executable (included on
 supported Windows/macOS installations; Linux installations need curl).
 
-Install v1.1.3 manually once to acquire the updater. Older versions such as v1.1.2
+Install v1.1.4 (or another current full bundle) manually once to acquire the updater. Older versions such as v1.1.2
 cannot acquire a feature they do not contain. Keep the complete bundle together, including
 `veil-install.txt` and `bin/neuron`, in a writable folder. Development executables and standalone
 `veil-desk` installations do not self-update. Updates target stable releases and never downgrade.
@@ -91,7 +93,7 @@ Maintainer examples (Python 3.12; not an end-user dependency):
 
 ```
 python scripts/smoke-release.py --bundle bin/veil-v<VERSION>-windows-x86_64.zip --version <VERSION> --cloudflare --output .release-smoke/local
-python scripts/smoke-release.py --release v1.1.3 --cloudflare --output .release-smoke/published
+python scripts/smoke-release.py --release v1.1.4 --cloudflare --output .release-smoke/published
 ```
 
 Each output directory must be new. A connection failure fails the requested check and retains logs;
@@ -107,5 +109,5 @@ The final Windows build also passed the full `scripts/check.ps1 -Full` oracle, t
 and rollback tests, and a local bundle smoke test exercising the shipped helper, parent-exit wait,
 replacement of both binaries, backup preservation and relaunch. All updater runtime paths compile
 for Apple Silicon, Intel macOS and Linux; compilation is not a substitute for native execution.
-Publication of v1.1.3 is gated on native execution and complete update assets for all four platforms;
+Publication of stable releases is gated on native execution and complete update assets for all four platforms;
 see the [release workflow results](https://github.com/gary23w/nl-veil/actions/workflows/release.yml).

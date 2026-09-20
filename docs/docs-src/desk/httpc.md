@@ -10,6 +10,14 @@
 
 Performs a single bounded HTTP/1.1 round trip to 127.0.0.1:<port> without spawning a child process. It exists to kill the old `curl.exe` spawn pattern — bearer token and JSON body on the command line (readable by any same-user process) plus a self-built binary forking curl to POST at localhost on the poller's cadence, which Defender's behavior/ML models flagged and killed. It simultaneously fixes the "casting hangs" bug of the earlier raw-socket attempt by parsing real HTTP framing and enforcing a hard total-time ceiling.
 
+## Timeout completion race fixed in v1.1.4
+
+The portable client's timer now distinguishes a completed request from an expired
+deadline. If the completion flag arrives before the response is published, the
+caller keeps waiting for the response instead of reporting a timeout. An actual
+deadline still cancels and drains the race, freeing any late response body.
+Deterministic tests cover both event orders in the desk and server copies.
+
 ## Key Exports
 
 - `request(io, gpa, req) Result` — one bounded HTTP/1.1 round trip (connect+send+recv) to 127.0.0.1:req.port; never blocks past req.timeout_s.

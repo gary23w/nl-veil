@@ -831,12 +831,22 @@ const mouse = struct {
         return rl.getMousePosition();
     }
     fn over(r: Rect) bool {
+        if (interaction_clip) |clip| {
+            if (!rl.checkCollisionPointRec(rl.getMousePosition(), clip)) return false;
+        }
         return rl.checkCollisionPointRec(rl.getMousePosition(), r);
     }
     fn clicked(r: Rect) bool {
-        return rl.checkCollisionPointRec(rl.getMousePosition(), r) and rl.isMouseButtonPressed(.left);
+        return over(r) and rl.isMouseButtonPressed(.left);
     }
 };
+
+var interaction_clip: ?Rect = null;
+
+/// Keep scrolled form controls from receiving clicks behind sticky navigation.
+pub fn setInteractionClip(clip: ?Rect) void {
+    interaction_clip = clip;
+}
 
 pub fn hovering(r: Rect) bool {
     return mouse.over(r);
@@ -932,6 +942,9 @@ pub fn kbTakeAnnouncement(out: []u8) usize {
 /// Register one interactive control; returns true when THIS control is keyboard-activated this frame.
 /// Draws the focus ring + queues the spoken label when the ring sits here.
 fn kbRegister(r: Rect, label: []const u8, kind: []const u8) bool {
+    if (interaction_clip) |clip| {
+        if (r.y < clip.y or r.y + r.height > clip.y + clip.height) return false;
+    }
     const idx: i32 = @intCast(kb_count);
     kb_count += 1;
     if (idx != kb_focus) return false;

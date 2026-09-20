@@ -2,6 +2,7 @@
 zig-out/
 .zig-cache/
 zig-cache/
+zig-global-cache/
 zig-pkg/
 
 # toolchains the installer / build scripts bootstrap into the tree (lib-deps.sh)
@@ -117,3 +118,6 @@ scripts/sim/tests/
 .release-smoke/
 .release-check.json
 .veil-update-*/
+
+
+marketing/

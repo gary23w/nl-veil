@@ -4,6 +4,55 @@
 
 const std = @import("std");
 
+pub const Fence = struct { marker: u8, len: usize };
+
+/// Match backtick and tilde fences without mistaking a shorter nested fence for a close.
+pub fn fenceOpen(line: []const u8) ?Fence {
+    const s = std.mem.trim(u8, line, " \t\r");
+    if (s.len < 3 or (s[0] != '`' and s[0] != '~')) return null;
+    var n: usize = 0;
+    while (n < s.len and s[n] == s[0]) : (n += 1) {}
+    if (n < 3) return null;
+    if (s[0] == '`' and std.mem.indexOfScalar(u8, s[n..], '`') != null) return null;
+    return .{ .marker = s[0], .len = n };
+}
+
+pub fn fenceClose(line: []const u8, fence: Fence) bool {
+    const s = std.mem.trim(u8, line, " \t\r");
+    var n: usize = 0;
+    while (n < s.len and s[n] == fence.marker) : (n += 1) {}
+    return n >= fence.len and n == s.len;
+}
+
+/// A display-only soft wrap; copying always uses the original bytes.
+pub fn codeChunk(s: []const u8, columns: usize) usize {
+    var i: usize = 0;
+    var cells: usize = 0;
+    while (i < s.len and cells < @max(1, columns)) : (cells += 1) {
+        i += 1;
+        while (i < s.len and s[i] & 0xc0 == 0x80) : (i += 1) {}
+    }
+    return i;
+}
+
+test "code fences preserve nested fences and support streaming and CRLF" {
+    const outer = fenceOpen("````markdown\r").?;
+    try std.testing.expect(!fenceClose("```", outer));
+    try std.testing.expect(!fenceClose("````text", outer));
+    try std.testing.expect(fenceClose(" `````\r", outer));
+    try std.testing.expect(fenceClose("~~~", fenceOpen("~~~zig").?));
+    try std.testing.expect(!fenceClose("```", fenceOpen("~~~").?));
+    try std.testing.expect(fenceOpen("``") == null);
+    try std.testing.expect(fenceOpen("```a`b") == null);
+}
+
+test "code soft wrapping preserves Unicode and always advances" {
+    try std.testing.expectEqual(@as(usize, 3), codeChunk("éab", 2));
+    try std.testing.expectEqual(@as(usize, 4), codeChunk("🙂x", 1));
+    try std.testing.expectEqual(@as(usize, 1), codeChunk("abc", 0));
+    try std.testing.expectEqual(@as(usize, 0), codeChunk("", 8));
+}
+
 pub fn mdstarts(hay: []const u8, needle: []const u8) bool {
     return std.mem.startsWith(u8, hay, needle);
 }

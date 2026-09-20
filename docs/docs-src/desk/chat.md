@@ -12,6 +12,13 @@ chat.zig is the desktop's chat worker thread (beside the UI and the poller), own
 
 The desk prefers the backend turn and **falls back to its own local engine** on any failure (a `501` from the kill switch `VEIL_CHAT_BACKEND=0`, a non-2xx, or an unreachable server), so the Chat tab keeps working even when the backend is disabled. It also owns chat-side presentation: conversation selection, streaming/render of the frames, the memory/proposal panes fed by the server, and settings.
 
+## Preparation feedback
+
+In v1.1.4, server routing marks the turn busy before provider resolution, attachment
+processing and history setup. The UI shows preparation immediately, then displays
+actual server status events in a persistent progress card. Failed routing clears
+that temporary state before the local fallback takes over.
+
 ## Key Exports
 
 - `Chat` (struct) — the chat client: state fields + methods; instantiated once and `run()` on its own thread

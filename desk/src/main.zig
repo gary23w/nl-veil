@@ -155,12 +155,15 @@ const Ui = struct {
     mh_mfp: [store_mod.MAX_CHAT_MSGS]u64 = undefined,
     mh_count: usize = 0,
     mh_cols: usize = 0,
+    mh_width: f32 = 0,
+    mh_scale: f32 = 0,
     mh_fp: u64 = 0,
     // live-stream measure cache: the growing preview only re-wraps when its length actually changed (not
     // every frame at 30-60fps while busy).
     stream_h: f32 = 0,
     stream_h_len: usize = std.math.maxInt(usize),
     stream_h_cols: usize = 0,
+    stream_h_fp: u64 = 0,
     // SMOOTH REVEAL: how many bytes of the in-flight reply are shown on screen (fractional so a sub-byte/frame
     // rate accumulates cleanly). Server tokens arrive in poll-batched chunks (33-120ms); dumping each batch at
     // once made a slow reply appear in visible jumps, and draining each batch FASTER than the next arrives made
@@ -188,6 +191,8 @@ const Ui = struct {
     c_renaming: bool = false, // the active conversation's title is being edited in the left pane
     chat_scroll: f32 = 0,
     chat_follow: bool = true,
+    chat_reflow: bool = false,
+    chat_view_h: f32 = 0,
     chat_inner: ChatInner = .chat, // center pane: conversation | Metrics (perf graphs) | Files (this chat's build dir)
     chat_file_scroll: f32 = 0, // scroll offset for the chat Files content viewer
     chat_file_hscroll: f32 = 0, // HORIZONTAL scroll offset (px) for the chat Files content viewer
@@ -256,6 +261,9 @@ const Ui = struct {
     input_dragging: bool = false,
     conv_selected: bool = false, // Ctrl+A on the transcript: the WHOLE conversation is the copy target
     // Settings page scroll (content outgrows the window at larger text sizes)
+    settings_drag: bool = false,
+    settings_page: usize = 0,
+    settings_colw: f32 = 720,
     settings_scroll: f32 = 0,
     settings_h: f32 = 0, // content height measured last frame — the scroll clamp
     // Tasks tab: task list + builder form ("once" fires at now+N; "every" repeats; "daily" at HH:MM)
@@ -637,6 +645,7 @@ pub fn runApp(data_dir: ?[]const u8) !void {
             applyChatVariantFonts(dys0, bold0); // keep the chat's bold/italic variants in the same family
             font_dyslexia_applied = dys0;
             font_bold_applied = bold0;
+            ui.mh_width = 0;
         }
         t.setUiScale(@as(f32, @floatFromInt(scale0)) / 100.0);
         MSG_LINE_H = @round(19.0 * t.uiScale());
@@ -651,10 +660,10 @@ pub fn runApp(data_dir: ?[]const u8) !void {
             if (mouse_active or ui.input_active or busy0) ui.hot_frames = 40; // ~0.66s of 60fps after any activity
             ui.input_active = false; // handleKeys/editField below re-arm it for the next frame
             const focused = rl.isWindowFocused();
-            // idle floors: 12 focused / 6 unfocused. Input is still polled EVERY frame, so the first wake
-            // costs at most one idle frame (~83ms) before hot_frames restores 60fps — imperceptible, and the
+            // idle floors: 30 focused / 6 unfocused. Input is still polled EVERY frame, so the first wake
+            // costs at most one idle frame (~33ms) before hot_frames restores 60fps, and the
             // focused-idle redraw was the last steady CPU line item after the poller/log churn fixes.
-            const fps: i32 = if (ui.hot_frames > 0) (if (focused) 60 else 30) else if (focused) 12 else 6;
+            const fps: i32 = if (ui.hot_frames > 0) (if (focused) 60 else 30) else if (focused) 30 else 6;
             if (ui.hot_frames > 0) ui.hot_frames -= 1;
             rl.setTargetFPS(fps);
         }
@@ -2498,8 +2507,8 @@ fn drawChat(store: *Store, body: t.Rect) void {
     // the next lands → continuous flow, no chunk-pause-chunk. It self-corrects to the model's pace (steady-state
     // backlog ≈ rate × window, ~a fifth of a second behind, imperceptible; a big burst drains fast). A small
     // floor flushes a trailing few bytes promptly instead of asymptoting. Resets with the buffer between turns.
-    const REVEAL_WINDOW_S: f64 = 0.16;
-    const REVEAL_FLOOR_BPS: f64 = 45.0; // minimum reveal speed (bytes/sec) so the tail of a batch doesn't crawl
+    const REVEAL_WINDOW_S: f64 = 0.08;
+    const REVEAL_FLOOR_BPS: f64 = 160.0; // minimum reveal speed (bytes/sec) so the tail of a batch doesn't crawl
     const len_f: f64 = @floatFromInt(inflight_full.len);
     if (ui.stream_reveal > len_f) ui.stream_reveal = len_f; // buffer shrank (commit / new turn / conv switch)
     if (ui.stream_reveal < len_f) {
@@ -3204,7 +3213,12 @@ fn drawCfProfileCard(store: *Store, r: t.Rect, now_s: i64) f32 {
     }
     if (chot) t.wantCursor(.pointing_hand);
     if (chot and rl.isMouseButtonPressed(.left)) {
-        if (cfc) ui.tab = .settings else store.pushCmd(store_mod.mkCmd(.oauth_cf_login, "", ""));
+        if (cfc) {
+            setTab(.settings);
+            ui.settings_page = 1;
+            ui.settings_scroll = 0;
+            ui.settings_h = 0;
+        } else store.pushCmd(store_mod.mkCmd(.oauth_cf_login, "", ""));
     }
     return foot_h;
 }
@@ -3435,15 +3449,24 @@ fn codeCopyChip(x: f32, y: f32) bool {
 }
 
 /// The code block's raw content, from just after the opening fence line to the closing fence.
-fn codeBlockSlice(text_: []const u8, from: usize) []const u8 {
+fn codeBlockSlice(text_: []const u8, from: usize, fence: md.Fence) []const u8 {
     var i = from;
     while (i < text_.len) {
         const nl = std.mem.indexOfScalarPos(u8, text_, i, '\n') orelse text_.len;
         const ln = std.mem.trimStart(u8, text_[i..nl], " ");
-        if (std.mem.startsWith(u8, ln, "```")) return text_[from..i];
+        if (md.fenceClose(ln, fence)) return text_[from..i];
         i = if (nl == text_.len) text_.len else nl + 1;
     }
     return text_[from..];
+}
+
+test "copy code preserves nested fences, indentation and unfinished streaming blocks" {
+    const nested = "````markdown\n```zig\n  const n = 1;\n```\n````\nanswer";
+    try std.testing.expectEqualStrings("```zig\n  const n = 1;\n```\n", codeBlockSlice(nested, 13, md.fenceOpen("````markdown").?));
+    const tilde = "~~~text\r\n\talpha\r\n~~~\r\n";
+    try std.testing.expectEqualStrings("\talpha\r\n", codeBlockSlice(tilde, 9, md.fenceOpen("~~~text").?));
+    const streaming = "```zig\nconst x =";
+    try std.testing.expectEqualStrings("const x =", codeBlockSlice(streaming, 7, md.fenceOpen("```zig").?));
 }
 
 // Chat line metrics — VARS, refreshed each frame from the text-scale settings so the reading surface's
@@ -3607,33 +3630,46 @@ fn renderMsg(view: t.Rect, y0: f32, role: store_mod.ChatRole, text_: []const u8,
         // border) with a small copy chip tucked in the top-right corner that only appears while the block is
         // hovered. The whole block is grouped by lookahead to the closing fence so height is exact in both the
         // measure and draw passes.
-        if (std.mem.startsWith(u8, tl, "```")) {
+        if (md.fenceOpen(tl)) |fence| {
             var j = i + 1;
-            while (j < n and !std.mem.startsWith(u8, std.mem.trim(u8, lines[j], " \r\t"), "```")) : (j += 1) {}
-            const n_code = j - (i + 1);
+            while (j < n and !md.fenceClose(lines[j], fence)) : (j += 1) {}
             const pad_v: f32 = 10;
-            const block_h = pad_v * 2 + @as(f32, @floatFromInt(n_code)) * MSG_LINE_H;
+            const header_h = MSG_LINE_H + 8;
             const bx = view.x + 8;
-            const bw = view.width - 16;
+            const bw = @max(1, view.width - 16);
+            const code_cols: usize = @intFromFloat(@max(1, @floor(@max(1, bw - 28) / @max(1, t.measureMonoF("M", fsz)))));
+            var rows: usize = 0;
+            for (lines[i + 1 .. j]) |line| {
+                var rest = std.mem.trimEnd(u8, line, "\r");
+                rows += 1;
+                while (rest.len > 0) {
+                    rest = rest[md.codeChunk(rest, code_cols)..];
+                    if (rest.len > 0) rows += 1;
+                }
+            }
+            const block_h = header_h + pad_v * 2 + @as(f32, @floatFromInt(rows)) * MSG_LINE_H;
             if (draw and inView(view, yy, block_h)) {
                 const block = t.Rect{ .x = bx, .y = yy, .width = bw, .height = block_h };
                 t.panelBordered(block, t.withAlpha(t.bg_hl, 170), t.border);
-                // the fence's language tag ("```zig") becomes a quiet label in the top-right corner
-                const lang = std.mem.trim(u8, tl[3..], " \r\t`");
-                if (lang.len > 0 and lang.len <= 12 and !t.hovering(block)) {
-                    const lw = t.measure(t.zs(lang), 10);
-                    t.textClip(lang, @intFromFloat(bx + bw - 10 - @as(f32, @floatFromInt(lw))), @intFromFloat(yy + 6), 10, t.comment, lw + 4);
+                const lang = std.mem.trim(u8, tl[fence.len..], " \r\t");
+                t.textClip(if (lang.len > 0) lang else "code", @intFromFloat(bx + 14), @intFromFloat(yy + 7), 11, t.fg_dim, @intFromFloat(@max(1, bw - 80)));
+                t.hline(@intFromFloat(bx + 1), @intFromFloat(yy + header_h), @intFromFloat(@max(1, bw - 2)), t.border);
+                var cy = yy + header_h + pad_v;
+                for (lines[i + 1 .. j]) |line| {
+                    var rest = std.mem.trimEnd(u8, line, "\r");
+                    if (rest.len == 0) cy += MSG_LINE_H;
+                    while (rest.len > 0) {
+                        const take = md.codeChunk(rest, code_cols);
+                        if (inView(view, cy, MSG_LINE_H)) t.textMonoClip(rest[0..take], @intFromFloat(bx + 14), @intFromFloat(cy), fsz, t.cyan, @intFromFloat(@max(1, bw - 28)));
+                        rest = rest[take..];
+                        cy += MSG_LINE_H;
+                    }
                 }
-                var k: usize = 0;
-                while (k < n_code) : (k += 1) {
-                    const cl = std.mem.trimEnd(u8, lines[i + 1 + k], "\r");
-                    t.textMonoClip(cl, @intFromFloat(bx + 14), @intFromFloat(yy + pad_v + @as(f32, @floatFromInt(k)) * MSG_LINE_H), fsz, t.cyan, @intFromFloat(bw - 28));
-                }
-                if (t.hovering(block)) {
+                if (bw >= 80 and t.hovering(view)) {
                     const off = @intFromPtr(lines[i].ptr) - @intFromPtr(text_.ptr);
                     const from = @min(off + lines[i].len + 1, text_.len);
                     if (codeCopyChip(bx + bw - 46, yy + 6)) {
-                        copyToClipboard(codeBlockSlice(text_, from));
+                        copyToClipboard(codeBlockSlice(text_, from, fence));
                         markCopied();
                     }
                 }
@@ -4196,11 +4232,11 @@ fn drawThinkingMark(x: f32, y: f32) f32 {
 /// the wait reads as a lively, transforming process rather than a frozen spinner. Cycles on a slow clock,
 /// independent of stream energy so the word is legible.
 const think_words = [_][:0]const u8{
-    "Discombobulating", "Transforming",  "Percolating",   "Conjuring",     "Synthesizing",
-    "Ruminating",       "Coalescing",    "Weaving",       "Distilling",    "Effervescing",
-    "Galvanizing",      "Kindling",      "Marinating",    "Orchestrating", "Simmering",
-    "Tessellating",     "Unfurling",     "Whirring",      "Cogitating",    "Shimmering",
-    "Manifesting",      "Noodling",      "Crystallizing", "Reticulating",  "Percolating",
+    "Discombobulating", "Transforming", "Percolating",   "Conjuring",     "Synthesizing",
+    "Ruminating",       "Coalescing",   "Weaving",       "Distilling",    "Effervescing",
+    "Galvanizing",      "Kindling",     "Marinating",    "Orchestrating", "Simmering",
+    "Tessellating",     "Unfurling",    "Whirring",      "Cogitating",    "Shimmering",
+    "Manifesting",      "Noodling",     "Crystallizing", "Reticulating",  "Percolating",
 };
 
 fn thinkWord() [:0]const u8 {
@@ -4293,6 +4329,39 @@ fn rowSetOpen(uid: u32, open: bool) void {
     }
     ui.open_uids[ui.open_n] = uid;
     ui.open_n += 1;
+}
+
+fn rowToggleByUser(uid: u32, open: bool) void {
+    rowSetOpen(uid, open);
+    ui.chat_reflow = true;
+}
+
+/// Small streaming reflows become bottom padding, not a backward camera movement.
+/// Large replacements and deliberate layout changes still use their actual bounds.
+fn chatScrollLimit(content_h: f32, view_h: f32, previous: f32, follow: bool, reflow: bool, slack: f32) f32 {
+    const required = @max(0, content_h - view_h);
+    if (!follow or reflow or previous - required > slack) return required;
+    return @max(required, previous);
+}
+
+test "chat follow does not bounce when streaming markdown briefly loses a line" {
+    var offset: f32 = 0;
+    for ([_]f32{ 495, 514, 507, 514, 533, 514, 533 }) |height| {
+        const next = chatScrollLimit(height, 500, offset, true, false, 38);
+        try std.testing.expect(next >= offset);
+        try std.testing.expect(next + 500 >= height);
+        offset = next;
+    }
+    try std.testing.expectEqual(@as(f32, 33), offset);
+    // A completed reply keeps the same small bottom cushion.
+    try std.testing.expectEqual(offset, chatScrollLimit(514, 500, offset, true, false, 38));
+}
+
+test "chat follow respects manual scrolling, resizing, collapse and large replacement" {
+    try std.testing.expectEqual(@as(f32, 14), chatScrollLimit(514, 500, 33, false, false, 38));
+    try std.testing.expectEqual(@as(f32, 14), chatScrollLimit(514, 500, 33, true, true, 38));
+    try std.testing.expectEqual(@as(f32, 0), chatScrollLimit(200, 500, 400, true, false, 38));
+    try std.testing.expectEqual(@as(f32, 100), chatScrollLimit(600, 500, 33, true, false, 38));
 }
 
 /// The collapsed reasoning-trace line — same shape as toolChip but labeled as the veil's own thinking. Shows
@@ -4588,6 +4657,22 @@ fn drawSelection() void {
     }
 }
 
+/// Status events remain visible while reading history and before the first model token.
+fn drawChatProgress(r: t.Rect, status: []const u8) f32 {
+    var lines: [16][]const u8 = undefined;
+    const text = if (status.len > 0) status else "Preparing your request...";
+    const count = wrapInto(text, @max(1, r.width - 32), &lines);
+    const lh = @round(16 * t.uiScale());
+    const height = 38 + @as(f32, @floatFromInt(count)) * lh;
+    t.panelBordered(.{ .x = r.x, .y = r.y, .width = r.width, .height = height }, t.bg_hl, t.border);
+    const mark = drawThinkingMark(r.x + 12, r.y + 10);
+    t.textClip("In progress", @intFromFloat(r.x + 18 + mark), @intFromFloat(r.y + 10), 12, t.blue, @intFromFloat(@max(1, r.width - mark - 30)));
+    for (lines[0..count], 0..) |line, i| {
+        t.textClip(line, @intFromFloat(r.x + 16), @intFromFloat(r.y + 32 + @as(f32, @floatFromInt(i)) * lh), 12, t.fg_dim, @intFromFloat(@max(1, r.width - 32)));
+    }
+    return height + 8;
+}
+
 fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, stream: []const u8, busy: bool, status: []const u8, cast_live: bool, conv_title: []const u8, convs: []const store_mod.ConvRow, active: []const u8) void {
     // The input row is USER-RESIZABLE (drag the grab strip above it): crafting a long prompt deserves
     // more than three lines. ui.input_extra persists for the session; the transcript view shrinks to
@@ -4702,7 +4787,8 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
         drawChatFiles(store, .{ .x = r.x, .y = r.y + tab_h + 6, .width = r.width, .height = r.height - tab_h - 6 });
         return;
     }
-    const view = t.Rect{ .x = r.x, .y = r.y + tab_h + 6, .width = r.width, .height = r.height - input_h - status_h - role_h - 14 - tab_h - 6 };
+    const progress_h = if (busy or cast_live) drawChatProgress(.{ .x = r.x, .y = r.y + tab_h + 6, .width = r.width, .height = 0 }, status) else 0;
+    const view = t.Rect{ .x = r.x, .y = r.y + tab_h + 6 + progress_h, .width = r.width, .height = @max(1, r.height - input_h - status_h - role_h - 14 - tab_h - 6 - progress_h) };
     t.panelBordered(view, t.bg_dark, t.border);
     // The transcript reads as a surface rather than a void. Drawn on the panel, BEFORE the messages and
     // outside the scroll scissor, so it stays pinned to the frame instead of sliding with the text — the
@@ -4719,6 +4805,7 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
     for (active) |c| conv_key = (conv_key ^ c) *% 0x100000001b3;
     if (ui.open_conv_key != conv_key) {
         ui.open_conv_key = conv_key;
+        ui.mh_width = 0;
         ui.open_n = 0;
         ui.thought_uid_hi = 0;
         for (msgs) |*m| ui.thought_uid_hi = @max(ui.thought_uid_hi, m.uid);
@@ -4744,11 +4831,14 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
     for (ui.open_uids[0..ui.open_n]) |u| fp = fp *% 31 +% u; // expand/collapse changes a row's height
     // message set / wrap width changed → drop a stale selection — but NOT mid-drag, or a background message commit
     // (a cast_note row, the finalized veil answer) during an active drag would silently kill the in-progress select.
-    if ((ui.mh_fp != fp or ui.mh_cols != cols) and !ui.sel_dragging) ui.sel_msg = null;
-    if (ui.mh_count != msgs.len or ui.mh_cols != cols or ui.mh_fp != fp) {
+    const layout_changed = ui.mh_width != view.width or ui.mh_scale != t.uiScale();
+    // A resize can happen between streams; invalidate even when no preview is drawn.
+    if (layout_changed) ui.stream_h_len = std.math.maxInt(usize);
+    if ((ui.mh_fp != fp or layout_changed) and !ui.sel_dragging) ui.sel_msg = null;
+    if (ui.mh_count != msgs.len or layout_changed or ui.mh_fp != fp) {
         // INCREMENTAL rebuild: only rows whose own fingerprint changed re-measure. A width change isn't caught
         // by the per-row fp, so `wipe` (below) forces every cached height stale.
-        const wipe = ui.mh_cols != cols; // wrap width changed → every cached height is stale
+        const wipe = layout_changed; // wrap width changed → every cached height is stale
         for (msgs, 0..) |*m, i| {
             const open = rowOpen(m.uid);
             // uid is folded in (spread across the word by the golden-ratio multiply) so a row that SHIFTED into
@@ -4763,22 +4853,25 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
         }
         ui.mh_count = msgs.len;
         ui.mh_cols = cols;
+        ui.mh_width = view.width;
+        ui.mh_scale = t.uiScale();
         ui.mh_fp = fp;
     }
-    var total: f32 = 8;
+    // Keep the reading cushion through stream -> committed-message transitions.
+    var total: f32 = 8 + MSG_LINE_H;
     for (msgs, 0..) |_, i| total += ui.mh[i];
-    if (busy or stream.len > 0) {
+    if (stream.len > 0) {
         // re-measure the live preview only when it actually grew (it only ever grows within a step)
-        if (stream.len != ui.stream_h_len or cols != ui.stream_h_cols) {
+        if (stream.len != ui.stream_h_len or layout_changed or std.hash.Wyhash.hash(0, stream) != ui.stream_h_fp) {
             ui.stream_h = renderMsg(view, 0, .veil, stream, fsz, false, false, "");
             ui.stream_h_len = stream.len;
             ui.stream_h_cols = cols;
+            ui.stream_h_fp = std.hash.Wyhash.hash(0, stream);
         }
-        total += ui.stream_h + MSG_LINE_H;
+        total += ui.stream_h;
     }
     if (cast_live) total += renderCastLive(view, 0, status, false);
 
-    const max_scroll = if (total > view.height) total - view.height else 0;
     // Release any table-scrollbar drag on mouse-up here, ONCE per frame and unconditionally — renderTable's own
     // release is gated on the table being on-screen, so a table dragged off-screen and released there would
     // otherwise leave tbl_hgrab stuck and hijack a later click when it scrolls back into view.
@@ -4790,6 +4883,9 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
         ui.chat_scroll -= wheel * 3 * MSG_LINE_H;
         ui.chat_follow = false;
     }
+    const max_scroll = chatScrollLimit(total, view.height, ui.chat_scroll, ui.chat_follow, layout_changed or ui.chat_reflow or ui.chat_view_h != view.height, MSG_LINE_H * 2);
+    ui.chat_reflow = false;
+    ui.chat_view_h = view.height;
     if (ui.chat_follow) ui.chat_scroll = max_scroll;
     if (ui.chat_scroll < 0) ui.chat_scroll = 0;
     if (ui.chat_scroll > max_scroll) ui.chat_scroll = max_scroll;
@@ -4833,9 +4929,9 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
                     }
                 }
                 const hdr = t.Rect{ .x = view.x + 2, .y = y0, .width = view.width - 132, .height = 20 };
-                if (t.hovering(hdr) and t.hovering(view) and rl.isMouseButtonPressed(.left)) rowSetOpen(m.uid, false);
+                if (t.hovering(hdr) and t.hovering(view) and rl.isMouseButtonPressed(.left)) rowToggleByUser(m.uid, false);
             } else if (thoughtChip(view, y0, false, m.textStr())) {
-                rowSetOpen(m.uid, true);
+                rowToggleByUser(m.uid, true);
             }
             continue;
         }
@@ -4857,9 +4953,9 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
                     if (openChip(view.x + view.width - 196, y0 + 3)) store.pushCmd(store_mod.mkCmd(.open_url, "", url));
                 }
                 const hdr = t.Rect{ .x = view.x + 2, .y = y0, .width = view.width - 132, .height = 20 };
-                if (t.hovering(hdr) and t.hovering(view) and rl.isMouseButtonPressed(.left)) rowSetOpen(m.uid, false);
+                if (t.hovering(hdr) and t.hovering(view) and rl.isMouseButtonPressed(.left)) rowToggleByUser(m.uid, false);
             } else if (toolChipEx(view, y0, tn, false, liveUrlIn(m.textStr()), store)) {
-                rowSetOpen(m.uid, true);
+                rowToggleByUser(m.uid, true);
             }
             continue;
         }
@@ -4876,7 +4972,7 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
         }
     }
     cur_sel_msg = std.math.maxInt(usize); // the streaming/cast-live rows change every frame — not selectable
-    if (busy or stream.len > 0) {
+    if (stream.len > 0) {
         // feed the thinking mark's energy: note whenever the stream actually GREW this frame
         if (stream.len != ui.live_len_prev) {
             ui.live_len_prev = stream.len;
@@ -4886,7 +4982,22 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
     }
     if (cast_live) yy = renderCastLive(view, yy, status, true);
     if (msgs.len == 0 and !busy and stream.len == 0) {
-        t.text(t.z("talk to the veil - it casts the hive when a task needs real work", .{}), @intFromFloat(view.x + 14), @intFromFloat(view.y + 14), 13, t.comment);
+        t.textClip("What would you like to make?", @intFromFloat(view.x + 20), @intFromFloat(view.y + 22), 20, t.fg, @intFromFloat(@max(1, view.width - 40)));
+        const intro_bottom = helpPara("Start with an idea, a question, or one thing you want to improve.", view.x + 20, view.y + 56, @max(1, view.width - 40));
+        const starters = [_]struct { title: [:0]const u8, prompt: []const u8 }{
+            .{ .title = "Explore my project", .prompt = "Help me understand this project. Explain the main parts and suggest one useful place to start." },
+            .{ .title = "Build something small", .prompt = "I want to build a small feature. Help me clarify the idea and break it into a few achievable steps." },
+            .{ .title = "Find an improvement", .prompt = "Review this project for one practical improvement. Explain why it matters before making changes." },
+        };
+        var starter_y = intro_bottom + 24;
+        for (starters) |starter| {
+            const card = t.Rect{ .x = view.x + 20, .y = starter_y, .width = @max(1, @min(360, view.width - 40)), .height = 38 };
+            if (card.y + card.height <= view.y + view.height and t.button(card, starter.title, t.blue, true)) {
+                setField(&ui.c_input, starter.prompt);
+                ui.focus = .c_input;
+            }
+            starter_y += 48;
+        }
         // The one-click on-ramp, right where a first-timer is looking: when the server offers the
         // Cloudflare login and this user has not taken it yet, say what it buys and let them click.
         var cfg = false;
@@ -4902,9 +5013,9 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
         if (cfg and !cfc) {
             const lbl: [:0]const u8 = if (cfp) t.z("waiting for cloudflare... (click to retry)", .{}) else t.z("+ log in with cloudflare - free workers ai, your live model list, r2 backup", .{});
             const lw: f32 = @floatFromInt(t.measure(lbl, 12));
-            const lr = t.Rect{ .x = view.x + 12, .y = view.y + 36, .width = lw + 8, .height = 18 };
-            const lhot = t.hovering(lr) and t.hovering(view);
-            t.text(lbl, @intFromFloat(lr.x + 2), @intFromFloat(lr.y + 2), 12, if (cfp) t.orange else if (lhot) CF_ORANGE else t.fg_dim);
+            const lr = t.Rect{ .x = view.x + 20, .y = starter_y + 8, .width = @min(lw + 8, @max(1, view.width - 40)), .height = 18 };
+            const lhot = t.hovering(lr) and t.hovering(view) and lr.y + lr.height <= view.y + view.height;
+            t.textClip(lbl, @intFromFloat(lr.x + 2), @intFromFloat(lr.y + 2), 12, if (cfp) t.orange else if (lhot) CF_ORANGE else t.fg_dim, @intFromFloat(lr.width));
             if (lhot) t.wantCursor(.pointing_hand);
             if (lhot and rl.isMouseButtonPressed(.left)) store.pushCmd(store_mod.mkCmd(.oauth_cf_login, "", ""));
         }
@@ -7761,16 +7872,51 @@ fn helpPara(s: []const u8, x: f32, y_in: f32, maxw: f32) f32 {
 /// One Settings toggle row: a FIXED-width state chip + its description. Every toggle passes the SAME `w` (the max
 /// over all chip labels), so the chips are flush left and every description starts at the same x — the per-label
 /// widths this replaces are why the page read as "all over the place". Returns true on click; the caller flips.
-fn settingRow(x: f32, y: f32, w: f32, label: [:0]const u8, on: bool, desc: [:0]const u8) bool {
-    const hit = t.button(.{ .x = x, .y = y, .width = w, .height = 32 }, label, if (on) t.green else t.comment, true);
-    t.text(desc, @intFromFloat(x + w + 14), @intFromFloat(y + 9), 12, t.comment);
+fn settingRow(x: f32, y: *f32, w: f32, label: [:0]const u8, on: bool, desc: [:0]const u8) bool {
+    const top = y.*;
+    const stacked = ui.settings_colw - w < 240;
+    const hit = t.button(.{ .x = x, .y = top, .width = @min(w, ui.settings_colw), .height = 34 }, label, if (on) t.blue else t.fg_dim, true);
+    const dx = if (stacked) x else x + w + 18;
+    const dy = if (stacked) top + 42 else top + 6;
+    const bottom = helpPara(desc, dx, dy, ui.settings_colw - (dx - x));
+    y.* = @max(top + 34, bottom) + 18;
     return hit;
 }
 
-fn drawSettings(store: *Store, body: t.Rect) void {
+fn drawSettings(store: *Store, frame: t.Rect) void {
+    const pad: f32 = t.PAD;
+    const colw = @max(1, @min(frame.width - pad * 2, 800));
+    const x = frame.x + (frame.width - colw) / 2;
+    ui.settings_colw = colw;
+    t.text(t.z("Settings", .{}), @intFromFloat(x), @intFromFloat(frame.y + 12), 24, t.fg);
+    t.textClip("Make the veil feel like yours.", @intFromFloat(x), @intFromFloat(frame.y + 46), 13, t.fg_dim, @intFromFloat(colw));
+    const pages = [_][:0]const u8{ "General", "Models", "Connection", "Data", "Updates" };
+    t.setBlockClicks(ui.open_dd != .none);
+    var nx = x;
+    var ny = frame.y + 74;
+    for (pages, 0..) |label, index| {
+        const width = t.tabW(label) + 12;
+        if (nx > x and nx + width > x + colw) {
+            nx = x;
+            ny += 36;
+        }
+        if (t.tab(.{ .x = nx, .y = ny, .width = width, .height = 30 }, label, ui.settings_page == index)) {
+            ui.settings_page = index;
+            ui.settings_scroll = 0;
+            ui.settings_drag = false;
+            ui.settings_h = 0;
+            ui.open_dd = .none;
+            ui.focus = .none;
+        }
+        nx += width + 6;
+    }
+    const content_y = ny + 44;
+    const body = t.Rect{ .x = x, .y = content_y, .width = colw, .height = @max(1, frame.y + frame.height - content_y) };
     // While a dropdown is open, block the form's buttons/toggles from eating a click meant for the dropdown
     // list drawn over them (flushChatDropdown clears this before drawing the list, so the options still work).
     t.setBlockClicks(ui.open_dd != .none);
+    t.setInteractionClip(body);
+    defer t.setInteractionClip(null);
     defer t.setBlockClicks(false); // never let it leak to the titlebar/tabbar of the next frame
     // SCROLL: the page outgrows the window (text size XL especially — the report was "we cannot scroll
     // settings"). Wheel scrolls; the clamp comes from the content height measured LAST frame (immediate
@@ -7781,20 +7927,23 @@ fn drawSettings(store: *Store, body: t.Rect) void {
             ui.settings_scroll -= wheel * 40;
             ui.input_active = true;
         }
+        if (ui.focus == .none and ui.open_dd == .none) {
+            if (rl.isKeyPressed(.page_down)) ui.settings_scroll += body.height * 0.8;
+            if (rl.isKeyPressed(.page_up)) ui.settings_scroll -= body.height * 0.8;
+            if (rl.isKeyPressed(.home)) ui.settings_scroll = 0;
+            if (rl.isKeyPressed(.end)) ui.settings_scroll = ui.settings_h;
+        }
         ui.settings_scroll = std.math.clamp(ui.settings_scroll, 0, @max(0, ui.settings_h - body.height + 24));
     }
     rl.beginScissorMode(@intFromFloat(body.x), @intFromFloat(body.y), @intFromFloat(body.width), @intFromFloat(body.height));
-    const pad: f32 = t.PAD;
-    var y: f32 = body.y + pad - ui.settings_scroll;
-    const x: f32 = pad;
-    const colw = @min(body.width - pad * 2, 720);
-    t.text(t.z("Settings", .{}), @intFromFloat(x), @intFromFloat(y), 20, t.fg);
-    y += 40;
-    y = settingSection(x, y, colw, "APP UPDATES");
-    y += @as(f32, @floatFromInt(drawMemText(updater.status(), x, y, 12, t.fg, colw))) * 16 + 12;
-    const update_phase = updater.phase.load(.acquire);
-    if (t.button(.{ .x = x, .y = y, .width = 180, .height = t.BTN_MD }, if (update_phase == .available) "Update & restart" else "Check for updates", t.red, update_phase == .available or update_phase == .current or update_phase == .failed)) updater.launch(update_phase == .available);
-    y += t.BTN_MD + 20;
+    var y: f32 = body.y + 8 - ui.settings_scroll;
+    if (ui.settings_page == 4) {
+        y = settingSection(x, y, colw, "APP UPDATES");
+        y += @as(f32, @floatFromInt(drawMemText(updater.status(), x, y, 12, t.fg, colw))) * 16 + 12;
+        const update_phase = updater.phase.load(.acquire);
+        if (t.button(.{ .x = x, .y = y, .width = 180, .height = t.BTN_MD }, if (update_phase == .available) "Update & restart" else "Check for updates", t.red, update_phase == .available or update_phase == .current or update_phase == .failed)) updater.launch(update_phase == .available);
+        y += t.BTN_MD + 20;
+    }
     store.lock();
     const dd = store.settings.dataDir();
     var ddb: [512]u8 = undefined;
@@ -7830,172 +7979,176 @@ fn drawSettings(store: *Store, body: t.Rect) void {
     @memcpy(cfab[0..cfan], store.settings.cf_account[0..cfan]);
     store.unlock();
 
-    y = settingSection(x, y, colw, "CONNECTION");
-    flabel(x, y, "DATA DIRECTORY (read live)");
-    y += 20;
-    const dr = t.Rect{ .x = x, .y = y, .width = colw, .height = 32 };
-    t.panelBordered(dr, t.bg, t.border);
-    t.textClip(ddb[0..ddn], @intFromFloat(x + 10), @intFromFloat(y + 9), 13, t.fg, @intFromFloat(colw - 20));
-    y += 48;
-    flabel(x, y, "SERVER HOST : PORT - the veil this desk drives (empty host = this machine)");
-    y += 20;
-    // Seed the editable fields from persisted values exactly once, after loadSettings finished — seeding
-    // earlier would capture the pre-load defaults and show a stale target until the tab is reopened.
-    if (!ui.srv_seeded and settings_loaded) {
-        setField(&ui.s_host, hostb[0..hostn]);
-        var spb: [8]u8 = undefined;
-        setField(&ui.s_port, std.fmt.bufPrint(&spb, "{d}", .{portv}) catch "8787");
-        ui.srv_seeded = true;
-    }
-    const ap_label = t.z("Apply", .{});
-    const apw = t.btnW(ap_label, t.BTN_MD);
-    const port_w: f32 = 76;
-    const host_w = colw - port_w - apw - t.GAP * 2;
-    textField(.{ .x = x, .y = y, .width = host_w, .height = t.FIELD_H }, &ui.s_host, ui.focus == .s_host, "127.0.0.1 (default - this machine)", .s_host);
-    textField(.{ .x = x + host_w + t.GAP, .y = y, .width = port_w, .height = t.FIELD_H }, &ui.s_port, ui.focus == .s_port, "8787", .s_port);
-    const apb = t.Rect{ .x = x + colw - apw, .y = y, .width = apw, .height = t.BTN_MD };
-    if (t.button(apb, ap_label, t.blue, true)) {
-        const hs = std.mem.trim(u8, ui.s_host.str(), " \t");
-        const p = std.fmt.parseInt(u16, std.mem.trim(u8, ui.s_port.str(), " \t"), 10) catch 0;
-        store.lock();
-        const s = &store.settings;
-        const hn2 = @min(hs.len, s.host.len);
-        @memcpy(s.host[0..hn2], hs[0..hn2]);
-        s.host_len = @intCast(hn2);
-        if (p >= 1) s.port = p; // 0/garbage = keep the current port rather than saving a dead target
-        store.unlock();
-        store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
-        store.pushNotif("Server target saved", if (hn2 == 0) "this machine (localhost)" else "remote veil - paste its nlk_ token below", 1);
-        ui.focus = .none;
-    }
-    y += 42;
-    t.text(t.z("{s}:{d}   ({s})", .{ if (hostn == 0) "127.0.0.1" else hostb[0..hostn], portv, if (online) "reachable" else "not reachable" }), @intFromFloat(x), @intFromFloat(y), 12, if (online) t.green else t.comment);
-    y += 34;
-    flabel(x, y, "API TOKEN - an nlk_ key from the web UI (enables Deploy over the API)");
-    y += 20;
-    const sv_label = t.z("Save token", .{});
-    const svw = t.btnW(sv_label, t.BTN_MD);
-    const tf = t.Rect{ .x = x, .y = y, .width = colw - svw - t.GAP, .height = t.FIELD_H };
-    textField(tf, &ui.d_key, ui.focus == .d_key, "nlk_... (also used by the Swarm tab's Deploy form)", .d_key);
-    const savb = t.Rect{ .x = x + colw - svw, .y = y, .width = svw, .height = t.BTN_MD };
-    if (t.button(savb, sv_label, t.blue, ui.d_key.len > 0)) {
-        store.lock();
-        const n = @min(ui.d_key.len, store.settings.token.len);
-        @memcpy(store.settings.token[0..n], ui.d_key.buf[0..n]);
-        store.settings.token_len = @intCast(n);
-        store.settings.token_manual = true; // stop the poller auto-syncing over the user's own key
-        store.unlock();
-        store.pushNotif("Token saved", "Deploy is authorized", 1);
-        ui.focus = .none;
-    }
-    y += 42; // clear the 34px field + gap
-    if (tok_n > 0) t.text(t.z("connected - a token is set ({d} chars, auto-loaded from the server)", .{tok_n}), @intFromFloat(x), @intFromFloat(y), 12, t.green);
-    y += 34;
-    // TEXT SIZE label (also feeds the shared chip width below). A global draw-time scale (90/100/112/125%);
-    // the chat's line heights follow it. Cycles on click, persists, applies the same frame.
-    const size_name: [:0]const u8 = switch (scale_now) {
-        90 => t.z("text size: Small", .{}),
-        112 => t.z("text size: Large", .{}),
-        125 => t.z("text size: XL", .{}),
-        else => t.z("text size: Normal", .{}),
-    };
-    // ONE chip width for every toggle, so the column is flush and all descriptions align. (Each toggle used to
-    // size itself, which left a ragged left edge and descriptions starting at eight different x positions.)
-    var tog_w: f32 = 0;
-    tog_w = @max(tog_w, t.btnW(t.z("notifications: OFF", .{}), 32));
-    tog_w = @max(tog_w, t.btnW(t.z("speed mode: OFF", .{}), 32));
-    tog_w = @max(tog_w, t.btnW(t.z("dyslexia mode: OFF", .{}), 32));
-    tog_w = @max(tog_w, t.btnW(t.z("text size: Normal", .{}), 32));
-    tog_w = @max(tog_w, t.btnW(t.z("text weight: Normal", .{}), 32));
-    tog_w = @max(tog_w, t.btnW(t.z("narrator: OFF", .{}), 32));
-    tog_w = @max(tog_w, t.btnW(t.z("browser window: SHOWN", .{}), 32));
-    tog_w = @max(tog_w, t.btnW(size_name, 32));
-    const ROW: f32 = 40;
-
-    // ---- APPEARANCE & ACCESSIBILITY -------------------------------------------------------------------
-    y = settingSection(x, y, colw, "APPEARANCE & ACCESSIBILITY");
-    if (settingRow(x, y, tog_w, size_name, scale_now != 100, t.z("scales every label and message - click to cycle Small / Normal / Large / XL.", .{}))) {
-        const next: u8 = switch (scale_now) {
-            90 => 100,
-            100 => 112,
-            112 => 125,
-            else => 90,
-        };
-        store.lock();
-        store.settings.font_scale = next;
-        store.unlock();
-        store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
-    }
-    y += ROW;
-    // Swaps to the face's Bold file (bundled OpenDyslexic Bold in dyslexia mode; the system face's bold otherwise).
-    if (settingRow(x, y, tog_w, if (bold_now) t.z("text weight: Bold", .{}) else t.z("text weight: Normal", .{}), bold_now, t.z("renders the whole app in the typeface's bold cut.", .{}))) {
-        store.lock();
-        store.settings.font_bold = !store.settings.font_bold;
-        store.unlock();
-        store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
-    }
-    y += ROW;
-    // OpenDyslexic (bundled, SIL OFL) — heavy-bottomed letterforms many dyslexic readers track more easily.
-    // Applies INSTANTLY (the render loop hot-swaps the font atlas next frame) and persists.
-    if (settingRow(x, y, tog_w, if (dys_on) t.z("dyslexia mode: ON", .{}) else t.z("dyslexia mode: OFF", .{}), dys_on, t.z("renders the app in OpenDyslexic, a typeface designed for dyslexic readers.", .{}))) {
-        store.lock();
-        store.settings.dyslexia = !store.settings.dyslexia;
-        store.unlock();
-        store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
-    }
-    y += ROW;
-    // The app SPEAKS through the OS's own text-to-speech (no audio code bundled); voice INPUT rides the OS
-    // dictation layer (Win+H) into the normal input box.
-    if (settingRow(x, y, tog_w, if (narr_on) t.z("narrator: ON", .{}) else t.z("narrator: OFF", .{}), narr_on, t.z("reads replies and alerts aloud (OS voice). dictate input with Win+H.", .{}))) {
-        store.lock();
-        store.settings.narrator = !store.settings.narrator;
-        const now_on = store.settings.narrator;
-        store.unlock();
-        store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
-        if (now_on) {
-            store.pushNotif("Narrator on", "replies and alerts will be read aloud. press Windows plus H to dictate into the message box", 1);
+    if (ui.settings_page == 2) {
+        y = settingSection(x, y, colw, "CONNECTION");
+        flabel(x, y, "DATA DIRECTORY (read live)");
+        y += 20;
+        const dr = t.Rect{ .x = x, .y = y, .width = colw, .height = 32 };
+        t.panelBordered(dr, t.bg, t.border);
+        t.textClip(ddb[0..ddn], @intFromFloat(x + 10), @intFromFloat(y + 9), 13, t.fg, @intFromFloat(colw - 20));
+        y += 48;
+        flabel(x, y, "SERVER HOST : PORT - the veil this desk drives (empty host = this machine)");
+        y += 20;
+        // Seed the editable fields from persisted values exactly once, after loadSettings finished — seeding
+        // earlier would capture the pre-load defaults and show a stale target until the tab is reopened.
+        if (!ui.srv_seeded and settings_loaded) {
+            setField(&ui.s_host, hostb[0..hostn]);
+            var spb: [8]u8 = undefined;
+            setField(&ui.s_port, std.fmt.bufPrint(&spb, "{d}", .{portv}) catch "8787");
+            ui.srv_seeded = true;
         }
+        const ap_label = t.z("Apply", .{});
+        const apw = t.btnW(ap_label, t.BTN_MD);
+        const port_w: f32 = 76;
+        const host_w = colw - port_w - apw - t.GAP * 2;
+        textField(.{ .x = x, .y = y, .width = host_w, .height = t.FIELD_H }, &ui.s_host, ui.focus == .s_host, "127.0.0.1 (default - this machine)", .s_host);
+        textField(.{ .x = x + host_w + t.GAP, .y = y, .width = port_w, .height = t.FIELD_H }, &ui.s_port, ui.focus == .s_port, "8787", .s_port);
+        const apb = t.Rect{ .x = x + colw - apw, .y = y, .width = apw, .height = t.BTN_MD };
+        if (t.button(apb, ap_label, t.blue, true)) {
+            const hs = std.mem.trim(u8, ui.s_host.str(), " \t");
+            const p = std.fmt.parseInt(u16, std.mem.trim(u8, ui.s_port.str(), " \t"), 10) catch 0;
+            store.lock();
+            const s = &store.settings;
+            const hn2 = @min(hs.len, s.host.len);
+            @memcpy(s.host[0..hn2], hs[0..hn2]);
+            s.host_len = @intCast(hn2);
+            if (p >= 1) s.port = p; // 0/garbage = keep the current port rather than saving a dead target
+            store.unlock();
+            store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
+            store.pushNotif("Server target saved", if (hn2 == 0) "this machine (localhost)" else "remote veil - paste its nlk_ token below", 1);
+            ui.focus = .none;
+        }
+        y += 42;
+        t.text(t.z("{s}:{d}   ({s})", .{ if (hostn == 0) "127.0.0.1" else hostb[0..hostn], portv, if (online) "reachable" else "not reachable" }), @intFromFloat(x), @intFromFloat(y), 12, if (online) t.green else t.comment);
+        y += 34;
+        flabel(x, y, "API TOKEN - an nlk_ key from the web UI (enables Deploy over the API)");
+        y += 20;
+        const sv_label = t.z("Save token", .{});
+        const svw = t.btnW(sv_label, t.BTN_MD);
+        const tf = t.Rect{ .x = x, .y = y, .width = colw - svw - t.GAP, .height = t.FIELD_H };
+        textField(tf, &ui.d_key, ui.focus == .d_key, "nlk_... (also used by the Swarm tab's Deploy form)", .d_key);
+        const savb = t.Rect{ .x = x + colw - svw, .y = y, .width = svw, .height = t.BTN_MD };
+        if (t.button(savb, sv_label, t.blue, ui.d_key.len > 0)) {
+            store.lock();
+            const n = @min(ui.d_key.len, store.settings.token.len);
+            @memcpy(store.settings.token[0..n], ui.d_key.buf[0..n]);
+            store.settings.token_len = @intCast(n);
+            store.settings.token_manual = true; // stop the poller auto-syncing over the user's own key
+            store.unlock();
+            store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
+            store.pushNotif("Token saved", "Deploy is authorized", 1);
+            ui.focus = .none;
+        }
+        y += 42; // clear the 34px field + gap
+        if (tok_n > 0) t.text(t.z("connected - a token is set ({d} chars, auto-loaded from the server)", .{tok_n}), @intFromFloat(x), @intFromFloat(y), 12, t.green);
+        y += 34;
     }
-    y += ROW + 10;
+    if (ui.settings_page == 0) {
+        // TEXT SIZE label (also feeds the shared chip width below). A global draw-time scale (90/100/112/125%);
+        // the chat's line heights follow it. Cycles on click, persists, applies the same frame.
+        const size_name: [:0]const u8 = switch (scale_now) {
+            90 => t.z("text size: Small", .{}),
+            112 => t.z("text size: Large", .{}),
+            125 => t.z("text size: XL", .{}),
+            else => t.z("text size: Normal", .{}),
+        };
+        // ONE chip width for every toggle, so the column is flush and all descriptions align. (Each toggle used to
+        // size itself, which left a ragged left edge and descriptions starting at eight different x positions.)
+        var tog_w: f32 = 0;
+        tog_w = @max(tog_w, t.btnW(t.z("notifications: OFF", .{}), 32));
+        tog_w = @max(tog_w, t.btnW(t.z("speed mode: OFF", .{}), 32));
+        tog_w = @max(tog_w, t.btnW(t.z("dyslexia mode: OFF", .{}), 32));
+        tog_w = @max(tog_w, t.btnW(t.z("text size: Normal", .{}), 32));
+        tog_w = @max(tog_w, t.btnW(t.z("text weight: Normal", .{}), 32));
+        tog_w = @max(tog_w, t.btnW(t.z("narrator: OFF", .{}), 32));
+        tog_w = @max(tog_w, t.btnW(t.z("browser window: SHOWN", .{}), 32));
+        tog_w = @max(tog_w, t.btnW(size_name, 32));
 
-    // ---- BEHAVIOR -------------------------------------------------------------------------------------
-    y = settingSection(x, y, colw, "BEHAVIOR");
-    if (settingRow(x, y, tog_w, if (notify_on) t.z("notifications: ON", .{}) else t.z("notifications: OFF", .{}), notify_on, t.z("desktop + tray alerts when a run finishes or needs you.", .{}))) {
-        store.lock();
-        store.settings.notify = !store.settings.notify;
-        store.unlock();
-    }
-    y += ROW;
-    // SPEED MODE: the chat builds projects itself; casts become 2-minute research sub-agents. OFF restores the
-    // autonomy posture (the chat may deploy long set-and-forget hiveminds). Persisted with the settings.
-    if (settingRow(x, y, tog_w, if (speed_on) t.z("speed mode: ON", .{}) else t.z("speed mode: OFF", .{}), speed_on, t.z("ON: the chat builds hands-on; swarms are 2-min research strikes.  OFF: long autonomous hiveminds.", .{}))) {
-        store.lock();
-        store.settings.speed_mode = !store.settings.speed_mode;
-        store.unlock();
-        store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
-    }
-    y += ROW;
-    // Show the AI's browser window (headful) instead of running it hidden. Persisted, and mirrored to the local
-    // browser daemon's prefs so the next session opens in the chosen mode without a restart.
-    if (settingRow(x, y, tog_w, if (bh_on) t.z("browser window: SHOWN", .{}) else t.z("browser window: HIDDEN", .{}), bh_on, t.z("when the AI drives a web browser here, show it on screen instead of running it hidden.", .{}))) {
-        store.lock();
-        store.settings.browser_headful = !store.settings.browser_headful;
-        store.unlock();
-        store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
-    }
-    y += ROW;
-    // REASONING MODE. ADVANCED is the default and the recommendation: the veil looks at what is actually
-    // there before it commits to a plan, and checks mid-task that the work is still aimed at the goal.
-    // FAST reverts to the older, cheaper behaviour — plan straight from the request, never re-examine.
-    // Worded as ADVANCED/FAST rather than on/off so neither reads as the broken one.
-    if (settingRow(x, y, tog_w, if (fast_on) t.z("reasoning: FAST", .{}) else t.z("reasoning: ADVANCED", .{}), !fast_on, t.z("advanced: look before planning, and re-check course mid-task. costs an extra model call per turn. fast: skip both.", .{}))) {
-        store.lock();
-        store.settings.fast_reasoning = !store.settings.fast_reasoning;
-        store.unlock();
-        store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
-    }
-    y += ROW + 10;
+        // ---- APPEARANCE & ACCESSIBILITY -------------------------------------------------------------------
+        y = settingSection(x, y, colw, "APPEARANCE & ACCESSIBILITY");
+        if (settingRow(x, &y, tog_w, size_name, scale_now != 100, t.z("scales every label and message - click to cycle Small / Normal / Large / XL.", .{}))) {
+            const next: u8 = switch (scale_now) {
+                90 => 100,
+                100 => 112,
+                112 => 125,
+                else => 90,
+            };
+            store.lock();
+            store.settings.font_scale = next;
+            store.unlock();
+            store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
+        }
 
+        // Swaps to the face's Bold file (bundled OpenDyslexic Bold in dyslexia mode; the system face's bold otherwise).
+        if (settingRow(x, &y, tog_w, if (bold_now) t.z("text weight: Bold", .{}) else t.z("text weight: Normal", .{}), bold_now, t.z("renders the whole app in the typeface's bold cut.", .{}))) {
+            store.lock();
+            store.settings.font_bold = !store.settings.font_bold;
+            store.unlock();
+            store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
+        }
+
+        // OpenDyslexic (bundled, SIL OFL) — heavy-bottomed letterforms many dyslexic readers track more easily.
+        // Applies INSTANTLY (the render loop hot-swaps the font atlas next frame) and persists.
+        if (settingRow(x, &y, tog_w, if (dys_on) t.z("dyslexia mode: ON", .{}) else t.z("dyslexia mode: OFF", .{}), dys_on, t.z("renders the app in OpenDyslexic, a typeface designed for dyslexic readers.", .{}))) {
+            store.lock();
+            store.settings.dyslexia = !store.settings.dyslexia;
+            store.unlock();
+            store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
+        }
+
+        // The app SPEAKS through the OS's own text-to-speech (no audio code bundled); voice INPUT rides the OS
+        // dictation layer (Win+H) into the normal input box.
+        if (settingRow(x, &y, tog_w, if (narr_on) t.z("narrator: ON", .{}) else t.z("narrator: OFF", .{}), narr_on, t.z("reads replies and alerts aloud (OS voice). dictate input with Win+H.", .{}))) {
+            store.lock();
+            store.settings.narrator = !store.settings.narrator;
+            const now_on = store.settings.narrator;
+            store.unlock();
+            store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
+            if (now_on) {
+                store.pushNotif("Narrator on", "replies and alerts will be read aloud. press Windows plus H to dictate into the message box", 1);
+            }
+        }
+        y += 10;
+
+        // ---- BEHAVIOR -------------------------------------------------------------------------------------
+        y = settingSection(x, y, colw, "BEHAVIOR");
+        if (settingRow(x, &y, tog_w, if (notify_on) t.z("notifications: ON", .{}) else t.z("notifications: OFF", .{}), notify_on, t.z("desktop + tray alerts when a run finishes or needs you.", .{}))) {
+            store.lock();
+            store.settings.notify = !store.settings.notify;
+            store.unlock();
+            store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
+        }
+
+        // SPEED MODE: the chat builds projects itself; casts become 2-minute research sub-agents. OFF restores the
+        // autonomy posture (the chat may deploy long set-and-forget hiveminds). Persisted with the settings.
+        if (settingRow(x, &y, tog_w, if (speed_on) t.z("speed mode: ON", .{}) else t.z("speed mode: OFF", .{}), speed_on, t.z("ON: the chat builds hands-on; swarms are 2-min research strikes.  OFF: long autonomous hiveminds.", .{}))) {
+            store.lock();
+            store.settings.speed_mode = !store.settings.speed_mode;
+            store.unlock();
+            store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
+        }
+
+        // Show the AI's browser window (headful) instead of running it hidden. Persisted, and mirrored to the local
+        // browser daemon's prefs so the next session opens in the chosen mode without a restart.
+        if (settingRow(x, &y, tog_w, if (bh_on) t.z("browser window: SHOWN", .{}) else t.z("browser window: HIDDEN", .{}), bh_on, t.z("when the AI drives a web browser here, show it on screen instead of running it hidden.", .{}))) {
+            store.lock();
+            store.settings.browser_headful = !store.settings.browser_headful;
+            store.unlock();
+            store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
+        }
+
+        // REASONING MODE. ADVANCED is the default and the recommendation: the veil looks at what is actually
+        // there before it commits to a plan, and checks mid-task that the work is still aimed at the goal.
+        // FAST reverts to the older, cheaper behaviour — plan straight from the request, never re-examine.
+        // Worded as ADVANCED/FAST rather than on/off so neither reads as the broken one.
+        if (settingRow(x, &y, tog_w, if (fast_on) t.z("reasoning: FAST", .{}) else t.z("reasoning: ADVANCED", .{}), !fast_on, t.z("advanced: look before planning, and re-check course mid-task. costs an extra model call per turn. fast: skip both.", .{}))) {
+            store.lock();
+            store.settings.fast_reasoning = !store.settings.fast_reasoning;
+            store.unlock();
+            store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
+        }
+        y += 10;
+    }
     // ---- chat model provider (the Chat tab's brain; casts use the same provider) ----
     // Seed the custom-URL editable fields from the store once (used only for chat_kind==2).
     if (!ui.s_seeded and (cmn > 0 or cbn > 0 or cfan > 0)) {
@@ -8004,500 +8157,497 @@ fn drawSettings(store: *Store, body: t.Rect) void {
         setField(&ui.s_cfacct, cfab[0..cfan]);
         ui.s_seeded = true;
     }
-    // ---- BUILT-IN MODEL: the server serves the-veil-12b itself (no external runtime) ----
-    // Pure render over store.bi_* — the poller owns the status poll and every verb rides the
-    // command ring, so nothing here touches io. The download itself runs SERVER-side: closing
-    // this window never interrupts it, and the bar picks the transfer back up on relaunch.
-    y = settingSection(x, y, colw, "BUILT-IN MODEL");
-    {
-        var bi_seen = false;
-        var bi_compiled = false;
-        var bi_pct: u8 = 0;
-        var bi_done_mb: u32 = 0;
-        var bi_total_mb: u32 = 0;
-        var bi_params: u32 = 0;
-        var stb: [16]u8 = undefined;
-        var stn: usize = 0;
-        var arb: [24]u8 = undefined;
-        var arn: usize = 0;
-        var gpb: [64]u8 = undefined;
-        var gpn: usize = 0;
-        var bi_gpu_layers: u32 = 0;
-        var bi_tps10: u32 = 0;
-        var erb: [160]u8 = undefined;
-        var ern: usize = 0;
-        var usb: [10]u8 = undefined;
-        var usn: usize = 0;
-        var ufb: [64]u8 = undefined;
-        var ufn: usize = 0;
-        var upd_mb: u32 = 0;
-        {
-            store.lock();
-            defer store.unlock();
-            bi_seen = store.bi_seen;
-            bi_compiled = store.bi_compiled;
-            bi_pct = store.bi_pct;
-            bi_done_mb = store.bi_done_mb;
-            bi_total_mb = store.bi_total_mb;
-            bi_params = store.bi_params_b;
-            stn = store.bi_state_len;
-            @memcpy(stb[0..stn], store.bi_state[0..stn]);
-            arn = store.bi_arch_len;
-            @memcpy(arb[0..arn], store.bi_arch[0..arn]);
-            gpn = store.bi_gpu_len;
-            @memcpy(gpb[0..gpn], store.bi_gpu[0..gpn]);
-            bi_gpu_layers = store.bi_gpu_layers;
-            bi_tps10 = store.bi_tps10;
-            ern = store.bi_err_len;
-            @memcpy(erb[0..ern], store.bi_err[0..ern]);
-            usn = store.bi_upd_state_len;
-            @memcpy(usb[0..usn], store.bi_upd_state[0..usn]);
-            ufn = store.bi_upd_file_len;
-            @memcpy(ufb[0..ufn], store.bi_upd_file[0..ufn]);
-            upd_mb = store.bi_upd_mb;
-        }
-        const bi_st = stb[0..stn];
-        const bi_busy = std.mem.eql(u8, bi_st, "downloading") or std.mem.eql(u8, bi_st, "importing") or
-            std.mem.eql(u8, bi_st, "verifying") or std.mem.eql(u8, bi_st, "resolving");
-        const bi_served = std.mem.eql(u8, bi_st, "ready") or std.mem.eql(u8, bi_st, "cold") or std.mem.eql(u8, bi_st, "done");
-        const bi_failed = std.mem.eql(u8, bi_st, "failed");
-
-        if (!bi_seen) {
-            t.text(t.z("the-veil-12b - checking the server...", .{}), @intFromFloat(x), @intFromFloat(y), 11, t.comment);
-        } else if (!bi_compiled) {
-            t.text(t.z("this server build carries no built-in engine (-Dbuiltin=false) - rebuild with defaults to enable it", .{}), @intFromFloat(x), @intFromFloat(y), 11, t.comment);
-        } else if (bi_served) {
-            if (gpn > 0 and bi_gpu_layers > 0) {
-                if (bi_tps10 > 0) {
-                    t.text(t.z("the-veil-12b installed ({s} {d}B - GPU: {s} - ~{d}.{d} tok/s) - zero setup, no key", .{ arb[0..arn], bi_params, gpb[0..gpn], bi_tps10 / 10, bi_tps10 % 10 }), @intFromFloat(x), @intFromFloat(y), 11, t.green);
-                } else {
-                    t.text(t.z("the-veil-12b installed ({s} {d}B - GPU: {s}) - zero setup, no key, no external runtime", .{ arb[0..arn], bi_params, gpb[0..gpn] }), @intFromFloat(x), @intFromFloat(y), 11, t.green);
-                }
-            } else if (bi_tps10 > 0) {
-                t.text(t.z("the-veil-12b installed ({s} {d}B - CPU - ~{d}.{d} tok/s) - zero setup, no key, no external runtime", .{ arb[0..arn], bi_params, bi_tps10 / 10, bi_tps10 % 10 }), @intFromFloat(x), @intFromFloat(y), 11, t.green);
-            } else {
-                t.text(t.z("the-veil-12b installed ({s} {d}B - CPU) - zero setup, no key, no external runtime", .{ arb[0..arn], bi_params }), @intFromFloat(x), @intFromFloat(y), 11, t.green);
-            }
-        } else if (bi_failed) {
-            t.text(t.z("failed: {s}", .{erb[0..ern]}), @intFromFloat(x), @intFromFloat(y), 11, t.red);
-        } else if (bi_busy) {
-            t.text(t.z("installing - the transfer runs on the server; closing this window is fine", .{}), @intFromFloat(x), @intFromFloat(y), 11, t.comment);
-        } else {
-            t.text(t.z("not downloaded - about 7 GB, sha-verified against the publisher's record before it ever serves", .{}), @intFromFloat(x), @intFromFloat(y), 11, t.comment);
-        }
+    if (ui.settings_page == 1) {
+        y = settingSection(x, y, colw, "CHAT MODEL");
+        t.text(t.z("the Chat tab talks through this provider - its swarm casts use it too", .{}), @intFromFloat(x), @intFromFloat(y), 11, t.comment);
         y += 20;
 
-        // the loading bar: filled to the server-reported pct, labeled with real transferred bytes
-        if (bi_busy) {
-            const bar_h: f32 = 18;
-            t.panelBordered(.{ .x = x, .y = y, .width = colw, .height = bar_h }, t.withAlpha(t.blue, 24), t.comment);
-            const frac: f32 = @as(f32, @floatFromInt(bi_pct)) / 100.0;
-            const fillw: f32 = (colw - 2) * frac;
-            if (fillw >= 1) t.fillRect(@intFromFloat(x + 1), @intFromFloat(y + 1), @intFromFloat(fillw), @intFromFloat(bar_h - 2), t.withAlpha(t.blue, 150));
-            const bar_lbl = if (bi_total_mb > 0)
-                t.z("{s}  {d}%  ({d} / {d} MB)", .{ bi_st, bi_pct, bi_done_mb, bi_total_mb })
-            else
-                t.z("{s}...", .{bi_st});
-            t.text(bar_lbl, @intFromFloat(x + 8), @intFromFloat(y + 3), 11, t.blue);
-            y += bar_h + 8;
-        }
-
-        if (bi_seen and bi_compiled) {
-            if (bi_busy) {
-                const cancel_lbl = t.z("Cancel", .{});
-                if (t.button(.{ .x = x, .y = y, .width = t.btnW(cancel_lbl, t.BTN_MD), .height = t.BTN_MD }, cancel_lbl, t.red, true)) {
-                    store.pushCmd(store_mod.mkCmd(.builtin_cancel, "", ""));
-                }
-                y += t.BTN_MD + 10;
-            } else if (!bi_served) {
-                const dl_lbl = t.z("Download the-veil-12b (~7 GB)", .{});
-                const dl_w = t.btnW(dl_lbl, t.BTN_MD);
-                if (t.buttonSolid(.{ .x = x, .y = y, .width = dl_w, .height = t.BTN_MD }, dl_lbl, t.blue, true)) {
-                    store.pushCmd(store_mod.mkCmd(.builtin_pull, "", ""));
-                }
-                const imp_lbl = t.z("Import local copy", .{});
-                if (t.button(.{ .x = x + dl_w + 8, .y = y, .width = t.btnW(imp_lbl, t.BTN_MD), .height = t.BTN_MD }, imp_lbl, t.blue, true)) {
-                    store.pushCmd(store_mod.mkCmd(.builtin_import, "", ""));
-                }
-                y += t.BTN_MD + 10;
-            } else {
-                const on_builtin = chat_kind == 1 and chat_byok == BUILTIN_IDX;
-                const use_lbl = t.z("Use built-in for chat", .{});
-                const use_w = t.btnW(use_lbl, t.BTN_MD);
-                if (t.buttonSolid(.{ .x = x, .y = y, .width = use_w, .height = t.BTN_MD }, use_lbl, if (on_builtin) t.green else t.blue, !on_builtin)) {
-                    store.lock();
-                    const s = &store.settings;
-                    s.chat_kind = 1;
-                    s.chat_byok = BUILTIN_IDX;
-                    const mid = "the-veil-12b";
-                    @memcpy(s.chat_model[0..mid.len], mid);
-                    s.chat_model_len = @intCast(mid.len);
-                    store.unlock();
-                    store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
-                    store.pushNotif("Chat: built-in model", "the-veil-12b serves from this server - no key, no external runtime", 1);
-                }
-                if (on_builtin) t.text(t.z("chat runs on the built-in model", .{}), @intFromFloat(x + use_w + 10), @intFromFloat(y + 8), 11, t.green);
-                const rm_lbl = t.z("Remove", .{});
-                const rm_w = t.btnW(rm_lbl, t.BTN_MD);
-                if (t.button(.{ .x = x + colw - rm_w, .y = y, .width = rm_w, .height = t.BTN_MD }, rm_lbl, t.red, true)) {
-                    store.pushCmd(store_mod.mkCmd(.builtin_remove, "", ""));
-                }
-                y += t.BTN_MD + 10;
-
-                // the update lane: an installed store can ask the published repo whether a newer
-                // release exists; a pull IS the updater (it verifies + hot-swaps server-side)
-                const upd = usb[0..usn];
-                if (std.mem.eql(u8, upd, "update")) {
-                    t.text(t.z("update available: {s} ({d} MB)", .{ ufb[0..ufn], upd_mb }), @intFromFloat(x), @intFromFloat(y + 6), 11, t.blue);
-                    const up_lbl = t.z("Update now", .{});
-                    const up_w = t.btnW(up_lbl, t.BTN_MD);
-                    if (t.buttonSolid(.{ .x = x + colw - up_w, .y = y, .width = up_w, .height = t.BTN_MD }, up_lbl, t.blue, true)) {
-                        store.pushCmd(store_mod.mkCmd(.builtin_pull, "", ""));
-                    }
-                    y += t.BTN_MD + 10;
-                } else if (std.mem.eql(u8, upd, "checking")) {
-                    t.text(t.z("checking the published repo...", .{}), @intFromFloat(x), @intFromFloat(y + 2), 11, t.comment);
-                    y += 22;
-                } else {
-                    const chk_lbl = t.z("Check for updates", .{});
-                    if (t.buttonGhost(.{ .x = x, .y = y, .width = t.btnW(chk_lbl, t.BTN_MD), .height = t.BTN_MD }, chk_lbl, t.blue, true)) {
-                        store.pushCmd(store_mod.mkCmd(.builtin_check, "", ""));
-                    }
-                    if (std.mem.eql(u8, upd, "current")) t.text(t.z("up to date with the published release", .{}), @intFromFloat(x + t.btnW(chk_lbl, t.BTN_MD) + 10), @intFromFloat(y + 8), 11, t.comment);
-                    y += t.BTN_MD + 10;
-                }
-            }
-        }
-    }
-    y += 8;
-
-    // ---- BUILD DATASET: capture everything the veil does, in a shape a fine-tune can eat ----
-    // Pure render over store.ds_* (the poller owns the status poll; the two verbs ride the command
-    // ring). Recording is SERVER-side and marker-driven, so it survives closing this window and it
-    // also captures swarm minds — the copy says so rather than implying the desk is doing the work.
-    y = settingSection(x, y, colw, "BUILD DATASET");
-    {
-        var ds_seen = false;
-        var ds_rec = false;
-        var idb: [40]u8 = undefined;
-        var idn: usize = 0;
-        var calls: u64 = 0;
-        var examples: u64 = 0;
-        var toolruns: u64 = 0;
-        var nsets: u32 = 0;
+        // CHAT ENGINE: the server brain (default + recommended) vs the retired local fallback. IMPORTANT COPY
+        // LESSON: in client mode the SERVER brain STILL runs every tool on THIS machine (delegation) — the old
+        // label sold "tools in your environment" as the LOCAL option's advantage, which misled the user into
+        // opting out of the server path right after it became the primary one.
         {
-            store.lock();
-            defer store.unlock();
-            ds_seen = store.ds_seen;
-            ds_rec = store.ds_recording;
-            idn = store.ds_id_len;
-            @memcpy(idb[0..idn], store.ds_id[0..idn]);
-            calls = store.ds_calls;
-            examples = store.ds_examples;
-            toolruns = store.ds_tools;
-            nsets = store.ds_sets;
-        }
-        if (!ds_seen) {
-            t.text(t.z("checking the server...", .{}), @intFromFloat(x), @intFromFloat(y), 11, t.comment);
-        } else if (ds_rec) {
-            t.text(t.z("RECORDING {s} - {d} training examples, {d} model calls, {d} tool runs captured", .{ idb[0..idn], examples, calls, toolruns }), @intFromFloat(x), @intFromFloat(y), 11, t.green);
-        } else {
-            t.text(t.z("off - turn it on and every chat turn, tool call, reasoning trace and swarm build is captured", .{}), @intFromFloat(x), @intFromFloat(y), 11, t.comment);
-        }
-        y += 18;
-        t.text(t.z("written to <data>/sets/<id>/ as sft.jsonl (OpenAI messages format), by-model shards, raw + tools logs{s}", .{if (nsets > 0) t.z(" - {d} set(s) on disk", .{nsets}) else ""}), @intFromFloat(x), @intFromFloat(y), 11, t.comment);
-        y += 22;
-        if (ds_seen) {
-            if (ds_rec) {
-                const stop_lbl = t.z("Stop + finalize", .{});
-                if (t.buttonSolid(.{ .x = x, .y = y, .width = t.btnW(stop_lbl, t.BTN_MD), .height = t.BTN_MD }, stop_lbl, t.red, true)) {
-                    store.pushCmd(store_mod.mkCmd(.dataset_stop, "", ""));
-                }
-            } else {
-                const go_lbl = t.z("Build dataset", .{});
-                if (t.buttonSolid(.{ .x = x, .y = y, .width = t.btnW(go_lbl, t.BTN_MD), .height = t.BTN_MD }, go_lbl, t.blue, true)) {
-                    // the label is what the set is FOR — the desk sends the active chat's name when
-                    // there is one, so a set is identifiable later without opening it
-                    store.pushCmd(store_mod.mkCmd(.dataset_start, "", "desk session"));
-                }
+            const cur = blk_ce: {
+                store.lock();
+                defer store.unlock();
+                break :blk_ce store.settings.server_chat;
+            };
+            // Full-row hit area: the label sits well past the 18px box, so a 22px-wide rect made only the tiny box
+            // clickable — clicking the label did nothing, which read as a "stuck" / policy-blocked switch.
+            // CONTRACT: t.checkbox returns TRUE ON CLICK (the caller flips), NOT the new value. The previous
+            // shape here (`nv = t.checkbox(...); if (nv != cur)`) treated the click flag as the value — so every
+            // UN-clicked frame with the box CHECKED saw nv(false) != cur(true) and FORCED server_chat off:
+            // opening Settings silently killed server mode, and turning it on lasted exactly one frame. That
+            // was the whole "cannot click the input on or off / stuck in client mode" bug.
+            if (t.checkbox(.{ .x = x, .y = y, .width = colw, .height = 22 }, t.z("Use server chat (recommended)", .{}), cur)) {
+                const nv = !cur;
+                store.lock();
+                store.settings.server_chat = nv;
+                store.unlock();
+                store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
+                store.pushNotif(if (nv) "Chat: server brain" else "Chat: local fallback engine", if (nv) "the brain runs in the backend; every tool still executes on this machine" else "the RETIRED local engine - use only if the server is unreachable", if (nv) 1 else 0);
             }
-            y += t.BTN_MD + 10;
+            y += 30;
+            y = helpPara("Tools run on this machine. Turn this off only to use the legacy local fallback.", x, y, colw) + 16;
         }
-    }
-    y += 8;
+        const half = (colw - 10) / 2;
 
-    y = settingSection(x, y, colw, "CHAT MODEL");
-    t.text(t.z("the Chat tab talks through this provider - its swarm casts use it too", .{}), @intFromFloat(x), @intFromFloat(y), 11, t.comment);
-    y += 20;
-
-    // CHAT ENGINE: the server brain (default + recommended) vs the retired local fallback. IMPORTANT COPY
-    // LESSON: in client mode the SERVER brain STILL runs every tool on THIS machine (delegation) — the old
-    // label sold "tools in your environment" as the LOCAL option's advantage, which misled the user into
-    // opting out of the server path right after it became the primary one.
-    {
-        const cur = blk_ce: {
+        // MODEL TRIO master toggle: one model for all three roles (default) vs a per-role coding/thinking/prompting
+        // trio. Turning the trio ON seeds the thinking + prompting roles from the current (coding) model so each
+        // panel starts identical, then the user tunes them; saveSettings' loadKey then loads each role's key.
+        const unified = blk_u: {
             store.lock();
             defer store.unlock();
-            break :blk_ce store.settings.server_chat;
+            break :blk_u store.settings.chat_unified;
         };
-        // Full-row hit area: the label sits well past the 18px box, so a 22px-wide rect made only the tiny box
-        // clickable — clicking the label did nothing, which read as a "stuck" / policy-blocked switch.
-        // CONTRACT: t.checkbox returns TRUE ON CLICK (the caller flips), NOT the new value. The previous
-        // shape here (`nv = t.checkbox(...); if (nv != cur)`) treated the click flag as the value — so every
-        // UN-clicked frame with the box CHECKED saw nv(false) != cur(true) and FORCED server_chat off:
-        // opening Settings silently killed server mode, and turning it on lasted exactly one frame. That
-        // was the whole "cannot click the input on or off / stuck in client mode" bug.
-        if (t.checkbox(.{ .x = x, .y = y, .width = colw, .height = 22 }, t.z("server chat brain (recommended) - tools still run on THIS machine; off = old local engine (fallback only)", .{}), cur)) {
-            const nv = !cur;
+        if (t.checkbox(.{ .x = x, .y = y, .width = colw, .height = 22 }, t.z("Use one model for every role", .{}), unified)) {
+            const nv = !unified;
             store.lock();
-            store.settings.server_chat = nv;
+            store.settings.chat_unified = nv;
             store.unlock();
             store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
-            store.pushNotif(if (nv) "Chat: server brain" else "Chat: local fallback engine", if (nv) "the brain runs in the backend; every tool still executes on this machine" else "the RETIRED local engine - use only if the server is unreachable", if (nv) 1 else 0);
+            // A role left blank is sent blank, and the SERVER may fill it from its own published trio before
+            // falling back to coding (service.zig roleDefault) — so "all use the model below" is only true
+            // of a host that publishes nothing. Say what actually decides it rather than overclaiming.
+            store.pushNotif(if (nv) "One model for everything" else "Per-role models", if (nv) "coding, thinking and prompting all use the model below, unless your server publishes its own" else "thinking + prompting start on the coding model; pick a provider below to override either", 1);
         }
         y += 30;
-    }
-    const half = (colw - 10) / 2;
+        if (!unified) {
+            y = helpPara(
+                "Coding writes files, uses tools, and answers you.\n" ++
+                    "Thinking plans the work and manages long conversations.\n" ++
+                    "Prompting chooses the next step. A smaller model can work well here.\n" ++
+                    "Leave a role blank to use your server's default, or the coding model if no default is set.",
+                x,
+                y,
+                colw,
+            );
+            y += 12;
+            t.text(t.z("CODING MODEL", .{}), @intFromFloat(x), @intFromFloat(y), 12, t.comment);
 
-    // MODEL TRIO master toggle: one model for all three roles (default) vs a per-role coding/thinking/prompting
-    // trio. Turning the trio ON seeds the thinking + prompting roles from the current (coding) model so each
-    // panel starts identical, then the user tunes them; saveSettings' loadKey then loads each role's key.
-    const unified = blk_u: {
-        store.lock();
-        defer store.unlock();
-        break :blk_u store.settings.chat_unified;
-    };
-    if (t.checkbox(.{ .x = x, .y = y, .width = colw, .height = 22 }, t.z("use one model for all three (coding / thinking / prompting)", .{}), unified)) {
-        const nv = !unified;
-        store.lock();
-        store.settings.chat_unified = nv;
-        store.unlock();
-        store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
-        // A role left blank is sent blank, and the SERVER may fill it from its own published trio before
-        // falling back to coding (service.zig roleDefault) — so "all use the model below" is only true
-        // of a host that publishes nothing. Say what actually decides it rather than overclaiming.
-        store.pushNotif(if (nv) "One model for everything" else "Per-role models", if (nv) "coding, thinking and prompting all use the model below, unless your server publishes its own" else "thinking + prompting start on the coding model; pick a provider below to override either", 1);
-    }
-    y += 30;
-    if (!unified) {
-        // Why anyone would pay for three: the roles do different jobs at very different volumes. The
-        // split below is MODELLED from request-body sizes after prefix-cache hits, not metered — it is
-        // here to steer a choice ("go cheap on prompting"), so it says so out loud. A settings page that
-        // states an unmeasured number as fact sends people to tune the wrong role.
-        //
-        // The other two things users get wrong without this paragraph:
-        //   1) they think a BLANK role breaks the turn. It doesn't. Precedence is the user's own role, then the
-        //      HOST's published role for it (service.zig roleDefault), then whatever coding resolved to
-        //      (ModelTrio.pick). So a single-model setup behaves exactly as it did before the trio existed —
-        //      additive, never required. The line says both hops because "blank uses coding" is simply FALSE on
-        //      a host that publishes its own thinking/prompting models, and this page must not teach that.
-        //   2) they read "thinking" as the clever role and put their biggest model on it. But thinking carries
-        //      two unlike jobs: `plan` is a ~1KB prompt that decides the acceptance contract (the judgment),
-        //      while `compact` + `ctxsum` are tens of KB per turn of mechanical compression — and the
-        //      compression is most of what the role COSTS. "Buy a bigger thinking model" is only good advice
-        //      about the planning half, so the copy splits them instead of implying every role wants more.
-        y = helpPara(
-            "estimate, not a measurement: about 60% of billable input goes to coding, 20% to thinking, 15% to prompting.\n" ++
-                "a blank role is fine: it falls back to your host's model for that role if it publishes one, otherwise to coding. the trio is opt-in - one model for everything still works.\n" ++
-                "coding does the work, and it is the one role prompt caching really pays off on: give it your strongest.\n" ++
-                "thinking is two jobs - planning is short and sets the bar for done (worth a good model); compaction is long, mechanical, and most of what thinking costs.\n" ++
-                "prompting is one short line per step, at high volume: the cheapest model that writes a clean sentence.",
-            x,
-            y,
-            colw,
-        );
-        y += 12;
-        t.text(t.z("CODING MODEL", .{}), @intFromFloat(x), @intFromFloat(y), 12, t.comment);
-        t.text(t.z("runs the tools, writes the files, streams the reply — your strongest", .{}), @intFromFloat(x + 110), @intFromFloat(y), 11, t.comment);
-        y += 20;
-    }
-
-    // PROVIDER dropdown: Local / BYOK / Custom URL
-    const kind_lbl = switch (chat_kind) {
-        1 => t.z("BYOK (cloud key)", .{}),
-        2 => t.z("Custom URL", .{}),
-        else => t.z("Local (Ollama)", .{}),
-    };
-    selector(.{ .x = x, .y = y, .width = half, .height = 48 }, t.z("PROVIDER", .{}), kind_lbl, .chat_provider);
-    // BYOK cloud-provider dropdown
-    if (chat_kind == 1) {
-        const p = &catalog.providers[@min(chat_byok, catalog.providers.len - 1)];
-        selector(.{ .x = x + half + 10, .y = y, .width = half, .height = 48 }, t.z("CLOUD PROVIDER", .{}), t.zs(p.label), .chat_byok);
-    }
-    y += 58;
-
-    // MODEL: a populated dropdown for local/BYOK; a text field for a custom endpoint (models unknown).
-    if (chat_kind == 2) {
-        flabel(x, y, "MODEL");
-        textField(.{ .x = x, .y = y + 14, .width = half, .height = t.FIELD_H }, &ui.s_model, ui.focus == .s_model, "model id", .s_model);
-        flabel(x + half + 10, y, "ENDPOINT URL (OpenAI-compatible /v1)");
-        textField(.{ .x = x + half + 10, .y = y + 14, .width = half, .height = t.FIELD_H }, &ui.s_url, ui.focus == .s_url, "https://host/v1", .s_url);
-        y += 58;
-        const sem_label = t.z("Save endpoint + model", .{});
-        if (t.buttonSolid(.{ .x = x, .y = y, .width = t.btnW(sem_label, t.BTN_MD), .height = t.BTN_MD }, sem_label, t.blue, true)) {
-            store.lock();
-            const s = &store.settings;
-            const mn = @min(ui.s_model.len, s.chat_model.len);
-            @memcpy(s.chat_model[0..mn], ui.s_model.buf[0..mn]);
-            s.chat_model_len = @intCast(mn);
-            const bn2 = @min(ui.s_url.len, s.chat_base.len);
-            @memcpy(s.chat_base[0..bn2], ui.s_url.buf[0..bn2]);
-            s.chat_base_len = @intCast(bn2);
-            store.unlock();
-            store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
-            store.pushNotif("Chat endpoint saved", "custom model config persisted", 1);
-            ui.focus = .none;
+            y += 20;
         }
-        y += 42;
-    } else if (chat_kind == 0) {
-        // Local (Ollama) defaults to 127.0.0.1:11434, but the box may run Ollama on a different port, or
-        // the model may live on another machine on the LAN — let the user override the endpoint.
-        const model_disp: []const u8 = if (cmn > 0) cmb[0..cmn] else "(pick a model)";
-        selector(.{ .x = x, .y = y, .width = half, .height = 48 }, t.z("MODEL", .{}), model_disp, .chat_model);
-        flabel(x + half + 10, y, "ENDPOINT (optional - defaults to 127.0.0.1:11434)");
-        const sv2_label = t.z("Save", .{});
-        const sv2w = t.btnW(sv2_label, t.FIELD_H);
-        const ew = half - sv2w - 8;
-        textField(.{ .x = x + half + 10, .y = y + 14, .width = ew, .height = t.FIELD_H }, &ui.s_url, ui.focus == .s_url, "http://127.0.0.1:11434/v1", .s_url);
-        if (t.button(.{ .x = x + half + 10 + ew + 8, .y = y + 14, .width = sv2w, .height = t.FIELD_H }, sv2_label, t.blue, true)) {
-            store.lock();
-            const s = &store.settings;
-            const bn2 = @min(ui.s_url.len, s.chat_base.len);
-            @memcpy(s.chat_base[0..bn2], ui.s_url.buf[0..bn2]);
-            s.chat_base_len = @intCast(bn2);
-            store.unlock();
-            store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
-            store.pushNotif("Endpoint saved", if (bn2 > 0) "custom Ollama endpoint set" else "reset to default 127.0.0.1:11434", 1);
-            ui.focus = .none;
+
+        // PROVIDER dropdown: Local / BYOK / Custom URL
+        const kind_lbl = switch (chat_kind) {
+            1 => t.z("BYOK (cloud key)", .{}),
+            2 => t.z("Custom URL", .{}),
+            else => t.z("Local (Ollama)", .{}),
+        };
+        selector(.{ .x = x, .y = y, .width = half, .height = 48 }, t.z("PROVIDER", .{}), kind_lbl, .chat_provider);
+        // BYOK cloud-provider dropdown
+        if (chat_kind == 1) {
+            const p = &catalog.providers[@min(chat_byok, catalog.providers.len - 1)];
+            selector(.{ .x = x + half + 10, .y = y, .width = half, .height = 48 }, t.z("CLOUD PROVIDER", .{}), t.zs(p.label), .chat_byok);
         }
         y += 58;
-        const hint = if (ol_n > 0) t.z("{d} models installed on this machine", .{ol_n}) else t.z("Ollama not reachable - showing common models", .{});
-        t.text(hint, @intFromFloat(x), @intFromFloat(y), 11, t.comment);
-        y += 20;
-    } else {
-        const model_disp: []const u8 = if (cmn > 0) cmb[0..cmn] else "(pick a model)";
-        selector(.{ .x = x, .y = y, .width = half, .height = 48 }, t.z("MODEL", .{}), model_disp, .chat_model);
-        drawModelsHint(store, &catalog.providers[@min(chat_byok, catalog.providers.len - 1)], x + half + 10, y + 18);
-        y += 58;
-    }
 
-    // LOG IN WITH CLOUDFLARE (OAuth) — one browser grant buys Workers AI, the live model list, and the
-    // R2 chat backup; the token lives server-side and auto-refreshes. Drawn ALWAYS, like the web app's
-    // Settings section: this is a top-level account feature, not a provider-specific field, and hiding
-    // it behind the workers-ai dropdown selection made the whole login look unbuilt. The manual
-    // account-id + token fields below remain the provider-specific fallback.
-    var cf_configured = false;
-    var cf_connected = false;
-    var cf_pending = false;
-    var cf_seen = false;
-    var acctbuf: [64]u8 = undefined;
-    var acct_len: usize = 0;
-    var namebuf: [96]u8 = undefined;
-    var name_len: usize = 0;
-    {
-        store.lock();
-        cf_configured = store.cf_oauth_configured;
-        cf_connected = store.cf_oauth_connected;
-        cf_pending = store.cf_oauth_pending;
-        cf_seen = store.cf_oauth_seen;
-        acct_len = @min(store.cf_oauth_account_len, acctbuf.len);
-        @memcpy(acctbuf[0..acct_len], store.cf_oauth_account[0..acct_len]);
-        name_len = @min(store.cf_oauth_name_len, namebuf.len);
-        @memcpy(namebuf[0..name_len], store.cf_oauth_name[0..name_len]);
-        store.unlock();
-    }
-    {
-        // Its own air, top and bottom: flush against the model row above and the account-id field
-        // below, the block read as one more form field instead of the account feature it is.
-        y += 12;
-        flabel(x, y, "CLOUDFLARE LOGIN");
-        y += 16;
-        if (cf_connected) {
-            // "connected — {who}": the profile name the login fetched, the account id as the detail line.
-            if (name_len > 0)
-                t.text(t.z("connected - {s}", .{namebuf[0..name_len]}), @intFromFloat(x), @intFromFloat(y + 8), 14, t.green)
-            else
-                t.text(t.z("connected", .{}), @intFromFloat(x), @intFromFloat(y + 8), 14, t.green);
-            if (acct_len > 0) t.text(t.z("account {s}", .{acctbuf[0..acct_len]}), @intFromFloat(x), @intFromFloat(y + 26), 12, t.comment);
-            const dl = t.z("Disconnect", .{});
-            const dw = t.btnW(dl, t.BTN_MD);
-            if (t.button(.{ .x = x + colw - dw, .y = y, .width = dw, .height = t.BTN_MD }, dl, t.red, true)) {
-                store.pushCmd(store_mod.mkCmd(.oauth_cf_logout, "", ""));
+        // MODEL: a populated dropdown for local/BYOK; a text field for a custom endpoint (models unknown).
+        if (chat_kind == 2) {
+            flabel(x, y, "MODEL");
+            textField(.{ .x = x, .y = y + 14, .width = half, .height = t.FIELD_H }, &ui.s_model, ui.focus == .s_model, "model id", .s_model);
+            flabel(x + half + 10, y, "ENDPOINT URL (OpenAI-compatible /v1)");
+            textField(.{ .x = x + half + 10, .y = y + 14, .width = half, .height = t.FIELD_H }, &ui.s_url, ui.focus == .s_url, "https://host/v1", .s_url);
+            y += 58;
+            const sem_label = t.z("Save endpoint + model", .{});
+            if (t.buttonSolid(.{ .x = x, .y = y, .width = t.btnW(sem_label, t.BTN_MD), .height = t.BTN_MD }, sem_label, t.blue, true)) {
+                store.lock();
+                const s = &store.settings;
+                const mn = @min(ui.s_model.len, s.chat_model.len);
+                @memcpy(s.chat_model[0..mn], ui.s_model.buf[0..mn]);
+                s.chat_model_len = @intCast(mn);
+                const bn2 = @min(ui.s_url.len, s.chat_base.len);
+                @memcpy(s.chat_base[0..bn2], ui.s_url.buf[0..bn2]);
+                s.chat_base_len = @intCast(bn2);
+                store.unlock();
+                store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
+                store.pushNotif("Chat endpoint saved", "custom model config persisted", 1);
+                ui.focus = .none;
+            }
+            y += 42;
+        } else if (chat_kind == 0) {
+            // Local (Ollama) defaults to 127.0.0.1:11434, but the box may run Ollama on a different port, or
+            // the model may live on another machine on the LAN — let the user override the endpoint.
+            const model_disp: []const u8 = if (cmn > 0) cmb[0..cmn] else "(pick a model)";
+            selector(.{ .x = x, .y = y, .width = half, .height = 48 }, t.z("MODEL", .{}), model_disp, .chat_model);
+            flabel(x + half + 10, y, "ENDPOINT (optional - defaults to 127.0.0.1:11434)");
+            const sv2_label = t.z("Save", .{});
+            const sv2w = t.btnW(sv2_label, t.FIELD_H);
+            const ew = half - sv2w - 8;
+            textField(.{ .x = x + half + 10, .y = y + 14, .width = ew, .height = t.FIELD_H }, &ui.s_url, ui.focus == .s_url, "http://127.0.0.1:11434/v1", .s_url);
+            if (t.button(.{ .x = x + half + 10 + ew + 8, .y = y + 14, .width = sv2w, .height = t.FIELD_H }, sv2_label, t.blue, true)) {
+                store.lock();
+                const s = &store.settings;
+                const bn2 = @min(ui.s_url.len, s.chat_base.len);
+                @memcpy(s.chat_base[0..bn2], ui.s_url.buf[0..bn2]);
+                s.chat_base_len = @intCast(bn2);
+                store.unlock();
+                store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
+                store.pushNotif("Endpoint saved", if (bn2 > 0) "custom Ollama endpoint set" else "reset to default 127.0.0.1:11434", 1);
+                ui.focus = .none;
+            }
+            y += 58;
+            const hint = if (ol_n > 0) t.z("{d} models installed on this machine", .{ol_n}) else t.z("Ollama not reachable - showing common models", .{});
+            t.text(hint, @intFromFloat(x), @intFromFloat(y), 11, t.comment);
+            y += 20;
+        } else {
+            const model_disp: []const u8 = if (cmn > 0) cmb[0..cmn] else "(pick a model)";
+            selector(.{ .x = x, .y = y, .width = half, .height = 48 }, t.z("MODEL", .{}), model_disp, .chat_model);
+            drawModelsHint(store, &catalog.providers[@min(chat_byok, catalog.providers.len - 1)], x + half + 10, y + 18);
+            y += 58;
+        }
+
+        // LOG IN WITH CLOUDFLARE (OAuth) — one browser grant buys Workers AI, the live model list, and the
+        // R2 chat backup; the token lives server-side and auto-refreshes. Drawn ALWAYS, like the web app's
+        // Settings section: this is a top-level account feature, not a provider-specific field, and hiding
+        // it behind the workers-ai dropdown selection made the whole login look unbuilt. The manual
+        // account-id + token fields below remain the provider-specific fallback.
+        var cf_configured = false;
+        var cf_connected = false;
+        var cf_pending = false;
+        var cf_seen = false;
+        var acctbuf: [64]u8 = undefined;
+        var acct_len: usize = 0;
+        var namebuf: [96]u8 = undefined;
+        var name_len: usize = 0;
+        {
+            store.lock();
+            cf_configured = store.cf_oauth_configured;
+            cf_connected = store.cf_oauth_connected;
+            cf_pending = store.cf_oauth_pending;
+            cf_seen = store.cf_oauth_seen;
+            acct_len = @min(store.cf_oauth_account_len, acctbuf.len);
+            @memcpy(acctbuf[0..acct_len], store.cf_oauth_account[0..acct_len]);
+            name_len = @min(store.cf_oauth_name_len, namebuf.len);
+            @memcpy(namebuf[0..name_len], store.cf_oauth_name[0..name_len]);
+            store.unlock();
+        }
+        {
+            // Its own air, top and bottom: flush against the model row above and the account-id field
+            // below, the block read as one more form field instead of the account feature it is.
+            y += 12;
+            flabel(x, y, "CLOUDFLARE LOGIN");
+            y += 16;
+            if (cf_connected) {
+                // "connected — {who}": the profile name the login fetched, the account id as the detail line.
+                if (name_len > 0)
+                    t.text(t.z("connected - {s}", .{namebuf[0..name_len]}), @intFromFloat(x), @intFromFloat(y + 8), 14, t.green)
+                else
+                    t.text(t.z("connected", .{}), @intFromFloat(x), @intFromFloat(y + 8), 14, t.green);
+                if (acct_len > 0) t.text(t.z("account {s}", .{acctbuf[0..acct_len]}), @intFromFloat(x), @intFromFloat(y + 26), 12, t.comment);
+                const dl = t.z("Disconnect", .{});
+                const dw = t.btnW(dl, t.BTN_MD);
+                if (t.button(.{ .x = x + colw - dw, .y = y, .width = dw, .height = t.BTN_MD }, dl, t.red, true)) {
+                    store.pushCmd(store_mod.mkCmd(.oauth_cf_logout, "", ""));
+                }
+                y += 44;
+                y = drawCfTunnelRows(store, x, y, colw);
+            } else if (cf_configured) {
+                // The login is the headline act, so it wears the vendor's own button (cfBrandButton),
+                // a size up from the form buttons around it.
+                const ll = t.z("Log in with Cloudflare", .{});
+                const lh: f32 = 40;
+                const lw = t.btnW(ll, lh) + 28;
+                // Enabled even while pending — an abandoned browser tab never clears the flag, so a
+                // disabled button here would wedge the login until restart. Clicking again just re-opens
+                // a fresh consent URL.
+                if (cfBrandButton(.{ .x = x, .y = y, .width = lw, .height = lh }, ll, true)) {
+                    store.pushCmd(store_mod.mkCmd(.oauth_cf_login, "", ""));
+                }
+                const sub: [:0]const u8 = if (cf_pending) t.z("waiting for the grant in your browser... (click again to retry)", .{}) else t.z("opens Cloudflare in your browser - one click, no token to paste", .{});
+                y = helpPara(sub, x, y + lh + 10, colw) + 10;
+            } else if (cf_seen) {
+                y = helpPara("Browser login is unavailable on this server. Select Workers AI above to connect with an API token.", x, y + 6, colw) + 12;
+            } else {
+                t.text(t.z("checking the server...", .{}), @intFromFloat(x), @intFromFloat(y + 6), 12, t.comment);
+                y += 30;
+            }
+            y += 12;
+        }
+
+        // Cloudflare account id (only when the BYOK provider needs one) — built into the Workers AI base_url.
+        if (chat_kind == 1 and catalog.providers[@min(chat_byok, catalog.providers.len - 1)].needs_account) {
+            flabel(x, y, "CLOUDFLARE ACCOUNT ID (paste manually - or use the login above)");
+            y += 14;
+            const sid_label = t.z("Save id", .{});
+            const sidw = t.btnW(sid_label, t.BTN_MD);
+            textField(.{ .x = x, .y = y, .width = colw - 240, .height = t.FIELD_H }, &ui.s_cfacct, ui.focus == .s_cfacct, "e.g. 0123456789abcdef0123456789abcdef", .s_cfacct);
+            if (t.button(.{ .x = x + colw - 240 + t.GAP, .y = y, .width = sidw, .height = t.BTN_MD }, sid_label, t.blue, true)) {
+                store.lock();
+                const s = &store.settings;
+                const n = @min(ui.s_cfacct.len, s.cf_account.len);
+                @memcpy(s.cf_account[0..n], ui.s_cfacct.buf[0..n]);
+                s.cf_account_len = @intCast(n);
+                store.unlock();
+                store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
+                store.pushNotif("Account id saved", "used to build the Workers AI endpoint", 1);
+                ui.focus = .none;
             }
             y += 44;
-            y = drawCfTunnelRows(store, x, y, colw);
-        } else if (cf_configured) {
-            // The login is the headline act, so it wears the vendor's own button (cfBrandButton),
-            // a size up from the form buttons around it.
-            const ll = t.z("Log in with Cloudflare", .{});
-            const lh: f32 = 40;
-            const lw = t.btnW(ll, lh) + 28;
-            // Enabled even while pending — an abandoned browser tab never clears the flag, so a
-            // disabled button here would wedge the login until restart. Clicking again just re-opens
-            // a fresh consent URL.
-            if (cfBrandButton(.{ .x = x, .y = y, .width = lw, .height = lh }, ll, true)) {
-                store.pushCmd(store_mod.mkCmd(.oauth_cf_login, "", ""));
+        }
+
+        // API key (BYOK only — local needs none, custom uses this too)
+        if (chat_kind != 0) {
+            const key_hint: [:0]const u8 = if (chat_kind == 1 and std.mem.eql(u8, catalog.providers[@min(chat_byok, catalog.providers.len - 1)].key, "huggingface")) t.z("hf_... (a Hugging Face fine-grained token with Inference Providers access)", .{}) else if (chat_kind == 1 and catalog.providers[@min(chat_byok, catalog.providers.len - 1)].needs_account) t.z("your Cloudflare API token (Workers AI)", .{}) else t.z("API KEY (stored in the OS-protected local store, never plaintext)", .{});
+            flabel(x, y, key_hint);
+            y += 14;
+            const sk_label = t.z("Save key", .{});
+            const skw = t.btnW(sk_label, t.BTN_MD);
+            textField(.{ .x = x, .y = y, .width = colw - 240, .height = t.FIELD_H }, &ui.s_ckey, ui.focus == .s_ckey, "sk-...", .s_ckey);
+            if (t.button(.{ .x = x + colw - 240 + t.GAP, .y = y, .width = skw, .height = t.BTN_MD }, sk_label, t.blue, ui.s_ckey.len > 0)) {
+                store.pushChatCmd(store_mod.mkChatCmd(.save_key, "", ui.s_ckey.str()));
+                ui.s_ckey.clear();
+                ui.focus = .none;
             }
-            const sub: [:0]const u8 = if (cf_pending) t.z("waiting for the grant in your browser... (click again to retry)", .{}) else t.z("opens Cloudflare in your browser - one click, no token to paste", .{});
-            t.text(sub, @intFromFloat(x + lw + 12), @intFromFloat(y + 13), 12, if (cf_pending) t.orange else t.comment);
-            y += lh + 10;
-        } else if (cf_seen) {
-            t.text(t.z("not set up on this server - set NL_CF_OAUTH_CLIENT_ID (or pick Workers AI below and paste a token)", .{}), @intFromFloat(x), @intFromFloat(y + 6), 12, t.comment);
-            y += 30;
-        } else {
-            t.text(t.z("checking the server...", .{}), @intFromFloat(x), @intFromFloat(y + 6), 12, t.comment);
-            y += 30;
+            if (chat_key_n > 0) t.text(t.z("key set ({d} chars)", .{chat_key_n}), @intFromFloat(x + colw - 240 + t.GAP + skw + 12), @intFromFloat(y + 10), 12, t.green);
+            y += 48;
         }
-        y += 12;
+        // MODEL TRIO: the thinking + prompting override panels — shown only when the user split the models out.
+        if (!unified) {
+            y = chatRolePanel(store, x, y, colw, half, ol_n, 1, "THINKING MODEL", "sets the plan, the bar for done, and what survives compaction", .think_provider, .think_byok, .think_model, &ui.s_tkey, .s_tkey, "think");
+            y = chatRolePanel(store, x, y, colw, half, ol_n, 2, "PROMPTING MODEL", "writes the next instruction each step — small context, go cheap", .prompt_provider, .prompt_byok, .prompt_model, &ui.s_pkey, .s_pkey, "prompt");
+        }
+        y += 8;
     }
+    if (ui.settings_page == 1) {
+        // The poller owns model downloads; this page only queues commands and displays status.
+        y = settingSection(x, y, colw, "BUILT-IN MODEL");
+        {
+            var bi_seen = false;
+            var bi_compiled = false;
+            var bi_pct: u8 = 0;
+            var bi_done_mb: u32 = 0;
+            var bi_total_mb: u32 = 0;
+            var bi_params: u32 = 0;
+            var stb: [16]u8 = undefined;
+            var stn: usize = 0;
+            var arb: [24]u8 = undefined;
+            var arn: usize = 0;
+            var gpb: [64]u8 = undefined;
+            var gpn: usize = 0;
+            var bi_gpu_layers: u32 = 0;
+            var bi_tps10: u32 = 0;
+            var erb: [160]u8 = undefined;
+            var ern: usize = 0;
+            var usb: [10]u8 = undefined;
+            var usn: usize = 0;
+            var ufb: [64]u8 = undefined;
+            var ufn: usize = 0;
+            var upd_mb: u32 = 0;
+            {
+                store.lock();
+                defer store.unlock();
+                bi_seen = store.bi_seen;
+                bi_compiled = store.bi_compiled;
+                bi_pct = store.bi_pct;
+                bi_done_mb = store.bi_done_mb;
+                bi_total_mb = store.bi_total_mb;
+                bi_params = store.bi_params_b;
+                stn = store.bi_state_len;
+                @memcpy(stb[0..stn], store.bi_state[0..stn]);
+                arn = store.bi_arch_len;
+                @memcpy(arb[0..arn], store.bi_arch[0..arn]);
+                gpn = store.bi_gpu_len;
+                @memcpy(gpb[0..gpn], store.bi_gpu[0..gpn]);
+                bi_gpu_layers = store.bi_gpu_layers;
+                bi_tps10 = store.bi_tps10;
+                ern = store.bi_err_len;
+                @memcpy(erb[0..ern], store.bi_err[0..ern]);
+                usn = store.bi_upd_state_len;
+                @memcpy(usb[0..usn], store.bi_upd_state[0..usn]);
+                ufn = store.bi_upd_file_len;
+                @memcpy(ufb[0..ufn], store.bi_upd_file[0..ufn]);
+                upd_mb = store.bi_upd_mb;
+            }
+            const bi_st = stb[0..stn];
+            const bi_busy = std.mem.eql(u8, bi_st, "downloading") or std.mem.eql(u8, bi_st, "importing") or
+                std.mem.eql(u8, bi_st, "verifying") or std.mem.eql(u8, bi_st, "resolving");
+            const bi_served = std.mem.eql(u8, bi_st, "ready") or std.mem.eql(u8, bi_st, "cold") or std.mem.eql(u8, bi_st, "done");
+            const bi_failed = std.mem.eql(u8, bi_st, "failed");
 
-    // Cloudflare account id (only when the BYOK provider needs one) — built into the Workers AI base_url.
-    if (chat_kind == 1 and catalog.providers[@min(chat_byok, catalog.providers.len - 1)].needs_account) {
-        flabel(x, y, "CLOUDFLARE ACCOUNT ID (paste manually - or use the login above)");
-        y += 14;
-        const sid_label = t.z("Save id", .{});
-        const sidw = t.btnW(sid_label, t.BTN_MD);
-        textField(.{ .x = x, .y = y, .width = colw - 240, .height = t.FIELD_H }, &ui.s_cfacct, ui.focus == .s_cfacct, "e.g. 0123456789abcdef0123456789abcdef", .s_cfacct);
-        if (t.button(.{ .x = x + colw - 240 + t.GAP, .y = y, .width = sidw, .height = t.BTN_MD }, sid_label, t.blue, true)) {
-            store.lock();
-            const s = &store.settings;
-            const n = @min(ui.s_cfacct.len, s.cf_account.len);
-            @memcpy(s.cf_account[0..n], ui.s_cfacct.buf[0..n]);
-            s.cf_account_len = @intCast(n);
-            store.unlock();
-            store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
-            store.pushNotif("Account id saved", "used to build the Workers AI endpoint", 1);
-            ui.focus = .none;
-        }
-        y += 44;
-    }
+            if (!bi_seen) {
+                t.text(t.z("the-veil-12b - checking the server...", .{}), @intFromFloat(x), @intFromFloat(y), 11, t.comment);
+            } else if (!bi_compiled) {
+                t.text(t.z("this server build carries no built-in engine (-Dbuiltin=false) - rebuild with defaults to enable it", .{}), @intFromFloat(x), @intFromFloat(y), 11, t.comment);
+            } else if (bi_served) {
+                if (gpn > 0 and bi_gpu_layers > 0) {
+                    if (bi_tps10 > 0) {
+                        t.text(t.z("the-veil-12b installed ({s} {d}B - GPU: {s} - ~{d}.{d} tok/s) - zero setup, no key", .{ arb[0..arn], bi_params, gpb[0..gpn], bi_tps10 / 10, bi_tps10 % 10 }), @intFromFloat(x), @intFromFloat(y), 11, t.green);
+                    } else {
+                        t.text(t.z("the-veil-12b installed ({s} {d}B - GPU: {s}) - zero setup, no key, no external runtime", .{ arb[0..arn], bi_params, gpb[0..gpn] }), @intFromFloat(x), @intFromFloat(y), 11, t.green);
+                    }
+                } else if (bi_tps10 > 0) {
+                    t.text(t.z("the-veil-12b installed ({s} {d}B - CPU - ~{d}.{d} tok/s) - zero setup, no key, no external runtime", .{ arb[0..arn], bi_params, bi_tps10 / 10, bi_tps10 % 10 }), @intFromFloat(x), @intFromFloat(y), 11, t.green);
+                } else {
+                    t.text(t.z("the-veil-12b installed ({s} {d}B - CPU) - zero setup, no key, no external runtime", .{ arb[0..arn], bi_params }), @intFromFloat(x), @intFromFloat(y), 11, t.green);
+                }
+            } else if (bi_failed) {
+                t.text(t.z("failed: {s}", .{erb[0..ern]}), @intFromFloat(x), @intFromFloat(y), 11, t.red);
+            } else if (bi_busy) {
+                t.text(t.z("installing - the transfer runs on the server; closing this window is fine", .{}), @intFromFloat(x), @intFromFloat(y), 11, t.comment);
+            } else {
+                t.text(t.z("not downloaded - about 7 GB, sha-verified against the publisher's record before it ever serves", .{}), @intFromFloat(x), @intFromFloat(y), 11, t.comment);
+            }
+            y += 20;
 
-    // API key (BYOK only — local needs none, custom uses this too)
-    if (chat_kind != 0) {
-        const key_hint: [:0]const u8 = if (chat_kind == 1 and std.mem.eql(u8, catalog.providers[@min(chat_byok, catalog.providers.len - 1)].key, "huggingface")) t.z("hf_... (a Hugging Face fine-grained token with Inference Providers access)", .{}) else if (chat_kind == 1 and catalog.providers[@min(chat_byok, catalog.providers.len - 1)].needs_account) t.z("your Cloudflare API token (Workers AI)", .{}) else t.z("API KEY (stored in the OS-protected local store, never plaintext)", .{});
-        flabel(x, y, key_hint);
-        y += 14;
-        const sk_label = t.z("Save key", .{});
-        const skw = t.btnW(sk_label, t.BTN_MD);
-        textField(.{ .x = x, .y = y, .width = colw - 240, .height = t.FIELD_H }, &ui.s_ckey, ui.focus == .s_ckey, "sk-...", .s_ckey);
-        if (t.button(.{ .x = x + colw - 240 + t.GAP, .y = y, .width = skw, .height = t.BTN_MD }, sk_label, t.blue, ui.s_ckey.len > 0)) {
-            store.pushChatCmd(store_mod.mkChatCmd(.save_key, "", ui.s_ckey.str()));
-            ui.s_ckey.clear();
-            ui.focus = .none;
+            // the loading bar: filled to the server-reported pct, labeled with real transferred bytes
+            if (bi_busy) {
+                const bar_h: f32 = 18;
+                t.panelBordered(.{ .x = x, .y = y, .width = colw, .height = bar_h }, t.withAlpha(t.blue, 24), t.comment);
+                const frac: f32 = @as(f32, @floatFromInt(bi_pct)) / 100.0;
+                const fillw: f32 = (colw - 2) * frac;
+                if (fillw >= 1) t.fillRect(@intFromFloat(x + 1), @intFromFloat(y + 1), @intFromFloat(fillw), @intFromFloat(bar_h - 2), t.withAlpha(t.blue, 150));
+                const bar_lbl = if (bi_total_mb > 0)
+                    t.z("{s}  {d}%  ({d} / {d} MB)", .{ bi_st, bi_pct, bi_done_mb, bi_total_mb })
+                else
+                    t.z("{s}...", .{bi_st});
+                t.text(bar_lbl, @intFromFloat(x + 8), @intFromFloat(y + 3), 11, t.blue);
+                y += bar_h + 8;
+            }
+
+            if (bi_seen and bi_compiled) {
+                if (bi_busy) {
+                    const cancel_lbl = t.z("Cancel", .{});
+                    if (t.button(.{ .x = x, .y = y, .width = t.btnW(cancel_lbl, t.BTN_MD), .height = t.BTN_MD }, cancel_lbl, t.red, true)) {
+                        store.pushCmd(store_mod.mkCmd(.builtin_cancel, "", ""));
+                    }
+                    y += t.BTN_MD + 10;
+                } else if (!bi_served) {
+                    const dl_lbl = t.z("Download the-veil-12b (~7 GB)", .{});
+                    const dl_w = t.btnW(dl_lbl, t.BTN_MD);
+                    if (t.buttonSolid(.{ .x = x, .y = y, .width = dl_w, .height = t.BTN_MD }, dl_lbl, t.blue, true)) {
+                        store.pushCmd(store_mod.mkCmd(.builtin_pull, "", ""));
+                    }
+                    const imp_lbl = t.z("Import local copy", .{});
+                    if (t.button(.{ .x = x + dl_w + 8, .y = y, .width = t.btnW(imp_lbl, t.BTN_MD), .height = t.BTN_MD }, imp_lbl, t.blue, true)) {
+                        store.pushCmd(store_mod.mkCmd(.builtin_import, "", ""));
+                    }
+                    y += t.BTN_MD + 10;
+                } else {
+                    const on_builtin = chat_kind == 1 and chat_byok == BUILTIN_IDX;
+                    const use_lbl = t.z("Use built-in for chat", .{});
+                    const use_w = t.btnW(use_lbl, t.BTN_MD);
+                    if (t.buttonSolid(.{ .x = x, .y = y, .width = use_w, .height = t.BTN_MD }, use_lbl, if (on_builtin) t.green else t.blue, !on_builtin)) {
+                        store.lock();
+                        const s = &store.settings;
+                        s.chat_kind = 1;
+                        s.chat_byok = BUILTIN_IDX;
+                        const mid = "the-veil-12b";
+                        @memcpy(s.chat_model[0..mid.len], mid);
+                        s.chat_model_len = @intCast(mid.len);
+                        store.unlock();
+                        store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
+                        store.pushNotif("Chat: built-in model", "the-veil-12b serves from this server - no key, no external runtime", 1);
+                    }
+                    if (on_builtin) t.text(t.z("chat runs on the built-in model", .{}), @intFromFloat(x + use_w + 10), @intFromFloat(y + 8), 11, t.green);
+                    const rm_lbl = t.z("Remove", .{});
+                    const rm_w = t.btnW(rm_lbl, t.BTN_MD);
+                    if (t.button(.{ .x = x + colw - rm_w, .y = y, .width = rm_w, .height = t.BTN_MD }, rm_lbl, t.red, true)) {
+                        store.pushCmd(store_mod.mkCmd(.builtin_remove, "", ""));
+                    }
+                    y += t.BTN_MD + 10;
+
+                    // the update lane: an installed store can ask the published repo whether a newer
+                    // release exists; a pull IS the updater (it verifies + hot-swaps server-side)
+                    const upd = usb[0..usn];
+                    if (std.mem.eql(u8, upd, "update")) {
+                        t.text(t.z("update available: {s} ({d} MB)", .{ ufb[0..ufn], upd_mb }), @intFromFloat(x), @intFromFloat(y + 6), 11, t.blue);
+                        const up_lbl = t.z("Update now", .{});
+                        const up_w = t.btnW(up_lbl, t.BTN_MD);
+                        if (t.buttonSolid(.{ .x = x + colw - up_w, .y = y, .width = up_w, .height = t.BTN_MD }, up_lbl, t.blue, true)) {
+                            store.pushCmd(store_mod.mkCmd(.builtin_pull, "", ""));
+                        }
+                        y += t.BTN_MD + 10;
+                    } else if (std.mem.eql(u8, upd, "checking")) {
+                        t.text(t.z("checking the published repo...", .{}), @intFromFloat(x), @intFromFloat(y + 2), 11, t.comment);
+                        y += 22;
+                    } else {
+                        const chk_lbl = t.z("Check for updates", .{});
+                        if (t.buttonGhost(.{ .x = x, .y = y, .width = t.btnW(chk_lbl, t.BTN_MD), .height = t.BTN_MD }, chk_lbl, t.blue, true)) {
+                            store.pushCmd(store_mod.mkCmd(.builtin_check, "", ""));
+                        }
+                        if (std.mem.eql(u8, upd, "current")) t.text(t.z("up to date with the published release", .{}), @intFromFloat(x + t.btnW(chk_lbl, t.BTN_MD) + 10), @intFromFloat(y + 8), 11, t.comment);
+                        y += t.BTN_MD + 10;
+                    }
+                }
+            }
         }
-        if (chat_key_n > 0) t.text(t.z("key set ({d} chars)", .{chat_key_n}), @intFromFloat(x + colw - 240 + t.GAP + skw + 12), @intFromFloat(y + 10), 12, t.green);
-        y += 48;
+        y += 8;
     }
-    // MODEL TRIO: the thinking + prompting override panels — shown only when the user split the models out.
-    if (!unified) {
-        y = chatRolePanel(store, x, y, colw, half, ol_n, 1, "THINKING MODEL", "sets the plan, the bar for done, and what survives compaction", .think_provider, .think_byok, .think_model, &ui.s_tkey, .s_tkey, "think");
-        y = chatRolePanel(store, x, y, colw, half, ol_n, 2, "PROMPTING MODEL", "writes the next instruction each step — small context, go cheap", .prompt_provider, .prompt_byok, .prompt_model, &ui.s_pkey, .s_pkey, "prompt");
+    if (ui.settings_page == 3) {
+        // ---- BUILD DATASET: capture everything the veil does, in a shape a fine-tune can eat ----
+        // Pure render over store.ds_* (the poller owns the status poll; the two verbs ride the command
+        // ring). Recording is SERVER-side and marker-driven, so it survives closing this window and it
+        // also captures swarm minds — the copy says so rather than implying the desk is doing the work.
+        y = settingSection(x, y, colw, "BUILD DATASET");
+        {
+            var ds_seen = false;
+            var ds_rec = false;
+            var idb: [40]u8 = undefined;
+            var idn: usize = 0;
+            var calls: u64 = 0;
+            var examples: u64 = 0;
+            var toolruns: u64 = 0;
+            var nsets: u32 = 0;
+            {
+                store.lock();
+                defer store.unlock();
+                ds_seen = store.ds_seen;
+                ds_rec = store.ds_recording;
+                idn = store.ds_id_len;
+                @memcpy(idb[0..idn], store.ds_id[0..idn]);
+                calls = store.ds_calls;
+                examples = store.ds_examples;
+                toolruns = store.ds_tools;
+                nsets = store.ds_sets;
+            }
+            if (!ds_seen) {
+                t.text(t.z("checking the server...", .{}), @intFromFloat(x), @intFromFloat(y), 11, t.comment);
+            } else if (ds_rec) {
+                t.text(t.z("RECORDING {s} - {d} training examples, {d} model calls, {d} tool runs captured", .{ idb[0..idn], examples, calls, toolruns }), @intFromFloat(x), @intFromFloat(y), 11, t.green);
+            } else {
+                t.text(t.z("off - turn it on and every chat turn, tool call, reasoning trace and swarm build is captured", .{}), @intFromFloat(x), @intFromFloat(y), 11, t.comment);
+            }
+            y += 18;
+            t.text(t.z("written to <data>/sets/<id>/ as sft.jsonl (OpenAI messages format), by-model shards, raw + tools logs{s}", .{if (nsets > 0) t.z(" - {d} set(s) on disk", .{nsets}) else ""}), @intFromFloat(x), @intFromFloat(y), 11, t.comment);
+            y += 22;
+            if (ds_seen) {
+                if (ds_rec) {
+                    const stop_lbl = t.z("Stop + finalize", .{});
+                    if (t.buttonSolid(.{ .x = x, .y = y, .width = t.btnW(stop_lbl, t.BTN_MD), .height = t.BTN_MD }, stop_lbl, t.red, true)) {
+                        store.pushCmd(store_mod.mkCmd(.dataset_stop, "", ""));
+                    }
+                } else {
+                    const go_lbl = t.z("Build dataset", .{});
+                    if (t.buttonSolid(.{ .x = x, .y = y, .width = t.btnW(go_lbl, t.BTN_MD), .height = t.BTN_MD }, go_lbl, t.blue, true)) {
+                        // the label is what the set is FOR — the desk sends the active chat's name when
+                        // there is one, so a set is identifiable later without opening it
+                        store.pushCmd(store_mod.mkCmd(.dataset_start, "", "desk session"));
+                    }
+                }
+                y += t.BTN_MD + 10;
+            }
+        }
+        y += 8;
     }
-    y += 8;
-    t.text(t.z("veil-desk v0.2.0 - same-machine companion - borderless chrome", .{}), @intFromFloat(x), @intFromFloat(y), 12, t.comment);
+    y += 16;
     // content height for next frame's scroll clamp (add back the offset this frame subtracted)
     ui.settings_h = (y + 24 + ui.settings_scroll) - body.y;
     rl.endScissorMode();
+    t.setInteractionClip(null);
+    const max_scroll = @max(0, ui.settings_h - body.height + 24);
+    if (max_scroll > 0) {
+        const track = t.Rect{ .x = body.x + body.width + 6, .y = body.y, .width = 8, .height = body.height };
+        const thumb_h = @min(track.height, @max(28, track.height * body.height / (ui.settings_h + 24)));
+        if (!rl.isMouseButtonDown(.left)) ui.settings_drag = false;
+        if (ui.open_dd == .none and t.hovering(track) and rl.isMouseButtonPressed(.left)) ui.settings_drag = true;
+        if (ui.settings_drag and track.height > thumb_h) {
+            ui.settings_scroll = std.math.clamp((rl.getMousePosition().y - track.y - thumb_h / 2) / (track.height - thumb_h), 0, 1) * max_scroll;
+        }
+        const thumb_y = track.y + (track.height - thumb_h) * std.math.clamp(ui.settings_scroll / max_scroll, 0, 1);
+        t.panel(track, t.bg_hl);
+        t.panel(.{ .x = track.x, .y = thumb_y, .width = track.width, .height = thumb_h }, if (ui.settings_drag or t.hovering(track)) t.blue else t.comment);
+    } else ui.settings_drag = false;
 
     // draw the open chat dropdown LAST so its option list sits on top of the fields below it (and outside
     // the page scissor — a list flipped upward may poke above the body rect). Unblock first so the option
