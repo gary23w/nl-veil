@@ -5894,6 +5894,34 @@ fn drawChatRight(store: *Store, r: t.Rect, open: bool, casts: []const store_mod.
 
 // -------------------------------------------------------------------------------- deploy form
 
+// Snapshot the same account/model state Settings uses; never borrow Store strings after unlocking.
+const DeployCloudflare = struct {
+    connected: bool = false,
+    models: [store_mod.MAX_CF_MODELS][96]u8 = undefined,
+    lens: [store_mod.MAX_CF_MODELS]u8 = undefined,
+    count: usize = 0,
+
+    fn read(store: *Store) DeployCloudflare {
+        store.lock();
+        defer store.unlock();
+        var cf: DeployCloudflare = .{ .connected = store.cf_oauth_connected };
+        if (cf.connected) {
+            cf.count = store.cf_model_count;
+            @memcpy(cf.models[0..cf.count], store.cf_models[0..cf.count]);
+            @memcpy(cf.lens[0..cf.count], store.cf_model_lens[0..cf.count]);
+        }
+        return cf;
+    }
+
+    fn model(cf: *const DeployCloudflare, prov: *const catalog.Provider, index: usize) []const u8 {
+        if (prov.needs_account and cf.count > 0) {
+            const i = if (index < cf.count) index else 0;
+            return cf.models[i][0..cf.lens[i]];
+        }
+        return prov.models[if (index < prov.models.len) index else 0].id;
+    }
+};
+
 fn drawDeploy(store: *Store, body: t.Rect) void {
     t.setBlockClicks(ui.open_dd != .none); // same dropdown-overlay guard as Settings (cleared before flushDropdown)
     defer t.setBlockClicks(false);
@@ -5906,7 +5934,9 @@ fn drawDeploy(store: *Store, body: t.Rect) void {
     y += 40;
 
     const prov = &catalog.providers[ui.d_provider];
-    if (ui.d_model >= prov.models.len) ui.d_model = 0;
+    const cf = DeployCloudflare.read(store);
+    const model_count = if (prov.needs_account and cf.count > 0) cf.count else prov.models.len;
+    if (ui.d_model >= model_count) ui.d_model = 0;
 
     // two columns
     const cw = (colw - t.PAD) / 2;
@@ -5923,22 +5953,26 @@ fn drawDeploy(store: *Store, body: t.Rect) void {
 
     // "default" = inherit the CLIENT's configured chat LLM (Settings → CHAT MODEL): the swarm runs on
     // whatever brain the user already set up, no re-entering providers and keys per deploy.
-    selector(.{ .x = x, .y = ly, .width = cw, .height = fh }, t.z("PROVIDER", .{}), if (ui.d_use_default) "default (your chat model)" else prov.label, .provider);
+    selector(.{ .x = x, .y = ly, .width = cw, .height = fh }, t.z("PROVIDER", .{}), if (ui.d_use_default) "default (your chat model)" else if (prov.needs_account and cf.connected) "Cloudflare (connected in Settings)" else prov.label, .provider);
     ly += fh + gap;
     if (ui.d_use_default) {
         selector(.{ .x = x, .y = ly, .width = cw, .height = fh }, t.z("MODEL", .{}), "from Settings - chat model", .model);
         ly += fh + gap;
     } else {
-        selector(.{ .x = x, .y = ly, .width = cw, .height = fh }, t.z("MODEL", .{}), prov.models[ui.d_model].label, .model);
+        selector(.{ .x = x, .y = ly, .width = cw, .height = fh }, t.z("MODEL", .{}), if (prov.needs_account and cf.count > 0) cf.model(prov, ui.d_model) else prov.models[ui.d_model].label, .model);
         ly += fh + gap;
+        if (prov.needs_account and cf.connected) {
+            drawModelsHint(store, prov, x, ly);
+            ly += 20;
+        }
     }
 
-    if (!ui.d_use_default and prov.needs_account) {
+    if (!ui.d_use_default and prov.needs_account and !cf.connected) {
         flabel(x, ly, "CLOUDFLARE ACCOUNT ID (blank = use the server's own Workers AI creds)");
         textField(.{ .x = x, .y = ly + 14, .width = cw, .height = t.FIELD_H }, &ui.d_cfacct, ui.focus == .d_cfacct, "account id", .d_cfacct);
         ly += fh + gap;
     }
-    if (!ui.d_use_default and prov.needs_key) {
+    if (!ui.d_use_default and prov.needs_key and !(prov.needs_account and cf.connected)) {
         const kh: [:0]const u8 = if (std.mem.eql(u8, prov.key, "huggingface")) t.z("HF TOKEN (hf_...)", .{}) else if (prov.needs_account) t.z("CLOUDFLARE API TOKEN (blank = server creds)", .{}) else t.z("API KEY (nlk_... or provider key)", .{});
         flabel(x, ly, kh);
         textField(.{ .x = x, .y = ly + 14, .width = cw, .height = t.FIELD_H }, &ui.d_key, ui.focus == .d_key, "sk-... / nlk_...", .d_key);
@@ -6003,7 +6037,7 @@ fn drawDeploy(store: *Store, body: t.Rect) void {
 
     // draw the open dropdown LAST so its list sits on top of the fields below it (unblock so options click).
     t.setBlockClicks(false);
-    flushDropdown();
+    flushDropdown(store);
 }
 
 /// A closed dropdown button (label + current value + chevron). Clicking toggles its option list, which is
@@ -6027,7 +6061,7 @@ fn selector(r: t.Rect, label: [:0]const u8, value: []const u8, kind: DdKind) voi
 }
 
 /// Render the currently-open dropdown's option list on top of the form and apply a selection.
-fn flushDropdown() void {
+fn flushDropdown(store: *Store) void {
     if (ui.open_dd == .none) return;
     switch (ui.open_dd) {
         .chat_provider, .chat_byok, .chat_model, .think_provider, .think_byok, .think_model, .prompt_provider, .prompt_byok, .prompt_model => return, // owned by flushChatDropdown (Settings tab)
@@ -6037,7 +6071,8 @@ fn flushDropdown() void {
     }
     // Build the option labels + current index for the open kind. The provider and model loops below write
     // unguarded, which is safe only because catalog.zig refuses to compile a catalog bigger than this array.
-    var labels: [catalog.DEPLOY_MENU_ROWS][]const u8 = undefined;
+    const cf = DeployCloudflare.read(store);
+    var labels: [@max(catalog.DEPLOY_MENU_ROWS, store_mod.MAX_CF_MODELS)][]const u8 = undefined;
     var count: usize = 0;
     var current: usize = 0;
     const prov = &catalog.providers[ui.d_provider];
@@ -6047,7 +6082,7 @@ fn flushDropdown() void {
             labels[0] = "default (your chat model)";
             count = 1;
             for (catalog.providers, 0..) |p, i| {
-                labels[i + 1] = p.label;
+                labels[i + 1] = if (p.needs_account and cf.connected) "Cloudflare (connected in Settings)" else p.label;
                 count += 1;
             }
             current = if (ui.d_use_default) 0 else ui.d_provider + 1;
@@ -6057,6 +6092,10 @@ fn flushDropdown() void {
                 labels[0] = "from Settings - chat model";
                 count = 1;
                 current = 0;
+            } else if (prov.needs_account and cf.count > 0) {
+                for (0..cf.count) |i| labels[i] = cf.models[i][0..cf.lens[i]];
+                count = cf.count;
+                current = if (ui.d_model < count) ui.d_model else 0;
             } else {
                 for (prov.models, 0..) |m, i| {
                     labels[i] = m.label;
@@ -6245,7 +6284,8 @@ fn submitDeploy(store: *Store, prov: *const catalog.Provider) void {
     var basebuf: [256]u8 = undefined;
     var eff_base = catalog.resolveBase(prov, ui.d_cfacct.str(), &basebuf);
     var eff_provider: []const u8 = prov.key;
-    var eff_model: []const u8 = prov.models[ui.d_model].id;
+    const cf = DeployCloudflare.read(store);
+    var eff_model: []const u8 = cf.model(prov, ui.d_model);
     var keybuf: [192]u8 = undefined;
     var modelbuf: [96]u8 = undefined;
     var eff_key: []const u8 = ui.d_key.str();
@@ -6287,6 +6327,12 @@ fn submitDeploy(store: *Store, prov: *const catalog.Provider) void {
         eff_model = modelbuf[0..mn];
         store.unlock();
     }
+    // The server resolves the authenticated user's OAuth token. Stale manual credentials must not
+    // override the account shown as connected in Settings, including when inheriting the chat model.
+    if (cf.connected and (std.mem.eql(u8, eff_provider, "workers-ai") or std.mem.eql(u8, eff_provider, "cloudflare"))) {
+        eff_base = "cloudflare";
+        eff_key = "";
+    }
     w.writeAll("{\"name\":\"") catch return;
     jesc(&w, ui.d_name.str());
     w.print("\",\"provider\":\"{s}\",\"model\":\"{s}\",\"style\":\"{s}\",\"stack\":\"{s}\",\"mode\":\"{s}\",\"base_url\":\"{s}\",\"minutes\":{d},\"encrypt\":{s},\"veil_population\":{s},\"autonomy\":\"{s}\",\"internet\":{s},\"gap_assess\":{s},\"breakout\":{s},\"observe_psyche\":{s},\"api_key\":\"", .{
@@ -6316,6 +6362,47 @@ fn submitDeploy(store: *Store, prov: *const catalog.Provider) void {
 
 fn boolStr(v: bool) []const u8 {
     return if (v) "true" else "false";
+}
+
+test "swarm deploy shares Cloudflare login and live models with Settings" {
+    const s = try std.testing.allocator.create(Store);
+    defer std.testing.allocator.destroy(s);
+    s.* = .{};
+    defer ui = .{};
+    ui = .{};
+    s.cf_oauth_connected = true;
+    s.cf_model_count = store_mod.MAX_CF_MODELS;
+    const live = "@cf/test/live-account-model";
+    for (0..s.cf_model_count) |i| {
+        @memcpy(s.cf_models[i][0..live.len], live);
+        s.cf_model_lens[i] = live.len;
+    }
+    const prov = &catalog.providers[WORKERS_AI_IDX];
+    ui.d_use_default = false;
+    ui.d_provider = WORKERS_AI_IDX;
+    ui.d_model = store_mod.MAX_CF_MODELS - 1;
+    // A previous manual setup must not win over the connected account.
+    @memcpy(ui.d_key.buf[0..5], "stale");
+    ui.d_key.len = 5;
+    submitDeploy(s, prov);
+    const cmd = s.popCmd().?;
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, cmd.textStr(), .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(live, parsed.value.object.get("model").?.string);
+    try std.testing.expectEqualStrings("cloudflare", parsed.value.object.get("base_url").?.string);
+    try std.testing.expectEqualStrings("", parsed.value.object.get("api_key").?.string);
+
+    ui.d_use_default = true;
+    s.settings.chat_kind = 1;
+    s.settings.chat_byok = WORKERS_AI_IDX;
+    submitDeploy(s, prov);
+    const inherited = s.popCmd().?;
+    try std.testing.expect(std.mem.indexOf(u8, inherited.textStr(), "\"base_url\":\"cloudflare\"") != null);
+
+    s.cf_oauth_connected = false;
+    const disconnected = DeployCloudflare.read(s);
+    try std.testing.expectEqual(@as(usize, 0), disconnected.count);
+    try std.testing.expectEqualStrings(prov.models[0].id, disconnected.model(prov, ui.d_model));
 }
 
 /// Escape one JSON string body (the caller writes the surrounding quotes).
