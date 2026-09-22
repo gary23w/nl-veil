@@ -2375,6 +2375,7 @@ test "a failed llm frame carries the error head; a good one carries no err field
 /// question: the verdict step already asked "was the work done?" and was answered with the same claim.
 const ZERO_TOOL_NUDGE = "(You reported a result, but you made NO tool call this turn - nothing was read, written or run, so nothing you reported has happened. Do the work now with tools: read what you need, make the change, verify it, then report what the tools showed.)";
 const NOW_NUDGE = "(You answered a question about the CURRENT state without running any tool this turn. What you recall may be stale: files change after they are read, and a partial view is not the whole file. Read or compute the current value with a tool now, then reply with what the tool shows.)";
+const EMPTY_NUDGE = "(Your previous response came back empty before any work was done, so nothing from it survived. Continue the request from the start: use tools to read or compute whatever it needs, then reply in the format it asked for.)";
 const CUT_NUDGE = "(Your previous reply was cut off at the output-token limit before it produced an answer, so nothing from it survived. Do not re-derive at length. If a computation is needed, make ONE tool call that prints the result; then reply with the final answer only, in the format the request asked for.)";
 /// What the drive loop posts, once per turn, when the step picker names a durable-memory change and this turn has
 /// recorded none: the model is asked for the bare lines the engine applies — never handed the picker's prose as a
@@ -3461,6 +3462,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     var zero_tool_nudged = false; // the zero-tool-claim continuation fires once per turn (see below)
     var ground_nudged = false; // the grounding continuation (a figure from nowhere / a NOW question, no tool run) - once per turn
     var cut_nudged = false; // the cut-reply continuation (output cap hit before any answer) - once per turn
+    var empty_retried = false; // the empty-before-any-work retry (a dead call, not a finished model) - once per turn
     outer: while (drive < max_steps) : (drive += 1) {
         // Reaching a SECOND drive step means the answer captured last step was not the turn's answer — drop it
         // (see the capture site). This clear is what makes "still held at the completion site" mean "the turn
@@ -3877,6 +3879,22 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
             http.jstr(gpa, &conv_buf, CUT_NUDGE) catch break :outer;
             conv_buf.append(gpa, '}') catch break :outer;
             llm.think_off_once = true;
+            continue :outer;
+        }
+        // AN EMPTY REPLY BEFORE ANY WORK IS A DEAD CALL, NOT A MODEL THAT HAS ITS ANSWER. The rescue below forbids
+        // tools by design, which is right when tool results already sit in the conversation and only the final
+        // words went missing - and wrong when nothing was gathered: then it can only guess. Bait bt_cache on v1.1.4:
+        // the first streamed call ran 62 s and ended ok with 0 tokens in / 1 out, and the tool-less rescue answered
+        // "sum the paid rows of data/txns.csv" with TOTAL=0.00 without ever being able to open the file. So an
+        // empty reply with no tool run this turn is asked ONCE more with the tools still advertised; only a second
+        // empty reply reaches the rescue.
+        if (!empty_retried and !inner.tools_ran and tools_spent == 0 and !toolsForbidden(goal_text) and std.mem.trim(u8, answer, " \r\n\t").len == 0) {
+            empty_retried = true;
+            gpa.free(answer);
+            emitKV(app, conv_dir, "status", "text", "the model returned nothing before doing any work - asking again, tools available");
+            conv_buf.appendSlice(gpa, ",{\"role\":\"user\",\"content\":") catch break :outer;
+            http.jstr(gpa, &conv_buf, EMPTY_NUDGE) catch break :outer;
+            conv_buf.append(gpa, '}') catch break :outer;
             continue :outer;
         }
         // EMPTY settled answer (the model "died" — returned no text and no tools, or stripped to nothing).
