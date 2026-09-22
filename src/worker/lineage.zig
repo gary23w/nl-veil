@@ -74,6 +74,15 @@ pub fn dbPath(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, lineage_i
     return std.fmt.allocPrint(gpa, "{s}/mind.sqlite", .{dir}) catch null;
 }
 
+/// The db path of lineage `id` under a KNOWN user root ("{data}/u{uid}", as userRootOf returns it for every run
+/// layout), for readers that must not create anything — the review API asks about a lineage, it never mints
+/// one. Caller frees.
+pub fn dbPathIn(gpa: std.mem.Allocator, user_root: []const u8, lineage_id: []const u8) ?[]u8 {
+    if (std.mem.trim(u8, lineage_id, " \t\r\n").len == 0) return null;
+    var sb: [96]u8 = undefined;
+    return std.fmt.allocPrint(gpa, "{s}/_lineage/{s}/mind.sqlite", .{ user_root, slug(lineage_id, &sb) }) catch null;
+}
+
 /// Does this lineage store already exist (i.e. a prior cast populated it)? Lets the engine tell a mind
 /// "you INHERIT the memory of N prior runs on this assignment" vs "you are the first run".
 pub fn exists(io: std.Io, gpa: std.mem.Allocator, db: []const u8) bool {
@@ -115,4 +124,9 @@ test "dbPath is stable across runs of the same lineage, empty id opts out" {
     // no lineage → null → caller keeps the per-run brain
     try t.expect(dbPath(gpa, io, "C:/x/data/u1/_chat/builds/conv-A", "") == null);
     try t.expect(dbPath(gpa, io, "C:/x/data/u1/_chat/builds/conv-A", "   ") == null);
+    // the reader's path for the same lineage is the same file, and it creates nothing
+    const c = dbPathIn(gpa, userRootOf("C:/x/data/u1/_chat/builds/conv-A"), "My Proj").?;
+    defer gpa.free(c);
+    try t.expectEqualStrings(a, c);
+    try t.expect(dbPathIn(gpa, "C:/x/data/u1", " ") == null);
 }

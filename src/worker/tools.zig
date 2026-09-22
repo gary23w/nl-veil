@@ -1159,6 +1159,11 @@ pub const SKILL_PROPOSED_SCOPE = "skills-proposed";
 /// same way the judge's lesson/skill proposals are, never auto-run and never injected into a prompt.
 pub const HABIT_PROPOSED_SCOPE = "habits-proposed";
 
+/// What review turned DOWN from the three quarantines above (proposals.zig `decide`). The judge reads it beside
+/// the pending lists ("never re-propose these") and the habit miner skips a sequence already here, so a lineage
+/// does not re-mint the same rejected proposal every run. Never recalled into a mind's prompt.
+pub const PROPOSAL_REJECTED_SCOPE = "proposals-rejected";
+
 /// The swarm's FITNESS history — one "round N: P/T (pct%)" line per round, written by the engine's benchmark.
 /// This is the measurable spine of recursive self-improvement: improvement is a NUMBER that must climb, not a
 /// vibe. The deliverable is scored each round (real tests > compiles > artifact-presence) and that score is fed

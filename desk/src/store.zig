@@ -22,7 +22,7 @@ const SpinLock = struct {
 
 pub const Tab = enum { dashboard, chat, swarm, hub, scheduled, settings }; // deploy = the Swarm tab's inner form
 
-pub const CmdKind = enum { none, select, say, set_goal, stop, deploy, delete, open_folder, refresh_now, open_file, sched_create, sched_update, sched_toggle, sched_delete, sched_run, oauth_cf_login, oauth_cf_logout, open_url, builtin_pull, builtin_cancel, builtin_import, builtin_remove, builtin_check, dataset_start, dataset_stop, cf_tunnel_on, cf_tunnel_off };
+pub const CmdKind = enum { none, select, say, set_goal, stop, deploy, delete, open_folder, refresh_now, open_file, sched_create, sched_update, sched_toggle, sched_delete, sched_run, oauth_cf_login, oauth_cf_logout, open_url, builtin_pull, builtin_cancel, builtin_import, builtin_remove, builtin_check, dataset_start, dataset_stop, cf_tunnel_on, cf_tunnel_off, lineage_accept, lineage_reject };
 
 /// A UI→poller command. Fixed-size, copied by value into the ring, so no cross-thread allocation.
 pub const Command = struct {
@@ -865,6 +865,30 @@ pub const PropRow = struct {
     }
 };
 
+/// A SWARM LINEAGE's quarantined proposal (the end-of-run judge's lesson/skill, or a mined habit), read from the
+/// server's /api/v1/lineages/<id>/proposals. Unlike PropRow (the desk chat's own brain, decided on the chat
+/// thread) these are decided by the poller over HTTP, and the server matches the EXACT stored text — so `text`
+/// holds a whole judge line (<= 600 chars + its evidence tail), never a clipped one.
+pub const LinPropRow = struct {
+    lineage: [64]u8 = [_]u8{0} ** 64, // the lineage slug (the server's _lineage/<slug> dir name)
+    lineage_len: u8 = 0,
+    scope: [24]u8 = [_]u8{0} ** 24, // lessons-proposed / skills-proposed / habits-proposed
+    scope_len: u8 = 0,
+    kind: u8 = 0, // 0 = lesson, 1 = skill, 2 = habit
+    text: [900]u8 = [_]u8{0} ** 900,
+    text_len: u16 = 0,
+    pub fn lineageStr(p: *const LinPropRow) []const u8 {
+        return p.lineage[0..p.lineage_len];
+    }
+    pub fn scopeStr(p: *const LinPropRow) []const u8 {
+        return p.scope[0..p.scope_len];
+    }
+    pub fn textStr(p: *const LinPropRow) []const u8 {
+        return p.text[0..p.text_len];
+    }
+};
+pub const MAX_LIN_PROPS = 16;
+
 /// A UI→chat-thread command; same copy-by-value ring discipline as Command.
 pub const ChatCommand = struct {
     kind: ChatCmdKind = .none,
@@ -942,6 +966,10 @@ pub const Store = struct {
     // --- judge proposals awaiting review (chat thread writes; Memory pane reads) ---
     chat_props: [12]PropRow = undefined,
     chat_prop_count: usize = 0,
+
+    // --- swarm-lineage proposals awaiting review (poller writes; Memory pane reads) ---
+    lin_props: [MAX_LIN_PROPS]LinPropRow = undefined,
+    lin_prop_count: usize = 0,
 
     // --- chat (chat thread writes, UI reads; UI writes the command ring) ---
     convs: [MAX_CONVS]ConvRow = undefined,
