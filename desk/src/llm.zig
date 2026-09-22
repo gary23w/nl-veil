@@ -1090,12 +1090,12 @@ const TEST_SSE = "data: {\"choices\":[{\"delta\":{\"content\":\"streamed\"}}]}\n
 /// A clean streamed answer: "streamed", then [DONE].
 const TEST_ANSWER = std.fmt.comptimePrint("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {d}\r\n\r\n{s}", .{ TEST_SSE.len, TEST_SSE });
 
-/// TEST ONLY. A model endpoint on 127.0.0.1, at a port the OS assigns (a fixed port is shared rather than exclusive
+/// TEST ONLY (pub for the poller's HTTP tests too). A model endpoint on 127.0.0.1, at a port the OS assigns (a fixed port is shared rather than exclusive
 /// on Windows, and a wildcard listen raises a Windows Firewall prompt). It reads each request whole and keeps the
 /// first, and runs `look` if it has one: the call is in flight, curl waiting on the reply. Then it answers `reply`
 /// and closes, or, with `hold`, answers `reply` (often nothing) and holds the connection open until stop(): an
 /// endpoint still working on the call.
-const Standin = struct {
+pub const Standin = struct {
     io: Io,
     server: Io.net.Server,
     port: u16,
@@ -1111,7 +1111,7 @@ const Standin = struct {
     thread: std.Thread,
 
     /// Starts in place: the serve thread holds a pointer to the struct, so it must not be copied.
-    fn start(sv: *Standin, io: Io, reply: []const u8, hold: bool) !void {
+    pub fn start(sv: *Standin, io: Io, reply: []const u8, hold: bool) !void {
         return sv.startWatched(io, reply, hold, null);
     }
 
@@ -1179,7 +1179,7 @@ const Standin = struct {
     }
 
     /// Waits up to ~30 s for `n` requests to arrive whole: a curl that read its config and sent its call.
-    fn awaitSeen(sv: *const Standin, n: u32) !void {
+    pub fn awaitSeen(sv: *const Standin, n: u32) !void {
         var waited: u32 = 0;
         while (sv.seen.load(.acquire) < n) : (waited += 1) {
             if (waited >= 3000) return error.StandinNeverCalled;
@@ -1188,12 +1188,12 @@ const Standin = struct {
     }
 
     /// The first request, head and body. Complete once awaitSeen(1) has returned.
-    fn request(sv: *const Standin) []const u8 {
+    pub fn request(sv: *const Standin) []const u8 {
         return sv.req[0..sv.req_len];
     }
 
     /// Releases a held connection too. Dials its own port once, so a serve loop parked in accept wakes and exits.
-    fn stop(sv: *Standin) void {
+    pub fn stop(sv: *Standin) void {
         sv.closing.store(true, .release);
         const addr = Io.net.IpAddress{ .ip4 = .loopback(sv.port) };
         if (Io.net.IpAddress.connect(&addr, sv.io, .{ .mode = .stream })) |c| c.close(sv.io) else |_| {}

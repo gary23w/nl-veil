@@ -113,7 +113,7 @@ pub fn isCommand(sub: []const u8) bool {
         "sched",     "hub",           "doctor", "health",  "desktop",   "desk",
         "help",      "--help",        "-h",     "version", "--version", "exec-tool",
         "sync-read", "sync-manifest", "rag",    "themes",  "plugins",   "plug",
-        "model",     "dataset",       "set",
+        "model",     "dataset",       "set",    "lineage",
     };
     for (verbs) |v| if (std.mem.eql(u8, sub, v)) return true;
     return false;
@@ -158,6 +158,7 @@ pub fn dispatch(ctx: *Ctx, sub: []const u8, args: []const []const u8) u8 {
     if (std.mem.eql(u8, sub, "plugins") or std.mem.eql(u8, sub, "plug")) return cmdPlugins(ctx, args);
     if (std.mem.eql(u8, sub, "model")) return cmdModel(ctx, args);
     if (std.mem.eql(u8, sub, "dataset") or std.mem.eql(u8, sub, "set")) return cmdDataset(ctx, args);
+    if (std.mem.eql(u8, sub, "lineage")) return cmdLineage(ctx, args);
     std.debug.print("unknown command '{s}' — run `veil help`\n", .{sub});
     return 1;
 }
@@ -556,6 +557,96 @@ fn cmdList(ctx: *Ctx) u8 {
     }
     if (count == 0) out("(no swarms — deploy one with `veil cast \"<goal>\"`)\n", .{});
     return 0;
+}
+
+/// `veil lineage [ls] | show <id> | accept <id> <n> | reject <id> <n>` — what a lineage has learned, and the
+/// review of what its end-of-run judge and habit miner proposed (lineage_api.zig / proposals.zig). A proposal is
+/// named by its number in `show`; the server is sent its exact text, so a list that changed in between refuses
+/// the decision (404) instead of deciding a different proposal.
+fn cmdLineage(ctx: *Ctx, args: []const []const u8) u8 {
+    const lineage = @import("worker/lineage.zig");
+    const verb = if (args.len > 0) args[0] else "ls";
+    if (std.mem.eql(u8, verb, "ls") or std.mem.eql(u8, verb, "list")) {
+        const resp = call(ctx, "GET", "/api/v1/lineages", null, 30, true) catch return unreachable_msg(ctx);
+        defer if (resp.body.len > 0) ctx.gpa.free(resp.body);
+        if (resp.status != 200) {
+            std.debug.print("lineage list failed (HTTP {d}): {s}\n", .{ resp.status, resp.body[0..@min(resp.body.len, 200)] });
+            return 1;
+        }
+        var count: usize = 0;
+        var it = JsonObjs.init(resp.body);
+        out("{s: <24}  {s: >7}  {s: >6}  {s: >8}  {s: >7}  {s: >8}\n", .{ "LINEAGE", "LESSONS", "SKILLS", "PLAYBOOK", "PENDING", "REJECTED" });
+        while (it.next()) |obj| {
+            const id = jsonStr(ctx.gpa, obj, "id") orelse continue;
+            defer ctx.gpa.free(id);
+            out("{s: <24}  {d: >7}  {d: >6}  {d: >8}  {d: >7}  {d: >8}\n", .{ id, jsonNum(obj, "lessons"), jsonNum(obj, "skills"), jsonNum(obj, "playbook"), jsonNum(obj, "pending"), jsonNum(obj, "rejected") });
+            count += 1;
+        }
+        if (count == 0) out("(no lineages - start one with `veil cast \"<goal>\" --lineage <id>`)\n", .{});
+        return 0;
+    }
+    const is_show = std.mem.eql(u8, verb, "show");
+    const is_accept = std.mem.eql(u8, verb, "accept");
+    const is_reject = std.mem.eql(u8, verb, "reject");
+    if (!(is_show or is_accept or is_reject) or args.len < 2 or (!is_show and args.len < 3)) {
+        out("usage: veil lineage [ls] | show <id> | accept <id> <n> | reject <id> <n>\n", .{});
+        return 1;
+    }
+    var sb: [96]u8 = undefined;
+    const slug = lineage.slug(args[1], &sb);
+    var pb: [200]u8 = undefined;
+    const path = std.fmt.bufPrint(&pb, "/api/v1/lineages/{s}/proposals", .{slug}) catch return 1;
+    const resp = call(ctx, "GET", path, null, 30, true) catch return unreachable_msg(ctx);
+    defer if (resp.body.len > 0) ctx.gpa.free(resp.body);
+    if (resp.status == 404) {
+        std.debug.print("no lineage '{s}'\n", .{slug});
+        return 1;
+    }
+    if (resp.status != 200) {
+        std.debug.print("lineage show failed (HTTP {d}): {s}\n", .{ resp.status, resp.body[0..@min(resp.body.len, 200)] });
+        return 1;
+    }
+    const want: usize = if (is_show) 0 else std.fmt.parseInt(usize, args[2], 10) catch {
+        out("<n> is a proposal number from `veil lineage show {s}`\n", .{slug});
+        return 1;
+    };
+    var n: usize = 0;
+    var it = JsonObjs.init(resp.body);
+    while (it.next()) |obj| {
+        n += 1;
+        const kind = jsonStr(ctx.gpa, obj, "kind") orelse continue;
+        defer ctx.gpa.free(kind);
+        const text = jsonStr(ctx.gpa, obj, "text") orelse continue;
+        defer ctx.gpa.free(text);
+        if (is_show) {
+            out("{d: >3}. [{s}] {s}\n", .{ n, kind, text });
+            continue;
+        }
+        if (n != want) continue;
+        const scope = jsonStr(ctx.gpa, obj, "scope") orelse return 1;
+        defer ctx.gpa.free(scope);
+        var jb: std.ArrayListUnmanaged(u8) = .empty;
+        defer jb.deinit(ctx.gpa);
+        jb.appendSlice(ctx.gpa, "{\"action\":") catch return 1;
+        jstr(ctx.gpa, &jb, if (is_accept) "accept" else "reject");
+        appendStr(ctx.gpa, &jb, "scope", scope);
+        appendStr(ctx.gpa, &jb, "text", text);
+        jb.append(ctx.gpa, '}') catch return 1;
+        const r2 = call(ctx, "POST", path, jb.items, 30, true) catch return unreachable_msg(ctx);
+        defer if (r2.body.len > 0) ctx.gpa.free(r2.body);
+        if (r2.status != 200) {
+            std.debug.print("{s} failed (HTTP {d}): {s}\n", .{ verb, r2.status, r2.body[0..@min(r2.body.len, 200)] });
+            return 1;
+        }
+        out("{s} [{s}] {s}\n", .{ if (is_accept) "promoted" else "rejected", kind, text[0..@min(text.len, 120)] });
+        return 0;
+    }
+    if (is_show) {
+        if (n == 0) out("(nothing pending review in '{s}')\n", .{slug});
+        return 0;
+    }
+    std.debug.print("no proposal {d} in '{s}' ({d} pending)\n", .{ want, slug, n });
+    return 1;
 }
 
 fn cmdStop(ctx: *Ctx, args: []const []const u8) u8 {
@@ -1051,6 +1142,9 @@ fn cmdHelp() u8 {
         \\  stop <id>                    ask a swarm to stop
         \\  rm <id>                      stop and remove a swarm
         \\  events <id> [--follow]       stream a swarm's event log
+        \\  lineage [ls]                 lineages: what each has learned + how many proposals await review
+        \\  lineage show <id>            the end-of-run judge's and habit miner's quarantined proposals
+        \\  lineage accept|reject <id> <n>  promote proposal n into the live memory, or reject it for good
         \\
         \\CHAT (the server-side veil brain)
         \\  chat [conv]                  interactive chat; steer/stop a running turn inline

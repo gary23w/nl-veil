@@ -212,6 +212,25 @@ pub fn schedUpdate(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8,
     return httpReq(io, gpa, "POST", port, path, token, body_json, 15);
 }
 
+/// GET /api/v1/lineages — this account's swarm lineages with their live and pending-review counts.
+pub fn lineageList(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8) ?Resp {
+    return httpReq(io, gpa, "GET", port, "/api/v1/lineages", token, null, 15);
+}
+
+/// GET /api/v1/lineages/<slug>/proposals — one lineage's quarantined proposals.
+pub fn lineageProposals(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8, slug: []const u8) ?Resp {
+    var pbuf: [160]u8 = undefined;
+    const path = std.fmt.bufPrint(&pbuf, "/api/v1/lineages/{s}/proposals", .{slug}) catch return null;
+    return httpReq(io, gpa, "GET", port, path, token, null, 15);
+}
+
+/// POST /api/v1/lineages/<slug>/proposals {"action","scope","text"} — accept (promote) or reject one proposal.
+pub fn lineageDecide(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8, slug: []const u8, body_json: []const u8) ?Resp {
+    var pbuf: [160]u8 = undefined;
+    const path = std.fmt.bufPrint(&pbuf, "/api/v1/lineages/{s}/proposals", .{slug}) catch return null;
+    return httpReq(io, gpa, "POST", port, path, token, body_json, 15);
+}
+
 /// DELETE /api/v1/sched/<id> — remove one scheduled task.
 pub fn schedDelete(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8, id: []const u8) ?Resp {
     log.trace("netcli.schedDelete port={d} id={s}", .{ port, id });

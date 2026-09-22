@@ -18,6 +18,7 @@ const App = http.App;
 
 const auth_api = @import("auth/auth_api.zig");
 const deploy_service = @import("worker/deploy/service.zig");
+const lineage_api = @import("worker/deploy/lineage_api.zig");
 const tail_fanout = @import("worker/control/fanout.zig");
 const control_writer = @import("worker/control/writer.zig");
 const chat_tools = @import("worker/chat/tools.zig");
@@ -781,6 +782,11 @@ pub fn main(init: std.process.Init) !void {
     router.post("/api/v1/swarms", deploy_service.deploy, .{});
     router.post("/api/v1/swarms/resolve", deploy_service.resolve, .{});
     router.get("/api/v1/swarms", deploy_service.listSwarms, .{});
+    // LINEAGES: what a cross-run memory has learned, and the review of what its end-of-run judge and habit
+    // miner proposed (quarantine -> accept promotes into the live scope, reject is remembered so it is not re-minted).
+    router.get("/api/v1/lineages", lineage_api.listLineages, .{});
+    router.get("/api/v1/lineages/:id/proposals", lineage_api.listProposals, .{});
+    router.post("/api/v1/lineages/:id/proposals", lineage_api.decideProposal, .{});
     router.post("/api/v1/keys", keys_api.putKey, .{});
     router.get("/api/v1/keys", keys_api.listKeys, .{});
     router.delete("/api/v1/keys/:provider", keys_api.delKey, .{});
@@ -1711,6 +1717,7 @@ const ROUTE_MODS = [_]struct { alias: []const u8, src: []const u8 }{
     .{ .alias = "auth_api", .src = @embedFile("auth/auth_api.zig") },
     .{ .alias = "cf_tunnel", .src = @embedFile("config/cf_tunnel.zig") },
     .{ .alias = "deploy_service", .src = @embedFile("worker/deploy/service.zig") },
+    .{ .alias = "lineage_api", .src = @embedFile("worker/deploy/lineage_api.zig") },
     .{ .alias = "tail_fanout", .src = @embedFile("worker/control/fanout.zig") },
     .{ .alias = "control_writer", .src = @embedFile("worker/control/writer.zig") },
     .{ .alias = "chat_tools", .src = @embedFile("worker/chat/tools.zig") },
