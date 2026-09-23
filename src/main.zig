@@ -925,7 +925,7 @@ pub fn main(init: std.process.Init) !void {
     // server on this machine, and it is a file readable only by this OS user — the port being open to
     // the LAN does not make a local file more reachable. Gating it on the bind address meant that
     // turning on network access silently broke every same-machine client.
-    preloadDesktopKey(gpa, io, &auth, &api_keys, init.environ_map, paths.data, admin_pw);
+    preloadDesktopKey(gpa, io, &auth, &api_keys, init.environ_map, paths.data);
     // Carry a pre-split install's stored credentials into the per-user store, once. uid 1 by
     // construction: next_id starts at 1 and the admin is the first account seeded, which is the same
     // assumption engine.zig's legacy read-fallback already makes.
@@ -1125,14 +1125,16 @@ fn migrateLegacyMemories(gpa: std.mem.Allocator, io: std.Io, data: []const u8, a
     log.info("migrated the durable memory store into u{d}/.veil-desk/ ({d} bytes); the original is kept as a backup", .{ admin_uid, body.len });
 }
 
-fn preloadDesktopKey(gpa: std.mem.Allocator, io: std.Io, auth: *Auth, keys: *@import("auth/api_keys.zig").ApiKeys, environ: *std.process.Environ.Map, data: []const u8, admin_pw: ?[]const u8) void {
+fn preloadDesktopKey(gpa: std.mem.Allocator, io: std.Io, auth: *Auth, keys: *@import("auth/api_keys.zig").ApiKeys, environ: *std.process.Environ.Map, data: []const u8) void {
     // Written unconditionally so the desktop and the CLI connect whether the server was auto-started or
     // launched later. It is a same-user local file; the port being open to the LAN does not change that.
     //
-    // `admin_pw` is the password that was ACTUALLY seeded, passed in rather than re-read from the
-    // environment. It used to assume "changeme", which quietly stopped being true the moment an unset
-    // password started being generated: the login below failed, the key was never written, and the desk
-    // and CLI lost their local auth with nothing in the log to say why.
+    // The key is minted for the admin ACCOUNT, found by email - never by logging in with a password. The
+    // login used to need the password in force, which this boot only knows when it seeded or generated it:
+    // a loopback-only boot (NL_BIND=127.0.0.1, no NL_ADMIN_PASSWORD) assumed "changeme", an install whose
+    // admin had a generated or user-chosen password answered BadCredentials, and the desk and CLI lost their
+    // local auth for good once the file went stale (seen 2026-09-22). A password proves nothing here: this
+    // process owns <data>, which holds auth.sqlite and admin-password.txt already.
     const path = std.fmt.allocPrint(gpa, "{s}/.desktop_key", .{data}) catch return;
     defer gpa.free(path);
     // reuse an existing valid key
@@ -1148,14 +1150,11 @@ fn preloadDesktopKey(gpa: std.mem.Allocator, io: std.Io, auth: *Auth, keys: *@im
         }
     } else |_| {}
     const email = environ.get("NL_ADMIN_EMAIL") orelse DEFAULT_ADMIN_EMAIL;
-    const pw = admin_pw orelse "changeme"; // null = nothing was seeded, so the shipped default stands
-    const tok = auth.login(email, pw) catch |e| {
-        log.warn("veil-desk: could not mint the local API key ({t}) — the desk and `veil <verb>` will ask for auth", .{e});
+    const uid = auth.idForEmail(email) orelse {
+        log.warn("veil-desk: no admin account {s} to mint the local API key for — the desk and `veil <verb>` will ask for auth", .{email});
         return;
     };
-    defer gpa.free(tok);
-    const u = auth.whoami(tok) orelse return;
-    const key = keys.create(u.id, "veil-desk") catch return;
+    const key = keys.create(uid, "veil-desk") catch return;
     defer gpa.free(key);
     // create() files the record fail-open; a key that never reached the store dies with this process, and
     // writing it would replace whatever the file held with a key that is invalid after the next restart.
@@ -2036,4 +2035,45 @@ test "the listen port: a second server cannot share it, and a stopped server's p
     if (rebound) again.stop();
     again_thread.join();
     try std.testing.expect(rebound);
+}
+
+test "the desktop key is minted for the admin account whatever its password, and a stale file is replaced" {
+    // preloadDesktopKey used to LOG IN to find the admin, with the password this boot happened to know: a
+    // loopback-only boot assumed "changeme", so an install whose admin had a generated password answered
+    // BadCredentials and the desk and CLI stayed locked out once the key file went stale (2026-09-22).
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const ApiKeys = @import("auth/api_keys.zig").ApiKeys;
+    var ta = try http.testApp(gpa, io, "zig-desktop-key-tmp");
+    defer ta.deinit();
+    std.Io.Dir.cwd().access(io, "bin/neuron.exe", .{}) catch std.Io.Dir.cwd().access(io, "bin/neuron", .{}) catch return error.SkipZigTest;
+
+    ta.auth.register(DEFAULT_ADMIN_EMAIL, "a generated password, not changeme") catch return error.SkipZigTest;
+    const admin = ta.auth.idForEmail(DEFAULT_ADMIN_EMAIL) orelse return error.TestUnexpectedResult;
+    var keys = ApiKeys.init(gpa, Neuron.init(gpa, io, if (@import("builtin").os.tag == .windows) "bin/neuron.exe" else "bin/neuron", ta.db));
+    defer {
+        var it = keys.keys.iterator();
+        while (it.next()) |e| {
+            gpa.free(e.key_ptr.*);
+            gpa.free(e.value_ptr.name);
+            gpa.free(e.value_ptr.prefix);
+        }
+        keys.keys.deinit(gpa);
+    }
+    try keys.warm();
+    if (!keys.loaded) return error.SkipZigTest; // store unusable on this box
+    const STALE = "nlk_0000000000000000000000000000000000000000000000000";
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = "zig-desktop-key-tmp/.desktop_key", .data = STALE });
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+
+    preloadDesktopKey(gpa, io, &ta.auth, &keys, &env, "zig-desktop-key-tmp");
+
+    const got = try std.Io.Dir.cwd().readFileAlloc(io, "zig-desktop-key-tmp/.desktop_key", gpa, .limited(256));
+    defer gpa.free(got);
+    try std.testing.expect(!std.mem.eql(u8, got, STALE));
+    try std.testing.expectEqual(@as(?u64, admin), keys.verify(got));
+    try std.testing.expect(keys.persisted(got));
 }
