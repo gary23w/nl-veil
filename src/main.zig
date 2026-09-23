@@ -785,6 +785,7 @@ pub fn main(init: std.process.Init) !void {
     // LINEAGES: what a cross-run memory has learned, and the review of what its end-of-run judge and habit
     // miner proposed (quarantine -> accept promotes into the live scope, reject is remembered so it is not re-minted).
     router.get("/api/v1/lineages", lineage_api.listLineages, .{});
+    router.get("/api/v1/lineages/:id", lineage_api.lineageDetail, .{});
     router.get("/api/v1/lineages/:id/proposals", lineage_api.listProposals, .{});
     router.post("/api/v1/lineages/:id/proposals", lineage_api.decideProposal, .{});
     router.post("/api/v1/keys", keys_api.putKey, .{});
