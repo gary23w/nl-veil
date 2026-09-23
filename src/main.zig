@@ -18,6 +18,7 @@ const App = http.App;
 
 const auth_api = @import("auth/auth_api.zig");
 const deploy_service = @import("worker/deploy/service.zig");
+const lineage_api = @import("worker/deploy/lineage_api.zig");
 const tail_fanout = @import("worker/control/fanout.zig");
 const control_writer = @import("worker/control/writer.zig");
 const chat_tools = @import("worker/chat/tools.zig");
@@ -781,6 +782,11 @@ pub fn main(init: std.process.Init) !void {
     router.post("/api/v1/swarms", deploy_service.deploy, .{});
     router.post("/api/v1/swarms/resolve", deploy_service.resolve, .{});
     router.get("/api/v1/swarms", deploy_service.listSwarms, .{});
+    // LINEAGES: what a cross-run memory has learned, and the review of what its end-of-run judge and habit
+    // miner proposed (quarantine -> accept promotes into the live scope, reject is remembered so it is not re-minted).
+    router.get("/api/v1/lineages", lineage_api.listLineages, .{});
+    router.get("/api/v1/lineages/:id/proposals", lineage_api.listProposals, .{});
+    router.post("/api/v1/lineages/:id/proposals", lineage_api.decideProposal, .{});
     router.post("/api/v1/keys", keys_api.putKey, .{});
     router.get("/api/v1/keys", keys_api.listKeys, .{});
     router.delete("/api/v1/keys/:provider", keys_api.delKey, .{});
@@ -1133,6 +1139,13 @@ fn preloadDesktopKey(gpa: std.mem.Allocator, io: std.Io, auth: *Auth, keys: *@im
     if (std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(256))) |old| {
         defer gpa.free(old);
         if (keys.verify(std.mem.trim(u8, old, " \r\n\t")) != null) return;
+        // A store that could not be READ verifies nothing, so "not valid" means "not known" here. Replacing the
+        // file then destroyed a working key: the desk and the CLI lost their auth although the key was still on
+        // record (seen 2026-09-22 with two servers on one data dir). Keep the file; the next clean boot decides.
+        if (!keys.loaded) {
+            log.warn("veil-desk: the key store could not be read; keeping the existing <data>/.desktop_key", .{});
+            return;
+        }
     } else |_| {}
     const email = environ.get("NL_ADMIN_EMAIL") orelse DEFAULT_ADMIN_EMAIL;
     const pw = admin_pw orelse "changeme"; // null = nothing was seeded, so the shipped default stands
@@ -1144,6 +1157,12 @@ fn preloadDesktopKey(gpa: std.mem.Allocator, io: std.Io, auth: *Auth, keys: *@im
     const u = auth.whoami(tok) orelse return;
     const key = keys.create(u.id, "veil-desk") catch return;
     defer gpa.free(key);
+    // create() files the record fail-open; a key that never reached the store dies with this process, and
+    // writing it would replace whatever the file held with a key that is invalid after the next restart.
+    if (!keys.persisted(key)) {
+        log.warn("veil-desk: the new local API key could not be stored; <data>/.desktop_key left unchanged", .{});
+        return;
+    }
     std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = key }) catch return;
     log.info("veil-desk: preloaded an admin API key at <data>/.desktop_key (localhost)", .{});
 }
@@ -1711,6 +1730,7 @@ const ROUTE_MODS = [_]struct { alias: []const u8, src: []const u8 }{
     .{ .alias = "auth_api", .src = @embedFile("auth/auth_api.zig") },
     .{ .alias = "cf_tunnel", .src = @embedFile("config/cf_tunnel.zig") },
     .{ .alias = "deploy_service", .src = @embedFile("worker/deploy/service.zig") },
+    .{ .alias = "lineage_api", .src = @embedFile("worker/deploy/lineage_api.zig") },
     .{ .alias = "tail_fanout", .src = @embedFile("worker/control/fanout.zig") },
     .{ .alias = "control_writer", .src = @embedFile("worker/control/writer.zig") },
     .{ .alias = "chat_tools", .src = @embedFile("worker/chat/tools.zig") },

@@ -71,6 +71,8 @@ test {
     _ = @import("worker/gemma4.zig"); // gemma4 wire format: byte-exact vs the model's own chat template
     _ = @import("worker/httpc.zig");
     _ = @import("worker/hyperspace.zig");
+    _ = @import("worker/proposals.zig"); // lineage proposal review: accept promotes, reject is remembered
+    _ = @import("worker/deploy/lineage_api.zig"); // /api/v1/lineages review routes
     _ = @import("worker/lineage.zig"); // cross-run persistent swarm memory (stable neuron-db identity)
     _ = @import("worker/llm.zig");
     _ = @import("worker/locs/atlas.zig");

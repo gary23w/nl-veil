@@ -654,6 +654,9 @@ pub fn runJudge(w: *Worker) void {
     defer gpa.free(pend_l);
     const pend_s = w.mem.list(tools.SKILL_PROPOSED_SCOPE);
     defer gpa.free(pend_s);
+    // what review already turned down (proposals.zig) — a lineage would otherwise re-mint it every run
+    const rejected = w.mem.list(tools.PROPOSAL_REJECTED_SCOPE);
+    defer gpa.free(rejected);
     const sys =
         "You are an EXTERNAL REVIEWER for a multi-mind agent run, reading a TRACE of what actually happened. " ++
         "act rows are REAL tool executions with their REAL results (exit codes and error text live inside the result strings); score rows are the engine's measured benchmark. " ++
@@ -679,6 +682,9 @@ pub fn runJudge(w: *Worker) void {
         \\{s}
         \\{s}
         \\
+        \\REJECTED IN REVIEW (never re-propose these either):
+        \\{s}
+        \\
         \\TRACE (newest last):
         \\{s}
     , .{
@@ -686,6 +692,7 @@ pub fn runJudge(w: *Worker) void {
         if (lessons.len > 0) clipTail(lessons, 700) else "(none)",
         if (pend_l.len > 0) clipTail(pend_l, 400) else "(none)",
         if (pend_s.len > 0) clipTail(pend_s, 400) else "",
+        if (rejected.len > 0) clipTail(rejected, 400) else "(none)",
         tr.items,
     }) catch return;
     defer gpa.free(user);

@@ -105,7 +105,8 @@
       { p: 'worker/control/fanout', c: 'CT-03', t: 'Event fanout — swarm events.jsonl cursor + SSE stream', s: 'control/fanout.zig' },
       { p: 'worker/evcursor', c: 'CT-06', t: 'Event cursor — the poll contract both events endpoints share', s: 'evcursor.zig' },
       { p: 'worker/deploy/service', c: 'CT-04', t: 'Deploy service — cast/deploy + swarm files and lifecycle', s: 'deploy/service.zig' },
-      { p: 'worker/neuron/client', c: 'CT-05', t: 'Neuron client — the neuron-db memory bridge (fail-open)', s: 'neuron/client.zig' }
+      { p: 'worker/neuron/client', c: 'CT-05', t: 'Neuron client — the neuron-db memory bridge (fail-open)', s: 'neuron/client.zig' },
+      { p: 'worker/deploy/lineage_api', c: 'CT-07', t: 'Lineage API — list lineages, review their quarantined proposals', s: 'deploy/lineage_api.zig' }
     ]},
     { key: 'worker/', label: 'WORKER — THE YARDS (runtime)', docs: [
       { p: 'worker/run', c: 'WK-01', t: 'Run — the hive worker process, the per-round tick loop', s: 'run.zig' },
@@ -139,7 +140,8 @@
       { p: 'worker/net', c: 'WK-29', t: 'Net — cached offline probe behind the hosted fast-fail', s: 'net.zig' },
       { p: 'worker/wsock', c: 'WK-30', t: 'Wsock — blocking Winsock round trip under httpc on Windows', s: 'wsock.zig' },
       { p: 'worker/dataset', c: 'WK-31', t: 'Dataset — every LLM call and tool run captured as a fine-tuning set', s: 'dataset.zig' },
-      { p: 'worker/portprobe', c: 'WK-32', t: 'Portprobe — is a port held: the Windows answer std listen cannot give', s: 'portprobe.zig' }
+      { p: 'worker/portprobe', c: 'WK-32', t: 'Portprobe — is a port held: the Windows answer std listen cannot give', s: 'portprobe.zig' },
+      { p: 'worker/proposals', c: 'WK-33', t: 'Proposals — accept or reject what a lineage proposed: lessons, skills, habits', s: 'proposals.zig' }
     ]},
     { key: 'desk/', label: 'DESK — THE NATIVE DASHBOARD (veil-desk)', note: 'zig + raylib', docs: [
       { p: 'desk/main', c: 'DK-01', t: 'Entry point — borderless raylib window, render loop, tabs', s: 'main.zig' },

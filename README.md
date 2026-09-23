@@ -698,6 +698,9 @@ SWARMS
   stop <id>                    ask a swarm to stop
   rm <id>                      stop and remove a swarm
   events <id> [--follow]       stream a swarm's event log  (aliases: logs, watch)
+  lineage [ls]                 lineages: what each has learned + how many proposals await review
+  lineage show <id>            the end-of-run judge's and habit miner's quarantined proposals
+  lineage accept|reject <id> <n>  promote proposal n into the live memory, or reject it for good
 
 CHAT (the server-side veil brain)
   chat [conv]                  interactive REPL; a line typed mid-turn steers the running turn
@@ -1070,6 +1073,11 @@ model's own claims:
   *sequences* per mind — zero extra model calls, folded from records it already keeps — and proposes the
   frequent ones into a quarantine. Nothing auto-registers, auto-runs, or reaches a prompt; promotion is
   a reviewed step like every other proposal.
+- **Review closes the loop across casts.** Under a lineage, the end-of-run judge's lessons and skills and
+  the mined habits wait in the lineage's quarantine until someone decides: `veil lineage show <id>`, then
+  `veil lineage accept|reject <id> <n>`, or keep/drop on the card in the desktop's Memory pane. An accepted
+  proposal goes into the live memory the next cast of that lineage recalls; a rejected one is remembered so
+  the judge and the miner do not propose it again. The same habit no longer comes back every run as a new line.
 - **A round that breaks one check while fixing another is visible.** The score is an aggregate, so that
   round used to read as "no change" to every loop watching it. The best-known-good build's failure set
   is now the champion and each later round the challenger, so a new break is reported even when the

@@ -39,6 +39,7 @@ const locs = @import("locs/atlas.zig");
 const ragmirror = @import("ragmirror.zig");
 const toolchain = @import("toolchain.zig");
 const lineage = @import("lineage.zig");
+const proposals = @import("proposals.zig");
 const cctx = @import("chat/context.zig");
 const cync = @import("chat/sync.zig"); // the chat engine's synced marker, which a worker entering a run dir drops
 
@@ -2901,11 +2902,20 @@ fn recordHabit(w: *Worker, moment: *const Moment) void {
 /// sequence into a runnable recipe; nothing here auto-registers or auto-runs one.
 fn proposeHabits(w: *Worker) void {
     if (!w.habit_mine) return;
+    // Under a lineage the same sequence recurs run after run: skip one already pending, rejected, or promoted
+    // (proposals.habitKnown), or the quarantine grows a new "ran Nx" line for it every run.
+    const pending = w.mem.list(tools.HABIT_PROPOSED_SCOPE);
+    defer w.gpa.free(pending);
+    const rejected = w.mem.list(tools.PROPOSAL_REJECTED_SCOPE);
+    defer w.gpa.free(rejected);
+    const skills = w.mem.list(tools.SKILL_SCOPE);
+    defer w.gpa.free(skills);
     var proposed: usize = 0;
     var i: usize = 0;
     while (i < w.habit_n and proposed < 5) : (i += 1) {
         const h = &w.habits[i];
         if (h.count < 3) continue;
+        if (proposals.habitKnown(h.seq[0..h.len], pending, rejected, skills)) continue;
         const line = std.fmt.allocPrint(w.gpa, "habit: {s} (a mind ran this sequence {d}x this run) | evidence: recurring successful tool sequence", .{ h.seq[0..h.len], h.count }) catch continue;
         defer w.gpa.free(line);
         _ = w.mem.observe(tools.HABIT_PROPOSED_SCOPE, line);
