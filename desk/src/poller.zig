@@ -55,6 +55,8 @@ pub const Poller = struct {
     last_sched_s: i64 = 0,
     sched_scratch: [store_mod.MAX_SCHED]store_mod.SchedRow = undefined,
     last_llm_s: i64 = 0, // LLM-usage metrics poll throttle (Dashboard aggregates move slowly)
+    last_lin_s: i64 = 0, // swarm-lineage proposal poll throttle (0 = next tick; a keep/drop resets it)
+    lin_scratch: [store_mod.MAX_LIN_PROPS]store_mod.LinPropRow = undefined,
     // idle-churn gates: the roster walk + the selected swarm's Details/Files sub-scans ran EVERY second
     // forever; these cache the last result so an idle desk touches the filesystem every 5-10s instead.
     last_roster_s: i64 = 0, // last full data-dir roster walk (0 = force next tick; deploy/delete reset it)
@@ -174,6 +176,8 @@ pub const Poller = struct {
                 .builtin_check => self.doBuiltinVerb(.check),
                 .dataset_start => self.doDataset(true, c.textStr()),
                 .dataset_stop => self.doDataset(false, ""),
+                .lineage_accept => self.doLineageDecide(c.idStr(), c.textStr(), true),
+                .lineage_reject => self.doLineageDecide(c.idStr(), c.textStr(), false),
             }
         }
     }
@@ -697,6 +701,13 @@ pub const Poller = struct {
             self.refreshSched();
         }
 
+        // 1b'') swarm-lineage proposals awaiting review (Memory pane). Slow: they only appear when a cast ends,
+        // and each lineage listed costs the server a few neuron subprocesses.
+        if (online and now_s - self.last_lin_s >= 30) {
+            self.last_lin_s = now_s;
+            self.refreshLineageProps();
+        }
+
         // 1b') LLM usage metrics for the Dashboard — a slower cadence (the aggregates only move when a turn
         // finishes, and the server re-reads its whole metrics file per GET).
         if (online and now_s - self.last_llm_s >= 12) {
@@ -935,6 +946,59 @@ pub const Poller = struct {
         self.store.sched_count = n;
         self.store.sched_seen = true;
         self.store.sched_denied = false;
+    }
+
+    /// GET /api/v1/lineages, then /proposals for each lineage with anything pending → publish LinPropRows under
+    /// one lock. Unreachable/failed polls keep the last rows (carry-forward, like refreshSched). A server that
+    /// predates the lineage routes answers 404 → no rows.
+    fn refreshLineageProps(self: *Poller) void {
+        var tbuf: [128]u8 = undefined;
+        const tok = self.tokenSnap(&tbuf);
+        const list = netcli.lineageList(self.io, self.gpa, self.port(), tok) orelse return;
+        defer if (list.body.len > 0) self.gpa.free(list.body);
+        if (list.status != 200) {
+            if (list.status == 404 or list.status == 401 or list.status == 403) self.publishLinProps(0);
+            return;
+        }
+        const n = collectLinProps(self.io, self.gpa, self.port(), tok, list.body, &self.lin_scratch) orelse return;
+        self.publishLinProps(n);
+    }
+
+    fn publishLinProps(self: *Poller, n: usize) void {
+        self.store.lock();
+        defer self.store.unlock();
+        @memcpy(self.store.lin_props[0..n], self.lin_scratch[0..n]);
+        self.store.lin_prop_count = n;
+    }
+
+    /// Accept (promote) or reject one lineage proposal. `packed_text` is "<scope>\n<exact stored text>".
+    fn doLineageDecide(self: *Poller, slug: []const u8, packed_text: []const u8, accept: bool) void {
+        const nl = std.mem.indexOfScalar(u8, packed_text, '\n') orelse return;
+        const scope = packed_text[0..nl];
+        const text = packed_text[nl + 1 ..];
+        if (slug.len == 0 or text.len == 0) return;
+        var jb: std.ArrayListUnmanaged(u8) = .empty;
+        defer jb.deinit(self.gpa);
+        jb.appendSlice(self.gpa, if (accept) "{\"action\":\"accept\",\"scope\":\"" else "{\"action\":\"reject\",\"scope\":\"") catch return;
+        appendEsc(&jb, self.gpa, scope);
+        jb.appendSlice(self.gpa, "\",\"text\":\"") catch return;
+        appendEsc(&jb, self.gpa, text);
+        jb.appendSlice(self.gpa, "\"}") catch return;
+        var tbuf: [128]u8 = undefined;
+        const tok = self.tokenSnap(&tbuf);
+        const resp = netcli.lineageDecide(self.io, self.gpa, self.port(), tok, slug, jb.items) orelse {
+            self.store.pushNotif("Review failed", "server unreachable - is it running?", 2);
+            return;
+        };
+        defer if (resp.body.len > 0) self.gpa.free(resp.body);
+        if (resp.status >= 200 and resp.status < 300) {
+            self.store.pushNotif(if (accept) "Lesson promoted" else "Proposal rejected", slug, 1);
+        } else if (resp.status == 404) {
+            self.store.pushNotif("Already decided", "that proposal is no longer pending", 1);
+        } else {
+            self.store.pushNotif("Review rejected", slug, 2);
+        }
+        self.last_lin_s = 0; // re-list on the next tick: the row must reflect the server truth
     }
 
     /// GET /api/v1/metrics/llm → publish per-model aggregates + the 14-day series for the Dashboard. A
@@ -1623,6 +1687,63 @@ fn parseLlmDay(obj: []const u8, day: *store_mod.LlmDay) void {
     }
 }
 
+/// Walk a /api/v1/lineages body; for each lineage with pending > 0, fetch its proposals into `out`. Returns
+/// the row count, or null when a proposals fetch was unreachable (keep the last rows rather than blank them).
+fn collectLinProps(io: std.Io, gpa: std.mem.Allocator, port: u16, tok: []const u8, list_body: []const u8, out: []store_mod.LinPropRow) ?usize {
+    const arr = std.mem.indexOf(u8, list_body, "\"lineages\":[") orelse return 0;
+    var cur = arr + "\"lineages\":[".len;
+    var n: usize = 0;
+    while (n < out.len) {
+        const obj = scan.nextJsonObj(list_body, &cur) orelse break;
+        var slug_buf: [64]u8 = undefined;
+        var slug: []const u8 = "";
+        var pending: i64 = 0;
+        var pc: usize = 0;
+        while (scan.nextJsonPair(obj, &pc)) |p| {
+            if (p.is_str and std.mem.eql(u8, p.key, "id")) slug = scan.unescapeInto(p.raw, &slug_buf);
+            if (!p.is_str and std.mem.eql(u8, p.key, "pending")) pending = std.fmt.parseInt(i64, p.raw, 10) catch 0;
+        }
+        if (slug.len == 0 or pending <= 0) continue;
+        const resp = netcli.lineageProposals(io, gpa, port, tok, slug) orelse return null;
+        defer if (resp.body.len > 0) gpa.free(resp.body);
+        if (resp.status != 200) continue;
+        n += parseLinProps(resp.body, slug, out[n..]);
+    }
+    return n;
+}
+
+/// One lineage's /proposals body → rows. A text too long for the row is SKIPPED rather than clipped: the
+/// server decides by exact text, so a clipped row could only ever answer "no such pending proposal". Pure.
+fn parseLinProps(body: []const u8, slug: []const u8, out: []store_mod.LinPropRow) usize {
+    const arr = std.mem.indexOf(u8, body, "\"proposals\":[") orelse return 0;
+    var cur = arr + "\"proposals\":[".len;
+    var n: usize = 0;
+    while (n < out.len) {
+        const obj = scan.nextJsonObj(body, &cur) orelse break;
+        var row: store_mod.LinPropRow = .{};
+        const sl = @min(slug.len, row.lineage.len);
+        @memcpy(row.lineage[0..sl], slug[0..sl]);
+        row.lineage_len = @intCast(sl);
+        var fits = true;
+        var pc: usize = 0;
+        while (scan.nextJsonPair(obj, &pc)) |p| {
+            if (!p.is_str) continue;
+            if (std.mem.eql(u8, p.key, "scope")) {
+                row.scope_len = @intCast(scan.unescapeInto(p.raw, &row.scope).len);
+            } else if (std.mem.eql(u8, p.key, "kind")) {
+                row.kind = if (std.mem.eql(u8, p.raw, "skill")) 1 else if (std.mem.eql(u8, p.raw, "habit")) 2 else 0;
+            } else if (std.mem.eql(u8, p.key, "text")) {
+                if (p.raw.len > row.text.len) fits = false;
+                row.text_len = @intCast(scan.unescapeInto(p.raw, &row.text).len);
+            }
+        }
+        if (!fits or row.text_len == 0 or row.scope_len == 0) continue;
+        out[n] = row;
+        n += 1;
+    }
+    return n;
+}
+
 fn parseSchedTask(obj: []const u8, row: *store_mod.SchedRow) void {
     var cur: usize = 0;
     while (scan.nextJsonPair(obj, &cur)) |p| {
@@ -2076,4 +2197,71 @@ test "a run whose id is wider than 64 bytes is selected, tailed from its own dir
     try std.testing.expectEqual(@as(usize, 1), p.stopped_n); // recorded once, not once per stopped tick
     // and the ticks really stayed off the network: the fleet GET neither counted a miss nor adopted a success
     try std.testing.expect(p.miss_streak == 0 and !s.server_online);
+}
+
+test "parseLinProps: rows carry the lineage, scope, kind and the exact unescaped text; an oversize text is skipped, never clipped" {
+    var out: [4]store_mod.LinPropRow = undefined;
+    var big: [1200]u8 = undefined;
+    @memset(&big, 'x');
+    var bb: [1600]u8 = undefined;
+    const body = try std.fmt.bufPrint(&bb,
+        \\{{"proposals":[{{"scope":"lessons-proposed","kind":"lesson","text":"Quote \"exactly\" before rounding | evidence: rows 3-5"}},{{"scope":"skills-proposed","kind":"skill","text":"{s}"}},{{"scope":"habits-proposed","kind":"habit","text":"habit: read_file>edit_file (a mind ran this sequence 3x this run) | evidence: recurring successful tool sequence"}}]}}
+    , .{big[0..]});
+    const n = parseLinProps(body, "proj", &out);
+    try std.testing.expectEqual(@as(usize, 2), n); // the 1200-byte skill could only ever be refused by the server
+    try std.testing.expectEqualStrings("proj", out[0].lineageStr());
+    try std.testing.expectEqualStrings("lessons-proposed", out[0].scopeStr());
+    try std.testing.expectEqual(@as(u8, 0), out[0].kind);
+    try std.testing.expectEqualStrings("Quote \"exactly\" before rounding | evidence: rows 3-5", out[0].textStr());
+    try std.testing.expectEqual(@as(u8, 2), out[1].kind);
+    try std.testing.expectEqualStrings("habits-proposed", out[1].scopeStr());
+    // a server without the route (or with nothing pending) yields no rows
+    try std.testing.expectEqual(@as(usize, 0), parseLinProps("{\"ok\":false,\"err\":\"not found\"}", "proj", &out));
+}
+
+test "a lineage keep posts the exact proposal to the server, notifies, and re-lists on the next tick" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const OK_BODY = "{\"ok\":true,\"outcome\":\"accepted\"}";
+    const reply = std.fmt.comptimePrint("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ OK_BODY.len, OK_BODY });
+    var sv: @import("llm.zig").Standin = undefined;
+    try sv.start(io, reply, false);
+    defer sv.stop();
+
+    const s = try gpa.create(Store);
+    defer gpa.destroy(s);
+    s.* = .{};
+    s.settings.narrator = false;
+    s.settings.port = sv.port;
+    const tok = "nlk_desk-lineage-test-token-not-a-real-credential";
+    @memcpy(s.settings.token[0..tok.len], tok);
+    s.settings.token_len = tok.len;
+    const p = try gpa.create(Poller);
+    defer gpa.destroy(p);
+    p.* = .{ .io = io, .gpa = gpa, .store = s };
+    defer p.log_buf.deinit(gpa);
+    p.last_lin_s = 12345;
+
+    s.pushCmd(store_mod.mkCmd(.lineage_accept, "proj", "lessons-proposed\nQuote \"exactly\" before rounding | evidence: rows 3-5"));
+    p.drainCommands();
+    try sv.awaitSeen(1);
+    const req = sv.request();
+    try std.testing.expect(std.mem.startsWith(u8, req, "POST /api/v1/lineages/proj/proposals "));
+    try std.testing.expect(std.mem.indexOf(u8, req, "Bearer " ++ tok) != null);
+    // the body the server decides by: exact text, quotes escaped, action and scope named
+    const at = std.mem.indexOf(u8, req, "{\"action\"") orelse return error.NoBody;
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, req[at..], .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("accept", parsed.value.object.get("action").?.string);
+    try std.testing.expectEqualStrings("lessons-proposed", parsed.value.object.get("scope").?.string);
+    try std.testing.expectEqualStrings("Quote \"exactly\" before rounding | evidence: rows 3-5", parsed.value.object.get("text").?.string);
+    {
+        s.lock();
+        defer s.unlock();
+        try std.testing.expectEqual(@as(usize, 1), s.notif_count);
+        try std.testing.expectEqualStrings("Lesson promoted", s.notifs[s.notif_head % s.notifs.len].titleStr());
+    }
+    try std.testing.expectEqual(@as(i64, 0), p.last_lin_s);
 }

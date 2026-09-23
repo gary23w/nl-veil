@@ -5598,8 +5598,10 @@ fn drawMemText(text: []const u8, x: f32, y0: f32, size: i32, color: t.Color, max
 fn drawChatMemory(store: *Store, r: t.Rect) void {
     var rows: [128]store_mod.MemRow = undefined;
     var props: [12]store_mod.PropRow = undefined;
+    var lprops: [store_mod.MAX_LIN_PROPS]store_mod.LinPropRow = undefined;
     var n: usize = 0;
     var np: usize = 0;
+    var nl: usize = 0;
     {
         store.lock();
         defer store.unlock();
@@ -5607,13 +5609,15 @@ fn drawChatMemory(store: *Store, r: t.Rect) void {
         @memcpy(rows[0..n], store.chat_mem[0..n]);
         np = @min(store.chat_prop_count, props.len);
         @memcpy(props[0..np], store.chat_props[0..np]);
+        nl = @min(store.lin_prop_count, lprops.len);
+        @memcpy(lprops[0..nl], store.lin_props[0..nl]);
     }
     var yy0: f32 = r.y + 40;
     t.textClip("keys, logins & preferences the veil keeps for you", @intFromFloat(r.x + 12), @intFromFloat(yy0), 11, t.comment, @intFromFloat(r.width - 20));
     yy0 += 15;
     t.textClip(t.z("{d} saved  -  private to this machine", .{n}), @intFromFloat(r.x + 12), @intFromFloat(yy0), 11, t.comment, @intFromFloat(r.width - 20));
     yy0 += 22;
-    if (n == 0 and np == 0) {
+    if (n == 0 and np == 0 and nl == 0) {
         t.text(t.z("nothing saved yet", .{}), @intFromFloat(r.x + 12), @intFromFloat(yy0 + 6), 12, t.fg_dim);
         t.textClip("tell the veil something to keep -", @intFromFloat(r.x + 12), @intFromFloat(yy0 + 30), 11, t.comment, @intFromFloat(r.width - 20));
         t.textClip("\"my openai key is sk-...\", a login,", @intFromFloat(r.x + 12), @intFromFloat(yy0 + 46), 11, t.comment, @intFromFloat(r.width - 20));
@@ -5627,6 +5631,8 @@ fn drawChatMemory(store: *Store, r: t.Rect) void {
     {
         var pi: usize = 0;
         while (pi < np) : (pi += 1) total += 24 + @as(f32, @floatFromInt(memLineCount(props[pi].text_len, 12, txtw))) * 16 + 30;
+        var li: usize = 0;
+        while (li < nl) : (li += 1) total += 24 + @as(f32, @floatFromInt(memLineCount(lprops[li].text_len, 12, txtw))) * 16 + 30;
         var i: usize = 0;
         while (i < n) : (i += 1) total += 24 + @as(f32, @floatFromInt(memLineCount(rows[i].text_len, 12, txtw))) * 16 + 6;
     }
@@ -5668,6 +5674,32 @@ fn drawChatMemory(store: *Store, r: t.Rect) void {
         }
         y += card_h;
     }
+    // SWARM LINEAGES — what a cast's end-of-run judge and habit miner proposed for the lineage's memory. Keeping
+    // one promotes it into the live scope the NEXT cast of that lineage recalls from; dropping it is remembered
+    // so it is not proposed again. Decided by the poller over the server API, not by the chat thread.
+    var lin_accept: ?usize = null;
+    var lin_reject: ?usize = null;
+    var li: usize = 0;
+    while (li < nl) : (li += 1) {
+        const p = &lprops[li];
+        const lines = memLineCount(p.text_len, 12, txtw);
+        const card_h = 24 + @as(f32, @floatFromInt(lines)) * 16 + 30;
+        if (y + card_h >= view.y and y <= view.y + view.height) {
+            const card = t.Rect{ .x = view.x + 4, .y = y + 2, .width = view.width - 8, .height = card_h - 4 };
+            t.panelBordered(card, t.bg, t.blue);
+            const chip: []const u8 = switch (p.kind) {
+                1 => "skill?",
+                2 => "habit?",
+                else => "lesson?",
+            };
+            t.textClip(t.z("[{s}] swarm lineage '{s}' - not yet binding", .{ chip, p.lineageStr() }), @intFromFloat(card.x + 8), @intFromFloat(card.y + 6), 11, t.blue, @intFromFloat(card.width - 16));
+            _ = drawMemText(p.textStr(), card.x + 8, card.y + 24, 12, t.fg, txtw);
+            const by = card.y + card_h - 30;
+            if (t.button(.{ .x = card.x + 8, .y = by, .width = t.btnW("keep", 22), .height = 22 }, t.z("keep", .{}), t.green, true)) lin_accept = li;
+            if (t.buttonGhost(.{ .x = card.x + 8 + t.btnW("keep", 22) + 8, .y = by, .width = t.btnW("drop", 22), .height = 22 }, t.z("drop", .{}), t.red, true)) lin_reject = li;
+        }
+        y += card_h;
+    }
     var i: usize = 0;
     while (i < n) : (i += 1) {
         const m = &rows[i];
@@ -5697,6 +5729,13 @@ fn drawChatMemory(store: *Store, r: t.Rect) void {
     if (reject_idx) |ri| {
         const tag = [1]u8{'0' + props[ri].scope};
         store.pushChatCmd(store_mod.mkChatCmd(.prop_reject, tag[0..1], props[ri].textStr()));
+    }
+    const lin_pick: ?usize = lin_accept orelse lin_reject;
+    if (lin_pick) |k| {
+        // "<scope>\n<exact text>" — the poller splits it back; the server decides by the exact stored text
+        var pk: [1024]u8 = undefined;
+        const packed_text = std.fmt.bufPrint(&pk, "{s}\n{s}", .{ lprops[k].scopeStr(), lprops[k].textStr() }) catch return;
+        store.pushCmd(store_mod.mkCmd(if (lin_accept != null) .lineage_accept else .lineage_reject, lprops[k].lineageStr(), packed_text));
     }
 }
 

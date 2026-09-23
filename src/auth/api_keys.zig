@@ -13,6 +13,9 @@ pub const ApiKeys = struct {
     nb: Neuron,
     mu: std.Io.Mutex = .init,
     keys: std.StringHashMapUnmanaged(Info) = .empty,
+    /// warm() actually listed the store. False means the store could not be read (a missing neuron binary, a
+    /// locked db): every verify() then answers null, which says nothing about whether a given key is valid.
+    loaded: bool = false,
 
     pub fn init(gpa: std.mem.Allocator, nb: Neuron) ApiKeys {
         return .{ .gpa = gpa, .nb = nb };
@@ -44,6 +47,7 @@ pub const ApiKeys = struct {
         self.mu.lockUncancelable(self.nb.io);
         defer self.mu.unlock(self.nb.io);
         const scopes = self.nb.scopes("k_") catch return;
+        self.loaded = true;
         defer {
             for (scopes) |s| self.gpa.free(s);
             self.gpa.free(scopes);
@@ -101,6 +105,19 @@ pub const ApiKeys = struct {
         const info = Info{ .uid = uid, .name = try self.gpa.dupe(u8, safe_name), .created = created, .prefix = prefix };
         self.keys.put(self.gpa, try self.gpa.dupe(u8, hash), info) catch {};
         return raw;
+    }
+
+    /// Did `raw`'s record reach the STORE, not just this process's map? create() files the record fail-open
+    /// (a key that works until restart beats a failed request), so a caller that hands the key to something
+    /// that outlives the process — the .desktop_key file — must ask.
+    pub fn persisted(self: *ApiKeys, raw: []const u8) bool {
+        var hbuf: [64]u8 = undefined;
+        const hash = hashHex(raw, &hbuf);
+        var sbuf: [80]u8 = undefined;
+        const scope = std.fmt.bufPrint(&sbuf, "k_{s}", .{hash}) catch return false;
+        const got = (self.nb.get(scope) catch return false) orelse return false;
+        self.gpa.free(got);
+        return true;
     }
 
     pub fn verify(self: *ApiKeys, raw: []const u8) ?u64 {
@@ -188,6 +205,21 @@ fn drainKeysForTest(self: *ApiKeys) void {
 /// TEST ONLY. A neuron handle whose binary cannot be spawned — see the note above.
 fn deadNeuronForTest(gpa: std.mem.Allocator, io: std.Io) Neuron {
     return Neuron.init(gpa, io, "__nl_no_such_neuron_bin__", "__nl_no_such_db__");
+}
+
+test "an unreadable store is not a loaded one, and a key it could not file is not persisted" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var ks = ApiKeys.init(gpa, deadNeuronForTest(gpa, io));
+    defer drainKeysForTest(&ks);
+    try ks.warm();
+    try std.testing.expect(!ks.loaded); // listing failed: verify() answers null for EVERY key now
+    const k = try ks.create(1, "veil-desk");
+    defer gpa.free(k);
+    try std.testing.expect(ks.verify(k) != null); // works in this process...
+    try std.testing.expect(!ks.persisted(k)); // ...and is gone at the next restart
 }
 
 test "minted key: nlk_ prefix + 48 lowercase hex, and two mints never collide" {
