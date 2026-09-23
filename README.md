@@ -48,7 +48,7 @@ code and credentials from anything you share.
 
 <p>
   <a href="https://github.com/gary23w/nl-veil/actions/workflows/release.yml"><img alt="build" src="https://github.com/gary23w/nl-veil/actions/workflows/release.yml/badge.svg"></a>
-  <a href="https://github.com/gary23w/nl-veil/releases"><img alt="release" src="https://img.shields.io/badge/release-v1.1.4-A8241B"></a>
+  <a href="https://github.com/gary23w/nl-veil/releases"><img alt="release" src="https://img.shields.io/badge/release-v1.1.5-A8241B"></a>
   <img alt="zig" src="https://img.shields.io/badge/zig-0.16-F7A41D?logo=zig&logoColor=white">
   <a href="https://huggingface.co/gary23w/the-veil-12b"><img alt="built-in model" src="https://img.shields.io/badge/built--in%20model-the--veil--12b-6E4A27?logo=huggingface&logoColor=white"></a>
   <a href="https://huggingface.co/gary23w/gary-neuron-emergent"><img alt="memory cortex" src="https://img.shields.io/badge/cortex-gary--neuron--emergent-6E4A27?logo=huggingface&logoColor=white"></a>
@@ -350,7 +350,7 @@ raylib is a *lazy* dependency, so `-Dapp=false` never fetches it at all.
 ## Install
 
 **Download it and run it — no toolchain, nothing to build.** Grab your platform's bundle from the
-**[latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.1.4)**, unzip, and run `veil`:
+**[latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.1.5)**, unzip, and run `veil`:
 
 | You're on | Download | Then run |
 |---|---|---|
@@ -511,7 +511,7 @@ step 5** — the rest is about letting other people in.
 
 ### 1. Download and unblock it
 
-Grab the bundle for your OS from the [latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.1.4)
+Grab the bundle for your OS from the [latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.1.5)
 and unzip it somewhere you'll find again. Builds are unsigned, so:
 
 - **Windows** shows *"Windows protected your PC"* → **More info** → **Run anyway**.
@@ -547,7 +547,7 @@ On startup the server prints one complete URL per address this machine answers o
 (`src/main.zig:861-889`, using `src/config/lan.zig`):
 
 ```
-neuron-loops 1.1.4 on http://localhost:8787
+neuron-loops 1.1.5 on http://localhost:8787
     open from another machine (phone, laptop) at:
       http://192.168.1.42:8787
 ```
@@ -1372,20 +1372,25 @@ dependency entirely rather than compiling it unused.
 
 ## Release
 
-**Current: [`v1.1.4`](https://github.com/gary23w/nl-veil/releases/tag/v1.1.4)** — a calmer desktop with
-visible preparation and planning updates, five organized settings pages, editable starter prompts,
-steadier streaming, and cleaner code blocks. Both HTTP clients also fix a completion race that could
-report a false timeout. [Full notes](docs/release/RELEASE-v1.1.4.md) · [Desktop guide](docs/DESK-UI.md).
+**Current: [`v1.1.5`](https://github.com/gary23w/nl-veil/releases/tag/v1.1.5)** — what a swarm lineage
+learns can reach its next cast: the end-of-run judge's lessons and skills and the mined habits are reviewed
+with `veil lineage` or keep/drop cards in the desktop's Memory pane, and a dropped proposal is not proposed
+again. A turn whose first reply comes back empty is asked again with its tools instead of guessing, and the
+desktop key survives a server that could not read its key store. [Full notes](docs/release/RELEASE-v1.1.5.md).
 
-**Updating:** from v1.1.3, use **Settings → App updates → Update & restart**. In v1.1.4,
-the same control lives under **Settings → Updates**. Versions before v1.1.3 require a manual full-bundle
-installation. Updates verify both executables and preserve data, with backups for recovery.
-[Updating and network troubleshooting](docs/UPDATES.md).
+**Updating:** from v1.1.3 or later, use **Settings → Updates → App updates → Update & restart**.
+Versions before v1.1.3 require a manual full-bundle installation. Updates verify both executables and
+preserve data, with backups for recovery. [Updating and network troubleshooting](docs/UPDATES.md).
 
-**Previously: [`v1.1.3`](https://github.com/gary23w/nl-veil/releases/tag/v1.1.3)** introduced verified
-desktop updates, confirmed Cloudflare tunnel readiness, and native release smoke checks on all four platforms.
+**Previously: [`v1.1.4`](docs/release/RELEASE-v1.1.4.md)** — a calmer desktop with visible preparation and
+planning updates, five organized settings pages, editable starter prompts, steadier streaming, and cleaner
+code blocks, plus a fix for an HTTP completion race that could report a false timeout.
+[Desktop guide](docs/DESK-UI.md).
 
-**Before it: [`v1.1.2`](https://github.com/gary23w/nl-veil/releases/tag/v1.1.2)** — a point release about
+**Before it: [`v1.1.3`](docs/release/RELEASE-v1.1.3.md)** introduced verified desktop updates, confirmed
+Cloudflare tunnel readiness, and native release smoke checks on all four platforms.
+
+**Before it: [`v1.1.2`](docs/release/RELEASE-v1.1.2.md)** — a point release about
 secrets on disk, and about work that reaches you. **No key becomes a file**: every build before this one
 wrote each model call's `Authorization: Bearer <key>` into a curl config beside your conversation and left
 it there — 111 of them were still on the machine this was found on, the oldest from July, in a folder that
