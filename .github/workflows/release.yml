@@ -126,6 +126,8 @@ jobs:
 
       - name: Exercise packaged app and Cloudflare transports
         shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # authenticated api.github.com calls: the anonymous limit is per shared runner IP
         run: |
           VERSION=$(sed -n 's/^const VERSION = "\(.*\)";$/\1/p' src/main.zig | head -1)
           BUNDLE="bin/veil-v$VERSION-${{ matrix.name }}.zip"
