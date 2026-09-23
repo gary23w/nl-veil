@@ -32,7 +32,14 @@ WINDOWS = os.name == "nt"
 
 
 def fetch(url):
-    req = urllib.request.Request(url, headers={"User-Agent": "nl-veil-release-smoke", "Accept": "application/dns-json" if "cloudflare-dns.com/" in url else "application/json"})
+    headers = {"User-Agent": "nl-veil-release-smoke", "Accept": "application/dns-json" if "cloudflare-dns.com/" in url else "application/json"}
+    # Anonymous api.github.com calls share 60 an hour per IP, and the hosted macOS runners share IPs: v1.1.5's
+    # arm64 bundle failed twice on "403 rate limit exceeded" fetching cloudflared's latest release. Authenticated
+    # calls get the workflow token's own limit. Only ever sent to api.github.com.
+    token = os.environ.get("GITHUB_TOKEN", "")
+    if token and url.startswith("https://api.github.com/"):
+        headers["Authorization"] = "Bearer " + token
+    req = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(req, timeout=30) as response:
         return response.read(2 << 20)
 
