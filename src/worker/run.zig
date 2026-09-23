@@ -217,6 +217,10 @@ pub const Worker = struct {
     last_bench_str: []const u8 = "",
     tests_seeded: bool = false,
     goal_brief: []const u8 = "",
+    // LINEAGE: the stable store this run's brain lives in ("" = a throwaway per-run brain), and whether it existed
+    // before this run. writeDone appends the run's outcome to the lineage's history beside it (lineage.zig).
+    lineage_db: []const u8 = "",
+    lineage_inherited: bool = false,
     veil_str: []const u8 = "",
     resting: bool = false,
     veil_directive: []const u8 = "",
@@ -733,6 +737,8 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
         .ctl_path = try std.fmt.allocPrint(gpa, "{s}/control.jsonl", .{run_dir}),
         .stop_path = try std.fmt.allocPrint(gpa, "{s}/STOP", .{run_dir}),
         .mem = Mem.init(gpa, io, neuron_bin, db_path),
+        .lineage_db = if (lineage_db != null) db_path else "",
+        .lineage_inherited = lineage_inherited,
         .base_url = base_url,
         .model = model,
         .key = key,
@@ -1950,8 +1956,10 @@ fn writeDone(w: *Worker, reason: []const u8) void {
     // any durable proposals BEFORE the DONE marker; a failed/unreachable judge is a silent no-op.
     if (!w.judged) {
         w.judged = true;
+        const pending0 = lineagePending(w);
         rsi.runJudge(w);
         proposeHabits(w); // deterministic counterpart to the LLM judge: propose recurring tool sequences
+        recordLineageOutcome(w, reason, lineagePending(w) -| pending0);
     }
     const dp = std.fmt.allocPrint(w.gpa, "{s}/DONE", .{w.run_dir}) catch return;
     defer w.gpa.free(dp);
@@ -1960,6 +1968,36 @@ fn writeDone(w: *Worker, reason: []const u8) void {
     defer w.gpa.free(pp);
     std.Io.Dir.cwd().deleteFile(w.io, pp) catch {};
     sweepKeyScratch(w);
+}
+
+/// Proposals waiting in the lineage's three quarantine scopes (0 for a run without a lineage).
+fn lineagePending(w: *Worker) u32 {
+    if (w.lineage_db.len == 0) return 0;
+    var n: u32 = 0;
+    for (proposals.SOURCES) |src| n += w.mem.factCount(src.scope);
+    return n;
+}
+
+/// Append this run's outcome to its lineage's history.jsonl, so whether a lineage gets better over time is a record,
+/// not a claim. best_pct is the engine's own round score, never ground truth; the counters are this worker process's.
+fn recordLineageOutcome(w: *Worker, reason: []const u8, proposed: u32) void {
+    if (w.lineage_db.len == 0) return;
+    var pb: [1024]u8 = undefined;
+    const path = lineage.historyPath(&pb, w.lineage_db) orelse return;
+    var lb: [640]u8 = undefined;
+    const line = lineage.historyLine(&lb, .{
+        .t = w.nowSecs(),
+        .run = std.fs.path.basename(w.run_dir),
+        .reason = reason,
+        .rounds = w.cur_round,
+        .best_pct = w.best_pct,
+        .calls = llm.calls_made.load(.monotonic),
+        .tok_in = llm.tokens_in.load(.monotonic),
+        .tok_out = llm.tokens_out.load(.monotonic),
+        .proposed = proposed,
+        .inherited = w.lineage_inherited,
+    });
+    if (line.len > 0) appendFile(w.io, w.gpa, path, line);
 }
 
 /// SECURITY/HYGIENE sweep at clean exit: the cast's key material must not outlive the run. `keys.env`
