@@ -1,6 +1,7 @@
 //! Lineage HTTP handlers — what a lineage has learned, and the review of what it proposed.
 //!
 //!   GET  /api/v1/lineages                   this account's lineages with their live and quarantined counts
+//!   GET  /api/v1/lineages/:id               one lineage: the same counts plus its cast history (history.jsonl)
 //!   GET  /api/v1/lineages/:id/proposals     the quarantined proposals, one row per stored line
 //!   POST /api/v1/lineages/:id/proposals     {"scope","text","action":"accept"|"reject"} — proposals.decide
 //!
@@ -25,6 +26,38 @@ const jstr = http.jstr;
 
 /// At most this many lineages are counted per listing: each count is a neuron subprocess.
 const LIST_MAX = 32;
+/// The newest casts a detail returns.
+const HISTORY_MAX = 100;
+
+/// The lineage's history.jsonl body ("" when it has none yet). Caller frees a non-empty result.
+fn readHistory(app: *App, gpa: std.mem.Allocator, db: []const u8) []const u8 {
+    var pb: [1024]u8 = undefined;
+    const path = lineage.historyPath(&pb, db) orelse return "";
+    return std.Io.Dir.cwd().readFileAlloc(app.io, path, gpa, .limited(4 << 20)) catch "";
+}
+
+/// Rows in a history body.
+fn castCount(body: []const u8) usize {
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, body, '\n');
+    while (it.next()) |l| {
+        if (std.mem.trim(u8, l, " \r\t").len > 1) n += 1;
+    }
+    return n;
+}
+
+fn writeCounts(out: *std.ArrayListUnmanaged(u8), arena: std.mem.Allocator, mem: osc.Mem, casts: usize) !void {
+    var pending: u32 = 0;
+    for (proposals.SOURCES) |s| pending += mem.factCount(s.scope);
+    try out.print(arena, ",\"lessons\":{d},\"skills\":{d},\"playbook\":{d},\"pending\":{d},\"rejected\":{d},\"casts\":{d}", .{
+        mem.factCount(tools.LESSON_SCOPE),
+        mem.factCount(tools.SKILL_SCOPE),
+        mem.factCount(tools.PLAYBOOK_SCOPE),
+        pending,
+        mem.factCount(tools.PROPOSAL_REJECTED_SCOPE),
+        casts,
+    });
+}
 
 fn userRoot(app: *App, arena: std.mem.Allocator, uid: u64) ![]u8 {
     return std.fmt.allocPrint(arena, "{s}/u{d}", .{ app.data, uid });
@@ -69,22 +102,36 @@ pub fn listLineages(app: *App, req: *httpz.Request, res: *httpz.Response) !void 
             const db = try std.fmt.allocPrint(res.arena, "{s}/{s}/mind.sqlite", .{ ldir, ent.name });
             if (!fileExists(app.io, db)) continue;
             const mem = osc.Mem.init(app.gpa, app.io, app.sup.neuron_bin, db);
-            var pending: u32 = 0;
-            for (proposals.SOURCES) |s| pending += mem.factCount(s.scope);
+            const hist = readHistory(app, app.gpa, db);
+            defer if (hist.len > 0) app.gpa.free(hist);
             if (n > 0) try out.append(res.arena, ',');
             try out.appendSlice(res.arena, "{\"id\":");
             try jstr(res.arena, &out, ent.name);
-            try out.print(res.arena, ",\"lessons\":{d},\"skills\":{d},\"playbook\":{d},\"pending\":{d},\"rejected\":{d}}}", .{
-                mem.factCount(tools.LESSON_SCOPE),
-                mem.factCount(tools.SKILL_SCOPE),
-                mem.factCount(tools.PLAYBOOK_SCOPE),
-                pending,
-                mem.factCount(tools.PROPOSAL_REJECTED_SCOPE),
-            });
+            try writeCounts(&out, res.arena, mem, castCount(hist));
+            try out.append(res.arena, '}');
             n += 1;
         }
     } else |_| {}
     try out.appendSlice(res.arena, "]}");
+    res.content_type = .JSON;
+    res.body = out.items;
+}
+
+pub fn lineageDetail(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
+    const u = requireUser(app, req, res) orelse return;
+    const db = (try lineageDb(app, req, res, u.id)) orelse return;
+    const mem = osc.Mem.init(app.gpa, app.io, app.sup.neuron_bin, db);
+    const hist = readHistory(app, app.gpa, db);
+    defer if (hist.len > 0) app.gpa.free(hist);
+    const arr = try lineage.historyArray(res.arena, hist, HISTORY_MAX);
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    try out.appendSlice(res.arena, "{\"id\":");
+    var sb: [96]u8 = undefined;
+    try jstr(res.arena, &out, lineage.slug(req.param("id") orelse "", &sb));
+    try writeCounts(&out, res.arena, mem, castCount(hist));
+    try out.appendSlice(res.arena, ",\"history\":");
+    try out.appendSlice(res.arena, arr);
+    try out.append(res.arena, '}');
     res.content_type = .JSON;
     res.body = out.items;
 }
@@ -152,6 +199,7 @@ const Handler = *const fn (*App, *httpz.Request, *httpz.Response) anyerror!void;
 
 const LINEAGE_ROUTES = [_]struct { name: []const u8, f: Handler }{
     .{ .name = "listLineages", .f = listLineages },
+    .{ .name = "lineageDetail", .f = lineageDetail },
     .{ .name = "listProposals", .f = listProposals },
     .{ .name = "decideProposal", .f = decideProposal },
 };
@@ -268,6 +316,37 @@ test "lineage routes: review reaches only the caller's own lineage, and a decisi
         try web.expectStatus(200);
         try std.testing.expect(std.mem.indexOf(u8, web.res.body, "\"id\":\"proj\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, web.res.body, "\"pending\":1") != null);
+        try std.testing.expect(std.mem.indexOf(u8, web.res.body, "\"casts\":0") != null);
+    }
+    // a finished cast's history row is served by the detail route, to the owner only
+    {
+        var hb: [512]u8 = undefined;
+        const row = lineage.historyLine(&hb, .{ .t = 1, .run = "c1", .reason = "completed", .rounds = 2, .best_pct = 90, .calls = 9, .tok_in = 100, .tok_out = 10, .proposed = 1, .inherited = false });
+        const hp = try std.fmt.allocPrint(gpa, "{s}/history.jsonl", .{dir});
+        defer gpa.free(hp);
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = hp, .data = row });
+    }
+    {
+        var web = httpz.testing.init(.{});
+        defer web.deinit();
+        web.header("cookie", cookie_one);
+        web.param("id", "proj");
+        try lineageDetail(&ta.app, web.req, web.res);
+        try web.expectStatus(200);
+        const parsed = try std.json.parseFromSlice(std.json.Value, gpa, web.res.body, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(@as(i64, 1), parsed.value.object.get("casts").?.integer);
+        const h = parsed.value.object.get("history").?.array;
+        try std.testing.expectEqual(@as(usize, 1), h.items.len);
+        try std.testing.expectEqual(@as(i64, 90), h.items[0].object.get("best_pct").?.integer);
+    }
+    {
+        var web = httpz.testing.init(.{});
+        defer web.deinit();
+        web.header("cookie", cookie_two);
+        web.param("id", "proj");
+        try lineageDetail(&ta.app, web.req, web.res);
+        try web.expectStatus(404);
     }
     // account two cannot decide it
     {

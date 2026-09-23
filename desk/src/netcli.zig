@@ -217,6 +217,13 @@ pub fn lineageList(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8)
     return httpReq(io, gpa, "GET", port, "/api/v1/lineages", token, null, 15);
 }
 
+/// GET /api/v1/lineages/<slug> — one lineage's counts and its cast history.
+pub fn lineageDetail(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8, slug: []const u8) ?Resp {
+    var pbuf: [160]u8 = undefined;
+    const path = std.fmt.bufPrint(&pbuf, "/api/v1/lineages/{s}", .{slug}) catch return null;
+    return httpReq(io, gpa, "GET", port, path, token, null, 15);
+}
+
 /// GET /api/v1/lineages/<slug>/proposals — one lineage's quarantined proposals.
 pub fn lineageProposals(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8, slug: []const u8) ?Resp {
     var pbuf: [160]u8 = undefined;
