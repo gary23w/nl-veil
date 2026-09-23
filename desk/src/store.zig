@@ -889,6 +889,30 @@ pub const LinPropRow = struct {
 };
 pub const MAX_LIN_PROPS = 16;
 
+/// One swarm LINEAGE as the server reports it (/api/v1/lineages + /api/v1/lineages/<id>): what it has learned, what
+/// waits for review, and its newest casts oldest-first, so the Lineages view can show whether it is getting better.
+pub const LINEAGE_HIST = 24;
+pub const LineageRow = struct {
+    id: [64]u8 = [_]u8{0} ** 64,
+    id_len: u8 = 0,
+    lessons: u32 = 0,
+    skills: u32 = 0,
+    playbook: u32 = 0,
+    pending: u32 = 0,
+    rejected: u32 = 0,
+    casts: u32 = 0, // every cast on record (the history below keeps the newest LINEAGE_HIST)
+    hist_n: u8 = 0,
+    hist_pct: [LINEAGE_HIST]u8 = [_]u8{0} ** LINEAGE_HIST, // engine best round score per cast
+    hist_rounds: [LINEAGE_HIST]u16 = [_]u16{0} ** LINEAGE_HIST,
+    hist_tok_k: [LINEAGE_HIST]u32 = [_]u32{0} ** LINEAGE_HIST, // input tokens per cast, thousands
+    hist_prop: [LINEAGE_HIST]u8 = [_]u8{0} ** LINEAGE_HIST, // proposals the cast added for review
+    last_t: i64 = 0, // unix seconds of the newest cast (0 = none yet)
+    pub fn idStr(r: *const LineageRow) []const u8 {
+        return r.id[0..r.id_len];
+    }
+};
+pub const MAX_LINEAGES = 16;
+
 /// A UI→chat-thread command; same copy-by-value ring discipline as Command.
 pub const ChatCommand = struct {
     kind: ChatCmdKind = .none,
@@ -970,6 +994,10 @@ pub const Store = struct {
     // --- swarm-lineage proposals awaiting review (poller writes; Memory pane reads) ---
     lin_props: [MAX_LIN_PROPS]LinPropRow = undefined,
     lin_prop_count: usize = 0,
+    // --- swarm lineages + their cast history (poller writes; the Swarm tab's Lineages view reads) ---
+    lineages: [MAX_LINEAGES]LineageRow = undefined,
+    lineage_count: usize = 0,
+    lineages_seen: bool = false, // at least one listing landed (distinguishes "none yet" from "not asked yet")
 
     // --- chat (chat thread writes, UI reads; UI writes the command ring) ---
     convs: [MAX_CONVS]ConvRow = undefined,

@@ -83,6 +83,72 @@ pub fn dbPathIn(gpa: std.mem.Allocator, user_root: []const u8, lineage_id: []con
     return std.fmt.allocPrint(gpa, "{s}/_lineage/{s}/mind.sqlite", .{ user_root, slug(lineage_id, &sb) }) catch null;
 }
 
+/// HISTORY: one JSON line per finished cast of the lineage, beside its mind.sqlite. The store says what the lineage
+/// KNOWS; this says how its casts DID, which is the only way to tell whether it gets better over time.
+pub const HISTORY_FILE = "history.jsonl";
+
+pub const Outcome = struct {
+    t: i64, // unix seconds at DONE
+    run: []const u8, // the run dir's last segment (a swarm id or a conversation id)
+    reason: []const u8, // why it stopped (completed / time_budget / stopped ...)
+    rounds: u32,
+    best_pct: u32, // the engine's own best round score; not ground truth
+    calls: u64,
+    tok_in: u64,
+    tok_out: u64,
+    proposed: u32, // proposals the end-of-run judge and habit miner added to the quarantine
+    inherited: bool, // the lineage store existed before this cast
+};
+
+/// `{dirname(db)}/history.jsonl`, or null. Pure.
+pub fn historyPath(buf: []u8, db: []const u8) ?[]const u8 {
+    const dir = std.fs.path.dirname(db) orelse return null;
+    return std.fmt.bufPrint(buf, "{s}/" ++ HISTORY_FILE, .{dir}) catch null;
+}
+
+/// A string field safe to drop between JSON quotes: printable ASCII only, quote/backslash replaced. Pure.
+fn safeField(buf: []u8, s: []const u8) []const u8 {
+    var n: usize = 0;
+    for (s) |c| {
+        if (n >= buf.len) break;
+        buf[n] = if (c < 0x20 or c > 0x7e or c == '"' or c == '\\') '_' else c;
+        n += 1;
+    }
+    return buf[0..n];
+}
+
+/// One history row, newline-terminated. Pure.
+pub fn historyLine(buf: []u8, o: Outcome) []const u8 {
+    var rb: [96]u8 = undefined;
+    var sb: [64]u8 = undefined;
+    return std.fmt.bufPrint(buf, "{{\"t\":{d},\"run\":\"{s}\",\"reason\":\"{s}\",\"rounds\":{d},\"best_pct\":{d},\"calls\":{d},\"tok_in\":{d},\"tok_out\":{d},\"proposed\":{d},\"inherited\":{}}}\n", .{
+        o.t, safeField(&rb, o.run), safeField(&sb, o.reason), o.rounds, o.best_pct, o.calls, o.tok_in, o.tok_out, o.proposed, o.inherited,
+    }) catch "";
+}
+
+/// The newest `max` history rows as one JSON array (`[{...},{...}]`, oldest first). Lines that do not look like a
+/// row are skipped, so a torn last line never breaks the array. Caller frees. Pure but for allocation.
+pub fn historyArray(gpa: std.mem.Allocator, body: []const u8, max: usize) ![]u8 {
+    var rows: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer rows.deinit(gpa);
+    var it = std.mem.splitScalar(u8, body, '\n');
+    while (it.next()) |raw| {
+        const l = std.mem.trim(u8, raw, " \r\t");
+        if (l.len < 2 or l[0] != '{' or l[l.len - 1] != '}') continue;
+        try rows.append(gpa, l);
+    }
+    const from = if (rows.items.len > max) rows.items.len - max else 0;
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(gpa);
+    try out.append(gpa, '[');
+    for (rows.items[from..], 0..) |r, i| {
+        if (i > 0) try out.append(gpa, ',');
+        try out.appendSlice(gpa, r);
+    }
+    try out.append(gpa, ']');
+    return out.toOwnedSlice(gpa);
+}
+
 /// Does this lineage store already exist (i.e. a prior cast populated it)? Lets the engine tell a mind
 /// "you INHERIT the memory of N prior runs on this assignment" vs "you are the first run".
 pub fn exists(io: std.Io, gpa: std.mem.Allocator, db: []const u8) bool {
@@ -93,6 +159,35 @@ pub fn exists(io: std.Io, gpa: std.mem.Allocator, db: []const u8) bool {
 // ------------------------------------------------------------------------------------------- tests
 
 const t = std.testing;
+
+test "history: a row is one JSON object per line, hostile strings cannot break it, and the array keeps the newest" {
+    const gpa = t.allocator;
+    var pb: [256]u8 = undefined;
+    try t.expectEqualStrings("C:/x/data/u1/_lineage/p/history.jsonl", historyPath(&pb, "C:/x/data/u1/_lineage/p/mind.sqlite").?);
+    var b: [512]u8 = undefined;
+    const line = historyLine(&b, .{ .t = 7, .run = "conv\"x\\y", .reason = "completed\n", .rounds = 3, .best_pct = 95, .calls = 40, .tok_in = 1000, .tok_out = 50, .proposed = 2, .inherited = true });
+    try t.expect(std.mem.endsWith(u8, line, "}\n"));
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, std.mem.trimEnd(u8, line, "\n"), .{});
+    defer parsed.deinit();
+    try t.expectEqualStrings("conv_x_y", parsed.value.object.get("run").?.string);
+    try t.expectEqual(@as(i64, 95), parsed.value.object.get("best_pct").?.integer);
+    try t.expect(parsed.value.object.get("inherited").?.bool);
+
+    var body: std.ArrayListUnmanaged(u8) = .empty;
+    defer body.deinit(gpa);
+    var i: u32 = 0;
+    while (i < 5) : (i += 1) try body.appendSlice(gpa, historyLine(&b, .{ .t = i, .run = "r", .reason = "done", .rounds = i, .best_pct = i, .calls = 0, .tok_in = 0, .tok_out = 0, .proposed = 0, .inherited = i > 0 }));
+    try body.appendSlice(gpa, "{\"t\":99,\"run\""); // a torn last line
+    const arr = try historyArray(gpa, body.items, 3);
+    defer gpa.free(arr);
+    const pa = try std.json.parseFromSlice(std.json.Value, gpa, arr, .{});
+    defer pa.deinit();
+    try t.expectEqual(@as(usize, 3), pa.value.array.items.len);
+    try t.expectEqual(@as(i64, 2), pa.value.array.items[0].object.get("t").?.integer); // oldest of the newest 3
+    const empty = try historyArray(gpa, "", 10);
+    defer gpa.free(empty);
+    try t.expectEqualStrings("[]", empty);
+}
 
 test "slug sanitizes to a safe path segment" {
     var b: [96]u8 = undefined;

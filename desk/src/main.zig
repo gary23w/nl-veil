@@ -136,7 +136,7 @@ const WORKERS_AI_IDX: u8 = blk: {
 const ChatInner = enum { chat, metrics, files }; // the Chat center-pane inner tabs
 const RightTab = enum { activity, memory }; // the right pane's inner tabs (Swarm activity | Memory)
 const SchedInner = enum { tasks, build }; // the Tasks tab's inner tabs (task list | builder form)
-const SwarmInner = enum { live, deploy }; // the Swarm tab's inner tabs (live view | deploy form)
+const SwarmInner = enum { live, deploy, lineages }; // the Swarm tab's inner tabs (live view | deploy form | lineages)
 const ChatsInner = enum { chats, sched }; // the chat LEFT pane's inner tabs (conversations | scheduled tasks)
 const PaneDrag = enum { none, left, right, console }; // which divider is being drag-resized (else none)
 
@@ -235,6 +235,7 @@ const Ui = struct {
     d_cfacct: Field = .{}, // Cloudflare account id (Deploy form, when the provider needs one)
     d_goal: Field = .{},
     d_gateway: Field = .{},
+    d_lineage: Field = .{}, // optional lineage id: re-casts with the same id share one memory (lineage.zig)
     d_provider: usize = 0,
     d_model: usize = 0,
     d_use_default: bool = false, // deploy PROVIDER slot 0: inherit the client's configured chat LLM
@@ -252,6 +253,7 @@ const Ui = struct {
     d_breakout: bool = false,
     d_psyche: bool = false,
     swarm_inner: SwarmInner = .live, // Swarm tab: live view | the deploy form (Deploy folded in as an inner tab)
+    lin_scroll: f32 = 0, // Swarm tab Lineages view
     // live-reply activity tracking (drives the thinking mark's energy): the stream's last seen length +
     // the wall time it last GREW. Updated at the one live renderMsg call site each frame.
     live_len_prev: usize = 0,
@@ -328,7 +330,7 @@ const Ui = struct {
     log_follow: bool = true,
     details_scroll: f32 = 0, // swarm Details tab: the goal + config + blueprint can outgrow the panel
 
-    const Focus = enum { none, chat, d_name, d_key, d_cfacct, d_goal, d_gateway, c_input, c_rename, s_model, s_url, s_ckey, s_cfacct, s_tunhost, s_tkey, s_pkey, s_host, s_port, con_input, sc_name, sc_prompt, sc_details, sc_base, sc_model, sc_key };
+    const Focus = enum { none, chat, d_name, d_key, d_cfacct, d_goal, d_gateway, d_lineage, c_input, c_rename, s_model, s_url, s_ckey, s_cfacct, s_tunhost, s_tkey, s_pkey, s_host, s_port, con_input, sc_name, sc_prompt, sc_details, sc_base, sc_model, sc_key };
     // Per chat-table horizontal-scroll offset (px), keyed by a content hash so it survives vertical scroll +
     // stream-settle. A tiny FIFO (see tblScrollOff): a new table evicts the oldest.
     const TblHScroll = struct { id: u64 = 0, off: f32 = 0 };
@@ -1735,6 +1737,7 @@ fn focusedField() ?*Ui.Field {
         .d_cfacct => &ui.d_cfacct,
         .d_goal => &ui.d_goal,
         .d_gateway => &ui.d_gateway,
+        .d_lineage => &ui.d_lineage,
         .c_input => &ui.c_input,
         .c_rename => &ui.c_rename,
         .s_model => &ui.s_model,
@@ -6040,6 +6043,36 @@ fn drawDeploy(store: *Store, body: t.Rect) void {
     textField(.{ .x = x, .y = gy + 14, .width = colw, .height = t.FIELD_H }, &ui.d_gateway, ui.focus == .d_gateway, "blank = same as the minds", .d_gateway);
     gy += fh + gap;
 
+    // lineage: one memory across casts. Existing lineages are offered as chips so a re-cast picks the SAME id.
+    flabel(x, gy, "LINEAGE (optional - casts with the same id share one memory and get reviewed lessons)");
+    textField(.{ .x = x, .y = gy + 14, .width = colw, .height = t.FIELD_H }, &ui.d_lineage, ui.focus == .d_lineage, "blank = a fresh memory for this swarm", .d_lineage);
+    gy += fh + 2;
+    {
+        var ids: [store_mod.MAX_LINEAGES][64]u8 = undefined;
+        var lens: [store_mod.MAX_LINEAGES]u8 = undefined;
+        var nl: usize = 0;
+        {
+            store.lock();
+            defer store.unlock();
+            nl = @min(store.lineage_count, ids.len);
+            for (store.lineages[0..nl], 0..) |*row, i| {
+                ids[i] = row.id;
+                lens[i] = row.id_len;
+            }
+        }
+        var cx = x;
+        var shown: usize = 0;
+        for (0..nl) |i| {
+            const lbl = t.z("{s}", .{ids[i][0..lens[i]]});
+            const chip_w = t.btnW(lbl, 20);
+            if (cx + chip_w > x + colw) break;
+            if (t.buttonGhost(.{ .x = cx, .y = gy, .width = chip_w, .height = 20 }, lbl, t.blue, true)) setField(&ui.d_lineage, ids[i][0..lens[i]]);
+            cx += chip_w + 6;
+            shown += 1;
+        }
+        if (shown > 0) gy += 26 else gy += 4;
+    }
+
     // RSI DIALS — the same knobs the deploy wizard writes into swarm.json (omitting them makes a
     // desktop-deployed swarm behave differently from a wizard one).
     flabel(x, gy, "RSI DIALS");
@@ -6382,6 +6415,11 @@ fn submitDeploy(store: *Store, prov: *const catalog.Provider) void {
     jesc(&w, eff_key);
     w.writeAll("\",\"gateway_model\":\"") catch return;
     jesc(&w, ui.d_gateway.str());
+    const lin = std.mem.trim(u8, ui.d_lineage.str(), " \t\r\n");
+    if (lin.len > 0) {
+        w.writeAll("\",\"lineage\":\"") catch return;
+        jesc(&w, lin);
+    }
     w.writeAll("\",\"goal\":\"") catch return;
     jesc(&w, ui.d_goal.str());
     w.writeAll("\",\"minds\":[") catch return;
@@ -6401,6 +6439,31 @@ fn submitDeploy(store: *Store, prov: *const catalog.Provider) void {
 
 fn boolStr(v: bool) []const u8 {
     return if (v) "true" else "false";
+}
+
+test "a lineage id in the deploy form reaches the deploy body, trimmed, and a blank one sends none" {
+    const s = try std.testing.allocator.create(Store);
+    defer std.testing.allocator.destroy(s);
+    s.* = .{};
+    defer ui = .{};
+    ui = .{};
+    const prov = &catalog.providers[WORKERS_AI_IDX];
+    ui.d_provider = WORKERS_AI_IDX;
+    setField(&ui.d_goal, "build the report");
+    setField(&ui.d_lineage, "  acme-books \"q3\" ");
+    submitDeploy(s, prov);
+    const cmd = s.popCmd().?;
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, cmd.textStr(), .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("acme-books \"q3\"", parsed.value.object.get("lineage").?.string);
+    try std.testing.expectEqualStrings("build the report", parsed.value.object.get("goal").?.string);
+
+    setField(&ui.d_lineage, "   ");
+    submitDeploy(s, prov);
+    const none = s.popCmd().?;
+    const p2 = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, none.textStr(), .{});
+    defer p2.deinit();
+    try std.testing.expect(p2.value.object.get("lineage") == null);
 }
 
 test "swarm deploy shares Cloudflare login and live models with Settings" {
@@ -6477,14 +6540,138 @@ fn drawSwarm(store: *Store, body: t.Rect) void {
     const tab_h: f32 = 26;
     const tl_live = t.z("Live", .{});
     const tl_deploy = t.z("Deploy", .{});
+    const tl_lin = t.z("Lineages", .{});
     var tx: f32 = pad;
     if (t.tab(.{ .x = tx, .y = body.y + pad, .width = t.tabW(tl_live), .height = tab_h }, tl_live, ui.swarm_inner == .live)) ui.swarm_inner = .live;
     tx += t.tabW(tl_live) + 6;
     if (t.tab(.{ .x = tx, .y = body.y + pad, .width = t.tabW(tl_deploy), .height = tab_h }, tl_deploy, ui.swarm_inner == .deploy)) ui.swarm_inner = .deploy;
+    tx += t.tabW(tl_deploy) + 6;
+    if (t.tab(.{ .x = tx, .y = body.y + pad, .width = t.tabW(tl_lin), .height = tab_h }, tl_lin, ui.swarm_inner == .lineages)) ui.swarm_inner = .lineages;
     const r = t.Rect{ .x = body.x, .y = body.y + pad + tab_h + 2, .width = body.width, .height = body.height - pad - tab_h - 2 };
     switch (ui.swarm_inner) {
         .live => drawSwarmLive(store, r),
         .deploy => drawDeploy(store, r),
+        .lineages => drawLineages(store, r),
+    }
+}
+
+/// Small bars for a per-cast series, oldest left, scaled to the series max (or `fixed_max` when > 0). Returns the
+/// height used.
+fn miniBars(x: f32, y: f32, w: f32, h: f32, label: []const u8, vals: []const f32, fixed_max: f32, color: t.Color) f32 {
+    t.textClip(label, @intFromFloat(x), @intFromFloat(y), 11, t.comment, @intFromFloat(w));
+    const by = y + 15;
+    t.fillRect(@intFromFloat(x), @intFromFloat(by + h), @intFromFloat(w), 1, t.border);
+    if (vals.len == 0) return h + 18;
+    var mx: f32 = fixed_max;
+    if (mx <= 0) for (vals) |v| {
+        mx = @max(mx, v);
+    };
+    if (mx <= 0) mx = 1;
+    const slot = w / @as(f32, @floatFromInt(@max(vals.len, 8)));
+    const bw = @max(2, slot - 3);
+    for (vals, 0..) |v, i| {
+        const bh = @max(1, h * @min(v, mx) / mx);
+        t.fillRect(@intFromFloat(x + @as(f32, @floatFromInt(i)) * slot), @intFromFloat(by + h - bh), @intFromFloat(bw), @intFromFloat(bh), if (i + 1 == vals.len) t.green else color);
+    }
+    return h + 18;
+}
+
+/// Swarm tab > Lineages: each lineage's memory, what waits for review, and its casts over time - the place to see
+/// whether a lineage is getting better. The history is the engine's own record (history.jsonl): the round score is
+/// the swarm's self-assessment, the rounds and tokens are what each cast actually spent.
+fn drawLineages(store: *Store, body: t.Rect) void {
+    var rows: [store_mod.MAX_LINEAGES]store_mod.LineageRow = undefined;
+    var n: usize = 0;
+    var seen = false;
+    {
+        store.lock();
+        defer store.unlock();
+        n = @min(store.lineage_count, rows.len);
+        @memcpy(rows[0..n], store.lineages[0..n]);
+        seen = store.lineages_seen;
+    }
+    const x = body.x + t.PAD;
+    const w = body.width - 2 * t.PAD;
+    var y0 = body.y + t.PAD;
+    t.textClip("a lineage keeps one memory across casts: lessons its runs proved, skills, and the playbook", @intFromFloat(x), @intFromFloat(y0), 12, t.comment, @intFromFloat(w));
+    y0 += 22;
+    if (n == 0) {
+        t.text(t.z("{s}", .{if (seen) "no lineages yet" else "waiting for the server..."}), @intFromFloat(x), @intFromFloat(y0 + 6), 13, t.fg_dim);
+        t.textClip("give a swarm a LINEAGE id in Deploy (or `veil cast ... --lineage <id>`); every cast with that id adds to it.", @intFromFloat(x), @intFromFloat(y0 + 30), 12, t.comment, @intFromFloat(w));
+        return;
+    }
+    const view = t.Rect{ .x = body.x, .y = y0, .width = body.width, .height = body.y + body.height - y0 - 4 };
+    const card_h: f32 = 196;
+    const total = @as(f32, @floatFromInt(n)) * (card_h + 10);
+    const max_scroll = if (total > view.height) total - view.height else 0;
+    const wheel = rl.getMouseWheelMove();
+    if (wheel != 0 and t.hovering(view)) ui.lin_scroll -= wheel * 3 * 18;
+    ui.lin_scroll = std.math.clamp(ui.lin_scroll, 0, max_scroll);
+    rl.beginScissorMode(@intFromFloat(view.x), @intFromFloat(view.y), @intFromFloat(view.width), @intFromFloat(view.height));
+    defer rl.endScissorMode();
+    var use_idx: ?usize = null;
+    var review = false;
+    var y = view.y - ui.lin_scroll;
+    for (rows[0..n], 0..) |*row, i| {
+        defer y += card_h + 10;
+        if (y + card_h < view.y or y > view.y + view.height) continue;
+        const card = t.Rect{ .x = x, .y = y, .width = w, .height = card_h };
+        t.panelBordered(card, t.bg, t.border);
+        const cx = card.x + 12;
+        const cw = card.width - 24;
+        t.text(t.z("{s}", .{row.idStr()}), @intFromFloat(cx), @intFromFloat(card.y + 10), 15, t.fg);
+        t.textClip(t.z("{d} cast(s)   {d} lessons   {d} skills   {d} playbook   {d} rejected", .{ row.casts, row.lessons, row.skills, row.playbook, row.rejected }), @intFromFloat(cx), @intFromFloat(card.y + 32), 12, t.comment, @intFromFloat(cw));
+        // the per-cast trend: score up and cost down is a lineage getting better
+        var pct: [store_mod.LINEAGE_HIST]f32 = undefined;
+        var rnd: [store_mod.LINEAGE_HIST]f32 = undefined;
+        var tok: [store_mod.LINEAGE_HIST]f32 = undefined;
+        const hn: usize = row.hist_n;
+        for (0..hn) |k| {
+            pct[k] = @floatFromInt(row.hist_pct[k]);
+            rnd[k] = @floatFromInt(row.hist_rounds[k]);
+            tok[k] = @floatFromInt(row.hist_tok_k[k]);
+        }
+        const third = (cw - 24) / 3;
+        const by = card.y + 54;
+        _ = miniBars(cx, by, third, 56, "round score % (self-assessed)", pct[0..hn], 100, t.blue);
+        _ = miniBars(cx + third + 12, by, third, 56, "rounds per cast", rnd[0..hn], 0, t.orange);
+        _ = miniBars(cx + 2 * (third + 12), by, third, 56, "input tokens per cast (k)", tok[0..hn], 0, t.orange);
+        const ty = by + 80;
+        if (hn >= 2) {
+            const h = hn / 2;
+            var a_r: f32 = 0;
+            var b_r: f32 = 0;
+            var a_t: f32 = 0;
+            var b_t: f32 = 0;
+            for (0..h) |k| {
+                a_r += rnd[k];
+                a_t += tok[k];
+            }
+            for (h..hn) |k| {
+                b_r += rnd[k];
+                b_t += tok[k];
+            }
+            const fh: f32 = @floatFromInt(h);
+            const sh: f32 = @floatFromInt(hn - h);
+            t.textClip(t.z("older half -> newer half: {d:.1} -> {d:.1} rounds, {d:.0}k -> {d:.0}k tokens per cast", .{ a_r / fh, b_r / sh, a_t / fh, b_t / sh }), @intFromFloat(cx), @intFromFloat(ty), 12, if (b_t <= a_t and b_r <= a_r) t.green else t.comment, @intFromFloat(cw));
+        } else {
+            t.textClip(if (hn == 0) "no casts recorded yet - history starts with the next cast" else "one cast so far - the trend starts at the second", @intFromFloat(cx), @intFromFloat(ty), 12, t.comment, @intFromFloat(cw));
+        }
+        const bty = card.y + card_h - 34;
+        if (t.button(.{ .x = cx, .y = bty, .width = t.btnW("cast again", 24), .height = 24 }, t.z("cast again", .{}), t.blue, true)) use_idx = i;
+        if (row.pending > 0) {
+            const rl_lbl = t.z("review {d} proposal(s)", .{row.pending});
+            if (t.buttonGhost(.{ .x = cx + t.btnW("cast again", 24) + 10, .y = bty, .width = t.btnW(rl_lbl, 24), .height = 24 }, rl_lbl, t.green, true)) review = true;
+        }
+    }
+    if (use_idx) |i| {
+        setField(&ui.d_lineage, rows[i].idStr());
+        ui.swarm_inner = .deploy;
+    }
+    if (review) {
+        // the keep/drop cards live in the Chat tab's Memory pane
+        ui.tab = .chat;
+        ui.right_tab = .memory;
     }
 }
 

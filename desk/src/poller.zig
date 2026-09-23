@@ -57,6 +57,7 @@ pub const Poller = struct {
     last_llm_s: i64 = 0, // LLM-usage metrics poll throttle (Dashboard aggregates move slowly)
     last_lin_s: i64 = 0, // swarm-lineage proposal poll throttle (0 = next tick; a keep/drop resets it)
     lin_scratch: [store_mod.MAX_LIN_PROPS]store_mod.LinPropRow = undefined,
+    lineage_scratch: [store_mod.MAX_LINEAGES]store_mod.LineageRow = undefined,
     // idle-churn gates: the roster walk + the selected swarm's Details/Files sub-scans ran EVERY second
     // forever; these cache the last result so an idle desk touches the filesystem every 5-10s instead.
     last_roster_s: i64 = 0, // last full data-dir roster walk (0 = force next tick; deploy/delete reset it)
@@ -962,6 +963,13 @@ pub const Poller = struct {
         }
         const n = collectLinProps(self.io, self.gpa, self.port(), tok, list.body, &self.lin_scratch) orelse return;
         self.publishLinProps(n);
+        // the same listing feeds the Swarm tab's Lineages view: counts from the list, history from each detail
+        const nl = collectLineages(self.io, self.gpa, self.port(), tok, list.body, &self.lineage_scratch);
+        self.store.lock();
+        defer self.store.unlock();
+        @memcpy(self.store.lineages[0..nl], self.lineage_scratch[0..nl]);
+        self.store.lineage_count = nl;
+        self.store.lineages_seen = true;
     }
 
     fn publishLinProps(self: *Poller, n: usize) void {
@@ -1687,6 +1695,73 @@ fn parseLlmDay(obj: []const u8, day: *store_mod.LlmDay) void {
     }
 }
 
+/// A /api/v1/lineages row's counts into `row` (the history comes from the detail). Pure.
+fn parseLineageRow(obj: []const u8, row: *store_mod.LineageRow) void {
+    var cur: usize = 0;
+    while (scan.nextJsonPair(obj, &cur)) |p| {
+        if (p.is_str) {
+            if (std.mem.eql(u8, p.key, "id")) row.id_len = @intCast(scan.unescapeInto(p.raw, &row.id).len);
+            continue;
+        }
+        const v = std.fmt.parseInt(u32, p.raw, 10) catch continue;
+        if (std.mem.eql(u8, p.key, "lessons")) row.lessons = v else if (std.mem.eql(u8, p.key, "skills")) row.skills = v else if (std.mem.eql(u8, p.key, "playbook")) row.playbook = v else if (std.mem.eql(u8, p.key, "pending")) row.pending = v else if (std.mem.eql(u8, p.key, "rejected")) row.rejected = v else if (std.mem.eql(u8, p.key, "casts")) row.casts = v;
+    }
+}
+
+/// A /api/v1/lineages/<id> body's "history" array (oldest first) into `row`, keeping the newest LINEAGE_HIST. Pure.
+fn parseLineageHistory(body: []const u8, row: *store_mod.LineageRow) void {
+    const at = std.mem.indexOf(u8, body, "\"history\":[") orelse return;
+    var cur = at + "\"history\":[".len;
+    var all: [128]struct { pct: u8, rounds: u16, tok_k: u32, prop: u8, t: i64 } = undefined;
+    var n: usize = 0;
+    while (scan.nextJsonObj(body, &cur)) |obj| {
+        var e: @TypeOf(all[0]) = .{ .pct = 0, .rounds = 0, .tok_k = 0, .prop = 0, .t = 0 };
+        var pc: usize = 0;
+        while (scan.nextJsonPair(obj, &pc)) |p| {
+            if (p.is_str) continue;
+            const v = std.fmt.parseInt(i64, p.raw, 10) catch continue;
+            if (v < 0) continue;
+            if (std.mem.eql(u8, p.key, "best_pct")) e.pct = @intCast(@min(v, 100)) else if (std.mem.eql(u8, p.key, "rounds")) e.rounds = @intCast(@min(v, 65535)) else if (std.mem.eql(u8, p.key, "tok_in")) e.tok_k = @intCast(@min(@divTrunc(v, 1000), std.math.maxInt(u32))) else if (std.mem.eql(u8, p.key, "proposed")) e.prop = @intCast(@min(v, 255)) else if (std.mem.eql(u8, p.key, "t")) e.t = v;
+        }
+        if (n == all.len) {
+            std.mem.copyForwards(@TypeOf(all[0]), all[0 .. all.len - 1], all[1..]);
+            n -= 1;
+        }
+        all[n] = e;
+        n += 1;
+    }
+    const keep = @min(n, store_mod.LINEAGE_HIST);
+    const from = n - keep;
+    for (all[from..n], 0..) |e, i| {
+        row.hist_pct[i] = e.pct;
+        row.hist_rounds[i] = e.rounds;
+        row.hist_tok_k[i] = e.tok_k;
+        row.hist_prop[i] = e.prop;
+    }
+    row.hist_n = @intCast(keep);
+    row.last_t = if (n > 0) all[n - 1].t else 0;
+}
+
+/// Every lineage in a /api/v1/lineages body, each with its history from one detail GET. A detail that fails keeps
+/// the row with its counts and no history.
+fn collectLineages(io: std.Io, gpa: std.mem.Allocator, port: u16, tok: []const u8, list_body: []const u8, out: []store_mod.LineageRow) usize {
+    const arr = std.mem.indexOf(u8, list_body, "\"lineages\":[") orelse return 0;
+    var cur = arr + "\"lineages\":[".len;
+    var n: usize = 0;
+    while (n < out.len) {
+        const obj = scan.nextJsonObj(list_body, &cur) orelse break;
+        out[n] = .{};
+        parseLineageRow(obj, &out[n]);
+        if (out[n].id_len == 0) continue;
+        if (netcli.lineageDetail(io, gpa, port, tok, out[n].idStr())) |resp| {
+            defer if (resp.body.len > 0) gpa.free(resp.body);
+            if (resp.status == 200) parseLineageHistory(resp.body, &out[n]);
+        }
+        n += 1;
+    }
+    return n;
+}
+
 /// Walk a /api/v1/lineages body; for each lineage with pending > 0, fetch its proposals into `out`. Returns
 /// the row count, or null when a proposals fetch was unreachable (keep the last rows rather than blank them).
 fn collectLinProps(io: std.Io, gpa: std.mem.Allocator, port: u16, tok: []const u8, list_body: []const u8, out: []store_mod.LinPropRow) ?usize {
@@ -2264,4 +2339,39 @@ test "a lineage keep posts the exact proposal to the server, notifies, and re-li
         try std.testing.expectEqualStrings("Lesson promoted", s.notifs[s.notif_head % s.notifs.len].titleStr());
     }
     try std.testing.expectEqual(@as(i64, 0), p.last_lin_s);
+}
+
+
+test "lineage rows: counts from the list, the newest history from the detail, a torn row skipped" {
+    var row: store_mod.LineageRow = .{};
+    parseLineageRow("{\"id\":\"acme\",\"lessons\":4,\"skills\":2,\"playbook\":1,\"pending\":3,\"rejected\":1,\"casts\":30}", &row);
+    try std.testing.expectEqualStrings("acme", row.idStr());
+    try std.testing.expectEqual(@as(u32, 4), row.lessons);
+    try std.testing.expectEqual(@as(u32, 3), row.pending);
+    try std.testing.expectEqual(@as(u32, 30), row.casts);
+
+    // 30 casts: the row keeps the newest LINEAGE_HIST, oldest first
+    var body: std.ArrayListUnmanaged(u8) = .empty;
+    defer body.deinit(std.testing.allocator);
+    try body.appendSlice(std.testing.allocator, "{\"id\":\"acme\",\"history\":[");
+    var i: usize = 0;
+    while (i < 30) : (i += 1) {
+        if (i > 0) try body.append(std.testing.allocator, ',');
+        var b: [200]u8 = undefined;
+        try body.appendSlice(std.testing.allocator, try std.fmt.bufPrint(&b, "{{\"t\":{d},\"run\":\"r\",\"rounds\":{d},\"best_pct\":{d},\"tok_in\":{d},\"proposed\":1}}", .{ 1000 + i, i, 70 + i, (i + 1) * 1000 }));
+    }
+    try body.appendSlice(std.testing.allocator, "]}");
+    parseLineageHistory(body.items, &row);
+    try std.testing.expectEqual(@as(u8, store_mod.LINEAGE_HIST), row.hist_n);
+    try std.testing.expectEqual(@as(u8, 70 + 6), row.hist_pct[0]); // cast 6 is the oldest kept of 30
+    try std.testing.expectEqual(@as(u8, 99), row.hist_pct[store_mod.LINEAGE_HIST - 1]);
+    try std.testing.expectEqual(@as(u32, 30), row.hist_tok_k[store_mod.LINEAGE_HIST - 1]);
+    try std.testing.expectEqual(@as(i64, 1029), row.last_t);
+
+    // no history yet: nothing changes, nothing panics
+    var fresh: store_mod.LineageRow = .{};
+    parseLineageHistory("{\"id\":\"x\",\"history\":[]}", &fresh);
+    try std.testing.expectEqual(@as(u8, 0), fresh.hist_n);
+    parseLineageHistory("{\"ok\":false}", &fresh);
+    try std.testing.expectEqual(@as(u8, 0), fresh.hist_n);
 }
