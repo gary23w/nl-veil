@@ -1139,6 +1139,13 @@ fn preloadDesktopKey(gpa: std.mem.Allocator, io: std.Io, auth: *Auth, keys: *@im
     if (std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(256))) |old| {
         defer gpa.free(old);
         if (keys.verify(std.mem.trim(u8, old, " \r\n\t")) != null) return;
+        // A store that could not be READ verifies nothing, so "not valid" means "not known" here. Replacing the
+        // file then destroyed a working key: the desk and the CLI lost their auth although the key was still on
+        // record (seen 2026-09-22 with two servers on one data dir). Keep the file; the next clean boot decides.
+        if (!keys.loaded) {
+            log.warn("veil-desk: the key store could not be read; keeping the existing <data>/.desktop_key", .{});
+            return;
+        }
     } else |_| {}
     const email = environ.get("NL_ADMIN_EMAIL") orelse DEFAULT_ADMIN_EMAIL;
     const pw = admin_pw orelse "changeme"; // null = nothing was seeded, so the shipped default stands
@@ -1150,6 +1157,12 @@ fn preloadDesktopKey(gpa: std.mem.Allocator, io: std.Io, auth: *Auth, keys: *@im
     const u = auth.whoami(tok) orelse return;
     const key = keys.create(u.id, "veil-desk") catch return;
     defer gpa.free(key);
+    // create() files the record fail-open; a key that never reached the store dies with this process, and
+    // writing it would replace whatever the file held with a key that is invalid after the next restart.
+    if (!keys.persisted(key)) {
+        log.warn("veil-desk: the new local API key could not be stored; <data>/.desktop_key left unchanged", .{});
+        return;
+    }
     std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = key }) catch return;
     log.info("veil-desk: preloaded an admin API key at <data>/.desktop_key (localhost)", .{});
 }
