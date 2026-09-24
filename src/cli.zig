@@ -113,7 +113,7 @@ pub fn isCommand(sub: []const u8) bool {
         "sched",     "hub",           "doctor", "health",  "desktop",   "desk",
         "help",      "--help",        "-h",     "version", "--version", "exec-tool",
         "sync-read", "sync-manifest", "rag",    "themes",  "plugins",   "plug",
-        "model",     "dataset",       "set",    "lineage",
+        "model",     "dataset",       "set",    "lineage",   "swarm",     "--swarm",
     };
     for (verbs) |v| if (std.mem.eql(u8, sub, v)) return true;
     return false;
@@ -159,6 +159,7 @@ pub fn dispatch(ctx: *Ctx, sub: []const u8, args: []const []const u8) u8 {
     if (std.mem.eql(u8, sub, "model")) return cmdModel(ctx, args);
     if (std.mem.eql(u8, sub, "dataset") or std.mem.eql(u8, sub, "set")) return cmdDataset(ctx, args);
     if (std.mem.eql(u8, sub, "lineage")) return cmdLineage(ctx, args);
+    if (std.mem.eql(u8, sub, "swarm") or std.mem.eql(u8, sub, "--swarm")) return @import("cli/swarm_tui.zig").cmd(ctx, args);
     std.debug.print("unknown command '{s}' — run `veil help`\n", .{sub});
     return 1;
 }
@@ -169,7 +170,7 @@ const HttpErr = error{ Unreachable, ServerError };
 
 /// One authenticated request to the local server. On a connect-refused it auto-starts the daemon once and
 /// retries, so any verb works from cold. Returns the gpa-owned response (caller frees body) or an error.
-fn call(ctx: *Ctx, method: []const u8, path: []const u8, body: ?[]const u8, timeout_s: u32, autostart: bool) HttpErr!httpc.Resp {
+pub fn call(ctx: *Ctx, method: []const u8, path: []const u8, body: ?[]const u8, timeout_s: u32, autostart: bool) HttpErr!httpc.Resp {
     var started = false;
     while (true) {
         switch (httpc.request(ctx.io, ctx.gpa, .{
@@ -230,7 +231,7 @@ fn ensureServer(ctx: *Ctx) bool {
     return false;
 }
 
-fn unreachable_msg(ctx: *Ctx) u8 {
+pub fn unreachable_msg(ctx: *Ctx) u8 {
     std.debug.print("no veil server on :{d} and it could not be started. Run `veil` (no arguments) in the repo to boot it.\n", .{ctx.port});
     return 1;
 }
@@ -708,7 +709,8 @@ fn cmdEvents(ctx: *Ctx, args: []const []const u8) u8 {
 }
 
 /// Tail a swarm's events.jsonl by advancing the byte cursor (the same protocol the desk poller uses). Prints
-/// new bytes as they arrive; ends on a {done} frame or Ctrl-C. Bounded per-poll; a slow server just paces it.
+/// new bytes as they arrive; ends on the swarm's {stopped} frame (or a chat {done}) or Ctrl-C. Bounded per-poll; a
+/// slow server just paces it.
 fn followEvents(ctx: *Ctx, id: []const u8) u8 {
     var from: usize = 0;
     var idle: u32 = 0;
@@ -725,7 +727,7 @@ fn followEvents(ctx: *Ctx, id: []const u8) u8 {
             out("{s}", .{resp.body});
             from += resp.body.len;
             idle = 0;
-            if (std.mem.indexOf(u8, resp.body, "\"kind\":\"done\"") != null) {
+            if (std.mem.indexOf(u8, resp.body, "\"kind\":\"done\"") != null or std.mem.indexOf(u8, resp.body, "\"kind\":\"stopped\"") != null) {
                 out("\n[done]\n", .{});
                 return 0;
             }
@@ -1133,6 +1135,9 @@ fn cmdHelp() u8 {
         \\  veil <command> [args]        talk to the running server (auto-starts it if needed)
         \\
         \\SWARMS
+        \\  --swarm "<goal>" [flags]     cast a swarm and WATCH it: every mind's step on the right, one chat line
+        \\                               into the whole swarm on the left; runs to completion on its own
+        \\      --minds N  --minutes N  --model M  --provider P  --lineage <id>  --once
         \\  cast "<goal>" [flags]        deploy a swarm to work a goal
         \\      --minutes N  --minds N  --model M  --provider P  --base-url U  --key K
         \\      --style S  --name N  --continuous  --offline  --follow
@@ -1724,7 +1729,7 @@ pub fn out(comptime fmt: []const u8, args: anytype) void {
 
 /// `--flag value` reader: if `a == flag`, advance `*i` past the value and return it (empty when it's the last
 /// token). Also accepts `--flag=value`. Returns null when `a` isn't this flag.
-fn flagVal(args: []const []const u8, i: *usize, a: []const u8, flag: []const u8) ?[]const u8 {
+pub fn flagVal(args: []const []const u8, i: *usize, a: []const u8, flag: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, a, flag)) {
         if (i.* + 1 < args.len) {
             i.* += 1;
@@ -1766,7 +1771,7 @@ pub fn jstr(gpa: std.mem.Allocator, list: *std.ArrayListUnmanaged(u8), s: []cons
     list.append(gpa, '"') catch return;
 }
 
-fn appendStr(gpa: std.mem.Allocator, list: *std.ArrayListUnmanaged(u8), field: []const u8, val: []const u8) void {
+pub fn appendStr(gpa: std.mem.Allocator, list: *std.ArrayListUnmanaged(u8), field: []const u8, val: []const u8) void {
     list.append(gpa, ',') catch return;
     jstr(gpa, list, field);
     list.append(gpa, ':') catch return;
@@ -1775,7 +1780,7 @@ fn appendStr(gpa: std.mem.Allocator, list: *std.ArrayListUnmanaged(u8), field: [
 
 /// Append `,"field":<val>` treating val as a raw NUMBER when it parses as one, else as a quoted string (so a
 /// bad --minutes value degrades to a string the server rejects cleanly rather than producing invalid JSON).
-fn appendNum(gpa: std.mem.Allocator, list: *std.ArrayListUnmanaged(u8), field: []const u8, val: []const u8) void {
+pub fn appendNum(gpa: std.mem.Allocator, list: *std.ArrayListUnmanaged(u8), field: []const u8, val: []const u8) void {
     _ = std.fmt.parseInt(i64, val, 10) catch return appendStr(gpa, list, field, val);
     list.append(gpa, ',') catch return;
     jstr(gpa, list, field);
