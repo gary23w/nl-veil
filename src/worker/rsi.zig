@@ -10,6 +10,7 @@ const std = @import("std");
 const llm = @import("llm.zig");
 const tools = @import("tools.zig");
 const run = @import("run.zig");
+const prop_review = @import("proposals.zig"); // near-duplicate + noise filters for what the judge proposes
 
 const Worker = run.Worker;
 const MindState = run.MindState;
@@ -657,12 +658,22 @@ pub fn runJudge(w: *Worker) void {
     // what review already turned down (proposals.zig) — a lineage would otherwise re-mint it every run
     const rejected = w.mem.list(tools.PROPOSAL_REJECTED_SCOPE);
     defer gpa.free(rejected);
+    // facts already live or waiting: a FACT the lineage holds must not come back as a new proposal
+    const live_facts = w.mem.list(tools.FACT_SCOPE);
+    defer gpa.free(live_facts);
+    const pend_f = w.mem.list(tools.FACT_PROPOSED_SCOPE);
+    defer gpa.free(pend_f);
+    const known_facts: []const u8 = std.mem.concat(gpa, u8, &.{ live_facts, "\n", pend_f }) catch "";
+    defer if (known_facts.len > 0) gpa.free(known_facts);
+    var minted: std.ArrayListUnmanaged(u8) = .empty; // this reply's own accepted lines, for in-reply dedup
+    defer minted.deinit(gpa);
     const sys =
         "You are an EXTERNAL REVIEWER for a multi-mind agent run, reading a TRACE of what actually happened. " ++
         "act rows are REAL tool executions with their REAL results (exit codes and error text live inside the result strings); score rows are the engine's measured benchmark. " ++
         "Never trust narration — grade only what the trace proves.\n" ++
-        "Propose durable entries ONLY where the trace PROVES a transition: a real failure followed by a real working fix, or a technique that measurably raised the score.\n" ++
+        "Propose durable entries ONLY where the trace PROVES them: a real failure followed by a real working fix, a technique that measurably raised the score, or a requirement of THIS task that a tool output stated.\n" ++
         "Output zero or more lines, nothing else:\n" ++
+        "FACT: <one requirement or constraint of this task, as a tool output stated it - e.g. a checker's rule, a function's real signature, a data file's real format> | evidence: <the tool result that states it>\n" ++
         "LESSON: <one general operational lesson> | evidence: <the trace rows that prove it>\n" ++
         "SKILL: <one class-level reusable procedure> | evidence: <proof>\n" ++
         "If nothing qualifies, output exactly: NONE\n" ++
@@ -671,7 +682,9 @@ pub fn runJudge(w: *Worker) void {
         "- NEVER an environment-dependent failure (missing binary, unconfigured credential, server down) as a durable lesson;\n" ++
         "- if retrying the SAME call worked, the lesson is the retry pattern, not the failure;\n" ++
         "- prefer PATCHING an existing lesson into a more general form over minting a narrow new one — output the full patched text;\n" ++
-        "- every proposal must be provable from the trace alone; no proposal without concrete evidence.";
+        "- every proposal must be provable from the trace alone; no proposal without concrete evidence;\n" ++
+        "- PREFER FACTs: the next run on this task gains most from what THIS task requires (the rules a checker enforced, what a test expected), least from generic process advice any competent agent already follows ('read the file first', 'make narrow edits') - propose that only when the trace shows it changed an outcome;\n" ++
+        "- never paste raw tool arguments or JSON into a proposal; state the rule in plain words.";
     const user = std.fmt.allocPrint(gpa,
         \\Goal: {s}
         \\
@@ -680,6 +693,9 @@ pub fn runJudge(w: *Worker) void {
         \\
         \\PENDING PROPOSALS (never re-propose these):
         \\{s}
+        \\{s}
+        \\
+        \\FACTS ALREADY KNOWN (never re-propose these):
         \\{s}
         \\
         \\REJECTED IN REVIEW (never re-propose these either):
@@ -692,6 +708,7 @@ pub fn runJudge(w: *Worker) void {
         if (lessons.len > 0) clipTail(lessons, 700) else "(none)",
         if (pend_l.len > 0) clipTail(pend_l, 400) else "(none)",
         if (pend_s.len > 0) clipTail(pend_s, 400) else "",
+        if (known_facts.len > 1) clipTail(known_facts, 500) else "(none)",
         if (rejected.len > 0) clipTail(rejected, 400) else "(none)",
         tr.items,
     }) catch return;
@@ -704,7 +721,19 @@ pub fn runJudge(w: *Worker) void {
     while (rit.next()) |raw| {
         if (n >= 4) break; // bounded — a flood of "lessons" is judge noise, not learning
         const pr = run.parseProposal(raw) orelse continue;
-        const scope = if (pr.kind == 1) tools.SKILL_PROPOSED_SCOPE else tools.LESSON_PROPOSED_SCOPE;
+        // noise and repeats never reach review: a raw-JSON "lesson", or one that restates what is already live,
+        // pending, rejected, or a line this same reply already proposed (lineage bench v2 stored exact duplicates)
+        if (prop_review.looksLikeNoise(pr.text)) continue;
+        if (prop_review.nearDuplicate(pr.text, lessons) or prop_review.nearDuplicate(pr.text, pend_l) or
+            prop_review.nearDuplicate(pr.text, pend_s) or prop_review.nearDuplicate(pr.text, rejected) or
+            prop_review.nearDuplicate(pr.text, known_facts) or prop_review.nearDuplicate(pr.text, minted.items)) continue;
+        minted.appendSlice(gpa, pr.text) catch {};
+        minted.append(gpa, '\n') catch {};
+        const scope = switch (pr.kind) {
+            1 => tools.SKILL_PROPOSED_SCOPE,
+            2 => tools.FACT_PROPOSED_SCOPE,
+            else => tools.LESSON_PROPOSED_SCOPE,
+        };
         var ab: [640]u8 = undefined;
         _ = w.mem.observe(scope, run.atomizeForObserve(&ab, pr.text));
         w.act("judge", 0, "propose", scope, pr.text);
