@@ -48,7 +48,7 @@ code and credentials from anything you share.
 
 <p>
   <a href="https://github.com/gary23w/nl-veil/actions/workflows/release.yml"><img alt="build" src="https://github.com/gary23w/nl-veil/actions/workflows/release.yml/badge.svg"></a>
-  <a href="https://github.com/gary23w/nl-veil/releases"><img alt="release" src="https://img.shields.io/badge/release-v1.1.5-A8241B"></a>
+  <a href="https://github.com/gary23w/nl-veil/releases"><img alt="release" src="https://img.shields.io/badge/release-v1.1.6-A8241B"></a>
   <img alt="zig" src="https://img.shields.io/badge/zig-0.16-F7A41D?logo=zig&logoColor=white">
   <a href="https://huggingface.co/gary23w/the-veil-12b"><img alt="built-in model" src="https://img.shields.io/badge/built--in%20model-the--veil--12b-6E4A27?logo=huggingface&logoColor=white"></a>
   <a href="https://huggingface.co/gary23w/gary-neuron-emergent"><img alt="memory cortex" src="https://img.shields.io/badge/cortex-gary--neuron--emergent-6E4A27?logo=huggingface&logoColor=white"></a>
@@ -350,7 +350,7 @@ raylib is a *lazy* dependency, so `-Dapp=false` never fetches it at all.
 ## Install
 
 **Download it and run it — no toolchain, nothing to build.** Grab your platform's bundle from the
-**[latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.1.5)**, unzip, and run `veil`:
+**[latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.1.6)**, unzip, and run `veil`:
 
 | You're on | Download | Then run |
 |---|---|---|
@@ -511,7 +511,7 @@ step 5** — the rest is about letting other people in.
 
 ### 1. Download and unblock it
 
-Grab the bundle for your OS from the [latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.1.5)
+Grab the bundle for your OS from the [latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.1.6)
 and unzip it somewhere you'll find again. Builds are unsigned, so:
 
 - **Windows** shows *"Windows protected your PC"* → **More info** → **Run anyway**.
@@ -547,7 +547,7 @@ On startup the server prints one complete URL per address this machine answers o
 (`src/main.zig:861-889`, using `src/config/lan.zig`):
 
 ```
-neuron-loops 1.1.5 on http://localhost:8787
+neuron-loops 1.1.6 on http://localhost:8787
     open from another machine (phone, laptop) at:
       http://192.168.1.42:8787
 ```
@@ -690,8 +690,9 @@ veil                          start the app: server + desktop (--server-only for
 
 SWARMS
   --swarm "<goal>" [flags]     cast a swarm and WATCH it: every mind's step on the right, one chat line
-                               into the whole swarm on the left; runs to completion on its own
-      --minds N  --minutes N  --model M  --provider P  --lineage <id>  --once
+                               into the whole swarm on the left; runs to completion on its own, with as
+                               many minds as the goal needs (--minds N to choose)
+      --minutes N  --model M  --provider P  --lineage <id>  --once  --background (no terminal view)
   cast "<goal>" [flags]        deploy a swarm to work a goal
       --minutes N  --minds N  --model M  --provider P  --base-url U  --key K
       --style S  --name N  --continuous  --offline  --follow
@@ -1382,17 +1383,24 @@ dependency entirely rather than compiling it unused.
 
 ## Release
 
-**Current: [`v1.1.5`](https://github.com/gary23w/nl-veil/releases/tag/v1.1.5)** — what a swarm lineage
-learns can reach its next cast: the end-of-run judge's lessons and skills and the mined habits are reviewed
-with `veil lineage` or keep/drop cards in the desktop's Memory pane, and a dropped proposal is not proposed
-again. A turn whose first reply comes back empty is asked again with its tools instead of guessing, and the
-desktop key survives a server that could not read its key store. [Full notes](docs/release/RELEASE-v1.1.5.md).
+**Current: [`v1.1.6`](https://github.com/gary23w/nl-veil/releases/tag/v1.1.6)** — `veil --swarm "<goal>"` casts a
+swarm and opens a terminal view of it: every mind's step on the right, one chat line into the whole swarm on
+the left, running to completion on its own. Lineages now keep **facts** a tool output proved (the checker's
+rules, a real signature) beside their lessons, every cast is on record in the lineage's history, and the
+desktop's **Swarm → Lineages** view shows each lineage's memory and its casts over time. The CLI reads the
+desktop's settings (host, port, chat model), and `veil --configure` connects a machine that has no desktop.
+[Full notes](docs/release/RELEASE-v1.1.6.md).
 
 **Updating:** from v1.1.3 or later, use **Settings → Updates → App updates → Update & restart**.
 Versions before v1.1.3 require a manual full-bundle installation. Updates verify both executables and
 preserve data, with backups for recovery. [Updating and network troubleshooting](docs/UPDATES.md).
 
-**Previously: [`v1.1.4`](docs/release/RELEASE-v1.1.4.md)** — a calmer desktop with visible preparation and
+**Previously: [`v1.1.5`](docs/release/RELEASE-v1.1.5.md)** — what a swarm lineage learns can reach its next
+cast: the judge's lessons and skills and the mined habits are reviewed with `veil lineage` or keep/drop cards in
+the Memory pane; a turn whose first reply comes back empty is asked again with its tools; the desktop key
+survives a server that could not read its key store.
+
+**Before it: [`v1.1.4`](docs/release/RELEASE-v1.1.4.md)** — a calmer desktop with visible preparation and
 planning updates, five organized settings pages, editable starter prompts, steadier streaming, and cleaner
 code blocks, plus a fix for an HTTP completion race that could report a false timeout.
 [Desktop guide](docs/DESK-UI.md).

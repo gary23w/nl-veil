@@ -811,8 +811,9 @@ fn control(ctx: *Ctx, id: []const u8, body: []const u8) bool {
     return resp.status >= 200 and resp.status < 300;
 }
 
-/// `veil --swarm "<goal>" [--minds N] [--minutes N] [--model M] [--provider P] [--lineage <id>] [--once]`
-/// (also `veil swarm ...`). Casts the goal as a CONTINUOUS swarm unless `--once`, then watches it from the terminal.
+/// `veil --swarm "<goal>" [--minds N] [--minutes N] [--model M] [--provider P] [--lineage <id>] [--once] [--background]`
+/// (also `veil swarm ...`). Casts the goal as a CONTINUOUS swarm unless `--once`, sized by the server from the goal
+/// unless `--minds`, then watches it from the terminal - or, with `--background`, prints the id and returns.
 pub fn cmd(ctx: *Ctx, args: []const []const u8) u8 {
     var goal: []const u8 = "";
     var minutes: []const u8 = "";
@@ -821,17 +822,20 @@ pub fn cmd(ctx: *Ctx, args: []const []const u8) u8 {
     var provider: []const u8 = "";
     var lineage: []const u8 = "";
     var once = false;
+    var background = false;
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const a = args[i];
         if (cli.flagVal(args, &i, a, "--minutes")) |v| minutes = v else if (cli.flagVal(args, &i, a, "--minds")) |v| minds = v else if (cli.flagVal(args, &i, a, "--model")) |v| model = v else if (cli.flagVal(args, &i, a, "--provider")) |v| provider = v else if (cli.flagVal(args, &i, a, "--lineage")) |v| lineage = v else if (std.mem.eql(u8, a, "--once")) {
             once = true;
+        } else if (std.mem.eql(u8, a, "--background") or std.mem.eql(u8, a, "--bg")) {
+            background = true;
         } else if (a.len > 0 and a[0] != '-' and goal.len == 0) {
             goal = a;
         }
     }
     if (goal.len == 0) {
-        cli.out("usage: veil --swarm \"<goal>\" [--minds N] [--minutes N] [--model M] [--provider P] [--lineage <id>] [--once]\n", .{});
+        cli.out("usage: veil --swarm \"<goal>\" [--minds N] [--minutes N] [--model M] [--provider P] [--lineage <id>] [--once] [--background]\n", .{});
         return 1;
     }
     var jb: std.ArrayListUnmanaged(u8) = .empty;
@@ -839,10 +843,12 @@ pub fn cmd(ctx: *Ctx, args: []const []const u8) u8 {
     jb.appendSlice(ctx.gpa, "{\"goal\":") catch return 1;
     cli.jstr(ctx.gpa, &jb, goal);
     if (minutes.len > 0) cli.appendNum(ctx.gpa, &jb, "minutes", minutes);
-    if (minds.len > 0) cli.appendNum(ctx.gpa, &jb, "minds", minds);
+    // minds: an explicit count, else 0 = "as many as the goal needs" (the server's sizeCast decides, within the plan)
+    if (minds.len > 0) cli.appendNum(ctx.gpa, &jb, "minds", minds) else cli.appendNum(ctx.gpa, &jb, "minds", "0");
     if (model.len > 0) cli.appendStr(ctx.gpa, &jb, "model", model);
     if (provider.len > 0) cli.appendStr(ctx.gpa, &jb, "provider", provider);
     if (lineage.len > 0) cli.appendStr(ctx.gpa, &jb, "lineage", lineage);
+    cli.appendDeskModel(ctx, &jb, model.len > 0 or provider.len > 0); // the desk's chat model, unless told otherwise
     if (!once) cli.appendStr(ctx.gpa, &jb, "mode", "continuous");
     jb.append(ctx.gpa, '}') catch return 1;
     const resp = cli.call(ctx, "POST", "/api/v1/cast", jb.items, 30, true) catch return cli.unreachable_msg(ctx);
@@ -856,12 +862,20 @@ pub fn cmd(ctx: *Ctx, args: []const []const u8) u8 {
         return 1;
     };
     defer ctx.gpa.free(id);
+    const sized = cli.jsonNum(resp.body, "minds");
+    if (background) {
+        cli.out("swarm deployed: {s}  ({d} mind(s){s})\n  watch:  veil events {s} --follow\n  attach: veil --swarm-attach is not a verb yet; the desk's Swarm tab shows it\n  stop:   veil stop {s}\n", .{ id, sized, if (minds.len == 0) ", sized from the goal" else "", id, id });
+        return 0;
+    }
 
     var m: Model = .{};
     m.id.set(id);
     m.goal.set(goal);
     m.started_ms = nowMs(ctx.io);
-    m.say(.system, "", "cast deployed - waiting for the swarm to start");
+    {
+        var sb: [96]u8 = undefined;
+        m.say(.system, "", std.fmt.bufPrint(&sb, "cast deployed with {d} mind(s){s} - waiting for the swarm to start", .{ sized, if (minds.len == 0) " sized from the goal" else "" }) catch "cast deployed");
+    }
 
     var keys = Keys{ .io = ctx.io };
     const th = std.Thread.spawn(.{}, Keys.reader, .{&keys}) catch null;
