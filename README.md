@@ -1078,6 +1078,13 @@ model's own claims:
   `veil lineage accept|reject <id> <n>`, or keep/drop on the card in the desktop's Memory pane. An accepted
   proposal goes into the live memory the next cast of that lineage recalls; a rejected one is remembered so
   the judge and the miner do not propose it again. The same habit no longer comes back every run as a new line.
+- **What a lineage keeps is the task, not just the process.** The judge also proposes **facts**: requirements a
+  tool output actually stated (a checker's rule, a function's real signature), which a later cast reads whole
+  as *proven task facts*. Measured first: with lessons alone, a lineage stored "read the file first" and never
+  the two house rules its checker printed on every run. A proposal that restates one already known, or pastes
+  tool JSON, is dropped before review. The desktop's **Swarm → Lineages** view shows each lineage's memory,
+  what awaits review, and its casts over time (round score, rounds, tokens), from the `history.jsonl` every
+  cast now appends to.
 - **A round that breaks one check while fixing another is visible.** The score is an aggregate, so that
   round used to read as "no change" to every loop watching it. The best-known-good build's failure set
   is now the champion and each later round the challenger, so a new break is reported even when the
