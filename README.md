@@ -689,6 +689,9 @@ argv secrets, no Python. The verbs:
 veil                          start the app: server + desktop (--server-only for headless)
 
 SWARMS
+  --swarm "<goal>" [flags]     cast a swarm and WATCH it: every mind's step on the right, one chat line
+                               into the whole swarm on the left; runs to completion on its own
+      --minds N  --minutes N  --model M  --provider P  --lineage <id>  --once
   cast "<goal>" [flags]        deploy a swarm to work a goal
       --minutes N  --minds N  --model M  --provider P  --base-url U  --key K
       --style S  --name N  --continuous  --offline  --follow
