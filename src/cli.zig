@@ -265,14 +265,18 @@ fn cmdConfigure(ctx: *Ctx, args: []const []const u8) u8 {
         std.debug.print("could not write {s}\n", .{path});
         return 1;
     };
-    // apply and prove it
-    const hn = @min(host_v.len, ctx.host_buf.len);
-    @memcpy(ctx.host_buf[0..hn], host_v[0..hn]);
-    ctx.host_len = hn;
+    // apply and prove it (a value left at its current setting already lives in the ctx buffer: no self-copy)
+    if (host_v.ptr != &ctx.host_buf) {
+        const hn = @min(host_v.len, ctx.host_buf.len);
+        @memcpy(ctx.host_buf[0..hn], host_v[0..hn]);
+        ctx.host_len = hn;
+    }
     ctx.port = port_v;
-    const tn = @min(token_v.len, ctx.token_buf.len);
-    @memcpy(ctx.token_buf[0..tn], token_v[0..tn]);
-    ctx.token_len = tn;
+    if (token_v.ptr != &ctx.token_buf) {
+        const tn = @min(token_v.len, ctx.token_buf.len);
+        @memcpy(ctx.token_buf[0..tn], token_v[0..tn]);
+        ctx.token_len = tn;
+    }
     out("saved {s}\n", .{path});
     const resp = call(ctx, "GET", "/api/v1/auth/me", null, 8, false) catch {
         out("not reachable: {s}:{d} - the settings are saved; start the veil there (or check the host) and retry\n", .{ if (host_v.len > 0) host_v else "127.0.0.1", port_v });
