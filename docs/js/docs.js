@@ -35,7 +35,8 @@
       { p: 'cli', c: 'CL-01', t: 'CLI client — every veil verb a thin authenticated call to the local server', s: 'cli.zig' },
       { p: 'cli/chat', c: 'CL-02', t: 'veil chat REPL — server-side brain, client-mode tool delegation', s: 'cli/chat.zig' },
       { p: 'cli/exec_tool', c: 'CL-03', t: 'Shared client tool executor — one tools.execute in the invoker cwd', s: 'cli/exec_tool.zig' },
-      { p: 'cli/hub', c: 'CL-04', t: 'Fleet console — roster, broadcast say/goal, stopall over the API', s: 'cli/hub.zig' }
+      { p: 'cli/hub', c: 'CL-04', t: 'Fleet console — roster, broadcast say/goal, stopall over the API', s: 'cli/hub.zig' },
+      { p: 'cli/swarm_tui', c: 'CL-05', t: 'veil --swarm — a terminal view of a live swarm, one chat line into it', s: 'cli/swarm_tui.zig' }
     ]},
     { key: 'config/', label: 'CONFIG — THE VAULT', docs: [
       { p: 'config/key_vault', c: 'CF-01', t: 'Key vault — write-only BYOK: seal in, never read out', s: 'key_vault.zig' },

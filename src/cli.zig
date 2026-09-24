@@ -85,9 +85,63 @@ pub const Ctx = struct {
     environ: *std.process.Environ.Map,
     token_buf: [128]u8 = undefined,
     token_len: usize = 0,
+    // BOUND TO THE DESK (bindDesk): the server it talks to and the model its casts default to come from the same
+    // {data}/.veil-desk/settings.json the desktop writes, so a user who set the desk up never configures the CLI
+    // separately. A headless machine writes the same file with `veil --configure`.
+    host_buf: [64]u8 = undefined,
+    host_len: usize = 0,
+    def_provider_buf: [32]u8 = undefined,
+    def_provider_len: usize = 0,
+    def_model_buf: [96]u8 = undefined,
+    def_model_len: usize = 0,
+    def_base_buf: [192]u8 = undefined,
+    def_base_len: usize = 0,
 
     fn token(self: *Ctx) []const u8 {
         return self.token_buf[0..self.token_len];
+    }
+    pub fn host(self: *const Ctx) []const u8 {
+        return self.host_buf[0..self.host_len];
+    }
+    pub fn defProvider(self: *const Ctx) []const u8 {
+        return self.def_provider_buf[0..self.def_provider_len];
+    }
+    pub fn defModel(self: *const Ctx) []const u8 {
+        return self.def_model_buf[0..self.def_model_len];
+    }
+    pub fn defBase(self: *const Ctx) []const u8 {
+        return self.def_base_buf[0..self.def_base_len];
+    }
+
+    /// Apply the desk's saved settings: `host` (a remote veil), `port` (unless NL_PORT was given), a `token` the
+    /// file carries (written by `veil --configure`; the desk keeps its own in memory), and the chat model as the
+    /// default for casts and swarms. Missing file or fields leave the defaults alone.
+    pub fn bindDesk(self: *Ctx) void {
+        var pb: [700]u8 = undefined;
+        const path = std.fmt.bufPrint(&pb, "{s}/.veil-desk/settings.json", .{self.data}) catch return;
+        const raw = std.Io.Dir.cwd().readFileAlloc(self.io, path, self.gpa, .limited(64 << 10)) catch return;
+        defer self.gpa.free(raw);
+        const d = deskDefaults(raw);
+        if (d.host.len > 0) {
+            const n = @min(d.host.len, self.host_buf.len);
+            @memcpy(self.host_buf[0..n], d.host[0..n]);
+            self.host_len = n;
+        }
+        if (d.port != 0 and self.environ.get("NL_PORT") == null) self.port = d.port;
+        if (d.token.len > 0) {
+            const n = @min(d.token.len, self.token_buf.len);
+            @memcpy(self.token_buf[0..n], d.token[0..n]);
+            self.token_len = n;
+        }
+        const pn = @min(d.provider.len, self.def_provider_buf.len);
+        @memcpy(self.def_provider_buf[0..pn], d.provider[0..pn]);
+        self.def_provider_len = pn;
+        const mn = @min(d.model.len, self.def_model_buf.len);
+        @memcpy(self.def_model_buf[0..mn], d.model[0..mn]);
+        self.def_model_len = mn;
+        const bn = @min(d.base.len, self.def_base_buf.len);
+        @memcpy(self.def_base_buf[0..bn], d.base[0..bn]);
+        self.def_base_len = bn;
     }
 
     /// Load the admin key the server dropped at {data}/.desktop_key. Empty when absent (server never ran on
@@ -104,6 +158,163 @@ pub const Ctx = struct {
     }
 };
 
+/// What the desk's settings.json means to the CLI. Slices borrow from `json`. Pure.
+pub const DeskCfg = struct {
+    host: []const u8 = "",
+    port: u16 = 0,
+    token: []const u8 = "",
+    provider: []const u8 = "", // the catalog key the desk's chat provider maps to ("" = a custom URL)
+    model: []const u8 = "",
+    base: []const u8 = "", // the custom endpoint, when the desk chats through one
+};
+
+/// The desk writes `kind` (0 local / 1 catalog provider / 2 custom URL), `byok` (a catalog index), `base`,
+/// `model`, `host`, `port`; `veil --configure` adds `token`. Pure over the text (raw field reads, no allocation).
+pub fn deskDefaults(json: []const u8) DeskCfg {
+    const catalog = @import("modelcfg");
+    var d: DeskCfg = .{};
+    d.host = rawStr(json, "host");
+    d.token = rawStr(json, "token");
+    const port = jsonNum(json, "port");
+    if (port > 0 and port < 65536) d.port = @intCast(port);
+    d.model = rawStr(json, "model");
+    const kind = jsonNum(json, "kind");
+    if (kind == 2) {
+        d.base = rawStr(json, "base");
+    } else if (kind == 1) {
+        const i = jsonNum(json, "byok");
+        if (i < catalog.providers.len) d.provider = catalog.providers[i].key;
+    } else {
+        for (catalog.providers) |p| if (catalog.isLocal(p.key)) {
+            d.provider = p.key;
+            break;
+        };
+    }
+    return d;
+}
+
+/// The unescaped-if-plain string value of a field, borrowed: "" when absent, and "" when the value carries an
+/// escape (a host, model or token never legitimately does; a quote inside would need an allocating unescape).
+fn rawStr(json: []const u8, field: []const u8) []const u8 {
+    const val = rawField(json, field) orelse return "";
+    if (val.len < 2 or val[0] != '"') return "";
+    const end = std.mem.indexOfScalarPos(u8, val, 1, '"') orelse return "";
+    const s = val[1..end];
+    return if (std.mem.indexOfScalar(u8, s, '\\') != null) "" else s;
+}
+
+/// The settings.json text with host/port/token set and every other key kept. Caller frees. A file that does not
+/// parse is replaced by one holding just these three (a token is not worth losing to a stray byte).
+pub fn mergeConfigure(gpa: std.mem.Allocator, existing: []const u8, host_v: []const u8, port_v: u16, token_v: []const u8) ![]u8 {
+    var parsed: ?std.json.Parsed(std.json.Value) = if (existing.len > 0) (std.json.parseFromSlice(std.json.Value, gpa, existing, .{}) catch null) else null;
+    defer if (parsed) |*p| p.deinit();
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var obj: std.json.ObjectMap = if (parsed != null and parsed.?.value == .object) try parsed.?.value.object.clone(a) else .empty;
+    try obj.put(a, "host", .{ .string = try a.dupe(u8, host_v) });
+    try obj.put(a, "port", .{ .integer = port_v });
+    if (token_v.len > 0) try obj.put(a, "token", .{ .string = try a.dupe(u8, token_v) }) else _ = obj.orderedRemove("token");
+    return std.json.Stringify.valueAlloc(gpa, std.json.Value{ .object = obj }, .{ .whitespace = .indent_2 });
+}
+
+/// `veil --configure [--host H] [--port P] [--token T]` — connect this machine's CLI (and desk) to a veil: writes
+/// host/port/token into {data}/.veil-desk/settings.json, the file the desk reads too, then proves the connection.
+/// With no flags it asks, showing what is set. The only way onto a remote veil from a box with no desk.
+fn cmdConfigure(ctx: *Ctx, args: []const []const u8) u8 {
+    var host_v: []const u8 = ctx.host();
+    var port_v: u16 = ctx.port;
+    var token_v: []const u8 = ctx.token();
+    var asked = false;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+        if (flagVal(args, &i, a, "--host")) |v| host_v = v else if (flagVal(args, &i, a, "--port")) |v| {
+            port_v = std.fmt.parseInt(u16, v, 10) catch port_v;
+        } else if (flagVal(args, &i, a, "--token")) |v| token_v = v;
+        asked = true;
+    }
+    var hb: [64]u8 = undefined;
+    var pbuf: [16]u8 = undefined;
+    var tb: [128]u8 = undefined;
+    if (!asked) {
+        out("connect this veil CLI (the desk reads the same file)\n", .{});
+        out("  host  [{s}]: ", .{if (host_v.len > 0) host_v else "this machine"});
+        if (readPrompt(ctx, &hb)) |v| if (v.len > 0) {
+            host_v = if (std.mem.eql(u8, v, "this machine") or std.mem.eql(u8, v, "local")) "" else v;
+        };
+        out("  port  [{d}]: ", .{port_v});
+        if (readPrompt(ctx, &pbuf)) |v| if (v.len > 0) {
+            port_v = std.fmt.parseInt(u16, v, 10) catch port_v;
+        };
+        out("  token [{s}]: ", .{if (token_v.len >= 12) token_v[0..12] else if (token_v.len > 0) "set" else "none"});
+        if (readPrompt(ctx, &tb)) |v| if (v.len > 0) {
+            token_v = v;
+        };
+    }
+    var pb: [700]u8 = undefined;
+    const dir = std.fmt.bufPrint(&pb, "{s}/.veil-desk", .{ctx.data}) catch return 1;
+    _ = std.Io.Dir.cwd().createDirPathStatus(ctx.io, dir, .default_dir) catch {};
+    var pb2: [700]u8 = undefined;
+    const path = std.fmt.bufPrint(&pb2, "{s}/.veil-desk/settings.json", .{ctx.data}) catch return 1;
+    const existing = std.Io.Dir.cwd().readFileAlloc(ctx.io, path, ctx.gpa, .limited(64 << 10)) catch "";
+    defer if (existing.len > 0) ctx.gpa.free(existing);
+    const merged = mergeConfigure(ctx.gpa, existing, host_v, port_v, token_v) catch return 1;
+    defer ctx.gpa.free(merged);
+    std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = path, .data = merged }) catch {
+        std.debug.print("could not write {s}\n", .{path});
+        return 1;
+    };
+    // apply and prove it
+    const hn = @min(host_v.len, ctx.host_buf.len);
+    @memcpy(ctx.host_buf[0..hn], host_v[0..hn]);
+    ctx.host_len = hn;
+    ctx.port = port_v;
+    const tn = @min(token_v.len, ctx.token_buf.len);
+    @memcpy(ctx.token_buf[0..tn], token_v[0..tn]);
+    ctx.token_len = tn;
+    out("saved {s}\n", .{path});
+    const resp = call(ctx, "GET", "/api/v1/auth/me", null, 8, false) catch {
+        out("not reachable: {s}:{d} - the settings are saved; start the veil there (or check the host) and retry\n", .{ if (host_v.len > 0) host_v else "127.0.0.1", port_v });
+        return 1;
+    };
+    defer if (resp.body.len > 0) ctx.gpa.free(resp.body);
+    const authed = std.mem.indexOf(u8, resp.body, "\"authed\":true") != null;
+    if (authed) {
+        const email = jsonStr(ctx.gpa, resp.body, "email");
+        defer if (email) |e| ctx.gpa.free(e);
+        out("connected to {s}:{d} as {s}\n", .{ if (host_v.len > 0) host_v else "127.0.0.1", port_v, email orelse "an authenticated user" });
+        return 0;
+    }
+    out("reached {s}:{d}, but the token is not accepted there (HTTP {d}) - mint one on that veil (Settings > API keys, or its data/.desktop_key) and run `veil --configure --token <key>`\n", .{ if (host_v.len > 0) host_v else "127.0.0.1", port_v, resp.status });
+    return 1;
+}
+
+/// One line from stdin for a prompt (null on EOF).
+fn readPrompt(ctx: *Ctx, buf: []u8) ?[]const u8 {
+    const stdin = std.Io.File.stdin();
+    var n: usize = 0;
+    while (n < buf.len) {
+        var one: [1]u8 = undefined;
+        var bufs = [_][]u8{&one};
+        const got = stdin.readStreaming(ctx.io, &bufs) catch return if (n == 0) null else std.mem.trim(u8, buf[0..n], " \r\t");
+        if (got == 0) return if (n == 0) null else std.mem.trim(u8, buf[0..n], " \r\t");
+        if (one[0] == '\n') return std.mem.trim(u8, buf[0..n], " \r\t");
+        buf[n] = one[0];
+        n += 1;
+    }
+    return std.mem.trim(u8, buf[0..n], " \r\t");
+}
+
+/// Casts and swarms with no --model/--provider/--base-url use the desk's chat model (bindDesk). Appends the
+/// fields to a cast body. `given` = the caller named a model or provider itself.
+pub fn appendDeskModel(ctx: *Ctx, jb: *std.ArrayListUnmanaged(u8), given: bool) void {
+    if (given) return;
+    if (ctx.defModel().len > 0) appendStr(ctx.gpa, jb, "model", ctx.defModel());
+    if (ctx.defProvider().len > 0) appendStr(ctx.gpa, jb, "provider", ctx.defProvider());
+    if (ctx.defBase().len > 0) appendStr(ctx.gpa, jb, "base_url", ctx.defBase());
+}
+
 /// True when `sub` is a CLI verb the dispatcher handles (so main.zig can fall through to the server boot for
 /// anything else, keeping bare `veil` = run the daemon). Kept in sync with `dispatch` below.
 pub fn isCommand(sub: []const u8) bool {
@@ -114,6 +325,7 @@ pub fn isCommand(sub: []const u8) bool {
         "help",      "--help",        "-h",     "version", "--version", "exec-tool",
         "sync-read", "sync-manifest", "rag",    "themes",  "plugins",   "plug",
         "model",     "dataset",       "set",    "lineage",   "swarm",     "--swarm",
+        "configure", "--configure",
     };
     for (verbs) |v| if (std.mem.eql(u8, sub, v)) return true;
     return false;
@@ -133,8 +345,10 @@ pub fn dispatch(ctx: *Ctx, sub: []const u8, args: []const []const u8) u8 {
         _ = win.SetConsoleCP(65001);
     }
     ctx.loadToken();
+    ctx.bindDesk(); // the desk's host/port/token/model are the CLI's, unless NL_PORT or a flag says otherwise
     if (std.mem.eql(u8, sub, "help") or std.mem.eql(u8, sub, "--help") or std.mem.eql(u8, sub, "-h"))
         return cmdHelp();
+    if (std.mem.eql(u8, sub, "configure") or std.mem.eql(u8, sub, "--configure")) return cmdConfigure(ctx, args);
     if (std.mem.eql(u8, sub, "version") or std.mem.eql(u8, sub, "--version"))
         return cmdVersion(ctx);
     if (std.mem.eql(u8, sub, "cast")) return cmdCast(ctx, args);
@@ -175,6 +389,7 @@ pub fn call(ctx: *Ctx, method: []const u8, path: []const u8, body: ?[]const u8, 
     while (true) {
         switch (httpc.request(ctx.io, ctx.gpa, .{
             .method = method,
+            .host = ctx.host(),
             .port = ctx.port,
             .path = path,
             .bearer = ctx.token(),
@@ -512,6 +727,7 @@ fn cmdCast(ctx: *Ctx, args: []const []const u8) u8 {
     if (name.len > 0) appendStr(ctx.gpa, &jb, "name", name);
     if (mode.len > 0) appendStr(ctx.gpa, &jb, "mode", mode);
     if (lineage.len > 0) appendStr(ctx.gpa, &jb, "lineage", lineage);
+    appendDeskModel(ctx, &jb, model.len > 0 or provider.len > 0 or base_url.len > 0);
     jb.appendSlice(ctx.gpa, "}") catch return 1;
 
     const resp = call(ctx, "POST", "/api/v1/cast", jb.items, 30, true) catch return unreachable_msg(ctx);
@@ -1133,11 +1349,14 @@ fn cmdHelp() u8 {
         \\  veil                         open the app: desktop window + its server, in ONE process
         \\  veil --server-only           run the server alone (headless hosts, service managers)
         \\  veil <command> [args]        talk to the running server (auto-starts it if needed)
+        \\  veil --configure             connect this CLI to a veil (host, port, token) - the desk's own settings file,
+        \\                               so a configured desk needs nothing more; headless boxes start here
         \\
         \\SWARMS
         \\  --swarm "<goal>" [flags]     cast a swarm and WATCH it: every mind's step on the right, one chat line
-        \\                               into the whole swarm on the left; runs to completion on its own
-        \\      --minds N  --minutes N  --model M  --provider P  --lineage <id>  --once
+        \\                               into the whole swarm on the left; runs to completion on its own, with as
+        \\                               many minds as the goal needs (--minds N to choose)
+        \\      --minutes N  --model M  --provider P  --lineage <id>  --once  --background (no terminal view)
         \\  cast "<goal>" [flags]        deploy a swarm to work a goal
         \\      --minutes N  --minds N  --model M  --provider P  --base-url U  --key K
         \\      --style S  --name N  --continuous  --offline  --follow
@@ -2139,4 +2358,60 @@ test "foldMetricsJsonl: a row missing model or role folds into the view it can, 
     foldMetricsJsonl(gpa, buf.items, &many);
     try std.testing.expectEqual(@as(usize, 24), many.nroles);
     try std.testing.expectEqual(@as(usize, 24), many.nmodels);
+}
+
+test "the CLI binds to the desk's settings: host, port, token and the chat model, per provider kind" {
+    const catalog = @import("modelcfg");
+    // a catalog provider (kind 1): its key becomes the cast default; the desk never writes a token, --configure does
+    var idx: usize = 0;
+    for (catalog.providers, 0..) |p, i| if (std.mem.eql(u8, p.key, "workers-ai")) {
+        idx = i;
+    };
+    var jb: [256]u8 = undefined;
+    const j1 = try std.fmt.bufPrint(&jb, "{{\"kind\":1,\"port\":8899,\"byok\":{d},\"host\":\"10.0.0.7\",\"base\":\"\",\"model\":\"@cf/some/model\",\"token\":\"nlk_abc\"}}", .{idx});
+    const d1 = deskDefaults(j1);
+    try std.testing.expectEqualStrings("10.0.0.7", d1.host);
+    try std.testing.expectEqual(@as(u16, 8899), d1.port);
+    try std.testing.expectEqualStrings("nlk_abc", d1.token);
+    try std.testing.expectEqualStrings("workers-ai", d1.provider);
+    try std.testing.expectEqualStrings("@cf/some/model", d1.model);
+    try std.testing.expectEqualStrings("", d1.base);
+    // a custom URL (kind 2): base carries, no provider key
+    const d2 = deskDefaults("{\"kind\":2,\"port\":8787,\"byok\":0,\"host\":\"\",\"base\":\"http://box:8000/v1\",\"model\":\"qwen\"}");
+    try std.testing.expectEqualStrings("http://box:8000/v1", d2.base);
+    try std.testing.expectEqualStrings("", d2.provider);
+    try std.testing.expectEqualStrings("qwen", d2.model);
+    // local (kind 0): the catalog's local provider
+    const d0 = deskDefaults("{\"kind\":0,\"model\":\"llama3\"}");
+    try std.testing.expect(catalog.isLocal(d0.provider));
+    // no file / garbage: nothing set
+    const dn = deskDefaults("");
+    try std.testing.expectEqual(@as(u16, 0), dn.port);
+    try std.testing.expectEqualStrings("", dn.host);
+}
+
+test "--configure rewrites only host/port/token and keeps the desk's other settings" {
+    const gpa = std.testing.allocator;
+    const before = "{\"kind\":1,\"port\":8787,\"byok\":3,\"theme_id\":\"dark\",\"host\":\"\",\"model\":\"m\",\"leftw\":300}";
+    const after = try mergeConfigure(gpa, before, "veil.lan", 9000, "nlk_new");
+    defer gpa.free(after);
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, after, .{});
+    defer parsed.deinit();
+    const o = parsed.value.object;
+    try std.testing.expectEqualStrings("veil.lan", o.get("host").?.string);
+    try std.testing.expectEqual(@as(i64, 9000), o.get("port").?.integer);
+    try std.testing.expectEqualStrings("nlk_new", o.get("token").?.string);
+    try std.testing.expectEqualStrings("dark", o.get("theme_id").?.string); // untouched
+    try std.testing.expectEqual(@as(i64, 300), o.get("leftw").?.integer);
+    try std.testing.expectEqual(@as(i64, 3), o.get("byok").?.integer);
+    // an empty token removes the key; a missing file yields a fresh object; garbage is replaced, not kept
+    const cleared = try mergeConfigure(gpa, after, "", 8787, "");
+    defer gpa.free(cleared);
+    try std.testing.expect(std.mem.indexOf(u8, cleared, "\"token\"") == null);
+    const fresh = try mergeConfigure(gpa, "", "", 8787, "nlk_x");
+    defer gpa.free(fresh);
+    try std.testing.expect(std.mem.indexOf(u8, fresh, "\"port\": 8787") != null);
+    const fixed = try mergeConfigure(gpa, "{not json", "h", 1, "t");
+    defer gpa.free(fixed);
+    try std.testing.expect(std.mem.indexOf(u8, fixed, "\"host\": \"h\"") != null);
 }

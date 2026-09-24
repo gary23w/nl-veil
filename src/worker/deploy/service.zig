@@ -545,11 +545,56 @@ pub fn cast(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
 /// The server-owned CAST pipeline: server cast defaults, mind naming, the workload-time floor, and the
 /// conversation build-dir redirect — then deploySwarm. Response-decoupled so BOTH the HTTP cast route and the
 /// in-process server chat turn (the veil casting its own swarm) call it.
+/// How many minds a goal needs, when the caller sends `minds: 0` ("you decide"). Deterministic and cheap, so the
+/// answer is explainable: one mind per distinct part of the goal (clauses split on and/then/;/,/numbered steps)
+/// and per pair of declared deliverables, plus a scout for a goal that needs current knowledge and a reviewer for
+/// one that names tests; never below 3 (lead, maker, reviewer) and never above `cap` (the plan's per-swarm limit).
+/// A cast that omits `minds` still gets 3 (the struct default), so only a caller that asks is sized. Pure.
+pub fn sizeCast(goal: []const u8, files: []const u8, cap: usize) usize {
+    var lower_buf: [1024]u8 = undefined;
+    const gl = std.ascii.lowerString(&lower_buf, goal[0..@min(goal.len, lower_buf.len)]);
+    // distinct parts: clause separators and numbered/bulleted steps
+    var parts: usize = 1;
+    for ([_][]const u8{ " and ", " then ", "; ", ", ", " plus ", " also " }) |sep| parts += std.mem.count(u8, gl, sep);
+    var steps: usize = 0;
+    var it = std.mem.tokenizeAny(u8, gl, "\n");
+    while (it.next()) |ln| {
+        const t = std.mem.trimStart(u8, ln, " \t");
+        if (t.len > 2 and ((std.ascii.isDigit(t[0]) and (t[1] == '.' or t[1] == ')')) or t[0] == '-' or t[0] == '*')) steps += 1;
+    }
+    parts = @max(parts, steps);
+    const declared: usize = if (files.len > 0) declCount(files) else 0;
+    var n: usize = @max(3, @min(parts, 8));
+    n = @max(n, 3 + declared / 2);
+    for ([_][]const u8{ "research", "compare", "survey", "latest", "current", "find out", "investigate", "documentation" }) |c| {
+        if (std.mem.indexOf(u8, gl, c) != null) {
+            n += 1;
+            break;
+        }
+    }
+    // word starts only: "latest" is not a test
+    if (std.mem.startsWith(u8, gl, "test") or std.mem.startsWith(u8, gl, "spec")) {
+        n += 1;
+    } else for ([_][]const u8{ " test", " spec", " verify", " coverage" }) |c| {
+        if (std.mem.indexOf(u8, gl, c) != null) {
+            n += 1;
+            break;
+        }
+    }
+    for ([_][]const u8{ "entire", "full ", "end-to-end", "end to end", "whole ", "complete app", "website", "service", "platform" }) |c| {
+        if (std.mem.indexOf(u8, gl, c) != null) {
+            n += 2;
+            break;
+        }
+    }
+    return @max(1, @min(n, if (cap == 0) 1 else cap));
+}
+
 pub fn castSwarm(app: *App, arena: std.mem.Allocator, u: http.User, rq: CastReq) DeployOutcome {
     if (std.mem.trim(u8, rq.goal, " \r\n\t").len == 0)
         return failBad("a goal is required, e.g. {\"goal\":\"research X and report findings\"}");
     const e = ent.entitlements(u.plan, app.auth.isAdmin(u));
-    var n: usize = if (rq.minds == 0) 3 else rq.minds;
+    var n: usize = if (rq.minds == 0) sizeCast(rq.goal, rq.files, e.per_swarm_minds) else rq.minds;
     if (n > e.per_swarm_minds) n = e.per_swarm_minds;
     if (n == 0) n = 1;
     const names = [_][]const u8{ "nova", "ada", "rex", "lux", "sol" };
@@ -1004,6 +1049,22 @@ const DEPLOY_ROUTES = [_]struct { name: []const u8, f: Handler }{
     .{ .name = "adminBilling", .f = adminBilling },
     .{ .name = "swarmDelete", .f = swarmDelete },
 };
+
+test "sizeCast: a plain goal gets the floor, parts and deliverables add minds, research and tests add roles, the cap holds" {
+    try std.testing.expectEqual(@as(usize, 3), sizeCast("write hello.py", "", 30));
+    // five clauses, tests named -> 5 parts + a reviewer
+    try std.testing.expectEqual(@as(usize, 6), sizeCast("build the parser, the formatter, the CLI, the docs and the tests", "", 30));
+    // numbered steps count as parts
+    try std.testing.expectEqual(@as(usize, 4), sizeCast("do this:\n1. scaffold\n2. wire the db\n3. add auth\n4. ship it", "", 30));
+    // ten declared deliverables -> 3 + 5
+    try std.testing.expectEqual(@as(usize, 8), sizeCast("build it", "a.py,b.py,c.py,d.py,e.py,f.py,g.py,h.py,i.py,j.py", 30));
+    // research adds a scout; an end-to-end product adds two
+    try std.testing.expectEqual(@as(usize, 4), sizeCast("research the latest zig io api and summarize", "", 30));
+    try std.testing.expectEqual(@as(usize, 6), sizeCast("build the entire website with tests", "", 30));
+    // the plan's cap wins, and a zero cap still yields one mind
+    try std.testing.expectEqual(@as(usize, 5), sizeCast("build the entire website with tests", "", 5));
+    try std.testing.expectEqual(@as(usize, 1), sizeCast("build the entire website with tests", "", 0));
+}
 
 test "exhaustiveness: every pub route in this file is covered by the auth sweep" {
     const SRC = @embedFile("service.zig");
