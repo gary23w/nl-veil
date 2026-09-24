@@ -12,7 +12,8 @@ A lineage (`veil cast … --lineage <id>`) keeps one neuron-db across casts at `
 
 ## Key Exports
 
-- `listLineages` — `GET /api/v1/lineages` → `{"lineages":[{"id","lessons","skills","playbook","pending","rejected"}]}` (at most 32 lineages; each count is a neuron subprocess)
+- `listLineages` — `GET /api/v1/lineages` → `{"lineages":[{"id","lessons","facts","skills","playbook","pending","rejected","casts"}]}` (at most 32 lineages; each count is a neuron subprocess)
+- `lineageDetail` — `GET /api/v1/lineages/:id` → the same counts plus `"history":[…]`, the newest 100 rows of the lineage's `history.jsonl`, oldest first
 - `listProposals` — `GET /api/v1/lineages/:id/proposals` → `{"proposals":[{"scope","kind","text"}]}`
 - `decideProposal` — `POST /api/v1/lineages/:id/proposals` with `{"scope","text","action":"accept"|"reject"}` → `{"ok":true,"outcome":…}`; 404 when that exact text is not pending, 400 for a bad action or a scope that is not a quarantine, 500 when the live write failed (the proposal stays queued)
 

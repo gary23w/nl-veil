@@ -874,7 +874,7 @@ pub const LinPropRow = struct {
     lineage_len: u8 = 0,
     scope: [24]u8 = [_]u8{0} ** 24, // lessons-proposed / skills-proposed / habits-proposed
     scope_len: u8 = 0,
-    kind: u8 = 0, // 0 = lesson, 1 = skill, 2 = habit
+    kind: u8 = 0, // 0 = lesson, 1 = skill, 2 = habit, 3 = fact
     text: [900]u8 = [_]u8{0} ** 900,
     text_len: u16 = 0,
     pub fn lineageStr(p: *const LinPropRow) []const u8 {
@@ -896,6 +896,7 @@ pub const LineageRow = struct {
     id: [64]u8 = [_]u8{0} ** 64,
     id_len: u8 = 0,
     lessons: u32 = 0,
+    facts: u32 = 0,
     skills: u32 = 0,
     playbook: u32 = 0,
     pending: u32 = 0,

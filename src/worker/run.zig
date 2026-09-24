@@ -2715,6 +2715,9 @@ pub fn parseProposal(raw: []const u8) ?Proposal {
     } else if (std.mem.startsWith(u8, ln, "SKILL:")) {
         kind = 1;
         rest = ln["SKILL:".len..];
+    } else if (std.mem.startsWith(u8, ln, "FACT:")) {
+        kind = 2;
+        rest = ln["FACT:".len..];
     } else return null;
     const text = std.mem.trim(u8, rest, " \t");
     if (text.len < 24 or text.len > 600) return null;
@@ -4198,7 +4201,16 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     else
         gpa.dupe(u8, "") catch @constCast("");
     defer gpa.free(ls_part);
-    const playbook_clause = std.fmt.allocPrint(gpa, "{s}{s}", .{ pb_part, ls_part }) catch (gpa.dupe(u8, "") catch @constCast(""));
+    // PROVEN TASK FACTS: the lineage's reviewed facts, listed WHOLE (a small scope) - an assoc() ranked by the goal
+    // could leave out the one house rule the task turns on.
+    const facts_raw = w.mem.list(tools.FACT_SCOPE);
+    defer gpa.free(facts_raw);
+    const fx_part = if (facts_raw.len > 0)
+        std.fmt.allocPrint(gpa, " PROVEN TASK FACTS — requirements a tool output stated on earlier casts of this assignment (they hold unless a tool says otherwise now):\n{s}\n", .{clipTail(facts_raw, 900)}) catch (gpa.dupe(u8, "") catch @constCast(""))
+    else
+        gpa.dupe(u8, "") catch @constCast("");
+    defer gpa.free(fx_part);
+    const playbook_clause = std.fmt.allocPrint(gpa, "{s}{s}{s}", .{ pb_part, ls_part, fx_part }) catch (gpa.dupe(u8, "") catch @constCast(""));
     defer gpa.free(playbook_clause);
     const space_clause = if (w.space.len > 0 and w.space_h > 0) blk: {
         const bands = @max(@as(u32, 1), mi.team);
