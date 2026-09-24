@@ -163,7 +163,15 @@ fn field(gpa: std.mem.Allocator, line: []const u8, key: []const u8, buf: []u8) [
 }
 
 fn isEngineVoice(mind: []const u8) bool {
-    for ([_][]const u8{ "engine", "veil", "orchestrator", "bench", "judge", "retro" }) |v| if (std.mem.eql(u8, mind, v)) return true;
+    for ([_][]const u8{ "engine", "veil", "orchestrator", "bench", "judge", "retro", "review", "hive", "curator", "operator", "system" }) |v| if (std.mem.eql(u8, mind, v)) return true;
+    return false;
+}
+
+/// An act row the engine writes INTO a mind's trace that is not a step the mind took: the context it was handed
+/// (recall, skills, knowledge, slot, my_files, score, stance), its journal, and the engine's nudges. A panel shows
+/// the mind's own last tool call, never these. Pure.
+fn isContextRow(tool: []const u8) bool {
+    for ([_][]const u8{ "thinking", "recall", "skills", "knowledge", "slot", "my_files", "score", "stance", "note_stance", "journal", "verify_nudge", "act_nudge", "lane_release", "salvage", "salvage_retry", "salvage_reject", "digest", "checkpoint", "cost", "mode", "capacity", "lineage", "promote", "habit" }) |v| if (std.mem.eql(u8, tool, v)) return true;
     return false;
 }
 
@@ -228,14 +236,13 @@ pub fn applyEvent(m: *Model, gpa: std.mem.Allocator, line: []const u8, now_ms: i
         }
         const md = m.mind(who) orelse return;
         md.round = round;
-        if (std.mem.eql(u8, tool, "thinking")) {
-            if (std.mem.eql(u8, args, "starting")) {
-                md.status = .thinking;
-                if (md.role.len == 0 and result.len > 0) md.role.set(result);
-                md.changed_ms = now_ms;
-            }
-            return; // the model's own text is not an act
+        if (std.mem.eql(u8, tool, "thinking") and std.mem.eql(u8, args, "starting")) {
+            md.status = .thinking;
+            if (md.role.len == 0 and result.len > 0) md.role.set(result);
+            md.changed_ms = now_ms;
+            return;
         }
+        if (isContextRow(tool)) return; // the model's own text, its context, a nudge: not a step it took
         // a real tool call
         md.status = .working;
         md.acts += 1;
@@ -289,15 +296,26 @@ pub fn applyEvent(m: *Model, gpa: std.mem.Allocator, line: []const u8, now_ms: i
     } else if (std.mem.eql(u8, kind, "synthesis")) {
         m.say(.system, "", "final report written: work/synthesis.md");
     } else if (std.mem.eql(u8, kind, "files")) {
-        // "files":["a.py","b.py"]
+        // "files":[{"path":"a.py","hash":..,"size":..},...] (or, in older logs, ["a.py","b.py"]); a roll-up, so no flash
         if (std.mem.indexOf(u8, line, "\"files\":[")) |at| {
-            var i = at + "\"files\":[".len;
-            while (i < line.len and line[i] != ']') {
-                const q1 = std.mem.indexOfScalarPos(u8, line, i, '"') orelse break;
-                const q2 = std.mem.indexOfScalarPos(u8, line, q1 + 1, '"') orelse break;
-                if (q1 > (std.mem.indexOfScalarPos(u8, line, i, ']') orelse line.len)) break;
-                m.touch(line[q1 + 1 .. q2], "", 0); // no flash: a roll-up, not a fresh edit
-                i = q2 + 1;
+            const arr = line[at + "\"files\":[".len ..];
+            if (std.mem.startsWith(u8, std.mem.trimStart(u8, arr, " "), "{")) {
+                var it = cli.JsonObjs.init(arr);
+                while (it.next()) |obj| {
+                    var pb: [64]u8 = undefined;
+                    const path = field(gpa, obj, "path", &pb);
+                    if (path.len > 0) m.touch(path, "", 0);
+                }
+            } else {
+                var i: usize = 0;
+                const end = std.mem.indexOfScalar(u8, arr, ']') orelse arr.len;
+                while (i < end) {
+                    const q1 = std.mem.indexOfScalarPos(u8, arr, i, '"') orelse break;
+                    if (q1 >= end) break;
+                    const q2 = std.mem.indexOfScalarPos(u8, arr, q1 + 1, '"') orelse break;
+                    m.touch(arr[q1 + 1 .. q2], "", 0);
+                    i = q2 + 1;
+                }
             }
         }
     } else if (std.mem.eql(u8, kind, "stopped")) {
@@ -750,8 +768,10 @@ const Keys = struct {
     head: usize = 0,
     tail: usize = 0,
     io: std.Io,
+    eof: std.atomic.Value(bool) = .init(false), // stdin ended (a pipe): nobody will press Enter
 
     fn reader(self: *Keys) void {
+        defer self.eof.store(true, .release);
         const stdin = std.Io.File.stdin();
         while (true) {
             var one: [1]u8 = undefined;
@@ -861,8 +881,9 @@ pub fn cmd(ctx: *Ctx, args: []const []const u8) u8 {
     var dirty = true;
     var done_at: i64 = 0;
     var gone = false;
+    var leave_now = false;
 
-    while (true) {
+    while (!leave_now) {
         const now = nowMs(ctx.io);
         // ---- events
         if (!m.done and now - last_poll >= 500) {
@@ -900,7 +921,9 @@ pub fn cmd(ctx: *Ctx, args: []const []const u8) u8 {
             if (line.feed(b)) {
                 const c = classify(line.str());
                 switch (c) {
-                    .empty => {},
+                    .empty => if (m.done) {
+                        leave_now = true;
+                    },
                     .quit => {
                         term.leave();
                         if (!m.done) cli.out("left the swarm running: {s}\n  watch:  veil events {s} --follow\n  stop:   veil stop {s}\n", .{ id, id, id });
@@ -959,10 +982,22 @@ pub fn cmd(ctx: *Ctx, args: []const []const u8) u8 {
             cli.out("{s}", .{frame.items});
             dirty = false;
         }
-        if (m.done and gone) break;
+        // a finished swarm stays on screen until Enter - unless nobody can press it (stdin is a pipe) or it is gone
+        if (m.done and (gone or keys.eof.load(.acquire))) {
+            if (done_at == 0) done_at = now;
+            if (now - done_at >= 1500) break;
+        }
         bu.sleepMs(40);
     }
     term.leave();
+    var sb: [64]u8 = undefined;
+    cli.out("swarm {s}: {s} after {d} round(s){s}\n  events: veil events {s}\n", .{
+        id,
+        if (m.done_reason.len > 0) m.done_reason.str() else "stopped",
+        m.round,
+        if (m.total > 0) (std.fmt.bufPrint(&sb, ", score {d}/{d} ({d}%)", .{ m.passed, m.total, m.pct }) catch "") else "",
+        id,
+    });
     return 0;
 }
 
@@ -1005,6 +1040,16 @@ test "swarm tui: the reducer builds panels, roles, files and chat from the event
     applyEvent(&m, gpa, "{\"kind\":\"cost\",\"round\":1,\"in\":100,\"out\":10,\"calls\":4,\"total_in\":100,\"total_out\":10}", 2400);
     applyEvent(&m, gpa, "{\"kind\":\"files\",\"n\":2,\"bytes\":9,\"round\":1,\"files\":[\"money.py\",\"test_money.py\"]}", 2500);
     try tt.expectEqual(@as(usize, 2), m.file_n);
+    // the live shape: objects with hash/size - only the path is a file (the smoke run listed "hash" and "size" as files)
+    applyEvent(&m, gpa, "{\"kind\":\"files\",\"n\":1,\"bytes\":9,\"round\":2,\"files\":[{\"path\":\"hello.py\",\"hash\":\"63f4aa78\",\"size\":42}]}", 2600);
+    try tt.expectEqual(@as(usize, 3), m.file_n);
+    try tt.expectEqualStrings("hello.py", m.files[0].path.str());
+    // context rows the engine writes into a mind's trace are not its steps, and the engine's review pass is no mind
+    applyEvent(&m, gpa, "{\"kind\":\"act\",\"mind\":\"ada\",\"round\":2,\"tool\":\"stance\",\"args\":\"the work is moving\",\"result\":\"satisfied\"}", 2700);
+    applyEvent(&m, gpa, "{\"kind\":\"act\",\"mind\":\"ada\",\"round\":2,\"tool\":\"score\",\"args\":\"fitness\",\"result\":\"WRITE-PATH NOTE\"}", 2700);
+    try tt.expectEqualStrings("write_file", m.minds[1].tool.str());
+    applyEvent(&m, gpa, "{\"kind\":\"act\",\"mind\":\"review\",\"round\":2,\"tool\":\"skill\",\"args\":\"\",\"result\":\"To rename an API\"}", 2700);
+    try tt.expectEqual(@as(usize, 2), m.mind_n);
     try tt.expectEqual(@as(u32, 87), m.pct);
     try tt.expectEqual(@as(u64, 4), m.calls);
     try tt.expect(!m.done);
