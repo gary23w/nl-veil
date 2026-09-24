@@ -49,8 +49,9 @@ fn castCount(body: []const u8) usize {
 fn writeCounts(out: *std.ArrayListUnmanaged(u8), arena: std.mem.Allocator, mem: osc.Mem, casts: usize) !void {
     var pending: u32 = 0;
     for (proposals.SOURCES) |s| pending += mem.factCount(s.scope);
-    try out.print(arena, ",\"lessons\":{d},\"skills\":{d},\"playbook\":{d},\"pending\":{d},\"rejected\":{d},\"casts\":{d}", .{
+    try out.print(arena, ",\"lessons\":{d},\"facts\":{d},\"skills\":{d},\"playbook\":{d},\"pending\":{d},\"rejected\":{d},\"casts\":{d}", .{
         mem.factCount(tools.LESSON_SCOPE),
+        mem.factCount(tools.FACT_SCOPE),
         mem.factCount(tools.SKILL_SCOPE),
         mem.factCount(tools.PLAYBOOK_SCOPE),
         pending,

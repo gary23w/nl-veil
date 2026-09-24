@@ -1164,6 +1164,15 @@ pub const HABIT_PROPOSED_SCOPE = "habits-proposed";
 /// does not re-mint the same rejected proposal every run. Never recalled into a mind's prompt.
 pub const PROPOSAL_REJECTED_SCOPE = "proposals-rejected";
 
+/// PROVEN TASK FACTS — requirements and constraints of the assignment that a TOOL OUTPUT stated (a checker's house
+/// rule, an API's real signature, a file format the data actually has), as opposed to LESSON_SCOPE's fail->fix
+/// process fixes. The end-of-run judge proposes them into FACT_PROPOSED_SCOPE; review promotes them here, and every
+/// mind reads this whole (small) scope, so a lineage's next cast starts from what the last one found out. Measured
+/// reason (lineage bench v2): with only lessons, a lineage stored generic process advice and never the two house
+/// rules its checker printed on every run, so later casts had nothing task-specific to recall.
+pub const FACT_SCOPE = "facts";
+pub const FACT_PROPOSED_SCOPE = "facts-proposed";
+
 /// The swarm's FITNESS history — one "round N: P/T (pct%)" line per round, written by the engine's benchmark.
 /// This is the measurable spine of recursive self-improvement: improvement is a NUMBER that must climb, not a
 /// vibe. The deliverable is scored each round (real tests > compiles > artifact-presence) and that score is fed

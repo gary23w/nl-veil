@@ -5693,6 +5693,7 @@ fn drawChatMemory(store: *Store, r: t.Rect) void {
             const chip: []const u8 = switch (p.kind) {
                 1 => "skill?",
                 2 => "habit?",
+                3 => "fact?",
                 else => "lesson?",
             };
             t.textClip(t.z("[{s}] swarm lineage '{s}' - not yet binding", .{ chip, p.lineageStr() }), @intFromFloat(card.x + 8), @intFromFloat(card.y + 6), 11, t.blue, @intFromFloat(card.width - 16));
@@ -6620,7 +6621,7 @@ fn drawLineages(store: *Store, body: t.Rect) void {
         const cx = card.x + 12;
         const cw = card.width - 24;
         t.text(t.z("{s}", .{row.idStr()}), @intFromFloat(cx), @intFromFloat(card.y + 10), 15, t.fg);
-        t.textClip(t.z("{d} cast(s)   {d} lessons   {d} skills   {d} playbook   {d} rejected", .{ row.casts, row.lessons, row.skills, row.playbook, row.rejected }), @intFromFloat(cx), @intFromFloat(card.y + 32), 12, t.comment, @intFromFloat(cw));
+        t.textClip(t.z("{d} cast(s)   {d} facts   {d} lessons   {d} skills   {d} playbook   {d} rejected", .{ row.casts, row.facts, row.lessons, row.skills, row.playbook, row.rejected }), @intFromFloat(cx), @intFromFloat(card.y + 32), 12, t.comment, @intFromFloat(cw));
         // the per-cast trend: score up and cost down is a lineage getting better
         var pct: [store_mod.LINEAGE_HIST]f32 = undefined;
         var rnd: [store_mod.LINEAGE_HIST]f32 = undefined;

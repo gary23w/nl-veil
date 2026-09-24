@@ -36,7 +36,73 @@ pub const SOURCES = [_]Source{
     // A habit has no live scope of its own: a recurring successful sequence IS a procedure, which is what the
     // skill scope holds, and skills are recalled by relevance to the goal (run.zig assoc on SKILL_SCOPE).
     .{ .scope = tools.HABIT_PROPOSED_SCOPE, .live = tools.SKILL_SCOPE, .kind = "habit" },
+    // a tool-proven requirement of the task: every mind reads the whole facts scope (run.zig PROVEN TASK FACTS)
+    .{ .scope = tools.FACT_PROPOSED_SCOPE, .live = tools.FACT_SCOPE, .kind = "fact" },
 };
+
+/// Lowercase alphanumeric words of 3+ chars, deduplicated, into `out`; returns the count. Pure.
+fn wordSet(text: []const u8, out: [][]const u8, store: []u8) usize {
+    var n: usize = 0;
+    var used: usize = 0;
+    var i: usize = 0;
+    while (i < text.len) {
+        while (i < text.len and !std.ascii.isAlphanumeric(text[i])) : (i += 1) {}
+        const st = i;
+        while (i < text.len and std.ascii.isAlphanumeric(text[i])) : (i += 1) {}
+        const w = text[st..i];
+        if (w.len < 3 or n >= out.len or used + w.len > store.len) continue;
+        const dst = store[used .. used + w.len];
+        for (w, 0..) |c, k| dst[k] = std.ascii.toLower(c);
+        var dup = false;
+        for (out[0..n]) |o| {
+            if (std.mem.eql(u8, o, dst)) {
+                dup = true;
+                break;
+            }
+        }
+        if (dup) continue;
+        used += w.len;
+        out[n] = dst;
+        n += 1;
+    }
+    return n;
+}
+
+/// Does `text` restate a line of `listing` (newline-separated)? The body before any "| evidence:" tail is compared
+/// as a word set; a Jaccard overlap of 0.6 or more is the same entry in other words. Pure.
+pub fn nearDuplicate(text: []const u8, listing: []const u8) bool {
+    var aw: [96][]const u8 = undefined;
+    var ab: [1024]u8 = undefined;
+    const an = wordSet(run.proposalBody(text), &aw, &ab);
+    if (an == 0) return false;
+    var it = std.mem.splitScalar(u8, listing, '\n');
+    while (it.next()) |line| {
+        var bw: [96][]const u8 = undefined;
+        var bb: [1024]u8 = undefined;
+        const bn = wordSet(run.proposalBody(line), &bw, &bb);
+        if (bn == 0) continue;
+        var common: usize = 0;
+        for (aw[0..an]) |a| {
+            for (bw[0..bn]) |b| {
+                if (std.mem.eql(u8, a, b)) {
+                    common += 1;
+                    break;
+                }
+            }
+        }
+        const uni = an + bn - common;
+        if (common * 10 >= uni * 6) return true;
+    }
+    return false;
+}
+
+/// A proposal that is a pasted tool call rather than a rule in words (bench v2 kept a `fix: edit_file {"path":...}`
+/// row): JSON object syntax or an edit anchor in the body. Pure.
+pub fn looksLikeNoise(text: []const u8) bool {
+    const body = run.proposalBody(text);
+    return std.mem.indexOf(u8, body, "{\"") != null or std.mem.indexOf(u8, body, "\":") != null or
+        std.mem.indexOf(u8, body, "\"ops\"") != null or std.mem.count(u8, body, "{") >= 2;
+}
 
 pub fn sourceFor(scope: []const u8) ?Source {
     for (SOURCES) |s| if (std.mem.eql(u8, s.scope, scope)) return s;
@@ -151,6 +217,20 @@ test "proposals: a lesson is promoted without its evidence tail, atomized to one
     const live = liveText(&b, les, "Install the missing module first. Then rerun the suite | evidence: act row 12 exit 1, row 14 exit 0");
     try tt.expectEqualStrings("Install the missing module first, Then rerun the suite", live);
     try tt.expect(sourceFor("lessons") == null); // a LIVE scope is never a review source
+}
+
+test "proposals: a restated entry is a near duplicate, a different one is not, and pasted JSON is noise" {
+    const live = "When an import fails, install the dependency then rerun the tests\nParse money with Decimal, never float, before rounding";
+    try tt.expect(nearDuplicate("When an import fails, install the dependency, then rerun the tests: worked | evidence: rows 3-4", live));
+    try tt.expect(nearDuplicate("Install the dependency then rerun the tests when an import fails | evidence: row 9", live));
+    try tt.expect(!nearDuplicate("A value that rounds to zero formats as 0.00, never -0.00 | evidence: FAIL HOUSE RULE row 12", live));
+    try tt.expect(!nearDuplicate("anything at all | evidence: x", ""));
+    try tt.expect(looksLikeNoise("fix: edit_file {\"path\": \"money.py\", \"ops\": []} failed | evidence: row 3"));
+    try tt.expect(!looksLikeNoise("A leading decimal point parses: '.5' is 0.50 | evidence: checker FAIL line {row 4}"));
+    // a FACT promotes into the live facts scope every mind reads
+    const f = sourceFor(tools.FACT_PROPOSED_SCOPE).?;
+    try tt.expectEqualStrings(tools.FACT_SCOPE, f.live);
+    try tt.expectEqualStrings("fact", f.kind);
 }
 
 test "proposals: present matches whole lines only" {

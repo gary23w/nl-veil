@@ -1704,7 +1704,7 @@ fn parseLineageRow(obj: []const u8, row: *store_mod.LineageRow) void {
             continue;
         }
         const v = std.fmt.parseInt(u32, p.raw, 10) catch continue;
-        if (std.mem.eql(u8, p.key, "lessons")) row.lessons = v else if (std.mem.eql(u8, p.key, "skills")) row.skills = v else if (std.mem.eql(u8, p.key, "playbook")) row.playbook = v else if (std.mem.eql(u8, p.key, "pending")) row.pending = v else if (std.mem.eql(u8, p.key, "rejected")) row.rejected = v else if (std.mem.eql(u8, p.key, "casts")) row.casts = v;
+        if (std.mem.eql(u8, p.key, "lessons")) row.lessons = v else if (std.mem.eql(u8, p.key, "facts")) row.facts = v else if (std.mem.eql(u8, p.key, "skills")) row.skills = v else if (std.mem.eql(u8, p.key, "playbook")) row.playbook = v else if (std.mem.eql(u8, p.key, "pending")) row.pending = v else if (std.mem.eql(u8, p.key, "rejected")) row.rejected = v else if (std.mem.eql(u8, p.key, "casts")) row.casts = v;
     }
 }
 
@@ -1806,7 +1806,7 @@ fn parseLinProps(body: []const u8, slug: []const u8, out: []store_mod.LinPropRow
             if (std.mem.eql(u8, p.key, "scope")) {
                 row.scope_len = @intCast(scan.unescapeInto(p.raw, &row.scope).len);
             } else if (std.mem.eql(u8, p.key, "kind")) {
-                row.kind = if (std.mem.eql(u8, p.raw, "skill")) 1 else if (std.mem.eql(u8, p.raw, "habit")) 2 else 0;
+                row.kind = if (std.mem.eql(u8, p.raw, "skill")) 1 else if (std.mem.eql(u8, p.raw, "habit")) 2 else if (std.mem.eql(u8, p.raw, "fact")) 3 else 0;
             } else if (std.mem.eql(u8, p.key, "text")) {
                 if (p.raw.len > row.text.len) fits = false;
                 row.text_len = @intCast(scan.unescapeInto(p.raw, &row.text).len);
