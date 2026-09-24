@@ -898,6 +898,15 @@
       "hosting": "local"
     },
     {
+      "id": "claude-opus-5-5",
+      "label": "Claude Opus 5.5",
+      "provider": "anthropic",
+      "hosting": "hosted",
+      "context": 1000000,
+      "note": "Released 2026-09-22. 1,000K context. Tool calling, reasoning, image / pdf input. $4 in / $20 out per MTok. Listed automatically from models.dev.",
+      "synced": "models.dev"
+    },
+    {
       "id": "claude-fable-5-1",
       "label": "Claude Fable 5.1",
       "provider": "anthropic",
@@ -916,6 +925,24 @@
       "synced": "models.dev"
     },
     {
+      "id": "gpt-6-luna",
+      "label": "GPT-6 Luna",
+      "provider": "openai",
+      "hosting": "hosted",
+      "context": 1050000,
+      "note": "Released 2026-09-22. 1,050K context. Tool calling, reasoning, image / pdf input. $0.1 in / $0.5 out per MTok. Listed automatically from models.dev.",
+      "synced": "models.dev"
+    },
+    {
+      "id": "gpt-6-sol",
+      "label": "GPT-6 Sol",
+      "provider": "openai",
+      "hosting": "hosted",
+      "context": 1050000,
+      "note": "Released 2026-09-22. 1,050K context. Tool calling, reasoning, image / pdf input. $2 in / $10 out per MTok. Listed automatically from models.dev.",
+      "synced": "models.dev"
+    },
+    {
       "id": "gpt-6-astra",
       "label": "GPT-6 Astra",
       "provider": "openai",
@@ -927,24 +954,6 @@
     {
       "id": "gpt-5.6",
       "label": "GPT-5.6",
-      "provider": "openai",
-      "hosting": "hosted",
-      "context": 1050000,
-      "note": "Released 2026-07-09. 1,050K context. Tool calling, reasoning, image / pdf input. $4 in / $20 out per MTok. Listed automatically from models.dev.",
-      "synced": "models.dev"
-    },
-    {
-      "id": "gpt-5.6-luna",
-      "label": "GPT-5.6 Luna",
-      "provider": "openai",
-      "hosting": "hosted",
-      "context": 1050000,
-      "note": "Released 2026-07-09. 1,050K context. Tool calling, reasoning, image / pdf input. $0.2 in / $1.2 out per MTok. Listed automatically from models.dev.",
-      "synced": "models.dev"
-    },
-    {
-      "id": "gpt-5.6-sol",
-      "label": "GPT-5.6 Sol",
       "provider": "openai",
       "hosting": "hosted",
       "context": 1050000,
@@ -1096,39 +1105,39 @@
       "synced": "models.dev"
     },
     {
-      "id": "deepseek/deepseek-v4.1-flash",
-      "label": "DeepSeek V4.1 Flash",
-      "provider": "openrouter",
-      "hosting": "hosted",
-      "context": 1048576,
-      "note": "Released 2026-09-10. 1,048K context. Tool calling, reasoning, image input. $0.15 in / $0.6 out per MTok. Listed automatically from models.dev.",
-      "synced": "models.dev"
-    },
-    {
-      "id": "openai/gpt-6-astra",
-      "label": "GPT-6 Astra",
-      "provider": "openrouter",
-      "hosting": "hosted",
-      "context": 1050000,
-      "note": "Released 2026-09-04. 1,050K context. Tool calling, reasoning, image / pdf input. $10 in / $50 out per MTok. Listed automatically from models.dev.",
-      "synced": "models.dev"
-    },
-    {
-      "id": "openai/gpt-6-astra-pro",
-      "label": "GPT-6 Astra Pro",
-      "provider": "openrouter",
-      "hosting": "hosted",
-      "context": 1050000,
-      "note": "Released 2026-09-04. 1,050K context. Tool calling, reasoning, pdf / image input. $10 in / $50 out per MTok. Listed automatically from models.dev.",
-      "synced": "models.dev"
-    },
-    {
-      "id": "qwen/qwen3.8-max-0902",
-      "label": "Qwen3.8 Max 0902",
+      "id": "qwen/qwen3.8-max-prime",
+      "label": "Qwen 3.8 Max Prime",
       "provider": "openrouter",
       "hosting": "hosted",
       "context": 1000000,
-      "note": "Released 2026-09-02. 1,000K context. Tool calling, reasoning, image / video input. $2 in / $6 out per MTok. Listed automatically from models.dev.",
+      "note": "Released 2026-09-23. 1,000K context. Tool calling, reasoning, image / video input. $4 in / $12 out per MTok. Listed automatically from models.dev.",
+      "synced": "models.dev"
+    },
+    {
+      "id": "anthropic/claude-opus-5.5",
+      "label": "Claude Opus 5.5",
+      "provider": "openrouter",
+      "hosting": "hosted",
+      "context": 1000000,
+      "note": "Released 2026-09-22. 1,000K context. Tool calling, reasoning, image / pdf input. $4 in / $20 out per MTok. Listed automatically from models.dev.",
+      "synced": "models.dev"
+    },
+    {
+      "id": "openai/gpt-6-luna",
+      "label": "GPT-6 Luna",
+      "provider": "openrouter",
+      "hosting": "hosted",
+      "context": 1050000,
+      "note": "Released 2026-09-22. 1,050K context. Tool calling, reasoning, image / pdf input. $0.1 in / $0.5 out per MTok. Listed automatically from models.dev.",
+      "synced": "models.dev"
+    },
+    {
+      "id": "openai/gpt-6-luna-pro",
+      "label": "GPT-6 Luna Pro",
+      "provider": "openrouter",
+      "hosting": "hosted",
+      "context": 1050000,
+      "note": "Released 2026-09-22. 1,050K context. Tool calling, reasoning, pdf / image input. $0.1 in / $0.5 out per MTok. Listed automatically from models.dev.",
       "synced": "models.dev"
     }
   ],
