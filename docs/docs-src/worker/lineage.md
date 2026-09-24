@@ -16,6 +16,8 @@ A swarm's whole brain is normally `{run_dir}/mind.sqlite` — born and destroyed
 - `userRootOf(run_dir)` — the per-user root a run_dir belongs to (peels the `/_chat/…` or `/_sched/…` build tail; anything else falls back to the run_dir's parent)
 - `dbPath(gpa, io, run_dir, lineage_id)` — resolve the persistent neuron-db path, creating its directory; null for an empty id (caller keeps the per-run brain)
 - `exists(io, gpa, db)` — has a prior cast populated this store? Lets the engine tell a mind "you INHERIT the memory of N prior runs" vs "you are the first run"
+- `dbPathIn(gpa, user_root, lineage_id)` — the same path for a reader that must not create anything (the review API)
+- History (`history.jsonl` beside the store, one JSON row per finished cast): `historyPath(buf, db)`, `historyLine(buf, Outcome)` (rounds, the engine's best round score, calls, tokens, proposals added, whether the store was inherited — hostile strings are neutralised), `historyArray(gpa, body, max)` (the newest rows as a JSON array; a torn last line is skipped). `run.writeDone` appends a row; `GET /api/v1/lineages/:id` serves it, and the desk's Lineages view draws it
 
 ## Dependencies
 
