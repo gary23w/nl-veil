@@ -2311,6 +2311,16 @@ pub const Chat = struct {
             }
             return;
         }
+        if (std.mem.eql(u8, kind, "goal")) {
+            // one measured goal-loop iteration, or the loop's end: keep the counters the status row shows
+            const live = std.mem.eql(u8, scRawField(line, "status") orelse "", "active") and std.mem.indexOf(u8, line, "\"ended\":true") == null;
+            self.store.lock();
+            defer self.store.unlock();
+            if (jInt(line, "iteration")) |v| self.store.chat_goal_iter = @intCast(@max(0, @min(v, 1_000_000)));
+            if (jInt(line, "improved")) |v| self.store.chat_goal_improved = @intCast(@max(0, @min(v, 1_000_000)));
+            self.store.chat_goal_live = live;
+            return;
+        }
         if (std.mem.eql(u8, kind, "usage")) {
             // the turn's token usage — a subtle transcript note (persists; a status would be cleared by {done} next)
             if (scRawField(line, "text")) |raw| {

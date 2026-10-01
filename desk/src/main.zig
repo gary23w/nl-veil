@@ -5076,7 +5076,13 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
     };
     const afk_on = loop_state[1];
     const loop_on = loop_state[0] or afk_on;
-    const ltxt: [:0]const u8 = if (afk_on) t.z("auto-loop: afk", .{}) else if (loop_on) t.z("auto-loop: on", .{}) else t.z("auto-loop: off", .{});
+    // a running goal loop (the server's `goal` frames) reads as itself; otherwise the auto-loop tier
+    const goal_row = blk: {
+        store.lock();
+        defer store.unlock();
+        break :blk .{ store.chat_goal_live and store.chat_server_turn, store.chat_goal_iter, store.chat_goal_improved };
+    };
+    const ltxt: [:0]const u8 = if (goal_row[0]) t.z("goal: {d} done, {d} better", .{ goal_row[1], goal_row[2] }) else if (afk_on) t.z("auto-loop: afk", .{}) else if (loop_on) t.z("auto-loop: on", .{}) else t.z("auto-loop: off", .{});
     const ltw: f32 = @floatFromInt(t.measure(ltxt, 12));
     const status_clip_w: i32 = @intFromFloat(@max(60, r.width - ltw - 24)); // never overlap the auto-loop label
     if (busy) {
@@ -5164,7 +5170,7 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
     }
     const input_rows: usize = @intFromFloat(@max(3, @divTrunc(input_h - chip_row_h - 16, 18))); // rows in the text region BELOW the chip
     const cf = t.Rect{ .x = r.x, .y = sy, .width = r.width - send_w - t.GAP, .height = input_h };
-    textArea(cf, &ui.c_input, ui.focus == .c_input, if (afk_on) t.z("auto-loop-afk - the veil never stops; type to steer, Stop to end", .{}) else if (loop_on) t.z("auto-loop on - type to steer, or let the veil drive", .{}) else t.z("message the veil - Enter to send", .{}), .c_input, input_rows, chip_row_h);
+    textArea(cf, &ui.c_input, ui.focus == .c_input, if (afk_on) t.z("auto-loop-afk - the veil never stops; type to steer, Stop to end", .{}) else if (loop_on) t.z("auto-loop on - type to steer, or let the veil drive", .{}) else t.z("message the veil - Enter to send   (/goal <what to achieve> starts a goal loop)", .{}), .c_input, input_rows, chip_row_h);
     // ATTACHMENT CHIP: the pending image's thumbnail sits at the composer's top-left (above the first text line),
     // with a ✕ to drop it. drawTexturePro is legal here — drawChatCenter runs on the main/GL thread.
     if (ui.c_attach.tex) |atex| {
