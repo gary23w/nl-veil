@@ -6,8 +6,9 @@
 //! deployment's request body. The poller calls the readers; main.zig draws the rows. No I/O here.
 //!
 //! A hot's events are kept as Ev: the colour key the swarm console uses (`kind`), the event's own kind (`label`),
-//! the goal iteration it belongs to (`round`) and its text with its line breaks, which the tab wraps. A row longer
-//! than the tab keeps ends in "..."; the hot's local folder (events.log) has every event whole.
+//! the goal iteration it belongs to (`round`), a one-line `brief` the console shows, whether it went well (`ok`),
+//! and its whole text with its line breaks, shown when the row is opened. A text longer than the tab keeps ends
+//! in "..."; the hot's local folder (events.log) has every event whole.
 
 const std = @import("std");
 
@@ -27,7 +28,17 @@ pub const Ev = struct {
     label_len: u8 = 0,
     text: [EV_TEXT]u8 = [_]u8{0} ** EV_TEXT,
     text_len: u16 = 0,
+    brief: [200]u8 = [_]u8{0} ** 200, // the one line the console shows for this event
+    brief_len: u8 = 0,
+    ok: bool = true, // false: it went wrong (an error, a failed tool call); the console marks the row
 
+    pub fn briefStr(e: *const Ev) []const u8 {
+        return e.brief[0..e.brief_len];
+    }
+    /// Whether opening the row shows more than its brief does.
+    pub fn hasMore(e: *const Ev) bool {
+        return e.text_len > e.brief_len or std.mem.indexOfScalar(u8, e.textStr(), '\n') != null;
+    }
     pub fn kindStr(e: *const Ev) []const u8 {
         return e.kind[0..e.kind_len];
     }
@@ -108,6 +119,7 @@ pub const Roster = struct {
     current: bool = true, // it runs this build's hot.js
     python: bool = false, // the hots can run Python (and keep skills)
     browser: bool = false, // the hots can drive a browser
+    neuron: bool = false, // the hots have neuron-db: recall by meaning, stances, a mood
     note: [200]u8 = [_]u8{0} ** 200, // why one of those is missing, in Cloudflare's words
     note_len: u8 = 0,
     n: usize = 0,
@@ -174,7 +186,7 @@ const JHot = struct {
     folder: []const u8 = "",
     goal: ?JGoal = null,
 };
-const JRoster = struct { ok: bool = false, connected: bool = false, deployed: bool = false, reachable: bool = false, current: bool = true, python: bool = false, browser: bool = false, tools_note: []const u8 = "", last_error: []const u8 = "", hots: []const JHot = &.{} };
+const JRoster = struct { ok: bool = false, connected: bool = false, deployed: bool = false, reachable: bool = false, current: bool = true, python: bool = false, browser: bool = false, neuron: bool = false, tools_note: []const u8 = "", last_error: []const u8 = "", hots: []const JHot = &.{} };
 
 fn rowOf(h: JHot) Row {
     var r: Row = .{};
@@ -207,7 +219,7 @@ pub fn parseRoster(gpa: std.mem.Allocator, body: []const u8, out: *Roster) bool 
     const p = std.json.parseFromSlice(JRoster, gpa, body, .{ .ignore_unknown_fields = true }) catch return false;
     defer p.deinit();
     if (!p.value.ok) return false;
-    var r: Roster = .{ .connected = p.value.connected, .deployed = p.value.deployed, .reachable = p.value.reachable, .current = p.value.current, .python = p.value.python, .browser = p.value.browser };
+    var r: Roster = .{ .connected = p.value.connected, .deployed = p.value.deployed, .reachable = p.value.reachable, .current = p.value.current, .python = p.value.python, .browser = p.value.browser, .neuron = p.value.neuron };
     r.err_len = @intCast(put(&r.err, p.value.last_error));
     r.note_len = @intCast(put(&r.note, p.value.tools_note));
     for (p.value.hots) |h| {
@@ -243,7 +255,7 @@ fn consoleKind(kind: []const u8, outcome: []const u8) []const u8 {
 /// Append the events of a GET /api/v1/hots/:name/events reply that are newer than `last_seq` to `evs[0..n]`,
 /// dropping the oldest rows when the tail is full. Returns the new count; `last_seq` moves to the newest seen.
 pub fn appendEvents(gpa: std.mem.Allocator, body: []const u8, evs: []Ev, n: usize, last_seq: *u64) usize {
-    const JEv = struct { seq: u64 = 0, kind: []const u8 = "", text: []const u8 = "", i: i64 = -1, outcome: []const u8 = "" };
+    const JEv = struct { seq: u64 = 0, kind: []const u8 = "", text: []const u8 = "", brief: []const u8 = "", ok: ?bool = null, i: i64 = -1, outcome: []const u8 = "" };
     const J = struct { ok: bool = false, events: []const JEv = &.{} };
     const p = std.json.parseFromSlice(J, gpa, body, .{ .ignore_unknown_fields = true }) catch return n;
     defer p.deinit();
@@ -260,6 +272,10 @@ pub fn appendEvents(gpa: std.mem.Allocator, body: []const u8, evs: []Ev, n: usiz
         ev.kind_len = @intCast(put(&ev.kind, consoleKind(e.kind, e.outcome)));
         ev.label_len = @intCast(put(&ev.label, e.kind));
         ev.text_len = @intCast(putText(&ev.text, e.text));
+        // an older runtime sends no brief: the text's first line stands in for it
+        const first_line = std.mem.sliceTo(std.mem.trimStart(u8, e.text, " \r\n\t"), '\n');
+        ev.brief_len = @intCast(put(&ev.brief, if (e.brief.len > 0) e.brief else first_line));
+        ev.ok = e.ok orelse (!std.mem.eql(u8, e.kind, "error") and std.mem.indexOf(u8, first_line, "-> ERROR") == null and std.mem.indexOf(u8, first_line, "-> FAILED") == null);
         evs[count] = ev;
         count += 1;
     }
@@ -414,4 +430,21 @@ test "hots: a long event keeps its line breaks and ends in ... where the tab cut
     try tt.expectEqualStrings("ab\ncd ef", b[0..putText(&b, "ab\r\ncd\tef")]);
     try tt.expectEqualStrings("abcdefg...", b[0..putText(&b, "abcdefghijklmnop")]);
     try tt.expectEqualStrings("abcdef...", b[0..putText(&b, "abcdef\xc3\xa9\xc3\xa9\xc3\xa9")]); // never half a character
+}
+
+test "hots: an event's brief is the runtime's, or its first line from an older one; a failed row is marked" {
+    var evs: [8]Ev = undefined;
+    var last: u64 = 0;
+    const body =
+        \\{"ok":true,"seq":4,"events":[{"seq":1,"kind":"act","text":"web_fetch {\"url\":\"ftp://x\"} -> ERROR: an http(s) URL is needed","brief":"web_fetch ftp://x -> ERROR: an http(s) URL is needed","ok":false},{"seq":2,"kind":"act","text":"write_file {\"name\":\"a.md\"} -> saved a.md\nline two","brief":"write_file a.md -> saved a.md","ok":true},{"seq":3,"kind":"act","text":"run_python {} -> FAILED\nTraceback"},{"seq":4,"kind":"status","text":"rested"}]}
+    ;
+    const n = appendEvents(tt.allocator, body, &evs, 0, &last);
+    try tt.expectEqual(@as(usize, 4), n);
+    try tt.expectEqualStrings("web_fetch ftp://x -> ERROR: an http(s) URL is needed", evs[0].briefStr());
+    try tt.expect(!evs[0].ok and evs[0].hasMore()); // the full row has the arguments as sent
+    try tt.expect(evs[1].ok and evs[1].hasMore());
+    try tt.expectEqualStrings("run_python {} -> FAILED", evs[2].briefStr()); // no brief sent: the first line
+    try tt.expect(!evs[2].ok); // and a failure is still seen as one
+    try tt.expectEqualStrings("rested", evs[3].briefStr());
+    try tt.expect(evs[3].ok and !evs[3].hasMore()); // nothing more to open
 }

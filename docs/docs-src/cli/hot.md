@@ -30,6 +30,7 @@ Every verb is one call to the local server (`config/cf_hot.zig`), which relays t
 - `watch` polls the event tail every 3 s from the newest sequence number it has printed; after the first reply, twenty failed polls in a row end it.
 - `pad --clear` empties the scratchpad (the server keeps a local copy); `rm` says when the hot was the last one and its Worker was removed with it.
 - `--calls unlimited` (or `infinite`, `none`, `0`) is no limit on model calls; `--pace` takes 5 seconds and up. The roster ends with the tools the account's hots have.
+- `key brave <key>` (or `google`, `google_cx`) gives the hots a search API key; `--remove` takes it away.
 - `teardown` needs `--yes`: it removes the runtime, every hot and everything they stored from the account.
 - `tell` joins its remaining arguments into one text, so `veil hot tell Gary /goal map every harbour --forever` needs no quotes.
 

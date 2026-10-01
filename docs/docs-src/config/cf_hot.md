@@ -22,6 +22,7 @@ A hot deployed with `local` may queue jobs for the veil on the owner's machine. 
 - `createHot` — `POST /api/v1/hots`: uploads the runtime when the account lacks it or runs another build's, then creates the hot; a `local: true` body records the grant
 - `deleteHot` / `teardown` — `DELETE /api/v1/hots/:name` removes one hot, and when it was the last one the Worker script too (the answer says `worker_removed`); `DELETE /api/v1/hots` removes the script and everything every hot stored. Both forget the deployment, every grant to this machine and the token generation the script held
 - `hotEvents` / `hotCommand` / `hotConfig` — the event tail, a command or message, and the settings (`model`, `pace_s`, `size`, `daily_calls`, `charter`, `paused`; never `local`)
+- `setKey` — `POST /api/v1/hots/keys`: a search key (`brave`, `google`, `google_cx`) becomes a secret binding of the Worker (it rides curl's stdin, never a file here); an empty value removes it. The runtime's own token is not a name it accepts
 - `padRead` / `padWrite` / `padClear` — the scratchpad the account's hots share; clearing it first keeps the local copy as `_hots/scratchpad-<when>.md`
 - `hotFolder` — a deployment's local folder, `u<uid>/_hots/<name>-<YYYYMMDD-HHMMSS>` (UTC): one per run, so a hot deployed again under the same name never writes into the old one's
 - `bgLoop` — the hots thread: every 20 s the owner's-machine bridge, every third pass the local folder mirror (and the replacement of a runtime an older veil uploaded)
@@ -39,6 +40,8 @@ A hot deployed with `local` may queue jobs for the veil on the owner's machine. 
 `main.zig` registers the nine routes, lists this file in its route-gate audit (`ROUTE_MODS`) and starts `bgLoop` beside the scheduler thread. The desk reaches the routes through `netcli.hots*` (poller.zig, only while the Hots tab is on screen); the CLI through `cli/hot.zig`. Every route is admin-gated like the scheduled tasks: a hot spends the account's Workers AI, and one with the owner's machine starts full-tool turns there.
 
 ## Notable Implementation Details
+
+- The runtime's upload carries four modules when the account takes them all: `hot.js`, and - the hot's mind - `neuron-db.mjs` with `neuron_core.wasm` (the veil's memory engine compiled to WebAssembly, `application/wasm`). hot.js imports the two by name only when it first needs them, so an upload without them is still a working runtime that recalls by keyword. The ladder is: everything; without the browser; without neuron-db; without Python. The state records `python`, `browser` and `neuron`.
 
 - Two scripts go up. `veil-hots-py` (cloud/hot_py.py, the `python_workers` flag, a `text/x-python` module) runs a hot's Python and has no public address; the runtime reaches it through a service binding, `PY`. The runtime's upload also asks for Cloudflare's browser binding, `BROWSER`. Both are optional: the runtime is uploaded asking for everything first, then without the browser, then without Python, and the first upload Cloudflare takes wins. The state records which the hots have (`python`, `browser`) and, for one that is missing, Cloudflare's own refusal (`tools_note`); the roster serves them so the tab and `veil hot` can say so. Removing the runtime removes the Python Worker after it.
 

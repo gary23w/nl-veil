@@ -32,6 +32,7 @@ The Hots tab (drawn in `main.zig`) shows up to three hots, the selected one's co
 
 - Names, states and the goal line are stored as one line (line breaks and tabs become spaces); event and scratchpad text keep their line breaks, because the tab wraps them (`hotWrapNext` in main.zig). Every cut lands on a UTF-8 boundary.
 - The bodies are written by `std.json`, and a test reads one back through a strict parser: text inside a goal cannot add a field, so it cannot grant the owner's machine.
+- An event's `brief` is the runtime's one line for it (for a tool call: the tool, its first argument, the first line of its result); an older runtime sends none and the text's first line stands in. `ok` false marks a row that went wrong, whether the runtime said so or the line shows `-> ERROR` / `-> FAILED`. `hasMore` says whether opening the row shows more than the brief.
 - Event kinds borrow the swarm console's colours by meaning: an improving verdict reads as a score, an error as a stop, a human's message as a tick.
 
 ---

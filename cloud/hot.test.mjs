@@ -770,9 +770,18 @@ test("Python: a script runs in the companion Worker beside the hot's files, what
   assert.match(await run("run_python", { code: "print(1)" }), /Python is not available/);
 });
 
-/// A stand-in for Cloudflare's browser binding: one session, one page, the DevTools commands the hot uses.
+/// A stand-in for Cloudflare's browser binding: one session and a small site of pages, each a text and a list of
+/// elements, answering the DevTools commands the hot uses - the page snapshot, element lookup, real mouse and key
+/// input, and evaluated scripts.
 function fakeBrowser() {
-  const b = { acquired: 0, connects: 0, log: [], page: { url: "about:blank", title: "", text: "" }, alive: true };
+  const site = {
+    "https://tides.example/": { title: "Tides", text: "Tide tables for the coast", els: [{ kind: "link", label: "Today", href: "https://tides.example/today" }, { kind: "input text", label: "", name: "q" }, { kind: "button", label: "Search" }] },
+    "https://tides.example/today": { title: "Today", text: "High tide 04:12\nLow tide 10:40", els: [{ kind: "link", label: "Home", href: "https://tides.example/" }] },
+    "https://tides.example/results": { title: "Results", text: "Results for tofino", els: [] },
+    "https://wall.example/": { title: "Just a moment...", text: "Verify you are human by completing the action below.", els: [] },
+  };
+  const b = { acquired: 0, connects: 0, log: [], url: "about:blank", history: [], typed: "", focused: 0, alive: true, serp: null };
+  const page = () => site[b.url] ?? { title: "", text: "", els: [] };
   b.fetch = async (url, init) => {
     const u = new URL(url);
     if (init?.method === "POST" && u.pathname === "/v1/devtools/browser") {
@@ -788,6 +797,12 @@ function fakeBrowser() {
     b.connects++;
     const listeners = { message: [], close: [], error: [] };
     const emit = (obj) => queueMicrotask(() => listeners.message.forEach((f) => f({ data: JSON.stringify(obj) })));
+    const go = (to) => {
+      b.history.push(b.url);
+      b.url = to;
+      emit({ method: "Page.frameNavigated", sessionId: "S1", params: {} });
+      emit({ method: "Page.loadEventFired", sessionId: "S1", params: {} });
+    };
     const ws = {
       accept() {},
       addEventListener: (type, f) => listeners[type].push(f),
@@ -796,23 +811,69 @@ function fakeBrowser() {
         const c = JSON.parse(raw);
         b.log.push(c.method);
         const ok = (result) => emit({ id: c.id, result });
+        const val = (v) => ok({ result: { value: v } });
         if (c.method === "Target.createTarget") return ok({ targetId: "T1" });
         if (c.method === "Target.attachToTarget") return c.params.targetId === "T1" ? ok({ sessionId: "S1" }) : emit({ id: c.id, error: { message: "No target with given id" } });
         if (c.method === "Page.navigate") {
-          b.page = { url: c.params.url, title: "Tides", text: "High tide 04:12\nLow tide 10:40" };
           ok({ frameId: "F" });
-          return emit({ method: "Page.loadEventFired", sessionId: "S1", params: {} });
+          return go(c.params.url);
+        }
+        if (c.method === "Input.dispatchMouseEvent") {
+          if (c.params.type === "mouseReleased") {
+            const el = page().els[c.params.x / 10 - 1]; // an element's x is its number times ten
+            b.focused = c.params.x / 10;
+            if (el?.href) go(el.href);
+          }
+          return ok({});
+        }
+        if (c.method === "Input.insertText") {
+          b.typed += c.params.text;
+          return ok({});
+        }
+        if (c.method === "Input.dispatchKeyEvent") {
+          if (c.params.type !== "keyUp" && c.params.key === "Enter" && b.url === "https://tides.example/") go("https://tides.example/results");
+          return ok({});
         }
         if (c.method === "Runtime.evaluate") {
           assert.equal(c.sessionId, "S1");
           const e = c.params.expression;
-          if (e.includes("location.href")) return ok({ result: { value: JSON.stringify(b.page) } });
-          if (e.includes("a.result__a")) return ok({ result: { value: JSON.stringify(b.page.url.includes("html.duckduckgo.com") ? [{ title: "Tide tables", url: "https://tides.example/", snippet: "from the browser" }] : []) } });
-          if (e.includes("throw")) return ok({ exceptionDetails: { text: "Uncaught", exception: { description: "Error: nope" } } });
-          if (e === "1+1") return ok({ result: { value: 2 } });
-          if (e.includes("no element matches") && e.includes('"missing"')) return ok({ result: { value: "no element matches" } });
-          if (e.includes("e.click()")) return ok({ result: { value: "clicked a Next" } });
-          return ok({ result: { value: "typed into input" } });
+          if (e.includes("data-veil-n") && e.includes("els: out")) {
+            const pg = page();
+            return val(JSON.stringify({ url: b.url, title: pg.title, text: pg.text, els: pg.els.map((x, k) => `[${k + 1}] ${x.kind}${x.label ? ` "${x.label}"` : ""}${x.href ? " -> " + new URL(x.href).pathname : ""}${x.name ? " name=" + x.name : ""}`) }));
+          }
+          if (e.includes("scrollIntoView")) {
+            const [, n, sel, t] = /const n = (.*?), sel = (".*?"), t = (".*?");/.exec(e);
+            const els = page().els;
+            let k = n === "null" ? -1 : Number(n) - 1;
+            if (k < 0 && JSON.parse(sel) === "#q") k = els.findIndex((x) => x.name === "q");
+            if (k < 0 && JSON.parse(t)) k = els.findIndex((x) => x.label.toLowerCase().includes(JSON.parse(t)));
+            if (!els[k]) return val(JSON.stringify({ err: n !== "null" ? `no element number ${n} on this page` : "no element matches" }));
+            return val(JSON.stringify({ x: (k + 1) * 10, y: 5, tag: els[k].kind.split(" ")[0] === "link" ? "a" : els[k].kind.split(" ")[0], label: els[k].label }));
+          }
+          if (e.includes("document.activeElement")) {
+            b.typed = "";
+            return val(null);
+          }
+          if (e.includes("b_algo")) return val(JSON.stringify(b.serp ? b.serp(b.url) : { results: [], blocked: false }));
+          if (e.includes("history.back()")) {
+            const prev = b.history.pop();
+            b.url = prev;
+            emit({ method: "Page.frameNavigated", sessionId: "S1", params: {} });
+            emit({ method: "Page.loadEventFired", sessionId: "S1", params: {} });
+            return val(null);
+          }
+          if (e.includes("window.scroll")) return val(null);
+          if (e.includes(".includes(")) return val(page().text.toLowerCase().includes(JSON.parse(/includes\((".*?")\)$/.exec(e)[1])));
+          if (e.includes("__l")) {
+            // the eval wrapper: answer for the scripts the test sends
+            if (e.includes("return (let x = 1")) return ok({ exceptionDetails: { text: "Uncaught", exception: { description: "SyntaxError: Unexpected identifier 'x'" } } });
+            if (e.includes("let x = 1; return x + 1")) return val(JSON.stringify({ v: 2, l: [] }));
+            if (e.includes("throw new Error")) return ok({ exceptionDetails: { text: "Uncaught", exception: { description: "Error: nope" } } });
+            if (e.includes('console.log("logged it")')) return val(JSON.stringify({ v: null, l: ["logged it"] }));
+            if (e.includes("document.title")) return val(JSON.stringify({ v: page().title, l: [] }));
+            return val(JSON.stringify({ v: null, l: [] }));
+          }
+          return val(null);
         }
         return ok({});
       },
@@ -822,47 +883,163 @@ function fakeBrowser() {
   return b;
 }
 
-test("the browser: a real page is opened over the DevTools protocol, read, clicked and scripted; the session is kept between iterations and replaced when it is gone", async () => {
+/// A hot with a browser whose waits are short enough for a test.
+async function browserWorld() {
   const w = world();
   const b = fakeBrowser();
   w.env.BROWSER = b;
   await w.req("POST", "/v1/hots", { goal: "first goal here" });
   const gary = w.hot("Gary");
+  gary.navMs = 20;
+  gary.settleMs = 1;
+  gary.pollMs = 1;
   const cfg = await gary.store.get("cfg");
-  const run = (tool, args) => gary.runTool(cfg, tool, args, "");
-  assert.equal((await w.req("GET", "/v1/hots/Gary")).body.hot.browser, true);
-  const page = await run("browser_open", { url: "https://tides.example/today" });
-  assert.equal(page, "Tides\nhttps://tides.example/today\n\nHigh tide 04:12\nLow tide 10:40");
-  assert.deepEqual(b.log.slice(0, 5), ["Target.createTarget", "Target.attachToTarget", "Page.enable", "Runtime.enable", "Page.navigate"]);
-  assert.equal(await run("browser_eval", { js: "1+1" }), "2");
-  assert.match(await run("browser_eval", { js: "throw new Error('nope')" }), /^ERROR: Error: nope/);
-  assert.match(await run("browser_click", { text: "Next" }), /^clicked a Next\n\nTides/);
-  assert.match(await run("browser_click", { selector: "missing" }), /ERROR: no element matches/);
-  assert.equal(await run("browser_type", { selector: "#q", text: "tofino" }), "typed into input");
-  assert.match(await run("browser_open", { url: "ftp://x" }), /ERROR: an http\(s\) URL/);
-  assert.equal(b.acquired, 1);
-  assert.equal(b.connects, 1); // one connection for the whole iteration
+  return { w, b, gary, run: (tool, args) => gary.runTool(cfg, tool, args, "") };
+}
 
-  // the next iteration: a new connection to the SAME session and page
+test("the browser: a page comes back as its text and a numbered list of what can be acted on; clicking and typing go by number, with real mouse and key input", async () => {
+  const { w, b, run } = await browserWorld();
+  assert.equal((await w.req("GET", "/v1/hots/Gary")).body.hot.browser, true);
+  const page = await run("browser_open", { url: "https://tides.example/" });
+  assert.equal(page, 'Tides\nhttps://tides.example/\n\nTide tables for the coast\n\nELEMENTS (act on one by its number):\n[1] link "Today" -> /today\n[2] input text name=q\n[3] button "Search"');
+  assert.deepEqual(b.log.slice(0, 5), ["Target.createTarget", "Target.attachToTarget", "Page.enable", "Runtime.enable", "Page.navigate"]);
+
+  // type into field 2 and submit: the field is focused by a click, cleared, typed into, and Enter is a real key
+  b.log.length = 0;
+  b.typed = "old text";
+  const typed = await run("browser_type", { n: 2, text: "tofino", submit: true });
+  assert.match(typed, /^typed into input "" and pressed Enter\n\nResults\nhttps:\/\/tides\.example\/results/);
+  assert.equal(b.typed, "tofino");
+  assert.deepEqual(b.log.filter((m) => m.startsWith("Input.")), ["Input.dispatchMouseEvent", "Input.dispatchMouseEvent", "Input.dispatchMouseEvent", "Input.insertText", "Input.dispatchKeyEvent", "Input.dispatchKeyEvent"]);
+
+  // back, then click link 1 by number: the click navigates, and the new page comes back with it
+  assert.match(await run("browser_back", {}), /^Tides\n/);
+  assert.match(await run("browser_click", { n: 1 }), /^clicked a "Today"\n\nToday\nhttps:\/\/tides\.example\/today\n\nHigh tide 04:12/);
+  // by text, and by an alias of the argument a model might use
+  assert.match(await run("browser_click", { text: "home" }), /^clicked a "Home"\n\nTides\n/);
+  assert.match(await run("browser_click", { index: 1 }), /clicked a "Today"/);
+  // what is not there is said, with the way out
+  assert.equal(await run("browser_click", { n: 9 }), "ERROR: no element number 9 on this page (browser_read lists the page's elements by number)");
+  assert.match(await run("browser_click", { selector: "#nope" }), /ERROR: no element matches/);
+  assert.match(await run("browser_type", { n: 1 }), /ERROR: give what to type/);
+  assert.match(await run("browser_key", { key: "F13" }), /ERROR: keys are Enter, Tab/);
+  assert.match(await run("browser_key", { key: "pagedown" }), /^pressed pagedown\n\nToday/);
+  assert.match(await run("browser_scroll", { to: "bottom" }), /^Today\n/);
+  assert.match(await run("browser_wait", { text: "low tide" }), /^"low tide" is on the page\n\nToday/);
+  assert.match(await run("browser_wait", { text: "never there", seconds: 0.2 }), /did not appear in 0\.2 s/);
+  assert.match(await run("browser_open", { url: "ftp://x" }), /ERROR: an http\(s\) URL/);
+  assert.match(await run("browser_open", { url: "http://192.168.1.1/admin" }), /private or internal/);
+  assert.equal(b.connects, 1); // one connection for the whole iteration
+});
+
+test("the browser: a script's value or what it logs comes back, statements run with return, and a bot check is called one", async () => {
+  const { b, run } = await browserWorld();
+  await run("browser_open", { url: "https://tides.example/" });
+  assert.equal(await run("browser_eval", { js: "document.title" }), "Tides");
+  assert.equal(await run("browser_eval", { code: "document.title;" }), "Tides"); // an alias, and a trailing semicolon
+  assert.equal(await run("browser_eval", { js: 'console.log("logged it")' }), "logged it");
+  assert.equal(await run("browser_eval", { js: "let x = 1; return x + 1" }), "2"); // statements: tried as an expression first, then as a body
+  assert.match(await run("browser_eval", { js: "throw new Error('nope')" }), /^ERROR: Error: nope/);
+  assert.match(await run("browser_eval", { text: "Select all squares" }), /ERROR: give the JavaScript/);
+  const wall = await run("browser_open", { url: "https://wall.example/" });
+  assert.match(wall, /^BOT CHECK: this page asks its visitor to prove they are human\. A hot does not solve these/);
+  assert.match(wall, /\(nothing on the page can be clicked or typed into\)$/);
+  assert.equal(b.connects, 1);
+});
+
+test("the browser: the session and its page are kept between iterations, and replaced when Cloudflare has ended it", async () => {
+  const { w, b, gary, run } = await browserWorld();
+  await run("browser_open", { url: "https://tides.example/today" });
   gary.br.cdp.close();
-  gary.br = null;
-  assert.match(await run("browser_read", {}), /^Tides\nhttps:\/\/tides.example\/today/);
+  gary.br = null; // the next iteration: a new connection to the SAME session and page
+  assert.match(await run("browser_read", {}), /^Today\nhttps:\/\/tides\.example\/today/);
   assert.equal(b.acquired, 1);
   assert.equal(b.connects, 2);
-  assert.ok(b.log.lastIndexOf("Target.createTarget") === 0); // re-attached, no new tab
-
-  // the session died on Cloudflare's side (its ten idle minutes passed): a new one is started
+  assert.equal(b.log.filter((m) => m === "Target.createTarget").length, 1); // re-attached, no new tab
   gary.br.cdp.close();
   gary.br = null;
-  b.alive = false;
-  assert.match(await run("browser_open", { url: "https://tides.example/tomorrow" }), /tomorrow/);
+  b.alive = false; // its ten idle minutes passed on Cloudflare's side
+  assert.match(await run("browser_open", { url: "https://tides.example/" }), /^Tides\n/);
   assert.equal(b.acquired, 2);
   assert.equal(await run("browser_close", {}), "browser closed");
   assert.equal(await gary.store.get("browser"), undefined);
-
-  // without the binding the tools say so, and are not offered
   delete w.env.BROWSER;
   assert.match(await run("browser_open", { url: "https://x.example" }), /no browser in this account/);
+});
+
+test("the mind: facts are recalled by neuron-db, stances and a mood are kept and ride every prompt, and all of it survives a new isolate", async () => {
+  const { NeuronDB } = await import("./neuron-db.mjs");
+  const fs = await import("node:fs");
+  const bytes = fs.readFileSync(new URL("./neuron_core.wasm", import.meta.url));
+  const w = world((messages) => {
+    const text = said(messages);
+    if (text.includes("GOAL LOOP")) return "Try the thing";
+    if (text.includes("THIS ITERATION'S STEP")) return '{"final": "nothing shown"}';
+    if (text.includes("Grade the LAST iteration")) return "SAME | score: none | evidence: nothing ran";
+    return "NONE";
+  });
+  w.env.NDB = () => NeuronDB.fromBytes(bytes);
+  await w.req("POST", "/v1/hots", { goal: "first goal here" });
+  const gary = w.hot("Gary");
+  const cfg = await gary.store.get("cfg");
+  const run = (tool, args) => gary.runTool(cfg, tool, args, "");
+  assert.equal((await w.req("GET", "/v1/hots/Gary")).body.hot.neuron, true);
+  await run("remember", { fact: "the tide API key lives in settings.json" });
+  await run("remember", { fact: "harbour pages are served from /h/<slug>" });
+  assert.equal(await run("recall", { query: "where is the API key?" }), "- the tide API key lives in settings.json");
+  assert.equal(await run("feel", { about: "web search", feeling: "frustrated: every engine refuses this address" }), "noted: web search - frustrated: every engine refuses this address");
+  await run("feel", { about: "Web Search", feeling: "better: the browser gets results" }); // one stance per topic
+  assert.deepEqual((await gary.store.get("stances")).map((x) => [x.topic, x.feeling]), [["Web Search", "better: the browser gets results"]]);
+  assert.match(await run("feel", { about: "x" }), /ERROR: give both/);
+  await w.tick("Gary"); // a flat iteration sets the mood
+  assert.equal(await gary.store.get("mood"), "steady - the last step changed nothing measurable");
+  await w.tick("Gary");
+  assert.match(await gary.store.get("mood"), /^frustrated but persistent/);
+  const mem = await gary.workingMemory();
+  assert.match(mem, /HOW YOU FEEL ABOUT THE WORK[\s\S]*- right now: frustrated but persistent[\s\S]*- Web Search: better: the browser gets results/);
+  assert.equal((await w.req("GET", "/v1/hots/Gary")).body.hot.mood.startsWith("frustrated"), true);
+  assert.ok((await w.events("Gary")).some((e) => e.kind === "feel" && e.text === "Web Search: better: the browser gets results"));
+
+  // a new isolate: the engine is loaded again from what the hot kept
+  gary.ndb = undefined;
+  const db = await gary.mind();
+  assert.equal(db.recall("hot", "API key", 3)[0], "the tide API key lives in settings.json");
+  assert.match(db.raw("stanceof", "hot", "Web Search"), /better: the browser gets results/);
+
+  // without the engine, recall still answers (by keyword) and stances are still kept
+  const w2 = world();
+  await w2.req("POST", "/v1/hots", { goal: "first goal here" });
+  const g2 = w2.hot("Gary");
+  const c2 = await g2.store.get("cfg");
+  assert.equal((await w2.req("GET", "/v1/hots/Gary")).body.hot.neuron, false);
+  await g2.runTool(c2, "remember", { fact: "the tide API key lives in settings.json" }, "");
+  assert.equal(await g2.runTool(c2, "recall", { query: "API key" }, ""), "- the tide API key lives in settings.json");
+  await g2.runTool(c2, "feel", { about: "python", feeling: "satisfied" }, "");
+  assert.equal((await g2.store.get("stances")).length, 1);
+});
+
+test("every event carries a one-line brief and whether it went well, beside its full text", async () => {
+  const w = world((messages, n) => {
+    const text = said(messages);
+    if (text.includes("GOAL LOOP")) return "Fetch the page";
+    if (text.includes("THIS ITERATION'S STEP")) return n === 2 ? '{"tool": "web_fetch", "args": {"url": "ftp://nope"}}' : n === 3 ? '{"tool": "write_file", "args": {"name": "a.md", "text": "line one\\nline two"}}' : '{"final": "done"}';
+    if (text.includes("Grade the LAST iteration")) return "SAME | score: none | evidence: none";
+    return "NONE";
+  });
+  await w.req("POST", "/v1/hots", { goal: "first goal here" });
+  await w.tick("Gary");
+  const evs = await w.events("Gary");
+  const acts = evs.filter((e) => e.kind === "act");
+  assert.equal(acts[0].ok, false);
+  assert.equal(acts[0].brief, 'web_fetch ftp://nope -> ERROR: an http(s) URL is needed, as {"url": "https://..."}');
+  assert.equal(acts[1].ok, true);
+  assert.equal(acts[1].brief, "write_file a.md -> saved a.md (17 characters)");
+  assert.ok(acts[1].text.includes("line one\\nline two")); // the full row keeps the arguments
+  for (const e of evs) {
+    assert.equal(typeof e.brief, "string");
+    assert.ok(!e.brief.includes("\n") && e.brief.length <= 181, e.brief);
+    assert.equal(typeof e.ok, "boolean");
+  }
 });
 
 test("a hot never calls a private address, directly or through a redirect; a reply still thinking at its end has no text", async () => {
@@ -923,12 +1100,28 @@ test("web_search walks the keyless chain: a SearXNG instance that answers is rem
     assert.match(await gary.runTool(cfg, "web_search", { query: "tides" }, ""), /\(Wikipedia\):\n1\. Tide\n   https:\/\/en\.wikipedia\.org\/wiki\/Tide\n   The rise and fall/);
     assert.ok(hosts.includes("html.duckduckgo.com") && hosts.includes("www.bing.com") && hosts.includes("api.duckduckgo.com"));
     mode = "nothing";
-    assert.match(await gary.runTool(cfg, "web_search", { query: "tides" }, ""), /^ERROR: no search engine answered \(/);
-    // with a browser, a search every engine refused is made through it
-    w.env.BROWSER = fakeBrowser();
-    assert.equal(await gary.runTool(cfg, "web_search", { query: "tide tables" }, ""), '1 results for "tide tables" (DuckDuckGo, through the browser):\n1. Tide tables\n   https://tides.example/\n   from the browser');
+    const none = await gary.runTool(cfg, "web_search", { query: "tides" }, "");
+    assert.match(none, /^ERROR: no search source answered \(/);
+    assert.match(none, /veil hot key brave <key>/); // the way out is named
+    // with a browser, a search every engine refused is made through it: Bing shows a bot check, Brave answers
+    const fb = fakeBrowser();
+    fb.serp = (url) => (url.includes("bing.com") ? { results: [], blocked: true } : { results: [{ title: "Tide tables", url: "https://tides.example/", snippet: "from the browser" }], blocked: false });
+    w.env.BROWSER = fb;
+    gary.settleMs = 1;
+    assert.equal(await gary.runTool(cfg, "web_search", { query: "tide tables" }, ""), '1 results for "tide tables" (Brave, through the browser):\n1. Tide tables\n   https://tides.example/\n   from the browser');
     delete w.env.BROWSER;
     gary.br = null;
+    // with a key, the search API is asked first and nothing else is
+    hosts.length = 0;
+    w.env.BRAVE_KEY = "k-123";
+    globalThis.fetch = async (url, init) => {
+      hosts.push(new URL(String(url)).hostname);
+      assert.equal(init.headers["x-subscription-token"], "k-123");
+      return new Response(JSON.stringify({ web: { results: [{ title: "Keyed", url: "https://k.example/", description: "from <b>Brave</b>" }] } }), { status: 200 });
+    };
+    assert.equal(await gary.runTool(cfg, "web_search", { query: "tides" }, ""), '1 results for "tides" (Brave):\n1. Keyed\n   https://k.example/\n   from Brave');
+    assert.deepEqual(hosts, ["api.search.brave.com"]);
+    delete w.env.BRAVE_KEY;
     assert.match(await gary.runTool(cfg, "web_search", {}, ""), /ERROR: give the words/);
   } finally {
     globalThis.fetch = realFetch;

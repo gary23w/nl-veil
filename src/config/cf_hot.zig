@@ -32,6 +32,7 @@
 //!   GET    /api/v1/hots/pad              the scratchpad the account's hots share (?after=N)
 //!   POST   /api/v1/hots/pad              write to it
 //!   POST   /api/v1/hots/pad/clear        empty it (the local copy is kept as _hots/scratchpad-<when>.md)
+//!   POST   /api/v1/hots/keys             give the hots a search key ({"name":"brave","value":"..."}); "" removes it
 //!
 //! THE LOCAL FOLDER: every deployment of a hot is mirrored into {data}/u<uid>/_hots/<name>-<deployed>/ (events.log
 //! to tail, events.jsonl, status.json, notes/), with the shared scratchpad at _hots/scratchpad.md. See mirrorHot.
@@ -55,6 +56,9 @@ const log = std.log.scoped(.cf_hot);
 const HOT_JS = @embedFile("hot.js");
 /// The Python a hot runs: a second Worker, reached from the runtime through a service binding (cloud/hot_py.py).
 const HOT_PY = @embedFile("hot_py.py");
+/// The hot's mind: neuron-db compiled to WebAssembly and its binding, two more modules of the runtime's upload.
+const NEURON_WASM = @embedFile("neuron_core.wasm");
+const NEURON_MJS = @embedFile("neuron-db.mjs");
 
 pub const SCRIPT = "veil-hots";
 pub const PY_SCRIPT = "veil-hots-py";
@@ -80,6 +84,7 @@ const State = struct {
     deployed_at: i64 = 0,
     python: bool = false, // the runtime has its Python Worker bound (run_python, skills)
     browser: bool = false, // the runtime has Cloudflare's browser bound (browser_*)
+    neuron: bool = false, // the runtime carries neuron-db (recall by meaning, stances, mood)
     tools_note: []const u8 = "", // why one of them is missing, in Cloudflare's words
     local: []const []const u8 = &.{}, // hots the owner allowed onto this machine, by name
     last_error: []const u8 = "",
@@ -144,6 +149,9 @@ fn scriptHash(out: *[16]u8) []const u8 {
     h.update(HOT_JS);
     h.update("\x00");
     h.update(HOT_PY);
+    h.update("\x00");
+    h.update(NEURON_MJS);
+    h.update(NEURON_WASM);
     var dig: [32]u8 = undefined;
     h.final(&dig);
     out.* = std.fmt.bytesToHex(dig[0..8].*, .lower);
@@ -197,7 +205,7 @@ fn api(app: *App, a: std.mem.Allocator, method: []const u8, url: []const u8, bod
 }
 
 /// Which optional bindings an upload asks for. The runtime works without either; each is one family of tools.
-const Extras = struct { python: bool, browser: bool };
+const Extras = struct { python: bool, browser: bool, neuron: bool = false };
 
 /// The script upload: a multipart body of the metadata and the module. The metadata names the AI binding and the
 /// object class, and KEEPS the secret already on the script - the token is set by its own small call (putSecret),
@@ -215,6 +223,13 @@ fn uploadBody(a: std.mem.Allocator, boundary: []const u8, fresh: bool, x: Extras
     if (fresh) try out.appendSlice(a, ",\"migrations\":{\"new_tag\":\"" ++ MIGRATION_TAG ++ "\",\"new_sqlite_classes\":[\"Hot\"]}");
     try out.print(a, "}}\r\n--{s}\r\nContent-Disposition: form-data; name=\"" ++ MODULE ++ "\"; filename=\"" ++ MODULE ++ "\"\r\nContent-Type: application/javascript+module\r\n\r\n", .{boundary});
     try out.appendSlice(a, HOT_JS);
+    if (x.neuron) {
+        // the names are the ones hot.js imports: "./neuron-db.mjs" and "./neuron_core.wasm"
+        try out.print(a, "\r\n--{s}\r\nContent-Disposition: form-data; name=\"neuron-db.mjs\"; filename=\"neuron-db.mjs\"\r\nContent-Type: application/javascript+module\r\n\r\n", .{boundary});
+        try out.appendSlice(a, NEURON_MJS);
+        try out.print(a, "\r\n--{s}\r\nContent-Disposition: form-data; name=\"neuron_core.wasm\"; filename=\"neuron_core.wasm\"\r\nContent-Type: application/wasm\r\n\r\n", .{boundary});
+        try out.appendSlice(a, NEURON_WASM);
+    }
     try out.print(a, "\r\n--{s}--\r\n", .{boundary});
     return out.items;
 }
@@ -300,14 +315,15 @@ fn ensureRuntime(app: *App, a: std.mem.Allocator, uid: u64, tok: Tok, st: *State
     // scope), so each set of bindings is tried with and without the class migration; the first upload Cloudflare
     // takes wins, and the first refusal of all is the one reported when none does.
     const wants = [_]Extras{
-        .{ .python = python, .browser = true },
-        .{ .python = python, .browser = false },
-        .{ .python = false, .browser = false },
+        .{ .python = python, .browser = true, .neuron = true },
+        .{ .python = python, .browser = false, .neuron = true },
+        .{ .python = python, .browser = false, .neuron = false },
+        .{ .python = false, .browser = false, .neuron = false },
     };
     var up_err: []const u8 = "";
     var got: ?Extras = null;
     ladder: for (wants, 0..) |x, wi| {
-        if (wi == 2 and !python) break; // the same upload as the one before it
+        if (wi == 3 and !python) break; // the same upload as the one before it
         var refusal: []const u8 = "";
         for ([_]bool{ !exists, exists }) |fresh| {
             const body = uploadBody(a, boundary, fresh, x) catch return "out of memory";
@@ -320,12 +336,15 @@ fn ensureRuntime(app: *App, a: std.mem.Allocator, uid: u64, tok: Tok, st: *State
             if (refusal.len == 0) refusal = e;
         }
         if (up_err.len == 0) up_err = refusal;
-        if (x.browser and note.len < 200) note = std.fmt.allocPrint(a, "{s}{s}the browser is off: {s}", .{ note, if (note.len > 0) "; " else "", refusal }) catch note;
+        // what the NEXT upload goes without is what this refusal is put down to
+        const dropped: []const u8 = if (wi == 0) "the browser" else if (wi == 1) "neuron-db" else "Python";
+        if (note.len < 300) note = std.fmt.allocPrint(a, "{s}{s}{s} is off: {s}", .{ note, if (note.len > 0) "; " else "", dropped, refusal }) catch note;
     }
     const have = got orelse return explain(a, "uploading the hot runtime", up_err);
     st.python = have.python;
     st.browser = have.browser;
-    st.tools_note = if (have.python and have.browser) "" else note;
+    st.neuron = have.neuron;
+    st.tools_note = if (have.python and have.browser and have.neuron) "" else note;
 
     // Its token, as a secret binding. A small JSON body: it rides curl's stdin with the bearer, never a file.
     var tb: [64]u8 = undefined;
@@ -439,7 +458,7 @@ pub fn listHots(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         if (i > 0) try out.append(app.gpa, ',');
         try http.jstr(app.gpa, &out, n);
     }
-    try out.print(app.gpa, "],\"python\":{},\"browser\":{},\"tools_note\":", .{ st.python, st.browser });
+    try out.print(app.gpa, "],\"python\":{},\"browser\":{},\"neuron\":{},\"tools_note\":", .{ st.python, st.browser, st.neuron });
     try http.jstr(app.gpa, &out, st.tools_note);
     try out.appendSlice(app.gpa, ",\"last_error\":");
     try http.jstr(app.gpa, &out, st.last_error);
@@ -746,6 +765,42 @@ fn archivePad(app: *App, a: std.mem.Allocator, uid: u64) void {
     const old = std.fmt.allocPrint(a, "{s}/scratchpad-{s}.md", .{ dir, nb[0..n] }) catch return;
     std.Io.Dir.cwd().writeFile(app.io, .{ .sub_path = old, .data = body }) catch return;
     std.Io.Dir.cwd().deleteFile(app.io, cur) catch {};
+}
+
+const KeyReq = struct { name: []const u8 = "", value: []const u8 = "" };
+
+/// The search keys a hot's web_search uses before the keyless sources: the name a human types, and the secret
+/// binding the runtime reads.
+fn keySecret(name: []const u8) ?[]const u8 {
+    if (std.ascii.eqlIgnoreCase(name, "brave")) return "BRAVE_KEY";
+    if (std.ascii.eqlIgnoreCase(name, "google")) return "GOOGLE_CSE_KEY";
+    if (std.ascii.eqlIgnoreCase(name, "google_cx") or std.ascii.eqlIgnoreCase(name, "google-cx")) return "GOOGLE_CSE_CX";
+    return null;
+}
+
+/// POST /api/v1/hots/keys {name, value} — set (or, with an empty value, remove) a search key on the runtime. The
+/// key becomes a secret binding of the Worker: it rides curl's stdin on its way there and is never written here.
+pub fn setKey(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
+    const u = gate(app, req, res) orelse return;
+    const body = (req.json(KeyReq) catch return badReq(res, "malformed JSON body")) orelse return badReq(res, "bad body");
+    const secret = keySecret(body.name) orelse return badReq(res, "a search key is one of: brave, google, google_cx");
+    const value = std.mem.trim(u8, body.value, " \r\n\t");
+    if (value.len > 400) return badReq(res, "that is too long to be a key");
+    for (value) |c| if (c < 0x20 or c == 0x7F) return badReq(res, "a key cannot hold control characters");
+    var arena = std.heap.ArenaAllocator.init(app.gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tok = tokOf(app, u.id, a) orelse return badReq(res, "not connected to Cloudflare - log in with Cloudflare first");
+    const st = readState(app, u.id, a);
+    if (st.url.len == 0) return badReq(res, "deploy a hot first: the key is kept on the hots' Worker");
+    const base = try std.fmt.allocPrint(a, "{s}/accounts/{s}/workers/scripts/" ++ SCRIPT ++ "/secrets", .{ app.cf_api_root, st.account });
+    const raw = if (value.len == 0)
+        api(app, a, "DELETE", try std.fmt.allocPrint(a, "{s}/{s}", .{ base, secret }), "", tok.key, "")
+    else
+        api(app, a, "PUT", base, std.json.Stringify.valueAlloc(a, .{ .name = secret, .text = value, .type = "secret_text" }, .{}) catch return http.serverErr(res, "out of memory"), tok.key, "application/json");
+    const msg = firstError(a, raw orelse return http.serverErr(res, "could not reach the Cloudflare API"));
+    if (msg.len > 0 and !(value.len == 0 and std.ascii.indexOfIgnoreCase(msg, "not found") != null)) return badReq(res, explain(a, "setting the key", msg));
+    try res.json(.{ .ok = true, .name = body.name, .set = value.len > 0 }, .{});
 }
 
 // ---------------------------------------------------------------------------------- the owner's machine
@@ -1125,7 +1180,7 @@ test "every hot route is gated: an anonymous caller gets 401 and nothing runs" {
     const io = threaded.io();
     var ta = try http.testApp(gpa, io, "zig-cfhot-gate-tmp");
     defer ta.deinit();
-    inline for (.{ listHots, createHot, deleteHot, teardown, hotEvents, hotCommand, hotConfig, padRead, padWrite, padClear }) |h| {
+    inline for (.{ listHots, createHot, deleteHot, teardown, hotEvents, hotCommand, hotConfig, padRead, padWrite, padClear, setKey }) |h| {
         var web = httpz.testing.init(.{});
         defer web.deinit();
         web.param("name", "Gary");
@@ -1207,7 +1262,7 @@ test "the upload carries the bindings and keeps the secret; the class migration 
     var arena = std.heap.ArenaAllocator.init(tt.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const first = try uploadBody(a, "----b", true, .{ .python = true, .browser = true });
+    const first = try uploadBody(a, "----b", true, .{ .python = true, .browser = true, .neuron = true });
     const again = try uploadBody(a, "----b", false, .{ .python = false, .browser = false });
     // the metadata part is JSON a real parser reads
     const meta_at = std.mem.indexOf(u8, first, "\r\n\r\n").? + 4;
@@ -1239,6 +1294,16 @@ test "the upload carries the bindings and keeps the secret; the class migration 
     try tt.expect(std.mem.indexOf(u8, again, "migrations") == null);
     try tt.expect(std.mem.indexOf(u8, first, HOT_JS) != null);
     try tt.expect(std.mem.endsWith(u8, first, "\r\n------b--\r\n"));
+    // the mind: both modules under the names hot.js imports, the engine as WebAssembly; neither when not asked for
+    try tt.expect(std.mem.indexOf(u8, HOT_JS, "const NEURON_WASM = \"./neuron_core.wasm\";") != null);
+    try tt.expect(std.mem.indexOf(u8, HOT_JS, "const NEURON_BINDING = \"./neuron-db.mjs\";") != null);
+    try tt.expect(std.mem.indexOf(u8, first, "name=\"neuron-db.mjs\"; filename=\"neuron-db.mjs\"\r\nContent-Type: application/javascript+module\r\n\r\n" ++ NEURON_MJS) != null);
+    try tt.expect(std.mem.indexOf(u8, first, "name=\"neuron_core.wasm\"; filename=\"neuron_core.wasm\"\r\nContent-Type: application/wasm\r\n\r\n" ++ NEURON_WASM) != null);
+    try tt.expect(std.mem.startsWith(u8, NEURON_WASM, "\x00asm"));
+    try tt.expect(std.mem.indexOf(u8, again, "application/wasm") == null);
+    try tt.expectEqualStrings("BRAVE_KEY", keySecret("Brave").?);
+    try tt.expectEqualStrings("GOOGLE_CSE_CX", keySecret("google_cx").?);
+    try tt.expect(keySecret("HOT_TOKEN") == null); // the runtime's own token is not a key anyone sets
     try tt.expect(std.mem.indexOf(u8, first, "HOT_TOKEN\",\"text\"") == null); // no secret in a body that rides a file
 }
 
@@ -1305,7 +1370,7 @@ test "a first deployment uploads the runtime, sets its token, creates the hot an
     try tt.expectEqual(@as(usize, 1), st.local.len);
     try tt.expectEqualStrings("Gary", st.local[0]);
     // Python went up and is bound; the browser was refused, and the state says why in Cloudflare's words
-    try tt.expect(st.python and !st.browser);
+    try tt.expect(st.python and !st.browser and st.neuron);
     try tt.expect(std.mem.indexOf(u8, st.tools_note, "the browser is off: Browser Rendering is not enabled") != null);
 
     // The state file holds no secret: not the runtime's token, not the OAuth bearer.

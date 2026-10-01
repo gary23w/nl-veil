@@ -272,6 +272,9 @@ const Ui = struct {
     hot_scroll: f32 = 0, // the console, in visual lines
     hot_follow: bool = true, // pinned to the newest line
     hot_sb_drag: bool = false, // the console's scrollbar is being dragged
+    hot_open: [12]u64 = [_]u64{0} ** 12, // the events (by seq) whose rows are open in the console
+    hot_open_n: usize = 0,
+    hot_errors_only: bool = false, // the console shows only the rows that went wrong
     hot_pad_scroll: f32 = 0, // the scratchpad, in pixels
     hot_pad_follow: bool = true,
     hot_pad_clear_armed: bool = false, // "clear" was clicked once (the second click clears)
@@ -7696,20 +7699,55 @@ fn hotLineCount(text: []const u8, cols: usize) usize {
     return @max(n, 1);
 }
 
-/// A hot's console: every event whole, wrapped to the panel, scrolled by the wheel or the bar on the right. It
-/// follows the newest line until you scroll up, and again once you are back at the bottom ("latest" jumps there).
+/// Whether event `seq` is open in the console.
+fn hotIsOpen(seq: u64) bool {
+    for (ui.hot_open[0..ui.hot_open_n]) |s| if (s == seq) return true;
+    return false;
+}
+
+/// Open a closed row, close an open one. The newest HOT_OPEN_MAX stay open; opening one more closes the oldest.
+fn hotToggle(seq: u64) void {
+    for (ui.hot_open[0..ui.hot_open_n], 0..) |s, k| if (s == seq) {
+        std.mem.copyForwards(u64, ui.hot_open[k .. ui.hot_open_n - 1], ui.hot_open[k + 1 .. ui.hot_open_n]);
+        ui.hot_open_n -= 1;
+        return;
+    };
+    if (ui.hot_open_n == ui.hot_open.len) {
+        std.mem.copyForwards(u64, ui.hot_open[0 .. ui.hot_open.len - 1], ui.hot_open[1..]);
+        ui.hot_open_n -= 1;
+    }
+    ui.hot_open[ui.hot_open_n] = seq;
+    ui.hot_open_n += 1;
+}
+
+/// A hot's console: ONE line per event - what happened, in brief - with a row that went wrong marked in red.
+/// Click a row to open it: its whole text drops down under it, wrapped to the panel; click again to close it.
+/// "errors only" hides everything else. It scrolls by the wheel or the bar on the right, and follows the newest
+/// line until you scroll up or open a row.
 fn drawHotConsole(r: t.Rect, evs: []const hots.Ev) void {
     t.panelBordered(r, t.bg_dark, t.border);
     const line_h: f32 = 20;
     const fsz: i32 = 13;
-    const label_x = r.x + 46;
-    const text_x = r.x + 124;
+    const mark_x = r.x + 46;
+    const label_x = r.x + 60;
+    const text_x = r.x + 138;
     const sb_w: f32 = 8;
     const text_w = r.width - (text_x - r.x) - sb_w - 16;
     const cw = @max(1.0, t.measureMonoF(t.z("MMMMMMMMMM", .{}), fsz) / 10.0);
     const cols: usize = @max(16, @as(usize, @intFromFloat(text_w / cw)));
+
+    // the filter chip, top right (left of the hover copy)
+    var failed: usize = 0;
+    for (evs) |*e| failed += @intFromBool(!e.ok);
+    const fl = if (ui.hot_errors_only) t.z("showing {d} errors - show all", .{failed}) else t.z("{d} errors", .{failed});
+    const fw = t.btnW(fl, 20);
+    const chip = t.Rect{ .x = r.x + r.width - fw - sb_w - 70, .y = r.y + 4, .width = fw, .height = 20 };
+
     var total: usize = 0;
-    for (evs) |*e| total += hotLineCount(e.textStr(), cols);
+    for (evs) |*e| {
+        if (ui.hot_errors_only and e.ok) continue;
+        total += 1 + (if (hotIsOpen(e.seq)) hotLineCount(e.textStr(), cols) else 0);
+    }
     const visible: usize = @max(1, @as(usize, @intFromFloat((r.height - 12) / line_h)));
     const max_scroll: f32 = @floatFromInt(if (total > visible) total - visible else 0);
 
@@ -7728,41 +7766,70 @@ fn drawHotConsole(r: t.Rect, evs: []const hots.Ev) void {
     }
     if (ui.hot_follow) ui.hot_scroll = max_scroll;
     ui.hot_scroll = std.math.clamp(ui.hot_scroll, 0, max_scroll);
-    if (!ui.hot_sb_drag and ui.hot_scroll >= max_scroll) ui.hot_follow = true; // back at the bottom: follow again
+    if (!ui.hot_sb_drag and wheel > 0 and ui.hot_scroll >= max_scroll) ui.hot_follow = true; // scrolled back to the bottom
     const first: usize = @intFromFloat(ui.hot_scroll);
 
+    var clicked: ?u64 = null;
     {
         rl.beginScissorMode(@intFromFloat(r.x + 1), @intFromFloat(r.y + 1), @intFromFloat(r.width - 2), @intFromFloat(r.height - 2));
         defer rl.endScissorMode();
         var li: usize = 0;
         var yy = r.y + 6;
         draw: for (evs) |*e| {
+            if (ui.hot_errors_only and e.ok) continue;
+            const open = hotIsOpen(e.seq);
             const txt = e.textStr();
-            const n = hotLineCount(txt, cols);
+            const n: usize = 1 + (if (open) hotLineCount(txt, cols) else 0);
             if (li + n <= first) {
                 li += n;
                 continue;
             }
-            const kc = kindColor(e.kindStr());
             var p: usize = 0;
             var k: usize = 0;
             while (k < n) : (k += 1) {
-                const w: HotWrap = if (txt.len == 0) .{ .line = txt, .next = 0 } else hotWrapNext(txt, p, cols);
-                p = w.next;
+                var line: []const u8 = e.briefStr();
+                if (k > 0) {
+                    const w = hotWrapNext(txt, p, cols);
+                    p = w.next;
+                    line = w.line;
+                }
                 if (li + k < first) continue;
                 if (k == 0) {
+                    const row = t.Rect{ .x = r.x + 2, .y = yy - 2, .width = r.width - sb_w - 12, .height = line_h };
+                    const can_open = e.hasMore();
+                    const hot = can_open and t.hovering(row) and !t.hovering(chip) and !ui.hot_sb_drag and yy < r.y + r.height - 4;
+                    if (!e.ok) t.fillRect(@intFromFloat(row.x), @intFromFloat(row.y), @intFromFloat(row.width), @intFromFloat(row.height), t.withAlpha(t.red, 26));
+                    if (hot) {
+                        t.fillRect(@intFromFloat(row.x), @intFromFloat(row.y), @intFromFloat(row.width), @intFromFloat(row.height), t.withAlpha(t.blue, 30));
+                        t.wantCursor(.pointing_hand);
+                        if (rl.isMouseButtonPressed(.left)) clicked = e.seq;
+                    }
                     if (e.round >= 0) t.textMono(t.z("r{d}", .{e.round}), @intFromFloat(r.x + 10), @intFromFloat(yy), fsz, t.comment);
-                    t.textMonoClip(e.labelStr(), @intFromFloat(label_x), @intFromFloat(yy), fsz, kc, @intFromFloat(text_x - label_x - 6));
+                    if (can_open) t.textMono(if (open) t.z("v", .{}) else t.z(">", .{}), @intFromFloat(mark_x), @intFromFloat(yy), fsz, if (hot) t.blue else t.comment);
+                    t.textMonoClip(e.labelStr(), @intFromFloat(label_x), @intFromFloat(yy), fsz, if (e.ok) kindColor(e.kindStr()) else t.red, @intFromFloat(text_x - label_x - 6));
+                    t.textMonoClip(line, @intFromFloat(text_x), @intFromFloat(yy), fsz, if (e.ok) t.fg else t.red, @intFromFloat(text_w));
+                } else {
+                    t.textMonoClip(line, @intFromFloat(text_x), @intFromFloat(yy), fsz, t.fg_dim, @intFromFloat(text_w + cw));
                 }
-                t.textMonoClip(w.line, @intFromFloat(text_x), @intFromFloat(yy), fsz, t.fg, @intFromFloat(text_w + cw));
                 yy += line_h;
                 if (yy > r.y + r.height - 4) break :draw;
             }
             li += n;
         }
     }
+    if (clicked) |seq| {
+        hotToggle(seq);
+        ui.hot_follow = false; // stay where the reader is
+    }
     if (evs.len == 0) t.text(t.z("no events yet - a new hot's first iteration starts within a few seconds", .{}), @intFromFloat(r.x + 14), @intFromFloat(r.y + 14), 13, t.comment);
+    if (evs.len > 0 and total == 0) t.text(t.z("no errors in what is shown", .{}), @intFromFloat(r.x + 14), @intFromFloat(r.y + 14), 13, t.comment);
 
+    if (failed > 0 or ui.hot_errors_only) {
+        if (t.buttonGhost(chip, fl, if (failed > 0) t.red else t.comment, true)) {
+            ui.hot_errors_only = !ui.hot_errors_only;
+            ui.hot_follow = true;
+        }
+    }
     if (max_scroll > 0) {
         t.fillRect(@intFromFloat(track.x), @intFromFloat(track.y), @intFromFloat(track.width), @intFromFloat(track.height), t.withAlpha(t.comment, 40));
         const vis_f: f32 = @floatFromInt(visible);
@@ -7776,11 +7843,12 @@ fn drawHotConsole(r: t.Rect, evs: []const hots.Ev) void {
             if (t.button(.{ .x = r.x + r.width - lw - sb_w - 16, .y = r.y + r.height - 30, .width = lw, .height = 22 }, ll, t.blue, true)) ui.hot_follow = true;
         }
     }
-    // hover copy: every event as "r<i> <kind> <text>" lines
+    // hover copy: every event shown, whole, as "r<i> <kind> <text>"
     if (evs.len > 0 and t.hovering(r)) {
-        if (copyChip(r.x + r.width - 72, r.y + 6)) {
+        if (copyChip(r.x + r.width - 64, r.y + 6)) {
             var n: usize = 0;
             for (evs) |*ev| {
+                if (ui.hot_errors_only and ev.ok) continue;
                 if (ev.round >= 0) bufAppend(&conv_buf, &n, t.z("r{d} ", .{ev.round}));
                 bufAppend(&conv_buf, &n, ev.labelStr());
                 bufAppend(&conv_buf, &n, " ");
@@ -7931,6 +7999,8 @@ fn drawHots(store: *Store, body: t.Rect) void {
             store.pushCmd(store_mod.mkCmd(.hot_select, row.nameStr(), ""));
             ui.hot_form = false;
             ui.hot_follow = true;
+            ui.hot_open_n = 0; // another hot's rows
+            ui.hot_errors_only = false;
         }
         y += card_h + 8;
     }
@@ -7952,7 +8022,7 @@ fn drawHots(store: *Store, body: t.Rect) void {
     y += t.BTN_MD + 8;
     // what the hots of this account can use, and why not when something is missing
     if (roster.reachable) {
-        t.textClip(t.z("tools: files, web, HTTP, memory{s}{s}", .{ if (roster.python) ", Python" else "", if (roster.browser) ", browser" else "" }), @intFromFloat(lx), @intFromFloat(y), 11, t.comment, @intFromFloat(left_w));
+        t.textClip(t.z("tools: files, web, HTTP, memory{s}{s}{s}", .{ if (roster.python) ", Python" else "", if (roster.browser) ", browser" else "", if (roster.neuron) ", neuron-db" else "" }), @intFromFloat(lx), @intFromFloat(y), 11, t.comment, @intFromFloat(left_w));
         y += 15;
         if (roster.note_len > 0) y = helpPara(roster.noteStr(), lx, y, left_w);
     }
@@ -8199,6 +8269,22 @@ test "hots tab: a pace and a goal line read the way the card shows them" {
     const fresh: Ui = .{};
     try std.testing.expect(fresh.hot_pace < HOT_PACES.len and fresh.hot_calls < HOT_CALLS.len);
     try std.testing.expect(!fresh.hot_local); // the owner's machine is never pre-checked
+}
+
+test "hots tab: a console row opens and closes on a click, and only so many stay open" {
+    ui.hot_open_n = 0;
+    hotToggle(7);
+    try std.testing.expect(hotIsOpen(7) and !hotIsOpen(8));
+    hotToggle(8);
+    hotToggle(7); // closes it, and the one opened after it stays
+    try std.testing.expect(!hotIsOpen(7) and hotIsOpen(8));
+    try std.testing.expectEqual(@as(usize, 1), ui.hot_open_n);
+    var s: u64 = 100;
+    while (s < 100 + ui.hot_open.len) : (s += 1) hotToggle(s);
+    try std.testing.expectEqual(ui.hot_open.len, ui.hot_open_n);
+    try std.testing.expect(!hotIsOpen(8)); // the oldest gave way
+    try std.testing.expect(hotIsOpen(100 + ui.hot_open.len - 1));
+    ui.hot_open_n = 0;
 }
 
 test "hots tab: the console wraps at the width, keeps line breaks, prefers spaces, and never loses a character" {
