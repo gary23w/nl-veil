@@ -1013,6 +1013,13 @@ fn ensureAdminPassword(auth: *Auth, email: []const u8, pw: []const u8) !void {
 /// accepted only when it already matches this account; a stale file cannot restore an old secret or
 /// transfer it to a different admin email. Only the published legacy default is rotated automatically.
 fn prepareAdminPassword(io: std.Io, auth: *Auth, data_dir: []const u8, email: []const u8, configured: ?[]const u8) !void {
+    try prepareAdminPasswordCore(io, auth, data_dir, email, configured);
+    if (!try auth.adminRecordPersisted(email)) return error.AdminPasswordNotDurable;
+}
+
+/// Reconcile the in-memory account; the startup wrapper above also proves the resulting record was
+/// stored. Keeping this step separate lets logic tests cover every password state without Neuron.
+fn prepareAdminPasswordCore(io: std.Io, auth: *Auth, data_dir: []const u8, email: []const u8, configured: ?[]const u8) !void {
     if (configured) |pw| return ensureAdminPassword(auth, email, pw);
 
     var pw_buf: [48]u8 = undefined;
@@ -1074,15 +1081,20 @@ fn readAdminPassword(io: std.Io, data_dir: []const u8, out: *[48]u8) ?[]const u8
     return out[0..pw.len];
 }
 
+fn requireNeuronTestBinary(io: std.Io) !void {
+    std.Io.Dir.cwd().access(io, if (builtin.os.tag == .windows) "bin/neuron.exe" else "bin/neuron", .{}) catch return error.SkipZigTest;
+}
+
 test "admin startup generates a password and retires the published default before exposure" {
     const gpa = std.testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
     defer threaded.deinit();
     const io = threaded.io();
+    try requireNeuronTestBinary(io);
 
     var fresh = try http.testApp(gpa, io, "zig-admin-fresh-tmp");
     defer fresh.deinit();
-    try prepareAdminPassword(io, &fresh.auth, fresh.root, DEFAULT_ADMIN_EMAIL, null);
+    try prepareAdminPasswordCore(io, &fresh.auth, fresh.root, DEFAULT_ADMIN_EMAIL, null);
     try std.testing.expect(!try fresh.auth.passwordMatches(DEFAULT_ADMIN_EMAIL, "changeme"));
     var first_buf: [48]u8 = undefined;
     const first = readAdminPassword(io, fresh.root, &first_buf) orelse return error.TestUnexpectedResult;
@@ -1092,7 +1104,7 @@ test "admin startup generates a password and retires the published default befor
     defer legacy.deinit();
     legacy.auth.seedDefaultAdmin("changeme");
     try std.testing.expect(try legacy.auth.passwordMatches(DEFAULT_ADMIN_EMAIL, "changeme"));
-    try prepareAdminPassword(io, &legacy.auth, legacy.root, DEFAULT_ADMIN_EMAIL, null);
+    try prepareAdminPasswordCore(io, &legacy.auth, legacy.root, DEFAULT_ADMIN_EMAIL, null);
     try std.testing.expect(!try legacy.auth.passwordMatches(DEFAULT_ADMIN_EMAIL, "changeme"));
     var saved_buf: [48]u8 = undefined;
     const saved = readAdminPassword(io, legacy.root, &saved_buf) orelse return error.TestUnexpectedResult;
@@ -1102,16 +1114,16 @@ test "admin startup generates a password and retires the published default befor
         legacy.auth.logout(session);
         gpa.free(session);
     }
-    try prepareAdminPassword(io, &legacy.auth, legacy.root, DEFAULT_ADMIN_EMAIL, null);
+    try prepareAdminPasswordCore(io, &legacy.auth, legacy.root, DEFAULT_ADMIN_EMAIL, null);
     try std.testing.expect(legacy.auth.whoami(session) != null);
 
     // A failed password-file write must not rotate the account to an unrecorded random secret.
     var blocked = try http.testApp(gpa, io, "zig-admin-blocked-tmp");
     defer blocked.deinit();
     blocked.auth.seedDefaultAdmin("changeme");
-    try std.testing.expectError(error.FileNotFound, prepareAdminPassword(io, &blocked.auth, "zig-admin-blocked-tmp/missing", DEFAULT_ADMIN_EMAIL, null));
+    try std.testing.expectError(error.FileNotFound, prepareAdminPasswordCore(io, &blocked.auth, "zig-admin-blocked-tmp/missing", DEFAULT_ADMIN_EMAIL, null));
     try std.testing.expect(try blocked.auth.passwordMatches(DEFAULT_ADMIN_EMAIL, "changeme"));
-    try prepareAdminPassword(io, &blocked.auth, blocked.root, DEFAULT_ADMIN_EMAIL, null);
+    try prepareAdminPasswordCore(io, &blocked.auth, blocked.root, DEFAULT_ADMIN_EMAIL, null);
     try std.testing.expect(!try blocked.auth.passwordMatches(DEFAULT_ADMIN_EMAIL, "changeme"));
 }
 
@@ -1120,17 +1132,18 @@ test "admin startup preserves custom credentials and applies an explicit replace
     var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
     defer threaded.deinit();
     const io = threaded.io();
+    try requireNeuronTestBinary(io);
     var ta = try http.testApp(gpa, io, "zig-admin-custom-tmp");
     defer ta.deinit();
     const old = "a private existing password";
     const replacement = "a different configured password";
     ta.auth.seedDefaultAdmin(old);
-    try prepareAdminPassword(io, &ta.auth, ta.root, DEFAULT_ADMIN_EMAIL, null);
+    try prepareAdminPasswordCore(io, &ta.auth, ta.root, DEFAULT_ADMIN_EMAIL, null);
     try std.testing.expect(try ta.auth.passwordMatches(DEFAULT_ADMIN_EMAIL, old));
     var buf: [48]u8 = undefined;
     try std.testing.expect(readAdminPassword(io, ta.root, &buf) == null);
 
-    try prepareAdminPassword(io, &ta.auth, ta.root, DEFAULT_ADMIN_EMAIL, replacement);
+    try prepareAdminPasswordCore(io, &ta.auth, ta.root, DEFAULT_ADMIN_EMAIL, replacement);
     try std.testing.expect(!try ta.auth.passwordMatches(DEFAULT_ADMIN_EMAIL, old));
     try std.testing.expect(try ta.auth.passwordMatches(DEFAULT_ADMIN_EMAIL, replacement));
     const session = try ta.auth.login(DEFAULT_ADMIN_EMAIL, replacement);
@@ -1138,9 +1151,9 @@ test "admin startup preserves custom credentials and applies an explicit replace
         ta.auth.logout(session);
         gpa.free(session);
     }
-    try prepareAdminPassword(io, &ta.auth, ta.root, DEFAULT_ADMIN_EMAIL, replacement);
+    try prepareAdminPasswordCore(io, &ta.auth, ta.root, DEFAULT_ADMIN_EMAIL, replacement);
     try std.testing.expect(ta.auth.whoami(session) != null);
-    try std.testing.expectError(error.InsecureAdminPassword, prepareAdminPassword(io, &ta.auth, ta.root, DEFAULT_ADMIN_EMAIL, "changeme"));
+    try std.testing.expectError(error.InsecureAdminPassword, prepareAdminPasswordCore(io, &ta.auth, ta.root, DEFAULT_ADMIN_EMAIL, "changeme"));
 }
 
 test "a stale generated file cannot restore an old password or change another admin" {
@@ -1148,21 +1161,22 @@ test "a stale generated file cannot restore an old password or change another ad
     var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
     defer threaded.deinit();
     const io = threaded.io();
+    try requireNeuronTestBinary(io);
     var ta = try http.testApp(gpa, io, "zig-admin-stale-tmp");
     defer ta.deinit();
-    try prepareAdminPassword(io, &ta.auth, ta.root, DEFAULT_ADMIN_EMAIL, null);
+    try prepareAdminPasswordCore(io, &ta.auth, ta.root, DEFAULT_ADMIN_EMAIL, null);
     var old_buf: [48]u8 = undefined;
     const old_generated = readAdminPassword(io, ta.root, &old_buf) orelse return error.TestUnexpectedResult;
     const replacement = "a replacement from the environment";
-    try prepareAdminPassword(io, &ta.auth, ta.root, DEFAULT_ADMIN_EMAIL, replacement);
-    try prepareAdminPassword(io, &ta.auth, ta.root, DEFAULT_ADMIN_EMAIL, null);
+    try prepareAdminPasswordCore(io, &ta.auth, ta.root, DEFAULT_ADMIN_EMAIL, replacement);
+    try prepareAdminPasswordCore(io, &ta.auth, ta.root, DEFAULT_ADMIN_EMAIL, null);
     try std.testing.expect(try ta.auth.passwordMatches(DEFAULT_ADMIN_EMAIL, replacement));
     try std.testing.expect(!try ta.auth.passwordMatches(DEFAULT_ADMIN_EMAIL, old_generated));
 
     const other_email = "new-owner@example.test";
     const other_password = "the new owner's own password";
     try ta.auth.register(other_email, other_password);
-    try prepareAdminPassword(io, &ta.auth, ta.root, other_email, null);
+    try prepareAdminPasswordCore(io, &ta.auth, ta.root, other_email, null);
     try std.testing.expect(try ta.auth.passwordMatches(other_email, other_password));
     try std.testing.expect(!try ta.auth.passwordMatches(other_email, old_generated));
 }
@@ -1178,9 +1192,60 @@ test "an unreadable password hash stops startup instead of preserving a possible
     const u = ta.auth.users.getPtr(DEFAULT_ADMIN_EMAIL) orelse return error.TestUnexpectedResult;
     gpa.free(u.pwhash);
     u.pwhash = try gpa.dupe(u8, "malformed-hash");
-    if (prepareAdminPassword(io, &ta.auth, ta.root, DEFAULT_ADMIN_EMAIL, null)) |_| {
+    if (prepareAdminPasswordCore(io, &ta.auth, ta.root, DEFAULT_ADMIN_EMAIL, null)) |_| {
         return error.TestUnexpectedResult;
     } else |_| {}
+}
+
+test "admin startup refuses an account that cannot be read back from storage" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var ta = try http.testApp(gpa, io, "zig-admin-durable-tmp");
+    defer ta.deinit();
+    ta.auth.nb.bin = "definitely-not-a-real-neuron-binary";
+
+    // register still admits a new account into memory if its Neuron write fails. The startup
+    // wrapper must reject that state before either the listener or Tunnel can start.
+    try std.testing.expectError(error.FileNotFound, prepareAdminPassword(io, &ta.auth, ta.root, DEFAULT_ADMIN_EMAIL, null));
+    var saved_buf: [48]u8 = undefined;
+    const saved = readAdminPassword(io, ta.root, &saved_buf) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(try ta.auth.passwordMatches(DEFAULT_ADMIN_EMAIL, saved));
+
+    // A failed replacement must keep the old in-memory hash and its existing sessions.
+    const session = try ta.auth.login(DEFAULT_ADMIN_EMAIL, saved);
+    defer {
+        ta.auth.logout(session);
+        gpa.free(session);
+    }
+    try std.testing.expect(!ta.auth.setPassword(DEFAULT_ADMIN_EMAIL, "a new configured password"));
+    try std.testing.expect(try ta.auth.passwordMatches(DEFAULT_ADMIN_EMAIL, saved));
+    try std.testing.expect(ta.auth.whoami(session) != null);
+}
+
+test "admin startup stores a rotated legacy password that survives reload" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    try requireNeuronTestBinary(io);
+    var ta = try http.testApp(gpa, io, "zig-admin-reload-tmp");
+    defer ta.deinit();
+    ta.auth.seedDefaultAdmin("changeme");
+
+    try prepareAdminPassword(io, &ta.auth, ta.root, DEFAULT_ADMIN_EMAIL, null);
+    var saved_buf: [48]u8 = undefined;
+    const saved = readAdminPassword(io, ta.root, &saved_buf) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!try ta.auth.passwordMatches(DEFAULT_ADMIN_EMAIL, "changeme"));
+
+    var reloaded = Auth.init(gpa, ta.auth.nb);
+    defer reloaded.deinit();
+    reloaded.setAdminEmail(null);
+    try reloaded.warm();
+    try std.testing.expect(try reloaded.passwordMatches(DEFAULT_ADMIN_EMAIL, saved));
+    try std.testing.expect(!try reloaded.passwordMatches(DEFAULT_ADMIN_EMAIL, "changeme"));
+    try std.testing.expect(try reloaded.adminRecordPersisted(DEFAULT_ADMIN_EMAIL));
 }
 
 /// MIGRATE the pre-split durable memory store into the admin's per-user one.
