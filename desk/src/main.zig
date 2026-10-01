@@ -262,7 +262,7 @@ const Ui = struct {
     hot_model: Field = .{},
     hot_cmd: Field = .{},
     hot_padline: Field = .{},
-    hot_pace: usize = 3, // index into HOT_PACES (10 minutes)
+    hot_pace: usize = 6, // index into HOT_PACES (10 minutes)
     hot_calls: usize = 3, // index into HOT_CALLS (400 a day)
     hot_size: i32 = 3,
     hot_forever: bool = false,
@@ -7639,8 +7639,15 @@ fn kindColor(kind: []const u8) t.Color {
 // -------------------------------------------------------------------------------- hots
 
 /// Seconds between iterations, and model calls per day: the choices the deploy form cycles through.
-const HOT_PACES = [_]u32{ 60, 120, 300, 600, 1800, 3600, 21600 };
-const HOT_CALLS = [_]u32{ 50, 100, 200, 400, 1000, 5000 };
+const HOT_PACES = [_]u32{ 5, 10, 30, 60, 120, 300, 600, 1800, 3600, 21600 };
+/// 0 = no limit.
+const HOT_CALLS = [_]u32{ 50, 100, 200, 400, 1000, 5000, 20000, 0 };
+
+/// "41/400 calls" or, with no limit, "41 calls, no limit". Pure.
+fn hotCallsStr(buf: []u8, today: u32, daily: u32) []const u8 {
+    if (daily == 0) return std.fmt.bufPrint(buf, "{d} calls, no limit", .{today}) catch "";
+    return std.fmt.bufPrint(buf, "{d}/{d} calls", .{ today, daily }) catch "";
+}
 
 /// "every 10m" / "every 6h" / "every 45s". Pure.
 fn hotPaceStr(buf: []u8, secs: u32) []const u8 {
@@ -7916,7 +7923,8 @@ fn drawHots(store: *Store, body: t.Rect) void {
         t.textClip(row.stateStr(), @intFromFloat(cr.x + left_w - 78), @intFromFloat(cr.y + 11), 12, hotStateColor(row.stateStr()), 70);
         t.textClip(if (row.goal_len > 0) row.goalStr() else "no goal - roaming", @intFromFloat(cr.x + 14), @intFromFloat(cr.y + 32), 12, t.fg_dim, @intFromFloat(left_w - 28));
         var sb: [96]u8 = undefined;
-        const stats = std.fmt.bufPrint(&sb, "{d}/{d} minds  {d}/{d} calls{s}", .{ row.minds, row.size, row.calls_today, row.daily_calls, if (row.local) "  +this machine" else "" }) catch "";
+        var cb: [40]u8 = undefined;
+        const stats = std.fmt.bufPrint(&sb, "{d}/{d} minds  {s}{s}", .{ row.minds, row.size, hotCallsStr(&cb, row.calls_today, row.daily_calls), if (row.local) "  +this machine" else "" }) catch "";
         t.textClip(stats, @intFromFloat(cr.x + 14), @intFromFloat(cr.y + 52), 11, t.comment, @intFromFloat(left_w - 28));
         if (hot) t.wantCursor(.pointing_hand);
         if (hot and rl.isMouseButtonPressed(.left)) {
@@ -7941,7 +7949,14 @@ fn drawHots(store: *Store, body: t.Rect) void {
         ui.hot_form = true;
         ui.focus = .h_goal;
     }
-    y += t.BTN_MD + 14;
+    y += t.BTN_MD + 8;
+    // what the hots of this account can use, and why not when something is missing
+    if (roster.reachable) {
+        t.textClip(t.z("tools: files, web, HTTP, memory{s}{s}", .{ if (roster.python) ", Python" else "", if (roster.browser) ", browser" else "" }), @intFromFloat(lx), @intFromFloat(y), 11, t.comment, @intFromFloat(left_w));
+        y += 15;
+        if (roster.note_len > 0) y = helpPara(roster.noteStr(), lx, y, left_w);
+    }
+    y += 8;
 
     // the scratchpad the hots share (and the human may write to); newest at the bottom, wrapped, scrollable
     flabel(lx, y, "SHARED SCRATCHPAD");
@@ -8020,7 +8035,7 @@ fn drawHotForm(store: *Store, r: t.Rect, first: bool, can_send: bool) void {
     var pb: [24]u8 = undefined;
     const pd = t.cycle(.{ .x = x, .y = y, .width = half, .height = fh }, t.z("PACE (one iteration)", .{}), t.zs(hotPaceStr(&pb, HOT_PACES[ui.hot_pace])), false);
     if (pd != 0) ui.hot_pace = wrap(ui.hot_pace, pd, HOT_PACES.len);
-    const cd = t.cycle(.{ .x = x + half + gap, .y = y, .width = half, .height = fh }, t.z("MODEL CALLS A DAY (then it rests)", .{}), t.z("{d}", .{HOT_CALLS[ui.hot_calls]}), false);
+    const cd = t.cycle(.{ .x = x + half + gap, .y = y, .width = half, .height = fh }, t.z("MODEL CALLS A DAY (then it rests)", .{}), if (HOT_CALLS[ui.hot_calls] == 0) t.z("unlimited", .{}) else t.z("{d}", .{HOT_CALLS[ui.hot_calls]}), false);
     if (cd != 0) ui.hot_calls = wrap(ui.hot_calls, cd, HOT_CALLS.len);
     y += fh + gap;
 
@@ -8095,9 +8110,10 @@ fn drawHotPanel(store: *Store, r: t.Rect, row: *const hots.Row) void {
     var gb: [120]u8 = undefined;
     t.textClip(hotGoalLine(&gb, row), @intFromFloat(r.x + 18), @intFromFloat(r.y + 30), 12, sc, @intFromFloat(r.width - 18));
     if (row.goal_len > 0) t.textClip(row.goalStr(), @intFromFloat(r.x), @intFromFloat(r.y + 48), 13, t.fg_dim, @intFromFloat(r.width));
-    var sb: [220]u8 = undefined;
+    var sb: [260]u8 = undefined;
     var pb: [24]u8 = undefined;
-    const stats = std.fmt.bufPrint(&sb, "{s}   {s}   {d} model calls today of {d}   {d} lessons   {d} queued{s}", .{ row.modelStr(), hotPaceStr(&pb, row.pace_s), row.calls_today, row.daily_calls, row.lessons, row.queue, if (row.local) "   may use this machine" else "" }) catch "";
+    var cb: [40]u8 = undefined;
+    const stats = std.fmt.bufPrint(&sb, "{s}   {s}   {s} today   {d} lessons   {d} queued{s}", .{ row.modelStr(), hotPaceStr(&pb, row.pace_s), hotCallsStr(&cb, row.calls_today, row.daily_calls), row.lessons, row.queue, if (row.local) "   may use this machine" else "" }) catch "";
     t.textClip(stats, @intFromFloat(r.x), @intFromFloat(r.y + 68), 11, t.comment, @intFromFloat(r.width));
 
     // controls: pause/resume, grow/shrink, delete (two clicks)
@@ -8163,6 +8179,7 @@ test "hots tab: a pace and a goal line read the way the card shows them" {
     try std.testing.expectEqualStrings("every 6h", hotPaceStr(&b, 21600));
     try std.testing.expectEqualStrings("every 45s", hotPaceStr(&b, 45));
     try std.testing.expectEqualStrings("every 90s", hotPaceStr(&b, 90));
+    const fresh_pace = (Ui{}).hot_pace;
     var row: hots.Row = .{ .iteration = 7, .improved = 4, .budget = 25 };
     try std.testing.expectEqualStrings("no goal - looking for the next best thing", hotGoalLine(&b, &row));
     row.goal_len = 4;
@@ -8172,7 +8189,13 @@ test "hots tab: a pace and a goal line read the way the card shows them" {
     row.forever = true;
     try std.testing.expectEqualStrings("active - iteration 7, 4 improved", hotGoalLine(&b, &row));
     // every preset is a pace the runtime accepts (30 s to a day) and the form's defaults index real entries
-    for (HOT_PACES) |p| try std.testing.expect(p >= 30 and p <= 86400);
+    for (HOT_PACES) |p| try std.testing.expect(p >= 5 and p <= 86400);
+    try std.testing.expectEqual(@as(u32, 5), HOT_PACES[0]);
+    try std.testing.expectEqual(@as(u32, 10), HOT_PACES[1]);
+    try std.testing.expectEqual(@as(u32, 600), HOT_PACES[fresh_pace]); // the form opens at ten minutes
+    try std.testing.expectEqualStrings("41/400 calls", hotCallsStr(&b, 41, 400));
+    try std.testing.expectEqualStrings("41 calls, no limit", hotCallsStr(&b, 41, 0));
+    try std.testing.expectEqual(@as(u32, 0), HOT_CALLS[HOT_CALLS.len - 1]); // the last choice is no limit
     const fresh: Ui = .{};
     try std.testing.expect(fresh.hot_pace < HOT_PACES.len and fresh.hot_calls < HOT_CALLS.len);
     try std.testing.expect(!fresh.hot_local); // the owner's machine is never pre-checked

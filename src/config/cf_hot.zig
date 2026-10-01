@@ -4,7 +4,9 @@
 //! machine of the user's under it. It lives in one Worker script ("veil-hots") this file uploads into the
 //! account behind "Log in with Cloudflare": each hot is a Durable Object whose alarm runs one iteration
 //! (pick -> do -> measure -> record -> learn), and whose model calls go through the account's own AI binding.
-//! The runtime is cloud/hot.js, embedded here and uploaded as it is; its header says what a hot can do.
+//! The runtime is cloud/hot.js, embedded here and uploaded as it is; its header says what a hot can do. Beside it
+//! goes cloud/hot_py.py, a second Worker ("veil-hots-py") that runs a hot's Python, and the upload asks for
+//! Cloudflare's browser binding: both are optional, and an account that refuses one gets a hot without it.
 //! An account holds at most MAX_HOTS of them, and the first is always named PRIMARY.
 //!
 //! HOW: the same OAuth token the chat turns use (workers-scripts.write) uploads the script, enables its
@@ -51,8 +53,12 @@ const log = std.log.scoped(.cf_hot);
 
 /// The runtime, uploaded as it is (cloud/hot.js; build.zig hands it over by this name).
 const HOT_JS = @embedFile("hot.js");
+/// The Python a hot runs: a second Worker, reached from the runtime through a service binding (cloud/hot_py.py).
+const HOT_PY = @embedFile("hot_py.py");
 
 pub const SCRIPT = "veil-hots";
+pub const PY_SCRIPT = "veil-hots-py";
+const PY_MODULE = "hot_py.py";
 pub const MAX_HOTS: usize = 3; // hot.js enforces it; a test below holds the two to one number
 pub const PRIMARY = "Gary";
 const MODULE = "hot.js";
@@ -72,6 +78,9 @@ const State = struct {
     script_hash: []const u8 = "", // the hot.js that is up there (scriptHash)
     token_gen: u32 = 0, // bumped to rotate the runtime's token
     deployed_at: i64 = 0,
+    python: bool = false, // the runtime has its Python Worker bound (run_python, skills)
+    browser: bool = false, // the runtime has Cloudflare's browser bound (browser_*)
+    tools_note: []const u8 = "", // why one of them is missing, in Cloudflare's words
     local: []const []const u8 = &.{}, // hots the owner allowed onto this machine, by name
     last_error: []const u8 = "",
 };
@@ -131,8 +140,12 @@ fn hotToken(app: *App, uid: u64, account: []const u8, gen: u32, out: *[64]u8) []
 
 /// Which hot.js this binary carries, as 16 hex characters.
 fn scriptHash(out: *[16]u8) []const u8 {
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    h.update(HOT_JS);
+    h.update("\x00");
+    h.update(HOT_PY);
     var dig: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(HOT_JS, &dig, .{});
+    h.final(&dig);
     out.* = std.fmt.bytesToHex(dig[0..8].*, .lower);
     return out;
 }
@@ -183,19 +196,37 @@ fn api(app: *App, a: std.mem.Allocator, method: []const u8, url: []const u8, bod
     return a.dupe(u8, raw) catch null;
 }
 
+/// Which optional bindings an upload asks for. The runtime works without either; each is one family of tools.
+const Extras = struct { python: bool, browser: bool };
+
 /// The script upload: a multipart body of the metadata and the module. The metadata names the AI binding and the
 /// object class, and KEEPS the secret already on the script - the token is set by its own small call (putSecret),
 /// so it is never part of a body that has to ride a file. `fresh` adds the migration that creates the class,
-/// which Cloudflare accepts exactly once per script.
-fn uploadBody(a: std.mem.Allocator, boundary: []const u8, fresh: bool) ![]u8 {
+/// which Cloudflare accepts exactly once per script. `x` adds the Python Worker (a service binding, PY) and
+/// Cloudflare's browser (BROWSER).
+fn uploadBody(a: std.mem.Allocator, boundary: []const u8, fresh: bool, x: Extras) ![]u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     try out.print(a, "--{s}\r\nContent-Disposition: form-data; name=\"metadata\"; filename=\"metadata.json\"\r\nContent-Type: application/json\r\n\r\n", .{boundary});
     try out.appendSlice(a, "{\"main_module\":\"" ++ MODULE ++ "\",\"compatibility_date\":\"" ++ COMPAT_DATE ++ "\"," ++
-        "\"bindings\":[{\"type\":\"ai\",\"name\":\"AI\"},{\"type\":\"durable_object_namespace\",\"name\":\"HOT\",\"class_name\":\"Hot\"}]," ++
-        "\"keep_bindings\":[\"secret_text\"]");
+        "\"bindings\":[{\"type\":\"ai\",\"name\":\"AI\"},{\"type\":\"durable_object_namespace\",\"name\":\"HOT\",\"class_name\":\"Hot\"}");
+    if (x.python) try out.appendSlice(a, ",{\"type\":\"service\",\"name\":\"PY\",\"service\":\"" ++ PY_SCRIPT ++ "\"}");
+    if (x.browser) try out.appendSlice(a, ",{\"type\":\"browser\",\"name\":\"BROWSER\"}");
+    try out.appendSlice(a, "],\"keep_bindings\":[\"secret_text\"]");
     if (fresh) try out.appendSlice(a, ",\"migrations\":{\"new_tag\":\"" ++ MIGRATION_TAG ++ "\",\"new_sqlite_classes\":[\"Hot\"]}");
     try out.print(a, "}}\r\n--{s}\r\nContent-Disposition: form-data; name=\"" ++ MODULE ++ "\"; filename=\"" ++ MODULE ++ "\"\r\nContent-Type: application/javascript+module\r\n\r\n", .{boundary});
     try out.appendSlice(a, HOT_JS);
+    try out.print(a, "\r\n--{s}--\r\n", .{boundary});
+    return out.items;
+}
+
+/// The Python Worker's upload: its metadata (the python_workers flag is what makes a .py module a Worker) and the
+/// module. It has no bindings, no secret and no public address; only the runtime's service binding reaches it.
+fn pyUploadBody(a: std.mem.Allocator, boundary: []const u8) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    try out.print(a, "--{s}\r\nContent-Disposition: form-data; name=\"metadata\"; filename=\"metadata.json\"\r\nContent-Type: application/json\r\n\r\n", .{boundary});
+    try out.appendSlice(a, "{\"main_module\":\"" ++ PY_MODULE ++ "\",\"compatibility_date\":\"" ++ COMPAT_DATE ++ "\",\"compatibility_flags\":[\"python_workers\"]}");
+    try out.print(a, "\r\n--{s}\r\nContent-Disposition: form-data; name=\"" ++ PY_MODULE ++ "\"; filename=\"" ++ PY_MODULE ++ "\"\r\nContent-Type: text/x-python\r\n\r\n", .{boundary});
+    try out.appendSlice(a, HOT_PY);
     try out.print(a, "\r\n--{s}--\r\n", .{boundary});
     return out.items;
 }
@@ -253,20 +284,48 @@ fn ensureRuntime(app: *App, a: std.mem.Allocator, uid: u64, tok: Tok, st: *State
     app.io.random(&bb);
     const boundary = std.fmt.allocPrint(a, "----veilhot{s}", .{std.fmt.bytesToHex(bb, .lower)}) catch return "out of memory";
     const ctype = std.fmt.allocPrint(a, "multipart/form-data; boundary={s}", .{boundary}) catch return "out of memory";
-    // The settings read is only a hint (a login may lack its scope): an upload refused one way is tried the
-    // other way once, and the first refusal is the one reported.
+    // The Python Worker first: the runtime binds to it by name, so it has to exist. An account that does not take
+    // it (or the browser, below) still gets a hot - without that family of tools, and told why.
+    var note: []const u8 = "";
+    const py_url = std.fmt.allocPrint(a, "{s}/accounts/{s}/workers/scripts/" ++ PY_SCRIPT, .{ root, acct }) catch return "out of memory";
+    const py_body = pyUploadBody(a, boundary) catch return "out of memory";
+    var python = false;
+    if (api(app, a, "PUT", py_url, py_body, tok.key, ctype)) |r| {
+        const e = firstError(a, r);
+        python = e.len == 0;
+        if (!python) note = std.fmt.allocPrint(a, "Python is off: {s}", .{e}) catch "Python is off";
+    } else note = "Python is off: the Cloudflare API did not answer its upload";
+
+    // The runtime, asking for everything first. The settings read above is only a hint (a login may lack its
+    // scope), so each set of bindings is tried with and without the class migration; the first upload Cloudflare
+    // takes wins, and the first refusal of all is the one reported when none does.
+    const wants = [_]Extras{
+        .{ .python = python, .browser = true },
+        .{ .python = python, .browser = false },
+        .{ .python = false, .browser = false },
+    };
     var up_err: []const u8 = "";
-    for ([_]bool{ !exists, exists }) |fresh| {
-        const body = uploadBody(a, boundary, fresh) catch return "out of memory";
-        const up = api(app, a, "PUT", script_url, body, tok.key, ctype) orelse return "could not reach the Cloudflare API to upload the hot runtime";
-        const e = firstError(a, up);
-        if (e.len == 0) {
-            up_err = "";
-            break;
+    var got: ?Extras = null;
+    ladder: for (wants, 0..) |x, wi| {
+        if (wi == 2 and !python) break; // the same upload as the one before it
+        var refusal: []const u8 = "";
+        for ([_]bool{ !exists, exists }) |fresh| {
+            const body = uploadBody(a, boundary, fresh, x) catch return "out of memory";
+            const up = api(app, a, "PUT", script_url, body, tok.key, ctype) orelse return "could not reach the Cloudflare API to upload the hot runtime";
+            const e = firstError(a, up);
+            if (e.len == 0) {
+                got = x;
+                break :ladder;
+            }
+            if (refusal.len == 0) refusal = e;
         }
-        if (up_err.len == 0) up_err = e;
+        if (up_err.len == 0) up_err = refusal;
+        if (x.browser and note.len < 200) note = std.fmt.allocPrint(a, "{s}{s}the browser is off: {s}", .{ note, if (note.len > 0) "; " else "", refusal }) catch note;
     }
-    if (up_err.len > 0) return explain(a, "uploading the hot runtime", up_err);
+    const have = got orelse return explain(a, "uploading the hot runtime", up_err);
+    st.python = have.python;
+    st.browser = have.browser;
+    st.tools_note = if (have.python and have.browser) "" else note;
 
     // Its token, as a secret binding. A small JSON body: it rides curl's stdin with the bearer, never a file.
     var tb: [64]u8 = undefined;
@@ -380,7 +439,9 @@ pub fn listHots(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         if (i > 0) try out.append(app.gpa, ',');
         try http.jstr(app.gpa, &out, n);
     }
-    try out.appendSlice(app.gpa, "],\"last_error\":");
+    try out.print(app.gpa, "],\"python\":{},\"browser\":{},\"tools_note\":", .{ st.python, st.browser });
+    try http.jstr(app.gpa, &out, st.tools_note);
+    try out.appendSlice(app.gpa, ",\"last_error\":");
     try http.jstr(app.gpa, &out, st.last_error);
     try out.appendSlice(app.gpa, ",\"hots\":");
     try out.appendSlice(app.gpa, hots);
@@ -548,6 +609,9 @@ fn removeScript(app: *App, a: std.mem.Allocator, uid: u64, tok: Tok, st: *State)
     const msg = firstError(a, raw);
     if (msg.len > 0 and std.ascii.indexOfIgnoreCase(msg, "not found") == null and std.ascii.indexOfIgnoreCase(msg, "does not exist") == null)
         return explain(a, "removing the hot runtime", msg);
+    // Its Python Worker goes after it (the runtime was bound to it). Best effort: it holds nothing.
+    const py_url = std.fmt.allocPrint(a, "{s}/accounts/{s}/workers/scripts/" ++ PY_SCRIPT ++ "?force=true", .{ app.cf_api_root, acct }) catch return "out of memory";
+    _ = api(app, a, "DELETE", py_url, "", tok.key, "");
     // A new generation: a later deployment gets a token the removed script never held.
     st.* = .{ .token_gen = st.token_gen +% 1 };
     writeState(app, uid, st.*);
@@ -983,13 +1047,19 @@ fn upgradeRuntime(app: *App, a: std.mem.Allocator, uid: u64, st: *State) void {
     if (st.url.len == 0 or std.mem.eql(u8, st.script_hash, scriptHash(&hb))) return;
     const tok = tokOf(app, uid, a) orelse return;
     if (!std.mem.eql(u8, tok.account_id, st.account)) return; // logged into another account: leave that one alone
+    // A refused update is not tried again for a quarter of an hour: the hots keep running on what they have.
+    const now = nowS(app.io);
+    if (now - upgrade_failed_s.load(.monotonic) < 900) return;
     var uploaded = false;
     if (ensureRuntime(app, a, uid, tok, st, &uploaded)) |msg| {
         st.last_error = msg;
+        upgrade_failed_s.store(now, .monotonic);
         log.warn("hot runtime for u{d} could not be updated: {s}", .{ uid, msg });
     }
     writeState(app, uid, st.*);
 }
+
+var upgrade_failed_s: std.atomic.Value(i64) = .init(0);
 
 /// One pass over every user with hots: run the jobs of those allowed onto this machine, and (when `mirror`) bring
 /// each hot's local folder up to date, first replacing a runtime an older veil uploaded.
@@ -1137,21 +1207,31 @@ test "the upload carries the bindings and keeps the secret; the class migration 
     var arena = std.heap.ArenaAllocator.init(tt.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const first = try uploadBody(a, "----b", true);
-    const again = try uploadBody(a, "----b", false);
+    const first = try uploadBody(a, "----b", true, .{ .python = true, .browser = true });
+    const again = try uploadBody(a, "----b", false, .{ .python = false, .browser = false });
     // the metadata part is JSON a real parser reads
     const meta_at = std.mem.indexOf(u8, first, "\r\n\r\n").? + 4;
     const meta = first[meta_at .. meta_at + std.mem.indexOf(u8, first[meta_at..], "\r\n").?];
     const M = struct {
         main_module: []const u8,
         compatibility_date: []const u8,
-        bindings: []const struct { type: []const u8, name: []const u8, class_name: []const u8 = "" },
+        bindings: []const struct { type: []const u8, name: []const u8, class_name: []const u8 = "", service: []const u8 = "" },
         keep_bindings: []const []const u8,
         migrations: ?struct { new_tag: []const u8, new_sqlite_classes: []const []const u8 } = null,
     };
     const m = try std.json.parseFromSliceLeaky(M, a, meta, .{});
     try tt.expectEqualStrings("hot.js", m.main_module);
-    try tt.expectEqual(@as(usize, 2), m.bindings.len);
+    try tt.expectEqual(@as(usize, 4), m.bindings.len);
+    try tt.expectEqualStrings("service", m.bindings[2].type);
+    try tt.expectEqualStrings(PY_SCRIPT, m.bindings[2].service);
+    try tt.expectEqualStrings("browser", m.bindings[3].type);
+    const again_meta = again[0..std.mem.indexOf(u8, again, "Content-Type: application/javascript+module").?];
+    try tt.expect(std.mem.indexOf(u8, again_meta, "\"service\"") == null and std.mem.indexOf(u8, again_meta, "\"browser\"") == null);
+    // the Python Worker: the flag that makes a .py module a Worker, and the module as Python
+    const py = try pyUploadBody(a, "----b");
+    try tt.expect(std.mem.indexOf(u8, py, "\"compatibility_flags\":[\"python_workers\"]") != null);
+    try tt.expect(std.mem.indexOf(u8, py, "Content-Type: text/x-python\r\n\r\n" ++ HOT_PY) != null);
+    try tt.expect(std.mem.indexOf(u8, HOT_PY, "class Default(WorkerEntrypoint):") != null);
     try tt.expectEqualStrings("ai", m.bindings[0].type);
     try tt.expectEqualStrings("Hot", m.bindings[1].class_name);
     try tt.expectEqualStrings("secret_text", m.keep_bindings[0]);
@@ -1168,6 +1248,7 @@ const StandIn = struct {
     const ok = w("{\"success\":true,\"errors\":[],\"result\":{}}");
     const subdomain = w("{\"success\":true,\"errors\":[],\"result\":{\"subdomain\":\"acme\"}}");
     const no_script = w("{\"success\":false,\"errors\":[{\"code\":10007,\"message\":\"This Worker does not exist on your account.\"}]}");
+    const no_browser = w("{\"success\":false,\"errors\":[{\"code\":10021,\"message\":\"Browser Rendering is not enabled for this account.\"}]}");
     const made = w("{\"ok\":true,\"hot\":{\"name\":\"Gary\",\"state\":\"working\",\"local\":true}}");
     const full = w("{\"ok\":false,\"err\":\"this account already has 3 hots (the limit); delete one first\"}");
 };
@@ -1185,7 +1266,10 @@ test "a first deployment uploads the runtime, sets its token, creates the hot an
     const routes = [_]fakehttp.Route{
         .{ .method = "GET", .path = "/accounts/acct/workers/subdomain", .reply = StandIn.subdomain },
         .{ .method = "GET", .path = "/workers/scripts/veil-hots/settings", .reply = StandIn.no_script },
+        .{ .method = "PUT", .path = "/workers/scripts/veil-hots-py", .reply = StandIn.ok },
         .{ .method = "PUT", .path = "/workers/scripts/veil-hots/secrets", .reply = StandIn.ok },
+        // this account has no browser: the upload that asks for one is refused, the next is taken
+        .{ .method = "PUT", .path = "/workers/scripts/veil-hots", .reply = StandIn.no_browser, .times = 2 },
         .{ .method = "PUT", .path = "/workers/scripts/veil-hots", .reply = StandIn.ok },
         .{ .method = "POST", .path = "/workers/scripts/veil-hots/subdomain", .reply = StandIn.ok },
         .{ .method = "POST", .path = "/v1/hots", .reply = StandIn.made, .times = 1 },
@@ -1211,6 +1295,7 @@ test "a first deployment uploads the runtime, sets its token, creates the hot an
     try tt.expect(deploy(&ta.app, a, 1, tok, .{ .goal = "watch the tides", .model = "gpt-4o" }) == .err);
 
     const first = deploy(&ta.app, a, 1, tok, .{ .goal = "watch the tide tables", .local = true, .pace_s = 120 });
+    if (first == .err) std.debug.print("deploy refused: {s}\n", .{first.err});
     try tt.expect(first == .ok);
     const st = readState(&ta.app, 1, a);
     try tt.expectEqualStrings("acct", st.account);
@@ -1219,6 +1304,9 @@ test "a first deployment uploads the runtime, sets its token, creates the hot an
     try tt.expectEqualStrings(scriptHash(&hb), st.script_hash);
     try tt.expectEqual(@as(usize, 1), st.local.len);
     try tt.expectEqualStrings("Gary", st.local[0]);
+    // Python went up and is bound; the browser was refused, and the state says why in Cloudflare's words
+    try tt.expect(st.python and !st.browser);
+    try tt.expect(std.mem.indexOf(u8, st.tools_note, "the browser is off: Browser Rendering is not enabled") != null);
 
     // The state file holds no secret: not the runtime's token, not the OAuth bearer.
     var tb: [64]u8 = undefined;
@@ -1234,19 +1322,18 @@ test "a first deployment uploads the runtime, sets its token, creates the hot an
 
     srv.stop();
     running = false;
-    // subdomain, exists?, upload, secret, route, create - in that order, each once; then one create
-    const order = [_]?usize{
-        srv.firstCall("GET", "/accounts/acct/workers/subdomain"),
-        srv.firstCall("GET", "/workers/scripts/veil-hots/settings"),
-        srv.firstCall("PUT", "/accounts/acct/workers/scripts/veil-hots"),
-        srv.firstCall("PUT", "/workers/scripts/veil-hots/secrets"),
-        srv.firstCall("POST", "/workers/scripts/veil-hots/subdomain"),
-        srv.firstCall("POST", "/v1/hots"),
-    };
-    for (order, 0..) |at, i| try tt.expectEqual(@as(?usize, i), at);
+    // subdomain, exists?, the Python Worker, the runtime (refused twice with the browser, taken without),
+    // secret, route, create - in that order; then one more create
+    try tt.expectEqual(@as(?usize, 0), srv.firstCall("GET", "/accounts/acct/workers/subdomain"));
+    try tt.expectEqual(@as(?usize, 1), srv.firstCall("GET", "/workers/scripts/veil-hots/settings"));
+    try tt.expectEqual(@as(?usize, 2), srv.firstCall("PUT", "/accounts/acct/workers/scripts/veil-hots-py"));
+    try tt.expectEqual(@as(?usize, 6), srv.firstCall("PUT", "/workers/scripts/veil-hots/secrets"));
+    try tt.expectEqual(@as(?usize, 7), srv.firstCall("POST", "/workers/scripts/veil-hots/subdomain"));
+    try tt.expectEqual(@as(?usize, 8), srv.firstCall("POST", "/v1/hots"));
+    try tt.expectEqual(@as(usize, 5), srv.countCalls("PUT", "/accounts/acct/workers/scripts/veil-hots")); // py, 3 runtime tries, secret
     try tt.expectEqual(@as(usize, 2), srv.countCalls("POST", "/v1/hots"));
     try tt.expectEqual(@as(usize, 1), srv.countCalls("GET", "/workers/subdomain"));
-    try tt.expectEqual(@as(usize, 7), srv.call_count);
+    try tt.expectEqual(@as(usize, 10), srv.call_count);
 }
 
 test "the bridge posts a finished job's answer back, fails a run that left none, and never reruns either" {
@@ -1409,7 +1496,8 @@ test "removing the Worker forgets the deployment, every grant to this machine, a
     try tt.expectEqual(@as(?[]const u8, null), removeScript(&ta.app, a, 1, .{ .key = "k", .account_id = "acct" }, &st));
     srv.stop();
     running = false;
-    try tt.expectEqual(@as(usize, 1), srv.countCalls("DELETE", "/accounts/acct/workers/scripts/veil-hots?force=true"));
+    try tt.expectEqual(@as(?usize, 0), srv.firstCall("DELETE", "/accounts/acct/workers/scripts/veil-hots?force=true"));
+    try tt.expectEqual(@as(?usize, 1), srv.firstCall("DELETE", "/accounts/acct/workers/scripts/veil-hots-py?force=true")); // then its Python Worker
     const after = readState(&ta.app, 1, a);
     try tt.expectEqualStrings("", after.url); // forgotten: the next deploy uploads again
     try tt.expectEqual(@as(usize, 0), after.local.len); // no grant outlives its hot

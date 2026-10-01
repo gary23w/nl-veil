@@ -151,6 +151,14 @@ pub const Server = struct {
                 const n = @min(clen, body_buf.len);
                 if (rd.interface.readSliceAll(body_buf[0..n])) {
                     if (first) self.capture(body_buf[0..n]);
+                    // A body longer than the capture is drained to its end all the same: answering with part
+                    // of it unread is the same reset hazard, and it made a 70 KB upload fail one run in four.
+                    var left = clen - n;
+                    while (left > 0) {
+                        const k = @min(left, body_buf.len);
+                        rd.interface.readSliceAll(body_buf[0..k]) catch break;
+                        left -= k;
+                    }
                 } else |_| {}
             }
             const call = line0[0..line0_len];

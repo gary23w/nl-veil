@@ -139,6 +139,8 @@ gate_hotjs() {
     echo "SKIPPED: node not on PATH — cloud/hot.js was NOT tested"; fi
 }
 gate "hot runtime suite (node --test cloud/hot.test.mjs)" gate_hotjs
+# cloud/hot_py.py is the Python a hot runs (a second Worker). Its logic is plain Python, tested as such.
+gate "hot python runner (cloud/hot_py_test.py)" "$PY" cloud/hot_py_test.py
 # -Dbuiltin=false, and why. This gate answers ONE question — does the server still compile without the GUI?
 # `-Dapp=false` alone only skips raylib: -Dbuiltin and -Dvulkan both default TRUE, so this step also fetched
 # llama.cpp, the Khronos headers and ~50MB of pre-built Vulkan shaders from two GitHub hosts before it

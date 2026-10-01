@@ -106,6 +106,10 @@ pub const Roster = struct {
     deployed: bool = false, // the runtime is in the account
     reachable: bool = false, // and it answered
     current: bool = true, // it runs this build's hot.js
+    python: bool = false, // the hots can run Python (and keep skills)
+    browser: bool = false, // the hots can drive a browser
+    note: [200]u8 = [_]u8{0} ** 200, // why one of those is missing, in Cloudflare's words
+    note_len: u8 = 0,
     n: usize = 0,
     rows: [MAX_HOTS]Row = [_]Row{.{}} ** MAX_HOTS,
     err: [200]u8 = [_]u8{0} ** 200, // the last deployment error, in the server's words
@@ -113,6 +117,9 @@ pub const Roster = struct {
 
     pub fn errStr(r: *const Roster) []const u8 {
         return r.err[0..r.err_len];
+    }
+    pub fn noteStr(r: *const Roster) []const u8 {
+        return r.note[0..r.note_len];
     }
 };
 
@@ -167,7 +174,7 @@ const JHot = struct {
     folder: []const u8 = "",
     goal: ?JGoal = null,
 };
-const JRoster = struct { ok: bool = false, connected: bool = false, deployed: bool = false, reachable: bool = false, current: bool = true, last_error: []const u8 = "", hots: []const JHot = &.{} };
+const JRoster = struct { ok: bool = false, connected: bool = false, deployed: bool = false, reachable: bool = false, current: bool = true, python: bool = false, browser: bool = false, tools_note: []const u8 = "", last_error: []const u8 = "", hots: []const JHot = &.{} };
 
 fn rowOf(h: JHot) Row {
     var r: Row = .{};
@@ -200,8 +207,9 @@ pub fn parseRoster(gpa: std.mem.Allocator, body: []const u8, out: *Roster) bool 
     const p = std.json.parseFromSlice(JRoster, gpa, body, .{ .ignore_unknown_fields = true }) catch return false;
     defer p.deinit();
     if (!p.value.ok) return false;
-    var r: Roster = .{ .connected = p.value.connected, .deployed = p.value.deployed, .reachable = p.value.reachable, .current = p.value.current };
+    var r: Roster = .{ .connected = p.value.connected, .deployed = p.value.deployed, .reachable = p.value.reachable, .current = p.value.current, .python = p.value.python, .browser = p.value.browser };
     r.err_len = @intCast(put(&r.err, p.value.last_error));
+    r.note_len = @intCast(put(&r.note, p.value.tools_note));
     for (p.value.hots) |h| {
         if (r.n >= MAX_HOTS) break;
         if (h.name.len == 0 or h.name.len > NAME_MAX) continue;
@@ -307,11 +315,13 @@ const tt = std.testing;
 
 test "hots: the roster reads the server's reply into rows, one line per field, and refuses anything else" {
     const body =
-        \\{"ok":true,"connected":true,"deployed":true,"reachable":true,"current":false,"max":3,"primary":"Gary","url":"https://veil-hots.acme.workers.dev","local":["Gary"],"last_error":"","hots":[{"name":"Gary","state":"working","model":"@cf/x/y","pace_s":600,"size":3,"minds":2,"daily_calls":400,"local":true,"charter":"","paused":false,"created":1,"goal":{"text":"map every\nharbour","status":"active","forever":true,"budget":0,"iteration":7,"improved":4,"flat":0,"best_num":-1,"best_den":0,"created":1},"queue":2,"lessons":5,"folder":"u1/_hots/Gary-20261001-120005","calls_today":41,"calls_total":900,"seq":88,"last_tick":1,"next_tick":2},{"name":"Ada","state":"unreachable"},{"name":"","state":"x"}]}
+        \\{"ok":true,"connected":true,"deployed":true,"reachable":true,"current":false,"max":3,"primary":"Gary","url":"https://veil-hots.acme.workers.dev","local":["Gary"],"python":true,"browser":false,"tools_note":"the browser is off: not enabled","last_error":"","hots":[{"name":"Gary","state":"working","model":"@cf/x/y","pace_s":600,"size":3,"minds":2,"daily_calls":400,"local":true,"charter":"","paused":false,"created":1,"goal":{"text":"map every\nharbour","status":"active","forever":true,"budget":0,"iteration":7,"improved":4,"flat":0,"best_num":-1,"best_den":0,"created":1},"queue":2,"lessons":5,"folder":"u1/_hots/Gary-20261001-120005","calls_today":41,"calls_total":900,"seq":88,"last_tick":1,"next_tick":2},{"name":"Ada","state":"unreachable"},{"name":"","state":"x"}]}
     ;
     var r: Roster = .{};
     try tt.expect(parseRoster(tt.allocator, body, &r));
     try tt.expect(r.connected and r.deployed and r.reachable and !r.current);
+    try tt.expect(r.python and !r.browser);
+    try tt.expectEqualStrings("the browser is off: not enabled", r.noteStr());
     try tt.expectEqual(@as(usize, 2), r.n); // the nameless row is dropped
     const g = &r.rows[0];
     try tt.expectEqualStrings("Gary", g.nameStr());

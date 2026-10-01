@@ -37,8 +37,11 @@ selected hot: its goal and counters, Pause / Resume, Shrink / Grow, **Open folde
 (its local run folder: `events.log`, notes, status), a two-click Delete, the event
 console and one line that sends it a message or a command. The console wraps every
 event and scrolls with the wheel or its bar; scrolling up stops it following, and
-*latest* (or scrolling back down) follows again. "Deploy a hot" replaces the right
-side with the deploy form: MODEL is a list of the account's live Workers AI models,
+*latest* (or scrolling back down) follows again. Under the Deploy button one line names the tools the
+account's hots have (Python and the browser are there when the account took them),
+and why not when one is missing. "Deploy a hot" replaces the right
+side with the deploy form: PACE runs from every 5 seconds to every 6 hours and MODEL
+CALLS A DAY ends in *unlimited*; MODEL is a list of the account's live Workers AI models,
 the goal and charter count against what that model can carry, and the last box,
 "let it use THIS machine", starts unchecked on every new form. The tab asks the
 server for the roster, the events and the scratchpad only while it is on screen.
