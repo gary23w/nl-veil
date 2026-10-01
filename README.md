@@ -292,21 +292,34 @@ so they never cross the public internet and need no API key.
   - *the web* - `web_search` (a keyless chain: public SearXNG instances, DuckDuckGo, Bing, reference
     lookups, and - when those refuse a datacenter address - the same search through the real browser), `web_fetch`, and `http_request` for any method, headers and body; private and internal addresses
     are refused, on redirects too;
-  - *a real browser* - `browser_open`, `browser_read`, `browser_links`, `browser_click`, `browser_type`,
-    `browser_eval`, `browser_close`, driving Cloudflare's browser over the DevTools protocol for pages that
-    need JavaScript, clicks or forms; the page stays open between iterations;
+  - *a real browser* - Cloudflare's browser, driven over the DevTools protocol. `browser_open` and
+    `browser_read` give the page as its text plus a **numbered list of what can be clicked or typed into**, and
+    `browser_click`, `browser_type` and `browser_select` act on an element by its number with real mouse and
+    key input (so forms and sign-up pages built on modern frameworks respond); `browser_key`, `browser_scroll`,
+    `browser_back`, `browser_wait` and `browser_eval` do the rest. The page stays open between iterations. A
+    page that is a bot check (a CAPTCHA) is named as one and left alone: a hot does not solve those;
   - *Python* - `run_python` runs a script beside the hot's files and keeps what it writes. A Worker's Python
     has no sockets, no processes and no pip, so the runner supplies what a script expects: `import requests`
     and `urllib` work on the Worker's own fetch, a missing import is installed from PyPI by itself (pure-Python
     packages; `pip install` and `pip_install` do the same) and stays installed, and anything that needs a
     process or native code is refused in words the hot can act on; `save_skill` keeps a script as a tool of the hot's own and `run_skill` runs it
     again, so a hot builds its own tools;
-  - *memory and planning* - `remember` / `recall` for facts, `plan_set` / `plan_done` for a plan it sees every
-    iteration;
+  - *a mind* - the hot's facts live in **neuron-db**, the veil's own memory engine compiled to WebAssembly
+    and uploaded with the runtime: `remember` keeps a fact and `recall` finds it by meaning. The same engine
+    keeps **stances** - `feel` records how the hot has come to regard a topic, a tool or a site from working
+    on it - and a **mood** the engine sets from how its measured iterations have been going. Both are shown to
+    the hot every iteration and steer what it tries next. This is an affect model that shapes behaviour, not
+    a claim that anything is felt. `plan_set` / `plan_done` keep a plan it sees every iteration;
   - *each other and you* - the scratchpad, `tell`, an inner `swarm`, `goal_queue`, `say`.
 
-  Python runs in a second small Worker (`veil-hots-py`) and the browser is Cloudflare's Browser Rendering;
-  both are added when your account takes them, and the tab says which a hot has and why not otherwise.
+  Python runs in a second small Worker (`veil-hots-py`), the browser is Cloudflare's Browser Rendering and
+  neuron-db is two more modules of the upload; each is added when your account takes it, and the tab says
+  which a hot has and why not otherwise.
+- **Search that answers.** Keyless search engines often refuse a cloud address, and their pages show a bot
+  check to a cloud browser. Give the hots a search API key and `web_search` asks it first:
+  `veil hot key brave <key>` (or `google` + `google_cx`). The key is stored as a secret on your Worker.
+- **A console you can read.** Each event is one line saying what happened; a row that went wrong is red.
+  Click a row to open its full text under it, click again to close it, and *errors* shows only what failed.
 - **Your machine, only if you say so.** The deploy form has one box, unchecked by default: *let it use THIS
   machine*. Checked, the hot may queue jobs for the veil on your computer - the full local tool set, run
   unattended as an ordinary chat conversation named `hot_<name>_...` you can open afterwards - and gets the
@@ -376,6 +389,7 @@ POST /api/v1/hots/:name/config           its settings: model, pace, size, daily 
 GET  /api/v1/hots/:name/events           its event tail
 GET  /api/v1/hots/pad   (and POST)       the scratchpad the hots share
 POST /api/v1/hots/pad/clear              empty it (a local copy is kept)
+POST /api/v1/hots/keys                   give the hots a search key (brave, google, google_cx)
 DELETE /api/v1/hots/:name                delete one (the last one takes the Worker with it);
                                          DELETE /api/v1/hots removes them all
 ```
@@ -810,6 +824,7 @@ HOTS (autonomous goal loops that run in YOUR Cloudflare account)
   hot watch <name>             follow its events
   hot set <name> [flags]       --model --pace --size --calls --charter --pause --resume
   hot pad ["<text>"|--clear]   the scratchpad the hots share (--clear empties it)
+  hot key brave <key>          a search key for the hots' web_search (google, google_cx; --remove)
   hot rm <name>                delete one       hot teardown --yes   remove them all + the runtime
 
 BUILT-IN MODEL (the-veil-12b, served in-process — no external runtime)
@@ -1480,6 +1495,8 @@ src/
     locs/atlas.zig         the source atlas — points scouts at nl-rag packs
 cloud/hot.js               the hot runtime - one Worker, one Durable Object per hot - embedded into
                            the binary and uploaded as it is; cloud/hot.test.mjs runs it under node
+cloud/hot_py.py            the Python a hot runs (a second Worker), with requests, pip and packages
+cloud/neuron_core.wasm  neuron-db.mjs   the hot's memory engine and its binding
 desk/                      veil-desk, the native desktop dashboard — compiled INTO `veil` as the
                            "desk" module (-Dapp, default true), not a separate shipped binary
 docs/                      the docs site: architecture map + annotated source (static, home-built

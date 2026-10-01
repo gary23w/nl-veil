@@ -1391,6 +1391,7 @@ fn cmdHelp() u8 {
         \\  hot watch <name>             follow its events
         \\  hot set <name> [flags]       --model --pace --size --calls --charter --pause --resume
         \\  hot pad ["<text>"|--clear]   the scratchpad the hots share (--clear empties it)
+        \\  hot key brave <key>          a search key for the hots' web_search (google, google_cx; --remove)
         \\  hot rm <name>                delete one       hot teardown --yes   remove them all + the runtime
         \\
         \\BUILT-IN MODEL (the-veil-12b served by the server itself — no external runtime)

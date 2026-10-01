@@ -35,9 +35,12 @@ left, above the scratchpad they share: entries wrap and scroll, newest at the bo
 and a two-click *clear* empties it for the next set of hots. The right side is the
 selected hot: its goal and counters, Pause / Resume, Shrink / Grow, **Open folder**
 (its local run folder: `events.log`, notes, status), a two-click Delete, the event
-console and one line that sends it a message or a command. The console wraps every
-event and scrolls with the wheel or its bar; scrolling up stops it following, and
-*latest* (or scrolling back down) follows again. Under the Deploy button one line names the tools the
+console and one line that sends it a message or a command. The console shows ONE line per
+event - what happened, in brief - with a row that went wrong in red. Clicking a row
+opens its whole text under it, wrapped to the panel; clicking again closes it, and up
+to twelve rows stay open. The *errors* chip shows only the rows that failed. It
+scrolls with the wheel or its bar; scrolling up or opening a row stops it following,
+and *latest* follows again. Under the Deploy button one line names the tools the
 account's hots have (Python and the browser are there when the account took them),
 and why not when one is missing. "Deploy a hot" replaces the right
 side with the deploy form: PACE runs from every 5 seconds to every 6 hours and MODEL
@@ -57,8 +60,9 @@ server for the roster, the events and the scratchpad only while it is on screen.
   visible without forcing the transcript to follow new output.
 - Resize the chat pane while streaming prose, tables, and long code. Change text
   size and font; verify message spacing recalculates.
-- With a Cloudflare login, open Hots, deploy one, and watch its console fill. Scroll
-  up, check that long rows wrap and stay put, then press *latest*. Send it a message
+- With a Cloudflare login, open Hots, deploy one, and watch its console fill. Each
+  event is one line; click one to open its full text and again to close it; press the
+  errors chip and check only red rows remain. Scroll up, then press *latest*. Send it a message
   and `/pause`; Grow and Shrink it; open its folder; click Delete once, click
   elsewhere, and confirm nothing was deleted. Open the form again: the machine box is
   unchecked, the MODEL list shows the account's models, and a goal past the counter

@@ -781,6 +781,7 @@ pub fn main(init: std.process.Init) !void {
     router.get("/api/v1/hots/pad", cf_hot.padRead, .{});
     router.post("/api/v1/hots/pad", cf_hot.padWrite, .{});
     router.post("/api/v1/hots/pad/clear", cf_hot.padClear, .{});
+    router.post("/api/v1/hots/keys", cf_hot.setKey, .{});
     router.delete("/api/v1/hots/:name", cf_hot.deleteHot, .{});
     router.get("/api/v1/hots/:name/events", cf_hot.hotEvents, .{});
     router.post("/api/v1/hots/:name/command", cf_hot.hotCommand, .{});

@@ -30,6 +30,7 @@ const USAGE =
     \\       veil hot set <name> [--model M] [--pace S] [--size N] [--calls N] [--charter "..."] [--pause|--resume]
     \\       veil hot pad ["<text>" | --clear]     the scratchpad the hots share (--clear empties it)
     \\       veil hot rm <name>                    delete one hot
+    \\       veil hot key brave <key>              a search key for the hots (google, google_cx too; --remove)
     \\       veil hot teardown --yes               remove the runtime and every hot from the account
     \\
 ;
@@ -47,7 +48,7 @@ const Hot = struct {
     local: bool = false,
     goal: ?Goal = null,
 };
-const Roster = struct { ok: bool = false, err: []const u8 = "", connected: bool = false, deployed: bool = false, reachable: bool = false, max: i64 = 0, python: bool = false, browser: bool = false, tools_note: []const u8 = "", last_error: []const u8 = "", hots: []const Hot = &.{} };
+const Roster = struct { ok: bool = false, err: []const u8 = "", connected: bool = false, deployed: bool = false, reachable: bool = false, max: i64 = 0, python: bool = false, browser: bool = false, neuron: bool = false, tools_note: []const u8 = "", last_error: []const u8 = "", hots: []const Hot = &.{} };
 const Event = struct { seq: u64 = 0, kind: []const u8 = "", text: []const u8 = "" };
 const Events = struct { ok: bool = false, err: []const u8 = "", seq: u64 = 0, events: []const Event = &.{} };
 const PadEntry = struct { seq: u64 = 0, from: []const u8 = "", text: []const u8 = "" };
@@ -103,6 +104,7 @@ pub fn cmd(ctx: *Ctx, args: []const []const u8) u8 {
     if (std.mem.eql(u8, verb, "pad")) return pad(ctx, a, rest);
     if (std.mem.eql(u8, verb, "rm") or std.mem.eql(u8, verb, "delete")) return rm(ctx, a, rest);
     if (std.mem.eql(u8, verb, "teardown")) return teardown(ctx, a, rest);
+    if (std.mem.eql(u8, verb, "key")) return key(ctx, a, rest);
     out(USAGE, .{});
     return 1;
 }
@@ -124,7 +126,7 @@ fn list(ctx: *Ctx, a: std.mem.Allocator) u8 {
         out("{s}\n", .{rosterLine(&b, h)});
     }
     if (r.hots.len == 0 and r.reachable) out("(no hots - deploy the first with `veil hot deploy \"<goal>\"`)\n", .{});
-    if (r.reachable) out("tools: files, web search, web fetch, HTTP, memory, plan, swarm{s}{s}\n", .{ if (r.python) ", Python + skills" else "", if (r.browser) ", browser" else "" });
+    if (r.reachable) out("tools: files, web search, web fetch, HTTP, memory, plan, swarm{s}{s}{s}\n", .{ if (r.python) ", Python + skills" else "", if (r.browser) ", browser" else "", if (r.neuron) ", neuron-db mind" else "" });
     if (r.tools_note.len > 0) out("{s}\n", .{r.tools_note});
     return 0;
 }
@@ -283,6 +285,23 @@ fn rm(ctx: *Ctx, a: std.mem.Allocator, args: []const []const u8) u8 {
     out("deleted {s}\n", .{args[0]});
     if (r.worker_removed) out("it was the last hot, so the veil-hots Worker is removed from your Cloudflare account too\n", .{});
     if (r.note.len > 0) out("{s}\n", .{r.note});
+    return 0;
+}
+
+/// `veil hot key brave|google|google_cx <value>` gives the hots a search key; `--remove` takes it away.
+fn key(ctx: *Ctx, a: std.mem.Allocator, args: []const []const u8) u8 {
+    if (args.len < 2) {
+        out("usage: veil hot key brave <key>            a Brave Search API key: web_search asks it first\n       veil hot key google <key>  +  veil hot key google_cx <engine id>\n       veil hot key <name> --remove\n", .{});
+        return 1;
+    }
+    var jb: std.ArrayListUnmanaged(u8) = .empty;
+    cli.appendStr(a, &jb, "name", args[0]);
+    cli.appendStr(a, &jb, "value", if (std.mem.eql(u8, args[1], "--remove")) "" else args[1]);
+    const body = object(a, jb.items) orelse return 1;
+    const resp = cli.call(ctx, "POST", "/api/v1/hots/keys", body, 40, true) catch return cli.unreachable_msg(ctx);
+    defer if (resp.body.len > 0) ctx.gpa.free(resp.body);
+    if (resp.status != 200) return fail("hot key", resp.status, resp.body, a);
+    out("{s} key {s}\n", .{ args[0], if (std.mem.eql(u8, args[1], "--remove")) "removed" else "set: every hot's web_search uses it from its next iteration" });
     return 0;
 }
 

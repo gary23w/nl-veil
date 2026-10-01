@@ -22,6 +22,12 @@
 // again, cast an inner swarm, and talk to the other hots. The browser and Python are bindings the veil server
 // adds when the account takes them; a hot without one is told so by the tool, in words.
 //
+// ITS MIND: the hot's facts live in neuron-db (cloud/neuron_core.wasm, the same memory engine the veil uses,
+// compiled to WebAssembly and uploaded beside this file), which recalls by meaning rather than by matching
+// words, and which keeps STANCES - how the hot has come to feel about a topic, from what happened when it worked
+// on it - and a MOOD. Both ride every prompt: they are the hot's own experience steering what it tries next.
+// Without the engine (an account that did not take the module) the hot recalls by keyword and still keeps stances.
+//
 // THE OWNER'S MACHINE: a hot deployed with `local: true` gets one more tool, local_run. It only QUEUES a job;
 // the veil server on the owner's machine polls for jobs (outbound only - nothing listens at home), runs each
 // as an unattended chat turn with the full local tool surface, and posts the result back to the inbox.
@@ -35,7 +41,7 @@
 // No imports and no platform globals beyond fetch/Response/crypto, so cloud/hot.test.mjs runs the whole file
 // under node with a Map for storage and a scripted model.
 
-export const VERSION = "3";
+export const VERSION = "4";
 export const MAX_HOTS = 3;
 export const PRIMARY = "Gary"; // the first hot of every account
 
@@ -50,6 +56,10 @@ const TICK_CALLS_MAX = 46; // model calls + fetches one alarm may make (a Worker
 const PACE_MIN_S = 5;
 const FALLBACK_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast"; // answers when the chosen model only reasons
 const FACTS_MAX = 300;
+const STANCES_MAX = 40;
+const MIND = "hot"; // this hot's scope in its neuron-db
+const NEURON_WASM = "./neuron_core.wasm"; // the two modules the veil server uploads beside this file
+const NEURON_BINDING = "./neuron-db.mjs";
 const UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36";
 const TICK_WALL_MS = 8 * 60 * 1000; // an alarm stops starting new model calls after this long
 const EVENTS_KEEP = 1500;
@@ -382,12 +392,16 @@ const TOOLS = [
   { name: "web_fetch", args: '{"url": "https://..."}', what: "GET a page or an API and read its text" },
   { name: "http_request", args: '{"method": "POST", "url": "https://...", "headers": {"content-type": "application/json"}, "body": "<text>"}', what: "any HTTP call: APIs, forms, webhooks; the status, headers and body come back" },
   // a real browser, for pages that need JavaScript, clicks or forms
-  { name: "browser_open", args: '{"url": "https://..."}', what: "open a page in a real browser (JavaScript runs) and read its title and visible text", need: "browser" },
-  { name: "browser_read", args: "{}", what: "read the current page again: url, title, visible text", need: "browser" },
-  { name: "browser_links", args: "{}", what: "the current page's links and buttons, with their text", need: "browser" },
-  { name: "browser_click", args: '{"text": "<link or button text>"}', what: 'click by visible text, or by {"selector": "<css>"}', need: "browser" },
-  { name: "browser_type", args: '{"selector": "<css>", "text": "<what to type>", "submit": true}', what: "type into a field; submit sends its form", need: "browser" },
-  { name: "browser_eval", args: '{"js": "<an expression or async code>"}', what: "run JavaScript in the page and get its value back", need: "browser" },
+  { name: "browser_open", args: '{"url": "https://..."}', what: "open a page in a real browser (JavaScript runs). You get its text and a NUMBERED list of what can be clicked or typed into", need: "browser" },
+  { name: "browser_read", args: "{}", what: "read the current page again: text and the numbered elements", need: "browser" },
+  { name: "browser_click", args: '{"n": 3}', what: 'click element number n from the list (or {"text": "<its visible text>"}). You get the page as it is afterwards', need: "browser" },
+  { name: "browser_type", args: '{"n": 2, "text": "<what to type>", "submit": true}', what: "type into field number n (it is cleared first); submit presses Enter", need: "browser" },
+  { name: "browser_select", args: '{"n": 4, "option": "<option text>"}', what: "choose an option of a dropdown", need: "browser" },
+  { name: "browser_key", args: '{"key": "Enter"}', what: "press a key: Enter, Tab, Escape, ArrowDown, ArrowUp, PageDown, Backspace, Space", need: "browser" },
+  { name: "browser_scroll", args: '{"to": "bottom"}', what: 'scroll: {"to": "bottom"}, {"to": "top"}, or one screen down with {}', need: "browser" },
+  { name: "browser_back", args: "{}", what: "go back one page", need: "browser" },
+  { name: "browser_wait", args: '{"text": "<words that will appear>"}', what: 'wait (up to 10 s) for words to appear, or {"seconds": 3}', need: "browser" },
+  { name: "browser_eval", args: '{"js": "<an expression, or statements with return>"}', what: "run JavaScript in the page; its value (or what it console.logs) comes back", need: "browser" },
   { name: "browser_close", args: "{}", what: "close the browser when you are done with it", need: "browser" },
   // scripting
   { name: "run_python", args: '{"code": "<a script>", "files": ["<a file of yours to put beside it>"]}', what: "run Python 3.12. The standard library is there, `import requests` and urllib work for HTTP, and a pure-Python package you import is installed from PyPI by itself. There are NO processes or shell (no subprocess, no os.system) and no native packages (numpy, pandas). It prints; the files it writes are kept in your workspace", need: "python" },
@@ -396,7 +410,8 @@ const TOOLS = [
   { name: "run_skill", args: '{"name": "<skill>", "args": {}}', what: "run a skill you saved; `args` arrives as ARGS", need: "python" },
   // memory and planning
   { name: "remember", args: '{"fact": "<one thing worth knowing later>"}', what: "keep a fact for every later iteration" },
-  { name: "recall", args: '{"query": "<words>"}', what: "find facts you kept" },
+  { name: "recall", args: '{"query": "<what you want to know>"}', what: "find facts you kept, by meaning" },
+  { name: "feel", args: '{"about": "<a topic, tool, site or approach>", "feeling": "<how it sits with you now, and why>"}', what: "record how you have come to feel about something from working on it; your stances are shown to you every iteration and should steer what you try" },
   { name: "plan_set", args: '{"items": ["<step>", "<step>"]}', what: "write or replace your plan for the goal (shown to you every iteration)" },
   { name: "plan_done", args: '{"item": 1}', what: "tick a plan item off" },
   // the other hots, and the human
@@ -413,7 +428,7 @@ const LOCAL_TOOL = {
   what: "queue a job for the veil on the owner's own machine (files, shell, builds, a swarm there); the result arrives in your inbox on a later iteration",
 };
 /// Earlier names for the file tools: a model (or a lesson) that still says note_write is understood.
-const ALIASES = { pip: "pip_install", install_package: "pip_install", note_write: "write_file", note_read: "read_file", note_list: "list_files", note_delete: "delete_file", fetch_json: "web_fetch", read_url: "web_fetch", list_dir: "list_files", observe: "remember", python: "run_python" };
+const ALIASES = { browser_links: "browser_read", browser_navigate: "browser_open", browser_goto: "browser_open", browser_press: "browser_key", stance: "feel", note_stance: "feel", pip: "pip_install", install_package: "pip_install", note_write: "write_file", note_read: "read_file", note_list: "list_files", note_delete: "delete_file", fetch_json: "web_fetch", read_url: "web_fetch", list_dir: "list_files", observe: "remember", python: "run_python" };
 const MIND_TOOLS = new Set(["write_file", "read_file", "list_files", "append_file", "web_search", "web_fetch", "http_request", "run_python", "pip_install", "run_skill", "remember", "recall", "pad_read", "pad_write"]);
 
 /// The tools this hot has here: everything, minus what a missing binding takes away.
@@ -463,6 +478,96 @@ export function searchResults(html, engine) {
   }
   return out;
 }
+
+const BOT_CHECK = /captcha|verify (that )?you are (a )?human|unusual traffic|are you a robot|not a robot|select all squares|checking your browser|just a moment\.\.\.|press and hold|prove you('| a)re human/i;
+
+/// Run in the page: number what a visitor could act on (each gets a data-veil-n attribute) and report the page.
+const PAGE_JS = `(() => {
+  const vis = (e) => { const r = e.getBoundingClientRect(); const s = getComputedStyle(e); return r.width > 1 && r.height > 1 && s.visibility !== "hidden" && s.display !== "none"; };
+  const label = (e) => (e.innerText || e.value || e.getAttribute("aria-label") || e.placeholder || e.name || e.title || "").trim().replace(/\\s+/g, " ").slice(0, 70);
+  document.querySelectorAll("[data-veil-n]").forEach((e) => e.removeAttribute("data-veil-n"));
+  const els = [...document.querySelectorAll("a[href], button, input:not([type=hidden]), textarea, select, [role=button], [role=link], [role=tab], [role=checkbox], [contenteditable=true], summary")].filter(vis).slice(0, 70);
+  const out = els.map((e, i) => {
+    e.setAttribute("data-veil-n", String(i + 1));
+    const tag = e.tagName.toLowerCase();
+    const kind = tag === "a" ? "link" : tag === "input" ? "input " + (e.type || "text") : tag;
+    const t = e.type === "password" ? "" : label(e);
+    let extra = "";
+    if (tag === "a") { try { const u = new URL(e.href); extra = " -> " + (u.origin === location.origin ? u.pathname + u.search : e.href).slice(0, 80); } catch (x) {} }
+    if (tag === "input" || tag === "textarea") extra = (e.name ? " name=" + e.name : "") + (e.placeholder ? ' placeholder="' + e.placeholder.slice(0, 40) + '"' : "");
+    if (tag === "select") extra = " options: " + [...e.options].slice(0, 8).map((o) => o.text.trim()).join(" | ");
+    return "[" + (i + 1) + "] " + kind + (t ? ' "' + t + '"' : "") + extra;
+  });
+  return JSON.stringify({ url: location.href, title: document.title, text: (document.body ? document.body.innerText : "").slice(0, 9000), els: out });
+})()`;
+
+/// Run in the page: find one element (by its number, a selector, or its text), bring it into view, say where it is.
+const targetJs = (n, selector, text) => `(() => {
+  const n = ${JSON.stringify(n)}, sel = ${JSON.stringify(selector)}, t = ${JSON.stringify(text)};
+  const lab = (x) => (x.innerText || x.value || x.getAttribute("aria-label") || x.placeholder || x.name || "").trim();
+  let e = null;
+  if (n) e = document.querySelector('[data-veil-n="' + n + '"]');
+  if (!e && sel) { try { e = document.querySelector(sel); } catch (x) { return JSON.stringify({ err: "that is not a CSS selector the page accepts" }); } }
+  if (!e && t) { const all = [...document.querySelectorAll("a, button, input, textarea, select, [role=button], [role=link], [role=tab], label, summary, [onclick]")]; e = all.find((x) => lab(x).toLowerCase() === t) || all.find((x) => lab(x).toLowerCase().includes(t)); }
+  if (!e) return JSON.stringify({ err: n ? "no element number " + n + " on this page" : "no element matches" });
+  e.scrollIntoView({ block: "center", inline: "center" });
+  const r = e.getBoundingClientRect();
+  return JSON.stringify({ x: r.left + r.width / 2, y: r.top + r.height / 2, tag: e.tagName.toLowerCase(), label: lab(e).replace(/\\s+/g, " ").slice(0, 60) });
+})()`;
+
+/// Run in the page: empty the focused field the way a page's own scripts will notice.
+const CLEAR_JS = `(() => { const e = document.activeElement; if (!e) return; if (e.isContentEditable) { e.textContent = ""; } else if ("value" in e) { const proto = e instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype; const d = Object.getOwnPropertyDescriptor(proto, "value"); if (d && d.set) d.set.call(e, ""); else e.value = ""; } e.dispatchEvent(new Event("input", { bubbles: true })); })()`;
+
+const selectJs = (n, selector, option) => `(() => {
+  const want = ${JSON.stringify(option)}.trim().toLowerCase();
+  let e = ${JSON.stringify(n)} ? document.querySelector('[data-veil-n="${n}"]') : null;
+  if (!e && ${JSON.stringify(selector)}) e = document.querySelector(${JSON.stringify(selector)});
+  if (!e || e.tagName !== "SELECT") return "no dropdown there";
+  const o = [...e.options].find((x) => x.text.trim().toLowerCase() === want || x.value.toLowerCase() === want) || [...e.options].find((x) => x.text.trim().toLowerCase().includes(want));
+  if (!o) return "no option like that; it has: " + [...e.options].slice(0, 12).map((x) => x.text.trim()).join(" | ");
+  e.value = o.value; e.dispatchEvent(new Event("input", { bubbles: true })); e.dispatchEvent(new Event("change", { bubbles: true }));
+  return "chose " + o.text.trim();
+})()`;
+
+/// Run in a search engine's results page: the results, or that the page is a bot check.
+const SERP_JS = `JSON.stringify((() => {
+  const engines = /(^|\\.)(bing|duckduckgo|brave|google|microsoft|startpage|msn|live)\\.(com|net)$/;
+  const seen = new Set(); const out = [];
+  for (const a of document.querySelectorAll("li.b_algo h2 a, a.result__a, [data-testid=result-title-a], .snippet a, h2 a, h3 a")) {
+    let u = a.href;
+    try {
+      const p = new URL(u);
+      const d = p.searchParams.get("uddg"); if (d) u = d;
+      if (p.hostname.endsWith("bing.com") && p.pathname.startsWith("/ck/")) { const v = p.searchParams.get("u") || ""; if (v.startsWith("a1")) u = atob(v.slice(2).replace(/-/g, "+").replace(/_/g, "/")); }
+      if (engines.test(new URL(u).hostname) || seen.has(u)) continue;
+    } catch (e) { continue; }
+    const t = (a.innerText || "").trim().replace(/\\s+/g, " ");
+    if (t.length < 4) continue;
+    seen.add(u);
+    const box = a.closest("li, article, .result, .snippet");
+    out.push({ title: t.slice(0, 160), url: u, snippet: box ? (box.innerText || "").replace(a.innerText || "", "").trim().replace(/\\s+/g, " ").slice(0, 260) : "" });
+    if (out.length >= 8) break;
+  }
+  const text = (document.body ? document.body.innerText : "").slice(0, 3000);
+  return { results: out, blocked: out.length === 0 && /captcha|unusual traffic|are you a robot|not a robot|select all squares|verify you are human/i.test(text) };
+})())`;
+
+const KEYS = {
+  Enter: { key: "Enter", code: "Enter", vk: 13, text: "\r" },
+  Tab: { key: "Tab", code: "Tab", vk: 9 },
+  Escape: { key: "Escape", code: "Escape", vk: 27 },
+  Backspace: { key: "Backspace", code: "Backspace", vk: 8 },
+  Delete: { key: "Delete", code: "Delete", vk: 46 },
+  Space: { key: " ", code: "Space", vk: 32, text: " " },
+  ArrowDown: { key: "ArrowDown", code: "ArrowDown", vk: 40 },
+  ArrowUp: { key: "ArrowUp", code: "ArrowUp", vk: 38 },
+  ArrowLeft: { key: "ArrowLeft", code: "ArrowLeft", vk: 37 },
+  ArrowRight: { key: "ArrowRight", code: "ArrowRight", vk: 39 },
+  PageDown: { key: "PageDown", code: "PageDown", vk: 34 },
+  PageUp: { key: "PageUp", code: "PageUp", vk: 33 },
+  Home: { key: "Home", code: "Home", vk: 36 },
+  End: { key: "End", code: "End", vk: 35 },
+};
 
 /// The DevTools protocol over the browser binding's WebSocket: commands by id, events to whoever waits for one.
 class Cdp {
@@ -640,6 +745,9 @@ export class Hot {
     this.now = () => Date.now(); // a test replaces it
     this.tick = null; // per-alarm counters
     this.br = null; // the browser connection of the running iteration
+    this.navMs = 1500; // how long a click is given to start a navigation
+    this.settleMs = 600; // how long a page's scripts are given after it loads
+    this.pollMs = 400;
   }
 
   // ---------------------------------------------------------------- requests from the Worker (already authorized)
@@ -790,6 +898,8 @@ export class Hot {
       tools: toolsFor(this.env, cfg).length,
       browser: !!this.env.BROWSER,
       python: !!this.env.PY,
+      neuron: !!(await this.mind()),
+      mood: (await this.store.get("mood")) ?? "",
       seq: (await this.store.get("seq")) ?? 0,
       notes_rev: (await this.store.get("notes_rev")) ?? 0,
       last_tick: (await this.store.get("last_tick")) ?? 0,
@@ -802,7 +912,11 @@ export class Hot {
   async emit(kind, text, extra) {
     const seq = ((await this.store.get("seq")) ?? 0) + 1;
     await this.store.put("seq", seq);
-    await this.store.put("ev:" + pad10(seq), { seq, t: this.now(), kind, text: clip(text, 4000), ...(extra ?? {}) });
+    // `brief` is the one line a console shows; `text` is everything, for whoever opens the row. `ok` false marks
+    // a row that went wrong.
+    const full = clip(text, 4000);
+    const brief = clip((full.split("\n").find((l) => l.trim().length > 0) ?? "").trim(), 180);
+    await this.store.put("ev:" + pad10(seq), { seq, t: this.now(), kind, text: full, brief, ok: kind !== "error", ...(extra ?? {}) });
     if (seq > EVENTS_KEEP) await this.store.delete("ev:" + pad10(seq - EVENTS_KEEP));
     return seq;
   }
@@ -1143,6 +1257,16 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
     await this.store.put("logseq", ((await this.store.get("logseq")) ?? 0) + 1);
     await this.store.put("goal", g);
     await this.store.put("fails", 0);
+    const mood = Hot.moodOf(g, outcome);
+    if (mood !== (await this.store.get("mood"))) {
+      await this.store.put("mood", mood);
+      const db = await this.mind();
+      if (db) {
+        try {
+          db.raw("mood", MIND, mood);
+        } catch {}
+      }
+    }
     await this.emit("verdict", `${outcome}${row.den > 0 ? ` [${row.num}/${row.den}]` : ""}${row.evidence ? `: ${row.evidence}` : ""}`, { i: row.i, outcome });
 
     // LEARN: the hot rewrites its own operating rules from what the measurement said.
@@ -1201,9 +1325,15 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
           }
         }
         record.push({ tool: act.tool, args, result });
-        await this.emit("act", `${mind ? mind + " " : ""}${act.tool} ${clip(JSON.stringify(args), 600)} -> ${clip(result, 1500)}`, { tool: act.tool });
+        const arg1 = String(Object.values(args).find((v) => typeof v === "string" || typeof v === "number") ?? "").replace(/\s+/g, " ");
+        const head = String(result).split("\n").find((l) => l.trim().length > 0) ?? "";
+        await this.emit("act", `${mind ? mind + " " : ""}${act.tool} ${clip(JSON.stringify(args), 600)} -> ${clip(result, 1500)}`, {
+          tool: act.tool,
+          brief: clip(`${mind ? mind + " " : ""}${act.tool} ${clip(arg1, 60)} -> ${clip(head.trim(), 100)}`, 180),
+          ok: !/^(ERROR|FAILED|BOT CHECK)/.test(String(result)),
+        });
         messages.push({ role: "assistant", content: clip(reply, 2000) });
-        messages.push({ role: "user", content: `RESULT of ${act.tool}:\n${clip(result, 6000)}\n\n${round + 2 >= rounds ? 'This is your last call for this step: reply {"final": ...} now.' : "Next action, or the final answer."}` });
+        messages.push({ role: "user", content: `RESULT of ${act.tool}:\n${clip(result, 8000)}\n\n${round + 2 >= rounds ? 'This is your last call for this step: reply {"final": ...} now.' : "Next action, or the final answer."}` });
         continue;
       }
       if (!nudged && round + 1 < rounds) {
@@ -1217,6 +1347,52 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
     return "(the step used all its calls without a final answer)";
   }
 
+  /// This hot's neuron-db, loaded once per isolate with the facts and stances it has kept; null when the engine is
+  /// not part of this upload. A test hands one in as env.NDB.
+  async mind() {
+    if (this.ndb !== undefined) return this.ndb;
+    this.ndb = null;
+    try {
+      let db = null;
+      if (typeof this.env.NDB === "function") db = await this.env.NDB();
+      else {
+        const [wasm, binding] = await Promise.all([import(NEURON_WASM), import(NEURON_BINDING)]);
+        db = binding.NeuronDB.fromModule(wasm.default);
+      }
+      const facts = (await this.store.get("facts")) ?? [];
+      if (facts.length > 0) db.observeMany(MIND, facts.map((f) => f.text));
+      for (const st of (await this.store.get("stances")) ?? []) db.raw("stance", MIND, st.topic, st.feeling);
+      const mood = await this.store.get("mood");
+      if (mood) db.raw("mood", MIND, mood);
+      this.ndb = db;
+    } catch {
+      this.ndb = null;
+    }
+    return this.ndb;
+  }
+
+  /// Keep how the hot feels about a topic. One stance per topic: a new one replaces the old.
+  async stance(topic, feeling) {
+    const all = ((await this.store.get("stances")) ?? []).filter((x) => x.topic.toLowerCase() !== topic.toLowerCase());
+    all.push({ topic, feeling, t: this.now() });
+    await this.store.put("stances", all.slice(-STANCES_MAX));
+    const db = await this.mind();
+    if (db) {
+      try {
+        db.raw("stance", MIND, topic, feeling);
+      } catch {}
+    }
+    await this.emit("feel", `${topic}: ${feeling}`);
+  }
+
+  /// The mood a run of outcomes leaves: what the last few measured iterations add up to. Pure.
+  static moodOf(g, outcome) {
+    if (outcome === "regressed") return "wary - the last step made things worse; undo or check before pushing on";
+    if (outcome === "improved") return g.improved >= 3 && g.flat === 0 ? "confident - several steps in a row have moved the goal" : "encouraged - the last step moved the goal";
+    if (g.flat >= 2) return "frustrated but persistent - the last steps changed nothing; a different approach is due";
+    return "steady - the last step changed nothing measurable";
+  }
+
   /// What a hot carries from iteration to iteration besides its lessons: its plan, the newest facts it kept, its
   /// files and its skills, by name. Appended to the system prompt.
   async workingMemory() {
@@ -1225,6 +1401,11 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
     if (plan.length > 0) out += "YOUR PLAN (plan_done ticks an item, plan_set rewrites it):\n" + plan.map((p, i) => `${i + 1}. [${p.done ? "x" : " "}] ${p.text}`).join("\n") + "\n";
     const facts = (await this.store.get("facts")) ?? [];
     if (facts.length > 0) out += `FACTS YOU KEPT (newest of ${facts.length}; recall finds the rest):\n` + facts.slice(-10).map((f) => `- ${f.text}`).join("\n") + "\n";
+    const mood = await this.store.get("mood");
+    const stances = (await this.store.get("stances")) ?? [];
+    if (mood || stances.length > 0)
+      out += "HOW YOU FEEL ABOUT THE WORK (your own stances, from what happened; let them steer what you try, and use feel when one changes):\n" +
+        (mood ? `- right now: ${mood}\n` : "") + stances.slice(-12).map((x) => `- ${x.topic}: ${x.feeling}`).join("\n") + (stances.length > 0 ? "\n" : "");
     const files = await this.store.list({ prefix: "note:", limit: 60 });
     if (files.size > 0) out += "YOUR FILES: " + [...files.entries()].map(([k, v]) => `${k.slice(5)} (${v.text.length})`).join(", ") + "\n";
     const skills = await this.store.list({ prefix: "skill:", limit: 40 });
@@ -1300,12 +1481,23 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
         return this.http(String(args.method ?? "GET").toUpperCase(), String(args.url ?? ""), args.headers, args.body);
       case "browser_open":
       case "browser_read":
-      case "browser_links":
       case "browser_click":
       case "browser_type":
+      case "browser_select":
+      case "browser_key":
+      case "browser_scroll":
+      case "browser_back":
+      case "browser_wait":
       case "browser_eval":
       case "browser_close":
         return this.browserTool(tool, args);
+      case "feel": {
+        const topic = clip(String(args.about ?? args.topic ?? "").trim().replace(/\s+/g, " "), 80);
+        const feeling = clip(String(args.feeling ?? args.text ?? args.value ?? "").trim().replace(/\s+/g, " "), 240);
+        if (topic.length < 2 || feeling.length < 2) return 'ERROR: give both, as {"about": "...", "feeling": "..."}';
+        await this.stance(topic, feeling);
+        return `noted: ${topic} - ${feeling}`;
+      }
       case "run_python":
         return this.runPython(String(args.code ?? args.value ?? ""), Array.isArray(args.files) ? args.files : [], args.args);
       case "pip_install": {
@@ -1332,19 +1524,33 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
         return this.runPython(sk.code, Array.isArray(args.files) ? args.files : [], args.args ?? {});
       }
       case "remember": {
-        const text = clip(String(args.fact ?? args.text ?? args.value ?? "").trim(), 500);
+        const text = clip(String(args.fact ?? args.text ?? args.value ?? "").trim().replace(/\s+/g, " "), 500);
         if (text.length < 3) return "ERROR: empty fact";
         const facts = (await this.store.get("facts")) ?? [];
         if (facts.some((f) => f.text === text)) return "already kept";
         facts.push({ t: this.now(), text });
         await this.store.put("facts", facts.slice(-FACTS_MAX));
+        const db = await this.mind();
+        if (db) {
+          try {
+            db.observe(MIND, text);
+          } catch {}
+        }
         return `kept (${Math.min(facts.length, FACTS_MAX)} facts)`;
       }
       case "recall": {
         const facts = (await this.store.get("facts")) ?? [];
         if (facts.length === 0) return "(no facts kept yet)";
-        const words = String(args.query ?? args.q ?? args.value ?? "").toLowerCase().split(/[^a-z0-9]+/).filter((x) => x.length > 2);
-        if (words.length === 0) return facts.slice(-12).map((f) => `- ${f.text}`).join("\n");
+        const query = String(args.query ?? args.q ?? args.value ?? "").trim();
+        if (query.length < 2) return facts.slice(-12).map((f) => `- ${f.text}`).join("\n");
+        const db = await this.mind();
+        if (db) {
+          try {
+            const hits = db.recallScored(MIND, query, 10).filter((h) => h.fact);
+            if (hits.length > 0) return hits.map((h) => `- ${h.fact}`).join("\n");
+          } catch {}
+        }
+        const words = query.toLowerCase().split(/[^a-z0-9]+/).filter((x) => x.length > 2);
         const scored = facts.map((f) => ({ f, n: words.filter((x) => f.text.toLowerCase().includes(x)).length })).filter((x) => x.n > 0);
         scored.sort((a, b) => b.n - a.n || b.f.t - a.f.t);
         return scored.length === 0 ? "(nothing kept matches)" : scored.slice(0, 10).map((x) => `- ${x.f.text}`).join("\n");
@@ -1465,6 +1671,31 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
       return fetch(url, { signal: AbortSignal.timeout(ms), headers: { "user-agent": UA, accept, "accept-language": "en-US,en;q=0.9" } });
     };
     const show = (via, results) => `${results.length} results for "${query}" (${via}):\n` + results.map((x, i) => `${i + 1}. ${x.title}\n   ${x.url}${x.snippet ? `\n   ${x.snippet}` : ""}`).join("\n");
+    // 0. a search API the owner gave a key for (veil hot key ...): the one source that does not refuse a datacenter
+    if (this.env.BRAVE_KEY) {
+      try {
+        this.spend();
+        const r = await fetch(`https://api.search.brave.com/res/v1/web/search?q=${q}&count=8`, { signal: AbortSignal.timeout(9000), headers: { "x-subscription-token": this.env.BRAVE_KEY, accept: "application/json" } });
+        const d = await r.json();
+        const results = (d?.web?.results ?? []).slice(0, 8).map((x) => ({ title: clip(x.title ?? "", 160), url: x.url ?? "", snippet: clip(readable(x.description ?? "").replace(/\s+/g, " ").trim(), 300) }));
+        if (results.length > 0) return show("Brave", results);
+        tried.push(`brave: HTTP ${r.status}`);
+      } catch (e) {
+        tried.push(`brave: ${clip(e?.message ?? e, 60)}`);
+      }
+    }
+    if (this.env.GOOGLE_CSE_KEY && this.env.GOOGLE_CSE_CX) {
+      try {
+        this.spend();
+        const r = await fetch(`https://www.googleapis.com/customsearch/v1?key=${encodeURIComponent(this.env.GOOGLE_CSE_KEY)}&cx=${encodeURIComponent(this.env.GOOGLE_CSE_CX)}&num=8&q=${q}`, { signal: AbortSignal.timeout(9000) });
+        const d = await r.json();
+        const results = (d.items ?? []).slice(0, 8).map((x) => ({ title: clip(x.title ?? "", 160), url: x.link ?? "", snippet: clip(x.snippet ?? "", 300) }));
+        if (results.length > 0) return show("Google", results);
+        tried.push(`google: HTTP ${r.status}`);
+      } catch (e) {
+        tried.push(`google: ${clip(e?.message ?? e, 60)}`);
+      }
+    }
     // 1. public SearXNG instances answer JSON; two are tried per search, starting at a different one each time
     const searx = ["https://searx.be", "https://search.disroot.org", "https://priv.au", "https://searx.tiekoetter.com", "https://search.bus-hit.me", "https://baresearch.org"];
     const start = ((await this.store.get("searx_i")) ?? 0) % searx.length;
@@ -1517,23 +1748,31 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
       const j = await (await get(`https://en.wikipedia.org/w/api.php?action=opensearch&limit=8&format=json&search=${q}`, "application/json", 7000)).json();
       if (Array.isArray(j?.[1]) && j[1].length > 0) return show("Wikipedia", j[1].map((ti, i) => ({ title: ti, url: j[3]?.[i] ?? "", snippet: j[2]?.[i] ?? "" })));
     } catch {}
-    // 4. the engines refuse a datacenter address more often than a browser: ask one through the real browser
+    // 4. the engines refuse a datacenter address more often than a real browser: ask them through one, each in
+    //    turn. A page that answers with a bot check is passed over - a hot does not solve those.
     if (this.env.BROWSER) {
-      try {
-        const b = await this.browser();
-        const loaded = b.cdp.event("Page.loadEventFired", b.session, 15000);
-        await b.cdp.send("Page.navigate", { url: `https://html.duckduckgo.com/html/?q=${q}` }, b.session);
-        await loaded;
-        const v = await this.pageEval(`JSON.stringify([...document.querySelectorAll(".result")].slice(0, 10).map(r => { const a = r.querySelector("a.result__a"); const s = r.querySelector(".result__snippet"); if (!a) return null; let u = a.href; try { const m = new URL(u).searchParams.get("uddg"); if (m) u = m; } catch (e) {} return {title: a.innerText.trim().slice(0, 160), url: u, snippet: s ? s.innerText.trim().slice(0, 300) : ""}; }).filter(x => x && x.title && !/duckduckgo\\.com\\/y\\.js/.test(x.url)))`);
-        const results = JSON.parse(v ?? "[]");
-        if (results.length > 0) return show("DuckDuckGo, through the browser", results);
-        tried.push("the browser: the page showed no results");
-      } catch (e) {
-        if (e instanceof TickBudget) throw e;
-        tried.push(`the browser: ${clip(e?.message ?? e, 80)}`);
+      for (const [engine, url] of [
+        ["Bing", `https://www.bing.com/search?q=${q}&setlang=en`],
+        ["Brave", `https://search.brave.com/search?q=${q}`],
+        ["DuckDuckGo", `https://html.duckduckgo.com/html/?q=${q}`],
+      ]) {
+        try {
+          const b = await this.browser();
+          const loaded = b.cdp.event("Page.loadEventFired", b.session, 15000);
+          await b.cdp.send("Page.navigate", { url }, b.session);
+          await loaded;
+          await new Promise((r) => setTimeout(r, this.settleMs));
+          const page = JSON.parse((await this.pageEval(SERP_JS)) ?? "{}");
+          if ((page.results ?? []).length > 0) return show(`${engine}, through the browser`, page.results);
+          tried.push(`${engine} in the browser: ${page.blocked ? "a bot check" : "no results on the page"}`);
+        } catch (e) {
+          if (e instanceof TickBudget) throw e;
+          tried.push(`${engine} in the browser: ${clip(e?.message ?? e, 80)}`);
+          break; // the browser itself is the trouble: the other engines would fail the same way
+        }
       }
     }
-    return `ERROR: no search engine answered (${tried.join("; ")}).${this.env.BROWSER ? ' Open a search page yourself: browser_open {"url": "https://www.bing.com/search?q=..."}.' : " Fetch a site you know with web_fetch instead."}`;
+    return `ERROR: no search source answered (${tried.join("; ")}). Fetch a site you already know with web_fetch or browser_open, or ask your human for a search key (they run: veil hot key brave <key>).`;
   }
 
   // ---------------------------------------------------------------- the browser
@@ -1596,10 +1835,49 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
     return r.result?.value;
   }
 
+  /// The page as a hot reads it: where it is, what it says, and a numbered list of what can be acted on. A page
+  /// that is a bot check is said to be one, first.
   async pageText() {
-    const v = await this.pageEval(`JSON.stringify({url: location.href, title: document.title, text: (document.body ? document.body.innerText : "").slice(0, 12000)})`);
-    const p = JSON.parse(v ?? "{}");
-    return `${p.title ?? ""}\n${p.url ?? ""}\n\n${clip(String(p.text ?? "").replace(/\n{3,}/g, "\n\n").trim(), 10000) || "(the page shows no text)"}`;
+    const p = JSON.parse((await this.pageEval(PAGE_JS)) ?? "{}");
+    const text = String(p.text ?? "").replace(/\n{3,}/g, "\n\n").trim();
+    const check = BOT_CHECK.test(text.slice(0, 2500)) && text.length < 2500;
+    return (
+      (check ? "BOT CHECK: this page asks its visitor to prove they are human. A hot does not solve these: use another site or source.\n" : "") +
+      `${p.title ?? ""}\n${p.url ?? ""}\n\n${clip(text, 3600) || "(the page shows no text)"}` +
+      ((p.els ?? []).length > 0 ? `\n\nELEMENTS (act on one by its number):\n${p.els.join("\n")}` : "\n\n(nothing on the page can be clicked or typed into)")
+    );
+  }
+
+  /// Where an element is, after scrolling it into view: by number (from the page's list), CSS selector, or text.
+  async locate(args, textKey) {
+    const n = Number.parseInt(args.n ?? args.index ?? args.element ?? args.id ?? args.number, 10);
+    const v = await this.pageEval(targetJs(Number.isFinite(n) ? n : null, String(args.selector ?? ""), String(args[textKey] ?? "").trim().toLowerCase()));
+    return JSON.parse(v ?? '{"err": "no element matches"}');
+  }
+
+  /// A real mouse click at a point of the page.
+  async clickAt(x, y) {
+    const b = await this.browser();
+    await b.cdp.send("Input.dispatchMouseEvent", { type: "mouseMoved", x, y }, b.session);
+    await b.cdp.send("Input.dispatchMouseEvent", { type: "mousePressed", x, y, button: "left", clickCount: 1 }, b.session);
+    await b.cdp.send("Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", clickCount: 1 }, b.session);
+  }
+
+  async pressKey(name) {
+    const k = KEYS[name] ?? KEYS[Object.keys(KEYS).find((x) => x.toLowerCase() === String(name).toLowerCase())];
+    if (!k) return false;
+    const b = await this.browser();
+    const base = { key: k.key, code: k.code, windowsVirtualKeyCode: k.vk, nativeVirtualKeyCode: k.vk };
+    await b.cdp.send("Input.dispatchKeyEvent", { type: k.text ? "keyDown" : "rawKeyDown", ...base, ...(k.text ? { text: k.text } : {}) }, b.session);
+    await b.cdp.send("Input.dispatchKeyEvent", { type: "keyUp", ...base }, b.session);
+    return true;
+  }
+
+  /// After something that may move the page: when a navigation starts, wait for it to load; then let scripts settle.
+  async settle(navigated) {
+    const b = await this.browser();
+    if (await navigated) await b.cdp.event("Page.loadEventFired", b.session, 15000);
+    await new Promise((r) => setTimeout(r, this.settleMs));
   }
 
   async browserTool(tool, args) {
@@ -1616,62 +1894,102 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
         await this.store.delete("browser");
         return "browser closed";
       }
+      const b = await this.browser();
+      const nav = () => b.cdp.event("Page.frameNavigated", b.session, this.navMs);
       if (tool === "browser_open") {
         const url = String(args.url ?? args.value ?? "");
         if (!/^https?:\/\//i.test(url)) return 'ERROR: an http(s) URL is needed, as {"url": "https://..."}';
-        const b = await this.browser();
+        try {
+          if (privateHost(new URL(url).hostname)) return "ERROR: that address is private or internal; a hot only browses the public internet";
+        } catch {
+          return "ERROR: that is not a URL";
+        }
         const loaded = b.cdp.event("Page.loadEventFired", b.session, 20000);
-        const nav = await b.cdp.send("Page.navigate", { url }, b.session);
-        if (nav.errorText) return `ERROR: the browser could not open it: ${nav.errorText}`;
+        const r = await b.cdp.send("Page.navigate", { url }, b.session);
+        if (r.errorText) return `ERROR: the browser could not open it: ${r.errorText}`;
         await loaded;
-        await new Promise((r) => setTimeout(r, 700)); // scripts that render after load
+        await new Promise((res) => setTimeout(res, this.settleMs));
         return this.pageText();
       }
       if (tool === "browser_read") return this.pageText();
-      if (tool === "browser_links") {
-        const v = await this.pageEval(`JSON.stringify([...document.querySelectorAll("a[href], button, input[type=submit], [role=button]")].slice(0, 400).map(e => [(e.innerText || e.value || e.getAttribute("aria-label") || "").trim().replace(/\\s+/g, " ").slice(0, 80), e.href || ""]).filter(x => x[0].length > 0).slice(0, 120))`);
-        const rows = JSON.parse(v ?? "[]");
-        return rows.length === 0 ? "(no links or buttons with text)" : rows.map((x) => (x[1] ? `${x[0]} -> ${x[1]}` : `[button] ${x[0]}`)).join("\n");
-      }
       if (tool === "browser_click") {
-        const sel = JSON.stringify(String(args.selector ?? ""));
-        const txt = JSON.stringify(String(args.text ?? args.value ?? "").trim().toLowerCase());
-        const b = await this.browser();
-        const loaded = b.cdp.event("Page.loadEventFired", b.session, 6000);
-        const r = await this.pageEval(`(() => { const sel = ${sel}, t = ${txt}; let e = sel ? document.querySelector(sel) : null; if (!e && t) { const all = [...document.querySelectorAll("a, button, input[type=submit], input[type=button], [role=button], [onclick], summary, label")]; e = all.find(x => (x.innerText || x.value || x.getAttribute("aria-label") || "").trim().toLowerCase() === t) || all.find(x => (x.innerText || x.value || x.getAttribute("aria-label") || "").trim().toLowerCase().includes(t)); } if (!e) return "no element matches"; e.scrollIntoView({block: "center"}); e.click(); return "clicked " + e.tagName.toLowerCase() + " " + (e.innerText || e.value || "").trim().slice(0, 60); })()`);
-        if (String(r).startsWith("no element")) return `ERROR: ${r} (browser_links lists what the page has)`;
-        await loaded; // a click that navigates; otherwise this is a short settle
-        await new Promise((res) => setTimeout(res, 500));
-        return `${r}\n\n${await this.pageText()}`;
+        const at = await this.locate(args, "text");
+        if (at.err) return `ERROR: ${at.err} (browser_read lists the page's elements by number)`;
+        const moved = nav();
+        await this.clickAt(at.x, at.y);
+        await this.settle(moved);
+        return `clicked ${at.tag} "${at.label}"\n\n${await this.pageText()}`;
       }
       if (tool === "browser_type") {
-        const sel = JSON.stringify(String(args.selector ?? "input, textarea"));
-        const txt = JSON.stringify(String(args.text ?? ""));
-        const submit = args.submit === true || args.submit === "true";
-        const b = await this.browser();
-        const loaded = submit ? b.cdp.event("Page.loadEventFired", b.session, 8000) : null;
-        const r = await this.pageEval(`(() => { const e = document.querySelector(${sel}); if (!e) return "no element matches"; e.focus(); const proto = e instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype; const set = Object.getOwnPropertyDescriptor(proto, "value"); if (set && set.set && (e instanceof HTMLInputElement || e instanceof HTMLTextAreaElement)) set.set.call(e, ${txt}); else e.textContent = ${txt}; e.dispatchEvent(new Event("input", {bubbles: true})); e.dispatchEvent(new Event("change", {bubbles: true})); if (${submit}) { const f = e.form; if (f) { if (f.requestSubmit) f.requestSubmit(); else f.submit(); } else { for (const type of ["keydown", "keypress", "keyup"]) e.dispatchEvent(new KeyboardEvent(type, {key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true})); } } return "typed into " + e.tagName.toLowerCase() + (${submit} ? " and submitted" : ""); })()`);
-        if (String(r).startsWith("no element")) return `ERROR: ${r}`;
-        if (loaded) {
-          await loaded;
-          await new Promise((res) => setTimeout(res, 500));
-          return `${r}\n\n${await this.pageText()}`;
+        if (args.text === undefined && args.value === undefined) return 'ERROR: give what to type, as {"n": 2, "text": "..."}';
+        const at = await this.locate(args, "field");
+        if (at.err) return `ERROR: ${at.err} (browser_read lists the page's fields by number)`;
+        await this.clickAt(at.x, at.y); // focus it the way a person would
+        await this.pageEval(CLEAR_JS);
+        await b.cdp.send("Input.insertText", { text: String(args.text ?? args.value) }, b.session);
+        if (args.submit === true || args.submit === "true") {
+          const moved = nav();
+          await this.pressKey("Enter");
+          await this.settle(moved);
+          return `typed into ${at.tag} "${at.label}" and pressed Enter\n\n${await this.pageText()}`;
         }
-        return String(r);
+        return `typed into ${at.tag} "${at.label}"`;
+      }
+      if (tool === "browser_select") {
+        const at = await this.locate(args, "field");
+        if (at.err) return `ERROR: ${at.err}`;
+        const n = Number.parseInt(args.n ?? args.index ?? args.element, 10);
+        const r = await this.pageEval(selectJs(Number.isFinite(n) ? n : null, String(args.selector ?? ""), String(args.option ?? args.value ?? args.text ?? "")));
+        return String(r).startsWith("no ") ? `ERROR: ${r}` : String(r);
+      }
+      if (tool === "browser_key") {
+        const moved = nav();
+        if (!(await this.pressKey(String(args.key ?? args.value ?? "")))) return `ERROR: keys are ${Object.keys(KEYS).join(", ")}`;
+        await this.settle(moved);
+        return `pressed ${args.key ?? args.value}\n\n${await this.pageText()}`;
+      }
+      if (tool === "browser_scroll") {
+        const to = String(args.to ?? args.direction ?? "").toLowerCase();
+        await this.pageEval(to === "top" || to === "up" ? "window.scrollTo(0, 0)" : to === "bottom" ? "window.scrollTo(0, document.body.scrollHeight)" : "window.scrollBy(0, Math.round(window.innerHeight * 0.9))");
+        await new Promise((res) => setTimeout(res, this.settleMs));
+        return this.pageText();
+      }
+      if (tool === "browser_back") {
+        const moved = nav();
+        await this.pageEval("history.back()");
+        await this.settle(moved);
+        return this.pageText();
+      }
+      if (tool === "browser_wait") {
+        const want = String(args.text ?? "").trim().toLowerCase();
+        const secs = Math.min(10, Math.max(0.2, Number(args.seconds ?? (want ? 10 : 2)) || 2));
+        const until = Date.now() + secs * 1000;
+        let seen = false;
+        do {
+          if (want && (await this.pageEval(`(document.body ? document.body.innerText : "").toLowerCase().includes(${JSON.stringify(want)})`))) {
+            seen = true;
+            break;
+          }
+          await new Promise((res) => setTimeout(res, want ? this.pollMs : secs * 1000));
+        } while (want && Date.now() < until);
+        return (want ? (seen ? `"${args.text}" is on the page\n\n` : `"${args.text}" did not appear in ${secs} s\n\n`) : "") + (await this.pageText());
       }
       if (tool === "browser_eval") {
-        const js = String(args.js ?? args.code ?? args.value ?? "");
-        if (js.trim().length === 0) return "ERROR: give the JavaScript as js";
-        let v;
+        const js = String(args.js ?? args.code ?? args.script ?? args.expression ?? args.value ?? "");
+        if (js.trim().length === 0) return 'ERROR: give the JavaScript, as {"js": "document.title"}';
+        // An expression's value comes back; statements run as the body of an async function (use return). What
+        // the script console.logs is collected and comes back when there is no value.
+        const wrap = (body) => `(async () => { const __l = []; const __o = console.log; console.log = (...a) => { __l.push(a.map((x) => (typeof x === "string" ? x : JSON.stringify(x))).join(" ")); }; try { const __v = await (async () => { ${body} })(); return JSON.stringify({ v: __v === undefined ? null : __v, l: __l }); } finally { console.log = __o; } })()`;
+        let raw;
         try {
-          v = await this.pageEval(js);
+          raw = await this.pageEval(wrap(`return (${js.replace(/;\s*$/, "")});`));
         } catch (first) {
-          // statements, or await at the top: run it as the body of an async function
-          v = await this.pageEval(`(async () => { ${js} })()`).catch(() => {
-            throw first;
-          });
+          if (!/SyntaxError/.test(String(first?.message))) throw first;
+          raw = await this.pageEval(wrap(js));
         }
-        return clip(typeof v === "string" ? v : JSON.stringify(v ?? null), 10000);
+        const r = JSON.parse(raw ?? '{"v": null, "l": []}');
+        const out = r.v !== null && r.v !== undefined ? (typeof r.v === "string" ? r.v : JSON.stringify(r.v)) : r.l.join("\n");
+        return clip(out || "(no value; end with an expression, or console.log what you want back)", 10000);
       }
       return `no such tool: ${tool}`;
     } catch (e) {
