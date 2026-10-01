@@ -733,7 +733,9 @@ test("Python: a script runs in the companion Worker beside the hot's files, what
       const body = JSON.parse(init.body);
       sent.push(body);
       if (body.code.includes("boom")) return new Response(JSON.stringify({ ok: false, out: "Traceback...\nZeroDivisionError", files: {} }));
-      return new Response(JSON.stringify({ ok: true, out: `ran with ${JSON.stringify(body.args)}\n`, files: { "out.csv": "a,b\n1,2\n", "../evil": "x" } }));
+      if (body.install.includes("nativepkg")) return new Response(JSON.stringify({ ok: false, out: "pip install failed: nativepkg has no pure-Python wheel", files: {}, installed: [] }));
+      const installed = [...new Set([...body.packages, ...body.install, ...(body.code.includes("import bs4") ? ["beautifulsoup4"] : [])])].sort();
+      return new Response(JSON.stringify({ ok: true, out: `ran with ${JSON.stringify(body.args)}\n`, files: body.code ? { "out.csv": "a,b\n1,2\n", "../evil": "x" } : {}, installed }));
     },
   };
   await w.req("POST", "/v1/hots", { goal: "first goal here" });
@@ -754,6 +756,15 @@ test("Python: a script runs in the companion Worker beside the hot's files, what
   assert.equal(sent.at(-1).code, "print(ARGS['n'] * 2)");
   assert.match(await run("run_skill", { name: "nope" }), /no skill named nope/);
   assert.match(await gary.workingMemory(), /YOUR SKILLS \(run_skill\):\n- double_it: doubles ARGS\['n'\]/);
+  // packages: what a script made the runner install is remembered and sent with every later script
+  await run("run_python", { code: "import bs4" });
+  assert.deepEqual(await gary.store.get("py_packages"), ["beautifulsoup4"]);
+  assert.equal(await run("pip_install", { packages: ["tidekit", "bad name!"] }), "installed. Your Python now has: beautifulsoup4, tidekit");
+  assert.deepEqual(sent.at(-1), { code: "", files: {}, args: null, packages: ["beautifulsoup4"], install: ["tidekit"] });
+  await run("run_python", { code: "print(1)" });
+  assert.deepEqual(sent.at(-1).packages, ["beautifulsoup4", "tidekit"]);
+  assert.match(await run("pip_install", { packages: ["nativepkg"] }), /^ERROR: pip install failed: nativepkg has no pure-Python wheel/);
+  assert.match(await run("pip_install", {}), /ERROR: name the packages/);
   // without the binding the tool says so in words instead of throwing
   delete w.env.PY;
   assert.match(await run("run_python", { code: "print(1)" }), /Python is not available/);
@@ -796,6 +807,7 @@ function fakeBrowser() {
           assert.equal(c.sessionId, "S1");
           const e = c.params.expression;
           if (e.includes("location.href")) return ok({ result: { value: JSON.stringify(b.page) } });
+          if (e.includes("a.result__a")) return ok({ result: { value: JSON.stringify(b.page.url.includes("html.duckduckgo.com") ? [{ title: "Tide tables", url: "https://tides.example/", snippet: "from the browser" }] : []) } });
           if (e.includes("throw")) return ok({ exceptionDetails: { text: "Uncaught", exception: { description: "Error: nope" } } });
           if (e === "1+1") return ok({ result: { value: 2 } });
           if (e.includes("no element matches") && e.includes('"missing"')) return ok({ result: { value: "no element matches" } });
@@ -912,6 +924,11 @@ test("web_search walks the keyless chain: a SearXNG instance that answers is rem
     assert.ok(hosts.includes("html.duckduckgo.com") && hosts.includes("www.bing.com") && hosts.includes("api.duckduckgo.com"));
     mode = "nothing";
     assert.match(await gary.runTool(cfg, "web_search", { query: "tides" }, ""), /^ERROR: no search engine answered \(/);
+    // with a browser, a search every engine refused is made through it
+    w.env.BROWSER = fakeBrowser();
+    assert.equal(await gary.runTool(cfg, "web_search", { query: "tide tables" }, ""), '1 results for "tide tables" (DuckDuckGo, through the browser):\n1. Tide tables\n   https://tides.example/\n   from the browser');
+    delete w.env.BROWSER;
+    gary.br = null;
     assert.match(await gary.runTool(cfg, "web_search", {}, ""), /ERROR: give the words/);
   } finally {
     globalThis.fetch = realFetch;
