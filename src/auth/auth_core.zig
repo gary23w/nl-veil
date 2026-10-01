@@ -334,7 +334,7 @@ pub const Auth = struct {
     pub fn setPassword(self: *Auth, email: []const u8, password: []const u8) bool {
         if (password.len < 8 or password.len > 200) return false;
         self.mu.lockUncancelable(self.nb.io);
-        var u = self.users.get(email) orelse {
+        const u = self.users.getPtr(email) orelse {
             self.mu.unlock(self.nb.io);
             return false;
         };
@@ -351,13 +351,38 @@ pub const Auth = struct {
             self.mu.unlock(self.nb.io);
             return false;
         };
-        self.gpa.free(u.pwhash);
+        var candidate = u.*;
+        candidate.pwhash = dup;
+        self.persistUser(candidate) catch {
+            self.gpa.free(dup);
+            self.mu.unlock(self.nb.io);
+            return false;
+        };
+        const old_hash = u.pwhash;
         u.pwhash = dup;
-        self.persistUser(u) catch {};
-        self.users.put(self.gpa, u.email, u) catch {};
+        self.gpa.free(old_hash);
         self.mu.unlock(self.nb.io);
         self.dropSessions(email);
         return true;
+    }
+
+    /// Before the listener starts, confirm that the admin record on disk agrees with the password
+    /// hash in memory. A Neuron write may fail or report success without storing a record, so a
+    /// successful in-memory password check alone cannot establish that a restart stays secure.
+    pub fn adminRecordPersisted(self: *Auth, email: []const u8) !bool {
+        self.mu.lockUncancelable(self.nb.io);
+        defer self.mu.unlock(self.nb.io);
+        const u = self.users.get(email) orelse return false;
+        var scope_buf: [16]u8 = undefined;
+        const enc = (try self.nb.get(userScope(email, &scope_buf))) orelse return false;
+        defer self.gpa.free(enc);
+        const json = try unb64(self.gpa, enc);
+        defer self.gpa.free(json);
+        const parsed = try std.json.parseFromSlice(struct { id: u64, email: []const u8, pwhash: []const u8 }, self.gpa, json, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        return parsed.value.id == u.id and
+            std.mem.eql(u8, parsed.value.email, email) and
+            std.mem.eql(u8, parsed.value.pwhash, u.pwhash);
     }
 
     /// Boot uses this to distinguish a password mismatch from a verifier failure. Login deliberately
