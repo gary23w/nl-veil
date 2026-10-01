@@ -328,8 +328,8 @@ pub fn isCommand(sub: []const u8) bool {
         "sched",     "hub",           "doctor", "health",  "desktop",   "desk",
         "help",      "--help",        "-h",     "version", "--version", "exec-tool",
         "sync-read", "sync-manifest", "rag",    "themes",  "plugins",   "plug",
-        "model",     "dataset",       "set",    "lineage",   "swarm",     "--swarm",
-        "configure", "--configure",
+        "model",     "dataset",       "set",    "lineage", "swarm",     "--swarm",
+        "configure", "--configure",   "goal",
     };
     for (verbs) |v| if (std.mem.eql(u8, sub, v)) return true;
     return false;
@@ -364,6 +364,7 @@ pub fn dispatch(ctx: *Ctx, sub: []const u8, args: []const []const u8) u8 {
     if (std.mem.eql(u8, sub, "events") or std.mem.eql(u8, sub, "logs") or std.mem.eql(u8, sub, "watch"))
         return cmdEvents(ctx, args);
     if (std.mem.eql(u8, sub, "chat")) return cmdChat(ctx, args);
+    if (std.mem.eql(u8, sub, "goal")) return cmdGoal(ctx, args);
     if (std.mem.eql(u8, sub, "sched")) return cmdSched(ctx, args);
     if (std.mem.eql(u8, sub, "hub")) return cmdHub(ctx, args);
     if (std.mem.eql(u8, sub, "doctor") or std.mem.eql(u8, sub, "health")) return cmdDoctor(ctx, args);
@@ -1376,6 +1377,9 @@ fn cmdHelp() u8 {
         \\
         \\CHAT (the server-side veil brain)
         \\  chat [conv]                  interactive chat; steer/stop a running turn inline
+        \\  goal "<what to achieve>"     a GOAL LOOP: pick the next best improvement, do it, measure it, repeat;
+        \\      [--budget N] [--forever] [--check "<cmd>"] [--conv id]   ends when achieved, spent, or nothing improves
+        \\                               in any chat: /goal <text>   /goal   /goal stop   /goal resume
         \\
         \\BUILT-IN MODEL (the-veil-12b served by the server itself — no external runtime)
         \\  model status                 weights + engine + any download in flight
@@ -1734,6 +1738,53 @@ const chat_cli = @import("cli/chat.zig");
 const hub_cli = @import("cli/hub.zig");
 fn cmdChat(ctx: *Ctx, args: []const []const u8) u8 {
     return chat_cli.run(ctx, args, call, followConv, ensureServer, unreachable_msg);
+}
+
+/// `veil goal "<what to achieve>" [--budget N] [--forever] [--check "<command>"] [--conv <id>]` - start a GOAL LOOP
+/// (worker/chat/goal.zig) in a chat conversation and follow it to its end. `veil goal status|stop|resume --conv <id>`
+/// manages one. It is `veil chat --say "/goal ..." --once`: the same command works typed into any chat.
+fn cmdGoal(ctx: *Ctx, args: []const []const u8) u8 {
+    var text: []const u8 = "";
+    var conv: []const u8 = "";
+    var budget: []const u8 = "";
+    var check: []const u8 = "";
+    var forever = false;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+        if (flagVal(args, &i, a, "--conv")) |v| conv = v else if (flagVal(args, &i, a, "--budget")) |v| budget = v else if (flagVal(args, &i, a, "--check")) |v| check = v else if (std.mem.eql(u8, a, "--forever")) {
+            forever = true;
+        } else if (a.len > 0 and a[0] != '-' and text.len == 0) {
+            text = a;
+        }
+    }
+    if (text.len == 0) {
+        out("usage: veil goal \"<what to achieve>\" [--budget N] [--forever] [--check \"<command>\"] [--conv <id>]\n       veil goal status|stop|resume --conv <id>\n", .{});
+        return 1;
+    }
+    var mb: std.ArrayListUnmanaged(u8) = .empty;
+    defer mb.deinit(ctx.gpa);
+    mb.appendSlice(ctx.gpa, "/goal ") catch return 1;
+    mb.appendSlice(ctx.gpa, text) catch return 1;
+    if (budget.len > 0) {
+        mb.appendSlice(ctx.gpa, " --budget ") catch return 1;
+        mb.appendSlice(ctx.gpa, budget) catch return 1;
+    }
+    if (forever) mb.appendSlice(ctx.gpa, " --forever") catch return 1;
+    if (check.len > 0) { // last: --check takes the rest of the line
+        mb.appendSlice(ctx.gpa, " --check ") catch return 1;
+        mb.appendSlice(ctx.gpa, check) catch return 1;
+    }
+    var argv: [4][]const u8 = undefined;
+    argv[0] = "--say";
+    argv[1] = mb.items;
+    argv[2] = "--once";
+    var n: usize = 3;
+    if (conv.len > 0) {
+        argv[3] = conv;
+        n = 4;
+    }
+    return chat_cli.run(ctx, argv[0..n], call, followConv, ensureServer, unreachable_msg);
 }
 fn cmdHub(ctx: *Ctx, args: []const []const u8) u8 {
     return hub_cli.run(ctx, args, call);

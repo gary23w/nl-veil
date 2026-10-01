@@ -46,6 +46,7 @@ test {
     _ = @import("worker/chat/engine.zig");
     _ = @import("worker/chat/overlay.zig"); // recall overlay: the per-thought working field, refractory + firing
     _ = @import("worker/chat/paths.zig");
+    _ = @import("worker/chat/goal.zig"); // goal mode: the /goal grammar, the iteration log, the verdict and stop rules
     _ = @import("worker/chat/plan.zig");
     _ = @import("worker/chat/service.zig");
     _ = @import("worker/chat/sync.zig");

@@ -1022,6 +1022,11 @@ pub const Store = struct {
     //                              DONE, failures, caps, cast pauses, and questions all reset their budget
     //                              instead of stopping; runs until the user clicks it off or hits Stop
     //                              (runtime only; afk implies chat_loop armed)
+    // GOAL MODE as the server reports it (`goal` frames, src/worker/chat/goal.zig): while a goal turn is running the
+    // status row shows these in place of the auto-loop label (chat thread writes, UI reads).
+    chat_goal_live: bool = false,
+    chat_goal_iter: u32 = 0,
+    chat_goal_improved: u32 = 0,
     goto_conv: [64]u8 = undefined, // POLLER→RENDER hand-off: open this conversation in Chat (a run-now's minted
     goto_conv_len: u8 = 0, //         scheduled_* conv); the render loop consumes it once per set
     chat_status: [96]u8 = [_]u8{0} ** 96, // "thinking…" / "casting…" / "watching r3 42%"

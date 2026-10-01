@@ -708,6 +708,9 @@ SWARMS
 
 CHAT (the server-side veil brain)
   chat [conv]                  interactive REPL; a line typed mid-turn steers the running turn
+  goal "<what to achieve>"     a GOAL LOOP: pick the next best improvement, do it, measure it, repeat;
+      [--budget N] [--forever] [--check "<cmd>"] [--conv id]   ends when achieved, spent, or nothing improves
+                               in any chat: /goal <text>   /goal   /goal stop   /goal resume
 
 BUILT-IN MODEL (the-veil-12b, served in-process — no external runtime)
   model status                 weights + engine + any download in flight
@@ -1012,6 +1015,17 @@ that shows every running hive round-by-round, and a **build console**.
   something and the turn casts a hive, watches it, and folds the deliverables back into the
   conversation — with an **auto-loop** tier (armed from the desk, driven server-side) that keeps a long
   build moving without you re-prompting each round.
+**Goal mode: `/goal <what to achieve>`.** The auto-loop with a goal it keeps. Type it in any chat - the desktop,
+the web app, `veil chat` - or run `veil goal "<text>"`. Each iteration **picks** the best improvement not yet
+tried, **does** it, and **measures** it: a judge reads the step's real tool results, never the assistant's claim,
+and answers improved / same / regressed; when a count was printed (tests passed, checks green) the comparison is
+the engine's own arithmetic. Every iteration is logged, so the next pick sees what was tried and what it changed.
+The loop ends on its own when the goal is **achieved**, when its **budget** is spent (`--budget N`, 25 by
+default), or on a **plateau**: three iterations in a row that improved nothing. `/goal` shows where it stands;
+`/goal stop`, `/goal resume`, `/goal budget N` and `/goal check <command>` tune it; `--forever` removes the
+finish line. The AFK tier below is now exactly that - a forever goal - so it keeps its promise and gains the
+log and the measurement.
+
 - **AFK: run until you stop it.** A second tier for leaving the machine. It never asks whether the goal
   is complete (a session you opted into running indefinitely has no end state to ask about), the
   **prompting model writes each re-drive** from what the transcript shows was just built rather than
