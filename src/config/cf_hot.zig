@@ -86,6 +86,10 @@ const State = struct {
     browser: bool = false, // the runtime has Cloudflare's browser bound (browser_*)
     neuron: bool = false, // the runtime carries neuron-db (recall by meaning, stances, mood)
     tools_note: []const u8 = "", // why one of them is missing, in Cloudflare's words
+    py_rung: u8 = 0, // which PY_NATIVE set the Python Worker was uploaded with
+    py_check: u8 = 0, // how many more times to ask whether that Python starts; 0 = settled
+    py_fails: u8 = 0, // answers in a row saying it does not
+    py_native: []const []const u8 = &.{}, // the native packages it came up with, as it reports them
     local: []const []const u8 = &.{}, // hots the owner allowed onto this machine, by name
     last_error: []const u8 = "",
 };
@@ -236,14 +240,43 @@ fn uploadBody(a: std.mem.Allocator, boundary: []const u8, fresh: bool, x: Extras
 
 /// The Python Worker's upload: its metadata (the python_workers flag is what makes a .py module a Worker) and the
 /// module. It has no bindings, no secret and no public address; only the runtime's service binding reaches it.
-fn pyUploadBody(a: std.mem.Allocator, boundary: []const u8) ![]u8 {
+fn pyUploadBody(a: std.mem.Allocator, boundary: []const u8, native: []const []const u8) ![]u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     try out.print(a, "--{s}\r\nContent-Disposition: form-data; name=\"metadata\"; filename=\"metadata.json\"\r\nContent-Type: application/json\r\n\r\n", .{boundary});
     try out.appendSlice(a, "{\"main_module\":\"" ++ PY_MODULE ++ "\",\"compatibility_date\":\"" ++ COMPAT_DATE ++ "\",\"compatibility_flags\":[\"python_workers\"]}");
     try out.print(a, "\r\n--{s}\r\nContent-Disposition: form-data; name=\"" ++ PY_MODULE ++ "\"; filename=\"" ++ PY_MODULE ++ "\"\r\nContent-Type: text/x-python\r\n\r\n", .{boundary});
     try out.appendSlice(a, HOT_PY);
+    // A package with native code cannot be fetched by a running script; it is asked for here, by name, as an
+    // empty module of the requirement type, and Cloudflare supplies its own build of it.
+    for (native) |name| try out.print(a, "\r\n--{s}\r\nContent-Disposition: form-data; name=\"{s}\"; filename=\"{s}\"\r\nContent-Type: text/x-python-requirement\r\n\r\n", .{ boundary, name, name });
     try out.print(a, "\r\n--{s}--\r\n", .{boundary});
     return out.items;
+}
+
+/// The native packages asked for with the Python Worker, most first. An upload Cloudflare refuses, or a Python
+/// that then does not start (checkPython), falls to the next set; the last is the plain Python.
+const PY_NATIVE = [_][]const []const u8{
+    &.{ "numpy", "regex", "pandas", "matplotlib", "pillow" },
+    &.{ "numpy", "regex" },
+    &.{},
+};
+const PY_CHECKS = 10;
+
+/// Upload the Python Worker with the first set from `from` on that Cloudflare takes. The set's index, or null
+/// with the first refusal in `why`.
+fn uploadPython(app: *App, a: std.mem.Allocator, url: []const u8, key: []const u8, boundary: []const u8, ctype: []const u8, from: usize, why: *[]const u8) ?u8 {
+    var r: usize = from;
+    while (r < PY_NATIVE.len) : (r += 1) {
+        const body = pyUploadBody(a, boundary, PY_NATIVE[r]) catch return null;
+        const up = api(app, a, "PUT", url, body, key, ctype) orelse {
+            if (why.len == 0) why.* = "the Cloudflare API did not answer its upload";
+            return null;
+        };
+        const e = firstError(a, up);
+        if (e.len == 0) return @intCast(r);
+        if (why.len == 0) why.* = e;
+    }
+    return null;
 }
 
 const Tok = struct { key: []const u8, account_id: []const u8 };
@@ -303,13 +336,10 @@ fn ensureRuntime(app: *App, a: std.mem.Allocator, uid: u64, tok: Tok, st: *State
     // it (or the browser, below) still gets a hot - without that family of tools, and told why.
     var note: []const u8 = "";
     const py_url = std.fmt.allocPrint(a, "{s}/accounts/{s}/workers/scripts/" ++ PY_SCRIPT, .{ root, acct }) catch return "out of memory";
-    const py_body = pyUploadBody(a, boundary) catch return "out of memory";
-    var python = false;
-    if (api(app, a, "PUT", py_url, py_body, tok.key, ctype)) |r| {
-        const e = firstError(a, r);
-        python = e.len == 0;
-        if (!python) note = std.fmt.allocPrint(a, "Python is off: {s}", .{e}) catch "Python is off";
-    } else note = "Python is off: the Cloudflare API did not answer its upload";
+    var py_why: []const u8 = "";
+    const py_rung = uploadPython(app, a, py_url, tok.key, boundary, ctype, 0, &py_why);
+    const python = py_rung != null;
+    if (!python) note = std.fmt.allocPrint(a, "Python is off: {s}", .{py_why}) catch "Python is off";
 
     // The runtime, asking for everything first. The settings read above is only a hint (a login may lack its
     // scope), so each set of bindings is tried with and without the class migration; the first upload Cloudflare
@@ -342,6 +372,10 @@ fn ensureRuntime(app: *App, a: std.mem.Allocator, uid: u64, tok: Tok, st: *State
     }
     const have = got orelse return explain(a, "uploading the hot runtime", up_err);
     st.python = have.python;
+    st.py_rung = py_rung orelse 0;
+    st.py_check = if (have.python and st.py_rung + 1 < PY_NATIVE.len) PY_CHECKS else 0;
+    st.py_fails = 0;
+    st.py_native = &.{};
     st.browser = have.browser;
     st.neuron = have.neuron;
     st.tools_note = if (have.python and have.browser and have.neuron) "" else note;
@@ -1116,6 +1150,48 @@ fn upgradeRuntime(app: *App, a: std.mem.Allocator, uid: u64, st: *State) void {
 
 var upgrade_failed_s: std.atomic.Value(i64) = .init(0);
 
+/// After an upload that asked for native packages: ask the runtime whether its Python starts. Yes settles it
+/// and records what it came up with. No, twice in a row, uploads the Python Worker again with the next smaller
+/// set. No answer at all (a new deployment takes a minute) is asked again, PY_CHECKS times at most.
+fn checkPython(app: *App, a: std.mem.Allocator, uid: u64, st: *State) void {
+    if (st.py_check == 0 or !st.python or st.url.len == 0) return;
+    const tok = tokOf(app, uid, a) orelse return;
+    if (!std.mem.eql(u8, tok.account_id, st.account)) return;
+    checkPythonAs(app, a, uid, tok, st);
+}
+
+fn checkPythonAs(app: *App, a: std.mem.Allocator, uid: u64, tok: Tok, st: *State) void {
+    st.py_check -= 1;
+    defer writeState(app, uid, st.*);
+    const raw = hotCall(app, a, uid, st.*, "GET", "/v1/python", "") orelse return;
+    const Caps = struct { ok: bool = false, python: bool = false, native: []const []const u8 = &.{}, @"error": []const u8 = "" };
+    const caps = std.json.parseFromSliceLeaky(Caps, a, raw, .{ .ignore_unknown_fields = true }) catch return;
+    if (!caps.ok) return; // not the runtime's answer yet
+    if (caps.python) {
+        st.py_native = caps.native;
+        st.py_check = 0;
+        st.py_fails = 0;
+        return;
+    }
+    st.py_fails += 1;
+    if (st.py_fails < 2) return;
+    st.py_fails = 0;
+    if (st.py_rung + 1 >= PY_NATIVE.len) {
+        st.py_check = 0;
+        return;
+    }
+    log.warn("hot Python for u{d} does not start with its packages ({s}); uploading it with fewer", .{ uid, caps.@"error" });
+    var bb: [8]u8 = undefined;
+    app.io.random(&bb);
+    const boundary = std.fmt.allocPrint(a, "----veilhot{s}", .{std.fmt.bytesToHex(bb, .lower)}) catch return;
+    const ctype = std.fmt.allocPrint(a, "multipart/form-data; boundary={s}", .{boundary}) catch return;
+    const py_url = std.fmt.allocPrint(a, "{s}/accounts/{s}/workers/scripts/" ++ PY_SCRIPT, .{ app.cf_api_root, st.account }) catch return;
+    var why: []const u8 = "";
+    const rung = uploadPython(app, a, py_url, tok.key, boundary, ctype, st.py_rung + 1, &why) orelse return;
+    st.py_rung = rung;
+    st.py_check = if (rung + 1 < PY_NATIVE.len) PY_CHECKS else 0;
+}
+
 /// One pass over every user with hots: run the jobs of those allowed onto this machine, and (when `mirror`) bring
 /// each hot's local folder up to date, first replacing a runtime an older veil uploaded.
 fn tick(app: *App, mirror: bool) void {
@@ -1140,6 +1216,7 @@ fn tick(app: *App, mirror: bool) void {
         if (!app.auth.isAdmin(owner)) continue;
         if (mirror) {
             upgradeRuntime(app, a, uid, &st);
+            checkPython(app, a, uid, &st);
             mirrorUser(app, a, uid, st);
         }
         if (backend_on) for (st.local) |name| if (validName(name)) {
@@ -1283,7 +1360,11 @@ test "the upload carries the bindings and keeps the secret; the class migration 
     const again_meta = again[0..std.mem.indexOf(u8, again, "Content-Type: application/javascript+module").?];
     try tt.expect(std.mem.indexOf(u8, again_meta, "\"service\"") == null and std.mem.indexOf(u8, again_meta, "\"browser\"") == null);
     // the Python Worker: the flag that makes a .py module a Worker, and the module as Python
-    const py = try pyUploadBody(a, "----b");
+    const py = try pyUploadBody(a, "----b", PY_NATIVE[0]);
+    // the native packages ride as empty modules of the requirement type; the plain upload names none
+    try tt.expect(std.mem.indexOf(u8, py, "name=\"numpy\"; filename=\"numpy\"\r\nContent-Type: text/x-python-requirement\r\n\r\n\r\n--") != null);
+    try tt.expect(std.mem.indexOf(u8, try pyUploadBody(a, "----b", PY_NATIVE[PY_NATIVE.len - 1]), "x-python-requirement") == null);
+    try tt.expectEqual(@as(usize, 0), PY_NATIVE[PY_NATIVE.len - 1].len);
     try tt.expect(std.mem.indexOf(u8, py, "\"compatibility_flags\":[\"python_workers\"]") != null);
     try tt.expect(std.mem.indexOf(u8, py, "Content-Type: text/x-python\r\n\r\n" ++ HOT_PY) != null);
     try tt.expect(std.mem.indexOf(u8, HOT_PY, "class Default(WorkerEntrypoint):") != null);
@@ -1567,4 +1648,59 @@ test "removing the Worker forgets the deployment, every grant to this machine, a
     try tt.expectEqualStrings("", after.url); // forgotten: the next deploy uploads again
     try tt.expectEqual(@as(usize, 0), after.local.len); // no grant outlives its hot
     try tt.expectEqual(@as(u32, 5), after.token_gen); // and the removed script's token is never valid again
+}
+
+test "a Python that does not start with its native packages is uploaded again with fewer; one that starts is settled with what it has" {
+    const gpa = tt.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var ta = try http.testApp(gpa, io, "zig-cfhot-pycheck-tmp");
+    defer ta.deinit();
+    if (!curlRuns(gpa, io)) return error.SkipZigTest;
+    const w = fakehttp.wire;
+    const routes = [_]fakehttp.Route{
+        // not the runtime's answer (a deployment still coming up), then "no" twice, then "yes"
+        .{ .method = "GET", .path = "/v1/python", .reply = w("<html>starting</html>"), .times = 1 },
+        .{ .method = "GET", .path = "/v1/python", .reply = w("{\"ok\":true,\"python\":false,\"native\":[],\"error\":\"Worker exceeded its startup limits\"}"), .times = 2 },
+        .{ .method = "GET", .path = "/v1/python", .reply = w("{\"ok\":true,\"python\":true,\"native\":[\"numpy\",\"regex\"],\"error\":\"\"}") },
+        .{ .method = "PUT", .path = "/workers/scripts/veil-hots-py", .reply = StandIn.ok },
+    };
+    var srv: fakehttp.Server = undefined;
+    try srv.startRouted(io, &routes, StandIn.no_script);
+    var running = true;
+    defer if (running) srv.stop();
+    var rb: [80]u8 = undefined;
+    ta.app.cf_api_root = try std.fmt.bufPrint(&rb, "http://127.0.0.1:{d}/client/v4", .{srv.port});
+    var ub: [80]u8 = undefined;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tok: Tok = .{ .key = "oauth-bearer", .account_id = "acct" };
+    var st: State = .{ .account = "acct", .url = try std.fmt.bufPrint(&ub, "http://127.0.0.1:{d}", .{srv.port}), .python = true, .py_rung = 0, .py_check = PY_CHECKS };
+
+    checkPythonAs(&ta.app, a, 1, tok, &st); // no answer worth the name: asked again later, nothing uploaded
+    try tt.expectEqual(@as(u8, PY_CHECKS - 1), st.py_check);
+    try tt.expectEqual(@as(u8, 0), st.py_rung);
+    checkPythonAs(&ta.app, a, 1, tok, &st); // one "no" is not enough
+    try tt.expectEqual(@as(u8, 1), st.py_fails);
+    try tt.expectEqual(@as(usize, 0), srv.countCalls("PUT", "/accounts/acct/workers/scripts/veil-hots-py"));
+    checkPythonAs(&ta.app, a, 1, tok, &st); // the second is: the next smaller set goes up, and is checked in turn
+    try tt.expectEqual(@as(u8, 1), st.py_rung);
+    try tt.expectEqual(@as(u8, PY_CHECKS), st.py_check);
+    try tt.expectEqual(@as(u8, 0), st.py_fails);
+    checkPythonAs(&ta.app, a, 1, tok, &st); // it starts: settled
+    try tt.expectEqual(@as(u8, 0), st.py_check);
+    try tt.expectEqual(@as(usize, 2), st.py_native.len);
+    try tt.expectEqualStrings("numpy", st.py_native[0]);
+    srv.stop();
+    running = false;
+    try tt.expectEqual(@as(usize, 1), srv.countCalls("PUT", "/accounts/acct/workers/scripts/veil-hots-py"));
+    try tt.expectEqual(@as(usize, 4), srv.countCalls("GET", "/v1/python"));
+    const kept = readState(&ta.app, 1, a); // and the state file says so
+    try tt.expectEqual(@as(u8, 1), kept.py_rung);
+    try tt.expectEqual(@as(usize, 2), kept.py_native.len);
+    // settled: nothing more is asked
+    checkPython(&ta.app, a, 1, &st);
+    try tt.expectEqual(@as(u8, 0), st.py_check);
 }

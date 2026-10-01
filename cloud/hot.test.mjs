@@ -760,7 +760,7 @@ test("Python: a script runs in the companion Worker beside the hot's files, what
   await run("run_python", { code: "import bs4" });
   assert.deepEqual(await gary.store.get("py_packages"), ["beautifulsoup4"]);
   assert.equal(await run("pip_install", { packages: ["tidekit", "bad name!"] }), "installed. Your Python now has: beautifulsoup4, tidekit");
-  assert.deepEqual(sent.at(-1), { code: "", files: {}, args: null, packages: ["beautifulsoup4"], install: ["tidekit"] });
+  assert.deepEqual(sent.at(-1), { code: "", files: {}, args: null, packages: ["beautifulsoup4"], install: ["tidekit"], skip: [] });
   await run("run_python", { code: "print(1)" });
   assert.deepEqual(sent.at(-1).packages, ["beautifulsoup4", "tidekit"]);
   assert.match(await run("pip_install", { packages: ["nativepkg"] }), /^ERROR: pip install failed: nativepkg has no pure-Python wheel/);
@@ -768,6 +768,67 @@ test("Python: a script runs in the companion Worker beside the hot's files, what
   // without the binding the tool says so in words instead of throwing
   delete w.env.PY;
   assert.match(await run("run_python", { code: "print(1)" }), /Python is not available/);
+});
+
+test("Python as it is: the hot is told what its Python has and cannot have, a refused package is never looked up twice, and a failed attempt is graded against what stood before", async () => {
+  const sent = [];
+  const w = world((messages) => {
+    const all = said(messages);
+    if (all.includes("You grade ONE iteration")) return "SAME | score: none | evidence: the install failed, nothing changed";
+    if (all.includes("You improve an autonomous agent")) return "NONE";
+    if (all.includes("THIS ITERATION'S STEP")) return all.includes("TOOL RESULT") || all.includes("has no pure-Python wheel") ? '{"final": "could not chart it"}' : '{"tool": "run_python", "args": {"code": "import matplotlib"}}';
+    return "Chart the table with matplotlib.";
+  });
+  let native = [];
+  w.env.PY = {
+    fetch: async (url, init) => {
+      const body = JSON.parse(init.body);
+      sent.push(body);
+      if (body.caps) return new Response(JSON.stringify({ ok: true, native, python: "3.12.7" }));
+      return new Response(JSON.stringify({ ok: false, out: "ModuleNotFoundError: No module named 'matplotlib'\n(matplotlib was looked up on PyPI: matplotlib has no pure-Python wheel (it needs native code))", files: {}, installed: [], native, unavailable: ["matplotlib", "oddnative"] }));
+    },
+  };
+  // the server's question after an upload: does the Python start, and with what
+  assert.deepEqual((await w.req("GET", "/v1/python")).body, { ok: true, python: true, native: [], error: "" });
+  await w.req("POST", "/v1/hots", { goal: "chart the tide table" });
+  await w.tick("Gary");
+  const gary = w.hot("Gary");
+  // before its first step the hot asked its Python what it is, once
+  assert.equal(sent.filter((b) => b.caps).length, 2);
+  assert.deepEqual(await gary.store.get("py_native"), []);
+  const pick = said(w.asked.find((q) => said(q.input.messages).includes("GOAL LOOP")).input.messages);
+  assert.match(pick, /YOUR PYTHON: the standard library, requests and urllib\. Any other pure-Python package installs/);
+  assert.match(pick, /NOT here and not installable \(native code\): numpy, pandas, matplotlib, /);
+  assert.match(pick, /choose only a step your tools and YOUR PYTHON as listed above can carry out/);
+  assert.match(pick, /a checklist file of concrete items a tool can verify/);
+  // what the runner refused is kept, named in the next prompt, and sent along so it is not looked up again
+  assert.deepEqual(await gary.store.get("py_missing"), ["matplotlib", "oddnative"]);
+  assert.match(await gary.workingMemory(), /not installable \(native code\): .*oddnative - never choose a step that needs one/);
+  // the judge is told a failed attempt is SAME, and sees the iterations before this one
+  const judge = w.asked.find((q) => said(q.input.messages).includes("You grade ONE iteration"));
+  assert.match(said(judge.input.messages), /left everything as it was is SAME, not REGRESSED/);
+  assert.match(said(judge.input.messages), /A first measurement is a baseline/);
+  assert.match(said(judge.input.messages), /EARLIER ITERATIONS \(what stood before this one\):\n  \(none yet\)/);
+  assert.equal((await gary.store.get("goal")).flat, 1);
+  assert.match(await gary.store.get("mood"), /^steady/); // a failed attempt is not "made things worse"
+  await w.tick("Gary");
+  assert.deepEqual(sent.at(-1).skip, ["matplotlib", "oddnative"]);
+  assert.equal(sent.filter((b) => b.caps).length, 2); // not asked again
+  const judge2 = w.asked.filter((q) => said(q.input.messages).includes("You grade ONE iteration")).at(-1);
+  assert.match(said(judge2.input.messages), /EARLIER ITERATIONS \(what stood before this one\):\n  1\. same: Chart the table with matplotlib\./);
+  // a Python uploaded with native packages says so; the hot's prompt follows, and they leave the cannot-have list
+  native = ["matplotlib", "numpy"];
+  await gary.runTool(await gary.store.get("cfg"), "run_python", { code: "import matplotlib" }, "");
+  assert.deepEqual(await gary.store.get("py_native"), ["matplotlib", "numpy"]);
+  assert.deepEqual(await gary.store.get("py_missing"), ["oddnative"]);
+  const mem = await gary.workingMemory();
+  assert.match(mem, /and these native packages: matplotlib, numpy\./);
+  assert.doesNotMatch(mem, /not installable \(native code\): [^-]*\b(numpy|matplotlib)\b/);
+  // a Python Worker that does not start is reported as such, in words
+  w.env.PY = { fetch: async () => { throw new Error("Worker threw exception"); } };
+  assert.deepEqual((await w.req("GET", "/v1/python")).body, { ok: true, python: false, native: [], error: "Worker threw exception" });
+  delete w.env.PY;
+  assert.equal((await w.req("GET", "/v1/python")).body.python, false);
 });
 
 /// A stand-in for Cloudflare's browser binding: one session and a small site of pages, each a text and a list of

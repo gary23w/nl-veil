@@ -25,6 +25,7 @@
 import ast
 import asyncio
 import contextlib
+import importlib.util
 import inspect
 import io
 import json
@@ -65,6 +66,46 @@ SITE = tempfile.mkdtemp(prefix="hotsite")  # where wheels are unpacked; lives as
 if SITE not in sys.path:
     sys.path.insert(0, SITE)
 INSTALLED = {}  # PyPI name (lowercase) -> version
+UNAVAILABLE = {}  # PyPI name (lowercase) -> 1: looked up, needs native code, cannot be had here
+
+# Packages with native code. One is here only when the Worker was uploaded with it; PyPI name -> import name.
+NATIVE = {"numpy": "numpy", "pandas": "pandas", "matplotlib": "matplotlib", "regex": "regex", "pillow": "PIL", "scipy": "scipy", "scikit-learn": "sklearn"}
+# What to do instead of a native package that is not here, said with the refusal.
+INSTEAD = {
+    "matplotlib": "For a chart, write the SVG or HTML text yourself and save it as a .svg or .html file.",
+    "pillow": "Images cannot be drawn here; write SVG text and save it as a .svg file.",
+    "numpy": "Use lists with the math and statistics modules.",
+    "scipy": "Use lists with the math and statistics modules.",
+    "pandas": "Use the csv and json modules with lists and dicts.",
+    "regex": "Use the re module.",
+    "scikit-learn": "Compute the measure yourself with sets, math and statistics.",
+    "spacy": "For text work use re, collections.Counter, difflib and string methods.",
+    "gensim": "For text work use re, collections.Counter, difflib and string methods.",
+}
+
+
+def _has(mod):
+    """Whether `mod` is part of this Python itself - not something unpacked into SITE by an install."""
+    try:
+        spec = importlib.util.find_spec(mod)
+    except (ImportError, ValueError, AttributeError):
+        return False
+    if spec is None:
+        return False
+    where = list(getattr(spec, "submodule_search_locations", None) or []) + [getattr(spec, "origin", None) or ""]
+    return not any(str(w).startswith(SITE) for w in where)
+
+
+def _caps():
+    """The native packages this Python was uploaded with."""
+    return sorted(n for n, mod in NATIVE.items() if _has(mod))
+
+
+def _native_words(name):
+    return "%s has no pure-Python wheel (it needs native code): it cannot be installed in this Python, which runs inside a Worker. %s" % (
+        name,
+        INSTEAD.get(_key(name), "Use the standard library or a pure-Python package."),
+    )
 
 
 class _NeedFetch(BaseException):
@@ -292,6 +333,10 @@ async def _install(name, seen, log):
     if k in INSTALLED or k in seen or k in SHIMMED:
         return
     seen.add(k)
+    if _has(NATIVE.get(k, k.replace("-", "_"))):
+        return  # part of this Python already: the standard library, or a package the Worker was uploaded with
+    if k in UNAVAILABLE:
+        raise RuntimeError(_native_words(name))  # looked up before: no second trip to PyPI
     if len(INSTALLED) >= PACKAGES_MAX:
         raise RuntimeError("%d packages are installed already; that is this Python's limit" % PACKAGES_MAX)
     status, _h, body = await _fetch("GET", PYPI.format(name), {"accept": "application/json"}, None)
@@ -302,7 +347,8 @@ async def _install(name, seen, log):
     meta = json.loads(body)
     wheel = next((f for f in meta.get("urls", []) if f.get("packagetype") == "bdist_wheel" and f.get("filename", "").endswith("-none-any.whl")), None)
     if wheel is None:
-        raise RuntimeError("%s has no pure-Python wheel (it needs native code): it cannot be installed in this Python, which runs inside a Worker. Use the standard library or a pure-Python package" % name)
+        UNAVAILABLE[k] = 1
+        raise RuntimeError(_native_words(name))
     if wheel.get("size", 0) > WHEEL_MAX:
         raise RuntimeError("%s is too large to install here (%d MB)" % (name, wheel["size"] >> 20))
     status, _h, data = await _fetch("GET", wheel["url"], {}, None)
@@ -317,8 +363,14 @@ async def _install(name, seen, log):
     log.append("%s %s" % (name, INSTALLED[k]))
     for spec in meta.get("info", {}).get("requires_dist") or []:
         dep = _dist_name(spec)
-        if dep:
+        if not dep:
+            continue
+        # A requirement that cannot be had does not take the package with it: the package is there, and the
+        # parts of it that need the requirement fail when they are used, which the note says up front.
+        try:
             await _install(dep, seen, log)
+        except RuntimeError as e:
+            log.append("(%s is installed WITHOUT %s, which it requires: %s)" % (name, dep, str(e).split(":")[0]))
 
 
 def _pip_main(args=None):
@@ -400,8 +452,13 @@ def _own_trace():
 
 async def run(data):
     """Run one script. Pure of the Worker runtime, so a test can call it."""
+    if data.get("caps"):
+        return {"ok": True, "native": _caps(), "python": sys.version.split()[0]}
     code = data.get("code") or ""
     files = data.get("files") or {}
+    for name in data.get("skip") or []:
+        if isinstance(name, str) and name:
+            UNAVAILABLE.setdefault(_key(name), 1)
     notes = []  # what was installed for this script, said once at the top of its output
     _HTTP_CACHE.clear()
     work = tempfile.mkdtemp(prefix="hot")
@@ -424,7 +481,7 @@ async def run(data):
                 await _install(name, seen, notes)
     except Exception as e:
         if data.get("install"):
-            return {"ok": False, "out": "pip install failed: %s" % e, "files": {}, "installed": sorted(INSTALLED)}
+            return {"ok": False, "out": "pip install failed: %s" % e, "files": {}, "installed": sorted(INSTALLED), "native": _caps(), "unavailable": sorted(UNAVAILABLE)}
         notes.append("(a remembered package could not be installed: %s)" % e)
 
     tried = set()
@@ -458,6 +515,7 @@ async def run(data):
                 out.write("pip install failed: %s\n" % ie)
         except ModuleNotFoundError as e:
             mod = (e.name or "").split(".")[0]
+            trace = _own_trace()  # the script's own, taken before the lookup below can add to it
             if mod and mod not in tried:
                 tried.add(mod)
                 try:
@@ -465,11 +523,11 @@ async def run(data):
                     again = True
                 except Exception as ie:
                     ok = False
-                    out.write(_own_trace())
+                    out.write(trace)
                     out.write("(%s was looked up on PyPI: %s)\n" % (mod, ie))
             else:
                 ok = False
-                out.write(_own_trace())
+                out.write(trace)
         except SystemExit as e:
             ok = e.code in (None, 0)
         except BaseException:
@@ -484,6 +542,7 @@ async def run(data):
         out.write("the script needed more than %d fetches or installs; split it up\n" % REPLAYS_MAX)
 
     changed = {}
+    binary = []
     try:
         for name in sorted(os.listdir(work)):
             path = os.path.join(work, name)
@@ -494,18 +553,24 @@ async def run(data):
             try:
                 with open(path, "r", encoding="utf-8") as f:
                     text = f.read()
-            except (UnicodeDecodeError, OSError):
+            except UnicodeDecodeError:
+                binary.append(name)
+                continue
+            except OSError:
                 continue
             if len(text) <= FILE_MAX and before.get(name) != text:
                 changed[name] = text
     except OSError:
         pass
     text = out.getvalue()
-    if notes:
-        text = "(installed: %s)\n" % ", ".join(notes) + text
+    if binary:
+        text += "(not kept: %s - only text files a script writes are kept; write .svg, .html, .csv, .json or .txt)\n" % ", ".join(binary[:8])
+    said = [n for n in notes if n.startswith("(")]
+    got = [n for n in notes if not n.startswith("(")]
+    text = ("(installed: %s)\n" % ", ".join(got) if got else "") + "".join(n + "\n" for n in said) + text
     if len(text) > OUT_MAX:
         text = "...(earlier output cut)...\n" + text[-OUT_MAX:]
-    return {"ok": ok, "out": text, "files": changed, "installed": sorted(INSTALLED)}
+    return {"ok": ok, "out": text, "files": changed, "installed": sorted(INSTALLED), "native": _caps(), "unavailable": sorted(UNAVAILABLE)}
 
 
 class Default(WorkerEntrypoint):
