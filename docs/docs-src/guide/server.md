@@ -47,15 +47,16 @@ The password depends on how you started it:
 | how you started it | the password |
 |---|---|
 | `NL_ADMIN_PASSWORD` set | yours, applied at boot |
-| default (network-reachable) bind, nothing set | **generated**, and written to `data/admin-password.txt` |
-| `NL_BIND=127.0.0.1`, nothing set | the seeded default, `changeme` — change it |
+| new install, nothing set (any bind) | **generated**, and written to `data/admin-password.txt` |
+| existing custom password, nothing set | the existing password remains in force |
+| existing legacy `changeme` password, nothing set | rotated to a generated password before listening |
 
 The generated case is the ordinary one, so that file is where most first-time logins begin. Open it, copy the line after `admin password:`, log in, and set your own.
 
 Two details that matter:
 
 - **It is stable across restarts.** The server reads the file back before minting anything, because generating a fresh secret every boot while the seeding path quietly discarded it meant the recorded password stopped being the real one from boot two onward.
-- **It is made true before it is written.** Seeding only ever *creates* an account; against an existing one it changes nothing. So the server proves the password logs in, rotates it if it does not, and only then writes the file. A file stating a password that was never applied is worse than no file, because the reader stops looking for the real problem.
+- **It is verified before serving requests.** The server saves a new generated password before applying it, so a failed file write cannot strand an unknown password. It then checks the password against the account before listening. On later boots, a saved password is used only when it already matches that admin account; a stale file cannot reinstate an old password.
 
 If you would rather pin your own from the start, set `NL_ADMIN_PASSWORD` (and `NL_ADMIN_EMAIL`) before the first run and no file is written at all.
 

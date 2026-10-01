@@ -1,10 +1,11 @@
 name: release
 
-# On main pushes: a fast build check (the badge signal). On a version tag or a
+# On pull requests and main pushes: a build check (the badge signal). On a version tag or a
 # manual run: full, self-contained bundles built natively per-OS — the only
 # reliable way to ship veil-desk (raylib) and neuron (Rust) for every platform.
 
 on:
+  pull_request:
   push:
     branches: [main]
     tags: ['v*']
@@ -16,10 +17,26 @@ permissions:
 jobs:
   # fast signal on every main push: does the server still build?
   check:
-    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # Admin startup must prove its password was stored in neuron-db before the listener opens.
+      # Without this executable the storage-backed tests skip, so build it for the check job too.
+      - uses: actions/checkout@v4
+        with:
+          repository: gary23w/neuron-db
+          path: neuron-db
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build the Neuron store for auth tests
+        working-directory: neuron-db/rust/neuron-core
+        run: cargo build --release --features "sqlite secure server trust semantic semantic-db fisher topics"
+      - name: Install the Neuron test executable
+        run: |
+          mkdir -p bin
+          install -m 0755 neuron-db/rust/neuron-core/target/release/neuron bin/neuron
       # v2 resolves releases through ziglang.org's download index; the old @v1 hand-built the
       # pre-0.16 tarball name (zig-linux-x86_64-…) and 404'd on every mirror after 0.16.0
       # switched to arch-first naming (zig-x86_64-linux-…). This is what broke every main-push check.
