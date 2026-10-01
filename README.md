@@ -289,14 +289,17 @@ so they never cross the public internet and need no API key.
 - **Its tool belt.** A hot works with real tools, in the cloud:
   - *files* - its own workspace (`write_file`, `read_file`, `edit_file`, `append_file`, `list_files`,
     `delete_file`), kept across iterations and mirrored to your machine;
-  - *the web* - `web_search` (a keyless chain: public SearXNG instances, DuckDuckGo, Bing, then reference
-    lookups), `web_fetch`, and `http_request` for any method, headers and body; private and internal addresses
+  - *the web* - `web_search` (a keyless chain: public SearXNG instances, DuckDuckGo, Bing, reference
+    lookups, and - when those refuse a datacenter address - the same search through the real browser), `web_fetch`, and `http_request` for any method, headers and body; private and internal addresses
     are refused, on redirects too;
   - *a real browser* - `browser_open`, `browser_read`, `browser_links`, `browser_click`, `browser_type`,
     `browser_eval`, `browser_close`, driving Cloudflare's browser over the DevTools protocol for pages that
     need JavaScript, clicks or forms; the page stays open between iterations;
-  - *Python* - `run_python` runs a script (the whole standard library, HTTP included) beside the hot's files
-    and keeps what it writes; `save_skill` keeps a script as a tool of the hot's own and `run_skill` runs it
+  - *Python* - `run_python` runs a script beside the hot's files and keeps what it writes. A Worker's Python
+    has no sockets, no processes and no pip, so the runner supplies what a script expects: `import requests`
+    and `urllib` work on the Worker's own fetch, a missing import is installed from PyPI by itself (pure-Python
+    packages; `pip install` and `pip_install` do the same) and stays installed, and anything that needs a
+    process or native code is refused in words the hot can act on; `save_skill` keeps a script as a tool of the hot's own and `run_skill` runs it
     again, so a hot builds its own tools;
   - *memory and planning* - `remember` / `recall` for facts, `plan_set` / `plan_done` for a plan it sees every
     iteration;

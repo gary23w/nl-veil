@@ -35,7 +35,7 @@
 // No imports and no platform globals beyond fetch/Response/crypto, so cloud/hot.test.mjs runs the whole file
 // under node with a Map for storage and a scripted model.
 
-export const VERSION = "2";
+export const VERSION = "3";
 export const MAX_HOTS = 3;
 export const PRIMARY = "Gary"; // the first hot of every account
 
@@ -390,7 +390,8 @@ const TOOLS = [
   { name: "browser_eval", args: '{"js": "<an expression or async code>"}', what: "run JavaScript in the page and get its value back", need: "browser" },
   { name: "browser_close", args: "{}", what: "close the browser when you are done with it", need: "browser" },
   // scripting
-  { name: "run_python", args: '{"code": "<a script>", "files": ["<a file of yours to put beside it>"]}', what: "run Python (the whole standard library; top-level await and `from pyodide.http import pyfetch` for HTTP). It prints; the files it writes are kept in your workspace", need: "python" },
+  { name: "run_python", args: '{"code": "<a script>", "files": ["<a file of yours to put beside it>"]}', what: "run Python 3.12. The standard library is there, `import requests` and urllib work for HTTP, and a pure-Python package you import is installed from PyPI by itself. There are NO processes or shell (no subprocess, no os.system) and no native packages (numpy, pandas). It prints; the files it writes are kept in your workspace", need: "python" },
+  { name: "pip_install", args: '{"packages": ["<name>"]}', what: "install pure-Python packages from PyPI for your scripts; they stay installed", need: "python" },
   { name: "save_skill", args: '{"name": "<short_name>", "about": "<what it does and its ARGS>", "code": "<a Python script reading ARGS>"}', what: "keep a script as a tool of your own, for every later iteration", need: "python" },
   { name: "run_skill", args: '{"name": "<skill>", "args": {}}', what: "run a skill you saved; `args` arrives as ARGS", need: "python" },
   // memory and planning
@@ -412,8 +413,8 @@ const LOCAL_TOOL = {
   what: "queue a job for the veil on the owner's own machine (files, shell, builds, a swarm there); the result arrives in your inbox on a later iteration",
 };
 /// Earlier names for the file tools: a model (or a lesson) that still says note_write is understood.
-const ALIASES = { note_write: "write_file", note_read: "read_file", note_list: "list_files", note_delete: "delete_file", fetch_json: "web_fetch", read_url: "web_fetch", list_dir: "list_files", observe: "remember", python: "run_python" };
-const MIND_TOOLS = new Set(["write_file", "read_file", "list_files", "append_file", "web_search", "web_fetch", "http_request", "run_python", "run_skill", "remember", "recall", "pad_read", "pad_write"]);
+const ALIASES = { pip: "pip_install", install_package: "pip_install", note_write: "write_file", note_read: "read_file", note_list: "list_files", note_delete: "delete_file", fetch_json: "web_fetch", read_url: "web_fetch", list_dir: "list_files", observe: "remember", python: "run_python" };
+const MIND_TOOLS = new Set(["write_file", "read_file", "list_files", "append_file", "web_search", "web_fetch", "http_request", "run_python", "pip_install", "run_skill", "remember", "recall", "pad_read", "pad_write"]);
 
 /// The tools this hot has here: everything, minus what a missing binding takes away.
 function toolsFor(env, cfg) {
@@ -1307,6 +1308,11 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
         return this.browserTool(tool, args);
       case "run_python":
         return this.runPython(String(args.code ?? args.value ?? ""), Array.isArray(args.files) ? args.files : [], args.args);
+      case "pip_install": {
+        const list = (Array.isArray(args.packages) ? args.packages : [args.packages ?? args.package ?? args.name ?? args.value]).map((x) => String(x ?? "").trim()).filter((x) => /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(x));
+        if (list.length === 0) return 'ERROR: name the packages, as {"packages": ["beautifulsoup4"]}';
+        return this.runPython("", [], null, list);
+      }
       case "save_skill": {
         const name = String(args.name ?? "").trim();
         if (!/^[a-z][a-z0-9_]{1,31}$/.test(name)) return "ERROR: a skill name is 2-32 of lowercase letters, digits and _";
@@ -1511,7 +1517,23 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
       const j = await (await get(`https://en.wikipedia.org/w/api.php?action=opensearch&limit=8&format=json&search=${q}`, "application/json", 7000)).json();
       if (Array.isArray(j?.[1]) && j[1].length > 0) return show("Wikipedia", j[1].map((ti, i) => ({ title: ti, url: j[3]?.[i] ?? "", snippet: j[2]?.[i] ?? "" })));
     } catch {}
-    return `ERROR: no search engine answered (${tried.join("; ")}).${this.env.BROWSER ? ' Open one in the browser instead: browser_open {"url": "https://duckduckgo.com/?q=..."}.' : " Fetch a site you know with web_fetch instead."}`;
+    // 4. the engines refuse a datacenter address more often than a browser: ask one through the real browser
+    if (this.env.BROWSER) {
+      try {
+        const b = await this.browser();
+        const loaded = b.cdp.event("Page.loadEventFired", b.session, 15000);
+        await b.cdp.send("Page.navigate", { url: `https://html.duckduckgo.com/html/?q=${q}` }, b.session);
+        await loaded;
+        const v = await this.pageEval(`JSON.stringify([...document.querySelectorAll(".result")].slice(0, 10).map(r => { const a = r.querySelector("a.result__a"); const s = r.querySelector(".result__snippet"); if (!a) return null; let u = a.href; try { const m = new URL(u).searchParams.get("uddg"); if (m) u = m; } catch (e) {} return {title: a.innerText.trim().slice(0, 160), url: u, snippet: s ? s.innerText.trim().slice(0, 300) : ""}; }).filter(x => x && x.title && !/duckduckgo\\.com\\/y\\.js/.test(x.url)))`);
+        const results = JSON.parse(v ?? "[]");
+        if (results.length > 0) return show("DuckDuckGo, through the browser", results);
+        tried.push("the browser: the page showed no results");
+      } catch (e) {
+        if (e instanceof TickBudget) throw e;
+        tried.push(`the browser: ${clip(e?.message ?? e, 80)}`);
+      }
+    }
+    return `ERROR: no search engine answered (${tried.join("; ")}).${this.env.BROWSER ? ' Open a search page yourself: browser_open {"url": "https://www.bing.com/search?q=..."}.' : " Fetch a site you know with web_fetch instead."}`;
   }
 
   // ---------------------------------------------------------------- the browser
@@ -1665,8 +1687,8 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
   // ---------------------------------------------------------------- Python
 
   /// Run a script in the companion Python Worker, beside the named files; what it writes comes back and is kept.
-  async runPython(code, fileNames, args) {
-    if (code.trim().length === 0) return 'ERROR: give the script as {"code": "..."}';
+  async runPython(code, fileNames, args, install) {
+    if (code.trim().length === 0 && !install) return 'ERROR: give the script as {"code": "..."}';
     if (code.length > 60000) return "ERROR: a script is at most 60000 characters";
     this.spend();
     const files = {};
@@ -1674,9 +1696,11 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
       const n = await this.store.get("note:" + String(raw));
       if (n) files[String(raw)] = n.text;
     }
+    // The Python Worker keeps nothing between scripts, so the packages this hot uses go with every one.
+    const packages = (await this.store.get("py_packages")) ?? [];
     let j;
     try {
-      const r = await this.env.PY.fetch("https://py/run", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ code, files, args: args ?? null }) });
+      const r = await this.env.PY.fetch("https://py/run", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ code, files, args: args ?? null, packages, install: install ?? [] }) });
       const text = await r.text();
       try {
         j = JSON.parse(text);
@@ -1686,6 +1710,11 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
     } catch (e) {
       return `ERROR: the Python runner could not be reached: ${clip(e?.message ?? e, 300)}`;
     }
+    if (Array.isArray(j.installed)) {
+      const all = [...new Set([...packages, ...j.installed.map(String)])].slice(0, 40);
+      if (all.length !== packages.length) await this.store.put("py_packages", all);
+    }
+    if (install) return j.ok ? `installed. Your Python now has: ${(j.installed ?? []).join(", ") || "(nothing new)"}` : `ERROR: ${clip(String(j.out ?? ""), 600)}`;
     const wrote = [];
     for (const [name, text] of Object.entries(j.files ?? {})) {
       const saved = await this.saveFile(name, String(text));
