@@ -76,6 +76,7 @@
       { p: 'worker/chat/toolperf', c: 'CH-09', t: 'Tool perf — per-machine learned tool behavior', s: 'chat/toolperf.zig' },
       { p: 'worker/chat/workspace', c: 'CH-10', t: 'Prompt workspace — scored admission, provenance receipts, decision log', s: 'chat/workspace.zig' },
       { p: 'worker/chat/overlay', c: 'CH-12', t: 'Recall overlay — memory settled around every thought', s: 'chat/overlay.zig' },
+      { p: 'worker/chat/goal', c: 'CH-13', t: 'Goal mode — a stored goal, an iteration log, a measure, and its own stop rules', s: 'chat/goal.zig' },
       { p: 'worker/continuity', c: 'CH-11', t: 'Continuity — resume anchors: what a cut unit of work established, banked durably', s: 'continuity.zig' }
     ]},
     { key: 'worker/browser/', label: 'WORKER · BROWSER — THE DRIVER', docs: [

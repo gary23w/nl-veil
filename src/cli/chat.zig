@@ -23,12 +23,25 @@ pub fn run(
     // conversation id: explicit arg, else a fresh timestamp-free hex the server will create on first message.
     var conv_buf: [64]u8 = undefined;
     var conv: []const u8 = "";
-    for (args) |a| {
-        if (a.len > 0 and a[0] != '-') {
-            const n = @min(a.len, conv_buf.len);
-            @memcpy(conv_buf[0..n], a[0..n]);
-            conv = conv_buf[0..n];
-            break;
+    // `--say "<message>"` sends that message first; `--once` leaves after one turn (how `veil goal` runs).
+    var say: []const u8 = "";
+    var once = false;
+    {
+        var i: usize = 0;
+        while (i < args.len) : (i += 1) {
+            const a = args[i];
+            if (std.mem.eql(u8, a, "--say")) {
+                if (i + 1 < args.len) {
+                    say = args[i + 1];
+                    i += 1;
+                }
+            } else if (std.mem.eql(u8, a, "--once")) {
+                once = true;
+            } else if (a.len > 0 and a[0] != '-' and conv.len == 0) {
+                const n = @min(a.len, conv_buf.len);
+                @memcpy(conv_buf[0..n], a[0..n]);
+                conv = conv_buf[0..n];
+            }
         }
     }
     if (conv.len == 0) {
@@ -50,8 +63,12 @@ pub fn run(
     // provider fields come from the environment: NL_LLM_BASE_URL / NL_LLM_MODEL / NL_LLM_KEY. Blank base_url
     // means the server has no backend to call (a chat turn needs one), so if it's unset we default to a local
     // Ollama — the common local case — and let the user override via env.
-    const base_url = ctx.environ.get("NL_LLM_BASE_URL") orelse "http://127.0.0.1:11434/v1";
-    const model = ctx.environ.get("NL_LLM_MODEL") orelse "gpt-oss:20b";
+    // With no NL_LLM_* set, the desk's chat model (cli.Ctx.bindDesk) is the CLI's too, when the server can resolve
+    // it without a URL from us: a custom endpoint the desk names, or a Workers AI model behind the login.
+    const desk_model = ctx.defModel();
+    const desk_ok = desk_model.len > 0 and (ctx.defBase().len > 0 or std.mem.startsWith(u8, desk_model, "@cf/"));
+    const base_url = ctx.environ.get("NL_LLM_BASE_URL") orelse (if (desk_ok) ctx.defBase() else "http://127.0.0.1:11434/v1");
+    const model = ctx.environ.get("NL_LLM_MODEL") orelse (if (desk_ok) desk_model else "gpt-oss:20b");
     const api_key = ctx.environ.get("NL_LLM_KEY") orelse "";
     // MODEL TRIO (optional): route the calls that are not the agentic step at other models via
     // NL_LLM_THINK_* / NL_LLM_PROMPT_*. thinking = plan/reflect/compact/ctxsum/summary/lesson (planning plus
@@ -76,9 +93,14 @@ pub fn run(
         cli.out("  thinking + prompting: unset — the server's models for those roles, else coding (set NL_LLM_THINK_* / NL_LLM_PROMPT_* to choose; `veil help`)\n", .{});
 
     var stdin_buf: [4096]u8 = undefined;
+    var said = false;
     while (true) {
-        cli.out("\n> ", .{});
-        const line = readLine(ctx, &stdin_buf) orelse break; // EOF (Ctrl-D / closed pipe) ends the REPL
+        if (once and said) break;
+        const line: []const u8 = if (say.len > 0 and !said) say else blk: {
+            cli.out("\n> ", .{});
+            break :blk readLine(ctx, &stdin_buf) orelse break; // EOF (Ctrl-D / closed pipe) ends the REPL
+        };
+        said = true;
         const msg = std.mem.trim(u8, line, " \r\n\t");
         if (msg.len == 0) continue;
         if (std.mem.eql(u8, msg, "/quit") or std.mem.eql(u8, msg, "/exit")) break;
