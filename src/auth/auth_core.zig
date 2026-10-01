@@ -104,17 +104,13 @@ pub const Auth = struct {
         return self.next_id == 1;
     }
 
-    pub fn seedDefaultAdmin(self: *Auth, password: ?[]const u8) void {
+    pub fn seedDefaultAdmin(self: *Auth, password: []const u8) void {
         const email = self.admin_email orelse DEFAULT_ADMIN_EMAIL;
-        const pw = password orelse "changeme";
-        self.register(email, pw) catch |e| {
+        self.register(email, password) catch |e| {
             if (e != AuthError.EmailTaken) log.err("seed admin {s}: {t}", .{ email, e });
             return;
         };
-        if (password == null)
-            log.warn("*** DEFAULT ADMIN SEEDED: {s} / changeme — set NL_ADMIN_PASSWORD and change this ***", .{email})
-        else
-            log.info("admin account ready: {s}", .{email});
+        log.info("admin account ready: {s}", .{email});
     }
 
     fn userScope(email: []const u8, out: *[16]u8) []const u8 {
@@ -361,6 +357,20 @@ pub const Auth = struct {
         self.users.put(self.gpa, u.email, u) catch {};
         self.mu.unlock(self.nb.io);
         self.dropSessions(email);
+        return true;
+    }
+
+    /// Boot uses this to distinguish a password mismatch from a verifier failure. Login deliberately
+    /// reports both as BadCredentials, which is right for a remote caller but unsafe when deciding
+    /// whether an existing account still has the published default password.
+    pub fn passwordMatches(self: *Auth, email: []const u8, password: []const u8) !bool {
+        self.mu.lockUncancelable(self.nb.io);
+        defer self.mu.unlock(self.nb.io);
+        const u = self.users.get(email) orelse return false;
+        std.crypto.pwhash.argon2.strVerify(u.pwhash, password, .{ .allocator = self.gpa }, self.nb.io) catch |e| switch (e) {
+            error.PasswordVerificationFailed => return false,
+            else => return e,
+        };
         return true;
     }
 

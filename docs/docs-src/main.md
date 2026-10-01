@@ -43,7 +43,7 @@ that helper while ordinary children remain subject to kill-on-close cleanup.
 
 The server binds **every interface by default**. `NL_BIND=127.0.0.1` (or `localhost`) is the opt-in that keeps it on this machine; anything else, including the unset case, listens on `0.0.0.0`. The startup banner reports which one actually happened, enumerating the machine's real addresses so somebody can type one.
 
-The admin password follows from that. `NL_ADMIN_PASSWORD` always wins. Otherwise, on a reachable bind, a password is generated — and then made true before it is written: seeding only ever *creates* an account, so the code proves the password logs in, rotates it if it does not, and only then saves it to `data/admin-password.txt`. It reads that file back on the next boot rather than minting a fresh secret, because a rotating password that the recorded file no longer matches is reassuring and wrong. On a loopback bind with nothing set, no password is generated and the shipped default stands.
+The admin password is independent of the bind address: a tunnel or another proxy can expose a loopback listener. `NL_ADMIN_PASSWORD` always wins and is applied to an existing account when it changes. Otherwise a new admin receives a generated password in `data/admin-password.txt`; an existing custom password remains in force, while the published legacy `changeme` password is rotated before listening. The generated password is saved before changing the account, then verified before listening. On later boots the file is used only if it already matches the current admin account, so a superseded password cannot return or transfer to another admin address.
 
 The full operator walkthrough is on [running a server](guide/server.md).
 
