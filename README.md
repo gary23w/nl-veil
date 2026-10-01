@@ -560,8 +560,8 @@ resolved, so the CLI and the server always agree.
 
 ### 4. Log in as the admin
 
-The first run creates an admin account. Because the server is reachable on the network by default and
-you did not choose a password, it **generates** one — and writes it to a file, because a banner you
+The first run creates an admin account. When you do not choose a password, it **generates** one on
+both network and loopback binds — and writes it to a file, because a banner you
 never saw is not a delivery mechanism:
 
 ```
@@ -569,16 +569,16 @@ data/admin-password.txt
 ```
 
 That file sits next to the binary, beside the data it protects. The password is **stable across
-restarts** — the server reads it back rather than minting a new one each boot (`src/main.zig`,
-`readAdminPassword` / `writeAdminPassword`).
+restarts** while it matches the admin account; a stale file cannot restore a superseded password
+(`src/main.zig`, `readAdminPassword` / `writeAdminPassword`).
 
 - Default email: **`admin@neuron-loops.local`** (change it with `NL_ADMIN_EMAIL`).
 - To pin your own password instead of using the generated one, set `NL_ADMIN_PASSWORD` before starting.
   Do that and no file is written — the password is the one you chose.
 
-> The old shipped default `changeme` still exists as the seed literal, but you will only ever meet it
-> on an explicit `NL_BIND=127.0.0.1` run, where nothing is generated because nothing is exposed.
-> Change it anyway.
+Older installs that still use the published `changeme` password are rotated to a generated one at
+startup, before the server listens. A custom existing password remains in force when no generated
+file or `NL_ADMIN_PASSWORD` is present.
 
 ### 5. Pick a default model for the instance
 

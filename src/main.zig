@@ -498,36 +498,12 @@ pub fn main(init: std.process.Init) !void {
     // people had to discover NL_BIND before the web UI existed for them at all. `NL_BIND=127.0.0.1`
     // still pins it to this machine.
     //
-    // This flag used to decide THREE unrelated things. It now decides one — the listen address. The
-    // other two moved to what actually motivates them: the desktop key is minted for the local clients
-    // that need it (gating that on the bind address silently broke the desk and CLI), and the admin
-    // password is randomised when the box is reachable AND nobody chose one.
+    // This flag decides only the listen address. A loopback listener can still be exposed by the
+    // Cloudflare tunnel or another proxy, so the admin password must be safe on either bind.
     const bind_all = if (init.environ_map.get("NL_BIND")) |v|
         !(std.mem.eql(u8, v, "127.0.0.1") or std.mem.eql(u8, v, "localhost"))
     else
         true;
-    var apw_buf: [48]u8 = undefined;
-    var apw_generated = false;
-    const admin_pw: ?[]const u8 = init.environ_map.get("NL_ADMIN_PASSWORD") orelse blk: {
-        if (!bind_all) break :blk null;
-        // REACHABLE + no password chosen. The shipped default is "changeme", published in the README,
-        // and this program runs arbitrary code as the user who started it — so a known password on a
-        // box answering the whole subnet is a full host compromise by anyone on the same wifi.
-        //
-        // REUSE what we generated last time before minting anything. Generating unconditionally meant a
-        // fresh secret every boot while seedDefaultAdmin quietly discarded it (register returns
-        // EmailTaken for an existing account and the caller returns), so from boot 2 the recorded
-        // password was never the real one — and on an upgraded install the real one was still
-        // "changeme" while the file said otherwise. Reassuring and wrong beats loud and right only in
-        // the sense that nobody notices.
-        if (readAdminPassword(io, paths.data, &apw_buf)) |saved| break :blk saved;
-        var raw: [24]u8 = undefined;
-        io.random(&raw);
-        const hx = std.fmt.bytesToHex(raw, .lower);
-        @memcpy(apw_buf[0..hx.len], &hx);
-        apw_generated = true;
-        break :blk apw_buf[0..hx.len];
-    };
     // How many requests one keep-alive socket serves before recycling. See the timeout block below.
     const keepalive_requests: u32 = if (init.environ_map.get("NL_KEEPALIVE_REQUESTS")) |v|
         (std.fmt.parseInt(u32, std.mem.trim(u8, v, " \r\n\t"), 10) catch 200)
@@ -538,35 +514,7 @@ pub fn main(init: std.process.Init) !void {
     // shared server; the right numbers depend on the rate limit of the provider key everyone shares.
     chat_service.configureTurnLimits(init.environ_map);
 
-    auth.seedDefaultAdmin(admin_pw);
-
-    // MAKE IT TRUE, then record it. seedDefaultAdmin only CREATES; against an existing account it
-    // returns having changed nothing. So prove the password actually works, rotate it if not, and only
-    // then write it down — a file that states a password which was never applied is worse than no file,
-    // because the reader stops looking for the real problem.
-    if (admin_pw) |pw| {
-        if (init.environ_map.get("NL_ADMIN_PASSWORD") == null) {
-            const email = init.environ_map.get("NL_ADMIN_EMAIL") orelse DEFAULT_ADMIN_EMAIL;
-            var in_force = false;
-            if (auth.login(email, pw)) |tok| {
-                gpa.free(tok);
-                in_force = true;
-            } else |_| {
-                // Not in force: either an account that predates this (still on the shipped default) or
-                // a data dir whose recorded password no longer matches. Rotate it.
-                in_force = auth.setPassword(email, pw);
-                if (in_force) apw_generated = true; // changed → the user needs to be told again
-            }
-            if (!in_force) {
-                log.err("could not set an admin password on {s} — it may still be the shipped default. Set NL_ADMIN_PASSWORD.", .{email});
-            } else if (apw_generated) {
-                writeAdminPassword(gpa, io, paths.data, pw);
-                log.warn("*** no NL_ADMIN_PASSWORD set and this server is reachable on the network.\n" ++
-                    "*** Admin password: {s}\n" ++
-                    "*** Saved to {s}/admin-password.txt — set NL_ADMIN_PASSWORD to pin your own.", .{ pw, paths.data });
-            }
-        }
-    }
+    try prepareAdminPassword(io, &auth, paths.data, init.environ_map.get("NL_ADMIN_EMAIL") orelse DEFAULT_ADMIN_EMAIL, init.environ_map.get("NL_ADMIN_PASSWORD"));
 
     var sup = Supervisor.init(gpa, io, paths.neuron_bin);
     sup.server_key = crypto.deriveServerKey(gpa, io, init.environ_map, paths.data);
@@ -1052,25 +1000,61 @@ fn awaitServer(gpa: std.mem.Allocator, io: std.Io, port: u16, budget_ms: u64) vo
 
 const DEFAULT_ADMIN_EMAIL = "admin@neuron-loops.local";
 
-/// Ensure a valid admin API key sits at <data>/.desktop_key so the desktop auto-connects. Reuses the
-/// existing key if it still verifies; otherwise logs in as the admin, mints one, and writes it. Best-effort.
+fn ensureAdminPassword(auth: *Auth, email: []const u8, pw: []const u8) !void {
+    if (std.mem.eql(u8, pw, "changeme")) return error.InsecureAdminPassword;
+    auth.seedDefaultAdmin(pw);
+    if (try auth.passwordMatches(email, pw)) return;
+    if (!auth.setPassword(email, pw)) return error.AdminPasswordNotApplied;
+    if (!try auth.passwordMatches(email, pw)) return error.AdminPasswordNotApplied;
+}
+
+/// Reconcile the credential before either the LAN listener or a tunnel can accept requests.
+/// Existing custom passwords stay in force without an explicit replacement. A generated file is
+/// accepted only when it already matches this account; a stale file cannot restore an old secret or
+/// transfer it to a different admin email. Only the published legacy default is rotated automatically.
+fn prepareAdminPassword(io: std.Io, auth: *Auth, data_dir: []const u8, email: []const u8, configured: ?[]const u8) !void {
+    if (configured) |pw| return ensureAdminPassword(auth, email, pw);
+
+    var pw_buf: [48]u8 = undefined;
+    if (auth.idForEmail(email) != null) {
+        if (readAdminPassword(io, data_dir, &pw_buf)) |saved| {
+            if (try auth.passwordMatches(email, saved)) return;
+        }
+        if (!try auth.passwordMatches(email, "changeme")) {
+            log.info("keeping the existing admin password; set NL_ADMIN_PASSWORD to pin a new one", .{});
+            return;
+        }
+    }
+
+    var raw: [24]u8 = undefined;
+    io.random(&raw);
+    const hx = std.fmt.bytesToHex(raw, .lower);
+    @memcpy(pw_buf[0..hx.len], &hx);
+    const generated = pw_buf[0..hx.len];
+    // Save first. If this fails, abort before replacing the account's password with an unknown
+    // random value that the next boot would mistake for an existing custom password.
+    try writeAdminPassword(io, data_dir, generated);
+    try ensureAdminPassword(auth, email, generated);
+    log.warn("*** no NL_ADMIN_PASSWORD set; generated an admin password.\n" ++
+        "*** Saved to {s}/admin-password.txt — set NL_ADMIN_PASSWORD to pin your own.", .{data_dir});
+}
+
 /// Save a generated admin password beside the data it protects. Logged once is not good enough: on a
 /// double-click launch there is no console at all, and the person who needs it is the one who did not
 /// set NL_ADMIN_PASSWORD in the first place.
-fn writeAdminPassword(gpa: std.mem.Allocator, io: std.Io, data_dir: []const u8, pw: []const u8) void {
-    _ = gpa;
+fn writeAdminPassword(io: std.Io, data_dir: []const u8, pw: []const u8) !void {
     var pb: [700]u8 = undefined;
-    const path = std.fmt.bufPrint(&pb, "{s}/admin-password.txt", .{data_dir}) catch return;
+    const path = try std.fmt.bufPrint(&pb, "{s}/admin-password.txt", .{data_dir});
     var body: [256]u8 = undefined;
-    const text = std.fmt.bufPrint(&body, "admin password: {s}\n\n" ++
-        "Generated because NL_ADMIN_PASSWORD was not set and this server is reachable\n" ++
-        "on the network. Set NL_ADMIN_PASSWORD to choose your own.\n", .{pw}) catch return;
-    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = text }) catch {};
+    const text = try std.fmt.bufPrint(&body, "admin password: {s}\n\n" ++
+        "Generated because NL_ADMIN_PASSWORD was not set. Set NL_ADMIN_PASSWORD\n" ++
+        "to choose your own.\n", .{pw});
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = text });
 }
 
 /// Read back a password this server generated earlier, so a restart does not mint a new one and
 /// invalidate what the user wrote down. Returns null when the file is absent or does not look like a
-/// password line we wrote.
+/// generated password line we wrote. Older manually edited or weak files are not trusted as seeds.
 fn readAdminPassword(io: std.Io, data_dir: []const u8, out: *[48]u8) ?[]const u8 {
     var pb: [700]u8 = undefined;
     const path = std.fmt.bufPrint(&pb, "{s}/admin-password.txt", .{data_dir}) catch return null;
@@ -1084,9 +1068,119 @@ fn readAdminPassword(io: std.Io, data_dir: []const u8, out: *[48]u8) ?[]const u8
     var rest = buf[at + tag.len .. n];
     if (std.mem.indexOfAny(u8, rest, "\r\n")) |e| rest = rest[0..e];
     const pw = std.mem.trim(u8, rest, " \t");
-    if (pw.len < 8 or pw.len > out.len) return null;
+    if (pw.len != out.len) return null;
+    for (pw) |c| if (!((c >= '0' and c <= '9') or (c >= 'a' and c <= 'f'))) return null;
     @memcpy(out[0..pw.len], pw);
     return out[0..pw.len];
+}
+
+test "admin startup generates a password and retires the published default before exposure" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var fresh = try http.testApp(gpa, io, "zig-admin-fresh-tmp");
+    defer fresh.deinit();
+    try prepareAdminPassword(io, &fresh.auth, fresh.root, DEFAULT_ADMIN_EMAIL, null);
+    try std.testing.expect(!try fresh.auth.passwordMatches(DEFAULT_ADMIN_EMAIL, "changeme"));
+    var first_buf: [48]u8 = undefined;
+    const first = readAdminPassword(io, fresh.root, &first_buf) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(try fresh.auth.passwordMatches(DEFAULT_ADMIN_EMAIL, first));
+
+    var legacy = try http.testApp(gpa, io, "zig-admin-legacy-tmp");
+    defer legacy.deinit();
+    legacy.auth.seedDefaultAdmin("changeme");
+    try std.testing.expect(try legacy.auth.passwordMatches(DEFAULT_ADMIN_EMAIL, "changeme"));
+    try prepareAdminPassword(io, &legacy.auth, legacy.root, DEFAULT_ADMIN_EMAIL, null);
+    try std.testing.expect(!try legacy.auth.passwordMatches(DEFAULT_ADMIN_EMAIL, "changeme"));
+    var saved_buf: [48]u8 = undefined;
+    const saved = readAdminPassword(io, legacy.root, &saved_buf) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(try legacy.auth.passwordMatches(DEFAULT_ADMIN_EMAIL, saved));
+    const session = try legacy.auth.login(DEFAULT_ADMIN_EMAIL, saved);
+    defer {
+        legacy.auth.logout(session);
+        gpa.free(session);
+    }
+    try prepareAdminPassword(io, &legacy.auth, legacy.root, DEFAULT_ADMIN_EMAIL, null);
+    try std.testing.expect(legacy.auth.whoami(session) != null);
+
+    // A failed password-file write must not rotate the account to an unrecorded random secret.
+    var blocked = try http.testApp(gpa, io, "zig-admin-blocked-tmp");
+    defer blocked.deinit();
+    blocked.auth.seedDefaultAdmin("changeme");
+    try std.testing.expectError(error.FileNotFound, prepareAdminPassword(io, &blocked.auth, "zig-admin-blocked-tmp/missing", DEFAULT_ADMIN_EMAIL, null));
+    try std.testing.expect(try blocked.auth.passwordMatches(DEFAULT_ADMIN_EMAIL, "changeme"));
+    try prepareAdminPassword(io, &blocked.auth, blocked.root, DEFAULT_ADMIN_EMAIL, null);
+    try std.testing.expect(!try blocked.auth.passwordMatches(DEFAULT_ADMIN_EMAIL, "changeme"));
+}
+
+test "admin startup preserves custom credentials and applies an explicit replacement" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var ta = try http.testApp(gpa, io, "zig-admin-custom-tmp");
+    defer ta.deinit();
+    const old = "a private existing password";
+    const replacement = "a different configured password";
+    ta.auth.seedDefaultAdmin(old);
+    try prepareAdminPassword(io, &ta.auth, ta.root, DEFAULT_ADMIN_EMAIL, null);
+    try std.testing.expect(try ta.auth.passwordMatches(DEFAULT_ADMIN_EMAIL, old));
+    var buf: [48]u8 = undefined;
+    try std.testing.expect(readAdminPassword(io, ta.root, &buf) == null);
+
+    try prepareAdminPassword(io, &ta.auth, ta.root, DEFAULT_ADMIN_EMAIL, replacement);
+    try std.testing.expect(!try ta.auth.passwordMatches(DEFAULT_ADMIN_EMAIL, old));
+    try std.testing.expect(try ta.auth.passwordMatches(DEFAULT_ADMIN_EMAIL, replacement));
+    const session = try ta.auth.login(DEFAULT_ADMIN_EMAIL, replacement);
+    defer {
+        ta.auth.logout(session);
+        gpa.free(session);
+    }
+    try prepareAdminPassword(io, &ta.auth, ta.root, DEFAULT_ADMIN_EMAIL, replacement);
+    try std.testing.expect(ta.auth.whoami(session) != null);
+    try std.testing.expectError(error.InsecureAdminPassword, prepareAdminPassword(io, &ta.auth, ta.root, DEFAULT_ADMIN_EMAIL, "changeme"));
+}
+
+test "a stale generated file cannot restore an old password or change another admin" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var ta = try http.testApp(gpa, io, "zig-admin-stale-tmp");
+    defer ta.deinit();
+    try prepareAdminPassword(io, &ta.auth, ta.root, DEFAULT_ADMIN_EMAIL, null);
+    var old_buf: [48]u8 = undefined;
+    const old_generated = readAdminPassword(io, ta.root, &old_buf) orelse return error.TestUnexpectedResult;
+    const replacement = "a replacement from the environment";
+    try prepareAdminPassword(io, &ta.auth, ta.root, DEFAULT_ADMIN_EMAIL, replacement);
+    try prepareAdminPassword(io, &ta.auth, ta.root, DEFAULT_ADMIN_EMAIL, null);
+    try std.testing.expect(try ta.auth.passwordMatches(DEFAULT_ADMIN_EMAIL, replacement));
+    try std.testing.expect(!try ta.auth.passwordMatches(DEFAULT_ADMIN_EMAIL, old_generated));
+
+    const other_email = "new-owner@example.test";
+    const other_password = "the new owner's own password";
+    try ta.auth.register(other_email, other_password);
+    try prepareAdminPassword(io, &ta.auth, ta.root, other_email, null);
+    try std.testing.expect(try ta.auth.passwordMatches(other_email, other_password));
+    try std.testing.expect(!try ta.auth.passwordMatches(other_email, old_generated));
+}
+
+test "an unreadable password hash stops startup instead of preserving a possible default" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var ta = try http.testApp(gpa, io, "zig-admin-verify-tmp");
+    defer ta.deinit();
+    ta.auth.seedDefaultAdmin("changeme");
+    const u = ta.auth.users.getPtr(DEFAULT_ADMIN_EMAIL) orelse return error.TestUnexpectedResult;
+    gpa.free(u.pwhash);
+    u.pwhash = try gpa.dupe(u8, "malformed-hash");
+    if (prepareAdminPassword(io, &ta.auth, ta.root, DEFAULT_ADMIN_EMAIL, null)) |_| {
+        return error.TestUnexpectedResult;
+    } else |_| {}
 }
 
 /// MIGRATE the pre-split durable memory store into the admin's per-user one.
