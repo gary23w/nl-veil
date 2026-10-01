@@ -6,7 +6,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import worker, { Hot, MAX_HOTS, PRIMARY, PLATEAU, firstJson, answerText, parseGoalCommand, parseVerdict, decide, newGoal, recordIteration, validName } from "./hot.js";
+import worker, { Hot, MAX_HOTS, PRIMARY, PLATEAU, firstJson, answerText, parseAction, searchResults, privateHost, parseGoalCommand, parseVerdict, decide, newGoal, recordIteration, validName } from "./hot.js";
 
 class Storage {
   constructor() {
@@ -183,16 +183,18 @@ test("one alarm is one iteration: pick, act with tools, a measured verdict, a lo
     }
     if (n === 2) {
       assert.match(text, /THIS ITERATION'S STEP: Save the three source URLs/);
-      assert.match(text, /note_write/);
+      assert.match(text, /write_file/);
       assert.doesNotMatch(text, /local_run/); // not granted
+      assert.doesNotMatch(text, /- browser_open|- run_python/); // no binding, so not offered...
+      assert.match(text, /NOT AVAILABLE in this account right now: a browser \(browser_\*\) and Python/); // ...and said so
       return 'I will save it.\n{"tool": "note_write", "args": {"name": "sources.md", "text": "a\\nb\\nc"}}';
     }
     if (n === 3) {
-      assert.match(text, /RESULT of note_write:\nsaved sources.md \(5 characters\)/);
+      assert.match(text, /RESULT of write_file:\nsaved sources.md \(5 characters\)/); // the old name still works
       return '{"final": "saved 3 URLs to sources.md"}';
     }
     if (n === 4) {
-      assert.match(text, /TOOL note_write/);
+      assert.match(text, /TOOL write_file/);
       return "IMPROVED | score: 3/10 | evidence: sources.md saved with 3 of 10 sources";
     }
     throw new Error("unexpected model call " + n);
@@ -312,8 +314,8 @@ test("commands: plain words reach the next iteration as a directive, /goal repla
   assert.equal(w.hot("Gary").store.alarm, null);
   assert.equal((await w.req("POST", "/v1/hots/Gary/command", { text: "/resume" })).body.hot.state, "working");
   assert.match((await w.req("POST", "/v1/hots/Gary/command", { text: "/nonsense" })).body.reply, /Commands:/);
-  const cfg = await w.req("POST", "/v1/hots/Gary/config", { pace_s: 5, size: 99, local: true, model: "@cf/x/y" });
-  assert.equal(cfg.body.hot.pace_s, 30); // clamped
+  const cfg = await w.req("POST", "/v1/hots/Gary/config", { pace_s: 1, size: 99, local: true, model: "@cf/x/y" });
+  assert.equal(cfg.body.hot.pace_s, 5); // 5 seconds is the fastest pace
   assert.equal(cfg.body.hot.size, 8);
   assert.equal(cfg.body.hot.model, "@cf/x/y");
   assert.equal(cfg.body.hot.local, false); // the owner's machine is granted at deployment only
@@ -590,4 +592,328 @@ test("clearing the scratchpad empties it for the next set of hots, and its seq m
   await w.req("POST", "/v1/pad", { text: "fresh" });
   assert.deepEqual((await w.req("GET", "/v1/pad")).body.entries.map((e) => [e.seq, e.text]), [[4, "fresh"]]);
   assert.equal((await w.req("POST", "/v1/pad/clear", {}, "wrong")).status, 401);
+});
+
+test("a tool call is understood however the model spells it", () => {
+  const want = { tool: "web_fetch", args: { url: "https://example.com" } };
+  for (const reply of [
+    '{"tool": "web_fetch", "args": {"url": "https://example.com"}}',
+    '{"tool": "web_fetch", "arguments": {"url": "https://example.com"}}',
+    '{"tool": "web_fetch", "parameters": {"url": "https://example.com"}}',
+    '{"tool": "web_fetch", "input": {"url": "https://example.com"}}',
+    '{"tool": "web_fetch", "url": "https://example.com"}', // flat
+    '{"name": "web_fetch", "arguments": "{\\"url\\": \\"https://example.com\\"}"}', // arguments as a JSON string
+    '{"tool_calls": [{"id": "c1", "type": "function", "function": {"name": "web_fetch", "arguments": "{\\"url\\": \\"https://example.com\\"}"}}]}',
+    'I will fetch it.\n```json\n{"action": "web_fetch", "args": {"url": "https://example.com"}}\n```',
+    '{"tool": "functions.web_fetch", "args": {"url": "https://example.com"}}',
+  ]) assert.deepEqual(parseAction(reply), want, reply);
+  assert.deepEqual(parseAction('{"final": "done, 3 saved"}'), { final: "done, 3 saved" });
+  assert.deepEqual(parseAction('{"tool": "final", "args": {"text": "all done"}}'), { final: "all done" });
+  assert.deepEqual(parseAction('{"tool": "list_files"}'), { tool: "list_files", args: {} });
+  assert.equal(parseAction("just prose"), null);
+  assert.equal(parseAction('{"thought": "hmm"}'), null);
+});
+
+test("a reply with no text is asked again with more room, and a model that stays silent is an error, never an empty step", async () => {
+  const sizes = [];
+  const w = world();
+  let silent = 1;
+  w.env.AI.run = async (model, input) => {
+    sizes.push(input.max_tokens);
+    if (silent-- > 0) return { choices: [{ message: { content: "", reasoning_content: "thinking for a long time..." } }] };
+    return { response: "DONE" };
+  };
+  await w.req("POST", "/v1/hots", { goal: "first goal here" });
+  await w.tick("Gary");
+  assert.deepEqual(sizes, [2000, 6000]); // the pick, then the pick again with three times the room
+  assert.equal((await w.hot("Gary").store.get("goal")).status, "achieved");
+
+  await w.req("POST", "/v1/hots/Gary/command", { text: "/goal another goal here" });
+  // a model that only ever reasons: the model that does not reason answers for it, and the hot says so once
+  silent = 99;
+  const real = w.env.AI.run;
+  w.env.AI.run = async (model, input) => (model === "@cf/meta/llama-3.3-70b-instruct-fp8-fast" ? { response: "DONE" } : real(model, input));
+  await w.req("POST", "/v1/hots/Gary/config", { model: "@cf/zai-org/reasons-only" });
+  await w.tick("Gary");
+  assert.equal((await w.hot("Gary").store.get("goal")).status, "achieved");
+  assert.equal((await w.events("Gary")).filter((e) => /returned no visible answer/.test(e.text)).length, 1);
+
+  // and when nothing answers at all, it is an error
+  await w.req("POST", "/v1/hots/Gary/command", { text: "/goal a third goal here" });
+  w.env.AI.run = real;
+  await w.tick("Gary");
+  const evs = await w.events("Gary");
+  assert.ok(evs.some((e) => e.kind === "error" && /returned no text twice/.test(e.text)));
+  assert.ok(!evs.some((e) => e.kind === "pick" && e.text === "")); // no empty step was ever recorded
+  assert.equal((await w.hot("Gary").store.get("goal")).iteration, 0);
+});
+
+test("model calls a day can be unlimited, and a hot may iterate every 5 seconds", async () => {
+  const w = world(() => "DONE");
+  const made = await w.req("POST", "/v1/hots", { goal: "first goal here", daily_calls: 0, pace_s: 5 });
+  assert.equal(made.body.hot.daily_calls, 0);
+  assert.equal(made.body.hot.pace_s, 5);
+  const gary = w.hot("Gary");
+  await gary.store.put("usage", { day: "2026-10-01", calls: 999999, total: 999999 });
+  assert.equal((await w.req("GET", "/v1/hots/Gary")).body.hot.state, "working"); // never "resting"
+  await w.tick("Gary");
+  assert.equal(w.asked.length, 1); // it still called the model
+  assert.match((await w.req("POST", "/v1/hots/Gary/command", { text: "/calls 250" })).body.reply, /250 model calls a day/);
+  assert.match((await w.req("POST", "/v1/hots/Gary/command", { text: "/calls unlimited" })).body.reply, /no limit on model calls/);
+  assert.equal((await w.req("POST", "/v1/hots/Gary/config", { daily_calls: 3 })).body.hot.daily_calls, 10); // a count is at least 10
+  assert.equal((await w.req("POST", "/v1/hots/Gary/command", { text: "/pace 10" })).body.hot.pace_s, 10);
+});
+
+test("files: write, append, edit one exact passage, list, delete - and bad names never become keys", async () => {
+  const w = world();
+  await w.req("POST", "/v1/hots", { goal: "first goal here" });
+  const gary = w.hot("Gary");
+  const cfg = await gary.store.get("cfg");
+  const run = (tool, args) => gary.runTool(cfg, tool, args, "");
+  assert.match(await run("write_file", { name: "plan.md", text: "alpha\nbeta\nalpha\n" }), /saved plan.md/);
+  assert.equal(await run("append_file", { name: "plan.md", text: "gamma\n" }), "saved plan.md (23 characters)");
+  assert.match(await run("edit_file", { name: "plan.md", old: "alpha", new: "x" }), /more than once/);
+  assert.match(await run("edit_file", { name: "plan.md", old: "beta", new: "BETA" }), /saved/);
+  assert.equal(await run("read_file", { name: "plan.md" }), "alpha\nBETA\nalpha\ngamma\n");
+  assert.match(await run("edit_file", { name: "plan.md", old: "nope", new: "x" }), /not in the file/);
+  assert.match(await run("write_file", { name: "../x", text: "y" }), /ERROR/);
+  assert.match(await run("write_file", { name: "..", text: "y" }), /ERROR/);
+  assert.equal(await run("list_files", {}), "plan.md (23 characters)");
+  assert.equal(await run("delete_file", { name: "plan.md" }), "deleted");
+  assert.equal(await run("list_files", {}), "(no files yet)");
+});
+
+test("memory and plan: facts are kept and found again, the plan rides every later prompt", async () => {
+  const w = world((messages) => {
+    const text = said(messages);
+    if (text.includes("GOAL LOOP")) {
+      assert.match(text, /YOUR PLAN[\s\S]*1\. \[x\] find sources[\s\S]*2\. \[ \] check them/);
+      assert.match(text, /FACTS YOU KEPT[\s\S]*the tide API key lives in settings.json/);
+      assert.match(text, /YOUR FILES: notes.md \(2\)/);
+      return "DONE";
+    }
+    throw new Error("unexpected");
+  });
+  await w.req("POST", "/v1/hots", { goal: "first goal here" });
+  const gary = w.hot("Gary");
+  const cfg = await gary.store.get("cfg");
+  const run = (tool, args) => gary.runTool(cfg, tool, args, "");
+  assert.match(await run("remember", { fact: "the tide API key lives in settings.json" }), /kept \(1 facts\)/);
+  assert.equal(await run("remember", { fact: "the tide API key lives in settings.json" }), "already kept");
+  await run("remember", { fact: "harbour pages are served from /h/<slug>" });
+  assert.equal(await run("recall", { query: "where is the API key?" }), "- the tide API key lives in settings.json");
+  assert.equal(await run("recall", { query: "zebra" }), "(nothing kept matches)");
+  assert.match(await run("plan_set", { items: ["find sources", "check them"] }), /plan set \(2 steps\)/);
+  assert.match(await run("plan_done", { item: 1 }), /1 of 2 done/);
+  assert.match(await run("plan_done", { item: 9 }), /ERROR/);
+  await run("write_file", { name: "notes.md", text: "hi" });
+  await w.tick("Gary");
+  assert.equal((await gary.store.get("goal")).status, "achieved"); // the prompt assertions above ran
+});
+
+test("search results are read out of an engine's HTML: the real link, the title, the snippet; engine links dropped", () => {
+  const ddg = `<div class="result"><a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Ftides&amp;rut=abc">Tide <b>tables</b></a>
+    <a class="result__snippet" href="x">High and low <b>tides</b> for the coast.</a></div>
+    <div class="result"><a class="result__a" href="https://duckduckgo.com/y.js?ad=1">An ad</a></div>
+    <div class="result"><a class="result__a" href="https://noaa.example/x">NOAA &amp; tides</a></div>`;
+  assert.deepEqual(searchResults(ddg, "duckduckgo"), [
+    { title: "Tide tables", url: "https://example.com/tides", snippet: "High and low tides for the coast." },
+    { title: "NOAA & tides", url: "https://noaa.example/x", snippet: "" },
+  ]);
+  const bing = `<li class="b_algo"><h2><a href="https://a.example/1" h="x">First</a></h2><div><p class="b_lineclamp">About the first.</p></div></li><li class="b_algo"><h2><a href="https://a.example/1">Repeat</a></h2></li>`;
+  assert.deepEqual(searchResults(bing, "bing"), [{ title: "First", url: "https://a.example/1", snippet: "About the first." }]);
+  assert.deepEqual(searchResults("<html>captcha</html>", "duckduckgo"), []);
+});
+
+test("Python: a script runs in the companion Worker beside the hot's files, what it writes is kept, and a skill is a script kept by name", async () => {
+  const w = world();
+  const sent = [];
+  w.env.PY = {
+    fetch: async (url, init) => {
+      const body = JSON.parse(init.body);
+      sent.push(body);
+      if (body.code.includes("boom")) return new Response(JSON.stringify({ ok: false, out: "Traceback...\nZeroDivisionError", files: {} }));
+      return new Response(JSON.stringify({ ok: true, out: `ran with ${JSON.stringify(body.args)}\n`, files: { "out.csv": "a,b\n1,2\n", "../evil": "x" } }));
+    },
+  };
+  await w.req("POST", "/v1/hots", { goal: "first goal here" });
+  const gary = w.hot("Gary");
+  const cfg = await gary.store.get("cfg");
+  const run = (tool, args) => gary.runTool(cfg, tool, args, "");
+  assert.equal((await w.req("GET", "/v1/hots/Gary")).body.hot.python, true);
+  await run("write_file", { name: "in.csv", text: "x\n1\n" });
+  const out = await run("run_python", { code: "print('hi')", files: ["in.csv", "missing.csv"] });
+  assert.match(out, /^exit ok\nran with null\n\nfiles written: out.csv$/);
+  assert.deepEqual(sent[0].files, { "in.csv": "x\n1\n" });
+  assert.equal(await run("read_file", { name: "out.csv" }), "a,b\n1,2\n");
+  assert.equal((await gary.store.list({ prefix: "note:" })).size, 2); // "../evil" was refused
+  assert.match(await run("run_python", { code: "boom" }), /^FAILED\nTraceback/);
+  assert.match(await run("save_skill", { name: "double_it", about: "doubles ARGS['n']", code: "print(ARGS['n'] * 2)" }), /skill double_it saved/);
+  assert.match(await run("save_skill", { name: "Bad Name", about: "", code: "print(1)" }), /ERROR/);
+  assert.match(await run("run_skill", { name: "double_it", args: { n: 21 } }), /ran with \{"n":21\}/);
+  assert.equal(sent.at(-1).code, "print(ARGS['n'] * 2)");
+  assert.match(await run("run_skill", { name: "nope" }), /no skill named nope/);
+  assert.match(await gary.workingMemory(), /YOUR SKILLS \(run_skill\):\n- double_it: doubles ARGS\['n'\]/);
+  // without the binding the tool says so in words instead of throwing
+  delete w.env.PY;
+  assert.match(await run("run_python", { code: "print(1)" }), /Python is not available/);
+});
+
+/// A stand-in for Cloudflare's browser binding: one session, one page, the DevTools commands the hot uses.
+function fakeBrowser() {
+  const b = { acquired: 0, connects: 0, log: [], page: { url: "about:blank", title: "", text: "" }, alive: true };
+  b.fetch = async (url, init) => {
+    const u = new URL(url);
+    if (init?.method === "POST" && u.pathname === "/v1/devtools/browser") {
+      b.acquired++;
+      b.alive = true;
+      assert.equal(u.searchParams.get("keep_alive"), "600000");
+      return new Response(JSON.stringify({ sessionId: "sess-" + b.acquired }), { status: 200 });
+    }
+    const m = /^\/v1\/devtools\/browser\/(sess-\d+)$/.exec(u.pathname);
+    assert.ok(m, "unexpected browser call " + url);
+    assert.equal(init.headers.Upgrade, "websocket");
+    if (!b.alive || m[1] !== "sess-" + b.acquired) return new Response("session not found", { status: 404 });
+    b.connects++;
+    const listeners = { message: [], close: [], error: [] };
+    const emit = (obj) => queueMicrotask(() => listeners.message.forEach((f) => f({ data: JSON.stringify(obj) })));
+    const ws = {
+      accept() {},
+      addEventListener: (type, f) => listeners[type].push(f),
+      close() {},
+      send(raw) {
+        const c = JSON.parse(raw);
+        b.log.push(c.method);
+        const ok = (result) => emit({ id: c.id, result });
+        if (c.method === "Target.createTarget") return ok({ targetId: "T1" });
+        if (c.method === "Target.attachToTarget") return c.params.targetId === "T1" ? ok({ sessionId: "S1" }) : emit({ id: c.id, error: { message: "No target with given id" } });
+        if (c.method === "Page.navigate") {
+          b.page = { url: c.params.url, title: "Tides", text: "High tide 04:12\nLow tide 10:40" };
+          ok({ frameId: "F" });
+          return emit({ method: "Page.loadEventFired", sessionId: "S1", params: {} });
+        }
+        if (c.method === "Runtime.evaluate") {
+          assert.equal(c.sessionId, "S1");
+          const e = c.params.expression;
+          if (e.includes("location.href")) return ok({ result: { value: JSON.stringify(b.page) } });
+          if (e.includes("throw")) return ok({ exceptionDetails: { text: "Uncaught", exception: { description: "Error: nope" } } });
+          if (e === "1+1") return ok({ result: { value: 2 } });
+          if (e.includes("no element matches") && e.includes('"missing"')) return ok({ result: { value: "no element matches" } });
+          if (e.includes("e.click()")) return ok({ result: { value: "clicked a Next" } });
+          return ok({ result: { value: "typed into input" } });
+        }
+        return ok({});
+      },
+    };
+    return { status: 101, webSocket: ws, text: async () => "" };
+  };
+  return b;
+}
+
+test("the browser: a real page is opened over the DevTools protocol, read, clicked and scripted; the session is kept between iterations and replaced when it is gone", async () => {
+  const w = world();
+  const b = fakeBrowser();
+  w.env.BROWSER = b;
+  await w.req("POST", "/v1/hots", { goal: "first goal here" });
+  const gary = w.hot("Gary");
+  const cfg = await gary.store.get("cfg");
+  const run = (tool, args) => gary.runTool(cfg, tool, args, "");
+  assert.equal((await w.req("GET", "/v1/hots/Gary")).body.hot.browser, true);
+  const page = await run("browser_open", { url: "https://tides.example/today" });
+  assert.equal(page, "Tides\nhttps://tides.example/today\n\nHigh tide 04:12\nLow tide 10:40");
+  assert.deepEqual(b.log.slice(0, 5), ["Target.createTarget", "Target.attachToTarget", "Page.enable", "Runtime.enable", "Page.navigate"]);
+  assert.equal(await run("browser_eval", { js: "1+1" }), "2");
+  assert.match(await run("browser_eval", { js: "throw new Error('nope')" }), /^ERROR: Error: nope/);
+  assert.match(await run("browser_click", { text: "Next" }), /^clicked a Next\n\nTides/);
+  assert.match(await run("browser_click", { selector: "missing" }), /ERROR: no element matches/);
+  assert.equal(await run("browser_type", { selector: "#q", text: "tofino" }), "typed into input");
+  assert.match(await run("browser_open", { url: "ftp://x" }), /ERROR: an http\(s\) URL/);
+  assert.equal(b.acquired, 1);
+  assert.equal(b.connects, 1); // one connection for the whole iteration
+
+  // the next iteration: a new connection to the SAME session and page
+  gary.br.cdp.close();
+  gary.br = null;
+  assert.match(await run("browser_read", {}), /^Tides\nhttps:\/\/tides.example\/today/);
+  assert.equal(b.acquired, 1);
+  assert.equal(b.connects, 2);
+  assert.ok(b.log.lastIndexOf("Target.createTarget") === 0); // re-attached, no new tab
+
+  // the session died on Cloudflare's side (its ten idle minutes passed): a new one is started
+  gary.br.cdp.close();
+  gary.br = null;
+  b.alive = false;
+  assert.match(await run("browser_open", { url: "https://tides.example/tomorrow" }), /tomorrow/);
+  assert.equal(b.acquired, 2);
+  assert.equal(await run("browser_close", {}), "browser closed");
+  assert.equal(await gary.store.get("browser"), undefined);
+
+  // without the binding the tools say so, and are not offered
+  delete w.env.BROWSER;
+  assert.match(await run("browser_open", { url: "https://x.example" }), /no browser in this account/);
+});
+
+test("a hot never calls a private address, directly or through a redirect; a reply still thinking at its end has no text", async () => {
+  for (const h of ["localhost", "127.0.0.1", "10.1.2.3", "192.168.1.1", "172.20.0.1", "169.254.169.254", "100.64.0.1", "::1", "fd00::1", "x.internal", "0.0.0.0"]) assert.ok(privateHost(h), h);
+  for (const h of ["example.com", "8.8.8.8", "172.32.0.1", "100.63.0.1", "1.1.1.1"]) assert.ok(!privateHost(h), h);
+  const w = world();
+  await w.req("POST", "/v1/hots", { goal: "first goal here" });
+  const gary = w.hot("Gary");
+  const cfg = await gary.store.get("cfg");
+  assert.match(await gary.runTool(cfg, "web_fetch", { url: "http://169.254.169.254/latest/meta-data" }, ""), /private or internal/);
+  assert.match(await gary.runTool(cfg, "http_request", { method: "POST", url: "http://localhost:8787/api/v1/x", body: "{}" }, ""), /private or internal/);
+  const realFetch = globalThis.fetch;
+  const seen = [];
+  globalThis.fetch = async (url, init) => {
+    seen.push([init.method, String(url)]);
+    if (String(url) === "https://a.example/go") return new Response("", { status: 302, headers: { location: "https://b.example/page" } });
+    if (String(url) === "https://a.example/trap") return new Response("", { status: 302, headers: { location: "http://10.0.0.5/admin" } });
+    return new Response("<html><head><title>x</title></head><body><p>Hello</p><p>World</p><script>bad()</script></body></html>", { status: 200, headers: { "content-type": "text/html" } });
+  };
+  try {
+    assert.equal(await gary.runTool(cfg, "web_fetch", { url: "https://a.example/go" }, ""), "HTTP 200\nHello\nWorld");
+    assert.deepEqual(seen, [["GET", "https://a.example/go"], ["GET", "https://b.example/page"]]);
+    assert.match(await gary.runTool(cfg, "web_fetch", { url: "https://a.example/trap" }, ""), /redirects to 10\.0\.0\.5, which a hot does not call/);
+    assert.equal(seen.length, 3); // the private hop was never fetched
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+  assert.equal(answerText({ response: "<think>still going" }), "");
+  assert.equal(answerText({ result: { response: "ok" } }), "ok");
+  assert.equal(answerText({ choices: [{ text: "legacy" }] }), "legacy");
+});
+
+test("web_search walks the keyless chain: a SearXNG instance that answers is remembered, and a refusal falls through to the next source", async () => {
+  const w = world();
+  await w.req("POST", "/v1/hots", { goal: "first goal here" });
+  const gary = w.hot("Gary");
+  const cfg = await gary.store.get("cfg");
+  const realFetch = globalThis.fetch;
+  const hosts = [];
+  let mode = "searx-second";
+  globalThis.fetch = async (url) => {
+    const u = new URL(String(url));
+    hosts.push(u.hostname);
+    if (mode === "searx-second" && u.hostname === "search.disroot.org") return new Response(JSON.stringify({ results: [{ title: "Tide tables", url: "https://tides.example/", content: "High and low" }] }), { status: 200 });
+    if (mode === "wikipedia" && u.hostname === "en.wikipedia.org") return new Response(JSON.stringify(["tides", ["Tide"], ["The rise and fall"], ["https://en.wikipedia.org/wiki/Tide"]]), { status: 200 });
+    if (u.hostname === "api.duckduckgo.com") return new Response("{}", { status: 200 });
+    return new Response("blocked", { status: 429 });
+  };
+  try {
+    const out = await gary.runTool(cfg, "web_search", { query: "tide tables" }, "");
+    assert.equal(out, '1 results for "tide tables" (SearXNG):\n1. Tide tables\n   https://tides.example/\n   High and low');
+    assert.deepEqual(hosts, ["searx.be", "search.disroot.org"]);
+    hosts.length = 0;
+    await gary.runTool(cfg, "web_search", { q: "again" }, ""); // an alias for the argument; starts at the one that worked
+    assert.equal(hosts[0], "search.disroot.org");
+    mode = "wikipedia";
+    hosts.length = 0;
+    assert.match(await gary.runTool(cfg, "web_search", { query: "tides" }, ""), /\(Wikipedia\):\n1\. Tide\n   https:\/\/en\.wikipedia\.org\/wiki\/Tide\n   The rise and fall/);
+    assert.ok(hosts.includes("html.duckduckgo.com") && hosts.includes("www.bing.com") && hosts.includes("api.duckduckgo.com"));
+    mode = "nothing";
+    assert.match(await gary.runTool(cfg, "web_search", { query: "tides" }, ""), /^ERROR: no search engine answered \(/);
+    assert.match(await gary.runTool(cfg, "web_search", {}, ""), /ERROR: give the words/);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
 });

@@ -1384,8 +1384,8 @@ fn cmdHelp() u8 {
         \\
         \\HOTS (autonomous goal loops that run in YOUR Cloudflare account - no human, no machine of yours)
         \\  hot                          the roster: at most 3; the first is always named Gary
-        \\  hot deploy "<goal>" [flags]  deploy one: --name N --charter "..." --model @cf/... --pace SECONDS
-        \\                               --size MINDS --calls PER_DAY --budget N --forever
+        \\  hot deploy "<goal>" [flags]  deploy one: --name N --charter "..." --model @cf/... --pace SECONDS (5+)
+        \\                               --size MINDS --calls PER_DAY|unlimited --budget N --forever
         \\                               --local  lets it queue jobs for the veil on THIS machine (deployment only)
         \\  hot tell <name> "<text>"     /goal <text>, /goal stop, /queue <goal>, /pause, /resume, or a message
         \\  hot watch <name>             follow its events

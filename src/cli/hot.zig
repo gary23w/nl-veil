@@ -3,7 +3,8 @@
 //!
 //!   veil hot                              the roster: every hot, its state, its goal
 //!   veil hot deploy "<goal>" [flags]      deploy one (the first is always named Gary)
-//!       --name N  --charter "..."  --model @cf/...  --pace SECONDS  --size MINDS  --calls PER_DAY
+//!       --name N  --charter "..."  --model @cf/...  --pace SECONDS (5 and up)  --size MINDS
+//!       --calls PER_DAY | unlimited
 //!       --budget N  --forever      --local   (let it queue jobs for the veil on THIS machine; deployment only)
 //!   veil hot tell <name> "<text>"         a command (/goal ..., /pause, /queue ...) or a message for its inbox
 //!   veil hot watch <name>                 follow its events
@@ -46,7 +47,7 @@ const Hot = struct {
     local: bool = false,
     goal: ?Goal = null,
 };
-const Roster = struct { ok: bool = false, err: []const u8 = "", connected: bool = false, deployed: bool = false, reachable: bool = false, max: i64 = 0, last_error: []const u8 = "", hots: []const Hot = &.{} };
+const Roster = struct { ok: bool = false, err: []const u8 = "", connected: bool = false, deployed: bool = false, reachable: bool = false, max: i64 = 0, python: bool = false, browser: bool = false, tools_note: []const u8 = "", last_error: []const u8 = "", hots: []const Hot = &.{} };
 const Event = struct { seq: u64 = 0, kind: []const u8 = "", text: []const u8 = "" };
 const Events = struct { ok: bool = false, err: []const u8 = "", seq: u64 = 0, events: []const Event = &.{} };
 const PadEntry = struct { seq: u64 = 0, from: []const u8 = "", text: []const u8 = "" };
@@ -58,8 +59,10 @@ pub fn rosterLine(buf: []u8, h: Hot) []const u8 {
     const g: Goal = h.goal orelse .{};
     var gb: [80]u8 = undefined;
     const goal: []const u8 = if (g.text.len == 0) "(no goal: roaming)" else std.fmt.bufPrint(&gb, "{s} {d}/{d}{s}", .{ g.status, g.improved, g.iteration, if (g.forever) " forever" else "" }) catch "";
-    return std.fmt.bufPrint(buf, "{s: <12} {s: <8} {d}/{d} minds  {d}/{d} calls{s}  {s}  {s}", .{
-        h.name, h.state, h.minds, h.size, h.calls_today, h.daily_calls, if (h.local) "  +this machine" else "", goal, g.text[0..@min(g.text.len, 70)],
+    var cb: [32]u8 = undefined;
+    const calls: []const u8 = if (h.daily_calls > 0) (std.fmt.bufPrint(&cb, "{d}/{d} calls", .{ h.calls_today, h.daily_calls }) catch "") else (std.fmt.bufPrint(&cb, "{d} calls, no limit", .{h.calls_today}) catch "");
+    return std.fmt.bufPrint(buf, "{s: <12} {s: <8} {d}/{d} minds  {s}{s}  {s}  {s}", .{
+        h.name, h.state, h.minds, h.size, calls, if (h.local) "  +this machine" else "", goal, g.text[0..@min(g.text.len, 70)],
     }) catch h.name;
 }
 
@@ -73,6 +76,12 @@ fn fail(what: []const u8, status: u16, body: []const u8, a: std.mem.Allocator) u
     const e = std.json.parseFromSliceLeaky(E, a, body, .{ .ignore_unknown_fields = true }) catch E{};
     std.debug.print("{s} failed (HTTP {d}): {s}\n", .{ what, status, if (e.err.len > 0) e.err else body[0..@min(body.len, 200)] });
     return 1;
+}
+
+/// `--calls unlimited` (or infinite, none, 0) is no limit on model calls: the wire value is 0.
+fn callsArg(v: []const u8) []const u8 {
+    for ([_][]const u8{ "unlimited", "infinite", "infinity", "none", "off" }) |w| if (std.ascii.eqlIgnoreCase(v, w)) return "0";
+    return v;
 }
 
 /// `,"a":1,"b":2` (what cli.appendStr / appendNum build) as the object `{"a":1,"b":2}`.
@@ -115,6 +124,8 @@ fn list(ctx: *Ctx, a: std.mem.Allocator) u8 {
         out("{s}\n", .{rosterLine(&b, h)});
     }
     if (r.hots.len == 0 and r.reachable) out("(no hots - deploy the first with `veil hot deploy \"<goal>\"`)\n", .{});
+    if (r.reachable) out("tools: files, web search, web fetch, HTTP, memory, plan, swarm{s}{s}\n", .{ if (r.python) ", Python + skills" else "", if (r.browser) ", browser" else "" });
+    if (r.tools_note.len > 0) out("{s}\n", .{r.tools_note});
     return 0;
 }
 
@@ -124,7 +135,7 @@ fn deploy(ctx: *Ctx, a: std.mem.Allocator, args: []const []const u8) u8 {
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const x = args[i];
-        if (cli.flagVal(args, &i, x, "--name")) |v| cli.appendStr(a, &jb, "name", v) else if (cli.flagVal(args, &i, x, "--charter")) |v| cli.appendStr(a, &jb, "charter", v) else if (cli.flagVal(args, &i, x, "--model")) |v| cli.appendStr(a, &jb, "model", v) else if (cli.flagVal(args, &i, x, "--pace")) |v| cli.appendNum(a, &jb, "pace_s", v) else if (cli.flagVal(args, &i, x, "--size")) |v| cli.appendNum(a, &jb, "size", v) else if (cli.flagVal(args, &i, x, "--calls")) |v| cli.appendNum(a, &jb, "daily_calls", v) else if (cli.flagVal(args, &i, x, "--budget")) |v| cli.appendNum(a, &jb, "budget", v) else if (std.mem.eql(u8, x, "--forever")) {
+        if (cli.flagVal(args, &i, x, "--name")) |v| cli.appendStr(a, &jb, "name", v) else if (cli.flagVal(args, &i, x, "--charter")) |v| cli.appendStr(a, &jb, "charter", v) else if (cli.flagVal(args, &i, x, "--model")) |v| cli.appendStr(a, &jb, "model", v) else if (cli.flagVal(args, &i, x, "--pace")) |v| cli.appendNum(a, &jb, "pace_s", v) else if (cli.flagVal(args, &i, x, "--size")) |v| cli.appendNum(a, &jb, "size", v) else if (cli.flagVal(args, &i, x, "--calls")) |v| cli.appendNum(a, &jb, "daily_calls", callsArg(v)) else if (cli.flagVal(args, &i, x, "--budget")) |v| cli.appendNum(a, &jb, "budget", v) else if (std.mem.eql(u8, x, "--forever")) {
             jb.appendSlice(a, ",\"forever\":true") catch return 1;
         } else if (std.mem.eql(u8, x, "--local")) {
             jb.appendSlice(a, ",\"local\":true") catch return 1;
@@ -209,7 +220,7 @@ fn set(ctx: *Ctx, a: std.mem.Allocator, args: []const []const u8) u8 {
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const x = args[i];
-        if (cli.flagVal(args, &i, x, "--model")) |v| cli.appendStr(a, &jb, "model", v) else if (cli.flagVal(args, &i, x, "--charter")) |v| cli.appendStr(a, &jb, "charter", v) else if (cli.flagVal(args, &i, x, "--pace")) |v| cli.appendNum(a, &jb, "pace_s", v) else if (cli.flagVal(args, &i, x, "--size")) |v| cli.appendNum(a, &jb, "size", v) else if (cli.flagVal(args, &i, x, "--calls")) |v| cli.appendNum(a, &jb, "daily_calls", v) else if (std.mem.eql(u8, x, "--pause")) {
+        if (cli.flagVal(args, &i, x, "--model")) |v| cli.appendStr(a, &jb, "model", v) else if (cli.flagVal(args, &i, x, "--charter")) |v| cli.appendStr(a, &jb, "charter", v) else if (cli.flagVal(args, &i, x, "--pace")) |v| cli.appendNum(a, &jb, "pace_s", v) else if (cli.flagVal(args, &i, x, "--size")) |v| cli.appendNum(a, &jb, "size", v) else if (cli.flagVal(args, &i, x, "--calls")) |v| cli.appendNum(a, &jb, "daily_calls", callsArg(v)) else if (std.mem.eql(u8, x, "--pause")) {
             jb.appendSlice(a, ",\"paused\":true") catch return 1;
         } else if (std.mem.eql(u8, x, "--resume")) {
             jb.appendSlice(a, ",\"paused\":false") catch return 1;
@@ -303,6 +314,9 @@ test "hot cli: a roster row reads the runtime's own status JSON, and an event ke
     try std.testing.expect(std.mem.indexOf(u8, row, "41/400 calls  +this machine") != null);
     try std.testing.expect(std.mem.indexOf(u8, row, "active 4/7 forever  map every harbour") != null);
     try std.testing.expect(std.mem.indexOf(u8, rosterLine(&b, r.hots[1]), "(no goal: roaming)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rosterLine(&b, .{ .name = "Ada", .calls_today = 7, .daily_calls = 0 }), "7 calls, no limit") != null);
+    try std.testing.expectEqualStrings("0", callsArg("Unlimited"));
+    try std.testing.expectEqualStrings("250", callsArg("250"));
     const ev = try std.json.parseFromSliceLeaky(Events, a, "{\"ok\":true,\"seq\":2,\"events\":[{\"seq\":2,\"t\":1,\"kind\":\"verdict\",\"text\":\"improved [3/10]: saved\",\"i\":1}]}", .{ .ignore_unknown_fields = true });
     try std.testing.expectEqualStrings("verdict  improved [3/10]: saved", eventLine(a, ev.events[0]));
 }

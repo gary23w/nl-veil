@@ -568,6 +568,8 @@ if ($node) {
     Write-Host ">> hot runtime suite (node --test cloud/hot.test.mjs)"
     Write-Host "   SKIPPED: node not on PATH -- cloud/hot.js was NOT tested" -ForegroundColor Yellow
 }
+# cloud/hot_py.py is the Python a hot runs (a second Worker). Its logic is plain Python, tested as such.
+$ok = (Confirm-Gate (Invoke-Gate "hot python runner (cloud/hot_py_test.py)" $python @("cloud/hot_py_test.py") $repo 60 "")) -and $ok
 # -Dbuiltin=false here for the same reason as scripts/check.sh (see the comment there): -Dapp=false only
 # skips raylib, so without this the gate also pulls llama.cpp + ~50MB of Vulkan shaders it never uses, and
 # a flaky GitHub download reads as a broken build. The default-build gate below still covers builtin+vulkan.

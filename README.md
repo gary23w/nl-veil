@@ -286,16 +286,35 @@ so they never cross the public internet and need no API key.
   size you allow (the tab's Grow / Shrink buttons move that ceiling).
 - **Hots work together.** They share one scratchpad, which you can read and write too, and can message each
   other. A hot can also cast its own small swarm: several minds side by side, one task each.
-- **Its tools** are its own notes, the scratchpad, messages to other hots, fetching public pages and APIs,
-  the inner swarm, a goal queue and a report line to you.
+- **Its tool belt.** A hot works with real tools, in the cloud:
+  - *files* - its own workspace (`write_file`, `read_file`, `edit_file`, `append_file`, `list_files`,
+    `delete_file`), kept across iterations and mirrored to your machine;
+  - *the web* - `web_search` (a keyless chain: public SearXNG instances, DuckDuckGo, Bing, then reference
+    lookups), `web_fetch`, and `http_request` for any method, headers and body; private and internal addresses
+    are refused, on redirects too;
+  - *a real browser* - `browser_open`, `browser_read`, `browser_links`, `browser_click`, `browser_type`,
+    `browser_eval`, `browser_close`, driving Cloudflare's browser over the DevTools protocol for pages that
+    need JavaScript, clicks or forms; the page stays open between iterations;
+  - *Python* - `run_python` runs a script (the whole standard library, HTTP included) beside the hot's files
+    and keeps what it writes; `save_skill` keeps a script as a tool of the hot's own and `run_skill` runs it
+    again, so a hot builds its own tools;
+  - *memory and planning* - `remember` / `recall` for facts, `plan_set` / `plan_done` for a plan it sees every
+    iteration;
+  - *each other and you* - the scratchpad, `tell`, an inner `swarm`, `goal_queue`, `say`.
+
+  Python runs in a second small Worker (`veil-hots-py`) and the browser is Cloudflare's Browser Rendering;
+  both are added when your account takes them, and the tab says which a hot has and why not otherwise.
 - **Your machine, only if you say so.** The deploy form has one box, unchecked by default: *let it use THIS
   machine*. Checked, the hot may queue jobs for the veil on your computer - the full local tool set, run
   unattended as an ordinary chat conversation named `hot_<name>_...` you can open afterwards - and gets the
   results back. Nothing listens at home for this: your veil asks the hot for jobs while it is running. The
   box is decided once, at deployment; it cannot be granted later.
-- **It has a budget.** Each hot has a pace (one iteration every N seconds) and a number of model calls a day;
-  when the day's calls are spent it rests until the next UTC day. Workers AI usage is billed to your account
-  by Cloudflare like any other.
+- **It has a budget, and you set it.** Each hot has a pace - one iteration every N seconds, from 5 seconds up -
+  and a number of model calls a day, or **no limit**; with a limit, it rests when the day's calls are spent
+  until the next UTC day. Workers AI usage is billed to your account by Cloudflare like any other, so an
+  unlimited hot at a 5-second pace spends as fast as its model answers.
+- **A model that only reasons does not stall it.** A reply with no visible answer is asked again with more
+  room, and then answered by a model that does not reason, with a line in the console saying so.
 - **You pick its model from your account.** The deploy form's MODEL list is your login's live Workers AI
   catalogue. A goal or charter may be as long as that model can carry - about a tenth of its context window,
   between 800 and 4000 characters - and the form counts as you type.
@@ -782,7 +801,7 @@ CHAT (the server-side veil brain)
 HOTS (autonomous goal loops that run in YOUR Cloudflare account)
   hot                          the roster: at most 3; the first is always named Gary
   hot deploy "<goal>" [flags]  --name N --charter "..." --model @cf/... --pace SECONDS --size MINDS
-                               --calls PER_DAY --budget N --forever
+                               --calls PER_DAY|unlimited --budget N --forever   (--pace from 5)
                                --local  lets it queue jobs for the veil on THIS machine (deployment only)
   hot tell <name> "<text>"     /goal <text>, /goal stop, /queue <goal>, /pause, /resume, or a message
   hot watch <name>             follow its events
