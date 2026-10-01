@@ -3346,7 +3346,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     defer verify_buf.deinit(gpa);
     const verify_prompt: []const u8 = blk_vp: {
         // tier test inline: `afk` is declared with the loop-mode block below this point
-        const vbase = if (loop >= LOOP_AFK) TERMINAL_VERIFY_PROMPT_AFK else TERMINAL_VERIFY_PROMPT;
+        const vbase = if (if (goal_on) goal_state.g.?.forever else loop >= LOOP_AFK) TERMINAL_VERIFY_PROMPT_AFK else TERMINAL_VERIFY_PROMPT;
         if (brief.done_when.len == 0) break :blk_vp vbase;
         verify_buf.appendSlice(gpa, vbase) catch break :blk_vp vbase;
         verify_buf.appendSlice(gpa, "\nThis turn is not done until EVERY one of these holds — check each one and name any that does not:\n") catch break :blk_vp TERMINAL_VERIFY_PROMPT;
@@ -3386,7 +3386,10 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     // AUTO-LOOP MODE (desk chat_loop / chat_loop_afk, now server-driven). A plan drives its own subtask budget; a
     // free-form turn drives DRIVE_MAX off, LOOP_MAX_STEPS armed-on, effectively-unbounded in afk (Stop is the exit).
     const armed = loop >= LOOP_ON or goal_on; // a goal arms the loop whatever tier the client sent
-    const afk = loop >= LOOP_AFK or (goal_on and goal_state.g.?.forever); // a forever goal has afk's no-end-state rules
+    // A goal that drives the turn decides the tier: a forever goal has afk's no-end-state rules, and a FINITE goal
+    // keeps its finish line even when the client sent loop=afk (the desk arms afk for every /goal so the loop
+    // carries across turns; afk's "DONE is never accepted" would otherwise make achieved unreachable).
+    const afk = if (goal_on) goal_state.g.?.forever else loop >= LOOP_AFK;
     const persist = afk or goal_on; // a finished plan does not end these: the loop goes on free-form
     // MID-TURN COURSE CHECK, on for the runs where drift is expensive: an armed loop (up to 30 steps, or
     // unbounded in afk) or a plan walking its board. A plain 6-step turn is short enough that the user is

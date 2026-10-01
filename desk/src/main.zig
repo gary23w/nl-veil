@@ -3567,8 +3567,12 @@ fn renderConsole(view: t.Rect, card_top: f32, text_: []const u8, fsz: i32, draw:
 /// (backdrop + copy chip), GFM tables (aligned columns), headings, horizontal rules, bullets, and inline
 /// **bold** / `code` / <br> handled. ONE function measures AND draws (draw flag) so scroll math and pixels
 /// can never disagree. Returns the y after the message.
-fn renderMsg(view: t.Rect, y0: f32, role: store_mod.ChatRole, text_: []const u8, fsz: i32, draw: bool, cursor: bool, img: []const u8) f32 {
+fn renderMsg(view: t.Rect, y0: f32, role: store_mod.ChatRole, text_in: []const u8, fsz: i32, draw: bool, cursor: bool, img: []const u8) f32 {
     var yy = y0;
+    // A `/goal ...` message is a GOAL row: the label says "goal", its flags sit beside the label, and the body is
+    // the goal itself - the slash command never shows. Decided here, so the measure and draw passes agree.
+    const gview: ?GoalView = if (role == .user) goalView(text_in) else null;
+    const text_ = if (gview) |g| g.body else text_in;
     // A folded shell result ("[console]\n$ cmd\n…") renders as a styled terminal CARD instead of plain prose.
     // renderConsole is reached HERE in BOTH the height-cache/measure pass and the draw pass (renderMsg is called
     // in each), so its height can't diverge. The card carries its own "console" header, so the outer role label
@@ -3580,7 +3584,11 @@ fn renderMsg(view: t.Rect, y0: f32, role: store_mod.ChatRole, text_: []const u8,
         // the LIVE reply (cursor=true only on the streaming message) carries the animated BRAND MARK +
         // thought dots — both paced by real stream activity (see thinkEnergy)
         if (cursor and role == .veil) lx += drawThinkingMark(lx, yy);
-        t.text(roleLabel(role), @intFromFloat(lx), @intFromFloat(yy), 11, roleColor(role));
+        if (gview) |g| {
+            const gl = t.z("goal", .{});
+            t.text(gl, @intFromFloat(lx), @intFromFloat(yy), 11, t.orange);
+            if (g.flags.len > 0) t.textClip(g.flags, @intFromFloat(lx + @as(f32, @floatFromInt(t.measure(gl, 11))) + 10), @intFromFloat(yy), 11, t.comment, @intFromFloat(@max(40, view.width - 120)));
+        } else t.text(roleLabel(role), @intFromFloat(lx), @intFromFloat(yy), 11, roleColor(role));
         if (cursor and role == .veil) drawThinkingActivity(lx + @as(f32, @floatFromInt(t.measure(roleLabel(role), 11))) + 14, yy);
     }
     yy += MSG_HEAD_H;
@@ -4283,6 +4291,41 @@ fn drawThinkingActivity(x: f32, y: f32) void {
     const word = thinkWord();
     const wa: u8 = @intFromFloat(120.0 + 90.0 * (0.5 + 0.5 * @sin(tm * 2.0))); // gentle breathing
     t.text(word, @intFromFloat(x + @as(f32, @floatFromInt(dots)) * dw + 8), @intFromFloat(y + 1), 11, t.withAlpha(t.magenta, wa));
+}
+
+/// How a `/goal ...` message reads in the transcript: `body` is the goal text (or the command word), `flags` the
+/// `--budget N --forever --check ...` tail shown beside the label. Null for any other message. Pure; both slices
+/// point into `text` (or a literal).
+const GoalView = struct { body: []const u8, flags: []const u8 };
+
+fn goalView(text: []const u8) ?GoalView {
+    const tr = std.mem.trim(u8, text, " \r\n\t");
+    if (!std.mem.startsWith(u8, tr, "/goal")) return null;
+    const rest = tr["/goal".len..];
+    if (rest.len > 0 and rest[0] != ' ' and rest[0] != '\n' and rest[0] != '\t') return null; // "/goals"
+    const r = std.mem.trim(u8, rest, " \r\n\t");
+    if (r.len == 0) return .{ .body = "status", .flags = "" };
+    var at: usize = 0;
+    while (std.mem.indexOfPos(u8, r, at, "--")) |i| : (at = i + 2) {
+        if (i == 0 or r[i - 1] == ' ') {
+            const body = std.mem.trim(u8, r[0..i], " \t");
+            if (body.len == 0) break; // flags only ("/goal --forever"): show them as the body
+            return .{ .body = body, .flags = r[i..] };
+        }
+    }
+    return .{ .body = r, .flags = "" };
+}
+
+test "goal row: the slash command never shows - body is the goal, flags ride beside the label" {
+    const g = goalView("/goal make every test pass --budget 6 --check python t.py").?;
+    try std.testing.expectEqualStrings("make every test pass", g.body);
+    try std.testing.expectEqualStrings("--budget 6 --check python t.py", g.flags);
+    try std.testing.expectEqualStrings("status", goalView("/goal").?.body);
+    try std.testing.expectEqualStrings("stop", goalView(" /goal stop ").?.body);
+    try std.testing.expectEqualStrings("--forever", goalView("/goal --forever").?.body);
+    try std.testing.expectEqualStrings("use a pre-commit hook", goalView("/goal use a pre-commit hook").?.body);
+    try std.testing.expect(goalView("/goals matter") == null);
+    try std.testing.expect(goalView("set a /goal") == null);
 }
 
 fn roleLabel(role: store_mod.ChatRole) [:0]const u8 {
