@@ -36,7 +36,8 @@
       { p: 'cli/chat', c: 'CL-02', t: 'veil chat REPL — server-side brain, client-mode tool delegation', s: 'cli/chat.zig' },
       { p: 'cli/exec_tool', c: 'CL-03', t: 'Shared client tool executor — one tools.execute in the invoker cwd', s: 'cli/exec_tool.zig' },
       { p: 'cli/hub', c: 'CL-04', t: 'Fleet console — roster, broadcast say/goal, stopall over the API', s: 'cli/hub.zig' },
-      { p: 'cli/swarm_tui', c: 'CL-05', t: 'veil --swarm — a terminal view of a live swarm, one chat line into it', s: 'cli/swarm_tui.zig' }
+      { p: 'cli/swarm_tui', c: 'CL-05', t: 'veil --swarm — a terminal view of a live swarm, one chat line into it', s: 'cli/swarm_tui.zig' },
+      { p: 'cli/hot', c: 'CL-06', t: 'veil hot — deploy, tell, watch, set and delete hots from the terminal', s: 'cli/hot.zig' }
     ]},
     { key: 'config/', label: 'CONFIG — THE VAULT', docs: [
       { p: 'config/key_vault', c: 'CF-01', t: 'Key vault — write-only BYOK: seal in, never read out', s: 'key_vault.zig' },
@@ -46,7 +47,8 @@
       { p: 'config/local_models', c: 'CF-05', t: 'Installed Ollama models — loopback /api/tags relay', s: 'local_models.zig' },
       { p: 'config/server_config', c: 'CF-06', t: 'Admin runtime defaults — model trio + browser preference, JSON-persisted', s: 'server_config.zig' },
       { p: 'config/cf_r2', c: 'CF-07', t: 'R2 backup — incremental chat + memory mirror into a bucket the user owns', s: 'cf_r2.zig' },
-      { p: 'config/cf_tunnel', c: 'CF-08', t: 'Cloudflare Tunnel — the public-URL switch: quick by default, named + Access on request', s: 'cf_tunnel.zig' }
+      { p: 'config/cf_tunnel', c: 'CF-08', t: 'Cloudflare Tunnel — the public-URL switch: quick by default, named + Access on request', s: 'cf_tunnel.zig' },
+      { p: 'config/cf_hot', c: 'CF-09', t: 'Hots — goal loops in the user\'s own Cloudflare account: upload, relay, the owner\'s-machine bridge', s: 'cf_hot.zig' }
     ]},
     { key: 'plug/', label: 'PLUG — THE EXTENSION LAYER', docs: [
       { p: 'plug/plugins', c: 'PG-01', t: 'Plugin registry — Lua manifests, tool/policy/prompt hooks, swap-on-reload', s: 'plugins.zig' },
@@ -168,7 +170,8 @@
       { p: 'desk/watchdog', c: 'DK-20', t: 'Watchdog — UI-hang witness: stale frames + the OS hung-window verdict', s: 'watchdog.zig' },
       { p: 'desk/wsock', c: 'DK-21', t: 'Wsock — blocking Winsock round trip, twin of the server copy', s: 'wsock.zig' },
       { p: 'desk/nap', c: 'DK-22', t: 'Nap — alert-free sleep + heartbeat clock for desk threads', s: 'nap.zig' },
-      { p: 'desk/updater', c: 'DK-23', t: 'Release updater — verified downloads, staged replacement and restart', s: 'updater.zig' }
+      { p: 'desk/updater', c: 'DK-23', t: 'Release updater — verified downloads, staged replacement and restart', s: 'updater.zig' },
+      { p: 'desk/hots', c: 'DK-24', t: 'Hots — roster rows, event tail and scratchpad for the Hots tab', s: 'hots.zig' }
     ]}
   ];
 

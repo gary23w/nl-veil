@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const scan = @import("scan.zig");
+const hots = @import("hots.zig");
 const log = @import("log.zig");
 
 /// A tiny io-free spinlock. std.Thread.Mutex is gone in this Zig and std.Io.Mutex needs an io handle the
@@ -20,9 +21,9 @@ const SpinLock = struct {
     }
 };
 
-pub const Tab = enum { dashboard, chat, swarm, hub, scheduled, settings }; // deploy = the Swarm tab's inner form
+pub const Tab = enum { dashboard, chat, swarm, hots, hub, scheduled, settings }; // deploy = the Swarm tab's inner form
 
-pub const CmdKind = enum { none, select, say, set_goal, stop, deploy, delete, open_folder, refresh_now, open_file, sched_create, sched_update, sched_toggle, sched_delete, sched_run, oauth_cf_login, oauth_cf_logout, open_url, builtin_pull, builtin_cancel, builtin_import, builtin_remove, builtin_check, dataset_start, dataset_stop, cf_tunnel_on, cf_tunnel_off, lineage_accept, lineage_reject };
+pub const CmdKind = enum { none, select, say, set_goal, stop, deploy, delete, open_folder, refresh_now, open_file, sched_create, sched_update, sched_toggle, sched_delete, sched_run, oauth_cf_login, oauth_cf_logout, open_url, builtin_pull, builtin_cancel, builtin_import, builtin_remove, builtin_check, dataset_start, dataset_stop, cf_tunnel_on, cf_tunnel_off, lineage_accept, lineage_reject, hot_select, hot_deploy, hot_command, hot_config, hot_delete, hot_pad_write, hot_open_folder, hot_pad_clear };
 
 /// A UI→poller command. Fixed-size, copied by value into the ring, so no cross-thread allocation.
 pub const Command = struct {
@@ -1152,6 +1153,26 @@ pub const Store = struct {
     cf_tun_url_len: usize = 0,
     cf_tun_err: [160]u8 = undefined,
     cf_tun_err_len: usize = 0,
+
+    // --- Hots (hots.zig): the poller writes from GET /api/v1/hots, the selected hot's events and the shared
+    // scratchpad, and ONLY while the Hots tab is being drawn - each poll is a call into the user's Cloudflare
+    // account. The tab raises hots_watch every frame; the poller reads and lowers it every tick.
+    hots_watch: bool = false,
+    hots_seen: bool = false, //   a roster fetch has landed at least once
+    hots_denied: bool = false, // the server refused this login (hots are admin-gated)
+    hots_busy: bool = false, //   a deployment is in flight (the first one uploads the runtime: up to a minute)
+    hots: hots.Roster = .{},
+    hot_sel: [hots.NAME_MAX]u8 = [_]u8{0} ** hots.NAME_MAX, // the hot whose console is shown
+    hot_sel_len: u8 = 0,
+    hot_events: [scan.MAX_LOG]hots.Ev = undefined,
+    hot_event_count: usize = 0,
+    hot_event_seq: u64 = 0, // newest event seq held for hot_sel
+    hot_pad: [hots.MAX_PAD]hots.PadRow = undefined,
+    hot_pad_count: usize = 0,
+    // The deploy form's JSON (a goal and a charter outgrow Command.text once escaped): parked here under lock,
+    // consumed and cleared by the poller - the sched_create_json discipline.
+    hot_deploy_json: [6144]u8 = undefined,
+    hot_deploy_len: usize = 0,
 
     // --- built-in model status (poller writes from GET /api/v1/models/builtin; Settings tab reads) ---
     // One snapshot of the server's own engine: whether the binary carries it (-Dbuiltin), whether the

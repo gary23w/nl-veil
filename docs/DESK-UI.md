@@ -30,6 +30,19 @@ the chat pane; copying preserves the original text, indentation, and line ending
 Both backtick and tilde fences are supported, including longer fences surrounding
 shorter examples and incomplete blocks during streaming.
 
+The Hots tab lists the account's hots (at most three, the first named Gary) on the
+left, above the scratchpad they share: entries wrap and scroll, newest at the bottom,
+and a two-click *clear* empties it for the next set of hots. The right side is the
+selected hot: its goal and counters, Pause / Resume, Shrink / Grow, **Open folder**
+(its local run folder: `events.log`, notes, status), a two-click Delete, the event
+console and one line that sends it a message or a command. The console wraps every
+event and scrolls with the wheel or its bar; scrolling up stops it following, and
+*latest* (or scrolling back down) follows again. "Deploy a hot" replaces the right
+side with the deploy form: MODEL is a list of the account's live Workers AI models,
+the goal and charter count against what that model can carry, and the last box,
+"let it use THIS machine", starts unchecked on every new form. The tab asks the
+server for the roster, the events and the scratchpad only while it is on screen.
+
 ## Manual review
 
 - Open each settings page at normal and XL text sizes. Scroll with the wheel and
@@ -41,6 +54,12 @@ shorter examples and incomplete blocks during streaming.
   visible without forcing the transcript to follow new output.
 - Resize the chat pane while streaming prose, tables, and long code. Change text
   size and font; verify message spacing recalculates.
+- With a Cloudflare login, open Hots, deploy one, and watch its console fill. Scroll
+  up, check that long rows wrap and stay put, then press *latest*. Send it a message
+  and `/pause`; Grow and Shrink it; open its folder; click Delete once, click
+  elsewhere, and confirm nothing was deleted. Open the form again: the machine box is
+  unchecked, the MODEL list shows the account's models, and a goal past the counter
+  disables Deploy.
 - Copy code from backtick, tilde, nested, and unfinished fences. Compare with the
   original bytes, including tabs and Unicode.
 

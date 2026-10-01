@@ -560,6 +560,14 @@ if ($node) {
     Write-Host ">> web assets parse (node --check app.js)"
     Write-Host "   SKIPPED: node not on PATH -- web/public/app.js was NOT parsed" -ForegroundColor Yellow
 }
+# cloud/hot.js is the hot runtime: @embedFile'd and uploaded into a user's Cloudflare account as it is. Nothing
+# in the Zig build runs it, so its own suite runs here, under node. Same name as check.sh's gate, same loud skip.
+if ($node) {
+    $ok = (Confirm-Gate (Invoke-Gate "hot runtime suite (node --test cloud/hot.test.mjs)" $node.Source @("--test", "cloud/hot.test.mjs") $repo 120 "")) -and $ok
+} else {
+    Write-Host ">> hot runtime suite (node --test cloud/hot.test.mjs)"
+    Write-Host "   SKIPPED: node not on PATH -- cloud/hot.js was NOT tested" -ForegroundColor Yellow
+}
 # -Dbuiltin=false here for the same reason as scripts/check.sh (see the comment there): -Dapp=false only
 # skips raylib, so without this the gate also pulls llama.cpp + ~50MB of Vulkan shaders it never uses, and
 # a flaky GitHub download reads as a broken build. The default-build gate below still covers builtin+vulkan.

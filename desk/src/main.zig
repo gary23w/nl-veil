@@ -11,6 +11,7 @@ const rl = @import("raylib");
 const t = @import("theme.zig");
 const store_mod = @import("store.zig");
 const scan = @import("scan.zig");
+const hots = @import("hots.zig");
 const poller_mod = @import("poller.zig");
 const chat_mod = @import("chat.zig");
 const llm = @import("llm.zig");
@@ -111,7 +112,7 @@ fn tbThemeRect() t.Rect {
 }
 
 const InnerTab = enum { console, details, files };
-const DdKind = enum { none, provider, model, style, minutes, stack, mode, chat_provider, chat_byok, chat_model, think_provider, think_byok, think_model, prompt_provider, prompt_byok, prompt_model, sched_model, chat_role };
+const DdKind = enum { none, provider, model, style, minutes, stack, mode, chat_provider, chat_byok, chat_model, think_provider, think_byok, think_model, prompt_provider, prompt_byok, prompt_model, sched_model, chat_role, hot_model };
 
 /// catalog.providers index of the BUILT-IN provider — the Settings one-click select writes it into
 /// chat_byok. Comptime so a catalog edit that drops or renames the provider fails the build here
@@ -253,6 +254,27 @@ const Ui = struct {
     d_breakout: bool = false,
     d_psyche: bool = false,
     swarm_inner: SwarmInner = .live, // Swarm tab: live view | the deploy form (Deploy folded in as an inner tab)
+    // Hots tab: the deploy form's fields, the line that talks to the selected hot, the scratchpad line
+    hot_form: bool = false,
+    hot_name: Field = .{},
+    hot_goal: Field = .{},
+    hot_charter: Field = .{},
+    hot_model: Field = .{},
+    hot_cmd: Field = .{},
+    hot_padline: Field = .{},
+    hot_pace: usize = 3, // index into HOT_PACES (10 minutes)
+    hot_calls: usize = 3, // index into HOT_CALLS (400 a day)
+    hot_size: i32 = 3,
+    hot_forever: bool = false,
+    hot_local: bool = false, // "let it use THIS machine": unchecked on every new form
+    hot_del: [hots.NAME_MAX]u8 = undefined, // the hot whose Delete was clicked once (the second click deletes)
+    hot_del_len: u8 = 0,
+    hot_scroll: f32 = 0, // the console, in visual lines
+    hot_follow: bool = true, // pinned to the newest line
+    hot_sb_drag: bool = false, // the console's scrollbar is being dragged
+    hot_pad_scroll: f32 = 0, // the scratchpad, in pixels
+    hot_pad_follow: bool = true,
+    hot_pad_clear_armed: bool = false, // "clear" was clicked once (the second click clears)
     lin_scroll: f32 = 0, // Swarm tab Lineages view
     // live-reply activity tracking (drives the thinking mark's energy): the stream's last seen length +
     // the wall time it last GREW. Updated at the one live renderMsg call site each frame.
@@ -330,7 +352,7 @@ const Ui = struct {
     log_follow: bool = true,
     details_scroll: f32 = 0, // swarm Details tab: the goal + config + blueprint can outgrow the panel
 
-    const Focus = enum { none, chat, d_name, d_key, d_cfacct, d_goal, d_gateway, d_lineage, c_input, c_rename, s_model, s_url, s_ckey, s_cfacct, s_tunhost, s_tkey, s_pkey, s_host, s_port, con_input, sc_name, sc_prompt, sc_details, sc_base, sc_model, sc_key };
+    const Focus = enum { none, chat, d_name, d_key, d_cfacct, d_goal, d_gateway, d_lineage, c_input, c_rename, s_model, s_url, s_ckey, s_cfacct, s_tunhost, s_tkey, s_pkey, s_host, s_port, con_input, sc_name, sc_prompt, sc_details, sc_base, sc_model, sc_key, h_name, h_goal, h_charter, h_model, h_cmd, h_pad };
     // Per chat-table horizontal-scroll offset (px), keyed by a content hash so it survives vertical scroll +
     // stream-settle. A tiny FIFO (see tblScrollOff): a new table evicts the oldest.
     const TblHScroll = struct { id: u64 = 0, off: f32 = 0 };
@@ -759,7 +781,7 @@ pub fn runApp(data_dir: ?[]const u8) !void {
                                     gotoDeploy(); // deploy is the Swarm tab's inner form now — "tab deploy" still lands there
                                 } else {
                                     const tv: ?Tab =
-                                        if (std.mem.eql(u8, tn, "dashboard")) .dashboard else if (std.mem.eql(u8, tn, "chat")) .chat else if (std.mem.eql(u8, tn, "swarm")) .swarm else if (std.mem.eql(u8, tn, "hub")) .hub else if (std.mem.eql(u8, tn, "scheduled")) .scheduled else if (std.mem.eql(u8, tn, "tasks")) .scheduled else if (std.mem.eql(u8, tn, "settings")) .settings else null;
+                                        if (std.mem.eql(u8, tn, "dashboard")) .dashboard else if (std.mem.eql(u8, tn, "chat")) .chat else if (std.mem.eql(u8, tn, "swarm")) .swarm else if (std.mem.eql(u8, tn, "hots")) .hots else if (std.mem.eql(u8, tn, "hub")) .hub else if (std.mem.eql(u8, tn, "scheduled")) .scheduled else if (std.mem.eql(u8, tn, "tasks")) .scheduled else if (std.mem.eql(u8, tn, "settings")) .settings else null;
                                     if (tv) |v| setTab(v);
                                 }
                             } else if (std.mem.startsWith(u8, cmd, "right ")) {
@@ -894,6 +916,7 @@ pub fn runApp(data_dir: ?[]const u8) !void {
             .dashboard => drawDashboard(&store, body),
             .chat => drawChat(&store, body),
             .swarm => drawSwarm(&store, body),
+            .hots => drawHots(&store, body),
             .hub => drawHub(body),
             .scheduled => drawScheduled(&store, body),
             .settings => drawSettings(&store, body),
@@ -1657,7 +1680,7 @@ fn gotoDeploy() void {
 fn handleKeys(store: *Store) void {
     // any handled shortcut counts as activity so the redraw stays at 60fps for a beat (see the FPS gate)
     if (rl.isKeyPressed(.f12) or rl.isKeyPressed(.one) or rl.isKeyPressed(.two) or rl.isKeyPressed(.three) or
-        rl.isKeyPressed(.four) or rl.isKeyPressed(.five) or rl.isKeyPressed(.six) or rl.isKeyPressed(.seven) or
+        rl.isKeyPressed(.four) or rl.isKeyPressed(.five) or rl.isKeyPressed(.six) or rl.isKeyPressed(.seven) or rl.isKeyPressed(.eight) or
         rl.isKeyPressed(.enter) or rl.isKeyPressed(.escape) or rl.isKeyPressed(.tab) or rl.isKeyDown(.left_control)) ui.input_active = true;
     if (rl.isKeyPressed(.f12)) ui.show_log = !ui.show_log; // debug log overlay
     if (ui.focus == .none) {
@@ -1668,6 +1691,7 @@ fn handleKeys(store: *Store) void {
         if (rl.isKeyPressed(.five)) setTab(.hub);
         if (rl.isKeyPressed(.six)) setTab(.settings);
         if (rl.isKeyPressed(.seven)) gotoDeploy(); // deploy lives inside Swarm now
+        if (rl.isKeyPressed(.eight)) setTab(.hots);
     }
     // Keyboard copy — ONE priority chain, NOT gated on focus (the Chat tab force-focuses the prompt input and
     // clicks never clear focus, so a focus gate would make "select text, Ctrl+C" copy the empty input instead):
@@ -1756,6 +1780,12 @@ fn focusedField() ?*Ui.Field {
         .sc_base => &ui.sc_base,
         .sc_model => &ui.sc_model,
         .sc_key => &ui.sc_key,
+        .h_name => &ui.hot_name,
+        .h_goal => &ui.hot_goal,
+        .h_charter => &ui.hot_charter,
+        .h_model => &ui.hot_model,
+        .h_cmd => &ui.hot_cmd,
+        .h_pad => &ui.hot_padline,
     };
 }
 
@@ -1858,8 +1888,8 @@ fn drawTabbar(store: *Store) void {
     const sw: f32 = @floatFromInt(rl.getScreenWidth());
     t.fillRect(0, TITLE_H, @intFromFloat(sw), TAB_H, t.bg_dark);
     t.hline(0, TITLE_H + TAB_H - 1, @intFromFloat(sw), t.border);
-    const labels = [_][:0]const u8{ t.z("Dashboard", .{}), t.z("Chat", .{}), t.z("Tasks", .{}), t.z("Swarm", .{}), t.z("Hub", .{}), t.z("Settings", .{}) };
-    const tabs = [_]Tab{ .dashboard, .chat, .scheduled, .swarm, .hub, .settings };
+    const labels = [_][:0]const u8{ t.z("Dashboard", .{}), t.z("Chat", .{}), t.z("Tasks", .{}), t.z("Swarm", .{}), t.z("Hots", .{}), t.z("Hub", .{}), t.z("Settings", .{}) };
+    const tabs = [_]Tab{ .dashboard, .chat, .scheduled, .swarm, .hots, .hub, .settings };
     var x: f32 = t.PAD;
     for (labels, tabs) |lb, tabv| {
         const w = t.tabW(lb);
@@ -6188,6 +6218,7 @@ fn flushDropdown(store: *Store) void {
     switch (ui.open_dd) {
         .chat_provider, .chat_byok, .chat_model, .think_provider, .think_byok, .think_model, .prompt_provider, .prompt_byok, .prompt_model => return, // owned by flushChatDropdown (Settings tab)
         .sched_model => return, // owned by flushSchedDropdown (Tasks tab) — never rendered from the deploy form
+        .hot_model => return, // owned by flushHotModelDropdown (Hots tab)
         .chat_role => return, // owned by flushChatRoleDropdown (Chat tab composer)
         else => {},
     }
@@ -6254,7 +6285,7 @@ fn flushDropdown(store: *Store) void {
             }
             current = ui.d_mode;
         },
-        .none, .chat_provider, .chat_byok, .chat_model, .think_provider, .think_byok, .think_model, .prompt_provider, .prompt_byok, .prompt_model, .sched_model, .chat_role => return,
+        .none, .chat_provider, .chat_byok, .chat_model, .think_provider, .think_byok, .think_model, .prompt_provider, .prompt_byok, .prompt_model, .sched_model, .chat_role, .hot_model => return,
     }
     const chosen = drawList(ui.dd_rect, labels[0..count], current);
     if (chosen) |ci| {
@@ -6275,7 +6306,7 @@ fn flushDropdown(store: *Store) void {
             .minutes => ui.d_minutes = ci,
             .stack => ui.d_stack = ci,
             .mode => ui.d_mode = ci,
-            .none, .chat_provider, .chat_byok, .chat_model, .think_provider, .think_byok, .think_model, .prompt_provider, .prompt_byok, .prompt_model, .sched_model, .chat_role => {},
+            .none, .chat_provider, .chat_byok, .chat_model, .think_provider, .think_byok, .think_model, .prompt_provider, .prompt_byok, .prompt_model, .sched_model, .chat_role, .hot_model => {},
         }
         ui.open_dd = .none;
     }
@@ -7603,6 +7634,579 @@ fn kindColor(kind: []const u8) t.Color {
     if (std.mem.eql(u8, kind, "tick")) return t.blue;
     if (std.mem.eql(u8, kind, "stopped")) return t.red;
     return t.cyan;
+}
+
+// -------------------------------------------------------------------------------- hots
+
+/// Seconds between iterations, and model calls per day: the choices the deploy form cycles through.
+const HOT_PACES = [_]u32{ 60, 120, 300, 600, 1800, 3600, 21600 };
+const HOT_CALLS = [_]u32{ 50, 100, 200, 400, 1000, 5000 };
+
+/// "every 10m" / "every 6h" / "every 45s". Pure.
+fn hotPaceStr(buf: []u8, secs: u32) []const u8 {
+    if (secs >= 3600 and secs % 3600 == 0) return std.fmt.bufPrint(buf, "every {d}h", .{secs / 3600}) catch "";
+    if (secs >= 60 and secs % 60 == 0) return std.fmt.bufPrint(buf, "every {d}m", .{secs / 60}) catch "";
+    return std.fmt.bufPrint(buf, "every {d}s", .{secs}) catch "";
+}
+
+/// One line of what a hot is doing with its goal: "active - iteration 7, 4 improved, runs until stopped". Pure.
+fn hotGoalLine(buf: []u8, row: *const hots.Row) []const u8 {
+    if (row.goal_len == 0) return "no goal - looking for the next best thing";
+    if (row.forever or row.budget == 0) return std.fmt.bufPrint(buf, "{s} - iteration {d}, {d} improved", .{ row.goalStatusStr(), row.iteration, row.improved }) catch "";
+    return std.fmt.bufPrint(buf, "{s} - iteration {d} of {d}, {d} improved", .{ row.goalStatusStr(), row.iteration, row.budget, row.improved }) catch "";
+}
+
+fn hotStateColor(state: []const u8) t.Color {
+    if (std.mem.eql(u8, state, "working")) return t.green;
+    if (std.mem.eql(u8, state, "roaming")) return t.cyan;
+    if (std.mem.eql(u8, state, "resting")) return t.yellow;
+    if (std.mem.eql(u8, state, "paused")) return t.comment;
+    return t.red;
+}
+
+/// The next visual line of `text` from `pos`, at most `cols` characters wide: up to a line break, else up to the
+/// last space that fits, else a hard cut (never inside a UTF-8 character). Pure.
+const HotWrap = struct { line: []const u8, next: usize };
+fn hotWrapNext(text: []const u8, pos: usize, cols: usize) HotWrap {
+    const rest = text[pos..];
+    const lim = @min(rest.len, cols);
+    if (std.mem.indexOfScalar(u8, rest[0..lim], '\n')) |k| return .{ .line = rest[0..k], .next = pos + k + 1 };
+    if (rest.len <= cols) return .{ .line = rest, .next = text.len };
+    if (rest[cols] == '\n') return .{ .line = rest[0..cols], .next = pos + cols + 1 };
+    var cut = cols;
+    if (std.mem.lastIndexOfScalar(u8, rest[0..cols], ' ')) |sp| {
+        if (sp > cols / 3) cut = sp;
+    }
+    while (cut > 1 and (rest[cut] & 0xC0) == 0x80) cut -= 1;
+    return .{ .line = rest[0..cut], .next = pos + cut + @as(usize, if (rest[cut] == ' ') 1 else 0) };
+}
+
+/// How many visual lines `text` takes at `cols` (at least one).
+fn hotLineCount(text: []const u8, cols: usize) usize {
+    var n: usize = 0;
+    var p: usize = 0;
+    while (p < text.len) : (n += 1) p = hotWrapNext(text, p, cols).next;
+    return @max(n, 1);
+}
+
+/// A hot's console: every event whole, wrapped to the panel, scrolled by the wheel or the bar on the right. It
+/// follows the newest line until you scroll up, and again once you are back at the bottom ("latest" jumps there).
+fn drawHotConsole(r: t.Rect, evs: []const hots.Ev) void {
+    t.panelBordered(r, t.bg_dark, t.border);
+    const line_h: f32 = 20;
+    const fsz: i32 = 13;
+    const label_x = r.x + 46;
+    const text_x = r.x + 124;
+    const sb_w: f32 = 8;
+    const text_w = r.width - (text_x - r.x) - sb_w - 16;
+    const cw = @max(1.0, t.measureMonoF(t.z("MMMMMMMMMM", .{}), fsz) / 10.0);
+    const cols: usize = @max(16, @as(usize, @intFromFloat(text_w / cw)));
+    var total: usize = 0;
+    for (evs) |*e| total += hotLineCount(e.textStr(), cols);
+    const visible: usize = @max(1, @as(usize, @intFromFloat((r.height - 12) / line_h)));
+    const max_scroll: f32 = @floatFromInt(if (total > visible) total - visible else 0);
+
+    const wheel = rl.getMouseWheelMove();
+    if (wheel != 0 and t.hovering(r)) {
+        ui.hot_scroll -= wheel * 3;
+        ui.hot_follow = false;
+    }
+    const track = t.Rect{ .x = r.x + r.width - sb_w - 4, .y = r.y + 4, .width = sb_w, .height = r.height - 8 };
+    if (max_scroll > 0 and rl.isMouseButtonPressed(.left) and t.hovering(track)) ui.hot_sb_drag = true;
+    if (!rl.isMouseButtonDown(.left)) ui.hot_sb_drag = false;
+    if (ui.hot_sb_drag and max_scroll > 0) {
+        const f = std.math.clamp((rl.getMousePosition().y - track.y) / track.height, 0, 1);
+        ui.hot_scroll = f * max_scroll;
+        ui.hot_follow = false;
+    }
+    if (ui.hot_follow) ui.hot_scroll = max_scroll;
+    ui.hot_scroll = std.math.clamp(ui.hot_scroll, 0, max_scroll);
+    if (!ui.hot_sb_drag and ui.hot_scroll >= max_scroll) ui.hot_follow = true; // back at the bottom: follow again
+    const first: usize = @intFromFloat(ui.hot_scroll);
+
+    {
+        rl.beginScissorMode(@intFromFloat(r.x + 1), @intFromFloat(r.y + 1), @intFromFloat(r.width - 2), @intFromFloat(r.height - 2));
+        defer rl.endScissorMode();
+        var li: usize = 0;
+        var yy = r.y + 6;
+        draw: for (evs) |*e| {
+            const txt = e.textStr();
+            const n = hotLineCount(txt, cols);
+            if (li + n <= first) {
+                li += n;
+                continue;
+            }
+            const kc = kindColor(e.kindStr());
+            var p: usize = 0;
+            var k: usize = 0;
+            while (k < n) : (k += 1) {
+                const w: HotWrap = if (txt.len == 0) .{ .line = txt, .next = 0 } else hotWrapNext(txt, p, cols);
+                p = w.next;
+                if (li + k < first) continue;
+                if (k == 0) {
+                    if (e.round >= 0) t.textMono(t.z("r{d}", .{e.round}), @intFromFloat(r.x + 10), @intFromFloat(yy), fsz, t.comment);
+                    t.textMonoClip(e.labelStr(), @intFromFloat(label_x), @intFromFloat(yy), fsz, kc, @intFromFloat(text_x - label_x - 6));
+                }
+                t.textMonoClip(w.line, @intFromFloat(text_x), @intFromFloat(yy), fsz, t.fg, @intFromFloat(text_w + cw));
+                yy += line_h;
+                if (yy > r.y + r.height - 4) break :draw;
+            }
+            li += n;
+        }
+    }
+    if (evs.len == 0) t.text(t.z("no events yet - a new hot's first iteration starts within a few seconds", .{}), @intFromFloat(r.x + 14), @intFromFloat(r.y + 14), 13, t.comment);
+
+    if (max_scroll > 0) {
+        t.fillRect(@intFromFloat(track.x), @intFromFloat(track.y), @intFromFloat(track.width), @intFromFloat(track.height), t.withAlpha(t.comment, 40));
+        const vis_f: f32 = @floatFromInt(visible);
+        const tot_f: f32 = @floatFromInt(total);
+        const th = @max(24, track.height * vis_f / tot_f);
+        const ty = track.y + (track.height - th) * (ui.hot_scroll / max_scroll);
+        t.fillRect(@intFromFloat(track.x), @intFromFloat(ty), @intFromFloat(track.width), @intFromFloat(th), if (ui.hot_sb_drag or t.hovering(track)) t.blue else t.withAlpha(t.comment, 160));
+        if (!ui.hot_follow) {
+            const ll = t.z("latest", .{});
+            const lw = t.btnW(ll, 22);
+            if (t.button(.{ .x = r.x + r.width - lw - sb_w - 16, .y = r.y + r.height - 30, .width = lw, .height = 22 }, ll, t.blue, true)) ui.hot_follow = true;
+        }
+    }
+    // hover copy: every event as "r<i> <kind> <text>" lines
+    if (evs.len > 0 and t.hovering(r)) {
+        if (copyChip(r.x + r.width - 72, r.y + 6)) {
+            var n: usize = 0;
+            for (evs) |*ev| {
+                if (ev.round >= 0) bufAppend(&conv_buf, &n, t.z("r{d} ", .{ev.round}));
+                bufAppend(&conv_buf, &n, ev.labelStr());
+                bufAppend(&conv_buf, &n, " ");
+                bufAppend(&conv_buf, &n, ev.textStr());
+                bufAppend(&conv_buf, &n, "\n");
+            }
+            if (n > 0) copyToClipboard(conv_buf[0..n]);
+            markCopied();
+        }
+    }
+}
+
+/// The shared scratchpad: each entry's author over its text, wrapped to the panel, newest at the bottom. It
+/// follows the newest entry until you scroll up.
+fn drawHotPad(r: t.Rect, rows: []const hots.PadRow) void {
+    t.panelBordered(r, t.bg_dark, t.border);
+    const lh: f32 = @round(15.0 * t.uiScale());
+    const maxw = r.width - 20;
+    var total: f32 = 0;
+    for (rows) |*e| {
+        var lines: [48][]const u8 = undefined;
+        total += lh + @as(f32, @floatFromInt(wrapInto(e.textStr(), maxw, &lines))) * lh + 8;
+    }
+    const view = r.height - 12;
+    const max_scroll = @max(0, total - view);
+    const wheel = rl.getMouseWheelMove();
+    if (wheel != 0 and t.hovering(r)) {
+        ui.hot_pad_scroll -= wheel * 3 * lh;
+        ui.hot_pad_follow = false;
+    }
+    if (ui.hot_pad_follow) ui.hot_pad_scroll = max_scroll;
+    ui.hot_pad_scroll = std.math.clamp(ui.hot_pad_scroll, 0, max_scroll);
+    if (ui.hot_pad_scroll >= max_scroll) ui.hot_pad_follow = true;
+    rl.beginScissorMode(@intFromFloat(r.x + 1), @intFromFloat(r.y + 1), @intFromFloat(r.width - 2), @intFromFloat(r.height - 2));
+    defer rl.endScissorMode();
+    var y = r.y + 6 - ui.hot_pad_scroll;
+    for (rows) |*e| {
+        var lines: [48][]const u8 = undefined;
+        const n = wrapInto(e.textStr(), maxw, &lines);
+        const h = lh + @as(f32, @floatFromInt(n)) * lh + 8;
+        if (y + h >= r.y and y <= r.y + r.height) {
+            t.textClip(e.fromStr(), @intFromFloat(r.x + 10), @intFromFloat(y), 11, t.cyan, @intFromFloat(maxw));
+            var ly = y + lh;
+            for (lines[0..n]) |ln| {
+                t.textClip(ln, @intFromFloat(r.x + 10), @intFromFloat(ly), 12, t.fg_dim, @intFromFloat(maxw + 4));
+                ly += lh;
+            }
+        }
+        y += h;
+    }
+    if (rows.len == 0) t.text(t.z("empty - hots leave findings for each other here", .{}), @intFromFloat(r.x + 10), @intFromFloat(r.y + 10), 11, t.comment);
+}
+
+/// The deploy form's MODEL list: the account's live Workers AI catalogue when the login has fetched it, else the
+/// catalog's Workers AI models. Row 0 is the default model.
+fn flushHotModelDropdown(store: *Store) void {
+    if (ui.open_dd != .hot_model) return;
+    var names: [store_mod.MAX_CF_MODELS][96]u8 = undefined;
+    var lens: [store_mod.MAX_CF_MODELS]u8 = undefined;
+    store.lock();
+    const live_n = store.cf_model_count;
+    @memcpy(names[0..live_n], store.cf_models[0..live_n]);
+    @memcpy(lens[0..live_n], store.cf_model_lens[0..live_n]);
+    store.unlock();
+    var labels: [store_mod.MAX_CF_MODELS + 1][]const u8 = undefined;
+    var dbuf: [128]u8 = undefined;
+    labels[0] = std.fmt.bufPrint(&dbuf, "default - {s}", .{catalog.defaults.cf_model}) catch "default";
+    var count: usize = 1;
+    var current: usize = 0;
+    const cur = ui.hot_model.str();
+    if (live_n > 0) {
+        for (0..live_n) |i| {
+            labels[count] = names[i][0..lens[i]];
+            if (std.mem.eql(u8, cur, labels[count])) current = count;
+            count += 1;
+        }
+    } else {
+        for (catalog.providers[WORKERS_AI_IDX].models) |m| {
+            if (count >= labels.len) break;
+            labels[count] = m.id;
+            if (std.mem.eql(u8, cur, m.id)) current = count;
+            count += 1;
+        }
+    }
+    const chosen = drawList(ui.dd_rect, labels[0..count], current) orelse return;
+    if (chosen == 0) ui.hot_model.clear() else setField(&ui.hot_model, labels[chosen]);
+    ui.open_dd = .none;
+}
+
+/// The deploy form's model as the server will run it.
+fn hotFormModel() []const u8 {
+    const m = std.mem.trim(u8, ui.hot_model.str(), " ");
+    return if (m.len > 0) m else catalog.defaults.cf_model;
+}
+
+/// "120/2400" beside a field's label, right-aligned at `right`; orange near the limit, red over it.
+fn hotCounter(right: f32, y: f32, used: usize, limit: usize) void {
+    const label = t.z("{d}/{d}", .{ used, limit });
+    const lw: f32 = @floatFromInt(t.measure(label, 11));
+    const col = if (used > limit) t.red else if (used * 5 > limit * 4) t.orange else t.comment;
+    t.text(label, @intFromFloat(right - lw), @intFromFloat(y), 11, col);
+}
+
+/// The Hots tab: the account's hots (at most hots.MAX_HOTS) on the left with the scratchpad they share, and on
+/// the right the selected hot's console and command line - or the deploy form. A hot runs in the user's own
+/// Cloudflare account with nobody in the loop; this tab watches and steers, it never has to be open.
+fn drawHots(store: *Store, body: t.Rect) void {
+    const pad: f32 = t.PAD;
+    store.lock();
+    store.hots_watch = true; // the poller polls the account only while this tab draws
+    const roster = store.hots;
+    const seen = store.hots_seen;
+    const denied = store.hots_denied;
+    const busy = store.hots_busy;
+    const online = store.server_online;
+    var sel: [hots.NAME_MAX]u8 = undefined;
+    const sel_n = store.hot_sel_len;
+    @memcpy(sel[0..sel_n], store.hot_sel[0..sel_n]);
+    var pad_rows: [hots.MAX_PAD]hots.PadRow = undefined;
+    const pad_n = store.hot_pad_count;
+    @memcpy(pad_rows[0..pad_n], store.hot_pad[0..pad_n]);
+    store.unlock();
+
+    const left_w: f32 = 300;
+    const lx = body.x + pad;
+    var y = body.y + pad;
+    t.text(t.z("Hots", .{}), @intFromFloat(lx), @intFromFloat(y), 20, t.fg);
+    t.text(t.z("{d} of {d}", .{ roster.n, hots.MAX_HOTS }), @intFromFloat(lx + 62), @intFromFloat(y + 6), 12, t.comment);
+    y += 30;
+
+    // roster cards
+    const card_h: f32 = 74;
+    for (roster.rows[0..roster.n]) |*row| {
+        const cr = t.Rect{ .x = lx, .y = y, .width = left_w, .height = card_h };
+        const is_sel = !ui.hot_form and std.mem.eql(u8, row.nameStr(), sel[0..sel_n]);
+        const hot = t.hovering(cr);
+        t.panelBordered(cr, if (is_sel) t.bg_sel else if (hot) t.bg_hl else t.bg_dark, if (is_sel) t.blue else t.border);
+        t.statusDot(@intFromFloat(cr.x + 14), @intFromFloat(cr.y + 18), hotStateColor(row.stateStr()));
+        t.textClip(row.nameStr(), @intFromFloat(cr.x + 28), @intFromFloat(cr.y + 9), 15, t.fg, 150);
+        t.textClip(row.stateStr(), @intFromFloat(cr.x + left_w - 78), @intFromFloat(cr.y + 11), 12, hotStateColor(row.stateStr()), 70);
+        t.textClip(if (row.goal_len > 0) row.goalStr() else "no goal - roaming", @intFromFloat(cr.x + 14), @intFromFloat(cr.y + 32), 12, t.fg_dim, @intFromFloat(left_w - 28));
+        var sb: [96]u8 = undefined;
+        const stats = std.fmt.bufPrint(&sb, "{d}/{d} minds  {d}/{d} calls{s}", .{ row.minds, row.size, row.calls_today, row.daily_calls, if (row.local) "  +this machine" else "" }) catch "";
+        t.textClip(stats, @intFromFloat(cr.x + 14), @intFromFloat(cr.y + 52), 11, t.comment, @intFromFloat(left_w - 28));
+        if (hot) t.wantCursor(.pointing_hand);
+        if (hot and rl.isMouseButtonPressed(.left)) {
+            store.pushCmd(store_mod.mkCmd(.hot_select, row.nameStr(), ""));
+            ui.hot_form = false;
+            ui.hot_follow = true;
+        }
+        y += card_h + 8;
+    }
+
+    // why the list is empty, in the order a user can act on
+    if (roster.n == 0) {
+        const why: []const u8 = if (!online) "the veil server is offline" else if (denied) "admin only - set the admin token in Settings" else if (!seen) "asking the server..." else if (!roster.connected) "log in with Cloudflare first (Settings > Models)" else if (roster.deployed and !roster.reachable) "the runtime did not answer - a new deployment can take a minute" else "none yet - the first one is always named Gary";
+        t.textClip(why, @intFromFloat(lx), @intFromFloat(y + 2), 12, t.comment, @intFromFloat(left_w));
+        y += 24;
+        if (roster.err_len > 0) y = helpPara(roster.errStr(), lx, y, left_w) + 6;
+    }
+
+    const can_deploy = online and !denied and seen and roster.connected and roster.n < hots.MAX_HOTS and !busy;
+    const dl = if (busy) t.z("deploying...", .{}) else t.z("Deploy a hot", .{});
+    if (t.button(.{ .x = lx, .y = y, .width = left_w, .height = t.BTN_MD }, dl, t.blue, can_deploy)) {
+        ui.hot_form = true;
+        ui.focus = .h_goal;
+    }
+    y += t.BTN_MD + 14;
+
+    // the scratchpad the hots share (and the human may write to); newest at the bottom, wrapped, scrollable
+    flabel(lx, y, "SHARED SCRATCHPAD");
+    {
+        const cl = if (ui.hot_pad_clear_armed) t.z("really clear?", .{}) else t.z("clear", .{});
+        const cw = t.btnW(cl, 20);
+        const cb = t.Rect{ .x = lx + left_w - cw, .y = y - 3, .width = cw, .height = 20 };
+        if (t.buttonGhost(cb, cl, t.red, pad_n > 0 and roster.reachable)) {
+            if (ui.hot_pad_clear_armed) store.pushCmd(store_mod.mkCmd(.hot_pad_clear, "", ""));
+            ui.hot_pad_clear_armed = !ui.hot_pad_clear_armed;
+        } else if (ui.hot_pad_clear_armed and rl.isMouseButtonPressed(.left) and !t.hovering(cb)) ui.hot_pad_clear_armed = false;
+    }
+    y += 18;
+    const pad_bottom = body.y + body.height - pad - t.FIELD_H - 8;
+    const pr = t.Rect{ .x = lx, .y = y, .width = left_w, .height = @max(40, pad_bottom - y) };
+    drawHotPad(pr, pad_rows[0..pad_n]);
+    const pf = t.Rect{ .x = lx, .y = pad_bottom + 8, .width = left_w - 64, .height = t.FIELD_H };
+    textField(pf, &ui.hot_padline, ui.focus == .h_pad, "write to the scratchpad", .h_pad);
+    const pb = t.Rect{ .x = lx + left_w - 58, .y = pad_bottom + 8, .width = 58, .height = t.FIELD_H };
+    const pad_ok = ui.hot_padline.len > 0 and roster.deployed;
+    if (t.button(pb, t.z("Add", .{}), t.blue, pad_ok) or (ui.focus == .h_pad and pad_ok and rl.isKeyPressed(.enter))) {
+        store.pushCmd(store_mod.mkCmd(.hot_pad_write, "", ui.hot_padline.str()));
+        ui.hot_padline.clear();
+        ui.hot_pad_follow = true;
+    }
+
+    // right side: the deploy form, or the selected hot
+    const rx = lx + left_w + pad;
+    const right = t.Rect{ .x = rx, .y = body.y + pad, .width = body.x + body.width - pad - rx, .height = body.height - pad * 2 };
+    if (ui.hot_form) return drawHotForm(store, right, roster.n == 0, online and !busy);
+    for (roster.rows[0..roster.n]) |*row| {
+        if (std.mem.eql(u8, row.nameStr(), sel[0..sel_n])) return drawHotPanel(store, right, row);
+    }
+    _ = helpPara("A hot is an autonomous technician that runs in YOUR Cloudflare account: it keeps a goal, makes one improvement at a time, measures whether it helped, writes itself rules from what it measured, and moves on to the next best thing when a goal ends. Nobody has to be here for it to work - this tab only watches and steers. You can run up to three; they share a scratchpad and can message each other.", right.x, right.y + 4, @min(right.width, 720));
+}
+
+/// The deploy form. `first` = the account has no hot yet, so this one is Gary.
+fn drawHotForm(store: *Store, r: t.Rect, first: bool, can_send: bool) void {
+    // While the MODEL list is open, the fields under it must not take a click meant for it (flushed last, below).
+    t.setBlockClicks(ui.open_dd == .hot_model);
+    defer t.setBlockClicks(false);
+    const limit = catalog.goalCharLimit(hotFormModel());
+    const x = r.x;
+    var y = r.y;
+    const colw = @min(r.width, 760);
+    const gap: f32 = t.GAP;
+    const fh: f32 = 48;
+    t.text(if (first) t.z("Deploy Gary", .{}) else t.z("Deploy a hot", .{}), @intFromFloat(x), @intFromFloat(y), 20, t.fg);
+    y += 30;
+    y = helpPara("It starts working as soon as it is deployed and never waits for anyone. Everything below can be changed later by telling it - except the last box.", x, y, colw) + 8;
+
+    if (first) {
+        t.text(t.z("NAME   Gary - the first hot of every account", .{}), @intFromFloat(x), @intFromFloat(y), 12, t.comment);
+        y += 22;
+    } else {
+        flabel(x, y, "NAME (letters, digits, - or _)");
+        textField(.{ .x = x, .y = y + 14, .width = colw / 2, .height = t.FIELD_H }, &ui.hot_name, ui.focus == .h_name, "e.g. Ada", .h_name);
+        y += fh + gap;
+    }
+
+    flabel(x, y, "GOAL (what to achieve first)");
+    hotCounter(x + colw, y, ui.hot_goal.len, limit);
+    textArea(.{ .x = x, .y = y + 14, .width = colw, .height = 88 }, &ui.hot_goal, ui.focus == .h_goal, "e.g. find every public tide-table source for the west coast and keep a checked list of them", .h_goal, 4, 0);
+    y += 14 + 88 + gap;
+
+    flabel(x, y, "CHARTER (optional: what it serves when a goal ends, so it can pick the next best thing)");
+    hotCounter(x + colw, y, ui.hot_charter.len, limit);
+    textArea(.{ .x = x, .y = y + 14, .width = colw, .height = 70 }, &ui.hot_charter, ui.focus == .h_charter, "e.g. keep my tide site accurate and growing", .h_charter, 3, 0);
+    y += 14 + 70 + gap;
+
+    const half = (colw - gap) / 2;
+    selector(.{ .x = x, .y = y, .width = half, .height = fh }, t.z("MODEL (your account's Workers AI)", .{}), if (ui.hot_model.len > 0) ui.hot_model.str() else catalog.defaults.cf_model, .hot_model);
+    ui.hot_size = t.stepper(.{ .x = x + half + gap, .y = y, .width = half, .height = fh }, t.z("SIZE (most minds it may grow to)", .{}), ui.hot_size, 1, 8);
+    y += fh + gap;
+
+    var pb: [24]u8 = undefined;
+    const pd = t.cycle(.{ .x = x, .y = y, .width = half, .height = fh }, t.z("PACE (one iteration)", .{}), t.zs(hotPaceStr(&pb, HOT_PACES[ui.hot_pace])), false);
+    if (pd != 0) ui.hot_pace = wrap(ui.hot_pace, pd, HOT_PACES.len);
+    const cd = t.cycle(.{ .x = x + half + gap, .y = y, .width = half, .height = fh }, t.z("MODEL CALLS A DAY (then it rests)", .{}), t.z("{d}", .{HOT_CALLS[ui.hot_calls]}), false);
+    if (cd != 0) ui.hot_calls = wrap(ui.hot_calls, cd, HOT_CALLS.len);
+    y += fh + gap;
+
+    if (t.checkbox(.{ .x = x, .y = y, .width = colw, .height = 28 }, t.z("the goal never finishes (keep improving until I stop it)", .{}), ui.hot_forever)) ui.hot_forever = !ui.hot_forever;
+    y += 32;
+    if (t.checkbox(.{ .x = x, .y = y, .width = colw, .height = 28 }, t.z("let it use THIS machine", .{}), ui.hot_local)) ui.hot_local = !ui.hot_local;
+    y += 30;
+    y = helpPara("Checked: it may send jobs to the veil on this computer (files, shell, builds, swarms - the full tool set), and they run unattended while this server is up. This is decided here, once: it cannot be granted later, and deleting the hot ends it.", x + 26, y, colw - 26) + 10;
+
+    const fits = ui.hot_goal.len <= limit and ui.hot_charter.len <= limit;
+    const ready = can_send and fits and (ui.hot_goal.len >= 3 or ui.hot_charter.len >= 3);
+    const dl = t.z("Deploy", .{});
+    const db = t.Rect{ .x = x, .y = y, .width = @max(140, t.btnW(dl, t.BTN_LG)), .height = t.BTN_LG };
+    if (t.buttonSolid(db, dl, t.blue, ready)) submitHot(store, first);
+    const cl = t.z("Cancel", .{});
+    if (t.buttonGhost(.{ .x = db.x + db.width + 10, .y = y, .width = t.btnW(cl, t.BTN_LG), .height = t.BTN_LG }, cl, t.comment, true)) ui.hot_form = false;
+    if (!fits)
+        t.text(t.z("this model takes at most {d} characters of goal or charter - shorten it, or pick a model with a bigger window", .{limit}), @intFromFloat(x), @intFromFloat(y + t.BTN_LG + 8), 11, t.red)
+    else
+        t.text(t.z("the first deployment uploads the runtime into your Cloudflare account (up to a minute)", .{}), @intFromFloat(x), @intFromFloat(y + t.BTN_LG + 8), 11, t.comment);
+    t.setBlockClicks(false);
+    flushHotModelDropdown(store); // last, so the list sits over the fields below it
+}
+
+/// Package the deploy form and hand it to the poller through the store's slot (it outgrows Command.text).
+fn submitHot(store: *Store, first: bool) void {
+    var b: [6144]u8 = undefined;
+    const body = hots.deployBody(&b, .{
+        .name = if (first) "" else ui.hot_name.str(),
+        .goal = ui.hot_goal.str(),
+        .charter = ui.hot_charter.str(),
+        .model = std.mem.trim(u8, ui.hot_model.str(), " "),
+        .pace_s = HOT_PACES[ui.hot_pace],
+        .size = ui.hot_size,
+        .daily_calls = HOT_CALLS[ui.hot_calls],
+        .forever = ui.hot_forever,
+        .local = ui.hot_local,
+    }) orelse {
+        store.pushNotif("Hot not deployed", "the goal and charter are too long together", 2);
+        return;
+    };
+    {
+        store.lock();
+        defer store.unlock();
+        @memcpy(store.hot_deploy_json[0..body.len], body);
+        store.hot_deploy_len = body.len; // the poller raises hots_busy when it takes this, and lowers it when done
+    }
+    store.pushCmd(store_mod.mkCmd(.hot_deploy, "", ""));
+    store.pushNotif("Deploying...", if (first) "Gary" else ui.hot_name.str(), 0);
+    ui.hot_name.clear();
+    ui.hot_goal.clear();
+    ui.hot_charter.clear();
+    ui.hot_forever = false;
+    ui.hot_local = false; // the grant is per deployment: the next form starts unchecked
+    ui.hot_form = false;
+    ui.focus = .none;
+}
+
+/// One hot: what it is doing, its controls, its console and the line that talks to it.
+fn drawHotPanel(store: *Store, r: t.Rect, row: *const hots.Row) void {
+    const name = row.nameStr();
+    var evs: [scan.MAX_LOG]hots.Ev = undefined;
+    store.lock();
+    const ev_n = store.hot_event_count;
+    @memcpy(evs[0..ev_n], store.hot_events[0..ev_n]);
+    store.unlock();
+
+    // header
+    t.textClip(name, @intFromFloat(r.x), @intFromFloat(r.y), 20, t.fg, 220);
+    const sc = hotStateColor(row.stateStr());
+    t.statusDot(@intFromFloat(r.x + 6), @intFromFloat(r.y + 38), sc);
+    var gb: [120]u8 = undefined;
+    t.textClip(hotGoalLine(&gb, row), @intFromFloat(r.x + 18), @intFromFloat(r.y + 30), 12, sc, @intFromFloat(r.width - 18));
+    if (row.goal_len > 0) t.textClip(row.goalStr(), @intFromFloat(r.x), @intFromFloat(r.y + 48), 13, t.fg_dim, @intFromFloat(r.width));
+    var sb: [220]u8 = undefined;
+    var pb: [24]u8 = undefined;
+    const stats = std.fmt.bufPrint(&sb, "{s}   {s}   {d} model calls today of {d}   {d} lessons   {d} queued{s}", .{ row.modelStr(), hotPaceStr(&pb, row.pace_s), row.calls_today, row.daily_calls, row.lessons, row.queue, if (row.local) "   may use this machine" else "" }) catch "";
+    t.textClip(stats, @intFromFloat(r.x), @intFromFloat(r.y + 68), 11, t.comment, @intFromFloat(r.width));
+
+    // controls: pause/resume, grow/shrink, delete (two clicks)
+    const ctrl_y = r.y + 88;
+    const ctrl_h: f32 = 32;
+    var cx = r.x;
+    const pl = if (row.paused) t.z("Resume", .{}) else t.z("Pause", .{});
+    const pw = t.btnW(pl, ctrl_h);
+    if (t.button(.{ .x = cx, .y = ctrl_y, .width = pw, .height = ctrl_h }, pl, if (row.paused) t.green else t.yellow, true))
+        store.pushCmd(store_mod.mkCmd(.hot_command, name, if (row.paused) "/resume" else "/pause"));
+    cx += pw + 8;
+    const sl = t.z("Shrink", .{});
+    const sw = t.btnW(sl, ctrl_h);
+    if (t.button(.{ .x = cx, .y = ctrl_y, .width = sw, .height = ctrl_h }, sl, t.cyan, row.size > 1))
+        store.pushCmd(store_mod.mkCmd(.hot_config, name, t.z("{{\"size\":{d}}}", .{row.size - 1})));
+    cx += sw + 8;
+    const gl = t.z("Grow", .{});
+    const gw = t.btnW(gl, ctrl_h);
+    if (t.button(.{ .x = cx, .y = ctrl_y, .width = gw, .height = ctrl_h }, gl, t.cyan, row.size < 8))
+        store.pushCmd(store_mod.mkCmd(.hot_config, name, t.z("{{\"size\":{d}}}", .{row.size + 1})));
+    cx += gw + 8;
+    t.text(t.z("{d} of {d} minds", .{ row.minds, row.size }), @intFromFloat(cx + 4), @intFromFloat(ctrl_y + 9), 12, t.comment);
+    const armed = std.mem.eql(u8, ui.hot_del[0..ui.hot_del_len], name);
+    const del_l = if (armed) t.z("Really delete?", .{}) else t.z("Delete", .{});
+    const dw = t.btnW(del_l, ctrl_h);
+    const delb = t.Rect{ .x = r.x + r.width - dw, .y = ctrl_y, .width = dw, .height = ctrl_h };
+    // its local folder (events.log, notes, status) on the machine the server runs on
+    const fl = t.z("Open folder", .{});
+    const fw = t.btnW(fl, ctrl_h);
+    if (t.button(.{ .x = delb.x - fw - 8, .y = ctrl_y, .width = fw, .height = ctrl_h }, fl, t.blue, row.folder_len > 0))
+        store.pushCmd(store_mod.mkCmd(.hot_open_folder, name, row.folderStr()));
+    if (t.button(delb, del_l, t.red, true)) {
+        if (armed) {
+            store.pushCmd(store_mod.mkCmd(.hot_delete, name, ""));
+            ui.hot_del_len = 0;
+        } else {
+            @memcpy(ui.hot_del[0..name.len], name);
+            ui.hot_del_len = @intCast(name.len);
+        }
+    } else if (armed and rl.isMouseButtonPressed(.left) and !t.hovering(delb)) ui.hot_del_len = 0; // a click anywhere else disarms
+
+    // console + the line that talks to it
+    const cmd_h: f32 = 38;
+    const top = ctrl_y + ctrl_h + 10;
+    const panel = t.Rect{ .x = r.x, .y = top, .width = r.width, .height = r.y + r.height - top - cmd_h - 8 };
+    drawHotConsole(panel, evs[0..ev_n]);
+    const cy = r.y + r.height - cmd_h;
+    const send_w: f32 = 92;
+    const cf = t.Rect{ .x = r.x, .y = cy, .width = r.width - send_w - t.GAP, .height = cmd_h };
+    textField(cf, &ui.hot_cmd, ui.focus == .h_cmd, "tell it anything, or /goal <text>   /queue <goal>   /charter <text>   /pause - Enter to send", .h_cmd);
+    const sendb = t.Rect{ .x = r.x + r.width - send_w, .y = cy, .width = send_w, .height = cmd_h };
+    const send = t.buttonSolid(sendb, t.z("Send", .{}), t.blue, ui.hot_cmd.len > 0);
+    if (send or (ui.focus == .h_cmd and ui.hot_cmd.len > 0 and rl.isKeyPressed(.enter))) {
+        store.pushCmd(store_mod.mkCmd(.hot_command, name, ui.hot_cmd.str()));
+        ui.hot_cmd.clear();
+        ui.hot_follow = true;
+    }
+}
+
+test "hots tab: a pace and a goal line read the way the card shows them" {
+    var b: [120]u8 = undefined;
+    try std.testing.expectEqualStrings("every 10m", hotPaceStr(&b, 600));
+    try std.testing.expectEqualStrings("every 6h", hotPaceStr(&b, 21600));
+    try std.testing.expectEqualStrings("every 45s", hotPaceStr(&b, 45));
+    try std.testing.expectEqualStrings("every 90s", hotPaceStr(&b, 90));
+    var row: hots.Row = .{ .iteration = 7, .improved = 4, .budget = 25 };
+    try std.testing.expectEqualStrings("no goal - looking for the next best thing", hotGoalLine(&b, &row));
+    row.goal_len = 4;
+    @memcpy(row.goal_status[0..6], "active");
+    row.goal_status_len = 6;
+    try std.testing.expectEqualStrings("active - iteration 7 of 25, 4 improved", hotGoalLine(&b, &row));
+    row.forever = true;
+    try std.testing.expectEqualStrings("active - iteration 7, 4 improved", hotGoalLine(&b, &row));
+    // every preset is a pace the runtime accepts (30 s to a day) and the form's defaults index real entries
+    for (HOT_PACES) |p| try std.testing.expect(p >= 30 and p <= 86400);
+    const fresh: Ui = .{};
+    try std.testing.expect(fresh.hot_pace < HOT_PACES.len and fresh.hot_calls < HOT_CALLS.len);
+    try std.testing.expect(!fresh.hot_local); // the owner's machine is never pre-checked
+}
+
+test "hots tab: the console wraps at the width, keeps line breaks, prefers spaces, and never loses a character" {
+    const text = "web_fetch {\"url\":\"https://example.com/a/very/long/path\"} -> HTTP 200\nsecond line";
+    var p: usize = 0;
+    var rebuilt: [256]u8 = undefined;
+    var n: usize = 0;
+    var lines: usize = 0;
+    while (p < text.len) : (lines += 1) {
+        const w = hotWrapNext(text, p, 20);
+        try std.testing.expect(w.line.len <= 20);
+        try std.testing.expect(std.mem.indexOfScalar(u8, w.line, '\n') == null);
+        @memcpy(rebuilt[n .. n + w.line.len], w.line);
+        n += w.line.len;
+        // what lies between this line and the next is exactly one dropped space or line break, or nothing
+        const gap = text[p + w.line.len .. w.next];
+        try std.testing.expect(gap.len == 0 or (gap.len == 1 and (gap[0] == ' ' or gap[0] == '\n')));
+        if (gap.len == 1) {
+            rebuilt[n] = gap[0];
+            n += 1;
+        }
+        p = w.next;
+    }
+    try std.testing.expectEqualStrings(text, rebuilt[0..n]);
+    try std.testing.expectEqual(lines, hotLineCount(text, 20));
+    try std.testing.expectEqual(@as(usize, 1), hotLineCount("", 20));
+    try std.testing.expectEqual(@as(usize, 2), hotLineCount("short\nlines", 80));
+    // a hard cut never splits a UTF-8 character
+    const accents = "\xc3\xa9" ** 12;
+    const w = hotWrapNext(accents, 0, 5);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(w.line));
 }
 
 // -------------------------------------------------------------------------------- hub

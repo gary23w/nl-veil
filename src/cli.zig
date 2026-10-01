@@ -329,7 +329,7 @@ pub fn isCommand(sub: []const u8) bool {
         "help",      "--help",        "-h",     "version", "--version", "exec-tool",
         "sync-read", "sync-manifest", "rag",    "themes",  "plugins",   "plug",
         "model",     "dataset",       "set",    "lineage", "swarm",     "--swarm",
-        "configure", "--configure",   "goal",
+        "configure", "--configure",   "goal",   "hot",
     };
     for (verbs) |v| if (std.mem.eql(u8, sub, v)) return true;
     return false;
@@ -379,6 +379,7 @@ pub fn dispatch(ctx: *Ctx, sub: []const u8, args: []const []const u8) u8 {
     if (std.mem.eql(u8, sub, "dataset") or std.mem.eql(u8, sub, "set")) return cmdDataset(ctx, args);
     if (std.mem.eql(u8, sub, "lineage")) return cmdLineage(ctx, args);
     if (std.mem.eql(u8, sub, "swarm") or std.mem.eql(u8, sub, "--swarm")) return @import("cli/swarm_tui.zig").cmd(ctx, args);
+    if (std.mem.eql(u8, sub, "hot")) return @import("cli/hot.zig").cmd(ctx, args);
     std.debug.print("unknown command '{s}' — run `veil help`\n", .{sub});
     return 1;
 }
@@ -1380,6 +1381,17 @@ fn cmdHelp() u8 {
         \\  goal "<what to achieve>"     a GOAL LOOP: pick the next best improvement, do it, measure it, repeat;
         \\      [--budget N] [--forever] [--check "<cmd>"] [--conv id]   ends when achieved, spent, or nothing improves
         \\                               in any chat: /goal <text>   /goal   /goal stop   /goal resume
+        \\
+        \\HOTS (autonomous goal loops that run in YOUR Cloudflare account - no human, no machine of yours)
+        \\  hot                          the roster: at most 3; the first is always named Gary
+        \\  hot deploy "<goal>" [flags]  deploy one: --name N --charter "..." --model @cf/... --pace SECONDS
+        \\                               --size MINDS --calls PER_DAY --budget N --forever
+        \\                               --local  lets it queue jobs for the veil on THIS machine (deployment only)
+        \\  hot tell <name> "<text>"     /goal <text>, /goal stop, /queue <goal>, /pause, /resume, or a message
+        \\  hot watch <name>             follow its events
+        \\  hot set <name> [flags]       --model --pace --size --calls --charter --pause --resume
+        \\  hot pad ["<text>"|--clear]   the scratchpad the hots share (--clear empties it)
+        \\  hot rm <name>                delete one       hot teardown --yes   remove them all + the runtime
         \\
         \\BUILT-IN MODEL (the-veil-12b served by the server itself — no external runtime)
         \\  model status                 weights + engine + any download in flight

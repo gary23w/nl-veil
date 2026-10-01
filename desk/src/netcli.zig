@@ -370,6 +370,49 @@ pub fn chatConvDelete(io: Io, gpa: std.mem.Allocator, port: u16, token: []const 
     return httpReq(io, gpa, "DELETE", port, path, token, null, 8);
 }
 
+/// GET /api/v1/hots — the hot roster + deployment status (config/cf_hot.zig). The server asks the runtime in
+/// the user's Cloudflare account, so this is slower than a local read: 20s.
+pub fn hotsList(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8) ?Resp {
+    return httpReq(io, gpa, "GET", port, "/api/v1/hots", token, null, 20);
+}
+
+/// POST /api/v1/hots — deploy a hot. The first deployment uploads the runtime and waits for its address to
+/// come up, so the ceiling is long. One shot, like every POST here.
+pub fn hotsDeploy(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8, body_json: []const u8) ?Resp {
+    return httpReq(io, gpa, "POST", port, "/api/v1/hots", token, body_json, 120);
+}
+
+/// GET /api/v1/hots/<name>/events?after=N — the hot's event tail past seq N.
+pub fn hotEvents(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8, name: []const u8, after: u64) ?Resp {
+    var pbuf: [160]u8 = undefined;
+    const path = std.fmt.bufPrint(&pbuf, "/api/v1/hots/{s}/events?after={d}", .{ name, after }) catch return null;
+    return httpReq(io, gpa, "GET", port, path, token, null, 20);
+}
+
+/// POST /api/v1/hots/<name>/<op> — op is "command" ({"text"}) or "config" (settings).
+pub fn hotPost(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8, name: []const u8, op: []const u8, body_json: []const u8) ?Resp {
+    var pbuf: [160]u8 = undefined;
+    const path = std.fmt.bufPrint(&pbuf, "/api/v1/hots/{s}/{s}", .{ name, op }) catch return null;
+    return httpReq(io, gpa, "POST", port, path, token, body_json, 30);
+}
+
+/// POST /api/v1/hots/pad/clear — empty the scratchpad the hots share.
+pub fn hotsPadClear(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8) ?Resp {
+    return httpReq(io, gpa, "POST", port, "/api/v1/hots/pad/clear", token, "{}", 30);
+}
+
+/// DELETE /api/v1/hots/<name> — delete one hot and everything it stored.
+pub fn hotDelete(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8, name: []const u8) ?Resp {
+    var pbuf: [160]u8 = undefined;
+    const path = std.fmt.bufPrint(&pbuf, "/api/v1/hots/{s}", .{name}) catch return null;
+    return httpReq(io, gpa, "DELETE", port, path, token, null, 30);
+}
+
+/// GET /api/v1/hots/pad — the scratchpad the account's hots share; POST writes an entry ({"text"}).
+pub fn hotsPad(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8, body_json: ?[]const u8) ?Resp {
+    return httpReq(io, gpa, if (body_json != null) "POST" else "GET", port, "/api/v1/hots/pad", token, body_json, 20);
+}
+
 /// DELETE /api/v1/swarms/<id> — the server stops the worker and removes its run dir. Needs the bearer key.
 pub fn delete(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8, id: []const u8) ?Resp {
     log.trace("netcli.delete port={d} id={s}", .{ port, id });

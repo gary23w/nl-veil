@@ -13,6 +13,7 @@ test {
     _ = @import("httpc.zig");
     _ = @import("llm.zig");
     _ = @import("log.zig");
+    _ = @import("hots.zig"); // the hot roster, event tail and scratchpad readers; the deploy body round-trip
     _ = @import("main.zig"); // the pure helpers under the drawing: formatters + index wrap
     _ = @import("mdutil.zig");
     _ = @import("nap.zig"); // the non-alertable sleep, and the heartbeats behind the silent-worker lines

@@ -2,7 +2,7 @@
 
 **File:** `desk/src/main.zig`  
 **Module:** `desk`  
-**Description:** The process entrypoint and UI shell for nl-veil's native desktop app "veil-desk": a borderless (self-drawn chrome) raylib window that immediate-mode-draws six tabs over a shared Store, running on the UI thread alongside a poller thread and a chat worker thread.
+**Description:** The process entrypoint and UI shell for nl-veil's native desktop app "veil-desk": a borderless (self-drawn chrome) raylib window that immediate-mode-draws seven tabs over a shared Store, running on the UI thread alongside a poller thread and a chat worker thread.
 
 ---
 
@@ -13,7 +13,7 @@ with a background status and **Update & restart** action. The render loop exits 
 update helper is ready; the normal app shutdown then lets it replace the executable and memory engine.
 See [updater](updater.md) for the platform asset and rollback contract.
 
-This is the UI/render half of veil-desk, a same-machine companion to the nl-veil server. `main()` sets up the shared `Store`, spawns two background threads (a filesystem/net poller and a model/chat worker), loads fonts and the tray, then runs the raylib event+draw loop. Every frame it snapshots the Store under a lock, draws the active tab (Dashboard/Chat/Swarm/Hub/Scheduled/Settings) in immediate mode, and pushes user actions back to the background threads as fixed-size commands. It owns raylib exclusively (raylib is single-threaded) and delegates the heavy server/model/run-directory io to the two background threads, itself doing only light local file reads (the admin key at startup and the SIM.txt automation poll).
+This is the UI/render half of veil-desk, a same-machine companion to the nl-veil server. `main()` sets up the shared `Store`, spawns two background threads (a filesystem/net poller and a model/chat worker), loads fonts and the tray, then runs the raylib event+draw loop. Every frame it snapshots the Store under a lock, draws the active tab (Dashboard/Chat/Swarm/Hots/Hub/Scheduled/Settings) in immediate mode, and pushes user actions back to the background threads as fixed-size commands. It owns raylib exclusively (raylib is single-threaded) and delegates the heavy server/model/run-directory io to the two background threads, itself doing only light local file reads (the admin key at startup and the SIM.txt automation poll).
 
 ## Desktop layout in v1.1.4
 
