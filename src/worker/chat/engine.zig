@@ -31,6 +31,7 @@ const wsp = @import("workspace.zig"); // prompt workspace: typed bids -> fixed-o
 const ovl = @import("overlay.zig"); // recall overlay: the working field settled around every thought
 const builtin_mod = @import("../builtin.zig"); // the built-in engine's sentinel + LIVE served-window publication
 const cplan = @import("plan.zig");
+const goal_mod = @import("goal.zig"); // goal mode: the auto-loop with a stored goal, an iteration log and a measure
 const cync = @import("sync.zig");
 const toolperf = @import("toolperf.zig"); // per-machine tool latency/reliability learning (dynamic, emergent)
 const deploy_service = @import("../deploy/service.zig");
@@ -2637,7 +2638,17 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     // (where the instructions live) and the file's name. See spillPaste for the 27-minute turn this replaces.
     const spilled = spillPaste(app, gpa, workdir, user_text_raw, nowSecs(app.io));
     defer if (spilled) |sp| gpa.free(sp);
-    const user_text: []const u8 = spilled orelse user_text_raw;
+    const user_text_in: []const u8 = spilled orelse user_text_raw;
+    // GOAL MODE (goal.zig): `/goal <text>` starts a goal loop and this turn runs on the goal's own text; every
+    // other /goal form is answered below without a model call. Parsed HERE, in the engine, so the desk, the web
+    // app and `veil chat` all have the command without knowing about it.
+    var goal_cmd_buf: [2048]u8 = undefined;
+    const goal_cmd = goal_mod.parseCommand(user_text_in, &goal_cmd_buf);
+    const user_text: []const u8 = switch (goal_cmd) {
+        .start => |s| s.text,
+        .go_on => "continue toward the goal",
+        else => user_text_in,
+    };
     if (spilled != null) emitKV(app, conv_dir, "status", "text", "saved the pasted data to inbox/ in the workdir; working from the file");
 
     appendMsg(app, conv_dir, "user", user_text, "user", nowSecs(app.io));
@@ -2652,6 +2663,49 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     // USAGE: snapshot the process token counters BEFORE any LLM work (plan decomposition, history summary, drive,
     // reflect, the agentic loop) — finishTurn emits the delta as this turn's usage at every completion path.
     const usage_t0 = llm.tokensSnapshot();
+
+    // GOAL MODE state for this turn. A goal drives the loop on the turn that starts it, on `/goal resume`, on a
+    // continuation ("continue", the desk's auto-loop kick) and in the afk tier. Any OTHER message runs as an
+    // ordinary turn and leaves the goal stored, so pressing Stop and then asking a question never resurrects a loop.
+    var goal_state: goal_mod.State = .{};
+    defer goal_state.deinit(gpa);
+    goal_state.load(gpa, app.io, conv_dir);
+    switch (goal_cmd) {
+        .none => {},
+        .start => |s| {
+            goal_state.start(gpa, s.text, s.forever, s.budget, nowSecs(app.io));
+            if (s.check.len > 0) goal_state.setCheck(gpa, s.check);
+            goal_state.save(gpa, app.io, conv_dir);
+        },
+        else => {
+            if (goal_cmd == .go_on and goal_state.g != null) {
+                const g = &goal_state.g.?;
+                if (g.status != .achieved) g.status = .active;
+                g.flat = 0; // a resume is a fresh look: the plateau count starts over
+                goal_state.save(gpa, app.io, conv_dir);
+            } else {
+                var rb: [1200]u8 = undefined;
+                const reply = goal_state.apply(gpa, app.io, conv_dir, goal_cmd, &rb);
+                appendMsg(app, conv_dir, "assistant", reply, "veil", nowSecs(app.io));
+                emitAssistant(app, conv_dir, reply);
+                finishTurn(app, conv_dir, usage_t0);
+                return;
+            }
+        },
+    }
+    // The afk tier IS a forever goal now: with none stored, the conversation's first message becomes one, so the
+    // run-until-stopped promise holds and afk gains the iteration log and the measurement.
+    if (loop >= LOOP_AFK and !goal_state.isActive()) {
+        const fg = firstUserGoal(app, conv_dir);
+        defer if (fg) |x| gpa.free(x);
+        goal_state.start(gpa, fg orelse user_text, true, null, nowSecs(app.io));
+        goal_state.save(gpa, app.io, conv_dir);
+    }
+    const goal_on = goal_state.isActive() and (goal_cmd == .start or goal_cmd == .go_on or loop >= LOOP_AFK or continuationShaped(user_text));
+    if (goal_on) {
+        var gsb: [220]u8 = undefined;
+        emitKV(app, conv_dir, "status", "text", std.fmt.bufPrint(&gsb, "goal loop: iteration {d} - {s}", .{ goal_state.g.?.iteration + 1, clipBytes(goal_state.g.?.text, 120) }) catch "goal loop");
+    }
 
     // ---- ToolCtx: byte-for-byte the chat_tools.runMindTool construction (per-uid store, builds/{conv} tree;
     // a SCHEDULED run's tree lives under its task's permanent _sched/{task}/runs/{stamp} dir — see paths.zig) ----
@@ -2860,7 +2914,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     // ago. Tier 1 keeps reading user_text exactly as before; only afk, whose "user_text" is the desk's own
     // kick sentence rather than anything a human wrote, gets the substitution. NOT for the hippocampus
     // observe either — the message the user really sent is what belongs in memory.
-    const goal_text: []const u8 = if (meta_q or loop >= LOOP_AFK) (if (goal_owned) |g| g else user_text) else user_text;
+    const goal_text: []const u8 = if (goal_on) goal_state.g.?.text else if (meta_q or loop >= LOOP_AFK) (if (goal_owned) |g| g else user_text) else user_text;
     {
         // RESUME CUE: a continuation-shaped turn ("continue", the desk's auto-loop arm) carries no recall
         // cue of its own — keyed on the literal word, recall surfaces nothing and the resumed turn starts
@@ -3331,8 +3385,9 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
 
     // AUTO-LOOP MODE (desk chat_loop / chat_loop_afk, now server-driven). A plan drives its own subtask budget; a
     // free-form turn drives DRIVE_MAX off, LOOP_MAX_STEPS armed-on, effectively-unbounded in afk (Stop is the exit).
-    const armed = loop >= LOOP_ON;
-    const afk = loop >= LOOP_AFK;
+    const armed = loop >= LOOP_ON or goal_on; // a goal arms the loop whatever tier the client sent
+    const afk = loop >= LOOP_AFK or (goal_on and goal_state.g.?.forever); // a forever goal has afk's no-end-state rules
+    const persist = afk or goal_on; // a finished plan does not end these: the loop goes on free-form
     // MID-TURN COURSE CHECK, on for the runs where drift is expensive: an armed loop (up to 30 steps, or
     // unbounded in afk) or a plan walking its board. A plain 6-step turn is short enough that the user is
     // still watching and is the correction, so it does not pay for a reviewer. NL_CHAT_COURSE=0 disables.
@@ -3343,7 +3398,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     const course_on = (armed or has_plan) and !fast and !envDisabled(environ, "NL_CHAT_COURSE");
     // afk OUTRANKS the plan cap: an afk turn whose message decomposed into a plan must still run until Stop (it
     // walks the plan, then keeps driving free-form) — not halt at PLAN_STEPS_PER_TURN, which would violate afk.
-    var max_steps: usize = if (afk) AFK_MAX_STEPS else if (has_plan) PLAN_STEPS_PER_TURN else if (armed) LOOP_MAX_STEPS else DRIVE_MAX;
+    var max_steps: usize = if (afk) AFK_MAX_STEPS else if (goal_on) goal_state.stepsLeft() + plan.len else if (has_plan) PLAN_STEPS_PER_TURN else if (armed) LOOP_MAX_STEPS else DRIVE_MAX;
     var idle_steps: usize = 0; // consecutive no-tool drive steps — the armed (non-afk) anti-spin bound (desk loop_idle)
     var verified_done = false; // TERMINAL BUILD-VERIFY fires at most once per turn (desk arc_final_verified)
     var swarm_timeout_nudged = false; // SWARM_TIMEOUT_MSG fires at most once per turn — after that a stuck hive can't hold the turn open forever
@@ -3358,7 +3413,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     // most valuable next improvement" treadmill is what afkNextStep replaced, and leaving it live at one
     // stuck-hive site is how it kept reappearing.
     const afk_stuck_msg = std.fmt.bufPrint(&stuck_buf, AFK_STUCK_TMPL, .{goal_clip}) catch "You repeated the last step — try a DIFFERENT approach; recall_hive / web_search the actual blocker first.";
-    if (armed) emitKV(app, conv_dir, "status", "text", if (afk) "auto-loop (afk): driving toward the goal" else "auto-loop: driving toward the goal");
+    if (armed and !goal_on) emitKV(app, conv_dir, "status", "text", if (afk) "auto-loop (afk): driving toward the goal" else "auto-loop: driving toward the goal");
     var steer_cursor = ctrl_cursor; // moving cursor over control.jsonl for stop + mid-turn steer messages
     // SCHEDULED-RUN TOOL BUDGET: an unattended auto-loop turn with a thorough model has an unbounded research
     // appetite — a live run burned 107 web calls (the repeat guard blocks exact duplicates, but the model just
@@ -3524,8 +3579,8 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
                     http.jstr(gpa, &conv_buf, stept.items) catch break :outer;
                     conv_buf.append(gpa, '}') catch break :outer;
                 }
-            } else if (!afk) {
-                // Whole plan done (non-afk). ARMED: don't settle over a RUNNING cast hive — a hive-routed final
+            } else if (!persist) {
+                // Whole plan done (non-afk, no goal loop). ARMED: don't settle over a RUNNING cast hive — a hive-routed final
                 // subtask is marked done the pass right after casting, which would otherwise end the turn while the
                 // hive is still working. Await it, then demote to FREE-FORM and gather.
                 var plan_break = true;
@@ -4103,6 +4158,22 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
             }
         }
 
+        // GOAL MODE - MEASURE the iteration that just settled, RECORD it, and stop when the goal's own rules say
+        // so (goal.zig). A judge reads this iteration's real tool results; an iteration that ran no tool changed
+        // nothing, so it is SAME without a model call.
+        if (goal_on) {
+            var evb: [300]u8 = undefined;
+            var verdict: goal_mod.Verdict = .{ .outcome = .same, .evidence = "no tool ran in this iteration" };
+            if (inner.tools_ran) verdict = goalJudge(app, llm_dir, prompt, goal_text, goal_state.g.?.check, conv_buf.items, &evb);
+            const outcome = goal_mod.decide(goal_state.g.?, verdict);
+            const stop = goal_state.record(gpa, app.io, conv_dir, prev_drive, verdict, nowSecs(app.io));
+            goalEmit(app, conv_dir, goal_state.g.?, outcome, verdict);
+            if (stop) |why| {
+                goalEnd(app, conv_dir, &goal_state, why);
+                break :outer;
+            }
+        }
+
         // DRIVE INFERENCE: one no-tools completion that names the next step (or DONE) — on a BOUNDED context:
         // a goal-anchor system message + the freshest boundary-aligned slice of the conversation + the loop
         // question, built in its OWN buffer (conv_buf is untouched). It used to ride the ENTIRE conv_buf,
@@ -4119,7 +4190,11 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
         lq.appendSlice(gpa, "},") catch break :outer;
         lq.appendSlice(gpa, msgTail(conv_buf.items, LOOP_CTX_BYTES)) catch break :outer;
         lq.appendSlice(gpa, ",{\"role\":\"user\",\"content\":") catch break :outer;
-        http.jstr(gpa, &lq, if (afk) LOOP_QUESTION_AFK else LOOP_QUESTION) catch break :outer;
+        // In goal mode the question carries the iteration log and asks for the best improvement NOT yet tried.
+        var goal_qbuf: [6400]u8 = undefined;
+        const goal_log: []u8 = if (goal_on) goal_mod.logTail(gpa, app.io, conv_dir, 14) else &[_]u8{};
+        defer if (goal_log.len > 0) gpa.free(goal_log);
+        http.jstr(gpa, &lq, if (goal_on) goal_mod.pickQuestion(&goal_qbuf, goal_state.g.?, goal_log, LOOP_MEMORY_RULE) else if (afk) LOOP_QUESTION_AFK else LOOP_QUESTION) catch break :outer;
         lq.append(gpa, '}') catch break :outer;
         const loop_cm = meterBegin(app.io);
         announcePhase(app, "loop");
@@ -4228,6 +4303,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
                     afk_written = afkNextStep(app, llm_dir, prompt, goal_text, conv_buf.items) orelse &[_]u8{};
                     next_step = if (afk_written.len > 0) afk_written else AFK_KEEP_GOING;
                 } else {
+                    if (goal_on) goalEnd(app, conv_dir, &goal_state, .achieved);
                     break :outer; // on: goal achieved, no hive in flight
                 }
             } else {
@@ -4346,7 +4422,12 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     // underneath it, so the history the next drive step reads alternates a completion claim in the model's own
     // voice with a re-drive. (afk also never reaches the plan-complete branch that would demote has_plan, so
     // this fired at the end of every planned afk turn.)
-    if (has_plan and !afk) emitPlanClosing(app, conv_dir, plan);
+    if (goal_on and goal_state.isActive()) {
+        // the turn ended (step cap, token ceiling, a repeat) with the goal still open: it is stored, not lost
+        var gpb: [160]u8 = undefined;
+        emitKV(app, conv_dir, "status", "text", std.fmt.bufPrint(&gpb, "goal loop paused after iteration {d}: say continue (or /goal resume) to go on, /goal for status", .{goal_state.g.?.iteration}) catch "goal loop paused");
+    }
+    if (has_plan and !persist) emitPlanClosing(app, conv_dir, plan);
     // POST-ANSWER CRITIQUE, review half. It runs HERE, in the same deferred phase as the rolling-summary refresh
     // below and for the same reason: the answer was delivered and read long before this point, so the cost lands
     // where the user is not waiting on a blank chat. It can only ADD a message — the answer above is already
@@ -13317,4 +13398,50 @@ test "the loop hard stop is reachable before MAX_ITERS, or it is dead code" {
     const t = std.testing;
     try t.expect(LOOP_STOP_REFUSALS > 1);
     try t.expect(ECHO_LIMIT > 1);
+}
+
+/// GOAL MODE judge (prompting): grade the iteration that just ran, from the REAL tool results in the transcript
+/// tail. A dead or unreadable judge is SAME with no score - it can never count as progress. `evid` receives the
+/// evidence text the verdict points at.
+fn goalJudge(app: *App, run_root: []const u8, p: Provider, goal: []const u8, check: []const u8, conv_items: []const u8, evid: []u8) goal_mod.Verdict {
+    const gpa = app.gpa;
+    const fail: goal_mod.Verdict = .{ .outcome = .same, .evidence = "the iteration could not be graded" };
+    var msgs: std.ArrayListUnmanaged(u8) = .empty;
+    defer msgs.deinit(gpa);
+    msgs.appendSlice(gpa, "{\"role\":\"system\",\"content\":") catch return fail;
+    http.jstr(gpa, &msgs, goal_mod.JUDGE_SYSTEM) catch return fail;
+    msgs.appendSlice(gpa, "},") catch return fail;
+    msgs.appendSlice(gpa, msgTail(conv_items, LOOP_CTX_BYTES)) catch return fail;
+    var qb: [1400]u8 = undefined;
+    msgs.appendSlice(gpa, ",{\"role\":\"user\",\"content\":") catch return fail;
+    http.jstr(gpa, &msgs, goal_mod.judgeQuestion(&qb, goal, check)) catch return fail;
+    msgs.append(gpa, '}') catch return fail;
+    const cm = meterBegin(app.io);
+    var step = completeAux(app, run_root, "goaljudge", p.base_url, p.key, p.model, msgs.items, 160, 0.1);
+    defer step.deinit(gpa);
+    meterEnd(app, cm, "goaljudge", .prompting, p.model, step.ok);
+    if (!step.ok) return fail;
+    return goal_mod.parseVerdict(step.content, evid);
+}
+
+/// One measured goal iteration, as a `goal` event (for clients that draw it) and a status line (for all of them).
+fn goalEmit(app: *App, conv_dir: []const u8, g: goal_mod.Goal, outcome: goal_mod.Outcome, v: goal_mod.Verdict) void {
+    var eb: [320]u8 = undefined;
+    emitEvent(app, conv_dir, std.fmt.bufPrint(&eb, "{{\"kind\":\"goal\",\"iteration\":{d},\"outcome\":\"{s}\",\"improved\":{d},\"flat\":{d},\"budget\":{d},\"num\":{d},\"den\":{d},\"status\":\"{s}\"}}", .{ g.iteration, @tagName(outcome), g.improved, g.flat, g.budget, v.num, v.den, @tagName(g.status) }) catch return);
+    var scb: [48]u8 = undefined;
+    const score: []const u8 = if (v.den > 0) (std.fmt.bufPrint(&scb, " [{d}/{d}]", .{ v.num, v.den }) catch "") else "";
+    var sb: [360]u8 = undefined;
+    emitKV(app, conv_dir, "status", "text", std.fmt.bufPrint(&sb, "goal iteration {d}: {s}{s} - {s}", .{ g.iteration, @tagName(outcome), score, clipBytes(v.evidence, 160) }) catch "goal iteration measured");
+}
+
+/// The goal loop ends on its own: store why, and tell the user what it achieved.
+fn goalEnd(app: *App, conv_dir: []const u8, st: *goal_mod.State, why: goal_mod.Status) void {
+    st.finish(app.gpa, app.io, conv_dir, why);
+    const g = st.g orelse return;
+    var b: [640]u8 = undefined;
+    const text = goal_mod.summaryText(&b, g, why);
+    appendMsg(app, conv_dir, "assistant", text, "veil", nowSecs(app.io));
+    emitAssistant(app, conv_dir, text);
+    var eb: [200]u8 = undefined;
+    emitEvent(app, conv_dir, std.fmt.bufPrint(&eb, "{{\"kind\":\"goal\",\"iteration\":{d},\"improved\":{d},\"status\":\"{s}\",\"ended\":true}}", .{ g.iteration, g.improved, @tagName(why) }) catch return);
 }
