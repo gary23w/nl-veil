@@ -16,6 +16,13 @@ Windows · macOS · Linux · MIT licensed. Local inference needs no provider acc
 hosted providers have their own data handling and costs. The built-in model requires a separate
 download, and coding tools require Python on `PATH` (some checks also use Node).
 
+### New in v1.1.7
+
+**Hots**: the veil's goal loop running in your own Cloudflare account, with nobody in it and your computer
+off. Deploy one from the desktop's Hots tab or `veil hot deploy "<goal>"`; the first is always named Gary.
+[How hots work](#hots---goal-loops-that-run-without-you-in-your-own-account) ·
+[release notes](docs/release/RELEASE-v1.1.7.md).
+
 ### New in v1.1.4
 
 A calmer desktop for longer tasks: visible preparation and planning updates, steadier
@@ -48,7 +55,7 @@ code and credentials from anything you share.
 
 <p>
   <a href="https://github.com/gary23w/nl-veil/actions/workflows/release.yml"><img alt="build" src="https://github.com/gary23w/nl-veil/actions/workflows/release.yml/badge.svg"></a>
-  <a href="https://github.com/gary23w/nl-veil/releases"><img alt="release" src="https://img.shields.io/badge/release-v1.1.6-A8241B"></a>
+  <a href="https://github.com/gary23w/nl-veil/releases"><img alt="release" src="https://img.shields.io/badge/release-v1.1.7-A8241B"></a>
   <img alt="zig" src="https://img.shields.io/badge/zig-0.16-F7A41D?logo=zig&logoColor=white">
   <a href="https://huggingface.co/gary23w/the-veil-12b"><img alt="built-in model" src="https://img.shields.io/badge/built--in%20model-the--veil--12b-6E4A27?logo=huggingface&logoColor=white"></a>
   <a href="https://huggingface.co/gary23w/gary-neuron-emergent"><img alt="memory cortex" src="https://img.shields.io/badge/cortex-gary--neuron--emergent-6E4A27?logo=huggingface&logoColor=white"></a>
@@ -68,8 +75,8 @@ window opens: a three-pane workspace where you give an AI a goal and watch it do
 conversations down the left, the work itself in the middle — the chat, or the files it is writing, or
 live token and latency metrics — and on the right what the agents are doing and what the thing
 remembers. Drag the dividers to whatever widths suit you (they persist), collapse a side you don't
-need, branch a side question into its own tab without losing the build. Six tabs across the top:
-**Dashboard, Chat, Swarm, Hub, Tasks, Settings.** It is the place you work, not a sidebar bolted onto
+need, branch a side question into its own tab without losing the build. Seven tabs across the top:
+**Dashboard, Chat, Tasks, Swarm, Hots, Hub, Settings.** It is the place you work, not a sidebar bolted onto
 something else.
 
 **The difference is what's behind the window.** Ask most tools for a feature and one assistant writes
@@ -256,6 +263,57 @@ What keeps that safe to do:
 The login asks for the tunnel, DNS, zone and Access scopes as *optional* permissions. A login that predates
 them simply lacks them; the switch then says so and asks you to log in with Cloudflare again.
 
+### Hots - goal loops that run without you, in your own account
+
+A **hot** (Human Overview Technician) is the veil's goal loop with no human in it and no machine of yours
+under it. Once you are logged in with Cloudflare, the desk's **Hots** tab (or `veil hot deploy "<goal>"`)
+uploads one small Worker, `veil-hots`, into *your* account and creates a hot in it. From then on the hot
+works on its own: it wakes on a timer, picks the single best next improvement toward its goal, does it with
+its tools, has a judge measure whether it helped from the tool results alone, records the iteration, and
+sets its next wake-up. Your computer can be off. Its model calls go through the account's own AI binding,
+so they never cross the public internet and need no API key.
+
+- **Up to three per account.** The first is always named **Gary**; you name the others.
+- **It never waits for anyone.** A message you send lands in its inbox and the next iteration reads it as a
+  directive. `/goal <text>`, `/goal stop`, `/queue <goal>`, `/charter <text>`, `/pause` and `/resume` work in
+  the tab's command line and through `veil hot tell <name> "..."`.
+- **A goal that ends is not the end.** Achieved, out of budget, or three iterations with no improvement: the
+  hot takes the next queued goal, or proposes one itself from its charter, or rests and looks again later.
+  `/pause` is what holds it still.
+- **It improves itself.** An iteration that did not move the goal becomes a lesson - one rule the hot writes
+  for its future self - and its lessons ride every later prompt; the least useful one is dropped when the
+  list is full. After two flat iterations it grows by one mind, and after an easy win it shrinks, inside the
+  size you allow (the tab's Grow / Shrink buttons move that ceiling).
+- **Hots work together.** They share one scratchpad, which you can read and write too, and can message each
+  other. A hot can also cast its own small swarm: several minds side by side, one task each.
+- **Its tools** are its own notes, the scratchpad, messages to other hots, fetching public pages and APIs,
+  the inner swarm, a goal queue and a report line to you.
+- **Your machine, only if you say so.** The deploy form has one box, unchecked by default: *let it use THIS
+  machine*. Checked, the hot may queue jobs for the veil on your computer - the full local tool set, run
+  unattended as an ordinary chat conversation named `hot_<name>_...` you can open afterwards - and gets the
+  results back. Nothing listens at home for this: your veil asks the hot for jobs while it is running. The
+  box is decided once, at deployment; it cannot be granted later.
+- **It has a budget.** Each hot has a pace (one iteration every N seconds) and a number of model calls a day;
+  when the day's calls are spent it rests until the next UTC day. Workers AI usage is billed to your account
+  by Cloudflare like any other.
+- **You pick its model from your account.** The deploy form's MODEL list is your login's live Workers AI
+  catalogue. A goal or charter may be as long as that model can carry - about a tenth of its context window,
+  between 800 and 4000 characters - and the form counts as you type.
+- **Every run has a folder on your machine.** Each deployment of a hot is mirrored, once a minute, into
+  `<data>/u<id>/_hots/<name>-<deployed>/`: `events.log` (one readable line per event - tail it),
+  `events.jsonl`, `status.json` and `notes/` (the hot's own notes, one file each). The shared scratchpad is
+  `_hots/scratchpad.md`. **Open folder** in the tab opens it; a deleted hot keeps its folder.
+- **The scratchpad can be cleared** for the next set of hots (two clicks in the tab, or
+  `veil hot pad --clear`); a copy of what it held is kept beside it as `scratchpad-<when>.md`.
+- **Deleting the last hot removes the Worker.** The `veil-hots` Worker exists for its hots: while any remain
+  it stays, and when the last one is deleted it is removed from your account. A newer veil replaces the
+  Worker's code in place, and the hots keep their memory.
+
+The desktop's console wraps every event and scrolls (wheel or the bar on the right; *latest* jumps back to the
+newest). `veil hot` lists them, `veil hot watch Gary` follows one, `veil hot rm <name>` deletes one, and
+`veil hot teardown --yes` removes the Worker and everything the hots stored. The upload needs the optional
+Workers scope the login already asks for; a login that declined it gets Cloudflare's refusal in plain words.
+
 ### Running your own OAuth client (optional)
 
 The shipped client id works out of the box. You only need your own if you are forking the veil or want a
@@ -289,6 +347,15 @@ POST /api/v1/oauth/cloudflare/logout     forget the credential
 GET  /api/v1/oauth/cloudflare/r2         backup status: bucket, files, bytes, last sync
 POST /api/v1/oauth/cloudflare/r2/sync    run a backup pass now
 POST /api/v1/oauth/cloudflare/r2/auto    turn the automatic backup on or off
+GET  /api/v1/hots                        your hots: the roster and the deployment status
+POST /api/v1/hots                        deploy one (uploads the runtime when the account lacks it)
+POST /api/v1/hots/:name/command          a command or a message for one hot
+POST /api/v1/hots/:name/config           its settings: model, pace, size, daily calls, charter, paused
+GET  /api/v1/hots/:name/events           its event tail
+GET  /api/v1/hots/pad   (and POST)       the scratchpad the hots share
+POST /api/v1/hots/pad/clear              empty it (a local copy is kept)
+DELETE /api/v1/hots/:name                delete one (the last one takes the Worker with it);
+                                         DELETE /api/v1/hots removes them all
 ```
 
 The token is stored per user, auto-refreshed, and **never returned to any client** — the UIs only ever
@@ -350,7 +417,7 @@ raylib is a *lazy* dependency, so `-Dapp=false` never fetches it at all.
 ## Install
 
 **Download it and run it — no toolchain, nothing to build.** Grab your platform's bundle from the
-**[latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.1.6)**, unzip, and run `veil`:
+**[latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.1.7)**, unzip, and run `veil`:
 
 | You're on | Download | Then run |
 |---|---|---|
@@ -511,7 +578,7 @@ step 5** — the rest is about letting other people in.
 
 ### 1. Download and unblock it
 
-Grab the bundle for your OS from the [latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.1.6)
+Grab the bundle for your OS from the [latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.1.7)
 and unzip it somewhere you'll find again. Builds are unsigned, so:
 
 - **Windows** shows *"Windows protected your PC"* → **More info** → **Run anyway**.
@@ -547,7 +614,7 @@ On startup the server prints one complete URL per address this machine answers o
 (`src/main.zig:861-889`, using `src/config/lan.zig`):
 
 ```
-neuron-loops 1.1.6 on http://localhost:8787
+neuron-loops 1.1.7 on http://localhost:8787
     open from another machine (phone, laptop) at:
       http://192.168.1.42:8787
 ```
@@ -711,6 +778,17 @@ CHAT (the server-side veil brain)
   goal "<what to achieve>"     a GOAL LOOP: pick the next best improvement, do it, measure it, repeat;
       [--budget N] [--forever] [--check "<cmd>"] [--conv id]   ends when achieved, spent, or nothing improves
                                in any chat: /goal <text>   /goal   /goal stop   /goal resume
+
+HOTS (autonomous goal loops that run in YOUR Cloudflare account)
+  hot                          the roster: at most 3; the first is always named Gary
+  hot deploy "<goal>" [flags]  --name N --charter "..." --model @cf/... --pace SECONDS --size MINDS
+                               --calls PER_DAY --budget N --forever
+                               --local  lets it queue jobs for the veil on THIS machine (deployment only)
+  hot tell <name> "<text>"     /goal <text>, /goal stop, /queue <goal>, /pause, /resume, or a message
+  hot watch <name>             follow its events
+  hot set <name> [flags]       --model --pace --size --calls --charter --pause --resume
+  hot pad ["<text>"|--clear]   the scratchpad the hots share (--clear empties it)
+  hot rm <name>                delete one       hot teardown --yes   remove them all + the runtime
 
 BUILT-IN MODEL (the-veil-12b, served in-process — no external runtime)
   model status                 weights + engine + any download in flight
@@ -1344,12 +1422,14 @@ build.zig                  the Zig build (server + CLI + desktop; -Dapp=false = 
 src/
   main.zig                 entry point: CLI dispatch, then the server + control plane (auth, routes)
   cli.zig                  the `veil` CLI — a thin client over the server's /api/v1/*
-  cli/{chat,hub}.zig       the interactive chat REPL and the fleet console
+  cli/{chat,hub,hot}.zig   the interactive chat REPL, the fleet console, and `veil hot`
   gateway/http.zig         the HTTP surface: App context, the auth guard, JSON/file helpers
   auth/  config/  admin/   accounts + API keys, the encrypted key vault, the admin API
     config/lan.zig         which addresses this machine is reachable at (the startup banner's URLs)
     config/server_config.zig  admin-owned runtime settings → data/server-config.json
     config/cf_{oauth,r2,tunnel}.zig  Log in with Cloudflare, the R2 chat backup, the public-URL tunnel
+    config/cf_hot.zig      hots: uploads the runtime into the user's account, relays to it, and runs
+                           the jobs a hot may send to the owner's machine
   worker/                  the hive and the server-side brain:
     chat/{engine,service,tools,context,overlay,workspace,plan,sync,toolperf,paths}.zig  the chat
                                                    brain — the agentic turn loop, its REST handlers,
@@ -1376,6 +1456,8 @@ src/
                                                    the Veil, the self-improvement faculties, the
                                                    micro-VCS for concurrent minds
     locs/atlas.zig         the source atlas — points scouts at nl-rag packs
+cloud/hot.js               the hot runtime - one Worker, one Durable Object per hot - embedded into
+                           the binary and uploaded as it is; cloud/hot.test.mjs runs it under node
 desk/                      veil-desk, the native desktop dashboard — compiled INTO `veil` as the
                            "desk" module (-Dapp, default true), not a separate shipped binary
 docs/                      the docs site: architecture map + annotated source (static, home-built
@@ -1397,19 +1479,29 @@ dependency entirely rather than compiling it unused.
 
 ## Release
 
-**Current: [`v1.1.6`](https://github.com/gary23w/nl-veil/releases/tag/v1.1.6)** — `veil --swarm "<goal>"` casts a
-swarm and opens a terminal view of it: every mind's step on the right, one chat line into the whole swarm on
-the left, running to completion on its own. Lineages now keep **facts** a tool output proved (the checker's
-rules, a real signature) beside their lessons, every cast is on record in the lineage's history, and the
-desktop's **Swarm → Lineages** view shows each lineage's memory and its casts over time. The CLI reads the
-desktop's settings (host, port, chat model), and `veil --configure` connects a machine that has no desktop.
-[Full notes](docs/release/RELEASE-v1.1.6.md).
+**Current: [`v1.1.7`](https://github.com/gary23w/nl-veil/releases/tag/v1.1.7)** — **[hots](#hots---goal-loops-that-run-without-you-in-your-own-account)**:
+the goal loop running in your own Cloudflare account with nobody in it. The desktop's new Hots tab (or
+`veil hot deploy "<goal>"`) uploads one small Worker into your account; each hot wakes on a timer, makes one
+measured improvement toward its goal, writes itself lessons from what the measurement said, and moves on to
+the next best thing when a goal ends. Up to three per account, the first always named Gary; they share a
+scratchpad, can cast their own inner swarms, and may use your machine only if you check the box at
+deployment. Each run is mirrored into a folder on your machine you can open and tail, the model list is your
+account's own, and deleting the last hot removes its Worker. And **goal mode**: `/goal <text>` in any chat
+gives the auto-loop a stored goal, an iteration log, a measured outcome per step and its own stop rules.
+[Full notes](docs/release/RELEASE-v1.1.7.md).
 
 **Updating:** from v1.1.3 or later, use **Settings → Updates → App updates → Update & restart**.
 Versions before v1.1.3 require a manual full-bundle installation. Updates verify both executables and
 preserve data, with backups for recovery. [Updating and network troubleshooting](docs/UPDATES.md).
 
-**Previously: [`v1.1.5`](docs/release/RELEASE-v1.1.5.md)** — what a swarm lineage learns can reach its next
+**Previously: [`v1.1.6`](docs/release/RELEASE-v1.1.6.md)** — `veil --swarm "<goal>"` casts a
+swarm and opens a terminal view of it: every mind's step on the right, one chat line into the whole swarm on
+the left, running to completion on its own. Lineages now keep **facts** a tool output proved (the checker's
+rules, a real signature) beside their lessons, every cast is on record in the lineage's history, and the
+desktop's **Swarm → Lineages** view shows each lineage's memory and its casts over time. The CLI reads the
+desktop's settings (host, port, chat model), and `veil --configure` connects a machine that has no desktop.
+
+**Before it: [`v1.1.5`](docs/release/RELEASE-v1.1.5.md)** — what a swarm lineage learns can reach its next
 cast: the judge's lessons and skills and the mined habits are reviewed with `veil lineage` or keep/drop cards in
 the Memory pane; a turn whose first reply comes back empty is asked again with its tools; the desktop key
 survives a server that could not read its key store.

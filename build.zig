@@ -73,6 +73,8 @@ pub fn build(b: *std.Build) void {
     exe.link_data_sections = true;
     exe.link_gc_sections = true;
     exe.root_module.addImport("httpz", httpz.module("httpz"));
+    // The hot runtime (config/cf_hot.zig uploads it into the user's Cloudflare account as it is).
+    exe.root_module.addAnonymousImport("hot.js", .{ .root_source_file = b.path("cloud/hot.js") });
     exe.root_module.addAnonymousImport("index.html", .{ .root_source_file = b.path("web/public/index.html") });
     exe.root_module.addAnonymousImport("app.js", .{ .root_source_file = b.path("web/public/app.js") });
     exe.root_module.addAnonymousImport("styles.css", .{ .root_source_file = b.path("web/public/styles.css") });
@@ -218,6 +220,7 @@ pub fn build(b: *std.Build) void {
     inline for (.{ "index.html", "app.js", "styles.css", "models.json" }) |asset| {
         tests.root_module.addAnonymousImport(asset, .{ .root_source_file = b.path("web/public/" ++ asset) });
     }
+    tests.root_module.addAnonymousImport("hot.js", .{ .root_source_file = b.path("cloud/hot.js") }); // config/cf_hot.zig
     addLua(b, tests.root_module); // src/plug/* tests bind the embedded Lua
     // The suite is server-side only and never links raylib, so it always sees gui=false — a test module that
     // pulled the GUI in would need GL on every CI box, which is exactly what -Dapp=false exists to avoid.

@@ -14,6 +14,7 @@ test {
     _ = @import("cli/hub.zig"); // broadcast body escaping: a pasted CRLF must not break the JSON
     _ = @import("config/cf_oauth.zig");
     _ = @import("config/cf_r2.zig"); // the R2 backup: gated routes, object-key charset, state defaults, per-account bucket, a deleted bucket re-created — via fakehttp
+    _ = @import("config/cf_hot.zig"); // hots: gated routes, the derived token, the upload, the owner's-machine bridge — via fakehttp
     _ = @import("config/cf_tunnel.zig"); // the tunnel: gated routes, token-free state, the permission explanation, Access claims, hostname changes — via fakehttp
     _ = @import("worker/wsock.zig"); // the loopback client's blocking round trip: IPv4 literals, the sockaddr layout
     _ = @import("config/key_vault.zig"); // registered DIRECTLY: reaching the root through another
@@ -72,6 +73,7 @@ test {
     _ = @import("worker/gemma4.zig"); // gemma4 wire format: byte-exact vs the model's own chat template
     _ = @import("worker/httpc.zig");
     _ = @import("worker/hyperspace.zig");
+    _ = @import("cli/hot.zig"); // veil hot: the roster row and the event line read the runtime's own JSON
     _ = @import("cli/swarm_tui.zig"); // veil --swarm: the reducer, the frame and the line editor are pure
     _ = @import("worker/proposals.zig"); // lineage proposal review: accept promotes, reject is remembered
     _ = @import("worker/deploy/lineage_api.zig"); // /api/v1/lineages review routes

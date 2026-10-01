@@ -55,7 +55,7 @@
       <a href="#memory">Memory</a>
     </nav>
     <span class="grow"></span>
-    <span class="chip"><span class="chip-dot"></span>v1.1.6</span>
+    <span class="chip"><span class="chip-dot"></span>v1.1.7</span>
     <button class="icon-btn" id="themeBtn" type="button" title="Toggle theme" aria-label="Toggle theme"></button>
     <a class="icon-btn" href="https://github.com/gary23w/nl-veil" target="_blank" rel="noopener" title="Source on GitHub" aria-label="Source on GitHub">
       <svg viewBox="0 0 24 24"><path d="M9 19c-5 1.5-5-2.5-7-3m14 6v-3.9a3.4 3.4 0 0 0-.9-2.6c3-.3 6.2-1.5 6.2-6.7A5.2 5.2 0 0 0 20 4.8a4.9 4.9 0 0 0-.1-3.6s-1.1-.3-3.7 1.4a12.6 12.6 0 0 0-6.6 0C7 .9 5.9 1.2 5.9 1.2A4.9 4.9 0 0 0 5.8 4.8a5.2 5.2 0 0 0-1.4 3.6c0 5.2 3.2 6.4 6.2 6.7a3.4 3.4 0 0 0-.9 2.6V22"/></svg>
@@ -146,7 +146,7 @@
           Windows <span class="dl-arch">x86-64</span>
         </span>
         <span class="dl-file">veil-&hellip;-windows-x86_64.zip</span>
-        <a class="btn btn-solid" href="https://github.com/gary23w/nl-veil/releases/tag/v1.1.6" target="_blank" rel="noopener">Download</a>
+        <a class="btn btn-solid" href="https://github.com/gary23w/nl-veil/releases/tag/v1.1.7" target="_blank" rel="noopener">Download</a>
       </div>
       <div class="dl-card" data-os="macarm">
         <span class="dl-os">
@@ -154,7 +154,7 @@
           macOS <span class="dl-arch">Apple Silicon</span>
         </span>
         <span class="dl-file">veil-&hellip;-macos-arm64.zip</span>
-        <a class="btn btn-solid" href="https://github.com/gary23w/nl-veil/releases/tag/v1.1.6" target="_blank" rel="noopener">Download</a>
+        <a class="btn btn-solid" href="https://github.com/gary23w/nl-veil/releases/tag/v1.1.7" target="_blank" rel="noopener">Download</a>
       </div>
       <div class="dl-card" data-os="macintel">
         <span class="dl-os">
@@ -162,7 +162,7 @@
           macOS <span class="dl-arch">Intel</span>
         </span>
         <span class="dl-file">veil-&hellip;-macos-x86_64.zip</span>
-        <a class="btn btn-solid" href="https://github.com/gary23w/nl-veil/releases/tag/v1.1.6" target="_blank" rel="noopener">Download</a>
+        <a class="btn btn-solid" href="https://github.com/gary23w/nl-veil/releases/tag/v1.1.7" target="_blank" rel="noopener">Download</a>
       </div>
       <div class="dl-card" data-os="linux">
         <span class="dl-os">
@@ -170,7 +170,7 @@
           Linux <span class="dl-arch">x86-64</span>
         </span>
         <span class="dl-file">veil-&hellip;-linux-x86_64.zip</span>
-        <a class="btn btn-solid" href="https://github.com/gary23w/nl-veil/releases/tag/v1.1.6" target="_blank" rel="noopener">Download</a>
+        <a class="btn btn-solid" href="https://github.com/gary23w/nl-veil/releases/tag/v1.1.7" target="_blank" rel="noopener">Download</a>
       </div>
     </div>
 
@@ -185,7 +185,20 @@
         is served by the server itself &mdash; no separate model runtime, no API key. Click <em>download the
         model</em> in the app (or run <code>veil model pull</code>) and the whole thing works offline. Point it
         at Ollama or any OpenAI-compatible endpoint instead whenever you would rather.</p>
-      <p><strong>New in <code>v1.1.6</code>: watch a swarm from the terminal, and talk to it as one.</strong>
+      <p><strong>New in <code>v1.1.7</code>: hots &mdash; goal loops that run without you, in your own account.</strong>
+        Log in with Cloudflare, open the new <em>Hots</em> tab (or run <code>veil hot deploy "&lt;goal&gt;"</code>),
+        and the veil uploads one small Worker into <em>your</em> account. Each hot wakes on a timer, makes one
+        measured improvement toward its goal, writes itself lessons from what the measurement said, and moves on
+        to the next best thing when a goal ends &mdash; with your computer off. Up to three per account, the first
+        always named Gary; they share a scratchpad, cast their own inner swarms, and may use your machine only if
+        you check the box at deployment. Every run is mirrored into a folder on your machine &mdash; an
+        <code>events.log</code> to tail, its notes, the shared scratchpad &mdash; that the tab opens for you; the
+        model list is your account's own, and deleting the last hot removes its Worker. Also new:
+        <code>/goal &lt;text&gt;</code> in any chat gives the auto-loop a stored goal, a measured outcome per step
+        and its own stop rules.
+        <a href="#doc=config/cf_hot">How hots work &rarr;</a>
+        <a href="https://github.com/gary23w/nl-veil/blob/main/docs/release/RELEASE-v1.1.7.md" target="_blank" rel="noopener">v1.1.7 release notes &rarr;</a></p>
+      <p><strong>Before it: <code>v1.1.6</code>, watch a swarm from the terminal.</strong>
         <code>veil --swarm "&lt;goal&gt;"</code> casts a swarm and opens a terminal view: every mind's step on the
         right, lit as it lands, and one chat line into the whole swarm on the left; it runs to completion on its
         own. Lineages now keep the <em>facts</em> a tool output proved beside their lessons, every cast is on
@@ -445,7 +458,7 @@ zig build run</code></pre>
 
 <footer class="foot">
   <div class="wrap foot-inner">
-    <span class="chip"><span class="chip-dot"></span>v1.1.6 &middot; open source, MIT</span>
+    <span class="chip"><span class="chip-dot"></span>v1.1.7 &middot; open source, MIT</span>
     <span class="dim" style="font-size:var(--fs-small)">Built by <a href="https://github.com/gary23w" target="_blank" rel="noopener">gary23w</a></span>
     <nav class="foot-links">
       <a href="https://github.com/gary23w/nl-veil" target="_blank" rel="noopener">nl-veil on GitHub</a>

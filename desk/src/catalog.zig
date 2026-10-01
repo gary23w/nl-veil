@@ -19,6 +19,8 @@ pub const Provider = modelcfg.Provider;
 pub const Tier = modelcfg.Tier;
 pub const ModelSense = modelcfg.ModelSense;
 pub const senseModel = modelcfg.senseModel;
+/// The most characters a hot's goal or charter may hold on a model (the server enforces the same number).
+pub const goalCharLimit = modelcfg.goalCharLimit;
 
 /// THE provider list — a comptime slice from models.yaml. Array-style access (`providers[i]`,
 /// `providers.len`, `for (providers)`) works exactly as the old in-file array did.
