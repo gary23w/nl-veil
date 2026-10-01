@@ -2319,6 +2319,10 @@ pub const Chat = struct {
             if (jInt(line, "iteration")) |v| self.store.chat_goal_iter = @intCast(@max(0, @min(v, 1_000_000)));
             if (jInt(line, "improved")) |v| self.store.chat_goal_improved = @intCast(@max(0, @min(v, 1_000_000)));
             self.store.chat_goal_live = live;
+            if (!live) { // the goal ended (achieved / budget / plateau / stopped): the loop it armed goes with it
+                self.store.chat_loop_afk = false;
+                self.store.chat_loop = false;
+            }
             return;
         }
         if (std.mem.eql(u8, kind, "usage")) {
@@ -4154,8 +4158,11 @@ pub const Chat = struct {
         }
         if (fresh) {
             var tb: [42]u8 = undefined;
-            const n = @min(text.len, tb.len);
-            @memcpy(tb[0..n], text[0..n]);
+            // a conversation opened by `/goal <text>` is named for the goal, not for the command
+            const lead = std.mem.trimStart(u8, text, " \r\n\t");
+            const tsrc = if (goalSendKind(text) == .start) std.mem.trimStart(u8, lead["/goal".len..], " \t\n") else text;
+            const n = @min(tsrc.len, tb.len);
+            @memcpy(tb[0..n], tsrc[0..n]);
             for (tb[0..n]) |*c| {
                 if (c.* == '\n' or c.* == '\r' or c.* == '\t') c.* = ' ';
             }
@@ -4184,6 +4191,26 @@ pub const Chat = struct {
         {
             self.store.lock();
             self.store.chat_loop = true;
+            // A GOAL ARMS THE LOOP BY ITSELF: `/goal <text>` (or resume) switches the afk tier on, so the toggle
+            // shows the loop engaged and the desk carries it across turns; the server ends a finite goal on its own
+            // (the `goal` frame's end disarms below). `/goal stop` switches it off.
+            switch (goalSendKind(text)) {
+                .start => {
+                    self.store.chat_loop_afk = true;
+                    self.store.chat_goal_live = true;
+                    self.store.chat_goal_iter = 0;
+                    self.store.chat_goal_improved = 0;
+                },
+                .go_on => {
+                    self.store.chat_loop_afk = true;
+                    self.store.chat_goal_live = true;
+                },
+                .stop => {
+                    self.store.chat_loop_afk = false;
+                    self.store.chat_goal_live = false;
+                },
+                .none, .other => {},
+            }
             self.store.unlock();
         }
         self.reflect_pass = 0; // fresh iterative self-critique budget for this user turn
@@ -15576,4 +15603,32 @@ test "the key sweep takes stranded GitHub token files from the sidecar the git t
     try std.testing.expectEqual(@as(usize, 3), swept.token_files);
     const again = Chat.sweepKeys(io, gpa, dd);
     try std.testing.expectEqual(@as(usize, 0), again.curl_configs + again.token_files); // and a second pass finds none
+}
+
+/// What a message typed into the chat means to the goal loop (the server's grammar, worker/chat/goal.zig
+/// parseCommand, mirrored only as far as the desk's own toggle needs it).
+pub const GoalSend = enum { none, start, go_on, stop, other };
+
+pub fn goalSendKind(text: []const u8) GoalSend {
+    const tr = std.mem.trim(u8, text, " \r\n\t");
+    if (!std.mem.startsWith(u8, tr, "/goal")) return .none;
+    const rest = tr["/goal".len..];
+    if (rest.len > 0 and rest[0] != ' ' and rest[0] != '\n' and rest[0] != '\t') return .none; // "/goals"
+    const r = std.mem.trim(u8, rest, " \r\n\t");
+    if (r.len == 0) return .other;
+    for ([_][]const u8{ "status", "show", "?", "forever", "--forever" }) |w| if (std.ascii.eqlIgnoreCase(r, w)) return .other;
+    for ([_][]const u8{ "stop", "off", "clear", "cancel", "pause", "end" }) |w| if (std.ascii.eqlIgnoreCase(r, w)) return .stop;
+    for ([_][]const u8{ "resume", "continue", "go", "on" }) |w| if (std.ascii.eqlIgnoreCase(r, w)) return .go_on;
+    if (std.ascii.startsWithIgnoreCase(r, "budget ") or std.ascii.startsWithIgnoreCase(r, "check ")) return .other;
+    return .start;
+}
+
+test "goal: a /goal send is classified for the loop toggle - start, resume, stop, and what leaves it alone" {
+    try std.testing.expectEqual(GoalSend.start, goalSendKind("/goal make every test pass --budget 6"));
+    try std.testing.expectEqual(GoalSend.go_on, goalSendKind("/goal resume"));
+    try std.testing.expectEqual(GoalSend.stop, goalSendKind(" /goal stop\n"));
+    try std.testing.expectEqual(GoalSend.other, goalSendKind("/goal"));
+    try std.testing.expectEqual(GoalSend.other, goalSendKind("/goal budget 9"));
+    try std.testing.expectEqual(GoalSend.none, goalSendKind("/goals are good"));
+    try std.testing.expectEqual(GoalSend.none, goalSendKind("my /goal is x"));
 }
