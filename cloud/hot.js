@@ -41,7 +41,7 @@
 // No imports and no platform globals beyond fetch/Response/crypto, so cloud/hot.test.mjs runs the whole file
 // under node with a Map for storage and a scripted model.
 
-export const VERSION = "4";
+export const VERSION = "5";
 export const MAX_HOTS = 3;
 export const PRIMARY = "Gary"; // the first hot of every account
 
@@ -351,7 +351,10 @@ const JUDGE_SYSTEM =
   "(fetched pages, saved notes, reports from minds, results from the owner's machine); the closing claim is only a " +
   "claim. Decide whether THIS iteration moved the goal forward, using tool results alone. IMPROVED needs a tool " +
   "result showing that something now exists, works, or measures better than before. A change with nothing to show " +
-  "its effect is SAME. A new failure or a worse measurement is REGRESSED.";
+  "its effect is SAME. An attempt that failed - an error, a package that could not be installed, a page that " +
+  "refused - and left everything as it was is SAME, not REGRESSED. A first measurement is a baseline, however low: " +
+  "it is never REGRESSED. REGRESSED is rare: it needs a tool result showing that something which worked, existed " +
+  "or measured better in an EARLIER iteration is now broken, gone or measures worse.";
 
 function judgeQuestion(goalText) {
   return (
@@ -372,7 +375,10 @@ function pickQuestion(g, rows) {
     "ITERATIONS SO FAR (never repeat one; if one regressed, undoing or fixing it may be the best next step):\n" +
     logText(rows) +
     "What is the single BEST next improvement - the one most likely to move the goal forward - that is NOT in that list? " +
-    "Prefer a step whose effect a tool can show. A CLAIM OF WORK IS NOT WORK. " +
+    "Prefer a step whose effect a tool can show, and choose only a step your tools and YOUR PYTHON as listed above can carry out: " +
+    "a step that needs a package or a tool you do not have is a wasted iteration. " +
+    "If the goal does not say how finished is measured and no file of yours does yet, the best step is to write that down first: " +
+    "a checklist file of concrete items a tool can verify, which later steps tick off and count. A CLAIM OF WORK IS NOT WORK. " +
     tail
   );
 }
@@ -404,7 +410,7 @@ const TOOLS = [
   { name: "browser_eval", args: '{"js": "<an expression, or statements with return>"}', what: "run JavaScript in the page; its value (or what it console.logs) comes back", need: "browser" },
   { name: "browser_close", args: "{}", what: "close the browser when you are done with it", need: "browser" },
   // scripting
-  { name: "run_python", args: '{"code": "<a script>", "files": ["<a file of yours to put beside it>"]}', what: "run Python 3.12. The standard library is there, `import requests` and urllib work for HTTP, and a pure-Python package you import is installed from PyPI by itself. There are NO processes or shell (no subprocess, no os.system) and no native packages (numpy, pandas). It prints; the files it writes are kept in your workspace", need: "python" },
+  { name: "run_python", args: '{"code": "<a script>", "files": ["<a file of yours to put beside it>"]}', what: "run Python 3.12. The standard library is there, `import requests` and urllib work for HTTP, and a pure-Python package you import is installed from PyPI by itself. There are NO processes or shell (no subprocess, no os.system), and a package with native code is there only if YOUR PYTHON lists it. It prints; the TEXT files it writes are kept in your workspace (no images: write SVG or HTML)", need: "python" },
   { name: "pip_install", args: '{"packages": ["<name>"]}', what: "install pure-Python packages from PyPI for your scripts; they stay installed", need: "python" },
   { name: "save_skill", args: '{"name": "<short_name>", "about": "<what it does and its ARGS>", "code": "<a Python script reading ARGS>"}', what: "keep a script as a tool of your own, for every later iteration", need: "python" },
   { name: "run_skill", args: '{"name": "<skill>", "args": {}}', what: "run a skill you saved; `args` arrives as ARGS", need: "python" },
@@ -667,6 +673,27 @@ const hotKey = (name) => "hot:" + name.toLowerCase();
 const call = (stub, path, body) =>
   stub.fetch("https://hot" + path, body === undefined ? undefined : { method: "POST", body: JSON.stringify(body), headers: { "content-type": "application/json" } });
 
+/// Ask the Python Worker what it is. Never throws.
+async function pythonCaps(env) {
+  if (!env.PY) return { ok: false, native: [], error: "no Python Worker is bound" };
+  try {
+    const r = await env.PY.fetch("https://py/run", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ caps: true }) });
+    const text = await r.text();
+    let j = null;
+    try {
+      j = JSON.parse(text);
+    } catch {}
+    if (j && j.ok === true && Array.isArray(j.native)) return { ok: true, native: j.native.map(String).slice(0, 40), error: "" };
+    return { ok: false, native: [], error: clip(j?.out ?? text, 300) };
+  } catch (e) {
+    return { ok: false, native: [], error: clip(e?.message ?? e, 300) };
+  }
+}
+
+/// Packages with native code a model reaches for by habit. Those this Python was not uploaded with are named
+/// to the hot as absent, so it plans around them instead of finding out one failed iteration at a time.
+const NATIVE_COMMON = ["numpy", "pandas", "matplotlib", "scipy", "scikit-learn", "pillow", "regex", "spacy", "gensim", "torch", "tensorflow", "opencv-python", "lxml"];
+
 async function route(req, env) {
   const url = new URL(req.url);
   const auth = req.headers.get("authorization") ?? "";
@@ -679,6 +706,13 @@ async function route(req, env) {
   const padStub = stubFor(env, "pad");
 
   if (seg[1] === "version" && method === "GET") return json({ ok: true, version: VERSION, max_hots: MAX_HOTS });
+
+  // Whether the Python Worker starts, and the native packages it came up with. The server asks after an upload:
+  // a Python that does not start with the packages it was uploaded with is uploaded again with fewer.
+  if (seg[1] === "python" && method === "GET") {
+    const caps = await pythonCaps(env);
+    return json({ ok: true, python: caps.ok, native: caps.native, error: caps.error });
+  }
 
   if (seg[1] === "pad") {
     if (seg[2] === "clear" && method === "POST") return call(padStub, "/pad/clear", {});
@@ -1214,6 +1248,10 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
     const inbox = (await this.store.get("inbox")) ?? [];
     if (inbox.length > 0) await this.store.put("inbox", []);
     const padTail = await this.padTail();
+    if (this.env.PY && (await this.store.get("py_native")) === undefined) {
+      const caps = await pythonCaps(this.env);
+      if (caps.ok) await this.store.put("py_native", caps.native);
+    }
     const system = this.systemPrompt(cfg, g, lessons, padTail) + (await this.workingMemory());
     const inboxText = inbox.length > 0 ? "\nNEW MESSAGES (a message from human is a directive and outranks your own plan):\n" + inbox.map((m) => `- ${m.from}: ${m.text}`).join("\n") + "\n" : "";
 
@@ -1238,7 +1276,7 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
 
     // MEASURE
     const transcript = record.length > 0 ? record.map((r) => `TOOL ${r.tool}(${clip(JSON.stringify(r.args), 300)}) -> ${clip(r.result, 1200)}`).join("\n") : "(no tool was used)";
-    const verdictLine = await this.ask(cfg, [{ role: "system", content: JUDGE_SYSTEM }, { role: "user", content: `THE STEP: ${step}\n\nTHE RECORD:\n${transcript}\n\nCLOSING CLAIM: ${clip(claim, 800)}\n\n${judgeQuestion(g.text)}` }], 1200);
+    const verdictLine = await this.ask(cfg, [{ role: "system", content: JUDGE_SYSTEM }, { role: "user", content: `EARLIER ITERATIONS (what stood before this one):\n${logText(rows)}\nTHE STEP: ${step}\n\nTHE RECORD:\n${transcript}\n\nCLOSING CLAIM: ${clip(claim, 800)}\n\n${judgeQuestion(g.text)}` }], 1200);
     const v = parseVerdict(verdictLine);
 
     // RECORD - onto the goal as it is stored NOW. The model calls above took a while, and a command may have
@@ -1410,6 +1448,19 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
     if (files.size > 0) out += "YOUR FILES: " + [...files.entries()].map(([k, v]) => `${k.slice(5)} (${v.text.length})`).join(", ") + "\n";
     const skills = await this.store.list({ prefix: "skill:", limit: 40 });
     if (skills.size > 0) out += "YOUR SKILLS (run_skill):\n" + [...skills.entries()].map(([k, v]) => `- ${k.slice(6)}: ${clip(v.about, 160)}`).join("\n") + "\n";
+    if (this.env.PY) {
+      const native = (await this.store.get("py_native")) ?? [];
+      const have = (await this.store.get("py_packages")) ?? [];
+      const missing = (await this.store.get("py_missing")) ?? [];
+      const absent = [...new Set([...NATIVE_COMMON, ...missing])].filter((n) => !native.includes(n));
+      out +=
+        "YOUR PYTHON: the standard library, requests and urllib" +
+        (native.length > 0 ? `, and these native packages: ${native.join(", ")}` : "") +
+        (have.length > 0 ? `; installed from PyPI: ${have.join(", ")}` : "") +
+        ". Any other pure-Python package installs when a script imports it. " +
+        `NOT here and not installable (native code): ${absent.join(", ")} - never choose a step that needs one. ` +
+        "For a chart write SVG or HTML text yourself; for tables use csv and json; for text use re, collections and difflib.\n";
+    }
     return out;
   }
 
@@ -2016,9 +2067,11 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
     }
     // The Python Worker keeps nothing between scripts, so the packages this hot uses go with every one.
     const packages = (await this.store.get("py_packages")) ?? [];
+    // ...and so do the names already found to need native code, so no script pays for looking them up again.
+    const skip = (await this.store.get("py_missing")) ?? [];
     let j;
     try {
-      const r = await this.env.PY.fetch("https://py/run", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ code, files, args: args ?? null, packages, install: install ?? [] }) });
+      const r = await this.env.PY.fetch("https://py/run", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ code, files, args: args ?? null, packages, install: install ?? [], skip }) });
       const text = await r.text();
       try {
         j = JSON.parse(text);
@@ -2031,6 +2084,15 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
     if (Array.isArray(j.installed)) {
       const all = [...new Set([...packages, ...j.installed.map(String)])].slice(0, 40);
       if (all.length !== packages.length) await this.store.put("py_packages", all);
+    }
+    if (Array.isArray(j.native)) {
+      const native = j.native.map(String).slice(0, 40);
+      if (JSON.stringify(native) !== JSON.stringify(await this.store.get("py_native"))) await this.store.put("py_native", native);
+    }
+    if (Array.isArray(j.unavailable)) {
+      const native = (await this.store.get("py_native")) ?? [];
+      const all = [...new Set([...skip, ...j.unavailable.map(String)])].filter((n) => !native.includes(n)).slice(-40);
+      if (JSON.stringify(all) !== JSON.stringify(skip)) await this.store.put("py_missing", all);
     }
     if (install) return j.ok ? `installed. Your Python now has: ${(j.installed ?? []).join(", ") || "(nothing new)"}` : `ERROR: ${clip(String(j.out ?? ""), 600)}`;
     const wrote = [];

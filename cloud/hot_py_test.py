@@ -38,6 +38,7 @@ def wheel(files):
 
 HITS = []
 WHEELS = {
+    "halfkit": wheel({"halfkit/__init__.py": "def ok():\n    return 'yes'\n", "halfkit-1.0.dist-info/METADATA": "Name: halfkit\n"}),
     "tidekit": wheel({"tidekit/__init__.py": "from tidehelp import twice\n\ndef high(n):\n    return twice(n) + 1\n", "tidekit-1.0.dist-info/METADATA": "Name: tidekit\n"}),
     "tidehelp": wheel({"tidehelp.py": "def twice(n):\n    return n * 2\n", "../escape.py": "x = 1\n"}),
 }
@@ -71,6 +72,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._send(200, json.dumps({"info": {"version": "1.0", "requires_dist": ["tidehelp>=1", 'extra-only ; extra == "dev"']}, "urls": [{"packagetype": "bdist_wheel", "filename": "tidekit-1.0-py3-none-any.whl", "url": base + "/w/tidekit", "size": 500}]}))
             if name == "tidehelp":
                 return self._send(200, json.dumps({"info": {"version": "2.1", "requires_dist": None}, "urls": [{"packagetype": "bdist_wheel", "filename": "tidehelp-2.1-py3-none-any.whl", "url": base + "/w/tidehelp", "size": 300}]}))
+            if name == "halfkit":
+                return self._send(200, json.dumps({"info": {"version": "1.0", "requires_dist": ["nativepkg"]}, "urls": [{"packagetype": "bdist_wheel", "filename": "halfkit-1.0-py3-none-any.whl", "url": base + "/w/halfkit", "size": 300}]}))
             if name == "nativepkg":
                 return self._send(200, json.dumps({"info": {"version": "9"}, "urls": [{"packagetype": "bdist_wheel", "filename": "nativepkg-9-cp312-cp312-manylinux_x86_64.whl", "url": base + "/w/x", "size": 1}, {"packagetype": "sdist", "filename": "nativepkg-9.tar.gz", "url": base + "/w/y", "size": 1}]}))
             return self._send(404, "{}")
@@ -172,6 +175,28 @@ check("a package PyPI does not have is said so", (not r["ok"]) and "there is no 
 
 r = run({"code": "", "install": ["nativepkg"]})
 check("an explicit install that fails is a failed answer", (not r["ok"]) and r["out"].startswith("pip install failed: nativepkg has no pure-Python wheel"), r)
+
+check("the refusal says what to do instead, and the name is remembered as one that cannot be had", "Use the standard library or a pure-Python package." in r["out"] and r["unavailable"] == ["nativepkg"], r)
+HITS.clear()
+r = run({"code": "import nativepkg"})
+check("a name already found to need native code is refused without a second trip to PyPI", (not r["ok"]) and "has no pure-Python wheel" in r["out"] and HITS == [], (r, HITS))
+check("the script's own error is shown once, without the runner's lookup inside it", r["out"].count("Traceback") == 1 and "hot_py.py" not in r["out"] and "During handling" not in r["out"], r)
+hot_py.UNAVAILABLE.clear()
+r = run({"code": "import nativepkg", "skip": ["NativePkg"]})
+check("the names a hot was already refused ride with the script", (not r["ok"]) and "has no pure-Python wheel" in r["out"] and not any("nativepkg" in h[1] for h in HITS), (r, HITS))
+hot_py.UNAVAILABLE.clear()
+
+r = run({"code": "import halfkit\nprint(halfkit.ok())"})
+check("a package whose requirement needs native code is installed without it, and says so", r["ok"] and r["out"] == "(installed: halfkit 1.0)\n(halfkit is installed WITHOUT nativepkg, which it requires: nativepkg has no pure-Python wheel (it needs native code))\nyes\n" and "halfkit" in r["installed"] and "nativepkg" not in r["installed"], r)
+hot_py.UNAVAILABLE.clear()
+
+r = run({"caps": True})
+check("asked what it is, the runner names the native packages it has", r["ok"] and isinstance(r["native"], list) and r["native"] == hot_py._caps() and r["python"][0] == "3", r)
+check("the standard library is never looked up on PyPI", run({"code": "", "install": ["json"]})["ok"] and not any("/json" in h[1] and "pypi/json/" in h[1] for h in HITS), HITS)
+check("a matplotlib that is not here is refused with what to do instead", hot_py._has("matplotlib") or "write the SVG or HTML text yourself" in hot_py._native_words("matplotlib"), hot_py._native_words("matplotlib"))
+
+r = run({"code": "open('pic.png', 'wb').write(bytes([137, 80, 78, 71, 255, 254]))\nopen('ok.svg', 'w').write('<svg/>')"})
+check("a binary file a script writes is not kept, and the output says so", r["ok"] and r["files"] == {"ok.svg": "<svg/>"} and "(not kept: pic.png - only text files" in r["out"], r)
 
 hot_py.INSTALLED.clear()
 r = run({"code": "import tidehelp\nprint(tidehelp.twice(4))", "packages": ["tidehelp"]})

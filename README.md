@@ -269,7 +269,9 @@ A **hot** (Human Overview Technician) is the veil's goal loop with no human in i
 under it. Once you are logged in with Cloudflare, the desk's **Hots** tab (or `veil hot deploy "<goal>"`)
 uploads one small Worker, `veil-hots`, into *your* account and creates a hot in it. From then on the hot
 works on its own: it wakes on a timer, picks the single best next improvement toward its goal, does it with
-its tools, has a judge measure whether it helped from the tool results alone, records the iteration, and
+its tools, has a judge measure whether it helped from the tool results alone (against the iterations
+before it: an attempt that failed and left things as they were is *same*, and only something that got worse is
+*regressed*), records the iteration, and
 sets its next wake-up. Your computer can be off. Its model calls go through the account's own AI binding,
 so they never cross the public internet and need no API key.
 
@@ -302,7 +304,12 @@ so they never cross the public internet and need no API key.
     has no sockets, no processes and no pip, so the runner supplies what a script expects: `import requests`
     and `urllib` work on the Worker's own fetch, a missing import is installed from PyPI by itself (pure-Python
     packages; `pip install` and `pip_install` do the same) and stays installed, and anything that needs a
-    process or native code is refused in words the hot can act on; `save_skill` keeps a script as a tool of the hot's own and `run_skill` runs it
+    process or native code is refused in words the hot can act on. Packages with native code cannot be
+    fetched by a running script, so the upload asks Cloudflare for a set of them by name (numpy, regex,
+    pandas, matplotlib, pillow); if Cloudflare refuses the set, or the Python does not start with it, a
+    smaller set goes up, down to the plain Python. Every iteration the hot is told what its Python has and
+    what it cannot have, so it plans around the gaps instead of finding them one failed step at a time;
+    `save_skill` keeps a script as a tool of the hot's own and `run_skill` runs it
     again, so a hot builds its own tools;
   - *a mind* - the hot's facts live in **neuron-db**, the veil's own memory engine compiled to WebAssembly
     and uploaded with the runtime: `remember` keeps a fact and `recall` finds it by meaning. The same engine
