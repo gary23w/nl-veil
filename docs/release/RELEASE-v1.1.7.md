@@ -32,7 +32,7 @@ The hot runtime has its own suite (35 tests, run under node by the oracle) cover
 
 Goal mode was run once live on Workers AI: a planted project with a failing test file went from 0 to 6/6 and the loop ended as achieved in two iterations.
 
-This release: `check.ps1 -Full` green; the server suite 862 passed / 1 skipped; the desktop suite 293/293; the hot runtime suite 35/35; the Python runner's own checks pass.
+This release: `check.ps1 -Full` green; the server suite 868 passed / 1 skipped; the desktop suite 293/293; the hot runtime suite 35/35; the Python runner's own checks pass.
 
 ## Known limits
 
