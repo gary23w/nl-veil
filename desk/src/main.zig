@@ -268,6 +268,8 @@ const Ui = struct {
     tot_forever: bool = false,
     tot_local: bool = false, // "let it use THIS machine": unchecked on every new form
     tot_del: [tots.NAME_MAX]u8 = undefined, // the tot whose Delete was clicked once (the second click deletes)
+    tot_run_del: [tots.LEAF_MAX]u8 = undefined,
+    tot_run_del_len: u8 = 0,
     tot_del_len: u8 = 0,
     tot_scroll: f32 = 0, // the console, in visual lines
     tot_follow: bool = true, // pinned to the newest line
@@ -7750,7 +7752,9 @@ fn drawTotConsole(r: t.Rect, evs: []const tots.Ev) void {
         if (ui.tot_errors_only and e.ok) continue;
         total += 1 + (if (totIsOpen(e.seq)) totLineCount(e.textStr(), cols) else 0);
     }
-    const visible: usize = @max(1, @as(usize, @intFromFloat((r.height - 12) / line_h)));
+    const header_h: f32 = 32;
+    t.text(t.z("ACTIVITY", .{}), @intFromFloat(r.x + 14), @intFromFloat(r.y + 10), 11, t.comment);
+    const visible: usize = @max(1, @as(usize, @intFromFloat(@max(0, r.height - header_h - 8) / line_h)));
     const max_scroll: f32 = @floatFromInt(if (total > visible) total - visible else 0);
 
     const wheel = rl.getMouseWheelMove();
@@ -7758,7 +7762,7 @@ fn drawTotConsole(r: t.Rect, evs: []const tots.Ev) void {
         ui.tot_scroll -= wheel * 3;
         ui.tot_follow = false;
     }
-    const track = t.Rect{ .x = r.x + r.width - sb_w - 4, .y = r.y + 4, .width = sb_w, .height = r.height - 8 };
+    const track = t.Rect{ .x = r.x + r.width - sb_w - 4, .y = r.y + header_h, .width = sb_w, .height = @max(1, r.height - header_h - 8) };
     if (max_scroll > 0 and rl.isMouseButtonPressed(.left) and t.hovering(track)) ui.tot_sb_drag = true;
     if (!rl.isMouseButtonDown(.left)) ui.tot_sb_drag = false;
     if (ui.tot_sb_drag and max_scroll > 0) {
@@ -7773,10 +7777,10 @@ fn drawTotConsole(r: t.Rect, evs: []const tots.Ev) void {
 
     var clicked: ?u64 = null;
     {
-        rl.beginScissorMode(@intFromFloat(r.x + 1), @intFromFloat(r.y + 1), @intFromFloat(r.width - 2), @intFromFloat(r.height - 2));
+        rl.beginScissorMode(@intFromFloat(r.x + 1), @intFromFloat(r.y + header_h), @intFromFloat(@max(0, r.width - 2)), @intFromFloat(@max(0, r.height - header_h - 2)));
         defer rl.endScissorMode();
         var li: usize = 0;
-        var yy = r.y + 6;
+        var yy = r.y + header_h + 4;
         draw: for (evs) |*e| {
             if (ui.tot_errors_only and e.ok) continue;
             const open = totIsOpen(e.seq);
@@ -7823,8 +7827,8 @@ fn drawTotConsole(r: t.Rect, evs: []const tots.Ev) void {
         totToggle(seq);
         ui.tot_follow = false; // stay where the reader is
     }
-    if (evs.len == 0) t.text(t.z("no events yet - a new tot's first iteration starts within a few seconds", .{}), @intFromFloat(r.x + 14), @intFromFloat(r.y + 14), 13, t.comment);
-    if (evs.len > 0 and total == 0) t.text(t.z("no errors in what is shown", .{}), @intFromFloat(r.x + 14), @intFromFloat(r.y + 14), 13, t.comment);
+    if (evs.len == 0) t.textClip("No activity yet. A new tot starts within a few seconds.", @intFromFloat(r.x + 14), @intFromFloat(r.y + header_h + 12), 13, t.comment, @intFromFloat(@max(0, r.width - 28)));
+    if (evs.len > 0 and total == 0) t.text(t.z("No errors in this run", .{}), @intFromFloat(r.x + 14), @intFromFloat(r.y + header_h + 12), 13, t.comment);
 
     if (failed > 0 or ui.tot_errors_only) {
         if (t.buttonGhost(chip, fl, if (failed > 0) t.red else t.comment, true)) {
@@ -8003,7 +8007,7 @@ fn drawTots(store: *Store, body: t.Rect) void {
         }
     }
 
-    const left_w: f32 = 300;
+    const left_w: f32 = std.math.clamp(body.width * 0.28, 280, 340);
     const lx = body.x + pad;
     var y = body.y + pad;
     t.text(t.z("Tater-tots", .{}), @intFromFloat(lx), @intFromFloat(y), 20, t.fg);
@@ -8021,10 +8025,10 @@ fn drawTots(store: *Store, body: t.Rect) void {
 
     // roster cards, in a list that scrolls once there are more than fit
     const card_h: f32 = 74;
-    const run_h: f32 = 36;
+    const run_h: f32 = 76;
     const runs_head: f32 = if (past_n > 0) 26 else 0;
     const list_total = @as(f32, @floatFromInt(roster.n)) * (card_h + 8) + runs_head + @as(f32, @floatFromInt(past_n)) * (run_h + 4);
-    const list_h = @min(list_total, @max(card_h + 8, body.height * 0.45));
+    const list_h = @min(list_total, @max(card_h + 8, @min(body.height * 0.55, body.height - 270)));
     const list_r = t.Rect{ .x = lx, .y = y, .width = left_w + 2, .height = list_h };
     const list_max = @max(0, list_total - list_h);
     if (t.hovering(list_r)) {
@@ -8075,11 +8079,12 @@ fn drawTots(store: *Store, body: t.Rect) void {
             const hot = t.hovering(rr) and t.hovering(list_r);
             t.panelBordered(rr, if (is_sel) t.bg_sel else if (hot) t.bg_hl else t.bg, if (is_sel) t.blue else t.border);
             const col = if (run.failed()) t.red else t.comment;
-            t.statusDot(@intFromFloat(rr.x + 12), @intFromFloat(rr.y + 18), col);
-            t.textClip(run.nameStr(), @intFromFloat(rr.x + 24), @intFromFloat(rr.y + 4), 13, t.fg_dim, 120);
+            t.statusDot(@intFromFloat(rr.x + 14), @intFromFloat(rr.y + 19), col);
+            t.textClip(if (std.mem.eql(u8, run.nameStr(), "unnamed")) "New deployment" else run.nameStr(), @intFromFloat(rr.x + 28), @intFromFloat(rr.y + 10), 14, t.fg, @intFromFloat(left_w - 116));
+            t.textClip(if (run.failed()) "Failed" else "Ended", @intFromFloat(rr.x + left_w - 68), @intFromFloat(rr.y + 12), 11, col, 58);
             var wb: [16]u8 = undefined;
-            t.textClip(t.z("{s}  {s}", .{ run.when(&wb), if (run.failed()) "failed" else "ended" }), @intFromFloat(rr.x + 24), @intFromFloat(rr.y + 20), 11, col, 160);
-            if (run.goal_len > 0) t.textClip(run.goalStr(), @intFromFloat(rr.x + 150), @intFromFloat(rr.y + 12), 11, t.comment, @intFromFloat(left_w - 160));
+            t.textClip(if (run.goal_len > 0) run.goalStr() else "No goal recorded", @intFromFloat(rr.x + 14), @intFromFloat(rr.y + 33), 12, t.fg_dim, @intFromFloat(left_w - 28));
+            t.textClip(t.z("{s} UTC  /  {d} events", .{ run.when(&wb), run.events }), @intFromFloat(rr.x + 14), @intFromFloat(rr.y + 55), 11, t.comment, @intFromFloat(left_w - 28));
             if (hot) t.wantCursor(.pointing_hand);
             if (hot and rl.isMouseButtonPressed(.left)) {
                 store.pushCmd(store_mod.mkCmd(.tot_select_run, run.nameStr(), run.leafStr()));
@@ -8089,6 +8094,12 @@ fn drawTots(store: *Store, body: t.Rect) void {
         }
     }
     if (any_rows) rl.endScissorMode();
+    if (list_max > 0) {
+        const thumb_h = @max(24, list_h * list_h / list_total);
+        const thumb_y = list_top + (list_h - thumb_h) * ui.tot_list_scroll / list_max;
+        t.fillRect(@intFromFloat(lx + left_w + 4), @intFromFloat(list_top), 3, @intFromFloat(list_h), t.withAlpha(t.comment, 30));
+        t.fillRect(@intFromFloat(lx + left_w + 4), @intFromFloat(thumb_y), 3, @intFromFloat(thumb_h), t.withAlpha(t.comment, 120));
+    }
     y = list_top + list_h;
     if (roster.total > roster.n) {
         t.textClip(t.z("+{d} more - veil --tater lists them all", .{roster.total - roster.n}), @intFromFloat(lx), @intFromFloat(y), 11, t.comment, @intFromFloat(left_w));
@@ -8280,17 +8291,21 @@ fn drawTotRun(store: *Store, r: t.Rect, run: *const tots.RunRow) void {
     @memcpy(evs[0..ev_n], store.tot_events[0..ev_n]);
     store.unlock();
 
-    t.textClip(run.nameStr(), @intFromFloat(r.x), @intFromFloat(r.y), 20, t.fg, 220);
+    t.textClip(if (std.mem.eql(u8, run.nameStr(), "unnamed")) "New deployment" else run.nameStr(), @intFromFloat(r.x), @intFromFloat(r.y), 22, t.fg, @intFromFloat(r.width));
     var wb: [16]u8 = undefined;
     const failed = run.failed();
     const sc = if (failed) t.red else t.comment;
     t.statusDot(@intFromFloat(r.x + 6), @intFromFloat(r.y + 38), sc);
     const how: []const u8 = if (failed) "deployment failed" else if (std.mem.eql(u8, run.stateStr(), "deleted")) "deleted - this run has ended" else "ended";
     t.textClip(t.z("{s}   started {s} UTC   {d} events", .{ how, run.when(&wb), run.events }), @intFromFloat(r.x + 18), @intFromFloat(r.y + 30), 12, sc, @intFromFloat(r.width - 18));
-    if (run.goal_len > 0) t.textClip(run.goalStr(), @intFromFloat(r.x), @intFromFloat(r.y + 48), 13, t.fg_dim, @intFromFloat(r.width));
-    if (run.err_len > 0) t.textClip(run.errStr(), @intFromFloat(r.x), @intFromFloat(r.y + 68), 12, t.red, @intFromFloat(r.width));
+    var detail_y = r.y + 56;
+    if (run.goal_len > 0) detail_y = helpPara(run.goalStr(), r.x, detail_y, r.width) + 10;
+    if (run.err_len > 0) {
+        t.text(t.z("DEPLOYMENT ERROR", .{}), @intFromFloat(r.x), @intFromFloat(detail_y), 11, t.red);
+        detail_y = helpPara(run.errStr(), r.x, detail_y + 19, r.width) + 12;
+    }
 
-    const ctrl_y = r.y + 88;
+    const ctrl_y = detail_y;
     const ctrl_h: f32 = 32;
     const al = t.z("Deploy again", .{});
     const aw = t.btnW(al, ctrl_h);
@@ -8304,10 +8319,23 @@ fn drawTotRun(store: *Store, r: t.Rect, run: *const tots.RunRow) void {
     const fw = t.btnW(fl, ctrl_h);
     if (t.button(.{ .x = r.x + aw + 8, .y = ctrl_y, .width = fw, .height = ctrl_h }, fl, t.cyan, run.folder_len > 0))
         store.pushCmd(store_mod.mkCmd(.tot_open_folder, run.nameStr(), run.folderStr()));
-    t.textClip(t.z("read from its folder on this machine - nothing runs", .{}), @intFromFloat(r.x + aw + fw + 24), @intFromFloat(ctrl_y + 9), 12, t.comment, @intFromFloat(@max(0, r.width - aw - fw - 24)));
+    const armed = std.mem.eql(u8, ui.tot_run_del[0..ui.tot_run_del_len], run.leafStr());
+    const remove_label = if (armed) t.z("Remove from list?", .{}) else t.z("Remove run", .{});
+    const remove_width = t.btnW(remove_label, ctrl_h);
+    const remove_button = t.Rect{ .x = r.x + r.width - remove_width, .y = ctrl_y, .width = remove_width, .height = ctrl_h };
+    if (t.buttonGhost(remove_button, remove_label, t.red, true)) {
+        if (armed) {
+            store.pushCmd(store_mod.mkCmd(.tot_delete_run, run.leafStr(), ""));
+            ui.tot_run_del_len = 0;
+        } else {
+            @memcpy(ui.tot_run_del[0..run.leaf_len], run.leafStr());
+            ui.tot_run_del_len = run.leaf_len;
+        }
+    } else if (armed and rl.isMouseButtonPressed(.left) and !t.hovering(remove_button)) ui.tot_run_del_len = 0;
+    t.textClip("Saved run / removing it from history keeps its files on this machine.", @intFromFloat(r.x), @intFromFloat(ctrl_y + ctrl_h + 12), 11, t.comment, @intFromFloat(r.width));
 
-    const top = ctrl_y + ctrl_h + 10;
-    drawTotConsole(.{ .x = r.x, .y = top, .width = r.width, .height = r.y + r.height - top }, evs[0..ev_n]);
+    const top = ctrl_y + ctrl_h + 38;
+    drawTotConsole(.{ .x = r.x, .y = top, .width = r.width, .height = @max(48, r.y + r.height - top) }, evs[0..ev_n]);
 }
 
 fn drawTotPanel(store: *Store, r: t.Rect, row: *const tots.Row) void {

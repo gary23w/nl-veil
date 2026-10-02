@@ -23,7 +23,7 @@ const SpinLock = struct {
 
 pub const Tab = enum { dashboard, chat, swarm, tots, hub, scheduled, settings }; // deploy = the Swarm tab's inner form
 
-pub const CmdKind = enum { none, select, say, set_goal, stop, deploy, delete, open_folder, refresh_now, open_file, sched_create, sched_update, sched_toggle, sched_delete, sched_run, oauth_cf_login, oauth_cf_logout, open_url, builtin_pull, builtin_cancel, builtin_import, builtin_remove, builtin_check, dataset_start, dataset_stop, cf_tunnel_on, cf_tunnel_off, lineage_accept, lineage_reject, tot_select, tot_deploy, tot_command, tot_config, tot_delete, tot_pad_write, tot_open_folder, tot_pad_clear, tot_limit, tot_select_run };
+pub const CmdKind = enum { none, select, say, set_goal, stop, deploy, delete, open_folder, refresh_now, open_file, sched_create, sched_update, sched_toggle, sched_delete, sched_run, oauth_cf_login, oauth_cf_logout, open_url, builtin_pull, builtin_cancel, builtin_import, builtin_remove, builtin_check, dataset_start, dataset_stop, cf_tunnel_on, cf_tunnel_off, lineage_accept, lineage_reject, tot_select, tot_deploy, tot_command, tot_config, tot_delete, tot_pad_write, tot_open_folder, tot_pad_clear, tot_limit, tot_select_run, tot_delete_run };
 
 /// A UI→poller command. Fixed-size, copied by value into the ring, so no cross-thread allocation.
 pub const Command = struct {
