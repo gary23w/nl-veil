@@ -16,6 +16,12 @@ Windows · macOS · Linux · MIT licensed. Local inference needs no provider acc
 hosted providers have their own data handling and costs. The built-in model requires a separate
 download, and coding tools require Python on `PATH` (some checks also use Node).
 
+### New in v1.1.8
+
+Admin credentials are checked against durable storage before the listener or Tunnel starts. Legacy
+default passwords are replaced, an explicitly configured admin password is applied to existing
+accounts, and startup stops if a required change cannot be verified. [Release notes](docs/release/RELEASE-v1.1.8.md).
+
 ### New in v1.1.7
 
 **Tater-tots**: the veil's goal loop running in your own Cloudflare account, with nobody in it and your computer
@@ -55,7 +61,7 @@ code and credentials from anything you share.
 
 <p>
   <a href="https://github.com/gary23w/nl-veil/actions/workflows/release.yml"><img alt="build" src="https://github.com/gary23w/nl-veil/actions/workflows/release.yml/badge.svg"></a>
-  <a href="https://github.com/gary23w/nl-veil/releases"><img alt="release" src="https://img.shields.io/badge/release-v1.1.7-A8241B"></a>
+  <a href="https://github.com/gary23w/nl-veil/releases"><img alt="release" src="https://img.shields.io/badge/release-v1.1.8-A8241B"></a>
   <img alt="zig" src="https://img.shields.io/badge/zig-0.16-F7A41D?logo=zig&logoColor=white">
   <a href="https://huggingface.co/gary23w/the-veil-12b"><img alt="built-in model" src="https://img.shields.io/badge/built--in%20model-the--veil--12b-6E4A27?logo=huggingface&logoColor=white"></a>
   <a href="https://huggingface.co/gary23w/gary-neuron-emergent"><img alt="memory cortex" src="https://img.shields.io/badge/cortex-gary--neuron--emergent-6E4A27?logo=huggingface&logoColor=white"></a>
@@ -506,7 +512,7 @@ raylib is a *lazy* dependency, so `-Dapp=false` never fetches it at all.
 ## Install
 
 **Download it and run it — no toolchain, nothing to build.** Grab your platform's bundle from the
-**[latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.1.7)**, unzip, and run `veil`:
+**[latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.1.8)**, unzip, and run `veil`:
 
 | You're on | Download | Then run |
 |---|---|---|
@@ -667,7 +673,7 @@ step 5** — the rest is about letting other people in.
 
 ### 1. Download and unblock it
 
-Grab the bundle for your OS from the [latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.1.7)
+Grab the bundle for your OS from the [latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.1.8)
 and unzip it somewhere you'll find again. Builds are unsigned, so:
 
 - **Windows** shows *"Windows protected your PC"* → **More info** → **Run anyway**.
@@ -1573,7 +1579,9 @@ dependency entirely rather than compiling it unused.
 
 ## Release
 
-**Current: [`v1.1.7`](https://github.com/gary23w/nl-veil/releases/tag/v1.1.7)** — **[tater-tots](#tater-tots---goal-loops-that-run-without-you-in-your-own-account)**:
+**Current: [`v1.1.8`](https://github.com/gary23w/nl-veil/releases/tag/v1.1.8)** — admin credentials are reconciled and read back from storage before a listener or Tunnel can expose the account. [Full notes](docs/release/RELEASE-v1.1.8.md).
+
+**Previously: [`v1.1.7`](docs/release/RELEASE-v1.1.7.md)** — **[tater-tots](#tater-tots---goal-loops-that-run-without-you-in-your-own-account)**:
 the goal loop running in your own Cloudflare account with nobody in it. The desktop's new Tater-tots tab (or
 `veil --tater deploy "<goal>"`) uploads one small Worker into your account; each tater-tot wakes on a timer, makes one
 measured improvement toward its goal, writes itself lessons from what the measurement said, and moves on to
