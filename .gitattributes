@@ -5,3 +5,5 @@
 *.ico binary
 *.exe binary
 *.wasm binary
+*.mp4 binary
+*.wav binary
