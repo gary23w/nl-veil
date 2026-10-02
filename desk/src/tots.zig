@@ -12,7 +12,8 @@
 
 const std = @import("std");
 
-pub const MAX_TOTS = 3; // the account limit; the server and the runtime enforce it, the tab only draws to it
+pub const ROSTER_CAP = 64; // rows the tab holds; an account may run more (its limit is `Roster.max`), `veil --tater` lists them all
+pub const DEFAULT_MAX = 24; // the account limit until the server says otherwise; the server and the runtime enforce it
 pub const MAX_PAD = 12; // newest scratchpad entries shown
 pub const NAME_MAX = 24;
 pub const EV_TEXT = 2200; // characters of an event the tab keeps: a tool row (args + result) whole
@@ -122,8 +123,10 @@ pub const Roster = struct {
     neuron: bool = false, // the tots have neuron-db: recall by meaning, stances, a mood
     note: [200]u8 = [_]u8{0} ** 200, // why one of those is missing, in Cloudflare's words
     note_len: u8 = 0,
+    max: u32 = DEFAULT_MAX, // how many this account may run (the owner sets it)
+    total: usize = 0, // how many it runs; `n` of them are in `rows`
     n: usize = 0,
-    rows: [MAX_TOTS]Row = [_]Row{.{}} ** MAX_TOTS,
+    rows: [ROSTER_CAP]Row = [_]Row{.{}} ** ROSTER_CAP,
     err: [200]u8 = [_]u8{0} ** 200, // the last deployment error, in the server's words
     err_len: u8 = 0,
 
@@ -186,7 +189,7 @@ const JTot = struct {
     folder: []const u8 = "",
     goal: ?JGoal = null,
 };
-const JRoster = struct { ok: bool = false, connected: bool = false, deployed: bool = false, reachable: bool = false, current: bool = true, python: bool = false, browser: bool = false, neuron: bool = false, tools_note: []const u8 = "", last_error: []const u8 = "", tots: []const JTot = &.{} };
+const JRoster = struct { ok: bool = false, max: i64 = DEFAULT_MAX, connected: bool = false, deployed: bool = false, reachable: bool = false, current: bool = true, python: bool = false, browser: bool = false, neuron: bool = false, tools_note: []const u8 = "", last_error: []const u8 = "", tots: []const JTot = &.{} };
 
 fn rowOf(h: JTot) Row {
     var r: Row = .{};
@@ -220,10 +223,12 @@ pub fn parseRoster(gpa: std.mem.Allocator, body: []const u8, out: *Roster) bool 
     defer p.deinit();
     if (!p.value.ok) return false;
     var r: Roster = .{ .connected = p.value.connected, .deployed = p.value.deployed, .reachable = p.value.reachable, .current = p.value.current, .python = p.value.python, .browser = p.value.browser, .neuron = p.value.neuron };
+    r.max = if (p.value.max >= 1) @intCast(@min(p.value.max, 100000)) else DEFAULT_MAX;
+    r.total = p.value.tots.len;
     r.err_len = @intCast(put(&r.err, p.value.last_error));
     r.note_len = @intCast(put(&r.note, p.value.tools_note));
     for (p.value.tots) |h| {
-        if (r.n >= MAX_TOTS) break;
+        if (r.n >= ROSTER_CAP) break;
         if (h.name.len == 0 or h.name.len > NAME_MAX) continue;
         r.rows[r.n] = rowOf(h);
         r.n += 1;
@@ -353,6 +358,13 @@ test "tots: the roster reads the server's reply into rows, one line per field, a
     try tt.expectEqualStrings("u1/_tots/Gary-20261001-120005", g.folderStr());
     try tt.expectEqualStrings("unreachable", r.rows[1].stateStr());
     try tt.expectEqual(@as(u8, 0), r.rows[1].goal_len);
+
+    // the account's limit comes from the server; a reply without one means the default
+    try tt.expectEqual(@as(u32, 3), r.max);
+    try tt.expectEqual(@as(usize, 3), r.total); // every row the runtime sent, the nameless one too
+    var plain: Roster = .{};
+    try tt.expect(parseRoster(tt.allocator, "{\"ok\":true,\"tots\":[]}", &plain));
+    try tt.expectEqual(@as(u32, DEFAULT_MAX), plain.max);
 
     var keep: Roster = .{ .n = 1 };
     try tt.expect(!parseRoster(tt.allocator, "{\"ok\":false,\"err\":\"tots are admin-only for now\"}", &keep));

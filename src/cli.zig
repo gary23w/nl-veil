@@ -1384,7 +1384,7 @@ fn cmdHelp() u8 {
         \\                               in any chat: /goal <text>   /goal   /goal stop   /goal resume
         \\
         \\TATER-TOTS (autonomous goal loops that run in YOUR Cloudflare account - no human, no machine of yours)
-        \\  --tater                         the roster: at most 3; the first is always named Gary
+        \\  --tater                         the roster (24 by default - see limit); the first is always named Gary
         \\  --tater deploy "<goal>" [flags] deploy one: --name N --charter "..." --model @cf/... --pace SECONDS (5+)
         \\                                  --size MINDS --calls PER_DAY|unlimited --budget N --forever
         \\                                  --local  lets it queue jobs for the veil on THIS machine (deployment only)
@@ -1393,6 +1393,8 @@ fn cmdHelp() u8 {
         \\  --tater set <name> [flags]      --model --pace --size --calls --charter --pause --resume
         \\  --tater pad ["<text>"|--clear]  the scratchpad the tater-tots share (--clear empties it)
         \\  --tater key brave <key>         a search key for their web_search (google, google_cx; --remove)
+        \\  --tater limit [N]               how many this account may run: 24 by default, 1 to 1000
+        \\                                  (your Cloudflare plan decides how many it really carries)
         \\  --tater rm <name>               delete one     --tater teardown --yes   remove them all + the runtime
         \\
         \\BUILT-IN MODEL (the-veil-12b served by the server itself — no external runtime)

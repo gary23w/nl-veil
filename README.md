@@ -275,7 +275,11 @@ before it: an attempt that failed and left things as they were is *same*, and on
 sets its next wake-up. Your computer can be off. Its model calls go through the account's own AI binding,
 so they never cross the public internet and need no API key.
 
-- **Up to three per account.** The first is always named **Gary**; you name the others.
+- **24 per account by default, more if your setup carries them.** The first is always named **Gary**; you
+  name the others. Raise the limit with the -/+ beside the count in the tab, or `veil --tater limit N` (up to
+  1000). How many an account really carries is its Cloudflare plan's to say: each tater-tot is a Durable
+  Object that wakes every few seconds and calls the account's AI, so a free plan's daily allowance runs out
+  long before a paid one's.
 - **It never waits for anyone.** A message you send lands in its inbox and the next iteration reads it as a
   directive. `/goal <text>`, `/goal stop`, `/queue <goal>`, `/charter <text>`, `/pause` and `/resume` work in
   the tab's command line and through `veil --tater tell <name> "..."`.
@@ -402,7 +406,8 @@ POST /api/v1/tots/:name/config           its settings: model, pace, size, daily 
 GET  /api/v1/tots/:name/events           its event tail
 GET  /api/v1/tots/pad   (and POST)       the scratchpad the tots share
 POST /api/v1/tots/pad/clear              empty it (a local copy is kept)
-POST /api/v1/tots/keys                   give the tots a search key (brave, google, google_cx)
+POST /api/v1/tots/keys                   give the tater-tots a search key (brave, google, google_cx)
+POST /api/v1/tots/limit                  how many this account may run ({"max": N}, 1 to 1000; 24 by default)
 DELETE /api/v1/tots/:name                delete one (the last one takes the Worker with it);
                                          DELETE /api/v1/tots removes them all
 ```
@@ -829,7 +834,7 @@ CHAT (the server-side veil brain)
                                in any chat: /goal <text>   /goal   /goal stop   /goal resume
 
 TATER-TOTS (autonomous goal loops that run in YOUR Cloudflare account)
-  --tater                         the roster: at most 3; the first is always named Gary
+  --tater                         the roster (24 by default - see limit); the first is always named Gary
   --tater deploy "<goal>" [flags] --name N --charter "..." --model @cf/... --pace SECONDS --size MINDS
                                   --calls PER_DAY|unlimited --budget N --forever   (--pace from 5)
                                   --local  lets it queue jobs for the veil on THIS machine (deployment only)
@@ -838,6 +843,8 @@ TATER-TOTS (autonomous goal loops that run in YOUR Cloudflare account)
   --tater set <name> [flags]      --model --pace --size --calls --charter --pause --resume
   --tater pad ["<text>"|--clear]  the scratchpad the tater-tots share (--clear empties it)
   --tater key brave <key>         a search key for their web_search (google, google_cx; --remove)
+  --tater limit [N]               how many this account may run: 24 by default, 1 to 1000
+                                  (your Cloudflare plan decides how many it really carries)
   --tater rm <name>               delete one     --tater teardown --yes   remove them all + the runtime
 
 BUILT-IN MODEL (the-veil-12b, served in-process — no external runtime)
@@ -1535,7 +1542,8 @@ dependency entirely rather than compiling it unused.
 the goal loop running in your own Cloudflare account with nobody in it. The desktop's new Tater-tots tab (or
 `veil --tater deploy "<goal>"`) uploads one small Worker into your account; each tater-tot wakes on a timer, makes one
 measured improvement toward its goal, writes itself lessons from what the measurement said, and moves on to
-the next best thing when a goal ends. Up to three per account, the first always named Gary; they share a
+the next best thing when a goal ends. 24 per account by default and more if your setup carries them, the
+first always named Gary; they share a
 scratchpad, can cast their own inner swarms, and may use your machine only if you check the box at
 deployment. Each run is mirrored into a folder on your machine you can open and tail, the model list is your
 account's own, and deleting the last tater-tot removes its Worker. And **goal mode**: `/goal <text>` in any chat

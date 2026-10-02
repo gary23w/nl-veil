@@ -13,7 +13,8 @@
 // human land in an inbox the next iteration reads, and a goal that ends (achieved / plateau / budget) hands
 // over to the next queued goal, or to one the tot proposes for itself from its charter.
 //
-// ONE MORE OBJECT of the same class, named "pad", holds what the tots share: the roster (at most MAX_TOTS)
+// ONE MORE OBJECT of the same class, named "pad", holds what the tots share: the roster (the account's limit,
+// DEFAULT_MAX_TOTS unless the owner set another)
 // and the conjoined scratchpad every tot reads at the start of an iteration and may write to.
 //
 // WHAT A TOT CAN DO (its tool belt; see TOOLS): keep files, search and fetch the web, make any HTTP call, drive a
@@ -42,7 +43,10 @@
 // under node with a Map for storage and a scripted model.
 
 export const VERSION = "6";
-export const MAX_TOTS = 3;
+// How many tots an account may run: 24 unless the owner sets another, up to MAX_TOTS_CEIL. What an account can
+// really carry is its Cloudflare plan's to say: every tot is a Durable Object that wakes every few seconds.
+export const DEFAULT_MAX_TOTS = 24;
+export const MAX_TOTS_CEIL = 1000;
 export const PRIMARY = "Gary"; // the first tot of every account
 
 // The goal loop's stop rules. Same numbers as src/worker/chat/goal.zig (cf_tot.zig has a test that compares them).
@@ -705,7 +709,7 @@ async function route(req, env) {
   if (method === "POST" && (body === null || typeof body !== "object")) return bad("malformed JSON body");
   const padStub = stubFor(env, "pad");
 
-  if (seg[1] === "version" && method === "GET") return json({ ok: true, version: VERSION, max_tots: MAX_TOTS });
+  if (seg[1] === "version" && method === "GET") return json({ ok: true, version: VERSION, max_tots: DEFAULT_MAX_TOTS, max_tots_ceil: MAX_TOTS_CEIL });
 
   // Whether the Python Worker starts, and the native packages it came up with. The server asks after an upload:
   // a Python that does not start with the packages it was uploaded with is uploaded again with fewer.
@@ -731,10 +735,10 @@ async function route(req, env) {
           return st?.ok ? st.tot : { name: h.name, state: "unreachable" };
         }),
       );
-      return json({ ok: true, version: VERSION, max_tots: MAX_TOTS, pad_seq: roster.pad_seq ?? 0, tots });
+      return json({ ok: true, version: VERSION, max_tots: roster.max_tots ?? DEFAULT_MAX_TOTS, pad_seq: roster.pad_seq ?? 0, tots });
     }
     if (method === "POST") {
-      const claim = await (await call(padStub, "/pad/claim", { name: body.name })).json();
+      const claim = await (await call(padStub, "/pad/claim", { name: body.name, max_tots: body.max_tots })).json();
       if (!claim.ok) return bad(claim.err, 409);
       const made = await call(stubFor(env, totKey(claim.name)), "/init", { ...body, name: claim.name });
       if (made.status !== 200) await call(padStub, "/pad/release", { name: claim.name });
@@ -817,13 +821,16 @@ export class Tot {
 
   async padRoute(p, url, body) {
     const roster = (await this.store.get("roster")) ?? [];
-    if (p === "/pad/roster") return json({ ok: true, tots: roster, pad_seq: (await this.store.get("padseq")) ?? 0 });
+    if (p === "/pad/roster") return json({ ok: true, tots: roster, pad_seq: (await this.store.get("padseq")) ?? 0, max_tots: (await this.store.get("max_tots")) ?? DEFAULT_MAX_TOTS });
     if (p === "/pad/claim") {
       // The first tot of an account is always the primary; a later one brings its own name.
       const name = roster.length === 0 ? PRIMARY : body.name;
       if (!validName(name)) return bad("a tot's name is 1-24 letters, digits, - or _, starting with a letter");
       if (roster.some((h) => h.name.toLowerCase() === name.toLowerCase())) return bad(`a tot named ${name} already exists`);
-      if (roster.length >= MAX_TOTS) return bad(`this account already has ${MAX_TOTS} tots (the limit); delete one first`);
+      // the owner's limit comes with each deployment (the veil server keeps it); the last one seen stands otherwise
+      const limit = clampInt(body.max_tots, 1, MAX_TOTS_CEIL, (await this.store.get("max_tots")) ?? DEFAULT_MAX_TOTS);
+      await this.store.put("max_tots", limit);
+      if (roster.length >= limit) return bad(`this account already has ${limit} tater-tots (its limit); raise the limit or delete one first`);
       roster.push({ name, created: this.now() });
       await this.store.put("roster", roster);
       return json({ ok: true, name });

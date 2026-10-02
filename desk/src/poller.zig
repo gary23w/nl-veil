@@ -195,6 +195,7 @@ pub const Poller = struct {
                 .tot_pad_write => self.doTotPadWrite(c.textStr()),
                 .tot_open_folder => self.doOpenTotFolder(dd, c.textStr()),
                 .tot_pad_clear => self.doTotPadClear(),
+                .tot_limit => self.doTotLimit(c.textStr()),
             }
         }
     }
@@ -1153,6 +1154,18 @@ pub const Poller = struct {
             self.store.tot_pad_count = 0;
         }
         self.last_tot_pad_s = 0;
+    }
+
+    /// The account's limit on how many tots it runs; the roster shows the new number on the next tick.
+    fn doTotLimit(self: *Poller, n: []const u8) void {
+        const v = std.fmt.parseInt(u32, n, 10) catch return;
+        var b: [48]u8 = undefined;
+        const body = std.fmt.bufPrint(&b, "{{\"max\":{d}}}", .{v}) catch return;
+        var tbuf: [128]u8 = undefined;
+        const tok = self.tokenSnap(&tbuf);
+        const resp = netcli.totsLimit(self.io, self.gpa, self.port(), tok, body);
+        defer if (resp) |r| if (r.body.len > 0) self.gpa.free(r.body);
+        if (self.totRespOk(resp, "Limit not changed")) self.last_tots_s = 0;
     }
 
     fn doTotPadWrite(self: *Poller, text: []const u8) void {
