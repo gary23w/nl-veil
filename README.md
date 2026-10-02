@@ -18,6 +18,11 @@ download, and coding tools require Python on `PATH` (some checks also use Node).
 
 ### New in v1.1.8
 
+Tater-tots can read, edit and deploy their shared Worker runtime, including their prompts, tools and
+stop rules. Browser tasks can work through CAPTCHA challenges and continue. Runtime uploads are
+applied by your running, Cloudflare-connected veil; cloud work continues on the last deployed version
+while it is offline.
+
 Admin credentials are checked against durable storage before the listener or Tunnel starts. Legacy
 default passwords are replaced, an explicitly configured admin password is applied to existing
 accounts, and startup stops if a required change cannot be verified. [Release notes](docs/release/RELEASE-v1.1.8.md).
@@ -718,7 +723,7 @@ On startup the server prints one complete URL per address this machine answers o
 (`src/main.zig:861-889`, using `src/config/lan.zig`):
 
 ```
-neuron-loops 1.1.7 on http://localhost:8787
+neuron-loops 1.1.8 on http://localhost:8787
     open from another machine (phone, laptop) at:
       http://192.168.1.42:8787
 ```
@@ -1588,7 +1593,7 @@ dependency entirely rather than compiling it unused.
 
 ## Release
 
-**Current: [`v1.1.8`](https://github.com/gary23w/nl-veil/releases/tag/v1.1.8)** — admin credentials are reconciled and read back from storage before a listener or Tunnel can expose the account. [Full notes](docs/release/RELEASE-v1.1.8.md).
+**Current: [`v1.1.8`](https://github.com/gary23w/nl-veil/releases/tag/v1.1.8)** — tater-tots can edit and deploy their shared runtime and work through browser challenges. Admin credentials are reconciled and read back from storage before a listener or Tunnel can expose the account. [Full notes](docs/release/RELEASE-v1.1.8.md).
 
 **Previously: [`v1.1.7`](docs/release/RELEASE-v1.1.7.md)** — **[tater-tots](#tater-tots---goal-loops-that-run-without-you-in-your-own-account)**:
 the goal loop running in your own Cloudflare account with nobody in it. The desktop's new Tater-tots tab (or
