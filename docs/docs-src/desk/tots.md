@@ -12,6 +12,7 @@ The Tater-tots tab (drawn in `main.zig`) shows the account's tater-tots against 
 
 ## Key Exports
 
+- `RunRow`, `parseRuns`, `rowLeaf` — the runs list (`GET /api/v1/tots/runs`): every deployment kept on the server's machine, newest first; a live row names its run by the last segment of its folder
 - `Row`, `PadRow`, `Roster`, `Ev` — the fixed-size values the Store holds; a row carries the tater-tot's local `folder` (Open folder), an event its kind, iteration and up to 2200 characters of text with its line breaks (a longer one ends in "...", and the local `events.log` has it whole)
 - `parseRoster` — a `GET /api/v1/tots` reply into a `Roster`; anything that is not that reply leaves the output untouched
 - `parseTot` — the one row a deploy / command / settings reply carries
@@ -38,3 +39,8 @@ The Tater-tots tab (drawn in `main.zig`) shows the account's tater-tots against 
 ---
 
 *Case file grounded in the module's `//!` header, public API, and its tests.*
+
+
+## Runs
+
+The Store selects a run, not just a name: `tot_sel` + `tot_sel_leaf` (+ `tot_sel_past`). The poller starts the console over (`tot_sel_gen`) when the selected name comes back as another run - deployed again after a delete - and keeps it when the same run goes from live to ended, reading the rest from the run's folder (`totRunEvents`). A failed deploy selects the failed run the server recorded.

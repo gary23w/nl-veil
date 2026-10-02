@@ -23,6 +23,7 @@ A tater-tot deployed with `local` may queue jobs for the veil on the owner's mac
 - `deleteTot` / `teardown` — `DELETE /api/v1/tots/:name` removes one tater-tot, and when it was the last one the Worker script too (the answer says `worker_removed`); `DELETE /api/v1/tots` removes the script and everything every tater-tot stored. Both forget the deployment, every grant to this machine and the token generation the script held
 - `totEvents` / `totCommand` / `totConfig` — the event tail, a command or message, and the settings (`model`, `pace_s`, `size`, `daily_calls`, `charter`, `paused`; never `local`)
 - `setLimit` — `POST /api/v1/tots/limit {max}`: how many tater-tots this account may run, 1 to `MAX_TOTS_CEIL`, kept in the state file (`max_tots`, 0 = the default) and sent with every deployment; lowering it under the count stops new deployments and deletes nothing. How many an account really carries is its Cloudflare plan's to say
+- `listRuns` / `runEvents` — `GET /api/v1/tots/runs` and `GET /api/v1/tots/runs/:run/events`: every deployment kept under `_tots/` (live, ended, failed), newest first, and one run's events read from its `events.jsonl` with the runtime's own `after`/`limit` semantics. `runLeafOk` is the folder-name rule (`<name>-<YYYYMMDD-HHMMSS>`)
 - `setKey` — `POST /api/v1/tots/keys`: a search key (`brave`, `google`, `google_cx`) becomes a secret binding of the Worker (it rides curl's stdin, never a file here); an empty value removes it. The runtime's own token is not a name it accepts
 - `padRead` / `padWrite` / `padClear` — the scratchpad the account's tater-tots share; clearing it first keeps the local copy as `_tots/scratchpad-<when>.md`
 - `totFolder` — a deployment's local folder, `u<uid>/_tots/<name>-<YYYYMMDD-HHMMSS>` (UTC): one per run, so a tater-tot deployed again under the same name never writes into the old one's
@@ -41,6 +42,8 @@ A tater-tot deployed with `local` may queue jobs for the veil on the owner's mac
 `main.zig` registers the nine routes, lists this file in its route-gate audit (`ROUTE_MODS`) and starts `bgLoop` beside the scheduler thread. The desk reaches the routes through `netcli.tots*` (poller.zig, only while the Tater-tots tab is on screen); the CLI through `cli/tot.zig`. Every route is admin-gated like the scheduled tasks: a tater-tot spends the account's Workers AI, and one with the owner's machine starts full-tool turns there.
 
 ## Notable Implementation Details
+
+- Runs: every deployment is a run with its own folder (`totFolder`: name + start time), so a name deployed again is a new run. A deployment that fails is kept as a run too (`recordFailed`: `status.json` with `state: failed` and the error, two events), and `createTot` answers `{ok:false, err, run}` so the desk can open it. `deleteTot` mirrors the tot one last time before the runtime forgets it, then marks the run `deleted` (`markEnded`); the desk reads an ended run's console from its folder.
 
 - CAPTCHA and bot-check pages remain actionable: `pageText` returns their text and numbered controls, and `web_search` keeps a browser challenge open for the tot to complete. The prompt directs the tot to solve the challenge, verify access and continue; detecting one does not mark the tool action as failed.
 

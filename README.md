@@ -365,6 +365,11 @@ so they never cross the public internet and need no API key.
 - **You pick its model from your account.** The deploy form's MODEL list is your login's live Workers AI
   catalogue. A goal or charter may be as long as that model can carry - about a tenth of its context window,
   between 800 and 4000 characters - and the form counts as you type.
+- **Every deployment is a run of its own, like a chat.** The tab lists the live tater-tots and, under them,
+  **past runs**: a tater-tot you deleted (the server syncs its last events before it goes) and a deployment that
+  failed (kept with what was asked and why it failed - the tab opens it when a deploy fails). Deploy the same
+  name again and it is a new run with a new console; the old one stays under past runs, read from its folder,
+  with *Deploy again* to start the form from what it asked.
 - **Every run has a folder on your machine.** Each deployment of a tater-tot is mirrored, once a minute, into
   `<data>/u<id>/_tots/<name>-<deployed>/`: `events.log` (one readable line per event - tail it),
   `events.jsonl`, `status.json` and `notes/` (the tater-tot's own notes, one file each). The shared scratchpad is
@@ -463,6 +468,8 @@ GET  /api/v1/tots/pad   (and POST)       the scratchpad the tots share
 POST /api/v1/tots/pad/clear              empty it (a local copy is kept)
 POST /api/v1/tots/keys                   give the tater-tots a search key (brave, google, google_cx)
 POST /api/v1/tots/limit                  how many this account may run ({"max": N}, 1 to 1000; 24 by default)
+GET  /api/v1/tots/runs                    every run kept on this machine: live, ended, failed (newest first)
+GET  /api/v1/tots/runs/:run/events       one run's events, read from its folder (?after=N)
 DELETE /api/v1/tots/:name                delete one (the last one takes the Worker with it);
                                          DELETE /api/v1/tots removes them all
 ```

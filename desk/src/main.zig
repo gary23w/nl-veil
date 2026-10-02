@@ -277,6 +277,7 @@ const Ui = struct {
     tot_errors_only: bool = false, // the console shows only the rows that went wrong
     tot_pad_scroll: f32 = 0, // the scratchpad, in pixels
     tot_list_scroll: f32 = 0, // the roster, in pixels
+    tot_gen_seen: u32 = 0, // the console generation the open rows belong to (Store.tot_sel_gen)
     tot_pad_follow: bool = true,
     tot_pad_clear_armed: bool = false, // "clear" was clicked once (the second click clears)
     lin_scroll: f32 = 0, // Swarm tab Lineages view
@@ -7969,10 +7970,38 @@ fn drawTots(store: *Store, body: t.Rect) void {
     var sel: [tots.NAME_MAX]u8 = undefined;
     const sel_n = store.tot_sel_len;
     @memcpy(sel[0..sel_n], store.tot_sel[0..sel_n]);
+    var sel_leaf_b: [tots.LEAF_MAX]u8 = undefined;
+    const sel_leaf_n = store.tot_sel_leaf_len;
+    @memcpy(sel_leaf_b[0..sel_leaf_n], store.tot_sel_leaf[0..sel_leaf_n]);
+    const sel_leaf = sel_leaf_b[0..sel_leaf_n];
+    const sel_past = store.tot_sel_past;
+    const sel_gen = store.tot_sel_gen;
+    const runs_n = store.tot_runs_n;
+    @memcpy(tot_runs_view[0..runs_n], store.tot_runs[0..runs_n]);
     var pad_rows: [tots.MAX_PAD]tots.PadRow = undefined;
     const pad_n = store.tot_pad_count;
     @memcpy(pad_rows[0..pad_n], store.tot_pad[0..pad_n]);
     store.unlock();
+    // the console started over (another run): rows opened in the last one mean nothing here
+    if (sel_gen != ui.tot_gen_seen) {
+        ui.tot_gen_seen = sel_gen;
+        ui.tot_open_n = 0;
+        ui.tot_follow = true;
+        ui.tot_errors_only = false;
+    }
+    // the runs that are not live: ended (deleted) and failed deployments, newest first
+    var past_idx: [tots.MAX_RUNS]usize = undefined;
+    var past_n: usize = 0;
+    for (tot_runs_view[0..runs_n], 0..) |*run, i| {
+        var live = false;
+        for (roster.rows[0..roster.n]) |*row| if (std.mem.eql(u8, tots.rowLeaf(row), run.leafStr())) {
+            live = true;
+        };
+        if (!live) {
+            past_idx[past_n] = i;
+            past_n += 1;
+        }
+    }
 
     const left_w: f32 = 300;
     const lx = body.x + pad;
@@ -7992,16 +8021,19 @@ fn drawTots(store: *Store, body: t.Rect) void {
 
     // roster cards, in a list that scrolls once there are more than fit
     const card_h: f32 = 74;
-    const list_h = @min(@as(f32, @floatFromInt(roster.n)) * (card_h + 8), @max(card_h + 8, body.height * 0.42));
+    const run_h: f32 = 36;
+    const runs_head: f32 = if (past_n > 0) 26 else 0;
+    const list_total = @as(f32, @floatFromInt(roster.n)) * (card_h + 8) + runs_head + @as(f32, @floatFromInt(past_n)) * (run_h + 4);
+    const list_h = @min(list_total, @max(card_h + 8, body.height * 0.45));
     const list_r = t.Rect{ .x = lx, .y = y, .width = left_w + 2, .height = list_h };
-    const list_total = @as(f32, @floatFromInt(roster.n)) * (card_h + 8);
     const list_max = @max(0, list_total - list_h);
     if (t.hovering(list_r)) {
         const wheel = rl.getMouseWheelMove();
         if (wheel != 0) ui.tot_list_scroll -= wheel * (card_h + 8);
     }
     ui.tot_list_scroll = std.math.clamp(ui.tot_list_scroll, 0, list_max);
-    if (roster.n > 0) rl.beginScissorMode(@intFromFloat(list_r.x), @intFromFloat(list_r.y), @intFromFloat(list_r.width), @intFromFloat(list_r.height));
+    const any_rows = roster.n + past_n > 0;
+    if (any_rows) rl.beginScissorMode(@intFromFloat(list_r.x), @intFromFloat(list_r.y), @intFromFloat(list_r.width), @intFromFloat(list_r.height));
     const list_top = y;
     y -= ui.tot_list_scroll;
     for (roster.rows[0..roster.n]) |*row| {
@@ -8010,7 +8042,7 @@ fn drawTots(store: *Store, body: t.Rect) void {
             continue;
         }
         const cr = t.Rect{ .x = lx, .y = y, .width = left_w, .height = card_h };
-        const is_sel = !ui.tot_form and std.mem.eql(u8, row.nameStr(), sel[0..sel_n]);
+        const is_sel = !ui.tot_form and !sel_past and std.mem.eql(u8, row.nameStr(), sel[0..sel_n]);
         const hot = t.hovering(cr) and t.hovering(list_r);
         t.panelBordered(cr, if (is_sel) t.bg_sel else if (hot) t.bg_hl else t.bg_dark, if (is_sel) t.blue else t.border);
         t.statusDot(@intFromFloat(cr.x + 14), @intFromFloat(cr.y + 18), totStateColor(row.stateStr()));
@@ -8023,15 +8055,40 @@ fn drawTots(store: *Store, body: t.Rect) void {
         t.textClip(stats, @intFromFloat(cr.x + 14), @intFromFloat(cr.y + 52), 11, t.comment, @intFromFloat(left_w - 28));
         if (hot) t.wantCursor(.pointing_hand);
         if (hot and rl.isMouseButtonPressed(.left)) {
-            store.pushCmd(store_mod.mkCmd(.tot_select, row.nameStr(), ""));
+            store.pushCmd(store_mod.mkCmd(.tot_select, row.nameStr(), tots.rowLeaf(row)));
             ui.tot_form = false;
-            ui.tot_follow = true;
-            ui.tot_open_n = 0; // another tot's rows
-            ui.tot_errors_only = false;
         }
         y += card_h + 8;
     }
-    if (roster.n > 0) rl.endScissorMode();
+    // every run that ended, like the chats a chat list keeps: a deleted tot's record, a deployment that failed
+    if (past_n > 0) {
+        if (y + runs_head >= list_top and y <= list_top + list_h) flabel(lx, y + 6, "PAST RUNS");
+        y += runs_head;
+        for (past_idx[0..past_n]) |ri| {
+            const run = &tot_runs_view[ri];
+            if (y + run_h < list_top or y > list_top + list_h) {
+                y += run_h + 4;
+                continue;
+            }
+            const rr = t.Rect{ .x = lx, .y = y, .width = left_w, .height = run_h };
+            const is_sel = !ui.tot_form and sel_past and std.mem.eql(u8, run.leafStr(), sel_leaf);
+            const hot = t.hovering(rr) and t.hovering(list_r);
+            t.panelBordered(rr, if (is_sel) t.bg_sel else if (hot) t.bg_hl else t.bg, if (is_sel) t.blue else t.border);
+            const col = if (run.failed()) t.red else t.comment;
+            t.statusDot(@intFromFloat(rr.x + 12), @intFromFloat(rr.y + 18), col);
+            t.textClip(run.nameStr(), @intFromFloat(rr.x + 24), @intFromFloat(rr.y + 4), 13, t.fg_dim, 120);
+            var wb: [16]u8 = undefined;
+            t.textClip(t.z("{s}  {s}", .{ run.when(&wb), if (run.failed()) "failed" else "ended" }), @intFromFloat(rr.x + 24), @intFromFloat(rr.y + 20), 11, col, 160);
+            if (run.goal_len > 0) t.textClip(run.goalStr(), @intFromFloat(rr.x + 150), @intFromFloat(rr.y + 12), 11, t.comment, @intFromFloat(left_w - 160));
+            if (hot) t.wantCursor(.pointing_hand);
+            if (hot and rl.isMouseButtonPressed(.left)) {
+                store.pushCmd(store_mod.mkCmd(.tot_select_run, run.nameStr(), run.leafStr()));
+                ui.tot_form = false;
+            }
+            y += run_h + 4;
+        }
+    }
+    if (any_rows) rl.endScissorMode();
     y = list_top + list_h;
     if (roster.total > roster.n) {
         t.textClip(t.z("+{d} more - veil --tater lists them all", .{roster.total - roster.n}), @intFromFloat(lx), @intFromFloat(y), 11, t.comment, @intFromFloat(left_w));
@@ -8090,6 +8147,11 @@ fn drawTots(store: *Store, body: t.Rect) void {
     const rx = lx + left_w + pad;
     const right = t.Rect{ .x = rx, .y = body.y + pad, .width = body.x + body.width - pad - rx, .height = body.height - pad * 2 };
     if (ui.tot_form) return drawTotForm(store, right, roster.n == 0, online and !busy);
+    if (sel_past) {
+        for (tot_runs_view[0..runs_n]) |*run| if (std.mem.eql(u8, run.leafStr(), sel_leaf)) return drawTotRun(store, right, run);
+        _ = helpPara("reading this run from its folder...", right.x, right.y + 4, @min(right.width, 720));
+        return;
+    }
     for (roster.rows[0..roster.n]) |*row| {
         if (std.mem.eql(u8, row.nameStr(), sel[0..sel_n])) return drawTotPanel(store, right, row);
     }
@@ -8198,6 +8260,56 @@ fn submitTot(store: *Store, first: bool) void {
 }
 
 /// One tot: what it is doing, its controls, its console and the line that talks to it.
+/// The runs list as the tab drew it last (a Store copy too big for the stack of a frame).
+var tot_runs_view: [tots.MAX_RUNS]tots.RunRow = undefined;
+
+fn fieldSet(f: anytype, s: []const u8) void {
+    const n = @min(s.len, f.buf.len);
+    @memcpy(f.buf[0..n], s[0..n]);
+    f.len = n;
+    f.cur = n;
+    f.sel = null;
+}
+
+/// A run that has ended - a tot that was deleted, or a deployment that failed - read from its folder: what it was
+/// asked, how it ended, and its console, kept like a closed chat. Deploy again starts the form from what it asked.
+fn drawTotRun(store: *Store, r: t.Rect, run: *const tots.RunRow) void {
+    var evs: [scan.MAX_LOG]tots.Ev = undefined;
+    store.lock();
+    const ev_n = store.tot_event_count;
+    @memcpy(evs[0..ev_n], store.tot_events[0..ev_n]);
+    store.unlock();
+
+    t.textClip(run.nameStr(), @intFromFloat(r.x), @intFromFloat(r.y), 20, t.fg, 220);
+    var wb: [16]u8 = undefined;
+    const failed = run.failed();
+    const sc = if (failed) t.red else t.comment;
+    t.statusDot(@intFromFloat(r.x + 6), @intFromFloat(r.y + 38), sc);
+    const how: []const u8 = if (failed) "deployment failed" else if (std.mem.eql(u8, run.stateStr(), "deleted")) "deleted - this run has ended" else "ended";
+    t.textClip(t.z("{s}   started {s} UTC   {d} events", .{ how, run.when(&wb), run.events }), @intFromFloat(r.x + 18), @intFromFloat(r.y + 30), 12, sc, @intFromFloat(r.width - 18));
+    if (run.goal_len > 0) t.textClip(run.goalStr(), @intFromFloat(r.x), @intFromFloat(r.y + 48), 13, t.fg_dim, @intFromFloat(r.width));
+    if (run.err_len > 0) t.textClip(run.errStr(), @intFromFloat(r.x), @intFromFloat(r.y + 68), 12, t.red, @intFromFloat(r.width));
+
+    const ctrl_y = r.y + 88;
+    const ctrl_h: f32 = 32;
+    const al = t.z("Deploy again", .{});
+    const aw = t.btnW(al, ctrl_h);
+    if (t.button(.{ .x = r.x, .y = ctrl_y, .width = aw, .height = ctrl_h }, al, t.blue, true)) {
+        fieldSet(&ui.tot_name, if (std.mem.eql(u8, run.nameStr(), "unnamed")) "" else run.nameStr());
+        fieldSet(&ui.tot_goal, run.goalStr());
+        ui.tot_form = true;
+        ui.focus = .h_goal;
+    }
+    const fl = t.z("Open folder", .{});
+    const fw = t.btnW(fl, ctrl_h);
+    if (t.button(.{ .x = r.x + aw + 8, .y = ctrl_y, .width = fw, .height = ctrl_h }, fl, t.cyan, run.folder_len > 0))
+        store.pushCmd(store_mod.mkCmd(.tot_open_folder, run.nameStr(), run.folderStr()));
+    t.textClip(t.z("read from its folder on this machine - nothing runs", .{}), @intFromFloat(r.x + aw + fw + 24), @intFromFloat(ctrl_y + 9), 12, t.comment, @intFromFloat(@max(0, r.width - aw - fw - 24)));
+
+    const top = ctrl_y + ctrl_h + 10;
+    drawTotConsole(.{ .x = r.x, .y = top, .width = r.width, .height = r.y + r.height - top }, evs[0..ev_n]);
+}
+
 fn drawTotPanel(store: *Store, r: t.Rect, row: *const tots.Row) void {
     const name = row.nameStr();
     var evs: [scan.MAX_LOG]tots.Ev = undefined;
