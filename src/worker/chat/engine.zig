@@ -2574,7 +2574,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
         const local_coding = std.mem.indexOf(u8, trio.coding.base_url, "127.0.0.1") != null or std.mem.indexOf(u8, trio.coding.base_url, "localhost") != null;
         const win_tok: usize = win_hint orelse @as(usize, modelcfg.senseModel(trio.coding.model, local_coding).ctx_k) * 1024;
         if (std.fmt.bufPrint(&tb, "context window {d} tokens ({s}); reasoning model: {s}; working span budget up to {d} KB", .{
-            win_tok, @as([]const u8, if (win_hint != null) "catalog" else "id heuristic"), @as([]const u8, if (turn_reasoning) "yes" else "no"),
+            win_tok,                                                                         @as([]const u8, if (win_hint != null) "catalog" else "id heuristic"), @as([]const u8, if (turn_reasoning) "yes" else "no"),
             workingBudgetBytes(trio.coding.base_url, trio.coding.model, 0, win_hint) / 1024,
         })) |t| emitKV(app, conv_dir, "trace", "text", t) else |_| {}
     }
@@ -6404,10 +6404,10 @@ fn exactReplyLines(user_text: []const u8) ?usize {
     for (user_text[0..n], 0..) |c, i| buf[i] = std.ascii.toLower(c);
     const low = buf[0..n];
     const words = [_]struct { w: []const u8, n: usize }{
-        .{ .w = "one line", .n = 1 },   .{ .w = "1 line", .n = 1 },   .{ .w = "single line", .n = 1 },
-        .{ .w = "two lines", .n = 2 },  .{ .w = "2 lines", .n = 2 },  .{ .w = "three lines", .n = 3 },
+        .{ .w = "one line", .n = 1 },   .{ .w = "1 line", .n = 1 },     .{ .w = "single line", .n = 1 },
+        .{ .w = "two lines", .n = 2 },  .{ .w = "2 lines", .n = 2 },    .{ .w = "three lines", .n = 3 },
         .{ .w = "3 lines", .n = 3 },    .{ .w = "four lines", .n = 4 }, .{ .w = "4 lines", .n = 4 },
-        .{ .w = "five lines", .n = 5 }, .{ .w = "5 lines", .n = 5 },  .{ .w = "six lines", .n = 6 },
+        .{ .w = "five lines", .n = 5 }, .{ .w = "5 lines", .n = 5 },    .{ .w = "six lines", .n = 6 },
         .{ .w = "6 lines", .n = 6 },
     };
     var from: usize = 0;
@@ -10467,7 +10467,7 @@ fn runInnerAgentic(
                 if (challenge or notfound) {
                     dud_fetches.* += 1;
                     const why: []const u8 = if (challenge)
-                        "(this is a BOT-CHECK page, not the article — the site blocked automated fetching. Do NOT treat it as content and do NOT retry this URL; use web_search or a different source."
+                        "(this is a BOT-CHECK page, not the article — open this URL with the browser tools, complete the verification challenge, then read the requested content."
                     else
                         "(this URL answered NOT FOUND — the page does not exist. Do NOT cite it and do NOT construct another URL by pattern; a URL you didn't copy verbatim from a search result or page above is a guess.";
                     const extra: []const u8 = if (dud_fetches.* >= DUD_FETCH_STREAK)

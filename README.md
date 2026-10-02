@@ -303,7 +303,8 @@ so they never cross the public internet and need no API key.
     `browser_click`, `browser_type` and `browser_select` act on an element by its number with real mouse and
     key input (so forms and sign-up pages built on modern frameworks respond); `browser_key`, `browser_scroll`,
     `browser_back`, `browser_wait` and `browser_eval` do the rest. The page stays open between iterations. When
-    a page turns out to be a bot check, the tater-tot knows it on sight and takes another road to what it needs;
+    a page presents a CAPTCHA or other bot check, the tater-tot can use its browser tools to solve it and continue.
+    Search keeps a challenge page open and returns its controls so the tot can work through it;
   - *Python* - `run_python` runs a script beside the tater-tot's files and keeps what it writes. A Worker's Python
     has no sockets, no processes and no pip, so the runner supplies what a script expects: `import requests`
     and `urllib` work on the Worker's own fetch, a missing import is installed from PyPI by itself (pure-Python
@@ -322,6 +323,14 @@ so they never cross the public internet and need no API key.
     the tater-tot every iteration and steer what it tries next. This is an affect model that shapes behaviour, not
     a claim that anything is felt. `plan_set` / `plan_done` keep a plan it sees every iteration;
   - *each other and you* - the scratchpad, `tell`, an inner `swarm`, `goal_queue`, `say`.
+
+  Tots also control their actual shared Worker source through `runtime_read`, `runtime_edit` and
+  `runtime_deploy`. They can rewrite prompts, tools, algorithms and stop rules without a proposal or approval
+  gate. The owner's running veil uploads the requested revision through the existing Cloudflare login on its
+  next minute's sync; this does not require the local-machine execution checkbox. `runtime_read` reports the
+  deployment result and any Cloudflare compiler error. Self-edits are kept across server restarts and ordinary
+  deployments; an edit affects every tot in the account. When the owner's veil is offline, deployment waits
+  for it to return.
 
   Python runs in a second small Worker (`veil-tots-py`), the browser is Cloudflare's Browser Rendering and
   neuron-db is two more modules of the upload; each is added when your account takes it, and the tab says

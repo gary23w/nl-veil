@@ -1025,7 +1025,7 @@ def s_browser(img, lt):
 
 
 say(s_browser, 0.05, 0.75, "tot", "click [7].")
-say(s_browser, 1.55, 2.4, "tot", "not my job.")
+say(s_browser, 1.55, 2.4, "tot", "one more step.")
 cue(s_browser, 0.75, "click")
 cue(s_browser, 0.8, "powerdown")
 cue(s_browser, 1.3, "alarm")

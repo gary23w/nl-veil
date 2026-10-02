@@ -142,7 +142,7 @@ def console(img, rows, shown, expanded=None):
         d.text((x0 + 180, y), s, font=code(20), fill=RED if bad else FG)
         y += 40
         if expanded == i:
-            for part in ("this page asks its visitor to prove they are human.", "A tater-tot does not solve those; it moves on."):
+            for part in ("this page has a verification challenge.", "Use the browser tools to complete it, then continue."):
                 d.text((x0 + 180, y), part, font=code(18), fill=FG_DIM)
                 y += 30
             y += 8
