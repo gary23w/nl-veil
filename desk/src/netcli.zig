@@ -389,6 +389,18 @@ pub fn totEvents(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8, n
     return httpReq(io, gpa, "GET", port, path, token, null, 20);
 }
 
+/// GET /api/v1/tots/runs — every deployment the server keeps a folder for (live, ended, failed), newest first.
+pub fn totRuns(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8) ?Resp {
+    return httpReq(io, gpa, "GET", port, "/api/v1/tots/runs", token, null, 20);
+}
+
+/// GET /api/v1/tots/runs/<run>/events?after=N — one run's events, read from its folder on the server's machine.
+pub fn totRunEvents(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8, leaf: []const u8, after: u64) ?Resp {
+    var pbuf: [200]u8 = undefined;
+    const path = std.fmt.bufPrint(&pbuf, "/api/v1/tots/runs/{s}/events?after={d}", .{ leaf, after }) catch return null;
+    return httpReq(io, gpa, "GET", port, path, token, null, 20);
+}
+
 /// POST /api/v1/tots/<name>/<op> — op is "command" ({"text"}) or "config" (settings).
 pub fn totPost(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8, name: []const u8, op: []const u8, body_json: []const u8) ?Resp {
     var pbuf: [160]u8 = undefined;

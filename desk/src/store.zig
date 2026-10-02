@@ -23,7 +23,7 @@ const SpinLock = struct {
 
 pub const Tab = enum { dashboard, chat, swarm, tots, hub, scheduled, settings }; // deploy = the Swarm tab's inner form
 
-pub const CmdKind = enum { none, select, say, set_goal, stop, deploy, delete, open_folder, refresh_now, open_file, sched_create, sched_update, sched_toggle, sched_delete, sched_run, oauth_cf_login, oauth_cf_logout, open_url, builtin_pull, builtin_cancel, builtin_import, builtin_remove, builtin_check, dataset_start, dataset_stop, cf_tunnel_on, cf_tunnel_off, lineage_accept, lineage_reject, tot_select, tot_deploy, tot_command, tot_config, tot_delete, tot_pad_write, tot_open_folder, tot_pad_clear, tot_limit };
+pub const CmdKind = enum { none, select, say, set_goal, stop, deploy, delete, open_folder, refresh_now, open_file, sched_create, sched_update, sched_toggle, sched_delete, sched_run, oauth_cf_login, oauth_cf_logout, open_url, builtin_pull, builtin_cancel, builtin_import, builtin_remove, builtin_check, dataset_start, dataset_stop, cf_tunnel_on, cf_tunnel_off, lineage_accept, lineage_reject, tot_select, tot_deploy, tot_command, tot_config, tot_delete, tot_pad_write, tot_open_folder, tot_pad_clear, tot_limit, tot_select_run };
 
 /// A UI→poller command. Fixed-size, copied by value into the ring, so no cross-thread allocation.
 pub const Command = struct {
@@ -1164,6 +1164,13 @@ pub const Store = struct {
     tots: tots.Roster = .{},
     tot_sel: [tots.NAME_MAX]u8 = [_]u8{0} ** tots.NAME_MAX, // the tot whose console is shown
     tot_sel_len: u8 = 0,
+    // ...and WHICH deployment of it: a name deployed again is another run with its own console, like a new chat
+    tot_sel_leaf: [tots.LEAF_MAX]u8 = [_]u8{0} ** tots.LEAF_MAX,
+    tot_sel_leaf_len: u8 = 0,
+    tot_sel_past: bool = false, // the run has ended (deleted, failed): its console is read from its folder here
+    tot_sel_gen: u32 = 0, // bumped whenever the console starts over, so the tab drops rows it had opened
+    tot_runs: [tots.MAX_RUNS]tots.RunRow = undefined, // every deployment the server keeps a folder for, newest first
+    tot_runs_n: usize = 0,
     tot_events: [scan.MAX_LOG]tots.Ev = undefined,
     tot_event_count: usize = 0,
     tot_event_seq: u64 = 0, // newest event seq held for tot_sel

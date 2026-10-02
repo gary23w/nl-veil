@@ -568,7 +568,11 @@ pub fn createTot(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
             res.content_type = .JSON;
             res.body = try res.arena.dupe(u8, raw);
         },
-        .err => |msg| return badReq(res, msg),
+        .err => |msg| {
+            const leaf = recordFailed(app, a, u.id, body, msg) orelse "";
+            res.status = 400;
+            return res.json(.{ .ok = false, .err = msg, .run = leaf }, .{});
+        },
     }
 }
 
@@ -669,9 +673,23 @@ pub fn deleteTot(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const a = arena.allocator();
     var st = readState(app, u.id, a);
     const path = try std.fmt.allocPrint(a, "/v1/tots/{s}", .{name});
+    // Its run folder first: the events since the last mirror pass would go with it otherwise.
+    var run_rel: ?[]const u8 = null;
+    if (totCall(app, a, u.id, st, "GET", path, "")) |sraw| {
+        const S = struct { ok: bool = false, tot: std.json.Value = .null };
+        const s = std.json.parseFromSliceLeaky(S, a, sraw, .{ .ignore_unknown_fields = true }) catch S{};
+        if (s.ok and s.tot == .object) {
+            if (std.json.parseFromValueLeaky(RosterTot, a, s.tot, .{ .ignore_unknown_fields = true })) |h| {
+                mirrorTot(app, a, u.id, st, h, s.tot);
+                var fb: [160]u8 = undefined;
+                if (totFolder(&fb, u.id, h.name, h.created)) |rel| run_rel = try a.dupe(u8, rel);
+            } else |_| {}
+        }
+    }
     const raw = totCall(app, a, u.id, st, "DELETE", path, "");
     const r = raw orelse return relay(res, a, raw);
     if (!replyOf(a, r).ok) return relay(res, a, raw);
+    if (run_rel) |rel| markEnded(app, a, rel, "deleted");
     st.local = withoutName(a, st.local, name);
     writeState(app, u.id, st);
     // The Worker exists for its tots: when the last one goes, so does the Worker, and the account is left as it was.
@@ -1357,6 +1375,186 @@ pub fn bgLoop(app: *App) void {
     }
 }
 
+// ---------------------------------------------------------------------------------- runs: every deployment's record
+
+/// The runs a user can look back on: one folder per deployment under {data}/u<uid>/_tots/ (see totFolder), kept
+/// after the tot is deleted, plus one for every deployment that failed (recordFailed). The desk lists them beside
+/// the live tots, as its chat list keeps every conversation, and reads a run's console from its events.jsonl.
+const RUNS_MAX: usize = 60;
+const RUN_EVENTS_MAX_BYTES: usize = 16 << 20;
+
+/// A run folder's own name: <tot name>-<YYYYMMDD-HHMMSS>.
+pub fn runLeafOk(leaf: []const u8) bool {
+    if (leaf.len < 17 or leaf.len > NAME_MAX + 16) return false;
+    if (leaf[leaf.len - 16] != '-') return false;
+    for (leaf[leaf.len - 15 ..], 0..) |c, i| {
+        if (i == 8) {
+            if (c != '-') return false;
+        } else if (!std.ascii.isDigit(c)) return false;
+    }
+    return validName(leaf[0 .. leaf.len - 16]);
+}
+
+const Run = struct {
+    leaf: []const u8,
+    folder: []const u8,
+    name: []const u8,
+    started: []const u8, // YYYYMMDD-HHMMSS, UTC
+    state: []const u8 = "",
+    @"error": []const u8 = "",
+    goal: []const u8 = "",
+    model: []const u8 = "",
+    events: i64 = 0,
+};
+
+fn str(v: ?std.json.Value) []const u8 {
+    const x = v orelse return "";
+    return if (x == .string) x.string else "";
+}
+
+/// The user's runs, newest first, as GET /api/v1/tots/runs answers them.
+fn runsJson(app: *App, a: std.mem.Allocator, uid: u64) ![]const u8 {
+    var list: std.ArrayListUnmanaged(Run) = .empty;
+    const dpath = try std.fmt.allocPrint(a, "{s}/u{d}/_tots", .{ app.data, uid });
+    if (std.Io.Dir.cwd().openDir(app.io, dpath, .{ .iterate = true })) |dir_| {
+        var dir = dir_;
+        defer dir.close(app.io);
+        var it = dir.iterate();
+        while (it.next(app.io) catch null) |ent| {
+            if (ent.kind != .directory or !runLeafOk(ent.name)) continue;
+            const leaf = try a.dupe(u8, ent.name);
+            var run: Run = .{ .leaf = leaf, .folder = try std.fmt.allocPrint(a, "u{d}/_tots/{s}", .{ uid, leaf }), .name = leaf[0 .. leaf.len - 16], .started = leaf[leaf.len - 15 ..] };
+            const sp = try std.fmt.allocPrint(a, "{s}/{s}/status.json", .{ dpath, leaf });
+            if (std.Io.Dir.cwd().readFileAlloc(app.io, sp, a, .limited(512 << 10))) |raw| {
+                const v = std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{}) catch std.json.Value{ .null = {} };
+                if (v == .object) {
+                    const o = v.object;
+                    run.state = str(o.get("state"));
+                    run.@"error" = str(o.get("error"));
+                    run.model = str(o.get("model"));
+                    if (o.get("goal")) |g| if (g == .object) {
+                        run.goal = str(g.object.get("text"));
+                    };
+                    if (o.get("seq")) |s| if (s == .integer) {
+                        run.events = s.integer;
+                    };
+                }
+            } else |_| {}
+            try list.append(a, run);
+        }
+    } else |_| {}
+    const Order = struct {
+        fn newer(_: void, x: Run, y: Run) bool {
+            const o = std.mem.order(u8, x.started, y.started);
+            return if (o == .eq) std.mem.lessThan(u8, x.name, y.name) else o == .gt;
+        }
+    };
+    std.mem.sort(Run, list.items, {}, Order.newer);
+    const runs = list.items[0..@min(list.items.len, RUNS_MAX)];
+    return std.json.Stringify.valueAlloc(a, .{ .ok = true, .runs = runs }, .{});
+}
+
+/// A run's events from its events.jsonl, as the runtime's own events route answers: the newest `limit` past
+/// `after`, oldest first. A run with no file yet has no events.
+fn runEventsJson(app: *App, a: std.mem.Allocator, uid: u64, leaf: []const u8, after: u64, limit: u64) ![]const u8 {
+    const path = try std.fmt.allocPrint(a, "{s}/u{d}/_tots/{s}/events.jsonl", .{ app.data, uid, leaf });
+    const raw = std.Io.Dir.cwd().readFileAlloc(app.io, path, a, .limited(RUN_EVENTS_MAX_BYTES)) catch "";
+    const Seq = struct { seq: u64 = 0 };
+    var top: u64 = 0;
+    var it = std.mem.splitScalar(u8, raw, '\n');
+    while (it.next()) |ln| {
+        if (ln.len == 0) continue;
+        const s = std.json.parseFromSliceLeaky(Seq, a, ln, .{ .ignore_unknown_fields = true }) catch continue;
+        top = @max(top, s.seq);
+    }
+    const floor = @max(after, if (top > limit) top - limit else 0);
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    try out.appendSlice(a, "{\"ok\":true,\"events\":[");
+    var first = true;
+    it = std.mem.splitScalar(u8, raw, '\n');
+    while (it.next()) |ln| {
+        if (ln.len == 0) continue;
+        const s = std.json.parseFromSliceLeaky(Seq, a, ln, .{ .ignore_unknown_fields = true }) catch continue;
+        if (s.seq <= floor) continue;
+        if (!first) try out.append(a, ',');
+        try out.appendSlice(a, ln);
+        first = false;
+    }
+    try out.appendSlice(a, "]}");
+    return out.items;
+}
+
+/// GET /api/v1/tots/runs — every deployment this user made that the veil keeps a folder for, newest first.
+pub fn listRuns(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
+    const u = gate(app, req, res) orelse return;
+    var arena = std.heap.ArenaAllocator.init(app.gpa);
+    defer arena.deinit();
+    const body = try runsJson(app, arena.allocator(), u.id);
+    res.content_type = .JSON;
+    res.body = try res.arena.dupe(u8, body);
+}
+
+/// GET /api/v1/tots/runs/:run/events?after=N&limit=M — one run's events, from its folder on this machine.
+pub fn runEvents(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
+    const u = gate(app, req, res) orelse return;
+    const leaf = req.param("run") orelse "";
+    if (!runLeafOk(leaf)) return badReq(res, "bad run name");
+    const q = try req.query();
+    const after = std.fmt.parseInt(u64, q.get("after") orelse "0", 10) catch 0;
+    const limit = std.math.clamp(std.fmt.parseInt(u64, q.get("limit") orelse "200", 10) catch 200, 1, 2000);
+    var arena = std.heap.ArenaAllocator.init(app.gpa);
+    defer arena.deinit();
+    const body = try runEventsJson(app, arena.allocator(), u.id, leaf, after, limit);
+    res.content_type = .JSON;
+    res.body = try res.arena.dupe(u8, body);
+}
+
+/// A deployment that failed, kept as a run of its own: its folder holds what was asked and why it failed, so the
+/// desk can open it like any other run. The run's name, or null when the folder could not be written.
+fn recordFailed(app: *App, a: std.mem.Allocator, uid: u64, body: CreateReq, msg: []const u8) ?[]const u8 {
+    const now_ms = std.Io.Timestamp.now(app.io, .real).toMilliseconds();
+    const want = std.mem.trim(u8, body.name, " \r\n\t");
+    const name = if (validName(want)) want else "unnamed";
+    var fb: [160]u8 = undefined;
+    const rel = totFolder(&fb, uid, name, now_ms) orelse return null;
+    const dir = std.fmt.allocPrint(a, "{s}/{s}", .{ app.data, rel }) catch return null;
+    _ = std.Io.Dir.cwd().createDirPathStatus(app.io, dir, .default_dir) catch return null;
+    const goal = std.mem.trim(u8, body.goal, " \r\n\t");
+    const model = if (body.model.len > 0) body.model else modelcfg.defaults.cf_model;
+    const asked = std.fmt.allocPrint(a, "deploying {s} on {s}: {s}", .{ name, model, if (goal.len > 0) goal else "(no goal; its charter)" }) catch return null;
+    const failed = std.fmt.allocPrint(a, "deployment failed: {s}", .{msg}) catch return null;
+    const Status = struct { name: []const u8, state: []const u8 = "failed", @"error": []const u8, goal: struct { text: []const u8 }, model: []const u8, created: i64, seq: i64 = 2 };
+    const status = std.json.Stringify.valueAlloc(a, Status{ .name = name, .@"error" = msg, .goal = .{ .text = goal }, .model = model, .created = now_ms }, .{ .whitespace = .indent_2 }) catch return null;
+    const E = struct { seq: u64, t: i64, kind: []const u8, text: []const u8, brief: []const u8, ok: bool };
+    const e1 = std.json.Stringify.valueAlloc(a, E{ .seq = 1, .t = now_ms, .kind = "status", .text = asked, .brief = asked[0..@min(asked.len, 180)], .ok = true }, .{}) catch return null;
+    const e2 = std.json.Stringify.valueAlloc(a, E{ .seq = 2, .t = now_ms, .kind = "error", .text = failed, .brief = failed[0..@min(failed.len, 180)], .ok = false }, .{}) catch return null;
+    var log_: std.ArrayListUnmanaged(u8) = .empty;
+    logLine(a, &log_, .{ .seq = 1, .t = now_ms, .kind = "status", .text = asked }) catch return null;
+    logLine(a, &log_, .{ .seq = 2, .t = now_ms, .kind = "error", .text = failed }) catch return null;
+    const files = [_][2][]const u8{
+        .{ "status.json", status },
+        .{ "events.jsonl", std.fmt.allocPrint(a, "{s}\n{s}\n", .{ e1, e2 }) catch return null },
+        .{ "events.log", log_.items },
+    };
+    for (files) |f| {
+        const p = std.fmt.allocPrint(a, "{s}/{s}", .{ dir, f[0] }) catch return null;
+        std.Io.Dir.cwd().writeFile(app.io, .{ .sub_path = p, .data = f[1] }) catch return null;
+    }
+    return a.dupe(u8, rel[std.mem.lastIndexOfScalar(u8, rel, '/').? + 1 ..]) catch null; // `rel` lives in this frame
+}
+
+/// Mark a run's status.json with how it ended ("deleted"), keeping everything else it says.
+fn markEnded(app: *App, a: std.mem.Allocator, rel: []const u8, how: []const u8) void {
+    const p = std.fmt.allocPrint(a, "{s}/{s}/status.json", .{ app.data, rel }) catch return;
+    const raw = std.Io.Dir.cwd().readFileAlloc(app.io, p, a, .limited(512 << 10)) catch return;
+    var v = std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{}) catch return;
+    if (v != .object) return;
+    v.object.put(a, "state", .{ .string = how }) catch return;
+    v.object.put(a, "ended", .{ .integer = std.Io.Timestamp.now(app.io, .real).toMilliseconds() }) catch return;
+    const out = std.json.Stringify.valueAlloc(a, v, .{ .whitespace = .indent_2 }) catch return;
+    std.Io.Dir.cwd().writeFile(app.io, .{ .sub_path = p, .data = out }) catch {};
+}
+
 // ---------------------------------------------------------------------------------- the move from hots
 
 /// Until 1.1.8 a tot was called a hot. Its runtime is the Worker "veil-hots" (with "veil-hots-py"), the state file
@@ -1572,10 +1770,11 @@ test "every tot route is gated: an anonymous caller gets 401 and nothing runs" {
     const io = threaded.io();
     var ta = try http.testApp(gpa, io, "zig-cftot-gate-tmp");
     defer ta.deinit();
-    inline for (.{ listTots, createTot, deleteTot, teardown, totEvents, totCommand, totConfig, padRead, padWrite, padClear, setKey, setLimit }) |h| {
+    inline for (.{ listTots, createTot, deleteTot, teardown, totEvents, totCommand, totConfig, padRead, padWrite, padClear, setKey, setLimit, listRuns, runEvents }) |h| {
         var web = httpz.testing.init(.{});
         defer web.deinit();
         web.param("name", "Gary");
+        web.param("run", "Gary-20261002-090000");
         web.json(.{ .goal = "watch the tide tables", .text = "/pause" });
         try h(&ta.app, web.req, web.res);
         try web.expectStatus(401);
@@ -2200,4 +2399,70 @@ test "a move whose old runtime does not answer removes nothing and keeps the old
     running = false;
     try tt.expectEqual(@as(usize, 0), srv.countCalls("DELETE", "/workers/scripts/veil-hots"));
     try tt.expect(readLegacy(&ta.app, 1, a) != null);
+}
+
+test "every deployment is a run of its own: a failed one is kept with its error, runs list newest first, a run's events read from its folder" {
+    const gpa = tt.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-cftot-runs-tmp";
+    var ta = try http.testApp(gpa, io, root);
+    defer ta.deinit();
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try tt.expect(runLeafOk("Gary-20261002-090000"));
+    try tt.expect(!runLeafOk("Gary-2026100-090000"));
+    try tt.expect(!runLeafOk("../x-20261002-090000"));
+    try tt.expect(!runLeafOk("Gary-20261002_090000"));
+    try tt.expect(!runLeafOk("scratchpad.md"));
+
+    // an earlier run of Gary that ran and was deleted, with three events
+    const old = root ++ "/u1/_tots/Gary-20261001-120000";
+    _ = try std.Io.Dir.cwd().createDirPathStatus(io, old, .default_dir);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = old ++ "/status.json", .data = "{\"name\":\"Gary\",\"state\":\"working\",\"seq\":3,\"goal\":{\"text\":\"map the harbour\"}}" });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = old ++ "/events.jsonl", .data = "{\"seq\":1,\"kind\":\"goal\",\"text\":\"map the harbour\"}\n{\"seq\":2,\"kind\":\"pick\",\"text\":\"read the charts\"}\n{\"seq\":3,\"kind\":\"verdict\",\"text\":\"improved\"}\n" });
+    markEnded(&ta.app, a, "u1/_tots/Gary-20261001-120000", "deleted");
+
+    // a deployment that fails is kept as a run, with what was asked and why it failed
+    const leaf = recordFailed(&ta.app, a, 1, .{ .name = "Ada", .goal = "watch the tide tables", .model = "@cf/x/y" }, "the account has no Workers subdomain").?;
+    try tt.expect(runLeafOk(leaf));
+    try tt.expect(std.mem.startsWith(u8, leaf, "Ada-"));
+    // no valid name: still a run
+    try tt.expect(std.mem.startsWith(u8, recordFailed(&ta.app, a, 1, .{ .name = "bad name!" }, "x").?, "unnamed-"));
+
+    const R = struct { ok: bool, runs: []const struct { leaf: []const u8, name: []const u8, state: []const u8, @"error": []const u8, goal: []const u8, events: i64 } };
+    const runs = try std.json.parseFromSliceLeaky(R, a, try runsJson(&ta.app, a, 1), .{ .ignore_unknown_fields = true });
+    try tt.expect(runs.ok);
+    try tt.expectEqual(@as(usize, 3), runs.runs.len);
+    try tt.expectEqualStrings("Gary-20261001-120000", runs.runs[runs.runs.len - 1].leaf); // the oldest last
+    try tt.expectEqualStrings("deleted", runs.runs[runs.runs.len - 1].state);
+    try tt.expectEqualStrings("map the harbour", runs.runs[runs.runs.len - 1].goal);
+    var failed_seen = false;
+    for (runs.runs) |r| if (std.mem.eql(u8, r.leaf, leaf)) {
+        failed_seen = true;
+        try tt.expectEqualStrings("failed", r.state);
+        try tt.expectEqualStrings("the account has no Workers subdomain", r.@"error");
+        try tt.expectEqualStrings("watch the tide tables", r.goal);
+    };
+    try tt.expect(failed_seen);
+
+    // a run's events, past `after`, the newest `limit`
+    const E = struct { ok: bool, events: []const struct { seq: u64, kind: []const u8 = "", ok: ?bool = null } };
+    const all = try std.json.parseFromSliceLeaky(E, a, try runEventsJson(&ta.app, a, 1, "Gary-20261001-120000", 0, 200), .{ .ignore_unknown_fields = true });
+    try tt.expectEqual(@as(usize, 3), all.events.len);
+    const later = try std.json.parseFromSliceLeaky(E, a, try runEventsJson(&ta.app, a, 1, "Gary-20261001-120000", 1, 200), .{ .ignore_unknown_fields = true });
+    try tt.expectEqual(@as(u64, 2), later.events[0].seq);
+    const last = try std.json.parseFromSliceLeaky(E, a, try runEventsJson(&ta.app, a, 1, "Gary-20261001-120000", 0, 1), .{ .ignore_unknown_fields = true });
+    try tt.expectEqual(@as(usize, 1), last.events.len);
+    try tt.expectEqual(@as(u64, 3), last.events[0].seq);
+    const fail_ev = try std.json.parseFromSliceLeaky(E, a, try runEventsJson(&ta.app, a, 1, leaf, 0, 200), .{ .ignore_unknown_fields = true });
+    try tt.expectEqual(@as(usize, 2), fail_ev.events.len);
+    try tt.expectEqualStrings("error", fail_ev.events[1].kind);
+    try tt.expectEqual(@as(?bool, false), fail_ev.events[1].ok);
+    // a run with no folder has no events, and that is not an error
+    const none = try std.json.parseFromSliceLeaky(E, a, try runEventsJson(&ta.app, a, 1, "Nova-20261002-000000", 0, 200), .{ .ignore_unknown_fields = true });
+    try tt.expectEqual(@as(usize, 0), none.events.len);
 }

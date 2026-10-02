@@ -15,6 +15,8 @@ const std = @import("std");
 pub const ROSTER_CAP = 64; // rows the tab holds; an account may run more (its limit is `Roster.max`), `veil --tater` lists them all
 pub const DEFAULT_MAX = 24; // the account limit until the server says otherwise; the server and the runtime enforce it
 pub const MAX_PAD = 12; // newest scratchpad entries shown
+pub const MAX_RUNS = 60; // past deployments listed (the server keeps a folder for each)
+pub const LEAF_MAX = 48; // a run's folder name: <name>-<YYYYMMDD-HHMMSS>
 pub const NAME_MAX = 24;
 pub const EV_TEXT = 2200; // characters of an event the tab keeps: a tool row (args + result) whole
 pub const PAD_TEXT = 600; // characters of a scratchpad entry the tab keeps
@@ -76,6 +78,7 @@ pub const Row = struct {
     local: bool = false, // may queue jobs for the veil on the owner's machine
     paused: bool = false,
     folder: [160]u8 = [_]u8{0} ** 160, // its local folder, relative to the data dir ("" until the server names one)
+    created: i64 = 0, // when this deployment of it started (ms): the same name deployed again is another run
     folder_len: u8 = 0,
 
     pub fn folderStr(r: *const Row) []const u8 {
@@ -188,6 +191,7 @@ const JTot = struct {
     paused: bool = false,
     folder: []const u8 = "",
     goal: ?JGoal = null,
+    created: i64 = 0,
 };
 const JRoster = struct { ok: bool = false, max: i64 = DEFAULT_MAX, connected: bool = false, deployed: bool = false, reachable: bool = false, current: bool = true, python: bool = false, browser: bool = false, neuron: bool = false, tools_note: []const u8 = "", last_error: []const u8 = "", tots: []const JTot = &.{} };
 
@@ -214,7 +218,86 @@ fn rowOf(h: JTot) Row {
     r.local = h.local;
     r.paused = h.paused;
     if (h.folder.len <= r.folder.len and std.mem.indexOf(u8, h.folder, "..") == null) r.folder_len = @intCast(put(&r.folder, h.folder));
+    r.created = h.created;
     return r;
+}
+
+/// One deployment the server keeps a folder for: live, ended (deleted) or failed. Fixed-size, Store-held.
+pub const RunRow = struct {
+    leaf: [LEAF_MAX]u8 = [_]u8{0} ** LEAF_MAX, // the folder's own name: what identifies the run
+    leaf_len: u8 = 0,
+    folder: [160]u8 = [_]u8{0} ** 160, // relative to the data dir (Open folder)
+    folder_len: u8 = 0,
+    name: [NAME_MAX]u8 = [_]u8{0} ** NAME_MAX,
+    name_len: u8 = 0,
+    started: [15]u8 = [_]u8{0} ** 15, // YYYYMMDD-HHMMSS, UTC
+    state: [12]u8 = [_]u8{0} ** 12, // its last state; "failed" and "deleted" are final
+    state_len: u8 = 0,
+    err: [200]u8 = [_]u8{0} ** 200,
+    err_len: u8 = 0,
+    goal: [160]u8 = [_]u8{0} ** 160,
+    goal_len: u8 = 0,
+    events: u32 = 0,
+
+    pub fn leafStr(r: *const RunRow) []const u8 {
+        return r.leaf[0..r.leaf_len];
+    }
+    pub fn folderStr(r: *const RunRow) []const u8 {
+        return r.folder[0..r.folder_len];
+    }
+    pub fn nameStr(r: *const RunRow) []const u8 {
+        return r.name[0..r.name_len];
+    }
+    pub fn stateStr(r: *const RunRow) []const u8 {
+        return r.state[0..r.state_len];
+    }
+    pub fn errStr(r: *const RunRow) []const u8 {
+        return r.err[0..r.err_len];
+    }
+    pub fn goalStr(r: *const RunRow) []const u8 {
+        return r.goal[0..r.goal_len];
+    }
+    pub fn failed(r: *const RunRow) bool {
+        return std.mem.eql(u8, r.stateStr(), "failed");
+    }
+    /// "10-02 09:15" from the stamp: the month, day and time it started, UTC.
+    pub fn when(r: *const RunRow, buf: []u8) []const u8 {
+        const s = r.started;
+        return std.fmt.bufPrint(buf, "{s}-{s} {s}:{s}", .{ s[4..6], s[6..8], s[9..11], s[11..13] }) catch "";
+    }
+};
+
+/// A live tot's run: the last segment of its folder ("" until the server names one).
+pub fn rowLeaf(r: *const Row) []const u8 {
+    const f = r.folderStr();
+    const i = std.mem.lastIndexOfScalar(u8, f, '/') orelse return f;
+    return f[i + 1 ..];
+}
+
+/// Read a GET /api/v1/tots/runs reply into `out`, newest first. How many; 0 for anything that is not that reply.
+pub fn parseRuns(gpa: std.mem.Allocator, body: []const u8, out: *[MAX_RUNS]RunRow) usize {
+    const JR = struct { leaf: []const u8 = "", folder: []const u8 = "", name: []const u8 = "", started: []const u8 = "", state: []const u8 = "", @"error": []const u8 = "", goal: []const u8 = "", events: i64 = 0 };
+    const J = struct { ok: bool = false, runs: []const JR = &.{} };
+    const p = std.json.parseFromSlice(J, gpa, body, .{ .ignore_unknown_fields = true }) catch return 0;
+    defer p.deinit();
+    if (!p.value.ok) return 0;
+    var n: usize = 0;
+    for (p.value.runs) |j| {
+        if (n == MAX_RUNS) break;
+        if (j.leaf.len == 0 or j.leaf.len > LEAF_MAX or j.started.len != 15 or std.mem.indexOf(u8, j.folder, "..") != null or j.folder.len > 160) continue;
+        var r: RunRow = .{};
+        r.leaf_len = @intCast(put(&r.leaf, j.leaf));
+        r.folder_len = @intCast(put(&r.folder, j.folder));
+        r.name_len = @intCast(put(&r.name, j.name));
+        @memcpy(&r.started, j.started[0..15]);
+        r.state_len = @intCast(put(&r.state, j.state));
+        r.err_len = @intCast(put(&r.err, j.@"error"));
+        r.goal_len = @intCast(put(&r.goal, j.goal));
+        r.events = u32of(j.events);
+        out[n] = r;
+        n += 1;
+    }
+    return n;
 }
 
 /// Read a GET /api/v1/tots reply. False (and `out` untouched) for anything that is not that reply.
@@ -459,4 +542,28 @@ test "tots: an event's brief is the runtime's, or its first line from an older o
     try tt.expect(!evs[2].ok); // and a failure is still seen as one
     try tt.expectEqualStrings("rested", evs[3].briefStr());
     try tt.expect(evs[3].ok and !evs[3].hasMore()); // nothing more to open
+}
+
+test "a run list reads newest first, skips what is not a run, and a live row names its run by its folder" {
+    var out: [MAX_RUNS]RunRow = undefined;
+    const body =
+        \\{"ok":true,"runs":[
+        \\{"leaf":"Ada-20261002-091500","folder":"u1/_tots/Ada-20261002-091500","name":"Ada","started":"20261002-091500","state":"failed","error":"no subdomain","goal":"watch the tides","events":2},
+        \\{"leaf":"Gary-20261001-120000","folder":"u1/_tots/Gary-20261001-120000","name":"Gary","started":"20261001-120000","state":"deleted","events":88},
+        \\{"leaf":"x","folder":"../../etc","name":"x","started":"bad"}]}
+    ;
+    const n = parseRuns(tt.allocator, body, &out);
+    try tt.expectEqual(@as(usize, 2), n);
+    try tt.expectEqualStrings("Ada-20261002-091500", out[0].leafStr());
+    try tt.expect(out[0].failed());
+    try tt.expectEqualStrings("no subdomain", out[0].errStr());
+    try tt.expectEqualStrings("watch the tides", out[0].goalStr());
+    var wb: [16]u8 = undefined;
+    try tt.expectEqualStrings("10-02 09:15", out[0].when(&wb));
+    try tt.expectEqualStrings("deleted", out[1].stateStr());
+    try tt.expectEqual(@as(u32, 88), out[1].events);
+    try tt.expectEqual(@as(usize, 0), parseRuns(tt.allocator, "<html>", &out));
+    var row: Row = .{};
+    row.folder_len = @intCast(put(&row.folder, "u1/_tots/Gary-20261002-090000"));
+    try tt.expectEqualStrings("Gary-20261002-090000", rowLeaf(&row));
 }

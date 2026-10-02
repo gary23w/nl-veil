@@ -186,7 +186,7 @@ pub const Poller = struct {
                 .tot_select => {
                     self.store.lock();
                     defer self.store.unlock();
-                    self.setTotSelLocked(c.idStr());
+                    self.setTotSelLocked(c.idStr(), c.textStr(), false);
                 },
                 .tot_deploy => self.doTotDeploy(),
                 .tot_command => self.doTotCommand(c.idStr(), c.textStr()),
@@ -196,6 +196,11 @@ pub const Poller = struct {
                 .tot_open_folder => self.doOpenTotFolder(dd, c.textStr()),
                 .tot_pad_clear => self.doTotPadClear(),
                 .tot_limit => self.doTotLimit(c.textStr()),
+                .tot_select_run => {
+                    self.store.lock();
+                    defer self.store.unlock();
+                    self.setTotSelLocked(c.idStr(), c.textStr(), true);
+                },
             }
         }
     }
@@ -962,6 +967,7 @@ pub const Poller = struct {
     /// GET /api/v1/tots -> the roster, under one lock. An unreachable server keeps the last rows; 401/403 marks
     /// the list denied so the tab can say why it is empty.
     fn refreshTots(self: *Poller) void {
+        self.refreshTotRuns();
         var tbuf: [128]u8 = undefined;
         const tok = self.tokenSnap(&tbuf);
         const resp = netcli.totsList(self.io, self.gpa, self.port(), tok) orelse return;
@@ -987,48 +993,93 @@ pub const Poller = struct {
         self.store.tots = r;
         self.store.tots_seen = true;
         self.store.tots_denied = false;
-        // the first tot there is becomes the selected one; a selected tot that is gone gives way
-        var found = false;
-        for (r.rows[0..r.n]) |*row| if (std.mem.eql(u8, row.nameStr(), self.store.tot_sel[0..self.store.tot_sel_len])) {
-            found = true;
+        const s = self.store;
+        if (s.tot_sel_past) return; // an ended run stays on screen until the user picks another
+        // A selected tot is followed by its RUN: the same name deployed again is a new run, and its console starts
+        // over; a tot that is gone stays on screen as the ended run it was. With nothing selected, the first one.
+        const sel = s.tot_sel[0..s.tot_sel_len];
+        const sel_leaf = s.tot_sel_leaf[0..s.tot_sel_leaf_len];
+        for (r.rows[0..r.n]) |*row| if (std.mem.eql(u8, row.nameStr(), sel)) {
+            const leaf = tots.rowLeaf(row);
+            if (leaf.len > 0 and !std.mem.eql(u8, leaf, sel_leaf)) self.setTotSelLocked(row.nameStr(), leaf, false);
+            return;
         };
-        if (!found and r.reachable) self.setTotSelLocked(if (r.n > 0) r.rows[0].nameStr() else "");
+        if (!r.reachable) return;
+        if (sel.len > 0 and sel_leaf.len > 0) {
+            for (s.tot_runs[0..s.tot_runs_n]) |*kept| if (std.mem.eql(u8, kept.leafStr(), sel_leaf)) {
+                s.tot_sel_past = true; // the same run, ended: its console carries on from its folder
+                return;
+            };
+        }
+        if (r.n > 0) self.setTotSelLocked(r.rows[0].nameStr(), tots.rowLeaf(&r.rows[0]), false) else self.setTotSelLocked("", "", false);
     }
 
-    /// CALLER HOLDS THE LOCK. Select a tot's console: a different tot starts from an empty tail.
-    fn setTotSelLocked(self: *Poller, name: []const u8) void {
+    /// The runs list: every deployment the server keeps a folder for. Cheap (the server reads its own disk).
+    fn refreshTotRuns(self: *Poller) void {
+        var tbuf: [128]u8 = undefined;
+        const tok = self.tokenSnap(&tbuf);
+        const resp = netcli.totRuns(self.io, self.gpa, self.port(), tok) orelse return;
+        defer if (resp.body.len > 0) self.gpa.free(resp.body);
+        if (resp.status != 200) return;
+        const runs = self.gpa.create([tots.MAX_RUNS]tots.RunRow) catch return;
+        defer self.gpa.destroy(runs);
+        const n = tots.parseRuns(self.gpa, resp.body, runs);
+        self.store.lock();
+        defer self.store.unlock();
+        @memcpy(self.store.tot_runs[0..n], runs[0..n]);
+        self.store.tot_runs_n = n;
+    }
+
+    /// CALLER HOLDS THE LOCK. Select a run's console: a different run - another tot, or the same name deployed
+    /// again - starts from an empty tail; the same run going from live to ended keeps what it shows.
+    fn setTotSelLocked(self: *Poller, name: []const u8, leaf: []const u8, past: bool) void {
         const s = self.store;
-        if (std.mem.eql(u8, name, s.tot_sel[0..s.tot_sel_len])) return;
+        const same_name = std.mem.eql(u8, name, s.tot_sel[0..s.tot_sel_len]);
+        const same_run = same_name and std.mem.eql(u8, leaf, s.tot_sel_leaf[0..s.tot_sel_leaf_len]);
+        s.tot_sel_past = past and leaf.len > 0;
+        if (same_run) return;
         const n = @min(name.len, s.tot_sel.len);
         @memcpy(s.tot_sel[0..n], name[0..n]);
         s.tot_sel_len = @intCast(n);
+        const ln = @min(leaf.len, s.tot_sel_leaf.len);
+        @memcpy(s.tot_sel_leaf[0..ln], leaf[0..ln]);
+        s.tot_sel_leaf_len = @intCast(ln);
         s.tot_event_count = 0;
         s.tot_event_seq = 0;
+        s.tot_sel_gen +%= 1;
         self.last_tot_ev_s = 0;
     }
 
     /// The selected tot's events past the newest one held, appended to the tail.
     fn refreshTotEvents(self: *Poller) void {
         var nb: [tots.NAME_MAX]u8 = undefined;
+        var lb: [tots.LEAF_MAX]u8 = undefined;
         var after: u64 = 0;
+        var past = false;
+        var leaf: []const u8 = "";
         const name = blk: {
             self.store.lock();
             defer self.store.unlock();
             const n = self.store.tot_sel_len;
             @memcpy(nb[0..n], self.store.tot_sel[0..n]);
+            const l = self.store.tot_sel_leaf_len;
+            @memcpy(lb[0..l], self.store.tot_sel_leaf[0..l]);
+            leaf = lb[0..l];
+            past = self.store.tot_sel_past;
             after = self.store.tot_event_seq;
             break :blk nb[0..n];
         };
-        if (name.len == 0) return;
+        if (name.len == 0 and !past) return;
         var tbuf: [128]u8 = undefined;
         const tok = self.tokenSnap(&tbuf);
-        const resp = netcli.totEvents(self.io, self.gpa, self.port(), tok, name, after) orelse return;
+        // a live run is asked of the runtime; an ended one is read from its folder (the runtime no longer has it)
+        const resp = (if (past) netcli.totRunEvents(self.io, self.gpa, self.port(), tok, leaf, after) else netcli.totEvents(self.io, self.gpa, self.port(), tok, name, after)) orelse return;
         defer if (resp.body.len > 0) self.gpa.free(resp.body);
         if (resp.status != 200) return;
         self.store.lock();
         defer self.store.unlock();
-        // the selection may have moved while the call was out: its rows belong to the tot that was asked
-        if (!std.mem.eql(u8, name, self.store.tot_sel[0..self.store.tot_sel_len]) or after != self.store.tot_event_seq) return;
+        // the selection may have moved while the call was out: its rows belong to the run that was asked
+        if (!std.mem.eql(u8, name, self.store.tot_sel[0..self.store.tot_sel_len]) or !std.mem.eql(u8, leaf, self.store.tot_sel_leaf[0..self.store.tot_sel_leaf_len]) or past != self.store.tot_sel_past or after != self.store.tot_event_seq) return;
         self.store.tot_event_count = tots.appendEvents(self.gpa, resp.body, &self.store.tot_events, self.store.tot_event_count, &self.store.tot_event_seq);
     }
 
@@ -1081,12 +1132,25 @@ pub const Poller = struct {
         const tok = self.tokenSnap(&tbuf);
         const resp = netcli.totsDeploy(self.io, self.gpa, self.port(), tok, body[0..blen]);
         defer if (resp) |r| if (r.body.len > 0) self.gpa.free(r.body);
-        if (!self.totRespOk(resp, "Tot not deployed")) return;
-        if (tots.parseTot(self.gpa, resp.?.body)) |row| {
-            self.store.pushNotif("Tot deployed", row.nameStr(), 1);
+        if (!self.totRespOk(resp, "Tater-tot not deployed")) {
+            // A failed deployment is a run of its own on the server: open it, so what failed stays on screen.
+            const r = resp orelse return;
+            const F = struct { run: []const u8 = "" };
+            const p = std.json.parseFromSlice(F, self.gpa, r.body, .{ .ignore_unknown_fields = true }) catch return;
+            defer p.deinit();
+            const leaf = p.value.run;
+            if (leaf.len < 17 or leaf.len > tots.LEAF_MAX) return;
+            self.refreshTotRuns();
             self.store.lock();
             defer self.store.unlock();
-            self.setTotSelLocked(row.nameStr());
+            self.setTotSelLocked(leaf[0 .. leaf.len - 16], leaf, true);
+            return;
+        }
+        if (tots.parseTot(self.gpa, resp.?.body)) |row| {
+            self.store.pushNotif("Tater-tot deployed", row.nameStr(), 1);
+            self.store.lock();
+            defer self.store.unlock();
+            self.setTotSelLocked(row.nameStr(), "", false); // a new run: its console starts empty; the roster names its folder
         }
         self.last_tots_s = 0;
     }
@@ -2693,4 +2757,44 @@ test "a message for a tot is posted to that tot as the exact text, and the roste
     p.drainCommands();
     try std.testing.expectEqual(@as(usize, 7), s.tot_event_count);
     try std.testing.expectEqual(@as(u64, 99), s.tot_event_seq);
+}
+
+test "a tater-tot's console follows its run: the same name deployed again starts over, the same run ending keeps what it shows" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const s = try gpa.create(Store); // Store is far too big for a test stack frame
+    defer gpa.destroy(s);
+    s.* = .{};
+    const p = try gpa.create(Poller);
+    defer gpa.destroy(p);
+    p.* = .{ .io = threaded.io(), .gpa = gpa, .store = s };
+    defer p.log_buf.deinit(gpa);
+
+    // Gary's first run, with events on screen
+    p.setTotSelLocked("Gary", "Gary-20261002-090000", false);
+    const gen0 = s.tot_sel_gen;
+    s.tot_event_count = 5;
+    s.tot_event_seq = 120;
+    // the same run again (a roster refresh): nothing changes
+    p.setTotSelLocked("Gary", "Gary-20261002-090000", false);
+    try std.testing.expectEqual(@as(u64, 120), s.tot_event_seq);
+    // deleted: the same run, now ended - its console stays, and the rest is read from its folder
+    p.setTotSelLocked("Gary", "Gary-20261002-090000", true);
+    try std.testing.expect(s.tot_sel_past);
+    try std.testing.expectEqual(@as(usize, 5), s.tot_event_count);
+    try std.testing.expectEqual(gen0, s.tot_sel_gen);
+    // Gary deployed again: another run, an empty console that asks from the start (the old seq would hide it all)
+    p.setTotSelLocked("Gary", "Gary-20261002-101500", false);
+    try std.testing.expect(!s.tot_sel_past);
+    try std.testing.expectEqual(@as(usize, 0), s.tot_event_count);
+    try std.testing.expectEqual(@as(u64, 0), s.tot_event_seq);
+    try std.testing.expect(s.tot_sel_gen != gen0);
+    try std.testing.expectEqualStrings("Gary-20261002-101500", s.tot_sel_leaf[0..s.tot_sel_leaf_len]);
+    // a failed deployment's run (no live name behind it) is selected as ended
+    p.setTotSelLocked("Ada", "Ada-20261002-102000", true);
+    try std.testing.expect(s.tot_sel_past);
+    // an ended selection with no run to read is not one
+    p.setTotSelLocked("", "", true);
+    try std.testing.expect(!s.tot_sel_past);
 }

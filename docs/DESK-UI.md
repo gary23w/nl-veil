@@ -31,7 +31,9 @@ Both backtick and tilde fences are supported, including longer fences surroundin
 shorter examples and incomplete blocks during streaming.
 
 The Tater-tots tab lists the account's tater-tots (24 by default; the -/+ beside the count
-raises or lowers the limit, up to 1000; the first is named Gary) in a list that scrolls, on the
+raises or lowers the limit, up to 1000; the first is named Gary) in a list that scrolls, with
+PAST RUNS under them - each deployment that ended or failed, kept like a closed chat and
+read from its folder (a deploy that fails opens its run, error and all) - on the
 left, above the scratchpad they share: entries wrap and scroll, newest at the bottom,
 and a two-click *clear* empties it for the next set of tater-tots. The right side is the
 selected tater-tot: its goal and counters, Pause / Resume, Shrink / Grow, **Open folder**
