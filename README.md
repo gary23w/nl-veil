@@ -1550,6 +1550,14 @@ account's own, and deleting the last tater-tot removes its Worker. And **goal mo
 gives the auto-loop a stored goal, an iteration log, a measured outcome per step and its own stop rules.
 [Full notes](docs/release/RELEASE-v1.1.7.md).
 
+**Watch the tater-tots trailer** (2:20, sound on): the Dots turn on us, and only a side dish can stop them.
+
+[![TATER-TOTS vs DOTS - the trailer](docs/video/tots-release.png)](https://gary23w.github.io/nl-veil/video/tots-release.mp4)
+
+[Play it in the browser](https://gary23w.github.io/nl-veil/video/tots-release.mp4) ·
+[download it](docs/video/tots-release.mp4) · every frame and sound is drawn by [`docs/video/render`](docs/video/render/render.py)
+(`python docs/video/render/render.py` builds it again).
+
 **Updating:** from v1.1.3 or later, use **Settings → Updates → App updates → Update & restart**.
 Versions before v1.1.3 require a manual full-bundle installation. Updates verify both executables and
 preserve data, with backups for recovery. [Updating and network troubleshooting](docs/UPDATES.md).
