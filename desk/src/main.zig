@@ -276,6 +276,7 @@ const Ui = struct {
     tot_open_n: usize = 0,
     tot_errors_only: bool = false, // the console shows only the rows that went wrong
     tot_pad_scroll: f32 = 0, // the scratchpad, in pixels
+    tot_list_scroll: f32 = 0, // the roster, in pixels
     tot_pad_follow: bool = true,
     tot_pad_clear_armed: bool = false, // "clear" was clicked once (the second click clears)
     lin_scroll: f32 = 0, // Swarm tab Lineages view
@@ -7952,7 +7953,8 @@ fn totCounter(right: f32, y: f32, used: usize, limit: usize) void {
     t.text(label, @intFromFloat(right - lw), @intFromFloat(y), 11, col);
 }
 
-/// The Tots tab: the account's tots (at most tots.MAX_TOTS) on the left with the scratchpad they share, and on
+/// The Tots tab: the account's tots (up to its limit, which the -/+ beside the count sets) on the left with the
+/// scratchpad they share, and on
 /// the right the selected tot's console and command line - or the deploy form. A tot runs in the user's own
 /// Cloudflare account with nobody in the loop; this tab watches and steers, it never has to be open.
 fn drawTots(store: *Store, body: t.Rect) void {
@@ -7976,15 +7978,40 @@ fn drawTots(store: *Store, body: t.Rect) void {
     const lx = body.x + pad;
     var y = body.y + pad;
     t.text(t.z("Tater-tots", .{}), @intFromFloat(lx), @intFromFloat(y), 20, t.fg);
-    t.text(t.z("{d} of {d}", .{ roster.n, tots.MAX_TOTS }), @intFromFloat(lx + 62), @intFromFloat(y + 6), 12, t.comment);
+    t.text(t.z("{d} of {d}", .{ roster.total, roster.max }), @intFromFloat(lx + 104), @intFromFloat(y + 6), 12, t.comment);
+    {
+        // the limit: one step at a time, held to the server's 1..1000
+        const mb = t.Rect{ .x = lx + left_w - 50, .y = y + 2, .width = 22, .height = 20 };
+        const pb2 = t.Rect{ .x = lx + left_w - 24, .y = y + 2, .width = 22, .height = 20 };
+        const live = online and !denied and roster.connected;
+        if (t.buttonGhost(mb, t.z("-", .{}), t.fg_dim, live and roster.max > 1)) store.pushCmd(store_mod.mkCmd(.tot_limit, "", t.z("{d}", .{roster.max - 1})));
+        if (t.buttonGhost(pb2, t.z("+", .{}), t.fg_dim, live and roster.max < 1000)) store.pushCmd(store_mod.mkCmd(.tot_limit, "", t.z("{d}", .{roster.max + 1})));
+        t.textClip(t.z("limit", .{}), @intFromFloat(lx + left_w - 92), @intFromFloat(y + 6), 11, t.comment, 40);
+    }
     y += 30;
 
-    // roster cards
+    // roster cards, in a list that scrolls once there are more than fit
     const card_h: f32 = 74;
+    const list_h = @min(@as(f32, @floatFromInt(roster.n)) * (card_h + 8), @max(card_h + 8, body.height * 0.42));
+    const list_r = t.Rect{ .x = lx, .y = y, .width = left_w + 2, .height = list_h };
+    const list_total = @as(f32, @floatFromInt(roster.n)) * (card_h + 8);
+    const list_max = @max(0, list_total - list_h);
+    if (t.hovering(list_r)) {
+        const wheel = rl.getMouseWheelMove();
+        if (wheel != 0) ui.tot_list_scroll -= wheel * (card_h + 8);
+    }
+    ui.tot_list_scroll = std.math.clamp(ui.tot_list_scroll, 0, list_max);
+    if (roster.n > 0) rl.beginScissorMode(@intFromFloat(list_r.x), @intFromFloat(list_r.y), @intFromFloat(list_r.width), @intFromFloat(list_r.height));
+    const list_top = y;
+    y -= ui.tot_list_scroll;
     for (roster.rows[0..roster.n]) |*row| {
+        if (y + card_h < list_top or y > list_top + list_h) {
+            y += card_h + 8;
+            continue;
+        }
         const cr = t.Rect{ .x = lx, .y = y, .width = left_w, .height = card_h };
         const is_sel = !ui.tot_form and std.mem.eql(u8, row.nameStr(), sel[0..sel_n]);
-        const hot = t.hovering(cr);
+        const hot = t.hovering(cr) and t.hovering(list_r);
         t.panelBordered(cr, if (is_sel) t.bg_sel else if (hot) t.bg_hl else t.bg_dark, if (is_sel) t.blue else t.border);
         t.statusDot(@intFromFloat(cr.x + 14), @intFromFloat(cr.y + 18), totStateColor(row.stateStr()));
         t.textClip(row.nameStr(), @intFromFloat(cr.x + 28), @intFromFloat(cr.y + 9), 15, t.fg, 150);
@@ -8004,6 +8031,12 @@ fn drawTots(store: *Store, body: t.Rect) void {
         }
         y += card_h + 8;
     }
+    if (roster.n > 0) rl.endScissorMode();
+    y = list_top + list_h;
+    if (roster.total > roster.n) {
+        t.textClip(t.z("+{d} more - veil --tater lists them all", .{roster.total - roster.n}), @intFromFloat(lx), @intFromFloat(y), 11, t.comment, @intFromFloat(left_w));
+        y += 16;
+    }
 
     // why the list is empty, in the order a user can act on
     if (roster.n == 0) {
@@ -8013,8 +8046,8 @@ fn drawTots(store: *Store, body: t.Rect) void {
         if (roster.err_len > 0) y = helpPara(roster.errStr(), lx, y, left_w) + 6;
     }
 
-    const can_deploy = online and !denied and seen and roster.connected and roster.n < tots.MAX_TOTS and !busy;
-    const dl = if (busy) t.z("deploying...", .{}) else t.z("Deploy a tot", .{});
+    const can_deploy = online and !denied and seen and roster.connected and roster.total < roster.max and !busy;
+    const dl = if (busy) t.z("deploying...", .{}) else if (roster.total >= roster.max and roster.connected) t.z("at the limit - raise it above", .{}) else t.z("Deploy a tater-tot", .{});
     if (t.button(.{ .x = lx, .y = y, .width = left_w, .height = t.BTN_MD }, dl, t.blue, can_deploy)) {
         ui.tot_form = true;
         ui.focus = .h_goal;
@@ -8060,7 +8093,7 @@ fn drawTots(store: *Store, body: t.Rect) void {
     for (roster.rows[0..roster.n]) |*row| {
         if (std.mem.eql(u8, row.nameStr(), sel[0..sel_n])) return drawTotPanel(store, right, row);
     }
-    _ = helpPara("A tot is an autonomous technician that runs in YOUR Cloudflare account: it keeps a goal, makes one improvement at a time, measures whether it helped, writes itself rules from what it measured, and moves on to the next best thing when a goal ends. Nobody has to be here for it to work - this tab only watches and steers. You can run up to three; they share a scratchpad and can message each other.", right.x, right.y + 4, @min(right.width, 720));
+    _ = helpPara("A tot is an autonomous technician that runs in YOUR Cloudflare account: it keeps a goal, makes one improvement at a time, measures whether it helped, writes itself rules from what it measured, and moves on to the next best thing when a goal ends. Nobody has to be here for it to work - this tab only watches and steers. An account runs 24 by default - raise the limit beside the count as far as your Cloudflare plan carries them (each one wakes every few seconds); they share a scratchpad and can message each other.", right.x, right.y + 4, @min(right.width, 720));
 }
 
 /// The deploy form. `first` = the account has no tot yet, so this one is Gary.

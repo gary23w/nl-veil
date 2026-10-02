@@ -29,6 +29,7 @@ const USAGE =
     \\       veil --tater watch <name>                 follow its events
     \\       veil --tater set <name> [--model M] [--pace S] [--size N] [--calls N] [--charter "..."] [--pause|--resume]
     \\       veil --tater pad ["<text>" | --clear]     the scratchpad the tater-tots share (--clear empties it)
+    \\       veil --tater limit [N]                    how many this account may run (24 by default; 1 to 1000)
     \\       veil --tater rm <name>                    delete one tater-tot
     \\       veil --tater key brave <key>              a search key for the tater-tots (google, google_cx too; --remove)
     \\       veil --tater teardown --yes               remove the runtime and every tater-tot from the account
@@ -106,6 +107,7 @@ pub fn cmd(ctx: *Ctx, args: []const []const u8) u8 {
     if (std.mem.eql(u8, verb, "rm") or std.mem.eql(u8, verb, "delete")) return rm(ctx, a, rest);
     if (std.mem.eql(u8, verb, "teardown")) return teardown(ctx, a, rest);
     if (std.mem.eql(u8, verb, "key")) return key(ctx, a, rest);
+    if (std.mem.eql(u8, verb, "limit")) return limit(ctx, a, rest);
     out(USAGE, .{});
     return 1;
 }
@@ -127,6 +129,7 @@ fn list(ctx: *Ctx, a: std.mem.Allocator) u8 {
         out("{s}\n", .{rosterLine(&b, h)});
     }
     if (r.tots.len == 0 and r.reachable) out("(no tater-tots - deploy the first with `veil --tater deploy \"<goal>\"`)\n", .{});
+    out("{d} of {d} (`veil --tater limit N` changes the limit)\n", .{ r.tots.len, r.max });
     if (r.reachable) out("tools: files, web search, web fetch, HTTP, memory, plan, swarm{s}{s}{s}\n", .{ if (r.python) ", Python + skills" else "", if (r.browser) ", browser" else "", if (r.neuron) ", neuron-db mind" else "" });
     if (r.tools_note.len > 0) out("{s}\n", .{r.tools_note});
     return 0;
@@ -269,6 +272,29 @@ fn pad(ctx: *Ctx, a: std.mem.Allocator, args: []const []const u8) u8 {
     const r = std.json.parseFromSliceLeaky(Pad, a, resp.body, .{ .ignore_unknown_fields = true }) catch Pad{};
     for (r.entries) |e| out("{d}. {s}: {s}\n", .{ e.seq, e.from, e.text });
     if (r.entries.len == 0) out("(the scratchpad is empty)\n", .{});
+    return 0;
+}
+
+/// `veil --tater limit [N]`: how many tater-tots this account may run (24 by default, 1 to 1000). What an account can
+/// really carry is its Cloudflare plan's to say: each one is a Durable Object waking every few seconds.
+fn limit(ctx: *Ctx, a: std.mem.Allocator, args: []const []const u8) u8 {
+    if (args.len == 0) {
+        const resp = cli.call(ctx, "GET", "/api/v1/tots", null, 40, true) catch return cli.unreachable_msg(ctx);
+        defer if (resp.body.len > 0) ctx.gpa.free(resp.body);
+        if (resp.status != 200) return fail("--tater limit", resp.status, resp.body, a);
+        const r = std.json.parseFromSliceLeaky(Roster, a, resp.body, .{ .ignore_unknown_fields = true }) catch return fail("--tater limit", resp.status, resp.body, a);
+        out("this account may run {d} tater-tots and runs {d}. `veil --tater limit N` sets 1 to 1000.\n", .{ r.max, r.tots.len });
+        return 0;
+    }
+    const n = std.fmt.parseInt(u32, args[0], 10) catch {
+        out("usage: veil --tater limit [N]     N is 1 to 1000\n", .{});
+        return 1;
+    };
+    const body = std.fmt.allocPrint(a, "{{\"max\":{d}}}", .{n}) catch return 1;
+    const resp = cli.call(ctx, "POST", "/api/v1/tots/limit", body, 40, true) catch return cli.unreachable_msg(ctx);
+    defer if (resp.body.len > 0) ctx.gpa.free(resp.body);
+    if (resp.status != 200) return fail("--tater limit", resp.status, resp.body, a);
+    out("this account may now run {d} tater-tots. Each one wakes every few seconds: your Cloudflare plan decides how many it really carries.\n", .{n});
     return 0;
 }
 

@@ -782,6 +782,7 @@ pub fn main(init: std.process.Init) !void {
     router.post("/api/v1/tots/pad", cf_tot.padWrite, .{});
     router.post("/api/v1/tots/pad/clear", cf_tot.padClear, .{});
     router.post("/api/v1/tots/keys", cf_tot.setKey, .{});
+    router.post("/api/v1/tots/limit", cf_tot.setLimit, .{});
     router.delete("/api/v1/tots/:name", cf_tot.deleteTot, .{});
     router.get("/api/v1/tots/:name/events", cf_tot.totEvents, .{});
     router.post("/api/v1/tots/:name/command", cf_tot.totCommand, .{});

@@ -396,6 +396,11 @@ pub fn totPost(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8, nam
     return httpReq(io, gpa, "POST", port, path, token, body_json, 30);
 }
 
+/// POST /api/v1/tots/limit — how many tots the account may run ({"max": N}, 1 to 1000).
+pub fn totsLimit(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8, body_json: []const u8) ?Resp {
+    return httpReq(io, gpa, "POST", port, "/api/v1/tots/limit", token, body_json, 20);
+}
+
 /// POST /api/v1/tots/pad/clear — empty the scratchpad the tots share.
 pub fn totsPadClear(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8) ?Resp {
     return httpReq(io, gpa, "POST", port, "/api/v1/tots/pad/clear", token, "{}", 30);

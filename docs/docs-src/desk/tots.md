@@ -8,7 +8,7 @@
 
 ## Purpose Summary
 
-The Tater-tots tab (drawn in `main.zig`) shows up to three tater-tots, the selected one's console and the scratchpad they share. This file is the data under it. The poller calls the readers and publishes the results into the Store under its one lock; the UI copies them out and draws. A tater-tot's events are kept as `Ev`: the swarm console's colour key, the event's own kind, the goal iteration it belongs to and its text with its line breaks, which the tab's console wraps and scrolls.
+The Tater-tots tab (drawn in `main.zig`) shows the account's tater-tots against its limit (`Roster.max`, from the server; `ROSTER_CAP` rows are held, `total` counts them all), the selected one's console and the scratchpad they share. This file is the data under it. The poller calls the readers and publishes the results into the Store under its one lock; the UI copies them out and draws. A tater-tot's events are kept as `Ev`: the swarm console's colour key, the event's own kind, the goal iteration it belongs to and its text with its line breaks, which the tab's console wraps and scrolls.
 
 ## Key Exports
 

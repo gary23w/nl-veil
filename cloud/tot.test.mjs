@@ -6,7 +6,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import worker, { Tot, MAX_TOTS, PRIMARY, PLATEAU, firstJson, answerText, parseAction, searchResults, privateHost, parseGoalCommand, parseVerdict, decide, newGoal, recordIteration, validName } from "./tot.js";
+import worker, { Tot, DEFAULT_MAX_TOTS, MAX_TOTS_CEIL, PRIMARY, PLATEAU, firstJson, answerText, parseAction, searchResults, privateHost, parseGoalCommand, parseVerdict, decide, newGoal, recordIteration, validName } from "./tot.js";
 
 class Storage {
   constructor() {
@@ -148,7 +148,7 @@ test("every route needs the token; a wrong one gets 401 and reaches no object", 
   assert.equal(w.objects.size, 0);
 });
 
-test("the first tot is always Gary, names are unique, and the fourth is refused", async () => {
+test("the first tot is always Gary, names are unique, and the one past the owner's limit is refused", async () => {
   const w = world();
   const first = await w.req("POST", "/v1/tots", { name: "Zed", goal: "watch the news" });
   assert.equal(first.status, 200);
@@ -157,20 +157,36 @@ test("the first tot is always Gary, names are unique, and the fourth is refused"
   assert.equal((await w.req("POST", "/v1/tots", { name: "gary", goal: "x y z" })).status, 409);
   assert.equal((await w.req("POST", "/v1/tots", { name: "bad name!", goal: "x y z" })).status, 409);
   assert.equal((await w.req("POST", "/v1/tots", { name: "Ada", goal: "x y z" })).body.tot.name, "Ada");
-  assert.equal((await w.req("POST", "/v1/tots", { name: "Nova", goal: "x y z" })).status, 200);
-  const fourth = await w.req("POST", "/v1/tots", { name: "Rex", goal: "x y z" });
+  assert.equal((await w.req("POST", "/v1/tots", { name: "Nova", goal: "x y z", max_tots: 3 })).status, 200);
+  const fourth = await w.req("POST", "/v1/tots", { name: "Rex", goal: "x y z", max_tots: 3 });
   assert.equal(fourth.status, 409);
   assert.match(fourth.body.err, /limit/);
   const list = await w.req("GET", "/v1/tots");
   assert.deepEqual(list.body.tots.map((h) => h.name), ["Gary", "Ada", "Nova"]);
-  assert.equal(list.body.max_tots, MAX_TOTS);
+  assert.equal(list.body.max_tots, 3); // the limit the owner sent stands until another comes
   // deleting one frees its slot and its storage
   assert.equal((await w.req("DELETE", "/v1/tots/ada")).body.deleted, "Ada");
   assert.equal(w.tot("Ada").store.m.size, 0);
   assert.equal(w.tot("Ada").store.alarm, null);
   assert.equal((await w.req("GET", "/v1/tots/Ada")).status, 404);
   assert.equal((await w.req("POST", "/v1/tots", { name: "Rex", goal: "x y z" })).status, 200);
+  // a raised limit takes the next one at once
+  assert.equal((await w.req("POST", "/v1/tots", { name: "Bo", goal: "x y z" })).status, 409);
+  assert.equal((await w.req("POST", "/v1/tots", { name: "Bo", goal: "x y z", max_tots: 30 })).status, 200);
+  assert.equal((await w.req("GET", "/v1/tots")).body.max_tots, 30);
   assert.ok(validName("Rex") && !validName("9lives") && !validName("") && !validName("a".repeat(25)));
+});
+
+test("an account runs 24 tater-tots unless its owner says otherwise, and no more than the ceiling", async () => {
+  const w = world();
+  for (let i = 0; i < DEFAULT_MAX_TOTS; i++) assert.equal((await w.req("POST", "/v1/tots", { name: `T${i}`, goal: "x y z" })).status, 200);
+  const over = await w.req("POST", "/v1/tots", { name: "Extra", goal: "x y z" });
+  assert.equal(over.status, 409);
+  assert.match(over.body.err, /24 tater-tots \(its limit\); raise the limit/);
+  assert.equal((await w.req("GET", "/v1/version")).body.max_tots_ceil, MAX_TOTS_CEIL);
+  // a limit past the ceiling is held to it
+  assert.equal((await w.req("POST", "/v1/tots", { name: "Extra", goal: "x y z", max_tots: 99999 })).status, 200);
+  assert.equal((await w.req("GET", "/v1/tots")).body.max_tots, MAX_TOTS_CEIL);
 });
 
 test("one alarm is one iteration: pick, act with tools, a measured verdict, a log row, and the next alarm", async () => {

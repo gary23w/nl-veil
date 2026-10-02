@@ -7,7 +7,8 @@
 //! The runtime is cloud/tot.js, embedded here and uploaded as it is; its header says what a tot can do. Beside it
 //! goes cloud/tot_py.py, a second Worker ("veil-tots-py") that runs a tot's Python, and the upload asks for
 //! Cloudflare's browser binding: both are optional, and an account that refuses one gets a tot without it.
-//! An account holds at most MAX_TOTS of them, and the first is always named PRIMARY.
+//! An account runs DEFAULT_MAX_TOTS of them unless its owner sets another limit (POST /api/v1/tots/limit, up to
+//! MAX_TOTS_CEIL; what an account can really carry is its Cloudflare plan's to say), and the first is always PRIMARY.
 //!
 //! HOW: the same OAuth token the chat turns use (workers-scripts.write) uploads the script, enables its
 //! workers.dev address and sets ONE secret on it: the token every later call carries. That token is never
@@ -63,7 +64,8 @@ const NEURON_MJS = @embedFile("neuron-db.mjs");
 pub const SCRIPT = "veil-tots";
 pub const PY_SCRIPT = "veil-tots-py";
 const PY_MODULE = "tot_py.py";
-pub const MAX_TOTS: usize = 3; // tot.js enforces it; a test below holds the two to one number
+pub const DEFAULT_MAX_TOTS: u32 = 24; // tot.js enforces the limit it is sent; a test below holds the two to one number
+pub const MAX_TOTS_CEIL: u32 = 1000;
 pub const PRIMARY = "Gary";
 const MODULE = "tot.js";
 const COMPAT_DATE = "2025-09-01";
@@ -93,7 +95,13 @@ const State = struct {
     local: []const []const u8 = &.{}, // tots the owner allowed onto this machine, by name
     last_error: []const u8 = "",
     moved: bool = false, // the old (hots) state only: everything is across, the old Workers' removal is left
+    max_tots: u32 = 0, // the owner's limit on how many this account runs; 0 = DEFAULT_MAX_TOTS
 };
+
+/// How many tots this account may run.
+fn limitOf(st: State) u32 {
+    return if (st.max_tots == 0) DEFAULT_MAX_TOTS else @min(st.max_tots, MAX_TOTS_CEIL);
+}
 
 fn statePath(app: *App, uid: u64, buf: []u8) ?[]const u8 {
     return std.fmt.bufPrint(buf, "{s}/u{d}/" ++ STATE_FILE, .{ app.data, uid }) catch null;
@@ -490,7 +498,7 @@ pub fn listTots(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     }
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(app.gpa);
-    try out.print(app.gpa, "{{\"ok\":true,\"connected\":{},\"deployed\":{},\"reachable\":{},\"current\":{},\"max\":{d},\"primary\":\"" ++ PRIMARY ++ "\",\"url\":", .{ connected, deployed, reachable, std.mem.eql(u8, st.script_hash, scriptHash(&hb)), MAX_TOTS });
+    try out.print(app.gpa, "{{\"ok\":true,\"connected\":{},\"deployed\":{},\"reachable\":{},\"current\":{},\"max\":{d},\"primary\":\"" ++ PRIMARY ++ "\",\"url\":", .{ connected, deployed, reachable, std.mem.eql(u8, st.script_hash, scriptHash(&hb)), limitOf(st) });
     try http.jstr(app.gpa, &out, st.url);
     try out.appendSlice(app.gpa, ",\"local\":[");
     for (st.local, 0..) |n, i| {
@@ -552,12 +560,12 @@ const Deployed = union(enum) { ok: []const u8, err: []const u8 };
 
 /// What goes to the runtime: the request as the user made it, plus the text limit of its model (the runtime clips
 /// a later `/goal` or `/charter` to it).
-const Sent = struct { req: CreateReq, text_max: usize };
+const Sent = struct { req: CreateReq, text_max: usize, max_tots: u32 = DEFAULT_MAX_TOTS };
 
 fn sentJson(a: std.mem.Allocator, s: Sent) ?[]const u8 {
     const body = std.json.Stringify.valueAlloc(a, s.req, .{ .emit_null_optional_fields = false }) catch return null;
     // the request is an object: add the limit as its last field
-    return std.fmt.allocPrint(a, "{s},\"text_max\":{d}}}", .{ body[0 .. body.len - 1], s.text_max }) catch null;
+    return std.fmt.allocPrint(a, "{s},\"text_max\":{d},\"max_tots\":{d}}}", .{ body[0 .. body.len - 1], s.text_max, s.max_tots }) catch null;
 }
 
 /// createTot without the request: validate, make sure the runtime is up, create the tot, record a local grant.
@@ -581,7 +589,7 @@ fn deploy(app: *App, a: std.mem.Allocator, uid: u64, tok: Tok, body: CreateReq) 
     }
     if (uploaded) writeState(app, uid, st);
 
-    var send: Sent = .{ .req = body, .text_max = limit };
+    var send: Sent = .{ .req = body, .text_max = limit, .max_tots = limitOf(st) };
     send.req.name = name;
     send.req.model = model;
     const json = sentJson(a, send) orelse return .{ .err = "out of memory" };
@@ -833,6 +841,24 @@ fn keySecret(name: []const u8) ?[]const u8 {
     if (std.ascii.eqlIgnoreCase(name, "google")) return "GOOGLE_CSE_KEY";
     if (std.ascii.eqlIgnoreCase(name, "google_cx") or std.ascii.eqlIgnoreCase(name, "google-cx")) return "GOOGLE_CSE_CX";
     return null;
+}
+
+const LimitReq = struct { max: i64 = 0 };
+
+/// POST /api/v1/tots/limit {max} — how many tots this account may run, 1 to MAX_TOTS_CEIL. Kept here and sent with
+/// every deployment, so the runtime enforces the number the owner chose. Lowering it below the count stops new
+/// deployments; it deletes nothing.
+pub fn setLimit(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
+    const u = gate(app, req, res) orelse return;
+    const body = (req.json(LimitReq) catch return badReq(res, "malformed JSON body")) orelse return badReq(res, "bad body");
+    if (body.max < 1 or body.max > MAX_TOTS_CEIL) return badReq(res, "the limit is 1 to 1000 tater-tots");
+    var arena = std.heap.ArenaAllocator.init(app.gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var st = readState(app, u.id, a);
+    st.max_tots = @intCast(body.max);
+    writeState(app, u.id, st);
+    try res.json(.{ .ok = true, .max = st.max_tots }, .{});
 }
 
 /// POST /api/v1/tots/keys {name, value} — set (or, with an empty value, remove) a search key on the runtime. The
@@ -1475,7 +1501,7 @@ test "every tot route is gated: an anonymous caller gets 401 and nothing runs" {
     const io = threaded.io();
     var ta = try http.testApp(gpa, io, "zig-cftot-gate-tmp");
     defer ta.deinit();
-    inline for (.{ listTots, createTot, deleteTot, teardown, totEvents, totCommand, totConfig, padRead, padWrite, padClear, setKey }) |h| {
+    inline for (.{ listTots, createTot, deleteTot, teardown, totEvents, totCommand, totConfig, padRead, padWrite, padClear, setKey, setLimit }) |h| {
         var web = httpz.testing.init(.{});
         defer web.deinit();
         web.param("name", "Gary");
@@ -1488,13 +1514,22 @@ test "every tot route is gated: an anonymous caller gets 401 and nothing runs" {
 test "the runtime and this server agree: the limit, the primary's name, the goal loop's stop rules, the default model" {
     const goal = @import("../worker/chat/goal.zig");
     var b: [96]u8 = undefined;
-    try tt.expect(std.mem.indexOf(u8, TOT_JS, try std.fmt.bufPrint(&b, "export const MAX_TOTS = {d};", .{MAX_TOTS})) != null);
+    try tt.expect(std.mem.indexOf(u8, TOT_JS, try std.fmt.bufPrint(&b, "export const DEFAULT_MAX_TOTS = {d};", .{DEFAULT_MAX_TOTS})) != null);
+    try tt.expect(std.mem.indexOf(u8, TOT_JS, try std.fmt.bufPrint(&b, "export const MAX_TOTS_CEIL = {d};", .{MAX_TOTS_CEIL})) != null);
     try tt.expect(std.mem.indexOf(u8, TOT_JS, "export const PRIMARY = \"" ++ PRIMARY ++ "\";") != null);
     try tt.expect(std.mem.indexOf(u8, TOT_JS, try std.fmt.bufPrint(&b, "export const PLATEAU = {d};", .{goal.PLATEAU})) != null);
     try tt.expect(std.mem.indexOf(u8, TOT_JS, try std.fmt.bufPrint(&b, "export const BUDGET_DEFAULT = {d};", .{goal.BUDGET_DEFAULT})) != null);
     try tt.expect(std.mem.indexOf(u8, TOT_JS, try std.fmt.bufPrint(&b, "model: \"{s}\",", .{modelcfg.defaults.cf_model})) != null);
     try tt.expect(std.mem.indexOf(u8, TOT_JS, "export class Tot ") != null); // the class the upload's binding names
-    try tt.expectEqual(@as(usize, 3), MAX_TOTS);
+    try tt.expectEqual(@as(u32, 24), DEFAULT_MAX_TOTS);
+    // the owner's limit: unset is the default, a set one is held to the ceiling, and it rides every deployment
+    try tt.expectEqual(@as(u32, 24), limitOf(.{}));
+    try tt.expectEqual(@as(u32, 60), limitOf(.{ .max_tots = 60 }));
+    try tt.expectEqual(MAX_TOTS_CEIL, limitOf(.{ .max_tots = 5000 }));
+    var arena = std.heap.ArenaAllocator.init(tt.allocator);
+    defer arena.deinit();
+    const sent = sentJson(arena.allocator(), .{ .req = .{ .goal = "map the harbour" }, .text_max = 2000, .max_tots = 60 }).?;
+    try tt.expect(std.mem.endsWith(u8, sent, ",\"text_max\":2000,\"max_tots\":60}"));
     try tt.expectEqualStrings("Gary", PRIMARY);
 }
 

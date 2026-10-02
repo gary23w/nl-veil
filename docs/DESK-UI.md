@@ -30,7 +30,8 @@ the chat pane; copying preserves the original text, indentation, and line ending
 Both backtick and tilde fences are supported, including longer fences surrounding
 shorter examples and incomplete blocks during streaming.
 
-The Tater-tots tab lists the account's tater-tots (at most three, the first named Gary) on the
+The Tater-tots tab lists the account's tater-tots (24 by default; the -/+ beside the count
+raises or lowers the limit, up to 1000; the first is named Gary) in a list that scrolls, on the
 left, above the scratchpad they share: entries wrap and scroll, newest at the bottom,
 and a two-click *clear* empties it for the next set of tater-tots. The right side is the
 selected tater-tot: its goal and counters, Pause / Resume, Shrink / Grow, **Open folder**
