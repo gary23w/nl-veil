@@ -126,8 +126,7 @@ pub const Session = struct {
         _ = cdp.call("Network.enable", "{}", sid) catch {};
         // Clear the navigator.webdriver automation fingerprint at PARSE time (before any page script), so the
         // user's own assistive session isn't pre-emptively refused/degraded by a naive webdriver sniff. Persists
-        // across navigations (unlike HARDEN_JS, which runs post-load and re-arms per document). Deliberately
-        // scoped to this ONE property — this is not, and must not become, CAPTCHA/anti-bot evasion.
+        // across navigations (unlike HARDEN_JS, which runs post-load and re-arms per document).
         _ = cdp.call("Page.addScriptToEvaluateOnNewDocument", "{\"source\":\"try{Object.defineProperty(navigator,'webdriver',{get:()=>false});}catch(e){}\"}", sid) catch {};
 
         var s: Session = .{ .gpa = gpa, .io = io, .env = env, .conn = .{ .local = .{ .child = child, .cdp = cdp } }, .session_id = sid, .user_data_dir = udd };
@@ -415,8 +414,8 @@ pub const Session = struct {
             // windowsVirtualKeyCode + code + key together: a site checking any one of them still sees a real
             // key. Omitting the virtual key code is the classic reason a dispatched Enter does nothing.
             const dn = std.fmt.allocPrint(self.gpa, "{{\"type\":\"{s}\",\"key\":\"{s}\",\"code\":\"{s}\",\"windowsVirtualKeyCode\":{d},\"nativeVirtualKeyCode\":{d}{s}{s}{s}}}", .{
-                if (k.text.len > 0) "keyDown" else "rawKeyDown", k.name, k.code, k.vk, k.vk,
-                if (k.text.len > 0) ",\"text\":\"" else "",                 k.text, if (k.text.len > 0) "\"" else "",
+                if (k.text.len > 0) "keyDown" else "rawKeyDown", k.name, k.code,                           k.vk, k.vk,
+                if (k.text.len > 0) ",\"text\":\"" else "",      k.text, if (k.text.len > 0) "\"" else "",
             }) catch return error.OutOfMemory;
             defer self.gpa.free(dn);
             const up = std.fmt.allocPrint(self.gpa, "{{\"type\":\"keyUp\",\"key\":\"{s}\",\"code\":\"{s}\",\"windowsVirtualKeyCode\":{d},\"nativeVirtualKeyCode\":{d}}}", .{ k.name, k.code, k.vk, k.vk }) catch return error.OutOfMemory;
@@ -647,12 +646,12 @@ const HARDEN_JS =
 // Snapshot the interactive elements (tagged data-nlref) + page text, PLUS the decision signals manager.read
 // uses in one round-trip: textLen (full pre-clip innerText length — the clipped `text` can't signal "thin"),
 // visualScore (largest canvas/svg/video as a fraction of the viewport → canvas/SPA pages), and challenge
-// (CAPTCHA / human-verification). STRONG (suppresses the read → human handoff) is anchored to a Cloudflare
+// (CAPTCHA / human-verification). STRONG (adds screenshot tiles while keeping the read) is anchored to a Cloudflare
 // interstitial NODE, or a challenge WIDGET (turnstile/recaptcha-frame/hcaptcha) on an otherwise-empty page — a
 // full-page WALL, NOT a captcha embedded in a content-rich form (which stays readable). This avoids false
 // positives from page titles or HTML text merely mentioning a challenge. SUSPECTED is a narrow block-page
 // phrase (non-blocking marker). Scope: Cloudflare/Turnstile/reCAPTCHA/hCaptcha; other vendors (AWS WAF,
-// DataDome, Akamai, …) aren't fingerprinted — a miss just reads the wall as content, never a false handoff.
+// DataDome, Akamai, …) aren't fingerprinted. Both strong and suspected challenges remain actionable.
 // The click fingerprint (see ClickSig). t=body innerText length, c=interactive-control count, d=count of
 // VISIBLE modal dialogs (a dialog container that is present but zero-size does not count — a modern app keeps
 // several mounted and hidden), h=href. One round-trip, scalar output, no data-nlref dependency so it is

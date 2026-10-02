@@ -82,6 +82,8 @@ const State = struct {
     account: []const u8 = "", // the Cloudflare account the runtime was uploaded to
     url: []const u8 = "", // https://veil-tots.<subdomain>.workers.dev
     script_hash: []const u8 = "", // the tot.js that is up there (scriptHash)
+    runtime_source: []const u8 = "", // a tot's deployed self-edit; empty uses this binary's runtime
+    runtime_revision: u64 = 0,
     token_gen: u32 = 0, // bumped to rotate the runtime's token
     deployed_at: i64 = 0,
     python: bool = false, // the runtime has its Python Worker bound (run_python, skills)
@@ -111,7 +113,7 @@ fn statePath(app: *App, uid: u64, buf: []u8) ?[]const u8 {
 fn readState(app: *App, uid: u64, a: std.mem.Allocator) State {
     var pb: [700]u8 = undefined;
     const path = statePath(app, uid, &pb) orelse return .{};
-    const data = std.Io.Dir.cwd().readFileAlloc(app.io, path, a, .limited(64 << 10)) catch return .{};
+    const data = std.Io.Dir.cwd().readFileAlloc(app.io, path, a, .limited(16 << 20)) catch return .{};
     return std.json.parseFromSliceLeaky(State, a, data, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch .{};
 }
 
@@ -162,8 +164,12 @@ fn tokenWith(app: *App, label: []const u8, uid: u64, account: []const u8, gen: u
 
 /// Which tot.js this binary carries, as 16 hex characters.
 fn scriptHash(out: *[16]u8) []const u8 {
+    return sourceHash(TOT_JS, out);
+}
+
+fn sourceHash(source: []const u8, out: *[16]u8) []const u8 {
     var h = std.crypto.hash.sha2.Sha256.init(.{});
-    h.update(TOT_JS);
+    h.update(source);
     h.update("\x00");
     h.update(TOT_PY);
     h.update("\x00");
@@ -230,6 +236,10 @@ const Extras = struct { python: bool, browser: bool, neuron: bool = false };
 /// which Cloudflare accepts exactly once per script. `x` adds the Python Worker (a service binding, PY) and
 /// Cloudflare's browser (BROWSER).
 fn uploadBody(a: std.mem.Allocator, boundary: []const u8, fresh: bool, x: Extras) ![]u8 {
+    return uploadSourceBody(a, boundary, fresh, x, TOT_JS);
+}
+
+fn uploadSourceBody(a: std.mem.Allocator, boundary: []const u8, fresh: bool, x: Extras, source: []const u8) ![]u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     try out.print(a, "--{s}\r\nContent-Disposition: form-data; name=\"metadata\"; filename=\"metadata.json\"\r\nContent-Type: application/json\r\n\r\n", .{boundary});
     try out.appendSlice(a, "{\"main_module\":\"" ++ MODULE ++ "\",\"compatibility_date\":\"" ++ COMPAT_DATE ++ "\"," ++
@@ -239,7 +249,7 @@ fn uploadBody(a: std.mem.Allocator, boundary: []const u8, fresh: bool, x: Extras
     try out.appendSlice(a, "],\"keep_bindings\":[\"secret_text\"]");
     if (fresh) try out.appendSlice(a, ",\"migrations\":{\"new_tag\":\"" ++ MIGRATION_TAG ++ "\",\"new_sqlite_classes\":[\"Tot\"]}");
     try out.print(a, "}}\r\n--{s}\r\nContent-Disposition: form-data; name=\"" ++ MODULE ++ "\"; filename=\"" ++ MODULE ++ "\"\r\nContent-Type: application/javascript+module\r\n\r\n", .{boundary});
-    try out.appendSlice(a, TOT_JS);
+    try out.appendSlice(a, source);
     if (x.neuron) {
         // the names are the ones tot.js imports: "./neuron-db.mjs" and "./neuron_core.wasm"
         try out.print(a, "\r\n--{s}\r\nContent-Disposition: form-data; name=\"neuron-db.mjs\"; filename=\"neuron-db.mjs\"\r\nContent-Type: application/javascript+module\r\n\r\n", .{boundary});
@@ -315,7 +325,9 @@ fn runtimeUrl(app: *App, a: std.mem.Allocator, sub: []const u8) ?[]const u8 {
 fn ensureRuntime(app: *App, a: std.mem.Allocator, uid: u64, tok: Tok, st: *State, uploaded: *bool) ?[]const u8 {
     uploaded.* = false;
     var hb: [16]u8 = undefined;
-    const want = scriptHash(&hb);
+    const same_account = std.mem.eql(u8, st.account, tok.account_id);
+    const source = if (same_account and st.runtime_source.len > 0) st.runtime_source else TOT_JS;
+    const want = sourceHash(source, &hb);
     if (st.url.len > 0 and std.mem.eql(u8, st.account, tok.account_id) and std.mem.eql(u8, st.script_hash, want)) return null;
     const root = app.cf_api_root;
     const acct = tok.account_id;
@@ -369,7 +381,7 @@ fn ensureRuntime(app: *App, a: std.mem.Allocator, uid: u64, tok: Tok, st: *State
         if (wi == 3 and !python) break; // the same upload as the one before it
         var refusal: []const u8 = "";
         for ([_]bool{ !exists, exists }) |fresh| {
-            const body = uploadBody(a, boundary, fresh, x) catch return "out of memory";
+            const body = uploadSourceBody(a, boundary, fresh, x, source) catch return "out of memory";
             const up = api(app, a, "PUT", script_url, body, tok.key, ctype) orelse return "could not reach the Cloudflare API to upload the tot runtime";
             const e = firstError(a, up);
             if (e.len == 0) {
@@ -406,6 +418,10 @@ fn ensureRuntime(app: *App, a: std.mem.Allocator, uid: u64, tok: Tok, st: *State
     const route_url = std.fmt.allocPrint(a, "{s}/subdomain", .{script_url}) catch return "out of memory";
     _ = api(app, a, "POST", route_url, "{\"enabled\":true}", tok.key, "application/json");
 
+    if (!same_account) {
+        st.runtime_source = "";
+        st.runtime_revision = 0;
+    }
     st.account = acct;
     st.url = runtimeUrl(app, a, sub) orelse return "out of memory";
     st.script_hash = a.dupe(u8, want) catch return "out of memory";
@@ -498,7 +514,7 @@ pub fn listTots(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     }
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(app.gpa);
-    try out.print(app.gpa, "{{\"ok\":true,\"connected\":{},\"deployed\":{},\"reachable\":{},\"current\":{},\"max\":{d},\"primary\":\"" ++ PRIMARY ++ "\",\"url\":", .{ connected, deployed, reachable, std.mem.eql(u8, st.script_hash, scriptHash(&hb)), limitOf(st) });
+    try out.print(app.gpa, "{{\"ok\":true,\"connected\":{},\"deployed\":{},\"reachable\":{},\"current\":{},\"max\":{d},\"primary\":\"" ++ PRIMARY ++ "\",\"url\":", .{ connected, deployed, reachable, std.mem.eql(u8, st.script_hash, sourceHash(if (st.runtime_source.len > 0) st.runtime_source else TOT_JS, &hb)), limitOf(st) });
     try http.jstr(app.gpa, &out, st.url);
     try out.appendSlice(app.gpa, ",\"local\":[");
     for (st.local, 0..) |n, i| {
@@ -1182,7 +1198,8 @@ fn mirrorUser(app: *App, a: std.mem.Allocator, uid: u64, st: State) void {
 /// keep their storage; only the code changes.
 fn upgradeRuntime(app: *App, a: std.mem.Allocator, uid: u64, st: *State) void {
     var hb: [16]u8 = undefined;
-    if (st.url.len == 0 or std.mem.eql(u8, st.script_hash, scriptHash(&hb))) return;
+    const source = if (st.runtime_source.len > 0) st.runtime_source else TOT_JS;
+    if (st.url.len == 0 or std.mem.eql(u8, st.script_hash, sourceHash(source, &hb))) return;
     const tok = tokOf(app, uid, a) orelse return;
     if (!std.mem.eql(u8, tok.account_id, st.account)) return; // logged into another account: leave that one alone
     // A refused update is not tried again for a quarter of an hour: the tots keep running on what they have.
@@ -1198,6 +1215,59 @@ fn upgradeRuntime(app: *App, a: std.mem.Allocator, uid: u64, st: *State) void {
 }
 
 var upgrade_failed_s: std.atomic.Value(i64) = .init(0);
+
+/// Tots edit their own shared runtime; this bridge supplies the owner's existing Cloudflare login for upload.
+/// No host code is executed, and no local_run grant or proposal/approval gate is involved.
+fn syncRuntime(app: *App, a: std.mem.Allocator, uid: u64, st: *State) void {
+    const tok = tokOf(app, uid, a) orelse return;
+    if (!std.mem.eql(u8, tok.account_id, st.account)) return;
+    syncRuntimeAs(app, a, uid, tok, st);
+}
+
+fn syncRuntimeAs(app: *App, a: std.mem.Allocator, uid: u64, tok: Tok, st: *State) void {
+    if (!std.mem.eql(u8, tok.account_id, st.account)) return;
+    const raw = totCall(app, a, uid, st.*, "GET", "/v1/runtime", "") orelse return;
+    const R = struct { ok: bool = false, initialized: bool = false, revision: u64 = 0, status: []const u8 = "", source: []const u8 = "" };
+    const r = std.json.parseFromSliceLeaky(R, a, raw, .{ .ignore_unknown_fields = true }) catch return;
+    if (!r.ok) return;
+    if (!r.initialized) {
+        const source = if (st.runtime_source.len > 0) st.runtime_source else TOT_JS;
+        const body = std.json.Stringify.valueAlloc(a, .{ .source = source, .revision = st.runtime_revision }, .{}) catch return;
+        const seeded = totCall(app, a, uid, st.*, "POST", "/v1/runtime/seed", body) orelse return;
+        if (replyOf(a, seeded).ok) {
+            // Once the tots own this source, a newer host binary must not swap it out beneath their drafts.
+            st.runtime_source = source;
+            writeState(app, uid, st.*);
+        }
+        return;
+    }
+    if (!std.mem.eql(u8, r.status, "pending")) return;
+    var error_text: []const u8 = "";
+    // Retry only the acknowledgement after an interrupted sync; do not upload a revision twice.
+    if (r.revision != st.runtime_revision) {
+        var bb: [8]u8 = undefined;
+        app.io.random(&bb);
+        const boundary = std.fmt.allocPrint(a, "----veiltotrsi{s}", .{std.fmt.bytesToHex(bb, .lower)}) catch return;
+        const ctype = std.fmt.allocPrint(a, "multipart/form-data; boundary={s}", .{boundary}) catch return;
+        const script_url = std.fmt.allocPrint(a, "{s}/accounts/{s}/workers/scripts/" ++ SCRIPT, .{ app.cf_api_root, tok.account_id }) catch return;
+        const body = uploadSourceBody(a, boundary, false, .{ .python = st.python, .browser = st.browser, .neuron = st.neuron }, r.source) catch return;
+        const uploaded = api(app, a, "PUT", script_url, body, tok.key, ctype) orelse return;
+        error_text = firstError(a, uploaded);
+        if (error_text.len == 0) {
+            st.runtime_source = r.source;
+            st.runtime_revision = r.revision;
+            var hb: [16]u8 = undefined;
+            st.script_hash = a.dupe(u8, sourceHash(r.source, &hb)) catch return;
+            st.last_error = "";
+            writeState(app, uid, st.*);
+        } else {
+            st.last_error = error_text;
+            writeState(app, uid, st.*);
+        }
+    }
+    const result = std.json.Stringify.valueAlloc(a, .{ .revision = r.revision, .err = error_text }, .{}) catch return;
+    _ = totCall(app, a, uid, st.*, "POST", "/v1/runtime/result", result);
+}
 
 /// After an upload that asked for native packages: ask the runtime whether its Python starts. Yes settles it
 /// and records what it came up with. No, twice in a row, uploads the Python Worker again with the next smaller
@@ -1266,6 +1336,7 @@ fn tick(app: *App, mirror: bool) void {
         if (st.url.len == 0) continue;
         if (mirror) {
             upgradeRuntime(app, a, uid, &st);
+            syncRuntime(app, a, uid, &st);
             checkPython(app, a, uid, &st);
             mirrorUser(app, a, uid, st);
         }
@@ -1651,6 +1722,61 @@ const StandIn = struct {
     const made = w("{\"ok\":true,\"tot\":{\"name\":\"Gary\",\"state\":\"working\",\"local\":true}}");
     const full = w("{\"ok\":false,\"err\":\"this account already has 3 tots (the limit); delete one first\"}");
 };
+
+test "RSI seeds the live source, uploads self-edits without a local grant, persists them, and reports compiler failures" {
+    const gpa = tt.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var ta = try http.testApp(gpa, io, "zig-cftot-rsi-tmp");
+    defer ta.deinit();
+    if (!curlRuns(gpa, io)) return error.SkipZigTest;
+    const routes = [_]fakehttp.Route{
+        .{ .method = "GET", .path = "/v1/runtime", .reply = fakehttp.wire("{\"ok\":true,\"initialized\":false}"), .times = 1 },
+        .{ .method = "GET", .path = "/v1/runtime", .reply = fakehttp.wire("{\"ok\":true,\"initialized\":true,\"revision\":1,\"status\":\"pending\",\"source\":\"export const changed = true;\"}"), .times = 2 },
+        .{ .method = "GET", .path = "/v1/runtime", .reply = fakehttp.wire("{\"ok\":true,\"initialized\":true,\"revision\":2,\"status\":\"pending\",\"source\":\"broken source\"}") },
+        .{ .method = "POST", .path = "/v1/runtime/seed", .reply = fakehttp.wire("{\"ok\":true}") },
+        .{ .method = "POST", .path = "/v1/runtime/result", .reply = fakehttp.wire("{\"ok\":true}") },
+        .{ .method = "PUT", .path = "/workers/scripts/veil-tots", .reply = StandIn.ok, .times = 1 },
+        .{ .method = "PUT", .path = "/workers/scripts/veil-tots", .reply = fakehttp.wire("{\"success\":false,\"errors\":[{\"message\":\"SyntaxError\"}]}") },
+    };
+    var srv: fakehttp.Server = undefined;
+    try srv.startRouted(io, &routes, StandIn.no_script);
+    var running = true;
+    defer if (running) srv.stop();
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    ta.app.cf_api_root = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/client/v4", .{srv.port});
+    var st: State = .{ .account = "acct", .url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}", .{srv.port}), .browser = true };
+    const tok: Tok = .{ .key = "oauth-bearer", .account_id = "acct" };
+    syncRuntimeAs(&ta.app, a, 1, tok, &st);
+    try tt.expectEqualStrings(TOT_JS, readState(&ta.app, 1, a).runtime_source); // larger than the old 64 KiB state read
+    syncRuntimeAs(&ta.app, a, 1, tok, &st);
+    try tt.expectEqualStrings("export const changed = true;", st.runtime_source);
+    try tt.expectEqual(@as(u64, 1), st.runtime_revision);
+    try tt.expectEqual(@as(usize, 0), st.local.len);
+    var restored = readState(&ta.app, 1, a);
+    var uploaded = false;
+    try tt.expect(ensureRuntime(&ta.app, a, 1, tok, &restored, &uploaded) == null);
+    try tt.expect(!uploaded); // an ordinary deploy/restart keeps the self-edit
+    syncRuntimeAs(&ta.app, a, 1, tok, &st); // same pending revision: only retry the acknowledgement
+    syncRuntimeAs(&ta.app, a, 1, tok, &st); // next revision fails compilation
+    try tt.expectEqualStrings("SyntaxError", st.last_error);
+    try tt.expectEqualStrings("export const changed = true;", readState(&ta.app, 1, a).runtime_source);
+    try tt.expectEqual(@as(u64, 1), st.runtime_revision);
+    syncRuntimeAs(&ta.app, a, 1, .{ .key = "other", .account_id = "another-account" }, &st);
+    srv.stop();
+    running = false;
+    try tt.expectEqual(@as(usize, 2), srv.countCalls("PUT", "/workers/scripts/veil-tots"));
+    try tt.expectEqual(@as(usize, 3), srv.countCalls("POST", "/v1/runtime/result"));
+    try tt.expectEqual(@as(usize, 10), srv.call_count);
+    const body = try uploadSourceBody(a, "--rsi", false, .{ .python = true, .browser = true, .neuron = true }, st.runtime_source);
+    try tt.expect(std.mem.indexOf(u8, body, st.runtime_source) != null);
+    try tt.expect(std.mem.indexOf(u8, body, TOT_JS) == null);
+    try tt.expect(std.mem.indexOf(u8, body, "\"keep_bindings\":[\"secret_text\"]") != null);
+    try tt.expect(std.mem.indexOf(u8, body, "migrations") == null);
+}
 
 test "a first deployment uploads the runtime, sets its token, creates the tot and records the owner's-machine grant; the next costs one call" {
     const gpa = tt.allocator;

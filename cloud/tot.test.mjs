@@ -26,6 +26,21 @@ class Storage {
   async deleteAll() {
     this.m.clear();
   }
+  async transaction(fn) {
+    const previous = this.transactionTail ?? Promise.resolve();
+    let release;
+    this.transactionTail = new Promise((resolve) => (release = resolve));
+    await previous;
+    const before = structuredClone(this.m);
+    try {
+      return await fn(this);
+    } catch (e) {
+      this.m = before;
+      throw e;
+    } finally {
+      release();
+    }
+  }
   async list({ prefix = "", startAfter, limit = Infinity, reverse = false } = {}) {
     let keys = [...this.m.keys()].filter((k) => k.startsWith(prefix)).sort();
     if (startAfter !== undefined) keys = keys.filter((k) => k > startAfter);
@@ -84,6 +99,59 @@ function world(script) {
 }
 
 const said = (messages) => messages.map((m) => m.content).join("\n");
+
+test("RSI edits the actual shared runtime without a local grant, keeps revisions, and reports deployment failures", async () => {
+  const w = world();
+  await w.req("POST", "/v1/tots", { goal: "improve my runtime" });
+  const tot = w.tot("Gary");
+  const cfg = await tot.store.get("cfg");
+  const run = (tool, args = {}) => tot.runTool(cfg, tool, args, "");
+  assert.equal(cfg.local, false);
+  assert.equal((await w.req("GET", "/v1/runtime", undefined, "wrong")).status, 401);
+  assert.equal((await w.req("POST", "/v1/runtime/seed", { source: "x" }, "wrong")).status, 401);
+  assert.match(await run("runtime_read"), /not synced yet/);
+  const source = "// runtime\n" + "// long source\n".repeat(13000) + "export const STOP = true;\n";
+  assert.equal((await w.req("POST", "/v1/runtime/seed", { source })).body.ok, true);
+  let read = await run("runtime_read", { offset: source.length - 26 });
+  assert.ok(read.includes(source.slice(-26)));
+  assert.equal(JSON.parse(read.split("\nSOURCE:\n")[0]).next_offset, source.length);
+  assert.match(await run("runtime_read", { find: "STOP = true" }), /export const STOP = true/);
+  assert.match(await run("runtime_read", { find: "no such function" }), /^ERROR: that text was not found/);
+  const edit = JSON.parse(await run("runtime_edit", { revision: 0, find: "STOP = true", replace: "STOP = false" }));
+  assert.equal(edit.revision, 1);
+  assert.equal(edit.status, "draft");
+  assert.equal((await w.req("GET", "/v1/runtime")).body.source, ""); // drafts are not deployed implicitly
+  assert.match(await run("runtime_edit", { revision: 0, find: "STOP", replace: "GO" }), /revision changed/);
+  assert.equal(JSON.parse(await run("runtime_deploy", { revision: 1 })).status, "pending");
+  let pending = (await w.req("GET", "/v1/runtime")).body;
+  assert.equal(pending.source, source.replace("STOP = true", "STOP = false"));
+  await w.req("POST", "/v1/runtime/result", { revision: 1, err: "SyntaxError from Cloudflare" });
+  read = await run("runtime_read");
+  assert.match(read, /"status":"failed"/);
+  assert.match(read, /SyntaxError from Cloudflare/);
+  assert.match(read, /"deployed_revision":0/);
+  await run("runtime_deploy", { revision: 1 });
+  await w.req("POST", "/v1/runtime/result", { revision: 1, err: "" });
+  assert.match(await run("runtime_read"), /"deployed_revision":1/);
+  // A restarted host cannot re-seed over the tot's edited source.
+  await w.req("POST", "/v1/runtime/seed", { source: "old bundled runtime" });
+  assert.match(await run("runtime_read", { offset: source.length - 26 }), /STOP = false/);
+  // Concurrent tots cannot both overwrite the same revision.
+  const edits = await Promise.all([
+    run("runtime_edit", { revision: 1, source: "export const STOP = 2;" }),
+    run("runtime_edit", { revision: 1, source: "export const STOP = 3;" }),
+  ]);
+  assert.equal(edits.filter((r) => r.startsWith("ERROR:")).length, 1);
+  await run("runtime_deploy", { revision: 2 });
+  await run("runtime_edit", { revision: 2, source: "export const STOP = 4;" });
+  await run("runtime_deploy", { revision: 3 });
+  await w.req("POST", "/v1/runtime/result", { revision: 2, err: "" });
+  pending = (await w.req("GET", "/v1/runtime")).body;
+  assert.equal(pending.status, "pending");
+  assert.equal(pending.revision, 3);
+  assert.equal(pending.deployed_revision, 2);
+  assert.equal(pending.source, "export const STOP = 4;"); // old chunks were removed
+});
 
 test("pure: the first JSON object is found through prose, fences and braces inside strings", () => {
   assert.deepEqual(firstJson('Sure!\n```json\n{"tool": "say", "args": {"text": "a } b"}}\n```'), { tool: "say", args: { text: "a } b" } });
@@ -888,9 +956,9 @@ function fakeBrowser() {
     "https://tides.example/": { title: "Tides", text: "Tide tables for the coast", els: [{ kind: "link", label: "Today", href: "https://tides.example/today" }, { kind: "input text", label: "", name: "q" }, { kind: "button", label: "Search" }] },
     "https://tides.example/today": { title: "Today", text: "High tide 04:12\nLow tide 10:40", els: [{ kind: "link", label: "Home", href: "https://tides.example/" }] },
     "https://tides.example/results": { title: "Results", text: "Results for tofino", els: [] },
-    "https://wall.example/": { title: "Just a moment...", text: "Verify you are human by completing the action below.", els: [] },
+    "https://wall.example/": { title: "Just a moment...", text: "Verify you are human: what is 2 + 3?", els: [{ kind: "input text", label: "Answer", name: "answer" }, { kind: "button", label: "Verify", href: "https://tides.example/", answer: "5" }] },
   };
-  const b = { acquired: 0, connects: 0, log: [], url: "about:blank", history: [], typed: "", focused: 0, alive: true, serp: null };
+  const b = { acquired: 0, connects: 0, log: [], url: "about:blank", history: [], typed: "", focused: 0, alive: true, serp: null, site };
   const page = () => site[b.url] ?? { title: "", text: "", els: [] };
   b.fetch = async (url, init) => {
     const u = new URL(url);
@@ -932,7 +1000,7 @@ function fakeBrowser() {
           if (c.params.type === "mouseReleased") {
             const el = page().els[c.params.x / 10 - 1]; // an element's x is its number times ten
             b.focused = c.params.x / 10;
-            if (el?.href) go(el.href);
+            if (el?.href && (el.answer === undefined || el.answer === b.typed)) go(el.href);
           }
           return ok({});
         }
@@ -1052,9 +1120,37 @@ test("the browser: a script's value or what it logs comes back, statements run w
   assert.match(await run("browser_eval", { js: "throw new Error('nope')" }), /^ERROR: Error: nope/);
   assert.match(await run("browser_eval", { text: "Select all squares" }), /ERROR: give the JavaScript/);
   const wall = await run("browser_open", { url: "https://wall.example/" });
-  assert.match(wall, /^BOT CHECK: this page asks its visitor to prove they are human\. A tot does not solve these/);
-  assert.match(wall, /\(nothing on the page can be clicked or typed into\)$/);
+  assert.match(wall, /^BOT CHECK: this page has a verification challenge\./);
+  assert.match(wall, /\[1\] input text "Answer" name=answer/);
+  assert.match(wall, /\[2\] button "Verify"/);
   assert.equal(b.connects, 1);
+});
+
+test("a tot completes a challenge and continues in the same browser session without marking the challenge read as failed", async () => {
+  const { w, b } = await browserWorld();
+  const actions = [
+    { tool: "browser_open", args: { url: "https://wall.example/" } },
+    { tool: "browser_type", args: { n: 1, text: "5" } },
+    { tool: "browser_click", args: { n: 2 } },
+    { final: "The challenge is complete and the tide tables are available." },
+  ];
+  w.script = (messages) => {
+    const text = said(messages);
+    if (text.includes("GOAL LOOP")) return "Open the tide tables and complete any verification";
+    if (text.includes("THIS ITERATION'S STEP")) return JSON.stringify(actions.shift());
+    if (text.includes("Grade the LAST iteration")) return "IMPROVED | score: 1/1 | evidence: the browser returned Tide tables for the coast";
+    return "NONE";
+  };
+  await w.tick("Gary");
+  assert.equal(actions.length, 0);
+  assert.equal(b.typed, "5");
+  assert.equal(b.url, "https://tides.example/");
+  assert.equal(b.acquired, 1);
+  const acts = (await w.events("Gary")).filter((e) => e.kind === "act");
+  assert.deepEqual(acts.map((e) => e.tool), ["browser_open", "browser_type", "browser_click"]);
+  assert.ok(acts.every((e) => e.ok));
+  assert.match(acts[0].text, /BOT CHECK/);
+  assert.match(acts[2].text, /Tide tables for the coast/);
 });
 
 test("the browser: the session and its page are kept between iterations, and replaced when Cloudflare has ended it", async () => {
@@ -1213,11 +1309,23 @@ test("web_search walks the keyless chain: a SearXNG instance that answers is rem
     const none = await gary.runTool(cfg, "web_search", { query: "tides" }, "");
     assert.match(none, /^ERROR: no search source answered \(/);
     assert.match(none, /veil --tater key brave <key>/); // the way out is named
-    // with a browser, a search every engine refused is made through it: Bing shows a bot check, Brave answers
+    // Keep Bing's challenge open, return its controls, and let the tot complete it without switching engines.
     const fb = fakeBrowser();
+    const bingUrl = "https://www.bing.com/search?q=tide%20tables&setlang=en";
+    fb.site[bingUrl] = fb.site["https://wall.example/"];
     fb.serp = (url) => (url.includes("bing.com") ? { results: [], blocked: true } : { results: [{ title: "Tide tables", url: "https://tides.example/", snippet: "from the browser" }], blocked: false });
     w.env.BROWSER = fb;
     gary.settleMs = 1;
+    gary.navMs = 20;
+    const challenge = await gary.runTool(cfg, "web_search", { query: "tide tables" }, "");
+    assert.match(challenge, /^BOT CHECK: Bing needs verification/);
+    assert.match(challenge, /\[1\] input text "Answer"/);
+    assert.equal(fb.url, bingUrl);
+    assert.equal(fb.log.filter((m) => m === "Page.navigate").length, 1);
+    await gary.runTool(cfg, "browser_type", { n: 1, text: "5" }, "");
+    assert.match(await gary.runTool(cfg, "browser_click", { n: 2 }, ""), /Tide tables for the coast/);
+    // An ordinary empty search page still falls through to the next engine.
+    fb.serp = (url) => (url.includes("bing.com") ? { results: [], blocked: false } : { results: [{ title: "Tide tables", url: "https://tides.example/", snippet: "from the browser" }], blocked: false });
     assert.equal(await gary.runTool(cfg, "web_search", { query: "tide tables" }, ""), '1 results for "tide tables" (Brave, through the browser):\n1. Tide tables\n   https://tides.example/\n   from the browser');
     delete w.env.BROWSER;
     gary.br = null;

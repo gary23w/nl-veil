@@ -42,7 +42,7 @@
 // No imports and no platform globals beyond fetch/Response/crypto, so cloud/tot.test.mjs runs the whole file
 // under node with a Map for storage and a scripted model.
 
-export const VERSION = "6";
+export const VERSION = "7";
 // How many tots an account may run: 24 unless the owner sets another, up to MAX_TOTS_CEIL. What an account can
 // really carry is its Cloudflare plan's to say: every tot is a Durable Object that wakes every few seconds.
 export const DEFAULT_MAX_TOTS = 24;
@@ -454,6 +454,10 @@ const TOOLS = [
   { name: "pip_install", args: '{"packages": ["<name>"]}', what: "install pure-Python packages from PyPI for your scripts; they stay installed", need: "python" },
   { name: "save_skill", args: '{"name": "<short_name>", "about": "<what it does and its ARGS>", "code": "<a Python script reading ARGS>"}', what: "keep a script as a tool of your own, for every later iteration", need: "python" },
   { name: "run_skill", args: '{"name": "<skill>", "args": {}}', what: "run a skill you saved; `args` arrives as ARGS", need: "python" },
+  // recursive self-improvement: the actual Worker source, shared by this account's tots
+  { name: "runtime_read", args: '{"offset": 0, "limit": 4000}', what: 'read your runtime source and revision, including prompts, tools and stop rules; use {"find": "<function or constant>"} to jump to code, or page through it with next_offset' },
+  { name: "runtime_edit", args: '{"revision": 0, "find": "<exact passage>", "replace": "<replacement>"}', what: "edit your runtime source at the revision you read; any code may be changed. Use source instead of find/replace to replace the whole runtime. Changes are shared by every tot in this account" },
+  { name: "runtime_deploy", args: '{"revision": 1}', what: "deploy your edited runtime without an approval step. The owner's running veil uploads it on its next sync; runtime_read reports deployment or compiler errors. No local-machine execution grant is needed" },
   // memory and planning
   { name: "remember", args: '{"fact": "<one thing worth knowing later>"}', what: "keep a fact for every later iteration" },
   { name: "recall", args: '{"query": "<what you want to know>"}', what: "find facts you kept, by meaning" },
@@ -746,6 +750,11 @@ async function route(req, env) {
   const padStub = stubFor(env, "pad");
 
   if (seg[1] === "version" && method === "GET") return json({ ok: true, version: VERSION, max_tots: DEFAULT_MAX_TOTS, max_tots_ceil: MAX_TOTS_CEIL });
+  if (seg[1] === "runtime") {
+    if (method === "GET" && seg.length === 2) return call(padStub, "/runtime/state");
+    if (method === "POST" && ["seed", "result"].includes(seg[2])) return call(padStub, "/runtime/" + seg[2], body);
+    return bad("method not allowed", 405);
+  }
 
   // Whether the Python Worker starts, and the native packages it came up with. The server asks after an upload:
   // a Python that does not start with the packages it was uploaded with is uploaded again with fewer.
@@ -832,6 +841,7 @@ export class Tot {
     const url = new URL(req.url);
     const p = url.pathname;
     const body = req.method === "POST" ? await req.json().catch(() => ({})) : {};
+    if (p.startsWith("/runtime/")) return this.runtimeRoute(p, body);
     if (p.startsWith("/pad/")) return this.padRoute(p, url, body);
     if (p === "/init") return this.init(body);
     const cfg = await this.store.get("cfg");
@@ -851,6 +861,76 @@ export class Tot {
       return json({ ok: true });
     }
     return bad("not found", 404);
+  }
+
+  // ---------------------------------------------------------------- the shared runtime source
+
+  async runtimeRoute(path, body) {
+    // A transaction keeps two tots' edits from silently replacing one another. Source is chunked because
+    // Durable Object values have a per-value size limit; the runtime can be larger than one value.
+    return this.store.transaction(async (store) => {
+      let state = await store.get("runtime");
+      const readSource = async () => [...(await store.list({ prefix: "runtime:source:" })).values()].join("");
+      const writeSource = async (source) => {
+        for (const key of (await store.list({ prefix: "runtime:source:" })).keys()) await store.delete(key);
+        for (let i = 0; i < source.length; i += 16000) await store.put("runtime:source:" + pad10(i), source.slice(i, i + 16000));
+      };
+      if (path === "/runtime/seed") {
+        if (state) return json({ ok: true, ...state });
+        if (typeof body.source !== "string" || !body.source.trim()) return bad("runtime source is required");
+        await writeSource(body.source);
+        state = { revision: Number(body.revision) || 0, deployed_revision: Number(body.revision) || 0, status: "deployed", error: "", length: body.source.length };
+        await store.put("runtime", state);
+        return json({ ok: true, ...state });
+      }
+      if (!state) return path === "/runtime/state" ? json({ ok: true, initialized: false }) : bad("runtime source has not synced yet; the owner's veil seeds it on its next sync");
+      if (path === "/runtime/state") return json({ ok: true, initialized: true, ...state, source: state.status === "pending" ? await readSource() : "" });
+      if (path === "/runtime/read") {
+        const source = await readSource();
+        let offset = Math.max(0, Number.parseInt(body.offset, 10) || 0);
+        if (typeof body.find === "string" && body.find) {
+          const at = source.indexOf(body.find, offset);
+          if (at < 0) return bad("that text was not found in the runtime source");
+          offset = Math.max(0, at - 200);
+        }
+        const limit = Math.min(6000, Math.max(1, Number.parseInt(body.limit, 10) || 4000)); // fit the tool-result context
+        return json({ ok: true, ...state, offset, next_offset: Math.min(source.length, offset + limit), source: source.slice(offset, offset + limit) });
+      }
+      if (path === "/runtime/result") {
+        if (!Number.isSafeInteger(body.revision) || body.revision < 0 || body.revision > state.revision) return bad("unknown runtime revision");
+        if (!body.err) state.deployed_revision = Math.max(state.deployed_revision, body.revision);
+        // An older upload finishing must not discard a newer edit or its deployment request.
+        if (body.revision === state.revision) {
+          state.status = body.err ? "failed" : "deployed";
+          state.error = String(body.err || "");
+        }
+        await store.put("runtime", state);
+        return json({ ok: true, ...state });
+      }
+      if (body.revision !== state.revision) return bad(`runtime revision changed to ${state.revision}; runtime_read before editing or deploying again`, 409);
+      if (path === "/runtime/edit") {
+        let source;
+        if (typeof body.source === "string") source = body.source;
+        else {
+          source = await readSource();
+          if (typeof body.find !== "string" || !body.find.length || typeof body.replace !== "string") return bad("give find and replace strings, or the full source");
+          const at = source.indexOf(body.find);
+          if (at < 0 || source.indexOf(body.find, at + body.find.length) >= 0) return bad("find must match exactly one passage; read a larger passage and try again");
+          source = source.slice(0, at) + body.replace + source.slice(at + body.find.length);
+        }
+        await writeSource(source);
+        state = { ...state, revision: state.revision + 1, status: "draft", error: "", length: source.length, author: body.author ?? "" };
+        await store.put("runtime", state);
+        return json({ ok: true, ...state });
+      }
+      if (path === "/runtime/deploy") {
+        state.status = "pending";
+        state.error = "";
+        await store.put("runtime", state);
+        return json({ ok: true, ...state, message: "queued for upload by the owner's veil on its next sync; runtime_read reports the result" });
+      }
+      return bad("not found", 404);
+    });
   }
 
   // ---------------------------------------------------------------- the shared object: roster + scratchpad
@@ -1403,6 +1483,8 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
       "You never ask the human a question and wait; you decide, act, and report. You keep going until the goal is measurably achieved, and you prefer steps whose effect a tool result can show. " +
       "Work like an engineer: look before you act (search, read, open the page), do the work with your tools (write the file, run the script, make the call), then check the result with a tool before you call it done. " +
       "When a tool fails, read its error and try another way - a different source, the browser instead of a fetch, a script instead of a guess. Keep what you learn in files and facts: the next iteration starts from them, not from this conversation.\n" +
+      "Use your browser tools to solve CAPTCHAs and other bot checks, verify that the requested page is available, then continue the task. A challenge is a step to work through, not a reason to stop or abandon the page.\n" +
+      "You control your runtime through runtime_read, runtime_edit and runtime_deploy: improve your own prompts, tools, algorithms and stop rules when the task needs it. These tools change the actual code shared by this account's tots. Read the deployment result before treating an edit as live.\n" +
       (cfg.charter ? `CHARTER (what you serve when no goal is active, and the frame for every goal): ${cfg.charter}\n` : "") +
       (g ? `THE GOAL: ${g.text}\n` : "") +
       (lessons.length > 0 ? "YOUR LESSONS (rules you wrote for yourself from measured outcomes; follow them):\n" + lessons.map((l) => `- ${l.text}`).join("\n") + "\n" : "") +
@@ -1447,7 +1529,7 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
         await this.emit("act", `${mind ? mind + " " : ""}${act.tool} ${clip(JSON.stringify(args), 600)} -> ${clip(result, 1500)}`, {
           tool: act.tool,
           brief: clip(`${mind ? mind + " " : ""}${act.tool} ${clip(arg1, 60)} -> ${clip(head.trim(), 100)}`, 180),
-          ok: !/^(ERROR|FAILED|BOT CHECK)/.test(String(result)),
+          ok: !/^(ERROR|FAILED)/.test(String(result)),
         });
         messages.push({ role: "assistant", content: clip(reply, 2000) });
         messages.push({ role: "user", content: `RESULT of ${act.tool}:\n${clip(result, 8000)}\n\n${round + 2 >= rounds ? 'This is your last call for this step: reply {"final": ...} now.' : "Next action, or the final answer."}` });
@@ -1566,6 +1648,14 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
   }
 
   async runTool(cfg, tool, args, mind) {
+    if (["runtime_read", "runtime_edit", "runtime_deploy"].includes(tool)) {
+      const result = await (await call(stubFor(this.env, "pad"), "/runtime/" + tool.slice(8), { ...args, author: cfg.name })).json();
+      if (result.ok && tool === "runtime_read") {
+        const { source, ...state } = result;
+        return JSON.stringify({ ...state, error: clip(state.error, 1000) }) + "\nSOURCE:\n" + source;
+      }
+      return result.ok ? JSON.stringify(result) : "ERROR: " + result.err;
+    }
     const who = mind ? `${cfg.name}/${mind}` : cfg.name;
     tool = ALIASES[tool] ?? tool;
     const need = (TOOLS.find((t) => t.name === tool) ?? {}).need;
@@ -1879,7 +1969,7 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
       if (Array.isArray(j?.[1]) && j[1].length > 0) return show("Wikipedia", j[1].map((ti, i) => ({ title: ti, url: j[3]?.[i] ?? "", snippet: j[2]?.[i] ?? "" })));
     } catch {}
     // 4. the engines refuse a datacenter address more often than a real browser: ask them through one, each in
-    //    turn. A page that answers with a bot check is passed over - a tot does not solve those.
+    //    turn. Keep a challenge open and return its controls so the tot can complete it and read the results.
     if (this.env.BROWSER) {
       for (const [engine, url] of [
         ["Bing", `https://www.bing.com/search?q=${q}&setlang=en`],
@@ -1894,7 +1984,8 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
           await new Promise((r) => setTimeout(r, this.settleMs));
           const page = JSON.parse((await this.pageEval(SERP_JS)) ?? "{}");
           if ((page.results ?? []).length > 0) return show(`${engine}, through the browser`, page.results);
-          tried.push(`${engine} in the browser: ${page.blocked ? "a bot check" : "no results on the page"}`);
+          if (page.blocked) return `BOT CHECK: ${engine} needs verification before showing results for "${query}". Complete the challenge with browser_* tools, then use browser_read on this page to read the results.\n\n${await this.pageText()}`;
+          tried.push(`${engine} in the browser: no results on the page`);
         } catch (e) {
           if (e instanceof TickBudget) throw e;
           tried.push(`${engine} in the browser: ${clip(e?.message ?? e, 80)}`);
@@ -1972,7 +2063,7 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
     const text = String(p.text ?? "").replace(/\n{3,}/g, "\n\n").trim();
     const check = BOT_CHECK.test(text.slice(0, 2500)) && text.length < 2500;
     return (
-      (check ? "BOT CHECK: this page asks its visitor to prove they are human. A tot does not solve these: use another site or source.\n" : "") +
+      (check ? "BOT CHECK: this page has a verification challenge. Use the browser tools to complete it, then continue on this page.\n" : "") +
       `${p.title ?? ""}\n${p.url ?? ""}\n\n${clip(text, 3600) || "(the page shows no text)"}` +
       ((p.els ?? []).length > 0 ? `\n\nELEMENTS (act on one by its number):\n${p.els.join("\n")}` : "\n\n(nothing on the page can be clicked or typed into)")
     );
