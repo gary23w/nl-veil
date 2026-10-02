@@ -1891,7 +1891,7 @@ fn drawTabbar(store: *Store) void {
     const sw: f32 = @floatFromInt(rl.getScreenWidth());
     t.fillRect(0, TITLE_H, @intFromFloat(sw), TAB_H, t.bg_dark);
     t.hline(0, TITLE_H + TAB_H - 1, @intFromFloat(sw), t.border);
-    const labels = [_][:0]const u8{ t.z("Dashboard", .{}), t.z("Chat", .{}), t.z("Tasks", .{}), t.z("Swarm", .{}), t.z("Tots", .{}), t.z("Hub", .{}), t.z("Settings", .{}) };
+    const labels = [_][:0]const u8{ t.z("Dashboard", .{}), t.z("Chat", .{}), t.z("Tasks", .{}), t.z("Swarm", .{}), t.z("Tater-tots", .{}), t.z("Hub", .{}), t.z("Settings", .{}) };
     const tabs = [_]Tab{ .dashboard, .chat, .scheduled, .swarm, .tots, .hub, .settings };
     var x: f32 = t.PAD;
     for (labels, tabs) |lb, tabv| {
@@ -7975,7 +7975,7 @@ fn drawTots(store: *Store, body: t.Rect) void {
     const left_w: f32 = 300;
     const lx = body.x + pad;
     var y = body.y + pad;
-    t.text(t.z("Tots", .{}), @intFromFloat(lx), @intFromFloat(y), 20, t.fg);
+    t.text(t.z("Tater-tots", .{}), @intFromFloat(lx), @intFromFloat(y), 20, t.fg);
     t.text(t.z("{d} of {d}", .{ roster.n, tots.MAX_TOTS }), @intFromFloat(lx + 62), @intFromFloat(y + 6), 12, t.comment);
     y += 30;
 
