@@ -1,43 +1,43 @@
-//! cf_hot.zig — HOTS: autonomous technicians that run the veil's goal loop in the user's own Cloudflare account.
+//! cf_tot.zig — TOTS: autonomous technicians that run the veil's goal loop in the user's own Cloudflare account.
 //!
-//! WHAT: a hot (Human Overview Technician) is the goal loop of worker/chat/goal.zig with no human in it and no
-//! machine of the user's under it. It lives in one Worker script ("veil-hots") this file uploads into the
-//! account behind "Log in with Cloudflare": each hot is a Durable Object whose alarm runs one iteration
+//! WHAT: a tot (Tiny Overview Technician) is the goal loop of worker/chat/goal.zig with no human in it and no
+//! machine of the user's under it. It lives in one Worker script ("veil-tots") this file uploads into the
+//! account behind "Log in with Cloudflare": each tot is a Durable Object whose alarm runs one iteration
 //! (pick -> do -> measure -> record -> learn), and whose model calls go through the account's own AI binding.
-//! The runtime is cloud/hot.js, embedded here and uploaded as it is; its header says what a hot can do. Beside it
-//! goes cloud/hot_py.py, a second Worker ("veil-hots-py") that runs a hot's Python, and the upload asks for
-//! Cloudflare's browser binding: both are optional, and an account that refuses one gets a hot without it.
-//! An account holds at most MAX_HOTS of them, and the first is always named PRIMARY.
+//! The runtime is cloud/tot.js, embedded here and uploaded as it is; its header says what a tot can do. Beside it
+//! goes cloud/tot_py.py, a second Worker ("veil-tots-py") that runs a tot's Python, and the upload asks for
+//! Cloudflare's browser binding: both are optional, and an account that refuses one gets a tot without it.
+//! An account holds at most MAX_TOTS of them, and the first is always named PRIMARY.
 //!
 //! HOW: the same OAuth token the chat turns use (workers-scripts.write) uploads the script, enables its
 //! workers.dev address and sets ONE secret on it: the token every later call carries. That token is never
-//! stored: it is derived from the server key, the user, the account and a generation counter (hotToken), so
-//! the state file ({data}/u{uid}/cf_hots.json) holds an address and a hash, nothing a reader could use.
-//! After that this file is a relay: the desk and `veil hot` ask this server, and this server asks
+//! stored: it is derived from the server key, the user, the account and a generation counter (totToken), so
+//! the state file ({data}/u{uid}/cf_tots.json) holds an address and a hash, nothing a reader could use.
+//! After that this file is a relay: the desk and `veil tot` ask this server, and this server asks
 //! the Worker - roster, deploy, command, settings, events, the shared scratchpad, delete.
 //!
-//! THE OWNER'S MACHINE: a hot deployed with `local` (a checkbox at deployment, never changeable later) may
-//! queue jobs for the veil here. Nothing listens at home for them: bgLoop polls each approved hot's queue and
+//! THE OWNER'S MACHINE: a tot deployed with `local` (a checkbox at deployment, never changeable later) may
+//! queue jobs for the veil here. Nothing listens at home for them: bgLoop polls each approved tot's queue and
 //! runs a job as an unattended chat turn - the same entry points a scheduled task uses (worker/sched.zig) - in
 //! a conversation named for the job, then posts the turn's final answer back. The approval is recorded HERE
 //! (State.local): a runtime that claimed the grant for itself would still find no bridge.
 //!
-//!   GET    /api/v1/hots                  roster + deployment status
-//!   POST   /api/v1/hots                  deploy one (uploads the runtime first when it is absent or older)
-//!   DELETE /api/v1/hots                  remove the runtime and every hot from the account
-//!   DELETE /api/v1/hots/:name            delete one hot; deleting the LAST one also removes the Worker
-//!   GET    /api/v1/hots/:name/events     its event tail (?after=N)
-//!   POST   /api/v1/hots/:name/command    a command or a message ("/goal ...", "/pause", plain words)
-//!   POST   /api/v1/hots/:name/config     settings: model, pace_s, size, daily_calls, charter, paused
-//!   GET    /api/v1/hots/pad              the scratchpad the account's hots share (?after=N)
-//!   POST   /api/v1/hots/pad              write to it
-//!   POST   /api/v1/hots/pad/clear        empty it (the local copy is kept as _hots/scratchpad-<when>.md)
-//!   POST   /api/v1/hots/keys             give the hots a search key ({"name":"brave","value":"..."}); "" removes it
+//!   GET    /api/v1/tots                  roster + deployment status
+//!   POST   /api/v1/tots                  deploy one (uploads the runtime first when it is absent or older)
+//!   DELETE /api/v1/tots                  remove the runtime and every tot from the account
+//!   DELETE /api/v1/tots/:name            delete one tot; deleting the LAST one also removes the Worker
+//!   GET    /api/v1/tots/:name/events     its event tail (?after=N)
+//!   POST   /api/v1/tots/:name/command    a command or a message ("/goal ...", "/pause", plain words)
+//!   POST   /api/v1/tots/:name/config     settings: model, pace_s, size, daily_calls, charter, paused
+//!   GET    /api/v1/tots/pad              the scratchpad the account's tots share (?after=N)
+//!   POST   /api/v1/tots/pad              write to it
+//!   POST   /api/v1/tots/pad/clear        empty it (the local copy is kept as _tots/scratchpad-<when>.md)
+//!   POST   /api/v1/tots/keys             give the tots a search key ({"name":"brave","value":"..."}); "" removes it
 //!
-//! THE LOCAL FOLDER: every deployment of a hot is mirrored into {data}/u<uid>/_hots/<name>-<deployed>/ (events.log
-//! to tail, events.jsonl, status.json, notes/), with the shared scratchpad at _hots/scratchpad.md. See mirrorHot.
+//! THE LOCAL FOLDER: every deployment of a tot is mirrored into {data}/u<uid>/_tots/<name>-<deployed>/ (events.log
+//! to tail, events.jsonl, status.json, notes/), with the shared scratchpad at _tots/scratchpad.md. See mirrorTot.
 //!
-//! Every route is admin-gated, like the scheduled tasks: a hot with the owner's machine runs full-tool turns.
+//! Every route is admin-gated, like the scheduled tasks: a tot with the owner's machine runs full-tool turns.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -47,39 +47,39 @@ const cf_oauth = @import("cf_oauth.zig");
 const chat_engine = @import("../worker/chat/engine.zig");
 const bu = @import("../worker/browser/util.zig"); // sleepMs: a raw-thread sleep, no Io park
 const modelcfg = @import("modelcfg");
-const fakehttp = @import("../worker/fakehttp.zig"); // TEST ONLY: the stand-in Cloudflare API and hot runtime
+const fakehttp = @import("../worker/fakehttp.zig"); // TEST ONLY: the stand-in Cloudflare API and tot runtime
 const App = http.App;
 const badReq = http.badReq;
-const log = std.log.scoped(.cf_hot);
+const log = std.log.scoped(.cf_tot);
 
-/// The runtime, uploaded as it is (cloud/hot.js; build.zig hands it over by this name).
-const HOT_JS = @embedFile("hot.js");
-/// The Python a hot runs: a second Worker, reached from the runtime through a service binding (cloud/hot_py.py).
-const HOT_PY = @embedFile("hot_py.py");
-/// The hot's mind: neuron-db compiled to WebAssembly and its binding, two more modules of the runtime's upload.
+/// The runtime, uploaded as it is (cloud/tot.js; build.zig hands it over by this name).
+const TOT_JS = @embedFile("tot.js");
+/// The Python a tot runs: a second Worker, reached from the runtime through a service binding (cloud/tot_py.py).
+const TOT_PY = @embedFile("tot_py.py");
+/// The tot's mind: neuron-db compiled to WebAssembly and its binding, two more modules of the runtime's upload.
 const NEURON_WASM = @embedFile("neuron_core.wasm");
 const NEURON_MJS = @embedFile("neuron-db.mjs");
 
-pub const SCRIPT = "veil-hots";
-pub const PY_SCRIPT = "veil-hots-py";
-const PY_MODULE = "hot_py.py";
-pub const MAX_HOTS: usize = 3; // hot.js enforces it; a test below holds the two to one number
+pub const SCRIPT = "veil-tots";
+pub const PY_SCRIPT = "veil-tots-py";
+const PY_MODULE = "tot_py.py";
+pub const MAX_TOTS: usize = 3; // tot.js enforces it; a test below holds the two to one number
 pub const PRIMARY = "Gary";
-const MODULE = "hot.js";
+const MODULE = "tot.js";
 const COMPAT_DATE = "2025-09-01";
 const MIGRATION_TAG = "v1";
-const STATE_FILE = "cf_hots.json";
+const STATE_FILE = "cf_tots.json";
 const NAME_MAX = 24;
-/// How often the bridge asks each approved hot for jobs.
+/// How often the bridge asks each approved tot for jobs.
 const BRIDGE_EVERY_MS: u64 = 20_000;
 
 // ---------------------------------------------------------------------------------- per-user state file
 
-/// What this server remembers about a user's hots. No secret: the runtime's token is derived (hotToken).
+/// What this server remembers about a user's tots. No secret: the runtime's token is derived (totToken).
 const State = struct {
     account: []const u8 = "", // the Cloudflare account the runtime was uploaded to
-    url: []const u8 = "", // https://veil-hots.<subdomain>.workers.dev
-    script_hash: []const u8 = "", // the hot.js that is up there (scriptHash)
+    url: []const u8 = "", // https://veil-tots.<subdomain>.workers.dev
+    script_hash: []const u8 = "", // the tot.js that is up there (scriptHash)
     token_gen: u32 = 0, // bumped to rotate the runtime's token
     deployed_at: i64 = 0,
     python: bool = false, // the runtime has its Python Worker bound (run_python, skills)
@@ -90,8 +90,9 @@ const State = struct {
     py_check: u8 = 0, // how many more times to ask whether that Python starts; 0 = settled
     py_fails: u8 = 0, // answers in a row saying it does not
     py_native: []const []const u8 = &.{}, // the native packages it came up with, as it reports them
-    local: []const []const u8 = &.{}, // hots the owner allowed onto this machine, by name
+    local: []const []const u8 = &.{}, // tots the owner allowed onto this machine, by name
     last_error: []const u8 = "",
+    moved: bool = false, // the old (hots) state only: everything is across, the old Workers' removal is left
 };
 
 fn statePath(app: *App, uid: u64, buf: []u8) ?[]const u8 {
@@ -124,7 +125,7 @@ fn nowS(io: std.Io) i64 {
 
 // ---------------------------------------------------------------------------------- names, token, address
 
-/// A hot's name: 1-24 of [A-Za-z0-9_-], starting with a letter. The same rule hot.js applies (validName): the
+/// A tot's name: 1-24 of [A-Za-z0-9_-], starting with a letter. The same rule tot.js applies (validName): the
 /// name becomes a URL segment there and part of a conversation id here.
 pub fn validName(name: []const u8) bool {
     if (name.len == 0 or name.len > NAME_MAX or !std.ascii.isAlphabetic(name[0])) return false;
@@ -134,11 +135,15 @@ pub fn validName(name: []const u8) bool {
 
 /// The bearer the runtime answers to, as 64 hex characters. Derived, so it is never written anywhere on this
 /// machine: HMAC-SHA256 under the server key of the user, the account and the generation.
-fn hotToken(app: *App, uid: u64, account: []const u8, gen: u32, out: *[64]u8) []const u8 {
+fn totToken(app: *App, uid: u64, account: []const u8, gen: u32, out: *[64]u8) []const u8 {
+    return tokenWith(app, "veil-tot-token", uid, account, gen, out);
+}
+
+fn tokenWith(app: *App, label: []const u8, uid: u64, account: []const u8, gen: u32, out: *[64]u8) []const u8 {
     const Hmac = std.crypto.auth.hmac.sha2.HmacSha256;
     var h = Hmac.init(&app.server_key);
     var nb: [48]u8 = undefined;
-    h.update("veil-hot-token");
+    h.update(label);
     h.update(std.fmt.bufPrint(&nb, "\x00u{d}\x00g{d}\x00", .{ uid, gen }) catch "");
     h.update(account);
     var mac: [Hmac.mac_length]u8 = undefined;
@@ -147,12 +152,12 @@ fn hotToken(app: *App, uid: u64, account: []const u8, gen: u32, out: *[64]u8) []
     return out;
 }
 
-/// Which hot.js this binary carries, as 16 hex characters.
+/// Which tot.js this binary carries, as 16 hex characters.
 fn scriptHash(out: *[16]u8) []const u8 {
     var h = std.crypto.hash.sha2.Sha256.init(.{});
-    h.update(HOT_JS);
+    h.update(TOT_JS);
     h.update("\x00");
-    h.update(HOT_PY);
+    h.update(TOT_PY);
     h.update("\x00");
     h.update(NEURON_MJS);
     h.update(NEURON_WASM);
@@ -220,15 +225,15 @@ fn uploadBody(a: std.mem.Allocator, boundary: []const u8, fresh: bool, x: Extras
     var out: std.ArrayListUnmanaged(u8) = .empty;
     try out.print(a, "--{s}\r\nContent-Disposition: form-data; name=\"metadata\"; filename=\"metadata.json\"\r\nContent-Type: application/json\r\n\r\n", .{boundary});
     try out.appendSlice(a, "{\"main_module\":\"" ++ MODULE ++ "\",\"compatibility_date\":\"" ++ COMPAT_DATE ++ "\"," ++
-        "\"bindings\":[{\"type\":\"ai\",\"name\":\"AI\"},{\"type\":\"durable_object_namespace\",\"name\":\"HOT\",\"class_name\":\"Hot\"}");
+        "\"bindings\":[{\"type\":\"ai\",\"name\":\"AI\"},{\"type\":\"durable_object_namespace\",\"name\":\"TOT\",\"class_name\":\"Tot\"}");
     if (x.python) try out.appendSlice(a, ",{\"type\":\"service\",\"name\":\"PY\",\"service\":\"" ++ PY_SCRIPT ++ "\"}");
     if (x.browser) try out.appendSlice(a, ",{\"type\":\"browser\",\"name\":\"BROWSER\"}");
     try out.appendSlice(a, "],\"keep_bindings\":[\"secret_text\"]");
-    if (fresh) try out.appendSlice(a, ",\"migrations\":{\"new_tag\":\"" ++ MIGRATION_TAG ++ "\",\"new_sqlite_classes\":[\"Hot\"]}");
+    if (fresh) try out.appendSlice(a, ",\"migrations\":{\"new_tag\":\"" ++ MIGRATION_TAG ++ "\",\"new_sqlite_classes\":[\"Tot\"]}");
     try out.print(a, "}}\r\n--{s}\r\nContent-Disposition: form-data; name=\"" ++ MODULE ++ "\"; filename=\"" ++ MODULE ++ "\"\r\nContent-Type: application/javascript+module\r\n\r\n", .{boundary});
-    try out.appendSlice(a, HOT_JS);
+    try out.appendSlice(a, TOT_JS);
     if (x.neuron) {
-        // the names are the ones hot.js imports: "./neuron-db.mjs" and "./neuron_core.wasm"
+        // the names are the ones tot.js imports: "./neuron-db.mjs" and "./neuron_core.wasm"
         try out.print(a, "\r\n--{s}\r\nContent-Disposition: form-data; name=\"neuron-db.mjs\"; filename=\"neuron-db.mjs\"\r\nContent-Type: application/javascript+module\r\n\r\n", .{boundary});
         try out.appendSlice(a, NEURON_MJS);
         try out.print(a, "\r\n--{s}\r\nContent-Disposition: form-data; name=\"neuron_core.wasm\"; filename=\"neuron_core.wasm\"\r\nContent-Type: application/wasm\r\n\r\n", .{boundary});
@@ -245,7 +250,7 @@ fn pyUploadBody(a: std.mem.Allocator, boundary: []const u8, native: []const []co
     try out.print(a, "--{s}\r\nContent-Disposition: form-data; name=\"metadata\"; filename=\"metadata.json\"\r\nContent-Type: application/json\r\n\r\n", .{boundary});
     try out.appendSlice(a, "{\"main_module\":\"" ++ PY_MODULE ++ "\",\"compatibility_date\":\"" ++ COMPAT_DATE ++ "\",\"compatibility_flags\":[\"python_workers\"]}");
     try out.print(a, "\r\n--{s}\r\nContent-Disposition: form-data; name=\"" ++ PY_MODULE ++ "\"; filename=\"" ++ PY_MODULE ++ "\"\r\nContent-Type: text/x-python\r\n\r\n", .{boundary});
-    try out.appendSlice(a, HOT_PY);
+    try out.appendSlice(a, TOT_PY);
     // A package with native code cannot be fetched by a running script; it is asked for here, by name, as an
     // empty module of the requirement type, and Cloudflare supplies its own build of it.
     for (native) |name| try out.print(a, "\r\n--{s}\r\nContent-Disposition: form-data; name=\"{s}\"; filename=\"{s}\"\r\nContent-Type: text/x-python-requirement\r\n\r\n", .{ boundary, name, name });
@@ -296,7 +301,7 @@ fn runtimeUrl(app: *App, a: std.mem.Allocator, sub: []const u8) ?[]const u8 {
     return std.fmt.allocPrint(a, "https://" ++ SCRIPT ++ ".{s}.workers.dev", .{sub}) catch null;
 }
 
-/// Make sure the account runs THIS binary's hot.js, and that `st` knows its address. Costs no call when the
+/// Make sure the account runs THIS binary's tot.js, and that `st` knows its address. Costs no call when the
 /// state already names this account and this script. Returns what went wrong in words a user can act on, or
 /// null; `uploaded` says whether a script went up just now (its address can take a few seconds to answer).
 fn ensureRuntime(app: *App, a: std.mem.Allocator, uid: u64, tok: Tok, st: *State, uploaded: *bool) ?[]const u8 {
@@ -330,10 +335,10 @@ fn ensureRuntime(app: *App, a: std.mem.Allocator, uid: u64, tok: Tok, st: *State
 
     var bb: [8]u8 = undefined;
     app.io.random(&bb);
-    const boundary = std.fmt.allocPrint(a, "----veilhot{s}", .{std.fmt.bytesToHex(bb, .lower)}) catch return "out of memory";
+    const boundary = std.fmt.allocPrint(a, "----veiltot{s}", .{std.fmt.bytesToHex(bb, .lower)}) catch return "out of memory";
     const ctype = std.fmt.allocPrint(a, "multipart/form-data; boundary={s}", .{boundary}) catch return "out of memory";
     // The Python Worker first: the runtime binds to it by name, so it has to exist. An account that does not take
-    // it (or the browser, below) still gets a hot - without that family of tools, and told why.
+    // it (or the browser, below) still gets a tot - without that family of tools, and told why.
     var note: []const u8 = "";
     const py_url = std.fmt.allocPrint(a, "{s}/accounts/{s}/workers/scripts/" ++ PY_SCRIPT, .{ root, acct }) catch return "out of memory";
     var py_why: []const u8 = "";
@@ -357,7 +362,7 @@ fn ensureRuntime(app: *App, a: std.mem.Allocator, uid: u64, tok: Tok, st: *State
         var refusal: []const u8 = "";
         for ([_]bool{ !exists, exists }) |fresh| {
             const body = uploadBody(a, boundary, fresh, x) catch return "out of memory";
-            const up = api(app, a, "PUT", script_url, body, tok.key, ctype) orelse return "could not reach the Cloudflare API to upload the hot runtime";
+            const up = api(app, a, "PUT", script_url, body, tok.key, ctype) orelse return "could not reach the Cloudflare API to upload the tot runtime";
             const e = firstError(a, up);
             if (e.len == 0) {
                 got = x;
@@ -370,7 +375,7 @@ fn ensureRuntime(app: *App, a: std.mem.Allocator, uid: u64, tok: Tok, st: *State
         const dropped: []const u8 = if (wi == 0) "the browser" else if (wi == 1) "neuron-db" else "Python";
         if (note.len < 300) note = std.fmt.allocPrint(a, "{s}{s}{s} is off: {s}", .{ note, if (note.len > 0) "; " else "", dropped, refusal }) catch note;
     }
-    const have = got orelse return explain(a, "uploading the hot runtime", up_err);
+    const have = got orelse return explain(a, "uploading the tot runtime", up_err);
     st.python = have.python;
     st.py_rung = py_rung orelse 0;
     st.py_check = if (have.python and st.py_rung + 1 < PY_NATIVE.len) PY_CHECKS else 0;
@@ -382,12 +387,12 @@ fn ensureRuntime(app: *App, a: std.mem.Allocator, uid: u64, tok: Tok, st: *State
 
     // Its token, as a secret binding. A small JSON body: it rides curl's stdin with the bearer, never a file.
     var tb: [64]u8 = undefined;
-    const token = hotToken(app, uid, acct, st.token_gen, &tb);
+    const token = totToken(app, uid, acct, st.token_gen, &tb);
     const secret_url = std.fmt.allocPrint(a, "{s}/secrets", .{script_url}) catch return "out of memory";
-    const secret_body = std.fmt.allocPrint(a, "{{\"name\":\"HOT_TOKEN\",\"text\":\"{s}\",\"type\":\"secret_text\"}}", .{token}) catch return "out of memory";
-    const sec = api(app, a, "PUT", secret_url, secret_body, tok.key, "application/json") orelse return "could not reach the Cloudflare API to set the hot runtime's token";
+    const secret_body = std.fmt.allocPrint(a, "{{\"name\":\"TOT_TOKEN\",\"text\":\"{s}\",\"type\":\"secret_text\"}}", .{token}) catch return "out of memory";
+    const sec = api(app, a, "PUT", secret_url, secret_body, tok.key, "application/json") orelse return "could not reach the Cloudflare API to set the tot runtime's token";
     const sec_err = firstError(a, sec);
-    if (sec_err.len > 0) return explain(a, "setting the hot runtime's token", sec_err);
+    if (sec_err.len > 0) return explain(a, "setting the tot runtime's token", sec_err);
 
     // Its workers.dev route. Best effort: a script that had it on keeps it on.
     const route_url = std.fmt.allocPrint(a, "{s}/subdomain", .{script_url}) catch return "out of memory";
@@ -399,7 +404,7 @@ fn ensureRuntime(app: *App, a: std.mem.Allocator, uid: u64, tok: Tok, st: *State
     st.deployed_at = nowS(app.io);
     st.last_error = "";
     uploaded.* = true;
-    log.info("hot runtime uploaded for u{d}: {s} ({s})", .{ uid, st.url, want });
+    log.info("tot runtime uploaded for u{d}: {s} ({s})", .{ uid, st.url, want });
     return null;
 }
 
@@ -409,11 +414,11 @@ const Reply = struct { ok: bool = false, err: []const u8 = "" };
 
 /// One call to the runtime; the reply lives in `a`. null: no address, an address this server will not send the
 /// token to, or no answer.
-fn hotCall(app: *App, a: std.mem.Allocator, uid: u64, st: State, method: []const u8, path: []const u8, body: []const u8) ?[]u8 {
+fn totCall(app: *App, a: std.mem.Allocator, uid: u64, st: State, method: []const u8, path: []const u8, body: []const u8) ?[]u8 {
     if (!allowedUrl(app, st.url)) return null;
     const url = std.fmt.allocPrint(a, "{s}{s}", .{ st.url, path }) catch return null;
     var tb: [64]u8 = undefined;
-    const token = hotToken(app, uid, st.account, st.token_gen, &tb);
+    const token = totToken(app, uid, st.account, st.token_gen, &tb);
     return api(app, a, method, url, body, token, if (body.len > 0) "application/json" else "");
 }
 
@@ -424,20 +429,20 @@ fn replyOf(a: std.mem.Allocator, raw: []const u8) Reply {
 
 /// Hand the runtime's answer to the client: its JSON as it is when it said ok, its own error otherwise.
 fn relay(res: *httpz.Response, a: std.mem.Allocator, raw: ?[]u8) !void {
-    const body = raw orelse return http.serverErr(res, "the hot runtime did not answer - is it deployed, and is this machine online?");
+    const body = raw orelse return http.serverErr(res, "the tot runtime did not answer - is it deployed, and is this machine online?");
     const r = replyOf(a, body);
-    if (!r.ok) return badReq(res, if (r.err.len > 0) r.err else "the hot runtime gave an unreadable answer (a new deployment can take a minute to come up)");
+    if (!r.ok) return badReq(res, if (r.err.len > 0) r.err else "the tot runtime gave an unreadable answer (a new deployment can take a minute to come up)");
     res.content_type = .JSON;
     res.body = try res.arena.dupe(u8, body);
 }
 
-/// requireUser + admin, replying 403 like the scheduled tasks: a hot allowed onto the owner's machine fires
-/// full-tool chat turns there, and a hot of any kind spends the account's Workers AI.
+/// requireUser + admin, replying 403 like the scheduled tasks: a tot allowed onto the owner's machine fires
+/// full-tool chat turns there, and a tot of any kind spends the account's Workers AI.
 fn gate(app: *App, req: *httpz.Request, res: *httpz.Response) ?http.User {
     const u = http.requireUser(app, req, res) orelse return null;
     if (!app.auth.isAdmin(u)) {
         res.status = 403;
-        res.json(.{ .ok = false, .err = "hots are admin-only for now" }, .{}) catch {};
+        res.json(.{ .ok = false, .err = "tots are admin-only for now" }, .{}) catch {};
         return null;
     }
     return u;
@@ -450,9 +455,9 @@ fn tokOf(app: *App, uid: u64, a: std.mem.Allocator) ?Tok {
 
 // ---------------------------------------------------------------------------------- HTTP handlers
 
-/// GET /api/v1/hots — the roster as the runtime reports it, plus what this server knows: connected, deployed,
-/// the address, which hots may use this machine, and the last deployment error.
-pub fn listHots(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
+/// GET /api/v1/tots — the roster as the runtime reports it, plus what this server knows: connected, deployed,
+/// the address, which tots may use this machine, and the last deployment error.
+pub fn listTots(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const u = gate(app, req, res) orelse return;
     var arena = std.heap.ArenaAllocator.init(app.gpa);
     defer arena.deinit();
@@ -462,30 +467,30 @@ pub fn listHots(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const st = readState(app, u.id, a);
     var hb: [16]u8 = undefined;
     const deployed = st.url.len > 0;
-    var hots: []const u8 = "[]";
+    var tots: []const u8 = "[]";
     var reachable = false;
     if (deployed) {
-        if (hotCall(app, a, u.id, st, "GET", "/v1/hots", "")) |raw| {
-            const R = struct { ok: bool = false, hots: std.json.Value = .null };
+        if (totCall(app, a, u.id, st, "GET", "/v1/tots", "")) |raw| {
+            const R = struct { ok: bool = false, tots: std.json.Value = .null };
             if (std.json.parseFromSliceLeaky(R, a, raw, .{ .ignore_unknown_fields = true })) |r| {
-                if (r.ok and r.hots == .array) {
+                if (r.ok and r.tots == .array) {
                     reachable = true;
-                    // each hot's local folder, relative to the data dir (the desk's Open folder)
-                    for (r.hots.array.items) |*v| {
+                    // each tot's local folder, relative to the data dir (the desk's Open folder)
+                    for (r.tots.array.items) |*v| {
                         if (v.* != .object) continue;
-                        const h = std.json.parseFromValueLeaky(RosterHot, a, v.*, .{ .ignore_unknown_fields = true }) catch continue;
+                        const h = std.json.parseFromValueLeaky(RosterTot, a, v.*, .{ .ignore_unknown_fields = true }) catch continue;
                         var fb: [160]u8 = undefined;
-                        const rel = hotFolder(&fb, u.id, h.name, h.created) orelse continue;
+                        const rel = totFolder(&fb, u.id, h.name, h.created) orelse continue;
                         v.object.put(a, "folder", .{ .string = a.dupe(u8, rel) catch continue }) catch {};
                     }
-                    hots = std.json.Stringify.valueAlloc(a, r.hots, .{}) catch "[]";
+                    tots = std.json.Stringify.valueAlloc(a, r.tots, .{}) catch "[]";
                 }
             } else |_| {}
         }
     }
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(app.gpa);
-    try out.print(app.gpa, "{{\"ok\":true,\"connected\":{},\"deployed\":{},\"reachable\":{},\"current\":{},\"max\":{d},\"primary\":\"" ++ PRIMARY ++ "\",\"url\":", .{ connected, deployed, reachable, std.mem.eql(u8, st.script_hash, scriptHash(&hb)), MAX_HOTS });
+    try out.print(app.gpa, "{{\"ok\":true,\"connected\":{},\"deployed\":{},\"reachable\":{},\"current\":{},\"max\":{d},\"primary\":\"" ++ PRIMARY ++ "\",\"url\":", .{ connected, deployed, reachable, std.mem.eql(u8, st.script_hash, scriptHash(&hb)), MAX_TOTS });
     try http.jstr(app.gpa, &out, st.url);
     try out.appendSlice(app.gpa, ",\"local\":[");
     for (st.local, 0..) |n, i| {
@@ -495,9 +500,13 @@ pub fn listHots(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     try out.print(app.gpa, "],\"python\":{},\"browser\":{},\"neuron\":{},\"tools_note\":", .{ st.python, st.browser, st.neuron });
     try http.jstr(app.gpa, &out, st.tools_note);
     try out.appendSlice(app.gpa, ",\"last_error\":");
-    try http.jstr(app.gpa, &out, st.last_error);
-    try out.appendSlice(app.gpa, ",\"hots\":");
-    try out.appendSlice(app.gpa, hots);
+    if (readLegacy(app, u.id, a)) |old| {
+        const why = if (old.last_error.len > 0) old.last_error else "it happens in the background within a minute or two";
+        try http.jstr(app.gpa, &out, try std.fmt.allocPrint(a, "hots are called tots now; yours are being moved across: {s}", .{why}));
+    } else try http.jstr(app.gpa, &out, st.last_error);
+    try out.print(app.gpa, ",\"moving\":{}", .{readLegacy(app, u.id, a) != null});
+    try out.appendSlice(app.gpa, ",\"tots\":");
+    try out.appendSlice(app.gpa, tots);
     try out.append(app.gpa, '}');
     res.content_type = .JSON;
     res.body = try res.arena.dupe(u8, out.items);
@@ -516,14 +525,19 @@ const CreateReq = struct {
     local: bool = false, // the owner's-machine checkbox: only ever granted here, at deployment
 };
 
-/// POST /api/v1/hots — deploy a hot. Uploads the runtime first when the account lacks it or runs an older one.
-pub fn createHot(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
+/// POST /api/v1/tots — deploy a tot. Uploads the runtime first when the account lacks it or runs an older one.
+pub fn createTot(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const u = gate(app, req, res) orelse return;
     const body = (req.json(CreateReq) catch return badReq(res, "malformed JSON body")) orelse return badReq(res, "bad body");
     var arena = std.heap.ArenaAllocator.init(app.gpa);
     defer arena.deinit();
     const a = arena.allocator();
     const tok = tokOf(app, u.id, a) orelse return badReq(res, "not connected to Cloudflare - log in with Cloudflare first");
+    // Hots from before the rename go across first, so a new tot never lands beside an old Worker still running.
+    if (readLegacy(app, u.id, a)) |old| if (old.account.len == 0 or std.mem.eql(u8, old.account, tok.account_id)) {
+        if (moveFromHots(app, a, u.id, tok)) |msg|
+            return badReq(res, try std.fmt.allocPrint(res.arena, "your hots are being moved to tots and that is not finished: {s}. Try again in a minute", .{msg}));
+    };
     switch (deploy(app, a, u.id, tok, body)) {
         .ok => |raw| {
             res.status = 201;
@@ -546,14 +560,14 @@ fn sentJson(a: std.mem.Allocator, s: Sent) ?[]const u8 {
     return std.fmt.allocPrint(a, "{s},\"text_max\":{d}}}", .{ body[0 .. body.len - 1], s.text_max }) catch null;
 }
 
-/// createHot without the request: validate, make sure the runtime is up, create the hot, record a local grant.
+/// createTot without the request: validate, make sure the runtime is up, create the tot, record a local grant.
 fn deploy(app: *App, a: std.mem.Allocator, uid: u64, tok: Tok, body: CreateReq) Deployed {
     const name = std.mem.trim(u8, body.name, " \r\n\t");
-    if (name.len > 0 and !validName(name)) return .{ .err = "a hot's name is 1-24 letters, digits, - or _, starting with a letter" };
+    if (name.len > 0 and !validName(name)) return .{ .err = "a tot's name is 1-24 letters, digits, - or _, starting with a letter" };
     if (std.mem.trim(u8, body.goal, " \r\n\t").len < 3 and std.mem.trim(u8, body.charter, " \r\n\t").len < 3)
-        return .{ .err = "a hot needs a goal or a charter to work toward" };
+        return .{ .err = "a tot needs a goal or a charter to work toward" };
     const model = if (body.model.len > 0) body.model else modelcfg.defaults.cf_model;
-    if (model[0] != '@') return .{ .err = "a hot runs on the account's Workers AI: pick an @cf/ model" };
+    if (model[0] != '@') return .{ .err = "a tot runs on the account's Workers AI: pick an @cf/ model" };
     const limit = modelcfg.goalCharLimit(model);
     if (body.goal.len > limit or body.charter.len > limit)
         return .{ .err = std.fmt.allocPrint(a, "on {s} a goal or a charter holds at most {d} characters - shorten it, or pick a model with a bigger window", .{ model, limit }) catch "goal too long for this model" };
@@ -574,20 +588,20 @@ fn deploy(app: *App, a: std.mem.Allocator, uid: u64, tok: Tok, body: CreateReq) 
     // A workers.dev address that was enabled a moment ago answers with Cloudflare's own page for a few seconds.
     var attempt: usize = 0;
     const raw = while (true) : (attempt += 1) {
-        if (hotCall(app, a, uid, st, "POST", "/v1/hots", json)) |r| {
+        if (totCall(app, a, uid, st, "POST", "/v1/tots", json)) |r| {
             const rep = replyOf(a, r);
             if (rep.ok) break r;
-            if (rep.err.len > 0) return .{ .err = a.dupe(u8, rep.err) catch "the hot runtime refused" };
+            if (rep.err.len > 0) return .{ .err = a.dupe(u8, rep.err) catch "the tot runtime refused" };
         }
-        if (!uploaded or attempt >= 8) return .{ .err = "the hot runtime did not answer - a new deployment can take a minute to come up; deploy again" };
+        if (!uploaded or attempt >= 8) return .{ .err = "the tot runtime did not answer - a new deployment can take a minute to come up; deploy again" };
         if (!builtin.is_test) bu.sleepMs(2500);
     };
     if (body.local) {
-        const Made = struct { hot: struct { name: []const u8 = "" } = .{} };
+        const Made = struct { tot: struct { name: []const u8 = "" } = .{} };
         const made = std.json.parseFromSliceLeaky(Made, a, raw, .{ .ignore_unknown_fields = true }) catch Made{};
-        if (validName(made.hot.name)) {
+        if (validName(made.tot.name)) {
             st = readState(app, uid, a);
-            st.local = withName(a, st.local, made.hot.name);
+            st.local = withName(a, st.local, made.tot.name);
             writeState(app, uid, st);
         }
     }
@@ -616,44 +630,44 @@ fn withoutName(a: std.mem.Allocator, list: []const []const u8, name: []const u8)
 fn nameParam(req: *httpz.Request, res: *httpz.Response) ?[]const u8 {
     const name = req.param("name") orelse "";
     if (!validName(name)) {
-        badReq(res, "bad hot name") catch {};
+        badReq(res, "bad tot name") catch {};
         return null;
     }
     return name;
 }
 
-/// DELETE /api/v1/hots/:name — delete one hot: its storage and its alarm go with it, and so does its grant here.
-pub fn deleteHot(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
+/// DELETE /api/v1/tots/:name — delete one tot: its storage and its alarm go with it, and so does its grant here.
+pub fn deleteTot(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const u = gate(app, req, res) orelse return;
     const name = nameParam(req, res) orelse return;
     var arena = std.heap.ArenaAllocator.init(app.gpa);
     defer arena.deinit();
     const a = arena.allocator();
     var st = readState(app, u.id, a);
-    const path = try std.fmt.allocPrint(a, "/v1/hots/{s}", .{name});
-    const raw = hotCall(app, a, u.id, st, "DELETE", path, "");
+    const path = try std.fmt.allocPrint(a, "/v1/tots/{s}", .{name});
+    const raw = totCall(app, a, u.id, st, "DELETE", path, "");
     const r = raw orelse return relay(res, a, raw);
     if (!replyOf(a, r).ok) return relay(res, a, raw);
     st.local = withoutName(a, st.local, name);
     writeState(app, u.id, st);
-    // The Worker exists for its hots: when the last one goes, so does the Worker, and the account is left as it was.
+    // The Worker exists for its tots: when the last one goes, so does the Worker, and the account is left as it was.
     // While others remain it stays, because they live in it.
     var left: usize = 1;
-    if (hotCall(app, a, u.id, st, "GET", "/v1/hots", "")) |list| {
-        const L = struct { ok: bool = false, hots: []const std.json.Value = &.{} };
+    if (totCall(app, a, u.id, st, "GET", "/v1/tots", "")) |list| {
+        const L = struct { ok: bool = false, tots: []const std.json.Value = &.{} };
         if (std.json.parseFromSliceLeaky(L, a, list, .{ .ignore_unknown_fields = true })) |l| {
-            if (l.ok) left = l.hots.len;
+            if (l.ok) left = l.tots.len;
         } else |_| {}
     }
-    if (left > 0) return res.json(.{ .ok = true, .deleted = name, .worker_removed = false, .hots_left = left }, .{});
+    if (left > 0) return res.json(.{ .ok = true, .deleted = name, .worker_removed = false, .tots_left = left }, .{});
     const tok = tokOf(app, u.id, a) orelse
-        return res.json(.{ .ok = true, .deleted = name, .worker_removed = false, .note = "that was the last hot; log in with Cloudflare again and run teardown to remove the Worker" }, .{});
+        return res.json(.{ .ok = true, .deleted = name, .worker_removed = false, .note = "that was the last tot; log in with Cloudflare again and run teardown to remove the Worker" }, .{});
     if (removeScript(app, a, u.id, tok, &st)) |msg|
         return res.json(.{ .ok = true, .deleted = name, .worker_removed = false, .note = msg }, .{});
-    try res.json(.{ .ok = true, .deleted = name, .worker_removed = true, .hots_left = 0 }, .{});
+    try res.json(.{ .ok = true, .deleted = name, .worker_removed = true, .tots_left = 0 }, .{});
 }
 
-/// Delete the Worker script (and with it every hot's storage) and start a new token generation. Null on success,
+/// Delete the Worker script (and with it every tot's storage) and start a new token generation. Null on success,
 /// Cloudflare's own words otherwise. A script that is already gone counts as removed.
 fn removeScript(app: *App, a: std.mem.Allocator, uid: u64, tok: Tok, st: *State) ?[]const u8 {
     const acct = if (st.account.len > 0) st.account else tok.account_id;
@@ -661,18 +675,18 @@ fn removeScript(app: *App, a: std.mem.Allocator, uid: u64, tok: Tok, st: *State)
     const raw = api(app, a, "DELETE", url, "", tok.key, "") orelse return "could not reach the Cloudflare API to remove the Worker";
     const msg = firstError(a, raw);
     if (msg.len > 0 and std.ascii.indexOfIgnoreCase(msg, "not found") == null and std.ascii.indexOfIgnoreCase(msg, "does not exist") == null)
-        return explain(a, "removing the hot runtime", msg);
+        return explain(a, "removing the tot runtime", msg);
     // Its Python Worker goes after it (the runtime was bound to it). Best effort: it holds nothing.
     const py_url = std.fmt.allocPrint(a, "{s}/accounts/{s}/workers/scripts/" ++ PY_SCRIPT ++ "?force=true", .{ app.cf_api_root, acct }) catch return "out of memory";
     _ = api(app, a, "DELETE", py_url, "", tok.key, "");
     // A new generation: a later deployment gets a token the removed script never held.
     st.* = .{ .token_gen = st.token_gen +% 1 };
     writeState(app, uid, st.*);
-    log.info("hot runtime removed from the Cloudflare account of u{d}", .{uid});
+    log.info("tot runtime removed from the Cloudflare account of u{d}", .{uid});
     return null;
 }
 
-/// DELETE /api/v1/hots — take the runtime out of the account: the script, every hot and everything they stored.
+/// DELETE /api/v1/tots — take the runtime out of the account: the script, every tot and everything they stored.
 pub fn teardown(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const u = gate(app, req, res) orelse return;
     var arena = std.heap.ArenaAllocator.init(app.gpa);
@@ -681,11 +695,20 @@ pub fn teardown(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const tok = tokOf(app, u.id, a) orelse return badReq(res, "not connected to Cloudflare - log in with Cloudflare first");
     var st = readState(app, u.id, a);
     if (removeScript(app, a, u.id, tok, &st)) |msg| return badReq(res, msg);
+    // and a deployment from before the rename, if one was never moved
+    if (readLegacy(app, u.id, a)) |old| if (old.account.len == 0 or std.mem.eql(u8, old.account, tok.account_id)) {
+        for ([_][]const u8{ LEGACY_SCRIPT, LEGACY_PY_SCRIPT }) |script| {
+            const url = try std.fmt.allocPrint(a, "{s}/accounts/{s}/workers/scripts/{s}?force=true", .{ app.cf_api_root, if (old.account.len > 0) old.account else tok.account_id, script });
+            _ = api(app, a, "DELETE", url, "", tok.key, "");
+        }
+        var pb: [700]u8 = undefined;
+        if (legacyPath(app, u.id, &pb)) |p| std.Io.Dir.cwd().deleteFile(app.io, p) catch {};
+    };
     try res.json(.{ .ok = true, .removed = true }, .{});
 }
 
-/// GET /api/v1/hots/:name/events?after=N — the hot's event tail, as the runtime serves it.
-pub fn hotEvents(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
+/// GET /api/v1/tots/:name/events?after=N — the tot's event tail, as the runtime serves it.
+pub fn totEvents(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const u = gate(app, req, res) orelse return;
     const name = nameParam(req, res) orelse return;
     var arena = std.heap.ArenaAllocator.init(app.gpa);
@@ -693,8 +716,8 @@ pub fn hotEvents(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const a = arena.allocator();
     const q = try req.query();
     const after = std.fmt.parseInt(u64, q.get("after") orelse "0", 10) catch 0;
-    const path = try std.fmt.allocPrint(a, "/v1/hots/{s}/events?after={d}&limit=200", .{ name, after });
-    try relay(res, a, hotCall(app, a, u.id, readState(app, u.id, a), "GET", path, ""));
+    const path = try std.fmt.allocPrint(a, "/v1/tots/{s}/events?after={d}&limit=200", .{ name, after });
+    try relay(res, a, totCall(app, a, u.id, readState(app, u.id, a), "GET", path, ""));
 }
 
 const TextReq = struct { text: []const u8 = "" };
@@ -703,8 +726,8 @@ fn textBody(a: std.mem.Allocator, text: []const u8) ?[]const u8 {
     return std.json.Stringify.valueAlloc(a, TextReq{ .text = text }, .{}) catch null;
 }
 
-/// POST /api/v1/hots/:name/command {text} — "/goal ...", "/pause", "/queue ...", or plain words for its inbox.
-pub fn hotCommand(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
+/// POST /api/v1/tots/:name/command {text} — "/goal ...", "/pause", "/queue ...", or plain words for its inbox.
+pub fn totCommand(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const u = gate(app, req, res) orelse return;
     const name = nameParam(req, res) orelse return;
     const body = (req.json(TextReq) catch return badReq(res, "malformed JSON body")) orelse return badReq(res, "bad body");
@@ -712,9 +735,9 @@ pub fn hotCommand(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     var arena = std.heap.ArenaAllocator.init(app.gpa);
     defer arena.deinit();
     const a = arena.allocator();
-    const path = try std.fmt.allocPrint(a, "/v1/hots/{s}/command", .{name});
+    const path = try std.fmt.allocPrint(a, "/v1/tots/{s}/command", .{name});
     const json = textBody(a, body.text) orelse return http.serverErr(res, "out of memory");
-    try relay(res, a, hotCall(app, a, u.id, readState(app, u.id, a), "POST", path, json));
+    try relay(res, a, totCall(app, a, u.id, readState(app, u.id, a), "POST", path, json));
 }
 
 const ConfigReq = struct {
@@ -726,24 +749,24 @@ const ConfigReq = struct {
     paused: ?bool = null,
 };
 
-/// POST /api/v1/hots/:name/config — change a hot's settings. There is no `local` here: the owner's machine is
+/// POST /api/v1/tots/:name/config — change a tot's settings. There is no `local` here: the owner's machine is
 /// granted at deployment or not at all.
-pub fn hotConfig(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
+pub fn totConfig(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const u = gate(app, req, res) orelse return;
     const name = nameParam(req, res) orelse return;
     const body = (req.json(ConfigReq) catch return badReq(res, "malformed JSON body")) orelse return badReq(res, "bad body");
-    if (body.model) |m| if (m.len == 0 or m[0] != '@') return badReq(res, "a hot runs on the account's Workers AI: pick an @cf/ model");
+    if (body.model) |m| if (m.len == 0 or m[0] != '@') return badReq(res, "a tot runs on the account's Workers AI: pick an @cf/ model");
     var arena = std.heap.ArenaAllocator.init(app.gpa);
     defer arena.deinit();
     const a = arena.allocator();
-    const path = try std.fmt.allocPrint(a, "/v1/hots/{s}/config", .{name});
+    const path = try std.fmt.allocPrint(a, "/v1/tots/{s}/config", .{name});
     var json = std.json.Stringify.valueAlloc(a, body, .{ .emit_null_optional_fields = false }) catch return http.serverErr(res, "out of memory");
     // a new model brings its own text limit
     if (body.model) |m| json = std.fmt.allocPrint(a, "{s}{s}\"text_max\":{d}}}", .{ json[0 .. json.len - 1], if (json.len > 2) "," else "", modelcfg.goalCharLimit(m) }) catch json;
-    try relay(res, a, hotCall(app, a, u.id, readState(app, u.id, a), "POST", path, json));
+    try relay(res, a, totCall(app, a, u.id, readState(app, u.id, a), "POST", path, json));
 }
 
-/// GET /api/v1/hots/pad?after=N — the scratchpad the account's hots share.
+/// GET /api/v1/tots/pad?after=N — the scratchpad the account's tots share.
 pub fn padRead(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const u = gate(app, req, res) orelse return;
     var arena = std.heap.ArenaAllocator.init(app.gpa);
@@ -752,10 +775,10 @@ pub fn padRead(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const q = try req.query();
     const after = std.fmt.parseInt(u64, q.get("after") orelse "0", 10) catch 0;
     const path = try std.fmt.allocPrint(a, "/v1/pad?after={d}", .{after});
-    try relay(res, a, hotCall(app, a, u.id, readState(app, u.id, a), "GET", path, ""));
+    try relay(res, a, totCall(app, a, u.id, readState(app, u.id, a), "GET", path, ""));
 }
 
-/// POST /api/v1/hots/pad {text} — the human writes to the shared scratchpad.
+/// POST /api/v1/tots/pad {text} — the human writes to the shared scratchpad.
 pub fn padWrite(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const u = gate(app, req, res) orelse return;
     const body = (req.json(TextReq) catch return badReq(res, "malformed JSON body")) orelse return badReq(res, "bad body");
@@ -764,24 +787,24 @@ pub fn padWrite(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     defer arena.deinit();
     const a = arena.allocator();
     const json = textBody(a, body.text) orelse return http.serverErr(res, "out of memory");
-    try relay(res, a, hotCall(app, a, u.id, readState(app, u.id, a), "POST", "/v1/pad", json));
+    try relay(res, a, totCall(app, a, u.id, readState(app, u.id, a), "POST", "/v1/pad", json));
 }
 
-/// POST /api/v1/hots/pad/clear — empty the shared scratchpad, for the next set of hots. The local mirror of it is
-/// kept first, renamed with the time it was cleared, so nothing the hots wrote is lost.
+/// POST /api/v1/tots/pad/clear — empty the shared scratchpad, for the next set of tots. The local mirror of it is
+/// kept first, renamed with the time it was cleared, so nothing the tots wrote is lost.
 pub fn padClear(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const u = gate(app, req, res) orelse return;
     var arena = std.heap.ArenaAllocator.init(app.gpa);
     defer arena.deinit();
     const a = arena.allocator();
-    const raw = hotCall(app, a, u.id, readState(app, u.id, a), "POST", "/v1/pad/clear", "{}");
+    const raw = totCall(app, a, u.id, readState(app, u.id, a), "POST", "/v1/pad/clear", "{}");
     if (raw) |r| if (replyOf(a, r).ok) archivePad(app, a, u.id);
     try relay(res, a, raw);
 }
 
-/// _hots/scratchpad.md -> _hots/scratchpad-<YYYYMMDD-HHMMSS>.md (UTC), when there is one.
+/// _tots/scratchpad.md -> _tots/scratchpad-<YYYYMMDD-HHMMSS>.md (UTC), when there is one.
 fn archivePad(app: *App, a: std.mem.Allocator, uid: u64) void {
-    const dir = std.fmt.allocPrint(a, "{s}/u{d}/_hots", .{ app.data, uid }) catch return;
+    const dir = std.fmt.allocPrint(a, "{s}/u{d}/_tots", .{ app.data, uid }) catch return;
     const cur = std.fmt.allocPrint(a, "{s}/scratchpad.md", .{dir}) catch return;
     const body = std.Io.Dir.cwd().readFileAlloc(app.io, cur, a, .limited(16 << 20)) catch return;
     var tb: [24]u8 = undefined;
@@ -803,7 +826,7 @@ fn archivePad(app: *App, a: std.mem.Allocator, uid: u64) void {
 
 const KeyReq = struct { name: []const u8 = "", value: []const u8 = "" };
 
-/// The search keys a hot's web_search uses before the keyless sources: the name a human types, and the secret
+/// The search keys a tot's web_search uses before the keyless sources: the name a human types, and the secret
 /// binding the runtime reads.
 fn keySecret(name: []const u8) ?[]const u8 {
     if (std.ascii.eqlIgnoreCase(name, "brave")) return "BRAVE_KEY";
@@ -812,7 +835,7 @@ fn keySecret(name: []const u8) ?[]const u8 {
     return null;
 }
 
-/// POST /api/v1/hots/keys {name, value} — set (or, with an empty value, remove) a search key on the runtime. The
+/// POST /api/v1/tots/keys {name, value} — set (or, with an empty value, remove) a search key on the runtime. The
 /// key becomes a secret binding of the Worker: it rides curl's stdin on its way there and is never written here.
 pub fn setKey(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const u = gate(app, req, res) orelse return;
@@ -826,7 +849,7 @@ pub fn setKey(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const a = arena.allocator();
     const tok = tokOf(app, u.id, a) orelse return badReq(res, "not connected to Cloudflare - log in with Cloudflare first");
     const st = readState(app, u.id, a);
-    if (st.url.len == 0) return badReq(res, "deploy a hot first: the key is kept on the hots' Worker");
+    if (st.url.len == 0) return badReq(res, "deploy a tot first: the key is kept on the tots' Worker");
     const base = try std.fmt.allocPrint(a, "{s}/accounts/{s}/workers/scripts/" ++ SCRIPT ++ "/secrets", .{ app.cf_api_root, st.account });
     const raw = if (value.len == 0)
         api(app, a, "DELETE", try std.fmt.allocPrint(a, "{s}/{s}", .{ base, secret }), "", tok.key, "")
@@ -842,22 +865,22 @@ pub fn setKey(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
 const Job = struct { id: []const u8 = "", t: i64 = 0, instruction: []const u8 = "" };
 const Jobs = struct { ok: bool = false, model: []const u8 = "", jobs: []const Job = &.{} };
 
-/// The conversation one job runs in: "hot_<name>_<job id>_<queued at, seconds>". The stamp keeps a job of a hot
-/// that was deleted and deployed again under the same name out of the old hot's conversation.
+/// The conversation one job runs in: "tot_<name>_<job id>_<queued at, seconds>". The stamp keeps a job of a tot
+/// that was deleted and deployed again under the same name out of the old tot's conversation.
 fn jobConv(buf: *[64]u8, name: []const u8, job: Job) ?[]const u8 {
     if (!validName(name) or job.id.len == 0 or job.id.len > 12) return null;
     for (job.id) |c| if (!std.ascii.isAlphanumeric(c)) return null;
     var lb: [NAME_MAX]u8 = undefined;
-    return std.fmt.bufPrint(buf, "hot_{s}_{s}_{d}", .{ std.ascii.lowerString(&lb, name), job.id, @divTrunc(@max(job.t, 0), 1000) }) catch null;
+    return std.fmt.bufPrint(buf, "tot_{s}_{s}_{d}", .{ std.ascii.lowerString(&lb, name), job.id, @divTrunc(@max(job.t, 0), 1000) }) catch null;
 }
 
-/// What the unattended turn is told: the hot's instruction, then who sent it and how the turn must end.
+/// What the unattended turn is told: the tot's instruction, then who sent it and how the turn must end.
 fn jobText(a: std.mem.Allocator, name: []const u8, instruction: []const u8) ?[]const u8 {
     return std.fmt.allocPrint(a,
         \\{s}
         \\
-        \\--- HOT JOB CONTEXT (engine-authored) ---
-        \\This job was sent by {s}, a hot: an autonomous technician that works for this machine's owner from their Cloudflare account. The owner allowed it to use this machine when deploying it. Nobody is watching this turn: do the work with your tools, never ask a question and wait, and end with a plain report of what was done and what the tool results showed. Your final message is sent back to {s} as the job's result.
+        \\--- TOT JOB CONTEXT (engine-authored) ---
+        \\This job was sent by {s}, a tot: an autonomous technician that works for this machine's owner from their Cloudflare account. The owner allowed it to use this machine when deploying it. Nobody is watching this turn: do the work with your tools, never ask a question and wait, and end with a plain report of what was done and what the tool results showed. Your final message is sent back to {s} as the job's result.
     , .{ instruction, name, name }) catch null;
 }
 
@@ -881,21 +904,21 @@ fn lastAssistant(app: *App, a: std.mem.Allocator, uid: u64, conv: []const u8, st
 }
 
 fn postResult(app: *App, a: std.mem.Allocator, uid: u64, st: State, name: []const u8, job_id: []const u8, ok: bool, result: []const u8) void {
-    const path = std.fmt.allocPrint(a, "/v1/hots/{s}/jobs/{s}", .{ name, job_id }) catch return;
+    const path = std.fmt.allocPrint(a, "/v1/tots/{s}/jobs/{s}", .{ name, job_id }) catch return;
     const clipped = result[0..@min(result.len, 6000)];
     const json = std.json.Stringify.valueAlloc(a, .{ .ok = ok, .result = clipped }, .{}) catch return;
-    _ = hotCall(app, a, uid, st, "POST", path, json);
+    _ = totCall(app, a, uid, st, "POST", path, json);
 }
 
-/// One approved hot, one pass: answer the jobs whose turn has ended, and start the next one. One job runs at a
-/// time per hot. Returns how many turns it started.
-fn bridgeHot(app: *App, a: std.mem.Allocator, uid: u64, st: State, name: []const u8) usize {
-    const raw = hotCall(app, a, uid, st, "GET", std.fmt.allocPrint(a, "/v1/hots/{s}/jobs", .{name}) catch return 0, "") orelse return 0;
+/// One approved tot, one pass: answer the jobs whose turn has ended, and start the next one. One job runs at a
+/// time per tot. Returns how many turns it started.
+fn bridgeTot(app: *App, a: std.mem.Allocator, uid: u64, st: State, name: []const u8) usize {
+    const raw = totCall(app, a, uid, st, "GET", std.fmt.allocPrint(a, "/v1/tots/{s}/jobs", .{name}) catch return 0, "") orelse return 0;
     const jobs = std.json.parseFromSliceLeaky(Jobs, a, raw, .{ .ignore_unknown_fields = true }) catch return 0;
     if (!jobs.ok) return 0;
     var lb: [NAME_MAX]u8 = undefined;
     var pb: [40]u8 = undefined;
-    const prefix = std.fmt.bufPrint(&pb, "hot_{s}_", .{std.ascii.lowerString(&lb, name)}) catch return 0;
+    const prefix = std.fmt.bufPrint(&pb, "tot_{s}_", .{std.ascii.lowerString(&lb, name)}) catch return 0;
     var started: usize = 0;
     for (jobs.jobs) |job| {
         var cb: [64]u8 = undefined;
@@ -920,7 +943,7 @@ fn bridgeHot(app: *App, a: std.mem.Allocator, uid: u64, st: State, name: []const
     return started;
 }
 
-/// Start the unattended chat turn for one job, on the owner's Cloudflare login and the hot's own model.
+/// Start the unattended chat turn for one job, on the owner's Cloudflare login and the tot's own model.
 fn launchJob(app: *App, a: std.mem.Allocator, uid: u64, name: []const u8, conv: []const u8, model: []const u8, instruction: []const u8) bool {
     const cf = cf_oauth.resolveToken(app, uid, a) orelse return false; // logged out: the job waits
     const text = jobText(a, name, instruction) orelse return false;
@@ -928,33 +951,33 @@ fn launchJob(app: *App, a: std.mem.Allocator, uid: u64, name: []const u8, conv: 
     if (!chat_engine.tryBeginTurn(app.io, conv)) return false;
     // loop=1: the drive loop carries the turn to a finished answer with nobody there, as a scheduled run does.
     chat_engine.spawnTurn(app, uid, conv, trio, text, 1, false, "", false, false);
-    log.info("hot {s}: job started on this machine in conversation {s}", .{ name, conv });
+    log.info("tot {s}: job started on this machine in conversation {s}", .{ name, conv });
     return true;
 }
 
 // ---------------------------------------------------------------------------------- the local folder
 //
-// Every hot a user deploys gets a folder on this machine, one per deployment ("run"), that this server keeps
-// up to date from the runtime: {data}/u<uid>/_hots/<name>-<deployed, UTC>/ holds
+// Every tot a user deploys gets a folder on this machine, one per deployment ("run"), that this server keeps
+// up to date from the runtime: {data}/u<uid>/_tots/<name>-<deployed, UTC>/ holds
 //   events.log     one readable line per event (tail it), events.jsonl the same events as the runtime wrote them,
-//   status.json    the hot's latest status, notes/   the hot's own notes, one file each,
-// and {data}/u<uid>/_hots/scratchpad.md is the scratchpad the account's hots share. The desk's Open folder button
-// opens a hot's folder. A pass asks only for what moved (the roster carries each hot's event seq and notes
-// revision, and the pad's seq), so an idle hot costs one roster call a minute. A hot that is deleted keeps its
+//   status.json    the tot's latest status, notes/   the tot's own notes, one file each,
+// and {data}/u<uid>/_tots/scratchpad.md is the scratchpad the account's tots share. The desk's Open folder button
+// opens a tot's folder. A pass asks only for what moved (the roster carries each tot's event seq and notes
+// revision, and the pad's seq), so an idle tot costs one roster call a minute. A tot that is deleted keeps its
 // folder: it is the user's record of the run.
 
 const MIRROR_EVERY_TICKS: u32 = 3; // one mirror pass every third bridge tick (60 s)
 const EVENTS_PAGE: u32 = 500;
-const PAGES_MAX: usize = 8; // a pass reads at most this many pages per hot; the next pass continues
+const PAGES_MAX: usize = 8; // a pass reads at most this many pages per tot; the next pass continues
 
-/// Where one deployment of a hot is mirrored, relative to the data dir: u<uid>/_hots/<name>-<YYYYMMDD-HHMMSS>.
-pub fn hotFolder(buf: []u8, uid: u64, name: []const u8, created_ms: i64) ?[]const u8 {
+/// Where one deployment of a tot is mirrored, relative to the data dir: u<uid>/_tots/<name>-<YYYYMMDD-HHMMSS>.
+pub fn totFolder(buf: []u8, uid: u64, name: []const u8, created_ms: i64) ?[]const u8 {
     if (!validName(name) or created_ms <= 0) return null;
     const es = std.time.epoch.EpochSeconds{ .secs = @intCast(@divTrunc(created_ms, 1000)) };
     const yd = es.getEpochDay().calculateYearDay();
     const md = yd.calculateMonthDay();
     const ds = es.getDaySeconds();
-    return std.fmt.bufPrint(buf, "u{d}/_hots/{s}-{d:0>4}{d:0>2}{d:0>2}-{d:0>2}{d:0>2}{d:0>2}", .{
+    return std.fmt.bufPrint(buf, "u{d}/_tots/{s}-{d:0>4}{d:0>2}{d:0>2}-{d:0>2}{d:0>2}{d:0>2}", .{
         uid, name, yd.year, md.month.numeric(), md.day_index + 1, ds.getHoursIntoDay(), ds.getMinutesIntoHour(), ds.getSecondsIntoMinute(),
     }) catch null;
 }
@@ -1012,12 +1035,12 @@ fn noteFileOk(name: []const u8) bool {
     return true;
 }
 
-const RosterHot = struct { name: []const u8 = "", created: i64 = 0, seq: u64 = 0, notes_rev: u64 = 0 };
+const RosterTot = struct { name: []const u8 = "", created: i64 = 0, seq: u64 = 0, notes_rev: u64 = 0 };
 
-/// Bring one hot's folder up to date.
-fn mirrorHot(app: *App, a: std.mem.Allocator, uid: u64, st: State, h: RosterHot, status: std.json.Value) void {
+/// Bring one tot's folder up to date.
+fn mirrorTot(app: *App, a: std.mem.Allocator, uid: u64, st: State, h: RosterTot, status: std.json.Value) void {
     var fb: [160]u8 = undefined;
-    const rel = hotFolder(&fb, uid, h.name, h.created) orelse return;
+    const rel = totFolder(&fb, uid, h.name, h.created) orelse return;
     const dir = std.fmt.allocPrint(a, "{s}/{s}", .{ app.data, rel }) catch return;
     const notes_dir = std.fmt.allocPrint(a, "{s}/notes", .{dir}) catch return;
     _ = std.Io.Dir.cwd().createDirPathStatus(app.io, notes_dir, .default_dir) catch return;
@@ -1032,8 +1055,8 @@ fn mirrorHot(app: *App, a: std.mem.Allocator, uid: u64, st: State, h: RosterHot,
     const lg = std.fmt.allocPrint(a, "{s}/events.log", .{dir}) catch return;
     var page: usize = 0;
     while (h.seq > cur.seq and page < PAGES_MAX) : (page += 1) {
-        const path = std.fmt.allocPrint(a, "/v1/hots/{s}/events?after={d}&limit={d}&forward=1", .{ h.name, cur.seq, EVENTS_PAGE }) catch break;
-        const raw = hotCall(app, a, uid, st, "GET", path, "") orelse break;
+        const path = std.fmt.allocPrint(a, "/v1/tots/{s}/events?after={d}&limit={d}&forward=1", .{ h.name, cur.seq, EVENTS_PAGE }) catch break;
+        const raw = totCall(app, a, uid, st, "GET", path, "") orelse break;
         const R = struct { ok: bool = false, events: []const std.json.Value = &.{} };
         const r = std.json.parseFromSliceLeaky(R, a, raw, .{ .ignore_unknown_fields = true }) catch break;
         if (!r.ok or r.events.len == 0) break;
@@ -1054,13 +1077,13 @@ fn mirrorHot(app: *App, a: std.mem.Allocator, uid: u64, st: State, h: RosterHot,
         if (cur.seq == before) break;
     }
 
-    // notes: what changed since the newest stamp held; then drop the files of notes the hot deleted
+    // notes: what changed since the newest stamp held; then drop the files of notes the tot deleted
     if (h.notes_rev != cur.notes_rev) notes: {
         var names: []const []const u8 = &.{};
         var pages: usize = 0;
         while (pages < PAGES_MAX) : (pages += 1) {
-            const path = std.fmt.allocPrint(a, "/v1/hots/{s}/notes?after={d}", .{ h.name, cur.notes_t }) catch break :notes;
-            const raw = hotCall(app, a, uid, st, "GET", path, "") orelse break :notes;
+            const path = std.fmt.allocPrint(a, "/v1/tots/{s}/notes?after={d}", .{ h.name, cur.notes_t }) catch break :notes;
+            const raw = totCall(app, a, uid, st, "GET", path, "") orelse break :notes;
             const N = struct { name: []const u8 = "", t: i64 = 0, text: []const u8 = "" };
             const R = struct { ok: bool = false, more: bool = false, notes: []const N = &.{}, names: []const []const u8 = &.{} };
             const r = std.json.parseFromSliceLeaky(R, a, raw, .{ .ignore_unknown_fields = true }) catch break :notes;
@@ -1093,19 +1116,19 @@ fn mirrorHot(app: *App, a: std.mem.Allocator, uid: u64, st: State, h: RosterHot,
     writeCursor(app, a, dir, cur);
 }
 
-/// The shared scratchpad as {data}/u<uid>/_hots/scratchpad.md, rewritten when its seq moves.
+/// The shared scratchpad as {data}/u<uid>/_tots/scratchpad.md, rewritten when its seq moves.
 fn mirrorPad(app: *App, a: std.mem.Allocator, uid: u64, st: State, pad_seq: u64) void {
-    const dir = std.fmt.allocPrint(a, "{s}/u{d}/_hots", .{ app.data, uid }) catch return;
+    const dir = std.fmt.allocPrint(a, "{s}/u{d}/_tots", .{ app.data, uid }) catch return;
     _ = std.Io.Dir.cwd().createDirPathStatus(app.io, dir, .default_dir) catch return;
     var cur = readCursor(app, a, dir);
     if (cur.pad_seq == pad_seq) return;
-    const raw = hotCall(app, a, uid, st, "GET", "/v1/pad?after=0", "") orelse return;
+    const raw = totCall(app, a, uid, st, "GET", "/v1/pad?after=0", "") orelse return;
     const E = struct { seq: u64 = 0, t: i64 = 0, from: []const u8 = "", text: []const u8 = "" };
     const R = struct { ok: bool = false, entries: []const E = &.{} };
     const r = std.json.parseFromSliceLeaky(R, a, raw, .{ .ignore_unknown_fields = true }) catch return;
     if (!r.ok) return;
     var out: std.ArrayListUnmanaged(u8) = .empty;
-    out.appendSlice(a, "# Shared scratchpad\n\nWhat the hots of this account leave for each other (and what you add from the desk or `veil hot pad`). The newest 200 entries, oldest first; rewritten as it changes.\n\n") catch return;
+    out.appendSlice(a, "# Shared scratchpad\n\nWhat the tots of this account leave for each other (and what you add from the desk or `veil tot pad`). The newest 200 entries, oldest first; rewritten as it changes.\n\n") catch return;
     for (r.entries) |e| {
         var tb: [24]u8 = undefined;
         out.print(a, "## {d}. {s} - {s} UTC\n\n{s}\n\n", .{ e.seq, e.from, stampStr(&tb, e.t), e.text }) catch return;
@@ -1116,34 +1139,34 @@ fn mirrorPad(app: *App, a: std.mem.Allocator, uid: u64, st: State, pad_seq: u64)
     writeCursor(app, a, dir, cur);
 }
 
-/// One mirror pass for a user: the roster, then each hot's folder, then the scratchpad.
+/// One mirror pass for a user: the roster, then each tot's folder, then the scratchpad.
 fn mirrorUser(app: *App, a: std.mem.Allocator, uid: u64, st: State) void {
-    const raw = hotCall(app, a, uid, st, "GET", "/v1/hots", "") orelse return;
-    const R = struct { ok: bool = false, pad_seq: u64 = 0, hots: []const std.json.Value = &.{} };
+    const raw = totCall(app, a, uid, st, "GET", "/v1/tots", "") orelse return;
+    const R = struct { ok: bool = false, pad_seq: u64 = 0, tots: []const std.json.Value = &.{} };
     const r = std.json.parseFromSliceLeaky(R, a, raw, .{ .ignore_unknown_fields = true }) catch return;
     if (!r.ok) return;
-    for (r.hots) |v| {
-        const h = std.json.parseFromValueLeaky(RosterHot, a, v, .{ .ignore_unknown_fields = true }) catch continue;
-        if (h.created > 0) mirrorHot(app, a, uid, st, h, v);
+    for (r.tots) |v| {
+        const h = std.json.parseFromValueLeaky(RosterTot, a, v, .{ .ignore_unknown_fields = true }) catch continue;
+        if (h.created > 0) mirrorTot(app, a, uid, st, h, v);
     }
     mirrorPad(app, a, uid, st, r.pad_seq);
 }
 
-/// A runtime uploaded by an older veil is replaced by this one's when the account is the one it is in. The hots
+/// A runtime uploaded by an older veil is replaced by this one's when the account is the one it is in. The tots
 /// keep their storage; only the code changes.
 fn upgradeRuntime(app: *App, a: std.mem.Allocator, uid: u64, st: *State) void {
     var hb: [16]u8 = undefined;
     if (st.url.len == 0 or std.mem.eql(u8, st.script_hash, scriptHash(&hb))) return;
     const tok = tokOf(app, uid, a) orelse return;
     if (!std.mem.eql(u8, tok.account_id, st.account)) return; // logged into another account: leave that one alone
-    // A refused update is not tried again for a quarter of an hour: the hots keep running on what they have.
+    // A refused update is not tried again for a quarter of an hour: the tots keep running on what they have.
     const now = nowS(app.io);
     if (now - upgrade_failed_s.load(.monotonic) < 900) return;
     var uploaded = false;
     if (ensureRuntime(app, a, uid, tok, st, &uploaded)) |msg| {
         st.last_error = msg;
         upgrade_failed_s.store(now, .monotonic);
-        log.warn("hot runtime for u{d} could not be updated: {s}", .{ uid, msg });
+        log.warn("tot runtime for u{d} could not be updated: {s}", .{ uid, msg });
     }
     writeState(app, uid, st.*);
 }
@@ -1163,7 +1186,7 @@ fn checkPython(app: *App, a: std.mem.Allocator, uid: u64, st: *State) void {
 fn checkPythonAs(app: *App, a: std.mem.Allocator, uid: u64, tok: Tok, st: *State) void {
     st.py_check -= 1;
     defer writeState(app, uid, st.*);
-    const raw = hotCall(app, a, uid, st.*, "GET", "/v1/python", "") orelse return;
+    const raw = totCall(app, a, uid, st.*, "GET", "/v1/python", "") orelse return;
     const Caps = struct { ok: bool = false, python: bool = false, native: []const []const u8 = &.{}, @"error": []const u8 = "" };
     const caps = std.json.parseFromSliceLeaky(Caps, a, raw, .{ .ignore_unknown_fields = true }) catch return;
     if (!caps.ok) return; // not the runtime's answer yet
@@ -1180,10 +1203,10 @@ fn checkPythonAs(app: *App, a: std.mem.Allocator, uid: u64, tok: Tok, st: *State
         st.py_check = 0;
         return;
     }
-    log.warn("hot Python for u{d} does not start with its packages ({s}); uploading it with fewer", .{ uid, caps.@"error" });
+    log.warn("tot Python for u{d} does not start with its packages ({s}); uploading it with fewer", .{ uid, caps.@"error" });
     var bb: [8]u8 = undefined;
     app.io.random(&bb);
-    const boundary = std.fmt.allocPrint(a, "----veilhot{s}", .{std.fmt.bytesToHex(bb, .lower)}) catch return;
+    const boundary = std.fmt.allocPrint(a, "----veiltot{s}", .{std.fmt.bytesToHex(bb, .lower)}) catch return;
     const ctype = std.fmt.allocPrint(a, "multipart/form-data; boundary={s}", .{boundary}) catch return;
     const py_url = std.fmt.allocPrint(a, "{s}/accounts/{s}/workers/scripts/" ++ PY_SCRIPT, .{ app.cf_api_root, st.account }) catch return;
     var why: []const u8 = "";
@@ -1192,8 +1215,8 @@ fn checkPythonAs(app: *App, a: std.mem.Allocator, uid: u64, tok: Tok, st: *State
     st.py_check = if (rung + 1 < PY_NATIVE.len) PY_CHECKS else 0;
 }
 
-/// One pass over every user with hots: run the jobs of those allowed onto this machine, and (when `mirror`) bring
-/// each hot's local folder up to date, first replacing a runtime an older veil uploaded.
+/// One pass over every user with tots: run the jobs of those allowed onto this machine, and (when `mirror`) bring
+/// each tot's local folder up to date, first replacing a runtime an older veil uploaded.
 fn tick(app: *App, mirror: bool) void {
     var backend_on = true; // VEIL_CHAT_BACKEND=0 switches the served chat turn off, and the jobs with it
     if (app.sup.parent_env) |env| if (env.get("VEIL_CHAT_BACKEND")) |v| {
@@ -1208,24 +1231,25 @@ fn tick(app: *App, mirror: bool) void {
     while (it.next(app.io) catch null) |ent| {
         if (ent.kind != .directory or ent.name.len < 2 or ent.name[0] != 'u') continue;
         const uid = std.fmt.parseInt(u64, ent.name[1..], 10) catch continue;
-        var st = readState(app, uid, a);
-        if (st.url.len == 0) continue;
         // Admin only, as the routes are: a state file is just a file, and it must not start full-tool turns
-        // for an account that could not have deployed a hot.
+        // for an account that could not have deployed a tot.
         const owner = app.auth.userById(uid) orelse continue;
         if (!app.auth.isAdmin(owner)) continue;
+        if (mirror) moveIfDue(app, a, uid);
+        var st = readState(app, uid, a);
+        if (st.url.len == 0) continue;
         if (mirror) {
             upgradeRuntime(app, a, uid, &st);
             checkPython(app, a, uid, &st);
             mirrorUser(app, a, uid, st);
         }
         if (backend_on) for (st.local) |name| if (validName(name)) {
-            _ = bridgeHot(app, a, uid, st, name);
+            _ = bridgeTot(app, a, uid, st, name);
         };
     }
 }
 
-/// The hots thread: for the life of the process, a pass every BRIDGE_EVERY_MS, mirroring every third. A raw thread,
+/// The tots thread: for the life of the process, a pass every BRIDGE_EVERY_MS, mirroring every third. A raw thread,
 /// so a raw sleep.
 pub fn bgLoop(app: *App) void {
     var n: u32 = 0;
@@ -1236,9 +1260,203 @@ pub fn bgLoop(app: *App) void {
     }
 }
 
+// ---------------------------------------------------------------------------------- the move from hots
+
+/// Until 1.1.8 a tot was called a hot. Its runtime is the Worker "veil-hots" (with "veil-hots-py"), the state file
+/// cf_hots.json and the folder _hots. The first time this server finds that state for a user logged in to the same
+/// Cloudflare account, it moves them: each hot is created again as a tot with the same name, goal, settings,
+/// owner's-machine grant and files; the scratchpad's entries come across; and only then are the old Workers
+/// removed, so nothing keeps running in the account under the old name. Lessons, facts and stances stay behind
+/// (the old runtime has no route that gives them out), and each tot's first event says so.
+const LEGACY_STATE_FILE = "cf_hots.json";
+const LEGACY_SCRIPT = "veil-hots";
+const LEGACY_PY_SCRIPT = "veil-hots-py";
+const LEGACY_FOLDER = "_hots";
+const LEGACY_TOKEN_LABEL = "veil-hot-token";
+/// The goal a moved hot gets when it had neither an active goal nor a charter.
+const MOVED_GOAL = "pick up where you left off: find the most valuable next thing to do for your human, and do it";
+/// The most a single import call carries; a tot's files go across in as many calls as they need.
+const IMPORT_BATCH: usize = 256 << 10;
+
+fn legacyPath(app: *App, uid: u64, buf: []u8) ?[]const u8 {
+    return std.fmt.bufPrint(buf, "{s}/u{d}/" ++ LEGACY_STATE_FILE, .{ app.data, uid }) catch null;
+}
+
+/// The old state, or null when there is nothing to move.
+fn readLegacy(app: *App, uid: u64, a: std.mem.Allocator) ?State {
+    var pb: [700]u8 = undefined;
+    const path = legacyPath(app, uid, &pb) orelse return null;
+    const data = std.Io.Dir.cwd().readFileAlloc(app.io, path, a, .limited(64 << 10)) catch return null;
+    return std.json.parseFromSliceLeaky(State, a, data, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch State{};
+}
+
+fn writeLegacy(app: *App, uid: u64, st: State) void {
+    var db: [700]u8 = undefined;
+    if (std.fmt.bufPrint(&db, "{s}/u{d}", .{ app.data, uid })) |dir| {
+        _ = std.Io.Dir.cwd().createDirPathStatus(app.io, dir, .default_dir) catch {};
+    } else |_| {}
+    var pb: [700]u8 = undefined;
+    const path = legacyPath(app, uid, &pb) orelse return;
+    const json = std.json.Stringify.valueAlloc(app.gpa, st, .{ .whitespace = .indent_1 }) catch return;
+    defer app.gpa.free(json);
+    std.Io.Dir.cwd().writeFile(app.io, .{ .sub_path = path, .data = json }) catch {};
+}
+
+/// One call to the old runtime, with the token it was given (the old label, the same server key).
+fn legacyCall(app: *App, a: std.mem.Allocator, uid: u64, old: State, method: []const u8, path: []const u8, body: []const u8) ?[]u8 {
+    if (!allowedUrl(app, old.url)) return null;
+    const url = std.fmt.allocPrint(a, "{s}{s}", .{ old.url, path }) catch return null;
+    var tb: [64]u8 = undefined;
+    const token = tokenWith(app, LEGACY_TOKEN_LABEL, uid, old.account, old.token_gen, &tb);
+    return api(app, a, method, url, body, token, if (body.len > 0) "application/json" else "");
+}
+
+const LegacyGoal = struct { text: []const u8 = "", status: []const u8 = "", forever: bool = false, budget: ?i64 = null };
+const LegacyHot = struct {
+    name: []const u8 = "",
+    model: []const u8 = "",
+    pace_s: ?i64 = null,
+    size: ?i64 = null,
+    daily_calls: ?i64 = null,
+    charter: []const u8 = "",
+    paused: bool = false,
+    goal: ?LegacyGoal = null,
+};
+const Note = struct { name: []const u8 = "", t: i64 = 0, text: []const u8 = "" };
+
+/// What a moved hot is created with: its own settings, its goal while that was active, else its charter alone.
+fn movedReq(h: LegacyHot, local: []const []const u8) CreateReq {
+    var r: CreateReq = .{ .name = h.name, .charter = h.charter, .model = h.model, .pace_s = h.pace_s, .size = h.size, .daily_calls = h.daily_calls };
+    if (h.goal) |g| if (std.mem.eql(u8, g.status, "active") and g.text.len >= 3) {
+        r.goal = g.text;
+        r.forever = g.forever;
+        r.budget = g.budget;
+    };
+    if (r.goal.len < 3 and std.mem.trim(u8, r.charter, " \r\n\t").len < 3) r.goal = MOVED_GOAL;
+    for (local) |n| if (std.ascii.eqlIgnoreCase(n, h.name)) {
+        r.local = true;
+    };
+    return r;
+}
+
+/// Move a user's hots to tots (see LEGACY_STATE_FILE). Null when there was nothing to move or it is done; the
+/// reason otherwise, and then nothing was removed and the next attempt starts over where this one stopped.
+fn moveFromHots(app: *App, a: std.mem.Allocator, uid: u64, tok: Tok) ?[]const u8 {
+    var old = readLegacy(app, uid, a) orelse return null;
+    if (old.account.len > 0 and !std.mem.eql(u8, old.account, tok.account_id))
+        return "the hots run in another Cloudflare account than the one logged in; log in to that one to move them";
+
+    if (old.url.len > 0 and !old.moved) {
+        // What the old runtime holds. No answer at all is a reason to come back later; an answer that is not its
+        // JSON (a Worker removed by hand: Cloudflare's own page) means there is nothing left to carry.
+        const roster_raw = legacyCall(app, a, uid, old, "GET", "/v1/hots", "") orelse return "the hots' runtime did not answer";
+        const R = struct { ok: bool = false, hots: []const LegacyHot = &.{} };
+        const roster = std.json.parseFromSliceLeaky(R, a, roster_raw, .{ .ignore_unknown_fields = true }) catch R{};
+        const hots = if (roster.ok) roster.hots else &.{};
+
+        for (hots) |h| {
+            if (!validName(h.name) or h.model.len == 0 or h.model[0] != '@') continue;
+            // its files, every page of them
+            var notes: std.ArrayListUnmanaged(Note) = .empty;
+            var after: i64 = 0;
+            var pages: usize = 0;
+            while (pages < 40) : (pages += 1) {
+                const path = std.fmt.allocPrint(a, "/v1/hots/{s}/notes?after={d}", .{ h.name, after }) catch return "out of memory";
+                const raw = legacyCall(app, a, uid, old, "GET", path, "") orelse return "the hots' runtime did not answer";
+                const N = struct { ok: bool = false, notes: []const Note = &.{}, more: bool = false };
+                const n = std.json.parseFromSliceLeaky(N, a, raw, .{ .ignore_unknown_fields = true }) catch break;
+                if (!n.ok) break;
+                notes.appendSlice(a, n.notes) catch return "out of memory";
+                if (n.notes.len == 0 or !n.more) break;
+                after = n.notes[n.notes.len - 1].t;
+            }
+            // the tot, unless an earlier attempt already made it
+            switch (deploy(app, a, uid, tok, movedReq(h, old.local))) {
+                .ok => {},
+                .err => |msg| if (std.ascii.indexOfIgnoreCase(msg, "already exists") == null) return msg,
+            }
+            const st = readState(app, uid, a);
+            const ipath = std.fmt.allocPrint(a, "/v1/tots/{s}/import", .{h.name}) catch return "out of memory";
+            var i: usize = 0;
+            while (true) {
+                // a batch of files under IMPORT_BATCH (at least one); the last batch carries the pause
+                var j = i;
+                var bytes: usize = 0;
+                while (j < notes.items.len and (j == i or bytes + notes.items[j].text.len < IMPORT_BATCH)) : (j += 1) bytes += notes.items[j].text.len;
+                const last = j >= notes.items.len;
+                const Imp = struct { notes: []const Note, paused: bool, from: []const u8 };
+                const body = std.json.Stringify.valueAlloc(a, Imp{ .notes = notes.items[i..j], .paused = last and h.paused, .from = LEGACY_SCRIPT }, .{}) catch return "out of memory";
+                const r = totCall(app, a, uid, st, "POST", ipath, body) orelse return "the tot runtime did not answer";
+                if (!replyOf(a, r).ok) return explain(a, "carrying a hot's files across", replyOf(a, r).err);
+                if (last) break;
+                i = j;
+            }
+        }
+
+        // the scratchpad, once
+        if (legacyCall(app, a, uid, old, "GET", "/v1/pad?after=0", "")) |raw| {
+            const P = struct { ok: bool = false, entries: []const std.json.Value = &.{} };
+            const p = std.json.parseFromSliceLeaky(P, a, raw, .{ .ignore_unknown_fields = true }) catch P{};
+            if (p.ok and p.entries.len > 0) {
+                const st = readState(app, uid, a);
+                const Pi = struct { entries: []const std.json.Value };
+                const body = std.json.Stringify.valueAlloc(a, Pi{ .entries = p.entries }, .{}) catch return "out of memory";
+                const r = totCall(app, a, uid, st, "POST", "/v1/pad/import", body) orelse return "the tot runtime did not answer";
+                if (!replyOf(a, r).ok) return explain(a, "carrying the scratchpad across", replyOf(a, r).err);
+            }
+        } else return "the hots' runtime did not answer";
+        old.moved = true;
+        writeLegacy(app, uid, old);
+    }
+
+    // Everything is across: the old Workers go.
+    if (old.url.len > 0) {
+        const acct = if (old.account.len > 0) old.account else tok.account_id;
+        const url = std.fmt.allocPrint(a, "{s}/accounts/{s}/workers/scripts/" ++ LEGACY_SCRIPT ++ "?force=true", .{ app.cf_api_root, acct }) catch return "out of memory";
+        const raw = api(app, a, "DELETE", url, "", tok.key, "") orelse return "could not reach the Cloudflare API to remove the old veil-hots Worker";
+        const msg = firstError(a, raw);
+        if (msg.len > 0 and std.ascii.indexOfIgnoreCase(msg, "not found") == null and std.ascii.indexOfIgnoreCase(msg, "does not exist") == null)
+            return explain(a, "removing the old veil-hots Worker", msg);
+        const py_url = std.fmt.allocPrint(a, "{s}/accounts/{s}/workers/scripts/" ++ LEGACY_PY_SCRIPT ++ "?force=true", .{ app.cf_api_root, acct }) catch return "out of memory";
+        _ = api(app, a, "DELETE", py_url, "", tok.key, "");
+    }
+
+    // The local folders come along under the new name, unless that name is taken already.
+    const from = std.fmt.allocPrint(a, "{s}/u{d}/" ++ LEGACY_FOLDER, .{ app.data, uid }) catch return "out of memory";
+    const to = std.fmt.allocPrint(a, "{s}/u{d}/_tots", .{ app.data, uid }) catch return "out of memory";
+    if (std.Io.Dir.cwd().access(app.io, to, .{})) |_| {} else |_| {
+        std.Io.Dir.rename(std.Io.Dir.cwd(), from, std.Io.Dir.cwd(), to, app.io) catch {};
+    }
+    var pb: [700]u8 = undefined;
+    if (legacyPath(app, uid, &pb)) |p| std.Io.Dir.cwd().deleteFile(app.io, p) catch {};
+    log.info("the hots of u{d} are tots now; the veil-hots Worker is removed", .{uid});
+    return null;
+}
+
+var move_failed_s: std.atomic.Value(i64) = .init(0);
+
+/// The move, from the background pass: a failed attempt waits a quarter of an hour before the next.
+fn moveIfDue(app: *App, a: std.mem.Allocator, uid: u64) void {
+    var pb: [700]u8 = undefined;
+    const path = legacyPath(app, uid, &pb) orelse return;
+    std.Io.Dir.cwd().access(app.io, path, .{}) catch return;
+    const now = nowS(app.io);
+    if (now - move_failed_s.load(.monotonic) < 900) return;
+    const tok = tokOf(app, uid, a) orelse return;
+    if (moveFromHots(app, a, uid, tok)) |msg| {
+        move_failed_s.store(now, .monotonic);
+        if (readLegacy(app, uid, a)) |old| {
+            var o = old;
+            o.last_error = msg;
+            writeLegacy(app, uid, o);
+        }
+        log.warn("the hots of u{d} could not be moved to tots yet: {s}", .{ uid, msg });
+    }
+}
+
 // ---------------------------------------------------------------------------
 // tests — see harness/TESTING.md. The Cloudflare API and the runtime are one fakehttp stand-in; the runtime's own
-// behaviour is tested where it runs (cloud/hot.test.mjs, under node).
+// behaviour is tested where it runs (cloud/tot.test.mjs, under node).
 // ---------------------------------------------------------------------------
 
 const tt = std.testing;
@@ -1250,14 +1468,14 @@ fn curlRuns(gpa: std.mem.Allocator, io: std.Io) bool {
     return r.term == .exited and r.term.exited == 0;
 }
 
-test "every hot route is gated: an anonymous caller gets 401 and nothing runs" {
+test "every tot route is gated: an anonymous caller gets 401 and nothing runs" {
     const gpa = tt.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
     defer threaded.deinit();
     const io = threaded.io();
-    var ta = try http.testApp(gpa, io, "zig-cfhot-gate-tmp");
+    var ta = try http.testApp(gpa, io, "zig-cftot-gate-tmp");
     defer ta.deinit();
-    inline for (.{ listHots, createHot, deleteHot, teardown, hotEvents, hotCommand, hotConfig, padRead, padWrite, padClear, setKey }) |h| {
+    inline for (.{ listTots, createTot, deleteTot, teardown, totEvents, totCommand, totConfig, padRead, padWrite, padClear, setKey }) |h| {
         var web = httpz.testing.init(.{});
         defer web.deinit();
         web.param("name", "Gary");
@@ -1270,13 +1488,13 @@ test "every hot route is gated: an anonymous caller gets 401 and nothing runs" {
 test "the runtime and this server agree: the limit, the primary's name, the goal loop's stop rules, the default model" {
     const goal = @import("../worker/chat/goal.zig");
     var b: [96]u8 = undefined;
-    try tt.expect(std.mem.indexOf(u8, HOT_JS, try std.fmt.bufPrint(&b, "export const MAX_HOTS = {d};", .{MAX_HOTS})) != null);
-    try tt.expect(std.mem.indexOf(u8, HOT_JS, "export const PRIMARY = \"" ++ PRIMARY ++ "\";") != null);
-    try tt.expect(std.mem.indexOf(u8, HOT_JS, try std.fmt.bufPrint(&b, "export const PLATEAU = {d};", .{goal.PLATEAU})) != null);
-    try tt.expect(std.mem.indexOf(u8, HOT_JS, try std.fmt.bufPrint(&b, "export const BUDGET_DEFAULT = {d};", .{goal.BUDGET_DEFAULT})) != null);
-    try tt.expect(std.mem.indexOf(u8, HOT_JS, try std.fmt.bufPrint(&b, "model: \"{s}\",", .{modelcfg.defaults.cf_model})) != null);
-    try tt.expect(std.mem.indexOf(u8, HOT_JS, "export class Hot ") != null); // the class the upload's binding names
-    try tt.expectEqual(@as(usize, 3), MAX_HOTS);
+    try tt.expect(std.mem.indexOf(u8, TOT_JS, try std.fmt.bufPrint(&b, "export const MAX_TOTS = {d};", .{MAX_TOTS})) != null);
+    try tt.expect(std.mem.indexOf(u8, TOT_JS, "export const PRIMARY = \"" ++ PRIMARY ++ "\";") != null);
+    try tt.expect(std.mem.indexOf(u8, TOT_JS, try std.fmt.bufPrint(&b, "export const PLATEAU = {d};", .{goal.PLATEAU})) != null);
+    try tt.expect(std.mem.indexOf(u8, TOT_JS, try std.fmt.bufPrint(&b, "export const BUDGET_DEFAULT = {d};", .{goal.BUDGET_DEFAULT})) != null);
+    try tt.expect(std.mem.indexOf(u8, TOT_JS, try std.fmt.bufPrint(&b, "model: \"{s}\",", .{modelcfg.defaults.cf_model})) != null);
+    try tt.expect(std.mem.indexOf(u8, TOT_JS, "export class Tot ") != null); // the class the upload's binding names
+    try tt.expectEqual(@as(usize, 3), MAX_TOTS);
     try tt.expectEqualStrings("Gary", PRIMARY);
 }
 
@@ -1285,7 +1503,7 @@ test "names: the rule a URL segment and a conversation id both need" {
     try tt.expect(!validName("") and !validName("9lives") and !validName("a b") and !validName("a/b") and !validName("pad?x"));
     try tt.expect(!validName("a" ** 25) and validName("a" ** 24));
     var cb: [64]u8 = undefined;
-    try tt.expectEqualStrings("hot_gary_j12_1790000000", jobConv(&cb, "Gary", .{ .id = "j12", .t = 1790000000123 }).?);
+    try tt.expectEqualStrings("tot_gary_j12_1790000000", jobConv(&cb, "Gary", .{ .id = "j12", .t = 1790000000123 }).?);
     try tt.expect(jobConv(&cb, "Gary", .{ .id = "../x", .t = 1 }) == null);
     try tt.expect(jobConv(&cb, "Gary", .{ .id = "", .t = 1 }) == null);
     // the longest name and id still fit a conversation id (64)
@@ -1296,31 +1514,31 @@ test "the runtime's token is derived, never stored: stable for one user+account+
     const gpa = tt.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
     defer threaded.deinit();
-    var ta = try http.testApp(gpa, threaded.io(), "zig-cfhot-token-tmp");
+    var ta = try http.testApp(gpa, threaded.io(), "zig-cftot-token-tmp");
     defer ta.deinit();
     var a: [64]u8 = undefined;
     var b: [64]u8 = undefined;
-    try tt.expectEqualStrings(hotToken(&ta.app, 1, "acct", 0, &a), hotToken(&ta.app, 1, "acct", 0, &b));
+    try tt.expectEqualStrings(totToken(&ta.app, 1, "acct", 0, &a), totToken(&ta.app, 1, "acct", 0, &b));
     for (a) |c| try tt.expect(std.ascii.isHex(c));
-    try tt.expect(!std.mem.eql(u8, hotToken(&ta.app, 1, "acct", 0, &a), hotToken(&ta.app, 2, "acct", 0, &b)));
-    try tt.expect(!std.mem.eql(u8, hotToken(&ta.app, 1, "acct", 0, &a), hotToken(&ta.app, 1, "acct2", 0, &b)));
-    try tt.expect(!std.mem.eql(u8, hotToken(&ta.app, 1, "acct", 0, &a), hotToken(&ta.app, 1, "acct", 1, &b)));
+    try tt.expect(!std.mem.eql(u8, totToken(&ta.app, 1, "acct", 0, &a), totToken(&ta.app, 2, "acct", 0, &b)));
+    try tt.expect(!std.mem.eql(u8, totToken(&ta.app, 1, "acct", 0, &a), totToken(&ta.app, 1, "acct2", 0, &b)));
+    try tt.expect(!std.mem.eql(u8, totToken(&ta.app, 1, "acct", 0, &a), totToken(&ta.app, 1, "acct", 1, &b)));
     ta.app.server_key = [_]u8{0x11} ** 32;
-    try tt.expect(!std.mem.eql(u8, &a, hotToken(&ta.app, 1, "acct", 0, &b)));
+    try tt.expect(!std.mem.eql(u8, &a, totToken(&ta.app, 1, "acct", 0, &b)));
 }
 
 test "the token only goes to a workers.dev address, or to loopback while the API itself is a loopback stand-in" {
     const gpa = tt.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
     defer threaded.deinit();
-    var ta = try http.testApp(gpa, threaded.io(), "zig-cfhot-url-tmp");
+    var ta = try http.testApp(gpa, threaded.io(), "zig-cftot-url-tmp");
     defer ta.deinit();
     const app = &ta.app;
-    try tt.expect(allowedUrl(app, "https://veil-hots.acme.workers.dev"));
-    try tt.expect(!allowedUrl(app, "http://veil-hots.acme.workers.dev")); // not https
-    try tt.expect(!allowedUrl(app, "https://veil-hots.acme.workers.dev.evil.example"));
+    try tt.expect(allowedUrl(app, "https://veil-tots.acme.workers.dev"));
+    try tt.expect(!allowedUrl(app, "http://veil-tots.acme.workers.dev")); // not https
+    try tt.expect(!allowedUrl(app, "https://veil-tots.acme.workers.dev.evil.example"));
     try tt.expect(!allowedUrl(app, "https://evil.example/x.workers.dev"));
-    try tt.expect(!allowedUrl(app, "https://user@veil-hots.acme.workers.dev"));
+    try tt.expect(!allowedUrl(app, "https://user@veil-tots.acme.workers.dev"));
     try tt.expect(!allowedUrl(app, "https://evil.example:443#.workers.dev"));
     try tt.expect(!allowedUrl(app, "http://127.0.0.1:8790")); // the real API root: no loopback runtime
     try tt.expect(!allowedUrl(app, ""));
@@ -1332,7 +1550,7 @@ test "the token only goes to a workers.dev address, or to loopback while the API
     defer arena.deinit();
     try tt.expectEqualStrings("http://127.0.0.1:8790", runtimeUrl(app, arena.allocator(), "acme").?);
     app.cf_api_root = "https://api.cloudflare.com/client/v4";
-    try tt.expectEqualStrings("https://veil-hots.acme.workers.dev", runtimeUrl(app, arena.allocator(), "acme").?);
+    try tt.expectEqualStrings("https://veil-tots.acme.workers.dev", runtimeUrl(app, arena.allocator(), "acme").?);
 }
 
 test "the upload carries the bindings and keeps the secret; the class migration rides only a first upload" {
@@ -1352,7 +1570,7 @@ test "the upload carries the bindings and keeps the secret; the class migration 
         migrations: ?struct { new_tag: []const u8, new_sqlite_classes: []const []const u8 } = null,
     };
     const m = try std.json.parseFromSliceLeaky(M, a, meta, .{});
-    try tt.expectEqualStrings("hot.js", m.main_module);
+    try tt.expectEqualStrings("tot.js", m.main_module);
     try tt.expectEqual(@as(usize, 4), m.bindings.len);
     try tt.expectEqualStrings("service", m.bindings[2].type);
     try tt.expectEqualStrings(PY_SCRIPT, m.bindings[2].service);
@@ -1366,26 +1584,26 @@ test "the upload carries the bindings and keeps the secret; the class migration 
     try tt.expect(std.mem.indexOf(u8, try pyUploadBody(a, "----b", PY_NATIVE[PY_NATIVE.len - 1]), "x-python-requirement") == null);
     try tt.expectEqual(@as(usize, 0), PY_NATIVE[PY_NATIVE.len - 1].len);
     try tt.expect(std.mem.indexOf(u8, py, "\"compatibility_flags\":[\"python_workers\"]") != null);
-    try tt.expect(std.mem.indexOf(u8, py, "Content-Type: text/x-python\r\n\r\n" ++ HOT_PY) != null);
-    try tt.expect(std.mem.indexOf(u8, HOT_PY, "class Default(WorkerEntrypoint):") != null);
+    try tt.expect(std.mem.indexOf(u8, py, "Content-Type: text/x-python\r\n\r\n" ++ TOT_PY) != null);
+    try tt.expect(std.mem.indexOf(u8, TOT_PY, "class Default(WorkerEntrypoint):") != null);
     try tt.expectEqualStrings("ai", m.bindings[0].type);
-    try tt.expectEqualStrings("Hot", m.bindings[1].class_name);
+    try tt.expectEqualStrings("Tot", m.bindings[1].class_name);
     try tt.expectEqualStrings("secret_text", m.keep_bindings[0]);
-    try tt.expectEqualStrings("Hot", m.migrations.?.new_sqlite_classes[0]);
+    try tt.expectEqualStrings("Tot", m.migrations.?.new_sqlite_classes[0]);
     try tt.expect(std.mem.indexOf(u8, again, "migrations") == null);
-    try tt.expect(std.mem.indexOf(u8, first, HOT_JS) != null);
+    try tt.expect(std.mem.indexOf(u8, first, TOT_JS) != null);
     try tt.expect(std.mem.endsWith(u8, first, "\r\n------b--\r\n"));
-    // the mind: both modules under the names hot.js imports, the engine as WebAssembly; neither when not asked for
-    try tt.expect(std.mem.indexOf(u8, HOT_JS, "const NEURON_WASM = \"./neuron_core.wasm\";") != null);
-    try tt.expect(std.mem.indexOf(u8, HOT_JS, "const NEURON_BINDING = \"./neuron-db.mjs\";") != null);
+    // the mind: both modules under the names tot.js imports, the engine as WebAssembly; neither when not asked for
+    try tt.expect(std.mem.indexOf(u8, TOT_JS, "const NEURON_WASM = \"./neuron_core.wasm\";") != null);
+    try tt.expect(std.mem.indexOf(u8, TOT_JS, "const NEURON_BINDING = \"./neuron-db.mjs\";") != null);
     try tt.expect(std.mem.indexOf(u8, first, "name=\"neuron-db.mjs\"; filename=\"neuron-db.mjs\"\r\nContent-Type: application/javascript+module\r\n\r\n" ++ NEURON_MJS) != null);
     try tt.expect(std.mem.indexOf(u8, first, "name=\"neuron_core.wasm\"; filename=\"neuron_core.wasm\"\r\nContent-Type: application/wasm\r\n\r\n" ++ NEURON_WASM) != null);
     try tt.expect(std.mem.startsWith(u8, NEURON_WASM, "\x00asm"));
     try tt.expect(std.mem.indexOf(u8, again, "application/wasm") == null);
     try tt.expectEqualStrings("BRAVE_KEY", keySecret("Brave").?);
     try tt.expectEqualStrings("GOOGLE_CSE_CX", keySecret("google_cx").?);
-    try tt.expect(keySecret("HOT_TOKEN") == null); // the runtime's own token is not a key anyone sets
-    try tt.expect(std.mem.indexOf(u8, first, "HOT_TOKEN\",\"text\"") == null); // no secret in a body that rides a file
+    try tt.expect(keySecret("TOT_TOKEN") == null); // the runtime's own token is not a key anyone sets
+    try tt.expect(std.mem.indexOf(u8, first, "TOT_TOKEN\",\"text\"") == null); // no secret in a body that rides a file
 }
 
 /// The stand-in's answers: the Cloudflare API on /client/v4, the runtime on /v1.
@@ -1395,31 +1613,31 @@ const StandIn = struct {
     const subdomain = w("{\"success\":true,\"errors\":[],\"result\":{\"subdomain\":\"acme\"}}");
     const no_script = w("{\"success\":false,\"errors\":[{\"code\":10007,\"message\":\"This Worker does not exist on your account.\"}]}");
     const no_browser = w("{\"success\":false,\"errors\":[{\"code\":10021,\"message\":\"Browser Rendering is not enabled for this account.\"}]}");
-    const made = w("{\"ok\":true,\"hot\":{\"name\":\"Gary\",\"state\":\"working\",\"local\":true}}");
-    const full = w("{\"ok\":false,\"err\":\"this account already has 3 hots (the limit); delete one first\"}");
+    const made = w("{\"ok\":true,\"tot\":{\"name\":\"Gary\",\"state\":\"working\",\"local\":true}}");
+    const full = w("{\"ok\":false,\"err\":\"this account already has 3 tots (the limit); delete one first\"}");
 };
 
-test "a first deployment uploads the runtime, sets its token, creates the hot and records the owner's-machine grant; the next costs one call" {
+test "a first deployment uploads the runtime, sets its token, creates the tot and records the owner's-machine grant; the next costs one call" {
     const gpa = tt.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
     defer threaded.deinit();
     const io = threaded.io();
-    const root = "zig-cfhot-deploy-tmp";
+    const root = "zig-cftot-deploy-tmp";
     var ta = try http.testApp(gpa, io, root);
     defer ta.deinit();
     if (!curlRuns(gpa, io)) return error.SkipZigTest;
 
     const routes = [_]fakehttp.Route{
         .{ .method = "GET", .path = "/accounts/acct/workers/subdomain", .reply = StandIn.subdomain },
-        .{ .method = "GET", .path = "/workers/scripts/veil-hots/settings", .reply = StandIn.no_script },
-        .{ .method = "PUT", .path = "/workers/scripts/veil-hots-py", .reply = StandIn.ok },
-        .{ .method = "PUT", .path = "/workers/scripts/veil-hots/secrets", .reply = StandIn.ok },
+        .{ .method = "GET", .path = "/workers/scripts/veil-tots/settings", .reply = StandIn.no_script },
+        .{ .method = "PUT", .path = "/workers/scripts/veil-tots-py", .reply = StandIn.ok },
+        .{ .method = "PUT", .path = "/workers/scripts/veil-tots/secrets", .reply = StandIn.ok },
         // this account has no browser: the upload that asks for one is refused, the next is taken
-        .{ .method = "PUT", .path = "/workers/scripts/veil-hots", .reply = StandIn.no_browser, .times = 2 },
-        .{ .method = "PUT", .path = "/workers/scripts/veil-hots", .reply = StandIn.ok },
-        .{ .method = "POST", .path = "/workers/scripts/veil-hots/subdomain", .reply = StandIn.ok },
-        .{ .method = "POST", .path = "/v1/hots", .reply = StandIn.made, .times = 1 },
-        .{ .method = "POST", .path = "/v1/hots", .reply = StandIn.full },
+        .{ .method = "PUT", .path = "/workers/scripts/veil-tots", .reply = StandIn.no_browser, .times = 2 },
+        .{ .method = "PUT", .path = "/workers/scripts/veil-tots", .reply = StandIn.ok },
+        .{ .method = "POST", .path = "/workers/scripts/veil-tots/subdomain", .reply = StandIn.ok },
+        .{ .method = "POST", .path = "/v1/tots", .reply = StandIn.made, .times = 1 },
+        .{ .method = "POST", .path = "/v1/tots", .reply = StandIn.full },
     };
     var srv: fakehttp.Server = undefined;
     try srv.startRouted(io, &routes, StandIn.no_script);
@@ -1456,28 +1674,28 @@ test "a first deployment uploads the runtime, sets its token, creates the hot an
 
     // The state file holds no secret: not the runtime's token, not the OAuth bearer.
     var tb: [64]u8 = undefined;
-    const token = hotToken(&ta.app, 1, "acct", 0, &tb);
+    const token = totToken(&ta.app, 1, "acct", 0, &tb);
     const on_disk = try std.Io.Dir.cwd().readFileAlloc(io, root ++ "/u1/" ++ STATE_FILE, a, .limited(64 << 10));
     try tt.expect(std.mem.indexOf(u8, on_disk, token) == null);
     try tt.expect(std.mem.indexOf(u8, on_disk, "oauth-bearer") == null);
 
     // The second deployment finds the runtime current: straight to the runtime, whose refusal comes back in its words.
-    const second = deploy(&ta.app, a, 1, tok, .{ .goal = "a fourth hot", .name = "Rex" });
+    const second = deploy(&ta.app, a, 1, tok, .{ .goal = "a fourth tot", .name = "Rex" });
     try tt.expect(second == .err);
-    try tt.expect(std.mem.indexOf(u8, second.err, "already has 3 hots") != null);
+    try tt.expect(std.mem.indexOf(u8, second.err, "already has 3 tots") != null);
 
     srv.stop();
     running = false;
     // subdomain, exists?, the Python Worker, the runtime (refused twice with the browser, taken without),
     // secret, route, create - in that order; then one more create
     try tt.expectEqual(@as(?usize, 0), srv.firstCall("GET", "/accounts/acct/workers/subdomain"));
-    try tt.expectEqual(@as(?usize, 1), srv.firstCall("GET", "/workers/scripts/veil-hots/settings"));
-    try tt.expectEqual(@as(?usize, 2), srv.firstCall("PUT", "/accounts/acct/workers/scripts/veil-hots-py"));
-    try tt.expectEqual(@as(?usize, 6), srv.firstCall("PUT", "/workers/scripts/veil-hots/secrets"));
-    try tt.expectEqual(@as(?usize, 7), srv.firstCall("POST", "/workers/scripts/veil-hots/subdomain"));
-    try tt.expectEqual(@as(?usize, 8), srv.firstCall("POST", "/v1/hots"));
-    try tt.expectEqual(@as(usize, 5), srv.countCalls("PUT", "/accounts/acct/workers/scripts/veil-hots")); // py, 3 runtime tries, secret
-    try tt.expectEqual(@as(usize, 2), srv.countCalls("POST", "/v1/hots"));
+    try tt.expectEqual(@as(?usize, 1), srv.firstCall("GET", "/workers/scripts/veil-tots/settings"));
+    try tt.expectEqual(@as(?usize, 2), srv.firstCall("PUT", "/accounts/acct/workers/scripts/veil-tots-py"));
+    try tt.expectEqual(@as(?usize, 6), srv.firstCall("PUT", "/workers/scripts/veil-tots/secrets"));
+    try tt.expectEqual(@as(?usize, 7), srv.firstCall("POST", "/workers/scripts/veil-tots/subdomain"));
+    try tt.expectEqual(@as(?usize, 8), srv.firstCall("POST", "/v1/tots"));
+    try tt.expectEqual(@as(usize, 5), srv.countCalls("PUT", "/accounts/acct/workers/scripts/veil-tots")); // py, 3 runtime tries, secret
+    try tt.expectEqual(@as(usize, 2), srv.countCalls("POST", "/v1/tots"));
     try tt.expectEqual(@as(usize, 1), srv.countCalls("GET", "/workers/subdomain"));
     try tt.expectEqual(@as(usize, 10), srv.call_count);
 }
@@ -1487,22 +1705,22 @@ test "the bridge posts a finished job's answer back, fails a run that left none,
     var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
     defer threaded.deinit();
     const io = threaded.io();
-    const root = "zig-cfhot-bridge-tmp";
+    const root = "zig-cftot-bridge-tmp";
     var ta = try http.testApp(gpa, io, root);
     defer ta.deinit();
     if (!curlRuns(gpa, io)) return error.SkipZigTest;
 
     // j1's turn has answered; j2's ran and left only the user message.
     const cwd = std.Io.Dir.cwd();
-    _ = try cwd.createDirPathStatus(io, root ++ "/u1/_chat/convs/hot_gary_j1_1790000000", .default_dir);
-    _ = try cwd.createDirPathStatus(io, root ++ "/u1/_chat/convs/hot_gary_j2_1790000001", .default_dir);
-    try cwd.writeFile(io, .{ .sub_path = root ++ "/u1/_chat/convs/hot_gary_j1_1790000000/messages.jsonl", .data = "{\"role\":\"user\",\"content\":\"run the suite\",\"kind\":\"\",\"ts\":1}\n{\"role\":\"assistant\",\"content\":\"working on it\",\"kind\":\"\",\"ts\":2}\n{\"role\":\"assistant\",\"content\":\"42 passed, 0 failed \\\"quoted\\\"\",\"kind\":\"\",\"ts\":3}\n" });
-    try cwd.writeFile(io, .{ .sub_path = root ++ "/u1/_chat/convs/hot_gary_j2_1790000001/messages.jsonl", .data = "{\"role\":\"user\",\"content\":\"build it\",\"kind\":\"\",\"ts\":1}\n" });
+    _ = try cwd.createDirPathStatus(io, root ++ "/u1/_chat/convs/tot_gary_j1_1790000000", .default_dir);
+    _ = try cwd.createDirPathStatus(io, root ++ "/u1/_chat/convs/tot_gary_j2_1790000001", .default_dir);
+    try cwd.writeFile(io, .{ .sub_path = root ++ "/u1/_chat/convs/tot_gary_j1_1790000000/messages.jsonl", .data = "{\"role\":\"user\",\"content\":\"run the suite\",\"kind\":\"\",\"ts\":1}\n{\"role\":\"assistant\",\"content\":\"working on it\",\"kind\":\"\",\"ts\":2}\n{\"role\":\"assistant\",\"content\":\"42 passed, 0 failed \\\"quoted\\\"\",\"kind\":\"\",\"ts\":3}\n" });
+    try cwd.writeFile(io, .{ .sub_path = root ++ "/u1/_chat/convs/tot_gary_j2_1790000001/messages.jsonl", .data = "{\"role\":\"user\",\"content\":\"build it\",\"kind\":\"\",\"ts\":1}\n" });
 
     const w = fakehttp.wire;
     const routes = [_]fakehttp.Route{
-        .{ .method = "GET", .path = "/v1/hots/Gary/jobs", .reply = w("{\"ok\":true,\"model\":\"@cf/x/y\",\"jobs\":[{\"id\":\"j1\",\"t\":1790000000123,\"instruction\":\"run the suite\",\"status\":\"pending\"},{\"id\":\"j2\",\"t\":1790000001000,\"instruction\":\"build it\",\"status\":\"pending\"}]}") },
-        .{ .method = "POST", .path = "/v1/hots/Gary/jobs/", .reply = w("{\"ok\":true}") },
+        .{ .method = "GET", .path = "/v1/tots/Gary/jobs", .reply = w("{\"ok\":true,\"model\":\"@cf/x/y\",\"jobs\":[{\"id\":\"j1\",\"t\":1790000000123,\"instruction\":\"run the suite\",\"status\":\"pending\"},{\"id\":\"j2\",\"t\":1790000001000,\"instruction\":\"build it\",\"status\":\"pending\"}]}") },
+        .{ .method = "POST", .path = "/v1/tots/Gary/jobs/", .reply = w("{\"ok\":true}") },
     };
     var srv: fakehttp.Server = undefined;
     try srv.startRouted(io, &routes, w("{\"ok\":false,\"err\":\"not found\"}"));
@@ -1516,16 +1734,16 @@ test "the bridge posts a finished job's answer back, fails a run that left none,
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
-    try tt.expectEqual(@as(usize, 0), bridgeHot(&ta.app, a, 1, st, "Gary")); // nothing was started
+    try tt.expectEqual(@as(usize, 0), bridgeTot(&ta.app, a, 1, st, "Gary")); // nothing was started
     var began = false;
-    try tt.expectEqualStrings("42 passed, 0 failed \"quoted\"", lastAssistant(&ta.app, a, 1, "hot_gary_j1_1790000000", &began).?);
-    try tt.expect(lastAssistant(&ta.app, a, 1, "hot_gary_j9_1", &began) == null and !began);
+    try tt.expectEqualStrings("42 passed, 0 failed \"quoted\"", lastAssistant(&ta.app, a, 1, "tot_gary_j1_1790000000", &began).?);
+    try tt.expect(lastAssistant(&ta.app, a, 1, "tot_gary_j9_1", &began) == null and !began);
 
     srv.stop();
     running = false;
-    try tt.expectEqual(@as(?usize, 0), srv.firstCall("GET", "/v1/hots/Gary/jobs"));
-    try tt.expectEqual(@as(?usize, 1), srv.firstCall("POST", "/v1/hots/Gary/jobs/j1"));
-    try tt.expectEqual(@as(?usize, 2), srv.firstCall("POST", "/v1/hots/Gary/jobs/j2"));
+    try tt.expectEqual(@as(?usize, 0), srv.firstCall("GET", "/v1/tots/Gary/jobs"));
+    try tt.expectEqual(@as(?usize, 1), srv.firstCall("POST", "/v1/tots/Gary/jobs/j1"));
+    try tt.expectEqual(@as(?usize, 2), srv.firstCall("POST", "/v1/tots/Gary/jobs/j2"));
     try tt.expectEqual(@as(usize, 3), srv.call_count);
     // What went back for j1 is the turn's last answer, as JSON a parser reads back whole. (fakehttp keeps the
     // FIRST request only, so the body is rebuilt the way postResult builds it.)
@@ -1536,7 +1754,7 @@ test "the bridge posts a finished job's answer back, fails a run that left none,
     try tt.expect(std.mem.startsWith(u8, text, "run the suite\n") and std.mem.indexOf(u8, text, "sent back to Gary") != null);
 }
 
-test "a grant list keeps one entry per hot, whatever the case, and drops it on delete" {
+test "a grant list keeps one entry per tot, whatever the case, and drops it on delete" {
     var arena = std.heap.ArenaAllocator.init(tt.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -1550,12 +1768,12 @@ test "a grant list keeps one entry per hot, whatever the case, and drops it on d
     try tt.expectEqualStrings("Ada", l[0]);
 }
 
-test "each deployment of a hot has its own folder name: the name and when it was deployed, in UTC" {
+test "each deployment of a tot has its own folder name: the name and when it was deployed, in UTC" {
     var b: [160]u8 = undefined;
-    try tt.expectEqualStrings("u3/_hots/Gary-20261001-120005", hotFolder(&b, 3, "Gary", 1790856005123).?);
-    try tt.expectEqualStrings("u3/_hots/Gary-20261001-120006", hotFolder(&b, 3, "Gary", 1790856006000).?); // a redeploy a second later is a new run
-    try tt.expect(hotFolder(&b, 3, "../x", 1790856005123) == null);
-    try tt.expect(hotFolder(&b, 3, "Gary", 0) == null); // an unreachable hot names no deployment
+    try tt.expectEqualStrings("u3/_tots/Gary-20261001-120005", totFolder(&b, 3, "Gary", 1790856005123).?);
+    try tt.expectEqualStrings("u3/_tots/Gary-20261001-120006", totFolder(&b, 3, "Gary", 1790856006000).?); // a redeploy a second later is a new run
+    try tt.expect(totFolder(&b, 3, "../x", 1790856005123) == null);
+    try tt.expect(totFolder(&b, 3, "Gary", 0) == null); // an unreachable tot names no deployment
     try tt.expect(noteFileOk("findings.md") and !noteFileOk("..") and !noteFileOk("a/b") and !noteFileOk("a\\b") and !noteFileOk(""));
     var arena = std.heap.ArenaAllocator.init(tt.allocator);
     defer arena.deinit();
@@ -1565,22 +1783,22 @@ test "each deployment of a hot has its own folder name: the name and when it was
     try tt.expectEqualStrings("2026-10-01 12:00:05  r2   verdict  improved [3/10]\n                                   second line\n2026-10-01 12:00:06       status   rested\n", out.items);
 }
 
-test "a mirror pass writes each hot's folder and the scratchpad, and the next pass asks only for what moved" {
+test "a mirror pass writes each tot's folder and the scratchpad, and the next pass asks only for what moved" {
     const gpa = tt.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
     defer threaded.deinit();
     const io = threaded.io();
-    const root = "zig-cfhot-mirror-tmp";
+    const root = "zig-cftot-mirror-tmp";
     var ta = try http.testApp(gpa, io, root);
     defer ta.deinit();
     if (!curlRuns(gpa, io)) return error.SkipZigTest;
 
     const w = fakehttp.wire;
     const routes = [_]fakehttp.Route{
-        .{ .method = "GET", .path = "/v1/hots/Gary/events?after=0&", .reply = w("{\"ok\":true,\"seq\":2,\"events\":[{\"seq\":1,\"t\":1790856005123,\"kind\":\"goal\",\"text\":\"map the harbours\"},{\"seq\":2,\"t\":1790856006000,\"kind\":\"pick\",\"text\":\"list them\",\"i\":1}]}") },
-        .{ .method = "GET", .path = "/v1/hots/Gary/notes?after=0", .reply = w("{\"ok\":true,\"more\":false,\"names\":[\"harbours.md\"],\"notes\":[{\"name\":\"harbours.md\",\"t\":9,\"text\":\"# Harbours\\n- Tofino\"},{\"name\":\"../escape\",\"t\":10,\"text\":\"x\"}]}") },
+        .{ .method = "GET", .path = "/v1/tots/Gary/events?after=0&", .reply = w("{\"ok\":true,\"seq\":2,\"events\":[{\"seq\":1,\"t\":1790856005123,\"kind\":\"goal\",\"text\":\"map the harbours\"},{\"seq\":2,\"t\":1790856006000,\"kind\":\"pick\",\"text\":\"list them\",\"i\":1}]}") },
+        .{ .method = "GET", .path = "/v1/tots/Gary/notes?after=0", .reply = w("{\"ok\":true,\"more\":false,\"names\":[\"harbours.md\"],\"notes\":[{\"name\":\"harbours.md\",\"t\":9,\"text\":\"# Harbours\\n- Tofino\"},{\"name\":\"../escape\",\"t\":10,\"text\":\"x\"}]}") },
         .{ .method = "GET", .path = "/v1/pad?after=0", .reply = w("{\"ok\":true,\"seq\":1,\"entries\":[{\"seq\":1,\"t\":1790856005123,\"from\":\"Gary\",\"text\":\"harbours are in note harbours.md\"}]}") },
-        .{ .method = "GET", .path = "/v1/hots", .reply = w("{\"ok\":true,\"pad_seq\":1,\"hots\":[{\"name\":\"Gary\",\"state\":\"working\",\"created\":1790856005123,\"seq\":2,\"notes_rev\":1},{\"name\":\"Ada\",\"state\":\"unreachable\"}]}") },
+        .{ .method = "GET", .path = "/v1/tots", .reply = w("{\"ok\":true,\"pad_seq\":1,\"tots\":[{\"name\":\"Gary\",\"state\":\"working\",\"created\":1790856005123,\"seq\":2,\"notes_rev\":1},{\"name\":\"Ada\",\"state\":\"unreachable\"}]}") },
     };
     var srv: fakehttp.Server = undefined;
     try srv.startRouted(io, &routes, w("{\"ok\":false,\"err\":\"not found\"}"));
@@ -1599,7 +1817,7 @@ test "a mirror pass writes each hot's folder and the scratchpad, and the next pa
     srv.stop();
     running = false;
 
-    const dir = root ++ "/u1/_hots/Gary-20261001-120005";
+    const dir = root ++ "/u1/_tots/Gary-20261001-120005";
     const cwd = std.Io.Dir.cwd();
     const lg = try cwd.readFileAlloc(io, dir ++ "/events.log", a, .limited(1 << 20));
     try tt.expectEqualStrings("2026-10-01 12:00:05       goal     map the harbours\n2026-10-01 12:00:06  r1   pick     list them\n", lg);
@@ -1607,11 +1825,11 @@ test "a mirror pass writes each hot's folder and the scratchpad, and the next pa
     try tt.expectEqual(@as(usize, 2), std.mem.count(u8, jl, "\n"));
     try tt.expectEqualStrings("# Harbours\n- Tofino", try cwd.readFileAlloc(io, dir ++ "/notes/harbours.md", a, .limited(4096)));
     try tt.expect(std.mem.indexOf(u8, try cwd.readFileAlloc(io, dir ++ "/status.json", a, .limited(4096)), "\"working\"") != null);
-    try tt.expect(std.mem.indexOf(u8, try cwd.readFileAlloc(io, root ++ "/u1/_hots/scratchpad.md", a, .limited(4096)), "harbours are in note harbours.md") != null);
-    try tt.expectError(error.FileNotFound, cwd.statFile(io, root ++ "/u1/_hots/escape", .{})); // a note name never leaves notes/
-    try tt.expectEqual(@as(usize, 2), srv.countCalls("GET", "/v1/hots?"[0..8]) - srv.countCalls("GET", "/v1/hots/")); // the two roster calls
-    try tt.expectEqual(@as(usize, 1), srv.countCalls("GET", "/v1/hots/Gary/events"));
-    try tt.expectEqual(@as(usize, 1), srv.countCalls("GET", "/v1/hots/Gary/notes"));
+    try tt.expect(std.mem.indexOf(u8, try cwd.readFileAlloc(io, root ++ "/u1/_tots/scratchpad.md", a, .limited(4096)), "harbours are in note harbours.md") != null);
+    try tt.expectError(error.FileNotFound, cwd.statFile(io, root ++ "/u1/_tots/escape", .{})); // a note name never leaves notes/
+    try tt.expectEqual(@as(usize, 2), srv.countCalls("GET", "/v1/tots?"[0..8]) - srv.countCalls("GET", "/v1/tots/")); // the two roster calls
+    try tt.expectEqual(@as(usize, 1), srv.countCalls("GET", "/v1/tots/Gary/events"));
+    try tt.expectEqual(@as(usize, 1), srv.countCalls("GET", "/v1/tots/Gary/notes"));
     try tt.expectEqual(@as(usize, 1), srv.countCalls("GET", "/v1/pad"));
     try tt.expectEqual(@as(usize, 5), srv.call_count);
 }
@@ -1621,12 +1839,12 @@ test "removing the Worker forgets the deployment, every grant to this machine, a
     var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
     defer threaded.deinit();
     const io = threaded.io();
-    var ta = try http.testApp(gpa, io, "zig-cfhot-dellast-tmp");
+    var ta = try http.testApp(gpa, io, "zig-cftot-dellast-tmp");
     defer ta.deinit();
     if (!curlRuns(gpa, io)) return error.SkipZigTest;
     const w = fakehttp.wire;
     const routes = [_]fakehttp.Route{
-        .{ .method = "DELETE", .path = "/workers/scripts/veil-hots?force=true", .reply = w("{\"success\":true,\"errors\":[],\"result\":null}") },
+        .{ .method = "DELETE", .path = "/workers/scripts/veil-tots?force=true", .reply = w("{\"success\":true,\"errors\":[],\"result\":null}") },
     };
     var srv: fakehttp.Server = undefined;
     try srv.startRouted(io, &routes, w("{\"success\":false,\"errors\":[{\"code\":10007,\"message\":\"x\"}]}"));
@@ -1642,11 +1860,11 @@ test "removing the Worker forgets the deployment, every grant to this machine, a
     try tt.expectEqual(@as(?[]const u8, null), removeScript(&ta.app, a, 1, .{ .key = "k", .account_id = "acct" }, &st));
     srv.stop();
     running = false;
-    try tt.expectEqual(@as(?usize, 0), srv.firstCall("DELETE", "/accounts/acct/workers/scripts/veil-hots?force=true"));
-    try tt.expectEqual(@as(?usize, 1), srv.firstCall("DELETE", "/accounts/acct/workers/scripts/veil-hots-py?force=true")); // then its Python Worker
+    try tt.expectEqual(@as(?usize, 0), srv.firstCall("DELETE", "/accounts/acct/workers/scripts/veil-tots?force=true"));
+    try tt.expectEqual(@as(?usize, 1), srv.firstCall("DELETE", "/accounts/acct/workers/scripts/veil-tots-py?force=true")); // then its Python Worker
     const after = readState(&ta.app, 1, a);
     try tt.expectEqualStrings("", after.url); // forgotten: the next deploy uploads again
-    try tt.expectEqual(@as(usize, 0), after.local.len); // no grant outlives its hot
+    try tt.expectEqual(@as(usize, 0), after.local.len); // no grant outlives its tot
     try tt.expectEqual(@as(u32, 5), after.token_gen); // and the removed script's token is never valid again
 }
 
@@ -1655,7 +1873,7 @@ test "a Python that does not start with its native packages is uploaded again wi
     var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
     defer threaded.deinit();
     const io = threaded.io();
-    var ta = try http.testApp(gpa, io, "zig-cfhot-pycheck-tmp");
+    var ta = try http.testApp(gpa, io, "zig-cftot-pycheck-tmp");
     defer ta.deinit();
     if (!curlRuns(gpa, io)) return error.SkipZigTest;
     const w = fakehttp.wire;
@@ -1664,7 +1882,7 @@ test "a Python that does not start with its native packages is uploaded again wi
         .{ .method = "GET", .path = "/v1/python", .reply = w("<html>starting</html>"), .times = 1 },
         .{ .method = "GET", .path = "/v1/python", .reply = w("{\"ok\":true,\"python\":false,\"native\":[],\"error\":\"Worker exceeded its startup limits\"}"), .times = 2 },
         .{ .method = "GET", .path = "/v1/python", .reply = w("{\"ok\":true,\"python\":true,\"native\":[\"numpy\",\"regex\"],\"error\":\"\"}") },
-        .{ .method = "PUT", .path = "/workers/scripts/veil-hots-py", .reply = StandIn.ok },
+        .{ .method = "PUT", .path = "/workers/scripts/veil-tots-py", .reply = StandIn.ok },
     };
     var srv: fakehttp.Server = undefined;
     try srv.startRouted(io, &routes, StandIn.no_script);
@@ -1684,7 +1902,7 @@ test "a Python that does not start with its native packages is uploaded again wi
     try tt.expectEqual(@as(u8, 0), st.py_rung);
     checkPythonAs(&ta.app, a, 1, tok, &st); // one "no" is not enough
     try tt.expectEqual(@as(u8, 1), st.py_fails);
-    try tt.expectEqual(@as(usize, 0), srv.countCalls("PUT", "/accounts/acct/workers/scripts/veil-hots-py"));
+    try tt.expectEqual(@as(usize, 0), srv.countCalls("PUT", "/accounts/acct/workers/scripts/veil-tots-py"));
     checkPythonAs(&ta.app, a, 1, tok, &st); // the second is: the next smaller set goes up, and is checked in turn
     try tt.expectEqual(@as(u8, 1), st.py_rung);
     try tt.expectEqual(@as(u8, PY_CHECKS), st.py_check);
@@ -1695,7 +1913,7 @@ test "a Python that does not start with its native packages is uploaded again wi
     try tt.expectEqualStrings("numpy", st.py_native[0]);
     srv.stop();
     running = false;
-    try tt.expectEqual(@as(usize, 1), srv.countCalls("PUT", "/accounts/acct/workers/scripts/veil-hots-py"));
+    try tt.expectEqual(@as(usize, 1), srv.countCalls("PUT", "/accounts/acct/workers/scripts/veil-tots-py"));
     try tt.expectEqual(@as(usize, 4), srv.countCalls("GET", "/v1/python"));
     const kept = readState(&ta.app, 1, a); // and the state file says so
     try tt.expectEqual(@as(u8, 1), kept.py_rung);
@@ -1703,4 +1921,122 @@ test "a Python that does not start with its native packages is uploaded again wi
     // settled: nothing more is asked
     checkPython(&ta.app, a, 1, &st);
     try tt.expectEqual(@as(u8, 0), st.py_check);
+}
+
+test "hots from before the rename move across: each becomes a tot with its goal, settings, grant and files, the scratchpad follows, then the old Worker goes" {
+    const gpa = tt.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-cftot-move-tmp";
+    var ta = try http.testApp(gpa, io, root);
+    defer ta.deinit();
+    if (!curlRuns(gpa, io)) return error.SkipZigTest;
+    const w = fakehttp.wire;
+    const routes = [_]fakehttp.Route{
+        // the old runtime
+        .{ .method = "GET", .path = "/v1/hots/Gary/notes", .reply = w("{\"ok\":true,\"notes\":[{\"name\":\"plan.md\",\"t\":5,\"text\":\"# the plan\"}],\"more\":false}") },
+        .{ .method = "GET", .path = "/v1/hots/Ada/notes", .reply = w("{\"ok\":true,\"notes\":[],\"more\":false}") },
+        .{ .method = "GET", .path = "/v1/hots", .reply = w("{\"ok\":true,\"hots\":[" ++
+            "{\"name\":\"Gary\",\"model\":\"@cf/meta/llama-3.3-70b-instruct-fp8-fast\",\"pace_s\":10,\"size\":3,\"daily_calls\":0,\"charter\":\"\",\"paused\":false,\"goal\":{\"text\":\"chart the tides\",\"status\":\"active\",\"forever\":true,\"budget\":null}}," ++
+            "{\"name\":\"Ada\",\"model\":\"@cf/meta/llama-3.3-70b-instruct-fp8-fast\",\"pace_s\":60,\"size\":1,\"daily_calls\":400,\"charter\":\"keep the docs fresh\",\"paused\":true,\"goal\":{\"text\":\"done thing\",\"status\":\"achieved\"}}]}") },
+        .{ .method = "GET", .path = "/v1/pad?after=0", .reply = w("{\"ok\":true,\"entries\":[{\"seq\":1,\"t\":9,\"from\":\"Gary\",\"text\":\"hello from before\"}],\"seq\":1}") },
+        // the Cloudflare API: the new runtime goes up
+        .{ .method = "GET", .path = "/accounts/acct/workers/subdomain", .reply = StandIn.subdomain },
+        .{ .method = "GET", .path = "/workers/scripts/veil-tots/settings", .reply = StandIn.no_script },
+        .{ .method = "PUT", .path = "/workers/scripts/veil-tots-py", .reply = StandIn.ok },
+        .{ .method = "PUT", .path = "/workers/scripts/veil-tots", .reply = StandIn.ok },
+        .{ .method = "POST", .path = "/workers/scripts/veil-tots/subdomain", .reply = StandIn.ok },
+        // the new runtime
+        .{ .method = "POST", .path = "/v1/tots/", .reply = w("{\"ok\":true,\"files\":1}") },
+        .{ .method = "POST", .path = "/v1/tots", .reply = w("{\"ok\":true,\"tot\":{\"name\":\"Gary\"}}"), .times = 1 },
+        .{ .method = "POST", .path = "/v1/tots", .reply = w("{\"ok\":true,\"tot\":{\"name\":\"Ada\"}}"), .times = 1 },
+        .{ .method = "POST", .path = "/v1/pad/import", .reply = w("{\"ok\":true,\"imported\":1}") },
+        // and the old Workers go
+        .{ .method = "DELETE", .path = "/workers/scripts/veil-hots", .reply = StandIn.ok },
+    };
+    var srv: fakehttp.Server = undefined;
+    try srv.startRouted(io, &routes, StandIn.ok);
+    var running = true;
+    defer if (running) srv.stop();
+    var rb: [80]u8 = undefined;
+    ta.app.cf_api_root = try std.fmt.bufPrint(&rb, "http://127.0.0.1:{d}/client/v4", .{srv.port});
+    var ub: [80]u8 = undefined;
+    const stand_in = try std.fmt.bufPrint(&ub, "http://127.0.0.1:{d}", .{srv.port});
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tok: Tok = .{ .key = "oauth-bearer", .account_id = "acct" };
+
+    // what travels: an active goal; a finished one leaves the charter alone; with neither, MOVED_GOAL
+    const g = movedReq(.{ .name = "Gary", .model = "@cf/x", .goal = .{ .text = "chart the tides", .status = "active", .forever = true } }, &.{"gary"});
+    try tt.expectEqualStrings("chart the tides", g.goal);
+    try tt.expect(g.forever and g.local);
+    const ada = movedReq(.{ .name = "Ada", .model = "@cf/x", .charter = "keep the docs fresh", .goal = .{ .text = "done thing", .status = "achieved" } }, &.{"Gary"});
+    try tt.expectEqualStrings("", ada.goal);
+    try tt.expect(!ada.local);
+    try tt.expectEqualStrings(MOVED_GOAL, movedReq(.{ .name = "Bo", .model = "@cf/x" }, &.{}).goal);
+
+    // the old state, but logged in to another account: nothing is touched
+    var lb: [700]u8 = undefined;
+    const lpath = legacyPath(&ta.app, 1, &lb).?;
+    writeLegacy(&ta.app, 1, .{ .account = "acct", .url = stand_in, .token_gen = 2, .local = &.{"Gary"} });
+    try tt.expect(moveFromHots(&ta.app, a, 1, .{ .key = "k", .account_id = "other" }) != null);
+    try tt.expectEqual(@as(usize, 0), srv.countCalls("GET", "/v1/hots"));
+    // an old folder with a run in it
+    const run_dir = root ++ "/u1/_hots/Gary-20261001-190430";
+    _ = try std.Io.Dir.cwd().createDirPathStatus(io, run_dir, .default_dir);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = run_dir ++ "/events.log", .data = "r1 pick ...\n" });
+
+    try tt.expectEqual(@as(?[]const u8, null), moveFromHots(&ta.app, a, 1, tok));
+    // nothing left to move: no call at all
+    const calls_after = srv.countCalls("GET", "/v1/hots");
+    try tt.expectEqual(@as(?[]const u8, null), moveFromHots(&ta.app, a, 1, tok));
+    srv.stop();
+    running = false;
+    try tt.expectEqual(calls_after, srv.countCalls("GET", "/v1/hots"));
+    // both came across, Gary first (the runtime names its first tot Gary), each with an import of its files
+    try tt.expectEqual(@as(usize, 2), srv.countCalls("POST", "/v1/tots/"));
+    const gary_imp = srv.firstCall("POST", "/v1/tots/Gary/import").?;
+    const ada_imp = srv.firstCall("POST", "/v1/tots/Ada/import").?;
+    try tt.expect(gary_imp < ada_imp);
+    // the scratchpad after the tots, the old Workers last of all
+    const pad_imp = srv.firstCall("POST", "/v1/pad/import").?;
+    const removed = srv.firstCall("DELETE", "/accounts/acct/workers/scripts/veil-hots?force=true").?;
+    try tt.expect(ada_imp < pad_imp and pad_imp < removed);
+    try tt.expect(srv.firstCall("DELETE", "/accounts/acct/workers/scripts/veil-hots-py?force=true") != null);
+    // the new state: deployed, and only the hot that had this machine still has it
+    const st = readState(&ta.app, 1, a);
+    try tt.expectEqualStrings(stand_in, st.url);
+    try tt.expectEqual(@as(usize, 1), st.local.len);
+    try tt.expectEqualStrings("Gary", st.local[0]);
+    // the old state is gone and the folder moved under the new name
+    try tt.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, lpath, .{}));
+    try std.Io.Dir.cwd().access(io, root ++ "/u1/_tots/Gary-20261001-190430/events.log", .{});
+}
+
+test "a move whose old runtime does not answer removes nothing and keeps the old state for the next attempt" {
+    const gpa = tt.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var ta = try http.testApp(gpa, io, "zig-cftot-move-dark-tmp");
+    defer ta.deinit();
+    if (!curlRuns(gpa, io)) return error.SkipZigTest;
+    var srv: fakehttp.Server = undefined;
+    try srv.startRouted(io, &.{}, StandIn.ok);
+    var running = true;
+    defer if (running) srv.stop();
+    var rb: [80]u8 = undefined;
+    ta.app.cf_api_root = try std.fmt.bufPrint(&rb, "http://127.0.0.1:{d}/client/v4", .{srv.port});
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // the old runtime's address answers nothing (a closed loopback port)
+    writeLegacy(&ta.app, 1, .{ .account = "acct", .url = "http://127.0.0.1:1" });
+    try tt.expect(moveFromHots(&ta.app, a, 1, .{ .key = "k", .account_id = "acct" }) != null);
+    srv.stop();
+    running = false;
+    try tt.expectEqual(@as(usize, 0), srv.countCalls("DELETE", "/workers/scripts/veil-hots"));
+    try tt.expect(readLegacy(&ta.app, 1, a) != null);
 }

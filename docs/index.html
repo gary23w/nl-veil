@@ -185,9 +185,10 @@
         is served by the server itself &mdash; no separate model runtime, no API key. Click <em>download the
         model</em> in the app (or run <code>veil model pull</code>) and the whole thing works offline. Point it
         at Ollama or any OpenAI-compatible endpoint instead whenever you would rather.</p>
-      <p><strong>New in <code>v1.1.7</code>: hots &mdash; goal loops that run without you, in your own account.</strong>
-        Log in with Cloudflare, open the new <em>Hots</em> tab (or run <code>veil hot deploy "&lt;goal&gt;"</code>),
-        and the veil uploads one small Worker into <em>your</em> account. Each hot wakes on a timer, makes one
+      <p><strong>New: tots &mdash; goal loops that run without you, in your own account.</strong>
+        (<code>v1.1.7</code> called them hots; a newer veil moves yours across by itself.)
+        Log in with Cloudflare, open the new <em>Tots</em> tab (or run <code>veil tot deploy "&lt;goal&gt;"</code>),
+        and the veil uploads one small Worker into <em>your</em> account. Each tot wakes on a timer, makes one
         measured improvement toward its goal, writes itself lessons from what the measurement said, and moves on
         to the next best thing when a goal ends &mdash; with your computer off. It works with real tools: its
         own files, web search and any HTTP call, a real browser, Python (and scripts it saves as skills of its
@@ -195,10 +196,10 @@
         always named Gary; they share a scratchpad, cast their own inner swarms, and may use your machine only if
         you check the box at deployment. Every run is mirrored into a folder on your machine &mdash; an
         <code>events.log</code> to tail, its notes, the shared scratchpad &mdash; that the tab opens for you; the
-        model list is your account's own, and deleting the last hot removes its Worker. Also new:
+        model list is your account's own, and deleting the last tot removes its Worker. Also new:
         <code>/goal &lt;text&gt;</code> in any chat gives the auto-loop a stored goal, a measured outcome per step
         and its own stop rules.
-        <a href="#doc=config/cf_hot">How hots work &rarr;</a>
+        <a href="#doc=config/cf_tot">How tots work &rarr;</a>
         <a href="https://github.com/gary23w/nl-veil/blob/main/docs/release/RELEASE-v1.1.7.md" target="_blank" rel="noopener">v1.1.7 release notes &rarr;</a></p>
       <p><strong>Before it: <code>v1.1.6</code>, watch a swarm from the terminal.</strong>
         <code>veil --swarm "&lt;goal&gt;"</code> casts a swarm and opens a terminal view: every mind's step on the

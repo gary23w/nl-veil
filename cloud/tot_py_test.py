@@ -1,4 +1,4 @@
-# hot_py_test.py - the hot's Python runner (hot_py.py) under plain CPython: `python cloud/hot_py_test.py`.
+# tot_py_test.py - the tot's Python runner (tot_py.py) under plain CPython: `python cloud/tot_py_test.py`.
 # The oracle runs it; it exits non-zero on the first failed check. Plain CPython has no run_sync, so every
 # HTTP call here goes the REPLAY way (stop at the request, fetch, run again) - the path a Worker without it takes.
 # The web and PyPI are a loopback server in this file; nothing leaves the machine.
@@ -12,11 +12,11 @@ import threading
 import zipfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import hot_py  # noqa: E402
+import tot_py  # noqa: E402
 
 
 def run(data):
-    return asyncio.run(hot_py.run(data))
+    return asyncio.run(tot_py.run(data))
 
 
 def check(name, cond, detail=None):
@@ -91,7 +91,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
 threading.Thread(target=srv.serve_forever, daemon=True).start()
 BASE = "http://127.0.0.1:%d" % srv.server_port
-hot_py.PYPI = BASE + "/pypi/{}/json"
+tot_py.PYPI = BASE + "/pypi/{}/json"
 
 # ------------------------------------------------------------------ the basics
 
@@ -106,7 +106,7 @@ check("a changed input comes back", r["files"] == {"in.txt": "changed"}, r)
 
 r = run({"code": "print('before')\n1/0"})
 check("an exception is a failed run with its traceback, and the output before it kept", (not r["ok"]) and "before" in r["out"] and "ZeroDivisionError" in r["out"], r)
-check("the traceback starts at the script's own frame, not the runner's", "hot_py.py" not in r["out"] and 'File "<hot>", line 2' in r["out"], r)
+check("the traceback starts at the script's own frame, not the runner's", "tot_py.py" not in r["out"] and 'File "<tot>", line 2' in r["out"], r)
 
 r = run({"code": "import asyncio\nawait asyncio.sleep(0)\nprint('awaited', ARGS['x'])", "args": {"x": 7}})
 check("top-level await runs, and ARGS carries the caller's arguments", r["ok"] and r["out"] == "awaited 7\n", r)
@@ -118,7 +118,7 @@ r = run({"code": "print(open('x').read())", "files": {"../escape": "no", "x": "y
 check("a file name never leaves the scratch directory", r["ok"] and r["out"] == "yes\n", r)
 
 r = run({"code": "print('y' * 50000)"})
-check("long output keeps its tail", len(r["out"]) <= hot_py.OUT_MAX + 40 and r["out"].startswith("...(earlier output cut)"), len(r["out"]))
+check("long output keeps its tail", len(r["out"]) <= tot_py.OUT_MAX + 40 and r["out"].startswith("...(earlier output cut)"), len(r["out"]))
 
 cwd = os.getcwd()
 run({"code": "import os\nos.chdir('/')"})
@@ -151,14 +151,14 @@ HITS.clear()
 r = run({"code": "import tidekit\nprint(tidekit.high(20))"})
 check("a missing import is installed from PyPI with what it requires, and the script runs", r["ok"] and r["out"] == "(installed: tidekit 1.0, tidehelp 2.1)\n41\n", r)
 check("the installed list names both, and an optional (extra) requirement was not fetched", r["installed"] == ["tidehelp", "tidekit"] and not any("extra-only" in h[1] for h in HITS), (r["installed"], HITS))
-check("a wheel member cannot leave the site directory", not os.path.exists(os.path.join(os.path.dirname(hot_py.SITE), "escape.py")))
+check("a wheel member cannot leave the site directory", not os.path.exists(os.path.join(os.path.dirname(tot_py.SITE), "escape.py")))
 
 HITS.clear()
 r = run({"code": "import tidekit\nprint(tidekit.high(1))"})
 check("an installed package is not fetched again", r["ok"] and r["out"] == "3\n" and HITS == [], (r, HITS))
 
 for k in ("tidekit", "tidehelp"):
-    hot_py.INSTALLED.pop(k, None)
+    tot_py.INSTALLED.pop(k, None)
     for m in [m for m in sys.modules if m.startswith(k)]:
         del sys.modules[m]
 r = run({"code": "import subprocess, sys\nsubprocess.check_call([sys.executable, '-m', 'pip', 'install', 'tidekit'])\nimport tidekit\nprint(tidekit.high(2))\nprint(subprocess.check_output(['pip', 'freeze']).decode().strip())"})
@@ -180,27 +180,27 @@ check("the refusal says what to do instead, and the name is remembered as one th
 HITS.clear()
 r = run({"code": "import nativepkg"})
 check("a name already found to need native code is refused without a second trip to PyPI", (not r["ok"]) and "has no pure-Python wheel" in r["out"] and HITS == [], (r, HITS))
-check("the script's own error is shown once, without the runner's lookup inside it", r["out"].count("Traceback") == 1 and "hot_py.py" not in r["out"] and "During handling" not in r["out"], r)
-hot_py.UNAVAILABLE.clear()
+check("the script's own error is shown once, without the runner's lookup inside it", r["out"].count("Traceback") == 1 and "tot_py.py" not in r["out"] and "During handling" not in r["out"], r)
+tot_py.UNAVAILABLE.clear()
 r = run({"code": "import nativepkg", "skip": ["NativePkg"]})
-check("the names a hot was already refused ride with the script", (not r["ok"]) and "has no pure-Python wheel" in r["out"] and not any("nativepkg" in h[1] for h in HITS), (r, HITS))
-hot_py.UNAVAILABLE.clear()
+check("the names a tot was already refused ride with the script", (not r["ok"]) and "has no pure-Python wheel" in r["out"] and not any("nativepkg" in h[1] for h in HITS), (r, HITS))
+tot_py.UNAVAILABLE.clear()
 
 r = run({"code": "import halfkit\nprint(halfkit.ok())"})
 check("a package whose requirement needs native code is installed without it, and says so", r["ok"] and r["out"] == "(installed: halfkit 1.0)\n(halfkit is installed WITHOUT nativepkg, which it requires: nativepkg has no pure-Python wheel (it needs native code))\nyes\n" and "halfkit" in r["installed"] and "nativepkg" not in r["installed"], r)
-hot_py.UNAVAILABLE.clear()
+tot_py.UNAVAILABLE.clear()
 
 r = run({"caps": True})
-check("asked what it is, the runner names the native packages it has", r["ok"] and isinstance(r["native"], list) and r["native"] == hot_py._caps() and r["python"][0] == "3", r)
+check("asked what it is, the runner names the native packages it has", r["ok"] and isinstance(r["native"], list) and r["native"] == tot_py._caps() and r["python"][0] == "3", r)
 check("the standard library is never looked up on PyPI", run({"code": "", "install": ["json"]})["ok"] and not any("/json" in h[1] and "pypi/json/" in h[1] for h in HITS), HITS)
-check("a matplotlib that is not here is refused with what to do instead", hot_py._has("matplotlib") or "write the SVG or HTML text yourself" in hot_py._native_words("matplotlib"), hot_py._native_words("matplotlib"))
+check("a matplotlib that is not here is refused with what to do instead", tot_py._has("matplotlib") or "write the SVG or HTML text yourself" in tot_py._native_words("matplotlib"), tot_py._native_words("matplotlib"))
 
 r = run({"code": "open('pic.png', 'wb').write(bytes([137, 80, 78, 71, 255, 254]))\nopen('ok.svg', 'w').write('<svg/>')"})
 check("a binary file a script writes is not kept, and the output says so", r["ok"] and r["files"] == {"ok.svg": "<svg/>"} and "(not kept: pic.png - only text files" in r["out"], r)
 
-hot_py.INSTALLED.clear()
+tot_py.INSTALLED.clear()
 r = run({"code": "import tidehelp\nprint(tidehelp.twice(4))", "packages": ["tidehelp"]})
-check("the packages a hot remembers are there before its script starts", r["ok"] and r["out"] == "(installed: tidehelp 2.1)\n8\n", r)
+check("the packages a tot remembers are there before its script starts", r["ok"] and r["out"] == "(installed: tidehelp 2.1)\n8\n", r)
 
 # ------------------------------------------------------------------ processes
 
@@ -221,10 +221,10 @@ class Req:
         return self.body
 
 
-resp = asyncio.run(hot_py.Default().fetch(Req(json.dumps({"code": "print(2+2)"}))))
+resp = asyncio.run(tot_py.Default().fetch(Req(json.dumps({"code": "print(2+2)"}))))
 j = json.loads(resp.body)
 check("the Worker entry answers JSON", (j["ok"], j["out"], j["files"]) == (True, "4\n", {}), j)
-resp = asyncio.run(hot_py.Default().fetch(Req("not json")))
+resp = asyncio.run(tot_py.Default().fetch(Req("not json")))
 check("a bad request is answered, not raised", json.loads(resp.body)["ok"] is False)
 srv.shutdown()
 print("all passed")

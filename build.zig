@@ -73,9 +73,9 @@ pub fn build(b: *std.Build) void {
     exe.link_data_sections = true;
     exe.link_gc_sections = true;
     exe.root_module.addImport("httpz", httpz.module("httpz"));
-    // The hot runtime (config/cf_hot.zig uploads it into the user's Cloudflare account as it is).
-    exe.root_module.addAnonymousImport("hot.js", .{ .root_source_file = b.path("cloud/hot.js") });
-    exe.root_module.addAnonymousImport("hot_py.py", .{ .root_source_file = b.path("cloud/hot_py.py") });
+    // The tot runtime (config/cf_tot.zig uploads it into the user's Cloudflare account as it is).
+    exe.root_module.addAnonymousImport("tot.js", .{ .root_source_file = b.path("cloud/tot.js") });
+    exe.root_module.addAnonymousImport("tot_py.py", .{ .root_source_file = b.path("cloud/tot_py.py") });
     exe.root_module.addAnonymousImport("neuron-db.mjs", .{ .root_source_file = b.path("cloud/neuron-db.mjs") });
     exe.root_module.addAnonymousImport("neuron_core.wasm", .{ .root_source_file = b.path("cloud/neuron_core.wasm") });
     exe.root_module.addAnonymousImport("index.html", .{ .root_source_file = b.path("web/public/index.html") });
@@ -223,8 +223,8 @@ pub fn build(b: *std.Build) void {
     inline for (.{ "index.html", "app.js", "styles.css", "models.json" }) |asset| {
         tests.root_module.addAnonymousImport(asset, .{ .root_source_file = b.path("web/public/" ++ asset) });
     }
-    tests.root_module.addAnonymousImport("hot.js", .{ .root_source_file = b.path("cloud/hot.js") }); // config/cf_hot.zig
-    tests.root_module.addAnonymousImport("hot_py.py", .{ .root_source_file = b.path("cloud/hot_py.py") });
+    tests.root_module.addAnonymousImport("tot.js", .{ .root_source_file = b.path("cloud/tot.js") }); // config/cf_tot.zig
+    tests.root_module.addAnonymousImport("tot_py.py", .{ .root_source_file = b.path("cloud/tot_py.py") });
     tests.root_module.addAnonymousImport("neuron-db.mjs", .{ .root_source_file = b.path("cloud/neuron-db.mjs") });
     tests.root_module.addAnonymousImport("neuron_core.wasm", .{ .root_source_file = b.path("cloud/neuron_core.wasm") });
     addLua(b, tests.root_module); // src/plug/* tests bind the embedded Lua

@@ -11,7 +11,7 @@ const rl = @import("raylib");
 const t = @import("theme.zig");
 const store_mod = @import("store.zig");
 const scan = @import("scan.zig");
-const hots = @import("hots.zig");
+const tots = @import("tots.zig");
 const poller_mod = @import("poller.zig");
 const chat_mod = @import("chat.zig");
 const llm = @import("llm.zig");
@@ -112,7 +112,7 @@ fn tbThemeRect() t.Rect {
 }
 
 const InnerTab = enum { console, details, files };
-const DdKind = enum { none, provider, model, style, minutes, stack, mode, chat_provider, chat_byok, chat_model, think_provider, think_byok, think_model, prompt_provider, prompt_byok, prompt_model, sched_model, chat_role, hot_model };
+const DdKind = enum { none, provider, model, style, minutes, stack, mode, chat_provider, chat_byok, chat_model, think_provider, think_byok, think_model, prompt_provider, prompt_byok, prompt_model, sched_model, chat_role, tot_model };
 
 /// catalog.providers index of the BUILT-IN provider — the Settings one-click select writes it into
 /// chat_byok. Comptime so a catalog edit that drops or renames the provider fails the build here
@@ -147,7 +147,7 @@ const Ui = struct {
     inner: InnerTab = .console,
     focus: Focus = .none,
     input_active: bool = false, // handleKeys/editField set this when they consume a keystroke — drives FPS
-    hot_frames: u32 = 0, // frames of snappy 60fps remaining after the last activity (activity-gated redraw)
+    tot_frames: u32 = 0, // frames of snappy 60fps remaining after the last activity (activity-gated redraw)
     // Chat message render-height cache: word-wrapping every message twice per frame (measure + draw) pins a
     // CPU core on long chats. Cache heights; recompute only when the message set or wrap width changes.
     // INCREMENTAL: per-row fingerprints (mh_mfp) so a change re-measures only the changed/new rows (re-wrapping
@@ -254,30 +254,30 @@ const Ui = struct {
     d_breakout: bool = false,
     d_psyche: bool = false,
     swarm_inner: SwarmInner = .live, // Swarm tab: live view | the deploy form (Deploy folded in as an inner tab)
-    // Hots tab: the deploy form's fields, the line that talks to the selected hot, the scratchpad line
-    hot_form: bool = false,
-    hot_name: Field = .{},
-    hot_goal: Field = .{},
-    hot_charter: Field = .{},
-    hot_model: Field = .{},
-    hot_cmd: Field = .{},
-    hot_padline: Field = .{},
-    hot_pace: usize = 6, // index into HOT_PACES (10 minutes)
-    hot_calls: usize = 3, // index into HOT_CALLS (400 a day)
-    hot_size: i32 = 3,
-    hot_forever: bool = false,
-    hot_local: bool = false, // "let it use THIS machine": unchecked on every new form
-    hot_del: [hots.NAME_MAX]u8 = undefined, // the hot whose Delete was clicked once (the second click deletes)
-    hot_del_len: u8 = 0,
-    hot_scroll: f32 = 0, // the console, in visual lines
-    hot_follow: bool = true, // pinned to the newest line
-    hot_sb_drag: bool = false, // the console's scrollbar is being dragged
-    hot_open: [12]u64 = [_]u64{0} ** 12, // the events (by seq) whose rows are open in the console
-    hot_open_n: usize = 0,
-    hot_errors_only: bool = false, // the console shows only the rows that went wrong
-    hot_pad_scroll: f32 = 0, // the scratchpad, in pixels
-    hot_pad_follow: bool = true,
-    hot_pad_clear_armed: bool = false, // "clear" was clicked once (the second click clears)
+    // Tots tab: the deploy form's fields, the line that talks to the selected tot, the scratchpad line
+    tot_form: bool = false,
+    tot_name: Field = .{},
+    tot_goal: Field = .{},
+    tot_charter: Field = .{},
+    tot_model: Field = .{},
+    tot_cmd: Field = .{},
+    tot_padline: Field = .{},
+    tot_pace: usize = 6, // index into TOT_PACES (10 minutes)
+    tot_calls: usize = 3, // index into TOT_CALLS (400 a day)
+    tot_size: i32 = 3,
+    tot_forever: bool = false,
+    tot_local: bool = false, // "let it use THIS machine": unchecked on every new form
+    tot_del: [tots.NAME_MAX]u8 = undefined, // the tot whose Delete was clicked once (the second click deletes)
+    tot_del_len: u8 = 0,
+    tot_scroll: f32 = 0, // the console, in visual lines
+    tot_follow: bool = true, // pinned to the newest line
+    tot_sb_drag: bool = false, // the console's scrollbar is being dragged
+    tot_open: [12]u64 = [_]u64{0} ** 12, // the events (by seq) whose rows are open in the console
+    tot_open_n: usize = 0,
+    tot_errors_only: bool = false, // the console shows only the rows that went wrong
+    tot_pad_scroll: f32 = 0, // the scratchpad, in pixels
+    tot_pad_follow: bool = true,
+    tot_pad_clear_armed: bool = false, // "clear" was clicked once (the second click clears)
     lin_scroll: f32 = 0, // Swarm tab Lineages view
     // live-reply activity tracking (drives the thinking mark's energy): the stream's last seen length +
     // the wall time it last GREW. Updated at the one live renderMsg call site each frame.
@@ -684,14 +684,14 @@ pub fn runApp(data_dir: ?[]const u8) !void {
         {
             const mdelta = rl.getMouseDelta();
             const mouse_active = mdelta.x != 0 or mdelta.y != 0 or rl.isMouseButtonDown(.left) or rl.isMouseButtonDown(.right) or rl.getMouseWheelMove() != 0;
-            if (mouse_active or ui.input_active or busy0) ui.hot_frames = 40; // ~0.66s of 60fps after any activity
+            if (mouse_active or ui.input_active or busy0) ui.tot_frames = 40; // ~0.66s of 60fps after any activity
             ui.input_active = false; // handleKeys/editField below re-arm it for the next frame
             const focused = rl.isWindowFocused();
             // idle floors: 30 focused / 6 unfocused. Input is still polled EVERY frame, so the first wake
-            // costs at most one idle frame (~33ms) before hot_frames restores 60fps, and the
+            // costs at most one idle frame (~33ms) before tot_frames restores 60fps, and the
             // focused-idle redraw was the last steady CPU line item after the poller/log churn fixes.
-            const fps: i32 = if (ui.hot_frames > 0) (if (focused) 60 else 30) else if (focused) 30 else 6;
-            if (ui.hot_frames > 0) ui.hot_frames -= 1;
+            const fps: i32 = if (ui.tot_frames > 0) (if (focused) 60 else 30) else if (focused) 30 else 6;
+            if (ui.tot_frames > 0) ui.tot_frames -= 1;
             rl.setTargetFPS(fps);
         }
         // KEYBOARD NAVIGATION (accessibility): Tab / Shift+Tab walk a high-contrast focus ring across
@@ -784,7 +784,7 @@ pub fn runApp(data_dir: ?[]const u8) !void {
                                     gotoDeploy(); // deploy is the Swarm tab's inner form now — "tab deploy" still lands there
                                 } else {
                                     const tv: ?Tab =
-                                        if (std.mem.eql(u8, tn, "dashboard")) .dashboard else if (std.mem.eql(u8, tn, "chat")) .chat else if (std.mem.eql(u8, tn, "swarm")) .swarm else if (std.mem.eql(u8, tn, "hots")) .hots else if (std.mem.eql(u8, tn, "hub")) .hub else if (std.mem.eql(u8, tn, "scheduled")) .scheduled else if (std.mem.eql(u8, tn, "tasks")) .scheduled else if (std.mem.eql(u8, tn, "settings")) .settings else null;
+                                        if (std.mem.eql(u8, tn, "dashboard")) .dashboard else if (std.mem.eql(u8, tn, "chat")) .chat else if (std.mem.eql(u8, tn, "swarm")) .swarm else if (std.mem.eql(u8, tn, "tots")) .tots else if (std.mem.eql(u8, tn, "hub")) .hub else if (std.mem.eql(u8, tn, "scheduled")) .scheduled else if (std.mem.eql(u8, tn, "tasks")) .scheduled else if (std.mem.eql(u8, tn, "settings")) .settings else null;
                                     if (tv) |v| setTab(v);
                                 }
                             } else if (std.mem.startsWith(u8, cmd, "right ")) {
@@ -919,7 +919,7 @@ pub fn runApp(data_dir: ?[]const u8) !void {
             .dashboard => drawDashboard(&store, body),
             .chat => drawChat(&store, body),
             .swarm => drawSwarm(&store, body),
-            .hots => drawHots(&store, body),
+            .tots => drawTots(&store, body),
             .hub => drawHub(body),
             .scheduled => drawScheduled(&store, body),
             .settings => drawSettings(&store, body),
@@ -1605,7 +1605,7 @@ fn showDesk() void {
     ui.dragging = false;
     ui.resizing = false;
     ui.file_menu = false;
-    ui.hot_frames = 60; // come back at full frame rate, not the idle pacer
+    ui.tot_frames = 60; // come back at full frame rate, not the idle pacer
     log.info("desk reopened from tray", .{});
 }
 
@@ -1694,7 +1694,7 @@ fn handleKeys(store: *Store) void {
         if (rl.isKeyPressed(.five)) setTab(.hub);
         if (rl.isKeyPressed(.six)) setTab(.settings);
         if (rl.isKeyPressed(.seven)) gotoDeploy(); // deploy lives inside Swarm now
-        if (rl.isKeyPressed(.eight)) setTab(.hots);
+        if (rl.isKeyPressed(.eight)) setTab(.tots);
     }
     // Keyboard copy — ONE priority chain, NOT gated on focus (the Chat tab force-focuses the prompt input and
     // clicks never clear focus, so a focus gate would make "select text, Ctrl+C" copy the empty input instead):
@@ -1783,12 +1783,12 @@ fn focusedField() ?*Ui.Field {
         .sc_base => &ui.sc_base,
         .sc_model => &ui.sc_model,
         .sc_key => &ui.sc_key,
-        .h_name => &ui.hot_name,
-        .h_goal => &ui.hot_goal,
-        .h_charter => &ui.hot_charter,
-        .h_model => &ui.hot_model,
-        .h_cmd => &ui.hot_cmd,
-        .h_pad => &ui.hot_padline,
+        .h_name => &ui.tot_name,
+        .h_goal => &ui.tot_goal,
+        .h_charter => &ui.tot_charter,
+        .h_model => &ui.tot_model,
+        .h_cmd => &ui.tot_cmd,
+        .h_pad => &ui.tot_padline,
     };
 }
 
@@ -1891,8 +1891,8 @@ fn drawTabbar(store: *Store) void {
     const sw: f32 = @floatFromInt(rl.getScreenWidth());
     t.fillRect(0, TITLE_H, @intFromFloat(sw), TAB_H, t.bg_dark);
     t.hline(0, TITLE_H + TAB_H - 1, @intFromFloat(sw), t.border);
-    const labels = [_][:0]const u8{ t.z("Dashboard", .{}), t.z("Chat", .{}), t.z("Tasks", .{}), t.z("Swarm", .{}), t.z("Hots", .{}), t.z("Hub", .{}), t.z("Settings", .{}) };
-    const tabs = [_]Tab{ .dashboard, .chat, .scheduled, .swarm, .hots, .hub, .settings };
+    const labels = [_][:0]const u8{ t.z("Dashboard", .{}), t.z("Chat", .{}), t.z("Tasks", .{}), t.z("Swarm", .{}), t.z("Tots", .{}), t.z("Hub", .{}), t.z("Settings", .{}) };
+    const tabs = [_]Tab{ .dashboard, .chat, .scheduled, .swarm, .tots, .hub, .settings };
     var x: f32 = t.PAD;
     for (labels, tabs) |lb, tabv| {
         const w = t.tabW(lb);
@@ -6221,7 +6221,7 @@ fn flushDropdown(store: *Store) void {
     switch (ui.open_dd) {
         .chat_provider, .chat_byok, .chat_model, .think_provider, .think_byok, .think_model, .prompt_provider, .prompt_byok, .prompt_model => return, // owned by flushChatDropdown (Settings tab)
         .sched_model => return, // owned by flushSchedDropdown (Tasks tab) — never rendered from the deploy form
-        .hot_model => return, // owned by flushHotModelDropdown (Hots tab)
+        .tot_model => return, // owned by flushTotModelDropdown (Tots tab)
         .chat_role => return, // owned by flushChatRoleDropdown (Chat tab composer)
         else => {},
     }
@@ -6288,7 +6288,7 @@ fn flushDropdown(store: *Store) void {
             }
             current = ui.d_mode;
         },
-        .none, .chat_provider, .chat_byok, .chat_model, .think_provider, .think_byok, .think_model, .prompt_provider, .prompt_byok, .prompt_model, .sched_model, .chat_role, .hot_model => return,
+        .none, .chat_provider, .chat_byok, .chat_model, .think_provider, .think_byok, .think_model, .prompt_provider, .prompt_byok, .prompt_model, .sched_model, .chat_role, .tot_model => return,
     }
     const chosen = drawList(ui.dd_rect, labels[0..count], current);
     if (chosen) |ci| {
@@ -6309,7 +6309,7 @@ fn flushDropdown(store: *Store) void {
             .minutes => ui.d_minutes = ci,
             .stack => ui.d_stack = ci,
             .mode => ui.d_mode = ci,
-            .none, .chat_provider, .chat_byok, .chat_model, .think_provider, .think_byok, .think_model, .prompt_provider, .prompt_byok, .prompt_model, .sched_model, .chat_role, .hot_model => {},
+            .none, .chat_provider, .chat_byok, .chat_model, .think_provider, .think_byok, .think_model, .prompt_provider, .prompt_byok, .prompt_model, .sched_model, .chat_role, .tot_model => {},
         }
         ui.open_dd = .none;
     }
@@ -7639,34 +7639,34 @@ fn kindColor(kind: []const u8) t.Color {
     return t.cyan;
 }
 
-// -------------------------------------------------------------------------------- hots
+// -------------------------------------------------------------------------------- tots
 
 /// Seconds between iterations, and model calls per day: the choices the deploy form cycles through.
-const HOT_PACES = [_]u32{ 5, 10, 30, 60, 120, 300, 600, 1800, 3600, 21600 };
+const TOT_PACES = [_]u32{ 5, 10, 30, 60, 120, 300, 600, 1800, 3600, 21600 };
 /// 0 = no limit.
-const HOT_CALLS = [_]u32{ 50, 100, 200, 400, 1000, 5000, 20000, 0 };
+const TOT_CALLS = [_]u32{ 50, 100, 200, 400, 1000, 5000, 20000, 0 };
 
 /// "41/400 calls" or, with no limit, "41 calls, no limit". Pure.
-fn hotCallsStr(buf: []u8, today: u32, daily: u32) []const u8 {
+fn totCallsStr(buf: []u8, today: u32, daily: u32) []const u8 {
     if (daily == 0) return std.fmt.bufPrint(buf, "{d} calls, no limit", .{today}) catch "";
     return std.fmt.bufPrint(buf, "{d}/{d} calls", .{ today, daily }) catch "";
 }
 
 /// "every 10m" / "every 6h" / "every 45s". Pure.
-fn hotPaceStr(buf: []u8, secs: u32) []const u8 {
+fn totPaceStr(buf: []u8, secs: u32) []const u8 {
     if (secs >= 3600 and secs % 3600 == 0) return std.fmt.bufPrint(buf, "every {d}h", .{secs / 3600}) catch "";
     if (secs >= 60 and secs % 60 == 0) return std.fmt.bufPrint(buf, "every {d}m", .{secs / 60}) catch "";
     return std.fmt.bufPrint(buf, "every {d}s", .{secs}) catch "";
 }
 
-/// One line of what a hot is doing with its goal: "active - iteration 7, 4 improved, runs until stopped". Pure.
-fn hotGoalLine(buf: []u8, row: *const hots.Row) []const u8 {
+/// One line of what a tot is doing with its goal: "active - iteration 7, 4 improved, runs until stopped". Pure.
+fn totGoalLine(buf: []u8, row: *const tots.Row) []const u8 {
     if (row.goal_len == 0) return "no goal - looking for the next best thing";
     if (row.forever or row.budget == 0) return std.fmt.bufPrint(buf, "{s} - iteration {d}, {d} improved", .{ row.goalStatusStr(), row.iteration, row.improved }) catch "";
     return std.fmt.bufPrint(buf, "{s} - iteration {d} of {d}, {d} improved", .{ row.goalStatusStr(), row.iteration, row.budget, row.improved }) catch "";
 }
 
-fn hotStateColor(state: []const u8) t.Color {
+fn totStateColor(state: []const u8) t.Color {
     if (std.mem.eql(u8, state, "working")) return t.green;
     if (std.mem.eql(u8, state, "roaming")) return t.cyan;
     if (std.mem.eql(u8, state, "resting")) return t.yellow;
@@ -7676,8 +7676,8 @@ fn hotStateColor(state: []const u8) t.Color {
 
 /// The next visual line of `text` from `pos`, at most `cols` characters wide: up to a line break, else up to the
 /// last space that fits, else a hard cut (never inside a UTF-8 character). Pure.
-const HotWrap = struct { line: []const u8, next: usize };
-fn hotWrapNext(text: []const u8, pos: usize, cols: usize) HotWrap {
+const TotWrap = struct { line: []const u8, next: usize };
+fn totWrapNext(text: []const u8, pos: usize, cols: usize) TotWrap {
     const rest = text[pos..];
     const lim = @min(rest.len, cols);
     if (std.mem.indexOfScalar(u8, rest[0..lim], '\n')) |k| return .{ .line = rest[0..k], .next = pos + k + 1 };
@@ -7692,39 +7692,39 @@ fn hotWrapNext(text: []const u8, pos: usize, cols: usize) HotWrap {
 }
 
 /// How many visual lines `text` takes at `cols` (at least one).
-fn hotLineCount(text: []const u8, cols: usize) usize {
+fn totLineCount(text: []const u8, cols: usize) usize {
     var n: usize = 0;
     var p: usize = 0;
-    while (p < text.len) : (n += 1) p = hotWrapNext(text, p, cols).next;
+    while (p < text.len) : (n += 1) p = totWrapNext(text, p, cols).next;
     return @max(n, 1);
 }
 
 /// Whether event `seq` is open in the console.
-fn hotIsOpen(seq: u64) bool {
-    for (ui.hot_open[0..ui.hot_open_n]) |s| if (s == seq) return true;
+fn totIsOpen(seq: u64) bool {
+    for (ui.tot_open[0..ui.tot_open_n]) |s| if (s == seq) return true;
     return false;
 }
 
-/// Open a closed row, close an open one. The newest HOT_OPEN_MAX stay open; opening one more closes the oldest.
-fn hotToggle(seq: u64) void {
-    for (ui.hot_open[0..ui.hot_open_n], 0..) |s, k| if (s == seq) {
-        std.mem.copyForwards(u64, ui.hot_open[k .. ui.hot_open_n - 1], ui.hot_open[k + 1 .. ui.hot_open_n]);
-        ui.hot_open_n -= 1;
+/// Open a closed row, close an open one. The newest TOT_OPEN_MAX stay open; opening one more closes the oldest.
+fn totToggle(seq: u64) void {
+    for (ui.tot_open[0..ui.tot_open_n], 0..) |s, k| if (s == seq) {
+        std.mem.copyForwards(u64, ui.tot_open[k .. ui.tot_open_n - 1], ui.tot_open[k + 1 .. ui.tot_open_n]);
+        ui.tot_open_n -= 1;
         return;
     };
-    if (ui.hot_open_n == ui.hot_open.len) {
-        std.mem.copyForwards(u64, ui.hot_open[0 .. ui.hot_open.len - 1], ui.hot_open[1..]);
-        ui.hot_open_n -= 1;
+    if (ui.tot_open_n == ui.tot_open.len) {
+        std.mem.copyForwards(u64, ui.tot_open[0 .. ui.tot_open.len - 1], ui.tot_open[1..]);
+        ui.tot_open_n -= 1;
     }
-    ui.hot_open[ui.hot_open_n] = seq;
-    ui.hot_open_n += 1;
+    ui.tot_open[ui.tot_open_n] = seq;
+    ui.tot_open_n += 1;
 }
 
-/// A hot's console: ONE line per event - what happened, in brief - with a row that went wrong marked in red.
+/// A tot's console: ONE line per event - what happened, in brief - with a row that went wrong marked in red.
 /// Click a row to open it: its whole text drops down under it, wrapped to the panel; click again to close it.
 /// "errors only" hides everything else. It scrolls by the wheel or the bar on the right, and follows the newest
 /// line until you scroll up or open a row.
-fn drawHotConsole(r: t.Rect, evs: []const hots.Ev) void {
+fn drawTotConsole(r: t.Rect, evs: []const tots.Ev) void {
     t.panelBordered(r, t.bg_dark, t.border);
     const line_h: f32 = 20;
     const fsz: i32 = 13;
@@ -7739,35 +7739,35 @@ fn drawHotConsole(r: t.Rect, evs: []const hots.Ev) void {
     // the filter chip, top right (left of the hover copy)
     var failed: usize = 0;
     for (evs) |*e| failed += @intFromBool(!e.ok);
-    const fl = if (ui.hot_errors_only) t.z("showing {d} errors - show all", .{failed}) else t.z("{d} errors", .{failed});
+    const fl = if (ui.tot_errors_only) t.z("showing {d} errors - show all", .{failed}) else t.z("{d} errors", .{failed});
     const fw = t.btnW(fl, 20);
     const chip = t.Rect{ .x = r.x + r.width - fw - sb_w - 70, .y = r.y + 4, .width = fw, .height = 20 };
 
     var total: usize = 0;
     for (evs) |*e| {
-        if (ui.hot_errors_only and e.ok) continue;
-        total += 1 + (if (hotIsOpen(e.seq)) hotLineCount(e.textStr(), cols) else 0);
+        if (ui.tot_errors_only and e.ok) continue;
+        total += 1 + (if (totIsOpen(e.seq)) totLineCount(e.textStr(), cols) else 0);
     }
     const visible: usize = @max(1, @as(usize, @intFromFloat((r.height - 12) / line_h)));
     const max_scroll: f32 = @floatFromInt(if (total > visible) total - visible else 0);
 
     const wheel = rl.getMouseWheelMove();
     if (wheel != 0 and t.hovering(r)) {
-        ui.hot_scroll -= wheel * 3;
-        ui.hot_follow = false;
+        ui.tot_scroll -= wheel * 3;
+        ui.tot_follow = false;
     }
     const track = t.Rect{ .x = r.x + r.width - sb_w - 4, .y = r.y + 4, .width = sb_w, .height = r.height - 8 };
-    if (max_scroll > 0 and rl.isMouseButtonPressed(.left) and t.hovering(track)) ui.hot_sb_drag = true;
-    if (!rl.isMouseButtonDown(.left)) ui.hot_sb_drag = false;
-    if (ui.hot_sb_drag and max_scroll > 0) {
+    if (max_scroll > 0 and rl.isMouseButtonPressed(.left) and t.hovering(track)) ui.tot_sb_drag = true;
+    if (!rl.isMouseButtonDown(.left)) ui.tot_sb_drag = false;
+    if (ui.tot_sb_drag and max_scroll > 0) {
         const f = std.math.clamp((rl.getMousePosition().y - track.y) / track.height, 0, 1);
-        ui.hot_scroll = f * max_scroll;
-        ui.hot_follow = false;
+        ui.tot_scroll = f * max_scroll;
+        ui.tot_follow = false;
     }
-    if (ui.hot_follow) ui.hot_scroll = max_scroll;
-    ui.hot_scroll = std.math.clamp(ui.hot_scroll, 0, max_scroll);
-    if (!ui.hot_sb_drag and wheel > 0 and ui.hot_scroll >= max_scroll) ui.hot_follow = true; // scrolled back to the bottom
-    const first: usize = @intFromFloat(ui.hot_scroll);
+    if (ui.tot_follow) ui.tot_scroll = max_scroll;
+    ui.tot_scroll = std.math.clamp(ui.tot_scroll, 0, max_scroll);
+    if (!ui.tot_sb_drag and wheel > 0 and ui.tot_scroll >= max_scroll) ui.tot_follow = true; // scrolled back to the bottom
+    const first: usize = @intFromFloat(ui.tot_scroll);
 
     var clicked: ?u64 = null;
     {
@@ -7776,10 +7776,10 @@ fn drawHotConsole(r: t.Rect, evs: []const hots.Ev) void {
         var li: usize = 0;
         var yy = r.y + 6;
         draw: for (evs) |*e| {
-            if (ui.hot_errors_only and e.ok) continue;
-            const open = hotIsOpen(e.seq);
+            if (ui.tot_errors_only and e.ok) continue;
+            const open = totIsOpen(e.seq);
             const txt = e.textStr();
-            const n: usize = 1 + (if (open) hotLineCount(txt, cols) else 0);
+            const n: usize = 1 + (if (open) totLineCount(txt, cols) else 0);
             if (li + n <= first) {
                 li += n;
                 continue;
@@ -7789,7 +7789,7 @@ fn drawHotConsole(r: t.Rect, evs: []const hots.Ev) void {
             while (k < n) : (k += 1) {
                 var line: []const u8 = e.briefStr();
                 if (k > 0) {
-                    const w = hotWrapNext(txt, p, cols);
+                    const w = totWrapNext(txt, p, cols);
                     p = w.next;
                     line = w.line;
                 }
@@ -7797,7 +7797,7 @@ fn drawHotConsole(r: t.Rect, evs: []const hots.Ev) void {
                 if (k == 0) {
                     const row = t.Rect{ .x = r.x + 2, .y = yy - 2, .width = r.width - sb_w - 12, .height = line_h };
                     const can_open = e.hasMore();
-                    const hot = can_open and t.hovering(row) and !t.hovering(chip) and !ui.hot_sb_drag and yy < r.y + r.height - 4;
+                    const hot = can_open and t.hovering(row) and !t.hovering(chip) and !ui.tot_sb_drag and yy < r.y + r.height - 4;
                     if (!e.ok) t.fillRect(@intFromFloat(row.x), @intFromFloat(row.y), @intFromFloat(row.width), @intFromFloat(row.height), t.withAlpha(t.red, 26));
                     if (hot) {
                         t.fillRect(@intFromFloat(row.x), @intFromFloat(row.y), @intFromFloat(row.width), @intFromFloat(row.height), t.withAlpha(t.blue, 30));
@@ -7818,16 +7818,16 @@ fn drawHotConsole(r: t.Rect, evs: []const hots.Ev) void {
         }
     }
     if (clicked) |seq| {
-        hotToggle(seq);
-        ui.hot_follow = false; // stay where the reader is
+        totToggle(seq);
+        ui.tot_follow = false; // stay where the reader is
     }
-    if (evs.len == 0) t.text(t.z("no events yet - a new hot's first iteration starts within a few seconds", .{}), @intFromFloat(r.x + 14), @intFromFloat(r.y + 14), 13, t.comment);
+    if (evs.len == 0) t.text(t.z("no events yet - a new tot's first iteration starts within a few seconds", .{}), @intFromFloat(r.x + 14), @intFromFloat(r.y + 14), 13, t.comment);
     if (evs.len > 0 and total == 0) t.text(t.z("no errors in what is shown", .{}), @intFromFloat(r.x + 14), @intFromFloat(r.y + 14), 13, t.comment);
 
-    if (failed > 0 or ui.hot_errors_only) {
+    if (failed > 0 or ui.tot_errors_only) {
         if (t.buttonGhost(chip, fl, if (failed > 0) t.red else t.comment, true)) {
-            ui.hot_errors_only = !ui.hot_errors_only;
-            ui.hot_follow = true;
+            ui.tot_errors_only = !ui.tot_errors_only;
+            ui.tot_follow = true;
         }
     }
     if (max_scroll > 0) {
@@ -7835,12 +7835,12 @@ fn drawHotConsole(r: t.Rect, evs: []const hots.Ev) void {
         const vis_f: f32 = @floatFromInt(visible);
         const tot_f: f32 = @floatFromInt(total);
         const th = @max(24, track.height * vis_f / tot_f);
-        const ty = track.y + (track.height - th) * (ui.hot_scroll / max_scroll);
-        t.fillRect(@intFromFloat(track.x), @intFromFloat(ty), @intFromFloat(track.width), @intFromFloat(th), if (ui.hot_sb_drag or t.hovering(track)) t.blue else t.withAlpha(t.comment, 160));
-        if (!ui.hot_follow) {
+        const ty = track.y + (track.height - th) * (ui.tot_scroll / max_scroll);
+        t.fillRect(@intFromFloat(track.x), @intFromFloat(ty), @intFromFloat(track.width), @intFromFloat(th), if (ui.tot_sb_drag or t.hovering(track)) t.blue else t.withAlpha(t.comment, 160));
+        if (!ui.tot_follow) {
             const ll = t.z("latest", .{});
             const lw = t.btnW(ll, 22);
-            if (t.button(.{ .x = r.x + r.width - lw - sb_w - 16, .y = r.y + r.height - 30, .width = lw, .height = 22 }, ll, t.blue, true)) ui.hot_follow = true;
+            if (t.button(.{ .x = r.x + r.width - lw - sb_w - 16, .y = r.y + r.height - 30, .width = lw, .height = 22 }, ll, t.blue, true)) ui.tot_follow = true;
         }
     }
     // hover copy: every event shown, whole, as "r<i> <kind> <text>"
@@ -7848,7 +7848,7 @@ fn drawHotConsole(r: t.Rect, evs: []const hots.Ev) void {
         if (copyChip(r.x + r.width - 64, r.y + 6)) {
             var n: usize = 0;
             for (evs) |*ev| {
-                if (ui.hot_errors_only and ev.ok) continue;
+                if (ui.tot_errors_only and ev.ok) continue;
                 if (ev.round >= 0) bufAppend(&conv_buf, &n, t.z("r{d} ", .{ev.round}));
                 bufAppend(&conv_buf, &n, ev.labelStr());
                 bufAppend(&conv_buf, &n, " ");
@@ -7863,7 +7863,7 @@ fn drawHotConsole(r: t.Rect, evs: []const hots.Ev) void {
 
 /// The shared scratchpad: each entry's author over its text, wrapped to the panel, newest at the bottom. It
 /// follows the newest entry until you scroll up.
-fn drawHotPad(r: t.Rect, rows: []const hots.PadRow) void {
+fn drawTotPad(r: t.Rect, rows: []const tots.PadRow) void {
     t.panelBordered(r, t.bg_dark, t.border);
     const lh: f32 = @round(15.0 * t.uiScale());
     const maxw = r.width - 20;
@@ -7876,15 +7876,15 @@ fn drawHotPad(r: t.Rect, rows: []const hots.PadRow) void {
     const max_scroll = @max(0, total - view);
     const wheel = rl.getMouseWheelMove();
     if (wheel != 0 and t.hovering(r)) {
-        ui.hot_pad_scroll -= wheel * 3 * lh;
-        ui.hot_pad_follow = false;
+        ui.tot_pad_scroll -= wheel * 3 * lh;
+        ui.tot_pad_follow = false;
     }
-    if (ui.hot_pad_follow) ui.hot_pad_scroll = max_scroll;
-    ui.hot_pad_scroll = std.math.clamp(ui.hot_pad_scroll, 0, max_scroll);
-    if (ui.hot_pad_scroll >= max_scroll) ui.hot_pad_follow = true;
+    if (ui.tot_pad_follow) ui.tot_pad_scroll = max_scroll;
+    ui.tot_pad_scroll = std.math.clamp(ui.tot_pad_scroll, 0, max_scroll);
+    if (ui.tot_pad_scroll >= max_scroll) ui.tot_pad_follow = true;
     rl.beginScissorMode(@intFromFloat(r.x + 1), @intFromFloat(r.y + 1), @intFromFloat(r.width - 2), @intFromFloat(r.height - 2));
     defer rl.endScissorMode();
-    var y = r.y + 6 - ui.hot_pad_scroll;
+    var y = r.y + 6 - ui.tot_pad_scroll;
     for (rows) |*e| {
         var lines: [48][]const u8 = undefined;
         const n = wrapInto(e.textStr(), maxw, &lines);
@@ -7899,13 +7899,13 @@ fn drawHotPad(r: t.Rect, rows: []const hots.PadRow) void {
         }
         y += h;
     }
-    if (rows.len == 0) t.text(t.z("empty - hots leave findings for each other here", .{}), @intFromFloat(r.x + 10), @intFromFloat(r.y + 10), 11, t.comment);
+    if (rows.len == 0) t.text(t.z("empty - tots leave findings for each other here", .{}), @intFromFloat(r.x + 10), @intFromFloat(r.y + 10), 11, t.comment);
 }
 
 /// The deploy form's MODEL list: the account's live Workers AI catalogue when the login has fetched it, else the
 /// catalog's Workers AI models. Row 0 is the default model.
-fn flushHotModelDropdown(store: *Store) void {
-    if (ui.open_dd != .hot_model) return;
+fn flushTotModelDropdown(store: *Store) void {
+    if (ui.open_dd != .tot_model) return;
     var names: [store_mod.MAX_CF_MODELS][96]u8 = undefined;
     var lens: [store_mod.MAX_CF_MODELS]u8 = undefined;
     store.lock();
@@ -7918,7 +7918,7 @@ fn flushHotModelDropdown(store: *Store) void {
     labels[0] = std.fmt.bufPrint(&dbuf, "default - {s}", .{catalog.defaults.cf_model}) catch "default";
     var count: usize = 1;
     var current: usize = 0;
-    const cur = ui.hot_model.str();
+    const cur = ui.tot_model.str();
     if (live_n > 0) {
         for (0..live_n) |i| {
             labels[count] = names[i][0..lens[i]];
@@ -7934,73 +7934,73 @@ fn flushHotModelDropdown(store: *Store) void {
         }
     }
     const chosen = drawList(ui.dd_rect, labels[0..count], current) orelse return;
-    if (chosen == 0) ui.hot_model.clear() else setField(&ui.hot_model, labels[chosen]);
+    if (chosen == 0) ui.tot_model.clear() else setField(&ui.tot_model, labels[chosen]);
     ui.open_dd = .none;
 }
 
 /// The deploy form's model as the server will run it.
-fn hotFormModel() []const u8 {
-    const m = std.mem.trim(u8, ui.hot_model.str(), " ");
+fn totFormModel() []const u8 {
+    const m = std.mem.trim(u8, ui.tot_model.str(), " ");
     return if (m.len > 0) m else catalog.defaults.cf_model;
 }
 
 /// "120/2400" beside a field's label, right-aligned at `right`; orange near the limit, red over it.
-fn hotCounter(right: f32, y: f32, used: usize, limit: usize) void {
+fn totCounter(right: f32, y: f32, used: usize, limit: usize) void {
     const label = t.z("{d}/{d}", .{ used, limit });
     const lw: f32 = @floatFromInt(t.measure(label, 11));
     const col = if (used > limit) t.red else if (used * 5 > limit * 4) t.orange else t.comment;
     t.text(label, @intFromFloat(right - lw), @intFromFloat(y), 11, col);
 }
 
-/// The Hots tab: the account's hots (at most hots.MAX_HOTS) on the left with the scratchpad they share, and on
-/// the right the selected hot's console and command line - or the deploy form. A hot runs in the user's own
+/// The Tots tab: the account's tots (at most tots.MAX_TOTS) on the left with the scratchpad they share, and on
+/// the right the selected tot's console and command line - or the deploy form. A tot runs in the user's own
 /// Cloudflare account with nobody in the loop; this tab watches and steers, it never has to be open.
-fn drawHots(store: *Store, body: t.Rect) void {
+fn drawTots(store: *Store, body: t.Rect) void {
     const pad: f32 = t.PAD;
     store.lock();
-    store.hots_watch = true; // the poller polls the account only while this tab draws
-    const roster = store.hots;
-    const seen = store.hots_seen;
-    const denied = store.hots_denied;
-    const busy = store.hots_busy;
+    store.tots_watch = true; // the poller polls the account only while this tab draws
+    const roster = store.tots;
+    const seen = store.tots_seen;
+    const denied = store.tots_denied;
+    const busy = store.tots_busy;
     const online = store.server_online;
-    var sel: [hots.NAME_MAX]u8 = undefined;
-    const sel_n = store.hot_sel_len;
-    @memcpy(sel[0..sel_n], store.hot_sel[0..sel_n]);
-    var pad_rows: [hots.MAX_PAD]hots.PadRow = undefined;
-    const pad_n = store.hot_pad_count;
-    @memcpy(pad_rows[0..pad_n], store.hot_pad[0..pad_n]);
+    var sel: [tots.NAME_MAX]u8 = undefined;
+    const sel_n = store.tot_sel_len;
+    @memcpy(sel[0..sel_n], store.tot_sel[0..sel_n]);
+    var pad_rows: [tots.MAX_PAD]tots.PadRow = undefined;
+    const pad_n = store.tot_pad_count;
+    @memcpy(pad_rows[0..pad_n], store.tot_pad[0..pad_n]);
     store.unlock();
 
     const left_w: f32 = 300;
     const lx = body.x + pad;
     var y = body.y + pad;
-    t.text(t.z("Hots", .{}), @intFromFloat(lx), @intFromFloat(y), 20, t.fg);
-    t.text(t.z("{d} of {d}", .{ roster.n, hots.MAX_HOTS }), @intFromFloat(lx + 62), @intFromFloat(y + 6), 12, t.comment);
+    t.text(t.z("Tots", .{}), @intFromFloat(lx), @intFromFloat(y), 20, t.fg);
+    t.text(t.z("{d} of {d}", .{ roster.n, tots.MAX_TOTS }), @intFromFloat(lx + 62), @intFromFloat(y + 6), 12, t.comment);
     y += 30;
 
     // roster cards
     const card_h: f32 = 74;
     for (roster.rows[0..roster.n]) |*row| {
         const cr = t.Rect{ .x = lx, .y = y, .width = left_w, .height = card_h };
-        const is_sel = !ui.hot_form and std.mem.eql(u8, row.nameStr(), sel[0..sel_n]);
+        const is_sel = !ui.tot_form and std.mem.eql(u8, row.nameStr(), sel[0..sel_n]);
         const hot = t.hovering(cr);
         t.panelBordered(cr, if (is_sel) t.bg_sel else if (hot) t.bg_hl else t.bg_dark, if (is_sel) t.blue else t.border);
-        t.statusDot(@intFromFloat(cr.x + 14), @intFromFloat(cr.y + 18), hotStateColor(row.stateStr()));
+        t.statusDot(@intFromFloat(cr.x + 14), @intFromFloat(cr.y + 18), totStateColor(row.stateStr()));
         t.textClip(row.nameStr(), @intFromFloat(cr.x + 28), @intFromFloat(cr.y + 9), 15, t.fg, 150);
-        t.textClip(row.stateStr(), @intFromFloat(cr.x + left_w - 78), @intFromFloat(cr.y + 11), 12, hotStateColor(row.stateStr()), 70);
+        t.textClip(row.stateStr(), @intFromFloat(cr.x + left_w - 78), @intFromFloat(cr.y + 11), 12, totStateColor(row.stateStr()), 70);
         t.textClip(if (row.goal_len > 0) row.goalStr() else "no goal - roaming", @intFromFloat(cr.x + 14), @intFromFloat(cr.y + 32), 12, t.fg_dim, @intFromFloat(left_w - 28));
         var sb: [96]u8 = undefined;
         var cb: [40]u8 = undefined;
-        const stats = std.fmt.bufPrint(&sb, "{d}/{d} minds  {s}{s}", .{ row.minds, row.size, hotCallsStr(&cb, row.calls_today, row.daily_calls), if (row.local) "  +this machine" else "" }) catch "";
+        const stats = std.fmt.bufPrint(&sb, "{d}/{d} minds  {s}{s}", .{ row.minds, row.size, totCallsStr(&cb, row.calls_today, row.daily_calls), if (row.local) "  +this machine" else "" }) catch "";
         t.textClip(stats, @intFromFloat(cr.x + 14), @intFromFloat(cr.y + 52), 11, t.comment, @intFromFloat(left_w - 28));
         if (hot) t.wantCursor(.pointing_hand);
         if (hot and rl.isMouseButtonPressed(.left)) {
-            store.pushCmd(store_mod.mkCmd(.hot_select, row.nameStr(), ""));
-            ui.hot_form = false;
-            ui.hot_follow = true;
-            ui.hot_open_n = 0; // another hot's rows
-            ui.hot_errors_only = false;
+            store.pushCmd(store_mod.mkCmd(.tot_select, row.nameStr(), ""));
+            ui.tot_form = false;
+            ui.tot_follow = true;
+            ui.tot_open_n = 0; // another tot's rows
+            ui.tot_errors_only = false;
         }
         y += card_h + 8;
     }
@@ -8013,14 +8013,14 @@ fn drawHots(store: *Store, body: t.Rect) void {
         if (roster.err_len > 0) y = helpPara(roster.errStr(), lx, y, left_w) + 6;
     }
 
-    const can_deploy = online and !denied and seen and roster.connected and roster.n < hots.MAX_HOTS and !busy;
-    const dl = if (busy) t.z("deploying...", .{}) else t.z("Deploy a hot", .{});
+    const can_deploy = online and !denied and seen and roster.connected and roster.n < tots.MAX_TOTS and !busy;
+    const dl = if (busy) t.z("deploying...", .{}) else t.z("Deploy a tot", .{});
     if (t.button(.{ .x = lx, .y = y, .width = left_w, .height = t.BTN_MD }, dl, t.blue, can_deploy)) {
-        ui.hot_form = true;
+        ui.tot_form = true;
         ui.focus = .h_goal;
     }
     y += t.BTN_MD + 8;
-    // what the hots of this account can use, and why not when something is missing
+    // what the tots of this account can use, and why not when something is missing
     if (roster.reachable) {
         t.textClip(t.z("tools: files, web, HTTP, memory{s}{s}{s}", .{ if (roster.python) ", Python" else "", if (roster.browser) ", browser" else "", if (roster.neuron) ", neuron-db" else "" }), @intFromFloat(lx), @intFromFloat(y), 11, t.comment, @intFromFloat(left_w));
         y += 15;
@@ -8028,162 +8028,162 @@ fn drawHots(store: *Store, body: t.Rect) void {
     }
     y += 8;
 
-    // the scratchpad the hots share (and the human may write to); newest at the bottom, wrapped, scrollable
+    // the scratchpad the tots share (and the human may write to); newest at the bottom, wrapped, scrollable
     flabel(lx, y, "SHARED SCRATCHPAD");
     {
-        const cl = if (ui.hot_pad_clear_armed) t.z("really clear?", .{}) else t.z("clear", .{});
+        const cl = if (ui.tot_pad_clear_armed) t.z("really clear?", .{}) else t.z("clear", .{});
         const cw = t.btnW(cl, 20);
         const cb = t.Rect{ .x = lx + left_w - cw, .y = y - 3, .width = cw, .height = 20 };
         if (t.buttonGhost(cb, cl, t.red, pad_n > 0 and roster.reachable)) {
-            if (ui.hot_pad_clear_armed) store.pushCmd(store_mod.mkCmd(.hot_pad_clear, "", ""));
-            ui.hot_pad_clear_armed = !ui.hot_pad_clear_armed;
-        } else if (ui.hot_pad_clear_armed and rl.isMouseButtonPressed(.left) and !t.hovering(cb)) ui.hot_pad_clear_armed = false;
+            if (ui.tot_pad_clear_armed) store.pushCmd(store_mod.mkCmd(.tot_pad_clear, "", ""));
+            ui.tot_pad_clear_armed = !ui.tot_pad_clear_armed;
+        } else if (ui.tot_pad_clear_armed and rl.isMouseButtonPressed(.left) and !t.hovering(cb)) ui.tot_pad_clear_armed = false;
     }
     y += 18;
     const pad_bottom = body.y + body.height - pad - t.FIELD_H - 8;
     const pr = t.Rect{ .x = lx, .y = y, .width = left_w, .height = @max(40, pad_bottom - y) };
-    drawHotPad(pr, pad_rows[0..pad_n]);
+    drawTotPad(pr, pad_rows[0..pad_n]);
     const pf = t.Rect{ .x = lx, .y = pad_bottom + 8, .width = left_w - 64, .height = t.FIELD_H };
-    textField(pf, &ui.hot_padline, ui.focus == .h_pad, "write to the scratchpad", .h_pad);
+    textField(pf, &ui.tot_padline, ui.focus == .h_pad, "write to the scratchpad", .h_pad);
     const pb = t.Rect{ .x = lx + left_w - 58, .y = pad_bottom + 8, .width = 58, .height = t.FIELD_H };
-    const pad_ok = ui.hot_padline.len > 0 and roster.deployed;
+    const pad_ok = ui.tot_padline.len > 0 and roster.deployed;
     if (t.button(pb, t.z("Add", .{}), t.blue, pad_ok) or (ui.focus == .h_pad and pad_ok and rl.isKeyPressed(.enter))) {
-        store.pushCmd(store_mod.mkCmd(.hot_pad_write, "", ui.hot_padline.str()));
-        ui.hot_padline.clear();
-        ui.hot_pad_follow = true;
+        store.pushCmd(store_mod.mkCmd(.tot_pad_write, "", ui.tot_padline.str()));
+        ui.tot_padline.clear();
+        ui.tot_pad_follow = true;
     }
 
-    // right side: the deploy form, or the selected hot
+    // right side: the deploy form, or the selected tot
     const rx = lx + left_w + pad;
     const right = t.Rect{ .x = rx, .y = body.y + pad, .width = body.x + body.width - pad - rx, .height = body.height - pad * 2 };
-    if (ui.hot_form) return drawHotForm(store, right, roster.n == 0, online and !busy);
+    if (ui.tot_form) return drawTotForm(store, right, roster.n == 0, online and !busy);
     for (roster.rows[0..roster.n]) |*row| {
-        if (std.mem.eql(u8, row.nameStr(), sel[0..sel_n])) return drawHotPanel(store, right, row);
+        if (std.mem.eql(u8, row.nameStr(), sel[0..sel_n])) return drawTotPanel(store, right, row);
     }
-    _ = helpPara("A hot is an autonomous technician that runs in YOUR Cloudflare account: it keeps a goal, makes one improvement at a time, measures whether it helped, writes itself rules from what it measured, and moves on to the next best thing when a goal ends. Nobody has to be here for it to work - this tab only watches and steers. You can run up to three; they share a scratchpad and can message each other.", right.x, right.y + 4, @min(right.width, 720));
+    _ = helpPara("A tot is an autonomous technician that runs in YOUR Cloudflare account: it keeps a goal, makes one improvement at a time, measures whether it helped, writes itself rules from what it measured, and moves on to the next best thing when a goal ends. Nobody has to be here for it to work - this tab only watches and steers. You can run up to three; they share a scratchpad and can message each other.", right.x, right.y + 4, @min(right.width, 720));
 }
 
-/// The deploy form. `first` = the account has no hot yet, so this one is Gary.
-fn drawHotForm(store: *Store, r: t.Rect, first: bool, can_send: bool) void {
+/// The deploy form. `first` = the account has no tot yet, so this one is Gary.
+fn drawTotForm(store: *Store, r: t.Rect, first: bool, can_send: bool) void {
     // While the MODEL list is open, the fields under it must not take a click meant for it (flushed last, below).
-    t.setBlockClicks(ui.open_dd == .hot_model);
+    t.setBlockClicks(ui.open_dd == .tot_model);
     defer t.setBlockClicks(false);
-    const limit = catalog.goalCharLimit(hotFormModel());
+    const limit = catalog.goalCharLimit(totFormModel());
     const x = r.x;
     var y = r.y;
     const colw = @min(r.width, 760);
     const gap: f32 = t.GAP;
     const fh: f32 = 48;
-    t.text(if (first) t.z("Deploy Gary", .{}) else t.z("Deploy a hot", .{}), @intFromFloat(x), @intFromFloat(y), 20, t.fg);
+    t.text(if (first) t.z("Deploy Gary", .{}) else t.z("Deploy a tot", .{}), @intFromFloat(x), @intFromFloat(y), 20, t.fg);
     y += 30;
     y = helpPara("It starts working as soon as it is deployed and never waits for anyone. Everything below can be changed later by telling it - except the last box.", x, y, colw) + 8;
 
     if (first) {
-        t.text(t.z("NAME   Gary - the first hot of every account", .{}), @intFromFloat(x), @intFromFloat(y), 12, t.comment);
+        t.text(t.z("NAME   Gary - the first tot of every account", .{}), @intFromFloat(x), @intFromFloat(y), 12, t.comment);
         y += 22;
     } else {
         flabel(x, y, "NAME (letters, digits, - or _)");
-        textField(.{ .x = x, .y = y + 14, .width = colw / 2, .height = t.FIELD_H }, &ui.hot_name, ui.focus == .h_name, "e.g. Ada", .h_name);
+        textField(.{ .x = x, .y = y + 14, .width = colw / 2, .height = t.FIELD_H }, &ui.tot_name, ui.focus == .h_name, "e.g. Ada", .h_name);
         y += fh + gap;
     }
 
     flabel(x, y, "GOAL (what to achieve first)");
-    hotCounter(x + colw, y, ui.hot_goal.len, limit);
-    textArea(.{ .x = x, .y = y + 14, .width = colw, .height = 88 }, &ui.hot_goal, ui.focus == .h_goal, "e.g. find every public tide-table source for the west coast and keep a checked list of them", .h_goal, 4, 0);
+    totCounter(x + colw, y, ui.tot_goal.len, limit);
+    textArea(.{ .x = x, .y = y + 14, .width = colw, .height = 88 }, &ui.tot_goal, ui.focus == .h_goal, "e.g. find every public tide-table source for the west coast and keep a checked list of them", .h_goal, 4, 0);
     y += 14 + 88 + gap;
 
     flabel(x, y, "CHARTER (optional: what it serves when a goal ends, so it can pick the next best thing)");
-    hotCounter(x + colw, y, ui.hot_charter.len, limit);
-    textArea(.{ .x = x, .y = y + 14, .width = colw, .height = 70 }, &ui.hot_charter, ui.focus == .h_charter, "e.g. keep my tide site accurate and growing", .h_charter, 3, 0);
+    totCounter(x + colw, y, ui.tot_charter.len, limit);
+    textArea(.{ .x = x, .y = y + 14, .width = colw, .height = 70 }, &ui.tot_charter, ui.focus == .h_charter, "e.g. keep my tide site accurate and growing", .h_charter, 3, 0);
     y += 14 + 70 + gap;
 
     const half = (colw - gap) / 2;
-    selector(.{ .x = x, .y = y, .width = half, .height = fh }, t.z("MODEL (your account's Workers AI)", .{}), if (ui.hot_model.len > 0) ui.hot_model.str() else catalog.defaults.cf_model, .hot_model);
-    ui.hot_size = t.stepper(.{ .x = x + half + gap, .y = y, .width = half, .height = fh }, t.z("SIZE (most minds it may grow to)", .{}), ui.hot_size, 1, 8);
+    selector(.{ .x = x, .y = y, .width = half, .height = fh }, t.z("MODEL (your account's Workers AI)", .{}), if (ui.tot_model.len > 0) ui.tot_model.str() else catalog.defaults.cf_model, .tot_model);
+    ui.tot_size = t.stepper(.{ .x = x + half + gap, .y = y, .width = half, .height = fh }, t.z("SIZE (most minds it may grow to)", .{}), ui.tot_size, 1, 8);
     y += fh + gap;
 
     var pb: [24]u8 = undefined;
-    const pd = t.cycle(.{ .x = x, .y = y, .width = half, .height = fh }, t.z("PACE (one iteration)", .{}), t.zs(hotPaceStr(&pb, HOT_PACES[ui.hot_pace])), false);
-    if (pd != 0) ui.hot_pace = wrap(ui.hot_pace, pd, HOT_PACES.len);
-    const cd = t.cycle(.{ .x = x + half + gap, .y = y, .width = half, .height = fh }, t.z("MODEL CALLS A DAY (then it rests)", .{}), if (HOT_CALLS[ui.hot_calls] == 0) t.z("unlimited", .{}) else t.z("{d}", .{HOT_CALLS[ui.hot_calls]}), false);
-    if (cd != 0) ui.hot_calls = wrap(ui.hot_calls, cd, HOT_CALLS.len);
+    const pd = t.cycle(.{ .x = x, .y = y, .width = half, .height = fh }, t.z("PACE (one iteration)", .{}), t.zs(totPaceStr(&pb, TOT_PACES[ui.tot_pace])), false);
+    if (pd != 0) ui.tot_pace = wrap(ui.tot_pace, pd, TOT_PACES.len);
+    const cd = t.cycle(.{ .x = x + half + gap, .y = y, .width = half, .height = fh }, t.z("MODEL CALLS A DAY (then it rests)", .{}), if (TOT_CALLS[ui.tot_calls] == 0) t.z("unlimited", .{}) else t.z("{d}", .{TOT_CALLS[ui.tot_calls]}), false);
+    if (cd != 0) ui.tot_calls = wrap(ui.tot_calls, cd, TOT_CALLS.len);
     y += fh + gap;
 
-    if (t.checkbox(.{ .x = x, .y = y, .width = colw, .height = 28 }, t.z("the goal never finishes (keep improving until I stop it)", .{}), ui.hot_forever)) ui.hot_forever = !ui.hot_forever;
+    if (t.checkbox(.{ .x = x, .y = y, .width = colw, .height = 28 }, t.z("the goal never finishes (keep improving until I stop it)", .{}), ui.tot_forever)) ui.tot_forever = !ui.tot_forever;
     y += 32;
-    if (t.checkbox(.{ .x = x, .y = y, .width = colw, .height = 28 }, t.z("let it use THIS machine", .{}), ui.hot_local)) ui.hot_local = !ui.hot_local;
+    if (t.checkbox(.{ .x = x, .y = y, .width = colw, .height = 28 }, t.z("let it use THIS machine", .{}), ui.tot_local)) ui.tot_local = !ui.tot_local;
     y += 30;
-    y = helpPara("Checked: it may send jobs to the veil on this computer (files, shell, builds, swarms - the full tool set), and they run unattended while this server is up. This is decided here, once: it cannot be granted later, and deleting the hot ends it.", x + 26, y, colw - 26) + 10;
+    y = helpPara("Checked: it may send jobs to the veil on this computer (files, shell, builds, swarms - the full tool set), and they run unattended while this server is up. This is decided here, once: it cannot be granted later, and deleting the tot ends it.", x + 26, y, colw - 26) + 10;
 
-    const fits = ui.hot_goal.len <= limit and ui.hot_charter.len <= limit;
-    const ready = can_send and fits and (ui.hot_goal.len >= 3 or ui.hot_charter.len >= 3);
+    const fits = ui.tot_goal.len <= limit and ui.tot_charter.len <= limit;
+    const ready = can_send and fits and (ui.tot_goal.len >= 3 or ui.tot_charter.len >= 3);
     const dl = t.z("Deploy", .{});
     const db = t.Rect{ .x = x, .y = y, .width = @max(140, t.btnW(dl, t.BTN_LG)), .height = t.BTN_LG };
-    if (t.buttonSolid(db, dl, t.blue, ready)) submitHot(store, first);
+    if (t.buttonSolid(db, dl, t.blue, ready)) submitTot(store, first);
     const cl = t.z("Cancel", .{});
-    if (t.buttonGhost(.{ .x = db.x + db.width + 10, .y = y, .width = t.btnW(cl, t.BTN_LG), .height = t.BTN_LG }, cl, t.comment, true)) ui.hot_form = false;
+    if (t.buttonGhost(.{ .x = db.x + db.width + 10, .y = y, .width = t.btnW(cl, t.BTN_LG), .height = t.BTN_LG }, cl, t.comment, true)) ui.tot_form = false;
     if (!fits)
         t.text(t.z("this model takes at most {d} characters of goal or charter - shorten it, or pick a model with a bigger window", .{limit}), @intFromFloat(x), @intFromFloat(y + t.BTN_LG + 8), 11, t.red)
     else
         t.text(t.z("the first deployment uploads the runtime into your Cloudflare account (up to a minute)", .{}), @intFromFloat(x), @intFromFloat(y + t.BTN_LG + 8), 11, t.comment);
     t.setBlockClicks(false);
-    flushHotModelDropdown(store); // last, so the list sits over the fields below it
+    flushTotModelDropdown(store); // last, so the list sits over the fields below it
 }
 
 /// Package the deploy form and hand it to the poller through the store's slot (it outgrows Command.text).
-fn submitHot(store: *Store, first: bool) void {
+fn submitTot(store: *Store, first: bool) void {
     var b: [6144]u8 = undefined;
-    const body = hots.deployBody(&b, .{
-        .name = if (first) "" else ui.hot_name.str(),
-        .goal = ui.hot_goal.str(),
-        .charter = ui.hot_charter.str(),
-        .model = std.mem.trim(u8, ui.hot_model.str(), " "),
-        .pace_s = HOT_PACES[ui.hot_pace],
-        .size = ui.hot_size,
-        .daily_calls = HOT_CALLS[ui.hot_calls],
-        .forever = ui.hot_forever,
-        .local = ui.hot_local,
+    const body = tots.deployBody(&b, .{
+        .name = if (first) "" else ui.tot_name.str(),
+        .goal = ui.tot_goal.str(),
+        .charter = ui.tot_charter.str(),
+        .model = std.mem.trim(u8, ui.tot_model.str(), " "),
+        .pace_s = TOT_PACES[ui.tot_pace],
+        .size = ui.tot_size,
+        .daily_calls = TOT_CALLS[ui.tot_calls],
+        .forever = ui.tot_forever,
+        .local = ui.tot_local,
     }) orelse {
-        store.pushNotif("Hot not deployed", "the goal and charter are too long together", 2);
+        store.pushNotif("Tot not deployed", "the goal and charter are too long together", 2);
         return;
     };
     {
         store.lock();
         defer store.unlock();
-        @memcpy(store.hot_deploy_json[0..body.len], body);
-        store.hot_deploy_len = body.len; // the poller raises hots_busy when it takes this, and lowers it when done
+        @memcpy(store.tot_deploy_json[0..body.len], body);
+        store.tot_deploy_len = body.len; // the poller raises tots_busy when it takes this, and lowers it when done
     }
-    store.pushCmd(store_mod.mkCmd(.hot_deploy, "", ""));
-    store.pushNotif("Deploying...", if (first) "Gary" else ui.hot_name.str(), 0);
-    ui.hot_name.clear();
-    ui.hot_goal.clear();
-    ui.hot_charter.clear();
-    ui.hot_forever = false;
-    ui.hot_local = false; // the grant is per deployment: the next form starts unchecked
-    ui.hot_form = false;
+    store.pushCmd(store_mod.mkCmd(.tot_deploy, "", ""));
+    store.pushNotif("Deploying...", if (first) "Gary" else ui.tot_name.str(), 0);
+    ui.tot_name.clear();
+    ui.tot_goal.clear();
+    ui.tot_charter.clear();
+    ui.tot_forever = false;
+    ui.tot_local = false; // the grant is per deployment: the next form starts unchecked
+    ui.tot_form = false;
     ui.focus = .none;
 }
 
-/// One hot: what it is doing, its controls, its console and the line that talks to it.
-fn drawHotPanel(store: *Store, r: t.Rect, row: *const hots.Row) void {
+/// One tot: what it is doing, its controls, its console and the line that talks to it.
+fn drawTotPanel(store: *Store, r: t.Rect, row: *const tots.Row) void {
     const name = row.nameStr();
-    var evs: [scan.MAX_LOG]hots.Ev = undefined;
+    var evs: [scan.MAX_LOG]tots.Ev = undefined;
     store.lock();
-    const ev_n = store.hot_event_count;
-    @memcpy(evs[0..ev_n], store.hot_events[0..ev_n]);
+    const ev_n = store.tot_event_count;
+    @memcpy(evs[0..ev_n], store.tot_events[0..ev_n]);
     store.unlock();
 
     // header
     t.textClip(name, @intFromFloat(r.x), @intFromFloat(r.y), 20, t.fg, 220);
-    const sc = hotStateColor(row.stateStr());
+    const sc = totStateColor(row.stateStr());
     t.statusDot(@intFromFloat(r.x + 6), @intFromFloat(r.y + 38), sc);
     var gb: [120]u8 = undefined;
-    t.textClip(hotGoalLine(&gb, row), @intFromFloat(r.x + 18), @intFromFloat(r.y + 30), 12, sc, @intFromFloat(r.width - 18));
+    t.textClip(totGoalLine(&gb, row), @intFromFloat(r.x + 18), @intFromFloat(r.y + 30), 12, sc, @intFromFloat(r.width - 18));
     if (row.goal_len > 0) t.textClip(row.goalStr(), @intFromFloat(r.x), @intFromFloat(r.y + 48), 13, t.fg_dim, @intFromFloat(r.width));
     var sb: [260]u8 = undefined;
     var pb: [24]u8 = undefined;
     var cb: [40]u8 = undefined;
-    const stats = std.fmt.bufPrint(&sb, "{s}   {s}   {s} today   {d} lessons   {d} queued{s}", .{ row.modelStr(), hotPaceStr(&pb, row.pace_s), hotCallsStr(&cb, row.calls_today, row.daily_calls), row.lessons, row.queue, if (row.local) "   may use this machine" else "" }) catch "";
+    const stats = std.fmt.bufPrint(&sb, "{s}   {s}   {s} today   {d} lessons   {d} queued{s}", .{ row.modelStr(), totPaceStr(&pb, row.pace_s), totCallsStr(&cb, row.calls_today, row.daily_calls), row.lessons, row.queue, if (row.local) "   may use this machine" else "" }) catch "";
     t.textClip(stats, @intFromFloat(r.x), @intFromFloat(r.y + 68), 11, t.comment, @intFromFloat(r.width));
 
     // controls: pause/resume, grow/shrink, delete (two clicks)
@@ -8193,20 +8193,20 @@ fn drawHotPanel(store: *Store, r: t.Rect, row: *const hots.Row) void {
     const pl = if (row.paused) t.z("Resume", .{}) else t.z("Pause", .{});
     const pw = t.btnW(pl, ctrl_h);
     if (t.button(.{ .x = cx, .y = ctrl_y, .width = pw, .height = ctrl_h }, pl, if (row.paused) t.green else t.yellow, true))
-        store.pushCmd(store_mod.mkCmd(.hot_command, name, if (row.paused) "/resume" else "/pause"));
+        store.pushCmd(store_mod.mkCmd(.tot_command, name, if (row.paused) "/resume" else "/pause"));
     cx += pw + 8;
     const sl = t.z("Shrink", .{});
     const sw = t.btnW(sl, ctrl_h);
     if (t.button(.{ .x = cx, .y = ctrl_y, .width = sw, .height = ctrl_h }, sl, t.cyan, row.size > 1))
-        store.pushCmd(store_mod.mkCmd(.hot_config, name, t.z("{{\"size\":{d}}}", .{row.size - 1})));
+        store.pushCmd(store_mod.mkCmd(.tot_config, name, t.z("{{\"size\":{d}}}", .{row.size - 1})));
     cx += sw + 8;
     const gl = t.z("Grow", .{});
     const gw = t.btnW(gl, ctrl_h);
     if (t.button(.{ .x = cx, .y = ctrl_y, .width = gw, .height = ctrl_h }, gl, t.cyan, row.size < 8))
-        store.pushCmd(store_mod.mkCmd(.hot_config, name, t.z("{{\"size\":{d}}}", .{row.size + 1})));
+        store.pushCmd(store_mod.mkCmd(.tot_config, name, t.z("{{\"size\":{d}}}", .{row.size + 1})));
     cx += gw + 8;
     t.text(t.z("{d} of {d} minds", .{ row.minds, row.size }), @intFromFloat(cx + 4), @intFromFloat(ctrl_y + 9), 12, t.comment);
-    const armed = std.mem.eql(u8, ui.hot_del[0..ui.hot_del_len], name);
+    const armed = std.mem.eql(u8, ui.tot_del[0..ui.tot_del_len], name);
     const del_l = if (armed) t.z("Really delete?", .{}) else t.z("Delete", .{});
     const dw = t.btnW(del_l, ctrl_h);
     const delb = t.Rect{ .x = r.x + r.width - dw, .y = ctrl_y, .width = dw, .height = ctrl_h };
@@ -8214,87 +8214,87 @@ fn drawHotPanel(store: *Store, r: t.Rect, row: *const hots.Row) void {
     const fl = t.z("Open folder", .{});
     const fw = t.btnW(fl, ctrl_h);
     if (t.button(.{ .x = delb.x - fw - 8, .y = ctrl_y, .width = fw, .height = ctrl_h }, fl, t.blue, row.folder_len > 0))
-        store.pushCmd(store_mod.mkCmd(.hot_open_folder, name, row.folderStr()));
+        store.pushCmd(store_mod.mkCmd(.tot_open_folder, name, row.folderStr()));
     if (t.button(delb, del_l, t.red, true)) {
         if (armed) {
-            store.pushCmd(store_mod.mkCmd(.hot_delete, name, ""));
-            ui.hot_del_len = 0;
+            store.pushCmd(store_mod.mkCmd(.tot_delete, name, ""));
+            ui.tot_del_len = 0;
         } else {
-            @memcpy(ui.hot_del[0..name.len], name);
-            ui.hot_del_len = @intCast(name.len);
+            @memcpy(ui.tot_del[0..name.len], name);
+            ui.tot_del_len = @intCast(name.len);
         }
-    } else if (armed and rl.isMouseButtonPressed(.left) and !t.hovering(delb)) ui.hot_del_len = 0; // a click anywhere else disarms
+    } else if (armed and rl.isMouseButtonPressed(.left) and !t.hovering(delb)) ui.tot_del_len = 0; // a click anywhere else disarms
 
     // console + the line that talks to it
     const cmd_h: f32 = 38;
     const top = ctrl_y + ctrl_h + 10;
     const panel = t.Rect{ .x = r.x, .y = top, .width = r.width, .height = r.y + r.height - top - cmd_h - 8 };
-    drawHotConsole(panel, evs[0..ev_n]);
+    drawTotConsole(panel, evs[0..ev_n]);
     const cy = r.y + r.height - cmd_h;
     const send_w: f32 = 92;
     const cf = t.Rect{ .x = r.x, .y = cy, .width = r.width - send_w - t.GAP, .height = cmd_h };
-    textField(cf, &ui.hot_cmd, ui.focus == .h_cmd, "tell it anything, or /goal <text>   /queue <goal>   /charter <text>   /pause - Enter to send", .h_cmd);
+    textField(cf, &ui.tot_cmd, ui.focus == .h_cmd, "tell it anything, or /goal <text>   /queue <goal>   /charter <text>   /pause - Enter to send", .h_cmd);
     const sendb = t.Rect{ .x = r.x + r.width - send_w, .y = cy, .width = send_w, .height = cmd_h };
-    const send = t.buttonSolid(sendb, t.z("Send", .{}), t.blue, ui.hot_cmd.len > 0);
-    if (send or (ui.focus == .h_cmd and ui.hot_cmd.len > 0 and rl.isKeyPressed(.enter))) {
-        store.pushCmd(store_mod.mkCmd(.hot_command, name, ui.hot_cmd.str()));
-        ui.hot_cmd.clear();
-        ui.hot_follow = true;
+    const send = t.buttonSolid(sendb, t.z("Send", .{}), t.blue, ui.tot_cmd.len > 0);
+    if (send or (ui.focus == .h_cmd and ui.tot_cmd.len > 0 and rl.isKeyPressed(.enter))) {
+        store.pushCmd(store_mod.mkCmd(.tot_command, name, ui.tot_cmd.str()));
+        ui.tot_cmd.clear();
+        ui.tot_follow = true;
     }
 }
 
-test "hots tab: a pace and a goal line read the way the card shows them" {
+test "tots tab: a pace and a goal line read the way the card shows them" {
     var b: [120]u8 = undefined;
-    try std.testing.expectEqualStrings("every 10m", hotPaceStr(&b, 600));
-    try std.testing.expectEqualStrings("every 6h", hotPaceStr(&b, 21600));
-    try std.testing.expectEqualStrings("every 45s", hotPaceStr(&b, 45));
-    try std.testing.expectEqualStrings("every 90s", hotPaceStr(&b, 90));
-    const fresh_pace = (Ui{}).hot_pace;
-    var row: hots.Row = .{ .iteration = 7, .improved = 4, .budget = 25 };
-    try std.testing.expectEqualStrings("no goal - looking for the next best thing", hotGoalLine(&b, &row));
+    try std.testing.expectEqualStrings("every 10m", totPaceStr(&b, 600));
+    try std.testing.expectEqualStrings("every 6h", totPaceStr(&b, 21600));
+    try std.testing.expectEqualStrings("every 45s", totPaceStr(&b, 45));
+    try std.testing.expectEqualStrings("every 90s", totPaceStr(&b, 90));
+    const fresh_pace = (Ui{}).tot_pace;
+    var row: tots.Row = .{ .iteration = 7, .improved = 4, .budget = 25 };
+    try std.testing.expectEqualStrings("no goal - looking for the next best thing", totGoalLine(&b, &row));
     row.goal_len = 4;
     @memcpy(row.goal_status[0..6], "active");
     row.goal_status_len = 6;
-    try std.testing.expectEqualStrings("active - iteration 7 of 25, 4 improved", hotGoalLine(&b, &row));
+    try std.testing.expectEqualStrings("active - iteration 7 of 25, 4 improved", totGoalLine(&b, &row));
     row.forever = true;
-    try std.testing.expectEqualStrings("active - iteration 7, 4 improved", hotGoalLine(&b, &row));
+    try std.testing.expectEqualStrings("active - iteration 7, 4 improved", totGoalLine(&b, &row));
     // every preset is a pace the runtime accepts (30 s to a day) and the form's defaults index real entries
-    for (HOT_PACES) |p| try std.testing.expect(p >= 5 and p <= 86400);
-    try std.testing.expectEqual(@as(u32, 5), HOT_PACES[0]);
-    try std.testing.expectEqual(@as(u32, 10), HOT_PACES[1]);
-    try std.testing.expectEqual(@as(u32, 600), HOT_PACES[fresh_pace]); // the form opens at ten minutes
-    try std.testing.expectEqualStrings("41/400 calls", hotCallsStr(&b, 41, 400));
-    try std.testing.expectEqualStrings("41 calls, no limit", hotCallsStr(&b, 41, 0));
-    try std.testing.expectEqual(@as(u32, 0), HOT_CALLS[HOT_CALLS.len - 1]); // the last choice is no limit
+    for (TOT_PACES) |p| try std.testing.expect(p >= 5 and p <= 86400);
+    try std.testing.expectEqual(@as(u32, 5), TOT_PACES[0]);
+    try std.testing.expectEqual(@as(u32, 10), TOT_PACES[1]);
+    try std.testing.expectEqual(@as(u32, 600), TOT_PACES[fresh_pace]); // the form opens at ten minutes
+    try std.testing.expectEqualStrings("41/400 calls", totCallsStr(&b, 41, 400));
+    try std.testing.expectEqualStrings("41 calls, no limit", totCallsStr(&b, 41, 0));
+    try std.testing.expectEqual(@as(u32, 0), TOT_CALLS[TOT_CALLS.len - 1]); // the last choice is no limit
     const fresh: Ui = .{};
-    try std.testing.expect(fresh.hot_pace < HOT_PACES.len and fresh.hot_calls < HOT_CALLS.len);
-    try std.testing.expect(!fresh.hot_local); // the owner's machine is never pre-checked
+    try std.testing.expect(fresh.tot_pace < TOT_PACES.len and fresh.tot_calls < TOT_CALLS.len);
+    try std.testing.expect(!fresh.tot_local); // the owner's machine is never pre-checked
 }
 
-test "hots tab: a console row opens and closes on a click, and only so many stay open" {
-    ui.hot_open_n = 0;
-    hotToggle(7);
-    try std.testing.expect(hotIsOpen(7) and !hotIsOpen(8));
-    hotToggle(8);
-    hotToggle(7); // closes it, and the one opened after it stays
-    try std.testing.expect(!hotIsOpen(7) and hotIsOpen(8));
-    try std.testing.expectEqual(@as(usize, 1), ui.hot_open_n);
+test "tots tab: a console row opens and closes on a click, and only so many stay open" {
+    ui.tot_open_n = 0;
+    totToggle(7);
+    try std.testing.expect(totIsOpen(7) and !totIsOpen(8));
+    totToggle(8);
+    totToggle(7); // closes it, and the one opened after it stays
+    try std.testing.expect(!totIsOpen(7) and totIsOpen(8));
+    try std.testing.expectEqual(@as(usize, 1), ui.tot_open_n);
     var s: u64 = 100;
-    while (s < 100 + ui.hot_open.len) : (s += 1) hotToggle(s);
-    try std.testing.expectEqual(ui.hot_open.len, ui.hot_open_n);
-    try std.testing.expect(!hotIsOpen(8)); // the oldest gave way
-    try std.testing.expect(hotIsOpen(100 + ui.hot_open.len - 1));
-    ui.hot_open_n = 0;
+    while (s < 100 + ui.tot_open.len) : (s += 1) totToggle(s);
+    try std.testing.expectEqual(ui.tot_open.len, ui.tot_open_n);
+    try std.testing.expect(!totIsOpen(8)); // the oldest gave way
+    try std.testing.expect(totIsOpen(100 + ui.tot_open.len - 1));
+    ui.tot_open_n = 0;
 }
 
-test "hots tab: the console wraps at the width, keeps line breaks, prefers spaces, and never loses a character" {
+test "tots tab: the console wraps at the width, keeps line breaks, prefers spaces, and never loses a character" {
     const text = "web_fetch {\"url\":\"https://example.com/a/very/long/path\"} -> HTTP 200\nsecond line";
     var p: usize = 0;
     var rebuilt: [256]u8 = undefined;
     var n: usize = 0;
     var lines: usize = 0;
     while (p < text.len) : (lines += 1) {
-        const w = hotWrapNext(text, p, 20);
+        const w = totWrapNext(text, p, 20);
         try std.testing.expect(w.line.len <= 20);
         try std.testing.expect(std.mem.indexOfScalar(u8, w.line, '\n') == null);
         @memcpy(rebuilt[n .. n + w.line.len], w.line);
@@ -8309,12 +8309,12 @@ test "hots tab: the console wraps at the width, keeps line breaks, prefers space
         p = w.next;
     }
     try std.testing.expectEqualStrings(text, rebuilt[0..n]);
-    try std.testing.expectEqual(lines, hotLineCount(text, 20));
-    try std.testing.expectEqual(@as(usize, 1), hotLineCount("", 20));
-    try std.testing.expectEqual(@as(usize, 2), hotLineCount("short\nlines", 80));
+    try std.testing.expectEqual(lines, totLineCount(text, 20));
+    try std.testing.expectEqual(@as(usize, 1), totLineCount("", 20));
+    try std.testing.expectEqual(@as(usize, 2), totLineCount("short\nlines", 80));
     // a hard cut never splits a UTF-8 character
     const accents = "\xc3\xa9" ** 12;
-    const w = hotWrapNext(accents, 0, 5);
+    const w = totWrapNext(accents, 0, 5);
     try std.testing.expect(std.unicode.utf8ValidateSlice(w.line));
 }
 

@@ -10,7 +10,7 @@ const Io = std.Io;
 const store_mod = @import("store.zig");
 const scan = @import("scan.zig");
 const netcli = @import("netcli.zig");
-const hots = @import("hots.zig");
+const tots = @import("tots.zig");
 const log = @import("log.zig");
 
 const Store = store_mod.Store;
@@ -74,9 +74,9 @@ pub const Poller = struct {
     last_cfm_s: i64 = 0, // Cloudflare live-models fetch throttle (only while connected; 0 = fetch next tick)
     last_r2_s: i64 = 0, // R2 backup snapshot throttle (only while connected; the card's "backed up 2m ago")
     last_tun_s: i64 = 0, // Cloudflare Tunnel snapshot throttle (3s while a flip is in flight, else 15s)
-    last_hots_s: i64 = 0, // hot roster throttle (only while the Hots tab is drawn; 0 = poll next tick)
-    last_hot_ev_s: i64 = 0, // the selected hot's event tail
-    last_hot_pad_s: i64 = 0, // the shared scratchpad
+    last_tots_s: i64 = 0, // tot roster throttle (only while the Tots tab is drawn; 0 = poll next tick)
+    last_tot_ev_s: i64 = 0, // the selected tot's event tail
+    last_tot_pad_s: i64 = 0, // the shared scratchpad
     last_bi_s: i64 = 0, // built-in model status poll throttle (0 = poll next tick; verbs reset it)
     last_ds_s: i64 = 0, // training-set capture poll throttle (fast while recording so counts climb live)
     // built-in transition memory (poller-local): a transfer that lands or fails raises ONE toast,
@@ -183,18 +183,18 @@ pub const Poller = struct {
                 .dataset_stop => self.doDataset(false, ""),
                 .lineage_accept => self.doLineageDecide(c.idStr(), c.textStr(), true),
                 .lineage_reject => self.doLineageDecide(c.idStr(), c.textStr(), false),
-                .hot_select => {
+                .tot_select => {
                     self.store.lock();
                     defer self.store.unlock();
-                    self.setHotSelLocked(c.idStr());
+                    self.setTotSelLocked(c.idStr());
                 },
-                .hot_deploy => self.doHotDeploy(),
-                .hot_command => self.doHotCommand(c.idStr(), c.textStr()),
-                .hot_config => self.doHotPost(c.idStr(), "config", c.textStr()),
-                .hot_delete => self.doHotDelete(c.idStr()),
-                .hot_pad_write => self.doHotPadWrite(c.textStr()),
-                .hot_open_folder => self.doOpenHotFolder(dd, c.textStr()),
-                .hot_pad_clear => self.doHotPadClear(),
+                .tot_deploy => self.doTotDeploy(),
+                .tot_command => self.doTotCommand(c.idStr(), c.textStr()),
+                .tot_config => self.doTotPost(c.idStr(), "config", c.textStr()),
+                .tot_delete => self.doTotDelete(c.idStr()),
+                .tot_pad_write => self.doTotPadWrite(c.textStr()),
+                .tot_open_folder => self.doOpenTotFolder(dd, c.textStr()),
+                .tot_pad_clear => self.doTotPadClear(),
             }
         }
     }
@@ -772,28 +772,28 @@ pub const Poller = struct {
             }
         }
 
-        // 1c') Hots - polled ONLY while the Hots tab is on screen (the tab raises hots_watch each frame): every
+        // 1c') Tots - polled ONLY while the Tots tab is on screen (the tab raises tots_watch each frame): every
         // poll is a call into the user's Cloudflare account, and a desk left on another tab must cost nothing.
         {
             const watched = blk: {
                 self.store.lock();
                 defer self.store.unlock();
-                const w = self.store.hots_watch;
-                self.store.hots_watch = false;
+                const w = self.store.tots_watch;
+                self.store.tots_watch = false;
                 break :blk w;
             };
             if (online and watched) {
-                if (now_s - self.last_hots_s >= 8) {
-                    self.last_hots_s = now_s;
-                    self.refreshHots();
+                if (now_s - self.last_tots_s >= 8) {
+                    self.last_tots_s = now_s;
+                    self.refreshTots();
                 }
-                if (now_s - self.last_hot_ev_s >= 3) {
-                    self.last_hot_ev_s = now_s;
-                    self.refreshHotEvents();
+                if (now_s - self.last_tot_ev_s >= 3) {
+                    self.last_tot_ev_s = now_s;
+                    self.refreshTotEvents();
                 }
-                if (now_s - self.last_hot_pad_s >= 20) {
-                    self.last_hot_pad_s = now_s;
-                    self.refreshHotPad();
+                if (now_s - self.last_tot_pad_s >= 20) {
+                    self.last_tot_pad_s = now_s;
+                    self.refreshTotPad();
                 }
             }
         }
@@ -956,97 +956,97 @@ pub const Poller = struct {
         self.notifyTransitions(online, self.swarm_scratch[0..nsw], selbuf[0..sel_len], metrics);
     }
 
-    // ------------------------------------------------------------------------------------ hots
+    // ------------------------------------------------------------------------------------ tots
 
-    /// GET /api/v1/hots -> the roster, under one lock. An unreachable server keeps the last rows; 401/403 marks
+    /// GET /api/v1/tots -> the roster, under one lock. An unreachable server keeps the last rows; 401/403 marks
     /// the list denied so the tab can say why it is empty.
-    fn refreshHots(self: *Poller) void {
+    fn refreshTots(self: *Poller) void {
         var tbuf: [128]u8 = undefined;
         const tok = self.tokenSnap(&tbuf);
-        const resp = netcli.hotsList(self.io, self.gpa, self.port(), tok) orelse return;
+        const resp = netcli.totsList(self.io, self.gpa, self.port(), tok) orelse return;
         defer if (resp.body.len > 0) self.gpa.free(resp.body);
         if (resp.status == 401 or resp.status == 403) {
             self.store.lock();
             defer self.store.unlock();
-            self.store.hots_denied = true;
-            self.store.hots_seen = true;
-            self.store.hots = .{};
+            self.store.tots_denied = true;
+            self.store.tots_seen = true;
+            self.store.tots = .{};
             return;
         }
         if (resp.status != 200) return;
-        var r: hots.Roster = .{};
-        if (!hots.parseRoster(self.gpa, resp.body, &r)) return;
+        var r: tots.Roster = .{};
+        if (!tots.parseRoster(self.gpa, resp.body, &r)) return;
         // A runtime that did not answer this once keeps the rows it showed last: one slow call must not blank the tab.
         self.store.lock();
         defer self.store.unlock();
-        if (r.deployed and !r.reachable and self.store.hots.n > 0) {
-            r.n = self.store.hots.n;
-            r.rows = self.store.hots.rows;
+        if (r.deployed and !r.reachable and self.store.tots.n > 0) {
+            r.n = self.store.tots.n;
+            r.rows = self.store.tots.rows;
         }
-        self.store.hots = r;
-        self.store.hots_seen = true;
-        self.store.hots_denied = false;
-        // the first hot there is becomes the selected one; a selected hot that is gone gives way
+        self.store.tots = r;
+        self.store.tots_seen = true;
+        self.store.tots_denied = false;
+        // the first tot there is becomes the selected one; a selected tot that is gone gives way
         var found = false;
-        for (r.rows[0..r.n]) |*row| if (std.mem.eql(u8, row.nameStr(), self.store.hot_sel[0..self.store.hot_sel_len])) {
+        for (r.rows[0..r.n]) |*row| if (std.mem.eql(u8, row.nameStr(), self.store.tot_sel[0..self.store.tot_sel_len])) {
             found = true;
         };
-        if (!found and r.reachable) self.setHotSelLocked(if (r.n > 0) r.rows[0].nameStr() else "");
+        if (!found and r.reachable) self.setTotSelLocked(if (r.n > 0) r.rows[0].nameStr() else "");
     }
 
-    /// CALLER HOLDS THE LOCK. Select a hot's console: a different hot starts from an empty tail.
-    fn setHotSelLocked(self: *Poller, name: []const u8) void {
+    /// CALLER HOLDS THE LOCK. Select a tot's console: a different tot starts from an empty tail.
+    fn setTotSelLocked(self: *Poller, name: []const u8) void {
         const s = self.store;
-        if (std.mem.eql(u8, name, s.hot_sel[0..s.hot_sel_len])) return;
-        const n = @min(name.len, s.hot_sel.len);
-        @memcpy(s.hot_sel[0..n], name[0..n]);
-        s.hot_sel_len = @intCast(n);
-        s.hot_event_count = 0;
-        s.hot_event_seq = 0;
-        self.last_hot_ev_s = 0;
+        if (std.mem.eql(u8, name, s.tot_sel[0..s.tot_sel_len])) return;
+        const n = @min(name.len, s.tot_sel.len);
+        @memcpy(s.tot_sel[0..n], name[0..n]);
+        s.tot_sel_len = @intCast(n);
+        s.tot_event_count = 0;
+        s.tot_event_seq = 0;
+        self.last_tot_ev_s = 0;
     }
 
-    /// The selected hot's events past the newest one held, appended to the tail.
-    fn refreshHotEvents(self: *Poller) void {
-        var nb: [hots.NAME_MAX]u8 = undefined;
+    /// The selected tot's events past the newest one held, appended to the tail.
+    fn refreshTotEvents(self: *Poller) void {
+        var nb: [tots.NAME_MAX]u8 = undefined;
         var after: u64 = 0;
         const name = blk: {
             self.store.lock();
             defer self.store.unlock();
-            const n = self.store.hot_sel_len;
-            @memcpy(nb[0..n], self.store.hot_sel[0..n]);
-            after = self.store.hot_event_seq;
+            const n = self.store.tot_sel_len;
+            @memcpy(nb[0..n], self.store.tot_sel[0..n]);
+            after = self.store.tot_event_seq;
             break :blk nb[0..n];
         };
         if (name.len == 0) return;
         var tbuf: [128]u8 = undefined;
         const tok = self.tokenSnap(&tbuf);
-        const resp = netcli.hotEvents(self.io, self.gpa, self.port(), tok, name, after) orelse return;
+        const resp = netcli.totEvents(self.io, self.gpa, self.port(), tok, name, after) orelse return;
         defer if (resp.body.len > 0) self.gpa.free(resp.body);
         if (resp.status != 200) return;
         self.store.lock();
         defer self.store.unlock();
-        // the selection may have moved while the call was out: its rows belong to the hot that was asked
-        if (!std.mem.eql(u8, name, self.store.hot_sel[0..self.store.hot_sel_len]) or after != self.store.hot_event_seq) return;
-        self.store.hot_event_count = hots.appendEvents(self.gpa, resp.body, &self.store.hot_events, self.store.hot_event_count, &self.store.hot_event_seq);
+        // the selection may have moved while the call was out: its rows belong to the tot that was asked
+        if (!std.mem.eql(u8, name, self.store.tot_sel[0..self.store.tot_sel_len]) or after != self.store.tot_event_seq) return;
+        self.store.tot_event_count = tots.appendEvents(self.gpa, resp.body, &self.store.tot_events, self.store.tot_event_count, &self.store.tot_event_seq);
     }
 
-    fn refreshHotPad(self: *Poller) void {
+    fn refreshTotPad(self: *Poller) void {
         var tbuf: [128]u8 = undefined;
         const tok = self.tokenSnap(&tbuf);
-        const resp = netcli.hotsPad(self.io, self.gpa, self.port(), tok, null) orelse return;
+        const resp = netcli.totsPad(self.io, self.gpa, self.port(), tok, null) orelse return;
         defer if (resp.body.len > 0) self.gpa.free(resp.body);
         if (resp.status != 200) return;
-        var rows: [hots.MAX_PAD]hots.PadRow = undefined;
-        const n = hots.parsePad(self.gpa, resp.body, &rows);
+        var rows: [tots.MAX_PAD]tots.PadRow = undefined;
+        const n = tots.parsePad(self.gpa, resp.body, &rows);
         self.store.lock();
         defer self.store.unlock();
-        @memcpy(self.store.hot_pad[0..n], rows[0..n]);
-        self.store.hot_pad_count = n;
+        @memcpy(self.store.tot_pad[0..n], rows[0..n]);
+        self.store.tot_pad_count = n;
     }
 
-    /// What a hot call's failure reads as. True when the reply says it landed.
-    fn hotRespOk(self: *Poller, resp: ?netcli.Resp, what: []const u8) bool {
+    /// What a tot call's failure reads as. True when the reply says it landed.
+    fn totRespOk(self: *Poller, resp: ?netcli.Resp, what: []const u8) bool {
         const r = resp orelse {
             self.store.pushNotif(what, "server unreachable - is it running?", 2);
             return false;
@@ -1059,72 +1059,72 @@ pub const Poller = struct {
     }
 
     /// POST the deploy form the UI parked in the store's slot.
-    fn doHotDeploy(self: *Poller) void {
+    fn doTotDeploy(self: *Poller) void {
         var body: [6144]u8 = undefined;
         var blen: usize = 0;
         {
             self.store.lock();
             defer self.store.unlock();
-            blen = @min(self.store.hot_deploy_len, body.len);
-            @memcpy(body[0..blen], self.store.hot_deploy_json[0..blen]);
-            self.store.hot_deploy_len = 0; // consumed - a stale slot must never deploy twice
-            if (blen > 0) self.store.hots_busy = true;
+            blen = @min(self.store.tot_deploy_len, body.len);
+            @memcpy(body[0..blen], self.store.tot_deploy_json[0..blen]);
+            self.store.tot_deploy_len = 0; // consumed - a stale slot must never deploy twice
+            if (blen > 0) self.store.tots_busy = true;
         }
         if (blen == 0) return;
         defer {
             self.store.lock();
-            self.store.hots_busy = false;
+            self.store.tots_busy = false;
             self.store.unlock();
         }
         var tbuf: [128]u8 = undefined;
         const tok = self.tokenSnap(&tbuf);
-        const resp = netcli.hotsDeploy(self.io, self.gpa, self.port(), tok, body[0..blen]);
+        const resp = netcli.totsDeploy(self.io, self.gpa, self.port(), tok, body[0..blen]);
         defer if (resp) |r| if (r.body.len > 0) self.gpa.free(r.body);
-        if (!self.hotRespOk(resp, "Hot not deployed")) return;
-        if (hots.parseHot(self.gpa, resp.?.body)) |row| {
-            self.store.pushNotif("Hot deployed", row.nameStr(), 1);
+        if (!self.totRespOk(resp, "Tot not deployed")) return;
+        if (tots.parseTot(self.gpa, resp.?.body)) |row| {
+            self.store.pushNotif("Tot deployed", row.nameStr(), 1);
             self.store.lock();
             defer self.store.unlock();
-            self.setHotSelLocked(row.nameStr());
+            self.setTotSelLocked(row.nameStr());
         }
-        self.last_hots_s = 0;
+        self.last_tots_s = 0;
     }
 
-    /// POST a command ("/goal ...", "/pause", plain words) or a settings object to one hot.
-    fn doHotPost(self: *Poller, name: []const u8, op: []const u8, body_json: []const u8) void {
+    /// POST a command ("/goal ...", "/pause", plain words) or a settings object to one tot.
+    fn doTotPost(self: *Poller, name: []const u8, op: []const u8, body_json: []const u8) void {
         if (name.len == 0 or body_json.len == 0) return;
         var tbuf: [128]u8 = undefined;
         const tok = self.tokenSnap(&tbuf);
-        const resp = netcli.hotPost(self.io, self.gpa, self.port(), tok, name, op, body_json);
+        const resp = netcli.totPost(self.io, self.gpa, self.port(), tok, name, op, body_json);
         defer if (resp) |r| if (r.body.len > 0) self.gpa.free(r.body);
-        if (!self.hotRespOk(resp, "Hot did not take it")) return;
-        self.last_hots_s = 0; // the row and the console show the change on the next tick
-        self.last_hot_ev_s = 0;
+        if (!self.totRespOk(resp, "Tot did not take it")) return;
+        self.last_tots_s = 0; // the row and the console show the change on the next tick
+        self.last_tot_ev_s = 0;
     }
 
-    fn doHotCommand(self: *Poller, name: []const u8, text: []const u8) void {
+    fn doTotCommand(self: *Poller, name: []const u8, text: []const u8) void {
         var b: [8192]u8 = undefined;
-        self.doHotPost(name, "command", hots.textBody(&b, text) orelse return);
+        self.doTotPost(name, "command", tots.textBody(&b, text) orelse return);
     }
 
-    fn doHotDelete(self: *Poller, name: []const u8) void {
+    fn doTotDelete(self: *Poller, name: []const u8) void {
         if (name.len == 0) return;
         var tbuf: [128]u8 = undefined;
         const tok = self.tokenSnap(&tbuf);
-        const resp = netcli.hotDelete(self.io, self.gpa, self.port(), tok, name);
+        const resp = netcli.totDelete(self.io, self.gpa, self.port(), tok, name);
         defer if (resp) |r| if (r.body.len > 0) self.gpa.free(r.body);
-        if (!self.hotRespOk(resp, "Hot not deleted")) return;
+        if (!self.totRespOk(resp, "Tot not deleted")) return;
         const body = resp.?.body;
         if (std.mem.indexOf(u8, body, "\"worker_removed\":true") != null)
-            self.store.pushNotif("Hot deleted", "it was the last one, so its Worker is removed from your Cloudflare account too", 1)
+            self.store.pushNotif("Tot deleted", "it was the last one, so its Worker is removed from your Cloudflare account too", 1)
         else
-            self.store.pushNotif("Hot deleted", name, 1);
-        self.last_hots_s = 0;
+            self.store.pushNotif("Tot deleted", name, 1);
+        self.last_tots_s = 0;
     }
 
-    /// Open a hot's local folder (rel to the data dir, as the server named it). The server mirrors each hot there
+    /// Open a tot's local folder (rel to the data dir, as the server named it). The server mirrors each tot there
     /// once a minute, so a folder that is not there yet is said so instead of opening nothing.
-    fn doOpenHotFolder(self: *Poller, dd: []const u8, rel: []const u8) void {
+    fn doOpenTotFolder(self: *Poller, dd: []const u8, rel: []const u8) void {
         if (rel.len == 0 or std.mem.indexOf(u8, rel, "..") != null or rel[0] == '/' or rel[0] == '\\') return;
         var tb: [640]u8 = undefined;
         const target = std.fmt.bufPrint(&tb, "{s}/{s}", .{ dd, rel }) catch return;
@@ -1140,29 +1140,29 @@ pub const Poller = struct {
         _ = std.process.spawn(self.io, .{ .argv = argv, .cwd = .{ .path = target }, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore }) catch {};
     }
 
-    fn doHotPadClear(self: *Poller) void {
+    fn doTotPadClear(self: *Poller) void {
         var tbuf: [128]u8 = undefined;
         const tok = self.tokenSnap(&tbuf);
-        const resp = netcli.hotsPadClear(self.io, self.gpa, self.port(), tok);
+        const resp = netcli.totsPadClear(self.io, self.gpa, self.port(), tok);
         defer if (resp) |r| if (r.body.len > 0) self.gpa.free(r.body);
-        if (!self.hotRespOk(resp, "Scratchpad not cleared")) return;
-        self.store.pushNotif("Scratchpad cleared", "a copy of what it held is in _hots/ in the data folder", 1);
+        if (!self.totRespOk(resp, "Scratchpad not cleared")) return;
+        self.store.pushNotif("Scratchpad cleared", "a copy of what it held is in _tots/ in the data folder", 1);
         {
             self.store.lock();
             defer self.store.unlock();
-            self.store.hot_pad_count = 0;
+            self.store.tot_pad_count = 0;
         }
-        self.last_hot_pad_s = 0;
+        self.last_tot_pad_s = 0;
     }
 
-    fn doHotPadWrite(self: *Poller, text: []const u8) void {
+    fn doTotPadWrite(self: *Poller, text: []const u8) void {
         var b: [8192]u8 = undefined;
-        const body = hots.textBody(&b, text) orelse return;
+        const body = tots.textBody(&b, text) orelse return;
         var tbuf: [128]u8 = undefined;
         const tok = self.tokenSnap(&tbuf);
-        const resp = netcli.hotsPad(self.io, self.gpa, self.port(), tok, body);
+        const resp = netcli.totsPad(self.io, self.gpa, self.port(), tok, body);
         defer if (resp) |r| if (r.body.len > 0) self.gpa.free(r.body);
-        if (self.hotRespOk(resp, "Scratchpad not written")) self.last_hot_pad_s = 0;
+        if (self.totRespOk(resp, "Scratchpad not written")) self.last_tot_pad_s = 0;
     }
 
     /// GET /api/v1/sched → parse the tasks array → publish SchedRows under one lock. A failed/unreachable
@@ -2626,12 +2626,12 @@ test "lineage rows: counts from the list, the newest history from the detail, a 
     try std.testing.expectEqual(@as(u8, 0), fresh.hist_n);
 }
 
-test "a message for a hot is posted to that hot as the exact text, and the roster and its console are asked again at once" {
+test "a message for a tot is posted to that tot as the exact text, and the roster and its console are asked again at once" {
     const gpa = std.testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
-    const OK_BODY = "{\"ok\":true,\"reply\":\"Gary reads this at its next iteration.\",\"hot\":{\"name\":\"Gary\",\"state\":\"working\"}}";
+    const OK_BODY = "{\"ok\":true,\"reply\":\"Gary reads this at its next iteration.\",\"tot\":{\"name\":\"Gary\",\"state\":\"working\"}}";
     const reply = std.fmt.comptimePrint("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ OK_BODY.len, OK_BODY });
     var sv: @import("llm.zig").Standin = undefined;
     try sv.start(io, reply, false);
@@ -2642,42 +2642,42 @@ test "a message for a hot is posted to that hot as the exact text, and the roste
     s.* = .{};
     s.settings.narrator = false;
     s.settings.port = sv.port;
-    const tok = "nlk_desk-hot-test-token-not-a-real-credential";
+    const tok = "nlk_desk-tot-test-token-not-a-real-credential";
     @memcpy(s.settings.token[0..tok.len], tok);
     s.settings.token_len = tok.len;
     const p = try gpa.create(Poller);
     defer gpa.destroy(p);
     p.* = .{ .io = io, .gpa = gpa, .store = s };
     defer p.log_buf.deinit(gpa);
-    p.last_hots_s = 12345;
-    p.last_hot_ev_s = 12345;
+    p.last_tots_s = 12345;
+    p.last_tot_ev_s = 12345;
 
     const text = "/goal map \"every\" harbour\n--forever";
-    s.pushCmd(store_mod.mkCmd(.hot_command, "Gary", text));
+    s.pushCmd(store_mod.mkCmd(.tot_command, "Gary", text));
     p.drainCommands();
     try sv.awaitSeen(1);
     const req = sv.request();
-    try std.testing.expect(std.mem.startsWith(u8, req, "POST /api/v1/hots/Gary/command "));
+    try std.testing.expect(std.mem.startsWith(u8, req, "POST /api/v1/tots/Gary/command "));
     try std.testing.expect(std.mem.indexOf(u8, req, "Bearer " ++ tok) != null);
     const at = std.mem.indexOf(u8, req, "{\"text\"") orelse return error.NoBody;
     const parsed = try std.json.parseFromSlice(struct { text: []const u8 }, gpa, req[at..], .{}); // strict: one field, as the server's parser demands
     defer parsed.deinit();
     try std.testing.expectEqualStrings(text, parsed.value.text);
-    try std.testing.expectEqual(@as(i64, 0), p.last_hots_s);
-    try std.testing.expectEqual(@as(i64, 0), p.last_hot_ev_s);
+    try std.testing.expectEqual(@as(i64, 0), p.last_tots_s);
+    try std.testing.expectEqual(@as(i64, 0), p.last_tot_ev_s);
     try std.testing.expectEqual(@as(usize, 0), s.notif_count); // a command that landed raises no toast
 
-    // selecting another hot starts its console from nothing; selecting the same one keeps the tail
-    s.hot_event_count = 7;
-    s.hot_event_seq = 99;
-    s.pushCmd(store_mod.mkCmd(.hot_select, "Gary", ""));
+    // selecting another tot starts its console from nothing; selecting the same one keeps the tail
+    s.tot_event_count = 7;
+    s.tot_event_seq = 99;
+    s.pushCmd(store_mod.mkCmd(.tot_select, "Gary", ""));
     p.drainCommands();
-    try std.testing.expectEqualStrings("Gary", s.hot_sel[0..s.hot_sel_len]);
-    try std.testing.expectEqual(@as(usize, 0), s.hot_event_count);
-    s.hot_event_count = 7;
-    s.hot_event_seq = 99;
-    s.pushCmd(store_mod.mkCmd(.hot_select, "Gary", ""));
+    try std.testing.expectEqualStrings("Gary", s.tot_sel[0..s.tot_sel_len]);
+    try std.testing.expectEqual(@as(usize, 0), s.tot_event_count);
+    s.tot_event_count = 7;
+    s.tot_event_seq = 99;
+    s.pushCmd(store_mod.mkCmd(.tot_select, "Gary", ""));
     p.drainCommands();
-    try std.testing.expectEqual(@as(usize, 7), s.hot_event_count);
-    try std.testing.expectEqual(@as(u64, 99), s.hot_event_seq);
+    try std.testing.expectEqual(@as(usize, 7), s.tot_event_count);
+    try std.testing.expectEqual(@as(u64, 99), s.tot_event_seq);
 }

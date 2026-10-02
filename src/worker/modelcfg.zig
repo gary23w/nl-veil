@@ -322,7 +322,7 @@ pub fn senseModel(model_id: []const u8, local_hint: bool) ModelSense {
     };
 }
 
-/// The most characters a hot's goal or charter may hold on `model_id`: about a tenth of the model's window in
+/// The most characters a tot's goal or charter may hold on `model_id`: about a tenth of the model's window in
 /// characters (100 per K tokens), between 800 and 4000. A goal rides every prompt of every iteration beside the
 /// lessons, the scratchpad and the step's record, so a small window must not spend itself on the goal. The desk's
 /// deploy form counts against it and the server refuses past it, from this one function.
@@ -637,7 +637,7 @@ test "senseModel: ctx window caps the tier; light markers read as mid; minimax i
     try std.testing.expectEqual(Tier.large, senseModel("minimax/minimax-m2.5", false).tier); // "mini" is not a bounded segment
 }
 
-test "goalCharLimit: a hot's goal fits the model - small windows get less, never under 800 or over 4000" {
+test "goalCharLimit: a tot's goal fits the model - small windows get less, never under 800 or over 4000" {
     try std.testing.expectEqual(@as(usize, 2400), goalCharLimit(defaults.cf_model)); // the catalog states 24K
     try std.testing.expectEqual(@as(usize, 800), goalCharLimit("@cf/some/tiny-4k")); // tier default 8K -> 800
     try std.testing.expectEqual(@as(usize, 4000), goalCharLimit("@cf/some/frontier-model-128k"));
