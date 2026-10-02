@@ -62,6 +62,7 @@ const FALLBACK_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast"; // answers wh
 const FACTS_MAX = 300;
 const STANCES_MAX = 40;
 const MIND = "tot"; // this tot's scope in its neuron-db
+const PY_FILES_BYTES = 1_500_000; // the most of its workspace a script gets beside it when it names no files
 const NEURON_WASM = "./neuron_core.wasm"; // the two modules the veil server uploads beside this file
 const NEURON_BINDING = "./neuron-db.mjs";
 const UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36";
@@ -165,7 +166,42 @@ export function firstJson(text) {
 /// What a model reply asks for: {tool, args}, {final}, or null when it is prose. Models spell a tool call many
 /// ways - "args" / "arguments" / "parameters" / "input", the arguments as a JSON string, the fields flat beside
 /// the tool's name, an OpenAI tool_calls envelope - and each is read as the same call.
+/// Tool calls a model wrote in its own native markup instead of JSON, e.g.
+/// <|tool_call_begin|>functions.read_file:1<|tool_call_argument_begin|>{"path": "x"}<|tool_call_end|>. Pure.
+export function nativeCalls(text) {
+  const out = [];
+  const re = /(?:functions?[.:])?([A-Za-z_][\w-]*)(?::\d+)?\s*<\|tool_call_argument_begin\|>([\s\S]*?)<\|tool_call_end\|>/g;
+  let m;
+  while ((m = re.exec(String(text ?? ""))) !== null) {
+    let args;
+    try {
+      args = JSON.parse(m[2]);
+    } catch {
+      args = { value: m[2].trim() };
+    }
+    out.push({ tool: m[1], args: args && typeof args === "object" && !Array.isArray(args) ? args : { value: args } });
+  }
+  return out;
+}
+
+/// A step the model wrote as native tool-call markup, turned back into one plain instruction: what it said before
+/// the markup, then the calls it meant. Any other markup token goes. Pure.
+export function pickText(reply) {
+  const s = String(reply ?? "");
+  if (!s.includes("<|")) return s.trim();
+  const calls = nativeCalls(s);
+  if (calls.length === 0) return s.replace(/<\|[^|]*\|>/g, " ").replace(/\s+/g, " ").trim();
+  const lead = s.split("<|")[0].trim();
+  const said = calls.map((c) => `${c.tool} ${JSON.stringify(c.args)}`).join(", then ");
+  const text = [lead, said ? `Do this: ${said}.` : ""].filter(Boolean).join(" ");
+  return text.replace(/<\|[^|]*\|>/g, " ").replace(/\s+/g, " ").trim();
+}
+
 export function parseAction(reply) {
+  if (String(reply ?? "").includes("<|tool_call")) {
+    const calls = nativeCalls(reply);
+    if (calls.length > 0) return { tool: calls[0].tool, args: calls[0].args };
+  }
   const o = firstJson(reply);
   if (!o) return null;
   let c = o;
@@ -414,7 +450,7 @@ const TOOLS = [
   { name: "browser_eval", args: '{"js": "<an expression, or statements with return>"}', what: "run JavaScript in the page; its value (or what it console.logs) comes back", need: "browser" },
   { name: "browser_close", args: "{}", what: "close the browser when you are done with it", need: "browser" },
   // scripting
-  { name: "run_python", args: '{"code": "<a script>", "files": ["<a file of yours to put beside it>"]}', what: "run Python 3.12. The standard library is there, `import requests` and urllib work for HTTP, and a pure-Python package you import is installed from PyPI by itself. There are NO processes or shell (no subprocess, no os.system), and a package with native code is there only if YOUR PYTHON lists it. It prints; the TEXT files it writes are kept in your workspace (no images: write SVG or HTML)", need: "python" },
+  { name: "run_python", args: '{"code": "<a script>", "files": ["<a file of yours to put beside it>"]}', what: "run Python 3.12. The standard library is there, `import requests` and urllib work for HTTP, and a pure-Python package you import is installed from PyPI by itself. There are NO processes or shell (no subprocess, no os.system), and a package with native code is there only if YOUR PYTHON lists it. Your files are in its working directory under their plain names (all of them, or only those you list in files): open them by name, never by a /workspace or /tmp path. It prints; the TEXT files it writes are kept in your workspace (no images: write SVG or HTML)", need: "python" },
   { name: "pip_install", args: '{"packages": ["<name>"]}', what: "install pure-Python packages from PyPI for your scripts; they stay installed", need: "python" },
   { name: "save_skill", args: '{"name": "<short_name>", "about": "<what it does and its ARGS>", "code": "<a Python script reading ARGS>"}', what: "keep a script as a tool of your own, for every later iteration", need: "python" },
   { name: "run_skill", args: '{"name": "<skill>", "args": {}}', what: "run a skill you saved; `args` arrives as ARGS", need: "python" },
@@ -1299,7 +1335,7 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
     const inboxText = inbox.length > 0 ? "\nNEW MESSAGES (a message from human is a directive and outranks your own plan):\n" + inbox.map((m) => `- ${m.from}: ${m.text}`).join("\n") + "\n" : "";
 
     // PICK
-    const pick = (await this.ask(cfg, [{ role: "system", content: system }, { role: "user", content: inboxText + pickQuestion(g, rows) }], 2000)).trim();
+    const pick = pickText(await this.ask(cfg, [{ role: "system", content: system }, { role: "user", content: inboxText + pickQuestion(g, rows) }], 2000));
     if (!g.forever && /^["'`*\s]*DONE\b/.test(pick) && pick.length < 40) {
       const cur = await this.store.get("goal"); // as stored now: a command may have landed while the model answered
       if (!cur || cur.id !== g.id || cur.status !== "active" || cur.forever) return 5;
@@ -2104,9 +2140,21 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
     if (code.length > 60000) return "ERROR: a script is at most 60000 characters";
     this.spend();
     const files = {};
-    for (const raw of fileNames.slice(0, 20)) {
-      const n = await this.store.get("note:" + String(raw));
-      if (n) files[String(raw)] = n.text;
+    if (fileNames.length > 0) {
+      for (const raw of fileNames.slice(0, 20)) {
+        const n = await this.store.get("note:" + String(raw));
+        if (n) files[String(raw)] = n.text;
+      }
+    } else if (!install) {
+      // A script that names no files gets the whole workspace in its directory, newest first, within PY_FILES_BYTES:
+      // the tot's files are where its script expects them, by their plain names.
+      const all = [...(await this.store.list({ prefix: "note:", limit: 200 })).entries()].sort((a, b) => (b[1].t ?? 0) - (a[1].t ?? 0));
+      let bytes = 0;
+      for (const [k, v] of all) {
+        if (bytes + v.text.length > PY_FILES_BYTES) continue;
+        files[k.slice(5)] = v.text;
+        bytes += v.text.length;
+      }
     }
     // The Python Worker keeps nothing between scripts, so the packages this tot uses go with every one.
     const packages = (await this.store.get("py_packages")) ?? [];

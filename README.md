@@ -361,6 +361,41 @@ so they never cross the public internet and need no API key.
   (lessons, facts, stances) stays behind, and its first event as a tater-tot says so. Its local folders move from
   `_hots` to `_tots`.
 
+#### Seen working
+
+[![TATER-TOTS vs DOTS - the trailer](docs/video/tots-release.png)](https://gary23w.github.io/nl-veil/video/tots-release.mp4)
+
+The trailer (2:20, sound on) is above; the numbers below are not from a trailer. They are three runs on a real
+Cloudflare account, each a tater-tot named Gary given the one-word goal `test` at a 5-second pace - the hard
+kind of goal, where nothing says what done looks like - copied from the folders the veil mirrors to the owner's
+machine:
+
+| run | model | iterations | improved | what it left in its folder |
+|---|---|---|---|---|
+| 1 | `llama-3.3-70b-instruct-fp8-fast` | 18 | 1 | 3 files |
+| 2 | `llama-3.3-70b-instruct-fp8-fast` | 49 | 21 | 24 files - TF-IDF, Jaccard, Spearman and co-occurrence reports, an HTML comparison page; 12 lessons; mood "confident" |
+| 3 | `kimi-k2.7-code` | 13 | 3, the last at **6/6** | a checklist of what `test` means, `test_runner.py`, `test_results.json`: 3 of 3 pass |
+
+Run 3 is the first on the runtime that writes down what a vague goal means before working on it. From its
+`events.log`, trimmed to the lines that tell the story:
+
+```
+19:48:52  r1   pick     Write a `test_goal_checklist.md` file that defines concrete, tool-verifiable items ...
+19:49:40       lesson   Never stop at a checklist; always create and run the minimal test artifact, then
+                        verify it passes before reporting progress.
+19:51:23  r3   verdict  improved [5/6]: py_compile OK; test_results.json has "status":"pass" and
+                        "tests_run":3; required files exist.
+20:01:45       lesson   If os.getcwd() differs from the workspace shown by list_files, enumerate /tmp and
+                        /workspace subdirectories to find where the files actually exist ...
+20:14:22  r11  verdict  improved [6/6]: run_python verified py_compile OK, exit code 0, stdout "TEST OK" /
+                        "PASS: 3", stderr empty, and test_results.json with status "pass" and tests_run 3 ...
+```
+
+The same run showed what to fix next, and both are fixed: its model sometimes answered in its own native
+tool-call markup instead of the JSON protocol (the runtime now reads that markup as the calls it meant, and a
+step written in it as plain words), and a script saw only the files it named, which is what that 20:01 lesson
+was working around (a script that names none now gets the whole workspace beside it, by plain names).
+
 The desktop's console shows one line per event, a failed one in red; click a row to open its full text,
 and *errors* keeps only what failed. `veil --tater` lists them, `veil --tater watch Gary` follows one, `veil --tater rm <name>` deletes one, and
 `veil --tater teardown --yes` removes the Worker and everything the tater-tots stored. The upload needs the optional

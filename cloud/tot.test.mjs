@@ -6,7 +6,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import worker, { Tot, DEFAULT_MAX_TOTS, MAX_TOTS_CEIL, PRIMARY, PLATEAU, firstJson, answerText, parseAction, searchResults, privateHost, parseGoalCommand, parseVerdict, decide, newGoal, recordIteration, validName } from "./tot.js";
+import worker, { Tot, DEFAULT_MAX_TOTS, MAX_TOTS_CEIL, PRIMARY, PLATEAU, firstJson, answerText, parseAction, nativeCalls, pickText, searchResults, privateHost, parseGoalCommand, parseVerdict, decide, newGoal, recordIteration, validName } from "./tot.js";
 
 class Storage {
   constructor() {
@@ -98,6 +98,17 @@ test("pure: a model answer reads the same from every envelope, with the reasonin
   assert.equal(answerText({ output: [{ type: "reasoning", content: [] }, { type: "message", content: [{ type: "output_text", text: "yo" }] }] }), "yo");
   assert.equal(answerText({ response: { tool: "x" } }), '{"tool":"x"}');
   assert.equal(answerText(null), "");
+});
+
+test("pure: a model's native tool-call markup is read as the call it meant, and a step written in it becomes plain words", () => {
+  const raw = 'I will look first.<|tool_calls_section_begin|><|tool_call_begin|>functions.read_file:1<|tool_call_argument_begin|>{"path": "plan.md"}<|tool_call_end|><|tool_call_begin|>functions.list_files:2<|tool_call_argument_begin|>{}<|tool_call_end|><|tool_calls_section_end|>';
+  assert.deepEqual(nativeCalls(raw), [{ tool: "read_file", args: { path: "plan.md" } }, { tool: "list_files", args: {} }]);
+  assert.deepEqual(parseAction(raw), { tool: "read_file", args: { path: "plan.md" } });
+  assert.equal(pickText(raw), 'I will look first. Do this: read_file {"path":"plan.md"}, then list_files {}.');
+  assert.equal(pickText("  Write the checklist.  "), "Write the checklist.");
+  assert.equal(pickText("odd <|im_end|> tail"), "odd tail");
+  // the JSON protocol is untouched
+  assert.deepEqual(parseAction('{"tool": "say", "args": {"text": "hi"}}'), { tool: "say", args: { text: "hi" } });
 });
 
 test("pure: the /goal grammar matches the chat loop's", () => {
@@ -787,6 +798,7 @@ test("Python: a script runs in the companion Worker beside the tot's files, what
   assert.equal(await run("read_file", { name: "out.csv" }), "a,b\n1,2\n");
   assert.equal((await gary.store.list({ prefix: "note:" })).size, 2); // "../evil" was refused
   assert.match(await run("run_python", { code: "boom" }), /^FAILED\nTraceback/);
+  assert.deepEqual(Object.keys(sent.at(-1).files).sort(), ["in.csv", "out.csv"]); // named none: the whole workspace
   assert.match(await run("save_skill", { name: "double_it", about: "doubles ARGS['n']", code: "print(ARGS['n'] * 2)" }), /skill double_it saved/);
   assert.match(await run("save_skill", { name: "Bad Name", about: "", code: "print(1)" }), /ERROR/);
   assert.match(await run("run_skill", { name: "double_it", args: { n: 21 } }), /ran with \{"n":21\}/);
