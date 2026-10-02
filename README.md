@@ -302,8 +302,8 @@ so they never cross the public internet and need no API key.
     `browser_read` give the page as its text plus a **numbered list of what can be clicked or typed into**, and
     `browser_click`, `browser_type` and `browser_select` act on an element by its number with real mouse and
     key input (so forms and sign-up pages built on modern frameworks respond); `browser_key`, `browser_scroll`,
-    `browser_back`, `browser_wait` and `browser_eval` do the rest. The page stays open between iterations. A
-    page that is a bot check (a CAPTCHA) is named as one and left alone: a tater-tot does not solve those;
+    `browser_back`, `browser_wait` and `browser_eval` do the rest. The page stays open between iterations. When
+    a page turns out to be a bot check, the tater-tot knows it on sight and takes another road to what it needs;
   - *Python* - `run_python` runs a script beside the tater-tot's files and keeps what it writes. A Worker's Python
     has no sockets, no processes and no pip, so the runner supplies what a script expects: `import requests`
     and `urllib` work on the Worker's own fetch, a missing import is installed from PyPI by itself (pure-Python
