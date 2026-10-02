@@ -2,17 +2,17 @@
 
 **File:** `desk/src/tots.zig`  
 **Module:** `desk`  
-**Description:** The desk's picture of the user's tots: fixed-size roster rows, the event tail and the shared scratchpad, the readers that fill them from the server's JSON, and the writer for a deployment's request body. No I/O.
+**Description:** The desk's picture of the user's tater-tots: fixed-size roster rows, the event tail and the shared scratchpad, the readers that fill them from the server's JSON, and the writer for a deployment's request body. No I/O.
 
 ---
 
 ## Purpose Summary
 
-The Tots tab (drawn in `main.zig`) shows up to three tots, the selected one's console and the scratchpad they share. This file is the data under it. The poller calls the readers and publishes the results into the Store under its one lock; the UI copies them out and draws. A tot's events are kept as `Ev`: the swarm console's colour key, the event's own kind, the goal iteration it belongs to and its text with its line breaks, which the tab's console wraps and scrolls.
+The Tater-tots tab (drawn in `main.zig`) shows up to three tater-tots, the selected one's console and the scratchpad they share. This file is the data under it. The poller calls the readers and publishes the results into the Store under its one lock; the UI copies them out and draws. A tater-tot's events are kept as `Ev`: the swarm console's colour key, the event's own kind, the goal iteration it belongs to and its text with its line breaks, which the tab's console wraps and scrolls.
 
 ## Key Exports
 
-- `Row`, `PadRow`, `Roster`, `Ev` — the fixed-size values the Store holds; a row carries the tot's local `folder` (Open folder), an event its kind, iteration and up to 2200 characters of text with its line breaks (a longer one ends in "...", and the local `events.log` has it whole)
+- `Row`, `PadRow`, `Roster`, `Ev` — the fixed-size values the Store holds; a row carries the tater-tot's local `folder` (Open folder), an event its kind, iteration and up to 2200 characters of text with its line breaks (a longer one ends in "...", and the local `events.log` has it whole)
 - `parseRoster` — a `GET /api/v1/tots` reply into a `Roster`; anything that is not that reply leaves the output untouched
 - `parseTot` — the one row a deploy / command / settings reply carries
 - `appendEvents` — the events newer than the last sequence held, appended to the tail; the oldest rows drop when it is full
@@ -26,7 +26,7 @@ The Tots tab (drawn in `main.zig`) shows up to three tots, the selected one's co
 
 ## Usage Context
 
-`store.zig` holds a `Roster`, the selected tot's events and the scratchpad rows. `poller.zig` fills them (`refreshTots`, `refreshTotEvents`, `refreshTotPad`) only while the Tots tab is on screen: the tab raises `Store.tots_watch` every frame and the poller lowers it every tick, because each poll is a call into the user's Cloudflare account. `main.zig` draws the tab (`drawTots`, `drawTotForm`, `drawTotPanel`) and builds the deploy body with `deployBody`.
+`store.zig` holds a `Roster`, the selected tater-tot's events and the scratchpad rows. `poller.zig` fills them (`refreshTots`, `refreshTotEvents`, `refreshTotPad`) only while the Tater-tots tab is on screen: the tab raises `Store.tots_watch` every frame and the poller lowers it every tick, because each poll is a call into the user's Cloudflare account. `main.zig` draws the tab (`drawTots`, `drawTotForm`, `drawTotPanel`) and builds the deploy body with `deployBody`.
 
 ## Notable Implementation Details
 

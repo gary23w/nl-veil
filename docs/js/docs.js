@@ -48,7 +48,7 @@
       { p: 'config/server_config', c: 'CF-06', t: 'Admin runtime defaults — model trio + browser preference, JSON-persisted', s: 'server_config.zig' },
       { p: 'config/cf_r2', c: 'CF-07', t: 'R2 backup — incremental chat + memory mirror into a bucket the user owns', s: 'cf_r2.zig' },
       { p: 'config/cf_tunnel', c: 'CF-08', t: 'Cloudflare Tunnel — the public-URL switch: quick by default, named + Access on request', s: 'cf_tunnel.zig' },
-      { p: 'config/cf_tot', c: 'CF-09', t: 'Tots — goal loops in the user\'s own Cloudflare account: upload, relay, the owner\'s-machine bridge', s: 'cf_tot.zig' }
+      { p: 'config/cf_tot', c: 'CF-09', t: 'Tater-tots — goal loops in the user\'s own Cloudflare account: upload, relay, the owner\'s-machine bridge', s: 'cf_tot.zig' }
     ]},
     { key: 'plug/', label: 'PLUG — THE EXTENSION LAYER', docs: [
       { p: 'plug/plugins', c: 'PG-01', t: 'Plugin registry — Lua manifests, tool/policy/prompt hooks, swap-on-reload', s: 'plugins.zig' },
@@ -171,7 +171,7 @@
       { p: 'desk/wsock', c: 'DK-21', t: 'Wsock — blocking Winsock round trip, twin of the server copy', s: 'wsock.zig' },
       { p: 'desk/nap', c: 'DK-22', t: 'Nap — alert-free sleep + heartbeat clock for desk threads', s: 'nap.zig' },
       { p: 'desk/updater', c: 'DK-23', t: 'Release updater — verified downloads, staged replacement and restart', s: 'updater.zig' },
-      { p: 'desk/tots', c: 'DK-24', t: 'Tots — roster rows, event tail and scratchpad for the Tots tab', s: 'tots.zig' }
+      { p: 'desk/tots', c: 'DK-24', t: 'Tater-tots — roster rows, event tail and scratchpad for the Tater-tots tab', s: 'tots.zig' }
     ]}
   ];
 
