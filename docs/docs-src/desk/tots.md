@@ -43,4 +43,6 @@ The Tater-tots tab (drawn in `main.zig`) shows the account's tater-tots against 
 
 ## Runs
 
+Past-run cards put the name, goal and timestamp on separate lines. A selected run wraps its goal and deployment error above the controls; the activity log reserves a separate header for its error filter. **Remove run** asks for a second click, removes the saved entry and clears its selected console. The files stay in the run folder and can be restored to history by removing `.hidden` there.
+
 The Store selects a run, not just a name: `tot_sel` + `tot_sel_leaf` (+ `tot_sel_past`). The poller starts the console over (`tot_sel_gen`) when the selected name comes back as another run - deployed again after a delete - and keeps it when the same run goes from live to ended, reading the rest from the run's folder (`totRunEvents`). A failed deploy selects the failed run the server recorded.

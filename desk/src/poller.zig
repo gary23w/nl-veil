@@ -192,6 +192,7 @@ pub const Poller = struct {
                 .tot_command => self.doTotCommand(c.idStr(), c.textStr()),
                 .tot_config => self.doTotPost(c.idStr(), "config", c.textStr()),
                 .tot_delete => self.doTotDelete(c.idStr()),
+                .tot_delete_run => self.doTotDeleteRun(c.idStr()),
                 .tot_pad_write => self.doTotPadWrite(c.textStr()),
                 .tot_open_folder => self.doOpenTotFolder(dd, c.textStr()),
                 .tot_pad_clear => self.doTotPadClear(),
@@ -1184,6 +1185,21 @@ pub const Poller = struct {
             self.store.pushNotif("Tot deleted", "it was the last one, so its Worker is removed from your Cloudflare account too", 1)
         else
             self.store.pushNotif("Tot deleted", name, 1);
+        self.last_tots_s = 0;
+    }
+
+    fn doTotDeleteRun(self: *Poller, leaf: []const u8) void {
+        if (leaf.len == 0) return;
+        var tbuf: [128]u8 = undefined;
+        const resp = netcli.totRunDelete(self.io, self.gpa, self.port(), self.tokenSnap(&tbuf), leaf);
+        defer if (resp) |r| if (r.body.len > 0) self.gpa.free(r.body);
+        if (!self.totRespOk(resp, "Run not removed")) return;
+        self.refreshTotRuns();
+        self.store.lock();
+        if (std.mem.eql(u8, leaf, self.store.tot_sel_leaf[0..self.store.tot_sel_leaf_len]))
+            self.setTotSelLocked("", "", false);
+        self.store.unlock();
+        self.store.pushNotif("Run removed from history", "Its files are still in the run folder; remove .hidden there to restore it.", 1);
         self.last_tots_s = 0;
     }
 
@@ -2701,6 +2717,37 @@ test "lineage rows: counts from the list, the newest history from the detail, a 
     try std.testing.expectEqual(@as(u8, 0), fresh.hist_n);
     parseLineageHistory("{\"ok\":false}", &fresh);
     try std.testing.expectEqual(@as(u8, 0), fresh.hist_n);
+}
+
+test "removing a saved run calls the history route and clears that run's console" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const body = "{\"ok\":true,\"runs\":[],\"files_preserved\":true}";
+    const reply = std.fmt.comptimePrint("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ body.len, body });
+    var sv: @import("llm.zig").Standin = undefined;
+    try sv.start(io, reply, false);
+    defer sv.stop();
+    const s = try gpa.create(Store);
+    defer gpa.destroy(s);
+    s.* = .{};
+    s.settings.port = sv.port;
+    const p = try gpa.create(Poller);
+    defer gpa.destroy(p);
+    p.* = .{ .io = io, .gpa = gpa, .store = s };
+    defer p.log_buf.deinit(gpa);
+    const leaf = "Gary-20261002-090000";
+    p.setTotSelLocked("Gary", leaf, true);
+    s.tot_event_count = 2;
+    s.tot_event_seq = 7;
+    s.pushCmd(store_mod.mkCmd(.tot_delete_run, leaf, ""));
+    p.drainCommands();
+    try sv.awaitSeen(2); // remove, then reload saved runs
+    try std.testing.expect(std.mem.startsWith(u8, sv.request(), "DELETE /api/v1/tots/runs/" ++ leaf ++ " "));
+    try std.testing.expectEqual(@as(u8, 0), s.tot_sel_leaf_len);
+    try std.testing.expectEqual(@as(usize, 0), s.tot_event_count);
+    try std.testing.expectEqual(@as(u64, 0), s.tot_event_seq);
 }
 
 test "a message for a tot is posted to that tot as the exact text, and the roster and its console are asked again at once" {

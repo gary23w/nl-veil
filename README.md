@@ -16,6 +16,13 @@ Windows · macOS · Linux · MIT licensed. Local inference needs no provider acc
 hosted providers have their own data handling and costs. The built-in model requires a separate
 download, and coding tools require Python on `PATH` (some checks also use Node).
 
+### New in v1.1.10
+
+Tater-tot deployment now reconnects a missing or unreachable cached runtime before creating a tot,
+checks its public route, and reports Cloudflare's error when setup fails. Past-run cards have clearer
+spacing and status lines, the activity controls have their own header, and **Remove run** clears an
+entry from history while keeping its files. [Release notes](docs/release/RELEASE-v1.1.10.md).
+
 ### New in v1.1.9
 
 Each tater-tot deployment has its own console and run history. Redeploying the same name starts a
@@ -72,7 +79,7 @@ code and credentials from anything you share.
 
 <p>
   <a href="https://github.com/gary23w/nl-veil/actions/workflows/release.yml"><img alt="build" src="https://github.com/gary23w/nl-veil/actions/workflows/release.yml/badge.svg"></a>
-  <a href="https://github.com/gary23w/nl-veil/releases"><img alt="release" src="https://img.shields.io/badge/release-v1.1.9-A8241B"></a>
+  <a href="https://github.com/gary23w/nl-veil/releases"><img alt="release" src="https://img.shields.io/badge/release-v1.1.10-A8241B"></a>
   <img alt="zig" src="https://img.shields.io/badge/zig-0.16-F7A41D?logo=zig&logoColor=white">
   <a href="https://huggingface.co/gary23w/the-veil-12b"><img alt="built-in model" src="https://img.shields.io/badge/built--in%20model-the--veil--12b-6E4A27?logo=huggingface&logoColor=white"></a>
   <a href="https://huggingface.co/gary23w/gary-neuron-emergent"><img alt="memory cortex" src="https://img.shields.io/badge/cortex-gary--neuron--emergent-6E4A27?logo=huggingface&logoColor=white"></a>
@@ -375,7 +382,8 @@ so they never cross the public internet and need no API key.
   **past runs**: a tater-tot you deleted (the server syncs its last events before it goes) and a deployment that
   failed (kept with what was asked and why it failed - the tab opens it when a deploy fails). Deploy the same
   name again and it is a new run with a new console; the old one stays under past runs, read from its folder,
-  with *Deploy again* to start the form from what it asked.
+  with *Deploy again* to start the form from what it asked. *Remove run* removes an entry from history while
+  preserving its folder; remove that folder's `.hidden` marker to restore the entry.
 - **Every run has a folder on your machine.** Each deployment of a tater-tot is mirrored, once a minute, into
   `<data>/u<id>/_tots/<name>-<deployed>/`: `events.log` (one readable line per event - tail it),
   `events.jsonl`, `status.json` and `notes/` (the tater-tot's own notes, one file each). The shared scratchpad is
@@ -476,6 +484,7 @@ POST /api/v1/tots/keys                   give the tater-tots a search key (brave
 POST /api/v1/tots/limit                  how many this account may run ({"max": N}, 1 to 1000; 24 by default)
 GET  /api/v1/tots/runs                    every run kept on this machine: live, ended, failed (newest first)
 GET  /api/v1/tots/runs/:run/events       one run's events, read from its folder (?after=N)
+DELETE /api/v1/tots/runs/:run            remove a history entry; its files are preserved
 DELETE /api/v1/tots/:name                delete one (the last one takes the Worker with it);
                                          DELETE /api/v1/tots removes them all
 ```
@@ -539,7 +548,7 @@ raylib is a *lazy* dependency, so `-Dapp=false` never fetches it at all.
 ## Install
 
 **Download it and run it — no toolchain, nothing to build.** Grab your platform's bundle from the
-**[latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.1.9)**, unzip, and run `veil`:
+**[latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.1.10)**, unzip, and run `veil`:
 
 | You're on | Download | Then run |
 |---|---|---|
@@ -700,7 +709,7 @@ step 5** — the rest is about letting other people in.
 
 ### 1. Download and unblock it
 
-Grab the bundle for your OS from the [latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.1.9)
+Grab the bundle for your OS from the [latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.1.10)
 and unzip it somewhere you'll find again. Builds are unsigned, so:
 
 - **Windows** shows *"Windows protected your PC"* → **More info** → **Run anyway**.
@@ -736,7 +745,7 @@ On startup the server prints one complete URL per address this machine answers o
 (`src/main.zig:861-889`, using `src/config/lan.zig`):
 
 ```
-neuron-loops 1.1.9 on http://localhost:8787
+neuron-loops 1.1.10 on http://localhost:8787
     open from another machine (phone, laptop) at:
       http://192.168.1.42:8787
 ```
@@ -1606,7 +1615,9 @@ dependency entirely rather than compiling it unused.
 
 ## Release
 
-**Current: [`v1.1.9`](https://github.com/gary23w/nl-veil/releases/tag/v1.1.9)** — each tot deployment has its own console. Past runs retain events and deployment errors, and redeploying the same name starts fresh. [Full notes](docs/release/RELEASE-v1.1.9.md).
+**Current: [`v1.1.10`](https://github.com/gary23w/nl-veil/releases/tag/v1.1.10)** — tot deployment reconnects stale runtimes, run history is easier to read, and saved runs can be removed from the list without deleting their files. [Full notes](docs/release/RELEASE-v1.1.10.md).
+
+**Previously: [`v1.1.9`](docs/release/RELEASE-v1.1.9.md)** — each tot deployment has its own console. Past runs retain events and deployment errors, and redeploying the same name starts fresh.
 
 **Previously: [`v1.1.8`](docs/release/RELEASE-v1.1.8.md)** — tater-tots can edit and deploy their shared runtime and work through browser challenges. Admin credentials are reconciled and read back from storage before a listener or Tunnel can expose the account. [Full notes](docs/release/RELEASE-v1.1.8.md).
 

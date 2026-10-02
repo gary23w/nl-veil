@@ -72,6 +72,7 @@ const COMPAT_DATE = "2025-09-01";
 const MIGRATION_TAG = "v1";
 const STATE_FILE = "cf_tots.json";
 const NAME_MAX = 24;
+
 /// How often the bridge asks each approved tot for jobs.
 const BRIDGE_EVERY_MS: u64 = 20_000;
 
@@ -414,9 +415,12 @@ fn ensureRuntime(app: *App, a: std.mem.Allocator, uid: u64, tok: Tok, st: *State
     const sec_err = firstError(a, sec);
     if (sec_err.len > 0) return explain(a, "setting the tot runtime's token", sec_err);
 
-    // Its workers.dev route. Best effort: a script that had it on keeps it on.
+    // An accepted upload is not reachable until its workers.dev route is enabled.
     const route_url = std.fmt.allocPrint(a, "{s}/subdomain", .{script_url}) catch return "out of memory";
-    _ = api(app, a, "POST", route_url, "{\"enabled\":true}", tok.key, "application/json");
+    const route = api(app, a, "POST", route_url, "{\"enabled\":true}", tok.key, "application/json") orelse
+        return "could not reach Cloudflare to enable the tot runtime's workers.dev address";
+    const route_err = firstError(a, route);
+    if (route_err.len > 0) return explain(a, "enabling the tot runtime's address", route_err);
 
     if (!same_account) {
         st.runtime_source = "";
@@ -449,6 +453,43 @@ fn totCall(app: *App, a: std.mem.Allocator, uid: u64, st: State, method: []const
 /// Whether the runtime said yes, and its words when it did not ("" for a reply that is not its JSON at all).
 fn replyOf(a: std.mem.Allocator, raw: []const u8) Reply {
     return std.json.parseFromSliceLeaky(Reply, a, raw, .{ .ignore_unknown_fields = true }) catch .{};
+}
+
+/// Preserve a useful provider error without putting an HTML error page in the desktop.
+fn runtimeFailure(raw: ?[]const u8) []const u8 {
+    const body = raw orelse return "the tot runtime could not be reached; check the network connection and try again";
+    if (std.mem.indexOf(u8, body, "1042") != null)
+        return "Cloudflare returned error 1042 for the tot runtime; check its workers.dev route and Worker fetch configuration in Workers & Pages";
+    if (std.mem.indexOf(u8, body, "1101") != null)
+        return "the tot Worker failed with Cloudflare error 1101; inspect its runtime logs in Workers & Pages";
+    if (std.mem.indexOf(u8, body, "1027") != null)
+        return "the tot runtime reached the Cloudflare account's daily request limit (1027)";
+    return "the tot runtime did not return a valid reply after reconnecting; check its deployment and logs in Workers & Pages";
+}
+
+/// Probe with GET before creating anything. A cached address can outlive its route, token or script.
+/// Repair setup once, preserving the saved runtime source and every Durable Object, then wait for readiness.
+fn readyRuntime(app: *App, a: std.mem.Allocator, uid: u64, tok: Tok, st: *State, uploaded: bool) ?[]const u8 {
+    var repaired = uploaded;
+    var attempt: usize = 0;
+    var last: ?[]const u8 = null;
+    while (attempt < 9) : (attempt += 1) {
+        last = totCall(app, a, uid, st.*, "GET", "/v1/tots", "");
+        if (last) |raw| {
+            const rep = replyOf(a, raw);
+            if (rep.ok) return null;
+            if (rep.err.len > 0 and !std.mem.eql(u8, rep.err, "unauthorized")) return rep.err;
+        }
+        if (!repaired) {
+            st.script_hash = ""; // only invalidate the cache; never delete the script or its storage
+            var did_upload = false;
+            if (ensureRuntime(app, a, uid, tok, st, &did_upload)) |msg| return msg;
+            writeState(app, uid, st.*);
+            repaired = true;
+        }
+        if (!builtin.is_test and attempt < 8) bu.sleepMs(2500);
+    }
+    return runtimeFailure(last);
 }
 
 /// Hand the runtime's answer to the client: its JSON as it is when it said ok, its own error otherwise.
@@ -608,22 +649,23 @@ fn deploy(app: *App, a: std.mem.Allocator, uid: u64, tok: Tok, body: CreateReq) 
         return .{ .err = msg };
     }
     if (uploaded) writeState(app, uid, st);
+    if (readyRuntime(app, a, uid, tok, &st, uploaded)) |msg| {
+        st.last_error = msg;
+        writeState(app, uid, st);
+        return .{ .err = msg };
+    }
 
     var send: Sent = .{ .req = body, .text_max = limit, .max_tots = limitOf(st) };
     send.req.name = name;
     send.req.model = model;
     const json = sentJson(a, send) orelse return .{ .err = "out of memory" };
-    // A workers.dev address that was enabled a moment ago answers with Cloudflare's own page for a few seconds.
-    var attempt: usize = 0;
-    const raw = while (true) : (attempt += 1) {
-        if (totCall(app, a, uid, st, "POST", "/v1/tots", json)) |r| {
-            const rep = replyOf(a, r);
-            if (rep.ok) break r;
-            if (rep.err.len > 0) return .{ .err = a.dupe(u8, rep.err) catch "the tot runtime refused" };
-        }
-        if (!uploaded or attempt >= 8) return .{ .err = "the tot runtime did not answer - a new deployment can take a minute to come up; deploy again" };
-        if (!builtin.is_test) bu.sleepMs(2500);
-    };
+    // POST once: retrying an unnamed create after a lost reply can create duplicate tots.
+    const raw = totCall(app, a, uid, st, "POST", "/v1/tots", json) orelse
+        return .{ .err = "the create reply was lost; refresh the live tots before deploying again" };
+    const rep = replyOf(a, raw);
+    if (!rep.ok) return .{ .err = if (rep.err.len > 0) rep.err else runtimeFailure(raw) };
+    st.last_error = "";
+    writeState(app, uid, st);
     if (body.local) {
         const Made = struct { tot: struct { name: []const u8 = "" } = .{} };
         const made = std.json.parseFromSliceLeaky(Made, a, raw, .{ .ignore_unknown_fields = true }) catch Made{};
@@ -1422,6 +1464,8 @@ fn runsJson(app: *App, a: std.mem.Allocator, uid: u64) ![]const u8 {
         var it = dir.iterate();
         while (it.next(app.io) catch null) |ent| {
             if (ent.kind != .directory or !runLeafOk(ent.name)) continue;
+            const hidden = try std.fmt.allocPrint(a, "{s}/{s}/.hidden", .{ dpath, ent.name });
+            if (std.Io.Dir.cwd().access(app.io, hidden, .{})) |_| continue else |_| {}
             const leaf = try a.dupe(u8, ent.name);
             var run: Run = .{ .leaf = leaf, .folder = try std.fmt.allocPrint(a, "u{d}/_tots/{s}", .{ uid, leaf }), .name = leaf[0 .. leaf.len - 16], .started = leaf[leaf.len - 15 ..] };
             const sp = try std.fmt.allocPrint(a, "{s}/{s}/status.json", .{ dpath, leaf });
@@ -1507,6 +1551,31 @@ pub fn runEvents(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const body = try runEventsJson(app, arena.allocator(), u.id, leaf, after, limit);
     res.content_type = .JSON;
     res.body = try res.arena.dupe(u8, body);
+}
+
+/// Remove a saved run from history. Its events, notes and status stay in its folder for recovery.
+fn hideRun(app: *App, a: std.mem.Allocator, uid: u64, leaf: []const u8) !void {
+    if (!runLeafOk(leaf)) return error.BadRunName;
+    const path = try std.fmt.allocPrint(a, "{s}/u{d}/_tots/{s}", .{ app.data, uid, leaf });
+    var dir = try std.Io.Dir.cwd().openDir(app.io, path, .{});
+    defer dir.close(app.io);
+    try dir.writeFile(app.io, .{ .sub_path = ".hidden", .data = "Removed from run history. Remove this marker to restore the entry.\n" });
+}
+
+pub fn deleteRun(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
+    const u = gate(app, req, res) orelse return;
+    const leaf = req.param("run") orelse "";
+    if (!runLeafOk(leaf)) return badReq(res, "bad run name");
+    var arena = std.heap.ArenaAllocator.init(app.gpa);
+    defer arena.deinit();
+    hideRun(app, arena.allocator(), u.id, leaf) catch |err| {
+        if (err == error.FileNotFound) {
+            res.status = 404;
+            return res.json(.{ .ok = false, .err = "saved run not found" }, .{});
+        }
+        return http.serverErr(res, "could not remove this run from history; its files are unchanged");
+    };
+    try res.json(.{ .ok = true, .removed = leaf, .files_preserved = true }, .{});
 }
 
 /// A deployment that failed, kept as a run of its own: its folder holds what was asked and why it failed, so the
@@ -1770,7 +1839,7 @@ test "every tot route is gated: an anonymous caller gets 401 and nothing runs" {
     const io = threaded.io();
     var ta = try http.testApp(gpa, io, "zig-cftot-gate-tmp");
     defer ta.deinit();
-    inline for (.{ listTots, createTot, deleteTot, teardown, totEvents, totCommand, totConfig, padRead, padWrite, padClear, setKey, setLimit, listRuns, runEvents }) |h| {
+    inline for (.{ listTots, createTot, deleteTot, teardown, totEvents, totCommand, totConfig, padRead, padWrite, padClear, setKey, setLimit, listRuns, runEvents, deleteRun }) |h| {
         var web = httpz.testing.init(.{});
         defer web.deinit();
         web.param("name", "Gary");
@@ -1977,7 +2046,7 @@ test "RSI seeds the live source, uploads self-edits without a local grant, persi
     try tt.expect(std.mem.indexOf(u8, body, "migrations") == null);
 }
 
-test "a first deployment uploads the runtime, sets its token, creates the tot and records the owner's-machine grant; the next costs one call" {
+test "a first deployment uploads the runtime, sets its token, creates the tot and records the owner's-machine grant; the next reuses the ready runtime" {
     const gpa = tt.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
     defer threaded.deinit();
@@ -1996,6 +2065,7 @@ test "a first deployment uploads the runtime, sets its token, creates the tot an
         .{ .method = "PUT", .path = "/workers/scripts/veil-tots", .reply = StandIn.no_browser, .times = 2 },
         .{ .method = "PUT", .path = "/workers/scripts/veil-tots", .reply = StandIn.ok },
         .{ .method = "POST", .path = "/workers/scripts/veil-tots/subdomain", .reply = StandIn.ok },
+        .{ .method = "GET", .path = "/v1/tots", .reply = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{\"ok\":true,\"tots\":[]}" },
         .{ .method = "POST", .path = "/v1/tots", .reply = StandIn.made, .times = 1 },
         .{ .method = "POST", .path = "/v1/tots", .reply = StandIn.full },
     };
@@ -2053,11 +2123,87 @@ test "a first deployment uploads the runtime, sets its token, creates the tot an
     try tt.expectEqual(@as(?usize, 2), srv.firstCall("PUT", "/accounts/acct/workers/scripts/veil-tots-py"));
     try tt.expectEqual(@as(?usize, 6), srv.firstCall("PUT", "/workers/scripts/veil-tots/secrets"));
     try tt.expectEqual(@as(?usize, 7), srv.firstCall("POST", "/workers/scripts/veil-tots/subdomain"));
-    try tt.expectEqual(@as(?usize, 8), srv.firstCall("POST", "/v1/tots"));
+    try tt.expectEqual(@as(?usize, 8), srv.firstCall("GET", "/v1/tots"));
+    try tt.expectEqual(@as(?usize, 9), srv.firstCall("POST", "/v1/tots"));
     try tt.expectEqual(@as(usize, 5), srv.countCalls("PUT", "/accounts/acct/workers/scripts/veil-tots")); // py, 3 runtime tries, secret
     try tt.expectEqual(@as(usize, 2), srv.countCalls("POST", "/v1/tots"));
     try tt.expectEqual(@as(usize, 1), srv.countCalls("GET", "/workers/subdomain"));
-    try tt.expectEqual(@as(usize, 10), srv.call_count);
+    try tt.expectEqual(@as(usize, 12), srv.call_count);
+}
+
+test "an unreachable cached runtime is repaired without deleting data and an uncertain create is never replayed" {
+    const gpa = tt.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var ta = try http.testApp(gpa, io, "zig-cftot-reconnect-tmp");
+    defer ta.deinit();
+    if (!curlRuns(gpa, io)) return error.SkipZigTest;
+    const routes = [_]fakehttp.Route{
+        .{ .method = "GET", .path = "/v1/tots", .reply = "HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\nerror code: 1042", .times = 1 },
+        .{ .method = "GET", .path = "/v1/tots", .reply = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{\"ok\":true,\"tots\":[]}" },
+        .{ .method = "GET", .path = "/workers/subdomain", .reply = StandIn.subdomain },
+        .{ .method = "GET", .path = "/workers/scripts/veil-tots/settings", .reply = StandIn.ok },
+        .{ .method = "PUT", .path = "/workers/scripts/", .reply = StandIn.ok },
+        .{ .method = "POST", .path = "/workers/scripts/veil-tots/subdomain", .reply = StandIn.ok },
+        .{ .method = "POST", .path = "/v1/tots", .reply = StandIn.made, .times = 1 },
+        .{ .method = "POST", .path = "/v1/tots", .reply = "HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\nunavailable" },
+    };
+    var srv: fakehttp.Server = undefined;
+    try srv.startRouted(io, &routes, StandIn.no_script);
+    var running = true;
+    defer if (running) srv.stop();
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    ta.app.cf_api_root = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/client/v4", .{srv.port});
+    const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}", .{srv.port});
+    const source = "// owner's runtime changes\n" ++ TOT_JS;
+    var hb: [16]u8 = undefined;
+    writeState(&ta.app, 1, .{ .account = "acct", .url = url, .runtime_source = source, .runtime_revision = 4, .script_hash = sourceHash(source, &hb) });
+    const tok = Tok{ .key = "test-oauth", .account_id = "acct" };
+    try tt.expect(deploy(&ta.app, a, 1, tok, .{ .goal = "watch the tide tables" }) == .ok);
+    const after = readState(&ta.app, 1, a);
+    try tt.expectEqualStrings(source, after.runtime_source);
+    try tt.expectEqual(@as(u64, 4), after.runtime_revision);
+    try tt.expect(deploy(&ta.app, a, 1, tok, .{ .goal = "watch the tide tables" }) == .err);
+    srv.stop();
+    running = false;
+    try tt.expectEqual(@as(usize, 0), srv.countCalls("DELETE", "/"));
+    try tt.expectEqual(@as(usize, 1), srv.countCalls("GET", "/workers/subdomain"));
+    try tt.expectEqual(@as(usize, 1), srv.countCalls("POST", "/workers/scripts/veil-tots/subdomain"));
+    try tt.expectEqual(@as(usize, 3), srv.countCalls("GET", "/v1/tots"));
+    try tt.expectEqual(@as(usize, 2), srv.countCalls("POST", "/v1/tots"));
+    try tt.expect(std.mem.indexOf(u8, runtimeFailure("error code: 1042"), "1042") != null);
+}
+
+test "a refused workers.dev route is reported before any tot can be created" {
+    const gpa = tt.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var ta = try http.testApp(gpa, io, "zig-cftot-route-tmp");
+    defer ta.deinit();
+    if (!curlRuns(gpa, io)) return error.SkipZigTest;
+    const routes = [_]fakehttp.Route{
+        .{ .method = "GET", .path = "/workers/subdomain", .reply = StandIn.subdomain },
+        .{ .method = "POST", .path = "/workers/scripts/veil-tots/subdomain", .reply = "HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n{\"success\":false,\"errors\":[{\"message\":\"route disabled by account\"}]}" },
+    };
+    var srv: fakehttp.Server = undefined;
+    try srv.startRouted(io, &routes, StandIn.ok);
+    var running = true;
+    defer if (running) srv.stop();
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    ta.app.cf_api_root = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/client/v4", .{srv.port});
+    const result = deploy(&ta.app, a, 1, .{ .key = "test-oauth", .account_id = "acct" }, .{ .goal = "watch the tide tables" });
+    try tt.expect(result == .err);
+    try tt.expect(std.mem.indexOf(u8, result.err, "route disabled by account") != null);
+    try tt.expectEqualStrings(result.err, readState(&ta.app, 1, a).last_error);
+    srv.stop();
+    running = false;
+    try tt.expectEqual(@as(usize, 0), srv.countCalls("POST", "/v1/tots"));
 }
 
 test "the bridge posts a finished job's answer back, fails a run that left none, and never reruns either" {
@@ -2308,6 +2454,7 @@ test "hots from before the rename move across: each becomes a tot with its goal,
         .{ .method = "PUT", .path = "/workers/scripts/veil-tots", .reply = StandIn.ok },
         .{ .method = "POST", .path = "/workers/scripts/veil-tots/subdomain", .reply = StandIn.ok },
         // the new runtime
+        .{ .method = "GET", .path = "/v1/tots", .reply = w("{\"ok\":true,\"tots\":[]}") },
         .{ .method = "POST", .path = "/v1/tots/", .reply = w("{\"ok\":true,\"files\":1}") },
         .{ .method = "POST", .path = "/v1/tots", .reply = w("{\"ok\":true,\"tot\":{\"name\":\"Gary\"}}"), .times = 1 },
         .{ .method = "POST", .path = "/v1/tots", .reply = w("{\"ok\":true,\"tot\":{\"name\":\"Ada\"}}"), .times = 1 },
@@ -2399,6 +2546,45 @@ test "a move whose old runtime does not answer removes nothing and keeps the old
     running = false;
     try tt.expectEqual(@as(usize, 0), srv.countCalls("DELETE", "/workers/scripts/veil-hots"));
     try tt.expect(readLegacy(&ta.app, 1, a) != null);
+}
+
+test "removing a run hides only its history entry and preserves files and other users' runs" {
+    const gpa = tt.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-cftot-hide-tmp";
+    var ta = try http.testApp(gpa, io, root);
+    defer ta.deinit();
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const leaf = "Gary-20261002-090000";
+    const events = "{\"seq\":1,\"text\":\"keep this event\"}\n";
+    for ([_]u64{ 1, 2 }) |uid| {
+        const path = try std.fmt.allocPrint(a, root ++ "/u{d}/_tots/" ++ leaf, .{uid});
+        _ = try std.Io.Dir.cwd().createDirPathStatus(io, path, .default_dir);
+        var dir = try std.Io.Dir.cwd().openDir(io, path, .{});
+        defer dir.close(io);
+        try dir.writeFile(io, .{ .sub_path = "status.json", .data = "{\"state\":\"failed\"}" });
+        try dir.writeFile(io, .{ .sub_path = "events.jsonl", .data = events });
+    }
+    try tt.expectError(error.BadRunName, hideRun(&ta.app, a, 1, "../" ++ leaf));
+    try tt.expectError(error.FileNotFound, hideRun(&ta.app, a, 1, "Ada-20261002-090000"));
+    try hideRun(&ta.app, a, 1, leaf);
+    try hideRun(&ta.app, a, 1, leaf); // idempotent
+    const List = struct { runs: []const std.json.Value };
+    const mine = try std.json.parseFromSliceLeaky(List, a, try runsJson(&ta.app, a, 1), .{ .ignore_unknown_fields = true });
+    const theirs = try std.json.parseFromSliceLeaky(List, a, try runsJson(&ta.app, a, 2), .{ .ignore_unknown_fields = true });
+    try tt.expectEqual(@as(usize, 0), mine.runs.len);
+    try tt.expectEqual(@as(usize, 1), theirs.runs.len);
+    const kept = try std.Io.Dir.cwd().readFileAlloc(io, root ++ "/u1/_tots/" ++ leaf ++ "/events.jsonl", gpa, .limited(1024));
+    defer gpa.free(kept);
+    try tt.expectEqualStrings(events, kept);
+    // Restoring the marker restores the same entry and its original events.
+    try std.Io.Dir.cwd().deleteFile(io, root ++ "/u1/_tots/" ++ leaf ++ "/.hidden");
+    const restored = try std.json.parseFromSliceLeaky(List, a, try runsJson(&ta.app, a, 1), .{ .ignore_unknown_fields = true });
+    try tt.expectEqual(@as(usize, 1), restored.runs.len);
 }
 
 test "every deployment is a run of its own: a failed one is kept with its error, runs list newest first, a run's events read from its folder" {

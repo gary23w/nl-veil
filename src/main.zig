@@ -74,7 +74,7 @@ const log = std.log.scoped(.server);
 // THE single source of release identity. scripts/build-official.sh seds this literal out of this file to
 // name every artifact (veil-v<VERSION>-<os>-<arch>.zip, veil-server-v<VERSION>-…), so the binary can never
 // report a version its own bundle disagrees with. Bump it here and the whole release follows.
-const VERSION = "1.1.9";
+const VERSION = "1.1.10";
 
 const ASSET_HTML = @embedFile("index.html");
 const ASSET_JS = @embedFile("app.js");
@@ -785,6 +785,7 @@ pub fn main(init: std.process.Init) !void {
     router.post("/api/v1/tots/limit", cf_tot.setLimit, .{});
     router.get("/api/v1/tots/runs", cf_tot.listRuns, .{});
     router.get("/api/v1/tots/runs/:run/events", cf_tot.runEvents, .{});
+    router.delete("/api/v1/tots/runs/:run", cf_tot.deleteRun, .{});
     router.delete("/api/v1/tots/:name", cf_tot.deleteTot, .{});
     router.get("/api/v1/tots/:name/events", cf_tot.totEvents, .{});
     router.post("/api/v1/tots/:name/command", cf_tot.totCommand, .{});
