@@ -13,7 +13,7 @@
 //! workers.dev address and sets ONE secret on it: the token every later call carries. That token is never
 //! stored: it is derived from the server key, the user, the account and a generation counter (totToken), so
 //! the state file ({data}/u{uid}/cf_tots.json) holds an address and a hash, nothing a reader could use.
-//! After that this file is a relay: the desk and `veil tot` ask this server, and this server asks
+//! After that this file is a relay: the desk and `veil --tater` ask this server, and this server asks
 //! the Worker - roster, deploy, command, settings, events, the shared scratchpad, delete.
 //!
 //! THE OWNER'S MACHINE: a tot deployed with `local` (a checkbox at deployment, never changeable later) may
@@ -1128,7 +1128,7 @@ fn mirrorPad(app: *App, a: std.mem.Allocator, uid: u64, st: State, pad_seq: u64)
     const r = std.json.parseFromSliceLeaky(R, a, raw, .{ .ignore_unknown_fields = true }) catch return;
     if (!r.ok) return;
     var out: std.ArrayListUnmanaged(u8) = .empty;
-    out.appendSlice(a, "# Shared scratchpad\n\nWhat the tots of this account leave for each other (and what you add from the desk or `veil tot pad`). The newest 200 entries, oldest first; rewritten as it changes.\n\n") catch return;
+    out.appendSlice(a, "# Shared scratchpad\n\nWhat the tots of this account leave for each other (and what you add from the desk or `veil --tater pad`). The newest 200 entries, oldest first; rewritten as it changes.\n\n") catch return;
     for (r.entries) |e| {
         var tb: [24]u8 = undefined;
         out.print(a, "## {d}. {s} - {s} UTC\n\n{s}\n\n", .{ e.seq, e.from, stampStr(&tb, e.t), e.text }) catch return;

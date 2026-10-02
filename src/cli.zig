@@ -329,7 +329,7 @@ pub fn isCommand(sub: []const u8) bool {
         "help",      "--help",        "-h",     "version", "--version", "exec-tool",
         "sync-read", "sync-manifest", "rag",    "themes",  "plugins",   "plug",
         "model",     "dataset",       "set",    "lineage", "swarm",     "--swarm",
-        "configure", "--configure",   "goal",   "tot",
+        "configure", "--configure",   "goal",   "tot",     "tater",     "--tater",
     };
     for (verbs) |v| if (std.mem.eql(u8, sub, v)) return true;
     return false;
@@ -379,7 +379,8 @@ pub fn dispatch(ctx: *Ctx, sub: []const u8, args: []const []const u8) u8 {
     if (std.mem.eql(u8, sub, "dataset") or std.mem.eql(u8, sub, "set")) return cmdDataset(ctx, args);
     if (std.mem.eql(u8, sub, "lineage")) return cmdLineage(ctx, args);
     if (std.mem.eql(u8, sub, "swarm") or std.mem.eql(u8, sub, "--swarm")) return @import("cli/swarm_tui.zig").cmd(ctx, args);
-    if (std.mem.eql(u8, sub, "tot")) return @import("cli/tot.zig").cmd(ctx, args);
+    // `veil --tater` (or `veil tater`); `tot` was its name for a few days and still answers
+    if (std.mem.eql(u8, sub, "--tater") or std.mem.eql(u8, sub, "tater") or std.mem.eql(u8, sub, "tot")) return @import("cli/tot.zig").cmd(ctx, args);
     std.debug.print("unknown command '{s}' — run `veil help`\n", .{sub});
     return 1;
 }
@@ -1382,17 +1383,17 @@ fn cmdHelp() u8 {
         \\      [--budget N] [--forever] [--check "<cmd>"] [--conv id]   ends when achieved, spent, or nothing improves
         \\                               in any chat: /goal <text>   /goal   /goal stop   /goal resume
         \\
-        \\TOTS (autonomous goal loops that run in YOUR Cloudflare account - no human, no machine of yours)
-        \\  tot                          the roster: at most 3; the first is always named Gary
-        \\  tot deploy "<goal>" [flags]  deploy one: --name N --charter "..." --model @cf/... --pace SECONDS (5+)
-        \\                               --size MINDS --calls PER_DAY|unlimited --budget N --forever
-        \\                               --local  lets it queue jobs for the veil on THIS machine (deployment only)
-        \\  tot tell <name> "<text>"     /goal <text>, /goal stop, /queue <goal>, /pause, /resume, or a message
-        \\  tot watch <name>             follow its events
-        \\  tot set <name> [flags]       --model --pace --size --calls --charter --pause --resume
-        \\  tot pad ["<text>"|--clear]   the scratchpad the tots share (--clear empties it)
-        \\  tot key brave <key>          a search key for the tots' web_search (google, google_cx; --remove)
-        \\  tot rm <name>                delete one       tot teardown --yes   remove them all + the runtime
+        \\TATER-TOTS (autonomous goal loops that run in YOUR Cloudflare account - no human, no machine of yours)
+        \\  --tater                         the roster: at most 3; the first is always named Gary
+        \\  --tater deploy "<goal>" [flags] deploy one: --name N --charter "..." --model @cf/... --pace SECONDS (5+)
+        \\                                  --size MINDS --calls PER_DAY|unlimited --budget N --forever
+        \\                                  --local  lets it queue jobs for the veil on THIS machine (deployment only)
+        \\  --tater tell <name> "<text>"    /goal <text>, /goal stop, /queue <goal>, /pause, /resume, or a message
+        \\  --tater watch <name>            follow its events
+        \\  --tater set <name> [flags]      --model --pace --size --calls --charter --pause --resume
+        \\  --tater pad ["<text>"|--clear]  the scratchpad the tater-tots share (--clear empties it)
+        \\  --tater key brave <key>         a search key for their web_search (google, google_cx; --remove)
+        \\  --tater rm <name>               delete one     --tater teardown --yes   remove them all + the runtime
         \\
         \\BUILT-IN MODEL (the-veil-12b served by the server itself — no external runtime)
         \\  model status                 weights + engine + any download in flight
