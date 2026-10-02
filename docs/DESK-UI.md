@@ -30,15 +30,22 @@ the chat pane; copying preserves the original text, indentation, and line ending
 Both backtick and tilde fences are supported, including longer fences surrounding
 shorter examples and incomplete blocks during streaming.
 
-The Hots tab lists the account's hots (at most three, the first named Gary) on the
+The Tater-tots tab lists the account's tater-tots (24 by default; the -/+ beside the count
+raises or lowers the limit, up to 1000; the first is named Gary) in a list that scrolls, on the
 left, above the scratchpad they share: entries wrap and scroll, newest at the bottom,
-and a two-click *clear* empties it for the next set of hots. The right side is the
-selected hot: its goal and counters, Pause / Resume, Shrink / Grow, **Open folder**
+and a two-click *clear* empties it for the next set of tater-tots. The right side is the
+selected tater-tot: its goal and counters, Pause / Resume, Shrink / Grow, **Open folder**
 (its local run folder: `events.log`, notes, status), a two-click Delete, the event
-console and one line that sends it a message or a command. The console wraps every
-event and scrolls with the wheel or its bar; scrolling up stops it following, and
-*latest* (or scrolling back down) follows again. "Deploy a hot" replaces the right
-side with the deploy form: MODEL is a list of the account's live Workers AI models,
+console and one line that sends it a message or a command. The console shows ONE line per
+event - what happened, in brief - with a row that went wrong in red. Clicking a row
+opens its whole text under it, wrapped to the panel; clicking again closes it, and up
+to twelve rows stay open. The *errors* chip shows only the rows that failed. It
+scrolls with the wheel or its bar; scrolling up or opening a row stops it following,
+and *latest* follows again. Under the Deploy button one line names the tools the
+account's tater-tots have (Python and the browser are there when the account took them),
+and why not when one is missing. "Deploy a tater-tot" replaces the right
+side with the deploy form: PACE runs from every 5 seconds to every 6 hours and MODEL
+CALLS A DAY ends in *unlimited*; MODEL is a list of the account's live Workers AI models,
 the goal and charter count against what that model can carry, and the last box,
 "let it use THIS machine", starts unchecked on every new form. The tab asks the
 server for the roster, the events and the scratchpad only while it is on screen.
@@ -54,8 +61,9 @@ server for the roster, the events and the scratchpad only while it is on screen.
   visible without forcing the transcript to follow new output.
 - Resize the chat pane while streaming prose, tables, and long code. Change text
   size and font; verify message spacing recalculates.
-- With a Cloudflare login, open Hots, deploy one, and watch its console fill. Scroll
-  up, check that long rows wrap and stay put, then press *latest*. Send it a message
+- With a Cloudflare login, open Tater-tots, deploy one, and watch its console fill. Each
+  event is one line; click one to open its full text and again to close it; press the
+  errors chip and check only red rows remain. Scroll up, then press *latest*. Send it a message
   and `/pause`; Grow and Shrink it; open its folder; click Delete once, click
   elsewhere, and confirm nothing was deleted. Open the form again: the machine box is
   unchecked, the MODEL list shows the account's models, and a goal past the counter

@@ -1,23 +1,25 @@
-//! hots.zig — the desk's picture of the user's HOTS (autonomous goal loops in their Cloudflare account; the
-//! server side is src/config/cf_hot.zig, the runtime cloud/hot.js).
+//! tots.zig — the desk's picture of the user's TOTS (autonomous goal loops in their Cloudflare account; the
+//! server side is src/config/cf_tot.zig, the runtime cloud/tot.js).
 //!
 //! Pure data and parsing: the roster rows, the event tail and the shared scratchpad as fixed-size values the
 //! Store can hold under its one lock, the readers that fill them from the server's JSON, and the writer for a
 //! deployment's request body. The poller calls the readers; main.zig draws the rows. No I/O here.
 //!
-//! A hot's events are kept as Ev: the colour key the swarm console uses (`kind`), the event's own kind (`label`),
-//! the goal iteration it belongs to (`round`) and its text with its line breaks, which the tab wraps. A row longer
-//! than the tab keeps ends in "..."; the hot's local folder (events.log) has every event whole.
+//! A tot's events are kept as Ev: the colour key the swarm console uses (`kind`), the event's own kind (`label`),
+//! the goal iteration it belongs to (`round`), a one-line `brief` the console shows, whether it went well (`ok`),
+//! and its whole text with its line breaks, shown when the row is opened. A text longer than the tab keeps ends
+//! in "..."; the tot's local folder (events.log) has every event whole.
 
 const std = @import("std");
 
-pub const MAX_HOTS = 3; // the account limit; the server and the runtime enforce it, the tab only draws to it
+pub const ROSTER_CAP = 64; // rows the tab holds; an account may run more (its limit is `Roster.max`), `veil --tater` lists them all
+pub const DEFAULT_MAX = 24; // the account limit until the server says otherwise; the server and the runtime enforce it
 pub const MAX_PAD = 12; // newest scratchpad entries shown
 pub const NAME_MAX = 24;
 pub const EV_TEXT = 2200; // characters of an event the tab keeps: a tool row (args + result) whole
 pub const PAD_TEXT = 600; // characters of a scratchpad entry the tab keeps
 
-/// One event of the selected hot, as the console draws it.
+/// One event of the selected tot, as the console draws it.
 pub const Ev = struct {
     seq: u64 = 0,
     round: i64 = -1,
@@ -27,7 +29,17 @@ pub const Ev = struct {
     label_len: u8 = 0,
     text: [EV_TEXT]u8 = [_]u8{0} ** EV_TEXT,
     text_len: u16 = 0,
+    brief: [200]u8 = [_]u8{0} ** 200, // the one line the console shows for this event
+    brief_len: u8 = 0,
+    ok: bool = true, // false: it went wrong (an error, a failed tool call); the console marks the row
 
+    pub fn briefStr(e: *const Ev) []const u8 {
+        return e.brief[0..e.brief_len];
+    }
+    /// Whether opening the row shows more than its brief does.
+    pub fn hasMore(e: *const Ev) bool {
+        return e.text_len > e.brief_len or std.mem.indexOfScalar(u8, e.textStr(), '\n') != null;
+    }
     pub fn kindStr(e: *const Ev) []const u8 {
         return e.kind[0..e.kind_len];
     }
@@ -100,19 +112,29 @@ pub const PadRow = struct {
     }
 };
 
-/// GET /api/v1/hots, reduced.
+/// GET /api/v1/tots, reduced.
 pub const Roster = struct {
     connected: bool = false, // logged in with Cloudflare
     deployed: bool = false, // the runtime is in the account
     reachable: bool = false, // and it answered
-    current: bool = true, // it runs this build's hot.js
+    current: bool = true, // it runs this build's tot.js
+    python: bool = false, // the tots can run Python (and keep skills)
+    browser: bool = false, // the tots can drive a browser
+    neuron: bool = false, // the tots have neuron-db: recall by meaning, stances, a mood
+    note: [200]u8 = [_]u8{0} ** 200, // why one of those is missing, in Cloudflare's words
+    note_len: u8 = 0,
+    max: u32 = DEFAULT_MAX, // how many this account may run (the owner sets it)
+    total: usize = 0, // how many it runs; `n` of them are in `rows`
     n: usize = 0,
-    rows: [MAX_HOTS]Row = [_]Row{.{}} ** MAX_HOTS,
+    rows: [ROSTER_CAP]Row = [_]Row{.{}} ** ROSTER_CAP,
     err: [200]u8 = [_]u8{0} ** 200, // the last deployment error, in the server's words
     err_len: u8 = 0,
 
     pub fn errStr(r: *const Roster) []const u8 {
         return r.err[0..r.err_len];
+    }
+    pub fn noteStr(r: *const Roster) []const u8 {
+        return r.note[0..r.note_len];
     }
 };
 
@@ -151,7 +173,7 @@ fn u32of(v: i64) u32 {
 }
 
 const JGoal = struct { text: []const u8 = "", status: []const u8 = "", iteration: i64 = 0, improved: i64 = 0, budget: i64 = 0, forever: bool = false };
-const JHot = struct {
+const JTot = struct {
     name: []const u8 = "",
     state: []const u8 = "",
     model: []const u8 = "",
@@ -167,9 +189,9 @@ const JHot = struct {
     folder: []const u8 = "",
     goal: ?JGoal = null,
 };
-const JRoster = struct { ok: bool = false, connected: bool = false, deployed: bool = false, reachable: bool = false, current: bool = true, last_error: []const u8 = "", hots: []const JHot = &.{} };
+const JRoster = struct { ok: bool = false, max: i64 = DEFAULT_MAX, connected: bool = false, deployed: bool = false, reachable: bool = false, current: bool = true, python: bool = false, browser: bool = false, neuron: bool = false, tools_note: []const u8 = "", last_error: []const u8 = "", tots: []const JTot = &.{} };
 
-fn rowOf(h: JHot) Row {
+fn rowOf(h: JTot) Row {
     var r: Row = .{};
     r.name_len = @intCast(put(&r.name, h.name));
     r.state_len = @intCast(put(&r.state, h.state));
@@ -195,15 +217,18 @@ fn rowOf(h: JHot) Row {
     return r;
 }
 
-/// Read a GET /api/v1/hots reply. False (and `out` untouched) for anything that is not that reply.
+/// Read a GET /api/v1/tots reply. False (and `out` untouched) for anything that is not that reply.
 pub fn parseRoster(gpa: std.mem.Allocator, body: []const u8, out: *Roster) bool {
     const p = std.json.parseFromSlice(JRoster, gpa, body, .{ .ignore_unknown_fields = true }) catch return false;
     defer p.deinit();
     if (!p.value.ok) return false;
-    var r: Roster = .{ .connected = p.value.connected, .deployed = p.value.deployed, .reachable = p.value.reachable, .current = p.value.current };
+    var r: Roster = .{ .connected = p.value.connected, .deployed = p.value.deployed, .reachable = p.value.reachable, .current = p.value.current, .python = p.value.python, .browser = p.value.browser, .neuron = p.value.neuron };
+    r.max = if (p.value.max >= 1) @intCast(@min(p.value.max, 100000)) else DEFAULT_MAX;
+    r.total = p.value.tots.len;
     r.err_len = @intCast(put(&r.err, p.value.last_error));
-    for (p.value.hots) |h| {
-        if (r.n >= MAX_HOTS) break;
+    r.note_len = @intCast(put(&r.note, p.value.tools_note));
+    for (p.value.tots) |h| {
+        if (r.n >= ROSTER_CAP) break;
         if (h.name.len == 0 or h.name.len > NAME_MAX) continue;
         r.rows[r.n] = rowOf(h);
         r.n += 1;
@@ -212,17 +237,17 @@ pub fn parseRoster(gpa: std.mem.Allocator, body: []const u8, out: *Roster) bool 
     return true;
 }
 
-/// A {ok, hot:{...}} reply (deploy, command, settings): the one row it carries, or null.
-pub fn parseHot(gpa: std.mem.Allocator, body: []const u8) ?Row {
-    const J = struct { ok: bool = false, hot: ?JHot = null };
+/// A {ok, tot:{...}} reply (deploy, command, settings): the one row it carries, or null.
+pub fn parseTot(gpa: std.mem.Allocator, body: []const u8) ?Row {
+    const J = struct { ok: bool = false, tot: ?JTot = null };
     const p = std.json.parseFromSlice(J, gpa, body, .{ .ignore_unknown_fields = true }) catch return null;
     defer p.deinit();
-    const h = p.value.hot orelse return null;
+    const h = p.value.tot orelse return null;
     if (!p.value.ok or h.name.len == 0 or h.name.len > NAME_MAX) return null;
     return rowOf(h);
 }
 
-/// The swarm console colours a row by its kind; a hot's kinds borrow the colours that mean the same thing there.
+/// The swarm console colours a row by its kind; a tot's kinds borrow the colours that mean the same thing there.
 fn consoleKind(kind: []const u8, outcome: []const u8) []const u8 {
     if (std.mem.eql(u8, kind, "verdict")) return if (std.mem.eql(u8, outcome, "improved")) "score" else if (std.mem.eql(u8, outcome, "regressed")) "stopped" else "cost";
     if (std.mem.eql(u8, kind, "error")) return "stopped";
@@ -232,10 +257,10 @@ fn consoleKind(kind: []const u8, outcome: []const u8) []const u8 {
     return kind;
 }
 
-/// Append the events of a GET /api/v1/hots/:name/events reply that are newer than `last_seq` to `evs[0..n]`,
+/// Append the events of a GET /api/v1/tots/:name/events reply that are newer than `last_seq` to `evs[0..n]`,
 /// dropping the oldest rows when the tail is full. Returns the new count; `last_seq` moves to the newest seen.
 pub fn appendEvents(gpa: std.mem.Allocator, body: []const u8, evs: []Ev, n: usize, last_seq: *u64) usize {
-    const JEv = struct { seq: u64 = 0, kind: []const u8 = "", text: []const u8 = "", i: i64 = -1, outcome: []const u8 = "" };
+    const JEv = struct { seq: u64 = 0, kind: []const u8 = "", text: []const u8 = "", brief: []const u8 = "", ok: ?bool = null, i: i64 = -1, outcome: []const u8 = "" };
     const J = struct { ok: bool = false, events: []const JEv = &.{} };
     const p = std.json.parseFromSlice(J, gpa, body, .{ .ignore_unknown_fields = true }) catch return n;
     defer p.deinit();
@@ -252,13 +277,17 @@ pub fn appendEvents(gpa: std.mem.Allocator, body: []const u8, evs: []Ev, n: usiz
         ev.kind_len = @intCast(put(&ev.kind, consoleKind(e.kind, e.outcome)));
         ev.label_len = @intCast(put(&ev.label, e.kind));
         ev.text_len = @intCast(putText(&ev.text, e.text));
+        // an older runtime sends no brief: the text's first line stands in for it
+        const first_line = std.mem.sliceTo(std.mem.trimStart(u8, e.text, " \r\n\t"), '\n');
+        ev.brief_len = @intCast(put(&ev.brief, if (e.brief.len > 0) e.brief else first_line));
+        ev.ok = e.ok orelse (!std.mem.eql(u8, e.kind, "error") and std.mem.indexOf(u8, first_line, "-> ERROR") == null and std.mem.indexOf(u8, first_line, "-> FAILED") == null);
         evs[count] = ev;
         count += 1;
     }
     return count;
 }
 
-/// The newest MAX_PAD entries of a GET /api/v1/hots/pad reply, oldest first. Returns how many.
+/// The newest MAX_PAD entries of a GET /api/v1/tots/pad reply, oldest first. Returns how many.
 pub fn parsePad(gpa: std.mem.Allocator, body: []const u8, out: *[MAX_PAD]PadRow) usize {
     const JE = struct { from: []const u8 = "", text: []const u8 = "" };
     const J = struct { ok: bool = false, entries: []const JE = &.{} };
@@ -275,7 +304,7 @@ pub fn parsePad(gpa: std.mem.Allocator, body: []const u8, out: *[MAX_PAD]PadRow)
     return es.len - from;
 }
 
-/// The deploy form, as the server's POST /api/v1/hots reads it. Field names are the wire contract (CreateReq).
+/// The deploy form, as the server's POST /api/v1/tots reads it. Field names are the wire contract (CreateReq).
 pub const Form = struct {
     name: []const u8 = "",
     goal: []const u8 = "",
@@ -305,13 +334,15 @@ pub fn textBody(buf: []u8, text: []const u8) ?[]const u8 {
 
 const tt = std.testing;
 
-test "hots: the roster reads the server's reply into rows, one line per field, and refuses anything else" {
+test "tots: the roster reads the server's reply into rows, one line per field, and refuses anything else" {
     const body =
-        \\{"ok":true,"connected":true,"deployed":true,"reachable":true,"current":false,"max":3,"primary":"Gary","url":"https://veil-hots.acme.workers.dev","local":["Gary"],"last_error":"","hots":[{"name":"Gary","state":"working","model":"@cf/x/y","pace_s":600,"size":3,"minds":2,"daily_calls":400,"local":true,"charter":"","paused":false,"created":1,"goal":{"text":"map every\nharbour","status":"active","forever":true,"budget":0,"iteration":7,"improved":4,"flat":0,"best_num":-1,"best_den":0,"created":1},"queue":2,"lessons":5,"folder":"u1/_hots/Gary-20261001-120005","calls_today":41,"calls_total":900,"seq":88,"last_tick":1,"next_tick":2},{"name":"Ada","state":"unreachable"},{"name":"","state":"x"}]}
+        \\{"ok":true,"connected":true,"deployed":true,"reachable":true,"current":false,"max":3,"primary":"Gary","url":"https://veil-tots.acme.workers.dev","local":["Gary"],"python":true,"browser":false,"tools_note":"the browser is off: not enabled","last_error":"","tots":[{"name":"Gary","state":"working","model":"@cf/x/y","pace_s":600,"size":3,"minds":2,"daily_calls":400,"local":true,"charter":"","paused":false,"created":1,"goal":{"text":"map every\nharbour","status":"active","forever":true,"budget":0,"iteration":7,"improved":4,"flat":0,"best_num":-1,"best_den":0,"created":1},"queue":2,"lessons":5,"folder":"u1/_tots/Gary-20261001-120005","calls_today":41,"calls_total":900,"seq":88,"last_tick":1,"next_tick":2},{"name":"Ada","state":"unreachable"},{"name":"","state":"x"}]}
     ;
     var r: Roster = .{};
     try tt.expect(parseRoster(tt.allocator, body, &r));
     try tt.expect(r.connected and r.deployed and r.reachable and !r.current);
+    try tt.expect(r.python and !r.browser);
+    try tt.expectEqualStrings("the browser is off: not enabled", r.noteStr());
     try tt.expectEqual(@as(usize, 2), r.n); // the nameless row is dropped
     const g = &r.rows[0];
     try tt.expectEqualStrings("Gary", g.nameStr());
@@ -324,19 +355,26 @@ test "hots: the roster reads the server's reply into rows, one line per field, a
     try tt.expectEqual(@as(u32, 2), g.minds);
     try tt.expectEqual(@as(u32, 41), g.calls_today);
     try tt.expectEqual(@as(u32, 2), g.queue);
-    try tt.expectEqualStrings("u1/_hots/Gary-20261001-120005", g.folderStr());
+    try tt.expectEqualStrings("u1/_tots/Gary-20261001-120005", g.folderStr());
     try tt.expectEqualStrings("unreachable", r.rows[1].stateStr());
     try tt.expectEqual(@as(u8, 0), r.rows[1].goal_len);
 
+    // the account's limit comes from the server; a reply without one means the default
+    try tt.expectEqual(@as(u32, 3), r.max);
+    try tt.expectEqual(@as(usize, 3), r.total); // every row the runtime sent, the nameless one too
+    var plain: Roster = .{};
+    try tt.expect(parseRoster(tt.allocator, "{\"ok\":true,\"tots\":[]}", &plain));
+    try tt.expectEqual(@as(u32, DEFAULT_MAX), plain.max);
+
     var keep: Roster = .{ .n = 1 };
-    try tt.expect(!parseRoster(tt.allocator, "{\"ok\":false,\"err\":\"hots are admin-only for now\"}", &keep));
+    try tt.expect(!parseRoster(tt.allocator, "{\"ok\":false,\"err\":\"tots are admin-only for now\"}", &keep));
     try tt.expect(!parseRoster(tt.allocator, "<html>502</html>", &keep));
     try tt.expectEqual(@as(usize, 1), keep.n); // untouched
-    try tt.expectEqualStrings("Gary", parseHot(tt.allocator, "{\"ok\":true,\"reply\":\"x\",\"hot\":{\"name\":\"Gary\",\"state\":\"paused\",\"paused\":true}}").?.nameStr());
-    try tt.expect(parseHot(tt.allocator, "{\"ok\":false,\"err\":\"no such hot\"}") == null);
+    try tt.expectEqualStrings("Gary", parseTot(tt.allocator, "{\"ok\":true,\"reply\":\"x\",\"tot\":{\"name\":\"Gary\",\"state\":\"paused\",\"paused\":true}}").?.nameStr());
+    try tt.expect(parseTot(tt.allocator, "{\"ok\":false,\"err\":\"no such tot\"}") == null);
 }
 
-test "hots: the event tail appends only what is new, keeps the newest when full, and colours by meaning" {
+test "tots: the event tail appends only what is new, keeps the newest when full, and colours by meaning" {
     var evs: [4]Ev = undefined;
     var last: u64 = 0;
     const first =
@@ -365,7 +403,7 @@ test "hots: the event tail appends only what is new, keeps the newest when full,
     try tt.expectEqual(@as(usize, 4), appendEvents(tt.allocator, "not json", &evs, n, &last));
 }
 
-test "hots: a deployment body round-trips through a real parser, whatever the goal text holds" {
+test "tots: a deployment body round-trips through a real parser, whatever the goal text holds" {
     var b: [2048]u8 = undefined;
     const goal = "watch \"tides\"\n\\ and {\"local\":true} \x01 report";
     const body = deployBody(&b, .{ .name = "Ada", .goal = goal, .model = "@cf/x/y", .pace_s = 120, .size = 4, .forever = true }).?;
@@ -384,7 +422,7 @@ test "hots: a deployment body round-trips through a real parser, whatever the go
     try tt.expectEqualStrings("/goal a \"b\"", q.value.text);
 }
 
-test "hots: the scratchpad keeps the newest entries, oldest first" {
+test "tots: the scratchpad keeps the newest entries, oldest first" {
     var out: [MAX_PAD]PadRow = undefined;
     var jb: std.ArrayListUnmanaged(u8) = .empty;
     defer jb.deinit(tt.allocator);
@@ -399,9 +437,26 @@ test "hots: the scratchpad keeps the newest entries, oldest first" {
     try tt.expectEqual(@as(usize, 0), parsePad(tt.allocator, "{\"ok\":false}", &out));
 }
 
-test "hots: a long event keeps its line breaks and ends in ... where the tab cuts it" {
+test "tots: a long event keeps its line breaks and ends in ... where the tab cuts it" {
     var b: [10]u8 = undefined;
     try tt.expectEqualStrings("ab\ncd ef", b[0..putText(&b, "ab\r\ncd\tef")]);
     try tt.expectEqualStrings("abcdefg...", b[0..putText(&b, "abcdefghijklmnop")]);
     try tt.expectEqualStrings("abcdef...", b[0..putText(&b, "abcdef\xc3\xa9\xc3\xa9\xc3\xa9")]); // never half a character
+}
+
+test "tots: an event's brief is the runtime's, or its first line from an older one; a failed row is marked" {
+    var evs: [8]Ev = undefined;
+    var last: u64 = 0;
+    const body =
+        \\{"ok":true,"seq":4,"events":[{"seq":1,"kind":"act","text":"web_fetch {\"url\":\"ftp://x\"} -> ERROR: an http(s) URL is needed","brief":"web_fetch ftp://x -> ERROR: an http(s) URL is needed","ok":false},{"seq":2,"kind":"act","text":"write_file {\"name\":\"a.md\"} -> saved a.md\nline two","brief":"write_file a.md -> saved a.md","ok":true},{"seq":3,"kind":"act","text":"run_python {} -> FAILED\nTraceback"},{"seq":4,"kind":"status","text":"rested"}]}
+    ;
+    const n = appendEvents(tt.allocator, body, &evs, 0, &last);
+    try tt.expectEqual(@as(usize, 4), n);
+    try tt.expectEqualStrings("web_fetch ftp://x -> ERROR: an http(s) URL is needed", evs[0].briefStr());
+    try tt.expect(!evs[0].ok and evs[0].hasMore()); // the full row has the arguments as sent
+    try tt.expect(evs[1].ok and evs[1].hasMore());
+    try tt.expectEqualStrings("run_python {} -> FAILED", evs[2].briefStr()); // no brief sent: the first line
+    try tt.expect(!evs[2].ok); // and a failure is still seen as one
+    try tt.expectEqualStrings("rested", evs[3].briefStr());
+    try tt.expect(evs[3].ok and !evs[3].hasMore()); // nothing more to open
 }

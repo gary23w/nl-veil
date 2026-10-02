@@ -35,7 +35,7 @@ const cf_oauth = @import("config/cf_oauth.zig");
 const cftools = @import("worker/cftools.zig"); // isLoopbackRoot — the NL_CF_API_ROOT gate
 const cf_r2 = @import("config/cf_r2.zig");
 const cf_tunnel = @import("config/cf_tunnel.zig");
-const cf_hot = @import("config/cf_hot.zig");
+const cf_tot = @import("config/cf_tot.zig");
 const server_config = @import("config/server_config.zig");
 const lan_mod = @import("config/lan.zig");
 const worker = @import("worker/run.zig");
@@ -622,9 +622,9 @@ pub fn main(init: std.process.Init) !void {
     // — not next to the sup.bgLoop spawn above — because it needs the fully-wired App; like sup, `app` lives on
     // main's stack for the life of the process (listen() below never returns in normal operation).
     if (std.Thread.spawn(.{}, sched.bgLoop, .{&app})) |t| t.detach() else |_| {}
-    // HOTS allowed onto this machine queue jobs in the cloud; this thread polls for them and runs each as an
-    // unattended chat turn (config/cf_hot.zig). It idles at no cost for a user who approved none.
-    if (std.Thread.spawn(.{}, cf_hot.bgLoop, .{&app})) |t| t.detach() else |_| {}
+    // TOTS allowed onto this machine queue jobs in the cloud; this thread polls for them and runs each as an
+    // unattended chat turn (config/cf_tot.zig). It idles at no cost for a user who approved none.
+    if (std.Thread.spawn(.{}, cf_tot.bgLoop, .{&app})) |t| t.detach() else |_| {}
     log.info("billing: {s} (NL_PRODUCTION)", .{if (production) "PRODUCTION — non-admins metered by neuron plan" else "BETA — unmetered full use"});
     if (!open_reg) log.info("registration: CLOSED (private beta) — set NL_OPEN_REGISTRATION=1 to open public signups", .{});
     // NL_CF_API_ROOT: a stand-in for api.cloudflare.com, for the simulation suite (scripts/sim/cfworld.py).
@@ -774,17 +774,19 @@ pub fn main(init: std.process.Init) !void {
     // may flip. The URL it publishes is this server, so the guards live in the module, not here.
     router.get("/api/v1/oauth/cloudflare/tunnel", cf_tunnel.tunnelStatus, .{});
     router.post("/api/v1/oauth/cloudflare/tunnel", cf_tunnel.tunnelSet, .{});
-    // Hots (config/cf_hot.zig): autonomous goal loops in the user's own Cloudflare account. Admin-gated.
-    router.get("/api/v1/hots", cf_hot.listHots, .{});
-    router.post("/api/v1/hots", cf_hot.createHot, .{});
-    router.delete("/api/v1/hots", cf_hot.teardown, .{});
-    router.get("/api/v1/hots/pad", cf_hot.padRead, .{});
-    router.post("/api/v1/hots/pad", cf_hot.padWrite, .{});
-    router.post("/api/v1/hots/pad/clear", cf_hot.padClear, .{});
-    router.delete("/api/v1/hots/:name", cf_hot.deleteHot, .{});
-    router.get("/api/v1/hots/:name/events", cf_hot.hotEvents, .{});
-    router.post("/api/v1/hots/:name/command", cf_hot.hotCommand, .{});
-    router.post("/api/v1/hots/:name/config", cf_hot.hotConfig, .{});
+    // Tots (config/cf_tot.zig): autonomous goal loops in the user's own Cloudflare account. Admin-gated.
+    router.get("/api/v1/tots", cf_tot.listTots, .{});
+    router.post("/api/v1/tots", cf_tot.createTot, .{});
+    router.delete("/api/v1/tots", cf_tot.teardown, .{});
+    router.get("/api/v1/tots/pad", cf_tot.padRead, .{});
+    router.post("/api/v1/tots/pad", cf_tot.padWrite, .{});
+    router.post("/api/v1/tots/pad/clear", cf_tot.padClear, .{});
+    router.post("/api/v1/tots/keys", cf_tot.setKey, .{});
+    router.post("/api/v1/tots/limit", cf_tot.setLimit, .{});
+    router.delete("/api/v1/tots/:name", cf_tot.deleteTot, .{});
+    router.get("/api/v1/tots/:name/events", cf_tot.totEvents, .{});
+    router.post("/api/v1/tots/:name/command", cf_tot.totCommand, .{});
+    router.post("/api/v1/tots/:name/config", cf_tot.totConfig, .{});
     router.get("/api/v1/swarms/:id/events", tail_fanout.swarmEvents, .{});
     router.get("/api/v1/swarms/:id/stream", tail_fanout.swarmStream, .{});
     router.get("/api/v1/swarms/:id/files", deploy_service.swarmFiles, .{});
@@ -1903,7 +1905,7 @@ const MAIN_SRC = @embedFile("main.zig");
 const ROUTE_MODS = [_]struct { alias: []const u8, src: []const u8 }{
     .{ .alias = "auth_api", .src = @embedFile("auth/auth_api.zig") },
     .{ .alias = "cf_tunnel", .src = @embedFile("config/cf_tunnel.zig") },
-    .{ .alias = "cf_hot", .src = @embedFile("config/cf_hot.zig") },
+    .{ .alias = "cf_tot", .src = @embedFile("config/cf_tot.zig") },
     .{ .alias = "deploy_service", .src = @embedFile("worker/deploy/service.zig") },
     .{ .alias = "lineage_api", .src = @embedFile("worker/deploy/lineage_api.zig") },
     .{ .alias = "tail_fanout", .src = @embedFile("worker/control/fanout.zig") },

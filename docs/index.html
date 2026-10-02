@@ -185,19 +185,35 @@
         is served by the server itself &mdash; no separate model runtime, no API key. Click <em>download the
         model</em> in the app (or run <code>veil model pull</code>) and the whole thing works offline. Point it
         at Ollama or any OpenAI-compatible endpoint instead whenever you would rather.</p>
-      <p><strong>New in <code>v1.1.7</code>: hots &mdash; goal loops that run without you, in your own account.</strong>
-        Log in with Cloudflare, open the new <em>Hots</em> tab (or run <code>veil hot deploy "&lt;goal&gt;"</code>),
-        and the veil uploads one small Worker into <em>your</em> account. Each hot wakes on a timer, makes one
+      <p><strong>New: tater-tots &mdash; goal loops that run without you, in your own account.</strong>
+        (<code>v1.1.7</code> called them hots; a newer veil moves yours across by itself.)
+        Log in with Cloudflare, open the new <em>Tater-tots</em> tab (or run <code>veil --tater deploy "&lt;goal&gt;"</code>),
+        and the veil uploads one small Worker into <em>your</em> account. Each tater-tot wakes on a timer, makes one
         measured improvement toward its goal, writes itself lessons from what the measurement said, and moves on
-        to the next best thing when a goal ends &mdash; with your computer off. Up to three per account, the first
+        to the next best thing when a goal ends &mdash; with your computer off. It works with real tools: its
+        own files, web search and any HTTP call, a real browser, Python (and scripts it saves as skills of its
+        own), memory and a plan. 24 per account by default, more if your setup carries them, the first
         always named Gary; they share a scratchpad, cast their own inner swarms, and may use your machine only if
         you check the box at deployment. Every run is mirrored into a folder on your machine &mdash; an
         <code>events.log</code> to tail, its notes, the shared scratchpad &mdash; that the tab opens for you; the
-        model list is your account's own, and deleting the last hot removes its Worker. Also new:
+        model list is your account's own, and deleting the last tater-tot removes its Worker. Also new:
         <code>/goal &lt;text&gt;</code> in any chat gives the auto-loop a stored goal, a measured outcome per step
         and its own stop rules.
-        <a href="#doc=config/cf_hot">How hots work &rarr;</a>
+        <a href="#doc=config/cf_tot">How tater-tots work &rarr;</a>
         <a href="https://github.com/gary23w/nl-veil/blob/main/docs/release/RELEASE-v1.1.7.md" target="_blank" rel="noopener">v1.1.7 release notes &rarr;</a></p>
+      <figure class="tots-trailer" style="margin:18px 0 6px">
+        <video controls preload="none" poster="video/tots-release.png" style="width:100%;max-width:960px;border-radius:12px;display:block" aria-label="TATER-TOTS vs DOTS, the trailer">
+          <source src="video/tots-release.mp4" type="video/mp4">
+          <a href="video/tots-release.mp4">Watch the tater-tots trailer</a>
+        </video>
+        <figcaption style="font-size:.9em;opacity:.8;margin-top:6px">The tater-tots trailer (2:20, sound on): the Dots turn on us, and only a side dish can stop them.</figcaption>
+      </figure>
+      <p><strong>Seen working, on a real account.</strong> Three runs, each a tater-tot named Gary given the one-word goal
+        <code>test</code> at a 5-second pace: 1 of 18 iterations improved on the first; 21 of 49 on the second, which left
+        24 files of reports and 12 lessons it wrote itself; and on the third the runtime first wrote down
+        what <code>test</code> means as a checklist, then wrote and ran <code>test_runner.py</code> and reached
+        <strong>6/6</strong> by iteration 11 (3 of 3 tests passing). The excerpt from its <code>events.log</code> is in the
+        <a href="https://github.com/gary23w/nl-veil#seen-working" target="_blank" rel="noopener">README</a>.</p>
       <p><strong>Before it: <code>v1.1.6</code>, watch a swarm from the terminal.</strong>
         <code>veil --swarm "&lt;goal&gt;"</code> casts a swarm and opens a terminal view: every mind's step on the
         right, lit as it lands, and one chat line into the whole swarm on the left; it runs to completion on its
