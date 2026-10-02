@@ -1,55 +1,55 @@
-// hot.js — the HOT runtime (Human Overview Technician): the veil's goal loop, living in the user's own
+// tot.js — the TOT runtime (Tiny Overview Technician): the veil's goal loop, living in the user's own
 // Cloudflare account and running with no human in it.
 //
-// WHAT: one Worker script ("veil-hots") the veil server uploads through the user's Cloudflare login
-// (src/config/cf_hot.zig embeds this file). Each hot is one Durable Object: its goal, its iteration log, its
+// WHAT: one Worker script ("veil-tots") the veil server uploads through the user's Cloudflare login
+// (src/config/cf_tot.zig embeds this file). Each tot is one Durable Object: its goal, its iteration log, its
 // lessons, its notes and its event tail live in that object's storage, and an ALARM is its heartbeat - every
 // alarm runs ONE iteration of the same loop src/worker/chat/goal.zig runs in a chat turn:
 //
 //     pick -> do -> measure -> record        (then: learn, and set the next alarm)
 //
 // The model is reached through the account's own AI binding (env.AI): the call never crosses the public
-// internet and needs no API key. A hot is never asked anything and never waits for anyone: commands from the
+// internet and needs no API key. A tot is never asked anything and never waits for anyone: commands from the
 // human land in an inbox the next iteration reads, and a goal that ends (achieved / plateau / budget) hands
-// over to the next queued goal, or to one the hot proposes for itself from its charter.
+// over to the next queued goal, or to one the tot proposes for itself from its charter.
 //
-// ONE MORE OBJECT of the same class, named "pad", holds what the hots share: the roster (at most MAX_HOTS)
-// and the conjoined scratchpad every hot reads at the start of an iteration and may write to.
+// ONE MORE OBJECT of the same class, named "pad", holds what the tots share: the roster (at most MAX_TOTS)
+// and the conjoined scratchpad every tot reads at the start of an iteration and may write to.
 //
-// WHAT A HOT CAN DO (its tool belt; see TOOLS): keep files, search and fetch the web, make any HTTP call, drive a
+// WHAT A TOT CAN DO (its tool belt; see TOOLS): keep files, search and fetch the web, make any HTTP call, drive a
 // real browser (env.BROWSER, Cloudflare's browser binding, spoken to in the DevTools protocol), run Python
-// (env.PY, the companion Worker cloud/hot_py.py), keep facts and a plan, save a script as a skill and run it
-// again, cast an inner swarm, and talk to the other hots. The browser and Python are bindings the veil server
-// adds when the account takes them; a hot without one is told so by the tool, in words.
+// (env.PY, the companion Worker cloud/tot_py.py), keep facts and a plan, save a script as a skill and run it
+// again, cast an inner swarm, and talk to the other tots. The browser and Python are bindings the veil server
+// adds when the account takes them; a tot without one is told so by the tool, in words.
 //
-// ITS MIND: the hot's facts live in neuron-db (cloud/neuron_core.wasm, the same memory engine the veil uses,
+// ITS MIND: the tot's facts live in neuron-db (cloud/neuron_core.wasm, the same memory engine the veil uses,
 // compiled to WebAssembly and uploaded beside this file), which recalls by meaning rather than by matching
-// words, and which keeps STANCES - how the hot has come to feel about a topic, from what happened when it worked
-// on it - and a MOOD. Both ride every prompt: they are the hot's own experience steering what it tries next.
-// Without the engine (an account that did not take the module) the hot recalls by keyword and still keeps stances.
+// words, and which keeps STANCES - how the tot has come to feel about a topic, from what happened when it worked
+// on it - and a MOOD. Both ride every prompt: they are the tot's own experience steering what it tries next.
+// Without the engine (an account that did not take the module) the tot recalls by keyword and still keeps stances.
 //
-// THE OWNER'S MACHINE: a hot deployed with `local: true` gets one more tool, local_run. It only QUEUES a job;
+// THE OWNER'S MACHINE: a tot deployed with `local: true` gets one more tool, local_run. It only QUEUES a job;
 // the veil server on the owner's machine polls for jobs (outbound only - nothing listens at home), runs each
 // as an unattended chat turn with the full local tool surface, and posts the result back to the inbox.
 //
-// THE LOCAL FOLDER: the veil server mirrors each hot into {data}/u<uid>/_hots/<name>-<deployed at>/ (events,
+// THE LOCAL FOLDER: the veil server mirrors each tot into {data}/u<uid>/_tots/<name>-<deployed at>/ (events,
 // status, notes) and the shared scratchpad beside them. Counters here (seq, notes_rev, the pad's seq) let it
 // ask only for what changed.
 //
-// Every route needs `Authorization: Bearer <HOT_TOKEN>` (a secret binding the veil server generates at deploy).
+// Every route needs `Authorization: Bearer <TOT_TOKEN>` (a secret binding the veil server generates at deploy).
 //
-// No imports and no platform globals beyond fetch/Response/crypto, so cloud/hot.test.mjs runs the whole file
+// No imports and no platform globals beyond fetch/Response/crypto, so cloud/tot.test.mjs runs the whole file
 // under node with a Map for storage and a scripted model.
 
-export const VERSION = "5";
-export const MAX_HOTS = 3;
-export const PRIMARY = "Gary"; // the first hot of every account
+export const VERSION = "6";
+export const MAX_TOTS = 3;
+export const PRIMARY = "Gary"; // the first tot of every account
 
-// The goal loop's stop rules. Same numbers as src/worker/chat/goal.zig (cf_hot.zig has a test that compares them).
+// The goal loop's stop rules. Same numbers as src/worker/chat/goal.zig (cf_tot.zig has a test that compares them).
 export const PLATEAU = 3;
 export const BUDGET_DEFAULT = 25;
 
-const SIZE_MAX = 8; // minds one hot may run side by side
+const SIZE_MAX = 8; // minds one tot may run side by side
 const TOOL_ROUNDS = 14; // model calls one iteration's "do" may spend
 const MIND_ROUNDS = 5; // model calls one mind of an inner swarm may spend
 const TICK_CALLS_MAX = 46; // model calls + fetches one alarm may make (a Worker invocation has a subrequest ceiling)
@@ -57,7 +57,7 @@ const PACE_MIN_S = 5;
 const FALLBACK_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast"; // answers when the chosen model only reasons
 const FACTS_MAX = 300;
 const STANCES_MAX = 40;
-const MIND = "hot"; // this hot's scope in its neuron-db
+const MIND = "tot"; // this tot's scope in its neuron-db
 const NEURON_WASM = "./neuron_core.wasm"; // the two modules the veil server uploads beside this file
 const NEURON_BINDING = "./neuron-db.mjs";
 const UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36";
@@ -74,7 +74,7 @@ const DEFAULTS = {
   model: "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
   pace_s: 600, // seconds between iterations
   size: 3, // the most minds an inner swarm may have; `minds` floats between 1 and this
-  daily_calls: 400, // model calls per UTC day; the hot rests when they are spent. 0 = no limit
+  daily_calls: 400, // model calls per UTC day; the tot rests when they are spent. 0 = no limit
   text_max: 2000, // the most characters of a goal or charter (the veil server sends its model's limit)
   local: false,
   charter: "",
@@ -114,7 +114,7 @@ function readable(html) {
     .replace(/\n{3,}/g, "\n\n");
 }
 
-/// A hot's name: 1-24 of [A-Za-z0-9_-], starting with a letter. It becomes a URL segment and an object name.
+/// A tot's name: 1-24 of [A-Za-z0-9_-], starting with a letter. It becomes a URL segment and an object name.
 export function validName(name) {
   return typeof name === "string" && /^[A-Za-z][A-Za-z0-9_-]{0,23}$/.test(name);
 }
@@ -217,7 +217,7 @@ export function answerText(r) {
   return t.replace(/<think>[\s\S]*?<\/think>/gi, "").replace(/<think>[\s\S]*$/i, "").trim();
 }
 
-/// An address a hot must not call: this machine, a private network, a cloud metadata service.
+/// An address a tot must not call: this machine, a private network, a cloud metadata service.
 export function privateHost(host) {
   const h = String(host ?? "").toLowerCase().replace(/^\[|\]$/g, "");
   if (h === "localhost" || h.endsWith(".localhost") || h.endsWith(".internal") || h.endsWith(".local")) return true;
@@ -234,7 +234,7 @@ export function privateHost(host) {
 
 export function newGoal(text, forever, budget, now, id = 0) {
   return {
-    id, // which goal this is: a hot's goals are numbered, so two set in the same millisecond still differ
+    id, // which goal this is: a tot's goals are numbered, so two set in the same millisecond still differ
     text: String(text).trim(),
     status: "active",
     forever: !!forever,
@@ -386,7 +386,7 @@ function pickQuestion(g, rows) {
 // ------------------------------------------------------------------------------------------ the tool surface
 
 const TOOLS = [
-  // files: the hot's own workspace. It lasts across iterations and is mirrored to the human's machine.
+  // files: the tot's own workspace. It lasts across iterations and is mirrored to the human's machine.
   { name: "write_file", args: '{"name": "<file name>", "text": "<content>"}', what: "create or replace a file in your workspace (it lasts; your human can open it)" },
   { name: "read_file", args: '{"name": "<file name>"}', what: "read one of your files" },
   { name: "edit_file", args: '{"name": "<file name>", "old": "<exact passage>", "new": "<replacement>"}', what: "replace one exact passage of a file" },
@@ -420,10 +420,10 @@ const TOOLS = [
   { name: "feel", args: '{"about": "<a topic, tool, site or approach>", "feeling": "<how it sits with you now, and why>"}', what: "record how you have come to feel about something from working on it; your stances are shown to you every iteration and should steer what you try" },
   { name: "plan_set", args: '{"items": ["<step>", "<step>"]}', what: "write or replace your plan for the goal (shown to you every iteration)" },
   { name: "plan_done", args: '{"item": 1}', what: "tick a plan item off" },
-  // the other hots, and the human
-  { name: "pad_read", args: "{}", what: "read the scratchpad every hot of this account shares" },
-  { name: "pad_write", args: '{"text": "<entry>"}', what: "add an entry to the shared scratchpad (findings other hots can use, claims of work, requests)" },
-  { name: "tell", args: '{"hot": "<name>", "text": "<message>"}', what: "send a message to another hot's inbox" },
+  // the other tots, and the human
+  { name: "pad_read", args: "{}", what: "read the scratchpad every tot of this account shares" },
+  { name: "pad_write", args: '{"text": "<entry>"}', what: "add an entry to the shared scratchpad (findings other tots can use, claims of work, requests)" },
+  { name: "tell", args: '{"tot": "<name>", "text": "<message>"}', what: "send a message to another tot's inbox" },
   { name: "swarm", args: '{"tasks": ["<task for mind 1>", "<task for mind 2>"]}', what: "run several minds side by side, one task each, and get every report back (use it for work that splits into independent parts)" },
   { name: "goal_queue", args: '{"text": "<a goal>"}', what: "queue a follow-on goal for after the current one ends" },
   { name: "say", args: '{"text": "<message>"}', what: "report to the human (they read it later; never ask them a question and wait)" },
@@ -437,14 +437,14 @@ const LOCAL_TOOL = {
 const ALIASES = { browser_links: "browser_read", browser_navigate: "browser_open", browser_goto: "browser_open", browser_press: "browser_key", stance: "feel", note_stance: "feel", pip: "pip_install", install_package: "pip_install", note_write: "write_file", note_read: "read_file", note_list: "list_files", note_delete: "delete_file", fetch_json: "web_fetch", read_url: "web_fetch", list_dir: "list_files", observe: "remember", python: "run_python" };
 const MIND_TOOLS = new Set(["write_file", "read_file", "list_files", "append_file", "web_search", "web_fetch", "http_request", "run_python", "pip_install", "run_skill", "remember", "recall", "pad_read", "pad_write"]);
 
-/// The tools this hot has here: everything, minus what a missing binding takes away.
+/// The tools this tot has here: everything, minus what a missing binding takes away.
 function toolsFor(env, cfg) {
   const have = { browser: !!env.BROWSER, python: !!env.PY };
   const list = TOOLS.filter((t) => !t.need || have[t.need]);
   return cfg.local ? [...list, LOCAL_TOOL] : list;
 }
 
-/// What a hot is told about the tools it lacks, so it plans around them instead of calling them.
+/// What a tot is told about the tools it lacks, so it plans around them instead of calling them.
 function missingNote(env) {
   const miss = [];
   if (!env.BROWSER) miss.push("a browser (browser_*)");
@@ -661,17 +661,17 @@ export default {
     try {
       return await route(req, env);
     } catch (e) {
-      return bad(`hot runtime error: ${clip(e?.message ?? e, 300)}`, 500);
+      return bad(`tot runtime error: ${clip(e?.message ?? e, 300)}`, 500);
     }
   },
 };
 
 function stubFor(env, key) {
-  return env.HOT.get(env.HOT.idFromName(key));
+  return env.TOT.get(env.TOT.idFromName(key));
 }
-const hotKey = (name) => "hot:" + name.toLowerCase();
+const totKey = (name) => "tot:" + name.toLowerCase();
 const call = (stub, path, body) =>
-  stub.fetch("https://hot" + path, body === undefined ? undefined : { method: "POST", body: JSON.stringify(body), headers: { "content-type": "application/json" } });
+  stub.fetch("https://tot" + path, body === undefined ? undefined : { method: "POST", body: JSON.stringify(body), headers: { "content-type": "application/json" } });
 
 /// Ask the Python Worker what it is. Never throws.
 async function pythonCaps(env) {
@@ -691,13 +691,13 @@ async function pythonCaps(env) {
 }
 
 /// Packages with native code a model reaches for by habit. Those this Python was not uploaded with are named
-/// to the hot as absent, so it plans around them instead of finding out one failed iteration at a time.
+/// to the tot as absent, so it plans around them instead of finding out one failed iteration at a time.
 const NATIVE_COMMON = ["numpy", "pandas", "matplotlib", "scipy", "scikit-learn", "pillow", "regex", "spacy", "gensim", "torch", "tensorflow", "opencv-python", "lxml"];
 
 async function route(req, env) {
   const url = new URL(req.url);
   const auth = req.headers.get("authorization") ?? "";
-  if (!sameToken(auth.startsWith("Bearer ") ? auth.slice(7) : "", env.HOT_TOKEN ?? "")) return bad("unauthorized", 401);
+  if (!sameToken(auth.startsWith("Bearer ") ? auth.slice(7) : "", env.TOT_TOKEN ?? "")) return bad("unauthorized", 401);
   const seg = url.pathname.split("/").filter(Boolean); // ["v1", ...]
   if (seg[0] !== "v1") return bad("not found", 404);
   const method = req.method.toUpperCase();
@@ -705,7 +705,7 @@ async function route(req, env) {
   if (method === "POST" && (body === null || typeof body !== "object")) return bad("malformed JSON body");
   const padStub = stubFor(env, "pad");
 
-  if (seg[1] === "version" && method === "GET") return json({ ok: true, version: VERSION, max_hots: MAX_HOTS });
+  if (seg[1] === "version" && method === "GET") return json({ ok: true, version: VERSION, max_tots: MAX_TOTS });
 
   // Whether the Python Worker starts, and the native packages it came up with. The server asks after an upload:
   // a Python that does not start with the packages it was uploaded with is uploaded again with fewer.
@@ -716,39 +716,40 @@ async function route(req, env) {
 
   if (seg[1] === "pad") {
     if (seg[2] === "clear" && method === "POST") return call(padStub, "/pad/clear", {});
+    if (seg[2] === "import" && method === "POST") return call(padStub, "/pad/import", body);
     if (method === "GET") return call(padStub, "/pad/read?after=" + encodeURIComponent(url.searchParams.get("after") ?? "0"));
     if (method === "POST") return call(padStub, "/pad/write", { from: "human", text: body.text });
     return bad("method not allowed", 405);
   }
 
-  if (seg[1] === "hots" && seg.length === 2) {
+  if (seg[1] === "tots" && seg.length === 2) {
     if (method === "GET") {
       const roster = await (await call(padStub, "/pad/roster")).json();
-      const hots = await Promise.all(
-        (roster.hots ?? []).map(async (h) => {
-          const st = await (await call(stubFor(env, hotKey(h.name)), "/status")).json().catch(() => null);
-          return st?.ok ? st.hot : { name: h.name, state: "unreachable" };
+      const tots = await Promise.all(
+        (roster.tots ?? []).map(async (h) => {
+          const st = await (await call(stubFor(env, totKey(h.name)), "/status")).json().catch(() => null);
+          return st?.ok ? st.tot : { name: h.name, state: "unreachable" };
         }),
       );
-      return json({ ok: true, version: VERSION, max_hots: MAX_HOTS, pad_seq: roster.pad_seq ?? 0, hots });
+      return json({ ok: true, version: VERSION, max_tots: MAX_TOTS, pad_seq: roster.pad_seq ?? 0, tots });
     }
     if (method === "POST") {
       const claim = await (await call(padStub, "/pad/claim", { name: body.name })).json();
       if (!claim.ok) return bad(claim.err, 409);
-      const made = await call(stubFor(env, hotKey(claim.name)), "/init", { ...body, name: claim.name });
+      const made = await call(stubFor(env, totKey(claim.name)), "/init", { ...body, name: claim.name });
       if (made.status !== 200) await call(padStub, "/pad/release", { name: claim.name });
       return made;
     }
     return bad("method not allowed", 405);
   }
 
-  if (seg[1] === "hots" && seg.length >= 3) {
+  if (seg[1] === "tots" && seg.length >= 3) {
     const name = decodeURIComponent(seg[2]);
-    if (!validName(name)) return bad("bad hot name");
+    if (!validName(name)) return bad("bad tot name");
     const roster = await (await call(padStub, "/pad/roster")).json();
-    const known = (roster.hots ?? []).find((h) => h.name.toLowerCase() === name.toLowerCase());
-    if (!known) return bad("no such hot", 404);
-    const stub = stubFor(env, hotKey(known.name));
+    const known = (roster.tots ?? []).find((h) => h.name.toLowerCase() === name.toLowerCase());
+    if (!known) return bad("no such tot", 404);
+    const stub = stubFor(env, totKey(known.name));
     const op = seg[3] ?? "";
     if (op === "" && method === "GET") return call(stub, "/status");
     if (op === "" && method === "DELETE") {
@@ -760,6 +761,7 @@ async function route(req, env) {
     if (op === "notes" && method === "GET") return call(stub, "/notes" + url.search);
     if (op === "command" && method === "POST") return call(stub, "/command", body);
     if (op === "config" && method === "POST") return call(stub, "/config", body);
+    if (op === "import" && method === "POST") return call(stub, "/import", body);
     if (op === "jobs" && seg.length === 4 && method === "GET") return call(stub, "/jobs");
     if (op === "jobs" && seg.length === 5 && method === "POST") return call(stub, "/jobs/" + encodeURIComponent(seg[4]), body);
     return bad("not found", 404);
@@ -771,7 +773,7 @@ async function route(req, env) {
 
 class TickBudget extends Error {}
 
-export class Hot {
+export class Tot {
   constructor(state, env) {
     this.state = state;
     this.store = state.storage;
@@ -793,14 +795,15 @@ export class Hot {
     if (p.startsWith("/pad/")) return this.padRoute(p, url, body);
     if (p === "/init") return this.init(body);
     const cfg = await this.store.get("cfg");
-    if (!cfg) return bad("no such hot", 404);
-    if (p === "/status") return json({ ok: true, hot: await this.status(cfg) });
+    if (!cfg) return bad("no such tot", 404);
+    if (p === "/status") return json({ ok: true, tot: await this.status(cfg) });
     if (p === "/events") return this.events(url);
     if (p === "/notes") return this.notesSince(url);
     if (p === "/command") return this.command(cfg, body);
     if (p === "/config") return this.configure(cfg, body);
     if (p === "/inbox") return this.inboxPush(cfg, body);
     if (p === "/jobs") return this.jobsPending(cfg);
+    if (p === "/import") return this.importFrom(cfg, body);
     if (p.startsWith("/jobs/")) return this.jobDone(cfg, decodeURIComponent(p.slice(6)), body);
     if (p === "/destroy") {
       await this.store.deleteAlarm();
@@ -814,13 +817,13 @@ export class Hot {
 
   async padRoute(p, url, body) {
     const roster = (await this.store.get("roster")) ?? [];
-    if (p === "/pad/roster") return json({ ok: true, hots: roster, pad_seq: (await this.store.get("padseq")) ?? 0 });
+    if (p === "/pad/roster") return json({ ok: true, tots: roster, pad_seq: (await this.store.get("padseq")) ?? 0 });
     if (p === "/pad/claim") {
-      // The first hot of an account is always the primary; a later one brings its own name.
+      // The first tot of an account is always the primary; a later one brings its own name.
       const name = roster.length === 0 ? PRIMARY : body.name;
-      if (!validName(name)) return bad("a hot's name is 1-24 letters, digits, - or _, starting with a letter");
-      if (roster.some((h) => h.name.toLowerCase() === name.toLowerCase())) return bad(`a hot named ${name} already exists`);
-      if (roster.length >= MAX_HOTS) return bad(`this account already has ${MAX_HOTS} hots (the limit); delete one first`);
+      if (!validName(name)) return bad("a tot's name is 1-24 letters, digits, - or _, starting with a letter");
+      if (roster.some((h) => h.name.toLowerCase() === name.toLowerCase())) return bad(`a tot named ${name} already exists`);
+      if (roster.length >= MAX_TOTS) return bad(`this account already has ${MAX_TOTS} tots (the limit); delete one first`);
       roster.push({ name, created: this.now() });
       await this.store.put("roster", roster);
       return json({ ok: true, name });
@@ -836,6 +839,21 @@ export class Hot {
       const seq = ((await this.store.get("padseq")) ?? 0) + 1;
       await this.store.put("padseq", seq);
       return json({ ok: true, cleared: keys.length, seq });
+    }
+    if (p === "/pad/import") {
+      // Entries carried over from an older runtime, oldest first, each with the name it was written under.
+      let seq = (await this.store.get("padseq")) ?? 0;
+      let n = 0;
+      for (const e of (Array.isArray(body.entries) ? body.entries : []).slice(-PAD_KEEP)) {
+        const text = clip(String(e?.text ?? "").trim(), 2000);
+        if (text.length === 0) continue;
+        seq += 1;
+        n += 1;
+        await this.store.put("pad:" + pad10(seq), { seq, t: Number.isFinite(e.t) ? e.t : this.now(), from: clip(e.from ?? "?", 24), text });
+        if (seq > PAD_KEEP) await this.store.delete("pad:" + pad10(seq - PAD_KEEP));
+      }
+      await this.store.put("padseq", seq);
+      return json({ ok: true, imported: n, seq });
     }
     if (p === "/pad/write") {
       const text = clip(String(body.text ?? "").trim(), 2000);
@@ -871,7 +889,25 @@ export class Hot {
       await this.emit("goal", g.text);
     }
     await this.store.setAlarm(now + 1000);
-    return json({ ok: true, hot: await this.status(cfg) });
+    return json({ ok: true, tot: await this.status(cfg) });
+  }
+
+  /// A tot carried over from an older runtime: its files, and whether it was paused. What it learned there
+  /// (lessons, facts, stances) did not travel, and its first event says so.
+  async importFrom(cfg, body) {
+    let files = 0;
+    for (const n of Array.isArray(body.notes) ? body.notes : []) {
+      if (typeof n?.name !== "string" || typeof n?.text !== "string") continue;
+      if (!(await this.saveFile(n.name, n.text)).startsWith("ERROR")) files += 1;
+    }
+    if (body.paused === true && !cfg.paused) {
+      cfg.paused = true;
+      await this.store.put("cfg", cfg);
+      await this.store.deleteAlarm();
+    }
+    const from = clip(String(body.from ?? "an older runtime"), 60);
+    await this.emit("status", `moved here from ${from}: its goal, settings and ${files} file(s) came along; its lessons, facts and stances start fresh`);
+    return json({ ok: true, files, tot: await this.status(cfg) });
   }
 
   /// The settings a human may change at any time. `local` is not among them.
@@ -899,7 +935,7 @@ export class Hot {
     await this.emit("status", `settings changed: model ${cfg.model}, every ${cfg.pace_s}s, up to ${cfg.size} minds, ${callsWord(cfg)}${cfg.paused ? ", paused" : ""}`);
     if (cfg.paused) await this.store.deleteAlarm();
     else if (wasPaused || (await this.store.getAlarm()) === null) await this.store.setAlarm(this.now() + 1000);
-    return json({ ok: true, hot: await this.status(cfg) });
+    return json({ ok: true, tot: await this.status(cfg) });
   }
 
   async status(cfg) {
@@ -997,7 +1033,7 @@ export class Hot {
     return json({ ok: true });
   }
 
-  /// Bring the next iteration forward (a message arrived, a job finished). A paused hot stays paused.
+  /// Bring the next iteration forward (a message arrived, a job finished). A paused tot stays paused.
   async wake(cfg) {
     if (cfg.paused) return;
     const at = await this.store.getAlarm();
@@ -1011,7 +1047,7 @@ export class Hot {
     await this.emit("human", text);
     const reply = await this.applyCommand(cfg, text);
     await this.emit("reply", reply);
-    return json({ ok: true, reply, hot: await this.status(cfg) });
+    return json({ ok: true, reply, tot: await this.status(cfg) });
   }
 
   async applyCommand(cfg, text) {
@@ -1069,7 +1105,7 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
     if (word === "/charter") {
       cfg.charter = clip(rest, cfg.text_max ?? DEFAULTS.text_max);
       await this.store.put("cfg", cfg);
-      return cfg.charter.length > 0 ? "Charter set: it is what this hot works toward when no goal is active." : "Charter cleared.";
+      return cfg.charter.length > 0 ? "Charter set: it is what this tot works toward when no goal is active." : "Charter cleared.";
     }
     if (word === "/pace" || word === "/size" || word === "/model" || word === "/calls") {
       const key = { "/pace": "pace_s", "/size": "size", "/model": "model", "/calls": "daily_calls" }[word];
@@ -1078,7 +1114,7 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
       return `model ${cfg.model}, every ${cfg.pace_s}s, up to ${cfg.size} minds, ${callsWord(cfg)}.`;
     }
     if (word === "/status") return goalStatusText(g);
-    if (word.startsWith("/")) return "Commands: /goal <text> [--forever] [--budget N], /goal stop|resume|status|budget N|forever, /queue <goal>, /charter <text>, /pause, /resume, /pace <seconds>, /size <minds>, /model <id>, /calls <per day>. Anything else is a message this hot reads at its next iteration.";
+    if (word.startsWith("/")) return "Commands: /goal <text> [--forever] [--budget N], /goal stop|resume|status|budget N|forever, /queue <goal>, /charter <text>, /pause, /resume, /pace <seconds>, /size <minds>, /model <id>, /calls <per day>. Anything else is a message this tot reads at its next iteration.";
     // Plain words: a directive the next iteration reads. Nobody answers it in person; the work does.
     const inbox = (await this.store.get("inbox")) ?? [];
     inbox.push({ t: now, from: "human", text: clip(text, 4000) });
@@ -1186,7 +1222,7 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
           nextS = Math.ceil((Date.parse(dayOf(this.now()) + "T00:00:00Z") + 86400000 - this.now()) / 1000) + 5;
         } else await this.emit("status", `iteration cut short: ${e.message}`);
       } else {
-        // A failed iteration never ends the hot: it says what failed and comes back.
+        // A failed iteration never ends the tot: it says what failed and comes back.
         const fails = ((await this.store.get("fails")) ?? 0) + 1;
         await this.store.put("fails", fails);
         await this.emit("error", clip(e?.message ?? e, 600));
@@ -1221,7 +1257,7 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
     const now = this.now();
     let g = (await this.store.get("goal")) ?? null;
 
-    // No active goal: the next queued one, else one the hot proposes for itself, else a longer and longer rest.
+    // No active goal: the next queued one, else one the tot proposes for itself, else a longer and longer rest.
     if (!g || g.status !== "active") {
       if (g) await this.archive(g, g.status);
       const queue = (await this.store.get("queue")) ?? [];
@@ -1234,7 +1270,7 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
         await this.patchCfg((c) => (c.roam_s = roam));
         return roam;
       }
-      // A goal the human set while the hot was asking itself what to do next wins over the answer.
+      // A goal the human set while the tot was asking itself what to do next wins over the answer.
       const set = await this.store.get("goal");
       if (!queued && set && set.status === "active" && (!g || set.id !== g.id)) return 5;
       g = newGoal(text, false, null, now, await this.nextGoalId());
@@ -1295,7 +1331,7 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
     await this.store.put("logseq", ((await this.store.get("logseq")) ?? 0) + 1);
     await this.store.put("goal", g);
     await this.store.put("fails", 0);
-    const mood = Hot.moodOf(g, outcome);
+    const mood = Tot.moodOf(g, outcome);
     if (mood !== (await this.store.get("mood"))) {
       await this.store.put("mood", mood);
       const db = await this.mind();
@@ -1307,7 +1343,7 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
     }
     await this.emit("verdict", `${outcome}${row.den > 0 ? ` [${row.num}/${row.den}]` : ""}${row.evidence ? `: ${row.evidence}` : ""}`, { i: row.i, outcome });
 
-    // LEARN: the hot rewrites its own operating rules from what the measurement said.
+    // LEARN: the tot rewrites its own operating rules from what the measurement said.
     await this.learn(cfg, g, lessons, step, transcript, outcome, record);
 
     if (stop && g.status === stop) {
@@ -1320,14 +1356,14 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
 
   systemPrompt(cfg, g, lessons, padTail) {
     return (
-      `You are ${cfg.name}, a hot: an autonomous technician that runs in the cloud for one human and works toward their goals with nobody watching. ` +
+      `You are ${cfg.name}, a tot: an autonomous technician that runs in the cloud for one human and works toward their goals with nobody watching. ` +
       "You never ask the human a question and wait; you decide, act, and report. You keep going until the goal is measurably achieved, and you prefer steps whose effect a tool result can show. " +
       "Work like an engineer: look before you act (search, read, open the page), do the work with your tools (write the file, run the script, make the call), then check the result with a tool before you call it done. " +
       "When a tool fails, read its error and try another way - a different source, the browser instead of a fetch, a script instead of a guess. Keep what you learn in files and facts: the next iteration starts from them, not from this conversation.\n" +
       (cfg.charter ? `CHARTER (what you serve when no goal is active, and the frame for every goal): ${cfg.charter}\n` : "") +
       (g ? `THE GOAL: ${g.text}\n` : "") +
       (lessons.length > 0 ? "YOUR LESSONS (rules you wrote for yourself from measured outcomes; follow them):\n" + lessons.map((l) => `- ${l.text}`).join("\n") + "\n" : "") +
-      (padTail ? "SHARED SCRATCHPAD (newest entries; every hot of this account reads and writes it):\n" + padTail + "\n" : "")
+      (padTail ? "SHARED SCRATCHPAD (newest entries; every tot of this account reads and writes it):\n" + padTail + "\n" : "")
     );
   }
 
@@ -1385,7 +1421,7 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
     return "(the step used all its calls without a final answer)";
   }
 
-  /// This hot's neuron-db, loaded once per isolate with the facts and stances it has kept; null when the engine is
+  /// This tot's neuron-db, loaded once per isolate with the facts and stances it has kept; null when the engine is
   /// not part of this upload. A test hands one in as env.NDB.
   async mind() {
     if (this.ndb !== undefined) return this.ndb;
@@ -1409,7 +1445,7 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
     return this.ndb;
   }
 
-  /// Keep how the hot feels about a topic. One stance per topic: a new one replaces the old.
+  /// Keep how the tot feels about a topic. One stance per topic: a new one replaces the old.
   async stance(topic, feeling) {
     const all = ((await this.store.get("stances")) ?? []).filter((x) => x.topic.toLowerCase() !== topic.toLowerCase());
     all.push({ topic, feeling, t: this.now() });
@@ -1431,7 +1467,7 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
     return "steady - the last step changed nothing measurable";
   }
 
-  /// What a hot carries from iteration to iteration besides its lessons: its plan, the newest facts it kept, its
+  /// What a tot carries from iteration to iteration besides its lessons: its plan, the newest facts it kept, its
   /// files and its skills, by name. Appended to the system prompt.
   async workingMemory() {
     let out = "";
@@ -1490,8 +1526,8 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
     const who = mind ? `${cfg.name}/${mind}` : cfg.name;
     tool = ALIASES[tool] ?? tool;
     const need = (TOOLS.find((t) => t.name === tool) ?? {}).need;
-    if (need === "browser" && !this.env.BROWSER) return "ERROR: no browser in this account right now (Browser Rendering is not bound to this hot). Use web_search, web_fetch and http_request.";
-    if (need === "python" && !this.env.PY) return "ERROR: Python is not available to this hot right now (its runner could not be deployed). Work it out with the other tools.";
+    if (need === "browser" && !this.env.BROWSER) return "ERROR: no browser in this account right now (Browser Rendering is not bound to this tot). Use web_search, web_fetch and http_request.";
+    if (need === "python" && !this.env.PY) return "ERROR: Python is not available to this tot right now (its runner could not be deployed). Work it out with the other tools.";
     switch (tool) {
       case "write_file":
         return this.saveFile(String(args.name ?? args.path ?? "").trim(), String(args.text ?? args.content ?? ""));
@@ -1630,12 +1666,12 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
         return r.ok ? `scratchpad entry ${r.seq} written` : `ERROR: ${r.err}`;
       }
       case "tell": {
-        const target = String(args.hot ?? args.to ?? "");
-        if (!validName(target) || target.toLowerCase() === cfg.name.toLowerCase()) return "ERROR: name another hot";
+        const target = String(args.tot ?? args.to ?? "");
+        if (!validName(target) || target.toLowerCase() === cfg.name.toLowerCase()) return "ERROR: name another tot";
         const roster = await (await call(stubFor(this.env, "pad"), "/pad/roster")).json();
-        const known = (roster.hots ?? []).find((h) => h.name.toLowerCase() === target.toLowerCase());
-        if (!known) return `ERROR: no hot named ${target}. Hots: ${(roster.hots ?? []).map((h) => h.name).join(", ")}`;
-        const r = await (await call(stubFor(this.env, hotKey(known.name)), "/inbox", { from: who, text: args.text })).json();
+        const known = (roster.tots ?? []).find((h) => h.name.toLowerCase() === target.toLowerCase());
+        if (!known) return `ERROR: no tot named ${target}. Tots: ${(roster.tots ?? []).map((h) => h.name).join(", ")}`;
+        const r = await (await call(stubFor(this.env, totKey(known.name)), "/inbox", { from: who, text: args.text })).json();
         return r.ok ? `delivered to ${known.name}` : `ERROR: ${r.err}`;
       }
       case "swarm":
@@ -1655,7 +1691,7 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
         return "reported";
       }
       case "local_run": {
-        if (!cfg.local) return "ERROR: this hot was not given the owner's machine";
+        if (!cfg.local) return "ERROR: this tot was not given the owner's machine";
         const instruction = clip(String(args.instruction ?? "").trim(), 4000);
         if (instruction.length < 3) return "ERROR: empty instruction";
         const pending = [...(await this.store.list({ prefix: "job:" })).values()].filter((j) => j.status === "pending");
@@ -1676,7 +1712,7 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
     if (!/^https?:\/\//i.test(url)) return 'ERROR: an http(s) URL is needed, as {"url": "https://..."}';
     if (!/^(GET|POST|PUT|PATCH|DELETE|HEAD)$/.test(method)) return "ERROR: method is GET, POST, PUT, PATCH, DELETE or HEAD";
     try {
-      if (privateHost(new URL(url).hostname)) return "ERROR: that address is private or internal; a hot only calls the public internet";
+      if (privateHost(new URL(url).hostname)) return "ERROR: that address is private or internal; a tot only calls the public internet";
     } catch {
       return "ERROR: that is not a URL";
     }
@@ -1694,7 +1730,7 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
       let r = await fetch(url, { method, signal: ctl.signal, redirect: "manual", headers: h, body: payload });
       for (let hop = 0; hop < 5 && [301, 302, 303, 307, 308].includes(r.status) && r.headers.get("location"); hop++) {
         const next = new URL(r.headers.get("location"), url);
-        if (!/^https?:$/.test(next.protocol) || privateHost(next.hostname)) return `ERROR: it redirects to ${next.hostname}, which a hot does not call`;
+        if (!/^https?:$/.test(next.protocol) || privateHost(next.hostname)) return `ERROR: it redirects to ${next.hostname}, which a tot does not call`;
         url = next.toString();
         const keep = r.status === 307 || r.status === 308;
         r = await fetch(url, { method: keep ? method : "GET", signal: ctl.signal, redirect: "manual", headers: h, body: keep ? payload : undefined });
@@ -1712,7 +1748,7 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
   }
 
   /// Search the web: the first engine that answers with results. An engine that blocks or returns nothing is
-  /// passed over; when all do, the hot is told how to search by hand.
+  /// passed over; when all do, the tot is told how to search by hand.
   async webSearch(query) {
     if (query.length < 2) return 'ERROR: give the words to search for, as {"query": "..."}';
     const q = encodeURIComponent(query);
@@ -1722,7 +1758,7 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
       return fetch(url, { signal: AbortSignal.timeout(ms), headers: { "user-agent": UA, accept, "accept-language": "en-US,en;q=0.9" } });
     };
     const show = (via, results) => `${results.length} results for "${query}" (${via}):\n` + results.map((x, i) => `${i + 1}. ${x.title}\n   ${x.url}${x.snippet ? `\n   ${x.snippet}` : ""}`).join("\n");
-    // 0. a search API the owner gave a key for (veil hot key ...): the one source that does not refuse a datacenter
+    // 0. a search API the owner gave a key for (veil tot key ...): the one source that does not refuse a datacenter
     if (this.env.BRAVE_KEY) {
       try {
         this.spend();
@@ -1789,7 +1825,7 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
     }
     // 3. DuckDuckGo's instant answers, then Wikipedia: reference lookups that still answer a datacenter address
     try {
-      const d = await (await get(`https://api.duckduckgo.com/?q=${q}&format=json&no_html=1&no_redirect=1&t=veilhot`, "application/json", 7000)).json();
+      const d = await (await get(`https://api.duckduckgo.com/?q=${q}&format=json&no_html=1&no_redirect=1&t=veiltot`, "application/json", 7000)).json();
       const results = [];
       if (d.AbstractText) results.push({ title: d.Heading || query, url: d.AbstractURL || "", snippet: clip(d.AbstractText, 400) });
       for (const t of d.RelatedTopics ?? []) if (t?.Text && t?.FirstURL) results.push({ title: clip(t.Text, 80), url: t.FirstURL, snippet: clip(t.Text, 300) });
@@ -1800,7 +1836,7 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
       if (Array.isArray(j?.[1]) && j[1].length > 0) return show("Wikipedia", j[1].map((ti, i) => ({ title: ti, url: j[3]?.[i] ?? "", snippet: j[2]?.[i] ?? "" })));
     } catch {}
     // 4. the engines refuse a datacenter address more often than a real browser: ask them through one, each in
-    //    turn. A page that answers with a bot check is passed over - a hot does not solve those.
+    //    turn. A page that answers with a bot check is passed over - a tot does not solve those.
     if (this.env.BROWSER) {
       for (const [engine, url] of [
         ["Bing", `https://www.bing.com/search?q=${q}&setlang=en`],
@@ -1823,12 +1859,12 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
         }
       }
     }
-    return `ERROR: no search source answered (${tried.join("; ")}). Fetch a site you already know with web_fetch or browser_open, or ask your human for a search key (they run: veil hot key brave <key>).`;
+    return `ERROR: no search source answered (${tried.join("; ")}). Fetch a site you already know with web_fetch or browser_open, or ask your human for a search key (they run: veil tot key brave <key>).`;
   }
 
   // ---------------------------------------------------------------- the browser
 
-  /// The running iteration's connection to this hot's browser session: the kept session when it is still alive
+  /// The running iteration's connection to this tot's browser session: the kept session when it is still alive
   /// (its page as it was left), else a new one.
   async browser() {
     if (this.br && !this.br.cdp.closed) return this.br;
@@ -1886,14 +1922,14 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
     return r.result?.value;
   }
 
-  /// The page as a hot reads it: where it is, what it says, and a numbered list of what can be acted on. A page
+  /// The page as a tot reads it: where it is, what it says, and a numbered list of what can be acted on. A page
   /// that is a bot check is said to be one, first.
   async pageText() {
     const p = JSON.parse((await this.pageEval(PAGE_JS)) ?? "{}");
     const text = String(p.text ?? "").replace(/\n{3,}/g, "\n\n").trim();
     const check = BOT_CHECK.test(text.slice(0, 2500)) && text.length < 2500;
     return (
-      (check ? "BOT CHECK: this page asks its visitor to prove they are human. A hot does not solve these: use another site or source.\n" : "") +
+      (check ? "BOT CHECK: this page asks its visitor to prove they are human. A tot does not solve these: use another site or source.\n" : "") +
       `${p.title ?? ""}\n${p.url ?? ""}\n\n${clip(text, 3600) || "(the page shows no text)"}` +
       ((p.els ?? []).length > 0 ? `\n\nELEMENTS (act on one by its number):\n${p.els.join("\n")}` : "\n\n(nothing on the page can be clicked or typed into)")
     );
@@ -1951,7 +1987,7 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
         const url = String(args.url ?? args.value ?? "");
         if (!/^https?:\/\//i.test(url)) return 'ERROR: an http(s) URL is needed, as {"url": "https://..."}';
         try {
-          if (privateHost(new URL(url).hostname)) return "ERROR: that address is private or internal; a hot only browses the public internet";
+          if (privateHost(new URL(url).hostname)) return "ERROR: that address is private or internal; a tot only browses the public internet";
         } catch {
           return "ERROR: that is not a URL";
         }
@@ -2065,7 +2101,7 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
       const n = await this.store.get("note:" + String(raw));
       if (n) files[String(raw)] = n.text;
     }
-    // The Python Worker keeps nothing between scripts, so the packages this hot uses go with every one.
+    // The Python Worker keeps nothing between scripts, so the packages this tot uses go with every one.
     const packages = (await this.store.get("py_packages")) ?? [];
     // ...and so do the names already found to need native code, so no script pays for looking them up again.
     const skip = (await this.store.get("py_missing")) ?? [];
@@ -2104,18 +2140,18 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
   }
 
   /// An inner swarm: one mind per task, side by side, each with its own short tool loop. `minds` is how many
-  /// this hot runs at its current size.
+  /// this tot runs at its current size.
   async swarm(cfg, args) {
     const tasks = (Array.isArray(args.tasks) ? args.tasks : []).map((t) => String(t ?? "").trim()).filter((t) => t.length > 2);
     if (tasks.length === 0) return "ERROR: give tasks: a list of one instruction per mind";
-    // At least two minds when the size allows it: a swarm of one is just this hot again, slower.
+    // At least two minds when the size allows it: a swarm of one is just this tot again, slower.
     const width = Math.min(cfg.size, Math.max(2, cfg.minds));
     const run = tasks.slice(0, width);
     const tools = toolsFor(this.env, cfg).filter((t) => MIND_TOOLS.has(t.name));
     const system =
       `You are one mind of ${cfg.name}'s swarm: you have ONE task, a few tool calls, and nobody to ask. Do the task and report what the tool results showed.\n\nTOOLS:\n` +
       toolList(tools) + "\n\n" + REPLY_RULE;
-    await this.emit("swarm", `cast ${run.length} mind(s)${tasks.length > run.length ? ` (${tasks.length - run.length} task(s) left out: this hot runs ${width} at a time now)` : ""}`);
+    await this.emit("swarm", `cast ${run.length} mind(s)${tasks.length > run.length ? ` (${tasks.length - run.length} task(s) left out: this tot runs ${width} at a time now)` : ""}`);
     const reports = await Promise.all(
       run.map(async (task, i) => {
         const mind = "m" + (i + 1);
@@ -2127,13 +2163,13 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
         }
       }),
     );
-    const left = tasks.length > run.length ? `\nNOT RUN (this hot runs ${width} at a time now): ${tasks.slice(run.length).map((t) => clip(t, 120)).join(" | ")}` : "";
+    const left = tasks.length > run.length ? `\nNOT RUN (this tot runs ${width} at a time now): ${tasks.slice(run.length).map((t) => clip(t, 120)).join(" | ")}` : "";
     return reports.join("\n") + left;
   }
 
   // ---------------------------------------------------------------- self-improvement
 
-  /// After every measured iteration the hot changes how it works:
+  /// After every measured iteration the tot changes how it works:
   ///   - a step that did not improve the goal becomes a LESSON (one rule for its future self), and the lessons
   ///     ride every later prompt; a lesson is credited when an iteration under it improves, and the least
   ///     useful one is dropped when the list is full;
@@ -2189,7 +2225,7 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
   }
 
   /// Change the STORED settings. An iteration holds its own copy for minutes while commands land, so it never
-  /// writes that copy back whole. Nothing is written for a hot that was deleted meanwhile.
+  /// writes that copy back whole. Nothing is written for a tot that was deleted meanwhile.
   async patchCfg(change) {
     const fresh = await this.store.get("cfg");
     if (!fresh) return null;

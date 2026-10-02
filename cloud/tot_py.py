@@ -1,4 +1,4 @@
-# hot_py.py - the Python a hot runs. A second Worker ("veil-hots-py") the veil server uploads beside the hot
+# tot_py.py - the Python a tot runs. A second Worker ("veil-tots-py") the veil server uploads beside the tot
 # runtime; the runtime reaches it through a service binding (env.PY), so it has no public address.
 #
 # One request = one script: {"code": "...", "files": {"name": "text"}, "args": <any JSON>, "packages": [...],
@@ -20,7 +20,7 @@
 #               with a sentence that says why and what to use instead.
 #
 # Nothing persists here between requests except what the Worker's isolate happens to keep (installed packages);
-# the hot remembers its packages and sends them with every script.
+# the tot remembers its packages and sends them with every script.
 
 import ast
 import asyncio
@@ -39,7 +39,7 @@ import zipfile
 
 try:
     from workers import Response, WorkerEntrypoint
-except ImportError:  # run outside Cloudflare (cloud/hot_py_test.py): the same code under plain CPython
+except ImportError:  # run outside Cloudflare (cloud/tot_py_test.py): the same code under plain CPython
 
     class WorkerEntrypoint:  # type: ignore
         pass
@@ -62,7 +62,7 @@ ALIASES = {"bs4": "beautifulsoup4", "yaml": "pyyaml", "dateutil": "python-dateut
 # supplied here, on the Worker's fetch: never installed over
 SHIMMED = {"requests", "urllib3", "pip"}
 
-SITE = tempfile.mkdtemp(prefix="hotsite")  # where wheels are unpacked; lives as long as this isolate
+SITE = tempfile.mkdtemp(prefix="totsite")  # where wheels are unpacked; lives as long as this isolate
 if SITE not in sys.path:
     sys.path.insert(0, SITE)
 INSTALLED = {}  # PyPI name (lowercase) -> version
@@ -222,7 +222,7 @@ def _request(method, url, params=None, data=None, json=None, headers=None, timeo
         h.setdefault("content-type", "application/x-www-form-urlencoded")
     elif data is not None:
         body = data if isinstance(data, bytes) else str(data).encode("utf-8")
-    h.setdefault("user-agent", "veil-hot-python")
+    h.setdefault("user-agent", "veil-tot-python")
     status, rh, content = _http(method, url, h, body)
     return _Resp(url, status, rh, content)
 
@@ -359,6 +359,8 @@ async def _install(name, seen, log):
             if member.startswith("/") or ".." in member.split("/"):
                 continue
             z.extract(member, SITE)
+    # The import system caches what a directory held; _has() may have looked at SITE before this wheel was there.
+    importlib.invalidate_caches()
     INSTALLED[k] = meta.get("info", {}).get("version", "?")
     log.append("%s %s" % (name, INSTALLED[k]))
     for spec in meta.get("info", {}).get("requires_dist") or []:
@@ -446,7 +448,7 @@ os.system = _os_system
 def _own_trace():
     """The traceback from the script's own first frame on: the runner's frames above it are not the script's."""
     text = traceback.format_exc()
-    at = text.find('  File "<hot>"')
+    at = text.find('  File "<tot>"')
     return ("Traceback (most recent call last):\n" + text[at:]) if at >= 0 else text
 
 
@@ -461,7 +463,7 @@ async def run(data):
             UNAVAILABLE.setdefault(_key(name), 1)
     notes = []  # what was installed for this script, said once at the top of its output
     _HTTP_CACHE.clear()
-    work = tempfile.mkdtemp(prefix="hot")
+    work = tempfile.mkdtemp(prefix="tot")
     before = {}
     for name, text in files.items():
         if not _safe_name(name) or not isinstance(text, str):
@@ -473,7 +475,7 @@ async def run(data):
     out = io.StringIO()
     ok = True
 
-    # the packages this hot already uses, and any it asks for now
+    # the packages this tot already uses, and any it asks for now
     try:
         seen = set()
         for name in list(data.get("packages") or []) + list(data.get("install") or []):
@@ -493,7 +495,7 @@ async def run(data):
         again = False
         try:
             with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
-                compiled = compile(code, "<hot>", "exec", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
+                compiled = compile(code, "<tot>", "exec", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
                 result = eval(compiled, scope)
                 if inspect.isawaitable(result):
                     await result

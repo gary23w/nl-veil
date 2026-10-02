@@ -131,16 +131,16 @@ gate_webjs() {
     echo "SKIPPED: node not on PATH — web/public/app.js was NOT parsed"; fi
 }
 gate "web assets parse (node --check app.js)" gate_webjs
-# cloud/hot.js is the hot runtime: @embedFile'd and uploaded into a user's Cloudflare account as it is. Nothing
+# cloud/tot.js is the tot runtime: @embedFile'd and uploaded into a user's Cloudflare account as it is. Nothing
 # in the Zig build runs it, so its own suite runs here, under node, with a Map for storage and a scripted
 # model. Same rule as above: an absent node skips loudly.
 gate_hotjs() {
-  if command -v node >/dev/null 2>&1; then node --test cloud/hot.test.mjs; else
-    echo "SKIPPED: node not on PATH — cloud/hot.js was NOT tested"; fi
+  if command -v node >/dev/null 2>&1; then node --test cloud/tot.test.mjs; else
+    echo "SKIPPED: node not on PATH — cloud/tot.js was NOT tested"; fi
 }
-gate "hot runtime suite (node --test cloud/hot.test.mjs)" gate_hotjs
-# cloud/hot_py.py is the Python a hot runs (a second Worker). Its logic is plain Python, tested as such.
-gate "hot python runner (cloud/hot_py_test.py)" "$PY" cloud/hot_py_test.py
+gate "tot runtime suite (node --test cloud/tot.test.mjs)" gate_hotjs
+# cloud/tot_py.py is the Python a tot runs (a second Worker). Its logic is plain Python, tested as such.
+gate "tot python runner (cloud/tot_py_test.py)" "$PY" cloud/tot_py_test.py
 # -Dbuiltin=false, and why. This gate answers ONE question — does the server still compile without the GUI?
 # `-Dapp=false` alone only skips raylib: -Dbuiltin and -Dvulkan both default TRUE, so this step also fetched
 # llama.cpp, the Khronos headers and ~50MB of pre-built Vulkan shaders from two GitHub hosts before it

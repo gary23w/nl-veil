@@ -1,17 +1,17 @@
-//! `veil hot` — the terminal door to HOTS (config/cf_hot.zig): autonomous goal loops that run in the user's own
+//! `veil tot` — the terminal door to TOTS (config/cf_tot.zig): autonomous goal loops that run in the user's own
 //! Cloudflare account, with no human in them.
 //!
-//!   veil hot                              the roster: every hot, its state, its goal
-//!   veil hot deploy "<goal>" [flags]      deploy one (the first is always named Gary)
+//!   veil tot                              the roster: every tot, its state, its goal
+//!   veil tot deploy "<goal>" [flags]      deploy one (the first is always named Gary)
 //!       --name N  --charter "..."  --model @cf/...  --pace SECONDS (5 and up)  --size MINDS
 //!       --calls PER_DAY | unlimited
 //!       --budget N  --forever      --local   (let it queue jobs for the veil on THIS machine; deployment only)
-//!   veil hot tell <name> "<text>"         a command (/goal ..., /pause, /queue ...) or a message for its inbox
-//!   veil hot watch <name>                 follow its events
-//!   veil hot set <name> [flags]           --model --pace --size --calls --charter --pause --resume
-//!   veil hot pad ["<text>" | --clear]     read the scratchpad the hots share, write to it, or empty it
-//!   veil hot rm <name>                    delete one hot
-//!   veil hot teardown --yes               remove the runtime and every hot from the Cloudflare account
+//!   veil tot tell <name> "<text>"         a command (/goal ..., /pause, /queue ...) or a message for its inbox
+//!   veil tot watch <name>                 follow its events
+//!   veil tot set <name> [flags]           --model --pace --size --calls --charter --pause --resume
+//!   veil tot pad ["<text>" | --clear]     read the scratchpad the tots share, write to it, or empty it
+//!   veil tot rm <name>                    delete one tot
+//!   veil tot teardown --yes               remove the runtime and every tot from the Cloudflare account
 //!
 //! Every verb is one call to the local server, which relays to the runtime. Nothing here talks to Cloudflare.
 
@@ -22,21 +22,21 @@ const Ctx = cli.Ctx;
 const out = cli.out;
 
 const USAGE =
-    \\usage: veil hot                              list your hots
-    \\       veil hot deploy "<goal>" [--name N] [--charter "..."] [--model @cf/...] [--pace SECONDS]
+    \\usage: veil tot                              list your tots
+    \\       veil tot deploy "<goal>" [--name N] [--charter "..."] [--model @cf/...] [--pace SECONDS]
     \\                       [--size MINDS] [--calls PER_DAY] [--budget N] [--forever] [--local]
-    \\       veil hot tell <name> "<text>"         /goal <text>, /goal stop, /queue <goal>, /pause, /resume, or a message
-    \\       veil hot watch <name>                 follow its events
-    \\       veil hot set <name> [--model M] [--pace S] [--size N] [--calls N] [--charter "..."] [--pause|--resume]
-    \\       veil hot pad ["<text>" | --clear]     the scratchpad the hots share (--clear empties it)
-    \\       veil hot rm <name>                    delete one hot
-    \\       veil hot key brave <key>              a search key for the hots (google, google_cx too; --remove)
-    \\       veil hot teardown --yes               remove the runtime and every hot from the account
+    \\       veil tot tell <name> "<text>"         /goal <text>, /goal stop, /queue <goal>, /pause, /resume, or a message
+    \\       veil tot watch <name>                 follow its events
+    \\       veil tot set <name> [--model M] [--pace S] [--size N] [--calls N] [--charter "..."] [--pause|--resume]
+    \\       veil tot pad ["<text>" | --clear]     the scratchpad the tots share (--clear empties it)
+    \\       veil tot rm <name>                    delete one tot
+    \\       veil tot key brave <key>              a search key for the tots (google, google_cx too; --remove)
+    \\       veil tot teardown --yes               remove the runtime and every tot from the account
     \\
 ;
 
 const Goal = struct { text: []const u8 = "", status: []const u8 = "", iteration: i64 = 0, improved: i64 = 0, budget: i64 = 0, forever: bool = false };
-const Hot = struct {
+const Tot = struct {
     name: []const u8 = "",
     state: []const u8 = "",
     model: []const u8 = "",
@@ -48,15 +48,15 @@ const Hot = struct {
     local: bool = false,
     goal: ?Goal = null,
 };
-const Roster = struct { ok: bool = false, err: []const u8 = "", connected: bool = false, deployed: bool = false, reachable: bool = false, max: i64 = 0, python: bool = false, browser: bool = false, neuron: bool = false, tools_note: []const u8 = "", last_error: []const u8 = "", hots: []const Hot = &.{} };
+const Roster = struct { ok: bool = false, err: []const u8 = "", connected: bool = false, deployed: bool = false, reachable: bool = false, max: i64 = 0, python: bool = false, browser: bool = false, neuron: bool = false, tools_note: []const u8 = "", last_error: []const u8 = "", tots: []const Tot = &.{} };
 const Event = struct { seq: u64 = 0, kind: []const u8 = "", text: []const u8 = "" };
 const Events = struct { ok: bool = false, err: []const u8 = "", seq: u64 = 0, events: []const Event = &.{} };
 const PadEntry = struct { seq: u64 = 0, from: []const u8 = "", text: []const u8 = "" };
 const Pad = struct { ok: bool = false, err: []const u8 = "", entries: []const PadEntry = &.{} };
-const Answer = struct { ok: bool = false, err: []const u8 = "", reply: []const u8 = "", hot: ?Hot = null };
+const Answer = struct { ok: bool = false, err: []const u8 = "", reply: []const u8 = "", tot: ?Tot = null };
 
 /// One roster row. Pure.
-pub fn rosterLine(buf: []u8, h: Hot) []const u8 {
+pub fn rosterLine(buf: []u8, h: Tot) []const u8 {
     const g: Goal = h.goal orelse .{};
     var gb: [80]u8 = undefined;
     const goal: []const u8 = if (g.text.len == 0) "(no goal: roaming)" else std.fmt.bufPrint(&gb, "{s} {d}/{d}{s}", .{ g.status, g.improved, g.iteration, if (g.forever) " forever" else "" }) catch "";
@@ -110,22 +110,22 @@ pub fn cmd(ctx: *Ctx, args: []const []const u8) u8 {
 }
 
 fn list(ctx: *Ctx, a: std.mem.Allocator) u8 {
-    const resp = cli.call(ctx, "GET", "/api/v1/hots", null, 40, true) catch return cli.unreachable_msg(ctx);
+    const resp = cli.call(ctx, "GET", "/api/v1/tots", null, 40, true) catch return cli.unreachable_msg(ctx);
     defer if (resp.body.len > 0) ctx.gpa.free(resp.body);
-    if (resp.status != 200) return fail("hot list", resp.status, resp.body, a);
-    const r = std.json.parseFromSliceLeaky(Roster, a, resp.body, .{ .ignore_unknown_fields = true }) catch return fail("hot list", resp.status, resp.body, a);
+    if (resp.status != 200) return fail("tot list", resp.status, resp.body, a);
+    const r = std.json.parseFromSliceLeaky(Roster, a, resp.body, .{ .ignore_unknown_fields = true }) catch return fail("tot list", resp.status, resp.body, a);
     if (!r.connected) out("not connected to Cloudflare: log in with Cloudflare in the desk (Settings > Models) first\n", .{});
     if (!r.deployed) {
-        out("(no hots - deploy the first with `veil hot deploy \"<goal>\"`; it will be named Gary)\n", .{});
+        out("(no tots - deploy the first with `veil tot deploy \"<goal>\"`; it will be named Gary)\n", .{});
         if (r.last_error.len > 0) out("last deployment error: {s}\n", .{r.last_error});
         return 0;
     }
-    if (!r.reachable) out("the hot runtime did not answer (a new deployment can take a minute)\n", .{});
-    for (r.hots) |h| {
+    if (!r.reachable) out("the tot runtime did not answer (a new deployment can take a minute)\n", .{});
+    for (r.tots) |h| {
         var b: [400]u8 = undefined;
         out("{s}\n", .{rosterLine(&b, h)});
     }
-    if (r.hots.len == 0 and r.reachable) out("(no hots - deploy the first with `veil hot deploy \"<goal>\"`)\n", .{});
+    if (r.tots.len == 0 and r.reachable) out("(no tots - deploy the first with `veil tot deploy \"<goal>\"`)\n", .{});
     if (r.reachable) out("tools: files, web search, web fetch, HTTP, memory, plan, swarm{s}{s}{s}\n", .{ if (r.python) ", Python + skills" else "", if (r.browser) ", browser" else "", if (r.neuron) ", neuron-db mind" else "" });
     if (r.tools_note.len > 0) out("{s}\n", .{r.tools_note});
     return 0;
@@ -151,12 +151,12 @@ fn deploy(ctx: *Ctx, a: std.mem.Allocator, args: []const []const u8) u8 {
     cli.appendStr(a, &jb, "goal", goal);
     const body = object(a, jb.items) orelse return 1;
     out("deploying (the first deployment uploads the runtime into your Cloudflare account; it can take a minute)...\n", .{});
-    const resp = cli.call(ctx, "POST", "/api/v1/hots", body, 120, true) catch return cli.unreachable_msg(ctx);
+    const resp = cli.call(ctx, "POST", "/api/v1/tots", body, 120, true) catch return cli.unreachable_msg(ctx);
     defer if (resp.body.len > 0) ctx.gpa.free(resp.body);
-    if (resp.status != 201) return fail("hot deploy", resp.status, resp.body, a);
+    if (resp.status != 201) return fail("tot deploy", resp.status, resp.body, a);
     const r = std.json.parseFromSliceLeaky(Answer, a, resp.body, .{ .ignore_unknown_fields = true }) catch Answer{};
-    const h: Hot = r.hot orelse .{};
-    out("{s} is deployed and working. `veil hot watch {s}` follows it; `veil hot tell {s} \"...\"` talks to it.\n", .{ h.name, h.name, h.name });
+    const h: Tot = r.tot orelse .{};
+    out("{s} is deployed and working. `veil tot watch {s}` follows it; `veil tot tell {s} \"...\"` talks to it.\n", .{ h.name, h.name, h.name });
     if (h.local) out("{s} may queue jobs for the veil on this machine; they run while this server is up.\n", .{h.name});
     return 0;
 }
@@ -171,10 +171,10 @@ fn tell(ctx: *Ctx, a: std.mem.Allocator, args: []const []const u8) u8 {
     jb.appendSlice(a, "{\"text\":") catch return 1;
     cli.jstr(a, &jb, text);
     jb.append(a, '}') catch return 1;
-    const path = std.fmt.allocPrint(a, "/api/v1/hots/{s}/command", .{args[0]}) catch return 1;
+    const path = std.fmt.allocPrint(a, "/api/v1/tots/{s}/command", .{args[0]}) catch return 1;
     const resp = cli.call(ctx, "POST", path, jb.items, 40, true) catch return cli.unreachable_msg(ctx);
     defer if (resp.body.len > 0) ctx.gpa.free(resp.body);
-    if (resp.status != 200) return fail("hot tell", resp.status, resp.body, a);
+    if (resp.status != 200) return fail("tot tell", resp.status, resp.body, a);
     const r = std.json.parseFromSliceLeaky(Answer, a, resp.body, .{ .ignore_unknown_fields = true }) catch Answer{};
     out("{s}\n", .{r.reply});
     return 0;
@@ -191,7 +191,7 @@ fn watch(ctx: *Ctx, a: std.mem.Allocator, args: []const []const u8) u8 {
         var pass = std.heap.ArenaAllocator.init(ctx.gpa);
         defer pass.deinit();
         const pa = pass.allocator();
-        const path = std.fmt.allocPrint(pa, "/api/v1/hots/{s}/events?after={d}", .{ args[0], after }) catch return 1;
+        const path = std.fmt.allocPrint(pa, "/api/v1/tots/{s}/events?after={d}", .{ args[0], after }) catch return 1;
         const resp = cli.call(ctx, "GET", path, null, 40, after == 0) catch {
             if (after == 0) return cli.unreachable_msg(ctx);
             misses += 1;
@@ -201,7 +201,7 @@ fn watch(ctx: *Ctx, a: std.mem.Allocator, args: []const []const u8) u8 {
         };
         defer if (resp.body.len > 0) ctx.gpa.free(resp.body);
         if (resp.status != 200) {
-            if (after == 0) return fail("hot watch", resp.status, resp.body, a);
+            if (after == 0) return fail("tot watch", resp.status, resp.body, a);
         } else if (std.json.parseFromSliceLeaky(Events, pa, resp.body, .{ .ignore_unknown_fields = true })) |r| {
             misses = 0;
             for (r.events) |e| {
@@ -232,22 +232,22 @@ fn set(ctx: *Ctx, a: std.mem.Allocator, args: []const []const u8) u8 {
         }
     }
     const body = object(a, jb.items) orelse return 1;
-    const path = std.fmt.allocPrint(a, "/api/v1/hots/{s}/config", .{args[0]}) catch return 1;
+    const path = std.fmt.allocPrint(a, "/api/v1/tots/{s}/config", .{args[0]}) catch return 1;
     const resp = cli.call(ctx, "POST", path, body, 40, true) catch return cli.unreachable_msg(ctx);
     defer if (resp.body.len > 0) ctx.gpa.free(resp.body);
-    if (resp.status != 200) return fail("hot set", resp.status, resp.body, a);
+    if (resp.status != 200) return fail("tot set", resp.status, resp.body, a);
     const r = std.json.parseFromSliceLeaky(Answer, a, resp.body, .{ .ignore_unknown_fields = true }) catch Answer{};
     var b: [400]u8 = undefined;
-    out("{s}\n", .{rosterLine(&b, r.hot orelse .{})});
+    out("{s}\n", .{rosterLine(&b, r.tot orelse .{})});
     return 0;
 }
 
 fn pad(ctx: *Ctx, a: std.mem.Allocator, args: []const []const u8) u8 {
     if (args.len == 1 and std.mem.eql(u8, args[0], "--clear")) {
-        const resp = cli.call(ctx, "POST", "/api/v1/hots/pad/clear", "{}", 40, true) catch return cli.unreachable_msg(ctx);
+        const resp = cli.call(ctx, "POST", "/api/v1/tots/pad/clear", "{}", 40, true) catch return cli.unreachable_msg(ctx);
         defer if (resp.body.len > 0) ctx.gpa.free(resp.body);
-        if (resp.status != 200) return fail("hot pad --clear", resp.status, resp.body, a);
-        out("the scratchpad is empty (this machine kept a copy in _hots/)\n", .{});
+        if (resp.status != 200) return fail("tot pad --clear", resp.status, resp.body, a);
+        out("the scratchpad is empty (this machine kept a copy in _tots/)\n", .{});
         return 0;
     }
     if (args.len > 0) {
@@ -256,15 +256,15 @@ fn pad(ctx: *Ctx, a: std.mem.Allocator, args: []const []const u8) u8 {
         jb.appendSlice(a, "{\"text\":") catch return 1;
         cli.jstr(a, &jb, text);
         jb.append(a, '}') catch return 1;
-        const resp = cli.call(ctx, "POST", "/api/v1/hots/pad", jb.items, 40, true) catch return cli.unreachable_msg(ctx);
+        const resp = cli.call(ctx, "POST", "/api/v1/tots/pad", jb.items, 40, true) catch return cli.unreachable_msg(ctx);
         defer if (resp.body.len > 0) ctx.gpa.free(resp.body);
-        if (resp.status != 200) return fail("hot pad", resp.status, resp.body, a);
+        if (resp.status != 200) return fail("tot pad", resp.status, resp.body, a);
         out("written\n", .{});
         return 0;
     }
-    const resp = cli.call(ctx, "GET", "/api/v1/hots/pad", null, 40, true) catch return cli.unreachable_msg(ctx);
+    const resp = cli.call(ctx, "GET", "/api/v1/tots/pad", null, 40, true) catch return cli.unreachable_msg(ctx);
     defer if (resp.body.len > 0) ctx.gpa.free(resp.body);
-    if (resp.status != 200) return fail("hot pad", resp.status, resp.body, a);
+    if (resp.status != 200) return fail("tot pad", resp.status, resp.body, a);
     const r = std.json.parseFromSliceLeaky(Pad, a, resp.body, .{ .ignore_unknown_fields = true }) catch Pad{};
     for (r.entries) |e| out("{d}. {s}: {s}\n", .{ e.seq, e.from, e.text });
     if (r.entries.len == 0) out("(the scratchpad is empty)\n", .{});
@@ -276,63 +276,63 @@ fn rm(ctx: *Ctx, a: std.mem.Allocator, args: []const []const u8) u8 {
         out(USAGE, .{});
         return 1;
     }
-    const path = std.fmt.allocPrint(a, "/api/v1/hots/{s}", .{args[0]}) catch return 1;
+    const path = std.fmt.allocPrint(a, "/api/v1/tots/{s}", .{args[0]}) catch return 1;
     const resp = cli.call(ctx, "DELETE", path, null, 40, true) catch return cli.unreachable_msg(ctx);
     defer if (resp.body.len > 0) ctx.gpa.free(resp.body);
-    if (resp.status != 200) return fail("hot rm", resp.status, resp.body, a);
+    if (resp.status != 200) return fail("tot rm", resp.status, resp.body, a);
     const R = struct { worker_removed: bool = false, note: []const u8 = "" };
     const r = std.json.parseFromSliceLeaky(R, a, resp.body, .{ .ignore_unknown_fields = true }) catch R{};
     out("deleted {s}\n", .{args[0]});
-    if (r.worker_removed) out("it was the last hot, so the veil-hots Worker is removed from your Cloudflare account too\n", .{});
+    if (r.worker_removed) out("it was the last tot, so the veil-tots Worker is removed from your Cloudflare account too\n", .{});
     if (r.note.len > 0) out("{s}\n", .{r.note});
     return 0;
 }
 
-/// `veil hot key brave|google|google_cx <value>` gives the hots a search key; `--remove` takes it away.
+/// `veil tot key brave|google|google_cx <value>` gives the tots a search key; `--remove` takes it away.
 fn key(ctx: *Ctx, a: std.mem.Allocator, args: []const []const u8) u8 {
     if (args.len < 2) {
-        out("usage: veil hot key brave <key>            a Brave Search API key: web_search asks it first\n       veil hot key google <key>  +  veil hot key google_cx <engine id>\n       veil hot key <name> --remove\n", .{});
+        out("usage: veil tot key brave <key>            a Brave Search API key: web_search asks it first\n       veil tot key google <key>  +  veil tot key google_cx <engine id>\n       veil tot key <name> --remove\n", .{});
         return 1;
     }
     var jb: std.ArrayListUnmanaged(u8) = .empty;
     cli.appendStr(a, &jb, "name", args[0]);
     cli.appendStr(a, &jb, "value", if (std.mem.eql(u8, args[1], "--remove")) "" else args[1]);
     const body = object(a, jb.items) orelse return 1;
-    const resp = cli.call(ctx, "POST", "/api/v1/hots/keys", body, 40, true) catch return cli.unreachable_msg(ctx);
+    const resp = cli.call(ctx, "POST", "/api/v1/tots/keys", body, 40, true) catch return cli.unreachable_msg(ctx);
     defer if (resp.body.len > 0) ctx.gpa.free(resp.body);
-    if (resp.status != 200) return fail("hot key", resp.status, resp.body, a);
-    out("{s} key {s}\n", .{ args[0], if (std.mem.eql(u8, args[1], "--remove")) "removed" else "set: every hot's web_search uses it from its next iteration" });
+    if (resp.status != 200) return fail("tot key", resp.status, resp.body, a);
+    out("{s} key {s}\n", .{ args[0], if (std.mem.eql(u8, args[1], "--remove")) "removed" else "set: every tot's web_search uses it from its next iteration" });
     return 0;
 }
 
 fn teardown(ctx: *Ctx, a: std.mem.Allocator, args: []const []const u8) u8 {
     if (args.len < 1 or !std.mem.eql(u8, args[0], "--yes")) {
-        out("this removes the hot runtime, every hot and everything they stored from your Cloudflare account.\nrun `veil hot teardown --yes` to do it.\n", .{});
+        out("this removes the tot runtime, every tot and everything they stored from your Cloudflare account.\nrun `veil tot teardown --yes` to do it.\n", .{});
         return 1;
     }
-    const resp = cli.call(ctx, "DELETE", "/api/v1/hots", null, 60, true) catch return cli.unreachable_msg(ctx);
+    const resp = cli.call(ctx, "DELETE", "/api/v1/tots", null, 60, true) catch return cli.unreachable_msg(ctx);
     defer if (resp.body.len > 0) ctx.gpa.free(resp.body);
-    if (resp.status != 200) return fail("hot teardown", resp.status, resp.body, a);
-    out("the hot runtime is removed from the account\n", .{});
+    if (resp.status != 200) return fail("tot teardown", resp.status, resp.body, a);
+    out("the tot runtime is removed from the account\n", .{});
     return 0;
 }
 
-test "hot cli: a roster row reads the runtime's own status JSON, and an event keeps its text" {
+test "tot cli: a roster row reads the runtime's own status JSON, and an event keeps its text" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     const body =
-        \\{"ok":true,"connected":true,"deployed":true,"reachable":true,"max":3,"hots":[{"name":"Gary","state":"working","model":"@cf/x/y","minds":2,"size":3,"pace_s":600,"calls_today":41,"daily_calls":400,"local":true,"unknown":1,"goal":{"text":"map every harbour","status":"active","iteration":7,"improved":4,"budget":0,"forever":true}},{"name":"Ada","state":"roaming","goal":null}]}
+        \\{"ok":true,"connected":true,"deployed":true,"reachable":true,"max":3,"tots":[{"name":"Gary","state":"working","model":"@cf/x/y","minds":2,"size":3,"pace_s":600,"calls_today":41,"daily_calls":400,"local":true,"unknown":1,"goal":{"text":"map every harbour","status":"active","iteration":7,"improved":4,"budget":0,"forever":true}},{"name":"Ada","state":"roaming","goal":null}]}
     ;
     const r = try std.json.parseFromSliceLeaky(Roster, a, body, .{ .ignore_unknown_fields = true });
-    try std.testing.expectEqual(@as(usize, 2), r.hots.len);
+    try std.testing.expectEqual(@as(usize, 2), r.tots.len);
     var b: [400]u8 = undefined;
-    const row = rosterLine(&b, r.hots[0]);
+    const row = rosterLine(&b, r.tots[0]);
     try std.testing.expect(std.mem.startsWith(u8, row, "Gary "));
     try std.testing.expect(std.mem.indexOf(u8, row, "2/3 minds") != null);
     try std.testing.expect(std.mem.indexOf(u8, row, "41/400 calls  +this machine") != null);
     try std.testing.expect(std.mem.indexOf(u8, row, "active 4/7 forever  map every harbour") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rosterLine(&b, r.hots[1]), "(no goal: roaming)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rosterLine(&b, r.tots[1]), "(no goal: roaming)") != null);
     try std.testing.expect(std.mem.indexOf(u8, rosterLine(&b, .{ .name = "Ada", .calls_today = 7, .daily_calls = 0 }), "7 calls, no limit") != null);
     try std.testing.expectEqualStrings("0", callsArg("Unlimited"));
     try std.testing.expectEqualStrings("250", callsArg("250"));

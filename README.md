@@ -18,9 +18,9 @@ download, and coding tools require Python on `PATH` (some checks also use Node).
 
 ### New in v1.1.7
 
-**Hots**: the veil's goal loop running in your own Cloudflare account, with nobody in it and your computer
-off. Deploy one from the desktop's Hots tab or `veil hot deploy "<goal>"`; the first is always named Gary.
-[How hots work](#hots---goal-loops-that-run-without-you-in-your-own-account) ·
+**Tots**: the veil's goal loop running in your own Cloudflare account, with nobody in it and your computer
+off. Deploy one from the desktop's Tots tab or `veil tot deploy "<goal>"`; the first is always named Gary.
+[How tots work](#tots---goal-loops-that-run-without-you-in-your-own-account) ·
 [release notes](docs/release/RELEASE-v1.1.7.md).
 
 ### New in v1.1.4
@@ -76,7 +76,7 @@ conversations down the left, the work itself in the middle — the chat, or the 
 live token and latency metrics — and on the right what the agents are doing and what the thing
 remembers. Drag the dividers to whatever widths suit you (they persist), collapse a side you don't
 need, branch a side question into its own tab without losing the build. Seven tabs across the top:
-**Dashboard, Chat, Tasks, Swarm, Hots, Hub, Settings.** It is the place you work, not a sidebar bolted onto
+**Dashboard, Chat, Tasks, Swarm, Tots, Hub, Settings.** It is the place you work, not a sidebar bolted onto
 something else.
 
 **The difference is what's behind the window.** Ask most tools for a feature and one assistant writes
@@ -263,11 +263,11 @@ What keeps that safe to do:
 The login asks for the tunnel, DNS, zone and Access scopes as *optional* permissions. A login that predates
 them simply lacks them; the switch then says so and asks you to log in with Cloudflare again.
 
-### Hots - goal loops that run without you, in your own account
+### Tots - goal loops that run without you, in your own account
 
-A **hot** (Human Overview Technician) is the veil's goal loop with no human in it and no machine of yours
-under it. Once you are logged in with Cloudflare, the desk's **Hots** tab (or `veil hot deploy "<goal>"`)
-uploads one small Worker, `veil-hots`, into *your* account and creates a hot in it. From then on the hot
+A **tot** (Tiny Overview Technician) is the veil's goal loop with no human in it and no machine of yours
+under it. Once you are logged in with Cloudflare, the desk's **Tots** tab (or `veil tot deploy "<goal>"`)
+uploads one small Worker, `veil-tots`, into *your* account and creates a tot in it. From then on the tot
 works on its own: it wakes on a timer, picks the single best next improvement toward its goal, does it with
 its tools, has a judge measure whether it helped from the tool results alone (against the iterations
 before it: an attempt that failed and left things as they were is *same*, and only something that got worse is
@@ -278,17 +278,17 @@ so they never cross the public internet and need no API key.
 - **Up to three per account.** The first is always named **Gary**; you name the others.
 - **It never waits for anyone.** A message you send lands in its inbox and the next iteration reads it as a
   directive. `/goal <text>`, `/goal stop`, `/queue <goal>`, `/charter <text>`, `/pause` and `/resume` work in
-  the tab's command line and through `veil hot tell <name> "..."`.
+  the tab's command line and through `veil tot tell <name> "..."`.
 - **A goal that ends is not the end.** Achieved, out of budget, or three iterations with no improvement: the
-  hot takes the next queued goal, or proposes one itself from its charter, or rests and looks again later.
+  tot takes the next queued goal, or proposes one itself from its charter, or rests and looks again later.
   `/pause` is what holds it still.
-- **It improves itself.** An iteration that did not move the goal becomes a lesson - one rule the hot writes
+- **It improves itself.** An iteration that did not move the goal becomes a lesson - one rule the tot writes
   for its future self - and its lessons ride every later prompt; the least useful one is dropped when the
   list is full. After two flat iterations it grows by one mind, and after an easy win it shrinks, inside the
   size you allow (the tab's Grow / Shrink buttons move that ceiling).
-- **Hots work together.** They share one scratchpad, which you can read and write too, and can message each
-  other. A hot can also cast its own small swarm: several minds side by side, one task each.
-- **Its tool belt.** A hot works with real tools, in the cloud:
+- **Tots work together.** They share one scratchpad, which you can read and write too, and can message each
+  other. A tot can also cast its own small swarm: several minds side by side, one task each.
+- **Its tool belt.** A tot works with real tools, in the cloud:
   - *files* - its own workspace (`write_file`, `read_file`, `edit_file`, `append_file`, `list_files`,
     `delete_file`), kept across iterations and mirrored to your machine;
   - *the web* - `web_search` (a keyless chain: public SearXNG instances, DuckDuckGo, Bing, reference
@@ -299,61 +299,67 @@ so they never cross the public internet and need no API key.
     `browser_click`, `browser_type` and `browser_select` act on an element by its number with real mouse and
     key input (so forms and sign-up pages built on modern frameworks respond); `browser_key`, `browser_scroll`,
     `browser_back`, `browser_wait` and `browser_eval` do the rest. The page stays open between iterations. A
-    page that is a bot check (a CAPTCHA) is named as one and left alone: a hot does not solve those;
-  - *Python* - `run_python` runs a script beside the hot's files and keeps what it writes. A Worker's Python
+    page that is a bot check (a CAPTCHA) is named as one and left alone: a tot does not solve those;
+  - *Python* - `run_python` runs a script beside the tot's files and keeps what it writes. A Worker's Python
     has no sockets, no processes and no pip, so the runner supplies what a script expects: `import requests`
     and `urllib` work on the Worker's own fetch, a missing import is installed from PyPI by itself (pure-Python
     packages; `pip install` and `pip_install` do the same) and stays installed, and anything that needs a
-    process or native code is refused in words the hot can act on. Packages with native code cannot be
+    process or native code is refused in words the tot can act on. Packages with native code cannot be
     fetched by a running script, so the upload asks Cloudflare for a set of them by name (numpy, regex,
     pandas, matplotlib, pillow); if Cloudflare refuses the set, or the Python does not start with it, a
-    smaller set goes up, down to the plain Python. Every iteration the hot is told what its Python has and
+    smaller set goes up, down to the plain Python. Every iteration the tot is told what its Python has and
     what it cannot have, so it plans around the gaps instead of finding them one failed step at a time;
-    `save_skill` keeps a script as a tool of the hot's own and `run_skill` runs it
-    again, so a hot builds its own tools;
-  - *a mind* - the hot's facts live in **neuron-db**, the veil's own memory engine compiled to WebAssembly
+    `save_skill` keeps a script as a tool of the tot's own and `run_skill` runs it
+    again, so a tot builds its own tools;
+  - *a mind* - the tot's facts live in **neuron-db**, the veil's own memory engine compiled to WebAssembly
     and uploaded with the runtime: `remember` keeps a fact and `recall` finds it by meaning. The same engine
-    keeps **stances** - `feel` records how the hot has come to regard a topic, a tool or a site from working
+    keeps **stances** - `feel` records how the tot has come to regard a topic, a tool or a site from working
     on it - and a **mood** the engine sets from how its measured iterations have been going. Both are shown to
-    the hot every iteration and steer what it tries next. This is an affect model that shapes behaviour, not
+    the tot every iteration and steer what it tries next. This is an affect model that shapes behaviour, not
     a claim that anything is felt. `plan_set` / `plan_done` keep a plan it sees every iteration;
   - *each other and you* - the scratchpad, `tell`, an inner `swarm`, `goal_queue`, `say`.
 
-  Python runs in a second small Worker (`veil-hots-py`), the browser is Cloudflare's Browser Rendering and
+  Python runs in a second small Worker (`veil-tots-py`), the browser is Cloudflare's Browser Rendering and
   neuron-db is two more modules of the upload; each is added when your account takes it, and the tab says
-  which a hot has and why not otherwise.
+  which a tot has and why not otherwise.
 - **Search that answers.** Keyless search engines often refuse a cloud address, and their pages show a bot
-  check to a cloud browser. Give the hots a search API key and `web_search` asks it first:
-  `veil hot key brave <key>` (or `google` + `google_cx`). The key is stored as a secret on your Worker.
+  check to a cloud browser. Give the tots a search API key and `web_search` asks it first:
+  `veil tot key brave <key>` (or `google` + `google_cx`). The key is stored as a secret on your Worker.
 - **A console you can read.** Each event is one line saying what happened; a row that went wrong is red.
   Click a row to open its full text under it, click again to close it, and *errors* shows only what failed.
 - **Your machine, only if you say so.** The deploy form has one box, unchecked by default: *let it use THIS
-  machine*. Checked, the hot may queue jobs for the veil on your computer - the full local tool set, run
-  unattended as an ordinary chat conversation named `hot_<name>_...` you can open afterwards - and gets the
-  results back. Nothing listens at home for this: your veil asks the hot for jobs while it is running. The
+  machine*. Checked, the tot may queue jobs for the veil on your computer - the full local tool set, run
+  unattended as an ordinary chat conversation named `tot_<name>_...` you can open afterwards - and gets the
+  results back. Nothing listens at home for this: your veil asks the tot for jobs while it is running. The
   box is decided once, at deployment; it cannot be granted later.
-- **It has a budget, and you set it.** Each hot has a pace - one iteration every N seconds, from 5 seconds up -
+- **It has a budget, and you set it.** Each tot has a pace - one iteration every N seconds, from 5 seconds up -
   and a number of model calls a day, or **no limit**; with a limit, it rests when the day's calls are spent
   until the next UTC day. Workers AI usage is billed to your account by Cloudflare like any other, so an
-  unlimited hot at a 5-second pace spends as fast as its model answers.
+  unlimited tot at a 5-second pace spends as fast as its model answers.
 - **A model that only reasons does not stall it.** A reply with no visible answer is asked again with more
   room, and then answered by a model that does not reason, with a line in the console saying so.
 - **You pick its model from your account.** The deploy form's MODEL list is your login's live Workers AI
   catalogue. A goal or charter may be as long as that model can carry - about a tenth of its context window,
   between 800 and 4000 characters - and the form counts as you type.
-- **Every run has a folder on your machine.** Each deployment of a hot is mirrored, once a minute, into
-  `<data>/u<id>/_hots/<name>-<deployed>/`: `events.log` (one readable line per event - tail it),
-  `events.jsonl`, `status.json` and `notes/` (the hot's own notes, one file each). The shared scratchpad is
-  `_hots/scratchpad.md`. **Open folder** in the tab opens it; a deleted hot keeps its folder.
-- **The scratchpad can be cleared** for the next set of hots (two clicks in the tab, or
-  `veil hot pad --clear`); a copy of what it held is kept beside it as `scratchpad-<when>.md`.
-- **Deleting the last hot removes the Worker.** The `veil-hots` Worker exists for its hots: while any remain
+- **Every run has a folder on your machine.** Each deployment of a tot is mirrored, once a minute, into
+  `<data>/u<id>/_tots/<name>-<deployed>/`: `events.log` (one readable line per event - tail it),
+  `events.jsonl`, `status.json` and `notes/` (the tot's own notes, one file each). The shared scratchpad is
+  `_tots/scratchpad.md`. **Open folder** in the tab opens it; a deleted tot keeps its folder.
+- **The scratchpad can be cleared** for the next set of tots (two clicks in the tab, or
+  `veil tot pad --clear`); a copy of what it held is kept beside it as `scratchpad-<when>.md`.
+- **Deleting the last tot removes the Worker.** The `veil-tots` Worker exists for its tots: while any remain
   it stays, and when the last one is deleted it is removed from your account. A newer veil replaces the
-  Worker's code in place, and the hots keep their memory.
+  Worker's code in place, and the tots keep their memory.
+- **Hots are tots now.** v1.1.7 called them hots. The first time a newer veil runs while you are logged in
+  to the same Cloudflare account, it moves them: each hot is created again as a tot with the same name,
+  goal, settings, owner's-machine grant and files; the shared scratchpad comes along; and only then is the
+  old `veil-hots` Worker removed, so nothing keeps running under the old name. What a hot had learned
+  (lessons, facts, stances) stays behind, and its first event as a tot says so. Its local folders move from
+  `_hots` to `_tots`.
 
-The desktop's console wraps every event and scrolls (wheel or the bar on the right; *latest* jumps back to the
-newest). `veil hot` lists them, `veil hot watch Gary` follows one, `veil hot rm <name>` deletes one, and
-`veil hot teardown --yes` removes the Worker and everything the hots stored. The upload needs the optional
+The desktop's console shows one line per event, a failed one in red; click a row to open its full text,
+and *errors* keeps only what failed. `veil tot` lists them, `veil tot watch Gary` follows one, `veil tot rm <name>` deletes one, and
+`veil tot teardown --yes` removes the Worker and everything the tots stored. The upload needs the optional
 Workers scope the login already asks for; a login that declined it gets Cloudflare's refusal in plain words.
 
 ### Running your own OAuth client (optional)
@@ -389,16 +395,16 @@ POST /api/v1/oauth/cloudflare/logout     forget the credential
 GET  /api/v1/oauth/cloudflare/r2         backup status: bucket, files, bytes, last sync
 POST /api/v1/oauth/cloudflare/r2/sync    run a backup pass now
 POST /api/v1/oauth/cloudflare/r2/auto    turn the automatic backup on or off
-GET  /api/v1/hots                        your hots: the roster and the deployment status
-POST /api/v1/hots                        deploy one (uploads the runtime when the account lacks it)
-POST /api/v1/hots/:name/command          a command or a message for one hot
-POST /api/v1/hots/:name/config           its settings: model, pace, size, daily calls, charter, paused
-GET  /api/v1/hots/:name/events           its event tail
-GET  /api/v1/hots/pad   (and POST)       the scratchpad the hots share
-POST /api/v1/hots/pad/clear              empty it (a local copy is kept)
-POST /api/v1/hots/keys                   give the hots a search key (brave, google, google_cx)
-DELETE /api/v1/hots/:name                delete one (the last one takes the Worker with it);
-                                         DELETE /api/v1/hots removes them all
+GET  /api/v1/tots                        your tots: the roster and the deployment status
+POST /api/v1/tots                        deploy one (uploads the runtime when the account lacks it)
+POST /api/v1/tots/:name/command          a command or a message for one tot
+POST /api/v1/tots/:name/config           its settings: model, pace, size, daily calls, charter, paused
+GET  /api/v1/tots/:name/events           its event tail
+GET  /api/v1/tots/pad   (and POST)       the scratchpad the tots share
+POST /api/v1/tots/pad/clear              empty it (a local copy is kept)
+POST /api/v1/tots/keys                   give the tots a search key (brave, google, google_cx)
+DELETE /api/v1/tots/:name                delete one (the last one takes the Worker with it);
+                                         DELETE /api/v1/tots removes them all
 ```
 
 The token is stored per user, auto-refreshed, and **never returned to any client** — the UIs only ever
@@ -822,17 +828,17 @@ CHAT (the server-side veil brain)
       [--budget N] [--forever] [--check "<cmd>"] [--conv id]   ends when achieved, spent, or nothing improves
                                in any chat: /goal <text>   /goal   /goal stop   /goal resume
 
-HOTS (autonomous goal loops that run in YOUR Cloudflare account)
-  hot                          the roster: at most 3; the first is always named Gary
-  hot deploy "<goal>" [flags]  --name N --charter "..." --model @cf/... --pace SECONDS --size MINDS
+TOTS (autonomous goal loops that run in YOUR Cloudflare account)
+  tot                          the roster: at most 3; the first is always named Gary
+  tot deploy "<goal>" [flags]  --name N --charter "..." --model @cf/... --pace SECONDS --size MINDS
                                --calls PER_DAY|unlimited --budget N --forever   (--pace from 5)
                                --local  lets it queue jobs for the veil on THIS machine (deployment only)
-  hot tell <name> "<text>"     /goal <text>, /goal stop, /queue <goal>, /pause, /resume, or a message
-  hot watch <name>             follow its events
-  hot set <name> [flags]       --model --pace --size --calls --charter --pause --resume
-  hot pad ["<text>"|--clear]   the scratchpad the hots share (--clear empties it)
-  hot key brave <key>          a search key for the hots' web_search (google, google_cx; --remove)
-  hot rm <name>                delete one       hot teardown --yes   remove them all + the runtime
+  tot tell <name> "<text>"     /goal <text>, /goal stop, /queue <goal>, /pause, /resume, or a message
+  tot watch <name>             follow its events
+  tot set <name> [flags]       --model --pace --size --calls --charter --pause --resume
+  tot pad ["<text>"|--clear]   the scratchpad the tots share (--clear empties it)
+  tot key brave <key>          a search key for the tots' web_search (google, google_cx; --remove)
+  tot rm <name>                delete one       tot teardown --yes   remove them all + the runtime
 
 BUILT-IN MODEL (the-veil-12b, served in-process — no external runtime)
   model status                 weights + engine + any download in flight
@@ -1466,14 +1472,14 @@ build.zig                  the Zig build (server + CLI + desktop; -Dapp=false = 
 src/
   main.zig                 entry point: CLI dispatch, then the server + control plane (auth, routes)
   cli.zig                  the `veil` CLI — a thin client over the server's /api/v1/*
-  cli/{chat,hub,hot}.zig   the interactive chat REPL, the fleet console, and `veil hot`
+  cli/{chat,hub,tot}.zig   the interactive chat REPL, the fleet console, and `veil tot`
   gateway/http.zig         the HTTP surface: App context, the auth guard, JSON/file helpers
   auth/  config/  admin/   accounts + API keys, the encrypted key vault, the admin API
     config/lan.zig         which addresses this machine is reachable at (the startup banner's URLs)
     config/server_config.zig  admin-owned runtime settings → data/server-config.json
     config/cf_{oauth,r2,tunnel}.zig  Log in with Cloudflare, the R2 chat backup, the public-URL tunnel
-    config/cf_hot.zig      hots: uploads the runtime into the user's account, relays to it, and runs
-                           the jobs a hot may send to the owner's machine
+    config/cf_tot.zig      tots: uploads the runtime into the user's account, relays to it, and runs
+                           the jobs a tot may send to the owner's machine
   worker/                  the hive and the server-side brain:
     chat/{engine,service,tools,context,overlay,workspace,plan,sync,toolperf,paths}.zig  the chat
                                                    brain — the agentic turn loop, its REST handlers,
@@ -1500,10 +1506,10 @@ src/
                                                    the Veil, the self-improvement faculties, the
                                                    micro-VCS for concurrent minds
     locs/atlas.zig         the source atlas — points scouts at nl-rag packs
-cloud/hot.js               the hot runtime - one Worker, one Durable Object per hot - embedded into
-                           the binary and uploaded as it is; cloud/hot.test.mjs runs it under node
-cloud/hot_py.py            the Python a hot runs (a second Worker), with requests, pip and packages
-cloud/neuron_core.wasm  neuron-db.mjs   the hot's memory engine and its binding
+cloud/tot.js               the tot runtime - one Worker, one Durable Object per tot - embedded into
+                           the binary and uploaded as it is; cloud/tot.test.mjs runs it under node
+cloud/tot_py.py            the Python a tot runs (a second Worker), with requests, pip and packages
+cloud/neuron_core.wasm  neuron-db.mjs   the tot's memory engine and its binding
 desk/                      veil-desk, the native desktop dashboard — compiled INTO `veil` as the
                            "desk" module (-Dapp, default true), not a separate shipped binary
 docs/                      the docs site: architecture map + annotated source (static, home-built
@@ -1525,14 +1531,14 @@ dependency entirely rather than compiling it unused.
 
 ## Release
 
-**Current: [`v1.1.7`](https://github.com/gary23w/nl-veil/releases/tag/v1.1.7)** — **[hots](#hots---goal-loops-that-run-without-you-in-your-own-account)**:
-the goal loop running in your own Cloudflare account with nobody in it. The desktop's new Hots tab (or
-`veil hot deploy "<goal>"`) uploads one small Worker into your account; each hot wakes on a timer, makes one
+**Current: [`v1.1.7`](https://github.com/gary23w/nl-veil/releases/tag/v1.1.7)** — **[tots](#tots---goal-loops-that-run-without-you-in-your-own-account)**:
+the goal loop running in your own Cloudflare account with nobody in it. The desktop's new Tots tab (or
+`veil tot deploy "<goal>"`) uploads one small Worker into your account; each tot wakes on a timer, makes one
 measured improvement toward its goal, writes itself lessons from what the measurement said, and moves on to
 the next best thing when a goal ends. Up to three per account, the first always named Gary; they share a
 scratchpad, can cast their own inner swarms, and may use your machine only if you check the box at
 deployment. Each run is mirrored into a folder on your machine you can open and tail, the model list is your
-account's own, and deleting the last hot removes its Worker. And **goal mode**: `/goal <text>` in any chat
+account's own, and deleting the last tot removes its Worker. And **goal mode**: `/goal <text>` in any chat
 gives the auto-loop a stored goal, an iteration log, a measured outcome per step and its own stop rules.
 [Full notes](docs/release/RELEASE-v1.1.7.md).
 
