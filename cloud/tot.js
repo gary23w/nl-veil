@@ -1758,7 +1758,7 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
       return fetch(url, { signal: AbortSignal.timeout(ms), headers: { "user-agent": UA, accept, "accept-language": "en-US,en;q=0.9" } });
     };
     const show = (via, results) => `${results.length} results for "${query}" (${via}):\n` + results.map((x, i) => `${i + 1}. ${x.title}\n   ${x.url}${x.snippet ? `\n   ${x.snippet}` : ""}`).join("\n");
-    // 0. a search API the owner gave a key for (veil tot key ...): the one source that does not refuse a datacenter
+    // 0. a search API the owner gave a key for (veil --tater key ...): the one source that does not refuse a datacenter
     if (this.env.BRAVE_KEY) {
       try {
         this.spend();
@@ -1859,7 +1859,7 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
         }
       }
     }
-    return `ERROR: no search source answered (${tried.join("; ")}). Fetch a site you already know with web_fetch or browser_open, or ask your human for a search key (they run: veil tot key brave <key>).`;
+    return `ERROR: no search source answered (${tried.join("; ")}). Fetch a site you already know with web_fetch or browser_open, or ask your human for a search key (they run: veil --tater key brave <key>).`;
   }
 
   // ---------------------------------------------------------------- the browser

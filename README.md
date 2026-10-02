@@ -19,7 +19,7 @@ download, and coding tools require Python on `PATH` (some checks also use Node).
 ### New in v1.1.7
 
 **Tater-tots**: the veil's goal loop running in your own Cloudflare account, with nobody in it and your computer
-off. Deploy one from the desktop's Tater-tots tab or `veil tot deploy "<goal>"`; the first is always named Gary.
+off. Deploy one from the desktop's Tater-tots tab or `veil --tater deploy "<goal>"`; the first is always named Gary.
 [How tater-tots work](#tater-tots---goal-loops-that-run-without-you-in-your-own-account) ·
 [release notes](docs/release/RELEASE-v1.1.7.md).
 
@@ -266,7 +266,7 @@ them simply lacks them; the switch then says so and asks you to log in with Clou
 ### Tater-tots - goal loops that run without you, in your own account
 
 A **tater-tot** (a *tot*, short for Tiny Overview Technician) is the veil's goal loop with no human in it and no machine of yours
-under it. Once you are logged in with Cloudflare, the desk's **Tater-tots** tab (or `veil tot deploy "<goal>"`)
+under it. Once you are logged in with Cloudflare, the desk's **Tater-tots** tab (or `veil --tater deploy "<goal>"`)
 uploads one small Worker, `veil-tots`, into *your* account and creates a tater-tot in it. From then on the tater-tot
 works on its own: it wakes on a timer, picks the single best next improvement toward its goal, does it with
 its tools, has a judge measure whether it helped from the tool results alone (against the iterations
@@ -278,7 +278,7 @@ so they never cross the public internet and need no API key.
 - **Up to three per account.** The first is always named **Gary**; you name the others.
 - **It never waits for anyone.** A message you send lands in its inbox and the next iteration reads it as a
   directive. `/goal <text>`, `/goal stop`, `/queue <goal>`, `/charter <text>`, `/pause` and `/resume` work in
-  the tab's command line and through `veil tot tell <name> "..."`.
+  the tab's command line and through `veil --tater tell <name> "..."`.
 - **A goal that ends is not the end.** Achieved, out of budget, or three iterations with no improvement: the
   tater-tot takes the next queued goal, or proposes one itself from its charter, or rests and looks again later.
   `/pause` is what holds it still.
@@ -324,7 +324,7 @@ so they never cross the public internet and need no API key.
   which a tater-tot has and why not otherwise.
 - **Search that answers.** Keyless search engines often refuse a cloud address, and their pages show a bot
   check to a cloud browser. Give the tater-tots a search API key and `web_search` asks it first:
-  `veil tot key brave <key>` (or `google` + `google_cx`). The key is stored as a secret on your Worker.
+  `veil --tater key brave <key>` (or `google` + `google_cx`). The key is stored as a secret on your Worker.
 - **A console you can read.** Each event is one line saying what happened; a row that went wrong is red.
   Click a row to open its full text under it, click again to close it, and *errors* shows only what failed.
 - **Your machine, only if you say so.** The deploy form has one box, unchecked by default: *let it use THIS
@@ -346,7 +346,7 @@ so they never cross the public internet and need no API key.
   `events.jsonl`, `status.json` and `notes/` (the tater-tot's own notes, one file each). The shared scratchpad is
   `_tots/scratchpad.md`. **Open folder** in the tab opens it; a deleted tater-tot keeps its folder.
 - **The scratchpad can be cleared** for the next set of tater-tots (two clicks in the tab, or
-  `veil tot pad --clear`); a copy of what it held is kept beside it as `scratchpad-<when>.md`.
+  `veil --tater pad --clear`); a copy of what it held is kept beside it as `scratchpad-<when>.md`.
 - **Deleting the last tater-tot removes the Worker.** The `veil-tots` Worker exists for its tater-tots: while any remain
   it stays, and when the last one is deleted it is removed from your account. A newer veil replaces the
   Worker's code in place, and the tater-tots keep their memory.
@@ -358,8 +358,8 @@ so they never cross the public internet and need no API key.
   `_hots` to `_tots`.
 
 The desktop's console shows one line per event, a failed one in red; click a row to open its full text,
-and *errors* keeps only what failed. `veil tot` lists them, `veil tot watch Gary` follows one, `veil tot rm <name>` deletes one, and
-`veil tot teardown --yes` removes the Worker and everything the tater-tots stored. The upload needs the optional
+and *errors* keeps only what failed. `veil --tater` lists them, `veil --tater watch Gary` follows one, `veil --tater rm <name>` deletes one, and
+`veil --tater teardown --yes` removes the Worker and everything the tater-tots stored. The upload needs the optional
 Workers scope the login already asks for; a login that declined it gets Cloudflare's refusal in plain words.
 
 ### Running your own OAuth client (optional)
@@ -828,17 +828,17 @@ CHAT (the server-side veil brain)
       [--budget N] [--forever] [--check "<cmd>"] [--conv id]   ends when achieved, spent, or nothing improves
                                in any chat: /goal <text>   /goal   /goal stop   /goal resume
 
-TOTS (autonomous goal loops that run in YOUR Cloudflare account)
-  tot                          the roster: at most 3; the first is always named Gary
-  tot deploy "<goal>" [flags]  --name N --charter "..." --model @cf/... --pace SECONDS --size MINDS
-                               --calls PER_DAY|unlimited --budget N --forever   (--pace from 5)
-                               --local  lets it queue jobs for the veil on THIS machine (deployment only)
-  tot tell <name> "<text>"     /goal <text>, /goal stop, /queue <goal>, /pause, /resume, or a message
-  tot watch <name>             follow its events
-  tot set <name> [flags]       --model --pace --size --calls --charter --pause --resume
-  tot pad ["<text>"|--clear]   the scratchpad the tots share (--clear empties it)
-  tot key brave <key>          a search key for the tots' web_search (google, google_cx; --remove)
-  tot rm <name>                delete one       tot teardown --yes   remove them all + the runtime
+TATER-TOTS (autonomous goal loops that run in YOUR Cloudflare account)
+  --tater                         the roster: at most 3; the first is always named Gary
+  --tater deploy "<goal>" [flags] --name N --charter "..." --model @cf/... --pace SECONDS --size MINDS
+                                  --calls PER_DAY|unlimited --budget N --forever   (--pace from 5)
+                                  --local  lets it queue jobs for the veil on THIS machine (deployment only)
+  --tater tell <name> "<text>"    /goal <text>, /goal stop, /queue <goal>, /pause, /resume, or a message
+  --tater watch <name>            follow its events
+  --tater set <name> [flags]      --model --pace --size --calls --charter --pause --resume
+  --tater pad ["<text>"|--clear]  the scratchpad the tater-tots share (--clear empties it)
+  --tater key brave <key>         a search key for their web_search (google, google_cx; --remove)
+  --tater rm <name>               delete one     --tater teardown --yes   remove them all + the runtime
 
 BUILT-IN MODEL (the-veil-12b, served in-process — no external runtime)
   model status                 weights + engine + any download in flight
@@ -1472,7 +1472,7 @@ build.zig                  the Zig build (server + CLI + desktop; -Dapp=false = 
 src/
   main.zig                 entry point: CLI dispatch, then the server + control plane (auth, routes)
   cli.zig                  the `veil` CLI — a thin client over the server's /api/v1/*
-  cli/{chat,hub,tot}.zig   the interactive chat REPL, the fleet console, and `veil tot`
+  cli/{chat,hub,tot}.zig   the interactive chat REPL, the fleet console, and `veil --tater`
   gateway/http.zig         the HTTP surface: App context, the auth guard, JSON/file helpers
   auth/  config/  admin/   accounts + API keys, the encrypted key vault, the admin API
     config/lan.zig         which addresses this machine is reachable at (the startup banner's URLs)
@@ -1533,7 +1533,7 @@ dependency entirely rather than compiling it unused.
 
 **Current: [`v1.1.7`](https://github.com/gary23w/nl-veil/releases/tag/v1.1.7)** — **[tater-tots](#tater-tots---goal-loops-that-run-without-you-in-your-own-account)**:
 the goal loop running in your own Cloudflare account with nobody in it. The desktop's new Tater-tots tab (or
-`veil tot deploy "<goal>"`) uploads one small Worker into your account; each tater-tot wakes on a timer, makes one
+`veil --tater deploy "<goal>"`) uploads one small Worker into your account; each tater-tot wakes on a timer, makes one
 measured improvement toward its goal, writes itself lessons from what the measurement said, and moves on to
 the next best thing when a goal ends. Up to three per account, the first always named Gary; they share a
 scratchpad, can cast their own inner swarms, and may use your machine only if you check the box at

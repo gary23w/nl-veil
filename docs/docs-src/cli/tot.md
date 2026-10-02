@@ -2,7 +2,7 @@
 
 **File:** `src/cli/tot.zig`  
 **Module:** `cli`  
-**Description:** `veil tot` — the terminal door to tater-tots: list them, deploy one, talk to it, follow it, change its settings, read and write the shared scratchpad, delete it.
+**Description:** `veil --tater` — the terminal door to tater-tots: list them, deploy one, talk to it, follow it, change its settings, read and write the shared scratchpad, delete it.
 
 ---
 
@@ -12,7 +12,7 @@ Every verb is one call to the local server (`config/cf_tot.zig`), which relays t
 
 ## Key Exports
 
-- `cmd` — the dispatcher for `veil tot [ls | deploy | tell | watch | set | pad | rm | teardown]`
+- `cmd` — the dispatcher for `veil --tater [ls | deploy | tell | watch | set | pad | rm | teardown]`
 - `rosterLine` — one roster row: name, state, minds, model calls today, the local grant, the goal and its counters (pure, tested)
 - `eventLine` — one event as a terminal line (pure, tested)
 
@@ -23,7 +23,7 @@ Every verb is one call to the local server (`config/cf_tot.zig`), which relays t
 
 ## Usage Context
 
-`cli.zig` dispatches the `tot` verb here and lists it in `isCommand`; the help text has a TOTS section. `deploy` sends only the fields the server's `CreateReq` names (the server's request parser is strict). `--local` is the terminal form of the deploy form's checkbox: it lets the tater-tot queue jobs for the veil on this machine, and it exists only on `deploy`.
+`cli.zig` dispatches `--tater` (and `tater`, and `tot`, its earlier name) here and lists them in `isCommand`; the help text has a TATER-TOTS section. `deploy` sends only the fields the server's `CreateReq` names (the server's request parser is strict). `--local` is the terminal form of the deploy form's checkbox: it lets the tater-tot queue jobs for the veil on this machine, and it exists only on `deploy`.
 
 ## Notable Implementation Details
 
@@ -32,7 +32,7 @@ Every verb is one call to the local server (`config/cf_tot.zig`), which relays t
 - `--calls unlimited` (or `infinite`, `none`, `0`) is no limit on model calls; `--pace` takes 5 seconds and up. The roster ends with the tools the account's tater-tots have.
 - `key brave <key>` (or `google`, `google_cx`) gives the tater-tots a search API key; `--remove` takes it away.
 - `teardown` needs `--yes`: it removes the runtime, every tater-tot and everything they stored from the account.
-- `tell` joins its remaining arguments into one text, so `veil tot tell Gary /goal map every harbour --forever` needs no quotes.
+- `tell` joins its remaining arguments into one text, so `veil --tater tell Gary /goal map every harbour --forever` needs no quotes.
 
 ---
 

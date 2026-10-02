@@ -1184,7 +1184,7 @@ test("web_search walks the keyless chain: a SearXNG instance that answers is rem
     mode = "nothing";
     const none = await gary.runTool(cfg, "web_search", { query: "tides" }, "");
     assert.match(none, /^ERROR: no search source answered \(/);
-    assert.match(none, /veil tot key brave <key>/); // the way out is named
+    assert.match(none, /veil --tater key brave <key>/); // the way out is named
     // with a browser, a search every engine refused is made through it: Bing shows a bot check, Brave answers
     const fb = fakeBrowser();
     fb.serp = (url) => (url.includes("bing.com") ? { results: [], blocked: true } : { results: [{ title: "Tide tables", url: "https://tides.example/", snippet: "from the browser" }], blocked: false });

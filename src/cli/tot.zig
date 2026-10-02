@@ -1,17 +1,17 @@
-//! `veil tot` — the terminal door to TOTS (config/cf_tot.zig): autonomous goal loops that run in the user's own
+//! `veil --tater` — the terminal door to TATER-TOTS (config/cf_tot.zig): autonomous goal loops that run in the user's own
 //! Cloudflare account, with no human in them.
 //!
-//!   veil tot                              the roster: every tot, its state, its goal
-//!   veil tot deploy "<goal>" [flags]      deploy one (the first is always named Gary)
+//!   veil --tater                            the roster: every tot, its state, its goal
+//!   veil --tater deploy "<goal>" [flags]    deploy one (the first is always named Gary)
 //!       --name N  --charter "..."  --model @cf/...  --pace SECONDS (5 and up)  --size MINDS
 //!       --calls PER_DAY | unlimited
 //!       --budget N  --forever      --local   (let it queue jobs for the veil on THIS machine; deployment only)
-//!   veil tot tell <name> "<text>"         a command (/goal ..., /pause, /queue ...) or a message for its inbox
-//!   veil tot watch <name>                 follow its events
-//!   veil tot set <name> [flags]           --model --pace --size --calls --charter --pause --resume
-//!   veil tot pad ["<text>" | --clear]     read the scratchpad the tots share, write to it, or empty it
-//!   veil tot rm <name>                    delete one tot
-//!   veil tot teardown --yes               remove the runtime and every tot from the Cloudflare account
+//!   veil --tater tell <name> "<text>"       a command (/goal ..., /pause, /queue ...) or a message for its inbox
+//!   veil --tater watch <name>               follow its events
+//!   veil --tater set <name> [flags]         --model --pace --size --calls --charter --pause --resume
+//!   veil --tater pad ["<text>" | --clear]   read the scratchpad the tots share, write to it, or empty it
+//!   veil --tater rm <name>                  delete one tot
+//!   veil --tater teardown --yes             remove the runtime and every tot from the Cloudflare account
 //!
 //! Every verb is one call to the local server, which relays to the runtime. Nothing here talks to Cloudflare.
 
@@ -22,16 +22,17 @@ const Ctx = cli.Ctx;
 const out = cli.out;
 
 const USAGE =
-    \\usage: veil tot                              list your tots
-    \\       veil tot deploy "<goal>" [--name N] [--charter "..."] [--model @cf/...] [--pace SECONDS]
+    \\usage: veil --tater                              list your tater-tots
+    \\       veil --tater deploy "<goal>" [--name N] [--charter "..."] [--model @cf/...] [--pace SECONDS]
     \\                       [--size MINDS] [--calls PER_DAY] [--budget N] [--forever] [--local]
-    \\       veil tot tell <name> "<text>"         /goal <text>, /goal stop, /queue <goal>, /pause, /resume, or a message
-    \\       veil tot watch <name>                 follow its events
-    \\       veil tot set <name> [--model M] [--pace S] [--size N] [--calls N] [--charter "..."] [--pause|--resume]
-    \\       veil tot pad ["<text>" | --clear]     the scratchpad the tots share (--clear empties it)
-    \\       veil tot rm <name>                    delete one tot
-    \\       veil tot key brave <key>              a search key for the tots (google, google_cx too; --remove)
-    \\       veil tot teardown --yes               remove the runtime and every tot from the account
+    \\       veil --tater tell <name> "<text>"         /goal <text>, /goal stop, /queue <goal>, /pause, /resume, or a message
+    \\       veil --tater watch <name>                 follow its events
+    \\       veil --tater set <name> [--model M] [--pace S] [--size N] [--calls N] [--charter "..."] [--pause|--resume]
+    \\       veil --tater pad ["<text>" | --clear]     the scratchpad the tater-tots share (--clear empties it)
+    \\       veil --tater rm <name>                    delete one tater-tot
+    \\       veil --tater key brave <key>              a search key for the tater-tots (google, google_cx too; --remove)
+    \\       veil --tater teardown --yes               remove the runtime and every tater-tot from the account
+    \\       (veil tater ... and veil --tater ... do the same)
     \\
 ;
 
@@ -112,11 +113,11 @@ pub fn cmd(ctx: *Ctx, args: []const []const u8) u8 {
 fn list(ctx: *Ctx, a: std.mem.Allocator) u8 {
     const resp = cli.call(ctx, "GET", "/api/v1/tots", null, 40, true) catch return cli.unreachable_msg(ctx);
     defer if (resp.body.len > 0) ctx.gpa.free(resp.body);
-    if (resp.status != 200) return fail("tot list", resp.status, resp.body, a);
-    const r = std.json.parseFromSliceLeaky(Roster, a, resp.body, .{ .ignore_unknown_fields = true }) catch return fail("tot list", resp.status, resp.body, a);
+    if (resp.status != 200) return fail("--tater list", resp.status, resp.body, a);
+    const r = std.json.parseFromSliceLeaky(Roster, a, resp.body, .{ .ignore_unknown_fields = true }) catch return fail("--tater list", resp.status, resp.body, a);
     if (!r.connected) out("not connected to Cloudflare: log in with Cloudflare in the desk (Settings > Models) first\n", .{});
     if (!r.deployed) {
-        out("(no tots - deploy the first with `veil tot deploy \"<goal>\"`; it will be named Gary)\n", .{});
+        out("(no tater-tots - deploy the first with `veil --tater deploy \"<goal>\"`; it will be named Gary)\n", .{});
         if (r.last_error.len > 0) out("last deployment error: {s}\n", .{r.last_error});
         return 0;
     }
@@ -125,7 +126,7 @@ fn list(ctx: *Ctx, a: std.mem.Allocator) u8 {
         var b: [400]u8 = undefined;
         out("{s}\n", .{rosterLine(&b, h)});
     }
-    if (r.tots.len == 0 and r.reachable) out("(no tots - deploy the first with `veil tot deploy \"<goal>\"`)\n", .{});
+    if (r.tots.len == 0 and r.reachable) out("(no tater-tots - deploy the first with `veil --tater deploy \"<goal>\"`)\n", .{});
     if (r.reachable) out("tools: files, web search, web fetch, HTTP, memory, plan, swarm{s}{s}{s}\n", .{ if (r.python) ", Python + skills" else "", if (r.browser) ", browser" else "", if (r.neuron) ", neuron-db mind" else "" });
     if (r.tools_note.len > 0) out("{s}\n", .{r.tools_note});
     return 0;
@@ -153,10 +154,10 @@ fn deploy(ctx: *Ctx, a: std.mem.Allocator, args: []const []const u8) u8 {
     out("deploying (the first deployment uploads the runtime into your Cloudflare account; it can take a minute)...\n", .{});
     const resp = cli.call(ctx, "POST", "/api/v1/tots", body, 120, true) catch return cli.unreachable_msg(ctx);
     defer if (resp.body.len > 0) ctx.gpa.free(resp.body);
-    if (resp.status != 201) return fail("tot deploy", resp.status, resp.body, a);
+    if (resp.status != 201) return fail("--tater deploy", resp.status, resp.body, a);
     const r = std.json.parseFromSliceLeaky(Answer, a, resp.body, .{ .ignore_unknown_fields = true }) catch Answer{};
     const h: Tot = r.tot orelse .{};
-    out("{s} is deployed and working. `veil tot watch {s}` follows it; `veil tot tell {s} \"...\"` talks to it.\n", .{ h.name, h.name, h.name });
+    out("{s} is deployed and working. `veil --tater watch {s}` follows it; `veil --tater tell {s} \"...\"` talks to it.\n", .{ h.name, h.name, h.name });
     if (h.local) out("{s} may queue jobs for the veil on this machine; they run while this server is up.\n", .{h.name});
     return 0;
 }
@@ -174,7 +175,7 @@ fn tell(ctx: *Ctx, a: std.mem.Allocator, args: []const []const u8) u8 {
     const path = std.fmt.allocPrint(a, "/api/v1/tots/{s}/command", .{args[0]}) catch return 1;
     const resp = cli.call(ctx, "POST", path, jb.items, 40, true) catch return cli.unreachable_msg(ctx);
     defer if (resp.body.len > 0) ctx.gpa.free(resp.body);
-    if (resp.status != 200) return fail("tot tell", resp.status, resp.body, a);
+    if (resp.status != 200) return fail("--tater tell", resp.status, resp.body, a);
     const r = std.json.parseFromSliceLeaky(Answer, a, resp.body, .{ .ignore_unknown_fields = true }) catch Answer{};
     out("{s}\n", .{r.reply});
     return 0;
@@ -201,7 +202,7 @@ fn watch(ctx: *Ctx, a: std.mem.Allocator, args: []const []const u8) u8 {
         };
         defer if (resp.body.len > 0) ctx.gpa.free(resp.body);
         if (resp.status != 200) {
-            if (after == 0) return fail("tot watch", resp.status, resp.body, a);
+            if (after == 0) return fail("--tater watch", resp.status, resp.body, a);
         } else if (std.json.parseFromSliceLeaky(Events, pa, resp.body, .{ .ignore_unknown_fields = true })) |r| {
             misses = 0;
             for (r.events) |e| {
@@ -235,7 +236,7 @@ fn set(ctx: *Ctx, a: std.mem.Allocator, args: []const []const u8) u8 {
     const path = std.fmt.allocPrint(a, "/api/v1/tots/{s}/config", .{args[0]}) catch return 1;
     const resp = cli.call(ctx, "POST", path, body, 40, true) catch return cli.unreachable_msg(ctx);
     defer if (resp.body.len > 0) ctx.gpa.free(resp.body);
-    if (resp.status != 200) return fail("tot set", resp.status, resp.body, a);
+    if (resp.status != 200) return fail("--tater set", resp.status, resp.body, a);
     const r = std.json.parseFromSliceLeaky(Answer, a, resp.body, .{ .ignore_unknown_fields = true }) catch Answer{};
     var b: [400]u8 = undefined;
     out("{s}\n", .{rosterLine(&b, r.tot orelse .{})});
@@ -246,7 +247,7 @@ fn pad(ctx: *Ctx, a: std.mem.Allocator, args: []const []const u8) u8 {
     if (args.len == 1 and std.mem.eql(u8, args[0], "--clear")) {
         const resp = cli.call(ctx, "POST", "/api/v1/tots/pad/clear", "{}", 40, true) catch return cli.unreachable_msg(ctx);
         defer if (resp.body.len > 0) ctx.gpa.free(resp.body);
-        if (resp.status != 200) return fail("tot pad --clear", resp.status, resp.body, a);
+        if (resp.status != 200) return fail("--tater pad --clear", resp.status, resp.body, a);
         out("the scratchpad is empty (this machine kept a copy in _tots/)\n", .{});
         return 0;
     }
@@ -258,13 +259,13 @@ fn pad(ctx: *Ctx, a: std.mem.Allocator, args: []const []const u8) u8 {
         jb.append(a, '}') catch return 1;
         const resp = cli.call(ctx, "POST", "/api/v1/tots/pad", jb.items, 40, true) catch return cli.unreachable_msg(ctx);
         defer if (resp.body.len > 0) ctx.gpa.free(resp.body);
-        if (resp.status != 200) return fail("tot pad", resp.status, resp.body, a);
+        if (resp.status != 200) return fail("--tater pad", resp.status, resp.body, a);
         out("written\n", .{});
         return 0;
     }
     const resp = cli.call(ctx, "GET", "/api/v1/tots/pad", null, 40, true) catch return cli.unreachable_msg(ctx);
     defer if (resp.body.len > 0) ctx.gpa.free(resp.body);
-    if (resp.status != 200) return fail("tot pad", resp.status, resp.body, a);
+    if (resp.status != 200) return fail("--tater pad", resp.status, resp.body, a);
     const r = std.json.parseFromSliceLeaky(Pad, a, resp.body, .{ .ignore_unknown_fields = true }) catch Pad{};
     for (r.entries) |e| out("{d}. {s}: {s}\n", .{ e.seq, e.from, e.text });
     if (r.entries.len == 0) out("(the scratchpad is empty)\n", .{});
@@ -279,7 +280,7 @@ fn rm(ctx: *Ctx, a: std.mem.Allocator, args: []const []const u8) u8 {
     const path = std.fmt.allocPrint(a, "/api/v1/tots/{s}", .{args[0]}) catch return 1;
     const resp = cli.call(ctx, "DELETE", path, null, 40, true) catch return cli.unreachable_msg(ctx);
     defer if (resp.body.len > 0) ctx.gpa.free(resp.body);
-    if (resp.status != 200) return fail("tot rm", resp.status, resp.body, a);
+    if (resp.status != 200) return fail("--tater rm", resp.status, resp.body, a);
     const R = struct { worker_removed: bool = false, note: []const u8 = "" };
     const r = std.json.parseFromSliceLeaky(R, a, resp.body, .{ .ignore_unknown_fields = true }) catch R{};
     out("deleted {s}\n", .{args[0]});
@@ -288,10 +289,10 @@ fn rm(ctx: *Ctx, a: std.mem.Allocator, args: []const []const u8) u8 {
     return 0;
 }
 
-/// `veil tot key brave|google|google_cx <value>` gives the tots a search key; `--remove` takes it away.
+/// `veil --tater key brave|google|google_cx <value>` gives the tots a search key; `--remove` takes it away.
 fn key(ctx: *Ctx, a: std.mem.Allocator, args: []const []const u8) u8 {
     if (args.len < 2) {
-        out("usage: veil tot key brave <key>            a Brave Search API key: web_search asks it first\n       veil tot key google <key>  +  veil tot key google_cx <engine id>\n       veil tot key <name> --remove\n", .{});
+        out("usage: veil --tater key brave <key>        a Brave Search API key: web_search asks it first\n       veil --tater key google <key>  +  veil --tater key google_cx <engine id>\n       veil --tater key <name> --remove\n", .{});
         return 1;
     }
     var jb: std.ArrayListUnmanaged(u8) = .empty;
@@ -300,19 +301,19 @@ fn key(ctx: *Ctx, a: std.mem.Allocator, args: []const []const u8) u8 {
     const body = object(a, jb.items) orelse return 1;
     const resp = cli.call(ctx, "POST", "/api/v1/tots/keys", body, 40, true) catch return cli.unreachable_msg(ctx);
     defer if (resp.body.len > 0) ctx.gpa.free(resp.body);
-    if (resp.status != 200) return fail("tot key", resp.status, resp.body, a);
+    if (resp.status != 200) return fail("--tater key", resp.status, resp.body, a);
     out("{s} key {s}\n", .{ args[0], if (std.mem.eql(u8, args[1], "--remove")) "removed" else "set: every tot's web_search uses it from its next iteration" });
     return 0;
 }
 
 fn teardown(ctx: *Ctx, a: std.mem.Allocator, args: []const []const u8) u8 {
     if (args.len < 1 or !std.mem.eql(u8, args[0], "--yes")) {
-        out("this removes the tot runtime, every tot and everything they stored from your Cloudflare account.\nrun `veil tot teardown --yes` to do it.\n", .{});
+        out("this removes the tot runtime, every tot and everything they stored from your Cloudflare account.\nrun `veil --tater teardown --yes` to do it.\n", .{});
         return 1;
     }
     const resp = cli.call(ctx, "DELETE", "/api/v1/tots", null, 60, true) catch return cli.unreachable_msg(ctx);
     defer if (resp.body.len > 0) ctx.gpa.free(resp.body);
-    if (resp.status != 200) return fail("tot teardown", resp.status, resp.body, a);
+    if (resp.status != 200) return fail("--tater teardown", resp.status, resp.body, a);
     out("the tot runtime is removed from the account\n", .{});
     return 0;
 }

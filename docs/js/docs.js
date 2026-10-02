@@ -37,7 +37,7 @@
       { p: 'cli/exec_tool', c: 'CL-03', t: 'Shared client tool executor — one tools.execute in the invoker cwd', s: 'cli/exec_tool.zig' },
       { p: 'cli/hub', c: 'CL-04', t: 'Fleet console — roster, broadcast say/goal, stopall over the API', s: 'cli/hub.zig' },
       { p: 'cli/swarm_tui', c: 'CL-05', t: 'veil --swarm — a terminal view of a live swarm, one chat line into it', s: 'cli/swarm_tui.zig' },
-      { p: 'cli/tot', c: 'CL-06', t: 'veil tot — deploy, tell, watch, set and delete tots from the terminal', s: 'cli/tot.zig' }
+      { p: 'cli/tot', c: 'CL-06', t: 'veil --tater — deploy, tell, watch, set and delete tater-tots from the terminal', s: 'cli/tot.zig' }
     ]},
     { key: 'config/', label: 'CONFIG — THE VAULT', docs: [
       { p: 'config/key_vault', c: 'CF-01', t: 'Key vault — write-only BYOK: seal in, never read out', s: 'key_vault.zig' },
