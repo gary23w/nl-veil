@@ -79,7 +79,7 @@ code and credentials from anything you share.
 
 <p>
   <a href="https://github.com/gary23w/nl-veil/actions/workflows/release.yml"><img alt="build" src="https://github.com/gary23w/nl-veil/actions/workflows/release.yml/badge.svg"></a>
-  <a href="https://github.com/gary23w/nl-veil/releases"><img alt="release" src="https://img.shields.io/badge/release-v1.1.10-A8241B"></a>
+  <a href="https://github.com/gary23w/nl-veil/releases"><img alt="release" src="https://img.shields.io/badge/release-v1.1.11-A8241B"></a>
   <img alt="zig" src="https://img.shields.io/badge/zig-0.16-F7A41D?logo=zig&logoColor=white">
   <a href="https://huggingface.co/gary23w/the-veil-12b"><img alt="built-in model" src="https://img.shields.io/badge/built--in%20model-the--veil--12b-6E4A27?logo=huggingface&logoColor=white"></a>
   <a href="https://huggingface.co/gary23w/gary-neuron-emergent"><img alt="memory cortex" src="https://img.shields.io/badge/cortex-gary--neuron--emergent-6E4A27?logo=huggingface&logoColor=white"></a>
@@ -548,7 +548,7 @@ raylib is a *lazy* dependency, so `-Dapp=false` never fetches it at all.
 ## Install
 
 **Download it and run it — no toolchain, nothing to build.** Grab your platform's bundle from the
-**[latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.1.10)**, unzip, and run `veil`:
+**[latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.1.11)**, unzip, and run `veil`:
 
 | You're on | Download | Then run |
 |---|---|---|
@@ -709,7 +709,7 @@ step 5** — the rest is about letting other people in.
 
 ### 1. Download and unblock it
 
-Grab the bundle for your OS from the [latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.1.10)
+Grab the bundle for your OS from the [latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.1.11)
 and unzip it somewhere you'll find again. Builds are unsigned, so:
 
 - **Windows** shows *"Windows protected your PC"* → **More info** → **Run anyway**.
@@ -745,7 +745,7 @@ On startup the server prints one complete URL per address this machine answers o
 (`src/main.zig:861-889`, using `src/config/lan.zig`):
 
 ```
-neuron-loops 1.1.10 on http://localhost:8787
+neuron-loops 1.1.11 on http://localhost:8787
     open from another machine (phone, laptop) at:
       http://192.168.1.42:8787
 ```
@@ -1615,7 +1615,9 @@ dependency entirely rather than compiling it unused.
 
 ## Release
 
-**Current: [`v1.1.10`](https://github.com/gary23w/nl-veil/releases/tag/v1.1.10)** — tot deployment reconnects stale runtimes, run history is easier to read, and saved runs can be removed from the list without deleting their files. [Full notes](docs/release/RELEASE-v1.1.10.md).
+**Current: [`v1.1.11`](https://github.com/gary23w/nl-veil/releases/tag/v1.1.11)** — chat keeps answering when a hosted model changes how it treats a request: a retired thinking-off setting stays retired, a cut turn's continuation state is read from the reasoning channel, the desktop stops dialing a placeholder endpoint and folds a message into a running turn, and the survey and planning passes show their reasoning in the chat. [Full notes](docs/release/RELEASE-v1.1.11.md).
+
+**Previously: [`v1.1.10`](docs/release/RELEASE-v1.1.10.md)** — tot deployment reconnects stale runtimes, run history is easier to read, and saved runs can be removed from the list without deleting their files.
 
 **Previously: [`v1.1.9`](docs/release/RELEASE-v1.1.9.md)** — each tot deployment has its own console. Past runs retain events and deployment errors, and redeploying the same name starts fresh.
 

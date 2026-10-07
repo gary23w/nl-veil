@@ -321,9 +321,14 @@ test "errHead: a provider envelope's message is named, anything else is the firs
 /// LEARNED per model, the way the temperature rules are: once a model has been SEEN reasoning
 /// (Quirk.reasons), each auxiliary call sends the next candidate; a reply that comes back without reasoning
 /// confirms the knob (persisted); a reply with reasoning, or a rejection, moves to the next; after the last
-/// one the model is left to reason (.none, never persisted, so a later provider feature gets its trial
-/// again). A learned knob that stops working is dropped the same way. The answer, the plan, the survey and
-/// the verdict keep their reasoning.
+/// one the model is left to reason (.none). A learned knob that stops working is dropped the same way, and
+/// the drop is persisted WITH the trial index (Quirk.reason_off_trial), because a provider can change under a
+/// learned knob: measured 2026-10-05/06, Workers AI glm-5.3-flash answered the byte-identical `template`
+/// request silently for a month and then with reasoning on 68 of 68 calls - and with EMPTY content on nearly
+/// every one, so every continuation state, search query and verdict that carried the knob came back blank.
+/// The retirement used to be undone on the very save meant to persist it (see mergeQuirkLocked), so the dead
+/// knob was sent 65 times in one day. To re-run the trials for a model (a provider that grew a knob), delete
+/// its line from provider_quirks.jsonl. The answer, the plan, the survey and the verdict keep their reasoning.
 const ReasonOff = enum { unknown, template, effort, disabled, none };
 const ReasonOffCandidate = struct { knob: ReasonOff, frag: []const u8 };
 /// One trial each, in this order. `template` carries both chat-template keys at once: a Jinja template
@@ -390,7 +395,9 @@ fn observeReasonOff(io: std.Io, model: []const u8, pick: ReasonOffPick, ok: bool
         }
         return; // confirmed, or the learned knob still works
     }
-    const next = reasonOffIndex(pick.knob) + 1;
+    // Never backwards: a peer process may already have moved further down the list (its index arrives through
+    // the store merge), and a dead knob this process re-sent must not pull the shared cursor back onto it.
+    const next = @max(e.q.reason_off_trial, reasonOffIndex(pick.knob) + 1);
     e.q.reason_off_trial = next;
     e.q.reason_off = if (next >= REASON_OFF_CANDIDATES.len) .none else .unknown;
     if (!pick.trial) saveQuirksLocked(io); // a persisted knob that stopped working is forgotten on disk too
@@ -443,6 +450,59 @@ test "reasonOffFor / observeReasonOff: learned from a silent reply, dropped when
     observeReasonOff(io, m, p4, true, true); // the last candidate failed: the model is left to reason
     try std.testing.expectEqualStrings("", reasonOffFor(io, "compact", m).frag);
     try std.testing.expectEqualStrings("", reasonOffFor(io, "compact", "test/plain").frag);
+}
+
+test "a retired reasoning-off knob stays retired through the store merge, and a peer's further trial is believed" {
+    // The 2026-10-06 shape: the file says `template` works, the provider changed under it, and the save that
+    // should persist the retirement re-reads that same file first. Counterfactual: with the old gap-fill
+    // (adopt any known knob into .unknown) the second pick below comes back `template`, learned, forever.
+    const saved_tbl = quirk_tbl;
+    defer quirk_tbl = saved_tbl;
+    quirk_tbl = @splat(.{});
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const m = "test/retired";
+    // boot: the file's lesson lands in the empty table
+    quirk_mtx.lockUncancelable(io);
+    mergeQuirkLocked(m, .{ .reasons = true, .reason_off = .template });
+    quirk_mtx.unlock(io);
+    const p1 = reasonOffFor(io, "compact", m);
+    try std.testing.expect(!p1.trial and p1.knob == .template);
+    observeReasonOff(io, m, p1, true, true); // the learned knob answered with reasoning: retired
+    // the save re-reads the stale file row - it must NOT resurrect the knob
+    quirk_mtx.lockUncancelable(io);
+    mergeQuirkLocked(m, .{ .reasons = true, .reason_off = .template });
+    quirk_mtx.unlock(io);
+    const p2 = reasonOffFor(io, "compact", m);
+    try std.testing.expect(p2.trial and p2.knob == .effort);
+    // a peer that already moved further is believed: its cursor wins, and the candidate it passed is skipped
+    quirk_mtx.lockUncancelable(io);
+    mergeQuirkLocked(m, .{ .reasons = true, .reason_off = .unknown, .reason_off_trial = 2 });
+    quirk_mtx.unlock(io);
+    const p3 = reasonOffFor(io, "compact", m);
+    try std.testing.expect(p3.trial and p3.knob == .disabled);
+    // a peer that LEARNED a later knob hands it over...
+    quirk_mtx.lockUncancelable(io);
+    mergeQuirkLocked(m, .{ .reasons = true, .reason_off = .disabled, .reason_off_trial = 2 });
+    quirk_mtx.unlock(io);
+    const p4 = reasonOffFor(io, "compact", m);
+    try std.testing.expect(!p4.trial and p4.knob == .disabled);
+    // ...and a peer that retired THAT one drops it here as well, instead of this process re-sending it
+    quirk_mtx.lockUncancelable(io);
+    mergeQuirkLocked(m, .{ .reasons = true, .reason_off = .none, .reason_off_trial = 3 });
+    quirk_mtx.unlock(io);
+    try std.testing.expectEqualStrings("", reasonOffFor(io, "compact", m).frag);
+    try std.testing.expect(quirkFor(io, m).reason_off == .none);
+    // the wire record carries the cursor, with the default an old file lands on
+    const gpa = std.testing.allocator;
+    const rec = try std.json.parseFromSlice(QuirkRec, gpa, "{\"model\":\"x\",\"reason_off\":\"none\",\"reason_off_trial\":3}", .{ .ignore_unknown_fields = true });
+    defer rec.deinit();
+    try std.testing.expectEqual(@as(u8, 3), rec.value.reason_off_trial);
+    try std.testing.expect(std.meta.stringToEnum(ReasonOff, rec.value.reason_off).? == .none);
+    const old = try std.json.parseFromSlice(QuirkRec, gpa, "{\"model\":\"x\",\"reason_off\":\"template\"}", .{ .ignore_unknown_fields = true });
+    defer old.deinit();
+    try std.testing.expectEqual(@as(u8, 0), old.value.reason_off_trial);
 }
 
 test "splitStat: the status suffix is peeled off the body, and a body without one is whole" {
@@ -2227,8 +2287,12 @@ const Quirk = struct {
     /// from the name or a catalog alone. It starts the reasoning-off trials and doubles the output cap.
     reasons: bool = false,
     /// The knob that silences this model's reasoning on auxiliary calls (see reasonOffFor); `.unknown` while
-    /// the candidates are on trial, `.none` once every candidate failed (RAM only).
+    /// the candidates are on trial, `.none` once every candidate failed. Persisted TOGETHER with the trial
+    /// index below: a retired knob reads `.unknown` exactly like a knob never tried, so without the index the
+    /// store merge put the file's stale lesson straight back on every save (see mergeQuirkLocked).
     reason_off: ReasonOff = .unknown,
+    /// Index of the next REASON_OFF_CANDIDATES entry to try. Every candidate below it is known dead for this
+    /// model - failed on trial, or learned and then seen reasoning again - and is never resurrected by a merge.
     reason_off_trial: u8 = 0,
 };
 
@@ -2299,13 +2363,21 @@ fn quirkFor(io: std.Io, model: []const u8) Quirk {
 /// ignored on parse, so a new constraint class is one added field here: an old engine skips it, a new
 /// engine reads an old file — the store never needs a migration. `temp` travels as the tag name (not the
 /// enum's integer) so a reordered TempRule can't silently reassign every persisted rule.
-const QuirkRec = struct { model: []const u8 = "", temp: []const u8 = "keep", temp_val: f32 = 1.0, reasoning_echo: bool = false, reasoning_budget: bool = false, reasons: bool = false, reason_off: []const u8 = "unknown" };
+const QuirkRec = struct { model: []const u8 = "", temp: []const u8 = "keep", temp_val: f32 = 1.0, reasoning_echo: bool = false, reasoning_budget: bool = false, reasons: bool = false, reason_off: []const u8 = "unknown", reason_off_trial: u8 = 0 };
 
 /// Fold one on-disk record into the RAM table (caller holds quirk_mtx). File fields never CLOBBER a live
 /// RAM lesson — this process learned from a fresher provider error than anything on disk — they fill gaps:
 /// a temp rule lands only where RAM still says .keep, and reasoning_echo only ever turns ON. That same
 /// never-lose merge is what makes the save path safe when several processes share the store (see
 /// saveQuirksLocked).
+///
+/// The reasoning-off knob is the one field where "fill the gap" was wrong on its own. A knob this process
+/// RETIRED (observeReasonOff: a learned knob answered with reasoning) sits in RAM as `.unknown` - the same
+/// value as "never tried" - and the save that was meant to persist the retirement re-reads the file first,
+/// where the old lesson still said `template`. The gap-fill put it straight back, the save wrote it straight
+/// back out, and the next auxiliary call sent the dead knob again: 65 times on 2026-10-06, every reply blank.
+/// So the trial INDEX travels too, the furthest index wins, and a knob either side has already moved past is
+/// never adopted - and is dropped from RAM when the file proves a peer moved past it.
 fn mergeQuirkLocked(model: []const u8, q: Quirk) void {
     const h = std.hash.Wyhash.hash(0x9e37, model);
     const e = slotForLocked(model, h);
@@ -2316,7 +2388,16 @@ fn mergeQuirkLocked(model: []const u8, q: Quirk) void {
     if (q.reasoning_echo) e.q.reasoning_echo = true;
     if (q.reasoning_budget) e.q.reasoning_budget = true;
     if (q.reasons) e.q.reasons = true;
-    if (q.reason_off != .unknown and q.reason_off != .none and e.q.reason_off == .unknown) e.q.reason_off = q.reason_off;
+    if (q.reason_off_trial > e.q.reason_off_trial) e.q.reason_off_trial = q.reason_off_trial;
+    // A knob RAM still trusts but a peer has retired (its index is below the merged cursor) is dropped first,
+    // so the retirement reaches every process sharing the store, not only the one that saw the reasoning -
+    // and a cursor past the last candidate means every one failed, which is `.none`, not "try again".
+    if (e.q.reason_off != .unknown and e.q.reason_off != .none and reasonOffIndex(e.q.reason_off) < e.q.reason_off_trial)
+        e.q.reason_off = if (e.q.reason_off_trial >= REASON_OFF_CANDIDATES.len) .none else .unknown;
+    // Then the file's knob fills a gap, and only if the trials have not already moved past it. `.none` sits at
+    // the end of the list (reasonOffIndex), so "every candidate failed" is adopted like any other lesson.
+    if (e.q.reason_off == .unknown and q.reason_off != .unknown and reasonOffIndex(q.reason_off) >= e.q.reason_off_trial)
+        e.q.reason_off = q.reason_off;
 }
 
 /// Merge the durable store's parseable lines into the table (caller holds quirk_mtx). Best-effort by
@@ -2341,6 +2422,7 @@ fn loadQuirksLocked(io: std.Io) void {
             .reasoning_budget = p.value.reasoning_budget,
             .reasons = p.value.reasons,
             .reason_off = std.meta.stringToEnum(ReasonOff, p.value.reason_off) orelse .unknown,
+            .reason_off_trial = p.value.reason_off_trial,
         });
     }
 }
@@ -2361,11 +2443,16 @@ fn saveQuirksLocked(io: std.Io) void {
         out.appendSlice(gpa, "{\"model\":") catch return;
         jstr(gpa, &out, e.name[0..e.name_len]) catch return;
         var tail: [240]u8 = undefined;
-        const t = std.fmt.bufPrint(&tail, ",\"temp\":\"{s}\",\"temp_val\":{d},\"reasoning_echo\":{s},\"reasoning_budget\":{s},\"reasons\":{s},\"reason_off\":\"{s}\"}}\n", .{
-            @tagName(e.q.temp), e.q.temp_val, if (e.q.reasoning_echo) "true" else "false",
+        // The knob AND its trial cursor: `.none` is written as itself now (an older engine reading it falls back
+        // to .unknown, which is what it always saw), because "every candidate failed" is a lesson worth keeping.
+        const t = std.fmt.bufPrint(&tail, ",\"temp\":\"{s}\",\"temp_val\":{d},\"reasoning_echo\":{s},\"reasoning_budget\":{s},\"reasons\":{s},\"reason_off\":\"{s}\",\"reason_off_trial\":{d}}}\n", .{
+            @tagName(e.q.temp),
+            e.q.temp_val,
+            if (e.q.reasoning_echo) "true" else "false",
             if (e.q.reasoning_budget) "true" else "false",
             if (e.q.reasons) "true" else "false",
-            if (e.q.reason_off == .none) "unknown" else @tagName(e.q.reason_off),
+            @tagName(e.q.reason_off),
+            e.q.reason_off_trial,
         }) catch return;
         out.appendSlice(gpa, t) catch return;
     }
@@ -3392,7 +3479,8 @@ fn meterStream(st: *const StreamState, local: bool, at: Attrib) void {
     logCall(at.ts, at.tag, at.model, at.base, at.ms, st.p_in, st.p_cached, st.p_out);
 }
 
-/// STREAMING agentic step (chat only). Same request as complete() but "stream":true; curl streams the
+/// STREAMING agentic step (the answer, and the pre-answer passes whose reasoning the engine shows while they
+/// run). Same request as complete() but "stream":true; curl streams the
 /// response to a scratch file that we tail, firing on_delta(ctx, .content|.reasoning, chunk) for each delta
 /// and accumulating the full Step (content + reasoning + tool_calls). ANY failure — or a case we can't stream
 /// cleanly — FALLS BACK to complete(), and on_delta never fires. The returned Step is caller-owned
