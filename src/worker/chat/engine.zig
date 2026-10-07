@@ -63,6 +63,9 @@ const MAX_ITERS: usize = 24;
 /// Identical (call, result) repeats before the echo guard refuses that ONE signature. Module-level so the
 /// hard stop below can be checked against it — the two only work as a pair.
 const ECHO_LIMIT: u8 = 3;
+/// The same guard on a loopback base (the built-in engine, a local runtime): the second identical call with the
+/// identical result is already the proof, and a small model re-reading a page it holds only loses the window.
+const ECHO_LIMIT_LOCAL: u8 = 1;
 
 /// How many consecutive refusal-bearing INFERENCES end the turn outright (see `loop_refusals` in
 /// runInnerAgentic). The echo guard refuses one signature once it has returned the identical result 3
@@ -555,7 +558,7 @@ const SYSTEM_PROMPT_COMPACT =
     "tool call at a time. Do not try to delegate - you have no sub-agents; you are the one doing the work. If a " ++
     "tool errors, read the error and CHANGE something (arguments, tool, approach) - never repeat the identical " ++
     "call hoping for a different result.\n" ++
-    "run_python IS YOUR EXECUTOR - the DEFAULT whenever no other tool on the belt fits, because it is the only " ++
+    "run_python IS YOUR EXECUTOR - the DEFAULT whenever no other tool fits, because it is the only " ++
     "way you can execute anything at all. Real Python 3, real network: HTTP with your own headers/auth/POST " ++
     "body, APIs no dedicated tool covers, parsing, math, data and file work. Reach for it instead of telling " ++
     "the user something is impossible. Read the LAST line of a traceback - that is the actual error; a " ++
@@ -788,8 +791,11 @@ fn beltManifest(gpa: std.mem.Allocator, belt: []const u8) ?[]u8 {
         i = end;
     }
     if (count == 0) return null;
-    return std.fmt.allocPrint(gpa, "\nTOOLS ON THIS BELT ({d}): {s}. That line is the complete belt: a tool named on it EXISTS and is callable by exactly that name; a name not on it is not available this turn.\n" ++
-        "WON'T, NOT CAN'T. If you decide against doing something — judgment, caution, the user should do it themselves — say \"I won't\" and give the real reason. NEVER say a tool on the belt line is missing, and never go looking for a tool with list_dir (that lists FILES, it can tell you nothing about your belt). Claiming a listed tool is absent is a false statement about yourself, and it does not become true by repeating it.", .{ count, names.items }) catch null;
+    // "YOUR TOOLS", not "TOOLS ON THIS BELT": the belt is the engine's name for the tool array, and a small model
+    // served this line repeats the word to the user ("not something I know from this belt", five replies in one
+    // hello chat on the-veil-12b). The line says what it is in the user's words.
+    return std.fmt.allocPrint(gpa, "\nYOUR TOOLS ({d}): {s}. That line is the complete list: a tool named on it EXISTS and is callable by exactly that name; a name not on it is not available this turn.\n" ++
+        "WON'T, NOT CAN'T. If you decide against doing something — judgment, caution, the user should do it themselves — say \"I won't\" and give the real reason. NEVER say a tool on that list is missing, and never go looking for a tool with list_dir (that lists FILES, it can tell you nothing about your tools). Claiming a listed tool is absent is a false statement about yourself, and it does not become true by repeating it.", .{ count, names.items }) catch null;
 }
 
 /// A belt tool (or tool FAMILY, e.g. "browser") that `reply` claims not to have, or null. The manifest
@@ -1054,7 +1060,7 @@ test "belt manifest: names EVERY tool a compact belt serves, with a true count, 
         try std.testing.expect(count > 0);
         // the count in the header is the belt's true def count, not an approximation
         var head: [64]u8 = undefined;
-        const expect_head = try std.fmt.bufPrint(&head, "\nTOOLS ON THIS BELT ({d}): ", .{count});
+        const expect_head = try std.fmt.bufPrint(&head, "\nYOUR TOOLS ({d}): ", .{count});
         try std.testing.expect(std.mem.startsWith(u8, m, expect_head));
     }
 }
@@ -1081,7 +1087,9 @@ test "the-veil-12b is SERVED a manifest: model id -> small tier -> compact belt 
     // link 2: the belt that tier selects yields a manifest naming its exact tools
     const m = beltManifest(gpa, TURN_TOOLS_COMPACT) orelse return error.TestUnexpectedResult;
     defer gpa.free(m);
-    try std.testing.expect(std.mem.startsWith(u8, m, "\nTOOLS ON THIS BELT ("));
+    try std.testing.expect(std.mem.startsWith(u8, m, "\nYOUR TOOLS ("));
+    // the engine's own word for the tool array never reaches the model: a small model repeats it to the user
+    try std.testing.expect(std.mem.indexOf(u8, m, "belt") == null);
     for ([_][]const u8{ "read_file", "run_python", "web_search", "recall", "browser_navigate" }) |name| {
         try std.testing.expect(std.mem.indexOf(u8, m, name) != null);
     }
@@ -2571,10 +2579,15 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     // of guessed at (a GLM conversation folded 6 KB at a time for a morning before this line existed).
     {
         var tb: [220]u8 = undefined;
-        const local_coding = std.mem.indexOf(u8, trio.coding.base_url, "127.0.0.1") != null or std.mem.indexOf(u8, trio.coding.base_url, "localhost") != null;
-        const win_tok: usize = win_hint orelse @as(usize, modelcfg.senseModel(trio.coding.model, local_coding).ctx_k) * 1024;
+        // The SAME window the budget is sized from (windowOf): the built-in engine's live served window first,
+        // then the catalog, then the id heuristic. The line used to print the heuristic for the built-in engine
+        // ("8192 tokens (id heuristic)") while the budget below it was sized from the served 16384.
+        const wo = windowOf(trio.coding.base_url, trio.coding.model, win_hint);
+        const win_src: []const u8 = if (servingWindowTokens(trio.coding.base_url) != null) "served" else if (win_hint != null) "catalog" else "id heuristic";
         if (std.fmt.bufPrint(&tb, "context window {d} tokens ({s}); reasoning model: {s}; working span budget up to {d} KB", .{
-            win_tok,                                                                         @as([]const u8, if (win_hint != null) "catalog" else "id heuristic"), @as([]const u8, if (turn_reasoning) "yes" else "no"),
+            wo.tokens,
+            win_src,
+            @as([]const u8, if (turn_reasoning) "yes" else "no"),
             workingBudgetBytes(trio.coding.base_url, trio.coding.model, 0, win_hint) / 1024,
         })) |t| emitKV(app, conv_dir, "trace", "text", t) else |_| {}
     }
@@ -3053,7 +3066,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
                 defer corr.deinit(gpa);
                 corr.appendSlice(gpa, "BELT CORRECTION — your previous reply said you do not have `") catch return;
                 corr.appendSlice(gpa, denied) catch return;
-                corr.appendSlice(gpa, "`. That is factually wrong: it is on this turn's belt (see TOOLS ON THIS BELT above) and calling it by that exact name works. Do not repeat the claim or try to verify it with list_dir — that lists files, not tools. CALL IT NOW as your next action and read what comes back; if a missing LOGIN is what you actually meant, that is also wrong — the browser is the user's own, its sessions are already signed in, and where one is not you can ask for the credential and sign in yourself. If instead you are declining by judgment, say plainly \"I won't ...\" and give the real reason. Do not describe a choice as an inability.") catch return;
+                corr.appendSlice(gpa, "`. That is factually wrong: it is on this turn's tool list (see YOUR TOOLS above) and calling it by that exact name works. Do not repeat the claim or try to verify it with list_dir — that lists files, not tools. CALL IT NOW as your next action and read what comes back; if a missing LOGIN is what you actually meant, that is also wrong — the browser is the user's own, its sessions are already signed in, and where one is not you can ask for the credential and sign in yourself. If instead you are declining by judgment, say plainly \"I won't ...\" and give the real reason. Do not describe a choice as an inability.") catch return;
                 ws.bid(.correction, "belt-manifest", corr.items, 0.95, 0, 0);
             }
         }
@@ -3363,6 +3376,15 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     // next free-form step, and drive again until the plan/goal is done, a repeat, or the step cap. ----
     // `prev_drive` seeds the repeat guard with the user's own request so a driver that merely echoes it stops.
     var prev_drive: []u8 = gpa.dupe(u8, goal_text) catch &[_]u8{};
+    // LOCAL HARNESS MODE: a loopback base (the built-in engine, a local runtime) is a small model driven by this
+    // same loop, and the loop's failure modes look different there. The three local-only rules below (the loop
+    // arming, the picker echo guard, the echo limit in runInnerAgentic) are keyed on this and change nothing
+    // for a hosted base — the harness that runs inside Cloudflare is byte-for-byte the one it was.
+    const local_harness = isLocalBase(trio.coding.base_url);
+    // The head of the last committed answer, for the picker echo guard: a small picker asked for "the next
+    // step" after a greeting answered with the assistant's own line, which then came back as the user's words.
+    var last_answer_buf: [400]u8 = undefined;
+    var last_answer_len: usize = 0;
     defer if (prev_drive.len > 0) gpa.free(prev_drive);
 
     // POST-ANSWER CRITIQUE source: the turn's first substantial answer, HELD (not critiqued) here and reviewed
@@ -3385,7 +3407,12 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
 
     // AUTO-LOOP MODE (desk chat_loop / chat_loop_afk, now server-driven). A plan drives its own subtask budget; a
     // free-form turn drives DRIVE_MAX off, LOOP_MAX_STEPS armed-on, effectively-unbounded in afk (Stop is the exit).
-    const armed = loop >= LOOP_ON or goal_on; // a goal arms the loop whatever tier the client sent
+    // LOCAL HARNESS: tier 1 drives only an action-shaped message. The desk arms tier 1 on every send, and on the
+    // built-in 12B the picker asked for "the next step" after "hello" / "are you the veil?" answered in the
+    // assistant's own voice, which was posted as the user's message (c6ac66eea: five of ten replies answered
+    // steps nobody sent). A greeting or a question gets its one answer and stops; afk and a goal still arm
+    // whatever the shape, and a hosted base keeps the tier it was sent.
+    const armed = (loop >= LOOP_ON and (!local_harness or loop >= LOOP_AFK or actionShaped(goal_text))) or goal_on; // a goal arms the loop whatever tier the client sent
     // A goal that drives the turn decides the tier: a forever goal has afk's no-end-state rules, and a FINITE goal
     // keeps its finish line even when the client sent loop=afk (the desk arms afk for every /goal so the loop
     // carries across turns; afk's "DONE is never accepted" would otherwise make achieved unreachable).
@@ -3848,6 +3875,12 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
             gpa.free(answer);
             answer = clean;
         }
+        {
+            // The head of what the user is about to see, kept for the picker echo guard (local harness only).
+            const head = std.mem.trim(u8, answer, " \r\n\t");
+            last_answer_len = @min(head.len, last_answer_buf.len);
+            @memcpy(last_answer_buf[0..last_answer_len], head[0..last_answer_len]);
+        }
 
         // Strip a leaked CONTROL-TOKEN WRAPPER first: some models wrap the whole reply in their own sentinel
         // (`<DSML>…</DSML>`), which reaches the user as literal tag text. Bare wrappers only — tool-call markup
@@ -4246,7 +4279,16 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
                 emitKV(app, conv_dir, "status", "text", "recording the memory change the step picker named");
             }
         }
-        const is_done = loopIsDone(next.content) or mem_step_done;
+        // LOCAL HARNESS: a step in the assistant's own voice, or one that copies the last answer, is the small
+        // picker failing the question, not a step. Observed on the built-in 12B (c6ac66eea): after "are you the
+        // veil?" the picker wrote "There is no goal on this belt yet, tell me what you want", the engine posted
+        // it as the user's message, and the model answered a demand nobody made; after the tools question it
+        // wrote the assistant's own promise back and the model said "that's my own line back to me". Counted
+        // as DONE, so the turn ends on the answer the user actually got.
+        const picker_echo = local_harness and (assistantVoicedStep(trimmed) or
+            (last_answer_len > 0 and nearlySame(trimmed, last_answer_buf[0..last_answer_len])));
+        if (picker_echo) emitKV(app, conv_dir, "status", "text", "the step picker answered in the assistant's voice - nothing to drive, done");
+        const is_done = loopIsDone(next.content) or mem_step_done or picker_echo;
         const is_repeat = nearlySame(trimmed, prev_drive) or cctx.looksLikeToolMarkup(trimmed);
 
         // Choose the next synthetic drive step, or break, honoring: TERMINAL VERIFY (an armed loop never accepts a
@@ -10334,7 +10376,12 @@ fn runInnerAgentic(
             // One threshold now. The legitimate case is untouched: the guard keys on the RESULT hash, so a read
             // returning something different (the read-after-write cycle BUILD DISCIPLINE asks for) resets the
             // count and never trips this.
-            const echo_limit: u8 = ECHO_LIMIT;
+            // LOCAL HARNESS: one identical re-read is all a small model gets before the refusal. The built-in
+            // 12B read the same Twitter page four times (c6ac66eea), each read re-uploaded on every later
+            // inference and each one tipping the 21 KB working span into a fold that cost ~5 s, before the
+            // stock limit refused the fifth; the guard keys on the result hash, so a read that comes back
+            // different still resets the count and a hosted model keeps the allowance it had.
+            const echo_limit: u8 = if (isLocalBase(trio.coding.base_url)) ECHO_LIMIT_LOCAL else ECHO_LIMIT;
             const echo_blocked = echo_slot != null and echo_slot.?.count >= echo_limit;
             if (echo_blocked) echo_slot.?.count +|= 1;
             // STRIKE MARK (resolved per ITERATION at the batch end — see loop_refusals above): an
@@ -11759,6 +11806,56 @@ fn drainChatControl(app: *App, conv_dir: []const u8, cursor: *usize, buf: *std.A
     }
     cursor.* += tail.len;
     return .none;
+}
+
+/// A drive step that is the assistant talking to the user instead of an instruction to the assistant. The picker
+/// is asked for "the single next concrete step"; a small model given a greeting answers the way the assistant
+/// would ("there is no goal yet, tell me what you want", "I'll list them for you"), and posted as a user turn
+/// that reads as the user demanding the assistant's own line back. A heuristic over the head of the step, used
+/// on the local harness only (see picker_echo); a real step is an imperative and never opens this way.
+fn assistantVoicedStep(step: []const u8) bool {
+    var buf: [160]u8 = undefined;
+    const n = @min(step.len, buf.len);
+    for (step[0..n], 0..) |c, i| buf[i] = std.ascii.toLower(c);
+    const low = std.mem.trimStart(u8, buf[0..n], " \t\"'(");
+    const openers = [_][]const u8{
+        "i'll ",
+        "i will ",
+        "i can ",
+        "i can't ",
+        "i cannot ",
+        "i don't ",
+        "i'm ",
+        "i am ",
+        "there is no goal",
+        "there's no goal",
+        "no goal has",
+        "tell me what you",
+        "how can i help",
+        "what can i do for you",
+        "sure, ",
+        "sure! ",
+        "okay, i",
+        "ok, i",
+    };
+    for (openers) |o| if (std.mem.startsWith(u8, low, o)) return true;
+    return std.mem.indexOf(u8, low, "tell me what you want") != null or std.mem.indexOf(u8, low, "how can i help") != null;
+}
+
+test "assistantVoicedStep: the picker's own-voice replies are caught, real steps and DONE are not" {
+    // the three steps the built-in 12B produced on the hello chat (c6ac66eea), verbatim heads
+    try std.testing.expect(assistantVoicedStep("There is no goal on this belt -- no goal has been stated yet. Tell me what you want"));
+    try std.testing.expect(assistantVoicedStep("That goal has no preceding conversation, so there's nothing to complete -- I can't help. Tell me what you want to do."));
+    try std.testing.expect(assistantVoicedStep("I'll list them for you."));
+    try std.testing.expect(assistantVoicedStep("\"I'm not sure what you're looking for\""));
+    // instructions a picker is supposed to write
+    try std.testing.expect(!assistantVoicedStep("Write the count to stats/answer.txt and run the tests."));
+    try std.testing.expect(!assistantVoicedStep("Read notes/a.md, then fix the import in app.py."));
+    try std.testing.expect(!assistantVoicedStep("continue"));
+    try std.testing.expect(!assistantVoicedStep("DONE"));
+    try std.testing.expect(!assistantVoicedStep(""));
+    // the local-only echo allowance is a real allowance, and never looser than the hosted one
+    try std.testing.expect(ECHO_LIMIT_LOCAL >= 1 and ECHO_LIMIT_LOCAL <= ECHO_LIMIT);
 }
 
 /// The drive is DONE when the inference's next-step text is exactly a terminal token (desk loopIsDone): trim the
