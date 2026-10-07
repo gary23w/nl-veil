@@ -1870,6 +1870,10 @@ pub const Chat = struct {
             defer if (resp.body.len > 0) self.gpa.free(resp.body);
             log.info("server chat: POST -> status={d}", .{resp.status});
             handled = resp.status == 200 or resp.status == 201 or resp.status == 202;
+            // 409 = THIS conversation already has a turn running that the desk lost sight of. The words go INTO
+            // that turn (steerIntoLiveTurn); a true means the poller below watches it exactly as a turn this send
+            // had fired — from0 was baselined before the POST, so only the live turn's new frames stream in.
+            if (!handled and resp.status == 409) handled = self.steerIntoLiveTurn(conv, text);
         } else {
             log.warn("server chat: POST returned null — checking whether the turn completed anyway", .{});
             handled = self.serverTurnDone(conv, from0);
@@ -1905,9 +1909,46 @@ pub const Chat = struct {
         // every send while the backend is down/misconfigured), and return false so cmdSend runs the local path.
         self.setBusy(false);
         self.setStatus("");
-        self.sc_cooldown_until = self.nowS() + SC_COOLDOWN_S;
-        log.info("server chat: unavailable — falling back to the local engine (cooldown {d}s)", .{SC_COOLDOWN_S});
+        // No cooldown when there is no engine of the desk's own to fall back TO (the server's "cloudflare"
+        // sentinel base — see baseIsServerSentinel): 45 s of sends routed straight into that dead end would be
+        // 45 s of lost messages. The next send asks the server again instead.
+        if (!baseIsServerSentinel(prov.base_url)) self.sc_cooldown_until = self.nowS() + SC_COOLDOWN_S;
+        log.info("server chat: unavailable — falling back to the local engine (cooldown {d}s)", .{if (baseIsServerSentinel(prov.base_url)) @as(i64, 0) else SC_COOLDOWN_S});
         return false;
+    }
+
+    /// A 409 on send means THIS conversation already has a turn running (service.zig: conv_busy; the slot limits
+    /// answer 429) that the desk lost sight of — a restart, or the turn was backgrounded. The words the user just
+    /// typed belong INSIDE that turn, exactly as Enter does while a served turn is visibly live (cmdSteerTurn),
+    /// not in a second brain started beside it: on the Cloudflare login the desk has no brain of its own (see the
+    /// sentinel guard in startTurn), so the old local fallback died in 2 s and the message was lost — measured
+    /// 2026-10-06 21:56 UTC. True when the running turn will consume the steer (the caller then watches the turn
+    /// as if it had fired it). False when the turn ended in between (the send path falls through as before) or
+    /// the control POST never completed (the text is still the user's — say so, never claim it was folded in).
+    fn steerIntoLiveTurn(self: *Chat, conv: []const u8, text: []const u8) bool {
+        const txt = std.mem.trim(u8, text, " \r\n\t");
+        if (txt.len == 0) return false;
+        const cap = txt.len * 2 + 32;
+        const body = self.gpa.alloc(u8, cap) catch return false;
+        defer self.gpa.free(body);
+        var w = Io.Writer.fixed(body);
+        w.writeAll("{\"op\":\"steer\",\"text\":\"") catch return false;
+        wesc(&w, txt);
+        w.writeAll("\"}") catch return false;
+        const r = self.runner().chatControl(self.io, self.gpa, conv, w.buffered()) orelse {
+            self.store.pushNotif("Steer failed", "a turn is already running here and the desk could not reach it; your text was not sent", 3);
+            return false;
+        };
+        defer if (r.body.len > 0) self.gpa.free(r.body);
+        // No "live" field = a server older than that contract; it accepted the op, so assume it lands.
+        const live = r.status >= 200 and r.status < 300 and (jBool(r.body, "live") orelse true);
+        if (live) {
+            log.info("server chat: 409 — a turn is already running for {s}; the message was steered into it", .{conv[0..@min(conv.len, 48)]});
+            self.setStatus("a turn was already running here — your message was folded into it");
+        } else {
+            log.info("server chat: 409 but the running turn will not consume a steer — sending as a fresh turn", .{});
+        }
+        return live;
     }
 
     /// One cheap poll: does the conv's events.jsonl carry a {"kind":"done"} frame past byte offset `from`? Detects
@@ -6140,6 +6181,14 @@ pub const Chat = struct {
         return self.resolveProviderFor(.coding, base_buf, key_buf, model_buf);
     }
 
+    /// The "cloudflare" base catalog.resolveBase hands out when no account id is set is a SERVER-side address:
+    /// it tells the server to use its own Workers AI login, and it is no URL at all — the desk's curl has nothing
+    /// to dial. Measured 2026-10-06: every local call made on it died in 2-3 s as HTTP 000 ("could not reach the
+    /// model endpoint"). True when the desk has no engine of its own behind `base`.
+    fn baseIsServerSentinel(base: []const u8) bool {
+        return std.mem.eql(u8, base, "cloudflare");
+    }
+
     /// Resolve ONE trio role into an llm.Provider{base_url,key,model}. The base chat_* fields ARE the coding role
     /// (and every role when chat_unified). A thinking/prompting role that is explicitly configured (set + a model)
     /// overrides; otherwise it FALLS BACK to the coding/base provider — so "use one model for all three" and an
@@ -6262,6 +6311,38 @@ pub const Chat = struct {
             else => .coding,
         };
         const prov = self.resolveProviderFor(turn_role, &bb, &kb, &mb);
+        if (baseIsServerSentinel(prov.base_url)) {
+            // Nothing below can succeed: the sentinel is the server's address, not a URL. Measured 2026-10-06: the
+            // call died in 2-3 s as "could not reach the model endpoint", the transient-death retry re-ran it once,
+            // and the local auto-loop then re-ran it sixteen times in a row (16:42 UTC). Say what is true, once,
+            // and stand down. turn is .idle here (every caller settles it before re-entry); busy may be set.
+            self.turn = .idle;
+            self.setBusy(false);
+            self.setStatus("");
+            switch (kind) {
+                .loop_infer => {
+                    // The server drives its own loop while it serves a turn (loop_mode rides in the send body); this
+                    // local drive step only runs once that loop has ended. It cannot run here, so the toggle goes
+                    // off instead of re-arming the same dead call every frame — afk included, which would otherwise
+                    // absorb a quiet stop (stopLoopQuiet) and spin.
+                    {
+                        self.store.lock();
+                        defer self.store.unlock();
+                        self.store.chat_loop = false;
+                        self.store.chat_loop_afk = false;
+                    }
+                    self.appendMsg(dd, .cast_note, "(auto-loop: the desk cannot drive the loop by itself on the Cloudflare login — the server brain drives the loop while it serves a turn; send the next step as a message)");
+                    log.info("local engine: the base is the server's cloudflare sentinel — the local auto-loop stands down", .{});
+                },
+                .user, .tool_follow => {
+                    self.appendMsg(dd, .veil, "(the desk has no model endpoint of its own on the Cloudflare login — the server brain answers chat, and it did not take this message; try again in a moment)");
+                    self.store.pushNotif("Server brain unavailable", "the server did not take the message, and the desk cannot call Workers AI by itself — try again in a moment", 2);
+                    log.warn("local engine: the base is the server's cloudflare sentinel — the local turn is refused instead of dialing it", .{});
+                },
+                else => log.info("local engine: the base is the server's cloudflare sentinel — a {s} turn is skipped", .{@tagName(kind)}),
+            }
+            return;
+        }
         const tier = senseTier(prov);
         const tb = budgetFor(tier);
         var msgs: std.ArrayListUnmanaged(u8) = .empty;
@@ -14180,6 +14261,16 @@ test "castProviderId routes a cast to the chat's configured backend (local vs BY
         const i = idxOf(key) orelse continue; // a provider the catalog no longer ships is not a failure
         try std.testing.expectEqualStrings(key, castProviderId(1, i));
     }
+}
+
+test "the cloudflare sentinel base is the server's address, never an endpoint the desk can dial" {
+    // 2026-10-06: with no account id the local engine resolved to the bare word, posted to
+    // "cloudflare/chat/completions" and died in 2 s, twice per turn, sixteen turns in a row. The guard in
+    // startTurn keys on this exact value; a real Workers AI URL or a local runtime must never trip it.
+    try std.testing.expect(Chat.baseIsServerSentinel("cloudflare"));
+    try std.testing.expect(!Chat.baseIsServerSentinel("https://api.cloudflare.com/client/v4/accounts/abc123/ai/v1"));
+    try std.testing.expect(!Chat.baseIsServerSentinel("http://127.0.0.1:11434/v1"));
+    try std.testing.expect(!Chat.baseIsServerSentinel(""));
 }
 
 test "resolveBase substitutes the Cloudflare {account}, falls back to the sentinel, and passes others through" {

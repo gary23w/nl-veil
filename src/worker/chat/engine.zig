@@ -3258,7 +3258,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
             const evidence = if (fast or envDisabled(environ, "NL_CHAT_RECON"))
                 null
             else
-                reconFindings(app, llm_dir, think, &ctx, user_text, ground.items);
+                reconFindings(app, llm_dir, conv_dir, ctrl_cursor, think, &ctx, user_text, ground.items);
             defer if (evidence) |e| gpa.free(e);
 
             var ev: std.ArrayListUnmanaged(u8) = .empty;
@@ -3266,7 +3266,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
             if (ground.items.len > 0) ev.appendSlice(gpa, ground.items) catch {};
             if (evidence) |e| ev.appendSlice(gpa, e) catch {};
 
-            const fresh = planTask(app, llm_dir, think.base_url, think.key, think.model, user_text, ev.items, &brief);
+            const fresh = planTask(app, llm_dir, conv_dir, ctrl_cursor, think.base_url, think.key, think.model, user_text, ev.items, &brief);
             if (fresh.len > 0) {
                 // SMALL-tier turns keep every subtask INLINE. A hive route hands a small model the hardest
                 // orchestration surface there is — observed live on a 12B: the plan said "(hive)", the drive
@@ -6182,6 +6182,20 @@ fn streamShouldAbort(cx: *anyopaque) bool {
     return stopRequestedSince(sc.app, sc.conv_dir, sc.ctrl_cursor);
 }
 
+/// What a PRE-ANSWER pass (recon, plan) hands completeStream. Its reasoning deltas ride to the client through
+/// streamOnDelta's accumulator as the same `{"kind":"reasoning"}` frames the answer's do, so the chat shows the
+/// model thinking while the status line says "surveying before planning" instead of a blank pane. Its CONTENT
+/// is dropped here on purpose: a probe list or a plan board is the pass's own output, parsed by the caller, and
+/// a `token` frame of it would type into the desk's reply preview as if it were the answer. The first byte of
+/// either kind still stamps fb_ms, because the provider started generating either way.
+fn auxReasoningOnDelta(cx: *anyopaque, kind: llm.DeltaKind, text: []const u8) void {
+    if (text.len == 0) return;
+    const sc: *StreamCtx = @ptrCast(@alignCast(cx));
+    if (sc.fb_ms == 0) sc.fb_ms = nowMillis(sc.app.io);
+    if (kind != .reasoning) return;
+    streamOnDelta(cx, kind, text);
+}
+
 /// llm.completeStream fires this per delta. We ACCUMULATE into a small buffer and emit a `{"kind":"token"|
 /// "reasoning","delta":…}` frame only every ~FLUSH_CHARS (or when the buffer fills) — the reply still types out,
 /// but at a sane frame rate. The chunk is borrowed (valid only during this call); scAccum copies it immediately.
@@ -6619,7 +6633,7 @@ test "shouldPlan: a task marker matches at a word start, never inside one" {
 /// list_dir/read_file answer identically; for a hosted server with a remote client they would describe the
 /// server's tree, not the user's. Delegating recon would put a client round trip ahead of time-to-first-token
 /// on every planned turn — deliberately not paid until a remote-client case actually needs it.
-fn reconFindings(app: *App, run_root: []const u8, p: Provider, ctx: *tools.ToolCtx, user_text: []const u8, ground: []const u8) ?[]u8 {
+fn reconFindings(app: *App, run_root: []const u8, conv_dir: []const u8, ctrl_cursor: usize, p: Provider, ctx: *tools.ToolCtx, user_text: []const u8, ground: []const u8) ?[]u8 {
     const gpa = app.gpa;
     var msgs: std.ArrayListUnmanaged(u8) = .empty;
     defer msgs.deinit(gpa);
@@ -6639,10 +6653,19 @@ fn reconFindings(app: *App, run_root: []const u8, p: Provider, ctx: *tools.ToolC
     http.jstr(gpa, &msgs, uc.items) catch return null;
     msgs.append(gpa, '}') catch return null;
 
-    const cm = meterBegin(app.io);
+    // STREAMED, reasoning only (auxReasoningOnDelta). The survey is the first inference of a planned turn and
+    // used to be silent for its whole length: the chat showed nothing under "surveying before planning (15s)"
+    // while the model was thinking in its reasoning channel the entire time. That thinking now types into the
+    // chat exactly as the answer's does; the probe list itself stays here, parsed below, never a reply to watch.
+    var sctx = StreamCtx{ .app = app, .conv_dir = conv_dir, .ctrl_cursor = ctrl_cursor };
+    var cm = meterBegin(app.io);
     announcePhase(app, "recon");
-    var step = llm.complete(gpa, app.io, run_root, "recon", p.base_url, p.key, p.model, msgs.items, "", 512, 0.2);
+    var step = llm.completeStream(gpa, app.io, run_root, "recon", p.base_url, p.key, p.model, msgs.items, "", 512, 0.2, &sctx, auxReasoningOnDelta, streamShouldAbort);
     defer step.deinit(gpa);
+    streamFlush(&sctx);
+    // A backend that did not stream (completeStream fell back to complete()) still shows its thinking once.
+    if (!sctx.streamed and step.reasoning.len > 0) emitKV(app, conv_dir, "reasoning", "delta", clipBytes(step.reasoning, 4000));
+    cm.fb_ms = sctx.fb_ms;
     meterEnd(app, cm, "recon", .thinking, p.model, step.ok);
     if (!step.ok) return null;
 
@@ -6772,7 +6795,7 @@ fn courseVerdict(content: []const u8) ?[]const u8 {
 /// `evidence` is what recon actually saw (empty when it looked at nothing). It goes in BEFORE the instruction
 /// so the decomposition is written against the real project rather than an imagined one — the whole point of
 /// the recon rung above.
-fn planTask(app: *App, run_root: []const u8, base_url: []const u8, key: []const u8, model: []const u8, user_text: []const u8, evidence: []const u8, out_brief: *cplan.Brief) []cplan.Task {
+fn planTask(app: *App, run_root: []const u8, conv_dir: []const u8, ctrl_cursor: usize, base_url: []const u8, key: []const u8, model: []const u8, user_text: []const u8, evidence: []const u8, out_brief: *cplan.Brief) []cplan.Task {
     const gpa = app.gpa;
     const empty: []cplan.Task = &.{};
     var msgs: std.ArrayListUnmanaged(u8) = .empty;
@@ -6794,10 +6817,16 @@ fn planTask(app: *App, run_root: []const u8, base_url: []const u8, key: []const 
     // cap is a ceiling, not a target (the model stops at the closing brace); it is raised only so a long plan
     // can't get truncated mid-JSON, which extractJsonObject would hand to the parser as an unbalanced object and
     // the whole board would come back empty.
-    const plan_cm = meterBegin(app.io);
+    // STREAMED, reasoning only, for the same reason reconFindings is: "planning the work" was a silent stretch
+    // too, and the thinking behind the board is worth watching. The board itself is parsed below, never streamed.
+    var sctx = StreamCtx{ .app = app, .conv_dir = conv_dir, .ctrl_cursor = ctrl_cursor };
+    var plan_cm = meterBegin(app.io);
     announcePhase(app, "plan");
-    var step = llm.complete(gpa, app.io, run_root, "plan", base_url, key, model, msgs.items, "", 1536, 0.3);
+    var step = llm.completeStream(gpa, app.io, run_root, "plan", base_url, key, model, msgs.items, "", 1536, 0.3, &sctx, auxReasoningOnDelta, streamShouldAbort);
     defer step.deinit(gpa);
+    streamFlush(&sctx);
+    if (!sctx.streamed and step.reasoning.len > 0) emitKV(app, conv_dir, "reasoning", "delta", clipBytes(step.reasoning, 4000));
+    plan_cm.fb_ms = sctx.fb_ms;
     meterEnd(app, plan_cm, "plan", .thinking, model, step.ok);
     if (!step.ok) return empty;
     const obj = extractJsonObject(step.content);
@@ -10061,8 +10090,8 @@ fn runInnerAgentic(
         // boundary, so the `llm` frame has to land where one genuinely is — past the tail of this reply, not
         // interleaved into it. (It is the last thing this inference emits either way.)
         //
-        // This assignment is what makes this — the ONLY streaming call of the ten — eligible to report
-        // `streamed:true`. It stays 0, and the frame stays false, when completeStream fell back to a blocking
+        // This assignment is what makes this — one of the three streaming calls, beside the recon and plan passes
+        // that stream their reasoning — eligible to report `streamed:true`. It stays 0, and the frame stays false, when completeStream fell back to a blocking
         // complete() or the reply carried no deltas at all: in either case there is no first byte we observed.
         chat_cm.fb_ms = sctx.fb_ms;
         meterEnd(app, chat_cm, "chat", .coding, model, step.ok);
@@ -12302,10 +12331,30 @@ fn turnHandoff(app: *App, run_root: []const u8, base_url: []const u8, key: []con
     // silently drops a row it cannot parse. Unscrubbed, one bad byte would delete the handoff AND the stop note
     // it rides in, leaving the next turn with strictly less than it has today.
     scrubUtf8(step.content);
-    const t = std.mem.trim(u8, step.content, " \r\n\t");
+    scrubUtf8(step.reasoning);
+    var t = std.mem.trim(u8, step.content, " \r\n\t");
+    // An empty content beside a reasoning channel is the state written in the wrong channel, not no state.
+    if (t.len < 24 and step.reasoning.len > 0) t = handoffFromReasoning(step.reasoning);
     // A degenerate or markup "continuation state" continues nothing and costs a replay slot on every later turn.
     if (t.len < 24 or cctx.looksLikeToolMarkup(t)) return null;
     return gpa.dupe(u8, clipBytes(t, HANDOFF_MAX_BYTES)) catch null;
+}
+
+/// The continuation state from a reply whose CONTENT came back empty. Some servings answer an auxiliary call
+/// entirely in the reasoning channel: measured 2026-10-05/06 on Workers AI glm-5.3-flash under the thinking-off
+/// template knob, 6 of 6 handoff replies had content "" and the labelled state inside `reasoning`, so every one
+/// of those turns committed the bare stop note and the next turn restarted from nothing. The knob is retired on
+/// that evidence now (llm.observeReasonOff), but the reply in hand is still worth reading. The state is the LAST
+/// draft in that channel: a model that thinks first restates the labels when it finally writes them, so the
+/// slice starts at the last ESTABLISHED (or, when that label is absent, the last of the next label in the
+/// writer's order) and runs to the end. A channel with no label at all comes back whole, trimmed, for the
+/// caller's length and markup checks.
+fn handoffFromReasoning(reasoning: []const u8) []const u8 {
+    const t = std.mem.trim(u8, reasoning, " \r\n\t");
+    for ([_][]const u8{ "ESTABLISHED", "ON DISK", "RULED OUT", "NEXT" }) |label| {
+        if (std.mem.lastIndexOf(u8, t, label)) |at| return t[at..];
+    }
+    return t;
 }
 
 /// Merge the engine's stop note and the cut turn's continuation state into the ONE role:"system"/kind:"engine"
@@ -12592,6 +12641,24 @@ test "a failed handoff writes byte-for-byte today's row, and a good one only eve
     try std.testing.expect(std.mem.indexOf(u8, HANDOFF_HEADER, "written by the engine") != null);
     try std.testing.expect(std.mem.indexOf(u8, HANDOFF_HEADER, "RULED OUT") != null);
     try std.testing.expect(std.mem.indexOf(u8, HANDOFF_HEADER, "NEXT") != null);
+}
+
+test "a continuation state written into the reasoning channel is still read, from its last draft" {
+    // 2026-10-06, Workers AI glm-5.3-flash: 6 of 6 handoff replies had content "" and the labelled state inside
+    // `reasoning`, so every one of those turns committed the bare stop note and the next turn restarted from
+    // nothing. The channel is read when content is empty, and the LAST draft wins: a thinking model restates
+    // the labels when it finally writes them.
+    const one = "Let me write the continuation state. Under 180 words.\n\nESTABLISHED: clone succeeded (exit 0).\nON DISK: notes/a.md\nNEXT: write notes/b.md.";
+    const got = handoffFromReasoning(one);
+    try std.testing.expect(std.mem.startsWith(u8, got, "ESTABLISHED: clone succeeded"));
+    try std.testing.expect(std.mem.endsWith(u8, got, "write notes/b.md."));
+    const two = "Draft: ESTABLISHED: x\nNEXT: y\n\nThat is too long, again:\nESTABLISHED: clone succeeded.\nNEXT: write notes/b.md.\n";
+    try std.testing.expectEqualStrings("ESTABLISHED: clone succeeded.\nNEXT: write notes/b.md.", handoffFromReasoning(two));
+    // a draft that omits ESTABLISHED (allowed) starts at the first label it does carry
+    const partial = "thinking...\nON DISK: notes/a.md (2 KB)\nNEXT: run the check.";
+    try std.testing.expectEqualStrings("ON DISK: notes/a.md (2 KB)\nNEXT: run the check.", handoffFromReasoning(partial));
+    // no label at all: the whole channel, trimmed, for the caller's length/markup checks
+    try std.testing.expectEqualStrings("just thinking out loud", handoffFromReasoning("  just thinking out loud \n"));
 }
 
 test "a fused handoff rides the ENGINE row, so a streak of cut turns still replays exactly one" {
@@ -13252,6 +13319,24 @@ test "every AUXILIARY completion bounds its prompt — only the real turn sends 
     // ...and the streamed turn DOES still send the whole transcript. If this ever stops being true the
     // rule above has been satisfied by crippling the actual conversation, which is not the intent.
     try std.testing.expect(std.mem.indexOf(u8, SRC, "completeStream(") != null);
+
+    // The pre-answer passes stream too (recon, plan: their THINKING types into the chat), and the rule holds
+    // for them unchanged: a bounded prompt, and only the answer's call may carry conv_buf. They also hand the
+    // stream auxReasoningOnDelta, never streamOnDelta — their content is a probe list or a plan board, parsed by
+    // the caller, and a `token` frame of it would type into the reply preview as if it were the answer.
+    const sneedle = "llm" ++ ".completeStream(";
+    var j: usize = 0;
+    var aux_streams: usize = 0;
+    while (std.mem.indexOfPos(u8, SRC, j, sneedle)) |at| {
+        const eol = std.mem.indexOfScalarPos(u8, SRC, at, '\n') orelse SRC.len;
+        const call = SRC[at..eol];
+        j = at + sneedle.len;
+        if (std.mem.indexOf(u8, call, "\"chat\"") != null) continue;
+        aux_streams += 1;
+        try std.testing.expect(std.mem.indexOf(u8, call, "conv_buf.items") == null);
+        try std.testing.expect(std.mem.indexOf(u8, call, "auxReasoningOnDelta") != null);
+    }
+    try std.testing.expect(aux_streams >= 2);
 }
 
 /// The subtask numbers a planrec reply marks complete, from "done: 1, 2". Returns a slice of `out`.
