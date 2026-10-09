@@ -783,6 +783,9 @@ pub fn main(init: std.process.Init) !void {
     router.post("/api/v1/tots/pad/clear", cf_tot.padClear, .{});
     router.post("/api/v1/tots/keys", cf_tot.setKey, .{});
     router.post("/api/v1/tots/limit", cf_tot.setLimit, .{});
+    router.get("/api/v1/tots/garrett", cf_tot.garrettStatus, .{});
+    router.post("/api/v1/tots/garrett", cf_tot.garrettLaunch, .{});
+    router.delete("/api/v1/tots/garrett", cf_tot.garrettRemove, .{});
     router.get("/api/v1/tots/runs", cf_tot.listRuns, .{});
     router.get("/api/v1/tots/runs/:run/events", cf_tot.runEvents, .{});
     router.delete("/api/v1/tots/runs/:run", cf_tot.deleteRun, .{});

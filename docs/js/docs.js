@@ -20,7 +20,8 @@
       { p: 'guide/themes', c: 'GD-06', t: 'Authoring a theme — the 16 palette slots, mono_ui, the workspace', s: 'plug/theme.zig' },
       { p: 'guide/plugins', c: 'GD-07', t: 'Writing a plugin — tools, policy + prompt hooks, MCP, the sandbox', s: 'plug/plugins.zig · plug/lua.zig' },
       { p: 'guide/desktop', c: 'GD-09', t: 'Desktop guide — settings, progress, streaming and code', s: 'desk/main.zig' },
-      { p: 'guide/updates', c: 'GD-08', t: 'Desktop updates — releases, recovery and Cloudflare connectivity', s: 'updater.zig · cf_tunnel.zig' }
+      { p: 'guide/updates', c: 'GD-08', t: 'Desktop updates — releases, recovery and Cloudflare connectivity', s: 'updater.zig · cf_tunnel.zig' },
+      { p: 'guide/day-after', c: 'GD-10', t: 'The day after — arming tater-tots for an AI incident: the guard, the evidence chain, DEFEND, the leash, Agent Garrett', s: 'cloud/tot.js · cf_tot.zig' }
     ]},
     { key: 'admin/', label: 'ADMIN — SYSTEM MANAGEMENT', docs: [
       { p: 'admin/admin_service', c: 'AD-01', t: 'Admin service — god-mode handlers, every action audited', s: 'admin_service.zig' }

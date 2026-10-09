@@ -334,6 +334,8 @@ pub fn parseTot(gpa: std.mem.Allocator, body: []const u8) ?Row {
 fn consoleKind(kind: []const u8, outcome: []const u8) []const u8 {
     if (std.mem.eql(u8, kind, "verdict")) return if (std.mem.eql(u8, outcome, "improved")) "score" else if (std.mem.eql(u8, outcome, "regressed")) "stopped" else "cost";
     if (std.mem.eql(u8, kind, "error")) return "stopped";
+    // the guard: a tripped or changed target reads red, a recovered one and a first look that is fine read green
+    if (std.mem.eql(u8, kind, "tripwire") or std.mem.eql(u8, kind, "guard")) return if (std.mem.eql(u8, outcome, "ok")) "score" else "stopped";
     if (std.mem.eql(u8, kind, "goal") or std.mem.eql(u8, kind, "say")) return "goal";
     if (std.mem.eql(u8, kind, "human") or std.mem.eql(u8, kind, "reply") or std.mem.eql(u8, kind, "inbox")) return "tick";
     if (std.mem.eql(u8, kind, "lesson")) return "cost";
@@ -484,6 +486,12 @@ test "tots: the event tail appends only what is new, keeps the newest when full,
     try tt.expectEqual(@as(u64, 6), evs[3].seq);
     try tt.expectEqualStrings("stopped", evs[1].kindStr()); // an error reads red
     try tt.expectEqual(@as(usize, 4), appendEvents(tt.allocator, "not json", &evs, n, &last));
+    // the guard: a tripped or changed target reads red, a recovery and a first look that is fine read green
+    try tt.expectEqualStrings("stopped", consoleKind("tripwire", "tripped"));
+    try tt.expectEqualStrings("stopped", consoleKind("tripwire", "changed"));
+    try tt.expectEqualStrings("score", consoleKind("tripwire", "ok"));
+    try tt.expectEqualStrings("score", consoleKind("guard", "ok"));
+    try tt.expectEqualStrings("stopped", consoleKind("guard", "tripped"));
 }
 
 test "tots: a deployment body round-trips through a real parser, whatever the goal text holds" {

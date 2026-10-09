@@ -34,7 +34,7 @@ The Tater-tots tab (drawn in `main.zig`) shows the account's tater-tots against 
 - Names, states and the goal line are stored as one line (line breaks and tabs become spaces); event and scratchpad text keep their line breaks, because the tab wraps them (`totWrapNext` in main.zig). Every cut lands on a UTF-8 boundary.
 - The bodies are written by `std.json`, and a test reads one back through a strict parser: text inside a goal cannot add a field, so it cannot grant the owner's machine.
 - An event's `brief` is the runtime's one line for it (for a tool call: the tool, its first argument, the first line of its result); an older runtime sends none and the text's first line stands in. `ok` false marks a row that went wrong, whether the runtime said so or the line shows `-> ERROR` / `-> FAILED`. `hasMore` says whether opening the row shows more than the brief.
-- Event kinds borrow the swarm console's colours by meaning: an improving verdict reads as a score, an error as a stop, a human's message as a tick.
+- Event kinds borrow the swarm console's colours by meaning: an improving verdict reads as a score, an error as a stop, a human's message as a tick. The guard's rows (`guard`, the first look at a target; `tripwire`, a change) read green when their outcome is `ok` (a target up, a recovery) and red otherwise (tripped, changed).
 
 ---
 

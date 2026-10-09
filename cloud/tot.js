@@ -37,12 +37,31 @@
 // status, notes) and the shared scratchpad beside them. Counters here (seq, notes_rev, the pad's seq) let it
 // ask only for what changed.
 //
+// THE DAY-AFTER KIT (docs/docs-src/guide/day-after.md): what a tot does when the model is gone, the lab is quiet
+// and attribution is the fight.
+//   THE GUARD (/guard, Tot.guard): targets the owner names - a page, with words it must show, a status it must
+//   answer, or its content pinned; a DNS name's answers by record type - looked at EVERY heartbeat BEFORE the
+//   model is asked and without one, so the watch goes on through a dead, rate-limited or withdrawn model and
+//   through a spent daily budget. A change of state is a TRIPWIRE: a chained event, a scratchpad entry every
+//   tot reads, a directive in this tot's inbox (its next iteration is brought forward), and - with the ALERT_URL
+//   secret - one JSON POST a Discord or Slack webhook renders as it is.
+//   THE EVIDENCE CHAIN (emit, chainHash): every event's hash covers the one before it, so the mirrored
+//   events.jsonl on the owner's machine is tamper-evident on its own; `veil --tater verify <run>` recomputes it.
+//   POSTURE DEFEND (/posture): the runtime is frozen (runtime_edit/deploy refused), a bot check is reported and
+//   not worked through, every request names the tot (guardUa) and the prompt holds it to read-only verification.
+//   THE LEASH (/leash): no contact from the owner's veil for leash_s holds the goal loop (the guard goes on) until
+//   any call from it arrives. A tot never runs on with nobody's veil alive.
+//   AGENT GARRETT (garrett, garrett_tools, garrett_launch): github.com/gary23w/garrettstimpson.ca/agent, a second
+//   Worker the veil server launches into the account on request (the pad's /garrett/* state) and the tots reach
+//   over its stateless MCP endpoint under the GARRETT_MCP_URL / GARRETT_MCP_TOKEN secrets: CVE/KEV/EPSS intel,
+//   DNS and certificate transparency, RDAP, email security posture, IOC extraction, evidence manifests, and more.
+//
 // Every route needs `Authorization: Bearer <TOT_TOKEN>` (a secret binding the veil server generates at deploy).
 //
 // No imports and no platform globals beyond fetch/Response/crypto, so cloud/tot.test.mjs runs the whole file
 // under node with a Map for storage and a scripted model.
 
-export const VERSION = "7";
+export const VERSION = "8";
 // How many tots an account may run: 24 unless the owner sets another, up to MAX_TOTS_CEIL. What an account can
 // really carry is its Cloudflare plan's to say: every tot is a Durable Object that wakes every few seconds.
 export const DEFAULT_MAX_TOTS = 24;
@@ -70,10 +89,21 @@ const TICK_WALL_MS = 8 * 60 * 1000; // an alarm stops starting new model calls a
 const EVENTS_KEEP = 1500;
 const PAD_KEEP = 200;
 const LESSONS_MAX = 12;
+const ENDED_GOALS_CONTEXT = 64;
 const INBOX_MAX = 24;
 const JOBS_PENDING_MAX = 4;
 const ROAM_BACKOFF_MAX_S = 6 * 3600;
 const NOTES_PAGE = 600000; // bytes of note text one /notes answer carries (the server reads at most 1 MiB)
+// THE GUARD: targets a tot watches every heartbeat WITHOUT a model (see Tot.guard), so the watch goes on when the
+// model is gone. Each target is one fetch per pass inside the alarm's TICK_CALLS_MAX.
+const WATCH_MAX = 16;
+const WATCH_MIN_S = 30;
+const WATCH_BODY_BYTES = 200000;
+const DOH = "https://cloudflare-dns.com/dns-query"; // the DNS answers a guarded name gives, from the Worker's edge
+// THE LEASH: with leash_s set, no contact from the owner's veil for that long holds the goal loop (the guard goes on).
+const LEASH_MIN_S = 60;
+const LEASH_MAX_S = 7 * 86400;
+const REPO = "https://github.com/gary23w/nl-veil"; // what a tot's own requests point at, so a tot is never anonymous
 
 const DEFAULTS = {
   model: "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
@@ -83,6 +113,8 @@ const DEFAULTS = {
   text_max: 2000, // the most characters of a goal or charter (the veil server sends its model's limit)
   local: false,
   charter: "",
+  posture: "normal", // "defend": the runtime is frozen, bot checks are reported, every request names the tot
+  leash_s: 0, // 0 = no leash
 };
 
 // ------------------------------------------------------------------------------------------ small helpers
@@ -337,8 +369,191 @@ export function parseVerdict(reply) {
     }
   }
   const e = /evidence:\s*([^\n]*)/i.exec(s);
-  if (e) v.evidence = clip(e[1].trim(), 240);
+  if (e) v.evidence = clip(e[1].split(/\|\s*proof:/i)[0].trim(), 240);
   return v;
+}
+
+function resultFailed(result) {
+  return /^(?:ERROR\b|FAILED\b|no such tool:|HTTP [45]\d\d\b)/i.test(String(result).trim());
+}
+
+// Keep the error or confirmation at the end of a long page, as well as its title and URL.
+function resultExcerpt(result, limit = 1800) {
+  const text = String(result ?? "");
+  if (text.length <= limit) return text;
+  const head = Math.floor(limit * 2 / 3);
+  return text.slice(0, head) + "\n...(middle omitted)...\n" + text.slice(-(limit - head));
+}
+
+function fingerprint(text) {
+  let h = 2166136261;
+  for (const c of String(text)) h = Math.imul(h ^ c.codePointAt(0), 16777619);
+  return (h >>> 0).toString(16);
+}
+
+const CLAIM_TOOLS = new Set(["write_file", "append_file", "edit_file", "say", "remember", "recall", "feel", "pad_write", "pad_read", "tell", "plan_set", "plan_done", "list_files", "list_skills", "save_skill", "local_run", "swarm"]);
+
+/// A judge must point at an actual observation. Saving or repeating a claim cannot prove it.
+/// Clearing the score on rejected evidence also prevents decide() from overriding SAME with arithmetic.
+export function evidenceVerdict(reply, record, known = []) {
+  const v = { ...parseVerdict(reply), verified: false, complete: false, proof_key: "" };
+  const reject = (why) => ({ ...v, outcome: "same", num: -1, den: 0, evidence: why });
+  const at = /\bproof:\s*/i.exec(String(reply));
+  const proof = at ? firstJson(String(reply).slice(at.index + at[0].length)) : null;
+  if (!proof || !Number.isInteger(proof.tool) || !["observation", "artifact"].includes(proof.kind) || typeof proof.quote !== "string")
+    return reject(v.outcome === "same" && v.den <= 0 ? v.evidence : "no cited tool observation supports the verdict");
+  const row = record[proof.tool - 1];
+  const quote = proof.quote.trim();
+  if (!row || quote.length < 4 || !String(row.result).includes(quote)) return reject("the cited quote is absent from that tool result");
+  if (CLAIM_TOOLS.has(row.tool) || (row.tool === "read_file") !== (proof.kind === "artifact"))
+    return reject("a saved claim or an action acknowledgement does not verify the requested outcome");
+  if (v.outcome !== "regressed" && resultFailed(row.result)) return reject("the cited tool failed; no improvement was verified");
+  // A failed check may prove a regression, but a contradictory score must never turn it into progress.
+  if (resultFailed(row.result)) { v.num = -1; v.den = 0; }
+  if (/^(?:saved\b|reported\b|queued\b|typed into\b|clicked\b|exit ok\s*$|\(no output\))/i.test(quote))
+    return reject("the quote acknowledges an attempt without showing its outcome");
+  // File verification identifies the whole content: quoting a different line of the same file is no new work.
+  const subject = row.args?.url ?? row.args?.name ?? row.args?.path ?? row.args?.query ?? String(row.result).match(/^https?:\/\/\S+$/m)?.[0] ?? "";
+  const content = proof.kind === "artifact" ? String(row.result) : quote.replace(/\s+/g, " ").toLowerCase();
+  v.proof_key = `${proof.kind}:${subject}:${fingerprint(content)}`;
+  v.verified = true;
+  v.complete = proof.complete === true && v.outcome !== "regressed" && (v.den <= 0 || v.num === v.den);
+  if (known.includes(v.proof_key) || (v.outcome === "improved" && v.den > 0 && v.num === 0))
+    return { ...v, outcome: "same", num: -1, den: 0, evidence: "unchanged observation: " + v.evidence };
+  return v;
+}
+
+/// Catch an unchanged goal even when punctuation or a short preamble disguises a repeat.
+export function repeatedGoal(text, ended) {
+  const words = (s) => new Set(String(s).toLowerCase().match(/[\p{L}\p{N}_]+/gu) ?? []);
+  const next = words(text);
+  return ended.some((g) => {
+    const old = words(g.text);
+    if (next.size === 0 || old.size === 0) return false;
+    const common = [...next].filter((w) => old.has(w)).length;
+    return common / (next.size + old.size - common) >= 0.9;
+  });
+}
+
+/// What a tot's own requests say they are. The guard's checks always, and a defending tot's every call: a tot
+/// is never one of the "hard to attribute" agents.
+function guardUa(cfg) {
+  return `veil-tot/${VERSION} (${cfg?.name ?? "tot"}; +${REPO})`;
+}
+const posture = (cfg) => (cfg?.posture === "defend" ? "defend" : "normal");
+
+/// A config an older runtime stored gets this one's fields, in place.
+function upgraded(cfg) {
+  if (!cfg) return cfg;
+  if (!Array.isArray(cfg.watch)) cfg.watch = [];
+  if (cfg.posture !== "defend") cfg.posture = "normal";
+  if (!Number.isFinite(cfg.leash_s)) cfg.leash_s = 0;
+  return cfg;
+}
+
+/// Words and "quoted phrases" of a command line.
+function splitArgs(s) {
+  const out = [];
+  const re = /"([^"]*)"|'([^']*)'|(\S+)/g;
+  let m;
+  while ((m = re.exec(s))) out.push(m[1] ?? m[2] ?? m[3]);
+  return out;
+}
+
+const DNS_TYPES = new Set(["A", "AAAA", "NS", "MX", "TXT", "CNAME", "CAA", "SOA"]);
+const DNS_TYPE_NUM = { A: 1, AAAA: 28, NS: 2, MX: 15, TXT: 16, CNAME: 5, CAA: 257, SOA: 6 };
+const GUARD_USAGE = 'Usage: /guard add <https://...> [--text "<words that must be on the page>"] [--status <code>] [--every <seconds>] [--pin]  |  /guard add dns:<name> [--type A|AAAA|NS|MX|TXT|CNAME|CAA|SOA] [--every <seconds>]  |  /guard rm <target or #n>  |  /guard clear  |  /guard';
+
+/// The /guard grammar: what to watch and how. Pure.
+export function parseGuardCommand(rest) {
+  const words = splitArgs(String(rest ?? "").trim());
+  const op = (words[0] ?? "").toLowerCase();
+  if (op === "" || op === "list" || op === "ls") return { op: "list" };
+  if (op === "clear") return { op: "clear" };
+  if (op === "rm" || op === "remove" || op === "del") {
+    const what = words[1] ?? "";
+    if (!what) return { op: "error", err: GUARD_USAGE };
+    const n = /^#?(\d+)$/.exec(what);
+    if (n) return { op: "rm", index: Number(n[1]) };
+    return { op: "rm", key: what.startsWith("dns:") ? `dns:${what.slice(4).toLowerCase().replace(/\.$/, "")}/${(words[2] ?? "A").toUpperCase()}` : "http:" + what };
+  }
+  if (op !== "add" && op !== "watch") return { op: "error", err: GUARD_USAGE };
+  const what = words[1] ?? "";
+  const flags = {};
+  for (let i = 2; i < words.length; i++) {
+    const w = words[i];
+    if (w === "--pin") flags.pin = true;
+    else if (/^--(text|status|every|type)$/.test(w) && i + 1 < words.length) flags[w.slice(2)] = words[++i];
+    else return { op: "error", err: `unknown option ${clip(w, 40)}. ${GUARD_USAGE}` };
+  }
+  const every_s = flags.every === undefined ? 0 : clampInt(flags.every, WATCH_MIN_S, 86400, 0);
+  if (what.startsWith("dns:")) {
+    const name = what.slice(4).toLowerCase().replace(/\.$/, "");
+    if (!/^(?=.{1,253}$)[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/.test(name)) return { op: "error", err: "dns: needs a host name, like dns:example.com" };
+    const type = String(flags.type ?? "A").toUpperCase();
+    if (!DNS_TYPES.has(type)) return { op: "error", err: "--type is one of A, AAAA, NS, MX, TXT, CNAME, CAA, SOA" };
+    return { op: "add", target: { dns: name, type, every_s } };
+  }
+  if (!/^https?:\/\//i.test(what) || what.length > 500) return { op: "error", err: "a guarded address starts with https:// (or http://), or is dns:<name>" };
+  try {
+    if (privateHost(new URL(what).hostname)) return { op: "error", err: "a tot guards the public internet, not a private address" };
+  } catch {
+    return { op: "error", err: "that is not a URL" };
+  }
+  const status = flags.status === undefined ? 0 : Number.parseInt(flags.status, 10);
+  if (!(status === 0 || (status >= 100 && status <= 599))) return { op: "error", err: "--status is an HTTP status code, 100 to 599" };
+  return { op: "add", target: { url: what, text: clip(String(flags.text ?? ""), 200), status, every_s, pin: flags.pin === true } };
+}
+
+export function watchKey(t) {
+  return t.dns ? `dns:${t.dns}/${t.type}` : `http:${t.url}`;
+}
+export function watchLabel(t) {
+  return t.dns ? `dns ${t.dns} ${t.type}` : t.url;
+}
+
+/// What one observation of a guarded target says: `tripped` or `ok`, and why. `change` is a one-time note (a
+/// pinned page's content, a DNS answer) that does not trip the target: the new value becomes the baseline. Pure.
+export function judgeTarget(t, obs, last) {
+  if (obs.error) return { state: "tripped", why: `unreachable: ${obs.error}`, change: "" };
+  if (t.dns) {
+    if (obs.status !== 0) return { state: "tripped", why: `DNS status ${obs.status}${obs.status === 3 ? " (NXDOMAIN)" : obs.status === 2 ? " (SERVFAIL)" : ""}`, change: "" };
+    const answers = obs.answers ?? [];
+    if (answers.length === 0) return { state: "tripped", why: `no ${t.type} answer`, change: "" };
+    const change = last?.answers?.length > 0 && last.answers.join(" ") !== answers.join(" ") ? `${t.type} answer changed: [${last.answers.join(", ")}] -> [${answers.join(", ")}]` : "";
+    return { state: "ok", why: `${answers.length} ${t.type} answer(s)`, change };
+  }
+  if (t.status ? obs.status !== t.status : obs.status < 200 || obs.status >= 400) return { state: "tripped", why: `HTTP ${obs.status}${t.status ? ` (expected ${t.status})` : ""}`, change: "" };
+  if (t.text && !String(obs.text ?? "").includes(t.text)) return { state: "tripped", why: `expected text missing: "${t.text}"`, change: "" };
+  const change = t.pin && last?.hash && obs.hash && obs.hash !== last.hash ? `content changed (fingerprint ${last.hash} -> ${obs.hash})` : "";
+  return { state: "ok", why: `HTTP ${obs.status}`, change };
+}
+
+/// THE EVIDENCE CHAIN: every event's hash covers the hash of the event before it, its seq, its time, its kind and
+/// its text, so the mirrored events.jsonl on the owner's machine is tamper-evident on its own (`veil --tater
+/// verify <run>` walks it; src/cli/tot.zig recomputes exactly this).
+export async function chainHash(prev, seq, t, kind, text) {
+  const d = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(`${prev}\n${seq}\n${t}\n${kind}\n${text}`));
+  return [...new Uint8Array(d)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/// Walk event rows, oldest first: every signed row must hash as written and point at the signed row before it.
+/// Rows an older runtime wrote unsigned are counted, not judged. `{ok, signed, unsigned, seq, why}`.
+export async function verifyChain(rows) {
+  let prev = null;
+  let signed = 0;
+  let unsigned = 0;
+  for (const r of rows) {
+    if (typeof r.hash !== "string" || r.hash.length !== 64) {
+      unsigned += 1;
+      continue;
+    }
+    if (prev !== null && r.prev !== prev) return { ok: false, signed, unsigned, seq: r.seq, why: `event ${r.seq} does not follow the event before it (prev ${clip(r.prev, 12)}, expected ${clip(prev, 12)})` };
+    if ((await chainHash(r.prev ?? "", r.seq, r.t, r.kind, r.text)) !== r.hash) return { ok: false, signed, unsigned, seq: r.seq, why: `event ${r.seq} was altered: its hash does not match its text` };
+    prev = r.hash;
+    signed += 1;
+  }
+  return { ok: true, signed, unsigned, seq: 0, why: "" };
 }
 
 /// The final outcome: two scores compare by arithmetic, whatever the judge said; otherwise the judge's word.
@@ -394,15 +609,26 @@ const JUDGE_SYSTEM =
   "its effect is SAME. An attempt that failed - an error, a package that could not be installed, a page that " +
   "refused - and left everything as it was is SAME, not REGRESSED. A first measurement is a baseline, however low: " +
   "it is never REGRESSED. REGRESSED is rare: it needs a tool result showing that something which worked, existed " +
-  "or measured better in an EARLIER iteration is now broken, gone or measures worse.";
+  "or measured better in an EARLIER iteration is now broken, gone or measures worse. " +
+  "Measure the human's requested outcome, not activity. A checklist, a larger file, a failed-login note, a generic " +
+  "homepage or a saved error page is not progress toward collecting data or completing an external action. " +
+  "write_file, say, remembered facts and reports from minds contain the agent's own claims; saving them does not " +
+  "prove their contents. For a factual goal cite the source observation; for a goal to create an artifact cite its " +
+  "read-back content and assess whether it actually meets the request. Unknown, inaccessible and not found are " +
+  "different states. Do not infer account existence, identity, wrongdoing, login success, submission success or " +
+  "elapsed time from an attempt. Previously observed information is not a new improvement. " +
+  "Use complete:true only when the entire goal is verified, including any external confirmation it requires.";
 
 function judgeQuestion(goalText) {
   return (
     `The goal: ${clip(goalText, 16000)}\n` +
     "Grade the LAST iteration. Reply with exactly one line:\n" +
-    "IMPROVED | score: <done>/<total> | evidence: <the tool result that shows it, in a few words>\n" +
+    'IMPROVED | score: <done>/<total> | evidence: <what changed toward the goal> | proof: {"tool": 1, "quote": "<exact substring of that tool result>", "kind": "observation", "complete": false}\n' +
     "using SAME or REGRESSED in place of IMPROVED when that is the truth, and `score: none` when no tool result in " +
-    "this iteration gave a count that measures the goal (items done out of a total, checks passing)."
+    "this iteration gave a count that measures the goal (items done out of a total, checks passing). " +
+    "tool is the numbered T row; quote must be verbatim, including whitespace. kind is observation for source or " +
+    "execution results, artifact only for read_file checking an artifact the human requested. An action acknowledgement " +
+    "alone is insufficient. For SAME with no observation, omit proof."
   );
 }
 
@@ -415,10 +641,12 @@ function pickQuestion(g, rows) {
     "ITERATIONS SO FAR (never repeat one; if one regressed, undoing or fixing it may be the best next step):\n" +
     logText(rows) +
     "What is the single BEST next improvement - the one most likely to move the goal forward - that is NOT in that list? " +
+    "State the action, the expected observable result and how to verify it in one concise instruction. " +
+    "Use the last failure to choose a changed method or repair its cause; merely retrying it or renaming the goal is no new approach. " +
     "Prefer a step whose effect a tool can show, and choose only a step your tools and YOUR PYTHON as listed above can carry out: " +
     "a step that needs a package or a tool you do not have is a wasted iteration. " +
-    "If the goal does not say how finished is measured and no file of yours does yet, the best step is to write that down first: " +
-    "a checklist file of concrete items a tool can verify, which later steps tick off and count. A CLAIM OF WORK IS NOT WORK. " +
+    "Establish how finished is measured once, in plan_set or an existing plan; then execute it. Do not spend repeated " +
+    "iterations rewriting checklists. A CLAIM OF WORK IS NOT WORK. " +
     tail
   );
 }
@@ -458,6 +686,10 @@ const TOOLS = [
   { name: "runtime_read", args: '{"offset": 0, "limit": 4000}', what: 'read your runtime source and revision, including prompts, tools and stop rules; use {"find": "<function or constant>"} to jump to code, or page through it with next_offset' },
   { name: "runtime_edit", args: '{"revision": 0, "find": "<exact passage>", "replace": "<replacement>"}', what: "edit your runtime source at the revision you read; any code may be changed. Use source instead of find/replace to replace the whole runtime. Changes are shared by every tot in this account" },
   { name: "runtime_deploy", args: '{"revision": 1}', what: "deploy your edited runtime without an approval step. The owner's running veil uploads it on its next sync; runtime_read reports deployment or compiler errors. No local-machine execution grant is needed" },
+  // Agent Garrett: a second Worker in this account (github.com/gary23w/garrettstimpson.ca/agent), a blue-team belt over MCP
+  { name: "garrett_tools", args: "{}", what: "list Agent Garrett's security tools (CVE / KEV / EPSS intel, DNS and certificate transparency, RDAP, email security posture, IOC extraction, evidence manifests, forensic timelines, and more) and the argument names they take", need: "garrett" },
+  { name: "garrett", args: '{"name": "<garrett tool>", "args": {"target": "example.com"}}', what: "run one of Agent Garrett's tools over MCP; its text comes back with its evidence metadata. Passive lookups by default; active ones only as the agent's operator allowed", need: "garrett" },
+  { name: "garrett_launch", args: "{}", what: "ask your human's veil to launch Agent Garrett into this account as a second Worker and point every tot at it; garrett and garrett_tools appear in your belt once it answers" },
   // memory and planning
   { name: "remember", args: '{"fact": "<one thing worth knowing later>"}', what: "keep a fact for every later iteration" },
   { name: "recall", args: '{"query": "<what you want to know>"}', what: "find facts you kept, by meaning" },
@@ -479,12 +711,16 @@ const LOCAL_TOOL = {
 };
 /// Earlier names for the file tools: a model (or a lesson) that still says note_write is understood.
 const ALIASES = { browser_links: "browser_read", browser_navigate: "browser_open", browser_goto: "browser_open", browser_press: "browser_key", stance: "feel", note_stance: "feel", pip: "pip_install", install_package: "pip_install", note_write: "write_file", note_read: "read_file", note_list: "list_files", note_delete: "delete_file", fetch_json: "web_fetch", read_url: "web_fetch", list_dir: "list_files", observe: "remember", python: "run_python" };
-const MIND_TOOLS = new Set(["write_file", "read_file", "list_files", "append_file", "web_search", "web_fetch", "http_request", "run_python", "pip_install", "run_skill", "remember", "recall", "pad_read", "pad_write"]);
+const MIND_TOOLS = new Set(["write_file", "read_file", "list_files", "append_file", "web_search", "web_fetch", "http_request", "run_python", "pip_install", "run_skill", "remember", "recall", "pad_read", "pad_write", "garrett", "garrett_tools"]);
+
+/// Agent Garrett is reachable when the veil server set both secrets on this Worker (cf_tot.zig launchGarrett, or
+/// `veil --tater key garrett_url` / `garrett_token` for an agent the owner deployed by hand).
+const hasGarrett = (env) => /^https:\/\//i.test(String(env.GARRETT_MCP_URL ?? "")) && typeof env.GARRETT_MCP_TOKEN === "string" && env.GARRETT_MCP_TOKEN.length > 0;
 
 /// The tools this tot has here: everything, minus what a missing binding takes away.
 function toolsFor(env, cfg) {
-  const have = { browser: !!env.BROWSER, python: !!env.PY };
-  const list = TOOLS.filter((t) => !t.need || have[t.need]);
+  const have = { browser: !!env.BROWSER, python: !!env.PY, garrett: hasGarrett(env) };
+  const list = TOOLS.filter((t) => !t.need || have[t.need]).filter((t) => t.name !== "garrett_launch" || !have.garrett);
   return cfg.local ? [...list, LOCAL_TOOL] : list;
 }
 
@@ -493,7 +729,8 @@ function missingNote(env) {
   const miss = [];
   if (!env.BROWSER) miss.push("a browser (browser_*)");
   if (!env.PY) miss.push("Python (run_python, skills)");
-  return miss.length ? `NOT AVAILABLE in this account right now: ${miss.join(" and ")}. Work with the tools listed.\n` : "";
+  if (!hasGarrett(env)) miss.push("Agent Garrett's security tools (garrett, garrett_tools; garrett_launch asks your human's veil for them)");
+  return miss.length ? `NOT AVAILABLE in this account right now: ${miss.join(", ")}. Work with the tools listed.\n` : "";
 }
 
 /// Search-result links out of an engine's HTML: [{title, url, snippet}], engine links and repeats dropped.
@@ -755,6 +992,12 @@ async function route(req, env) {
     if (method === "POST" && ["seed", "result"].includes(seg[2])) return call(padStub, "/runtime/" + seg[2], body);
     return bad("method not allowed", 405);
   }
+  // Agent Garrett's launch: a tot asks (request), the owner's veil deploys it and answers (result). See padRoute.
+  if (seg[1] === "garrett") {
+    if (method === "GET" && seg.length === 2) return call(padStub, "/garrett/state");
+    if (method === "POST" && ["request", "result", "clear"].includes(seg[2])) return call(padStub, "/garrett/" + seg[2], body);
+    return bad("method not allowed", 405);
+  }
 
   // Whether the Python Worker starts, and the native packages it came up with. The server asks after an upload:
   // a Python that does not start with the packages it was uploaded with is uploaded again with fewer.
@@ -842,10 +1085,12 @@ export class Tot {
     const p = url.pathname;
     const body = req.method === "POST" ? await req.json().catch(() => ({})) : {};
     if (p.startsWith("/runtime/")) return this.runtimeRoute(p, body);
-    if (p.startsWith("/pad/")) return this.padRoute(p, url, body);
+    if (p.startsWith("/pad/") || p.startsWith("/garrett/")) return this.padRoute(p, url, body);
     if (p === "/init") return this.init(body);
-    const cfg = await this.store.get("cfg");
+    const cfg = upgraded(await this.store.get("cfg"));
     if (!cfg) return bad("no such tot", 404);
+    // Every route but a sibling's /inbox is the owner's veil (it holds the token): contact, for the leash.
+    if (p !== "/inbox") await this.contact(cfg);
     if (p === "/status") return json({ ok: true, tot: await this.status(cfg) });
     if (p === "/events") return this.events(url);
     if (p === "/notes") return this.notesSince(url);
@@ -992,6 +1237,39 @@ export class Tot {
       const rows = [...(await this.store.list({ prefix: "pad:", startAfter: "pad:" + pad10(after), limit: PAD_KEEP })).values()];
       return json({ ok: true, entries: rows, seq: (await this.store.get("padseq")) ?? 0 });
     }
+    // Agent Garrett, shared by the account's tots: none -> pending (a tot asked, or the owner did) -> deployed |
+    // failed. The owner's veil reads `pending` on its sync, launches the Worker through the Cloudflare login,
+    // sets this Worker's GARRETT_MCP_URL / GARRETT_MCP_TOKEN secrets, and posts the result here.
+    if (p.startsWith("/garrett/")) {
+      const g = (await this.store.get("garrett")) ?? { status: "none" };
+      if (p === "/garrett/state") return json({ ok: true, ...g });
+      if (p === "/garrett/request") {
+        if (g.status !== "deployed" && g.status !== "pending") {
+          g.status = "pending";
+          g.asked_by = clip(String(body.by ?? "?"), 24);
+          g.asked_at = this.now();
+          await this.store.put("garrett", g);
+        }
+        return json({ ok: true, ...g });
+      }
+      if (p === "/garrett/result") {
+        if (body.err) {
+          g.status = "failed";
+          g.error = clip(String(body.err), 600);
+        } else {
+          g.status = "deployed";
+          g.url = clip(String(body.url ?? ""), 300);
+          g.error = "";
+          g.deployed_at = this.now();
+        }
+        await this.store.put("garrett", g);
+        return json({ ok: true, ...g });
+      }
+      if (p === "/garrett/clear") {
+        await this.store.delete("garrett");
+        return json({ ok: true, status: "none" });
+      }
+    }
     return bad("not found", 404);
   }
 
@@ -1000,7 +1278,7 @@ export class Tot {
   async init(body) {
     if (await this.store.get("cfg")) return bad("already deployed", 409);
     const now = this.now();
-    const cfg = { name: body.name, created: now, paused: false, minds: 1, roam_s: 0, ...DEFAULTS };
+    const cfg = { name: body.name, created: now, paused: false, minds: 1, roam_s: 0, watch: [], ...DEFAULTS };
     this.applyConfig(cfg, body);
     cfg.local = body.local === true; // granted once, at deployment; never by a later config call
     await this.store.put("cfg", cfg);
@@ -1049,15 +1327,24 @@ export class Tot {
     if (b.text_max !== undefined) cfg.text_max = clampInt(b.text_max, 500, 16000, cfg.text_max);
     if (typeof b.charter === "string") cfg.charter = clip(b.charter.trim(), cfg.text_max ?? DEFAULTS.text_max);
     if (typeof b.paused === "boolean") cfg.paused = b.paused;
+    if (typeof b.posture === "string" && /^(normal|defend)$/i.test(b.posture.trim())) cfg.posture = b.posture.trim().toLowerCase();
+    if (b.leash_s !== undefined) cfg.leash_s = /^(0|off|none|no)$/i.test(String(b.leash_s).trim()) ? 0 : clampInt(b.leash_s, LEASH_MIN_S, LEASH_MAX_S, cfg.leash_s ?? 0);
+  }
+
+  settingsLine(cfg) {
+    return `model ${cfg.model}, every ${cfg.pace_s}s, up to ${cfg.size} minds, ${callsWord(cfg)}${posture(cfg) === "defend" ? ", posture DEFEND" : ""}${cfg.leash_s > 0 ? `, leash ${cfg.leash_s}s` : ""}${cfg.paused ? ", paused" : ""}`;
   }
 
   async configure(cfg, body) {
     const wasPaused = cfg.paused;
     this.applyConfig(cfg, body);
     await this.store.put("cfg", cfg);
-    await this.emit("status", `settings changed: model ${cfg.model}, every ${cfg.pace_s}s, up to ${cfg.size} minds, ${callsWord(cfg)}${cfg.paused ? ", paused" : ""}`);
+    await this.emit("status", `settings changed: ${this.settingsLine(cfg)}`);
     if (cfg.paused) await this.store.deleteAlarm();
-    else if (wasPaused || (await this.store.getAlarm()) === null) await this.store.setAlarm(this.now() + 1000);
+    else if (wasPaused || (await this.store.getAlarm()) === null) {
+      await this.store.put("loop_due", 0);
+      await this.store.setAlarm(this.now() + 1000);
+    }
     return json({ ok: true, tot: await this.status(cfg) });
   }
 
@@ -1067,10 +1354,19 @@ export class Tot {
     const alarm = await this.store.getAlarm();
     const queue = (await this.store.get("queue")) ?? [];
     const lessons = (await this.store.get("lessons")) ?? [];
+    const leashed = !!(await this.store.get("leashed"));
     let state = "working";
     if (cfg.paused) state = "paused";
+    else if (leashed) state = "leashed";
     else if (cfg.daily_calls > 0 && usage.calls >= cfg.daily_calls) state = "resting";
     else if (!goal || goal.status !== "active") state = queue.length > 0 ? "working" : "roaming";
+    let guard_ok = 0;
+    let guard_tripped = 0;
+    for (const t of cfg.watch ?? []) {
+      const w = await this.store.get("watch:" + watchKey(t));
+      if (w?.state === "tripped") guard_tripped += 1;
+      else if (w?.state === "ok") guard_ok += 1;
+    }
     return {
       name: cfg.name,
       state,
@@ -1092,6 +1388,14 @@ export class Tot {
       browser: !!this.env.BROWSER,
       python: !!this.env.PY,
       neuron: !!(await this.mind()),
+      garrett: hasGarrett(this.env),
+      posture: posture(cfg),
+      leash_s: cfg.leash_s ?? 0,
+      leashed,
+      watch: (cfg.watch ?? []).length,
+      guard_ok,
+      guard_tripped,
+      chain: (await this.store.get("chain")) ?? "",
       mood: (await this.store.get("mood")) ?? "",
       seq: (await this.store.get("seq")) ?? 0,
       notes_rev: (await this.store.get("notes_rev")) ?? 0,
@@ -1106,10 +1410,16 @@ export class Tot {
     const seq = ((await this.store.get("seq")) ?? 0) + 1;
     await this.store.put("seq", seq);
     // `brief` is the one line a console shows; `text` is everything, for whoever opens the row. `ok` false marks
-    // a row that went wrong.
-    const full = clip(text, 4000);
+    // a row that went wrong. `prev` and `hash` chain the row to the one before it (chainHash): well-formed text,
+    // so the bytes hashed here are the bytes the mirror writes.
+    const cut = clip(text, 4000);
+    const full = typeof cut.toWellFormed === "function" ? cut.toWellFormed() : cut;
     const brief = clip((full.split("\n").find((l) => l.trim().length > 0) ?? "").trim(), 180);
-    await this.store.put("ev:" + pad10(seq), { seq, t: this.now(), kind, text: full, brief, ok: kind !== "error", ...(extra ?? {}) });
+    const t = this.now();
+    const prev = (await this.store.get("chain")) ?? "";
+    const hash = await chainHash(prev, seq, t, kind, full);
+    await this.store.put("ev:" + pad10(seq), { seq, t, kind, text: full, brief, ok: kind !== "error", ...(extra ?? {}), prev, hash });
+    await this.store.put("chain", hash);
     if (seq > EVENTS_KEEP) await this.store.delete("ev:" + pad10(seq - EVENTS_KEEP));
     return seq;
   }
@@ -1159,6 +1469,7 @@ export class Tot {
   /// Bring the next iteration forward (a message arrived, a job finished). A paused tot stays paused.
   async wake(cfg) {
     if (cfg.paused) return;
+    await this.store.put("loop_due", 0); // whatever rest or backoff the goal loop was in, this is worth an iteration
     const at = await this.store.getAlarm();
     const soon = this.now() + 1000;
     if (at === null || at > soon) await this.store.setAlarm(soon);
@@ -1214,9 +1525,13 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
       cfg.paused = word === "/pause";
       await this.store.put("cfg", cfg);
       if (cfg.paused) await this.store.deleteAlarm();
-      else await this.store.setAlarm(now + 1000);
+      else {
+        await this.store.put("loop_due", 0);
+        await this.store.setAlarm(now + 1000);
+      }
       return cfg.paused ? `${cfg.name} is paused. /resume starts it again.` : `${cfg.name} is running again.`;
     }
+    if (word === "/guard") return this.guardCommand(cfg, rest);
     if (word === "/queue") {
       if (rest.length < 3) return "Usage: /queue <a goal to take up after the current one>";
       const queue = (await this.store.get("queue")) ?? [];
@@ -1230,14 +1545,17 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
       await this.store.put("cfg", cfg);
       return cfg.charter.length > 0 ? "Charter set: it is what this tot works toward when no goal is active." : "Charter cleared.";
     }
-    if (word === "/pace" || word === "/size" || word === "/model" || word === "/calls") {
-      const key = { "/pace": "pace_s", "/size": "size", "/model": "model", "/calls": "daily_calls" }[word];
+    if (word === "/pace" || word === "/size" || word === "/model" || word === "/calls" || word === "/posture" || word === "/leash") {
+      const key = { "/pace": "pace_s", "/size": "size", "/model": "model", "/calls": "daily_calls", "/posture": "posture", "/leash": "leash_s" }[word];
+      if (word === "/posture" && !/^(normal|defend)$/i.test(rest)) return "Usage: /posture defend | normal. DEFEND freezes the runtime, reports bot checks instead of working through them, names this tot in every request and keeps it to read-only verification unless you ask for more.";
+      if (word === "/leash" && !/^(\d+|off|none|no)$/i.test(rest)) return `Usage: /leash <seconds> | off. With a leash, no contact from your veil for that long holds the goal loop until it is back; the guard goes on. ${LEASH_MIN_S} to ${LEASH_MAX_S} seconds.`;
       this.applyConfig(cfg, { [key]: rest });
       await this.store.put("cfg", cfg);
-      return `model ${cfg.model}, every ${cfg.pace_s}s, up to ${cfg.size} minds, ${callsWord(cfg)}.`;
+      if (word === "/posture") await this.emit("status", `posture ${posture(cfg).toUpperCase()}${posture(cfg) === "defend" ? ": the runtime is frozen, bot checks are reported, every request names this tot, read-only unless the human asks for more" : ""}`);
+      return this.settingsLine(cfg) + ".";
     }
     if (word === "/status") return goalStatusText(g);
-    if (word.startsWith("/")) return "Commands: /goal <text> [--forever] [--budget N], /goal stop|resume|status|budget N|forever, /queue <goal>, /charter <text>, /pause, /resume, /pace <seconds>, /size <minds>, /model <id>, /calls <per day>. Anything else is a message this tot reads at its next iteration.";
+    if (word.startsWith("/")) return "Commands: /goal <text> [--forever] [--budget N], /goal stop|resume|status|budget N|forever, /queue <goal>, /charter <text>, /pause, /resume, /pace <seconds>, /size <minds>, /model <id>, /calls <per day>, /guard add|rm|clear ..., /posture defend|normal, /leash <seconds>|off. Anything else is a message this tot reads at its next iteration.";
     // Plain words: a directive the next iteration reads. Nobody answers it in person; the work does.
     const inbox = (await this.store.get("inbox")) ?? [];
     inbox.push({ t: now, from: "human", text: clip(text, 4000) });
@@ -1331,12 +1649,23 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
   // ---------------------------------------------------------------- the heartbeat
 
   async alarm() {
-    const cfg = await this.store.get("cfg");
+    const cfg = upgraded(await this.store.get("cfg"));
     if (!cfg || cfg.paused) return;
     this.tick = { calls: 0, started: this.now() };
-    let nextS = cfg.pace_s;
+    let nextS = cfg.pace_s; // the goal loop's next turn
+    let guardS = Infinity; // the guard's
+    let loop = false; // whether the goal loop ran (or tried to) this alarm
     try {
-      nextS = await this.iterate(cfg);
+      // THE GUARD FIRST, with no model: it is what goes on when the model is gone, rate-limited or withdrawn.
+      const gd = await this.guard(cfg);
+      if (gd) guardS = gd.next_s;
+      const loopDue = (await this.store.get("loop_due")) ?? 0;
+      if (await this.leashCheck(cfg)) nextS = cfg.pace_s; // held: the guard alone, until the owner's veil is back
+      else if (gd && this.now() < loopDue) nextS = Math.max(1, Math.ceil((loopDue - this.now()) / 1000)); // the guard woke the object early; the loop's own rest or backoff holds
+      else {
+        loop = true;
+        nextS = await this.iterate(cfg);
+      }
     } catch (e) {
       if (e instanceof TickBudget) {
         const u = await this.usage();
@@ -1367,7 +1696,9 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
       }
       await this.store.put("last_tick", this.now());
       if (!fresh.paused) {
-        const due = this.now() + Math.max(5, nextS) * 1000;
+        // The goal loop's own next turn is kept apart from the alarm: the guard may wake the object sooner.
+        if (loop) await this.store.put("loop_due", this.now() + Math.max(5, nextS) * 1000);
+        const due = this.now() + Math.max(5, Math.min(nextS, guardS)) * 1000;
         const at = await this.store.getAlarm();
         // A wake that arrived during the iteration (a command, a finished job) keeps its earlier time.
         if (at === null || at <= this.now() || at > due) await this.store.setAlarm(due);
@@ -1411,21 +1742,17 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
       const caps = await pythonCaps(this.env);
       if (caps.ok) await this.store.put("py_native", caps.native);
     }
-    const system = this.systemPrompt(cfg, g, lessons, padTail) + (await this.workingMemory());
-    const inboxText = inbox.length > 0 ? "\nNEW MESSAGES (a message from human is a directive and outranks your own plan):\n" + inbox.map((m) => `- ${m.from}: ${m.text}`).join("\n") + "\n" : "";
+    const system = this.systemPrompt(cfg, g, lessons, padTail) + (await this.guardText(cfg)) + (await this.workingMemory());
+    const inboxText = inbox.length > 0 ? "\nNEW MESSAGES (a message from human or guard is a directive and outranks your own plan):\n" + inbox.map((m) => `- ${m.from}: ${m.text}`).join("\n") + "\n" : "";
 
     // PICK
     const pick = pickText(await this.ask(cfg, [{ role: "system", content: system }, { role: "user", content: inboxText + pickQuestion(g, rows) }], 2000));
-    if (!g.forever && /^["'`*\s]*DONE\b/.test(pick) && pick.length < 40) {
+    const checkDone = !g.forever && /^["'`*\s]*DONE\b/.test(pick) && pick.length < 40;
+    if (checkDone) {
       const cur = await this.store.get("goal"); // as stored now: a command may have landed while the model answered
       if (!cur || cur.id !== g.id || cur.status !== "active" || cur.forever) return 5;
-      g = cur;
-      g.status = "achieved";
-      await this.store.put("goal", g);
-      await this.emit("status", `goal achieved after ${g.iteration} iteration(s), ${g.improved} improved${g.best_den > 0 ? `, best ${g.best_num}/${g.best_den}` : ""}: ${clip(g.text, 300)}`);
-      return 5; // straight on to the next thing
     }
-    const step = clip(pick, 1200);
+    const step = checkDone ? "Verify the entire goal with tools: inspect the requested artifact or source confirmation, compare it with every success criterion, and report any remaining gap. DONE is a claim until this check succeeds." : clip(pick, 1200);
     await this.emit("pick", step, { i: g.iteration + 1 });
 
     // DO
@@ -1434,9 +1761,9 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
     const claim = await this.toolLoop(cfg, system + "\n\nTOOLS:\n" + toolList(tools) + "\n" + missingNote(this.env) + "\n" + REPLY_RULE, inboxText + "THIS ITERATION'S STEP: " + step, tools, TOOL_ROUNDS, record, "");
 
     // MEASURE
-    const transcript = record.length > 0 ? record.map((r) => `TOOL ${r.tool}(${clip(JSON.stringify(r.args), 300)}) -> ${clip(r.result, 1200)}`).join("\n") : "(no tool was used)";
+    const transcript = record.length > 0 ? record.map((r, i) => `T${i + 1} TOOL ${r.tool}(${clip(JSON.stringify(r.args), 300)}) -> ${resultExcerpt(r.result)}`).join("\n") : "(no tool was used)";
     const verdictLine = await this.ask(cfg, [{ role: "system", content: JUDGE_SYSTEM }, { role: "user", content: `EARLIER ITERATIONS (what stood before this one):\n${logText(rows)}\nTHE STEP: ${step}\n\nTHE RECORD:\n${transcript}\n\nCLOSING CLAIM: ${clip(claim, 800)}\n\n${judgeQuestion(g.text)}` }], 1200);
-    const v = parseVerdict(verdictLine);
+    const v = evidenceVerdict(verdictLine, record, g.proofs ?? []);
 
     // RECORD - onto the goal as it is stored NOW. The model calls above took a while, and a command may have
     // landed in between: a goal that was replaced gets no row from the old goal's step, and one that was
@@ -1450,9 +1777,18 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
     const held = g.status; // a goal the human stopped meanwhile stays stopped, whatever this iteration's count says
     const { row, stop, outcome } = recordIteration(g, step, v, this.now());
     if (held !== "active") g.status = held;
+    else if (!g.forever && v.verified && v.complete) g.status = "achieved";
+    if (v.verified && v.proof_key) g.proofs = [...new Set([...(g.proofs ?? []), v.proof_key])].slice(-64);
     await this.store.put("log:" + pad10(((await this.store.get("logseq")) ?? 0) + 1), { ...row, goal: g.id });
     await this.store.put("logseq", ((await this.store.get("logseq")) ?? 0) + 1);
     await this.store.put("goal", g);
+    // Carry the actual blocker across goal changes; a new goal must not erase why the old method failed.
+    const failed = record.filter((r) => resultFailed(r.result)).slice(-4);
+    const observed = record.filter((r) => !CLAIM_TOOLS.has(r.tool)).slice(-3);
+    await this.store.put("last_work", {
+      t: this.now(), goal: clip(g.text, 400), step: clip(step, 400), outcome, evidence: row.evidence,
+      results: [...new Set([...failed, ...observed])].map((r) => `${r.tool}: ${resultExcerpt(r.result, 500)}`).join("\n"),
+    });
     await this.store.put("fails", 0);
     const mood = Tot.moodOf(g, outcome);
     if (mood !== (await this.store.get("mood"))) {
@@ -1469,6 +1805,10 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
     // LEARN: the tot rewrites its own operating rules from what the measurement said.
     await this.learn(cfg, g, lessons, step, transcript, outcome, record);
 
+    if (g.status === "achieved" && held === "active") {
+      await this.emit("status", `goal achieved after verified completion: ${g.iteration} iteration(s), ${g.improved} improved: ${clip(g.text, 300)}`);
+      return 5;
+    }
     if (stop && g.status === stop) {
       const why = stop === "plateau" ? "the last three iterations improved nothing" : "its iteration budget is spent";
       await this.emit("status", `goal loop ended: ${why}. ${g.iteration} iteration(s), ${g.improved} improved. Moving to the next best thing.`);
@@ -1483,11 +1823,26 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
       "You never ask the human a question and wait; you decide, act, and report. You keep going until the goal is measurably achieved, and you prefer steps whose effect a tool result can show. " +
       "Work like an engineer: look before you act (search, read, open the page), do the work with your tools (write the file, run the script, make the call), then check the result with a tool before you call it done. " +
       "When a tool fails, read its error and try another way - a different source, the browser instead of a fetch, a script instead of a guess. Keep what you learn in files and facts: the next iteration starts from them, not from this conversation.\n" +
-      "Use your browser tools to solve CAPTCHAs and other bot checks, verify that the requested page is available, then continue the task. A challenge is a step to work through, not a reason to stop or abandon the page.\n" +
-      "You control your runtime through runtime_read, runtime_edit and runtime_deploy: improve your own prompts, tools, algorithms and stop rules when the task needs it. These tools change the actual code shared by this account's tots. Read the deployment result before treating an edit as live.\n" +
+      "Reason from observations: keep known facts, hypotheses and missing information distinct. First identify the requested " +
+      "deliverable and its success criteria, then choose the smallest action that resolves the most valuable uncertainty. " +
+      "After acting, inspect the result and update the plan. A file name, a successful click, a script exiting zero or your own " +
+      "summary does not prove that the requested data or outcome exists. Preserve source URLs and exact observations with facts. " +
+      "An inaccessible page leaves the answer unknown; it does not prove an account absent. A matching username does not establish identity.\n" +
+      "For browser work, read the current page and its elements before choosing fields or selectors; check the resulting page " +
+      "after navigation or submission. Use credentials actually available in the task context; invented or placeholder credentials " +
+      "cannot fix a login failure. Record the missing prerequisite and continue with accessible sources. " +
+      "For 429 use the stated retry interval; an hour has not passed just because a note says it has. " +
+      "NoGilError, an unavailable runner or a CPU limit is an execution-environment failure: use another available tool or " +
+      "repair and test the environment rather than submitting the same script repeatedly.\n" +
+      (posture(cfg) === "defend"
+        ? "POSTURE: DEFEND. Your human declared an incident posture, and you are a defender. The guard pass runs before you every heartbeat, without a model, and its TRIPWIRE, RECOVERED and CHANGED messages outrank your plan: investigate a tripwire with read-only tools (web_fetch, http_request GET, DNS and certificate lookups, Agent Garrett's passive tools), preserve what you find in a file first, then report what you observed with the exact evidence through say. " +
+          "In this posture you never modify your runtime (runtime_edit and runtime_deploy are refused), you never work through a CAPTCHA or bot check (report BOT CHECK and move on), every request you make names you as a veil tot, and nothing irreversible - deleting, sending, purchasing, publishing, scanning or probing anything you were not asked to guard - happens unless your human asked for it in a message.\n"
+        : "Use your browser tools to solve CAPTCHAs and other bot checks, verify that the requested page is available, then continue the task. A challenge is a step to work through, not a reason to stop or abandon the page.\n" +
+          "You control your runtime through runtime_read, runtime_edit and runtime_deploy: improve your own prompts, tools, algorithms and stop rules when the task needs it. These tools change the actual code shared by this account's tots. Read the deployment result before treating an edit as live.\n") +
       (cfg.charter ? `CHARTER (what you serve when no goal is active, and the frame for every goal): ${cfg.charter}\n` : "") +
       (g ? `THE GOAL: ${g.text}\n` : "") +
-      (lessons.length > 0 ? "YOUR LESSONS (rules you wrote for yourself from measured outcomes; follow them):\n" + lessons.map((l) => `- ${l.text}`).join("\n") + "\n" : "") +
+      `CURRENT UTC TIME: ${new Date(this.now()).toISOString()}\n` +
+      (lessons.length > 0 ? "YOUR LESSONS (rules from past outcomes; apply only when supported by the current tools and observations):\n" + lessons.map((l) => `- ${l.text}`).join("\n") + "\n" : "") +
       (padTail ? "SHARED SCRATCHPAD (newest entries; every tot of this account reads and writes it):\n" + padTail + "\n" : "")
     );
   }
@@ -1529,10 +1884,11 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
         await this.emit("act", `${mind ? mind + " " : ""}${act.tool} ${clip(JSON.stringify(args), 600)} -> ${clip(result, 1500)}`, {
           tool: act.tool,
           brief: clip(`${mind ? mind + " " : ""}${act.tool} ${clip(arg1, 60)} -> ${clip(head.trim(), 100)}`, 180),
-          ok: !/^(ERROR|FAILED)/.test(String(result)),
+          ok: !resultFailed(result),
         });
         messages.push({ role: "assistant", content: clip(reply, 2000) });
-        messages.push({ role: "user", content: `RESULT of ${act.tool}:\n${clip(result, 8000)}\n\n${round + 2 >= rounds ? 'This is your last call for this step: reply {"final": ...} now.' : "Next action, or the final answer."}` });
+        const retry = resultFailed(result) ? "This attempt failed. Diagnose its cause and change the method or repair the prerequisite before retrying; saving this error is not success.\n" : "Check whether this result meets the step's success criterion; an acknowledgement alone is not verification.\n";
+        messages.push({ role: "user", content: `RESULT of ${act.tool}:\n${resultExcerpt(result, 8000)}\n\n${retry}${round + 2 >= rounds ? 'This is your last call for this step: reply {"final": ...} now.' : "Next action, or the final answer."}` });
         continue;
       }
       if (!nudged && round + 1 < rounds) {
@@ -1596,6 +1952,8 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
   /// files and its skills, by name. Appended to the system prompt.
   async workingMemory() {
     let out = "";
+    const last = await this.store.get("last_work");
+    if (last) out += `LAST MEASURED WORK (also applies when a goal changes):\n${new Date(last.t).toISOString()} | ${last.outcome}: ${last.evidence}\nGoal: ${last.goal}\nStep: ${last.step}\n${last.results}\n`;
     const plan = (await this.store.get("plan")) ?? [];
     if (plan.length > 0) out += "YOUR PLAN (plan_done ticks an item, plan_set rewrites it):\n" + plan.map((p, i) => `${i + 1}. [${p.done ? "x" : " "}] ${p.text}`).join("\n") + "\n";
     const facts = (await this.store.get("facts")) ?? [];
@@ -1649,6 +2007,7 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
 
   async runTool(cfg, tool, args, mind) {
     if (["runtime_read", "runtime_edit", "runtime_deploy"].includes(tool)) {
+      if (tool !== "runtime_read" && posture(cfg) === "defend") return "ERROR: posture is DEFEND: the runtime is frozen until your human sets /posture normal";
       const result = await (await call(stubFor(this.env, "pad"), "/runtime/" + tool.slice(8), { ...args, author: cfg.name })).json();
       if (result.ok && tool === "runtime_read") {
         const { source, ...state } = result;
@@ -1696,9 +2055,19 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
       case "web_search":
         return this.webSearch(String(args.query ?? args.q ?? args.value ?? "").trim());
       case "web_fetch":
-        return this.http("GET", String(args.url ?? args.value ?? ""), null, null);
+        return this.http("GET", String(args.url ?? args.value ?? ""), null, null, cfg);
       case "http_request":
-        return this.http(String(args.method ?? "GET").toUpperCase(), String(args.url ?? ""), args.headers, args.body);
+        return this.http(String(args.method ?? "GET").toUpperCase(), String(args.url ?? ""), args.headers, args.body, cfg);
+      case "garrett_tools":
+        return this.garrettCall(cfg, "tools/list", {}, "list");
+      case "garrett":
+        return this.garrettCall(cfg, "tools/call", { name: String(args.name ?? args.tool ?? "").trim().toLowerCase(), arguments: args.args && typeof args.args === "object" && !Array.isArray(args.args) ? args.args : args.arguments && typeof args.arguments === "object" && !Array.isArray(args.arguments) ? args.arguments : {} }, "call");
+      case "garrett_launch": {
+        if (hasGarrett(this.env)) return "Agent Garrett is already up; garrett_tools lists its tools";
+        const r = await (await call(stubFor(this.env, "pad"), "/garrett/request", { by: who })).json();
+        if (!r.ok) return "ERROR: " + r.err;
+        return `asked: your human's veil launches Agent Garrett on its next sync (within about a minute while it is running), and then garrett and garrett_tools appear in your belt. Do not wait for it in this step.`;
+      }
       case "browser_open":
       case "browser_read":
       case "browser_click":
@@ -1841,7 +2210,7 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
   }
 
   /// One HTTP call. HTML comes back as its readable text; anything else as it is.
-  async http(method, url, headers, body) {
+  async http(method, url, headers, body, cfg) {
     if (!/^https?:\/\//i.test(url)) return 'ERROR: an http(s) URL is needed, as {"url": "https://..."}';
     if (!/^(GET|POST|PUT|PATCH|DELETE|HEAD)$/.test(method)) return "ERROR: method is GET, POST, PUT, PATCH, DELETE or HEAD";
     try {
@@ -1852,32 +2221,271 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
     this.spend();
     const h = { "user-agent": UA, accept: "text/html,application/json,text/plain,*/*", "accept-language": "en-US,en;q=0.9" };
     if (headers && typeof headers === "object") for (const [k, v] of Object.entries(headers)) h[String(k).toLowerCase()] = String(v);
+    if (posture(cfg) === "defend") h["user-agent"] = guardUa(cfg); // a defending tot names itself, whatever the model asked
     let payload;
     if (body !== undefined && body !== null && method !== "GET" && method !== "HEAD") {
       payload = typeof body === "string" ? body : JSON.stringify(body);
       if (typeof body !== "string" && !h["content-type"]) h["content-type"] = "application/json";
     }
-    const ctl = new AbortController();
-    const timer = setTimeout(() => ctl.abort(), 25000);
     try {
-      let r = await fetch(url, { method, signal: ctl.signal, redirect: "manual", headers: h, body: payload });
-      for (let hop = 0; hop < 5 && [301, 302, 303, 307, 308].includes(r.status) && r.headers.get("location"); hop++) {
-        const next = new URL(r.headers.get("location"), url);
-        if (!/^https?:$/.test(next.protocol) || privateHost(next.hostname)) return `ERROR: it redirects to ${next.hostname}, which a tot does not call`;
-        url = next.toString();
-        const keep = r.status === 307 || r.status === 308;
-        r = await fetch(url, { method: keep ? method : "GET", signal: ctl.signal, redirect: "manual", headers: h, body: keep ? payload : undefined });
-      }
-      const type = r.headers.get("content-type") ?? "";
-      let text = method === "HEAD" ? "" : (await r.text()).slice(0, 600000);
-      if (type.includes("html")) text = readable(text);
-      const head = method === "GET" ? `HTTP ${r.status}` : `HTTP ${r.status} ${type}`;
+      const r = await this.follow(method, url, h, payload, 25000, 600000);
+      const text = r.type.includes("html") ? readable(r.text) : r.text;
+      const head = method === "GET" ? `HTTP ${r.status}` : `HTTP ${r.status} ${r.type}`;
       return `${head}\n${clip(text.trim(), 12000)}`;
     } catch (e) {
-      return `ERROR: ${method} failed: ${clip(e?.message ?? e, 200)}`;
+      return e?.hop ? `ERROR: ${e.message}` : `ERROR: ${method} failed: ${clip(e?.message ?? e, 200)}`;
+    }
+  }
+
+  /// A fetch with its redirects followed by hand, so a hop to a private host is refused too, and the whole of it
+  /// (the body included) under one timer. `{status, type, text}`; throws what fetch threw, or a refused hop
+  /// (`hop` set on the error).
+  async follow(method, url, headers, payload, timeoutMs, limit) {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), timeoutMs);
+    try {
+      let r = await fetch(url, { method, signal: ctl.signal, redirect: "manual", headers, body: payload });
+      for (let hop = 0; hop < 5 && [301, 302, 303, 307, 308].includes(r.status) && r.headers.get("location"); hop++) {
+        const next = new URL(r.headers.get("location"), url);
+        if (!/^https?:$/.test(next.protocol) || privateHost(next.hostname)) throw Object.assign(new Error(`it redirects to ${next.hostname}, which a tot does not call`), { hop: true });
+        url = next.toString();
+        const keep = r.status === 307 || r.status === 308;
+        r = await fetch(url, { method: keep ? method : "GET", signal: ctl.signal, redirect: "manual", headers, body: keep ? payload : undefined });
+      }
+      const type = r.headers.get("content-type") ?? "";
+      return { status: r.status, type, text: method === "HEAD" ? "" : (await r.text()).slice(0, limit) };
     } finally {
       clearTimeout(timer);
     }
+  }
+
+  // ---------------------------------------------------------------- the guard, the leash, the owner's webhook
+
+  /// THE GUARD PASS: every target that is due, looked at and judged, with no model. A change of state is a
+  /// tripwire; the first look and a one-time change are noted. Never throws; stops when the alarm has no fetch
+  /// left. Returns the seconds until a target is due again, or null when nothing is guarded.
+  async guard(cfg) {
+    const list = cfg.watch ?? [];
+    if (list.length === 0) return null;
+    let nextS = Infinity;
+    let tripped = 0;
+    let checked = 0;
+    for (const t of list) {
+      const now = this.now();
+      const key = watchKey(t);
+      const last = await this.store.get("watch:" + key);
+      const every = Math.max(WATCH_MIN_S, t.every_s || cfg.pace_s);
+      if (last && now - last.t < every * 1000 - 1000) {
+        nextS = Math.min(nextS, Math.max(1, Math.ceil((last.t + every * 1000 - now) / 1000)));
+        if (last.state === "tripped") tripped += 1;
+        continue;
+      }
+      let obs;
+      try {
+        obs = await this.observe(cfg, t);
+      } catch (e) {
+        if (e instanceof TickBudget) break;
+        obs = { error: clip(e?.message ?? e, 200), ms: 0 };
+      }
+      checked += 1;
+      const v = judgeTarget(t, obs, last);
+      const row = {
+        t: now,
+        state: v.state,
+        why: v.why,
+        ms: obs.ms,
+        status: obs.status ?? 0,
+        hash: obs.hash || last?.hash || "",
+        answers: obs.answers ?? last?.answers ?? [],
+        since: last && last.state === v.state ? last.since : now,
+        fails: v.state === "tripped" ? (last?.fails ?? 0) + 1 : 0,
+      };
+      await this.store.put("watch:" + key, row);
+      nextS = Math.min(nextS, every);
+      if (v.state === "tripped") tripped += 1;
+      const label = watchLabel(t);
+      if (!last) await this.emit("guard", `watching ${label}: ${v.state === "ok" ? v.why : "TRIPPED, " + v.why}${obs.ms ? ` (${obs.ms} ms)` : ""}`, { ok: v.state === "ok", outcome: v.state, target: key });
+      else if (last.state !== v.state) await this.tripwire(cfg, v.state === "tripped" ? `TRIPWIRE ${label}: ${v.why}` : `RECOVERED ${label}: ${v.why}, after ${Math.round((now - last.since) / 1000)} s`, v.state, key);
+      if (v.change) await this.tripwire(cfg, `CHANGED ${label}: ${v.change}`, "changed", key);
+    }
+    return { next_s: Number.isFinite(nextS) ? nextS : Math.max(WATCH_MIN_S, cfg.pace_s), tripped, checked };
+  }
+
+  /// One look at a guarded target, as the guard sees it: the DNS answers of a name (DNS over HTTPS, the record
+  /// type asked for), or a page's status, text and - pinned - fingerprint. Throws when the alarm has no fetch
+  /// left (TickBudget) or the target does not answer.
+  async observe(cfg, t) {
+    const started = Date.now();
+    this.spend();
+    if (t.dns) {
+      const r = await fetch(`${DOH}?name=${encodeURIComponent(t.dns)}&type=${t.type}`, { headers: { accept: "application/dns-json", "user-agent": guardUa(cfg) }, signal: AbortSignal.timeout(10000) });
+      const j = await r.json();
+      const want = DNS_TYPE_NUM[t.type];
+      const answers = (Array.isArray(j.Answer) ? j.Answer : [])
+        .filter((x) => x && (x.type === want || x.type === undefined))
+        .map((x) => String(x.data ?? "").trim())
+        .filter((x) => x.length > 0)
+        .sort();
+      return { ms: Date.now() - started, status: Number.isInteger(j.Status) ? j.Status : -1, answers };
+    }
+    const r = await this.follow("GET", t.url, { "user-agent": guardUa(cfg), accept: "text/html,application/json,text/plain,*/*" }, undefined, 15000, WATCH_BODY_BYTES);
+    const text = r.type.includes("html") ? readable(r.text) : r.text;
+    return { ms: Date.now() - started, status: r.status, text, hash: t.pin ? fingerprint(text.replace(/\s+/g, " ").trim()) : "" };
+  }
+
+  /// A guarded target changed: the event (chained), the scratchpad (every tot of the account reads it), this
+  /// tot's inbox (its next iteration reads it as a directive, and that iteration is brought forward) and the
+  /// owner's webhook, when one is set.
+  async tripwire(cfg, text, outcome, key) {
+    const seq = await this.emit("tripwire", text, { ok: outcome === "ok", outcome, target: key });
+    try {
+      await call(stubFor(this.env, "pad"), "/pad/write", { from: cfg.name, text: clip(text, 1000) });
+    } catch {}
+    const inbox = (await this.store.get("inbox")) ?? [];
+    inbox.push({ t: this.now(), from: "guard", text: `${text}\nThe guard checks this target again every pass. Investigate with your tools, preserve what you find, and report it with evidence (say).` });
+    await this.store.put("inbox", inbox.slice(-INBOX_MAX));
+    await this.store.put("loop_due", 0);
+    await this.alert(cfg, outcome, text, { seq, hash: (await this.store.get("chain")) ?? "", target: key });
+  }
+
+  /// The owner's webhook (the ALERT_URL secret: `veil --tater key alert <https://...>`): one JSON POST a chat
+  /// webhook renders as it is (`content` for Discord, `text` for Slack), with the event beside it. Never throws.
+  async alert(cfg, kind, text, extra) {
+    const url = String(this.env.ALERT_URL ?? "").trim();
+    if (!/^https:\/\//i.test(url)) return false;
+    try {
+      if (privateHost(new URL(url).hostname)) return false;
+      this.spend();
+      const line = `[veil-tot ${cfg.name}] ${kind}: ${clip(text.split("\n")[0], 600)}`;
+      const r = await fetch(url, {
+        method: "POST",
+        headers: { "content-type": "application/json", "user-agent": guardUa(cfg) },
+        body: JSON.stringify({ source: "veil-tot", tot: cfg.name, kind, t: this.now(), content: line, text: line, event: { text: clip(text, 2000), ...(extra ?? {}) } }),
+        signal: AbortSignal.timeout(10000),
+      });
+      return r.status < 400;
+    } catch {
+      return false;
+    }
+  }
+
+  /// The owner's veil called: the leash's clock restarts, and a held tot resumes.
+  async contact(cfg) {
+    const now = this.now();
+    const last = (await this.store.get("last_contact")) ?? 0;
+    if (now - last >= 10000) await this.store.put("last_contact", now);
+    if (await this.store.get("leashed")) {
+      await this.store.delete("leashed");
+      await this.emit("status", `the owner's veil is back; ${cfg.name} resumes its goal loop`);
+      await this.wake(cfg);
+    }
+  }
+
+  /// With a leash, no contact from the owner's veil for leash_s holds the goal loop; the guard goes on. Said
+  /// once, and the owner's webhook hears it. True while held.
+  async leashCheck(cfg) {
+    const s = cfg.leash_s ?? 0;
+    if (!(s > 0)) return false;
+    const last = (await this.store.get("last_contact")) ?? cfg.created;
+    const held = this.now() - last > s * 1000;
+    if (held && !(await this.store.get("leashed"))) {
+      await this.store.put("leashed", this.now());
+      const text = `leashed: no contact from the owner's veil for ${Math.round((this.now() - last) / 1000)} s (the leash is ${s} s). The goal loop holds and the guard goes on; any call from the owner's veil releases it.`;
+      await this.emit("status", text, { ok: false });
+      await this.alert(cfg, "leashed", text, {});
+    }
+    return held;
+  }
+
+  /// The guard list as the model sees it, each target with its last state.
+  async guardText(cfg) {
+    const list = cfg.watch ?? [];
+    if (list.length === 0) return "";
+    const lines = [];
+    for (const t of list) {
+      const w = await this.store.get("watch:" + watchKey(t));
+      lines.push(`- ${watchLabel(t)}: ${w ? `${w.state.toUpperCase()} ${w.why} (since ${new Date(w.since).toISOString()})` : "not checked yet"}`);
+    }
+    return "GUARD LIST (checked every heartbeat before you run, without a model; a TRIPWIRE outranks your plan):\n" + lines.join("\n") + "\n";
+  }
+
+  /// /guard: the targets this tot watches every heartbeat without a model.
+  async guardCommand(cfg, rest) {
+    const gc = parseGuardCommand(rest);
+    const list = cfg.watch ?? [];
+    if (gc.op === "error") return gc.err;
+    if (gc.op === "list") {
+      if (list.length === 0) return "Nothing is guarded. " + GUARD_USAGE;
+      const lines = [];
+      for (const [i, t] of list.entries()) {
+        const w = await this.store.get("watch:" + watchKey(t));
+        lines.push(`${i + 1}. ${watchLabel(t)} every ${t.every_s || cfg.pace_s}s${t.text ? ` text "${t.text}"` : ""}${t.status ? ` status ${t.status}` : ""}${t.pin ? " pinned" : ""}: ${w ? `${w.state.toUpperCase()} ${w.why} (since ${new Date(w.since).toISOString()})` : "not checked yet"}`);
+      }
+      return lines.join("\n");
+    }
+    if (gc.op === "clear") {
+      for (const t of list) await this.store.delete("watch:" + watchKey(t));
+      cfg.watch = [];
+      await this.store.put("cfg", cfg);
+      return "The guard list is empty.";
+    }
+    if (gc.op === "rm") {
+      const i = gc.index !== undefined ? gc.index - 1 : list.findIndex((t) => watchKey(t) === gc.key);
+      if (!(i >= 0 && i < list.length)) return `Not guarded. /guard lists ${list.length} target(s) by number.`;
+      const [gone] = list.splice(i, 1);
+      await this.store.delete("watch:" + watchKey(gone));
+      cfg.watch = list;
+      await this.store.put("cfg", cfg);
+      return `No longer guarding ${watchLabel(gone)}.`;
+    }
+    const key = watchKey(gc.target);
+    if (list.some((t) => watchKey(t) === key)) return `${watchLabel(gc.target)} is already guarded.`;
+    if (list.length >= WATCH_MAX) return `A tot guards at most ${WATCH_MAX} targets; /guard rm one first, or deploy another tot.`;
+    cfg.watch = [...list, gc.target];
+    await this.store.put("cfg", cfg);
+    await this.wake(cfg);
+    return `Guarding ${watchLabel(gc.target)} every ${gc.target.every_s || cfg.pace_s}s; the first check runs at the next heartbeat, with no model. A change raises a tripwire event, a scratchpad entry, a message in this tot's inbox and, with an alert key set, the owner's webhook.`;
+  }
+
+  /// One call to Agent Garrett's stateless MCP endpoint (POST /mcp: JSON-RPC under a bearer of its own).
+  async garrettCall(cfg, method, params, what) {
+    if (!hasGarrett(this.env)) return "ERROR: Agent Garrett is not launched in this account (garrett_launch asks your human's veil for it)";
+    const url = String(this.env.GARRETT_MCP_URL).trim();
+    try {
+      if (privateHost(new URL(url).hostname)) return "ERROR: Agent Garrett's address is private; a tot only calls the public internet";
+    } catch {
+      return "ERROR: Agent Garrett's address is not a URL";
+    }
+    if (what === "call" && !/^[a-z][a-z0-9_]{1,40}$/.test(params.name)) return 'ERROR: name one of Agent Garrett\'s tools, as {"name": "nvd_lookup", "args": {"cveId": "CVE-2026-1234"}}; garrett_tools lists them';
+    this.spend();
+    let r;
+    let text;
+    try {
+      r = await fetch(url, {
+        method: "POST",
+        headers: { "content-type": "application/json", accept: "application/json", authorization: "Bearer " + this.env.GARRETT_MCP_TOKEN, "user-agent": guardUa(cfg) },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+        signal: AbortSignal.timeout(30000),
+      });
+      text = await r.text();
+    } catch (e) {
+      return `ERROR: Agent Garrett did not answer: ${clip(e?.message ?? e, 200)}`;
+    }
+    let j = null;
+    try {
+      j = JSON.parse(text);
+    } catch {}
+    if (!j || typeof j !== "object") return `ERROR: Agent Garrett answered HTTP ${r.status}: ${clip(text, 300)}`;
+    if (j.error) return `ERROR: Agent Garrett: ${clip(j.error.message ?? JSON.stringify(j.error), 400)}`;
+    if (what === "list") {
+      const tools = Array.isArray(j.result?.tools) ? j.result.tools : [];
+      if (tools.length === 0) return "(Agent Garrett lists no tools)";
+      const keys = Object.keys(tools[0].inputSchema?.properties ?? {});
+      return tools.map((t) => `- ${t.name}: ${clip(String(t.description ?? ""), 160)}`).join("\n") + (keys.length > 0 ? `\nArguments are strings; each tool reads the ones it needs from: ${keys.join(", ")}` : "");
+    }
+    const out = (Array.isArray(j.result?.content) ? j.result.content : []).filter((c) => c?.type === "text").map((c) => c.text).join("\n");
+    const meta = j.result?.structuredContent ? "\nEVIDENCE: " + clip(JSON.stringify(j.result.structuredContent), 600) : "";
+    return (j.result?.isError ? "FAILED: " : "") + clip(out || "(no text)", 12000) + meta;
   }
 
   /// Search the web: the first engine that answers with results. An engine that blocks or returns nothing is
@@ -2331,7 +2939,7 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
         const reply = await this.ask(
           cfg,
           [
-            { role: "system", content: "You improve an autonomous agent by writing rules for it. One rule, imperative, specific to what went wrong, at most 200 characters. No preamble." },
+            { role: "system", content: "You improve an autonomous agent by writing rules for it. One rule, imperative, specific to what the tool record proves went wrong, at most 200 characters. Identify a repair or a changed method; never invent credentials, selectors, capabilities or evidence. No preamble." },
             { role: "user", content: `GOAL: ${clip(g.text, 400)}\nTHE STEP: ${clip(step, 400)}\nWHAT HAPPENED (${outcome}):\n${clip(transcript, 2500)}\n\nRULES IT ALREADY HAS:\n${lessons.map((l) => "- " + l.text).join("\n") || "(none)"}\n\nWrite ONE new rule that would have made this iteration improve the goal, or reply exactly NONE if the existing rules already cover it.` },
           ],
           1000,
@@ -2386,24 +2994,28 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
     if (last.some((d) => d.id === g.id)) return;
     const n = ((await this.store.get("doneseq")) ?? 0) + 1;
     await this.store.put("doneseq", n);
-    await this.store.put("done:" + pad10(n), { id: g.id, text: clip(g.text, 300), status, improved: g.improved });
+    await this.store.put("done:" + pad10(n), { id: g.id, text: clip(g.text, 2000), status, improved: g.improved });
   }
 
   /// No goal and nothing queued: ask what the next best thing is. "" when there is nothing worth doing now.
   async roam(cfg) {
-    const ended = [...(await this.store.list({ prefix: "done:", reverse: true, limit: 8 })).values()];
+    const ended = [...(await this.store.list({ prefix: "done:", reverse: true, limit: ENDED_GOALS_CONTEXT })).values()];
     if (!cfg.charter && ended.length === 0) return ""; // nothing to roam from: wait for a goal
     const padTail = await this.padTail();
     const reply = await this.ask(
       cfg,
       [
-        { role: "system", content: this.systemPrompt(cfg, null, (await this.store.get("lessons")) ?? [], padTail) },
-        { role: "user", content: `You have no active goal.\nGOALS THAT ENDED (newest first):\n${ended.map((d) => `- ${d.status} (${d.improved} improved): ${d.text}`).join("\n") || "(none)"}\n\nWhat is the next best thing to pursue for your human: the most valuable goal that follows from the charter and from what ended above, that is NOT a repeat of a goal that plateaued? A stopped goal was stopped by the human: do not take it up again. Reply with ONLY the goal as one sentence, or exactly REST if nothing is worth doing right now.` },
+        { role: "system", content: this.systemPrompt(cfg, null, (await this.store.get("lessons")) ?? [], padTail) + (await this.workingMemory()) },
+        { role: "user", content: `You have no active goal.\nGOALS THAT ENDED (newest first):\n${ended.map((d) => `- ${d.status} (${d.improved} improved): ${clip(d.text, 400)}`).join("\n") || "(none)"}\n\nWhat is the next best thing to pursue for your human: the most valuable goal that follows from the charter and from what ended above, that is NOT a repeat of a goal that plateaued? A stopped goal was stopped by the human: do not take it up again. Changing a platform or rewording the same blocked investigation is not a new goal unless the new method addresses the recorded blocker. Prefer repairing that blocker or verifying an existing result. Reply with ONLY the goal as one sentence, or exactly REST if no useful action is available with the current evidence and tools.` },
       ],
       1200,
     );
     const text = clip(reply.replace(/^["'`\s]+|["'`\s]+$/g, ""), 600);
     if (text.length < 8 || /^REST\b/i.test(text)) return "";
+    if (repeatedGoal(text, ended)) {
+      await this.emit("status", "the proposed goal repeats ended work; reconsidering after the next rest interval");
+      return "";
+    }
     await this.emit("status", "no goal left; taking up the next best thing");
     return text;
   }

@@ -21,6 +21,7 @@ So the table is gone. Close this sheet and read the inventory.
 | [running a server](guide/server.md) | install, first login, the network bind, the default model, the shared provider key, accounts |
 | [desktop experience](guide/desktop.md) | settings pages, task progress, stable streaming, and code formatting |
 | [desktop updates](guide/updates.md) | Git-free release updates, recovery and Cloudflare outbound connectivity |
+| [the day after](guide/day-after.md) | arming tater-tots for an AI incident: the guard that needs no model, the evidence chain, the DEFEND posture, the leash, Agent Garrett over MCP |
 | [accounts and the sandbox](guide/accounts.md) | what a non-admin account can and cannot do, and why the line is capability rather than path |
 | [main](main.md) | the entry point itself — CLI dispatch, subsystem wiring, the route table, server or app mode |
 
