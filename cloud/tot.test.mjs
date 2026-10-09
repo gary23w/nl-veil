@@ -6,7 +6,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import worker, { Tot, DEFAULT_MAX_TOTS, MAX_TOTS_CEIL, PRIMARY, PLATEAU, firstJson, answerText, parseAction, nativeCalls, pickText, searchResults, privateHost, parseGoalCommand, parseVerdict, decide, newGoal, recordIteration, validName } from "./tot.js";
+import worker, { Tot, VERSION, DEFAULT_MAX_TOTS, MAX_TOTS_CEIL, PRIMARY, PLATEAU, firstJson, answerText, parseAction, nativeCalls, pickText, searchResults, privateHost, parseGoalCommand, parseVerdict, evidenceVerdict, repeatedGoal, decide, newGoal, recordIteration, validName, parseGuardCommand, watchKey, judgeTarget, chainHash, verifyChain } from "./tot.js";
 
 class Storage {
   constructor() {
@@ -99,6 +99,156 @@ function world(script) {
 }
 
 const said = (messages) => messages.map((m) => m.content).join("\n");
+const proofLine = (outcome, evidence, proof, score = "none") => `${outcome} | score: ${score} | evidence: ${evidence} | proof: ${JSON.stringify(proof)}`;
+
+test("progress requires a source observation, not a saved failure, invented quote or ungrounded score", () => {
+  const record = [
+    { tool: "write_file", args: { name: "result.txt" }, result: "saved result.txt (12 characters)" },
+    { tool: "web_fetch", args: { url: "https://tides.example/" }, result: "HTTP 429\nToo many requests" },
+    { tool: "browser_read", args: {}, result: "Today\nHigh tide 04:12\nLow tide 10:40" },
+    { tool: "read_file", args: { name: "result.txt" }, result: "Login failed" },
+  ];
+  for (const proof of [
+    { tool: 1, quote: "saved result.txt", kind: "observation" },
+    { tool: 2, quote: "Too many requests", kind: "observation" },
+    { tool: 3, quote: "Report submitted", kind: "observation" },
+    { tool: 4, quote: "Login failed", kind: "observation" },
+    { tool: 19, quote: "High tide 04:12", kind: "observation" },
+  ]) {
+    const v = evidenceVerdict(proofLine("IMPROVED", "reported success", proof, "1/1"), record);
+    assert.equal(v.verified, false);
+    assert.equal(decide({ best_num: 0, best_den: 1 }, v), "same"); // a false score cannot bypass the check
+    assert.equal(v.complete, false);
+  }
+  assert.equal(evidenceVerdict("IMPROVED | score: 1/1 | evidence: trust me", []).outcome, "same");
+  const good = evidenceVerdict(proofLine("IMPROVED", "tide time observed", { tool: 3, quote: "High tide 04:12", kind: "observation" }), record);
+  assert.equal(good.verified, true);
+  assert.equal(good.outcome, "improved");
+  assert.equal(evidenceVerdict(proofLine("IMPROVED", "same tide time", { tool: 3, quote: "High tide 04:12", kind: "observation" }), record, [good.proof_key]).outcome, "same");
+  const badScore = evidenceVerdict(proofLine("REGRESSED", "request failed", { tool: 2, quote: "Too many requests", kind: "observation", complete: true }, "9/10"), record);
+  assert.equal(decide({ best_num: 1, best_den: 10 }, badScore), "regressed");
+  assert.equal(badScore.complete, false);
+});
+
+test("artifact verification checks content and gives an unchanged file no second improvement", () => {
+  const record = [{ tool: "read_file", args: { name: "poem.txt" }, result: "The sea is blue\nThe sky is clear" }];
+  const v = evidenceVerdict(proofLine("IMPROVED", "requested poem read back", { tool: 1, quote: "The sea is blue", kind: "artifact", complete: true }, "1/1"), record);
+  assert.equal(v.verified, true);
+  assert.equal(v.complete, true);
+  const again = evidenceVerdict(proofLine("IMPROVED", "another line of the poem", { tool: 1, quote: "The sky is clear", kind: "artifact", complete: true }), record, [v.proof_key]);
+  assert.equal(again.outcome, "same");
+  assert.equal(again.complete, true); // a completed artifact may still be verified again
+  assert.equal(evidenceVerdict(proofLine("IMPROVED", "partial artifact", { tool: 1, quote: "The sea is blue", kind: "artifact", complete: true }, "1/2"), record).complete, false);
+});
+
+test("roaming recognizes an ended goal despite punctuation or a repeated-word preamble", () => {
+  const ended = [{ text: "Check the tide tables against the harbour source", status: "plateau" }];
+  assert.equal(repeatedGoal("CHECK the tide tables against the harbour source!", ended), true);
+  assert.equal(repeatedGoal("Check: check the tide tables against the harbour source.", ended), true);
+  assert.equal(repeatedGoal("Repair the Python runner and verify requests with a local fixture", ended), false);
+});
+
+test("a bare DONE and a fabricated perfect score never mark an unverified goal achieved", async () => {
+  const w = world((messages) => {
+    const text = said(messages);
+    if (text.includes("GOAL LOOP")) return "DONE";
+    if (text.includes("THIS ITERATION'S STEP")) return '{"final":"everything is complete"}';
+    if (text.includes("Grade the LAST iteration")) return "IMPROVED | score: 10/10 | evidence: everything complete";
+    return "NONE";
+  });
+  await w.req("POST", "/v1/tots", { goal: "retrieve ten public tide tables" });
+  await w.tick("Gary");
+  const g = await w.tot("Gary").store.get("goal");
+  assert.equal(g.status, "active");
+  assert.equal(g.improved, 0);
+  assert.equal(g.best_den, 0);
+  assert.equal(g.flat, 1);
+  assert.ok((await w.events("Gary")).some((e) => e.kind === "pick" && /Verify the entire goal/.test(e.text)));
+  assert.ok(!(await w.events("Gary")).some((e) => /goal achieved/.test(e.text)));
+});
+
+test("a failed runner and its saved error earn no progress and remain visible after the human changes the goal", async () => {
+  let phase = "failure";
+  const w = world((messages) => {
+    const text = said(messages);
+    if (text.includes("GOAL LOOP")) {
+      if (phase === "fallback") {
+        assert.match(text, /LAST MEASURED WORK[\s\S]*NoGilError/);
+        assert.match(text, /CURRENT UTC TIME: 2026-10-01T12:00:00\.000Z/);
+        return "Read the browser result instead of reusing the broken runner";
+      }
+      return "Fetch public tide tables with Python and verify the response";
+    }
+    if (text.includes("THIS ITERATION'S STEP")) {
+      if (phase === "fallback") return '{"final":"next method selected"}';
+      if (!text.includes("RESULT of run_python")) return '{"tool":"run_python","args":{"code":"print(1)"}}';
+      assert.match(text, /This attempt failed\. Diagnose its cause/);
+      if (!text.includes("RESULT of write_file")) return '{"tool":"write_file","args":{"name":"failure.txt","text":"NoGilError: runner failed"}}';
+      return '{"final":"saved the failure"}';
+    }
+    if (text.includes("Grade the LAST iteration")) return phase === "failure" ? proofLine("IMPROVED", "failure.txt saved", { tool: 2, quote: "saved failure.txt", kind: "observation" }, "1/1") : "SAME | score: none | evidence: no new result";
+    return "NONE";
+  });
+  w.env.PY = { fetch: async (_url, init) => {
+    if (JSON.parse(init.body).caps) return new Response(JSON.stringify({ ok: true, native: [] }));
+    throw new Error("NoGilError: Attempted to use PyProxy when Python GIL not held");
+  } };
+  await w.req("POST", "/v1/tots", { goal: "retrieve public tide tables" });
+  await w.tick("Gary");
+  assert.equal((await w.tot("Gary").store.get("goal")).improved, 0);
+  assert.equal((await w.tot("Gary").store.get("note:failure.txt")).text, "NoGilError: runner failed");
+  phase = "fallback";
+  await w.req("POST", "/v1/tots/Gary/command", { text: "/goal verify public tide tables using the browser" });
+  await w.tick("Gary");
+  assert.equal((await w.tot("Gary").store.get("goal")).iteration, 1);
+});
+
+test("the judge sees a confirmation at the end of a long tool response", async () => {
+  const w = world((messages) => {
+    const text = said(messages);
+    if (text.includes("GOAL LOOP")) return "Fetch and verify the tide table";
+    if (text.includes("THIS ITERATION'S STEP")) return text.includes("RESULT of web_fetch") ? '{"final":"table retrieved"}' : '{"tool":"web_fetch","args":{"url":"https://tides.example/today"}}';
+    if (text.includes("Grade the LAST iteration")) {
+      assert.match(text, /T1 TOOL web_fetch/);
+      assert.match(text, /High tide 04:12\nLow tide 10:40/);
+      return proofLine("IMPROVED", "tide table retrieved", { tool: 1, quote: "High tide 04:12\nLow tide 10:40", kind: "observation", complete: true }, "1/1");
+    }
+    return "NONE";
+  });
+  await w.req("POST", "/v1/tots", { goal: "retrieve today's high and low tide times" });
+  w.tot("Gary").runTool = async () => "HTTP 200\n" + "Navigation\n".repeat(2200) + "High tide 04:12\nLow tide 10:40";
+  await w.tick("Gary");
+  assert.equal((await w.tot("Gary").store.get("goal")).status, "achieved");
+});
+
+test("roaming remembers more than eight ended goals and explicit queued work can still revisit them", async () => {
+  const repeated = "Retrieve public tide times for the harbour from the coast source";
+  const w = world((messages) => {
+    const text = said(messages);
+    if (text.includes("You have no active goal")) {
+      assert.match(text, /Retrieve public tide times for the harbour from the coast source/);
+      return repeated.toUpperCase() + "!";
+    }
+    if (text.includes("GOAL LOOP")) return "Verify the source again after the human's new request";
+    if (text.includes("THIS ITERATION'S STEP")) return '{"final":"no new observation"}';
+    return "NONE";
+  });
+  await w.req("POST", "/v1/tots", { goal: "current work has ended", pace_s: 60 });
+  const tot = w.tot("Gary");
+  const g = await tot.store.get("goal");
+  g.status = "plateau";
+  await tot.store.put("goal", g);
+  for (let i = 1; i <= 12; i++) await tot.store.put("done:" + String(i).padStart(10, "0"), { id: i + 20, text: i === 1 ? repeated : "ended unrelated work " + i, status: "plateau", improved: 0 });
+  await tot.store.put("doneseq", 12);
+  await w.tick("Gary");
+  assert.equal((await tot.store.get("goal")).id, g.id);
+  assert.equal(tot.store.alarm, w.now + 120000);
+  assert.ok((await w.events("Gary")).some((e) => /proposed goal repeats ended work/.test(e.text)));
+  await w.req("POST", "/v1/tots/Gary/command", { text: "/queue " + repeated });
+  await w.tick("Gary");
+  assert.equal((await tot.store.get("goal")).text, repeated);
+  assert.equal((await tot.store.get("goal")).iteration, 1);
+});
 
 test("RSI edits the actual shared runtime without a local grant, keeps revisions, and reports deployment failures", async () => {
   const w = world();
@@ -281,38 +431,48 @@ test("one alarm is one iteration: pick, act with tools, a measured verdict, a lo
       assert.match(text, /write_file/);
       assert.doesNotMatch(text, /local_run/); // not granted
       assert.doesNotMatch(text, /- browser_open|- run_python/); // no binding, so not offered...
-      assert.match(text, /NOT AVAILABLE in this account right now: a browser \(browser_\*\) and Python/); // ...and said so
+      assert.match(text, /NOT AVAILABLE in this account right now: a browser \(browser_\*\), Python \(run_python, skills\), Agent Garrett's security tools/); // ...and said so
       return 'I will save it.\n{"tool": "note_write", "args": {"name": "sources.md", "text": "a\\nb\\nc"}}';
     }
     if (n === 3) {
       assert.match(text, /RESULT of write_file:\nsaved sources.md \(5 characters\)/); // the old name still works
-      return '{"final": "saved 3 URLs to sources.md"}';
+      return '{"tool": "read_file", "args": {"name": "sources.md"}}';
     }
     if (n === 4) {
+      assert.match(text, /RESULT of read_file:\na\nb\nc/);
+      return '{"final": "saved 3 URLs to sources.md"}';
+    }
+    if (n === 5) {
       assert.match(text, /TOOL write_file/);
-      return "IMPROVED | score: 3/10 | evidence: sources.md saved with 3 of 10 sources";
+      return proofLine("IMPROVED", "sources.md saved with 3 of 3 sources", { tool: 2, quote: "a\nb\nc", kind: "artifact" }, "3/3");
     }
     throw new Error("unexpected model call " + n);
   });
-  await w.req("POST", "/v1/tots", { goal: "collect ten sources on tide tables", pace_s: 120 });
+  await w.req("POST", "/v1/tots", { goal: "write three source URLs in sources.md", pace_s: 120 });
   assert.equal(w.tot("Gary").store.alarm, w.now + 1000);
   await w.tick("Gary");
-  assert.equal(w.asked.length, 4);
+  assert.equal(w.asked.length, 5);
   const st = (await w.req("GET", "/v1/tots/Gary")).body.tot;
   assert.equal(st.goal.iteration, 1);
   assert.equal(st.goal.improved, 1);
   assert.equal(st.goal.best_num, 3);
-  assert.equal(st.calls_today, 4);
+  assert.equal(st.calls_today, 5);
   assert.equal(st.next_tick, w.now + 120000);
   assert.equal(st.state, "working");
   const kinds = (await w.events("Gary")).map((e) => e.kind);
-  assert.deepEqual(kinds, ["status", "goal", "pick", "act", "verdict"]);
+  assert.deepEqual(kinds, ["status", "goal", "pick", "act", "act", "verdict"]);
   assert.equal((await w.tot("Gary").store.get("note:sources.md")).text, "a\nb\nc");
 
-  // The next iteration's pick sees the log, and DONE ends a finite goal as achieved.
+  // DONE triggers a fresh read-back; completion is established by that observation.
   w.script = (messages) => {
-    assert.match(said(messages), /1\. improved: Save the three source URLs in a note \(sources\.md saved with 3 of 10 sources\) \[3\/10\]/);
-    return "DONE";
+    const text = said(messages);
+    if (text.includes("GOAL LOOP")) {
+      assert.match(text, /1\. improved: Save the three source URLs in a note \(sources\.md saved with 3 of 3 sources\) \[3\/3\]/);
+      return "DONE";
+    }
+    if (text.includes("THIS ITERATION'S STEP")) return text.includes("RESULT of read_file") ? '{"final":"verified the file"}' : '{"tool":"read_file","args":{"name":"sources.md"}}';
+    if (text.includes("Grade the LAST iteration")) return proofLine("SAME", "all sources read back", { tool: 1, quote: "a\nb\nc", kind: "artifact", complete: true }, "3/3");
+    return "NONE";
   };
   await w.tick("Gary");
   const done = (await w.req("GET", "/v1/tots/Gary")).body.tot;
@@ -358,17 +518,21 @@ test("a goal that ends hands over to the queue, then to a goal the tot proposes 
       return roamAnswer;
     }
     if (text.includes("GOAL LOOP")) return "DONE";
+    if (text.includes("THIS ITERATION'S STEP")) return text.includes("RESULT of read_file") ? '{"final":"verified"}' : '{"tool":"read_file","args":{"name":"checks.txt"}}';
+    if (text.includes("Grade the LAST iteration")) return proofLine("SAME", "all checks passed", { tool: 1, quote: "all checks passed", kind: "artifact", complete: true }, "1/1");
+    if (text.includes("Write ONE new rule")) return "NONE";
     throw new Error("unexpected: " + text.slice(0, 80));
   });
   let roamAnswer = "Check the tide tables for errors against a second source";
   await w.req("POST", "/v1/tots", { goal: "first goal here", charter: "keep the tide site accurate", pace_s: 60 });
+  await w.tot("Gary").saveFile("checks.txt", "all checks passed");
   await w.req("POST", "/v1/tots/Gary/command", { text: "/queue second goal here" });
-  await w.tick("Gary"); // first: DONE
-  await w.tick("Gary"); // takes the queued goal and picks: DONE
+  await w.tick("Gary"); // first: DONE and verification
+  await w.tick("Gary"); // takes the queued goal and verifies it
   let st = (await w.req("GET", "/v1/tots/Gary")).body.tot;
   assert.equal(st.goal.text, "second goal here");
   assert.equal(st.goal.status, "achieved");
-  await w.tick("Gary"); // nothing queued: roam proposes, then pick says DONE
+  await w.tick("Gary"); // nothing queued: roam proposes, then pick verifies completion
   st = (await w.req("GET", "/v1/tots/Gary")).body.tot;
   assert.equal(st.goal.text, "Check the tide tables for errors against a second source");
   roamAnswer = "REST";
@@ -531,11 +695,12 @@ test("a model family that only takes `input` is learned once and remembered", as
     return { output: [{ type: "message", content: [{ type: "output_text", text: "DONE" }] }] };
   };
   await w.req("POST", "/v1/tots", { goal: "first goal here", model: "@cf/some/responses-model" });
-  await w.tick("Gary");
+  const tot = w.tot("Gary");
+  await tot.ask(await tot.store.get("cfg"), [{ role: "user", content: "hello" }], 2000);
   assert.deepEqual(w.asked.map((a) => (a.messages ? "messages" : "input")), ["messages", "input"]);
-  assert.equal((await w.tot("Gary").store.get("goal")).status, "achieved");
+  assert.equal((await tot.store.get("goal")).status, "active"); // a model answer alone never completes a goal
   await w.req("POST", "/v1/tots/Gary/command", { text: "/goal another goal here" });
-  await w.tick("Gary");
+  await tot.ask(await tot.store.get("cfg"), [{ role: "user", content: "hello again" }], 2000);
   assert.equal(w.asked.length, 3); // straight to `input` this time
   assert.ok(w.asked[2].input);
 });
@@ -740,9 +905,10 @@ test("a reply with no text is asked again with more room, and a model that stays
     return { response: "DONE" };
   };
   await w.req("POST", "/v1/tots", { goal: "first goal here" });
-  await w.tick("Gary");
+  const tot = w.tot("Gary");
+  await tot.ask(await tot.store.get("cfg"), [{ role: "user", content: "hello" }], 2000);
   assert.deepEqual(sizes, [2000, 6000]); // the pick, then the pick again with three times the room
-  assert.equal((await w.tot("Gary").store.get("goal")).status, "achieved");
+  assert.equal((await tot.store.get("goal")).status, "active");
 
   await w.req("POST", "/v1/tots/Gary/command", { text: "/goal another goal here" });
   // a model that only ever reasons: the model that does not reason answers for it, and the tot says so once
@@ -750,8 +916,8 @@ test("a reply with no text is asked again with more room, and a model that stays
   const real = w.env.AI.run;
   w.env.AI.run = async (model, input) => (model === "@cf/meta/llama-3.3-70b-instruct-fp8-fast" ? { response: "DONE" } : real(model, input));
   await w.req("POST", "/v1/tots/Gary/config", { model: "@cf/zai-org/reasons-only" });
-  await w.tick("Gary");
-  assert.equal((await w.tot("Gary").store.get("goal")).status, "achieved");
+  await tot.ask(await tot.store.get("cfg"), [{ role: "user", content: "hello again" }], 2000);
+  assert.equal((await tot.store.get("goal")).status, "active");
   assert.equal((await w.events("Gary")).filter((e) => /returned no visible answer/.test(e.text)).length, 1);
 
   // and when nothing answers at all, it is an error
@@ -765,7 +931,7 @@ test("a reply with no text is asked again with more room, and a model that stays
 });
 
 test("model calls a day can be unlimited, and a tot may iterate every 5 seconds", async () => {
-  const w = world(() => "DONE");
+  const w = world((messages) => said(messages).includes("GOAL LOOP") ? "Inspect the current result" : '{"final":"nothing verified"}');
   const made = await w.req("POST", "/v1/tots", { goal: "first goal here", daily_calls: 0, pace_s: 5 });
   assert.equal(made.body.tot.daily_calls, 0);
   assert.equal(made.body.tot.pace_s, 5);
@@ -773,7 +939,7 @@ test("model calls a day can be unlimited, and a tot may iterate every 5 seconds"
   await gary.store.put("usage", { day: "2026-10-01", calls: 999999, total: 999999 });
   assert.equal((await w.req("GET", "/v1/tots/Gary")).body.tot.state, "working"); // never "resting"
   await w.tick("Gary");
-  assert.equal(w.asked.length, 1); // it still called the model
+  assert.ok(w.asked.length > 0); // it still called the model
   assert.match((await w.req("POST", "/v1/tots/Gary/command", { text: "/calls 250" })).body.reply, /250 model calls a day/);
   assert.match((await w.req("POST", "/v1/tots/Gary/command", { text: "/calls unlimited" })).body.reply, /no limit on model calls/);
   assert.equal((await w.req("POST", "/v1/tots/Gary/config", { daily_calls: 3 })).body.tot.daily_calls, 10); // a count is at least 10
@@ -806,9 +972,10 @@ test("memory and plan: facts are kept and found again, the plan rides every late
       assert.match(text, /YOUR PLAN[\s\S]*1\. \[x\] find sources[\s\S]*2\. \[ \] check them/);
       assert.match(text, /FACTS YOU KEPT[\s\S]*the tide API key lives in settings.json/);
       assert.match(text, /YOUR FILES: notes.md \(2\)/);
-      return "DONE";
+      return "Inspect the current plan";
     }
-    throw new Error("unexpected");
+    if (text.includes("THIS ITERATION'S STEP")) return '{"final":"plan inspected"}';
+    return "NONE";
   });
   await w.req("POST", "/v1/tots", { goal: "first goal here" });
   const gary = w.tot("Gary");
@@ -824,7 +991,8 @@ test("memory and plan: facts are kept and found again, the plan rides every late
   assert.match(await run("plan_done", { item: 9 }), /ERROR/);
   await run("write_file", { name: "notes.md", text: "hi" });
   await w.tick("Gary");
-  assert.equal((await gary.store.get("goal")).status, "achieved"); // the prompt assertions above ran
+  assert.equal((await gary.store.get("goal")).iteration, 1); // the prompt assertions above ran
+  assert.equal((await gary.store.get("goal")).status, "active");
 });
 
 test("search results are read out of an engine's HTML: the real link, the title, the snippet; engine links dropped", () => {
@@ -893,7 +1061,7 @@ test("Python as it is: the tot is told what its Python has and cannot have, a re
     const all = said(messages);
     if (all.includes("You grade ONE iteration")) return "SAME | score: none | evidence: the install failed, nothing changed";
     if (all.includes("You improve an autonomous agent")) return "NONE";
-    if (all.includes("THIS ITERATION'S STEP")) return all.includes("TOOL RESULT") || all.includes("has no pure-Python wheel") ? '{"final": "could not chart it"}' : '{"tool": "run_python", "args": {"code": "import matplotlib"}}';
+    if (all.includes("THIS ITERATION'S STEP")) return messages.some((m) => m.role === "user" && m.content.startsWith("RESULT of run_python")) ? '{"final": "could not chart it"}' : '{"tool": "run_python", "args": {"code": "import matplotlib"}}';
     return "Chart the table with matplotlib.";
   });
   let native = [];
@@ -917,7 +1085,7 @@ test("Python as it is: the tot is told what its Python has and cannot have, a re
   assert.match(pick, /YOUR PYTHON: the standard library, requests and urllib\. Any other pure-Python package installs/);
   assert.match(pick, /NOT here and not installable \(native code\): numpy, pandas, matplotlib, /);
   assert.match(pick, /choose only a step your tools and YOUR PYTHON as listed above can carry out/);
-  assert.match(pick, /a checklist file of concrete items a tool can verify/);
+  assert.match(pick, /Establish how finished is measured once/);
   // what the runner refused is kept, named in the next prompt, and sent along so it is not looked up again
   assert.deepEqual(await gary.store.get("py_missing"), ["matplotlib", "oddnative"]);
   assert.match(await gary.workingMemory(), /not installable \(native code\): .*oddnative - never choose a step that needs one/);
@@ -1343,5 +1511,396 @@ test("web_search walks the keyless chain: a SearXNG instance that answers is rem
     assert.match(await gary.runTool(cfg, "web_search", {}, ""), /ERROR: give the words/);
   } finally {
     globalThis.fetch = realFetch;
+  }
+});
+
+// ------------------------------------------------------------------------------------------ the day-after kit
+
+const TOT_UA = `veil-tot/${VERSION} (Gary; +https://github.com/gary23w/nl-veil)`;
+
+test("pure: the /guard grammar, each target's key, and what one look at a target says", () => {
+  assert.deepEqual(parseGuardCommand(""), { op: "list" });
+  assert.deepEqual(parseGuardCommand("clear"), { op: "clear" });
+  assert.deepEqual(parseGuardCommand('add https://svc.example/health --text "status: OK" --status 200 --every 45 --pin'), { op: "add", target: { url: "https://svc.example/health", text: "status: OK", status: 200, every_s: 45, pin: true } });
+  assert.deepEqual(parseGuardCommand("add https://svc.example/"), { op: "add", target: { url: "https://svc.example/", text: "", status: 0, every_s: 0, pin: false } });
+  assert.deepEqual(parseGuardCommand("add dns:Example.com. --type mx"), { op: "add", target: { dns: "example.com", type: "MX", every_s: 0 } });
+  assert.equal(parseGuardCommand("add dns:example.com --type PTR").op, "error");
+  assert.equal(parseGuardCommand("add dns:not a name").op, "error");
+  assert.equal(parseGuardCommand("add http://10.0.0.1/").op, "error"); // a private address is never guarded
+  assert.equal(parseGuardCommand("add ftp://x").op, "error");
+  assert.equal(parseGuardCommand("add https://x.example/ --bogus").op, "error");
+  assert.equal(parseGuardCommand("add https://x.example/ --status 42").op, "error");
+  assert.equal(parseGuardCommand("add https://x.example/ --every 5").target.every_s, 30); // floored
+  assert.deepEqual(parseGuardCommand("rm #2"), { op: "rm", index: 2 });
+  assert.deepEqual(parseGuardCommand("rm https://x.example/"), { op: "rm", key: "http:https://x.example/" });
+  assert.deepEqual(parseGuardCommand("rm dns:x.example"), { op: "rm", key: "dns:x.example/A" });
+  assert.equal(parseGuardCommand("bogus").op, "error");
+  assert.equal(watchKey({ url: "https://x/" }), "http:https://x/");
+  assert.equal(watchKey({ dns: "x.example", type: "NS" }), "dns:x.example/NS");
+  const t = { url: "https://x/", text: "OK", status: 0, pin: true };
+  assert.deepEqual(judgeTarget(t, { error: "fetch failed" }), { state: "tripped", why: "unreachable: fetch failed", change: "" });
+  assert.equal(judgeTarget(t, { status: 503, text: "OK" }).why, "HTTP 503");
+  assert.equal(judgeTarget({ ...t, status: 204 }, { status: 200, text: "OK" }).why, "HTTP 200 (expected 204)");
+  assert.equal(judgeTarget(t, { status: 200, text: "nope" }).why, 'expected text missing: "OK"');
+  assert.deepEqual(judgeTarget(t, { status: 200, text: "OK", hash: "b" }, { hash: "a" }), { state: "ok", why: "HTTP 200", change: "content changed (fingerprint a -> b)" });
+  assert.equal(judgeTarget({ ...t, pin: false }, { status: 200, text: "OK", hash: "b" }, { hash: "a" }).change, ""); // not pinned: a page may change
+  assert.equal(judgeTarget({ ...t, text: "" }, { status: 301, text: "" }).state, "ok");
+  const d = { dns: "x.example", type: "A" };
+  assert.equal(judgeTarget(d, { status: 2, answers: [] }).why, "DNS status 2 (SERVFAIL)");
+  assert.equal(judgeTarget(d, { status: 0, answers: [] }).why, "no A answer");
+  assert.deepEqual(judgeTarget(d, { status: 0, answers: ["1.1.1.1"] }, { answers: ["2.2.2.2"] }), { state: "ok", why: "1 A answer(s)", change: "A answer changed: [2.2.2.2] -> [1.1.1.1]" });
+  assert.equal(judgeTarget(d, { status: 0, answers: ["1.1.1.1"] }, { answers: ["1.1.1.1"] }).change, "");
+});
+
+test("the guard runs every heartbeat before the model and without one: a tripwire reaches the events, the scratchpad, the inbox and the owner's webhook, and the watch keeps its cadence through a dead model and a spent budget", async () => {
+  const w = world(() => {
+    throw new Error("AI is down: 5007"); // the model is gone from the start
+  });
+  await w.req("POST", "/v1/tots", { goal: "first goal here", pace_s: 600, daily_calls: 10 });
+  const gary = w.tot("Gary");
+  w.env.ALERT_URL = "https://hooks.example/abc";
+  const realFetch = globalThis.fetch;
+  const seen = [];
+  let up = true;
+  globalThis.fetch = async (url, init) => {
+    const u = String(url);
+    seen.push({ method: init?.method ?? "GET", url: u, ua: init?.headers?.["user-agent"] ?? "", body: init?.body });
+    if (u === "https://hooks.example/abc") return new Response("", { status: 204 });
+    if (u === "https://svc.example/health") return up ? new Response("<html><body><p>status: OK</p></body></html>", { status: 200, headers: { "content-type": "text/html" } }) : new Response("down", { status: 503 });
+    return new Response("?", { status: 404 });
+  };
+  try {
+    const r = (await w.req("POST", "/v1/tots/Gary/command", { text: '/guard add https://svc.example/health --text "status: OK" --every 60' })).body;
+    assert.match(r.reply, /^Guarding https:\/\/svc\.example\/health every 60s/);
+    assert.equal(r.tot.watch, 1);
+    assert.equal(gary.store.alarm, w.now + 1000);
+    assert.match((await w.req("POST", "/v1/tots/Gary/command", { text: "/guard add https://svc.example/health" })).body.reply, /already guarded/);
+
+    // the first heartbeat: the guard looks (no model), then the goal loop tries the model and fails
+    await w.tick("Gary");
+    let evs = await w.events("Gary");
+    const first = evs.find((e) => e.kind === "guard");
+    assert.match(first.text, /^watching https:\/\/svc\.example\/health: HTTP 200/);
+    assert.equal(first.ok, true);
+    assert.equal(first.target, "http:https://svc.example/health");
+    assert.ok(evs.some((e) => e.kind === "error" && /AI is down/.test(e.text)));
+    assert.equal(seen[0].ua, TOT_UA); // the guard's checks name the tot, always
+    assert.equal(gary.store.alarm, w.now + 60000); // the guard's cadence, not the loop's 1200 s backoff
+    assert.equal(await gary.store.get("loop_due"), w.now + 1200000);
+    let st = (await w.req("GET", "/v1/tots/Gary")).body.tot;
+    assert.equal(st.guard_ok, 1);
+    assert.equal(st.guard_tripped, 0);
+    assert.match(said(w.asked[0].input.messages), /GUARD LIST \(checked every heartbeat before you run, without a model/);
+
+    // the target goes down: the guard trips, and the tripwire brings the goal loop forward in the same heartbeat
+    up = false;
+    w.now += 60000;
+    await w.tick("Gary");
+    assert.equal(w.asked.length, 2); // the loop ran at once (its 1200 s backoff dropped), reading the tripwire as a directive
+    assert.match(said(w.asked[1].input.messages), /NEW MESSAGES \(a message from human or guard is a directive[^]*- guard: TRIPWIRE https:\/\/svc\.example\/health: HTTP 503\nThe guard checks this target again every pass/);
+    evs = await w.events("Gary");
+    const trip = evs.find((e) => e.kind === "tripwire");
+    assert.match(trip.text, /^TRIPWIRE https:\/\/svc\.example\/health: HTTP 503/);
+    assert.equal(trip.ok, false);
+    assert.equal(trip.outcome, "tripped");
+    assert.ok(evs.findIndex((e) => e.kind === "tripwire") < evs.findLastIndex((e) => e.kind === "error")); // the guard spoke first
+    const pad = (await w.req("GET", "/v1/pad")).body.entries;
+    assert.ok(pad.some((e) => e.from === "Gary" && /^TRIPWIRE https:\/\/svc\.example\/health/.test(e.text)));
+    const hook = seen.find((s) => s.url === "https://hooks.example/abc");
+    assert.equal(hook.method, "POST");
+    assert.equal(hook.ua, TOT_UA);
+    const body = JSON.parse(hook.body);
+    assert.equal(body.source, "veil-tot");
+    assert.equal(body.tot, "Gary");
+    assert.equal(body.kind, "tripped");
+    assert.match(body.content, /^\[veil-tot Gary\] tripped: TRIPWIRE https:\/\/svc\.example\/health: HTTP 503$/);
+    assert.equal(body.text, body.content); // Discord reads content, Slack reads text
+    assert.equal(body.event.hash, trip.hash);
+    assert.equal(body.event.target, "http:https://svc.example/health");
+    assert.equal(await gary.store.get("loop_due"), w.now + 1800000); // the loop failed again: its backoff grew
+    st = (await w.req("GET", "/v1/tots/Gary")).body.tot;
+    assert.equal(st.guard_tripped, 1);
+    assert.equal(st.guard_ok, 0);
+
+    // the next heartbeat: still down, so nothing new to say, and the loop's backoff holds
+    w.now += 60000;
+    await w.tick("Gary");
+    assert.equal(w.asked.length, 2);
+    assert.equal((await w.events("Gary")).filter((e) => e.kind === "tripwire").length, 1);
+
+    // recovery: said, and the loop is brought forward again
+    up = true;
+    w.now += 60000;
+    await w.tick("Gary");
+    const rec = (await w.events("Gary")).filter((e) => e.kind === "tripwire").at(-1);
+    assert.match(rec.text, /^RECOVERED https:\/\/svc\.example\/health: HTTP 200, after 120 s/);
+    assert.equal(rec.ok, true);
+    assert.equal(rec.outcome, "ok");
+    assert.equal(w.asked.length, 3);
+    assert.equal(seen.filter((s) => s.url === "https://hooks.example/abc").length, 2);
+
+    // the daily budget is spent: the rest is said once, and the guard keeps its cadence until tomorrow
+    await gary.store.put("usage", { day: "2026-10-01", calls: 10, total: 10 });
+    await gary.store.put("loop_due", 0);
+    w.now += 60000;
+    await w.tick("Gary");
+    assert.equal((await w.req("GET", "/v1/tots/Gary")).body.tot.state, "resting");
+    assert.equal(gary.store.alarm, w.now + 60000);
+    w.now += 60000;
+    await w.tick("Gary");
+    assert.equal((await w.events("Gary")).filter((e) => /resting until tomorrow/.test(e.text)).length, 1);
+    assert.equal(seen.filter((s) => s.url === "https://svc.example/health").length, 6);
+    assert.equal(gary.store.alarm, w.now + 60000);
+
+    // the list, and clearing it
+    assert.match((await w.req("POST", "/v1/tots/Gary/command", { text: "/guard" })).body.reply, /^1\. https:\/\/svc\.example\/health every 60s text "status: OK": OK HTTP 200 \(since 2026-10-01T12:03:00\.000Z\)$/);
+    assert.equal((await w.req("POST", "/v1/tots/Gary/command", { text: "/guard clear" })).body.reply, "The guard list is empty.");
+    assert.equal(await gary.store.get("watch:http:https://svc.example/health"), undefined);
+    assert.match((await w.req("POST", "/v1/tots/Gary/command", { text: "/guard" })).body.reply, /^Nothing is guarded\. Usage:/);
+  } finally {
+    globalThis.fetch = realFetch;
+    delete w.env.ALERT_URL;
+  }
+});
+
+test("the guard reads a name's DNS answers by type: a changed answer is noted once and becomes the baseline, NXDOMAIN trips, and a target is removed by number", async () => {
+  const w = world(() => {
+    throw new Error("no model");
+  });
+  await w.req("POST", "/v1/tots", { goal: "first goal here", pace_s: 60 });
+  const gary = w.tot("Gary");
+  const realFetch = globalThis.fetch;
+  let answer = { Status: 0, Answer: [{ name: "example.com", type: 5, data: "edge.example.net." }, { name: "edge.example.net", type: 1, data: "203.0.113.7" }, { name: "edge.example.net", type: 1, data: "203.0.113.5" }] };
+  const urls = [];
+  globalThis.fetch = async (url, init) => {
+    urls.push(String(url));
+    assert.equal(init.headers.accept, "application/dns-json");
+    assert.equal(init.headers["user-agent"], TOT_UA);
+    return new Response(JSON.stringify(answer), { status: 200 });
+  };
+  try {
+    assert.match((await w.req("POST", "/v1/tots/Gary/command", { text: "/guard add dns:Example.COM. --type a --every 60" })).body.reply, /^Guarding dns example\.com A every 60s/);
+    await w.tick("Gary");
+    assert.equal(urls[0], "https://cloudflare-dns.com/dns-query?name=example.com&type=A");
+    assert.match((await w.events("Gary")).find((e) => e.kind === "guard").text, /^watching dns example\.com A: 2 A answer\(s\)/);
+    assert.deepEqual((await gary.store.get("watch:dns:example.com/A")).answers, ["203.0.113.5", "203.0.113.7"]); // the CNAME is not an A answer; sorted
+    // the answer changes: noted once, the target stays ok, the new answer is the baseline
+    answer = { Status: 0, Answer: [{ name: "example.com", type: 1, data: "198.51.100.9" }] };
+    w.now += 60000;
+    await w.tick("Gary");
+    const ch = (await w.events("Gary")).filter((e) => e.kind === "tripwire");
+    assert.equal(ch.length, 1);
+    assert.match(ch[0].text, /^CHANGED dns example\.com A: A answer changed: \[203\.0\.113\.5, 203\.0\.113\.7\] -> \[198\.51\.100\.9\]$/);
+    assert.equal(ch[0].outcome, "changed");
+    assert.equal(ch[0].ok, false);
+    assert.equal((await w.req("GET", "/v1/tots/Gary")).body.tot.guard_tripped, 0);
+    w.now += 60000;
+    await w.tick("Gary");
+    assert.equal((await w.events("Gary")).filter((e) => e.kind === "tripwire").length, 1); // not noted again
+    // NXDOMAIN trips
+    answer = { Status: 3 };
+    w.now += 60000;
+    await w.tick("Gary");
+    assert.match((await w.events("Gary")).filter((e) => e.kind === "tripwire").at(-1).text, /^TRIPWIRE dns example\.com A: DNS status 3 \(NXDOMAIN\)$/);
+    assert.match((await w.req("POST", "/v1/tots/Gary/command", { text: "/guard" })).body.reply, /^1\. dns example\.com A every 60s: TRIPPED DNS status 3 \(NXDOMAIN\)/);
+    assert.match((await w.req("POST", "/v1/tots/Gary/command", { text: "/guard rm 1" })).body.reply, /^No longer guarding dns example\.com A\.$/);
+    assert.equal((await gary.store.get("cfg")).watch.length, 0);
+    assert.equal(await gary.store.get("watch:dns:example.com/A"), undefined);
+    assert.match((await w.req("POST", "/v1/tots/Gary/command", { text: "/guard rm 1" })).body.reply, /^Not guarded/);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test("every event is chained to the one before it: the rows verify, an altered or dropped row is caught, and the hash is pinned to its bytes for the Zig verifier", async () => {
+  const w = world((messages) => {
+    const text = said(messages);
+    if (text.includes("GOAL LOOP")) return "Write the note";
+    if (text.includes("THIS ITERATION'S STEP")) return text.includes("RESULT of") ? '{"final":"done"}' : '{"tool":"write_file","args":{"name":"a.md","text":"héllo"}}';
+    if (text.includes("Grade the LAST iteration")) return "SAME | score: none | evidence: none";
+    return "NONE";
+  });
+  await w.req("POST", "/v1/tots", { goal: "first goal here" });
+  await w.tick("Gary");
+  const evs = await w.events("Gary");
+  assert.ok(evs.length >= 5);
+  assert.equal(evs[0].prev, "");
+  for (let i = 1; i < evs.length; i++) assert.equal(evs[i].prev, evs[i - 1].hash);
+  for (const e of evs) assert.equal(e.hash, await chainHash(e.prev, e.seq, e.t, e.kind, e.text));
+  assert.deepEqual(await verifyChain(evs), { ok: true, signed: evs.length, unsigned: 0, seq: 0, why: "" });
+  assert.equal((await w.req("GET", "/v1/tots/Gary")).body.tot.chain, evs.at(-1).hash);
+  // a row an older runtime wrote unsigned is counted, not judged
+  assert.deepEqual(await verifyChain([{ seq: 0, t: 1, kind: "status", text: "from before" }, ...evs]), { ok: true, signed: evs.length, unsigned: 1, seq: 0, why: "" });
+  // the rows as the mirror writes them (JSON, re-read) still verify; an altered text and a dropped row do not
+  const mirrored = evs.map((e) => JSON.parse(JSON.stringify(e)));
+  assert.equal((await verifyChain(mirrored)).ok, true);
+  const altered = structuredClone(evs);
+  altered[2].text += " (edited)";
+  assert.match((await verifyChain(altered)).why, /^event 3 was altered/);
+  assert.equal((await verifyChain(altered)).seq, 3);
+  const dropped = evs.filter((e) => e.seq !== 2);
+  assert.match((await verifyChain(dropped)).why, /^event 3 does not follow the event before it/);
+  // the vectors src/cli/tot.zig's test holds: the same bytes, the same digest
+  assert.equal(await chainHash("", 1, 1700000000000, "status", "Gary deployed"), "ee277e3b7484a3200287ecddfb64a112c39df30eb1ea8a384c30cd634f265b35");
+  assert.equal(await chainHash("a".repeat(64), 2, 1700000001000, "pick", "look at the harbour\nthen the tide"), "a95660e7604f89bd2a16d1c3b088bd40d340180a7320eb8f09759853399e73fb");
+});
+
+test("posture DEFEND freezes the runtime, names the tot in every request and swaps the bot-check line; a leash holds the goal loop while the guard goes on, until the owner's veil is back", async () => {
+  const w = world((messages) => {
+    const text = said(messages);
+    if (text.includes("GOAL LOOP")) return "Fetch the page";
+    if (text.includes("THIS ITERATION'S STEP")) return text.includes("RESULT of") ? '{"final":"done"}' : '{"tool":"web_fetch","args":{"url":"https://a.example/"}}';
+    if (text.includes("Grade the LAST iteration")) return "SAME | score: none | evidence: none";
+    return "NONE";
+  });
+  await w.req("POST", "/v1/tots", { goal: "first goal here", pace_s: 60 });
+  const gary = w.tot("Gary");
+  const realFetch = globalThis.fetch;
+  const uas = [];
+  globalThis.fetch = async (url, init) => {
+    uas.push(init?.headers?.["user-agent"] ?? "");
+    return new Response("hi", { status: 200, headers: { "content-type": "text/plain" } });
+  };
+  try {
+    // normal: the page sees a browser, and the prompt says bot checks are worked through and the runtime is its own
+    await w.tick("Gary");
+    assert.match(uas[0], /^Mozilla\/5\.0/);
+    const normal = said(w.asked[0].input.messages);
+    assert.match(normal, /solve CAPTCHAs/);
+    assert.match(normal, /runtime_edit/);
+    assert.doesNotMatch(normal, /POSTURE: DEFEND/);
+
+    const r = (await w.req("POST", "/v1/tots/Gary/command", { text: "/posture defend" })).body;
+    assert.match(r.reply, /posture DEFEND/);
+    assert.equal(r.tot.posture, "defend");
+    assert.ok((await w.events("Gary")).some((e) => e.kind === "status" && /^posture DEFEND: the runtime is frozen/.test(e.text)));
+    const cfg = await gary.store.get("cfg");
+    assert.match(await gary.runTool(cfg, "runtime_edit", { revision: 0, find: "a", replace: "b" }, ""), /^ERROR: posture is DEFEND: the runtime is frozen/);
+    assert.match(await gary.runTool(cfg, "runtime_deploy", { revision: 0 }, ""), /^ERROR: posture is DEFEND/);
+    uas.length = 0;
+    assert.equal(await gary.runTool(cfg, "http_request", { method: "GET", url: "https://a.example/", headers: { "user-agent": "Mozilla/9 (fake)" } }, ""), "HTTP 200\nhi");
+    assert.equal(uas[0], TOT_UA); // whatever the model asked for
+    const before = w.asked.length;
+    w.now += 60000;
+    await w.tick("Gary");
+    const sys = said(w.asked[before].input.messages);
+    assert.match(sys, /POSTURE: DEFEND\. Your human declared an incident posture/);
+    assert.doesNotMatch(sys, /solve CAPTCHAs/);
+    assert.doesNotMatch(sys, /improve your own prompts/);
+    assert.equal(uas.at(-1), TOT_UA);
+    assert.match((await w.req("POST", "/v1/tots/Gary/command", { text: "/posture sideways" })).body.reply, /^Usage: \/posture defend \| normal/);
+    assert.match((await w.req("POST", "/v1/tots/Gary/command", { text: "/posture normal" })).body.reply, /^model /);
+    assert.equal((await w.req("GET", "/v1/tots/Gary")).body.tot.posture, "normal");
+
+    // the leash: 120 s without a call from the owner's veil holds the loop; the guard goes on
+    assert.match((await w.req("POST", "/v1/tots/Gary/command", { text: "/leash 10" })).body.reply, /leash 60s/); // under the floor: floored
+    assert.match((await w.req("POST", "/v1/tots/Gary/command", { text: "/leash 120" })).body.reply, /leash 120s/);
+    assert.match((await w.req("POST", "/v1/tots/Gary/command", { text: "/leash soon" })).body.reply, /^Usage: \/leash <seconds> \| off/);
+    assert.equal((await w.req("GET", "/v1/tots/Gary")).body.tot.leash_s, 120);
+    await w.req("POST", "/v1/tots/Gary/command", { text: "/guard add https://svc.example/ --every 60" });
+    const asked = w.asked.length;
+    const peek = async () => [...(await gary.store.list({ prefix: "ev:" })).values()]; // reading events through the API would itself be contact
+    w.now += 121000;
+    await w.tick("Gary");
+    assert.equal(w.asked.length, asked); // the model was not called
+    let evs = await peek();
+    const held = evs.find((e) => e.kind === "status" && /^leashed: no contact from the owner's veil for 121 s \(the leash is 120 s\)/.test(e.text));
+    assert.equal(held.ok, false);
+    assert.ok(evs.some((e) => e.kind === "guard" && /^watching https:\/\/svc\.example\/: HTTP 200/.test(e.text))); // the guard still looked
+    assert.equal(gary.store.alarm, w.now + 60000);
+    assert.equal(await gary.store.get("leashed"), w.now);
+    w.now += 60000;
+    await w.tick("Gary");
+    assert.equal(w.asked.length, asked); // still held
+    assert.equal((await peek()).filter((e) => /^leashed:/.test(e.text)).length, 1); // said once
+    assert.ok(!(await peek()).some((e) => /owner's veil is back/.test(e.text)));
+    // any call from the owner's veil releases it: the status call itself is contact
+    const st = (await w.req("GET", "/v1/tots/Gary")).body.tot;
+    assert.equal(st.leashed, false);
+    assert.equal(st.state, "working");
+    evs = await w.events("Gary");
+    assert.ok(evs.some((e) => /^the owner's veil is back; Gary resumes its goal loop/.test(e.text)));
+    assert.equal(gary.store.alarm, w.now + 1000);
+    await w.tick("Gary");
+    assert.ok(w.asked.length > asked); // the loop ran again
+    assert.match((await w.req("POST", "/v1/tots/Gary/command", { text: "/leash off" })).body.reply, /^model /);
+    assert.equal((await w.req("GET", "/v1/tots/Gary")).body.tot.leash_s, 0);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test("Agent Garrett: its tools appear only with both secrets, a call goes over MCP under the bearer and comes back with its evidence, and a tot asks for the launch through the pad", async () => {
+  const w = world();
+  await w.req("POST", "/v1/tots", { goal: "first goal here" });
+  const gary = w.tot("Gary");
+  const cfg = await gary.store.get("cfg");
+  const st0 = (await w.req("GET", "/v1/tots/Gary")).body.tot;
+  assert.equal(st0.garrett, false);
+  assert.match(await gary.runTool(cfg, "garrett", { name: "nvd_lookup", args: { cveId: "CVE-2026-1" } }, ""), /^ERROR: Agent Garrett is not launched/);
+  assert.equal((await w.req("GET", "/v1/garrett")).body.status, "none");
+  assert.match(await gary.runTool(cfg, "garrett_launch", {}, ""), /^asked: your human's veil launches Agent Garrett/);
+  let g = (await w.req("GET", "/v1/garrett")).body;
+  assert.equal(g.status, "pending");
+  assert.equal(g.asked_by, "Gary");
+  assert.equal(g.asked_at, w.now);
+  // the owner's veil reports a failure; a tot may ask again; then it reports success
+  await w.req("POST", "/v1/garrett/result", { err: "Cloudflare refused the upload" });
+  g = (await w.req("GET", "/v1/garrett")).body;
+  assert.equal(g.status, "failed");
+  assert.equal(g.error, "Cloudflare refused the upload");
+  await gary.runTool(cfg, "garrett_launch", {}, "");
+  assert.equal((await w.req("GET", "/v1/garrett")).body.status, "pending");
+  await w.req("POST", "/v1/garrett/result", { url: "https://veil-garrett.acme.workers.dev/mcp" });
+  g = (await w.req("GET", "/v1/garrett")).body;
+  assert.equal(g.status, "deployed");
+  assert.equal(g.url, "https://veil-garrett.acme.workers.dev/mcp");
+  assert.equal((await w.req("POST", "/v1/garrett/bogus", {})).status, 405);
+
+  w.env.GARRETT_MCP_URL = "https://veil-garrett.acme.workers.dev/mcp";
+  w.env.GARRETT_MCP_TOKEN = "garrett-bearer-token-24chars!";
+  const realFetch = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (url, init) => {
+    calls.push({ url: String(url), init });
+    const body = JSON.parse(init.body);
+    if (body.method === "tools/list") return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: { tools: [{ name: "nvd_lookup", description: "NVD CVE metadata lookup. Passive/read-only evidence lookup.", inputSchema: { type: "object", properties: { target: {}, cveId: {} } } }], ttlMs: 60000 } }));
+    if (body.params.name === "nvd_lookup") return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: { content: [{ type: "text", text: "CVE-2026-1: CVSS 9.8" }], structuredContent: { tool: "nvd_lookup", via: "builtin", target: "CVE-2026-1" }, isError: false } }));
+    if (body.params.name === "nmap_scan") return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: { content: [{ type: "text", text: "Active MCP tools are disabled." }], isError: true } }));
+    return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, error: { code: -32602, message: "Unknown tool argument: bogus" } }), { status: 400 });
+  };
+  try {
+    const st = (await w.req("GET", "/v1/tots/Gary")).body.tot;
+    assert.equal(st.garrett, true);
+    assert.equal(st.tools, st0.tools + 1); // garrett + garrett_tools in, garrett_launch out
+    assert.equal(await gary.runTool(cfg, "garrett_launch", {}, ""), "Agent Garrett is already up; garrett_tools lists its tools");
+    const list = await gary.runTool(cfg, "garrett_tools", {}, "");
+    assert.match(list, /^- nvd_lookup: NVD CVE metadata lookup/);
+    assert.match(list, /reads the ones it needs from: target, cveId$/);
+    assert.deepEqual(JSON.parse(calls[0].init.body), { jsonrpc: "2.0", id: 1, method: "tools/list", params: {} });
+    const out = await gary.runTool(cfg, "garrett", { name: "NVD_lookup", args: { cveId: "CVE-2026-1" } }, "");
+    assert.equal(out, 'CVE-2026-1: CVSS 9.8\nEVIDENCE: {"tool":"nvd_lookup","via":"builtin","target":"CVE-2026-1"}');
+    const c = calls.at(-1);
+    assert.equal(c.url, "https://veil-garrett.acme.workers.dev/mcp");
+    assert.equal(c.init.method, "POST");
+    assert.equal(c.init.headers.authorization, "Bearer garrett-bearer-token-24chars!");
+    assert.equal(c.init.headers["user-agent"], TOT_UA);
+    assert.equal(c.init.headers["mcp-protocol-version"], undefined); // the stateless legacy form: no protocol header, no Mcp-* headers
+    assert.deepEqual(JSON.parse(c.init.body), { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "nvd_lookup", arguments: { cveId: "CVE-2026-1" } } });
+    assert.match(await gary.runTool(cfg, "garrett", { name: "nmap_scan", arguments: { target: "example.com" } }, ""), /^FAILED: Active MCP tools are disabled\./);
+    assert.match(await gary.runTool(cfg, "garrett", { name: "whois", args: { bogus: "1" } }, ""), /^ERROR: Agent Garrett: Unknown tool argument: bogus/);
+    assert.match(await gary.runTool(cfg, "garrett", { args: {} }, ""), /^ERROR: name one of Agent Garrett's tools/);
+    globalThis.fetch = async () => {
+      throw new Error("connect timeout");
+    };
+    assert.match(await gary.runTool(cfg, "garrett", { name: "nvd_lookup", args: {} }, ""), /^ERROR: Agent Garrett did not answer: connect timeout/);
+    w.env.GARRETT_MCP_URL = "https://10.0.0.9/mcp";
+    assert.match(await gary.runTool(cfg, "garrett", { name: "nvd_lookup", args: {} }, ""), /^ERROR: Agent Garrett's address is private/);
+    w.env.GARRETT_MCP_URL = "http://veil-garrett.acme.workers.dev/mcp"; // not https: as good as unset
+    assert.equal((await w.req("GET", "/v1/tots/Gary")).body.tot.garrett, false);
+  } finally {
+    globalThis.fetch = realFetch;
+    delete w.env.GARRETT_MCP_URL;
+    delete w.env.GARRETT_MCP_TOKEN;
   }
 });

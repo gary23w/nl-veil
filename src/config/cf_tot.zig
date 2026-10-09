@@ -33,7 +33,20 @@
 //!   GET    /api/v1/tots/pad              the scratchpad the account's tots share (?after=N)
 //!   POST   /api/v1/tots/pad              write to it
 //!   POST   /api/v1/tots/pad/clear        empty it (the local copy is kept as _tots/scratchpad-<when>.md)
-//!   POST   /api/v1/tots/keys             give the tots a search key ({"name":"brave","value":"..."}); "" removes it
+//!   POST   /api/v1/tots/keys             give the tots a key ({"name":"brave","value":"..."}); "" removes it. Names:
+//!                                        brave, google, google_cx (search), alert (the guard's webhook, https),
+//!                                        garrett_url + garrett_token (an Agent Garrett the owner deployed by hand)
+//!   GET    /api/v1/tots/garrett          Agent Garrett: launched or not, its address, what the runtime says
+//!                                        (?reveal=1 adds the password locking its chat UI)
+//!   POST   /api/v1/tots/garrett          launch it now;  DELETE removes it
+//!
+//! AGENT GARRETT (github.com/gary23w/garrettstimpson.ca/agent): a second Worker, `veil-garrett`, the tots reach over
+//! MCP for blue-team lookups (CVE/KEV/EPSS intel, DNS and certificate transparency, RDAP, email security posture,
+//! IOC extraction, evidence manifests...). launchGarrett reads its five modules from the repo and uploads them
+//! through the same login, with derived secrets (its MCP bearer; a password locking the chat UI nobody asked for;
+//! its policy vars pin safe mode and no active or dark-web tools over MCP), enables its address, and points the tots
+//! at it with two secrets on their Worker. A tot asks for it with garrett_launch (the runtime's /v1/garrett then
+//! says `pending`, and syncGarrett launches on the next mirror pass); the owner asks with POST /api/v1/tots/garrett.
 //!
 //! THE LOCAL FOLDER: every deployment of a tot is mirrored into {data}/u<uid>/_tots/<name>-<deployed>/ (events.log
 //! to tail, events.jsonl, status.json, notes/), with the shared scratchpad at _tots/scratchpad.md. See mirrorTot.
@@ -76,6 +89,14 @@ const NAME_MAX = 24;
 /// How often the bridge asks each approved tot for jobs.
 const BRIDGE_EVERY_MS: u64 = 20_000;
 
+// Agent Garrett: the script name beside the tots', where its modules come from, and what its upload asks for.
+pub const GARRETT_SCRIPT = "veil-garrett";
+const GARRETT_SRC = "https://raw.githubusercontent.com/gary23w/garrettstimpson.ca/main/agent/src/";
+const GARRETT_FILES = [_][]const u8{ "index.js", "mcp.mjs", "harness.mjs", "neuron-db.mjs", "neuron_core.wasm" };
+const GARRETT_COMPAT_DATE = "2026-09-03"; // agent/wrangler.toml
+const GARRETT_MIGRATION_TAG = "security-limiters-v1";
+const GARRETT_FILE_MAX: usize = 1 << 20; // index.js is ~430 KB; a module past curl's 1 MiB answer is refused
+
 // ---------------------------------------------------------------------------------- per-user state file
 
 /// What this server remembers about a user's tots. No secret: the runtime's token is derived (totToken).
@@ -99,6 +120,9 @@ const State = struct {
     last_error: []const u8 = "",
     moved: bool = false, // the old (hots) state only: everything is across, the old Workers' removal is left
     max_tots: u32 = 0, // the owner's limit on how many this account runs; 0 = DEFAULT_MAX_TOTS
+    garrett_url: []const u8 = "", // https://veil-garrett.<subdomain>.workers.dev once Agent Garrett is launched
+    garrett_hash: []const u8 = "", // the modules it was launched from (garrettHash)
+    garrett_at: i64 = 0,
 };
 
 /// How many tots this account may run.
@@ -309,6 +333,11 @@ const Tok = struct { key: []const u8, account_id: []const u8 };
 /// stand-in (NL_CF_API_ROOT, the simulation suite, the tests below) the stand-in plays the account, so it plays
 /// the account's workers.dev too: the runtime's address is the stand-in's own origin.
 fn runtimeUrl(app: *App, a: std.mem.Allocator, sub: []const u8) ?[]const u8 {
+    return workerUrl(app, a, SCRIPT, sub);
+}
+
+/// Where a script of this account answers: its workers.dev address, or the stand-in's origin (runtimeUrl).
+fn workerUrl(app: *App, a: std.mem.Allocator, script: []const u8, sub: []const u8) ?[]const u8 {
     const root = app.cf_api_root;
     inline for (.{ "http://127.0.0.1:", "http://localhost:" }) |loop| {
         if (std.mem.startsWith(u8, root, loop)) {
@@ -317,7 +346,34 @@ fn runtimeUrl(app: *App, a: std.mem.Allocator, sub: []const u8) ?[]const u8 {
             return std.fmt.allocPrint(a, "http://127.0.0.1:{s}", .{port}) catch null;
         }
     }
-    return std.fmt.allocPrint(a, "https://" ++ SCRIPT ++ ".{s}.workers.dev", .{sub}) catch null;
+    return std.fmt.allocPrint(a, "https://{s}.{s}.workers.dev", .{ script, sub }) catch null;
+}
+
+/// The account's workers.dev subdomain: every script's address hangs off it. Null with the reason in `why`.
+fn workersSubdomain(app: *App, a: std.mem.Allocator, tok: Tok, why: *[]const u8) ?[]const u8 {
+    const sub_url = std.fmt.allocPrint(a, "{s}/accounts/{s}/workers/subdomain", .{ app.cf_api_root, tok.account_id }) catch {
+        why.* = "out of memory";
+        return null;
+    };
+    const sub_raw = api(app, a, "GET", sub_url, "", tok.key, "") orelse {
+        why.* = "could not reach the Cloudflare API";
+        return null;
+    };
+    const Sub = struct { result: ?struct { subdomain: []const u8 = "" } = null };
+    const sub = blk: {
+        const p = std.json.parseFromSliceLeaky(Sub, a, sub_raw, .{ .ignore_unknown_fields = true }) catch break :blk "";
+        break :blk if (p.result) |r| r.subdomain else "";
+    };
+    if (sub.len == 0) {
+        const msg = firstError(a, sub_raw);
+        why.* = if (msg.len > 0 and std.mem.indexOf(u8, msg, "subdomain") == null) explain(a, "workers.dev address", msg) else "this Cloudflare account has no workers.dev subdomain yet - open Workers & Pages in the Cloudflare dashboard once (it offers one), then deploy again";
+        return null;
+    }
+    for (sub) |c| if (!(std.ascii.isAlphanumeric(c) or c == '-')) {
+        why.* = "the account's workers.dev subdomain is not a name this server can use";
+        return null;
+    };
+    return sub;
 }
 
 /// Make sure the account runs THIS binary's tot.js, and that `st` knows its address. Costs no call when the
@@ -335,19 +391,8 @@ fn ensureRuntime(app: *App, a: std.mem.Allocator, uid: u64, tok: Tok, st: *State
     if (acct.len == 0) return "your Cloudflare login names no account - Disconnect and log in with Cloudflare again";
 
     // The account's workers.dev subdomain: the runtime's address hangs off it.
-    const sub_url = std.fmt.allocPrint(a, "{s}/accounts/{s}/workers/subdomain", .{ root, acct }) catch return "out of memory";
-    const sub_raw = api(app, a, "GET", sub_url, "", tok.key, "") orelse return "could not reach the Cloudflare API";
-    const Sub = struct { result: ?struct { subdomain: []const u8 = "" } = null };
-    const sub = blk: {
-        const p = std.json.parseFromSliceLeaky(Sub, a, sub_raw, .{ .ignore_unknown_fields = true }) catch break :blk "";
-        break :blk if (p.result) |r| r.subdomain else "";
-    };
-    if (sub.len == 0) {
-        const msg = firstError(a, sub_raw);
-        if (msg.len > 0 and std.mem.indexOf(u8, msg, "subdomain") == null) return explain(a, "workers.dev address", msg);
-        return "this Cloudflare account has no workers.dev subdomain yet - open Workers & Pages in the Cloudflare dashboard once (it offers one), then deploy again";
-    }
-    for (sub) |c| if (!(std.ascii.isAlphanumeric(c) or c == '-')) return "the account's workers.dev subdomain is not a name this server can use";
+    var sub_why: []const u8 = "";
+    const sub = workersSubdomain(app, a, tok, &sub_why) orelse return sub_why;
 
     // Is the script already there? Its class migration applies once, so a second upload must not carry it.
     const script_url = std.fmt.allocPrint(a, "{s}/accounts/{s}/workers/scripts/" ++ SCRIPT, .{ root, acct }) catch return "out of memory";
@@ -588,6 +633,8 @@ const CreateReq = struct {
     budget: ?i64 = null,
     forever: bool = false,
     local: bool = false, // the owner's-machine checkbox: only ever granted here, at deployment
+    posture: ?[]const u8 = null, // "defend" deploys it as a defender (the runtime's DEFEND posture)
+    leash_s: ?i64 = null,
 };
 
 /// POST /api/v1/tots — deploy a tot. Uploads the runtime first when the account lacks it or runs an older one.
@@ -633,6 +680,7 @@ fn sentJson(a: std.mem.Allocator, s: Sent) ?[]const u8 {
 fn deploy(app: *App, a: std.mem.Allocator, uid: u64, tok: Tok, body: CreateReq) Deployed {
     const name = std.mem.trim(u8, body.name, " \r\n\t");
     if (name.len > 0 and !validName(name)) return .{ .err = "a tot's name is 1-24 letters, digits, - or _, starting with a letter" };
+    if (body.posture) |p| if (!(std.mem.eql(u8, p, "normal") or std.mem.eql(u8, p, "defend"))) return .{ .err = "posture is normal or defend" };
     if (std.mem.trim(u8, body.goal, " \r\n\t").len < 3 and std.mem.trim(u8, body.charter, " \r\n\t").len < 3)
         return .{ .err = "a tot needs a goal or a charter to work toward" };
     const model = if (body.model.len > 0) body.model else modelcfg.defaults.cf_model;
@@ -763,6 +811,11 @@ fn removeScript(app: *App, a: std.mem.Allocator, uid: u64, tok: Tok, st: *State)
     // Its Python Worker goes after it (the runtime was bound to it). Best effort: it holds nothing.
     const py_url = std.fmt.allocPrint(a, "{s}/accounts/{s}/workers/scripts/" ++ PY_SCRIPT ++ "?force=true", .{ app.cf_api_root, acct }) catch return "out of memory";
     _ = api(app, a, "DELETE", py_url, "", tok.key, "");
+    // Agent Garrett was launched for the tots: it goes with them. Best effort too.
+    if (st.garrett_url.len > 0) {
+        const g_url = std.fmt.allocPrint(a, "{s}/accounts/{s}/workers/scripts/" ++ GARRETT_SCRIPT ++ "?force=true", .{ app.cf_api_root, acct }) catch return "out of memory";
+        _ = api(app, a, "DELETE", g_url, "", tok.key, "");
+    }
     // A new generation: a later deployment gets a token the removed script never held.
     st.* = .{ .token_gen = st.token_gen +% 1 };
     writeState(app, uid, st.*);
@@ -831,6 +884,8 @@ const ConfigReq = struct {
     daily_calls: ?i64 = null,
     charter: ?[]const u8 = null,
     paused: ?bool = null,
+    posture: ?[]const u8 = null, // "normal" | "defend"
+    leash_s: ?i64 = null, // 0 = no leash; else 60 .. 604800, the runtime's floor and ceiling
 };
 
 /// POST /api/v1/tots/:name/config — change a tot's settings. There is no `local` here: the owner's machine is
@@ -840,6 +895,8 @@ pub fn totConfig(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const name = nameParam(req, res) orelse return;
     const body = (req.json(ConfigReq) catch return badReq(res, "malformed JSON body")) orelse return badReq(res, "bad body");
     if (body.model) |m| if (m.len == 0 or m[0] != '@') return badReq(res, "a tot runs on the account's Workers AI: pick an @cf/ model");
+    if (body.posture) |p| if (!(std.mem.eql(u8, p, "normal") or std.mem.eql(u8, p, "defend"))) return badReq(res, "posture is normal or defend");
+    if (body.leash_s) |s| if (s < 0) return badReq(res, "the leash is a number of seconds, or 0 for none");
     var arena = std.heap.ArenaAllocator.init(app.gpa);
     defer arena.deinit();
     const a = arena.allocator();
@@ -910,13 +967,22 @@ fn archivePad(app: *App, a: std.mem.Allocator, uid: u64) void {
 
 const KeyReq = struct { name: []const u8 = "", value: []const u8 = "" };
 
-/// The search keys a tot's web_search uses before the keyless sources: the name a human types, and the secret
-/// binding the runtime reads.
+/// The keys a tot reads as secrets of its Worker: the name a human types, and the binding the runtime reads. The
+/// search keys (web_search asks them before the keyless sources), the guard's webhook, and an Agent Garrett the
+/// owner deployed by hand (launchGarrett sets the same two itself).
 fn keySecret(name: []const u8) ?[]const u8 {
     if (std.ascii.eqlIgnoreCase(name, "brave")) return "BRAVE_KEY";
     if (std.ascii.eqlIgnoreCase(name, "google")) return "GOOGLE_CSE_KEY";
     if (std.ascii.eqlIgnoreCase(name, "google_cx") or std.ascii.eqlIgnoreCase(name, "google-cx")) return "GOOGLE_CSE_CX";
+    if (std.ascii.eqlIgnoreCase(name, "alert")) return "ALERT_URL";
+    if (std.ascii.eqlIgnoreCase(name, "garrett_url") or std.ascii.eqlIgnoreCase(name, "garrett-url")) return "GARRETT_MCP_URL";
+    if (std.ascii.eqlIgnoreCase(name, "garrett_token") or std.ascii.eqlIgnoreCase(name, "garrett-token")) return "GARRETT_MCP_TOKEN";
     return null;
+}
+
+/// The keys that are addresses: the runtime only calls them over https.
+fn keyIsUrl(secret: []const u8) bool {
+    return std.mem.eql(u8, secret, "ALERT_URL") or std.mem.eql(u8, secret, "GARRETT_MCP_URL");
 }
 
 const LimitReq = struct { max: i64 = 0 };
@@ -942,10 +1008,11 @@ pub fn setLimit(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
 pub fn setKey(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const u = gate(app, req, res) orelse return;
     const body = (req.json(KeyReq) catch return badReq(res, "malformed JSON body")) orelse return badReq(res, "bad body");
-    const secret = keySecret(body.name) orelse return badReq(res, "a search key is one of: brave, google, google_cx");
+    const secret = keySecret(body.name) orelse return badReq(res, "a key is one of: brave, google, google_cx, alert, garrett_url, garrett_token");
     const value = std.mem.trim(u8, body.value, " \r\n\t");
     if (value.len > 400) return badReq(res, "that is too long to be a key");
     for (value) |c| if (c < 0x20 or c == 0x7F) return badReq(res, "a key cannot hold control characters");
+    if (value.len > 0 and keyIsUrl(secret) and !std.mem.startsWith(u8, value, "https://")) return badReq(res, "that key is an address: give an https:// URL");
     var arena = std.heap.ArenaAllocator.init(app.gpa);
     defer arena.deinit();
     const a = arena.allocator();
@@ -960,6 +1027,263 @@ pub fn setKey(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const msg = firstError(a, raw orelse return http.serverErr(res, "could not reach the Cloudflare API"));
     if (msg.len > 0 and !(value.len == 0 and std.ascii.indexOfIgnoreCase(msg, "not found") != null)) return badReq(res, explain(a, "setting the key", msg));
     try res.json(.{ .ok = true, .name = body.name, .set = value.len > 0 }, .{});
+}
+
+// ---------------------------------------------------------------------------------- Agent Garrett
+
+/// When the last launch was refused: a refused launch is not tried again for a quarter of an hour.
+var garrett_failed_s: std.atomic.Value(i64) = .init(0);
+
+/// Where Agent Garrett's modules are read from: the repo, or - while the Cloudflare API is a loopback stand-in -
+/// the stand-in, under /garrett/src/ (the tests serve them there).
+fn garrettSrc(app: *App, a: std.mem.Allocator, file: []const u8) ?[]const u8 {
+    const root = app.cf_api_root;
+    inline for (.{ "http://127.0.0.1:", "http://localhost:" }) |loop| {
+        if (std.mem.startsWith(u8, root, loop)) {
+            const rest = root[loop.len..];
+            const port = rest[0 .. std.mem.indexOfScalar(u8, rest, '/') orelse rest.len];
+            return std.fmt.allocPrint(a, "http://127.0.0.1:{s}/garrett/src/{s}", .{ port, file }) catch null;
+        }
+    }
+    return std.fmt.allocPrint(a, GARRETT_SRC ++ "{s}", .{file}) catch null;
+}
+
+/// The modules as fetched, as 16 hex characters: what a launch was made from.
+fn garrettHash(files: []const []const u8, out: *[16]u8) []const u8 {
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    for (files) |f| {
+        h.update(f);
+        h.update("\x00");
+    }
+    var dig: [32]u8 = undefined;
+    h.final(&dig);
+    out.* = std.fmt.bytesToHex(dig[0..8].*, .lower);
+    return out;
+}
+
+/// Agent Garrett's upload: the metadata (its AI binding, its three Durable Object classes, its policy vars - safe
+/// mode, confirmation required, no active and no dark-web tools over MCP, as agent/wrangler.toml ships them - and
+/// the secrets kept) and the five modules as fetched, the engine as WebAssembly. `fresh` carries the class
+/// migration, which Cloudflare takes once per script.
+fn garrettUploadBody(a: std.mem.Allocator, boundary: []const u8, fresh: bool, files: []const []const u8) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    try out.print(a, "--{s}\r\nContent-Disposition: form-data; name=\"metadata\"; filename=\"metadata.json\"\r\nContent-Type: application/json\r\n\r\n", .{boundary});
+    try out.appendSlice(a, "{\"main_module\":\"index.js\",\"compatibility_date\":\"" ++ GARRETT_COMPAT_DATE ++ "\",\"bindings\":[" ++
+        "{\"type\":\"ai\",\"name\":\"AI\"}," ++
+        "{\"type\":\"durable_object_namespace\",\"name\":\"DISCLOSURE_LIMITER\",\"class_name\":\"DisclosureLimiter\"}," ++
+        "{\"type\":\"durable_object_namespace\",\"name\":\"LOGIN_LIMITER\",\"class_name\":\"LoginLimiter\"}," ++
+        "{\"type\":\"durable_object_namespace\",\"name\":\"AUTH_SESSIONS\",\"class_name\":\"AuthSession\"}," ++
+        "{\"type\":\"plain_text\",\"name\":\"LLMS_URL\",\"text\":\"https://raw.githubusercontent.com/gary23w/garrettstimpson.ca/refs/heads/main/llms.txt\"}," ++
+        "{\"type\":\"plain_text\",\"name\":\"SITE_NAME\",\"text\":\"Agent Garrett (veil tater-tots)\"}," ++
+        "{\"type\":\"plain_text\",\"name\":\"CTF_SAFE_MODE\",\"text\":\"true\"}," ++
+        "{\"type\":\"plain_text\",\"name\":\"CTF_REQUIRE_CONFIRM\",\"text\":\"true\"}," ++
+        "{\"type\":\"plain_text\",\"name\":\"AGENT_ALLOW_ACTIVE_TOOLS\",\"text\":\"false\"}," ++
+        "{\"type\":\"plain_text\",\"name\":\"MCP_ALLOW_ACTIVE_TOOLS\",\"text\":\"false\"}," ++
+        "{\"type\":\"plain_text\",\"name\":\"MCP_ALLOW_DARKWEB\",\"text\":\"false\"}" ++
+        "],\"keep_bindings\":[\"secret_text\"]");
+    if (fresh) try out.appendSlice(a, ",\"migrations\":{\"new_tag\":\"" ++ GARRETT_MIGRATION_TAG ++ "\",\"new_sqlite_classes\":[\"DisclosureLimiter\",\"LoginLimiter\",\"AuthSession\"]}");
+    try out.append(a, '}');
+    for (GARRETT_FILES, files) |name, data| {
+        const ctype: []const u8 = if (std.mem.endsWith(u8, name, ".wasm")) "application/wasm" else "application/javascript+module";
+        try out.print(a, "\r\n--{s}\r\nContent-Disposition: form-data; name=\"{s}\"; filename=\"{s}\"\r\nContent-Type: {s}\r\n\r\n", .{ boundary, name, name, ctype });
+        try out.appendSlice(a, data);
+    }
+    try out.print(a, "\r\n--{s}--\r\n", .{boundary});
+    return out.items;
+}
+
+/// Agent Garrett's MCP bearer, as the tots carry it: derived like the tots' own token, never stored.
+fn garrettToken(app: *App, uid: u64, account: []const u8, gen: u32, out: *[64]u8) []const u8 {
+    return tokenWith(app, "veil-garrett-mcp", uid, account, gen, out);
+}
+
+/// The password locking its chat UI: open to anyone with the address otherwise. `veil --tater garrett password`.
+fn garrettPassword(app: *App, uid: u64, account: []const u8, gen: u32, out: *[64]u8) []const u8 {
+    return tokenWith(app, "veil-garrett-access", uid, account, gen, out);
+}
+
+/// One secret on a script. A small JSON body: it rides curl's stdin with the bearer, never a file.
+fn putSecret(app: *App, a: std.mem.Allocator, script_url: []const u8, key: []const u8, name: []const u8, value: []const u8, what: []const u8) ?[]const u8 {
+    const url = std.fmt.allocPrint(a, "{s}/secrets", .{script_url}) catch return "out of memory";
+    const body = std.json.Stringify.valueAlloc(a, .{ .name = name, .text = value, .type = "secret_text" }, .{}) catch return "out of memory";
+    const raw = api(app, a, "PUT", url, body, key, "application/json") orelse return std.fmt.allocPrint(a, "could not reach the Cloudflare API ({s})", .{what}) catch "could not reach the Cloudflare API";
+    const e = firstError(a, raw);
+    if (e.len > 0) return explain(a, what, e);
+    return null;
+}
+
+/// Launch Agent Garrett into the account: its five modules as the repo has them now, uploaded as one Worker beside
+/// the tots' with its own derived secrets, its address enabled, and the tots pointed at it. What went wrong in
+/// words a user can act on, or null. The modules are read before anything in the account is touched.
+fn launchGarrett(app: *App, a: std.mem.Allocator, uid: u64, tok: Tok, st: *State) ?[]const u8 {
+    const root = app.cf_api_root;
+    const acct = tok.account_id;
+    if (acct.len == 0) return "your Cloudflare login names no account - Disconnect and log in with Cloudflare again";
+    if (st.url.len == 0 or !std.mem.eql(u8, st.account, acct)) return "deploy a tater-tot first: Agent Garrett is launched beside the tots' Worker";
+    var files: [GARRETT_FILES.len][]const u8 = undefined;
+    for (GARRETT_FILES, 0..) |name, i| {
+        const url = garrettSrc(app, a, name) orelse return "out of memory";
+        const raw = api(app, a, "GET", url, "", "", "") orelse return std.fmt.allocPrint(a, "could not read Agent Garrett's {s} from its repo", .{name}) catch "could not read Agent Garrett's modules";
+        const wasm = std.mem.endsWith(u8, name, ".wasm");
+        const looks = if (wasm) std.mem.startsWith(u8, raw, "\x00asm") else std.mem.indexOf(u8, raw, "export") != null and std.mem.indexOf(u8, raw[0..@min(raw.len, 256)], "<!DOCTYPE") == null;
+        if (!looks or raw.len > GARRETT_FILE_MAX) return std.fmt.allocPrint(a, "Agent Garrett's {s} did not come back as a module: {s}", .{ name, raw[0..@min(raw.len, 80)] }) catch "a module of Agent Garrett did not come back as one";
+        files[i] = raw;
+    }
+    var why: []const u8 = "";
+    const sub = workersSubdomain(app, a, tok, &why) orelse return why;
+    const script_url = std.fmt.allocPrint(a, "{s}/accounts/{s}/workers/scripts/" ++ GARRETT_SCRIPT, .{ root, acct }) catch return "out of memory";
+    const settings_url = std.fmt.allocPrint(a, "{s}/settings", .{script_url}) catch return "out of memory";
+    const exists = if (api(app, a, "GET", settings_url, "", tok.key, "")) |r| firstError(a, r).len == 0 else false;
+    var bb: [8]u8 = undefined;
+    app.io.random(&bb);
+    const boundary = std.fmt.allocPrint(a, "----veilgarrett{s}", .{std.fmt.bytesToHex(bb, .lower)}) catch return "out of memory";
+    const ctype = std.fmt.allocPrint(a, "multipart/form-data; boundary={s}", .{boundary}) catch return "out of memory";
+    // The settings read is only a hint, so the upload is tried with and without the class migration.
+    var up_err: []const u8 = "";
+    var taken = false;
+    for ([_]bool{ !exists, exists }) |fresh| {
+        const body = garrettUploadBody(a, boundary, fresh, &files) catch return "out of memory";
+        const up = api(app, a, "PUT", script_url, body, tok.key, ctype) orelse return "could not reach the Cloudflare API to upload Agent Garrett";
+        const e = firstError(a, up);
+        if (e.len == 0) {
+            taken = true;
+            break;
+        }
+        if (up_err.len == 0) up_err = e;
+    }
+    if (!taken) return explain(a, "uploading Agent Garrett", up_err);
+    // Its secrets: the MCP bearer the tots carry, and a lock on the chat UI (it is open to anyone otherwise).
+    var mb: [64]u8 = undefined;
+    var pb: [64]u8 = undefined;
+    var sb: [64]u8 = undefined;
+    const mcp = garrettToken(app, uid, acct, st.token_gen, &mb);
+    if (putSecret(app, a, script_url, tok.key, "MCP_API_TOKEN", mcp, "setting Agent Garrett's MCP token")) |m| return m;
+    if (putSecret(app, a, script_url, tok.key, "ACCESS_PASSWORD", garrettPassword(app, uid, acct, st.token_gen, &pb), "locking Agent Garrett's chat UI")) |m| return m;
+    if (putSecret(app, a, script_url, tok.key, "ACCESS_SESSION_SECRET", tokenWith(app, "veil-garrett-session", uid, acct, st.token_gen, &sb), "setting Agent Garrett's session secret")) |m| return m;
+    const route_url = std.fmt.allocPrint(a, "{s}/subdomain", .{script_url}) catch return "out of memory";
+    const route = api(app, a, "POST", route_url, "{\"enabled\":true}", tok.key, "application/json") orelse return "could not reach Cloudflare to enable Agent Garrett's workers.dev address";
+    const route_err = firstError(a, route);
+    if (route_err.len > 0) return explain(a, "enabling Agent Garrett's address", route_err);
+    const url = workerUrl(app, a, GARRETT_SCRIPT, sub) orelse return "out of memory";
+    // The tots: where it answers, and the bearer it answers to.
+    const tots_url = std.fmt.allocPrint(a, "{s}/accounts/{s}/workers/scripts/" ++ SCRIPT, .{ root, acct }) catch return "out of memory";
+    const mcp_url = std.fmt.allocPrint(a, "{s}/mcp", .{url}) catch return "out of memory";
+    if (putSecret(app, a, tots_url, tok.key, "GARRETT_MCP_URL", mcp_url, "pointing the tots at Agent Garrett")) |m| return m;
+    if (putSecret(app, a, tots_url, tok.key, "GARRETT_MCP_TOKEN", mcp, "giving the tots Agent Garrett's token")) |m| return m;
+    var hb: [16]u8 = undefined;
+    st.garrett_url = url;
+    st.garrett_hash = a.dupe(u8, garrettHash(&files, &hb)) catch return "out of memory";
+    st.garrett_at = nowS(app.io);
+    writeState(app, uid, st.*);
+    log.info("Agent Garrett launched for u{d}: {s}", .{ uid, url });
+    return null;
+}
+
+/// Remove Agent Garrett: its Worker, the tots' two secrets, the runtime's record. Best effort past the script.
+fn removeGarrett(app: *App, a: std.mem.Allocator, uid: u64, tok: Tok, st: *State) ?[]const u8 {
+    const acct = if (st.account.len > 0) st.account else tok.account_id;
+    const url = std.fmt.allocPrint(a, "{s}/accounts/{s}/workers/scripts/" ++ GARRETT_SCRIPT ++ "?force=true", .{ app.cf_api_root, acct }) catch return "out of memory";
+    const raw = api(app, a, "DELETE", url, "", tok.key, "") orelse return "could not reach the Cloudflare API to remove Agent Garrett";
+    const msg = firstError(a, raw);
+    if (msg.len > 0 and std.ascii.indexOfIgnoreCase(msg, "not found") == null and std.ascii.indexOfIgnoreCase(msg, "does not exist") == null)
+        return explain(a, "removing Agent Garrett", msg);
+    for ([_][]const u8{ "GARRETT_MCP_URL", "GARRETT_MCP_TOKEN" }) |name| {
+        const s = std.fmt.allocPrint(a, "{s}/accounts/{s}/workers/scripts/" ++ SCRIPT ++ "/secrets/{s}", .{ app.cf_api_root, acct, name }) catch continue;
+        _ = api(app, a, "DELETE", s, "", tok.key, "");
+    }
+    if (st.url.len > 0) _ = totCall(app, a, uid, st.*, "POST", "/v1/garrett/clear", "{}");
+    st.garrett_url = "";
+    st.garrett_hash = "";
+    st.garrett_at = 0;
+    writeState(app, uid, st.*);
+    log.info("Agent Garrett removed from the Cloudflare account of u{d}", .{uid});
+    return null;
+}
+
+/// What the runtime says about Agent Garrett: a tot's request is `pending`, and what syncGarrett acts on.
+const GarrettState = struct { ok: bool = false, status: []const u8 = "none", url: []const u8 = "", @"error": []const u8 = "", asked_by: []const u8 = "", asked_at: i64 = 0 };
+
+fn garrettState(app: *App, a: std.mem.Allocator, uid: u64, st: State) GarrettState {
+    if (st.url.len == 0) return .{};
+    const raw = totCall(app, a, uid, st, "GET", "/v1/garrett", "") orelse return .{};
+    return std.json.parseFromSliceLeaky(GarrettState, a, raw, .{ .ignore_unknown_fields = true }) catch .{};
+}
+
+/// Tell the runtime how a launch went: its address, or why not. The tots read it from their pad.
+fn garrettResult(app: *App, a: std.mem.Allocator, uid: u64, st: State, mcp_url: []const u8, err: ?[]const u8) void {
+    const body = std.json.Stringify.valueAlloc(a, .{ .url = mcp_url, .err = err orelse "" }, .{}) catch return;
+    _ = totCall(app, a, uid, st, "POST", "/v1/garrett/result", body);
+}
+
+/// A mirror pass: a tot asked for Agent Garrett (garrett_launch) - launch it, and tell the runtime how it went. A
+/// refused launch waits a quarter of an hour before the next attempt, so a tot asking every iteration costs nothing.
+fn syncGarrett(app: *App, a: std.mem.Allocator, uid: u64, st: *State) void {
+    const tok = tokOf(app, uid, a) orelse return;
+    syncGarrettAs(app, a, uid, tok, st);
+}
+
+fn syncGarrettAs(app: *App, a: std.mem.Allocator, uid: u64, tok: Tok, st: *State) void {
+    if (!std.mem.eql(u8, tok.account_id, st.account)) return;
+    const g = garrettState(app, a, uid, st.*);
+    if (!g.ok or !std.mem.eql(u8, g.status, "pending")) return;
+    const now = nowS(app.io);
+    if (now - garrett_failed_s.load(.monotonic) < 900) return;
+    if (launchGarrett(app, a, uid, tok, st)) |msg| {
+        garrett_failed_s.store(now, .monotonic);
+        log.warn("Agent Garrett could not be launched for u{d}: {s}", .{ uid, msg });
+        garrettResult(app, a, uid, st.*, "", msg);
+        return;
+    }
+    const mcp_url = std.fmt.allocPrint(a, "{s}/mcp", .{st.garrett_url}) catch return;
+    garrettResult(app, a, uid, st.*, mcp_url, null);
+}
+
+/// GET /api/v1/tots/garrett — Agent Garrett as this server and the runtime know it. `?reveal=1` adds the password
+/// that locks its chat UI (derived, so it can always be shown again).
+pub fn garrettStatus(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
+    const u = gate(app, req, res) orelse return;
+    var arena = std.heap.ArenaAllocator.init(app.gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const st = readState(app, u.id, a);
+    const g = garrettState(app, a, u.id, st);
+    const q = try req.query();
+    const launched = st.garrett_url.len > 0;
+    const reveal = launched and std.mem.eql(u8, q.get("reveal") orelse "0", "1");
+    var pb: [64]u8 = undefined;
+    const password: []const u8 = if (reveal) garrettPassword(app, u.id, st.account, st.token_gen, &pb) else "";
+    const mcp_url: []const u8 = if (launched) try std.fmt.allocPrint(a, "{s}/mcp", .{st.garrett_url}) else "";
+    const status: []const u8 = if (launched and std.mem.eql(u8, g.status, "none")) "deployed" else g.status;
+    try res.json(.{ .ok = true, .launched = launched, .url = st.garrett_url, .mcp_url = mcp_url, .launched_at = st.garrett_at, .sources = st.garrett_hash, .status = status, .@"error" = g.@"error", .asked_by = g.asked_by, .asked_at = g.asked_at, .password = password, .repo = "https://github.com/gary23w/garrettstimpson.ca/tree/main/agent" }, .{});
+}
+
+/// POST /api/v1/tots/garrett — launch Agent Garrett now (the owner asking; a tot asks through garrett_launch).
+pub fn garrettLaunch(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
+    const u = gate(app, req, res) orelse return;
+    var arena = std.heap.ArenaAllocator.init(app.gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tok = tokOf(app, u.id, a) orelse return badReq(res, "not connected to Cloudflare - log in with Cloudflare first");
+    var st = readState(app, u.id, a);
+    if (launchGarrett(app, a, u.id, tok, &st)) |msg| {
+        garrettResult(app, a, u.id, st, "", msg);
+        return badReq(res, msg);
+    }
+    const mcp_url = try std.fmt.allocPrint(a, "{s}/mcp", .{st.garrett_url});
+    garrettResult(app, a, u.id, st, mcp_url, null);
+    try res.json(.{ .ok = true, .url = st.garrett_url, .mcp_url = mcp_url }, .{});
+}
+
+/// DELETE /api/v1/tots/garrett — remove it: the Worker, the tots' two secrets, the runtime's record.
+pub fn garrettRemove(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
+    const u = gate(app, req, res) orelse return;
+    var arena = std.heap.ArenaAllocator.init(app.gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tok = tokOf(app, u.id, a) orelse return badReq(res, "not connected to Cloudflare - log in with Cloudflare first");
+    var st = readState(app, u.id, a);
+    if (removeGarrett(app, a, u.id, tok, &st)) |msg| return badReq(res, msg);
+    try res.json(.{ .ok = true, .removed = true }, .{});
 }
 
 // ---------------------------------------------------------------------------------- the owner's machine
@@ -1397,6 +1721,7 @@ fn tick(app: *App, mirror: bool) void {
         if (mirror) {
             upgradeRuntime(app, a, uid, &st);
             syncRuntime(app, a, uid, &st);
+            syncGarrett(app, a, uid, &st);
             checkPython(app, a, uid, &st);
             mirrorUser(app, a, uid, st);
         }
@@ -1499,8 +1824,9 @@ fn runsJson(app: *App, a: std.mem.Allocator, uid: u64) ![]const u8 {
 }
 
 /// A run's events from its events.jsonl, as the runtime's own events route answers: the newest `limit` past
-/// `after`, oldest first. A run with no file yet has no events.
-fn runEventsJson(app: *App, a: std.mem.Allocator, uid: u64, leaf: []const u8, after: u64, limit: u64) ![]const u8 {
+/// `after`, oldest first - or, `forward`, the first `limit` past `after` (what `veil --tater verify` walks, from
+/// the run's first event on). A run with no file yet has no events.
+fn runEventsJson(app: *App, a: std.mem.Allocator, uid: u64, leaf: []const u8, after: u64, limit: u64, forward: bool) ![]const u8 {
     const path = try std.fmt.allocPrint(a, "{s}/u{d}/_tots/{s}/events.jsonl", .{ app.data, uid, leaf });
     const raw = std.Io.Dir.cwd().readFileAlloc(app.io, path, a, .limited(RUN_EVENTS_MAX_BYTES)) catch "";
     const Seq = struct { seq: u64 = 0 };
@@ -1511,18 +1837,21 @@ fn runEventsJson(app: *App, a: std.mem.Allocator, uid: u64, leaf: []const u8, af
         const s = std.json.parseFromSliceLeaky(Seq, a, ln, .{ .ignore_unknown_fields = true }) catch continue;
         top = @max(top, s.seq);
     }
-    const floor = @max(after, if (top > limit) top - limit else 0);
+    const floor = if (forward) after else @max(after, if (top > limit) top - limit else 0);
     var out: std.ArrayListUnmanaged(u8) = .empty;
     try out.appendSlice(a, "{\"ok\":true,\"events\":[");
     var first = true;
+    var count: u64 = 0;
     it = std.mem.splitScalar(u8, raw, '\n');
     while (it.next()) |ln| {
         if (ln.len == 0) continue;
         const s = std.json.parseFromSliceLeaky(Seq, a, ln, .{ .ignore_unknown_fields = true }) catch continue;
         if (s.seq <= floor) continue;
+        if (forward and count >= limit) break;
         if (!first) try out.append(a, ',');
         try out.appendSlice(a, ln);
         first = false;
+        count += 1;
     }
     try out.appendSlice(a, "]}");
     return out.items;
@@ -1546,9 +1875,10 @@ pub fn runEvents(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const q = try req.query();
     const after = std.fmt.parseInt(u64, q.get("after") orelse "0", 10) catch 0;
     const limit = std.math.clamp(std.fmt.parseInt(u64, q.get("limit") orelse "200", 10) catch 200, 1, 2000);
+    const forward = std.mem.eql(u8, q.get("forward") orelse "0", "1");
     var arena = std.heap.ArenaAllocator.init(app.gpa);
     defer arena.deinit();
-    const body = try runEventsJson(app, arena.allocator(), u.id, leaf, after, limit);
+    const body = try runEventsJson(app, arena.allocator(), u.id, leaf, after, limit, forward);
     res.content_type = .JSON;
     res.body = try res.arena.dupe(u8, body);
 }
@@ -1989,7 +2319,166 @@ const StandIn = struct {
     const no_browser = w("{\"success\":false,\"errors\":[{\"code\":10021,\"message\":\"Browser Rendering is not enabled for this account.\"}]}");
     const made = w("{\"ok\":true,\"tot\":{\"name\":\"Gary\",\"state\":\"working\",\"local\":true}}");
     const full = w("{\"ok\":false,\"err\":\"this account already has 3 tots (the limit); delete one first\"}");
+    // Agent Garrett: what the runtime's pad says, and the modules "the repo" serves
+    const garrett_pending = w("{\"ok\":true,\"status\":\"pending\",\"asked_by\":\"Gary\",\"asked_at\":1}");
+    const garrett_deployed = w("{\"ok\":true,\"status\":\"deployed\"}");
+    const src_index_body = "// Agent Garrett\nimport { handleMcpRequest } from './mcp.mjs';\nexport default { async fetch(request, env) { return new Response('ok'); } };\n";
+    const src_mjs_body = "export const x = 1;\n";
+    const src_wasm_body = "\x00asm\x01\x00\x00\x00";
+    const src_index = w(src_index_body);
+    const src_mjs = w(src_mjs_body);
+    const src_wasm = w(src_wasm_body);
 };
+
+test "Agent Garrett's upload names its bindings, pins its policy, keeps its secrets out of the body and carries the five modules, the engine as WebAssembly" {
+    var arena = std.heap.ArenaAllocator.init(tt.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const files = [_][]const u8{ "export default {}", "export const m = 1;", "export const h = 1;", "export const n = 1;", "\x00asm\x01\x00\x00\x00" };
+    const first = try garrettUploadBody(a, "----b", true, &files);
+    const again = try garrettUploadBody(a, "----b", false, &files);
+    const meta_at = std.mem.indexOf(u8, first, "\r\n\r\n").? + 4;
+    const meta = first[meta_at .. meta_at + std.mem.indexOf(u8, first[meta_at..], "\r\n").?];
+    const M = struct {
+        main_module: []const u8,
+        compatibility_date: []const u8,
+        bindings: []const struct { type: []const u8, name: []const u8, class_name: []const u8 = "", text: []const u8 = "" },
+        keep_bindings: []const []const u8,
+        migrations: ?struct { new_tag: []const u8, new_sqlite_classes: []const []const u8 } = null,
+    };
+    const m = try std.json.parseFromSliceLeaky(M, a, meta, .{});
+    try tt.expectEqualStrings("index.js", m.main_module);
+    try tt.expectEqualStrings(GARRETT_COMPAT_DATE, m.compatibility_date);
+    try tt.expectEqual(@as(usize, 11), m.bindings.len);
+    try tt.expectEqualStrings("ai", m.bindings[0].type);
+    try tt.expectEqualStrings("DisclosureLimiter", m.bindings[1].class_name);
+    try tt.expectEqualStrings("LOGIN_LIMITER", m.bindings[2].name);
+    try tt.expectEqualStrings("AuthSession", m.bindings[3].class_name);
+    // the policy the agent ships with: safe mode, confirmation, no active and no dark-web tools over MCP
+    for (m.bindings[4..]) |b| try tt.expectEqualStrings("plain_text", b.type);
+    try tt.expectEqualStrings("CTF_SAFE_MODE", m.bindings[6].name);
+    try tt.expectEqualStrings("true", m.bindings[6].text);
+    try tt.expectEqualStrings("MCP_ALLOW_ACTIVE_TOOLS", m.bindings[9].name);
+    try tt.expectEqualStrings("false", m.bindings[9].text);
+    try tt.expectEqualStrings("MCP_ALLOW_DARKWEB", m.bindings[10].name);
+    try tt.expectEqualStrings("false", m.bindings[10].text);
+    try tt.expectEqualStrings("secret_text", m.keep_bindings[0]);
+    try tt.expectEqualStrings(GARRETT_MIGRATION_TAG, m.migrations.?.new_tag);
+    try tt.expectEqual(@as(usize, 3), m.migrations.?.new_sqlite_classes.len);
+    try tt.expect(std.mem.indexOf(u8, again, "migrations") == null);
+    // no secret rides the body: the three are set by their own calls
+    try tt.expect(std.mem.indexOf(u8, first, "MCP_API_TOKEN") == null and std.mem.indexOf(u8, first, "ACCESS_PASSWORD") == null);
+    try tt.expect(std.mem.indexOf(u8, first, "name=\"index.js\"; filename=\"index.js\"\r\nContent-Type: application/javascript+module\r\n\r\nexport default {}") != null);
+    try tt.expect(std.mem.indexOf(u8, first, "name=\"harness.mjs\"; filename=\"harness.mjs\"\r\nContent-Type: application/javascript+module\r\n\r\nexport const h = 1;") != null);
+    try tt.expect(std.mem.indexOf(u8, first, "name=\"neuron_core.wasm\"; filename=\"neuron_core.wasm\"\r\nContent-Type: application/wasm\r\n\r\n\x00asm") != null);
+    try tt.expect(std.mem.endsWith(u8, first, "\r\n------b--\r\n"));
+    // the keys the owner may set by hand, and the names the runtime reads them under
+    try tt.expectEqualStrings("ALERT_URL", keySecret("alert").?);
+    try tt.expectEqualStrings("GARRETT_MCP_URL", keySecret("garrett_url").?);
+    try tt.expectEqualStrings("GARRETT_MCP_TOKEN", keySecret("garrett-token").?);
+    try tt.expect(keyIsUrl("ALERT_URL") and keyIsUrl("GARRETT_MCP_URL") and !keyIsUrl("GARRETT_MCP_TOKEN") and !keyIsUrl("BRAVE_KEY"));
+    try tt.expect(std.mem.indexOf(u8, TOT_JS, "env.ALERT_URL") != null);
+    try tt.expect(std.mem.indexOf(u8, TOT_JS, "env.GARRETT_MCP_URL") != null);
+    try tt.expect(std.mem.indexOf(u8, TOT_JS, "env.GARRETT_MCP_TOKEN") != null);
+    // the settings the runtime takes by those names
+    try tt.expect(std.mem.indexOf(u8, TOT_JS, "b.posture") != null and std.mem.indexOf(u8, TOT_JS, "b.leash_s") != null);
+}
+
+test "Agent Garrett is launched from its repo's modules beside the tots' Worker - locked, pointed at from the tots, reported to the runtime - and a refusal waits a quarter of an hour" {
+    const gpa = tt.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-cftot-garrett-tmp";
+    var ta = try http.testApp(gpa, io, root);
+    defer ta.deinit();
+    if (!curlRuns(gpa, io)) return error.SkipZigTest;
+    garrett_failed_s.store(0, .monotonic);
+
+    const routes = [_]fakehttp.Route{
+        .{ .method = "GET", .path = "/v1/garrett", .reply = StandIn.garrett_pending },
+        .{ .method = "GET", .path = "/garrett/src/index.js", .reply = StandIn.src_index },
+        .{ .method = "GET", .path = "/garrett/src/neuron_core.wasm", .reply = StandIn.src_wasm },
+        .{ .method = "GET", .path = "/garrett/src/", .reply = StandIn.src_mjs },
+        .{ .method = "GET", .path = "/accounts/acct/workers/subdomain", .reply = StandIn.subdomain },
+        .{ .method = "GET", .path = "/workers/scripts/veil-garrett/settings", .reply = StandIn.no_script },
+        .{ .method = "PUT", .path = "/workers/scripts/veil-garrett/secrets", .reply = StandIn.ok },
+        // the first launch is refused both ways (with and without the class migration); the next is taken
+        .{ .method = "PUT", .path = "/workers/scripts/veil-garrett", .reply = StandIn.no_browser, .times = 2 },
+        .{ .method = "PUT", .path = "/workers/scripts/veil-garrett", .reply = StandIn.ok },
+        .{ .method = "POST", .path = "/workers/scripts/veil-garrett/subdomain", .reply = StandIn.ok },
+        .{ .method = "PUT", .path = "/workers/scripts/veil-tots/secrets", .reply = StandIn.ok },
+        .{ .method = "POST", .path = "/v1/garrett/result", .reply = StandIn.garrett_deployed },
+    };
+    var srv: fakehttp.Server = undefined;
+    try srv.startRouted(io, &routes, StandIn.ok);
+    var running = true;
+    defer if (running) srv.stop();
+    var rb: [80]u8 = undefined;
+    ta.app.cf_api_root = try std.fmt.bufPrint(&rb, "http://127.0.0.1:{d}/client/v4", .{srv.port});
+    var ub: [80]u8 = undefined;
+    const stand_in = try std.fmt.bufPrint(&ub, "http://127.0.0.1:{d}", .{srv.port});
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tok: Tok = .{ .key = "oauth-bearer", .account_id = "acct" };
+    // a deployed runtime, as a tot's garrett_launch finds it; without one there is nothing to launch beside
+    var none: State = .{};
+    try tt.expect(launchGarrett(&ta.app, a, 1, tok, &none) != null);
+    var st: State = .{ .account = "acct", .url = stand_in, .script_hash = "x" };
+    writeState(&ta.app, 1, st);
+
+    // 1: the runtime says a tot asked; the upload is refused, the refusal is reported, nothing is recorded
+    syncGarrettAs(&ta.app, a, 1, tok, &st);
+    try tt.expectEqualStrings("", st.garrett_url);
+    try tt.expect(garrett_failed_s.load(.monotonic) > 0);
+    // 2: within the quarter hour only the question is asked
+    const before = srv.call_count;
+    syncGarrettAs(&ta.app, a, 1, tok, &st);
+    try tt.expectEqual(before + 1, srv.call_count);
+    // 3: the backoff over, the launch goes through: the Worker, its secrets, its address, the tots' two secrets
+    garrett_failed_s.store(0, .monotonic);
+    syncGarrettAs(&ta.app, a, 1, tok, &st);
+    try tt.expectEqualStrings(stand_in, st.garrett_url);
+    var hb: [16]u8 = undefined;
+    try tt.expectEqualStrings(garrettHash(&[_][]const u8{ StandIn.src_index_body, StandIn.src_mjs_body, StandIn.src_mjs_body, StandIn.src_mjs_body, StandIn.src_wasm_body }, &hb), st.garrett_hash);
+    try tt.expect(st.garrett_at > 0);
+    try tt.expectEqualStrings(stand_in, readState(&ta.app, 1, a).garrett_url);
+    // the state file holds no secret of Agent Garrett's
+    var mb: [64]u8 = undefined;
+    var pb: [64]u8 = undefined;
+    const on_disk = try std.Io.Dir.cwd().readFileAlloc(io, root ++ "/u1/" ++ STATE_FILE, a, .limited(64 << 10));
+    try tt.expect(std.mem.indexOf(u8, on_disk, garrettToken(&ta.app, 1, "acct", 0, &mb)) == null);
+    try tt.expect(std.mem.indexOf(u8, on_disk, garrettPassword(&ta.app, 1, "acct", 0, &pb)) == null);
+    try tt.expect(!std.mem.eql(u8, &mb, &pb)); // two derived secrets, two values
+    // removal: the Worker, the tots' two secrets, the runtime's record
+    try tt.expect(removeGarrett(&ta.app, a, 1, tok, &st) == null);
+    try tt.expectEqualStrings("", st.garrett_url);
+    try tt.expectEqualStrings("", readState(&ta.app, 1, a).garrett_url);
+
+    srv.stop();
+    running = false;
+    // the modules are read before anything in the account is touched; then the subdomain, the script, the upload
+    try tt.expectEqual(@as(?usize, 0), srv.firstCall("GET", "/v1/garrett"));
+    try tt.expectEqual(@as(?usize, 1), srv.firstCall("GET", "/garrett/src/index.js"));
+    try tt.expectEqual(@as(?usize, 2), srv.firstCall("GET", "/garrett/src/mcp.mjs"));
+    try tt.expectEqual(@as(?usize, 5), srv.firstCall("GET", "/garrett/src/neuron_core.wasm"));
+    try tt.expectEqual(@as(?usize, 6), srv.firstCall("GET", "/accounts/acct/workers/subdomain"));
+    try tt.expectEqual(@as(?usize, 7), srv.firstCall("GET", "/workers/scripts/veil-garrett/settings"));
+    try tt.expectEqual(@as(?usize, 8), srv.firstCall("PUT", "/accounts/acct/workers/scripts/veil-garrett"));
+    try tt.expectEqual(@as(?usize, 10), srv.firstCall("POST", "/v1/garrett/result")); // the refusal, reported
+    try tt.expectEqual(@as(usize, 3), srv.countCalls("GET", "/v1/garrett"));
+    try tt.expectEqual(@as(usize, 6), srv.countCalls("PUT", "/accounts/acct/workers/scripts/veil-garrett")); // 3 uploads + 3 secrets
+    try tt.expectEqual(@as(usize, 3), srv.countCalls("PUT", "/workers/scripts/veil-garrett/secrets"));
+    try tt.expectEqual(@as(usize, 1), srv.countCalls("POST", "/workers/scripts/veil-garrett/subdomain"));
+    try tt.expectEqual(@as(usize, 2), srv.countCalls("PUT", "/workers/scripts/veil-tots/secrets"));
+    try tt.expectEqual(@as(usize, 2), srv.countCalls("POST", "/v1/garrett/result"));
+    try tt.expectEqual(@as(usize, 1), srv.countCalls("DELETE", "/workers/scripts/veil-garrett?force=true"));
+    try tt.expectEqual(@as(usize, 2), srv.countCalls("DELETE", "/workers/scripts/veil-tots/secrets/GARRETT_MCP_"));
+    try tt.expectEqual(@as(usize, 1), srv.countCalls("POST", "/v1/garrett/clear"));
+    try tt.expectEqual(@as(usize, 32), srv.call_count);
+}
 
 test "RSI seeds the live source, uploads self-edits without a local grant, persists them, and reports compiler failures" {
     const gpa = tt.allocator;
@@ -2637,18 +3126,25 @@ test "every deployment is a run of its own: a failed one is kept with its error,
 
     // a run's events, past `after`, the newest `limit`
     const E = struct { ok: bool, events: []const struct { seq: u64, kind: []const u8 = "", ok: ?bool = null } };
-    const all = try std.json.parseFromSliceLeaky(E, a, try runEventsJson(&ta.app, a, 1, "Gary-20261001-120000", 0, 200), .{ .ignore_unknown_fields = true });
+    const all = try std.json.parseFromSliceLeaky(E, a, try runEventsJson(&ta.app, a, 1, "Gary-20261001-120000", 0, 200, false), .{ .ignore_unknown_fields = true });
     try tt.expectEqual(@as(usize, 3), all.events.len);
-    const later = try std.json.parseFromSliceLeaky(E, a, try runEventsJson(&ta.app, a, 1, "Gary-20261001-120000", 1, 200), .{ .ignore_unknown_fields = true });
+    const later = try std.json.parseFromSliceLeaky(E, a, try runEventsJson(&ta.app, a, 1, "Gary-20261001-120000", 1, 200, false), .{ .ignore_unknown_fields = true });
     try tt.expectEqual(@as(u64, 2), later.events[0].seq);
-    const last = try std.json.parseFromSliceLeaky(E, a, try runEventsJson(&ta.app, a, 1, "Gary-20261001-120000", 0, 1), .{ .ignore_unknown_fields = true });
+    const last = try std.json.parseFromSliceLeaky(E, a, try runEventsJson(&ta.app, a, 1, "Gary-20261001-120000", 0, 1, false), .{ .ignore_unknown_fields = true });
     try tt.expectEqual(@as(usize, 1), last.events.len);
     try tt.expectEqual(@as(u64, 3), last.events[0].seq);
-    const fail_ev = try std.json.parseFromSliceLeaky(E, a, try runEventsJson(&ta.app, a, 1, leaf, 0, 200), .{ .ignore_unknown_fields = true });
+    // forward (what `veil --tater verify` walks): the FIRST `limit` past `after`, from the run's first event on
+    const fwd = try std.json.parseFromSliceLeaky(E, a, try runEventsJson(&ta.app, a, 1, "Gary-20261001-120000", 0, 1, true), .{ .ignore_unknown_fields = true });
+    try tt.expectEqual(@as(usize, 1), fwd.events.len);
+    try tt.expectEqual(@as(u64, 1), fwd.events[0].seq);
+    const fwd2 = try std.json.parseFromSliceLeaky(E, a, try runEventsJson(&ta.app, a, 1, "Gary-20261001-120000", 1, 2, true), .{ .ignore_unknown_fields = true });
+    try tt.expectEqual(@as(usize, 2), fwd2.events.len);
+    try tt.expectEqual(@as(u64, 2), fwd2.events[0].seq);
+    const fail_ev = try std.json.parseFromSliceLeaky(E, a, try runEventsJson(&ta.app, a, 1, leaf, 0, 200, false), .{ .ignore_unknown_fields = true });
     try tt.expectEqual(@as(usize, 2), fail_ev.events.len);
     try tt.expectEqualStrings("error", fail_ev.events[1].kind);
     try tt.expectEqual(@as(?bool, false), fail_ev.events[1].ok);
     // a run with no folder has no events, and that is not an error
-    const none = try std.json.parseFromSliceLeaky(E, a, try runEventsJson(&ta.app, a, 1, "Nova-20261002-000000", 0, 200), .{ .ignore_unknown_fields = true });
+    const none = try std.json.parseFromSliceLeaky(E, a, try runEventsJson(&ta.app, a, 1, "Nova-20261002-000000", 0, 200, false), .{ .ignore_unknown_fields = true });
     try tt.expectEqual(@as(usize, 0), none.events.len);
 }

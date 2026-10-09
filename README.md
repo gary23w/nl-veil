@@ -362,6 +362,26 @@ so they never cross the public internet and need no API key.
 - **Search that answers.** Keyless search engines often refuse a cloud address, and their pages show a bot
   check to a cloud browser. Give the tater-tots a search API key and `web_search` asks it first:
   `veil --tater key brave <key>` (or `google` + `google_cx`). The key is stored as a secret on your Worker.
+- **It stands guard, with or without a model.** Name what a tater-tot watches - a page and the words it must show,
+  a status it must answer, its content pinned; a DNS name's answers - and it looks every heartbeat *before* the
+  model is asked, with no model at all, so the watch goes on when the model is dead, rate-limited or withdrawn.
+  A change is a **tripwire**: an event, a scratchpad entry every tater-tot reads, a directive in its inbox, and a
+  post to your webhook (`veil --tater key alert <Discord or Slack webhook URL>`).
+  `veil --tater guard Gary add https://example.com/health --text "ok" --every 60`, or `/guard ...` in the tab.
+- **Every event is chained.** Each event's hash covers the one before it, so the `events.jsonl` on your machine
+  is tamper-evident on its own: `veil --tater verify <run>` recomputes the chain and names the first row that was
+  altered or dropped. Who knew what, when, held outside anyone's lab.
+- **A DEFEND posture and a leash.** `/posture defend` freezes the runtime, reports bot checks instead of working
+  through them, names the tater-tot in every request it makes and holds it to read-only verification;
+  `/leash 3600` holds the goal loop whenever your veil has not been heard from for an hour (the guard goes on)
+  and releases it the moment it is back. A tater-tot never runs on with nobody's veil alive.
+- **Agent Garrett, on request.** The blue-team agent from
+  [garrettstimpson.ca/agent](https://github.com/gary23w/garrettstimpson.ca/tree/main/agent) - CVE/KEV/EPSS
+  intel, DNS and certificate transparency, RDAP, email security posture, IOC extraction, evidence manifests, 90-odd
+  tools, passive by default - launched into your account beside the tater-tots (`veil --tater garrett launch`, or a
+  tater-tot's own `garrett_launch`) and reached over its MCP endpoint with `garrett` / `garrett_tools`. Its chat UI
+  is locked at launch; `veil --tater garrett password` shows the password.
+  [The day after](https://gary23w.github.io/nl-veil/#doc=guide/day-after) says what all of this is for.
 - **A console you can read.** Each event is one line saying what happened; a row that went wrong is red.
   Click a row to open its full text under it, click again to close it, and *errors* shows only what failed.
 - **Your machine, only if you say so.** The deploy form has one box, unchecked by default: *let it use THIS
