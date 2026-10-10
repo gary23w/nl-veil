@@ -1870,3 +1870,108 @@ test("Agent Garrett: per-feature opt-in preserves typed schemas and direct calls
     assert.equal(calls.length,before);
   } finally { globalThis.fetch = realFetch; }
 });
+
+
+test("an accepted model request shape is retained and later errors are not hidden", async () => {
+  const w = world();
+  await w.req("POST", "/v1/tots", {goal:"inspect our website"});
+  const tot=w.tot("Gary"), cfg=await tot.store.get("cfg");
+  const messages=[{role:"user",content:"hello"}];
+  assert.equal(await tot.askOnce(cfg,messages,2000),'{"final": "nothing to do"}');
+  assert.equal((await tot.store.get("shapes"))[cfg.model],"messages");
+  let calls=0;
+  w.env.AI.run=async (model,input)=>{
+    calls++;
+    assert.ok(input.messages);
+    throw new Error("model input exceeds its context window");
+  };
+  await assert.rejects(tot.askOnce(cfg,messages,4000),/model input exceeds its context window/);
+  assert.equal(calls,1);
+});
+
+test("a failed request-shape probe preserves the original and fallback errors", async () => {
+  const w=world();
+  await w.req("POST","/v1/tots",{goal:"inspect our website"});
+  const tot=w.tot("Gary"),cfg=await tot.store.get("cfg");
+  w.env.AI.run=async (model,input)=>{
+    if(input.messages)throw new Error("original input schema error: invalid content");
+    throw new Error("5006: oneOf at '/' not met: required properties are messages or prompt");
+  };
+  await assert.rejects(tot.askOnce(cfg,[{role:"user",content:"hello"}],4000),/messages request failed: original input schema error: invalid content; input fallback also failed: 5006/);
+  assert.equal(await tot.store.get("shapes"),undefined);
+});
+
+test("a full security catalogue is visible in planning without flooding execution, and schema lookup preserves typed calls", async () => {
+  const schema={type:"object",properties:{targets:{type:"array",items:{type:"string"}},options:{type:"object",properties:{enabled:{type:"boolean"},count:{type:"integer"}}}},required:["targets","options"]};
+  const wide={type:"object",properties:Object.fromEntries(Array.from({length:55},(_,i)=>["argument_"+i,{type:"string",maxLength:12000}])),additionalProperties:false};
+  const catalog=Array.from({length:164},(_,i)=>({name:"gary_catalog_"+i,description:"A deployed security capability with its complete typed arguments",inputSchema:wide}));
+  catalog.push({name:"dns_lookup",description:"DNS over HTTPS lookup",inputSchema:wide},{name:"gary_probe",description:"Inspect a target with typed options",inputSchema:schema});
+  const oldPrompt=catalog.map(t=>JSON.stringify(t.inputSchema)).join("\n");
+  assert.ok(oldPrompt.length>300000);
+  const submitted={targets:["garrettstimpson.ca"],options:{enabled:false,count:2}};
+  const w=world((messages,n,input)=>{
+    assert.ok(messages.reduce((size,m)=>size+m.content.length,0)<=54000);
+    if(n===1){
+      assert.match(messages[0].content,/AVAILABLE TOOLS:/);
+      assert.match(messages[0].content,/security_dns_lookup/);
+      assert.match(messages[0].content,/security_gary_catalog_163/);
+      return "Inspect the domain with security_gary_probe using its actual schema.";
+    }
+    if(n===2){
+      assert.match(messages[0].content,/typed arguments: call tool_schema/);
+      assert.doesNotMatch(messages[0].content,/argument_54/);
+      return JSON.stringify({tool:"tool_schema",args:{name:"security_gary_probe"}});
+    }
+    if(n===3){
+      const result=messages.at(-1).content;
+      assert.match(result,/"type":"array"/);
+      assert.match(result,/"type":"boolean"/);
+      assert.match(result,/"type":"integer"/);
+      return JSON.stringify({tool:"security_gary_probe",args:submitted});
+    }
+    if(n===4)return JSON.stringify({final:"The cloud tool returned completed."});
+    if(n===5)return proofLine("SAME","completed probe","none");
+    return "NONE";
+  });
+  w.env.GARRETT_MCP_URL="https://veil-garrett.example.workers.dev/mcp";
+  w.env.GARRETT_MCP_TOKEN="test-token-only-not-a-live-credential";
+  await w.req("POST","/v1/tots",{goal:"Audit garrettstimpson.ca with Agent Garrett",garrett:true});
+  const tot=w.tot("Gary"),cfg=await tot.store.get("cfg");
+  const realFetch=globalThis.fetch;
+  const calls=[];
+  globalThis.fetch=async (url,init)=>{
+    const body=JSON.parse(init.body);
+    calls.push(body);
+    return Response.json({jsonrpc:"2.0",id:1,result:body.method==="tools/list"?{tools:catalog}:{content:[{type:"text",text:"completed"}],isError:false}});
+  };
+  try{
+    await tot.iterate(cfg);
+    assert.equal(w.env.SECURITY_TOOLS.length,166);
+    assert.deepEqual(calls.find(c=>c.method==="tools/call").params,{name:"gary_probe",arguments:submitted});
+    assert.deepEqual(JSON.parse(await tot.runTool(cfg,"tool_schema",{name:"security_gary_probe"},"")).inputSchema,schema);
+    const events=await w.events("Gary");
+    assert.ok(events.some(e=>e.kind==="act"&&e.tool==="tool_schema"&&e.ok));
+    assert.ok(events.some(e=>e.kind==="act"&&e.tool==="security_gary_probe"&&e.ok));
+    assert.ok(!events.some(e=>e.kind==="error"));
+    const disabled={...cfg,garrett:false};
+    assert.match(await tot.runTool(disabled,"tool_schema",{name:"security_gary_probe"},""),/not available/);
+  }finally{globalThis.fetch=realFetch;}
+});
+
+test("a long execution retains its task and newest evidence while bounding model requests", async () => {
+  const w=world((messages,n)=>{
+    assert.equal(messages[0].content,"Keep the goal and use returned evidence.");
+    assert.equal(messages[1].content,"Inspect the current domain.");
+    assert.ok(messages.reduce((size,m)=>size+m.content.length,0)<=54000);
+    if(n>1)assert.match(messages.at(-1).content,new RegExp("evidence-"+(n-1)));
+    return JSON.stringify(n<10?{tool:"read_file",args:{name:"evidence.txt"}}:{final:"checked"});
+  });
+  await w.req("POST","/v1/tots",{goal:"inspect our website"});
+  const tot=w.tot("Gary"),cfg=await tot.store.get("cfg");
+  let calls=0;
+  tot.runTool=async()=>"evidence-"+(++calls)+" "+"x".repeat(9000);
+  const record=[];
+  assert.equal(await tot.toolLoop(cfg,"Keep the goal and use returned evidence.","Inspect the current domain.",[{name:"read_file"}],12,record,""),"checked");
+  assert.equal(record.length,9);
+  assert.ok(w.asked.at(-1).input.messages.length<20);
+});

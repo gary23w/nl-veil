@@ -63,7 +63,7 @@
 // No imports and no platform globals beyond fetch/Response/crypto, so cloud/tot.test.mjs runs the whole file
 // under node with a Map for storage and a scripted model.
 
-export const VERSION = "9";
+export const VERSION = "10";
 // How many tots an account may run: 24 unless the owner sets another, up to MAX_TOTS_CEIL. What an account can
 // really carry is its Cloudflare plan's to say: every tot is a Durable Object that wakes every few seconds.
 export const DEFAULT_MAX_TOTS = 24;
@@ -715,7 +715,7 @@ const LOCAL_TOOL = {
 };
 /// Earlier names for the file tools: a model (or a lesson) that still says note_write is understood.
 const ALIASES = { browser_links: "browser_read", browser_navigate: "browser_open", browser_goto: "browser_open", browser_press: "browser_key", stance: "feel", note_stance: "feel", pip: "pip_install", install_package: "pip_install", note_write: "write_file", note_read: "read_file", note_list: "list_files", note_delete: "delete_file", fetch_json: "web_fetch", read_url: "web_fetch", list_dir: "list_files", observe: "remember", python: "run_python" };
-const MIND_TOOLS = new Set(["write_file", "read_file", "list_files", "append_file", "web_search", "web_fetch", "http_request", "run_python", "pip_install", "run_skill", "remember", "recall", "pad_read", "pad_write", "garrett", "garrett_tools"]);
+const MIND_TOOLS = new Set(["tool_schema", "write_file", "read_file", "list_files", "append_file", "web_search", "web_fetch", "http_request", "run_python", "pip_install", "run_skill", "remember", "recall", "pad_read", "pad_write", "garrett", "garrett_tools"]);
 
 /// Agent Garrett is reachable when the veil server set both secrets on this Worker (cf_tot.zig launchGarrett, or
 /// `veil --tater key garrett_url` / `garrett_token` for an agent the owner deployed by hand).
@@ -730,7 +730,7 @@ const wantsGarrett = (cfg) => cfg.garrett === true;
 function toolsFor(env, cfg) {
   const want = wantsGarrett(cfg);
   const have = { browser: !!env.BROWSER, python: !!env.PY, garrett: want && hasGarrett(env) };
-  const list = TOOLS.filter((t) => !t.need || have[t.need]).filter((t) => t.name !== "garrett_launch" || (cfg.garrett === true && !hasGarrett(env)));
+  const list = [{name:"tool_schema",args:'{"name":"<available tool>"}',what:"inspect one available tool\'s complete typed input schema or example arguments before calling it"}, ...TOOLS].filter((t) => !t.need || have[t.need]).filter((t) => t.name !== "garrett_launch" || (cfg.garrett === true && !hasGarrett(env)));
   const full = [...list, ...(have.garrett ? env.SECURITY_TOOLS ?? [] : [])];
   return cfg.local ? [...full, LOCAL_TOOL] : full;
 }
@@ -740,6 +740,8 @@ function missingNote(env, cfg) {
   const miss = [];
   if (!env.BROWSER) miss.push("a browser (browser_*)");
   if (!env.PY) miss.push("Python (run_python, skills)");
+  if (!wantsGarrett(cfg)) miss.push("Agent Garrett security tools (enable Agent Garrett for this tot)");
+  else if (!hasGarrett(env)) miss.push("Agent Garrett security tools (the deployment connection is not ready)");
   return miss.length ? `NOT AVAILABLE in this account right now: ${miss.join(", ")}. Work with the tools listed.\n` : "";
 }
 
@@ -936,13 +938,29 @@ class Cdp {
   }
 }
 
-function toolList(tools) {
-  return tools.map((t) => `- ${t.name} ${t.args} : ${t.what}`).join("\n");
+export function toolIndex(tools) {
+  return tools.map((t) => `- ${t.name}: ${clip(t.what, 100)}`).join("\n");
+}
+
+export function toolList(tools) {
+  return tools.map((t) => t.name.startsWith("security_")
+    ? `- ${t.name}: ${clip(t.what, 100)} (typed arguments: call tool_schema)`
+    : `- ${t.name} ${t.args} : ${t.what}`).join("\n");
+}
+
+function recentMessages(messages) {
+  const bounded = messages.slice();
+  let size = bounded.reduce((n, m) => n + String(m.content ?? "").length, 0);
+  while (size > 54000 && bounded.length > 4) {
+    const removed = bounded.splice(2, 2);
+    size -= removed.reduce((n, m) => n + String(m.content ?? "").length, 0);
+  }
+  return bounded;
 }
 
 const REPLY_RULE =
   'Reply with exactly ONE JSON object and nothing else. To use a tool: {"tool": "<name>", "args": {...}} with the ' +
-  "tool's arguments inside args, exactly as its line above shows them. " +
+  "tool's argument values inside args. For security_* tools, first use tool_schema to read the full input schema; preserve objects, arrays, booleans and numbers, and send argument values rather than the schema itself. " +
   'When the step is finished (or cannot go further): {"final": "<what was done and what the tool results showed>"}.';
 
 // ------------------------------------------------------------------------------------------ the Worker (router)
@@ -1647,17 +1665,28 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
     // Most chat models take `messages`; a family that only takes `input` says so in its error, once, and the
     // shape that worked is remembered per model.
     const shapes = (await this.store.get("shapes")) ?? {};
-    const first = shapes[cfg.model] === "input" ? "input" : "messages";
-    const run = (shape) => this.env.AI.run(cfg.model, shape === "input" ? { input: messages, max_output_tokens: maxTokens } : { messages, max_tokens: maxTokens });
+    const known = shapes[cfg.model];
+    const first = known === "input" ? "input" : "messages";
+    const bounded = recentMessages(messages);
+    const run = (shape) => this.env.AI.run(cfg.model, shape === "input" ? { input: bounded, max_output_tokens: maxTokens } : { messages: bounded, max_tokens: maxTokens });
+    const accept = async (shape, result) => {
+      if (shapes[cfg.model] !== shape) {
+        shapes[cfg.model] = shape;
+        await this.store.put("shapes", shapes);
+      }
+      return answerText(result);
+    };
     try {
-      return answerText(await run(first));
+      return await accept(first, await run(first));
     } catch (e) {
+      const error = String(e?.message ?? e);
+      if (known || !/input|messages|required|schema|oneOf/i.test(error)) throw e;
       const other = first === "messages" ? "input" : "messages";
-      if (!/input|messages|required|schema|oneOf/i.test(String(e?.message ?? e))) throw e;
-      const text = answerText(await run(other));
-      shapes[cfg.model] = other;
-      await this.store.put("shapes", shapes);
-      return text;
+      try {
+        return await accept(other, await run(other));
+      } catch (fallback) {
+        throw new Error(`${first} request failed: ${error}; ${other} fallback also failed: ${String(fallback?.message ?? fallback)}`, {cause:e});
+      }
     }
   }
 
@@ -1758,11 +1787,12 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
       const caps = await pythonCaps(this.env);
       if (caps.ok) await this.store.put("py_native", caps.native);
     }
+    const tools = toolsFor(this.env, cfg);
     const system = this.systemPrompt(cfg, g, lessons, padTail) + (await this.guardText(cfg)) + (await this.workingMemory());
     const inboxText = inbox.length > 0 ? "\nNEW MESSAGES (a message from human or guard is a directive and outranks your own plan):\n" + inbox.map((m) => `- ${m.from}: ${m.text}`).join("\n") + "\n" : "";
 
     // PICK
-    const pick = pickText(await this.ask(cfg, [{ role: "system", content: system }, { role: "user", content: inboxText + pickQuestion(g, rows) }], 2000));
+    const pick = pickText(await this.ask(cfg, [{ role: "system", content: system + "\nAVAILABLE TOOLS:\n" + toolIndex(tools) + "\n" + missingNote(this.env, cfg) }, { role: "user", content: inboxText + pickQuestion(g, rows) }], 2000));
     const checkDone = !g.forever && /^["'`*\s]*DONE\b/.test(pick) && pick.length < 40;
     if (checkDone) {
       const cur = await this.store.get("goal"); // as stored now: a command may have landed while the model answered
@@ -1773,7 +1803,6 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
 
     // DO
     const record = [];
-    const tools = toolsFor(this.env, cfg);
     const claim = await this.toolLoop(cfg, system + "\n\nTOOLS:\n" + toolList(tools) + "\n" + missingNote(this.env, cfg) + "\n" + REPLY_RULE, inboxText + "THIS ITERATION'S STEP: " + step, tools, TOOL_ROUNDS, record, "");
 
     // MEASURE
@@ -2022,6 +2051,13 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
   }
 
   async runTool(cfg, tool, args, mind) {
+    if (tool === "tool_schema") {
+      const entry = toolsFor(this.env, cfg).find(t => t.name === String(args.name ?? ""));
+      if (!entry) return "ERROR: that tool is not available on this tot's belt";
+      return JSON.stringify(entry.inputSchema
+        ? {name:entry.name,description:entry.what,inputSchema:entry.inputSchema}
+        : {name:entry.name,description:entry.what,exampleArguments:entry.args});
+    }
     if ((tool.startsWith("security_") || tool === "garrett" || tool === "garrett_tools") && !wantsGarrett(cfg)) return "Agent Garrett is not enabled for this tot. Use /garrett on to enable its full toolset.";
     if (tool.startsWith("security_")) return this.garrettCall(cfg, "tools/call", {name:tool.slice(9), arguments:args}, "call");
     if (["runtime_read", "runtime_edit", "runtime_deploy"].includes(tool)) {
@@ -2473,7 +2509,7 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
       const response = await fetch(this.env.GARRETT_MCP_URL, {method:"POST", headers:{"content-type":"application/json",authorization:"Bearer "+this.env.GARRETT_MCP_TOKEN}, body:JSON.stringify({jsonrpc:"2.0",id:1,method:"tools/list",params:{}}),signal:AbortSignal.timeout(30000)});
       const result = await response.json();
       if (!response.ok || !Array.isArray(result.result?.tools)) return;
-      this.env.SECURITY_TOOLS = result.result.tools.filter(t=>/^[a-z][a-z0-9_]{1,39}$/.test(t.name) && t.inputSchema).map(t=>({name:"security_"+t.name,args:JSON.stringify(t.inputSchema),what:String(t.description ?? ""),need:"garrett"}));
+      this.env.SECURITY_TOOLS = result.result.tools.filter(t=>/^[a-z][a-z0-9_]{1,39}$/.test(t.name) && t.inputSchema).map(t=>({name:"security_"+t.name,args:JSON.stringify(t.inputSchema),what:String(t.description ?? ""),inputSchema:t.inputSchema,need:"garrett"}));
       this.securityAt = Date.now();
     } catch {}
   }

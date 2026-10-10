@@ -48,3 +48,7 @@ MCP credentials stay on the server for desktop and CLI chat calls. The MCP endpo
 ## Licenses and corresponding source
 
 NL-Veil code uses its [MIT license](https://github.com/gary23w/nl-veil/blob/v1.1.12/LICENSE). Gary includes modified [ARTEX](https://github.com/Hinln/ARTEX) source under [AGPL-3.0](https://github.com/gary23w/nl-veil/blob/v1.1.12/cloud/GARY-LICENSE). The [Gary notice](https://github.com/gary23w/nl-veil/blob/v1.1.12/cloud/GARY-NOTICE), [source archive](https://github.com/gary23w/nl-veil/raw/refs/tags/v1.1.12/cloud/gary-source.tar.gz), and [Cloudflare build sources](https://github.com/gary23w/nl-veil/tree/v1.1.12/cloud) are public and included in every full release bundle. Dependencies retain their own licenses.
+
+## Tater-tot schema discovery
+
+Tater-tots see every available Garrett tool during planning. Before using a `security_*` tool, they call `tool_schema` with its exposed name to obtain the complete input schema. Arrays, nested objects, booleans and numbers retain their original types. This avoids sending all 166 schemas in every model request. The tater-tot must have Agent Garrett enabled and its deployment connection ready.
