@@ -176,8 +176,13 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          # Bump this to the current release's notes on every tag (one notes file per release under docs/release/).
-          body_path: docs/release/RELEASE-v1.1.12.md
+          body_path: ${{ github.ref_name != 'v1.1.15' && 'docs/release/RELEASE-v1.1.15.md' || '' }}
+          body: |
+            Fixes Tater-tot model failures when the complete Agent Garrett security catalogue is enabled.
+
+            All 166 security tools remain available. The planner receives the complete tool index, and execution loads full typed argument schemas on demand. Long tool runs retain their task and recent evidence within the model request budget. Successful model request formats are cached, and original errors are preserved.
+
+            Repository documentation and READMEs are unchanged for this release.
           draft: true
           # A tag with a hyphen in it (v1.0.1-beta-7, v2.0.0-rc.1) is a prerelease; a bare version
           # (v1.1.0) is not. This was hardcoded `true` through every alpha and beta, which was correct
