@@ -1,4 +1,3 @@
-
 const std = @import("std");
 const cf_oauth = @import("../config/cf_oauth.zig"); // curl: the transport that keeps the bearer off disk and argv
 
@@ -60,6 +59,30 @@ pub fn discover(c: Ctx) []u8 {
     return renderDefs(c.gpa, raw);
 }
 
+/// How much of a tool's own description rides on the belt, and how much of one argument's. The belt is
+/// re-uploaded on EVERY inference of every turn that has Agent Garrett on: measured on the first long chat with
+/// the 166-tool catalogue (conv c6ac996e9, 2026-10-10), the verbatim schemas were 366 KB of a 405 KB tools array,
+/// ~110k tokens a call, and the turn crossed its 400k-token spend ceiling every three or four inferences — four
+/// compactions in one task, each one a visible carry the user read as the harness losing the thread. Of those
+/// 366 KB, 44 KB were tool descriptions, 34 KB argument descriptions, 29 KB `maxLength`/`pattern` constraints the
+/// model never needs, and 257 KB were ONE identical 54-argument schema repeated on 94 tools (see ARG_BAG_MIN).
+const DEF_DESC_MAX: usize = 200;
+const ARG_DESC_MAX: usize = 80;
+
+/// An object with more named arguments than this is an alias bag, not a signature: the catalogue's generic
+/// tools each declare the same 54 optional strings (`cve` and `cveId`, `addr` and `address`, `pw` and
+/// `password`, ...) and the tool's one-line description is what actually says which of them it reads. Repeating
+/// that bag typed, 94 times, is what made the belt 257 KB. It is rendered once per tool as the REQUIRED arguments
+/// (typed), `additionalProperties: true`, and the remaining names listed in the object's description — so the
+/// model still spells every key the way the upstream server does, at ~0.4 KB a tool instead of 2.7.
+const ARG_BAG_MIN: usize = 16;
+
+/// The catalogue as OpenAI-style function definitions, one `security_<name>` per tool, comma-joined (no outer
+/// brackets — the caller splices them into its tools array). Names, types, enums, nested objects and arrays and
+/// the `required` list are preserved exactly; what is dropped is what the model does not need to call the tool
+/// correctly: validation constraints, and description text past the first sentences (see DEF_DESC_MAX /
+/// ARG_DESC_MAX / ARG_BAG_MIN). A terse belt is the difference between a chat that compacts every few calls and
+/// one that does not.
 fn renderDefs(gpa: std.mem.Allocator, raw: []const u8) []u8 {
     const parsed = std.json.parseFromSlice(std.json.Value, gpa, raw, .{}) catch return dupe(gpa, "");
     defer parsed.deinit();
@@ -74,14 +97,139 @@ fn renderDefs(gpa: std.mem.Allocator, raw: []const u8) []u8 {
         var buf: [40]u8 = undefined;
         const name = toolName(str(tool.get("name")), &buf) orelse continue;
         const schema = tool.get("inputSchema") orelse continue;
-        const full_name = std.fmt.allocPrint(gpa, "security_{s}", .{name}) catch return dupe(gpa, "");
-        defer gpa.free(full_name);
-        const def = std.json.Stringify.valueAlloc(gpa, .{ .type = "function", .function = .{ .name = full_name, .description = str(tool.get("description")), .parameters = schema } }, .{}) catch return dupe(gpa, "");
-        defer gpa.free(def);
+        var def: std.ArrayListUnmanaged(u8) = .empty;
+        defer def.deinit(gpa);
+        const ok = blk: {
+            def.appendSlice(gpa, "{\"type\":\"function\",\"function\":{\"name\":\"security_") catch break :blk false;
+            def.appendSlice(gpa, name) catch break :blk false;
+            def.appendSlice(gpa, "\",\"description\":") catch break :blk false;
+            jsonLit(gpa, &def, firstSentences(str(tool.get("description")), DEF_DESC_MAX)) catch break :blk false;
+            def.appendSlice(gpa, ",\"parameters\":") catch break :blk false;
+            terseSchema(gpa, &def, schema, 0) catch break :blk false;
+            def.appendSlice(gpa, "}}") catch break :blk false;
+            break :blk true;
+        };
+        if (!ok) return dupe(gpa, "");
         if (out.items.len > 0) out.appendSlice(gpa, ",\n") catch return dupe(gpa, "");
-        out.appendSlice(gpa, def) catch return dupe(gpa, "");
+        out.appendSlice(gpa, def.items) catch return dupe(gpa, "");
     }
     return out.toOwnedSlice(gpa) catch dupe(gpa, "");
+}
+
+/// One schema node, terse (see renderDefs). `depth` 0 is the tool's parameters object, whose description is
+/// the tool's own and is not repeated.
+fn terseSchema(gpa: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), v: std.json.Value, depth: usize) !void {
+    const o = objOf(v) orelse return out.appendSlice(gpa, "{}");
+    try out.append(gpa, '{');
+    var first = true;
+    if (o.get("type")) |t| {
+        try terseKey(gpa, out, &first, "type");
+        try jsonValue(gpa, out, t);
+    }
+    if (o.get("enum")) |e| {
+        try terseKey(gpa, out, &first, "enum");
+        try jsonValue(gpa, out, e);
+    }
+    if (o.get("required")) |r| if (r == .array and r.array.items.len > 0) {
+        try terseKey(gpa, out, &first, "required");
+        try jsonValue(gpa, out, r);
+    };
+    if (o.get("items")) |it| {
+        try terseKey(gpa, out, &first, "items");
+        try terseSchema(gpa, out, it, depth + 1);
+    }
+    const props_opt = objOf(o.get("properties"));
+    const bag = if (props_opt) |p| p.count() > ARG_BAG_MIN else false;
+    const own = std.mem.trim(u8, str(o.get("description")), " \r\n\t");
+    if (depth > 0 and depth <= 2 and !bag and own.len > 0) {
+        try terseKey(gpa, out, &first, "description");
+        try jsonLit(gpa, out, firstSentences(oneLine(own), ARG_DESC_MAX));
+    }
+    if (props_opt) |props| {
+        try terseKey(gpa, out, &first, "properties");
+        try out.append(gpa, '{');
+        var pf = true;
+        var rest: std.ArrayListUnmanaged(u8) = .empty;
+        defer rest.deinit(gpa);
+        var it = props.iterator();
+        while (it.next()) |p| {
+            const key = p.key_ptr.*;
+            if (bag and !requires(o, key) and !std.mem.eql(u8, key, "_gary")) {
+                if (rest.items.len > 0) try rest.append(gpa, ',');
+                try rest.appendSlice(gpa, key);
+                continue;
+            }
+            if (!pf) try out.append(gpa, ',');
+            pf = false;
+            try jsonLit(gpa, out, key);
+            try out.append(gpa, ':');
+            try terseSchema(gpa, out, p.value_ptr.*, depth + 1);
+        }
+        try out.append(gpa, '}');
+        if (bag) {
+            try terseKey(gpa, out, &first, "additionalProperties");
+            try out.appendSlice(gpa, "true");
+            if (rest.items.len > 0 or (depth > 0 and own.len > 0)) {
+                var note: std.ArrayListUnmanaged(u8) = .empty;
+                defer note.deinit(gpa);
+                if (depth > 0 and own.len > 0) {
+                    try note.appendSlice(gpa, firstSentences(oneLine(own), ARG_DESC_MAX));
+                    if (rest.items.len > 0) try note.appendSlice(gpa, " ");
+                }
+                if (rest.items.len > 0) {
+                    try note.appendSlice(gpa, "optional string arguments, pick the ones the tool description implies: ");
+                    try note.appendSlice(gpa, rest.items);
+                }
+                try terseKey(gpa, out, &first, "description");
+                try jsonLit(gpa, out, note.items);
+            }
+        }
+    }
+    try out.append(gpa, '}');
+}
+
+fn terseKey(gpa: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), first: *bool, key: []const u8) !void {
+    if (!first.*) try out.append(gpa, ',');
+    first.* = false;
+    try out.append(gpa, '"');
+    try out.appendSlice(gpa, key);
+    try out.appendSlice(gpa, "\":");
+}
+
+fn requires(o: std.json.ObjectMap, key: []const u8) bool {
+    const r = o.get("required") orelse return false;
+    if (r != .array) return false;
+    for (r.array.items) |item| if (item == .string and std.mem.eql(u8, item.string, key)) return true;
+    return false;
+}
+
+fn jsonValue(gpa: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), v: std.json.Value) !void {
+    const lit = try std.json.Stringify.valueAlloc(gpa, v, .{});
+    defer gpa.free(lit);
+    try out.appendSlice(gpa, lit);
+}
+
+fn jsonLit(gpa: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), s: []const u8) !void {
+    const lit = try std.json.Stringify.valueAlloc(gpa, s, .{});
+    defer gpa.free(lit);
+    try out.appendSlice(gpa, lit);
+}
+
+/// `s` whole when it fits `max`, else its leading sentences — cut at the last sentence end inside `max`, or at
+/// a word boundary when there is none (never mid-codepoint). The catalogue's descriptions put the one line that
+/// says what the tool does first and the usage essay after it; the essay is what this drops.
+fn firstSentences(s: []const u8, max: usize) []const u8 {
+    const t = std.mem.trim(u8, s, " \r\n\t");
+    if (t.len <= max) return t;
+    var end: usize = 0;
+    var i: usize = 1;
+    while (i < max) : (i += 1) {
+        if ((t[i] == ' ' or t[i] == '\n') and (t[i - 1] == '.' or t[i - 1] == '!' or t[i - 1] == '?')) end = i;
+    }
+    if (end >= 24) return std.mem.trimEnd(u8, t[0..end], " \r\n\t");
+    const cut = clipped(t, max);
+    const sp = std.mem.lastIndexOfScalar(u8, cut, ' ') orelse return cut;
+    return if (sp >= 24) cut[0..sp] else cut;
 }
 
 fn list(c: Ctx) []u8 {
@@ -265,7 +413,6 @@ fn dupe(gpa: std.mem.Allocator, s: []const u8) []u8 {
     return gpa.dupe(u8, s) catch @constCast("");
 }
 
-
 const tt = std.testing;
 const fakehttp = @import("fakehttp.zig");
 const http = @import("../gateway/http.zig"); // testEnviron: the environment curl is spawned with
@@ -396,4 +543,51 @@ test "MCP discovery preserves separate typed schemas and routes direct security 
     try tt.expectEqualStrings("integer", props.get("count").?.object.get("type").?.string);
     try tt.expectEqualStrings("boolean", props.get("enabled").?.object.get("type").?.string);
     try tt.expect(isTool("security_gary_probe"));
+}
+
+test "the belt is terse: alias bags collapse, constraints and essays drop, and every type the model needs survives" {
+    const raw =
+        \\{"result":{"tools":[
+        \\{"name":"nvd_lookup","description":"NVD CVE metadata lookup. Passive/read-only evidence lookup. Use it when a CVE identifier needs its CVSS vector, the affected CPE list, the publication date and the reference set; prefer kev_lookup first when exploitation status is the question, and epss_lookup for the probability of exploitation in the next thirty days.","inputSchema":{"type":"object","additionalProperties":false,"required":["cveId"],"properties":{"addr":{"type":"string","maxLength":200},"address":{"type":"string","maxLength":200},"asn":{"type":"string"},"cidr":{"type":"string"},"count":{"type":"string"},"cve":{"type":"string"},"cveId":{"type":"string","pattern":"^CVE-"},"domain":{"type":"string"},"email":{"type":"string"},"file":{"type":"string"},"hash":{"type":"string"},"host":{"type":"string"},"id":{"type":"string"},"ip":{"type":"string"},"name":{"type":"string"},"path":{"type":"string"},"query":{"type":"string"},"target":{"type":"string"},"text":{"type":"string"},"url":{"type":"string"},"_gary":{"type":"object","additionalProperties":false,"properties":{"sessionId":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$","description":"Reuse this session for shell state, files, background processes and connected tools."},"taskId":{"type":"string","pattern":"^[0-9]+$"}}}}}},
+        \\{"name":"insert_assets","description":"Insert assets.","inputSchema":{"type":"object","properties":{"assets":{"type":"array","description":"Asset array, each element corresponds to an asset record, appended rather than replacing what the case already holds","items":{"type":"object","properties":{"domain":{"type":"string","maxLength":253},"ports":{"type":"array","items":{"type":"integer"}},"kind":{"type":"string","enum":["ip","domain","app"]}},"required":["kind"]}}},"required":["assets"]}}
+        \\]}}
+    ;
+    const defs = renderDefs(tt.allocator, raw);
+    defer tt.allocator.free(defs);
+    const array = try std.fmt.allocPrint(tt.allocator, "[{s}]", .{defs});
+    defer tt.allocator.free(array);
+    const parsed = try std.json.parseFromSlice(std.json.Value, tt.allocator, array, .{});
+    defer parsed.deinit();
+    try tt.expectEqual(@as(usize, 2), parsed.value.array.items.len);
+    // validation constraints the model never needs are gone from the whole belt
+    try tt.expect(std.mem.indexOf(u8, defs, "maxLength") == null);
+    try tt.expect(std.mem.indexOf(u8, defs, "pattern") == null);
+
+    const bag = parsed.value.array.items[0].object.get("function").?.object;
+    try tt.expectEqualStrings("security_nvd_lookup", bag.get("name").?.string);
+    // the description keeps its leading sentences and drops the usage essay
+    try tt.expectEqualStrings("NVD CVE metadata lookup. Passive/read-only evidence lookup.", bag.get("description").?.string);
+    const bp = bag.get("parameters").?.object;
+    try tt.expectEqualStrings("cveId", bp.get("required").?.array.items[0].string);
+    const props = bp.get("properties").?.object;
+    try tt.expectEqual(@as(usize, 2), props.count()); // the required argument and the session carrier, typed
+    try tt.expectEqualStrings("string", props.get("cveId").?.object.get("type").?.string);
+    try tt.expectEqualStrings("object", props.get("_gary").?.object.get("type").?.string);
+    try tt.expect(bp.get("additionalProperties").?.bool);
+    const note = bp.get("description").?.string;
+    try tt.expect(std.mem.indexOf(u8, note, "addr,address,asn") != null); // every upstream spelling is still named
+    try tt.expect(std.mem.indexOf(u8, note, "cveId") == null); // ...but a typed property is not listed twice
+    // the whole 20-argument bag renders well under a kilobyte (the real 54-argument one was 2.7 KB verbatim)
+    const first_def = defs[0..std.mem.indexOf(u8, defs, ",\n").?];
+    try tt.expect(first_def.len < 900);
+
+    const typed = parsed.value.array.items[1].object.get("function").?.object.get("parameters").?.object;
+    const assets = typed.get("properties").?.object.get("assets").?.object;
+    try tt.expectEqualStrings("array", assets.get("type").?.string);
+    try tt.expect(assets.get("description").?.string.len <= ARG_DESC_MAX);
+    const item = assets.get("items").?.object;
+    try tt.expectEqualStrings("kind", item.get("required").?.array.items[0].string);
+    const kind = item.get("properties").?.object.get("kind").?.object;
+    try tt.expectEqual(@as(usize, 3), kind.get("enum").?.array.items.len);
+    try tt.expectEqualStrings("integer", item.get("properties").?.object.get("ports").?.object.get("items").?.object.get("type").?.string);
 }

@@ -82,6 +82,8 @@
       { p: 'worker/chat/workspace', c: 'CH-10', t: 'Prompt workspace — scored admission, provenance receipts, decision log', s: 'chat/workspace.zig' },
       { p: 'worker/chat/overlay', c: 'CH-12', t: 'Recall overlay — memory settled around every thought', s: 'chat/overlay.zig' },
       { p: 'worker/chat/goal', c: 'CH-13', t: 'Goal mode — a stored goal, an iteration log, a measure, and its own stop rules', s: 'chat/goal.zig' },
+      { p: 'worker/chat/belt', c: 'CH-14', t: 'The tool tree — the belt as a map the model walks, not a list it is handed', s: 'chat/belt.zig' },
+      { p: 'worker/chat/net', c: 'CH-15', t: "Gary's 4tope — the working span as a DAG: critical chain, source unfolding, no-model continuation", s: 'chat/net.zig' },
       { p: 'worker/continuity', c: 'CH-11', t: 'Continuity — resume anchors: what a cut unit of work established, banked durably', s: 'continuity.zig' }
     ]},
     { key: 'worker/browser/', label: 'WORKER · BROWSER — THE DRIVER', docs: [

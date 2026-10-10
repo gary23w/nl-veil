@@ -29,6 +29,8 @@ const osc = @import("../oscillation.zig");
 const llm = @import("../llm.zig");
 const modelcfg = @import("modelcfg"); // a MODULE (src/worker/modelcfg.zig) — never a path import
 const cctx = @import("context.zig");
+const toolmap = @import("belt.zig"); // the tool map: the belt as a tree the model walks (opt-in, NL_TOOL_MAP)
+const dag = @import("net.zig"); // Gary's 4tope: the working span as a DAG — the critical chain a prune keeps, the unfolding a cut carries
 const wsp = @import("workspace.zig"); // prompt workspace: typed bids -> fixed-order scored admission + decision log
 const ovl = @import("overlay.zig"); // recall overlay: the working field settled around every thought
 const builtin_mod = @import("../builtin.zig"); // the built-in engine's sentinel + LIVE served-window publication
@@ -205,8 +207,8 @@ const HANDOFF_SYSTEM =
     "that did not work, and why, so the next turn does not repeat them. NEXT: the single concrete action to " ++
     "take first. State what IS, never what you will do. Do not apologize, do not restate the request, do not " ++
     "call tools.";
-const HANDOFF_QUESTION =
-    "Write the continuation state now, under 180 words total, using exactly the labels ESTABLISHED / ON DISK / " ++
+const HANDOFF_QUESTION_FMT =
+    "Write the continuation state now, under {d} words total, using exactly the labels ESTABLISHED / ON DISK / " ++
     "RULED OUT / NEXT. Omit a label entirely if there is genuinely nothing true to put under it. Reply with " ++
     "ONLY those lines.";
 
@@ -224,8 +226,43 @@ const HANDOFF_ELISION = "\n…[middle rounds of this turn elided — the head ab
 /// a tightened local model gets (see historyWindowBytes) — a handoff that size crowds out the conversation it
 /// exists to continue. Every replayed byte is also re-uploaded on EVERY inference of every later turn until the
 /// window rolls past it, the argument BRIEF_MAX_BYTES (1200) and ledgerBlock (~1400) both make. 1400 is ~220
-/// words: room for four labels. The caller tightens it AGAIN against the actual window (hist_win / 8).
+/// words: room for four labels. The caller sizes it against the actual window (handoffCap).
 const HANDOFF_MAX_BYTES: usize = 1400;
+/// How far the continuation state may grow on a WIDE window (see handoffCap). 1400 B was the right carry for a
+/// 28 KB recency window and the wrong one for a model replaying 128 KB: measured on the first long chat with the
+/// full security catalogue (conv c6ac996e9, 2026-10-10), four segments of real work on a 1.3M-token model were
+/// each carried forward as ~180 words, and the user reading those carries saw a harness that had kept almost
+/// nothing of what it had just done. Six KB is ~900 words — a page, which is what a segment of work is worth —
+/// and still under 5% of the window it rides in.
+const HANDOFF_WIDE_BYTES: usize = 6 * 1024;
+
+/// The continuation state's cap for a reader replaying `hist_win` bytes of recency window: the stock cap,
+/// tightened to an eighth of a small window exactly as before, OR a sixteenth of the window up to
+/// HANDOFF_WIDE_BYTES — whichever is larger. A small local model keeps today's figure to the byte; a frontier
+/// window carries a page.
+fn handoffCap(hist_win: usize) usize {
+    const stock = @max(512, @min(HANDOFF_MAX_BYTES, hist_win / 8));
+    return @max(stock, @min(HANDOFF_WIDE_BYTES, hist_win / 16));
+}
+
+/// How many inferences' worth of the prompt's FIXED prefix the spend ceiling must allow at minimum (see
+/// segmentCeiling). Twelve is a short research turn: a plan, a handful of reads and calls, a write, a check.
+const CEILING_MIN_INFERENCES: u64 = 12;
+
+/// The spend ceiling a segment is actually held to. `token_cap` is the flat figure (the default or the
+/// operator's); `prefix_bytes` is what EVERY inference of the turn re-uploads before it has done anything —
+/// the assembled prefix plus the tools array. The flat 400k was written against a 20-tool belt. With Agent
+/// Garrett's catalogue on, the belt alone was ~110k tokens an inference (conv c6ac996e9, 2026-10-10): the
+/// ceiling tripped after three or four inferences, every three or four inferences, and each trip was a
+/// distillation the user watched. A ceiling that cannot afford a dozen uploads of the prompt itself is not
+/// a runaway backstop, it is a metronome — so the default is floored at CEILING_MIN_INFERENCES prefixes, at
+/// the same pessimistic 3 bytes/token the budgets use. An explicit NL_TURN_TOKEN_CEILING is honoured as
+/// written (an operator pinning a small ceiling to exercise the roll must get the roll), and 0 still disables.
+fn segmentCeiling(token_cap: u64, prefix_bytes: usize, explicit: bool) u64 {
+    if (token_cap == 0 or explicit) return token_cap;
+    const prefix_tokens: u64 = @intCast(prefix_bytes / 3);
+    return @max(token_cap, CEILING_MIN_INFERENCES * prefix_tokens);
+}
 
 /// STUCK-RECOVERY WRITER (prompting). Reads the same bounded transcript tail the drive picker rides and names the
 /// concrete way around the blocker it can see, instead of the template's abstract encouragement.
@@ -1906,6 +1943,18 @@ const WORKING_KEEP_TAIL_BYTES: usize = 32 * 1024;
 /// something to anchor on.
 const WORKING_HARD_FOLD_BYTES: usize = 48 * 1024;
 
+/// The verbatim tail on a WIDE working budget (see workingSpanCap): a third of the budget, between the stock
+/// tail and this. The point of letting a frontier window hold a 256 KB span is that the model keeps its recent
+/// reads; a 32 KB tail under that budget would fold away seven-eighths of what it had just been allowed to hold.
+/// At the stock 96 KB cap this is exactly WORKING_KEEP_TAIL_BYTES, so nothing changes for a 128k model.
+const WORKING_KEEP_TAIL_WIDE_BYTES: usize = 64 * 1024;
+
+/// What replaces a stale tool result's content once it has scrolled out of the protected tail (see
+/// pruneToolResults). Third person and plain about what happened, like every engine note in this file.
+const PRUNED_RESULT_NOTE = "[tool result pruned from the working context ({d} KB): the assistant already read and acted on it. Re-run the call if the exact bytes are needed again.]";
+/// A stale result smaller than this is kept whole: the stub would hardly be smaller than the result.
+const PRUNE_RESULT_MIN_BYTES: usize = 2 * 1024;
+
 /// Floor for the window-scaled working budget (see workingBudgetBytes). Small enough that a genuinely tiny
 /// window still folds, large enough that one real tool round survives a fold — below this the model spends
 /// every round re-reading what the previous fold deleted, which is worse than a slightly long prompt.
@@ -2976,6 +3025,52 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
         }
     }
 
+    // THE TOOL MAP (belt.zig) — opt-in by NL_TOOL_MAP=1 while it proves itself live. The belt becomes a tree the
+    // model walks: a small model keeps toolmap.CORE_SMALL in hand and walks everything else; a mid/large model keeps
+    // the whole built-in belt it reads fine today and walks only the discovered families (security / cloud /
+    // plugins), the ones that grow without bound. The tools array is then whatever is OPEN — rebuilt by
+    // runInnerAgentic whenever the walk changes it — so `turn_tools` below becomes the turn's FIRST array (core +
+    // open_tools + what the pre-walk opened for this request), and everything sized from it (the spend ceiling,
+    // the context plan, the manifest) sizes the mapped belt. Any failure here leaves the flat belt exactly as is.
+    var map_tree: ?toolmap.Tree = null;
+    defer if (map_tree) |*mt| mt.deinit();
+    var map_learned: ?toolmap.Learned = null;
+    defer if (map_learned) |*ml| ml.deinit();
+    var map_walk: ?toolmap.Walk = null;
+    defer if (map_walk) |*mw| mw.deinit();
+    var map_core: ?[]u8 = null;
+    defer if (map_core) |c| gpa.free(c);
+    const map_on = if (ctx.environ.get("NL_TOOL_MAP")) |v| (v.len > 0 and v[0] != '0' and !std.ascii.eqlIgnoreCase(v, "off")) else false;
+    if (map_on) map: {
+        const split = toolmap.splitBelt(gpa, turn_tools, compact_belt) catch break :map;
+        defer gpa.free(split.map);
+        var tree = toolmap.Tree.init(gpa) catch {
+            gpa.free(split.core);
+            break :map;
+        };
+        tree.addDefs(split.map) catch {
+            tree.deinit();
+            gpa.free(split.core);
+            break :map;
+        };
+        map_tree = tree;
+        map_core = split.core;
+        map_learned = toolmap.Learned.init(gpa);
+        beltLearnedLoad(app, &map_learned.?);
+        var w = toolmap.Walk.init(gpa, &map_tree.?, user_text) catch break :map;
+        w.learned = &map_learned.?;
+        w.core = map_core.?;
+        const saved = beltStateRead(app, conv_dir);
+        defer if (saved) |s| gpa.free(s);
+        w.start(saved orelse "");
+        map_walk = w;
+        const first = map_walk.?.tools(gpa, map_core.?) catch break :map;
+        if (turn_tools_owned) |old| gpa.free(old);
+        turn_tools_owned = first;
+        turn_tools = first;
+        emitKV(app, conv_dir, "trace", "text", "tool map on: the belt is a tree the model walks (open_tools); the array carries the core and the open groups");
+    }
+
     // ---- seed the LLM conversation: system prompt + every persisted message (incl. the user turn just added) ----
     // `conv_buf` is the INSIDE of "messages":[ … ]; it grows in the loop with the assistant tool_call turns and
     // tool-result turns so the model always sees full context. First object has no leading comma; rest do.
@@ -2996,9 +3091,12 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
         // BELT MANIFEST — compact tier ONLY: the one-line tool index (see beltManifest). Derived from
         // `turn_tools` AFTER grants and plugin schemas merged above, so every def the provider will
         // see is named on the line; the full tier reads its belt fine and pays nothing.
-        const manifest: ?[]u8 = if (compact_belt) beltManifest(gpa, turn_tools) else null;
+        // On a MAPPED turn the manifest's "that line is the complete list" would be false — the map teaches
+        // the opposite (a known name is callable whether or not it is advertised) — so the doctrine replaces it.
+        const manifest: ?[]u8 = if (compact_belt and map_walk == null) beltManifest(gpa, turn_tools) else null;
         defer if (manifest) |m| gpa.free(m);
-        const dated = std.fmt.allocPrint(gpa, "{s}{s}\nTODAY (UTC): {s}. Any time-sensitive search query, date, or claim must be grounded in THIS date — never a guessed one.", .{ sys_base, manifest orelse "", tools.dateStamp(app.io, &dstamp) }) catch null;
+        const map_doctrine: []const u8 = if (map_walk != null) "\n" ++ toolmap.DOCTRINE else "";
+        const dated = std.fmt.allocPrint(gpa, "{s}{s}{s}\nTODAY (UTC): {s}. Any time-sensitive search query, date, or claim must be grounded in THIS date — never a guessed one.", .{ sys_base, manifest orelse "", map_doctrine, tools.dateStamp(app.io, &dstamp) }) catch null;
         defer if (dated) |d| gpa.free(d);
         http.jstr(gpa, &conv_buf, dated orelse sys_base) catch return;
     }
@@ -3571,10 +3669,14 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     // ABSOLUTE ceiling for this turn, not a delta: tokensSnapshot is thread-local and each turn owns its thread
     // (spawnTurn), so usage_t0 + budget is exactly "this turn has spent enough" even with turns running
     // concurrently for other conversations. Operator-tunable; 0 disables the backstop entirely.
-    const token_cap: u64 = if (ctx.environ.get("NL_TURN_TOKEN_CEILING")) |v|
+    const token_cap_env = ctx.environ.get("NL_TURN_TOKEN_CEILING");
+    const token_cap_flat: u64 = if (token_cap_env) |v|
         std.fmt.parseInt(u64, std.mem.trim(u8, v, " \r\n\t"), 10) catch TURN_TOKEN_CEILING_DEFAULT
     else
         TURN_TOKEN_CEILING_DEFAULT;
+    // NET OF THE BELT: the default is floored at a dozen uploads of this turn's own fixed prefix (the assembled
+    // prompt plus the tools array), so a wide belt widens the ceiling instead of tripping it every few calls.
+    const token_cap: u64 = segmentCeiling(token_cap_flat, assembled_len + turn_tools.len, token_cap_env != null);
     // VAR, and re-anchored per SEGMENT (see the ceiling arm below). The ceiling is an absolute thread
     // reading, not a delta, so a turn that rolls on past one must move its own goalposts or the very next
     // inference re-trips it instantly and the roll becomes a spin.
@@ -3760,7 +3862,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
 
         // Run one agentic tool pass to a SETTLED (no-tool-call) answer.
         const mut_before = file_ledger.mutations;
-        const inner = runInnerAgentic(app, uid, conv, conv_dir, llm_dir, trio, &conv_buf, &ctx, &steer_cursor, &tool_obs, &tool_perf, tool_client, &no_ack_streak, &dud_fetches, &poll_timeouts, &tools_spent, tool_budget, token_ceiling, &echo_guard, &call_ledger, &file_ledger, foreign_mem.items, &foreign_warned, search_intent, &search_log, turn_tools, if (overlay) |*o| o else null);
+        const inner = runInnerAgentic(app, uid, conv, conv_dir, llm_dir, trio, &conv_buf, &ctx, &steer_cursor, &tool_obs, &tool_perf, tool_client, &no_ack_streak, &dud_fetches, &poll_timeouts, &tools_spent, tool_budget, token_ceiling, &echo_guard, &call_ledger, &file_ledger, foreign_mem.items, &foreign_warned, search_intent, &search_log, turn_tools, if (map_walk) |*mw| mw else null, if (overlay) |*o| o else null);
         // TRAJECTORY THREAD (fine weave): a pass that LANDED file changes mints one provenance-labeled
         // progress fact pairing the step's language with the engine-observed effect — the lexical thread
         // that lets a later step's recall hop from "what am I doing" to "what already happened here".
@@ -3877,7 +3979,24 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
                         var ground: std.ArrayListUnmanaged(u8) = .empty;
                         defer ground.deinit(gpa);
                         ledgerBlock(gpa, &file_ledger, &ground);
-                        handoff = turnHandoff(app, llm_dir, think.base_url, think.key, think.model, search_intent, ground.items, conv_buf.items, assembled_len) orelse &[_]u8{};
+                        // GARY'S 4TOPE FIRST (net.zig): the continuation state as the source unfolding of this turn's
+                        // own working span — verbatim bytes, the dead ends included, no model call. The
+                        // model-written state remains for NL_HANDOFF=model and for a span the net finds nothing in.
+                        const hcap = handoffCap(hist_win);
+                        const by_model = if (ctx.environ.get("NL_HANDOFF")) |v| std.ascii.eqlIgnoreCase(std.mem.trim(u8, v, " \r\n\t"), "model") else false;
+                        if (!by_model) {
+                            var g: ?dag.Graph = dag.Graph.fromSpan(gpa, conv_buf.items[@min(assembled_len, conv_buf.items.len)..]) catch null;
+                            defer if (g) |*gg| gg.deinit();
+                            if (g) |*gg| {
+                                if (gg.unfold(gpa, hcap - @min(hcap / 4, 400), ground.items)) |rendered| {
+                                    if (rendered.len > 0) {
+                                        handoff = rendered;
+                                        emitKV(app, conv_dir, "trace", "text", "continuation state: unfolded by Gary's 4tope from the turn's own span (no model call)");
+                                    } else gpa.free(rendered);
+                                } else |_| {}
+                            }
+                        }
+                        if (handoff.len == 0) handoff = turnHandoff(app, llm_dir, think.base_url, think.key, think.model, search_intent, ground.items, conv_buf.items, assembled_len, hcap) orelse &[_]u8{};
                         // AND DURABLY, under the conversation's own memory scope. The fused row above serves
                         // the next turn of THIS transcript, which is enough right up until the next unit of
                         // work reads a different one — and a scheduled run always does, because sched hands
@@ -3889,8 +4008,9 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
                     }
                     var hrow: std.ArrayListUnmanaged(u8) = .empty;
                     defer hrow.deinit(gpa);
-                    // Tightened against the ACTUAL window: 1400 B is 5% of a roomy history window and 17% of the
-                    // 8 KB floor a small local model gets, where a handoff must not crowd out the conversation.
+                    // Sized against the ACTUAL window (handoffCap): 1400 B is 5% of a stock history window and
+                    // 17% of the 8 KB floor a small local model gets, where a handoff must not crowd out the
+                    // conversation; a frontier window replaying 128 KB carries up to a page.
                     // THE LEDGER POINTER GOES FIRST, before the cap can clip it: a next turn that knows where the
                     // facts are does not need them in the row, and the row is what a "Continue." turn is given.
                     var hf: std.ArrayListUnmanaged(u8) = .empty;
@@ -3901,7 +4021,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
                         hf.appendSlice(gpa, std.fmt.bufPrint(&fb2, "FACTS LEDGER: {s} in the workdir holds {d} lines of concrete values already established (ids, amounts, tokens, statuses). read_file it BEFORE re-querying anything.\n", .{ FACTS_LEDGER_NAME, fl }) catch "") catch {};
                         hf.appendSlice(gpa, handoff) catch {};
                     }
-                    const row = handoffRow(gpa, inner.engine_note, if (fl > 0) hf.items else handoff, @max(512, @min(HANDOFF_MAX_BYTES, hist_win / 8)), &hrow);
+                    const row = handoffRow(gpa, inner.engine_note, if (fl > 0) hf.items else handoff, handoffCap(hist_win), &hrow);
                     // Best-effort, like every summary in this file: a Stop, an empty span, a refused, degenerate
                     // or markup completion, or any OOM leaves `row` bound to inner.engine_note and these two
                     // lines commit exactly the row they commit today.
@@ -4616,6 +4736,16 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     // keeps the capability invisible in ordinary use: an anchor exists only between a real cut and the work
     // being picked back up, so a healthy conversation never reads one and never renders the block.
     continuity.clear(ctx.mem, mem_scope);
+    // THE TOOL MAP remembers: what this turn opened (for the next turn of this conversation) and what it learned
+    // (for every turn on this machine). Best-effort, like every other end-of-turn write here.
+    if (map_walk) |*mw| {
+        mw.finish();
+        if (mw.save(gpa)) |st| {
+            defer gpa.free(st);
+            beltStateWrite(app, conv_dir, st);
+        } else |_| {}
+        if (map_learned) |*ml| beltLearnedSave(app, ml);
+    }
     refreshSummary(app, conv_dir, llm_dir, think.base_url, think.key, think.model, ctx_plan);
     // NO {done} here: it is emitted by signalDone after the caller releases the conversation slot, so the frame
     // that tells a client "the turn is over" is not followed by a 409 when the client believes it.
@@ -9984,6 +10114,19 @@ fn warnIfPromptCannotFit(model: []const u8, tools_bytes: usize, plan: ContextPla
 /// compactions were 71% of the run's model time - most of them re-summarising the previous note.
 const WORKING_SPAN_MAX_BYTES: usize = 96 * 1024;
 
+/// ...and the most on a WIDE window (see workingSpanCap). 96 KB was sized when a frontier window was 128k; on a
+/// 1.3M-token model it is 2.5% of the window, and the turn that motivated this (conv c6ac996e9, 2026-10-10) folded
+/// and re-folded a span the model could have held fifty times over. 256 KB is ~85k tokens: still under a tenth of
+/// that window, and three times fewer folds for the same work. Together with pruneToolResults (stale results are
+/// stubbed before any fold), most spans on a wide window never need a model call to stay inside it.
+const WORKING_SPAN_WIDE_BYTES: usize = 256 * 1024;
+
+/// The working-span cap for a window of `win_bytes`: the stock cap, growing past it only while the span stays
+/// at most an eighth of the window — a 128k model keeps 96 KB, a 1.3M one holds 256 KB.
+fn workingSpanCap(win_bytes: usize) usize {
+    return std.math.clamp(win_bytes / 8, WORKING_SPAN_MAX_BYTES, WORKING_SPAN_WIDE_BYTES);
+}
+
 /// `win_hint` is the model's window in tokens when something authoritative states it - the Workers AI
 /// catalog's context_window (cf_oauth.windowTokensFor) - and null to fall back to the id heuristic, which
 /// read "flash" as a small model and gave deepseek-v4-flash 32k against the catalog's 1,310,720.
@@ -9998,8 +10141,8 @@ fn workingBudgetBytes(base_url: []const u8, model: []const u8, fixed_bytes: usiz
     const reserve = @as(usize, turnOutputReserveBytes) + fixed_bytes;
     if (win_bytes <= reserve) return WORKING_MIN_BUDGET_BYTES;
     const available = win_bytes - reserve;
-    // roomy: a third of what is free, never below the stock 24 KB and never above the span cap
-    if (available >= WORKING_HARD_FOLD_BYTES) return std.math.clamp(available / 3, cctx.WORKING_COMPACT_BYTES, WORKING_SPAN_MAX_BYTES);
+    // roomy: a third of what is free, never below the stock 24 KB and never above the span cap for this window
+    if (available >= WORKING_HARD_FOLD_BYTES) return std.math.clamp(available / 3, cctx.WORKING_COMPACT_BYTES, workingSpanCap(win_bytes));
     return @max(WORKING_MIN_BUDGET_BYTES, @min(cctx.WORKING_COMPACT_BYTES, available));
 }
 
@@ -10091,9 +10234,17 @@ fn runInnerAgentic(
     // This turn's advertised tools array — the caller's static CAPS variant plus any granted recipe schemas,
     // built ONCE per turn in runTurn (turn-stable, byte-identical across drive passes → prefix-cache safe).
     turn_tools: []const u8,
+    /// The tool map's walk when NL_TOOL_MAP is on, else null: it rebuilds the advertised array as groups open and
+    /// close, answers the open_tools verb, and opens a known-but-closed name's group in the round it is called.
+    walk: ?*toolmap.Walk,
     overlay: ?*ovl.Overlay, // the recall overlay: settled before every round's chat call, removed right after (overlay.zig)
 ) InnerResult {
     const gpa = app.gpa;
+    // THE MAPPED BELT changes as the walk opens and closes groups; `tools_cur` is what THIS inference advertises.
+    // Without a walk it is `turn_tools` for the whole pass, byte-identical, exactly as before.
+    var tools_owned: ?[]u8 = null;
+    defer if (tools_owned) |t| gpa.free(t);
+    var tools_cur: []const u8 = turn_tools;
     // Bind the coding/base triple to the names this body already uses (the main agentic stream is the CODING
     // call), and pick `think` for the context-housekeeping calls (compact/summary). orchTool receives the full
     // trio (it forwards to schedule_task, which persists all three). See ModelTrio for the fallback rule.
@@ -10235,11 +10386,19 @@ fn runInnerAgentic(
                 appendMsgObj(gpa, conv_buf, "system", blk, blk.len);
             }
         }
+        if (walk) |w| if (w.dirty) {
+            if (w.tools(gpa, w.core)) |fresh| {
+                if (tools_owned) |old| gpa.free(old);
+                tools_owned = fresh;
+                tools_cur = fresh;
+            } else |_| {}
+        };
         var sctx = StreamCtx{ .app = app, .conv_dir = conv_dir, .ctrl_cursor = steer_cursor.* };
         var chat_cm = meterBegin(app.io);
         traceFrame(app, "worker.llm", "completeStream", "enter", null, null);
         announcePhase(app, "chat");
-        var step = llm.completeStream(gpa, app.io, run_root, "chat", base_url, key, model, conv_buf.items, turn_tools, turnTokenBudget(ctx.environ, base_url, model, turn_reasoning), 0.7, &sctx, streamOnDelta, streamShouldAbort);
+        var step = llm.completeStream(gpa, app.io, run_root, "chat", base_url, key, model, conv_buf.items, tools_cur, turnTokenBudget(ctx.environ, base_url, model, turn_reasoning), 0.7, &sctx, streamOnDelta, streamShouldAbort);
+        if (walk) |w| w.tick(); // one inference, for the map's least-recently-used bookkeeping
         conv_buf.shrinkRetainingCapacity(pre_overlay_len); // the overlay was for that inference alone
         traceFrame(app, "worker.llm", "completeStream", "exit", step.ok, null);
         defer step.deinit(gpa);
@@ -10541,6 +10700,7 @@ fn runInnerAgentic(
             }
             var executed = false; // did the tool genuinely run (vs a dedup/budget guard)? gates perf learning
             var name_fixed: ?[]const u8 = null; // set when a miscapitalized name auto-corrected (WebSearch→web_search)
+            var map_opened: ?[]const u8 = null; // set when the call opened its own group on the tool map (toolmap.Walk.noteCall)
             const t_call = nowMillis(app.io);
             traceFrame(app, "worker.tools", c.name, "enter", null, null);
             var result = if (echo_blocked)
@@ -10604,12 +10764,24 @@ fn runInnerAgentic(
                 // advertised tool, run that tool now and teach the exact name in the result note, instead of
                 // burning a whole agentic round on a correction the model must read, obey, and re-emit.
                 var run_name: []const u8 = c.name;
-                if (!knownToolName(turn_tools, c.name)) {
-                    if (canonToolMatch(turn_tools, c.name)) |real| {
+                // THE MAP ITSELF (open_tools): a view, an opened group, or a find — the engine answers, no tool ran.
+                if (walk) |w| if (std.mem.eql(u8, c.name, toolmap.NAV_TOOL)) {
+                    executed = false;
+                    break :blk (w.navigate(gpa, run_args) catch gpa.dupe(u8, "(the tool map could not answer this round — out of memory; call the tool you need by name)") catch empty);
+                };
+                // A name the map knows is callable whether or not it is open (the map shrinks what is ADVERTISED,
+                // never what is callable); only a name that exists nowhere is refused.
+                if (!(walk != null and walk.?.knows(c.name)) and !knownToolName(tools_cur, c.name)) {
+                    if (canonToolMatch(tools_cur, c.name)) |real| {
                         run_name = real;
                         name_fixed = real;
-                    } else break :blk unknownToolResult(gpa, c.name, turn_tools);
+                    } else break :blk unknownToolResult(gpa, c.name, tools_cur);
                 }
+                // A known name that was not open opens its group now and runs in this same round — a model that
+                // knows the exit never walks the maze (toolmap.Walk.noteCall). The result says so below.
+                if (walk) |w| if (w.noteCall(run_name)) |opened| {
+                    map_opened = opened;
+                };
                 // POLL BUDGET: after POLL_TIMEOUT_STREAK consecutive timeouts, further polls are answered
                 // instantly instead of blocking the turn another 180s each. The model is told the honest state
                 // and the way out; the streak resets on any poll that actually MATCHES (see intake below).
@@ -10641,6 +10813,12 @@ fn runInnerAgentic(
             // arriving under its own alias reads as confirmation). Appended, same reason as the search note.
             if (name_fixed) |real| {
                 if (std.fmt.allocPrint(gpa, "{s}\n(engine: no tool is named \"{s}\" — this ran {s}, the exact advertised name. Call it {s} from now on.)", .{ result, c.name, real, real })) |noted| {
+                    gpa.free(result);
+                    result = noted;
+                } else |_| {}
+            }
+            if (map_opened) |p| {
+                if (std.fmt.allocPrint(gpa, "{s}\n(engine: {s} was not open on the tool map, so it opened for this call; its tools are callable by name now.)", .{ result, p })) |noted| {
                     gpa.free(result);
                     result = noted;
                 } else |_| {}
@@ -10725,7 +10903,7 @@ fn runInnerAgentic(
                     // ADVERTISED check, not knownToolName: the latter falls back to the static full-schema
                     // tables, which is precisely how compact turns still execute "cast" — here the question
                     // is what this turn's belt SHOWS, so only the tools-array needle answers it.
-                    const option_space: []const u8 = if (std.mem.indexOf(u8, turn_tools, "\"name\":\"cast\"") != null)
+                    const option_space: []const u8 = if (std.mem.indexOf(u8, tools_cur, "\"name\":\"cast\"") != null)
                         "files: write_file/edit_file/read_file/list_dir; waiting or watching anything: poll; web: web_fetch/read_url/fetch_json; stored docs: read_doc/recall_hive; a side-thread: open_subchat; a team: cast"
                     else
                         // read_url and fetch_json were dropped from the small belt in an earlier pass and never
@@ -10743,7 +10921,7 @@ fn runInnerAgentic(
                     // call, its error, and this machine's tool belt, and returns ONE concrete next move. The
                     // generic nudge was ignored twice; a specific suggestion breaks the grind. Deliberation as
                     // escalation (fires once per streak), never a per-call tax. Never auto-executed — advice only.
-                    if (toolArbiter(app, run_root, trio.pick(.prompting), intent, c.name, run_args, result, turn_tools)) |adv| {
+                    if (toolArbiter(app, run_root, trio.pick(.prompting), intent, c.name, run_args, result, tools_cur)) |adv| {
                         defer gpa.free(adv);
                         const noted = std.fmt.allocPrint(gpa, "{s}\n(engine arbiter — {s} failed 3x; a focused look at your goal, this error, and your tool belt suggests: {s} Weigh it; you decide.)", .{ result, c.name, adv }) catch result;
                         if (noted.ptr != result.ptr) {
@@ -10944,6 +11122,16 @@ fn runInnerAgentic(
         // precise form, and a batch that neither refused nor executed (all budget-refused/vetoed) freezes
         // the streak rather than feeding either side.
         if (iter_refused) loop_refusals +|= 1 else if (iter_executed) loop_refusals = 0;
+        // MEMORY AS THE CHAT RUNS (net.zig's premise): this step's tool findings land in neuron-db NOW — one
+        // batched subprocess per step that produced any — so every later step's recall can reach them and the
+        // continuation is a layout of what is already remembered, not the only copy of it. Before this they waited
+        // for a fold or the turn's exit; a launch costs ~300 ms, paid once per step with results, against
+        // inferences that take seconds.
+        if (tool_obs.items.len > 0) {
+            memBank(app, ctx, ctx.scope, tool_obs.items);
+            for (tool_obs.items) |note| gpa.free(note);
+            tool_obs.clearRetainingCapacity();
+        }
         // WITHIN-TURN COMPACTION (step boundary): if this pass's working growth has crossed the budget, compress it
         // into a progress note so a long/afk turn can keep going without overflowing the model window.
         compactWorking(app, run_root, think.base_url, think.key, think.model, conv_buf, base_len, ctx, tool_obs, workingBudgetBytes(base_url, model, base_len + turn_tools.len, turn_win_hint));
@@ -12500,7 +12688,7 @@ fn handoffSpan(gpa: std.mem.Allocator, work: []const u8, out: *std.ArrayListUnma
 ///
 /// llm.complete rather than completeAux, deliberately and for summarizeWorkingSpan's reason: this payload
 /// carries NO assistant turns, so the thinking-mode reasoning-echo quirk cannot bite it.
-fn turnHandoff(app: *App, run_root: []const u8, base_url: []const u8, key: []const u8, model: []const u8, objective: []const u8, ground: []const u8, conv_items: []const u8, assembled_len: usize) ?[]u8 {
+fn turnHandoff(app: *App, run_root: []const u8, base_url: []const u8, key: []const u8, model: []const u8, objective: []const u8, ground: []const u8, conv_items: []const u8, assembled_len: usize, cap: usize) ?[]u8 {
     const gpa = app.gpa;
     // THE TURN's base, not the pass's. runInnerAgentic's base_len is set at PASS entry, so on drive step >= 1 —
     // where the ceiling routinely trips at iter 0 — the pass's own span is EMPTY and every byte of the turn's
@@ -12529,13 +12717,15 @@ fn turnHandoff(app: *App, run_root: []const u8, base_url: []const u8, key: []con
     uc.appendSlice(gpa, "\n\nWORKING LOG OF THIS TURN (assistant tool calls + tool results as JSON):\n") catch return null;
     uc.appendSlice(gpa, span.items) catch return null;
     uc.appendSlice(gpa, "\n\n") catch return null;
-    uc.appendSlice(gpa, HANDOFF_QUESTION) catch return null;
+    // The word budget and the completion budget both follow the cap (handoffCap): ~8 bytes a word, and the
+    // reply may run to half the cap in tokens — 768 at the stock 1400 B exactly as before, 3072 at the widest.
+    uc.print(gpa, HANDOFF_QUESTION_FMT, .{@max(120, cap / 8)}) catch return null;
     http.jstr(gpa, &msgs, uc.items) catch return null;
     msgs.append(gpa, '}') catch return null;
 
     const ho_cm = meterBegin(app.io);
     announcePhase(app, "handoff");
-    var step = llm.complete(gpa, app.io, run_root, "handoff", base_url, key, model, msgs.items, "", 768, 0.3);
+    var step = llm.complete(gpa, app.io, run_root, "handoff", base_url, key, model, msgs.items, "", @intCast(std.math.clamp(cap / 2, 768, 3072)), 0.3);
     defer step.deinit(gpa);
     // Metered even when it fails: a success rate read off the stream would otherwise be 100% by construction.
     meterEnd(app, ho_cm, "handoff", .thinking, model, step.ok);
@@ -12550,7 +12740,7 @@ fn turnHandoff(app: *App, run_root: []const u8, base_url: []const u8, key: []con
     if (t.len < 24 and step.reasoning.len > 0) t = handoffFromReasoning(step.reasoning);
     // A degenerate or markup "continuation state" continues nothing and costs a replay slot on every later turn.
     if (t.len < 24 or cctx.looksLikeToolMarkup(t)) return null;
-    return gpa.dupe(u8, clipBytes(t, HANDOFF_MAX_BYTES)) catch null;
+    return gpa.dupe(u8, clipBytes(t, cap)) catch null;
 }
 
 /// The continuation state from a reply whose CONTENT came back empty. Some servings answer an auxiliary call
@@ -12666,6 +12856,43 @@ fn factsLedgerAppend(app: *App, workdir: []const u8, note: []const u8) void {
     std.Io.Dir.cwd().writeFile(app.io, .{ .sub_path = path, .data = merged }) catch {};
 }
 
+/// The tool map's state on disk: the conversation's open set (`{conv}/belt.txt`, toolmap.Walk.save) and the machine's
+/// learned cue→tool edges (`{data}/belt-learned.txt`, toolmap.Learned). Best-effort throughout: a missing or
+/// unreadable file is an empty one, a failed write loses one turn's lesson and nothing else. The learned table is
+/// read and written whole per turn, so concurrent turns race and the later writer wins — a lost edge is relearned
+/// the next time the same words lead to the same tool.
+const BELT_STATE_FILE = "belt.txt";
+const BELT_LEARNED_FILE = "belt-learned.txt";
+const BELT_LEARNED_CAP: usize = 256 * 1024;
+
+fn beltStateRead(app: *App, conv_dir: []const u8) ?[]u8 {
+    var pb: [1024]u8 = undefined;
+    const path = std.fmt.bufPrint(&pb, "{s}/{s}", .{ conv_dir, BELT_STATE_FILE }) catch return null;
+    return std.Io.Dir.cwd().readFileAlloc(app.io, path, app.gpa, .limited(4096)) catch null;
+}
+
+fn beltStateWrite(app: *App, conv_dir: []const u8, state: []const u8) void {
+    var pb: [1024]u8 = undefined;
+    const path = std.fmt.bufPrint(&pb, "{s}/{s}", .{ conv_dir, BELT_STATE_FILE }) catch return;
+    std.Io.Dir.cwd().writeFile(app.io, .{ .sub_path = path, .data = state }) catch {};
+}
+
+fn beltLearnedLoad(app: *App, learned: *toolmap.Learned) void {
+    var pb: [1024]u8 = undefined;
+    const path = std.fmt.bufPrint(&pb, "{s}/{s}", .{ app.data, BELT_LEARNED_FILE }) catch return;
+    const data = std.Io.Dir.cwd().readFileAlloc(app.io, path, app.gpa, .limited(BELT_LEARNED_CAP)) catch return;
+    defer app.gpa.free(data);
+    learned.load(data);
+}
+
+fn beltLearnedSave(app: *App, learned: *const toolmap.Learned) void {
+    var pb: [1024]u8 = undefined;
+    const path = std.fmt.bufPrint(&pb, "{s}/{s}", .{ app.data, BELT_LEARNED_FILE }) catch return;
+    const text = learned.save(app.gpa) catch return;
+    defer app.gpa.free(text);
+    std.Io.Dir.cwd().writeFile(app.io, .{ .sub_path = path, .data = text }) catch {};
+}
+
 /// How many fact lines the ledger holds (0 when absent) - the number the pointer quotes.
 fn factsLedgerLines(app: *App, workdir: []const u8) usize {
     if (workdir.len == 0) return 0;
@@ -12712,21 +12939,89 @@ test "the workdir facts ledger evicts its OLDEST lines when full, keeps its head
     try std.testing.expect(evicted.len <= cap);
 }
 
-/// If this pass's working growth (everything appended after `base_len`) exceeds WORKING_COMPACT_BYTES, replace its
-/// OLDER part with a single compressed progress note — the newest WORKING_KEEP_TAIL_BYTES stay verbatim — so the
-/// loop can continue bounded without deleting the results the model is actively working from. Called at a STEP
-/// BOUNDARY (after all of a step's tool results are appended), so the message sequence stays protocol-valid (no
-/// dangling tool_calls). When no safe splice point exists the span is left alone, or folded whole past
-/// WORKING_HARD_FOLD_BYTES — see the two constants for both cases.
+/// PRUNE BEFORE FOLDING — the first thing compaction tries, and the cheap one.
+///
+/// A working span is mostly tool results: file reads, fetched pages, command output. By the time the span is over
+/// budget the model has READ those results and said what it made of them in its own following messages, which are
+/// the part worth keeping verbatim. Folding the whole older span into a note spends a model call (the C1 run's
+/// dominant cost) and replaces the model's own words with a paraphrase; stubbing the stale results and keeping
+/// everything else is free and loses nothing the model is still using. This is the order opencode's compaction
+/// takes — prune stale tool outputs, summarize only if still over — adopted here for the same reason.
+///
+/// Every role:"tool" object OLDER than the protected tail (`protect` bytes, anchored by msgTail on a clean message
+/// boundary) and larger than PRUNE_RESULT_MIN_BYTES has its content replaced by PRUNED_RESULT_NOTE; the
+/// tool_call_id and every assistant/user/system object stay byte-identical, so the sequence remains protocol-valid.
+/// The buffer is rewritten only after the new span is built whole, into capacity it already has (the result is
+/// never longer than what it replaces), so an allocation failure leaves it exactly as it was. Returns true when at
+/// least one result was stubbed.
+fn pruneToolResults(gpa: std.mem.Allocator, conv_buf: *std.ArrayListUnmanaged(u8), base_len: usize, protect: usize, protect_ids: []const []const u8) bool {
+    if (conv_buf.items.len <= base_len) return false;
+    const span = conv_buf.items[base_len..];
+    const tail = msgTail(span, protect);
+    if (tail.len >= span.len) return false; // no anchor: nothing lies beyond the protected tail
+    const older = span[0 .. span.len - tail.len - 1]; // -1: msgTail skipped the joining comma
+    const marker = ",{\"role\":\"";
+    const tool_head = ",{\"role\":\"tool\",\"tool_call_id\":";
+    const content_key = ",\"content\":\"";
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(gpa);
+    var pruned: usize = 0;
+    var at: usize = 0;
+    while (at < older.len) {
+        const next = std.mem.indexOfPos(u8, older, at + 1, marker) orelse older.len;
+        const obj = older[at..next];
+        at = next;
+        if (obj.len > PRUNE_RESULT_MIN_BYTES and std.mem.startsWith(u8, obj, tool_head) and obj[obj.len - 1] == '}' and !protectedResult(obj, protect_ids)) {
+            if (std.mem.indexOf(u8, obj, content_key)) |ck| {
+                const head = obj[0 .. ck + content_key.len - 1]; // through the content key, excluding the opening quote
+                var nb: [192]u8 = undefined;
+                const note = std.fmt.bufPrint(&nb, PRUNED_RESULT_NOTE, .{(obj.len - head.len) / 1024}) catch "[tool result pruned]";
+                out.appendSlice(gpa, head) catch return false;
+                http.jstr(gpa, &out, note) catch return false;
+                out.append(gpa, '}') catch return false;
+                pruned += 1;
+                continue;
+            }
+        }
+        out.appendSlice(gpa, obj) catch return false;
+    }
+    if (pruned == 0) return false;
+    out.append(gpa, ',') catch return false;
+    out.appendSlice(gpa, tail) catch return false;
+    std.debug.assert(out.items.len <= span.len); // only ever shorter: the splice below cannot need to grow
+    conv_buf.shrinkRetainingCapacity(base_len);
+    conv_buf.appendSliceAssumeCapacity(out.items);
+    return true;
+}
+
+/// Is this tool-result object one of the ids the critical chain protects (net.zig)? Read from its own
+/// `"tool_call_id":"…"`, which the append site writes right after the role.
+fn protectedResult(obj: []const u8, protect_ids: []const []const u8) bool {
+    if (protect_ids.len == 0) return false;
+    const id = dag.jsonStr(obj[1..], "tool_call_id"); // past the joining comma
+    if (id.len == 0) return false;
+    for (protect_ids) |p| if (std.mem.eql(u8, p, id)) return true;
+    return false;
+}
+
+/// If this pass's working growth (everything appended after `base_len`) exceeds the budget, first PRUNE the stale
+/// tool results older than the kept tail (pruneToolResults — no model call; on a wide window that alone usually
+/// brings the span back under budget) and, only if it is still over, replace the OLDER part with a single
+/// compressed progress note — the newest keep-tail bytes (WORKING_KEEP_TAIL_BYTES, wider on a wide budget) stay
+/// verbatim — so the loop can continue bounded without deleting the results the model is actively working from.
+/// Called at a STEP BOUNDARY (after all of a step's tool results are appended), so the message sequence stays
+/// protocol-valid (no dangling tool_calls). When no safe splice point exists the span is left alone, or folded
+/// whole past WORKING_HARD_FOLD_BYTES — see the two constants for both cases.
 /// Best-effort: a failed summary leaves the buffer as-is (the MAX_ITERS cap still bounds the pass).
 fn compactWorking(app: *App, run_root: []const u8, base_url: []const u8, key: []const u8, model: []const u8, conv_buf: *std.ArrayListUnmanaged(u8), base_len: usize, ctx: *tools.ToolCtx, tool_obs: *std.ArrayListUnmanaged([]u8), budget: usize) void {
     if (conv_buf.items.len <= base_len or conv_buf.items.len - base_len <= budget) return;
     // The tail kept verbatim must be SMALLER than the trigger, or a fold cannot shrink the span. At the
     // stock 24 KB trigger / 32 KB tail it never did: folding only really began at 32 KB. That slack is
     // affordable on a large window and fatal on a small one, so on a tightened budget the tail is half of
-    // it — every fold then halves the span and the loop is guaranteed to make progress.
+    // it — every fold then halves the span and the loop is guaranteed to make progress. On a WIDE budget the
+    // tail widens with it (a third, up to WORKING_KEEP_TAIL_WIDE_BYTES); at the stock cap it is unchanged.
     const roomy = budget >= cctx.WORKING_COMPACT_BYTES;
-    const keep_tail = if (roomy) WORKING_KEEP_TAIL_BYTES else @max(2 * 1024, budget / 2);
+    const keep_tail = if (roomy) std.math.clamp(budget / 3, WORKING_KEEP_TAIL_BYTES, WORKING_KEEP_TAIL_WIDE_BYTES) else @max(2 * 1024, budget / 2);
     const hard_fold = if (roomy) WORKING_HARD_FOLD_BYTES else budget + budget / 2;
     const gpa = app.gpa;
     // MEMORY-BEFORE-FORGETTING: the span about to be folded holds tool findings whose queued observes have
@@ -12739,6 +13034,17 @@ fn compactWorking(app: *App, run_root: []const u8, base_url: []const u8, key: []
         for (tool_obs.items) |note| gpa.free(note);
         tool_obs.clearRetainingCapacity();
     }
+    // PRUNE FIRST (see pruneToolResults): stale results beyond the kept tail become stubs, for free. When that
+    // alone brings the span back under budget there is no fold — no model call, no note, and the model's own
+    // messages stay verbatim. The fold below reads the pruned span when it is still needed.
+    // THE CRITICAL CHAIN (Gary's 4tope, net.zig): the live results the frontier transitively rests on are never stubbed, however
+    // old — the longest path on the span's dependency DAG, one linear pass — so a prune keeps what the work depends
+    // on rather than what happens to be newest. The graph is read before the buffer is rewritten and owns its bytes.
+    var chain_graph: ?dag.Graph = dag.Graph.fromSpan(gpa, conv_buf.items[base_len..]) catch null;
+    defer if (chain_graph) |*cg| cg.deinit();
+    const protect_ids: []const []const u8 = if (chain_graph) |*cg| (cg.protectedIds(gpa) catch &.{}) else &.{};
+    defer if (protect_ids.len > 0) gpa.free(protect_ids);
+    if (pruneToolResults(gpa, conv_buf, base_len, keep_tail, protect_ids) and conv_buf.items.len - base_len <= budget) return;
     // TAIL-PRESERVING FOLD: summarize only the span OLDER than the newest WORKING_KEEP_TAIL_BYTES, then put that
     // tail back verbatim after the note. Folding the whole span deleted the model's own just-read bytes and it
     // re-read them (see WORKING_KEEP_TAIL_BYTES). msgTail picks the splice point because the splice MUST land on
@@ -13656,7 +13962,11 @@ test "the working budget tightens for a small window and leaves a roomy one alon
     const cf = "https://api.cloudflare.com/client/v4/accounts/x/ai/v1";
     const guessed = workingBudgetBytes(cf, "@cf/deepseek-ai/deepseek-v4-flash-0731", 40 * 1024, null);
     try t.expect(guessed < 32 * 1024);
-    try t.expectEqual(WORKING_SPAN_MAX_BYTES, workingBudgetBytes(cf, "@cf/deepseek-ai/deepseek-v4-flash-0731", 40 * 1024, 1_310_720));
+    // ...the WIDE cap: a 1.3M-token window is allowed a 256 KB span (workingSpanCap), a 200k one keeps 96 KB
+    try t.expectEqual(WORKING_SPAN_WIDE_BYTES, workingBudgetBytes(cf, "@cf/deepseek-ai/deepseek-v4-flash-0731", 40 * 1024, 1_310_720));
+    try t.expectEqual(WORKING_SPAN_MAX_BYTES, workingBudgetBytes("https://api.anthropic.com/v1", "claude-opus-4-8", 40 * 1024, 200_000));
+    try t.expectEqual(WORKING_SPAN_MAX_BYTES, workingSpanCap(128 * 1024 * 3));
+    try t.expectEqual(WORKING_SPAN_WIDE_BYTES, workingSpanCap(1_310_720 * 3));
 
     // TIGHT: the built-in 12B serves 8192 tokens. Its fixed prefix in a real turn (conv c6a6e014f) was
     // ~19 KB -- ~6 KB of system blocks plus a 13 KB 20-tool schema array -- which together with the answer
