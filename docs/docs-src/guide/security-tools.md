@@ -48,3 +48,7 @@ MCP credentials stay on the server for desktop and CLI chat calls. The MCP endpo
 ## Licenses and corresponding source
 
 NL-Veil code is licensed under MIT. The Gary security runtime is licensed under AGPL-3.0. Its source archive and Cloudflare build sources are available in the repository and included in full release bundles. Dependencies retain their own licenses.
+
+## Tater-tot schema discovery
+
+Tater-tots see every available Garrett tool during planning. Before using a `security_*` tool, they call `tool_schema` with its exposed name to obtain the complete input schema. Arrays, nested objects, booleans and numbers retain their original types. This avoids sending all 166 schemas in every model request. The tater-tot must have Agent Garrett enabled and its deployment connection ready.
