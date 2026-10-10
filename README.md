@@ -16,6 +16,19 @@ Windows · macOS · Linux · [MIT app code and AGPL security runtime](#license).
 hosted providers have their own data handling and costs. The built-in model requires a separate
 download, and coding tools require Python on `PATH` (some checks also use Node).
 
+### New in v1.1.16
+
+**Gary's 4tope** carries a long chat forward by graph instead of by summary. When a turn has to
+compact, the engine reads its working log as a dependency graph, keeps the chain of results the
+current step rests on, and writes the continuation from the turn's own text: the step's last words,
+the files on disk, the calls that failed, and what the work depends on. No model call, no
+paraphrase. The **tool tree** (`NL_TOOL_MAP=1`) turns the belt into a map the model walks seven
+branches at a time, so a small model can use a belt of hundreds of tools. Long chats with Agent
+Garrett compact far less: its belt is 60% smaller and the spend ceiling now scales with it.
+[Release results](docs/release/RELEASE-v1.1.16.md) ·
+[how Gary's 4tope works](https://gary23w.github.io/nl-veil/#doc=worker/chat/net) ·
+[the tool tree](https://gary23w.github.io/nl-veil/#doc=worker/chat/belt).
+
 ### New in v1.1.12
 
 Agent Garrett's full **166-tool security catalogue** is available to chats, swarms and tater-tots
@@ -91,7 +104,7 @@ code and credentials from anything you share.
 
 <p>
   <a href="https://github.com/gary23w/nl-veil/actions/workflows/release.yml"><img alt="build" src="https://github.com/gary23w/nl-veil/actions/workflows/release.yml/badge.svg"></a>
-  <a href="https://github.com/gary23w/nl-veil/releases"><img alt="release" src="https://img.shields.io/badge/release-v1.1.12-A8241B"></a>
+  <a href="https://github.com/gary23w/nl-veil/releases"><img alt="release" src="https://img.shields.io/badge/release-v1.1.16-A8241B"></a>
   <img alt="zig" src="https://img.shields.io/badge/zig-0.16-F7A41D?logo=zig&logoColor=white">
   <a href="https://huggingface.co/gary23w/the-veil-12b"><img alt="built-in model" src="https://img.shields.io/badge/built--in%20model-the--veil--12b-6E4A27?logo=huggingface&logoColor=white"></a>
   <a href="https://huggingface.co/gary23w/gary-neuron-emergent"><img alt="memory cortex" src="https://img.shields.io/badge/cortex-gary--neuron--emergent-6E4A27?logo=huggingface&logoColor=white"></a>
@@ -576,7 +589,7 @@ raylib is a *lazy* dependency, so `-Dapp=false` never fetches it at all.
 ## Install
 
 **Download it and run it — no toolchain, nothing to build.** Grab your platform's bundle from the
-**[latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.1.12)**, unzip, and run `veil`:
+**[latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.1.16)**, unzip, and run `veil`:
 
 | You're on | Download | Then run |
 |---|---|---|
@@ -737,7 +750,7 @@ step 5** — the rest is about letting other people in.
 
 ### 1. Download and unblock it
 
-Grab the bundle for your OS from the [latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.1.12)
+Grab the bundle for your OS from the [latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.1.16)
 and unzip it somewhere you'll find again. Builds are unsigned, so:
 
 - **Windows** shows *"Windows protected your PC"* → **More info** → **Run anyway**.
@@ -773,7 +786,7 @@ On startup the server prints one complete URL per address this machine answers o
 (`src/main.zig:861-889`, using `src/config/lan.zig`):
 
 ```
-neuron-loops 1.1.12 on http://localhost:8787
+neuron-loops 1.1.16 on http://localhost:8787
     open from another machine (phone, laptop) at:
       http://192.168.1.42:8787
 ```
@@ -1077,6 +1090,17 @@ a large model with a 128k window replays 64 KB verbatim, and a small local summa
 fold it cannot hold
 ([context](https://gary23w.github.io/nl-veil/#doc=worker/chat/context)).
 
+**A long turn carries itself forward by graph, not by summary.** When a turn crosses its spend ceiling,
+[Gary's 4tope](https://gary23w.github.io/nl-veil/#doc=worker/chat/net) reads the turn's working log as a
+dependency graph: each result hangs off the step that asked for it, a step depends on the results it
+reused, and a later read or write of the same file supersedes the earlier one. The longest path back from
+the current step is the chain the work rests on; it is never pruned. The continuation is laid out along the
+shortest-path tree from that step, under a byte budget, in the turn's own words: NEXT, ON DISK, RULED OUT,
+ESTABLISHED. No model writes it, so nothing is paraphrased away, and a failure a later success replaced is
+not carried as current. Tool findings reach neuron-db at every step, so the carry is a layout of what is
+already remembered. `NL_HANDOFF=model` restores the model-written state. Before any of that, old tool
+results are stubbed before anything is summarized, and the working span grows with the model's window.
+
 Inside a turn, a [recall overlay](https://gary23w.github.io/nl-veil/#doc=worker/chat/overlay) keeps a small
 working field of the conversation's memory, your durable notes and the file ledger, grows it with every
 finding the moment it exists, and settles it around what the model is doing right now before **every**
@@ -1120,6 +1144,15 @@ file, URL, port, process, command, or swarm until it's done or the budget expire
 a chain of bounded polls instead of one guess. And **`stop_process`** exists because a turn that can
 start a server must be able to end one — a Stop from you now reaches a blocking tool instead of
 waiting for it to finish.
+
+**The tool tree** (`NL_TOOL_MAP=1`, opt-in) advertises the belt as a map instead of a list. The model
+walks it with one verb, `open_tools`: at most seven branches at a time, each with one line saying what it
+is for, and reaching a group opens its tools by name. The engine opens the likeliest group from the
+request before the first call, a tool the model already knows opens its own branch in the round it is
+called, and a model that wanders for four rounds is handed a search of the whole map. Agent Garrett's
+catalogue, plugins and other MCP servers attach as branches of their own, and the map learns which words
+lead to which tools. Shrinking what is advertised never shrinks what is callable
+([the tool tree](https://gary23w.github.io/nl-veil/#doc=worker/chat/belt)).
 
 Non-admin accounts run a **restricted subset** (workspace files, research, and the whole memory
 surface — but no shell, no browser, no MCP, no tool authoring, no casting). See
@@ -1645,7 +1678,17 @@ dependency entirely rather than compiling it unused.
 
 ## Release
 
-**Current: [`v1.1.12`](https://github.com/gary23w/nl-veil/releases/tag/v1.1.12)** — the complete 166-tool Agent Garrett catalogue is available through typed MCP tools in chats, swarms and tater-tots. Deployment includes a dedicated Cloudflare execution runtime, Settings shows its build progress, feature opt-ins are separate, and the desktop has corrected spacing and panel borders. [Full notes](docs/release/RELEASE-v1.1.12.md) · [Security tools guide](docs/docs-src/guide/security-tools.md).
+**Current: [`v1.1.16`](https://github.com/gary23w/nl-veil/releases/tag/v1.1.16)** — **Gary's 4tope**:
+a long chat carries itself forward by graph instead of by summary, keeping the chain of results the current
+step rests on and writing the continuation from the turn's own text with no model call. Plus the opt-in
+**tool tree** that lets a small model walk a belt of hundreds of tools, a 60% lighter Agent Garrett belt,
+and a spend ceiling that scales with the belt. [Full notes](docs/release/RELEASE-v1.1.16.md).
+
+**Previously: [`v1.1.15`](https://github.com/gary23w/nl-veil/releases/tag/v1.1.15)** — tater-tots plan
+correctly with the complete Agent Garrett catalogue enabled: the planner receives the full tool index and
+execution loads each tool's typed schema on demand.
+
+**Previously: [`v1.1.12`](https://github.com/gary23w/nl-veil/releases/tag/v1.1.12)** — the complete 166-tool Agent Garrett catalogue is available through typed MCP tools in chats, swarms and tater-tots. Deployment includes a dedicated Cloudflare execution runtime, Settings shows its build progress, feature opt-ins are separate, and the desktop has corrected spacing and panel borders. [Full notes](docs/release/RELEASE-v1.1.12.md) · [Security tools guide](docs/docs-src/guide/security-tools.md).
 
 **Previously: [`v1.1.11`](https://github.com/gary23w/nl-veil/releases/tag/v1.1.11)** — chat keeps answering when a hosted model changes how it treats a request: a retired thinking-off setting stays retired, a cut turn's continuation state is read from the reasoning channel, the desktop stops dialing a placeholder endpoint and folds a message into a running turn, and the survey and planning passes show their reasoning in the chat. [Full notes](docs/release/RELEASE-v1.1.11.md).
 
