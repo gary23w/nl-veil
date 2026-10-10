@@ -1778,6 +1778,11 @@ pub const Chat = struct {
             defer self.store.unlock();
             break :blk_fr self.store.settings.fast_reasoning;
         };
+        const use_garrett: bool = blk_ug: {
+            self.store.lock();
+            defer self.store.unlock();
+            break :blk_ug self.store.garrett_deployed and self.store.settings.use_garrett;
+        };
 
         // IMAGE ATTACHMENT (v1, single image): read the raw PNG the UI captured and base64-encode it (STANDARD
         // alphabet, no "data:" prefix) into the body's "image_b64" field. File-read + encode happen HERE, on the
@@ -1833,6 +1838,7 @@ pub const Chat = struct {
             // Only sent when TRUE: the server default is advanced, so an absent field and a false one mean
             // the same thing, and saying nothing is the smaller wire contract.
             if (fast_reasoning) w.writeAll(",\"fast\":true") catch break :blk false;
+            if (use_garrett) w.writeAll(",\"garrett\":true") catch break :blk false;
             // Optional single-image attachment. base64's alphabet ([A-Za-z0-9+/=]) needs no JSON escaping.
             if (image_b64.len > 0) {
                 w.writeAll(",\"image_b64\":\"") catch break :blk false;
@@ -5137,6 +5143,7 @@ pub const Chat = struct {
         var cfa: [64]u8 = undefined;
         var cfa_n: usize = 0;
         var unified = true;
+        var use_garrett = false;
         var think_cfg: store_mod.RoleCfg = .{};
         var prompt_cfg: store_mod.RoleCfg = .{};
         {
@@ -5169,6 +5176,7 @@ pub const Chat = struct {
             rightw = s.chat_right_w;
             conh = s.chat_con_h;
             unified = s.chat_unified;
+            use_garrett = s.use_garrett;
             think_cfg = s.chat_think;
             prompt_cfg = s.chat_prompt;
         }
@@ -5207,6 +5215,7 @@ pub const Chat = struct {
         // MODEL TRIO: the "use one model for all three" flag + the thinking/prompting role overrides. Role keys
         // are NOT written here — they live in the OS secret store (secrets.zig), keyed by provider slug.
         jb.print(self.gpa, ",\"unified\":{}", .{unified}) catch return;
+        jb.print(self.gpa, ",\"garrett\":{}", .{use_garrett}) catch return;
         emitRoleCfg(&jb, self.gpa, "think", think_cfg) catch return;
         emitRoleCfg(&jb, self.gpa, "prompt", prompt_cfg) catch return;
         jb.appendSlice(self.gpa, "}") catch return;
@@ -5333,6 +5342,7 @@ pub const Chat = struct {
         // prompting role overrides. Missing keys leave the RoleCfg defaults (set=false) ⇒ fall back to coding,
         // so an old settings.json loads as today's single-model chat.
         s.chat_unified = std.mem.indexOf(u8, data, "\"unified\":false") == null;
+        s.use_garrett = std.mem.indexOf(u8, data, "\"garrett\":true") != null;
         parseRoleCfg(self.gpa, data, "think", &s.chat_think);
         parseRoleCfg(self.gpa, data, "prompt", &s.chat_prompt);
     }

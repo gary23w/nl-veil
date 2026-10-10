@@ -46,3 +46,9 @@ The exact surface veil-desk and the `veil chat` CLI both drive: POST a message, 
 ---
 
 *Case file grounded in the module's `//!` header and public API.*
+
+## Security tools in v1.1.12
+
+Chat request parsing includes the `garrett` feature opt-in. The value reaches the engine, where the authenticated user’s deployment is resolved and its typed security catalogue is added for that turn.
+
+[Security deployment and use guide](../../guide/security-tools.md).

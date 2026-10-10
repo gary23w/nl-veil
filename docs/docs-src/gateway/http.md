@@ -55,3 +55,9 @@ The server ALWAYS mints an admin API key and drops it at `{data}/.desktop_key`, 
 ---
 
 *Case file grounded in the module's `//!` header and public API.*
+
+## Security tools in v1.1.12
+
+The default Cloudflare scope list now includes `containers.read` and `containers.write`. This enables native provisioning and removal of the Gary Container alongside Workers and R2. Existing Cloudflare authorizations need a fresh consent grant before those operations can succeed.
+
+[Security deployment and use guide](../guide/security-tools.md).

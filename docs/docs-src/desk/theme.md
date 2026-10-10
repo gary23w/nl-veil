@@ -44,3 +44,9 @@ The RING OF 24 SCRATCH BUFFERS (ZBUFS=24, each [2048]u8) is the load-bearing tri
 ---
 
 *Case file grounded in the module's `//!` header and public API.*
+
+## Security tools in v1.1.12
+
+`labelH`, `formRowH` and `rowH` keep scaled labels and controls aligned. Panel outlines are inset inside the filled rectangle so clipping preserves all edges; this repairs past-run card and Settings field borders. Button, tab and checkbox text uses the same measured centering rules.
+
+[Security deployment and use guide](../guide/security-tools.md).

@@ -90,6 +90,9 @@ const Manifest = struct {
     /// DECLARED deliverables from the caller (the chat's veil reasons out the output paths and names them;
     /// comma/newline separated). Adopted verbatim as the blueprint — the model declares, the engine carries.
     files: []const u8 = "",
+    /// the user's own Agent Garrett on every mind's belt (deploy/service.zig): the pair itself rides keys.env
+    /// as GARRETT_MCP_URL / GARRETT_MCP_TOKEN, read the way the model key is
+    garrett: bool = false,
 };
 
 /// One tracked tool-call signature for the per-mind loop guard: sig = hash(name+args),
@@ -352,6 +355,10 @@ pub const Worker = struct {
     // lazily on the first browser_* call, so an unused belt costs nothing and a machine with no browser
     // degrades to a graceful per-call error. NL_BROWSER_DRIVER=0/false turns it off.
     browser: bool = false,
+    // Agent Garrett's pair for this run (keys.env, when the manifest asked): blank ⇒ the two verbs are neither
+    // on any mind's belt nor dispatchable (tools.execute refuses in words).
+    garrett_url: []const u8 = "",
+    garrett_token: []const u8 = "",
     digest_str: []const u8 = "",
     state_str: []const u8 = "",
     // STRUCTURED PROGRESS CHECKPOINT — a compact, engine-tracked ground-truth record of the LAST round
@@ -714,6 +721,12 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
     defer gpa.free(base_url);
     const key = resolveCfg(gpa, io, environ, run_dir, &.{ "NL_LLM_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY" }) orelse try gpa.dupe(u8, "");
     defer gpa.free(key);
+    // AGENT GARRETT: the pair the deploy wrote into keys.env when the swarm asked for it (deploy/service.zig),
+    // read the way the model key is; a manifest that never asked reads nothing, whatever the file holds.
+    const garrett_url = if (m.garrett) (resolveCfg(gpa, io, environ, run_dir, &.{"GARRETT_MCP_URL"}) orelse try gpa.dupe(u8, "")) else try gpa.dupe(u8, "");
+    defer gpa.free(garrett_url);
+    const garrett_token = if (m.garrett) (resolveCfg(gpa, io, environ, run_dir, &.{"GARRETT_MCP_TOKEN"}) orelse try gpa.dupe(u8, "")) else try gpa.dupe(u8, "");
+    defer gpa.free(garrett_token);
     const model = if (cli_model.len > 0 and !std.mem.eql(u8, cli_model, "mock")) cli_model else m.model;
     const live = key.len > 0 and !std.mem.eql(u8, key, "nl-brokered") and !std.mem.eql(u8, m.provider, "mock");
 
@@ -742,6 +755,8 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
         .base_url = base_url,
         .model = model,
         .key = key,
+        .garrett_url = garrett_url,
+        .garrett_token = garrett_token,
         .autonomous = m.autonomous,
         .internet = m.internet,
         .want_net = m.internet,
@@ -4040,7 +4055,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     var had_reject = false; // this mind's work was refused this round (edit/salvage reject) — a NEGATIVE affect signal
     const workdir = std.fmt.allocPrint(gpa, "{s}/work", .{w.run_dir}) catch (gpa.dupe(u8, w.run_dir) catch @panic("out of memory"));
     defer gpa.free(workdir);
-    var ctx = tools.ToolCtx{ .gpa = gpa, .io = w.io, .environ = environ, .run_dir = w.run_dir, .workdir = workdir, .scope = mi.scope, .mind = mi.name, .round = round, .mem = w.mem, .files_written = &files, .observed = &observed, .skills_saved = &skills_saved, .directives_set = &directives_set, .tools_made = &tools_made, .space = w.space, .share_obs = mi.scout, .internet = w.internet, .browser = w.browser, .discourse = w.discourse, .blueprint = w.blueprint, .egress_allow = (environ.get("NL_EGRESS_ALLOWLIST") orelse ""), .gw_base = w.gw_base, .gw_key = w.gw_key, .gw_model = w.gateway_model, .fmtx = &w.files_mtx, .vcs_enabled = live and !w.quick and mi.team > 1, .anchored_reads = !w.discourse, .operating = w.operating, .app_attach = w.app_attach, .reject_notes = &w.reject_notes, .patch_root = w.patch_root };
+    var ctx = tools.ToolCtx{ .gpa = gpa, .io = w.io, .environ = environ, .run_dir = w.run_dir, .workdir = workdir, .scope = mi.scope, .mind = mi.name, .round = round, .mem = w.mem, .files_written = &files, .observed = &observed, .skills_saved = &skills_saved, .directives_set = &directives_set, .tools_made = &tools_made, .space = w.space, .share_obs = mi.scout, .internet = w.internet, .browser = w.browser, .discourse = w.discourse, .blueprint = w.blueprint, .egress_allow = (environ.get("NL_EGRESS_ALLOWLIST") orelse ""), .gw_base = w.gw_base, .gw_key = w.gw_key, .gw_model = w.gateway_model, .fmtx = &w.files_mtx, .vcs_enabled = live and !w.quick and mi.team > 1, .anchored_reads = !w.discourse, .operating = w.operating, .app_attach = w.app_attach, .reject_notes = &w.reject_notes, .patch_root = w.patch_root, .garrett_url = w.garrett_url, .garrett_token = w.garrett_token };
     var mem_sink = tools.MemSink{ .gpa = gpa };
     defer mem_sink.deinit();
     const normalize_mem = w.cap.tier != .author;
@@ -4664,7 +4679,13 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
         break :blk v.len > 0 and !std.mem.eql(u8, v, "0") and !std.ascii.eqlIgnoreCase(v, "false");
     };
     const mcp_defs: []const u8 = if (mcp_on and (gate.schema == .full or gate.schema == .operate)) ",\n" ++ tools.MCP_SCHEMA else "";
-    const live_schema = if (authored_defs.len > 0 or browser_defs.len > 0 or mcp_defs.len > 0) (std.fmt.allocPrint(gpa, "{s}{s}{s}{s}", .{ base_schema, authored_defs, browser_defs, mcp_defs }) catch base_schema) else base_schema;
+    // Agent Garrett's two verbs: on every tier's belt when the deploy carried the pair (swarm.json asked and
+    // keys.env holds it) and the run is online — a blue-team lookup is research, so the scout gets it too.
+    const discovered = tools.garrettDiscover(.{ .gpa = gpa, .io = w.io, .scratch = w.run_dir, .url = if (w.internet) w.garrett_url else "", .token = w.garrett_token });
+    defer gpa.free(discovered);
+    const garrett_defs: []const u8 = if (w.internet and tools.garrettOn(w.garrett_url, w.garrett_token)) (std.fmt.allocPrint(gpa, ",\n{s}", .{if (discovered.len > 0) discovered else tools.GARRETT_SCHEMA}) catch "") else "";
+    defer if (garrett_defs.len > 0) gpa.free(garrett_defs);
+    const live_schema = if (authored_defs.len > 0 or browser_defs.len > 0 or mcp_defs.len > 0 or garrett_defs.len > 0) (std.fmt.allocPrint(gpa, "{s}{s}{s}{s}{s}", .{ base_schema, authored_defs, browser_defs, mcp_defs, garrett_defs }) catch base_schema) else base_schema;
     defer if (live_schema.ptr != base_schema.ptr) gpa.free(@constCast(live_schema));
     var web_calls: u32 = 0;
     var fetched_url: []const u8 = "";

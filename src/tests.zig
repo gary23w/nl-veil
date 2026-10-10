@@ -15,6 +15,8 @@ test {
     _ = @import("config/cf_oauth.zig");
     _ = @import("config/cf_r2.zig"); // the R2 backup: gated routes, object-key charset, state defaults, per-account bucket, a deleted bucket re-created — via fakehttp
     _ = @import("config/cf_tot.zig"); // tots: gated routes, the derived token, the upload, the owner's-machine bridge — via fakehttp
+    _ = @import("config/cf_garrett.zig"); // Agent Garrett's derived pair, read back from the state file
+    _ = @import("worker/garrett.zig"); // Agent Garrett's belt: the two verbs over one JSON-RPC POST each — via fakehttp
     _ = @import("config/cf_tunnel.zig"); // the tunnel: gated routes, token-free state, the permission explanation, Access claims, hostname changes — via fakehttp
     _ = @import("worker/wsock.zig"); // the loopback client's blocking round trip: IPv4 literals, the sockaddr layout
     _ = @import("config/key_vault.zig"); // registered DIRECTLY: reaching the root through another

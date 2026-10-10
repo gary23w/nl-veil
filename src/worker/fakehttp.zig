@@ -30,8 +30,8 @@ pub const Route = struct { method: []const u8, path: []const u8, reply: []const 
 /// (`startWatched`): the client is connected and waiting, so a test sees the world as it is mid-call.
 pub const OnRequest = *const fn () void;
 
-const MAX_ROUTES = 16;
-const MAX_CALLS = 32;
+const MAX_ROUTES = 32;
+const MAX_CALLS = 128; // Agent Garrett's launch beside the tots, twice, and its removal are 36 calls
 const CALL_LEN = 256;
 
 /// TEST ONLY. A loopback server that answers EVERY connection with the same canned bytes, and counts
@@ -216,6 +216,15 @@ pub const Server = struct {
         for (self.calls[0..self.call_count], self.call_lens[0..self.call_count]) |*c, len| {
             const sp = std.mem.indexOfScalar(u8, c[0..len], ' ') orelse continue;
             if (std.mem.eql(u8, c[0..sp], method) and std.mem.indexOf(u8, c[sp + 1 .. len], path) != null) n += 1;
+        }
+        return n;
+    }
+
+    pub fn countCallsExact(self: *const Server, method: []const u8, path: []const u8) usize {
+        var n: usize = 0;
+        for (self.calls[0..self.call_count], self.call_lens[0..self.call_count]) |*c, len| {
+            const sp = std.mem.indexOfScalar(u8, c[0..len], ' ') orelse continue;
+            if (std.mem.eql(u8, c[0..sp], method) and std.mem.eql(u8, c[sp + 1 .. len], path)) n += 1;
         }
         return n;
     }

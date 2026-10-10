@@ -37,3 +37,9 @@ The load-bearing logic is the retry/triage in the private `httpReq`, keyed off i
 ---
 
 *Case file grounded in the module's `//!` header and public API.*
+
+## Security tools in v1.1.12
+
+`garrettStatus`, `garrettDeploy` and `garrettRemove` call the authenticated `/api/v1/tots/garrett` endpoint. Status includes the cloud runtime phase; deployment provisions the complete execution system; removal deletes the two Workers and Container before clearing local state.
+
+[Security deployment and use guide](../guide/security-tools.md).

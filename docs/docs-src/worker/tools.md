@@ -49,3 +49,9 @@ The worker engine (`run.zig`) and the chat engine dispatch every parsed model to
 ---
 
 *Case file grounded in the module's `//!` header, public API, and its tests.*
+
+## Security tools in v1.1.12
+
+The reserved `security_` family and `garrett_tools`/`garrett` wrappers dispatch through `worker/garrett.zig`. Opted-in contexts carry the user’s MCP URL and token plus the discovered typed catalogue. Security tools run in that authenticated cloud deployment, remain unavailable without its credential pair, and require an online run.
+
+[Security deployment and use guide](../guide/security-tools.md).

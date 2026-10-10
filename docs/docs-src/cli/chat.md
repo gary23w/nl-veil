@@ -32,3 +32,7 @@ Reached only through `cli.zig`'s `cmdChat` (the `veil chat [conv]` verb). The co
 ---
 
 *Case file grounded in the module's `//!` header and public API.*
+
+## Security tools
+
+Run `veil chat --garrett` to include the authenticated user's Agent Garrett deployment on the turn. Tools are advertised individually as `security_<name>` with their original input schemas. Security calls run on the server in client mode, keeping the MCP bearer out of delegated-tool events. [Deployment and feature opt-ins](../guide/security-tools.md).

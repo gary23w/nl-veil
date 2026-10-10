@@ -37,3 +37,9 @@ The engine behind `veil cast` / `veil deploy` / `veil list` / `veil rm` and the 
 ---
 
 *Case file grounded in the module's `//!` header and public API.*
+
+## Security tools in v1.1.12
+
+The deployment request includes a separate `garrett` opt-in. When enabled, it resolves the authenticated user’s deployment and writes the MCP URL/token into the swarm’s existing key material for its workers. A deployment without this opt-in does not receive that credential pair.
+
+[Security deployment and use guide](../../guide/security-tools.md).

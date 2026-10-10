@@ -1,11 +1,12 @@
 # Desktop experience
 
-Settings has five pages with fixed navigation and a scrollable content area:
+Settings has five pages with fixed navigation and a scrollable content area. Its scrollbar is hidden; use the mouse wheel, Page Up/Page Down, Home or End:
+
 
 | Page | Controls |
 | --- | --- |
 | General | Text size, accessibility, notifications, and task behavior |
-| Models | Chat provider, model roles, Cloudflare login, and built-in model installation |
+| Models | Chat provider, model roles, Cloudflare login, security-tool deployment and build progress, and built-in model installation |
 | Connection | Server address, port, API token, and data location |
 | Data | Dataset recording |
 | Updates | Release checks and installation |
@@ -30,10 +31,16 @@ the chat pane; copying preserves the original text, indentation, and line ending
 Both backtick and tilde fences are supported, including longer fences surrounding
 shorter examples and incomplete blocks during streaming.
 
+## Security tools and spacing
+
+**Agent Garrett: on/off** is a plain clickable chat label beside auto-loop. Swarm and tater-tot deploy forms have independent **Agent Garrett** checkboxes. Settings → Models contains **Deploy security tools** (or **Update security tools** once deployed), with an animated bar during upload and cloud runtime preparation. See [the security guide](security-tools.md).
+
+Tab content uses consistent outer margins. Form labels and controls reserve scaled text height. Rounded panel borders stay inside clipping bounds, so past-run cards and Settings fields retain all four edges.
+
 ## Manual review
 
 - Open each settings page at normal and XL text sizes. Scroll with the wheel and
-  scrollbar; check that content cannot be clicked behind the navigation.
+  keyboard; check that content cannot be clicked behind the navigation.
 - Change notifications and the connection token, restart, and verify persistence.
 - Select a starter, edit it, and send. Confirm preparation and server phase updates
   appear before the first response token and disappear after completion or Stop.

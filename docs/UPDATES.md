@@ -1,5 +1,9 @@
 # Desktop updates and release connectivity
 
+## v1.1.12
+
+This release adds the full Agent Garrett toolset and dedicated Cloudflare runtime. After updating, reconnect an existing Cloudflare login once for Containers permissions, then choose **Settings → Models → Deploy security tools** (or **Update security tools**). The animated loading bar remains visible while the cloud runtime prepares. Re-enable Agent Garrett separately for each feature that should use it; the chat control is beside auto-loop. [Release results](release/RELEASE-v1.1.12.md) · [Security setup](docs-src/guide/security-tools.md).
+
 In v1.1.3, the updater is directly under Settings → App updates. In v1.1.4, use the Updates page.
 
 Starting with v1.1.3, official bundles check the latest stable GitHub release in the background when the desktop starts.

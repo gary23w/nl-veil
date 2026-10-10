@@ -41,3 +41,9 @@ Spawned by the server (`veil worker` subcommand dispatched in `src/main.zig`); t
 ---
 
 *Case file grounded in the module's `//!` header, public API, and its tests.*
+
+## Security tools in v1.1.12
+
+An opted-in swarm loads its MCP credential pair from its deployment key material and discovers the individual security tools for its tool bundle. The typed schemas are carried into the model request, while execution routes through the authenticated Garrett MCP client.
+
+[Security deployment and use guide](../guide/security-tools.md).

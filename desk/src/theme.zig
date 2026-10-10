@@ -683,6 +683,19 @@ fn spacingFor(size_px: f32) f32 {
     return @max(0.0, size_px / 64.0);
 }
 
+pub fn textH(size: i32) f32 {
+    return scaledUi(size);
+}
+pub fn labelH() f32 {
+    return textH(12) + 6;
+}
+pub fn formRowH() f32 {
+    return labelH() + FIELD_H;
+}
+pub fn rowH() f32 {
+    return @max(30, textH(13) + 12);
+}
+
 pub fn text(s: [:0]const u8, x: i32, y: i32, size: i32, c: Color) void {
     const px = scaledUi(size);
     rl.drawTextEx(theFont(), s, .{ .x = @floatFromInt(x), .y = @floatFromInt(y) }, px, spacingFor(px), c);
@@ -785,7 +798,8 @@ pub fn panel(r: Rect, fill: Color) void {
 pub fn panelBordered(r: Rect, fill: Color, line: Color) void {
     const rn = roundnessFor(r, 7);
     rl.drawRectangleRounded(r, rn, 8, fill);
-    rl.drawRectangleRoundedLinesEx(r, rn, 8, 1.0, line);
+    const edge = Rect{ .x = r.x + 1, .y = r.y + 1, .width = @max(0, r.width - 2), .height = @max(0, r.height - 2) };
+    rl.drawRectangleRoundedLinesEx(edge, roundnessFor(edge, 6), 8, 1.0, line);
 }
 
 pub fn fillRect(x: i32, y: i32, w: i32, h: i32, c: Color) void {
@@ -1007,7 +1021,7 @@ pub fn buttonEx(r: Rect, label: [:0]const u8, accent: Color, enabled: bool, styl
     const fs = btnFont(r.height);
     const tw = measure(label, fs);
     const nudge: f32 = if (down) 1 else 0;
-    text(label, @intFromFloat(r.x + (r.width - @as(f32, @floatFromInt(tw))) / 2), @intFromFloat(r.y + (r.height - @as(f32, @floatFromInt(fs))) / 2 + nudge), fs, label_c);
+    text(label, @intFromFloat(r.x + (r.width - @as(f32, @floatFromInt(tw))) / 2), @intFromFloat(r.y + (r.height - textH(fs)) / 2 + nudge), fs, label_c);
     const kb = kbRegister(r, label, "button") and enabled;
     return kb or (hot and rl.isMouseButtonPressed(.left) and !clicks_blocked);
 }
@@ -1041,7 +1055,7 @@ pub fn tab(r: Rect, label: [:0]const u8, active: bool) bool {
     }
     const c = if (active) fg else if (hot) fg_dim else comment;
     const tw = measure(label, 13);
-    text(label, @intFromFloat(r.x + (r.width - @as(f32, @floatFromInt(tw))) / 2), @intFromFloat(r.y + (r.height - 13) / 2), 13, c);
+    text(label, @intFromFloat(r.x + (r.width - @as(f32, @floatFromInt(tw))) / 2), @intFromFloat(r.y + (r.height - textH(13)) / 2), 13, c);
     if (hot and !active and !clicks_blocked) wantCursor(.pointing_hand);
     const kb = kbRegister(r, label, "tab");
     return kb or (hot and rl.isMouseButtonPressed(.left) and !clicks_blocked);
@@ -1053,7 +1067,7 @@ pub fn winButton(r: Rect, glyph: [:0]const u8, danger: bool) bool {
     if (hot) rl.drawRectangleRec(r, if (danger) withAlpha(red, 200) else withAlpha(bg_hl, 220));
     const c = if (hot) (if (danger) bg_dark else fg) else fg_dim;
     const tw = measure(glyph, 15);
-    text(glyph, @intFromFloat(r.x + (r.width - @as(f32, @floatFromInt(tw))) / 2), @intFromFloat(r.y + (r.height - 15) / 2), 15, c);
+    text(glyph, @intFromFloat(r.x + (r.width - @as(f32, @floatFromInt(tw))) / 2), @intFromFloat(r.y + (r.height - textH(15)) / 2), 15, c);
     if (hot) wantCursor(.pointing_hand);
     return hot and rl.isMouseButtonPressed(.left);
 }
@@ -1115,8 +1129,8 @@ pub fn cycle(r: Rect, label: [:0]const u8, value: [:0]const u8, focused: bool) i
     textClip(value, @intFromFloat(r.x + 12), @intFromFloat(r.y + 22), 14, fg, @intFromFloat(r.width - 48));
     // chevrons
     const hot = mouse.over(r);
-    text(z("<", .{}), @intFromFloat(r.x + r.width - 36), @intFromFloat(r.y + (r.height - 14) / 2), 14, if (hot) blue else comment);
-    text(z(">", .{}), @intFromFloat(r.x + r.width - 18), @intFromFloat(r.y + (r.height - 14) / 2), 14, if (hot) blue else comment);
+    text(z("<", .{}), @intFromFloat(r.x + r.width - 36), @intFromFloat(r.y + (r.height - textH(14)) / 2), 14, if (hot) blue else comment);
+    text(z(">", .{}), @intFromFloat(r.x + r.width - 18), @intFromFloat(r.y + (r.height - textH(14)) / 2), 14, if (hot) blue else comment);
     if (!hot) return 0;
     wantCursor(.pointing_hand);
     if (rl.isMouseButtonPressed(.left)) return 1;
@@ -1131,11 +1145,94 @@ pub fn checkbox(r: Rect, label: [:0]const u8, on: bool) bool {
     const rn = roundnessFor(box, 5);
     rl.drawRectangleRounded(box, rn, 8, if (on) withAlpha(green, 60) else if (hot) bg_hl else bg);
     rl.drawRectangleRoundedLinesEx(box, rn, 8, 1.0, if (on) green else if (hot) fg_dim else border);
-    if (on) text(z("x", .{}), @intFromFloat(box.x + 5), @intFromFloat(box.y + 2), 14, green);
-    text(label, @intFromFloat(r.x + 26), @intFromFloat(r.y + (r.height - 13) / 2), 13, if (on) fg else if (hot) fg else fg_dim);
+    if (on) {
+        const mark = z("x", .{});
+        text(mark, @intFromFloat(box.x + (box.width - @as(f32, @floatFromInt(measure(mark, 12)))) / 2), @intFromFloat(box.y + (box.height - textH(12)) / 2), 12, green);
+    }
+    textClip(label, @intFromFloat(r.x + 26), @intFromFloat(r.y + (r.height - textH(13)) / 2), 13, if (on) fg else if (hot) fg else fg_dim, @intFromFloat(@max(1, r.width - 30)));
     if (hot) wantCursor(.pointing_hand);
     const kb = kbRegister(r, if (label.len > 0) label else @as([]const u8, if (on) "checked" else "unchecked"), "checkbox");
     return kb or (hot and rl.isMouseButtonPressed(.left));
+}
+
+/// A checkbox that may be switched OFF as a control: `enabled` false draws it dimmed, takes no click, and asks for
+/// `tip_text` as the frame's tooltip (why, and how to turn it on) while the mouse rests on it. Returns true on a
+/// click only while enabled.
+pub fn checkboxEx(r: Rect, label: [:0]const u8, on: bool, enabled: bool, tip_text: []const u8) bool {
+    if (enabled) return checkbox(r, label, on);
+    const box = Rect{ .x = r.x, .y = r.y + (r.height - 18) / 2, .width = 18, .height = 18 };
+    const rn = roundnessFor(box, 5);
+    rl.drawRectangleRounded(box, rn, 8, withAlpha(bg_hl, 120));
+    rl.drawRectangleRoundedLinesEx(box, rn, 8, 1.0, withAlpha(border, 160));
+    textClip(label, @intFromFloat(r.x + 26), @intFromFloat(r.y + (r.height - textH(13)) / 2), 13, withAlpha(fg_dim, 150), @intFromFloat(@max(1, r.width - 30)));
+    if (mouse.over(r) and !clicks_blocked) tip(r, tip_text);
+    return false;
+}
+
+// ---- tooltips: a widget REQUESTS one while hovered; the frame draws ONE, last, on top of everything ----
+// Same discipline as the cursor: the last request of the frame wins, and main flushes it after every pane
+// (flushTip), so a tooltip never ends up under the widgets drawn after the one that asked for it.
+var tip_text_buf: [400]u8 = undefined;
+var tip_len: usize = 0;
+var tip_anchor: Rect = .{ .x = 0, .y = 0, .width = 0, .height = 0 };
+
+/// Ask for a tooltip under `anchor` this frame.
+pub fn tip(anchor: Rect, s: []const u8) void {
+    const n = @min(s.len, tip_text_buf.len);
+    @memcpy(tip_text_buf[0..n], s[0..n]);
+    tip_len = n;
+    tip_anchor = anchor;
+}
+
+/// Draw the pending tooltip, if any, and clear it. Called once per frame by main, after everything else.
+pub fn flushTip() void {
+    defer tip_len = 0;
+    if (tip_len == 0) return;
+    const size: i32 = 12;
+    const pad: f32 = 8;
+    const max_w: f32 = 380;
+    const s = tip_text_buf[0..tip_len];
+    // word-wrap into lines that fit max_w
+    var lines: [12][]const u8 = undefined;
+    var n_lines: usize = 0;
+    var widest: f32 = 0;
+    var start: usize = 0;
+    while (start < s.len and n_lines < lines.len) {
+        var end = start;
+        var last_space: ?usize = null;
+        while (end < s.len) : (end += 1) {
+            if (s[end] == ' ') last_space = end;
+            const w: f32 = @floatFromInt(measure(zs(s[start .. end + 1]), size));
+            if (w > max_w) break;
+        }
+        var cut = end;
+        if (end < s.len) {
+            if (last_space) |sp| {
+                if (sp > start) cut = sp;
+            }
+        }
+        if (cut == start) cut = @min(start + 1, s.len);
+        lines[n_lines] = s[start..cut];
+        widest = @max(widest, @as(f32, @floatFromInt(measure(zs(s[start..cut]), size))));
+        n_lines += 1;
+        start = cut;
+        while (start < s.len and s[start] == ' ') start += 1;
+    }
+    if (n_lines == 0) return;
+    const line_h: f32 = 16;
+    const w = widest + pad * 2;
+    const h = line_h * @as(f32, @floatFromInt(n_lines)) + pad * 2 - 2;
+    const sw: f32 = @floatFromInt(rl.getScreenWidth());
+    const sh: f32 = @floatFromInt(rl.getScreenHeight());
+    var x = tip_anchor.x;
+    var y = tip_anchor.y + tip_anchor.height + 6;
+    if (x + w > sw - 8) x = @max(8, sw - 8 - w);
+    if (y + h > sh - 8) y = @max(8, tip_anchor.y - h - 6);
+    const box = Rect{ .x = x, .y = y, .width = w, .height = h };
+    panelBordered(box, bg_hl, border);
+    for (lines[0..n_lines], 0..) |ln, i| {
+        text(zs(ln), @intFromFloat(x + pad), @intFromFloat(y + pad - 1 + line_h * @as(f32, @floatFromInt(i))), size, fg);
+    }
 }
 
 /// A small +/- stepper for an integer in [lo,hi]. Returns the new value.

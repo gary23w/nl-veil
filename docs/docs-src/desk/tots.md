@@ -13,12 +13,12 @@ The Tater-tots tab (drawn in `main.zig`) shows the account's tater-tots against 
 ## Key Exports
 
 - `RunRow`, `parseRuns`, `rowLeaf` — the runs list (`GET /api/v1/tots/runs`): every deployment kept on the server's machine, newest first; a live row names its run by the last segment of its folder
-- `Row`, `PadRow`, `Roster`, `Ev` — the fixed-size values the Store holds; a row carries the tater-tot's local `folder` (Open folder), an event its kind, iteration and up to 2200 characters of text with its line breaks (a longer one ends in "...", and the local `events.log` has it whole)
+- `Row`, `PadRow`, `Roster`, `Ev` — the fixed-size values the Store holds; a row carries the tater-tot's local `folder` (Open folder) and `garrett` (Agent Garrett's tools are on its belt), a roster whether the account has Agent Garrett deployed (`garrett`), an event its kind, iteration and up to 2200 characters of text with its line breaks (a longer one ends in "...", and the local `events.log` has it whole)
 - `parseRoster` — a `GET /api/v1/tots` reply into a `Roster`; anything that is not that reply leaves the output untouched
 - `parseTot` — the one row a deploy / command / settings reply carries
 - `appendEvents` — the events newer than the last sequence held, appended to the tail; the oldest rows drop when it is full
 - `parsePad` — the newest `MAX_PAD` scratchpad entries, oldest first
-- `Form`, `deployBody` — the deploy form as the server's `POST /api/v1/tots` reads it
+- `Form`, `deployBody` — the deploy form as the server's `POST /api/v1/tots` reads it, the two boxes included (`local`, `garrett`)
 - `textBody` — `{"text": ...}` for a command or a scratchpad entry
 
 ## Dependencies
@@ -46,3 +46,9 @@ The Tater-tots tab (drawn in `main.zig`) shows the account's tater-tots against 
 Past-run cards put the name, goal and timestamp on separate lines. A selected run wraps its goal and deployment error above the controls; the activity log reserves a separate header for its error filter. **Remove run** asks for a second click, removes the saved entry and clears its selected console. The files stay in the run folder and can be restored to history by removing `.hidden` there.
 
 The Store selects a run, not just a name: `tot_sel` + `tot_sel_leaf` (+ `tot_sel_past`). The poller starts the console over (`tot_sel_gen`) when the selected name comes back as another run - deployed again after a delete - and keeps it when the same run goes from live to ended, reading the rest from the run's folder (`totRunEvents`). A failed deploy selects the failed run the server recorded.
+
+## Agent Garrett
+
+The deploy form's **Agent Garrett** checkbox is independent of **let it use THIS machine**. `Form.garrett` carries the opt-in; the deployed cloud runtime discovers the full typed security catalogue when available. The checkbox is enabled after security tools are deployed in **Settings → Models**. A running tot can change it with `/garrett on|off`.
+
+Chat uses the plain **Agent Garrett: on/off** label beside auto-loop, persisted as `settings.use_garrett`. Swarm deployment has its own checkbox. `GarrettSnap` supplies deployment and build status; the Settings button displays progress until the runtime reports readiness. Past-run card borders are drawn inside their clipping bounds. See [security tools](../guide/security-tools.md).

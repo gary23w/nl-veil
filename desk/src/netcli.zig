@@ -303,6 +303,26 @@ pub fn oauthCfTunnelSet(io: Io, gpa: std.mem.Allocator, port: u16, token: []cons
     return httpReq(io, gpa, "POST", port, "/api/v1/oauth/cloudflare/tunnel", token, body, 20);
 }
 
+/// GET /api/v1/tots/garrett — Agent Garrett as the server knows it (deployed, its address, the runtime's word).
+/// The Settings card and every "use Agent Garrett" box read the snapshot this fills.
+pub fn garrettStatus(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8) ?Resp {
+    log.trace("netcli.garrettStatus port={d}", .{port});
+    return httpReq(io, gpa, "GET", port, "/api/v1/tots/garrett", token, null, 20);
+}
+
+/// POST /api/v1/tots/garrett — deploy it into the user's Cloudflare account: the server reads the agent's modules
+/// from its repo and uploads them as a Worker (a handful of calls: up to a few minutes). The reply is the result.
+pub fn garrettDeploy(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8) ?Resp {
+    log.trace("netcli.garrettDeploy port={d}", .{port});
+    return httpReq(io, gpa, "POST", port, "/api/v1/tots/garrett", token, "{}", 240);
+}
+
+/// DELETE /api/v1/tots/garrett — remove it (its Worker, and the tots' pointers at it when they are there).
+pub fn garrettRemove(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8) ?Resp {
+    log.trace("netcli.garrettRemove port={d}", .{port});
+    return httpReq(io, gpa, "DELETE", port, "/api/v1/tots/garrett", token, null, 60);
+}
+
 /// GET /api/v1/models/builtin — the built-in engine snapshot (compiled?, weights, transfer progress)
 /// the Settings tab renders. Cheap authed GET beside the other polls.
 pub fn builtinStatus(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8) ?Resp {

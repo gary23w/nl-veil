@@ -69,3 +69,9 @@ Concurrency: three threads (UI/main, poller, chat), one shared Store behind a ti
 ---
 
 *Case file grounded in the module's `//!` header and public API.*
+
+## Security tools in v1.1.12
+
+All tab bodies use consistent content margins and reserve the actual scaled height of labels and form rows. Settings hides its scrollbar while retaining wheel and keyboard scrolling. Its security-tools action shows an animated preparation bar during upload and authenticated runtime build polling. Chat, swarm and tater-tot opt-ins remain separate.
+
+[Security deployment and use guide](../guide/security-tools.md).

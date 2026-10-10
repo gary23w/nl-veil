@@ -20,6 +20,8 @@ const http = @import("../../gateway/http.zig");
 const tools = @import("../tools.zig");
 const cf_oauth = @import("../../config/cf_oauth.zig"); // per-turn Cloudflare credentials for the cf_ tool family
 const cftools = @import("../cftools.zig"); // and the belt entries those tools are advertised by
+const cf_garrett = @import("../../config/cf_garrett.zig"); // the user's own Agent Garrett: where it answers, the derived bearer
+const garrett = @import("../garrett.zig"); // and the two verbs that put it on a turn's belt
 const recipes = @import("../recipes.zig"); // recipe tools: the per-turn granted set advertised in turn_tools + resolved onto ctx.grants
 const plugins = @import("../../plug/plugins.zig"); // user extensions: prompt/policy/tool hooks over the sandboxed Lua runtime
 const pixelrag = @import("../pixelrag.zig"); // browser-free image attachment ingest (OCR → pixel-RAG index)
@@ -726,7 +728,8 @@ fn buildTurnTools(gpa: std.mem.Allocator, ctx: *const tools.ToolCtx, compact: bo
     // A sandboxed caller is shown only the verbs its gate admits (CF_TOOLS_SANDBOXED — none, today).
     const cf_block: []const u8 = if (ctx.caps == .sandboxed) CF_TOOLS_SANDBOXED else cftools.SCHEMA;
     const cf_on = ctx.cf_token.len > 0 and ctx.cf_account.len > 0 and cf_block.len > 0;
-    if (ctx.grants.len == 0 and !cf_on) return base; // common case ⇒ the exact static string, zero allocation
+    const gar_on = garrett.on(ctx.garrett_url, ctx.garrett_token);
+    if (ctx.grants.len == 0 and !cf_on and !gar_on) return base; // common case ⇒ the exact static string, zero allocation
     var b: std.ArrayListUnmanaged(u8) = .empty;
     b.appendSlice(gpa, base) catch {
         b.deinit(gpa);
@@ -738,6 +741,16 @@ fn buildTurnTools(gpa: std.mem.Allocator, ctx: *const tools.ToolCtx, compact: bo
             return base;
         };
         b.appendSlice(gpa, cf_block) catch {
+            b.deinit(gpa);
+            return base;
+        };
+    }
+    if (gar_on) {
+        b.appendSlice(gpa, ",\n") catch {
+            b.deinit(gpa);
+            return base;
+        };
+        b.appendSlice(gpa, if (ctx.garrett_schema.len > 0) ctx.garrett_schema else garrett.SCHEMA) catch {
             b.deinit(gpa);
             return base;
         };
@@ -1663,6 +1676,86 @@ test "a turn holding Cloudflare credentials is shown only the cf_ verbs its own 
     }
 }
 
+test "installed security tools ride any turn holding the user’s credential pair" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    var counters = [_]u32{0} ** 5;
+    var fmtx: std.Io.Mutex = .init;
+    var ctx = tools.ToolCtx{
+        .gpa = gpa,
+        .io = io,
+        .environ = &env,
+        .run_dir = ".",
+        .workdir = ".",
+        .scope = "t",
+        .mind = "t",
+        .round = 0,
+        .mem = osc.Mem.init(gpa, io, "", ""),
+        .files_written = &counters[0],
+        .observed = &counters[1],
+        .skills_saved = &counters[2],
+        .directives_set = &counters[3],
+        .tools_made = &counters[4],
+        .fmtx = &fmtx,
+    };
+    // no pair (the default of every construction site): the static base, by pointer
+    for ([_]bool{ false, true }) |compact| {
+        var owned: ?[]u8 = null;
+        const got = buildTurnTools(gpa, &ctx, compact, &owned);
+        defer if (owned) |o| gpa.free(o);
+        try std.testing.expect(owned == null);
+        try std.testing.expect(std.mem.indexOf(u8, got, "\"name\":\"garrett\"") == null);
+    }
+    // the pair, on a full turn: both verbs appended, whole, after the base — and after the cf_ belt when both ride
+    ctx.garrett_url = "https://veil-garrett.acme.workers.dev/mcp";
+    ctx.garrett_token = "bearer";
+    for ([_]bool{ false, true }) |with_cf| {
+        ctx.cf_token = if (with_cf) "tok" else "";
+        ctx.cf_account = if (with_cf) "acct" else "";
+        var owned: ?[]u8 = null;
+        const got = buildTurnTools(gpa, &ctx, false, &owned);
+        defer if (owned) |o| gpa.free(o);
+        try std.testing.expect(owned != null);
+        try std.testing.expect(std.mem.startsWith(u8, got, TURN_TOOLS_FULL));
+        try std.testing.expect(std.mem.endsWith(u8, got, garrett.SCHEMA));
+        try std.testing.expect(std.mem.indexOf(u8, got, "\"name\":\"garrett_tools\"") != null);
+        const cf_at = std.mem.indexOf(u8, got, "\"name\":\"cf_api\"");
+        try std.testing.expect((cf_at != null) == with_cf);
+        if (cf_at) |at| try std.testing.expect(at < std.mem.indexOf(u8, got, "\"name\":\"garrett_tools\"").?);
+        // the whole array still parses: nothing torn at the seams
+        const arr = try std.fmt.allocPrint(gpa, "[{s}]", .{got});
+        defer gpa.free(arr);
+        const parsed = try std.json.parseFromSlice(std.json.Value, gpa, arr, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value == .array);
+    }
+    // a token with an address the bearer may not go to is no pair at all
+    ctx.cf_token = "";
+    ctx.cf_account = "";
+    ctx.garrett_url = "http://veil-garrett.acme.workers.dev/mcp";
+    {
+        var owned: ?[]u8 = null;
+        const got = buildTurnTools(gpa, &ctx, false, &owned);
+        defer if (owned) |o| gpa.free(o);
+        try std.testing.expect(owned == null);
+        try std.testing.expect(std.mem.indexOf(u8, got, "garrett") == null);
+    }
+    // a sandboxed turn is never shown them, pair or no pair
+    ctx.garrett_url = "https://veil-garrett.acme.workers.dev/mcp";
+    ctx.caps = .sandboxed;
+    {
+        var owned: ?[]u8 = null;
+        const got = buildTurnTools(gpa, &ctx, false, &owned);
+        defer if (owned) |o| gpa.free(o);
+        try std.testing.expect(owned != null);
+        try std.testing.expect(std.mem.indexOf(u8, got, "\"name\":\"garrett\"") != null);
+    }
+}
+
 test "a client-mode turn runs a tool whose credential only this server holds here, never on the client" {
     // Every verb the cf_ belt defines — read from the belt itself, so a seventh verb cannot slip back into
     // delegation — runs server-side with its file carried; the client executor holds no Cloudflare pair and
@@ -1678,6 +1771,9 @@ test "a client-mode turn runs a tool whose credential only this server holds her
     }
     try std.testing.expectEqual(@as(usize, 6), seen);
     try std.testing.expectEqual(ClientRoute.server, clientRoute("get_credential"));
+    // Agent Garrett's pair is this server's too: both verbs run here, and the client executor never sees the bearer
+    try std.testing.expectEqual(ClientRoute.server, clientRoute("garrett"));
+    try std.testing.expectEqual(ClientRoute.server, clientRoute("garrett_tools"));
     // ...and the tools that exist to act on the user's machine still go there
     for ([_][]const u8{ "write_file", "read_file", "list_dir", "run_python", "browser_navigate", "poll" }) |n|
         try std.testing.expectEqual(ClientRoute.client, clientRoute(n));
@@ -2512,7 +2608,7 @@ test "a paste is spilled by size AND shape: a long request stays a request, 300 
     try std.testing.expectEqual(@as(usize, 303), countLines(big.items));
 }
 
-pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text_raw: []const u8, loop: u8, tool_client_req: bool, image_b64: []const u8, fast: bool, trace_req: bool) void {
+pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text_raw: []const u8, loop: u8, tool_client_req: bool, image_b64: []const u8, fast: bool, trace_req: bool, garrett_req: bool) void {
     const gpa = app.gpa;
 
     // TOOL DELEGATION IS ADMIN-ONLY, and the check belongs HERE rather than at the delegation branch.
@@ -2753,6 +2849,18 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     }
     defer if (cf_tok.len > 0) gpa.free(cf_tok);
     defer if (cf_acct.len > 0) gpa.free(cf_acct);
+    var gar_url: []const u8 = "";
+    var gar_tok: []const u8 = "";
+    const gar_pair = if (garrett_req) cf_garrett.credsFor(app, uid, gpa) else null;
+    if (gar_pair) |g| {
+        gar_url = g.mcp_url;
+        gar_tok = g.token;
+    }
+    defer if (gar_url.len > 0) gpa.free(gar_url);
+    defer if (gar_tok.len > 0) gpa.free(gar_tok);
+
+    const gar_schema = garrett.discover(.{ .gpa = gpa, .io = app.io, .scratch = run_root, .url = gar_url, .token = gar_tok });
+    defer gpa.free(gar_schema);
 
     var counters = [_]u32{0} ** 5;
     // Lives for the whole turn: `ctx.cancel` borrows it, and a tool may consult it minutes from here.
@@ -2786,6 +2894,10 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
         .cf_token = cf_tok,
         .cf_account = cf_acct,
         .cf_api_root = app.cf_api_root,
+        // Agent Garrett's pair for this turn (blank ⇒ unadvertised and refused, like the cf_ family).
+        .garrett_url = gar_url,
+        .garrett_token = gar_tok,
+        .garrett_schema = gar_schema,
         .mem = blk_mem: {
             var m = osc.Mem.init(gpa, app.io, app.sup.neuron_bin, db);
             // TRUST-WEIGHTED RANKING: the trust feature is compiled in; without this flag every assoc runs
@@ -5972,12 +6084,15 @@ pub const TurnArgs = struct {
     /// False = the default = advanced.
     fast: bool,
     trace: bool,
+    /// AGENT GARRETT: the client asked for the user's own blue-team agent on the belt (see the Body field in
+    /// chat/service.zig). runTurn derives the pair itself; false = the default = no such verbs.
+    garrett: bool,
 };
 
 /// Detached-thread entry: run the whole turn, then free the owned args. Any failure inside runTurn is already
 /// caught + surfaced as an event, so this thread returns cleanly (never propagates an error that could abort it).
 fn turnThread(args: *TurnArgs) void {
-    runTurn(args.app, args.uid, args.conv, args.trio, args.text, args.loop, args.tool_client, args.image_b64, args.fast, args.trace);
+    runTurn(args.app, args.uid, args.conv, args.trio, args.text, args.loop, args.tool_client, args.image_b64, args.fast, args.trace, args.garrett);
     endTurn(args.app.io, args.conv); // release the per-conv turn lock (before freeing the blob `conv` points into)
     signalDone(args.app, args.uid, args.conv); // ...and only now is the turn genuinely over for the client
     if (llm.isLocal(args.trio.coding.base_url)) releaseLocal(args.app.io); // release the machine-sized local slot (admission keys on the coding/base model)
@@ -5991,7 +6106,7 @@ fn turnThread(args: *TurnArgs) void {
 /// block the client's /events poll for the whole turn). On an
 /// allocation or thread-spawn failure it runs the turn INLINE (blocking the caller) rather than drop it — the
 /// caller's arg slices are still valid at that point. The turn writes its frames to events.jsonl either way.
-pub fn spawnTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, text: []const u8, loop: u8, tool_client: bool, image_b64: []const u8, fast: bool, trace: bool) void {
+pub fn spawnTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, text: []const u8, loop: u8, tool_client: bool, image_b64: []const u8, fast: bool, trace: bool, garrett_req: bool) void {
     const gpa = app.gpa;
     const c = trio.coding;
     const t = trio.thinking;
@@ -6006,7 +6121,7 @@ pub fn spawnTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, text: [
     // must release it. The detached/inline turnThread paths release in turnThread; the two alloc-failure inline
     // paths run the turn directly, so they release explicitly. Local-slot release keys on the coding/base model.
     const args = gpa.create(TurnArgs) catch {
-        runTurn(app, uid, conv, trio, text, loop, tool_client, image_b64, fast, trace);
+        runTurn(app, uid, conv, trio, text, loop, tool_client, image_b64, fast, trace, garrett_req);
         endTurn(app.io, conv);
         signalDone(app, uid, conv);
         if (llm.isLocal(c.base_url)) releaseLocal(app.io);
@@ -6014,7 +6129,7 @@ pub fn spawnTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, text: [
     };
     const blob = gpa.alloc(u8, total) catch {
         gpa.destroy(args);
-        runTurn(app, uid, conv, trio, text, loop, tool_client, image_b64, fast, trace);
+        runTurn(app, uid, conv, trio, text, loop, tool_client, image_b64, fast, trace, garrett_req);
         endTurn(app.io, conv);
         signalDone(app, uid, conv);
         if (llm.isLocal(c.base_url)) releaseLocal(app.io);
@@ -6030,7 +6145,7 @@ pub fn spawnTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, text: [
         .thinking = .{ .base_url = dupInto(blob, &o, t.base_url), .key = dupInto(blob, &o, t.key), .model = dupInto(blob, &o, t.model) },
         .prompting = .{ .base_url = dupInto(blob, &o, p.base_url), .key = dupInto(blob, &o, p.key), .model = dupInto(blob, &o, p.model) },
     };
-    args.* = .{ .app = app, .uid = uid, .blob = blob, .conv = cv, .trio = owned, .text = tx, .loop = loop, .tool_client = tool_client, .image_b64 = ib, .fast = fast, .trace = trace };
+    args.* = .{ .app = app, .uid = uid, .blob = blob, .conv = cv, .trio = owned, .text = tx, .loop = loop, .tool_client = tool_client, .image_b64 = ib, .fast = fast, .trace = trace, .garrett = garrett_req };
     if (std.Thread.spawn(.{}, turnThread, .{args})) |th| {
         th.detach();
     } else |_| {
@@ -7550,7 +7665,7 @@ fn openSubchatTool(app: *App, uid: u64, conv: []const u8, conv_dir: []const u8, 
     // A sub-chat runs on the DEFAULTS, exactly as this call site already does for loop and tool_client:
     // it works unattended on a branch nobody is watching, which is precisely where advanced reasoning
     // earns its cost. The parent's fast-mode choice was about the parent's own latency.
-    spawnTurn(app, uid, bid, trio, goal, 0, false, "", false, false);
+    spawnTurn(app, uid, bid, trio, goal, 0, false, "", false, false, false);
     return std.fmt.allocPrint(gpa, "{{\"ok\":true,\"tool\":\"open_subchat\",\"sub\":\"s{d}\",\"conv\":\"{s}\",\"note\":\"sub-chat s{d} opened and its first turn is RUNNING server-side on that goal. It shares this chat's workspace and memory — its findings become recallable here (recall) as it works. Tell the user it opened as tab s{d}; check its progress later via recall or by switching to the tab.\"}}", .{ free_n, bid, free_n, free_n }) catch emptyRes();
 }
 
@@ -8942,6 +9057,7 @@ const ClientRoute = enum { client, server, cloudflare };
 
 fn clientRoute(name: []const u8) ClientRoute {
     if (std.mem.eql(u8, name, "get_credential")) return .server;
+    if (garrett.isTool(name)) return .server; // Agent Garrett's pair lives here too (runTurn derives it); no file of the user's is involved
     if (std.mem.startsWith(u8, name, "cf_")) return .cloudflare; // the whole prefix is the family's (tools.isBuiltinTool)
     return .client;
 }

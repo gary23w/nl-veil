@@ -105,7 +105,7 @@ pub const App = struct {
 /// has a zone for.
 /// A login that pre-dates them simply lacks them; config/cf_tunnel.zig turns the resulting refusal
 /// into "log in again to grant the tunnel permissions".
-pub const CF_OAUTH_SCOPES_DEFAULT = "ai.read ai.write workers-r2.read workers-r2.write user-details.read account-settings.read offline_access workers-scripts.read workers-scripts.write workers-scripts.bind page.read page.write d1.read d1.write workers-kv-storage.read workers-kv-storage.write queues.read queues.write vectorize.read vectorize.write workers-routes.read workers-routes.write workers-tail.read workers-observability.read argotunnel.read argotunnel.write dns.read dns.write zone.read zone-access.read zone-access.write access-org.read";
+pub const CF_OAUTH_SCOPES_DEFAULT = "containers.read containers.write ai.read ai.write workers-r2.read workers-r2.write user-details.read account-settings.read offline_access workers-scripts.read workers-scripts.write workers-scripts.bind page.read page.write d1.read d1.write workers-kv-storage.read workers-kv-storage.write queues.read queues.write vectorize.read vectorize.write workers-routes.read workers-routes.write workers-tail.read workers-observability.read argotunnel.read argotunnel.write dns.read dns.write zone.read zone-access.read zone-access.write access-org.read";
 
 pub fn metered(app: *App, u: User) bool {
     return app.production and app.ledger != null and !app.auth.isAdmin(u);

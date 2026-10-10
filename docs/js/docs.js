@@ -21,6 +21,7 @@
       { p: 'guide/plugins', c: 'GD-07', t: 'Writing a plugin — tools, policy + prompt hooks, MCP, the sandbox', s: 'plug/plugins.zig · plug/lua.zig' },
       { p: 'guide/desktop', c: 'GD-09', t: 'Desktop guide — settings, progress, streaming and code', s: 'desk/main.zig' },
       { p: 'guide/updates', c: 'GD-08', t: 'Desktop updates — releases, recovery and Cloudflare connectivity', s: 'updater.zig · cf_tunnel.zig' },
+      { p: 'guide/security-tools', c: 'GD-11', t: 'Security tools — full Agent Garrett catalogue, Cloudflare runtime and local harness', s: 'cf_tot.zig · worker/garrett.zig' },
       { p: 'guide/day-after', c: 'GD-10', t: 'The day after — arming tater-tots for an AI incident: the guard, the evidence chain, DEFEND, the leash, Agent Garrett', s: 'cloud/tot.js · cf_tot.zig' }
     ]},
     { key: 'admin/', label: 'ADMIN — SYSTEM MANAGEMENT', docs: [
@@ -49,7 +50,8 @@
       { p: 'config/server_config', c: 'CF-06', t: 'Admin runtime defaults — model trio + browser preference, JSON-persisted', s: 'server_config.zig' },
       { p: 'config/cf_r2', c: 'CF-07', t: 'R2 backup — incremental chat + memory mirror into a bucket the user owns', s: 'cf_r2.zig' },
       { p: 'config/cf_tunnel', c: 'CF-08', t: 'Cloudflare Tunnel — the public-URL switch: quick by default, named + Access on request', s: 'cf_tunnel.zig' },
-      { p: 'config/cf_tot', c: 'CF-09', t: 'Tater-tots — goal loops in the user\'s own Cloudflare account: upload, relay, the owner\'s-machine bridge', s: 'cf_tot.zig' }
+      { p: 'config/cf_tot', c: 'CF-09', t: 'Tater-tots — goal loops in the user\'s own Cloudflare account: upload, relay, the owner\'s-machine bridge', s: 'cf_tot.zig' },
+      { p: 'config/cf_garrett', c: 'CF-10', t: 'Agent Garrett — the user\'s deployment and derived MCP credentials', s: 'cf_garrett.zig' }
     ]},
     { key: 'plug/', label: 'PLUG — THE EXTENSION LAYER', docs: [
       { p: 'plug/plugins', c: 'PG-01', t: 'Plugin registry — Lua manifests, tool/policy/prompt hooks, swap-on-reload', s: 'plugins.zig' },
@@ -142,6 +144,7 @@
       { p: 'worker/ocr', c: 'WK-26', t: 'OCR — OS-native shims: vision as text', s: 'ocr.zig' },
       { p: 'worker/pixelrag', c: 'WK-27', t: 'Pixelrag — screenshot-tile ingest and retrieval', s: 'pixelrag.zig' },
       { p: 'worker/cftools', c: 'WK-28', t: 'Cftools — the cf_ belt: deploy a Worker, R2, D1, any v4 endpoint', s: 'cftools.zig' },
+      { p: 'worker/garrett', c: 'WK-34', t: 'Garrett — typed security tools, catalogue discovery, calls and runtime status', s: 'garrett.zig' },
       { p: 'worker/net', c: 'WK-29', t: 'Net — cached offline probe behind the hosted fast-fail', s: 'net.zig' },
       { p: 'worker/wsock', c: 'WK-30', t: 'Wsock — blocking Winsock round trip under httpc on Windows', s: 'wsock.zig' },
       { p: 'worker/dataset', c: 'WK-31', t: 'Dataset — every LLM call and tool run captured as a fine-tuning set', s: 'dataset.zig' },

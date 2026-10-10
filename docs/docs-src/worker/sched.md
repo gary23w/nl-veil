@@ -55,3 +55,9 @@ Driven from veil-desk's scheduled-tasks builder and from `veil sched list|add|ru
 ---
 
 *Case file grounded in the module's `//!` header and public API.*
+
+## Security tools in v1.1.12
+
+Unattended scheduled chat turns pass the security opt-in as false. They do not inherit the desktop chat toggle or receive Garrett credentials. Security-enabled continuous cloud work uses a tater-tot with its own explicit Agent Garrett opt-in.
+
+[Security deployment and use guide](../guide/security-tools.md).

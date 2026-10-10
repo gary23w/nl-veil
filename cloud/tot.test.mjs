@@ -431,7 +431,8 @@ test("one alarm is one iteration: pick, act with tools, a measured verdict, a lo
       assert.match(text, /write_file/);
       assert.doesNotMatch(text, /local_run/); // not granted
       assert.doesNotMatch(text, /- browser_open|- run_python/); // no binding, so not offered...
-      assert.match(text, /NOT AVAILABLE in this account right now: a browser \(browser_\*\), Python \(run_python, skills\), Agent Garrett's security tools/); // ...and said so
+      assert.match(text, /NOT AVAILABLE in this account right now: a browser \(browser_\*\), Python \(run_python, skills\)\. Work with/); // ...and said so
+      assert.doesNotMatch(text, /Agent Garrett/); // a tot that never asked for the agent is not told about it either way
       return 'I will save it.\n{"tool": "note_write", "args": {"name": "sources.md", "text": "a\\nb\\nc"}}';
     }
     if (n === 3) {
@@ -1830,77 +1831,42 @@ test("posture DEFEND freezes the runtime, names the tot in every request and swa
   }
 });
 
-test("Agent Garrett: its tools appear only with both secrets, a call goes over MCP under the bearer and comes back with its evidence, and a tot asks for the launch through the pad", async () => {
+test("Agent Garrett: per-feature opt-in preserves typed schemas and direct calls", async () => {
   const w = world();
-  await w.req("POST", "/v1/tots", { goal: "first goal here" });
-  const gary = w.tot("Gary");
-  const cfg = await gary.store.get("cfg");
-  const st0 = (await w.req("GET", "/v1/tots/Gary")).body.tot;
-  assert.equal(st0.garrett, false);
-  assert.match(await gary.runTool(cfg, "garrett", { name: "nvd_lookup", args: { cveId: "CVE-2026-1" } }, ""), /^ERROR: Agent Garrett is not launched/);
-  assert.equal((await w.req("GET", "/v1/garrett")).body.status, "none");
-  assert.match(await gary.runTool(cfg, "garrett_launch", {}, ""), /^asked: your human's veil launches Agent Garrett/);
-  let g = (await w.req("GET", "/v1/garrett")).body;
-  assert.equal(g.status, "pending");
-  assert.equal(g.asked_by, "Gary");
-  assert.equal(g.asked_at, w.now);
-  // the owner's veil reports a failure; a tot may ask again; then it reports success
-  await w.req("POST", "/v1/garrett/result", { err: "Cloudflare refused the upload" });
-  g = (await w.req("GET", "/v1/garrett")).body;
-  assert.equal(g.status, "failed");
-  assert.equal(g.error, "Cloudflare refused the upload");
-  await gary.runTool(cfg, "garrett_launch", {}, "");
+  await w.req("POST", "/v1/tots", {goal:"security test goal",garrett:true});
+  const tot = w.tot("Gary");
+  const cfg = await tot.store.get("cfg");
+  assert.equal(cfg.garrett, true);
+  assert.match(await tot.runTool(cfg, "garrett", {name:"ioc_extract",args:{}}, ""), /not launched/);
+  assert.match(await tot.runTool(cfg, "garrett_launch", {}, ""), /^asked:/);
   assert.equal((await w.req("GET", "/v1/garrett")).body.status, "pending");
-  await w.req("POST", "/v1/garrett/result", { url: "https://veil-garrett.acme.workers.dev/mcp" });
-  g = (await w.req("GET", "/v1/garrett")).body;
-  assert.equal(g.status, "deployed");
-  assert.equal(g.url, "https://veil-garrett.acme.workers.dev/mcp");
-  assert.equal((await w.req("POST", "/v1/garrett/bogus", {})).status, 405);
-
   w.env.GARRETT_MCP_URL = "https://veil-garrett.acme.workers.dev/mcp";
-  w.env.GARRETT_MCP_TOKEN = "garrett-bearer-token-24chars!";
+  w.env.GARRETT_MCP_TOKEN = "test-mcp-token-at-least-24-characters";
   const realFetch = globalThis.fetch;
   const calls = [];
-  globalThis.fetch = async (url, init) => {
-    calls.push({ url: String(url), init });
+  const schema = {type:"object",properties:{targets:{type:"array",items:{type:"string"}},options:{type:"object",properties:{enabled:{type:"boolean"},count:{type:"integer"}}}},required:["targets"]};
+  globalThis.fetch = async (url,init) => {
     const body = JSON.parse(init.body);
-    if (body.method === "tools/list") return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: { tools: [{ name: "nvd_lookup", description: "NVD CVE metadata lookup. Passive/read-only evidence lookup.", inputSchema: { type: "object", properties: { target: {}, cveId: {} } } }], ttlMs: 60000 } }));
-    if (body.params.name === "nvd_lookup") return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: { content: [{ type: "text", text: "CVE-2026-1: CVSS 9.8" }], structuredContent: { tool: "nvd_lookup", via: "builtin", target: "CVE-2026-1" }, isError: false } }));
-    if (body.params.name === "nmap_scan") return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: { content: [{ type: "text", text: "Active MCP tools are disabled." }], isError: true } }));
-    return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, error: { code: -32602, message: "Unknown tool argument: bogus" } }), { status: 400 });
+    calls.push({url,init,body});
+    return Response.json({jsonrpc:"2.0",id:1,result:body.method === "tools/list" ? {tools:[{name:"gary_probe",description:"test probe",inputSchema:schema}]} : {content:[{type:"text",text:"completed"}],isError:false}});
   };
   try {
-    const st = (await w.req("GET", "/v1/tots/Gary")).body.tot;
-    assert.equal(st.garrett, true);
-    assert.equal(st.tools, st0.tools + 1); // garrett + garrett_tools in, garrett_launch out
-    assert.equal(await gary.runTool(cfg, "garrett_launch", {}, ""), "Agent Garrett is already up; garrett_tools lists its tools");
-    const list = await gary.runTool(cfg, "garrett_tools", {}, "");
-    assert.match(list, /^- nvd_lookup: NVD CVE metadata lookup/);
-    assert.match(list, /reads the ones it needs from: target, cveId$/);
-    assert.deepEqual(JSON.parse(calls[0].init.body), { jsonrpc: "2.0", id: 1, method: "tools/list", params: {} });
-    const out = await gary.runTool(cfg, "garrett", { name: "NVD_lookup", args: { cveId: "CVE-2026-1" } }, "");
-    assert.equal(out, 'CVE-2026-1: CVSS 9.8\nEVIDENCE: {"tool":"nvd_lookup","via":"builtin","target":"CVE-2026-1"}');
-    const c = calls.at(-1);
-    assert.equal(c.url, "https://veil-garrett.acme.workers.dev/mcp");
-    assert.equal(c.init.method, "POST");
-    assert.equal(c.init.headers.authorization, "Bearer garrett-bearer-token-24chars!");
-    assert.equal(c.init.headers["user-agent"], TOT_UA);
-    assert.equal(c.init.headers["mcp-protocol-version"], undefined); // the stateless legacy form: no protocol header, no Mcp-* headers
-    assert.deepEqual(JSON.parse(c.init.body), { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "nvd_lookup", arguments: { cveId: "CVE-2026-1" } } });
-    assert.match(await gary.runTool(cfg, "garrett", { name: "nmap_scan", arguments: { target: "example.com" } }, ""), /^FAILED: Active MCP tools are disabled\./);
-    assert.match(await gary.runTool(cfg, "garrett", { name: "whois", args: { bogus: "1" } }, ""), /^ERROR: Agent Garrett: Unknown tool argument: bogus/);
-    assert.match(await gary.runTool(cfg, "garrett", { args: {} }, ""), /^ERROR: name one of Agent Garrett's tools/);
-    globalThis.fetch = async () => {
-      throw new Error("connect timeout");
-    };
-    assert.match(await gary.runTool(cfg, "garrett", { name: "nvd_lookup", args: {} }, ""), /^ERROR: Agent Garrett did not answer: connect timeout/);
-    w.env.GARRETT_MCP_URL = "https://10.0.0.9/mcp";
-    assert.match(await gary.runTool(cfg, "garrett", { name: "nvd_lookup", args: {} }, ""), /^ERROR: Agent Garrett's address is private/);
-    w.env.GARRETT_MCP_URL = "http://veil-garrett.acme.workers.dev/mcp"; // not https: as good as unset
-    assert.equal((await w.req("GET", "/v1/tots/Gary")).body.tot.garrett, false);
-  } finally {
-    globalThis.fetch = realFetch;
-    delete w.env.GARRETT_MCP_URL;
-    delete w.env.GARRETT_MCP_TOKEN;
-  }
+    const initial = (await w.req("GET", "/v1/tots/Gary")).body.tot;
+    assert.equal(initial.garrett, true);
+    await tot.discoverSecurityTools();
+    assert.equal(w.env.SECURITY_TOOLS[0].name, "security_gary_probe");
+    assert.deepEqual(JSON.parse(w.env.SECURITY_TOOLS[0].args), schema);
+    const args = {targets:["example.test"],options:{enabled:true,count:2}};
+    assert.equal(await tot.runTool(cfg,"security_gary_probe",args,""),"completed");
+    assert.deepEqual(calls.at(-1).body.params,{name:"gary_probe",arguments:args});
+    assert.equal(calls.at(-1).init.headers.authorization,"Bearer "+w.env.GARRETT_MCP_TOKEN);
+    const list = await tot.runTool(cfg,"garrett_tools",{},"");
+    assert.match(list,/inputSchema:/);
+    assert.match(list,/"type":"array"/);
+    await w.req("POST", "/v1/tots/Gary/config", {garrett:false});
+    assert.equal((await w.req("GET", "/v1/tots/Gary")).body.tot.garrett,false);
+    const before = calls.length;
+    assert.match(await tot.runTool(await tot.store.get("cfg"),"security_gary_probe",args,""), /not enabled/);
+    assert.equal(calls.length,before);
+  } finally { globalThis.fetch = realFetch; }
 });

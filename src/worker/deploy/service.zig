@@ -9,6 +9,7 @@ const ent = @import("../../plan/entitlements.zig");
 const neurons = @import("../../plan/neurons.zig");
 const crypto = @import("../../config/key_vault.zig");
 const cf_oauth = @import("../../config/cf_oauth.zig");
+const cf_garrett = @import("../../config/cf_garrett.zig"); // the user's own Agent Garrett: the pair a swarm that asked for it carries in keys.env
 const modelcfg = @import("modelcfg"); // a MODULE (src/worker/modelcfg.zig) — shared with the compiled-in desk
 const builtin_mod = @import("../builtin.zig"); // the built-in engine's sentinel + live-endpoint resolution
 const tail_fanout = @import("../control/fanout.zig");
@@ -47,6 +48,10 @@ const DeployReq = struct {
     gap_assess: bool = true,
     breakout: bool = false,
     observe_psyche: bool = false,
+    // AGENT GARRETT — put the user's own blue-team agent (config/cf_garrett.zig) on every mind's belt. The pair
+    // is derived at deploy and rides keys.env into the run dir; a deployment that asks for it with none deployed
+    // is refused in words rather than spawned without the verbs it was promised.
+    garrett: bool = false,
     // NEWS DESK — when true the swarm runs in discourse mode and composes a grounded, screened briefing each
     // round; `post` (default on) additionally publishes it to a public Telegraph page.
     publish: bool = false,
@@ -249,6 +254,8 @@ pub fn deploySwarm(app: *App, arena: std.mem.Allocator, u: http.User, body: Depl
     // caller may not.
     if (local_model and eff_base.len == 0) eff_base = "http://127.0.0.1:11434/v1";
 
+    const gar = if (body.garrett) cf_garrett.credsFor(app, u.id, arena) else null;
+
     // RE-CAST HYGIENE: a cast into a chat conversation dir REUSES the previous cast's run_dir
     // (`_chat/builds/{conv}`), so its lifecycle files are still on disk. A leftover STOP would stop the new
     // worker at its first boundary check, a leftover DONE would read the fresh spawn as already-finished,
@@ -265,8 +272,8 @@ pub fn deploySwarm(app: *App, arena: std.mem.Allocator, u: http.User, body: Depl
     const mani_path = std.fmt.allocPrint(arena, "{s}/swarm.json", .{run_dir}) catch return failSrv("out of memory");
     std.Io.Dir.cwd().writeFile(app.io, .{ .sub_path = mani_path, .data = mani_items }) catch return failSrv("could not write manifest");
 
-    if (eff_key.len > 0)
-        writeKeysEnv(app, arena, run_dir, eff_key, eff_base, body.encrypt and e.encrypted) catch return failSrv("could not prepare keys");
+    if (eff_key.len > 0 or gar != null)
+        writeKeysEnv(app, arena, run_dir, eff_key, eff_base, gar, body.encrypt and e.encrypted) catch return failSrv("could not prepare keys");
 
     const sw = app.sup.spawn(u.id, id, body.name, run_dir, eff_model, body.minds.len) catch return failSrv("could not spawn worker");
     return .{ .ok = .{ .id = sw.id, .state = @tagName(sw.state), .minds = sw.minds, .run_dir = run_dir } };
@@ -316,6 +323,8 @@ fn buildManifest(arena: std.mem.Allocator, body: DeployReq, eff_provider: []cons
     try mani.appendSlice(arena, if (body.gap_assess) ",\"gap_assess\":true" else ",\"gap_assess\":false");
     if (body.breakout) try mani.appendSlice(arena, ",\"breakout\":true");
     if (body.observe_psyche) try mani.appendSlice(arena, ",\"observe_psyche\":true");
+    // Agent Garrett on the minds' belt: the manifest says so; the pair itself is keys.env's, like the model key
+    if (body.garrett) try mani.appendSlice(arena, ",\"garrett\":true");
     // NEWS DESK dials — publish gates the discourse/briefing path; post gates the actual Telegraph egress
     // (default on, so "publish without post" is grounded-and-screened-to-disk only). Only emit when publishing.
     if (body.publish) {
@@ -351,7 +360,7 @@ fn buildManifest(arena: std.mem.Allocator, body: DeployReq, eff_provider: []cons
 
 /// Write keys.env (or keys.env.enc when encrypted) for the worker. Only a SEAL failure is fatal (returns an
 /// error the caller maps to a failure); a plaintext write error is best-effort silent.
-fn writeKeysEnv(app: *App, arena: std.mem.Allocator, run_dir: []const u8, eff_key: []const u8, eff_base: []const u8, encrypted: bool) !void {
+fn writeKeysEnv(app: *App, arena: std.mem.Allocator, run_dir: []const u8, eff_key: []const u8, eff_base: []const u8, gar: ?cf_garrett.Creds, encrypted: bool) !void {
     var kbuf: std.ArrayListUnmanaged(u8) = .empty;
     try kbuf.appendSlice(arena, "NL_LLM_KEY=");
     try kbuf.appendSlice(arena, eff_key);
@@ -359,6 +368,14 @@ fn writeKeysEnv(app: *App, arena: std.mem.Allocator, run_dir: []const u8, eff_ke
     if (eff_base.len > 0) {
         try kbuf.appendSlice(arena, "NL_LLM_BASE_URL=");
         try kbuf.appendSlice(arena, eff_base);
+        try kbuf.append(arena, '\n');
+    }
+    // Agent Garrett's pair, when the swarm asked for it: read back by run.zig the way the model key is
+    if (gar) |g| {
+        try kbuf.appendSlice(arena, "GARRETT_MCP_URL=");
+        try kbuf.appendSlice(arena, g.mcp_url);
+        try kbuf.appendSlice(arena, "\nGARRETT_MCP_TOKEN=");
+        try kbuf.appendSlice(arena, g.token);
         try kbuf.append(arena, '\n');
     }
     if (encrypted) {
@@ -1354,4 +1371,19 @@ test "a re-cast refused over its model or credentials keeps the previous run fin
     defer gpa.free(rotated);
     try std.testing.expectEqualStrings(EVENTS, rotated);
     try std.testing.expectEqual(@as(usize, 0), ta.app.sup.activeSwarmsForUser(u.id));
+}
+
+test "a swarm that asked for Agent Garrett says so in its manifest; one that did not carries nothing of it, and the pair never rides the manifest" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var minds = [_]MindSpec{.{ .name = "nova", .lead = true }};
+    const with = try buildManifest(a, .{ .name = "s", .goal = "g", .garrett = true, .minds = &minds }, "mock", "/w", "", "mock", false);
+    try std.testing.expect(std.mem.indexOf(u8, with, ",\"garrett\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, with, "GARRETT") == null); // the pair is keys.env's, like the model key
+    const without = try buildManifest(a, .{ .name = "s", .goal = "g", .minds = &minds }, "mock", "/w", "", "mock", false);
+    try std.testing.expect(std.mem.indexOf(u8, without, "garrett") == null);
+    // an old client that never heard of the field deploys exactly as before
+    const parsed = try std.json.parseFromSlice(DeployReq, a, "{\"name\":\"s\",\"minds\":[{\"name\":\"nova\"}]}", .{ .ignore_unknown_fields = true });
+    try std.testing.expect(!parsed.value.garrett);
 }

@@ -36,17 +36,21 @@
 //!   POST   /api/v1/tots/keys             give the tots a key ({"name":"brave","value":"..."}); "" removes it. Names:
 //!                                        brave, google, google_cx (search), alert (the guard's webhook, https),
 //!                                        garrett_url + garrett_token (an Agent Garrett the owner deployed by hand)
-//!   GET    /api/v1/tots/garrett          Agent Garrett: launched or not, its address, what the runtime says
+//!   GET    /api/v1/tots/garrett          Agent Garrett: deployed or not, its address, what the runtime says
 //!                                        (?reveal=1 adds the password locking its chat UI)
-//!   POST   /api/v1/tots/garrett          launch it now;  DELETE removes it
+//!   POST   /api/v1/tots/garrett          deploy it now;  DELETE removes it
 //!
-//! AGENT GARRETT (github.com/gary23w/garrettstimpson.ca/agent): a second Worker, `veil-garrett`, the tots reach over
-//! MCP for blue-team lookups (CVE/KEV/EPSS intel, DNS and certificate transparency, RDAP, email security posture,
-//! IOC extraction, evidence manifests...). launchGarrett reads its five modules from the repo and uploads them
-//! through the same login, with derived secrets (its MCP bearer; a password locking the chat UI nobody asked for;
-//! its policy vars pin safe mode and no active or dark-web tools over MCP), enables its address, and points the tots
-//! at it with two secrets on their Worker. A tot asks for it with garrett_launch (the runtime's /v1/garrett then
-//! says `pending`, and syncGarrett launches on the next mirror pass); the owner asks with POST /api/v1/tots/garrett.
+//! AGENT GARRETT (github.com/gary23w/garrettstimpson.ca/agent): a Worker of its own, `veil-garrett`, with ninety-odd
+//! blue-team tools behind a stateless MCP endpoint (CVE/KEV/EPSS intel, DNS and certificate transparency, RDAP,
+//! email security posture, IOC extraction, evidence manifests...). It is the user's ACCOUNT-LEVEL deployment, not
+//! the tots': the desk's Settings button (Deploy Agent Garrett), `veil --tater garrett launch` or a tot's own
+//! garrett_launch puts it there, with or without a tot in the account. launchGarrett reads its wrangler.toml and
+//! every module under its src/ from the repo, LIVE, and uploads them through the same login, with derived secrets (its MCP bearer; a password locking the
+//! chat UI nobody asked for; its policy vars pin safe mode and no active or dark-web tools over MCP), enables its
+//! address, and - when the tots' Worker is in the account - points it at the agent with two secrets (a runtime
+//! uploaded later is pointed at it by ensureRuntime). WHO USES IT is opt-in, per thing: a chat turn that asked
+//! (`garrett` in the message body), a swarm deployed with `garrett`, a tot deployed or configured with `garrett`;
+//! config/cf_garrett.zig derives the pair for all of them. Removing the tots keeps it; DELETE removes it.
 //!
 //! THE LOCAL FOLDER: every deployment of a tot is mirrored into {data}/u<uid>/_tots/<name>-<deployed>/ (events.log
 //! to tail, events.jsonl, status.json, notes/), with the shared scratchpad at _tots/scratchpad.md. See mirrorTot.
@@ -58,6 +62,8 @@ const builtin = @import("builtin");
 const httpz = @import("httpz");
 const http = @import("../gateway/http.zig");
 const cf_oauth = @import("cf_oauth.zig");
+const security_runtime = @import("../worker/garrett.zig");
+const cf_garrett = @import("cf_garrett.zig"); // Agent Garrett's derived pair and labels, as every reader of it sees them
 const chat_engine = @import("../worker/chat/engine.zig");
 const bu = @import("../worker/browser/util.zig"); // sleepMs: a raw-thread sleep, no Io park
 const modelcfg = @import("modelcfg");
@@ -83,19 +89,29 @@ pub const PRIMARY = "Gary";
 const MODULE = "tot.js";
 const COMPAT_DATE = "2025-09-01";
 const MIGRATION_TAG = "v1";
-const STATE_FILE = "cf_tots.json";
+const STATE_FILE = cf_garrett.STATE_FILE; // cf_garrett reads the Agent Garrett fields of the same file
 const NAME_MAX = 24;
 
 /// How often the bridge asks each approved tot for jobs.
 const BRIDGE_EVERY_MS: u64 = 20_000;
 
 // Agent Garrett: the script name beside the tots', where its modules come from, and what its upload asks for.
-pub const GARRETT_SCRIPT = "veil-garrett";
-const GARRETT_SRC = "https://raw.githubusercontent.com/gary23w/garrettstimpson.ca/main/agent/src/";
-const GARRETT_FILES = [_][]const u8{ "index.js", "mcp.mjs", "harness.mjs", "neuron-db.mjs", "neuron_core.wasm" };
-const GARRETT_COMPAT_DATE = "2026-09-03"; // agent/wrangler.toml
-const GARRETT_MIGRATION_TAG = "security-limiters-v1";
-const GARRETT_FILE_MAX: usize = 1 << 20; // index.js is ~430 KB; a module past curl's 1 MiB answer is refused
+pub const GARRETT_SCRIPT = cf_garrett.SCRIPT;
+// Agent Garrett comes from its repo, LIVE, at every launch: its Worker config (agent/wrangler.toml) and every module
+// under its main module's directory, as the repo has them then. Nothing about its layout is pinned here (a pinned
+// list of five modules once left a sixth import unresolved, and Cloudflare refused the upload), so the agent's own
+// changes land at the next launch. The listing is GitHub's contents API (unauthenticated: 60 calls an hour, a
+// launch uses one per directory); the files come from raw.githubusercontent.com.
+const GARRETT_REPO = "gary23w/garrettstimpson.ca";
+const GARRETT_DIR = "agent"; // the agent's folder in the repo: its wrangler.toml, its src/
+const GARRETT_RAW = "https://raw.githubusercontent.com/" ++ GARRETT_REPO ++ "/main/" ++ GARRETT_DIR ++ "/";
+const GARRETT_LIST = "https://api.github.com/repos/" ++ GARRETT_REPO ++ "/contents/" ++ GARRETT_DIR ++ "/";
+const GARRETT_TOML = "wrangler.toml";
+const GARRETT_COMPAT_DATE = "2026-09-03"; // when the toml names none (it does)
+const GARRETT_MIGRATION_TAG = "veil-garrett-v1"; // when the toml names none (it does: its own tag is used)
+const GARRETT_FILE_MAX: usize = 8 << 20; // one module (index.js is ~430 KB, the engine ~350 KB)
+const GARRETT_FILES_MAX = 64; // modules a launch carries; a directory past that is not the agent
+const GARRETT_UA = "nl-veil (+https://github.com/gary23w/nl-veil)"; // what the reads say they are
 
 // ---------------------------------------------------------------------------------- per-user state file
 
@@ -123,6 +139,8 @@ const State = struct {
     garrett_url: []const u8 = "", // https://veil-garrett.<subdomain>.workers.dev once Agent Garrett is launched
     garrett_hash: []const u8 = "", // the modules it was launched from (garrettHash)
     garrett_at: i64 = 0,
+    garrett_account: []const u8 = "", // the account it was launched into (empty for a launch from before this field: the tots' account)
+    garrett_gen: u32 = 0, // the generation its secrets were derived under (likewise: the tots' token_gen then)
 };
 
 /// How many tots this account may run.
@@ -174,18 +192,9 @@ fn totToken(app: *App, uid: u64, account: []const u8, gen: u32, out: *[64]u8) []
     return tokenWith(app, "veil-tot-token", uid, account, gen, out);
 }
 
-fn tokenWith(app: *App, label: []const u8, uid: u64, account: []const u8, gen: u32, out: *[64]u8) []const u8 {
-    const Hmac = std.crypto.auth.hmac.sha2.HmacSha256;
-    var h = Hmac.init(&app.server_key);
-    var nb: [48]u8 = undefined;
-    h.update(label);
-    h.update(std.fmt.bufPrint(&nb, "\x00u{d}\x00g{d}\x00", .{ uid, gen }) catch "");
-    h.update(account);
-    var mac: [Hmac.mac_length]u8 = undefined;
-    h.final(&mac);
-    out.* = std.fmt.bytesToHex(mac, .lower);
-    return out;
-}
+/// One derivation for every secret the veil puts in the account (cf_garrett.zig holds it: Agent Garrett's readers
+/// derive its bearer the same way without importing this launcher).
+const tokenWith = cf_garrett.tokenWith;
 
 /// Which tot.js this binary carries, as 16 hex characters.
 fn scriptHash(out: *[16]u8) []const u8 {
@@ -241,7 +250,7 @@ fn explain(a: std.mem.Allocator, what: []const u8, msg: []const u8) []const u8 {
     const perm = std.mem.indexOf(u8, msg, "Authentication error") != null or std.mem.indexOf(u8, msg, "insufficient") != null or
         std.mem.indexOf(u8, msg, "not authorized") != null or std.mem.indexOf(u8, msg, "permission") != null;
     if (perm)
-        return std.fmt.allocPrint(a, "{s}: your Cloudflare login has not granted the Workers permission - Disconnect and log in with Cloudflare again to grant it", .{what}) catch what;
+        return std.fmt.allocPrint(a, "{s}: your Cloudflare login has not granted the required permission - Disconnect and log in with Cloudflare again to grant it", .{what}) catch what;
     return std.fmt.allocPrint(a, "{s}: {s}", .{ what, msg }) catch what;
 }
 
@@ -476,6 +485,11 @@ fn ensureRuntime(app: *App, a: std.mem.Allocator, uid: u64, tok: Tok, st: *State
     st.script_hash = a.dupe(u8, want) catch return "out of memory";
     st.deployed_at = nowS(app.io);
     st.last_error = "";
+    // An Agent Garrett already in this account: the new runtime is pointed at it (its two secrets). Best effort:
+    // the runtime is up either way, and a tot that asks for the agent is told in its words when it is not there.
+    if (st.garrett_url.len > 0 and std.mem.eql(u8, garrettAccount(st.*), acct)) {
+        if (pointTotsAtGarrett(app, a, uid, tok, st.*)) |m| log.warn("the new tot runtime could not be pointed at Agent Garrett for u{d}: {s}", .{ uid, m });
+    }
     uploaded.* = true;
     log.info("tot runtime uploaded for u{d}: {s} ({s})", .{ uid, st.url, want });
     return null;
@@ -607,7 +621,9 @@ pub fn listTots(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         if (i > 0) try out.append(app.gpa, ',');
         try http.jstr(app.gpa, &out, n);
     }
-    try out.print(app.gpa, "],\"python\":{},\"browser\":{},\"neuron\":{},\"tools_note\":", .{ st.python, st.browser, st.neuron });
+    try out.print(app.gpa, "],\"python\":{},\"browser\":{},\"neuron\":{},\"garrett\":{},\"garrett_url\":", .{ st.python, st.browser, st.neuron, st.garrett_url.len > 0 });
+    try http.jstr(app.gpa, &out, st.garrett_url);
+    try out.appendSlice(app.gpa, ",\"tools_note\":");
     try http.jstr(app.gpa, &out, st.tools_note);
     try out.appendSlice(app.gpa, ",\"last_error\":");
     if (readLegacy(app, u.id, a)) |old| {
@@ -635,6 +651,7 @@ const CreateReq = struct {
     local: bool = false, // the owner's-machine checkbox: only ever granted here, at deployment
     posture: ?[]const u8 = null, // "defend" deploys it as a defender (the runtime's DEFEND posture)
     leash_s: ?i64 = null,
+    garrett: bool = false, // Agent Garrett's tools on its belt: the account's deployment must exist (Settings); the runtime keeps it as a setting
 };
 
 /// POST /api/v1/tots — deploy a tot. Uploads the runtime first when the account lacks it or runs an older one.
@@ -690,6 +707,7 @@ fn deploy(app: *App, a: std.mem.Allocator, uid: u64, tok: Tok, body: CreateReq) 
         return .{ .err = std.fmt.allocPrint(a, "on {s} a goal or a charter holds at most {d} characters - shorten it, or pick a model with a bigger window", .{ model, limit }) catch "goal too long for this model" };
 
     var st = readState(app, uid, a);
+    if (body.garrett and st.garrett_url.len == 0) return .{ .err = "Agent Garrett is not deployed in this account - Settings > Deploy Agent Garrett first (or untick 'use Agent Garrett')" };
     var uploaded = false;
     if (ensureRuntime(app, a, uid, tok, &st, &uploaded)) |msg| {
         st.last_error = msg;
@@ -811,13 +829,21 @@ fn removeScript(app: *App, a: std.mem.Allocator, uid: u64, tok: Tok, st: *State)
     // Its Python Worker goes after it (the runtime was bound to it). Best effort: it holds nothing.
     const py_url = std.fmt.allocPrint(a, "{s}/accounts/{s}/workers/scripts/" ++ PY_SCRIPT ++ "?force=true", .{ app.cf_api_root, acct }) catch return "out of memory";
     _ = api(app, a, "DELETE", py_url, "", tok.key, "");
-    // Agent Garrett was launched for the tots: it goes with them. Best effort too.
-    if (st.garrett_url.len > 0) {
-        const g_url = std.fmt.allocPrint(a, "{s}/accounts/{s}/workers/scripts/" ++ GARRETT_SCRIPT ++ "?force=true", .{ app.cf_api_root, acct }) catch return "out of memory";
-        _ = api(app, a, "DELETE", g_url, "", tok.key, "");
-    }
-    // A new generation: a later deployment gets a token the removed script never held.
-    st.* = .{ .token_gen = st.token_gen +% 1 };
+    // A new generation: a later deployment gets a token the removed script never held. Agent Garrett is the
+    // account's, not the tots' (Settings deploys it on its own; DELETE /api/v1/tots/garrett removes it): it stays,
+    // with the account and generation its secrets were derived under pinned, so the bump cannot move them.
+    // (built in a local first: a literal assigned straight into `st.*` may write its defaults before every field
+    // on its right-hand side has been read from the old value - Zig's result-location aliasing)
+    const keep_garrett = st.garrett_url.len > 0;
+    const next: State = .{
+        .token_gen = st.token_gen +% 1,
+        .garrett_url = st.garrett_url,
+        .garrett_hash = st.garrett_hash,
+        .garrett_at = st.garrett_at,
+        .garrett_account = if (keep_garrett) garrettAccount(st.*) else "",
+        .garrett_gen = if (keep_garrett) garrettGen(st.*) else 0,
+    };
+    st.* = next;
     writeState(app, uid, st.*);
     log.info("tot runtime removed from the Cloudflare account of u{d}", .{uid});
     return null;
@@ -886,6 +912,7 @@ const ConfigReq = struct {
     paused: ?bool = null,
     posture: ?[]const u8 = null, // "normal" | "defend"
     leash_s: ?i64 = null, // 0 = no leash; else 60 .. 604800, the runtime's floor and ceiling
+    garrett: ?bool = null, // Agent Garrett's tools on its belt (the account's deployment must exist for them to answer)
 };
 
 /// POST /api/v1/tots/:name/config — change a tot's settings. There is no `local` here: the owner's machine is
@@ -900,6 +927,7 @@ pub fn totConfig(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     var arena = std.heap.ArenaAllocator.init(app.gpa);
     defer arena.deinit();
     const a = arena.allocator();
+    if (body.garrett == true and readState(app, u.id, a).garrett_url.len == 0) return badReq(res, "Agent Garrett is not deployed in this account - Settings > Deploy Agent Garrett first");
     const path = try std.fmt.allocPrint(a, "/v1/tots/{s}/config", .{name});
     var json = std.json.Stringify.valueAlloc(a, body, .{ .emit_null_optional_fields = false }) catch return http.serverErr(res, "out of memory");
     // a new model brings its own text limit
@@ -1034,18 +1062,212 @@ pub fn setKey(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
 /// When the last launch was refused: a refused launch is not tried again for a quarter of an hour.
 var garrett_failed_s: std.atomic.Value(i64) = .init(0);
 
-/// Where Agent Garrett's modules are read from: the repo, or - while the Cloudflare API is a loopback stand-in -
-/// the stand-in, under /garrett/src/ (the tests serve them there).
-fn garrettSrc(app: *App, a: std.mem.Allocator, file: []const u8) ?[]const u8 {
+/// The port of a loopback stand-in the Cloudflare API is pointed at (NL_CF_API_ROOT, the tests), or null for the
+/// real API. While there is one, it plays the agent's repo too.
+fn loopbackPort(app: *App) ?[]const u8 {
     const root = app.cf_api_root;
     inline for (.{ "http://127.0.0.1:", "http://localhost:" }) |loop| {
         if (std.mem.startsWith(u8, root, loop)) {
             const rest = root[loop.len..];
-            const port = rest[0 .. std.mem.indexOfScalar(u8, rest, '/') orelse rest.len];
-            return std.fmt.allocPrint(a, "http://127.0.0.1:{s}/garrett/src/{s}", .{ port, file }) catch null;
+            return rest[0 .. std.mem.indexOfScalar(u8, rest, '/') orelse rest.len];
         }
     }
-    return std.fmt.allocPrint(a, GARRETT_SRC ++ "{s}", .{file}) catch null;
+    return null;
+}
+
+/// Where one file of Agent Garrett's folder is read from (`rel`: "wrangler.toml", "src/index.js"): the repo, or -
+/// while the Cloudflare API is a loopback stand-in - the stand-in, under /garrett/ (the tests serve it there).
+fn garrettUrl(app: *App, a: std.mem.Allocator, rel: []const u8) ?[]const u8 {
+    if (loopbackPort(app)) |port| return std.fmt.allocPrint(a, "http://127.0.0.1:{s}/garrett/{s}", .{ port, rel }) catch null;
+    return std.fmt.allocPrint(a, GARRETT_RAW ++ "{s}", .{rel}) catch null;
+}
+
+/// The listing of one directory of the agent's folder: GitHub's contents API, or the stand-in's /garrett/contents/.
+fn garrettListUrl(app: *App, a: std.mem.Allocator, dir: []const u8) ?[]const u8 {
+    if (loopbackPort(app)) |port| return std.fmt.allocPrint(a, "http://127.0.0.1:{s}/garrett/contents/{s}", .{ port, dir }) catch null;
+    return std.fmt.allocPrint(a, GARRETT_LIST ++ "{s}?ref=main", .{dir}) catch null;
+}
+
+/// One read from the repo (or the stand-in): no bearer, a module-sized answer, the veil named as the client (GitHub
+/// wants a user agent). The reply is copied into `a`; null when nothing came back or it was past GARRETT_FILE_MAX.
+fn garrettFetch(app: *App, a: std.mem.Allocator, url: []const u8) ?[]u8 {
+    const raw = cf_oauth.curl(.{ .gpa = app.gpa, .io = app.io, .scratch = app.data, .body_prefix = ".cfgarrett-body-", .max_time_s = 60, .stdout_limit = GARRETT_FILE_MAX + 1, .extra = &.{ "-A", GARRETT_UA, "-H", "Accept: application/vnd.github+json" } }, "GET", url, "", "", "") orelse return null;
+    defer app.gpa.free(raw);
+    if (raw.len > GARRETT_FILE_MAX) return null;
+    return a.dupe(u8, raw) catch null;
+}
+
+/// One module of the upload: its name (the path under the main module's directory, as the Worker imports it), its
+/// bytes, and the Content-Type that tells Cloudflare what it is.
+const GarrettModule = struct { name: []const u8, data: []const u8, ctype: []const u8 };
+
+const GarrettCfg = struct {
+    main: []const u8 = "src/index.js",
+    compat_date: []const u8 = GARRETT_COMPAT_DATE,
+    flags: []const []const u8 = &.{},
+    ai: []const u8 = "", // the AI binding's name; "" = none
+    vars: []const Var = &.{},
+    dos: []const Do = &.{},
+    tag: []const u8 = GARRETT_MIGRATION_TAG, // the last migration's tag
+    sqlite_classes: []const []const u8 = &.{},
+    classes: []const []const u8 = &.{},
+
+    const Var = struct { name: []const u8, text: []const u8 };
+    const Do = struct { name: []const u8 = "", class: []const u8 = "" };
+
+    /// The directory of the main module, which every module's name is relative to ("src" for "src/index.js").
+    fn mainDir(c: GarrettCfg) []const u8 {
+        const i = std.mem.lastIndexOfScalar(u8, c.main, '/') orelse return "";
+        return c.main[0..i];
+    }
+    /// The main module as Cloudflare names it: relative to that directory ("index.js").
+    fn mainModule(c: GarrettCfg) []const u8 {
+        const i = std.mem.lastIndexOfScalar(u8, c.main, '/') orelse return c.main;
+        return c.main[i + 1 ..];
+    }
+};
+
+/// A TOML scalar as this file uses them: a quoted string's inside, else the bare value up to a comment.
+fn tomlStr(v: []const u8) []const u8 {
+    const t = std.mem.trim(u8, v, " \t");
+    if (t.len >= 2 and (t[0] == '"' or t[0] == '\'')) {
+        if (std.mem.indexOfScalarPos(u8, t, 1, t[0])) |end| return t[1..end];
+    }
+    return std.mem.trim(u8, std.mem.sliceTo(t, '#'), " \t");
+}
+
+/// A TOML array of strings on one line (`["a", "b"]`), appended to `out`.
+fn tomlList(a: std.mem.Allocator, out: *std.ArrayListUnmanaged([]const u8), v: []const u8) void {
+    const open = std.mem.indexOfScalar(u8, v, '[') orelse return;
+    const close = std.mem.lastIndexOfScalar(u8, v, ']') orelse return;
+    if (close <= open) return;
+    var it = std.mem.splitScalar(u8, v[open + 1 .. close], ',');
+    while (it.next()) |p| {
+        const s = tomlStr(p);
+        if (s.len > 0) out.append(a, s) catch {};
+    }
+}
+
+/// wrangler.toml -> GarrettCfg. Every slice points into `src` or lives in `a`.
+fn parseGarrettToml(a: std.mem.Allocator, src: []const u8) GarrettCfg {
+    var cfg: GarrettCfg = .{};
+    var flags: std.ArrayListUnmanaged([]const u8) = .empty;
+    var vars: std.ArrayListUnmanaged(GarrettCfg.Var) = .empty;
+    var dos: std.ArrayListUnmanaged(GarrettCfg.Do) = .empty;
+    var sqlite: std.ArrayListUnmanaged([]const u8) = .empty;
+    var classes: std.ArrayListUnmanaged([]const u8) = .empty;
+    var table: []const u8 = "";
+    var it = std.mem.splitScalar(u8, src, '\n');
+    while (it.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0 or line[0] == '#') continue;
+        if (line[0] == '[') {
+            table = std.mem.trim(u8, line, "[] \t");
+            if (std.mem.eql(u8, table, "durable_objects.bindings")) dos.append(a, .{}) catch {};
+            continue;
+        }
+        const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        const key = std.mem.trim(u8, line[0..eq], " \t");
+        const val = line[eq + 1 ..];
+        if (table.len == 0) {
+            if (std.mem.eql(u8, key, "main")) cfg.main = tomlStr(val) else if (std.mem.eql(u8, key, "compatibility_date")) cfg.compat_date = tomlStr(val) else if (std.mem.eql(u8, key, "compatibility_flags")) tomlList(a, &flags, val);
+        } else if (std.mem.eql(u8, table, "ai")) {
+            if (std.mem.eql(u8, key, "binding")) cfg.ai = tomlStr(val);
+        } else if (std.mem.eql(u8, table, "vars")) {
+            vars.append(a, .{ .name = key, .text = tomlStr(val) }) catch {};
+        } else if (std.mem.eql(u8, table, "durable_objects.bindings")) {
+            if (dos.items.len == 0) continue;
+            const d = &dos.items[dos.items.len - 1];
+            if (std.mem.eql(u8, key, "name")) d.name = tomlStr(val) else if (std.mem.eql(u8, key, "class_name")) d.class = tomlStr(val);
+        } else if (std.mem.eql(u8, table, "migrations")) {
+            if (std.mem.eql(u8, key, "tag")) cfg.tag = tomlStr(val) else if (std.mem.eql(u8, key, "new_sqlite_classes")) tomlList(a, &sqlite, val) else if (std.mem.eql(u8, key, "new_classes")) tomlList(a, &classes, val);
+        }
+    }
+    if (cfg.main.len == 0) cfg.main = "src/index.js";
+    if (cfg.compat_date.len == 0) cfg.compat_date = GARRETT_COMPAT_DATE;
+    if (cfg.tag.len == 0) cfg.tag = GARRETT_MIGRATION_TAG;
+    cfg.flags = flags.items;
+    cfg.vars = vars.items;
+    cfg.dos = dos.items;
+    cfg.sqlite_classes = sqlite.items;
+    cfg.classes = classes.items;
+    return cfg;
+}
+
+/// What a module is to Cloudflare, by its name: an ES module, CommonJS, WebAssembly, Python, text, or bytes.
+fn moduleType(name: []const u8) []const u8 {
+    const base = name[(std.mem.lastIndexOfScalar(u8, name, '/') orelse 0)..];
+    const ext = if (std.mem.lastIndexOfScalar(u8, base, '.')) |i| base[i..] else "";
+    const eq = std.mem.eql;
+    if (eq(u8, ext, ".js") or eq(u8, ext, ".mjs")) return "application/javascript+module";
+    if (eq(u8, ext, ".cjs")) return "application/javascript";
+    if (eq(u8, ext, ".wasm")) return "application/wasm";
+    if (eq(u8, ext, ".py")) return "text/x-python";
+    if (eq(u8, ext, ".txt") or eq(u8, ext, ".html") or eq(u8, ext, ".md") or eq(u8, ext, ".json") or eq(u8, ext, ".css") or eq(u8, ext, ".svg")) return "text/plain";
+    return "application/octet-stream";
+}
+
+/// Whether what came back is the module and not an error page: WebAssembly by its magic, a script by not being
+/// HTML or GitHub's "404: Not Found", anything else by not being that 404.
+fn looksLikeModule(ctype: []const u8, data: []const u8) bool {
+    if (data.len == 0 or std.mem.startsWith(u8, data, "404: Not Found")) return false;
+    if (std.mem.eql(u8, ctype, "application/wasm")) return std.mem.startsWith(u8, data, "\x00asm");
+    if (std.mem.eql(u8, ctype, "application/javascript+module") or std.mem.eql(u8, ctype, "application/javascript")) {
+        const head = data[0..@min(data.len, 256)];
+        return std.mem.indexOf(u8, head, "<!DOCTYPE") == null and std.mem.indexOf(u8, head, "<html") == null;
+    }
+    return true;
+}
+
+/// The first line of a reply, for an error message.
+fn oneLine(s: []const u8, n: usize) []const u8 {
+    return std.mem.trim(u8, std.mem.sliceTo(s[0..@min(s.len, n)], '\n'), " \r\t");
+}
+
+const GarrettEntry = struct { name: []const u8 = "", type: []const u8 = "" };
+
+/// The modules under the agent's main-module directory, as the repo has them now: GitHub's listing of that directory
+/// (and its subdirectories, two deep), each file fetched and typed by its name. What went wrong, or null.
+fn garrettModules(app: *App, a: std.mem.Allocator, cfg: GarrettCfg, out: *std.ArrayListUnmanaged(GarrettModule)) ?[]const u8 {
+    return garrettDir(app, a, cfg.mainDir(), "", 0, out);
+}
+
+fn garrettDir(app: *App, a: std.mem.Allocator, base: []const u8, sub: []const u8, depth: u8, out: *std.ArrayListUnmanaged(GarrettModule)) ?[]const u8 {
+    const dir = if (sub.len == 0) base else std.fmt.allocPrint(a, "{s}/{s}", .{ base, sub }) catch return "out of memory";
+    const url = garrettListUrl(app, a, dir) orelse return "out of memory";
+    const raw = garrettFetch(app, a, url) orelse return std.fmt.allocPrint(a, "could not list Agent Garrett's modules on GitHub ({s}/{s})", .{ GARRETT_DIR, dir }) catch "could not list Agent Garrett's modules on GitHub";
+    const entries = std.json.parseFromSliceLeaky([]const GarrettEntry, a, raw, .{ .ignore_unknown_fields = true }) catch
+        return std.fmt.allocPrint(a, "GitHub did not list Agent Garrett's modules ({s}/{s}): {s}", .{ GARRETT_DIR, dir, oneLine(raw, 120) }) catch "GitHub did not list Agent Garrett's modules";
+    for (entries) |e| {
+        if (e.name.len == 0 or e.name[0] == '.' or std.mem.indexOfScalar(u8, e.name, '/') != null) continue;
+        const rel = if (sub.len == 0) e.name else std.fmt.allocPrint(a, "{s}/{s}", .{ sub, e.name }) catch return "out of memory";
+        if (std.mem.eql(u8, e.type, "dir")) {
+            if (depth < 2) if (garrettDir(app, a, base, rel, depth + 1, out)) |m| return m;
+            continue;
+        }
+        if (!std.mem.eql(u8, e.type, "file")) continue;
+        if (out.items.len >= GARRETT_FILES_MAX) return "Agent Garrett's repo lists more modules than a launch carries";
+        const file_rel = if (base.len == 0) rel else std.fmt.allocPrint(a, "{s}/{s}", .{ base, rel }) catch return "out of memory";
+        const furl = garrettUrl(app, a, file_rel) orelse return "out of memory";
+        const data = garrettFetch(app, a, furl) orelse return std.fmt.allocPrint(a, "could not read Agent Garrett's {s} from its repo", .{rel}) catch "could not read Agent Garrett's modules";
+        const ctype = moduleType(e.name);
+        if (!looksLikeModule(ctype, data)) return std.fmt.allocPrint(a, "Agent Garrett's {s} did not come back as a module: {s}", .{ rel, oneLine(data, 80) }) catch "a module of Agent Garrett did not come back as one";
+        out.append(a, .{ .name = rel, .data = data, .ctype = ctype }) catch return "out of memory";
+    }
+    return null;
+}
+
+fn garrettVars(a: std.mem.Allocator, cfg: GarrettCfg) ![]const GarrettCfg.Var {
+    var out: std.ArrayListUnmanaged(GarrettCfg.Var) = .empty;
+    for (cfg.vars) |v| {
+        if (std.mem.eql(u8, v.name, "TOOL_ALLOWLIST") or std.mem.eql(u8, v.name, "ROUTER_ENFORCE_POLICY") or std.mem.eql(u8, v.name, "SITE_NAME") or std.mem.eql(u8, v.name, "GARY_TOOLS_ENABLED") or
+            std.mem.eql(u8, v.name, "AGENT_ALLOW_ACTIVE_TOOLS") or std.mem.eql(u8, v.name, "MCP_ALLOW_ACTIVE_TOOLS") or
+            std.mem.eql(u8, v.name, "MCP_ALLOW_DARKWEB") or std.mem.eql(u8, v.name, "CTF_SAFE_MODE") or std.mem.eql(u8, v.name, "CTF_REQUIRE_CONFIRM")) continue;
+        try out.append(a, v);
+    }
+    inline for (.{ .{ "TOOL_ALLOWLIST", @embedFile("security-tools.txt") }, .{ "ROUTER_ENFORCE_POLICY", "false" }, .{ "SITE_NAME", "Security tools" }, .{ "GARY_TOOLS_ENABLED", "true" }, .{ "AGENT_ALLOW_ACTIVE_TOOLS", "true" }, .{ "MCP_ALLOW_ACTIVE_TOOLS", "true" }, .{ "MCP_ALLOW_DARKWEB", "true" }, .{ "CTF_SAFE_MODE", "false" }, .{ "CTF_REQUIRE_CONFIRM", "false" } }) |v|
+        try out.append(a, .{ .name = v[0], .text = v[1] });
+    return out.items;
 }
 
 /// The modules as fetched, as 16 hex characters: what a launch was made from.
@@ -1061,32 +1283,91 @@ fn garrettHash(files: []const []const u8, out: *[16]u8) []const u8 {
     return out;
 }
 
-/// Agent Garrett's upload: the metadata (its AI binding, its three Durable Object classes, its policy vars - safe
-/// mode, confirmation required, no active and no dark-web tools over MCP, as agent/wrangler.toml ships them - and
-/// the secrets kept) and the five modules as fetched, the engine as WebAssembly. `fresh` carries the class
-/// migration, which Cloudflare takes once per script.
-fn garrettUploadBody(a: std.mem.Allocator, boundary: []const u8, fresh: bool, files: []const []const u8) ![]u8 {
+/// Agent Garrett's upload: the metadata (its main module, compatibility date and flags, its AI binding, its Durable
+/// Object classes and its vars, as its wrangler.toml ships them, the secrets kept) and the modules as fetched, each
+/// with its type. `fresh` carries the class migration, which Cloudflare takes once per script.
+fn garrettModuleData(a: std.mem.Allocator, name: []const u8, data: []const u8) ![]const u8 {
+    if (std.mem.endsWith(u8, name, "gary-tools.mjs")) return std.fmt.allocPrint(a, "{s}{s}", .{ data, "\nexport async function garyRuntimeStatus(env = {}) {\n  let status = await requestRuntime(env, 'runtime/status', {}, 15000);\n  if (status.phase === 'not-started' || status.phase === 'failed') {\n    try { await loadGaryToolCatalog(env); } catch {}\n    status = await requestRuntime(env, 'runtime/status', {}, 15000);\n  }\n  return {phase:status.phase || 'unavailable', error:status.error || ''};\n}\n" });
+    if (std.mem.endsWith(u8, name, "mcp.mjs")) return std.mem.replaceOwned(u8, a, data, "  if (body.method === 'ping')", "  if (body.method === 'gary/runtime/status') {\n    try { return jsonResponse(rpc(body.id, await handlers.runtimeStatus())); }\n    catch (error) { return jsonResponse(rpc(body.id, {phase:'failed',error:error.message})); }\n  }\n  if (body.method === 'ping')");
+    if (!std.mem.endsWith(u8, name, "index.js")) return data;
+    const scoped = try std.mem.replaceOwned(u8, a, data, "if (targets.length && !policy.targetAllowlist.size)", "if (policy.safeMode && targets.length && !policy.targetAllowlist.size)");
+    defer a.free(scoped);
+    const imported = try std.mem.replaceOwned(u8, a, scoped, "import { garyToolCatalog,", "import { garyRuntimeStatus, garyToolCatalog,");
+    defer a.free(imported);
+    return std.mem.replaceOwned(u8, a, imported, "readJson: req => readJsonBodyLimited(req),", "readJson: req => readJsonBodyLimited(req),\n        runtimeStatus: () => garyRuntimeStatus(env),");
+}
+
+test "security deployment applies target scoping only when safe mode is selected" {
+    const a = tt.allocator;
+    const input = "if (targets.length && !policy.targetAllowlist.size) reject();";
+    const result = try garrettModuleData(a, "index.js", input);
+    defer a.free(result);
+    try tt.expectEqualStrings("if (policy.safeMode && targets.length && !policy.targetAllowlist.size) reject();", result);
+    try tt.expectEqualStrings(input, try garrettModuleData(a, "other.mjs", input));
+}
+
+fn garrettUploadBody(a: std.mem.Allocator, boundary: []const u8, fresh: bool, cfg: GarrettCfg, mods: []const GarrettModule) ![]u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     try out.print(a, "--{s}\r\nContent-Disposition: form-data; name=\"metadata\"; filename=\"metadata.json\"\r\nContent-Type: application/json\r\n\r\n", .{boundary});
-    try out.appendSlice(a, "{\"main_module\":\"index.js\",\"compatibility_date\":\"" ++ GARRETT_COMPAT_DATE ++ "\",\"bindings\":[" ++
-        "{\"type\":\"ai\",\"name\":\"AI\"}," ++
-        "{\"type\":\"durable_object_namespace\",\"name\":\"DISCLOSURE_LIMITER\",\"class_name\":\"DisclosureLimiter\"}," ++
-        "{\"type\":\"durable_object_namespace\",\"name\":\"LOGIN_LIMITER\",\"class_name\":\"LoginLimiter\"}," ++
-        "{\"type\":\"durable_object_namespace\",\"name\":\"AUTH_SESSIONS\",\"class_name\":\"AuthSession\"}," ++
-        "{\"type\":\"plain_text\",\"name\":\"LLMS_URL\",\"text\":\"https://raw.githubusercontent.com/gary23w/garrettstimpson.ca/refs/heads/main/llms.txt\"}," ++
-        "{\"type\":\"plain_text\",\"name\":\"SITE_NAME\",\"text\":\"Agent Garrett (veil tater-tots)\"}," ++
-        "{\"type\":\"plain_text\",\"name\":\"CTF_SAFE_MODE\",\"text\":\"true\"}," ++
-        "{\"type\":\"plain_text\",\"name\":\"CTF_REQUIRE_CONFIRM\",\"text\":\"true\"}," ++
-        "{\"type\":\"plain_text\",\"name\":\"AGENT_ALLOW_ACTIVE_TOOLS\",\"text\":\"false\"}," ++
-        "{\"type\":\"plain_text\",\"name\":\"MCP_ALLOW_ACTIVE_TOOLS\",\"text\":\"false\"}," ++
-        "{\"type\":\"plain_text\",\"name\":\"MCP_ALLOW_DARKWEB\",\"text\":\"false\"}" ++
-        "],\"keep_bindings\":[\"secret_text\"]");
-    if (fresh) try out.appendSlice(a, ",\"migrations\":{\"new_tag\":\"" ++ GARRETT_MIGRATION_TAG ++ "\",\"new_sqlite_classes\":[\"DisclosureLimiter\",\"LoginLimiter\",\"AuthSession\"]}");
+    try out.appendSlice(a, "{\"main_module\":");
+    try http.jstr(a, &out, cfg.mainModule());
+    try out.appendSlice(a, ",\"compatibility_date\":");
+    try http.jstr(a, &out, cfg.compat_date);
+    if (cfg.flags.len > 0) {
+        try out.appendSlice(a, ",\"compatibility_flags\":[");
+        for (cfg.flags, 0..) |f, i| {
+            if (i > 0) try out.append(a, ',');
+            try http.jstr(a, &out, f);
+        }
+        try out.append(a, ']');
+    }
+    try out.appendSlice(a, ",\"bindings\":[");
+    var n: usize = 0;
+    if (cfg.ai.len > 0) {
+        try out.appendSlice(a, "{\"type\":\"ai\",\"name\":");
+        try http.jstr(a, &out, cfg.ai);
+        try out.append(a, '}');
+        n += 1;
+    }
+    for (cfg.dos) |d| {
+        if (d.name.len == 0 or d.class.len == 0) continue;
+        if (n > 0) try out.append(a, ',');
+        try out.appendSlice(a, "{\"type\":\"durable_object_namespace\",\"name\":");
+        try http.jstr(a, &out, d.name);
+        try out.appendSlice(a, ",\"class_name\":");
+        try http.jstr(a, &out, d.class);
+        try out.append(a, '}');
+        n += 1;
+    }
+    for (try garrettVars(a, cfg)) |v| {
+        if (n > 0) try out.append(a, ',');
+        try out.appendSlice(a, "{\"type\":\"plain_text\",\"name\":");
+        try http.jstr(a, &out, v.name);
+        try out.appendSlice(a, ",\"text\":");
+        try http.jstr(a, &out, v.text);
+        try out.append(a, '}');
+        n += 1;
+    }
+    try out.appendSlice(a, ",{\"type\":\"service\",\"name\":\"GARY_RUNTIME\",\"service\":\"" ++ GARY_SCRIPT ++ "\",\"entrypoint\":\"GaryBackend\"}],\"keep_bindings\":[\"secret_text\"]");
+    if (fresh and (cfg.sqlite_classes.len > 0 or cfg.classes.len > 0)) {
+        try out.appendSlice(a, ",\"migrations\":{\"new_tag\":");
+        try http.jstr(a, &out, cfg.tag);
+        inline for (.{ .{ "new_sqlite_classes", cfg.sqlite_classes }, .{ "new_classes", cfg.classes } }) |kv| {
+            if (kv[1].len > 0) {
+                try out.print(a, ",\"{s}\":[", .{kv[0]});
+                for (kv[1], 0..) |c, i| {
+                    if (i > 0) try out.append(a, ',');
+                    try http.jstr(a, &out, c);
+                }
+                try out.append(a, ']');
+            }
+        }
+        try out.append(a, '}');
+    }
     try out.append(a, '}');
-    for (GARRETT_FILES, files) |name, data| {
-        const ctype: []const u8 = if (std.mem.endsWith(u8, name, ".wasm")) "application/wasm" else "application/javascript+module";
-        try out.print(a, "\r\n--{s}\r\nContent-Disposition: form-data; name=\"{s}\"; filename=\"{s}\"\r\nContent-Type: {s}\r\n\r\n", .{ boundary, name, name, ctype });
-        try out.appendSlice(a, data);
+    for (mods) |m| {
+        try out.print(a, "\r\n--{s}\r\nContent-Disposition: form-data; name=\"{s}\"; filename=\"{s}\"\r\nContent-Type: {s}\r\n\r\n", .{ boundary, m.name, m.name, m.ctype });
+        try out.appendSlice(a, try garrettModuleData(a, m.name, m.data));
     }
     try out.print(a, "\r\n--{s}--\r\n", .{boundary});
     return out.items;
@@ -1094,12 +1375,35 @@ fn garrettUploadBody(a: std.mem.Allocator, boundary: []const u8, fresh: bool, fi
 
 /// Agent Garrett's MCP bearer, as the tots carry it: derived like the tots' own token, never stored.
 fn garrettToken(app: *App, uid: u64, account: []const u8, gen: u32, out: *[64]u8) []const u8 {
-    return tokenWith(app, "veil-garrett-mcp", uid, account, gen, out);
+    return tokenWith(app, cf_garrett.MCP_LABEL, uid, account, gen, out);
 }
 
 /// The password locking its chat UI: open to anyone with the address otherwise. `veil --tater garrett password`.
 fn garrettPassword(app: *App, uid: u64, account: []const u8, gen: u32, out: *[64]u8) []const u8 {
-    return tokenWith(app, "veil-garrett-access", uid, account, gen, out);
+    return tokenWith(app, cf_garrett.ACCESS_LABEL, uid, account, gen, out);
+}
+
+/// The account Agent Garrett was launched into and the generation its secrets were derived under. A launch from
+/// before State recorded them was made beside the tots: theirs stand in (cf_garrett.credsFor reads them the same way).
+fn garrettAccount(st: State) []const u8 {
+    return if (st.garrett_account.len > 0) st.garrett_account else st.account;
+}
+
+fn garrettGen(st: State) u32 {
+    return if (st.garrett_account.len > 0) st.garrett_gen else st.token_gen;
+}
+
+/// Point the tots' Worker at Agent Garrett: where it answers and the bearer it answers to, as two secrets on
+/// their script. What went wrong in words, or null.
+fn pointTotsAtGarrett(app: *App, a: std.mem.Allocator, uid: u64, tok: Tok, st: State) ?[]const u8 {
+    const acct = garrettAccount(st);
+    const tots_url = std.fmt.allocPrint(a, "{s}/accounts/{s}/workers/scripts/" ++ SCRIPT, .{ app.cf_api_root, acct }) catch return "out of memory";
+    const mcp_url = std.fmt.allocPrint(a, "{s}/mcp", .{st.garrett_url}) catch return "out of memory";
+    var mb: [64]u8 = undefined;
+    const mcp = garrettToken(app, uid, acct, garrettGen(st), &mb);
+    if (putSecret(app, a, tots_url, tok.key, "GARRETT_MCP_URL", mcp_url, "pointing the tots at Agent Garrett")) |m| return m;
+    if (putSecret(app, a, tots_url, tok.key, "GARRETT_MCP_TOKEN", mcp, "giving the tots Agent Garrett's token")) |m| return m;
+    return null;
 }
 
 /// One secret on a script. A small JSON body: it rides curl's stdin with the bearer, never a file.
@@ -1112,25 +1416,133 @@ fn putSecret(app: *App, a: std.mem.Allocator, script_url: []const u8, key: []con
     return null;
 }
 
-/// Launch Agent Garrett into the account: its five modules as the repo has them now, uploaded as one Worker beside
-/// the tots' with its own derived secrets, its address enabled, and the tots pointed at it. What went wrong in
-/// words a user can act on, or null. The modules are read before anything in the account is touched.
+/// Launch Agent Garrett into the account: its Worker config and every module as its repo has them NOW, uploaded as
+/// one Worker of its own with its derived secrets, its address enabled, and - when the tots' Worker is in this
+/// account - the tots pointed at it. No tot is needed: the desk's Settings button deploys it on its own. What went
+/// wrong in words a user can act on, or null. The repo is read before anything in the account is touched.
+const GARY_SCRIPT = "veil-garrett-gary";
+const GARY_BUCKET = "veil-garrett-gary-state";
+const GARY_UPLOADER = "veil-garrett-upload";
+const GARY_APP = "veil-garrett-gary-garycontainer";
+const GARY_SOURCE = @embedFile("gary-source.tar.gz");
+
+fn garyBody(a: std.mem.Allocator, boundary: []const u8, metadata: []const u8, mods: []const GarrettModule) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    try out.print(a, "--{s}\r\nContent-Disposition: form-data; name=\"metadata\"\r\nContent-Type: application/json\r\n\r\n{s}", .{ boundary, metadata });
+    for (mods) |m| {
+        try out.print(a, "\r\n--{s}\r\nContent-Disposition: form-data; name=\"{s}\"; filename=\"{s}\"\r\nContent-Type: {s}\r\n\r\n", .{ boundary, m.name, m.name, m.ctype });
+        try out.appendSlice(a, m.data);
+    }
+    try out.print(a, "\r\n--{s}--\r\n", .{boundary});
+    return out.items;
+}
+
+fn launchGary(app: *App, a: std.mem.Allocator, uid: u64, tok: Tok, gen: u32, sub: []const u8) ?[]const u8 {
+    const base = std.fmt.allocPrint(a, "{s}/accounts/{s}", .{ app.cf_api_root, tok.account_id }) catch return "out of memory";
+    const bucket_url = std.fmt.allocPrint(a, "{s}/r2/buckets/" ++ GARY_BUCKET, .{base}) catch return "out of memory";
+    const exists = if (api(app, a, "GET", bucket_url, "", tok.key, "")) |r| firstError(a, r).len == 0 else false;
+    if (!exists) {
+        const url = std.fmt.allocPrint(a, "{s}/r2/buckets", .{base}) catch return "out of memory";
+        const raw = api(app, a, "POST", url, "{\"name\":\"" ++ GARY_BUCKET ++ "\"}", tok.key, "application/json") orelse return "could not create the security runtime storage";
+        const err = firstError(a, raw);
+        if (err.len > 0) return explain(a, "creating the security runtime storage", err);
+    }
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(GARY_SOURCE, &digest, .{});
+    const hash = std.fmt.bytesToHex(digest, .lower);
+    const boundary = "----veilgaryruntime";
+    const ctype = "multipart/form-data; boundary=" ++ boundary;
+    const upload_url = std.fmt.allocPrint(a, "{s}/workers/scripts/" ++ GARY_UPLOADER, .{base}) catch return "out of memory";
+    const upload_meta = "{\"main_module\":\"upload.mjs\",\"compatibility_date\":\"2026-10-09\",\"bindings\":[{\"type\":\"r2_bucket\",\"name\":\"STATE\",\"bucket_name\":\"" ++ GARY_BUCKET ++ "\"}],\"keep_bindings\":[\"secret_text\"]}";
+    const upload_source =
+        \\export default { async fetch(r,e) {
+        \\if (r.method !== 'PUT' || r.headers.get('Authorization') !== 'Bearer '+e.TOKEN) return new Response('Unauthorized',{status:401});
+        \\const key = new URL(r.url).pathname.slice(1);
+        \\if (!/^build\/[a-f0-9]{64}\.tar\.gz$/.test(key)) return new Response('Invalid package',{status:400});
+        \\const bytes = await r.arrayBuffer();
+        \\if (bytes.byteLength > 33554432) return new Response('Too large',{status:413});
+        \\const hash = [...new Uint8Array(await crypto.subtle.digest('SHA-256',bytes))].map(x=>x.toString(16).padStart(2,'0')).join('');
+        \\if (key !== 'build/'+hash+'.tar.gz') return new Response('Checksum failed',{status:400});
+        \\await e.STATE.put(key,bytes); return Response.json({success:true}); } };
+    ;
+    const upload_body = garyBody(a, boundary, upload_meta, &.{.{ .name = "upload.mjs", .data = upload_source, .ctype = "application/javascript+module" }}) catch return "out of memory";
+    const uploaded = api(app, a, "PUT", upload_url, upload_body, tok.key, ctype) orelse return "could not upload the runtime package transport";
+    const up_err = firstError(a, uploaded);
+    if (up_err.len > 0) return explain(a, "uploading the runtime package transport", up_err);
+    defer _ = api(app, a, "DELETE", upload_url, "", tok.key, "");
+    var tb: [64]u8 = undefined;
+    const runtime_token = tokenWith(app, "veil-gary-runtime", uid, tok.account_id, gen, &tb);
+    if (putSecret(app, a, upload_url, tok.key, "TOKEN", runtime_token, "configuring the package transport")) |m| return m;
+    const route_url = std.fmt.allocPrint(a, "{s}/subdomain", .{upload_url}) catch return "out of memory";
+    const routed = api(app, a, "POST", route_url, "{\"enabled\":true}", tok.key, "application/json") orelse return "could not enable the package transport";
+    const route_err = firstError(a, routed);
+    if (route_err.len > 0) return explain(a, "enabling the package transport", route_err);
+    const origin = workerUrl(app, a, GARY_UPLOADER, sub) orelse return "out of memory";
+    const package_url = std.fmt.allocPrint(a, "{s}/build/{s}.tar.gz", .{ origin, hash }) catch return "out of memory";
+    var stored = false;
+    for (0..12) |attempt| {
+        if (attempt > 0) app.io.sleep(.{ .nanoseconds = 2 * std.time.ns_per_s }, .awake) catch {};
+        const result = api(app, a, "PUT", package_url, GARY_SOURCE, runtime_token, "application/gzip") orelse continue;
+        if (std.mem.indexOf(u8, result, "\"success\":true") != null) {
+            stored = true;
+            break;
+        }
+    }
+    if (!stored) return "could not store the security runtime source package";
+    const metadata = std.fmt.allocPrint(a, "{{\"main_module\":\"worker.mjs\",\"compatibility_date\":\"2026-10-09\",\"compatibility_flags\":[\"enable_request_signal\"]," ++
+        "\"bindings\":[{{\"type\":\"ai\",\"name\":\"AI\"}},{{\"type\":\"durable_object_namespace\",\"name\":\"GARY_CONTAINER\",\"class_name\":\"GaryContainer\"}},{{\"type\":\"r2_bucket\",\"name\":\"GARY_STATE\",\"bucket_name\":\"" ++ GARY_BUCKET ++ "\"}},{{\"type\":\"plain_text\",\"name\":\"GARY_BUILD_ID\",\"text\":\"{s}\"}},{{\"type\":\"plain_text\",\"name\":\"GARY_LLM_MODEL\",\"text\":\"@cf/zai-org/glm-4.7-flash\"}}]," ++
+        "\"exports\":{{\"GaryContainer\":{{\"type\":\"durable-object\",\"storage\":\"sqlite\",\"container\":\"" ++ GARY_APP ++ "\"}}}},\"containers\":[{{\"name\":\"" ++ GARY_APP ++ "\",\"class_name\":\"GaryContainer\"}}],\"keep_bindings\":[\"secret_text\"]}}", .{hash}) catch return "out of memory";
+    const body = garyBody(a, boundary, metadata, &.{
+        .{ .name = "worker.mjs", .data = @embedFile("gary-worker.mjs"), .ctype = "application/javascript+module" },
+        .{ .name = "gateway.mjs", .data = @embedFile("gary-gateway.mjs"), .ctype = "application/javascript+module" },
+        .{ .name = "bootstrap.py", .data = @embedFile("gary-bootstrap.py"), .ctype = "text/plain" },
+    }) catch return "out of memory";
+    const script_url = std.fmt.allocPrint(a, "{s}/workers/scripts/" ++ GARY_SCRIPT, .{base}) catch return "out of memory";
+    const deployed = api(app, a, "PUT", script_url, body, tok.key, ctype) orelse return "could not deploy the security execution Worker";
+    const dep_err = firstError(a, deployed);
+    if (dep_err.len > 0) return explain(a, "deploying the security execution Worker", dep_err);
+    if (putSecret(app, a, script_url, tok.key, "GARY_RUNTIME_TOKEN", runtime_token, "configuring the security runtime")) |m| return m;
+    const namespaces_url = std.fmt.allocPrint(a, "{s}/workers/durable_objects/namespaces?per_page=1000", .{base}) catch return "out of memory";
+    const ns_raw = api(app, a, "GET", namespaces_url, "", tok.key, "") orelse return "could not inspect the security runtime namespace";
+    const Ns = struct { id: []const u8 = "", script: []const u8 = "", class: []const u8 = "", preview: ?bool = null };
+    const ns = std.json.parseFromSliceLeaky(struct { result: []const Ns = &.{} }, a, ns_raw, .{ .ignore_unknown_fields = true }) catch return "invalid security runtime namespace response";
+    var namespace: []const u8 = "";
+    for (ns.result) |n| if (std.mem.eql(u8, n.script, GARY_SCRIPT) and std.mem.eql(u8, n.class, "GaryContainer") and n.preview == null) {
+        namespace = n.id;
+        break;
+    };
+    if (namespace.len == 0) return "the security runtime namespace was not provisioned";
+    const apps_url = std.fmt.allocPrint(a, "{s}/containers/applications", .{base}) catch return "out of memory";
+    const one_url = std.fmt.allocPrint(a, "{s}/{s}", .{ apps_url, namespace }) catch return "out of memory";
+    const has_app = if (api(app, a, "GET", one_url, "", tok.key, "")) |r| firstError(a, r).len == 0 else false;
+    if (!has_app) {
+        const config = std.json.Stringify.valueAlloc(a, .{ .name = GARY_APP, .scheduling_policy = "durable_object", .durable_objects = .{ .namespace_id = namespace } }, .{}) catch return "out of memory";
+        const result = api(app, a, "POST", apps_url, config, tok.key, "application/json") orelse return "could not create the dedicated security Container";
+        const err = firstError(a, result);
+        if (err.len > 0) return std.fmt.allocPrint(a, "creating the dedicated security Container: {s}. Reconnect Cloudflare with Containers permissions.", .{err}) catch "reconnect Cloudflare with Containers permissions";
+    }
+    return null;
+}
+
 fn launchGarrett(app: *App, a: std.mem.Allocator, uid: u64, tok: Tok, st: *State) ?[]const u8 {
     const root = app.cf_api_root;
     const acct = tok.account_id;
     if (acct.len == 0) return "your Cloudflare login names no account - Disconnect and log in with Cloudflare again";
-    if (st.url.len == 0 or !std.mem.eql(u8, st.account, acct)) return "deploy a tater-tot first: Agent Garrett is launched beside the tots' Worker";
-    var files: [GARRETT_FILES.len][]const u8 = undefined;
-    for (GARRETT_FILES, 0..) |name, i| {
-        const url = garrettSrc(app, a, name) orelse return "out of memory";
-        const raw = api(app, a, "GET", url, "", "", "") orelse return std.fmt.allocPrint(a, "could not read Agent Garrett's {s} from its repo", .{name}) catch "could not read Agent Garrett's modules";
-        const wasm = std.mem.endsWith(u8, name, ".wasm");
-        const looks = if (wasm) std.mem.startsWith(u8, raw, "\x00asm") else std.mem.indexOf(u8, raw, "export") != null and std.mem.indexOf(u8, raw[0..@min(raw.len, 256)], "<!DOCTYPE") == null;
-        if (!looks or raw.len > GARRETT_FILE_MAX) return std.fmt.allocPrint(a, "Agent Garrett's {s} did not come back as a module: {s}", .{ name, raw[0..@min(raw.len, 80)] }) catch "a module of Agent Garrett did not come back as one";
-        files[i] = raw;
+    // The agent as its repo has it this minute: its Worker config, then every module under its main module's dir.
+    const toml_url = garrettUrl(app, a, GARRETT_TOML) orelse return "out of memory";
+    const toml = garrettFetch(app, a, toml_url) orelse return "could not read Agent Garrett's wrangler.toml from its repo (github.com/" ++ GARRETT_REPO ++ ")";
+    if (std.mem.startsWith(u8, toml, "404") or std.mem.indexOf(u8, toml, "main") == null) return std.fmt.allocPrint(a, "Agent Garrett's wrangler.toml did not come back as one: {s}", .{oneLine(toml, 80)}) catch "Agent Garrett's wrangler.toml did not come back as one";
+    const cfg = parseGarrettToml(a, toml);
+    var mods: std.ArrayListUnmanaged(GarrettModule) = .empty;
+    if (garrettModules(app, a, cfg, &mods)) |msg| return msg;
+    var has_main = false;
+    for (mods.items) |m| {
+        if (std.mem.eql(u8, m.name, cfg.mainModule())) has_main = true;
     }
+    if (!has_main) return std.fmt.allocPrint(a, "Agent Garrett's repo lists no {s} under {s}/{s}/ (its wrangler.toml names it as the main module)", .{ cfg.mainModule(), GARRETT_DIR, cfg.mainDir() }) catch "Agent Garrett's main module is missing from its repo";
     var why: []const u8 = "";
     const sub = workersSubdomain(app, a, tok, &why) orelse return why;
+    if (launchGary(app, a, uid, tok, st.token_gen, sub)) |msg| return msg;
     const script_url = std.fmt.allocPrint(a, "{s}/accounts/{s}/workers/scripts/" ++ GARRETT_SCRIPT, .{ root, acct }) catch return "out of memory";
     const settings_url = std.fmt.allocPrint(a, "{s}/settings", .{script_url}) catch return "out of memory";
     const exists = if (api(app, a, "GET", settings_url, "", tok.key, "")) |r| firstError(a, r).len == 0 else false;
@@ -1142,7 +1554,7 @@ fn launchGarrett(app: *App, a: std.mem.Allocator, uid: u64, tok: Tok, st: *State
     var up_err: []const u8 = "";
     var taken = false;
     for ([_]bool{ !exists, exists }) |fresh| {
-        const body = garrettUploadBody(a, boundary, fresh, &files) catch return "out of memory";
+        const body = garrettUploadBody(a, boundary, fresh, cfg, mods.items) catch return "out of memory";
         const up = api(app, a, "PUT", script_url, body, tok.key, ctype) orelse return "could not reach the Cloudflare API to upload Agent Garrett";
         const e = firstError(a, up);
         if (e.len == 0) {
@@ -1159,42 +1571,75 @@ fn launchGarrett(app: *App, a: std.mem.Allocator, uid: u64, tok: Tok, st: *State
     const mcp = garrettToken(app, uid, acct, st.token_gen, &mb);
     if (putSecret(app, a, script_url, tok.key, "MCP_API_TOKEN", mcp, "setting Agent Garrett's MCP token")) |m| return m;
     if (putSecret(app, a, script_url, tok.key, "ACCESS_PASSWORD", garrettPassword(app, uid, acct, st.token_gen, &pb), "locking Agent Garrett's chat UI")) |m| return m;
-    if (putSecret(app, a, script_url, tok.key, "ACCESS_SESSION_SECRET", tokenWith(app, "veil-garrett-session", uid, acct, st.token_gen, &sb), "setting Agent Garrett's session secret")) |m| return m;
+    if (putSecret(app, a, script_url, tok.key, "ACCESS_SESSION_SECRET", tokenWith(app, cf_garrett.SESSION_LABEL, uid, acct, st.token_gen, &sb), "setting Agent Garrett's session secret")) |m| return m;
     const route_url = std.fmt.allocPrint(a, "{s}/subdomain", .{script_url}) catch return "out of memory";
     const route = api(app, a, "POST", route_url, "{\"enabled\":true}", tok.key, "application/json") orelse return "could not reach Cloudflare to enable Agent Garrett's workers.dev address";
     const route_err = firstError(a, route);
     if (route_err.len > 0) return explain(a, "enabling Agent Garrett's address", route_err);
     const url = workerUrl(app, a, GARRETT_SCRIPT, sub) orelse return "out of memory";
-    // The tots: where it answers, and the bearer it answers to.
-    const tots_url = std.fmt.allocPrint(a, "{s}/accounts/{s}/workers/scripts/" ++ SCRIPT, .{ root, acct }) catch return "out of memory";
-    const mcp_url = std.fmt.allocPrint(a, "{s}/mcp", .{url}) catch return "out of memory";
-    if (putSecret(app, a, tots_url, tok.key, "GARRETT_MCP_URL", mcp_url, "pointing the tots at Agent Garrett")) |m| return m;
-    if (putSecret(app, a, tots_url, tok.key, "GARRETT_MCP_TOKEN", mcp, "giving the tots Agent Garrett's token")) |m| return m;
     var hb: [16]u8 = undefined;
+    var datas: std.ArrayListUnmanaged([]const u8) = .empty;
+    for (mods.items) |m| datas.append(a, m.data) catch return "out of memory";
     st.garrett_url = url;
-    st.garrett_hash = a.dupe(u8, garrettHash(&files, &hb)) catch return "out of memory";
+    st.garrett_hash = a.dupe(u8, garrettHash(datas.items, &hb)) catch return "out of memory";
     st.garrett_at = nowS(app.io);
-    writeState(app, uid, st.*);
+    st.garrett_account = acct;
+    st.garrett_gen = st.token_gen;
+    writeState(app, uid, st.*); // it is up: recorded before the tots are pointed at it, so a refusal there loses nothing
     log.info("Agent Garrett launched for u{d}: {s}", .{ uid, url });
+    // The tots, when their Worker is in this account: where it answers, and the bearer it answers to. A runtime
+    // uploaded later is pointed at it by ensureRuntime.
+    if (st.url.len > 0 and std.mem.eql(u8, st.account, acct)) if (pointTotsAtGarrett(app, a, uid, tok, st.*)) |m| return m;
     return null;
 }
 
-/// Remove Agent Garrett: its Worker, the tots' two secrets, the runtime's record. Best effort past the script.
+/// Remove Agent Garrett: its Worker, and - when the tots' Worker is here - their two secrets and the runtime's
+/// record. Best effort past the script.
+fn removeGary(app: *App, a: std.mem.Allocator, tok: Tok, account: []const u8) ?[]const u8 {
+    const base = std.fmt.allocPrint(a, "{s}/accounts/{s}", .{ app.cf_api_root, account }) catch return "out of memory";
+    const ns_url = std.fmt.allocPrint(a, "{s}/workers/durable_objects/namespaces?per_page=1000", .{base}) catch return "out of memory";
+    const raw = api(app, a, "GET", ns_url, "", tok.key, "") orelse return "could not inspect the security runtime before removing it";
+    const err = firstError(a, raw);
+    if (err.len > 0) return explain(a, "inspecting the security runtime", err);
+    const Ns = struct { id: []const u8 = "", script: []const u8 = "", class: []const u8 = "", preview: ?bool = null };
+    const ns = std.json.parseFromSliceLeaky(struct { result: []const Ns = &.{} }, a, raw, .{ .ignore_unknown_fields = true }) catch return "invalid security runtime namespace response";
+    for (ns.result) |n| {
+        if (!std.mem.eql(u8, n.script, GARY_SCRIPT) or !std.mem.eql(u8, n.class, "GaryContainer") or n.preview != null) continue;
+        const url = std.fmt.allocPrint(a, "{s}/containers/applications/{s}", .{ base, n.id }) catch return "out of memory";
+        const deleted = api(app, a, "DELETE", url, "", tok.key, "") orelse return "could not reach Cloudflare to remove the security Container";
+        const why = firstError(a, deleted);
+        if (why.len > 0 and std.ascii.indexOfIgnoreCase(why, "not found") == null and std.ascii.indexOfIgnoreCase(why, "does not exist") == null)
+            return explain(a, "removing the security Container", why);
+    }
+    const url = std.fmt.allocPrint(a, "{s}/workers/scripts/" ++ GARY_SCRIPT ++ "?force=true", .{base}) catch return "out of memory";
+    const deleted = api(app, a, "DELETE", url, "", tok.key, "") orelse return "could not reach Cloudflare to remove the security execution Worker";
+    const why = firstError(a, deleted);
+    if (why.len > 0 and std.ascii.indexOfIgnoreCase(why, "not found") == null and std.ascii.indexOfIgnoreCase(why, "does not exist") == null)
+        return explain(a, "removing the security execution Worker", why);
+    return null;
+}
+
 fn removeGarrett(app: *App, a: std.mem.Allocator, uid: u64, tok: Tok, st: *State) ?[]const u8 {
-    const acct = if (st.account.len > 0) st.account else tok.account_id;
+    const acct = if (garrettAccount(st.*).len > 0) garrettAccount(st.*) else tok.account_id;
     const url = std.fmt.allocPrint(a, "{s}/accounts/{s}/workers/scripts/" ++ GARRETT_SCRIPT ++ "?force=true", .{ app.cf_api_root, acct }) catch return "out of memory";
     const raw = api(app, a, "DELETE", url, "", tok.key, "") orelse return "could not reach the Cloudflare API to remove Agent Garrett";
     const msg = firstError(a, raw);
     if (msg.len > 0 and std.ascii.indexOfIgnoreCase(msg, "not found") == null and std.ascii.indexOfIgnoreCase(msg, "does not exist") == null)
         return explain(a, "removing Agent Garrett", msg);
-    for ([_][]const u8{ "GARRETT_MCP_URL", "GARRETT_MCP_TOKEN" }) |name| {
-        const s = std.fmt.allocPrint(a, "{s}/accounts/{s}/workers/scripts/" ++ SCRIPT ++ "/secrets/{s}", .{ app.cf_api_root, acct, name }) catch continue;
-        _ = api(app, a, "DELETE", s, "", tok.key, "");
+    if (removeGary(app, a, tok, acct)) |why| return why;
+    // the tots, when their Worker is here: the two secrets go, and the runtime's record
+    if (st.url.len > 0) {
+        for ([_][]const u8{ "GARRETT_MCP_URL", "GARRETT_MCP_TOKEN" }) |name| {
+            const s = std.fmt.allocPrint(a, "{s}/accounts/{s}/workers/scripts/" ++ SCRIPT ++ "/secrets/{s}", .{ app.cf_api_root, st.account, name }) catch continue;
+            _ = api(app, a, "DELETE", s, "", tok.key, "");
+        }
+        _ = totCall(app, a, uid, st.*, "POST", "/v1/garrett/clear", "{}");
     }
-    if (st.url.len > 0) _ = totCall(app, a, uid, st.*, "POST", "/v1/garrett/clear", "{}");
     st.garrett_url = "";
     st.garrett_hash = "";
     st.garrett_at = 0;
+    st.garrett_account = "";
+    st.garrett_gen = 0;
     writeState(app, uid, st.*);
     log.info("Agent Garrett removed from the Cloudflare account of u{d}", .{uid});
     return null;
@@ -1251,10 +1696,23 @@ pub fn garrettStatus(app: *App, req: *httpz.Request, res: *httpz.Response) !void
     const launched = st.garrett_url.len > 0;
     const reveal = launched and std.mem.eql(u8, q.get("reveal") orelse "0", "1");
     var pb: [64]u8 = undefined;
-    const password: []const u8 = if (reveal) garrettPassword(app, u.id, st.account, st.token_gen, &pb) else "";
+    const password: []const u8 = if (reveal) garrettPassword(app, u.id, garrettAccount(st), garrettGen(st), &pb) else "";
     const mcp_url: []const u8 = if (launched) try std.fmt.allocPrint(a, "{s}/mcp", .{st.garrett_url}) else "";
+    var runtime_phase: []const u8 = "none";
+    var runtime_error: []const u8 = "";
+    if (cf_garrett.credsFor(app, u.id, a)) |creds| {
+        const raw = security_runtime.runtimeStatus(.{ .gpa = a, .io = app.io, .scratch = app.data, .url = creds.mcp_url, .token = creds.token });
+        const Runtime = struct { result: struct { phase: []const u8 = "unavailable", @"error": []const u8 = "" } = .{} };
+        if (std.json.parseFromSliceLeaky(Runtime, a, raw, .{ .ignore_unknown_fields = true })) |r| {
+            runtime_phase = r.result.phase;
+            runtime_error = r.result.@"error";
+        } else |_| {
+            runtime_phase = "unavailable";
+        }
+    }
+    const building = std.mem.eql(u8, runtime_phase, "building") or std.mem.eql(u8, runtime_phase, "not-started");
     const status: []const u8 = if (launched and std.mem.eql(u8, g.status, "none")) "deployed" else g.status;
-    try res.json(.{ .ok = true, .launched = launched, .url = st.garrett_url, .mcp_url = mcp_url, .launched_at = st.garrett_at, .sources = st.garrett_hash, .status = status, .@"error" = g.@"error", .asked_by = g.asked_by, .asked_at = g.asked_at, .password = password, .repo = "https://github.com/gary23w/garrettstimpson.ca/tree/main/agent" }, .{});
+    try res.json(.{ .ok = true, .launched = launched, .url = st.garrett_url, .mcp_url = mcp_url, .account = if (launched) garrettAccount(st) else "", .launched_at = st.garrett_at, .sources = st.garrett_hash, .status = status, .runtime_phase = runtime_phase, .runtime_building = building, .runtime_ready = std.mem.eql(u8, runtime_phase, "ready"), .@"error" = if (runtime_error.len > 0) runtime_error else g.@"error", .asked_by = g.asked_by, .asked_at = g.asked_at, .password = password, .repo = "https://github.com/gary23w/garrettstimpson.ca/tree/main/agent" }, .{});
 }
 
 /// POST /api/v1/tots/garrett — launch Agent Garrett now (the owner asking; a tot asks through garrett_launch).
@@ -1376,7 +1834,7 @@ fn launchJob(app: *App, a: std.mem.Allocator, uid: u64, name: []const u8, conv: 
     const trio: chat_engine.ModelTrio = .{ .coding = .{ .base_url = cf.base_url, .key = cf.key, .model = if (model.len > 0 and model[0] == '@') model else modelcfg.defaults.cf_model } };
     if (!chat_engine.tryBeginTurn(app.io, conv)) return false;
     // loop=1: the drive loop carries the turn to a finished answer with nobody there, as a scheduled run does.
-    chat_engine.spawnTurn(app, uid, conv, trio, text, 1, false, "", false, false);
+    chat_engine.spawnTurn(app, uid, conv, trio, text, 1, false, "", false, false, false); // no Agent Garrett: a job runs with the machine's own tools, as the grant said
     log.info("tot {s}: job started on this machine in conversation {s}", .{ name, conv });
     return true;
 }
@@ -2319,9 +2777,61 @@ const StandIn = struct {
     const no_browser = w("{\"success\":false,\"errors\":[{\"code\":10021,\"message\":\"Browser Rendering is not enabled for this account.\"}]}");
     const made = w("{\"ok\":true,\"tot\":{\"name\":\"Gary\",\"state\":\"working\",\"local\":true}}");
     const full = w("{\"ok\":false,\"err\":\"this account already has 3 tots (the limit); delete one first\"}");
-    // Agent Garrett: what the runtime's pad says, and the modules "the repo" serves
+    // Agent Garrett: what the runtime's pad says, and what "the repo" serves - its wrangler.toml (as the agent's
+    // reads today, tables the launcher passes over included), GitHub's listing of src/, and the modules
     const garrett_pending = w("{\"ok\":true,\"status\":\"pending\",\"asked_by\":\"Gary\",\"asked_at\":1}");
     const garrett_deployed = w("{\"ok\":true,\"status\":\"deployed\"}");
+    const toml_body =
+        \\name = "garrettstimpson-agent"
+        \\main = "src/index.js"
+        \\compatibility_date = "2026-09-03"
+        \\compatibility_flags = ["global_fetch_strictly_public"]
+        \\
+        \\[[rules]]
+        \\type = "CompiledWasm"
+        \\globs = ["**/*.wasm"]
+        \\fallthrough = true
+        \\
+        \\[ai]
+        \\binding = "AI"
+        \\
+        \\[vars]
+        \\LLMS_URL  = "https://raw.githubusercontent.com/gary23w/garrettstimpson.ca/refs/heads/main/llms.txt"
+        \\SITE_NAME = "Garrett Stimpson Security Research"
+        \\CTF_SAFE_MODE = "true"
+        \\CTF_REQUIRE_CONFIRM = "true"
+        \\AGENT_ALLOW_ACTIVE_TOOLS = "false"
+        \\MCP_ALLOW_ACTIVE_TOOLS = "false"
+        \\MCP_ALLOW_DARKWEB = "false" # over MCP
+        \\
+        \\[[durable_objects.bindings]]
+        \\name = "DISCLOSURE_LIMITER"
+        \\class_name = "DisclosureLimiter"
+        \\
+        \\[[durable_objects.bindings]]
+        \\name = "LOGIN_LIMITER"
+        \\class_name = "LoginLimiter"
+        \\
+        \\[[durable_objects.bindings]]
+        \\name = "AUTH_SESSIONS"
+        \\class_name = "AuthSession"
+        \\
+        \\[[migrations]]
+        \\tag = "security-limiters-v1"
+        \\new_sqlite_classes = ["DisclosureLimiter", "LoginLimiter", "AuthSession"]
+        \\
+        \\[triggers]
+        \\crons = ["0 7 * * *"]
+        \\
+        \\[[services]]
+        \\binding = "GARY_RUNTIME"
+        \\service = "garrettstimpson-gary"
+        \\entrypoint = "GaryBackend"
+        \\
+    ;
+    const toml = w(toml_body);
+    const list_body = "[{\"name\":\"index.js\",\"path\":\"agent/src/index.js\",\"type\":\"file\",\"size\":120},{\"name\":\"mcp.mjs\",\"path\":\"agent/src/mcp.mjs\",\"type\":\"file\",\"size\":20},{\"name\":\"harness.mjs\",\"path\":\"agent/src/harness.mjs\",\"type\":\"file\",\"size\":20},{\"name\":\"neuron-db.mjs\",\"path\":\"agent/src/neuron-db.mjs\",\"type\":\"file\",\"size\":20},{\"name\":\"neuron_core.wasm\",\"path\":\"agent/src/neuron_core.wasm\",\"type\":\"file\",\"size\":8},{\"name\":\".gitkeep\",\"path\":\"agent/src/.gitkeep\",\"type\":\"file\",\"size\":0}]";
+    const list = w(list_body);
     const src_index_body = "// Agent Garrett\nimport { handleMcpRequest } from './mcp.mjs';\nexport default { async fetch(request, env) { return new Response('ok'); } };\n";
     const src_mjs_body = "export const x = 1;\n";
     const src_wasm_body = "\x00asm\x01\x00\x00\x00";
@@ -2330,40 +2840,77 @@ const StandIn = struct {
     const src_wasm = w(src_wasm_body);
 };
 
-test "Agent Garrett's upload names its bindings, pins its policy, keeps its secrets out of the body and carries the five modules, the engine as WebAssembly" {
+test "Agent Garrett's upload is made from its repo's wrangler.toml: its bindings, policy and flags, the full gary runtime bound, no secret in the body, every module typed, the engine as WebAssembly" {
     var arena = std.heap.ArenaAllocator.init(tt.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const files = [_][]const u8{ "export default {}", "export const m = 1;", "export const h = 1;", "export const n = 1;", "\x00asm\x01\x00\x00\x00" };
-    const first = try garrettUploadBody(a, "----b", true, &files);
-    const again = try garrettUploadBody(a, "----b", false, &files);
+    // the toml as the agent ships it: what the launcher reads, and what it passes over
+    const cfg = parseGarrettToml(a, StandIn.toml_body);
+    try tt.expectEqualStrings("src/index.js", cfg.main);
+    try tt.expectEqualStrings("src", cfg.mainDir());
+    try tt.expectEqualStrings("index.js", cfg.mainModule());
+    try tt.expectEqualStrings("2026-09-03", cfg.compat_date);
+    try tt.expectEqual(@as(usize, 1), cfg.flags.len);
+    try tt.expectEqualStrings("global_fetch_strictly_public", cfg.flags[0]);
+    try tt.expectEqualStrings("AI", cfg.ai);
+    try tt.expectEqual(@as(usize, 3), cfg.dos.len);
+    try tt.expectEqualStrings("LOGIN_LIMITER", cfg.dos[1].name);
+    try tt.expectEqualStrings("AuthSession", cfg.dos[2].class);
+    try tt.expectEqualStrings("security-limiters-v1", cfg.tag);
+    try tt.expectEqual(@as(usize, 3), cfg.sqlite_classes.len);
+    try tt.expectEqual(@as(usize, 0), cfg.classes.len);
+    try tt.expectEqual(@as(usize, 7), cfg.vars.len);
+    try tt.expectEqualStrings("false", cfg.vars[6].text); // a trailing comment is not part of the value
+    // a toml with none of it still makes a launchable config
+    const bare = parseGarrettToml(a, "name = \"x\"\n");
+    try tt.expectEqualStrings("src/index.js", bare.main);
+    try tt.expectEqualStrings(GARRETT_COMPAT_DATE, bare.compat_date);
+    try tt.expectEqual(@as(usize, 0), bare.dos.len);
+
+    const mods = [_]GarrettModule{
+        .{ .name = "index.js", .data = "export default {}", .ctype = moduleType("index.js") },
+        .{ .name = "harness.mjs", .data = "export const h = 1;", .ctype = moduleType("harness.mjs") },
+        .{ .name = "neuron_core.wasm", .data = "\x00asm\x01\x00\x00\x00", .ctype = moduleType("neuron_core.wasm") },
+    };
+    const first = try garrettUploadBody(a, "----b", true, cfg, &mods);
+    const again = try garrettUploadBody(a, "----b", false, cfg, &mods);
     const meta_at = std.mem.indexOf(u8, first, "\r\n\r\n").? + 4;
     const meta = first[meta_at .. meta_at + std.mem.indexOf(u8, first[meta_at..], "\r\n").?];
     const M = struct {
         main_module: []const u8,
         compatibility_date: []const u8,
-        bindings: []const struct { type: []const u8, name: []const u8, class_name: []const u8 = "", text: []const u8 = "" },
+        compatibility_flags: []const []const u8 = &.{},
+        bindings: []const struct { type: []const u8, name: []const u8, class_name: []const u8 = "", text: []const u8 = "", service: []const u8 = "", entrypoint: []const u8 = "" },
         keep_bindings: []const []const u8,
         migrations: ?struct { new_tag: []const u8, new_sqlite_classes: []const []const u8 } = null,
     };
     const m = try std.json.parseFromSliceLeaky(M, a, meta, .{});
     try tt.expectEqualStrings("index.js", m.main_module);
-    try tt.expectEqualStrings(GARRETT_COMPAT_DATE, m.compatibility_date);
-    try tt.expectEqual(@as(usize, 11), m.bindings.len);
+    try tt.expectEqualStrings("2026-09-03", m.compatibility_date);
+    try tt.expectEqual(@as(usize, 1), m.compatibility_flags.len);
+    try tt.expectEqualStrings("global_fetch_strictly_public", m.compatibility_flags[0]);
+    try tt.expectEqual(@as(usize, 15), m.bindings.len);
     try tt.expectEqualStrings("ai", m.bindings[0].type);
+    try tt.expectEqualStrings("AI", m.bindings[0].name);
     try tt.expectEqualStrings("DisclosureLimiter", m.bindings[1].class_name);
     try tt.expectEqualStrings("LOGIN_LIMITER", m.bindings[2].name);
     try tt.expectEqualStrings("AuthSession", m.bindings[3].class_name);
-    // the policy the agent ships with: safe mode, confirmation, no active and no dark-web tools over MCP
-    for (m.bindings[4..]) |b| try tt.expectEqualStrings("plain_text", b.type);
-    try tt.expectEqualStrings("CTF_SAFE_MODE", m.bindings[6].name);
-    try tt.expectEqualStrings("true", m.bindings[6].text);
-    try tt.expectEqualStrings("MCP_ALLOW_ACTIVE_TOOLS", m.bindings[9].name);
-    try tt.expectEqualStrings("false", m.bindings[9].text);
-    try tt.expectEqualStrings("MCP_ALLOW_DARKWEB", m.bindings[10].name);
-    try tt.expectEqualStrings("false", m.bindings[10].text);
+    for (m.bindings[4 .. m.bindings.len - 1]) |b| try tt.expectEqualStrings("plain_text", b.type);
+    const backend = m.bindings[m.bindings.len - 1];
+    try tt.expectEqualStrings("service", backend.type);
+    try tt.expectEqualStrings("GARY_RUNTIME", backend.name);
+    try tt.expectEqualStrings(GARY_SCRIPT, backend.service);
+    try tt.expectEqualStrings("GaryBackend", backend.entrypoint);
+    try tt.expectEqualStrings("LLMS_URL", m.bindings[4].name);
+    try tt.expect(std.mem.indexOf(u8, first, "GARY_RUNTIME") != null);
+    try tt.expect(std.mem.indexOf(u8, first, GARY_SCRIPT) != null);
+    for (m.bindings) |binding| {
+        if (std.mem.eql(u8, binding.name, "GARY_TOOLS_ENABLED") or std.mem.eql(u8, binding.name, "MCP_ALLOW_ACTIVE_TOOLS") or std.mem.eql(u8, binding.name, "MCP_ALLOW_DARKWEB")) try tt.expectEqualStrings("true", binding.text);
+        if (std.mem.eql(u8, binding.name, "CTF_SAFE_MODE") or std.mem.eql(u8, binding.name, "CTF_REQUIRE_CONFIRM")) try tt.expectEqualStrings("false", binding.text);
+    }
+    try tt.expect(std.mem.indexOf(u8, first, "crons") == null);
     try tt.expectEqualStrings("secret_text", m.keep_bindings[0]);
-    try tt.expectEqualStrings(GARRETT_MIGRATION_TAG, m.migrations.?.new_tag);
+    try tt.expectEqualStrings("security-limiters-v1", m.migrations.?.new_tag);
     try tt.expectEqual(@as(usize, 3), m.migrations.?.new_sqlite_classes.len);
     try tt.expect(std.mem.indexOf(u8, again, "migrations") == null);
     // no secret rides the body: the three are set by their own calls
@@ -2372,6 +2919,17 @@ test "Agent Garrett's upload names its bindings, pins its policy, keeps its secr
     try tt.expect(std.mem.indexOf(u8, first, "name=\"harness.mjs\"; filename=\"harness.mjs\"\r\nContent-Type: application/javascript+module\r\n\r\nexport const h = 1;") != null);
     try tt.expect(std.mem.indexOf(u8, first, "name=\"neuron_core.wasm\"; filename=\"neuron_core.wasm\"\r\nContent-Type: application/wasm\r\n\r\n\x00asm") != null);
     try tt.expect(std.mem.endsWith(u8, first, "\r\n------b--\r\n"));
+    // a module is typed by its name, and what comes back from the repo is judged by what it is: an error page is
+    // never uploaded as a script
+    try tt.expectEqualStrings("application/javascript", moduleType("lib/x.cjs"));
+    try tt.expectEqualStrings("text/plain", moduleType("prompt.md"));
+    try tt.expectEqualStrings("application/octet-stream", moduleType("blob.bin"));
+    try tt.expect(looksLikeModule("application/javascript+module", "export const x = 1;"));
+    try tt.expect(!looksLikeModule("application/javascript+module", "404: Not Found"));
+    try tt.expect(!looksLikeModule("application/javascript+module", "<!DOCTYPE html><html><body>Oops</body></html>"));
+    try tt.expect(looksLikeModule("application/wasm", "\x00asm\x01") and !looksLikeModule("application/wasm", "export"));
+    try tt.expect(looksLikeModule("text/plain", "<!DOCTYPE html>") and !looksLikeModule("text/plain", "404: Not Found"));
+    try tt.expect(!looksLikeModule("text/plain", ""));
     // the keys the owner may set by hand, and the names the runtime reads them under
     try tt.expectEqualStrings("ALERT_URL", keySecret("alert").?);
     try tt.expectEqualStrings("GARRETT_MCP_URL", keySecret("garrett_url").?);
@@ -2396,7 +2954,16 @@ test "Agent Garrett is launched from its repo's modules beside the tots' Worker 
     garrett_failed_s.store(0, .monotonic);
 
     const routes = [_]fakehttp.Route{
+        .{ .method = "PUT", .path = "/workers/scripts/veil-garrett-upload", .reply = StandIn.ok },
+        .{ .method = "POST", .path = "/workers/scripts/veil-garrett-upload/subdomain", .reply = StandIn.ok },
+        .{ .method = "DELETE", .path = "/workers/scripts/veil-garrett-upload", .reply = StandIn.ok },
+        .{ .method = "PUT", .path = "/build/", .reply = fakehttp.wire("{\"success\":true}") },
+        .{ .method = "PUT", .path = "/workers/scripts/veil-garrett-gary", .reply = StandIn.ok },
+        .{ .method = "GET", .path = "/workers/durable_objects/namespaces", .reply = fakehttp.wire("{\"success\":true,\"result\":[{\"id\":\"gary-namespace\",\"script\":\"veil-garrett-gary\",\"class\":\"GaryContainer\"}]}") },
+
         .{ .method = "GET", .path = "/v1/garrett", .reply = StandIn.garrett_pending },
+        .{ .method = "GET", .path = "/garrett/wrangler.toml", .reply = StandIn.toml },
+        .{ .method = "GET", .path = "/garrett/contents/src", .reply = StandIn.list },
         .{ .method = "GET", .path = "/garrett/src/index.js", .reply = StandIn.src_index },
         .{ .method = "GET", .path = "/garrett/src/neuron_core.wasm", .reply = StandIn.src_wasm },
         .{ .method = "GET", .path = "/garrett/src/", .reply = StandIn.src_mjs },
@@ -2423,9 +2990,9 @@ test "Agent Garrett is launched from its repo's modules beside the tots' Worker 
     defer arena.deinit();
     const a = arena.allocator();
     const tok: Tok = .{ .key = "oauth-bearer", .account_id = "acct" };
-    // a deployed runtime, as a tot's garrett_launch finds it; without one there is nothing to launch beside
+    // a login that names no account is refused before any call (a launch needs no tot: see the next test)
     var none: State = .{};
-    try tt.expect(launchGarrett(&ta.app, a, 1, tok, &none) != null);
+    try tt.expect(launchGarrett(&ta.app, a, 1, .{ .key = "oauth-bearer", .account_id = "" }, &none) != null);
     var st: State = .{ .account = "acct", .url = stand_in, .script_hash = "x" };
     writeState(&ta.app, 1, st);
 
@@ -2444,6 +3011,8 @@ test "Agent Garrett is launched from its repo's modules beside the tots' Worker 
     var hb: [16]u8 = undefined;
     try tt.expectEqualStrings(garrettHash(&[_][]const u8{ StandIn.src_index_body, StandIn.src_mjs_body, StandIn.src_mjs_body, StandIn.src_mjs_body, StandIn.src_wasm_body }, &hb), st.garrett_hash);
     try tt.expect(st.garrett_at > 0);
+    try tt.expectEqualStrings("acct", st.garrett_account); // the launch records the account and generation its secrets were made under
+    try tt.expectEqual(@as(u32, 0), st.garrett_gen);
     try tt.expectEqualStrings(stand_in, readState(&ta.app, 1, a).garrett_url);
     // the state file holds no secret of Agent Garrett's
     var mb: [64]u8 = undefined;
@@ -2459,17 +3028,24 @@ test "Agent Garrett is launched from its repo's modules beside the tots' Worker 
 
     srv.stop();
     running = false;
-    // the modules are read before anything in the account is touched; then the subdomain, the script, the upload
+    // the repo is read before anything in the account is touched - its toml, the listing, the modules in the
+    // listing's order (the dotfile skipped) - then the subdomain, the script, the upload
     try tt.expectEqual(@as(?usize, 0), srv.firstCall("GET", "/v1/garrett"));
-    try tt.expectEqual(@as(?usize, 1), srv.firstCall("GET", "/garrett/src/index.js"));
-    try tt.expectEqual(@as(?usize, 2), srv.firstCall("GET", "/garrett/src/mcp.mjs"));
-    try tt.expectEqual(@as(?usize, 5), srv.firstCall("GET", "/garrett/src/neuron_core.wasm"));
-    try tt.expectEqual(@as(?usize, 6), srv.firstCall("GET", "/accounts/acct/workers/subdomain"));
-    try tt.expectEqual(@as(?usize, 7), srv.firstCall("GET", "/workers/scripts/veil-garrett/settings"));
-    try tt.expectEqual(@as(?usize, 8), srv.firstCall("PUT", "/accounts/acct/workers/scripts/veil-garrett"));
-    try tt.expectEqual(@as(?usize, 10), srv.firstCall("POST", "/v1/garrett/result")); // the refusal, reported
+    try tt.expectEqual(@as(?usize, 1), srv.firstCall("GET", "/garrett/wrangler.toml"));
+    try tt.expectEqual(@as(?usize, 2), srv.firstCall("GET", "/garrett/contents/src"));
+    try tt.expectEqual(@as(?usize, 3), srv.firstCall("GET", "/garrett/src/index.js"));
+    try tt.expectEqual(@as(?usize, 4), srv.firstCall("GET", "/garrett/src/mcp.mjs"));
+    try tt.expectEqual(@as(?usize, 7), srv.firstCall("GET", "/garrett/src/neuron_core.wasm"));
+    try tt.expectEqual(@as(?usize, 8), srv.firstCall("GET", "/accounts/acct/workers/subdomain"));
+    try tt.expect(srv.firstCall("GET", "/workers/scripts/veil-garrett/settings") != null);
+    try tt.expect(srv.firstCall("PUT", "/accounts/acct/workers/scripts/veil-garrett") != null);
+    try tt.expect(srv.firstCall("POST", "/v1/garrett/result") != null);
     try tt.expectEqual(@as(usize, 3), srv.countCalls("GET", "/v1/garrett"));
-    try tt.expectEqual(@as(usize, 6), srv.countCalls("PUT", "/accounts/acct/workers/scripts/veil-garrett")); // 3 uploads + 3 secrets
+    try tt.expectEqual(@as(usize, 2), srv.countCalls("GET", "/garrett/wrangler.toml")); // read again at the second launch: live, never cached
+    try tt.expectEqual(@as(usize, 2), srv.countCalls("GET", "/garrett/contents/src"));
+    try tt.expectEqual(@as(usize, 0), srv.countCalls("GET", "/garrett/src/.gitkeep"));
+    try tt.expectEqual(@as(usize, 3), srv.countCallsExact("PUT", "/client/v4/accounts/acct/workers/scripts/veil-garrett"));
+    try tt.expectEqual(@as(usize, 2), srv.countCallsExact("PUT", "/client/v4/accounts/acct/workers/scripts/veil-garrett-gary"));
     try tt.expectEqual(@as(usize, 3), srv.countCalls("PUT", "/workers/scripts/veil-garrett/secrets"));
     try tt.expectEqual(@as(usize, 1), srv.countCalls("POST", "/workers/scripts/veil-garrett/subdomain"));
     try tt.expectEqual(@as(usize, 2), srv.countCalls("PUT", "/workers/scripts/veil-tots/secrets"));
@@ -2477,7 +3053,102 @@ test "Agent Garrett is launched from its repo's modules beside the tots' Worker 
     try tt.expectEqual(@as(usize, 1), srv.countCalls("DELETE", "/workers/scripts/veil-garrett?force=true"));
     try tt.expectEqual(@as(usize, 2), srv.countCalls("DELETE", "/workers/scripts/veil-tots/secrets/GARRETT_MCP_"));
     try tt.expectEqual(@as(usize, 1), srv.countCalls("POST", "/v1/garrett/clear"));
-    try tt.expectEqual(@as(usize, 32), srv.call_count);
+    try tt.expect(srv.call_count > 36 and srv.call_count < 128);
+}
+
+test "Agent Garrett deploys on its own, with no tater-tot in the account: its pair is derived for a chat or a swarm, a runtime that arrives later is pointed at it, removing the tots keeps it, and removing it touches no tots" {
+    const gpa = tt.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-cftot-garrett-solo-tmp";
+    var ta = try http.testApp(gpa, io, root);
+    defer ta.deinit();
+    if (!curlRuns(gpa, io)) return error.SkipZigTest;
+
+    const routes = [_]fakehttp.Route{
+        .{ .method = "PUT", .path = "/workers/scripts/veil-garrett-upload", .reply = StandIn.ok },
+        .{ .method = "POST", .path = "/workers/scripts/veil-garrett-upload/subdomain", .reply = StandIn.ok },
+        .{ .method = "DELETE", .path = "/workers/scripts/veil-garrett-upload", .reply = StandIn.ok },
+        .{ .method = "PUT", .path = "/build/", .reply = fakehttp.wire("{\"success\":true}") },
+        .{ .method = "PUT", .path = "/workers/scripts/veil-garrett-gary", .reply = StandIn.ok },
+        .{ .method = "GET", .path = "/workers/durable_objects/namespaces", .reply = fakehttp.wire("{\"success\":true,\"result\":[{\"id\":\"gary-namespace\",\"script\":\"veil-garrett-gary\",\"class\":\"GaryContainer\"}]}") },
+
+        .{ .method = "GET", .path = "/garrett/wrangler.toml", .reply = StandIn.toml },
+        .{ .method = "GET", .path = "/garrett/contents/src", .reply = StandIn.list },
+        .{ .method = "GET", .path = "/garrett/src/index.js", .reply = StandIn.src_index },
+        .{ .method = "GET", .path = "/garrett/src/neuron_core.wasm", .reply = StandIn.src_wasm },
+        .{ .method = "GET", .path = "/garrett/src/", .reply = StandIn.src_mjs },
+        .{ .method = "GET", .path = "/accounts/acct/workers/subdomain", .reply = StandIn.subdomain },
+        .{ .method = "GET", .path = "/workers/scripts/veil-garrett/settings", .reply = StandIn.no_script },
+    };
+    var srv: fakehttp.Server = undefined;
+    try srv.startRouted(io, &routes, StandIn.ok);
+    var running = true;
+    defer if (running) srv.stop();
+    var rb: [80]u8 = undefined;
+    ta.app.cf_api_root = try std.fmt.bufPrint(&rb, "http://127.0.0.1:{d}/client/v4", .{srv.port});
+    var ub: [80]u8 = undefined;
+    const stand_in = try std.fmt.bufPrint(&ub, "http://127.0.0.1:{d}", .{srv.port});
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tok: Tok = .{ .key = "oauth-bearer", .account_id = "acct" };
+
+    // 1: no tot, no runtime - the launch goes through: the modules, the address, the upload, its three secrets,
+    //    its route. Nothing is put on a tots' Worker that is not there, and no runtime is told.
+    var st: State = .{ .token_gen = 2 };
+    if (launchGarrett(&ta.app, a, 1, tok, &st)) |msg| {
+        std.debug.print("launch refused: {s}\n", .{msg});
+        return error.TestUnexpectedResult;
+    }
+    try tt.expectEqualStrings(stand_in, st.garrett_url);
+    try tt.expectEqualStrings("acct", st.garrett_account);
+    try tt.expectEqual(@as(u32, 2), st.garrett_gen);
+    try tt.expectEqualStrings("", st.url); // still no tots
+    try tt.expectEqualStrings(stand_in, readState(&ta.app, 1, a).garrett_url);
+    // what a chat turn or a swarm deployment derives IS the bearer the Worker was given
+    const creds = cf_garrett.credsFor(&ta.app, 1, a) orelse return error.TestUnexpectedResult;
+    var mb: [64]u8 = undefined;
+    try tt.expectEqualStrings(garrettToken(&ta.app, 1, "acct", 2, &mb), creds.token);
+    try tt.expectEqualStrings(try std.fmt.allocPrint(a, "{s}/mcp", .{stand_in}), creds.mcp_url);
+    // 2: the tots arrive later: their new runtime is pointed at it (ensureRuntime's step, on its own)
+    try tt.expect(pointTotsAtGarrett(&ta.app, a, 1, tok, st) == null);
+    // 3: the tots go (teardown): the agent stays, its account and generation pinned past the bump
+    st.account = "acct";
+    st.url = stand_in;
+    try tt.expect(removeScript(&ta.app, a, 1, tok, &st) == null);
+    try tt.expectEqual(@as(u32, 3), st.token_gen);
+    try tt.expectEqualStrings("", st.url);
+    try tt.expectEqualStrings(stand_in, st.garrett_url);
+    try tt.expectEqualStrings("acct", st.garrett_account);
+    try tt.expectEqual(@as(u32, 2), st.garrett_gen);
+    const still = cf_garrett.credsFor(&ta.app, 1, a) orelse return error.TestUnexpectedResult;
+    try tt.expectEqualStrings(creds.token, still.token);
+    // 4: removed on its own, with no runtime to tell and no tots' secrets to take
+    try tt.expect(removeGarrett(&ta.app, a, 1, tok, &st) == null);
+    try tt.expectEqualStrings("", st.garrett_url);
+    try tt.expectEqualStrings("", st.garrett_account);
+    try tt.expect(cf_garrett.credsFor(&ta.app, 1, a) == null);
+
+    srv.stop();
+    running = false;
+    try tt.expectEqual(@as(?usize, 0), srv.firstCall("GET", "/garrett/wrangler.toml"));
+    try tt.expectEqual(@as(?usize, 1), srv.firstCall("GET", "/garrett/contents/src"));
+    try tt.expectEqual(@as(usize, 5), srv.countCalls("GET", "/garrett/src/"));
+    try tt.expect(srv.firstCall("PUT", "/accounts/acct/workers/scripts/veil-garrett") != null);
+    try tt.expectEqual(@as(usize, 1), srv.countCallsExact("PUT", "/client/v4/accounts/acct/workers/scripts/veil-garrett"));
+    try tt.expectEqual(@as(usize, 1), srv.countCallsExact("PUT", "/client/v4/accounts/acct/workers/scripts/veil-garrett-gary"));
+    try tt.expectEqual(@as(usize, 3), srv.countCalls("PUT", "/workers/scripts/veil-garrett/secrets"));
+    try tt.expect(srv.firstCall("POST", "/workers/scripts/veil-garrett/subdomain") != null);
+    try tt.expect(srv.firstCall("PUT", "/workers/scripts/veil-tots/secrets") != null);
+    try tt.expectEqual(@as(usize, 2), srv.countCalls("PUT", "/workers/scripts/veil-tots/secrets"));
+    try tt.expectEqual(@as(usize, 0), srv.countCalls("POST", "/v1/garrett/result"));
+    try tt.expectEqual(@as(usize, 0), srv.countCalls("POST", "/v1/garrett/clear"));
+    try tt.expectEqual(@as(usize, 0), srv.countCalls("DELETE", "/workers/scripts/veil-tots/secrets/"));
+    try tt.expect(srv.firstCall("DELETE", "/workers/scripts/veil-tots?force=true") != null);
+    try tt.expect(srv.firstCall("DELETE", "/workers/scripts/veil-garrett?force=true") != null);
+    try tt.expect(srv.call_count > 19 and srv.call_count < 128);
 }
 
 test "RSI seeds the live source, uploads self-edits without a local grant, persists them, and reports compiler failures" {
@@ -3147,4 +3818,59 @@ test "every deployment is a run of its own: a failed one is kept with its error,
     // a run with no folder has no events, and that is not an error
     const none = try std.json.parseFromSliceLeaky(E, a, try runEventsJson(&ta.app, a, 1, "Nova-20261002-000000", 0, 200, false), .{ .ignore_unknown_fields = true });
     try tt.expectEqual(@as(usize, 0), none.events.len);
+}
+
+test "security removal stops its Container and backend before clearing local state" {
+    const gpa = tt.allocator;
+    const io = tt.io;
+    var ta = try http.testApp(gpa, io, "zig-gary-remove-tmp");
+    defer ta.deinit();
+    if (!curlRuns(gpa, io)) return error.SkipZigTest;
+    const routes = [_]fakehttp.Route{
+        .{ .method = "GET", .path = "/workers/durable_objects/namespaces", .reply = fakehttp.wire("{\"success\":true,\"result\":[{\"id\":\"own-gary\",\"script\":\"veil-garrett-gary\",\"class\":\"GaryContainer\"},{\"id\":\"unrelated\",\"script\":\"other\",\"class\":\"GaryContainer\"}]}") },
+    };
+    var srv: fakehttp.Server = undefined;
+    try srv.startRouted(io, &routes, StandIn.ok);
+    defer srv.stop();
+    var rb: [80]u8 = undefined;
+    ta.app.cf_api_root = try std.fmt.bufPrint(&rb, "http://127.0.0.1:{d}/client/v4", .{srv.port});
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var st: State = .{ .garrett_url = "https://agent.example.test", .garrett_account = "acct" };
+    writeState(&ta.app, 1, st);
+    try tt.expect(removeGarrett(&ta.app, a, 1, .{ .key = "test-bearer", .account_id = "acct" }, &st) == null);
+    const frontend = srv.firstCall("DELETE", "/accounts/acct/workers/scripts/veil-garrett?force=true").?;
+    const container = srv.firstCall("DELETE", "/accounts/acct/containers/applications/own-gary").?;
+    const backend = srv.firstCall("DELETE", "/accounts/acct/workers/scripts/veil-garrett-gary?force=true").?;
+    try tt.expect(frontend < container and container < backend);
+    try tt.expect(srv.firstCall("DELETE", "/accounts/acct/containers/applications/unrelated") == null);
+    try tt.expectEqualStrings("", readState(&ta.app, 1, a).garrett_url);
+}
+
+test "failed security Container removal keeps state for an explicit retry" {
+    const gpa = tt.allocator;
+    const io = tt.io;
+    var ta = try http.testApp(gpa, io, "zig-gary-remove-failed-tmp");
+    defer ta.deinit();
+    if (!curlRuns(gpa, io)) return error.SkipZigTest;
+    const routes = [_]fakehttp.Route{
+        .{ .method = "GET", .path = "/workers/durable_objects/namespaces", .reply = fakehttp.wire("{\"success\":true,\"result\":[{\"id\":\"own-gary\",\"script\":\"veil-garrett-gary\",\"class\":\"GaryContainer\"}]}") },
+        .{ .method = "DELETE", .path = "/containers/applications/own-gary", .reply = fakehttp.wire("{\"success\":false,\"errors\":[{\"message\":\"permission denied\"}]}") },
+    };
+    var srv: fakehttp.Server = undefined;
+    try srv.startRouted(io, &routes, StandIn.ok);
+    defer srv.stop();
+    var rb: [80]u8 = undefined;
+    ta.app.cf_api_root = try std.fmt.bufPrint(&rb, "http://127.0.0.1:{d}/client/v4", .{srv.port});
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var st: State = .{ .garrett_url = "https://agent.example.test", .garrett_account = "acct" };
+    writeState(&ta.app, 1, st);
+    const why = removeGarrett(&ta.app, a, 1, .{ .key = "test-bearer", .account_id = "acct" }, &st) orelse return error.TestUnexpectedResult;
+    try tt.expect(std.mem.indexOf(u8, why, "removing the security Container") != null);
+    try tt.expect(std.mem.indexOf(u8, why, "Disconnect and log in with Cloudflare again") != null);
+    try tt.expectEqualStrings("https://agent.example.test", readState(&ta.app, 1, a).garrett_url);
+    try tt.expect(srv.firstCall("DELETE", "/accounts/acct/workers/scripts/veil-garrett-gary?force=true") == null);
 }
