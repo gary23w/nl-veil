@@ -8,7 +8,7 @@
 
 ## Start from the uncomfortable fact
 
-A chat turn runs **on the server, in the server's process, as the OS user who started `veil`**. A browser cannot execute a shell command, so the web client deliberately leaves the "run tools on my machine" flag out of its request and the server executes the turn's tools itself.
+A chat turn's local built-in tools run **on the server, in the server's process, as the OS user who started `veil`**. A browser cannot execute a shell command, so the web client deliberately leaves the "run tools on my machine" flag out of its request. Agent Garrett is a separate execution path: its tools are called server-side over authenticated MCP and run in the account's Cloudflare deployment.
 
 That is the whole reason this page exists. Handing someone a login is handing them a prompt that reaches a real machine. What stops that from being a host compromise is a capability gate, not good manners.
 
@@ -37,17 +37,18 @@ The memory store is per-uid for a specific reason: it backs `get_credential`, an
 A non-admin turn runs with `caps = .sandboxed`. The check is the **first thing** in `tools.execute`, before any tool-specific logic, so there is exactly one place a capability decision is made:
 
 ```zig
-if (ctx.caps == .sandboxed and !sandboxAllowed(name))
+if (ctx.caps == .sandboxed and !sandboxAllowed(name) and
+    !garrett.isTool(name) and grantedRecipe(ctx, name) == null)
     return "that tool is not available in this workspace — …";
 ```
 
-It is an **allowlist**, deliberately. `execute` falls through to authored tools for unknown names, and a denylist would be defeated the moment a model called `make_tool`.
+Local tools use an **allowlist**. A recipe granted to this caller can also enter the dispatcher, but each recipe step is checked under the same capabilities. Garrett names (`security_*`, `garrett_tools`, and `garrett`) enter a separate authenticated MCP path. They require the caller's configured deployment credentials and an online execution context; an unavailable or disabled deployment cannot execute a call.
 
 The HTTP tool endpoint does not keep a second list. `worker/chat/tools.zig` delegates to the same `tools.sandboxAllowed` predicate, because a tool added to one list and forgotten in the other is exactly how a hole gets opened quietly.
 
 ## What a sandboxed account keeps
 
-The hive mind is the product, and a sandboxed user keeps all of it. What they lose is the ability to act on the machine.
+A sandboxed user keeps research, memory and coordination, while the local machine's execution tools stay restricted. From v1.1.12, an opted-in user also receives the complete Garrett security catalogue from their own Cloudflare deployment; this does not grant local host access.
 
 - **Research** — `web_search`, `web_fetch`, `fetch_json`, `read_url`
 - **The entire memory surface** — `recall`, `recall_hive`, `observe`, `share`, `note_stance`, `save_skill`, `journal`, `set_directive`, `probe`
@@ -56,7 +57,15 @@ The hive mind is the product, and a sandboxed user keeps all of it. What they lo
 - **`pixel_search`** — local retrieval over the caller's own attachments; renders nothing, touches no network
 - **Read-only swarm observation** — `swarm_status`, `swarm_asks`, and `stop_swarm`, each uid-checked by its own handler
 
-## What it does not get
+## Garrett security tools in v1.1.12
+
+Deploy security tools in **Settings → Models**, wait for the cloud build to finish, then enable **Agent Garrett** for the intended chat, swarm or tater-tot. Each receives the 166 tools with their typed argument schemas under `security_<name>`. Admin status is not required to use the caller's own Garrett deployment. The per-account MCP credentials remain server-side for chat calls.
+
+Gary shell and file tools operate inside the dedicated Cloudflare Container. They do not automatically reach the user's laptop: local defense work uses NL-Veil as the harness to provide evidence or perform a requested local action. Generic `mcp_discover` / `mcp_call` and local host tools retain their existing capability checks. Scheduled unattended chat runs do not inherit the desktop Garrett toggle.
+
+See [Security tools](security-tools.md) for setup, runtime status, feature opt-ins and personal defense workflows.
+
+## Local tools it does not get
 
 Code execution (`run_python`, `run_tests`), host control (`host_status`, `host_command`, `host_explore`), engine self-modification (`patch_system`, `propose_change`, `simulate_change`), tool authoring (`make_tool`), egress and recon (`stage_delivery`, `osint_scan`), the browser verbs, `pixel_ingest` / `pixel_capture`, and the MCP verbs.
 
