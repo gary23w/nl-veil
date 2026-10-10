@@ -46,6 +46,8 @@ test {
     _ = @import("worker/modelpull.zig"); // weights downloader: repo resolve, resume, sha verify — via fakehttp
     _ = @import("worker/fakehttp.zig"); // the test stand-in itself: every server on a port of its own
     _ = @import("worker/chat/context.zig");
+    _ = @import("worker/chat/belt.zig"); // the tool map: the belt as a tree the model walks
+    _ = @import("worker/chat/net.zig"); // the net: the working span as a DAG, the critical chain, the source unfolding
     _ = @import("worker/chat/engine.zig");
     _ = @import("worker/chat/overlay.zig"); // recall overlay: the per-thought working field, refractory + firing
     _ = @import("worker/chat/paths.zig");
