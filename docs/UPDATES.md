@@ -1,5 +1,9 @@
 # Desktop updates and release connectivity
 
+## v1.1.16
+
+Nothing to do after updating. Gary's 4tope is on by default: when a long turn compacts, its continuation is written from the turn's own working log instead of by a model. To restore the model-written continuation, set `NL_HANDOFF=model` before starting the server. The tool tree is off until you set `NL_TOOL_MAP=1`; with it unset, the tool belt is exactly what v1.1.15 sent. Existing conversations continue as before.
+
 ## v1.1.12
 
 This release adds the full Agent Garrett toolset and dedicated Cloudflare runtime. After updating, reconnect an existing Cloudflare login once for Containers permissions, then choose **Settings → Models → Deploy security tools** (or **Update security tools**). The animated loading bar remains visible while the cloud runtime prepares. Re-enable Agent Garrett separately for each feature that should use it; the chat control is beside auto-loop. [Release results](release/RELEASE-v1.1.12.md) · [Security setup](docs-src/guide/security-tools.md).

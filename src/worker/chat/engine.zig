@@ -3987,8 +3987,11 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
                         if (!by_model) {
                             var g: ?dag.Graph = dag.Graph.fromSpan(gpa, conv_buf.items[@min(assembled_len, conv_buf.items.len)..]) catch null;
                             defer if (g) |*gg| gg.deinit();
+                            var paths: std.ArrayListUnmanaged(u8) = .empty;
+                            defer paths.deinit(gpa);
+                            ledgerPaths(gpa, &file_ledger, &paths);
                             if (g) |*gg| {
-                                if (gg.unfold(gpa, hcap - @min(hcap / 4, 400), ground.items)) |rendered| {
+                                if (gg.unfold(gpa, hcap - @min(hcap / 4, 400), paths.items)) |rendered| {
                                     if (rendered.len > 0) {
                                         handoff = rendered;
                                         emitKV(app, conv_dir, "trace", "text", "continuation state: unfolded by Gary's 4tope from the turn's own span (no model call)");
@@ -5240,6 +5243,51 @@ fn ledgerBlock(gpa: std.mem.Allocator, ledger: *const FileLedger, out: *std.Arra
         out.appendSlice(gpa, std.fmt.bufPrint(&mb, " … +{d} more", .{ledger.files.items.len - listed}) catch "") catch return;
     }
     out.append(gpa, ']') catch return;
+}
+
+/// The ledger as Gary's 4tope's ON DISK line wants it: the paths and their sizes, nothing else. ledgerBlock's
+/// framing sentence is ~300 bytes, and under the carry's quarter-budget clip it was ALL that survived: the first
+/// live 4tope cut (2026-10-10 smoke) rendered "ON DISK: [ENGINE GROUND TRUTH — these files were ALREADY WRITTEN
+/// ... a file NOT" and never named notes.md. The carry's header already says ON DISK is real; the line needs only
+/// what is on disk. Says so when the ledger knows it is incomplete.
+fn ledgerPaths(gpa: std.mem.Allocator, ledger: *const FileLedger, out: *std.ArrayListUnmanaged(u8)) void {
+    if (ledger.files.items.len == 0) return;
+    var listed: usize = 0;
+    for (ledger.files.items) |f| {
+        if (out.items.len > 1200) break;
+        if (listed > 0) out.appendSlice(gpa, ", ") catch return;
+        out.appendSlice(gpa, f.path) catch return;
+        var bb: [32]u8 = undefined;
+        out.appendSlice(gpa, std.fmt.bufPrint(&bb, " ({d} B)", .{f.bytes}) catch "") catch return;
+        listed += 1;
+    }
+    if (listed < ledger.files.items.len) {
+        var mb: [40]u8 = undefined;
+        out.appendSlice(gpa, std.fmt.bufPrint(&mb, " … +{d} more", .{ledger.files.items.len - listed}) catch "") catch return;
+    }
+    if (ledger.partial) out.appendSlice(gpa, " (this list may be incomplete)") catch return;
+}
+
+test "the 4tope's ON DISK line is the paths themselves, never the framing sentence" {
+    const gpa = std.testing.allocator;
+    var ledger: FileLedger = .{};
+    defer ledger.deinit(gpa);
+    try ledger.files.append(gpa, .{ .path = try gpa.dupe(u8, "notes.md"), .bytes = 22 });
+    try ledger.files.append(gpa, .{ .path = try gpa.dupe(u8, "src/app.py"), .bytes = 1400 });
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(gpa);
+    ledgerPaths(gpa, &ledger, &out);
+    try std.testing.expectEqualStrings("notes.md (22 B), src/app.py (1400 B)", out.items);
+    ledger.partial = true;
+    out.clearRetainingCapacity();
+    ledgerPaths(gpa, &ledger, &out);
+    try std.testing.expect(std.mem.endsWith(u8, out.items, "(this list may be incomplete)"));
+    // an empty ledger renders nothing, so the carry omits the line
+    var empty: FileLedger = .{};
+    defer empty.deinit(gpa);
+    out.clearRetainingCapacity();
+    ledgerPaths(gpa, &empty, &out);
+    try std.testing.expectEqual(@as(usize, 0), out.items.len);
 }
 
 /// One drive step's woven context; both halves gpa-owned ("" = absent). `step` — the engine's file-ledger
