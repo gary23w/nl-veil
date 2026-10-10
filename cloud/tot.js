@@ -740,8 +740,7 @@ function missingNote(env, cfg) {
   const miss = [];
   if (!env.BROWSER) miss.push("a browser (browser_*)");
   if (!env.PY) miss.push("Python (run_python, skills)");
-  if (!wantsGarrett(cfg)) miss.push("Agent Garrett security tools (enable Agent Garrett for this tot)");
-  else if (!hasGarrett(env)) miss.push("Agent Garrett security tools (the deployment connection is not ready)");
+  if (wantsGarrett(cfg) && !hasGarrett(env)) miss.push("Agent Garrett security tools (the deployment connection is not ready)");
   return miss.length ? `NOT AVAILABLE in this account right now: ${miss.join(", ")}. Work with the tools listed.\n` : "";
 }
 
