@@ -123,3 +123,9 @@ Entered only through `chat_service.postMessage`. ON by default; the kill switch 
 ---
 
 *Case file grounded in the module's `//!` header and public API.*
+
+## Security tools in v1.1.12
+
+A chat request with `garrett` enabled resolves only the authenticated user’s own deployment credentials. Discovery adds the individual `security_<name>` tools with their original typed schemas. These calls execute on the server that holds the credentials; delegated tool events do not receive the MCP bearer token. Offline turns do not add cloud security tools.
+
+[Security deployment and use guide](../../guide/security-tools.md).

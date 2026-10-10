@@ -74,6 +74,7 @@ pub const Poller = struct {
     last_cfm_s: i64 = 0, // Cloudflare live-models fetch throttle (only while connected; 0 = fetch next tick)
     last_r2_s: i64 = 0, // R2 backup snapshot throttle (only while connected; the card's "backed up 2m ago")
     last_tun_s: i64 = 0, // Cloudflare Tunnel snapshot throttle (3s while a flip is in flight, else 15s)
+    last_gar_s: i64 = 0, // Security tools snapshot throttle (only while connected; 3s while a deploy is in flight, else 20s)
     last_tots_s: i64 = 0, // tot roster throttle (only while the Tots tab is drawn; 0 = poll next tick)
     last_tot_ev_s: i64 = 0, // the selected tot's event tail
     last_tot_pad_s: i64 = 0, // the shared scratchpad
@@ -172,6 +173,8 @@ pub const Poller = struct {
                 .oauth_cf_logout => self.doOauthCfLogout(),
                 .cf_tunnel_on => self.doCfTunnel(true, std.mem.eql(u8, c.idStr(), "domain"), c.textStr()),
                 .cf_tunnel_off => self.doCfTunnel(false, false, ""),
+                .garrett_deploy => self.doGarrett(true),
+                .garrett_remove => self.doGarrett(false),
                 // a "live ↗" on a Cloudflare deploy chip: the URL rides Command.text, the browser opens it
                 .open_url => if (std.mem.startsWith(u8, c.textStr(), "https://")) self.openUrl(c.textStr()),
                 .builtin_pull => self.doBuiltinVerb(.pull),
@@ -775,6 +778,18 @@ pub const Poller = struct {
                 if (now_s - self.last_tun_s >= tun_every) {
                     self.last_tun_s = now_s;
                     self.refreshCfTunnel();
+                }
+                // Security tools snapshot — what the Settings card and every "use Security tools" box wait on. 20s;
+                // 3s while a deploy or removal is in flight, so the card moves as soon as the server answers.
+                const gar_busy = blk: {
+                    self.store.lock();
+                    defer self.store.unlock();
+                    break :blk self.store.garrett_busy;
+                };
+                const gar_every: i64 = if (gar_busy) 3 else 20;
+                if (now_s - self.last_gar_s >= gar_every) {
+                    self.last_gar_s = now_s;
+                    self.refreshGarrett();
                 }
             }
         }
@@ -1891,6 +1906,93 @@ pub const Poller = struct {
             }
         }
         self.last_tun_s = 0; // poll promptly so the state line moves at once
+    }
+
+    /// GET /api/v1/tots/garrett → the store's Security tools snapshot: deployed or not, its address, the last
+    /// refusal. A login the route refuses (it is admin-gated, like the tots) reads as "not deployed" and is not
+    /// asked again for a minute.
+    fn refreshGarrett(self: *Poller) void {
+        var tbuf: [128]u8 = undefined;
+        const tok = self.tokenSnap(&tbuf);
+        const resp = netcli.garrettStatus(self.io, self.gpa, self.port(), tok) orelse return;
+        defer if (resp.body.len > 0) self.gpa.free(resp.body);
+        if (resp.status == 401 or resp.status == 403) {
+            self.last_gar_s += 60;
+            self.store.lock();
+            defer self.store.unlock();
+            self.store.garrett_seen = true;
+            self.store.garrett_deployed = false;
+            return;
+        }
+        if (resp.status != 200) return;
+        const deployed = std.mem.indexOf(u8, resp.body, "\"launched\":true") != null;
+        var ub: [200]u8 = undefined;
+        const url = valueForKey(resp.body, "url", &ub);
+        var eb: [200]u8 = undefined;
+        const err = valueForKey(resp.body, "error", &eb);
+        self.store.lock();
+        defer self.store.unlock();
+        self.store.garrett_seen = true;
+        self.store.garrett_deployed = deployed;
+        self.store.garrett_building = std.mem.indexOf(u8, resp.body, "\"runtime_building\":true") != null;
+        self.store.garrett_ready = std.mem.indexOf(u8, resp.body, "\"runtime_ready\":true") != null;
+        const un = @min(url.len, self.store.garrett_url.len);
+        @memcpy(self.store.garrett_url[0..un], url[0..un]);
+        self.store.garrett_url_len = un;
+        if (!self.store.garrett_busy) { // a deploy in flight owns the error line until it answers
+            const en = @min(err.len, self.store.garrett_err.len);
+            @memcpy(self.store.garrett_err[0..en], err[0..en]);
+            self.store.garrett_err_len = en;
+        }
+    }
+
+    /// POST (deploy) or DELETE (remove) /api/v1/tots/garrett. A deploy fetches the agent's modules from its repo
+    /// and uploads them into the account - up to a few minutes - so the card says "deploying..." until it answers.
+    fn doGarrett(self: *Poller, deploy: bool) void {
+        {
+            self.store.lock();
+            defer self.store.unlock();
+            if (self.store.garrett_busy) return; // one at a time
+            self.store.garrett_busy = true;
+            self.store.garrett_err_len = 0;
+        }
+        defer {
+            self.store.lock();
+            self.store.garrett_busy = false;
+            self.store.unlock();
+            self.last_gar_s = 0; // read the result back at once
+        }
+        var tbuf: [128]u8 = undefined;
+        const tok = self.tokenSnap(&tbuf);
+        const resp = (if (deploy) netcli.garrettDeploy(self.io, self.gpa, self.port(), tok) else netcli.garrettRemove(self.io, self.gpa, self.port(), tok)) orelse {
+            self.store.pushNotif("Security tools", "server unreachable - is it running?", 2);
+            return;
+        };
+        defer if (resp.body.len > 0) self.gpa.free(resp.body);
+        if (resp.status < 200 or resp.status >= 300) {
+            var eb: [200]u8 = undefined;
+            const err = valueForKey(resp.body, "err", &eb);
+            const msg: []const u8 = if (err.len > 0) err else if (deploy) "the server could not deploy it" else "the server could not remove it";
+            self.store.pushNotif(if (deploy) "Security tools not deployed" else "Security tools not removed", msg, 2);
+            self.store.lock();
+            defer self.store.unlock();
+            const en = @min(msg.len, self.store.garrett_err.len);
+            @memcpy(self.store.garrett_err[0..en], msg[0..en]);
+            self.store.garrett_err_len = en;
+            return;
+        }
+        var ub: [200]u8 = undefined;
+        const url = valueForKey(resp.body, "url", &ub);
+        {
+            self.store.lock();
+            defer self.store.unlock();
+            self.store.garrett_seen = true;
+            self.store.garrett_deployed = deploy;
+            const un = if (deploy) @min(url.len, self.store.garrett_url.len) else 0;
+            @memcpy(self.store.garrett_url[0..un], url[0..un]);
+            self.store.garrett_url_len = un;
+        }
+        self.store.pushNotif(if (deploy) "Security tools deployed" else "Security tools removed", if (deploy and url.len > 0) url else if (deploy) "available automatically in chat, swarms and tater-tots" else "chats, swarms and tater-tots lose its tools", 1);
     }
 
     fn notifyTransitions(self: *Poller, online: bool, swarms: []const scan.SwarmSummary, sel: []const u8, sel_metrics: scan.Metrics) void {

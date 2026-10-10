@@ -75,6 +75,12 @@ Copy-Item $Server (Join-Path $Out 'veil.exe')
 if ($Neuron) { Copy-Item $Neuron (Join-Path $Out 'bin\neuron.exe') }
 if (-not $Neuron) { throw 'refusing incomplete desktop release: neuron is required' }
 'veil-bundle-v1' | Set-Content -Encoding ascii (Join-Path $Out 'veil-install.txt')
+Copy-Item -LiteralPath (Join-Path $Root 'LICENSE') -Destination (Join-Path $Out 'LICENSE')
+$SourceDir = Join-Path $Out 'cloud'
+New-Item -ItemType Directory -Force -Path $SourceDir | Out-Null
+foreach ($SourceFile in @('GARY-LICENSE', 'GARY-NOTICE', 'gary-source.tar.gz', 'gary-bootstrap.py', 'gary-gateway.mjs', 'gary-worker.mjs', 'security-tools.txt')) {
+  Copy-Item -LiteralPath (Join-Path $Root ('cloud\' + $SourceFile)) -Destination (Join-Path $SourceDir $SourceFile)
+}
 Copy-Item $Server (Join-Path $Dist "veil-update-v$Version-$Os-$Arch-app")
 Copy-Item $Neuron (Join-Path $Dist "veil-update-v$Version-$Os-$Arch-neuron")
 
@@ -87,6 +93,11 @@ veil.exe %*
 
 @"
 the veil - v$Version ($Os/$Arch)
+
+LICENSES AND SECURITY RUNTIME SOURCE
+  NL-Veil: MIT (LICENSE). Gary: AGPL-3.0 (cloud/GARY-LICENSE).
+  Attribution and corresponding source: cloud/GARY-NOTICE and cloud/gary-source.tar.gz.
+  https://github.com/gary23w/nl-veil/tree/v$Version/cloud
 
 Run:  double-click start.cmd  (or veil.exe directly - same thing)
 It opens the desktop dashboard and runs its server on http://127.0.0.1:8787,

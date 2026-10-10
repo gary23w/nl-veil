@@ -135,6 +135,15 @@ def smoke_bundle(archive, work, version, legacy):
     engine = app.parent / "bin" / ("neuron.exe" if WINDOWS else "neuron")
     if not engine.is_file():
         raise RuntimeError("Memory engine missing from bundle")
+    release_version = tuple(int(part) for part in version.split("-", 1)[0].split("."))
+    if release_version >= (1, 1, 12):
+        for name in ("LICENSE", "cloud/GARY-LICENSE", "cloud/GARY-NOTICE",
+                     "cloud/gary-source.tar.gz", "cloud/gary-bootstrap.py",
+                     "cloud/gary-gateway.mjs", "cloud/gary-worker.mjs", "cloud/security-tools.txt"):
+            if not (app.parent / name).is_file():
+                raise RuntimeError(f"License or corresponding source missing from bundle: {name}")
+        if "GNU AFFERO GENERAL PUBLIC LICENSE" not in (app.parent / "cloud/GARY-LICENSE").read_text():
+            raise RuntimeError("Gary AGPL license missing from bundle")
     for p in install.rglob("*"):
         if p.name in {"data", ".desktop_key", ".server.key"} or ".sqlite" in p.name:
             raise RuntimeError(f"Runtime state shipped in release: {p.name}")

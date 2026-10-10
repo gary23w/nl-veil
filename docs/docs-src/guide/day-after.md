@@ -1,6 +1,6 @@
 # the day after
 
-**Covers:** `cloud/tot.js` (the tater-tot runtime, VERSION 8), `src/config/cf_tot.zig` (the launcher and the relay), `src/cli/tot.zig` (`guard`, `verify`, `garrett`)  
+**Covers:** `cloud/tot.js` (the tater-tot runtime, VERSION 9), `src/config/cf_tot.zig` (the launcher and the relay), `src/config/cf_garrett.zig` + `src/worker/garrett.zig` (Agent Garrett's pair and belt for chats and swarms), `src/cli/tot.zig` (`guard`, `verify`, `garrett`)
 **Kind:** operator walkthrough  
 **Description:** What a tater-tot is for when a large AI incident lands: the week in which the labs go quiet, the hosted models get locked down or withdrawn, the attribution fight starts, and the rules get written. How to arm one before that week, what each piece does, and what it does not do.
 
@@ -23,18 +23,18 @@ And one thing must *not* go wrong: a tot must never become part of the swarm. Th
 Deploy it as a defender, with a leash, and give it something to watch:
 
 ```sh
+veil --tater garrett launch
 veil --tater deploy "Keep the public services below answering; investigate and report every tripwire with evidence" \
-    --name Sentinel --posture defend --leash 3600 --pace 120
+    --name Sentinel --posture defend --leash 3600 --pace 120 --garrett
 veil --tater guard Sentinel add https://status.example.org/ --text "All Systems Operational" --every 60
 veil --tater guard Sentinel add https://api.example.org/health --status 200 --every 60
 veil --tater guard Sentinel add https://www.example.org/ --pin --every 300
 veil --tater guard Sentinel add dns:example.org --type NS --every 300
 veil --tater guard Sentinel add dns:example.org --type MX --every 600
 veil --tater key alert https://discord.com/api/webhooks/...
-veil --tater garrett launch
 ```
 
-Every one of those is a runtime command too (`/guard add ...`, `/posture defend`, `/leash 3600`) in the desk's Tater-tots tab. A tot guards at most 16 targets; deploy another for more.
+Every one of those is a runtime command too (`/guard add ...`, `/posture defend`, `/leash 3600`, `/garrett on`) in the desk's Tater-tots tab, and the first line is the desk's Settings button, *Deploy Agent Garrett*. A tot guards at most 16 targets; deploy another for more.
 
 ## The guard: a watch that needs no model
 
@@ -45,7 +45,7 @@ Every heartbeat, **before** the model is asked and whether or not one answers, t
 
 A change of state is a **tripwire**. It goes four places at once: a `tripwire` event (chained, red in the console), an entry in the scratchpad every tot of the account reads, a directive in the tot's own inbox (its next iteration is brought forward and reads the tripwire as outranking its plan), and, with the `alert` key, one JSON POST to your webhook. A Discord or Slack webhook URL renders it as it is (`content` and `text` both carry the one line); anything else gets the event beside them. A recovery is said the same way, with how long the target was down. A pinned page's content changing, or a DNS answer changing, is noted once as `CHANGED` and becomes the new baseline, so round-robin addresses do not flap.
 
-The alarm fires at the guard's cadence (`--every`, 30 s and up; the tot's pace otherwise) and the goal loop keeps its own next time, so a dead model, a model that only reasons, a spent daily budget and the loop's own backoff never stop the watch. The guard's checks always name the tot: `User-Agent: veil-tot/8 (Sentinel; +https://github.com/gary23w/nl-veil)`.
+The alarm fires at the guard's cadence (`--every`, 30 s and up; the tot's pace otherwise) and the goal loop keeps its own next time, so a dead model, a model that only reasons, a spent daily budget and the loop's own backoff never stop the watch. The guard's checks always name the tot: `User-Agent: veil-tot/9 (Sentinel; +https://github.com/gary23w/nl-veil)`.
 
 `veil --tater guard Sentinel` lists what it watches and the state of each target; `veil --tater` shows `guard N` and `TRIPPED` on the roster.
 
@@ -76,16 +76,18 @@ Every call from your veil is contact: the mirror's roster poll once a minute whi
 
 A tot with a leash cannot be the agent that keeps acting after its operator has gone dark. The guard, which only reads and reports, is what it does on its own.
 
-## Agent Garrett: a blue-team belt
+## Agent Garrett: the full security toolkit
 
-[Agent Garrett](https://github.com/gary23w/garrettstimpson.ca/tree/main/agent) is a Cloudflare Worker with some ninety security tools behind a stateless MCP endpoint: CVE / KEV / EPSS intel, DNS and certificate transparency, RDAP, email security posture (SPF / DMARC / DNSSEC), subdomain takeover checks, IOC extraction and defanging, evidence manifests (content receipts), forensic timelines, event-log triage, hash reputation. Passive by default; the active ones only as its operator allows.
+Agent Garrett now provides 166 tools: 94 existing security tools and 72 Gary tools. **Settings → Models → Deploy security tools** deploys its edge MCP Worker, private execution Worker, dedicated Cloudflare Container and R2 storage into your account. The initial build takes place in Cloudflare and shows progress in Settings. Existing Cloudflare logins need Containers permissions; reconnect once when upgrading.
 
-`veil --tater garrett launch` puts it in your account beside the tater-tots: the veil reads the agent's five modules from its repo, uploads them as one Worker, `veil-garrett`, with the policy the agent's own `wrangler.toml` ships (safe mode, confirmation required, no active and no dark-web tools over MCP), sets its secrets (its MCP bearer; a password locking its chat UI, which is open to anyone with the address otherwise; a session secret), enables its address, and points the tots at it with two secrets on their Worker. From their next iteration the tots have `garrett_tools` (the list, with the argument names) and `garrett` (`{"name": "dns_records", "args": {"domain": "example.org"}}`); a tool's text comes back with its evidence metadata. A tot can ask for the launch itself (`garrett_launch`): your veil launches it on its next sync while it is running. `veil --tater garrett` shows it; `garrett password` prints the UI password; `garrett rm` removes it; removing the last tater-tot removes it too. An Agent Garrett you deployed yourself works as well: `veil --tater key garrett_url https://.../mcp` and `key garrett_token <token>`.
+Enable it separately for chat (**Agent Garrett: on/off** beside auto-loop), a swarm or a tater-tot (the deploy form's **Agent Garrett** checkbox). The CLI supports `veil chat --garrett`; a tot can change its setting with `/garrett on|off`. Each opted-in feature receives typed `security_<name>` tools. `garrett_tools` and `garrett` remain available for compatibility.
 
-## What this is not
+Use NL-Veil as the local harness for your machine's evidence and controls. Gary's cloud filesystem is separate; the local-machine grant for a tot remains a separate choice. The complete deployment enables active and Gary tools. Choose the checks appropriate to your incident and configure a tot's posture and leash separately. [Security setup and personal-defense workflows](security-tools.md) explains that boundary and the verified live checks.
 
-A Worker in a Cloudflare account does not defend a grid, a payment rail or a water plant, and nothing here attacks anything: there is no scanner, no exploit, no counter-attack, and the DEFEND prompt forbids probing what the tot was not asked to guard. What a tot does in that week is the part a lone technician can: keep watching the public face of what matters to you when every hosted model is dark, keep an unforgeable record of what it saw and when, raise the alarm where you will see it, look things up with a blue-team belt that does not route through a lab, and never, by construction, be the anonymous agent in the story.
+## Choose the work and preserve its evidence
 
-## What is proven, and what is not
+The guard keeps watching at its configured cadence; an opted-in Agent Garrett supplies the full security toolkit for the investigation you request. Active and Gary tools are enabled. Give the tot a target set and the intended actions, configure its posture and leash, and retain the local mirror of its events and findings. The dedicated cloud runtime does not automatically have access to your laptop's filesystem or home network.
 
-Every piece above is covered against stand-ins: the runtime's node suite (the guard through a dead model and a spent budget, DNS drift, the chain and a tampered row, DEFEND, the leash, Agent Garrett over MCP and the launch request) and the Zig suite (the upload body, the launch flow against the stand-in API with a refusal and its quarter-hour backoff, the chain verifier against the runtime's vectors). Not yet proven on a live account: a tripwire on a real Worker, a real Discord or Slack webhook rendering the POST, and the Agent Garrett launch against the real Cloudflare API. The agent's modules are fetched from its `main` branch at launch, so its own changes land at the next launch, and a change to its `wrangler.toml` bindings would need the launcher's metadata updated to match.
+## Verification
+
+Native and cloud regression suites cover guards, event chaining, posture, leash behavior, typed MCP discovery and dispatch, feature opt-ins and deployment/removal. On October 9, 2026, a live NL-Veil chat called the deployed Cloudflare runtime: Gary's command printed the requested marker and Linux, cloud shell listing returned its session list, and IOC extraction returned defanged synthetic indicators. A fresh chat completed with the exact cloud output after the desktop restarted. The live catalogue contains 94 edge tools and 72 Gary tools. Webhook delivery still depends on the operator's configured endpoint; the release's live checks exercise MCP and the dedicated execution runtime.

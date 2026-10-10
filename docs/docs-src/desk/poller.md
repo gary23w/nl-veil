@@ -39,3 +39,9 @@ Concurrency: one io-owning thread + a Store mutex is the entire model. Everythin
 ---
 
 *Case file grounded in the module's `//!` header and public API.*
+
+## Security tools in v1.1.12
+
+The poller handles security deployment and removal commands and refreshes authenticated runtime status. Upload activity and cloud build activity are separate store fields, allowing the loading bar to continue after the deployment request has returned. Ready or failed runtime states clear the build indicator.
+
+[Security deployment and use guide](../guide/security-tools.md).

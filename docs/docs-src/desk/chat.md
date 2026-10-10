@@ -69,3 +69,9 @@ The **local fallback engine** is the desk's own earlier chat brain, kept as a re
 ---
 
 *Case file grounded in the module's `//!` header and public API.*
+
+## Security tools in v1.1.12
+
+The composer uses a plain clickable **Agent Garrett: on/off** label beside auto-loop. The choice is persisted in Settings and sent with each chat request. Tools are resolved server-side for the authenticated user, and switching this feature off prevents the catalogue from being added to that turn.
+
+[Security deployment and use guide](../guide/security-tools.md).

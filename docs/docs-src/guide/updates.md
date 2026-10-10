@@ -22,3 +22,7 @@ or notarization and does not bypass those protections.
 The [full update and recovery guide](https://github.com/gary23w/nl-veil/blob/main/docs/UPDATES.md)
 documents the asset contract, preserved data, backup recovery, network destinations and test limits.
 The [updater source sheet](#doc=desk/updater) describes the implementation.
+
+## v1.1.12 security runtime
+
+After installing v1.1.12, reconnect an existing Cloudflare login once for Containers permissions, then deploy or update security tools from Settings → Models. The loading bar covers upload and runtime preparation. Enable Agent Garrett independently in chat, swarm deployment and tater-tot deployment. [Security setup and results](security-tools.md).

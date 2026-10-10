@@ -23,9 +23,11 @@ pub fn run(
     // conversation id: explicit arg, else a fresh timestamp-free hex the server will create on first message.
     var conv_buf: [64]u8 = undefined;
     var conv: []const u8 = "";
-    // `--say "<message>"` sends that message first; `--once` leaves after one turn (how `veil goal` runs).
+    // `--say "<message>"` sends that message first; `--once` leaves after one turn (how `veil goal` runs);
+    // `--garrett` puts the user's own Agent Garrett (Settings > Deploy Agent Garrett) on every turn's belt.
     var say: []const u8 = "";
     var once = false;
+    var use_garrett = false;
     {
         var i: usize = 0;
         while (i < args.len) : (i += 1) {
@@ -37,6 +39,8 @@ pub fn run(
                 }
             } else if (std.mem.eql(u8, a, "--once")) {
                 once = true;
+            } else if (std.mem.eql(u8, a, "--garrett")) {
+                use_garrett = true;
             } else if (a.len > 0 and a[0] != '-' and conv.len == 0) {
                 const n = @min(a.len, conv_buf.len);
                 @memcpy(conv_buf[0..n], a[0..n]);
@@ -142,7 +146,10 @@ pub fn run(
         jb.appendSlice(ctx.gpa, ",\"prompt_api_key\":") catch continue;
         appendJsonStr(ctx.gpa, &jb, prompt_key);
         // client mode: the server delegates tool calls back to us and we run them locally.
-        jb.appendSlice(ctx.gpa, ",\"tool_client\":true,\"loop\":0}") catch continue;
+        jb.appendSlice(ctx.gpa, ",\"tool_client\":true,\"loop\":0") catch continue;
+        // Agent Garrett's belt, when asked for: the server derives the pair; a missing deployment is a turn without the verbs
+        if (use_garrett) jb.appendSlice(ctx.gpa, ",\"garrett\":true") catch continue;
+        jb.appendSlice(ctx.gpa, "}") catch continue;
 
         var pb: [220]u8 = undefined;
         const path = std.fmt.bufPrint(&pb, "/api/v1/chat/convs/{s}/messages", .{conv}) catch continue;

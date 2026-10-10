@@ -76,6 +76,7 @@ pub const Row = struct {
     queue: u32 = 0,
     lessons: u32 = 0,
     local: bool = false, // may queue jobs for the veil on the owner's machine
+    garrett: bool = false, // Agent Garrett's tools are on its belt (asked for, and the account has the agent)
     paused: bool = false,
     folder: [160]u8 = [_]u8{0} ** 160, // its local folder, relative to the data dir ("" until the server names one)
     created: i64 = 0, // when this deployment of it started (ms): the same name deployed again is another run
@@ -124,6 +125,7 @@ pub const Roster = struct {
     python: bool = false, // the tots can run Python (and keep skills)
     browser: bool = false, // the tots can drive a browser
     neuron: bool = false, // the tots have neuron-db: recall by meaning, stances, a mood
+    garrett: bool = false, // Agent Garrett is deployed in the account (Settings): the deploy form's box is live
     note: [200]u8 = [_]u8{0} ** 200, // why one of those is missing, in Cloudflare's words
     note_len: u8 = 0,
     max: u32 = DEFAULT_MAX, // how many this account may run (the owner sets it)
@@ -188,12 +190,13 @@ const JTot = struct {
     queue: i64 = 0,
     lessons: i64 = 0,
     local: bool = false,
+    garrett: bool = false,
     paused: bool = false,
     folder: []const u8 = "",
     goal: ?JGoal = null,
     created: i64 = 0,
 };
-const JRoster = struct { ok: bool = false, max: i64 = DEFAULT_MAX, connected: bool = false, deployed: bool = false, reachable: bool = false, current: bool = true, python: bool = false, browser: bool = false, neuron: bool = false, tools_note: []const u8 = "", last_error: []const u8 = "", tots: []const JTot = &.{} };
+const JRoster = struct { ok: bool = false, max: i64 = DEFAULT_MAX, connected: bool = false, deployed: bool = false, reachable: bool = false, current: bool = true, python: bool = false, browser: bool = false, neuron: bool = false, garrett: bool = false, tools_note: []const u8 = "", last_error: []const u8 = "", tots: []const JTot = &.{} };
 
 fn rowOf(h: JTot) Row {
     var r: Row = .{};
@@ -216,6 +219,7 @@ fn rowOf(h: JTot) Row {
     r.queue = u32of(h.queue);
     r.lessons = u32of(h.lessons);
     r.local = h.local;
+    r.garrett = h.garrett;
     r.paused = h.paused;
     if (h.folder.len <= r.folder.len and std.mem.indexOf(u8, h.folder, "..") == null) r.folder_len = @intCast(put(&r.folder, h.folder));
     r.created = h.created;
@@ -305,7 +309,7 @@ pub fn parseRoster(gpa: std.mem.Allocator, body: []const u8, out: *Roster) bool 
     const p = std.json.parseFromSlice(JRoster, gpa, body, .{ .ignore_unknown_fields = true }) catch return false;
     defer p.deinit();
     if (!p.value.ok) return false;
-    var r: Roster = .{ .connected = p.value.connected, .deployed = p.value.deployed, .reachable = p.value.reachable, .current = p.value.current, .python = p.value.python, .browser = p.value.browser, .neuron = p.value.neuron };
+    var r: Roster = .{ .connected = p.value.connected, .deployed = p.value.deployed, .reachable = p.value.reachable, .current = p.value.current, .python = p.value.python, .browser = p.value.browser, .neuron = p.value.neuron, .garrett = p.value.garrett };
     r.max = if (p.value.max >= 1) @intCast(@min(p.value.max, 100000)) else DEFAULT_MAX;
     r.total = p.value.tots.len;
     r.err_len = @intCast(put(&r.err, p.value.last_error));
@@ -401,6 +405,7 @@ pub const Form = struct {
     budget: ?i64 = null,
     forever: bool = false,
     local: bool = false,
+    garrett: bool = false, // "use Agent Garrett": its tools on this tot's belt (the box is live once Settings deployed it)
 };
 
 /// The deployment's JSON body in `buf`, or null when it does not fit.
@@ -450,6 +455,10 @@ test "tots: the roster reads the server's reply into rows, one line per field, a
     var plain: Roster = .{};
     try tt.expect(parseRoster(tt.allocator, "{\"ok\":true,\"tots\":[]}", &plain));
     try tt.expectEqual(@as(u32, DEFAULT_MAX), plain.max);
+    try tt.expect(!plain.garrett and !g.garrett); // no Agent Garrett in the account, none on Gary's belt
+    var with_g: Roster = .{};
+    try tt.expect(parseRoster(tt.allocator, "{\"ok\":true,\"garrett\":true,\"tots\":[{\"name\":\"Ada\",\"state\":\"working\",\"garrett\":true}]}", &with_g));
+    try tt.expect(with_g.garrett and with_g.rows[0].garrett);
 
     var keep: Roster = .{ .n = 1 };
     try tt.expect(!parseRoster(tt.allocator, "{\"ok\":false,\"err\":\"tots are admin-only for now\"}", &keep));
@@ -498,11 +507,16 @@ test "tots: a deployment body round-trips through a real parser, whatever the go
     var b: [2048]u8 = undefined;
     const goal = "watch \"tides\"\n\\ and {\"local\":true} \x01 report";
     const body = deployBody(&b, .{ .name = "Ada", .goal = goal, .model = "@cf/x/y", .pace_s = 120, .size = 4, .forever = true }).?;
-    const P = struct { name: []const u8, goal: []const u8, charter: []const u8, model: []const u8, pace_s: i64, size: i64, daily_calls: i64, budget: ?i64 = null, forever: bool, local: bool };
+    const P = struct { name: []const u8, goal: []const u8, charter: []const u8, model: []const u8, pace_s: i64, size: i64, daily_calls: i64, budget: ?i64 = null, forever: bool, local: bool, garrett: bool };
     const p = try std.json.parseFromSlice(P, tt.allocator, body, .{}); // strict: no field the server does not know
     defer p.deinit();
     try tt.expectEqualStrings(goal, p.value.goal);
     try tt.expect(!p.value.local); // text inside the goal cannot grant the owner's machine
+    try tt.expect(!p.value.garrett); // nor put Agent Garrett on its belt
+    const gb = deployBody(&b, .{ .name = "Ada", .goal = "watch", .garrett = true }).?;
+    const gp = try std.json.parseFromSlice(P, tt.allocator, gb, .{});
+    defer gp.deinit();
+    try tt.expect(gp.value.garrett);
     try tt.expect(p.value.forever and p.value.budget == null);
     try tt.expectEqual(@as(i64, 120), p.value.pace_s);
     var small: [16]u8 = undefined;

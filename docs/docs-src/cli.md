@@ -45,3 +45,9 @@ One dispatcher for every CLI verb: swarms (`cast`/`deploy`/`list`/`stop`/`rm`/`e
 ---
 
 *Case file grounded in the module's `//!` header, public API, and its tests.*
+
+## Security tools in v1.1.12
+
+`veil chat --garrett` opts a chat into the deployed security catalogue. Tater-tot deployment accepts `--garrett`, and `veil --tater set <name> --garrett on|off` changes an existing tot. `veil --tater garrett launch` provisions the Cloudflare runtime; `garrett rm` removes both Workers and the Container while retaining R2 recovery storage.
+
+[Security deployment and use guide](guide/security-tools.md).

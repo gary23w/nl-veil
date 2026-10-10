@@ -42,3 +42,9 @@ Concurrency: all cross-thread state sits behind one custom `SpinLock` (atomic bo
 ---
 
 *Case file grounded in the module's `//!` header and public API.*
+
+## Security tools in v1.1.12
+
+The persisted `Settings.use_garrett` flag defaults to false. The shared store records deployment availability, upload/removal activity, cloud build state, readiness, URL and the latest error. The desktop reads those fields for its action button, build bar and feature opt-ins.
+
+[Security deployment and use guide](../guide/security-tools.md).

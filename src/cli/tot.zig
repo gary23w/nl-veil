@@ -6,12 +6,13 @@
 //!       --name N  --charter "..."  --model @cf/...  --pace SECONDS (5 and up)  --size MINDS
 //!       --calls PER_DAY | unlimited
 //!       --budget N  --forever      --local   (let it queue jobs for the veil on THIS machine; deployment only)
+//!       --garrett                  (Agent Garrett's security tools on its belt; Settings must have deployed the agent)
 //!   veil --tater tell <name> "<text>"       a command (/goal ..., /pause, /queue ...) or a message for its inbox
 //!   veil --tater watch <name>               follow its events
-//!   veil --tater set <name> [flags]         --model --pace --size --calls --charter --pause --resume --posture --leash
+//!   veil --tater set <name> [flags]         --model --pace --size --calls --charter --pause --resume --posture --leash --garrett on|off
 //!   veil --tater guard <name> ...           what it watches every heartbeat without a model (its /guard command)
 //!   veil --tater verify <run>               check a run's evidence chain: every mirrored event hashed to the one before
-//!   veil --tater garrett [launch|rm|password]  Agent Garrett, the blue-team belt the tots reach over MCP
+//!   veil --tater garrett [launch|rm|password]  Agent Garrett: the blue-team agent a chat, a swarm or a tot can use over MCP
 //!   veil --tater pad ["<text>" | --clear]   read the scratchpad the tots share, write to it, or empty it
 //!   veil --tater rm <name>                  delete one tot
 //!   veil --tater teardown --yes             remove the runtime and every tot from the Cloudflare account
@@ -30,17 +31,17 @@ const USAGE =
     \\usage: veil --tater                              list your tater-tots
     \\       veil --tater deploy "<goal>" [--name N] [--charter "..."] [--model @cf/...] [--pace SECONDS]
     \\                       [--size MINDS] [--calls PER_DAY] [--budget N] [--forever] [--local]
-    \\                       [--posture defend] [--leash SECONDS]
+    \\                       [--posture defend] [--leash SECONDS] [--garrett]
     \\       veil --tater tell <name> "<text>"         /goal <text>, /goal stop, /queue <goal>, /pause, /resume, or a message
     \\       veil --tater watch <name>                 follow its events
     \\       veil --tater set <name> [--model M] [--pace S] [--size N] [--calls N] [--charter "..."] [--pause|--resume]
-    \\                       [--posture defend|normal] [--leash SECONDS|off]
+    \\                       [--posture defend|normal] [--leash SECONDS|off] [--garrett on|off]
     \\       veil --tater guard <name>                 what it watches every heartbeat, with no model
     \\       veil --tater guard <name> add <https://...> [--text "words on the page"] [--status N] [--every S] [--pin]
     \\       veil --tater guard <name> add dns:<host> [--type A|AAAA|NS|MX|TXT|CNAME|CAA|SOA] [--every S]
     \\       veil --tater guard <name> rm <target|#n> | clear
     \\       veil --tater verify <run>                 check a run's evidence chain (a run: <name>-<YYYYMMDD-HHMMSS>)
-    \\       veil --tater garrett [launch|rm|password] Agent Garrett: the blue-team belt the tater-tots reach over MCP
+    \\       veil --tater garrett [launch|rm|password] Agent Garrett: the blue-team agent chats, swarms and tater-tots can use over MCP
     \\       veil --tater pad ["<text>" | --clear]     the scratchpad the tater-tots share (--clear empties it)
     \\       veil --tater limit [N]                    how many this account may run (24 by default; 1 to 1000)
     \\       veil --tater rm <name>                    delete one tater-tot
@@ -66,7 +67,8 @@ const Tot = struct {
     posture: []const u8 = "",
     watch: i64 = 0,
     guard_tripped: i64 = 0,
-    garrett: bool = false,
+    garrett: bool = false, // its verbs are on this tot's belt (asked for, and the account has the agent)
+    garrett_on: bool = false, // asked for (the deploy box, --garrett, /garrett on)
 };
 const Roster = struct { ok: bool = false, err: []const u8 = "", connected: bool = false, deployed: bool = false, reachable: bool = false, max: i64 = 0, python: bool = false, browser: bool = false, neuron: bool = false, tools_note: []const u8 = "", last_error: []const u8 = "", tots: []const Tot = &.{} };
 const Event = struct { seq: u64 = 0, kind: []const u8 = "", text: []const u8 = "" };
@@ -84,8 +86,8 @@ pub fn rosterLine(buf: []u8, h: Tot) []const u8 {
     const calls: []const u8 = if (h.daily_calls > 0) (std.fmt.bufPrint(&cb, "{d}/{d} calls", .{ h.calls_today, h.daily_calls }) catch "") else (std.fmt.bufPrint(&cb, "{d} calls, no limit", .{h.calls_today}) catch "");
     var wb: [40]u8 = undefined;
     const guard_col: []const u8 = if (h.watch > 0) (std.fmt.bufPrint(&wb, "  guard {d}{s}", .{ h.watch, if (h.guard_tripped > 0) " TRIPPED" else "" }) catch "") else "";
-    return std.fmt.bufPrint(buf, "{s: <12} {s: <8} {d}/{d} minds  {s}{s}{s}{s}  {s}  {s}", .{
-        h.name, h.state, h.minds, h.size, calls, if (h.local) "  +this machine" else "", if (std.mem.eql(u8, h.posture, "defend")) "  DEFEND" else "", guard_col, goal, g.text[0..@min(g.text.len, 70)],
+    return std.fmt.bufPrint(buf, "{s: <12} {s: <8} {d}/{d} minds  {s}{s}{s}{s}{s}  {s}  {s}", .{
+        h.name, h.state, h.minds, h.size, calls, if (h.local) "  +this machine" else "", if (std.mem.eql(u8, h.posture, "defend")) "  DEFEND" else "", if (h.garrett_on) "  +garrett" else "", guard_col, goal, g.text[0..@min(g.text.len, 70)],
     }) catch h.name;
 }
 
@@ -171,6 +173,12 @@ fn fail(what: []const u8, status: u16, body: []const u8, a: std.mem.Allocator) u
     return 1;
 }
 
+/// `--garrett off` (or false, no, 0) takes Agent Garrett off a tot's belt; anything else puts it on.
+fn garrettOff(v: []const u8) bool {
+    for ([_][]const u8{ "off", "false", "no", "0" }) |w| if (std.ascii.eqlIgnoreCase(v, w)) return true;
+    return false;
+}
+
 /// `--calls unlimited` (or infinite, none, 0) is no limit on model calls: the wire value is 0.
 fn callsArg(v: []const u8) []const u8 {
     for ([_][]const u8{ "unlimited", "infinite", "infinity", "none", "off" }) |w| if (std.ascii.eqlIgnoreCase(v, w)) return "0";
@@ -238,6 +246,8 @@ fn deploy(ctx: *Ctx, a: std.mem.Allocator, args: []const []const u8) u8 {
             jb.appendSlice(a, ",\"forever\":true") catch return 1;
         } else if (std.mem.eql(u8, x, "--local")) {
             jb.appendSlice(a, ",\"local\":true") catch return 1;
+        } else if (std.mem.eql(u8, x, "--garrett")) {
+            jb.appendSlice(a, ",\"garrett\":true") catch return 1;
         } else if (cli.flagVal(args, &i, x, "--posture")) |v| {
             cli.appendStr(a, &jb, "posture", v);
         } else if (cli.flagVal(args, &i, x, "--leash")) |v| {
@@ -371,18 +381,18 @@ fn garrett(ctx: *Ctx, a: std.mem.Allocator, args: []const []const u8) u8 {
         defer if (resp.body.len > 0) ctx.gpa.free(resp.body);
         if (resp.status != 200) return fail("--tater garrett launch", resp.status, resp.body, a);
         const r = std.json.parseFromSliceLeaky(G, a, resp.body, .{ .ignore_unknown_fields = true }) catch G{};
-        out("Agent Garrett is up at {s}\nthe tater-tots reach it over MCP at {s} from their next iteration (garrett_tools lists its tools).\nits chat UI is locked; `veil --tater garrett password` shows the password.\n", .{ r.url, r.mcp_url });
+        out("Agent Garrett is up at {s}\nits MCP endpoint is {s}: a chat (`veil chat --garrett`, the desk's box), a swarm deployed with --garrett and a tater-tot deployed or set with --garrett reach it from now on (garrett_tools lists its tools).\nits chat UI is locked; `veil --tater garrett password` shows the password.\n", .{ r.url, r.mcp_url });
         return 0;
     }
     if (std.mem.eql(u8, sub, "rm") or std.mem.eql(u8, sub, "remove")) {
         const resp = cli.call(ctx, "DELETE", "/api/v1/tots/garrett", null, 60, true) catch return cli.unreachable_msg(ctx);
         defer if (resp.body.len > 0) ctx.gpa.free(resp.body);
         if (resp.status != 200) return fail("--tater garrett rm", resp.status, resp.body, a);
-        out("Agent Garrett is removed from the account; the tater-tots lose garrett and garrett_tools at their next iteration\n", .{});
+        out("Agent Garrett is removed from the account; chats, swarms and tater-tots lose garrett and garrett_tools\n", .{});
         return 0;
     }
     if (sub.len > 0 and !std.mem.eql(u8, sub, "password") and !std.mem.eql(u8, sub, "status")) {
-        out("usage: veil --tater garrett              where it is, what the runtime says\n       veil --tater garrett launch       put it in your account beside the tater-tots\n       veil --tater garrett password     the password locking its chat UI\n       veil --tater garrett rm           remove it\n", .{});
+        out("usage: veil --tater garrett              where it is, what the runtime says\n       veil --tater garrett launch       deploy it into your Cloudflare account (no tater-tot needed)\n       veil --tater garrett password     the password locking its chat UI\n       veil --tater garrett rm           remove it\n", .{});
         return 1;
     }
     const reveal = std.mem.eql(u8, sub, "password");
@@ -391,7 +401,7 @@ fn garrett(ctx: *Ctx, a: std.mem.Allocator, args: []const []const u8) u8 {
     if (resp.status != 200) return fail("--tater garrett", resp.status, resp.body, a);
     const r = std.json.parseFromSliceLeaky(G, a, resp.body, .{ .ignore_unknown_fields = true }) catch G{};
     if (!r.launched) {
-        out("Agent Garrett is not launched. `veil --tater garrett launch` puts it in your account beside the tater-tots; a tater-tot can ask for it too (garrett_launch).\n", .{});
+        out("Agent Garrett is not deployed. `veil --tater garrett launch` (or Settings > Deploy Agent Garrett in the desk) puts it in your Cloudflare account; a tater-tot deployed with --garrett can ask for it too (garrett_launch).\n", .{});
         if (std.mem.eql(u8, r.status, "pending")) out("a tater-tot asked ({s}); your veil launches it within a minute while it is running.\n", .{r.asked_by});
         if (std.mem.eql(u8, r.status, "failed")) out("the last attempt failed: {s}\n", .{r.@"error"});
         return 1;
@@ -400,7 +410,7 @@ fn garrett(ctx: *Ctx, a: std.mem.Allocator, args: []const []const u8) u8 {
         out("{s}\n", .{r.password});
         return 0;
     }
-    out("Agent Garrett: {s}\nMCP endpoint (the tater-tots use it, with a bearer of its own): {s}\nruntime says: {s}\nmodules: {s}\nits chat UI is locked; `veil --tater garrett password` shows the password.\n", .{ r.url, r.mcp_url, r.status, r.sources });
+    out("Agent Garrett: {s}\nMCP endpoint (chats, swarms and tater-tots that asked for it use it, with a bearer of its own): {s}\nruntime says: {s}\nmodules: {s}\nits chat UI is locked; `veil --tater garrett password` shows the password.\n", .{ r.url, r.mcp_url, r.status, r.sources });
     return 0;
 }
 
@@ -454,6 +464,8 @@ fn set(ctx: *Ctx, a: std.mem.Allocator, args: []const []const u8) u8 {
             cli.appendStr(a, &jb, "posture", v);
         } else if (cli.flagVal(args, &i, x, "--leash")) |v| {
             cli.appendNum(a, &jb, "leash_s", leashArg(v));
+        } else if (cli.flagVal(args, &i, x, "--garrett")) |v| {
+            jb.appendSlice(a, if (garrettOff(v)) ",\"garrett\":false" else ",\"garrett\":true") catch return 1;
         } else {
             out(USAGE, .{});
             return 1;

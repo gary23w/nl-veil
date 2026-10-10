@@ -12,9 +12,21 @@ into your next session. Use the built-in model, Ollama, or an OpenAI-compatible 
 **[Screenshot walkthrough: setup & build with Cloudflare AI](https://gary23w.github.io/nl-veil/demos/)** ·
 [Installation and requirements](#install) · [Try your first task](#try-your-first-task)
 
-Windows · macOS · Linux · MIT licensed. Local inference needs no provider account or API key;
+Windows · macOS · Linux · [MIT app code and AGPL security runtime](#license). Local inference needs no provider account or API key;
 hosted providers have their own data handling and costs. The built-in model requires a separate
 download, and coding tools require Python on `PATH` (some checks also use Node).
+
+### New in v1.1.12
+
+Agent Garrett's full **166-tool security catalogue** is available to chats, swarms and tater-tots
+through typed MCP tools. Settings deploys the edge Worker, private Worker, Cloudflare Container and
+R2 storage into your account, then shows progress while the runtime builds. Enable each feature
+separately. Desktop margins, field spacing and past-run card borders are repaired, and Settings
+keeps scrolling with its scrollbar hidden.
+
+Live cloud command execution, shell-session listing and indicator extraction were verified through
+NL-Veil. [Release results](docs/release/RELEASE-v1.1.12.md) ·
+[Security setup and personal defense guide](docs/docs-src/guide/security-tools.md).
 
 ### New in v1.1.10
 
@@ -79,7 +91,7 @@ code and credentials from anything you share.
 
 <p>
   <a href="https://github.com/gary23w/nl-veil/actions/workflows/release.yml"><img alt="build" src="https://github.com/gary23w/nl-veil/actions/workflows/release.yml/badge.svg"></a>
-  <a href="https://github.com/gary23w/nl-veil/releases"><img alt="release" src="https://img.shields.io/badge/release-v1.1.11-A8241B"></a>
+  <a href="https://github.com/gary23w/nl-veil/releases"><img alt="release" src="https://img.shields.io/badge/release-v1.1.12-A8241B"></a>
   <img alt="zig" src="https://img.shields.io/badge/zig-0.16-F7A41D?logo=zig&logoColor=white">
   <a href="https://huggingface.co/gary23w/the-veil-12b"><img alt="built-in model" src="https://img.shields.io/badge/built--in%20model-the--veil--12b-6E4A27?logo=huggingface&logoColor=white"></a>
   <a href="https://huggingface.co/gary23w/gary-neuron-emergent"><img alt="memory cortex" src="https://img.shields.io/badge/cortex-gary--neuron--emergent-6E4A27?logo=huggingface&logoColor=white"></a>
@@ -375,13 +387,9 @@ so they never cross the public internet and need no API key.
   through them, names the tater-tot in every request it makes and holds it to read-only verification;
   `/leash 3600` holds the goal loop whenever your veil has not been heard from for an hour (the guard goes on)
   and releases it the moment it is back. A tater-tot never runs on with nobody's veil alive.
-- **Agent Garrett, on request.** The blue-team agent from
-  [garrettstimpson.ca/agent](https://github.com/gary23w/garrettstimpson.ca/tree/main/agent) - CVE/KEV/EPSS
-  intel, DNS and certificate transparency, RDAP, email security posture, IOC extraction, evidence manifests, 90-odd
-  tools, passive by default - launched into your account beside the tater-tots (`veil --tater garrett launch`, or a
-  tater-tot's own `garrett_launch`) and reached over its MCP endpoint with `garrett` / `garrett_tools`. Its chat UI
-  is locked at launch; `veil --tater garrett password` shows the password.
-  [The day after](https://gary23w.github.io/nl-veil/#doc=guide/day-after) says what all of this is for.
+- **Agent Garrett, the full security toolkit.** [The agent](https://github.com/gary23w/garrettstimpson.ca/tree/main/agent) contributes 166 tools: 94 existing security tools and 72 Gary tools. **Settings → Models → Deploy security tools** provisions its edge MCP Worker, private execution Worker, dedicated Cloudflare Container and R2 storage in your Cloudflare account. The first cloud build needs no local Docker or separate Linux host; the button shows an animated loading bar during preparation. Existing Cloudflare logins need to reconnect once for Containers permissions.
+  Enable **Agent Garrett: on** beside the chat's auto-loop, or check **Agent Garrett** in the swarm or tater-tot deploy form. Each opted-in feature receives individual `security_<name>` tools with typed arguments; `garrett_tools` and `garrett` remain compatibility wrappers. Chat calls keep the MCP bearer on the server. The cloud filesystem is separate from your local machine, which NL-Veil supplies through its local harness when requested. [Setup, personal defense and lab workflows](docs/docs-src/guide/security-tools.md).
+
 - **A console you can read.** Each event is one line saying what happened; a row that went wrong is red.
   Click a row to open its full text under it, click again to close it, and *errors* shows only what failed.
 - **Your machine, only if you say so.** The deploy form has one box, unchecked by default: *let it use THIS
@@ -568,7 +576,7 @@ raylib is a *lazy* dependency, so `-Dapp=false` never fetches it at all.
 ## Install
 
 **Download it and run it — no toolchain, nothing to build.** Grab your platform's bundle from the
-**[latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.1.11)**, unzip, and run `veil`:
+**[latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.1.12)**, unzip, and run `veil`:
 
 | You're on | Download | Then run |
 |---|---|---|
@@ -729,7 +737,7 @@ step 5** — the rest is about letting other people in.
 
 ### 1. Download and unblock it
 
-Grab the bundle for your OS from the [latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.1.11)
+Grab the bundle for your OS from the [latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.1.12)
 and unzip it somewhere you'll find again. Builds are unsigned, so:
 
 - **Windows** shows *"Windows protected your PC"* → **More info** → **Run anyway**.
@@ -765,7 +773,7 @@ On startup the server prints one complete URL per address this machine answers o
 (`src/main.zig:861-889`, using `src/config/lan.zig`):
 
 ```
-neuron-loops 1.1.11 on http://localhost:8787
+neuron-loops 1.1.12 on http://localhost:8787
     open from another machine (phone, laptop) at:
       http://192.168.1.42:8787
 ```
@@ -1635,7 +1643,9 @@ dependency entirely rather than compiling it unused.
 
 ## Release
 
-**Current: [`v1.1.11`](https://github.com/gary23w/nl-veil/releases/tag/v1.1.11)** — chat keeps answering when a hosted model changes how it treats a request: a retired thinking-off setting stays retired, a cut turn's continuation state is read from the reasoning channel, the desktop stops dialing a placeholder endpoint and folds a message into a running turn, and the survey and planning passes show their reasoning in the chat. [Full notes](docs/release/RELEASE-v1.1.11.md).
+**Current: [`v1.1.12`](https://github.com/gary23w/nl-veil/releases/tag/v1.1.12)** — the complete 166-tool Agent Garrett catalogue is available through typed MCP tools in chats, swarms and tater-tots. Deployment includes a dedicated Cloudflare execution runtime, Settings shows its build progress, feature opt-ins are separate, and the desktop has corrected spacing and panel borders. [Full notes](docs/release/RELEASE-v1.1.12.md) · [Security tools guide](docs/docs-src/guide/security-tools.md).
+
+**Previously: [`v1.1.11`](https://github.com/gary23w/nl-veil/releases/tag/v1.1.11)** — chat keeps answering when a hosted model changes how it treats a request: a retired thinking-off setting stays retired, a cut turn's continuation state is read from the reasoning channel, the desktop stops dialing a placeholder endpoint and folds a message into a running turn, and the survey and planning passes show their reasoning in the chat. [Full notes](docs/release/RELEASE-v1.1.11.md).
 
 **Previously: [`v1.1.10`](docs/release/RELEASE-v1.1.10.md)** — tot deployment reconnects stale runtimes, run history is easier to read, and saved runs can be removed from the list without deleting their files.
 
@@ -1781,4 +1791,4 @@ cortex).
 
 ## License
 
-[MIT](LICENSE). Use it, fork it, build on it.
+NL-Veil code is licensed under [MIT](LICENSE). The Gary security runtime includes modified [ARTEX](https://github.com/Hinln/ARTEX) code under [AGPL-3.0](cloud/GARY-LICENSE). Its [attribution](cloud/GARY-NOTICE), [corresponding source](cloud/gary-source.tar.gz), and Cloudflare build sources are available in `cloud/` and included in the full release bundles. Dependencies retain their own licenses.

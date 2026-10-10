@@ -103,6 +103,9 @@ cp "$SERVER" "$OUT/veil$EXE"
 [ -n "$neuron" ] && cp "$neuron" "$OUT/bin/neuron$EXE"
 [ -n "$neuron" ] || { say 'refusing incomplete desktop release: neuron is required'; exit 1; }
 printf '%s\n' 'veil-bundle-v1' > "$OUT/veil-install.txt"
+cp "$ROOT/LICENSE" "$OUT/LICENSE"
+mkdir -p "$OUT/cloud"
+cp "$ROOT/cloud/GARY-LICENSE" "$ROOT/cloud/GARY-NOTICE" "$ROOT/cloud/gary-source.tar.gz" "$ROOT/cloud/gary-bootstrap.py" "$ROOT/cloud/gary-gateway.mjs" "$ROOT/cloud/gary-worker.mjs" "$ROOT/cloud/security-tools.txt" "$OUT/cloud/"
 cp "$SERVER" "$DIST/veil-update-v$VERSION-$OS-$ARCH-app"
 cp "$neuron" "$DIST/veil-update-v$VERSION-$OS-$ARCH-neuron"
 
@@ -127,6 +130,11 @@ LAUNCHW
 
 cat > "$OUT/README.txt" <<TXT
 the veil — v$VERSION ($OS/$ARCH)
+
+LICENSES AND SECURITY RUNTIME SOURCE
+  NL-Veil: MIT (LICENSE). Gary: AGPL-3.0 (cloud/GARY-LICENSE).
+  Attribution and corresponding source: cloud/GARY-NOTICE and cloud/gary-source.tar.gz.
+  https://github.com/gary23w/nl-veil/tree/v$VERSION/cloud
 
 Run:
   Windows        double-click start.cmd

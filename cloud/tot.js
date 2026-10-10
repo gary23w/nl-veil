@@ -51,17 +51,19 @@
 //   not worked through, every request names the tot (guardUa) and the prompt holds it to read-only verification.
 //   THE LEASH (/leash): no contact from the owner's veil for leash_s holds the goal loop (the guard goes on) until
 //   any call from it arrives. A tot never runs on with nobody's veil alive.
-//   AGENT GARRETT (garrett, garrett_tools, garrett_launch): github.com/gary23w/garrettstimpson.ca/agent, a second
-//   Worker the veil server launches into the account on request (the pad's /garrett/* state) and the tots reach
-//   over its stateless MCP endpoint under the GARRETT_MCP_URL / GARRETT_MCP_TOKEN secrets: CVE/KEV/EPSS intel,
-//   DNS and certificate transparency, RDAP, email security posture, IOC extraction, evidence manifests, and more.
+//   AGENT GARRETT (garrett, garrett_tools, garrett_launch): github.com/gary23w/garrettstimpson.ca/agent, a Worker
+//   of its own the veil server deploys into the account (the desk's Settings button; a tot may ask through the
+//   pad's /garrett/* state). A tot deployed or configured with `garrett` (/garrett on|off) reaches it over its
+//   stateless MCP endpoint under the GARRETT_MCP_URL / GARRETT_MCP_TOKEN secrets: CVE/KEV/EPSS intel, DNS and
+//   certificate transparency, RDAP, email security posture, IOC extraction, evidence manifests, and more. Off
+//   for a tot unless asked for: the account's agent is not every tot's business.
 //
 // Every route needs `Authorization: Bearer <TOT_TOKEN>` (a secret binding the veil server generates at deploy).
 //
 // No imports and no platform globals beyond fetch/Response/crypto, so cloud/tot.test.mjs runs the whole file
 // under node with a Map for storage and a scripted model.
 
-export const VERSION = "8";
+export const VERSION = "9";
 // How many tots an account may run: 24 unless the owner sets another, up to MAX_TOTS_CEIL. What an account can
 // really carry is its Cloudflare plan's to say: every tot is a Durable Object that wakes every few seconds.
 export const DEFAULT_MAX_TOTS = 24;
@@ -115,6 +117,7 @@ const DEFAULTS = {
   charter: "",
   posture: "normal", // "defend": the runtime is frozen, bot checks are reported, every request names the tot
   leash_s: 0, // 0 = no leash
+  garrett: false, // Agent Garrett's tools on this tot's belt (the account's agent must be deployed for them to answer)
 };
 
 // ------------------------------------------------------------------------------------------ small helpers
@@ -448,6 +451,7 @@ function upgraded(cfg) {
   if (!Array.isArray(cfg.watch)) cfg.watch = [];
   if (cfg.posture !== "defend") cfg.posture = "normal";
   if (!Number.isFinite(cfg.leash_s)) cfg.leash_s = 0;
+  if (cfg.garrett !== true) cfg.garrett = false;
   return cfg;
 }
 
@@ -688,7 +692,7 @@ const TOOLS = [
   { name: "runtime_deploy", args: '{"revision": 1}', what: "deploy your edited runtime without an approval step. The owner's running veil uploads it on its next sync; runtime_read reports deployment or compiler errors. No local-machine execution grant is needed" },
   // Agent Garrett: a second Worker in this account (github.com/gary23w/garrettstimpson.ca/agent), a blue-team belt over MCP
   { name: "garrett_tools", args: "{}", what: "list Agent Garrett's security tools (CVE / KEV / EPSS intel, DNS and certificate transparency, RDAP, email security posture, IOC extraction, evidence manifests, forensic timelines, and more) and the argument names they take", need: "garrett" },
-  { name: "garrett", args: '{"name": "<garrett tool>", "args": {"target": "example.com"}}', what: "run one of Agent Garrett's tools over MCP; its text comes back with its evidence metadata. Passive lookups by default; active ones only as the agent's operator allowed", need: "garrett" },
+  { name: "garrett", args: '{"name": "<garrett tool>", "args": {"target": "example.com"}}', what: "run one of Agent Garrett's tools over MCP; its text comes back with its evidence metadata. Preserve each tool's typed JSON arguments", need: "garrett" },
   { name: "garrett_launch", args: "{}", what: "ask your human's veil to launch Agent Garrett into this account as a second Worker and point every tot at it; garrett and garrett_tools appear in your belt once it answers" },
   // memory and planning
   { name: "remember", args: '{"fact": "<one thing worth knowing later>"}', what: "keep a fact for every later iteration" },
@@ -717,19 +721,25 @@ const MIND_TOOLS = new Set(["write_file", "read_file", "list_files", "append_fil
 /// `veil --tater key garrett_url` / `garrett_token` for an agent the owner deployed by hand).
 const hasGarrett = (env) => /^https:\/\//i.test(String(env.GARRETT_MCP_URL ?? "")) && typeof env.GARRETT_MCP_TOKEN === "string" && env.GARRETT_MCP_TOKEN.length > 0;
 
-/// The tools this tot has here: everything, minus what a missing binding takes away.
+/// Whether this tot was asked to carry Agent Garrett: deployed or configured with `garrett` (/garrett on|off).
+const wantsGarrett = (cfg) => cfg.garrett === true;
+
+/// The tools this tot has here: everything, minus what a missing binding takes away. Agent Garrett's verbs are
+/// opt-in per tot: garrett / garrett_tools only when it was asked for AND the account has the agent;
+/// garrett_launch only when it was asked for and the account has none yet.
 function toolsFor(env, cfg) {
-  const have = { browser: !!env.BROWSER, python: !!env.PY, garrett: hasGarrett(env) };
-  const list = TOOLS.filter((t) => !t.need || have[t.need]).filter((t) => t.name !== "garrett_launch" || !have.garrett);
-  return cfg.local ? [...list, LOCAL_TOOL] : list;
+  const want = wantsGarrett(cfg);
+  const have = { browser: !!env.BROWSER, python: !!env.PY, garrett: want && hasGarrett(env) };
+  const list = TOOLS.filter((t) => !t.need || have[t.need]).filter((t) => t.name !== "garrett_launch" || (cfg.garrett === true && !hasGarrett(env)));
+  const full = [...list, ...(have.garrett ? env.SECURITY_TOOLS ?? [] : [])];
+  return cfg.local ? [...full, LOCAL_TOOL] : full;
 }
 
 /// What a tot is told about the tools it lacks, so it plans around them instead of calling them.
-function missingNote(env) {
+function missingNote(env, cfg) {
   const miss = [];
   if (!env.BROWSER) miss.push("a browser (browser_*)");
   if (!env.PY) miss.push("Python (run_python, skills)");
-  if (!hasGarrett(env)) miss.push("Agent Garrett's security tools (garrett, garrett_tools; garrett_launch asks your human's veil for them)");
   return miss.length ? `NOT AVAILABLE in this account right now: ${miss.join(", ")}. Work with the tools listed.\n` : "";
 }
 
@@ -1329,10 +1339,12 @@ export class Tot {
     if (typeof b.paused === "boolean") cfg.paused = b.paused;
     if (typeof b.posture === "string" && /^(normal|defend)$/i.test(b.posture.trim())) cfg.posture = b.posture.trim().toLowerCase();
     if (b.leash_s !== undefined) cfg.leash_s = /^(0|off|none|no)$/i.test(String(b.leash_s).trim()) ? 0 : clampInt(b.leash_s, LEASH_MIN_S, LEASH_MAX_S, cfg.leash_s ?? 0);
+    // Agent Garrett on this tot's belt: a boolean from the API, "on" / "off" from the command line
+    if (b.garrett !== undefined) cfg.garrett = b.garrett === true || /^(on|true|yes|1)$/i.test(String(b.garrett).trim());
   }
 
   settingsLine(cfg) {
-    return `model ${cfg.model}, every ${cfg.pace_s}s, up to ${cfg.size} minds, ${callsWord(cfg)}${posture(cfg) === "defend" ? ", posture DEFEND" : ""}${cfg.leash_s > 0 ? `, leash ${cfg.leash_s}s` : ""}${cfg.paused ? ", paused" : ""}`;
+    return `model ${cfg.model}, every ${cfg.pace_s}s, up to ${cfg.size} minds, ${callsWord(cfg)}${posture(cfg) === "defend" ? ", posture DEFEND" : ""}${cfg.leash_s > 0 ? `, leash ${cfg.leash_s}s` : ""}${wantsGarrett(cfg) ? ", Agent Garrett" : ""}${cfg.paused ? ", paused" : ""}`;
   }
 
   async configure(cfg, body) {
@@ -1388,7 +1400,8 @@ export class Tot {
       browser: !!this.env.BROWSER,
       python: !!this.env.PY,
       neuron: !!(await this.mind()),
-      garrett: hasGarrett(this.env),
+      garrett: wantsGarrett(cfg) && hasGarrett(this.env), // its verbs are on this tot's belt
+      garrett_on: wantsGarrett(cfg), // it was asked for, whether or not the account has the agent yet
       posture: posture(cfg),
       leash_s: cfg.leash_s ?? 0,
       leashed,
@@ -1545,17 +1558,19 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
       await this.store.put("cfg", cfg);
       return cfg.charter.length > 0 ? "Charter set: it is what this tot works toward when no goal is active." : "Charter cleared.";
     }
-    if (word === "/pace" || word === "/size" || word === "/model" || word === "/calls" || word === "/posture" || word === "/leash") {
-      const key = { "/pace": "pace_s", "/size": "size", "/model": "model", "/calls": "daily_calls", "/posture": "posture", "/leash": "leash_s" }[word];
+    if (word === "/pace" || word === "/size" || word === "/model" || word === "/calls" || word === "/posture" || word === "/leash" || word === "/garrett") {
+      const key = { "/pace": "pace_s", "/size": "size", "/model": "model", "/calls": "daily_calls", "/posture": "posture", "/leash": "leash_s", "/garrett": "garrett" }[word];
       if (word === "/posture" && !/^(normal|defend)$/i.test(rest)) return "Usage: /posture defend | normal. DEFEND freezes the runtime, reports bot checks instead of working through them, names this tot in every request and keeps it to read-only verification unless you ask for more.";
       if (word === "/leash" && !/^(\d+|off|none|no)$/i.test(rest)) return `Usage: /leash <seconds> | off. With a leash, no contact from your veil for that long holds the goal loop until it is back; the guard goes on. ${LEASH_MIN_S} to ${LEASH_MAX_S} seconds.`;
+      if (word === "/garrett" && !/^(on|off)$/i.test(rest)) return "Usage: /garrett on | off. On, Agent Garrett's security tools (garrett, garrett_tools) are on this tot's belt once your human has deployed the agent (Settings > Deploy Agent Garrett); garrett_launch asks for it until then.";
       this.applyConfig(cfg, { [key]: rest });
       await this.store.put("cfg", cfg);
       if (word === "/posture") await this.emit("status", `posture ${posture(cfg).toUpperCase()}${posture(cfg) === "defend" ? ": the runtime is frozen, bot checks are reported, every request names this tot, read-only unless the human asks for more" : ""}`);
+      if (word === "/garrett") await this.emit("status", wantsGarrett(cfg) ? (hasGarrett(this.env) ? "Agent Garrett is on this tot's belt (garrett, garrett_tools)" : "Agent Garrett asked for: its tools are on this tot's belt once your human deploys the agent (garrett_launch asks)") : "Agent Garrett is off this tot's belt");
       return this.settingsLine(cfg) + ".";
     }
     if (word === "/status") return goalStatusText(g);
-    if (word.startsWith("/")) return "Commands: /goal <text> [--forever] [--budget N], /goal stop|resume|status|budget N|forever, /queue <goal>, /charter <text>, /pause, /resume, /pace <seconds>, /size <minds>, /model <id>, /calls <per day>, /guard add|rm|clear ..., /posture defend|normal, /leash <seconds>|off. Anything else is a message this tot reads at its next iteration.";
+    if (word.startsWith("/")) return "Commands: /goal <text> [--forever] [--budget N], /goal stop|resume|status|budget N|forever, /queue <goal>, /charter <text>, /pause, /resume, /pace <seconds>, /size <minds>, /model <id>, /calls <per day>, /guard add|rm|clear ..., /posture defend|normal, /leash <seconds>|off, /garrett on|off. Anything else is a message this tot reads at its next iteration.";
     // Plain words: a directive the next iteration reads. Nobody answers it in person; the work does.
     const inbox = (await this.store.get("inbox")) ?? [];
     inbox.push({ t: now, from: "human", text: clip(text, 4000) });
@@ -1708,6 +1723,7 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
 
   /// One iteration. Returns the seconds until the next one.
   async iterate(cfg) {
+    await this.discoverSecurityTools();
     const now = this.now();
     let g = (await this.store.get("goal")) ?? null;
 
@@ -1758,7 +1774,7 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
     // DO
     const record = [];
     const tools = toolsFor(this.env, cfg);
-    const claim = await this.toolLoop(cfg, system + "\n\nTOOLS:\n" + toolList(tools) + "\n" + missingNote(this.env) + "\n" + REPLY_RULE, inboxText + "THIS ITERATION'S STEP: " + step, tools, TOOL_ROUNDS, record, "");
+    const claim = await this.toolLoop(cfg, system + "\n\nTOOLS:\n" + toolList(tools) + "\n" + missingNote(this.env, cfg) + "\n" + REPLY_RULE, inboxText + "THIS ITERATION'S STEP: " + step, tools, TOOL_ROUNDS, record, "");
 
     // MEASURE
     const transcript = record.length > 0 ? record.map((r, i) => `T${i + 1} TOOL ${r.tool}(${clip(JSON.stringify(r.args), 300)}) -> ${resultExcerpt(r.result)}`).join("\n") : "(no tool was used)";
@@ -2006,6 +2022,8 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
   }
 
   async runTool(cfg, tool, args, mind) {
+    if ((tool.startsWith("security_") || tool === "garrett" || tool === "garrett_tools") && !wantsGarrett(cfg)) return "Agent Garrett is not enabled for this tot. Use /garrett on to enable its full toolset.";
+    if (tool.startsWith("security_")) return this.garrettCall(cfg, "tools/call", {name:tool.slice(9), arguments:args}, "call");
     if (["runtime_read", "runtime_edit", "runtime_deploy"].includes(tool)) {
       if (tool !== "runtime_read" && posture(cfg) === "defend") return "ERROR: posture is DEFEND: the runtime is frozen until your human sets /posture normal";
       const result = await (await call(stubFor(this.env, "pad"), "/runtime/" + tool.slice(8), { ...args, author: cfg.name })).json();
@@ -2063,7 +2081,7 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
       case "garrett":
         return this.garrettCall(cfg, "tools/call", { name: String(args.name ?? args.tool ?? "").trim().toLowerCase(), arguments: args.args && typeof args.args === "object" && !Array.isArray(args.args) ? args.args : args.arguments && typeof args.arguments === "object" && !Array.isArray(args.arguments) ? args.arguments : {} }, "call");
       case "garrett_launch": {
-        if (hasGarrett(this.env)) return "Agent Garrett is already up; garrett_tools lists its tools";
+            if (hasGarrett(this.env)) return "Agent Garrett is already up; garrett_tools lists its tools";
         const r = await (await call(stubFor(this.env, "pad"), "/garrett/request", { by: who })).json();
         if (!r.ok) return "ERROR: " + r.err;
         return `asked: your human's veil launches Agent Garrett on its next sync (within about a minute while it is running), and then garrett and garrett_tools appear in your belt. Do not wait for it in this step.`;
@@ -2448,6 +2466,18 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
   }
 
   /// One call to Agent Garrett's stateless MCP endpoint (POST /mcp: JSON-RPC under a bearer of its own).
+  async discoverSecurityTools() {
+    if (!hasGarrett(this.env)) { this.env.SECURITY_TOOLS = []; return; }
+    if (this.securityAt && Date.now() - this.securityAt < 600000) return;
+    try {
+      const response = await fetch(this.env.GARRETT_MCP_URL, {method:"POST", headers:{"content-type":"application/json",authorization:"Bearer "+this.env.GARRETT_MCP_TOKEN}, body:JSON.stringify({jsonrpc:"2.0",id:1,method:"tools/list",params:{}}),signal:AbortSignal.timeout(30000)});
+      const result = await response.json();
+      if (!response.ok || !Array.isArray(result.result?.tools)) return;
+      this.env.SECURITY_TOOLS = result.result.tools.filter(t=>/^[a-z][a-z0-9_]{1,39}$/.test(t.name) && t.inputSchema).map(t=>({name:"security_"+t.name,args:JSON.stringify(t.inputSchema),what:String(t.description ?? ""),need:"garrett"}));
+      this.securityAt = Date.now();
+    } catch {}
+  }
+
   async garrettCall(cfg, method, params, what) {
     if (!hasGarrett(this.env)) return "ERROR: Agent Garrett is not launched in this account (garrett_launch asks your human's veil for it)";
     const url = String(this.env.GARRETT_MCP_URL).trim();
@@ -2480,8 +2510,7 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
     if (what === "list") {
       const tools = Array.isArray(j.result?.tools) ? j.result.tools : [];
       if (tools.length === 0) return "(Agent Garrett lists no tools)";
-      const keys = Object.keys(tools[0].inputSchema?.properties ?? {});
-      return tools.map((t) => `- ${t.name}: ${clip(String(t.description ?? ""), 160)}`).join("\n") + (keys.length > 0 ? `\nArguments are strings; each tool reads the ones it needs from: ${keys.join(", ")}` : "");
+      return tools.map((t) => `- ${t.name}: ${clip(String(t.description ?? ""), 160)}\n  inputSchema: ${JSON.stringify(t.inputSchema ?? {type:"object",properties:{}})}`).join("\n");
     }
     const out = (Array.isArray(j.result?.content) ? j.result.content : []).filter((c) => c?.type === "text").map((c) => c.text).join("\n");
     const meta = j.result?.structuredContent ? "\nEVIDENCE: " + clip(JSON.stringify(j.result.structuredContent), 600) : "";
@@ -2901,7 +2930,7 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
     // At least two minds when the size allows it: a swarm of one is just this tot again, slower.
     const width = Math.min(cfg.size, Math.max(2, cfg.minds));
     const run = tasks.slice(0, width);
-    const tools = toolsFor(this.env, cfg).filter((t) => MIND_TOOLS.has(t.name));
+    const tools = toolsFor(this.env, cfg).filter((t) => MIND_TOOLS.has(t.name) || t.name.startsWith("security_"));
     const system =
       `You are one mind of ${cfg.name}'s swarm: you have ONE task, a few tool calls, and nobody to ask. Do the task and report what the tool results showed.\n\nTOOLS:\n` +
       toolList(tools) + "\n\n" + REPLY_RULE;

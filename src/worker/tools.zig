@@ -23,6 +23,7 @@ const ragmirror = @import("ragmirror.zig");
 const recipes = @import("recipes.zig"); // recipe tools: DATA sequences over already-allowed tools (Feature: granted recipes)
 const dataset = @import("dataset.zig"); // training-set capture — the tool-execution half of a set
 const cftools = @import("cftools.zig"); // the cf_ family: a connected Cloudflare account's own tool belt
+const garrett = @import("garrett.zig"); // Agent Garrett's belt: the user's own blue-team agent over MCP (garrett, garrett_tools)
 const cpaths = @import("chat/paths.zig"); // sub-chat family base for recall (chat:<parent>__sN → chat:<parent>)
 
 /// Injected into an authored tool's Python body ONLY when NL_BROWSER_DRIVER is enabled: a `browser(action,
@@ -562,6 +563,13 @@ pub const ToolCtx = struct {
     /// true once a download has landed in this workdir (cftools.Ctx.wrote), which is how the engine knows
     /// there is a file to carry back to the user's machine.
     cf_wrote: ?*bool = null,
+    // AGENT GARRETT (garrett, garrett_tools): where the user's own blue-team agent answers and the bearer it
+    // answers to — derived per turn by the chat engine (config/cf_garrett.zig) when the client asked for it, read
+    // from keys.env by a swarm worker whose deploy asked. Blank everywhere else, and blank means the two verbs
+    // are neither advertised nor dispatchable: same shape and same reason as the cf_ pair above.
+    garrett_url: []const u8 = "",
+    garrett_token: []const u8 = "",
+    garrett_schema: []const u8 = "",
     // Recipe recursion depth. A recipe step may not name another recipe (refused at run time, I5), so this is
     // 0 or 1 in practice; it is a belt-and-braces backstop against any future path that could re-enter
     // runRecipe, guaranteeing one level only regardless of how the step was reached.
@@ -1346,6 +1354,11 @@ pub const PIXEL_SCHEMA =
 
 /// MCP tools (round 2): let RSI find + use the AI-ready MCP servers / runtimes installed on the user's machine.
 /// Injected at runtime only when NL_MCP is set. Comma-joined, no outer brackets.
+/// Agent Garrett's two verbs (garrett.zig): appended to a turn's or a mind's belt only when the pair is there.
+pub const GARRETT_SCHEMA = garrett.SCHEMA;
+pub const garrettOn = garrett.on;
+pub const garrettDiscover = garrett.discover;
+
 pub const MCP_SCHEMA =
     \\{"type":"function","function":{"name":"mcp_discover","description":"Discover AI-ready capabilities installed on THIS machine: MCP servers declared in the local app configs (Claude Desktop, Cursor, VS Code) and local AI runtimes (Ollama, LM Studio). Call with no arguments to list every server + runtime; pass a server name to connect to it and list the tools it offers. Use this to find a local tool/app that can get information or perform an action plain web tools can't.","parameters":{"type":"object","properties":{"server":{"type":"string","description":"optional: a server name from a prior mcp_discover, to list ITS tools"}},"required":[]}}},
     \\{"type":"function","function":{"name":"mcp_call","description":"Call a tool on a locally-installed MCP server (discovered via mcp_discover). Give the server name, the tool name, and the tool's arguments object; returns the tool's result. Only use servers/tools the user already has installed and configured.","parameters":{"type":"object","properties":{"server":{"type":"string"},"tool":{"type":"string"},"args":{"type":"object","description":"the tool's arguments"}},"required":["server","tool"]}}}
@@ -1588,7 +1601,7 @@ fn executeInner(ctx: *ToolCtx, name: []const u8, args_json: []const u8) []u8 {
     // sandboxAllowed() is unchanged; a granted name is merely allowed to reach the recipe DISPATCH below, whose
     // steps each re-hit THIS gate under these same caps (I4). So a grant controls HOW a tool runs (a data
     // recipe through the gate), never WHETHER the gate refuses a name — the whole safety property of the feature.
-    if (ctx.caps == .sandboxed and !sandboxAllowed(name) and grantedRecipe(ctx, name) == null)
+    if (ctx.caps == .sandboxed and !sandboxAllowed(name) and !garrett.isTool(name) and grantedRecipe(ctx, name) == null)
         return dupe(gpa, SANDBOX_REFUSAL);
 
     // A GRANTED NAME RUNS AS DATA OR NOT AT ALL — and this must be decided BEFORE the built-in chain.
@@ -1628,6 +1641,13 @@ fn executeInner(ctx: *ToolCtx, name: []const u8, args_json: []const u8) []u8 {
     if (std.mem.eql(u8, name, "host_status")) return hostStatus(ctx, args_json);
     if (std.mem.eql(u8, name, "host_command")) return hostCommand(ctx, args_json);
     if (std.mem.eql(u8, name, "host_explore")) return hostExplore(ctx, args_json);
+    // AGENT GARRETT (garrett_tools, garrett): the user's own blue-team agent over MCP. Runs in the process that
+    // holds the pair (ctx.garrett_url/token — the server for a chat turn, the worker itself for a mind); blank
+    // means the belt was never advertised, and the verb says how to get it instead of pretending.
+    if (garrett.isTool(name)) {
+        if (!ctx.internet) return dupe(gpa, "web disabled: this is an OFFLINE run, and Agent Garrett answers over the internet. Answer from the hive's preloaded memory.");
+        return garrett.run(.{ .gpa = gpa, .io = ctx.io, .scratch = ctx.run_dir, .url = ctx.garrett_url, .token = ctx.garrett_token }, name, args_json);
+    }
     if (!ctx.internet and (std.mem.eql(u8, name, "web_fetch") or std.mem.eql(u8, name, "web_search") or
         std.mem.eql(u8, name, "fetch_json") or std.mem.eql(u8, name, "read_url") or
         std.mem.eql(u8, name, "osint_scan") or std.mem.eql(u8, name, "deep_crawl")))
@@ -2440,11 +2460,11 @@ pub fn isBuiltinTool(n: []const u8) bool {
     // families were listed only as their exact verbs, so "mcp_lookup" or "browser_summary" slipped through
     // as well. Keep this in sync with the dispatch chain in execute(); the test below reads execute()'s
     // source and fails if the two ever disagree again.
-    const builtins = [_][]const u8{ "run_python", "write_file", "edit_file", "read_file", "absorb", "stage_file", "patch_system", "list_dir", "run_tests", "delete_file", "web_fetch", "web_search", "fetch_json", "read_url", "osint_scan", "deep_crawl", "observe", "recall", "recall_hive", "read_doc", "poll", "stop_process", "share", "probe", "note_stance", "save_skill", "journal", "set_directive", "send_message", "add_task", "claim_task", "complete_task", "stage_delivery", "make_tool", "propose_change", "simulate_change", "propose_plan_change", "ask_veil", "host_status", "host_command", "host_explore", "get_credential" };
+    const builtins = [_][]const u8{ "run_python", "write_file", "edit_file", "read_file", "absorb", "stage_file", "patch_system", "list_dir", "run_tests", "delete_file", "web_fetch", "web_search", "fetch_json", "read_url", "osint_scan", "deep_crawl", "observe", "recall", "recall_hive", "read_doc", "poll", "stop_process", "share", "probe", "note_stance", "save_skill", "journal", "set_directive", "send_message", "add_task", "claim_task", "complete_task", "stage_delivery", "make_tool", "propose_change", "simulate_change", "propose_plan_change", "ask_veil", "host_status", "host_command", "host_explore", "get_credential", "garrett_tools", "garrett" };
     for (builtins) |b| if (std.mem.eql(u8, b, n)) return true;
     // PREFIX families: execute() routes these with startsWith, so every suffix is reserved, not just the
     // verbs that happen to exist today.
-    const families = [_][]const u8{ "browser_", "pixel_", "mcp_", "cf_" };
+    const families = [_][]const u8{ "browser_", "pixel_", "mcp_", "cf_", "security_" };
     for (families) |f| if (std.mem.startsWith(u8, n, f)) return true;
     return false;
 }

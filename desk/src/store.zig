@@ -23,7 +23,7 @@ const SpinLock = struct {
 
 pub const Tab = enum { dashboard, chat, swarm, tots, hub, scheduled, settings }; // deploy = the Swarm tab's inner form
 
-pub const CmdKind = enum { none, select, say, set_goal, stop, deploy, delete, open_folder, refresh_now, open_file, sched_create, sched_update, sched_toggle, sched_delete, sched_run, oauth_cf_login, oauth_cf_logout, open_url, builtin_pull, builtin_cancel, builtin_import, builtin_remove, builtin_check, dataset_start, dataset_stop, cf_tunnel_on, cf_tunnel_off, lineage_accept, lineage_reject, tot_select, tot_deploy, tot_command, tot_config, tot_delete, tot_pad_write, tot_open_folder, tot_pad_clear, tot_limit, tot_select_run, tot_delete_run };
+pub const CmdKind = enum { none, select, say, set_goal, stop, deploy, delete, open_folder, refresh_now, open_file, sched_create, sched_update, sched_toggle, sched_delete, sched_run, oauth_cf_login, oauth_cf_logout, open_url, builtin_pull, builtin_cancel, builtin_import, builtin_remove, builtin_check, dataset_start, dataset_stop, cf_tunnel_on, cf_tunnel_off, lineage_accept, lineage_reject, tot_select, tot_deploy, tot_command, tot_config, tot_delete, tot_pad_write, tot_open_folder, tot_pad_clear, tot_limit, tot_select_run, tot_delete_run, garrett_deploy, garrett_remove };
 
 /// A UI→poller command. Fixed-size, copied by value into the ring, so no cross-thread allocation.
 pub const Command = struct {
@@ -328,6 +328,7 @@ pub const Settings = struct {
     // min(280, 42% of the pane) with no way to change it, which is what made the shell unusable: a terminal
     // you cannot make taller than 280px, in a column you cannot widen past 560px, is a peephole.
     chat_con_h: u16 = 280,
+    use_garrett: bool = false,
     shell_always_allow: bool = false, // "Bypass" chosen once → the veil's RUN: shell commands skip the approval prompt
     // SPEED MODE (default ON): the chat BUILDS projects itself with its file tools, and casts are quick
     // research sub-agents capped at 2 minutes. OFF = the autonomy posture: the chat may deploy long
@@ -1153,6 +1154,18 @@ pub const Store = struct {
     cf_tun_url_len: usize = 0,
     cf_tun_err: [160]u8 = undefined,
     cf_tun_err_len: usize = 0,
+    // --- Agent Garrett (the poller writes from GET /api/v1/tots/garrett while connected; the Settings card, the
+    // tot and swarm deploy forms and the chat composer read): deployed or not, its address, a deploy or removal in
+    // flight, and the last refusal in the server's words.
+    garrett_seen: bool = false,
+    garrett_deployed: bool = false,
+    garrett_busy: bool = false,
+    garrett_building: bool = false,
+    garrett_ready: bool = false,
+    garrett_url: [200]u8 = undefined,
+    garrett_url_len: usize = 0,
+    garrett_err: [200]u8 = undefined,
+    garrett_err_len: usize = 0,
 
     // --- Tots (tots.zig): the poller writes from GET /api/v1/tots, the selected tot's events and the shared
     // scratchpad, and ONLY while the Tots tab is being drawn - each poll is a call into the user's Cloudflare

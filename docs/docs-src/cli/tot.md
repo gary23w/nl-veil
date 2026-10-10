@@ -13,7 +13,7 @@ Every verb is one call to the local server (`config/cf_tot.zig`), which relays t
 ## Key Exports
 
 - `cmd` — the dispatcher for `veil --tater [ls | deploy | tell | watch | set | guard | verify | garrett | pad | limit | key | rm | teardown]`
-- `rosterLine` — one roster row: name, state, minds, model calls today, the local grant, `DEFEND` when the posture is, `guard N` (and `TRIPPED`) when it watches anything, the goal and its counters (pure, tested)
+- `rosterLine` — one roster row: name, state, minds, model calls today, the local grant, `DEFEND` when the posture is, `+garrett` when it asked for Agent Garrett, `guard N` (and `TRIPPED`) when it watches anything, the goal and its counters (pure, tested)
 - `eventLine` — one event as a terminal line (pure, tested)
 - `chainHash` / `Chain` / `ChainEvent` — the runtime's evidence chain recomputed here: SHA-256 of `<prev>\n<seq>\n<t>\n<kind>\n<text>`, and a walker that takes a run's rows oldest first, counts unsigned rows (an older runtime's), and names the first row that was altered or does not follow the signed row before it (pure; held to the same vectors as `cloud/tot.test.mjs`)
 - `guardCommand` — the words after the name as the tot's own `/guard` line, a phrase with spaces quoted again (pure, tested)
@@ -25,7 +25,7 @@ Every verb is one call to the local server (`config/cf_tot.zig`), which relays t
 
 ## Usage Context
 
-`cli.zig` dispatches `--tater` (and `tater`, and `tot`, its earlier name) here and lists them in `isCommand`; the help text has a TATER-TOTS section. `deploy` sends only the fields the server's `CreateReq` names (the server's request parser is strict). `--local` is the terminal form of the deploy form's checkbox: it lets the tater-tot queue jobs for the veil on this machine, and it exists only on `deploy`.
+`cli.zig` dispatches `--tater` (and `tater`, and `tot`, its earlier name) here and lists them in `isCommand`; the help text has a TATER-TOTS section. `deploy` sends only the fields the server's `CreateReq` names (the server's request parser is strict). `--local` is the terminal form of the deploy form's checkbox: it lets the tater-tot queue jobs for the veil on this machine, and it exists only on `deploy`. `--garrett` is the form's other box, "Agent Garrett": the agent's security tools on that tot's belt; `set <name> --garrett on|off` changes it later.
 
 ## Notable Implementation Details
 
@@ -38,8 +38,8 @@ Every verb is one call to the local server (`config/cf_tot.zig`), which relays t
 - `tell` joins its remaining arguments into one text, so `veil --tater tell Gary /goal map every harbour --forever` needs no quotes.
 - `guard <name> ...` sends the tater-tot its own `/guard` command: `add <https://...> [--text "..."] [--status N] [--every S] [--pin]`, `add dns:<host> [--type A]`, `rm <target|#n>`, `clear`, or nothing to list what it watches and the state of each target. The reply is the runtime's.
 - `verify <run>` pages `GET /api/v1/tots/runs/:run/events?forward=1` from the run's first event and recomputes the chain on this machine. It exits 0 with the signed count and the last hash, 2 with the event where the chain broke and why, 1 when the run has no events or none of them is signed (a run from before the chain).
-- `garrett` shows Agent Garrett as the server knows it; `garrett launch` puts it in the account beside the tater-tots (up to a few minutes: the modules come from the agent's repo, the upload is five calls); `garrett password` prints the password locking its chat UI; `garrett rm` removes it.
-- `set` and `deploy` take `--posture defend|normal` and `--leash SECONDS|off`; `key alert <https://...>` is the guard's webhook, `key garrett_url` + `key garrett_token` point at an Agent Garrett deployed by hand.
+- `garrett` shows Agent Garrett as the server knows it; `garrett launch` deploys it into the Cloudflare account - no tater-tot needed; the desk's Settings → Models → Deploy security tools button provisions the edge Worker, private Worker, Container and R2 storage, then shows build progress until the full runtime is ready; `garrett password` prints the password locking its chat UI; `garrett rm` removes it, and chats, swarms and tater-tots lose its verbs.
+- `set` and `deploy` take `--posture defend|normal`, `--leash SECONDS|off` and `--garrett` (`set`: `--garrett on|off`); `key alert <https://...>` is the guard's webhook, `key garrett_url` + `key garrett_token` point the tater-tots at an Agent Garrett deployed by hand. `veil chat --garrett` is the chat's box.
 
 ---
 

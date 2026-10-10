@@ -1,0 +1,19 @@
+Gary security runtime
+
+This component includes modified ARTEX source by Hinln and its contributors.
+Upstream: https://github.com/Hinln/ARTEX
+License: GNU Affero General Public License, version 3 (AGPL-3.0).
+The full license is provided in GARY-LICENSE and in the source archive.
+
+NL-Veil's Gary modifications rename the tool interface, translate runtime
+messages into English, and integrate Cloudflare Containers and authenticated
+MCP execution. The corresponding source is in gary-source.tar.gz, together
+with its original dependency manifests and installation script. Cloudflare
+integration and build sources are provided alongside it in this directory.
+
+Public corresponding source for v1.1.12:
+https://github.com/gary23w/nl-veil/tree/v1.1.12/cloud
+https://github.com/gary23w/nl-veil/raw/refs/tags/v1.1.12/cloud/gary-source.tar.gz
+
+NL-Veil's own code is distributed under its root MIT LICENSE. The Gary
+component is distributed under AGPL-3.0. Dependencies retain their own licenses.

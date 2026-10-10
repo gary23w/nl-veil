@@ -8,6 +8,7 @@ const builtin = @import("builtin");
 const nap = @import("nap.zig");
 pub const updater = @import("updater.zig");
 const rl = @import("raylib");
+extern fn rlDrawRenderBatchActive() callconv(.c) void;
 const t = @import("theme.zig");
 const store_mod = @import("store.zig");
 const scan = @import("scan.zig");
@@ -165,12 +166,11 @@ const Ui = struct {
     stream_h_len: usize = std.math.maxInt(usize),
     stream_h_cols: usize = 0,
     stream_h_fp: u64 = 0,
-    // SMOOTH REVEAL: how many bytes of the in-flight reply are shown on screen (fractional so a sub-byte/frame
-    // rate accumulates cleanly). Server tokens arrive in poll-batched chunks (33-120ms); dumping each batch at
-    // once made a slow reply appear in visible jumps, and draining each batch FASTER than the next arrives made
-    // it chunk-pause-chunk. This spreads each batch over a window slightly longer than the poll cadence, so the
-    // reveal is still flowing when the next batch lands — continuous, at the model's real pace.
-    stream_reveal: f64 = 0,
+    // SMOOTH REVEAL, paced by latency: how much of the in-flight reply is on screen, and the arrival cadence it
+    // is paced to (see Reveal). Dumping each poll batch at once made a slow reply appear in visible jumps, and
+    // draining each batch FASTER than the next arrives made it chunk-pause-chunk; the pacer measures how the
+    // text is arriving and types at that pace, so the flow is unbroken at a brisk model's rate and a slow one's.
+    reveal: Reveal = .{},
     // EXPANDED ROWS (tool calls + reasoning traces), keyed by the stable ChatMsg.uid rather than by row index.
     // Index keying was wrong twice over: the message array shifts under the UI (a reasoning trace is INSERTED
     // before the answer it produced; the 64-slot ring evicts from the front), so an open block popped shut and
@@ -253,9 +253,11 @@ const Ui = struct {
     d_gap: bool = true,
     d_breakout: bool = false,
     d_psyche: bool = false,
+    d_garrett: bool = false,
     swarm_inner: SwarmInner = .live, // Swarm tab: live view | the deploy form (Deploy folded in as an inner tab)
     // Tots tab: the deploy form's fields, the line that talks to the selected tot, the scratchpad line
     tot_form: bool = false,
+    tot_garrett: bool = false,
     tot_name: Field = .{},
     tot_goal: Field = .{},
     tot_charter: Field = .{},
@@ -353,6 +355,8 @@ const Ui = struct {
     saved_y: i32 = 0,
     saved_w: i32 = 0,
     saved_h: i32 = 0,
+    snapshot_path: [768]u8 = undefined,
+    snapshot_len: usize = 0,
     show_log: bool = false, // F12 debug overlay
     // log console
     log_scroll: f32 = 0,
@@ -791,6 +795,16 @@ pub fn runApp(data_dir: ?[]const u8) !void {
                                         if (std.mem.eql(u8, tn, "dashboard")) .dashboard else if (std.mem.eql(u8, tn, "chat")) .chat else if (std.mem.eql(u8, tn, "swarm")) .swarm else if (std.mem.eql(u8, tn, "tots")) .tots else if (std.mem.eql(u8, tn, "hub")) .hub else if (std.mem.eql(u8, tn, "scheduled")) .scheduled else if (std.mem.eql(u8, tn, "tasks")) .scheduled else if (std.mem.eql(u8, tn, "settings")) .settings else null;
                                     if (tv) |v| setTab(v);
                                 }
+                            } else if (std.mem.startsWith(u8, cmd, "snapshot ")) {
+                                const snapshot_dest = std.mem.trim(u8, cmd[9..], " \r\n\t");
+                                ui.snapshot_len = @min(snapshot_dest.len, ui.snapshot_path.len - 1);
+                                @memcpy(ui.snapshot_path[0..ui.snapshot_len], snapshot_dest[0..ui.snapshot_len]);
+                                ui.snapshot_path[ui.snapshot_len] = 0;
+                            } else if (std.mem.startsWith(u8, cmd, "settings page ")) {
+                                const page = std.fmt.parseInt(usize, cmd[14..], 10) catch 0;
+                                ui.settings_page = @min(page, 4);
+                                ui.settings_scroll = 0;
+                                ui.settings_h = 0;
                             } else if (std.mem.startsWith(u8, cmd, "right ")) {
                                 // switch the right pane's inner tab (Swarm activity | Memory) for headless verification
                                 const rn = std.mem.trim(u8, cmd[6..], " \r\n\t");
@@ -932,6 +946,12 @@ pub fn runApp(data_dir: ?[]const u8) !void {
         if (ui.file_menu) drawFileMenu(&store);
         drawToasts(&store);
         if (ui.show_log) drawLogOverlay();
+        t.flushTip(); // the one tooltip a hovered control asked for this frame, drawn over everything else
+        if (ui.snapshot_len > 0) {
+            rlDrawRenderBatchActive();
+            rl.takeScreenshot(ui.snapshot_path[0..ui.snapshot_len :0]);
+            ui.snapshot_len = 0;
+        }
         t.applyCursor(); // one OS-cursor update per frame: pointer over buttons, I-beam over inputs
     }
 }
@@ -1911,7 +1931,7 @@ fn drawTabbar(store: *Store) void {
 fn drawDashboard(store: *Store, body: t.Rect) void {
     const pad: f32 = t.PAD;
     var y: f32 = body.y + pad;
-    const x: f32 = pad;
+    const x: f32 = body.x + pad;
     const colw: f32 = body.width - pad * 2;
     t.text(t.z("Dashboard", .{}), @intFromFloat(x), @intFromFloat(y), 20, t.fg);
     y += 38;
@@ -2366,7 +2386,7 @@ fn silentNotice(buf: anytype, comptime fmt: []const u8, now_ms: i64, beat_ms: i6
 /// the message stream + input, right = live swarm-cast activity (collapsible). Pane open state persists
 /// via the chat settings file.
 fn drawChat(store: *Store, body: t.Rect) void {
-    const pad: f32 = 12;
+    const pad: f32 = t.PAD;
 
     // copy everything the frame needs under one short lock
     store.lock();
@@ -2541,25 +2561,12 @@ fn drawChat(store: *Store, body: t.Rect) void {
     var inflight_buf: [18432]u8 = undefined;
     const inflight_full = buildInflight(&inflight_buf, sreason_buf[0..sreason_n], stream_buf[0..stream_n], stream_draft);
 
-    // SMOOTH REVEAL: show a growing prefix of the received buffer so chunky poll-batched arrivals read as smooth
-    // typing. Advance is PROPORTIONAL to the backlog and TIME-BASED: reveal the backlog over ~REVEAL_WINDOW_S,
-    // which is deliberately a touch longer than the slow poll interval (120ms) so a batch is still revealing when
-    // the next lands → continuous flow, no chunk-pause-chunk. It self-corrects to the model's pace (steady-state
-    // backlog ≈ rate × window, ~a fifth of a second behind, imperceptible; a big burst drains fast). A small
-    // floor flushes a trailing few bytes promptly instead of asymptoting. Resets with the buffer between turns.
-    const REVEAL_WINDOW_S: f64 = 0.08;
-    const REVEAL_FLOOR_BPS: f64 = 160.0; // minimum reveal speed (bytes/sec) so the tail of a batch doesn't crawl
-    const len_f: f64 = @floatFromInt(inflight_full.len);
-    if (ui.stream_reveal > len_f) ui.stream_reveal = len_f; // buffer shrank (commit / new turn / conv switch)
-    if (ui.stream_reveal < len_f) {
-        const dt: f64 = @min(@as(f64, rl.getFrameTime()), 0.1); // guard a first-frame / hitch spike
-        const backlog = len_f - ui.stream_reveal;
-        const adv = @max(backlog * (dt / REVEAL_WINDOW_S), REVEAL_FLOOR_BPS * dt);
-        ui.stream_reveal = @min(len_f, ui.stream_reveal + adv);
-    }
+    // SMOOTH REVEAL, paced by latency: show a growing prefix of the received buffer, advancing at the pace the
+    // text is arriving (Reveal measures bytes per chunk and seconds between chunks), so a chunk types out over
+    // the interval until the next one lands instead of appearing at once and leaving a pause. Resets with the
+    // buffer between turns.
+    var reveal = ui.reveal.advance(inflight_full.len, rl.getTime(), rl.getFrameTime());
     // never cut a multibyte UTF-8 glyph mid-sequence — back up to the last char boundary at/under the reveal
-    var reveal: usize = @intFromFloat(ui.stream_reveal);
-    if (reveal > inflight_full.len) reveal = inflight_full.len;
     while (reveal > 0 and reveal < inflight_full.len and (inflight_full[reveal] & 0xC0) == 0x80) reveal -= 1;
     const inflight = inflight_full[0..reveal];
 
@@ -2888,6 +2895,158 @@ fn quoteInto(buf: []u8, at: usize, text: []const u8) usize {
     return w;
 }
 
+/// SMOOTH REVEAL, PACED BY LATENCY. The in-flight reply arrives in chunks - a poll batch, a provider's ten-token
+/// delta - and a chunk painted the moment it lands reads as chunk, pause, chunk whenever chunks are sparse (a slow
+/// model: ten tokens every 0.7 s). So the view shows a growing prefix that advances at the pace the text is
+/// ARRIVING: bytes per chunk over seconds per chunk, both exponential averages of the last few arrivals. Steady
+/// state, a chunk types out over the interval until the next one lands (a touch longer, so the flow is unbroken),
+/// which puts the view about one chunk behind the wire - a fifth of a second on a brisk model, under a second on a
+/// slow one. A burst (several chunks in one poll) drains within one interval; a long silence (a tool call, a
+/// thinking model) is a pause, not a cadence, and is not averaged in; a backlog never takes longer than MAX_S to
+/// appear whatever the cadence says; the first chunk of a turn, with no cadence known yet, shows briskly. Pure:
+/// fed the buffer's length and the clock, it says how many bytes to paint. Resets with the buffer between turns.
+const Reveal = struct {
+    shown: f64 = 0, // bytes revealed (fractional: a sub-byte per frame still accumulates)
+    last_len: usize = 0, // the buffer's length at the last frame (growth = an arrival)
+    last_t: f64 = -1, // when the last arrival landed (-1 = none this turn)
+    gap: f64 = 0, // EMA of seconds between arrivals (0 = fewer than two seen)
+    chunk: f64 = 0, // EMA of bytes per arrival
+
+    const EMA: f64 = 0.35; // weight of the newest arrival: a cadence that changes is followed within a few chunks
+    const MAX_GAP_S: f64 = 2.5; // a silence past this is a pause, not a cadence
+    const MAX_S: f64 = 1.0; // a backlog never takes longer than this to drain
+    const SLACK: f64 = 1.15; // drain a chunk over slightly MORE than the interval, so the next lands mid-flow
+    const FIRST_S: f64 = 0.08; // before a cadence is known: a batch drains over the poll interval, as it used to
+    const FIRST_BPS: f64 = 400.0; // ...and never slower than this
+
+    /// How many bytes of a buffer `len` long to paint at wall time `now` (seconds), `dt` seconds after the last
+    /// frame. Every frame, whether or not anything arrived.
+    fn advance(r: *Reveal, len: usize, now: f64, dt_raw: f64) usize {
+        if (len == 0) { // committed, cleared: the next turn starts over
+            r.* = .{};
+            return 0;
+        }
+        if (len < r.last_len) { // shrank but not gone (live reasoning committed out of it, a conversation switch):
+            r.last_len = len; // keep the cadence, never re-type what is already on screen
+            const len_now: f64 = @floatFromInt(len);
+            if (r.shown > len_now) r.shown = len_now;
+        }
+        if (len > r.last_len) { // an arrival: measure it
+            const grew: f64 = @floatFromInt(len - r.last_len);
+            if (r.last_t >= 0) {
+                const g = now - r.last_t;
+                if (g > 0 and g <= MAX_GAP_S) r.gap = if (r.gap == 0) g else r.gap + (g - r.gap) * EMA;
+            }
+            r.chunk = if (r.chunk == 0) grew else r.chunk + (grew - r.chunk) * EMA;
+            r.last_t = now;
+            r.last_len = len;
+        }
+        const len_f: f64 = @floatFromInt(len);
+        if (r.shown >= len_f) {
+            r.shown = len_f;
+            return len;
+        }
+        const dt = @min(@max(dt_raw, 0), 0.1); // guard a first-frame / hitch spike
+        const backlog = len_f - r.shown;
+        // the window one chunk is spread over: the measured interval (with slack), capped; the poll interval
+        // until a cadence is known
+        const window: f64 = if (r.gap > 0) @min(r.gap * SLACK, MAX_S) else FIRST_S;
+        const pace: f64 = if (r.gap > 0) @max(r.chunk, 1) / window else FIRST_BPS;
+        // the arrival pace - or faster when more than a chunk is waiting (a burst), so it drains within one window
+        const rate = @max(pace, backlog / window);
+        r.shown = @min(len_f, r.shown + rate * dt);
+        return @intFromFloat(r.shown);
+    }
+};
+
+test "the reveal paces itself to the arrival cadence: a sparse stream types continuously, a brisk one keeps up, a pause never becomes a crawl" {
+    const fps: f64 = 60;
+    const dt = 1.0 / fps;
+    // tonight's shape: 30-byte chunks every 0.7 s. Painted at once, the view would idle ~70% of the time; paced,
+    // it is still typing when the next chunk lands and never more than two chunks behind the wire.
+    {
+        var r: Reveal = .{};
+        var len: usize = 0;
+        var clock: f64 = 0;
+        var next: f64 = 0;
+        var frames: u32 = 0;
+        var caught_up: u32 = 0;
+        var max_lag: usize = 0;
+        while (clock < 14.0) : (clock += dt) {
+            if (clock >= next) {
+                len += 30;
+                next += 0.7;
+            }
+            const s = r.advance(len, clock, dt);
+            if (clock > 2.0) { // past the two arrivals it takes to learn the cadence
+                frames += 1;
+                if (s >= len) caught_up += 1;
+                max_lag = @max(max_lag, len - s);
+            }
+        }
+        try std.testing.expect(caught_up * 4 < frames); // waiting with nothing to show on under a quarter of the frames
+        try std.testing.expect(max_lag <= 60);
+        // the measured cadence is the real one, within a frame
+        try std.testing.expect(r.gap > 0.65 and r.gap < 0.75);
+        try std.testing.expect(r.chunk > 29 and r.chunk < 31);
+    }
+    // a brisk model: 8-byte deltas every 40 ms. The view stays within a few chunks of the wire.
+    {
+        var r: Reveal = .{};
+        var len: usize = 0;
+        var clock: f64 = 0;
+        var next: f64 = 0;
+        var max_lag: usize = 0;
+        while (clock < 4.0) : (clock += dt) {
+            if (clock >= next) {
+                len += 8;
+                next += 0.04;
+            }
+            const s = r.advance(len, clock, dt);
+            if (clock > 1.0) max_lag = @max(max_lag, len - s);
+        }
+        try std.testing.expect(max_lag <= 24);
+    }
+    // a pause: a 10 s silence (a tool call) between two chunks is not a cadence. The chunk after it is painted
+    // within MAX_S, not crawled out over ten seconds.
+    {
+        var r: Reveal = .{};
+        var clock: f64 = 0;
+        _ = r.advance(30, clock, dt);
+        clock += 0.7;
+        _ = r.advance(60, clock, dt);
+        var s: usize = 0;
+        while (s < 60) : (clock += dt) s = r.advance(60, clock, dt);
+        clock += 10.0;
+        _ = r.advance(90, clock, dt);
+        const at0 = clock;
+        s = 0;
+        while (s < 90 and clock - at0 < 5.0) : (clock += dt) s = r.advance(90, clock, dt);
+        try std.testing.expect(clock - at0 <= Reveal.MAX_S + dt * 2);
+        try std.testing.expect(r.gap > 0.65 and r.gap < 0.75); // the silence left the cadence alone
+    }
+    // the first chunk of a turn, with no cadence known, is on screen within a tenth of a second; a buffer that
+    // shrinks (a commit, a new turn) starts the pacer over
+    {
+        var r: Reveal = .{};
+        var clock: f64 = 0;
+        var s: usize = 0;
+        while (s < 40 and clock < 1.0) : (clock += dt) s = r.advance(40, clock, dt);
+        try std.testing.expect(clock <= 0.12);
+        // shrunk but not gone (reasoning committed out of the live view): what is there stays painted, the
+        // cadence is kept; emptied: everything starts over
+        clock += 0.7;
+        _ = r.advance(70, clock, dt);
+        const kept_chunk = r.chunk;
+        try std.testing.expect(kept_chunk > 0 and r.gap > 0);
+        try std.testing.expectEqual(@as(usize, 25), r.advance(25, clock + dt, dt));
+        try std.testing.expect(r.chunk == kept_chunk and r.gap > 0);
+        try std.testing.expectEqual(@as(usize, 0), r.advance(0, clock, dt));
+        try std.testing.expectEqual(@as(usize, 0), r.last_len);
+        try std.testing.expect(r.chunk == 0 and r.gap == 0 and r.last_t < 0);
+    }
+}
+
 fn buildInflight(buf: []u8, reasoning: []const u8, content: []const u8, draft: bool) []const u8 {
     var w: usize = 0;
     if (reasoning.len > 0) {
@@ -3074,6 +3233,68 @@ fn agoStr(buf: []u8, secs: i64) []const u8 {
 /// of state, and the URL in its own box with Copy / Open. The server owns every decision (owner-only,
 /// registration closed, provisioning through the account); this only shows the snapshot and sends the
 /// flip. The switch is disabled while a flip is in flight so it cannot be double-sent.
+const GarrettSnap = struct {
+    seen: bool = false,
+    deployed: bool = false,
+    busy: bool = false,
+    building: bool = false,
+    ready: bool = false,
+    use: bool = false,
+    cf: bool = false, // logged in with Cloudflare (the deployment needs it)
+    url: [200]u8 = undefined,
+    url_len: usize = 0,
+    err: [200]u8 = undefined,
+    err_len: usize = 0,
+
+    fn read(store: *Store) GarrettSnap {
+        store.lock();
+        defer store.unlock();
+        var g: GarrettSnap = .{ .seen = store.garrett_seen, .deployed = store.garrett_deployed, .busy = store.garrett_busy, .building = store.garrett_building, .ready = store.garrett_ready, .use = store.settings.use_garrett, .cf = store.cf_oauth_connected };
+        g.url_len = @min(store.garrett_url_len, g.url.len);
+        @memcpy(g.url[0..g.url_len], store.garrett_url[0..g.url_len]);
+        g.err_len = @min(store.garrett_err_len, g.err.len);
+        @memcpy(g.err[0..g.err_len], store.garrett_err[0..g.err_len]);
+        return g;
+    }
+    fn urlStr(g: *const GarrettSnap) []const u8 {
+        return g.url[0..g.url_len];
+    }
+    fn errStr(g: *const GarrettSnap) []const u8 {
+        return g.err[0..g.err_len];
+    }
+};
+
+fn drawGarrettOptIn(store: *Store, r: t.Rect, on: bool) bool {
+    const g = GarrettSnap.read(store);
+    return t.checkboxEx(r, t.z("Agent Garrett", .{}), on and g.deployed, g.deployed, "Deploy security tools in Settings first.");
+}
+
+fn drawGarrettRows(store: *Store, x: f32, y0: f32, colw: f32) f32 {
+    const g = GarrettSnap.read(store);
+    const loading = g.busy or g.building;
+    var y = y0;
+    const label = t.zs(if (g.busy) "Deploying security tools..." else if (g.building) "Building security runtime..." else if (g.deployed) "Update security tools" else "Deploy security tools");
+    const bh = @max(t.BTN_MD, t.textH(13) + 18);
+    const rm = t.z("Remove", .{});
+    const rmw = if (g.deployed) t.btnW(rm, bh) + t.GAP else 0;
+    const width = @min(@max(1, colw - rmw), t.btnW(label, bh) + 16);
+    const button = t.Rect{ .x = x, .y = y, .width = width, .height = bh };
+    if (t.button(button, label, t.blue, g.cf and !loading)) store.pushCmd(store_mod.mkCmd(.garrett_deploy, "", ""));
+    if (loading) {
+        const track = t.Rect{ .x = x + 8, .y = y + bh - 6, .width = @max(1, width - 16), .height = 3 };
+        t.panel(track, t.withAlpha(t.blue, 35));
+        const chunk = track.width * 0.28;
+        const motion: f32 = @floatCast((@sin(rl.getTime() * 2) + 1) / 2);
+        t.panel(.{ .x = track.x + (track.width - chunk) * motion, .y = track.y, .width = chunk, .height = track.height }, t.blue);
+    }
+    if (g.deployed and t.button(.{ .x = x + width + t.GAP, .y = y, .width = rmw - t.GAP, .height = bh }, rm, t.red, !g.busy)) store.pushCmd(store_mod.mkCmd(.garrett_remove, "", ""));
+    y += bh + t.GAP;
+    if (g.err_len > 0) {
+        y = helpPara(g.errStr(), x, y, colw) + t.GAP;
+    }
+    return y;
+}
+
 fn drawCfTunnelRows(store: *Store, x: f32, y0: f32, colw: f32) f32 {
     var y = y0;
     var seen = false;
@@ -4768,8 +4989,8 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
     const status_h: f32 = 22;
     // A slim row reserved BELOW the input for the role picker. Always reserved (not gated on the picker being
     // visible) so the transcript height doesn't jump as busy/idle toggles; the anchor itself is idle-only.
-    const role_h: f32 = 22;
-    const tab_h: f32 = 26;
+    const role_h: f32 = @max(26, t.textH(12) + 10);
+    const tab_h: f32 = @max(30, t.textH(13) + 12);
     // Chat | Metrics | Files inner tabs (Metrics = per-turn perf graphs; Files = this chat's own build dir)
     const tl_chat = t.z("Chat", .{});
     const tl_metrics = t.z("Metrics", .{});
@@ -5164,7 +5385,11 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
     };
     const ltxt: [:0]const u8 = if (goal_row[0]) t.z("goal: {d} done, {d} better", .{ goal_row[1], goal_row[2] }) else if (afk_on) t.z("auto-loop: afk", .{}) else if (loop_on) t.z("auto-loop: on", .{}) else t.z("auto-loop: off", .{});
     const ltw: f32 = @floatFromInt(t.measure(ltxt, 12));
-    const status_clip_w: i32 = @intFromFloat(@max(60, r.width - ltw - 24)); // never overlap the auto-loop label
+    const gar = GarrettSnap.read(store);
+    const gar_on = gar.deployed and gar.use;
+    const gtxt = t.z("Agent Garrett: {s}", .{if (gar_on) "on" else "off"});
+    const gtw: f32 = @floatFromInt(t.measure(gtxt, 12));
+    const status_clip_w: i32 = @intFromFloat(@max(1, r.width - ltw - gtw - 32));
     if (busy) {
         const dots: usize = @intFromFloat(@mod(rl.getTime() * 2.5, 4.0));
         const dstr = [_][]const u8{ "", ".", "..", "..." };
@@ -5174,11 +5399,21 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
     } else if (status.len > 0) {
         t.textClip(status, @intFromFloat(r.x + 4), @intFromFloat(sy), 12, t.comment, status_clip_w);
     }
+    const gtog = t.Rect{ .x = r.x + r.width - ltw - gtw - 24, .y = sy - 3, .width = gtw + 6, .height = t.textH(12) + 6 };
+    const ghot = gar.deployed and t.hovering(gtog);
+    t.text(gtxt, @intFromFloat(gtog.x + 3), @intFromFloat(sy), 12, if (gar_on) t.green else if (ghot) t.fg_dim else t.comment);
+    if (ghot) t.wantCursor(.pointing_hand);
+    if (ghot and rl.isMouseButtonPressed(.left)) {
+        store.lock();
+        store.settings.use_garrett = !store.settings.use_garrett;
+        store.unlock();
+        store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
+    }
     // AUTO-LOOP toggle (full-auto: the AI writes + sends its own next message toward the goal until DONE or the
     // 12-step cap). Plain clickable label — no button chrome; the TEXT alone turns green when engaged.
     // DOUBLE-CLICK escalates to the THIRD TIER, auto-loop-afk (orange): the loop NEVER backs itself out —
     // no DONE, no failure, no cap, no cast pause ends it; it runs until the user clicks it off or hits Stop.
-    const ltog = t.Rect{ .x = r.x + r.width - ltw - 8, .y = sy - 3, .width = ltw + 10, .height = 17 };
+    const ltog = t.Rect{ .x = r.x + r.width - ltw - 8, .y = sy - 3, .width = ltw + 10, .height = t.textH(12) + 6 };
     const lhot = t.hovering(ltog);
     t.text(ltxt, @intFromFloat(ltog.x + 3), @intFromFloat(sy), 12, if (afk_on) t.orange else if (loop_on) t.green else if (lhot) t.fg_dim else t.comment);
     if (lhot) t.wantCursor(.pointing_hand);
@@ -6055,7 +6290,7 @@ fn drawDeploy(store: *Store, body: t.Rect) void {
     t.setBlockClicks(ui.open_dd != .none); // same dropdown-overlay guard as Settings (cleared before flushDropdown)
     defer t.setBlockClicks(false);
     const pad: f32 = t.PAD;
-    const x: f32 = pad;
+    const x: f32 = body.x + pad;
     const colw = @min(body.width - pad * 2, 900);
     var y: f32 = body.y + pad;
     t.text(t.z("Deploy a swarm", .{}), @intFromFloat(x), @intFromFloat(y), 20, t.fg);
@@ -6072,12 +6307,12 @@ fn drawDeploy(store: *Store, body: t.Rect) void {
     const rx = x + cw + t.PAD;
     var ly = y;
     var ry = y;
-    const fh: f32 = 48; // one field row: 14px label + 34px input
+    const fh: f32 = t.formRowH(); // one field row: 14px label + 34px input
     const gap: f32 = t.GAP;
 
     // left column: identity + endpoint
     flabel(x, ly, "NAME");
-    textField(.{ .x = x, .y = ly + 14, .width = cw, .height = t.FIELD_H }, &ui.d_name, ui.focus == .d_name, "swarm name", .d_name);
+    textField(.{ .x = x, .y = ly + t.labelH(), .width = cw, .height = t.FIELD_H }, &ui.d_name, ui.focus == .d_name, "swarm name", .d_name);
     ly += fh + gap;
 
     // "default" = inherit the CLIENT's configured chat LLM (Settings → CHAT MODEL): the swarm runs on
@@ -6098,13 +6333,13 @@ fn drawDeploy(store: *Store, body: t.Rect) void {
 
     if (!ui.d_use_default and prov.needs_account and !cf.connected) {
         flabel(x, ly, "CLOUDFLARE ACCOUNT ID (blank = use the server's own Workers AI creds)");
-        textField(.{ .x = x, .y = ly + 14, .width = cw, .height = t.FIELD_H }, &ui.d_cfacct, ui.focus == .d_cfacct, "account id", .d_cfacct);
+        textField(.{ .x = x, .y = ly + t.labelH(), .width = cw, .height = t.FIELD_H }, &ui.d_cfacct, ui.focus == .d_cfacct, "account id", .d_cfacct);
         ly += fh + gap;
     }
     if (!ui.d_use_default and prov.needs_key and !(prov.needs_account and cf.connected)) {
         const kh: [:0]const u8 = if (std.mem.eql(u8, prov.key, "huggingface")) t.z("HF TOKEN (hf_...)", .{}) else if (prov.needs_account) t.z("CLOUDFLARE API TOKEN (blank = server creds)", .{}) else t.z("API KEY (nlk_... or provider key)", .{});
         flabel(x, ly, kh);
-        textField(.{ .x = x, .y = ly + 14, .width = cw, .height = t.FIELD_H }, &ui.d_key, ui.focus == .d_key, "sk-... / nlk_...", .d_key);
+        textField(.{ .x = x, .y = ly + t.labelH(), .width = cw, .height = t.FIELD_H }, &ui.d_key, ui.focus == .d_key, "sk-... / nlk_...", .d_key);
         ly += fh + gap;
     }
 
@@ -6122,17 +6357,17 @@ fn drawDeploy(store: *Store, body: t.Rect) void {
     // goal spans full width below the columns
     var gy = @max(ly, ry) + 6;
     flabel(x, gy, "GOAL");
-    textField(.{ .x = x, .y = gy + 14, .width = colw, .height = 56 }, &ui.d_goal, ui.focus == .d_goal, "one line: what should the hive build or research?", .d_goal);
-    gy += 14 + 56 + gap;
+    textField(.{ .x = x, .y = gy + t.labelH(), .width = colw, .height = 56 }, &ui.d_goal, ui.focus == .d_goal, "one line: what should the hive build or research?", .d_goal);
+    gy += t.labelH() + 56 + gap;
 
     // gateway
     flabel(x, gy, "GATEWAY MODEL (optional - cheap model for mechanical calls)");
-    textField(.{ .x = x, .y = gy + 14, .width = colw, .height = t.FIELD_H }, &ui.d_gateway, ui.focus == .d_gateway, "blank = same as the minds", .d_gateway);
+    textField(.{ .x = x, .y = gy + t.labelH(), .width = colw, .height = t.FIELD_H }, &ui.d_gateway, ui.focus == .d_gateway, "blank = same as the minds", .d_gateway);
     gy += fh + gap;
 
     // lineage: one memory across casts. Existing lineages are offered as chips so a re-cast picks the SAME id.
     flabel(x, gy, "LINEAGE (optional - casts with the same id share one memory and get reviewed lessons)");
-    textField(.{ .x = x, .y = gy + 14, .width = colw, .height = t.FIELD_H }, &ui.d_lineage, ui.focus == .d_lineage, "blank = a fresh memory for this swarm", .d_lineage);
+    textField(.{ .x = x, .y = gy + t.labelH(), .width = colw, .height = t.FIELD_H }, &ui.d_lineage, ui.focus == .d_lineage, "blank = a fresh memory for this swarm", .d_lineage);
     gy += fh + 2;
     {
         var ids: [store_mod.MAX_LINEAGES][64]u8 = undefined;
@@ -6177,6 +6412,7 @@ fn drawDeploy(store: *Store, body: t.Rect) void {
     if (t.checkbox(.{ .x = c0, .y = gy, .width = tcw, .height = 30 }, t.z("living hive", .{}), ui.d_population)) ui.d_population = !ui.d_population;
     if (t.checkbox(.{ .x = c1, .y = gy, .width = tcw, .height = 30 }, t.z("observe psyche", .{}), ui.d_psyche)) ui.d_psyche = !ui.d_psyche;
     if (t.checkbox(.{ .x = c2, .y = gy, .width = tcw, .height = 30 }, t.z("encrypt memory", .{}), ui.d_encrypt)) ui.d_encrypt = !ui.d_encrypt;
+    if (drawGarrettOptIn(store, .{ .x = c3, .y = gy, .width = tcw, .height = 30 }, ui.d_garrett)) ui.d_garrett = !ui.d_garrett;
     gy += 30 + t.PAD;
 
     // deploy button
@@ -6206,8 +6442,8 @@ fn selector(r: t.Rect, label: [:0]const u8, value: []const u8, kind: DdKind) voi
     const hot = t.hovering(r);
     t.panelBordered(r, if (hot and !open) t.bg_hl else t.bg, if (open) t.blue else if (hot) t.fg_dim else t.border);
     t.text(label, @intFromFloat(r.x + 12), @intFromFloat(r.y + 7), 11, t.comment);
-    t.textClip(value, @intFromFloat(r.x + 12), @intFromFloat(r.y + 22), 14, t.fg, @intFromFloat(r.width - 34));
-    t.text(t.z("v", .{}), @intFromFloat(r.x + r.width - 22), @intFromFloat(r.y + (r.height - 13) / 2), 13, if (open or hot) t.blue else t.comment);
+    t.textClip(value, @intFromFloat(r.x + 12), @intFromFloat(r.y + 6 + t.textH(11) + 4), 14, t.fg, @intFromFloat(r.width - 34));
+    t.text(t.z("v", .{}), @intFromFloat(r.x + r.width - 22), @intFromFloat(r.y + (r.height - t.textH(13)) / 2), 13, if (open or hot) t.blue else t.comment);
     // While any dropdown list is open, only its own anchor may toggle; this prevents list clicks from
     // leaking through to a selector drawn underneath the list in the same frame.
     const can_toggle = ui.open_dd == .none or open;
@@ -6495,10 +6731,10 @@ fn submitDeploy(store: *Store, prov: *const catalog.Provider) void {
     }
     w.writeAll("{\"name\":\"") catch return;
     jesc(&w, ui.d_name.str());
-    w.print("\",\"provider\":\"{s}\",\"model\":\"{s}\",\"style\":\"{s}\",\"stack\":\"{s}\",\"mode\":\"{s}\",\"base_url\":\"{s}\",\"minutes\":{d},\"encrypt\":{s},\"veil_population\":{s},\"autonomy\":\"{s}\",\"internet\":{s},\"gap_assess\":{s},\"breakout\":{s},\"observe_psyche\":{s},\"api_key\":\"", .{
+    w.print("\",\"provider\":\"{s}\",\"model\":\"{s}\",\"style\":\"{s}\",\"stack\":\"{s}\",\"mode\":\"{s}\",\"base_url\":\"{s}\",\"minutes\":{d},\"encrypt\":{s},\"veil_population\":{s},\"autonomy\":\"{s}\",\"internet\":{s},\"gap_assess\":{s},\"breakout\":{s},\"observe_psyche\":{s},\"garrett\":{s},\"api_key\":\"", .{
         eff_provider,           eff_model,                     catalog.styles[ui.d_style], catalog.stacks[ui.d_stack], catalog.modes[ui.d_mode],
         eff_base,               catalog.minutes[ui.d_minutes], boolStr(ui.d_encrypt),      boolStr(ui.d_population),   if (ui.d_autonomy_full) "full" else "bounded",
-        boolStr(ui.d_internet), boolStr(ui.d_gap),             boolStr(ui.d_breakout),     boolStr(ui.d_psyche),
+        boolStr(ui.d_internet), boolStr(ui.d_gap),             boolStr(ui.d_breakout),     boolStr(ui.d_psyche),       boolStr(ui.d_garrett and GarrettSnap.read(store).deployed),
     }) catch return;
     jesc(&w, eff_key);
     w.writeAll("\",\"gateway_model\":\"") catch return;
@@ -6625,11 +6861,11 @@ fn jesc(w: *std.Io.Writer, s: []const u8) void {
 /// this inner tab via gotoDeploy).
 fn drawSwarm(store: *Store, body: t.Rect) void {
     const pad: f32 = t.PAD;
-    const tab_h: f32 = 26;
+    const tab_h: f32 = @max(30, t.textH(13) + 12);
     const tl_live = t.z("Live", .{});
     const tl_deploy = t.z("Deploy", .{});
     const tl_lin = t.z("Lineages", .{});
-    var tx: f32 = pad;
+    var tx: f32 = body.x + pad;
     if (t.tab(.{ .x = tx, .y = body.y + pad, .width = t.tabW(tl_live), .height = tab_h }, tl_live, ui.swarm_inner == .live)) ui.swarm_inner = .live;
     tx += t.tabW(tl_live) + 6;
     if (t.tab(.{ .x = tx, .y = body.y + pad, .width = t.tabW(tl_deploy), .height = tab_h }, tl_deploy, ui.swarm_inner == .deploy)) ui.swarm_inner = .deploy;
@@ -8179,7 +8415,7 @@ fn drawTotForm(store: *Store, r: t.Rect, first: bool, can_send: bool) void {
     var y = r.y;
     const colw = @min(r.width, 760);
     const gap: f32 = t.GAP;
-    const fh: f32 = 48;
+    const fh: f32 = t.formRowH();
     t.text(if (first) t.z("Deploy Gary", .{}) else t.z("Deploy a tot", .{}), @intFromFloat(x), @intFromFloat(y), 20, t.fg);
     y += 30;
     y = helpPara("It starts working as soon as it is deployed and never waits for anyone. Everything below can be changed later by telling it - except the last box.", x, y, colw) + 8;
@@ -8189,18 +8425,18 @@ fn drawTotForm(store: *Store, r: t.Rect, first: bool, can_send: bool) void {
         y += 22;
     } else {
         flabel(x, y, "NAME (letters, digits, - or _)");
-        textField(.{ .x = x, .y = y + 14, .width = colw / 2, .height = t.FIELD_H }, &ui.tot_name, ui.focus == .h_name, "e.g. Ada", .h_name);
+        textField(.{ .x = x, .y = y + t.labelH(), .width = colw / 2, .height = t.FIELD_H }, &ui.tot_name, ui.focus == .h_name, "e.g. Ada", .h_name);
         y += fh + gap;
     }
 
     flabel(x, y, "GOAL (what to achieve first)");
     totCounter(x + colw, y, ui.tot_goal.len, limit);
-    textArea(.{ .x = x, .y = y + 14, .width = colw, .height = 88 }, &ui.tot_goal, ui.focus == .h_goal, "e.g. find every public tide-table source for the west coast and keep a checked list of them", .h_goal, 4, 0);
+    textArea(.{ .x = x, .y = y + t.labelH(), .width = colw, .height = 88 }, &ui.tot_goal, ui.focus == .h_goal, "e.g. find every public tide-table source for the west coast and keep a checked list of them", .h_goal, 4, 0);
     y += 14 + 88 + gap;
 
     flabel(x, y, "CHARTER (optional: what it serves when a goal ends, so it can pick the next best thing)");
     totCounter(x + colw, y, ui.tot_charter.len, limit);
-    textArea(.{ .x = x, .y = y + 14, .width = colw, .height = 70 }, &ui.tot_charter, ui.focus == .h_charter, "e.g. keep my tide site accurate and growing", .h_charter, 3, 0);
+    textArea(.{ .x = x, .y = y + t.labelH(), .width = colw, .height = 70 }, &ui.tot_charter, ui.focus == .h_charter, "e.g. keep my tide site accurate and growing", .h_charter, 3, 0);
     y += 14 + 70 + gap;
 
     const half = (colw - gap) / 2;
@@ -8221,6 +8457,8 @@ fn drawTotForm(store: *Store, r: t.Rect, first: bool, can_send: bool) void {
     y += 30;
     y = helpPara("Checked: it may send jobs to the veil on this computer (files, shell, builds, swarms - the full tool set), and they run unattended while this server is up. This is decided here, once: it cannot be granted later, and deleting the tot ends it.", x + 26, y, colw - 26) + 10;
 
+    if (drawGarrettOptIn(store, .{ .x = x, .y = y, .width = colw, .height = t.rowH() }, ui.tot_garrett)) ui.tot_garrett = !ui.tot_garrett;
+    y += t.rowH() + t.GAP;
     const fits = ui.tot_goal.len <= limit and ui.tot_charter.len <= limit;
     const ready = can_send and fits and (ui.tot_goal.len >= 3 or ui.tot_charter.len >= 3);
     const dl = t.z("Deploy", .{});
@@ -8249,6 +8487,7 @@ fn submitTot(store: *Store, first: bool) void {
         .daily_calls = TOT_CALLS[ui.tot_calls],
         .forever = ui.tot_forever,
         .local = ui.tot_local,
+        .garrett = ui.tot_garrett and GarrettSnap.read(store).deployed,
     }) orelse {
         store.pushNotif("Tot not deployed", "the goal and charter are too long together", 2);
         return;
@@ -8496,7 +8735,7 @@ test "tots tab: the console wraps at the width, keeps line breaks, prefers space
 fn drawHub(body: t.Rect) void {
     const pad: f32 = t.PAD;
     var y: f32 = body.y + pad;
-    const x: f32 = pad;
+    const x: f32 = body.x + pad;
     const colw = body.width - pad * 2;
     t.text(t.z("Hub - the fleet console", .{}), @intFromFloat(x), @intFromFloat(y), 20, t.fg);
     y += 38;
@@ -8529,11 +8768,11 @@ fn drawHub(body: t.Rect) void {
 /// re-lists every few seconds so the rows track the server.
 fn drawScheduled(store: *Store, body: t.Rect) void {
     const pad: f32 = t.PAD;
-    const tab_h: f32 = 26;
+    const tab_h: f32 = @max(30, t.textH(13) + 12);
     const editing = ui.sc_edit_id_len > 0;
     const tl_tasks = t.z("All tasks", .{});
     const tl_build = if (editing) t.z("Edit task", .{}) else t.z("Build a task", .{});
-    var tx: f32 = pad;
+    var tx: f32 = body.x + pad;
     if (t.tab(.{ .x = tx, .y = body.y + pad, .width = t.tabW(tl_tasks), .height = tab_h }, tl_tasks, ui.sched_inner == .tasks)) ui.sched_inner = .tasks;
     tx += t.tabW(tl_tasks) + 6;
     if (t.tab(.{ .x = tx, .y = body.y + pad, .width = t.tabW(tl_build), .height = tab_h }, tl_build, ui.sched_inner == .build)) ui.sched_inner = .build;
@@ -8839,7 +9078,7 @@ fn drawSchedBuild(store: *Store, r: t.Rect) void {
     const runs_w: f32 = 280;
     const want_runs = editing and r.width >= 560 + runs_w;
     const colw = @min(if (want_runs) r.width - runs_w - 24 else r.width, 760);
-    const fh: f32 = 48; // one field row: 14px label + 34px input
+    const fh: f32 = t.formRowH(); // one field row: 14px label + 34px input
     const area_h: f32 = 88; // a 4-row textArea (8px pad + 4×18px lines + 8px pad)
     const gap: f32 = t.GAP;
 
@@ -8851,15 +9090,15 @@ fn drawSchedBuild(store: *Store, r: t.Rect) void {
     }
 
     flabel(x, y, "NAME");
-    textField(.{ .x = x, .y = y + 14, .width = colw, .height = t.FIELD_H }, &ui.sc_name, ui.focus == .sc_name, "what to call this task", .sc_name);
+    textField(.{ .x = x, .y = y + t.labelH(), .width = colw, .height = t.FIELD_H }, &ui.sc_name, ui.focus == .sc_name, "what to call this task", .sc_name);
     y += fh + gap;
 
     flabel(x, y, "PROMPT (the message the veil receives on every run)");
-    textArea(.{ .x = x, .y = y + 14, .width = colw, .height = area_h }, &ui.sc_prompt, ui.focus == .sc_prompt, "e.g. check the overnight build logs and summarize any failures", .sc_prompt, 4, 0);
+    textArea(.{ .x = x, .y = y + t.labelH(), .width = colw, .height = area_h }, &ui.sc_prompt, ui.focus == .sc_prompt, "e.g. check the overnight build logs and summarize any failures", .sc_prompt, 4, 0);
     y += 14 + area_h + gap;
 
     flabel(x, y, "KEY DETAILS / DATA (context every run should carry)");
-    textArea(.{ .x = x, .y = y + 14, .width = colw, .height = area_h }, &ui.sc_details, ui.focus == .sc_details, "paths, hosts, formats, constraints - anything the run needs to know", .sc_details, 4, 0);
+    textArea(.{ .x = x, .y = y + t.labelH(), .width = colw, .height = area_h }, &ui.sc_details, ui.focus == .sc_details, "paths, hosts, formats, constraints - anything the run needs to know", .sc_details, 4, 0);
     y += 14 + area_h + gap;
 
     // schedule kind: click-to-cycle (three options — a floating dropdown would be overkill), with the
@@ -8883,14 +9122,14 @@ fn drawSchedBuild(store: *Store, r: t.Rect) void {
     // blank = snapshot the chat provider from Settings, per-field otherwise. Edit: what's shown is what's
     // stored; a blank key keeps the stored one (the server never echoes keys back).
     flabel(x, y, "MODEL OVERRIDE (this task can run on its own provider)");
-    textField(.{ .x = x, .y = y + 14, .width = half, .height = t.FIELD_H }, &ui.sc_base, ui.focus == .sc_base, "base URL - blank = your chat provider's", .sc_base);
+    textField(.{ .x = x, .y = y + t.labelH(), .width = half, .height = t.FIELD_H }, &ui.sc_base, ui.focus == .sc_base, "base URL - blank = your chat provider's", .sc_base);
     // MODEL: a dropdown populated from the shared model catalog (was a free-text field). Shows the chosen
     // model id, or the default hint when blank. The option list + selection are handled by flushSchedDropdown
     // after the whole form draws (so the list sits on top of the fields below it).
     const model_disp: []const u8 = if (ui.sc_model.len > 0) ui.sc_model.str() else "model - blank = your chat model";
     selector(.{ .x = x + half + gap, .y = y + 14, .width = half, .height = t.FIELD_H }, t.z("MODEL", .{}), model_disp, .sched_model);
     y += fh + 4;
-    textField(.{ .x = x, .y = y + 14, .width = colw, .height = t.FIELD_H }, &ui.sc_key, ui.focus == .sc_key, if (editing) "API key - blank = keep the stored key" else "API key - blank = your chat provider's", .sc_key);
+    textField(.{ .x = x, .y = y + t.labelH(), .width = colw, .height = t.FIELD_H }, &ui.sc_key, ui.focus == .sc_key, if (editing) "API key - blank = keep the stored key" else "API key - blank = your chat provider's", .sc_key);
     y += fh + gap;
 
     if (t.checkbox(.{ .x = x, .y = y, .width = 200, .height = 30 }, t.z("enabled", .{}), ui.sc_enabled)) ui.sc_enabled = !ui.sc_enabled;
@@ -9137,19 +9376,19 @@ fn drawSettings(store: *Store, frame: t.Rect) void {
     const colw = @max(1, @min(frame.width - pad * 2, 800));
     const x = frame.x + (frame.width - colw) / 2;
     ui.settings_colw = colw;
-    t.text(t.z("Settings", .{}), @intFromFloat(x), @intFromFloat(frame.y + 12), 24, t.fg);
-    t.textClip("Make the veil feel like yours.", @intFromFloat(x), @intFromFloat(frame.y + 46), 13, t.fg_dim, @intFromFloat(colw));
+    t.text(t.z("Settings", .{}), @intFromFloat(x), @intFromFloat(frame.y + t.PAD), 24, t.fg);
+    t.textClip("Make the veil feel like yours.", @intFromFloat(x), @intFromFloat(frame.y + t.PAD + t.textH(24) + t.GAP), 13, t.fg_dim, @intFromFloat(colw));
     const pages = [_][:0]const u8{ "General", "Models", "Connection", "Data", "Updates" };
     t.setBlockClicks(ui.open_dd != .none);
     var nx = x;
-    var ny = frame.y + 74;
+    var ny = frame.y + t.PAD + t.textH(24) + t.GAP + t.textH(13) + t.GAP;
     for (pages, 0..) |label, index| {
         const width = t.tabW(label) + 12;
         if (nx > x and nx + width > x + colw) {
             nx = x;
-            ny += 36;
+            ny += t.rowH() + 6;
         }
-        if (t.tab(.{ .x = nx, .y = ny, .width = width, .height = 30 }, label, ui.settings_page == index)) {
+        if (t.tab(.{ .x = nx, .y = ny, .width = width, .height = t.rowH() }, label, ui.settings_page == index)) {
             ui.settings_page = index;
             ui.settings_scroll = 0;
             ui.settings_drag = false;
@@ -9159,8 +9398,8 @@ fn drawSettings(store: *Store, frame: t.Rect) void {
         }
         nx += width + 6;
     }
-    const content_y = ny + 44;
-    const body = t.Rect{ .x = x, .y = content_y, .width = colw, .height = @max(1, frame.y + frame.height - content_y) };
+    const content_y = ny + t.rowH() + t.GAP;
+    const body = t.Rect{ .x = x, .y = content_y, .width = colw, .height = @max(1, frame.y + frame.height - content_y - t.PAD) };
     // While a dropdown is open, block the form's buttons/toggles from eating a click meant for the dropdown
     // list drawn over them (flushChatDropdown clears this before drawing the list, so the options still work).
     t.setBlockClicks(ui.open_dd != .none);
@@ -9494,9 +9733,9 @@ fn drawSettings(store: *Store, frame: t.Rect) void {
         // MODEL: a populated dropdown for local/BYOK; a text field for a custom endpoint (models unknown).
         if (chat_kind == 2) {
             flabel(x, y, "MODEL");
-            textField(.{ .x = x, .y = y + 14, .width = half, .height = t.FIELD_H }, &ui.s_model, ui.focus == .s_model, "model id", .s_model);
+            textField(.{ .x = x, .y = y + t.labelH(), .width = half, .height = t.FIELD_H }, &ui.s_model, ui.focus == .s_model, "model id", .s_model);
             flabel(x + half + 10, y, "ENDPOINT URL (OpenAI-compatible /v1)");
-            textField(.{ .x = x + half + 10, .y = y + 14, .width = half, .height = t.FIELD_H }, &ui.s_url, ui.focus == .s_url, "https://host/v1", .s_url);
+            textField(.{ .x = x + half + 10, .y = y + t.labelH(), .width = half, .height = t.FIELD_H }, &ui.s_url, ui.focus == .s_url, "https://host/v1", .s_url);
             y += 58;
             const sem_label = t.z("Save endpoint + model", .{});
             if (t.buttonSolid(.{ .x = x, .y = y, .width = t.btnW(sem_label, t.BTN_MD), .height = t.BTN_MD }, sem_label, t.blue, true)) {
@@ -9523,7 +9762,7 @@ fn drawSettings(store: *Store, frame: t.Rect) void {
             const sv2_label = t.z("Save", .{});
             const sv2w = t.btnW(sv2_label, t.FIELD_H);
             const ew = half - sv2w - 8;
-            textField(.{ .x = x + half + 10, .y = y + 14, .width = ew, .height = t.FIELD_H }, &ui.s_url, ui.focus == .s_url, "http://127.0.0.1:11434/v1", .s_url);
+            textField(.{ .x = x + half + 10, .y = y + t.labelH(), .width = ew, .height = t.FIELD_H }, &ui.s_url, ui.focus == .s_url, "http://127.0.0.1:11434/v1", .s_url);
             if (t.button(.{ .x = x + half + 10 + ew + 8, .y = y + 14, .width = sv2w, .height = t.FIELD_H }, sv2_label, t.blue, true)) {
                 store.lock();
                 const s = &store.settings;
@@ -9591,6 +9830,7 @@ fn drawSettings(store: *Store, frame: t.Rect) void {
                 }
                 y += 44;
                 y = drawCfTunnelRows(store, x, y, colw);
+                y = drawGarrettRows(store, x, y, colw);
             } else if (cf_configured) {
                 // The login is the headline act, so it wears the vendor's own button (cfBrandButton),
                 // a size up from the form buttons around it.
@@ -9884,19 +10124,7 @@ fn drawSettings(store: *Store, frame: t.Rect) void {
     ui.settings_h = (y + 24 + ui.settings_scroll) - body.y;
     rl.endScissorMode();
     t.setInteractionClip(null);
-    const max_scroll = @max(0, ui.settings_h - body.height + 24);
-    if (max_scroll > 0) {
-        const track = t.Rect{ .x = body.x + body.width + 6, .y = body.y, .width = 8, .height = body.height };
-        const thumb_h = @min(track.height, @max(28, track.height * body.height / (ui.settings_h + 24)));
-        if (!rl.isMouseButtonDown(.left)) ui.settings_drag = false;
-        if (ui.open_dd == .none and t.hovering(track) and rl.isMouseButtonPressed(.left)) ui.settings_drag = true;
-        if (ui.settings_drag and track.height > thumb_h) {
-            ui.settings_scroll = std.math.clamp((rl.getMousePosition().y - track.y - thumb_h / 2) / (track.height - thumb_h), 0, 1) * max_scroll;
-        }
-        const thumb_y = track.y + (track.height - thumb_h) * std.math.clamp(ui.settings_scroll / max_scroll, 0, 1);
-        t.panel(track, t.bg_hl);
-        t.panel(.{ .x = track.x, .y = thumb_y, .width = track.width, .height = thumb_h }, if (ui.settings_drag or t.hovering(track)) t.blue else t.comment);
-    } else ui.settings_drag = false;
+    ui.settings_drag = false;
 
     // draw the open chat dropdown LAST so its option list sits on top of the fields below it (and outside
     // the page scissor — a list flipped upward may poke above the body rect). Unblock first so the option
@@ -10312,7 +10540,7 @@ fn textField(r: t.Rect, f: *Ui.Field, focused: bool, placeholder: [:0]const u8, 
     if (t.hovering(r) and ui.open_dd == .none) t.wantCursor(.ibeam);
     f.clampCur();
     const inner_x: i32 = @intFromFloat(r.x + 10);
-    const inner_y: i32 = @intFromFloat(r.y + (r.height - 13) / 2);
+    const inner_y: i32 = @intFromFloat(r.y + (r.height - t.textH(13)) / 2);
     // Don't grab focus while a dropdown is open: its option list is drawn OVER the fields below it, so a click
     // meant for a dropdown item would otherwise fall through and focus the input underneath. The open dropdown
     // owns the click; drawList closes it on an outside-click.

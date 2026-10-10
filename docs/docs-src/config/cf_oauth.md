@@ -45,3 +45,9 @@ Routes are registered by the server; the desk drives start → browser consent �
 ---
 
 *Case file grounded in the module's `//!` header, public API, and its tests.*
+
+## Security tools in v1.1.12
+
+The default Cloudflare OAuth scope set includes Containers read/write permissions for the dedicated Gary execution runtime. Existing logins must disconnect and reconnect once to grant those scopes. The access token stays in the server-side OAuth transport; deployment uses the authenticated owner’s Cloudflare account.
+
+[Security deployment and use guide](../guide/security-tools.md).
