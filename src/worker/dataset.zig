@@ -27,6 +27,16 @@
 //!                        format from later.
 //!   tools.jsonl          every tool EXECUTION: name, verbatim args, the result the model saw, ok, ms.
 //!
+//! ROLLING PARTS. No file that is still being written grows past PART_MAX. The append that would cross it first
+//! renames the live file to <name>.<UTC stamp>.jsonl (a rename, no copy) and starts a fresh <name>.jsonl, and an
+//! archived part is never written again. WHY: Windows Defender's real-time protection rescans a file in full every
+//! time it is modified and closed. Measured 2026-10-11 on a set recording since 2026-08-20: raw.jsonl 511 MB,
+//! sft.jsonl 526 MB and by-model/ 526 MB took a few dozen KB per model call, and Defender answered every append by
+//! re-reading them — bursts of 0.9-1.3 GB/s, about 45 bursts of ~1 GB in 150 s around one prompt, enough to take
+//! the whole machine down whenever RAM was tight. Records are untouched: the same bytes, never split across parts.
+//! A reader that wants one stream concatenates <name>.*.jsonl in name order and then <name>.jsonl — the parts'
+//! UTC stamps sort before the live file's "jsonl" — and gets exactly the bytes a single file would have held.
+//!
 //! ON/OFF IS A FILE, DELIBERATELY. `<root>/RECORDING` holds the active set id. Swarm minds are
 //! separate PROCESSES (the supervisor injects NL_SETS_DIR), and a marker file is the one switch every
 //! process can read with no IPC and no restart — flip it in the server and the next call a worker
@@ -38,6 +48,7 @@
 //! "not recording".
 
 const std = @import("std");
+const vthread = @import("../threads.zig"); // every thread: small Windows stack commit + a name (see threads.zig)
 
 /// The marker file's name inside the sets root; its contents are the active set id.
 pub const MARKER = "RECORDING";
@@ -282,7 +293,7 @@ fn writeMeta(dir: []const u8, id: []const u8, label: []const u8, started_s: i64,
     jstr(&j, label) catch return;
     j.print(gpa, ",\"started_s\":{d},\"ended_s\":{d},\"closed\":{s}", .{ started_s, ended_s, if (closed) "true" else "false" }) catch return;
     j.print(gpa, ",\"calls\":{d},\"examples\":{d},\"tool_runs\":{d}", .{ st.calls, st.examples, st.tools }) catch return;
-    j.appendSlice(gpa, ",\"format\":\"openai-messages-sft\",\"files\":{\"training\":\"sft.jsonl\",\"raw\":\"raw.jsonl\",\"tools\":\"tools.jsonl\",\"by_model\":\"by-model/\"}}\n") catch return;
+    j.appendSlice(gpa, ",\"format\":\"openai-messages-sft\",\"files\":{\"training\":\"sft.jsonl\",\"raw\":\"raw.jsonl\",\"tools\":\"tools.jsonl\",\"by_model\":\"by-model/\"},\"parts\":\"every file rolls at 16 MiB into <name>.<UTC stamp>.jsonl; concatenate <name>.*.jsonl in name order, then <name>.jsonl\"}\n") catch return;
     var pbuf: [700]u8 = undefined;
     const p = std.fmt.bufPrint(&pbuf, "{s}/meta.json", .{dir}) catch return;
     std.Io.Dir.cwd().writeFile(st.io, .{ .sub_path = p, .data = j.items }) catch {};
@@ -339,6 +350,11 @@ fn writeReadme(dir: []const u8, id: []const u8, label: []const u8) void {
         \\| `raw.jsonl` | full fidelity: verbatim request body, parsed response, timing, token counts, provider host, role label. Re-derive any other format from here. |
         \\| `tools.jsonl` | every tool execution: name, verbatim arguments, the result text the model saw, ok, and duration. |
         \\| `meta.json` | label, window, counts. |
+        \\
+        \\Every `.jsonl` file rolls at 16 MiB: the full file is renamed to `<name>.<UTC stamp>.jsonl` and a fresh
+        \\`<name>.jsonl` continues (Windows Defender rescans a modified file in full, so a file that keeps growing
+        \\makes every write cost a rescan of all of it). For one stream, concatenate `<name>.*.jsonl` in name order,
+        \\then `<name>.jsonl` — for example `cat sft.*.jsonl sft.jsonl > all-sft.jsonl`. Records never span parts.
         \\
         \\## Fields on an sft record
         \\
@@ -746,6 +762,27 @@ fn redact(gpa: std.mem.Allocator, data: []const u8) ?[]u8 {
     };
 }
 
+/// The size a file that is still being written may reach before its next append rolls it (see ROLLING PARTS at the
+/// top of this file). 16 MiB: a Defender rescan of that is milliseconds, and a long-running set still makes only a
+/// few hundred parts. A var only so the tests can roll on a few hundred bytes.
+pub const PART_MAX: u64 = 16 << 20;
+var part_max: u64 = PART_MAX;
+
+/// Serializes appendTo across this process's threads: a roll (stat, rename, fresh file) must not interleave with
+/// another thread's stat-then-write, and two appends must not land at the same offset. An io-free spin-and-yield
+/// lock rather than std.Io.Mutex, because the callers are plain threads (chat turns, httpz workers, swarm minds)
+/// and a contended runtime mutex parks on the thread's alert — the primitive behind the 2026-09-02 desk freeze
+/// (desk/src/nap.zig). A waiter yields its timeslice instead; a hold is one small append to a small file.
+var append_held = std.atomic.Value(bool).init(false);
+
+fn appendLock() void {
+    while (append_held.swap(true, .acquire)) std.Thread.yield() catch {};
+}
+
+fn appendUnlock() void {
+    append_held.store(false, .release);
+}
+
 fn appendTo(dir: []const u8, rel: []const u8, data_in: []const u8) void {
     // EVERY output file is written through here — that is why the scrub lives here rather than at the
     // four call sites, so a fifth output cannot be added and silently skip it.
@@ -754,14 +791,56 @@ fn appendTo(dir: []const u8, rel: []const u8, data_in: []const u8) void {
     const data = scrubbed orelse data_in;
     var pbuf: [900]u8 = undefined;
     const p = std.fmt.bufPrint(&pbuf, "{s}/{s}", .{ dir, rel }) catch return;
+    appendLock();
+    defer appendUnlock();
     const d = std.Io.Dir.cwd();
-    const end: u64 = if (d.statFile(st.io, p, .{})) |s| s.size else |e| switch (e) {
+    const size: u64 = if (d.statFile(st.io, p, .{})) |s| s.size else |e| switch (e) {
         error.FileNotFound => 0,
         else => return, // never collapse an unknown stat error to offset 0 — that clobbers the log
     };
+    // ROLL before an append that would carry a non-empty file past part_max. A failed rename (another process holds
+    // the file without delete sharing) keeps appending to the big file: slower for Defender, never lost data.
+    if (size > 0 and size + data.len > part_max) _ = rollPart(p);
     const f = d.createFile(st.io, p, .{ .truncate = false }) catch return;
     defer f.close(st.io);
+    // The offset is read AFTER opening, from the path (a fresh handle reports length 0 on this Io — see
+    // http.appendFile): between the stat above and this open, another PROCESS appending to the same set may have
+    // grown the file (writing at the old offset would clobber its record) or rolled it (writing at the old offset
+    // into the fresh part would leave a gap of zeros). The lock above covers this process's threads only.
+    const end: u64 = if (d.statFile(st.io, p, .{})) |s| s.size else |e| switch (e) {
+        error.FileNotFound => 0,
+        else => return,
+    };
     f.writePositionalAll(st.io, data, end) catch {};
+}
+
+/// Rolls this process has made, so two in the same millisecond still get distinct, ordered names.
+var roll_seq: std.atomic.Value(u32) = .init(0);
+
+/// Rename the live file `p` (…/raw.jsonl) to its archived part …/raw.<YYYYMMDD-HHMMSS.mmm>-<seq>-t<thread>.jsonl,
+/// stamped in UTC. The stamp (then the zero-padded sequence) sorts parts oldest-first and before the live file; the
+/// thread id keeps two processes that roll in the same millisecond apart. A name that already exists is never
+/// renamed onto (a rename may replace its target): the roll is skipped and the next append tries again. True when
+/// the live path is free for a fresh part.
+fn rollPart(p: []const u8) bool {
+    const stem = if (std.mem.endsWith(u8, p, ".jsonl")) p[0 .. p.len - ".jsonl".len] else p;
+    const ms = std.Io.Timestamp.now(st.io, .real).toMilliseconds();
+    if (ms <= 0) return false;
+    const secs: u64 = @intCast(@divTrunc(ms, 1000));
+    const es = std.time.epoch.EpochSeconds{ .secs = secs };
+    const yd = es.getEpochDay().calculateYearDay();
+    const md = yd.calculateMonthDay();
+    const ds = es.getDaySeconds();
+    var nb: [960]u8 = undefined;
+    const archive = std.fmt.bufPrint(&nb, "{s}.{d:0>4}{d:0>2}{d:0>2}-{d:0>2}{d:0>2}{d:0>2}.{d:0>3}-{d:0>6}-t{d}.jsonl", .{
+        stem,                             yd.year,                   md.month.numeric(),        @as(u32, md.day_index) + 1,
+        ds.getHoursIntoDay(),             ds.getMinutesIntoHour(),   ds.getSecondsIntoMinute(), @as(u64, @intCast(@mod(ms, 1000))),
+        roll_seq.fetchAdd(1, .monotonic), std.Thread.getCurrentId(),
+    }) catch return false;
+    const cwd = std.Io.Dir.cwd();
+    if (cwd.statFile(st.io, archive, .{})) |_| return false else |_| {}
+    cwd.rename(p, cwd, archive, st.io) catch return false;
+    return true;
 }
 
 fn clip(s: []const u8) []const u8 {
@@ -1319,4 +1398,181 @@ test "redact strips the memory block, keys and emails before anything is written
     try std.testing.expect(std.mem.indexOf(u8, fixed, "@app.get(") != null); // decorator survived
     const pf = try std.json.parseFromSlice(std.json.Value, gpa, fixed, .{}); // still parseable
     defer pf.deinit();
+}
+
+// ---- rolling parts --------------------------------------------------------------------------------------------------
+
+/// A scratch recorder state for the rolling tests: configured on its own root, no set started (appendTo writes to
+/// whatever dir it is given), part_max shrunk so a roll happens every few records.
+const RollFixture = struct {
+    threaded: std.Io.Threaded,
+    env: std.process.Environ.Map,
+    root: []const u8,
+
+    fn init(f: *RollFixture, root: []const u8, max: u64) !std.Io {
+        const gpa = std.testing.allocator;
+        f.threaded = std.Io.Threaded.init(gpa, .{});
+        const io = f.threaded.io();
+        f.root = root;
+        std.Io.Dir.cwd().deleteTree(io, root) catch {};
+        _ = try std.Io.Dir.cwd().createDirPathStatus(io, root, .default_dir);
+        f.env = std.process.Environ.Map.init(gpa);
+        var sb: [256]u8 = undefined;
+        try f.env.put("NL_SETS_DIR", try std.fmt.bufPrint(&sb, "{s}/sets", .{root}));
+        configure(gpa, io, &f.env, root);
+        part_max = max;
+        return io;
+    }
+
+    fn deinit(f: *RollFixture) void {
+        part_max = PART_MAX;
+        st.configured = false;
+        st.armed.store(false, .release);
+        std.Io.Dir.cwd().deleteTree(f.threaded.io(), f.root) catch {};
+        f.env.deinit();
+        f.threaded.deinit();
+    }
+};
+
+/// Every file in `dir` whose name is `stem` + ".jsonl" or a part of it, in the order a reader concatenates them
+/// (parts by name, then the live file), joined. Also reports how many parts there were and the largest file.
+fn rollReadAll(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, stem: []const u8, parts_out: *usize, largest_out: *u64) ![]u8 {
+    var names: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (names.items) |n| gpa.free(n);
+        names.deinit(gpa);
+    }
+    var d = try std.Io.Dir.cwd().openDir(io, dir, .{ .iterate = true });
+    defer d.close(io);
+    var it = d.iterate();
+    var live = false;
+    while (try it.next(io)) |ent| {
+        if (ent.kind != .file or !std.mem.startsWith(u8, ent.name, stem) or !std.mem.endsWith(u8, ent.name, ".jsonl")) continue;
+        const mid = ent.name[stem.len .. ent.name.len - ".jsonl".len];
+        if (mid.len == 0) {
+            live = true;
+            continue;
+        }
+        if (mid[0] != '.') continue;
+        try names.append(gpa, try gpa.dupe(u8, ent.name));
+    }
+    std.mem.sort([]u8, names.items, {}, struct {
+        fn lt(_: void, a: []u8, b: []u8) bool {
+            return std.mem.order(u8, a, b) == .lt;
+        }
+    }.lt);
+    parts_out.* = names.items.len;
+    largest_out.* = 0;
+    var all: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer all.deinit(gpa);
+    var pb: [600]u8 = undefined;
+    for (names.items) |n| {
+        const body = try std.Io.Dir.cwd().readFileAlloc(io, try std.fmt.bufPrint(&pb, "{s}/{s}", .{ dir, n }), gpa, .limited(1 << 22));
+        defer gpa.free(body);
+        largest_out.* = @max(largest_out.*, body.len);
+        try all.appendSlice(gpa, body);
+    }
+    if (live) {
+        const body = try std.Io.Dir.cwd().readFileAlloc(io, try std.fmt.bufPrint(&pb, "{s}/{s}.jsonl", .{ dir, stem }), gpa, .limited(1 << 22));
+        defer gpa.free(body);
+        largest_out.* = @max(largest_out.*, body.len);
+        try all.appendSlice(gpa, body);
+    }
+    return all.toOwnedSlice(gpa);
+}
+
+test "rolling parts: no file outgrows part_max, records never split, and the parts concatenate to exactly what was written" {
+    const gpa = std.testing.allocator;
+    var fx: RollFixture = undefined;
+    const io = try fx.init("zig-dataset-roll-tmp", 300);
+    defer fx.deinit();
+    const dir = "zig-dataset-roll-tmp/set";
+    _ = try std.Io.Dir.cwd().createDirPathStatus(io, dir, .default_dir);
+
+    var want: std.ArrayListUnmanaged(u8) = .empty;
+    defer want.deinit(gpa);
+    var i: usize = 0;
+    while (i < 60) : (i += 1) {
+        var lb: [96]u8 = undefined;
+        const line = try std.fmt.bufPrint(&lb, "{{\"n\":{d},\"pad\":\"abcdefghijklmnopqrstuvwxyz\"}}\n", .{i});
+        appendTo(dir, "raw.jsonl", line);
+        try want.appendSlice(gpa, line);
+    }
+    var parts: usize = 0;
+    var largest: u64 = 0;
+    const got = try rollReadAll(gpa, io, dir, "raw", &parts, &largest);
+    defer gpa.free(got);
+    try std.testing.expect(parts >= 8); // ~3 KB of records through a 300-byte cap
+    try std.testing.expect(largest <= 300); // nothing that was still being written ever passed the cap
+    try std.testing.expectEqualStrings(want.items, got); // byte-identical, in order, nothing lost or duplicated
+    // every part ends on a record boundary: each file's last byte is a newline (checked through the whole stream)
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, got, "\n"), '\n');
+    var n: usize = 0;
+    while (lines.next()) |ln| : (n += 1) {
+        const p = try std.json.parseFromSlice(std.json.Value, gpa, ln, .{});
+        p.deinit();
+    }
+    try std.testing.expectEqual(@as(usize, 60), n);
+}
+
+test "rolling parts: a record bigger than part_max still lands whole, in a part of its own" {
+    const gpa = std.testing.allocator;
+    var fx: RollFixture = undefined;
+    const io = try fx.init("zig-dataset-roll-big-tmp", 100);
+    defer fx.deinit();
+    const dir = "zig-dataset-roll-big-tmp/set";
+    _ = try std.Io.Dir.cwd().createDirPathStatus(io, dir, .default_dir);
+    appendTo(dir, "sft.jsonl", "{\"small\":1}\n");
+    var big: [251]u8 = undefined;
+    @memset(big[0..249], 'x');
+    big[0] = '"';
+    big[248] = '"';
+    big[249] = '\n';
+    appendTo(dir, "sft.jsonl", big[0..250]);
+    var parts: usize = 0;
+    var largest: u64 = 0;
+    const got = try rollReadAll(gpa, io, dir, "sft", &parts, &largest);
+    defer gpa.free(got);
+    try std.testing.expectEqual(@as(usize, 1), parts); // the small record was rolled away first
+    try std.testing.expectEqual(@as(u64, 250), largest); // the big one was never split
+    try std.testing.expect(std.mem.startsWith(u8, got, "{\"small\":1}\n\""));
+}
+
+test "rolling parts: parallel writers through the roll lose nothing, duplicate nothing, and leave no zero-filled gaps" {
+    const gpa = std.testing.allocator;
+    var fx: RollFixture = undefined;
+    const io = try fx.init("zig-dataset-roll-par-tmp", 400);
+    defer fx.deinit();
+    const dir = "zig-dataset-roll-par-tmp/set";
+    _ = try std.Io.Dir.cwd().createDirPathStatus(io, dir, .default_dir);
+    const W = struct {
+        fn run(w: usize) void {
+            var i: usize = 0;
+            while (i < 40) : (i += 1) {
+                var lb: [96]u8 = undefined;
+                const line = std.fmt.bufPrint(&lb, "{{\"w\":{d},\"i\":{d},\"pad\":\"0123456789\"}}\n", .{ w, i }) catch return;
+                appendTo("zig-dataset-roll-par-tmp/set", "tools.jsonl", line);
+            }
+        }
+    };
+    var threads: [4]std.Thread = undefined;
+    for (&threads, 0..) |*t, w| t.* = try vthread.spawn("test-dataset", W.run, .{w});
+    for (threads) |t| t.join();
+    var parts: usize = 0;
+    var largest: u64 = 0;
+    const got = try rollReadAll(gpa, io, dir, "tools", &parts, &largest);
+    defer gpa.free(got);
+    try std.testing.expect(parts >= 4);
+    try std.testing.expect(std.mem.indexOfScalar(u8, got, 0) == null); // no gap written at a stale offset
+    var seen = [_][40]bool{[_]bool{false} ** 40} ** 4;
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, got, "\n"), '\n');
+    var n: usize = 0;
+    while (lines.next()) |ln| : (n += 1) {
+        const R = struct { w: usize, i: usize, pad: []const u8 };
+        const p = try std.json.parseFromSlice(R, gpa, ln, .{});
+        defer p.deinit();
+        try std.testing.expect(!seen[p.value.w][p.value.i]); // never twice
+        seen[p.value.w][p.value.i] = true;
+    }
+    try std.testing.expectEqual(@as(usize, 160), n); // never lost
 }

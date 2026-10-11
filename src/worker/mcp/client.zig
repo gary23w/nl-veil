@@ -5,6 +5,7 @@
 //! hung server. HTTP/SSE transport is a follow-on (stdio is what OS-installed MCP servers use).
 
 const std = @import("std");
+const vthread = @import("../../threads.zig"); // every thread: small Windows stack commit + a name (see threads.zig)
 const builtin = @import("builtin");
 
 const log = std.log.scoped(.mcp);
@@ -101,7 +102,7 @@ fn oneShot(gpa: std.mem.Allocator, io: std.Io, base_env: *const std.process.Envi
     // Watchdog: kill the child if it runs past the deadline.
     var done = std.atomic.Value(bool).init(false);
     const th: ?std.Thread = if (child.id != null)
-        (std.Thread.spawn(.{}, KillGuard.watch, .{KillGuard{ .id = child.id.?, .deadline_ms = timeout_s * 1000, .done = &done }}) catch null)
+        (vthread.spawn("mcp-killguard", KillGuard.watch, .{KillGuard{ .id = child.id.?, .deadline_ms = timeout_s * 1000, .done = &done }}) catch null)
     else
         null;
     defer {

@@ -15,6 +15,7 @@
 //! is admin-only. The desk prefers this backend turn and falls back to its own local engine on any failure.
 
 const std = @import("std");
+const vthread = @import("../../threads.zig"); // every thread: small Windows stack commit + a name (see threads.zig)
 const builtin = @import("builtin");
 const http = @import("../../gateway/http.zig");
 const tools = @import("../tools.zig");
@@ -22,6 +23,7 @@ const cf_oauth = @import("../../config/cf_oauth.zig"); // per-turn Cloudflare cr
 const cftools = @import("../cftools.zig"); // and the belt entries those tools are advertised by
 const cf_garrett = @import("../../config/cf_garrett.zig"); // the user's own Agent Garrett: where it answers, the derived bearer
 const garrett = @import("../garrett.zig"); // and the two verbs that put it on a turn's belt
+const sentry = @import("../sentry.zig"); // the sentry: this machine's firewall and watch, on an admin turn's belt
 const recipes = @import("../recipes.zig"); // recipe tools: the per-turn granted set advertised in turn_tools + resolved onto ctx.grants
 const plugins = @import("../../plug/plugins.zig"); // user extensions: prompt/policy/tool hooks over the sandboxed Lua runtime
 const pixelrag = @import("../pixelrag.zig"); // browser-free image attachment ingest (OCR → pixel-RAG index)
@@ -29,7 +31,7 @@ const osc = @import("../oscillation.zig");
 const llm = @import("../llm.zig");
 const modelcfg = @import("modelcfg"); // a MODULE (src/worker/modelcfg.zig) — never a path import
 const cctx = @import("context.zig");
-const toolmap = @import("belt.zig"); // the tool map: the belt as a tree the model walks (opt-in, NL_TOOL_MAP)
+const toolmap = @import("belt.zig"); // the tool map: the belt as a tree the model walks (default; NL_TOOL_MAP=0 opts out)
 const dag = @import("net.zig"); // Gary's 4tope: the working span as a DAG — the critical chain a prune keeps, the unfolding a cut carries
 const wsp = @import("workspace.zig"); // prompt workspace: typed bids -> fixed-order scored admission + decision log
 const ovl = @import("overlay.zig"); // recall overlay: the working field settled around every thought
@@ -766,7 +768,11 @@ fn buildTurnTools(gpa: std.mem.Allocator, ctx: *const tools.ToolCtx, compact: bo
     const cf_block: []const u8 = if (ctx.caps == .sandboxed) CF_TOOLS_SANDBOXED else cftools.SCHEMA;
     const cf_on = ctx.cf_token.len > 0 and ctx.cf_account.len > 0 and cf_block.len > 0;
     const gar_on = garrett.on(ctx.garrett_url, ctx.garrett_token);
-    if (ctx.grants.len == 0 and !cf_on and !gar_on) return base; // common case ⇒ the exact static string, zero allocation
+    // THE SENTRY: on every admin turn served from the machine the sentry watches (ctx.sentry is set only there),
+    // so the user can turn it on from a chat. A compact belt (small model) carries it only once it is ON —
+    // six defs a 12B model never needs until it does. Turn-stable: enabled() changes between turns, not within.
+    const sen_on = ctx.sentry != null and ctx.caps == .full and (!compact or ctx.sentry.?.enabled());
+    if (ctx.grants.len == 0 and !cf_on and !gar_on and !sen_on) return base; // common case ⇒ the exact static string, zero allocation
     var b: std.ArrayListUnmanaged(u8) = .empty;
     b.appendSlice(gpa, base) catch {
         b.deinit(gpa);
@@ -778,6 +784,16 @@ fn buildTurnTools(gpa: std.mem.Allocator, ctx: *const tools.ToolCtx, compact: bo
             return base;
         };
         b.appendSlice(gpa, cf_block) catch {
+            b.deinit(gpa);
+            return base;
+        };
+    }
+    if (sen_on) {
+        b.appendSlice(gpa, ",\n") catch {
+            b.deinit(gpa);
+            return base;
+        };
+        b.appendSlice(gpa, sentry.SCHEMA) catch {
             b.deinit(gpa);
             return base;
         };
@@ -2441,7 +2457,7 @@ fn pulseStart(app: *App, conv_dir: []const u8) void {
     }
     @memcpy(p.dir[0..conv_dir.len], conv_dir);
     p.dir_len = conv_dir.len;
-    p.thread = std.Thread.spawn(.{}, Pulse.run, .{p}) catch {
+    p.thread = vthread.spawn("chat-pulse", Pulse.run, .{p}) catch {
         app.gpa.destroy(p);
         return;
     };
@@ -2947,6 +2963,9 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
         .garrett_url = gar_url,
         .garrett_token = gar_tok,
         .garrett_schema = gar_schema,
+        // The sentry of the machine this server runs on (null on a server built without one). The belt and the
+        // dispatcher gate it on caps: a sandboxed turn is never shown it and is refused if it guesses the name.
+        .sentry = app.sentry,
         .mem = blk_mem: {
             var m = osc.Mem.init(gpa, app.io, app.sup.neuron_bin, db);
             // TRUST-WEIGHTED RANKING: the trust feature is compiled in; without this flag every assoc runs
@@ -3025,7 +3044,10 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
         }
     }
 
-    // THE TOOL MAP (belt.zig) — opt-in by NL_TOOL_MAP=1 while it proves itself live. The belt becomes a tree the
+    // THE TOOL MAP (belt.zig) — ON BY DEFAULT; NL_TOOL_MAP=0 (or off) restores the flat belt. It shipped opt-in in
+    // v1.1.16 while it proved itself live; a 2026-10-11 desk chat measured why it cannot stay optional: with Agent
+    // Garrett on, a one-word first message carried 227 flat tool defs, 182 KB and ~48k tokens, re-read on every
+    // inference (34 s a call at Cloudflare, no prompt cache). On the map the same belt is ~12-16 KB. The belt becomes a tree the
     // model walks: a small model keeps toolmap.CORE_SMALL in hand and walks everything else; a mid/large model keeps
     // the whole built-in belt it reads fine today and walks only the discovered families (security / cloud /
     // plugins), the ones that grow without bound. The tools array is then whatever is OPEN — rebuilt by
@@ -3040,7 +3062,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     defer if (map_walk) |*mw| mw.deinit();
     var map_core: ?[]u8 = null;
     defer if (map_core) |c| gpa.free(c);
-    const map_on = if (ctx.environ.get("NL_TOOL_MAP")) |v| (v.len > 0 and v[0] != '0' and !std.ascii.eqlIgnoreCase(v, "off")) else false;
+    const map_on = if (ctx.environ.get("NL_TOOL_MAP")) |v| (v.len == 0 or (v[0] != '0' and !std.ascii.eqlIgnoreCase(v, "off"))) else true;
     if (map_on) map: {
         const split = toolmap.splitBelt(gpa, turn_tools, compact_belt) catch break :map;
         defer gpa.free(split.map);
@@ -3096,7 +3118,12 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
         const manifest: ?[]u8 = if (compact_belt and map_walk == null) beltManifest(gpa, turn_tools) else null;
         defer if (manifest) |m| gpa.free(m);
         const map_doctrine: []const u8 = if (map_walk != null) "\n" ++ toolmap.DOCTRINE else "";
-        const dated = std.fmt.allocPrint(gpa, "{s}{s}{s}\nTODAY (UTC): {s}. Any time-sensitive search query, date, or claim must be grounded in THIS date — never a guessed one.", .{ sys_base, manifest orelse "", map_doctrine, tools.dateStamp(app.io, &dstamp) }) catch null;
+        // THE SENTRY's line: posture, host firewall, how many findings wait — so a question about this machine
+        // is answered by a model that already knows a port opened last night. Empty when the sentry is off or
+        // the caller is sandboxed. Changes between turns (a scan ran), never within one: prefix-cache safe.
+        var sen_db: [720]u8 = undefined;
+        const sen_line: []const u8 = if (ctx.sentry != null and ctx.caps == .full) ctx.sentry.?.doctrine(&sen_db) else "";
+        const dated = std.fmt.allocPrint(gpa, "{s}{s}{s}{s}{s}\nTODAY (UTC): {s}. Any time-sensitive search query, date, or claim must be grounded in THIS date — never a guessed one.", .{ sys_base, manifest orelse "", map_doctrine, if (sen_line.len > 0) "\n" else "", sen_line, tools.dateStamp(app.io, &dstamp) }) catch null;
         defer if (dated) |d| gpa.free(d);
         http.jstr(gpa, &conv_buf, dated orelse sys_base) catch return;
     }
@@ -6324,7 +6351,7 @@ pub fn spawnTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, text: [
         .prompting = .{ .base_url = dupInto(blob, &o, p.base_url), .key = dupInto(blob, &o, p.key), .model = dupInto(blob, &o, p.model) },
     };
     args.* = .{ .app = app, .uid = uid, .blob = blob, .conv = cv, .trio = owned, .text = tx, .loop = loop, .tool_client = tool_client, .image_b64 = ib, .fast = fast, .trace = trace, .garrett = garrett_req };
-    if (std.Thread.spawn(.{}, turnThread, .{args})) |th| {
+    if (vthread.spawn("chat-turn", turnThread, .{args})) |th| {
         th.detach();
     } else |_| {
         turnThread(args); // spawn failed → run inline (blocks) + free, rather than drop the turn
@@ -9236,6 +9263,7 @@ const ClientRoute = enum { client, server, cloudflare };
 fn clientRoute(name: []const u8) ClientRoute {
     if (std.mem.eql(u8, name, "get_credential")) return .server;
     if (garrett.isTool(name)) return .server; // Agent Garrett's pair lives here too (runTurn derives it); no file of the user's is involved
+    if (sentry.isTool(name)) return .server; // the sentry watches the machine the SERVER runs on; a client executor has no Sentry
     if (std.mem.startsWith(u8, name, "cf_")) return .cloudflare; // the whole prefix is the family's (tools.isBuiltinTool)
     return .client;
 }
@@ -9453,7 +9481,7 @@ const TestSyncClient = struct {
     thread: ?std.Thread = null,
 
     fn start(self: *TestSyncClient) !void {
-        self.thread = try std.Thread.spawn(.{}, loop, .{self});
+        self.thread = try vthread.spawn("test-sync-client", loop, .{self});
     }
 
     fn stop(self: *TestSyncClient) void {
@@ -10282,7 +10310,7 @@ fn runInnerAgentic(
     // This turn's advertised tools array — the caller's static CAPS variant plus any granted recipe schemas,
     // built ONCE per turn in runTurn (turn-stable, byte-identical across drive passes → prefix-cache safe).
     turn_tools: []const u8,
-    /// The tool map's walk when NL_TOOL_MAP is on, else null: it rebuilds the advertised array as groups open and
+    /// The tool map's walk unless NL_TOOL_MAP=0, else null: it rebuilds the advertised array as groups open and
     /// close, answers the open_tools verb, and opens a known-but-closed name's group in the round it is called.
     walk: ?*toolmap.Walk,
     overlay: ?*ovl.Overlay, // the recall overlay: settled before every round's chat call, removed right after (overlay.zig)

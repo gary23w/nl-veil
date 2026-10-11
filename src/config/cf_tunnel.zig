@@ -30,6 +30,7 @@
 //! The switch position is persisted: a tunnel left on comes back on at the next boot, and NL_TUNNEL=1 (or
 //! `--tunnel`) turns it on at boot for a server that was configured by hand. Either way the URL is logged.
 const std = @import("std");
+const vthread = @import("../threads.zig"); // every thread: small Windows stack commit + a name (see threads.zig)
 const builtin = @import("builtin");
 const bu = @import("../worker/browser/util.zig"); // sleepMs: a raw-thread sleep, no Io park (see onThread)
 const httpz = @import("httpz");
@@ -683,7 +684,7 @@ fn startChild(app: *App, a: std.mem.Allocator, uid: u64, st: *State, token: ?[]c
         live.phase = .starting;
     }
     child = undefined;
-    const th = std.Thread.spawn(.{}, waiter, .{io}) catch null;
+    const th = vthread.spawn("tunnel-waiter", waiter, .{io}) catch null;
     if (th) |t| t.detach();
 
     // watch the log
@@ -973,7 +974,7 @@ fn bootThread(app: *App, forced: bool) void {
 /// At boot: restore a switch that was left on, or force it on for NL_TUNNEL / --tunnel. Asynchronous — the
 /// server must not wait on the Cloudflare API to start listening.
 pub fn bootAsync(app: *App, forced: bool) void {
-    const th = std.Thread.spawn(.{}, bootThread, .{ app, forced }) catch return;
+    const th = vthread.spawn("tunnel-boot", bootThread, .{ app, forced }) catch return;
     th.detach();
 }
 
@@ -1092,7 +1093,7 @@ pub fn tunnelSet(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
             live.published = false;
             live.access = false; // nor its protection: turnOn says again once the new address is live
         }
-        const th = std.Thread.spawn(.{}, onThread, .{ app, u.id }) catch {
+        const th = vthread.spawn("tunnel-on", onThread, .{ app, u.id }) catch {
             setErr(app.io, "could not start the tunnel worker thread");
             return badReq(res, "could not start the tunnel worker thread");
         };

@@ -16,11 +16,20 @@ Windows · macOS · Linux · [MIT app code and AGPL security runtime](#license).
 hosted providers have their own data handling and costs. The built-in model requires a separate
 download, and coding tools require Python on `PATH` (some checks also use Node).
 
-### Stable release: v1.1.16
+### New in v1.1.18
 
-v1.1.17 has been withdrawn. If you installed it, download and run the
-[v1.1.16 bundle](https://github.com/gary23w/nl-veil/releases/tag/v1.1.16) for your platform.
-Automatic updates do not downgrade an installed app.
+**The veil stops charging your machine for memory it never uses.** On Windows every thread
+committed its full 16 MiB stack up front, and the HTTP server preallocated a 16 MiB request buffer
+for each of its 128 workers. Before its first request the app charged 4.7 GB to the machine's
+commit limit. It now charges about 330 MB, and threads still grow to the same depth on demand.
+**The training-set recorder no longer stalls the machine:** its files roll into 16 MiB parts, so
+Windows Defender's rescan after each model call reads at most 16 MiB instead of a half-gigabyte file.
+**The app reports its own vitals** (commit, threads by name, disk I/O and Defender's reads) in its
+log every minute and at `GET /api/v1/vitals`, and in app mode the server's log lines now reach
+`veil-desk.log` instead of being lost. Also new: **the sentry**, the veil as your machine's firewall
+and blue-team watch; the **tool tree** on by default; Tab through every field and button in the desk;
+and v1.1.17's lineage batching, since v1.1.17 was withdrawn before publication.
+[Release notes](docs/release/RELEASE-v1.1.18.md).
 
 ### New in v1.1.16
 
@@ -110,7 +119,7 @@ code and credentials from anything you share.
 
 <p>
   <a href="https://github.com/gary23w/nl-veil/actions/workflows/release.yml"><img alt="build" src="https://github.com/gary23w/nl-veil/actions/workflows/release.yml/badge.svg"></a>
-  <a href="https://github.com/gary23w/nl-veil/releases"><img alt="release" src="https://img.shields.io/badge/release-v1.1.16-A8241B"></a>
+  <a href="https://github.com/gary23w/nl-veil/releases"><img alt="release" src="https://img.shields.io/badge/release-v1.1.18-A8241B"></a>
   <img alt="zig" src="https://img.shields.io/badge/zig-0.16-F7A41D?logo=zig&logoColor=white">
   <a href="https://huggingface.co/gary23w/the-veil-12b"><img alt="built-in model" src="https://img.shields.io/badge/built--in%20model-the--veil--12b-6E4A27?logo=huggingface&logoColor=white"></a>
   <a href="https://huggingface.co/gary23w/gary-neuron-emergent"><img alt="memory cortex" src="https://img.shields.io/badge/cortex-gary--neuron--emergent-6E4A27?logo=huggingface&logoColor=white"></a>
@@ -170,6 +179,7 @@ you connect.
 | [**The model trio**](#three-models-one-turn--the-model-trio) | every LLM call is labelled and routed — coding / thinking / prompting — so a cheap model can carry the bulk |
 | [**Your own browser**](#it-can-use-your-browser) | drive the Chrome/Edge you're already signed into, through a tiny extension — or a private throwaway profile |
 | [**The tool belt**](#the-tool-belt) | ~58 tools: files, shell, tests, web, deep crawl, memory, images/OCR, MCP servers, tool authoring |
+| [**The sentry**](docs/docs-src/guide/security-tools.md#the-sentry-the-veil-as-your-machines-firewall-and-watch) | the veil as your machine's firewall and blue-team watch: what listens, what starts at boot, the host firewall, findings the chat reads; block and allow rules it can apply to Windows Defender Firewall, nftables or pf |
 | [**Memory that compounds**](#how-it-works) | [neuron-db](https://github.com/gary23w/neuron-db) behind every recall, with `--lineage` so re-casts get better |
 | [**Built-in RAG**](#what-you-can-do) | mirror the [nl-rag](https://github.com/gary23w/nl-rag) corpus to disk and research with the network off |
 | [**It learns**](#it-learns) | a playbook of fixes verified by real exit codes, a smoke gate, and a judge that reads the trace |
@@ -595,7 +605,7 @@ raylib is a *lazy* dependency, so `-Dapp=false` never fetches it at all.
 ## Install
 
 **Download it and run it — no toolchain, nothing to build.** Grab your platform's bundle from the
-**[latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.1.16)**, unzip, and run `veil`:
+**[latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.1.18)**, unzip, and run `veil`:
 
 | You're on | Download | Then run |
 |---|---|---|
@@ -760,7 +770,7 @@ step 5** — the rest is about letting other people in.
 
 ### 1. Download and unblock it
 
-Grab the bundle for your OS from the [latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.1.16)
+Grab the bundle for your OS from the [latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.1.18)
 and unzip it somewhere you'll find again. Builds are unsigned, so:
 
 - **Windows** shows *"Windows protected your PC"* → **More info** → **Run anyway**.
@@ -796,7 +806,7 @@ On startup the server prints one complete URL per address this machine answers o
 (`src/main.zig:861-889`, using `src/config/lan.zig`):
 
 ```
-neuron-loops 1.1.16 on http://localhost:8787
+neuron-loops 1.1.18 on http://localhost:8787
     open from another machine (phone, laptop) at:
       http://192.168.1.42:8787
 ```
@@ -1155,7 +1165,7 @@ a chain of bounded polls instead of one guess. And **`stop_process`** exists bec
 start a server must be able to end one — a Stop from you now reaches a blocking tool instead of
 waiting for it to finish.
 
-**The tool tree** (`NL_TOOL_MAP=1`, opt-in) advertises the belt as a map instead of a list. The model
+**The tool tree** (on by default since v1.1.18; `NL_TOOL_MAP=0` restores the flat belt) advertises the belt as a map instead of a list. The model
 walks it with one verb, `open_tools`: at most seven branches at a time, each with one line saying what it
 is for, and reaching a group opens its tools by name. The engine opens the likeliest group from the
 request before the first call, a tool the model already knows opens its own branch in the round it is
@@ -1591,7 +1601,9 @@ what changed is that the dangerous verbs are now refused inside a turn, not just
 | `NL_TURN_TOKEN_CEILING` | input tokens one turn **segment** may spend before the engine compacts its working context and continues (default 400000; `0` disables the ceiling). A runaway backstop, not a budget — a thorough research turn lands well under it |
 | `NL_TURN_CONTINUE_MAX` | how many times one turn may compact and keep going (default 3). **`0` restores beta-5's behaviour exactly**: the turn settles at the ceiling and waits for you |
 | `NL_TURN_CONTINUE_HARD_MAX` | the ceiling on the *earned* allowance (default 10). A segment that wrote a file or made a call it had not made before buys one more pass, up to this; a segment that only re-read its own context buys nothing, so a spinning turn still settles at `NL_TURN_CONTINUE_MAX` |
-| `NL_TOOL_MAP` | **experimental** — advertise the belt as a MAP the model walks (one `open_tools` verb, seven branches at a time) instead of a flat list. A small model keeps nine core verbs in hand and walks the rest; a large one walks only the discovered families (security tools, Cloudflare, plugins), the ones that grow without bound. A known tool name is always callable and opens its own branch. Default off (unset or `0`); `1` turns it on. See `worker/chat/belt` in the docs |
+| `NL_TOOL_MAP` | the tool tree: the belt is advertised as a MAP the model walks (one `open_tools` verb, seven branches at a time) instead of a flat list. **On by default** since v1.1.18; `0` or `off` restores the flat belt byte for byte. A small model keeps nine core verbs in hand and walks everything else; a larger one keeps the built-in belt and walks only the discovered families (security, cloud, plugins), which is what keeps Agent Garrett's 166 tools off every inference until one is wanted. |
+| `NL_VITALS` | the app's own vitals: every 5 s it samples its commit charge, working set, threads by name and disk bytes, the machine's commit and free RAM, and Windows Defender's reads; one line a window and a warning on a spike (in app mode they land in `veil-desk.log` as `srv(vitals)`), and `GET /api/v1/vitals` (admin) returns the last 10 minutes. On by default; `0` or `off` disables it. |
+| `NL_VITALS_LOG_S` | seconds between vitals lines (default `60`, 5 to 3600). Spikes log at once regardless. |
 | `NL_HANDOFF` | how the CONTINUATION STATE is written when a turn compacts and continues: `net` (default) unfolds the turn's own working span with Gary's 4tope — the frontier's last words, the file ledger, the failed calls, the results the frontier rests on, verbatim, no model call; `model` restores the model-written four-label state |
 | `NL_KEEPALIVE_REQUESTS` | requests one connection serves before recycling (default 200). Drop to 1 if you hit a stuck-socket worker thread |
 | `NL_DEFAULT_MODEL` / `NL_DEFAULT_BASE_URL` | **seeds** the default model on a fresh install, for unattended provisioning. Afterwards set it in **Admin → Default model** — that persists to `data/server-config.json` and wins over the environment, so a stale launch script cannot undo the admin on the next restart |
@@ -1688,19 +1700,26 @@ dependency entirely rather than compiling it unused.
 
 ## Release
 
-**Current: [`v1.1.16`](https://github.com/gary23w/nl-veil/releases/tag/v1.1.16)** — **Gary's 4tope**:
+**Current: [`v1.1.18`](https://github.com/gary23w/nl-veil/releases/tag/v1.1.18)** — the idle app's commit charge
+falls from 4.7 GB to about 330 MB: every thread commits 256 KiB instead of 16 MiB, and the HTTP server's request
+buffers are a small shared pool. The training-set recorder rolls into 16 MiB parts so Defender's rescans stay small,
+the app logs its own vitals, and server log lines reach `veil-desk.log` in app mode. Also the sentry, the tool tree on
+by default, desk Tab order, and v1.1.17's lineage batching (v1.1.17 was withdrawn before publication).
+[Full notes](docs/release/RELEASE-v1.1.18.md).
+
+**Previously: [`v1.1.16`](docs/release/RELEASE-v1.1.16.md)** — **Gary's 4tope**:
 a long chat carries itself forward by graph instead of by summary, keeping the chain of results the current
 step rests on and writing the continuation from the turn's own text with no model call. Plus the opt-in
 **tool tree** that lets a small model walk a belt of hundreds of tools, a 60% lighter Agent Garrett belt,
 and a spend ceiling that scales with the belt. [Full notes](docs/release/RELEASE-v1.1.16.md).
 
-**Previously: [`v1.1.15`](https://github.com/gary23w/nl-veil/releases/tag/v1.1.15)** — tater-tots plan
+**Previously: `v1.1.15`** — tater-tots plan
 correctly with the complete Agent Garrett catalogue enabled: the planner receives the full tool index and
 execution loads each tool's typed schema on demand.
 
-**Previously: [`v1.1.12`](https://github.com/gary23w/nl-veil/releases/tag/v1.1.12)** — the complete 166-tool Agent Garrett catalogue is available through typed MCP tools in chats, swarms and tater-tots. Deployment includes a dedicated Cloudflare execution runtime, Settings shows its build progress, feature opt-ins are separate, and the desktop has corrected spacing and panel borders. [Full notes](docs/release/RELEASE-v1.1.12.md) · [Security tools guide](docs/docs-src/guide/security-tools.md).
+**Previously: [`v1.1.12`](docs/release/RELEASE-v1.1.12.md)** — the complete 166-tool Agent Garrett catalogue is available through typed MCP tools in chats, swarms and tater-tots. Deployment includes a dedicated Cloudflare execution runtime, Settings shows its build progress, feature opt-ins are separate, and the desktop has corrected spacing and panel borders. [Full notes](docs/release/RELEASE-v1.1.12.md) · [Security tools guide](docs/docs-src/guide/security-tools.md).
 
-**Previously: [`v1.1.11`](https://github.com/gary23w/nl-veil/releases/tag/v1.1.11)** — chat keeps answering when a hosted model changes how it treats a request: a retired thinking-off setting stays retired, a cut turn's continuation state is read from the reasoning channel, the desktop stops dialing a placeholder endpoint and folds a message into a running turn, and the survey and planning passes show their reasoning in the chat. [Full notes](docs/release/RELEASE-v1.1.11.md).
+**Previously: [`v1.1.11`](docs/release/RELEASE-v1.1.11.md)** — chat keeps answering when a hosted model changes how it treats a request: a retired thinking-off setting stays retired, a cut turn's continuation state is read from the reasoning channel, the desktop stops dialing a placeholder endpoint and folds a message into a running turn, and the survey and planning passes show their reasoning in the chat. [Full notes](docs/release/RELEASE-v1.1.11.md).
 
 **Previously: [`v1.1.10`](docs/release/RELEASE-v1.1.10.md)** — tot deployment reconnects stale runtimes, run history is easier to read, and saved runs can be removed from the list without deleting their files.
 

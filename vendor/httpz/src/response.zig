@@ -1,4 +1,5 @@
 const std = @import("std");
+const spawn_cfg = @import("spawn_cfg.zig"); // NOTE: local patch to vendored httpz (small Windows stack commit)
 const builtin = @import("builtin");
 
 const posix = @import("posix.zig");
@@ -126,7 +127,7 @@ pub const Response = struct {
         try self.writeHeader();
         try self.disown();
 
-        const thread = try std.Thread.spawn(.{}, handler, .{ ctx, stream });
+        const thread = try std.Thread.spawn(spawn_cfg.config, handler, .{ ctx, stream });
         thread.detach();
     }
 

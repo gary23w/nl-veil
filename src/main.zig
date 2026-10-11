@@ -2,6 +2,7 @@
 //! server — or dispatches a CLI verb / the worker entry when invoked as a subcommand.
 
 const std = @import("std");
+const vthread = @import("threads.zig"); // every thread: small Windows stack commit + a name (see threads.zig)
 const builtin = @import("builtin");
 const httpz = @import("httpz");
 
@@ -36,6 +37,9 @@ const cftools = @import("worker/cftools.zig"); // isLoopbackRoot — the NL_CF_A
 const cf_r2 = @import("config/cf_r2.zig");
 const cf_tunnel = @import("config/cf_tunnel.zig");
 const cf_tot = @import("config/cf_tot.zig");
+const sentry = @import("worker/sentry.zig"); // the sentry: this machine's own firewall and blue-team watch
+const sentry_api = @import("worker/sentry_api.zig"); // its admin routes and background thread
+const vitals = @import("worker/vitals.zig"); // the app's own commit/threads/Defender readings: logged + /api/v1/vitals
 const server_config = @import("config/server_config.zig");
 const lan_mod = @import("config/lan.zig");
 const worker = @import("worker/run.zig");
@@ -67,14 +71,35 @@ const dataset = @import("worker/dataset.zig");
 // .info, explicitly: the default log_level tracks the optimize mode, and the ReleaseFast default (.err)
 // would silently swallow every operational message below — including the one-shot generated-admin-password
 // banner. This is the single binary-wide switch; per-module scopes are declared at each file's top.
-pub const std_options: std.Options = .{ .unexpected_error_tracing = false, .log_level = .info };
+pub const std_options: std.Options = .{ .unexpected_error_tracing = false, .log_level = .info, .logFn = appLog };
+
+/// In APP mode (server + desk window in one GUI process) stderr is attached to nothing, so every std.log line the
+/// server wrote was lost: no warning, no error, no retention line ever reached a file (found 2026-10-11 while
+/// chasing the lag). appLog keeps the stderr write (server-only mode redirects stderr to a file, dev.ps1 does) and,
+/// once app mode starts, also hands each line to the desk's log ring, which veil-desk.log is flushed from. Server
+/// lines there read "srv(<scope>): ...". Lines longer than the buffer are cut, never dropped.
+var app_log = std.atomic.Value(bool).init(false);
+fn appLog(comptime level: std.log.Level, comptime scope: @EnumLiteral(), comptime format: []const u8, args: anytype) void {
+    std.log.defaultLog(level, scope, format, args);
+    if (comptime !HAS_GUI) return;
+    if (!app_log.load(.acquire)) return;
+    var buf: [1536]u8 = undefined;
+    const tag = if (scope == .default) "srv: " else "srv(" ++ @tagName(scope) ++ "): ";
+    const line = std.fmt.bufPrint(&buf, tag ++ format, args) catch buf[0..]; // NoSpaceLeft = buf is full: keep it
+    desk.serverLog(@intFromEnum(level), line);
+}
 
 const log = std.log.scoped(.server);
+
+/// The veil's own listening ports, for the sentry (worker/sentry.zig): the server's, and the built-in engine's
+/// once it is up. File-scope because the engine's port is known inside a block main() leaves before the sentry
+/// is configured, and the slice must outlive the process.
+var sentry_own_ports: [2]u16 = .{ 0, 0 };
 
 // THE single source of release identity. scripts/build-official.sh seds this literal out of this file to
 // name every artifact (veil-v<VERSION>-<os>-<arch>.zip, veil-server-v<VERSION>-…), so the binary can never
 // report a version its own bundle disagrees with. Bump it here and the whole release follows.
-const VERSION = "1.1.17";
+const VERSION = "1.1.18";
 
 const ASSET_HTML = @embedFile("index.html");
 const ASSET_JS = @embedFile("app.js");
@@ -354,7 +379,7 @@ pub fn main(init: std.process.Init) !void {
     // losing race timer holds its slot for its full 5-8s on Windows (blocked sockets can't be canceled at all),
     // so ordinary chat traffic pinned the pool at saturation and every caller degraded to serial inline waits.
     // Threads spawn on demand only, so a high ceiling costs nothing when quiet.
-    var threaded = std.Io.Threaded.init(gpa, .{ .environ = environ, .async_limit = .limited(512) });
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = environ, .async_limit = .limited(512), .stack_size = vthread.io_stack_size });
     defer threaded.deinit();
     const io = threaded.io();
     if (HAS_GUI) {
@@ -563,7 +588,7 @@ pub fn main(init: std.process.Init) !void {
     // wedges the server. Handlers now only read the in-memory roster.
     sup.gc_data_dir = paths.data;
     sup.gc_days = retention_days;
-    if (std.Thread.spawn(.{}, Supervisor.bgLoop, .{&sup})) |t| t.detach() else |_| {}
+    if (vthread.spawn("supervisor", Supervisor.bgLoop, .{&sup})) |t| t.detach() else |_| {}
     var audit = AuditLog.init(gpa, io, paths.data);
     var login_guard = LoginGuard.init(gpa, io);
     var vault = KeyVault.init(gpa, io, nb, sup.server_key);
@@ -627,6 +652,7 @@ pub fn main(init: std.process.Init) !void {
         modelpull.on_store_change = builtinStoreChanged;
         modelpull.on_before_swap = builtinBeforeSwap;
         if (builtin_endpoint.start(gpa, io, llamaeng.engine(), init.environ_map)) |bport| {
+            sentry_own_ports[1] = bport; // the sentry never reports or blocks the veil's own listeners
             const winf = llamaeng.info();
             log.info("built-in model engine: {s} on 127.0.0.1:{d}{s} (weights: {s})", .{ builtin_state.MODEL_ID, bport, builtin_state.PATH_PREFIX, @tagName(winf.state) });
         } else |e| {
@@ -643,10 +669,44 @@ pub fn main(init: std.process.Init) !void {
     // cadence): a due task spawns a full chat turn, which must never ride an httpz request thread. Spawned here
     // — not next to the sup.bgLoop spawn above — because it needs the fully-wired App; like sup, `app` lives on
     // main's stack for the life of the process (listen() below never returns in normal operation).
-    if (std.Thread.spawn(.{}, sched.bgLoop, .{&app})) |t| t.detach() else |_| {}
+    if (vthread.spawn("sched", sched.bgLoop, .{&app})) |t| t.detach() else |_| {}
     // TOTS allowed onto this machine queue jobs in the cloud; this thread polls for them and runs each as an
     // unattended chat turn (config/cf_tot.zig). It idles at no cost for a user who approved none.
-    if (std.Thread.spawn(.{}, cf_tot.bgLoop, .{&app})) |t| t.detach() else |_| {}
+    if (vthread.spawn("tots", cf_tot.bgLoop, .{&app})) |t| t.detach() else |_| {}
+    // THE SENTRY (worker/sentry.zig): this machine's own firewall and blue-team watch. Heap-allocated (its
+    // finding ring is ~70 KB) and, like `app`, alive for the process. NL_SENTRY=1 seeds it ON for a fresh
+    // install (an unattended machine comes up watched); after that {data}/_sentry/policy.json is the truth and
+    // the chat, `veil sentry` and the desk switch it. Its thread idles for two-second naps while it is off.
+    {
+        const sentry_state = try gpa.create(sentry.Sentry);
+        sentry_state.* = sentry.Sentry.init(gpa, io, paths.data);
+        sentry_own_ports[0] = cli_port;
+        const on_default = if (init.environ_map.get("NL_SENTRY")) |v| (std.mem.eql(u8, v, "1") or std.ascii.eqlIgnoreCase(v, "true") or std.ascii.eqlIgnoreCase(v, "yes") or std.ascii.eqlIgnoreCase(v, "on")) else false;
+        const every_default: u32 = if (init.environ_map.get("NL_SENTRY_EVERY")) |v| (std.fmt.parseInt(u32, std.mem.trim(u8, v, " \r\n\t"), 10) catch sentry.DEFAULT_EVERY_S) else sentry.DEFAULT_EVERY_S;
+        sentry_state.configure(.{
+            .own_ports = if (sentry_own_ports[1] != 0) sentry_own_ports[0..2] else sentry_own_ports[0..1],
+            .open_registration = open_reg,
+            .environ = init.environ_map,
+            .enabled_default = on_default,
+            .every_default = every_default,
+        });
+        app.sentry = sentry_state;
+        if (vthread.spawn("sentry", sentry_api.bgLoop, .{&app})) |t| t.detach() else |_| {}
+        log.info("sentry: {s} (posture {s}; NL_SENTRY=1 seeds it on, `veil sentry` and the chat's sentry_set switch it)", .{ if (sentry_state.enabled()) "ON — watching this machine" else "off", @tagName(sentry_state.posture()) });
+    }
+    // VITALS: this process's commit, working set, threads by name and I/O, the machine's commit and free RAM, and
+    // Defender's reads, every 5 s; one line a window (NL_VITALS_LOG_S, default 60) and a warn line on a spike.
+    // NL_VITALS=0 turns it off. A plain thread (vthread) on raw OS sleeps; page_allocator is thread-safe.
+    // APP MODE routes std.log into the desk's ring from here on (appLog), so boot lines such as vitals' start line
+    // are kept rather than lost to a GUI process's stderr. The no-window path turns it back off.
+    if (desktop_mode and HAS_GUI) app_log.store(true, .release);
+    if (vitals.supported and vitals.enabled(init.environ_map.get("NL_VITALS"))) { // macOS: no reader, no thread
+        vitals_ctx = .{ .gpa = std.heap.page_allocator, .log_every_s = vitals.logEvery(init.environ_map.get("NL_VITALS_LOG_S")) };
+        if (vthread.spawn("vitals", vitals.loop, .{&vitals_ctx})) |t| {
+            t.detach();
+            vitals_on.store(true, .release);
+        } else |e| log.warn("vitals: could not start its thread ({t})", .{e});
+    }
     log.info("billing: {s} (NL_PRODUCTION)", .{if (production) "PRODUCTION — non-admins metered by neuron plan" else "BETA — unmetered full use"});
     if (!open_reg) log.info("registration: CLOSED (private beta) — set NL_OPEN_REGISTRATION=1 to open public signups", .{});
     // NL_CF_API_ROOT: a stand-in for api.cloudflare.com, for the simulation suite (scripts/sim/cfworld.py).
@@ -708,10 +768,16 @@ pub fn main(init: std.process.Init) !void {
         // connections: one thread owns one socket for that socket's whole life. Measured by holding N sockets
         // open and counting requests to the first stall — the stall lands at exactly (held + in-flight) ==
         // count, every time, and the request over the line HANGS 15-25s instead of queueing or being refused.
-        // Left at 128 deliberately: each worker charges ~30 MB of commit (its buffer + stack), so 512 pushed
-        // this process from 4.5 GB to 16.9 GB of commit charge for headroom the keepalive fix above already
-        // buys far more cheaply. Raise it only with that cost in mind.
+        // Left at 128. A worker used to charge ~32 MB of commit (a 16 MiB stack + a 16 MiB body buffer), so the pool
+        // alone held 4 GB before the first request (measured 2026-10-11: the app at 4.7 GB of commit, idle). Both
+        // halves are gone: worker stacks commit 256 KiB and grow on demand (vendor/httpz/src/spawn_cfg.zig, see
+        // threads.zig), and the body buffer pool is the small fixed one below.
         .thread_pool = .{ .count = 128 },
+        // httpz preallocates large_buffer_count buffers of large_buffer_size, defaulting in blocking mode to one per
+        // worker sized to max_body_size: 128 x 16 MiB = 2 GiB committed up front for a body that is almost always a
+        // few KB. A body that does not fit a pooled buffer, or arrives while all are lent out, is allocated for that
+        // request alone (buffer.zig allocType), so a 16 MiB image upload still works; only the idle commit goes.
+        .workers = .{ .large_buffer_count = 16, .large_buffer_size = 256 << 10 },
     }, &app);
     defer {
         cf_tunnel.shutdown(&app); // the public URL first: it must not outlive the server it fronts
@@ -857,6 +923,17 @@ pub fn main(init: std.process.Init) !void {
     router.post("/api/v1/sched/:id", sched.updateTask, .{});
     router.delete("/api/v1/sched/:id", sched.deleteTask, .{});
     router.post("/api/v1/sched/:id/run", sched.runTaskNow, .{});
+    // The sentry (worker/sentry_api.zig): this machine's firewall and watch. Admin-gated: it reads the host and,
+    // in the enforce posture, changes its firewall.
+    router.get("/api/v1/vitals", vitalsRoute, .{});
+    router.get("/api/v1/sentry", sentry_api.status, .{});
+    router.post("/api/v1/sentry/scan", sentry_api.scanNow, .{});
+    router.get("/api/v1/sentry/findings", sentry_api.findings, .{});
+    router.get("/api/v1/sentry/inventory", sentry_api.inventory, .{});
+    router.get("/api/v1/sentry/rules", sentry_api.rules, .{});
+    router.post("/api/v1/sentry/rules", sentry_api.addRule, .{});
+    router.delete("/api/v1/sentry/rules/:id", sentry_api.deleteRule, .{});
+    router.post("/api/v1/sentry/set", sentry_api.setRoute, .{});
     router.get("/api/v1/metrics/llm", metrics.getLlm, .{});
     router.delete("/api/v1/swarms/:id", deploy_service.swarmDelete, .{});
     router.post("/api/v1/billing/checkout", billing_seam.billingCheckout, .{});
@@ -946,9 +1023,10 @@ pub fn main(init: std.process.Init) !void {
     // The job object still goes up FIRST, and still matters: workers, neuron, and the browser host are all
     // spawned from this process, and a kill-on-job-close job is the only thing that reaps them when we are
     // hard-killed (Task Manager) and no defer or watcher ever runs.
+    app_log.store(true, .release); // from here on the server's log lines also land in veil-desk.log (see appLog)
     ownProcessTree(init.environ_map);
     var st = ServerThread{ .server = &server, .port = port };
-    const server_thread = std.Thread.spawn(.{}, ServerThread.run, .{&st}) catch |e| {
+    const server_thread = vthread.spawn("server", ServerThread.run, .{&st}) catch |e| {
         // No server thread = no backend for the GUI to talk to. Fall back to the blocking listen rather than
         // opening a window onto nothing.
         log.err("could not start the HTTP thread ({t}) — running server-only on this thread instead", .{e});
@@ -963,7 +1041,12 @@ pub fn main(init: std.process.Init) !void {
     desk.runApp(paths.data) catch |e| {
         // NO WINDOW is not a reason to take the server down with it — the server is the useful half, and
         // the web UI is right there. Degrade instead of exiting silently (see serveWithoutDesk).
-        if (e == error.WindowUnavailable) serveWithoutDesk(io, port, paths.data);
+        // No window = the desk's poller is already stopped, and it is the only thing that flushes the log ring:
+        // server lines go back to stderr alone rather than into a ring nobody writes out (found in review).
+        if (e == error.WindowUnavailable) {
+            app_log.store(false, .release);
+            serveWithoutDesk(io, port, paths.data);
+        }
         log.err("desktop GUI exited with an error: {t}", .{e});
     };
 
@@ -1930,6 +2013,22 @@ test "safeHost: passes real hostnames, neutralizes anything that could break out
 
 const MAIN_SRC = @embedFile("main.zig");
 
+var vitals_ctx: vitals.Ctx = undefined;
+var vitals_on = std.atomic.Value(bool).init(false);
+
+/// GET /api/v1/vitals (admin): the last ~10 minutes of vitals samples plus a fresh count of threads by name.
+fn vitalsRoute(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
+    _ = http.requireAdmin(app, req, res) orelse return;
+    if (!vitals_on.load(.acquire)) {
+        res.status = 404;
+        res.body = "{\"error\":\"vitals is off (NL_VITALS=0) or unsupported on this OS\"}";
+        return;
+    }
+    const body = try vitals.renderJson(&vitals_ctx, res.arena);
+    res.content_type = .JSON;
+    res.body = body;
+}
+
 const ROUTE_MODS = [_]struct { alias: []const u8, src: []const u8 }{
     .{ .alias = "auth_api", .src = @embedFile("auth/auth_api.zig") },
     .{ .alias = "cf_tunnel", .src = @embedFile("config/cf_tunnel.zig") },
@@ -1941,6 +2040,7 @@ const ROUTE_MODS = [_]struct { alias: []const u8, src: []const u8 }{
     .{ .alias = "chat_tools", .src = @embedFile("worker/chat/tools.zig") },
     .{ .alias = "chat_service", .src = @embedFile("worker/chat/service.zig") },
     .{ .alias = "sched", .src = @embedFile("worker/sched.zig") },
+    .{ .alias = "sentry_api", .src = @embedFile("worker/sentry_api.zig") },
     .{ .alias = "metrics", .src = @embedFile("worker/metrics.zig") },
     .{ .alias = "admin_service", .src = @embedFile("admin/admin_service.zig") },
     .{ .alias = "billing_seam", .src = @embedFile("plan/billing_seam.zig") },
@@ -2198,7 +2298,7 @@ test "the listen port: a second server cannot share it, and a stopped server's p
         var second = try httpz.Server(void).init(io, gpa, .{ .address = .localhost(port) }, {});
         defer second.deinit();
         var attempt: ListenAttempt = .{ .server = &second };
-        const t = try std.Thread.spawn(.{}, ListenAttempt.run, .{&attempt});
+        const t = try vthread.spawn("test-listen", ListenAttempt.run, .{&attempt});
         const deadline = std.Io.Timestamp.now(io, .awake).nanoseconds + 5 * std.time.ns_per_s;
         while (!attempt.done.load(.acquire) and std.Io.Timestamp.now(io, .awake).nanoseconds < deadline) threadSleepMs(io, 5);
         if (!attempt.done.load(.acquire)) {

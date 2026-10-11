@@ -26,6 +26,7 @@
 //! apply here.
 
 const std = @import("std");
+const vthread = @import("../threads.zig"); // every thread: small Windows stack commit + a name (see threads.zig)
 const builtin = @import("builtin");
 const Io = std.Io;
 const depprobe = @import("deps.zig"); // aliased like run.zig: tells "curl is missing" apart from "network down"
@@ -274,7 +275,7 @@ test "one probe at a time: callers that arrive while it runs share its verdict i
     var spawned: usize = 0;
     defer for (threads[0..spawned]) |t| t.join();
     for (&threads, &verdicts) |*t, *v| {
-        t.* = try std.Thread.spawn(.{}, Caller.run, .{ io, gpa, &env, v });
+        t.* = try vthread.spawn("net-call", Caller.run, .{ io, gpa, &env, v });
         spawned += 1;
     }
     for (threads) |t| t.join();

@@ -1,4 +1,5 @@
 const std = @import("std");
+const spawn_cfg = @import("spawn_cfg.zig"); // NOTE: local patch to vendored httpz (small Windows stack commit)
 const metrics = @import("metrics.zig");
 const blockingMode = @import("httpz.zig").blockingMode;
 
@@ -166,7 +167,7 @@ test "BufferPool race" {
     };
 
     var threads: [4]std.Thread = undefined;
-    for (&threads) |*thr| thr.* = try std.Thread.spawn(.{}, Ctx.worker, .{&pool});
+    for (&threads) |*thr| thr.* = try std.Thread.spawn(spawn_cfg.config, Ctx.worker, .{&pool});
     for (&threads) |*thr| thr.join();
 }
 

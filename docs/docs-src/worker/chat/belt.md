@@ -67,9 +67,9 @@ Breadth-first is what a flat belt already is: every option at once, and it is th
 
 The tools array changes only when the open set changes — a navigation round or an eviction — and each change costs one uncached prefill of the prefix. Bounded by `NAV_MAX` plus evictions per turn, against a flat belt that was uncached-size on every call once it overflowed.
 
-## Wiring (engine.zig), behind `NL_TOOL_MAP`
+## Wiring (engine.zig), on by default (`NL_TOOL_MAP=0` opts out)
 
-The module is the algorithm and its state; the engine owns the turn, and it walks only when `NL_TOOL_MAP` is set (`1`; unset or `0` is today's flat belt, byte for byte). The seams, in the order a turn meets them:
+The module is the algorithm and its state; the engine owns the turn, and it walks unless `NL_TOOL_MAP` is `0` or `off` (unset or `1` is the map; `0` is the flat belt, byte for byte). The seams, in the order a turn meets them:
 
 1. **Build** (`runTurn`, right after the plugin schemas merge). `splitBelt` divides the turn's full array by tier: a small model's core is `CORE_SMALL` (read, write, edit, list, run Python, search, fetch, recall, observe) and everything else is walked; a mid or large model keeps the whole built-in belt as its core and walks only the discovered families (`isDiscovered`: `security_`, `cf_`, `plug_`). The map half goes through `Tree.addDefs`; the learned table is read from `{data}/belt-learned.txt`; `Walk.start` restores `{conv}/belt.txt` and pre-opens for the request. The walk's first `tools` array *replaces* `turn_tools`, so the spend ceiling, the context plan and everything else sized from the array size the mapped belt.
 2. **Teach.** For a mapped turn `DOCTRINE` rides in the system prompt and the compact tier's YOUR TOOLS manifest does not — its "that line is the complete list" would be false on a map.

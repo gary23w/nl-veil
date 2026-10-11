@@ -9,7 +9,8 @@
   const GROUPS = [
     { key: '', label: 'OVERVIEW', note: 'start here', docs: [
       { p: 'index', c: 'IX-00', t: 'Module index — the contents of the tree', s: 'docs-src' },
-      { p: 'main', c: 'MN-01', t: 'Entry point — CLI dispatch, the route table, server or app mode', s: 'main.zig' }
+      { p: 'main', c: 'MN-01', t: 'Entry point — CLI dispatch, the route table, server or app mode', s: 'main.zig' },
+      { p: 'threads', c: 'MN-02', t: 'Threads — every thread: a 256 KiB Windows stack commit instead of 16 MiB, and a name', s: 'threads.zig' }
     ]},
     { key: 'guide/', label: 'GUIDE — RUNNING THE THING', note: 'not per-file', docs: [
       { p: 'guide/architecture', c: 'GD-01', t: 'Architecture — one server, three clients (web, desk, CLI)', s: 'main.zig · build.zig' },
@@ -39,7 +40,8 @@
       { p: 'cli/exec_tool', c: 'CL-03', t: 'Shared client tool executor — one tools.execute in the invoker cwd', s: 'cli/exec_tool.zig' },
       { p: 'cli/hub', c: 'CL-04', t: 'Fleet console — roster, broadcast say/goal, stopall over the API', s: 'cli/hub.zig' },
       { p: 'cli/swarm_tui', c: 'CL-05', t: 'veil --swarm — a terminal view of a live swarm, one chat line into it', s: 'cli/swarm_tui.zig' },
-      { p: 'cli/tot', c: 'CL-06', t: 'veil --tater — deploy, tell, watch, set and delete tater-tots from the terminal', s: 'cli/tot.zig' }
+      { p: 'cli/tot', c: 'CL-06', t: 'veil --tater — deploy, tell, watch, set and delete tater-tots from the terminal', s: 'cli/tot.zig' },
+      { p: 'cli/sentry', c: 'CL-07', t: 'veil sentry — this machine\'s firewall and watch from the terminal: status, scan, findings, rules, posture', s: 'cli/sentry.zig' }
     ]},
     { key: 'config/', label: 'CONFIG — THE VAULT', docs: [
       { p: 'config/key_vault', c: 'CF-01', t: 'Key vault — write-only BYOK: seal in, never read out', s: 'key_vault.zig' },
@@ -151,7 +153,10 @@
       { p: 'worker/wsock', c: 'WK-30', t: 'Wsock — blocking Winsock round trip under httpc on Windows', s: 'wsock.zig' },
       { p: 'worker/dataset', c: 'WK-31', t: 'Dataset — every LLM call and tool run captured as a fine-tuning set', s: 'dataset.zig' },
       { p: 'worker/portprobe', c: 'WK-32', t: 'Portprobe — is a port held: the Windows answer std listen cannot give', s: 'portprobe.zig' },
-      { p: 'worker/proposals', c: 'WK-33', t: 'Proposals — accept or reject what a lineage proposed: lessons, skills, habits', s: 'proposals.zig' }
+      { p: 'worker/proposals', c: 'WK-33', t: 'Proposals — accept or reject what a lineage proposed: lessons, skills, habits', s: 'proposals.zig' },
+      { p: 'worker/sentry', c: 'WK-34', t: 'The sentry — the veil as a working firewall and blue-team watch for the machine it runs on', s: 'sentry.zig' },
+      { p: 'worker/sentry_api', c: 'WK-35', t: 'Sentry API — the sentry\'s admin routes and its background thread', s: 'sentry_api.zig' },
+      { p: 'worker/vitals', c: 'WK-36', t: 'Vitals — the app\'s own commit, threads by name, I/O and Defender reads, logged and at /api/v1/vitals', s: 'vitals.zig' }
     ]},
     { key: 'desk/', label: 'DESK — THE NATIVE DASHBOARD (veil-desk)', note: 'zig + raylib', docs: [
       { p: 'desk/main', c: 'DK-01', t: 'Entry point — borderless raylib window, render loop, tabs', s: 'main.zig' },
@@ -177,7 +182,9 @@
       { p: 'desk/wsock', c: 'DK-21', t: 'Wsock — blocking Winsock round trip, twin of the server copy', s: 'wsock.zig' },
       { p: 'desk/nap', c: 'DK-22', t: 'Nap — alert-free sleep + heartbeat clock for desk threads', s: 'nap.zig' },
       { p: 'desk/updater', c: 'DK-23', t: 'Release updater — verified downloads, staged replacement and restart', s: 'updater.zig' },
-      { p: 'desk/tots', c: 'DK-24', t: 'Tater-tots — roster rows, event tail and scratchpad for the Tater-tots tab', s: 'tots.zig' }
+      { p: 'desk/tots', c: 'DK-24', t: 'Tater-tots — roster rows, event tail and scratchpad for the Tater-tots tab', s: 'tots.zig' },
+      { p: 'desk/threads', c: 'DK-25', t: 'Threads — the desk twin of src/threads.zig: small Windows stack commit + names', s: 'threads.zig' },
+      { p: 'desk/distribution', c: 'DK-26', t: 'Distribution — MSIX identity: a Store install keeps its data in the package LocalState', s: 'distribution.zig' }
     ]}
   ];
 

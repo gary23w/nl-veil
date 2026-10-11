@@ -1,4 +1,5 @@
 const std = @import("std");
+const spawn_cfg = @import("spawn_cfg.zig"); // NOTE: local patch to vendored httpz (small Windows stack commit)
 
 const Io = std.Io;
 const Thread = std.Thread;
@@ -75,7 +76,7 @@ pub fn ThreadPool(comptime F: anytype) type {
                 workers[i] = .{ .shared = shared, .buffer = try aa.alloc(u8, opts.buffer_size) };
             }
             for (0..workers.len) |i| {
-                threads[i] = try Thread.spawn(.{}, Worker(F).run, .{&workers[i]});
+                threads[i] = try Thread.spawn(spawn_cfg.config, Worker(F).run, .{&workers[i]});
                 started += 1;
             }
 
@@ -237,6 +238,7 @@ fn Worker(comptime F: anytype) type {
         const Self = @This();
 
         fn run(self: *Self) void {
+            spawn_cfg.nameCurrent("veil:http"); // NOTE: local patch: the vitals line counts workers by name
             const buffer = self.buffer;
             while (self.shared.pop()) |args| {
                 // convert Args to FullArgs, i.e. inject buffer as the last argument

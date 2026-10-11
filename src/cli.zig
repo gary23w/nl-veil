@@ -330,6 +330,7 @@ pub fn isCommand(sub: []const u8) bool {
         "sync-read", "sync-manifest", "rag",    "themes",  "plugins",   "plug",
         "model",     "dataset",       "set",    "lineage", "swarm",     "--swarm",
         "configure", "--configure",   "goal",   "tot",     "tater",     "--tater",
+        "sentry",
     };
     for (verbs) |v| if (std.mem.eql(u8, sub, v)) return true;
     return false;
@@ -366,6 +367,7 @@ pub fn dispatch(ctx: *Ctx, sub: []const u8, args: []const []const u8) u8 {
     if (std.mem.eql(u8, sub, "chat")) return cmdChat(ctx, args);
     if (std.mem.eql(u8, sub, "goal")) return cmdGoal(ctx, args);
     if (std.mem.eql(u8, sub, "sched")) return cmdSched(ctx, args);
+    if (std.mem.eql(u8, sub, "sentry")) return @import("cli/sentry.zig").cmd(ctx, args);
     if (std.mem.eql(u8, sub, "hub")) return cmdHub(ctx, args);
     if (std.mem.eql(u8, sub, "doctor") or std.mem.eql(u8, sub, "health")) return cmdDoctor(ctx, args);
     if (std.mem.eql(u8, sub, "desktop") or std.mem.eql(u8, sub, "desk")) return cmdDesktop(ctx);
@@ -1396,6 +1398,17 @@ fn cmdHelp() u8 {
         \\  --tater limit [N]               how many this account may run: 24 by default, 1 to 1000
         \\                                  (your Cloudflare plan decides how many it really carries)
         \\  --tater rm <name>               delete one     --tater teardown --yes   remove them all + the runtime
+        \\
+        \\THE SENTRY (this machine's own firewall and blue-team watch; admin-only)
+        \\  sentry                          status: on/off, posture, host firewall, what is exposed, open findings
+        \\  sentry on | off                 watch this machine (observe posture: nothing on the host changes)
+        \\  sentry scan                     inventory now: listeners with their process, then new findings
+        \\  sentry findings [--all]         new listeners, startup entries, firewall off, odd outbound, quarantines
+        \\  sentry inventory [--connections] [--persistence]
+        \\  sentry rules                    the policy;  sentry block|allow <port> [--udp] [--out] [--remote IP] [--program P]
+        \\  sentry rm <id>                  drop a rule  sentry posture observe|enforce   enforce applies rules to the host firewall
+        \\  sentry auto-block on|off        enforce only: quarantine a new network-reachable listener on sight
+        \\  sentry baseline | ack           accept what it sees as normal | mark the findings reviewed
         \\
         \\BUILT-IN MODEL (the-veil-12b served by the server itself — no external runtime)
         \\  model status                 weights + engine + any download in flight

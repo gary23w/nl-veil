@@ -914,34 +914,117 @@ var kb_activate: bool = false; // Enter/Space fired this frame → the focused c
 var kb_announce: [160]u8 = undefined; // focused label, queued for the narrator
 var kb_announce_len: usize = 0;
 var kb_announced: i32 = -2; // last index announced (speak once per focus move, not per frame)
+// TEXT FIELDS ARE IN THE ORDER TOO. A field registers like a button (kbField), and the ring reaching one hands
+// it the keyboard instead of drawing around it. Tab FROM a field continues from where that field sat, so Tab
+// walks NAME → GOAL → CHARTER → Deploy the way every form does. Before this, Tab while typing moved the ring
+// across the buttons behind the caret (the caret stayed put, and the ring sat on a control Space would fire
+// once the field let go), and no form could be tabbed through at all.
+var kb_field_idx: i32 = -1; // this frame: the registration index of the field that drew focused
+var kb_field_prev: i32 = -1; // last frame's — where Tab from a field starts
+// TAB SWITCH. The titlebar and tab bar register first and are the same on every tab, so a ring sitting there
+// may stay across a switch (Enter on the "Settings" tab keeps the ring on that tab). A ring in the old tab's
+// body would land on whatever unrelated control the new tab has at that index, so a switch drops it.
+var kb_chrome_cur: usize = 0; // this frame: controls registered before the active tab's body
+var kb_chrome: usize = 0; // last frame's
 
-/// Once per frame, BEFORE any control draws. `advance`/`back` = Tab / Shift+Tab, `activate` = Enter/Space
-/// (the caller gates these on "no text field focused" so typing is never hijacked).
-pub fn kbFrame(advance: bool, back: bool, activate: bool) void {
+/// The index Tab (or Shift+Tab with `back`) lands on from `cur` in an order of `controls` controls, wrapping at
+/// both ends; `cur` outside the order starts at the first (or, going back, the last). -1 when there is nothing.
+pub fn kbStep(cur: i32, controls: usize, back: bool) i32 {
+    if (controls == 0) return -1;
+    const n: i32 = @intCast(controls);
+    if (cur < 0 or cur >= n) return if (back) n - 1 else 0;
+    var next = cur + @as(i32, if (back) -1 else 1);
+    if (next < 0) next = n - 1;
+    if (next >= n) next = 0;
+    return next;
+}
+
+/// Once per frame, BEFORE any control draws. `advance`/`back` = Tab / Shift+Tab, `activate` = Enter/Space (the
+/// caller gates it on "no text field focused" so typing is never hijacked), `field_focused` = a text field owns
+/// the keyboard right now. Returns true when Tab moved focus OUT of that field: the caller must then let go of
+/// the field (the control Tab moved to takes over as it draws — a field through kbField, a button by the ring).
+pub fn kbFrame(advance: bool, back: bool, activate: bool, field_focused: bool) bool {
     kb_prev_count = kb_count;
     kb_count = 0;
     kb_activate = false;
+    kb_field_prev = kb_field_idx;
+    kb_field_idx = -1;
+    kb_chrome = kb_chrome_cur;
+    kb_chrome_cur = 0;
     if (kb_prev_count == 0) {
         kb_focus = -1;
-        return;
+        return false;
     }
+    var left_field = false;
     if (advance or back) {
-        if (kb_focus < 0) {
-            kb_focus = if (back) @intCast(kb_prev_count - 1) else 0;
+        if (field_focused) {
+            kb_focus = kbStep(kb_field_prev, kb_prev_count, back);
+            left_field = true;
         } else {
-            kb_focus += if (back) -1 else 1;
-            if (kb_focus < 0) kb_focus = @intCast(kb_prev_count - 1);
-            if (kb_focus >= @as(i32, @intCast(kb_prev_count))) kb_focus = 0;
+            kb_focus = kbStep(kb_focus, kb_prev_count, back);
         }
+    } else if (field_focused) {
+        // A field took the keyboard some other way (a click, a tab switch that focuses its input): one focus
+        // indicator at a time, and Enter belongs to the field, so the ring goes.
+        kb_focus = -1;
     }
     if (kb_focus >= @as(i32, @intCast(kb_prev_count))) kb_focus = -1; // the view shrank under the ring
     kb_activate = activate and kb_focus >= 0;
+    return left_field;
 }
 
-/// Drop keyboard-nav mode (mouse click / Escape / tab switch).
+/// Drop keyboard-nav mode (mouse click / Escape).
 pub fn kbCancel() void {
     kb_focus = -1;
     kb_announced = -2;
+}
+
+/// Call once per frame right after the titlebar and tab bar draw: everything registered so far is chrome.
+pub fn kbChromeEnd() void {
+    kb_chrome_cur = kb_count;
+}
+
+/// The active tab changed: keep a ring that sits on the chrome, drop one that sat in the old tab's body.
+pub fn kbTabSwitched() void {
+    if (kb_focus >= @as(i32, @intCast(kb_chrome))) kbCancel();
+}
+
+/// Register one text field in the focus order. `focused` = it owns the keyboard this frame. Returns true when
+/// Tab just moved focus ONTO it: the caller hands it the keyboard (sets its focus) — no ring is drawn around a
+/// field, its own focused border and caret are the indicator.
+pub fn kbField(r: Rect, label: []const u8, focused: bool) bool {
+    if (interaction_clip) |clip| {
+        if (r.y < clip.y or r.y + r.height > clip.y + clip.height) return false;
+    }
+    const idx: i32 = @intCast(kb_count);
+    kb_count += 1;
+    if (focused) kb_field_idx = idx;
+    if (idx != kb_focus) return false;
+    kb_focus = -1;
+    kb_field_idx = idx;
+    kbQueueAnnouncement(idx, label, "text field");
+    return true;
+}
+
+/// Queue `label. kind` for the narrator, once per focus move.
+fn kbQueueAnnouncement(idx: i32, label: []const u8, kind: []const u8) void {
+    if (kb_announced == idx) return;
+    kb_announced = idx;
+    var w: usize = 0;
+    for (label) |c| {
+        if (w >= kb_announce.len - 12) break;
+        kb_announce[w] = c;
+        w += 1;
+    }
+    const sep = ". ";
+    @memcpy(kb_announce[w .. w + sep.len], sep);
+    w += sep.len;
+    for (kind) |c| {
+        if (w >= kb_announce.len) break;
+        kb_announce[w] = c;
+        w += 1;
+    }
+    kb_announce_len = w;
 }
 
 /// Consume the pending focus announcement (main forwards it to the narrator queue).
@@ -956,34 +1039,24 @@ pub fn kbTakeAnnouncement(out: []u8) usize {
 /// Register one interactive control; returns true when THIS control is keyboard-activated this frame.
 /// Draws the focus ring + queues the spoken label when the ring sits here.
 fn kbRegister(r: Rect, label: []const u8, kind: []const u8) bool {
+    if (!kbClaim(r, label, kind)) return false;
+    // double ring: accent inner + fg outer — visible on any backdrop in any scheme
+    rl.drawRectangleLinesEx(.{ .x = r.x - 3, .y = r.y - 3, .width = r.width + 6, .height = r.height + 6 }, 2, blue);
+    rl.drawRectangleLinesEx(.{ .x = r.x - 5, .y = r.y - 5, .width = r.width + 10, .height = r.height + 10 }, 1, fg);
+    return kb_activate;
+}
+
+/// The bookkeeping half of kbRegister, without pixels (so the order is testable without a window): count the
+/// control, and when the ring sits on it queue its announcement and return true.
+fn kbClaim(r: Rect, label: []const u8, kind: []const u8) bool {
     if (interaction_clip) |clip| {
         if (r.y < clip.y or r.y + r.height > clip.y + clip.height) return false;
     }
     const idx: i32 = @intCast(kb_count);
     kb_count += 1;
     if (idx != kb_focus) return false;
-    // double ring: accent inner + fg outer — visible on any backdrop in any scheme
-    rl.drawRectangleLinesEx(.{ .x = r.x - 3, .y = r.y - 3, .width = r.width + 6, .height = r.height + 6 }, 2, blue);
-    rl.drawRectangleLinesEx(.{ .x = r.x - 5, .y = r.y - 5, .width = r.width + 10, .height = r.height + 10 }, 1, fg);
-    if (kb_announced != kb_focus) {
-        kb_announced = kb_focus;
-        var w: usize = 0;
-        for (label) |c| {
-            if (w >= kb_announce.len - 12) break;
-            kb_announce[w] = c;
-            w += 1;
-        }
-        const sep = ". ";
-        @memcpy(kb_announce[w .. w + sep.len], sep);
-        w += sep.len;
-        for (kind) |c| {
-            if (w >= kb_announce.len) break;
-            kb_announce[w] = c;
-            w += 1;
-        }
-        kb_announce_len = w;
-    }
-    return kb_activate;
+    kbQueueAnnouncement(idx, label, kind);
+    return true;
 }
 
 pub fn buttonEx(r: Rect, label: [:0]const u8, accent: Color, enabled: bool, style: BtnStyle) bool {
@@ -1268,4 +1341,130 @@ test "foldAscii collapses newlines and transliterates Unicode punctuation (fixes
         const n = foldAscii(&buf, "caf\u{e9} \u{1f600}ok");
         try std.testing.expectEqualStrings("caf\u{e9} ok", buf[0..n]);
     }
+}
+
+// ---- keyboard order (the Tab key) ----------------------------------------------------------------------------------
+// These drive the bookkeeping exactly as a frame does — kbFrame first, then every control in draw order — through
+// kbField and kbClaim, the halves that draw nothing, so they run without a window.
+
+fn kbTestReset() void {
+    kb_count = 0;
+    kb_prev_count = 0;
+    kb_focus = -1;
+    kb_activate = false;
+    kb_announced = -2;
+    kb_announce_len = 0;
+    kb_field_idx = -1;
+    kb_field_prev = -1;
+    kb_chrome_cur = 0;
+    kb_chrome = 0;
+}
+
+const kb_test_r = Rect{ .x = 0, .y = 0, .width = 10, .height = 10 };
+
+/// One frame of a form with three text fields. `focus` = the field that owns the keyboard (-1 none), updated the
+/// way main.zig does: let go when kbFrame says Tab left the field, take it when kbField says Tab arrived.
+fn kbTestFormFrame(focus: *i32, tab_key: bool, back: bool) void {
+    if (kbFrame(tab_key and !back, tab_key and back, false, focus.* >= 0)) focus.* = -1;
+    var i: i32 = 0;
+    while (i < 3) : (i += 1) {
+        if (kbField(kb_test_r, "field", focus.* == i)) focus.* = i;
+    }
+}
+
+test "kbStep: forward and back with wrap, a fresh start lands on the first (or last), nothing to land on is -1" {
+    try std.testing.expectEqual(@as(i32, 1), kbStep(0, 3, false));
+    try std.testing.expectEqual(@as(i32, 0), kbStep(2, 3, false));
+    try std.testing.expectEqual(@as(i32, 2), kbStep(0, 3, true));
+    try std.testing.expectEqual(@as(i32, 0), kbStep(-1, 3, false));
+    try std.testing.expectEqual(@as(i32, 2), kbStep(-1, 3, true));
+    try std.testing.expectEqual(@as(i32, 0), kbStep(7, 3, false)); // the view shrank under the old index
+    try std.testing.expectEqual(@as(i32, -1), kbStep(0, 0, false));
+}
+
+test "Tab moves the caret from text field to text field in draw order, wraps, and Shift+Tab walks back" {
+    kbTestReset();
+    var focus: i32 = 0; // the first field owns the keyboard (it was clicked)
+    kbTestFormFrame(&focus, false, false); // the frame that registers the order
+    kbTestFormFrame(&focus, true, false);
+    try std.testing.expectEqual(@as(i32, 1), focus);
+    kbTestFormFrame(&focus, true, false);
+    try std.testing.expectEqual(@as(i32, 2), focus);
+    kbTestFormFrame(&focus, true, false);
+    try std.testing.expectEqual(@as(i32, 0), focus); // wrapped
+    kbTestFormFrame(&focus, true, true);
+    try std.testing.expectEqual(@as(i32, 2), focus); // Shift+Tab back across the wrap
+    kbTestFormFrame(&focus, false, false);
+    try std.testing.expectEqual(@as(i32, 2), focus); // no key, no move
+    // and no ring was ever left behind on a field
+    try std.testing.expectEqual(@as(i32, -1), kb_focus);
+}
+
+test "Tab from a field onto a button: the field lets go, the ring sits on the button, Enter fires it, Tab moves on" {
+    kbTestReset();
+    // frame 1: NAME (focused), a Deploy button, GOAL
+    _ = kbFrame(false, false, false, true);
+    _ = kbField(kb_test_r, "name", true);
+    try std.testing.expect(!kbClaim(kb_test_r, "Deploy", "button"));
+    _ = kbField(kb_test_r, "goal", false);
+    // frame 2: Tab — reported as leaving the field; the button is ringed, neither field takes the keyboard
+    try std.testing.expect(kbFrame(true, false, false, true));
+    try std.testing.expect(!kbField(kb_test_r, "name", false));
+    try std.testing.expect(kbClaim(kb_test_r, "Deploy", "button"));
+    try std.testing.expect(!kbField(kb_test_r, "goal", false));
+    // frame 3: Enter with no field focused fires the ringed button
+    _ = kbFrame(false, false, true, false);
+    _ = kbField(kb_test_r, "name", false);
+    try std.testing.expect(kbClaim(kb_test_r, "Deploy", "button"));
+    try std.testing.expect(kb_activate);
+    _ = kbField(kb_test_r, "goal", false);
+    // frame 4: Tab again reaches GOAL, which takes the keyboard (and no ring stays on it)
+    try std.testing.expect(!kbFrame(true, false, false, false));
+    _ = kbField(kb_test_r, "name", false);
+    try std.testing.expect(!kbClaim(kb_test_r, "Deploy", "button"));
+    try std.testing.expect(kbField(kb_test_r, "goal", false));
+    try std.testing.expectEqual(@as(i32, -1), kb_focus);
+}
+
+test "typing is never hijacked: once a field owns the keyboard, a ring left from before is gone and Enter fires nothing" {
+    kbTestReset();
+    _ = kbFrame(false, false, false, false);
+    _ = kbClaim(kb_test_r, "Delete", "button");
+    _ = kbField(kb_test_r, "prompt", false);
+    // the ring walks onto Delete
+    _ = kbFrame(true, false, false, false);
+    try std.testing.expect(kbClaim(kb_test_r, "Delete", "button"));
+    _ = kbField(kb_test_r, "prompt", false);
+    // then the prompt field gets the keyboard some other way (a click, a tab switch focusing it). main passes
+    // activate=false while a field is focused; the ring must not survive to be fired once the field lets go.
+    _ = kbFrame(false, false, false, true);
+    try std.testing.expect(!kbClaim(kb_test_r, "Delete", "button"));
+    _ = kbField(kb_test_r, "prompt", true);
+    _ = kbFrame(false, false, true, false); // the field let go and Enter/Space is pressed
+    try std.testing.expect(!kbClaim(kb_test_r, "Delete", "button"));
+    try std.testing.expect(!kb_activate);
+}
+
+test "a tab switch keeps a ring on the titlebar or tab bar and drops one sitting in the old tab's body" {
+    kbTestReset();
+    const Frame = struct {
+        fn run(tab_key: bool) void {
+            _ = kbFrame(tab_key, false, false, false);
+            _ = kbClaim(kb_test_r, "Chat", "tab");
+            _ = kbClaim(kb_test_r, "Settings", "tab");
+            kbChromeEnd();
+            _ = kbClaim(kb_test_r, "Save", "button");
+            _ = kbClaim(kb_test_r, "Reset", "button");
+        }
+    };
+    Frame.run(false); // registers the order: 2 chrome controls, 2 body controls
+    Frame.run(true); // ring on "Chat"
+    Frame.run(true); // ring on "Settings"
+    try std.testing.expectEqual(@as(i32, 1), kb_focus);
+    kbTabSwitched(); // Enter on the Settings tab switched tabs: the ring stays on the tab bar
+    try std.testing.expectEqual(@as(i32, 1), kb_focus);
+    Frame.run(true); // ring into the body: "Save"
+    try std.testing.expectEqual(@as(i32, 2), kb_focus);
+    kbTabSwitched(); // a shortcut switched tabs: "Save" must not become the new tab's control at index 2
+    try std.testing.expectEqual(@as(i32, -1), kb_focus);
 }

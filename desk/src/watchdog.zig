@@ -21,6 +21,7 @@
 //! AMD + NVIDIA setup) — not our code. Anything else names our code and narrows it to one section.
 
 const std = @import("std");
+const vthread = @import("threads.zig"); // every thread: small Windows stack commit + a name (see threads.zig)
 const builtin = @import("builtin");
 const Io = std.Io;
 const log = @import("log.zig");
@@ -75,6 +76,7 @@ pub fn stallCount() u32 {
 /// watchdog that either never fires or never stops. One clock, owned here, is the only safe arrangement.
 /// No-op until start() has run.
 pub fn beat(p: Phase) void {
+    if (phase_timing) phaseEnter(p);
     if (!running.load(.acquire)) return;
     beat_ms.store(nowMs(ctx.io), .monotonic);
     phase_v.store(@intFromEnum(p), .monotonic);
@@ -83,7 +85,43 @@ pub fn beat(p: Phase) void {
 /// Mark the phase without a new timestamp: use INSIDE a frame so a stall is attributed to the section that
 /// was actually running, while the heartbeat keeps measuring from the frame's start.
 pub fn mark(p: Phase) void {
+    if (phase_timing) phaseEnter(p);
     phase_v.store(@intFromEnum(p), .monotonic);
+}
+
+// ---- PHASE TIMING (main.zig's NL_DESK_FRAMELOG) -----------------------------------------------------------------
+// The same marks, timed: each beat/mark closes the phase that was running and charges its duration to that phase's
+// sum and max. UI thread only (it is the only caller of beat/mark), so plain variables. Off unless the frame log
+// turned it on; then the cost is one clock read per mark, five a frame.
+pub const PHASES = @typeInfo(Phase).@"enum".fields.len;
+pub var phase_timing: bool = false;
+pub var phase_sum_us: [PHASES]u64 = [_]u64{0} ** PHASES;
+pub var phase_max_us: [PHASES]u64 = [_]u64{0} ** PHASES;
+var phase_cur: Phase = .idle_start;
+var phase_t_us: i64 = 0;
+
+fn phaseEnter(p: Phase) void {
+    const now = nap.nowUs();
+    if (phase_t_us != 0) {
+        const d: u64 = @intCast(@max(0, now - phase_t_us));
+        const i = @intFromEnum(phase_cur);
+        phase_sum_us[i] += d;
+        if (d > phase_max_us[i]) phase_max_us[i] = d;
+    }
+    phase_cur = p;
+    phase_t_us = now;
+}
+
+/// Forget the running phase without charging it: the hidden-window branch sleeps between frames, and that sleep
+/// is not a phase of anything.
+pub fn phaseReset() void {
+    phase_t_us = 0;
+}
+
+/// Zero the per-window sums and maxima (the frame log calls this after printing a line).
+pub fn phaseClear() void {
+    phase_sum_us = [_]u64{0} ** PHASES;
+    phase_max_us = [_]u64{0} ** PHASES;
 }
 
 pub fn frameDone() void {
@@ -123,7 +161,7 @@ pub fn start(io: Io, data_dir: []const u8, hwnd: ?*anyopaque) void {
         ctx.hang_len = p.len;
     } else |_| ctx.hang_len = 0;
     beat_ms.store(nowMs(io), .monotonic);
-    _ = std.Thread.spawn(.{}, watch, .{}) catch {
+    _ = vthread.spawn("desk-watchdog", watch, .{}) catch {
         running.store(false, .release);
         log.warn("watchdog: could not start — a UI hang will go unreported", .{});
     };

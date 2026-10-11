@@ -91,6 +91,20 @@ if [ "${1:-}" = "--scan" ]; then
   else
     echo "[twins] wsock.zig twins differ -- make the two copies identical"
   fi
+  # threads.zig twin: identical BELOW the //! header (same rule as check.ps1's twin of this check)
+  if [ "$(grep -v '^//!' src/threads.zig)" = "$(grep -v '^//!' desk/src/threads.zig)" ]; then
+    echo "[twins] threads.zig twins in sync (below-header contract holds)"
+  else
+    echo "[twins] threads.zig twin BODIES differ -- mirror them"
+  fi
+  # thread stacks: a default-config spawn commits 16 MiB on Windows (Zig 0.16); use vthread.spawn (check.ps1 2b)
+  raw16=$(grep -rnE 'Thread\.spawn\(\s*\.\{\s*\}' src desk/src vendor/httpz/src --include=*.zig || true)
+  if [ -z "$raw16" ]; then
+    echo "[threads] no default-config thread spawns (every stack commits small on Windows)"
+  else
+    echo "[threads] default-config thread spawns (16 MiB commit each on Windows) -- use vthread.spawn:"
+    echo "$raw16" | sed 's/^/    /'
+  fi
   vz=$(sed -n 's/.*\.version = "\([^"]*\)".*/\1/p' build.zig.zon | head -1)
   vm=$(sed -n 's/.*VERSION = "\([^"]*\)".*/\1/p' src/main.zig | head -1)
   # desk/build.zig.zon is checked too: it was in NEITHER this echo nor bump-version.ps1's edit list, so it

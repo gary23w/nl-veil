@@ -33,6 +33,24 @@ Use NL-Veil for local evidence and control. The Cloudflare Container sees its ow
 
 For continuous observation, configure a tater-tot guard and choose its posture and leash. Those tater-tot settings remain separate from the security-tool opt-in. See [the day after](day-after.md) for guard commands, event-chain verification and the local run folders.
 
+## The sentry: the veil as your machine's firewall and watch
+
+Agent Garrett looks out from the cloud. The **sentry** looks in: it runs inside the veil on the computer the veil is installed on, needs no Cloudflare account, and never sends anything anywhere. Every minute it inventories what the operating system already knows (which ports are listening and which process holds each one, where established connections go, what starts at boot or on a schedule, whether the host firewall is on), compares that with the baseline you accepted, and records what changed as **findings** with a severity. The chat is told how many findings await review, so the next question you ask about your machine is answered by a model that already knows a new port opened last night.
+
+| Do | How |
+| --- | --- |
+| Turn it on | `veil sentry on`, the **Sentry** rows in the desktop's Settings, `sentry_set enabled=true` in a chat, or `NL_SENTRY=1` for a fresh install |
+| See what is exposed right now | `veil sentry scan`, or ask the chat "what is listening on this machine?" (it calls `sentry_scan`) |
+| Review findings | `veil sentry findings`, the open findings in `veil sentry` and the desktop's Dashboard, or `sentry_findings` in a chat |
+| Say "that is my machine" | `veil sentry baseline` after you have looked; `veil sentry ack` marks the findings reviewed without changing the baseline |
+| Close a port to the network | `veil sentry block 4444` (add `--udp`, `--out`, `--remote 203.0.113.0/24`, `--program C:\path\to.exe` as needed) |
+| Make the rules real | `veil sentry posture enforce` applies the policy to Windows Defender Firewall, nftables or pf, naming every rule `veil-sentry:<id>`; `posture observe` withdraws them all. Enforcement needs an elevated veil on Windows and root on Linux or macOS; without that the rule is recorded and the status says why it was not applied |
+| Quarantine on sight | `veil sentry auto-block on` (enforce only): a new listener bound to a network address that is not in the baseline or on the allowlist gets an inbound block for its port at once, named `auto-tcp-<port>`, and one `veil sentry rm` lifts it |
+
+The first scan adopts the machine as it is, so a fresh install reports nothing until something changes. The veil's own ports are never reported or blocked, and nothing on loopback is ever blocked. Everything lives under `{data}/_sentry/`: `policy.json` (switch, posture, rules, allowlist), `baseline.json`, `state.json`, `events.jsonl` (every finding, append-only). Rule changes and posture switches are written to the audit log. The sentry does not sniff traffic, inject into processes or hide: it reads what `netstat`, `ss`, `lsof`, `reg`, `schtasks`, `crontab`, `systemctl` and `netsh` print, and it changes the host firewall only in the posture you chose. See [the sentry's source notes](../worker/sentry.md) for the inventory each platform gets and the exact firewall commands.
+
+Together they are the two halves of a blue team on your own desk: the sentry notices a new listener or a new scheduled task and names the process; Agent Garrett takes the hash, the domain it talks to or the task's command line and tells you what the world knows about it.
+
 ## Lab and red-team work
 
 The same runtime can inventory an authorized lab, run selected checks, preserve findings and traffic, and organize retests. Give it an explicit target set, a goal and the expected evidence. For example: “Inventory the services in my supplied lab scope, save the results, identify candidate weaknesses and propose the next verification step.” For a retest: “Use the saved finding and its traffic to verify whether my fix changed the observed behavior, then record the result.”

@@ -36,6 +36,7 @@
 //! and `call` back to the server over loopback. The server itself never proxies — it IS the host.
 
 const std = @import("std");
+const vthread = @import("../../threads.zig"); // every thread: small Windows stack commit + a name (see threads.zig)
 const util = @import("util.zig");
 const httpc = @import("../httpc.zig");
 
@@ -631,14 +632,14 @@ test "call: a delivered reply is returned verbatim, and an extension error surfa
     };
 
     {
-        const th = try std.Thread.spawn(.{}, Answer.go, .{ gpa, io, @as(u64, 1), "{\"value\":2}", false });
+        const th = try vthread.spawn("test-ext", Answer.go, .{ gpa, io, @as(u64, 1), "{\"value\":2}", false });
         defer th.join();
         const got = try call(gpa, io, &env, "Runtime.evaluate", "{\"expression\":\"1+1\"}", "42", 5000);
         defer gpa.free(got);
         try std.testing.expectEqualStrings("{\"value\":2}", got);
     }
     {
-        const th = try std.Thread.spawn(.{}, Answer.go, .{ gpa, io, @as(u64, 2), "no tab attached", true });
+        const th = try vthread.spawn("test-ext", Answer.go, .{ gpa, io, @as(u64, 2), "no tab attached", true });
         defer th.join();
         try std.testing.expectError(error.ExtError, call(gpa, io, &env, "Input.dispatchMouseEvent", "{}", "42", 5000));
     }

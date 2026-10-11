@@ -23,6 +23,7 @@
 //! program (gitEnviron), and a push with nothing usable fails at once.
 
 const std = @import("std");
+const vthread = @import("threads.zig"); // every thread: small Windows stack commit + a name (see threads.zig)
 const builtin = @import("builtin");
 const Io = std.Io;
 const log = @import("log.zig");
@@ -395,7 +396,7 @@ const Lease = struct {
 
     /// Starts in place: the thread holds a pointer to the struct, which must stay put until `end`.
     fn begin(l: *Lease) void {
-        l.thread = std.Thread.spawn(.{}, keep, .{l}) catch |e| blk: {
+        l.thread = vthread.spawn("desk-git-keep", keep, .{l}) catch |e| blk: {
             log.warn("git push: no lease on {s} ({t}); a push running past {d}s can lose it to another desk's sweep", .{ l.path, e, TOKEN_FILE_STALE_S });
             break :blk null;
         };
@@ -686,7 +687,7 @@ const Standin = struct {
         sv.auth_len = 0;
         sv.api_len = (std.fmt.bufPrint(&sv.api, "http://127.0.0.1:{d}", .{sv.port}) catch unreachable).len;
         sv.host_len = (std.fmt.bufPrint(&sv.host, "127.0.0.1:{d}", .{sv.port}) catch unreachable).len;
-        sv.thread = std.Thread.spawn(.{}, serve, .{sv}) catch |e| {
+        sv.thread = vthread.spawn("test-gitvc-serve", serve, .{sv}) catch |e| {
             sv.server.deinit(io);
             return e;
         };

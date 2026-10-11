@@ -20,6 +20,16 @@ On/off is a **file**: `<root>/RECORDING` holds the active set id. Swarm minds ar
 - `tools.jsonl` — every execution: name, verbatim args, the result the model read, ok, ms.
 - `meta.json`, `README.md` — what the set is, and its format documented inside the set.
 
+## Rolling parts
+
+No file that is still being written grows past `PART_MAX` (16 MiB). The append that would cross it first renames the live file to `<name>.<YYYYMMDD-HHMMSS.mmm>-<seq>-t<thread>.jsonl` (UTC; a rename, no copy) and starts a fresh `<name>.jsonl`. An archived part is never written again.
+
+The reason is Windows Defender: real-time protection rescans a file in full each time it is modified and closed. On 2026-10-11 a set recording since August held `raw.jsonl` at 511 MB, `sft.jsonl` at 526 MB and `by-model/` at 526 MB. Every model call appended a few dozen KB, and Defender re-read the files in bursts of 0.9 to 1.3 GB/s: about 45 bursts of roughly 1 GB in the 150 seconds around one prompt, enough to stall the whole machine when memory was tight. With parts, a rescan covers at most 16 MiB.
+
+Records are unchanged and never split across parts. For one stream, concatenate `<name>.*.jsonl` in name order and then `<name>.jsonl`, for example `cat sft.*.jsonl sft.jsonl`. The stamps sort before the live file's name. For `by-model/`, where one model's slug can be a prefix of another's (`qwen2` and `qwen2.5-coder_7b`), match the stamp pattern rather than a bare glob.
+
+Appends are serialized within a process by an io-free spin-and-yield lock (never `std.Io.Mutex`, whose contended path parks plain threads on the runtime's alert). The write offset is read after opening the file, so another process that appended or rolled in between is never overwritten and never leaves a gap.
+
 ## Key Exports
 
 - `configure` / `setSource` / `setsDir` — boot wiring (`NL_SETS_DIR` overrides the root)

@@ -19,6 +19,7 @@
 //! request, and one saw no connections at all. The port the OS assigns is private.
 
 const std = @import("std");
+const vthread = @import("../threads.zig"); // every thread: small Windows stack commit + a name (see threads.zig)
 const builtin = @import("builtin");
 
 /// TEST ONLY. One canned answer for `Server.startRouted`: requests whose method is `method` and whose
@@ -108,7 +109,7 @@ pub const Server = struct {
         self.used = @splat(0);
         self.call_count = 0;
         self.on_request = on_request;
-        self.thread = std.Thread.spawn(.{}, serve, .{self}) catch |e| {
+        self.thread = vthread.spawn("test-fakehttp", serve, .{self}) catch |e| {
             self.server.deinit(io);
             return e;
         };

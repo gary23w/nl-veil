@@ -13,6 +13,7 @@ const recipes = @import("../worker/recipes.zig");
 // read ONE registry. plug/plugins.zig imports the mcp client + lua + theme under src/plug — no cycle back
 // into http.zig.
 const plugins = @import("../plug/plugins.zig");
+const sentry_mod = @import("../worker/sentry.zig"); // the sentry: App.sentry, wired by main()
 
 pub const Auth = auth_core.Auth;
 pub const User = auth_core.User;
@@ -73,6 +74,10 @@ pub const App = struct {
     /// loopback address (cftools.isLoopbackRoot): the belt carries the user's OAuth bearer, and a
     /// simulation stand-in on the same machine is the one place that may receive it besides Cloudflare.
     cf_api_root: []const u8 = "https://api.cloudflare.com/client/v4",
+    /// THE SENTRY (worker/sentry.zig): this machine's own firewall and blue-team watch. Wired by main() for the
+    /// process that serves the user's machine; null in a test app and anywhere the host is not ours to read, and
+    /// null-safe at every reader (the routes answer 503, the belt leaves the family off).
+    sentry: ?*sentry_mod.Sentry = null,
 };
 
 /// The consent this login asks for, ONE definition (main.zig's env fallback reads it too; the registered

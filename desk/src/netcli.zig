@@ -310,6 +310,20 @@ pub fn garrettStatus(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u
     return httpReq(io, gpa, "GET", port, "/api/v1/tots/garrett", token, null, 20);
 }
 
+/// GET /api/v1/sentry — the sentry's status: on/off, posture, the host firewall, the last scan's counts, the open
+/// findings. Admin-gated on the server, like the tots.
+pub fn sentryStatus(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8) ?Resp {
+    log.trace("netcli.sentryStatus port={d}", .{port});
+    return httpReq(io, gpa, "GET", port, "/api/v1/sentry", token, null, 20);
+}
+
+/// POST /api/v1/sentry/set — a settings change (`{"enabled":true}`, `{"posture":"enforce"}`, `{"auto_block":false}`,
+/// `{"baseline":true}`, `{"ack":true}`). Turning it on runs a scan before the reply, so the ceiling is generous.
+pub fn sentrySet(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8, body: []const u8) ?Resp {
+    log.trace("netcli.sentrySet port={d}", .{port});
+    return httpReq(io, gpa, "POST", port, "/api/v1/sentry/set", token, body, 120);
+}
+
 /// POST /api/v1/tots/garrett — deploy it into the user's Cloudflare account: the server reads the agent's modules
 /// from its repo and uploads them as a Worker (a handful of calls: up to a few minutes). The reply is the result.
 pub fn garrettDeploy(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8) ?Resp {

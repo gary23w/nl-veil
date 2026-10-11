@@ -4,6 +4,7 @@
 //! chat/monitor/stop them, and watch the live event console + metrics.
 
 const std = @import("std");
+const vthread = @import("threads.zig"); // every thread: small Windows stack commit + a name (see threads.zig)
 const builtin = @import("builtin");
 const nap = @import("nap.zig");
 pub const updater = @import("updater.zig");
@@ -60,7 +61,7 @@ fn deskPanic(msg: []const u8, first_trace_addr: ?usize) noreturn {
 fn writeCrashReport(msg: []const u8, ra: ?usize) void {
     // The app's gpa may be corrupt mid-panic, so stand up a throwaway blocking Io on the page allocator
     // (lock-free VirtualAlloc, no shared state). Skip deinit: we abort in defaultPanic right after.
-    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{ .stack_size = vthread.io_stack_size });
     const io = threaded.io();
     const base = @intFromPtr(GetModuleHandleW(null)); // this module's load base → RVA = ret_addr - base
     // The desk's cwd varies (repo root, zig-out/bin, Explorer double-click) and createFile makes no parent
@@ -150,6 +151,12 @@ const Ui = struct {
     focus: Focus = .none,
     input_active: bool = false, // handleKeys/editField set this when they consume a keystroke — drives FPS
     tot_frames: u32 = 0, // frames of snappy 60fps remaining after the last activity (activity-gated redraw)
+    // presenting while unfocused (see unfocusedPresent): when the last unfocused frame was presented, frames still owed
+    // after focus was lost (so hover/caret settle), whether the window was focused last loop, and frames presented in all
+    unfocused_last_s: f64 = 0,
+    unfocused_settle: u8 = 0,
+    was_focused: bool = true,
+    frames_presented: u32 = 0,
     // Chat message render-height cache: word-wrapping every message twice per frame (measure + draw) pins a
     // CPU core on long chats. Cache heights; recompute only when the message set or wrap width changes.
     // INCREMENTAL: per-row fingerprints (mh_mfp) so a change re-measures only the changed/new rows (re-wrapping
@@ -486,7 +493,243 @@ pub fn main() !void {
 /// launched from the repo. In-process there is no such guarantee — `veil` can be started from anywhere — so
 /// the server hands down the absolute path it resolved from its own executable location. Without this the
 /// desk would probe relative to the user's shell CWD and quietly find no <data>/.desktop_key.
+// ---- FRAME LOG (NL_DESK_FRAMELOG=1): what each frame of the UI thread actually cost -------------------------------
+// The watchdog only speaks when a frame stalls past four seconds; a GUI that merely FEELS laggy never trips it. With
+// the variable set, every five seconds one line goes to veil-desk.log: how many frames were drawn, the renderer's
+// own work per frame (input + layout + draw, average and worst), the swap (EndDrawing: vsync, the target-FPS wait,
+// the driver), how long the UI thread waited for the Store lock in that window and its worst single wait, and a
+// count of frames whose work crossed 16 ms and 50 ms. Three numbers that separate "our drawing is slow" from "the
+// UI is waiting on a worker" from "the driver is holding the swap". Off, the cost is two clock reads a frame.
+const FRAMELOG_WINDOW_MS: i64 = 5000;
+var framelog_on: ?bool = null;
+var fl_window_start_ms: i64 = 0;
+var fl_frames: u32 = 0;
+var fl_work_us: u64 = 0;
+var fl_work_max_us: u64 = 0;
+var fl_swap_us: u64 = 0;
+var fl_swap_max_us: u64 = 0;
+var fl_over16: u32 = 0;
+var fl_over50: u32 = 0;
+
+fn frameLogEnabled() bool {
+    if (framelog_on) |on| return on;
+    const on = if (std.c.getenv("NL_DESK_FRAMELOG")) |p| blk: {
+        const v = std.mem.span(p);
+        break :blk v.len > 0 and v[0] != '0' and !std.ascii.eqlIgnoreCase(v, "off");
+    } else false;
+    framelog_on = on;
+    watchdog.phase_timing = on; // the per-phase maxima on each line come from the watchdog's own marks
+    if (on) log.info("framelog: on — one line per {d}s: frames, work avg/max, swap avg/max, UI lock wait total/max, frames over 16/50ms, then the worst time of each frame phase (pre = top of the loop before input)", .{@divTrunc(FRAMELOG_WINDOW_MS, 1000)});
+    return on;
+}
+
+/// Called once per drawn frame from the frame loop's defer: `t0` when our work began, `t1` just before the swap,
+/// `t2` after it (nap.nowUs).
+fn frameLogTick(t0: i64, t1: i64, t2: i64) void {
+    if (!frameLogEnabled()) return;
+    const work: u64 = @intCast(@max(0, t1 - t0));
+    const swap: u64 = @intCast(@max(0, t2 - t1));
+    fl_frames += 1;
+    fl_work_us += work;
+    fl_swap_us += swap;
+    if (work > fl_work_max_us) fl_work_max_us = work;
+    if (swap > fl_swap_max_us) fl_swap_max_us = swap;
+    if (work > 16_000) fl_over16 += 1;
+    if (work > 50_000) fl_over50 += 1;
+    const now = nap.nowMs();
+    if (fl_window_start_ms == 0) fl_window_start_ms = now;
+    if (now - fl_window_start_ms < FRAMELOG_WINDOW_MS) return;
+    const lock_us = store_mod.ui_lock_wait_us.swap(0, .monotonic);
+    const lock_max_us = store_mod.ui_lock_wait_max_us.swap(0, .monotonic);
+    const n: u64 = @max(1, fl_frames);
+    log.info("framelog: {d} frames/{d}s | work avg {d}.{d}ms max {d}ms | swap avg {d}.{d}ms max {d}ms | ui lock wait {d}ms (max {d}ms) | over16 {d} over50 {d} | tab {s}", .{
+        fl_frames,                     @divTrunc(now - fl_window_start_ms, 1000),
+        fl_work_us / n / 1000,         (fl_work_us / n % 1000) / 100,
+        fl_work_max_us / 1000,         fl_swap_us / n / 1000,
+        (fl_swap_us / n % 1000) / 100, fl_swap_max_us / 1000,
+        lock_us / 1000,                lock_max_us / 1000,
+        fl_over16,                     fl_over50,
+        @tagName(ui.tab),
+    });
+    // The worst single run of each phase in the window (watchdog marks): which part of a frame a stutter lives in.
+    const P = watchdog.Phase;
+    const mx = &watchdog.phase_max_us;
+    log.info("framelog:   phase max ms | pre {d} | input {d} | chrome {d} | tab {d} | swap {d}", .{
+        mx[@intFromEnum(P.idle_start)] / 1000,  mx[@intFromEnum(P.input)] / 1000,
+        mx[@intFromEnum(P.draw_chrome)] / 1000, mx[@intFromEnum(P.draw_tab)] / 1000,
+        mx[@intFromEnum(P.gl_swap)] / 1000,
+    });
+    watchdog.phaseClear();
+    fl_window_start_ms = now;
+    fl_frames = 0;
+    fl_work_us = 0;
+    fl_work_max_us = 0;
+    fl_swap_us = 0;
+    fl_swap_max_us = 0;
+    fl_over16 = 0;
+    fl_over50 = 0;
+}
+
+// ---- PRESENTING WHILE UNFOCUSED -----------------------------------------------------------------------------------
+// After the user switched away (Alt+Tab, a click on another app, another app maximized on top), this window kept
+// presenting 6 to 30 frames a second. When nothing will show those frames — the window covered, cloaked on another
+// virtual desktop, the display asleep — the GPU driver's swap can hold the UI thread for seconds: data/desk-hang.log
+// carries 687 'GL endDrawing (driver)' stalls, the latest (2026-10-11 13:06) a 10.8 s freeze a minute after Gary
+// switched away, with the whole machine lagging while it lasted. Minimized and tray already skip drawing (the
+// branch above this one in runApp). Unfocused, a frame is now presented only when something is changing (a reply
+// streaming, the mouse over the window, the two frames after focus left, the first frames after launch), at most
+// every UNFOCUSED_ACTIVE_GAP_S, while at least part of the window is uncovered and the machine has had input in the
+// last UNFOCUSED_SYSTEM_IDLE_MS (a long-idle machine is one whose display may be asleep).
+const UNFOCUSED_NAP_MS: u64 = 50;
+const UNFOCUSED_ACTIVE_GAP_S: f64 = 0.1;
+const UNFOCUSED_SYSTEM_IDLE_MS: u64 = 60_000;
+
+/// Present this unfocused frame? Pure, so the policy is tested without a window.
+pub fn unfocusedPresent(now_s: f64, last_present_s: f64, active: bool, covered: bool, system_idle_ms: u64) bool {
+    if (!active or covered) return false;
+    if (system_idle_ms >= UNFOCUSED_SYSTEM_IDLE_MS) return false;
+    return now_s - last_present_s >= UNFOCUSED_ACTIVE_GAP_S;
+}
+
+const win_present = if (builtin.os.tag == .windows) struct {
+    const POINT = extern struct { x: i32, y: i32 };
+    const RECT = extern struct { left: i32, top: i32, right: i32, bottom: i32 };
+    const LASTINPUTINFO = extern struct { cbSize: u32, dwTime: u32 };
+    const GA_ROOT: u32 = 2;
+    extern "user32" fn WindowFromPoint(p: POINT) callconv(.winapi) ?*anyopaque;
+    extern "user32" fn GetAncestor(hwnd: *anyopaque, flags: u32) callconv(.winapi) ?*anyopaque;
+    extern "user32" fn GetWindowRect(hwnd: *anyopaque, r: *RECT) callconv(.winapi) i32;
+    extern "user32" fn GetLastInputInfo(plii: *LASTINPUTINFO) callconv(.winapi) i32;
+    extern "kernel32" fn GetTickCount() callconv(.winapi) u32;
+} else struct {};
+
+/// True when none of five sample points of the window (its centre and four inset corners) has this window on top:
+/// another window covers it, it sits on another virtual desktop (DWM cloaks it; another window answers there), or it
+/// is off-screen. Windows only; elsewhere the window counts as visible and the other gates decide.
+fn windowCovered() bool {
+    if (builtin.os.tag != .windows) return false;
+    const hwnd = rl.getWindowHandle();
+    var r: win_present.RECT = undefined;
+    if (win_present.GetWindowRect(hwnd, &r) == 0) return false;
+    const w = r.right - r.left;
+    const h = r.bottom - r.top;
+    if (w < 8 or h < 8) return true;
+    const ix = @divTrunc(w, 8);
+    const iy = @divTrunc(h, 8);
+    const pts = [_]win_present.POINT{
+        .{ .x = r.left + @divTrunc(w, 2), .y = r.top + @divTrunc(h, 2) },
+        .{ .x = r.left + ix, .y = r.top + iy },
+        .{ .x = r.right - ix, .y = r.top + iy },
+        .{ .x = r.left + ix, .y = r.bottom - iy },
+        .{ .x = r.right - ix, .y = r.bottom - iy },
+    };
+    for (pts) |p| {
+        const at = win_present.WindowFromPoint(p) orelse continue;
+        if (at == hwnd) return false;
+        if (win_present.GetAncestor(at, win_present.GA_ROOT)) |root| if (root == hwnd) return false;
+    }
+    return true;
+}
+
+/// Milliseconds since the last keyboard or mouse input anywhere on the machine (GetLastInputInfo). 0 off Windows.
+fn systemIdleMs() u64 {
+    if (builtin.os.tag != .windows) return 0;
+    var li: win_present.LASTINPUTINFO = .{ .cbSize = @sizeOf(win_present.LASTINPUTINFO), .dwTime = 0 };
+    if (win_present.GetLastInputInfo(&li) == 0) return 0;
+    return win_present.GetTickCount() -% li.dwTime;
+}
+
+test "unfocused frames present only when something changes, the window is uncovered, the machine not idle, at most every 100 ms" {
+    try std.testing.expect(!unfocusedPresent(10.0, 0.0, false, false, 0)); // nothing changing: never
+    try std.testing.expect(unfocusedPresent(10.0, 0.0, true, false, 0)); // changing and visible
+    try std.testing.expect(!unfocusedPresent(10.0, 0.0, true, true, 0)); // covered / other desktop: never
+    try std.testing.expect(!unfocusedPresent(10.0, 0.0, true, false, 60_000)); // a minute without input: display may sleep
+    try std.testing.expect(unfocusedPresent(10.0, 0.0, true, false, 59_999));
+    try std.testing.expect(!unfocusedPresent(10.05, 10.0, true, false, 0)); // throttled
+    try std.testing.expect(unfocusedPresent(10.2, 10.0, true, false, 0));
+}
+
+/// FRAME LOG DETAIL: one message's layout (measure or draw) that takes longer than this names itself in the log,
+/// so a hitch in the "tab" phase points at the message and the call site instead of at the whole chat tab.
+const SLOW_LAYOUT_US: i64 = 25_000;
+
+/// renderMsg, timed when the frame log is on. Identical result; the only addition is one log line for a slow call:
+/// the site, the role, and the text's size, line count and longest line (the shape a layout cost depends on).
+fn layoutTimed(site: []const u8, view: t.Rect, y0: f32, role: store_mod.ChatRole, text: []const u8, fsz: i32, draw: bool, cursor: bool, img: []const u8) f32 {
+    if (!frameLogEnabled()) return renderMsg(view, y0, role, text, fsz, draw, cursor, img);
+    const lt0 = nap.nowUs();
+    const r = renderMsg(view, y0, role, text, fsz, draw, cursor, img);
+    const us = nap.nowUs() - lt0;
+    if (us >= SLOW_LAYOUT_US) {
+        var lines: usize = 1;
+        var longest: usize = 0;
+        var cur: usize = 0;
+        for (text) |c| {
+            if (c == '\n') {
+                lines += 1;
+                longest = @max(longest, cur);
+                cur = 0;
+            } else cur += 1;
+        }
+        longest = @max(longest, cur);
+        log.info("framelog:   slow layout {d}ms at {s}: role {s}, {d} chars, {d} lines, longest line {d}, image {}", .{ @divTrunc(us, 1000), site, @tagName(role), text.len, lines, longest, img.len > 0 });
+    }
+    return r;
+}
+
+extern "kernel32" fn GetSystemTimeAsFileTime(ft: *u64) callconv(.winapi) void;
+
+/// Unix seconds from the OS clock with no Io (a server thread calls this). Off Windows the GUI build links libc
+/// (raylib needs it), so POSIX asks clock_gettime(CLOCK_REALTIME); a libc-free build reports nothing and the poller stamps the clock.
+fn wallClockS() ?i64 {
+    if (builtin.os.tag == .windows) {
+        var ft: u64 = 0;
+        GetSystemTimeAsFileTime(&ft);
+        return @as(i64, @intCast(ft / 10_000_000)) - 11_644_473_600;
+    }
+    if (!builtin.link_libc) return null;
+    var ts: std.c.timespec = undefined;
+    if (std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts) != 0) return null;
+    return @intCast(ts.sec);
+}
+
+/// The server's std.log lines in app mode (src/main.zig appLog), into the ring veil-desk.log is flushed from.
+/// `level` is std.log.Level's integer: 0 err, 1 warn, 2 info, 3 debug.
+/// A ring line holds 220 bytes (log.Line), so a longer server line is split into continuation lines ("  ..."),
+/// at most eight, written under one lock hold (log.emitLines) so another thread's line cannot land between them.
+/// A cut never splits a UTF-8 sequence, and a newline inside a line (httpz's "unhandled exception" warning carries
+/// one) becomes a space, so veil-desk.log keeps one entry per line.
+pub fn serverLog(level: u8, line: []const u8) void {
+    if (!log.clockIsSet()) if (wallClockS()) |now| log.setClock(now); // boot lines come before the poller's first stamp
+    var store: [8][220]u8 = undefined;
+    var parts: [8][]const u8 = undefined;
+    var n: usize = 0;
+    var rest = line;
+    while (rest.len > 0 and n < parts.len) : (n += 1) {
+        const lead: []const u8 = if (n == 0) "" else "  ...";
+        var take = @min(rest.len, 200);
+        if (take < rest.len) {
+            while (take > 0 and (rest[take] & 0xC0) == 0x80) take -= 1; // back off to a code point boundary
+            if (take == 0) take = @min(rest.len, 200);
+        }
+        const out = store[n][0 .. lead.len + take];
+        @memcpy(out[0..lead.len], lead);
+        @memcpy(out[lead.len..], rest[0..take]);
+        for (out) |*c| {
+            if (c.* == '\n' or c.* == '\r') c.* = ' ';
+        }
+        parts[n] = out;
+        rest = rest[take..];
+    }
+    log.emitLines(switch (level) {
+        0 => .err,
+        1 => .warn,
+        else => .info,
+    }, parts[0..n]);
+}
+
 pub fn runApp(data_dir: ?[]const u8) !void {
+    store_mod.is_ui_thread = true; // this thread renders; Store.lock() times its waits for the frame log
     const gpa = std.heap.c_allocator;
 
     // carry the real process environ so spawned children (curl, explorer) get a working environment.
@@ -494,7 +737,7 @@ pub fn runApp(data_dir: ?[]const u8) !void {
     // timeout race then blocks its calling thread for request+timeout, and a saturated pool froze the window
     // (poller probes inline on whoever calls them). Losing race timers hold slots ~5-8s each on Windows, so
     // the default saturates under ordinary polling; a high ceiling only spawns threads when actually needed.
-    var threaded = std.Io.Threaded.init(gpa, .{ .environ = llm.osEnviron(), .async_limit = .limited(256) });
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = llm.osEnviron(), .async_limit = .limited(256), .stack_size = vthread.io_stack_size });
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -505,7 +748,7 @@ pub fn runApp(data_dir: ?[]const u8) !void {
     ui.d_name.len = seedName(&ui.d_name.buf);
 
     var poller = poller_mod.Poller{ .io = io, .gpa = gpa, .store = &store };
-    const th = try std.Thread.spawn(.{}, poller_mod.Poller.run, .{&poller});
+    const th = try vthread.spawn("desk-poller", poller_mod.Poller.run, .{&poller});
     defer {
         poller.stop.store(true, .monotonic);
         th.join();
@@ -513,10 +756,10 @@ pub fn runApp(data_dir: ?[]const u8) !void {
 
     // The chat worker is the third thread (model turns + swarm casting); it owns its own Io instance so
     // the poller's cadence and the chat's long-running streams never contend.
-    var chat_threaded = std.Io.Threaded.init(gpa, .{ .environ = llm.osEnviron(), .async_limit = .limited(256) });
+    var chat_threaded = std.Io.Threaded.init(gpa, .{ .environ = llm.osEnviron(), .async_limit = .limited(256), .stack_size = vthread.io_stack_size });
     defer chat_threaded.deinit();
     var chat_worker = chat_mod.Chat{ .io = chat_threaded.io(), .gpa = gpa, .store = &store };
-    const cth = try std.Thread.spawn(.{}, chat_mod.Chat.run, .{&chat_worker});
+    const cth = try vthread.spawn("desk-chat", chat_mod.Chat.run, .{&chat_worker});
     defer {
         chat_worker.stop.store(true, .monotonic);
         cth.join();
@@ -696,6 +939,8 @@ pub fn runApp(data_dir: ?[]const u8) !void {
             if (mouse_active or ui.input_active or busy0) ui.tot_frames = 40; // ~0.66s of 60fps after any activity
             ui.input_active = false; // handleKeys/editField below re-arm it for the next frame
             const focused = rl.isWindowFocused();
+            if (ui.was_focused and !focused) ui.unfocused_settle = 2; // two frames to drop hover and caret, then quiet
+            ui.was_focused = focused;
             // idle floors: 30 focused / 6 unfocused. Input is still polled EVERY frame, so the first wake
             // costs at most one idle frame (~33ms) before tot_frames restores 60fps, and the
             // focused-idle redraw was the last steady CPU line item after the poller/log churn fixes.
@@ -712,7 +957,10 @@ pub fn runApp(data_dir: ?[]const u8) !void {
             const tab_k = rl.isKeyPressed(.tab);
             const kshift = rl.isKeyDown(.left_shift) or rl.isKeyDown(.right_shift);
             const no_field = ui.focus == .none;
-            t.kbFrame(tab_k and !kshift, tab_k and kshift, no_field and (rl.isKeyPressed(.enter) or rl.isKeyPressed(.kp_enter) or rl.isKeyPressed(.space)));
+            // Text fields are IN the order (textField/textArea register through t.kbField): Tab from a field moves
+            // to the next control, so the field lets go here and whatever Tab reached takes over as it draws.
+            if (t.kbFrame(tab_k and !kshift, tab_k and kshift, no_field and (rl.isKeyPressed(.enter) or rl.isKeyPressed(.kp_enter) or rl.isKeyPressed(.space)), !no_field))
+                ui.focus = .none;
             if (rl.isMouseButtonPressed(.left) or rl.isKeyPressed(.escape)) t.kbCancel();
             if (tab_k) ui.input_active = true; // keep 60fps while walking the ring
             var ab: [160]u8 = undefined;
@@ -903,9 +1151,29 @@ pub fn runApp(data_dir: ?[]const u8) !void {
         if (ui.hidden or rl.isWindowMinimized()) {
             rl.pollInputEvents();
             watchdog.frameDone();
+            watchdog.phaseReset(); // the frame log's phase timing must not charge this nap to any phase
             nap.ms(HIDDEN_SLEEP_MS); // NOT io.sleep: the UI thread must never park on the runtime (nap.zig)
             continue;
         }
+        // UNFOCUSED: the user switched away. Present only what can matter to someone who can see it (unfocusedPresent
+        // says why); every other loop pumps messages and naps like the tray path, so input and the close button still
+        // work and focus coming back redraws within one nap.
+        if (!rl.isWindowFocused()) {
+            const active = busy0 or ui.tot_frames > 0 or ui.unfocused_settle > 0 or ui.frames_presented < 60;
+            const now_s = rl.getTime();
+            // the OS questions (window coverage, machine idle) are asked only when the cheap gates already said yes
+            const may = active and now_s - ui.unfocused_last_s >= UNFOCUSED_ACTIVE_GAP_S;
+            if (!may or !unfocusedPresent(now_s, ui.unfocused_last_s, active, windowCovered(), systemIdleMs())) {
+                rl.pollInputEvents();
+                watchdog.frameDone();
+                watchdog.phaseReset();
+                nap.ms(UNFOCUSED_NAP_MS);
+                continue;
+            }
+            ui.unfocused_last_s = now_s;
+            if (ui.unfocused_settle > 0) ui.unfocused_settle -= 1;
+        }
+        const fl_t0 = nap.nowUs(); // frame log: our work starts here, the swap is measured in the defer below
         watchdog.mark(.input);
         handleWindowChrome();
         handleKeys(&store);
@@ -929,14 +1197,18 @@ pub fn runApp(data_dir: ?[]const u8) !void {
         // is load-bearing: there is a confirmed nvoglv64.dll fault today and a hybrid AMD + NVIDIA setup.
         defer {
             watchdog.mark(.gl_swap);
+            const fl_t1 = nap.nowUs();
             rl.endDrawing();
             watchdog.frameDone();
+            ui.frames_presented +|= 1;
+            frameLogTick(fl_t0, fl_t1, nap.nowUs());
         }
         rl.clearBackground(t.bg);
 
         watchdog.mark(.draw_chrome);
         drawTitlebar(&store);
         drawTabbar(&store);
+        t.kbChromeEnd(); // keyboard order: everything above is chrome — a tab switch keeps a ring there (setTab)
         watchdog.mark(.draw_tab);
         const top = TITLE_H + TAB_H;
         const body = t.Rect{ .x = 0, .y = top, .width = @floatFromInt(rl.getScreenWidth()), .height = @floatFromInt(rl.getScreenHeight() - top) };
@@ -1701,6 +1973,7 @@ fn pumpTray(store: *Store, tray: *tray_mod.Tray, gpa: std.mem.Allocator) void {
 fn setTab(tabv: Tab) void {
     ui.tab = tabv;
     ui.open_dd = .none;
+    t.kbTabSwitched(); // a focus ring in the old tab's body must not land on the new tab's control at that index
     ui.focus = if (tabv == .chat) .c_input else .none;
     if (tabv == .chat) while (rl.getCharPressed() > 0) {}; // drain the trigger digit; don't type it into the field
 }
@@ -1988,7 +2261,7 @@ fn drawDashboard(store: *Store, body: t.Rect) void {
 
     // right column: CLIENT panel, then the per-model table, then the 14-day bars filling the rest
     const rx = x + left_w + t.PAD;
-    const client_h: f32 = 172; // one row taller since the cloudflare line joined the census
+    const client_h: f32 = 194; // one row for the cloudflare line, one for the sentry's
     drawClientPanel(store, .{ .x = rx, .y = y, .width = right_w, .height = client_h });
     const bars_h: f32 = 118;
     const table_r = t.Rect{ .x = rx, .y = y + client_h + t.GAP, .width = right_w, .height = @max(90, bottom - y - client_h - bars_h - 2 * t.GAP) };
@@ -2082,6 +2355,14 @@ fn drawClientPanel(store: *Store, r: t.Rect) void {
     var cf_configured = false;
     var cf_name: [96]u8 = undefined;
     var cf_name_n: usize = 0;
+    var sen_seen = false;
+    var sen_on = false;
+    var sen_enforce = false;
+    var sen_exposed: u32 = 0;
+    var sen_open: u32 = 0;
+    var sen_high: u32 = 0;
+    var sen_fw: [12]u8 = undefined;
+    var sen_fw_n: usize = 0;
     {
         store.lock();
         defer store.unlock();
@@ -2097,6 +2378,14 @@ fn drawClientPanel(store: *Store, r: t.Rect) void {
             cf_name_n = @min(store.cf_oauth_account_len, cf_name.len);
             @memcpy(cf_name[0..cf_name_n], store.cf_oauth_account[0..cf_name_n]);
         }
+        sen_seen = store.sentry_seen;
+        sen_on = store.sentry_on;
+        sen_enforce = store.sentry_enforce;
+        sen_exposed = store.sentry_exposed;
+        sen_open = store.sentry_open;
+        sen_high = store.sentry_high;
+        sen_fw_n = @min(store.sentry_fw_len, sen_fw.len);
+        @memcpy(sen_fw[0..sen_fw_n], store.sentry_fw[0..sen_fw_n]);
     }
     const up: u64 = @intFromFloat(@max(0, rl.getTime()));
     // core count can't change mid-session — one syscall ever, not one per frame
@@ -2125,8 +2414,19 @@ fn drawClientPanel(store: *Store, r: t.Rect) void {
     // dashboard says nothing about a button that does not exist.
     if (cf_connected) {
         clientRow(r, yy, "cloudflare", if (cf_name_n > 0) cf_name[0..cf_name_n] else "connected");
+        yy += lh;
     } else if (cf_configured) {
         clientRow(r, yy, "cloudflare", "not connected (Settings)");
+        yy += lh;
+    }
+    // The sentry, as a client fact: what it sees of this machine, or that it is off. Only once the server has
+    // answered (an admin's session); a non-admin desk says nothing about a line it cannot read.
+    if (sen_seen) {
+        if (sen_on) {
+            clientRow(r, yy, "sentry", t.z("{s}: firewall {s}, {d} port(s) on the network, {d} finding(s) open{s}", .{ if (sen_enforce) "enforcing" else "observing", sen_fw[0..sen_fw_n], sen_exposed, sen_open, if (sen_high > 0) " (HIGH)" else "" }));
+        } else {
+            clientRow(r, yy, "sentry", "off (Settings)");
+        }
     }
 }
 
@@ -3300,6 +3600,58 @@ fn drawGarrettRows(store: *Store, x: f32, y0: f32, colw: f32) f32 {
         y = helpPara(g.errStr(), x, y, colw) + t.GAP;
     }
     return y;
+}
+
+/// THE SENTRY — this machine's own firewall and blue-team watch (server: worker/sentry.zig), under the server
+/// rows in Settings: the switch, the posture, auto-block, one status line, and the last refusal. Every click is
+/// one POST /api/v1/sentry/set through the poller (sentry_set); the rows read the poller's snapshot, so a box
+/// moves when the server answers, not when it is clicked.
+fn drawSentryRows(store: *Store, x: f32, y0: f32, colw: f32) f32 {
+    var y = y0;
+    const Snap = struct { seen: bool, on: bool, enforce: bool, auto: bool, busy: bool, ok: bool, fw: [12]u8, fw_len: usize, listeners: u32, exposed: u32, rules: u32, open: u32, high: u32, err: [200]u8, err_len: usize };
+    var s: Snap = undefined;
+    {
+        store.lock();
+        defer store.unlock();
+        s = .{ .seen = store.sentry_seen, .on = store.sentry_on, .enforce = store.sentry_enforce, .auto = store.sentry_auto, .busy = store.sentry_busy, .ok = store.sentry_enforce_ok, .fw = store.sentry_fw, .fw_len = @min(store.sentry_fw_len, 12), .listeners = store.sentry_listeners, .exposed = store.sentry_exposed, .rules = store.sentry_rules, .open = store.sentry_open, .high = store.sentry_high, .err = store.sentry_err, .err_len = @min(store.sentry_err_len, 200) };
+    }
+    flabel(x, y, "THE SENTRY - this machine's own firewall and watch");
+    y += 20;
+    if (!s.seen) {
+        y = helpPara("Not available: the sentry answers the server's admin only (log in as the admin, or this server was built without one).", x, y, colw) + 12;
+        return y;
+    }
+    const rh: f32 = 30;
+    const third = @max(1, (colw - 2 * t.GAP) / 3);
+    const enabled = !s.busy;
+    if (t.checkboxEx(.{ .x = x, .y = y, .width = third, .height = rh }, t.z("Watch this machine", .{}), s.on, enabled, "Inventory every minute: open ports and their processes, startup and scheduled entries, the host firewall; findings when something changes.")) {
+        store.pushCmd(store_mod.mkCmd(.sentry_set, "", if (s.on) "{\"enabled\":false}" else "{\"enabled\":true}"));
+    }
+    if (t.checkboxEx(.{ .x = x + third + t.GAP, .y = y, .width = third, .height = rh }, t.z("Enforce rules", .{}), s.enforce, enabled and s.on, if (s.on) "Apply the block/allow policy to the host firewall (Windows Defender Firewall, nftables, pf). Needs an elevated veil on Windows, root elsewhere. Off = observe: nothing on the host changes." else "Turn the sentry on first.")) {
+        store.pushCmd(store_mod.mkCmd(.sentry_set, "", if (s.enforce) "{\"posture\":\"observe\"}" else "{\"posture\":\"enforce\"}"));
+    }
+    if (t.checkboxEx(.{ .x = x + 2 * (third + t.GAP), .y = y, .width = third, .height = rh }, t.z("Auto-block", .{}), s.auto, enabled and s.on and s.enforce, if (s.on and s.enforce) "Quarantine a new network-reachable listener on sight: an inbound block for its port, named so one click lifts it." else "Needs Enforce rules.")) {
+        store.pushCmd(store_mod.mkCmd(.sentry_set, "", if (s.auto) "{\"auto_block\":false}" else "{\"auto_block\":true}"));
+    }
+    y += rh + 6;
+    if (s.on) {
+        const line = t.z("host firewall {s} - {d} listening ({d} on network addresses) - {d} rule(s){s} - {d} finding(s) open, {d} high", .{ s.fw[0..s.fw_len], s.listeners, s.exposed, s.rules, if (s.enforce and !s.ok) " (enforce FAILED)" else "", s.open, s.high });
+        t.text(line, @intFromFloat(x), @intFromFloat(y), 12, if (s.high > 0 or (s.enforce and !s.ok)) t.red else if (s.open > 0) t.yellow else t.green);
+        y += 20;
+        const bh = @max(t.BTN_MD, t.textH(13) + 18);
+        const bl = t.z("Accept as baseline", .{});
+        const bw = t.btnW(bl, bh) + 12;
+        if (t.button(.{ .x = x, .y = y, .width = bw, .height = bh }, bl, t.blue, enabled)) store.pushCmd(store_mod.mkCmd(.sentry_set, "", "{\"baseline\":true}"));
+        const al = t.z("Mark findings reviewed", .{});
+        const aw = t.btnW(al, bh) + 12;
+        if (t.button(.{ .x = x + bw + t.GAP, .y = y, .width = aw, .height = bh }, al, t.blue, enabled and s.open > 0)) store.pushCmd(store_mod.mkCmd(.sentry_set, "", "{\"ack\":true}"));
+        y += bh + t.GAP;
+        y = helpPara("Ask the chat \"what is listening on this machine?\" or run `veil sentry` for the findings and the inventory.", x, y, colw) + 6;
+    } else {
+        y = helpPara("Off. On, it watches this machine and tells the chat what changed; the observe posture never touches the host firewall.", x, y, colw) + 6;
+    }
+    if (s.err_len > 0) y = helpPara(s.err[0..s.err_len], x, y, colw) + t.GAP;
+    return y + 8;
 }
 
 fn drawCfTunnelRows(store: *Store, x: f32, y0: f32, colw: f32) f32 {
@@ -5159,7 +5511,7 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
             ui.mh[i] = if ((m.role == .thought or toolName(m.textStr()) != null) and !open)
                 TOOL_CHIP_H // collapsed tool call / reasoning trace = a one-line chip
             else
-                renderMsg(view, 0, m.role, m.textStr(), fsz, false, false, m.imgStr());
+                layoutTimed("row re-measure", view, 0, m.role, m.textStr(), fsz, false, false, m.imgStr());
             ui.mh_mfp[i] = mfp;
         }
         ui.mh_count = msgs.len;
@@ -5174,7 +5526,7 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
     if (stream.len > 0) {
         // re-measure the live preview only when it actually grew (it only ever grows within a step)
         if (stream.len != ui.stream_h_len or layout_changed or std.hash.Wyhash.hash(0, stream) != ui.stream_h_fp) {
-            ui.stream_h = renderMsg(view, 0, .veil, stream, fsz, false, false, "");
+            ui.stream_h = layoutTimed("live stream re-measure", view, 0, .veil, stream, fsz, false, false, "");
             ui.stream_h_len = stream.len;
             ui.stream_h_cols = cols;
             ui.stream_h_fp = std.hash.Wyhash.hash(0, stream);
@@ -5230,7 +5582,7 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
             // live) and nothing but the user's own click on the header collapses it. Excluded from the model's
             // history, so leaving it open costs nothing but screen.
             if (rowOpen(m.uid)) {
-                _ = renderMsg(view, y0, m.role, m.textStr(), fsz, true, false, m.imgStr());
+                _ = layoutTimed("row draw", view, y0, m.role, m.textStr(), fsz, true, false, m.imgStr());
                 // copy chip: flush RIGHT and only while the row is hovered (a reasoning block has no token-cost
                 // label to its right, so a mid-row chip would read as floating).
                 if (t.hovering(t.Rect{ .x = view.x + 2, .y = y0, .width = view.width - 4, .height = yy - y0 }) and t.hovering(view)) {
@@ -5251,7 +5603,7 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
             // text is untouched in the message, so the model still receives it and copy still grabs it. Each
             // chip is independent — opening one no longer closes whatever else the user left open.
             if (rowOpen(m.uid)) {
-                _ = renderMsg(view, y0, m.role, m.textStr(), fsz, true, false, m.imgStr());
+                _ = layoutTimed("row draw", view, y0, m.role, m.textStr(), fsz, true, false, m.imgStr());
                 // the token cost lives in the expanded dropdown (top-right), not the collapsed line
                 t.text(t.z("~{d} tok", .{tokCostOf(m.textStr())}), @intFromFloat(view.x + view.width - 76), @intFromFloat(y0 + 6), 11, t.comment);
                 // expanded tool text is copyable like any other message
@@ -5272,7 +5624,7 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
         }
         cur_sel_msg = i; // capture THIS message's text-line geometry for selection
         cur_sel_char0 = 0;
-        _ = renderMsg(view, y0, m.role, m.textStr(), fsz, true, false, m.imgStr());
+        _ = layoutTimed("row draw", view, y0, m.role, m.textStr(), fsz, true, false, m.imgStr());
         // whole-message copy chip on hover (beside the role label)
         const mrect = t.Rect{ .x = view.x + 2, .y = y0, .width = view.width - 4, .height = yy - y0 };
         if (m.text_len > 0 and t.hovering(mrect) and t.hovering(view)) {
@@ -5289,7 +5641,7 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
             ui.live_len_prev = stream.len;
             ui.live_change_t = rl.getTime();
         }
-        yy = renderMsg(view, yy, .veil, stream, fsz, true, true, "");
+        yy = layoutTimed("live stream draw", view, yy, .veil, stream, fsz, true, true, "");
     }
     if (cast_live) yy = renderCastLive(view, yy, status, true);
     if (msgs.len == 0 and !busy and stream.len == 0) {
@@ -9537,6 +9889,7 @@ fn drawSettings(store: *Store, frame: t.Rect) void {
         y += 42; // clear the 34px field + gap
         if (tok_n > 0) t.text(t.z("connected - a token is set ({d} chars, auto-loaded from the server)", .{tok_n}), @intFromFloat(x), @intFromFloat(y), 12, t.green);
         y += 34;
+        y = drawSentryRows(store, x, y, colw);
     }
     if (ui.settings_page == 0) {
         // TEXT SIZE label (also feeds the shared chip width below). A global draw-time scale (90/100/112/125%);
@@ -10456,6 +10809,13 @@ fn textArea(r: t.Rect, f: *Ui.Field, focused: bool, placeholder: [:0]const u8, w
     t.panelBordered(r, t.bg, if (focused) t.blue else t.border);
     if (t.hovering(r) and ui.open_dd == .none) t.wantCursor(.ibeam);
     f.clampCur();
+    // keyboard order: Tab reaching this field hands it the keyboard, caret at the end (theme.kbField). Before the
+    // empty-placeholder return below, so an empty field is in the order too.
+    if (t.kbField(r, placeholder, focused)) {
+        ui.focus = which;
+        f.cur = f.len;
+        f.sel = null;
+    }
     const inner_x: i32 = @intFromFloat(r.x + 10);
     const line_h: f32 = 18;
     // Text starts below any reserved top strip (top_pad) — e.g. the composer's image-attachment chip — so a
@@ -10546,6 +10906,12 @@ fn textField(r: t.Rect, f: *Ui.Field, focused: bool, placeholder: [:0]const u8, 
     t.panelBordered(r, t.bg, if (focused) t.blue else t.border);
     if (t.hovering(r) and ui.open_dd == .none) t.wantCursor(.ibeam);
     f.clampCur();
+    // keyboard order: Tab reaching this field hands it the keyboard, caret at the end (theme.kbField)
+    if (t.kbField(r, placeholder, focused)) {
+        ui.focus = which;
+        f.cur = f.len;
+        f.sel = null;
+    }
     const inner_x: i32 = @intFromFloat(r.x + 10);
     const inner_y: i32 = @intFromFloat(r.y + (r.height - t.textH(13)) / 2);
     // Don't grab focus while a dropdown is open: its option list is drawn OVER the fields below it, so a click

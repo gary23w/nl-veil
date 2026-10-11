@@ -32,6 +32,7 @@
 //! into the bucket. Task definitions can join the backup only via a redacted re-encode.
 
 const std = @import("std");
+const vthread = @import("../threads.zig"); // every thread: small Windows stack commit + a name (see threads.zig)
 const httpz = @import("httpz");
 const http = @import("../gateway/http.zig");
 const cf_oauth = @import("cf_oauth.zig");
@@ -188,7 +189,7 @@ fn syncThread(ctx: *Ctx) void {
 pub fn kickSync(app: *App, uid: u64) void {
     const ctx = app.gpa.create(Ctx) catch return;
     ctx.* = .{ .app = app, .uid = uid };
-    if (std.Thread.spawn(.{}, syncThread, .{ctx})) |t| t.detach() else |_| app.gpa.destroy(ctx);
+    if (vthread.spawn("r2-sync", syncThread, .{ctx})) |t| t.detach() else |_| app.gpa.destroy(ctx);
 }
 
 /// The throttled auto-backup heartbeat: called from every connected status poll; runs a real pass at

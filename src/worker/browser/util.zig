@@ -1,6 +1,7 @@
 //! Small shared helpers for the browser layer.
 
 const std = @import("std");
+const vthread = @import("../../threads.zig"); // every thread: small Windows stack commit + a name (see threads.zig)
 const builtin = @import("builtin");
 
 extern "kernel32" fn Sleep(dwMilliseconds: u32) callconv(.winapi) void;
@@ -91,7 +92,7 @@ test "sleepMs waits on a RAW thread — the whole reason this helper exists" {
     // in scope, exactly like the callers in host.zig / launch.zig / session.zig. Timed from the parent so the
     // raw thread stays raw.
     const t0 = nowMs(io);
-    const th = try std.Thread.spawn(.{}, struct {
+    const th = try vthread.spawn("test-util", struct {
         fn go() void {
             sleepMs(60);
         }
@@ -128,7 +129,7 @@ test "sleepMs: a thread alert left pending neither ends the wait nor is taken by
         }
     };
     var p: Probe = .{};
-    const th = try std.Thread.spawn(.{}, Probe.go, .{ &p, io });
+    const th = try vthread.spawn("test-probe", Probe.go, .{ &p, io });
     th.join();
 
     try std.testing.expect(p.drained == .ALERTED);

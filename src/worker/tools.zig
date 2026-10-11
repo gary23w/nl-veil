@@ -2,6 +2,7 @@
 //! and remember. The model is given SCHEMA as the `tools` array; execute() runs a parsed tool_call and
 //! returns a text result to feed back into the conversation.
 const std = @import("std");
+const vthread = @import("../threads.zig"); // every thread: small Windows stack commit + a name (see threads.zig)
 const builtin = @import("builtin");
 const oscillation = @import("oscillation.zig");
 const Mem = oscillation.Mem;
@@ -24,6 +25,7 @@ const recipes = @import("recipes.zig"); // recipe tools: DATA sequences over alr
 const dataset = @import("dataset.zig"); // training-set capture — the tool-execution half of a set
 const cftools = @import("cftools.zig"); // the cf_ family: a connected Cloudflare account's own tool belt
 const garrett = @import("garrett.zig"); // Agent Garrett's belt: the user's own blue-team agent over MCP (garrett, garrett_tools)
+const sentry = @import("sentry.zig"); // the sentry: this machine's own firewall and blue-team watch (sentry_*)
 const cpaths = @import("chat/paths.zig"); // sub-chat family base for recall (chat:<parent>__sN → chat:<parent>)
 
 /// Injected into an authored tool's Python body ONLY when NL_BROWSER_DRIVER is enabled: a `browser(action,
@@ -94,7 +96,7 @@ fn spawnGuarded(io: std.Io, argv: []const []const u8, deadline_ms: u32) ?anyerro
     var child = std.process.spawn(io, .{ .argv = argv, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore, .create_no_window = true }) catch |e| return e;
     var done = std.atomic.Value(bool).init(false);
     const th: ?std.Thread = if (child.id != null)
-        (std.Thread.spawn(.{}, KillGuard.watch, .{KillGuard{ .id = child.id.?, .deadline_ms = deadline_ms, .done = &done }}) catch null)
+        (vthread.spawn("tool-killguard", KillGuard.watch, .{KillGuard{ .id = child.id.?, .deadline_ms = deadline_ms, .done = &done }}) catch null)
     else
         null;
     _ = child.wait(io) catch {};
@@ -570,6 +572,11 @@ pub const ToolCtx = struct {
     garrett_url: []const u8 = "",
     garrett_token: []const u8 = "",
     garrett_schema: []const u8 = "",
+    // THE SENTRY (sentry_*): the firewall and blue-team watch of the machine this process runs on. Set ONLY by
+    // the chat engine from app.sentry — the server IS the user's machine in a desktop install — and null
+    // everywhere else, so a swarm mind, the CLI executor or a tot structurally cannot read or change the host.
+    // The sandbox gate never admits the family, so a non-admin turn is refused before this is consulted.
+    sentry: ?*sentry.Sentry = null,
     // Recipe recursion depth. A recipe step may not name another recipe (refused at run time, I5), so this is
     // 0 or 1 in practice; it is a belt-and-braces backstop against any future path that could re-enter
     // runRecipe, guaranteeing one level only regardless of how the step was reached.
@@ -1644,6 +1651,9 @@ fn executeInner(ctx: *ToolCtx, name: []const u8, args_json: []const u8) []u8 {
     // AGENT GARRETT (garrett_tools, garrett): the user's own blue-team agent over MCP. Runs in the process that
     // holds the pair (ctx.garrett_url/token — the server for a chat turn, the worker itself for a mind); blank
     // means the belt was never advertised, and the verb says how to get it instead of pretending.
+    // THE SENTRY (sentry_*): this machine's own firewall and watch (sentry.zig). Null ctx.sentry is the refusal:
+    // only the chat engine on the server's own machine sets it, and only past the sandbox gate above.
+    if (sentry.isTool(name)) return sentry.run(ctx.sentry, gpa, name, args_json);
     if (garrett.isTool(name)) {
         if (!ctx.internet) return dupe(gpa, "web disabled: this is an OFFLINE run, and Agent Garrett answers over the internet. Answer from the hive's preloaded memory.");
         return garrett.run(.{ .gpa = gpa, .io = ctx.io, .scratch = ctx.run_dir, .url = ctx.garrett_url, .token = ctx.garrett_token }, name, args_json);
@@ -2464,7 +2474,7 @@ pub fn isBuiltinTool(n: []const u8) bool {
     for (builtins) |b| if (std.mem.eql(u8, b, n)) return true;
     // PREFIX families: execute() routes these with startsWith, so every suffix is reserved, not just the
     // verbs that happen to exist today.
-    const families = [_][]const u8{ "browser_", "pixel_", "mcp_", "cf_", "security_" };
+    const families = [_][]const u8{ "browser_", "pixel_", "mcp_", "cf_", "security_", "sentry_" };
     for (families) |f| if (std.mem.startsWith(u8, n, f)) return true;
     return false;
 }

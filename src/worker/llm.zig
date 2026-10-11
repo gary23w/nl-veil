@@ -7,6 +7,7 @@
 //! Two entry points: chat() for a one-shot system+user completion, and complete() for the agentic tool loop
 //! (a pre-built messages array + a tools array → content OR parsed tool_calls).
 const std = @import("std");
+const vthread = @import("../threads.zig"); // every thread: small Windows stack commit + a name (see threads.zig)
 const builtin = @import("builtin");
 const httpc = @import("httpc.zig");
 const net = @import("net.zig"); // cached "is there internet?" — consulted ONLY on the hosted path
@@ -5298,7 +5299,7 @@ test "handing curl its key never waits on curl: the longest config a call sends 
     };
     Watchdog.done.store(false, .release);
     Watchdog.fired.store(false, .release);
-    const dog = try std.Thread.spawn(.{}, Watchdog.run, .{child.id.?});
+    const dog = try vthread.spawn("llm-watchdog", Watchdog.run, .{child.id.?});
     const cfg = try gpa.alloc(u8, KEY_CFG_MAX);
     defer gpa.free(cfg);
     @memset(cfg, 'k');
@@ -5557,7 +5558,7 @@ test "calls running at once under one dir and tag each send their own request bo
     for (&threads, 0..) |*t, i| {
         // 127.1 is 127.0.0.1 to curl but not to httpc.parseLoopbackUrl, so each call takes the curl path
         const url = try std.fmt.bufPrint(&ubufs[i], "http://127.1:{d}/v1/chat/completions", .{srvs[i].port});
-        t.* = try std.Thread.spawn(.{}, Call.run, .{ gpa, io, url, bodies[i], &replies[i] });
+        t.* = try vthread.spawn("test-llm-call", Call.run, .{ gpa, io, url, bodies[i], &replies[i] });
         spawned += 1;
     }
     for (threads[0..spawned]) |t| t.join();
@@ -5694,7 +5695,7 @@ test "streamed calls running at once under one dir and tag each send their own b
     for (&threads, 0..) |*t, i| {
         // plain 127.0.0.1: the streamed path has no in-process fast path, so this is its curl child and scratch
         const base = try std.fmt.bufPrint(&ubufs[i], "http://127.0.0.1:{d}/v1", .{srvs[i].port});
-        t.* = try std.Thread.spawn(.{}, Call.run, .{ gpa, io, base, msgs[i], &steps[i] });
+        t.* = try vthread.spawn("test-llm-call", Call.run, .{ gpa, io, base, msgs[i], &steps[i] });
         spawned += 1;
     }
     for (threads[0..spawned]) |t| t.join();

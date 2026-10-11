@@ -279,7 +279,7 @@ const test_peer = if (builtin.os.tag == .windows) struct {
 test "roundTrip: a whole exchange through the bounded connect - send, then read to the peer's close" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
     const l = try test_peer.listenLoopback();
-    const peer = try std.Thread.spawn(.{}, test_peer.serve, .{ l.s, test_peer.Script.answer_and_close });
+    const peer = try std.Thread.spawn(.{ .stack_size = 1 << 20 }, test_peer.serve, .{ l.s, test_peer.Script.answer_and_close });
     defer peer.join();
     const req = "GET /x HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
     switch (roundTrip(std.testing.allocator, .{ 127, 0, 0, 1 }, l.port, req, 5, 1 << 20)) {
@@ -297,7 +297,7 @@ test "roundTrip: a whole exchange through the bounded connect - send, then read 
 test "roundTrip: timeout_s bounds the whole trip - a reply that stalls after its first byte ends on the deadline" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
     const l = try test_peer.listenLoopback();
-    const peer = try std.Thread.spawn(.{}, test_peer.serve, .{ l.s, test_peer.Script.stall_after_one_byte });
+    const peer = try std.Thread.spawn(.{ .stack_size = 1 << 20 }, test_peer.serve, .{ l.s, test_peer.Script.stall_after_one_byte });
     defer peer.join();
     const t0 = nowMs();
     const out = roundTrip(std.testing.allocator, .{ 127, 0, 0, 1 }, l.port, "GET / HTTP/1.1\r\n\r\n", 2, 1 << 20);

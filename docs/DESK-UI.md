@@ -59,10 +59,23 @@ server for the roster, the events and the scratchpad only while it is on screen.
 
 Tab content uses consistent outer margins. Form labels and controls reserve scaled text height. Rounded panel borders stay inside clipping bounds, so past-run cards and Settings fields retain all four edges.
 
+## Keyboard
+
+**Tab** and **Shift+Tab** move through text fields, buttons, tabs and checkboxes in the order they appear.
+A text field reached this way takes the caret, so a form can be filled without the mouse: NAME, Tab,
+GOAL, Tab, and so on to its button. A button, tab or checkbox gets a double focus ring, and **Enter** or
+**Space** activates it only while no text field has the caret. **Escape** or any click drops the ring.
+Switching tabs keeps a ring that sits on the titlebar or tab bar and drops one inside the old tab, so
+it can never land on an unrelated control of the new tab. With no field focused, **1** to **8** switch
+tabs. With the narrator on, each move speaks the control's label and kind.
+
 ## Manual review
 
 - Open each settings page at normal and XL text sizes. Scroll with the wheel and
   keyboard; check that content cannot be clicked behind the navigation.
+- In the tater-tot deploy form, click NAME, type, and press Tab: the caret moves to
+  GOAL and the typing follows it. Shift+Tab returns. Tab past the last field rings
+  the next button; Enter fires it only once no field has the caret.
 - Change notifications and the connection token, restart, and verify persistence.
 - Select a starter, edit it, and send. Confirm preparation and server phase updates
   appear before the first response token and disappear after completion or Stop.
@@ -79,6 +92,24 @@ Tab content uses consistent outer margins. Form labels and controls reserve scal
   disables Deploy.
 - Copy code from backtick, tilde, nested, and unfinished fences. Compare with the
   original bytes, including tabs and Unicode.
+
+## Frame log
+
+Set `NL_DESK_FRAMELOG=1` before starting the desk and every five seconds `veil-desk.log` gets one
+line: frames drawn, the renderer's own work per frame (average and worst), the swap (vsync, the
+frame cap, the driver), how long the UI thread waited for the store lock, and how many frames
+crossed 16 ms and 50 ms of work. It separates "our drawing is slow" from "the UI is waiting on a
+worker" from "the driver or the machine is holding the swap". Off, it costs two clock reads a frame.
+
+## The sentry
+
+Settings carries three boxes under the server rows: **Watch this machine**, **Enforce
+rules** and **Auto-block**, with one status line (host firewall, how many ports listen
+and how many are bound to a network address, rules, open findings) and two buttons, **Accept as
+baseline** and **Mark findings reviewed**. Each click is one request to the server; a
+box moves when the server answers. The Dashboard's CLIENT panel shows the same status
+in one line. The server-side feature, its findings and the `veil sentry` verbs are
+described in the [security guide](docs-src/guide/security-tools.md#the-sentry-the-veil-as-your-machines-firewall-and-watch).
 
 Run `zig build` at the repository root and `zig build test` inside `desk` for build
 and regression checks. Live-service tests may skip when their services are absent;

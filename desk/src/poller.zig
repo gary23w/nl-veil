@@ -75,6 +75,7 @@ pub const Poller = struct {
     last_r2_s: i64 = 0, // R2 backup snapshot throttle (only while connected; the card's "backed up 2m ago")
     last_tun_s: i64 = 0, // Cloudflare Tunnel snapshot throttle (3s while a flip is in flight, else 15s)
     last_gar_s: i64 = 0, // Security tools snapshot throttle (only while connected; 3s while a deploy is in flight, else 20s)
+    last_sen_s: i64 = 0, // the sentry's status throttle (20s; 3s while a settings change is in flight; a refusal waits a minute)
     last_tots_s: i64 = 0, // tot roster throttle (only while the Tots tab is drawn; 0 = poll next tick)
     last_tot_ev_s: i64 = 0, // the selected tot's event tail
     last_tot_pad_s: i64 = 0, // the shared scratchpad
@@ -175,6 +176,7 @@ pub const Poller = struct {
                 .cf_tunnel_off => self.doCfTunnel(false, false, ""),
                 .garrett_deploy => self.doGarrett(true),
                 .garrett_remove => self.doGarrett(false),
+                .sentry_set => self.doSentrySet(c.textStr()),
                 // a "live ↗" on a Cloudflare deploy chip: the URL rides Command.text, the browser opens it
                 .open_url => if (std.mem.startsWith(u8, c.textStr(), "https://")) self.openUrl(c.textStr()),
                 .builtin_pull => self.doBuiltinVerb(.pull),
@@ -790,6 +792,20 @@ pub const Poller = struct {
                 if (now_s - self.last_gar_s >= gar_every) {
                     self.last_gar_s = now_s;
                     self.refreshGarrett();
+                }
+            }
+            // The sentry (this machine's firewall and watch) — the Settings rows and the Dashboard line. 20s; 3s
+            // while a settings change is in flight. Needs no Cloudflare login, so it sits outside the block above.
+            {
+                const sen_busy = blk: {
+                    self.store.lock();
+                    defer self.store.unlock();
+                    break :blk self.store.sentry_busy;
+                };
+                const sen_every: i64 = if (sen_busy) 3 else 20;
+                if (now_s - self.last_sen_s >= sen_every) {
+                    self.last_sen_s = now_s;
+                    self.refreshSentry();
                 }
             }
         }
@@ -1906,6 +1922,91 @@ pub const Poller = struct {
             }
         }
         self.last_tun_s = 0; // poll promptly so the state line moves at once
+    }
+
+    /// GET /api/v1/sentry → the store's sentry snapshot: on/off, posture, auto-block, the host firewall, the last
+    /// scan's counts, open findings, the last error. A refusal (the route is admin-gated) reads as "not seen" and
+    /// is not asked again for a minute, like the Security tools card.
+    fn refreshSentry(self: *Poller) void {
+        var tbuf: [128]u8 = undefined;
+        const tok = self.tokenSnap(&tbuf);
+        const resp = netcli.sentryStatus(self.io, self.gpa, self.port(), tok) orelse return;
+        defer if (resp.body.len > 0) self.gpa.free(resp.body);
+        if (resp.status == 401 or resp.status == 403 or resp.status == 503) {
+            self.last_sen_s += 60;
+            self.store.lock();
+            defer self.store.unlock();
+            self.store.sentry_seen = false;
+            return;
+        }
+        if (resp.status != 200) return;
+        self.applySentryBody(resp.body);
+    }
+
+    /// The one reader of a /api/v1/sentry reply (status and set share the shape).
+    fn applySentryBody(self: *Poller, body: []const u8) void {
+        var fb: [12]u8 = undefined;
+        const fw = valueForKey(body, "firewall", &fb);
+        var eb: [200]u8 = undefined;
+        const err = valueForKey(body, "last_error", &eb);
+        var pb: [12]u8 = undefined;
+        const posture = valueForKey(body, "posture", &pb);
+        self.store.lock();
+        defer self.store.unlock();
+        self.store.sentry_seen = true;
+        self.store.sentry_on = std.mem.indexOf(u8, body, "\"enabled\":true") != null;
+        self.store.sentry_enforce = std.mem.eql(u8, posture, "enforce");
+        self.store.sentry_auto = std.mem.indexOf(u8, body, "\"auto_block\":true") != null;
+        self.store.sentry_enforce_ok = std.mem.indexOf(u8, body, "\"enforce_ok\":false") == null;
+        const fn_ = @min(fw.len, self.store.sentry_fw.len);
+        @memcpy(self.store.sentry_fw[0..fn_], fw[0..fn_]);
+        self.store.sentry_fw_len = fn_;
+        self.store.sentry_listeners = @intCast(@min(intForKey(body, "listeners") orelse 0, std.math.maxInt(u32)));
+        self.store.sentry_exposed = @intCast(@min(intForKey(body, "exposed") orelse 0, std.math.maxInt(u32)));
+        self.store.sentry_rules = @intCast(@min(intForKey(body, "rules") orelse 0, std.math.maxInt(u32)));
+        self.store.sentry_open = @intCast(@min(intForKey(body, "findings_open") orelse 0, std.math.maxInt(u32)));
+        self.store.sentry_high = @intCast(@min(intForKey(body, "findings_high_open") orelse 0, std.math.maxInt(u32)));
+        if (!self.store.sentry_busy) {
+            const en = @min(err.len, self.store.sentry_err.len);
+            @memcpy(self.store.sentry_err[0..en], err[0..en]);
+            self.store.sentry_err_len = en;
+        }
+    }
+
+    /// POST /api/v1/sentry/set with the JSON the Settings row built. The reply is the status after the change.
+    fn doSentrySet(self: *Poller, body: []const u8) void {
+        {
+            self.store.lock();
+            defer self.store.unlock();
+            if (self.store.sentry_busy) return; // one at a time
+            self.store.sentry_busy = true;
+            self.store.sentry_err_len = 0;
+        }
+        defer {
+            self.store.lock();
+            self.store.sentry_busy = false;
+            self.store.unlock();
+            self.last_sen_s = 0; // read the result back at once
+        }
+        var tbuf: [128]u8 = undefined;
+        const tok = self.tokenSnap(&tbuf);
+        const resp = netcli.sentrySet(self.io, self.gpa, self.port(), tok, body) orelse {
+            self.store.pushNotif("Sentry", "server unreachable - is it running?", 2);
+            return;
+        };
+        defer if (resp.body.len > 0) self.gpa.free(resp.body);
+        if (resp.status != 200) {
+            var eb: [200]u8 = undefined;
+            const err = valueForKey(resp.body, "err", &eb);
+            self.store.lock();
+            defer self.store.unlock();
+            const en = @min(err.len, self.store.sentry_err.len);
+            @memcpy(self.store.sentry_err[0..en], err[0..en]);
+            self.store.sentry_err_len = en;
+            self.store.pushNotif("Sentry", if (en > 0) self.store.sentry_err[0..en] else "the change was refused", 2);
+            return;
+        }
+        self.applySentryBody(resp.body);
     }
 
     /// GET /api/v1/tots/garrett → the store's Security tools snapshot: deployed or not, its address, the last

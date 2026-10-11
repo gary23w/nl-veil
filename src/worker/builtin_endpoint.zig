@@ -24,6 +24,7 @@
 //! as an interface instead of an import.
 
 const std = @import("std");
+const vthread = @import("../threads.zig"); // every thread: small Windows stack commit + a name (see threads.zig)
 const httpz = @import("httpz");
 const builtin_mod = @import("builtin.zig");
 const gemma4 = @import("gemma4.zig");
@@ -107,7 +108,7 @@ fn tryStart(gpa: std.mem.Allocator, io: std.Io, app: *EndpointApp, port: u16) bo
     router.post(P ++ "/api/chat", chat, .{});
     router.post(P ++ "/v1/chat/completions", oaiChat, .{});
 
-    const t = std.Thread.spawn(.{}, listenLoop, .{server}) catch {
+    const t = vthread.spawn("builtin-endpoint", listenLoop, .{server}) catch {
         server.deinit();
         gpa.destroy(server);
         return false;

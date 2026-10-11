@@ -392,6 +392,7 @@ pub fn pathFor(name: []const u8) []const u8 {
         .{ .n = "get_credential", .p = "connect/mcp" },
     };
     for (table) |e| if (std.mem.eql(u8, e.n, name)) return e.p;
+    if (std.mem.startsWith(u8, name, "sentry_")) return "security/sentry";
     if (std.mem.startsWith(u8, name, "security_")) return securityPath(name["security_".len..]);
     if (std.mem.startsWith(u8, name, "plug_")) return "connect/plugins";
     if (std.mem.startsWith(u8, name, "cf_")) return "cloud";
@@ -460,7 +461,8 @@ fn branchDesc(path: []const u8) []const u8 {
         .{ .p = "connect", .d = "other systems: MCP servers, plugins, credentials, waiting on a client" },
         .{ .p = "connect/mcp", .d = "discover and call tools on a connected MCP server; ask for a credential; wait for a client" },
         .{ .p = "connect/plugins", .d = "tools loaded from plugins" },
-        .{ .p = "security", .d = "Agent Garrett, the user's own blue-team agent: threat intel, DNS and certificates, email and breach checks, people and company OSINT, malware and forensics, scanning, and its own task system" },
+        .{ .p = "security", .d = "Agent Garrett, the user's own blue-team agent: threat intel, DNS and certificates, email and breach checks, people and company OSINT, malware and forensics, scanning, and its own task system; and the sentry watching THIS machine: open ports, startup entries, the host firewall, block and allow rules" },
+        .{ .p = "security/sentry", .d = "THIS machine: what is listening and on which address, new startup or scheduled entries, the host firewall, the sentry's findings; block or allow a port, address or program" },
         .{ .p = "security/intel", .d = "vulnerability intelligence: CVE details, EPSS probability, CISA KEV status, CVSS, MITRE, exposure search" },
         .{ .p = "security/dns-ip", .d = "DNS records, certificate transparency, subdomains, RDAP and ASN registration, IP geolocation, Shodan and GreyNoise" },
         .{ .p = "security/web", .d = "a target web site: fetch, crawl, headers, CORS, tech fingerprint, .well-known, URL scans, Wayback, phishing and typosquat checks" },

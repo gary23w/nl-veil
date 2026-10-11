@@ -7,6 +7,15 @@ const std = @import("std");
 const scan = @import("scan.zig");
 const tots = @import("tots.zig");
 const log = @import("log.zig");
+const nap = @import("nap.zig"); // nowUs: the UI thread's lock-wait accounting (see Store.lock)
+
+/// True on the renderer thread only (main.zig sets it before the first frame). Store.lock() measures its waits
+/// there, so the frame log can tell "the UI waited on a worker" from "the UI's own frame was slow".
+pub threadlocal var is_ui_thread: bool = false;
+/// Microseconds the UI thread has spent waiting in Store.lock(), and the longest single wait; the frame log
+/// reads and resets both every window.
+pub var ui_lock_wait_us: std.atomic.Value(u64) = .init(0);
+pub var ui_lock_wait_max_us: std.atomic.Value(u64) = .init(0);
 
 /// A tiny io-free spinlock. std.Thread.Mutex is gone in this Zig and std.Io.Mutex needs an io handle the
 /// UI thread doesn't carry. Critical sections here are microscopic (copying a few small fixed arrays under
@@ -23,7 +32,7 @@ const SpinLock = struct {
 
 pub const Tab = enum { dashboard, chat, swarm, tots, hub, scheduled, settings }; // deploy = the Swarm tab's inner form
 
-pub const CmdKind = enum { none, select, say, set_goal, stop, deploy, delete, open_folder, refresh_now, open_file, sched_create, sched_update, sched_toggle, sched_delete, sched_run, oauth_cf_login, oauth_cf_logout, open_url, builtin_pull, builtin_cancel, builtin_import, builtin_remove, builtin_check, dataset_start, dataset_stop, cf_tunnel_on, cf_tunnel_off, lineage_accept, lineage_reject, tot_select, tot_deploy, tot_command, tot_config, tot_delete, tot_pad_write, tot_open_folder, tot_pad_clear, tot_limit, tot_select_run, tot_delete_run, garrett_deploy, garrett_remove };
+pub const CmdKind = enum { none, select, say, set_goal, stop, deploy, delete, open_folder, refresh_now, open_file, sched_create, sched_update, sched_toggle, sched_delete, sched_run, oauth_cf_login, oauth_cf_logout, open_url, builtin_pull, builtin_cancel, builtin_import, builtin_remove, builtin_check, dataset_start, dataset_stop, cf_tunnel_on, cf_tunnel_off, lineage_accept, lineage_reject, tot_select, tot_deploy, tot_command, tot_config, tot_delete, tot_pad_write, tot_open_folder, tot_pad_clear, tot_limit, tot_select_run, tot_delete_run, garrett_deploy, garrett_remove, sentry_set };
 
 /// A UI→poller command. Fixed-size, copied by value into the ring, so no cross-thread allocation.
 pub const Command = struct {
@@ -1166,6 +1175,24 @@ pub const Store = struct {
     garrett_url_len: usize = 0,
     garrett_err: [200]u8 = undefined,
     garrett_err_len: usize = 0,
+    // --- The sentry (the poller writes from GET /api/v1/sentry; the Settings rows and the Dashboard read): on or
+    // off, posture, auto-block, the host firewall's state, what the last scan counted, how many findings wait,
+    // a settings change in flight, and the last refusal in the server's words.
+    sentry_seen: bool = false,
+    sentry_on: bool = false,
+    sentry_enforce: bool = false,
+    sentry_auto: bool = false,
+    sentry_busy: bool = false,
+    sentry_enforce_ok: bool = true,
+    sentry_fw: [12]u8 = undefined,
+    sentry_fw_len: usize = 0,
+    sentry_listeners: u32 = 0,
+    sentry_exposed: u32 = 0,
+    sentry_rules: u32 = 0,
+    sentry_open: u32 = 0,
+    sentry_high: u32 = 0,
+    sentry_err: [200]u8 = undefined,
+    sentry_err_len: usize = 0,
 
     // --- Tots (tots.zig): the poller writes from GET /api/v1/tots, the selected tot's events and the shared
     // scratchpad, and ONLY while the Tots tab is being drawn - each poll is a call into the user's Cloudflare
@@ -1254,6 +1281,16 @@ pub const Store = struct {
     narr_count: usize = 0,
 
     pub fn lock(s: *Store) void {
+        if (is_ui_thread) {
+            // FRAME-LOG ACCOUNTING (main.zig NL_DESK_FRAMELOG): how long the renderer waited for this lock. Only
+            // the UI thread pays the two clock reads; every worker takes the plain path below.
+            const t0 = nap.nowUs();
+            s.mu.lock();
+            const w: u64 = @intCast(@max(0, nap.nowUs() - t0));
+            _ = ui_lock_wait_us.fetchAdd(w, .monotonic);
+            if (w > ui_lock_wait_max_us.load(.monotonic)) ui_lock_wait_max_us.store(w, .monotonic);
+            return;
+        }
         s.mu.lock();
     }
     pub fn unlock(s: *Store) void {

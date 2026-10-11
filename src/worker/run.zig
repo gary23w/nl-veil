@@ -13,6 +13,7 @@
 //! Why Zig: a worker is ~1-5 MB resident and starts instantly — the lever for running many swarms on
 //! one box. A mind tick is LLM-bound, so per-tick latency is dominated by the model, not the host.
 const std = @import("std");
+const vthread = @import("../threads.zig"); // every thread: small Windows stack commit + a name (see threads.zig)
 const builtin = @import("builtin");
 const llm = @import("llm.zig");
 const modelcfg = @import("modelcfg"); // a MODULE (this dir's modelcfg.zig) — shared with the compiled-in desk
@@ -1382,7 +1383,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
         }
         if (seeded > 0) w.act("engine", 0, "board_seed", "one OPEN task per blueprint file — claim before you build", std.fmt.allocPrint(w.a(), "{d} task(s) seeded", .{seeded}) catch "seeded");
     }
-    const wd_thread: ?std.Thread = if (live) (std.Thread.spawn(.{}, hangWatchdog, .{&w}) catch null) else null;
+    const wd_thread: ?std.Thread = if (live) (vthread.spawn("worker-watchdog", hangWatchdog, .{&w}) catch null) else null;
     const probe_url: []const u8 = if (environ.get("NL_NET_PROBE_URL")) |u| (if (u.len > 0) u else "https://1.1.1.1") else "https://1.1.1.1";
     while (true) {
         round += 1;

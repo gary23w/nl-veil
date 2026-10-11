@@ -17,6 +17,7 @@
 //! control.jsonl at round end), so a reply takes a round or two; the chat says so once.
 
 const std = @import("std");
+const vthread = @import("../threads.zig"); // every thread: small Windows stack commit + a name (see threads.zig)
 const builtin = @import("builtin");
 const cli = @import("../cli.zig");
 const Ctx = cli.Ctx;
@@ -878,7 +879,7 @@ pub fn cmd(ctx: *Ctx, args: []const []const u8) u8 {
     }
 
     var keys = Keys{ .io = ctx.io };
-    const th = std.Thread.spawn(.{}, Keys.reader, .{&keys}) catch null;
+    const th = vthread.spawn("tui-keys", Keys.reader, .{&keys}) catch null;
     if (th) |t| t.detach();
     var term = Term{ .io = ctx.io };
     term.enter();

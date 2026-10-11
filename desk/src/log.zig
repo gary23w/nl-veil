@@ -64,6 +64,28 @@ pub fn setClock(t_s: i64) void {
     @atomicStore(i64, &g_clock, t_s, .monotonic);
 }
 
+/// True once anything has stamped the clock. Server lines (main.zig serverLog) arrive before the poller's first
+/// refresh, so they stamp it themselves rather than print 00:00:00.
+pub fn clockIsSet() bool {
+    return @atomicLoad(i64, &g_clock, .monotonic) != 0;
+}
+
+/// Several pre-formatted lines written under ONE lock hold, so the chunks of a long server line (main.zig
+/// serverLog) can never interleave with another thread's line. Each is cut to a Line's buffer.
+pub fn emitLines(level: Level, texts: []const []const u8) void {
+    const t_s = @atomicLoad(i64, &g_clock, .monotonic);
+    lock();
+    defer unlock();
+    for (texts) |text| {
+        var ln: Line = .{ .t_s = t_s, .level = level };
+        const n = @min(text.len, ln.buf.len);
+        @memcpy(ln.buf[0..n], text[0..n]);
+        ln.len = @intCast(n);
+        g_lines[g_write % CAP] = ln;
+        g_write += 1;
+    }
+}
+
 fn emit(level: Level, comptime fmt: []const u8, args: anytype) void {
     var ln: Line = .{ .t_s = @atomicLoad(i64, &g_clock, .monotonic), .level = level };
     const s = std.fmt.bufPrint(&ln.buf, fmt, args) catch blk: {
@@ -293,4 +315,17 @@ test "setClock stamps the lines written after it — a line never reads the cloc
     try std.testing.expectEqual(@as(usize, 2), drain(&out));
     try std.testing.expectEqual(@as(i64, 1_784_000_000), out[0].t_s);
     try std.testing.expectEqual(@as(i64, 1_784_000_042), out[1].t_s);
+}
+
+test "emitLines writes a split line's chunks back to back" {
+    var sink: [CAP]Line = undefined;
+    _ = drain(&sink); // other modules' tests log into the same ring: start from empty
+    emitLines(.warn, &.{ "srv(x): first part", "  ...second part", "  ...third part" });
+    var out: [8]Line = undefined;
+    const n = drain(&out);
+    try std.testing.expectEqual(@as(usize, 3), n);
+    try std.testing.expectEqualStrings("srv(x): first part", out[0].str());
+    try std.testing.expectEqualStrings("  ...second part", out[1].str());
+    try std.testing.expectEqualStrings("  ...third part", out[2].str());
+    try std.testing.expect(out[0].level == .warn and out[2].level == .warn);
 }

@@ -49,6 +49,17 @@ pub fn nowMs() i64 {
     return 0;
 }
 
+/// The same clock in microseconds, for the frame log (main.zig NL_DESK_FRAMELOG) and the UI thread's lock-wait
+/// accounting (store.zig): a frame's work is a few milliseconds, which the ms reading cannot resolve.
+pub fn nowUs() i64 {
+    if (builtin.os.tag == .windows) {
+        var t: u64 = 0;
+        _ = kernel32.QueryUnbiasedInterruptTime(&t);
+        return @intCast(t / 10);
+    }
+    return 0;
+}
+
 const kernel32 = if (builtin.os.tag == .windows) struct {
     extern "kernel32" fn QueryUnbiasedInterruptTime(unbiased_time: *u64) callconv(.winapi) i32;
 } else struct {};

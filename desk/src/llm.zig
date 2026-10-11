@@ -7,6 +7,7 @@
 //! it, appending deltas to the Store. Runs on the CHAT thread only.
 
 const std = @import("std");
+const vthread = @import("threads.zig"); // every thread: small Windows stack commit + a name (see threads.zig)
 const builtin = @import("builtin");
 const Io = std.Io;
 const log = @import("log.zig");
@@ -1127,7 +1128,7 @@ pub const Standin = struct {
         sv.closing = .init(false);
         sv.seen = .init(0);
         sv.req_len = 0;
-        sv.thread = std.Thread.spawn(.{}, serve, .{sv}) catch |e| {
+        sv.thread = vthread.spawn("test-desk-llm-serve", serve, .{sv}) catch |e| {
             sv.server.deinit(io);
             return e;
         };
@@ -1592,7 +1593,7 @@ test "handing curl its key never waits on curl: the longest config a desk call s
     };
     Watchdog.done.store(false, .release);
     Watchdog.fired.store(false, .release);
-    const dog = try std.Thread.spawn(.{}, Watchdog.run, .{child.id.?});
+    const dog = try vthread.spawn("desk-llm-watchdog", Watchdog.run, .{child.id.?});
     const cfg = try gpa.alloc(u8, KEY_CFG_MAX);
     defer gpa.free(cfg);
     @memset(cfg, 'k');

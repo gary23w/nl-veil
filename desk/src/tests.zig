@@ -26,6 +26,7 @@ test {
     _ = @import("secrets.zig");
     _ = @import("store.zig");
     _ = @import("theme.zig");
+    _ = @import("threads.zig"); // the desk twin of src/threads.zig: small Windows stack commit + thread names
     _ = @import("watchdog.zig"); // the stall-detection timing rules, plus one real-thread, real-clock freeze and recovery
     _ = @import("updater.zig");
     _ = @import("distribution.zig");

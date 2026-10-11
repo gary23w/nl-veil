@@ -243,6 +243,41 @@ if ($Scan) {
             Write-Host "[twins] wsock.zig twins identical (whole-file contract holds)" -ForegroundColor Green
         }
     }
+    #    threads.zig: the desk cannot import the server's copy (separate module), so it carries a twin whose body
+    #    must match below the //! header. Keep this and check.sh's twin of it on the same rule.
+    $a = Join-Path $repo "src\threads.zig"; $b = Join-Path $repo "desk\src\threads.zig"
+    if ((Test-Path $a) -and (Test-Path $b)) {
+        $bodyA = ((Get-Content $a) -notmatch '^//!') -join "`n"
+        $bodyB = ((Get-Content $b) -notmatch '^//!') -join "`n"
+        if ($bodyA -ne $bodyB) {
+            $signals++
+            Write-Host "[twins] threads.zig twin BODIES differ (below-header contract broken) -- mirror them" -ForegroundColor Yellow
+        } else {
+            Write-Host "[twins] threads.zig twins in sync (below-header contract holds)" -ForegroundColor Green
+        }
+    }
+
+    # 2b) thread stacks. Zig 0.16's std.Thread.spawn commits its whole stack_size on Windows, and the default is
+    #     16 MiB: 160 default-config threads held 2.4 GB of commit in the live app (2026-10-11). Every thread goes
+    #     through vthread.spawn (src/threads.zig, desk/src/threads.zig) or, in vendored httpz, spawn_cfg.config.
+    #     A spawn with the default config `.{}` anywhere else is that regression coming back.
+    $raw16 = @()
+    foreach ($dir in @("src", "desk\src", "vendor\httpz\src")) {
+        $root = Join-Path $repo $dir
+        if (-not (Test-Path $root)) { continue }
+        Get-ChildItem $root -Recurse -Filter *.zig | ForEach-Object {
+            Select-String -LiteralPath $_.FullName -Pattern 'Thread\.spawn\(\s*\.\{\s*\}' | ForEach-Object {
+                $raw16 += ("{0}:{1}" -f $_.Path.Substring($repo.Length + 1), $_.LineNumber)
+            }
+        }
+    }
+    if ($raw16.Count -gt 0) {
+        $signals += $raw16.Count
+        Write-Host ("[threads] {0} spawn(s) with the default config commit 16 MiB each on Windows -- use vthread.spawn:" -f $raw16.Count) -ForegroundColor Yellow
+        $raw16 | ForEach-Object { Write-Host "    $_" }
+    } else {
+        Write-Host "[threads] no default-config thread spawns (every stack commits small on Windows)" -ForegroundColor Green
+    }
 
     # 3) version stamp drift across the hand-stamped locations.
     $vZon  = (Select-String -Path (Join-Path $repo "build.zig.zon") -Pattern '\.version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value

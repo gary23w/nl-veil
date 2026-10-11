@@ -6039,14 +6039,14 @@ pub const Chat = struct {
         // has always used, which demonstrably works.
         const size: u64 = if (Io.Dir.cwd().statFile(self.io, path, .{})) |st| st.size else |_| 0;
         const f = Io.Dir.cwd().createFile(self.io, path, .{ .truncate = false }) catch |e| {
-            std.log.warn("chat archive: cannot open {s}: {t}", .{ path, e });
+            log.warn("chat archive: cannot open {s}: {t}", .{ path, e });
             return;
         };
         defer f.close(self.io);
         // LOUD on failure: a silent archive is indistinguishable from a working one until the history is
         // already gone — which is exactly how the 0-byte bug survived a release.
         f.writePositionalAll(self.io, jb.items, size) catch |e|
-            std.log.warn("chat archive: write failed for {s}: {t}", .{ path, e });
+            log.warn("chat archive: write failed for {s}: {t}", .{ path, e });
     }
 
     /// Append ONE message line to the conv file. Returns false when the caller must do the full persistConv

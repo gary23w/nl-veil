@@ -71,6 +71,8 @@ test {
     _ = @import("worker/browser/util.zig");
     _ = @import("worker/cftools.zig"); // the cf_ belt: path/URL jails, the no-account refusal, schema↔dispatch agreement
     _ = @import("worker/crawl.zig");
+    _ = @import("threads.zig"); // every thread: 256 KiB Windows stack commit (not 16 MiB), deep stacks still grow, names
+    _ = @import("worker/vitals.zig"); // commit/threads/Defender sampler: layouts, spike rules, line format, ring, JSON
     _ = @import("worker/dataset.zig"); // training-set capture: the sft/raw/tools record shapes + the marker switch
     _ = @import("worker/deps.zig");
     _ = @import("worker/evcursor.zig"); // events.jsonl poll cursor: probe sentinel, page cap, catch-up walk
@@ -103,6 +105,9 @@ test {
     _ = @import("worker/rsi.zig");
     _ = @import("worker/run.zig");
     _ = @import("worker/sched.zig");
+    _ = @import("worker/sentry.zig"); // the sentry: inventory parsers, the diff, the policy, the host-firewall argv shapes
+    _ = @import("worker/sentry_api.zig"); // its admin routes: every one gated; no sentry ⇒ 503
+    _ = @import("cli/sentry.zig"); // veil sentry: the verb table and the timestamp
     _ = @import("worker/toolchain.zig"); // dependency bootstrap + manifest-derived acceptance rows
     _ = @import("worker/tools.zig");
     _ = @import("worker/vcs.zig");

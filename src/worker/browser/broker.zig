@@ -17,6 +17,7 @@
 //! machine sat on 43110 and a tool call could land in another process's broker.
 
 const std = @import("std");
+const vthread = @import("../../threads.zig"); // every thread: small Windows stack commit + a name (see threads.zig)
 const Io = std.Io;
 const browser_mgr = @import("manager.zig");
 const mcp_discovery = @import("../mcp/discovery.zig");
@@ -57,7 +58,7 @@ pub fn ensure(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Ma
 
     const boxed = gpa.create(Io.net.Server) catch return null;
     boxed.* = server;
-    _ = std.Thread.spawn(.{}, acceptLoop, .{boxed}) catch {
+    _ = vthread.spawn("browser-broker", acceptLoop, .{boxed}) catch {
         log.warn("browser broker: could not spawn accept thread", .{});
         return null;
     };

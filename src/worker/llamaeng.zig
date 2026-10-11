@@ -33,6 +33,7 @@
 //!     would drag unresolved externs into every `zig build test`.
 
 const std = @import("std");
+const vthread = @import("../threads.zig"); // every thread: small Windows stack commit + a name (see threads.zig)
 const builtin_mod = @import("builtin.zig");
 const bu = @import("browser/util.zig"); // sleepMs: a raw-thread sleep, no Io park
 
@@ -247,7 +248,7 @@ pub fn configure(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process
 
     if (!g.unloader_up) {
         g.unloader_up = true;
-        const t = std.Thread.spawn(.{}, unloaderLoop, .{}) catch blk: {
+        const t = vthread.spawn("llama-unloader", unloaderLoop, .{}) catch blk: {
             g.unloader_up = false;
             break :blk null;
         };

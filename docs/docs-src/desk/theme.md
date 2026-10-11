@@ -22,6 +22,7 @@ Defines veil-desk's entire visual language: the Tokyo Night color scheme (the da
 - `drawMark` — brand mark from assets/icon.png with a procedural magenta-bust fallback
 - `wantCursor` / `applyCursor` — per-frame last-writer-wins OS cursor request
 - `setBlockClicks` — suppress covered-widget clicks while an overlay is open
+- `kbFrame` / `kbField` / `kbStep` / `kbChromeEnd` / `kbTabSwitched` / `kbCancel` / `kbTakeAnnouncement` — the keyboard order: every button, tab, checkbox and text field registers as it draws, so registration order is the Tab order. Tab from a text field continues from that field (kbFrame reports that the field must let go), a field reached by Tab takes the caret (kbField returns true) instead of getting a ring, Enter/Space fire a ringed control only while no field has the keyboard, and a tab switch keeps a ring on the titlebar or tab bar but drops one in the old tab's body. The bookkeeping (kbClaim, kbField) draws nothing and is unit-tested without a window
 - `setFont` / `setMono` / `deinit` — install the loaded TTFs and free the mark texture
 - `withAlpha` — color alpha override; plus design tokens PAD/PAD_IN/GAP/BTN_SM/BTN_MD/BTN_LG/FIELD_H
 
