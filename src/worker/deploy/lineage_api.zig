@@ -24,7 +24,7 @@ const notFound = http.notFound;
 const serverErr = http.serverErr;
 const jstr = http.jstr;
 
-/// At most this many lineages are counted per listing: each count is a neuron subprocess.
+/// At most this many lineages are counted per listing: each lineage uses one neuron subprocess.
 const LIST_MAX = 32;
 /// The newest casts a detail returns.
 const HISTORY_MAX = 100;
@@ -47,15 +47,21 @@ fn castCount(body: []const u8) usize {
 }
 
 fn writeCounts(out: *std.ArrayListUnmanaged(u8), arena: std.mem.Allocator, mem: osc.Mem, casts: usize) !void {
-    var pending: u32 = 0;
-    for (proposals.SOURCES) |s| pending += mem.factCount(s.scope);
+    const live_scopes = [_][]const u8{ tools.LESSON_SCOPE, tools.FACT_SCOPE, tools.SKILL_SCOPE, tools.PLAYBOOK_SCOPE, tools.PROPOSAL_REJECTED_SCOPE };
+    var scopes: [live_scopes.len + proposals.SOURCES.len][]const u8 = undefined;
+    @memcpy(scopes[0..live_scopes.len], &live_scopes);
+    for (proposals.SOURCES, 0..) |source, i| scopes[live_scopes.len + i] = source.scope;
+    var counts: [scopes.len]u32 = undefined;
+    try mem.factCounts(&scopes, &counts);
+    var pending: u64 = 0;
+    for (counts[live_scopes.len..]) |count| pending += count;
     try out.print(arena, ",\"lessons\":{d},\"facts\":{d},\"skills\":{d},\"playbook\":{d},\"pending\":{d},\"rejected\":{d},\"casts\":{d}", .{
-        mem.factCount(tools.LESSON_SCOPE),
-        mem.factCount(tools.FACT_SCOPE),
-        mem.factCount(tools.SKILL_SCOPE),
-        mem.factCount(tools.PLAYBOOK_SCOPE),
+        counts[0],
+        counts[1],
+        counts[2],
+        counts[3],
         pending,
-        mem.factCount(tools.PROPOSAL_REJECTED_SCOPE),
+        counts[4],
         casts,
     });
 }
@@ -313,7 +319,9 @@ test "lineage routes: review reaches only the caller's own lineage, and a decisi
         var web = httpz.testing.init(.{});
         defer web.deinit();
         web.header("cookie", cookie_one);
+        const before = osc.spawn_probe;
         try listLineages(&ta.app, web.req, web.res);
+        try std.testing.expectEqual(before + 1, osc.spawn_probe);
         try web.expectStatus(200);
         try std.testing.expect(std.mem.indexOf(u8, web.res.body, "\"id\":\"proj\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, web.res.body, "\"pending\":1") != null);
@@ -332,7 +340,9 @@ test "lineage routes: review reaches only the caller's own lineage, and a decisi
         defer web.deinit();
         web.header("cookie", cookie_one);
         web.param("id", "proj");
+        const before = osc.spawn_probe;
         try lineageDetail(&ta.app, web.req, web.res);
+        try std.testing.expectEqual(before + 1, osc.spawn_probe);
         try web.expectStatus(200);
         const parsed = try std.json.parseFromSlice(std.json.Value, gpa, web.res.body, .{});
         defer parsed.deinit();

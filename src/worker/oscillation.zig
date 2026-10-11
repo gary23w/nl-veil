@@ -4,7 +4,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-/// COST PROBE — bumped only in test builds. `Mem.run` is the single `std.process.run` in this file,
+/// COST PROBE — bumped only in test builds. `Mem.runChecked` is the single `std.process.run` in this file,
 /// so this counts every neuron-db PROCESS SPAWN the hive memory makes, which is what this module's
 /// batching claims are actually about (`observeBatch`: "ONE subprocess instead of one spawn per
 /// fact", against a 40-tool storm that used to pay ~40 serialized launches).
@@ -336,6 +336,10 @@ pub const Mem = struct {
     pub const MAX_FACTS: u32 = 20_000;
 
     fn run(self: Mem, args: []const []const u8) ?[]u8 {
+        return self.runChecked(args) catch null;
+    }
+
+    fn runChecked(self: Mem, args: []const []const u8) ![]u8 {
         var argv: std.ArrayListUnmanaged([]const u8) = .empty;
         defer argv.deinit(self.gpa);
         var dbbuf: [768]u8 = undefined;
@@ -343,14 +347,14 @@ pub const Mem = struct {
         const dbp = if (d == 0) self.db else (std.fmt.bufPrint(&dbbuf, "{s}.{x}.q", .{ self.db, d }) catch "/x/nonexistent.q");
         var maxbuf: [12]u8 = undefined;
         const maxs = std.fmt.bufPrint(&maxbuf, "{d}", .{MAX_FACTS}) catch "20000";
-        argv.appendSlice(self.gpa, &.{ self.bin, "--db", dbp, "--max", maxs }) catch return null;
-        argv.appendSlice(self.gpa, args) catch return null;
+        try argv.appendSlice(self.gpa, &.{ self.bin, "--db", dbp, "--max", maxs });
+        try argv.appendSlice(self.gpa, args);
         if (builtin.is_test) spawn_probe += 1;
-        const r = std.process.run(self.gpa, self.io, .{ .argv = argv.items, .stdout_limit = .limited(1 << 20) }) catch return null;
+        const r = try std.process.run(self.gpa, self.io, .{ .argv = argv.items, .stdout_limit = .limited(1 << 20) });
         self.gpa.free(r.stderr);
         if (r.term != .exited or r.term.exited != 0) {
             self.gpa.free(r.stdout);
-            return null;
+            return error.NeuronFailed;
         }
         return r.stdout;
     }
@@ -743,7 +747,85 @@ pub const Mem = struct {
         defer self.gpa.free(out);
         return jsonUint(out, "\"facts\":");
     }
+
+    /// Fill caller-owned counts in scope order with one read-only database process.
+    pub fn factCounts(self: Mem, scopes: []const []const u8, counts: []u32) !void {
+        if (scopes.len != counts.len) return error.InvalidStatsResponse;
+        if (scopes.len == 0) return;
+        var args: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer args.deinit(self.gpa);
+        try args.appendSlice(self.gpa, &.{ "--json", "stats-batch" });
+        try args.appendSlice(self.gpa, scopes);
+        const out = try self.runChecked(args.items);
+        defer self.gpa.free(out);
+        try parseFactCounts(self.gpa, out, scopes, counts);
+    }
 };
+
+fn parseFactCounts(gpa: std.mem.Allocator, body: []const u8, scopes: []const []const u8, counts: []u32) error{ OutOfMemory, InvalidStatsResponse }!void {
+    const Row = struct { scope: []const u8, facts: u32 };
+    const parsed = std.json.parseFromSlice(struct { scopes: []const Row }, gpa, body, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidStatsResponse,
+    };
+    defer parsed.deinit();
+    if (scopes.len != counts.len or parsed.value.scopes.len != scopes.len) return error.InvalidStatsResponse;
+    for (parsed.value.scopes, scopes) |row, scope| {
+        if (!std.mem.eql(u8, row.scope, scope)) return error.InvalidStatsResponse;
+    }
+    for (parsed.value.scopes, counts) |row, *count| count.* = row.facts;
+}
+
+test "batched counts reject missing or mismatched rows without changing the caller's counts" {
+    const gpa = std.testing.allocator;
+    const scopes = [_][]const u8{ "lessons", "facts" };
+    var counts = [_]u32{ 91, 92 };
+    try parseFactCounts(gpa, "{\"scopes\":[{\"scope\":\"lessons\",\"facts\":2},{\"scope\":\"facts\",\"facts\":0}]}", &scopes, &counts);
+    try std.testing.expectEqualSlices(u32, &.{ 2, 0 }, &counts);
+    try std.testing.checkAllAllocationFailures(gpa, parseFactCounts, .{ "{\"scopes\":[{\"scope\":\"lessons\",\"facts\":2},{\"scope\":\"facts\",\"facts\":0}]}", @as([]const []const u8, &scopes), @as([]u32, &counts) });
+    for ([_][]const u8{
+        "{\"scopes\":[]}",
+        "{\"scopes\":[{\"scope\":\"lessons\",\"facts\":8},{\"scope\":\"other\",\"facts\":9}]}",
+        "{\"scopes\":[{\"scope\":\"facts\",\"facts\":8},{\"scope\":\"lessons\",\"facts\":9}]}",
+        "{\"scopes\":[{\"scope\":\"lessons\",\"facts\":-1},{\"scope\":\"facts\",\"facts\":0}]}",
+        "{\"scopes\":[{\"scope\":\"lessons\",\"facts\":4294967296},{\"scope\":\"facts\",\"facts\":0}]}",
+        "{\"scopes\":[{\"scope\":\"lessons\"},{\"scope\":\"facts\",\"facts\":0}]}",
+    }) |body| {
+        counts = .{ 91, 92 };
+        try std.testing.expectError(error.InvalidStatsResponse, parseFactCounts(gpa, body, &scopes, &counts));
+        try std.testing.expectEqualSlices(u32, &.{ 91, 92 }, &counts);
+    }
+}
+
+test "batched counts match individual reads while charging one process for all scopes" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = if (builtin.os.tag == .windows) .{ .block = .global } else .{ .block = .{ .slice = std.mem.span(std.c.environ) } } });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-fact-count-batch-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = try std.Io.Dir.cwd().createDirPathStatus(io, root, .default_dir);
+    const mem = Mem.init(gpa, io, if (builtin.os.tag == .windows) "bin/neuron.exe" else "bin/neuron", root ++ "/mind.sqlite");
+    std.Io.Dir.cwd().access(io, mem.bin, .{}) catch return error.SkipZigTest;
+    try std.testing.expect(mem.observe("lessons", "Run the formatter before the linter so the linter sees final source code") > 0);
+    const scopes = [_][]const u8{ "lessons", "facts", "skills", "playbook", "proposals-rejected", "lessons-proposed", "facts-proposed", "skills-proposed", "habits-proposed" };
+    var expected: [scopes.len]u32 = undefined;
+    const old_before = spawn_probe;
+    for (scopes, &expected) |scope, *count| count.* = mem.factCount(scope);
+    try std.testing.expectEqual(old_before + scopes.len, spawn_probe);
+    var counts: [scopes.len]u32 = undefined;
+    const before = spawn_probe;
+    try mem.factCounts(&scopes, &counts);
+    try std.testing.expectEqual(before + 1, spawn_probe);
+    try std.testing.expectEqualSlices(u32, &expected, &counts);
+    try std.testing.expect(counts[0] > 0);
+    const empty_before = spawn_probe;
+    try mem.factCounts(&.{}, &.{});
+    try std.testing.expectEqual(empty_before, spawn_probe);
+    const missing = Mem.init(gpa, io, "definitely-not-a-real-neuron-binary", mem.db);
+    try std.testing.expectError(error.FileNotFound, missing.factCounts(&scopes, &counts));
+}
 
 /// The digit run right after `key` (a `"name":` JSON key) parsed as an integer; 0 when absent/garbled.
 /// The flat-scan shape every Mem parser here uses — the CLI's --json output is single-line and unnested.

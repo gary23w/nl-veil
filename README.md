@@ -16,6 +16,13 @@ Windows · macOS · Linux · [MIT app code and AGPL security runtime](#license).
 hosted providers have their own data handling and costs. The built-in model requires a separate
 download, and coding tools require Python on `PATH` (some checks also use Node).
 
+### New in v1.1.17
+
+Lineage refreshes now collect all nine memory counts in one Neuron process per lineage.
+Seven lineages launch seven processes instead of 63 on each 30-second refresh, reducing
+background work and avoiding the serialized counting delay. The compatible memory engine
+is included in every bundle. [Release notes](docs/release/RELEASE-v1.1.17.md).
+
 ### New in v1.1.16
 
 **Gary's 4tope** carries a long chat forward by graph instead of by summary. When a turn has to
@@ -104,7 +111,7 @@ code and credentials from anything you share.
 
 <p>
   <a href="https://github.com/gary23w/nl-veil/actions/workflows/release.yml"><img alt="build" src="https://github.com/gary23w/nl-veil/actions/workflows/release.yml/badge.svg"></a>
-  <a href="https://github.com/gary23w/nl-veil/releases"><img alt="release" src="https://img.shields.io/badge/release-v1.1.16-A8241B"></a>
+  <a href="https://github.com/gary23w/nl-veil/releases"><img alt="release" src="https://img.shields.io/badge/release-v1.1.17-A8241B"></a>
   <img alt="zig" src="https://img.shields.io/badge/zig-0.16-F7A41D?logo=zig&logoColor=white">
   <a href="https://huggingface.co/gary23w/the-veil-12b"><img alt="built-in model" src="https://img.shields.io/badge/built--in%20model-the--veil--12b-6E4A27?logo=huggingface&logoColor=white"></a>
   <a href="https://huggingface.co/gary23w/gary-neuron-emergent"><img alt="memory cortex" src="https://img.shields.io/badge/cortex-gary--neuron--emergent-6E4A27?logo=huggingface&logoColor=white"></a>
@@ -589,7 +596,7 @@ raylib is a *lazy* dependency, so `-Dapp=false` never fetches it at all.
 ## Install
 
 **Download it and run it — no toolchain, nothing to build.** Grab your platform's bundle from the
-**[latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.1.16)**, unzip, and run `veil`:
+**[latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.1.17)**, unzip, and run `veil`:
 
 | You're on | Download | Then run |
 |---|---|---|
@@ -632,6 +639,10 @@ zig build run
 The `veil` binary (Zig) and the neuron-db memory engine (Rust) are built for you on first run — each
 with a prompt before it downloads anything. Point `--neuron-bin` / `--bin` at existing binaries to
 skip the builds.
+
+For v1.1.17, use Neuron commit `5db2c039bf8f20349299e64650aea2d6a2fce911` from
+[`batch/stats`](https://github.com/gary23w/neuron-db/tree/batch/stats), which supplies
+the lineage count batching command. Complete release bundles already include this engine.
 </details>
 
 ## Start it
@@ -750,7 +761,7 @@ step 5** — the rest is about letting other people in.
 
 ### 1. Download and unblock it
 
-Grab the bundle for your OS from the [latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.1.16)
+Grab the bundle for your OS from the [latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.1.17)
 and unzip it somewhere you'll find again. Builds are unsigned, so:
 
 - **Windows** shows *"Windows protected your PC"* → **More info** → **Run anyway**.
@@ -786,7 +797,7 @@ On startup the server prints one complete URL per address this machine answers o
 (`src/main.zig:861-889`, using `src/config/lan.zig`):
 
 ```
-neuron-loops 1.1.16 on http://localhost:8787
+neuron-loops 1.1.17 on http://localhost:8787
     open from another machine (phone, laptop) at:
       http://192.168.1.42:8787
 ```
@@ -1678,7 +1689,9 @@ dependency entirely rather than compiling it unused.
 
 ## Release
 
-**Current: [`v1.1.16`](https://github.com/gary23w/nl-veil/releases/tag/v1.1.16)** — **Gary's 4tope**:
+**Current: [`v1.1.17`](https://github.com/gary23w/nl-veil/releases/tag/v1.1.17)** - lineage counts use one memory-engine process per lineage instead of nine, reducing repeated background launches. [Full notes](docs/release/RELEASE-v1.1.17.md).
+
+**Previously: [`v1.1.16`](https://github.com/gary23w/nl-veil/releases/tag/v1.1.16)** — **Gary's 4tope**:
 a long chat carries itself forward by graph instead of by summary, keeping the chain of results the current
 step rests on and writing the continuation from the turn's own text with no model call. Plus the opt-in
 **tool tree** that lets a small model walk a belt of hundreds of tools, a 60% lighter Agent Garrett belt,

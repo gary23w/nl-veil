@@ -151,6 +151,16 @@ def smoke_bundle(archive, work, version, legacy):
         raise RuntimeError("Update install marker missing")
     app.chmod(0o700)
     engine.chmod(0o700)
+    if release_version >= (1, 1, 17):
+        scopes = ["lessons", "facts", "skills", "playbook", "proposals-rejected",
+                  "lessons-proposed", "facts-proposed", "skills-proposed", "habits-proposed"]
+        result = subprocess.run([str(engine), "--db", str(work / "counts.sqlite"),
+                                 "--json", "stats-batch", *scopes],
+                                capture_output=True, text=True, timeout=20)
+        expected = {"scopes": [{"scope": scope, "facts": 0} for scope in scopes]}
+        if result.returncode or json.loads(result.stdout) != expected:
+            raise RuntimeError("Packaged memory engine does not support lineage count batching")
+        print("PASS packaged memory engine: nine scopes in one stats-batch request", flush=True)
     if not legacy:
         result = subprocess.run([str(app), "--build-version"], capture_output=True, text=True, timeout=20)
         if result.returncode or result.stdout.strip() != version:
