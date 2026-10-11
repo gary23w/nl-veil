@@ -2584,6 +2584,36 @@ test "the tool face without a sentry refuses; every verb in SCHEMA dispatches; a
     try tt.expectEqual(@as(usize, 6), parsed.value.array.items.len);
 }
 
+/// TEST ONLY. An address as the inventory keeps it: hex digits, '.', ':' (and '*' for "any" when `wild`), then an
+/// optional zone after '%'. Windows numbers the zone (fe80::1%12); Linux names the interface (127.0.0.53%lo, which
+/// systemd-resolved listens on, or fe80::1%eth0), so the zone allows letters too. The first CI run on Linux
+/// (2026-10-11) failed on exactly that listener.
+fn testAddrOk(a: []const u8, wild: bool) bool {
+    if (a.len == 0) return false;
+    const pct = std.mem.indexOfScalar(u8, a, '%') orelse a.len;
+    for (a[0..pct]) |c| {
+        if (!(std.ascii.isHex(c) or c == '.' or c == ':' or (wild and c == '*'))) return false;
+    }
+    if (pct == a.len) return true;
+    const zone = a[pct + 1 ..];
+    if (zone.len == 0) return false;
+    for (zone) |c| if (!(std.ascii.isAlphanumeric(c) or c == '.' or c == '_' or c == '-')) return false;
+    return true;
+}
+
+test "testAddrOk takes a Linux interface zone and still refuses what a merged column would leave" {
+    try tt.expect(testAddrOk("127.0.0.53%lo", true));
+    try tt.expect(testAddrOk("fe80::1%eth0", false));
+    try tt.expect(testAddrOk("fe80::1%12", false));
+    try tt.expect(testAddrOk("0.0.0.0", true));
+    try tt.expect(testAddrOk("*", true));
+    try tt.expect(!testAddrOk("*", false));
+    try tt.expect(!testAddrOk("", true));
+    try tt.expect(!testAddrOk("127.0.0.1%", true));
+    try tt.expect(!testAddrOk("10.0.0.1 LISTEN", true)); // a second column glued on
+    try tt.expect(!testAddrOk("users:((sshd", true));
+}
+
 test "the live inventory on this host parses into rows, never crashes, and names its own listeners" {
     // Runs the real commands of this OS. On a runner without them (no ss, no netsh) `errors` counts them and
     // the rows stay empty, which is also a pass: coverage is reported, not faked.
@@ -2599,13 +2629,13 @@ test "the live inventory on this host parses into rows, never crashes, and names
     for (snap.listeners.items) |l| {
         try tt.expect(l.port != 0 or l.proto == .udp);
         try tt.expect(l.addr.len > 0);
-        for (l.addr) |c| try tt.expect(std.ascii.isHex(c) or c == '.' or c == ':' or c == '%' or c == '*');
+        try tt.expect(testAddrOk(l.addr, true));
         try tt.expect(l.name.len > 0);
         for (l.name) |c| try tt.expect(c >= 0x20 and c != 0x7F);
     }
     for (snap.conns.items) |c| {
         try tt.expect(c.raddr.len > 0);
-        for (c.raddr) |ch| try tt.expect(std.ascii.isHex(ch) or ch == '.' or ch == ':' or ch == '%');
+        try tt.expect(testAddrOk(c.raddr, false));
     }
     var kb: [512]u8 = undefined;
     for (snap.persist.items) |p| try tt.expect(persistKey(&kb, p).len > 2);
