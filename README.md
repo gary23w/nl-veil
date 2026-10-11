@@ -16,6 +16,12 @@ Windows · macOS · Linux · [MIT app code and AGPL security runtime](#license).
 hosted providers have their own data handling and costs. The built-in model requires a separate
 download, and coding tools require Python on `PATH` (some checks also use Node).
 
+### Stable release: v1.1.16
+
+v1.1.17 has been withdrawn. If you installed it, download and run the
+[v1.1.16 bundle](https://github.com/gary23w/nl-veil/releases/tag/v1.1.16) for your platform.
+Automatic updates do not downgrade an installed app.
+
 ### New in v1.1.16
 
 **Gary's 4tope** carries a long chat forward by graph instead of by summary. When a turn has to
