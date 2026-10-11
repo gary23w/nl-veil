@@ -98,9 +98,9 @@ var static_js: StaticAsset = .{ .body = ASSET_JS };
 var static_css: StaticAsset = .{ .body = ASSET_CSS };
 var static_models: StaticAsset = .{ .body = ASSET_MODELS };
 
-const Paths = struct { home: []const u8, data: []const u8, neuron_bin: []const u8 };
+const Paths = struct { home: []const u8, data: []const u8, neuron_bin: []const u8, working_dir: ?[]const u8 = null };
 
-fn resolvePaths(gpa: std.mem.Allocator, io: std.Io) !Paths {
+fn resolvePaths(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map) !Paths {
     var buf: [4096]u8 = undefined;
     const n = try std.process.executablePath(io, &buf);
     const exe_dir = std.fs.path.dirname(buf[0..n]) orelse ".";
@@ -112,10 +112,19 @@ fn resolvePaths(gpa: std.mem.Allocator, io: std.Io) !Paths {
         }
     }
     home = try gpa.dupe(u8, home);
+    var working_dir: ?[]const u8 = null;
+    if (HAS_GUI) {
+        if (try desk.distribution.packageFamily(gpa)) |family| {
+            defer gpa.free(family);
+            const local = environ.get("LOCALAPPDATA") orelse return error.LocalAppDataUnavailable;
+            working_dir = try desk.distribution.stateRoot(gpa, local, family);
+        }
+    }
     return .{
         .home = home,
-        .data = try std.fmt.allocPrint(gpa, "{s}/data", .{home}),
+        .data = try std.fmt.allocPrint(gpa, "{s}/data", .{working_dir orelse home}),
         .neuron_bin = try std.fmt.allocPrint(gpa, "{s}/bin/{s}", .{ home, NEURON_EXE }),
+        .working_dir = working_dir,
     };
 }
 
@@ -378,6 +387,10 @@ pub fn main(init: std.process.Init) !void {
                 try std.Io.File.stdout().writeStreamingAll(io, VERSION ++ "\n");
                 return;
             }
+            if (std.mem.eql(u8, sub, "--package-support")) {
+                try std.Io.File.stdout().writeStreamingAll(io, if (HAS_GUI) "veil-msix-v1\n" else "server-only\n");
+                return;
+            }
             if (std.mem.eql(u8, sub, "worker")) {
                 const run_dir = try gpa.dupe(u8, it.next() orelse "");
                 const nbin = try gpa.dupe(u8, it.next() orelse "");
@@ -417,7 +430,7 @@ pub fn main(init: std.process.Init) !void {
         }
     } else |_| {}
 
-    var paths = try resolvePaths(gpa, io);
+    var paths = try resolvePaths(gpa, io, init.environ_map);
     if (init.environ_map.get("NEURON_LOOPS_DATA")) |d| {
         if (d.len > 0) paths.data = try gpa.dupe(u8, d);
     }
@@ -466,6 +479,15 @@ pub fn main(init: std.process.Init) !void {
     if (cli_sub.len > 0 and cli.isCommand(cli_sub)) {
         var cctx = cli.Ctx{ .gpa = gpa, .io = io, .data = paths.data, .home = paths.home, .port = cli_port, .environ = init.environ_map };
         return std.process.exit(cli.dispatch(&cctx, cli_sub, cli_args.items));
+    }
+
+    // Store activation has no useful writable CWD. Keep relative runtime files in LocalState;
+    // CLI commands and worker subprocesses retain the working directory their caller supplied.
+    if (HAS_GUI) {
+        if (paths.working_dir) |root| {
+            try std.Io.Dir.cwd().createDirPath(io, root);
+            try desk.distribution.setWorkingDirectory(gpa, root);
+        }
     }
 
     // DOUBLE-CLICK CONSOLE (Windows, app mode only). Past this point no CLI verb can be running and every

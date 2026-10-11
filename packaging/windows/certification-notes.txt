@@ -1,0 +1,35 @@
+nl-veil - certification notes (review before submitting)
+
+This is a native Win32 desktop app built with Zig and raylib. It needs
+runFullTrust to access user-selected coding projects, execute development
+commands, and run its bundled Neuron memory subprocess. It does not require
+administrator privileges for its main coding workflow. Optional host firewall
+changes are separate user-requested operations and may need elevated tools.
+
+Launch "nl-veil" from Start. A desktop window and local backend run in one
+process. The app uses port 8787 by default. Configure a local Ollama endpoint,
+download the built-in model, or connect a hosted provider in Settings > Models.
+Provider accounts and credentials belong to the reviewer; none are bundled.
+Python on PATH is needed for coding tools. Node.js is needed for some
+JavaScript checks. The built-in model download is optional and is not bundled.
+
+No Veil subscription or provider API key is required for local inference.
+Hosted AI services and optional Cloudflare features may incur provider costs.
+
+Test on a machine with OpenGL 3.3-capable graphics. For a first task, use a
+temporary project with demo files and ask the app to make a small change,
+then review its diff and test results. Existing user sessions must not be used
+as certification fixtures or screenshots.
+
+Store installations use per-user package LocalState for writable app data;
+the bundled app and Neuron engine remain in the read-only package directory.
+Microsoft Store manages app updates. The portable GitHub updater is disabled
+for packaged processes, including its direct apply entry point.
+
+The optional Gary security runtime is AGPL-3.0. Its license, notice and
+corresponding source archive are shipped in cloud/. The app code is MIT.
+
+Before submitting: run Windows App Certification Kit against a signed,
+installed package; exercise launch, model setup, an actual coding task,
+restart with saved state, an update and uninstall on a clean Windows test
+machine. Complete the content/age questionnaire and confirm privacy URL.

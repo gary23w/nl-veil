@@ -4,6 +4,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const nap = @import("nap.zig");
+const distribution = @import("distribution.zig");
 const Io = std.Io;
 const dir = Io.Dir;
 const windows = builtin.os.tag == .windows;
@@ -19,10 +20,11 @@ var thread: ?std.Thread = null;
 var context: struct { io: Io, gpa: std.mem.Allocator, version: []const u8, args: []const []const u8 } = undefined;
 var failure: []const u8 = "";
 var release_json: ?[]u8 = null;
+var store_managed = false;
 
 pub fn status() []const u8 {
     return switch (phase.load(.acquire)) {
-        .disabled => "Updates require an official installed bundle.",
+        .disabled => if (store_managed) "Microsoft Store manages app updates. Open Microsoft Store to check for updates." else "Updates require an official installed bundle.",
         .checking => "Checking GitHub releases...",
         .current => "You have the latest stable release.",
         .available => "A new release is available. Updating restarts the app; finish active work first.",
@@ -34,9 +36,11 @@ pub fn status() []const u8 {
 
 pub fn configure(io: Io, gpa: std.mem.Allocator, version: []const u8, args: []const []const u8) void {
     context = .{ .io = io, .gpa = gpa, .version = version, .args = args };
+    store_managed = distribution.isPackaged();
 }
 
 pub fn start() void {
+    if (store_managed) return;
     if (phase.load(.acquire) != .disabled) return;
     var b: [4096]u8 = undefined;
     const n = std.process.executablePath(context.io, &b) catch return;
@@ -58,6 +62,7 @@ pub fn finish() void {
 }
 
 pub fn launch(install: bool) void {
+    if (store_managed) return;
     const p = phase.load(.acquire);
     if (p == .checking or p == .installing or p == .restart) return;
     if (install and p != .available) return;
@@ -69,6 +74,24 @@ pub fn launch(install: bool) void {
         phase.store(.failed, .release);
         return;
     };
+}
+
+test "packaged installs cannot check or install a GitHub update" {
+    const old_managed = store_managed;
+    const old_phase = phase.load(.acquire);
+    defer {
+        store_managed = old_managed;
+        phase.store(old_phase, .release);
+    }
+    store_managed = true;
+    phase.store(.disabled, .release);
+    start();
+    launch(false);
+    try std.testing.expectEqual(Phase.disabled, phase.load(.acquire));
+    try std.testing.expect(std.mem.indexOf(u8, status(), "Microsoft Store") != null);
+    phase.store(.available, .release);
+    launch(true);
+    try std.testing.expectEqual(Phase.available, phase.load(.acquire));
 }
 
 const Asset = struct { name: []const u8, browser_download_url: []const u8, size: u64, digest: ?[]const u8 = null };
@@ -278,6 +301,7 @@ fn spawnHelper(io: Io, a: std.mem.Allocator, path: []const u8) !void {
 
 /// Called before app initialization or joining the Windows job. No network or server is started.
 pub fn apply(io: Io, a: std.mem.Allocator, pid_text: []const u8) !void {
+    if (distribution.isPackaged()) return error.StoreManagesUpdates;
     const pid = try std.fmt.parseInt(u32, pid_text, 10);
     if (pid == 0 or pid > std.math.maxInt(i32)) return error.InvalidParent;
     var eb: [4096]u8 = undefined;
