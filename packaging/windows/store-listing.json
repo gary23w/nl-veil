@@ -1,0 +1,24 @@
+{
+  "language": "en-us",
+  "productName": "nl-veil",
+  "shortDescription": "An AI coding team that remembers your project.",
+  "description": "Build software with an AI team in a native desktop workspace. Give the Veil a task, work with specialist agents, review their changes and test results, and carry project memory into your next conversation.\n\nUse a local model through the built-in inference engine or Ollama, or connect an OpenAI-compatible hosted provider. The built-in model is a separate download; hardware needs depend on the model you choose. Hosted providers may require an account, an API key and usage charges.\n\nThe workspace brings together chat, task management, multi-agent work, project memory and model settings. Optional Cloudflare connections add Workers AI, backups and cloud tasks running in your own account.\n\nThe Veil is free, open-source software. Its coding tools require Python on PATH; some JavaScript checks also use Node.js. Agents can read and change project files and run commands, so review their work on projects you choose to open.",
+  "features": [
+    "Chat and work with AI coding agents in a native desktop workspace",
+    "Coordinate specialist agents through a shared project workspace",
+    "Keep project memory across conversations",
+    "Choose local inference, Ollama or an OpenAI-compatible provider",
+    "Connect your own Cloudflare account for optional AI, backups and cloud tasks",
+    "Review tool activity, changed files and test results"
+  ],
+  "searchTerms": ["AI coding", "coding assistant", "local AI", "agents", "project memory", "developer tools"],
+  "suggestedCategory": "Developer tools",
+  "suggestedPrice": "Free",
+  "website": "https://gary23w.github.io/nl-veil/",
+  "supportUrl": "https://github.com/gary23w/nl-veil/issues",
+  "privacyPolicyUrl": "https://gary23w.github.io/nl-veil/privacy.html",
+  "privacyPolicyStatus": "Draft in docs/privacy.html; publish and verify the public URL before submission",
+  "minimumSystemRequirements": "64-bit Windows 10 build 19041 or later, OpenGL 3.3 graphics for the desktop, Python on PATH for coding tools. Network access for downloads and hosted services. Model RAM, GPU and disk requirements vary.",
+  "screenshotStatus": "Capture current desktop screens at 1366 x 768 or larger, with demo data. At least one screenshot is required; four are recommended. Do not use mockups or add marketing text.",
+  "ageRatingsStatus": "Complete the IARC questionnaire in Partner Center; no age rating has been assigned here."
+}

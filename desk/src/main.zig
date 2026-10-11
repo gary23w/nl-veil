@@ -7,6 +7,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const nap = @import("nap.zig");
 pub const updater = @import("updater.zig");
+pub const distribution = @import("distribution.zig");
 const rl = @import("raylib");
 extern fn rlDrawRenderBatchActive() callconv(.c) void;
 const t = @import("theme.zig");
@@ -795,6 +796,12 @@ pub fn runApp(data_dir: ?[]const u8) !void {
                                         if (std.mem.eql(u8, tn, "dashboard")) .dashboard else if (std.mem.eql(u8, tn, "chat")) .chat else if (std.mem.eql(u8, tn, "swarm")) .swarm else if (std.mem.eql(u8, tn, "tots")) .tots else if (std.mem.eql(u8, tn, "hub")) .hub else if (std.mem.eql(u8, tn, "scheduled")) .scheduled else if (std.mem.eql(u8, tn, "tasks")) .scheduled else if (std.mem.eql(u8, tn, "settings")) .settings else null;
                                     if (tv) |v| setTab(v);
                                 }
+                            } else if (std.mem.startsWith(u8, cmd, "size ")) {
+                                var dims = std.mem.tokenizeScalar(u8, cmd[5..], ' ');
+                                const width = std.fmt.parseInt(i32, dims.next() orelse "", 10) catch 0;
+                                const height = std.fmt.parseInt(i32, dims.next() orelse "", 10) catch 0;
+                                if (width >= 760 and width <= 3840 and height >= 520 and height <= 2160 and dims.next() == null)
+                                    rl.setWindowSize(width, height);
                             } else if (std.mem.startsWith(u8, cmd, "snapshot ")) {
                                 const snapshot_dest = std.mem.trim(u8, cmd[9..], " \r\n\t");
                                 ui.snapshot_len = @min(snapshot_dest.len, ui.snapshot_path.len - 1);
