@@ -7,3 +7,7 @@
 // Generated from desk/assets/icon48x48.png (the same art makeIcon loads at runtime) at 16/24/32/48/64/
 // 128/256 so every shell context -- list view, tiles, jumbo icons, high-DPI -- has an exact size to draw.
 1 ICON "veil.ico"
+
+// Declare the same per-monitor DPI awareness GLFW sets at runtime, so Windows
+// and package certification can determine it before the desktop starts.
+1 24 "veil.manifest"
