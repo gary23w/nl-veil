@@ -1,0 +1,158 @@
+name: Windows Store package
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Submit an update to the existing live Microsoft Store product
+        type: boolean
+        default: false
+  workflow_call:
+    inputs:
+      publish:
+        type: boolean
+        default: false
+      release_tag:
+        type: string
+        default: ''
+    secrets:
+      AZURE_AD_TENANT_ID:
+        required: false
+      AZURE_AD_APPLICATION_CLIENT_ID:
+        required: false
+      AZURE_AD_APPLICATION_SECRET:
+        required: false
+      SELLER_ID:
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-store
+  cancel-in-progress: false
+
+jobs:
+  package:
+    runs-on: windows-latest
+    env:
+      STORE_IDENTITY_NAME: ${{ vars.STORE_IDENTITY_NAME }}
+      STORE_PUBLISHER: ${{ vars.STORE_PUBLISHER }}
+      STORE_PUBLISHER_DISPLAY_NAME: ${{ vars.STORE_PUBLISHER_DISPLAY_NAME }}
+      STORE_DISPLAY_NAME: ${{ vars.STORE_DISPLAY_NAME }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Require reserved Store identity
+        shell: pwsh
+        run: |
+          foreach ($value in @($env:STORE_IDENTITY_NAME, $env:STORE_PUBLISHER, $env:STORE_PUBLISHER_DISPLAY_NAME, $env:STORE_DISPLAY_NAME)) {
+            if ([string]::IsNullOrWhiteSpace($value)) { throw 'Set the four STORE_* repository variables from Partner Center product identity before running this workflow.' }
+          }
+      - name: Verify release tag agrees with app version
+        if: inputs.release_tag != ''
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          $match = Select-String -LiteralPath src/main.zig -Pattern '^const VERSION = "([^"]+)";$'
+          $version = $match.Matches[0].Groups[1].Value
+          if ($env:RELEASE_TAG -notmatch '^v[1-9][0-9]*\.[0-9]+\.[0-9]+$' -or $env:RELEASE_TAG -ne "v$version") {
+            throw 'Store releases require a stable version tag matching src/main.zig'
+          }
+      - uses: actions/checkout@v4
+        with:
+          repository: gary23w/neuron-db
+          ref: 5db2c039bf8f20349299e64650aea2d6a2fce911
+          path: neuron-db
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build Neuron
+        working-directory: neuron-db/rust/neuron-core
+        run: cargo build --release --features "sqlite secure server trust semantic semantic-db fisher topics"
+      - name: Test and build desktop
+        shell: pwsh
+        run: |
+          zig build test -Dapp=false -Dbuiltin=false
+          if ($LASTEXITCODE -ne 0) { throw 'Server tests failed' }
+          Push-Location desk
+          try {
+            zig build test
+            if ($LASTEXITCODE -ne 0) { throw 'Desktop tests failed' }
+          } finally { Pop-Location }
+          zig build --prefix dist/windows-store/build
+          if ($LASTEXITCODE -ne 0) { throw 'Desktop build failed' }
+      - name: Package for Store upload
+        shell: pwsh
+        run: |
+          $identity = @{
+            identityName = $env:STORE_IDENTITY_NAME
+            publisher = $env:STORE_PUBLISHER
+            publisherDisplayName = $env:STORE_PUBLISHER_DISPLAY_NAME
+            displayName = $env:STORE_DISPLAY_NAME
+          }
+          $identity | ConvertTo-Json | Set-Content -LiteralPath packaging/windows/store-identity.json -Encoding utf8
+          ./scripts/package-store.ps1 -NeuronPath neuron-db/rust/neuron-core/target/release/neuron.exe
+      - name: Upload reviewable submission artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-store-submission
+          if-no-files-found: error
+          path: |
+            dist/windows-store/packages/*.msix
+            dist/windows-store/packages/*.msix.json
+            dist/windows-store/packages/stage-*/Assets/ListingIcon.png
+            packaging/windows/store-listing.json
+            packaging/windows/certification-notes.txt
+            packaging/windows/README.txt
+
+  publish:
+    needs: package
+    if: inputs.publish
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-store-submission
+          path: store-submission
+      - name: Require Microsoft publishing connection
+        shell: pwsh
+        env:
+          STORE_PRODUCT_ID: ${{ vars.STORE_PRODUCT_ID }}
+          AZURE_AD_TENANT_ID: ${{ secrets.AZURE_AD_TENANT_ID }}
+          AZURE_AD_APPLICATION_CLIENT_ID: ${{ secrets.AZURE_AD_APPLICATION_CLIENT_ID }}
+          AZURE_AD_APPLICATION_SECRET: ${{ secrets.AZURE_AD_APPLICATION_SECRET }}
+          SELLER_ID: ${{ secrets.SELLER_ID }}
+        run: |
+          foreach ($name in @('STORE_PRODUCT_ID', 'AZURE_AD_TENANT_ID', 'AZURE_AD_APPLICATION_CLIENT_ID', 'AZURE_AD_APPLICATION_SECRET', 'SELLER_ID')) {
+            if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) { throw "Missing Microsoft publishing configuration: $name" }
+          }
+      - uses: microsoft/microsoft-store-apppublisher@v1.1
+      - name: Authenticate Microsoft Store publisher
+        shell: pwsh
+        env:
+          AZURE_AD_TENANT_ID: ${{ secrets.AZURE_AD_TENANT_ID }}
+          AZURE_AD_APPLICATION_CLIENT_ID: ${{ secrets.AZURE_AD_APPLICATION_CLIENT_ID }}
+          AZURE_AD_APPLICATION_SECRET: ${{ secrets.AZURE_AD_APPLICATION_SECRET }}
+          SELLER_ID: ${{ secrets.SELLER_ID }}
+        run: |
+          msstore reconfigure --tenantId $env:AZURE_AD_TENANT_ID --sellerId $env:SELLER_ID --clientId $env:AZURE_AD_APPLICATION_CLIENT_ID --clientSecret $env:AZURE_AD_APPLICATION_SECRET
+          if ($LASTEXITCODE -ne 0) { throw 'Microsoft Store authentication failed' }
+      - name: Verify and submit package update
+        shell: pwsh
+        env:
+          STORE_PRODUCT_ID: ${{ vars.STORE_PRODUCT_ID }}
+        run: |
+          $packageRoot = Join-Path $PWD 'store-submission/dist/windows-store/packages'
+          $packages = @(Get-ChildItem -LiteralPath $packageRoot -Filter '*.msix' -File)
+          if ($packages.Count -ne 1 -or $packages[0].Name -match 'development') { throw 'Expected exactly one production MSIX' }
+          $package = $packages[0]
+          $report = Get-Content -LiteralPath ($package.FullName + '.json') -Raw | ConvertFrom-Json
+          if ($report.development -or (Get-FileHash -LiteralPath $package.FullName -Algorithm SHA256).Hash -ne $report.packageSha256) { throw 'Package integrity or identity check failed' }
+          msstore publish $packageRoot --appId $env:STORE_PRODUCT_ID --inputFile $package.FullName
+          if ($LASTEXITCODE -ne 0) { throw 'Microsoft Store update submission failed' }
+          msstore submission status $env:STORE_PRODUCT_ID
+          if ($LASTEXITCODE -ne 0) { throw 'Could not verify submission status' }
+          'Microsoft Store update submitted for certification. Microsoft controls the final certification and rollout.' >> $env:GITHUB_STEP_SUMMARY
