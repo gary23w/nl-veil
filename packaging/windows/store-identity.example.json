@@ -1,0 +1,6 @@
+{
+  "identityName": "COPY Package.Identity.Name FROM PARTNER CENTER",
+  "publisher": "COPY Package.Identity.Publisher FROM PARTNER CENTER",
+  "publisherDisplayName": "COPY Package.Properties.PublisherDisplayName FROM PARTNER CENTER",
+  "displayName": "nl-veil"
+}

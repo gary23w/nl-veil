@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>the Veil — Privacy</title>
+  <meta name="description" content="How the Veil uses local project data and optional connected services.">
+  <style>
+    :root { color-scheme: light dark; font: 17px/1.65 system-ui, sans-serif; }
+    body { max-width: 760px; margin: 0 auto; padding: 40px 24px 72px; }
+    h1, h2 { line-height: 1.25; } h2 { margin-top: 32px; font-size: 1.3rem; }
+    a { color: light-dark(#244caf, #9bbcff); } .date { opacity: .7; }
+  </style>
+</head>
+<body>
+  <a href="./">the Veil</a>
+  <h1>Privacy</h1>
+  <p class="date">Updated October 11, 2026</p>
+  <p>The Veil is an open-source desktop app for working on software with AI agents.
+    The data used by a task depends on the model, tools and connected services you choose.</p>
+
+  <h2>Data on your computer</h2>
+  <p>The app stores conversations, project memory, settings, logs and credentials in its
+    local data folder. Agents can read project files, write changes and run commands as
+    part of the tasks you give them. Use the app with projects you intend it to access
+    and review the resulting changes and activity.</p>
+  <p>Portable installs normally keep data next to the app. Microsoft Store installs
+    use the package's per-user LocalState folder. A configured data-directory override
+    can change that location. Local files are subject to your Windows account's access
+    controls and any backup or sync software you use.</p>
+
+  <h2>Models and online tools</h2>
+  <p>Local inference can process prompts on your machine using the built-in model engine
+    or a local model provider such as Ollama. Model downloads contact the hosting service.
+    Choosing a hosted provider sends prompts, conversation context and relevant project
+    or tool content to that provider. Its terms, privacy practices and charges apply.</p>
+  <p>Web searches, browsing, remote tools and other network features contact their
+    destinations and send the inputs needed for that operation. A local model does not
+    make network tools offline. Connected providers and websites may receive network
+    information such as your IP address.</p>
+
+  <h2>Optional Cloudflare connections</h2>
+  <p>Connecting Cloudflare authorizes the features you use in your own account. These
+    may include Workers AI, Workers, R2 storage, Containers and Tunnel. Workers AI
+    receives model requests. R2 backup can upload conversations and related app data;
+    automatic backup is enabled by default for a connected account and can be turned
+    off in the app. Cloud tasks upload their task inputs and runtime to your account
+    and may continue while the desktop app is closed. Cloudflare's terms and privacy
+    practices apply.</p>
+
+  <h2>Updates and distribution</h2>
+  <p>Official portable bundles check GitHub for app releases. Microsoft Store manages
+    updates for Store installations. Those services handle downloads and associated
+    network requests under their own privacy policies.</p>
+
+  <h2>Removing data and disconnecting services</h2>
+  <p>You can remove conversations and other local data using available app controls,
+    or close the app and remove its data folder. Back up anything you wish to keep.
+    Removing the app or local data does not remove copies held by a hosted provider,
+    your own backups or resources deployed into a cloud account. Manage those copies
+    and revoke connected-service access with the relevant provider. Previously deployed
+    cloud tasks and resources may need to be stopped or deleted separately.</p>
+
+  <h2>Questions and changes</h2>
+  <p>For questions about the app's data handling, use the
+    <a href="https://github.com/gary23w/nl-veil/issues">project support tracker</a>.
+    That tracker is public; do not post credentials, private source code or sensitive
+    personal information. The source is available at
+    <a href="https://github.com/gary23w/nl-veil">github.com/gary23w/nl-veil</a>.
+    This page will be updated when the described behavior changes.</p>
+</body>
+</html>
