@@ -29,6 +29,15 @@ for packaged processes, including its direct apply entry point.
 The optional Gary security runtime is AGPL-3.0. Its license, notice and
 corresponding source archive are shipped in cloud/. The app code is MIT.
 
+Windows App Certification Kit's optional Archive files usage check flags
+cloud/gary-source.tar.gz. This is corresponding source for the optional Gary
+runtime, not an archive of executables extracted and launched on the host.
+The optional Blocked executables check flags the bundled Neuron subprocess
+and user-requested command execution. These are core developer-tool features
+covered by the runFullTrust justification. Windows in S mode is not supported.
+Microsoft documents these Desktop Bridge optional checks as informational:
+https://learn.microsoft.com/en-us/windows/uwp/debug-test-perf/windows-desktop-bridge-app-tests
+
 Before submitting: run Windows App Certification Kit against a signed,
 installed package; exercise launch, model setup, an actual coding task,
 restart with saved state, an update and uninstall on a clean Windows test
