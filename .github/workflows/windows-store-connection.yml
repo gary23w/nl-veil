@@ -1,0 +1,40 @@
+name: Microsoft Store connection
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-store
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    env:
+      STORE_PRODUCT_ID: ${{ vars.STORE_PRODUCT_ID }}
+      AZURE_AD_TENANT_ID: ${{ secrets.AZURE_AD_TENANT_ID }}
+      AZURE_AD_APPLICATION_CLIENT_ID: ${{ secrets.AZURE_AD_APPLICATION_CLIENT_ID }}
+      AZURE_AD_APPLICATION_SECRET: ${{ secrets.AZURE_AD_APPLICATION_SECRET }}
+      SELLER_ID: ${{ secrets.SELLER_ID }}
+    steps:
+      - name: Require the existing publishing configuration
+        shell: pwsh
+        run: |
+          foreach ($name in @('STORE_PRODUCT_ID', 'AZURE_AD_TENANT_ID', 'AZURE_AD_APPLICATION_CLIENT_ID', 'AZURE_AD_APPLICATION_SECRET', 'SELLER_ID')) {
+            if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) { throw "Missing Microsoft publishing configuration: $name" }
+          }
+      - uses: microsoft/microsoft-store-apppublisher@v1.1
+      - name: Authenticate and read the existing product
+        shell: pwsh
+        run: |
+          msstore reconfigure --tenantId $env:AZURE_AD_TENANT_ID --sellerId $env:SELLER_ID --clientId $env:AZURE_AD_APPLICATION_CLIENT_ID --clientSecret $env:AZURE_AD_APPLICATION_SECRET
+          if ($LASTEXITCODE -ne 0) { throw 'Microsoft Store authentication failed' }
+          msstore apps get $env:STORE_PRODUCT_ID
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot read the configured Store product' }
+          msstore submission status $env:STORE_PRODUCT_ID
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot read the Store submission status' }
+          'GitHub authenticated the Microsoft Store publisher and read the configured product and submission status.' >> $env:GITHUB_STEP_SUMMARY
