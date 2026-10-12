@@ -18,9 +18,11 @@ download, and coding tools require Python on `PATH` (some checks also use Node).
 
 ### Stable release: v1.1.16
 
-v1.1.17 has been withdrawn. If you installed it, download and run the
-[v1.1.16 bundle](https://github.com/gary23w/nl-veil/releases/tag/v1.1.16) for your platform.
-Automatic updates do not downgrade an installed app.
+The original v1.1.16 build from October 10, with Gary's 4tope and the tool tree, is the
+latest stable release again. v1.1.17 and v1.1.18 have been withdrawn. If you installed
+either, download and run the [v1.1.16 bundle](https://github.com/gary23w/nl-veil/releases/tag/v1.1.16).
+Automatic updates do not downgrade an installed app. In this release, `NL_TOOL_MAP=1`
+enables the tool tree; Gary's 4tope is enabled by default.
 
 ### New in v1.1.16
 
