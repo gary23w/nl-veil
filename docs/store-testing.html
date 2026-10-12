@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>nl-veil — Microsoft Store reviewer instructions</title>
+  <meta name="description" content="Model setup, coding checks, and Microsoft Store runtime notes for nl-veil reviewers.">
+  <style>
+    :root { color-scheme: light dark; font: 17px/1.65 system-ui, sans-serif; }
+    body { max-width: 760px; margin: 0 auto; padding: 40px 24px 72px; }
+    h1, h2 { line-height: 1.25; } h2 { margin-top: 32px; font-size: 1.3rem; }
+    a { color: light-dark(#244caf, #9bbcff); } .date { opacity: .7; }
+    code { overflow-wrap: anywhere; }
+  </style>
+</head>
+<body>
+  <a href="./">the Veil</a>
+  <h1>Microsoft Store reviewer instructions</h1>
+  <p class="date">Updated October 11, 2026</p>
+  <p>nl-veil is a native x64 AI coding desktop app. Use Windows 10 build 19041 or later
+    with an OpenGL 3.3-capable graphics driver. The desktop workspace opens without
+    an AI-provider account.</p>
+  <h2>Model setup</h2>
+  <p>In Settings, choose a local model through Ollama or the built-in engine, or connect
+    your own hosted provider. Model weights are a separate download and are not bundled.
+    Local inference does not require a Veil subscription. Hosted providers may charge
+    for usage. No provider credentials or test accounts are included in the package.</p>
+  <p>Python must be on PATH for Python coding tools. Some JavaScript checks use Node.js.
+    Start the installed app normally so it inherits the standard Windows environment.
+    Close a portable Veil instance first to avoid a port conflict.</p>
+  <h2>Suggested checks</h2>
+  <ol>
+    <li>Launch nl-veil from Start, open Settings, change a setting, and save it.</li>
+    <li>Close and reopen the app; confirm the setting persists.</li>
+    <li>Connect a model and create a fresh conversation.</li>
+    <li>Ask for a small Python file with an addition function and a simple assertion.
+      Review the generated file and run its test.</li>
+    <li>Reopen the app and confirm the generated file and model setup remain available.</li>
+  </ol>
+  <h2>Store runtime</h2>
+  <p>The app needs runFullTrust for its native UI, bundled Neuron memory subprocess, and
+    user-requested development commands. Agents access projects the user opens. Core
+    operation does not require administrator rights. Store installations keep writable
+    state in the package's per-user LocalState folder and receive updates through
+    Microsoft Store.</p>
+  <p>Cloudflare ready: users may connect their own Cloudflare account for optional
+    Workers AI, backups, and cloud tasks. These features are optional and may incur
+    Cloudflare usage charges.</p>
+  <h2>Certification kit findings</h2>
+  <p>The optional Archive files usage check can flag <code>cloud/gary-source.tar.gz</code>.
+    This is corresponding source for the optional AGPL Gary runtime, not an executable
+    archive unpacked and launched on the host. The optional Blocked executables check
+    can flag the bundled Neuron subprocess and user-requested development commands.
+    Windows in S mode is not supported.</p>
+  <p>Microsoft describes these Desktop Bridge optional checks as informational in its
+    <a href="https://learn.microsoft.com/en-us/windows/uwp/debug-test-perf/windows-desktop-bridge-app-tests">certification guidance</a>.
+    App-specific results and remaining verification limits should be assessed against
+    the exact submission build.</p>
+  <p><a href="privacy.html">Privacy policy</a> ·
+    <a href="https://github.com/gary23w/nl-veil">Source repository</a></p>
+</body>
+</html>
