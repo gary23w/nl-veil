@@ -110,3 +110,41 @@ GitHub Pages. Merging docs/privacy.html makes its privacy URL available there.
 Monitor workflow results in GitHub Actions and certification in Partner
 Center; a workflow failure or certification rejection is not a published app.
 https://learn.microsoft.com/en-us/windows/apps/publish/msstore-dev-cli/github-actions
+
+AUTOMATIC CREDENTIAL REFRESH (GITHUB IDENTITY)
+Microsoft Store CLI v0.4.3 supports --clientAssertion and the
+MSSTORE_CLIENT_ASSERTION environment variable. The Store workflows use
+scripts/store-oidc.psm1 to request a fresh GitHub assertion immediately
+before each command, mask it in logs, and clear it after the command.
+No expiring client secret is needed when STORE_AUTH_MODE=oidc.
+
+One-time setup for the existing nl-veil GitHub publisher Entra application:
+  Issuer: https://token.actions.githubusercontent.com
+  Audience: api://AzureADTokenExchange
+  Subject: repo:gary23w@61893883/nl-veil@1280825877:environment:microsoft-store-publishing
+Create this exact federated credential using the Other issuer scenario.
+The immutable owner/repository IDs match the repository's existing OIDC
+configuration. Keep the existing Partner Center Manager role. No new Graph
+permissions or Azure subscription are needed.
+
+Create GitHub environment microsoft-store-publishing with selected deployment
+branches/tags: branch main and tags v*.*.*. Do not add PR refs, other branches,
+or wildcard branches. The helper independently rejects PRs and prereleases.
+The reusable release caller must grant id-token: write, as does its Store
+publishing job. Packaging and pull-request tests do not receive tokens.
+
+First run Microsoft Store connection on main with use_oidc=true. Only after
+it succeeds, set STORE_AUTH_MODE=oidc, run it again with the default inputs,
+and retire AZURE_AD_APPLICATION_SECRET and its original Entra client secret.
+Keep the tenant ID, client ID, and seller ID secrets, plus product variables.
+The connection workflow checks access weekly and can also be run manually;
+it never changes a Store submission. GitHub's usual workflow failure
+notifications apply. Publishing no longer depends on a scheduled rotation
+or a stored token expiry; each release obtains its own short-lived identity.
+
+Tests: ./scripts/test-store-oidc.ps1 (mocked network and Store command).
+Live verification: Microsoft Store connection, use_oidc=true (no submission).
+https://github.com/microsoft/msstore-cli/blob/v0.4.3/MSStore.CLI/Commands/ReconfigureCommand.cs
+https://github.com/microsoft/msstore-cli/blob/v0.4.3/MSStore.CLI/Services/EnvironmentInfo.cs
+https://docs.github.com/en/actions/reference/security/oidc
+https://learn.microsoft.com/en-us/entra/workload-id/workload-identity-federation-create-trust

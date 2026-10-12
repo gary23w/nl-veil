@@ -112,7 +112,16 @@ jobs:
     if: inputs.publish
     runs-on: windows-latest
     timeout-minutes: 30
+    environment: microsoft-store-publishing
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      USE_STORE_OIDC: ${{ vars.STORE_AUTH_MODE == 'oidc' }}
     steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
           name: windows-store-submission
@@ -126,10 +135,14 @@ jobs:
           AZURE_AD_APPLICATION_SECRET: ${{ secrets.AZURE_AD_APPLICATION_SECRET }}
           SELLER_ID: ${{ secrets.SELLER_ID }}
         run: |
-          foreach ($name in @('STORE_PRODUCT_ID', 'AZURE_AD_TENANT_ID', 'AZURE_AD_APPLICATION_CLIENT_ID', 'AZURE_AD_APPLICATION_SECRET', 'SELLER_ID')) {
+          $required = @('STORE_PRODUCT_ID', 'AZURE_AD_TENANT_ID', 'AZURE_AD_APPLICATION_CLIENT_ID', 'SELLER_ID')
+          if ($env:USE_STORE_OIDC -ne 'true') { $required += 'AZURE_AD_APPLICATION_SECRET' }
+          foreach ($name in $required) {
             if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) { throw "Missing Microsoft publishing configuration: $name" }
           }
       - uses: microsoft/microsoft-store-apppublisher@v1.1
+        with:
+          version: v0.4.3
       - name: Authenticate Microsoft Store publisher
         shell: pwsh
         env:
@@ -138,8 +151,13 @@ jobs:
           AZURE_AD_APPLICATION_SECRET: ${{ secrets.AZURE_AD_APPLICATION_SECRET }}
           SELLER_ID: ${{ secrets.SELLER_ID }}
         run: |
-          msstore reconfigure --tenantId $env:AZURE_AD_TENANT_ID --sellerId $env:SELLER_ID --clientId $env:AZURE_AD_APPLICATION_CLIENT_ID --clientSecret $env:AZURE_AD_APPLICATION_SECRET
-          if ($LASTEXITCODE -ne 0) { throw 'Microsoft Store authentication failed' }
+          if ($env:USE_STORE_OIDC -eq 'true') {
+            Import-Module ./scripts/store-oidc.psm1 -Force
+            Invoke-MicrosoftStoreWithOidc -Arguments @('reconfigure', '--tenantId', $env:AZURE_AD_TENANT_ID, '--sellerId', $env:SELLER_ID, '--clientId', $env:AZURE_AD_APPLICATION_CLIENT_ID, '--clientAssertion')
+          } else {
+            msstore reconfigure --tenantId $env:AZURE_AD_TENANT_ID --sellerId $env:SELLER_ID --clientId $env:AZURE_AD_APPLICATION_CLIENT_ID --clientSecret $env:AZURE_AD_APPLICATION_SECRET
+            if ($LASTEXITCODE -ne 0) { throw 'Microsoft Store authentication failed' }
+          }
       - name: Verify and submit package update
         shell: pwsh
         env:
@@ -151,8 +169,14 @@ jobs:
           $package = $packages[0]
           $report = Get-Content -LiteralPath ($package.FullName + '.json') -Raw | ConvertFrom-Json
           if ($report.development -or (Get-FileHash -LiteralPath $package.FullName -Algorithm SHA256).Hash -ne $report.packageSha256) { throw 'Package integrity or identity check failed' }
-          msstore publish $packageRoot --appId $env:STORE_PRODUCT_ID --inputFile $package.FullName
-          if ($LASTEXITCODE -ne 0) { throw 'Microsoft Store update submission failed' }
-          msstore submission status $env:STORE_PRODUCT_ID
-          if ($LASTEXITCODE -ne 0) { throw 'Could not verify submission status' }
+          if ($env:USE_STORE_OIDC -eq 'true') {
+            Import-Module ./scripts/store-oidc.psm1 -Force
+            Invoke-MicrosoftStoreWithOidc -Arguments @('publish', $packageRoot, '--appId', $env:STORE_PRODUCT_ID, '--inputFile', $package.FullName)
+            Invoke-MicrosoftStoreWithOidc -Arguments @('submission', 'status', $env:STORE_PRODUCT_ID)
+          } else {
+            msstore publish $packageRoot --appId $env:STORE_PRODUCT_ID --inputFile $package.FullName
+            if ($LASTEXITCODE -ne 0) { throw 'Microsoft Store update submission failed' }
+            msstore submission status $env:STORE_PRODUCT_ID
+            if ($LASTEXITCODE -ne 0) { throw 'Could not verify submission status' }
+          }
           'Microsoft Store update submitted for certification. Microsoft controls the final certification and rollout.' >> $env:GITHUB_STEP_SUMMARY
