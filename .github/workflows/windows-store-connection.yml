@@ -2,6 +2,13 @@ name: Microsoft Store connection
 
 on:
   workflow_dispatch:
+    inputs:
+      use_oidc:
+        description: Verify the GitHub identity connection before switching publishing
+        type: boolean
+        default: false
+  schedule:
+    - cron: '17 12 * * 1'
 
 permissions:
   contents: read
@@ -12,29 +19,50 @@ concurrency:
 
 jobs:
   verify:
+    if: github.repository == 'gary23w/nl-veil' && github.ref == 'refs/heads/main'
     runs-on: windows-latest
+    environment: microsoft-store-publishing
+    permissions:
+      contents: read
+      id-token: write
     timeout-minutes: 10
     env:
+      USE_STORE_OIDC: ${{ inputs.use_oidc || vars.STORE_AUTH_MODE == 'oidc' }}
       STORE_PRODUCT_ID: ${{ vars.STORE_PRODUCT_ID }}
       AZURE_AD_TENANT_ID: ${{ secrets.AZURE_AD_TENANT_ID }}
       AZURE_AD_APPLICATION_CLIENT_ID: ${{ secrets.AZURE_AD_APPLICATION_CLIENT_ID }}
       AZURE_AD_APPLICATION_SECRET: ${{ secrets.AZURE_AD_APPLICATION_SECRET }}
       SELLER_ID: ${{ secrets.SELLER_ID }}
     steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Require the existing publishing configuration
         shell: pwsh
         run: |
-          foreach ($name in @('STORE_PRODUCT_ID', 'AZURE_AD_TENANT_ID', 'AZURE_AD_APPLICATION_CLIENT_ID', 'AZURE_AD_APPLICATION_SECRET', 'SELLER_ID')) {
+          $required = @('STORE_PRODUCT_ID', 'AZURE_AD_TENANT_ID', 'AZURE_AD_APPLICATION_CLIENT_ID', 'SELLER_ID')
+          if ($env:USE_STORE_OIDC -ne 'true') { $required += 'AZURE_AD_APPLICATION_SECRET' }
+          foreach ($name in $required) {
             if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) { throw "Missing Microsoft publishing configuration: $name" }
           }
       - uses: microsoft/microsoft-store-apppublisher@v1.1
+        with:
+          version: v0.4.3
       - name: Authenticate and read the existing product
         shell: pwsh
         run: |
-          msstore reconfigure --tenantId $env:AZURE_AD_TENANT_ID --sellerId $env:SELLER_ID --clientId $env:AZURE_AD_APPLICATION_CLIENT_ID --clientSecret $env:AZURE_AD_APPLICATION_SECRET
-          if ($LASTEXITCODE -ne 0) { throw 'Microsoft Store authentication failed' }
-          msstore apps get $env:STORE_PRODUCT_ID
-          if ($LASTEXITCODE -ne 0) { throw 'Cannot read the configured Store product' }
-          msstore submission status $env:STORE_PRODUCT_ID
-          if ($LASTEXITCODE -ne 0) { throw 'Cannot read the Store submission status' }
+          if ($env:USE_STORE_OIDC -eq 'true') {
+            Import-Module ./scripts/store-oidc.psm1 -Force
+            Invoke-MicrosoftStoreWithOidc -Arguments @('reconfigure', '--tenantId', $env:AZURE_AD_TENANT_ID, '--sellerId', $env:SELLER_ID, '--clientId', $env:AZURE_AD_APPLICATION_CLIENT_ID, '--clientAssertion')
+            Invoke-MicrosoftStoreWithOidc -Arguments @('apps', 'get', $env:STORE_PRODUCT_ID)
+            Invoke-MicrosoftStoreWithOidc -Arguments @('submission', 'status', $env:STORE_PRODUCT_ID)
+            'GitHub identity authentication passed. Each Store command received a fresh short-lived assertion; no client secret was used.' >> $env:GITHUB_STEP_SUMMARY
+          } else {
+            msstore reconfigure --tenantId $env:AZURE_AD_TENANT_ID --sellerId $env:SELLER_ID --clientId $env:AZURE_AD_APPLICATION_CLIENT_ID --clientSecret $env:AZURE_AD_APPLICATION_SECRET
+            if ($LASTEXITCODE -ne 0) { throw 'Microsoft Store authentication failed' }
+            msstore apps get $env:STORE_PRODUCT_ID
+            if ($LASTEXITCODE -ne 0) { throw 'Cannot read the configured Store product' }
+            msstore submission status $env:STORE_PRODUCT_ID
+            if ($LASTEXITCODE -ne 0) { throw 'Cannot read the Store submission status' }
+          }
           'GitHub authenticated the Microsoft Store publisher and read the configured product and submission status.' >> $env:GITHUB_STEP_SUMMARY
