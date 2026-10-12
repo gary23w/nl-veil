@@ -1,0 +1,31 @@
+name: Store authentication tests
+
+on:
+  pull_request:
+    paths:
+      - 'scripts/store-oidc.psm1'
+      - 'scripts/test-store-oidc.ps1'
+      - '.github/workflows/windows-store*.yml'
+      - '.github/workflows/release.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/store-oidc.psm1'
+      - 'scripts/test-store-oidc.ps1'
+      - '.github/workflows/windows-store*.yml'
+      - '.github/workflows/release.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Verify Store identity boundaries and cleanup without credentials
+        shell: pwsh
+        run: ./scripts/test-store-oidc.ps1
