@@ -59,18 +59,21 @@ jobs:
           if ($env:RELEASE_TAG -notmatch '^v[1-9][0-9]*\.[0-9]+\.[0-9]+$' -or $env:RELEASE_TAG -ne "v$version") {
             throw 'Store releases require a stable version tag matching src/main.zig'
           }
-      - uses: actions/checkout@v4
-        with:
-          repository: gary23w/neuron-db
-          ref: 5db2c039bf8f20349299e64650aea2d6a2fce911
-          path: neuron-db
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Build Neuron
-        working-directory: neuron-db/rust/neuron-core
-        run: cargo build --release --features "sqlite secure server trust semantic semantic-db fisher topics"
+      - name: Retrieve verified stable 1.1.16 memory engine
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          New-Item -ItemType Directory -Path bin -Force | Out-Null
+          gh release download v1.1.16 --repo gary23w/nl-veil --pattern veil-update-v1.1.16-windows-x86_64-neuron --dir bin
+          if ($LASTEXITCODE -ne 0) { throw 'Stable memory engine download failed' }
+          $engine = 'bin/veil-update-v1.1.16-windows-x86_64-neuron'
+          $expected = 'AE6F95578B7D8E6DA38960391B315872D442A7D21118C88060DD19E8C8008D27'
+          if ((Get-FileHash -LiteralPath $engine -Algorithm SHA256).Hash -ne $expected) { throw 'Stable memory engine checksum mismatch' }
+          Move-Item -LiteralPath $engine -Destination bin/neuron.exe
       - name: Test and build desktop
         shell: pwsh
         run: |
@@ -93,7 +96,7 @@ jobs:
             displayName = $env:STORE_DISPLAY_NAME
           }
           $identity | ConvertTo-Json | Set-Content -LiteralPath packaging/windows/store-identity.json -Encoding utf8
-          ./scripts/package-store.ps1 -NeuronPath neuron-db/rust/neuron-core/target/release/neuron.exe
+          ./scripts/package-store.ps1 -NeuronPath bin/neuron.exe
       - name: Upload reviewable submission artifacts
         uses: actions/upload-artifact@v4
         with:
