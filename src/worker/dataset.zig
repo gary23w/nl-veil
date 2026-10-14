@@ -348,7 +348,7 @@ fn writeReadme(dir: []const u8, id: []const u8, label: []const u8) void {
         \\- `source` — `chat`, `swarm`, or `task`: which surface generated it.
         \\- `role_label` — the engine's own name for the call (`chat`, `plan`, `loop`, `compact`, …), so a
         \\  trainer can keep the agentic step and the summarizer apart.
-        \\- `finish_reason` — `tool_calls`, `stop`, or `length`. Read this before training; see below.
+        \\- `finish_reason` — `tool_calls`, `stop`, `length`, or `incomplete`. Read this before training; see below.
         \\
         \\## Filtering
         \\
@@ -360,6 +360,11 @@ fn writeReadme(dir: []const u8, id: []const u8, label: []const u8) void {
         \\when the token budget ran out — the text ends mid-word and there is no answer and no tool call,
         \\only a truncated reasoning trace. They look like empty replies and they teach exactly that. On the
         \\first real capture they were 13% of the set. `jq 'select(.finish_reason != "length")'`.
+        \\
+        \\**Drop `finish_reason:"incomplete"` too.** A streamed reply whose stream ended with no finish and no
+        \\`[DONE]` — a transfer cut at its time limit or dropped mid-reply. It holds what arrived before the cut
+        \\and nothing says whether the answer was coming. `jq 'select(.finish_reason == "stop" or
+        \\.finish_reason == "tool_calls")'` keeps only the finished ones.
         \\
         \\**A `stop` record with an empty completion is usually CORRECT, not broken.** The memory-extraction
         \\role emits nothing when a turn holds no durable fact ("Nothing qualifies. Output empty."). That is

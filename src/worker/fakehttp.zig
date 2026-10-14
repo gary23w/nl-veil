@@ -24,7 +24,10 @@ const builtin = @import("builtin");
 /// TEST ONLY. One canned answer for `Server.startRouted`: requests whose method is `method` and whose
 /// target contains `path`. `times` > 0 retires the route after that many answers, so "fails once, then
 /// succeeds" is two routes in that order; 0 answers for as long as the server runs.
-pub const Route = struct { method: []const u8, path: []const u8, reply: []const u8, times: u32 = 0 };
+/// `has` narrows it further: every listed substring must appear in that request's head (its headers) or the first
+/// 32 KB of its body. A credential rotation is then two routes on one path - `Authorization: Bearer key-old` refused,
+/// `Bearer key-new` answered - and `"stream":true` tells a streamed request from a blocking one.
+pub const Route = struct { method: []const u8, path: []const u8, reply: []const u8, times: u32 = 0, has: []const []const u8 = &.{} };
 
 /// TEST ONLY. Runs on the serve thread for each request once it has arrived whole, before its reply goes out
 /// (`startWatched`): the client is connected and waiting, so a test sees the world as it is mid-call.
@@ -130,9 +133,19 @@ pub const Server = struct {
             var line0: [CALL_LEN]u8 = undefined;
             var line0_len: usize = 0;
             var head_lines: usize = 0;
+            // THIS request's head, for the routes that match on it (Route.has): `req` keeps only the first request's.
+            var head: [8 << 10]u8 = undefined;
+            var head_len: usize = 0;
             while (true) {
                 const line = (rd.interface.takeDelimiter('\n') catch break) orelse break;
                 if (first) self.capture(line);
+                const hn = @min(line.len, head.len - head_len);
+                @memcpy(head[head_len..][0..hn], line[0..hn]);
+                head_len += hn;
+                if (head_len < head.len) {
+                    head[head_len] = '\n';
+                    head_len += 1;
+                }
                 if (head_lines == 0) {
                     const t = std.mem.trimEnd(u8, line, "\r");
                     const end = std.mem.lastIndexOfScalar(u8, t, ' ') orelse t.len; // drop " HTTP/1.1"
@@ -146,17 +159,21 @@ pub const Server = struct {
             // Then the body, so a test can assert what was SENT and not just that something arrived.
             // Read it even when not capturing: leaving it unread is the reset hazard the head drain
             // above exists to avoid.
+            var body_buf: [32 << 10]u8 = undefined;
+            var body_len: usize = 0; // the body's first bytes, kept for Route.has
             if (clen > 0) {
-                var body_buf: [32 << 10]u8 = undefined;
                 const n = @min(clen, body_buf.len);
                 if (rd.interface.readSliceAll(body_buf[0..n])) {
                     if (first) self.capture(body_buf[0..n]);
+                    body_len = n;
                     // A body longer than the capture is drained to its end all the same: answering with part
                     // of it unread is the same reset hazard, and it made a 70 KB upload fail one run in four.
+                    // Into a buffer of its own, so the first bytes stay for the route match.
+                    var drain: [4 << 10]u8 = undefined;
                     var left = clen - n;
                     while (left > 0) {
-                        const k = @min(left, body_buf.len);
-                        rd.interface.readSliceAll(body_buf[0..k]) catch break;
+                        const k = @min(left, drain.len);
+                        rd.interface.readSliceAll(drain[0..k]) catch break;
                         left -= k;
                     }
                 } else |_| {}
@@ -170,17 +187,22 @@ pub const Server = struct {
             if (self.on_request) |f| f();
             var wbuf: [8 << 10]u8 = undefined;
             var wr = conn.writer(self.io, &wbuf);
-            wr.interface.writeAll(self.pick(call)) catch {};
+            wr.interface.writeAll(self.pick(call, head[0..head_len], body_buf[0..body_len])) catch {};
             wr.interface.flush() catch {};
         }
     }
 
-    /// The reply for one request line: the first route matching it with uses left, else `reply`.
-    fn pick(self: *Server, call: []const u8) []const u8 {
+    /// The reply for one request: the first route matching its line (and its head or body, Route.has) with uses
+    /// left, else `reply`.
+    fn pick(self: *Server, call: []const u8, head: []const u8, body: []const u8) []const u8 {
         const sp = std.mem.indexOfScalar(u8, call, ' ') orelse return self.reply;
         for (self.routes, 0..) |r, i| {
             if (r.times > 0 and self.used[i] >= r.times) continue;
             if (!std.mem.eql(u8, r.method, call[0..sp]) or std.mem.indexOf(u8, call[sp + 1 ..], r.path) == null) continue;
+            const has_all = for (r.has) |s| {
+                if (std.mem.indexOf(u8, head, s) == null and std.mem.indexOf(u8, body, s) == null) break false;
+            } else true;
+            if (!has_all) continue;
             self.used[i] += 1;
             return r.reply;
         }
@@ -269,4 +291,50 @@ test "stand-ins started side by side get ports of their own, so none answers ano
     try std.testing.expect(one.port != 0);
     try std.testing.expect(two.port != 0);
     try std.testing.expect(one.port != two.port);
+}
+
+test "a route that names what a request must carry answers only the requests carrying it, in its head or its body" {
+    const httpc = @import("httpc.zig"); // test-only: the in-process client puts a bearer in the head as a caller does
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var srv: Server = undefined;
+    const routes = [_]Route{
+        .{ .method = "POST", .path = "/v1", .reply = wire("{\"who\":\"refused\"}"), .has = &.{"Authorization: Bearer key-old"} },
+        .{ .method = "POST", .path = "/v1", .reply = wire("{\"who\":\"stream\"}"), .has = &.{ "Bearer key-new", "\"stream\":true" } },
+        .{ .method = "POST", .path = "/v1", .reply = wire("{\"who\":\"plain\"}"), .has = &.{"Bearer key-new"} },
+    };
+    try srv.startRouted(io, &routes, wire("{\"who\":\"nobody\"}"));
+    const Case = struct { bearer: []const u8, body: []const u8, who: []const u8 };
+    const cases = [_]Case{
+        .{ .bearer = "key-old", .body = "{\"stream\":true}", .who = "refused" }, // the first route that matches answers
+        .{ .bearer = "key-new", .body = "{\"stream\":true}", .who = "stream" }, // head AND body
+        .{ .bearer = "key-new", .body = "{}", .who = "plain" },
+        .{ .bearer = "key-newer", .body = "{}", .who = "plain" }, // a substring match: name what tells them apart
+        .{ .bearer = "other", .body = "{}", .who = "nobody" },
+    };
+    var got: [cases.len][32]u8 = undefined;
+    var got_len: [cases.len]usize = undefined;
+    for (cases, 0..) |c, i| {
+        switch (httpc.request(io, gpa, .{ .method = "POST", .port = srv.port, .path = "/v1", .bearer = c.bearer, .body = c.body, .timeout_s = 10 })) {
+            .ok => |resp| {
+                defer if (resp.body.len > 0) gpa.free(resp.body);
+                got_len[i] = @min(resp.body.len, got[i].len);
+                @memcpy(got[i][0..got_len[i]], resp.body[0..got_len[i]]);
+            },
+            else => {
+                srv.stop();
+                return error.SkipZigTest; // no loopback round trip on this box
+            },
+        }
+    }
+    srv.stop();
+    for (cases, 0..) |c, i| {
+        var want: [32]u8 = undefined;
+        try std.testing.expectEqualStrings(try std.fmt.bufPrint(&want, "{{\"who\":\"{s}\"}}", .{c.who}), got[i][0..got_len[i]]);
+    }
+    try std.testing.expectEqual(@as(u32, 1), srv.used[0]);
+    try std.testing.expectEqual(@as(u32, 1), srv.used[1]);
+    try std.testing.expectEqual(@as(u32, 2), srv.used[2]);
 }
