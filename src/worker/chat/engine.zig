@@ -1882,6 +1882,38 @@ const TOOL_PREVIEW_BYTES: usize = 2000;
 /// Bounded-context sizes for the cheap auxiliary inferences (drive-loop step picker / round-cap summary).
 const LOOP_CTX_BYTES: usize = 14 * 1024;
 const SUMMARY_CTX_BYTES: usize = 18 * 1024;
+/// How much of the request the drive picker and the course check are shown as THE GOAL. It was 1400 bytes — the
+/// opening paragraph. A task message that opens with an intro and a tool recipe and puts its requirements after
+/// them (every SWE-bench Lite task message, measured 2026-10-14: the issue starts past byte 1400 on all of them)
+/// gave the picker a goal with no requirement in it, so it named next steps for a task it had never read. 6 KB
+/// is the allowance the recon survey already gives the request (reconFindings), paid once per drive step on a
+/// toolless call that reuses no cached prefix anyway; a longer request is clipped there, as before.
+const PICKER_GOAL_BYTES: usize = 6 * 1024;
+
+/// The drive picker's goal anchor: the system line that tells a bounded picker what the whole conversation is
+/// for, with the request clipped at PICKER_GOAL_BYTES. gpa-owned.
+fn pickerGoalLine(gpa: std.mem.Allocator, goal: []const u8) ![]u8 {
+    return std.fmt.allocPrint(gpa, "You drive an agentic work loop. THE GOAL of this conversation: {s}\n(Only the most recent part of the conversation follows.)", .{clipBytes(goal, PICKER_GOAL_BYTES)});
+}
+
+test "the drive picker is shown the request's requirements, not only its opening paragraph" {
+    const gpa = std.testing.allocator;
+    var req: std.ArrayListUnmanaged(u8) = .empty;
+    defer req.deinit(gpa);
+    try req.appendSlice(gpa, "Fix the following software issue in the existing checkout.\n\n");
+    while (req.items.len < 3000) try req.appendSlice(gpa, "Tools: read_file, edit_file, run_python; the container recipe repeats here. ");
+    try req.appendSlice(gpa, "\n\nRules: never edit existing tests; run testing/test_terminal.py after the change.\n\nIssue:\nthe wrong path is shown");
+    const line = try pickerGoalLine(gpa, req.items);
+    defer gpa.free(line);
+    try std.testing.expect(std.mem.indexOf(u8, line, "never edit existing tests") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "Issue:\nthe wrong path is shown") != null);
+    try std.testing.expect(std.mem.startsWith(u8, line, "You drive an agentic work loop. THE GOAL of this conversation: Fix the following"));
+    // still bounded: a request past the allowance is clipped there, never carried whole
+    while (req.items.len < PICKER_GOAL_BYTES + 4000) try req.appendSlice(gpa, "more of the issue text. ");
+    const long = try pickerGoalLine(gpa, req.items);
+    defer gpa.free(long);
+    try std.testing.expect(long.len < PICKER_GOAL_BYTES + 200);
+}
 
 /// The cut turn's working log, as HEAD + TAIL, for the continuation state (see handoffSpan). Both ends, weighted
 /// to the tail, because compaction has already shaped this span: compactWorking folds the older part into one
@@ -4513,8 +4545,8 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
         var lq: std.ArrayListUnmanaged(u8) = .empty;
         defer lq.deinit(gpa);
         lq.appendSlice(gpa, "{\"role\":\"system\",\"content\":") catch break :outer;
-        var gb: [1700]u8 = undefined;
-        const goal_line = std.fmt.bufPrint(&gb, "You drive an agentic work loop. THE GOAL of this conversation: {s}\n(Only the most recent part of the conversation follows.)", .{clipBytes(goal_text, 1400)}) catch "You drive an agentic work loop; only the most recent part of the conversation follows.";
+        const goal_line = pickerGoalLine(gpa, goal_text) catch break :outer;
+        defer gpa.free(goal_line);
         http.jstr(gpa, &lq, goal_line) catch break :outer;
         lq.appendSlice(gpa, "},") catch break :outer;
         lq.appendSlice(gpa, msgTail(conv_buf.items, LOOP_CTX_BYTES)) catch break :outer;
@@ -8387,7 +8419,7 @@ fn courseCheck(app: *App, run_root: []const u8, p: Provider, role: Role, goal: [
     var gl: std.ArrayListUnmanaged(u8) = .empty;
     defer gl.deinit(gpa);
     gl.appendSlice(gpa, "THE GOAL: ") catch return null;
-    gl.appendSlice(gpa, clipBytes(goal, 1400)) catch return null;
+    gl.appendSlice(gpa, clipBytes(goal, PICKER_GOAL_BYTES)) catch return null;
     if (!brief.isEmpty()) {
         gl.appendSlice(gpa, "\nDONE MEANS:") catch return null;
         for (brief.done_when) |c| {
