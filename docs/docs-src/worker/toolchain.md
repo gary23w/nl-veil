@@ -18,7 +18,7 @@ Gap 1, BOOTSTRAP: the swarm writes a package.json / requirements.txt / Cargo.tom
 
 ## Dependencies
 
-- `std` + `builtin` only — `std.process.run` through `cmd /C` on Windows and `/bin/sh -c` elsewhere.
+- `std` + `builtin`, and `bounded.zig` — `bounded.run` through `cmd /C` on Windows and `/bin/sh -c` elsewhere.
 
 ## Usage Context
 
@@ -27,7 +27,7 @@ Imported by `worker/run.zig`. Per the header, bootstrap is gated by the engine o
 ## Notable Implementation Details
 
 - API credentials are blanked from the child environment (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `NL_BROKER_AUTH`) exactly like the declared-checks lane — an install script must never see the operator's keys.
-- Each install step is bounded: 360s timeout, 32 KB output caps; a failure note carries the exit code and the last 300 chars of stderr (or stdout), and a spawn failure/timeout is reported as "did not finish" without stopping the other steps.
+- Each install step is bounded through `bounded.run`: one 360 s deadline for the whole step (it was a silence timer that never fired on Windows for a silent install), killed with everything it started, and 32 KB output caps; a failure note carries the exit code and the last 300 chars of stderr (or stdout), and a step that never finished is reported as "did not finish" with its reason (still running at the bound, printed over 32 KB, or could not be run) without stopping the other steps.
 - `deriveChecks` skips npm's default `"no test specified"` placeholder — it is not a test suite — and adopts a build row only when the script is a non-empty string.
 - The fingerprint XORs a per-file Wyhash (keyed by the manifest name) so both content changes and which-manifests-exist changes move it.
 

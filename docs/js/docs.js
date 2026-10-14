@@ -151,7 +151,8 @@
       { p: 'worker/wsock', c: 'WK-30', t: 'Wsock — blocking Winsock round trip under httpc on Windows', s: 'wsock.zig' },
       { p: 'worker/dataset', c: 'WK-31', t: 'Dataset — every LLM call and tool run captured as a fine-tuning set', s: 'dataset.zig' },
       { p: 'worker/portprobe', c: 'WK-32', t: 'Portprobe — is a port held: the Windows answer std listen cannot give', s: 'portprobe.zig' },
-      { p: 'worker/proposals', c: 'WK-33', t: 'Proposals — accept or reject what a lineage proposed: lessons, skills, habits', s: 'proposals.zig' }
+      { p: 'worker/proposals', c: 'WK-33', t: 'Proposals — accept or reject what a lineage proposed: lessons, skills, habits', s: 'proposals.zig' },
+      { p: 'worker/bounded', c: 'WK-35', t: 'Bounded — a child run whose bound holds on Windows: one deadline, the tree killed', s: 'bounded.zig' }
     ]},
     { key: 'desk/', label: 'DESK — THE NATIVE DASHBOARD (veil-desk)', note: 'zig + raylib', docs: [
       { p: 'desk/main', c: 'DK-01', t: 'Entry point — borderless raylib window, render loop, tabs', s: 'main.zig' },

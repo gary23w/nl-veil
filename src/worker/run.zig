@@ -38,6 +38,7 @@ const writer = @import("writer.zig");
 const locs = @import("locs/atlas.zig");
 const ragmirror = @import("ragmirror.zig");
 const toolchain = @import("toolchain.zig");
+const bounded = @import("bounded.zig"); // a child run under a bound that holds on Windows too (std.process.run's does not)
 const lineage = @import("lineage.zig");
 const proposals = @import("proposals.zig");
 const cctx = @import("chat/context.zig");
@@ -6162,13 +6163,10 @@ fn pySalvageCheck(w: *Worker, source: []const u8) u8 {
     // dup check counts only UNDECORATED defs (@overload / @singledispatch.register legitimately repeat a name)
     const code = "import os,sys,ast\nsrc=os.environ.get('NL_SALVAGE_SRC','')\ntry:\n compile(src,'<salvage>','exec')\nexcept SyntaxError:\n sys.exit(7)\nexcept Exception:\n sys.exit(0)\ntry:\n seen=set()\n for n in ast.parse(src).body:\n  if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef,ast.ClassDef)) and not n.decorator_list:\n   if n.name in seen: sys.exit(8)\n   seen.add(n.name)\nexcept Exception:\n pass\nsys.exit(0)\n";
     const argv = [_][]const u8{ py, "-c", code };
-    const r = std.process.run(gpa, w.io, .{ .argv = &argv, .environ_map = &env, .stdout_limit = .limited(4096), .stderr_limit = .limited(4096), .timeout = .{ .duration = .{ .raw = .fromSeconds(15), .clock = .awake } } }) catch return 0;
-    defer gpa.free(r.stdout);
-    defer gpa.free(r.stderr);
-    return switch (r.term) {
-        .exited => |c| if (c == 7 or c == 8) @intCast(c) else 0,
-        else => 0,
-    };
+    var r = bounded.run(gpa, w.io, .{ .argv = &argv, .environ_map = &env, .bound_ms = 15_000, .stdout_limit = 4096, .stderr_limit = 4096 });
+    defer r.deinit(gpa);
+    const c = r.exited() orelse return 0;
+    return if (c == 7 or c == 8) @intCast(c) else 0;
 }
 
 fn urlFromArgs(args: []const u8) ?[]const u8 {
@@ -7072,9 +7070,9 @@ fn probeRowExecutes(w: *Worker, run_dir: []const u8, row: []const u8) ?[]const u
     defer if (via.len > 0) gpa.free(@constCast(via));
     const row_arg: []const u8 = if (via.len > 0) via else row;
     const argv: [3][]const u8 = if (builtin.os.tag == .windows) .{ "cmd", "/C", row_arg } else .{ "/bin/sh", "-c", row };
-    const r = std.process.run(gpa, w.io, .{ .argv = &argv, .cwd = .{ .path = workdir }, .environ_map = &env, .stdout_limit = .limited(16 << 10), .stderr_limit = .limited(16 << 10), .timeout = .{ .duration = .{ .raw = .fromSeconds(25), .clock = .awake } } }) catch return null;
-    defer gpa.free(r.stdout);
-    defer gpa.free(r.stderr);
+    var r = bounded.run(gpa, w.io, .{ .argv = &argv, .cwd = .{ .path = workdir }, .environ_map = &env, .bound_ms = 25_000, .stdout_limit = 16 << 10, .stderr_limit = 16 << 10 });
+    defer r.deinit(gpa);
+    if (!r.finished()) return null; // cut at the bound or a limit (so it ran), or the probe itself failed: not proof
     if (!shellNonExec(r.stderr) and !shellNonExec(r.stdout)) return null;
     const src = if (shellNonExec(r.stderr)) r.stderr else r.stdout;
     return gpa.dupe(u8, clip(std.mem.trim(u8, src, " \r\n\t"), 300)) catch null;
@@ -7197,27 +7195,28 @@ fn runDeclaredChecks(w: *Worker, run_dir: []const u8) BenchResult {
         const cmd = std.mem.trim(u8, raw, " \r\t");
         if (cmd.len == 0) continue;
         total += 1;
-        // Rows run sequentially, so one script slot is safely reused; the file is fully read by cmd
-        // before std.process.run returns (run waits for exit).
+        // Rows run sequentially, so one script slot is safely reused; the shell that reads it is gone
+        // before bounded.run returns (it waits for the exit, or kills the tree at the bound).
         const via = winRowViaScript(w, run_dir, cmd, ".chk_row.cmd");
         defer if (via.len > 0) gpa.free(@constCast(via));
         const row_arg: []const u8 = if (via.len > 0) via else cmd;
         const argv: [3][]const u8 = if (builtin.os.tag == .windows) .{ "cmd", "/C", row_arg } else .{ "/bin/sh", "-c", cmd };
-        // The timeout guards a HUNG toolchain only — deliberately generous, because a cold `cargo build` or
+        // The bound guards a HUNG toolchain only — deliberately generous, because a cold `cargo build` or
         // first `go build` legitimately takes minutes; per-test speed budgets belong in the declared command.
-        const r = std.process.run(gpa, w.io, .{ .argv = &argv, .cwd = .{ .path = workdir }, .environ_map = &env, .stdout_limit = .limited(48 << 10), .stderr_limit = .limited(48 << 10), .timeout = .{ .duration = .{ .raw = .fromSeconds(240), .clock = .awake } } }) catch {
+        // It is ONE deadline for the row: std.process.run's timeout restarted at every line the row printed,
+        // and on Windows never fired for a row that printed nothing.
+        var r = bounded.run(gpa, w.io, .{ .argv = &argv, .cwd = .{ .path = workdir }, .environ_map = &env, .bound_ms = 240_000, .stdout_limit = 48 << 10, .stderr_limit = 48 << 10 });
+        defer r.deinit(gpa);
+        if (!r.finished()) {
             if (fl.items.len > 0) fl.appendSlice(gpa, "; ") catch {};
-            fl.appendSlice(gpa, "`") catch {};
-            fl.appendSlice(gpa, cmd) catch {};
-            fl.appendSlice(gpa, "` did not finish (spawn failed or exceeded 240s)") catch {};
+            switch (r.end) {
+                .killed => fl.print(gpa, "`{s}` did not finish (still running at the 240s bound; killed with everything it started)", .{cmd}) catch {},
+                .overflow => fl.print(gpa, "`{s}` did not finish (printed over 48 KB; stopped there)", .{cmd}) catch {},
+                else => fl.print(gpa, "`{s}` did not finish (could not be run: {s})", .{ cmd, r.why() }) catch {},
+            }
             continue;
-        };
-        defer gpa.free(r.stdout);
-        defer gpa.free(r.stderr);
-        const code: u32 = switch (r.term) {
-            .exited => |c| c,
-            else => 999,
-        };
+        }
+        const code: u32 = r.exited() orelse 999;
         if (code == 0) {
             passed += 1;
             continue;
@@ -7276,6 +7275,58 @@ fn runDeclaredChecks(w: *Worker, run_dir: []const u8) BenchResult {
     return res;
 }
 
+test "a declared check that hangs printing nothing is cut at its bound with everything it started, and the next row still runs (real shell)" {
+    const gpa = std.testing.allocator;
+    const environ: std.process.Environ = if (builtin.os.tag == .windows) .{ .block = .global } else .{ .block = .{ .slice = std.mem.span(std.c.environ) } };
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = environ });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const cwd = std.Io.Dir.cwd();
+    const root = "zig-declared-bound-tmp";
+    cwd.deleteTree(io, root) catch {};
+    defer cwd.deleteTree(io, root) catch {};
+    _ = cwd.createDirPathStatus(io, root ++ "/work", .default_dir) catch {};
+    var env = try environ.createMap(gpa);
+    defer env.deinit();
+    var w = Worker{
+        .gpa = gpa,
+        .io = io,
+        .scratch = std.heap.ArenaAllocator.init(gpa),
+        .run_dir = root,
+        .ev_path = root ++ "/events.jsonl",
+        .ctl_path = root ++ "/control.jsonl",
+        .stop_path = root ++ "/STOP",
+        .mem = Mem.init(gpa, io, root ++ "/no-neuron.exe", root ++ "/hive.db"),
+        .base_url = "",
+        .key = "",
+        .model = "fake-model",
+    };
+    defer w.scratch.deinit();
+    w.mem.environ = &env; // the checks' env is a clone of this one
+    // The measured failure's shape: the row's real work runs a level below the shell and nothing reaches the pipes
+    // (ping's output goes to held.txt, which it holds open; the POSIX loop grows it). Only a natural end, ~30 s out,
+    // writes end.txt. The old std.process.run waited that out on Windows; its 240 s silence timer would have too.
+    const hang = if (builtin.os.tag == .windows)
+        "ping -n 30 127.0.0.1 >held.txt 2>&1 & echo natural>end.txt"
+    else
+        "sh -c 'i=0; while [ $i -lt 300 ]; do echo x >> held.txt; i=$((i+1)); sleep 0.1; done'; echo natural > end.txt";
+    w.checks_str = hang ++ "\necho second-row-ran";
+    bounded.seam.cap_ms = 1000; // the real bound is 240 s
+    defer bounded.seam.cap_ms = null;
+    const res = runDeclaredChecks(&w, root);
+    defer gpa.free(res.failures);
+    try std.testing.expectEqual(@as(u32, 2), res.total);
+    try std.testing.expectEqual(@as(u32, 1), res.passed);
+    try std.testing.expect(std.mem.indexOf(u8, res.failures, "` did not finish (still running at the 240s bound; killed with everything it started)") != null);
+    try std.testing.expectError(error.FileNotFound, cwd.statFile(io, root ++ "/work/end.txt", .{}));
+    try bounded.expectTreeGone(io, root ++ "/work/held.txt");
+    // The adoption probe of a row runs under its own bound (25 s for real): a row still running there has executed,
+    // so it reads as runnable, and it is cut there too.
+    try std.testing.expectEqual(@as(?[]const u8, null), probeRowExecutes(&w, root, hang));
+    try std.testing.expectError(error.FileNotFound, cwd.statFile(io, root ++ "/work/end.txt", .{}));
+    try bounded.expectTreeGone(io, root ++ "/work/held.txt");
+}
+
 /// GET `url`, returning just the HTTP status code (0 = nothing answered). Local-probe shaped: tight
 /// per-request timeouts; the retry cadence lives in the caller's boot window. A loopback url (the
 /// normal declared-PROBE shape) goes in-process; anything else still rides curl for TLS/remote.
@@ -7302,9 +7353,9 @@ fn curlCode(w: *Worker, url: []const u8) u32 {
     }
     const nul = if (builtin.os.tag == .windows) "NUL" else "/dev/null";
     const argv = [_][]const u8{ "curl", "-s", "-o", nul, "-w", "%{http_code}", "--max-time", "3", url };
-    const r = std.process.run(gpa, w.io, .{ .argv = &argv, .stdout_limit = .limited(64), .stderr_limit = .limited(256), .timeout = .{ .duration = .{ .raw = .fromSeconds(8), .clock = .awake } } }) catch return 0;
-    defer gpa.free(r.stdout);
-    defer gpa.free(r.stderr);
+    var r = bounded.run(gpa, w.io, .{ .argv = &argv, .bound_ms = 8_000, .stdout_limit = 64, .stderr_limit = 256 });
+    defer r.deinit(gpa);
+    if (!r.finished()) return 0;
     return std.fmt.parseInt(u32, std.mem.trim(u8, r.stdout, " \r\n\t"), 10) catch 0;
 }
 
@@ -7376,23 +7427,13 @@ fn declaredSmoke(w: *Worker, run_dir: []const u8, round: u32) void {
         if (all_ok) break;
         bu.sleepMs(1000);
     }
-    // ALWAYS reap the tree — a leaked server keeps the port and the workdir's build locks hostage
-    if (child.id) |h| {
-        if (builtin.os.tag == .windows) {
-            var pb: [16]u8 = undefined;
-            const pid = GetProcessId(@ptrCast(h)); // Child.Id is a HANDLE on Windows; taskkill wants the pid
-            if (std.fmt.bufPrint(&pb, "{d}", .{pid})) |ps| {
-                const ka = [_][]const u8{ "taskkill", "/F", "/T", "/PID", ps };
-                if (std.process.run(gpa, w.io, .{ .argv = &ka, .stdout_limit = .limited(512), .stderr_limit = .limited(512), .timeout = .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } } })) |kr| {
-                    gpa.free(kr.stdout);
-                    gpa.free(kr.stderr);
-                } else |_| {}
-            } else |_| {}
-            _ = TerminateProcess(@ptrCast(h), 1); // belt-and-braces for the direct child
-        } else {
-            std.posix.kill(h, .KILL) catch {};
-        }
-    }
+    // ALWAYS reap the tree — a leaked server keeps the port and the workdir's build locks hostage. killTree's
+    // taskkill is itself bounded (a std.process.run timeout was not, on Windows); POSIX gets a direct kill, as
+    // this child leads no process group of its own.
+    bounded.killTree(w.io, &child);
+    if (builtin.os.tag == .windows) if (child.id) |h| {
+        _ = TerminateProcess(@ptrCast(h), 1); // belt-and-braces for the direct child
+    };
     _ = child.wait(w.io) catch {};
     if (all_ok) {
         w.smoke_ok = true;
@@ -9041,7 +9082,6 @@ const HANG_CHECK_S: u32 = 30;
 const HANG_STALE_CHECKS: u32 = 10;
 
 extern "kernel32" fn Sleep(dwMilliseconds: u32) callconv(.winapi) void;
-extern "kernel32" fn GetProcessId(hProcess: *anyopaque) callconv(.winapi) u32;
 extern "kernel32" fn TerminateProcess(hProcess: *anyopaque, uExitCode: u32) callconv(.winapi) i32;
 fn rawSleep1s() void {
     if (@import("builtin").os.tag == .windows) {

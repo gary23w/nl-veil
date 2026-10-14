@@ -22,7 +22,7 @@ The app spawns external binaries all over the toolbelt, and a missing one used t
 ## Dependencies
 
 - `worker/browser/launch.zig` — the browser probe reuses `launch.discover()` so there is exactly one place a browser is found
-- `std` — `std.process.run` for the PATH locator and `--version` reads
+- `std` and `bounded.zig` — `bounded.run` for the PATH locator and `--version` reads
 
 ## Usage Context
 
@@ -33,7 +33,7 @@ Imported by `main.zig`, `worker/run.zig`, and `worker/tools.zig`. `probeAll` fee
 - Resolution order in `probe`: an `NL_<DEP>_BIN` override pointing at a real file wins; then `where` (Windows) / `which` (POSIX) resolves the binary on PATH without executing it; absence yields the spec's remedy text.
 - If the locator itself can't spawn (a stripped container with no `which`), a direct `<bin> --version` fallback decides — so a missing locator never masquerades as a missing dependency.
 - `isSpawnMissing` draws the exact line of the feature: only FileNotFound/NotDir/IsDir/InvalidExe/InvalidName/AccessDenied/PermissionDenied earn a hint; StreamTooLong, timeouts, OOM, and resource limits keep the caller's "it ran and something went wrong" behaviour.
-- Version reads are best-effort and bounded (5s timeout, first non-blank line, clipped to 120 bytes, stderr fallback for tools like older python) — they never fail the probe.
+- Version reads are best-effort and bounded (one 5 s deadline through `bounded.run`, which holds on Windows for a binary that hangs printing nothing; first non-blank line, clipped to 120 bytes, stderr fallback for tools like older python) — they never fail the probe. A spawn failure reaches `isSpawnMissing` as `bounded.Result.err`.
 - The browser probe never runs `<browser> --version`: on Windows `msedge.exe --version` can OPEN A BROWSER WINDOW, so presence comes from `discover()`'s path check and the executable's basename is reported as the identity.
 
 ---
