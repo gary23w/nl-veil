@@ -2,8 +2,6 @@
 
 # the veil
 
-[![Email info](https://img.shields.io/badge/Email%20info-garystimpson03%40gmail.com-2563eb?logo=gmail&logoColor=white)](mailto:garystimpson03@gmail.com)
-
 **An AI coding team that remembers your project.**
 
 the Veil (nl-veil) is an open-source desktop app for building software with AI. Give it a task,
@@ -12,7 +10,7 @@ into your next session. Use the built-in model, Ollama, or an OpenAI-compatible 
 
 **[Download the desktop app](https://github.com/gary23w/nl-veil/releases/latest)** ·
 **[Screenshot walkthrough: setup & build with Cloudflare AI](https://gary23w.github.io/nl-veil/demos/)** ·
-[Installation and requirements](#install) · [Try your first task](#try-your-first-task)
+[Installation and requirements](#install) · [Try your first task](#try-your-first-task) · [Email info](mailto:garystimpson03@gmail.com)
 
 Windows · macOS · Linux · [MIT app code and AGPL security runtime](#license). Local inference needs no provider account or API key;
 hosted providers have their own data handling and costs. The built-in model requires a separate
