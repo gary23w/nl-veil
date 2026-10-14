@@ -3347,6 +3347,236 @@ fn jsonParseError(gpa: std.mem.Allocator, source_in: []const u8) ?[]u8 {
     }
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// DROPPED-DEFINITION NOTE: what an edit took away that the file still relies on
+// ---------------------------------------------------------------------------------------------------------------
+
+const DefKind = enum { import, def, assign };
+const Def = struct { name: []const u8, kind: DefKind };
+
+/// Files past this are not scanned (two whole-file passes per edit; EDIT_MAX_BYTES is far larger).
+const DEF_NOTE_MAX_BYTES: usize = 512 * 1024;
+/// Names reported per edit, at most.
+const DEF_NOTE_MAX_NAMES: usize = 4;
+/// A column-0 binding named after one of these is a shadow of a builtin or the commonest of locals: once it is
+/// gone, a use of the name is the builtin (or some other binding) again, not a NameError. Imports and defs are
+/// never filtered by this — `from os import path` dropped while `path(` is called is exactly the case.
+const DEF_NOTE_COMMON = [_][]const u8{ "id", "type", "list", "dict", "set", "str", "int", "float", "bool", "len", "range", "print", "open", "object", "input", "map", "filter", "min", "max", "sum", "any", "all", "next", "iter", "super", "property", "format", "hash", "bytes", "tuple", "sorted", "zip", "enumerate", "self", "cls", "name", "value", "data", "result", "args", "kwargs", "key", "file", "line", "text", "i", "j", "k", "n", "x", "y", "z" };
+
+fn identChar(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '_';
+}
+
+/// The identifier at the start of `s`, or "" when it does not start with one.
+fn identAt(s: []const u8) []const u8 {
+    var n: usize = 0;
+    while (n < s.len and identChar(s[n])) : (n += 1) {}
+    if (n == 0 or std.ascii.isDigit(s[0])) return "";
+    return s[0..n];
+}
+
+fn isCommonName(name: []const u8) bool {
+    for (DEF_NOTE_COMMON) |c| if (std.mem.eql(u8, c, name)) return true;
+    return false;
+}
+
+/// `a, b as c, (d, e)` → the names an import binds (the alias when there is one; `a.b.c` binds `a`).
+fn importedNames(gpa: std.mem.Allocator, spec_in: []const u8, out: *std.ArrayListUnmanaged(Def)) !void {
+    var spec = spec_in;
+    if (std.mem.indexOfScalar(u8, spec, '#')) |h| spec = spec[0..h];
+    if (std.mem.indexOf(u8, spec, "//")) |h| spec = spec[0..h];
+    var it = std.mem.splitScalar(u8, spec, ',');
+    while (it.next()) |piece_raw| {
+        const piece = std.mem.trim(u8, piece_raw, " \t(){};'\"\r");
+        if (piece.len == 0) continue;
+        if (std.mem.indexOf(u8, piece, " as ")) |a| {
+            const alias = identAt(std.mem.trimStart(u8, piece[a + " as ".len ..], " \t"));
+            if (alias.len > 0) try out.append(gpa, .{ .name = alias, .kind = .import });
+            continue;
+        }
+        const name = identAt(piece);
+        if (name.len > 0) try out.append(gpa, .{ .name = name, .kind = .import });
+    }
+}
+
+/// The names one line DEFINES, as this reader sees lines: the forms Python, JavaScript/TypeScript and their
+/// relatives share. An import at any indentation; `def`/`class`/`function`/`const`/`let`/`var` and a bare
+/// `name = …` (or `name: T = …`) only at column 0 — a module-level binding, which is what other code reaches
+/// for. Nothing here is a parser: a line it cannot read defines nothing, which can only make the note quieter.
+fn lineDefinitions(gpa: std.mem.Allocator, line_in: []const u8, out: *std.ArrayListUnmanaged(Def)) !void {
+    const line = std.mem.trimEnd(u8, line_in, " \t\r");
+    const body = std.mem.trimStart(u8, line, " \t");
+    const lead = line.len - body.len;
+    if (body.len == 0 or body[0] == '#' or std.mem.startsWith(u8, body, "//")) return;
+    if (std.mem.startsWith(u8, body, "from ")) {
+        const at = std.mem.indexOf(u8, body, " import ") orelse return;
+        return importedNames(gpa, body[at + " import ".len ..], out);
+    }
+    if (std.mem.startsWith(u8, body, "import ")) {
+        const rest = body["import ".len..];
+        if (std.mem.indexOf(u8, rest, " from ")) |f| { // JS: `import x from`, `import {a, b as c} from`, `import * as ns from`
+            var spec = rest[0..f];
+            if (std.mem.startsWith(u8, spec, "* as ")) spec = spec["* as ".len..];
+            return importedNames(gpa, spec, out);
+        }
+        return importedNames(gpa, rest, out);
+    }
+    if (lead != 0) return;
+    var b = body;
+    if (std.mem.startsWith(u8, b, "export default ")) b = b["export default ".len..];
+    if (std.mem.startsWith(u8, b, "export ")) b = b["export ".len..];
+    if (std.mem.startsWith(u8, b, "async ")) b = b["async ".len..];
+    for ([_][]const u8{ "def ", "class ", "function " }) |kw| if (std.mem.startsWith(u8, b, kw)) {
+        const name = identAt(std.mem.trimStart(u8, b[kw.len..], " \t"));
+        if (name.len > 0) try out.append(gpa, .{ .name = name, .kind = .def });
+        return;
+    };
+    for ([_][]const u8{ "const ", "let ", "var " }) |kw| if (std.mem.startsWith(u8, b, kw)) {
+        const name = identAt(std.mem.trimStart(u8, b[kw.len..], " \t"));
+        if (name.len > 0) try out.append(gpa, .{ .name = name, .kind = .assign });
+        return;
+    };
+    // a bare `name = …` / `name: T = …` at column 0 (`==` is a comparison, not a binding)
+    const name = identAt(b);
+    if (name.len == 0) return;
+    var rest = std.mem.trimStart(u8, b[name.len..], " \t");
+    if (rest.len > 0 and rest[0] == ':') { // an annotation: the binding is at its `=`
+        const eq = std.mem.indexOfScalar(u8, rest, '=') orelse return;
+        rest = rest[eq..];
+    }
+    if (rest.len >= 1 and rest[0] == '=' and !(rest.len >= 2 and rest[1] == '=')) try out.append(gpa, .{ .name = name, .kind = .assign });
+}
+
+fn collectDefinitions(gpa: std.mem.Allocator, text: []const u8, out: *std.ArrayListUnmanaged(Def)) !void {
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |line| try lineDefinitions(gpa, line, out);
+}
+
+fn definesName(defs: []const Def, name: []const u8) bool {
+    for (defs) |d| if (std.mem.eql(u8, d.name, name)) return true;
+    return false;
+}
+
+/// The first line (1-based) on which `name` is USED in `text` — a whole word that is not an attribute of something
+/// else (`x.name`) and not on an import line (there it names a module, not a binding) — and how many such uses
+/// there are. null when there is none.
+fn firstUse(text: []const u8, name: []const u8) ?struct { line: usize, count: usize } {
+    var first: usize = 0;
+    var count: usize = 0;
+    var ln: usize = 0;
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |line| {
+        ln += 1;
+        const body = std.mem.trimStart(u8, line, " \t");
+        if (std.mem.startsWith(u8, body, "import ") or std.mem.startsWith(u8, body, "from ")) continue;
+        var i: usize = 0;
+        while (std.mem.indexOfPos(u8, line, i, name)) |at| {
+            i = at + name.len;
+            if (at > 0 and (identChar(line[at - 1]) or line[at - 1] == '.')) continue;
+            if (i < line.len and identChar(line[i])) continue;
+            count += 1;
+            if (first == 0) first = ln;
+        }
+    }
+    if (count == 0) return null;
+    return .{ .line = first, .count = count };
+}
+
+/// WHAT AN EDIT TOOK AWAY THAT THE FILE STILL USES. An edit that removes the line defining or importing a name
+/// lands cleanly — the file still compiles (a missing import is a NameError at run time, not a syntax error), the
+/// syntax gate stays quiet — and the break surfaces rounds later in a test run, pointing at nothing. Measured on
+/// a SWE-bench Lite turn (pytest-7220, 2026-10-14): an edit_file anchored on the wrong line took an `import` with
+/// it, every edit reported success, and a full suite run later failed on the name. So the edit's own result says
+/// what it dropped: every name whose LAST definition (an import, a column-0 def/class/function, a column-0
+/// binding) disappeared in this edit while the result still refers to it. A note, never a rejection — a refactor
+/// may drop a definition on purpose and re-add it in a later op — but said in the same round. Reads `before` and
+/// `after` whole, so a definition moved elsewhere in the same edit is not reported. gpa-owned, null when there is
+/// nothing to say (or nothing it can read: an empty side, a file past DEF_NOTE_MAX_BYTES).
+pub fn droppedDefinitionsNote(gpa: std.mem.Allocator, before: []const u8, after: []const u8) ?[]u8 {
+    if (before.len == 0 or after.len == 0 or before.len > DEF_NOTE_MAX_BYTES or after.len > DEF_NOTE_MAX_BYTES) return null;
+    var was: std.ArrayListUnmanaged(Def) = .empty;
+    defer was.deinit(gpa);
+    var now: std.ArrayListUnmanaged(Def) = .empty;
+    defer now.deinit(gpa);
+    collectDefinitions(gpa, before, &was) catch return null;
+    collectDefinitions(gpa, after, &now) catch return null;
+    var note: std.ArrayListUnmanaged(u8) = .empty;
+    defer note.deinit(gpa);
+    var seen: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer seen.deinit(gpa);
+    var reported: usize = 0;
+    for (was.items) |d| {
+        if (reported >= DEF_NOTE_MAX_NAMES) break;
+        if (d.kind == .assign and isCommonName(d.name)) continue;
+        if (definesName(now.items, d.name)) continue; // still defined somewhere: moved, re-added, or never the only one
+        var dup = false;
+        for (seen.items) |s| if (std.mem.eql(u8, s, d.name)) {
+            dup = true;
+        };
+        if (dup) continue;
+        const use = firstUse(after, d.name) orelse continue; // gone and unused: a deliberate removal
+        seen.append(gpa, d.name) catch break;
+        const what: []const u8 = switch (d.kind) {
+            .import => "an import",
+            .def => "a top-level def",
+            .assign => "a top-level binding",
+        };
+        if (reported == 0) {
+            note.appendSlice(gpa, "NOTE: this edit removed the only definition of ") catch return null;
+        } else note.appendSlice(gpa, ", ") catch return null;
+        if (use.count > 1)
+            note.print(gpa, "`{s}` ({s}; the file still uses it at line {d} and {d} more place(s))", .{ d.name, what, use.line, use.count - 1 }) catch return null
+        else
+            note.print(gpa, "`{s}` ({s}; the file still uses it at line {d})", .{ d.name, what, use.line }) catch return null;
+        reported += 1;
+    }
+    if (reported == 0) return null;
+    note.appendSlice(gpa, " — if that was not intended, re-add it before moving on; if it was, the remaining use(s) need changing too.") catch return null;
+    return note.toOwnedSlice(gpa) catch null;
+}
+
+test "an edit that drops the only definition of a name the file still uses says so in the edit's own result" {
+    const gpa = std.testing.allocator;
+    const before = "import os\nimport sys\nfrom pathlib import Path as P\n\n\ndef main():\n    print(os.getcwd(), P('.'))\n    return sys.argv\n";
+    // the wrong-line anchor: the `import os` line replaced by something else; the file still compiles
+    const after = "VERSION = 1\nimport sys\nfrom pathlib import Path as P\n\n\ndef main():\n    print(os.getcwd(), P('.'))\n    return sys.argv\n";
+    const note = droppedDefinitionsNote(gpa, before, after) orelse return error.MissedDroppedImport;
+    defer gpa.free(note);
+    try std.testing.expect(std.mem.indexOf(u8, note, "`os` (an import; the file still uses it at line 7)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, note, "`sys`") == null); // still imported: not dropped
+    // dropped and no longer used: a deliberate removal, nothing to say
+    const gone = "import sys\nfrom pathlib import Path as P\n\n\ndef main():\n    print(P('.'))\n    return sys.argv\n";
+    try std.testing.expect(droppedDefinitionsNote(gpa, before, gone) == null);
+    // moved rather than dropped (re-imported elsewhere in the same edit): nothing to say
+    const moved = "import sys\nfrom pathlib import Path as P\n\n\ndef main():\n    import os\n    print(os.getcwd(), P('.'))\n    return sys.argv\n";
+    try std.testing.expect(droppedDefinitionsNote(gpa, before, moved) == null);
+    // an attribute of the same name is not a use, and neither is the module named on an import line
+    const attr = "import sys\nfrom pathlib import Path as P\nfrom os import path\n\n\ndef main():\n    print(sys.os, P('.'))\n    return sys.argv\n";
+    try std.testing.expect(droppedDefinitionsNote(gpa, before, attr) == null);
+    // the alias is the bound name: `Path as P` dropped while P is used is reported as P
+    const alias_gone = "import os\nimport sys\n\n\ndef main():\n    print(os.getcwd(), P('.'))\n    return sys.argv\n";
+    const n2 = droppedDefinitionsNote(gpa, before, alias_gone) orelse return error.MissedDroppedAlias;
+    defer gpa.free(n2);
+    try std.testing.expect(std.mem.indexOf(u8, n2, "`P` (an import;") != null);
+    // a column-0 function removed while a call to it remains, counted in every place
+    const fn_before = "import os\n\n\ndef main():\n    return 1\n\n\nprint(main())\nprint(main() + 1)\n";
+    const fn_after = "import os\n\n\nprint(main())\nprint(main() + 1)\n";
+    const n3 = droppedDefinitionsNote(gpa, fn_before, fn_after) orelse return error.MissedDroppedDef;
+    defer gpa.free(n3);
+    try std.testing.expect(std.mem.indexOf(u8, n3, "`main` (a top-level def; the file still uses it at line 4 and 1 more place(s))") != null);
+    // JavaScript: a dropped top-level const still called; a surviving aliased import is not reported
+    const js_before = "const fmt = require('./fmt');\nimport { render as draw } from './view';\n\nfunction main() {\n  draw(fmt(1));\n}\n";
+    const js_after = "import { render as draw } from './view';\n\nfunction main() {\n  draw(fmt(1));\n}\n";
+    const n4 = droppedDefinitionsNote(gpa, js_before, js_after) orelse return error.MissedDroppedConst;
+    defer gpa.free(n4);
+    try std.testing.expect(std.mem.indexOf(u8, n4, "`fmt` (a top-level binding; the file still uses it at line 4)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, n4, "`draw`") == null);
+    // a shadowed builtin is not reported: removing `id = 3` leaves `id(...)` the builtin again
+    try std.testing.expect(droppedDefinitionsNote(gpa, "id = 3\nprint(id(4))\n", "print(id(4))\n") == null);
+    // a local's reassignment inside a function is not a definition this reads: removing it says nothing
+    try std.testing.expect(droppedDefinitionsNote(gpa, "def f():\n    total = 0\n    return total\n", "def f():\n    return total\n") == null);
+}
+
 /// EXTENSION-DISPATCHED syntax gate shared by every edit path (and writeFile's soft note): .py compiles via
 /// the workdir python (plus its duplicate-def AST diff against `orig`), .js/.mjs/.cjs parse via
 /// `node --check`, .json parses natively. null = pass — and every subprocess gate fails OPEN when its
@@ -3481,6 +3711,8 @@ fn hashlineApply(ctx: *ToolCtx, npath: []const u8, full: []const u8, original: [
                 defer gpa.free(perr);
                 return editRejectMsg(gpa, npath, perr) orelse dupe(gpa, "edit rejected: result does not compile");
             }
+            const dropped = droppedDefinitionsNote(gpa, head, ap.content);
+            defer if (dropped) |d| gpa.free(d);
             if (!writeWorkFileAtomic(ctx, full, ap.content)) return dupe(gpa, "could not write the edited file");
             ctx.files_written.* += 1;
             {
@@ -3507,7 +3739,7 @@ fn hashlineApply(ctx: *ToolCtx, npath: []const u8, full: []const u8, original: [
                 }
                 recordRoundWrite(ctx, npath);
             }
-            return std.fmt.allocPrint(gpa, "edited {s} — {d} tagged op(s) applied atomically; file is now {d} bytes.\n{s}", .{ npath, hops.len, ap.content.len, ap.summary }) catch dupe(gpa, "edited");
+            return std.fmt.allocPrint(gpa, "edited {s} — {d} tagged op(s) applied atomically; file is now {d} bytes.\n{s}{s}{s}", .{ npath, hops.len, ap.content.len, ap.summary, if (dropped != null) "\n" else "", dropped orelse "" }) catch dupe(gpa, "edited");
         },
     }
 }
@@ -3692,6 +3924,8 @@ fn editFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
         const Gate = struct {
             tc: *ToolCtx,
             path: []const u8,
+            /// the dropped-definition note for the candidate that passed, read off the committed result below
+            dropped: ?[]u8 = null,
             fn check(vctx: *anyopaque, head: []const u8, candidate: []const u8) ?[]u8 {
                 const g: *@This() = @ptrCast(@alignCast(vctx));
                 // Language-blind, runs for EVERY file: an op's `text` must not smuggle the edit protocol
@@ -3699,12 +3933,17 @@ fn editFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
                 // them stays editable, mirroring the NL_CHK_ORIG baseline rule).
                 if (bufedit.editMarkerCorruption(candidate) and !bufedit.editMarkerCorruption(head))
                     return dupe(g.tc.gpa, "edit rejected — the result would ADD SEARCH/REPLACE / merge-conflict marker lines to the file: your `text` itself carries edit-script fences. Put ONLY the final code lines in `text` — never <<<<<<< SEARCH / ======= / >>>>>>> REPLACE.");
-                const perr = syntaxGateError(g.tc, g.path, candidate, head) orelse return null;
-                defer g.tc.gpa.free(perr);
-                return editRejectMsg(g.tc.gpa, g.path, perr) orelse (dupe(g.tc.gpa, "edit rejected: result does not compile"));
+                if (syntaxGateError(g.tc, g.path, candidate, head)) |perr| {
+                    defer g.tc.gpa.free(perr);
+                    return editRejectMsg(g.tc.gpa, g.path, perr) orelse (dupe(g.tc.gpa, "edit rejected: result does not compile"));
+                }
+                if (g.dropped) |d| g.tc.gpa.free(d); // a rebase re-checks: the note follows the candidate that lands
+                g.dropped = droppedDefinitionsNote(g.tc.gpa, head, candidate);
+                return null;
             }
         };
         var gate = Gate{ .tc = ctx, .path = npath };
+        defer if (gate.dropped) |d| gpa.free(d);
         const outcome = vcs.commitEdit(ctx.io, gpa, m, ctx.run_dir, npath, full, ops.items, original, ctx.mind, .{ .ctx = @ptrCast(&gate), .check = &Gate.check });
         switch (outcome) {
             .committed => |c| {
@@ -3712,7 +3951,7 @@ fn editFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
                 lockFiles(ctx);
                 recordRoundWrite(ctx, npath);
                 unlockFiles(ctx);
-                return std.fmt.allocPrint(gpa, "edited {s} — {d} op(s) applied{s}, file is now {d} bytes", .{ npath, ops.items.len, if (c.rebased) " and merged with a teammate's concurrent change (unverified — re-check the file still builds)" else "", c.len }) catch dupe(gpa, "edited");
+                return std.fmt.allocPrint(gpa, "edited {s} — {d} op(s) applied{s}, file is now {d} bytes{s}{s}", .{ npath, ops.items.len, if (c.rebased) " and merged with a teammate's concurrent change (unverified — re-check the file still builds)" else "", c.len, if (gate.dropped != null) "\n" else "", gate.dropped orelse "" }) catch dupe(gpa, "edited");
             },
             .conflict => |msg| return msg,
             .failed => |msg| return msg,
@@ -3734,6 +3973,9 @@ fn editFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
         defer gpa.free(perr);
         return editRejectMsg(gpa, npath, perr) orelse dupe(gpa, "edit rejected: result does not compile");
     }
+    // the dropped-definition note rides the success line (droppedDefinitionsNote): a note, never a rejection
+    const dropped = droppedDefinitionsNote(gpa, original, res.bytes);
+    defer if (dropped) |d| gpa.free(d);
     if (!writeWorkFileAtomic(ctx, full, res.bytes)) return dupe(gpa, "could not write the edited file");
     ctx.files_written.* += 1;
     {
@@ -3756,8 +3998,8 @@ fn editFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
         recordRoundWrite(ctx, npath);
     }
     if (res.reindented > 0)
-        return std.fmt.allocPrint(gpa, "edited {s} — {d} op(s) applied, file is now {d} bytes. NOTE: {d} op(s) matched only after auto-reindenting your text to the file's indentation — your SEARCH lines had the wrong leading whitespace; copy them exactly next time.", .{ npath, ops.items.len, res.bytes.len, res.reindented }) catch dupe(gpa, "edited");
-    return std.fmt.allocPrint(gpa, "edited {s} — {d} op(s) applied, file is now {d} bytes", .{ npath, ops.items.len, res.bytes.len }) catch dupe(gpa, "edited");
+        return std.fmt.allocPrint(gpa, "edited {s} — {d} op(s) applied, file is now {d} bytes. NOTE: {d} op(s) matched only after auto-reindenting your text to the file's indentation — your SEARCH lines had the wrong leading whitespace; copy them exactly next time.{s}{s}", .{ npath, ops.items.len, res.bytes.len, res.reindented, if (dropped != null) "\n" else "", dropped orelse "" }) catch dupe(gpa, "edited");
+    return std.fmt.allocPrint(gpa, "edited {s} — {d} op(s) applied, file is now {d} bytes{s}{s}", .{ npath, ops.items.len, res.bytes.len, if (dropped != null) "\n" else "", dropped orelse "" }) catch dupe(gpa, "edited");
 }
 
 /// Return lines `start`..`end` (1-indexed, inclusive) of `text` with a `[lines A-B of N]` header, so the reader
