@@ -4959,7 +4959,15 @@ const EchoRec = struct { sig: u64 = 0, res: u64 = 0, count: u8 = 0, probe: bool 
 /// client-mode writes register too), upserted by path, persisted per-conv as files.jsonl, observed into the
 /// conversation's neuron-db partition immediately, and woven into every drive step — so the model never has
 /// to "wonder" (or confabulate) what it already wrote.
-const LedgerFile = struct { path: []u8, bytes: u64 };
+/// `turn`: THIS turn's own tools changed it (noteMutation), as opposed to an earlier turn's write or a survey entry.
+const LedgerFile = struct { path: []u8, bytes: u64, turn: bool = false };
+/// LEDGER_FILES_MAX bounds what the ledger takes from files.jsonl and the restart survey (note); LEDGER_TURN_ROOM is
+/// how many more entries the turn's own mutations may add past it (noteMutation). The second bound exists because
+/// the first fills on arrival: a survey of any real checkout stops at 128 files, after which note() dropped every
+/// new file the turn wrote, so a 4tope carry listed the upstream tree as ON DISK and never the agent's own script
+/// (a SWE-bench Lite baseline run). Still bounded, so a scaffold writing hundreds of files cannot grow it forever.
+const LEDGER_FILES_MAX: usize = 128;
+const LEDGER_TURN_ROOM: usize = 128;
 const FileLedger = struct {
     files: std.ArrayListUnmanaged(LedgerFile) = .empty,
     mutations: u32 = 0, // landed mutations this TURN (incl. delegated) — the client-mode files_written stand-in
@@ -4980,14 +4988,39 @@ const FileLedger = struct {
     /// written earlier; both are one file). Stored paths are normalized to '/'. Bounded at 128 files —
     /// overflow flips `partial` so the block downgrades its claim instead of lying by omission.
     fn note(self: *FileLedger, gpa: std.mem.Allocator, path: []const u8, bytes: u64) void {
+        self.upsert(gpa, path, bytes, LEDGER_FILES_MAX, false);
+    }
+    /// A mutation THIS turn landed: upserted like note(), marked as the turn's own (ledgerPaths lists those
+    /// first), and given LEDGER_TURN_ROOM past the cap a survey may already have filled.
+    fn noteMutation(self: *FileLedger, gpa: std.mem.Allocator, path: []const u8, bytes: u64) void {
+        self.upsert(gpa, path, bytes, LEDGER_FILES_MAX + LEDGER_TURN_ROOM, true);
+    }
+    /// Everything the dispatch site (runInnerAgentic) records for a landed mutation: the path with its separators
+    /// normalized to '/' in `buf` (files.jsonl must hold '/'-paths, or ledgerLoad's backslash fail-safe reads our own
+    /// lines as unparseable and flags the ledger partial), noted as the turn's own, counted. Returns the normalized
+    /// path for ledgerPersist. `path` is parseFileMutation's, so at most 300 bytes. A method rather than inline code
+    /// so a test drives exactly what dispatch does: `zig build test` never analyzes runInnerAgentic, and the note()
+    /// that site used to call is the one a full survey turns away.
+    fn noteLanded(self: *FileLedger, gpa: std.mem.Allocator, path: []const u8, bytes: u64, buf: *[300]u8) []const u8 {
+        const np = buf[0..path.len];
+        @memcpy(np, path);
+        for (np) |*ch| {
+            if (ch.* == '\\') ch.* = '/';
+        }
+        self.noteMutation(gpa, np, bytes);
+        self.mutations += 1;
+        return np;
+    }
+    fn upsert(self: *FileLedger, gpa: std.mem.Allocator, path: []const u8, bytes: u64, cap: usize, turn: bool) void {
         if (path.len == 0 or path.len > 300) return;
         for (self.files.items) |*f| {
             if (sameSep(f.path, path)) {
                 f.bytes = bytes;
+                f.turn = f.turn or turn;
                 return;
             }
         }
-        if (self.files.items.len >= 128) {
+        if (self.files.items.len >= cap) {
             self.partial = true;
             return;
         }
@@ -4995,7 +5028,7 @@ const FileLedger = struct {
         for (p) |*ch| {
             if (ch.* == '\\') ch.* = '/';
         }
-        self.files.append(gpa, .{ .path = p, .bytes = bytes }) catch gpa.free(p);
+        self.files.append(gpa, .{ .path = p, .bytes = bytes, .turn = turn }) catch gpa.free(p);
     }
     fn has(self: *const FileLedger, path: []const u8) ?u64 {
         for (self.files.items) |f| {
@@ -5229,20 +5262,43 @@ fn ledgerBlock(gpa: std.mem.Allocator, ledger: *const FileLedger, out: *std.Arra
         "\n\n[ENGINE GROUND TRUTH — the build workdir ALREADY CONTAINS these files (surveyed from disk; this conversation is RESUMING earlier work). Do NOT start over or re-scaffold: continue FROM this state — read what exists where needed and build the missing pieces: "
     else
         "\n\n[ENGINE GROUND TRUTH — these files were ALREADY WRITTEN in this conversation and exist in the build workdir. Do not re-write them blind and do not burn a step re-verifying them; a file NOT in this list was never successfully written: ") catch return;
-    var listed: usize = 0;
+    ledgerList(gpa, ledger, out, 1400);
+    out.append(gpa, ']') catch return;
+}
+
+/// The ledger's paths and sizes as one list, THIS turn's own changes first, until `out` holds more than `limit`
+/// bytes; " … +N more" names what it left out. A restart survey fills the ledger with the checkout as it was found,
+/// and every surface that lists it clips (the woven block at 1400 bytes, the 4tope's ON DISK line at 1200 and again
+/// at a quarter of the carry), so in ledger order the files the turn itself wrote or edited came last and were the
+/// part clipped away: the model-written carry (NL_HANDOFF=model, or a span the net finds nothing in) and every
+/// per-step weave hid them behind the survey. Labelled (`changed this turn:` / `also on disk:`) only when the turn
+/// changed something, so a ledger of earlier turns' writes renders exactly as before.
+fn ledgerList(gpa: std.mem.Allocator, ledger: *const FileLedger, out: *std.ArrayListUnmanaged(u8), limit: usize) void {
+    var own: usize = 0;
     for (ledger.files.items) |f| {
-        if (out.items.len > 1400) break;
-        if (listed > 0) out.appendSlice(gpa, ", ") catch return;
-        out.appendSlice(gpa, f.path) catch return;
-        var bb: [32]u8 = undefined;
-        out.appendSlice(gpa, std.fmt.bufPrint(&bb, " ({d} B)", .{f.bytes}) catch "") catch return;
-        listed += 1;
+        if (f.turn) own += 1;
+    }
+    var listed: usize = 0;
+    groups: for ([_]bool{ true, false }) |turn| {
+        var in_group: usize = 0;
+        for (ledger.files.items) |f| {
+            if (f.turn != turn) continue;
+            if (out.items.len > limit) break :groups;
+            if (own > 0 and in_group == 0) {
+                if (listed > 0) out.appendSlice(gpa, "; ") catch return;
+                out.appendSlice(gpa, if (turn) "changed this turn: " else "also on disk: ") catch return;
+            } else if (listed > 0) out.appendSlice(gpa, ", ") catch return;
+            out.appendSlice(gpa, f.path) catch return;
+            var bb: [32]u8 = undefined;
+            out.appendSlice(gpa, std.fmt.bufPrint(&bb, " ({d} B)", .{f.bytes}) catch "") catch return;
+            listed += 1;
+            in_group += 1;
+        }
     }
     if (listed < ledger.files.items.len) {
         var mb: [40]u8 = undefined;
         out.appendSlice(gpa, std.fmt.bufPrint(&mb, " … +{d} more", .{ledger.files.items.len - listed}) catch "") catch return;
     }
-    out.append(gpa, ']') catch return;
 }
 
 /// The ledger as Gary's 4tope's ON DISK line wants it: the paths and their sizes, nothing else. ledgerBlock's
@@ -5252,19 +5308,9 @@ fn ledgerBlock(gpa: std.mem.Allocator, ledger: *const FileLedger, out: *std.Arra
 /// what is on disk. Says so when the ledger knows it is incomplete.
 fn ledgerPaths(gpa: std.mem.Allocator, ledger: *const FileLedger, out: *std.ArrayListUnmanaged(u8)) void {
     if (ledger.files.items.len == 0) return;
-    var listed: usize = 0;
-    for (ledger.files.items) |f| {
-        if (out.items.len > 1200) break;
-        if (listed > 0) out.appendSlice(gpa, ", ") catch return;
-        out.appendSlice(gpa, f.path) catch return;
-        var bb: [32]u8 = undefined;
-        out.appendSlice(gpa, std.fmt.bufPrint(&bb, " ({d} B)", .{f.bytes}) catch "") catch return;
-        listed += 1;
-    }
-    if (listed < ledger.files.items.len) {
-        var mb: [40]u8 = undefined;
-        out.appendSlice(gpa, std.fmt.bufPrint(&mb, " … +{d} more", .{ledger.files.items.len - listed}) catch "") catch return;
-    }
+    // the turn's own changes first (ledgerList): this line is clipped twice, 1200 bytes here and a quarter of the
+    // carry in net.unfold
+    ledgerList(gpa, ledger, out, 1200);
     if (ledger.partial) out.appendSlice(gpa, " (this list may be incomplete)") catch return;
 }
 
@@ -5288,6 +5334,256 @@ test "the 4tope's ON DISK line is the paths themselves, never the framing senten
     out.clearRetainingCapacity();
     ledgerPaths(gpa, &empty, &out);
     try std.testing.expectEqual(@as(usize, 0), out.items.len);
+}
+
+test "the turn's own changes survive a full disk survey and ride ahead of it into the 4tope's carry" {
+    const gpa = std.testing.allocator;
+    var ledger: FileLedger = .{};
+    defer ledger.deinit(gpa);
+    // a restart survey of a checkout bigger than the ledger: it fills, and note() refuses the rest
+    var pb: [64]u8 = undefined;
+    var i: usize = 0;
+    while (i < LEDGER_FILES_MAX) : (i += 1) ledger.note(gpa, std.fmt.bufPrint(&pb, "pkg/module_{d:0>3}.py", .{i}) catch unreachable, 1000 + i);
+    ledger.note(gpa, "pkg/one_too_many.py", 1);
+    try std.testing.expect(ledger.has("pkg/one_too_many.py") == null);
+    try std.testing.expect(ledger.partial);
+    // this turn: a new script past the full survey, and an edit of a surveyed file (reported with a backslash),
+    // each recorded exactly as the dispatch site records a landed mutation
+    var pbuf: [300]u8 = undefined;
+    try std.testing.expectEqualStrings("repro_script.py", ledger.noteLanded(gpa, "repro_script.py", 812, &pbuf));
+    try std.testing.expectEqualStrings("pkg/module_100.py", ledger.noteLanded(gpa, "pkg\\module_100.py", 1205, &pbuf)); // what files.jsonl gets
+    try std.testing.expectEqual(@as(?u64, 812), ledger.has("repro_script.py"));
+    try std.testing.expectEqual(@as(?u64, 1205), ledger.has("pkg/module_100.py"));
+    try std.testing.expectEqual(LEDGER_FILES_MAX + 1, ledger.files.items.len); // the edit upserted, it did not add
+    try std.testing.expectEqual(@as(u32, 2), ledger.mutations);
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(gpa);
+    ledgerPaths(gpa, &ledger, &out);
+    try std.testing.expect(std.mem.startsWith(u8, out.items, "changed this turn: "));
+    const own = std.mem.indexOf(u8, out.items, "repro_script.py (812 B)") orelse return error.OwnWriteNotListed;
+    const edit = std.mem.indexOf(u8, out.items, "pkg/module_100.py (1205 B)") orelse return error.OwnEditNotListed;
+    const survey = std.mem.indexOf(u8, out.items, "; also on disk: pkg/module_000.py (1000 B)") orelse return error.SurveyNotListed;
+    try std.testing.expect(own < survey and edit < survey);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, out.items, "pkg/module_100.py")); // once, in its group
+    try std.testing.expect(std.mem.endsWith(u8, out.items, "(this list may be incomplete)"));
+    // ...and through the carry itself, which clips this line to a quarter of its budget: unfold called exactly as
+    // the cut path calls it, at the cap a 64 KB history window gets (handoffCap)
+    const span = ",{\"role\":\"assistant\",\"content\":\"Running the repro script.\",\"tool_calls\":[{\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"run_python\",\"arguments\":\"{}\"}}]}" ++
+        ",{\"role\":\"tool\",\"tool_call_id\":\"c1\",\"content\":\"has E exponent: True\"}" ++
+        ",{\"role\":\"assistant\",\"content\":\"Confirmed; now the fix.\"}";
+    var g = try dag.Graph.fromSpan(gpa, span);
+    defer g.deinit();
+    const hcap = handoffCap(64 * 1024);
+    const carry = try g.unfold(gpa, hcap - @min(hcap / 4, 400), out.items);
+    defer gpa.free(carry);
+    try std.testing.expect(std.mem.indexOf(u8, carry, "ON DISK: changed this turn: pkg/module_100.py (1205 B), repro_script.py (812 B); also on disk: ") != null);
+    // ...and through the woven ground-truth block too, which is also the model-written carry's ground (its 1400-byte
+    // clip falls inside the survey, so in ledger order the turn's own files were the part cut away)
+    ledger.from_disk = true;
+    var block: std.ArrayListUnmanaged(u8) = .empty;
+    defer block.deinit(gpa);
+    ledgerBlock(gpa, &ledger, &block);
+    const b_own = std.mem.indexOf(u8, block.items, "changed this turn: pkg/module_100.py (1205 B), repro_script.py (812 B); also on disk: pkg/module_000.py (1000 B)") orelse return error.OwnChangesNotInBlock;
+    try std.testing.expect(std.mem.indexOf(u8, block.items[0..b_own], "RESUMING") != null); // after the framing, ahead of the survey
+    try std.testing.expect(std.mem.indexOf(u8, block.items, " … +") != null); // the clip did fall inside the survey
+    try std.testing.expect(std.mem.endsWith(u8, block.items, "]"));
+}
+
+/// One tool call and its result, appended to a working span the way runInnerAgentic appends them: the call's
+/// arguments escaped with http.jstr, the result clipped by clipToolResult and then escaped. For the net tests below.
+fn testSpanCall(gpa: std.mem.Allocator, span: *std.ArrayListUnmanaged(u8), id: []const u8, name: []const u8, args: []const u8, result: []const u8) !void {
+    try span.appendSlice(gpa, ",{\"role\":\"assistant\",\"content\":\"Reading output_field where it is built.\",\"tool_calls\":[{\"id\":");
+    try http.jstr(gpa, span, id);
+    try span.appendSlice(gpa, ",\"type\":\"function\",\"function\":{\"name\":");
+    try http.jstr(gpa, span, name);
+    try span.appendSlice(gpa, ",\"arguments\":");
+    try http.jstr(gpa, span, args);
+    try span.appendSlice(gpa, "}}]}");
+    const kept = clipToolResult(gpa, result);
+    defer if (kept.ptr != result.ptr) gpa.free(kept);
+    try span.appendSlice(gpa, ",{\"role\":\"tool\",\"tool_call_id\":");
+    try http.jstr(gpa, span, id);
+    try span.appendSlice(gpa, ",\"content\":");
+    try http.jstr(gpa, span, kept);
+    try span.append(gpa, '}');
+}
+
+/// Is result `id` superseded in the graph of `span` (plus a frontier note)?
+fn testSuperseded(gpa: std.mem.Allocator, span: *std.ArrayListUnmanaged(u8), id: []const u8) !bool {
+    try span.appendSlice(gpa, ",{\"role\":\"assistant\",\"content\":\"The fix assigns the replace() result back into output_field.\"}");
+    var g = try dag.Graph.fromSpan(gpa, span.items);
+    defer g.deinit();
+    for (g.nodes.items) |n| if (n.kind == .result and std.mem.eql(u8, n.id, id)) return n.superseded;
+    return error.NoSuchResult;
+}
+
+test "the net reads real read_file views as the dispatch site appends them: windows, line tags, cuts, landed edits" {
+    // net.zig's own tests use stand-in views. These are tools.zig's: readFile renders (tagged, as every chat read in
+    // the workdir is), clipToolResult clips, http.jstr escapes, and the net must read windows, tags and cuts off
+    // exactly those bytes. Drift in any of them (a new header, a per-line prefix only in windows, readFile's alias
+    // rules, the elision notice) turns this red instead of silently disabling supersession.
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-net-reads-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, root ++ "/work/pkg", .default_dir) catch {};
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    var counters = [_]u32{0} ** 6;
+    var fmtx: std.Io.Mutex = .init;
+    var ctx = tools.ToolCtx{
+        .gpa = gpa,
+        .io = io,
+        .environ = &env,
+        .run_dir = root,
+        .workdir = root ++ "/work",
+        .scope = "test",
+        .mind = "chat",
+        .round = 0,
+        .mem = undefined, // file tools only
+        .files_written = &counters[0],
+        .observed = &counters[1],
+        .skills_saved = &counters[2],
+        .directives_set = &counters[3],
+        .tools_made = &counters[4],
+        .fmtx = &fmtx,
+        .anchored_reads = true, // the chat surface's reads, as engine.zig builds its ctx
+    };
+    // a 1500-line module whose bug site opens on a line looksDead reads as a failure
+    var src: std.ArrayListUnmanaged(u8) = .empty;
+    defer src.deinit(gpa);
+    var ln: usize = 1;
+    while (ln <= 1500) : (ln += 1) {
+        if (ln == 1230) {
+            try src.appendSlice(gpa, "        raise KeyError(name + ' not found in registry')\n");
+        } else try src.print(gpa, "    output_field = rec_{d}.field(col)\n", .{ln});
+    }
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/work/pkg/records.py", .data = src.items });
+
+    // 1. The window each spelling asks for is the window readFile serves (dag.Lines mirrors its resolution).
+    for ([_][]const u8{
+        "{\"path\":\"pkg/records.py\",\"start_line\":1230,\"end_line\":1290}",
+        "{\"path\":\"pkg/records.py\",\"offset\":1200,\"limit\":101}",
+        "{\"path\":\"pkg/records.py\",\"start_line\":\"1230\",\"end_line\":\"1290\"}",
+        "{\"path\":\"pkg/records.py\",\"start_line\":1230.0,\"end_line\":1290}",
+        "{\"path\":\"pkg/records.py\",\"start_line\":1490}",
+        "{\"path\":\"pkg/records.py\",\"end_line\":5}",
+        "{\"path\":\"pkg/records.py\",\"limit\":10}",
+        "{\"path\":\"pkg/records.py\"}",
+    }) |args| {
+        const view = tools.execute(&ctx, "read_file", args);
+        defer gpa.free(view);
+        const w = dag.Lines.of(args);
+        try std.testing.expect(w.known);
+        try std.testing.expectEqual(w.windowed, std.mem.startsWith(u8, view, "[lines "));
+        if (w.windowed) {
+            var hb: [64]u8 = undefined;
+            const want = try std.fmt.bufPrint(&hb, "[lines {d}-{d} of 1500]\n", .{ w.first, @min(w.last, 1500) });
+            if (!std.mem.startsWith(u8, view, want)) {
+                std.debug.print("\n{s}: readFile served {s}, dag.Lines says {s}\n", .{ args, view[0..@min(view.len, 40)], want });
+                return error.WindowDisagrees;
+            }
+        }
+    }
+
+    // 2. Reading another region leaves the bug-site read live, and its raising first line does not make it a dead end.
+    const site_args = "{\"path\":\"pkg/records.py\",\"start_line\":1230,\"end_line\":1290}";
+    const site = tools.execute(&ctx, "read_file", site_args);
+    defer gpa.free(site);
+    try std.testing.expect(dag.looksDead(site[0..@min(site.len, 240)])); // the premise: its opening reads as a failure
+    {
+        const other = tools.execute(&ctx, "read_file", "{\"path\":\"pkg/records.py\",\"start_line\":820,\"end_line\":845}");
+        defer gpa.free(other);
+        var span: std.ArrayListUnmanaged(u8) = .empty;
+        defer span.deinit(gpa);
+        try testSpanCall(gpa, &span, "r1", "read_file", site_args, site);
+        try testSpanCall(gpa, &span, "r2", "read_file", "{\"path\":\"pkg/records.py\",\"start_line\":820,\"end_line\":845}", other);
+        try span.appendSlice(gpa, ",{\"role\":\"assistant\",\"content\":\"The fix assigns the replace() result back into output_field.\"}");
+        var g = try dag.Graph.fromSpan(gpa, span.items);
+        defer g.deinit();
+        for (g.nodes.items) |n| if (n.kind == .result and std.mem.eql(u8, n.id, "r1")) {
+            try std.testing.expect(!n.dead);
+            try std.testing.expect(!n.superseded);
+        };
+    }
+
+    // 3. A shell patch between two reads (no file tool, so the net sees no write): the wider re-read shows lines
+    // 1230-1290 again, as they are now, and stales the pre-patch view by their numbers.
+    const patched = try std.mem.replaceOwned(u8, gpa, src.items, "rec_", "fixed_");
+    defer gpa.free(patched);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/work/pkg/records.py", .data = patched });
+    {
+        const wider_args = "{\"path\":\"pkg/records.py\",\"start_line\":1200,\"end_line\":1300}";
+        const wider = tools.execute(&ctx, "read_file", wider_args);
+        defer gpa.free(wider);
+        try std.testing.expect(std.mem.indexOf(u8, wider, "fixed_1231") != null);
+        var span: std.ArrayListUnmanaged(u8) = .empty;
+        defer span.deinit(gpa);
+        try testSpanCall(gpa, &span, "r1", "read_file", site_args, site);
+        try testSpanCall(gpa, &span, "r2", "host_command", "{\"command\":\"sed -i s/rec_/fixed_/ pkg/records.py\"}", "exit 0");
+        try testSpanCall(gpa, &span, "r3", "read_file", wider_args, wider);
+        try std.testing.expect(try testSuperseded(gpa, &span, "r1"));
+    }
+
+    // 4. A window past 10 KB, elided by clipToolResult: a line its head shows whole is shown, the line the head's cut
+    // runs through is not, and neither is anything elided.
+    const big_args = "{\"path\":\"pkg/records.py\",\"start_line\":1100,\"end_line\":1400}";
+    const big = tools.execute(&ctx, "read_file", big_args);
+    defer gpa.free(big);
+    const clipped = clipToolResult(gpa, big);
+    defer if (clipped.ptr != big.ptr) gpa.free(clipped);
+    const notice = std.mem.indexOf(u8, clipped, "\n...[") orelse return error.NotElided;
+    try std.testing.expect(clipped[notice - 1] != '\n'); // the head's last line really was cut mid-line
+    const cut_at = (std.mem.lastIndexOfScalar(u8, clipped[0..notice], '\n') orelse return error.NoHeadLine) + 1;
+    const colon = std.mem.indexOfScalarPos(u8, clipped, cut_at, ':') orelse return error.NoTag;
+    const cut_line = try std.fmt.parseInt(u32, clipped[cut_at..colon], 10);
+    const Case = struct { first: u32, last: u32, stale: bool };
+    for ([_]Case{
+        .{ .first = cut_line - 1, .last = cut_line - 1, .stale = true },
+        .{ .first = cut_line, .last = cut_line, .stale = false },
+        .{ .first = cut_line + 20, .last = cut_line + 30, .stale = false },
+        .{ .first = 1395, .last = 1400, .stale = true },
+    }) |c| {
+        var ab: [96]u8 = undefined;
+        const args = try std.fmt.bufPrint(&ab, "{{\"path\":\"pkg/records.py\",\"start_line\":{d},\"end_line\":{d}}}", .{ c.first, c.last });
+        const older = tools.execute(&ctx, "read_file", args);
+        defer gpa.free(older);
+        var span: std.ArrayListUnmanaged(u8) = .empty;
+        defer span.deinit(gpa);
+        try testSpanCall(gpa, &span, "r1", "read_file", args, older);
+        try testSpanCall(gpa, &span, "r2", "read_file", big_args, big);
+        try std.testing.expectEqual(c.stale, try testSuperseded(gpa, &span, "r1"));
+    }
+
+    // 5. A write, edit or delete stales the reads only when it landed, read off its answer the way the file ledger
+    // reads it (parseFileMutation), and a pruned stub still counts as landed.
+    try std.testing.expect(std.mem.startsWith(u8, PRUNED_RESULT_NOTE, dag.PRUNED_STUB));
+    const Mut = struct { name: []const u8, args: []const u8, landed: bool };
+    for ([_]Mut{
+        .{ .name = "write_file", .args = "{\"path\":\"notes.txt\",\"content\":\"alpha\\nbeta\\n\"}", .landed = true },
+        .{ .name = "edit_file", .args = "{\"path\":\"notes.txt\",\"search\":\"alpha\",\"replace\":\"gamma\"}", .landed = true },
+        .{ .name = "edit_file", .args = "{\"path\":\"notes.txt\",\"search\":\"nowhere in the file\",\"replace\":\"x\"}", .landed = false },
+        .{ .name = "edit_file", .args = "{\"path\":\"notes.txt\",\"search\":\"beta\",\"replace\":\"2:abc:def\u{2192}beta\"}", .landed = false },
+        .{ .name = "edit_file", .args = "{\"path\":\"missing.txt\",\"search\":\"a\",\"replace\":\"b\"}", .landed = false },
+        .{ .name = "delete_file", .args = "{\"path\":\"missing.txt\"}", .landed = false },
+        .{ .name = "delete_file", .args = "{\"path\":\"notes.txt\"}", .landed = true },
+    }) |m| {
+        const answer = tools.execute(&ctx, m.name, m.args);
+        defer gpa.free(answer);
+        var esc: std.ArrayListUnmanaged(u8) = .empty;
+        defer esc.deinit(gpa);
+        try http.jstr(gpa, &esc, answer);
+        const raw = esc.items[1 .. esc.items.len - 1]; // as the span holds it: escaped, unquoted
+        if (dag.mutationLanded(m.name, raw) != m.landed) {
+            std.debug.print("\n{s} {s} answered: {s}\n", .{ m.name, m.args, answer });
+            return error.LandedMisread;
+        }
+        if (!std.mem.eql(u8, m.name, "delete_file"))
+            try std.testing.expectEqual(m.landed, parseFileMutation(m.name, answer) != null);
+    }
 }
 
 /// One drive step's woven context; both halves gpa-owned ("" = absent). `step` — the engine's file-ledger
@@ -11069,15 +11365,10 @@ fn runInnerAgentic(
             if (parseFileMutation(c.name, result)) |m| {
                 file_mutated = true;
                 // Normalize separators BEFORE persisting: files.jsonl must hold '/'-paths so ledgerLoad's
-                // fail-safe (backslash ⇒ unparseable ⇒ partial) never triggers on our own lines.
+                // fail-safe (backslash ⇒ unparseable ⇒ partial) never triggers on our own lines. noteLanded does
+                // that, notes the file as the turn's own (past a full survey too, listed first in a carry) and counts it.
                 var pbuf: [300]u8 = undefined;
-                @memcpy(pbuf[0..m.path.len], m.path);
-                for (pbuf[0..m.path.len]) |*ch| {
-                    if (ch.* == '\\') ch.* = '/';
-                }
-                const np = pbuf[0..m.path.len];
-                file_ledger.note(gpa, np, m.bytes);
-                file_ledger.mutations += 1;
+                const np = file_ledger.noteLanded(gpa, m.path, m.bytes, &pbuf);
                 ledgerPersist(app, conv_dir, c.name, np, m.bytes);
             } else if (std.mem.eql(u8, c.name, "read_file") and std.mem.eql(u8, std.mem.trim(u8, result, " \r\n\t"), "not found")) {
                 // GROUND-TRUTH CONFLICT (anti-confabulation): the ledger says this file was WRITTEN, the

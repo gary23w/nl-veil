@@ -33,10 +33,12 @@
 //! Edges are recorded at write time from what is actually in the span, never inferred by a model: a result depends
 //! on the step that issued it (by tool_call_id); a step depends STRONGLY on a previous-round result whose
 //! distinctive tokens its own words or arguments reuse (it demonstrably read it), and weakly on the rest of that
-//! round; a step depends on the step before it (the model's own thread). A later read or write of the same file,
-//! or an identical call, SUPERSEDES the earlier result; a result that reads as an error is a DEAD END. Superseded
-//! results are stale and are neither protected nor carried; dead ends are carried under RULED OUT, which is the
-//! negative knowledge a paraphrase forgets and a retrieval must be told about.
+//! round; a step depends on the step before it (the model's own thread). An identical call, or a later write, edit
+//! or delete of the same file that landed, SUPERSEDES the earlier result; a later READ supersedes an earlier read
+//! only when it demonstrably shows all of it (reading another region of a file is more evidence, not a
+//! replacement); a result that reads as an error is a DEAD END, except a read that shows the file's own lines,
+//! whatever they say. Superseded results are stale and are neither protected nor carried; dead ends are carried
+//! under RULED OUT, which is the negative knowledge a paraphrase forgets and a retrieval must be told about.
 //!
 //! The rendering keeps the four labels the next segment already reads (ESTABLISHED / ON DISK / RULED OUT / NEXT)
 //! so nothing downstream changes, but every line is verbatim bytes from the span: NEXT is the frontier's own last
@@ -68,6 +70,51 @@ pub const Node = struct {
     dead: bool = false,
     /// bytes this message occupies in the span (for the budget)
     bytes: usize = 0,
+    /// a read_file result's line window, read from its arguments; the whole file for every other node
+    lines: Lines = .{},
+};
+
+/// The line window a read_file call asked for, resolved the way tools.zig `readFile` resolves it: start_line (or
+/// its `offset` alias) through end_line (or offset+limit-1), 1-indexed and inclusive, a missing bound being the
+/// file's edge, so a call with no window at all is the whole file. `windowed` is readFile's own test: a windowed
+/// read answers with a `[lines A-B of N]` header line and then the lines, an unwindowed one with the file's head.
+/// Each bound is read as readFile's own std.json parse reads its `usize` field, so `"start_line":"1230"` and
+/// `1230.0` are line 1230 there as here. `known` is false when the arguments could not be read in full (their
+/// excerpt was clipped, or a bound is one std.json refuses, which readFile answers with "bad args"): such a window
+/// is contained only by a whole-file one and contains nothing.
+pub const Lines = struct {
+    first: u64 = 1,
+    last: u64 = std.math.maxInt(u64),
+    windowed: bool = false,
+    known: bool = true,
+
+    /// The window in a read_file call's unescaped arguments (a Node's `args`).
+    pub fn of(args: []const u8) Lines {
+        const unknown: Lines = .{ .windowed = true, .known = false };
+        // an args excerpt longer than its cap ends in "..." rather than the object's own '}', and may have lost
+        // the very bound that narrows the window
+        if (args.len == 0 or args[args.len - 1] != '}') return unknown;
+        const sl = jsonUint(args, "start_line") orelse return unknown;
+        const el = jsonUint(args, "end_line") orelse return unknown;
+        const off = jsonUint(args, "offset") orelse return unknown;
+        const lim = jsonUint(args, "limit") orelse return unknown;
+        // readFile: `start_line = start_line or offset`, `end_line = end_line or start+limit-1 (only with a start)`
+        const start = if (sl > 0) sl else off;
+        const end = if (el > 0) el else if (lim > 0 and start > 0) start +| (lim - 1) else 0;
+        return .{
+            .first = if (start == 0) 1 else start,
+            .last = if (end == 0) std.math.maxInt(u64) else end,
+            .windowed = start > 0 or end > 0,
+        };
+    }
+
+    /// Every line `inner` asked for lies inside `outer` (a whole-file window holds any window, known or not).
+    pub fn contains(outer: Lines, inner: Lines) bool {
+        if (!outer.known) return false;
+        if (outer.first <= 1 and outer.last == std.math.maxInt(u64)) return true;
+        if (!inner.known) return false;
+        return outer.first <= inner.first and inner.last <= outer.last;
+    }
 };
 
 /// How much of one message the net carries. Enough for a path and the line that matters; a 10 KB file read is a
@@ -113,6 +160,11 @@ pub const Graph = struct {
         var g: Graph = .{ .gpa = gpa, .arena = std.heap.ArenaAllocator.init(gpa) };
         errdefer g.deinit();
         const a = g.arena.allocator();
+        // each node's content as the span holds it (results only; "" otherwise), one per node: supersession needs
+        // the bytes a read really showed, which the clipped excerpt does not keep. Slices into `span`, so they
+        // live only for this call.
+        var raws: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer raws.deinit(gpa);
         // pass 1: the nodes, in order (which is a topological order: every edge points at an older node)
         var round: u32 = 0;
         var at: usize = 0;
@@ -123,6 +175,7 @@ pub const Graph = struct {
             at = next;
             const role = jsonStr(obj, "role");
             var n: Node = .{ .kind = .engine, .bytes = obj.len };
+            var n_raw: []const u8 = "";
             if (std.mem.eql(u8, role, "user")) {
                 n.kind = .user;
                 n.text = try excerpt(a, jsonStr(obj, "content"), EXCERPT_MAX);
@@ -133,6 +186,7 @@ pub const Graph = struct {
                 n.text = try excerpt(a, jsonStr(obj, "content"), NEXT_MAX);
                 n.round = round;
                 try g.nodes.append(gpa, n);
+                try raws.append(gpa, n_raw);
                 const step_idx: u32 = @intCast(g.nodes.items.len - 1);
                 g.frontier = step_idx;
                 // the step's calls become result PLACEHOLDERS only when their results arrive (below); here we
@@ -150,14 +204,24 @@ pub const Graph = struct {
                 if (g.callOf(n.id)) |c| {
                     n.name = c.name;
                     n.args = c.args;
+                    if (std.mem.eql(u8, c.name, "read_file")) {
+                        n.lines = Lines.of(c.args);
+                        // looksDead judges the excerpt, and a read's excerpt is the FILE's opening lines: a bug-site
+                        // window whose first line raises `KeyError(name + ' not found')` read as a failed call, was
+                        // carried under RULED OUT, and gave way to any later read of the path, another region
+                        // included. A view that shows the file's own lines did not fail, whatever they say.
+                        if (n.dead and showsFileLines(raw)) n.dead = false;
+                    }
                     try n.deps.append(gpa, .{ .to = c.step, .w = W_ISSUED });
                 }
+                n_raw = raw;
             } else {
                 n.kind = .engine;
                 n.text = try excerpt(a, jsonStr(obj, "content"), EXCERPT_MAX);
                 n.round = round;
             }
-            try g.nodes.append(gpa, n);
+            try g.nodes.append(gpa, n); // the graph owns n.deps from here, so the append below cannot leak them
+            try raws.append(gpa, n_raw);
         }
         if (g.nodes.items.len == 0) return g;
         // pass 2: what each step READ (previous-round results whose distinctive tokens it reuses), the thread, and
@@ -188,7 +252,7 @@ pub const Graph = struct {
             }
             prev_step = idx;
         }
-        g.markSuperseded();
+        g.markSuperseded(raws.items);
         return g;
     }
 
@@ -218,8 +282,20 @@ pub const Graph = struct {
         return null;
     }
 
-    /// A later read or write of the same file, or an identical call, makes the earlier result stale.
-    fn markSuperseded(g: *Graph) void {
+    /// What makes an earlier result stale:
+    ///   * an IDENTICAL later call: the newer answer to the same question is the current one;
+    ///   * a later write, edit or delete of the same path that LANDED (`mutationLanded`): every earlier view of the
+    ///     file, and every earlier change record of it, describes a file that is no longer that way. One that was
+    ///     refused changed nothing, so it stales nothing: an edit the tag guard rejected (SymPy's edit #24 in the
+    ///     same baseline) used to stale every earlier read of the file as surely as a landed one;
+    ///   * a later READ of the path only when it shows everything the earlier read showed (`readCovers`), and a
+    ///     later listing of a directory an earlier listing of it.
+    /// Reading another region of a file is gathering more evidence, not replacing it. While ANY later call on a path
+    /// superseded every earlier result on it, a read of lines 820-845 staled the read of the bug site at 1230-1290
+    /// of the same file: the prune was free to stub it, the carry dropped it, and the segment after the spend
+    /// ceiling re-derived the bug from scratch and first reached for the wrong fix (a SWE-bench Lite baseline run).
+    /// `raws` is each node's content as the span held it, for readCovers.
+    fn markSuperseded(g: *Graph, raws: []const []const u8) void {
         const items = g.nodes.items;
         for (items, 0..) |*older, i| {
             if (older.kind != .result or older.name.len == 0) continue;
@@ -232,7 +308,14 @@ pub const Graph = struct {
                     older.superseded = true;
                     break;
                 }
-                if (path.len > 0 and isFileTool(newer.name) and std.mem.eql(u8, jsonStr(newer.args, "path"), path)) {
+                if (path.len == 0 or !isFileTool(newer.name) or !std.mem.eql(u8, jsonStr(newer.args, "path"), path)) continue;
+                const stale = if (isFileMutation(newer.name))
+                    mutationLanded(newer.name, raws[j])
+                else if (std.mem.eql(u8, newer.name, "read_file") and std.mem.eql(u8, older.name, "read_file"))
+                    readCovers(newer, older.*, raws[j], raws[i])
+                else
+                    std.mem.eql(u8, newer.name, "list_dir") and std.mem.eql(u8, older.name, "list_dir");
+                if (stale) {
                     older.superseded = true;
                     break;
                 }
@@ -456,6 +539,211 @@ fn isFileTool(name: []const u8) bool {
     return false;
 }
 
+/// The file tools that change the file, rather than look at it.
+fn isFileMutation(name: []const u8) bool {
+    const names = [_][]const u8{ "write_file", "edit_file", "delete_file" };
+    for (names) |n| if (std.mem.eql(u8, n, name)) return true;
+    return false;
+}
+
+/// How engine.zig's PRUNED_RESULT_NOTE opens (pinned there by a test): the one-line stub a prune leaves in place of
+/// a result.
+pub const PRUNED_STUB = "[tool result pruned";
+
+/// Did a write, edit or delete change the file, by its own answer (`raw`, as the span holds it)? The success answers
+/// are tools.zig's, the shapes engine.zig parseFileMutation records in the file ledger (a test there pins the two
+/// together): write_file and edit_file open with "wrote ", "appended to ", "rewrote " or "edited " and always carry
+/// "file is now "; delete_file opens with "deleted ". Any other answer is a refusal that left the file as it was (a
+/// stale anchor, tags in the replacement text, a syntax-gate rejection, a missing file, an engine refusal). A result
+/// the prune stubbed no longer says which it was, so it is taken to have landed, as every mutation used to be: a
+/// pre-edit view wrongly kept live is a file carried as it no longer is, the worse of the two mistakes.
+pub fn mutationLanded(name: []const u8, raw: []const u8) bool {
+    if (std.mem.startsWith(u8, raw, PRUNED_STUB)) return true;
+    if (std.mem.eql(u8, name, "delete_file")) return std.mem.startsWith(u8, raw, "deleted ");
+    for ([_][]const u8{ "wrote ", "appended to ", "rewrote ", "edited " }) |p| {
+        if (std.mem.startsWith(u8, raw, p)) return std.mem.indexOf(u8, raw, "file is now ") != null;
+    }
+    return false;
+}
+
+/// Does the newer read show everything the older read showed? Both are read_file results on one path; the raws
+/// are their contents as the span holds them (still escaped).
+fn readCovers(newer: Node, older: Node, raw_new: []const u8, raw_old: []const u8) bool {
+    // a failed read showed no file, so the first later read that worked is the news; a failed one shows nothing
+    // (`dead` on a read is fromSpan's: a view that shows the file's own lines is never a failed read)
+    if (older.dead) return !newer.dead;
+    if (newer.dead) return false;
+    // the same whole-file request twice: the newer view is the current one
+    if (older.lines.known and newer.lines.known and !older.lines.windowed and !newer.lines.windowed) return true;
+    if (!newer.lines.contains(older.lines)) return false;
+    // The window says it should; the view must say it did. A covering range can still show LESS than the read it
+    // would replace: a whole-file view stops at its head (readFile's 8000-byte cap), a window at
+    // hashline.WINDOW_MAX_BYTES, the engine elides the middle of any result past 10 KB, and a prune leaves a
+    // one-line stub. The hashline tags say which lines each view shows, by NUMBER, and they are absolute, so a
+    // window and a whole-file view name a line alike. Numbers, not bytes: a file changed between the two reads by a
+    // tool the net does not count as a write (run_python, a shell sed) is still shown again, line for line, by the
+    // newer view, and that view is the current one. A byte check kept the pre-change view live beside it, both
+    // protected and carried, two contradictory views of the same lines told apart only by their round labels.
+    if (tagsCover(raw_new, raw_old)) |covered| return covered;
+    // An untagged view (a roamed read outside the workdir, a binary-ish file) has no numbers to read, so only its
+    // bytes can show it: the older read's text inside the newer result. That cannot see through a change made
+    // between the two reads, and then keeps both views: one view too many is the safer way to be wrong.
+    return std.mem.indexOf(u8, raw_new, shownText(raw_old, older.lines)) != null;
+}
+
+/// The file text a read result shows, as the span holds it (still escaped): a windowed read's view minus its
+/// `[lines A-B of N]` header line, an unwindowed one's view whole. A windowed answer with no line break in it has
+/// no file text at all (a past-the-end notice, a refusal, a pruned stub), so it shows "". A window whose arguments
+/// could not be read may have been either kind; its own header says which.
+fn shownText(raw: []const u8, lines: Lines) []const u8 {
+    if (!lines.windowed or (!lines.known and !std.mem.startsWith(u8, raw, "[lines "))) return raw;
+    var i: usize = 0;
+    while (i + 1 < raw.len) : (i += 1) {
+        if (raw[i] != '\\') continue;
+        if (raw[i + 1] == 'n') return raw[i + 2 ..];
+        i += 1; // any other escape: step over its second byte so an escaped backslash cannot pose as `\n`
+    }
+    return "";
+}
+
+/// Does a read result show the file's own lines? By its tags, or by readFile's `[lines A-B of N]` header with lines
+/// under it (an untagged window). An untagged whole-file view carries no such mark, so this cannot say for one.
+fn showsFileLines(raw: []const u8) bool {
+    var it: TagRuns = .{ .raw = raw, .whole = false };
+    if (it.next() != null) return true;
+    return std.mem.startsWith(u8, raw, "[lines ") and shownText(raw, .{ .windowed = true }).len > 0;
+}
+
+/// hashline.HASH_LEN: the letters in each half of a line tag (engine.zig's test of real read views pins it).
+const TAG_HASH_LEN = 3;
+
+/// A run of consecutive line numbers a read view shows.
+const Run = struct { first: u64, last: u64 };
+
+/// The runs of line numbers a read result shows, read off the hashline tags its lines open with (`42:abc:def→`,
+/// which readFile puts on every chat read inside the workdir), in the result as the span holds it (still escaped).
+/// With `whole`, a line the view cut short is left out: readFile clips a whole-file view at its byte cap and the
+/// engine elides the middle of a big result, both mid-line, and each says so on the line right after the cut
+/// (`[...view clipped`, `...[N bytes elided`). A window clipped at WINDOW_MAX_BYTES ends on a whole line before its
+/// `[...window clipped` notice, which costs that line here too; counting one line too few is the safe side.
+const TagRuns = struct {
+    raw: []const u8,
+    whole: bool,
+    at: usize = 0,
+    /// the run being read; any line that does not open with the next tag ends it
+    cur: ?Run = null,
+
+    fn next(it: *TagRuns) ?Run {
+        while (it.at <= it.raw.len) {
+            // one line: up to the next escaped line break, stepping over every other escape whole
+            const start = it.at;
+            var end = it.raw.len;
+            var i = start;
+            while (i + 1 < it.raw.len) : (i += 1) {
+                if (it.raw[i] != '\\') continue;
+                if (it.raw[i + 1] == 'n') {
+                    end = i;
+                    break;
+                }
+                i += 1;
+            }
+            it.at = if (end < it.raw.len) end + 2 else it.raw.len + 1;
+            const line = it.raw[start..end];
+            if (tagLine(line)) |n| {
+                if (it.cur) |*c| if (n == c.last + 1) {
+                    c.last = n;
+                    continue;
+                };
+                const done = it.cur;
+                it.cur = .{ .first = n, .last = n };
+                if (done) |d| return d;
+                continue;
+            }
+            var r = it.cur orelse continue;
+            it.cur = null;
+            if (it.whole and (std.mem.startsWith(u8, line, "[...") or std.mem.startsWith(u8, line, "...["))) {
+                if (r.first == r.last) continue;
+                r.last -= 1;
+            }
+            return r;
+        }
+        const tail = it.cur;
+        it.cur = null;
+        return tail;
+    }
+};
+
+/// The line number a read view's line opens with, when it opens with a hashline tag (`42:abc:def→`, the arrow as
+/// UTF-8, which http.jstr keeps, or escaped as `→`); null for any other line.
+fn tagLine(line: []const u8) ?u64 {
+    var i: usize = 0;
+    var n: u64 = 0;
+    while (i < line.len and i < 12 and std.ascii.isDigit(line[i])) : (i += 1) n = n * 10 + (line[i] - '0');
+    if (i == 0 or n == 0) return null;
+    for (0..2) |_| {
+        if (i >= line.len or line[i] != ':') return null;
+        i += 1;
+        for (0..TAG_HASH_LEN) |_| {
+            if (i >= line.len or line[i] < 'a' or line[i] > 'z') return null;
+            i += 1;
+        }
+    }
+    const rest = line[i..];
+    if (std.mem.startsWith(u8, rest, "\u{2192}") or std.ascii.startsWithIgnoreCase(rest, "\\u2192")) return n;
+    return null;
+}
+
+/// Does the newer view show, whole, every line the older view shows? Read off both views' tags. null when the older
+/// view carries none (an untagged view, or one that shows no file at all), for the caller to judge another way.
+fn tagsCover(raw_new: []const u8, raw_old: []const u8) ?bool {
+    var held: [8]Run = undefined; // a view is one run, or a head and a tail around an elision
+    var nh: usize = 0;
+    var nw: TagRuns = .{ .raw = raw_new, .whole = true };
+    while (nw.next()) |r| {
+        if (nh == held.len) break; // a view in more pieces than that is not counted past them
+        held[nh] = r;
+        nh += 1;
+    }
+    var ow: TagRuns = .{ .raw = raw_old, .whole = false };
+    var any = false;
+    while (ow.next()) |r| {
+        any = true;
+        // walk the older run through the newer runs that hold it
+        var at = r.first;
+        while (at <= r.last) {
+            const h = for (held[0..nh]) |run| {
+                if (run.first <= at and at <= run.last) break run;
+            } else return false;
+            at = h.last + 1;
+        }
+    }
+    return if (any) true else null;
+}
+
+/// The value of `key` in a flat JSON object as readFile's std.json parse reads a `usize` field: a number, or a string
+/// holding one, integral floats included. 0 when the key is absent (the field's default), null when it is present
+/// but std.json refuses it (a fraction, a negative, a word), which readFile answers with "bad args".
+fn jsonUint(obj: []const u8, key: []const u8) ?u64 {
+    const at = valueAt(obj, key) orelse return 0;
+    // the value's own token: a string through its closing quote, anything else up to the next delimiter
+    var end = at;
+    if (end < obj.len and obj[end] == '"') {
+        end += 1;
+        while (end < obj.len and obj[end] != '"') : (end += 1) {
+            if (obj[end] == '\\') end += 1;
+        }
+        end += 1;
+        if (end > obj.len) return null;
+    } else {
+        while (end < obj.len and obj[end] != ',' and obj[end] != '}' and obj[end] != ' ' and obj[end] != '\t') end += 1;
+    }
+    // the parse readFile runs, on that token alone; a bound's string never needs the room an unescape could take
+    var buf: [256]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    const v = std.json.parseFromSliceLeaky(usize, fba.allocator(), obj[at..end], .{}) catch return null;
+    return v;
+}
+
 /// A compaction note or a FACTS carrier is worth carrying; the model's own narration is not (its decisions show
 /// in what it then called).
 fn isDistillation(text: []const u8) bool {
@@ -519,8 +807,25 @@ fn isCommon(tok: []const u8) bool {
 
 /// The string value of `key` in a flat JSON object, RAW (still escaped), or "".
 pub fn jsonStr(obj: []const u8, key: []const u8) []const u8 {
+    var i = valueAt(obj, key) orelse return "";
+    if (i >= obj.len or obj[i] != '"') return "";
+    i += 1;
+    const start = i;
+    while (i < obj.len) : (i += 1) {
+        if (obj[i] == '\\') {
+            i += 1;
+            continue;
+        }
+        if (obj[i] == '"') return obj[start..i];
+    }
+    return "";
+}
+
+/// Where the value of `key` starts in a flat JSON object (past the colon and any spaces), or null when the key is
+/// absent. The first occurrence that IS a key wins.
+fn valueAt(obj: []const u8, key: []const u8) ?usize {
     var kb: [48]u8 = undefined;
-    const k = std.fmt.bufPrint(&kb, "\"{s}\":", .{key}) catch return "";
+    const k = std.fmt.bufPrint(&kb, "\"{s}\":", .{key}) catch return null;
     var from: usize = 0;
     while (std.mem.indexOfPos(u8, obj, from, k)) |at| {
         // must be a key: preceded by '{' or ',' (skipping spaces) — not the same bytes inside a string value
@@ -532,19 +837,9 @@ pub fn jsonStr(obj: []const u8, key: []const u8) []const u8 {
         }
         var i = at + k.len;
         while (i < obj.len and (obj[i] == ' ' or obj[i] == '\t')) i += 1;
-        if (i >= obj.len or obj[i] != '"') return "";
-        i += 1;
-        const start = i;
-        while (i < obj.len) : (i += 1) {
-            if (obj[i] == '\\') {
-                i += 1;
-                continue;
-            }
-            if (obj[i] == '"') return obj[start..i];
-        }
-        return "";
+        return i;
     }
-    return "";
+    return null;
 }
 
 /// Unescape a raw JSON string into the arena as ONE line, clipped to `max` at a word boundary when it is longer.
@@ -636,7 +931,7 @@ fn sampleSpan(gpa: std.mem.Allocator) ![]u8 {
     try tResult(&s, gpa, "c3", "ERROR: 2 tests failed\\nparser.test.header: expected MAGIC_V2 accepted");
     try tResult(&s, gpa, "c6", "ERROR: 404 not found for https://spec.example.com/magic");
     try tStep(&s, gpa, "Fixing parseHeader to accept MAGIC_V2.", tCall("c4", "edit_file", "{\\\"path\\\":\\\"src/parser.zig\\\",\\\"old\\\":\\\"MAGIC_V1\\\",\\\"new\\\":\\\"MAGIC_V1, MAGIC_V2\\\"}", &b4));
-    try tResult(&s, gpa, "c4", "edited src/parser.zig (1 replacement)");
+    try tResult(&s, gpa, "c4", "edited src/parser.zig \u{2014} 1 op(s) applied, file is now 2210 bytes");
     try tStep(&s, gpa, "Re-running the tests after the parseHeader fix.", tCall("c5", "run_tests", "{}", &b5));
     try tResult(&s, gpa, "c5", "All 12 tests passed.");
     return s.toOwnedSlice(gpa);
@@ -787,4 +1082,298 @@ test "the readers: raw JSON strings, failure shapes, distinctive tokens" {
     try tt.expectEqualStrings("one two", try excerpt(arena.allocator(), "one\\n\\n  two", 100));
     const cut = try excerpt(arena.allocator(), "alpha beta gamma delta epsilon", 14);
     try tt.expectEqualStrings("alpha beta...", cut);
+}
+
+/// `{"path":"pkg/records.py"` escaped for a call's arguments, left open for the window keys.
+const T_REC = "{\\\"path\\\":\\\"pkg/records.py\\\"";
+
+/// A read_file window as readFile answers it in a chat, escaped for the span: the `[lines A-B of N]` header, then one
+/// line per line number opening with its hashline tag (`N:abc:def→`; the letters are fixed, the net reads only the
+/// number), each carrying a token no other line has (`word`_N). engine.zig's test of the same reads drives the real
+/// readFile, so these stand-ins cannot drift from what it renders unnoticed.
+fn tWindow(gpa: std.mem.Allocator, first: u32, last: u32, total: u32) ![]u8 {
+    return tWindowOf(gpa, first, last, total, "rec");
+}
+fn tWindowOf(gpa: std.mem.Allocator, first: u32, last: u32, total: u32, word: []const u8) ![]u8 {
+    var s: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer s.deinit(gpa);
+    try s.print(gpa, "[lines {d}-{d} of {d}]\\n", .{ first, last, total });
+    try tLines(&s, gpa, first, last, word);
+    return s.toOwnedSlice(gpa);
+}
+fn tLines(s: *std.ArrayListUnmanaged(u8), gpa: std.mem.Allocator, first: u32, last: u32, word: []const u8) !void {
+    var i = first;
+    while (i <= last) : (i += 1) try s.print(gpa, "{d}:abc:def\u{2192}    output_field = {s}_{d}.field(col)\\n", .{ i, word, i });
+}
+
+/// Is `id` on the protect list a prune honours?
+fn tProtected(gpa: std.mem.Allocator, g: *const Graph, id: []const u8) !bool {
+    const ids = try g.protectedIds(gpa);
+    defer gpa.free(ids);
+    for (ids) |p| if (std.mem.eql(u8, p, id)) return true;
+    return false;
+}
+
+/// One call per round, then a frontier note. `rounds[k]` is the tool name, its escaped arguments and its escaped
+/// result; the ids run r1, r2, ...
+fn tRounds(gpa: std.mem.Allocator, rounds: []const [3][]const u8) ![]u8 {
+    var s: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer s.deinit(gpa);
+    for (rounds, 1..) |r, k| {
+        var idb: [16]u8 = undefined;
+        const id = std.fmt.bufPrint(&idb, "r{d}", .{k}) catch unreachable;
+        var cb: [512]u8 = undefined;
+        try tStep(&s, gpa, "Reading output_field where it is built.", tCall(id, r[0], r[1], &cb));
+        try tResult(&s, gpa, id, r[2]);
+    }
+    try s.appendSlice(gpa, ",{\"role\":\"assistant\",\"content\":\"The fix assigns the replace() result back into output_field.\"}");
+    return s.toOwnedSlice(gpa);
+}
+
+fn tResultNode(g: *const Graph, id: []const u8) !Node {
+    for (g.nodes.items) |n| if (n.kind == .result and std.mem.eql(u8, n.id, id)) return n;
+    return error.NoSuchResult;
+}
+
+/// Is the first call's result stale once the second one has run?
+fn tStaleAfter(gpa: std.mem.Allocator, first: [3][]const u8, second: [3][]const u8) !bool {
+    const span = try tRounds(gpa, &.{ first, second });
+    defer gpa.free(span);
+    var g = try Graph.fromSpan(gpa, span);
+    defer g.deinit();
+    return (try tResultNode(&g, "r1")).superseded;
+}
+
+test "reading another region of a file leaves the earlier read live: the frontier's evidence stays protected and carried" {
+    const gpa = tt.allocator;
+    const site = try tWindow(gpa, 1230, 1290, 1500);
+    defer gpa.free(site);
+    const other = try tWindow(gpa, 820, 845, 1500);
+    defer gpa.free(other);
+    const span = try tRounds(gpa, &.{
+        .{ "read_file", T_REC ++ ",\\\"start_line\\\":1230,\\\"end_line\\\":1290}", site },
+        .{ "read_file", T_REC ++ ",\\\"start_line\\\":820,\\\"end_line\\\":845}", other },
+    });
+    defer gpa.free(span);
+    var g = try Graph.fromSpan(gpa, span);
+    defer g.deinit();
+    const r1 = try tResultNode(&g, "r1");
+    // the window came from the call's own arguments
+    try tt.expectEqual(@as(u64, 1230), r1.lines.first);
+    try tt.expectEqual(@as(u64, 1290), r1.lines.last);
+    try tt.expect(!r1.superseded);
+    // the second step reused its output_field, so the frontier rests on it and a prune must leave it alone ...
+    try tt.expect(try tProtected(gpa, &g, "r1"));
+    // ... and the carry brings its lines along with the later read's
+    const net = try g.unfold(gpa, 1400, "");
+    defer gpa.free(net);
+    try tt.expect(std.mem.indexOf(u8, net, "1230:abc:def\u{2192} output_field = rec_1230") != null);
+    try tt.expect(std.mem.indexOf(u8, net, "820:abc:def\u{2192} output_field = rec_820") != null);
+}
+
+test "a later read stales an earlier one only when it shows all of it; a write, edit or delete that landed stales every earlier result on the path" {
+    const gpa = tt.allocator;
+    const site = try tWindow(gpa, 1230, 1290, 1500);
+    defer gpa.free(site);
+    const at_site = [3][]const u8{ "read_file", T_REC ++ ",\\\"start_line\\\":1230,\\\"end_line\\\":1290}", site };
+    // the same window again, keys in another order (so not an identical call: the window rule decides)
+    try tt.expect(try tStaleAfter(gpa, at_site, .{ "read_file", "{\\\"end_line\\\":1290,\\\"start_line\\\":1230,\\\"path\\\":\\\"pkg/records.py\\\"}", site }));
+    // a wider window shows it all, in either spelling readFile accepts
+    const wider = try tWindow(gpa, 1200, 1300, 1500);
+    defer gpa.free(wider);
+    try tt.expect(try tStaleAfter(gpa, at_site, .{ "read_file", T_REC ++ ",\\\"start_line\\\":1200,\\\"end_line\\\":1300}", wider }));
+    try tt.expect(try tStaleAfter(gpa, at_site, .{ "read_file", T_REC ++ ",\\\"offset\\\":1200,\\\"limit\\\":101}", wider }));
+    // a window inside it does not
+    const inside = try tWindow(gpa, 1240, 1250, 1500);
+    defer gpa.free(inside);
+    try tt.expect(!(try tStaleAfter(gpa, at_site, .{ "read_file", T_REC ++ ",\\\"start_line\\\":1240,\\\"end_line\\\":1250}", inside })));
+    // a whole-file read of a file small enough to show whole covers any window of it ...
+    const small_window = try tWindow(gpa, 10, 20, 40);
+    defer gpa.free(small_window);
+    var small_whole: std.ArrayListUnmanaged(u8) = .empty;
+    defer small_whole.deinit(gpa);
+    try tLines(&small_whole, gpa, 1, 40, "rec");
+    try tt.expect(try tStaleAfter(gpa, .{ "read_file", "{\\\"path\\\":\\\"small.py\\\",\\\"start_line\\\":10,\\\"end_line\\\":20}", small_window }, .{ "read_file", "{\\\"path\\\":\\\"small.py\\\"}", small_whole.items }));
+    // ... and so does it a window whose arguments were clipped past their excerpt cap (an unknown window), by the
+    // lines that window's own tags say it showed
+    const long_args = "{\\\"path\\\":\\\"small.py\\\",\\\"start_line\\\":10,\\\"end_line\\\":20,\\\"why\\\":\\\"the loop that fills output_field is the one the failing test exercises, so read it and only it this time round, then patch the assignment it makes\\\"}";
+    {
+        const span = try tRounds(gpa, &.{ .{ "read_file", long_args, small_window }, .{ "read_file", "{\\\"path\\\":\\\"small.py\\\"}", small_whole.items } });
+        defer gpa.free(span);
+        var g = try Graph.fromSpan(gpa, span);
+        defer g.deinit();
+        const r1 = try tResultNode(&g, "r1");
+        try tt.expect(!r1.lines.known);
+        try tt.expect(r1.superseded);
+    }
+    // ... but of a big one it is the HEAD (readFile clips the view): on paper it covers every line, in its bytes
+    // it shows none of these
+    var head: std.ArrayListUnmanaged(u8) = .empty;
+    defer head.deinit(gpa);
+    try tLines(&head, gpa, 1, 200, "rec");
+    try head.appendSlice(gpa, "[...view clipped: showing the first 8000 of 52000 bytes. The file on disk is WHOLE.]");
+    try tt.expect(!(try tStaleAfter(gpa, at_site, .{ "read_file", T_REC ++ "}", head.items })));
+    // and so is a wider window that stopped short of it
+    var short: std.ArrayListUnmanaged(u8) = .empty;
+    defer short.deinit(gpa);
+    try short.appendSlice(gpa, "[lines 1200-1400 of 1500]\\n");
+    try tLines(&short, gpa, 1200, 1240, "rec");
+    try short.appendSlice(gpa, "[...window clipped at line 1240 - narrow your range]\\n");
+    try tt.expect(!(try tStaleAfter(gpa, at_site, .{ "read_file", T_REC ++ ",\\\"start_line\\\":1200,\\\"end_line\\\":1400}", short.items })));
+    // a read that failed is replaced by the first later read that worked, never the other way round
+    const failed = [3][]const u8{ "read_file", T_REC ++ ",\\\"start_line\\\":1230,\\\"end_line\\\":1291}", "ERROR: could not read the file" };
+    try tt.expect(try tStaleAfter(gpa, failed, at_site));
+    try tt.expect(!(try tStaleAfter(gpa, at_site, failed)));
+    // any change to the path that landed stales every earlier result on it, its reads included ...
+    const edited = [3][]const u8{ "edit_file", T_REC ++ ",\\\"ops\\\":[]}", "edited pkg/records.py \u{2014} 1 op(s) applied, file is now 52001 bytes" };
+    try tt.expect(try tStaleAfter(gpa, at_site, edited));
+    try tt.expect(try tStaleAfter(gpa, at_site, .{ "write_file", T_REC ++ ",\\\"content\\\":\\\"x\\\"}", "wrote pkg/records.py \u{2014} file is now 1 bytes" }));
+    try tt.expect(try tStaleAfter(gpa, at_site, .{ "delete_file", T_REC ++ "}", "deleted pkg/records.py" }));
+    // and so does one whose answer the prune has since stubbed: it can no longer say it failed
+    try tt.expect(try tStaleAfter(gpa, at_site, .{ "edit_file", T_REC ++ ",\\\"ops\\\":[]}", PRUNED_STUB ++ " from the working context (3 KB): the assistant already read and acted on it.]" }));
+    // ... while a later read of the file leaves the record of the change standing
+    try tt.expect(!(try tStaleAfter(gpa, edited, at_site)));
+    // A change that was REFUSED left the file as the read saw it, so the read stays live: the tag guard's rejection,
+    // a stale anchor, an engine refusal, a delete of nothing
+    try tt.expect(!(try tStaleAfter(gpa, at_site, .{ "edit_file", T_REC ++ ",\\\"ops\\\":[]}", "edit REJECTED (nothing was changed) \u{2014} your `replace` text carries anchor tags (`42:abc:def\u{2192}`)." })));
+    try tt.expect(!(try tStaleAfter(gpa, at_site, .{ "edit_file", T_REC ++ ",\\\"ops\\\":[]}", "op1: anchor \\\"abc:def\\\" is a line tag with its LINE NUMBER dropped, and its hashes match no line in pkg/records.py as it is now \u{2014} that line changed since you read it. Nothing was modified." })));
+    try tt.expect(!(try tStaleAfter(gpa, at_site, .{ "write_file", T_REC ++ ",\\\"content\\\":\\\"x\\\"}", "(NOT executed: this turn's write budget is spent)" })));
+    try tt.expect(!(try tStaleAfter(gpa, at_site, .{ "delete_file", T_REC ++ "}", "could not delete (not found?)" })));
+}
+
+test "a re-read stales the earlier view by its line numbers, even after the file changed outside the file tools" {
+    const gpa = tt.allocator;
+    // read the bug site, patch it with run_python (no file tool: the net sees no write), re-read a wider window
+    const site = try tWindow(gpa, 1230, 1290, 1500);
+    defer gpa.free(site);
+    const patched = try tWindowOf(gpa, 1200, 1300, 1500, "fixed");
+    defer gpa.free(patched);
+    const rounds = [_][3][]const u8{
+        .{ "read_file", T_REC ++ ",\\\"start_line\\\":1230,\\\"end_line\\\":1290}", site },
+        .{ "run_python", "{\\\"code\\\":\\\"patch()\\\"}", "patched 61 lines of pkg/records.py" },
+        .{ "read_file", T_REC ++ ",\\\"start_line\\\":1200,\\\"end_line\\\":1300}", patched },
+    };
+    const span = try tRounds(gpa, &rounds);
+    defer gpa.free(span);
+    var g = try Graph.fromSpan(gpa, span);
+    defer g.deinit();
+    // the newer view shows lines 1230-1290 again, as they are NOW: the pre-change view is stale, off the protect
+    // list, and out of the carry, which holds the current lines only
+    try tt.expect((try tResultNode(&g, "r1")).superseded);
+    try tt.expect(!(try tProtected(gpa, &g, "r1")));
+    const net = try g.unfold(gpa, 4000, "");
+    defer gpa.free(net);
+    try tt.expect(std.mem.indexOf(u8, net, "fixed_1200") != null);
+    try tt.expect(std.mem.indexOf(u8, net, "rec_1230") == null);
+    // An untagged view (a read outside the workdir) has no numbers, so only its bytes can show it: the change
+    // between the reads keeps both views live. Pinned so the fallback stays the conservative one.
+    const plain_site = "[lines 1230-1231 of 1500]\\n    output_field = rec_1230.field(col)\\n    output_field = rec_1231.field(col)\\n";
+    const plain_patched = "[lines 1230-1231 of 1500]\\n    output_field = fixed_1230.field(col)\\n    output_field = fixed_1231.field(col)\\n";
+    const plain_args = "{\\\"path\\\":\\\"C:/ext/records.py\\\",\\\"start_line\\\":1230,\\\"end_line\\\":1231}";
+    try tt.expect(!(try tStaleAfter(gpa, .{ "read_file", plain_args, plain_site }, .{ "read_file", "{\\\"start_line\\\":1230,\\\"end_line\\\":1231,\\\"path\\\":\\\"C:/ext/records.py\\\"}", plain_patched })));
+    try tt.expect(try tStaleAfter(gpa, .{ "read_file", plain_args, plain_site }, .{ "read_file", "{\\\"start_line\\\":1230,\\\"end_line\\\":1231,\\\"path\\\":\\\"C:/ext/records.py\\\"}", plain_site }));
+    // ... and its own `[lines A-B of N]` header is not file text, so a whole-file view can show an untagged window
+    // even when the window's arguments were clipped past their excerpt cap
+    const small_plain = "[lines 2-3 of 4]\\nbeta = 2\\ngamma = 3\\n";
+    const small_args = "{\\\"path\\\":\\\"C:/ext/small.ini\\\",\\\"start_line\\\":2,\\\"end_line\\\":3,\\\"why\\\":\\\"the two settings the failing import reads before anything else runs, and nothing past them this time, since the rest of the file is comments\\\"}";
+    const span_ini = try tRounds(gpa, &.{ .{ "read_file", small_args, small_plain }, .{ "read_file", "{\\\"path\\\":\\\"C:/ext/small.ini\\\"}", "alpha = 1\\nbeta = 2\\ngamma = 3\\ndelta = 4\\n" } });
+    defer gpa.free(span_ini);
+    var g2 = try Graph.fromSpan(gpa, span_ini);
+    defer g2.deinit();
+    const r1 = try tResultNode(&g2, "r1");
+    try tt.expect(!r1.lines.known);
+    try tt.expect(r1.superseded);
+}
+
+test "a read whose own lines read like an error is still a read: not a dead end, not staled by another region" {
+    const gpa = tt.allocator;
+    // the bug site's first line raises; looksDead alone reads that excerpt as a failed call
+    var site: std.ArrayListUnmanaged(u8) = .empty;
+    defer site.deinit(gpa);
+    try site.appendSlice(gpa, "[lines 1230-1290 of 1500]\\n1230:abc:def\u{2192}        raise KeyError(name + ' not found in registry')\\n");
+    try tLines(&site, gpa, 1231, 1290, "rec");
+    try tt.expect(looksDead("[lines 1230-1290 of 1500] 1230:abc:def\u{2192} raise KeyError(name + ' not found in registry')"));
+    const other = try tWindow(gpa, 820, 845, 1500);
+    defer gpa.free(other);
+    const span = try tRounds(gpa, &.{
+        .{ "read_file", T_REC ++ ",\\\"start_line\\\":1230,\\\"end_line\\\":1290}", site.items },
+        .{ "read_file", T_REC ++ ",\\\"start_line\\\":820,\\\"end_line\\\":845}", other },
+    });
+    defer gpa.free(span);
+    var g = try Graph.fromSpan(gpa, span);
+    defer g.deinit();
+    const r1 = try tResultNode(&g, "r1");
+    try tt.expect(!r1.dead);
+    try tt.expect(!r1.superseded);
+    try tt.expect(try tProtected(gpa, &g, "r1"));
+    // carried as what the frontier rests on, never as a call that failed
+    const net = try g.unfold(gpa, 4000, "");
+    defer gpa.free(net);
+    try tt.expect(std.mem.indexOf(u8, net, "not found in registry") != null);
+    try tt.expect(std.mem.indexOf(u8, net, "RULED OUT") == null);
+    // a read that showed no file at all is still the dead end it was
+    const gone = try tRounds(gpa, &.{.{ "read_file", T_REC ++ "}", "not found" }});
+    defer gpa.free(gone);
+    var g2 = try Graph.fromSpan(gpa, gone);
+    defer g2.deinit();
+    try tt.expect((try tResultNode(&g2, "r1")).dead);
+}
+
+test "a line a view cut short is not a line it shows" {
+    const gpa = tt.allocator;
+    // a wide window the engine elided in the middle (head + notice + tail, both cuts mid-line), as clipToolResult
+    // leaves a result past 10 KB
+    var cut: std.ArrayListUnmanaged(u8) = .empty;
+    defer cut.deinit(gpa);
+    try cut.appendSlice(gpa, "[lines 1200-1400 of 1500]\\n");
+    try tLines(&cut, gpa, 1200, 1224, "rec");
+    try cut.appendSlice(gpa, "1225:abc:def\u{2192}    output_fi\\n...[9000 bytes elided from the middle of this tool result]...\\neld = rec_1380.field(col)\\n");
+    try tLines(&cut, gpa, 1381, 1400, "rec");
+    const wide = [3][]const u8{ "read_file", T_REC ++ ",\\\"start_line\\\":1200,\\\"end_line\\\":1400}", cut.items };
+    const Case = struct { first: u32, last: u32, stale: bool };
+    for ([_]Case{
+        .{ .first = 1210, .last = 1220, .stale = true }, // shown whole in the head
+        .{ .first = 1381, .last = 1400, .stale = true }, // and in the tail
+        .{ .first = 1225, .last = 1225, .stale = false }, // the line the head's cut ran through
+        .{ .first = 1380, .last = 1380, .stale = false }, // the line the tail starts inside
+        .{ .first = 1230, .last = 1290, .stale = false }, // elided
+        .{ .first = 1220, .last = 1385, .stale = false }, // across the elision
+    }) |c| {
+        const older = try tWindow(gpa, c.first, c.last, 1500);
+        defer gpa.free(older);
+        var ab: [128]u8 = undefined;
+        const args = try std.fmt.bufPrint(&ab, "{s},\\\"start_line\\\":{d},\\\"end_line\\\":{d}}}", .{ T_REC, c.first, c.last });
+        try tt.expectEqual(c.stale, try tStaleAfter(gpa, .{ "read_file", args, older }, wide));
+    }
+}
+
+test "a read's window is read from its arguments the way readFile resolves them, and unknown is never guessed" {
+    const whole = Lines.of("{\"path\":\"a.py\"}");
+    try tt.expect(whole.known and !whole.windowed and whole.first == 1 and whole.last == std.math.maxInt(u64));
+    const win = Lines.of("{\"path\":\"a.py\", \"start_line\": 12, \"end_line\": 40}");
+    try tt.expect(win.known and win.windowed and win.first == 12 and win.last == 40);
+    const open = Lines.of("{\"path\":\"a.py\",\"start_line\":200}");
+    try tt.expect(open.windowed and open.first == 200 and open.last == std.math.maxInt(u64));
+    const ol = Lines.of("{\"path\":\"a.py\",\"offset\":5,\"limit\":10}");
+    try tt.expect(ol.windowed and ol.first == 5 and ol.last == 14);
+    // readFile ignores a limit with no start: that is the whole file
+    try tt.expect(!Lines.of("{\"path\":\"a.py\",\"limit\":10}").windowed);
+    // a bound is read the way readFile's std.json parse reads its usize field: a quoted number and an integral
+    // float are that line (readFile serves them), ...
+    const quoted = Lines.of("{\"path\":\"a.py\",\"start_line\":\"12\",\"end_line\":\"40\"}");
+    try tt.expect(quoted.known and quoted.first == 12 and quoted.last == 40);
+    const float = Lines.of("{\"path\":\"a.py\",\"start_line\":1230.0,\"end_line\":1.29e3}");
+    try tt.expect(float.known and float.first == 1230 and float.last == 1290);
+    // ... while one std.json refuses (readFile answers "bad args"), or arguments clipped past their excerpt cap, stay
+    // unknown
+    const unknown = Lines.of("{\"path\":\"a/very/long/path.py\",\"start_l...");
+    try tt.expect(!unknown.known);
+    try tt.expect(!Lines.of("{\"path\":\"a.py\",\"start_line\":1.5}").known);
+    try tt.expect(!Lines.of("{\"path\":\"a.py\",\"start_line\":-3}").known);
+    try tt.expect(!Lines.of("{\"path\":\"a.py\",\"start_line\":\"twelve\"}").known);
+    try tt.expect(!Lines.of("{\"path\":\"a.py\",\"start_line\":null}").known);
+    // a whole-file window holds any window, an unknown one holds nothing and only a whole-file one holds it
+    try tt.expect(whole.contains(win) and whole.contains(unknown));
+    try tt.expect(!win.contains(whole) and !win.contains(unknown) and !unknown.contains(win));
+    try tt.expect(win.contains(Lines.of("{\"start_line\":12,\"end_line\":40}")) and !win.contains(open));
 }
