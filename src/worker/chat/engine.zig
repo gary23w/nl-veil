@@ -9458,9 +9458,18 @@ fn scheduleDeleteTool(app: *App, uid: u64, args: []const u8) []u8 {
 fn castTool(app: *App, uid: u64, conv: []const u8, conv_dir: []const u8, ctrl_cursor: usize, trio: ModelTrio, args: []const u8, tool_client: bool) []u8 {
     const gpa = app.gpa;
     const base_url = trio.coding.base_url;
-    const key = trio.coding.key;
     const model = trio.coding.model;
     const gw = trio.pick(.prompting);
+    // THE TURN'S CURRENT KEY, not the one it was handed. The trio's keys are resolved once, when the message is
+    // submitted; a Cloudflare access token that expired since was re-resolved by the model calls' retry ladder and
+    // lives for the rest of the turn in llm.zig's swap table (swappedKey) — which the chat calls consult and this
+    // cast did not, so an unarmed swarm was deployed with the token the turn itself had already seen refused.
+    const fresh_key = llm.swappedKey(gpa, base_url, trio.coding.key);
+    defer if (fresh_key) |k| llm.freeKey(gpa, k);
+    const key: []const u8 = fresh_key orelse trio.coding.key;
+    const fresh_gw_key = llm.swappedKey(gpa, gw.base_url, gw.key);
+    defer if (fresh_gw_key) |k| llm.freeKey(gpa, k);
+    const gw_key: []const u8 = fresh_gw_key orelse gw.key;
     // "Distinct" by the SAME test run.zig:7406 / agi.zig:447 use to decide a fallback exists (model OR endpoint
     // differs) — so what the manifest declares and what the worker acts on can never disagree.
     const gw_distinct = !std.mem.eql(u8, gw.model, model) or !std.mem.eql(u8, gw.base_url, base_url);
@@ -9509,7 +9518,7 @@ fn castTool(app: *App, uid: u64, conv: []const u8, conv_dir: []const u8, ctrl_cu
         // The gateway needs its OWN key: a cross-provider gateway authenticates against a different endpoint,
         // and leaving it blank makes run.zig:750 substitute the literal "gateway-local" (right for a keyless
         // local sidecar, a 401 for a hosted second provider).
-        .gateway_key = if (gw_distinct) gw.key else "",
+        .gateway_key = if (gw_distinct) gw_key else "",
         .style = "auto",
         .mode = a.mode,
         .dir = conv, // build in this conversation's dir so the cast + chat co-edit one tree
