@@ -193,7 +193,7 @@ CLOUDFLARE
   The connector needs outbound UDP or TCP 7844; HTTPS 443 alone is insufficient.
   No inbound router/firewall rule is needed for a tunnel. OS approval of these unsigned
   binaries is separate. Recovery and network guidance:
-  https://github.com/gary23w/nl-veil/blob/swe/benchmark_1/docs/UPDATES.md
+  https://github.com/gary23w/nl-veil/blob/main/docs/UPDATES.md
 
 the veil — by gary23w
   author   https://github.com/gary23w
