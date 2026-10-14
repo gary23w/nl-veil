@@ -16,6 +16,8 @@ Text anchors ask a model to re-emit a code line byte-for-byte (models paraphrase
 - `lineHash(line)` / `encode(h, out)` / `chunkFp(lines, idx)` — the hash primitives (whitespace-stable, token-sensitive)
 - `Anchor` + `parseAnchor(raw)` — parse `42:abc:rst`, `42:abc`, `0:` (start-of-file), or `EOF`; tolerates a copied `→content` suffix; null = treat as a legacy text anchor
 - `isNumberedAnchor(s)` — batch-level dispatch requires at least one numbered anchor (plain code contains "EOF")
+- `formatAnchor(a, buf)` — the normalised `N:abc[:def]` text of a parsed anchor, for echoing a ready-made fix into an error
+- `SpannedTags` + `spannedTagAnchor(raw)` — detects a block of the read view pasted as ONE anchor (several lines, the first opening with a tag) and reports its first and last tags; null for a single line or a multi-line text anchor
 - `renderAnchor` / `renderRead(gpa, content)` — the anchored read rendering (`N:abc:def→line`) that makes anchors copyable
 - `splitLines(gpa, content)` — line split matching anchor numbering (drops the synthetic trailing-newline tail)
 - `Verdict` + `validate(lines, a)` — valid / stale / out_of_range against the current file
@@ -37,6 +39,7 @@ The header pins the split: `tools.zig` owns reading/writing the file around `app
 - Shifted-anchor recovery: a stale anchor often just moved; the ±`SEARCH_RADIUS` scan names the new line only when exactly ONE position re-validates both hashes — several matches is ambiguity the model must resolve from the fresh context.
 - Splices are applied bottom-up (ties: later op first) on original coordinates after an overlap check; a no-trailing-newline original is preserved.
 - Hashing is whitespace-normalized (indent/trailing-ws changes don't invalidate; token changes do), and the chunk fingerprint makes edits NEAR a line surface as staleness too.
+- A tag names one line. `parseAnchor` keeps only what precedes the first `→`, so an anchor that pastes several tagged lines would silently name its first line alone: a replace swaps that one line and leaves the rest of the block behind, reporting success. `spannedTagAnchor` detects that shape; `tools.zig` rejects it before dispatch with the block's own `anchor`..`end` range filled in.
 
 ---
 
