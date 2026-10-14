@@ -2703,6 +2703,9 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     // entirely (see the note in web/public/app.js) because the server executes its tools.
     const is_admin = if (app.auth.userById(uid)) |cu| app.auth.isAdmin(cu) else false;
     const tool_client = tool_client_req and is_admin;
+    // turn-scoped client-absence evidence — see delegateTool / CLIENT_GONE_AFTER. Declared with the flag because
+    // the first delegated call of a client-mode turn can be a recon probe (reconFindings), well before the loop.
+    var no_ack_streak: u32 = 0;
 
     // The trio splits this turn's LLM calls across three models. `coding` is the base/default (the main answer
     // stream, metrics attribution, cast/schedule inheritance); `think` drives planning + context housekeeping;
@@ -3529,7 +3532,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
             const evidence = if (fast or envDisabled(environ, "NL_CHAT_RECON"))
                 null
             else
-                reconFindings(app, llm_dir, conv_dir, ctrl_cursor, think, &ctx, user_text, ground.items);
+                reconFindings(app, llm_dir, conv_dir, ctrl_cursor, think, &ctx, user_text, ground.items, tool_client, &no_ack_streak);
             defer if (evidence) |e| gpa.free(e);
 
             var ev: std.ArrayListUnmanaged(u8) = .empty;
@@ -3710,7 +3713,6 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     // the budget, every further tool call is answered with "finalize NOW", which drives the model to settle.
     // The successful reference run used 14 calls; 60 is generous headroom for real research.
     var tools_spent: usize = 0;
-    var no_ack_streak: u32 = 0; // turn-scoped client-absence evidence — see delegateTool / CLIENT_GONE_AFTER
     var dud_fetches: u32 = 0; // turn-scoped guessed-URL spiral evidence — see looksLikeNotFound / DUD_FETCH_STREAK
     var poll_timeouts: u32 = 0; // turn-scoped stuck-in-a-wait evidence — see POLL_TIMEOUT_STREAK
     const tool_budget: usize = if (schedTaskOf(conv) != null) 60 else std.math.maxInt(usize);
@@ -8316,12 +8318,15 @@ test "a starved recon or plan pass says so in the run log; an answered or failed
 /// The whitelist check is the load-bearing line. `tools.execute` is the full tool surface, so a probe list
 /// taken at face value would let a PLANNING pass write files and run code before the user has seen a plan.
 ///
-/// KNOWN LIMIT: probes run SERVER-side (tools.execute) even on a client-delegated turn, which the main loop
-/// would route through delegateTool. For the desk that is the same machine and the same workdir, so
-/// list_dir/read_file answer identically; for a hosted server with a remote client they would describe the
-/// server's tree, not the user's. Delegating recon would put a client round trip ahead of time-to-first-token
-/// on every planned turn — deliberately not paid until a remote-client case actually needs it.
-fn reconFindings(app: *App, run_root: []const u8, conv_dir: []const u8, ctrl_cursor: usize, p: Provider, ctx: *tools.ToolCtx, user_text: []const u8, ground: []const u8) ?[]u8 {
+/// Probes take THE TURN'S OWN ROUTE (runRouted): on a client-mode turn they are delegated to the client exactly
+/// as the main loop delegates its calls, so a probe never reads this server's tree in place of the user's, and
+/// never reaches the web or the hive from here when the turn's harness is the one that runs — and records,
+/// filters, or refuses — every tool. They used to run server-side on every turn (a "known limit" taken for the
+/// desk's sake, where the two trees are one): the client's harness then saw a planning pass's web_search,
+/// read_url and recall_hive go out with none of its rules applied, and a remote client was shown the server's
+/// files. The cost is one client round trip per probe ahead of time-to-first-token on a planned client-mode
+/// turn, which is the price of the turn's tools being the turn's.
+fn reconFindings(app: *App, run_root: []const u8, conv_dir: []const u8, ctrl_cursor: usize, p: Provider, ctx: *tools.ToolCtx, user_text: []const u8, ground: []const u8, tool_client: bool, no_ack_streak: *u32) ?[]u8 {
     const gpa = app.gpa;
     var msgs: std.ArrayListUnmanaged(u8) = .empty;
     defer msgs.deinit(gpa);
@@ -8387,7 +8392,7 @@ fn reconFindings(app: *App, run_root: []const u8, conv_dir: []const u8, ctrl_cur
         if (!allowed) continue;
         const args = std.json.Stringify.valueAlloc(gpa, pr.args, .{}) catch continue;
         defer gpa.free(args);
-        const res = tools.execute(ctx, pr.tool, if (std.mem.eql(u8, args, "null")) "{}" else args);
+        const res = runRouted(app, ctx, conv_dir, ctrl_cursor, tool_client, "", pr.tool, if (std.mem.eql(u8, args, "null")) "{}" else args, no_ack_streak);
         defer gpa.free(res);
         if (ran == 0) out.appendSlice(gpa, "\n\nWHAT YOU FOUND WHEN YOU LOOKED (evidence — plan from THIS, not from assumption):") catch break;
         const seg = std.fmt.allocPrint(gpa, "\n\n$ {s} {s}\n{s}", .{ pr.tool, clipBytes(args, 200), clipBytes(res, 1200) }) catch break;
@@ -10620,6 +10625,35 @@ fn clientRoute(name: []const u8) ClientRoute {
     return .client;
 }
 
+/// Where a mind tool runs on THIS turn: here, unless the turn is client-mode, where clientRoute decides. The one
+/// answer every tool-running site takes — the agentic loop's calls and the recon pass's probes — so a turn's tools
+/// are the turn's wherever the call originates.
+fn toolRoute(tool_client: bool, name: []const u8) ClientRoute {
+    return if (tool_client) clientRoute(name) else .server;
+}
+
+/// Run one mind tool by the turn's route (toolRoute). `id` is the call's id for the client bridge, "" to mint one.
+fn runRouted(app: *App, ctx: *tools.ToolCtx, conv_dir: []const u8, ctrl_cursor: usize, tool_client: bool, id: []const u8, name: []const u8, args: []const u8, no_ack_streak: *u32) []u8 {
+    return switch (toolRoute(tool_client, name)) {
+        .server => tools.execute(ctx, name, args),
+        .client => delegateTool(app, conv_dir, id, name, args, ctrl_cursor, no_ack_streak),
+        .cloudflare => cfClientTool(app, ctx, conv_dir, ctrl_cursor, name, args, no_ack_streak),
+    };
+}
+
+test "recon probes take the turn's own route: the client's harness on a client-mode turn, this server otherwise" {
+    // every recon probe is a client tool (none is a credential read, an Agent Garrett verb or a cf_ call), so a
+    // client-mode turn delegates all of them — the main loop and the recon pass answer with one function
+    for (RECON_TOOLS) |t| {
+        try std.testing.expect(toolRoute(true, t) == .client);
+        try std.testing.expect(toolRoute(false, t) == .server);
+    }
+    // the main loop's server-side exceptions are the same exceptions here
+    try std.testing.expect(toolRoute(true, "get_credential") == .server);
+    try std.testing.expect(toolRoute(true, "cf_upload") == .cloudflare);
+    try std.testing.expect(toolRoute(false, "cf_upload") == .server);
+}
+
 /// A cf_ call in a CLIENT-MODE turn. The call runs HERE, with this turn's credentials, while the workspace the
 /// model works in is the client's disk. So the one file the call touches (cftools.fileUse) crosses over:
 ///
@@ -12241,11 +12275,7 @@ fn runInnerAgentic(
                 if (step.truncated and ci == step.calls.len - 1 and isMutatingTool(run_name))
                     break :blk gpa.dupe(u8, "(NOT executed: this call was CUT OFF by the output-token limit — done_reason=length — so its arguments are almost certainly incomplete, and running it would have written a truncated file that looks finished. Re-issue the SAME call with less content: write the file in smaller pieces (edit_file appends/patches), or shorten what you are writing. Do not assume anything was written.)") catch emptyRes();
                 break :blk orchTool(app, uid, ctx, conv, conv_dir, steer_cursor.*, trio, run_name, run_args, tool_client) orelse
-                    (if (!tool_client) tools.execute(ctx, run_name, run_args) else switch (clientRoute(run_name)) {
-                        .client => delegateTool(app, conv_dir, c.id, run_name, run_args, steer_cursor.*, no_ack_streak),
-                        .server => tools.execute(ctx, run_name, run_args),
-                        .cloudflare => cfClientTool(app, ctx, conv_dir, steer_cursor.*, run_name, run_args, no_ack_streak),
-                    });
+                    runRouted(app, ctx, conv_dir, steer_cursor.*, tool_client, c.id, run_name, run_args, no_ack_streak);
             };
             traceFrame(app, "worker.tools", c.name, "exit", null, null);
             scrubUtf8(result); // fetched bytes may be invalid UTF-8; must be valid before it rides in JSON
