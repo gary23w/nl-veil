@@ -3466,8 +3466,8 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
         // decomposition ROUND-TRIP — that sequential inference adds seconds to time-to-first-token even when the
         // model correctly returns an empty plan, and weak models over-decompose greetings into swarm plans. Real
         // tasks still plan + coordinate; chat stays fast. This persistPlan only overwrites a completed/absent plan,
-        // so no in-progress work is lost.
-        if (shouldPlan(user_text)) {
+        // so no in-progress work is lost. NL_CHAT_PLAN=0 turns the whole decomposition off (planGate).
+        if (planGate(environ, user_text)) {
             // LOOK BEFORE PLANNING. Rung 1 is free — the workdir survey the engine already holds, which until
             // now reached only the chat inference. Rung 2 spends one inference plus up to three READ-ONLY
             // probes so the decomposition is written against the project that exists. Both degrade to nothing:
@@ -3758,10 +3758,14 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     // step" rule under the drive inference below.
     var mem_applied_turn: usize = 0;
     var mem_step_nudged = false;
-    var zero_tool_nudged = false; // the zero-tool-claim continuation fires once per turn (see below)
-    var ground_nudged = false; // the grounding continuation (a figure from nowhere / a NOW question, no tool run) - once per turn
-    var cut_nudged = false; // the cut-reply continuation (output cap hit before any answer) - once per turn
-    var empty_retried = false; // the empty-before-any-work retry (a dead call, not a finished model) - once per turn
+    // THE TURN'S SIDE OF EVERY SETTLED REPLY'S ROUTE (ReplyTurn): the passes that ran a tool, counted as each
+    // returns, and the once-per-turn continuations already spent - the zero-tool claim, grounding, the cut nudge,
+    // the empty retry - plus the picker routes taken (CUT_PICK_MAX).
+    var replies: ReplyTurn = .{};
+    // A picker-route pass committed nothing (its reply was empty), and the step it earned has not run yet. Set by
+    // the route, cleared once the next pass starts. If the drive ends the loop instead of naming a step, the loop
+    // exit gives the turn its end (ReplyTurn.pickEnd); a Stop before the step runs ends it as stopped.
+    var pick_unanswered = false;
     outer: while (drive < max_steps) : (drive += 1) {
         // Reaching a SECOND drive step means the answer captured last step was not the turn's answer — drop it
         // (see the capture site). This clear is what makes "still held at the completion site" mean "the turn
@@ -3774,11 +3778,16 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
         // mid-turn user message (posting to steer a running turn) so the next inference picks it up.
         switch (drainChatControl(app, conv_dir, &steer_cursor, &conv_buf)) {
             .stop => {
+                // The step a picker-route pass earned is injected but has not run: the empty reply that took the
+                // route committed nothing, so the Stop is what the turn's row says - never "(no reply)", and
+                // nothing recorded against a schedule (emptyReplyEnd: a Stop is not a model failure).
+                if (pick_unanswered) endEmptyReply(app, conv_dir, &ctx, mem_scope, uid, conv, sched_task, emptyReplyEnd(true));
                 finishTurn(app, conv_dir, usage_t0);
                 return;
             },
             .none => {},
         }
+        pick_unanswered = false; // the picked step's pass starts now: it answers, or routes, on its own
 
         // CROSS-STEP COMPACTION: fold accumulated drive-step growth (prior settled answers + compacted notes) into
         // one note when it crosses the budget, so a long multi-step / afk turn can't overflow the model window
@@ -3863,6 +3872,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
         // Run one agentic tool pass to a SETTLED (no-tool-call) answer.
         const mut_before = file_ledger.mutations;
         const inner = runInnerAgentic(app, uid, conv, conv_dir, llm_dir, trio, &conv_buf, &ctx, &steer_cursor, &tool_obs, &tool_perf, tool_client, &no_ack_streak, &dud_fetches, &poll_timeouts, &tools_spent, tool_budget, token_ceiling, &echo_guard, &call_ledger, &file_ledger, foreign_mem.items, &foreign_warned, search_intent, &search_log, turn_tools, if (map_walk) |*mw| mw else null, if (overlay) |*o| o else null);
+        replies.notePass(inner.tools_ran); // every outcome: a roll-on segment's tools ran this turn too
         // TRAJECTORY THREAD (fine weave): a pass that LANDED file changes mints one provenance-labeled
         // progress fact pairing the step's language with the engine-observed effect — the lexical thread
         // that lets a later step's recall hop from "what am I doing" to "what already happened here".
@@ -4101,6 +4111,10 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
         }
 
         // Commit the settled answer as the assistant turn (durable + narrated) and thread it into the LLM context.
+        // The fast path below asks whether the RAW reply claims work. Read here, before any strip below can free
+        // inner.content: it used to be read there, after them - a read of freed memory whenever a strip had
+        // replaced the reply (the watermark fold, a sentinel wrapper, leaked markup, a memory directive).
+        const settled_claims = claimsWork(inner.content);
         var answer = inner.content;
 
         // WATERMARK FOLD on the committed answer: the streamed deltas were folded at the edge, but the
@@ -4137,6 +4151,30 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
 
         const reply_lines = answerLineCount(answer);
 
+        // THE SETTLED REPLY'S ROUTE, decided in one place (emptyReplyRoute, under this turn's ReplyTurn): which of
+        // the continuations below it earns, if any. The blocks below are what each route DOES; the order they are
+        // tried in, the conditions each one reads, the whole-turn tool count and the once-per-turn flags live in
+        // those pure units, where a table test pins every shape and a pass-by-pass test walks whole turns. The
+        // route spends the once-per-turn continuation it returns (grounding's block spends its own, since it may
+        // still let the reply stand). The Stop is read for an empty reply only, so the ordinary settled path pays
+        // no control-file read.
+        const empty_now = std.mem.trim(u8, answer, " \r\n\t").len == 0;
+        const stop_pending = empty_now and stopRequestedSince(app, conv_dir, steer_cursor);
+        const route = replies.route(inner.tools_ran, .{
+            .empty = empty_now,
+            .claims_work = claimsWork(answer),
+            .action = actionShaped(goal_text),
+            .tools_forbidden = toolsForbidden(goal_text),
+            .afk = afk,
+            .goal = goal_on,
+            .truncated = inner.truncated,
+            .reasoning_only = inner.reasoning_only,
+            .free_form = task_idx == null,
+            .steps_left = drive + 1 < max_steps,
+            .stop_pending = stop_pending,
+        });
+        pick_unanswered = route == .picker;
+
         // A ZERO-TOOL CLAIM IS NOT DONE. Ledger run 5, turns 13, 14, 21 and 23: "record these transactions" was
         // answered "RECORDED=6 / BALANCE ..." in six seconds with no tool call, and the verdict below accepted it;
         // turn 21's claim was manufactured by the plain-text rescue, which forbids tools by design; turn 23
@@ -4144,12 +4182,10 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
         // the transcript: an action-shaped request, no tool run this whole turn, and a reply that claims work
         // (or says nothing) gets ONE deterministic continuation that states the fact. The verdict decides only
         // once the model has been told.
-        if (!zero_tool_nudged and !afk and !inner.tools_ran and tools_spent == 0 and actionShaped(goal_text) and
-            (claimsWork(answer) or std.mem.trim(u8, answer, " \r\n\t").len == 0))
-        {
-            zero_tool_nudged = true;
+        if (route == .zero_tool) {
+            const zt_status = zeroToolStatus(answer); // static: read BEFORE the free, emitted after it
             gpa.free(answer);
-            emitKV(app, conv_dir, "status", "text", "the reply claims work, but no tool ran this turn - continuing");
+            emitKV(app, conv_dir, "status", "text", zt_status);
             conv_buf.appendSlice(gpa, ",{\"role\":\"user\",\"content\":") catch break :outer;
             http.jstr(gpa, &conv_buf, ZERO_TOOL_NUDGE) catch break :outer;
             conv_buf.append(gpa, '}') catch break :outer;
@@ -4165,7 +4201,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
         // compute, or say the value cannot be derived; the second reply stands. Only a conversation that has
         // DONE tool work qualifies - a tool result in the history, or a facts ledger - so a pure chat's "366
         // days in a leap year" is never sent to look for a file.
-        if (!ground_nudged and !zero_tool_nudged and !afk and !inner.tools_ran and tools_spent == 0 and !toolsForbidden(goal_text)) ground: {
+        if (route == .ground) ground: {
             const trimmed = std.mem.trim(u8, answer, " \r\n\t");
             if (trimmed.len == 0) break :ground;
             const facts_text: ?[]u8 = factsLedgerText(app, workdir);
@@ -4177,7 +4213,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
             if (!worked_before) break :ground;
             const stray = ungroundedNumber(trimmed, goal_text, tool_obs.items, facts_text orelse "");
             if (stray == null and !asksAboutNow(goal_text)) break :ground;
-            ground_nudged = true;
+            replies.ground_nudged = true; // spent here, not by the route: the checks above may let the reply stand
             var nb: [512]u8 = undefined;
             const nudge: []const u8 = if (stray) |num|
                 (std.fmt.bufPrint(&nb, "(Your reply states a figure - {s} - that no tool produced this turn and the request did not supply, and no tool ran this turn. A number recalled from earlier is not the current state. Read or compute it with a tool now and reply with what the tool shows; if it genuinely cannot be derived, say so instead of guessing.)", .{num}) catch NOW_NUDGE)
@@ -4197,8 +4233,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
         // continuation first: the model is told what happened and asked to answer directly, one tool call at
         // most; on Workers AI that call runs without reasoning (llm.think_off_once), so the answer comes out
         // of the context it already holds. Only a reply that is empty for some other reason reaches the rescue.
-        if (!cut_nudged and inner.truncated and std.mem.trim(u8, answer, " \r\n\t").len == 0) {
-            cut_nudged = true;
+        if (route == .cut) {
             gpa.free(answer);
             emitKV(app, conv_dir, "status", "text", "the reply was cut at the output limit before it answered - continuing, directly");
             conv_buf.appendSlice(gpa, ",{\"role\":\"user\",\"content\":") catch break :outer;
@@ -4214,14 +4249,34 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
         // "sum the paid rows of data/txns.csv" with TOTAL=0.00 without ever being able to open the file. So an
         // empty reply with no tool run this turn is asked ONCE more with the tools still advertised; only a second
         // empty reply reaches the rescue.
-        if (!empty_retried and !inner.tools_ran and tools_spent == 0 and !toolsForbidden(goal_text) and std.mem.trim(u8, answer, " \r\n\t").len == 0) {
-            empty_retried = true;
+        if (route == .empty_retry) {
             gpa.free(answer);
             emitKV(app, conv_dir, "status", "text", "the model returned nothing before doing any work - asking again, tools available");
             conv_buf.appendSlice(gpa, ",{\"role\":\"user\",\"content\":") catch break :outer;
             http.jstr(gpa, &conv_buf, EMPTY_NUDGE) catch break :outer;
             conv_buf.append(gpa, '}') catch break :outer;
             continue :outer;
+        }
+        // A REPLY THAT HELD ONLY REASONING, ON WORK NOT YET DONE, GOES TO THE STEP PICKER. Measured on a five-task
+        // coding run (2026-10-12): a reasoning model's coding call ran to the 240 s deadline thinking, with no
+        // answer and no call, and the old order of the blocks above sent it, in turn, a nudge saying "you reported
+        // a result" (false - it reported nothing), the same unbounded call again ("continue from the start",
+        // another 240 s of thinking), and the tool-less rescue, which can only narrate: one task spent 720 s in
+        // three such cuts plus 79 s of rescue before any tool ran, the other spent its last 265 s of budget in a
+        // rescue that never answered. What restored tool work in the first was the drive loop's step picker - a
+        // bounded-context call (12 s there) that named one concrete step. So that reply goes straight to it:
+        // nothing is committed (an empty row is not an answer), the drive inference below runs even at drive 0
+        // (the fast path is skipped), and the step it names is injected like any drive step. CUT_PICK_MAX per
+        // turn (the route counts them), then the honest end; a pending Stop never starts the picker. If the
+        // picker ends the loop instead of naming a step, the loop exit still gives a turn that ran tools the
+        // rescue (ReplyTurn.pickEnd). The rescue stays first for a question, for a request that forbade tools,
+        // for a reply that was empty WITHOUT a reasoning trail behind it, and on the last drive step.
+        //
+        // `answer` is left as it is - empty, or whitespace - and this pass's commit below is skipped; the defer
+        // there frees it as on every other pass, and processMemoryDirectives returns null for text without a
+        // directive in it.
+        if (route == .picker) {
+            emitKV(app, conv_dir, "status", "text", "the reply held only reasoning - no answer and no tool call - asking the step picker for the next step");
         }
         // EMPTY settled answer (the model "died" — returned no text and no tools, or stripped to nothing).
         // ONE plain-text rescue before surrendering: re-ask with NO tools advertised — the model cannot emit
@@ -4230,52 +4285,28 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
         // the data was IN CONTEXT and the turn still ended "(no reply)". One bounded inference turns that
         // gathered-but-unspoken context into the user's answer; a model that returns nothing twice still gets
         // the honest note below.
-        if (std.mem.trim(u8, answer, " \r\n\t").len == 0) rescue: {
-            var rmsgs: std.ArrayListUnmanaged(u8) = .empty;
-            defer rmsgs.deinit(gpa);
-            rmsgs.appendSlice(gpa, conv_buf.items) catch break :rescue;
-            rmsgs.appendSlice(gpa, ",{\"role\":\"user\",\"content\":\"(your previous response was empty or malformed and was discarded. Answer me NOW in plain text, using what the conversation above already established — especially any tool results. Do not call tools; do not emit JSON, code fences, or tool markup. Just the answer.)\"}") catch break :rescue;
-            emitKV(app, conv_dir, "status", "text", "recovering: asking for a plain-text answer");
-            const rp = trio.coding; // the rescue finishes the answer stream's own job — coding role (see trio_routing_test)
-            const rcm = meterBegin(app.io);
-            var rs = completeAux(app, llm_dir, "rescue", rp.base_url, rp.key, rp.model, rmsgs.items, 1024, 0.4);
-            defer rs.deinit(gpa);
-            meterEnd(app, rcm, "rescue", .coding, rp.model, rs.ok);
-            if (!rs.ok) break :rescue;
-            // the rescue output rides the same strips the settled path applies above
-            var r: []u8 = gpa.dupe(u8, rs.content) catch break :rescue;
-            if (cctx.stripSentinelTags(gpa, r)) |clean| {
-                gpa.free(r);
-                r = clean;
+        //
+        // A STOP IS NOT A DEAD MODEL (emptyReplyEnd). Asked before the route was chosen (stop_pending), so a Stop
+        // that is already pending never starts this call: it is blocking, with no abort hook, so once started it
+        // runs to its own end. Asked again at the end, only if the rescue ran, so a Stop that landed DURING it
+        // still ends the turn as a stop rather than as "(no reply)" plus a FAILED schedule outcome.
+        if (route == .rescue) {
+            // the rescue finishes the answer stream's own job — coding role (see trio_routing_test)
+            if (plainTextRescue(app, llm_dir, conv_dir, trio.coding, conv_buf.items)) |r| {
+                gpa.free(answer);
+                answer = r; // rescued — fall through to the normal commit path
             }
-            if (cctx.looksLikeToolMarkup(r)) {
-                const clean = cctx.contentBeforeMarkup(r);
-                if (gpa.dupe(u8, clean)) |d| {
-                    gpa.free(r);
-                    r = d;
-                } else |_| {}
-            }
-            if (std.mem.trim(u8, r, " \r\n\t").len == 0) {
-                gpa.free(r);
-                break :rescue;
-            }
-            gpa.free(answer);
-            answer = r; // rescued — fall through to the normal commit path
         }
-        if (std.mem.trim(u8, answer, " \r\n\t").len == 0) {
+        // GIVE UP: an empty reply no continuation took (the picker route is the one empty reply that goes on).
+        if (route != .picker and std.mem.trim(u8, answer, " \r\n\t").len == 0) {
+            var empty_end = emptyReplyEnd(stop_pending);
+            if (route == .rescue and stopRequestedSince(app, conv_dir, steer_cursor)) empty_end = emptyReplyEnd(true);
             gpa.free(answer);
             planStepInterrupted(app, conv_dir, plan, task_idx);
-            const note = "(no reply — the model returned an empty or malformed response this turn)";
-            appendMsg(app, conv_dir, "assistant", note, "veil", nowSecs(app.io));
-            emitAssistant(app, conv_dir, note);
-            // SCHEDULED runs learn from an empty run too — a mechanical fact the next run's recall sees, plus
-            // the task-file outcome that flips the next run into self-heal posture and arms the backoff.
-            if (sched_task) |tid| {
-                var fb: [180]u8 = undefined;
-                _ = ctx.mem.observe(mem_scope, std.fmt.bufPrint(&fb, "run {s} produced NO ANSWER (empty/malformed model response) — retry with a simpler first step", .{conv[0..@min(conv.len, 64)]}) catch "a previous run produced no answer");
-                _ = sched.recordRunOutcome(app, uid, tid, false, "FAILED: empty/malformed model response (no answer produced)");
-            }
-            salvageSteers(app, conv_dir, &steer_cursor); // an empty-reply end must not eat a pending steer
+            endEmptyReply(app, conv_dir, &ctx, mem_scope, uid, conv, sched_task, empty_end);
+            // An empty-reply end must not eat a pending steer - a stopped one included: no drain has read the
+            // control file since the last inference, so a steer posted ahead of the Stop is still unread.
+            salvageSteers(app, conv_dir, &steer_cursor);
             finishTurn(app, conv_dir, usage_t0);
             return;
         }
@@ -4342,11 +4373,15 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
             } else |_| {}
         }
         defer gpa.free(answer);
-        appendMsg(app, conv_dir, "assistant", answer, "veil", nowSecs(app.io));
-        emitAssistant(app, conv_dir, answer);
-        conv_buf.appendSlice(gpa, ",{\"role\":\"assistant\",\"content\":") catch break :outer;
-        http.jstr(gpa, &conv_buf, answer) catch break :outer;
-        conv_buf.append(gpa, '}') catch break :outer;
+        // The picker route commits nothing: its reply was empty, and an empty assistant row is not an answer - it
+        // would only teach the next pass that saying nothing is a turn. The drive below injects the picked step.
+        if (route != .picker) {
+            appendMsg(app, conv_dir, "assistant", answer, "veil", nowSecs(app.io));
+            emitAssistant(app, conv_dir, answer);
+            conv_buf.appendSlice(gpa, ",{\"role\":\"assistant\",\"content\":") catch break :outer;
+            http.jstr(gpa, &conv_buf, answer) catch break :outer;
+            conv_buf.append(gpa, '}') catch break :outer;
+        }
         // The engine's memory row rides directly under the reply that earned it — a system turn, never the model's
         // voice — so the drive verdict's tail and every later pass read the update as a fact of this turn.
         if (mem_row) |row| {
@@ -4370,8 +4405,15 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
             continue :outer; // next subtask, OR (afk/armed + plan done) loop back — the top transitions or awaits
         }
 
-        // ANTI-SPIN / FAST-PATH: a step that ran NO tools did no agentic work this pass.
-        if (!inner.tools_ran) {
+        // ANTI-SPIN / FAST-PATH: a step that ran NO tools did no agentic work this pass (idleStep).
+        // A PICKER-ROUTE PASS WITH NO TOOL SKIPS BOTH. Reaching the drive inference at drive 0 is its whole point,
+        // and the fast path would end the turn there (an empty reply claims nothing); and a pass cut mid-thought is
+        // not the idle announce-only step the armed bound counts. CUT_PICK_MAX bounds it instead. One that RAN
+        // tools before the cut did work, and resets the count like any other such pass.
+        const idle_step = idleStep(inner.tools_ran, route);
+        if (idle_step == .hold) {
+            // straight on to the drive inference
+        } else if (idle_step == .idle) {
             if (!armed) {
                 // OFF: a first-step no-plan answer with no tools is a complete one-shot reply (plain Q&A) — end now,
                 // skipping the wasted LOOP_QUESTION round-trip. (A drive>0 no-tools step falls through to the DONE
@@ -4383,7 +4425,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
                 // right after a failed memory pass), and the fast path shipped it to the user as done. Such a step
                 // pays the one drive verdict below, which sees no tool results in the transcript and names the step
                 // that is missing; a genuine no-tools answer to a task ("I can't, because…") still ends on DONE.
-                if (drive == 0 and !(actionShaped(goal_text) and claimsWork(inner.content))) break :outer;
+                if (drive == 0 and !(actionShaped(goal_text) and settled_claims)) break :outer;
             } else {
                 // ARMED: tolerate ONE idle (announce-only) step so a build that pauses to narrate isn't cut off, but
                 // end a non-afk loop after TWO consecutive idle steps (that's a conversation, not work). AFK never
@@ -4554,6 +4596,8 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
                 // await it (cheap, stop-checked), then gather its results instead of settling over them.
                 if (if (cast_abandoned) null else awaitConvCast(app, uid, conv, conv_dir, steer_cursor, tool_client)) |w| switch (w) {
                     .stopped => {
+                        // a picker-route pass committed nothing: its row is the stop (see the loop-head drain)
+                        if (pick_unanswered) endEmptyReply(app, conv_dir, &ctx, mem_scope, uid, conv, sched_task, emptyReplyEnd(true));
                         finishTurn(app, conv_dir, usage_t0);
                         return;
                     },
@@ -4612,6 +4656,8 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
                 // a stall. Await + gather; a genuine no-progress repeat (no hive) still ends the loop.
                 if (awaitConvCast(app, uid, conv, conv_dir, steer_cursor, tool_client)) |w| switch (w) {
                     .stopped => {
+                        // a picker-route pass committed nothing: its row is the stop (see the loop-head drain)
+                        if (pick_unanswered) endEmptyReply(app, conv_dir, &ctx, mem_scope, uid, conv, sched_task, emptyReplyEnd(true));
                         finishTurn(app, conv_dir, usage_t0);
                         return;
                     },
@@ -4688,6 +4734,48 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
         const nd: []u8 = gpa.dupe(u8, trimmed) catch &[_]u8{};
         if (prev_drive.len > 0) gpa.free(prev_drive);
         prev_drive = nd;
+        // (pick_unanswered stays set until the next pass starts, past the loop-head drain: a Stop that landed
+        // during the picker call is read there, and ends the turn with the stopped row.)
+    }
+
+    // THE PICKER ROUTE ENDED THE LOOP INSTEAD OF NAMING A STEP: the drive inference failed, answered DONE or
+    // repeated itself, or a loop rule ended the turn - after a pass whose reply was empty and which committed
+    // nothing. Falling through would end the turn with no row at all for that pass.
+    //
+    // AFTER TOOL WORK, THE RESCUE STILL GETS ITS TRY (ReplyTurn.pickEnd). The old order gave this exact reply -
+    // tools ran, then a pass that held only reasoning - the plain-text rescue over the results already in
+    // context, and the picker ending the loop is the picker saying there is no step left to take: the work may
+    // well have landed, and only the closing words were cut. A rescue that answers is committed and the turn
+    // ends normally, a scheduled run recording it completed. Before any tool ran there is nothing for a rescue
+    // to report but a claim of work (ledger run 5, turn 21), so that turn - or one whose rescue answered
+    // nothing - ends exactly as an empty reply no continuation took (the give-up block in the loop): the honest
+    // note and a scheduled run's FAILED outcome, or, a Stop having landed, the stopped one.
+    if (pick_unanswered) pick_end: {
+        var stopped = stopRequestedSince(app, conv_dir, steer_cursor);
+        if (replies.pickEnd(stopped) == .rescue) {
+            // the rescue finishes the answer stream's own job — coding role (see trio_routing_test)
+            if (plainTextRescue(app, llm_dir, conv_dir, trio.coding, conv_buf.items)) |r| {
+                defer gpa.free(r);
+                // The settled path's own handling of a rescued answer, from its memory strip to its commit.
+                var mem_saved: usize = 0;
+                const stripped = processMemoryDirectives(app, uid, r, &mem_saved, null);
+                defer if (stripped) |s| gpa.free(s);
+                const said: []const u8 = if (stripped) |s|
+                    (if (std.mem.trim(u8, s, " \r\n\t").len == 0 and mem_saved > 0) "(noted — saved to your memory)" else s)
+                else
+                    r;
+                if (mem_saved > 0) emitMemoryUpdated(app, conv_dir, mem_saved);
+                appendMsg(app, conv_dir, "assistant", said, "veil", nowSecs(app.io));
+                emitAssistant(app, conv_dir, said);
+                appendMsgObj(gpa, &conv_buf, "assistant", said, said.len); // schedLearn's tail reads it below
+                break :pick_end;
+            }
+            stopped = stopRequestedSince(app, conv_dir, steer_cursor); // a Stop that landed during the rescue
+        }
+        endEmptyReply(app, conv_dir, &ctx, mem_scope, uid, conv, sched_task, emptyReplyEnd(stopped));
+        salvageSteers(app, conv_dir, &steer_cursor);
+        finishTurn(app, conv_dir, usage_t0);
+        return;
     }
 
     // The drive loop ended (plan complete / DONE / repeat / step cap / an OOM append) — every settled answer is
@@ -6647,6 +6735,13 @@ const InnerResult = struct {
     /// The provider cut the settling reply at the output-token limit (finish_reason "length"). With an empty
     /// `content` that is a reply that never got to answer, not an answer of nothing - see the cut continuation.
     truncated: bool = false,
+    /// The settling reply held ONLY reasoning: no content, no tool call, a non-empty reasoning channel
+    /// (reasoningOnly). That is the signature of a call cut while the model was still thinking - the case
+    /// `truncated` misses, because a call the wall-clock deadline ends carries no finish_reason at all. Measured
+    /// on a five-task coding run (2026-10-12, a reasoning model on a hosted provider): four coding calls ran to
+    /// the 240 s deadline with 48-50K characters of reasoning, no content and no call, and each settled here as
+    /// an ordinary empty answer. It changes no transport: llm.zig already returns the reasoning on the Step.
+    reasoning_only: bool = false,
     /// The ENGINE's own account of why this pass ended (today: the loop-guard hard stop), kept STRICTLY apart
     /// from `content`. `content` is committed as the assistant's durable message, so an engine note folded into
     /// it is stored in the model's voice and replayed next turn as something the model itself said. That is the
@@ -6997,6 +7092,21 @@ fn hasWordMarker(low: []const u8, marker: []const u8) bool {
     return false;
 }
 
+/// THE PLAN GATE: shouldPlan's markers, under the operator's NL_CHAT_PLAN kill switch. A planned turn pays two
+/// SEQUENTIAL thinking-role inferences before its first coding call - recon, then the decomposition - and on a
+/// model that reasons until its output budget runs out neither one produces anything. Measured on a five-task
+/// coding run with @cf/zai-org/glm-5.3 in every role (2026-10-12): the plan pass came back cut at the length
+/// limit with empty content in 5 of 5 tasks, recon in 2 of 5, no board or brief formed in any, and the two
+/// passes held the first coding call back by 161-280 s per task. NL_CHAT_RECON could already drop the first
+/// pass; this drops both as one decision, because recon's evidence has exactly one reader - the plan.
+///
+/// DEFAULT ON, with envDisabled's contract exactly (only "0"/"false" disable; "off" is a typo and reads ON),
+/// so a machine that has not been told otherwise plans precisely as before. It is read from the server
+/// process's environment, so turning it off is a per-server profile choice, never a per-request one.
+fn planGate(environ: *const std.process.Environ.Map, user_text: []const u8) bool {
+    return shouldPlan(user_text) and !envDisabled(environ, "NL_CHAT_PLAN");
+}
+
 /// A request that asks for something to be DONE to the world — files written, code run, things deployed —
 /// as opposed to asked about. Cheap and deliberately broad: it only decides whether a no-tools reply to the
 /// request earns a drive verdict (one short call) rather than ending the turn on the fast path.
@@ -7239,6 +7349,774 @@ test "actionShaped / claimsWork: a fabricated RECORDED line earns a verdict, a q
     try std.testing.expect(!claimsWork(""));
 }
 
+/// The status line the zero-tool continuation shows. That guard fires on a reply that claims work OR on an
+/// EMPTY one (see the guard in runTurn), and it used to say "the reply claims work" for both - which is false
+/// for an empty reply, which claims nothing. Measured: a coding call cut mid-reasoning at its 240 s deadline
+/// came back with no content at all, and the run log then read as a fabricated claim of work, sending the
+/// diagnosis after the wrong failure. Static strings, so the caller may free the reply before emitting.
+fn zeroToolStatus(answer: []const u8) []const u8 {
+    return if (std.mem.trim(u8, answer, " \r\n\t").len == 0)
+        "the reply was empty and no tool ran this turn - continuing"
+    else
+        "the reply claims work, but no tool ran this turn - continuing";
+}
+
+/// The two ways a turn whose reply is still EMPTY after every continuation can end, and what each commits.
+/// A model that returned nothing is a model failure: the note says so, and a scheduled run banks the fact and
+/// records a FAILED outcome (self-heal posture next run, backoff armed). A user's Stop is not: the turn was
+/// told to stop spending, so the tool-less rescue - a blocking call with no abort hook, which on a slow
+/// reasoning model ran 556 s and past a Stop - is never started, the committed row says the turn was stopped,
+/// and nothing is recorded against the schedule. The model did not fail; it was interrupted.
+const EMPTY_REPLY_NOTE = "(no reply — the model returned an empty or malformed response this turn)";
+const STOPPED_EMPTY_NOTE = "(stopped — the turn was stopped before the model produced a reply)";
+const EmptyReplyEnd = struct {
+    /// a recovery call may still be started: the plain-text rescue, or the step picker (emptyReplyRoute)
+    rescue: bool,
+    /// the row committed (as the assistant turn) if the reply is still empty
+    note: []const u8,
+    /// a model failure: a scheduled run banks "produced NO ANSWER" and records FAILED
+    failed: bool,
+};
+fn emptyReplyEnd(stop_pending: bool) EmptyReplyEnd {
+    if (stop_pending) return .{ .rescue = false, .note = STOPPED_EMPTY_NOTE, .failed = false };
+    return .{ .rescue = true, .note = EMPTY_REPLY_NOTE, .failed = true };
+}
+
+/// What a Stop that lands during the chat call commits as the pass's narration. The partial that streamed,
+/// when the call SUCCEEDED; otherwise the last narration the pass already holds (possibly none). A FAILED
+/// step's content is the transport's error text - "curl exit: " when the call's curl was killed - and
+/// committing it put that error into the transcript as the assistant's own words, where the next turn replays
+/// it as something the model said.
+fn stoppedPartial(step_ok: bool, step_content: []const u8, last_content: []const u8) []const u8 {
+    return if (step_ok and step_content.len > 0) step_content else last_content;
+}
+
+/// Commit the end of a turn whose reply stayed EMPTY (emptyReplyEnd says which end): the row, and - for a model
+/// failure on a scheduled run - the banked fact and the task-file outcome. One body for every place an empty
+/// reply ends a turn: the drive loop's give-up block, the loop exit after a picker-route pass named no step, and
+/// a Stop read while a picker-route pass's step has not run yet.
+fn endEmptyReply(app: *App, conv_dir: []const u8, ctx: *tools.ToolCtx, mem_scope: []const u8, uid: u64, conv: []const u8, sched_task: ?[]const u8, end: EmptyReplyEnd) void {
+    appendMsg(app, conv_dir, "assistant", end.note, "veil", nowSecs(app.io));
+    emitAssistant(app, conv_dir, end.note);
+    // SCHEDULED runs learn from an empty run too — a mechanical fact the next run's recall sees, plus the
+    // task-file outcome that flips the next run into self-heal posture and arms the backoff. Not from a STOPPED
+    // one: the model did not fail, so neither the fact nor the outcome would be true.
+    if (end.failed) {
+        if (sched_task) |tid| {
+            var fb: [180]u8 = undefined;
+            _ = ctx.mem.observe(mem_scope, std.fmt.bufPrint(&fb, "run {s} produced NO ANSWER (empty/malformed model response) — retry with a simpler first step", .{conv[0..@min(conv.len, 64)]}) catch "a previous run produced no answer");
+            _ = sched.recordRunOutcome(app, uid, tid, false, "FAILED: empty/malformed model response (no answer produced)");
+        }
+    }
+}
+
+/// The settling reply held only reasoning (InnerResult.reasoning_only). Asked where a pass settles, so "no tool
+/// call" holds by position; whitespace is nothing on either channel. A reply whose content was malformed markup
+/// is NOT this: its content came back, the strips empty it, and the rescue was written for exactly that case.
+fn reasoningOnly(content: []const u8, reasoning: []const u8) bool {
+    return std.mem.trim(u8, content, " \r\n\t").len == 0 and std.mem.trim(u8, reasoning, " \r\n\t").len > 0;
+}
+
+/// Where a settled reply goes before it is committed (emptyReplyRoute); null means it stands. Each names the
+/// runTurn block that carries it out, where its own measured case is written up.
+const ReplyRoute = enum {
+    /// ZERO_TOOL_NUDGE: an action request answered with a claim of work, or with nothing, and no tool run this turn
+    zero_tool,
+    /// the grounding check: a figure from nowhere or a question about NOW, no tool run (it may let the reply stand)
+    ground,
+    /// CUT_NUDGE with thinking off: the output limit cut the reply before it answered
+    cut,
+    /// EMPTY_NUDGE: nothing came back before any work - a dead call, asked once more with the tools advertised
+    empty_retry,
+    /// the tool-less plain-text rescue: the work's results are in context, only the words went missing
+    rescue,
+    /// the drive loop's step picker names the next step, and it is injected as the next pass's instruction
+    picker,
+    /// nothing left to try: the turn ends on the honest note, or the stopped one
+    give_up,
+};
+
+/// Everything emptyReplyRoute decides on. runTurn computes each pass field from live state, and ReplyTurn.route
+/// fills the turn fields (the defaulted ones) from what the turn's earlier passes did; the decision reads nothing.
+const ReplyFacts = struct {
+    /// the reply, after the strips, is empty
+    empty: bool,
+    /// claimsWork(reply)
+    claims_work: bool,
+    /// actionShaped(goal): the request asks for something to be DONE
+    action: bool,
+    /// toolsForbidden(goal)
+    tools_forbidden: bool,
+    afk: bool,
+    /// a /goal drives this turn: its judge measures every pass and its own question names the next step
+    goal: bool,
+    /// a tool ran in some pass of this TURN, this one included (ReplyTurn.route fills it)
+    tools_this_turn: bool = false,
+    /// InnerResult.truncated: finish_reason "length"
+    truncated: bool,
+    /// InnerResult.reasoning_only: no content, no call, a reasoning trail
+    reasoning_only: bool,
+    /// no plan subtask drives this step, so the step picker is what runs after it
+    free_form: bool,
+    /// drive + 1 < max_steps: a picked step would still get a pass to run in
+    steps_left: bool,
+    /// a Stop is pending (read for an empty reply only)
+    stop_pending: bool,
+    zero_tool_nudged: bool = false,
+    ground_nudged: bool = false,
+    cut_nudged: bool = false,
+    empty_retried: bool = false,
+    /// picker routes this turn has already taken
+    picks: u8 = 0,
+};
+
+/// How many times one turn sends a reasoning-only reply to the step picker. In the measured run one picked step
+/// was enough to put tool work back on track; a model that thinks past the deadline a third time on the same work
+/// is not unstuck by a fourth call, and the honest end hands the turn back to the user for nothing.
+const CUT_PICK_MAX: u8 = 2;
+
+/// THE SETTLED REPLY'S ROUTE, in the order runTurn has always tried its continuations (each is written up at its
+/// block there): the zero-tool claim, grounding, the output-limit cut, the empty-before-work retry, the plain-text
+/// rescue, and giving up. Pure, so a table test pins every shape: runTurn is never analyzed by `zig build test`.
+///
+/// ONE ROUTE COMES FIRST: a reply that held only reasoning, on ACTION work, with a drive step left for a picked
+/// step to run in. That is a call cut while the model was still thinking (InnerResult.reasoning_only), and three
+/// continuations the old order gave it were wrong for it: the zero-tool nudge tells it "you reported a result" (it
+/// reported nothing), the empty retry re-sends the same unbounded call, and the rescue removes the very tools the
+/// work needs, so it can only narrate. It goes to the drive loop's step picker instead (the picker block in runTurn
+/// has the measured case), at most CUT_PICK_MAX times a turn, then gives up honestly - and if the picker ends the
+/// loop rather than naming a step, the loop exit still gives a turn that ran tools the rescue (ReplyTurn.pickEnd).
+///
+/// The fourth, the cut nudge, keeps its old place for a reply the output LIMIT cut (truncated) AFTER tool work:
+/// first, once, as in the old order, where only the zero-tool check (which needs no tool run) came before it. That
+/// is CUT_NUDGE's case, a model reasoning over results it already holds (ledger run H, turn 23). Before any tool
+/// ran, its "make ONE tool call, then reply with the final answer only" - with thinking off - would close work that
+/// has not started, so that cut goes to the picker like a deadline cut; the old order sent it the zero-tool nudge.
+///
+/// Where the picker is not what names the next step, the old order stands, rescue included: afk (no end state -
+/// giving up would end a session the user asked to run until Stop), a /goal (its judge measures every pass and
+/// its own question names the next improvement; a picker pass there would be measured as a flat iteration), a
+/// plan subtask (the plan names the next step), and the last drive step (a picked step would have no pass).
+fn emptyReplyRoute(f: ReplyFacts) ?ReplyRoute {
+    if (f.empty and f.reasoning_only and f.action and !f.tools_forbidden and !f.afk and !f.goal and f.free_form and f.steps_left) {
+        if (f.truncated and !f.cut_nudged and f.tools_this_turn) return .cut;
+        // A pending Stop never starts the picker: like the rescue, it is a blocking call with no abort hook.
+        if (!emptyReplyEnd(f.stop_pending).rescue or f.picks >= CUT_PICK_MAX) return .give_up;
+        return .picker;
+    }
+    if (!f.zero_tool_nudged and !f.afk and !f.tools_this_turn and f.action and (f.claims_work or f.empty)) return .zero_tool;
+    if (!f.ground_nudged and !f.zero_tool_nudged and !f.afk and !f.tools_this_turn and !f.tools_forbidden and !f.empty) return .ground;
+    if (!f.cut_nudged and f.truncated and f.empty) return .cut;
+    if (!f.empty_retried and !f.tools_this_turn and !f.tools_forbidden and f.empty) return .empty_retry;
+    if (!f.empty) return null;
+    return if (emptyReplyEnd(f.stop_pending).rescue) .rescue else .give_up;
+}
+
+/// THE TURN'S SIDE OF THE ROUTE: what the earlier passes of THIS turn did, which a settled pass cannot see in its
+/// own result. runTurn keeps one per turn: notePass as every pass returns, route as a pass settles.
+///
+/// "No tool ran this turn" is a fact about the TURN, and the continuations that read it (the zero-tool claim,
+/// grounding, the empty retry) read it off one pass: that pass's tools_ran plus tools_spent, which counts network
+/// research only. A turn whose earlier pass read and edited files - or ran every tool on the client (tool_client),
+/// where nothing executes in this process - then read as untouched on every later pass, and a claim of the work
+/// it had done was answered "you made NO tool call this turn". Counting here and reading the count here puts both
+/// halves where a test can walk a turn pass by pass; runTurn only reports each pass.
+const ReplyTurn = struct {
+    /// passes of this turn that ran a tool, whatever their outcome (a roll-on segment's tools ran this turn too)
+    tool_passes: usize = 0,
+    zero_tool_nudged: bool = false,
+    /// spent by the grounding block itself, when it nudges (see route)
+    ground_nudged: bool = false,
+    cut_nudged: bool = false,
+    empty_retried: bool = false,
+    /// picker routes taken this turn (CUT_PICK_MAX)
+    picks: u8 = 0,
+
+    /// Every pass, as it returns - before any outcome can take the turn past the route.
+    fn notePass(self: *ReplyTurn, tools_ran: bool) void {
+        if (tools_ran) self.tool_passes += 1;
+    }
+
+    /// The settled pass's route: its own facts in `pass` (the turn fields are filled here, whatever the caller left
+    /// in them) and whether THIS pass ran a tool, which counts whether or not notePass has seen it yet. Spends the
+    /// once-per-turn continuation it returns - all but grounding, whose block can still let the reply stand and so
+    /// spends it only when it nudges.
+    fn route(self: *ReplyTurn, pass_ran: bool, pass: ReplyFacts) ?ReplyRoute {
+        var f = pass;
+        f.tools_this_turn = pass_ran or self.tool_passes > 0;
+        f.zero_tool_nudged = self.zero_tool_nudged;
+        f.ground_nudged = self.ground_nudged;
+        f.cut_nudged = self.cut_nudged;
+        f.empty_retried = self.empty_retried;
+        f.picks = self.picks;
+        const r = emptyReplyRoute(f) orelse return null;
+        switch (r) {
+            .zero_tool => self.zero_tool_nudged = true,
+            .cut => self.cut_nudged = true,
+            .empty_retry => self.empty_retried = true,
+            .picker => self.picks += 1,
+            .ground, .rescue, .give_up => {},
+        }
+        return r;
+    }
+
+    /// The end of a turn whose picker-route pass committed nothing and whose drive then ended the loop instead of
+    /// naming a step: the step picker found no step to take. What the old order would still have given that reply:
+    /// after tool work, the plain-text rescue over the results already in context (.rescue) - the work may have
+    /// landed, only the closing words were cut; before any, nothing (.give_up) - a rescue there can only narrate
+    /// work that never happened. A Stop never starts the rescue.
+    fn pickEnd(self: ReplyTurn, stop_pending: bool) ReplyRoute {
+        return if (self.tool_passes > 0 and emptyReplyEnd(stop_pending).rescue) .rescue else .give_up;
+    }
+};
+
+/// What a settled pass does to the armed loop's count of consecutive idle passes (idle_steps in runTurn).
+const IdleStep = enum {
+    /// it ran a tool: work happened, so the count starts over - a picker-route pass's tools included
+    reset,
+    /// no tool, and cut mid-thought (the picker route): not the announce-only step the armed bound counts, and not
+    /// work either. The count stands; CUT_PICK_MAX bounds the route. The no-tools fast path is skipped too.
+    hold,
+    /// no tool, and a reply: an idle step for the armed bound (unarmed: the fast path's one-shot answer)
+    idle,
+};
+
+/// A pass that ran a tool did work, whatever its reply then was. The picker route first skipped the whole
+/// no-tools block, reset arm included, so a pass that ran tools and was then cut kept the count it found: an
+/// armed turn whose previous pass had announced without a tool then ended on the very next announcement, mid-work
+/// - the second "consecutive" idle step, with a pass of real tool work between the two.
+fn idleStep(tools_ran: bool, route: ?ReplyRoute) IdleStep {
+    if (tools_ran) return .reset;
+    return if (route == .picker) .hold else .idle;
+}
+
+/// THE PLAIN-TEXT RESCUE (see its block in runTurn): one tool-less re-ask over the conversation so far, for a reply
+/// that came back empty with the work's results already in context. Returns the answer after the settled path's
+/// own strips, gpa-owned and non-empty, or null when the call failed or answered nothing. Blocking, with no abort
+/// hook: callers read a pending Stop before calling it (emptyReplyEnd).
+fn plainTextRescue(app: *App, llm_dir: []const u8, conv_dir: []const u8, rp: Provider, conv_json: []const u8) ?[]u8 {
+    const gpa = app.gpa;
+    var rmsgs: std.ArrayListUnmanaged(u8) = .empty;
+    defer rmsgs.deinit(gpa);
+    rmsgs.appendSlice(gpa, conv_json) catch return null;
+    rmsgs.appendSlice(gpa, ",{\"role\":\"user\",\"content\":\"(your previous response was empty or malformed and was discarded. Answer me NOW in plain text, using what the conversation above already established — especially any tool results. Do not call tools; do not emit JSON, code fences, or tool markup. Just the answer.)\"}") catch return null;
+    emitKV(app, conv_dir, "status", "text", "recovering: asking for a plain-text answer");
+    const rcm = meterBegin(app.io);
+    var rs = completeAux(app, llm_dir, "rescue", rp.base_url, rp.key, rp.model, rmsgs.items, 1024, 0.4);
+    defer rs.deinit(gpa);
+    meterEnd(app, rcm, "rescue", .coding, rp.model, rs.ok);
+    if (!rs.ok) return null;
+    // the rescue output rides the same strips the settled path applies
+    var r: []u8 = gpa.dupe(u8, rs.content) catch return null;
+    if (cctx.stripSentinelTags(gpa, r)) |clean| {
+        gpa.free(r);
+        r = clean;
+    }
+    if (cctx.looksLikeToolMarkup(r)) {
+        const clean = cctx.contentBeforeMarkup(r);
+        if (gpa.dupe(u8, clean)) |d| {
+            gpa.free(r);
+            r = d;
+        } else |_| {}
+    }
+    if (std.mem.trim(u8, r, " \r\n\t").len == 0) {
+        gpa.free(r);
+        return null;
+    }
+    return r;
+}
+
+test "reasoningOnly: a reply cut while still thinking is told apart from an empty answer and a malformed one" {
+    const t = std.testing;
+    const thought = "Let me recall how the repr of a chained exception is assembled before opening any file...";
+    // The measured cut: no content at all, a long reasoning channel.
+    try t.expect(reasoningOnly("", thought));
+    try t.expect(reasoningOnly(" \r\n", thought));
+    // A dead call - nothing on either channel - is not a cut (bait bt_cache's shape: 0 tokens in, 1 out).
+    try t.expect(!reasoningOnly("", ""));
+    try t.expect(!reasoningOnly("", " \n\t"));
+    // Content came back: malformed markup the strips will empty (the rescue's design case), or an answer.
+    try t.expect(!reasoningOnly("<tool_call>{\"name\":\"read_file\"", thought));
+    try t.expect(!reasoningOnly("The repr is built in src/_pytest/_code/code.py.", thought));
+}
+
+test "emptyReplyRoute: every reply the picker route does not claim is routed exactly as the chain it replaced" {
+    const t = std.testing;
+    // The chain as runTurn spelled it inline before it moved here: v1.1.16's conditions, in its order, plus the
+    // Stop gate the rescue gained (emptyReplyEnd). `ran` stands for "a tool ran", which runTurn read per PASS
+    // (inner.tools_ran, tools_spent) and now reads per TURN. Here the two are one fact by construction, so this
+    // test cannot see that change: the ReplyTurn tests below walk turns pass by pass for it.
+    const Before = struct {
+        fn route(f: ReplyFacts) ?ReplyRoute {
+            const ran = f.tools_this_turn;
+            if (!f.zero_tool_nudged and !f.afk and !ran and f.action and (f.claims_work or f.empty)) return .zero_tool;
+            // the grounding block broke out on an empty reply ("if (trimmed.len == 0) break :ground")
+            if (!f.ground_nudged and !f.zero_tool_nudged and !f.afk and !ran and !f.tools_forbidden and !f.empty) return .ground;
+            if (!f.cut_nudged and f.truncated and f.empty) return .cut;
+            if (!f.empty_retried and !ran and !f.tools_forbidden and f.empty) return .empty_retry;
+            if (f.empty) return if (f.stop_pending) .give_up else .rescue;
+            return null;
+        }
+        fn bit(x: u32, i: u5) bool {
+            return (x >> i) & 1 == 1;
+        }
+    };
+    // EVERY combination of the sixteen flags, at every pick count up to one past the cap.
+    var same: usize = 0;
+    var claimed: usize = 0;
+    var x: u32 = 0;
+    while (x < (1 << 16)) : (x += 1) {
+        var picks: u8 = 0;
+        while (picks <= CUT_PICK_MAX + 1) : (picks += 1) {
+            const f = ReplyFacts{
+                .empty = Before.bit(x, 0),
+                .claims_work = Before.bit(x, 1),
+                .action = Before.bit(x, 2),
+                .tools_forbidden = Before.bit(x, 3),
+                .afk = Before.bit(x, 4),
+                .tools_this_turn = Before.bit(x, 5),
+                .truncated = Before.bit(x, 6),
+                .reasoning_only = Before.bit(x, 7),
+                .free_form = Before.bit(x, 8),
+                .steps_left = Before.bit(x, 9),
+                .stop_pending = Before.bit(x, 10),
+                .zero_tool_nudged = Before.bit(x, 11),
+                .ground_nudged = Before.bit(x, 12),
+                .cut_nudged = Before.bit(x, 13),
+                .empty_retried = Before.bit(x, 14),
+                .goal = Before.bit(x, 15),
+                .picks = picks,
+            };
+            const got = emptyReplyRoute(f);
+            if (f.empty and f.reasoning_only and f.action and !f.tools_forbidden and !f.afk and !f.goal and f.free_form and f.steps_left) {
+                // The one shape the new route claims. Never the three continuations it exists to skip...
+                claimed += 1;
+                const r = got orelse return error.ClaimedReplyStood;
+                try t.expect(r != .zero_tool and r != .empty_retry and r != .rescue and r != .ground);
+                // ...and exactly: the cut nudge where the old chain gave it first too (a LENGTH cut, unspent, after
+                // tool work: the zero-tool check, the only one ahead of it, needs no tool run), else the picker
+                // until the cap or a Stop.
+                const want: ReplyRoute = if (f.truncated and !f.cut_nudged and f.tools_this_turn) .cut else if (f.stop_pending or f.picks >= CUT_PICK_MAX) .give_up else .picker;
+                try t.expectEqual(want, r);
+                // Two derivations of one rule: wherever the claimed route keeps the cut nudge, the old chain had it.
+                if (r == .cut) try t.expectEqual(Before.route(f), got);
+            } else {
+                t.expectEqual(Before.route(f), got) catch |e| {
+                    std.debug.print("\nroute changed for {any}\n", .{f});
+                    return e;
+                };
+                same += 1;
+            }
+        }
+    }
+    try t.expectEqual(@as(usize, 1 << 18), same + claimed);
+    try t.expect(claimed > 0 and same > claimed);
+
+    // THE SHAPES THE CONTINUATIONS WERE BUILT ON, by name - each routed as it always was.
+    const record = "Record these 6 transactions in ledger/journal.jsonl, then regenerate ledger.json.";
+    const cache_q = "What is the total `amount` across the rows with status `paid` in `data/txns.csv`? Reply with exactly one line: `TOTAL=<amount with two decimals>`.";
+    try t.expect(actionShaped(record) and !actionShaped(cache_q)); // the rows below are not vacuous
+    const fresh = ReplyFacts{ .empty = false, .claims_work = false, .action = false, .tools_forbidden = false, .afk = false, .goal = false, .tools_this_turn = false, .truncated = false, .reasoning_only = false, .free_form = true, .steps_left = true, .stop_pending = false };
+    // Ledger run 5: "RECORDED=6" in six seconds and no tool call -> the zero-tool continuation.
+    var f = fresh;
+    f.action = actionShaped(record);
+    f.claims_work = claimsWork("RECORDED=6\nBALANCE travel=1755.87");
+    try t.expectEqual(@as(?ReplyRoute, .zero_tool), emptyReplyRoute(f));
+    // An action request's dead call (empty, no reasoning trail, nothing run yet) still gets it first, too.
+    f = fresh;
+    f.action = true;
+    f.empty = true;
+    try t.expectEqual(@as(?ReplyRoute, .zero_tool), emptyReplyRoute(f));
+    // Bait bt_cache: a question, nothing back before any work -> asked once more with tools; then the rescue.
+    f = fresh;
+    f.action = actionShaped(cache_q);
+    f.empty = true;
+    try t.expectEqual(@as(?ReplyRoute, .empty_retry), emptyReplyRoute(f));
+    f.empty_retried = true;
+    try t.expectEqual(@as(?ReplyRoute, .rescue), emptyReplyRoute(f));
+    // Ledger run H, turn 23: tools ran, then the output cap cut the reply mid-thought -> the cut continuation.
+    f = fresh;
+    f.empty = true;
+    f.tools_this_turn = true;
+    f.truncated = true;
+    f.reasoning_only = true;
+    try t.expectEqual(@as(?ReplyRoute, .cut), emptyReplyRoute(f));
+    // A question whose answer went missing after tool results -> the rescue, its design case; a Stop -> give up.
+    f = fresh;
+    f.empty = true;
+    f.tools_this_turn = true;
+    try t.expectEqual(@as(?ReplyRoute, .rescue), emptyReplyRoute(f));
+    f.stop_pending = true;
+    try t.expectEqual(@as(?ReplyRoute, .give_up), emptyReplyRoute(f));
+    // Ledger run H, turns 10 and 15: a figure and no tool this turn -> the grounding check decides.
+    f = fresh;
+    try t.expectEqual(@as(?ReplyRoute, .ground), emptyReplyRoute(f));
+    // Words after tool work stand.
+    f.tools_this_turn = true;
+    try t.expectEqual(@as(?ReplyRoute, null), emptyReplyRoute(f));
+}
+
+test "emptyReplyRoute: a reply that held only reasoning on action work goes to the step picker, at most twice" {
+    const t = std.testing;
+    const task = "Fix the following software issue in the existing example/widgets checkout. Implement the smallest correct source change, inspect the relevant code, and validate it.";
+    const thought = "Let me recall how the repr of a chained exception is assembled before opening any file...";
+    // The measured cut, built from the real classifiers: settled with no content, no call, a reasoning trail.
+    const cut = ReplyFacts{
+        .empty = true,
+        .claims_work = claimsWork(""),
+        .action = actionShaped(task),
+        .tools_forbidden = toolsForbidden(task),
+        .afk = false,
+        .goal = false,
+        .tools_this_turn = false,
+        .truncated = false, // a deadline cut has no finish_reason
+        .reasoning_only = reasoningOnly("", thought),
+        .free_form = true,
+        .steps_left = true,
+        .stop_pending = false,
+    };
+    try t.expect(cut.action and cut.reasoning_only and !cut.claims_work and !cut.tools_forbidden); // not vacuous
+    // THE FIRST MEASURED SHAPE: no tool yet, drive 0 -> the picker. The old order sent it the zero-tool nudge.
+    try t.expectEqual(@as(?ReplyRoute, .picker), emptyReplyRoute(cut));
+    // THE SECOND: thirteen tool calls this pass, then the cut -> the picker. The old order sent it the rescue.
+    var f = cut;
+    f.tools_this_turn = true;
+    try t.expectEqual(@as(?ReplyRoute, .picker), emptyReplyRoute(f));
+    // A second cut on the same turn -> the picker route again, never the nudges it skipped. (Whether a step comes
+    // of it is the drive's call: a picker that names the very step it named last time is a no-progress repeat
+    // there, and the loop exit then ends the turn - with the rescue, if the turn ran tools: ReplyTurn.pickEnd.)
+    f.picks = 1;
+    try t.expectEqual(@as(?ReplyRoute, .picker), emptyReplyRoute(f));
+    // THE THIRD CUT gives up: the honest note, and no rescue.
+    f.picks = CUT_PICK_MAX;
+    try t.expectEqual(@as(?ReplyRoute, .give_up), emptyReplyRoute(f));
+    // A pending Stop never starts the picker.
+    f = cut;
+    f.stop_pending = true;
+    try t.expectEqual(@as(?ReplyRoute, .give_up), emptyReplyRoute(f));
+
+    // THE LAST DRIVE STEP keeps the old order, rescue included: a picked step would have no pass to run in, and
+    // giving up there threw away the rescue a turn that had already run tools always got.
+    f = cut;
+    f.steps_left = false;
+    try t.expectEqual(@as(?ReplyRoute, .zero_tool), emptyReplyRoute(f)); // no tool yet: as before
+    f.tools_this_turn = true;
+    try t.expectEqual(@as(?ReplyRoute, .rescue), emptyReplyRoute(f)); // tools ran, then the cut: as before
+
+    // A LENGTH cut AFTER tool work gets the cut continuation first, once - its place in the old order - then the
+    // picker: a model reasoning over results it already holds (ledger run H, turn 23).
+    f = cut;
+    f.truncated = true;
+    f.tools_this_turn = true;
+    try t.expectEqual(@as(?ReplyRoute, .cut), emptyReplyRoute(f));
+    f.cut_nudged = true;
+    try t.expectEqual(@as(?ReplyRoute, .picker), emptyReplyRoute(f));
+    // A length cut BEFORE any tool goes straight to the picker, like a deadline cut: CUT_NUDGE's "one tool call,
+    // then the final answer only", with thinking off, would close a coding task that has not started.
+    f = cut;
+    f.truncated = true;
+    try t.expectEqual(@as(?ReplyRoute, .picker), emptyReplyRoute(f));
+
+    // THE RESCUE STAYS where it was designed to work, the same reasoning-only reply notwithstanding:
+    // a question, after tool results;
+    f = cut;
+    f.action = actionShaped("What does the cache layer return for a missing key, per the files read above?");
+    f.tools_this_turn = true;
+    try t.expectEqual(@as(?ReplyRoute, .rescue), emptyReplyRoute(f));
+    // a request that forbade tools (never action-shaped; the route also refuses it on its own);
+    f = cut;
+    f.tools_forbidden = true;
+    f.tools_this_turn = true;
+    try t.expectEqual(@as(?ReplyRoute, .rescue), emptyReplyRoute(f));
+    // an empty reply with NO reasoning behind it - a dead call, not a cut - after tool results.
+    f = cut;
+    f.reasoning_only = reasoningOnly("", "");
+    f.tools_this_turn = true;
+    try t.expectEqual(@as(?ReplyRoute, .rescue), emptyReplyRoute(f));
+    // afk, a /goal and a plan subtask keep the chain they had.
+    f = cut;
+    f.afk = true;
+    try t.expectEqual(@as(?ReplyRoute, .empty_retry), emptyReplyRoute(f));
+    f = cut;
+    f.goal = true;
+    try t.expectEqual(@as(?ReplyRoute, .zero_tool), emptyReplyRoute(f));
+    f = cut;
+    f.free_form = false;
+    try t.expectEqual(@as(?ReplyRoute, .zero_tool), emptyReplyRoute(f));
+}
+
+test "ReplyTurn: a tool run in an earlier pass of the turn is work this turn did, on every later pass" {
+    const t = std.testing;
+    const narrated = ReplyFacts{ .empty = false, .claims_work = false, .action = true, .tools_forbidden = false, .afk = false, .goal = false, .truncated = false, .reasoning_only = false, .free_form = true, .steps_left = true, .stop_pending = false };
+    var claim = narrated;
+    claim.claims_work = claimsWork("Done - the fix is applied and the test passes.");
+    var dead_q = narrated;
+    dead_q.empty = true;
+    dead_q.action = actionShaped("What does the cache layer return for a missing key, per the files read above?");
+    try t.expect(claim.claims_work and !dead_q.action); // not vacuous
+
+    // A turn, walked pass by pass as runTurn reports it. Pass 0 read and edited files on the client - so
+    // tools_spent, which counts network research only, stayed 0 - and narrated what it found.
+    var turn: ReplyTurn = .{};
+    turn.notePass(true);
+    try t.expectEqual(@as(?ReplyRoute, null), turn.route(true, narrated));
+    // Pass 1, the drive's next step, ran no tool and reports the work done: the claim stands for the drive
+    // verdict, which has pass 0's results in view.
+    turn.notePass(false);
+    try t.expectEqual(@as(?ReplyRoute, null), turn.route(false, claim));
+    // Pass 2 is a question's dead call: the rescue's, the results being in context - not a dead start.
+    turn.notePass(false);
+    try t.expectEqual(@as(?ReplyRoute, .rescue), turn.route(false, dead_q));
+
+    // THE SAME TWO PASSES, PRICED THE PER-PASS WAY - a turn in which no pass ran a tool, which is what each later
+    // pass read: the claim was told "you made NO tool call this turn", the dead call re-sent as a dead start.
+    var per_pass: ReplyTurn = .{};
+    per_pass.notePass(false);
+    try t.expectEqual(@as(?ReplyRoute, .zero_tool), per_pass.route(false, claim));
+    var per_pass_q: ReplyTurn = .{};
+    per_pass_q.notePass(false);
+    try t.expectEqual(@as(?ReplyRoute, .empty_retry), per_pass_q.route(false, dead_q));
+
+    // This pass's own tools count whether or not notePass has seen it yet.
+    var unseen: ReplyTurn = .{};
+    try t.expectEqual(@as(?ReplyRoute, null), unseen.route(true, claim));
+}
+
+test "ReplyTurn: a turn spends each continuation once, and the picker route at most CUT_PICK_MAX times" {
+    const t = std.testing;
+    const thought = "Let me recall how the repr of a chained exception is assembled before opening any file...";
+    const cut = ReplyFacts{ .empty = true, .claims_work = false, .action = true, .tools_forbidden = false, .afk = false, .goal = false, .truncated = false, .reasoning_only = reasoningOnly("", thought), .free_form = true, .steps_left = true, .stop_pending = false };
+    try t.expect(cut.reasoning_only); // not vacuous
+
+    // THE MEASURED TASK, pass by pass: cut at drive 0 before any tool -> the picker; the picked step's pass ran
+    // tools and was cut again -> the picker; a third cut -> the honest end. No nudge in between.
+    var turn: ReplyTurn = .{};
+    turn.notePass(false);
+    try t.expectEqual(@as(?ReplyRoute, .picker), turn.route(false, cut));
+    turn.notePass(true);
+    try t.expectEqual(@as(?ReplyRoute, .picker), turn.route(true, cut));
+    turn.notePass(false);
+    try t.expectEqual(@as(?ReplyRoute, .give_up), turn.route(false, cut));
+    try t.expectEqual(CUT_PICK_MAX, turn.picks);
+
+    // AN ACTION REQUEST'S DEAD CALLS (empty, no reasoning trail): each continuation once, in the old order.
+    var dead = cut;
+    dead.reasoning_only = false;
+    var d: ReplyTurn = .{};
+    for ([_]ReplyRoute{ .zero_tool, .empty_retry, .rescue }) |want| {
+        d.notePass(false);
+        try t.expectEqual(@as(?ReplyRoute, want), d.route(false, dead));
+    }
+
+    // A LENGTH cut after tool work: the cut nudge once, then the picker.
+    var len_cut = cut;
+    len_cut.truncated = true;
+    var l: ReplyTurn = .{};
+    l.notePass(true);
+    try t.expectEqual(@as(?ReplyRoute, .cut), l.route(true, len_cut));
+    l.notePass(false);
+    try t.expectEqual(@as(?ReplyRoute, .picker), l.route(false, len_cut));
+
+    // GROUNDING is spent by its block, not by the route: a block that let the reply stand leaves it unspent.
+    const figure = ReplyFacts{ .empty = false, .claims_work = false, .action = false, .tools_forbidden = false, .afk = false, .goal = false, .truncated = false, .reasoning_only = false, .free_form = true, .steps_left = true, .stop_pending = false };
+    var g: ReplyTurn = .{};
+    try t.expectEqual(@as(?ReplyRoute, .ground), g.route(false, figure));
+    try t.expectEqual(@as(?ReplyRoute, .ground), g.route(false, figure));
+    g.ground_nudged = true; // what runTurn's grounding block does when it nudges
+    try t.expectEqual(@as(?ReplyRoute, null), g.route(false, figure));
+}
+
+test "ReplyTurn.pickEnd: when the picker ends the loop after tool work, the rescue still gets its try" {
+    const t = std.testing;
+    // The second measured shape: thirteen tool calls, then a pass that held only reasoning, then a picker that
+    // ended the loop (DONE, or a repeat) - the edit may well have landed, only the closing words were cut. The
+    // old order gave that reply the plain-text rescue; ending it on "(no reply)" recorded a scheduled run FAILED.
+    var ran: ReplyTurn = .{};
+    ran.notePass(true);
+    try t.expectEqual(ReplyRoute.rescue, ran.pickEnd(false));
+    // Two derivations of one end, which must agree: the same reply on the last drive step, where the picker is
+    // not in play, takes the old order - which ends it the same way, Stop or no Stop.
+    const django = ReplyFacts{ .empty = true, .claims_work = false, .action = true, .tools_forbidden = false, .afk = false, .goal = false, .truncated = false, .reasoning_only = true, .free_form = true, .steps_left = false, .stop_pending = false };
+    for ([_]bool{ false, true }) |stop| {
+        var last = ran;
+        var f = django;
+        f.stop_pending = stop;
+        try t.expectEqual(@as(?ReplyRoute, ran.pickEnd(stop)), last.route(false, f));
+    }
+    // A Stop never starts the rescue.
+    try t.expectEqual(ReplyRoute.give_up, ran.pickEnd(true));
+    // BEFORE ANY TOOL there is nothing for a rescue to report but a claim of work never done (ledger run 5,
+    // turn 21): the honest end.
+    var none: ReplyTurn = .{};
+    none.notePass(false);
+    try t.expectEqual(ReplyRoute.give_up, none.pickEnd(false));
+}
+
+test "idleStep: a pass that ran a tool resets the armed idle count, a picker-route pass's included" {
+    const t = std.testing;
+    // An armed (non-afk) turn, pass by pass, through the same count runTurn keeps: pass k announced without a
+    // tool; pass k+1 ran tools and then settled holding only reasoning (the picker route); pass k+2 narrated
+    // without a tool.
+    const Pass = struct { ran: bool, route: ?ReplyRoute };
+    const passes = [_]Pass{ .{ .ran = false, .route = null }, .{ .ran = true, .route = .picker }, .{ .ran = false, .route = null } };
+    var idle: usize = 0;
+    for (passes) |p| switch (idleStep(p.ran, p.route)) {
+        .reset => idle = 0,
+        .hold => {},
+        .idle => idle += 1,
+    };
+    // One idle step since the last tool work - the tolerated one. Holding the count across pass k+1 made it two,
+    // which ends a non-afk armed loop (runTurn's `idle_steps >= 2`) in the middle of the work.
+    try t.expectEqual(@as(usize, 1), idle);
+    // The picker route with no tool run holds the count; every other pass is counted as before.
+    try t.expectEqual(IdleStep.hold, idleStep(false, .picker));
+    try t.expectEqual(IdleStep.idle, idleStep(false, null));
+    try t.expectEqual(IdleStep.idle, idleStep(false, .rescue));
+    try t.expectEqual(IdleStep.reset, idleStep(true, null));
+}
+
+test "runTurn routes every settled reply through ReplyTurn, counts tools per turn, and ends the picker route honestly" {
+    // runTurn is compiled only by the -Dapp=false build, never analyzed by `zig build test`, so the call sites
+    // are pinned in the source (the planReconcile precedent): what each one does is proven by the ReplyTurn,
+    // idleStep and emptyReplyRoute tests above, and these needles prove runTurn still calls them. Each needle is
+    // split so this text never matches itself.
+    const SRC = @embedFile("engine.zig");
+    const wired = [_][]const u8{
+        // the pass reports the cut signature, and the route reads it
+        ".reasoning_only = " ++ "reasoningOnly(step.content, step.reasoning)",
+        "const route = " ++ "replies.route(inner.tools_ran, .{",
+        ".reasoning_only = " ++ "inner.reasoning_only,",
+        ".goal = " ++ "goal_on,",
+        ".free_form = " ++ "task_idx == null,",
+        ".steps_left = " ++ "drive + 1 < max_steps,",
+        // the whole-turn tool count: every pass reported as it returns, whatever its outcome
+        "replies.notePass" ++ "(inner.tools_ran);",
+        // every continuation block runs on the route, not on its own copy of the condition
+        "if (route == " ++ ".zero_tool) {",
+        "if (route == " ++ ".ground) ground: {",
+        "replies.ground_nudged = " ++ "true;",
+        "if (route == " ++ ".cut) {",
+        "if (route == " ++ ".empty_retry) {",
+        "if (route == " ++ ".rescue) {",
+        "if (route != " ++ ".picker and std.mem.trim(u8, answer, \" \\r\\n\\t\").len == 0) {",
+        // the picker route: nothing committed, the idle count by idleStep, an end if no step comes
+        "if (route != " ++ ".picker) {\n            appendMsg(app, conv_dir, \"assistant\", answer,",
+        "const idle_step = " ++ "idleStep(inner.tools_ran, route);",
+        "if (idle_step == " ++ ".hold) {\n            // straight on to the drive inference\n        } else if (idle_step == .idle) {",
+        "pick_unanswered = " ++ "route == .picker;",
+        "pick_unanswered = " ++ "false; // the picked step's pass starts now",
+        "if (" ++ "pick_unanswered) pick_end: {",
+        "if (replies.pickEnd" ++ "(stopped) == .rescue) {",
+        // the fast path reads the claim snapshotted before the strips could free inner.content
+        "!(actionShaped(goal_text) and " ++ "settled_claims)",
+    };
+    for (wired) |w| {
+        if (std.mem.indexOf(u8, SRC, w) == null) {
+            std.debug.print("\nno longer wired into the turn: {s}\n", .{w});
+            return error.RouteNotWired;
+        }
+    }
+    // Wired at an exact number of places, each one needed.
+    const counted = [_]struct { needle: []const u8, n: usize }{
+        // the rescue: the in-loop route, and the loop exit after a picker that named no step
+        .{ .needle = "plainTextRescue" ++ "(app, llm_dir, conv_dir, trio.coding, conv_buf.items)", .n = 2 },
+        // a Stop read while a picker-route pass's step has not run: the loop-head drain and the two hive awaits
+        // the drive section reaches from a picker pass (DONE while armed, a repeat while armed)
+        .{ .needle = "if (pick_unanswered) " ++ "endEmptyReply(app, conv_dir, &ctx, mem_scope, uid, conv, sched_task, emptyReplyEnd(true));", .n = 3 },
+    };
+    for (counted) |c| {
+        const n = std.mem.count(u8, SRC, c.needle);
+        if (n != c.n) {
+            std.debug.print("\nwired at {d} places, not {d}: {s}\n", .{ n, c.n, c.needle });
+            return error.RouteNotWired;
+        }
+    }
+    const gone = [_][]const u8{
+        "!inner.tools_ran and " ++ "tools_spent == 0", // the per-pass reading of "no tool ran this turn"
+        "claimsWork(" ++ "inner.content)))", // the read after the strips had freed it
+        // the picker arm that skipped the idle reset of a pass that had run tools
+        "if (route == " ++ ".picker) {\n            // straight on to the drive inference",
+    };
+    for (gone) |g| {
+        if (std.mem.indexOf(u8, SRC, g) != null) {
+            std.debug.print("\nthe replaced form is back: {s}\n", .{g});
+            return error.ReplacedFormReturned;
+        }
+    }
+}
+
+test "a Stop ends an empty reply as stopped, not as a model failure, and never commits an error as narration" {
+    const t = std.testing;
+    // THE ZERO-TOOL LINE tells the truth about what came back.
+    try t.expect(std.mem.indexOf(u8, zeroToolStatus(""), "claims work") == null);
+    try t.expect(std.mem.indexOf(u8, zeroToolStatus(" \r\n"), "empty") != null);
+    try t.expect(std.mem.indexOf(u8, zeroToolStatus("RECORDED=6\nBALANCE travel=1755.87"), "claims work") != null);
+
+    // A STOP PENDING when the reply came back empty: no rescue call, a stopped row, nothing recorded as failed.
+    const stopped = emptyReplyEnd(true);
+    try t.expect(!stopped.rescue);
+    try t.expect(!stopped.failed);
+    try t.expect(std.mem.indexOf(u8, stopped.note, "stopped") != null);
+    try t.expect(std.mem.indexOf(u8, stopped.note, "empty or malformed") == null);
+    // ...and with no Stop, exactly today's behaviour: one rescue, then the honest no-reply note and FAILED.
+    const dead = emptyReplyEnd(false);
+    try t.expect(dead.rescue);
+    try t.expect(dead.failed);
+    try t.expectEqualStrings(EMPTY_REPLY_NOTE, dead.note);
+    // Neither row speaks in the model's voice: both are committed as the assistant turn and replayed.
+    for ([_][]const u8{ stopped.note, dead.note }) |n| {
+        try t.expect(std.mem.indexOf(u8, n, "I ") == null and std.mem.indexOf(u8, n, " my ") == null);
+    }
+
+    // THE STOPPED COMMIT: a failed step's content is an error, never narration.
+    const last = "Reading src/_pytest/_code/code.py to find where the repr is built.";
+    try t.expectEqualStrings(last, stoppedPartial(false, "curl exit: ", last));
+    try t.expectEqualStrings("", stoppedPartial(false, "curl exit: ", ""));
+    // A successful call's streamed partial is still what the user watched type out, so it wins.
+    try t.expectEqualStrings("Half a sentence", stoppedPartial(true, "Half a sentence", last));
+    try t.expectEqualStrings(last, stoppedPartial(true, "", last));
+}
+
+test "runTurn and the pre-answer passes actually CALL the plan gate, the starvation line and the Stop helpers" {
+    // `zig build test` never analyzes runTurn (only the -Dapp=false build compiles it), and a unit test of a
+    // helper says nothing about whether the turn uses it - 0086's lesson, as planReconcile's test applies it.
+    // So the call sites are pinned in the source. Each needle is split so this test's own text never matches.
+    const SRC = @embedFile("engine.zig");
+    const wired = [_][]const u8{
+        "if (" ++ "planGate(environ, user_text))",
+        "auxStarvedStatus" ++ "(.recon, step.ok, step.truncated, step.content, step.reasoning)",
+        "auxStarvedStatus" ++ "(.plan, step.ok, step.truncated, step.content, step.reasoning)",
+        "zeroToolStatus" ++ "(answer)",
+        // the Stop is read before the route (which gates the rescue and the picker on it), re-read after a rescue
+        "const stop_pending = empty_now and " ++ "stopRequestedSince(app, conv_dir, steer_cursor);",
+        ".stop_pending = " ++ "stop_pending,",
+        "var empty_end = " ++ "emptyReplyEnd(stop_pending);",
+        "if (route == .rescue and " ++ "stopRequestedSince(app, conv_dir, steer_cursor)) empty_end = emptyReplyEnd(true);",
+        "endEmptyReply" ++ "(app, conv_dir, &ctx, mem_scope, uid, conv, sched_task, empty_end);",
+        "if (end" ++ ".failed) {",
+        "appendMsg(app, conv_dir, \"assistant\", end" ++ ".note,",
+        "stoppedPartial" ++ "(step.ok, step.content, last_content)",
+    };
+    for (wired) |w| {
+        if (std.mem.indexOf(u8, SRC, w) == null) {
+            std.debug.print("\nno longer wired into the turn: {s}\n", .{w});
+            return error.HelperNotWired;
+        }
+    }
+    // ...and the ungated forms they replaced are gone: planning straight off the markers (no kill switch), and
+    // a failed step's error text committed as the stopped narration.
+    const gone = [_][]const u8{
+        "if (" ++ "shouldPlan(user_text))",
+        "if (step.content.len > 0) " ++ "step.content else last_content",
+    };
+    for (gone) |g| {
+        if (std.mem.indexOf(u8, SRC, g) != null) {
+            std.debug.print("\nthe ungated form is back: {s}\n", .{g});
+            return error.UngatedFormReturned;
+        }
+    }
+}
+
 test "shouldPlan: a task marker matches at a word start, never inside one" {
     // "report the result" contains "port the"; "recreate" contains "create " — neither is a build task
     try std.testing.expect(!shouldPlan("Run this project's test suite (python tests/test_core.py) and report the result as exactly one line: PASSED=<n> FAILED=<n>."));
@@ -7250,6 +8128,84 @@ test "shouldPlan: a task marker matches at a word start, never inside one" {
     try std.testing.expect(shouldPlan("Write a small script stats/primes.py that counts the primes below 5000 and writes the count to stats/answer.txt."));
     try std.testing.expect(hasWordMarker("audit the engine", "audit "));
     try std.testing.expect(!hasWordMarker("preaudit the engine", "audit "));
+}
+
+test "planGate: NL_CHAT_PLAN turns planning off only when an operator means it, and never turns a question on" {
+    const t = std.testing;
+    var env = std.process.Environ.Map.init(t.allocator);
+    defer env.deinit();
+    // The shape that measured the cost (see planGate): an issue-fixing request whose "Implement " sits inside
+    // shouldPlan's 192-byte window. Unset is the state of every machine not told otherwise: it must plan.
+    const task = "Fix the following software issue in the existing example/widgets checkout. Implement the smallest correct source change, inspect the relevant code, and validate it.";
+    try t.expect(shouldPlan(task)); // not vacuous: the markers themselves still say "plan"
+    try t.expect(planGate(&env, task));
+    // The kill switch, in the spellings an operator types - the same set envDisabled's own test pins.
+    for ([_][]const u8{ "0", "false", "FALSE", " 0 ", "False\n" }) |off| {
+        try env.put("NL_CHAT_PLAN", off);
+        try t.expect(!planGate(&env, task));
+    }
+    // Anything else is ON, "off" included: envDisabled's contract, so a typo can never silently drop planning.
+    for ([_][]const u8{ "1", "true", "", "off", "no" }) |on| {
+        try env.put("NL_CHAT_PLAN", on);
+        try t.expect(planGate(&env, task));
+    }
+    // The switch only ever REMOVES planning: a question opener does not plan with the switch unset or on.
+    const question = "What does the implement step in this build script do, and why does it run twice?";
+    try env.put("NL_CHAT_PLAN", "1");
+    try t.expect(!planGate(&env, question));
+    _ = env.swapRemove("NL_CHAT_PLAN");
+    try t.expect(!planGate(&env, question));
+    // ...and it is its own switch: the recon switch being off does not turn planning off.
+    try env.put("NL_CHAT_RECON", "0");
+    try t.expect(planGate(&env, task));
+}
+
+/// THE STARVED PRE-ANSWER PASS, made visible. reconFindings and planTask parse a probe list / a board out of
+/// the reply's CONTENT, and a reasoning model can spend the whole reply in its reasoning channel and return
+/// none: the call is ok, the content empty, the reasoning long. Both passes then degrade quietly - no probes,
+/// no board - which is the designed fallback, but nothing in the run log said that minutes of thinking-role
+/// time had produced nothing (7 of the 10 pre-answer calls in the run planGate cites). One status line, true
+/// in both shapes: a reply the output limit cut (truncated), and one that ended with no content and no
+/// finish_reason (a deadline cut, which streamAttempt does not flag truncated). Null for an answered pass, a
+/// failed call (its content is the transport's error, already in its llm frame), and a reply with no
+/// reasoning either (an empty answer, not a starved one).
+const AuxPass = enum { recon, plan };
+fn auxStarvedStatus(pass: AuxPass, ok: bool, truncated: bool, content: []const u8, reasoning: []const u8) ?[]const u8 {
+    if (!ok) return null;
+    if (std.mem.trim(u8, content, " \r\n\t").len > 0) return null;
+    if (std.mem.trim(u8, reasoning, " \r\n\t").len == 0) return null;
+    return switch (pass) {
+        .recon => if (truncated)
+            "surveying: the model reasoned until the output limit cut it and returned no probes - planning without them"
+        else
+            "surveying: the model returned reasoning but no probes - planning without them",
+        .plan => if (truncated)
+            "planning: the model reasoned until the output limit cut it and returned no plan - continuing without one"
+        else
+            "planning: the model returned reasoning but no plan - continuing without one",
+    };
+}
+
+test "a starved recon or plan pass says so in the run log; an answered or failed one does not" {
+    const t = std.testing;
+    const thought = "Let me try to recall how this module is laid out before choosing any probe...";
+    // The measured shape: ok, finish_reason "length", 0 content characters, a long reasoning channel.
+    const plan_cut = auxStarvedStatus(.plan, true, true, "", thought) orelse return error.StarvedPlanSilent;
+    try t.expect(std.mem.indexOf(u8, plan_cut, "no plan") != null);
+    try t.expect(std.mem.indexOf(u8, plan_cut, "output limit") != null);
+    const recon_cut = auxStarvedStatus(.recon, true, true, " \r\n", thought) orelse return error.StarvedReconSilent;
+    try t.expect(std.mem.indexOf(u8, recon_cut, "no probes") != null);
+    // A deadline cut ends with no finish_reason, so it arrives NOT truncated: still reported, and the line
+    // must not claim an output limit that was never hit.
+    const plan_deadline = auxStarvedStatus(.plan, true, false, "", thought) orelse return error.StarvedPlanSilent;
+    try t.expect(std.mem.indexOf(u8, plan_deadline, "output limit") == null);
+    try t.expect(std.mem.indexOf(u8, plan_deadline, "no plan") != null);
+    // Silent for everything that is not starvation: an answer (even a truncated one with content), a failed
+    // call carrying its error text, and an empty reply with no reasoning behind it.
+    try t.expect(auxStarvedStatus(.plan, true, true, "{\"subtasks\":[]}", thought) == null);
+    try t.expect(auxStarvedStatus(.recon, true, false, "{\"probes\":[]}", thought) == null);
+    try t.expect(auxStarvedStatus(.plan, false, false, "curl exit: ", thought) == null);
+    try t.expect(auxStarvedStatus(.recon, true, true, "", "") == null);
 }
 
 /// RECON pass (see RECON_SYSTEM): ask what needs finding out, run those read-only probes, and return a bounded
@@ -7298,6 +8254,7 @@ fn reconFindings(app: *App, run_root: []const u8, conv_dir: []const u8, ctrl_cur
     if (!sctx.streamed and step.reasoning.len > 0) emitKV(app, conv_dir, "reasoning", "delta", clipBytes(step.reasoning, 4000));
     cm.fb_ms = sctx.fb_ms;
     meterEnd(app, cm, "recon", .thinking, p.model, step.ok);
+    if (auxStarvedStatus(.recon, step.ok, step.truncated, step.content, step.reasoning)) |s| emitKV(app, conv_dir, "status", "text", s);
     if (!step.ok) return null;
 
     const obj = extractJsonObject(step.content);
@@ -7459,6 +8416,7 @@ fn planTask(app: *App, run_root: []const u8, conv_dir: []const u8, ctrl_cursor: 
     if (!sctx.streamed and step.reasoning.len > 0) emitKV(app, conv_dir, "reasoning", "delta", clipBytes(step.reasoning, 4000));
     plan_cm.fb_ms = sctx.fb_ms;
     meterEnd(app, plan_cm, "plan", .thinking, model, step.ok);
+    if (auxStarvedStatus(.plan, step.ok, step.truncated, step.content, step.reasoning)) |s| emitKV(app, conv_dir, "status", "text", s);
     if (!step.ok) return empty;
     const obj = extractJsonObject(step.content);
     const tasks = cplan.parseDecomposition(gpa, obj);
@@ -10212,8 +11170,12 @@ fn scanToolChannel(app: *App, conv_dir: []const u8, id: []const u8, cursor: *usi
 /// whatever was probed last, so in a server also running casts a chat turn could inherit a local model's
 /// window. senseModel is keyed on this turn's own model id and always yields a non-zero ctx_k.
 ///
-/// Raising this also buys the time to spend it, at no extra cost: llm.callTimeoutS derives each call's
-/// wall-clock deadline from the budget it asked for, so the deadline widens with the request.
+/// Raising this does NOT buy the time to spend it. llm.callTimeoutS derives a call's wall-clock deadline from the
+/// budget it asked for only up to its TIMEOUT_CEIL_S ceiling (240 s): at its pessimistic 40 tok/s plus a 45 s
+/// base the derived deadline reaches that ceiling near 7800 tokens, so the 8192 base and the doubled reasoning
+/// budget below both get the SAME 240 s. A model decoding slower than the budget assumes is cut by the deadline
+/// before the token cap - 16384 tokens at ~49 tok/s needs ~330 s - and such a cut ends the stream with no
+/// finish_reason, so it does not arrive flagged as a "length" truncation either.
 /// A positive integer knob from the environment, or `default` when unset or unparsable.
 fn envUsize(environ: *const std.process.Environ.Map, name: []const u8, default: usize) usize {
     const v = environ.get(name) orelse return default;
@@ -10231,9 +11193,11 @@ fn envDisabled(environ: *const std.process.Environ.Map, name: []const u8) bool {
 /// `reasoning` says the serving catalog marks the model as one that reasons before answering (Workers AI's
 /// `reasoning` property, via cf_oauth.reasoningFor). Its thought is spent from the same cap as its answer:
 /// ledger run H, turn 23, deepseek-v4-flash reasoned for 98 s about two disagreeing balance sets, the 8192 cap
-/// cut the call with no answer at all, and the rescue reported the wrong set. Such a model gets twice the cap
-/// (the deadline follows the cap - llm.callTimeoutS), and the provider accepts it (probed: max_tokens up to
-/// 65536 on Workers AI).
+/// cut the call with no answer at all, and the rescue reported the wrong set. Such a model gets twice the cap,
+/// and the provider accepts it (probed: max_tokens up to 65536 on Workers AI). Twice the TOKEN cap only: the
+/// deadline does not double with it. llm.callTimeoutS stops growing at its ceiling, which a wide window's base
+/// budget already reaches (see the note above envUsize), so there the extra room is spendable only by a model
+/// fast enough to reach it before the same 240 s deadline.
 fn turnTokenBudget(environ: *const std.process.Environ.Map, base_url: []const u8, model: []const u8, reasoning: bool) u32 {
     if (environ.get("NL_MAX_TOKENS")) |mts| {
         if (std.fmt.parseInt(u32, std.mem.trim(u8, mts, " \t\r\n"), 10)) |v| return std.math.clamp(v, 256, 32768) else |_| {}
@@ -10759,9 +11723,10 @@ fn runInnerAgentic(
 
         // STOP DURING STREAMING: the abort hook killed the stream mid-generation. Commit the partial that already
         // streamed to the user (step.content) as the stopped narration and end the turn — don't fall through to
-        // treat the truncated reply as a settled answer or drive on it.
+        // treat the truncated reply as a settled answer or drive on it. A FAILED step has no partial: its content
+        // is the transport's error, so the last narration stands in (stoppedPartial).
         if (stopRequestedSince(app, conv_dir, steer_cursor.*)) {
-            const partial = if (step.content.len > 0) step.content else last_content;
+            const partial = stoppedPartial(step.ok, step.content, last_content);
             return .{ .outcome = .stopped, .content = gpa.dupe(u8, partial) catch empty };
         }
 
@@ -10862,7 +11827,7 @@ fn runInnerAgentic(
         }
 
         if (step.calls.len == 0) // no tool calls — this settled answer is the turn's reply for this drive step.
-            return .{ .outcome = .settled, .content = gpa.dupe(u8, step.content) catch empty, .tools_ran = any_tool, .truncated = step.truncated };
+            return .{ .outcome = .settled, .content = gpa.dupe(u8, step.content) catch empty, .tools_ran = any_tool, .truncated = step.truncated, .reasoning_only = reasoningOnly(step.content, step.reasoning) };
 
         any_tool = true; // this iteration is running tools — the turn did agentic work, so the drive loop may continue
 
