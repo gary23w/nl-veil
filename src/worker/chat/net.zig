@@ -122,6 +122,10 @@ pub const Lines = struct {
 pub const EXCERPT_MAX: usize = 240;
 /// ...and of the frontier's last words, which are the one thing worth more room.
 pub const NEXT_MAX: usize = 700;
+/// How many wordless assistant messages back NEXT looks for the model's last stated intention (nearestWords).
+const NEXT_WORDS_LOOKBACK: usize = 4;
+/// How much of the frontier's own calls NEXT shows beside its words (a `run_python` body is not a plan).
+const NEXT_CALLS_MAX: usize = 240;
 /// Edge weights for the critical chain: a result the step demonstrably read, the step that issued a result, the
 /// model's own thread, and a previous-round result nothing points at.
 const W_USED: u8 = 2;
@@ -403,8 +407,12 @@ pub const Graph = struct {
         }
         // SELECT in distance order under the budget: NEXT and ON DISK are reserved first (NEXT gets at most a
         // third, ON DISK a quarter, and the section headers their room)
-        const next_text = clipWords(g.nodes.items[g.frontier].text, @max(80, budget / 3));
+        const words = g.nearestWords();
+        const next_text = clipWords(words.text, @max(80, budget / 3));
+        // the frontier's own calls ride beside borrowed words (see nearestWords), clipped and counted
+        const frontier_calls: ?[]const u8 = if (words.at != g.frontier) g.lastCallsOf(g.frontier) else null;
         var spent: usize = next_text.len + 64 + @min(ground.len, budget / 4) + 200;
+        if (frontier_calls) |c| spent += @min(c.len, NEXT_CALLS_MAX) + 24;
         const chosen = try gpa.alloc(bool, n);
         defer gpa.free(chosen);
         @memset(chosen, false);
@@ -435,9 +443,13 @@ pub const Graph = struct {
         try out.appendSlice(gpa, "NEXT (the frontier, in its own last words): ");
         if (next_text.len > 0) {
             try out.appendSlice(gpa, next_text);
+            if (frontier_calls) |calls| {
+                try out.appendSlice(gpa, " — it had then called ");
+                try out.appendSlice(gpa, clip(calls, NEXT_CALLS_MAX));
+            }
         } else if (g.lastCallsOf(g.frontier)) |calls| {
             try out.appendSlice(gpa, "it had just called ");
-            try out.appendSlice(gpa, calls);
+            try out.appendSlice(gpa, clip(calls, NEXT_CALLS_MAX));
         } else {
             try out.appendSlice(gpa, "(no words; see the results below)");
         }
@@ -514,6 +526,32 @@ pub const Graph = struct {
             },
             else => {},
         }
+    }
+
+    /// THE WORDS NEXT CARRIES: the frontier's own, or — when its last message was a bare tool call — the newest
+    /// earlier assistant message that said anything, within NEXT_WORDS_LOOKBACK assistant messages. A step's
+    /// words are its stated intention, and a frontier that only called a tool has not retracted the sentence
+    /// before it. Measured on a cut SWE-bench Lite turn (pytest-7220, arm D, 2026-10-14): the model had written
+    /// "The fix works. Now add a regression test. Let me check existing tests for a similar style:" one round
+    /// earlier, its frontier was a wordless `run_python` call, and NEXT carried that call's truncated arguments —
+    /// so the next segment re-derived the fix's state instead of writing the test. A fold note (a distillation)
+    /// is the engine's summary, never the model's intention, and is skipped. `at` is the node the words came
+    /// from, NONE when nothing within reach said anything.
+    fn nearestWords(g: *const Graph) struct { text: []const u8, at: u32 } {
+        if (g.frontier == NONE) return .{ .text = "", .at = NONE };
+        var i: u32 = g.frontier;
+        var seen: usize = 0;
+        while (true) {
+            const node = g.nodes.items[i];
+            if (node.kind == .step or (node.kind == .note and !isDistillation(node.text))) {
+                if (node.text.len > 0) return .{ .text = node.text, .at = i };
+                seen += 1;
+                if (seen > NEXT_WORDS_LOOKBACK) break;
+            }
+            if (i == 0) break;
+            i -= 1;
+        }
+        return .{ .text = "", .at = NONE };
     }
 
     /// "name args, name args" for the calls a step issued, or null.
@@ -1016,6 +1054,40 @@ test "the critical chain is the longest weighted path back from the frontier: it
     }
     try tt.expect(kept_c4);
     try tt.expect(!kept_c1);
+}
+
+test "NEXT carries the model's nearest words when the frontier was a bare tool call, and names that call" {
+    const gpa = tt.allocator;
+    var s: std.ArrayListUnmanaged(u8) = .empty;
+    defer s.deinit(gpa);
+    var b1: [256]u8 = undefined;
+    var b2: [256]u8 = undefined;
+    var b3: [256]u8 = undefined;
+    try tStep(&s, gpa, "Reading the failing test first.", tCall("c1", "read_file", "{\\\"path\\\":\\\"testing/test_terminal.py\\\"}", &b1));
+    try tResult(&s, gpa, "c1", "def test_passes(self, testdir): ...");
+    try tStep(&s, gpa, "The fix works. Now add a regression test; checking the existing tests for the style.", tCall("c2", "edit_file", "{\\\"path\\\":\\\"src/_pytest/nodes.py\\\"}", &b2));
+    try tResult(&s, gpa, "c2", "edited src/_pytest/nodes.py \u{2014} 1 op(s) applied, file is now 20582 bytes");
+    // a model that emits a tool call with EMPTY content: the frontier has no words of its own
+    try tStep(&s, gpa, "", tCall("c3", "run_python", "{\\\"code\\\":\\\"import subprocess; print(subprocess.run(['git','grep','-n','chdir','--','testing/']))\\\"}", &b3));
+    try tResult(&s, gpa, "c3", "exit=0 stdout: testing/test_terminal.py:660: old = p1.dirpath().chdir()");
+    var g = try Graph.fromSpan(gpa, s.items);
+    defer g.deinit();
+    const net = try g.unfold(gpa, 1400, "");
+    defer gpa.free(net);
+    // the stated intention first, then the call it had gone on to make — never the call alone
+    try tt.expect(std.mem.startsWith(u8, net, "NEXT (the frontier, in its own last words): The fix works. Now add a regression test; checking the existing tests for the style. \u{2014} it had then called run_python "));
+    try tt.expect(std.mem.indexOf(u8, net, "'git','grep'") != null);
+    // a frontier whose call followed NOTHING said within reach still names the call, as before
+    var bare: std.ArrayListUnmanaged(u8) = .empty;
+    defer bare.deinit(gpa);
+    var b4: [256]u8 = undefined;
+    try tStep(&bare, gpa, "", tCall("c9", "run_tests", "{}", &b4));
+    try tResult(&bare, gpa, "c9", "All 12 tests passed.");
+    var g2 = try Graph.fromSpan(gpa, bare.items);
+    defer g2.deinit();
+    const net2 = try g2.unfold(gpa, 1400, "");
+    defer gpa.free(net2);
+    try tt.expect(std.mem.startsWith(u8, net2, "NEXT (the frontier, in its own last words): it had just called run_tests {}"));
 }
 
 test "the unfolding carries the frontier's words, the failures, and the chain in tree order, once each, under budget" {

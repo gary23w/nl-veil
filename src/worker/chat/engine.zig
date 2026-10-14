@@ -5412,10 +5412,59 @@ fn ledgerList(gpa: std.mem.Allocator, ledger: *const FileLedger, out: *std.Array
 /// what is on disk. Says so when the ledger knows it is incomplete.
 fn ledgerPaths(gpa: std.mem.Allocator, ledger: *const FileLedger, out: *std.ArrayListUnmanaged(u8)) void {
     if (ledger.files.items.len == 0) return;
-    // the turn's own changes first (ledgerList): this line is clipped twice, 1200 bytes here and a quarter of the
-    // carry in net.unfold
-    ledgerList(gpa, ledger, out, 1200);
+    var own: usize = 0;
+    for (ledger.files.items) |f| {
+        if (f.turn) own += 1;
+    }
+    if (own == 0) {
+        // nothing of the turn's own to set apart: the ledger as it is, clipped twice (1200 bytes here and a
+        // quarter of the carry in net.unfold)
+        ledgerList(gpa, ledger, out, 1200);
+    } else {
+        // THE TURN'S OWN CHANGES BY NAME, THE REST BY COUNT. A restart survey of a real checkout puts hundreds of
+        // untouched files in the ledger, and under the carry's quarter-budget clip they were what ON DISK said:
+        // measured on a cut SWE-bench Lite turn (pytest-7220, arm D, 2026-10-14), the line named the two files
+        // the turn had edited and then a thousand bytes of `AUTHORS (4593 B), bench/bench.py (339 B), changelog/
+        // …` — the upstream tree, which the next segment can list_dir for itself. What it cannot recover is which
+        // files THIS turn changed, so those are the line, and the survey is a number.
+        var listed: usize = 0;
+        for (ledger.files.items) |f| {
+            if (!f.turn) continue;
+            if (out.items.len > 1200) break;
+            out.appendSlice(gpa, if (listed == 0) "changed this turn: " else ", ") catch return;
+            out.appendSlice(gpa, f.path) catch return;
+            var bb: [32]u8 = undefined;
+            out.appendSlice(gpa, std.fmt.bufPrint(&bb, " ({d} B)", .{f.bytes}) catch "") catch return;
+            listed += 1;
+        }
+        var mb: [96]u8 = undefined;
+        if (listed < own) out.appendSlice(gpa, std.fmt.bufPrint(&mb, " … +{d} more changed this turn", .{own - listed}) catch "") catch return;
+        const rest = ledger.files.items.len - own;
+        if (rest > 0) out.appendSlice(gpa, std.fmt.bufPrint(&mb, "; also on disk: {d} other file(s) this turn did not change (list_dir to see them)", .{rest}) catch "") catch return;
+    }
     if (ledger.partial) out.appendSlice(gpa, " (this list may be incomplete)") catch return;
+}
+
+test "the 4tope's ON DISK line names the turn's own changes and counts the survey, never lists it" {
+    const gpa = std.testing.allocator;
+    var ledger: FileLedger = .{};
+    defer ledger.deinit(gpa);
+    // a restart survey of a checkout (what a cut SWE-bench turn's ledger holds), then two edits of the turn's own
+    var i: usize = 0;
+    while (i < 120) : (i += 1) {
+        var pb: [48]u8 = undefined;
+        const p = std.fmt.bufPrint(&pb, "changelog/{d}.bugfix.rst", .{6000 + i}) catch unreachable;
+        try ledger.files.append(gpa, .{ .path = try gpa.dupe(u8, p), .bytes = 100 + i });
+    }
+    try ledger.files.append(gpa, .{ .path = try gpa.dupe(u8, "src/_pytest/nodes.py"), .bytes = 20582, .turn = true });
+    try ledger.files.append(gpa, .{ .path = try gpa.dupe(u8, "src/_pytest/_code/code.py"), .bytes = 43004, .turn = true });
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(gpa);
+    ledgerPaths(gpa, &ledger, &out);
+    try std.testing.expectEqualStrings("changed this turn: src/_pytest/nodes.py (20582 B), src/_pytest/_code/code.py (43004 B); also on disk: 120 other file(s) this turn did not change (list_dir to see them)", out.items);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "changelog/") == null);
+    // and it stays short enough to survive the carry's quarter-budget clip whole (net.unfold at a 1400-byte carry)
+    try std.testing.expect(out.items.len < 350);
 }
 
 test "the 4tope's ON DISK line is the paths themselves, never the framing sentence" {
@@ -5466,8 +5515,12 @@ test "the turn's own changes survive a full disk survey and ride ahead of it int
     try std.testing.expect(std.mem.startsWith(u8, out.items, "changed this turn: "));
     const own = std.mem.indexOf(u8, out.items, "repro_script.py (812 B)") orelse return error.OwnWriteNotListed;
     const edit = std.mem.indexOf(u8, out.items, "pkg/module_100.py (1205 B)") orelse return error.OwnEditNotListed;
-    const survey = std.mem.indexOf(u8, out.items, "; also on disk: pkg/module_000.py (1000 B)") orelse return error.SurveyNotListed;
+    // the survey rides as a COUNT (everything the turn did not change), after the turn's own changes
+    var sb: [96]u8 = undefined;
+    const survey_line = std.fmt.bufPrint(&sb, "; also on disk: {d} other file(s) this turn did not change (list_dir to see them)", .{ledger.files.items.len - 2}) catch unreachable;
+    const survey = std.mem.indexOf(u8, out.items, survey_line) orelse return error.SurveyNotCounted;
     try std.testing.expect(own < survey and edit < survey);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "pkg/module_000.py") == null); // never by name
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, out.items, "pkg/module_100.py")); // once, in its group
     try std.testing.expect(std.mem.endsWith(u8, out.items, "(this list may be incomplete)"));
     // ...and through the carry itself, which clips this line to a quarter of its budget: unfold called exactly as
@@ -5480,7 +5533,7 @@ test "the turn's own changes survive a full disk survey and ride ahead of it int
     const hcap = handoffCap(64 * 1024);
     const carry = try g.unfold(gpa, hcap - @min(hcap / 4, 400), out.items);
     defer gpa.free(carry);
-    try std.testing.expect(std.mem.indexOf(u8, carry, "ON DISK: changed this turn: pkg/module_100.py (1205 B), repro_script.py (812 B); also on disk: ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, carry, "ON DISK: changed this turn: pkg/module_100.py (1205 B), repro_script.py (812 B); also on disk: 127 other file(s)") != null);
     // ...and through the woven ground-truth block too, which is also the model-written carry's ground (its 1400-byte
     // clip falls inside the survey, so in ledger order the turn's own files were the part cut away)
     ledger.from_disk = true;
