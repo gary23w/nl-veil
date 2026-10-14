@@ -20,6 +20,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const bounded = @import("bounded.zig");
 
 fn readSmall(io: std.Io, gpa: std.mem.Allocator, dir: []const u8, name: []const u8, cap: usize) ?[]u8 {
     const p = std.fmt.allocPrint(gpa, "{s}/{s}", .{ dir, name }) catch return null;
@@ -79,16 +80,19 @@ pub fn bootstrap(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process
         }
         const cmd = if (builtin.os.tag == .windows) s.win else s.nix;
         const argv: [3][]const u8 = if (builtin.os.tag == .windows) .{ "cmd", "/C", cmd } else .{ "/bin/sh", "-c", cmd };
-        const r = std.process.run(gpa, io, .{ .argv = &argv, .cwd = .{ .path = workdir }, .environ_map = &env, .stdout_limit = .limited(32 << 10), .stderr_limit = .limited(32 << 10), .timeout = .{ .duration = .{ .raw = .fromSeconds(360), .clock = .awake } } }) catch {
-            note.print(gpa, "{s}: did not finish (spawn failed or exceeded 360s)\n", .{s.label}) catch {};
+        // ONE deadline for the install (bounded.run): std.process.run's timeout restarted at every line printed,
+        // and on Windows never fired for an install that printed nothing.
+        var r = bounded.run(gpa, io, .{ .argv = &argv, .cwd = .{ .path = workdir }, .environ_map = &env, .bound_ms = 360_000, .stdout_limit = 32 << 10, .stderr_limit = 32 << 10 });
+        defer r.deinit(gpa);
+        if (!r.finished()) {
+            switch (r.end) {
+                .killed => note.print(gpa, "{s}: did not finish (still running at the 360s bound; killed with everything it started)\n", .{s.label}) catch {},
+                .overflow => note.print(gpa, "{s}: did not finish (printed over 32 KB; stopped there)\n", .{s.label}) catch {},
+                else => note.print(gpa, "{s}: did not finish (could not be run: {s})\n", .{ s.label, r.why() }) catch {},
+            }
             continue;
-        };
-        defer gpa.free(r.stdout);
-        defer gpa.free(r.stderr);
-        const code: u32 = switch (r.term) {
-            .exited => |c| c,
-            else => 999,
-        };
+        }
+        const code: u32 = r.exited() orelse 999;
         if (code == 0) {
             note.print(gpa, "{s}: ok\n", .{s.label}) catch {};
         } else {

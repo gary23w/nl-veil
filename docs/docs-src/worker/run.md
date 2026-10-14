@@ -24,7 +24,7 @@ The worker process behind every swarm. It reads `<run_dir>/swarm.json` (provider
 
 ## Dependencies
 
-`llm.zig` (chat calls), `oscillation.zig` (`Mem`, the neuron-db gateway), `tools.zig`, `rsi.zig`, `agi.zig`, `commons.zig` (bus messages), `hyperspace.zig`, `bufedit.zig`, `crawl.zig`, `writer.zig`, `toolchain.zig`, `lineage.zig`, `ragmirror.zig`, `chat/context.zig`, `browser/util.zig` (`sleepMs` for the round loop's back-off and idle waits and the smoke gate's probe wait: OS sleeps, never `io.sleep`, on this plain main thread), plus the shared `modelcfg` module.
+`llm.zig` (chat calls), `oscillation.zig` (`Mem`, the neuron-db gateway), `tools.zig`, `rsi.zig`, `agi.zig`, `commons.zig` (bus messages), `hyperspace.zig`, `bufedit.zig`, `crawl.zig`, `writer.zig`, `toolchain.zig`, `bounded.zig` (every bounded child: VERIFY rows at 240 s, their adoption probe, the smoke probes' curl, the salvage syntax gate, and the smoke reap's tree kill), `lineage.zig`, `ragmirror.zig`, `chat/context.zig`, `browser/util.zig` (`sleepMs` for the round loop's back-off and idle waits and the smoke gate's probe wait: OS sleeps, never `io.sleep`, on this plain main thread), plus the shared `modelcfg` module.
 
 ## Usage Context
 

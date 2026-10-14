@@ -11,6 +11,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const launch = @import("browser/launch.zig");
+const bounded = @import("bounded.zig");
 
 pub const Dep = struct {
     /// "python" | "node" | "npm" | "curl" | "git" | "browser". A STATIC literal — the caller does NOT free it.
@@ -116,15 +117,10 @@ fn fileExists(io: std.Io, path: []const u8) bool {
 /// use stderr, so we fall back. Bounded by a short timeout so a wedged binary can't stall a health check.
 fn versionOf(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, invoke: []const u8) []const u8 {
     const argv = [_][]const u8{ invoke, "--version" };
-    const r = std.process.run(gpa, io, .{
-        .argv = &argv,
-        .environ_map = env,
-        .stdout_limit = .limited(8192),
-        .stderr_limit = .limited(8192),
-        .timeout = .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } },
-    }) catch return "";
-    defer gpa.free(r.stdout);
-    defer gpa.free(r.stderr);
+    // bounded.run: std.process.run's timeout never fires on Windows for a binary that hangs printing nothing
+    var r = bounded.run(gpa, io, .{ .argv = &argv, .environ_map = env, .bound_ms = 5_000, .stdout_limit = 8192, .stderr_limit = 8192 });
+    defer r.deinit(gpa);
+    if (!r.finished()) return "";
     const src = if (std.mem.trim(u8, r.stdout, " \r\n\t").len > 0) r.stdout else r.stderr;
     var it = std.mem.tokenizeAny(u8, src, "\r\n");
     const first = it.next() orelse return "";
@@ -140,20 +136,11 @@ fn versionOf(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ
 fn onPath(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, bin: []const u8) ?[]u8 {
     const locator = if (builtin.os.tag == .windows) "where" else "which";
     const argv = [_][]const u8{ locator, bin };
-    const r = std.process.run(gpa, io, .{
-        .argv = &argv,
-        .environ_map = env,
-        .stdout_limit = .limited(4096),
-        .stderr_limit = .limited(1024),
-        .timeout = .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } },
-    }) catch |e| {
-        if (isSpawnMissing(e)) return probeDirect(gpa, io, env, bin);
-        return null;
-    };
-    defer gpa.free(r.stdout);
-    defer gpa.free(r.stderr);
+    var r = bounded.run(gpa, io, .{ .argv = &argv, .environ_map = env, .bound_ms = 5_000, .stdout_limit = 4096, .stderr_limit = 1024 });
+    defer r.deinit(gpa);
+    if (r.end == .unstarted and isSpawnMissing(r.err.?)) return probeDirect(gpa, io, env, bin);
     // The locator RAN: a non-zero exit means it searched PATH and found nothing → absent.
-    if (r.term != .exited or r.term.exited != 0) return null;
+    if (!r.ok()) return null;
     var it = std.mem.tokenizeAny(u8, r.stdout, "\r\n");
     const first = it.next() orelse return null;
     const path = std.mem.trim(u8, first, " \t");
@@ -166,18 +153,9 @@ fn onPath(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Ma
 /// don't know the path, so we hand back the bare name as the "resolved" marker.
 fn probeDirect(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, bin: []const u8) ?[]u8 {
     const argv = [_][]const u8{ bin, "--version" };
-    const r = std.process.run(gpa, io, .{
-        .argv = &argv,
-        .environ_map = env,
-        .stdout_limit = .limited(4096),
-        .stderr_limit = .limited(4096),
-        .timeout = .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } },
-    }) catch |e| {
-        if (isSpawnMissing(e)) return null;
-        return gpa.dupe(u8, bin) catch null;
-    };
-    gpa.free(r.stdout);
-    gpa.free(r.stderr);
+    var r = bounded.run(gpa, io, .{ .argv = &argv, .environ_map = env, .bound_ms = 5_000, .stdout_limit = 4096, .stderr_limit = 4096 });
+    defer r.deinit(gpa);
+    if (r.end == .unstarted and isSpawnMissing(r.err.?)) return null;
     return gpa.dupe(u8, bin) catch null;
 }
 

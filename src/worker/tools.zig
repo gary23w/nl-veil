@@ -25,6 +25,7 @@ const dataset = @import("dataset.zig"); // training-set capture — the tool-exe
 const cftools = @import("cftools.zig"); // the cf_ family: a connected Cloudflare account's own tool belt
 const garrett = @import("garrett.zig"); // Agent Garrett's belt: the user's own blue-team agent over MCP (garrett, garrett_tools)
 const cpaths = @import("chat/paths.zig"); // sub-chat family base for recall (chat:<parent>__sN → chat:<parent>)
+const bounded = @import("bounded.zig"); // a child run under a bound that holds on Windows too (std.process.run's does not)
 
 /// Injected into an authored tool's Python body ONLY when NL_BROWSER_DRIVER is enabled: a `browser(action,
 /// params)` helper that POSTs to the loopback broker so an INVENTED tool can compose the browser primitives
@@ -56,54 +57,8 @@ const MCP_HELPER_PY =
     \\
 ;
 
-extern "kernel32" fn TerminateProcess(hProcess: *anyopaque, uExitCode: u32) callconv(.winapi) i32;
-extern "kernel32" fn Sleep(dwMilliseconds: u32) callconv(.winapi) void;
-extern "kernel32" fn GetProcessId(hProcess: *anyopaque) callconv(.winapi) u32; // Child.Id is a HANDLE; taskkill wants the pid
-extern "kernel32" fn CancelIoEx(hFile: *anyopaque, lpOverlapped: ?*anyopaque) callconv(.winapi) i32;
-
-const KillGuard = struct {
-    id: std.process.Child.Id,
-    deadline_ms: u32,
-    done: *std.atomic.Value(bool),
-    fn watch(g: KillGuard) void {
-        var waited: u32 = 0;
-        while (waited < g.deadline_ms) : (waited += 150) {
-            if (builtin.os.tag == .windows) {
-                Sleep(150);
-            } else {
-                const ts = std.posix.timespec{ .sec = 0, .nsec = 150 * std.time.ns_per_ms };
-                _ = std.c.nanosleep(&ts, null); // libc, not os.linux — ports to macOS (see browser/util.sleepMs)
-            }
-            if (g.done.load(.monotonic)) return;
-        }
-        if (g.done.load(.monotonic)) return;
-        if (builtin.os.tag == .windows) {
-            _ = TerminateProcess(@ptrCast(g.id), 1);
-        } else std.posix.kill(g.id, .KILL) catch {};
-    }
-};
-
-/// Spawn a subprocess (its body redirected to a file via the caller's argv, so stdout never blocks the read) and KILL
-/// it by handle if it runs longer than `deadline_ms` — so a WAF-held curl self-heals (the tool returns whatever
-/// arrived) instead of wedging the swarm. The watchdog holds a COPY of the handle (captured before spawn) so it never
-/// races the main thread's wait(); TerminateProcess on an already-closed handle is harmless.
-/// Returns the SPAWN error if the child could not be started (so a caller can tell a MISSING curl from a
-/// curl that ran and returned nothing — see deps.isSpawnMissing), else null on a successful spawn+wait.
-fn spawnGuarded(io: std.Io, argv: []const []const u8, deadline_ms: u32) ?anyerror {
-    // create_no_window: on Windows a bare spawn of a console app (curl.exe) from a windowless parent pops a
-    // console that flashes on the user's desktop for each fetch. std.process.run already defaults this true;
-    // std.process.spawn defaults it FALSE, so set it explicitly here (no-op off Windows).
-    var child = std.process.spawn(io, .{ .argv = argv, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore, .create_no_window = true }) catch |e| return e;
-    var done = std.atomic.Value(bool).init(false);
-    const th: ?std.Thread = if (child.id != null)
-        (std.Thread.spawn(.{}, KillGuard.watch, .{KillGuard{ .id = child.id.?, .deadline_ms = deadline_ms, .done = &done }}) catch null)
-    else
-        null;
-    _ = child.wait(io) catch {};
-    done.store(true, .monotonic);
-    if (th) |t| t.join();
-    return null;
-}
+/// Kills a child by handle past its deadline; moved to bounded.zig beside the bounded run and its tree kill.
+const spawnGuarded = bounded.spawnGuarded;
 
 /// Fetch a URL via curl into a per-mind temp file, guarded by spawnGuarded (so a WAF hang is killed, not fatal), then
 /// read back whatever body arrived. Caller frees. `json` adds the Accept header; `limit` caps the read.
@@ -3260,15 +3215,34 @@ fn pyCompileError(ctx: *ToolCtx, source: []const u8, orig: []const u8) ?[]u8 {
     // legitimately repeat a top-level name — a decorator means "not a plain redefinition".
     const code = "import os,sys,ast\nsrc=os.environ.get('NL_CHK_SRC','')\ntry:\n compile(src,'<edit>','exec')\nexcept SyntaxError as e:\n sys.stdout.write('line %s: %s'%(getattr(e,'lineno','?'),(e.msg or 'syntax error')));sys.exit(7)\nexcept Exception:\n sys.exit(0)\ntry:\n def tops(s):\n  seen=set();d=set()\n  for n in ast.parse(s).body:\n   if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef,ast.ClassDef)) and not n.decorator_list:\n    if n.name in seen: d.add(n.name)\n    seen.add(n.name)\n  return d\n nd=sorted(tops(src)-tops(os.environ.get('NL_CHK_ORIG','')))\n if nd:\n  sys.stdout.write('duplicate top-level definition(s): '+', '.join(nd));sys.exit(8)\nexcept Exception:\n pass\nsys.exit(0)\n";
     const argv = [_][]const u8{ py, "-c", code };
-    // TIMEOUT: this gate can run while vcs.commitEdit holds the ONE worker file mutex — an unbounded child
+    // BOUND: this gate can run while vcs.commitEdit holds the ONE worker file mutex — an unbounded child
     // (or a Windows handle-inheritance stall) would freeze every mind until the hang watchdog kills the run.
-    const r = std.process.run(gpa, ctx.io, .{ .argv = &argv, .environ_map = &env, .stdout_limit = .limited(4096), .stderr_limit = .limited(4096), .timeout = .{ .duration = .{ .raw = .fromSeconds(15), .clock = .awake } } }) catch return null;
-    defer gpa.free(r.stdout);
-    defer gpa.free(r.stderr);
-    return switch (r.term) {
-        .exited => |c| if (c == 7 or c == 8) (gpa.dupe(u8, std.mem.trim(u8, r.stdout, " \r\n\t")) catch null) else null,
-        else => null,
-    };
+    // bounded.run, because std.process.run's timeout never fires on Windows for a child that prints nothing.
+    var r = bounded.run(gpa, ctx.io, .{ .argv = &argv, .environ_map = &env, .bound_ms = 15_000, .stdout_limit = 4096, .stderr_limit = 4096 });
+    defer r.deinit(gpa);
+    const c = r.exited() orelse return null;
+    return if (c == 7 or c == 8) (gpa.dupe(u8, std.mem.trim(u8, r.stdout, " \r\n\t")) catch null) else null;
+}
+
+test "the python edit gate answers through its bounded run: a SyntaxError or a pasted second copy rejects in python's own words, a clean body passes (real python)" {
+    const gpa = std.testing.allocator;
+    var f: PollFixture = undefined;
+    try f.init(gpa);
+    defer f.deinit();
+    var ctx = f.ctx(gpa);
+    { // skip only on proof that the interpreter the gate spawns is not on this machine
+        const py = if (builtin.os.tag == .windows) "python" else "python3";
+        var probe = bounded.run(gpa, ctx.io, .{ .argv = &.{ py, "--version" }, .environ_map = &f.env, .bound_ms = 30_000, .stdout_limit = 256, .stderr_limit = 256 });
+        defer probe.deinit(gpa);
+        if (!probe.ok()) return error.SkipZigTest; // missing, or the Store alias stub
+    }
+    const bad = pyCompileError(&ctx, "def f(:\n    pass\n", "") orelse return error.NoSyntaxVerdict;
+    defer gpa.free(bad);
+    try std.testing.expect(std.mem.startsWith(u8, bad, "line 1: "));
+    const dup = pyCompileError(&ctx, "def f():\n    pass\n\ndef f():\n    pass\n", "") orelse return error.NoDuplicateVerdict;
+    defer gpa.free(dup);
+    try std.testing.expectEqualStrings("duplicate top-level definition(s): f", dup);
+    try std.testing.expectEqual(@as(?[]u8, null), pyCompileError(&ctx, "x = 1\n", ""));
 }
 
 /// Distinguishes concurrent syntax-gate scratch files; two minds can gate-check in the same run_dir at once.
@@ -3316,13 +3290,10 @@ fn nodeCheckOnce(ctx: *ToolCtx, source: []const u8, ext: []const u8) ?[]u8 {
     // while vcs.commitEdit holds the ONE worker file mutex. stderr gets more rope than stdout because node
     // echoes the whole offending source line (minified JS = one huge line) BEFORE the SyntaxError verdict,
     // and a clipped-off verdict = fail-open.
-    const r = std.process.run(gpa, ctx.io, .{ .argv = &argv, .environ_map = ctx.environ, .stdout_limit = .limited(4096), .stderr_limit = .limited(16 << 10), .timeout = .{ .duration = .{ .raw = .fromSeconds(15), .clock = .awake } } }) catch return null;
-    defer gpa.free(r.stdout);
-    defer gpa.free(r.stderr);
-    return switch (r.term) {
-        .exited => |c| if (c == 0) null else jsSyntaxErrLine(gpa, r.stderr),
-        else => null,
-    };
+    var r = bounded.run(gpa, ctx.io, .{ .argv = &argv, .environ_map = ctx.environ, .bound_ms = 15_000, .stdout_limit = 4096, .stderr_limit = 16 << 10 });
+    defer r.deinit(gpa);
+    const c = r.exited() orelse return null;
+    return if (c == 0) null else jsSyntaxErrLine(gpa, r.stderr);
 }
 
 /// Syntax-check a candidate .js/.mjs/.cjs body via `node --check`. A bare `.js` has no module system of
@@ -4145,24 +4116,9 @@ const probe_seam = if (builtin.is_test) struct {
     var sleep_ms: ?u64 = null;
 } else struct {};
 
-/// One command probe: how it ended and what it printed. Both buffers are gpa-owned (possibly empty).
-const CmdProbe = struct {
-    /// `.killed` = still running at its bound; `.overflow` = printed more than PROBE_STDOUT_MAX; `.unread` = its
-    /// output could not be read; `.unstarted` = the shell itself would not start.
-    end: enum { exited, signal, killed, overflow, unread, unstarted } = .unstarted,
-    code: u32 = 0,
-    stdout: []u8 = &.{},
-    stderr: []u8 = &.{},
-    why: []const u8 = "",
-
-    fn deinit(p: *CmdProbe, gpa: std.mem.Allocator) void {
-        gpa.free(p.stdout);
-        gpa.free(p.stderr);
-    }
-    fn ok(p: *const CmdProbe) bool {
-        return p.end == .exited and p.code == 0;
-    }
-};
+/// One command probe: how it ended and what it printed (bounded.Result). `.overflow` = printed more than
+/// PROBE_STDOUT_MAX; `.unstarted` = the shell itself would not start.
+const CmdProbe = bounded.Result;
 
 /// Run ONE `poll kind=command` probe the way a person would at a prompt, bounded, with both streams kept.
 ///
@@ -4183,11 +4139,10 @@ const CmdProbe = struct {
 /// never torn. POSIX `sh -c` was always verbatim. The verbatim child's environment is the process's own, which is
 /// what the direct path's child inherits through io, plus the one variable.
 ///
-/// BOUND. At `bound_ms` the probe is killed with its whole tree: on Windows by taskkill /T (the declaredSmoke reap),
-/// because cmd.exe never execs; on POSIX through the process group the probe leads. Killing the shell alone leaves
-/// whatever it started running: measured 2026-10-14, the ping (Windows) and sleep (WSL dash) under a nested shell
-/// outlived a direct-child kill, and a docker exec would too. The cost of the group, accepted: a terminal's Ctrl-C
-/// signals only its foreground group, so it no longer reaches an in-flight probe directly.
+/// BOUND. bounded.run: at `bound_ms` the probe is killed with its whole tree (taskkill /T on Windows, because cmd.exe
+/// never execs; the process group it leads on POSIX). Killing the shell alone leaves whatever it started running:
+/// measured 2026-10-14, the ping (Windows) and sleep (WSL dash) under a nested shell outlived a direct-child kill,
+/// and a docker exec would too.
 fn runProbe(ctx: *ToolCtx, target: []const u8, bound_ms: u64) CmdProbe {
     const gpa = ctx.gpa;
     const io = ctx.io;
@@ -4199,15 +4154,15 @@ fn runProbe(ctx: *ToolCtx, target: []const u8, bound_ms: u64) CmdProbe {
     };
     if (win) {
         if (std.mem.indexOfScalar(u8, target, '"') != null) {
-            var m = (std.process.Environ{ .block = .global }).createMap(gpa) catch |e| return .{ .why = @errorName(e) };
+            var m = (std.process.Environ{ .block = .global }).createMap(gpa) catch |e| return .{ .err = e };
             const text = expandPercentVars(gpa, target, &m) catch |e| {
                 m.deinit();
-                return .{ .why = @errorName(e) };
+                return .{ .err = e };
             };
             defer gpa.free(text);
             m.put(PROBE_ENV, text) catch |e| {
                 m.deinit();
-                return .{ .why = @errorName(e) };
+                return .{ .err = e };
             };
             env = m;
         }
@@ -4215,79 +4170,8 @@ fn runProbe(ctx: *ToolCtx, target: []const u8, bound_ms: u64) CmdProbe {
     const direct = [3][]const u8{ if (win) "cmd" else "sh", if (win) "/C" else "-c", target };
     const em: ?*const std.process.Environ.Map = if (win) (if (env) |*m| m else null) else null;
     const argv: []const []const u8 = if (em != null) &probe_argv_verbatim else &direct;
-    // POSIX: its own process group, so the bound can kill the probe's whole tree (killProbeTree). dash does not exec
-    // a nested `sh -c` either: measured in WSL, killing the direct child alone left `sh -c sleep 6` and its sleep.
-    const pgid: ?std.posix.pid_t = if (win) null else 0;
-    var child = std.process.spawn(io, .{ .argv = argv, .environ_map = em, .stdin = .ignore, .stdout = .pipe, .stderr = .pipe, .create_no_window = true, .pgid = pgid }) catch |e| return .{ .why = @errorName(e) };
-    defer child.kill(io);
-    var bufs: std.Io.File.MultiReader.Buffer(2) = undefined;
-    var mr: std.Io.File.MultiReader = undefined;
-    mr.init(gpa, io, bufs.toStreams(), &.{ child.stdout.?, child.stderr.? });
-    defer mr.deinit();
-    // ONE deadline for the whole probe: a `.duration` restarts at every read, so a probe that prints a line a
-    // second would never time out.
-    const deadline = (std.Io.Timeout{ .duration = .{ .raw = .fromMilliseconds(@intCast(bound_ms)), .clock = .awake } }).toDeadline(io);
-    var p: CmdProbe = .{ .end = .exited };
-    while (mr.fill(256, deadline)) |_| {
-        if (mr.reader(0).buffered().len > PROBE_STDOUT_MAX) {
-            p.end = .overflow;
-            break;
-        }
-        // stderr is shown only as its tail, so only a tail is kept: progress bars on stderr must not grow it unbounded
-        const er = mr.reader(1);
-        if (er.buffered().len > 16 << 10) er.toss(er.buffered().len - 4096);
-    } else |e| switch (e) {
-        error.EndOfStream => {},
-        error.Timeout => p.end = .killed,
-        else => {
-            p.end = .unread;
-            p.why = @errorName(e);
-        },
-    }
-    // COPIES, never mr.toOwnedSlice. On Windows a probe cut at its bound (or past PROBE_STDOUT_MAX) still has its
-    // overlapped pipe reads pending in the kernel, aimed at r.buffer[r.end..] of these very buffers; toOwnedSlice
-    // reallocs or frees them on the spot, so whatever the probe printed during the tree kill below was copied by
-    // the kernel into heap veil no longer owned (measured: a still-printing probe's bytes turned up in released
-    // blocks under a quarantine allocator). The buffers stay the MultiReader's until its deferred deinit, whose
-    // batch cancel drains those reads before it frees anything.
-    p.stdout = gpa.dupe(u8, mr.reader(0).buffered()) catch &.{};
-    p.stderr = gpa.dupe(u8, mr.reader(1).buffered()) catch &.{};
-    if (p.end != .exited) {
-        killProbeTree(ctx, &child); // then the deferred child.kill reaps the direct child
-        // Zig 0.16's Windows batch cancel waits for an APC BEFORE it cancels, so MultiReader.deinit with reads still
-        // pending blocks until something writes to or closes the pipe. Measured: std.process.run's 1 s `.timeout` on
-        // a silent `cmd /C "ping -n 6 ... >NUL"` came back after the child's natural 5 s. The tree kill closes the
-        // pipes; cancelling our own reads covers a holder that escaped it, so the bound stays a bound.
-        if (builtin.os.tag == .windows) {
-            _ = CancelIoEx(child.stdout.?.handle, null);
-            _ = CancelIoEx(child.stderr.?.handle, null);
-        }
-        return p;
-    }
-    const term = child.wait(io) catch |e| {
-        p.end = .unread;
-        p.why = @errorName(e);
-        return p;
-    };
-    switch (term) {
-        .exited => |c| p.code = c,
-        else => p.end = .signal,
-    }
-    return p;
-}
-
-fn killProbeTree(ctx: *ToolCtx, child: *std.process.Child) void {
-    const h = child.id orelse return;
-    if (builtin.os.tag == .windows) {
-        var pb: [16]u8 = undefined;
-        const ps = std.fmt.bufPrint(&pb, "{d}", .{GetProcessId(h)}) catch return;
-        // spawnGuarded, not std.process.run's `.timeout`: that one is not a bound on Windows (see runProbe), so a
-        // taskkill stuck mid-enumeration would hold the probe; KillGuard terminates it by handle at 10 s.
-        _ = spawnGuarded(ctx.io, &.{ "taskkill", "/F", "/T", "/PID", ps }, 10_000);
-    } else {
-        std.posix.kill(-h, .KILL) catch {}; // the probe's group (runProbe made it the leader)
-        std.posix.kill(h, .KILL) catch {}; // and the leader itself, should the group signal have been refused
-    }
+    // stderr is shown only as its tail, so only a tail is kept: progress bars on stderr must not grow it unbounded
+    return bounded.run(gpa, io, .{ .argv = argv, .environ_map = em, .bound_ms = bound_ms, .stdout_limit = PROBE_STDOUT_MAX, .stderr_limit = 4096, .stderr_tail = true });
 }
 
 /// A cmd PROMPT's percent expansion (not a batch file's: no `%%` escape, no `%1`), done up front for a quoted
@@ -4330,8 +4214,8 @@ fn probeLine(buf: []u8, p: *const CmdProbe, bound_ms: u64) []const u8 {
         .signal => w.writeAll("ended by a signal") catch {},
         .killed => w.print("killed after {d}.{d}s, still running when this call's timeout_s ran out (a probe must return on its own: no tail -f, no prompts)", .{ bound_ms / 1000, bound_ms % 1000 / 100 }) catch {},
         .overflow => w.print("stopped: printed over {d} KB, narrow the probe (e.g. tail -n 20)", .{PROBE_STDOUT_MAX >> 10}) catch {},
-        .unread => w.print("its output could not be read ({s})", .{p.why}) catch {},
-        .unstarted => w.print("could not start the probe shell ({s})", .{p.why}) catch {},
+        .unread => w.print("its output could not be read ({s})", .{p.why()}) catch {},
+        .unstarted => w.print("could not start the probe shell ({s})", .{p.why()}) catch {},
     }
     if (p.end != .overflow and p.end != .unstarted) {
         const out = std.mem.trim(u8, p.stdout, " \r\n\t");
@@ -4725,13 +4609,10 @@ fn zigAstCheckError(ctx: *ToolCtx, source: []const u8) ?[]u8 {
     };
     const argv = [_][]const u8{ zig, "ast-check", tmp };
     // Same mutex-safety story as the py/js gates: this can run while a file mutex is held, so it is bounded.
-    const r = std.process.run(gpa, ctx.io, .{ .argv = &argv, .environ_map = ctx.environ, .stdout_limit = .limited(4096), .stderr_limit = .limited(16 << 10), .timeout = .{ .duration = .{ .raw = .fromSeconds(20), .clock = .awake } } }) catch return null;
-    defer gpa.free(r.stdout);
-    defer gpa.free(r.stderr);
-    return switch (r.term) {
-        .exited => |c| if (c == 0) null else zigAstErrLine(gpa, r.stderr),
-        else => null,
-    };
+    var r = bounded.run(gpa, ctx.io, .{ .argv = &argv, .environ_map = ctx.environ, .bound_ms = 20_000, .stdout_limit = 4096, .stderr_limit = 16 << 10 });
+    defer r.deinit(gpa);
+    const c = r.exited() orelse return null;
+    return if (c == 0) null else zigAstErrLine(gpa, r.stderr);
 }
 
 /// The post-write verifier for patch_system: real .zig ast-check, else the shared extension gate (.py/.js/.json
