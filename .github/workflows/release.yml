@@ -1,13 +1,13 @@
 name: release
 
-# On pull requests and main pushes: a build check (the badge signal). On a version tag or a
+# On pull requests and benchmark-branch pushes: a build check (the badge signal). On a version tag or a
 # manual run: full, self-contained bundles built natively per-OS — the only
 # reliable way to ship veil-desk (raylib) and neuron (Rust) for every platform.
 
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: ['swe/benchmark_1']
     tags: ['v*']
   workflow_dispatch:
 
@@ -15,9 +15,9 @@ permissions:
   contents: write
 
 jobs:
-  # fast signal on every main push: does the server still build?
+  # fast signal on every benchmark-branch push: does the server still build?
   check:
-    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/swe/benchmark_1' || startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
     permissions:
       contents: read
     runs-on: ubuntu-latest
@@ -39,7 +39,7 @@ jobs:
           install -m 0755 neuron-db/rust/neuron-core/target/release/neuron bin/neuron
       # v2 resolves releases through ziglang.org's download index; the old @v1 hand-built the
       # pre-0.16 tarball name (zig-linux-x86_64-…) and 404'd on every mirror after 0.16.0
-      # switched to arch-first naming (zig-x86_64-linux-…). This is what broke every main-push check.
+      # switched to arch-first naming (zig-x86_64-linux-…). This is what broke every branch-push check.
       - uses: mlugg/setup-zig@v2
         with: { version: 0.16.0 }
       # GUI deps first: scripts/check.sh --full ends with the DEFAULT build (raylib merged into `veil`),

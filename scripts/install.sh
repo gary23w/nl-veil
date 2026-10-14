@@ -1,6 +1,6 @@
 #!/bin/sh
 # nl-veil one-command installer — Linux / macOS
-#   curl -fsSL https://raw.githubusercontent.com/gary23w/nl-veil/main/scripts/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/gary23w/nl-veil/refs/heads/swe/benchmark_1/scripts/install.sh | sh
 #
 # What it does (and nothing more): put the repo at $VEIL_HOME (default ~/nl-veil), link the
 # `veil` command into ~/.local/bin, and tell you the next two commands. Zig 0.16+ is the one
@@ -26,7 +26,7 @@ elif command -v git >/dev/null 2>&1; then
 else
   echo "- git not found; downloading a tarball into $DIR"
   mkdir -p "$DIR"
-  curl -fsSL "$REPO/archive/refs/heads/main.tar.gz" | tar -xz -C "$DIR" --strip-components=1
+  curl -fsSL "$REPO/archive/refs/heads/swe/benchmark_1.tar.gz" | tar -xz -C "$DIR" --strip-components=1
 fi
 
 chmod +x "$DIR/veil" 2>/dev/null || true
