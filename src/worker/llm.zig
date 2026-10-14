@@ -42,6 +42,22 @@ fn notify(text: []const u8) void {
     if (retry_notify) |f| f(text);
 }
 
+/// Whether the turn on this thread has been stopped: retry_abort, the engine's control.jsonl Stop predicate for the
+/// conversation whose turn owns this thread (false on any other thread, and with no hook). NO REQUEST STARTS ONCE IT
+/// IS TRUE. It used to be asked only between the slices of a retry wait, so every other way a call puts a request on
+/// the wire ignored a Stop: the knob-free re-send, the heals, the stream's fallback, the ladder's own retries. Measured
+/// 2026-10-12: a rescue call started a fresh request 133.8 s after the user pressed Stop, and it ran until a person
+/// killed its curl. The checks sit where a request starts (post, streamAttempt, completeOllamaNative) and where a
+/// failed call decides to go again (complete, chatTemp). A blocking request already in flight still runs to its own
+/// end; a streamed one is killed by its caller's should_abort, as before.
+fn stopRequested() bool {
+    return if (retry_abort) |f| f() else false;
+}
+
+/// What a call refused because its turn was stopped answers with (ok=false). post() returns it before anything is
+/// written or dialed. The engine reads a Stop off control.jsonl itself; this text is for the llm frame and the log.
+pub const STOPPED = "stopped: the turn was stopped before this request was sent";
+
 /// The head of the last error this thread's client produced, for the llm frame of a failed call. The frame
 /// carried only ok=false, and a desk-hosted server has no captured stderr, so a swallowed auxiliary failure
 /// (a loop verdict that came back in 2 s with nothing) left no reason anywhere. Each entry point clears it.
@@ -96,16 +112,168 @@ threadlocal var retry_armed: bool = false;
 threadlocal var retry_slots: [RETRY_SLOTS]RetrySlot = undefined;
 threadlocal var retry_slots_n: usize = 0;
 
-/// Arm this thread's retry budget for a turn: every provider starts with RETRY_MAX retries.
+/// Arm this thread's retry budget for a turn: every provider starts with RETRY_MAX retries, and no credential
+/// re-resolved by an earlier turn on this thread is carried in (KeySwap).
 pub fn armRetries() void {
+    forgetKeys();
     retry_armed = true;
     retry_slots_n = 0;
 }
 
-/// Disarm at turn exit, so a recycled thread never carries one turn's spent budget into the next.
+/// Disarm at turn exit, so a recycled thread never carries one turn's spent budget into the next - nor the
+/// credentials it re-resolved, which are zeroed here (KeySwap).
 pub fn disarmRetries() void {
+    forgetKeys();
     retry_armed = false;
     retry_slots_n = 0;
+}
+
+/// A CREDENTIAL RE-RESOLVED AFTER A 401 SERVES THE REST OF THE TURN. The engine resolves a turn's keys once, when the
+/// message is submitted, and passes that copy to every model call; a Cloudflare OAuth access token that expires
+/// mid-turn is refused (HTTP 401, code 10000) on every call after that. complete()'s ladder asks retry_rekey for the
+/// re-resolved token, and the retry with it lands - but that key used to live and die with the one complete() call
+/// that fetched it. Measured 2026-10-12 on a 20-minute turn: each of the ten calls after the token's expiry paid a
+/// silent streamed 401, an announced one, a 5 s wait and a vault read (about 6 s each), and lost streaming for a
+/// blocking fallback. So the fresh key is remembered here, per thread, for as long as the retry budget is armed:
+/// complete() and completeStream send it in place of the key the caller holds, and the next rotation replaces it.
+///
+/// MATCHED ON (base_url, the key the caller holds): a role whose key or endpoint differs is never handed another's
+/// credential, and roles holding the same token (the trio usually does) share the one entry. Hashes only: the stale
+/// key itself is not kept. The fresh key is a copy, kept with the allocator that made it (the call's gpa), and zeroed
+/// before it goes back: when it is replaced, evicted or forgotten (arm, disarm). An unarmed thread remembers nothing,
+/// so nothing outlives a turn. A turn nested on its parent's thread (spawnTurn's inline fallback, when a thread cannot
+/// be spawned) clears the parent's entries with its own arm and disarm, and its disarm leaves the parent's thread
+/// UNARMED for the rest of the parent's turn - as it already did the parent's budget: no swap, the unbudgeted ladder
+/// (transient failures only, so a 401 fails at once), and no re-resolve (the engine's runTurn also clears turn_app).
+const KeySwap = struct { base: u64, held: u64, key: []u8, gpa: std.mem.Allocator };
+/// A turn's endpoints: the trio's, a vision model's; the oldest entry goes past four.
+const KEY_SWAPS = 4;
+threadlocal var key_swaps: [KEY_SWAPS]KeySwap = undefined;
+threadlocal var key_swaps_n: usize = 0;
+
+fn keySwapId(s: []const u8) u64 {
+    return std.hash.Wyhash.hash(0x6b65_7973_7761_7031, s);
+}
+
+/// Zero a key before its memory goes back, so the copies this file keeps for a whole turn (KeySwap) and hands each
+/// call (swappedKey) do not sit in freed heap after they are dropped. That is all it covers, not the token: every
+/// request's curl config (chatCfg) carries the same bearer and is freed without zeroing, and so are the engine's own
+/// copies of a re-resolved key (llmRetryRekey, cf_oauth).
+fn freeKey(gpa: std.mem.Allocator, k: []const u8) void {
+    std.crypto.secureZero(u8, @constCast(k));
+    gpa.free(k);
+}
+
+fn forgetKeys() void {
+    for (key_swaps[0..key_swaps_n]) |s| freeKey(s.gpa, s.key);
+    key_swaps_n = 0;
+}
+
+/// The key this turn re-resolved for a caller holding `held` at `base_url`, as a `gpa`-owned copy the caller frees
+/// with freeKey; null when there is none (send `held`). A copy, so a rotation during the caller's call can replace
+/// the entry without pulling the key out from under it.
+fn swappedKey(gpa: std.mem.Allocator, base_url: []const u8, held: []const u8) ?[]u8 {
+    if (!retry_armed) return null;
+    const b = keySwapId(trimSlash(base_url));
+    const h = keySwapId(held);
+    for (key_swaps[0..key_swaps_n]) |s| if (s.base == b and s.held == h) return gpa.dupe(u8, s.key) catch null;
+    return null;
+}
+
+/// Remember `fresh` as the key to send to `base_url` in place of `held` for the rest of the turn (see KeySwap). Out
+/// of memory it remembers nothing, and the next call pays the 401 again: the call in hand has its own copy.
+fn rememberKey(gpa: std.mem.Allocator, base_url: []const u8, held: []const u8, fresh: []const u8) void {
+    if (!retry_armed) return;
+    const b = keySwapId(trimSlash(base_url));
+    const h = keySwapId(held);
+    var at: ?usize = null;
+    for (key_swaps[0..key_swaps_n], 0..) |s, i| {
+        if (s.base == b and s.held == h) at = i;
+    }
+    if (std.mem.eql(u8, fresh, held)) {
+        // the key the caller holds is current again: nothing to swap
+        if (at) |i| {
+            freeKey(key_swaps[i].gpa, key_swaps[i].key);
+            std.mem.copyForwards(KeySwap, key_swaps[i .. key_swaps_n - 1], key_swaps[i + 1 .. key_swaps_n]);
+            key_swaps_n -= 1;
+        }
+        return;
+    }
+    const copy = gpa.dupe(u8, fresh) catch return;
+    if (at) |i| {
+        freeKey(key_swaps[i].gpa, key_swaps[i].key);
+        key_swaps[i] = .{ .base = b, .held = h, .key = copy, .gpa = gpa };
+        return;
+    }
+    if (key_swaps_n == KEY_SWAPS) {
+        freeKey(key_swaps[0].gpa, key_swaps[0].key);
+        std.mem.copyForwards(KeySwap, key_swaps[0 .. KEY_SWAPS - 1], key_swaps[1..KEY_SWAPS]);
+        key_swaps_n -= 1;
+    }
+    key_swaps[key_swaps_n] = .{ .base = b, .held = h, .key = copy, .gpa = gpa };
+    key_swaps_n += 1;
+}
+
+test "a credential kept for the turn answers only its endpoint and the key it replaced, and goes back when it is replaced, evicted or the turn ends" {
+    const gpa = std.testing.allocator;
+    const saved_armed = retry_armed;
+    const saved_n = retry_slots_n;
+    defer {
+        disarmRetries();
+        retry_armed = saved_armed;
+        retry_slots_n = saved_n;
+    }
+    // Every key the swap keeps comes through this allocator, which counts the frees; std.testing.allocator under it
+    // reports any key never given back. (Whether freeKey zeroed a key cannot be seen from here: a Debug build's
+    // Allocator.free overwrites the bytes itself before the allocator is told. The secureZero is for release builds,
+    // where that overwrite is compiled out.)
+    var counting = std.testing.FailingAllocator.init(gpa, .{});
+    const za = counting.allocator();
+    const cf = "https://api.cloudflare.com/client/v4/accounts/abc/ai/v1";
+
+    // an unarmed thread (a swarm worker) remembers nothing: there is no turn for the key to outlive
+    disarmRetries();
+    rememberKey(za, cf, "key-old", "key-new");
+    try std.testing.expectEqual(@as(usize, 0), key_swaps_n);
+
+    armRetries();
+    rememberKey(za, cf ++ "/", "key-old", "key-new"); // a trailing slash is the same endpoint
+    {
+        const k = swappedKey(gpa, cf, "key-old") orelse return error.TestExpectedSwap;
+        defer freeKey(gpa, k);
+        try std.testing.expectEqualStrings("key-new", k);
+    }
+    // a caller holding another key, or the same key at another endpoint, is never handed this one
+    try std.testing.expect(swappedKey(gpa, cf, "key-other") == null);
+    try std.testing.expect(swappedKey(gpa, "https://api.example.com/v1", "key-old") == null);
+    // the next rotation replaces the entry, and the key it replaces goes back
+    rememberKey(za, cf, "key-old", "key-newer");
+    {
+        const k = swappedKey(gpa, cf, "key-old") orelse return error.TestExpectedSwap;
+        defer freeKey(gpa, k);
+        try std.testing.expectEqualStrings("key-newer", k);
+    }
+    try std.testing.expectEqual(@as(usize, 1), key_swaps_n);
+    try std.testing.expectEqual(@as(usize, 1), counting.deallocations);
+    // the caller's own key current again: no swap at all
+    rememberKey(za, cf, "key-old", "key-old");
+    try std.testing.expect(swappedKey(gpa, cf, "key-old") == null);
+    try std.testing.expectEqual(@as(usize, 0), key_swaps_n);
+    // past KEY_SWAPS endpoints the oldest goes
+    var bufs: [KEY_SWAPS + 1][48]u8 = undefined;
+    for (&bufs, 0..) |*b, i| rememberKey(za, try std.fmt.bufPrint(b, "https://h{d}.example.com/v1", .{i}), "key-old", "key-new");
+    try std.testing.expectEqual(@as(usize, KEY_SWAPS), key_swaps_n);
+    try std.testing.expect(swappedKey(gpa, "https://h0.example.com/v1", "key-old") == null);
+    {
+        const k = swappedKey(gpa, "https://h1.example.com/v1", "key-old") orelse return error.TestExpectedSwap;
+        freeKey(gpa, k);
+    }
+    // a turn's end (and the next one's start) forgets them all
+    disarmRetries();
+    try std.testing.expectEqual(@as(usize, 0), key_swaps_n);
+    try std.testing.expect(swappedKey(gpa, "https://h1.example.com/v1", "key-old") == null);
+    try std.testing.expectEqual(@as(usize, 3 + KEY_SWAPS), counting.deallocations); // replaced, cleared, evicted, the four forgotten
+    try std.testing.expectEqual(counting.allocations, counting.deallocations);
 }
 
 fn providerId(base_url: []const u8, model: []const u8) u64 {
@@ -172,6 +340,10 @@ fn retryPlan(base_url: []const u8, model: []const u8, attempt: usize, err_text: 
     return .{ .wait_s = RETRY_WAITS_TRANSIENT_S[attempt], .n = @intCast(attempt + 1), .of = RETRY_WAITS_TRANSIENT_S.len };
 }
 
+/// TEST SEAM: what one second of a retry wait sleeps, in ms (retryWait). A test that walks the ladder sets 0: the
+/// wait costs nothing and still asks retry_abort once, so the ladder's counts are pinned without its real 5-60 s.
+var test_retry_ms_per_s: if (builtin.is_test) u64 else void = if (builtin.is_test) std.time.ms_per_s else {};
+
 /// Sleep out a retry wait in quarter-second slices, asking retry_abort between them, so a chat Stop ends the
 /// wait within a slice instead of after a minute. False when aborted: the ladder stops and the failure surfaces.
 /// The slices sleep on the OS (bu.sleepMs), never io.sleep: a chat turn's ladder runs on the turn's plain
@@ -179,7 +351,7 @@ fn retryPlan(base_url: []const u8, model: []const u8, attempt: usize, err_text: 
 /// streamAttempt). An OS sleep cannot be canceled, which changes nothing here: retry_abort is how a wait ends
 /// early, and nothing cancels the Io tasks the swarm's minds call complete() from.
 fn retryWait(wait_s: u64) bool {
-    var left_ms: u64 = wait_s * 1000;
+    var left_ms: u64 = wait_s * (if (builtin.is_test) test_retry_ms_per_s else std.time.ms_per_s);
     while (left_ms > 0) {
         if (retry_abort) |f| if (f()) return false;
         const slice: u64 = @min(left_ms, 250);
@@ -401,6 +573,79 @@ fn observeReasonOff(io: std.Io, model: []const u8, pick: ReasonOffPick, ok: bool
     e.q.reason_off_trial = next;
     e.q.reason_off = if (next >= REASON_OFF_CANDIDATES.len) .none else .unknown;
     if (!pick.trial) saveQuirksLocked(io); // a persisted knob that stopped working is forgotten on disk too
+}
+
+/// A failed call whose failure says NOTHING about the reasoning-off knob it carried: the credential (HTTP 401, 403),
+/// the provider's clock or capacity (408, 429, any 5xx), the transport (every curl failure - its own timeout
+/// included - and a local call that timed out, dropped or was refused), no uplink at all (net.MSG), or a request
+/// that never left this process: a key curl's config cannot carry (KEY_STRAY_BYTE, KEY_CFG_TOO_LONG), a body that
+/// could not be written, no memory, a turn stopped before it was sent (STOPPED). None of these reached the point
+/// where a provider weighs a request's parameters, so the call may neither retire the knob (observeReasonOff) nor
+/// buy a re-send without it. complete()'s retry ladder still resends the same body as for any failure; chat() and
+/// chatTemp() have no ladder, so such a call now ends on its one request (and curl's own --retry of a hosted
+/// 408/429/5xx), where the knob-free re-send used to buy it a second that was sent for the wrong reason.
+///
+/// Measured 2026-10-12: a raised call that ran ~236 s into the provider's own timeout counted as a rejection of its
+/// knob, moved the model's trial from `template` to `effort` on no evidence about either, and bought a knob-free
+/// re-send that started after the turn had been stopped. A rejection in the BODY - an HTTP 400 naming the
+/// parameter, or an HTTP 200 carrying an error envelope (Kimi) - IS evidence and keeps that path: the knob moves on
+/// and the call goes again without it. The texts are matched by the constants that produce them (postUrl's ERR_*),
+/// so a reworded message moves both sides at once.
+fn knobBlindFailure(err_text: []const u8) bool {
+    if (std.mem.startsWith(u8, err_text, "HTTP ")) {
+        const digits = err_text["HTTP ".len..];
+        var end: usize = 0;
+        while (end < digits.len and end < 3 and std.ascii.isDigit(digits[end])) end += 1;
+        const code = std.fmt.parseInt(u16, digits[0..end], 10) catch return false;
+        return code == 401 or code == 403 or code == 408 or code == 429 or (code >= 500 and code <= 599);
+    }
+    const blind = [_][]const u8{
+        ERR_LOCAL_REFUSED, ERR_LOCAL_TIMED_OUT, ERR_LOCAL_DROPPED, ERR_CURL_NO_CONFIG, ERR_CURL_NO_SPAWN, ERR_CURL_NONZERO,
+        ERR_WRITE_BODY,    ERR_OOM,             KEY_STRAY_BYTE,    KEY_CFG_TOO_LONG,   net.MSG,           STOPPED,
+    };
+    for (blind) |t| if (std.mem.eql(u8, err_text, t)) return true;
+    return std.mem.startsWith(u8, err_text, ERR_CURL_EXIT);
+}
+
+test "knobBlindFailure: the credential, the provider's clock, the transport, the uplink and a request never sent say nothing about a knob; a body that rejects a parameter does" {
+    const blind = [_][]const u8{
+        "HTTP 401: {\"result\":null,\"success\":false,\"errors\":[{\"code\":10000,\"message\":\"Authentication error\"}],\"messages\":[]}",
+        "HTTP 403: {\"errors\":[{\"message\":\"forbidden\"}]}",
+        "HTTP 408: {\"errors\":[{\"message\":\"AiError: Request timeout\"}]}",
+        "HTTP 429: {\"errors\":[{\"code\":3040,\"message\":\"rate limited\"}]}",
+        "HTTP 500: internal error",
+        "HTTP 503: upstream unavailable",
+        ERR_CURL_EXIT ++ "curl: (28) Operation timed out after 240001 milliseconds with 0 bytes received",
+        ERR_CURL_EXIT,
+        ERR_CURL_NONZERO,
+        ERR_CURL_NO_CONFIG,
+        ERR_CURL_NO_SPAWN,
+        ERR_LOCAL_TIMED_OUT,
+        ERR_LOCAL_DROPPED,
+        ERR_LOCAL_REFUSED,
+        ERR_WRITE_BODY,
+        ERR_OOM,
+        KEY_STRAY_BYTE,
+        KEY_CFG_TOO_LONG,
+        net.MSG,
+        STOPPED,
+    };
+    for (blind) |t| if (!knobBlindFailure(t)) {
+        std.debug.print("\nread as evidence about the knob: {s}\n", .{t});
+        return error.TestUnexpectedResult;
+    };
+    const evidence = [_][]const u8{
+        "HTTP 400: {\"error\":{\"message\":\"Unrecognized request argument supplied: chat_template_kwargs\"}}",
+        "HTTP 422: {\"detail\":\"reasoning_effort: extra inputs are not permitted\"}",
+        "provider error: Unrecognized request argument supplied: thinking",
+        "provider error 5006: invalid parameter",
+        "no choices in LLM response",
+        "HTTP 4", // a clipped status is no status this list knows
+    };
+    for (evidence) |t| if (knobBlindFailure(t)) {
+        std.debug.print("\nread as saying nothing about the knob: {s}\n", .{t});
+        return error.TestUnexpectedResult;
+    };
 }
 
 /// This model has been seen reasoning: the trials may begin, and the engine doubles its output cap.
@@ -772,6 +1017,14 @@ pub const Step = struct {
     // Load-bearing for the narrated-write salvage: a fenced file body inside a cut reply is INCOMPLETE
     // even though it reads as a clean prefix, so committing it silently ships a truncated deliverable.
     truncated: bool = false,
+    // A STREAMED reply whose stream never said it ended: no finish_reason and no [DONE] (native: no done:true),
+    // and not stopped on our side (a Stop, the runaway breaker). curl writes its -w end marker after a cut transfer
+    // as well as a finished one (--max-time, a dropped connection), so the tail loop's end proves only that curl
+    // stopped. content/reasoning/calls hold what arrived before the cut, which may be missing its answer, its tool
+    // call or both. The provider said nothing about WHY it ended, so `truncated` (its "length") stays false.
+    // A signal for the caller: this file acts on it only to keep it out of the dataset's "stop" label and off the
+    // retry budget's "the provider answered" (completeStream).
+    incomplete: bool = false,
 
     pub fn deinit(self: *Step, gpa: std.mem.Allocator) void {
         gpa.free(self.content);
@@ -892,6 +1145,82 @@ fn callTimeoutS(local: bool, budget_tokens: u32) u32 {
     return @min(TIMEOUT_CEIL_S, @max(floor, derived));
 }
 
+/// How much room the starved-reasoning heal's raised call must be able to give the reasoning, as a multiple of the
+/// budget it starved in, at the starved call's own pace and before the raised call's deadline (healFits).
+const HEAL_ROOM_X: u32 = 2;
+
+/// May the starved-reasoning heal (completeBodyH) chain its raised call? Only when, at the starved call's own
+/// pace, the call raised from `budget_tokens` to `raised` output tokens can give the reasoning HEAL_ROOM_X times
+/// the room it starved in before its OWN deadline, callTimeoutS(local, raised), cuts it off.
+///
+/// WHY: the deadline does not follow the raise. callTimeoutS reaches TIMEOUT_CEIL_S at about 7800 tokens, so the
+/// heal's 8x raise of an 8192-token call (to 65536) bought tokens with no time to emit them. Measured on a slow
+/// hosted reasoner (2026-10-12, a plain-text rescue): the starved reply spent its 8192 tokens in 162 s, so at that
+/// pace the raised call's 240 s held about 12K tokens, half as much again, and the 65536-token heal ran ~236 s and
+/// ended with no answer - on top of a call that had already said, by its own pace, that there was no room.
+///
+/// THE PACE IS THIS CALL'S OWN LIVE SIGNAL, never a rate constant. A starved reply stopped at finish_reason
+/// "length", so it emitted its whole budget, and call_ms / budget_tokens is what one token cost on this provider,
+/// this model and this prompt, seconds ago. Prefill, the provider's queue and post()'s pacing ride inside it, so
+/// it errs slow: a provider faster than it loses a heal it might have survived, never the reverse.
+///
+/// THE ROOM IS NOT THE RAISE. The raised call does not have to spend its raised budget, only enough to finish what
+/// the starved one began: more than `budget_tokens`, otherwise unknown. Asking for room for all of `raised` (the
+/// first cut of this check) asked an 8x-raised call to fit in 8x the starved call's time. On a reasoner decoding
+/// 48-70 tok/s (Workers AI glm-5.3, measured) that refused every starved call over about 1.5-2K tokens - the
+/// engine's 3072-token compaction and handoff budgets could never heal - and left the 768-token distillation the
+/// heal was built for 22.5 s from refusal, which each of its measured 24-62 s first-byte stalls crossed. Twice the
+/// starve is the least a raised call is worth sending for, one more budget of reasoning past where it stopped, and
+/// it lets a starved call take up to half the raised call's deadline; the rescue above (1.48x) stays refused. A raised
+/// call this lets through can still run out, if the reasoning needs more than twice the starve: the line buys the
+/// retry a fair chance, not a guarantee, and costs at most one deadline when it loses. The model is learned either
+/// way (learnReasoningBudget runs first), so every later call asks for the floor up front.
+fn healFits(call_ms: u64, budget_tokens: u32, raised: u32, local: bool) bool {
+    const budget: u64 = @max(budget_tokens, 1);
+    const room: u64 = @min(@as(u64, raised), budget * HEAL_ROOM_X); // never more than the raise could hold
+    const projected_ms = call_ms *| room / budget;
+    return projected_ms <= @as(u64, callTimeoutS(local, raised)) * std.time.ms_per_s;
+}
+
+test "the starved-reasoning heal chains a raised call only when this call's own pace leaves the reasoning room to finish" {
+    // The 2026-10-12 rescue's numbers: 8192 tokens starved in 162_077 ms, raised 8x. The raised call gets no more
+    // time than the ceiling (the deadline does not follow the raise), and at that pace that is 1.48x the starve.
+    const raised = @max(8192 *| 8, REASONING_MIN_TOKENS);
+    try std.testing.expectEqual(@as(u32, 65536), raised);
+    try std.testing.expectEqual(TIMEOUT_CEIL_S, callTimeoutS(false, raised));
+    try std.testing.expect(!healFits(162_077, 8192, raised, false));
+    // The case the heal was built for (768 -> 8192) heals starved in seconds, and behind the longest measured
+    // first-byte stall (62 s) at the slowest measured decode (48 tok/s: 16 s for 768 tokens) as well.
+    const r768 = @max(768 *| 8, REASONING_MIN_TOKENS);
+    try std.testing.expect(healFits(12_000, 768, r768, false));
+    try std.testing.expect(healFits(62_000 + 16_000, 768, r768, false));
+    // The engine's compaction budget (3072 -> 24576) at that decode (64 s) behind a 24 s stall heals too. Room for
+    // the whole raise refused it past 30 s: no reasoner at 48-70 tok/s decodes 3072 tokens that fast.
+    try std.testing.expect(healFits(24_000 + 64_000, 3072, 3072 * 8, false));
+    try std.testing.expect(88_000 * @as(u64, 3072 * 8) / 3072 > @as(u64, callTimeoutS(false, 3072 * 8)) * std.time.ms_per_s);
+    // The line, read off the module's constants: a starved call may take the raised call's deadline over
+    // HEAL_ROOM_X. The room is a multiple of the starve, so the line is the same time at any budget.
+    const limit_ms: u64 = @as(u64, callTimeoutS(false, raised)) * std.time.ms_per_s / HEAL_ROOM_X;
+    try std.testing.expectEqual(callTimeoutS(false, raised), callTimeoutS(false, r768));
+    for ([_][2]u32{ .{ 8192, raised }, .{ 768, r768 } }) |c| {
+        try std.testing.expect(healFits(limit_ms, c[0], c[1], false));
+        try std.testing.expect(!healFits(limit_ms + 1, c[0], c[1], false));
+    }
+    // The room never asks for more than the raise holds: a raise under HEAL_ROOM_X times the budget is weighed whole
+    // (1100 tokens at 60 ms each is 66 s, inside that raise's own deadline; twice the starve would be 120 s).
+    try std.testing.expect(callTimeoutS(false, 1100) * std.time.ms_per_s < 120_000);
+    try std.testing.expect(healFits(60_000, 1000, 1100, false));
+    // A local call is weighed against the local deadline, which a raised budget never moves either.
+    try std.testing.expectEqual(TIMEOUT_FLOOR_LOCAL_S, callTimeoutS(true, raised));
+    try std.testing.expect(!healFits(162_077, 8192, raised, true));
+    // A degenerate zero budget cannot divide by zero, and is weighed as one token.
+    try std.testing.expect(healFits(1, 0, REASONING_MIN_TOKENS, false));
+}
+
+/// TEST SEAM: the duration completeBodyH's starved-reasoning heal weighs (healFits) in place of the one it measured.
+/// A test pins a pace it could otherwise only get by holding the stand-in's reply for minutes.
+var test_heal_call_ms: if (builtin.is_test) ?u64 else void = if (builtin.is_test) null else {};
+
 /// How far past its own --max-time streamAttempt's tail loop waits for curl before giving up on it.
 const STREAM_WALL_SLACK_S = 30;
 
@@ -987,6 +1316,19 @@ const KEY_CFG_TOO_LONG = std.fmt.comptimePrint("the API key is too long to hand 
 /// A call whose key holds a byte a curl config value cannot carry fails with this, before it writes anything. It
 /// quotes no part of the key: this message reaches the run log and the chat transcript.
 const KEY_STRAY_BYTE = "the API key holds a control byte, which a curl config value cannot carry: re-copy the key on its own";
+
+/// What postUrl answers with when a call fails at the transport, or before its request ever leaves this process
+/// (beside the two key refusals above). Named so that knobBlindFailure, which must tell these from a provider's
+/// verdict on the request, matches the texts postUrl really produces rather than copies of them.
+const ERR_LOCAL_REFUSED = "connect refused — is the local model server running?";
+const ERR_LOCAL_TIMED_OUT = "local model call timed out";
+const ERR_LOCAL_DROPPED = "local model call failed (connection dropped mid-reply)";
+const ERR_CURL_NO_CONFIG = "curl exited before it read its config";
+const ERR_CURL_NO_SPAWN = "curl failed to run";
+const ERR_CURL_EXIT = "curl exit: "; // + the head of curl's own stderr
+const ERR_CURL_NONZERO = "curl nonzero exit"; // ERR_CURL_EXIT when its message could not be formatted
+const ERR_WRITE_BODY = "could not write llm request";
+const ERR_OOM = "out of memory";
 
 /// Where `value` holds a byte a curl config value cannot carry, and which byte: `at` is its index. Enough for a message
 /// that tells the user where to look without quoting any of the key (desk chat.zig), and the shape gitvc's
@@ -1111,6 +1453,9 @@ var test_before_curl: if (builtin.is_test) ?*const fn () void else void = if (bu
 /// `budget_tokens` is the max_tokens/num_predict THIS body asked for — it sizes the deadline (see callTimeoutS).
 /// 0 means "unknown/tiny" and yields the historical floor.
 fn post(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const u8, base_url: []const u8, key: []const u8, body: []const u8, budget_tokens: u32) Reply {
+    // A STOPPED TURN SENDS NOTHING (stopRequested). Every request complete(), chat() and the heals make starts here,
+    // so this one check covers the re-sends that never asked: the knob-free one, the heals, the stream's fallback.
+    if (stopRequested()) return err(gpa, STOPPED);
     const url = std.fmt.allocPrint(gpa, "{s}/chat/completions", .{trimSlash(base_url)}) catch return oom(gpa);
     defer gpa.free(url);
     // OFFLINE FAST-FAIL, hosted only. Every call below is individually well-bounded (--connect-timeout 20),
@@ -1122,6 +1467,9 @@ fn post(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const u8
     // HOSTED-provider pacing: honor any active per-host 429 cooldown + the optional RPM cap before sending.
     // Local backends never rate-limit, so they skip it (and keep their long, retry-free timeout).
     if (!isLocal(base_url)) rate.acquire(io, base_url);
+    // ...and again once the pacing has let it go: a host's 429 cooldown can hold this call for many seconds, and a
+    // Stop pressed in them is one more request nobody wants.
+    if (stopRequested()) return err(gpa, STOPPED);
     return postUrl(gpa, io, run_dir, tag, url, key, body, isLocal(base_url), budget_tokens);
 }
 
@@ -1140,9 +1488,9 @@ fn postUrl(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const
             .cap = 8 << 20,
         })) {
             .ok => |resp| return .{ .content = resp.body, .ok = true },
-            .refused => return err(gpa, "connect refused — is the local model server running?"),
-            .timed_out => return err(gpa, "local model call timed out"),
-            .failed => return err(gpa, "local model call failed (connection dropped mid-reply)"),
+            .refused => return err(gpa, ERR_LOCAL_REFUSED),
+            .timed_out => return err(gpa, ERR_LOCAL_TIMED_OUT),
+            .failed => return err(gpa, ERR_LOCAL_DROPPED),
         }
     }
     // THE KEY NEVER TOUCHES DISK. curl reads this config from its stdin (keyToCurl), so the key is on no file, not
@@ -1162,7 +1510,7 @@ fn postUrl(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const
     defer gpa.free(lastpath);
     std.Io.Dir.cwd().writeFile(io, .{ .sub_path = reqpath, .data = body }) catch {
         std.Io.Dir.cwd().deleteFile(io, reqpath) catch {};
-        return err(gpa, "could not write llm request");
+        return err(gpa, ERR_WRITE_BODY);
     };
     // THE BODY IS THE CALL'S OWN. Calls sharing this dir and tag run at once (callPath), and curl reads the body
     // only when it starts: one .llmreq-<tag>.json for all of them let a sibling's write land first, and this call
@@ -1188,12 +1536,12 @@ fn postUrl(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const
     if (!local) av.appendSlice(gpa, &.{ "--retry", "1", "--retry-delay", "1", "--retry-connrefused", "--retry-all-errors", "--retry-max-time", "3" }) catch return oom(gpa);
     av.appendSlice(gpa, &.{ "-K", "-", "--data-binary", data_at, "-w", STREAM_STAT ++ "%{http_code}", url }) catch return oom(gpa);
     if (builtin.is_test) if (test_before_curl) |hold| hold();
-    const run = runCurl(gpa, io, av.items, cfg, 8 << 20) catch |e| return err(gpa, if (e == error.CurlTookNoConfig) "curl exited before it read its config" else "curl failed to run");
+    const run = runCurl(gpa, io, av.items, cfg, 8 << 20) catch |e| return err(gpa, if (e == error.CurlTookNoConfig) ERR_CURL_NO_CONFIG else ERR_CURL_NO_SPAWN);
     defer gpa.free(run.stderr);
     if (run.term != .exited or run.term.exited != 0) {
         defer gpa.free(run.stdout);
         // err() keeps its own copy, so the formatted message is freed here rather than orphaned per failed call.
-        const why = std.fmt.allocPrint(gpa, "curl exit: {s}", .{run.stderr[0..@min(run.stderr.len, 200)]}) catch return err(gpa, "curl nonzero exit");
+        const why = std.fmt.allocPrint(gpa, ERR_CURL_EXIT ++ "{s}", .{run.stderr[0..@min(run.stderr.len, 200)]}) catch return err(gpa, ERR_CURL_NONZERO);
         defer gpa.free(why);
         return err(gpa, why);
     }
@@ -1237,8 +1585,12 @@ pub fn chatTemp(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []
     defer gpa.free(body);
     var s = completeBody(gpa, io, run_dir, tag, base_url, key, model, body, mt);
     defer s.deinit(gpa);
+    // stopped while it ran, or refused for a Stop (STOPPED): the failure stands as it is, as in complete() - no knob
+    // verdict, no re-send
+    if (!s.ok and (std.mem.eql(u8, s.content, STOPPED) or stopRequested())) return err(gpa, s.content);
     if (s.ok and s.reasoning.len > 0) noteReasons(io, model);
-    if (pick.knob != .unknown) {
+    // a failure that never reached the knob teaches nothing about it (knobBlindFailure), as in complete()
+    if (pick.knob != .unknown and (s.ok or !knobBlindFailure(s.content))) {
         observeReasonOff(io, model, pick, s.ok, s.reasoning.len > 0);
         if (!s.ok and think_frag.len > 0) {
             if (std.mem.replaceOwned(u8, gpa, body, think_frag, "")) |bare| {
@@ -1283,8 +1635,13 @@ pub fn visionExtract(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, ta
 
 /// The agentic step: `messages_json` is the inside of "messages":[ … ] (caller-built, grows each turn);
 /// `tools_json` is the inside of "tools":[ … ]. Returns the assistant content OR parsed tool_calls.
-pub fn complete(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const u8, base_url: []const u8, key: []const u8, model: []const u8, messages_json: []const u8, tools_json: []const u8, max_tokens: u32, temperature: f32) Step {
+pub fn complete(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const u8, base_url: []const u8, key_in: []const u8, model: []const u8, messages_json: []const u8, tools_json: []const u8, max_tokens: u32, temperature: f32) Step {
     clearLastError();
+    // The key this turn already re-resolved for this endpoint and the key the caller holds, if any (KeySwap): the
+    // caller's copy may be the one a provider refused an hour ago. Every request below sends `key`.
+    const swapped = swappedKey(gpa, base_url, key_in);
+    defer if (swapped) |k| freeKey(gpa, k);
+    const key: []const u8 = swapped orelse key_in;
     if (isOllama(base_url)) return completeOllamaNative(gpa, io, run_dir, tag, base_url, key, model, messages_json, tools_json, max_tokens, temperature);
     const mt = effTokens(io, base_url, model, max_tokens);
     const temp_frag = tempFragOwned(gpa, io, model, temperature); // learned-quirk aware (Kimi temp=1, etc.)
@@ -1308,11 +1665,21 @@ pub fn complete(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []
         std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}]{s}{s},\"max_tokens\":{d}}}", .{ model, msgs_eff, temp_frag, think_frag, mt }) catch return stepErr(gpa, "oom");
     defer gpa.free(body);
     var step = completeBody(gpa, io, run_dir, tag, base_url, key, model, body, mt);
+    // A STOPPED TURN TAKES THE FAILURE AS IT IS. A call that failed while (or because) its turn was stopped goes no
+    // further: a failure the Stop caused - its curl killed, the request refused (STOPPED) - is no verdict on the knob,
+    // and every path below would put another request on the wire (post() refuses them, but the knob's trial would
+    // move first, and the ladder would spend a retry and announce one). A reply that came back is still a reply.
+    // A refusal post() already made for a Stop is taken as one without asking again: the engine's predicate is
+    // best-effort (a control.jsonl it cannot read answers "no Stop"), and a second read that disagreed with the
+    // first would send exactly the requests the refusal was for.
+    if (!step.ok and (std.mem.eql(u8, step.content, STOPPED) or stopRequested())) return step;
     // THE REPLY TEACHES THE KNOB. A reply with reasoning marks the model as one that reasons (the trials may
     // begin); the reply to a call that carried a candidate or a learned knob confirms or retires it; and a call
-    // a provider REJECTED for the knob is retried once without it, so a trial never costs the answer.
+    // a provider REJECTED for the knob is retried once without it, so a trial never costs the answer. A failure that
+    // never reached the knob (knobBlindFailure: a 401, a 408, a dead transfer, no uplink) does neither: the trial
+    // stays where it was, and the ladder below resends the same body.
     if (step.ok and step.reasoning.len > 0) noteReasons(io, model);
-    if (pick.knob != .unknown) {
+    if (pick.knob != .unknown and (step.ok or !knobBlindFailure(step.content))) {
         observeReasonOff(io, model, pick, step.ok, step.reasoning.len > 0);
         if (!step.ok and think_frag.len > 0) {
             if (std.mem.replaceOwned(u8, gpa, body, think_frag, "")) |bare| {
@@ -1356,9 +1723,12 @@ pub fn complete(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []
     // (streamAttempt falls back to complete on a broken stream). A 429 has already cooled the host down for
     // every other turn (postUrl -> rate.note429), and a Stop pressed during a wait ends the ladder at once.
     var attempt: usize = 0;
-    var fresh_key: ?[]const u8 = null; // a re-resolved credential, kept for the rest of this call's retries
-    defer if (fresh_key) |k| gpa.free(k);
+    var fresh_key: ?[]const u8 = null; // a re-resolved credential, kept for this call's retries (and the turn's: rememberKey)
+    defer if (fresh_key) |k| freeKey(gpa, k);
     while (!step.ok) : (attempt += 1) {
+        // A Stop that landed while the last attempt was out ends the ladder before it plans: no retry is spent and
+        // no "retrying in" frame is shown for a retry that would never be sent.
+        if (stopRequested()) break;
         const plan = retryPlan(base_url, model, attempt, step.content) orelse break;
         var hb: [128]u8 = undefined;
         var nb: [240]u8 = undefined;
@@ -1368,8 +1738,11 @@ pub fn complete(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []
         if (!retryWait(plan.wait_s)) break; // stopped: the failure surfaces now
         if (retry_rekey) |f| {
             if (f(gpa, base_url, fresh_key orelse key)) |k| {
-                if (fresh_key) |old| gpa.free(old);
+                if (fresh_key) |old| freeKey(gpa, old);
                 fresh_key = k;
+                // ...and for every later call this turn makes to this endpoint with the key the caller holds, streamed
+                // or not: the caller's copy is still the one that was refused (KeySwap)
+                rememberKey(gpa, base_url, key_in, k);
                 std.log.warn("llm[{s}/{s}] retrying with a re-resolved credential", .{ tag, model });
             }
         }
@@ -1498,6 +1871,8 @@ fn dumpMalformed(io: std.Io, run_dir: []const u8, tag: []const u8, msgs: []const
 }
 
 fn completeOllamaNative(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const u8, base_url: []const u8, key: []const u8, model: []const u8, messages_json: []const u8, tools_json: []const u8, max_tokens: u32, temperature: f32) Step {
+    // this path posts through postUrl, past post()'s Stop check: a stopped turn sends nothing here either
+    if (stopRequested()) return stepErr(gpa, STOPPED);
     const np: u32 = if (isThinking(model)) @max(max_tokens, NATIVE_THINK_TOKENS) else max_tokens;
     const temp_frag = tempFragOwned(gpa, io, model, temperature); // learned-quirk aware
     defer gpa.free(temp_frag);
@@ -1510,7 +1885,9 @@ fn completeOllamaNative(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8,
     // ordinary /api/chat path below, unchanged.
     if (tools_json.len > 0 and !caps.name_binding_ok and gemma4.canRenderFamily(caps.familyName())) {
         if (completeGemma4Raw(gpa, io, run_dir, tag, base_url, root, key, model, messages_json, tools_json, np, temp_frag)) |step| return step;
-        // rendering failed (malformed buffer): fall through rather than lose the turn
+        // rendering failed (malformed buffer): fall through rather than lose the turn - unless the turn was stopped
+        // while the raw request was out. The fall-through is a second request, and a stopped turn starts none.
+        if (stopRequested()) return stepErr(gpa, STOPPED);
     }
 
     const url = std.fmt.allocPrint(gpa, "{s}/api/chat", .{root}) catch return stepErr(gpa, "oom");
@@ -2954,7 +3331,17 @@ fn completeBodyH(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: [
     {
         learnReasoningBudget(io, model);
         const raised = @max(budget_tokens *| 8, REASONING_MIN_TOKENS);
-        if (raised > budget_tokens) {
+        // ...ONCE, and only when that retry has room to finish inside its own deadline (healFits): the lesson above
+        // is kept either way, so the next call to this model asks for the floor up front instead of starving again.
+        const local = isLocal(base_url);
+        const measured_ms: u64 = @intCast(@max(call_ms, 0));
+        const heal_ms: u64 = if (builtin.is_test) (test_heal_call_ms orelse measured_ms) else measured_ms;
+        const fits = healFits(heal_ms, budget_tokens, raised, local);
+        if (raised > budget_tokens and !fits)
+            std.log.info("llm[{s}/{s}] starved reasoning: at this call's pace ({d}ms for {d} tokens) a {d}-token retry's {d}s deadline leaves the reasoning no room to finish; not retried", .{ tag, model, heal_ms, budget_tokens, raised, callTimeoutS(local, raised) });
+        // Nor once the turn is stopped: post() would refuse the raised call anyway, and the caller would get that
+        // refusal in place of the reply the provider DID send. The starved reply goes back as it came.
+        if (raised > budget_tokens and fits and !stopRequested()) {
             if (withMaxTokens(gpa, body, raised)) |bigger| {
                 defer gpa.free(bigger);
                 gpa.free(content);
@@ -3091,6 +3478,13 @@ const StreamState = struct {
     p_in: u64 = 0,
     p_out: u64 = 0,
     p_cached: u64 = 0,
+    // Hosted SSE usage is FOLDED across chunks, never overwritten (handleSseStreamLine): what one chunk's `usage`
+    // means differs by provider, so the two readings are kept apart and p_out is the larger of them.
+    out_deltas: u64 = 0, // completion_tokens summed over chunks that carry no prompt count: per-chunk deltas
+    out_total: u64 = 0, // completion_tokens of the last chunk that carries a prompt count: a running total
+    // The stream SAID it ended with a finish_reason on some choice (SSE). [DONE] (native: done:true) sets `done`.
+    // A stream with neither that we did not stop ourselves ended early: Step.incomplete.
+    finish_seen: bool = false,
 
     fn deinit(st: *StreamState, gpa: std.mem.Allocator) void {
         st.content.deinit(gpa);
@@ -3355,15 +3749,29 @@ fn handleSseStreamLine(st: *StreamState, gpa: std.mem.Allocator, line: []const u
             }
         }
         if (ch.finish_reason) |fr| {
+            if (fr.len > 0) st.finish_seen = true;
             if (std.mem.eql(u8, fr, "length")) st.truncated = true;
             if (std.mem.eql(u8, fr, "tool_calls")) st.saw_tool_calls = true;
         }
     }
     if (parsed.value.usage) |u| {
-        st.p_in = u.prompt_tokens;
-        st.p_out = u.completion_tokens;
+        // USAGE IS FOLDED ACROSS CHUNKS, never taken from the last one. The dialects, measured:
+        //  - OpenAI-style: one usage block, on the final chunk, holding the totals.
+        //  - Workers AI: usage on EVERY chunk. The first carries the prompt with completion 0 (25220/0), each later
+        //    one prompt 0 and its OWN completion delta (1-7), and a completed stream ends with a zero chunk, a finish
+        //    chunk restating the totals (25220/<sum of the deltas>), then [DONE].
+        //  - Either one cut before its end (curl's --max-time, a dropped transfer) has no terminal chunk at all.
+        // Overwriting per chunk metered a cut Workers AI stream as its last delta: "in=0 out=2" for a call that read
+        // a 25220-token prompt and wrote 11394 tokens of reasoning, and the same zeros reached the turn's spend
+        // ceiling and every per-role cost row. So the prompt is the largest count seen, and the completion is the
+        // larger of the summed deltas (chunks with no prompt count) and the last running total (chunks with one):
+        // a completed Workers AI stream's restated total equals its deltas' sum and is counted once, the OpenAI
+        // block is its own total, and a provider that restates a growing total on every chunk keeps its latest.
+        st.p_in = @max(st.p_in, u.prompt_tokens);
+        if (u.prompt_tokens == 0) st.out_deltas +|= u.completion_tokens else st.out_total = u.completion_tokens;
+        st.p_out = @max(st.out_deltas, st.out_total);
         const nested: u64 = if (u.prompt_tokens_details) |dd| dd.cached_tokens else 0;
-        st.p_cached = @max(nested, @max(u.prompt_cache_hit_tokens, u.cached_tokens));
+        st.p_cached = @max(st.p_cached, @max(nested, @max(u.prompt_cache_hit_tokens, u.cached_tokens)));
         st.metered = true;
     }
 }
@@ -3505,9 +3913,17 @@ pub fn completeStream(
     // waiting out the whole generation. null ⇒ never aborts.
     should_abort: ?*const fn (ctx: *anyopaque) bool,
 ) Step {
-    if (streamAttempt(gpa, io, run_dir, tag, base_url, key, model, messages_json, tools_json, max_tokens, temperature, ctx, on_delta, should_abort)) |step| {
+    // The key this turn re-resolved for this endpoint and the caller's key (KeySwap), so a call after a rotation streams
+    // on it: with the refused key the stream fails silently (a 401 envelope is no SSE line) and the call falls back to
+    // a blocking complete() that pays the 401 again. The fallback below passes the caller's key; complete() swaps it.
+    const swapped = swappedKey(gpa, base_url, key);
+    defer if (swapped) |k| freeKey(gpa, k);
+    if (streamAttempt(gpa, io, run_dir, tag, base_url, swapped orelse key, model, messages_json, tools_json, max_tokens, temperature, ctx, on_delta, should_abort)) |step| {
         if (step.ok and step.reasoning.len > 0) noteReasons(io, model); // the answer is where reasoning is usually first seen
-        if (step.ok) noteProviderOk(base_url, model); // a streamed reply counts: the provider's failures in a row are over
+        // A streamed reply counts: the provider's failures in a row are over. A stream that never said it ended
+        // (Step.incomplete) does not: a cut transfer is not the provider answering. Nor does one that brought nothing
+        // at all, which only a Stop returns (stoppedStream, or a kill before the first byte): nobody answered.
+        if (step.ok and !step.incomplete and (step.content.len > 0 or step.reasoning.len > 0 or step.calls.len > 0)) noteProviderOk(base_url, model);
         return step;
     }
     return complete(gpa, io, run_dir, tag, base_url, key, model, messages_json, tools_json, max_tokens, temperature);
@@ -3548,7 +3964,25 @@ fn curlExited(io: std.Io, child: *std.process.Child, code: *?u32) bool {
     }
 }
 
-/// The streaming body. Returns a Step on a clean stream, or null to signal "fall back to complete()".
+/// The tail's word on a streamed reply returned as Step.incomplete (streamAttempt), logged only where one is returned.
+fn logIncompleteStream(curl_code: ?u32, streamed: usize) void {
+    std.log.scoped(.llm).warn("stream: ended without a finish_reason or [DONE] (curl exit {?d}, {d} bytes streamed): the reply is incomplete", .{ curl_code, streamed });
+}
+
+/// What a stream stopped before it started answers with: the shape a Stop mid-stream returns (streamAttempt's
+/// `aborted`), ok and holding what streamed - here nothing - so the caller's own Stop check commits it like any
+/// stopped partial. null only on OOM, which falls back to complete(), where post() refuses with STOPPED.
+fn stoppedStream(gpa: std.mem.Allocator) ?Step {
+    const c = gpa.dupe(u8, "") catch return null;
+    const r = gpa.dupe(u8, "") catch {
+        gpa.free(c);
+        return null;
+    };
+    return .{ .content = c, .reasoning = r, .calls = &.{}, .ok = true };
+}
+
+/// The streaming body. Returns a Step on a clean stream or a Stop (stoppedStream, the aborted partial), or null to
+/// signal "fall back to complete()".
 fn streamAttempt(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -3565,6 +3999,12 @@ fn streamAttempt(
     on_delta: *const fn (ctx: *anyopaque, kind: DeltaKind, text: []const u8) void,
     should_abort: ?*const fn (ctx: *anyopaque) bool,
 ) ?Step {
+    // A STOPPED TURN STARTS NO STREAM (stopRequested). The tail loop below kills a stream on a Stop, but only once curl
+    // is running: with the Stop already in, the config's close had sent the request before the loop's first lap could
+    // ask. It answers as a Stop mid-stream does (stoppedStream), never null, which would fall back to a blocking
+    // complete(). The turn's predicate, not this call's should_abort: on a chat turn both read the same control.jsonl,
+    // and a caller's own should_abort keeps the meaning it has always had, a kill once the stream is under way.
+    if (stopRequested()) return stoppedStream(gpa);
     const native = isOllama(base_url);
     const local = isLocal(base_url);
     // OFFLINE, hosted only: skip the streamed attempt entirely rather than spawn a curl that will spend 20s
@@ -3662,6 +4102,8 @@ fn streamAttempt(
     // HOSTED-provider pacing: honor any active per-host 429 cooldown + the optional RPM cap before this request
     // reaches the wire. Local backends never rate-limit. (A fallback to complete() re-paces at its own post().)
     if (!local) rate.acquire(io, base_url);
+    // ...and again after the pacing, as post() does: a cooldown can hold the call long enough for a Stop to land
+    if (stopRequested()) return stoppedStream(gpa);
 
     const stream_max_s: u32 = callTimeoutS(local, budget_tokens); // parity with post()/postUrl's --max-time
     var tt_buf: [16]u8 = undefined;
@@ -3882,6 +4324,16 @@ fn streamAttempt(
     // ---- decide: return a clean streamed Step, or null → complete() reparses authoritatively ----
     if (st.failed) return null; // an error line — let complete() surface the exact error
 
+    // DID THE STREAM SAY IT ENDED? A provider ends a stream with a finish_reason and [DONE] (native: done:true).
+    // Reaching curl's -w marker proves only that curl stopped: curl writes it after a --max-time cut or a dropped
+    // transfer too. Measured: a reasoning-only reply cut at the 240 s --max-time, with neither, came back ok and
+    // untruncated, went into the training set labelled "stop", and reset its provider's run of failures as if it
+    // had answered. What arrived is still returned below (the reasoning is real); it is marked, and the caller
+    // decides what an unfinished reply is worth (Step.incomplete). The warning is logged where such a reply is
+    // returned, not here: a stream that falls back to complete() below (nothing streamed - a 401 envelope, a curl
+    // that never ran - or tool calls it could not rebuild) returns no reply to call incomplete.
+    const incomplete = !st.done and !st.finish_seen;
+
     if (st.saw_tool_calls) {
         // Assemble the call(s) FROM THE STREAM — native from the single captured NDJSON line, hosted from the
         // per-index SSE fragments (ToolAccum). Returning them here avoids a second complete() inference just to
@@ -3899,7 +4351,8 @@ fn streamAttempt(
             };
             meterStream(&st, local, streamAttrib(io, tag, model, base_url, call_t0));
             reported = true;
-            const step = Step{ .content = c_owned, .reasoning = r_owned, .calls = calls, .ok = true, .truncated = st.truncated };
+            if (incomplete) logIncompleteStream(curl_code, offset);
+            const step = Step{ .content = c_owned, .reasoning = r_owned, .calls = calls, .ok = true, .truncated = st.truncated, .incomplete = incomplete };
             recordDataset(gpa, tag, model, base_url, body, &step, @intCast(@max(@divTrunc(std.Io.Timestamp.now(io, .real).nanoseconds - call_t0, std.time.ns_per_ms), 0)), st.p_in, st.p_out, false);
             return step;
         }
@@ -3916,7 +4369,8 @@ fn streamAttempt(
     };
     meterStream(&st, local, streamAttrib(io, tag, model, base_url, call_t0));
     reported = true;
-    const step = Step{ .content = c_owned, .reasoning = r_owned, .calls = &.{}, .ok = true, .truncated = st.truncated };
+    if (incomplete) logIncompleteStream(curl_code, offset);
+    const step = Step{ .content = c_owned, .reasoning = r_owned, .calls = &.{}, .ok = true, .truncated = st.truncated, .incomplete = incomplete };
     // THE headline record: the streamed chat answer is the turn the user actually saw.
     recordDataset(gpa, tag, model, base_url, body, &step, @intCast(@max(@divTrunc(std.Io.Timestamp.now(io, .real).nanoseconds - call_t0, std.time.ns_per_ms), 0)), st.p_in, st.p_out, false);
     return step;
@@ -3963,7 +4417,8 @@ fn recordDataset(
         .content = step.content,
         .reasoning = step.reasoning,
         .tool_calls = tc.items,
-        .finish_reason = if (step.truncated) "length" else if (step.calls.len > 0) "tool_calls" else "stop",
+        // "incomplete": a stream that never said it ended (Step.incomplete) - not a "stop", whatever arrived
+        .finish_reason = if (step.truncated) "length" else if (step.incomplete) "incomplete" else if (step.calls.len > 0) "tool_calls" else "stop",
         .ok = step.ok,
         .ms = ms,
         .tokens_in = tok_in,
@@ -3976,7 +4431,7 @@ fn trimSlash(s: []const u8) []const u8 {
     return if (s.len > 0 and s[s.len - 1] == '/') s[0 .. s.len - 1] else s;
 }
 fn oom(gpa: std.mem.Allocator) Reply {
-    return .{ .content = gpa.dupe(u8, "out of memory") catch @constCast("oom"), .ok = false };
+    return .{ .content = gpa.dupe(u8, ERR_OOM) catch @constCast("oom"), .ok = false };
 }
 /// A failed Reply holding its OWN copy of `msg`. The caller still owns `msg`: a message formatted for the call
 /// is freed by the caller after this returns (`defer gpa.free(why)`), never passed in straight from allocPrint.
@@ -4702,6 +5157,60 @@ test "completeStream SSE parser: reasoning + content deltas fire on_delta, accum
     try std.testing.expectEqualStrings("think ", st.reasoning.items);
     try std.testing.expectEqualStrings("think ", cap.reasoning.items);
     try std.testing.expect(st.metered and st.p_in == 11 and st.p_out == 2);
+    try std.testing.expect(!st.finish_seen); // this stream named no finish_reason; its [DONE] is what ended it
+}
+
+test "completeStream SSE parser: per-chunk usage meters a cut stream for what it read and wrote, and a finished one's restated total once" {
+    // Workers AI's dialect, measured on a cut sink: usage rides EVERY chunk - the first carries the prompt with
+    // completion 0, each later one prompt 0 and its own completion delta - and a cut stream has no terminal chunk.
+    const gpa = std.testing.allocator;
+    var cap: StreamCapture = .{};
+    defer cap.deinit(gpa);
+    const first = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"weighing \"}}],\"usage\":{\"prompt_tokens\":25220,\"completion_tokens\":0}}\n\n";
+    const deltas = [_]u64{ 1, 1, 3, 7, 2 };
+    var cut = StreamState{ .native = false, .ctx = &cap, .on_delta = StreamCapture.onDelta };
+    defer cut.deinit(gpa);
+    feedStream(&cut, gpa, first);
+    var sum: u64 = 0;
+    for (deltas) |d| {
+        var lb: [160]u8 = undefined;
+        feedStream(&cut, gpa, try std.fmt.bufPrint(&lb, "data: {{\"choices\":[{{\"delta\":{{\"reasoning_content\":\"x\"}}}}],\"usage\":{{\"prompt_tokens\":0,\"completion_tokens\":{d}}}}}\n\n", .{d}));
+        sum += d;
+    }
+    // the prompt that was read and every token that was written - not the last chunk's (0, 2)
+    try std.testing.expect(cut.metered);
+    try std.testing.expectEqual(@as(u64, 25220), cut.p_in);
+    try std.testing.expectEqual(sum, cut.p_out);
+    // ...and nothing said it ended: no finish_reason, no [DONE]
+    try std.testing.expect(!cut.finish_seen and !cut.done);
+
+    // The same stream finished: a zero finish chunk, the finish chunk restating the totals, [DONE]. The restated
+    // total and the deltas' sum are two readings of one count, so they agree and are counted once, not added.
+    var whole = StreamState{ .native = false, .ctx = &cap, .on_delta = StreamCapture.onDelta };
+    defer whole.deinit(gpa);
+    feedStream(&whole, gpa, first);
+    for (deltas) |d| {
+        var lb: [160]u8 = undefined;
+        feedStream(&whole, gpa, try std.fmt.bufPrint(&lb, "data: {{\"choices\":[{{\"delta\":{{\"reasoning_content\":\"x\"}}}}],\"usage\":{{\"prompt_tokens\":0,\"completion_tokens\":{d}}}}}\n\n", .{d}));
+    }
+    var tb: [320]u8 = undefined;
+    feedStream(&whole, gpa, try std.fmt.bufPrint(&tb, "data: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"length\"}}],\"usage\":{{\"prompt_tokens\":0,\"completion_tokens\":0}}}}\n\n" ++
+        "data: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"length\"}}],\"usage\":{{\"prompt_tokens\":25220,\"completion_tokens\":{d}}}}}\n\ndata: [DONE]\n\n", .{sum}));
+    try std.testing.expectEqual(@as(u64, 25220), whole.p_in);
+    try std.testing.expectEqual(sum, whole.out_total);
+    try std.testing.expectEqual(whole.out_deltas, whole.out_total);
+    try std.testing.expectEqual(sum, whole.p_out);
+    try std.testing.expect(whole.finish_seen and whole.done and whole.truncated);
+
+    // A provider that restates a GROWING total on every chunk (prompt included) keeps its latest, never a sum.
+    var running = StreamState{ .native = false, .ctx = &cap, .on_delta = StreamCapture.onDelta };
+    defer running.deinit(gpa);
+    feedStream(&running, gpa, "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}],\"usage\":{\"prompt_tokens\":40,\"completion_tokens\":1}}\n\n" ++
+        "data: {\"choices\":[{\"delta\":{\"content\":\"b\"}}],\"usage\":{\"prompt_tokens\":40,\"completion_tokens\":2}}\n\n" ++
+        "data: {\"choices\":[{\"delta\":{\"content\":\"c\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":40,\"completion_tokens\":3}}\n\ndata: [DONE]\n\n");
+    try std.testing.expectEqual(@as(u64, 40), running.p_in);
+    try std.testing.expectEqual(@as(u64, 3), running.p_out);
+    try std.testing.expect(running.finish_seen and !running.truncated);
 }
 
 test "completeStream SSE parser: an error chunk fails the stream; finish_reason tool_calls flags fallback" {
@@ -5035,6 +5544,128 @@ test "chat() sends what it claims to: the path, the model, and both message role
     try std.testing.expect(sys < usr);
     try std.testing.expect(std.mem.indexOf(u8, req, "\"role\":\"system\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, req, "\"role\":\"user\"") != null);
+}
+
+test "a starved reply is retried with room to reason when its pace leaves the raised call room, and left to its learned floor when not" {
+    // completeBodyH's starved-reasoning heal against a stand-in that starves EVERY request: reasoning, no content,
+    // cut at the budget. Requests are COUNTED, never timed: the stand-in answers at once, and a slow starve is the
+    // pace it took pinned through test_heal_call_ms, the paces of the measured calls the heal is weighed against.
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = if (builtin.os.tag == .windows) .{ .block = .global } else .{ .block = .{ .slice = std.mem.span(std.c.environ) } } });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const saved_tbl = quirk_tbl;
+    defer quirk_tbl = saved_tbl;
+    quirk_tbl = @splat(.{});
+    const saved_ms = test_heal_call_ms;
+    defer test_heal_call_ms = saved_ms;
+
+    const root = "zig-llm-starved-heal-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, root, .default_dir) catch {};
+
+    const starved = fakehttp.wire(
+        \\{"choices":[{"message":{"content":"","reasoning_content":"still weighing the options"},"finish_reason":"length"}],"usage":{"prompt_tokens":9,"completion_tokens":1}}
+    );
+
+    const Case = struct { model: []const u8, budget: u32, pace_ms: ?u64, posts: usize };
+    const cases = [_]Case{
+        // the shape the heal was built for (768 -> 8192), answered at once: far inside its deadline, so it heals
+        .{ .model = "test/starved-fast", .budget = 768, .pace_ms = null, .posts = 2 },
+        // the engine's compaction budget starved at 48 tok/s behind a 24 s first-byte stall: the raised call still
+        // has room for twice that, so it heals (room for the whole 8x raise would have refused it)
+        .{ .model = "test/starved-compact", .budget = 3072, .pace_ms = 24_000 + 64_000, .posts = 2 },
+        // the 2026-10-12 rescue: 8192 tokens starved in 162 s leave its raised call room for half as much again, so
+        // one request and no doomed second one
+        .{ .model = "test/starved-slow", .budget = 8192, .pace_ms = 162_077, .posts = 1 },
+    };
+    for (cases) |c| {
+        test_heal_call_ms = c.pace_ms;
+        var srv: fakehttp.Server = undefined;
+        try srv.start(io, starved);
+        var ub: [64]u8 = undefined;
+        // plain 127.0.0.1: the in-process loopback path, no curl child; local, so no offline probe either
+        const base = try std.fmt.bufPrint(&ub, "http://127.0.0.1:{d}/v1", .{srv.port});
+        var bb: [128]u8 = undefined;
+        const body = try std.fmt.bufPrint(&bb, "{{\"model\":\"{s}\",\"messages\":[],\"max_tokens\":{d}}}", .{ c.model, c.budget });
+        var step = completeBody(gpa, io, root, "heal", base, "", c.model, body, c.budget);
+        defer step.deinit(gpa);
+        srv.stop(); // joins the serve thread; countCalls is only safe after it
+
+        try std.testing.expectEqual(c.posts, srv.countCalls("POST", "/chat/completions"));
+        // either way the caller gets the honest starved reply: ok, cut, no answer
+        try std.testing.expect(step.ok and step.truncated);
+        try std.testing.expectEqualStrings("", step.content);
+        // ...and the lesson is learned before the deadline is weighed, so the next call starts at the floor
+        try std.testing.expect(reasoningBudgetFor(io, c.model));
+    }
+}
+
+test "a failure that never reached the reasoning-off knob leaves its trial where it was and buys no knob-free re-send; a body that rejects the knob still does" {
+    // complete() and chat() each carry the model's first trial knob (`template`) to a stand-in that answers every
+    // request the same way. Requests are counted at the stand-in, and the trial read back from the quirk table.
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = if (builtin.os.tag == .windows) .{ .block = .global } else .{ .block = .{ .slice = std.mem.span(std.c.environ) } } });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const saved_tbl = quirk_tbl;
+    defer quirk_tbl = saved_tbl;
+    // A hosted call, the probe at a stand-in of its own (HostedTurn), on an UNARMED thread: neither reply below is
+    // one its transient ladder retries, and curl's own --retry resends neither a 401 nor a 400, so every request the
+    // stand-in counts is one this file made.
+    var turn: HostedTurn = undefined;
+    try turn.begin(gpa, io);
+    defer turn.end(gpa);
+    disarmRetries();
+
+    const root = "zig-llm-knobtrial-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, root, .default_dir) catch {};
+
+    const auth_body = "{\"result\":null,\"success\":false,\"errors\":[{\"code\":10000,\"message\":\"Authentication error\"}],\"messages\":[]}";
+    const reject_body = "{\"error\":{\"message\":\"Unrecognized request argument supplied: chat_template_kwargs\",\"type\":\"invalid_request_error\"}}";
+    const Case = struct { what: []const u8, key: []const u8 = "key-a", reply: []const u8, posts: usize, trial: u8 };
+    const cases = [_]Case{
+        // the credential failed: nothing was learned about the knob, so the trial stays and nothing is re-sent
+        .{ .what = "HTTP 401", .reply = std.fmt.comptimePrint("HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ auth_body.len, auth_body }), .posts = 1, .trial = 0 },
+        // a key curl's config cannot carry is refused before anything is dialed (KEY_STRAY_BYTE): no provider saw it
+        .{ .what = "a key refused before the wire", .key = "key-a\nurl = \"http://127.1:9/\"", .reply = fakehttp.wire("{\"choices\":[{\"message\":{\"content\":\"answered\"}}]}"), .posts = 0, .trial = 0 },
+        // the body names the knob as the problem: the trial moves on, and the call goes again without it
+        .{ .what = "HTTP 400", .reply = std.fmt.comptimePrint("HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ reject_body.len, reject_body }), .posts = 2, .trial = 1 },
+    };
+    const m = "test/knob-trial";
+    for ([_][]const u8{ "complete", "chat" }) |entry| for (cases) |c| {
+        quirk_tbl = @splat(.{});
+        noteReasons(io, m); // seen reasoning: the trials begin, with the first candidate
+        // not vacuous: the call carries the trial knob its failure is weighed against
+        try std.testing.expect(reasonOffFor(io, "compact", m).knob == .template);
+        var srv: fakehttp.Server = undefined;
+        try srv.start(io, c.reply);
+        var ub: [64]u8 = undefined;
+        const base = try std.fmt.bufPrint(&ub, "http://127.1:{d}/v1", .{srv.port});
+        var ok = true;
+        if (std.mem.eql(u8, entry, "complete")) {
+            var s = complete(gpa, io, root, "compact", base, c.key, m, "{\"role\":\"user\",\"content\":\"fold this\"}", "", 64, -1);
+            ok = s.ok;
+            s.deinit(gpa);
+        } else {
+            const r = chat(gpa, io, root, "compact", base, c.key, m, "fold the turn", "fold this", 64);
+            ok = r.ok;
+            gpa.free(r.content);
+        }
+        srv.stop(); // joins the serve thread; request() and countCalls are only safe after it
+
+        const q = quirkFor(io, m);
+        const posts = srv.countCalls("POST", "/chat/completions");
+        if (ok or posts != c.posts or q.reason_off_trial != c.trial or q.reason_off != .unknown) {
+            std.debug.print("\n{s} on {s}: ok={}, {d} requests (want {d}), trial {d} (want {d}), knob {s}\n", .{ entry, c.what, ok, posts, c.posts, q.reason_off_trial, c.trial, @tagName(q.reason_off) });
+            return error.TestUnexpectedResult;
+        }
+        // ...and the first request that went out DID carry it
+        if (posts > 0) try std.testing.expect(std.mem.indexOf(u8, srv.request(), "chat_template_kwargs") != null);
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -5838,6 +6469,698 @@ test "a streamed call whose curl exits before its transfer falls back at once, n
     }
     try std.testing.expect(step.ok);
     try std.testing.expect(std.mem.indexOf(u8, srv.request(), "\"stream\":true") == null);
+}
+
+test "a streamed reply whose stream never said it ended comes back marked incomplete, and metered for what it read and wrote" {
+    // The real curl child against a stand-in whose Content-Length ends the transfer cleanly: curl exits 0 and writes
+    // its -w end marker, exactly as it does after a --max-time cut. Only the body differs between the cases.
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = if (builtin.os.tag == .windows) .{ .block = .global } else .{ .block = .{ .slice = std.mem.span(std.c.environ) } } });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const saved_tbl = quirk_tbl; // a reasoning reply teaches the model's quirks (noteReasons)
+    defer quirk_tbl = saved_tbl;
+    quirk_tbl = @splat(.{});
+
+    const root = "zig-llm-cutstream-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, root, .default_dir) catch {};
+
+    // Workers AI's dialect: the prompt on the first chunk, a completion delta on each later one. Reasoning only.
+    const head = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"weighing \"}}],\"usage\":{\"prompt_tokens\":25220,\"completion_tokens\":0}}\n\n" ++
+        "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"the \"}}],\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":3}}\n\n" ++
+        "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"options\"}}],\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":2}}\n\n";
+    // How it ENDS when it finishes: a zero finish chunk, the finish chunk restating the totals, [DONE].
+    const tail = "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":0}}\n\n" ++
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":25220,\"completion_tokens\":5}}\n\ndata: [DONE]\n\n";
+    const Case = struct { stream: []const u8, incomplete: bool };
+    const cases = [_]Case{
+        .{ .stream = fakehttp.wire(head), .incomplete = true }, // cut: no terminal chunk at all
+        .{ .stream = fakehttp.wire(head ++ tail), .incomplete = false },
+    };
+    const Probe = struct {
+        fn onDelta(ctx: *anyopaque, kind: DeltaKind, text: []const u8) void {
+            _ = ctx;
+            _ = kind;
+            _ = text;
+        }
+    };
+    for (cases) |c| {
+        var srv: fakehttp.Server = undefined;
+        const routes = [_]fakehttp.Route{.{ .method = "POST", .path = "/chat/completions", .reply = c.stream, .times = 1 }};
+        // a fallback to complete() would be answered with this, and fail the reasoning check below
+        try srv.startRouted(io, &routes, fakehttp.wire("{\"choices\":[{\"message\":{\"content\":\"fell back\"}}]}"));
+        var ub: [64]u8 = undefined;
+        // plain 127.0.0.1: the streamed path has no in-process fast path, so this is its curl child
+        const base = try std.fmt.bufPrint(&ub, "http://127.0.0.1:{d}/v1", .{srv.port});
+        const before = tokensSnapshot();
+        var ctx: u8 = 0;
+        var step = completeStream(gpa, io, root, "chat", base, "", "test/cut-stream", "{\"role\":\"user\",\"content\":\"hi\"}", "", 16, -1, &ctx, Probe.onDelta, null);
+        defer step.deinit(gpa);
+        srv.stop(); // joins the serve thread; conns is final after it
+        const after = tokensSnapshot();
+
+        // one streamed request and no fallback: what streamed IS the reply, finished or not
+        try std.testing.expectEqual(@as(u32, 1), srv.conns.load(.monotonic));
+        try std.testing.expect(step.ok);
+        try std.testing.expectEqualStrings("", step.content);
+        try std.testing.expectEqualStrings("weighing the options", step.reasoning);
+        try std.testing.expectEqual(c.incomplete, step.incomplete);
+        try std.testing.expect(!step.truncated); // no "length" was said: the cut is its own signal
+        // metered for the prompt it read and every token it wrote, cut or finished - and a finished one's restated
+        // total once, not on top of its deltas
+        try std.testing.expectEqual(@as(u64, 25220), after.in - before.in);
+        try std.testing.expectEqual(@as(u64, 5), after.out - before.out);
+    }
+}
+
+/// TEST ONLY: a chat turn's HOSTED calls, made against loopback stand-ins. `http://127.1:<port>/v1` is a hosted base
+/// to this file (isLocal and httpc.parseLoopbackUrl do not claim it) and 127.0.0.1 to curl, so the turn's retry
+/// budget, its re-resolves and post()'s offline probe all apply. The probe is pointed at a stand-in of its own
+/// (net.useEnviron) so no test knocks on the real internet; the hooks the engine installs start cleared, the ladder's
+/// waits take no time (test_retry_ms_per_s), and the thread's budget is armed. `end` undoes all of it, the probe
+/// override back to the empty one a test process starts with. Started in place: the stand-in's thread holds a pointer.
+const HostedTurn = struct {
+    probe: fakehttp.Server,
+    saved_notify: ?*const fn (text: []const u8) void,
+    saved_abort: ?*const fn () bool,
+    saved_rekey: ?*const fn (gpa: std.mem.Allocator, base_url: []const u8, key: []const u8) ?[]const u8,
+    saved_ms: u64,
+    saved_armed: bool,
+    saved_n: usize,
+
+    fn begin(self: *HostedTurn, gpa: std.mem.Allocator, io: std.Io) !void {
+        return self.beginWatched(gpa, io, null);
+    }
+
+    /// As begin, and `on_probe` runs on the probe stand-in's thread each time a call's offline probe arrives: the
+    /// moment a hosted call is held before the wire (post() and streamAttempt probe after their entry check and
+    /// before rate.acquire). net.invalidate() before a call makes it probe again.
+    fn beginWatched(self: *HostedTurn, gpa: std.mem.Allocator, io: std.Io, on_probe: ?fakehttp.OnRequest) !void {
+        const up = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"; // curl -I: a 200 is an uplink
+        if (on_probe) |f| try self.probe.startWatched(io, &.{}, up, f) else try self.probe.start(io, up);
+        errdefer self.probe.stop();
+        var env = std.process.Environ.Map.init(gpa);
+        defer env.deinit();
+        var ub: [64]u8 = undefined;
+        try env.put("NL_NET_PROBE_URL", try std.fmt.bufPrint(&ub, "http://127.0.0.1:{d}/", .{self.probe.port}));
+        net.useEnviron(&env);
+        net.invalidate(); // no verdict another test cached
+        self.saved_notify = retry_notify;
+        self.saved_abort = retry_abort;
+        self.saved_rekey = retry_rekey;
+        self.saved_ms = test_retry_ms_per_s;
+        self.saved_armed = retry_armed;
+        self.saved_n = retry_slots_n;
+        retry_notify = null;
+        retry_abort = null;
+        retry_rekey = null;
+        test_retry_ms_per_s = 0;
+        armRetries();
+    }
+
+    fn end(self: *HostedTurn, gpa: std.mem.Allocator) void {
+        disarmRetries(); // and with it every key the turn kept
+        retry_armed = self.saved_armed;
+        retry_slots_n = self.saved_n;
+        test_retry_ms_per_s = self.saved_ms;
+        retry_rekey = self.saved_rekey;
+        retry_abort = self.saved_abort;
+        retry_notify = self.saved_notify;
+        var empty = std.process.Environ.Map.init(gpa);
+        defer empty.deinit();
+        net.useEnviron(&empty);
+        net.invalidate();
+        self.probe.stop();
+    }
+};
+
+test "no request starts once the turn is stopped: complete(), chat() and a stream send nothing, and the same calls unstopped send one request each" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = if (builtin.os.tag == .windows) .{ .block = .global } else .{ .block = .{ .slice = std.mem.span(std.c.environ) } } });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const saved_tbl = quirk_tbl;
+    defer quirk_tbl = saved_tbl;
+    quirk_tbl = @splat(.{});
+    var turn: HostedTurn = undefined;
+    try turn.begin(gpa, io);
+    defer turn.end(gpa);
+    const Hooks = struct {
+        var stop: bool = false;
+        var notes: u32 = 0;
+        fn abort() bool {
+            return stop;
+        }
+        fn note(text: []const u8) void {
+            _ = text;
+            notes += 1;
+        }
+        fn onDelta(ctx: *anyopaque, kind: DeltaKind, text: []const u8) void {
+            _ = ctx;
+            _ = kind;
+            _ = text;
+        }
+    };
+    retry_abort = &Hooks.abort;
+    retry_notify = &Hooks.note;
+    Hooks.notes = 0;
+
+    const root = "zig-llm-stopgate-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, root, .default_dir) catch {};
+
+    const m = "test/stop-gate";
+    const msgs = "{\"role\":\"user\",\"content\":\"fold this\"}";
+    const routes = [_]fakehttp.Route{.{ .method = "POST", .path = "/chat/completions", .reply = fakehttp.wire("data: {\"choices\":[{\"delta\":{\"content\":\"streamed\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"), .has = &.{"\"stream\":true"} }};
+    for ([_]bool{ true, false }) |stopped| {
+        Hooks.stop = stopped;
+        var srv: fakehttp.Server = undefined;
+        try srv.startRouted(io, &routes, fakehttp.wire("{\"choices\":[{\"message\":{\"content\":\"answered\"}}]}"));
+        var ub: [64]u8 = undefined;
+        const base = try std.fmt.bufPrint(&ub, "http://127.1:{d}/v1", .{srv.port});
+        var s1 = complete(gpa, io, root, "compact", base, "key-a", m, msgs, "", 64, -1);
+        defer s1.deinit(gpa);
+        const r2 = chat(gpa, io, root, "screen", base, "key-a", m, "judge this", "fold this", 64);
+        defer gpa.free(r2.content);
+        var ctx: u8 = 0;
+        var s3 = completeStream(gpa, io, root, "chat", base, "key-a", m, msgs, "", 64, -1, &ctx, Hooks.onDelta, null);
+        defer s3.deinit(gpa);
+        srv.stop(); // joins the serve thread; conns is final after it
+
+        try std.testing.expectEqual(@as(u32, if (stopped) 0 else 3), srv.conns.load(.monotonic));
+        if (stopped) {
+            try std.testing.expect(!s1.ok);
+            try std.testing.expectEqualStrings(STOPPED, s1.content);
+            try std.testing.expect(!r2.ok);
+            try std.testing.expectEqualStrings(STOPPED, r2.content);
+            // the stream answers as a Stop mid-stream does: ok, holding what streamed - nothing - and no fallback
+            try std.testing.expect(s3.ok);
+            try std.testing.expectEqual(@as(usize, 0), s3.content.len + s3.reasoning.len + s3.calls.len);
+        } else {
+            try std.testing.expectEqualStrings("answered", s1.content);
+            try std.testing.expectEqualStrings("answered", r2.content);
+            try std.testing.expectEqualStrings("streamed", s3.content);
+        }
+        // nothing was retried or announced, and the provider's budget is whole either way
+        try std.testing.expectEqual(@as(u32, 0), Hooks.notes);
+        try std.testing.expectEqual(RETRY_MAX, retriesLeft(base, m));
+    }
+
+    // The native Ollama path posts through postUrl, past post(): completeOllamaNative asks for itself.
+    const saved_caps = caps;
+    defer caps = saved_caps;
+    caps = .{ .probed = true, .ollama_native = true, .reasoning = false };
+    for ([_]bool{ true, false }) |stopped| {
+        Hooks.stop = stopped;
+        var srv: fakehttp.Server = undefined;
+        try srv.start(io, fakehttp.wire("{\"message\":{\"role\":\"assistant\",\"content\":\"native\"},\"done\":true}"));
+        var ub: [64]u8 = undefined;
+        const base = try std.fmt.bufPrint(&ub, "http://127.0.0.1:{d}/v1", .{srv.port});
+        var s = complete(gpa, io, root, "compact", base, "", m, msgs, "", 64, -1);
+        defer s.deinit(gpa);
+        srv.stop();
+        try std.testing.expectEqual(@as(u32, if (stopped) 0 else 1), srv.conns.load(.monotonic));
+        try std.testing.expectEqual(!stopped, s.ok);
+        try std.testing.expectEqualStrings(if (stopped) STOPPED else "native", s.content);
+    }
+}
+
+test "a Stop that lands while a hosted call is held before the wire sends nothing: post() and a stream ask again once the pacing lets them go" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = if (builtin.os.tag == .windows) .{ .block = .global } else .{ .block = .{ .slice = std.mem.span(std.c.environ) } } });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const saved_tbl = quirk_tbl;
+    defer quirk_tbl = saved_tbl;
+    quirk_tbl = @splat(.{});
+    // The Stop lands when the call's offline probe reaches its stand-in: after the entry check has let the call in,
+    // before rate.acquire and the check behind it - so that second check alone decides, in post() and in
+    // streamAttempt each. Atomics: the probe stand-in's thread writes, the call's thread reads.
+    const Hooks = struct {
+        var stop = std.atomic.Value(bool).init(false);
+        var raise = std.atomic.Value(bool).init(true);
+        fn onProbe() void {
+            if (raise.load(.acquire)) stop.store(true, .release);
+        }
+        fn abort() bool {
+            return stop.load(.acquire);
+        }
+        fn onDelta(ctx: *anyopaque, kind: DeltaKind, text: []const u8) void {
+            _ = ctx;
+            _ = kind;
+            _ = text;
+        }
+    };
+    var turn: HostedTurn = undefined;
+    try turn.beginWatched(gpa, io, Hooks.onProbe);
+    defer turn.end(gpa);
+    retry_abort = &Hooks.abort;
+
+    const root = "zig-llm-heldstop-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, root, .default_dir) catch {};
+
+    const m = "test/held-stop";
+    const msgs = "{\"role\":\"user\",\"content\":\"fold this\"}";
+    const routes = [_]fakehttp.Route{.{ .method = "POST", .path = "/chat/completions", .reply = fakehttp.wire("data: {\"choices\":[{\"delta\":{\"content\":\"streamed\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"), .has = &.{"\"stream\":true"} }};
+    const Entry = enum { complete, stream };
+    // raised: the Stop lands mid-wait; not raised (the price): the same calls each put one request on the wire
+    for ([_]bool{ true, false }) |raise| for ([_]Entry{ .complete, .stream }) |entry| {
+        Hooks.raise.store(raise, .release);
+        Hooks.stop.store(false, .release);
+        net.invalidate(); // this call probes again, so the Stop lands inside it
+        const probes = turn.probe.conns.load(.monotonic);
+        var srv: fakehttp.Server = undefined;
+        try srv.startRouted(io, &routes, fakehttp.wire("{\"choices\":[{\"message\":{\"content\":\"answered\"}}]}"));
+        var ub: [64]u8 = undefined;
+        const base = try std.fmt.bufPrint(&ub, "http://127.1:{d}/v1", .{srv.port});
+        var ctx: u8 = 0;
+        var s = switch (entry) {
+            .complete => complete(gpa, io, root, "compact", base, "key-a", m, msgs, "", 64, -1),
+            .stream => completeStream(gpa, io, root, "chat", base, "key-a", m, msgs, "", 64, -1, &ctx, Hooks.onDelta, null),
+        };
+        defer s.deinit(gpa);
+        srv.stop(); // joins the serve thread; conns is final after it
+        // no probe reached the stand-in (a box whose curl cannot run one): nothing raised the Stop, so nothing to see
+        if (turn.probe.conns.load(.monotonic) == probes) return error.SkipZigTest;
+
+        const want: u32 = if (raise) 0 else 1;
+        if (srv.conns.load(.monotonic) != want) {
+            std.debug.print("\n{s}, Stop {s}: {d} requests reached the provider (want {d})\n", .{ @tagName(entry), if (raise) "raised before the wire" else "never raised", srv.conns.load(.monotonic), want });
+            return error.TestUnexpectedResult;
+        }
+        if (!raise) {
+            try std.testing.expectEqualStrings(if (entry == .complete) "answered" else "streamed", s.content);
+        } else if (entry == .complete) {
+            try std.testing.expect(!s.ok);
+            try std.testing.expectEqualStrings(STOPPED, s.content);
+        } else {
+            // as a Stop mid-stream answers: ok, nothing streamed, no blocking fallback
+            try std.testing.expect(s.ok);
+            try std.testing.expectEqual(@as(usize, 0), s.content.len + s.reasoning.len + s.calls.len);
+        }
+    };
+}
+
+test "a request refused for a Stop is not sent after all when the Stop cannot be read again: no knob verdict, no re-send, no retry" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = if (builtin.os.tag == .windows) .{ .block = .global } else .{ .block = .{ .slice = std.mem.span(std.c.environ) } } });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const saved_tbl = quirk_tbl;
+    defer quirk_tbl = saved_tbl;
+    var turn: HostedTurn = undefined;
+    try turn.begin(gpa, io);
+    defer turn.end(gpa);
+    // The engine's Stop predicate is best-effort: a control.jsonl it cannot open or read answers "no Stop". This one
+    // answers true once - post()'s entry check, which refuses the request with STOPPED - and false ever after.
+    const Hooks = struct {
+        var asked: u32 = 0;
+        var notes: u32 = 0;
+        fn abort() bool {
+            asked += 1;
+            return asked == 1;
+        }
+        fn note(text: []const u8) void {
+            _ = text;
+            notes += 1;
+        }
+    };
+    retry_abort = &Hooks.abort;
+    retry_notify = &Hooks.note;
+
+    const root = "zig-llm-stoponce-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, root, .default_dir) catch {};
+
+    const m = "test/stop-once";
+    for ([_][]const u8{ "complete", "chat" }) |entry| {
+        quirk_tbl = @splat(.{});
+        noteReasons(io, m); // seen reasoning: its calls carry the first trial knob, which a refusal must not move
+        Hooks.asked = 0;
+        Hooks.notes = 0;
+        var srv: fakehttp.Server = undefined;
+        try srv.start(io, fakehttp.wire("{\"choices\":[{\"message\":{\"content\":\"answered\"}}]}"));
+        var ub: [64]u8 = undefined;
+        const base = try std.fmt.bufPrint(&ub, "http://127.1:{d}/v1", .{srv.port});
+        var ok = true;
+        var got: [STOPPED.len + 16]u8 = undefined;
+        var got_len: usize = 0;
+        if (std.mem.eql(u8, entry, "complete")) {
+            var s = complete(gpa, io, root, "compact", base, "key-a", m, "{\"role\":\"user\",\"content\":\"fold this\"}", "", 64, -1);
+            defer s.deinit(gpa);
+            ok = s.ok;
+            got_len = @min(s.content.len, got.len);
+            @memcpy(got[0..got_len], s.content[0..got_len]);
+        } else {
+            const r = chat(gpa, io, root, "compact", base, "key-a", m, "fold the turn", "fold this", 64);
+            defer gpa.free(r.content);
+            ok = r.ok;
+            got_len = @min(r.content.len, got.len);
+            @memcpy(got[0..got_len], r.content[0..got_len]);
+        }
+        srv.stop(); // joins the serve thread; conns is final after it
+
+        const q = quirkFor(io, m);
+        const posts = srv.conns.load(.monotonic);
+        const spent = RETRY_MAX - retriesLeft(base, m);
+        if (ok or posts != 0 or Hooks.notes != 0 or spent != 0 or q.reason_off_trial != 0 or q.reason_off != .unknown) {
+            std.debug.print("\n{s}: ok={}, {d} requests (want 0), {d} retry notes (want 0), {d} retries spent (want 0), trial {d} (want 0), knob {s}\n", .{ entry, ok, posts, Hooks.notes, spent, q.reason_off_trial, @tagName(q.reason_off) });
+            return error.TestUnexpectedResult;
+        }
+        try std.testing.expectEqualStrings(STOPPED, got[0..got_len]);
+    }
+}
+
+test "a stream that never said it ended, or that a Stop left empty, is not the provider answering: its run of failures stands" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = if (builtin.os.tag == .windows) .{ .block = .global } else .{ .block = .{ .slice = std.mem.span(std.c.environ) } } });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const saved_tbl = quirk_tbl; // a reasoning reply teaches the model's quirks (noteReasons)
+    defer quirk_tbl = saved_tbl;
+    quirk_tbl = @splat(.{});
+    // A hosted, armed provider whose budget is part spent: noteProviderOk can only write RETRY_MAX back, so a full
+    // budget could never show whether a stream restored it.
+    var turn: HostedTurn = undefined;
+    try turn.begin(gpa, io);
+    defer turn.end(gpa);
+    const Hooks = struct {
+        var stop: bool = false;
+        fn abort() bool {
+            return stop;
+        }
+        fn onDelta(ctx: *anyopaque, kind: DeltaKind, text: []const u8) void {
+            _ = ctx;
+            _ = kind;
+            _ = text;
+        }
+    };
+    Hooks.stop = false;
+    retry_abort = &Hooks.abort;
+
+    const root = "zig-llm-okgate-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, root, .default_dir) catch {};
+
+    // Workers AI's dialect, reasoning only; cut, it has no terminal chunk and no [DONE].
+    const head = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"weighing \"}}],\"usage\":{\"prompt_tokens\":40,\"completion_tokens\":0}}\n\n" ++
+        "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"it\"}}],\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":2}}\n\n";
+    const tail = "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":40,\"completion_tokens\":2}}\n\ndata: [DONE]\n\n";
+    const Case = struct { what: []const u8, stream: []const u8, stopped: bool, answered: bool };
+    const cases = [_]Case{
+        .{ .what = "a cut stream", .stream = fakehttp.wire(head), .stopped = false, .answered = false },
+        .{ .what = "a stream stopped before it started", .stream = fakehttp.wire(head ++ tail), .stopped = true, .answered = false },
+        // the price: a stream that said it ended IS the provider answering, and its run of failures is over
+        .{ .what = "a finished stream", .stream = fakehttp.wire(head ++ tail), .stopped = false, .answered = true },
+    };
+    const m = "test/ok-gate";
+    for (cases) |c| {
+        var srv: fakehttp.Server = undefined;
+        // every request gets the stream: a fallback to complete() would fail to parse it and climb the ladder, and
+        // the request count below would show it
+        try srv.start(io, c.stream);
+        var ub: [64]u8 = undefined;
+        const base = try std.fmt.bufPrint(&ub, "http://127.1:{d}/v1", .{srv.port});
+        // one failure in a row on this provider, as a retry the ladder took leaves it
+        _ = retryPlan(base, m, 0, "HTTP 503: upstream unavailable") orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(RETRY_MAX - 1, retriesLeft(base, m));
+        Hooks.stop = c.stopped;
+        var ctx: u8 = 0;
+        var step = completeStream(gpa, io, root, "chat", base, "key-a", m, "{\"role\":\"user\",\"content\":\"hi\"}", "", 64, -1, &ctx, Hooks.onDelta, null);
+        defer step.deinit(gpa);
+        Hooks.stop = false;
+        srv.stop(); // joins the serve thread; conns is final after it
+
+        const posts = srv.conns.load(.monotonic);
+        const left = retriesLeft(base, m);
+        const want_left: u32 = if (c.answered) RETRY_MAX else RETRY_MAX - 1;
+        if (!step.ok or posts != @as(u32, if (c.stopped) 0 else 1) or left != want_left or (!c.stopped and step.incomplete == c.answered)) {
+            std.debug.print("\n{s}: ok={}, incomplete={}, {d} requests, {d} retries left (want {d})\n", .{ c.what, step.ok, step.incomplete, posts, left, want_left });
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+test "a Stop that lands while the engine-rendered request is out starts no /api/chat fallback behind it" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = if (builtin.os.tag == .windows) .{ .block = .global } else .{ .block = .{ .slice = std.mem.span(std.c.environ) } } });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const saved_abort = retry_abort;
+    defer retry_abort = saved_abort;
+    // a local gemma4 backend that failed the name-binding probe: a call with tools goes out engine-rendered first
+    const saved_caps = caps;
+    defer caps = saved_caps;
+    caps = .{ .probed = true, .ollama_native = true };
+    parseShowCaps("{\"details\":{\"family\":\"gemma4\"}}");
+    caps.name_binding_ok = false;
+    // The stand-in raises the Stop when a request arrives, before it answers: the raw request was already out.
+    const Hooks = struct {
+        var stop = std.atomic.Value(bool).init(false);
+        var raise = std.atomic.Value(bool).init(true);
+        fn onRequest() void {
+            if (raise.load(.acquire)) stop.store(true, .release);
+        }
+        fn abort() bool {
+            return stop.load(.acquire);
+        }
+    };
+    retry_abort = &Hooks.abort;
+
+    const root = "zig-llm-rawstop-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, root, .default_dir) catch {};
+
+    // /api/generate answers with something that is not its JSON, which completeGemma4Raw gives up on (null): the
+    // case that falls through to an ordinary /api/chat request.
+    const routes = [_]fakehttp.Route{.{ .method = "POST", .path = "/api/generate", .reply = fakehttp.wire("<html>Bad Gateway</html>") }};
+    for ([_]bool{ true, false }) |raise| {
+        Hooks.raise.store(raise, .release);
+        Hooks.stop.store(false, .release);
+        var srv: fakehttp.Server = undefined;
+        try srv.startWatched(io, &routes, fakehttp.wire("{\"message\":{\"role\":\"assistant\",\"content\":\"native\"},\"done\":true}"), Hooks.onRequest);
+        var ub: [64]u8 = undefined;
+        const base = try std.fmt.bufPrint(&ub, "http://127.0.0.1:{d}/v1", .{srv.port});
+        var s = complete(gpa, io, root, "chat", base, "", "test/raw-stop", "{\"role\":\"user\",\"content\":\"say something\"}", FAIL_TOOL, 32, -1);
+        defer s.deinit(gpa);
+        srv.stop(); // joins the serve thread; countCalls is only safe after it
+
+        // the raw request went out either way; the fallback only without the Stop (the price: one more request)
+        try std.testing.expectEqual(@as(usize, 1), srv.countCalls("POST", "/api/generate"));
+        try std.testing.expectEqual(@as(usize, if (raise) 0 else 1), srv.countCalls("POST", "/api/chat"));
+        try std.testing.expectEqual(!raise, s.ok);
+        try std.testing.expectEqualStrings(if (raise) STOPPED else "native", s.content);
+    }
+}
+
+test "a Stop that lands while a request is out ends the call with that request: no knob verdict or knob-free re-send, no starved-reasoning heal, no retry planned" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = if (builtin.os.tag == .windows) .{ .block = .global } else .{ .block = .{ .slice = std.mem.span(std.c.environ) } } });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const saved_tbl = quirk_tbl;
+    defer quirk_tbl = saved_tbl;
+    var turn: HostedTurn = undefined;
+    try turn.begin(gpa, io);
+    defer turn.end(gpa);
+    // The stand-in raises the Stop when its `stop_at`-th request arrives, before it answers: the request was already
+    // out, exactly as when a user presses Stop mid-call. Atomics: the serve thread writes, the call's thread reads.
+    const Hooks = struct {
+        var stop = std.atomic.Value(bool).init(false);
+        var arrived = std.atomic.Value(u32).init(0);
+        var stop_at: u32 = 1;
+        var notes: u32 = 0;
+        fn onRequest() void {
+            if (arrived.fetchAdd(1, .acq_rel) + 1 == stop_at) stop.store(true, .release);
+        }
+        fn abort() bool {
+            return stop.load(.acquire);
+        }
+        fn note(text: []const u8) void {
+            _ = text;
+            notes += 1;
+        }
+    };
+    retry_abort = &Hooks.abort;
+    retry_notify = &Hooks.note;
+
+    const root = "zig-llm-midstop-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, root, .default_dir) catch {};
+
+    // 4xx replies: curl's own --retry (a hosted call's) resends a 5xx or a 408/429 itself, and the counts below are of
+    // requests this file made.
+    const reject_body = "{\"error\":{\"message\":\"Unrecognized request argument supplied: chat_template_kwargs\",\"type\":\"invalid_request_error\"}}";
+    const auth_body = "{\"result\":null,\"success\":false,\"errors\":[{\"code\":10000,\"message\":\"Authentication error\"}],\"messages\":[]}";
+    const Case = struct { what: []const u8, entry: enum { complete, chat }, model: []const u8, knob: bool, reply: []const u8, stop_at: u32, posts: usize, ok: bool, notes: u32, spent: u32 };
+    const cases = [_]Case{
+        // the body rejects the trial knob, but the turn was stopped meanwhile: the knob keeps its trial, nothing is re-sent
+        .{ .what = "knob/complete", .entry = .complete, .model = "test/midstop-knob", .knob = true, .reply = std.fmt.comptimePrint("HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ reject_body.len, reject_body }), .stop_at = 1, .posts = 1, .ok = false, .notes = 0, .spent = 0 },
+        .{ .what = "knob/chat", .entry = .chat, .model = "test/midstop-knob", .knob = true, .reply = std.fmt.comptimePrint("HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ reject_body.len, reject_body }), .stop_at = 1, .posts = 1, .ok = false, .notes = 0, .spent = 0 },
+        // a starved reply comes back while the Stop lands: no raised call behind it, and the reply stands as sent
+        .{ .what = "starved", .entry = .complete, .model = "test/midstop-starved", .knob = false, .reply = fakehttp.wire("{\"choices\":[{\"message\":{\"content\":\"\",\"reasoning_content\":\"still weighing\"},\"finish_reason\":\"length\"}]}"), .stop_at = 1, .posts = 1, .ok = true, .notes = 0, .spent = 0 },
+        // the ladder's first retry is out when the Stop lands: one retry was announced and spent, no second is planned
+        .{ .what = "ladder", .entry = .complete, .model = "test/midstop-ladder", .knob = false, .reply = std.fmt.comptimePrint("HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ auth_body.len, auth_body }), .stop_at = 2, .posts = 2, .ok = false, .notes = 1, .spent = 1 },
+    };
+    for (cases) |c| {
+        quirk_tbl = @splat(.{});
+        if (c.knob) noteReasons(io, c.model); // seen reasoning: its auxiliary calls carry the first trial knob
+        Hooks.stop.store(false, .release);
+        Hooks.arrived.store(0, .release);
+        Hooks.stop_at = c.stop_at;
+        Hooks.notes = 0;
+        var srv: fakehttp.Server = undefined;
+        try srv.startWatched(io, &.{}, c.reply, Hooks.onRequest);
+        var ub: [64]u8 = undefined;
+        const base = try std.fmt.bufPrint(&ub, "http://127.1:{d}/v1", .{srv.port});
+        var ok = false;
+        var reasoning_kept = false;
+        // 2048 tokens: a starved reply's raised call (8x) then fits its deadline at any pace under 30 s (healFits), so
+        // only the Stop can be what keeps it from going out
+        switch (c.entry) {
+            .complete => {
+                var s = complete(gpa, io, root, "compact", base, "key-a", c.model, "{\"role\":\"user\",\"content\":\"fold this\"}", "", 2048, -1);
+                defer s.deinit(gpa);
+                ok = s.ok;
+                reasoning_kept = s.ok and s.truncated and std.mem.eql(u8, s.reasoning, "still weighing");
+            },
+            .chat => {
+                const r = chat(gpa, io, root, "compact", base, "key-a", c.model, "fold the turn", "fold this", 2048);
+                defer gpa.free(r.content);
+                ok = r.ok;
+            },
+        }
+        srv.stop(); // joins the serve thread; request() and countCalls are only safe after it
+
+        const q = quirkFor(io, c.model);
+        const posts = srv.countCalls("POST", "/chat/completions");
+        const spent = RETRY_MAX - retriesLeft(base, c.model);
+        if (posts != c.posts or ok != c.ok or Hooks.notes != c.notes or spent != c.spent or q.reason_off_trial != 0 or q.reason_off != .unknown) {
+            std.debug.print("\n{s}: {d} requests (want {d}), ok={} (want {}), {d} retry notes (want {d}), {d} retries spent (want {d}), trial {d} (want 0), knob {s}\n", .{ c.what, posts, c.posts, ok, c.ok, Hooks.notes, c.notes, spent, c.spent, q.reason_off_trial, @tagName(q.reason_off) });
+            return error.TestUnexpectedResult;
+        }
+        if (c.knob) try std.testing.expect(std.mem.indexOf(u8, srv.request(), "chat_template_kwargs") != null); // it DID carry the knob
+        if (c.ok) try std.testing.expect(reasoning_kept);
+    }
+}
+
+test "a credential re-resolved after a 401 serves the rest of the turn: later calls send it, streamed or not, and pay no 401 and no re-resolve" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = if (builtin.os.tag == .windows) .{ .block = .global } else .{ .block = .{ .slice = std.mem.span(std.c.environ) } } });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var turn: HostedTurn = undefined;
+    try turn.begin(gpa, io);
+    defer turn.end(gpa);
+    // The engine's re-resolve stands in for Cloudflare's OAuth: once the token has rotated, the turn's key resolves to
+    // the new one. Counted on the call's own thread, like the retry notes.
+    const Hooks = struct {
+        var rotated: bool = false;
+        var rekeys: u32 = 0;
+        var auth_notes: u32 = 0;
+        fn rekey(a: std.mem.Allocator, base_url: []const u8, key: []const u8) ?[]const u8 {
+            _ = base_url;
+            rekeys += 1;
+            if (!rotated or !std.mem.eql(u8, key, "key-old")) return null;
+            return a.dupe(u8, "key-new") catch null;
+        }
+        fn note(text: []const u8) void {
+            if (std.mem.indexOf(u8, text, "HTTP 401") != null) auth_notes += 1;
+        }
+        fn onDelta(ctx: *anyopaque, kind: DeltaKind, text: []const u8) void {
+            _ = ctx;
+            _ = kind;
+            _ = text;
+        }
+    };
+    Hooks.rotated = false;
+    Hooks.rekeys = 0;
+    Hooks.auth_notes = 0;
+    retry_rekey = &Hooks.rekey;
+    retry_notify = &Hooks.note;
+
+    const root = "zig-llm-keyswap-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, root, .default_dir) catch {};
+
+    // Cloudflare's 401 for an expired access token, and a stand-in that tells the two keys apart by the header curl sent.
+    const auth_body = "{\"result\":null,\"success\":false,\"errors\":[{\"code\":10000,\"message\":\"Authentication error\"}],\"messages\":[]}";
+    const R_BEFORE = 0;
+    const R_OLD = 1;
+    const R_STREAM = 2;
+    const R_NEW = 3;
+    const routes = [_]fakehttp.Route{
+        // before the rotation the turn's key is good (once: the first call)
+        .{ .method = "POST", .path = "/chat/completions", .reply = fakehttp.wire("{\"choices\":[{\"message\":{\"content\":\"before\"}}]}"), .times = 1, .has = &.{"Authorization: Bearer key-old"} },
+        // after it, every request carrying it is refused - a streamed one too, silently: a 401 envelope is no SSE line
+        .{ .method = "POST", .path = "/chat/completions", .reply = std.fmt.comptimePrint("HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ auth_body.len, auth_body }), .has = &.{"Authorization: Bearer key-old"} },
+        .{ .method = "POST", .path = "/chat/completions", .reply = fakehttp.wire("data: {\"choices\":[{\"delta\":{\"content\":\"streamed\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"), .has = &.{ "Authorization: Bearer key-new", "\"stream\":true" } },
+        .{ .method = "POST", .path = "/chat/completions", .reply = fakehttp.wire("{\"choices\":[{\"message\":{\"content\":\"after\"}}]}"), .has = &.{"Authorization: Bearer key-new"} },
+    };
+    var srv: fakehttp.Server = undefined;
+    try srv.startRouted(io, &routes, fakehttp.wire("{\"error\":{\"message\":\"no route took this request\"}}"));
+    var srv_up = true;
+    defer if (srv_up) srv.stop();
+    var ub: [64]u8 = undefined;
+    const base = try std.fmt.bufPrint(&ub, "http://127.1:{d}/v1", .{srv.port});
+    const m = "test/keyswap";
+    const msgs = "{\"role\":\"user\",\"content\":\"next step\"}";
+
+    const Want = struct { content: []const u8, rekeys: u32, auth_notes: u32 };
+    const Call = struct {
+        fn blocking(io_: std.Io, base_: []const u8, want: Want) !void {
+            var s = complete(std.testing.allocator, io_, "zig-llm-keyswap-tmp", "chat", base_, "key-old", m, msgs, "", 64, -1);
+            defer s.deinit(std.testing.allocator);
+            try expectCall(s, want);
+        }
+        fn streamed(io_: std.Io, base_: []const u8, want: Want) !void {
+            var ctx: u8 = 0;
+            var s = completeStream(std.testing.allocator, io_, "zig-llm-keyswap-tmp", "chat", base_, "key-old", m, msgs, "", 64, -1, &ctx, Hooks.onDelta, null);
+            defer s.deinit(std.testing.allocator);
+            try expectCall(s, want);
+        }
+        fn expectCall(s: Step, want: Want) !void {
+            if (!s.ok or !std.mem.eql(u8, s.content, want.content) or Hooks.rekeys != want.rekeys or Hooks.auth_notes != want.auth_notes) {
+                std.debug.print("\ngot ok={} \"{s}\" after {d} re-resolves and {d} announced 401s; want \"{s}\", {d}, {d}\n", .{ s.ok, s.content, Hooks.rekeys, Hooks.auth_notes, want.content, want.rekeys, want.auth_notes });
+                return error.TestUnexpectedResult;
+            }
+        }
+    };
+    // 1. the turn's key is good
+    try Call.blocking(io, base, .{ .content = "before", .rekeys = 0, .auth_notes = 0 });
+    Hooks.rotated = true;
+    // 2. it expired: one 401, one re-resolve, and the retry with the fresh key lands - what every call used to pay
+    try Call.blocking(io, base, .{ .content = "after", .rekeys = 1, .auth_notes = 1 });
+    // 3. a later blocking call of the same turn sends the fresh key at once: no 401, no re-resolve
+    try Call.blocking(io, base, .{ .content = "after", .rekeys = 1, .auth_notes = 1 });
+    // 4. and a streamed one STREAMS on it, instead of a silent 401 and a blocking fallback that pays one more
+    try Call.streamed(io, base, .{ .content = "streamed", .rekeys = 1, .auth_notes = 1 });
+    // THE PRICE OF FORGETTING IT: a new turn on this thread (arm) starts from the caller's key, so its first call pays
+    // the 401 and the re-resolve once more - the cost every call of the old turn paid - and its next one does not.
+    disarmRetries();
+    armRetries();
+    try Call.blocking(io, base, .{ .content = "after", .rekeys = 2, .auth_notes = 2 });
+    try Call.blocking(io, base, .{ .content = "after", .rekeys = 2, .auth_notes = 2 });
+    srv.stop(); // joins the serve thread; the route counts are final after it
+    srv_up = false;
+
+    // From the stand-in's side: the old key was refused once per turn, the streamed call streamed, and every other
+    // request after the rotation carried the fresh key.
+    try std.testing.expectEqual(@as(u32, 1), srv.used[R_BEFORE]);
+    try std.testing.expectEqual(@as(u32, 2), srv.used[R_OLD]);
+    try std.testing.expectEqual(@as(u32, 1), srv.used[R_STREAM]);
+    try std.testing.expectEqual(@as(u32, 4), srv.used[R_NEW]);
+    try std.testing.expectEqual(@as(usize, 8), srv.countCalls("POST", "/chat/completions"));
 }
 
 test "the scratch sweeps know a call's own body from the copy a replay starts from" {

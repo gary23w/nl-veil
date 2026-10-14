@@ -541,13 +541,43 @@ pub fn resolveToken(app: *App, uid: u64, alloc: std.mem.Allocator) ?Token {
     return finishToken(alloc, access, account);
 }
 
+/// The Token resolveToken hands out, every field `alloc`-owned except an `account_id` that could not be copied ("",
+/// which the callers already skip freeing). The base is workersAiBase's own allocation, handed over as is: it used
+/// to be duped, and the copy it was duped from was never freed, so with a non-arena allocator every resolve leaked
+/// one base URL - every credential re-resolve a retry asked for (engine.zig llmRetryRekey) and every turn's cf_
+/// belt token. workersAiBase answers an allocation failure with a static "" (a real base is never empty), so an
+/// empty one means nothing to free and no token: the key copied before it goes back too.
 fn finishToken(alloc: std.mem.Allocator, access: []const u8, account: []const u8) ?Token {
     if (account.len == 0) return null;
-    return .{
-        .key = alloc.dupe(u8, access) catch return null,
-        .base_url = alloc.dupe(u8, workersAiBase(alloc, account)) catch return null,
-        .account_id = alloc.dupe(u8, account) catch "",
+    const key = alloc.dupe(u8, access) catch return null;
+    const base = workersAiBase(alloc, account);
+    if (base.len == 0) {
+        alloc.free(key);
+        return null;
+    }
+    return .{ .key = key, .base_url = base, .account_id = alloc.dupe(u8, account) catch "" };
+}
+
+test "finishToken hands every field it allocates to the caller, an allocation failure at any point included" {
+    // The fields freed the way the callers free them (engine.zig llmRetryRekey): key and base always, the account
+    // id when it is not "". Under std.testing.allocator a base duped from an orphaned copy leaks on the first run.
+    const Run = struct {
+        fn once(a: std.mem.Allocator) !void {
+            const t = finishToken(a, "access-token", "0123456789abcdef") orelse return error.OutOfMemory;
+            defer a.free(t.key);
+            defer a.free(t.base_url);
+            defer if (t.account_id.len > 0) a.free(t.account_id);
+            try std.testing.expectEqualStrings("access-token", t.key);
+            try std.testing.expectEqualStrings("https://api.cloudflare.com/client/v4/accounts/0123456789abcdef/ai/v1", t.base_url);
+            // an account id that could not be copied is the one allocation failure finishToken absorbs: report it
+            // as the failure it was, so checkAllAllocationFailures sees every failing allocation surface
+            if (t.account_id.len == 0) return error.OutOfMemory;
+            try std.testing.expectEqualStrings("0123456789abcdef", t.account_id);
+        }
     };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Run.once, .{});
+    // no account, no token, and nothing allocated for it
+    try std.testing.expect(finishToken(std.testing.allocator, "access-token", "") == null);
 }
 
 test "refreshPlan: a live token never waits, a failed refresh backs off, only an expired token waits" {
