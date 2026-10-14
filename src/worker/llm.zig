@@ -750,6 +750,319 @@ test "a retired reasoning-off knob stays retired through the store merge, and a 
     try std.testing.expectEqual(@as(u8, 0), old.value.reason_off_trial);
 }
 
+/// THE OPERATOR'S REASONING-EFFORT DIAL: HOW HARD A MODEL THINKS, NOT WHETHER. The reasoning-off trials above ask one
+/// question per model - is there a knob that SILENCES its reasoning - and retire any knob whose reply still carries
+/// some. A provider can have a knob that only turns reasoning DOWN: Workers AI documents `reasoning_effort` low | high
+/// | max for @cf/zai-org/glm-5.3, default max ("reasoning cannot be disabled"; none/minimal/medium/xhigh alias to max).
+/// Measured on glm-5.3-flash (2026-10-08): `low` took a search-query call from 2229 reasoning chars / 12.9 s to 0 /
+/// 1.1 s, a plan recheck from 1698 / 11.8 s to 0 / 1.5 s, a reflect call from ~2000 / 7.9 s to 333 / 4.7 s - and the
+/// trials retired it, because 333 is not 0. The calls that keep their reasoning (chat, plan, recon, loop) never send
+/// an effort at all: in the SWE-bench baseline every coding step ran at the provider's max, ~49 tok/s, 60-145 s a
+/// productive step, and steps cut at the 240 s deadline.
+///
+/// So the operator may set one: NL_REASONING_EFFORT = low | high | max (any case, trimmed; empty, unset or anything
+/// else is OFF), read by the engine per turn and armed on the turn's thread (armReasoningEffort). An armed call sends
+/// `,"reasoning_effort":"<v>"` when ALL of these hold (effortPick): the endpoint is hosted (a local server has no such
+/// parameter to honour; isLocal is the line every hosted-only rule here draws), the model has been SEEN reasoning
+/// (Quirk.reasons, the observation that starts the trials: a model never seen reasoning gets the bytes it always got),
+/// no reasoning-off knob goes out on the call (a trial or learned knob is the stronger claim on the same reasoning, and
+/// the `effort` knob IS this key: two of them would be a body a provider may refuse or read either way), and the
+/// provider has not refused the dial for this model in this process (effortRefused). Unarmed, a request is
+/// byte-identical to one built before the dial existed: nothing is read and no lock is taken.
+///
+/// It is NOT learned and never persisted: observeReasonOff never sees it, provider_quirks.jsonl never holds it, and
+/// nothing about any model's reasoning is inferred from the replies it brings. The one thing kept is a refusal, in RAM.
+///
+/// NESTING. armReasoningEffort returns the value it replaced and restoreReasoningEffort puts it back, so a turn nested
+/// on its parent's thread (spawnTurn's inline fallback, when no thread can be spawned) runs on its own reading of the
+/// env and hands the parent's dial back when it ends: the parent neither inherits a nested turn's setting nor loses its
+/// own. The retry budget beside it does not do this (a nested turn's disarm leaves the parent unarmed for the rest of
+/// its turn - see KeySwap); the dial has no per-turn state to forget, so restoring it costs nothing. A thread no turn
+/// armed (a swarm worker) never sends it.
+pub const ReasoningEffort = enum { off, low, high, max };
+
+/// The dial's setting from an env value: low | high | max in any case, surrounding whitespace trimmed; anything else -
+/// empty, unset, a typo, a level some provider aliases (medium, xhigh) - is OFF, never a guess at what was meant.
+pub fn parseReasoningEffort(v: ?[]const u8) ReasoningEffort {
+    const t = std.mem.trim(u8, v orelse return .off, " \t\r\n");
+    inline for (.{ ReasoningEffort.low, ReasoningEffort.high, ReasoningEffort.max }) |e| {
+        if (std.ascii.eqlIgnoreCase(t, @tagName(e))) return e;
+    }
+    return .off;
+}
+
+/// The key the dial sends, as the provider documents it - and what a provider that refuses the dial names in its
+/// rejection (effortSuspect).
+const EFFORT_KEY = "reasoning_effort";
+
+/// The bytes the dial splices into a request body, spelled as the provider documents them.
+fn effortFrag(e: ReasoningEffort) []const u8 {
+    return switch (e) {
+        .off => "",
+        .low => ",\"" ++ EFFORT_KEY ++ "\":\"low\"",
+        .high => ",\"" ++ EFFORT_KEY ++ "\":\"high\"",
+        .max => ",\"" ++ EFFORT_KEY ++ "\":\"max\"",
+    };
+}
+
+/// The dial armed on this thread: set by the engine for one turn, .off everywhere else.
+threadlocal var effort_dial: ReasoningEffort = .off;
+
+/// Arm the dial for the turn on this thread; returns the setting it replaced, for restoreReasoningEffort (NESTING).
+pub fn armReasoningEffort(e: ReasoningEffort) ReasoningEffort {
+    const prev = effort_dial;
+    effort_dial = e;
+    return prev;
+}
+
+/// Put back what armReasoningEffort replaced, at the turn's exit (every path: the engine defers it).
+pub fn restoreReasoningEffort(prev: ReasoningEffort) void {
+    effort_dial = prev;
+}
+
+/// MODELS WHOSE PROVIDER REFUSED THE DIAL, this process only. A call carrying the dial that fails in a way that can be
+/// about the dial (effortSuspect) goes once more without it (effortResend), and when THAT is answered the dial was the
+/// difference: the model is noted here, once, with a warning, and its later calls skip the dial instead of each paying
+/// a rejected request first. A re-send that fails as well proves nothing about the dial, so nothing is noted and the
+/// next call tries it again. RAM only, on purpose: a provider that grows the parameter is believed again after a
+/// restart, and an operator's setting never becomes a persisted lesson. Keyed on the model, as the quirk table is; a
+/// ring of EFFORT_REFUSED_MAX, the oldest going first.
+const EFFORT_REFUSED_MAX = 32;
+var effort_refused: [EFFORT_REFUSED_MAX]u64 = @splat(0);
+var effort_refused_next: usize = 0;
+var effort_mtx: std.Io.Mutex = .init;
+
+/// Never 0, which marks an empty slot.
+fn effortModelId(model: []const u8) u64 {
+    return std.hash.Wyhash.hash(0x6566_666f_7274, model) | 1;
+}
+
+fn effortRefused(io: std.Io, model: []const u8) bool {
+    const id = effortModelId(model);
+    effort_mtx.lockUncancelable(io);
+    defer effort_mtx.unlock(io);
+    for (effort_refused) |h| if (h == id) return true;
+    return false;
+}
+
+/// Note that `model`'s provider refused the dial (see EFFORT_REFUSED_MAX); warns the first time only.
+fn noteEffortRefused(io: std.Io, tag: []const u8, model: []const u8, frag: []const u8) void {
+    const id = effortModelId(model);
+    {
+        effort_mtx.lockUncancelable(io);
+        defer effort_mtx.unlock(io);
+        for (effort_refused) |h| if (h == id) return;
+        effort_refused[effort_refused_next] = id;
+        effort_refused_next = (effort_refused_next + 1) % EFFORT_REFUSED_MAX;
+    }
+    std.log.warn("llm[{s}/{s}] the provider refused the reasoning-effort dial ({s}) and answered without it: this model is called without the dial for the rest of this process", .{ tag, model, std.mem.trimStart(u8, frag, ",") });
+}
+
+/// Whether this process has seen `model`'s provider refuse the dial (effortRefused): its calls go without it. For the
+/// engine's per-turn line, so a run log never reads "armed" alone for a turn whose calls all go at the provider default.
+pub fn reasoningEffortRefused(io: std.Io, model: []const u8) bool {
+    return effortRefused(io, model);
+}
+
+/// Whether a failed call that carried the dial may have failed BECAUSE of it - the failures that buy the re-send
+/// without it, and, when that re-send is answered, the note that the model refuses it for the rest of the process.
+///  - Never a failure that did not reach the point where a provider weighs a parameter (knobBlindFailure).
+///  - Always a rejection that NAMES the key the dial sent (EFFORT_KEY), whatever else it says: "Unrecognized request
+///    argument supplied: reasoning_effort", and just as much a Google-style "Invalid JSON payload received. Unknown
+///    name \"reasoning_effort\": Cannot find field.", which isMalformedBodyError's "invalid json" also matches - read
+///    as a broken body, the dial was never taken off, nor the model noted, and on an armed turn every call to that
+///    model spent its provider's whole retry budget resending it.
+///  - Short of that, never a failure this module already counts as a provider hiccup (isTransientLlmError: an HTTP 200
+///    with an empty `choices`, a torn body, a 200 envelope saying "too many requests" or "could not route"): one such
+///    flake on a dial call, answered on the re-send, noted a model that honours the dial as refusing it, and every
+///    later call to it ran at the provider's default for the rest of the process - the very setting a run with the
+///    dial is measuring away from - with one warning to show for it. Those go to the retry ladder with the dial on,
+///    as with the dial off.
+///  - Nor a body the provider could not parse at all (isMalformedBodyError): complete()'s heal repairs that body, the
+///    dial kept.
+fn effortSuspect(err_text: []const u8) bool {
+    if (knobBlindFailure(err_text)) return false;
+    if (std.mem.indexOf(u8, err_text, EFFORT_KEY) != null) return true;
+    return !isTransientLlmError(err_text) and !isMalformedBodyError(err_text);
+}
+
+/// THE DIAL'S RE-SEND, the knob's strip-and-resend in the dial's terms (chatTemp, complete). When `step` failed in a
+/// way that may be about the dial (effortSuspect) and no Stop is in (stopRequested: a Stop never re-sends), `body` goes
+/// once more with `effort_frag` taken out, into `step`; when that is ANSWERED the model is noted as refusing the dial
+/// (noteEffortRefused). Returns the body it sent, caller-owned, so the rest of the call keeps sending it; null when
+/// nothing went out. Never a knob verdict: observeReasonOff never sees the dial.
+fn effortResend(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const u8, base_url: []const u8, key: []const u8, model: []const u8, body: []const u8, effort_frag: []const u8, budget_tokens: u32, step: *Step) ?[]u8 {
+    if (effort_frag.len == 0 or step.ok or !effortSuspect(step.content) or stopRequested()) return null;
+    const bare = std.mem.replaceOwned(u8, gpa, body, effort_frag, "") catch return null;
+    step.deinit(gpa);
+    step.* = completeBody(gpa, io, run_dir, tag, base_url, key, model, bare, budget_tokens);
+    if (step.ok) noteEffortRefused(io, tag, model, effort_frag);
+    return bare;
+}
+
+test "effortSuspect: a rejection that names the dial is evidence whatever it says; a knob-blind failure, a provider hiccup or an unparsable body is not" {
+    const suspect = [_][]const u8{
+        "HTTP 400: {\"error\":{\"message\":\"Unrecognized request argument supplied: reasoning_effort\",\"type\":\"invalid_request_error\"}}",
+        "HTTP 422: {\"detail\":\"reasoning_effort: extra inputs are not permitted\"}",
+        // Google's unknown-field wording: isMalformedBodyError reads it as a broken body, the key named says otherwise
+        "HTTP 400: {\"error\":{\"code\":400,\"message\":\"Invalid JSON payload received. Unknown name \\\"reasoning_effort\\\": Cannot find field.\",\"status\":\"INVALID_ARGUMENT\"}}",
+        // a rejection that does not name it, in the body of a 400 or a 200 envelope, may still be about it
+        "HTTP 400: {\"errors\":[{\"code\":5006,\"message\":\"AiError: Bad input: must NOT have additional properties\"}]}",
+        "provider error 5006: invalid parameter",
+        "provider error: Unrecognized request argument supplied: reasoning_effort",
+    };
+    for (suspect) |t| {
+        if (!effortSuspect(t)) {
+            std.debug.print("\nnot read as a possible refusal of the dial: {s}\n", .{t});
+            return error.TestUnexpectedResult;
+        }
+    }
+    const not_suspect = [_][]const u8{
+        // knob-blind: the credential, the provider's clock or capacity, the transport, a Stop - even naming the key
+        "HTTP 401: {\"result\":null,\"success\":false,\"errors\":[{\"code\":10000,\"message\":\"Authentication error\"}],\"messages\":[]}",
+        "HTTP 429: {\"errors\":[{\"code\":3040,\"message\":\"rate limited\"}]}",
+        "HTTP 503: upstream unavailable while reading reasoning_effort",
+        ERR_CURL_EXIT ++ "curl: (28) Operation timed out after 240001 milliseconds with 0 bytes received",
+        STOPPED,
+        // provider hiccups the ladder retries (isTransientLlmError): an HTTP 200 with nothing in it, a torn body, a 200
+        // envelope about capacity or routing
+        "no choices in LLM response",
+        "bad LLM response: {\"choices\":[{\"message\":{\"content\":\"half an ans",
+        "provider error 3040: Too many requests",
+        "provider error 4002: AiError: could not route request",
+        // a body the provider could not parse (the heal's, dial kept)
+        "HTTP 400: {\"error\":{\"message\":\"Failed to parse the request body as JSON: messages[7].?: expected `,` or `}`\"}}",
+    };
+    for (not_suspect) |t| {
+        if (effortSuspect(t)) {
+            std.debug.print("\nread as a possible refusal of the dial: {s}\n", .{t});
+            return error.TestUnexpectedResult;
+        }
+    }
+    // each half of the predicate holds on its own: the hiccups and the unparsable body ARE evidence about a knob
+    // (knobBlindFailure says no to them), so only effortSuspect's own exclusions keep them out
+    for ([_][]const u8{ "no choices in LLM response", "provider error 3040: Too many requests", not_suspect[not_suspect.len - 1] }) |t| try std.testing.expect(!knobBlindFailure(t));
+    try std.testing.expect(isMalformedBodyError(suspect[2])); // the Google wording: the name is what lets it through
+}
+
+/// What the dial adds to a call, from the facts that decide it (see ReasoningEffort). Pure - tested.
+fn effortPick(e: ReasoningEffort, local: bool, reasons: bool, knob_out: bool, refused: bool) []const u8 {
+    if (e == .off or local or !reasons or knob_out or refused) return "";
+    return effortFrag(e);
+}
+
+/// What the dial adds to this call on this thread: "" unless armed, else effortPick over this endpoint, this model and
+/// `knob_frag`, the reasoning-off fragment the call already carries (reasonOffFor's pick).
+fn effortFor(io: std.Io, base_url: []const u8, model: []const u8, knob_frag: []const u8) []const u8 {
+    const e = effort_dial;
+    if (e == .off) return ""; // the byte-identical path: no quirk read, no lock
+    return effortPick(e, isLocal(base_url), quirkFor(io, model).reasons, knob_frag.len > 0, effortRefused(io, model));
+}
+
+test "the reasoning-effort dial: off unless armed with an exact level, spelled as documented, sent only to a hosted model seen reasoning, never beside a reasoning-off knob" {
+    const t = std.testing;
+    // ---- the env value: three levels in any case, trimmed; anything else is off ----
+    try t.expect(parseReasoningEffort(null) == .off);
+    for ([_][]const u8{ "", "   ", "medium", "none", "minimal", "xhigh", "1", "on", "true", "lowest", "lo w", "max!", "\"low\"" }) |v| {
+        if (parseReasoningEffort(v) != .off) {
+            std.debug.print("\nNL_REASONING_EFFORT={s} read as {s}\n", .{ v, @tagName(parseReasoningEffort(v)) });
+            return error.TestUnexpectedResult;
+        }
+    }
+    try t.expect(parseReasoningEffort("low") == .low);
+    try t.expect(parseReasoningEffort(" HIGH\r\n") == .high);
+    try t.expect(parseReasoningEffort("Max") == .max);
+    // ---- each level spelled exactly, and a real parser reads the key and the value back out of a body ----
+    try t.expectEqualStrings(",\"reasoning_effort\":\"low\"", effortFrag(.low));
+    try t.expectEqualStrings(",\"reasoning_effort\":\"high\"", effortFrag(.high));
+    try t.expectEqualStrings(",\"reasoning_effort\":\"max\"", effortFrag(.max));
+    try t.expectEqualStrings("", effortFrag(.off));
+    inline for (.{ ReasoningEffort.low, ReasoningEffort.high, ReasoningEffort.max }) |e| {
+        const body = "{\"model\":\"m\"" ++ comptime effortFrag(e) ++ ",\"max_tokens\":64}";
+        const parsed = try std.json.parseFromSlice(struct { reasoning_effort: []const u8 }, t.allocator, body, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        try t.expectEqualStrings(@tagName(e), parsed.value.reasoning_effort);
+    }
+    // ---- the pure pick: every gate on its own ----
+    try t.expectEqualStrings(effortFrag(.high), effortPick(.high, false, true, false, false));
+    try t.expectEqualStrings("", effortPick(.off, false, true, false, false)); // unarmed
+    try t.expectEqualStrings("", effortPick(.high, true, true, false, false)); // a local endpoint
+    try t.expectEqualStrings("", effortPick(.high, false, false, false, false)); // a model never seen reasoning
+    try t.expectEqualStrings("", effortPick(.high, false, true, true, false)); // a reasoning-off knob goes out
+    try t.expectEqualStrings("", effortPick(.high, false, true, false, true)); // the provider refused it here
+
+    // ---- through the pair every call site runs (reasonOffFor, then effortFor), on the real quirk table ----
+    var threaded = std.Io.Threaded.init(t.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const saved_tbl = quirk_tbl;
+    const saved_dial = effort_dial;
+    const saved_refused = effort_refused;
+    const saved_next = effort_refused_next;
+    defer {
+        quirk_tbl = saved_tbl;
+        effort_dial = saved_dial;
+        effort_refused = saved_refused;
+        effort_refused_next = saved_next;
+        think_off_once = false;
+    }
+    quirk_tbl = @splat(.{});
+    effort_refused = @splat(0);
+    effort_refused_next = 0;
+    const hosted = "https://api.example.com/v1";
+    const m = "test/effort-dial";
+    const outer = armReasoningEffort(.high);
+    try t.expect(outer == saved_dial);
+    try t.expectEqualStrings("", effortFor(io, hosted, m, reasonOffFor(io, "chat", m).frag)); // never seen reasoning
+    noteReasons(io, m);
+    // the answer keeps its reasoning, so no knob goes out: the dial does
+    const chat_pick = reasonOffFor(io, "chat", m);
+    try t.expectEqualStrings("", chat_pick.frag);
+    try t.expectEqualStrings(effortFrag(.high), effortFor(io, hosted, m, chat_pick.frag));
+    // an auxiliary call carries the knob on trial: only the knob
+    const trial = reasonOffFor(io, "compact", m);
+    try t.expect(trial.trial and trial.knob == .template);
+    try t.expectEqualStrings("", effortFor(io, hosted, m, trial.frag));
+    // a LEARNED knob - `effort`, the very key the dial sends - goes alone too
+    observeReasonOff(io, m, trial, true, true); // reasoning came back: on to `effort`
+    observeReasonOff(io, m, reasonOffFor(io, "compact", m), true, false); // silent: learned
+    const learned = reasonOffFor(io, "compact", m);
+    try t.expect(!learned.trial and learned.knob == .effort);
+    try t.expectEqualStrings("", effortFor(io, hosted, m, learned.frag));
+    // ...and so does the one-shot override that puts the learned knob on an answer
+    think_off_once = true;
+    const once = reasonOffFor(io, "chat", m);
+    try t.expect(once.knob == .effort);
+    try t.expectEqualStrings("", effortFor(io, hosted, m, once.frag));
+    // every knob retired (.none): the auxiliary call carries none, so the dial goes
+    observeReasonOff(io, m, learned, true, true);
+    observeReasonOff(io, m, reasonOffFor(io, "compact", m), true, true);
+    try t.expect(quirkFor(io, m).reason_off == .none);
+    try t.expectEqualStrings(effortFrag(.high), effortFor(io, hosted, m, reasonOffFor(io, "compact", m).frag));
+    // a local endpoint: nothing, armed or not
+    try t.expectEqualStrings("", effortFor(io, "http://127.0.0.1:11434/v1", m, ""));
+    // refused for this model: nothing for it, and another model seen reasoning is untouched
+    noteEffortRefused(io, "chat", m, effortFrag(.high));
+    try t.expectEqualStrings("", effortFor(io, hosted, m, ""));
+    noteReasons(io, "test/effort-other");
+    try t.expectEqualStrings(effortFrag(.high), effortFor(io, hosted, "test/effort-other", ""));
+    // NESTING: a turn nested on this thread arms its own reading and hands this one back when it ends
+    const inner = armReasoningEffort(.low);
+    try t.expect(inner == .high);
+    try t.expectEqualStrings(effortFrag(.low), effortFor(io, hosted, "test/effort-other", ""));
+    restoreReasoningEffort(inner);
+    try t.expectEqualStrings(effortFrag(.high), effortFor(io, hosted, "test/effort-other", ""));
+    const off_inner = armReasoningEffort(.off); // a nested turn whose env says off sends nothing...
+    try t.expectEqualStrings("", effortFor(io, hosted, "test/effort-other", ""));
+    restoreReasoningEffort(off_inner); // ...and does not switch the parent's off
+    try t.expectEqualStrings(effortFrag(.high), effortFor(io, hosted, "test/effort-other", ""));
+    // the turn's exit: unarmed, nothing
+    restoreReasoningEffort(outer);
+    try t.expectEqualStrings("", effortFor(io, hosted, "test/effort-other", ""));
+    // the dial left no trace in the learned quirks: nothing it did moved the knob state
+    try t.expect(quirkFor(io, "test/effort-other").reason_off == .unknown and quirkFor(io, "test/effort-other").reason_off_trial == 0);
+}
+
 test "splitStat: the status suffix is peeled off the body, and a body without one is whole" {
     const a = splitStat("{\"choices\":[]}\n__VEILSTAT__429");
     try std.testing.expectEqual(@as(u16, 429), a.code);
@@ -1581,7 +1894,9 @@ pub fn chatTemp(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []
     defer gpa.free(temp_frag);
     const pick = reasonOffFor(io, tag, model);
     const think_frag: []const u8 = pick.frag;
-    const body = std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}]{s}{s},\"max_tokens\":{d}}}", .{ model, msgs.items, temp_frag, think_frag, mt }) catch return oom(gpa);
+    // the operator's reasoning-effort dial, only where no knob goes out (effortFor): "" unarmed, the same bytes as ever
+    const effort_frag = effortFor(io, base_url, model, think_frag);
+    const body = std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}]{s}{s}{s},\"max_tokens\":{d}}}", .{ model, msgs.items, temp_frag, think_frag, effort_frag, mt }) catch return oom(gpa);
     defer gpa.free(body);
     var s = completeBody(gpa, io, run_dir, tag, base_url, key, model, body, mt);
     defer s.deinit(gpa);
@@ -1600,6 +1915,9 @@ pub fn chatTemp(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []
             } else |_| {}
         }
     }
+    // the dial's twin of that re-send (effortResend), as in complete(): never a knob verdict, and only an answered re-send
+    // notes a refusal. No ladder follows here, so the body it sent is done with at once.
+    if (effortResend(gpa, io, run_dir, tag, base_url, key, model, body, effort_frag, mt, &s)) |bare| gpa.free(bare);
     if (!s.ok) return err(gpa, s.content);
     return .{ .content = gpa.dupe(u8, s.content) catch return oom(gpa), .ok = true };
 }
@@ -1648,6 +1966,8 @@ pub fn complete(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []
     defer gpa.free(temp_frag);
     const pick = reasonOffFor(io, tag, model);
     const think_frag: []const u8 = pick.frag;
+    // the operator's reasoning-effort dial, only where no knob goes out (effortFor): "" unarmed, the same bytes as ever
+    const effort_frag = effortFor(io, base_url, model, think_frag);
     // Learned-quirk pre-echo (the effTemp analog for the reasoning echo): once a model has demanded the
     // echo, every request pre-splices "" into any bare assistant turn BEFORE dispatch — no failed
     // round-trip, at every call site. Callers holding real reasoning text have already echoed it
@@ -1660,9 +1980,9 @@ pub fn complete(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []
     };
     defer if (msgs_eff.ptr != messages_json.ptr) gpa.free(@constCast(msgs_eff));
     const body = if (tools_json.len > 0)
-        std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"tools\":[{s}]{s}{s},\"max_tokens\":{d}}}", .{ model, msgs_eff, tools_json, temp_frag, think_frag, mt }) catch return stepErr(gpa, "oom")
+        std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"tools\":[{s}]{s}{s}{s},\"max_tokens\":{d}}}", .{ model, msgs_eff, tools_json, temp_frag, think_frag, effort_frag, mt }) catch return stepErr(gpa, "oom")
     else
-        std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}]{s}{s},\"max_tokens\":{d}}}", .{ model, msgs_eff, temp_frag, think_frag, mt }) catch return stepErr(gpa, "oom");
+        std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}]{s}{s}{s},\"max_tokens\":{d}}}", .{ model, msgs_eff, temp_frag, think_frag, effort_frag, mt }) catch return stepErr(gpa, "oom");
     defer gpa.free(body);
     var step = completeBody(gpa, io, run_dir, tag, base_url, key, model, body, mt);
     // A STOPPED TURN TAKES THE FAILURE AS IT IS. A call that failed while (or because) its turn was stopped goes no
@@ -1689,6 +2009,17 @@ pub fn complete(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []
             } else |_| {}
         }
     }
+    // A PROVIDER THAT REFUSES THE DIAL (see ReasoningEffort) costs this call one more request, never the answer: a
+    // call that carried it and failed in a way that can be about the dial (effortSuspect: not knob-blind, not a provider
+    // hiccup, not an unparsable body, unless the failure names the dial's key) goes again without it (effortResend), the
+    // knob's re-send above in the dial's terms. It is no knob verdict (observeReasonOff never sees the dial), and only an
+    // ANSWERED re-send notes the model as refusing it, in RAM: a re-send that fails too says nothing about the dial. A
+    // Stop never gets here (the return above). The heal and the ladder below then send what was sent last, so a dial
+    // taken off stays off for the rest of this call - and the ladder asks the same question of each retry while the
+    // dial is still on (see there).
+    var dial_bare: ?[]u8 = effortResend(gpa, io, run_dir, tag, base_url, key, model, body, effort_frag, mt, &step);
+    defer if (dial_bare) |b| gpa.free(b);
+    const sent_effort: []const u8 = if (dial_bare != null) "" else effort_frag;
     // MALFORMED-BODY RECOVERY: the provider rejected our REQUEST as invalid JSON — a conversation turn was
     // serialized broken somewhere upstream (an unterminated content string is the observed shape). Rather
     // than surface a hard error, truncate the messages to the last INTACT turn and retry once. A degraded
@@ -1699,9 +2030,9 @@ pub fn complete(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []
         if (safe.len > 0 and safe.len < msgs_eff.len) {
             dumpMalformed(io, run_dir, tag, msgs_eff, safe.len);
             const body2 = if (tools_json.len > 0)
-                std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"tools\":[{s}]{s}{s},\"max_tokens\":{d}}}", .{ model, safe, tools_json, temp_frag, think_frag, mt }) catch return step
+                std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"tools\":[{s}]{s}{s}{s},\"max_tokens\":{d}}}", .{ model, safe, tools_json, temp_frag, think_frag, sent_effort, mt }) catch return step
             else
-                std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}]{s}{s},\"max_tokens\":{d}}}", .{ model, safe, temp_frag, think_frag, mt }) catch return step;
+                std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}]{s}{s}{s},\"max_tokens\":{d}}}", .{ model, safe, temp_frag, think_frag, sent_effort, mt }) catch return step;
             defer gpa.free(body2);
             std.log.warn("llm[{s}/{s}] MALFORMED request body healed: {d} -> {d} msg bytes (dropped a corrupt turn)", .{ tag, model, msgs_eff.len, safe.len });
             var step2 = completeBody(gpa, io, run_dir, tag, base_url, key, model, body2, mt);
@@ -1746,9 +2077,16 @@ pub fn complete(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []
                 std.log.warn("llm[{s}/{s}] retrying with a re-resolved credential", .{ tag, model });
             }
         }
-        const again = completeBody(gpa, io, run_dir, tag, base_url, fresh_key orelse key, model, body, mt);
+        const again = completeBody(gpa, io, run_dir, tag, base_url, fresh_key orelse key, model, dial_bare orelse body, mt);
         step.deinit(gpa);
         step = again;
+        // THE DIAL'S RE-SEND AT WHICHEVER ATTEMPT THE PROVIDER FIRST REFUSES IT. A first attempt that failed knob-blind
+        // (a 401 from a token that expired mid-turn, a 429, a dead transfer) bought no re-send above, so this retry is
+        // the first time the provider weighed the dial: asked only of the first answer, every retry after it resent the
+        // refused dial - ten refusals and 320 s of waits on a turn's budget, then the call lost and nothing noted, where
+        // the same flake with the dial off cost one retry. Once per call (dial_bare), and no budget spent on it: the
+        // re-send is the dial's, as the first one is, and its body is what the ladder sends from then on.
+        if (dial_bare == null) dial_bare = effortResend(gpa, io, run_dir, tag, base_url, fresh_key orelse key, model, body, effort_frag, mt, &step);
     }
     if (step.ok) noteProviderOk(base_url, model);
     return step;
@@ -3918,6 +4256,7 @@ pub fn completeStream(
     // a blocking complete() that pays the 401 again. The fallback below passes the caller's key; complete() swaps it.
     const swapped = swappedKey(gpa, base_url, key);
     defer if (swapped) |k| freeKey(gpa, k);
+    const once = think_off_once; // streamAttempt spends it (reasonOffFor); the fallback below is the same call
     if (streamAttempt(gpa, io, run_dir, tag, base_url, swapped orelse key, model, messages_json, tools_json, max_tokens, temperature, ctx, on_delta, should_abort)) |step| {
         if (step.ok and step.reasoning.len > 0) noteReasons(io, model); // the answer is where reasoning is usually first seen
         // A streamed reply counts: the provider's failures in a row are over. A stream that never said it ended
@@ -3926,6 +4265,13 @@ pub fn completeStream(
         if (step.ok and !step.incomplete and (step.content.len > 0 or step.reasoning.len > 0 or step.calls.len > 0)) noteProviderOk(base_url, model);
         return step;
     }
+    // THE FALLBACK IS THE SAME CALL, so the one-shot reasoning-off override the engine set for it (think_off_once: the
+    // continuation after a reply cut at the output cap) rides it too. The stream had spent the flag, so the fallback
+    // went out with no knob - and, with the operator's reasoning-effort dial armed, with the dial in the knob's place
+    // (effortFor sends it where no knob goes out): explicit effort on the call the engine had asked to be silenced.
+    // Not for Ollama: complete() hands that to completeOllamaNative, which never reads the flag, so it would ride the
+    // turn's NEXT call instead.
+    if (!isOllama(base_url)) think_off_once = once;
     return complete(gpa, io, run_dir, tag, base_url, key, model, messages_json, tools_json, max_tokens, temperature);
 }
 
@@ -4033,6 +4379,9 @@ fn streamAttempt(
     defer gpa.free(temp_frag);
     const pick = reasonOffFor(io, tag, model);
     const think_frag: []const u8 = pick.frag;
+    // the operator's reasoning-effort dial (effortFor), hosted body only. A provider that refuses it answers no SSE line,
+    // so the stream falls back to complete(), whose re-send without the dial finds that out and notes it for the model.
+    const effort_frag = effortFor(io, base_url, model, think_frag);
 
     // The output budget this request actually asks for — hoisted out of the body builder because it also sizes
     // the deadline (callTimeoutS): the streamed path must not be capped shorter than the tokens it requested.
@@ -4066,9 +4415,9 @@ fn streamAttempt(
         }
         const mt = budget_tokens;
         break :blk (if (tools_json.len > 0)
-            std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"tools\":[{s}],\"stream\":true,\"stream_options\":{{\"include_usage\":true}}{s}{s},\"max_tokens\":{d}}}", .{ model, hosted_msgs, tools_json, temp_frag, think_frag, mt })
+            std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"tools\":[{s}],\"stream\":true,\"stream_options\":{{\"include_usage\":true}}{s}{s}{s},\"max_tokens\":{d}}}", .{ model, hosted_msgs, tools_json, temp_frag, think_frag, effort_frag, mt })
         else
-            std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"stream\":true,\"stream_options\":{{\"include_usage\":true}}{s}{s},\"max_tokens\":{d}}}", .{ model, hosted_msgs, temp_frag, think_frag, mt })) catch return null;
+            std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"stream\":true,\"stream_options\":{{\"include_usage\":true}}{s}{s}{s},\"max_tokens\":{d}}}", .{ model, hosted_msgs, temp_frag, think_frag, effort_frag, mt })) catch return null;
     };
     defer gpa.free(body);
 
@@ -7161,6 +7510,507 @@ test "a credential re-resolved after a 401 serves the rest of the turn: later ca
     try std.testing.expectEqual(@as(u32, 1), srv.used[R_STREAM]);
     try std.testing.expectEqual(@as(u32, 4), srv.used[R_NEW]);
     try std.testing.expectEqual(@as(usize, 8), srv.countCalls("POST", "/chat/completions"));
+}
+
+test "an armed reasoning-effort dial rides complete(), chat() and a streamed call to a hosted model seen reasoning, tools or none, never stacked on a reasoning-off knob, and unarmed each sends the body it sent before the dial existed" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = if (builtin.os.tag == .windows) .{ .block = .global } else .{ .block = .{ .slice = std.mem.span(std.c.environ) } } });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const saved_tbl = quirk_tbl;
+    const saved_dial = effort_dial;
+    const saved_refused = effort_refused;
+    const saved_next = effort_refused_next;
+    const saved_once = think_off_once;
+    defer {
+        quirk_tbl = saved_tbl;
+        effort_dial = saved_dial;
+        effort_refused = saved_refused;
+        effort_refused_next = saved_next;
+        think_off_once = saved_once;
+    }
+    quirk_tbl = @splat(.{});
+    effort_refused = @splat(0);
+    effort_refused_next = 0;
+    var turn: HostedTurn = undefined;
+    try turn.begin(gpa, io);
+    defer turn.end(gpa);
+    const Probe = struct {
+        fn onDelta(ctx: *anyopaque, kind: DeltaKind, text: []const u8) void {
+            _ = ctx;
+            _ = kind;
+            _ = text;
+        }
+    };
+
+    const root = "zig-llm-effortbody-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, root, .default_dir) catch {};
+
+    const m = "test/effort-body";
+    noteReasons(io, m); // seen reasoning: the one model state the dial needs
+    const msgs = "{\"role\":\"user\",\"content\":\"next step\"}";
+    const tools = "{\"type\":\"function\",\"function\":{\"name\":\"probe\",\"description\":\"d\",\"parameters\":{\"type\":\"object\",\"properties\":{}}}}";
+    // The stand-in tells the bodies apart (fakehttp.Route.has): a call carrying the reasoning-off knob (with the dial
+    // stacked on it, which must never happen, or alone; streamed or not), and a streamed and a blocking one, each with
+    // the dial at `max` or without it.
+    const sse = fakehttp.wire("data: {\"choices\":[{\"delta\":{\"content\":\"streamed\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n");
+    const answered = fakehttp.wire("{\"choices\":[{\"message\":{\"content\":\"answered\"}}]}");
+    const R_STACKED = 0;
+    const R_STREAM_KNOB = 1;
+    const R_KNOB = 2;
+    const R_STREAM_DIAL = 3;
+    const R_STREAM = 4;
+    const R_DIAL = 5;
+    const routes = [_]fakehttp.Route{
+        .{ .method = "POST", .path = "/chat/completions", .reply = answered, .has = &.{ "chat_template_kwargs", "\"reasoning_effort\"" } },
+        .{ .method = "POST", .path = "/chat/completions", .reply = sse, .has = &.{ "\"stream\":true", "chat_template_kwargs" } },
+        .{ .method = "POST", .path = "/chat/completions", .reply = answered, .has = &.{"chat_template_kwargs"} },
+        .{ .method = "POST", .path = "/chat/completions", .reply = sse, .has = &.{ "\"stream\":true", "\"reasoning_effort\":\"max\"" } },
+        .{ .method = "POST", .path = "/chat/completions", .reply = sse, .has = &.{"\"stream\":true"} },
+        .{ .method = "POST", .path = "/chat/completions", .reply = answered, .has = &.{"\"reasoning_effort\":\"max\""} },
+    };
+    // complete()'s request as it was before the dial, byte for byte, and the same request with it: the one place the
+    // dial may show is between the last fragment and max_tokens
+    const before = "{\"model\":\"" ++ m ++ "\",\"messages\":[" ++ msgs ++ "],\"max_tokens\":64}";
+    const with_dial = "{\"model\":\"" ++ m ++ "\",\"messages\":[" ++ msgs ++ "],\"reasoning_effort\":\"max\",\"max_tokens\":64}";
+    for ([_]ReasoningEffort{ .off, .max }) |dial| {
+        const prev = armReasoningEffort(dial);
+        defer restoreReasoningEffort(prev);
+        const armed = dial != .off;
+        var srv: fakehttp.Server = undefined;
+        try srv.startRouted(io, &routes, fakehttp.wire("{\"choices\":[{\"message\":{\"content\":\"answered\"}}]}"));
+        var srv_up = true;
+        defer if (srv_up) srv.stop();
+        var ub: [64]u8 = undefined;
+        const base = try std.fmt.bufPrint(&ub, "http://127.1:{d}/v1", .{srv.port});
+        var s1 = complete(gpa, io, root, "chat", base, "key-a", m, msgs, "", 64, -1); // the request the stand-in keeps whole
+        defer s1.deinit(gpa);
+        const r2 = chat(gpa, io, root, "plan", base, "key-a", m, "plan this", "next step", 64);
+        defer gpa.free(r2.content);
+        var ctx: u8 = 0;
+        var s3 = completeStream(gpa, io, root, "chat", base, "key-a", m, msgs, "", 64, -1, &ctx, Probe.onDelta, null);
+        defer s3.deinit(gpa);
+        // an auxiliary call carries the reasoning-off knob (on trial the first time, learned from its silent reply after)
+        var s4 = complete(gpa, io, root, "compact", base, "key-a", m, msgs, "", 64, -1);
+        defer s4.deinit(gpa);
+        // ...through chat() as well (chatTemp builds its own body), and on a streamed answer the engine asked to have
+        // silenced (think_off_once, the continuation after a cut reply: streamAttempt builds its own body too)
+        const r5 = chat(gpa, io, root, "compact", base, "key-a", m, "fold this", "next step", 64);
+        defer gpa.free(r5.content);
+        think_off_once = true;
+        var s6 = completeStream(gpa, io, root, "chat", base, "key-a", m, msgs, "", 64, -1, &ctx, Probe.onDelta, null);
+        defer s6.deinit(gpa);
+        // the body shapes with a tools array, blocking and streamed
+        var s7 = complete(gpa, io, root, "chat", base, "key-a", m, msgs, tools, 64, -1);
+        defer s7.deinit(gpa);
+        var s8 = completeStream(gpa, io, root, "chat", base, "key-a", m, msgs, tools, 64, -1, &ctx, Probe.onDelta, null);
+        defer s8.deinit(gpa);
+        srv.stop(); // joins the serve thread; request() and the route counts are only safe after it
+        srv_up = false;
+
+        try std.testing.expectEqualStrings("answered", s1.content);
+        try std.testing.expectEqualStrings("answered", r2.content);
+        try std.testing.expectEqualStrings("streamed", s3.content);
+        try std.testing.expectEqualStrings("answered", s4.content);
+        try std.testing.expectEqualStrings("answered", r5.content);
+        try std.testing.expectEqualStrings("streamed", s6.content);
+        try std.testing.expectEqualStrings("answered", s7.content);
+        try std.testing.expectEqualStrings("streamed", s8.content);
+        try std.testing.expect(!think_off_once); // spent by the one call it was for
+        // one request per call, each carrying the dial exactly when it is armed - and the knob's calls only their knob
+        try std.testing.expectEqual(@as(usize, 8), srv.countCalls("POST", "/chat/completions"));
+        if (srv.used[R_STACKED] != 0 or srv.used[R_STREAM_KNOB] != 1 or srv.used[R_KNOB] != 2 or srv.used[R_STREAM_DIAL] != @as(u32, if (armed) 2 else 0) or srv.used[R_STREAM] != @as(u32, if (armed) 0 else 2) or srv.used[R_DIAL] != @as(u32, if (armed) 3 else 0)) {
+            std.debug.print("\ndial {s}: knob with the dial {d}, streamed knob alone {d}, knob alone {d}, streamed with the dial {d}, streamed without {d}, blocking with it {d}\n", .{ @tagName(dial), srv.used[R_STACKED], srv.used[R_STREAM_KNOB], srv.used[R_KNOB], srv.used[R_STREAM_DIAL], srv.used[R_STREAM], srv.used[R_DIAL] });
+            return error.TestUnexpectedResult;
+        }
+        // the stand-in keeps the head's lines without their line feeds, then the body, which opens with the model
+        const req = srv.request();
+        const at = std.mem.indexOf(u8, req, "{\"model\":") orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings(if (armed) with_dial else before, req[at..]);
+    }
+}
+
+test "a provider that refuses the reasoning-effort dial costs one request without it, then the model goes without it for the process; a knob-blind failure, an unparsable body, a re-send refused too, or a Stop buys nothing more" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = if (builtin.os.tag == .windows) .{ .block = .global } else .{ .block = .{ .slice = std.mem.span(std.c.environ) } } });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const saved_tbl = quirk_tbl;
+    const saved_dial = effort_dial;
+    const saved_refused = effort_refused;
+    const saved_next = effort_refused_next;
+    defer {
+        quirk_tbl = saved_tbl;
+        effort_dial = saved_dial;
+        effort_refused = saved_refused;
+        effort_refused_next = saved_next;
+    }
+    // A hosted call, the probe at a stand-in of its own (HostedTurn), on an UNARMED thread: no reply below is one its
+    // transient ladder retries, and curl's own --retry resends neither a 401 nor a 400, so every request the stand-in
+    // counts is one this file made. The stand-in raises the Stop as the first request arrives, when a case asks.
+    var turn: HostedTurn = undefined;
+    try turn.begin(gpa, io);
+    defer turn.end(gpa);
+    disarmRetries();
+    const Hooks = struct {
+        var stop = std.atomic.Value(bool).init(false);
+        var raise = std.atomic.Value(bool).init(false);
+        fn onRequest() void {
+            if (raise.load(.acquire)) stop.store(true, .release);
+        }
+        fn abort() bool {
+            return stop.load(.acquire);
+        }
+        fn onDelta(ctx: *anyopaque, kind: DeltaKind, text: []const u8) void {
+            _ = ctx;
+            _ = kind;
+            _ = text;
+        }
+    };
+    retry_abort = &Hooks.abort;
+
+    const root = "zig-llm-effortrefuse-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, root, .default_dir) catch {};
+
+    const Http = struct {
+        fn reply(comptime status: []const u8, comptime body: []const u8) []const u8 {
+            return std.fmt.comptimePrint("HTTP/1.1 {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ status, body.len, body });
+        }
+    };
+    const refuse = Http.reply("400 Bad Request", "{\"error\":{\"message\":\"Unrecognized request argument supplied: reasoning_effort\",\"type\":\"invalid_request_error\"}}");
+    const refuse_too = Http.reply("400 Bad Request", "{\"error\":{\"message\":\"model is not served on this route\",\"type\":\"invalid_request_error\"}}");
+    const auth = Http.reply("401 Unauthorized", "{\"result\":null,\"success\":false,\"errors\":[{\"code\":10000,\"message\":\"Authentication error\"}],\"messages\":[]}");
+    const unparsable = Http.reply("400 Bad Request", "{\"error\":{\"message\":\"Failed to parse the request body as JSON\"}}");
+    const answered = fakehttp.wire("{\"choices\":[{\"message\":{\"content\":\"answered\"}}]}");
+    const sse = fakehttp.wire("data: {\"choices\":[{\"delta\":{\"content\":\"streamed\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n");
+    const Entry = enum { complete, chat, stream };
+    const Case = struct { what: []const u8, entry: Entry, dial_reply: []const u8, bare_reply: []const u8, stop: bool = false, posts: usize, ok: bool, refused: bool };
+    const cases = [_]Case{
+        // refused, and the request without it answered: two requests, the second without it, and the model is noted
+        .{ .what = "refused/complete", .entry = .complete, .dial_reply = refuse, .bare_reply = answered, .posts = 2, .ok = true, .refused = true },
+        .{ .what = "refused/chat", .entry = .chat, .dial_reply = refuse, .bare_reply = answered, .posts = 2, .ok = true, .refused = true },
+        // a refused stream says nothing a tail can read: it falls back to complete(), which finds the refusal out
+        .{ .what = "refused/stream", .entry = .stream, .dial_reply = refuse, .bare_reply = answered, .posts = 3, .ok = true, .refused = true },
+        // the request without it is refused as well: the dial was not the difference, so nothing is noted
+        .{ .what = "re-send refused too", .entry = .complete, .dial_reply = refuse, .bare_reply = refuse_too, .posts = 2, .ok = false, .refused = false },
+        // a failure that never reached the point where a provider weighs a parameter buys no re-send
+        .{ .what = "401/complete", .entry = .complete, .dial_reply = auth, .bare_reply = answered, .posts = 1, .ok = false, .refused = false },
+        .{ .what = "401/chat", .entry = .chat, .dial_reply = auth, .bare_reply = answered, .posts = 1, .ok = false, .refused = false },
+        // nor does a body the provider could not parse at all
+        .{ .what = "unparsable body", .entry = .complete, .dial_reply = unparsable, .bare_reply = answered, .posts = 1, .ok = false, .refused = false },
+        // refused while the turn was being stopped: the failure stands, nothing more goes out
+        .{ .what = "Stop/complete", .entry = .complete, .dial_reply = refuse, .bare_reply = answered, .stop = true, .posts = 1, .ok = false, .refused = false },
+        .{ .what = "Stop/chat", .entry = .chat, .dial_reply = refuse, .bare_reply = answered, .stop = true, .posts = 1, .ok = false, .refused = false },
+    };
+    const m = "test/effort-refuse";
+    const msgs = "{\"role\":\"user\",\"content\":\"next step\"}";
+    const prev = armReasoningEffort(.high);
+    defer restoreReasoningEffort(prev);
+    const Call = struct {
+        /// One call by `entry` on the dial's model; true when it came back answered.
+        fn run(io_: std.Io, entry: Entry, base: []const u8) bool {
+            const a = std.testing.allocator;
+            switch (entry) {
+                .complete => {
+                    var s = complete(a, io_, root, "chat", base, "key-a", m, msgs, "", 64, -1);
+                    defer s.deinit(a);
+                    return s.ok;
+                },
+                .chat => {
+                    const r = chat(a, io_, root, "plan", base, "key-a", m, "plan this", "next step", 64);
+                    defer a.free(r.content);
+                    return r.ok;
+                },
+                .stream => {
+                    var ctx: u8 = 0;
+                    var s = completeStream(a, io_, root, "chat", base, "key-a", m, msgs, "", 64, -1, &ctx, Hooks.onDelta, null);
+                    defer s.deinit(a);
+                    return s.ok and s.content.len > 0;
+                },
+            }
+        }
+    };
+    for (cases) |c| {
+        quirk_tbl = @splat(.{});
+        effort_refused = @splat(0);
+        effort_refused_next = 0;
+        noteReasons(io, m); // seen reasoning: its answer-side calls carry the dial
+        // route 0 answers every body that carries the dial; route 1 a stream without it (the later streamed call)
+        const routes = [_]fakehttp.Route{
+            .{ .method = "POST", .path = "/chat/completions", .reply = c.dial_reply, .has = &.{"\"reasoning_effort\":\"high\""} },
+            .{ .method = "POST", .path = "/chat/completions", .reply = sse, .has = &.{"\"stream\":true"} },
+        };
+        // ---- the call the provider refuses ----
+        Hooks.stop.store(false, .release);
+        Hooks.raise.store(c.stop, .release);
+        var srv: fakehttp.Server = undefined;
+        try srv.startWatched(io, &routes, c.bare_reply, Hooks.onRequest);
+        var ub: [64]u8 = undefined;
+        const ok = Call.run(io, c.entry, try std.fmt.bufPrint(&ub, "http://127.1:{d}/v1", .{srv.port}));
+        srv.stop(); // joins the serve thread; the counts are final after it
+        Hooks.raise.store(false, .release);
+        Hooks.stop.store(false, .release);
+        const posts = srv.countCalls("POST", "/chat/completions");
+        // every request after the first went WITHOUT the dial: the first is the only one route 0 answered
+        const dial_sent = srv.used[0];
+        const refused = effortRefused(io, m);
+        const q = quirkFor(io, m);
+        if (posts != c.posts or ok != c.ok or dial_sent != (if (c.entry == .stream and c.posts == 3) @as(u32, 2) else @as(u32, 1)) or refused != c.refused) {
+            std.debug.print("\n{s}: {d} requests (want {d}), {d} with the dial, ok={} (want {}), refused={} (want {})\n", .{ c.what, posts, c.posts, dial_sent, ok, c.ok, refused, c.refused });
+            return error.TestUnexpectedResult;
+        }
+        // the dial is no knob: whatever the provider said about it, the reasoning-off trial did not move
+        try std.testing.expect(q.reason_off == .unknown and q.reason_off_trial == 0);
+        // ---- a later call on the same model, unstopped, at a stand-in of its own: the refusal is the model's ----
+        var srv2: fakehttp.Server = undefined;
+        try srv2.startRouted(io, &routes, answered);
+        var ub2: [64]u8 = undefined;
+        _ = Call.run(io, c.entry, try std.fmt.bufPrint(&ub2, "http://127.1:{d}/v1", .{srv2.port}));
+        srv2.stop();
+        const later_dial = srv2.used[0];
+        const later_posts = srv2.countCalls("POST", "/chat/completions");
+        // noted: one request, no dial; not noted: the later call carries the dial again
+        if (later_dial != @intFromBool(!c.refused) or (c.refused and later_posts != 1)) {
+            std.debug.print("\n{s}, the later call: {d} requests, {d} with the dial (want {d})\n", .{ c.what, later_posts, later_dial, @intFromBool(!c.refused) });
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+test "on a turn's armed retry ladder the dial comes off at whichever attempt the provider first refuses it; a provider hiccup or an unparsable body never takes it off, and the heal and the ladder send what was sent last" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = if (builtin.os.tag == .windows) .{ .block = .global } else .{ .block = .{ .slice = std.mem.span(std.c.environ) } } });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const saved_tbl = quirk_tbl;
+    const saved_dial = effort_dial;
+    const saved_refused = effort_refused;
+    const saved_next = effort_refused_next;
+    defer {
+        quirk_tbl = saved_tbl;
+        effort_dial = saved_dial;
+        effort_refused = saved_refused;
+        effort_refused_next = saved_next;
+    }
+    // A hosted call (the probe at a stand-in of its own) on an ARMED thread, as every chat turn's is: the ladder retries
+    // any failure on the turn's budget, its waits cost nothing here (HostedTurn) and no re-resolve is offered. curl's
+    // own --retry resends neither a 401, a 400 nor a 200, so every request the stand-in counts is one this file made.
+    // The stand-in raises the Stop as a case's `stop_at`-th request arrives.
+    var turn: HostedTurn = undefined;
+    try turn.begin(gpa, io);
+    defer turn.end(gpa); // restores retry_abort too
+    const Hooks = struct {
+        var stop = std.atomic.Value(bool).init(false);
+        var seen = std.atomic.Value(u32).init(0);
+        var stop_at = std.atomic.Value(u32).init(0);
+        fn onRequest() void {
+            const n = seen.fetchAdd(1, .acq_rel) + 1;
+            const at = stop_at.load(.acquire);
+            if (at != 0 and n >= at) stop.store(true, .release);
+        }
+        fn abort() bool {
+            return stop.load(.acquire);
+        }
+    };
+    retry_abort = &Hooks.abort;
+
+    const root = "zig-llm-effortladder-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, root, .default_dir) catch {};
+
+    const Http = struct {
+        fn reply(comptime status: []const u8, comptime body: []const u8) []const u8 {
+            return std.fmt.comptimePrint("HTTP/1.1 {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ status, body.len, body });
+        }
+    };
+    const refuse = Http.reply("400 Bad Request", "{\"error\":{\"message\":\"Unrecognized request argument supplied: reasoning_effort\",\"type\":\"invalid_request_error\"}}");
+    // Google's unknown-field wording, which isMalformedBodyError's "invalid json" also matches
+    const unknown_name = Http.reply("400 Bad Request", "{\"error\":{\"code\":400,\"message\":\"Invalid JSON payload received. Unknown name \\\"reasoning_effort\\\": Cannot find field.\",\"status\":\"INVALID_ARGUMENT\"}}");
+    const auth = Http.reply("401 Unauthorized", "{\"result\":null,\"success\":false,\"errors\":[{\"code\":10000,\"message\":\"Authentication error\"}],\"messages\":[]}");
+    const unparsable = Http.reply("400 Bad Request", "{\"error\":{\"message\":\"Failed to parse the request body as JSON: messages[1]: expected `,` or `}`\"}}");
+    // the provider hiccups this module already retries (isTransientLlmError), each an HTTP 200
+    const no_choices = fakehttp.wire("{\"choices\":[]}");
+    const torn = fakehttp.wire("{\"choices\":[{\"message\":{\"content\":\"half an ans");
+    const busy = fakehttp.wire("{\"success\":false,\"errors\":[{\"code\":3040,\"message\":\"Too many requests\"}]}");
+    const answered = fakehttp.wire("{\"choices\":[{\"message\":{\"content\":\"answered\"}}]}");
+    const dial = "\"reasoning_effort\":\"high\"";
+    const P = "/chat/completions";
+    const intact = "{\"role\":\"user\",\"content\":\"next step\"}";
+    // a conversation whose last turn was serialized broken: the heal keeps the turn before it (safeMessagePrefix)
+    const corrupt = intact ++ ",{\"role\":\"assistant\",\"content\":\"cut off";
+    // `used`: how often each of the case's routes answered; a request no route takes gets `answered`
+    const Case = struct { what: []const u8, routes: []const fakehttp.Route, msgs: []const u8 = intact, stop_at: u32 = 0, posts: usize, used: []const u32, ok: bool, refused: bool };
+    const cases = [_]Case{
+        // a 401 first (a token that expired mid-turn) is knob-blind and buys nothing, so the ladder's retry is the
+        // first request the provider weighs the dial on: it refuses it, the re-send without it lands, the model is noted
+        .{ .what = "401, then refused", .routes = &.{
+            .{ .method = "POST", .path = P, .reply = auth, .times = 1 },
+            .{ .method = "POST", .path = P, .reply = refuse, .has = &.{dial} },
+        }, .posts = 3, .used = &.{ 1, 1 }, .ok = true, .refused = true },
+        // refused, and the re-send without it fails (a 401): nothing noted, and the ladder retries the body it sent
+        // LAST, without the dial - not the refused one
+        .{ .what = "refused, the re-send 401", .routes = &.{
+            .{ .method = "POST", .path = P, .reply = refuse, .has = &.{dial} },
+            .{ .method = "POST", .path = P, .reply = auth, .times = 1 },
+        }, .posts = 3, .used = &.{ 1, 1 }, .ok = true, .refused = false },
+        // a hiccup on a dial call is retried with the dial, as with the dial off: never taken off, never noted
+        .{ .what = "200 with no choices", .routes = &.{
+            .{ .method = "POST", .path = P, .reply = no_choices, .times = 1 },
+            .{ .method = "POST", .path = P, .reply = answered, .has = &.{dial} },
+        }, .posts = 2, .used = &.{ 1, 1 }, .ok = true, .refused = false },
+        .{ .what = "a torn 200", .routes = &.{
+            .{ .method = "POST", .path = P, .reply = torn, .times = 1 },
+            .{ .method = "POST", .path = P, .reply = answered, .has = &.{dial} },
+        }, .posts = 2, .used = &.{ 1, 1 }, .ok = true, .refused = false },
+        .{ .what = "a 200 envelope, too many requests", .routes = &.{
+            .{ .method = "POST", .path = P, .reply = busy, .times = 1 },
+            .{ .method = "POST", .path = P, .reply = answered, .has = &.{dial} },
+        }, .posts = 2, .used = &.{ 1, 1 }, .ok = true, .refused = false },
+        // a rejection that names the dial is one, though its wording reads as a broken body
+        .{ .what = "Invalid JSON payload, unknown name reasoning_effort", .routes = &.{
+            .{ .method = "POST", .path = P, .reply = unknown_name, .has = &.{dial} },
+        }, .posts = 2, .used = &.{1}, .ok = true, .refused = true },
+        // refused, then the body without it is unparsable: the heal drops the broken turn from THAT body, dial off
+        .{ .what = "refused, the re-send unparsable", .msgs = corrupt, .routes = &.{
+            .{ .method = "POST", .path = P, .reply = refuse, .has = &.{dial} },
+            .{ .method = "POST", .path = P, .reply = unparsable, .times = 1 },
+        }, .posts = 3, .used = &.{ 1, 1 }, .ok = true, .refused = false },
+        // unparsable with the dial on: no re-send, and the heal keeps the dial
+        .{ .what = "unparsable", .msgs = corrupt, .routes = &.{
+            .{ .method = "POST", .path = P, .reply = unparsable, .times = 1 },
+            .{ .method = "POST", .path = P, .reply = answered, .has = &.{dial} },
+        }, .posts = 2, .used = &.{ 1, 1 }, .ok = true, .refused = false },
+        // the Stop lands as the ladder's retry goes out and the provider refuses the dial on it: nothing more is sent
+        .{ .what = "a Stop as the retry goes out", .stop_at = 2, .routes = &.{
+            .{ .method = "POST", .path = P, .reply = auth, .times = 1 },
+            .{ .method = "POST", .path = P, .reply = refuse, .has = &.{dial} },
+        }, .posts = 2, .used = &.{ 1, 1 }, .ok = false, .refused = false },
+    };
+    const m = "test/effort-ladder";
+    const prev = armReasoningEffort(.high);
+    defer restoreReasoningEffort(prev);
+    for (cases) |c| {
+        quirk_tbl = @splat(.{});
+        effort_refused = @splat(0);
+        effort_refused_next = 0;
+        noteReasons(io, m); // seen reasoning: the answer's calls carry the dial
+        armRetries(); // a turn's whole budget
+        Hooks.stop.store(false, .release);
+        Hooks.seen.store(0, .release);
+        Hooks.stop_at.store(c.stop_at, .release);
+        var srv: fakehttp.Server = undefined;
+        try srv.startWatched(io, c.routes, answered, Hooks.onRequest);
+        var srv_up = true;
+        defer if (srv_up) srv.stop();
+        var ub: [64]u8 = undefined;
+        const base = try std.fmt.bufPrint(&ub, "http://127.1:{d}/v1", .{srv.port});
+        var s = complete(gpa, io, root, "chat", base, "key-a", m, c.msgs, "", 64, -1);
+        defer s.deinit(gpa);
+        srv.stop(); // joins the serve thread; the counts are final after it
+        srv_up = false;
+        Hooks.stop_at.store(0, .release);
+        Hooks.stop.store(false, .release);
+        const posts = srv.countCalls("POST", "/chat/completions");
+        const refused = effortRefused(io, m);
+        const used_ok = for (c.used, 0..) |u, i| {
+            if (srv.used[i] != u) break false;
+        } else true;
+        if (posts != c.posts or s.ok != c.ok or !used_ok or refused != c.refused) {
+            std.debug.print("\n{s}: {d} requests (want {d}), ok={} (want {}), refused={} (want {}), routes used", .{ c.what, posts, c.posts, s.ok, c.ok, refused, c.refused });
+            for (c.used, 0..) |u, i| std.debug.print(" {d} (want {d})", .{ srv.used[i], u });
+            std.debug.print("\n", .{});
+            return error.TestUnexpectedResult;
+        }
+        // the dial is no knob: whatever the provider said about it, the reasoning-off trial did not move
+        const q = quirkFor(io, m);
+        try std.testing.expect(q.reason_off == .unknown and q.reason_off_trial == 0);
+    }
+}
+
+test "a streamed call the engine asked to have silenced keeps its reasoning-off knob on the blocking fallback, and the dial never takes the knob's place" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = if (builtin.os.tag == .windows) .{ .block = .global } else .{ .block = .{ .slice = std.mem.span(std.c.environ) } } });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const saved_tbl = quirk_tbl;
+    const saved_dial = effort_dial;
+    const saved_refused = effort_refused;
+    const saved_next = effort_refused_next;
+    const saved_once = think_off_once;
+    defer {
+        quirk_tbl = saved_tbl;
+        effort_dial = saved_dial;
+        effort_refused = saved_refused;
+        effort_refused_next = saved_next;
+        think_off_once = saved_once;
+    }
+    quirk_tbl = @splat(.{});
+    effort_refused = @splat(0);
+    effort_refused_next = 0;
+    var turn: HostedTurn = undefined;
+    try turn.begin(gpa, io);
+    defer turn.end(gpa);
+    const Probe = struct {
+        fn onDelta(ctx: *anyopaque, kind: DeltaKind, text: []const u8) void {
+            _ = ctx;
+            _ = kind;
+            _ = text;
+        }
+    };
+
+    const root = "zig-llm-effortonce-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, root, .default_dir) catch {};
+
+    const m = "test/effort-once";
+    noteReasons(io, m);
+    // a learned knob: the `template` trial confirmed by a silent reply
+    observeReasonOff(io, m, reasonOffFor(io, "compact", m), true, false);
+    try std.testing.expect(quirkFor(io, m).reason_off == .template);
+    const msgs = "{\"role\":\"user\",\"content\":\"continue\"}";
+    const no_stream = "{\"error\":{\"message\":\"streaming is not available on this route\"}}";
+    const answered = fakehttp.wire("{\"choices\":[{\"message\":{\"content\":\"answered\"}}]}");
+    const R_STREAM = 0;
+    const R_STACKED = 1;
+    const R_KNOB = 2;
+    const R_DIAL = 3;
+    // every stream is refused (no SSE line, so the call falls back to complete()); the blocking bodies are told apart
+    const routes = [_]fakehttp.Route{
+        .{ .method = "POST", .path = "/chat/completions", .reply = std.fmt.comptimePrint("HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ no_stream.len, no_stream }), .has = &.{"\"stream\":true"} },
+        .{ .method = "POST", .path = "/chat/completions", .reply = answered, .has = &.{ "chat_template_kwargs", "\"reasoning_effort\"" } },
+        .{ .method = "POST", .path = "/chat/completions", .reply = answered, .has = &.{"chat_template_kwargs"} },
+        .{ .method = "POST", .path = "/chat/completions", .reply = answered, .has = &.{"\"reasoning_effort\":\"max\""} },
+    };
+    const prev = armReasoningEffort(.max);
+    defer restoreReasoningEffort(prev);
+    // silenced (the continuation after a cut reply), then an ordinary answer: the fallback carries what the stream did
+    for ([_]bool{ true, false }) |once| {
+        var srv: fakehttp.Server = undefined;
+        try srv.startRouted(io, &routes, answered);
+        var srv_up = true;
+        defer if (srv_up) srv.stop();
+        var ub: [64]u8 = undefined;
+        const base = try std.fmt.bufPrint(&ub, "http://127.1:{d}/v1", .{srv.port});
+        think_off_once = once;
+        var ctx: u8 = 0;
+        var s = completeStream(gpa, io, root, "chat", base, "key-a", m, msgs, "", 64, -1, &ctx, Probe.onDelta, null);
+        defer s.deinit(gpa);
+        srv.stop();
+        srv_up = false;
+        try std.testing.expect(s.ok);
+        try std.testing.expectEqualStrings("answered", s.content);
+        try std.testing.expect(!think_off_once); // spent, by the call it was for
+        if (srv.countCalls("POST", "/chat/completions") != 2 or srv.used[R_STREAM] != 1 or srv.used[R_STACKED] != 0 or srv.used[R_KNOB] != @intFromBool(once) or srv.used[R_DIAL] != @intFromBool(!once)) {
+            std.debug.print("\nsilenced={}: {d} requests, streams {d}, knob with the dial {d}, fallback with the knob {d}, fallback with the dial {d}\n", .{ once, srv.countCalls("POST", "/chat/completions"), srv.used[R_STREAM], srv.used[R_STACKED], srv.used[R_KNOB], srv.used[R_DIAL] });
+            return error.TestUnexpectedResult;
+        }
+    }
 }
 
 test "the scratch sweeps know a call's own body from the copy a replay starts from" {

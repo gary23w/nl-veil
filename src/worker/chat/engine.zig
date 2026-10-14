@@ -2708,6 +2708,22 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     llm.retry_rekey = &llmRetryRekey;
     llm.armRetries();
     defer llm.disarmRetries();
+    // THE OPERATOR'S REASONING-EFFORT DIAL (llm.ReasoningEffort): NL_REASONING_EFFORT = low | high | max in the server's
+    // env, off when unset or anything else. Armed for this thread beside the retry budget, so every model call the turn
+    // makes may carry it (llm.effortFor decides per call), and put back on every exit by the defer. RESTORED, not
+    // disarmed: a turn nested on this thread (spawnTurn's inline fallback) runs on its own reading of the env and hands
+    // the parent's setting back when it ends, where its llm.disarmRetries above leaves the parent's budget unarmed.
+    const effort = reasoningEffortEnv(app.sup.parent_env);
+    const effort_prev = llm.armReasoningEffort(effort);
+    defer llm.restoreReasoningEffort(effort_prev);
+    // A coding model whose provider refused the dial earlier in this process is called without it (llm.effortRefused, RAM
+    // only): the line says so, so a run log never reads "armed" alone for a turn whose calls all go at the provider's
+    // default.
+    if (effort != .off) std.log.info("chat {s}: reasoning effort {s} armed for this turn (NL_REASONING_EFFORT){s}", .{
+        conv,
+        @tagName(effort),
+        if (llm.reasoningEffortRefused(app.io, trio.coding.model)) " - but the coding model's provider refused it earlier in this process, so its calls go without it" else "",
+    });
     turn_app = app;
     defer turn_app = null;
     turn_uid = uid;
@@ -11190,6 +11206,15 @@ fn envDisabled(environ: *const std.process.Environ.Map, name: []const u8) bool {
     return std.mem.eql(u8, t, "0") or std.ascii.eqlIgnoreCase(t, "false");
 }
 
+/// The operator's reasoning-effort dial for a turn (llm.ReasoningEffort): NL_REASONING_EFFORT in the server's env, read
+/// by llm.parseReasoningEffort. The OPPOSITE default to envDisabled: this one is OFF unless it names a level exactly
+/// (low | high | max, any case, trimmed), because it changes what every request asks of the provider - a typo, an empty
+/// value, a level some provider aliases (medium, xhigh) or no env at all leaves the requests as they always were.
+fn reasoningEffortEnv(environ: ?*const std.process.Environ.Map) llm.ReasoningEffort {
+    const env = environ orelse return .off;
+    return llm.parseReasoningEffort(env.get("NL_REASONING_EFFORT"));
+}
+
 /// `reasoning` says the serving catalog marks the model as one that reasons before answering (Workers AI's
 /// `reasoning` property, via cf_oauth.reasoningFor). Its thought is spent from the same cap as its answer:
 /// ledger run H, turn 23, deepseek-v4-flash reasoned for 98 s about two disagreeing balance sets, the 8192 cap
@@ -15102,6 +15127,34 @@ test "both upgrades default ON: only an explicit 0/false disables them" {
     for ([_][]const u8{ "1", "true", "yes", "", "no", "off" }) |on| {
         try env.put("NL_CHAT_RECON", on);
         try t.expect(!envDisabled(&env, "NL_CHAT_RECON"));
+    }
+}
+
+test "the reasoning-effort dial is off unless NL_REASONING_EFFORT names a level exactly: low, high or max, in any case" {
+    const t = std.testing;
+    var env = std.process.Environ.Map.init(t.allocator);
+    defer env.deinit();
+    // no env at all, and an env without the variable: the requests every turn sent before the dial existed
+    try t.expect(reasoningEffortEnv(null) == .off);
+    try t.expect(reasoningEffortEnv(&env) == .off);
+    // the three levels, in the spellings an operator types
+    const Want = struct { v: []const u8, e: llm.ReasoningEffort };
+    for ([_]Want{
+        .{ .v = "low", .e = .low },    .{ .v = "LOW", .e = .low },   .{ .v = " low\r\n", .e = .low },
+        .{ .v = "high", .e = .high },  .{ .v = "High", .e = .high }, .{ .v = "max", .e = .max },
+        .{ .v = "\tMAX ", .e = .max },
+    }) |w| {
+        try env.put("NL_REASONING_EFFORT", w.v);
+        try t.expectEqual(w.e, reasoningEffortEnv(&env));
+    }
+    // anything else is OFF - a typo, an empty value, a level another provider aliases, a switch-shaped word - never a
+    // guess at what was meant
+    for ([_][]const u8{ "", " ", "medium", "minimal", "none", "xhigh", "1", "0", "on", "true", "lowest", "hi", "max effort" }) |v| {
+        try env.put("NL_REASONING_EFFORT", v);
+        if (reasoningEffortEnv(&env) != .off) {
+            std.debug.print("\nNL_REASONING_EFFORT=\"{s}\" read as {s}\n", .{ v, @tagName(reasoningEffortEnv(&env)) });
+            return error.TestUnexpectedResult;
+        }
     }
 }
 
