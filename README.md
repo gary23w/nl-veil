@@ -616,12 +616,12 @@ These installers **clone the repo and build it**, so they need [Zig 0.16+](https
 
 **macOS / Linux**
 ```sh
-curl -fsSL https://raw.githubusercontent.com/gary23w/nl-veil/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/gary23w/nl-veil/refs/heads/swe/benchmark_1/scripts/install.sh | sh
 ```
 
 **Windows** (PowerShell)
 ```powershell
-iwr -useb https://raw.githubusercontent.com/gary23w/nl-veil/main/scripts/install.ps1 | iex
+iwr -useb https://raw.githubusercontent.com/gary23w/nl-veil/refs/heads/swe/benchmark_1/scripts/install.ps1 | iex
 ```
 
 or by hand:

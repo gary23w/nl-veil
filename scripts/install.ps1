@@ -1,5 +1,5 @@
 # nl-veil one-command installer — Windows PowerShell
-#   iwr -useb https://raw.githubusercontent.com/gary23w/nl-veil/main/scripts/install.ps1 | iex
+#   iwr -useb https://raw.githubusercontent.com/gary23w/nl-veil/refs/heads/swe/benchmark_1/scripts/install.ps1 | iex
 #
 # What it does (and nothing more): put the repo at $env:VEIL_HOME (default ~\nl-veil), add it to
 # your user PATH so `veil` works in any new terminal, and tell you the next two commands. Zig 0.16+
@@ -25,11 +25,15 @@ elseif (Get-Command git -ErrorAction SilentlyContinue) {
 }
 else {
     Write-Host "- git not found; downloading a zip into $dir"
-    $zip = Join-Path $env:TEMP "nl-veil-main.zip"
-    Invoke-WebRequest -UseBasicParsing "$repo/archive/refs/heads/main.zip" -OutFile $zip
+    $zip = Join-Path $env:TEMP "nl-veil-benchmark.zip"
+    Invoke-WebRequest -UseBasicParsing "$repo/archive/refs/heads/swe/benchmark_1.zip" -OutFile $zip
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $archive = [System.IO.Compression.ZipFile]::OpenRead($zip)
+    try { $archiveRoot = $archive.Entries[0].FullName.Split('/')[0] }
+    finally { $archive.Dispose() }
     Expand-Archive $zip -DestinationPath $env:TEMP -Force
     New-Item -ItemType Directory -Force $dir | Out-Null
-    Copy-Item (Join-Path $env:TEMP "nl-veil-main\*") $dir -Recurse -Force
+    Copy-Item (Join-Path $env:TEMP ($archiveRoot + "\*")) $dir -Recurse -Force
     Remove-Item $zip -Force
 }
 
