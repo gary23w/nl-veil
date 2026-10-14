@@ -58,6 +58,8 @@ const MCP_HELPER_PY =
 
 extern "kernel32" fn TerminateProcess(hProcess: *anyopaque, uExitCode: u32) callconv(.winapi) i32;
 extern "kernel32" fn Sleep(dwMilliseconds: u32) callconv(.winapi) void;
+extern "kernel32" fn GetProcessId(hProcess: *anyopaque) callconv(.winapi) u32; // Child.Id is a HANDLE; taskkill wants the pid
+extern "kernel32" fn CancelIoEx(hFile: *anyopaque, lpOverlapped: ?*anyopaque) callconv(.winapi) i32;
 
 const KillGuard = struct {
     id: std.process.Child.Id,
@@ -1307,7 +1309,7 @@ pub const SCHEMA =
     \\{"type":"function","function":{"name":"share","description":"Contribute one fact to the HIVE'S SHARED ASSOCIATIVE MIND — the collective memory every teammate reads. Use this for anything the whole hive should know (a finding, a decision, a constraint, an interface you settled on). Unlike observe (your private memory), this is the team's. Write one crisp sentence and include the key entities/names so it links into the associative graph.","parameters":{"type":"object","properties":{"fact":{"type":"string"}},"required":["fact"]}}},
     \\{"type":"function","function":{"name":"recall_hive","description":"Think WITH the whole hive: spreading-activation recall across the shared collective memory AND every stored document (absorbed books/docs are searched automatically). Unlike recall (your own facts), this surfaces the CHAINED neighborhood of what ANY teammate contributed — related facts that may share no words with your query but are reached by following shared entities. Use it to ask the collective what it knows before you act. For WHOLE-document work use read_doc instead — fragments are not a summary.","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}},
     \\{"type":"function","function":{"name":"read_doc","description":"Read a stored document from long-term memory IN ORDER, one page at a time — the ONLY correct path for whole-document work (summarize, outline, review, translate). recall/recall_hive return scattered fragments; this returns the document itself. Call with NO args to list the stored documents; then pass scope (absorb's result names it) and page with from until END. [section] lines are chapter markers.","parameters":{"type":"object","properties":{"scope":{"type":"string","description":"the document scope, e.g. knowledge__doc-mybook"},"name":{"type":"string","description":"alternative: the document's label, resolved to its scope"},"from":{"type":"integer","description":"start fact index (default 0)"},"limit":{"type":"integer","description":"facts per page (default 120, max 400)"}},"required":[]}}},
-    \\{"type":"function","function":{"name":"poll","description":"WATCH something to completion instead of guessing or checking once: a bounded observe loop that samples every interval_s until done or timeout_s, returning the observation log + a verdict (matched/up/open/running/gone/quiet/done/timeout). kinds: file (a log/output file — reports growth and the new tail; done when `until` text appears, or after quiet_s with no growth), url (probe an http(s) endpoint until it answers), port (until a local tcp port accepts), process (until a process is running — or exited, with until:'gone'), command (re-run a probe command until exit 0 or output contains `until`), swarm (until this conversation's cast finishes). Use it to wait on builds, servers coming up, downloads, logs, casts. On 'timeout' you may poll again — a long wait is a CHAIN of bounded polls, never one blind sleep — but STOP after 2-3 timeouts with zero progress: the thing may never arrive; act on what you have or tell the user.","parameters":{"type":"object","properties":{"kind":{"type":"string","enum":["file","url","port","process","command","swarm"]},"target":{"type":"string","description":"path / url / port number / process name / probe command (kind swarm needs none)"},"until":{"type":"string","description":"text meaning DONE (file/command), an http status code (url), or 'gone' (process)"},"quiet_s":{"type":"integer","description":"file: also done after this many seconds of no growth"},"interval_s":{"type":"integer","description":"seconds between samples (default 3, max 30)"},"timeout_s":{"type":"integer","description":"this call's budget in seconds (default 60, max 180)"}},"required":["kind"]}}},
+    \\{"type":"function","function":{"name":"poll","description":"WATCH something to completion instead of guessing or checking once: a bounded observe loop that samples every interval_s until done or timeout_s, returning the observation log + a verdict (matched/up/open/running/gone/quiet/done/failing/timeout). kinds: file (a log/output file — reports growth and the new tail; done when `until` text appears, or after quiet_s with no growth), url (probe an http(s) endpoint until it answers), port (until a local tcp port accepts), process (until a process is running — or exited, with until:'gone'), command (re-run a probe command until exit 0 or output contains `until`; each sample shows its exit code, stdout and stderr; a probe still running when timeout_s ends is killed; one that fails the same way WITH an error message from its first samples ends the call as 'failing' — to wait out a not-ready state that prints an error, silence it: 2>/dev/null, test -f, grep -q, curl -sf), swarm (until this conversation's cast finishes). Use it to wait on builds, servers coming up, downloads, logs, casts. On 'timeout' you may poll again — a long wait is a CHAIN of bounded polls, never one blind sleep — but STOP after 2-3 timeouts with zero progress: the thing may never arrive; act on what you have or tell the user.","parameters":{"type":"object","properties":{"kind":{"type":"string","enum":["file","url","port","process","command","swarm"]},"target":{"type":"string","description":"path / url / port number / process name / probe command (kind swarm needs none)"},"until":{"type":"string","description":"text meaning DONE (file/command), an http status code (url), or 'gone' (process)"},"quiet_s":{"type":"integer","description":"file: also done after this many seconds of no growth"},"interval_s":{"type":"integer","description":"seconds between samples (default 3, max 30)"},"timeout_s":{"type":"integer","description":"this call's budget in seconds (default 60, max 180)"}},"required":["kind"]}}},
     \\{"type":"function","function":{"name":"probe","description":"PERCEIVE one cell of the hidden spatial grid (only available when the swarm has a spatial substrate). You cannot see the grid directly — you sense it ONE cell at a time. probe(x,y) reads the cell at column x, row y (both 0-based) and AUTO-RECORDS it to the hive's shared map so every teammate sees it. This is the hive's spatial superpower: divide the grid into regions, each mind probes a DIFFERENT region in parallel, and the shared map fills in far faster than one mind alone. Check the 'Discovered map' you're shown before re-probing a known cell.","parameters":{"type":"object","properties":{"x":{"type":"integer","description":"column, 0-based"},"y":{"type":"integer","description":"row, 0-based"}},"required":["x","y"]}}}
 ;
 
@@ -1398,7 +1400,7 @@ pub const CHAT_SCHEMA =
     \\{"type":"function","function":{"name":"recall","description":"Recall facts from your memory relevant to a query.","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}},
     \\{"type":"function","function":{"name":"recall_hive","description":"Think WITH the whole hive: spreading-activation recall across the shared collective memory AND every stored document (absorbed books/docs are searched automatically). Unlike recall (your own facts), this surfaces the CHAINED neighborhood of related facts reached by following shared entities. Use it for targeted questions. For WHOLE-document work use read_doc instead — fragments are not a summary.","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}},
     \\{"type":"function","function":{"name":"read_doc","description":"Read a stored document from long-term memory IN ORDER, one page at a time — the ONLY correct path for whole-document work (summarize, outline, review, translate). recall/recall_hive return scattered fragments; this returns the document itself. Call with NO args to list the stored documents; then pass scope (absorb's result names it) and page with from until END. [section] lines are chapter markers.","parameters":{"type":"object","properties":{"scope":{"type":"string","description":"the document scope, e.g. knowledge__doc-mybook"},"name":{"type":"string","description":"alternative: the document's label, resolved to its scope"},"from":{"type":"integer","description":"start fact index (default 0)"},"limit":{"type":"integer","description":"facts per page (default 120, max 400)"}},"required":[]}}},
-    \\{"type":"function","function":{"name":"poll","description":"WATCH something to completion instead of guessing or checking once: a bounded observe loop that samples every interval_s until done or timeout_s, returning the observation log + a verdict (matched/up/open/running/gone/quiet/done/timeout). kinds: file (a log/output file — reports growth and the new tail; done when `until` text appears, or after quiet_s with no growth), url (probe an http(s) endpoint until it answers), port (until a local tcp port accepts), process (until a process is running — or exited, with until:'gone'), command (re-run a probe command until exit 0 or output contains `until`), swarm (until this conversation's cast finishes). Use it to wait on builds, servers coming up, downloads, logs, casts. On 'timeout' you may poll again — a long wait is a CHAIN of bounded polls, never one blind sleep — but STOP after 2-3 timeouts with zero progress: the thing may never arrive; act on what you have or tell the user.","parameters":{"type":"object","properties":{"kind":{"type":"string","enum":["file","url","port","process","command","swarm"]},"target":{"type":"string","description":"path / url / port number / process name / probe command (kind swarm needs none)"},"until":{"type":"string","description":"text meaning DONE (file/command), an http status code (url), or 'gone' (process)"},"quiet_s":{"type":"integer","description":"file: also done after this many seconds of no growth"},"interval_s":{"type":"integer","description":"seconds between samples (default 3, max 30)"},"timeout_s":{"type":"integer","description":"this call's budget in seconds (default 60, max 180)"}},"required":["kind"]}}},
+    \\{"type":"function","function":{"name":"poll","description":"WATCH something to completion instead of guessing or checking once: a bounded observe loop that samples every interval_s until done or timeout_s, returning the observation log + a verdict (matched/up/open/running/gone/quiet/done/failing/timeout). kinds: file (a log/output file — reports growth and the new tail; done when `until` text appears, or after quiet_s with no growth), url (probe an http(s) endpoint until it answers), port (until a local tcp port accepts), process (until a process is running — or exited, with until:'gone'), command (re-run a probe command until exit 0 or output contains `until`; each sample shows its exit code, stdout and stderr; a probe still running when timeout_s ends is killed; one that fails the same way WITH an error message from its first samples ends the call as 'failing' — to wait out a not-ready state that prints an error, silence it: 2>/dev/null, test -f, grep -q, curl -sf), swarm (until this conversation's cast finishes). Use it to wait on builds, servers coming up, downloads, logs, casts. On 'timeout' you may poll again — a long wait is a CHAIN of bounded polls, never one blind sleep — but STOP after 2-3 timeouts with zero progress: the thing may never arrive; act on what you have or tell the user.","parameters":{"type":"object","properties":{"kind":{"type":"string","enum":["file","url","port","process","command","swarm"]},"target":{"type":"string","description":"path / url / port number / process name / probe command (kind swarm needs none)"},"until":{"type":"string","description":"text meaning DONE (file/command), an http status code (url), or 'gone' (process)"},"quiet_s":{"type":"integer","description":"file: also done after this many seconds of no growth"},"interval_s":{"type":"integer","description":"seconds between samples (default 3, max 30)"},"timeout_s":{"type":"integer","description":"this call's budget in seconds (default 60, max 180)"}},"required":["kind"]}}},
     \\{"type":"function","function":{"name":"get_credential","description":"Fetch ONE stored credential VALUE from the user's durable memory (the YOUR MEMORY entries shown masked as '[withheld]'). Values never ride in prompts by default — call this in the turn that actually needs one, then use it directly in that call. NEVER echo a fetched credential into replies, observe/share notes, REMEMBER lines, or files beyond the immediate use.","parameters":{"type":"object","properties":{"query":{"type":"string","description":"a few identifying words — the service or domain from the masked entry"}},"required":["query"]}}}
 ;
 
@@ -4109,7 +4111,9 @@ fn stopProcessTool(ctx: *ToolCtx, args_json: []const u8) []u8 {
     return std.fmt.allocPrint(gpa, "stop_process: pid {d} was not stopped — {s}", .{ pid, if (why.len > 0) why[0..@min(why.len, 240)] else "no such process, or it is not yours to kill" }) catch dupe(gpa, "stop_process: failed");
 }
 
-fn pollSleepMs(io: std.Io, ms: u64) void {
+fn pollSleepMs(io: std.Io, ms_in: u64) void {
+    const ms = if (builtin.is_test) (probe_seam.sleep_ms orelse ms_in) else ms_in;
+    if (ms == 0) return;
     if (builtin.os.tag == .windows) {
         pollsleep.Sleep(@intCast(@min(ms, 60_000)));
     } else {
@@ -4117,11 +4121,300 @@ fn pollSleepMs(io: std.Io, ms: u64) void {
     }
 }
 
+/// Identical failing probes, counted from the FIRST sample with no success before them, that end a command poll
+/// early (verdict `failing`). A live SWE-bench run spent 251 s, 64% of its coding time, on two polls whose probe
+/// was broken by its own quoting and failed identically 16 times from t+0. Three is enough to know.
+const PROBE_FAIL_FAST_N: u32 = 3;
+/// How much of a probe's stderr each observation carries: its TAIL, where shells and runtimes put the verdict
+/// ("unexpected EOF while looking for matching", "No such container", a traceback's last line).
+const PROBE_STDERR_TAIL: usize = 300;
+/// stdout a probe may print before the poll stops reading it (the limit std.process.run was given before).
+const PROBE_STDOUT_MAX: usize = 32 << 10;
+/// The environment variable a quoted Windows probe rides in (see runProbe), and the argv that expands it. No /D:
+/// the direct `cmd /C` route never had it and a prompt runs the user's AutoRun too, so a probe's PATH (a conda
+/// hook's, say) must not change just because the probe gained a pair of quotes.
+const PROBE_ENV = "NL_POLL_PROBE";
+const probe_argv_verbatim = [_][]const u8{ "cmd", "/S", "/C", "%" ++ PROBE_ENV ++ "%" };
+
+/// TEST SEAMS (TESTING.md: count it, never time it). `spawns` counts probes at their one choke point (runProbe);
+/// `last_bound_ms` is the bound pollTool handed the last one; `sleep_ms` replaces the between-sample sleep so the
+/// fail-fast and log tests run many samples in well under a second instead of interval_s each.
+const probe_seam = if (builtin.is_test) struct {
+    var spawns: u32 = 0;
+    var last_bound_ms: u64 = 0;
+    var sleep_ms: ?u64 = null;
+} else struct {};
+
+/// One command probe: how it ended and what it printed. Both buffers are gpa-owned (possibly empty).
+const CmdProbe = struct {
+    /// `.killed` = still running at its bound; `.overflow` = printed more than PROBE_STDOUT_MAX; `.unread` = its
+    /// output could not be read; `.unstarted` = the shell itself would not start.
+    end: enum { exited, signal, killed, overflow, unread, unstarted } = .unstarted,
+    code: u32 = 0,
+    stdout: []u8 = &.{},
+    stderr: []u8 = &.{},
+    why: []const u8 = "",
+
+    fn deinit(p: *CmdProbe, gpa: std.mem.Allocator) void {
+        gpa.free(p.stdout);
+        gpa.free(p.stderr);
+    }
+    fn ok(p: *const CmdProbe) bool {
+        return p.end == .exited and p.code == 0;
+    }
+};
+
+/// Run ONE `poll kind=command` probe the way a person would at a prompt, bounded, with both streams kept.
+///
+/// WINDOWS QUOTING. `cmd /C <target>` as one argv element cannot carry embedded double quotes. Zig's argv encoder
+/// writes them as `\"` (the CommandLineToArgvW convention); cmd.exe reads no backslash escapes, strips only the
+/// outer pair, and hands the next program `\"...\"`. Measured 2026-10-14: `echo "two words"` printed
+/// `\"two words\"`, and `cmd /D /C "echo inner ok"` failed "'\"echo inner ok\"' is not recognized". That is the
+/// shape that tore `docker exec <c> bash -lc "tail -n 5 log"` into `bash -lc '"tail'` in a live SWE-bench run,
+/// so every probe read "(non-zero exit)" for 251 s while the log already held its answer. Zig 0.16's spawn has no
+/// verbatim command-line option, so a QUOTED target rides in an environment variable that cmd expands:
+/// `cmd /S /C %NL_POLL_PROBE%`. Percent expansion runs BEFORE cmd tokenizes quotes, `&`, `|` and redirects, so
+/// the text is parsed exactly as typed, and the argument Zig encodes has no quote or space for it to escape.
+/// Chosen over a one-shot .cmd file (run.zig winRowViaScript's detour): nothing to write, name per call, delete
+/// on every exit path, or have Defender scan before each 3 s sample, and no batch semantics (`%1`, `%%`) to escape
+/// around. cmd expands that variable in ONE pass, so a `%VAR%` inside the target would stay literal
+/// (`type "%TEMP%\x.log"`); expandPercentVars does the prompt's own expansion first, against the environment the
+/// probe gets. A quote-free target keeps the direct `cmd /C` argv, where cmd expands as at a prompt; that path was
+/// never torn. POSIX `sh -c` was always verbatim. The verbatim child's environment is the process's own, which is
+/// what the direct path's child inherits through io, plus the one variable.
+///
+/// BOUND. At `bound_ms` the probe is killed with its whole tree: on Windows by taskkill /T (the declaredSmoke reap),
+/// because cmd.exe never execs; on POSIX through the process group the probe leads. Killing the shell alone leaves
+/// whatever it started running: measured 2026-10-14, the ping (Windows) and sleep (WSL dash) under a nested shell
+/// outlived a direct-child kill, and a docker exec would too. The cost of the group, accepted: a terminal's Ctrl-C
+/// signals only its foreground group, so it no longer reaches an in-flight probe directly.
+fn runProbe(ctx: *ToolCtx, target: []const u8, bound_ms: u64) CmdProbe {
+    const gpa = ctx.gpa;
+    const io = ctx.io;
+    if (builtin.is_test) probe_seam.spawns += 1;
+    const win = builtin.os.tag == .windows;
+    var env: if (win) ?std.process.Environ.Map else void = if (win) null else {};
+    defer if (win) {
+        if (env) |*m| m.deinit();
+    };
+    if (win) {
+        if (std.mem.indexOfScalar(u8, target, '"') != null) {
+            var m = (std.process.Environ{ .block = .global }).createMap(gpa) catch |e| return .{ .why = @errorName(e) };
+            const text = expandPercentVars(gpa, target, &m) catch |e| {
+                m.deinit();
+                return .{ .why = @errorName(e) };
+            };
+            defer gpa.free(text);
+            m.put(PROBE_ENV, text) catch |e| {
+                m.deinit();
+                return .{ .why = @errorName(e) };
+            };
+            env = m;
+        }
+    }
+    const direct = [3][]const u8{ if (win) "cmd" else "sh", if (win) "/C" else "-c", target };
+    const em: ?*const std.process.Environ.Map = if (win) (if (env) |*m| m else null) else null;
+    const argv: []const []const u8 = if (em != null) &probe_argv_verbatim else &direct;
+    // POSIX: its own process group, so the bound can kill the probe's whole tree (killProbeTree). dash does not exec
+    // a nested `sh -c` either: measured in WSL, killing the direct child alone left `sh -c sleep 6` and its sleep.
+    const pgid: ?std.posix.pid_t = if (win) null else 0;
+    var child = std.process.spawn(io, .{ .argv = argv, .environ_map = em, .stdin = .ignore, .stdout = .pipe, .stderr = .pipe, .create_no_window = true, .pgid = pgid }) catch |e| return .{ .why = @errorName(e) };
+    defer child.kill(io);
+    var bufs: std.Io.File.MultiReader.Buffer(2) = undefined;
+    var mr: std.Io.File.MultiReader = undefined;
+    mr.init(gpa, io, bufs.toStreams(), &.{ child.stdout.?, child.stderr.? });
+    defer mr.deinit();
+    // ONE deadline for the whole probe: a `.duration` restarts at every read, so a probe that prints a line a
+    // second would never time out.
+    const deadline = (std.Io.Timeout{ .duration = .{ .raw = .fromMilliseconds(@intCast(bound_ms)), .clock = .awake } }).toDeadline(io);
+    var p: CmdProbe = .{ .end = .exited };
+    while (mr.fill(256, deadline)) |_| {
+        if (mr.reader(0).buffered().len > PROBE_STDOUT_MAX) {
+            p.end = .overflow;
+            break;
+        }
+        // stderr is shown only as its tail, so only a tail is kept: progress bars on stderr must not grow it unbounded
+        const er = mr.reader(1);
+        if (er.buffered().len > 16 << 10) er.toss(er.buffered().len - 4096);
+    } else |e| switch (e) {
+        error.EndOfStream => {},
+        error.Timeout => p.end = .killed,
+        else => {
+            p.end = .unread;
+            p.why = @errorName(e);
+        },
+    }
+    // COPIES, never mr.toOwnedSlice. On Windows a probe cut at its bound (or past PROBE_STDOUT_MAX) still has its
+    // overlapped pipe reads pending in the kernel, aimed at r.buffer[r.end..] of these very buffers; toOwnedSlice
+    // reallocs or frees them on the spot, so whatever the probe printed during the tree kill below was copied by
+    // the kernel into heap veil no longer owned (measured: a still-printing probe's bytes turned up in released
+    // blocks under a quarantine allocator). The buffers stay the MultiReader's until its deferred deinit, whose
+    // batch cancel drains those reads before it frees anything.
+    p.stdout = gpa.dupe(u8, mr.reader(0).buffered()) catch &.{};
+    p.stderr = gpa.dupe(u8, mr.reader(1).buffered()) catch &.{};
+    if (p.end != .exited) {
+        killProbeTree(ctx, &child); // then the deferred child.kill reaps the direct child
+        // Zig 0.16's Windows batch cancel waits for an APC BEFORE it cancels, so MultiReader.deinit with reads still
+        // pending blocks until something writes to or closes the pipe. Measured: std.process.run's 1 s `.timeout` on
+        // a silent `cmd /C "ping -n 6 ... >NUL"` came back after the child's natural 5 s. The tree kill closes the
+        // pipes; cancelling our own reads covers a holder that escaped it, so the bound stays a bound.
+        if (builtin.os.tag == .windows) {
+            _ = CancelIoEx(child.stdout.?.handle, null);
+            _ = CancelIoEx(child.stderr.?.handle, null);
+        }
+        return p;
+    }
+    const term = child.wait(io) catch |e| {
+        p.end = .unread;
+        p.why = @errorName(e);
+        return p;
+    };
+    switch (term) {
+        .exited => |c| p.code = c,
+        else => p.end = .signal,
+    }
+    return p;
+}
+
+fn killProbeTree(ctx: *ToolCtx, child: *std.process.Child) void {
+    const h = child.id orelse return;
+    if (builtin.os.tag == .windows) {
+        var pb: [16]u8 = undefined;
+        const ps = std.fmt.bufPrint(&pb, "{d}", .{GetProcessId(h)}) catch return;
+        // spawnGuarded, not std.process.run's `.timeout`: that one is not a bound on Windows (see runProbe), so a
+        // taskkill stuck mid-enumeration would hold the probe; KillGuard terminates it by handle at 10 s.
+        _ = spawnGuarded(ctx.io, &.{ "taskkill", "/F", "/T", "/PID", ps }, 10_000);
+    } else {
+        std.posix.kill(-h, .KILL) catch {}; // the probe's group (runProbe made it the leader)
+        std.posix.kill(h, .KILL) catch {}; // and the leader itself, should the group signal have been refused
+    }
+}
+
+/// A cmd PROMPT's percent expansion (not a batch file's: no `%%` escape, no `%1`), done up front for a quoted
+/// Windows probe because cmd expands its NL_POLL_PROBE carrier in one pass and never rescans the result. `%NAME%`
+/// with NAME defined becomes its value, unrescanned (names case-insensitive, as the Map is on Windows); any other
+/// `%...%` keeps its text and the scan resumes AT the closing `%`, so `%UNDEF%PATH%` reads `%UNDEF` plus PATH's
+/// value and `%%` stays `%%`; a lone `%` stays. Each rule was measured against `cmd /S /C "<text>"` on 2026-10-14.
+/// Not modelled, so left literal: cmd's dynamic names (%CD%, %DATE%, %RANDOM%, %ERRORLEVEL%) and the `%NAME:~1,3%`
+/// / `%NAME:a=b%` edit forms.
+fn expandPercentVars(gpa: std.mem.Allocator, text: []const u8, env: *const std.process.Environ.Map) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(gpa);
+    var i: usize = 0;
+    while (i < text.len) {
+        if (text[i] == '%') if (std.mem.indexOfScalarPos(u8, text, i + 1, '%')) |close| {
+            const name = text[i + 1 .. close];
+            // validateKeyForFetch: Map.get asserts WTF-8 on Windows, and a model's target is arbitrary bytes
+            if (name.len > 0 and std.process.Environ.Map.validateKeyForFetch(name)) if (env.get(name)) |v| {
+                try out.appendSlice(gpa, v);
+                i = close + 1;
+                continue;
+            };
+            try out.appendSlice(gpa, text[i..close]);
+            i = close;
+            continue;
+        };
+        try out.append(gpa, text[i]);
+        i += 1;
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+/// One probe as the model reads it: how it ended, stdout's head, and stderr's TAIL when there is any. Before this
+/// a failing probe read "(non-zero exit)" and nothing else, so a probe broken by its own quoting looked exactly
+/// like one still waiting, sample after sample.
+fn probeLine(buf: []u8, p: *const CmdProbe, bound_ms: u64) []const u8 {
+    var w: std.Io.Writer = .fixed(buf);
+    switch (p.end) {
+        .exited => w.print("exit {d}", .{p.code}) catch {},
+        .signal => w.writeAll("ended by a signal") catch {},
+        .killed => w.print("killed after {d}.{d}s, still running when this call's timeout_s ran out (a probe must return on its own: no tail -f, no prompts)", .{ bound_ms / 1000, bound_ms % 1000 / 100 }) catch {},
+        .overflow => w.print("stopped: printed over {d} KB, narrow the probe (e.g. tail -n 20)", .{PROBE_STDOUT_MAX >> 10}) catch {},
+        .unread => w.print("its output could not be read ({s})", .{p.why}) catch {},
+        .unstarted => w.print("could not start the probe shell ({s})", .{p.why}) catch {},
+    }
+    if (p.end != .overflow and p.end != .unstarted) {
+        const out = std.mem.trim(u8, p.stdout, " \r\n\t");
+        if (out.len > 0) {
+            w.print(": {s}", .{out[0..@min(out.len, 220)]}) catch {};
+        } else {
+            w.writeAll(", no stdout") catch {};
+        }
+    }
+    const er = std.mem.trim(u8, p.stderr, " \r\n\t");
+    if (er.len > 0) w.print(" | stderr: {s}", .{er[er.len -| PROBE_STDERR_TAIL..]}) catch {};
+    return w.buffered();
+}
+
+/// What a command poll remembers between samples: the previous observation (an identical repeat logs as one short
+/// line, so the bounded log keeps room for the sample that finally changes) and the fail-fast streak.
+const ProbeWatch = struct {
+    last: ?u64 = null,
+    last_t: u64 = 0,
+    sig: u64 = 0,
+    streak: u32 = 0,
+    live: bool = true, // false once a probe succeeded or failed differently: no fail-fast for the rest of the call
+    signal: bool = false, // how the streak failed, kept for the result line
+    code: u32 = 0,
+    quote: [PROBE_STDERR_TAIL + 80]u8 = undefined,
+    quote_len: usize = 0,
+
+    /// The t+ of the identical observation this one repeats, or null (and it becomes the one to compare against).
+    fn repeatOf(w: *ProbeWatch, line: []const u8, secs: u64) ?u64 {
+        const h = std.hash.Wyhash.hash(0, line);
+        if (w.last) |l| if (l == h) return w.last_t;
+        w.last = h;
+        w.last_t = secs;
+        return null;
+    }
+
+    /// Feed a probe that did NOT satisfy the poll; true = end the poll now with verdict `failing`.
+    fn failFast(w: *ProbeWatch, p: *const CmdProbe) bool {
+        if (!w.live) return false;
+        const er = std.mem.trim(u8, p.stderr, " \r\n\t");
+        // A failure counts only when it SAYS something. A silent non-zero exit (`test -f done`, `grep -q EXIT=`) is
+        // the documented "until exit 0" wait itself, not a broken probe, and cutting it short would break that mode.
+        // The rule cannot tell a broken probe from a not-ready state that speaks ("connection refused", "No such
+        // file" before the file exists): both fail identically from t+0. So the `failing` result names the escape,
+        // the same silence: such a wait is re-polled with its failure muted and is never cut short again. A probe
+        // killed at its bound never counts: that bound is the call's remaining timeout_s, so it ends the call anyway.
+        const counts = p.end != .killed and !p.ok() and er.len > 0;
+        var h = std.hash.Wyhash.init(0);
+        h.update(@tagName(p.end));
+        h.update(std.mem.asBytes(&p.code));
+        h.update(er[0..@min(er.len, 200)]);
+        h.update(std.mem.trim(u8, p.stdout, " \r\n\t")); // output that changes is progress, not the same failure
+        const sig = h.final();
+        if (!counts or (w.streak > 0 and sig != w.sig)) {
+            w.live = false;
+            return false;
+        }
+        w.sig = sig;
+        w.streak += 1;
+        if (w.streak < PROBE_FAIL_FAST_N) return false;
+        // copied now: the probe's buffers are freed before the result is written
+        w.signal = p.end == .signal;
+        w.code = p.code;
+        const q = er[er.len -| PROBE_STDERR_TAIL..];
+        w.quote_len = @min(q.len, w.quote.len);
+        @memcpy(w.quote[0..w.quote_len], q[0..w.quote_len]);
+        return true;
+    }
+
+    fn guidance(w: *const ProbeWatch, buf: []u8) []const u8 {
+        var hb: [48]u8 = undefined;
+        const how = if (w.signal) "ended by a signal each time" else (std.fmt.bufPrint(&hb, "exit {d} each time", .{w.code}) catch "same exit each time");
+        return std.fmt.bufPrint(buf, " — the probe failed the same way on its first {d} runs ({s}, same error) and never once succeeded, so this poll ended early instead of spending timeout_s on it. Its error: \"{s}\". If that error means the probe itself is broken (quoting, a path, the program or container name), fix the command. If it IS the not-ready state you are waiting for (a file not written yet, a server not listening yet), poll again with that failure SILENCED: stderr sent away (2>/dev/null; 2>NUL in a Windows cmd) or a quiet form (test -f, grep -q, curl -sf). A silent failure never ends a poll early.", .{ PROBE_FAIL_FAST_N, how, w.quote[0..w.quote_len] }) catch " — the probe keeps failing the same way: fix it, or silence its stderr if that error is the not-ready state you are waiting for";
+    }
+};
+
 /// poll — WATCH SOMETHING TO COMPLETION instead of guessing or busy-asking: a bounded observe loop over a
 /// log file (growth/pattern), an http(s) url, a local tcp port, a process, a probe command, or this
 /// conversation's swarm. One call is bounded (timeout clamp 1..180s) and returns an observation log plus a
 /// verdict — on `timeout` the caller simply polls again, so a long wait is a chain of bounded calls the
-/// engine can always interrupt, never one unbounded hang.
+/// engine can always interrupt, never one unbounded hang. A command probe runs as typed at a prompt, is killed
+/// if it would outlive the call (runProbe), reports its exit code and stderr tail, and a probe failing the same
+/// SPOKEN way from the first sample ends the call early as `failing` with its error quoted (ProbeWatch).
 fn pollTool(ctx: *ToolCtx, args_json: []const u8) []u8 {
     const gpa = ctx.gpa;
     const A = struct {
@@ -4154,10 +4447,17 @@ fn pollTool(ctx: *ToolCtx, args_json: []const u8) []u8 {
     var last_size: u64 = 0;
     var quiet_since: u64 = 0; // elapsed seconds when the file last grew
     var have_size = false;
+    var pw: ProbeWatch = .{}; // kind command only
     const obs = struct {
         fn line(g: std.mem.Allocator, l: *std.ArrayListUnmanaged(u8), secs: u64, text: []const u8) void {
-            if (l.items.len > 6000) return; // bounded log — the verdict matters more than every tick
-            l.print(g, "t+{d}s: {s}\n", .{ secs, if (text.len > 220) text[0..220] else text }) catch {};
+            lineCap(g, l, secs, text, 220, false);
+        }
+        /// `decides` = the sample that settles the verdict: logged past the bound, one line at most, because it
+        /// is the one the model needs. A command observation runs ~550 bytes with its stderr tail, so the bound
+        /// fills after ~11 distinct samples, and the matched line carrying the EXIT= being waited for was dropped.
+        fn lineCap(g: std.mem.Allocator, l: *std.ArrayListUnmanaged(u8), secs: u64, text: []const u8, cap: usize, decides: bool) void {
+            if (l.items.len > 6000 and !decides) return; // bounded log — the verdict matters more than every tick
+            l.print(g, "t+{d}s: {s}\n", .{ secs, if (text.len > cap) text[0..cap] else text }) catch {};
         }
     };
     while (true) {
@@ -4273,18 +4573,34 @@ fn pollTool(ctx: *ToolCtx, args_json: []const u8) []u8 {
                 }
             },
             .command => {
-                const r = std.process.run(gpa, ctx.io, .{ .argv = if (builtin.os.tag == .windows) &.{ "cmd", "/C", target } else &.{ "sh", "-c", target }, .stdout_limit = .limited(32 << 10) }) catch {
+                // The probe's bound is what is left of THIS call's timeout_s. The budget used to be checked only
+                // BETWEEN samples, so one hung probe (`tail -f`, a prompt nobody sees) held the poll and the turn's
+                // thread forever; now it is killed when the call would have ended. Not a shorter fixed cap: a slow
+                // but finite probe (a 40 s `pytest | tail -3`, a `kubectl wait`) that matched inside the call before
+                // must still match, and only a probe that would outlive the call is cut.
+                const bound_ms: u64 = @max(1, timeout -| elapsed) * 1000;
+                if (builtin.is_test) probe_seam.last_bound_ms = bound_ms;
+                var pr = runProbe(ctx, target, bound_ms);
+                defer pr.deinit(gpa);
+                const errored = pr.end == .unstarted or pr.end == .overflow or pr.end == .unread;
+                // a probe killed at its bound still counts what it printed: the text did appear
+                const done = !errored and (if (until.len > 0) std.mem.indexOf(u8, pr.stdout, until) != null else pr.ok());
+                var lb: [720]u8 = undefined;
+                const seen = probeLine(&lb, &pr, bound_ms);
+                if (pw.repeatOf(seen, elapsed)) |first| {
+                    var sb: [40]u8 = undefined;
+                    obs.line(gpa, &log, elapsed, std.fmt.bufPrint(&sb, "(same as t+{d}s)", .{first}) catch "(same as before)");
+                } else obs.lineCap(gpa, &log, elapsed, seen, lb.len, done or errored);
+                if (errored) {
                     verdict = "error";
                     break;
-                };
-                defer gpa.free(r.stdout);
-                defer gpa.free(r.stderr);
-                const out = std.mem.trim(u8, r.stdout, " \r\n\t");
-                const ok_exit = r.term == .exited and r.term.exited == 0;
-                obs.line(gpa, &log, elapsed, if (out.len > 0) out else if (ok_exit) "(exit 0)" else "(non-zero exit)");
-                const done = if (until.len > 0) std.mem.indexOf(u8, out, until) != null else ok_exit;
+                }
                 if (done) {
                     verdict = "matched";
+                    break;
+                }
+                if (pw.failFast(&pr)) {
+                    verdict = "failing";
                     break;
                 }
             },
@@ -4305,8 +4621,11 @@ fn pollTool(ctx: *ToolCtx, args_json: []const u8) []u8 {
         if (now + interval > timeout) break;
         pollSleepMs(ctx.io, interval * 1000);
     }
+    var gb: [PROBE_STDERR_TAIL + 800]u8 = undefined;
     const guidance = if (std.mem.eql(u8, verdict, "stopped"))
         " — the USER stopped this watch. Do not start another poll; say what the log shows and wait for them."
+    else if (std.mem.eql(u8, verdict, "failing"))
+        pw.guidance(&gb)
     else if (std.mem.eql(u8, verdict, "interrupted"))
         " — the USER said something while you were watching. Read it and answer THAT first; resume polling only if they still want the wait."
     else if (std.mem.eql(u8, verdict, "timeout"))
@@ -8323,6 +8642,394 @@ test "poll file: an already-present pattern matches on the first sample, tail in
     const sw = pollTool(&ctx, "{\"kind\":\"swarm\",\"timeout_s\":1,\"interval_s\":1}");
     try std.testing.expect(std.mem.indexOf(u8, sw, "-> timeout") != null);
     try std.testing.expect(std.mem.indexOf(u8, sw, "Poll again ONLY if") != null);
+}
+
+/// Test-only: a ToolCtx over the REAL process environment (TESTING.md: an empty one leaves a Windows child without
+/// SystemRoot/PATH) for the command-poll tests, with the probe seams reset. Pinned in place: the ctx points into it.
+const PollFixture = struct {
+    threaded: std.Io.Threaded,
+    env: std.process.Environ.Map,
+    counters: [6]u32,
+
+    fn init(f: *PollFixture, gpa: std.mem.Allocator) !void {
+        const environ: std.process.Environ = if (builtin.os.tag == .windows)
+            .{ .block = .global }
+        else
+            .{ .block = .{ .slice = std.mem.span(std.c.environ) } };
+        f.threaded = std.Io.Threaded.init(gpa, .{ .environ = environ });
+        f.env = environ.createMap(gpa) catch |e| {
+            f.threaded.deinit();
+            return e;
+        };
+        f.counters = .{0} ** 6;
+        probe_seam.spawns = 0;
+        probe_seam.last_bound_ms = 0;
+        probe_seam.sleep_ms = null;
+    }
+    fn deinit(f: *PollFixture) void {
+        probe_seam.sleep_ms = null;
+        f.env.deinit();
+        f.threaded.deinit();
+    }
+    /// A fresh cwd-relative dir for a probe that writes files: probes run in the process cwd (TESTING.md's pattern;
+    /// the caller defers the deleteTree).
+    fn scratch(f: *PollFixture, root: []const u8) void {
+        const io = f.threaded.io();
+        std.Io.Dir.cwd().deleteTree(io, root) catch {};
+        _ = std.Io.Dir.cwd().createDirPathStatus(io, root, .default_dir) catch {};
+    }
+    fn ctx(f: *PollFixture, gpa: std.mem.Allocator) ToolCtx {
+        return .{
+            .gpa = gpa,
+            .io = f.threaded.io(),
+            .environ = &f.env,
+            .run_dir = ".",
+            .workdir = ".",
+            .scope = "test",
+            .mind = "test",
+            .round = 0,
+            .mem = undefined, // a command poll never touches memory
+            .files_written = &f.counters[0],
+            .observed = &f.counters[1],
+            .skills_saved = &f.counters[2],
+            .directives_set = &f.counters[3],
+            .tools_made = &f.counters[4],
+        };
+    }
+};
+
+test "poll command: a probe with embedded double quotes runs as typed at a prompt, so a nested shell gets its script whole (real shell)" {
+    const gpa = std.testing.allocator;
+    var f: PollFixture = undefined;
+    try f.init(gpa);
+    defer f.deinit();
+    var ctx = f.ctx(gpa);
+    probe_seam.sleep_ms = 0; // a miss would re-sample at once, not sleep interval_s
+    // The live failure's shape: `docker exec <c> bash -lc "tail -n 5 log"` is one program handing a QUOTED script
+    // to an inner interpreter. cmd and sh stand in for docker and bash on every host. Before the fix, Windows
+    // delivered the script as `\"echo inner ok\"` and the inner cmd answered "is not recognized" on every sample.
+    const args = if (builtin.os.tag == .windows)
+        \\{"kind":"command","target":"cmd /D /C \"echo inner ok\"","until":"inner ok","timeout_s":30,"interval_s":1}
+    else
+        \\{"kind":"command","target":"sh -c \"echo inner ok\"","until":"inner ok","timeout_s":30,"interval_s":1}
+    ;
+    const out = pollTool(&ctx, args);
+    defer gpa.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "-> matched") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "t+0s: exit 0: inner ok") != null);
+    if (builtin.os.tag == .windows) {
+        // ...and quotes reach the program as typed, not as the argv encoder's `\"two words\"`
+        const typed = pollTool(&ctx,
+            \\{"kind":"command","target":"echo \"two words\"","timeout_s":30,"interval_s":1}
+        );
+        defer gpa.free(typed);
+        try std.testing.expect(std.mem.indexOf(u8, typed, "exit 0: \"two words\"") != null);
+        // ...and a %VAR% inside them expands as at a prompt (cmd expands the NL_POLL_PROBE carrier only once), while
+        // an undefined name stays as typed, as a prompt leaves it
+        const sys = f.env.get("SystemRoot") orelse return error.SkipZigTest;
+        const pct = pollTool(&ctx,
+            \\{"kind":"command","target":"echo \"%SystemRoot%\" \"%NL_POLL_NO_SUCH_VAR%\"","timeout_s":30,"interval_s":1}
+        );
+        defer gpa.free(pct);
+        var wb: [512]u8 = undefined;
+        const want = try std.fmt.bufPrint(&wb, "exit 0: \"{s}\" \"%NL_POLL_NO_SUCH_VAR%\"", .{sys});
+        try std.testing.expect(std.mem.indexOf(u8, pct, want) != null);
+    }
+}
+
+test "expandPercentVars: a quoted Windows probe gets a cmd PROMPT's expansion, rule for rule as measured" {
+    const gpa = std.testing.allocator;
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    try env.put("NLX_A", "alpha");
+    try env.put("NLX_PCT", "has%NLX_A%inside");
+    // each expected value is what `cmd /S /C "echo <in>"` printed on 2026-10-14 with the same two variables set
+    const rows = [_][2][]const u8{
+        .{ "\"%NLX_A%\"", "\"alpha\"" },
+        .{ "\"%NLX_UNDEF%\"", "\"%NLX_UNDEF%\"" }, // undefined: kept as typed
+        .{ "\"%NLX_UNDEF%NLX_A%\"", "\"%NLX_UNDEFalpha\"" }, // ...and the scan resumes AT its closing %
+        .{ "\"100%\"", "\"100%\"" },
+        .{ "\"a %% b\"", "\"a %% b\"" }, // no batch-file %% escape at a prompt
+        .{ "\"%%NLX_A%%\"", "\"%alpha%\"" },
+        .{ "\"%NLX_PCT%\"", "\"has%NLX_A%inside\"" }, // a value is never rescanned
+        .{ "\"% %\"", "\"% %\"" },
+        .{ "\"%NLX_A%%NLX_A%\"", "\"alphaalpha\"" },
+        .{ "x%\"NLX_A\"%y", "x%\"NLX_A\"%y" },
+    };
+    for (rows) |r| {
+        const got = try expandPercentVars(gpa, r[0], &env);
+        defer gpa.free(got);
+        try std.testing.expectEqualStrings(r[1], got);
+    }
+    // names are case-insensitive on Windows, as cmd's are (and as the Map is there)
+    if (builtin.os.tag == .windows) {
+        const got = try expandPercentVars(gpa, "%nlx_a%", &env);
+        defer gpa.free(got);
+        try std.testing.expectEqualStrings("alpha", got);
+    }
+}
+
+test "poll command: a failing probe's observation carries its exit code and its stderr tail, so it explains itself (real shell)" {
+    const gpa = std.testing.allocator;
+    var f: PollFixture = undefined;
+    try f.init(gpa);
+    defer f.deinit();
+    var ctx = f.ctx(gpa);
+    probe_seam.sleep_ms = 0; // it repeats until fail-fast ends it, with no interval_s sleeps between
+    // Before: "(non-zero exit)" and nothing else, so a broken probe and a still-waiting one read the same.
+    const args = if (builtin.os.tag == .windows)
+        \\{"kind":"command","target":"cmd /D /C \"echo boom-on-stderr 1>&2 & exit /b 3\"","timeout_s":30,"interval_s":1}
+    else
+        \\{"kind":"command","target":"sh -c \"echo boom-on-stderr 1>&2; exit 3\"","timeout_s":30,"interval_s":1}
+    ;
+    const out = pollTool(&ctx, args);
+    defer gpa.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "t+0s: exit 3, no stdout | stderr: boom-on-stderr") != null);
+}
+
+test "poll command: a probe that would outlive the call is killed, with everything it started, when timeout_s runs out (real shell)" {
+    const gpa = std.testing.allocator;
+    var f: PollFixture = undefined;
+    try f.init(gpa);
+    defer f.deinit();
+    const io = f.threaded.io();
+    const root = "zig-pollkill-tmp";
+    f.scratch(root);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    var ctx = f.ctx(gpa);
+    // A QUOTE-FREE target (cmd's direct route) whose real work runs a level down: ping under cmd, a loop in a nested
+    // sh. Killing only the direct child leaves that grandchild running, and the old probe (std.process.run) waited
+    // for all of it to end on its own. end.txt is written only by such a natural end. No process listing needed:
+    // ping holds held.txt open (cmd's redirect shares no delete), the loop keeps growing hb.txt, so either file
+    // says whether anything survived.
+    const args = if (builtin.os.tag == .windows)
+        \\{"kind":"command","target":"ping -n 30 127.0.0.1 >zig-pollkill-tmp\\held.txt 2>&1 & echo natural>zig-pollkill-tmp\\end.txt","until":"never","timeout_s":1,"interval_s":1}
+    else
+        \\{"kind":"command","target":"sh -c 'i=0; while [ $i -lt 100 ]; do echo x >> zig-pollkill-tmp/hb.txt; i=$((i+1)); sleep 0.1; done'; echo natural > zig-pollkill-tmp/end.txt","until":"never","timeout_s":1,"interval_s":1}
+    ;
+    const out = pollTool(&ctx, args);
+    defer gpa.free(out);
+    try std.testing.expectEqual(@as(u32, 1), probe_seam.spawns);
+    try std.testing.expect(std.mem.startsWith(u8, out, "poll command -> timeout"));
+    try std.testing.expect(std.mem.indexOf(u8, out, "t+0s: killed after 1.0s, still running when this call's timeout_s ran out") != null);
+    // cut at the bound, not waited out
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, root ++ "/end.txt", .{}));
+    if (builtin.os.tag == .windows) {
+        // held.txt deletes only once ping is gone: retried briefly while the killed tree's handles close
+        var tries: u32 = 0;
+        while (true) : (tries += 1) {
+            if (std.Io.Dir.cwd().deleteFile(io, root ++ "/held.txt")) |_| break else |e| {
+                if (e == error.FileNotFound or tries >= 40) return e; // FileNotFound = ping never ran: no proof
+                pollSleepMs(io, 50);
+            }
+        }
+    } else {
+        // the heartbeat stopped: nothing is left to write it
+        const s1 = (try std.Io.Dir.cwd().statFile(io, root ++ "/hb.txt", .{})).size;
+        pollSleepMs(io, 500);
+        const s2 = (try std.Io.Dir.cwd().statFile(io, root ++ "/hb.txt", .{})).size;
+        try std.testing.expect(s1 > 0);
+        try std.testing.expectEqual(s1, s2);
+    }
+}
+
+/// Test-only: an allocator that never hands memory back while a test runs. Every block released through it (freed,
+/// or left behind by a realloc, which it never does in place) is filled with 0xAA and parked, so `dirty` counts
+/// bytes written through a pointer the code had already given up. All of it reaches the backing allocator at
+/// deinit, so std.testing.allocator still counts leaks.
+const Quarantine = struct {
+    const Parked = struct { mem: []u8, alignment: std.mem.Alignment };
+    backing: std.mem.Allocator,
+    parked: std.ArrayListUnmanaged(Parked) = .empty,
+
+    fn allocator(q: *Quarantine) std.mem.Allocator {
+        return .{ .ptr = q, .vtable = &.{ .alloc = alloc, .resize = std.mem.Allocator.noResize, .remap = std.mem.Allocator.noRemap, .free = free } };
+    }
+    fn alloc(c: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const q: *Quarantine = @ptrCast(@alignCast(c));
+        return q.backing.rawAlloc(len, a, ra);
+    }
+    fn free(c: *anyopaque, mem: []u8, a: std.mem.Alignment, ra: usize) void {
+        const q: *Quarantine = @ptrCast(@alignCast(c));
+        @memset(mem, 0xAA);
+        q.parked.append(q.backing, .{ .mem = mem, .alignment = a }) catch q.backing.rawFree(mem, a, ra);
+    }
+    fn dirty(q: *const Quarantine) usize {
+        var n: usize = 0;
+        for (q.parked.items) |b| {
+            for (b.mem) |x| n += @intFromBool(x != 0xAA);
+        }
+        return n;
+    }
+    fn deinit(q: *Quarantine) void {
+        for (q.parked.items) |b| q.backing.rawFree(b.mem, b.alignment, @returnAddress());
+        q.parked.deinit(q.backing);
+    }
+};
+
+test "poll command: a probe cut at its bound while still printing writes nothing into memory the poll already released (real shell)" {
+    const gpa = std.testing.allocator;
+    var q: Quarantine = .{ .backing = gpa };
+    defer q.deinit();
+    var f: PollFixture = undefined;
+    try f.init(gpa);
+    defer f.deinit();
+    const io = f.threaded.io();
+    const root = "zig-pollquar-tmp";
+    f.scratch(root);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    // Prints on BOTH streams every few ms for far longer than the call, so its pipe reads are in flight when the
+    // bound fires and it keeps printing through the tree kill. On Windows those reads are overlapped: the kernel
+    // writes them into whatever buffer they were aimed at, owned or not.
+    if (builtin.os.tag == .windows) {
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/chatty.cmd", .data = "@echo off\r\nfor /L %%i in (1,1,400) do (\r\necho out %%i\r\necho err %%i 1>&2\r\nping -n 1 127.0.0.1 >NUL\r\n)\r\n" });
+    } else {
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/chatty.sh", .data = "i=0\nwhile [ $i -lt 400 ]; do echo out $i; echo err $i >&2; i=$((i+1)); sleep 0.01; done\n" });
+    }
+    var ctx = f.ctx(q.allocator());
+    const args = if (builtin.os.tag == .windows)
+        \\{"kind":"command","target":"zig-pollquar-tmp\\chatty.cmd","until":"never","timeout_s":1,"interval_s":1}
+    else
+        \\{"kind":"command","target":"sh zig-pollquar-tmp/chatty.sh","until":"never","timeout_s":1,"interval_s":1}
+    ;
+    const out = pollTool(&ctx, args);
+    defer q.allocator().free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "killed after 1.0s") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "out 1") != null); // it was printing when cut
+    try std.testing.expect(q.parked.items.len > 0); // the poll's own buffers went through the quarantine
+    try std.testing.expectEqual(@as(usize, 0), q.dirty());
+}
+
+test "poll command: a probe may run for all that is left of the call's timeout_s, so a slow but finite probe still matches (real shell)" {
+    const gpa = std.testing.allocator;
+    var f: PollFixture = undefined;
+    try f.init(gpa);
+    defer f.deinit();
+    var ctx = f.ctx(gpa);
+    const out = pollTool(&ctx,
+        \\{"kind":"command","target":"echo ready","until":"ready","timeout_s":60,"interval_s":1}
+    );
+    defer gpa.free(out);
+    try std.testing.expect(std.mem.startsWith(u8, out, "poll command -> matched"));
+    // The bound handed to the first probe is the call's whole budget (less the at most one second the clock may
+    // have ticked), not a shorter fixed cap that would kill a 40 s `pytest | tail -3` on every sample.
+    try std.testing.expect(probe_seam.last_bound_ms >= 59_000 and probe_seam.last_bound_ms <= 60_000);
+}
+
+test "poll command: the sample that settles the poll is in its log even after long observations filled it (real shell)" {
+    const gpa = std.testing.allocator;
+    var f: PollFixture = undefined;
+    try f.init(gpa);
+    defer f.deinit();
+    const io = f.threaded.io();
+    const root = "zig-pollcap-tmp";
+    f.scratch(root);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    var ctx = f.ctx(gpa);
+    probe_seam.sleep_ms = 0;
+    // Each sample appends a line to count.txt and prints the file's size first (cmd: "x\r\n", 3 bytes a line, so 45
+    // on the 15th; no space before its `&`, or echo writes it too; sh: 2, so 30), then a 220-byte stdout head and a
+    // 300-byte stderr tail: ~550 bytes an observation, so
+    // the 6000-byte log is full after 11, and the poll matches on the 15th. Quote-free, and cmd-builtin only (a
+    // `find` would be Git's on some PATHs).
+    const pad_out = "P" ** 220;
+    const pad_err = "E" ** 300;
+    const win = builtin.os.tag == .windows;
+    const args = if (win)
+        try std.fmt.allocPrint(gpa,
+            \\{{"kind":"command","target":"echo x>>zig-pollcap-tmp\\count.txt& for %A in (zig-pollcap-tmp\\count.txt) do @echo %~zA & echo {s} & echo {s} 1>&2","until":"45","timeout_s":60,"interval_s":1}}
+        , .{ pad_out, pad_err })
+    else
+        try std.fmt.allocPrint(gpa,
+            \\{{"kind":"command","target":"echo x >> zig-pollcap-tmp/count.txt; wc -c < zig-pollcap-tmp/count.txt; echo {s}; echo {s} >&2","until":"30","timeout_s":60,"interval_s":1}}
+        , .{ pad_out, pad_err });
+    defer gpa.free(args);
+    const out = pollTool(&ctx, args);
+    defer gpa.free(out);
+    try std.testing.expect(std.mem.startsWith(u8, out, "poll command -> matched"));
+    try std.testing.expectEqual(@as(u32, 15), probe_seam.spawns);
+    try std.testing.expect(std.mem.indexOf(u8, out, if (win) "exit 0: 42" else "exit 0: 28") == null); // the bound dropped samples...
+    try std.testing.expect(std.mem.indexOf(u8, out, if (win) "exit 0: 45" else "exit 0: 30") != null); // ...not the deciding one
+}
+
+test "poll command: a probe failing the same way from its first sample ends the poll early, error quoted (real shell)" {
+    const gpa = std.testing.allocator;
+    var f: PollFixture = undefined;
+    try f.init(gpa);
+    defer f.deinit();
+    var ctx = f.ctx(gpa);
+    probe_seam.sleep_ms = 0; // the budget below allows far more than PROBE_FAIL_FAST_N samples
+    const args = if (builtin.os.tag == .windows)
+        \\{"kind":"command","target":"cmd /D /C \"echo probe is broken 1>&2 & exit /b 2\"","until":"EXIT=","timeout_s":5,"interval_s":1}
+    else
+        \\{"kind":"command","target":"sh -c \"echo probe is broken 1>&2; exit 2\"","until":"EXIT=","timeout_s":5,"interval_s":1}
+    ;
+    const out = pollTool(&ctx, args);
+    defer gpa.free(out);
+    try std.testing.expectEqual(PROBE_FAIL_FAST_N, probe_seam.spawns);
+    try std.testing.expect(std.mem.startsWith(u8, out, "poll command -> failing"));
+    try std.testing.expect(std.mem.indexOf(u8, out, "(exit 2 each time, same error)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Its error: \"probe is broken\"") != null);
+    // The rule cannot tell a broken probe from a not-ready state that prints an error ("connection refused"), so
+    // the result must name the way to WAIT on the latter: the same probe silenced, which never ends a poll early.
+    try std.testing.expect(std.mem.indexOf(u8, out, "SILENCED") != null and std.mem.indexOf(u8, out, "2>/dev/null") != null);
+    // the repeats log as one short line each, so the bounded log keeps room for a sample that changes
+    try std.testing.expect(std.mem.indexOf(u8, out, "(same as t+0s)") != null);
+    // ...and the engine's poll budget counts this REAL result as a fruitless wait instead of zeroing its streak
+    try std.testing.expectEqual(@as(u32, 2), @import("chat/engine.zig").pollStreakAfter(1, out));
+}
+
+test "ProbeWatch: only a probe that fails the same SPOKEN way from the first sample ends the poll; silent exits keep waiting" {
+    const P = struct {
+        fn mk(end: @FieldType(CmdProbe, "end"), code: u32, out: []const u8, err: []const u8) CmdProbe {
+            return .{ .end = end, .code = code, .stdout = @constCast(out), .stderr = @constCast(err) };
+        }
+    };
+    const broken = P.mk(.exited, 2, "", "bash: -c: line 1: unexpected EOF while looking for matching `\"'\n");
+    const Cut = struct { // the 1-based sample that ended the poll, or null if none of `limit` did
+        fn at(w: *ProbeWatch, p: *const CmdProbe, limit: u32) ?u32 {
+            for (1..limit + 1) |i| if (w.failFast(p)) return @intCast(i);
+            return null;
+        }
+    };
+    { // identical spoken failures: cut at exactly PROBE_FAIL_FAST_N, the error kept for the result
+        var w: ProbeWatch = .{};
+        try std.testing.expectEqual(@as(?u32, PROBE_FAIL_FAST_N), Cut.at(&w, &broken, 10));
+        try std.testing.expect(std.mem.indexOf(u8, w.quote[0..w.quote_len], "unexpected EOF") != null);
+    }
+    { // a SILENT non-zero exit is the documented "until exit 0" wait (`test -f done`): never cut short
+        var w: ProbeWatch = .{};
+        const silent = P.mk(.exited, 1, "", "");
+        for (0..PROBE_FAIL_FAST_N * 3) |_| try std.testing.expect(!w.failFast(&silent));
+        // ...and it disarms the streak for the rest of the call, so a later spoken failure is no "first N"
+        for (0..PROBE_FAIL_FAST_N * 3) |_| try std.testing.expect(!w.failFast(&broken));
+    }
+    { // a success before the streak completes disarms it
+        var w: ProbeWatch = .{};
+        const ok = P.mk(.exited, 0, "not yet", "");
+        try std.testing.expect(!w.failFast(&broken));
+        try std.testing.expect(!w.failFast(&ok));
+        for (0..PROBE_FAIL_FAST_N * 3) |_| try std.testing.expect(!w.failFast(&broken));
+    }
+    { // a failure that CHANGES (new stdout = progress) is not the same failure
+        var w: ProbeWatch = .{};
+        try std.testing.expect(!w.failFast(&broken));
+        const moved = P.mk(.exited, 2, "12% done", broken.stderr);
+        try std.testing.expect(!w.failFast(&moved));
+        for (0..PROBE_FAIL_FAST_N * 3) |_| try std.testing.expect(!w.failFast(&broken));
+    }
+    { // a killed probe never counts, stderr or not: its bound is the call's remaining timeout_s, so it ends the call
+        var w: ProbeWatch = .{};
+        const hung = P.mk(.killed, 0, "", "still waiting\n");
+        try std.testing.expectEqual(@as(?u32, null), Cut.at(&w, &hung, 10));
+    }
+    { // a probe that dies by a signal each time is named so, not as "exit 0"
+        var w: ProbeWatch = .{};
+        const segv = P.mk(.signal, 0, "", "Segmentation fault\n");
+        try std.testing.expectEqual(@as(?u32, PROBE_FAIL_FAST_N), Cut.at(&w, &segv, 10));
+        var gb: [PROBE_STDERR_TAIL + 800]u8 = undefined;
+        try std.testing.expect(std.mem.indexOf(u8, w.guidance(&gb), "(ended by a signal each time, same error)") != null);
+    }
 }
 
 test "localCoversQuery gates the RAG prepend: on-topic passes, fiction matched on one word fails" {
