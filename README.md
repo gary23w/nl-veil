@@ -2,6 +2,8 @@
 
 # the veil
 
+[![Email info](https://img.shields.io/badge/Email%20info-garystimpson03%40gmail.com-2563eb?logo=gmail&logoColor=white)](mailto:garystimpson03@gmail.com)
+
 **An AI coding team that remembers your project.**
 
 the Veil (nl-veil) is an open-source desktop app for building software with AI. Give it a task,
