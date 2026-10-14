@@ -137,6 +137,46 @@ pub fn isNumberedAnchor(s: []const u8) bool {
     return !a.eof and !a.bof;
 }
 
+/// The `N:abc[:def]` text of a numbered anchor — the form a model copies back. Normalised: whatever decoration
+/// or `→content` suffix the raw string carried is gone, so it can be echoed into an error as a ready-made fix.
+pub fn formatAnchor(a: Anchor, buf: *[24]u8) []const u8 {
+    if (a.has_ctx) return std.fmt.bufPrint(buf, "{d}:{s}:{s}", .{ a.line, &a.local, &a.ctx }) catch unreachable;
+    return std.fmt.bufPrint(buf, "{d}:{s}", .{ a.line, &a.local }) catch unreachable;
+}
+
+/// An anchor string that spans SEVERAL lines and OPENS with a line tag — a block of the read view pasted into
+/// one op's anchor (`41:abc:def→…\n42:bcd:efg→…\n…`). `lines` counts the block's lines; `first` is its
+/// opening tag, `last` the final line that still carries one (null when only the first does).
+pub const SpannedTags = struct { first: Anchor, last: ?Anchor, lines: usize };
+
+/// Detect a tag anchor that names more than one line. parseAnchor keeps only what precedes the FIRST arrow
+/// (the tolerated `→content` suffix), so such an anchor silently names its first line alone: a replace swaps
+/// that ONE line for the whole new block, leaves the rest of the old block in the file, and reports success.
+/// Seen in a measured SWE-bench run — the model's first edit pasted five tagged lines as the anchor, four dead
+/// lines were left behind after a `return`, and the fresh-tag snippet the success carried stopped just short
+/// of them, so nothing looked wrong until a git diff about five minutes later.
+///
+/// Detection, not repair: whether the block meant a range (replace/delete) or a position (insert) is the
+/// caller's question to put back to the model. null = a single line, or a multi-line string whose first line
+/// is not a numbered tag — a multi-line TEXT anchor is a legitimate snippet and stays the text matcher's.
+pub fn spannedTagAnchor(raw: []const u8) ?SpannedTags {
+    const s = std.mem.trim(u8, raw, " \t\r\n");
+    if (std.mem.indexOfScalar(u8, s, '\n') == null) return null;
+    var it = std.mem.splitScalar(u8, s, '\n');
+    const head = it.first();
+    const first = parseAnchor(head) orelse return null;
+    if (first.eof or first.bof) return null;
+    var out = SpannedTags{ .first = first, .last = null, .lines = 1 };
+    while (it.next()) |ln| {
+        out.lines += 1;
+        // A later line counts as tagged on the same terms hasTaggedLine uses: the tag OPENS the line.
+        const cut = std.mem.indexOf(u8, ln, "\u{2192}") orelse ln.len;
+        const a = parseAnchor(ln[0..cut]) orelse continue;
+        if (!a.eof and !a.bof) out.last = a;
+    }
+    return out;
+}
+
 /// The NUMBER-LESS half of a rendered tag: `abc:def`, optionally still carrying the `→line text` (or
 /// `->line text`) suffix a read prints. Models copy this constantly — a read shows `467:wcj:dwp→</body>` and
 /// the hash pair is the part that reads like the identifier, so the line number gets dropped. Shape test only
@@ -824,4 +864,59 @@ test "tag dialect: replace listed BEFORE insert_before on the same line does not
             return error.BatchRejectedUnexpectedly;
         },
     }
+}
+
+test "a block of the read view pasted as ONE anchor is detected, with the range's real first and last tags" {
+    const gpa = t.allocator;
+    const src = "def f(x):\n    a = 1\n    b = 2\n    c = 3\n    return a\nprint(f(0))\n";
+    var lines = try splitLines(gpa, src);
+    defer lines.deinit(gpa);
+    const view = renderRead(gpa, src);
+    defer gpa.free(view);
+    // The anchor exactly as a model pastes it: the view's first five lines, tags and content included.
+    var cut: usize = 0;
+    for (0..5) |_| cut = std.mem.indexOfScalarPos(u8, view, cut, '\n').? + 1;
+    const block = view[0 .. cut - 1];
+
+    // Why this needs catching: the parser reads the whole block as line 1 and nothing else.
+    try t.expectEqual(@as(u32, 1), parseAnchor(block).?.line);
+
+    const sp = spannedTagAnchor(block) orelse return error.SpannedAnchorMissed;
+    try t.expectEqual(@as(usize, 5), sp.lines);
+    var ab: [24]u8 = undefined;
+    var fb: [24]u8 = undefined;
+    try t.expectEqualStrings(renderAnchor(lines.items, 0, &ab), formatAnchor(sp.first, &fb));
+    const last = sp.last orelse return error.LastTagMissed;
+    try t.expectEqualStrings(renderAnchor(lines.items, 4, &ab), formatAnchor(last, &fb));
+    // the reported tags are live ones: an anchor..end range built from them validates as it stands
+    try t.expectEqual(Verdict.valid, validate(lines.items, sp.first));
+    try t.expectEqual(Verdict.valid, validate(lines.items, last));
+
+    { // bare tags, one per line, no arrows: same block, same verdict
+        var b: std.ArrayListUnmanaged(u8) = .empty;
+        defer b.deinit(gpa);
+        for (0..3) |i| {
+            if (i > 0) try b.append(gpa, '\n');
+            try b.appendSlice(gpa, renderAnchor(lines.items, i, &ab));
+        }
+        const bare = spannedTagAnchor(b.items) orelse return error.BareBlockMissed;
+        try t.expectEqual(@as(u32, 3), bare.last.?.line);
+    }
+    { // one tagged line, then untagged code: still a block, with no closing tag to offer
+        const opener = renderAnchor(lines.items, 0, &ab);
+        const mixed = try std.fmt.allocPrint(gpa, "{s}\u{2192}def f(x):\n    a = 1\n    b = 2", .{opener});
+        defer gpa.free(mixed);
+        const m = spannedTagAnchor(mixed) orelse return error.MixedBlockMissed;
+        try t.expectEqual(@as(usize, 3), m.lines);
+        try t.expect(m.last == null);
+    }
+    // What stays legal: ONE tag (with its pasted content, or a trailing newline), and multi-line TEXT anchors —
+    // including code that carries `->`, a colon or the word EOF, which the tag parser must not mistake for tags.
+    const one = try std.fmt.allocPrint(gpa, "{s}\u{2192}    a = 1\n", .{renderAnchor(lines.items, 1, &ab)});
+    defer gpa.free(one);
+    try t.expect(spannedTagAnchor(one) == null);
+    try t.expect(spannedTagAnchor("def f(x) -> int:\n    return x") == null);
+    try t.expect(spannedTagAnchor("x: int = 1\ny = 2") == null);
+    try t.expect(spannedTagAnchor("EOF\nmore") == null);
+    try t.expect(spannedTagAnchor("0:\nprepended") == null);
 }

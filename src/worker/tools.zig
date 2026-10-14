@@ -1271,7 +1271,7 @@ pub const MAX_TOOL_PARAMS = 4 * 1024;
 
 /// The OpenAI `tools` array contents (comma-separated function defs, no outer brackets).
 pub const SCHEMA =
-    \\{"type":"function","function":{"name":"run_python","description":"Run Python (no GUI) in the build workdir; returns stdout/stderr. This is your general-purpose EXECUTOR and the DEFAULT whenever no other tool fits, because it is the only way you can execute anything: HTTP and API calls with your own headers/auth/POST body (requests works, the network is up), computation, data wrangling, generating files. Provider API keys are stripped from the environment, but a credential written into the code itself is used as-is.","parameters":{"type":"object","properties":{"code":{"type":"string","description":"the Python source to execute"}},"required":["code"]}}},
+    \\{"type":"function","function":{"name":"run_python","description":"Run Python (no GUI) in the build workdir; returns stdout/stderr. This is your general-purpose EXECUTOR and the DEFAULT whenever no other tool fits, because it is the only way you can execute anything: HTTP and API calls with your own headers/auth/POST body (requests works, the network is up), computation, data wrangling, generating files. Provider API keys are stripped from the environment, but a credential written into the code itself is used as-is. Each run has a hard wall-clock cap (25 s unless the host set another): a timeout= inside your code cannot raise it, so start a longer job in the background with its output sent to a file, then watch that file with poll.","parameters":{"type":"object","properties":{"code":{"type":"string","description":"the Python source to execute"}},"required":["code"]}}},
     \\{"type":"function","function":{"name":"stop_process","description":"KILL a process YOU started (and its children) by pid — the background server, fuzzer, watcher or build you launched with run_python and no longer want. Ending a turn does NOT reap what a script spawned, so a run left behind keeps holding the machine and its ports. Use it when the user says stop, when you are done watching something, or before relaunching a service on the same port.","parameters":{"type":"object","properties":{"pid":{"type":"integer","description":"the process id to terminate, together with its child tree"}},"required":["pid"]}}},
     \\{"type":"function","function":{"name":"write_file","description":"Write a UTF-8 text file at a relative path inside the build workdir (creates parent dirs). To GROW a long document (e.g. add the next scene to a chapter) pass mode:\"append\" with ONLY the new text — it is concatenated onto the existing file, so you never resend (or truncate) prior content. mode:\"overwrite\" (default) replaces the file. To CHANGE an existing file, prefer edit_file (never re-emit a large file).","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"mode":{"type":"string","enum":["overwrite","append"]}},"required":["path","content"]}}},
     \\{"type":"function","function":{"name":"edit_file","description":"Make a SURGICAL edit to an EXISTING file WITHOUT resending the whole file — use this (NOT write_file) to change a file that already exists, especially a large one (write_file re-emits the whole file and truncates big ones). PREFERRED anchors: reads prefix every line with a tag like 42:abc:def — copy that tag as the op's anchor (add end = the range's LAST-line tag to cover several lines). Tags are verified against the CURRENT file and the batch is ATOMIC: all ops apply or none do, and a stale-tag error hands you FRESH tags — retry the whole batch with those (no re-read needed). Plain text anchors (a snippet copied VERBATIM, unique in the file) also work. op is: replace (swap the anchored line/range for text), insert_before / insert_after (add text around the anchor; anchor 0: = file start, EOF = file end), delete (remove the anchored lines).","parameters":{"type":"object","properties":{"path":{"type":"string"},"ops":{"type":"array","items":{"type":"object","properties":{"op":{"type":"string","enum":["replace","insert_before","insert_after","delete"]},"anchor":{"type":"string"},"end":{"type":"string"},"text":{"type":"string"}},"required":["op","anchor"]}}},"required":["path","ops"]}}},
@@ -1380,7 +1380,7 @@ pub const MCP_SCHEMA =
 /// and CHAT_ONLY_DEFS below, and the test there fails on any UNDECLARED difference — so an accidentally stale
 /// copy is caught, while an intentional adaptation has to be written down.
 pub const CHAT_SCHEMA =
-    \\{"type":"function","function":{"name":"run_python","description":"Run Python (no GUI) in the build workdir; returns stdout/stderr. This is your general-purpose EXECUTOR and the DEFAULT whenever no other tool fits, because it is the only way you can execute anything: HTTP and API calls with your own headers/auth/POST body (requests works, the network is up), computation, data wrangling, generating files. Provider API keys are stripped from the environment, but a credential written into the code itself is used as-is.","parameters":{"type":"object","properties":{"code":{"type":"string","description":"the Python source to execute"}},"required":["code"]}}},
+    \\{"type":"function","function":{"name":"run_python","description":"Run Python (no GUI) in the build workdir; returns stdout/stderr. This is your general-purpose EXECUTOR and the DEFAULT whenever no other tool fits, because it is the only way you can execute anything: HTTP and API calls with your own headers/auth/POST body (requests works, the network is up), computation, data wrangling, generating files. Provider API keys are stripped from the environment, but a credential written into the code itself is used as-is. Each run has a hard wall-clock cap (25 s unless the host set another): a timeout= inside your code cannot raise it, so start a longer job in the background with its output sent to a file, then watch that file with poll.","parameters":{"type":"object","properties":{"code":{"type":"string","description":"the Python source to execute"}},"required":["code"]}}},
     \\{"type":"function","function":{"name":"stop_process","description":"KILL a process YOU started (and its children) by pid — the background server, fuzzer, watcher or build you launched with run_python and no longer want. Ending a turn does NOT reap what a script spawned, so a run left behind keeps holding the machine and its ports. Use it when the user says stop, when you are done watching something, or before relaunching a service on the same port.","parameters":{"type":"object","properties":{"pid":{"type":"integer","description":"the process id to terminate, together with its child tree"}},"required":["pid"]}}},
     \\{"type":"function","function":{"name":"write_file","description":"Write a UTF-8 text file at a relative path inside the build workdir (creates parent dirs). To GROW a long document (e.g. add the next scene to a chapter) pass mode:\"append\" with ONLY the new text — it is concatenated onto the existing file, so you never resend (or truncate) prior content. mode:\"overwrite\" (default) replaces the file. To CHANGE an existing file, prefer edit_file (never re-emit a large file).","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"mode":{"type":"string","enum":["overwrite","append"]}},"required":["path","content"]}}},
     \\{"type":"function","function":{"name":"edit_file","description":"Make a SURGICAL edit to an EXISTING file WITHOUT resending the whole file — use this (NOT write_file) to change a file that already exists, especially a large one (write_file re-emits the whole file and truncates big ones). PREFERRED anchors: reads prefix every line with a tag like 42:abc:def — copy that tag as the op's anchor (add end = the range's LAST-line tag to cover several lines). Tags are verified against the CURRENT file and the batch is ATOMIC: all ops apply or none do, and a stale-tag error hands you FRESH tags — retry the whole batch with those (no re-read needed). Plain text anchors (a snippet copied VERBATIM, unique in the file) also work. op is: replace (swap the anchored line/range for text), insert_before / insert_after (add text around the anchor; anchor 0: = file start, EOF = file end), delete (remove the anchored lines).","parameters":{"type":"object","properties":{"path":{"type":"string"},"ops":{"type":"array","items":{"type":"object","properties":{"op":{"type":"string","enum":["replace","insert_before","insert_after","delete"]},"anchor":{"type":"string"},"end":{"type":"string"},"text":{"type":"string"}},"required":["op","anchor"]}}},"required":["path","ops"]}}},
@@ -2401,7 +2401,8 @@ fn runPython(ctx: *ToolCtx, args_json: []const u8) []u8 {
     inline for (.{ "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "NL_BROKER_AUTH" }) |k| env.put(k, "") catch {};
 
     const py = if (@import("builtin").os.tag == .windows) "python" else "python3";
-    const argv = [_][]const u8{ py, "-c", PYRUN, script_name };
+    var cap_buf: [10]u8 = undefined;
+    const argv = [_][]const u8{ py, "-c", PYRUN, pyrunCapArg(ctx.environ, &cap_buf), script_name };
     // A SPAWN error (python missing / unstartable) is not the same as a script that ran and crashed: the
     // latter returns a RunResult with a non-zero exit and NEVER reaches this catch. So only the genuine
     // "the interpreter itself is missing" case swaps the flat string for the actionable dep hint.
@@ -2444,6 +2445,154 @@ test "clipEnds keeps the exception line a head clip would have thrown away" {
     const h2, const t2 = clipEnds("boom", 1500);
     try std.testing.expectEqualStrings("boom", h2);
     try std.testing.expectEqual(@as(usize, 0), t2.len);
+}
+
+test "run_python's cap: NL_PYRUN_TIMEOUT_S is bounded both ways, and both belts state the real default" {
+    try std.testing.expectEqual(PYRUN_CAP_DEFAULT_S, pyrunCapS(null));
+    // a typo is never "no cap" and never "cap 0"
+    for ([_][]const u8{ "", "  ", "0", "-5", "abc", "1.5", "25s" }) |bad|
+        try std.testing.expectEqual(PYRUN_CAP_DEFAULT_S, pyrunCapS(bad));
+    try std.testing.expectEqual(@as(u32, 1), pyrunCapS("1"));
+    try std.testing.expectEqual(@as(u32, 90), pyrunCapS(" 90\r\n"));
+    // past the ceiling clamps — even past u32 — rather than snapping back to the short default
+    try std.testing.expectEqual(PYRUN_CAP_MAX_S, pyrunCapS("100000"));
+    try std.testing.expectEqual(PYRUN_CAP_MAX_S, pyrunCapS("99999999999"));
+    try std.testing.expect(PYRUN_CAP_DEFAULT_S <= PYRUN_CAP_MAX_S);
+    // The model can only plan around a cap it is told about. Both run_python defs carry the sentence (the
+    // CHAT_SCHEMA drift test keeps them identical); this pins that the number in it is the constant's.
+    const stated = std.fmt.comptimePrint("({d} s unless the host set another)", .{PYRUN_CAP_DEFAULT_S});
+    for ([_][]const u8{ SCHEMA, CHAT_SCHEMA }) |block| {
+        const def = findSchemaDef(block, "run_python") orelse return error.NoRunPythonDef;
+        try std.testing.expect(std.mem.indexOf(u8, def, stated) != null);
+        try std.testing.expect(std.mem.indexOf(u8, def, "a timeout= inside your code cannot raise it") != null);
+    }
+}
+
+test "a run_python cap hit keeps what the script printed and names the cap as run_python's own; a pipe-holding child stretches the call by the grace at most, and one that finishes inside it is no cap hit (real python)" {
+    const gpa = std.testing.allocator;
+    // The REAL process environ (TESTING.md): an empty one leaves the Windows child without SystemRoot/TEMP.
+    const environ: std.process.Environ = if (@import("builtin").os.tag == .windows)
+        .{ .block = .global }
+    else
+        .{ .block = .{ .slice = std.mem.span(std.c.environ) } };
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = environ });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var env = environ.createMap(gpa) catch return error.SkipZigTest;
+    defer env.deinit();
+    { // skip only on proof that the interpreter runPython spawns is not on this machine
+        const py = if (@import("builtin").os.tag == .windows) "python" else "python3";
+        const probe = std.process.run(gpa, io, .{ .argv = &.{ py, "--version" }, .environ_map = &env, .stdout_limit = .limited(256), .stderr_limit = .limited(256), .timeout = .{ .duration = .{ .raw = .fromSeconds(30), .clock = .awake } } }) catch |e| {
+            if (deps.isSpawnMissing(e)) return error.SkipZigTest;
+            return e;
+        };
+        defer gpa.free(probe.stdout);
+        defer gpa.free(probe.stderr);
+        if (probe.term != .exited or probe.term.exited != 0) return error.SkipZigTest; // e.g. the Store alias stub
+    }
+    const root = "zig-pyrun-cap-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, root, .default_dir) catch {};
+    var counters = [_]u32{0} ** 6;
+    var ctx = ToolCtx{
+        .gpa = gpa,
+        .io = io,
+        .environ = &env,
+        .run_dir = root,
+        .workdir = root,
+        .scope = "test",
+        .mind = "test",
+        .round = 0,
+        .mem = undefined, // run_python never touches memory
+        .files_written = &counters[0],
+        .observed = &counters[1],
+        .skills_saved = &counters[2],
+        .directives_set = &counters[3],
+        .tools_made = &counters[4],
+    };
+
+    // The scripts below are JSON-encoded by the serializer rather than by hand: they carry quotes and escapes
+    // three layers deep (Zig, JSON, the Python -c string of a grandchild).
+    const Args = struct { code: []const u8 };
+
+    // Caps here are 2-3 s, not 1: the property is "the cap applies", and a 1 s cap under a loaded parallel build
+    // starts measuring how fast the interpreter comes up instead.
+    try env.put("NL_PYRUN_TIMEOUT_S", "2");
+    { // five seconds of sleep against a two-second cap — under the old fixed 25 s cap this simply finished
+        const out = runPython(&ctx, "{\"code\":\"import time\\nprint('BEFORE', flush=True)\\ntime.sleep(5)\\nprint('AFTER')\"}");
+        defer gpa.free(out);
+        if (!std.mem.startsWith(u8, out, "exit=124\n")) {
+            std.debug.print("\nexpected a cap hit at 2 s, got:\n{s}\n", .{out});
+            return error.CapNotApplied;
+        }
+        try std.testing.expect(std.mem.indexOf(u8, out, "BEFORE") != null); // what it printed survives the kill
+        try std.testing.expect(std.mem.indexOf(u8, out, "AFTER") == null); // ...and the kill came first
+        try std.testing.expect(std.mem.indexOf(u8, out, "run_python cap is 2 s") != null); // the configured cap, by name
+        try std.testing.expect(std.mem.indexOf(u8, out, "timeout= inside your code cannot raise this cap") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "was still running and was killed") != null);
+        // the kill reaches the script alone, and the reply says so rather than implying everything stopped
+        try std.testing.expect(std.mem.indexOf(u8, out, "Anything it started was not killed") != null);
+    }
+    try env.put("NL_PYRUN_TIMEOUT_S", "20");
+    { // under the cap, the launcher is invisible: exit code, stdout (non-ASCII included) and stderr pass through
+        const out = runPython(&ctx, "{\"code\":\"import sys\\nprint('ok \\u2192 done')\\nsys.stderr.write('warned')\\nsys.exit(3)\"}");
+        defer gpa.free(out);
+        try std.testing.expect(std.mem.startsWith(u8, out, "exit=3\n"));
+        try std.testing.expect(std.mem.indexOf(u8, out, "ok \u{2192} done") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "warned") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "TIMEOUT") == null);
+    }
+    try env.put("NL_PYRUN_TIMEOUT_S", "3");
+    { // The script prints to both streams and exits at once, but a process it started inherits the pipes and holds
+        // them well past cap + grace. Two things were wrong here. An unbounded drain sat the child out. And on
+        // Windows, communicate() hands back NOTHING when its pipes are still held, so `launched` and `err-before`
+        // vanished under a reply that spoke of "the output above". Now the call ends at cap + grace with both.
+        // The grandchild ticks a dot every 0.25 s so it dies on the broken pipe soon after the launcher exits,
+        // instead of outliving the test; 80 ticks bound it either way.
+        const code =
+            \\import subprocess,sys,tempfile
+            \\sys.stderr.write('err-before\n'); sys.stderr.flush()
+            \\subprocess.Popen([sys.executable,'-c','import sys,time\nfor _ in range(80):\n time.sleep(0.25); sys.stdout.write("."); sys.stdout.flush()'],cwd=tempfile.gettempdir())
+            \\print('launched', flush=True)
+        ;
+        const args = try std.json.Stringify.valueAlloc(gpa, Args{ .code = code }, .{});
+        defer gpa.free(args);
+        const out = runPython(&ctx, args);
+        defer gpa.free(out);
+        if (!std.mem.startsWith(u8, out, "exit=124\n") or std.mem.indexOf(u8, out, "still holds that output open") == null) {
+            std.debug.print("\nexpected the grace to end on a pipe-holding child, got:\n{s}\n", .{out});
+            return error.DrainNotBounded;
+        }
+        if (std.mem.indexOf(u8, out, "launched") == null or std.mem.indexOf(u8, out, "err-before") == null) {
+            std.debug.print("\nwhat the script printed before the cap was lost:\n{s}\n", .{out});
+            return error.OutputLost;
+        }
+        try std.testing.expect(std.mem.indexOf(u8, out, "The script itself had exited (code 0)") != null);
+    }
+    { // The finished-suite shape (SymPy): the script backgrounds a run without redirection and exits; the run
+        // prints its result 4 s in, past the 3 s cap but inside the grace. Every byte arrives and nothing is left
+        // running, so this is no cap hit: the script's own exit code and the full output come back. The old
+        // launcher answered exit 124 and "cut off" here, and the model re-ran a suite that had already finished.
+        const code =
+            \\import subprocess,sys,tempfile
+            \\subprocess.Popen([sys.executable,'-c','import time\ntime.sleep(4)\nprint("tests finished: 16 passed", flush=True)'],cwd=tempfile.gettempdir())
+            \\print('launched', flush=True)
+        ;
+        const args = try std.json.Stringify.valueAlloc(gpa, Args{ .code = code }, .{});
+        defer gpa.free(args);
+        const out = runPython(&ctx, args);
+        defer gpa.free(out);
+        if (!std.mem.startsWith(u8, out, "exit=0\n") or std.mem.indexOf(u8, out, "TIMEOUT") != null) {
+            std.debug.print("\na run that finished inside the grace was reported as a cap hit:\n{s}\n", .{out});
+            return error.FinishedRunCalledCut;
+        }
+        try std.testing.expect(std.mem.indexOf(u8, out, "launched") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "tests finished: 16 passed") != null);
+        // ...and the one line that is added says the output is whole, so the model has no reason to run it again
+        try std.testing.expect(std.mem.indexOf(u8, out, "NOTE: the script exited (code 0) within run_python's 3 s cap") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "that output is complete above") != null);
+    }
 }
 
 /// True if `n` is a built-in tool name. execute() checks built-ins FIRST and make_tool rejects these names, so
@@ -2550,7 +2699,8 @@ fn runAuthored(ctx: *ToolCtx, name: []const u8, body: []const u8, args_json: []c
     }
     const aj = if (std.mem.trim(u8, args_json, " \r\n\t").len == 0) "{}" else args_json;
     const py = if (@import("builtin").os.tag == .windows) "python" else "python3";
-    const argv = [_][]const u8{ py, "-c", PYRUN, script_name, aj };
+    var cap_buf: [10]u8 = undefined;
+    const argv = [_][]const u8{ py, "-c", PYRUN, pyrunCapArg(ctx.environ, &cap_buf), script_name, aj };
     // spawn-missing (python absent) → the dep hint; a script that ran and failed exits non-zero and is
     // handled below, never here.
     const r = std.process.run(gpa, ctx.io, .{ .argv = &argv, .cwd = .{ .path = ctx.workdir }, .environ_map = &env, .stdout_limit = .limited(256 << 10), .stderr_limit = .limited(64 << 10) }) catch |e|
@@ -3396,6 +3546,29 @@ fn hashlineApply(ctx: *ToolCtx, npath: []const u8, full: []const u8, original: [
 /// editable (a file one accepts and another cannot read is an edit that fails forever).
 const EDIT_MAX_BYTES: usize = vcs.MAX_FILE_BYTES;
 
+/// The rejection for an op whose `anchor` (or `end`) is several lines of the tagged read view; null when `raw` is
+/// not that. It names the RANGE form with the block's own first and last tags filled in, so the retry is a copy,
+/// not a re-read — the same courtesy the stale-tag errors extend. Owned.
+fn spannedAnchorReject(gpa: std.mem.Allocator, op_n: usize, field: []const u8, raw: []const u8) ?[]u8 {
+    const sp = hashline.spannedTagAnchor(raw) orelse return null;
+    var fb: [24]u8 = undefined;
+    var lb: [24]u8 = undefined;
+    const first = hashline.formatAnchor(sp.first, &fb);
+    const last = if (sp.last) |l| hashline.formatAnchor(l, &lb) else "<the block's LAST line tag>";
+    if (std.mem.eql(u8, field, "end"))
+        return std.fmt.allocPrint(gpa, "op{d} REJECTED (nothing was changed) — its `end` spans {d} lines of the read view. `end` is ONE tag: the LAST line of the anchor..end range, e.g. \"end\":\"{s}\".", .{ op_n, sp.lines, last }) catch dupe(gpa, "op REJECTED — `end` must be ONE tag, the range's last line");
+    // What the op would have done unrejected depends on the paste, so only claim it where it is true. With the read
+    // view's arrow on the first line, parseAnchor reads the whole block as that line's tag and the op lands on it
+    // alone; a block of bare tags (no arrows) parses as no tag at all and only ever reached the text matcher's
+    // no-match.
+    var wb: [128]u8 = undefined;
+    const would: []const u8 = if (hashline.parseAnchor(raw) != null)
+        std.fmt.bufPrint(&wb, ": this op would have acted on line {d} alone and left the rest of that block in the file", .{sp.first.line}) catch ""
+    else
+        "";
+    return std.fmt.allocPrint(gpa, "op{d} REJECTED (nothing was changed) — its `{s}` spans {d} lines of the read view, but a tag names ONE line{s}. To replace or delete the block, use the anchor..end range form — the FIRST line's tag in `anchor`, the LAST line's in `end` (inclusive): \"anchor\":\"{s}\",\"end\":\"{s}\". To insert beside it, anchor on the single line you insert before or after.", .{ op_n, field, sp.lines, would, first, last }) catch dupe(gpa, "op REJECTED — a multi-line anchor names only its first line; use anchor = the first line's tag and end = the last line's tag");
+}
+
 fn editFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
     const gpa = ctx.gpa;
     // Accept BOTH edit dialects: the hive prompt teaches {op, anchor, text}; the chat prompt teaches
@@ -3465,6 +3638,15 @@ fn editFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
     }
     if (hashline.hasTaggedLine(p.value.replace))
         return dupe(gpa, "edit REJECTED (nothing was changed) — your `replace` text carries anchor tags (`42:abc:def\u{2192}`). Tags are how you POINT at a line; they are not part of the line. Send the file's real code with every tag prefix stripped.");
+    // The mirror mistake on the ANCHOR side: a block of the tagged view pasted as one op's anchor (or end). A
+    // tag names one line and the parser keeps only the first, so left alone this does not fail — it lands as a
+    // one-line edit and leaves the rest of the block in the file (see hashline.spannedTagAnchor). Reject it here,
+    // before dialect dispatch, so it never reaches the anchor engine OR the text matcher.
+    for (p.value.ops, 0..) |o, i| {
+        const afield: []const u8 = if (o.anchor.len > 0) "anchor" else "search"; // the chat dialect's alias
+        if (spannedAnchorReject(gpa, i + 1, afield, if (o.anchor.len > 0) o.anchor else o.search)) |msg| return msg;
+        if (spannedAnchorReject(gpa, i + 1, "end", if (o.end.len > 0) o.end else o.end_anchor)) |msg| return msg;
+    }
     // HASH-ANCHORED DIALECT: any op whose anchor is a copied `42:abc:def` tag routes the WHOLE batch
     // through the atomic anchor engine (hashline.zig) — anchors verify against the file AS IT IS NOW
     // (that check IS the concurrent-edit guarantee: a teammate's change in your neighborhood surfaces as
@@ -6737,19 +6919,111 @@ pub const DEPGRAPH_PY =
 
 /// A timeout LAUNCHER for model-authored Python: instead of `python script.py` (which `std.process.run` runs
 /// with NO timeout, so an infinite loop / blocking input() / un-timed network call would freeze the mind's
-/// moment and deadlock the whole round), run `python -c PYRUN script.py [arg]` — it re-execs the script with a
-/// HARD 25s wall-clock cap and kills it on timeout, so a runaway script fails fast instead of hanging the swarm.
-/// (Defense-in-depth behind the engine's hang watchdog.) cwd + env (keys blanked) are inherited by the child.
+/// moment and deadlock the whole round), run `python -c PYRUN <cap_s> script.py [arg]` — it re-execs the script
+/// with a HARD wall-clock cap (pyrunCapS: 25 s unless NL_PYRUN_TIMEOUT_S says otherwise) and kills it on
+/// timeout, so a runaway script fails fast instead of hanging the swarm. (Defense-in-depth behind the engine's
+/// hang watchdog.) cwd + env (keys blanked) are inherited by the child.
+///
+/// What a cap hit SAYS matters as much as the cap. This used to drop everything the script had printed and
+/// answer "this script exceeded 25s wall-clock and was killed" — a sentence a model reads as a fact about its
+/// own code. In a measured SWE-bench run it went on wrapping test commands in timeout=120, 600 and 900 that the
+/// 25 s cap silently overrode, and it re-ran a suite that had most likely already finished: the script had
+/// exited, and only a process it started was still holding the pipes. So a hit now returns the TAIL of what was
+/// printed, names the cap as run_python's own (a timeout= inside the code cannot raise it), and says whether the
+/// script itself was still running. Output passes through as bytes, so an undecodable byte from the script
+/// cannot take the launcher down with it.
+///
+/// The launcher reads both pipes ITSELF, in chunks, on two threads, rather than through communicate(). On Windows
+/// CPython's communicate() reads each pipe with ONE blocking read() to EOF, and a timeout hands back nothing at
+/// all, so whenever a process the script started still held the inherited pipes (a test run Popen'ed without
+/// redirection, a `docker exec` the script was waiting on) every byte the script had printed was lost, even
+/// though POSIX kept it. The chunks that arrived are there to show on every platform. The pipes are also what
+/// decides "finished": once the script has exited, the call waits for them to close, past the cap by at most a
+/// 5 s grace, so a process left holding them cannot hold the tool open. If they close inside that grace, nothing
+/// was cut off — the output is complete and the script's own exit code passes through, with a note, because
+/// answering "cut off" there is exactly what sent the model back to re-run a suite that had already finished.
+/// The kill reaches the script alone (what it started keeps running, and the reply says so). Every exit is a
+/// flush and os._exit, so a reader still parked on a held pipe cannot stall interpreter shutdown (a Windows exit
+/// code past 2^31 is passed as its signed twin, which os._exit accepts and the OS reads back unchanged); an error
+/// after the spawn kills the script before reporting, as subprocess.run's own cleanup did.
 pub const PYRUN =
-    \\import subprocess,sys
+    \\import os,subprocess,sys,threading,time
+    \\def tail(b,n):
+    \\    if len(b)<=n: return b
+    \\    t=b[-n:]; i=t.find(b"\n")
+    \\    if 0<=i<200: t=t[i+1:]
+    \\    return (b"[... %d earlier bytes not shown ...]\n"%(len(b)-len(t)))+t
+    \\def pump(f,buf):
+    \\    try:
+    \\        while True:
+    \\            c=os.read(f.fileno(),65536)
+    \\            if not c: return
+    \\            buf.append(c)
+    \\    except Exception: pass
+    \\def drained(by):
+    \\    for t in ts: t.join(max(0.0,by-time.monotonic()))
+    \\    return not any(t.is_alive() for t in ts)
+    \\def done(o,e,code):
+    \\    sys.stdout.buffer.write(o); sys.stdout.flush()
+    \\    sys.stderr.buffer.write(e); sys.stderr.flush()
+    \\    os._exit(code-2**32 if code>=2**31 else code)
     \\try:
-    \\    r=subprocess.run([sys.executable]+sys.argv[1:],capture_output=True,text=True,timeout=25)
-    \\    sys.stdout.write(r.stdout or ""); sys.stderr.write(r.stderr or ""); sys.exit(r.returncode)
-    \\except subprocess.TimeoutExpired:
-    \\    sys.stderr.write("TIMEOUT: this script exceeded 25s wall-clock and was killed"); sys.exit(124)
-    \\except Exception as e:
-    \\    sys.stderr.write("launcher error: "+str(e)); sys.exit(1)
+    \\    cap=int(sys.argv[1])
+    \\    p=subprocess.Popen([sys.executable]+sys.argv[2:],stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+    \\except Exception as x:
+    \\    sys.stderr.write("launcher error: "+str(x)); sys.exit(1)
+    \\try:
+    \\    t0=time.monotonic(); ob=[]; eb=[]
+    \\    ts=[threading.Thread(target=pump,args=(p.stdout,ob),daemon=True),threading.Thread(target=pump,args=(p.stderr,eb),daemon=True)]
+    \\    for t in ts: t.start()
+    \\    try: rc=p.wait(timeout=cap)
+    \\    except subprocess.TimeoutExpired: rc=p.poll()
+    \\    if rc is not None and drained(t0+cap): done(b"".join(ob),b"".join(eb),rc)
+    \\    cut=rc is None
+    \\    if cut: p.kill()
+    \\    held=not drained(time.monotonic()+5)
+    \\    o=b"".join(ob[:]); e=b"".join(eb[:])
+    \\    if not cut and not held:
+    \\        n="\nNOTE: the script exited (code %d) within run_python's %d s cap; a process it started held its output open until %.1f s, and that output is complete above."%(rc,cap,time.monotonic()-t0)
+    \\        done(o,e+n.encode(),rc)
+    \\    m="\nTIMEOUT: the run_python cap is %d s and this run reached it. "%cap
+    \\    m+="The script was still running and was killed; the output above is what it printed before that. " if cut else "The script itself had exited (code %d), but a process it started kept its output open past the cap, so the call was cut off here. "%rc
+    \\    m+="A process it started still holds that output open and was not killed: it may still be running, and nothing it prints from here on is shown. " if held else "Anything it started was not killed and may still be running. "
+    \\    m+="A timeout= inside your code cannot raise this cap. Split the work into shorter runs, or start a long job in the background with its output sent to a file and watch that file with poll."
+    \\    done(tail(o,3000),tail(e,800)+m.encode(),124)
+    \\except Exception as x:
+    \\    try: p.kill()
+    \\    except Exception: pass
+    \\    sys.stderr.write("launcher error: "+str(x)); sys.stderr.flush(); os._exit(1)
 ;
+
+/// run_python's wall-clock cap when NL_PYRUN_TIMEOUT_S is unset. Deliberately short, and not raised to suit the
+/// benchmark that exposed the cap's wording: in that same run the cap is what turned an import that silently
+/// rebuilt C extensions inside a container (at least 117 s) into a 25 s answer, and every swarm mind runs
+/// through this launcher too. Hosts whose work genuinely runs longer (a test suite in a container) raise it.
+pub const PYRUN_CAP_DEFAULT_S: u32 = 25;
+
+/// Ceiling on NL_PYRUN_TIMEOUT_S. Kept under the swarm hang watchdog's silence threshold (run.zig: HANG_CHECK_S
+/// x HANG_STALE_CHECKS = 300 s): past it, one quiet script would get a whole swarm force-halted as "hung" before
+/// this launcher ever got round to killing the script — the watchdog doing the cap's job, at far greater cost.
+pub const PYRUN_CAP_MAX_S: u32 = 240;
+
+/// NL_PYRUN_TIMEOUT_S → the cap PYRUN is handed. Unset, empty, zero, negative or not a number all mean the
+/// default: a typo must never quietly become "no cap" or "cap 0". Past the ceiling it clamps rather than falling
+/// back, because an operator who asked for 900 wants long runs — just not unbounded ones.
+pub fn pyrunCapS(raw: ?[]const u8) u32 {
+    const s = std.mem.trim(u8, raw orelse return PYRUN_CAP_DEFAULT_S, " \t\r\n");
+    const n = std.fmt.parseInt(u64, s, 10) catch return PYRUN_CAP_DEFAULT_S; // u64: "99999999999" still clamps
+    if (n == 0) return PYRUN_CAP_DEFAULT_S;
+    return @intCast(@min(n, PYRUN_CAP_MAX_S));
+}
+
+/// PYRUN's first argument: the cap as decimal text, read from the caller's environ the way every other NL_*
+/// knob in this file is. Passed on the command line rather than through the child's env so PYRUN never has to
+/// re-validate a raw value — pyrunCapS above is the one place that decides what the cap is.
+fn pyrunCapArg(environ: *const std.process.Environ.Map, buf: *[10]u8) []const u8 {
+    return std.fmt.bufPrint(buf, "{d}", .{pyrunCapS(environ.get("NL_PYRUN_TIMEOUT_S"))}) catch unreachable;
+}
 
 /// The engine-owned RUNTIME SMOKE TEST — does the deliverable actually RUN, not just pass presence checks? Run
 /// once per round (cwd = workdir) via `python -c SMOKE_PY`. It finds the most likely server entry (a .py that
@@ -7806,6 +8080,108 @@ test "chat surface, large file: window-read → copy tag → edit lands surgical
     try std.testing.expect(std.mem.indexOf(u8, editFile(&ctx, pasted), "REJECTED") != null);
     const echoed = try std.fmt.allocPrint(gpa, "{{\"path\":\"echo.txt\",\"content\":\"1:abc:def\\u2192a();\\n2:bcd:def\\u2192b();\\n3:cde:def\\u2192c();\\n\"}}", .{});
     try std.testing.expect(std.mem.indexOf(u8, writeFile(&ctx, echoed), "REJECTED") != null);
+}
+
+test "edit_file refuses a multi-line tag anchor instead of splicing its first line, and the range it names lands" {
+    // The measured failure (a SWE-bench SymPy run): the model's first edit pasted FIVE tagged lines of a read as
+    // ONE anchor. The parser kept the first tag, so the replace swapped line 1 alone for the new block, the four
+    // lines it was meant to remove stayed behind as dead code, and the tool answered "applied atomically".
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-spanned-anchor-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, root ++ "/work", .default_dir) catch {};
+    var env = std.process.Environ.Map.init(gpa); // .txt with no delimiters: no syntax gate arms, nothing spawns
+    defer env.deinit();
+    var counters = [_]u32{0} ** 6;
+    var ctx = ToolCtx{
+        .gpa = gpa,
+        .io = io,
+        .environ = &env,
+        .run_dir = root,
+        .workdir = root ++ "/work",
+        .scope = "test",
+        .mind = "chat",
+        .round = 0,
+        .mem = undefined, // file tools only
+        .files_written = &counters[0],
+        .observed = &counters[1],
+        .skills_saved = &counters[2],
+        .directives_set = &counters[3],
+        .tools_made = &counters[4],
+        .anchored_reads = true,
+    };
+    const original = "total = 0\nstep one: load\nstep two: parse\nstep three: render\nstep four: return\nend\n";
+    const path = root ++ "/work/steps.txt";
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = original });
+
+    // The anchor exactly as a model pastes it: the read view's first five lines, tags and content included.
+    const view = hashline.renderRead(gpa, original);
+    defer gpa.free(view);
+    var cut: usize = 0;
+    for (0..5) |_| cut = std.mem.indexOfScalarPos(u8, view, cut, '\n').? + 1;
+    const block = view[0 .. cut - 1];
+    const new_text = "total = 0\nstep: all at once";
+
+    const Op = struct { op: []const u8, anchor: []const u8, text: []const u8 };
+    const pasted = try std.json.Stringify.valueAlloc(gpa, .{ .path = "steps.txt", .ops = &[_]Op{.{ .op = "replace", .anchor = block, .text = new_text }} }, .{});
+    defer gpa.free(pasted);
+    const out = editFile(&ctx, pasted);
+    defer gpa.free(out);
+    {
+        const after = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(4096));
+        defer gpa.free(after);
+        if (!std.mem.eql(u8, original, after)) {
+            std.debug.print("\nmulti-line anchor MANGLED the file (tool said: {s})\n--- file now ---\n{s}\n", .{ out[0..@min(out.len, 160)], after });
+            return error.FileMangled;
+        }
+    }
+    try std.testing.expect(std.mem.indexOf(u8, out, "REJECTED") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "anchor..end") != null);
+    // ...and it hands back the block's own first and last tags, so the retry is a copy rather than a re-read
+    var lines = try hashline.splitLines(gpa, original);
+    defer lines.deinit(gpa);
+    var fb: [24]u8 = undefined;
+    var lb: [24]u8 = undefined;
+    const first = hashline.renderAnchor(lines.items, 0, &fb);
+    const last = hashline.renderAnchor(lines.items, 4, &lb);
+    try std.testing.expect(std.mem.indexOf(u8, out, first) != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, last) != null);
+    // It says what the op would have done only where that is true. The pasted block carries the read view's arrow,
+    // so the parser took it as line 1's tag and the op would have landed there alone...
+    try std.testing.expect(std.mem.indexOf(u8, out, "would have acted on line 1 alone") != null);
+    { // ...while a block of bare tags parses as no tag at all (it only ever met the text matcher's no-match), so
+        // the same claim would be false there. Still rejected, with the same range advice and the file untouched.
+        var b1: [24]u8 = undefined;
+        var b2: [24]u8 = undefined;
+        const bare = try std.fmt.allocPrint(gpa, "{s}\n{s}\n{s}", .{ first, hashline.renderAnchor(lines.items, 1, &b1), hashline.renderAnchor(lines.items, 2, &b2) });
+        defer gpa.free(bare);
+        try std.testing.expect(hashline.parseAnchor(bare) == null); // the premise: nothing to have "acted on"
+        const bj = try std.json.Stringify.valueAlloc(gpa, .{ .path = "steps.txt", .ops = &[_]Op{.{ .op = "replace", .anchor = bare, .text = new_text }} }, .{});
+        defer gpa.free(bj);
+        const bout = editFile(&ctx, bj);
+        defer gpa.free(bout);
+        try std.testing.expect(std.mem.indexOf(u8, bout, "REJECTED") != null);
+        try std.testing.expect(std.mem.indexOf(u8, bout, "anchor..end") != null);
+        try std.testing.expect(std.mem.indexOf(u8, bout, "would have acted") == null);
+        const still = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(4096));
+        defer gpa.free(still);
+        try std.testing.expectEqualStrings(original, still);
+    }
+
+    // Following the advice lands the edit the model meant: lines 1-5 become the new block, line 6 survives.
+    const R = struct { op: []const u8, anchor: []const u8, end: []const u8, text: []const u8 };
+    const ranged = try std.json.Stringify.valueAlloc(gpa, .{ .path = "steps.txt", .ops = &[_]R{.{ .op = "replace", .anchor = first, .end = last, .text = new_text }} }, .{});
+    defer gpa.free(ranged);
+    const ok = editFile(&ctx, ranged);
+    defer gpa.free(ok);
+    try std.testing.expect(std.mem.indexOf(u8, ok, "edited steps.txt") != null);
+    const after = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(4096));
+    defer gpa.free(after);
+    try std.testing.expectEqualStrings("total = 0\nstep: all at once\nend\n", after);
 }
 
 test "jsCheckError via node --check: broken js rejects with a line verdict; ESM-in-.js and valid .cjs pass (skips without node)" {
