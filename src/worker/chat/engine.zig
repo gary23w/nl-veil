@@ -9867,6 +9867,31 @@ const DUD_FETCH_STREAK = 3;
 /// turn until the user typed "stop polling". Three timeouts with zero matches is not waiting, it is stuck.
 const POLL_TIMEOUT_STREAK = 3;
 
+/// The poll streak after one poll RESULT. A call that waited and saw nothing arrive extends it: "-> timeout", and
+/// "-> failing" (a command probe that failed the same way from its first samples, cut short by pollTool). Any other
+/// executed result (matched/up/done...) resets it; a result the engine answered itself ('('-leading: the budget
+/// refusal) leaves it alone. `failing` must count: it is the same fruitless wait, only shorter, and resetting on it
+/// let a model whose probe speaks its not-ready state ("connection refused") re-poll without end, every call cut
+/// short and the budget never reached (the echo guard misses it as soon as interval_s changes).
+pub fn pollStreakAfter(streak: u32, result: []const u8) u32 {
+    if (std.mem.indexOf(u8, result, "-> timeout") != null or std.mem.indexOf(u8, result, "-> failing") != null) return streak + 1;
+    if (result.len > 0 and result[0] != '(') return 0;
+    return streak;
+}
+
+test "poll budget: a poll cut short as failing extends the stuck-in-a-wait streak, so mixed timeouts and failings still trip it" {
+    // The shapes pollTool prints (tools.zig pins the real `failing` text against this function in its own test).
+    const timeout = "poll command -> timeout — still not there. Poll again ONLY if the log shows progress\nt+0s: exit 7, no stdout | stderr: curl: (7) Failed to connect";
+    const failing = "poll command -> failing — the probe failed the same way on its first 3 runs (exit 7 each time, same error)\nt+0s: exit 7, no stdout | stderr: curl: (7) Failed to connect";
+    var s: u32 = 0;
+    // T,F,T: before, the failing result zeroed the streak between the timeouts and the refusal never came
+    for ([_][]const u8{ timeout, failing, timeout }) |r| s = pollStreakAfter(s, r);
+    try std.testing.expectEqual(@as(u32, POLL_TIMEOUT_STREAK), s);
+    // an engine-answered result (the refusal itself) leaves it; a real match resets it
+    try std.testing.expectEqual(s, pollStreakAfter(s, "(NOT executed — poll budget for this turn is exhausted"));
+    try std.testing.expectEqual(@as(u32, 0), pollStreakAfter(s, "poll command -> matched\nt+0s: exit 0: EXIT=0"));
+}
+
 /// Does a fetched body look like a bot-check interstitial rather than the page? Conservative on purpose: the
 /// markers are the stub pages' own words, checked only in the HEAD of a SMALL body — a real article that merely
 /// mentions Cloudflare is big and keeps its first bytes for itself. False negative = today's behavior; false
@@ -12120,7 +12145,7 @@ fn runInnerAgentic(
                 // instantly instead of blocking the turn another 180s each. The model is told the honest state
                 // and the way out; the streak resets on any poll that actually MATCHES (see intake below).
                 if (std.mem.eql(u8, run_name, "poll") and poll_timeouts.* >= POLL_TIMEOUT_STREAK)
-                    break :blk gpa.dupe(u8, "(NOT executed — poll budget for this turn is exhausted: the last 3 polls all timed out with nothing arriving. The thing you are waiting for is not coming on this turn's clock. STOP waiting: report the current state to the user plainly, or take a different action. If it genuinely needs longer, say so and end the turn — the user can ask again later or schedule a task.)") catch emptyRes();
+                    break :blk gpa.dupe(u8, "(NOT executed — poll budget for this turn is exhausted: the last 3 polls all timed out or failed with nothing arriving. The thing you are waiting for is not coming on this turn's clock. STOP waiting: report the current state to the user plainly, or take a different action. If it genuinely needs longer, say so and end the turn — the user can ask again later or schedule a task.)") catch emptyRes();
                 // TRUNCATED MUTATION GUARD: `done_reason:"length"` with tool_calls present means the output
                 // budget ran out MID-CALL — and Ollama's constrained decoding closes the JSON anyway, so the
                 // last call arrives as VALID args whose string content was silently amputated. Executing that
@@ -12186,12 +12211,10 @@ fn runInnerAgentic(
                     dud_fetches.* = 0; // a real page — the model is fetching URLs that exist again
                 }
             }
-            // POLL STREAK intake: a "-> timeout" verdict counts toward the budget; a match/up/done resets it.
-            // Keyed on the verdict string pollTool itself prints, so the delegated (desk) and server executors
-            // are covered identically.
-            if (std.mem.eql(u8, name_fixed orelse c.name, "poll")) {
-                if (std.mem.indexOf(u8, result, "-> timeout") != null) poll_timeouts.* += 1 else if (result.len > 0 and result[0] != '(') poll_timeouts.* = 0;
-            }
+            // POLL STREAK intake: a "-> timeout" or "-> failing" verdict counts toward the budget; a match/up/done
+            // resets it (pollStreakAfter). Keyed on the verdict string pollTool itself prints, so the delegated
+            // (desk) and server executors are covered identically.
+            if (std.mem.eql(u8, name_fixed orelse c.name, "poll")) poll_timeouts.* = pollStreakAfter(poll_timeouts.*, result);
             if (new_query.len > 0 and result.len > 0) {
                 if (std.fmt.allocPrint(gpa, "{s}\n(engine: this searched \"{s}\" — a focused rewrite of the query you gave, aimed at the same intent.)", .{ result, new_query })) |noted| {
                     gpa.free(result);
