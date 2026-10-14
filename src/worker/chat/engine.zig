@@ -9234,6 +9234,27 @@ fn syncDirTool(app: *App, conv: []const u8, conv_dir: []const u8, ctrl_cursor: u
     return std.fmt.allocPrint(gpa, "{{\"ok\":true,\"tool\":\"sync_dir\",\"projected\":{d},\"into\":\"{s}\",\"note\":\"{d} file(s) copied/updated from the client folder into the workdir (unchanged files skipped by hash; text files only, caps 64 files / 512KB each / 4MB total — project the SPECIFIC subfolder you need). The source folder is never written back to; outputs belong in the workdir.\"}}", .{ got, base_name, got }) catch emptyRes();
 }
 
+/// What schedule_task stores as a role's key: nothing for a role whose endpoint is the owner's Cloudflare login
+/// (`login_base`, "" when there is no login) — its token is re-resolved at every firing — and the key as held
+/// for any other endpoint. Compared with trailing slashes ignored, the way llm.zig keys its endpoints.
+fn schedKeyToStore(role_base: []const u8, role_key: []const u8, login_base: []const u8) []const u8 {
+    if (login_base.len == 0) return role_key;
+    if (std.mem.eql(u8, std.mem.trimEnd(u8, role_base, "/"), std.mem.trimEnd(u8, login_base, "/"))) return "";
+    return role_key;
+}
+
+test "schedule_task never writes the Cloudflare login's access token into a task file" {
+    const login = "https://api.cloudflare.com/client/v4/accounts/0123abcd/ai/v1";
+    // a role on the login's endpoint stores no key, however the slash falls
+    try std.testing.expectEqualStrings("", schedKeyToStore(login, "cf-access-token-xyz", login));
+    try std.testing.expectEqualStrings("", schedKeyToStore(login ++ "/", "cf-access-token-xyz", login));
+    // a role on any other endpoint keeps the user's own key — another account's Workers AI included
+    try std.testing.expectEqualStrings("sk-byok", schedKeyToStore("https://api.openai.com/v1", "sk-byok", login));
+    try std.testing.expectEqualStrings("tok-other", schedKeyToStore("https://api.cloudflare.com/client/v4/accounts/ffff/ai/v1", "tok-other", login));
+    // no login at all: nothing changes
+    try std.testing.expectEqualStrings("cf-access-token-xyz", schedKeyToStore(login, "cf-access-token-xyz", ""));
+}
+
 /// schedule_task — the veil creates a scheduled task straight from conversation ("do X every morning at 9").
 /// The task inherits THIS turn's provider creds, so its unattended runs use the same backend that created it.
 /// Time conveniences the model can actually express: in_min (relative) and at_hm (next local occurrence) for
@@ -9268,6 +9289,11 @@ fn scheduleTool(app: *App, uid: u64, trio: ModelTrio, args: []const u8) []u8 {
     }
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
+    // NO LOGIN TOKEN ON DISK. A role that rides the owner's Cloudflare login holds a short-lived access token;
+    // stored, it sits in the task file long after it has expired and the run re-resolves nothing because the
+    // field is not blank. Blank, every firing resolves the login afresh (sched.resolveProvider for the coding
+    // role, sched.roleKey for the other two). A key for any other endpoint is the user's own and is kept.
+    const login_base: []const u8 = if (cf_oauth.resolveToken(app, uid, arena_state.allocator())) |cf| cf.base_url else "";
     switch (sched.createFromSpec(app, arena_state.allocator(), uid, .{
         .name = a.name,
         .prompt = a.prompt,
@@ -9281,13 +9307,13 @@ fn scheduleTool(app: *App, uid: u64, trio: ModelTrio, args: []const u8) []u8 {
         // coding/base provider at run time (launchRun rebuilds a ModelTrio whose pick() resolves the blanks).
         .base_url = trio.coding.base_url,
         .model = trio.coding.model,
-        .api_key = trio.coding.key,
+        .api_key = schedKeyToStore(trio.coding.base_url, trio.coding.key, login_base),
         .think_base_url = trio.thinking.base_url,
         .think_model = trio.thinking.model,
-        .think_api_key = trio.thinking.key,
+        .think_api_key = schedKeyToStore(trio.thinking.base_url, trio.thinking.key, login_base),
         .prompt_base_url = trio.prompting.base_url,
         .prompt_model = trio.prompting.model,
-        .prompt_api_key = trio.prompting.key,
+        .prompt_api_key = schedKeyToStore(trio.prompting.base_url, trio.prompting.key, login_base),
     })) {
         .id => |id| return std.fmt.allocPrint(gpa, "{{\"ok\":true,\"tool\":\"schedule_task\",\"id\":\"{s}\",\"note\":\"created — it fires on schedule as an unattended run with its own cross-run memory; schedule_list shows it\"}}", .{id}) catch emptyRes(),
         .err => |e| return orchErr(gpa, e),

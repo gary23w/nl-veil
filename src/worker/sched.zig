@@ -726,6 +726,30 @@ const Provider = struct { base: []const u8, key: []const u8, model: []const u8 }
 /// backbone (account URL + token + its default model when none/mismatched is stored), else the user's stored
 /// key for that default provider. An explicit base or key on the task is respected verbatim — same rule that
 /// keeps a cast from silently redirecting a custom endpoint's traffic to the wrong host with the wrong creds.
+/// A role that EXPLICITLY targets Workers AI — a "@cf/" model, or a Cloudflare /ai/ base — which, stored keyless,
+/// rides the owner's Cloudflare login at run time. The one test resolveProvider (coding) and roleKey (thinking,
+/// prompting) share, so a task schedule_task stores without the login's token (chat/engine.zig schedKeyToStore)
+/// resolves it the same way on every role.
+pub fn ridesLogin(base: []const u8, model: []const u8) bool {
+    return std.mem.startsWith(u8, model, "@cf/") or
+        (std.mem.indexOf(u8, base, "api.cloudflare.com") != null and std.mem.indexOf(u8, base, "/ai/") != null);
+}
+
+/// A thinking/prompting role's key at run time: as stored, or — for a role stored keyless on Workers AI — the
+/// owner's current login token, exactly as resolveProvider gives the coding role. A role stored keyless anywhere
+/// else stays keyless (the turn reports the provider failure, as it does for the coding role).
+fn roleKey(app: *App, alloc: std.mem.Allocator, uid: u64, base: []const u8, model: []const u8, key: []const u8) []const u8 {
+    if (key.len != 0 or !ridesLogin(base, model)) return key;
+    return if (cf_oauth.resolveToken(app, uid, alloc)) |cf| cf.key else key;
+}
+
+test "ridesLogin: a Workers AI role is told by its model or its base, never by a key it does not hold" {
+    try std.testing.expect(ridesLogin("", "@cf/zai-org/glm-5.3"));
+    try std.testing.expect(ridesLogin("https://api.cloudflare.com/client/v4/accounts/abc/ai/v1", ""));
+    try std.testing.expect(!ridesLogin("https://api.openai.com/v1", "gpt-x"));
+    try std.testing.expect(!ridesLogin("https://api.cloudflare.com/client/v4/accounts/abc/r2", "")); // not the AI surface
+}
+
 fn resolveProvider(app: *App, alloc: std.mem.Allocator, uid: u64, t: *const Task) Provider {
     var base = t.base_url;
     var key = t.api_key;
@@ -734,9 +758,7 @@ fn resolveProvider(app: *App, alloc: std.mem.Allocator, uid: u64, t: *const Task
     // rides the owner's Cloudflare login, exactly as the same request would in chat (resolveRole) and in a
     // cast (deploySwarm). This was the one turn path a login did not cover: the task saved fine and every
     // run then failed with a blank key.
-    if (key.len == 0 and (std.mem.startsWith(u8, model, "@cf/") or
-        (std.mem.indexOf(u8, base, "api.cloudflare.com") != null and std.mem.indexOf(u8, base, "/ai/") != null)))
-    {
+    if (key.len == 0 and ridesLogin(base, model)) {
         if (cf_oauth.resolveToken(app, uid, alloc)) |cf| {
             key = cf.key;
             base = cf.base_url;
@@ -828,10 +850,11 @@ fn launchRun(app: *App, alloc: std.mem.Allocator, uid: u64, t: *Task, now: i64) 
     // The run's model trio: coding/base is the blank-filled provider above; thinking/prompting come straight
     // from the task (empty ⇒ ModelTrio.pick falls back to coding, so an old single-model task is unchanged).
     // This is how an unattended run's auto-loop drive + planning honor the trio the creating turn picked.
+    // A role stored keyless on Workers AI (schedule_task stores no login token) rides the login here, as coding does.
     const trio: chat_engine.ModelTrio = .{
         .coding = .{ .base_url = pr.base, .key = pr.key, .model = pr.model },
-        .thinking = .{ .base_url = t.think_base_url, .key = t.think_api_key, .model = t.think_model },
-        .prompting = .{ .base_url = t.prompt_base_url, .key = t.prompt_api_key, .model = t.prompt_model },
+        .thinking = .{ .base_url = t.think_base_url, .key = roleKey(app, alloc, uid, t.think_base_url, t.think_model, t.think_api_key), .model = t.think_model },
+        .prompting = .{ .base_url = t.prompt_base_url, .key = roleKey(app, alloc, uid, t.prompt_base_url, t.prompt_model, t.prompt_api_key), .model = t.prompt_model },
     };
 
     // Claim-before-spawn, exactly like postMessage: a `false` here means a same-named run from this minute is
