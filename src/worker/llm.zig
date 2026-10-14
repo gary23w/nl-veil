@@ -159,7 +159,7 @@ fn keySwapId(s: []const u8) u64 {
 /// call (swappedKey) do not sit in freed heap after they are dropped. That is all it covers, not the token: every
 /// request's curl config (chatCfg) carries the same bearer and is freed without zeroing, and so are the engine's own
 /// copies of a re-resolved key (llmRetryRekey, cf_oauth).
-fn freeKey(gpa: std.mem.Allocator, k: []const u8) void {
+pub fn freeKey(gpa: std.mem.Allocator, k: []const u8) void {
     std.crypto.secureZero(u8, @constCast(k));
     gpa.free(k);
 }
@@ -171,8 +171,9 @@ fn forgetKeys() void {
 
 /// The key this turn re-resolved for a caller holding `held` at `base_url`, as a `gpa`-owned copy the caller frees
 /// with freeKey; null when there is none (send `held`). A copy, so a rotation during the caller's call can replace
-/// the entry without pulling the key out from under it.
-fn swappedKey(gpa: std.mem.Allocator, base_url: []const u8, held: []const u8) ?[]u8 {
+/// the entry without pulling the key out from under it. Public for the engine's own hand-ons of a turn's key — a
+/// cast deploys workers with it (castTool) — so what leaves the turn is the key the turn's own calls are sending.
+pub fn swappedKey(gpa: std.mem.Allocator, base_url: []const u8, held: []const u8) ?[]u8 {
     if (!retry_armed) return null;
     const b = keySwapId(trimSlash(base_url));
     const h = keySwapId(held);
@@ -7400,6 +7401,22 @@ test "a Stop that lands while a request is out ends the call with that request: 
         if (c.knob) try std.testing.expect(std.mem.indexOf(u8, srv.request(), "chat_template_kwargs") != null); // it DID carry the knob
         if (c.ok) try std.testing.expect(reasoning_kept);
     }
+}
+
+test "a key the turn hands on (a cast's) is the re-resolved one while the turn is armed, and nothing after it" {
+    const gpa = std.testing.allocator;
+    armRetries();
+    defer disarmRetries();
+    const base = "https://api.cloudflare.com/client/v4/accounts/abc/ai/v1";
+    try std.testing.expect(swappedKey(gpa, base, "tok-old") == null); // nothing re-resolved yet: send what is held
+    rememberKey(gpa, base, "tok-old", "tok-new");
+    const k = swappedKey(gpa, base ++ "/", "tok-old") orelse return error.SwapNotFound; // the slash does not matter
+    defer freeKey(gpa, k);
+    try std.testing.expectEqualStrings("tok-new", k);
+    try std.testing.expect(swappedKey(gpa, base, "tok-other") == null); // another role's key is never handed this one
+    try std.testing.expect(swappedKey(gpa, "https://api.openai.com/v1", "tok-old") == null); // nor another endpoint's
+    disarmRetries();
+    try std.testing.expect(swappedKey(gpa, base, "tok-old") == null); // the turn is over: nothing outlives it
 }
 
 test "a credential re-resolved after a 401 serves the rest of the turn: later calls send it, streamed or not, and pay no 401 and no re-resolve" {
