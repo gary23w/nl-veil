@@ -6,7 +6,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import worker, { Tot, VERSION, DEFAULT_MAX_TOTS, MAX_TOTS_CEIL, PRIMARY, PLATEAU, firstJson, answerText, parseAction, nativeCalls, pickText, searchResults, privateHost, parseGoalCommand, parseVerdict, evidenceVerdict, repeatedGoal, decide, newGoal, recordIteration, validName, parseGuardCommand, watchKey, judgeTarget, chainHash, verifyChain, toolPath, cueTokens, buildTree, Walk, Learned, beltFor, mapIndex, NAV_MAX, OPEN_MAX, MAP_AT, loopGraph, criticalChain, unfold, netFold, netOf, looksDead, distinctiveTokens, similarText, repeatedStep, classifyModelError } from "./tot.js";
+import worker, { Tot, VERSION, DEFAULT_MAX_TOTS, MAX_TOTS_CEIL, PRIMARY, PLATEAU, firstJson, answerText, parseAction, nativeCalls, pickText, searchResults, privateHost, parseGoalCommand, parseVerdict, evidenceVerdict, repeatedGoal, decide, newGoal, recordIteration, validName, parseGuardCommand, watchKey, judgeTarget, chainHash, verifyChain, toolPath, cueTokens, buildTree, Walk, Learned, beltFor, mapIndex, NAV_MAX, OPEN_MAX, MAP_AT, loopGraph, criticalChain, unfold, netFold, netOf, looksDead, distinctiveTokens, similarText, repeatedStep, classifyModelError, nearestSecurity, beltListing } from "./tot.js";
 
 class Storage {
   constructor() {
@@ -1861,8 +1861,9 @@ test("Agent Garrett: per-feature opt-in preserves typed schemas and direct calls
     assert.deepEqual(calls.at(-1).body.params,{name:"gary_probe",arguments:args});
     assert.equal(calls.at(-1).init.headers.authorization,"Bearer "+w.env.GARRETT_MCP_TOKEN);
     const list = await tot.runTool(cfg,"garrett_tools",{},"");
-    assert.match(list,/inputSchema:/);
-    assert.match(list,/"type":"array"/);
+    assert.match(list, /^Agent Garrett's 1 tool on your belt, by branch[\s\S]*\nsecurity\/agent\/tasks - [^\n]*:\n  security_gary_probe \(targets, options\)\n/); // by branch, with the belt's names; the typed schema is tool_schema's
+    assert.doesNotMatch(list, /inputSchema:/);
+    assert.match(await tot.runTool(cfg, "tool_schema", { name: "security_gary_probe" }, ""), /"type":"array"/);
     await w.req("POST", "/v1/tots/Gary/config", {garrett:false});
     assert.equal((await w.req("GET", "/v1/tots/Gary")).body.tot.garrett,false);
     const before = calls.length;
@@ -2449,4 +2450,101 @@ test("a pick that repeats an earlier iteration is asked once more for a changed 
   assert.match((await w.req("POST", "/v1/tots/Gary/command", { text: "/belt sideways" })).body.reply, /^Usage: \/belt auto \| map \| flat\./);
   assert.match((await w.req("POST", "/v1/tots/Gary/command", { text: "/belt auto" })).body.reply, /minds, 400 model calls a day\.$/);
   assert.match((await w.req("POST", "/v1/tots/Gary/command", { text: "/help" })).body.reply, /\/belt auto\|map\|flat/);
+});
+
+// ---------------------------------------------------------------------------------------- Agent Garrett by name
+
+test("the garrett wrapper takes a belt name with or without its security_ prefix, a guessed name is answered with the nearest belt names and never reaches the agent, and garrett_tools lists the catalogue by branch with the belt's names and argument names", async () => {
+  const sec = (n, what, props = {}) => ({ name: "security_" + n, args: JSON.stringify({ type: "object", properties: props }), what, inputSchema: { type: "object", properties: props }, need: "garrett" });
+  const catalogue = [sec("crtsh_subs", "crt.sh certificate-transparency subdomain enumeration", { domain: { type: "string" } }), sec("dns_records", "DNS records of a host", { domain: { type: "string" }, type: { type: "string" } }), sec("cert_ct", "certificate transparency log entries", { domain: { type: "string" } }), sec("nvd_lookup", "NVD CVE metadata lookup", { target: { type: "string" } })];
+  const w = world();
+  w.env.GARRETT_MCP_URL = "https://veil-garrett.example.workers.dev/mcp";
+  w.env.GARRETT_MCP_TOKEN = "test-token-only-not-a-live-credential";
+  w.env.SECURITY_TOOLS = catalogue;
+  await w.req("POST", "/v1/tots", { goal: "audit the domain", garrett: true });
+  const tot = w.tot("Gary");
+  const cfg = await tot.store.get("cfg");
+  const calls = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (_url, init) => {
+    const body = JSON.parse(init.body);
+    calls.push(body);
+    const known = catalogue.some((t) => t.name === "security_" + body.params.name);
+    return Response.json({ jsonrpc: "2.0", id: 1, result: known ? { content: [{ type: "text", text: "completed" }], isError: false } : { content: [{ type: "text", text: "Unknown tool: " + body.params.name }], isError: true } });
+  };
+  try {
+    // the live failure: the belt's spelling handed to the wrapper
+    assert.equal(await tot.runTool(cfg, "garrett", { name: "security_crtsh_subs", args: { domain: "example.com" } }, ""), "completed");
+    assert.deepEqual(calls.at(-1).params, { name: "crtsh_subs", arguments: { domain: "example.com" } });
+    assert.equal(await tot.runTool(cfg, "garrett", { name: "crtsh_subs", args: { domain: "example.com" } }, ""), "completed");
+    assert.deepEqual(calls.at(-1).params, { name: "crtsh_subs", arguments: { domain: "example.com" } });
+    // a guessed name: the nearest belt names, and no call goes out
+    const before = calls.length;
+    assert.match(await tot.runTool(cfg, "garrett", { name: "crtsh", args: {} }, ""), /^ERROR: Agent Garrett has no tool named crtsh\. Nearest: security_crtsh_subs\. garrett_tools lists them by branch; call one by its security_ name/);
+    assert.match(await tot.runTool(cfg, "garrett", { name: "security_dns_lookup", args: {} }, ""), /^ERROR: Agent Garrett has no tool named dns_lookup\. Nearest: security_dns_records, security_nvd_lookup\./);
+    assert.equal(calls.length, before);
+    assert.equal(nearestSecurity("nothing_here", catalogue), "");
+    // the listing: every tool on one screen, by branch, with the belt's names and argument names, no schema and no call
+    const list = await tot.runTool(cfg, "garrett_tools", {}, "");
+    assert.match(list, /^Agent Garrett's 4 tools on your belt, by branch/);
+    assert.match(list, /\nsecurity\/dns-ip - DNS records, certificate transparency[^\n]*:\n  security_crtsh_subs \(domain\), security_dns_records \(domain, type\), security_cert_ct \(domain\)\n/);
+    assert.match(list, /\nsecurity\/intel - [^\n]*:\n  security_nvd_lookup \(target\)\n/);
+    assert.match(list, /The garrett wrapper takes the same name, with or without security_\.$/);
+    assert.doesNotMatch(list, /inputSchema/);
+    assert.equal(calls.length, before);
+    // the belt empty (discovery failed): the wrapper goes to the agent, and an unknown name comes back with the way to the right one
+    w.env.SECURITY_TOOLS = [];
+    assert.match(await tot.runTool(cfg, "garrett", { name: "security_ghost", args: {} }, ""), /^FAILED: Unknown tool: ghost\ngarrett_tools lists Agent Garrett's tools by branch; call one by its security_ name \(the garrett wrapper takes that name too\)/);
+    assert.equal(calls.at(-1).params.name, "ghost");
+    assert.match(await tot.runTool(cfg, "garrett_tools", {}, ""), /Agent Garrett lists no tools|^- /); // the agent's own list, as before
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test("the host's newer runtime becomes the next revision only over a deployed runtime the host wrote: a tot's draft, a pending upload and a tot's deployed edit refuse it, a revert to a host revision lets it in again, and it is revertable like any revision", async () => {
+  const w = world();
+  await w.req("POST", "/v1/tots", { goal: "improve my runtime" });
+  const tot = w.tot("Gary");
+  const cfg = await tot.store.get("cfg");
+  const run = (tool, args = {}) => tot.runTool(cfg, tool, args, "");
+  const up = (source, revision) => w.req("POST", "/v1/runtime/upgrade", { source, revision, by: "veil host" });
+  assert.match((await up("stock v2", 0)).body.err, /not synced yet/);
+  await w.req("POST", "/v1/runtime/seed", { source: "stock v1" });
+  assert.equal((await w.req("GET", "/v1/runtime")).body.host, true); // the seed is the host's
+  assert.equal((await up("stock v2", 7)).status, 409);
+  assert.deepEqual((await up("stock v1", 0)).body.unchanged, true); // the same source: nothing to do
+  const offered = (await up("stock v2", 0)).body;
+  assert.equal(offered.revision, 1);
+  assert.equal(offered.status, "pending");
+  assert.equal(offered.host, true);
+  assert.equal(offered.author, "veil host");
+  const pending = (await w.req("GET", "/v1/runtime")).body;
+  assert.equal(pending.source, "stock v2"); // the owner's veil uploads it on its next sync
+  assert.match((await up("stock v3", 1)).body.err, /revision 1 is pending; the host's source waits until it has deployed/);
+  await w.req("POST", "/v1/runtime/result", { revision: 1, err: "" });
+  assert.equal((await w.req("GET", "/v1/runtime")).body.status, "deployed");
+  // a tot edits: from then on the runtime is the tots', and the host's source is refused
+  await run("runtime_edit", { revision: 1, find: "v2", replace: "v2 edited by Gary" });
+  assert.match((await up("stock v3", 2)).body.err, /^the tots own this runtime: revision 2 was written by a tot/);
+  assert.equal((await w.req("GET", "/v1/runtime")).body.host, false);
+  await run("runtime_deploy", { revision: 2 });
+  await w.req("POST", "/v1/runtime/result", { revision: 2, err: "SyntaxError" });
+  assert.match((await up("stock v3", 2)).body.err, /^the tots own this runtime/);
+  // the tot reverts to the last deployed source, which the host wrote: the host's source is welcome again
+  const back = JSON.parse(await run("runtime_revert", { revision: 2 }));
+  assert.equal(back.revision, 3);
+  assert.equal(back.host, true);
+  assert.match(await run("runtime_read", { find: "stock" }), /stock v2$/);
+  const taken = (await up("stock v3", 3)).body;
+  assert.equal(taken.revision, 4);
+  assert.equal(taken.status, "pending");
+  await w.req("POST", "/v1/runtime/result", { revision: 4, err: "" });
+  assert.match(await run("runtime_read", { find: "stock" }), /stock v3$/);
+  // ...and a tot's deployed edit stays its own: the way back is the tot's source, not the host's
+  await run("runtime_edit", { revision: 4, source: "Gary's own runtime" });
+  await run("runtime_deploy", { revision: 5 });
+  await w.req("POST", "/v1/runtime/result", { revision: 5, err: "" });
+  assert.equal(JSON.parse(await run("runtime_revert", { revision: 5 })).host, false);
+  assert.match((await up("stock v4", 6)).body.err, /^the tots own this runtime/);
 });

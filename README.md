@@ -350,7 +350,9 @@ so they never cross the public internet and need no API key.
   one that answers nothing three times in a day hands the day to the fallback model and is tried again tomorrow;
   a context-length error halves the window for that model; a missing model routes to the fallback. A runtime
   edit that fails to deploy reaches the next iteration as a directive, and `runtime_revert` restores the last
-  deployed source.
+  deployed source. A newer veil's runtime reaches the tater-tots as a revision of their own - only over a
+  runtime the veil itself wrote, never over an edit of theirs - so an upgrade is read back and reverted like
+  any other revision.
 - **Tater-tots work together.** They share one scratchpad, which you can read and write too, and can message each
   other. A tater-tot can also cast its own small swarm: several minds side by side, one task each.
 - **Its tool belt.** A tater-tot works with real tools, in the cloud:
