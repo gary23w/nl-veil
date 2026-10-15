@@ -761,8 +761,10 @@ test "a retired reasoning-off knob stays retired through the store merge, and a 
 /// an effort at all: in the SWE-bench baseline every coding step ran at the provider's max, ~49 tok/s, 60-145 s a
 /// productive step, and steps cut at the 240 s deadline.
 ///
-/// So the operator may set one: NL_REASONING_EFFORT = low | high | max (any case, trimmed; empty, unset or anything
-/// else is OFF), read by the engine per turn and armed on the turn's thread (armReasoningEffort). An armed call sends
+/// So the operator may set one: NL_REASONING_EFFORT = low | high | max (any case, trimmed) pins a level; off | none |
+/// 0 | false turns the dial off (every request byte-identical to one built before the dial existed); unset, empty or
+/// anything else is AUTO, the default (below). It is read by the engine per turn and armed on the turn's thread
+/// (armReasoningEffort). An armed call sends
 /// `,"reasoning_effort":"<v>"` when ALL of these hold (effortPick): the endpoint is hosted (a local server has no such
 /// parameter to honour; isLocal is the line every hosted-only rule here draws), the model has been SEEN reasoning
 /// (Quirk.reasons, the observation that starts the trials: a model never seen reasoning gets the bytes it always got),
@@ -771,8 +773,24 @@ test "a retired reasoning-off knob stays retired through the store merge, and a 
 /// provider has not refused the dial for this model in this process (effortRefused). Unarmed, a request is
 /// byte-identical to one built before the dial existed: nothing is read and no lock is taken.
 ///
-/// It is NOT learned and never persisted: observeReasonOff never sees it, provider_quirks.jsonl never holds it, and
-/// nothing about any model's reasoning is inferred from the replies it brings. The one thing kept is a refusal, in RAM.
+/// A pinned level is NOT learned and never persisted: observeReasonOff never sees it, provider_quirks.jsonl never holds
+/// it, and nothing about any model's reasoning is inferred from the replies it brings. The one thing kept is a refusal,
+/// in RAM.
+///
+/// AUTO: THE ENGINE'S OWN SETTING WHEN THE OPERATOR HAS NONE, learned like the knobs above from what the model did, not
+/// from its name or a catalog. Auto sends nothing until a model's reasoning has OVERRUN the engine's bounds
+/// (Quirk.reasoning_overruns): a call at or above the reasoning floor (REASONING_MIN_TOKENS, which effTokens already
+/// grants a model learned to starve) that ended cut - at the output limit (finish_reason "length") or without an end at
+/// all (a stream the deadline closed) - with reasoning and no answer: no content, no tool call. From then on auto sends
+/// `low`, the one level every provider that documents the key reads as "less", wherever the pick allows. Measured on the
+/// 2026-10-14 held-out run (@cf/zai-org/glm-5.3 on Workers AI, whose default effort is max, ENGINE DEFAULTS): the plan
+/// pass reasoned to the 8192-token limit in 10 of 10 tasks (109-149 s each), the survey in 3, seven coding calls ran to
+/// the 240 s deadline thinking, the first tool ran at a median of 250 s, and 0 of 10 tasks were resolved; the same
+/// engine with the dial pinned at low had no cut, its first tool at 2-62 s, and 7 of 10 resolved. A model whose reasoning
+/// fits the bounds never gets the dial from auto: a provider default that answers in time is left alone. The lesson is
+/// persisted with the model's other quirks (provider_quirks.jsonl) and never unlearned by itself: a pinned level or
+/// `off` overrides it, and deleting the model's line re-runs the observation. A thread no turn armed (a swarm worker)
+/// stays at `.off` and sends nothing, auto or not.
 ///
 /// NESTING. armReasoningEffort returns the value it replaced and restoreReasoningEffort puts it back, so a turn nested
 /// on its parent's thread (spawnTurn's inline fallback, when no thread can be spawned) runs on its own reading of the
@@ -780,16 +798,20 @@ test "a retired reasoning-off knob stays retired through the store merge, and a 
 /// own. The retry budget beside it does not do this (a nested turn's disarm leaves the parent unarmed for the rest of
 /// its turn - see KeySwap); the dial has no per-turn state to forget, so restoring it costs nothing. A thread no turn
 /// armed (a swarm worker) never sends it.
-pub const ReasoningEffort = enum { off, low, high, max };
+pub const ReasoningEffort = enum { off, auto, low, high, max };
 
-/// The dial's setting from an env value: low | high | max in any case, surrounding whitespace trimmed; anything else -
-/// empty, unset, a typo, a level some provider aliases (medium, xhigh) - is OFF, never a guess at what was meant.
+/// The dial's setting from an env value: low | high | max in any case, surrounding whitespace trimmed, pins that level;
+/// off | none | 0 | false (any case) turns the dial off; anything else - unset, empty, a typo, a level some provider
+/// aliases (medium, xhigh) - is AUTO, the default, never a guess at which level was meant and never a silent "off".
 pub fn parseReasoningEffort(v: ?[]const u8) ReasoningEffort {
-    const t = std.mem.trim(u8, v orelse return .off, " \t\r\n");
+    const t = std.mem.trim(u8, v orelse return .auto, " \t\r\n");
     inline for (.{ ReasoningEffort.low, ReasoningEffort.high, ReasoningEffort.max }) |e| {
         if (std.ascii.eqlIgnoreCase(t, @tagName(e))) return e;
     }
-    return .off;
+    inline for (.{ "off", "none", "0", "false" }) |w| {
+        if (std.ascii.eqlIgnoreCase(t, w)) return .off;
+    }
+    return .auto;
 }
 
 /// The key the dial sends, as the provider documents it - and what a provider that refuses the dial names in its
@@ -799,7 +821,7 @@ const EFFORT_KEY = "reasoning_effort";
 /// The bytes the dial splices into a request body, spelled as the provider documents them.
 fn effortFrag(e: ReasoningEffort) []const u8 {
     return switch (e) {
-        .off => "",
+        .off, .auto => "", // auto spells itself as the level it resolves to (effortPick), never as "auto"
         .low => ",\"" ++ EFFORT_KEY ++ "\":\"low\"",
         .high => ",\"" ++ EFFORT_KEY ++ "\":\"high\"",
         .max => ",\"" ++ EFFORT_KEY ++ "\":\"max\"",
@@ -946,9 +968,12 @@ test "effortSuspect: a rejection that names the dial is evidence whatever it say
     try std.testing.expect(isMalformedBodyError(suspect[2])); // the Google wording: the name is what lets it through
 }
 
-/// What the dial adds to a call, from the facts that decide it (see ReasoningEffort). Pure - tested.
-fn effortPick(e: ReasoningEffort, local: bool, reasons: bool, knob_out: bool, refused: bool) []const u8 {
+/// What the dial adds to a call, from the facts that decide it (see ReasoningEffort). Pure - tested. `overruns` is the
+/// model's learned Quirk.reasoning_overruns, read by `.auto` alone: `low` once the model's reasoning has overrun a call's
+/// bounds, nothing before; a pinned level sends itself whatever the model did.
+fn effortPick(e: ReasoningEffort, local: bool, reasons: bool, knob_out: bool, refused: bool, overruns: bool) []const u8 {
     if (e == .off or local or !reasons or knob_out or refused) return "";
+    if (e == .auto) return if (overruns) effortFrag(.low) else "";
     return effortFrag(e);
 }
 
@@ -957,14 +982,22 @@ fn effortPick(e: ReasoningEffort, local: bool, reasons: bool, knob_out: bool, re
 fn effortFor(io: std.Io, base_url: []const u8, model: []const u8, knob_frag: []const u8) []const u8 {
     const e = effort_dial;
     if (e == .off) return ""; // the byte-identical path: no quirk read, no lock
-    return effortPick(e, isLocal(base_url), quirkFor(io, model).reasons, knob_frag.len > 0, effortRefused(io, model));
+    const q = quirkFor(io, model);
+    if (e == .auto and !q.reasoning_overruns) return ""; // auto before any overrun: the bytes the model always got
+    return effortPick(e, isLocal(base_url), q.reasons, knob_frag.len > 0, effortRefused(io, model), q.reasoning_overruns);
 }
 
-test "the reasoning-effort dial: off unless armed with an exact level, spelled as documented, sent only to a hosted model seen reasoning, never beside a reasoning-off knob" {
+test "the reasoning-effort dial: auto unless pinned or turned off, spelled as documented, sent only to a hosted model seen reasoning, never beside a reasoning-off knob; auto sends low only to a model whose reasoning overran a call's bounds" {
     const t = std.testing;
-    // ---- the env value: three levels in any case, trimmed; anything else is off ----
-    try t.expect(parseReasoningEffort(null) == .off);
-    for ([_][]const u8{ "", "   ", "medium", "none", "minimal", "xhigh", "1", "on", "true", "lowest", "lo w", "max!", "\"low\"" }) |v| {
+    // ---- the env value: three levels in any case, trimmed, pin; four words turn it off; anything else is auto ----
+    try t.expect(parseReasoningEffort(null) == .auto);
+    for ([_][]const u8{ "", "   ", "medium", "minimal", "xhigh", "1", "on", "true", "lowest", "lo w", "max!", "\"low\"", "auto" }) |v| {
+        if (parseReasoningEffort(v) != .auto) {
+            std.debug.print("\nNL_REASONING_EFFORT={s} read as {s}\n", .{ v, @tagName(parseReasoningEffort(v)) });
+            return error.TestUnexpectedResult;
+        }
+    }
+    for ([_][]const u8{ "off", "OFF", " none\n", "0", "false", "False" }) |v| {
         if (parseReasoningEffort(v) != .off) {
             std.debug.print("\nNL_REASONING_EFFORT={s} read as {s}\n", .{ v, @tagName(parseReasoningEffort(v)) });
             return error.TestUnexpectedResult;
@@ -978,6 +1011,7 @@ test "the reasoning-effort dial: off unless armed with an exact level, spelled a
     try t.expectEqualStrings(",\"reasoning_effort\":\"high\"", effortFrag(.high));
     try t.expectEqualStrings(",\"reasoning_effort\":\"max\"", effortFrag(.max));
     try t.expectEqualStrings("", effortFrag(.off));
+    try t.expectEqualStrings("", effortFrag(.auto)); // never a level of its own on the wire
     inline for (.{ ReasoningEffort.low, ReasoningEffort.high, ReasoningEffort.max }) |e| {
         const body = "{\"model\":\"m\"" ++ comptime effortFrag(e) ++ ",\"max_tokens\":64}";
         const parsed = try std.json.parseFromSlice(struct { reasoning_effort: []const u8 }, t.allocator, body, .{ .ignore_unknown_fields = true });
@@ -985,12 +1019,23 @@ test "the reasoning-effort dial: off unless armed with an exact level, spelled a
         try t.expectEqualStrings(@tagName(e), parsed.value.reasoning_effort);
     }
     // ---- the pure pick: every gate on its own ----
-    try t.expectEqualStrings(effortFrag(.high), effortPick(.high, false, true, false, false));
-    try t.expectEqualStrings("", effortPick(.off, false, true, false, false)); // unarmed
-    try t.expectEqualStrings("", effortPick(.high, true, true, false, false)); // a local endpoint
-    try t.expectEqualStrings("", effortPick(.high, false, false, false, false)); // a model never seen reasoning
-    try t.expectEqualStrings("", effortPick(.high, false, true, true, false)); // a reasoning-off knob goes out
-    try t.expectEqualStrings("", effortPick(.high, false, true, false, true)); // the provider refused it here
+    try t.expectEqualStrings(effortFrag(.high), effortPick(.high, false, true, false, false, false));
+    try t.expectEqualStrings("", effortPick(.off, false, true, false, false, false)); // unarmed
+    try t.expectEqualStrings("", effortPick(.high, true, true, false, false, false)); // a local endpoint
+    try t.expectEqualStrings("", effortPick(.high, false, false, false, false, false)); // a model never seen reasoning
+    try t.expectEqualStrings("", effortPick(.high, false, true, true, false, false)); // a reasoning-off knob goes out
+    try t.expectEqualStrings("", effortPick(.high, false, true, false, true, false)); // the provider refused it here
+    // auto: nothing until the model's reasoning overran a call's bounds, then low, behind every gate above
+    try t.expectEqualStrings("", effortPick(.auto, false, true, false, false, false));
+    try t.expectEqualStrings(effortFrag(.low), effortPick(.auto, false, true, false, false, true));
+    try t.expectEqualStrings("", effortPick(.auto, true, true, false, false, true)); // local
+    try t.expectEqualStrings("", effortPick(.auto, false, false, false, false, true)); // never seen reasoning (the lesson sets it; the pick still asks)
+    try t.expectEqualStrings("", effortPick(.auto, false, true, true, false, true)); // a knob goes out
+    try t.expectEqualStrings("", effortPick(.auto, false, true, false, true, true)); // refused
+    // a pinned level ignores the lesson either way: it sends itself, and off sends nothing
+    try t.expectEqualStrings(effortFrag(.max), effortPick(.max, false, true, false, false, true));
+    try t.expectEqualStrings(effortFrag(.high), effortPick(.high, false, true, false, false, false));
+    try t.expectEqualStrings("", effortPick(.off, false, true, false, false, true));
 
     // ---- through the pair every call site runs (reasonOffFor, then effortFor), on the real quirk table ----
     var threaded = std.Io.Threaded.init(t.allocator, .{});
@@ -1047,6 +1092,22 @@ test "the reasoning-effort dial: off unless armed with an exact level, spelled a
     try t.expectEqualStrings("", effortFor(io, hosted, m, ""));
     noteReasons(io, "test/effort-other");
     try t.expectEqualStrings(effortFrag(.high), effortFor(io, hosted, "test/effort-other", ""));
+    // AUTO, the default when the operator set nothing: the bytes the model always got until its reasoning has overrun
+    // a call's bounds (learnReasoningOverrun), then low; local and refused stay without it; a pinned level ignores it
+    const auto_prev = armReasoningEffort(.auto);
+    try t.expect(auto_prev == .high);
+    try t.expectEqualStrings("", effortFor(io, hosted, "test/effort-other", ""));
+    learnReasoningOverrun(io, "test/effort-other");
+    try t.expectEqualStrings(effortFrag(.low), effortFor(io, hosted, "test/effort-other", ""));
+    try t.expectEqualStrings("", effortFor(io, "http://127.0.0.1:11434/v1", "test/effort-other", ""));
+    learnReasoningOverrun(io, m); // the model whose provider refused the dial: still nothing
+    try t.expectEqualStrings("", effortFor(io, hosted, m, ""));
+    // ...and a model never seen before learns both facts from the one observation: the pick needs `reasons` too
+    learnReasoningOverrun(io, "test/effort-fresh");
+    try t.expect(quirkFor(io, "test/effort-fresh").reasons);
+    try t.expectEqualStrings(effortFrag(.low), effortFor(io, hosted, "test/effort-fresh", ""));
+    restoreReasoningEffort(auto_prev);
+    try t.expectEqualStrings(effortFrag(.high), effortFor(io, hosted, "test/effort-other", "")); // pinned high: high
     // NESTING: a turn nested on this thread arms its own reading and hands this one back when it ends
     const inner = armReasoningEffort(.low);
     try t.expect(inner == .high);
@@ -3002,6 +3063,12 @@ const Quirk = struct {
     /// This model has been SEEN reasoning (reasoning_content in a reply) - learned from observation, never
     /// from the name or a catalog alone. It starts the reasoning-off trials and doubles the output cap.
     reasons: bool = false,
+    /// This model's reasoning has OVERRUN the engine's bounds: a call at or above REASONING_MIN_TOKENS ended cut -
+    /// at the output limit, or without an end (a stream the deadline closed) - with reasoning and no answer, no
+    /// content and no tool call. Learned from that signature (learnReasoningOverrun: completeBodyH and streamAttempt
+    /// see it), never from the name or the catalog. What the reasoning-effort dial's auto setting turns on (see
+    /// ReasoningEffort / effortPick). Only ever turns ON, in RAM and through the store merge.
+    reasoning_overruns: bool = false,
     /// The knob that silences this model's reasoning on auxiliary calls (see reasonOffFor); `.unknown` while
     /// the candidates are on trial, `.none` once every candidate failed. Persisted TOGETHER with the trial
     /// index below: a retired knob reads `.unknown` exactly like a knob never tried, so without the index the
@@ -3079,7 +3146,7 @@ fn quirkFor(io: std.Io, model: []const u8) Quirk {
 /// ignored on parse, so a new constraint class is one added field here: an old engine skips it, a new
 /// engine reads an old file — the store never needs a migration. `temp` travels as the tag name (not the
 /// enum's integer) so a reordered TempRule can't silently reassign every persisted rule.
-const QuirkRec = struct { model: []const u8 = "", temp: []const u8 = "keep", temp_val: f32 = 1.0, reasoning_echo: bool = false, reasoning_budget: bool = false, reasons: bool = false, reason_off: []const u8 = "unknown", reason_off_trial: u8 = 0 };
+const QuirkRec = struct { model: []const u8 = "", temp: []const u8 = "keep", temp_val: f32 = 1.0, reasoning_echo: bool = false, reasoning_budget: bool = false, reasons: bool = false, reason_off: []const u8 = "unknown", reason_off_trial: u8 = 0, reasoning_overruns: bool = false };
 
 /// Fold one on-disk record into the RAM table (caller holds quirk_mtx). File fields never CLOBBER a live
 /// RAM lesson — this process learned from a fresher provider error than anything on disk — they fill gaps:
@@ -3104,6 +3171,7 @@ fn mergeQuirkLocked(model: []const u8, q: Quirk) void {
     if (q.reasoning_echo) e.q.reasoning_echo = true;
     if (q.reasoning_budget) e.q.reasoning_budget = true;
     if (q.reasons) e.q.reasons = true;
+    if (q.reasoning_overruns) e.q.reasoning_overruns = true;
     if (q.reason_off_trial > e.q.reason_off_trial) e.q.reason_off_trial = q.reason_off_trial;
     // A knob RAM still trusts but a peer has retired (its index is below the merged cursor) is dropped first,
     // so the retirement reaches every process sharing the store, not only the one that saw the reasoning -
@@ -3139,6 +3207,7 @@ fn loadQuirksLocked(io: std.Io) void {
             .reasons = p.value.reasons,
             .reason_off = std.meta.stringToEnum(ReasonOff, p.value.reason_off) orelse .unknown,
             .reason_off_trial = p.value.reason_off_trial,
+            .reasoning_overruns = p.value.reasoning_overruns,
         });
     }
 }
@@ -3158,10 +3227,12 @@ fn saveQuirksLocked(io: std.Io) void {
         if (e.hash == 0 or e.name_len == 0) continue;
         out.appendSlice(gpa, "{\"model\":") catch return;
         jstr(gpa, &out, e.name[0..e.name_len]) catch return;
-        var tail: [240]u8 = undefined;
+        var tail: [288]u8 = undefined;
         // The knob AND its trial cursor: `.none` is written as itself now (an older engine reading it falls back
         // to .unknown, which is what it always saw), because "every candidate failed" is a lesson worth keeping.
-        const t = std.fmt.bufPrint(&tail, ",\"temp\":\"{s}\",\"temp_val\":{d},\"reasoning_echo\":{s},\"reasoning_budget\":{s},\"reasons\":{s},\"reason_off\":\"{s}\",\"reason_off_trial\":{d}}}\n", .{
+        // reasoning_overruns rides last: an older engine ignores the field and, when it saves, drops it (its own
+        // record has no such lesson), which is the never-lose merge's one-way door for a field it predates.
+        const t = std.fmt.bufPrint(&tail, ",\"temp\":\"{s}\",\"temp_val\":{d},\"reasoning_echo\":{s},\"reasoning_budget\":{s},\"reasons\":{s},\"reason_off\":\"{s}\",\"reason_off_trial\":{d},\"reasoning_overruns\":{s}}}\n", .{
             @tagName(e.q.temp),
             e.q.temp_val,
             if (e.q.reasoning_echo) "true" else "false",
@@ -3169,6 +3240,7 @@ fn saveQuirksLocked(io: std.Io) void {
             if (e.q.reasons) "true" else "false",
             @tagName(e.q.reason_off),
             e.q.reason_off_trial,
+            if (e.q.reasoning_overruns) "true" else "false",
         }) catch return;
         out.appendSlice(gpa, t) catch return;
     }
@@ -3228,6 +3300,31 @@ pub fn learnReasoningBudget(io: std.Io, model: []const u8) void {
 /// Does this model need room to reason before it will answer at all? (Learned; false until proven.)
 pub fn reasoningBudgetFor(io: std.Io, model: []const u8) bool {
     return quirkFor(io, model).reasoning_budget;
+}
+
+/// Learn that THIS model's reasoning has overrun the engine's bounds (Quirk.reasoning_overruns): a call that already
+/// had the reasoning floor, or more, ended cut with reasoning and no answer. Called by the two places that see a
+/// reply end (completeBodyH, streamAttempt); the reasoning-effort dial's auto setting reads it (effortPick). The
+/// evidence includes reasoning, so the model is marked as seen reasoning too, which the pick also requires.
+pub fn learnReasoningOverrun(io: std.Io, model: []const u8) void {
+    if (model.len == 0) return;
+    const h = std.hash.Wyhash.hash(0x9e37, model);
+    const changed = blk: {
+        quirk_mtx.lockUncancelable(io);
+        defer quirk_mtx.unlock(io);
+        const e = slotForLocked(model, h);
+        const changed = !e.q.reasoning_overruns;
+        e.q.reasoning_overruns = true;
+        e.q.reasons = true;
+        if (changed) saveQuirksLocked(io);
+        break :blk changed;
+    };
+    if (changed) std.log.info("llm[{s}] the reasoning overran a call's bounds (reasoning, no answer, cut at or past the reasoning floor): the reasoning-effort dial's auto setting sends low to this model from here on", .{model});
+}
+
+/// Has this model's reasoning overrun a call's bounds? (Learned; false until seen.)
+pub fn reasoningOverrunsFor(io: std.Io, model: []const u8) bool {
+    return quirkFor(io, model).reasoning_overruns;
 }
 
 /// Is this provider error the thinking-mode "reasoning_content must be passed back" constraint? The chat
@@ -3665,9 +3762,13 @@ fn completeBodyH(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: [
     // asked for 768 tokens to distil a turn's continuation state, the answer never fit behind the reasoning,
     // and the empty result was indistinguishable from "the model had nothing to say" - so the engine committed
     // a bare compaction note with no state and the next turn began again from nothing. Ten turns out of eleven.
-    if (heal_ok and calls.items.len == 0 and trunc and reasoning.len > 0 and
-        std.mem.trim(u8, content, " \r\n\t").len == 0)
-    {
+    const starved = calls.items.len == 0 and trunc and reasoning.len > 0 and std.mem.trim(u8, content, " \r\n\t").len == 0;
+    // THE REASONING OVERRAN THE CALL (Quirk.reasoning_overruns, for the dial's auto setting): starved at a budget the
+    // reasoning floor had already raised, or past it. Learned whether or not the heal below runs: the heal's own raised
+    // call lands here with heal_ok=false, and a raise that starved again is the clearest evidence there is. A call
+    // starved below the floor teaches the floor (below) and nothing more: any reasoner starves at 768.
+    if (starved and budget_tokens >= REASONING_MIN_TOKENS) learnReasoningOverrun(io, model);
+    if (heal_ok and starved) {
         learnReasoningBudget(io, model);
         const raised = @max(budget_tokens *| 8, REASONING_MIN_TOKENS);
         // ...ONCE, and only when that retry has room to finish inside its own deadline (healFits): the lesson above
@@ -4720,6 +4821,11 @@ fn streamAttempt(
     meterStream(&st, local, streamAttrib(io, tag, model, base_url, call_t0));
     reported = true;
     if (incomplete) logIncompleteStream(curl_code, offset);
+    // THE REASONING OVERRAN THE CALL (Quirk.reasoning_overruns, for the dial's auto setting): what streamed was reasoning
+    // alone, no answer, and the stream was cut - at the output limit, or without an end, the deadline's shape - at a
+    // budget at or past the reasoning floor. A Stop's partial returned above and never counts; a reply that answered,
+    // however cut, is not this.
+    if ((incomplete or st.truncated) and r_owned.len > 0 and std.mem.trim(u8, c_owned, " \r\n\t").len == 0 and budget_tokens >= REASONING_MIN_TOKENS) learnReasoningOverrun(io, model);
     const step = Step{ .content = c_owned, .reasoning = r_owned, .calls = &.{}, .ok = true, .truncated = st.truncated, .incomplete = incomplete };
     // THE headline record: the streamed chat answer is the turn the user actually saw.
     recordDataset(gpa, tag, model, base_url, body, &step, @intCast(@max(@divTrunc(std.Io.Timestamp.now(io, .real).nanoseconds - call_t0, std.time.ns_per_ms), 0)), st.p_in, st.p_out, false);
@@ -4975,12 +5081,14 @@ test "quirk store: lessons survive a restart — saved on learn, loaded at init,
     // Each learn writes through — the file exists and carries the model NAME (the durable key), not a hash.
     learnQuirk(io, "persist-x", .{ .temp = .force, .temp_val = 1.0 });
     learnReasoningEcho(io, "persist-x");
+    learnReasoningOverrun(io, "persist-x");
     learnQuirk(io, "persist-y", .{ .temp = .drop });
     {
         const raw = try std.Io.Dir.cwd().readFileAlloc(io, root ++ "/" ++ QUIRK_STORE_BASENAME, gpa, .limited(64 << 10));
         defer gpa.free(raw);
         try std.testing.expect(std.mem.indexOf(u8, raw, "\"persist-x\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, raw, "\"force\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "\"reasoning_overruns\":true") != null);
     }
 
     // "RESTART": wipe RAM, re-init from the same dir — every lesson is back, merged per model.
@@ -4989,8 +5097,11 @@ test "quirk store: lessons survive a restart — saved on learn, loaded at init,
     try std.testing.expectEqual(TempRule.force, quirkFor(io, "persist-x").temp);
     try std.testing.expectEqual(@as(f32, 1.0), quirkFor(io, "persist-x").temp_val);
     try std.testing.expect(reasoningEchoFor(io, "persist-x"));
+    try std.testing.expect(reasoningOverrunsFor(io, "persist-x")); // the overrun lesson survives the restart too
+    try std.testing.expect(modelReasons(io, "persist-x")); // and brought "seen reasoning" with it
     try std.testing.expectEqual(TempRule.drop, quirkFor(io, "persist-y").temp);
     try std.testing.expect(!reasoningEchoFor(io, "persist-y"));
+    try std.testing.expect(!reasoningOverrunsFor(io, "persist-y")); // a lesson about one model is not about another
 
     // A fresh lesson beats the stale file field, but never loses a field only the file carries: relearn
     // persist-x's temp rule as .drop — after another restart both the new rule AND the old echo survive.
@@ -5010,6 +5121,7 @@ test "quirk store: lessons survive a restart — saved on learn, loaded at init,
     initQuirkStore(io, dir2);
     try std.testing.expectEqual(TempRule.force, quirkFor(io, "persist-z").temp);
     try std.testing.expect(reasoningEchoFor(io, "persist-z"));
+    try std.testing.expect(!reasoningOverrunsFor(io, "persist-z")); // a line from before the field: no overrun invented
 }
 
 test "reasoningSpliceOffset finds the tool-call turn head, skips plain + already-echoed turns" {
@@ -5349,11 +5461,11 @@ test "nativeToolArgs: unusable arguments degrade to {} instead of sinking the re
 
     for ([_][]const u8{
         \\{"function":{"arguments":""}}
-    ,
+        ,
         \\{"function":{"arguments":"path=src"}}
-    ,
+        ,
         \\{"function":{"arguments":"[1,2]"}}
-    ,
+        ,
         \\{"function":{"arguments":"{\"a\":1} trailing junk"}}
     }) |src| {
         const got = try nativeToolArgs(gpa, src);
@@ -5949,6 +6061,68 @@ test "a starved reply is retried with room to reason when its pace leaves the ra
         try std.testing.expectEqualStrings("", step.content);
         // ...and the lesson is learned before the deadline is weighed, so the next call starts at the floor
         try std.testing.expect(reasoningBudgetFor(io, c.model));
+        // ...and a reply starved AT or past the floor - the raised call's, or the 8192 call's own - is the reasoning
+        // overrunning the call's bounds, which the dial's auto setting acts on (Quirk.reasoning_overruns)
+        try std.testing.expect(reasoningOverrunsFor(io, c.model));
+    }
+}
+
+test "a reply starved below the reasoning floor whose raised call answers teaches the floor and no overrun; one starved at the floor teaches the overrun" {
+    // The two lessons told apart at the stand-in: a 768-token call it starves and an 8192-token call it answers is a
+    // model that merely needs room (the heal's case); a model that starves at 8192 too has overrun the call.
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = if (builtin.os.tag == .windows) .{ .block = .global } else .{ .block = .{ .slice = std.mem.span(std.c.environ) } } });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const saved_tbl = quirk_tbl;
+    defer quirk_tbl = saved_tbl;
+    quirk_tbl = @splat(.{});
+    const saved_ms = test_heal_call_ms;
+    defer test_heal_call_ms = saved_ms;
+    test_heal_call_ms = null; // answered at once: every heal fits its deadline
+
+    const root = "zig-llm-overrun-floor-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, root, .default_dir) catch {};
+
+    const starved = fakehttp.wire(
+        \\{"choices":[{"message":{"content":"","reasoning_content":"still weighing the options"},"finish_reason":"length"}],"usage":{"prompt_tokens":9,"completion_tokens":1}}
+    );
+    const answered = fakehttp.wire(
+        \\{"choices":[{"message":{"content":"the answer","reasoning_content":"brief"},"finish_reason":"stop"}],"usage":{"prompt_tokens":9,"completion_tokens":3}}
+    );
+    const m = "test/needs-room";
+    {
+        // starves the 768-token request, answers the raised one (fakehttp.Route.has reads the body)
+        const routes = [_]fakehttp.Route{.{ .method = "POST", .path = "/chat/completions", .reply = starved, .has = &.{"\"max_tokens\":768"} }};
+        var srv: fakehttp.Server = undefined;
+        try srv.startRouted(io, &routes, answered);
+        var ub: [64]u8 = undefined;
+        const base = try std.fmt.bufPrint(&ub, "http://127.0.0.1:{d}/v1", .{srv.port});
+        const body = "{\"model\":\"" ++ m ++ "\",\"messages\":[],\"max_tokens\":768}";
+        var step = completeBody(gpa, io, root, "heal", base, "", m, body, 768);
+        defer step.deinit(gpa);
+        srv.stop();
+        try std.testing.expectEqual(@as(usize, 2), srv.countCalls("POST", "/chat/completions")); // starved, then raised
+        try std.testing.expectEqualStrings("the answer", step.content);
+        try std.testing.expect(reasoningBudgetFor(io, m)); // the floor: learned
+        try std.testing.expect(!reasoningOverrunsFor(io, m)); // the overrun: not - 768 starves any reasoner
+    }
+    {
+        // the same model, now asking for the floor up front, starved at it: the overrun
+        var srv: fakehttp.Server = undefined;
+        try srv.start(io, starved);
+        var ub: [64]u8 = undefined;
+        const base = try std.fmt.bufPrint(&ub, "http://127.0.0.1:{d}/v1", .{srv.port});
+        var bb: [128]u8 = undefined;
+        const body = try std.fmt.bufPrint(&bb, "{{\"model\":\"{s}\",\"messages\":[],\"max_tokens\":{d}}}", .{ m, REASONING_MIN_TOKENS });
+        var step = completeBody(gpa, io, root, "heal", base, "", m, body, REASONING_MIN_TOKENS);
+        defer step.deinit(gpa);
+        srv.stop();
+        try std.testing.expect(step.ok and step.truncated);
+        try std.testing.expectEqualStrings("", step.content);
+        try std.testing.expect(reasoningOverrunsFor(io, m));
     }
 }
 
@@ -6844,10 +7018,15 @@ test "a streamed reply whose stream never said it ended comes back marked incomp
     // How it ENDS when it finishes: a zero finish chunk, the finish chunk restating the totals, [DONE].
     const tail = "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":0}}\n\n" ++
         "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":25220,\"completion_tokens\":5}}\n\ndata: [DONE]\n\n";
-    const Case = struct { stream: []const u8, incomplete: bool };
+    // `floored`: the model has already been learned to need the reasoning floor (effTokens then asks for
+    // REASONING_MIN_TOKENS, the measured shape of a cut aux pass); `overrun`: whether the stream teaches the dial's
+    // auto setting that the reasoning overran the call (Quirk.reasoning_overruns).
+    const Case = struct { stream: []const u8, incomplete: bool, model: []const u8, floored: bool, overrun: bool };
     const cases = [_]Case{
-        .{ .stream = fakehttp.wire(head), .incomplete = true }, // cut: no terminal chunk at all
-        .{ .stream = fakehttp.wire(head ++ tail), .incomplete = false },
+        .{ .stream = fakehttp.wire(head), .incomplete = true, .model = "test/cut-stream", .floored = true, .overrun = true }, // cut: no terminal chunk at all
+        .{ .stream = fakehttp.wire(head ++ tail), .incomplete = false, .model = "test/cut-stream-done", .floored = true, .overrun = false },
+        // the same cut at a 16-token budget: a stream cut below the floor says nothing about the bounds
+        .{ .stream = fakehttp.wire(head), .incomplete = true, .model = "test/cut-stream-small", .floored = false, .overrun = false },
     };
     const Probe = struct {
         fn onDelta(ctx: *anyopaque, kind: DeltaKind, text: []const u8) void {
@@ -6857,6 +7036,7 @@ test "a streamed reply whose stream never said it ended comes back marked incomp
         }
     };
     for (cases) |c| {
+        if (c.floored) learnReasoningBudget(io, c.model);
         var srv: fakehttp.Server = undefined;
         const routes = [_]fakehttp.Route{.{ .method = "POST", .path = "/chat/completions", .reply = c.stream, .times = 1 }};
         // a fallback to complete() would be answered with this, and fail the reasoning check below
@@ -6866,7 +7046,7 @@ test "a streamed reply whose stream never said it ended comes back marked incomp
         const base = try std.fmt.bufPrint(&ub, "http://127.0.0.1:{d}/v1", .{srv.port});
         const before = tokensSnapshot();
         var ctx: u8 = 0;
-        var step = completeStream(gpa, io, root, "chat", base, "", "test/cut-stream", "{\"role\":\"user\",\"content\":\"hi\"}", "", 16, -1, &ctx, Probe.onDelta, null);
+        var step = completeStream(gpa, io, root, "chat", base, "", c.model, "{\"role\":\"user\",\"content\":\"hi\"}", "", 16, -1, &ctx, Probe.onDelta, null);
         defer step.deinit(gpa);
         srv.stop(); // joins the serve thread; conns is final after it
         const after = tokensSnapshot();
@@ -6882,6 +7062,10 @@ test "a streamed reply whose stream never said it ended comes back marked incomp
         // total once, not on top of its deltas
         try std.testing.expectEqual(@as(u64, 25220), after.in - before.in);
         try std.testing.expectEqual(@as(u64, 5), after.out - before.out);
+        // the body asked for the floor exactly when the model had been learned to need it (not vacuous: the overrun
+        // lesson below turns on that budget)
+        try std.testing.expectEqual(c.floored, std.mem.indexOf(u8, srv.request(), std.fmt.comptimePrint("\"max_tokens\":{d}", .{REASONING_MIN_TOKENS})) != null);
+        try std.testing.expectEqual(c.overrun, reasoningOverrunsFor(io, c.model));
     }
 }
 

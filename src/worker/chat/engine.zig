@@ -2744,21 +2744,25 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     llm.armRetries();
     defer llm.disarmRetries();
     // THE OPERATOR'S REASONING-EFFORT DIAL (llm.ReasoningEffort): NL_REASONING_EFFORT = low | high | max in the server's
-    // env, off when unset or anything else. Armed for this thread beside the retry budget, so every model call the turn
-    // makes may carry it (llm.effortFor decides per call), and put back on every exit by the defer. RESTORED, not
-    // disarmed: a turn nested on this thread (spawnTurn's inline fallback) runs on its own reading of the env and hands
-    // the parent's setting back when it ends, where its llm.disarmRetries above leaves the parent's budget unarmed.
+    // env pins a level, off turns it off, and unset (or anything else) is AUTO: low for a model whose reasoning has
+    // overrun a call's bounds before (llm.reasoningOverrunsFor, learned where the cut reply is seen), nothing for any
+    // other. Armed for this thread beside the retry budget, so every model call the turn makes may carry it
+    // (llm.effortFor decides per call), and put back on every exit by the defer. RESTORED, not disarmed: a turn nested
+    // on this thread (spawnTurn's inline fallback) runs on its own reading of the env and hands the parent's setting
+    // back when it ends, where its llm.disarmRetries above leaves the parent's budget unarmed.
     const effort = reasoningEffortEnv(app.sup.parent_env);
     const effort_prev = llm.armReasoningEffort(effort);
     defer llm.restoreReasoningEffort(effort_prev);
     // A coding model whose provider refused the dial earlier in this process is called without it (llm.effortRefused, RAM
     // only): the line says so, so a run log never reads "armed" alone for a turn whose calls all go at the provider's
-    // default.
-    if (effort != .off) std.log.info("chat {s}: reasoning effort {s} armed for this turn (NL_REASONING_EFFORT){s}", .{
-        conv,
-        @tagName(effort),
-        if (llm.reasoningEffortRefused(app.io, trio.coding.model)) " - but the coding model's provider refused it earlier in this process, so its calls go without it" else "",
-    });
+    // default. Auto writes its line only once it changes a request - the coding model has overrun before - for the same
+    // reason: an auto turn on a model whose reasoning fits sends what every turn always sent.
+    if (effort != .off) {
+        const refused_note: []const u8 = if (llm.reasoningEffortRefused(app.io, trio.coding.model)) " - but the coding model's provider refused it earlier in this process, so its calls go without it" else "";
+        if (effort == .auto) {
+            if (llm.reasoningOverrunsFor(app.io, trio.coding.model)) std.log.info("chat {s}: reasoning effort low for this turn: this model's reasoning has overrun a call's bounds before (NL_REASONING_EFFORT unset; a level or off pins it){s}", .{ conv, refused_note });
+        } else std.log.info("chat {s}: reasoning effort {s} armed for this turn (NL_REASONING_EFFORT){s}", .{ conv, @tagName(effort), refused_note });
+    }
     turn_app = app;
     defer turn_app = null;
     turn_uid = uid;
@@ -3529,10 +3533,17 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
             // Rung 2 is what FAST MODE gives up: the probe inference plus its tool calls, which is where
             // the latency lives. Rung 1 (the ledger block above) stays in BOTH modes — it is already in
             // hand and costs nothing, and a planner that cannot see the workdir is not "fast", just wrong.
+            // A SURVEY THAT STARVED ENDS THE PLANNING FOR THIS TURN (recon_starved, set where auxStarvedStatus reads
+            // the reply): the survey's one reader is the plan pass, which asks the same model, at the same effort, for
+            // three times the output. Measured on the 2026-10-14 held-out run (engine defaults, a hosted reasoning
+            // model): in each of the three tasks whose survey reasoned to the output limit, the plan pass then did the
+            // same - 109 to 149 s more before the first coding call - and no board formed. The turn goes to the drive
+            // loop with the ledger block it already holds, which is where every unplanned turn starts.
+            var recon_starved = false;
             const evidence = if (fast or envDisabled(environ, "NL_CHAT_RECON"))
                 null
             else
-                reconFindings(app, llm_dir, conv_dir, ctrl_cursor, think, &ctx, user_text, ground.items, tool_client, &no_ack_streak);
+                reconFindings(app, llm_dir, conv_dir, ctrl_cursor, think, &ctx, user_text, ground.items, tool_client, &no_ack_streak, &recon_starved);
             defer if (evidence) |e| gpa.free(e);
 
             var ev: std.ArrayListUnmanaged(u8) = .empty;
@@ -3540,7 +3551,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
             if (ground.items.len > 0) ev.appendSlice(gpa, ground.items) catch {};
             if (evidence) |e| ev.appendSlice(gpa, e) catch {};
 
-            const fresh = planTask(app, llm_dir, conv_dir, ctrl_cursor, think.base_url, think.key, think.model, user_text, ev.items, &brief);
+            const fresh: []cplan.Task = if (recon_starved) &.{} else planTask(app, llm_dir, conv_dir, ctrl_cursor, think.base_url, think.key, think.model, user_text, ev.items, &brief);
             if (fresh.len > 0) {
                 // SMALL-tier turns keep every subtask INLINE. A hive route hands a small model the hardest
                 // orchestration surface there is — observed live on a 12B: the plan said "(hive)", the drive
@@ -8272,6 +8283,11 @@ test "planGate: NL_CHAT_PLAN turns planning off only when an operator means it, 
 /// finish_reason (a deadline cut, which streamAttempt does not flag truncated). Null for an answered pass, a
 /// failed call (its content is the transport's error, already in its llm frame), and a reply with no
 /// reasoning either (an empty answer, not a starved one).
+///
+/// For the SURVEY the line is also a decision: a starved survey ends the planning for this turn (runTurn skips the
+/// plan pass on it - see the measured case there), so its text says so. Each starved pass is also what teaches the
+/// reasoning-effort dial's auto setting to send `low` to the model from then on (llm.learnReasoningOverrun, where the
+/// cut reply is first seen), so the second starved pass on a model is the one auto spares the turn.
 const AuxPass = enum { recon, plan };
 fn auxStarvedStatus(pass: AuxPass, ok: bool, truncated: bool, content: []const u8, reasoning: []const u8) ?[]const u8 {
     if (!ok) return null;
@@ -8279,9 +8295,9 @@ fn auxStarvedStatus(pass: AuxPass, ok: bool, truncated: bool, content: []const u
     if (std.mem.trim(u8, reasoning, " \r\n\t").len == 0) return null;
     return switch (pass) {
         .recon => if (truncated)
-            "surveying: the model reasoned until the output limit cut it and returned no probes - planning without them"
+            "surveying: the model reasoned until the output limit cut it and returned no probes - no plan this turn, on to the work"
         else
-            "surveying: the model returned reasoning but no probes - planning without them",
+            "surveying: the model returned reasoning but no probes - no plan this turn, on to the work",
         .plan => if (truncated)
             "planning: the model reasoned until the output limit cut it and returned no plan - continuing without one"
         else
@@ -8298,6 +8314,12 @@ test "a starved recon or plan pass says so in the run log; an answered or failed
     try t.expect(std.mem.indexOf(u8, plan_cut, "output limit") != null);
     const recon_cut = auxStarvedStatus(.recon, true, true, " \r\n", thought) orelse return error.StarvedReconSilent;
     try t.expect(std.mem.indexOf(u8, recon_cut, "no probes") != null);
+    // A starved survey ends the planning for the turn (runTurn skips the plan pass on it): the line says so, in both
+    // shapes, and the plan's own lines never promise a plan that is not coming either.
+    try t.expect(std.mem.indexOf(u8, recon_cut, "no plan this turn") != null);
+    const recon_deadline = auxStarvedStatus(.recon, true, false, "", thought) orelse return error.StarvedReconSilent;
+    try t.expect(std.mem.indexOf(u8, recon_deadline, "no plan this turn") != null);
+    try t.expect(std.mem.indexOf(u8, recon_deadline, "output limit") == null);
     // A deadline cut ends with no finish_reason, so it arrives NOT truncated: still reported, and the line
     // must not claim an output limit that was never hit.
     const plan_deadline = auxStarvedStatus(.plan, true, false, "", thought) orelse return error.StarvedPlanSilent;
@@ -8326,7 +8348,7 @@ test "a starved recon or plan pass says so in the run log; an answered or failed
 /// read_url and recall_hive go out with none of its rules applied, and a remote client was shown the server's
 /// files. The cost is one client round trip per probe ahead of time-to-first-token on a planned client-mode
 /// turn, which is the price of the turn's tools being the turn's.
-fn reconFindings(app: *App, run_root: []const u8, conv_dir: []const u8, ctrl_cursor: usize, p: Provider, ctx: *tools.ToolCtx, user_text: []const u8, ground: []const u8, tool_client: bool, no_ack_streak: *u32) ?[]u8 {
+fn reconFindings(app: *App, run_root: []const u8, conv_dir: []const u8, ctrl_cursor: usize, p: Provider, ctx: *tools.ToolCtx, user_text: []const u8, ground: []const u8, tool_client: bool, no_ack_streak: *u32, starved_out: *bool) ?[]u8 {
     const gpa = app.gpa;
     var msgs: std.ArrayListUnmanaged(u8) = .empty;
     defer msgs.deinit(gpa);
@@ -8360,7 +8382,10 @@ fn reconFindings(app: *App, run_root: []const u8, conv_dir: []const u8, ctrl_cur
     if (!sctx.streamed and step.reasoning.len > 0) emitKV(app, conv_dir, "reasoning", "delta", clipBytes(step.reasoning, 4000));
     cm.fb_ms = sctx.fb_ms;
     meterEnd(app, cm, "recon", .thinking, p.model, step.ok);
-    if (auxStarvedStatus(.recon, step.ok, step.truncated, step.content, step.reasoning)) |s| emitKV(app, conv_dir, "status", "text", s);
+    if (auxStarvedStatus(.recon, step.ok, step.truncated, step.content, step.reasoning)) |s| {
+        starved_out.* = true; // the caller skips the plan pass on it (see the measured case at the call site)
+        emitKV(app, conv_dir, "status", "text", s);
+    }
     if (!step.ok) return null;
 
     const obj = extractJsonObject(step.content);
@@ -11386,11 +11411,13 @@ fn envDisabled(environ: *const std.process.Environ.Map, name: []const u8) bool {
 }
 
 /// The operator's reasoning-effort dial for a turn (llm.ReasoningEffort): NL_REASONING_EFFORT in the server's env, read
-/// by llm.parseReasoningEffort. The OPPOSITE default to envDisabled: this one is OFF unless it names a level exactly
-/// (low | high | max, any case, trimmed), because it changes what every request asks of the provider - a typo, an empty
-/// value, a level some provider aliases (medium, xhigh) or no env at all leaves the requests as they always were.
+/// by llm.parseReasoningEffort. A level named exactly (low | high | max, any case, trimmed) is pinned; off | none | 0 |
+/// false turns the dial off; everything else - no env at all, the variable unset or empty, a typo, a level some
+/// provider aliases (medium, xhigh) - is AUTO, the engine's own setting: `low` only for a model whose reasoning has
+/// overrun a call's bounds before (llm.reasoningOverrunsFor), and for any other model the requests as they always were.
+/// A typo is never read as a level (a guess at what was meant) nor as off (a silent loss of the default).
 fn reasoningEffortEnv(environ: ?*const std.process.Environ.Map) llm.ReasoningEffort {
-    const env = environ orelse return .off;
+    const env = environ orelse return .auto;
     return llm.parseReasoningEffort(env.get("NL_REASONING_EFFORT"));
 }
 
@@ -15303,13 +15330,14 @@ test "both upgrades default ON: only an explicit 0/false disables them" {
     }
 }
 
-test "the reasoning-effort dial is off unless NL_REASONING_EFFORT names a level exactly: low, high or max, in any case" {
+test "the reasoning-effort dial is auto unless NL_REASONING_EFFORT names a level exactly (low, high or max, in any case) or turns it off" {
     const t = std.testing;
     var env = std.process.Environ.Map.init(t.allocator);
     defer env.deinit();
-    // no env at all, and an env without the variable: the requests every turn sent before the dial existed
-    try t.expect(reasoningEffortEnv(null) == .off);
-    try t.expect(reasoningEffortEnv(&env) == .off);
+    // no env at all, and an env without the variable: AUTO, the engine's own setting (low only for a model whose
+    // reasoning has overrun a call's bounds; the requests every turn always sent for any other)
+    try t.expect(reasoningEffortEnv(null) == .auto);
+    try t.expect(reasoningEffortEnv(&env) == .auto);
     // the three levels, in the spellings an operator types
     const Want = struct { v: []const u8, e: llm.ReasoningEffort };
     for ([_]Want{
@@ -15320,11 +15348,19 @@ test "the reasoning-effort dial is off unless NL_REASONING_EFFORT names a level 
         try env.put("NL_REASONING_EFFORT", w.v);
         try t.expectEqual(w.e, reasoningEffortEnv(&env));
     }
-    // anything else is OFF - a typo, an empty value, a level another provider aliases, a switch-shaped word - never a
-    // guess at what was meant
-    for ([_][]const u8{ "", " ", "medium", "minimal", "none", "xhigh", "1", "0", "on", "true", "lowest", "hi", "max effort" }) |v| {
+    // the words that turn it OFF, in the spellings an operator types: every request as it was before the dial existed
+    for ([_][]const u8{ "off", "OFF", " off\r\n", "none", "0", "false", "False" }) |v| {
         try env.put("NL_REASONING_EFFORT", v);
         if (reasoningEffortEnv(&env) != .off) {
+            std.debug.print("\nNL_REASONING_EFFORT=\"{s}\" read as {s}\n", .{ v, @tagName(reasoningEffortEnv(&env)) });
+            return error.TestUnexpectedResult;
+        }
+    }
+    // anything else is AUTO - a typo, an empty value, a level another provider aliases, a switch-shaped word - never a
+    // guess at what was meant, and never a silent off
+    for ([_][]const u8{ "", " ", "medium", "minimal", "xhigh", "1", "on", "true", "lowest", "hi", "max effort", "auto" }) |v| {
+        try env.put("NL_REASONING_EFFORT", v);
+        if (reasoningEffortEnv(&env) != .auto) {
             std.debug.print("\nNL_REASONING_EFFORT=\"{s}\" read as {s}\n", .{ v, @tagName(reasoningEffortEnv(&env)) });
             return error.TestUnexpectedResult;
         }
