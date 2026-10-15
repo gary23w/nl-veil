@@ -770,7 +770,7 @@ const TOOLS = [
   { name: "runtime_revert", args: '{"revision": 2}', what: "restore the last successfully DEPLOYED runtime source as a new revision, at the revision you read: the way back when an edit failed to deploy or made things worse" },
   // Agent Garrett: a second Worker in this account (github.com/gary23w/garrettstimpson.ca/agent), a blue-team belt over MCP
   { name: "garrett_tools", args: "{}", what: "list Agent Garrett's security tools (CVE / KEV / EPSS intel, DNS and certificate transparency, RDAP, email security posture, IOC extraction, evidence manifests, forensic timelines, and more) and the argument names they take", need: "garrett" },
-  { name: "garrett", args: '{"name": "<garrett tool>", "args": {"target": "example.com"}}', what: "run one of Agent Garrett's tools over MCP; its text comes back with its evidence metadata. Preserve each tool's typed JSON arguments", need: "garrett" },
+  { name: "garrett", args: '{"name": "<garrett tool>", "args": {"target": "example.com"}}', what: "run one of Agent Garrett's tools over MCP by name (with or without its security_ prefix; calling security_<name> directly is the same); its text comes back with its evidence metadata. Preserve each tool's typed JSON arguments", need: "garrett" },
   { name: "garrett_launch", args: "{}", what: "ask your human's veil to launch Agent Garrett into this account as a second Worker and point every tot at it; garrett and garrett_tools appear in your belt once it answers" },
   // memory and planning
   { name: "remember", args: '{"fact": "<one thing worth knowing later>"}', what: "keep a fact for every later iteration" },
@@ -1086,6 +1086,37 @@ function securityPath(n) {
   if (hasAny(n, ["hash", "yara", "file_analyze", "reverse_analyze", "malware", "urlhaus", "ransomware", "ioc", "persistence"])) return "security/malware";
   if (hasAny(n, ["nmap", "vuln", "bucket", "poc", "disclosure"])) return "security/scan";
   return "security/other";
+}
+
+/// The belt's security tools nearest to a name the model guessed: the most shared `_` tokens, then a substring
+/// either way. " Nearest: a, b." or "" when nothing comes close. Pure.
+export function nearestSecurity(name, tools) {
+  const want = String(name ?? "").toLowerCase().replace(/^security_/, "");
+  if (want.length < 2) return "";
+  const toks = want.split("_").filter((t) => t.length > 1);
+  const scored = [];
+  for (const t of tools) {
+    const bare = String(t.name).replace(/^security_/, "");
+    let s = toks.filter((k) => bare.split("_").includes(k)).length * 2;
+    if (bare.includes(want) || want.includes(bare)) s += 3;
+    if (s > 0) scored.push({ name: t.name, s });
+  }
+  scored.sort((a, b) => b.s - a.s || (a.name < b.name ? -1 : 1));
+  return scored.length > 0 ? ` Nearest: ${scored.slice(0, 5).map((x) => x.name).join(", ")}.` : "";
+}
+
+/// Agent Garrett's catalogue as the belt holds it, by branch, each tool by its belt name with the argument names
+/// it takes: every tool on one screen, so a step never guesses a name. Pure.
+export function beltListing(tools) {
+  const groups = new Map();
+  for (const t of tools) {
+    const path = toolPath(t.name);
+    if (!groups.has(path)) groups.set(path, []);
+    const props = Object.keys(t.inputSchema?.properties ?? {});
+    groups.get(path).push(`${t.name}${props.length > 0 ? ` (${props.slice(0, 6).join(", ")}${props.length > 6 ? ", ..." : ""})` : ""}`);
+  }
+  const lines = [...groups].sort((a, b) => (a[0] < b[0] ? -1 : 1)).map(([path, names]) => `${path} - ${BRANCH_DESC[path] ?? "tools"}:\n  ${names.join(", ")}`);
+  return `Agent Garrett's ${tools.length} tool${tools.length === 1 ? "" : "s"} on your belt, by branch (each with the argument names it takes):\n${lines.join("\n")}\nCall one by its security_ name as a tool of your own; tool_schema {"name": "<it>"} shows its full typed schema. The garrett wrapper takes the same name, with or without security_.`;
 }
 
 /// Where a tool sits on the map. Pure.
@@ -1963,7 +1994,7 @@ async function route(req, env) {
   if (seg[1] === "version" && method === "GET") return json({ ok: true, version: VERSION, max_tots: DEFAULT_MAX_TOTS, max_tots_ceil: MAX_TOTS_CEIL });
   if (seg[1] === "runtime") {
     if (method === "GET" && seg.length === 2) return call(padStub, "/runtime/state");
-    if (method === "POST" && ["seed", "result"].includes(seg[2])) return call(padStub, "/runtime/" + seg[2], body);
+    if (method === "POST" && ["seed", "result", "upgrade"].includes(seg[2])) return call(padStub, "/runtime/" + seg[2], body);
     return bad("method not allowed", 405);
   }
   // Agent Garrett's launch: a tot asks (request), the owner's veil deploys it and answers (result). See padRoute.
@@ -2099,25 +2130,43 @@ export class Tot {
       // the last source that DEPLOYED, kept apart from the drafts: the way back from an edit that failed
       const readGood = () => readChunks("runtime:good:");
       const keepGood = (source) => writeChunks("runtime:good:", source);
+      // `host`: the current revision was written by the owner's veil (the seed, or a newer build offered as a
+      // revision) rather than by a tot. A state an older runtime wrote has no flag: its seed is the host's.
+      const hostOwned = (s) => s.host === true || (s.host === undefined && s.revision === 0);
       if (path === "/runtime/seed") {
         if (state) return json({ ok: true, ...state });
         if (typeof body.source !== "string" || !body.source.trim()) return bad("runtime source is required");
         await writeSource(body.source);
         await keepGood(body.source);
-        state = { revision: Number(body.revision) || 0, deployed_revision: Number(body.revision) || 0, status: "deployed", error: "", length: body.source.length };
+        state = { revision: Number(body.revision) || 0, deployed_revision: Number(body.revision) || 0, status: "deployed", error: "", length: body.source.length, host: true, good_host: true };
         await store.put("runtime", state);
         return json({ ok: true, ...state });
       }
       if (!state) return path === "/runtime/state" ? json({ ok: true, initialized: false }) : bad("runtime source has not synced yet; the owner's veil seeds it on its next sync");
-      if (path === "/runtime/state") return json({ ok: true, initialized: true, ...state, source: state.status === "pending" ? await readSource() : "" });
+      if (path === "/runtime/state") return json({ ok: true, initialized: true, ...state, host: hostOwned(state), source: state.status === "pending" ? await readSource() : "" });
       if (path === "/runtime/revert") {
         if (body.revision !== state.revision) return bad(`runtime revision changed to ${state.revision}; runtime_read before reverting`, 409);
         const good = await readGood();
         if (!good) return bad("no deployed runtime source is kept to revert to");
         await writeSource(good);
-        state = { ...state, revision: state.revision + 1, deployed_revision: state.revision + 1, status: "deployed", error: "", length: good.length, author: body.author ?? "", reverted_from: state.revision };
+        state = { ...state, revision: state.revision + 1, deployed_revision: state.revision + 1, status: "deployed", error: "", length: good.length, author: body.author ?? "", reverted_from: state.revision, host: state.good_host === true };
         await store.put("runtime", state);
         return json({ ok: true, ...state, message: "the last deployed source is the current revision again; the Worker on Cloudflare already runs it" });
+      }
+      if (path === "/runtime/upgrade") {
+        // THE HOST'S RUNTIME AS A REVISION: a newer veil carries a newer tot.js. It is applied only over a runtime
+        // the host itself wrote that is deployed with nothing pending - the tots' own edits, drafts and uploads
+        // are theirs, and a host never swaps beneath them - and it is a revision like any other: the next sync
+        // uploads it, runtime_read shows it, runtime_revert takes it back.
+        if (typeof body.source !== "string" || !body.source.trim()) return bad("runtime source is required");
+        if (body.revision !== state.revision) return bad(`runtime revision changed to ${state.revision}`, 409);
+        if (!hostOwned(state)) return bad(`the tots own this runtime: revision ${state.revision} was written by a tot, so the host's newer source is not applied over it (runtime_revert to a host revision would let it in)`);
+        if (state.status !== "deployed" || state.revision !== state.deployed_revision) return bad(`revision ${state.revision} is ${state.status}; the host's source waits until it has deployed`);
+        if ((await readSource()) === body.source) return json({ ok: true, ...state, unchanged: true });
+        await writeSource(body.source);
+        state = { ...state, revision: state.revision + 1, status: "pending", error: "", length: body.source.length, author: clip(String(body.by ?? "veil"), 40), host: true };
+        await store.put("runtime", state);
+        return json({ ok: true, ...state, message: "the host's newer runtime is the next revision; the owner's veil uploads it on its next sync" });
       }
       if (path === "/runtime/read") {
         const source = await readSource();
@@ -2135,7 +2184,10 @@ export class Tot {
         if (!body.err) {
           state.deployed_revision = Math.max(state.deployed_revision, body.revision);
           // what is up there now is the way back for the next edit (the current source when this is the newest revision)
-          if (body.revision === state.revision) await keepGood(await readSource());
+          if (body.revision === state.revision) {
+            await keepGood(await readSource());
+            state.good_host = hostOwned(state);
+          }
         }
         // An older upload finishing must not discard a newer edit or its deployment request.
         if (body.revision === state.revision) {
@@ -2157,7 +2209,7 @@ export class Tot {
           source = source.slice(0, at) + body.replace + source.slice(at + body.find.length);
         }
         await writeSource(source);
-        state = { ...state, revision: state.revision + 1, status: "draft", error: "", length: source.length, author: body.author ?? "" };
+        state = { ...state, revision: state.revision + 1, status: "draft", error: "", length: source.length, author: body.author ?? "", host: false };
         await store.put("runtime", state);
         return json({ ok: true, ...state });
       }
@@ -2638,8 +2690,12 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
       }
     }
     // Still nothing visible: the same question goes to a model that does not reason, so the iteration goes on.
+    let rescueWhy = "";
     if (c.model !== FALLBACK_MODEL) {
-      const rescue = await this.askOnce({ ...c, model: FALLBACK_MODEL }, messages, maxTokens).catch(() => "");
+      const rescue = await this.askOnce({ ...c, model: FALLBACK_MODEL }, messages, maxTokens).catch((e) => {
+        rescueWhy = String(e?.message ?? e); // a provider error on the fallback is said, not read as silence
+        return "";
+      });
       if (rescue.length > 0) {
         if (!this.tick || !this.tick.rescued) await this.emit("status", `${c.model} returned no visible answer; ${FALLBACK_MODEL} answered instead (/model <id> picks another)`);
         if (this.tick) this.tick.rescued = true;
@@ -2662,7 +2718,7 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
         return rescue;
       }
     }
-    throw new Error(`the model (${c.model}) returned no text twice - it may be spending its whole reply on reasoning; /model <id> picks another`);
+    throw new Error(`the model (${c.model}) returned no text twice${rescueWhy ? `, and ${FALLBACK_MODEL} failed: ${clip(rescueWhy, 200)}` : ""} - it may be spending its whole reply on reasoning; /model <id> picks another`);
   }
 
   /// A model call failed: the remedy for its class is learned for that model and the call is retried ONCE.
@@ -3256,9 +3312,16 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
       case "http_request":
         return this.http(String(args.method ?? "GET").toUpperCase(), String(args.url ?? ""), args.headers, args.body, cfg);
       case "garrett_tools":
-        return this.garrettCall(cfg, "tools/list", {}, "list");
-      case "garrett":
-        return this.garrettCall(cfg, "tools/call", { name: String(args.name ?? args.tool ?? "").trim().toLowerCase(), arguments: args.args && typeof args.args === "object" && !Array.isArray(args.args) ? args.args : args.arguments && typeof args.arguments === "object" && !Array.isArray(args.arguments) ? args.arguments : {} }, "call");
+        // the catalogue this tot's belt already holds, by branch and by the names the belt uses - every tool on
+        // one screen; the agent's own list (every schema inline) only when the belt has none
+        return (this.env.SECURITY_TOOLS ?? []).length > 0 ? beltListing(this.env.SECURITY_TOOLS) : this.garrettCall(cfg, "tools/list", {}, "list");
+      case "garrett": {
+        // the belt's name (security_<x>) and the agent's own (<x>) are the same tool: both are taken
+        const name = String(args.name ?? args.tool ?? "").trim().toLowerCase().replace(/^security_/, "");
+        const known = this.env.SECURITY_TOOLS ?? [];
+        if (/^[a-z][a-z0-9_]{1,40}$/.test(name) && known.length > 0 && !known.some((t) => t.name === "security_" + name)) return `ERROR: Agent Garrett has no tool named ${name}.${nearestSecurity(name, known)} garrett_tools lists them by branch; call one by its security_ name, with tool_schema for its arguments.`;
+        return this.garrettCall(cfg, "tools/call", { name, arguments: args.args && typeof args.args === "object" && !Array.isArray(args.args) ? args.args : args.arguments && typeof args.arguments === "object" && !Array.isArray(args.arguments) ? args.arguments : {} }, "call");
+      }
       case "garrett_launch": {
             if (hasGarrett(this.env)) return "Agent Garrett is already up; garrett_tools lists its tools";
         const r = await (await call(stubFor(this.env, "pad"), "/garrett/request", { by: who })).json();
@@ -3693,7 +3756,9 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
     }
     const out = (Array.isArray(j.result?.content) ? j.result.content : []).filter((c) => c?.type === "text").map((c) => c.text).join("\n");
     const meta = j.result?.structuredContent ? "\nEVIDENCE: " + clip(JSON.stringify(j.result.structuredContent), 600) : "";
-    return (j.result?.isError ? "FAILED: " : "") + clip(out || "(no text)", 12000) + meta;
+    // a name the agent does not know: the way to the right one is named, not just the refusal
+    const hint = j.result?.isError && /^Unknown tool\b/i.test(out) ? `\n${nearestSecurity(params.name, this.env.SECURITY_TOOLS ?? []).trim()} garrett_tools lists Agent Garrett's tools by branch; call one by its security_ name (the garrett wrapper takes that name too), with tool_schema for its arguments.`.replace(/^\n /, "\n") : "";
+    return (j.result?.isError ? "FAILED: " : "") + clip(out || "(no text)", 12000) + meta + hint;
   }
 
   /// Search the web: the first engine that answers with results. An engine that blocks or returns nothing is
