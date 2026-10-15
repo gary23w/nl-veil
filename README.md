@@ -68,7 +68,7 @@ accounts, and startup stops if a required change cannot be verified. [Release no
 ### New in v1.1.7
 
 **Tater-tots**: the veil's goal loop running in your own Cloudflare account, with nobody in it and your computer
-off. Deploy one from the desktop's Tater-tots tab or `veil --tater deploy "<goal>"`; the first is always named Gary.
+off. Deploy one from the desktop's Taters tab or `veil --tater deploy "<goal>"`; the first is always named Gary.
 [How tater-tots work](#tater-tots---goal-loops-that-run-without-you-in-your-own-account) ·
 [release notes](docs/release/RELEASE-v1.1.7.md).
 
@@ -125,7 +125,7 @@ conversations down the left, the work itself in the middle — the chat, or the 
 live token and latency metrics — and on the right what the agents are doing and what the thing
 remembers. Drag the dividers to whatever widths suit you (they persist), collapse a side you don't
 need, branch a side question into its own tab without losing the build. Seven tabs across the top:
-**Dashboard, Chat, Tasks, Swarm, Tater-tots, Hub, Settings.** It is the place you work, not a sidebar bolted onto
+**Dashboard, Chat, Tasks, Swarm, Taters, Hub, Settings.** It is the place you work, not a sidebar bolted onto
 something else.
 
 **The difference is what's behind the window.** Ask most tools for a feature and one assistant writes
@@ -315,7 +315,7 @@ them simply lacks them; the switch then says so and asks you to log in with Clou
 ### Tater-tots - goal loops that run without you, in your own account
 
 A **tater-tot** (a *tot*, short for Tiny Overview Technician) is the veil's goal loop with no human in it and no machine of yours
-under it. Once you are logged in with Cloudflare, the desk's **Tater-tots** tab (or `veil --tater deploy "<goal>"`)
+under it. Once you are logged in with Cloudflare, the desk's **Taters** tab (or `veil --tater deploy "<goal>"`)
 uploads one small Worker, `veil-tots`, into *your* account and creates a tater-tot in it. From then on the tater-tot
 works on its own: it wakes on a timer, picks the single best next improvement toward its goal, does it with
 its tools, has a judge measure whether it helped from the tool results alone (against the iterations
@@ -338,7 +338,19 @@ so they never cross the public internet and need no API key.
 - **It improves itself.** An iteration that did not move the goal becomes a lesson - one rule the tater-tot writes
   for its future self - and its lessons ride every later prompt; the least useful one is dropped when the
   list is full. After two flat iterations it grows by one mind, and after an easy win it shrinks, inside the
-  size you allow (the tab's Grow / Shrink buttons move that ceiling).
+  size you allow (the tab's Grow / Shrink buttons move that ceiling). A lesson that says the same thing in other
+  words is not kept twice, and a step that repeats an earlier iteration is asked once more for a changed method.
+- **Its belt is a map, and its memory of a step is a net.** Past 48 tools (Agent Garrett's catalogue) the belt is
+  the tool tree from v1.1.16: the built-in tools stay listed, the rest is walked with one verb, `open_tools`, or
+  opened by calling a tool by name; the step's own words open the right group first, and what a step led the
+  tater-tot to call is learned for the next (`/belt auto|map|flat`). When a step's rounds outgrow the model's
+  window they are laid out as Gary's 4tope instead of cut oldest-first - the results the step rests on stay
+  verbatim, the failures ride as RULED OUT - and the same net is carried into the next iteration.
+- **It heals itself, per model.** A model that answers only with three times the room is asked for it first;
+  one that answers nothing three times in a day hands the day to the fallback model and is tried again tomorrow;
+  a context-length error halves the window for that model; a missing model routes to the fallback. A runtime
+  edit that fails to deploy reaches the next iteration as a directive, and `runtime_revert` restores the last
+  deployed source.
 - **Tater-tots work together.** They share one scratchpad, which you can read and write too, and can message each
   other. A tater-tot can also cast its own small swarm: several minds side by side, one task each.
 - **Its tool belt.** A tater-tot works with real tools, in the cloud:

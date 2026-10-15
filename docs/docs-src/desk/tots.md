@@ -8,7 +8,7 @@
 
 ## Purpose Summary
 
-The Tater-tots tab (drawn in `main.zig`) shows the account's tater-tots against its limit (`Roster.max`, from the server; `ROSTER_CAP` rows are held, `total` counts them all), the selected one's console and the scratchpad they share. This file is the data under it. The poller calls the readers and publishes the results into the Store under its one lock; the UI copies them out and draws. A tater-tot's events are kept as `Ev`: the swarm console's colour key, the event's own kind, the goal iteration it belongs to and its text with its line breaks, which the tab's console wraps and scrolls.
+The Taters tab (drawn in `main.zig`) shows the account's tater-tots against its limit (`Roster.max`, from the server; `ROSTER_CAP` rows are held, `total` counts them all), the selected one's console and the scratchpad they share. This file is the data under it. The poller calls the readers and publishes the results into the Store under its one lock; the UI copies them out and draws. A tater-tot's events are kept as `Ev`: the swarm console's colour key, the event's own kind, the goal iteration it belongs to and its text with its line breaks, which the tab's console wraps and scrolls.
 
 ## Key Exports
 
@@ -27,7 +27,7 @@ The Tater-tots tab (drawn in `main.zig`) shows the account's tater-tots against 
 
 ## Usage Context
 
-`store.zig` holds a `Roster`, the selected tater-tot's events and the scratchpad rows. `poller.zig` fills them (`refreshTots`, `refreshTotEvents`, `refreshTotPad`) only while the Tater-tots tab is on screen: the tab raises `Store.tots_watch` every frame and the poller lowers it every tick, because each poll is a call into the user's Cloudflare account. `main.zig` draws the tab (`drawTots`, `drawTotForm`, `drawTotPanel`) and builds the deploy body with `deployBody`.
+`store.zig` holds a `Roster`, the selected tater-tot's events and the scratchpad rows. `poller.zig` fills them (`refreshTots`, `refreshTotEvents`, `refreshTotPad`) only while the Taters tab is on screen: the tab raises `Store.tots_watch` every frame and the poller lowers it every tick, because each poll is a call into the user's Cloudflare account. `main.zig` draws the tab (`drawTots`, `drawTotForm`, `drawTotPanel`) and builds the deploy body with `deployBody`.
 
 ## Notable Implementation Details
 

@@ -34,7 +34,7 @@ veil --tater guard Sentinel add dns:example.org --type MX --every 600
 veil --tater key alert https://discord.com/api/webhooks/...
 ```
 
-Every one of those is a runtime command too (`/guard add ...`, `/posture defend`, `/leash 3600`, `/garrett on`) in the desk's Tater-tots tab, and the first line is the desk's Settings button, *Deploy Agent Garrett*. A tot guards at most 16 targets; deploy another for more.
+Every one of those is a runtime command too (`/guard add ...`, `/posture defend`, `/leash 3600`, `/garrett on`) in the desk's Taters tab, and the first line is the desk's Settings button, *Deploy Agent Garrett*. A tot guards at most 16 targets; deploy another for more.
 
 ## The guard: a watch that needs no model
 
