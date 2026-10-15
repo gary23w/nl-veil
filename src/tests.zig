@@ -13,6 +13,7 @@ test {
     _ = @import("cli.zig");
     _ = @import("cli/hub.zig"); // broadcast body escaping: a pasted CRLF must not break the JSON
     _ = @import("config/cf_oauth.zig");
+    _ = @import("config/datalock.zig"); // one server per data dir: the lock is exclusive across processes, stale-safe, and names its holder
     _ = @import("config/cf_r2.zig"); // the R2 backup: gated routes, object-key charset, state defaults, per-account bucket, a deleted bucket re-created — via fakehttp
     _ = @import("config/cf_tot.zig"); // tots: gated routes, the derived token, the upload, the owner's-machine bridge — via fakehttp
     _ = @import("config/cf_garrett.zig"); // Agent Garrett's derived pair, read back from the state file
