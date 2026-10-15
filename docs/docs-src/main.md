@@ -55,6 +55,8 @@ Otherwise the two swap places: raylib's window creation and event pump are main-
 
 If the HTTP thread cannot be spawned at all, it falls back to a blocking `listen()` on this thread rather than opening a window onto no backend.
 
+Neither path is reached on a data dir another veil already serves. The data-dir claim ([config/datalock](config/datalock.md)) runs right after the console detach: a server-only start on a held dir is refused with exit code 75, and a desk start opens `desk.runApp` as that server's client, handed the holder's port from the lock record and pinned to it on the loopback for the run (desk `AttachTarget`), so the desk's own settings.json cannot point it at a server that is not the one holding its data. The process exits when the window closes; the holder keeps running.
+
 ## Failure behaviour
 
 Not uniform, and deliberately so. Warm-up steps that can degrade — the auth and API-key warms, the desktop key preload, the legacy memory migration, Ollama tuning, the job object — log and carry on. A failure that would leave a half-built server, such as path resolution or `httpz` init, propagates out of `main` as an error. In app mode a listener that cannot bind (usually another `veil` already holding the port) logs loudly and leaves the window open but backendless, because a mysteriously disconnected GUI is a worse outcome than a stated one. With `--server-only` the listen error returns out of `main` and the process exits.

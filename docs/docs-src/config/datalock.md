@@ -35,7 +35,7 @@ Not a byte-range lock (what std's `lock = .exclusive` does on Windows through Nt
 
 - nobody holds the dir: serve, and hold the lock until exit (released by hand on the app-mode `exit()` path, which runs no defer);
 - another veil holds it and this is a server-only start: refuse with one log line naming the holder's pid, bind and port, exit code 75 (sysexits' EX_TEMPFAIL: a service manager that retries succeeds once the holder is gone);
-- another veil holds it and this is a desk start: open the desk as a client of that server and exit when the window closes. That server is not ours to stop; nothing bound a port or wrote the dir;
+- another veil holds it and this is a desk start: open the desk as a client of that server and exit when the window closes. That server is not ours to stop; nothing bound a port or wrote the dir. The desk is handed the holder's port from the record (desk `AttachTarget`) and pinned to it on the loopback for the run, so a settings.json naming another server cannot point it elsewhere; a record with no port pins nothing;
 - the lock file cannot be created at all: serve unguarded and say so.
 
 Registered directly in `src/tests.zig`.
@@ -47,7 +47,7 @@ Registered directly in `src/tests.zig`.
 - The record is three `key=value` lines, parsed leniently: CRLF, a partial write and garbage all read as an unknown or partial holder, and the gate never depends on the record.
 - Lock handles are not inherited: `CreateFileW` with null security attributes, and std's `O_CLOEXEC` on POSIX, so a worker subprocess cannot keep a dead server's lock alive.
 - Tests: a second take in the same process is refused with the holder's record (a second open is what a second process is to the lock, on both OSes); a stale file with a dead pid is taken and overwritten; the record parser is pinned; and two tests run a REAL second process through the house shell pattern. A probe (PowerShell's `File.Open` for write access sharing everything, so only the holder's share mode can refuse it; `flock -n` on POSIX) is refused while this process holds the dir and succeeds once it lets go. A holder in another process, writing its own pid and port 4242, is reported with exactly those, and the dir is free again once it exits. The POSIX halves skip where `flock(1)` is absent (macOS). Counterfactual, measured 2026-10-15: a holder that shares write turns the in-process, second-process and main.zig claim tests red.
-- Not handled: Windows paths past 260 characters (no `\\?\` prefix), a data dir on a filesystem without lock support (POSIX `error.FileLocksUnsupported` surfaces as the unguarded verdict), and a holder on a different port from the desk's configured one, which the attaching desk reports as offline.
+- Not handled: Windows paths past 260 characters (no `\\?\` prefix), and a data dir on a filesystem without lock support (POSIX `error.FileLocksUnsupported` surfaces as the unguarded verdict).
 
 ---
 

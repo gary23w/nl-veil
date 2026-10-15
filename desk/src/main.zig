@@ -474,8 +474,20 @@ var ui: Ui = .{};
 /// dashboard on its own against an already-running server. The shipped app does NOT come through here — the
 /// GUI is compiled into `veil` and src/main.zig calls runApp directly (see below).
 pub fn main() !void {
-    return runApp(null);
+    return runApp(null, null);
 }
+
+/// The server an attaching desk drives. src/main.zig's data-dir claim (config/datalock.zig) hands this down when it
+/// finds the data dir already served by another veil: that server's port, read from its lock record, on the local
+/// loopback (`host` empty), which reaches a holder bound to 127.0.0.1 or 0.0.0.0 alike. Pinned for the run:
+/// seedSettings writes it into the Store before the chat thread starts, and that thread's settings.json loader
+/// leaves port and host alone (Settings.target_pinned), so a persisted target cannot point this desk at a server
+/// that is not the one holding its data dir. Measured 2026-10-15: without it a holder on another port read as
+/// "server down" in the desk that had just been told to attach to it.
+pub const AttachTarget = struct {
+    port: u16,
+    host: []const u8 = "",
+};
 
 /// THE GUI. Owns the raylib window and must run on the process's MAIN thread — raylib's window creation and
 /// event pump are main-thread-only on macOS and unreliable off it elsewhere. Returns when the user closes the
@@ -486,7 +498,11 @@ pub fn main() !void {
 /// launched from the repo. In-process there is no such guarantee — `veil` can be started from anywhere — so
 /// the server hands down the absolute path it resolved from its own executable location. Without this the
 /// desk would probe relative to the user's shell CWD and quietly find no <data>/.desktop_key.
-pub fn runApp(data_dir: ?[]const u8) !void {
+///
+/// `attach` names the server this desk is a client of when another veil already serves `data_dir` (AttachTarget);
+/// null = the configured target (settings.json, else 8787 on the loopback), which is every other start: the
+/// standalone binary, and the one-process app whose server is in this very process.
+pub fn runApp(data_dir: ?[]const u8, attach: ?AttachTarget) !void {
     const gpa = std.heap.c_allocator;
 
     // carry the real process environ so spawned children (curl, explorer) get a working environment.
@@ -499,7 +515,7 @@ pub fn runApp(data_dir: ?[]const u8) !void {
     const io = threaded.io();
 
     var store = Store{};
-    seedSettings(&store, gpa, io, data_dir);
+    seedSettings(&store, gpa, io, data_dir, attach);
     if (data_dir != null) updater.start();
     defer if (data_dir != null) updater.finish();
     ui.d_name.len = seedName(&ui.d_name.buf);
@@ -1496,8 +1512,19 @@ fn seedName(buf: []u8) usize {
     return s.len;
 }
 
-fn seedSettings(store: *Store, gpa: std.mem.Allocator, io: std.Io, pinned: ?[]const u8) void {
+fn seedSettings(store: *Store, gpa: std.mem.Allocator, io: std.Io, pinned: ?[]const u8, attach: ?AttachTarget) void {
     seedChatDefaults(store);
+    seedDataDir(store, gpa, io, pinned);
+    // An attaching desk's server is decided before any settings file is read: the one holding the data dir. The chat
+    // thread's loader sees the pin and leaves the target alone (chat.zig loadSettings).
+    if (attach) |a| {
+        store.lock();
+        defer store.unlock();
+        store.settings.pinTarget(a.port, a.host);
+    }
+}
+
+fn seedDataDir(store: *Store, gpa: std.mem.Allocator, io: std.Io, pinned: ?[]const u8) void {
     // A caller-pinned data dir (the in-process GUI: the server already resolved it from its own executable
     // path) wins outright — no probing, because the CWD-relative candidates below are meaningless when
     // `veil` was launched from an arbitrary directory.
@@ -9508,6 +9535,7 @@ fn drawSettings(store: *Store, frame: t.Rect) void {
             @memcpy(s.host[0..hn2], hs[0..hn2]);
             s.host_len = @intCast(hn2);
             if (p >= 1) s.port = p; // 0/garbage = keep the current port rather than saving a dead target
+            s.target_pinned = false; // a target the user typed is theirs: persisted like any other from here on
             store.unlock();
             store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
             store.pushNotif("Server target saved", if (hn2 == 0) "this machine (localhost)" else "remote veil - paste its nlk_ token below", 1);
@@ -10709,6 +10737,31 @@ test "silentNotice: the whole line renders in the real buffers, and nothing repl
     // the widest silence a heartbeat can produce still fits, digits and all
     const wide = silentNotice(&status, SILENT_CHAT_FMT, std.math.maxInt(i64), 1).?;
     try std.testing.expect(std.mem.endsWith(u8, wide, "s - restart the desk"));
+}
+
+test "an attaching desk is seeded with the holder's port on the loopback and pinned; every other start keeps the configured default, unpinned" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = std.testing.allocator;
+    // a data dir that does not exist: the seed must not need one (no .desktop_key to read), and leaves nothing behind
+    const dd = "zig-desk-attach-seed-tmp-nodir";
+    const attached = try gpa.create(Store); // Store is far too big for a test stack frame
+    defer gpa.destroy(attached);
+    attached.* = .{};
+    seedSettings(attached, gpa, io, dd, .{ .port = 9000 });
+    try std.testing.expectEqualStrings(dd, attached.settings.dataDir());
+    try std.testing.expectEqual(@as(u16, 9000), attached.settings.port);
+    try std.testing.expectEqualStrings("", attached.settings.hostStr()); // the loopback: what an empty host means everywhere
+    try std.testing.expect(attached.settings.target_pinned);
+
+    const plain = try gpa.create(Store);
+    defer gpa.destroy(plain);
+    plain.* = .{};
+    seedSettings(plain, gpa, io, dd, null);
+    try std.testing.expectEqual(@as(u16, 8787), plain.settings.port); // Settings' own default, for settings.json to override
+    try std.testing.expectEqualStrings("", plain.settings.hostStr());
+    try std.testing.expect(!plain.settings.target_pinned);
 }
 
 test "autoSelect hands the poller the newest run's whole id, even one wider than 64 bytes" {
