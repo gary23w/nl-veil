@@ -2057,6 +2057,8 @@ fn upgradeRuntime(app: *App, a: std.mem.Allocator, uid: u64, st: *State) void {
 }
 
 var upgrade_failed_s: std.atomic.Value(i64) = .init(0);
+/// When this build's tot.js was last offered to the tots as a revision and refused (syncRuntimeAs).
+var host_offer_s: std.atomic.Value(i64) = .init(0);
 
 /// Tots edit their own shared runtime; this bridge supplies the owner's existing Cloudflare login for upload.
 /// No host code is executed, and no local_run grant or proposal/approval gate is involved.
@@ -2069,7 +2071,7 @@ fn syncRuntime(app: *App, a: std.mem.Allocator, uid: u64, st: *State) void {
 fn syncRuntimeAs(app: *App, a: std.mem.Allocator, uid: u64, tok: Tok, st: *State) void {
     if (!std.mem.eql(u8, tok.account_id, st.account)) return;
     const raw = totCall(app, a, uid, st.*, "GET", "/v1/runtime", "") orelse return;
-    const R = struct { ok: bool = false, initialized: bool = false, revision: u64 = 0, status: []const u8 = "", source: []const u8 = "" };
+    const R = struct { ok: bool = false, initialized: bool = false, revision: u64 = 0, deployed_revision: u64 = 0, status: []const u8 = "", source: []const u8 = "", host: bool = false };
     const r = std.json.parseFromSliceLeaky(R, a, raw, .{ .ignore_unknown_fields = true }) catch return;
     if (!r.ok) return;
     if (!r.initialized) {
@@ -2081,6 +2083,24 @@ fn syncRuntimeAs(app: *App, a: std.mem.Allocator, uid: u64, tok: Tok, st: *State
             st.runtime_source = source;
             writeState(app, uid, st.*);
         }
+        return;
+    }
+    // THE HOST'S RUNTIME AS A REVISION: this build carries a tot.js the account's tots do not run yet. It is
+    // offered only over a runtime the host itself wrote (`host`: the seed, or an earlier offer) that is deployed
+    // with nothing pending - a tot's own edits, drafts and uploads are theirs, and a host never swaps beneath
+    // them. The pad holds the same rule; the next sync finds the new revision pending and uploads it like any
+    // other, and a tot can read it or revert it. A refusal is not retried for a quarter of an hour.
+    if (std.mem.eql(u8, r.status, "deployed") and r.revision == r.deployed_revision and r.host and !std.mem.eql(u8, st.runtime_source, TOT_JS)) {
+        const now = nowS(app.io);
+        if (now - host_offer_s.load(.monotonic) < 900) return;
+        host_offer_s.store(now, .monotonic);
+        const body = std.json.Stringify.valueAlloc(a, .{ .source = TOT_JS, .revision = r.revision, .by = "veil host" }, .{}) catch return;
+        const offered = totCall(app, a, uid, st.*, "POST", "/v1/runtime/upgrade", body) orelse return;
+        const reply = replyOf(a, offered);
+        if (reply.ok) {
+            host_offer_s.store(0, .monotonic); // taken: the next sync uploads it
+            log.info("tot runtime for u{d}: this build's tot.js is runtime revision {d}; it goes up on the next sync", .{ uid, r.revision + 1 });
+        } else log.warn("tot runtime for u{d}: this build's tot.js was not taken as a revision: {s}", .{ uid, reply.err });
         return;
     }
     if (!std.mem.eql(u8, r.status, "pending")) return;
@@ -3149,6 +3169,47 @@ test "Agent Garrett deploys on its own, with no tater-tot in the account: its pa
     try tt.expect(srv.firstCall("DELETE", "/workers/scripts/veil-tots?force=true") != null);
     try tt.expect(srv.firstCall("DELETE", "/workers/scripts/veil-garrett?force=true") != null);
     try tt.expect(srv.call_count > 19 and srv.call_count < 128);
+}
+
+test "this build's tot.js is offered to the tots as the next runtime revision over a deployed host runtime, backs off a refusal, and is never offered over a tot's own" {
+    const gpa = tt.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var ta = try http.testApp(gpa, io, "zig-cftot-hostrev-tmp");
+    defer ta.deinit();
+    if (!curlRuns(gpa, io)) return error.SkipZigTest;
+    const routes = [_]fakehttp.Route{
+        .{ .method = "GET", .path = "/v1/runtime", .reply = fakehttp.wire("{\"ok\":true,\"initialized\":true,\"revision\":0,\"deployed_revision\":0,\"status\":\"deployed\",\"host\":true}"), .times = 3 },
+        .{ .method = "GET", .path = "/v1/runtime", .reply = fakehttp.wire("{\"ok\":true,\"initialized\":true,\"revision\":3,\"deployed_revision\":3,\"status\":\"deployed\",\"host\":false}") },
+        .{ .method = "POST", .path = "/v1/runtime/upgrade", .reply = fakehttp.wire("{\"ok\":false,\"err\":\"revision 0 is pending; the host's source waits until it has deployed\"}"), .times = 1 },
+        .{ .method = "POST", .path = "/v1/runtime/upgrade", .reply = fakehttp.wire("{\"ok\":true,\"revision\":1,\"status\":\"pending\"}") },
+    };
+    var srv: fakehttp.Server = undefined;
+    try srv.startRouted(io, &routes, StandIn.no_script);
+    var running = true;
+    defer if (running) srv.stop();
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    ta.app.cf_api_root = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/client/v4", .{srv.port});
+    var st: State = .{ .account = "acct", .url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}", .{srv.port}), .runtime_source = "an older stock runtime" };
+    const tok: Tok = .{ .key = "oauth-bearer", .account_id = "acct" };
+    host_offer_s.store(0, .monotonic);
+    syncRuntimeAs(&ta.app, a, 1, tok, &st); // deployed, the host's, older than this build: offered; the stand-in refuses it
+    try tt.expectEqual(@as(usize, 1), srv.countCalls("POST", "/v1/runtime/upgrade"));
+    syncRuntimeAs(&ta.app, a, 1, tok, &st); // refused a moment ago: not offered again within the quarter hour
+    try tt.expectEqual(@as(usize, 1), srv.countCalls("POST", "/v1/runtime/upgrade"));
+    host_offer_s.store(0, .monotonic); // the quarter hour has passed
+    syncRuntimeAs(&ta.app, a, 1, tok, &st); // taken: it is revision 1, pending, and the next sync uploads it
+    try tt.expectEqual(@as(usize, 2), srv.countCalls("POST", "/v1/runtime/upgrade"));
+    try tt.expectEqual(@as(i64, 0), host_offer_s.load(.monotonic));
+    try tt.expectEqualStrings("an older stock runtime", st.runtime_source); // nothing is recorded until the upload is acknowledged
+    syncRuntimeAs(&ta.app, a, 1, tok, &st); // a tot's own deployed runtime: the host's is not offered over it
+    try tt.expectEqual(@as(usize, 2), srv.countCalls("POST", "/v1/runtime/upgrade"));
+    srv.stop();
+    running = false;
+    try tt.expectEqual(@as(usize, 6), srv.call_count);
 }
 
 test "RSI seeds the live source, uploads self-edits without a local grant, persists them, and reports compiler failures" {
