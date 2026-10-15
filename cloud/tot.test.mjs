@@ -6,7 +6,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import worker, { Tot, VERSION, DEFAULT_MAX_TOTS, MAX_TOTS_CEIL, PRIMARY, PLATEAU, firstJson, answerText, parseAction, nativeCalls, pickText, searchResults, privateHost, parseGoalCommand, parseVerdict, evidenceVerdict, repeatedGoal, decide, newGoal, recordIteration, validName, parseGuardCommand, watchKey, judgeTarget, chainHash, verifyChain } from "./tot.js";
+import worker, { Tot, VERSION, DEFAULT_MAX_TOTS, MAX_TOTS_CEIL, PRIMARY, PLATEAU, firstJson, answerText, parseAction, nativeCalls, pickText, searchResults, privateHost, parseGoalCommand, parseVerdict, evidenceVerdict, repeatedGoal, decide, newGoal, recordIteration, validName, parseGuardCommand, watchKey, judgeTarget, chainHash, verifyChain, toolPath, cueTokens, buildTree, Walk, Learned, beltFor, mapIndex, NAV_MAX, OPEN_MAX, MAP_AT, loopGraph, criticalChain, unfold, netFold, netOf, looksDead, distinctiveTokens, similarText, repeatedStep, classifyModelError } from "./tot.js";
 
 class Storage {
   constructor() {
@@ -1974,4 +1974,479 @@ test("a long execution retains its task and newest evidence while bounding model
   assert.equal(await tot.toolLoop(cfg,"Keep the goal and use returned evidence.","Inspect the current domain.",[{name:"read_file"}],12,record,""),"checked");
   assert.equal(record.length,9);
   assert.ok(w.asked.at(-1).input.messages.length<20);
+});
+
+// ---------------------------------------------------------------------------------------- the tool map
+
+/// A belt past MAP_AT tools: the built-in verbs plus a small security catalogue of known shape.
+function mapBelt() {
+  const plain = ["tool_schema", "write_file", "read_file", "edit_file", "append_file", "list_files", "delete_file", "web_search", "web_fetch", "http_request", "browser_open", "browser_read", "browser_click", "browser_type", "run_python", "pip_install", "save_skill", "run_skill", "runtime_read", "runtime_edit", "runtime_deploy", "runtime_revert", "remember", "recall", "feel", "plan_set", "plan_done", "pad_read", "pad_write", "tell", "swarm", "goal_queue", "say", "garrett", "garrett_tools"].map((name) => ({ name, args: "{}", what: `the ${name.replace(/_/g, " ")} verb` }));
+  const sec = (n, what) => ({ name: "security_" + n, args: "{}", what, inputSchema: { type: "object", properties: {} }, need: "garrett" });
+  const catalogue = [
+    sec("nvd_lookup", "look up a CVE in NVD"), sec("epss_score", "EPSS probability for a CVE"),
+    sec("dns_records", "DNS records of a host"), sec("crtsh_search", "certificate transparency search for a host"),
+    sec("http_headers", "the response headers of a site"), sec("email_dmarc", "DMARC and SPF posture of a mail domain"),
+    sec("gary_probe", "inspect a target with typed options"), sec("gary_shell_open", "open a shell on the agent"),
+    ...Array.from({ length: 8 }, (_, i) => sec("gary_catalog_" + i, "a deployed security capability")),
+  ];
+  return [...plain, ...catalogue];
+}
+
+test("pure: the tool map - every tool has a branch, the step's words open the branch it names, a walk opens by path and by find, a left branch is a dead end, the open set is bounded, what a find led to is learned, and a learned edge opens the group unasked next time", () => {
+  assert.equal(toolPath("browser_click"), "web/browser");
+  assert.equal(toolPath("security_nvd_lookup"), "security/intel");
+  assert.equal(toolPath("security_gary_shell_open"), "security/agent/shell");
+  assert.equal(toolPath("security_favicon_hash"), "security/web"); // web before malware
+  assert.equal(toolPath("runtime_revert"), "self/runtime");
+  assert.equal(toolPath("nothing_like_it"), "other");
+  assert.deepEqual(cueTokens("Inspect the domain with security_gary_probe using its actual schema, then check the file"), ["inspect", "domain", "security_gary_probe", "schema"]);
+  const tools = mapBelt();
+  assert.ok(tools.length > MAP_AT);
+  const tree = buildTree(tools);
+  assert.equal(tree.nodes[tree.byName.get("security_nvd_lookup")].path, "security/intel/security_nvd_lookup");
+  assert.equal(tree.nodes[tree.byPath.get("security")].kind, "family");
+  assert.equal(tree.nodes[tree.byPath.get("security/agent")].kind, "family");
+  assert.equal(tree.nodes[tree.byPath.get("security/agent/shell")].kind, "group");
+  assert.equal(tree.nodes[tree.byPath.get("security")].tool_count, 18); // the catalogue, and the three garrett verbs
+  // flat: no walk; auto under MAP_AT: no walk; auto past it: the built-in belt is the core; map: a small core
+  assert.equal(beltFor({ belt: "flat" }, tools, "x", [], null), null);
+  assert.equal(beltFor({ belt: "auto" }, tools.slice(0, 40), "x", [], null), null);
+  const small = beltFor({ belt: "map" }, tools.slice(0, 30), "x", [], null);
+  assert.ok(small.isOpen("write_file") && !small.isOpen("browser_open") && small.knows("browser_open"));
+  const w = beltFor({ belt: "auto" }, tools, "Inspect the domain with security_gary_probe using its actual schema", [], null);
+  assert.ok(w.isOpen("write_file") && w.isOpen("browser_open")); // the core
+  assert.ok(w.isOpen("security_gary_probe")); // the pre-walk opened the group the step named
+  assert.equal(w.isOpen("security_nvd_lookup"), false);
+  const shown = w.tools().map((t) => t.name);
+  assert.ok(shown.includes("open_tools") && shown.includes("security_gary_probe") && !shown.includes("security_nvd_lookup"));
+  assert.equal(w.dirty, false);
+  // a walk: the families, into one, a group opens by its bare name, back out of it: a dead end, labelled
+  const root = w.navigate({});
+  assert.match(root, /^TOOL MAP - the families/);
+  assert.match(root, /  security - Agent Garrett[^\n]*\(18 tools in \d+ branches\)/);
+  assert.match(w.navigate({ path: "security" }), /you are at: security/);
+  w.tick();
+  assert.match(w.navigate({ path: "intel" }), /^OPENED security\/intel - vulnerability intelligence[^\n]*\n  security_nvd_lookup - look up a CVE in NVD\n  security_epss_score/);
+  assert.ok(w.isOpen("security_nvd_lookup") && w.dirty);
+  assert.match(w.navigate({ back: true }), /  intel - [^\n]*\[looked already: nothing fit\]/);
+  // find opens the clear best, and the call it leads to is learned under the find's words
+  const learned = new Learned();
+  w.learned = learned;
+  w.tick();
+  const found = w.navigate({ find: "certificate transparency" });
+  assert.match(found, /^FOUND for "certificate transparency":\n  security_crtsh_search - certificate transparency search for a host  \(in security\/dns-ip\)\nOpened security\/dns-ip: its tools are callable by name now\./);
+  // on a tie with a core tool, the one not at hand ranks first and the core one is marked callable already
+  const tied = beltFor({ belt: "auto" }, [...tools, { name: "garrett_tools", args: "{}", what: "list Agent Garrett's tools: certificate transparency and more" }].filter((t, i, all) => all.findIndex((x) => x.name === t.name) === i || t.what.includes("transparency")), "x", [], null);
+  tied.tree.nodes[tied.tree.byName.get("garrett_tools")].desc = "list Agent Garrett's tools: certificate transparency and more";
+  assert.match(tied.navigate({ find: "certificate transparency" }), /^FOUND for "certificate transparency":\n  security_crtsh_search - [^\n]*\(in security\/dns-ip\)\n  garrett_tools - [^\n]*\(in security\/garrett, callable already\)\nOpened security\/dns-ip/);
+  assert.equal(w.noteCall("security_crtsh_search"), null); // already open: nothing to say
+  assert.equal(learned.bonus("certificate", "security_crtsh_search"), 1);
+  assert.equal(learned.bonus("transparency", "security_crtsh_search"), 1);
+  // the open set is bounded: the fifth group closes the least recently used, and the view says so
+  w.tick();
+  w.navigate({ path: "security/web" });
+  w.tick();
+  const fifth = w.navigate({ path: "security/email-breach" });
+  assert.match(fifth, /Closed to make room: security\/agent\/tasks \(reopen it with open_tools/);
+  assert.equal(w.open.length, OPEN_MAX);
+  assert.equal(w.isOpen("security_gary_probe"), false);
+  // a known name opens its group (and runs, in the loop) without a walk
+  w.tick();
+  assert.equal(w.noteCall("security_gary_shell_open"), "security/agent/shell");
+  assert.deepEqual(w.save()[0], "security/agent/shell"); // most recently used first
+  // step end: the step's words are tied to what it called; the next step with those words opens the group unasked
+  w.finish();
+  const w2 = beltFor({ belt: "auto" }, tools, "inspect the domain", [], learned);
+  assert.ok(w2.isOpen("security_crtsh_search"));
+  assert.equal(w2.isOpen("security_gary_probe"), false);
+  // a lost walker: NAV_MAX navigation rounds without a call, and the engine searches the map from the step's words
+  const w3 = beltFor({ belt: "auto" }, tools, "look at nvd", [], null); // one weak name hit: nothing opens unasked
+  assert.equal(w3.isOpen("security_nvd_lookup"), false);
+  let last = "";
+  for (let i = 0; i <= NAV_MAX; i++) last = w3.navigate({ path: "web" });
+  assert.match(last, /^\(you have been walking the map for a while without calling a tool/);
+  assert.ok(w3.isOpen("security_nvd_lookup"));
+  assert.match(w3.navigate({ path: "nowhere" }), /^No branch named "nowhere" here\. TOOL MAP/);
+  // the plan's index: the core one line each, the rest by group with every tool NAMED but none described
+  const index = mapIndex(w3);
+  assert.match(index, /^- tool_schema: /);
+  assert.match(index, /\n  security\/intel - vulnerability intelligence[^\n]*\(2\): security_nvd_lookup, security_epss_score/);
+  assert.doesNotMatch(index, /- security_nvd_lookup:/);
+  assert.doesNotMatch(index, /\n  files - /); // all core: no group line
+  // learned edges survive a round trip and keep a cap
+  const back = new Learned(learned.rows());
+  assert.equal(back.bonus("certificate", "security_crtsh_search"), 1);
+  for (let i = 0; i < 700; i++) back.bump("word" + i, "security_nvd_lookup");
+  assert.ok(back.edges.size <= 600);
+});
+
+test("with Agent Garrett's catalogue the do loop sees the core belt, open_tools and the group the step named; a walk is an event and never a judge row; a name the model knew opens its branch and runs; the open set, what was learned and the net carry to the next iteration", async () => {
+  const sec = (n, what, props = {}) => ({ name: "security_" + n, args: JSON.stringify({ type: "object", properties: props }), what, inputSchema: { type: "object", properties: props }, need: "garrett" });
+  const catalogue = Array.from({ length: 60 }, (_, i) => sec("gary_catalog_" + i, "a deployed security capability"));
+  catalogue.push(sec("gary_probe", "inspect a target with typed options", { target: { type: "string" } }), sec("crtsh_search", "certificate transparency search for a host", { host: { type: "string" } }), sec("gary_shell_open", "open a shell on the agent"));
+  const w = world((messages, n) => {
+    const sys = messages[0].content;
+    const last = messages.at(-1).content;
+    assert.ok(messages.reduce((s, m) => s + m.content.length, 0) <= 54000);
+    if (n === 1) {
+      assert.match(sys, /AVAILABLE TOOLS:\n- tool_schema: /);
+      assert.match(sys, /TOOL MAP \(the rest of the belt/);
+      assert.match(sys, /security\/agent\/tasks - [^\n]*security_gary_catalog_59/);
+      assert.match(sys, /security\/dns-ip - [^\n]*security_crtsh_search/);
+      assert.doesNotMatch(sys, /- security_gary_catalog_59:/);
+      return "Inspect the domain with security_gary_probe using its actual schema.";
+    }
+    if (n === 2) {
+      assert.match(sys, /YOUR TOOLS ARE A MAP/);
+      assert.match(sys, /- open_tools \{"path"/);
+      assert.match(sys, /- write_file \{/);
+      assert.match(sys, /- security_gary_probe: [^\n]*\(typed arguments: call tool_schema\)/); // the pre-walk opened the group the step named
+      assert.doesNotMatch(sys, /security_crtsh_search|security_gary_shell_open/);
+      return JSON.stringify({ tool: "open_tools", args: { find: "certificate transparency" } });
+    }
+    if (n === 3) {
+      assert.match(last, /^RESULT of open_tools:\nFOUND for "certificate transparency":\n  security_crtsh_search - [^\n]*\(in security\/dns-ip\)\n  garrett_tools - [^\n]*callable already/);
+      assert.match(last, /Opened security\/dns-ip/);
+      assert.match(sys, /- security_crtsh_search: /);
+      return JSON.stringify({ tool: "security_crtsh_search", args: { host: "example.com" } });
+    }
+    if (n === 4) {
+      assert.match(last, /^RESULT of security_crtsh_search:\ncompleted/);
+      return JSON.stringify({ tool: "security_gary_shell_open", args: {} }); // a name it knew, in a group that is not open
+    }
+    if (n === 5) {
+      assert.match(last, /^RESULT of security_gary_shell_open:\ncompleted[\s\S]*\(security_gary_shell_open opened security\/agent\/shell: its tools are callable by name now\.\)/);
+      assert.match(sys, /- security_gary_shell_open: /);
+      return JSON.stringify({ final: "inspected" });
+    }
+    if (n === 6) {
+      const text = said(messages);
+      assert.match(text, /T1 TOOL security_crtsh_search/);
+      assert.match(text, /T2 TOOL security_gary_shell_open/);
+      assert.doesNotMatch(text, /TOOL open_tools/);
+      return "SAME | score: none | evidence: nothing measured";
+    }
+    if (n === 7) return "NONE";
+    if (n === 8) {
+      assert.match(sys, /LAST ITERATION'S NET[^\n]*\nNEXT \(the frontier[\s\S]*ESTABLISHED[\s\S]*- r1 security_crtsh_search \{"host":"example.com"\}: completed/);
+      assert.doesNotMatch(sys, /- r\d open_tools/);
+      return "Search certificate transparency for the host once more";
+    }
+    if (n === 9) {
+      assert.match(sys, /- security_crtsh_search: /); // the open set came back
+      return JSON.stringify({ final: "again" });
+    }
+    if (n === 10) return "SAME | score: none | evidence: nothing";
+    return "NONE";
+  });
+  w.env.GARRETT_MCP_URL = "https://veil-garrett.example.workers.dev/mcp";
+  w.env.GARRETT_MCP_TOKEN = "test-token-only-not-a-live-credential";
+  w.env.SECURITY_TOOLS = catalogue;
+  await w.req("POST", "/v1/tots", { goal: "Audit example.com with Agent Garrett", garrett: true });
+  const tot = w.tot("Gary");
+  tot.securityAt = Date.now(); // the catalogue is set; no discovery call
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async () => Response.json({ jsonrpc: "2.0", id: 1, result: { content: [{ type: "text", text: "completed" }], isError: false } });
+  try {
+    await w.tick("Gary");
+    assert.equal(w.asked.length, 7);
+    const evs = await w.events("Gary");
+    assert.ok(evs.some((e) => e.kind === "act" && e.tool === "open_tools" && e.ok && /FOUND for "certificate transparency"/.test(e.text)));
+    assert.deepEqual(await tot.store.get("belt_open"), ["security/agent/shell", "security/dns-ip", "security/agent/tasks"]); // most recently used first
+    const learned = await tot.store.get("belt_learned");
+    assert.ok(learned.some(([tok, tool]) => tok === "certificate" && tool === "security_crtsh_search")); // the find that led to the call
+    assert.ok(learned.some(([tok, tool]) => tok === "inspect" && tool === "security_gary_shell_open")); // the step's words, tied to what it called
+    const st = (await w.req("GET", "/v1/tots/Gary")).body.tot;
+    assert.equal(st.belt, "auto");
+    assert.ok(st.learned >= 4);
+    assert.match((await tot.store.get("last_work")).net, /^NEXT \(the frontier/);
+    await w.tick("Gary");
+    assert.equal(w.asked.length, 11);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+// ---------------------------------------------------------------------------------------- Gary's 4tope
+
+test("pure: Gary's 4tope - the loop's rounds read as a graph, a result the step reused is a strong edge, a later identical call supersedes, a failed call is a dead end, the critical chain runs through the live results, and the net lays out NEXT / ON DISK / RULED OUT / ESTABLISHED verbatim with no model call", () => {
+  const step = (tool, args) => ({ role: "assistant", content: JSON.stringify({ tool, args }) });
+  const res = (tool, text, failed = false) => ({ role: "user", content: `RESULT of ${tool}:\n${text}\n\n${failed ? "This attempt failed. Diagnose its cause and change the method or repair the prerequisite before retrying; saving this error is not success.\n" : "Check whether this result meets the step's success criterion; an acknowledgement alone is not verification.\n"}Next action, or the final answer.` });
+  const messages = [
+    { role: "system", content: "S" }, { role: "user", content: "T" },
+    step("read_file", { name: "plan.md" }), res("read_file", "1. fetch tides.example/today\n2. parse the table"),
+    step("web_fetch", { url: "https://tides.example/today" }), res("web_fetch", "HTTP 200\nhttps://tides.example/today\nHigh tide 04:12\nLow tide 10:40"),
+    step("run_python", { code: "print(x)" }), res("run_python", "FAILED\nTraceback: NameError", true),
+    step("read_file", { name: "plan.md" }), res("read_file", "1. fetch tides.example/today\n2. parse the table\n3. done"),
+    step("write_file", { name: "tides.md", text: "High tide 04:12 at tides.example" }), res("write_file", "saved tides.md (32 characters)"),
+  ];
+  assert.ok(looksDead("ERROR: no such file") && looksDead("FAILED\nx") && looksDead("HTTP 503\n") && !looksDead("HTTP 200\nfine") && !looksDead("saved x"));
+  assert.deepEqual(distinctiveTokens('{"tool":"web_fetch","args":{"url":"https://tides.example/today"}}'), ["web_fetch", "https", "tides.example/today"]);
+  const g = loopGraph(messages);
+  const steps = g.nodes.filter((n) => n.kind === "step");
+  const results = g.nodes.filter((n) => n.kind === "result");
+  assert.equal(steps.length, 5);
+  assert.equal(results.length, 5);
+  assert.equal(g.frontier, g.nodes.indexOf(steps[4]));
+  assert.equal(results[0].superseded, true); // the plan, read again later
+  assert.equal(results[3].superseded, false);
+  assert.equal(results[2].dead, true);
+  assert.equal(results[2].deps[0].to, g.nodes.indexOf(steps[2])); // a result depends on the step that issued it
+  assert.equal(steps[1].deps.find((d) => d.to === g.nodes.indexOf(results[0])).w, 2); // the fetch reused the plan's URL: strong
+  assert.equal(steps[2].deps.find((d) => d.to === g.nodes.indexOf(results[1])).w, 0); // the script read nothing from the page: weak
+  assert.equal(steps[4].deps.find((d) => d.to === g.nodes.indexOf(results[3])).w, 2);
+  assert.equal(steps[4].deps.find((d) => d.to === g.nodes.indexOf(steps[3])).w, 1); // the model's own thread
+  const chain = criticalChain(g);
+  assert.equal(chain[0], g.frontier);
+  assert.ok(chain.includes(g.nodes.indexOf(results[3])));
+  assert.ok(chain.includes(g.nodes.indexOf(results[1])));
+  assert.deepEqual(criticalChain({ nodes: [], calls: [], frontier: -1 }), []);
+  const net = unfold(g, 3000, "files written this step: tides.md");
+  assert.match(net, /^NEXT \(the frontier, in its own last words\): \{"tool":"write_file","args":\{"name":"tides.md"/);
+  assert.match(net, /\nON DISK: files written this step: tides.md\n/);
+  assert.match(net, /\nRULED OUT \(calls that failed; do not repeat them as they were\):\n- r3 run_python \{"code":"print\(x\)"\} -> FAILED Traceback: NameError\n/);
+  assert.match(net, /\nESTABLISHED \(what the frontier rests on, nearest first, each derivation contiguous\):\n- r5 write_file [^\n]*: saved tides.md \(32 characters\)\n- r4 read_file \{"name":"plan.md"\}: 1\. fetch tides.example\/today 2\. parse the table 3\. done\n/);
+  assert.match(net, /- r2 web_fetch \{"url":"https:\/\/tides.example\/today"\}: HTTP 200 https:\/\/tides.example\/today High tide 04:12 Low tide 10:40\n/);
+  assert.doesNotMatch(net, /- r1 read_file/); // superseded: stale, never carried
+  assert.equal(unfold({ nodes: [], calls: [], frontier: -1 }, 3000), "");
+  assert.equal(unfold(g, 100), ""); // no budget, no net
+  // under a tight budget the nearest nodes ride and the farthest is left out, in distance order
+  const tight = unfold(g, 520);
+  assert.match(tight, /- r5 write_file/);
+  assert.doesNotMatch(tight, /- r2 web_fetch/);
+});
+
+test("a long do loop folds into a net (Gary's 4tope) instead of dropping its oldest rounds: the system message and the task stay, the chain's live results stay verbatim and clipped, a failed call rides as a RULED OUT line, a second fold keeps the first's lines, the window holds, and the carry remembers it all", async () => {
+  const w = world((messages, n) => {
+    assert.equal(messages[0].content, "Keep the goal and use returned evidence.");
+    assert.equal(messages[1].content, "Inspect the current domain.");
+    assert.ok(messages.reduce((size, m) => size + m.content.length, 0) <= 54000);
+    if (n > 1) assert.match(messages.at(-1).content, new RegExp("^RESULT of read_file:\\n(evidence-" + (n - 1) + " x|ERROR: no such file: evidence-" + (n - 1) + ")"));
+    if (n > 1 && n < 9) assert.equal(messages[2].role, "assistant"); // under the window: nothing folds
+    if (n === 9) {
+      // the first fold: rounds 1-6 folded, 7 and 8 kept whole
+      assert.match(messages[2].content, /^CONTINUATION \(Gary's 4tope/);
+      assert.match(messages[2].content, /\nRULED OUT \(calls that failed[^\n]*\n- r3 read_file \{"name":"evidence-3.txt"\} -> ERROR: no such file: evidence-3\n/);
+      assert.match(messages[2].content, /\nESTABLISHED[^\n]*\n[\s\S]*- r2 read_file \{"name":"evidence-2.txt"\}: evidence-2 xxxx/);
+      assert.doesNotMatch(messages[2].content, /EARLIER/);
+      const kept = messages.slice(3).filter((m) => m.role === "user").map((m) => m.content);
+      assert.equal(kept.length, 7); // r1, r2, r4, r5, r6 (the chain's live results, clipped), r7, r8 (kept whole)
+      assert.ok(kept.slice(0, 5).every((c) => c.length <= 3200 && c.includes("...(middle omitted)...")));
+      assert.ok(kept.slice(5).every((c) => c.length > 8000));
+      assert.match(kept[0], /^RESULT of read_file:\nevidence-1 xxxx/);
+      assert.ok(!kept.some((c) => /evidence-3\.txt|no such file/.test(c)));
+    }
+    if (n === 11) assert.doesNotMatch(messages[2].content, /EARLIER/); // still the first fold: the window held
+    if (n === 12) {
+      // the second fold carries the first's lines under EARLIER, the ruled-out call first
+      assert.match(messages[2].content, /^CONTINUATION[^\n]*\nNEXT \(the frontier, in its own last words\): \{"tool":"read_file","args":\{"name":"evidence-11.txt"\}\}\n/);
+      assert.match(messages[2].content, /\nEARLIER \(from the fold before this one\):\n- r3 read_file \{"name":"evidence-3.txt"\} -> ERROR: no such file: evidence-3\n/);
+    }
+    if (n === 13) assert.ok(messages.length < 30, String(messages.length));
+    return JSON.stringify(n < 13 ? { tool: "read_file", args: { name: "evidence-" + n + ".txt" } } : { final: "checked" });
+  });
+  await w.req("POST", "/v1/tots", { goal: "inspect our website" });
+  const tot = w.tot("Gary");
+  const cfg = await tot.store.get("cfg");
+  tot.runTool = async (_cfg, _tool, args) => (args.name === "evidence-3.txt" ? "ERROR: no such file: evidence-3" : args.name.replace(".txt", "") + " " + "x".repeat(9000));
+  const record = [];
+  const loop = { walk: null, messages: null };
+  assert.equal(await tot.toolLoop(cfg, "Keep the goal and use returned evidence.", "Inspect the current domain.", [{ name: "read_file" }], 14, record, "", loop), "checked");
+  assert.equal(record.length, 12);
+  assert.equal(w.asked.length, 13);
+  const carry = netOf(loop.messages);
+  assert.match(carry, /^NEXT \(the frontier, in its own last words\): \{"tool":"read_file","args":\{"name":"evidence-12.txt"\}\}\n/);
+  assert.match(carry, /\nESTABLISHED[^\n]*\n- r\d+ read_file \{"name":"evidence-12.txt"\}: evidence-12 xxxx/);
+  assert.match(carry, /\nEARLIER \(from the fold before this one\):\n- r3 read_file \{"name":"evidence-3.txt"\} -> ERROR: no such file: evidence-3/);
+  assert.ok(carry.length <= 3400, String(carry.length));
+  // a loop under the window is never folded
+  const short = [{ role: "system", content: "S" }, { role: "user", content: "T" }, { role: "assistant", content: '{"tool":"say","args":{}}' }, { role: "user", content: "RESULT of say:\nreported\n\nNext action, or the final answer." }];
+  assert.equal(netFold(short, 54000), short);
+  assert.match(netOf(short), /^NEXT [^\n]*\nESTABLISHED[^\n]*\n- r1 say \{\}: reported\n$/); // ...but the carry still has what it rested on
+});
+
+// ---------------------------------------------------------------------------------------- self-healing
+
+test("self-healing is learned per model, never per vendor: a model that needs three times the room twice is asked for it first; one that answers nothing three times in a day hands the day to the fallback and is tried again tomorrow; a context-length error halves its window; a missing model routes to the fallback; any other error surfaces as it is", async () => {
+  const FB = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
+  const w = world();
+  await w.req("POST", "/v1/tots", { goal: "first goal here", model: "@cf/zai-org/reasons-a-lot" });
+  const tot = w.tot("Gary");
+  const cfg = () => tot.store.get("cfg");
+  const msgs = [{ role: "user", content: "hello" }];
+  const sizes = [];
+  let silent = 0;
+  w.env.AI.run = async (model, input) => {
+    sizes.push([model, input.max_tokens]);
+    if (silent > 0) {
+      silent -= 1;
+      return { response: "" };
+    }
+    return { response: "ok" };
+  };
+  // twice silent at the plain room and answering at three times it: from then on the room is asked for first
+  silent = 1;
+  assert.equal(await tot.ask(await cfg(), msgs, 1000), "ok");
+  assert.deepEqual(sizes, [["@cf/zai-org/reasons-a-lot", 1000], ["@cf/zai-org/reasons-a-lot", 3000]]);
+  assert.equal((await tot.store.get("quirks"))["@cf/zai-org/reasons-a-lot"].tokens_x, undefined);
+  silent = 1;
+  sizes.length = 0;
+  await tot.ask(await cfg(), msgs, 1000);
+  assert.equal((await tot.store.get("quirks"))["@cf/zai-org/reasons-a-lot"].tokens_x, 3);
+  sizes.length = 0;
+  await tot.ask(await cfg(), msgs, 1000);
+  assert.deepEqual(sizes, [["@cf/zai-org/reasons-a-lot", 3000]]);
+  assert.equal((await w.events("Gary")).filter((e) => /learned: @cf\/zai-org\/reasons-a-lot answers only with three times the room/.test(e.text)).length, 1);
+  // a model that stays silent: the fallback answers, and after three rescues the rest of the day is its
+  w.env.AI.run = async (model, input) => {
+    sizes.push([model, input.max_tokens]);
+    return { response: model === FB ? "fallback says" : "" };
+  };
+  for (let i = 0; i < 3; i++) assert.equal(await tot.ask(await cfg(), msgs, 1000), "fallback says");
+  let q = (await tot.store.get("quirks"))["@cf/zai-org/reasons-a-lot"];
+  assert.equal(q.route, "fallback");
+  assert.equal(q.rescues, 3);
+  sizes.length = 0;
+  assert.equal(await tot.ask(await cfg(), msgs, 1000), "fallback says");
+  assert.deepEqual(sizes, [[FB, 1000]]); // straight to the fallback: one call
+  assert.equal((await w.events("Gary")).filter((e) => /answered nothing 3 times today; @cf\/meta\/llama-3.3-70b-instruct-fp8-fast answers for it until tomorrow/.test(e.text)).length, 1);
+  assert.equal((await cfg()).model, "@cf/zai-org/reasons-a-lot"); // the human's setting is untouched
+  w.now += 86400000; // tomorrow: the chosen model is tried again
+  sizes.length = 0;
+  await tot.ask(await cfg(), msgs, 1000);
+  assert.equal(sizes[0][0], "@cf/zai-org/reasons-a-lot");
+  // a context-length error: the window halves for that model and the call is retried with the messages cut
+  const big = [{ role: "system", content: "S" }, { role: "user", content: "T" }];
+  for (let i = 0; i < 8; i++) big.push({ role: "assistant", content: "a" }, { role: "user", content: "x".repeat(6000) });
+  let seen = [];
+  let fail = 1;
+  w.env.AI.run = async (model, input) => {
+    seen.push(input.messages.reduce((n, m) => n + m.content.length, 0));
+    if (fail > 0) {
+      fail -= 1;
+      throw new Error("model input exceeds its context window");
+    }
+    return { response: "fits" };
+  };
+  await w.req("POST", "/v1/tots/Gary/config", { model: "@cf/some/small-window" });
+  assert.equal(await tot.ask(await cfg(), big, 1000), "fits");
+  assert.ok(seen[0] > 27000 && seen[1] <= 27000, JSON.stringify(seen));
+  assert.equal((await tot.store.get("quirks"))["@cf/some/small-window"].ctx_small, true);
+  assert.ok((await w.events("Gary")).some((e) => /learned: @cf\/some\/small-window has a smaller window/.test(e.text)));
+  seen = [];
+  await tot.ask(await cfg(), big, 1000);
+  assert.ok(seen[0] <= 27000); // and from then on the messages are held to half for that model
+  // a missing model: the fallback answers, said once, and the day is routed there
+  w.env.AI.run = async (model) => {
+    if (model === FB) return { response: "fallback says" };
+    throw new Error("5007: No such model @cf/gone/model or task");
+  };
+  await w.req("POST", "/v1/tots/Gary/config", { model: "@cf/gone/model" });
+  assert.equal(await tot.ask(await cfg(), msgs, 1000), "fallback says");
+  assert.equal(await tot.ask(await cfg(), msgs, 1000), "fallback says");
+  assert.equal((await w.events("Gary")).filter((e) => /@cf\/gone\/model is not available in this account/.test(e.text)).length, 1);
+  // an error of no known class surfaces as it is, and a failed remedy surfaces the original error too
+  w.env.AI.run = async () => {
+    throw new Error("something else entirely");
+  };
+  await w.req("POST", "/v1/tots/Gary/config", { model: "@cf/another/model" });
+  await assert.rejects(tot.ask(await cfg(), msgs, 1000), /something else entirely/);
+  w.env.AI.run = async () => {
+    throw new Error("prompt is too long for this model");
+  };
+  await assert.rejects(tot.ask(await cfg(), big, 1000), /prompt is too long for this model; retried with the messages halved: prompt is too long/);
+  assert.equal(classifyModelError("HTTP 429 Too Many Requests"), "busy");
+  assert.equal(classifyModelError("anything"), "");
+});
+
+test("self-healing of the runtime: a revision that fails to deploy reaches the next iteration as a directive, once, and runtime_revert restores the last deployed source as a new revision that is already live", async () => {
+  const picks = [];
+  const w = world((messages) => {
+    const text = said(messages);
+    if (text.includes("GOAL LOOP")) {
+      picks.push(text);
+      return "Fix the runtime, attempt " + picks.length;
+    }
+    if (text.includes("THIS ITERATION'S STEP")) return '{"final":"looked"}';
+    if (text.includes("Grade the LAST iteration")) return "SAME | score: none | evidence: nothing";
+    return "NONE";
+  });
+  await w.req("POST", "/v1/tots", { goal: "improve my runtime" });
+  const tot = w.tot("Gary");
+  const cfg = await tot.store.get("cfg");
+  const run = (tool, args = {}) => tot.runTool(cfg, tool, args, "");
+  assert.match(await run("runtime_revert", { revision: 0 }), /^ERROR: runtime source has not synced yet/);
+  await w.req("POST", "/v1/runtime/seed", { source: "export const STOP = true;" });
+  assert.match(await run("runtime_revert", { revision: 0 }), /^\{"ok":true,"revision":1,"deployed_revision":1,"status":"deployed"/); // the deployed source again, as a new revision
+  await run("runtime_edit", { revision: 1, find: "true", replace: "tru" });
+  await run("runtime_deploy", { revision: 2 });
+  await w.req("POST", "/v1/runtime/result", { revision: 2, err: "SyntaxError: Unexpected token" });
+  await w.tick("Gary");
+  assert.match(picks[0], /NEW MESSAGES[\s\S]*- runtime: revision 2 of your runtime FAILED to deploy \(SyntaxError: Unexpected token\)\. The Worker still runs revision 1\.[\s\S]*runtime_revert \{"revision": 2\}/);
+  assert.ok((await w.events("Gary")).some((e) => e.kind === "status" && e.ok === false && /runtime revision 2 failed to deploy: SyntaxError/.test(e.text)));
+  await w.tick("Gary");
+  assert.equal(picks.length, 2);
+  assert.doesNotMatch(picks[1], /FAILED to deploy/); // said once per revision
+  assert.match(await run("runtime_revert", { revision: 1 }), /^ERROR: runtime revision changed to 2; runtime_read before reverting/);
+  const back = JSON.parse(await run("runtime_revert", { revision: 2 }));
+  assert.equal(back.revision, 3);
+  assert.equal(back.deployed_revision, 3);
+  assert.equal(back.status, "deployed");
+  assert.equal(back.reverted_from, 2);
+  assert.match(await run("runtime_read", { find: "STOP" }), /export const STOP = true;/);
+  assert.equal((await w.req("GET", "/v1/runtime")).body.source, ""); // nothing is pending: the Worker already runs this source
+  // a later deployment that succeeds becomes the new way back; one that fails does not
+  await run("runtime_edit", { revision: 3, source: "export const STOP = 2;" });
+  await run("runtime_deploy", { revision: 4 });
+  await w.req("POST", "/v1/runtime/result", { revision: 4, err: "" });
+  await run("runtime_edit", { revision: 4, source: "broken" });
+  await run("runtime_deploy", { revision: 5 });
+  await w.req("POST", "/v1/runtime/result", { revision: 5, err: "boom" });
+  assert.equal(JSON.parse(await run("runtime_revert", { revision: 5 })).revision, 6);
+  assert.match(await run("runtime_read"), /SOURCE:\nexport const STOP = 2;$/);
+  assert.match(await tot.runTool({ ...cfg, posture: "defend" }, "runtime_revert", { revision: 6 }, ""), /posture is DEFEND/); // frozen, like edit and deploy
+});
+
+test("a pick that repeats an earlier iteration is asked once more for a changed method and goes on when none comes; a lesson that says the same thing in other words is not kept twice; /belt chooses how the belt is shown", async () => {
+  let asks = 0;
+  let secondPick = "Try something else entirely: a different source";
+  let lessonReply = "Always finish a step with a tool result that shows its effect.";
+  const w = world((messages) => {
+    const text = said(messages);
+    if (text.includes("GOAL LOOP")) {
+      asks += 1;
+      return text.includes("Your previous answer repeated an earlier iteration") ? secondPick : "Try the thing";
+    }
+    if (text.includes("THIS ITERATION'S STEP")) return '{"final": "did"}';
+    if (text.includes("Grade the LAST iteration")) return "SAME | score: none | evidence: nothing";
+    if (text.includes("Write ONE new rule")) return lessonReply;
+    return "NONE";
+  });
+  await w.req("POST", "/v1/tots", { goal: "make the report better" });
+  await w.tick("Gary");
+  assert.equal(asks, 1);
+  assert.equal((await w.tot("Gary").store.get("lessons")).length, 1);
+  lessonReply = "Always finish a step with a tool result showing its effect";
+  await w.tick("Gary"); // the pick repeated iteration 1: asked again, the changed answer is the step
+  assert.equal(asks, 3);
+  const rows = [...(await w.tot("Gary").store.list({ prefix: "log:" })).values()];
+  assert.equal(rows[1].step, "Try something else entirely: a different source");
+  assert.equal((await w.tot("Gary").store.get("lessons")).length, 1); // the same rule in other words
+  secondPick = "Try the thing"; // a model that repeats itself twice goes on with it, and the console says so
+  await w.tick("Gary");
+  assert.equal(asks, 5);
+  const evs = await w.events("Gary");
+  assert.ok(evs.some((e) => e.kind === "status" && e.ok === false && /the pick repeats an earlier iteration \(Try the thing\); asked once for a changed method/.test(e.text)));
+  assert.equal(evs.filter((e) => e.kind === "pick").length, 3);
+  assert.ok(similarText("Always finish a step with a tool result that shows its effect.", "Always finish a step with a tool result showing its effect") >= 0.7);
+  assert.ok(similarText("Always verify the file content with read_file before claiming success", "Always verify the page content with browser_read before claiming success") < 0.7); // one noun apart: two rules
+  assert.equal(repeatedStep("Read the browser result", [{ step: "Fetch tides with Python" }]), false);
+  assert.equal(repeatedStep("Fix the runtime, attempt 2", [{ step: "Fix the runtime, attempt 1" }]), false); // a numbered attempt is a new one
+  // /belt
+  assert.match((await w.req("POST", "/v1/tots/Gary/command", { text: "/belt map" })).body.reply, /, belt map\.$/);
+  assert.equal((await w.req("GET", "/v1/tots/Gary")).body.tot.belt, "map");
+  assert.ok(evs.length < (await w.events("Gary")).length);
+  assert.match((await w.req("POST", "/v1/tots/Gary/command", { text: "/belt sideways" })).body.reply, /^Usage: \/belt auto \| map \| flat\./);
+  assert.match((await w.req("POST", "/v1/tots/Gary/command", { text: "/belt auto" })).body.reply, /minds, 400 model calls a day\.$/);
+  assert.match((await w.req("POST", "/v1/tots/Gary/command", { text: "/help" })).body.reply, /\/belt auto\|map\|flat/);
 });

@@ -177,7 +177,7 @@
       { p: 'desk/wsock', c: 'DK-21', t: 'Wsock — blocking Winsock round trip, twin of the server copy', s: 'wsock.zig' },
       { p: 'desk/nap', c: 'DK-22', t: 'Nap — alert-free sleep + heartbeat clock for desk threads', s: 'nap.zig' },
       { p: 'desk/updater', c: 'DK-23', t: 'Release updater — verified downloads, staged replacement and restart', s: 'updater.zig' },
-      { p: 'desk/tots', c: 'DK-24', t: 'Tater-tots — roster rows, event tail and scratchpad for the Tater-tots tab', s: 'tots.zig' }
+      { p: 'desk/tots', c: 'DK-24', t: 'Tater-tots — roster rows, event tail and scratchpad for the Taters tab', s: 'tots.zig' }
     ]}
   ];
 

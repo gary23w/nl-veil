@@ -61,3 +61,5 @@ ESTABLISHED is a depth-first walk of the shortest-path tree with the nearest chi
 Tests build a three-round span (a read that mattered, a read that did not, a failed run, a fix, a frontier) and pin: results hang off their issuing step and steps depend strongly on what they reused; the critical chain follows reads rather than the bare thread and excludes the never-used read; a superseded read is off the protect set; the unfolding carries NEXT, ON DISK, the failure and the chain in tree order, each once, under budget, and nothing from nothing.
 
 See [engine](#doc=worker/chat/engine) for the two sites, [belt](#doc=worker/chat/belt) for the other tree in this directory (the tool map is the same shape with different leaves), and [context](#doc=worker/chat/context) for the fold the net now runs ahead of.
+
+The same algorithm runs in the tater-tots' runtime (`cloud/tot.js`: `loopGraph`, `criticalChain`, `unfold`, `netFold`, `netOf`), where it folds a step's do loop past its window and is the carry between iterations; see [cf_tot](#doc=config/cf_tot).
