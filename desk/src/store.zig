@@ -23,7 +23,7 @@ const SpinLock = struct {
 
 pub const Tab = enum { dashboard, chat, swarm, tots, hub, scheduled, settings }; // deploy = the Swarm tab's inner form
 
-pub const CmdKind = enum { none, select, say, set_goal, stop, deploy, delete, open_folder, refresh_now, open_file, sched_create, sched_update, sched_toggle, sched_delete, sched_run, oauth_cf_login, oauth_cf_logout, open_url, builtin_pull, builtin_cancel, builtin_import, builtin_remove, builtin_check, dataset_start, dataset_stop, cf_tunnel_on, cf_tunnel_off, lineage_accept, lineage_reject, tot_select, tot_deploy, tot_command, tot_config, tot_delete, tot_pad_write, tot_open_folder, tot_pad_clear, tot_limit, tot_select_run, tot_delete_run, garrett_deploy, garrett_remove };
+pub const CmdKind = enum { none, select, say, set_goal, stop, deploy, delete, open_folder, refresh_now, open_file, sched_create, sched_update, sched_toggle, sched_delete, sched_run, oauth_cf_login, oauth_cf_logout, open_url, builtin_pull, builtin_cancel, builtin_import, builtin_remove, builtin_check, dataset_start, dataset_stop, cf_tunnel_on, cf_tunnel_off, lineage_accept, lineage_reject, tot_select, tot_deploy, tot_command, tot_config, tot_delete, tot_pad_write, tot_open_folder, tot_pad_clear, tot_limit, tot_select_run, tot_delete_run, garrett_deploy, garrett_connect, garrett_remove };
 
 /// A UI→poller command. Fixed-size, copied by value into the ring, so no cross-thread allocation.
 pub const Command = struct {
@@ -229,6 +229,21 @@ test "a delete's mark and its command enter the Store together, or neither does"
     s.pushDelete("u1/aaaa", true); // already marked
     try std.testing.expect(s.popCmd() == null);
     try std.testing.expectEqual(@as(usize, 1), s.deleting.n);
+}
+
+test "a Garrett key is not dropped silently and its queued copy is cleared after delivery" {
+    const a = std.testing.allocator;
+    const s = try a.create(Store);
+    defer a.destroy(s);
+    s.* = .{};
+    const key = "gtt_" ++ "a" ** 64;
+    try std.testing.expect(s.pushGarrettConnect(key));
+    const c = s.popCmd().?;
+    try std.testing.expectEqualStrings(key, c.textStr());
+    try std.testing.expectEqual(CmdKind.garrett_connect, c.kind);
+    for (s.cmds[0].text) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+    for (0..CMD_RING - 1) |_| s.pushCmd(mkCmd(.refresh_now, "", ""));
+    try std.testing.expect(!s.pushGarrettConnect(key));
 }
 
 /// A poller→UI notification. Shown as an in-app toast AND handed to the OS tray (tray.zig).
@@ -1173,6 +1188,8 @@ pub const Store = struct {
     // --- Agent Garrett (the poller writes from GET /api/v1/tots/garrett while connected; the Settings card, the
     // tot and swarm deploy forms and the chat composer read): deployed or not, its address, a deploy or removal in
     // flight, and the last refusal in the server's words.
+    garrett_managed: bool = false,
+    garrett_tools: usize = 0,
     garrett_seen: bool = false,
     garrett_deployed: bool = false,
     garrett_busy: bool = false,
@@ -1335,11 +1352,18 @@ pub const Store = struct {
     }
 
     /// Poller thread: pop the next command, or null. Caller must hold no lock (this takes it).
+    pub fn pushGarrettConnect(s: *Store, key: []const u8) bool {
+        s.lock();
+        defer s.unlock();
+        return s.pushCmdLocked(mkCmd(.garrett_connect, "", key));
+    }
+
     pub fn popCmd(s: *Store) ?Command {
         s.lock();
         defer s.unlock();
         if (s.cmd_tail == s.cmd_head) return null;
         const c = s.cmds[s.cmd_tail];
+        if (c.kind == .garrett_connect) std.crypto.secureZero(u8, &s.cmds[s.cmd_tail].text);
         s.cmd_tail = (s.cmd_tail + 1) % CMD_RING;
         log.trace("store.popCmd kind={t} id={s}", .{ c.kind, c.idStr() });
         return c;

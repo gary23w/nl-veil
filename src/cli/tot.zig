@@ -373,26 +373,21 @@ fn verify(ctx: *Ctx, a: std.mem.Allocator, args: []const []const u8) u8 {
 
 /// `veil --tater garrett [launch|rm|password]`: Agent Garrett, as the server sees it.
 fn garrett(ctx: *Ctx, a: std.mem.Allocator, args: []const []const u8) u8 {
-    const G = struct { ok: bool = false, err: []const u8 = "", launched: bool = false, url: []const u8 = "", mcp_url: []const u8 = "", status: []const u8 = "", @"error": []const u8 = "", asked_by: []const u8 = "", password: []const u8 = "", sources: []const u8 = "" };
+    const G = struct { ok: bool = false, managed: bool = false, tools: usize = 0, err: []const u8 = "", launched: bool = false, url: []const u8 = "", mcp_url: []const u8 = "", status: []const u8 = "", @"error": []const u8 = "", asked_by: []const u8 = "", password: []const u8 = "", sources: []const u8 = "" };
     const sub = if (args.len > 0) args[0] else "";
     if (std.mem.eql(u8, sub, "launch")) {
-        out("launching Agent Garrett into your Cloudflare account (its modules come from github.com/gary23w/garrettstimpson.ca; this can take a minute)...\n", .{});
-        const resp = cli.call(ctx, "POST", "/api/v1/tots/garrett", "{}", 180, true) catch return cli.unreachable_msg(ctx);
-        defer if (resp.body.len > 0) ctx.gpa.free(resp.body);
-        if (resp.status != 200) return fail("--tater garrett launch", resp.status, resp.body, a);
-        const r = std.json.parseFromSliceLeaky(G, a, resp.body, .{ .ignore_unknown_fields = true }) catch G{};
-        out("Agent Garrett is up at {s}\nits MCP endpoint is {s}: a chat (`veil chat --garrett`, the desk's box), a swarm deployed with --garrett and a tater-tot deployed or set with --garrett reach it from now on (garrett_tools lists its tools).\nits chat UI is locked; `veil --tater garrett password` shows the password.\n", .{ r.url, r.mcp_url });
+        out("Set up Agent Garrett at https://agent.garrettstimpson.ca/dashboard, then connect the generated API key in desktop Settings > Agent Garrett. NL-Veil discovers the authenticated tools automatically.\n", .{});
         return 0;
     }
     if (std.mem.eql(u8, sub, "rm") or std.mem.eql(u8, sub, "remove")) {
         const resp = cli.call(ctx, "DELETE", "/api/v1/tots/garrett", null, 60, true) catch return cli.unreachable_msg(ctx);
         defer if (resp.body.len > 0) ctx.gpa.free(resp.body);
         if (resp.status != 200) return fail("--tater garrett rm", resp.status, resp.body, a);
-        out("Agent Garrett is removed from the account; chats, swarms and tater-tots lose garrett and garrett_tools\n", .{});
+        out("Disconnected from NL-Veil. The cloud agent, saved memory, API keys, and subscription remain in Garrett; check the dashboard to manage or revoke them.\n", .{});
         return 0;
     }
     if (sub.len > 0 and !std.mem.eql(u8, sub, "password") and !std.mem.eql(u8, sub, "status")) {
-        out("usage: veil --tater garrett              where it is, what the runtime says\n       veil --tater garrett launch       deploy it into your Cloudflare account (no tater-tot needed)\n       veil --tater garrett password     the password locking its chat UI\n       veil --tater garrett rm           remove it\n", .{});
+        out("usage: veil --tater garrett              where it is, what the runtime says\n       veil --tater garrett launch       show dashboard setup instructions\n       veil --tater garrett password     the password locking its chat UI\n       veil --tater garrett rm           remove it\n", .{});
         return 1;
     }
     const reveal = std.mem.eql(u8, sub, "password");
@@ -401,10 +396,14 @@ fn garrett(ctx: *Ctx, a: std.mem.Allocator, args: []const []const u8) u8 {
     if (resp.status != 200) return fail("--tater garrett", resp.status, resp.body, a);
     const r = std.json.parseFromSliceLeaky(G, a, resp.body, .{ .ignore_unknown_fields = true }) catch G{};
     if (!r.launched) {
-        out("Agent Garrett is not deployed. `veil --tater garrett launch` (or Settings > Deploy Agent Garrett in the desk) puts it in your Cloudflare account; a tater-tot deployed with --garrett can ask for it too (garrett_launch).\n", .{});
-        if (std.mem.eql(u8, r.status, "pending")) out("a tater-tot asked ({s}); your veil launches it within a minute while it is running.\n", .{r.asked_by});
+        out("Agent Garrett is not connected. Set up your plan and agent at https://agent.garrettstimpson.ca/dashboard, then connect its API key in desktop Settings > Agent Garrett.\n", .{});
+        if (std.mem.eql(u8, r.status, "pending")) out("a tater-tot asked ({s}); connect your dashboard key to make it available.\n", .{r.asked_by});
         if (std.mem.eql(u8, r.status, "failed")) out("the last attempt failed: {s}\n", .{r.@"error"});
         return 1;
+    }
+    if (r.managed) {
+        out("Agent Garrett: connected through authenticated MCP\nEndpoint: {s}\nTools discovered: {d}\nManage agents, billing, API keys, and saved memory: https://agent.garrettstimpson.ca/dashboard\n", .{ r.mcp_url, r.tools });
+        return 0;
     }
     if (reveal) {
         out("{s}\n", .{r.password});

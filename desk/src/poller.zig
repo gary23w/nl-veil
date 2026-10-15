@@ -152,7 +152,9 @@ pub const Poller = struct {
     fn drainCommands(self: *Poller) void {
         var dbuf: [512]u8 = undefined;
         const dd = self.dataDir(&dbuf);
-        while (self.store.popCmd()) |c| {
+        while (self.store.popCmd()) |command| {
+            var c = command;
+            defer if (c.kind == .garrett_connect) std.crypto.secureZero(u8, &c.text);
             log.trace("poller.drainCommands kind={t} id={s}", .{ c.kind, c.idStr() });
             switch (c.kind) {
                 .none, .refresh_now => {},
@@ -173,8 +175,9 @@ pub const Poller = struct {
                 .oauth_cf_logout => self.doOauthCfLogout(),
                 .cf_tunnel_on => self.doCfTunnel(true, std.mem.eql(u8, c.idStr(), "domain"), c.textStr()),
                 .cf_tunnel_off => self.doCfTunnel(false, false, ""),
-                .garrett_deploy => self.doGarrett(true),
-                .garrett_remove => self.doGarrett(false),
+                .garrett_deploy => self.openUrl("https://agent.garrettstimpson.ca/dashboard"),
+                .garrett_connect => self.doGarrett(c.textStr()),
+                .garrett_remove => self.doGarrett(null),
                 // a "live ↗" on a Cloudflare deploy chip: the URL rides Command.text, the browser opens it
                 .open_url => if (std.mem.startsWith(u8, c.textStr(), "https://")) self.openUrl(c.textStr()),
                 .builtin_pull => self.doBuiltinVerb(.pull),
@@ -779,6 +782,9 @@ pub const Poller = struct {
                     self.last_tun_s = now_s;
                     self.refreshCfTunnel();
                 }
+            }
+            // Dashboard keys work without a separate Cloudflare login in NL-Veil.
+            if (online) {
                 // Security tools snapshot — what the Settings card and every "use Security tools" box wait on. 20s;
                 // 3s while a deploy or removal is in flight, so the card moves as soon as the server answers.
                 const gar_busy = blk: {
@@ -1909,7 +1915,7 @@ pub const Poller = struct {
     }
 
     /// GET /api/v1/tots/garrett → the store's Security tools snapshot: deployed or not, its address, the last
-    /// refusal. A login the route refuses (it is admin-gated, like the tots) reads as "not deployed" and is not
+    /// refusal. An unauthorized login reads as disconnected and is not
     /// asked again for a minute.
     fn refreshGarrett(self: *Poller) void {
         var tbuf: [128]u8 = undefined;
@@ -1934,6 +1940,12 @@ pub const Poller = struct {
         defer self.store.unlock();
         self.store.garrett_seen = true;
         self.store.garrett_deployed = deployed;
+        self.store.garrett_managed = std.mem.indexOf(u8, resp.body, "\"managed\":true") != null;
+        const parsed_tools = std.json.parseFromSlice(struct { tools: usize = 0 }, self.gpa, resp.body, .{ .ignore_unknown_fields = true }) catch null;
+        if (parsed_tools) |p| {
+            self.store.garrett_tools = p.value.tools;
+            p.deinit();
+        }
         self.store.garrett_building = std.mem.indexOf(u8, resp.body, "\"runtime_building\":true") != null;
         self.store.garrett_ready = std.mem.indexOf(u8, resp.body, "\"runtime_ready\":true") != null;
         const un = @min(url.len, self.store.garrett_url.len);
@@ -1946,9 +1958,9 @@ pub const Poller = struct {
         }
     }
 
-    /// POST (deploy) or DELETE (remove) /api/v1/tots/garrett. A deploy fetches the agent's modules from its repo
-    /// and uploads them into the account - up to a few minutes - so the card says "deploying..." until it answers.
-    fn doGarrett(self: *Poller, deploy: bool) void {
+    /// Connect a dashboard key, or disconnect without removing the cloud agent.
+    fn doGarrett(self: *Poller, key: ?[]const u8) void {
+        const deploy = key != null;
         {
             self.store.lock();
             defer self.store.unlock();
@@ -1964,7 +1976,7 @@ pub const Poller = struct {
         }
         var tbuf: [128]u8 = undefined;
         const tok = self.tokenSnap(&tbuf);
-        const resp = (if (deploy) netcli.garrettDeploy(self.io, self.gpa, self.port(), tok) else netcli.garrettRemove(self.io, self.gpa, self.port(), tok)) orelse {
+        const resp = (if (deploy) netcli.garrettConnect(self.io, self.gpa, self.port(), tok, key.?) else netcli.garrettRemove(self.io, self.gpa, self.port(), tok)) orelse {
             self.store.pushNotif("Security tools", "server unreachable - is it running?", 2);
             return;
         };
@@ -1972,8 +1984,8 @@ pub const Poller = struct {
         if (resp.status < 200 or resp.status >= 300) {
             var eb: [200]u8 = undefined;
             const err = valueForKey(resp.body, "err", &eb);
-            const msg: []const u8 = if (err.len > 0) err else if (deploy) "the server could not deploy it" else "the server could not remove it";
-            self.store.pushNotif(if (deploy) "Security tools not deployed" else "Security tools not removed", msg, 2);
+            const msg: []const u8 = if (err.len > 0) err else if (deploy) "The connection could not be verified." else "The connection could not be disconnected.";
+            self.store.pushNotif(if (deploy) "Garrett connection needs attention" else "Garrett disconnect needs attention", msg, 2);
             self.store.lock();
             defer self.store.unlock();
             const en = @min(msg.len, self.store.garrett_err.len);
@@ -1988,11 +2000,17 @@ pub const Poller = struct {
             defer self.store.unlock();
             self.store.garrett_seen = true;
             self.store.garrett_deployed = deploy;
+            self.store.garrett_managed = true;
+            self.store.settings.use_garrett = deploy;
+
             const un = if (deploy) @min(url.len, self.store.garrett_url.len) else 0;
             @memcpy(self.store.garrett_url[0..un], url[0..un]);
             self.store.garrett_url_len = un;
         }
-        self.store.pushNotif(if (deploy) "Security tools deployed" else "Security tools removed", if (deploy and url.len > 0) url else if (deploy) "available automatically in chat, swarms and tater-tots" else "chats, swarms and tater-tots lose its tools", 1);
+        self.store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
+        var wb: [200]u8 = undefined;
+        const warning = valueForKey(resp.body, "warning", &wb);
+        self.store.pushNotif(if (deploy) "Agent Garrett connected" else "Garrett disconnected", if (warning.len > 0) warning else if (deploy) "Tools discovered. Agent Garrett is on for chat; enable it on each swarm or tater-tot." else "The cloud agent, billing, memory, and API keys are retained in Garrett.", if (warning.len > 0) 2 else 1);
     }
 
     fn notifyTransitions(self: *Poller, online: bool, swarms: []const scan.SwarmSummary, sel: []const u8, sel_metrics: scan.Metrics) void {

@@ -310,14 +310,22 @@ pub fn garrettStatus(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u
     return httpReq(io, gpa, "GET", port, "/api/v1/tots/garrett", token, null, 20);
 }
 
-/// POST /api/v1/tots/garrett — deploy it into the user's Cloudflare account: the server reads the agent's modules
-/// from its repo and uploads them as a Worker (a handful of calls: up to a few minutes). The reply is the result.
+/// POST /api/v1/tots/garrett verifies and securely saves a dashboard-generated key.
+pub fn garrettConnect(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8, key: []const u8) ?Resp {
+    const body = std.json.Stringify.valueAlloc(gpa, .{ .api_key = key }, .{}) catch return null;
+    defer {
+        std.crypto.secureZero(u8, body);
+        gpa.free(body);
+    }
+    return httpReq(io, gpa, "POST", port, "/api/v1/tots/garrett", token, body, 140);
+}
+
 pub fn garrettDeploy(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8) ?Resp {
     log.trace("netcli.garrettDeploy port={d}", .{port});
     return httpReq(io, gpa, "POST", port, "/api/v1/tots/garrett", token, "{}", 240);
 }
 
-/// DELETE /api/v1/tots/garrett — remove it (its Worker, and the tots' pointers at it when they are there).
+/// DELETE disconnects this client and clears tot pointers; cloud agents are retained.
 pub fn garrettRemove(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8) ?Resp {
     log.trace("netcli.garrettRemove port={d}", .{port});
     return httpReq(io, gpa, "DELETE", port, "/api/v1/tots/garrett", token, null, 60);

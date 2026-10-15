@@ -1,23 +1,27 @@
 # Agent Garrett security tools
 
-NL-Veil is the local harness for Agent Garrett. It connects your chat, swarm or tater-tot to a security runtime deployed in your Cloudflare account. The v1.1.12 deployment enables 166 MCP tools: 94 existing security tools and 72 Gary tools for cloud commands, files, tasks, shells and the runtime's other capabilities.
+NL-Veil connects your chat, swarm, or tater-tot to the Agent Garrett service through authenticated MCP. Garrett manages the subscription, agent deployment, API keys, persistent cloud memory, and automatic backend updates.
 
-## Deploy once, choose where to use it
+## Connect once, choose where to use it
 
-Open **Settings → Models**, connect Cloudflare, and choose **Deploy security tools**. Deployment creates the public `veil-garrett` Worker, private `veil-garrett-gary` Worker, dedicated Gary Container and `veil-garrett-gary-state` R2 bucket. Containers and R2 must be available on the account. Reconnect an existing Cloudflare login once to authorize Containers access.
+Open **Settings → Agent Garrett**, then **Open Garrett dashboard**. Sign in with Cloudflare, activate Trial or Agent, and deploy your agent. Generate an API key in the dashboard. Return to NL-Veil, choose **Paste key / MCP config**, and **Connect Agent Garrett**. You can paste either the generated key or the dashboard's copied MCP configuration.
 
-The edge Worker handles the chat and MCP endpoint. Gary's Linux execution runs in Cloudflare Containers. Source, preparation snapshots and runtime state are stored in R2. Cloudflare performs the initial build when Gary is first requested. No Docker on your computer and no separate Linux host are required. Building can take several minutes; the Settings button shows an animated loading bar throughout upload and preparation.
+NL-Veil supplies the service endpoint automatically, checks authenticated MCP initialization, and discovers the available tools. You do not need to deploy backend source, provide a Cloudflare API token to NL-Veil, or configure individual tools. Garrett's dashboard handles any Cloudflare account setup needed for the deployment.
+
+The key is encrypted with the local server's key and bound to your NL-Veil user account. It is never returned by the status API or saved in desktop preferences. An invalid replacement key leaves the previous connection intact. Existing legacy connections remain usable until you choose to replace or disconnect them.
+
+Trial includes MCP and backend API access. Autonomous website protection, identity monitoring, follow-up, and email alerts require paid Agent or an eligible admin-granted plan. Those dashboard services continue while NL-Veil is closed.
 
 Choose which feature receives the toolset:
 
 | Feature | Enable it | Change it later |
 | --- | --- | --- |
-| Chat | Click **Agent Garrett: off** beside auto-loop | Click the same label to switch it off |
+| Chat | Enabled after connecting; click **Agent Garrett: on/off** beside auto-loop | Click the same label to switch it off |
 | Swarm | Check **Agent Garrett** in the deploy form | The choice applies to that deployed swarm |
 | Tater-tot | Check **Agent Garrett** in the deploy form | Send `/garrett on` or `/garrett off` |
 | CLI chat | Run `veil chat --garrett` | Start a chat without that flag |
 
-Tools appear individually as `security_<upstream_name>`, with typed argument schemas. For example, `security_gary_bash` accepts a command, a boolean background flag and a numeric timeout. `garrett_tools` lists the current catalogue with schemas; `garrett` remains a compatibility wrapper accepting a tool name and an argument object. Discovery can show the edge tools first while Gary is still building, then the full catalogue once Gary is ready.
+Tools appear individually as `security_<upstream_name>`, with typed argument schemas. For example, `security_gary_bash` accepts a command, a boolean background flag and a numeric timeout. `garrett_tools` lists the current catalogue with schemas; `garrett` remains a compatibility wrapper accepting a tool name and an argument object. The available catalogue is discovered from your authenticated service rather than a hard-coded tool count.
 
 ## Protect yourself through the local harness
 
@@ -43,11 +47,13 @@ The deployment enables active and Gary tools. Its tool catalogue is not a statem
 
 Turn Agent Garrett on in chat and ask: “Call `security_gary_bash` with `printf 'hello from Gary\n'; uname -s`, then show the exact output.” The command should run in the cloud Container and report `Linux`. Use `security_gary_shell_list` to inspect cloud shell sessions. `security_ioc_extract` can be checked with a synthetic domain and documentation address without contacting a target.
 
-MCP credentials stay on the server for desktop and CLI chat calls. The MCP endpoint requires its bearer token, and NL-Veil resolves credentials for the authenticated user's own deployment. Remove stops the Container and deletes the two Workers; R2 source and snapshots remain for recovery. If Cloudflare refuses removal, NL-Veil reports the failure and keeps deployment state so it can be retried.
+MCP credentials stay on the NL-Veil server for desktop and CLI chat calls. Each request carries your Garrett Bearer API key. Existing cloud tater-tots receive the connection through Cloudflare secrets; a failed sync is shown in Settings and retried when their runtime is next mirrored. Their per-tot opt-in stays unchanged.
+
+**Open live agent logs** takes you to Garrett's dashboard activity view. **Disconnect from Veil** disables the local connection and clears its tater-tot pointers when Cloudflare is available. It does not delete the cloud agent, cancel billing, revoke the dashboard API key, or erase memory. If cloud sync is pending, reconnect Cloudflare or revoke the key in Garrett to stop cloud use immediately. Manage agent deletion, key revocation, billing, and protection settings in Garrett's dashboard.
 
 ## Licenses and corresponding source
 
-NL-Veil code uses its [MIT license](https://github.com/gary23w/nl-veil/blob/v1.1.12/LICENSE). Gary includes modified [ARTEX](https://github.com/Hinln/ARTEX) source under [AGPL-3.0](https://github.com/gary23w/nl-veil/blob/v1.1.12/cloud/GARY-LICENSE). The [Gary notice](https://github.com/gary23w/nl-veil/blob/v1.1.12/cloud/GARY-NOTICE), [source archive](https://github.com/gary23w/nl-veil/raw/refs/tags/v1.1.12/cloud/gary-source.tar.gz), and [Cloudflare build sources](https://github.com/gary23w/nl-veil/tree/v1.1.12/cloud) are public and included in every full release bundle. Dependencies retain their own licenses.
+NL-Veil code uses its [MIT license](https://github.com/gary23w/nl-veil/blob/v1.1.12/LICENSE). Legacy v1.1.12 self-hosted Gary bundles include modified [ARTEX](https://github.com/Hinln/ARTEX) source under [AGPL-3.0](https://github.com/gary23w/nl-veil/blob/v1.1.12/cloud/GARY-LICENSE). The [Gary notice](https://github.com/gary23w/nl-veil/blob/v1.1.12/cloud/GARY-NOTICE), [source archive](https://github.com/gary23w/nl-veil/raw/refs/tags/v1.1.12/cloud/gary-source.tar.gz), and [Cloudflare build sources](https://github.com/gary23w/nl-veil/tree/v1.1.12/cloud) remain available with that historical release. Current dashboard onboarding connects to the managed service. Dependencies retain their own licenses.
 
 ## Tater-tot schema discovery
 
