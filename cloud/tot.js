@@ -2937,7 +2937,8 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
       if (!cur || cur.id !== g.id || cur.status !== "active" || cur.forever) return 5;
     }
     const step = checkDone ? "Verify the entire goal with tools: inspect the requested artifact or source confirmation, compare it with every success criterion, and report any remaining gap. DONE is a claim until this check succeeds." : clip(pick, 1200);
-    await this.emit("pick", step, { i: g.iteration + 1 });
+    // `map`: the pick saw the belt as a map (TOOL MAP block); `net`: characters of the last iteration's net it carried
+    await this.emit("pick", step, { i: g.iteration + 1, map: !!shape, net: ((await this.store.get("last_work"))?.net ?? "").length });
 
     // DO. The belt as a map (beltFor): the step's own words open the best group before the model moves, the
     // previous step's open set is restored, and what the step calls is learned for the next pre-walk.
@@ -3086,6 +3087,7 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
       if (folded !== messages) {
         messages = folded;
         if (loop) loop.messages = messages;
+        await this.emit("status", `${mind ? mind + " " : ""}the step's earlier rounds folded into a net (Gary's 4tope, ${messages[2].content.length} characters laid out from where the loop stands); the newest ${Math.floor((messages.length - 3) / 2)} round(s) stay whole`);
       }
       const reply = await this.ask(cfg, messages, 4000);
       walk?.tick();
