@@ -26,6 +26,7 @@ that temporary state before the local fallback takes over.
 - `Chat.cmdSend` — entry for a user message: POSTs it as a turn to the server chat brain, arms the auto-loop tier for the conversation
 - `Chat.cmdStopCast` / control helpers — post `{"op":"stop"}` / `{"op":"steer",…}` to the running turn's `/control`
 - conversation lifecycle + message-render primitives that mirror the server's `messages.jsonl` / `events.jsonl` shape
+- `loadSettings` / `saveSettings` — the `<data>/.veil-desk/settings.json` round trip, run first on the chat thread. While the launcher's pin holds (`Settings.target_pinned`: an attaching desk, seeded by main.zig's `AttachTarget` with the port of the veil that holds the data dir) the loader leaves port and host alone, and `saveTarget` has the saver write the file's own target back (the defaults where it names none), so a theme change made while attached cannot leave the next standalone start pointed at a server that is gone
 
 ## Dependencies
 

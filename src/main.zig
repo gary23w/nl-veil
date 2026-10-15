@@ -528,7 +528,9 @@ pub fn main(init: std.process.Init) !void {
             // The desk is a client and needs no server of its own: run it against the one already serving this dir
             // and leave when it closes. That server is not ours to stop; nothing here bound a port or wrote the dir.
             log.info("{s} is already served by veil pid {d} on {s}:{d} — opening the desk as a client of that server", .{ paths.data, h.pid, h.bindStr(), h.port });
-            if (HAS_GUI) desk.runApp(paths.data) catch |e| {
+            // The desk drives the holder, not whatever port its settings.json names (desk AttachTarget). A record with no
+            // port (a holder between its open and its write, a garbled file) pins nothing: the desk falls back to its own.
+            if (HAS_GUI) desk.runApp(paths.data, if (h.port != 0) desk.AttachTarget{ .port = h.port } else null) catch |e| {
                 log.err("desktop GUI exited with an error: {t} — the server at pid {d} keeps running; open http://127.0.0.1:{d} in a browser", .{ e, h.pid, h.port });
                 return std.process.exit(1);
             };
@@ -990,7 +992,7 @@ pub fn main(init: std.process.Init) !void {
     // "server offline" flash on every launch. Bounded and best-effort: never block the window on the backend.
     awaitServer(gpa, io, port, 3000);
 
-    desk.runApp(paths.data) catch |e| {
+    desk.runApp(paths.data, null) catch |e| {
         // NO WINDOW is not a reason to take the server down with it — the server is the useful half, and
         // the web UI is right there. Degrade instead of exiting silently (see serveWithoutDesk).
         if (e == error.WindowUnavailable) serveWithoutDesk(io, port, paths.data);

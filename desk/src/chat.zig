@@ -5180,24 +5180,14 @@ pub const Chat = struct {
             think_cfg = s.chat_think;
             prompt_cfg = s.chat_prompt;
         }
-        var port: u16 = 8787;
-        var host: [64]u8 = undefined;
-        var host_n: usize = 0;
-        {
-            self.store.lock();
-            defer self.store.unlock();
-            port = self.store.settings.port;
-            const h = self.store.settings.hostStr();
-            host_n = @min(h.len, host.len);
-            @memcpy(host[0..host_n], h[0..host_n]);
-        }
+        const target = self.saveTarget(dd);
         var jb: std.ArrayListUnmanaged(u8) = .empty;
         defer jb.deinit(self.gpa);
         jb.appendSlice(self.gpa, "{\"kind\":") catch return;
-        jb.print(self.gpa, "{d},\"port\":{d},\"byok\":{d},\"theme\":{d},\"theme_id\":\"", .{ kind, port, byok, theme }) catch return;
+        jb.print(self.gpa, "{d},\"port\":{d},\"byok\":{d},\"theme\":{d},\"theme_id\":\"", .{ kind, target.port, byok, theme }) catch return;
         escJson(&jb, self.gpa, theme_id[0..theme_id_n]);
         jb.appendSlice(self.gpa, "\",\"host\":\"") catch return;
-        escJson(&jb, self.gpa, host[0..host_n]);
+        escJson(&jb, self.gpa, target.hostStr());
         jb.appendSlice(self.gpa, "\",\"base\":\"") catch return;
         escJson(&jb, self.gpa, base[0..base_n]);
         jb.appendSlice(self.gpa, "\",\"model\":\"") catch return;
@@ -5249,6 +5239,50 @@ pub const Chat = struct {
         Io.Dir.cwd().writeFile(self.io, .{ .sub_path = path, .data = body }) catch {};
     }
 
+    /// The server target a settings save writes: 8787 on the loopback until read otherwise.
+    const SaveTarget = struct {
+        port: u16 = 8787,
+        host: [64]u8 = undefined,
+        host_n: usize = 0,
+        fn hostStr(t: *const SaveTarget) []const u8 {
+            return t.host[0..t.host_n];
+        }
+    };
+
+    /// What saveSettings persists as the server target: the live one, except while the launcher's pin holds (an
+    /// attaching desk, main.zig AttachTarget). Then it is the target the file already names, or the defaults where it
+    /// names none, so a theme change made while attached to a veil on another port cannot leave the next standalone
+    /// start pointed at a server that is gone. The Settings tab's Apply ends the pin: a target the user typed persists.
+    fn saveTarget(self: *Chat, dd: []const u8) SaveTarget {
+        var t: SaveTarget = .{};
+        var pinned = false;
+        {
+            self.store.lock();
+            defer self.store.unlock();
+            t.port = self.store.settings.port;
+            const h = self.store.settings.hostStr();
+            t.host_n = @min(h.len, t.host.len);
+            @memcpy(t.host[0..t.host_n], h[0..t.host_n]);
+            pinned = self.store.settings.target_pinned;
+        }
+        if (!pinned) return t;
+        t = .{};
+        var pb: [700]u8 = undefined;
+        const path = std.fmt.bufPrint(&pb, "{s}/.veil-desk/settings.json", .{dd}) catch return t;
+        const prev = Io.Dir.cwd().readFileAlloc(self.io, path, self.gpa, .limited(8 << 10)) catch return t;
+        defer self.gpa.free(prev);
+        // the same two keys loadSettings reads, under the same bounds
+        if (jInt(prev, "port")) |v| {
+            if (v >= 1 and v <= 65535) t.port = @intCast(v);
+        }
+        if (llm.jsonUnescape(self.gpa, prev, "host")) |h| {
+            defer self.gpa.free(h);
+            t.host_n = @min(h.len, t.host.len);
+            @memcpy(t.host[0..t.host_n], h[0..t.host_n]);
+        }
+        return t;
+    }
+
     fn loadSettings(self: *Chat, dd: []const u8) void {
         // Runs LAST (registered before the body's lock/defer pair), on every path out — including the
         // no-settings-file early return of a fresh install: "loaded" means "the load pass finished",
@@ -5266,15 +5300,19 @@ pub const Chat = struct {
         defer self.store.unlock();
         const s = &self.store.settings;
         // server host + port (absent host = local loopback, absent port = 8787): lets a desk instance
-        // target a non-default or REMOTE veil server without a rebuild.
-        if (jInt(data, "port")) |v| {
-            if (v >= 1 and v <= 65535) s.port = @intCast(v);
-        }
-        if (llm.jsonUnescape(self.gpa, data, "host")) |h| {
-            defer self.gpa.free(h);
-            const n = @min(h.len, s.host.len);
-            @memcpy(s.host[0..n], h[0..n]);
-            s.host_len = @intCast(n);
+        // target a non-default or REMOTE veil server without a rebuild. Not while the launcher's pin holds: an
+        // attaching desk drives the veil that holds its data dir (main.zig AttachTarget), and the file's target
+        // would point it at a server that is not that one — "server down" was the whole desk.
+        if (!s.target_pinned) {
+            if (jInt(data, "port")) |v| {
+                if (v >= 1 and v <= 65535) s.port = @intCast(v);
+            }
+            if (llm.jsonUnescape(self.gpa, data, "host")) |h| {
+                defer self.gpa.free(h);
+                const n = @min(h.len, s.host.len);
+                @memcpy(s.host[0..n], h[0..n]);
+                s.host_len = @intCast(n);
+            }
         }
         if (jInt(data, "kind")) |v| s.chat_kind = @intCast(@max(0, @min(v, 2)));
         if (jInt(data, "byok")) |v| s.chat_byok = @intCast(@max(0, @min(v, @as(i64, @intCast(catalog.providers.len - 1)))));
@@ -13993,6 +14031,62 @@ test "jsonStrInto unescapes; extractToolResult picks the right field" {
     // list_swarms has no string field -> raw body handed back
     const raw = "{\"ok\":true,\"tool\":\"list_swarms\",\"swarms\":[]}";
     try std.testing.expectEqualStrings(raw, extractToolResult(raw, &out));
+}
+
+test "an attaching desk keeps the launcher's port and loopback host through a settings.json naming another server, and persists the file's target rather than its own until the user types one" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{ .environ = llm.osEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dd = "zig-desk-attach-target-tmp";
+    Io.Dir.cwd().deleteTree(io, dd) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dd) catch {};
+    _ = Io.Dir.cwd().createDirPathStatus(io, dd ++ "/.veil-desk", .default_dir) catch {};
+    // the persisted target: a remote veil on another port, beside a setting the pin must not touch
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = dd ++ "/.veil-desk/settings.json", .data = "{\"kind\":0,\"port\":9100,\"theme\":0,\"host\":\"10.0.0.5\"}" });
+
+    var store = std.testing.allocator.create(Store) catch unreachable;
+    defer std.testing.allocator.destroy(store);
+    store.* = .{};
+    @memcpy(store.settings.data_dir[0..dd.len], dd);
+    store.settings.data_dir_len = dd.len;
+    var chat = std.testing.allocator.create(Chat) catch unreachable;
+    defer std.testing.allocator.destroy(chat);
+    chat.* = .{ .io = io, .gpa = std.testing.allocator, .store = store };
+
+    // unpinned (a standalone desk, the one-process app): the file's target wins, as it always has
+    chat.loadSettings(dd);
+    try std.testing.expect(store.settings_loaded);
+    try std.testing.expectEqual(@as(u16, 9100), store.settings.port);
+    try std.testing.expectEqualStrings("10.0.0.5", store.settings.hostStr());
+    try std.testing.expectEqual(@as(u8, 0), store.settings.theme);
+
+    // pinned (an attaching desk: main.zig seeds the holder's port before the chat thread starts): the holder's port
+    // on the loopback survives the load, and the rest of the file still applies
+    store.settings.pinTarget(8800, "");
+    store.settings.theme = 1;
+    chat.loadSettings(dd);
+    try std.testing.expectEqual(@as(u16, 8800), store.settings.port);
+    try std.testing.expectEqualStrings("", store.settings.hostStr());
+    try std.testing.expectEqual(@as(u8, 0), store.settings.theme);
+
+    // a save while pinned persists the FILE's target, not the pinned one: the next standalone start keeps its server
+    const while_pinned = chat.saveTarget(dd);
+    try std.testing.expectEqual(@as(u16, 9100), while_pinned.port);
+    try std.testing.expectEqualStrings("10.0.0.5", while_pinned.hostStr());
+    try std.testing.expectEqual(@as(u16, 8800), store.settings.port); // and the live target is untouched
+
+    // the user types a target in the Settings tab: the pin ends (main.zig's Apply) and what they typed persists
+    store.settings.target_pinned = false;
+    const typed = chat.saveTarget(dd);
+    try std.testing.expectEqual(@as(u16, 8800), typed.port);
+    try std.testing.expectEqualStrings("", typed.hostStr());
+
+    // pinned with no file at all (a first run): the defaults loadSettings would have used, not the pinned server
+    store.settings.target_pinned = true;
+    Io.Dir.cwd().deleteFile(io, dd ++ "/.veil-desk/settings.json") catch {};
+    const fresh = chat.saveTarget(dd);
+    try std.testing.expectEqual(@as(u16, 8787), fresh.port);
+    try std.testing.expectEqualStrings("", fresh.hostStr());
 }
 
 test "jBool reads a bare true/false and reports MISSING as null, not false" {

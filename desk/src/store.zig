@@ -289,6 +289,12 @@ pub const Settings = struct {
     // at a remote veil. Persisted with the settings.
     host: [64]u8 = [_]u8{0} ** 64,
     host_len: u8 = 0,
+    // The server target was pinned for this run by the launcher (main.zig AttachTarget): src/main.zig found the data
+    // dir already served by another veil and handed that server's port down, so this desk drives THAT server,
+    // whatever a persisted settings.json names. While set, the chat thread's loader leaves port and host alone and
+    // its saver writes the file's own target back rather than this one. The Settings tab's Apply clears it: a
+    // target the user typed is theirs to persist. Never written to settings.json.
+    target_pinned: bool = false,
     token: [128]u8 = [_]u8{0} ** 128,
     token_len: u8 = 0,
     token_manual: bool = false, // user pasted+saved a token → don't auto-sync over it
@@ -370,6 +376,16 @@ pub const Settings = struct {
     }
     pub fn hostStr(s: *const Settings) []const u8 {
         return s.host[0..s.host_len];
+    }
+
+    /// Point this desk at `port` on `host` (empty = the local loopback) and pin the target for the run: the
+    /// settings.json loader then keeps its hands off both (chat.zig loadSettings). The launcher's seam, not the UI's.
+    pub fn pinTarget(s: *Settings, port: u16, host: []const u8) void {
+        s.port = port;
+        const n = @min(host.len, s.host.len);
+        @memcpy(s.host[0..n], host[0..n]);
+        s.host_len = @intCast(n);
+        s.target_pinned = true;
     }
     pub fn tokenStr(s: *const Settings) []const u8 {
         return s.token[0..s.token_len];
