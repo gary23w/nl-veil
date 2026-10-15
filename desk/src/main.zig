@@ -1952,7 +1952,7 @@ fn drawTabbar(store: *Store) void {
     const sw: f32 = @floatFromInt(rl.getScreenWidth());
     t.fillRect(0, TITLE_H, @intFromFloat(sw), TAB_H, t.bg_dark);
     t.hline(0, TITLE_H + TAB_H - 1, @intFromFloat(sw), t.border);
-    const labels = [_][:0]const u8{ t.z("Dashboard", .{}), t.z("Chat", .{}), t.z("Tasks", .{}), t.z("Swarm", .{}), t.z("Tater-tots", .{}), t.z("Hub", .{}), t.z("Settings", .{}) };
+    const labels = [_][:0]const u8{ t.z("Dashboard", .{}), t.z("Chat", .{}), t.z("Tasks", .{}), t.z("Swarm", .{}), t.z("Taters", .{}), t.z("Hub", .{}), t.z("Settings", .{}) };
     const tabs = [_]Tab{ .dashboard, .chat, .scheduled, .swarm, .tots, .hub, .settings };
     var x: f32 = t.PAD;
     for (labels, tabs) |lb, tabv| {
@@ -8315,7 +8315,7 @@ fn drawTots(store: *Store, body: t.Rect) void {
     const left_w: f32 = std.math.clamp(body.width * 0.28, 280, 340);
     const lx = body.x + pad;
     var y = body.y + pad;
-    t.text(t.z("Tater-tots", .{}), @intFromFloat(lx), @intFromFloat(y), 20, t.fg);
+    t.text(t.z("Taters", .{}), @intFromFloat(lx), @intFromFloat(y), 20, t.fg);
     t.text(t.z("{d} of {d}", .{ roster.total, roster.max }), @intFromFloat(lx + 104), @intFromFloat(y + 6), 12, t.comment);
     {
         // the limit: one step at a time, held to the server's 1..1000
@@ -8420,7 +8420,7 @@ fn drawTots(store: *Store, body: t.Rect) void {
     }
 
     const can_deploy = online and !denied and seen and roster.connected and roster.total < roster.max and !busy;
-    const dl = if (busy) t.z("deploying...", .{}) else if (roster.total >= roster.max and roster.connected) t.z("at the limit - raise it above", .{}) else t.z("Deploy a tater-tot", .{});
+    const dl = if (busy) t.z("deploying...", .{}) else if (roster.total >= roster.max and roster.connected) t.z("at the limit - raise it above", .{}) else t.z("Deploy a tater", .{});
     if (t.button(.{ .x = lx, .y = y, .width = left_w, .height = t.BTN_MD }, dl, t.blue, can_deploy)) {
         ui.tot_form = true;
         ui.focus = .h_goal;

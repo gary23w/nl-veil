@@ -32,7 +32,7 @@ the chat pane; copying preserves the original text, indentation, and line ending
 Both backtick and tilde fences are supported, including longer fences surrounding
 shorter examples and incomplete blocks during streaming.
 
-The Tater-tots tab lists the account's tater-tots (24 by default; the -/+ beside the count
+The Taters tab lists the account's tater-tots (24 by default; the -/+ beside the count
 raises or lowers the limit, up to 1000; the first is named Gary) in a list that scrolls, with
 PAST RUNS under them - each deployment that ended or failed, kept like a closed chat and
 read from its folder (a deploy that fails opens its run, error and all) - on the
@@ -71,7 +71,7 @@ Tab content uses consistent outer margins. Form labels and controls reserve scal
   visible without forcing the transcript to follow new output.
 - Resize the chat pane while streaming prose, tables, and long code. Change text
   size and font; verify message spacing recalculates.
-- With a Cloudflare login, open Tater-tots, deploy one, and watch its console fill. Each
+- With a Cloudflare login, open Taters, deploy one, and watch its console fill. Each
   event is one line; click one to open its full text and again to close it; press the
   errors chip and check only red rows remain. Scroll up, then press *latest*. Send it a message
   and `/pause`; Grow and Shrink it; open its folder; click Delete once, click

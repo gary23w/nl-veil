@@ -273,7 +273,7 @@ fn call(c: Ctx, args_json: []const u8) []u8 {
         else => return dupe(gpa, USAGE),
     };
     var nb: [40]u8 = undefined;
-    const name = toolName(name_raw, &nb) orelse return dupe(gpa, USAGE);
+    const name = toolName(bareName(name_raw), &nb) orelse return dupe(gpa, USAGE);
     const args_v: ?std.json.Value = obj.get("args") orelse obj.get("arguments");
     const args_str: []u8 = if (args_v) |av| switch (av) {
         .object => std.json.Stringify.valueAlloc(gpa, av, .{}) catch return dupe(gpa, "ERROR: out of memory"),
@@ -287,6 +287,13 @@ fn call(c: Ctx, args_json: []const u8) []u8 {
     const raw = rpc(c, "tools/call", params) orelse return dupe(gpa, "ERROR: Agent Garrett did not answer (Settings shows whether it is still deployed)");
     defer gpa.free(raw);
     return renderCall(gpa, raw);
+}
+
+/// The belt advertises every catalogue tool as `security_<name>`, and a model hands the wrapper that spelling
+/// as readily as the agent's own: both name the same tool.
+pub fn bareName(raw: []const u8) []const u8 {
+    const t = std.mem.trim(u8, raw, " \r\n\t");
+    return if (std.mem.startsWith(u8, t, "security_")) t["security_".len..] else t;
 }
 
 pub fn toolName(raw: []const u8, buf: *[40]u8) ?[]const u8 {
@@ -467,6 +474,10 @@ test "the bearer goes to an https address or the loopback stand-in, nothing else
     try tt.expect(on("https://veil-garrett.acme.workers.dev/mcp", "t") and !on("https://veil-garrett.acme.workers.dev/mcp", "") and !on("", "t"));
     var b: [40]u8 = undefined;
     try tt.expectEqualStrings("nvd_lookup", toolName(" NVD_lookup\n", &b).?);
+    // the belt's spelling names the same tool as the agent's own
+    try tt.expectEqualStrings("nvd_lookup", bareName(" security_nvd_lookup "));
+    try tt.expectEqualStrings("nvd_lookup", bareName("nvd_lookup"));
+    try tt.expectEqualStrings("nvd_lookup", toolName(bareName("security_NVD_lookup"), &b).?);
     try tt.expect(toolName("9lives", &b) == null);
     try tt.expect(toolName("a", &b) == null);
     try tt.expect(toolName("rm -rf", &b) == null);
