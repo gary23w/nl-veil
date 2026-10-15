@@ -37,6 +37,7 @@ const cf_r2 = @import("config/cf_r2.zig");
 const cf_tunnel = @import("config/cf_tunnel.zig");
 const cf_tot = @import("config/cf_tot.zig");
 const server_config = @import("config/server_config.zig");
+const datalock = @import("config/datalock.zig"); // one server per data dir: the lock every serving start takes
 const lan_mod = @import("config/lan.zig");
 const worker = @import("worker/run.zig");
 const tools = @import("worker/tools.zig");
@@ -446,6 +447,17 @@ pub fn main(init: std.process.Init) !void {
         (std.fmt.parseInt(u16, std.mem.trim(u8, v, " \r\n\t"), 10) catch 8787)
     else
         8787;
+    // BIND 0.0.0.0 BY DEFAULT. The veil is meant to be reachable from the other machines around it —
+    // a phone on the sofa, a laptop in the next room — and a loopback default meant every one of those
+    // people had to discover NL_BIND before the web UI existed for them at all. `NL_BIND=127.0.0.1`
+    // still pins it to this machine.
+    //
+    // This flag decides only the listen address. A loopback listener can still be exposed by the
+    // Cloudflare tunnel or another proxy, so the admin password must be safe on either bind.
+    const bind_all = if (init.environ_map.get("NL_BIND")) |v|
+        !(std.mem.eql(u8, v, "127.0.0.1") or std.mem.eql(u8, v, "localhost"))
+    else
+        true;
 
     // Single-process exercise of the Feature 2 browser tools (dispatch + gate + persistent session manager);
     // needs the real io + environ, so it short-circuits here like `worker`/`browser-smoke`.
@@ -497,6 +509,35 @@ pub fn main(init: std.process.Init) !void {
     // before any of the heavy boot below, so the parent exits instantly instead of double-booting the server.
     if (desktop_mode and detachOwnConsole(gpa, io, init.environ_map, cli_sub, cli_args.items)) return std.process.exit(0);
 
+    // ONE SERVER PER DATA DIR. Every start that will serve this dir — server-only, the one-click app, --desk — passes
+    // here: after every CLI verb and smoke has returned, and after the console relaunch (the parent must not hold
+    // the lock its windowless child is about to take). Nothing below this line may run on a dir another veil serves.
+    // Measured 2026-10-14: a second server on one dir took over the port on Windows, shared the vault and the OAuth
+    // token, and answered the first server's client out of the same files while that server's turn was dead. The
+    // lock is the OS's and dies with the holder, so a crashed veil never blocks the next (config/datalock.zig).
+    const bind_name: []const u8 = if (bind_all) "0.0.0.0" else "127.0.0.1";
+    var claim = claimDataDir(io, paths.data, cli_port, bind_name, desktop_mode);
+    switch (claim) {
+        .serve => {},
+        .unguarded => |e| log.warn("data dir lock: could not take {s}/{s} ({t}) — serving WITHOUT the one-server guard; a second veil on this dir will not be refused", .{ paths.data, datalock.FILE_NAME, e }),
+        .refuse => |h| {
+            log.err("not starting: {s} is already served by veil pid {d} on {s}:{d}. Stop that one first, or give this one its own data dir (NEURON_LOOPS_DATA).", .{ paths.data, h.pid, h.bindStr(), h.port });
+            return std.process.exit(EXIT_DATA_DIR_HELD);
+        },
+        .attach => |h| {
+            // The desk is a client and needs no server of its own: run it against the one already serving this dir
+            // and leave when it closes. That server is not ours to stop; nothing here bound a port or wrote the dir.
+            log.info("{s} is already served by veil pid {d} on {s}:{d} — opening the desk as a client of that server", .{ paths.data, h.pid, h.bindStr(), h.port });
+            if (HAS_GUI) desk.runApp(paths.data) catch |e| {
+                log.err("desktop GUI exited with an error: {t} — the server at pid {d} keeps running; open http://127.0.0.1:{d} in a browser", .{ e, h.pid, h.port });
+                return std.process.exit(1);
+            };
+            log.info("desktop window closed — the server at pid {d} is not ours and keeps running", .{h.pid});
+            return std.process.exit(0);
+        },
+    }
+    defer if (claim == .serve) claim.serve.release(io);
+
     // Make local Ollama parallel + right-sized on launch (crucial for cast/chat steering; see tuneOllama).
     tuneOllama(gpa, io, init.environ_map);
 
@@ -516,17 +557,6 @@ pub fn main(init: std.process.Init) !void {
     api_keys.warm() catch |e| log.warn("api_keys warm: {t}", .{e});
     auth.setAdminEmail(init.environ_map.get("NL_ADMIN_EMAIL"));
     auth.warm() catch |e| log.warn("auth warm: {t}", .{e});
-    // BIND 0.0.0.0 BY DEFAULT. The veil is meant to be reachable from the other machines around it —
-    // a phone on the sofa, a laptop in the next room — and a loopback default meant every one of those
-    // people had to discover NL_BIND before the web UI existed for them at all. `NL_BIND=127.0.0.1`
-    // still pins it to this machine.
-    //
-    // This flag decides only the listen address. A loopback listener can still be exposed by the
-    // Cloudflare tunnel or another proxy, so the admin password must be safe on either bind.
-    const bind_all = if (init.environ_map.get("NL_BIND")) |v|
-        !(std.mem.eql(u8, v, "127.0.0.1") or std.mem.eql(u8, v, "localhost"))
-    else
-        true;
     // How many requests one keep-alive socket serves before recycling. See the timeout block below.
     const keepalive_requests: u32 = if (init.environ_map.get("NL_KEEPALIVE_REQUESTS")) |v|
         (std.fmt.parseInt(u32, std.mem.trim(u8, v, " \r\n\t"), 10) catch 200)
@@ -976,6 +1006,7 @@ pub fn main(init: std.process.Init) !void {
     // Then exit outright rather than returning: main's `defer server.deinit()` would race the listen thread
     // that is still unwinding, and the job object (Windows) reaps the descendants on process exit anyway.
     threadSleepMs(io, 150);
+    if (claim == .serve) claim.serve.release(io); // exit() runs no defer: let the data dir go by hand
     std.process.exit(0);
 }
 
@@ -1041,6 +1072,32 @@ fn awaitServer(gpa: std.mem.Allocator, io: std.Io, port: u16, budget_ms: u64) vo
         waited += 50;
     }
     log.warn("HTTP server was not answering on port {d} after {d}ms — opening the window anyway; it will connect when the server comes up", .{ port, budget_ms });
+}
+
+/// A server-only start refused because another veil serves the data dir. sysexits' EX_TEMPFAIL: a service manager
+/// that retries will succeed once the holder is gone, and nothing about this binary or its config is wrong.
+const EXIT_DATA_DIR_HELD: u8 = 75;
+
+/// The one-server rule's verdict for this start (see the claim in main).
+const DataDirClaim = union(enum) {
+    /// Nobody served the dir: this process does, and holds the lock until it exits.
+    serve: datalock.Lock,
+    /// Another veil serves it and this is a desk start: open the desk as that server's client.
+    attach: datalock.Holder,
+    /// Another veil serves it and this is a server-only start: there is nothing to offer, refuse.
+    refuse: datalock.Holder,
+    /// The lock file could not be created at all (not a holder: an unwritable dir). Served unguarded, said loudly.
+    unguarded: anyerror,
+};
+
+/// Take the data dir, or say why not. `desktop_mode` decides what a held dir means: a desk can attach to the
+/// server that holds it, a server-only start cannot. Never blocks, never writes a dir another veil serves.
+fn claimDataDir(io: std.Io, data_dir: []const u8, port: u16, bind: []const u8, desktop_mode: bool) DataDirClaim {
+    const outcome = datalock.take(io, data_dir, port, bind) catch |e| return .{ .unguarded = e };
+    return switch (outcome) {
+        .taken => |l| .{ .serve = l },
+        .held => |h| if (desktop_mode) .{ .attach = h } else .{ .refuse = h },
+    };
 }
 
 const DEFAULT_ADMIN_EMAIL = "admin@neuron-loops.local";
@@ -2282,4 +2339,45 @@ test "the desktop key is minted for the admin account whatever its password, and
     try std.testing.expect(!std.mem.eql(u8, got, STALE));
     try std.testing.expectEqual(@as(?u64, admin), keys.verify(got));
     try std.testing.expect(keys.persisted(got));
+}
+
+test "a data dir another veil serves is refused to a server-only start and offered to a desk start, naming the holder" {
+    // The measured collision (2026-10-14): a desk start on a dir a server-only veil was serving. The second start
+    // must not serve. What it does instead depends on what it is: a desk attaches, a server refuses — and either is
+    // told the holder's pid, port and bind, which is the whole content of the message the user gets.
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-datadir-claim-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, root, .default_dir) catch {};
+
+    // Nobody holds it: a server-only start serves, and holds.
+    var first = claimDataDir(io, root, 8787, "127.0.0.1", false);
+    try std.testing.expect(first == .serve);
+    var first_held = true;
+    defer if (first_held) first.serve.release(io); // a failed assertion must not leave the dir held
+    // Held: a second server-only start is refused and told who holds it, with the HOLDER's port and bind, not its own.
+    const second = claimDataDir(io, root, 8787, "0.0.0.0", false);
+    try std.testing.expect(second == .refuse);
+    try std.testing.expectEqual(datalock.ownPid(), second.refuse.pid);
+    try std.testing.expectEqual(@as(u16, 8787), second.refuse.port);
+    try std.testing.expectEqualStrings("127.0.0.1", second.refuse.bindStr());
+    // Held: a desk start attaches to that server instead, with the same facts.
+    const third = claimDataDir(io, root, 8787, "0.0.0.0", true);
+    try std.testing.expect(third == .attach);
+    try std.testing.expectEqual(datalock.ownPid(), third.attach.pid);
+    try std.testing.expectEqual(@as(u16, 8787), third.attach.port);
+    // Neither refused start wrote anything: the record is still the holder's.
+    try std.testing.expectEqualStrings("127.0.0.1", datalock.holderOf(io, root).bindStr());
+
+    // Released: the next start serves.
+    first_held = false;
+    first.serve.release(io);
+    var again = claimDataDir(io, root, 9000, "0.0.0.0", false);
+    try std.testing.expect(again == .serve);
+    defer again.serve.release(io);
+    try std.testing.expectEqual(@as(u16, 9000), datalock.holderOf(io, root).port);
 }
