@@ -502,6 +502,24 @@ test "errHead: a provider envelope's message is named, anything else is the firs
 /// The retirement used to be undone on the very save meant to persist it (see mergeQuirkLocked), so the dead
 /// knob was sent 65 times in one day. To re-run the trials for a model (a provider that grew a knob), delete
 /// its line from provider_quirks.jsonl. The answer, the plan, the survey and the verdict keep their reasoning.
+///
+/// THE REDUCING KNOB, a second lesson beside the silencer. The trials ask whether a knob SILENCES reasoning and
+/// retire one whose reply still carries some, so a knob that only turns reasoning DOWN is lost to them: measured
+/// 2026-10-14 (and 2026-10-08, see ReasoningEffort), Workers AI glm-5.3-flash cut a reflect call's reasoning from
+/// ~2000 chars to 333 on `reasoning_effort: low`, the trial retired it because 333 is not 0, and once the last
+/// candidate failed the model reasoned in full on every auxiliary call again. So a silencing trial whose reply reasons
+/// at most a quarter (REASON_LESS_LEARN_DIV) of this model's BASELINE - Quirk.reason_bytes, how much an auxiliary
+/// reply reasons when nothing asks it not to - is kept as the reducing knob (Quirk.reason_less, persisted) while the
+/// silencing trial moves on; once every candidate failed to silence (.none) the reducing knob goes out on the
+/// auxiliary calls instead of nothing, and it is dropped (persisted, and never resurrected by a store merge) only by
+/// a reply whose reasoning grew back past half the baseline (REASON_LESS_KEEP_DIV), or by a rejection. The baseline
+/// is an EWMA over knob-free auxiliary replies (noteReasonBytes), but it needs a first sample before the trials can
+/// tell shortened from full, and a model is usually first seen reasoning in the answer (whose reasoning is the wrong
+/// size to hold an auxiliary reply to) with every auxiliary call after that carrying a knob: so the first auxiliary
+/// reply WITH reasoning seeds it, knob-free or under a knob that reply just proved does not silence. A seed taken
+/// under a knob that shortened without silencing reads low, which only makes the quarter stricter and the half
+/// quicker to drop - never a knob kept for a reduction it did not make - and it means the FIRST candidate cannot be
+/// learned as the reducer for a model first seen reasoning in the answer; the measured case needed the second.
 const ReasonOff = enum { unknown, template, effort, disabled, none };
 const ReasonOffCandidate = struct { knob: ReasonOff, frag: []const u8 };
 /// One trial each, in this order. `template` carries both chat-template keys at once: a Jinja template
@@ -532,10 +550,13 @@ fn keepsReasoning(tag: []const u8) bool {
 /// output cap before it answered, which should come out of the context the model already holds.
 pub threadlocal var think_off_once: bool = false;
 
-const ReasonOffPick = struct { frag: []const u8 = "", knob: ReasonOff = .unknown, trial: bool = false };
+/// `trial`: a silencing candidate on trial. `reduce`: the reducing knob (Quirk.reason_less), out only once every
+/// candidate failed to silence, and judged by how much reasoning comes back, not by whether any does.
+const ReasonOffPick = struct { frag: []const u8 = "", knob: ReasonOff = .unknown, trial: bool = false, reduce: bool = false };
 
 /// What this call sends to silence reasoning, if anything: nothing for a call that keeps its reasoning or a
-/// model never seen reasoning; the learned knob; or the next candidate, on trial.
+/// model never seen reasoning; the learned knob; the next candidate, on trial; or, once every candidate failed
+/// to silence, the knob that was seen to shorten (the reducing knob).
 fn reasonOffFor(io: std.Io, tag: []const u8, model: []const u8) ReasonOffPick {
     const once = think_off_once;
     think_off_once = false;
@@ -548,32 +569,63 @@ fn reasonOffFor(io: std.Io, tag: []const u8, model: []const u8) ReasonOffPick {
             const c = REASON_OFF_CANDIDATES[q.reason_off_trial];
             break :blk ReasonOffPick{ .frag = c.frag, .knob = c.knob, .trial = true };
         },
-        .none => ReasonOffPick{},
+        .none => if (q.reason_less != .unknown and q.reason_less != .none)
+            ReasonOffPick{ .frag = reasonOffFrag(q.reason_less), .knob = q.reason_less, .reduce = true }
+        else
+            ReasonOffPick{},
         else => |k| ReasonOffPick{ .frag = reasonOffFrag(k), .knob = k, .trial = false },
     };
 }
 
-/// The reply to a call that carried `pick`: a silent reply confirms a trial; a reasoning reply or a rejection
-/// moves past the knob, on trial or learned.
-fn observeReasonOff(io: std.Io, model: []const u8, pick: ReasonOffPick, ok: bool, had_reasoning: bool) void {
+/// A silencing trial's reply that still reasons, at this fraction of the baseline or less, is the reducing lesson...
+const REASON_LESS_LEARN_DIV: u32 = 4;
+/// ...and the reducing knob holds while a reply's reasoning stays within this fraction of the baseline.
+const REASON_LESS_KEEP_DIV: u32 = 2;
+
+/// The reply to a call that carried `pick`, with `reasoning_bytes` of reasoning on it: a silent reply confirms a
+/// trial; a reasoning reply or a rejection moves past the knob, on trial or learned - a trial reply shortened to a
+/// quarter of the baseline or less first kept as the reducing knob, and the first reasoning reply under a silencer
+/// seeding the baseline. The reducing knob itself holds through any reply within half the baseline (a silent one
+/// included) and is dropped by one that is not, or by a rejection.
+fn observeReasonOff(io: std.Io, model: []const u8, pick: ReasonOffPick, ok: bool, reasoning_bytes: usize) void {
     if (pick.knob == .unknown or model.len == 0) return;
     const h = std.hash.Wyhash.hash(0x9e37, model);
     quirk_mtx.lockUncancelable(io);
     defer quirk_mtx.unlock(io);
     const e = slotForLocked(model, h);
-    if (ok and !had_reasoning) {
+    if (pick.reduce) {
+        // With no baseline to hold it to (a hand-edited file), a reply that came back is taken as it is.
+        if (ok and (e.q.reason_bytes == 0 or reasoning_bytes <= e.q.reason_bytes / REASON_LESS_KEEP_DIV)) return;
+        e.q.reason_less = .none; // the reasoning grew back, or the provider refused the knob: dropped, for good
+        saveQuirksLocked(io);
+        return;
+    }
+    if (ok and reasoning_bytes == 0) {
         if (pick.trial) {
             e.q.reason_off = pick.knob;
             saveQuirksLocked(io);
         }
         return; // confirmed, or the learned knob still works
     }
+    // The reply reasoned under a knob meant to silence it. Before the knob is moved past: with no baseline yet, this
+    // reply is the one that seeds it (see the doc above); with one, a TRIAL reply shortened to a quarter of it or
+    // less is the reducing lesson - the first knob seen to shorten, kept once.
+    var lesson = false;
+    if (ok and e.q.reason_bytes == 0) {
+        e.q.reason_bytes = reasonBytesEwma(0, reasoning_bytes);
+        lesson = true;
+    } else if (ok and pick.trial and e.q.reason_less == .unknown and reasoning_bytes <= e.q.reason_bytes / REASON_LESS_LEARN_DIV) {
+        e.q.reason_less = pick.knob;
+        lesson = true;
+    }
     // Never backwards: a peer process may already have moved further down the list (its index arrives through
     // the store merge), and a dead knob this process re-sent must not pull the shared cursor back onto it.
     const next = @max(e.q.reason_off_trial, reasonOffIndex(pick.knob) + 1);
     e.q.reason_off_trial = next;
     e.q.reason_off = if (next >= REASON_OFF_CANDIDATES.len) .none else .unknown;
-    if (!pick.trial) saveQuirksLocked(io); // a persisted knob that stopped working is forgotten on disk too
+    // A persisted knob that stopped working is forgotten on disk too, a lesson is kept, and so is "every candidate
+    // failed": without that a restart re-ran the last trial once before the reducing knob could go out.
+    if (!pick.trial or lesson or e.q.reason_off == .none) saveQuirksLocked(io);
 }
 
 /// A failed call whose failure says NOTHING about the reasoning-off knob it carried: the credential (HTTP 401, 403),
@@ -661,6 +713,32 @@ fn noteReasons(io: std.Io, model: []const u8) void {
     saveQuirksLocked(io);
 }
 
+/// One auxiliary reply that carried no knob and no dial, with `bytes` of reasoning on it: a sample of how much this
+/// model reasons when nothing asks it not to, the baseline the reducing knob is judged against (Quirk.reason_bytes).
+/// The first sample is persisted as the lesson; later ones refine it in RAM and ride the next save.
+fn noteReasonBytes(io: std.Io, model: []const u8, bytes: usize) void {
+    if (model.len == 0 or bytes == 0) return;
+    const h = std.hash.Wyhash.hash(0x9e37, model);
+    quirk_mtx.lockUncancelable(io);
+    defer quirk_mtx.unlock(io);
+    const e = slotForLocked(model, h);
+    const first = e.q.reason_bytes == 0;
+    e.q.reason_bytes = reasonBytesEwma(e.q.reason_bytes, bytes);
+    if (first) saveQuirksLocked(io);
+}
+
+/// The baseline weighs its past this many parts to one part of a new sample: one unusual reply moves it a quarter
+/// of the way and never swings it.
+const REASON_BYTES_EWMA_OLD: u64 = 3;
+
+/// The baseline after one more sample: the sample itself when there was none (0 = unknown), else the weighted mean
+/// above; a sample past u32 counts as u32's limit.
+fn reasonBytesEwma(old: u32, sample: usize) u32 {
+    const s: u32 = @intCast(@min(sample, std.math.maxInt(u32)));
+    if (old == 0) return s;
+    return @intCast((@as(u64, old) * REASON_BYTES_EWMA_OLD + s) / (REASON_BYTES_EWMA_OLD + 1));
+}
+
 pub fn modelReasons(io: std.Io, model: []const u8) bool {
     return quirkFor(io, model).reasons;
 }
@@ -678,10 +756,10 @@ test "reasonOffFor / observeReasonOff: learned from a silent reply, dropped when
     try std.testing.expect(modelReasons(io, m));
     const p1 = reasonOffFor(io, "compact", m);
     try std.testing.expect(p1.trial and p1.knob == .template);
-    observeReasonOff(io, m, p1, true, true); // reasoning came back: next candidate
+    observeReasonOff(io, m, p1, true, 2000); // reasoning came back: next candidate
     const p2 = reasonOffFor(io, "compact", m);
     try std.testing.expect(p2.trial and p2.knob == .effort);
-    observeReasonOff(io, m, p2, true, false); // silent: learned
+    observeReasonOff(io, m, p2, true, 0); // silent: learned
     const p3 = reasonOffFor(io, "compact", m);
     try std.testing.expect(!p3.trial and p3.knob == .effort);
     try std.testing.expectEqualStrings(",\"reasoning_effort\":\"low\"", p3.frag);
@@ -690,10 +768,10 @@ test "reasonOffFor / observeReasonOff: learned from a silent reply, dropped when
     think_off_once = true;
     try std.testing.expect(reasonOffFor(io, "chat", m).knob == .effort); // the one-shot override applies the learned knob
     try std.testing.expect(!think_off_once);
-    observeReasonOff(io, m, p3, false, false); // rejected: forgotten, on to the next
+    observeReasonOff(io, m, p3, false, 0); // rejected: forgotten, on to the next
     const p4 = reasonOffFor(io, "compact", m);
     try std.testing.expect(p4.trial and p4.knob == .disabled);
-    observeReasonOff(io, m, p4, true, true); // the last candidate failed: the model is left to reason
+    observeReasonOff(io, m, p4, true, 2000); // the last candidate failed: the model is left to reason
     try std.testing.expectEqualStrings("", reasonOffFor(io, "compact", m).frag);
     try std.testing.expectEqualStrings("", reasonOffFor(io, "compact", "test/plain").frag);
 }
@@ -715,7 +793,7 @@ test "a retired reasoning-off knob stays retired through the store merge, and a 
     quirk_mtx.unlock(io);
     const p1 = reasonOffFor(io, "compact", m);
     try std.testing.expect(!p1.trial and p1.knob == .template);
-    observeReasonOff(io, m, p1, true, true); // the learned knob answered with reasoning: retired
+    observeReasonOff(io, m, p1, true, 2000); // the learned knob answered with reasoning: retired
     // the save re-reads the stale file row - it must NOT resurrect the knob
     quirk_mtx.lockUncancelable(io);
     mergeQuirkLocked(m, .{ .reasons = true, .reason_off = .template });
@@ -749,6 +827,184 @@ test "a retired reasoning-off knob stays retired through the store merge, and a 
     const old = try std.json.parseFromSlice(QuirkRec, gpa, "{\"model\":\"x\",\"reason_off\":\"template\"}", .{ .ignore_unknown_fields = true });
     defer old.deinit();
     try std.testing.expectEqual(@as(u8, 0), old.value.reason_off_trial);
+}
+
+test "the reducing knob: learned from a silencing trial's shortened reply, sent only once every silencer failed, dropped when the reasoning grows back or the provider refuses it, never sent to a model not seen reasoning" {
+    const saved_tbl = quirk_tbl;
+    defer {
+        quirk_tbl = saved_tbl;
+        think_off_once = false;
+    }
+    quirk_tbl = @splat(.{});
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const full: u32 = 2000; // what an auxiliary reply of this model reasons when nothing asks it not to
+    const reduced: u32 = full / REASON_LESS_LEARN_DIV; // the most a reply may still reason and teach the lesson
+
+    // The measured shape (Workers AI glm-5.3-flash, 2026-10-14): first seen reasoning in the answer, so no baseline when
+    // the trials begin; `template` ignored, `reasoning_effort: low` shortening without silencing, `thinking: disabled`
+    // ignored - and, before this lesson, a model left to reason in full on every auxiliary call.
+    const m = "test/reducer";
+    noteReasons(io, m);
+    try std.testing.expectEqual(@as(u32, 0), quirkFor(io, m).reason_bytes);
+    const p1 = reasonOffFor(io, "compact", m);
+    try std.testing.expect(p1.trial and !p1.reduce and p1.knob == .template);
+    observeReasonOff(io, m, p1, true, full); // ignored, in full: the reply seeds the baseline, and the trial moves on
+    try std.testing.expectEqual(full, quirkFor(io, m).reason_bytes);
+    try std.testing.expect(quirkFor(io, m).reason_less == .unknown);
+    const p2 = reasonOffFor(io, "compact", m);
+    try std.testing.expect(p2.trial and p2.knob == .effort);
+    observeReasonOff(io, m, p2, true, reduced); // shortened to a quarter, not silent: the lesson, and the trial moves on
+    const q2 = quirkFor(io, m);
+    try std.testing.expect(q2.reason_less == .effort and q2.reason_off == .unknown and q2.reason_off_trial == 2);
+    try std.testing.expectEqual(full, q2.reason_bytes); // a reply under a knob is no baseline sample
+    const p3 = reasonOffFor(io, "compact", m);
+    try std.testing.expect(p3.trial and !p3.reduce and p3.knob == .disabled); // a silencer still on trial goes first
+    observeReasonOff(io, m, p3, true, full); // the last silencer failed...
+    try std.testing.expect(quirkFor(io, m).reason_off == .none);
+    const p4 = reasonOffFor(io, "compact", m); // ...so the reducing knob goes out: as itself, not on trial
+    try std.testing.expect(p4.reduce and !p4.trial and p4.knob == .effort);
+    try std.testing.expectEqualStrings(reasonOffFrag(.effort), p4.frag);
+    try std.testing.expectEqualStrings(",\"reasoning_effort\":\"low\"", p4.frag);
+    for ([_][]const u8{ "chat", "plan", "recon", "loop" }) |tag| try std.testing.expectEqualStrings("", reasonOffFor(io, tag, m).frag); // the answer keeps its reasoning
+    think_off_once = true;
+    try std.testing.expect(reasonOffFor(io, "chat", m).reduce); // the one-shot override applies it, as it would a silencer
+    try std.testing.expect(!think_off_once);
+    observeReasonOff(io, m, p4, true, full / REASON_LESS_KEEP_DIV); // within half the baseline: held
+    try std.testing.expect(reasonOffFor(io, "compact", m).reduce);
+    observeReasonOff(io, m, p4, true, 0); // silent: held
+    try std.testing.expect(reasonOffFor(io, "compact", m).reduce);
+    observeReasonOff(io, m, p4, true, full / REASON_LESS_KEEP_DIV + 1); // grown back past half: dropped, for good
+    try std.testing.expectEqualStrings("", reasonOffFor(io, "compact", m).frag);
+    const q4 = quirkFor(io, m);
+    try std.testing.expect(q4.reason_less == .none and q4.reason_off == .none and q4.reasons);
+
+    // A baseline known before the trials (seen reasoning on a knob-free auxiliary call): a trial shortened by less
+    // than a quarter is no lesson, the first knob to shorten to a quarter is, and a later one does not replace it.
+    const m2 = "test/reducer-measured";
+    noteReasons(io, m2);
+    noteReasonBytes(io, m2, full);
+    try std.testing.expectEqual(full, quirkFor(io, m2).reason_bytes);
+    observeReasonOff(io, m2, reasonOffFor(io, "compact", m2), true, reduced + 1); // `template`: not shortened enough
+    try std.testing.expect(quirkFor(io, m2).reason_less == .unknown and quirkFor(io, m2).reason_off_trial == 1);
+    observeReasonOff(io, m2, reasonOffFor(io, "compact", m2), true, reduced); // `effort`: the lesson
+    try std.testing.expect(quirkFor(io, m2).reason_less == .effort);
+    observeReasonOff(io, m2, reasonOffFor(io, "compact", m2), true, 1); // `disabled`: shorter still, but the lesson is taken
+    const q5 = quirkFor(io, m2);
+    try std.testing.expect(q5.reason_less == .effort and q5.reason_off == .none);
+    try std.testing.expect(reasonOffFor(io, "compact", m2).knob == .effort);
+
+    // The provider refusing the reducing knob drops it as well (the call site's strip-and-resend then goes without it,
+    // as for a silencer).
+    const m3 = "test/reducer-refused";
+    quirk_mtx.lockUncancelable(io);
+    mergeQuirkLocked(m3, .{ .reasons = true, .reason_off = .none, .reason_off_trial = REASON_OFF_CANDIDATES.len, .reason_less = .disabled, .reason_bytes = full });
+    quirk_mtx.unlock(io);
+    const p6 = reasonOffFor(io, "compact", m3);
+    try std.testing.expect(p6.reduce and p6.knob == .disabled);
+    observeReasonOff(io, m3, p6, false, 0);
+    try std.testing.expectEqualStrings("", reasonOffFor(io, "compact", m3).frag);
+    try std.testing.expect(quirkFor(io, m3).reason_less == .none);
+
+    // Never to a model not seen reasoning, whatever the file says about it; and never beside a silencer, learned or
+    // still on trial - the reducing knob is what remains once every silencer failed.
+    quirk_mtx.lockUncancelable(io);
+    mergeQuirkLocked("test/reducer-unseen", .{ .reason_off = .none, .reason_off_trial = REASON_OFF_CANDIDATES.len, .reason_less = .effort, .reason_bytes = full });
+    mergeQuirkLocked("test/reducer-silenced", .{ .reasons = true, .reason_off = .template, .reason_less = .effort, .reason_bytes = full });
+    mergeQuirkLocked("test/reducer-trialing", .{ .reasons = true, .reason_off = .unknown, .reason_off_trial = 1, .reason_less = .template, .reason_bytes = full });
+    quirk_mtx.unlock(io);
+    try std.testing.expectEqualStrings("", reasonOffFor(io, "compact", "test/reducer-unseen").frag);
+    const silenced = reasonOffFor(io, "compact", "test/reducer-silenced");
+    try std.testing.expect(!silenced.reduce and !silenced.trial and silenced.knob == .template);
+    const trialing = reasonOffFor(io, "compact", "test/reducer-trialing");
+    try std.testing.expect(trialing.trial and !trialing.reduce and trialing.knob == .effort);
+}
+
+test "the reducing knob and its baseline survive the store: on the wire, through a restart, and through a merge that never puts back a dropped knob nor loses this process's samples" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const saved_tbl = quirk_tbl;
+    const saved_store_len = quirk_store_len;
+    defer {
+        quirk_tbl = saved_tbl;
+        quirk_store_len = saved_store_len;
+    }
+    quirk_tbl = @splat(.{});
+    quirk_store_len = 0;
+
+    // the baseline: the first sample as it is, then REASON_BYTES_EWMA_OLD parts old to one part new, a sample past
+    // u32 clipped - and noteReasonBytes folds the same way
+    try std.testing.expectEqual(@as(u32, 2000), reasonBytesEwma(0, 2000));
+    try std.testing.expectEqual(@as(u32, @intCast((2000 * REASON_BYTES_EWMA_OLD + 1000) / (REASON_BYTES_EWMA_OLD + 1))), reasonBytesEwma(2000, 1000));
+    try std.testing.expectEqual(@as(u32, std.math.maxInt(u32)), reasonBytesEwma(0, std.math.maxInt(usize)));
+    noteReasonBytes(io, "test/reducer-ewma", 2000);
+    noteReasonBytes(io, "test/reducer-ewma", 1000);
+    try std.testing.expectEqual(reasonBytesEwma(2000, 1000), quirkFor(io, "test/reducer-ewma").reason_bytes);
+    noteReasonBytes(io, "test/reducer-ewma", 0); // no reasoning is no sample
+    try std.testing.expectEqual(reasonBytesEwma(2000, 1000), quirkFor(io, "test/reducer-ewma").reason_bytes);
+
+    // the merge, row by row as a save's re-read hands them over
+    const Merge = struct {
+        fn row(io_: std.Io, model: []const u8, q: Quirk) void {
+            quirk_mtx.lockUncancelable(io_);
+            defer quirk_mtx.unlock(io_);
+            mergeQuirkLocked(model, q);
+        }
+    };
+    const m = "test/reducer-merge";
+    Merge.row(io, m, .{ .reasons = true, .reason_less = .effort, .reason_bytes = 1500 }); // the file's lesson lands in the gap
+    try std.testing.expect(quirkFor(io, m).reason_less == .effort and quirkFor(io, m).reason_bytes == 1500);
+    Merge.row(io, m, .{ .reasons = true, .reason_less = .disabled, .reason_bytes = 3000 }); // a stale row: this process's lesson and samples stay
+    try std.testing.expect(quirkFor(io, m).reason_less == .effort and quirkFor(io, m).reason_bytes == 1500);
+    Merge.row(io, m, .{ .reasons = true, .reason_less = .none }); // a peer dropped it: dropped here too
+    try std.testing.expect(quirkFor(io, m).reason_less == .none);
+    Merge.row(io, m, .{ .reasons = true, .reason_less = .effort, .reason_bytes = 1500 }); // the 2026-10-06 shape in the reducer's terms: a row that still says `effort` does not put it back
+    try std.testing.expect(quirkFor(io, m).reason_less == .none);
+
+    // the wire record: both fields, and the defaults an old row lands on
+    const rec = try std.json.parseFromSlice(QuirkRec, gpa, "{\"model\":\"x\",\"reason_off\":\"none\",\"reason_off_trial\":3,\"reason_less\":\"effort\",\"reason_bytes\":1234}", .{ .ignore_unknown_fields = true });
+    defer rec.deinit();
+    try std.testing.expect(std.meta.stringToEnum(ReasonOff, rec.value.reason_less).? == .effort);
+    try std.testing.expectEqual(@as(u32, 1234), rec.value.reason_bytes);
+    const old = try std.json.parseFromSlice(QuirkRec, gpa, "{\"model\":\"x\",\"reason_off\":\"none\",\"reason_off_trial\":3}", .{ .ignore_unknown_fields = true });
+    defer old.deinit();
+    try std.testing.expectEqualStrings("unknown", old.value.reason_less);
+    try std.testing.expectEqual(@as(u32, 0), old.value.reason_bytes);
+
+    // a restart: the lesson the trials taught comes back from the file, with "every silencer failed", so the first
+    // auxiliary pick after boot is the reducing knob and no trial is re-run; a drop survives a restart the same way
+    const root = "zig-llm-reducer-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    quirk_tbl = @splat(.{});
+    initQuirkStore(io, root);
+    const r = "test/reducer-restart";
+    noteReasons(io, r);
+    noteReasonBytes(io, r, 2000);
+    observeReasonOff(io, r, reasonOffFor(io, "compact", r), true, 2000); // `template`: ignored
+    observeReasonOff(io, r, reasonOffFor(io, "compact", r), true, 2000 / REASON_LESS_LEARN_DIV); // `effort`: shortened
+    try std.testing.expect(quirkFor(io, r).reason_less == .effort);
+    {
+        const raw = try std.Io.Dir.cwd().readFileAlloc(io, root ++ "/" ++ QUIRK_STORE_BASENAME, gpa, .limited(64 << 10));
+        defer gpa.free(raw);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "\"reason_less\":\"effort\"") != null); // written at the lesson, before the trials end
+        try std.testing.expect(std.mem.indexOf(u8, raw, "\"reason_bytes\":2000") != null);
+    }
+    observeReasonOff(io, r, reasonOffFor(io, "compact", r), true, 2000); // `disabled`: ignored, every silencer failed
+    quirk_tbl = @splat(.{});
+    initQuirkStore(io, root);
+    const q = quirkFor(io, r);
+    try std.testing.expect(q.reasons and q.reason_off == .none and q.reason_off_trial == REASON_OFF_CANDIDATES.len and q.reason_less == .effort and q.reason_bytes == 2000);
+    const after = reasonOffFor(io, "compact", r);
+    try std.testing.expect(after.reduce and after.knob == .effort);
+    observeReasonOff(io, r, after, true, 2000); // grown back: dropped
+    quirk_tbl = @splat(.{});
+    initQuirkStore(io, root);
+    try std.testing.expect(quirkFor(io, r).reason_less == .none);
+    try std.testing.expectEqualStrings("", reasonOffFor(io, "compact", r).frag);
 }
 
 /// THE OPERATOR'S REASONING-EFFORT DIAL: HOW HARD A MODEL THINKS, NOT WHETHER. The reasoning-off trials above ask one
@@ -1070,8 +1326,8 @@ test "the reasoning-effort dial: auto unless pinned or turned off, spelled as do
     try t.expect(trial.trial and trial.knob == .template);
     try t.expectEqualStrings("", effortFor(io, hosted, m, trial.frag));
     // a LEARNED knob - `effort`, the very key the dial sends - goes alone too
-    observeReasonOff(io, m, trial, true, true); // reasoning came back: on to `effort`
-    observeReasonOff(io, m, reasonOffFor(io, "compact", m), true, false); // silent: learned
+    observeReasonOff(io, m, trial, true, 2000); // reasoning came back: on to `effort`
+    observeReasonOff(io, m, reasonOffFor(io, "compact", m), true, 0); // silent: learned
     const learned = reasonOffFor(io, "compact", m);
     try t.expect(!learned.trial and learned.knob == .effort);
     try t.expectEqualStrings("", effortFor(io, hosted, m, learned.frag));
@@ -1081,8 +1337,8 @@ test "the reasoning-effort dial: auto unless pinned or turned off, spelled as do
     try t.expect(once.knob == .effort);
     try t.expectEqualStrings("", effortFor(io, hosted, m, once.frag));
     // every knob retired (.none): the auxiliary call carries none, so the dial goes
-    observeReasonOff(io, m, learned, true, true);
-    observeReasonOff(io, m, reasonOffFor(io, "compact", m), true, true);
+    observeReasonOff(io, m, learned, true, 2000);
+    observeReasonOff(io, m, reasonOffFor(io, "compact", m), true, 2000);
     try t.expect(quirkFor(io, m).reason_off == .none);
     try t.expectEqualStrings(effortFrag(.high), effortFor(io, hosted, m, reasonOffFor(io, "compact", m).frag));
     // a local endpoint: nothing, armed or not
@@ -1965,10 +2221,14 @@ pub fn chatTemp(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []
     // stopped while it ran, or refused for a Stop (STOPPED): the failure stands as it is, as in complete() - no knob
     // verdict, no re-send
     if (!s.ok and (std.mem.eql(u8, s.content, STOPPED) or stopRequested())) return err(gpa, s.content);
-    if (s.ok and s.reasoning.len > 0) noteReasons(io, model);
+    if (s.ok and s.reasoning.len > 0) {
+        noteReasons(io, model);
+        // an auxiliary reply with nothing on the call asking for less reasoning measures the baseline (noteReasonBytes)
+        if (pick.knob == .unknown and effort_frag.len == 0 and !keepsReasoning(tag)) noteReasonBytes(io, model, s.reasoning.len);
+    }
     // a failure that never reached the knob teaches nothing about it (knobBlindFailure), as in complete()
     if (pick.knob != .unknown and (s.ok or !knobBlindFailure(s.content))) {
-        observeReasonOff(io, model, pick, s.ok, s.reasoning.len > 0);
+        observeReasonOff(io, model, pick, s.ok, s.reasoning.len);
         if (!s.ok and think_frag.len > 0) {
             if (std.mem.replaceOwned(u8, gpa, body, think_frag, "")) |bare| {
                 defer gpa.free(bare);
@@ -2056,13 +2316,18 @@ pub fn complete(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []
     // first would send exactly the requests the refusal was for.
     if (!step.ok and (std.mem.eql(u8, step.content, STOPPED) or stopRequested())) return step;
     // THE REPLY TEACHES THE KNOB. A reply with reasoning marks the model as one that reasons (the trials may
-    // begin); the reply to a call that carried a candidate or a learned knob confirms or retires it; and a call
+    // begin), and on a knob-free auxiliary call measures how much (the baseline the reducing knob is held to); the
+    // reply to a call that carried a candidate or a learned knob confirms or retires it; and a call
     // a provider REJECTED for the knob is retried once without it, so a trial never costs the answer. A failure that
     // never reached the knob (knobBlindFailure: a 401, a 408, a dead transfer, no uplink) does neither: the trial
     // stays where it was, and the ladder below resends the same body.
-    if (step.ok and step.reasoning.len > 0) noteReasons(io, model);
+    if (step.ok and step.reasoning.len > 0) {
+        noteReasons(io, model);
+        // an auxiliary reply with nothing on the call asking for less reasoning measures the baseline (noteReasonBytes)
+        if (pick.knob == .unknown and effort_frag.len == 0 and !keepsReasoning(tag)) noteReasonBytes(io, model, step.reasoning.len);
+    }
     if (pick.knob != .unknown and (step.ok or !knobBlindFailure(step.content))) {
-        observeReasonOff(io, model, pick, step.ok, step.reasoning.len > 0);
+        observeReasonOff(io, model, pick, step.ok, step.reasoning.len);
         if (!step.ok and think_frag.len > 0) {
             if (std.mem.replaceOwned(u8, gpa, body, think_frag, "")) |bare| {
                 defer gpa.free(bare);
@@ -3077,6 +3342,16 @@ const Quirk = struct {
     /// Index of the next REASON_OFF_CANDIDATES entry to try. Every candidate below it is known dead for this
     /// model - failed on trial, or learned and then seen reasoning again - and is never resurrected by a merge.
     reason_off_trial: u8 = 0,
+    /// The knob seen to SHORTEN this model's reasoning without silencing it (a silencing trial whose reply reasoned
+    /// at most a REASON_LESS_LEARN_DIV-th of the baseline), sent on the auxiliary calls once every candidate failed
+    /// to silence (reason_off == .none, see reasonOffFor). `.unknown` until one is seen; `.none` once the learned one
+    /// was dropped (reasoning back past half the baseline, or a rejection) - final, like reason_off's, and what a
+    /// store merge never puts a knob back over.
+    reason_less: ReasonOff = .unknown,
+    /// How much an auxiliary reply of this model reasons when nothing asks it not to, in bytes: an EWMA over
+    /// knob-free replies (noteReasonBytes), seeded by the first auxiliary reply seen reasoning (observeReasonOff);
+    /// 0 = no sample yet. The reducing knob is learned and held against it.
+    reason_bytes: u32 = 0,
 };
 
 const QuirkSlot = struct {
@@ -3146,7 +3421,7 @@ fn quirkFor(io: std.Io, model: []const u8) Quirk {
 /// ignored on parse, so a new constraint class is one added field here: an old engine skips it, a new
 /// engine reads an old file — the store never needs a migration. `temp` travels as the tag name (not the
 /// enum's integer) so a reordered TempRule can't silently reassign every persisted rule.
-const QuirkRec = struct { model: []const u8 = "", temp: []const u8 = "keep", temp_val: f32 = 1.0, reasoning_echo: bool = false, reasoning_budget: bool = false, reasons: bool = false, reason_off: []const u8 = "unknown", reason_off_trial: u8 = 0, reasoning_overruns: bool = false };
+const QuirkRec = struct { model: []const u8 = "", temp: []const u8 = "keep", temp_val: f32 = 1.0, reasoning_echo: bool = false, reasoning_budget: bool = false, reasons: bool = false, reason_off: []const u8 = "unknown", reason_off_trial: u8 = 0, reasoning_overruns: bool = false, reason_less: []const u8 = "unknown", reason_bytes: u32 = 0 };
 
 /// Fold one on-disk record into the RAM table (caller holds quirk_mtx). File fields never CLOBBER a live
 /// RAM lesson — this process learned from a fresher provider error than anything on disk — they fill gaps:
@@ -3182,6 +3457,16 @@ fn mergeQuirkLocked(model: []const u8, q: Quirk) void {
     // the end of the list (reasonOffIndex), so "every candidate failed" is adopted like any other lesson.
     if (e.q.reason_off == .unknown and q.reason_off != .unknown and reasonOffIndex(q.reason_off) >= e.q.reason_off_trial)
         e.q.reason_off = q.reason_off;
+    // The reducing knob: a drop (.none) is final and reaches every process sharing the store, so it wins over any
+    // knob either side still holds; short of that the file's knob fills a gap, and the one RAM learned stays. A
+    // dropped knob sits in RAM as `.none`, not `.unknown`, which is what keeps a stale file row from putting it back.
+    if (q.reason_less == .none) {
+        e.q.reason_less = .none;
+    } else if (e.q.reason_less == .unknown) {
+        e.q.reason_less = q.reason_less;
+    }
+    // The baseline: this process's own samples stay, the file's fills a gap.
+    if (e.q.reason_bytes == 0) e.q.reason_bytes = q.reason_bytes;
 }
 
 /// Merge the durable store's parseable lines into the table (caller holds quirk_mtx). Best-effort by
@@ -3208,6 +3493,8 @@ fn loadQuirksLocked(io: std.Io) void {
             .reason_off = std.meta.stringToEnum(ReasonOff, p.value.reason_off) orelse .unknown,
             .reason_off_trial = p.value.reason_off_trial,
             .reasoning_overruns = p.value.reasoning_overruns,
+            .reason_less = std.meta.stringToEnum(ReasonOff, p.value.reason_less) orelse .unknown,
+            .reason_bytes = p.value.reason_bytes,
         });
     }
 }
@@ -3227,12 +3514,13 @@ fn saveQuirksLocked(io: std.Io) void {
         if (e.hash == 0 or e.name_len == 0) continue;
         out.appendSlice(gpa, "{\"model\":") catch return;
         jstr(gpa, &out, e.name[0..e.name_len]) catch return;
-        var tail: [288]u8 = undefined;
+        var tail: [320]u8 = undefined;
         // The knob AND its trial cursor: `.none` is written as itself now (an older engine reading it falls back
         // to .unknown, which is what it always saw), because "every candidate failed" is a lesson worth keeping.
-        // reasoning_overruns rides last: an older engine ignores the field and, when it saves, drops it (its own
-        // record has no such lesson), which is the never-lose merge's one-way door for a field it predates.
-        const t = std.fmt.bufPrint(&tail, ",\"temp\":\"{s}\",\"temp_val\":{d},\"reasoning_echo\":{s},\"reasoning_budget\":{s},\"reasons\":{s},\"reason_off\":\"{s}\",\"reason_off_trial\":{d},\"reasoning_overruns\":{s}}}\n", .{
+        // reasoning_overruns, then the reducing knob and the baseline it is held to, ride last: an older engine
+        // ignores the fields and, when it saves, drops them (its own record has no such lesson), which is the
+        // never-lose merge's one-way door for a field it predates.
+        const t = std.fmt.bufPrint(&tail, ",\"temp\":\"{s}\",\"temp_val\":{d},\"reasoning_echo\":{s},\"reasoning_budget\":{s},\"reasons\":{s},\"reason_off\":\"{s}\",\"reason_off_trial\":{d},\"reasoning_overruns\":{s},\"reason_less\":\"{s}\",\"reason_bytes\":{d}}}\n", .{
             @tagName(e.q.temp),
             e.q.temp_val,
             if (e.q.reasoning_echo) "true" else "false",
@@ -3241,6 +3529,8 @@ fn saveQuirksLocked(io: std.Io) void {
             @tagName(e.q.reason_off),
             e.q.reason_off_trial,
             if (e.q.reasoning_overruns) "true" else "false",
+            @tagName(e.q.reason_less),
+            e.q.reason_bytes,
         }) catch return;
         out.appendSlice(gpa, t) catch return;
     }
@@ -8172,7 +8462,7 @@ test "a streamed call the engine asked to have silenced keeps its reasoning-off 
     const m = "test/effort-once";
     noteReasons(io, m);
     // a learned knob: the `template` trial confirmed by a silent reply
-    observeReasonOff(io, m, reasonOffFor(io, "compact", m), true, false);
+    observeReasonOff(io, m, reasonOffFor(io, "compact", m), true, 0);
     try std.testing.expect(quirkFor(io, m).reason_off == .template);
     const msgs = "{\"role\":\"user\",\"content\":\"continue\"}";
     const no_stream = "{\"error\":{\"message\":\"streaming is not available on this route\"}}";
