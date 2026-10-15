@@ -58,12 +58,38 @@
 //   certificate transparency, RDAP, email security posture, IOC extraction, evidence manifests, and more. Off
 //   for a tot unless asked for: the account's agent is not every tot's business.
 //
+// THE TOOL MAP (ToolTree, Walk, Learned; a port of src/worker/chat/belt.zig): past MAP_AT tools the belt is no
+//   longer a list the model is handed but a tree it walks. The built-in belt stays callable and advertised; what
+//   lies beyond it (Agent Garrett's catalogue, 166 tools) is reached through ONE navigation verb, open_tools -
+//   families, then groups, each a one-line use case - and a group that opens joins the TOOLS list by name. The
+//   engine (this object) holds the whole map, the visited marks and the open set; the model has local vision
+//   only. Pre-walk: the step's own words open the best group before the model moves. Auto-open: a tool called
+//   by name opens its group and runs. A lost walker is handed `find` unasked. What a step's words led the tot
+//   to call is LEARNED (belt_learned), so the pre-walk opens the right group the second time. The open set
+//   persists across iterations (belt_open). `/belt map` walks everything but a small core, for a small model.
+// GARY'S 4TOPE (loopGraph, unfold; a port of src/worker/chat/net.zig): the do loop's rounds as a dependency
+//   graph - a result depends on the step that issued it; a step depends STRONGLY on the earlier result whose
+//   distinctive words it reused and weakly on the rest; a later identical call or a later write of the same file
+//   SUPERSEDES; a failed call is a DEAD END. The longest path back from the frontier is the CRITICAL CHAIN,
+//   whose live results a fold must keep verbatim. When the loop's messages pass LOOP_BYTES they are no longer
+//   cut oldest-first: the folded rounds become one NET (the shortest-path tree from the frontier, laid flat
+//   under a byte budget: NEXT / ON DISK / RULED OUT / ESTABLISHED, every line verbatim, no model call) and the
+//   chain's results stay. The same unfolding is the carry between iterations (last_work.net).
+// SELF-HEALING (quirks, runtime revert, the repeated pick): a model's quirks are LEARNED per model and never
+//   special-cased by vendor - a model that answers only with three times the room is asked for it first after
+//   twice; one that answers nothing three times in a UTC day hands the day to FALLBACK_MODEL and is tried again
+//   the next; a context-length error halves the loop's window for that model; a missing model routes to the
+//   fallback. The pad keeps the last DEPLOYED runtime source: a revision that fails to deploy reaches the next
+//   iteration as a directive, and runtime_revert restores the deployed source as a new revision, so an edit
+//   never leaves the tots without a runtime. A pick that repeats the last iteration's step is asked once more
+//   for a changed method; a lesson that says the same thing in other words is not kept twice.
+//
 // Every route needs `Authorization: Bearer <TOT_TOKEN>` (a secret binding the veil server generates at deploy).
 //
 // No imports and no platform globals beyond fetch/Response/crypto, so cloud/tot.test.mjs runs the whole file
 // under node with a Map for storage and a scripted model.
 
-export const VERSION = "10";
+export const VERSION = "11";
 // How many tots an account may run: 24 unless the owner sets another, up to MAX_TOTS_CEIL. What an account can
 // really carry is its Cloudflare plan's to say: every tot is a Durable Object that wakes every few seconds.
 export const DEFAULT_MAX_TOTS = 24;
@@ -106,6 +132,27 @@ const DOH = "https://cloudflare-dns.com/dns-query"; // the DNS answers a guarded
 const LEASH_MIN_S = 60;
 const LEASH_MAX_S = 7 * 86400;
 const REPO = "https://github.com/gary23w/nl-veil"; // what a tot's own requests point at, so a tot is never anonymous
+// THE TOOL MAP (see the header; the numbers are belt.zig's)
+const BRANCH_SHOW = 7; // most branches shown at one node: the width a small model picks from reliably
+export const OPEN_MAX = 4; // most groups open at once; the least recently USED one closes when a fifth opens
+export const NAV_MAX = 4; // navigation rounds in a row before the engine runs `find` for the model
+const FIND_TOP = 5;
+const PREOPEN_MIN = 5; // a group must answer the step's words at least this well to open unasked
+const CUE_MAX = 24;
+const LEARNED_MAX = 600; // cue-word -> tool edges a tot keeps (one Durable Object value holds them)
+const BONUS_CAP = 3;
+export const MAP_AT = 48; // belt size past which "auto" walks what lies beyond the built-in belt
+// GARY'S 4TOPE
+const LOOP_BYTES = 54000; // the do loop's messages, before the net folds them (halved for a model that said its window is smaller)
+const KEEP_ROUNDS = 2; // the newest rounds a fold leaves verbatim
+const NET_LOOP_BUDGET = 7000; // characters a fold's net may take
+const NET_CARRY_BUDGET = 2400; // ...and the carry into the next iteration
+const PROTECT_MAX = 3000; // a chain result kept through a fold is clipped to this (head and tail)
+const EXCERPT_MAX = 240;
+const NEXT_MAX = 700;
+// SELF-HEALING
+const EMPTY_LEARN = 2; // empty answers (rescued by 3x the room) before the room is asked for first
+const RESCUE_LEARN = 3; // rescues by the fallback model in one UTC day before the day goes to it
 
 const DEFAULTS = {
   model: "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
@@ -118,6 +165,7 @@ const DEFAULTS = {
   posture: "normal", // "defend": the runtime is frozen, bot checks are reported, every request names the tot
   leash_s: 0, // 0 = no leash
   garrett: false, // Agent Garrett's tools on this tot's belt (the account's agent must be deployed for them to answer)
+  belt: "auto", // "auto": the map holds what lies beyond the built-in belt; "map": everything but a small core; "flat": a list
 };
 
 // ------------------------------------------------------------------------------------------ small helpers
@@ -394,7 +442,7 @@ function fingerprint(text) {
   return (h >>> 0).toString(16);
 }
 
-const CLAIM_TOOLS = new Set(["write_file", "append_file", "edit_file", "say", "remember", "recall", "feel", "pad_write", "pad_read", "tell", "plan_set", "plan_done", "list_files", "list_skills", "save_skill", "local_run", "swarm"]);
+const CLAIM_TOOLS = new Set(["write_file", "append_file", "edit_file", "say", "remember", "recall", "feel", "pad_write", "pad_read", "tell", "plan_set", "plan_done", "list_files", "list_skills", "save_skill", "local_run", "swarm", "open_tools"]);
 
 /// A judge must point at an actual observation. Saving or repeating a claim cannot prove it.
 /// Clearing the score on rejected evidence also prevents decide() from overriding SAME with arithmetic.
@@ -452,7 +500,36 @@ function upgraded(cfg) {
   if (cfg.posture !== "defend") cfg.posture = "normal";
   if (!Number.isFinite(cfg.leash_s)) cfg.leash_s = 0;
   if (cfg.garrett !== true) cfg.garrett = false;
+  if (!["auto", "map", "flat"].includes(cfg.belt)) cfg.belt = "auto";
   return cfg;
+}
+const beltMode = (cfg) => (["map", "flat"].includes(cfg?.belt) ? cfg.belt : "auto");
+
+/// Two texts that say the same thing in other words: the share of their content words in common (Jaccard over
+/// the words of four letters or more, and any number). Pure.
+export function similarText(a, b) {
+  const words = (s) => new Set((String(s).toLowerCase().match(/[\p{L}\p{N}_]+/gu) ?? []).filter((w) => w.length >= 4 || /\p{N}/u.test(w)));
+  const x = words(a);
+  const y = words(b);
+  if (x.size === 0 || y.size === 0) return 0;
+  const common = [...x].filter((w) => y.has(w)).length;
+  return common / (x.size + y.size - common);
+}
+
+/// A pick that repeats an earlier iteration's step in other words. The rules say never to; a model that does
+/// anyway is asked once more. Pure.
+export function repeatedStep(step, rows) {
+  return rows.some((r) => similarText(step, r.step) >= 0.8);
+}
+
+/// What went wrong with a model call, by class, so the remedy can be learned per model and never per vendor:
+/// `context` (the window is smaller than the request), `missing` (no such model), `busy` (rate limited), or "".
+export function classifyModelError(message) {
+  const m = String(message ?? "");
+  if (/context (?:window|length)|too (?:long|many tokens)|maximum (?:context|input|number of tokens)|exceeds? (?:its|the) (?:context|limit|maximum)|input is too long|prompt is too long|token limit/i.test(m)) return "context";
+  if (/no such model|model not found|does not exist|unknown model|unsupported model|\b404\b/i.test(m)) return "missing";
+  if (/\b429\b|rate.?limit|too many requests|capacity|overloaded/i.test(m)) return "busy";
+  return "";
 }
 
 /// Words and "quoted phrases" of a command line.
@@ -690,9 +767,10 @@ const TOOLS = [
   { name: "runtime_read", args: '{"offset": 0, "limit": 4000}', what: 'read your runtime source and revision, including prompts, tools and stop rules; use {"find": "<function or constant>"} to jump to code, or page through it with next_offset' },
   { name: "runtime_edit", args: '{"revision": 0, "find": "<exact passage>", "replace": "<replacement>"}', what: "edit your runtime source at the revision you read; any code may be changed. Use source instead of find/replace to replace the whole runtime. Changes are shared by every tot in this account" },
   { name: "runtime_deploy", args: '{"revision": 1}', what: "deploy your edited runtime without an approval step. The owner's running veil uploads it on its next sync; runtime_read reports deployment or compiler errors. No local-machine execution grant is needed" },
+  { name: "runtime_revert", args: '{"revision": 2}', what: "restore the last successfully DEPLOYED runtime source as a new revision, at the revision you read: the way back when an edit failed to deploy or made things worse" },
   // Agent Garrett: a second Worker in this account (github.com/gary23w/garrettstimpson.ca/agent), a blue-team belt over MCP
   { name: "garrett_tools", args: "{}", what: "list Agent Garrett's security tools (CVE / KEV / EPSS intel, DNS and certificate transparency, RDAP, email security posture, IOC extraction, evidence manifests, forensic timelines, and more) and the argument names they take", need: "garrett" },
-  { name: "garrett", args: '{"name": "<garrett tool>", "args": {"target": "example.com"}}', what: "run one of Agent Garrett's tools over MCP; its text comes back with its evidence metadata. Preserve each tool's typed JSON arguments", need: "garrett" },
+  { name: "garrett", args: '{"name": "<garrett tool>", "args": {"target": "example.com"}}', what: "run one of Agent Garrett's tools over MCP by name (with or without its security_ prefix; calling security_<name> directly is the same); its text comes back with its evidence metadata. Preserve each tool's typed JSON arguments", need: "garrett" },
   { name: "garrett_launch", args: "{}", what: "ask your human's veil to launch Agent Garrett into this account as a second Worker and point every tot at it; garrett and garrett_tools appear in your belt once it answers" },
   // memory and planning
   { name: "remember", args: '{"fact": "<one thing worth knowing later>"}', what: "keep a fact for every later iteration" },
@@ -947,11 +1025,911 @@ export function toolList(tools) {
     : `- ${t.name} ${t.args} : ${t.what}`).join("\n");
 }
 
-function recentMessages(messages) {
+// ------------------------------------------------------------------------------------------ the tool map
+// A port of src/worker/chat/belt.zig: the belt as a tree the model walks. The ENGINE (this object) holds the whole
+// map, the visited marks, the path and the open set; the MODEL sees the branches where it stands, at most
+// BRANCH_SHOW of them, and does the one thing a tiny model does reliably: pick the line that matches, go deeper,
+// back out when it was wrong. Reaching a GROUP opens it: its tools join the TOOLS list by name. The tree only
+// ever shrinks what is ADVERTISED, never what is CALLABLE: runTool dispatches every tool, and a call by a known
+// name opens its group and runs in the same round.
+
+export const NAV_TOOL = "open_tools";
+const NAV_DEF = {
+  name: NAV_TOOL,
+  args: '{"path": "<branch>"}  or  {"find": "<what you need>"}  or  {"back": true}  or  {}',
+  what: "your tools are a MAP, not a list: with no arguments it shows the families; path walks into one and OPENS its tools, callable by name from then on; find searches the whole map at once; back leaves a branch that did not fit. A tool whose name you already know can be called directly: it opens itself",
+};
+const DOCTRINE =
+  "YOUR TOOLS ARE A MAP. The tools listed are callable now; open_tools reaches the rest. When you need something you " +
+  "have no tool for, call open_tools with no arguments: it shows the families, each with one line saying what it is for. " +
+  "Pick the line that matches and call open_tools with its path; keep going one level at a time until a branch OPENS and " +
+  "lists tools you can call by name. If a branch does not fit, open_tools back=true and try another. If you know the " +
+  "tool's name already, just call it. Never say a tool is missing before you have looked at the map.";
+/// The core a small model keeps when the whole belt is walked (/belt map).
+const CORE_SMALL = new Set(["tool_schema", "write_file", "read_file", "edit_file", "append_file", "list_files", "web_search", "web_fetch", "remember", "recall", "plan_set", "plan_done", "say"]);
+
+const TOOL_PATH = {
+  write_file: "files", read_file: "files", edit_file: "files", append_file: "files", list_files: "files", delete_file: "files",
+  web_search: "web/fetch", web_fetch: "web/fetch", http_request: "web/fetch",
+  run_python: "code", pip_install: "code", save_skill: "code", run_skill: "code",
+  runtime_read: "self/runtime", runtime_edit: "self/runtime", runtime_deploy: "self/runtime", runtime_revert: "self/runtime", tool_schema: "self/schema",
+  remember: "mind/memory", recall: "mind/memory", feel: "mind/memory", plan_set: "mind/plan", plan_done: "mind/plan",
+  pad_read: "tots/pad", pad_write: "tots/pad", tell: "tots/pad", swarm: "tots/swarm",
+  say: "human", goal_queue: "human", local_run: "human",
+  garrett_tools: "security/garrett", garrett: "security/garrett", garrett_launch: "security/garrett",
+};
+const hasAny = (name, keys) => keys.some((k) => name.includes(k));
+
+/// Agent Garrett's catalogue, grouped by what a tool is for: keyword rules rather than a name table, so a tool the
+/// catalogue gains next month lands somewhere sensible. The same rules as belt.zig's securityPath.
+function securityPath(n) {
+  if (n.startsWith("gary_")) {
+    const g = n.slice(5);
+    if (hasAny(g, ["shell"])) return "security/agent/shell";
+    if (hasAny(g, ["traffic"])) return "security/agent/traffic";
+    if (hasAny(g, ["finding", "fact", "retest"])) return "security/agent/findings";
+    if (hasAny(g, ["asset", "company", "scope"])) return "security/agent/assets";
+    if (hasAny(g, ["tool", "mcp", "skill", "llm"])) return "security/agent/extend";
+    if (hasAny(g, ["web", "fetch"])) return "security/agent/web";
+    if (["read", "write", "edit", "multiedit", "glob", "grep", "ls", "bash"].includes(g)) return "security/agent/files";
+    if (hasAny(g, ["trace", "output", "graph", "node", "digest"])) return "security/agent/inspect";
+    return "security/agent/tasks";
+  }
+  if (n === "hash_id" || hasAny(n, ["crypto", "jwt", "encode", "decode"])) return "security/decode";
+  if (hasAny(n, ["nvd", "epss", "kev", "cve", "cvss", "mitre", "circl", "exposure"])) return "security/intel";
+  if (hasAny(n, ["dns", "cert", "crtsh", "subdomain", "rdap", "asn", "cidr", "ip_geo", "tor_exit", "origin_ip", "shodan", "greynoise", "whois"])) return "security/dns-ip";
+  if (hasAny(n, ["email", "gravatar", "holehe", "pwned", "breach", "leak", "stealer", "paste"])) return "security/email-breach";
+  if (hasAny(n, ["people", "username", "github", "devto", "keybase", "phone", "image_osint", "opencorporates", "edgar"])) return "security/people";
+  if (hasAny(n, ["forensic", "disk_", "memory_", "pcap", "evtx", "eventlog", "artifact", "evidence", "timestamp", "timeline"])) return "security/forensics";
+  if (hasAny(n, ["onion"])) return "security/darkweb";
+  if (hasAny(n, ["fetch", "crawl", "http", "cors", "fingerprint", "wellknown", "favicon", "urlscan", "wayback", "archive", "unshorten", "dork", "search", "typosquat", "phish"])) return "security/web";
+  if (hasAny(n, ["hash", "yara", "file_analyze", "reverse_analyze", "malware", "urlhaus", "ransomware", "ioc", "persistence"])) return "security/malware";
+  if (hasAny(n, ["nmap", "vuln", "bucket", "poc", "disclosure"])) return "security/scan";
+  return "security/other";
+}
+
+/// The belt's security tools nearest to a name the model guessed: the most shared `_` tokens, then a substring
+/// either way. " Nearest: a, b." or "" when nothing comes close. Pure.
+export function nearestSecurity(name, tools) {
+  const want = String(name ?? "").toLowerCase().replace(/^security_/, "");
+  if (want.length < 2) return "";
+  const toks = want.split("_").filter((t) => t.length > 1);
+  const scored = [];
+  for (const t of tools) {
+    const bare = String(t.name).replace(/^security_/, "");
+    let s = toks.filter((k) => bare.split("_").includes(k)).length * 2;
+    if (bare.includes(want) || want.includes(bare)) s += 3;
+    if (s > 0) scored.push({ name: t.name, s });
+  }
+  scored.sort((a, b) => b.s - a.s || (a.name < b.name ? -1 : 1));
+  return scored.length > 0 ? ` Nearest: ${scored.slice(0, 5).map((x) => x.name).join(", ")}.` : "";
+}
+
+/// Agent Garrett's catalogue as the belt holds it, by branch, each tool by its belt name with the argument names
+/// it takes: every tool on one screen, so a step never guesses a name. Pure.
+export function beltListing(tools) {
+  const groups = new Map();
+  for (const t of tools) {
+    const path = toolPath(t.name);
+    if (!groups.has(path)) groups.set(path, []);
+    const props = Object.keys(t.inputSchema?.properties ?? {});
+    groups.get(path).push(`${t.name}${props.length > 0 ? ` (${props.slice(0, 6).join(", ")}${props.length > 6 ? ", ..." : ""})` : ""}`);
+  }
+  const lines = [...groups].sort((a, b) => (a[0] < b[0] ? -1 : 1)).map(([path, names]) => `${path} - ${BRANCH_DESC[path] ?? "tools"}:\n  ${names.join(", ")}`);
+  return `Agent Garrett's ${tools.length} tool${tools.length === 1 ? "" : "s"} on your belt, by branch (each with the argument names it takes):\n${lines.join("\n")}\nCall one by its security_ name as a tool of your own; tool_schema {"name": "<it>"} shows its full typed schema. The garrett wrapper takes the same name, with or without security_.`;
+}
+
+/// Where a tool sits on the map. Pure.
+export function toolPath(name) {
+  if (TOOL_PATH[name]) return TOOL_PATH[name];
+  if (name.startsWith("security_")) return securityPath(name.slice(9));
+  if (name.startsWith("browser_")) return "web/browser";
+  if (name.startsWith("runtime_")) return "self/runtime";
+  return "other";
+}
+
+/// The one line a BRANCH shows for itself: what it is FOR. A branch not listed describes itself by its tools.
+const BRANCH_DESC = {
+  files: "your workspace: write, read, edit, append, list and delete your files (they last; your human can open them)",
+  web: "anything on the web: fetch a page or an API, search, make any HTTP call, or drive a real browser",
+  "web/fetch": "fetch a URL's text or JSON without a browser; search the web; make any HTTP call",
+  "web/browser": "a real browser: open a page, read it as numbered elements, click, type, select, scroll, run JavaScript",
+  code: "run Python beside your files, install packages, keep a script as a skill and run it again",
+  self: "your own runtime and tool schemas: read, edit, deploy or revert the code every tot of this account runs",
+  "self/runtime": "read, edit, deploy and revert the shared runtime source: prompts, tools, stop rules",
+  "self/schema": "the complete typed input schema of one tool, before calling it",
+  mind: "what you keep between iterations: facts, how you feel, your plan",
+  "mind/memory": "keep and recall facts; record how you have come to feel about a topic",
+  "mind/plan": "write or tick your plan for the goal",
+  tots: "the other tots of this account: the shared scratchpad, messages, an inner swarm",
+  "tots/pad": "read and write the scratchpad every tot shares; message another tot",
+  "tots/swarm": "run several minds side by side, one task each",
+  human: "report to your human, queue a follow-on goal, or queue a job for their machine",
+  security: "Agent Garrett, your human's own blue-team agent: threat intel, DNS and certificates, email and breach checks, people and company OSINT, malware and forensics, scanning, and its own task system",
+  "security/garrett": "Agent Garrett itself: list its tools, call one by name, or ask your human's veil to launch it",
+  "security/intel": "vulnerability intelligence: CVE details, EPSS probability, CISA KEV status, CVSS, MITRE, exposure search",
+  "security/dns-ip": "DNS records, certificate transparency, subdomains, RDAP and ASN registration, IP geolocation, Shodan and GreyNoise",
+  "security/web": "a target web site: fetch, crawl, headers, CORS, tech fingerprint, .well-known, URL scans, Wayback, phishing and typosquat checks",
+  "security/email-breach": "email security posture (SPF, DMARC, DNSSEC), breach and leak checks, pastes, stealer logs",
+  "security/people": "OSINT on a person or company: usernames, GitHub, phone, image, corporate registries",
+  "security/malware": "hashes, YARA, file and reverse analysis, IOC extraction, URLhaus, ransomware and persistence",
+  "security/forensics": "disk, memory, PCAP, event-log and timeline forensics; evidence manifests; timestamps",
+  "security/darkweb": "Tor .onion search, fetch and intel",
+  "security/decode": "decode and encode data, identify hashes, JWTs, crypto addresses",
+  "security/scan": "active scanning of a target in scope: nmap, vulnerability scan, buckets, CVE proof-of-concept, disclosure drafts",
+  "security/agent": "Agent Garrett's own task system: shells, files, tasks and workers, findings, assets, traffic, extensions",
+  "security/agent/shell": "open, drive, read and close interactive shells on the agent",
+  "security/agent/files": "read, write, edit, search and list files on the agent",
+  "security/agent/tasks": "spawn, steer, pause and stop the agent's tasks; set its goals, hints and constraints",
+  "security/agent/inspect": "look inside running work: task graphs, worker traces and output, digests",
+  "security/agent/findings": "record, list and retest findings and facts",
+  "security/agent/assets": "assets, companies and scope on the agent's cases",
+  "security/agent/traffic": "captured request/response traffic",
+  "security/agent/extend": "the agent's custom tools, MCP connections and skills",
+  "security/agent/web": "the agent's own web search and fetch",
+  "security/other": "the rest of Agent Garrett's tools",
+  other: "tools no family claims",
+};
+
+const STOP_WORDS = new Set(["that", "this", "with", "from", "have", "will", "your", "into", "then", "than", "they", "them", "what", "when", "which", "there", "their", "about", "would", "should", "could", "these", "those", "where", "after", "before", "while", "using", "based", "first", "other", "because", "also", "just", "only", "more", "most", "some", "such", "very", "each", "every", "over", "under", "does", "done", "make", "made", "take", "need", "want", "like", "been", "being", "were", "here", "next", "step", "goal", "tool", "tools", "iteration", "verify", "check", "result", "results", "file", "files", "save", "write", "read", "then", "note", "notes", "human", "report", "whether", "actual", "single", "best"]);
+
+/// The content words of a request, lower-cased, deduplicated: 4-32 characters, no stop words. Pure.
+export function cueTokens(text) {
+  const out = [];
+  const seen = new Set();
+  for (const m of String(text ?? "").matchAll(/[A-Za-z0-9][A-Za-z0-9_]*/g)) {
+    const tok = m[0].toLowerCase();
+    if (tok.length < 4 || tok.length > 32 || STOP_WORDS.has(tok) || seen.has(tok)) continue;
+    seen.add(tok);
+    out.push(tok);
+    if (out.length >= CUE_MAX) break;
+  }
+  return out;
+}
+
+/// How well a tool answers the cue: a cue word in its name or its line counts one; the tool's own name counts
+/// four more (the step named it); plus what the walk has learned ties those words to it.
+function toolScore(n, cue, learned) {
+  let s = 0;
+  const name = n.name.toLowerCase();
+  const desc = n.desc.toLowerCase();
+  for (const c of cue) {
+    if (name.includes(c) || desc.includes(c)) s += 1;
+    if (name === c) s += 4;
+    if (learned) s += learned.bonus(c, n.name);
+  }
+  return s;
+}
+
+/// How well a branch answers the cue: its best tool, weighted, plus a little for each tool that answers at all
+/// and for its own line, so one strong match beats a dozen weak ones.
+function branchScore(tree, idx, cue, learned) {
+  const n = tree.nodes[idx];
+  if (n.kind === "tool") return toolScore(n, cue, learned) * 3;
+  let best = 0;
+  let hits = 0;
+  for (const c of n.children) {
+    const s = branchScore(tree, c, cue, learned);
+    if (s > best) best = s;
+    if (s > 0) hits += 1;
+  }
+  let own = 0;
+  const desc = n.desc.toLowerCase();
+  const name = n.name.toLowerCase();
+  for (const c of cue) if (desc.includes(c) || name.includes(c)) own += 2;
+  return best + Math.min(hits, 4) + own;
+}
+
+/// The map: families, groups and tools. Every tool entry is the belt's own (name, args, what, inputSchema...).
+export class ToolTree {
+  constructor() {
+    this.nodes = [{ kind: "family", path: "", name: "", desc: "every tool, by what it is for", parent: -1, children: [], tool_count: 0 }];
+    this.byPath = new Map([["", 0]]);
+    this.byName = new Map();
+  }
+  /// `path` is the GROUP the tool joins ("web/browser"); the families above it are made as needed. A tool that
+  /// lands on a family (a path that already has branches) goes into that family's `misc` group.
+  addTool(path, entry) {
+    if (!entry?.name || this.byName.has(entry.name)) return;
+    const segs = String(path).split("/").filter(Boolean);
+    if (segs.length === 0) segs.push("other");
+    let parent = 0;
+    let acc = "";
+    for (let i = 0; i < segs.length; i++) {
+      acc = acc ? `${acc}/${segs[i]}` : segs[i];
+      const last = i === segs.length - 1;
+      let idx = this.byPath.get(acc);
+      if (idx === undefined) {
+        idx = this.nodes.length;
+        this.nodes.push({ kind: last ? "group" : "family", path: acc, name: segs[i], desc: BRANCH_DESC[acc] ?? "", parent, children: [], tool_count: 0 });
+        this.nodes[parent].children.push(idx);
+        this.byPath.set(acc, idx);
+      } else if (last && this.nodes[idx].kind === "family") {
+        parent = idx;
+        acc = `${acc}/misc`;
+        idx = this.byPath.get(acc);
+        if (idx === undefined) {
+          idx = this.nodes.length;
+          this.nodes.push({ kind: "group", path: acc, name: "misc", desc: `the rest of ${segs[i]}`, parent, children: [], tool_count: 0 });
+          this.nodes[parent].children.push(idx);
+          this.byPath.set(acc, idx);
+        }
+      } else if (!last && this.nodes[idx].kind === "group") {
+        this.nodes[idx].kind = "family"; // a group gains branches: its own tools stay on it as a group would hold them
+      }
+      parent = idx;
+    }
+    const t = this.nodes.length;
+    this.nodes.push({ kind: "tool", path: `${acc}/${entry.name}`, name: entry.name, desc: String(entry.what ?? ""), def: entry, parent, children: [], tool_count: 0 });
+    this.nodes[parent].children.push(t);
+    this.byName.set(entry.name, t);
+    for (let up = parent; up >= 0; up = this.nodes[up].parent) this.nodes[up].tool_count += 1;
+  }
+  groupOf(tool) {
+    return this.nodes[tool].parent;
+  }
+  /// The tools under a node, at any depth, by name.
+  namesUnder(idx) {
+    const out = [];
+    const stack = [idx];
+    while (stack.length > 0) {
+      const n = this.nodes[stack.pop()];
+      if (n.kind === "tool") out.push(n.name);
+      else for (let i = n.children.length - 1; i >= 0; i--) stack.push(n.children[i]);
+    }
+    return out;
+  }
+}
+
+/// The map built from a tool list, every tool under toolPath's branch for it. Pure.
+export function buildTree(tools) {
+  const tree = new ToolTree();
+  for (const t of tools) tree.addTool(toolPath(t.name), t);
+  return tree;
+}
+
+/// What the walk has learned on this tot: cue word -> tool edges, from finds that led to calls and from each
+/// step's words tied to the tools it ended up calling. Capped; the weakest edge goes when the cap is reached.
+export class Learned {
+  constructor(rows) {
+    this.edges = new Map();
+    for (const r of Array.isArray(rows) ? rows : []) if (Array.isArray(r) && typeof r[0] === "string" && typeof r[1] === "string") this.edges.set(`${r[0]}\t${r[1]}`, Math.max(1, Number(r[2]) || 1));
+  }
+  note(cue, tool) {
+    for (const tok of cueTokens(cue)) this.bump(tok, tool);
+  }
+  bump(tok, tool) {
+    const k = `${tok}\t${tool}`;
+    if (this.edges.has(k)) {
+      this.edges.set(k, this.edges.get(k) + 1);
+      return;
+    }
+    if (this.edges.size >= LEARNED_MAX) {
+      let weakest = null;
+      for (const [key, n] of this.edges) if (weakest === null || n < this.edges.get(weakest)) weakest = key;
+      this.edges.delete(weakest);
+    }
+    this.edges.set(k, 1);
+  }
+  bonus(tok, tool) {
+    return Math.min(BONUS_CAP, this.edges.get(`${tok}\t${tool}`) ?? 0);
+  }
+  rows() {
+    return [...this.edges].map(([k, n]) => [...k.split("\t"), n]);
+  }
+}
+
+/// One step's walk through the map: what is open, where the model stands, what it has tried and left. `core`
+/// names the tools advertised beside the map whatever is open; `saved` is the previous step's open set.
+export class Walk {
+  constructor(tree, cue, core, learned) {
+    this.tree = tree;
+    this.cue = String(cue ?? "");
+    this.core = core ?? new Set();
+    this.learned = learned ?? null;
+    this.here = 0;
+    this.open = []; // [{g, stamp, opened_at}], at most OPEN_MAX
+    this.dead = new Set(); // nodes entered and left without a call from under them
+    this.seen = new Set();
+    this.round = 1;
+    this.nav_streak = 0;
+    this.dirty = true; // the TOOLS list changed since the model last saw it
+    this.closed = -1; // the group closed to make room, for the next view's note
+    this.pending_find = "";
+    this.called = new Set();
+  }
+  /// Step start: restore the previous step's open set, then the engine's own read of the map: the best group for
+  /// the cue opens if anything answers it well enough. No model call, no round spent.
+  start(saved) {
+    for (const p of Array.isArray(saved) ? saved : []) {
+      const idx = this.tree.byPath.get(String(p));
+      if (idx !== undefined && this.tree.nodes[idx].kind === "group") this.openGroup(idx);
+    }
+    const g = this.bestGroup(this.cue);
+    if (g !== null) this.openGroup(g);
+    this.dirty = true;
+  }
+  bestGroup(cue) {
+    const toks = cueTokens(cue);
+    if (toks.length === 0) return null;
+    let best = null;
+    let bestS = 0;
+    this.tree.nodes.forEach((n, i) => {
+      if (n.kind !== "group") return;
+      const s = branchScore(this.tree, i, toks, this.learned);
+      if (s > bestS) {
+        bestS = s;
+        best = i;
+      }
+    });
+    return bestS >= PREOPEN_MIN ? best : null;
+  }
+  tick() {
+    this.round += 1;
+  }
+  slotOf(g) {
+    return this.open.findIndex((o) => o.g === g);
+  }
+  openGroup(g) {
+    const s = this.slotOf(g);
+    if (s >= 0) {
+      this.open[s].stamp = this.round;
+      return;
+    }
+    if (this.open.length >= OPEN_MAX) {
+      let lru = 0;
+      this.open.forEach((o, i) => {
+        if (o.stamp < this.open[lru].stamp) lru = i;
+      });
+      this.closed = this.open[lru].g;
+      this.open.splice(lru, 1);
+    }
+    this.open.push({ g, stamp: this.round, opened_at: this.round });
+    this.seen.add(g);
+    this.dead.delete(g);
+    this.dirty = true;
+  }
+  /// A tool was called by name: its group stays warm, the walk is no longer wandering, and if the group was not
+  /// open (a name the model knew) it opens now; the caller runs the call in the same round. Returns the group's
+  /// path when this call OPENED it, else null. A core tool opens nothing: it is always advertised.
+  noteCall(name) {
+    this.nav_streak = 0;
+    const t = this.tree.byName.get(name);
+    if (t === undefined) return null;
+    const g = this.tree.groupOf(t);
+    this.dead.delete(g);
+    this.called.add(name);
+    if (this.pending_find) {
+      this.learned?.note(this.pending_find, name);
+      this.pending_find = "";
+    }
+    if (this.core.has(name)) return null;
+    const s = this.slotOf(g);
+    if (s >= 0) {
+      this.open[s].stamp = this.round;
+      return null;
+    }
+    this.openGroup(g);
+    return this.tree.nodes[g].path;
+  }
+  isOpen(name) {
+    if (this.core.has(name)) return true;
+    const t = this.tree.byName.get(name);
+    return t !== undefined && this.slotOf(this.tree.groupOf(t)) >= 0;
+  }
+  knows(name) {
+    return this.tree.byName.has(name);
+  }
+  /// The tools the model sees now: the core, the navigation verb, then every open group's tools. Clears `dirty`.
+  tools() {
+    const out = [];
+    const seen = new Set();
+    for (const n of this.tree.nodes) {
+      if (n.kind !== "tool" || !this.core.has(n.name)) continue;
+      out.push(n.def);
+      seen.add(n.name);
+    }
+    out.push(NAV_DEF);
+    for (const o of this.open) {
+      for (const c of this.tree.nodes[o.g].children) {
+        const n = this.tree.nodes[c];
+        if (n.kind !== "tool" || seen.has(n.name)) continue;
+        out.push(n.def);
+        seen.add(n.name);
+      }
+    }
+    this.dirty = false;
+    return out;
+  }
+  /// The open set for the next step: group paths, most recently used first.
+  save() {
+    return this.open.slice().sort((a, b) => b.stamp - a.stamp).map((o) => this.tree.nodes[o.g].path);
+  }
+  /// Step end: what this step asked for is tied to the tools it ended up calling, so the pre-walk opens them
+  /// unasked next time the step sounds like this one.
+  finish() {
+    if (!this.learned) return;
+    for (const name of this.called) if (!this.core.has(name)) this.learned.note(this.cue, name);
+  }
+  /// The open_tools verb. Returns the text the model reads: a view of a branch, the tools a group opened, or a
+  /// find result.
+  navigate(args) {
+    const a = args && typeof args === "object" ? args : {};
+    const find = String(a.find ?? a.query ?? a.search ?? "").trim();
+    const path = String(a.path ?? a.branch ?? a.name ?? (typeof a.value === "string" ? a.value : "")).trim();
+    const back = a.back === true || /^(true|yes|1)$/i.test(String(a.back ?? "")) || path === "..";
+    if (find.length > 0) return this.renderFind(find, false);
+    if (back) {
+      this.leave();
+      return this.renderView(this.here);
+    }
+    this.nav_streak += 1;
+    if (this.nav_streak > NAV_MAX) {
+      this.nav_streak = 0;
+      return "(you have been walking the map for a while without calling a tool, so here is the whole map searched for what this step is about)\n" + this.renderFind(this.cue, true);
+    }
+    if (path.length === 0 || path === "/") {
+      this.here = 0;
+      return this.renderView(0);
+    }
+    const target = this.resolve(path);
+    if (target === null) return `No branch named "${clip(path, 60)}" here. ` + this.renderView(this.here);
+    const n = this.tree.nodes[target];
+    if (n.kind === "tool") return this.enterGroup(this.tree.groupOf(target));
+    if (n.kind === "group") return this.enterGroup(target);
+    if (this.here !== target && this.here !== 0 && !this.isAncestor(this.here, target)) this.markLeft(this.here);
+    this.here = target;
+    return this.renderView(target);
+  }
+  // ---- internals ----
+  isAncestor(maybe, idx) {
+    for (let up = this.tree.nodes[idx].parent; up >= 0; up = this.tree.nodes[up].parent) if (up === maybe) return true;
+    return false;
+  }
+  /// Leaving `idx`: a group opened this step and never called from is a dead end; a family whose viewed groups
+  /// are all dead is dead too.
+  markLeft(idx) {
+    if (idx <= 0) return;
+    const n = this.tree.nodes[idx];
+    if (n.kind === "group") {
+      const s = this.slotOf(idx);
+      if (s >= 0 && this.open[s].stamp === this.open[s].opened_at) this.dead.add(idx);
+    } else if (n.kind === "family") {
+      let any = false;
+      let allDead = true;
+      for (const c of n.children) {
+        if (!this.seen.has(c)) continue;
+        any = true;
+        if (!this.dead.has(c)) allDead = false;
+      }
+      if (any && allDead) this.dead.add(idx);
+    }
+  }
+  leave() {
+    this.nav_streak += 1;
+    if (this.here === 0) return;
+    this.markLeft(this.here);
+    this.here = Math.max(0, this.tree.nodes[this.here].parent);
+  }
+  /// `path` as the model wrote it: from the root, else relative to where it stands, else a bare name anywhere.
+  resolve(path) {
+    const p = String(path).replace(/^[\s/]+|[\s/]+$/g, "");
+    if (p.length === 0) return 0;
+    const abs = this.tree.byPath.get(p);
+    if (abs !== undefined) return abs;
+    if (this.here !== 0) {
+      const rel = this.tree.byPath.get(`${this.tree.nodes[this.here].path}/${p}`);
+      if (rel !== undefined) return rel;
+    }
+    if (!p.includes("/")) {
+      const i = this.tree.nodes.findIndex((n) => n.kind !== "tool" && n.name === p);
+      if (i >= 0) return i;
+      const t = this.tree.byName.get(p);
+      if (t !== undefined) return t;
+    }
+    return null;
+  }
+  enterGroup(g) {
+    if (this.here !== g && this.here !== 0 && this.here !== this.tree.nodes[g].parent) this.markLeft(this.here);
+    this.here = g;
+    this.closed = -1;
+    this.openGroup(g);
+    const n = this.tree.nodes[g];
+    let out = `OPENED ${n.path} - ${n.desc}. These tools are callable by name now:\n`;
+    for (const c of n.children) {
+      const tn = this.tree.nodes[c];
+      if (tn.kind === "tool") out += `  ${tn.name} - ${clip(tn.desc, 140)}\n`;
+    }
+    return out + this.renderOpenSet(g);
+  }
+  renderOpenSet(except) {
+    const others = this.open.filter((o) => o.g !== except).map((o) => this.tree.nodes[o.g].path);
+    let out = others.length > 0 ? `Also open: ${others.join(", ")}.` : "";
+    if (this.closed >= 0) {
+      out += ` Closed to make room: ${this.tree.nodes[this.closed].path} (reopen it with open_tools if you need it again).`;
+      this.closed = -1;
+    }
+    return out.length > 0 ? out.trim() + "\n" : "";
+  }
+  /// The first few tool names under a branch with no line of its own.
+  sampleNames(idx) {
+    const names = this.tree.namesUnder(idx);
+    return names.slice(0, 4).join(", ") + (names.length > 4 ? ", ..." : "");
+  }
+  /// The branches at `idx`: ranked for the cue, dead ends last and labelled, at most BRANCH_SHOW.
+  renderView(idx) {
+    const n = this.tree.nodes[idx];
+    this.seen.add(idx);
+    let out = idx === 0 ? 'TOOL MAP - the families. Pick the one whose line matches what you need: open_tools path="<name>".\n' : `TOOL MAP - you are at: ${n.path} (${n.desc}). Pick a branch: open_tools path="<name>".\n`;
+    const cue = cueTokens(this.cue);
+    const scored = n.children.map((c, i) => ({ c, i, s: this.dead.has(c) ? 0 : branchScore(this.tree, c, cue, this.learned) + 1 }));
+    scored.sort((a, b) => b.s - a.s || a.i - b.i);
+    const shown = scored.slice(0, BRANCH_SHOW);
+    for (const { c } of shown) {
+      const cn = this.tree.nodes[c];
+      out += `  ${cn.name} - ${cn.desc || this.sampleNames(c)}`;
+      if (cn.kind === "group") out += ` (${cn.tool_count} tools${this.slotOf(c) >= 0 ? ", open" : ""})`;
+      else if (cn.kind === "family") out += ` (${cn.tool_count} tools in ${cn.children.length} branches)`;
+      if (this.dead.has(c)) out += " [looked already: nothing fit]";
+      out += "\n";
+    }
+    if (n.children.length > shown.length) out += `...and ${n.children.length - shown.length} more: name one, or open_tools find="what you need".\n`;
+    if (idx !== 0) out += "Up one level: open_tools back=true. ";
+    out += 'Anywhere at once: open_tools find="what you need".\n';
+    return out + this.renderOpenSet(-1);
+  }
+  /// Breadth-first over every tool for the words in `q`: the best FIND_TOP with their paths; the best one's group
+  /// is opened when there is a clear best (always, when the engine ran the find unasked).
+  renderFind(q, unasked) {
+    const cue = cueTokens(q);
+    if (!unasked) this.pending_find = clip(q, 160);
+    const top = [];
+    this.tree.nodes.forEach((n, i) => {
+      if (n.kind !== "tool") return;
+      const s = toolScore(n, cue, this.learned);
+      // a find is for what is not at hand: on a tie, a tool the model cannot call yet ranks above a core one
+      if (s > 0) top.push({ i, s, core: this.core.has(n.name) ? 1 : 0 });
+    });
+    top.sort((a, b) => b.s - a.s || a.core - b.core || a.i - b.i);
+    const best = top.slice(0, FIND_TOP);
+    if (best.length === 0) return `Nothing on the map matches "${clip(q, 80)}". ` + this.renderView(0);
+    let out = `FOUND for "${clip(q, 80)}":\n`;
+    for (const { i, core } of best) {
+      const n = this.tree.nodes[i];
+      out += `  ${n.name} - ${clip(n.desc, 140)}  (in ${this.tree.nodes[n.parent].path}${core ? ", callable already" : ""})\n`;
+    }
+    const clear = best.length === 1 || best[0].s > best[1].s || best[0].core < best[1].core || this.tree.groupOf(best[0].i) === this.tree.groupOf(best[1].i);
+    if (clear || unasked) {
+      const g = this.tree.groupOf(best[0].i);
+      this.here = g;
+      this.closed = -1;
+      this.openGroup(g);
+      out += `Opened ${this.tree.nodes[g].path}: its tools are callable by name now.\n` + this.renderOpenSet(g);
+    } else out += 'Two branches match equally. Open one: open_tools path="<its branch>".\n';
+    return out;
+  }
+}
+
+/// The walk for a step, or null when the belt stays a list: "flat" always; "auto" until the belt passes MAP_AT
+/// tools (then the built-in belt is the core and the map holds what lies beyond it, Agent Garrett's catalogue);
+/// "map" always, with CORE_SMALL as the core. `saved` is the previous step's open set, `learned` this tot's edges.
+export function beltFor(cfg, tools, cue, saved, learned) {
+  const mode = beltMode(cfg);
+  if (mode === "flat" || (mode === "auto" && tools.length <= MAP_AT)) return null;
+  const core = new Set(tools.filter((t) => (mode === "map" ? CORE_SMALL.has(t.name) : !t.name.startsWith("security_"))).map((t) => t.name));
+  const w = new Walk(buildTree(tools), cue, core, learned);
+  w.start(saved);
+  return w;
+}
+
+/// The pick's view of a walked belt: the core, one line each, then the map's groups with the NAMES of their tools,
+/// so the plan can name any tool on the belt without paying for every tool's line.
+export function mapIndex(walk) {
+  const lines = [];
+  for (const n of walk.tree.nodes) if (n.kind === "tool" && walk.core.has(n.name)) lines.push(`- ${n.name}: ${clip(n.desc, 100)}`);
+  lines.push("TOOL MAP (the rest of the belt; the step reaches a branch with open_tools, or calls a tool by name):");
+  walk.tree.nodes.forEach((n, i) => {
+    if (n.kind !== "group") return;
+    const names = walk.tree.namesUnder(i).filter((x) => !walk.core.has(x));
+    if (names.length > 0) lines.push(`  ${n.path} - ${n.desc || "tools"} (${names.length}): ${names.join(", ")}`);
+  });
+  return lines.join("\n");
+}
+
+// ------------------------------------------------------------------------------------------ Gary's 4tope
+// A port of src/worker/chat/net.zig for the do loop: its rounds as a DAG, the critical chain, and the net.
+
+const W_USED = 2;
+const W_ISSUED = 1;
+const W_THREAD = 1;
+const W_WEAK = 0;
+const C_USED = 1;
+const C_ISSUED = 1;
+const C_WEAK = 3;
+const C_SUPERSEDED = 4;
+const C_DEAD = 1;
+const NET_HEAD = "CONTINUATION (Gary's 4tope: the earlier rounds of this step, laid out from where you stand; every line is verbatim from a tool result, so nothing here is a paraphrase):\n";
+const FILE_TOOLS = new Set(["read_file", "write_file", "edit_file", "append_file", "delete_file"]);
+const COMMON_WORDS = new Set(["which", "there", "their", "about", "would", "should", "could", "these", "those", "where", "after", "before", "while", "using", "based", "first", "other", "because", "return", "returns", "content", "result", "results", "value", "values", "string", "number", "false", "error", "function", "const", "write", "check", "tools", "model", "please", "thanks", "found", "output", "input", "lines", "bytes", "assistant", "system", "message", "messages", "status", "working", "being", "final", "args"]);
+
+/// Does a result read as a failure? Judged on its opening, where every tool here puts it. Pure.
+export function looksDead(text) {
+  const head = String(text ?? "").slice(0, 400);
+  if (resultFailed(head)) return true;
+  if (/^(?:Error:|error:|\(no |\(failed|Traceback|BOT CHECK)/.test(head)) return true;
+  return /Traceback \(most recent|No such file|not found|command not found|timed out|refused|exit code [12]\b|did not answer|could not be reached/.test(head);
+}
+
+/// Tokens a later step could only have got from THIS text: 5+ characters, carrying a letter, not a common word.
+/// Paths and identifiers keep their punctuation. Pure.
+export function distinctiveTokens(text, max = 32) {
+  const out = [];
+  const seen = new Set();
+  for (const m of String(text ?? "").matchAll(/[A-Za-z0-9_./-]+/g)) {
+    const tok = m[0].replace(/^[./_-]+|[./_-]+$/g, "");
+    if (tok.length < 5 || tok.length > 64 || !/[A-Za-z]/.test(tok)) continue;
+    const low = tok.toLowerCase();
+    if (COMMON_WORDS.has(low) || seen.has(low)) continue;
+    seen.add(low);
+    out.push(tok);
+    if (out.length >= max) break;
+  }
+  return out;
+}
+
+const oneLine = (s, max) => {
+  const t = String(s ?? "").replace(/\s+/g, " ").trim();
+  if (t.length <= max) return t;
+  const cut = t.slice(0, max);
+  const sp = cut.lastIndexOf(" ");
+  return (sp > max / 2 ? cut.slice(0, sp) : cut).trimEnd() + "...";
+};
+
+/// The body of a RESULT message the loop wrote (`RESULT of <tool>:\n<text>\n\n<engine's line>`), or the message.
+function resultBody(content) {
+  const s = String(content ?? "");
+  const m = /^RESULT of [^\n]*\n([\s\S]*?)(?:\n\n(?:This attempt failed\.|Check whether this result|This is your last call|Next action, or the final answer)[\s\S]*)?$/.exec(s);
+  return m ? m[1] : s;
+}
+
+/// The do loop's messages as a dependency graph. `from` is where the rounds start (after the system message,
+/// the task and any net a fold left). Nodes are in order, which is a topological order: every edge points at an
+/// older node. Pure.
+export function loopGraph(messages, from = 2) {
+  const g = { nodes: [], calls: [], frontier: -1 };
+  let round = 0;
+  let prevStep = -1;
+  for (let i = from; i < messages.length; i++) {
+    const m = messages[i];
+    const content = String(m?.content ?? "");
+    if (m?.role === "assistant") {
+      const act = parseAction(content);
+      const call = act && typeof act.tool === "string" ? { name: ALIASES[act.tool] ?? act.tool, args: oneLine(JSON.stringify(act.args ?? {}), 160) } : null;
+      if (call && call.name === NAV_TOOL) {
+        // a walk of the map is the engine's business, not a derivation: it never rides the net
+        g.nodes.push({ kind: "engine", at: i, round, name: "", args: "", text: "", full: "", deps: [], superseded: false, dead: false, bytes: content.length });
+        continue;
+      }
+      if (call) round += 1;
+      const node = { kind: call ? "step" : "note", at: i, round, name: call?.name ?? "", args: call?.args ?? "", text: oneLine(content, NEXT_MAX), full: "", deps: [], superseded: false, dead: false, bytes: content.length };
+      const idx = g.nodes.push(node) - 1;
+      g.frontier = idx;
+      if (call) g.calls.push({ ...call, step: idx });
+      // what this step READ: the previous round's results whose distinctive words its own words or arguments reuse
+      if (prevStep >= 0) node.deps.push({ to: prevStep, w: W_THREAD });
+      const toks = distinctiveTokens(content + " " + (call?.args ?? ""));
+      for (let j = prevStep + 1; j < idx; j++) {
+        const r = g.nodes[j];
+        if (r.kind !== "result") continue;
+        const used = toks.some((t) => r.full.includes(t.toLowerCase()));
+        node.deps.push({ to: j, w: used ? W_USED : W_WEAK });
+      }
+      prevStep = idx;
+      continue;
+    }
+    if (m?.role === "user" && /^RESULT of /.test(content) && !/^RESULT of open_tools:/.test(content)) {
+      const body = resultBody(content);
+      const issuer = g.calls.length > 0 && g.calls[g.calls.length - 1].step === prevStep ? g.calls[g.calls.length - 1] : null;
+      const node = { kind: "result", at: i, round, name: issuer?.name ?? /^RESULT of ([^:\n]+)/.exec(content)?.[1] ?? "tool", args: issuer?.args ?? "", text: oneLine(body, EXCERPT_MAX), full: body.slice(0, 6000).toLowerCase(), deps: [], superseded: false, dead: looksDead(body), bytes: content.length };
+      if (issuer) node.deps.push({ to: issuer.step, w: W_ISSUED });
+      g.nodes.push(node);
+      continue;
+    }
+    g.nodes.push({ kind: "engine", at: i, round, name: "", args: "", text: oneLine(content, EXCERPT_MAX), full: "", deps: [], superseded: false, dead: false, bytes: content.length });
+  }
+  // a later identical call, or a later read or write of the same file, makes the earlier result stale
+  const fileOf = (args) => /"(?:name|path)":"([^"]+)"/.exec(args)?.[1] ?? "";
+  for (let i = 0; i < g.nodes.length; i++) {
+    const older = g.nodes[i];
+    if (older.kind !== "result" || !older.name) continue;
+    const file = FILE_TOOLS.has(older.name) ? fileOf(older.args) : "";
+    for (let j = i + 1; j < g.nodes.length; j++) {
+      const newer = g.nodes[j];
+      if (newer.kind !== "result" || !newer.name) continue;
+      if ((newer.name === older.name && newer.args === older.args) || (file && FILE_TOOLS.has(newer.name) && fileOf(newer.args) === file)) {
+        older.superseded = true;
+        break;
+      }
+    }
+  }
+  return g;
+}
+
+/// THE CRITICAL CHAIN: the longest weighted dependency path from the frontier back through the loop (the DAG
+/// recurrence, one pass in order). Frontier first; empty when there is no frontier. Pure.
+export function criticalChain(g) {
+  if (g.frontier < 0) return [];
+  const dist = new Array(g.nodes.length).fill(0);
+  const via = new Array(g.nodes.length).fill(-1);
+  g.nodes.forEach((node, i) => {
+    for (const d of node.deps) {
+      const cand = dist[d.to] + d.w;
+      // ties go to the NEWER dependency: the frontier's recent reads over its old ones
+      if (cand > dist[i] || (cand === dist[i] && via[i] >= 0 && d.to > via[i])) {
+        dist[i] = cand;
+        via[i] = d.to;
+      }
+    }
+  });
+  const out = [];
+  for (let at = g.frontier; at >= 0; at = via[at]) out.push(at);
+  return out;
+}
+
+/// THE SOURCE UNFOLDING: Dijkstra from the frontier over the graph (both directions, weighted so what the frontier
+/// read is nearer than what it merely saw, and stale or failed results are farther), nodes taken in distance
+/// order until `budget` characters are spoken for, laid out in shortest-path-tree order: NEXT (the frontier's own
+/// words) / ON DISK (`ground`, verbatim) / RULED OUT (dead ends) / ESTABLISHED (each derivation contiguous). Nodes
+/// `skip` names (a kept tail) are left out of the selection. "" when there is nothing to carry. Pure.
+export function unfold(g, budget, ground = "", skip = null) {
+  if (g.frontier < 0 || budget < 200) return "";
+  const n = g.nodes.length;
+  const INF = Number.MAX_SAFE_INTEGER;
+  const dist = new Array(n).fill(INF);
+  const parent = new Array(n).fill(-1);
+  const done = new Array(n).fill(false);
+  dist[g.frontier] = 0;
+  const relax = (from, to, w) => {
+    const target = g.nodes[to];
+    let c = w === W_USED ? C_USED : w === W_WEAK ? C_WEAK : C_ISSUED;
+    if (target.superseded) c += C_SUPERSEDED;
+    if (target.dead) c += C_DEAD;
+    if (dist[from] !== INF && dist[from] + c < dist[to]) {
+      dist[to] = dist[from] + c;
+      parent[to] = from;
+    }
+  };
+  for (let left = n; left > 0; left--) {
+    let u = -1;
+    for (let i = 0; i < n; i++) if (!done[i] && dist[i] !== INF && (u < 0 || dist[i] < dist[u])) u = i;
+    if (u < 0) break;
+    done[u] = true;
+    for (const d of g.nodes[u].deps) relax(u, d.to, d.w);
+    g.nodes.forEach((node, i) => {
+      for (const d of node.deps) if (d.to === u) relax(u, i, d.w);
+    });
+  }
+  const frontier = g.nodes[g.frontier];
+  const nextText = oneLine(frontier.text, Math.max(80, Math.floor(budget / 3)));
+  const groundText = oneLine(ground, Math.floor(budget / 4));
+  let spent = nextText.length + 64 + groundText.length + 200;
+  const order = [...Array(n).keys()].sort((x, y) => dist[x] - dist[y] || y - x);
+  const chosen = new Array(n).fill(false);
+  for (const i of order) {
+    if (dist[i] === INF) break;
+    const node = g.nodes[i];
+    if (i === g.frontier || node.kind !== "result" || node.superseded || node.text.length === 0) continue;
+    if (skip && skip.has(i)) continue;
+    const cost = node.text.length + node.name.length + node.args.length + 24;
+    if (spent + cost > budget) continue;
+    spent += cost;
+    chosen[i] = true;
+  }
+  const line = (i) => {
+    const node = g.nodes[i];
+    return `- r${node.round} ${node.name || "tool"}${node.args ? " " + node.args : ""}${node.dead ? " -> " : ": "}${node.text}\n`;
+  };
+  let out = "NEXT (the frontier, in its own last words): ";
+  if (nextText.length > 0) out += nextText;
+  else {
+    const calls = g.calls.filter((c) => c.step === g.frontier).map((c) => `${c.name}${c.args ? " " + c.args : ""}`);
+    out += calls.length > 0 ? `it had just called ${calls.join(", ")}` : "(no words; see the results below)";
+  }
+  out += "\n";
+  if (groundText.length > 0) out += `ON DISK: ${groundText}\n`;
+  let anyDead = false;
+  for (const i of order) {
+    if (!chosen[i] || !g.nodes[i].dead) continue;
+    if (!anyDead) out += "RULED OUT (calls that failed; do not repeat them as they were):\n";
+    anyDead = true;
+    out += line(i);
+  }
+  let anyEst = false;
+  const visited = new Array(n).fill(false);
+  const stack = [g.frontier];
+  while (stack.length > 0) {
+    const u = stack.pop();
+    if (visited[u]) continue;
+    visited[u] = true;
+    if (chosen[u] && !g.nodes[u].dead) {
+      if (!anyEst) out += "ESTABLISHED (what the frontier rests on, nearest first, each derivation contiguous):\n";
+      anyEst = true;
+      out += line(u);
+    }
+    const kids = [];
+    parent.forEach((p, i) => {
+      if (p === u) kids.push(i);
+    });
+    kids.sort((x, y) => dist[y] - dist[x]); // farthest first, so the nearest is walked first
+    stack.push(...kids);
+  }
+  return anyDead || anyEst || groundText.length > 0 ? out : "";
+}
+
+/// Where a loop's rounds start: after the system message, the task, and any net a fold left.
+const roundsFrom = (messages) => (messages[2]?.role === "user" && String(messages[2].content).startsWith(NET_HEAD) ? 3 : 2);
+
+/// ON DISK for a tot: the files this step's record wrote, by name.
+function filesWritten(record) {
+  const names = [...new Set(record.filter((r) => ["write_file", "append_file", "edit_file"].includes(r.tool) && !resultFailed(r.result)).map((r) => String(r.args?.name ?? r.args?.path ?? "").trim()).filter(Boolean))];
+  return names.length > 0 ? `files written this step: ${names.join(", ")}` : "";
+}
+
+/// THE FOLD: when the loop's messages pass `limit`, the rounds before the newest KEEP_ROUNDS become one net and
+/// the critical chain's live results stay verbatim (clipped); the oldest round is no longer the one that goes.
+/// What an earlier fold established rides on under EARLIER. Pure; returns a new array.
+export function netFold(messages, limit, ground = "") {
+  const size = (ms) => ms.reduce((n, m) => n + String(m.content ?? "").length, 0);
+  if (size(messages) <= limit) return messages;
+  const from = roundsFrom(messages);
+  const pairs = Math.floor((messages.length - from) / 2);
+  if (pairs <= KEEP_ROUNDS) return messages;
+  const tailStart = from + 2 * (pairs - KEEP_ROUNDS);
+  const g = loopGraph(messages, from);
+  const tail = new Set();
+  g.nodes.forEach((node, i) => {
+    if (node.at >= tailStart) tail.add(i);
+  });
+  const protect = new Set();
+  for (const i of criticalChain(g)) {
+    const node = g.nodes[i];
+    if (node.kind === "result" && !node.superseded && !node.dead && node.at < tailStart) protect.add(node.at);
+  }
+  const net = unfold(g, NET_LOOP_BUDGET, ground, tail) + earlierLines(messages, Math.floor(NET_LOOP_BUDGET / 3));
+  const out = messages.slice(0, 2);
+  out.push({ role: "user", content: NET_HEAD + (net || "(the earlier rounds established nothing a tool result shows)\n") });
+  for (let i = from; i < tailStart; i += 2) {
+    if (!protect.has(i + 1)) continue;
+    out.push({ role: "assistant", content: clip(String(messages[i].content), 600) });
+    const u = String(messages[i + 1].content);
+    out.push({ role: "user", content: u.length > PROTECT_MAX ? resultExcerpt(u, PROTECT_MAX) : u });
+  }
+  out.push(...messages.slice(tailStart));
+  return out;
+}
+
+/// What an earlier fold's net established and ruled out, verbatim, so a second fold (or the carry) keeps it.
+function earlierLines(messages, budget) {
+  if (roundsFrom(messages) !== 3) return "";
+  // what was ruled out first: negative knowledge is what a cut forgets soonest and a clip must keep longest
+  const rows = String(messages[2].content).slice(NET_HEAD.length).split("\n").filter((l) => l.startsWith("- r"));
+  const lines = [...rows.filter((l) => / -> /.test(l)), ...rows.filter((l) => !/ -> /.test(l))].join("\n");
+  return lines.length > 0 ? `EARLIER (from the fold before this one):\n${clip(lines, budget)}\n` : "";
+}
+
+/// The carry into the next iteration: the whole loop unfolded under NET_CARRY_BUDGET. "" when nothing to carry.
+export function netOf(messages, ground = "") {
+  const net = unfold(loopGraph(messages, roundsFrom(messages)), NET_CARRY_BUDGET, ground);
+  return net.length > 0 ? net + earlierLines(messages, Math.floor(NET_CARRY_BUDGET / 3)) : "";
+}
+
+/// The last resort under a model's window: pairs go oldest first, never the system message, the task or a net.
+function recentMessages(messages, limit = LOOP_BYTES) {
   const bounded = messages.slice();
+  const from = roundsFrom(bounded);
   let size = bounded.reduce((n, m) => n + String(m.content ?? "").length, 0);
-  while (size > 54000 && bounded.length > 4) {
-    const removed = bounded.splice(2, 2);
+  while (size > limit && bounded.length > from + 2) {
+    const removed = bounded.splice(from, 2);
     size -= removed.reduce((n, m) => n + String(m.content ?? "").length, 0);
   }
   return bounded;
@@ -1016,7 +1994,7 @@ async function route(req, env) {
   if (seg[1] === "version" && method === "GET") return json({ ok: true, version: VERSION, max_tots: DEFAULT_MAX_TOTS, max_tots_ceil: MAX_TOTS_CEIL });
   if (seg[1] === "runtime") {
     if (method === "GET" && seg.length === 2) return call(padStub, "/runtime/state");
-    if (method === "POST" && ["seed", "result"].includes(seg[2])) return call(padStub, "/runtime/" + seg[2], body);
+    if (method === "POST" && ["seed", "result", "upgrade"].includes(seg[2])) return call(padStub, "/runtime/" + seg[2], body);
     return bad("method not allowed", 405);
   }
   // Agent Garrett's launch: a tot asks (request), the owner's veil deploys it and answers (result). See padRoute.
@@ -1142,21 +2120,54 @@ export class Tot {
     // Durable Object values have a per-value size limit; the runtime can be larger than one value.
     return this.store.transaction(async (store) => {
       let state = await store.get("runtime");
-      const readSource = async () => [...(await store.list({ prefix: "runtime:source:" })).values()].join("");
-      const writeSource = async (source) => {
-        for (const key of (await store.list({ prefix: "runtime:source:" })).keys()) await store.delete(key);
-        for (let i = 0; i < source.length; i += 16000) await store.put("runtime:source:" + pad10(i), source.slice(i, i + 16000));
+      const readChunks = async (prefix) => [...(await store.list({ prefix })).values()].join("");
+      const writeChunks = async (prefix, source) => {
+        for (const key of (await store.list({ prefix })).keys()) await store.delete(key);
+        for (let i = 0; i < source.length; i += 16000) await store.put(prefix + pad10(i), source.slice(i, i + 16000));
       };
+      const readSource = () => readChunks("runtime:source:");
+      const writeSource = (source) => writeChunks("runtime:source:", source);
+      // the last source that DEPLOYED, kept apart from the drafts: the way back from an edit that failed
+      const readGood = () => readChunks("runtime:good:");
+      const keepGood = (source) => writeChunks("runtime:good:", source);
+      // `host`: the current revision was written by the owner's veil (the seed, or a newer build offered as a
+      // revision) rather than by a tot. A state an older runtime wrote has no flag: its seed is the host's.
+      const hostOwned = (s) => s.host === true || (s.host === undefined && s.revision === 0);
       if (path === "/runtime/seed") {
         if (state) return json({ ok: true, ...state });
         if (typeof body.source !== "string" || !body.source.trim()) return bad("runtime source is required");
         await writeSource(body.source);
-        state = { revision: Number(body.revision) || 0, deployed_revision: Number(body.revision) || 0, status: "deployed", error: "", length: body.source.length };
+        await keepGood(body.source);
+        state = { revision: Number(body.revision) || 0, deployed_revision: Number(body.revision) || 0, status: "deployed", error: "", length: body.source.length, host: true, good_host: true };
         await store.put("runtime", state);
         return json({ ok: true, ...state });
       }
       if (!state) return path === "/runtime/state" ? json({ ok: true, initialized: false }) : bad("runtime source has not synced yet; the owner's veil seeds it on its next sync");
-      if (path === "/runtime/state") return json({ ok: true, initialized: true, ...state, source: state.status === "pending" ? await readSource() : "" });
+      if (path === "/runtime/state") return json({ ok: true, initialized: true, ...state, host: hostOwned(state), source: state.status === "pending" ? await readSource() : "" });
+      if (path === "/runtime/revert") {
+        if (body.revision !== state.revision) return bad(`runtime revision changed to ${state.revision}; runtime_read before reverting`, 409);
+        const good = await readGood();
+        if (!good) return bad("no deployed runtime source is kept to revert to");
+        await writeSource(good);
+        state = { ...state, revision: state.revision + 1, deployed_revision: state.revision + 1, status: "deployed", error: "", length: good.length, author: body.author ?? "", reverted_from: state.revision, host: state.good_host === true };
+        await store.put("runtime", state);
+        return json({ ok: true, ...state, message: "the last deployed source is the current revision again; the Worker on Cloudflare already runs it" });
+      }
+      if (path === "/runtime/upgrade") {
+        // THE HOST'S RUNTIME AS A REVISION: a newer veil carries a newer tot.js. It is applied only over a runtime
+        // the host itself wrote that is deployed with nothing pending - the tots' own edits, drafts and uploads
+        // are theirs, and a host never swaps beneath them - and it is a revision like any other: the next sync
+        // uploads it, runtime_read shows it, runtime_revert takes it back.
+        if (typeof body.source !== "string" || !body.source.trim()) return bad("runtime source is required");
+        if (body.revision !== state.revision) return bad(`runtime revision changed to ${state.revision}`, 409);
+        if (!hostOwned(state)) return bad(`the tots own this runtime: revision ${state.revision} was written by a tot, so the host's newer source is not applied over it (runtime_revert to a host revision would let it in)`);
+        if (state.status !== "deployed" || state.revision !== state.deployed_revision) return bad(`revision ${state.revision} is ${state.status}; the host's source waits until it has deployed`);
+        if ((await readSource()) === body.source) return json({ ok: true, ...state, unchanged: true });
+        await writeSource(body.source);
+        state = { ...state, revision: state.revision + 1, status: "pending", error: "", length: body.source.length, author: clip(String(body.by ?? "veil"), 40), host: true };
+        await store.put("runtime", state);
+        return json({ ok: true, ...state, message: "the host's newer runtime is the next revision; the owner's veil uploads it on its next sync" });
+      }
       if (path === "/runtime/read") {
         const source = await readSource();
         let offset = Math.max(0, Number.parseInt(body.offset, 10) || 0);
@@ -1170,7 +2181,14 @@ export class Tot {
       }
       if (path === "/runtime/result") {
         if (!Number.isSafeInteger(body.revision) || body.revision < 0 || body.revision > state.revision) return bad("unknown runtime revision");
-        if (!body.err) state.deployed_revision = Math.max(state.deployed_revision, body.revision);
+        if (!body.err) {
+          state.deployed_revision = Math.max(state.deployed_revision, body.revision);
+          // what is up there now is the way back for the next edit (the current source when this is the newest revision)
+          if (body.revision === state.revision) {
+            await keepGood(await readSource());
+            state.good_host = hostOwned(state);
+          }
+        }
         // An older upload finishing must not discard a newer edit or its deployment request.
         if (body.revision === state.revision) {
           state.status = body.err ? "failed" : "deployed";
@@ -1191,7 +2209,7 @@ export class Tot {
           source = source.slice(0, at) + body.replace + source.slice(at + body.find.length);
         }
         await writeSource(source);
-        state = { ...state, revision: state.revision + 1, status: "draft", error: "", length: source.length, author: body.author ?? "" };
+        state = { ...state, revision: state.revision + 1, status: "draft", error: "", length: source.length, author: body.author ?? "", host: false };
         await store.put("runtime", state);
         return json({ ok: true, ...state });
       }
@@ -1358,10 +2376,12 @@ export class Tot {
     if (b.leash_s !== undefined) cfg.leash_s = /^(0|off|none|no)$/i.test(String(b.leash_s).trim()) ? 0 : clampInt(b.leash_s, LEASH_MIN_S, LEASH_MAX_S, cfg.leash_s ?? 0);
     // Agent Garrett on this tot's belt: a boolean from the API, "on" / "off" from the command line
     if (b.garrett !== undefined) cfg.garrett = b.garrett === true || /^(on|true|yes|1)$/i.test(String(b.garrett).trim());
+    // the belt as a map: auto (what lies beyond the built-in belt), map (everything but a small core), flat
+    if (typeof b.belt === "string" && /^(auto|map|flat)$/i.test(b.belt.trim())) cfg.belt = b.belt.trim().toLowerCase();
   }
 
   settingsLine(cfg) {
-    return `model ${cfg.model}, every ${cfg.pace_s}s, up to ${cfg.size} minds, ${callsWord(cfg)}${posture(cfg) === "defend" ? ", posture DEFEND" : ""}${cfg.leash_s > 0 ? `, leash ${cfg.leash_s}s` : ""}${wantsGarrett(cfg) ? ", Agent Garrett" : ""}${cfg.paused ? ", paused" : ""}`;
+    return `model ${cfg.model}, every ${cfg.pace_s}s, up to ${cfg.size} minds, ${callsWord(cfg)}${posture(cfg) === "defend" ? ", posture DEFEND" : ""}${cfg.leash_s > 0 ? `, leash ${cfg.leash_s}s` : ""}${wantsGarrett(cfg) ? ", Agent Garrett" : ""}${beltMode(cfg) !== "auto" ? `, belt ${beltMode(cfg)}` : ""}${cfg.paused ? ", paused" : ""}`;
   }
 
   async configure(cfg, body) {
@@ -1422,6 +2442,9 @@ export class Tot {
       posture: posture(cfg),
       leash_s: cfg.leash_s ?? 0,
       leashed,
+      belt: beltMode(cfg),
+      belt_open: (await this.store.get("belt_open")) ?? [], // the map's open groups, carried between iterations
+      learned: ((await this.store.get("belt_learned")) ?? []).length, // cue-word -> tool edges the walk has learned
       watch: (cfg.watch ?? []).length,
       guard_ok,
       guard_tripped,
@@ -1575,19 +2598,21 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
       await this.store.put("cfg", cfg);
       return cfg.charter.length > 0 ? "Charter set: it is what this tot works toward when no goal is active." : "Charter cleared.";
     }
-    if (word === "/pace" || word === "/size" || word === "/model" || word === "/calls" || word === "/posture" || word === "/leash" || word === "/garrett") {
-      const key = { "/pace": "pace_s", "/size": "size", "/model": "model", "/calls": "daily_calls", "/posture": "posture", "/leash": "leash_s", "/garrett": "garrett" }[word];
+    if (word === "/pace" || word === "/size" || word === "/model" || word === "/calls" || word === "/posture" || word === "/leash" || word === "/garrett" || word === "/belt") {
+      const key = { "/pace": "pace_s", "/size": "size", "/model": "model", "/calls": "daily_calls", "/posture": "posture", "/leash": "leash_s", "/garrett": "garrett", "/belt": "belt" }[word];
       if (word === "/posture" && !/^(normal|defend)$/i.test(rest)) return "Usage: /posture defend | normal. DEFEND freezes the runtime, reports bot checks instead of working through them, names this tot in every request and keeps it to read-only verification unless you ask for more.";
       if (word === "/leash" && !/^(\d+|off|none|no)$/i.test(rest)) return `Usage: /leash <seconds> | off. With a leash, no contact from your veil for that long holds the goal loop until it is back; the guard goes on. ${LEASH_MIN_S} to ${LEASH_MAX_S} seconds.`;
       if (word === "/garrett" && !/^(on|off)$/i.test(rest)) return "Usage: /garrett on | off. On, Agent Garrett's security tools (garrett, garrett_tools) are on this tot's belt once your human has deployed the agent (Settings > Deploy Agent Garrett); garrett_launch asks for it until then.";
+      if (word === "/belt" && !/^(auto|map|flat)$/i.test(rest)) return `Usage: /belt auto | map | flat. The tools as a MAP the model walks (open_tools): auto walks only what lies beyond the built-in belt once there are more than ${MAP_AT} tools (Agent Garrett's catalogue); map walks everything but a small core, for a small model; flat is the whole list every call.`;
       this.applyConfig(cfg, { [key]: rest });
       await this.store.put("cfg", cfg);
       if (word === "/posture") await this.emit("status", `posture ${posture(cfg).toUpperCase()}${posture(cfg) === "defend" ? ": the runtime is frozen, bot checks are reported, every request names this tot, read-only unless the human asks for more" : ""}`);
       if (word === "/garrett") await this.emit("status", wantsGarrett(cfg) ? (hasGarrett(this.env) ? "Agent Garrett is on this tot's belt (garrett, garrett_tools)" : "Agent Garrett asked for: its tools are on this tot's belt once your human deploys the agent (garrett_launch asks)") : "Agent Garrett is off this tot's belt");
+      if (word === "/belt") await this.emit("status", `belt ${beltMode(cfg)}: ${{ auto: "the map holds what lies beyond the built-in belt", map: "everything but a small core is reached through open_tools", flat: "every tool is listed on every call" }[beltMode(cfg)]}`);
       return this.settingsLine(cfg) + ".";
     }
     if (word === "/status") return goalStatusText(g);
-    if (word.startsWith("/")) return "Commands: /goal <text> [--forever] [--budget N], /goal stop|resume|status|budget N|forever, /queue <goal>, /charter <text>, /pause, /resume, /pace <seconds>, /size <minds>, /model <id>, /calls <per day>, /guard add|rm|clear ..., /posture defend|normal, /leash <seconds>|off, /garrett on|off. Anything else is a message this tot reads at its next iteration.";
+    if (word.startsWith("/")) return "Commands: /goal <text> [--forever] [--budget N], /goal stop|resume|status|budget N|forever, /queue <goal>, /charter <text>, /pause, /resume, /pace <seconds>, /size <minds>, /model <id>, /calls <per day>, /guard add|rm|clear ..., /posture defend|normal, /leash <seconds>|off, /garrett on|off, /belt auto|map|flat. Anything else is a message this tot reads at its next iteration.";
     // Plain words: a directive the next iteration reads. Nobody answers it in person; the work does.
     const inbox = (await this.store.get("inbox")) ?? [];
     inbox.push({ t: now, from: "human", text: clip(text, 4000) });
@@ -1634,20 +2659,120 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
   /// at all. So the budgets here are roomy, and an empty answer is asked once more with three times the room;
   /// one that is still empty is an error the iteration reports, never a step.
   async ask(cfg, messages, maxTokens) {
-    const text = await this.askOnce(cfg, messages, maxTokens);
+    // what this tot has learned about the chosen model (never about its vendor): the room it needs, whether the
+    // day went to the fallback, whether its window is smaller than the loop's
+    const q = await this.quirk(cfg.model);
+    const today = dayOf(this.now());
+    const c = q.route === "fallback" && q.day === today && cfg.model !== FALLBACK_MODEL ? { ...cfg, model: FALLBACK_MODEL } : cfg;
+    const qc = c === cfg ? q : await this.quirk(c.model); // the room is the answering model's
+    const room = maxTokens * (qc.tokens_x >= 3 ? 3 : 1);
+    let text;
+    try {
+      text = await this.askOnce(c, messages, room);
+    } catch (e) {
+      text = await this.healCall(c, messages, room, e);
+    }
     if (text.length > 0) return text;
-    const again = await this.askOnce(cfg, messages, maxTokens * 3);
-    if (again.length > 0) return again;
+    if (room === maxTokens) {
+      const again = await this.askOnce(c, messages, maxTokens * 3);
+      if (again.length > 0) {
+        // it answers with three times the room: after EMPTY_LEARN such rescues it is asked for that room first
+        const learned = await this.learnQuirk(c.model, (x) => {
+          x.empties = (x.empties ?? 0) + 1;
+          if (x.empties >= EMPTY_LEARN && !(x.tokens_x >= 3)) {
+            x.tokens_x = 3;
+            return true;
+          }
+          return false;
+        });
+        if (learned) await this.emit("status", `learned: ${c.model} answers only with three times the room (its reasoning eats the rest); it is asked for that room first from now on`);
+        return again;
+      }
+    }
     // Still nothing visible: the same question goes to a model that does not reason, so the iteration goes on.
-    if (cfg.model !== FALLBACK_MODEL) {
-      const rescue = await this.askOnce({ ...cfg, model: FALLBACK_MODEL }, messages, maxTokens).catch(() => "");
+    let rescueWhy = "";
+    if (c.model !== FALLBACK_MODEL) {
+      const rescue = await this.askOnce({ ...c, model: FALLBACK_MODEL }, messages, maxTokens).catch((e) => {
+        rescueWhy = String(e?.message ?? e); // a provider error on the fallback is said, not read as silence
+        return "";
+      });
       if (rescue.length > 0) {
-        if (!this.tick || !this.tick.rescued) await this.emit("status", `${cfg.model} returned no visible answer; ${FALLBACK_MODEL} answered instead (/model <id> picks another)`);
+        if (!this.tick || !this.tick.rescued) await this.emit("status", `${c.model} returned no visible answer; ${FALLBACK_MODEL} answered instead (/model <id> picks another)`);
         if (this.tick) this.tick.rescued = true;
+        // RESCUE_LEARN rescues in one UTC day: the rest of the day goes to the fallback, and tomorrow the chosen
+        // model is tried again (the human's setting is untouched)
+        const routed = await this.learnQuirk(c.model, (x) => {
+          if (x.day !== today) {
+            x.day = today;
+            x.rescues = 0;
+            x.route = "";
+          }
+          x.rescues = (x.rescues ?? 0) + 1;
+          if (x.rescues >= RESCUE_LEARN && x.route !== "fallback") {
+            x.route = "fallback";
+            return true;
+          }
+          return false;
+        });
+        if (routed) await this.emit("status", `${c.model} answered nothing ${RESCUE_LEARN} times today; ${FALLBACK_MODEL} answers for it until tomorrow (UTC), then ${c.model} is tried again. /model <id> picks another`);
         return rescue;
       }
     }
-    throw new Error(`the model (${cfg.model}) returned no text twice - it may be spending its whole reply on reasoning; /model <id> picks another`);
+    throw new Error(`the model (${c.model}) returned no text twice${rescueWhy ? `, and ${FALLBACK_MODEL} failed: ${clip(rescueWhy, 200)}` : ""} - it may be spending its whole reply on reasoning; /model <id> picks another`);
+  }
+
+  /// A model call failed: the remedy for its class is learned for that model and the call is retried ONCE.
+  /// `context` (its window is smaller than the loop's): the window halves for this model and the messages are
+  /// cut to it; `missing` (no such model): the fallback answers and the day is routed there. Any other error, or
+  /// a failed remedy, surfaces the original error: every heal is fail-open.
+  async healCall(cfg, messages, room, e) {
+    const kind = classifyModelError(e?.message ?? e);
+    if (kind === "context") {
+      const first = await this.learnQuirk(cfg.model, (x) => {
+        if (x.ctx_small) return false;
+        x.ctx_small = true;
+        return true;
+      });
+      if (first) await this.emit("status", `learned: ${cfg.model} has a smaller window than the loop assumed; its messages are held to half from now on`);
+      try {
+        return await this.askOnce(cfg, recentMessages(messages, Math.floor(LOOP_BYTES / 2)), room);
+      } catch (again) {
+        throw new Error(`${e?.message ?? e}; retried with the messages halved: ${again?.message ?? again}`, { cause: e });
+      }
+    }
+    if (kind === "missing" && cfg.model !== FALLBACK_MODEL) {
+      const first = await this.learnQuirk(cfg.model, (x) => {
+        const today = dayOf(this.now());
+        const was = x.route;
+        x.day = today;
+        x.route = "fallback";
+        x.missing = true;
+        return was !== "fallback";
+      });
+      if (first) await this.emit("status", `${cfg.model} is not available in this account (${clip(e?.message ?? e, 120)}); ${FALLBACK_MODEL} answers for it today. /model <id> picks another`);
+      try {
+        return await this.askOnce({ ...cfg, model: FALLBACK_MODEL }, messages, room);
+      } catch (again) {
+        throw new Error(`${e?.message ?? e}; ${FALLBACK_MODEL} also failed: ${again?.message ?? again}`, { cause: e });
+      }
+    }
+    throw e;
+  }
+
+  /// What is known about one model, by name: `{tokens_x, empties, rescues, day, route, ctx_small, missing}`.
+  async quirk(model) {
+    const all = (await this.store.get("quirks")) ?? {};
+    return all[model] ?? {};
+  }
+
+  /// Change what is known about a model; `change` returns whether something NEW was learned (the caller says so once).
+  async learnQuirk(model, change) {
+    const all = (await this.store.get("quirks")) ?? {};
+    const q = all[model] ?? {};
+    const learned = change(q) === true;
+    all[model] = q;
+    await this.store.put("quirks", all);
+    return learned;
   }
 
   async askOnce(cfg, messages, maxTokens) {
@@ -1666,7 +2791,7 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
     const shapes = (await this.store.get("shapes")) ?? {};
     const known = shapes[cfg.model];
     const first = known === "input" ? "input" : "messages";
-    const bounded = recentMessages(messages);
+    const bounded = recentMessages(messages, (await this.quirk(cfg.model)).ctx_small ? Math.floor(LOOP_BYTES / 2) : LOOP_BYTES);
     const run = (shape) => this.env.AI.run(cfg.model, shape === "input" ? { input: bounded, max_output_tokens: maxTokens } : { messages: bounded, max_tokens: maxTokens });
     const accept = async (shape, result) => {
       if (shapes[cfg.model] !== shape) {
@@ -1788,21 +2913,47 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
     }
     const tools = toolsFor(this.env, cfg);
     const system = this.systemPrompt(cfg, g, lessons, padTail) + (await this.guardText(cfg)) + (await this.workingMemory());
-    const inboxText = inbox.length > 0 ? "\nNEW MESSAGES (a message from human or guard is a directive and outranks your own plan):\n" + inbox.map((m) => `- ${m.from}: ${m.text}`).join("\n") + "\n" : "";
+    const directives = inbox.map((m) => `- ${m.from}: ${m.text}`);
+    const runtimeNote = await this.runtimeHealth();
+    if (runtimeNote) directives.push(runtimeNote);
+    const inboxText = directives.length > 0 ? "\nNEW MESSAGES (a message from human or guard is a directive and outranks your own plan):\n" + directives.join("\n") + "\n" : "";
 
-    // PICK
-    const pick = pickText(await this.ask(cfg, [{ role: "system", content: system + "\nAVAILABLE TOOLS:\n" + toolIndex(tools) + "\n" + missingNote(this.env, cfg) }, { role: "user", content: inboxText + pickQuestion(g, rows) }], 2000));
+    // PICK. With a belt past MAP_AT tools the plan sees the core one line each and the map's groups by the
+    // NAMES of their tools (every tool stays visible to the plan; no tool's line is paid for twice).
+    const learned = new Learned(await this.store.get("belt_learned"));
+    const shape = beltFor(cfg, tools, "", [], null);
+    const pickSystem = system + "\nAVAILABLE TOOLS:\n" + (shape ? mapIndex(shape) : toolIndex(tools)) + "\n" + missingNote(this.env, cfg);
+    let pick = pickText(await this.ask(cfg, [{ role: "system", content: pickSystem }, { role: "user", content: inboxText + pickQuestion(g, rows) }], 2000));
     const checkDone = !g.forever && /^["'`*\s]*DONE\b/.test(pick) && pick.length < 40;
+    // a pick that repeats an earlier iteration's step (the rules say never to) is asked once more for a changed
+    // method; a model that repeats itself twice goes on with it, measured as before
+    if (!checkDone && repeatedStep(pick, rows)) {
+      const again = pickText(await this.ask(cfg, [{ role: "system", content: pickSystem }, { role: "user", content: inboxText + pickQuestion(g, rows) + `\n\nYour previous answer repeated an earlier iteration: "${clip(pick, 200)}". Name a DIFFERENT method, target or source; retrying what was already measured is a wasted iteration.` }], 2000));
+      if (again.length > 0 && !repeatedStep(again, rows)) pick = again;
+      else await this.emit("status", `the pick repeats an earlier iteration (${clip(pick, 120)}); asked once for a changed method and got none, so it is measured again`, { ok: false });
+    }
     if (checkDone) {
       const cur = await this.store.get("goal"); // as stored now: a command may have landed while the model answered
       if (!cur || cur.id !== g.id || cur.status !== "active" || cur.forever) return 5;
     }
     const step = checkDone ? "Verify the entire goal with tools: inspect the requested artifact or source confirmation, compare it with every success criterion, and report any remaining gap. DONE is a claim until this check succeeds." : clip(pick, 1200);
-    await this.emit("pick", step, { i: g.iteration + 1 });
+    // `map`: the pick saw the belt as a map (TOOL MAP block); `net`: characters of the last iteration's net it carried
+    await this.emit("pick", step, { i: g.iteration + 1, map: !!shape, net: ((await this.store.get("last_work"))?.net ?? "").length });
 
-    // DO
+    // DO. The belt as a map (beltFor): the step's own words open the best group before the model moves, the
+    // previous step's open set is restored, and what the step calls is learned for the next pre-walk.
     const record = [];
-    const claim = await this.toolLoop(cfg, system + "\n\nTOOLS:\n" + toolList(tools) + "\n" + missingNote(this.env, cfg) + "\n" + REPLY_RULE, inboxText + "THIS ITERATION'S STEP: " + step, tools, TOOL_ROUNDS, record, "");
+    const walk = beltFor(cfg, tools, step, (await this.store.get("belt_open")) ?? [], learned);
+    const systemFor = (w) => system + "\n\nTOOLS:\n" + toolList(w ? w.tools() : tools) + "\n" + missingNote(this.env, cfg) + (w ? "\n" + DOCTRINE + "\n" : "\n") + REPLY_RULE;
+    const loop = { walk, messages: null };
+    const claim = await this.toolLoop(cfg, systemFor, inboxText + "THIS ITERATION'S STEP: " + step, tools, TOOL_ROUNDS, record, "", loop);
+    if (walk) {
+      walk.finish();
+      await this.store.put("belt_open", walk.save());
+      await this.store.put("belt_learned", learned.rows());
+    }
+    // the net (Gary's 4tope): what this iteration's frontier rested on, laid out for the next one
+    const net = loop.messages ? netOf(loop.messages, filesWritten(record)) : "";
 
     // MEASURE
     const transcript = record.length > 0 ? record.map((r, i) => `T${i + 1} TOOL ${r.tool}(${clip(JSON.stringify(r.args), 300)}) -> ${resultExcerpt(r.result)}`).join("\n") : "(no tool was used)";
@@ -1832,6 +2983,7 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
     await this.store.put("last_work", {
       t: this.now(), goal: clip(g.text, 400), step: clip(step, 400), outcome, evidence: row.evidence,
       results: [...new Set([...failed, ...observed])].map((r) => `${r.tool}: ${resultExcerpt(r.result, 500)}`).join("\n"),
+      net,
     });
     await this.store.put("fails", 0);
     const mood = Tot.moodOf(g, outcome);
@@ -1900,21 +3052,68 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
     }
   }
 
-  /// The do loop: the model answers with one JSON action at a time until it answers {"final": ...}.
-  async toolLoop(cfg, system, task, tools, rounds, record, mind) {
+  /// A runtime revision that failed to deploy reaches the iteration as a directive, once per revision: the way
+  /// back (runtime_revert) is named, so a broken draft never stays the current revision unnoticed.
+  async runtimeHealth() {
+    let r;
+    try {
+      r = await (await call(stubFor(this.env, "pad"), "/runtime/state")).json();
+    } catch {
+      return "";
+    }
+    if (!r?.ok || !r.initialized || r.status !== "failed") return "";
+    if ((await this.store.get("runtime_failed_seen")) === r.revision) return "";
+    await this.store.put("runtime_failed_seen", r.revision);
+    await this.emit("status", `runtime revision ${r.revision} failed to deploy: ${clip(r.error, 200)}`, { ok: false });
+    return `- runtime: revision ${r.revision} of your runtime FAILED to deploy (${clip(r.error, 300)}). The Worker still runs revision ${r.deployed_revision}. Fix the source (runtime_read, runtime_edit, runtime_deploy) or restore the deployed source with runtime_revert {"revision": ${r.revision}}; do not leave a broken draft as the current revision.`;
+  }
+
+  /// The do loop: the model answers with one JSON action at a time until it answers {"final": ...}. `system` is
+  /// the text, or a function of the walk when the belt is a map (the TOOLS list is rebuilt when the open set
+  /// changes). `loop.walk` is the step's walk; `loop.messages` is left holding the loop's messages, for the net.
+  async toolLoop(cfg, system, task, tools, rounds, record, mind, loop) {
+    const walk = loop?.walk ?? null;
+    const systemFor = typeof system === "function" ? system : () => system;
     const names = new Set(tools.map((t) => t.name));
-    const messages = [{ role: "system", content: system }, { role: "user", content: task }];
+    let messages = [{ role: "system", content: systemFor(walk) }, { role: "user", content: task }];
+    if (loop) loop.messages = messages;
     let nudged = false;
+    const limit = (await this.quirk(cfg.model)).ctx_small ? Math.floor(LOOP_BYTES / 2) : LOOP_BYTES;
     for (let round = 0; round < rounds; round++) {
+      if (walk?.dirty) messages[0] = { role: "system", content: systemFor(walk) };
+      // past the window the rounds FOLD into a net (Gary's 4tope): the chain's results stay, the rest ride as
+      // verbatim lines, and the oldest round is no longer simply the one that goes
+      const folded = netFold(messages, limit, filesWritten(record));
+      if (folded !== messages) {
+        messages = folded;
+        if (loop) loop.messages = messages;
+        await this.emit("status", `${mind ? mind + " " : ""}the step's earlier rounds folded into a net (Gary's 4tope, ${messages[2].content.length} characters laid out from where the loop stands); the newest ${Math.floor((messages.length - 3) / 2)} round(s) stay whole`);
+      }
       const reply = await this.ask(cfg, messages, 4000);
+      walk?.tick();
       const act = parseAction(reply);
       if (act && typeof act.final === "string") return act.final;
       if (act && typeof act.tool === "string") {
         act.tool = ALIASES[act.tool] ?? act.tool;
-        const args = act.args;
+        const args = act.args && typeof act.args === "object" && !Array.isArray(act.args) ? act.args : {};
+        if (walk && act.tool === NAV_TOOL) {
+          // navigation: the engine answers, no tool runs, and the judge never sees it as a result
+          const view = walk.navigate(args);
+          await this.emit("act", `${mind ? mind + " " : ""}open_tools ${clip(JSON.stringify(args), 300)} -> ${clip(view, 1500)}`, {
+            tool: NAV_TOOL,
+            brief: clip(`${mind ? mind + " " : ""}open_tools ${clip(JSON.stringify(args), 60)} -> ${clip(view.split("\n")[0], 100)}`, 180),
+            ok: true,
+          });
+          messages.push({ role: "assistant", content: clip(reply, 2000) });
+          messages.push({ role: "user", content: `RESULT of open_tools:\n${view}\n\n${round + 2 >= rounds ? 'This is your last call for this step: reply {"final": ...} now.' : "Next action, or the final answer."}` });
+          continue;
+        }
         let result;
-        if (!names.has(act.tool)) result = `no such tool: ${act.tool}. Tools: ${[...names].join(", ")}`;
+        let opened = null;
+        if (!names.has(act.tool)) result = `no such tool: ${act.tool}. Tools: ${walk ? 'the ones listed; open_tools find="<what you need>" searches the rest of the map' : [...names].join(", ")}`;
         else {
+          // a known name opens its group (the model never walks for a tool it knows) and runs in this round
+          opened = walk ? walk.noteCall(act.tool) : null;
           try {
             result = await this.runTool(cfg, act.tool, args, mind);
           } catch (e) {
@@ -1932,7 +3131,8 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
         });
         messages.push({ role: "assistant", content: clip(reply, 2000) });
         const retry = resultFailed(result) ? "This attempt failed. Diagnose its cause and change the method or repair the prerequisite before retrying; saving this error is not success.\n" : "Check whether this result meets the step's success criterion; an acknowledgement alone is not verification.\n";
-        messages.push({ role: "user", content: `RESULT of ${act.tool}:\n${resultExcerpt(result, 8000)}\n\n${retry}${round + 2 >= rounds ? 'This is your last call for this step: reply {"final": ...} now.' : "Next action, or the final answer."}` });
+        const note = opened ? `(${act.tool} opened ${opened}: its tools are callable by name now.)\n` : "";
+        messages.push({ role: "user", content: `RESULT of ${act.tool}:\n${resultExcerpt(result, 8000)}\n\n${retry}${note}${round + 2 >= rounds ? 'This is your last call for this step: reply {"final": ...} now.' : "Next action, or the final answer."}` });
         continue;
       }
       if (!nudged && round + 1 < rounds) {
@@ -1998,6 +3198,8 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
     let out = "";
     const last = await this.store.get("last_work");
     if (last) out += `LAST MEASURED WORK (also applies when a goal changes):\n${new Date(last.t).toISOString()} | ${last.outcome}: ${last.evidence}\nGoal: ${last.goal}\nStep: ${last.step}\n${last.results}\n`;
+    // the last iteration's net (Gary's 4tope): what its frontier rested on and what it ruled out, verbatim
+    if (last?.net) out += `LAST ITERATION'S NET (its rounds laid out from where it ended; every line verbatim from a tool result):\n${last.net}`;
     const plan = (await this.store.get("plan")) ?? [];
     if (plan.length > 0) out += "YOUR PLAN (plan_done ticks an item, plan_set rewrites it):\n" + plan.map((p, i) => `${i + 1}. [${p.done ? "x" : " "}] ${p.text}`).join("\n") + "\n";
     const facts = (await this.store.get("facts")) ?? [];
@@ -2059,7 +3261,7 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
     }
     if ((tool.startsWith("security_") || tool === "garrett" || tool === "garrett_tools") && !wantsGarrett(cfg)) return "Agent Garrett is not enabled for this tot. Use /garrett on to enable its full toolset.";
     if (tool.startsWith("security_")) return this.garrettCall(cfg, "tools/call", {name:tool.slice(9), arguments:args}, "call");
-    if (["runtime_read", "runtime_edit", "runtime_deploy"].includes(tool)) {
+    if (["runtime_read", "runtime_edit", "runtime_deploy", "runtime_revert"].includes(tool)) {
       if (tool !== "runtime_read" && posture(cfg) === "defend") return "ERROR: posture is DEFEND: the runtime is frozen until your human sets /posture normal";
       const result = await (await call(stubFor(this.env, "pad"), "/runtime/" + tool.slice(8), { ...args, author: cfg.name })).json();
       if (result.ok && tool === "runtime_read") {
@@ -2112,9 +3314,16 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
       case "http_request":
         return this.http(String(args.method ?? "GET").toUpperCase(), String(args.url ?? ""), args.headers, args.body, cfg);
       case "garrett_tools":
-        return this.garrettCall(cfg, "tools/list", {}, "list");
-      case "garrett":
-        return this.garrettCall(cfg, "tools/call", { name: String(args.name ?? args.tool ?? "").trim().toLowerCase(), arguments: args.args && typeof args.args === "object" && !Array.isArray(args.args) ? args.args : args.arguments && typeof args.arguments === "object" && !Array.isArray(args.arguments) ? args.arguments : {} }, "call");
+        // the catalogue this tot's belt already holds, by branch and by the names the belt uses - every tool on
+        // one screen; the agent's own list (every schema inline) only when the belt has none
+        return (this.env.SECURITY_TOOLS ?? []).length > 0 ? beltListing(this.env.SECURITY_TOOLS) : this.garrettCall(cfg, "tools/list", {}, "list");
+      case "garrett": {
+        // the belt's name (security_<x>) and the agent's own (<x>) are the same tool: both are taken
+        const name = String(args.name ?? args.tool ?? "").trim().toLowerCase().replace(/^security_/, "");
+        const known = this.env.SECURITY_TOOLS ?? [];
+        if (/^[a-z][a-z0-9_]{1,40}$/.test(name) && known.length > 0 && !known.some((t) => t.name === "security_" + name)) return `ERROR: Agent Garrett has no tool named ${name}.${nearestSecurity(name, known)} garrett_tools lists them by branch; call one by its security_ name, with tool_schema for its arguments.`;
+        return this.garrettCall(cfg, "tools/call", { name, arguments: args.args && typeof args.args === "object" && !Array.isArray(args.args) ? args.args : args.arguments && typeof args.arguments === "object" && !Array.isArray(args.arguments) ? args.arguments : {} }, "call");
+      }
       case "garrett_launch": {
             if (hasGarrett(this.env)) return "Agent Garrett is already up; garrett_tools lists its tools";
         const r = await (await call(stubFor(this.env, "pad"), "/garrett/request", { by: who })).json();
@@ -2549,7 +3758,9 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
     }
     const out = (Array.isArray(j.result?.content) ? j.result.content : []).filter((c) => c?.type === "text").map((c) => c.text).join("\n");
     const meta = j.result?.structuredContent ? "\nEVIDENCE: " + clip(JSON.stringify(j.result.structuredContent), 600) : "";
-    return (j.result?.isError ? "FAILED: " : "") + clip(out || "(no text)", 12000) + meta;
+    // a name the agent does not know: the way to the right one is named, not just the refusal
+    const hint = j.result?.isError && /^Unknown tool\b/i.test(out) ? `\n${nearestSecurity(params.name, this.env.SECURITY_TOOLS ?? []).trim()} garrett_tools lists Agent Garrett's tools by branch; call one by its security_ name (the garrett wrapper takes that name too), with tool_schema for its arguments.`.replace(/^\n /, "\n") : "";
+    return (j.result?.isError ? "FAILED: " : "") + clip(out || "(no text)", 12000) + meta + hint;
   }
 
   /// Search the web: the first engine that answers with results. An engine that blocks or returns nothing is
@@ -2966,15 +4177,17 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
     const width = Math.min(cfg.size, Math.max(2, cfg.minds));
     const run = tasks.slice(0, width);
     const tools = toolsFor(this.env, cfg).filter((t) => MIND_TOOLS.has(t.name) || t.name.startsWith("security_"));
-    const system =
+    // a mind walks the same map as its tot (its task is the cue; what the tot has learned ranks the branches)
+    const learned = new Learned(await this.store.get("belt_learned"));
+    const systemFor = (w) =>
       `You are one mind of ${cfg.name}'s swarm: you have ONE task, a few tool calls, and nobody to ask. Do the task and report what the tool results showed.\n\nTOOLS:\n` +
-      toolList(tools) + "\n\n" + REPLY_RULE;
+      toolList(w ? w.tools() : tools) + (w ? "\n" + DOCTRINE : "") + "\n\n" + REPLY_RULE;
     await this.emit("swarm", `cast ${run.length} mind(s)${tasks.length > run.length ? ` (${tasks.length - run.length} task(s) left out: this tot runs ${width} at a time now)` : ""}`);
     const reports = await Promise.all(
       run.map(async (task, i) => {
         const mind = "m" + (i + 1);
         try {
-          return `MIND ${i + 1} (${clip(task, 160)}): ${clip(await this.toolLoop(cfg, system, task, tools, MIND_ROUNDS, [], mind), 1500)}`;
+          return `MIND ${i + 1} (${clip(task, 160)}): ${clip(await this.toolLoop(cfg, systemFor, task, tools, MIND_ROUNDS, [], mind, { walk: beltFor(cfg, tools, task, [], learned) }), 1500)}`;
         } catch (e) {
           if (e instanceof TickBudget) return `MIND ${i + 1}: stopped, ${e.message}`;
           return `MIND ${i + 1}: ERROR ${clip(e?.message ?? e, 200)}`;
@@ -3009,7 +4222,8 @@ ${cfg.name} now looks for the next best thing; /pause holds it still.` : "");
           1000,
         );
         const text = clip(reply.replace(/^[-*\s"']+|["'\s]+$/g, ""), 200);
-        if (text.length > 12 && !/^NONE\b/i.test(text) && !lessons.some((l) => l.text.toLowerCase() === text.toLowerCase())) {
+        // a rule the tot already has in other words is not a second rule
+        if (text.length > 12 && !/^NONE\b/i.test(text) && !lessons.some((l) => similarText(l.text, text) >= 0.7)) {
           if (lessons.length >= LESSONS_MAX) {
             // Drop the rule with the worst record; among equals, the oldest.
             let worst = 0;
