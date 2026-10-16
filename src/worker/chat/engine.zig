@@ -31,6 +31,7 @@ const modelcfg = @import("modelcfg"); // a MODULE (src/worker/modelcfg.zig) — 
 const cctx = @import("context.zig");
 const toolmap = @import("belt.zig"); // the tool map: the belt as a tree the model walks (opt-in, NL_TOOL_MAP)
 const dag = @import("net.zig"); // Gary's 4tope: the working span as a DAG — the critical chain a prune keeps, the unfolding a cut carries
+const nstore = @import("store.zig"); // Gary's 4tope as the memory: every message captured as the chat runs, requests unfolded from it
 const wsp = @import("workspace.zig"); // prompt workspace: typed bids -> fixed-order scored admission + decision log
 const ovl = @import("overlay.zig"); // recall overlay: the working field settled around every thought
 const builtin_mod = @import("../builtin.zig"); // the built-in engine's sentinel + LIVE served-window publication
@@ -183,6 +184,13 @@ const CONTINUE_SEGMENT_MSG = "Continue this work from the CONTINUATION STATE abo
 /// wording states the mechanism and that the work is intact, which is true whether the reader is a person, the
 /// desk's idle re-prompt, or a scheduled driver.
 const TOKEN_CEILING_NOTE = "engine: the working context for this stretch was COMPACTED.";
+/// What the spend ceiling writes under NL_CONTEXT=net once the turn's allowance is spent. Nothing was compacted —
+/// every request is unfolded from the store — so it says what did happen, in the engine's voice, and where the
+/// work is.
+const NET_CEILING_NOTE = "engine: this turn reached its spend ceiling and stopped. Everything it did is in this conversation's store and is laid out again from there on the next turn.";
+/// The least room the store's net gets in a request (NL_CONTEXT=net), however much the newest rounds take: enough
+/// for the asks, the failures and the nearest results of the work so far.
+const NET_MIN_BUDGET_BYTES: usize = 4 * 1024;
 /// CONTINUATION-STATE WRITER (thinking). Deliberately NOT summarizeWorkingSpan's prompt.
 ///
 /// That one compresses a working log so the SAME turn can keep going — its reader still holds the verbatim tail
@@ -3159,6 +3167,41 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     // tool-result turns so the model always sees full context. First object has no leading comma; rest do.
     var conv_buf: std.ArrayListUnmanaged(u8) = .empty;
     defer conv_buf.deinit(gpa);
+
+    // THE STORE (store.zig, Gary's 4tope as the memory): every message of this turn is captured into
+    // {conv}/graph.jsonl as it lands, and each tool result's payload into neuron-db as a document of its own. Under
+    // NL_CONTEXT=net every request is then unfolded from the store: no fold, no carry, no rolling summary.
+    var store: ?nstore.Store = if (netContextOn(ctx.environ.get("NL_CONTEXT")) or storeCaptureOn(ctx.environ.get("NL_CONTEXT_CAPTURE")))
+        (nstore.Store.init(gpa, app.io, conv_dir, mem_scope, storeGate) catch null)
+    else
+        null;
+    defer if (store) |*s| s.deinit();
+    const net_on = store != null and netContextOn(ctx.environ.get("NL_CONTEXT"));
+    if (store) |*s| {
+        if (s.torn > 0) {
+            var tb: [160]u8 = undefined;
+            emitKV(app, conv_dir, "trace", "text", std.fmt.bufPrint(&tb, "context: the store skipped {d} line(s) of graph.jsonl that do not parse (a torn write)", .{s.torn}) catch "context: the store skipped lines of graph.jsonl that do not parse");
+        }
+        s.captureAsk(user_text);
+    }
+    // the turn's last messages (the final answer, a cut's partial) are captured on every way out of the turn
+    defer if (store) |*s| {
+        s.capture(conv_buf.items);
+        if (s.takeDocs()) |d| {
+            defer gpa.free(d);
+            _ = ctx.mem.importDocs(d);
+        }
+    };
+    // recall_node rides the belt only where there is a net naming node ids
+    var recall_tools_owned: ?[]u8 = null;
+    defer if (recall_tools_owned) |t| gpa.free(t);
+    if (net_on and turn_tools.len > 1 and turn_tools[turn_tools.len - 1] == ']') {
+        if (std.fmt.allocPrint(gpa, "{s}{s}{s}]", .{ turn_tools[0 .. turn_tools.len - 1], if (turn_tools.len > 2) "," else "", RECALL_NODE_DEF })) |t| {
+            recall_tools_owned = t;
+            turn_tools = t;
+        } else |_| {}
+    }
+    if (net_on) emitKV(app, conv_dir, "trace", "text", "context: NL_CONTEXT=net — every request is unfolded from the conversation's store (Gary's 4tope); nothing is folded or carried");
     conv_buf.appendSlice(gpa, "{\"role\":\"system\",\"content\":") catch return;
     // Tier-paired with the belt: the compact belt gets the compact prompt. One decides WHAT is advertised, the
     // other WHAT is taught — a small model must never be taught a verb its belt doesn't advertise (the
@@ -3472,7 +3515,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
             ctx_plan.hist_win / 1024, ctx_plan.summary_cap / 1024, ctx_plan.facts_budget / 1024, ctx_plan.chunk_bytes / 1024, ctx_plan.shape.words, ctx_plan.net_budget / 1024,
         })) |t| emitKV(app, conv_dir, "trace", "text", t) else |_| {}
     }
-    assembleHistory(app, conv_dir, user_text, &conv_buf, ws_packed.varying, ctx_plan);
+    assembleHistory(app, conv_dir, user_text, &conv_buf, ws_packed.varying, ctx_plan, if (net_on) &store.? else null);
     conv_buf.appendSlice(gpa, ws_packed.suffix) catch {};
 
     if (ws_packed.log.len > 0) {
@@ -3658,6 +3701,8 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     // offset and cut the TURN BRIEF 23 bytes short of its closing quote, and the next ~70 calls went out unparsable.
     var assembled_len = conv_buf.items.len;
     const assembled_msgs = llm.msgCount(conv_buf.items);
+    // the store captures everything after the assembled prefix (counted in messages, so a heal cannot move it)
+    if (store) |*s| s.setPrefix(conv_buf.items);
 
     // TERMINAL VERIFY, contract-aware: the generic paragraph plus THIS turn's done_when list, so the one
     // completeness check an armed loop gets before accepting DONE names the specific conditions that must hold
@@ -3892,7 +3937,13 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
         // across steps. No-op on the first step (nothing past the assembled prefix yet).
         // Budget keyed on the CODING model + this turn's tool array: coding is what consumes conv_buf, and
         // the schemas ride in the same window. `think` here is only who WRITES the fold.
-        compactWorking(app, conv_dir, llm_dir, think.base_url, think.key, think.model, &conv_buf, assembled_len, &ctx, &tool_obs, workingBudgetBytes(trio.coding.base_url, trio.coding.model, assembled_len + turn_tools.len, win_hint));
+        // THE STORE first: the previous step's settled answer is captured before any fold can rewrite it; under
+        // NL_CONTEXT=net nothing is folded at all (every request is unfolded from the store instead).
+        if (store) |*s| s.capture(conv_buf.items);
+        if (!net_on) {
+            compactWorking(app, conv_dir, llm_dir, think.base_url, think.key, think.model, &conv_buf, assembled_len, &ctx, &tool_obs, workingBudgetBytes(trio.coding.base_url, trio.coding.model, assembled_len + turn_tools.len, win_hint));
+            if (store) |*s| s.resync(conv_buf.items);
+        }
 
         // PLAN STEP: when a plan is active, take the next pending subtask and inject it as this step's working turn
         // (so the agentic pass works THAT subtask, route-hinted). No plan → drive step 0 works the user's message
@@ -3969,7 +4020,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
 
         // Run one agentic tool pass to a SETTLED (no-tool-call) answer.
         const mut_before = file_ledger.mutations;
-        const inner = runInnerAgentic(app, uid, conv, conv_dir, llm_dir, trio, &conv_buf, &ctx, &steer_cursor, &tool_obs, &tool_perf, tool_client, &no_ack_streak, &dud_fetches, &poll_timeouts, &tools_spent, tool_budget, token_ceiling, &echo_guard, &call_ledger, &file_ledger, foreign_mem.items, &foreign_warned, search_intent, &search_log, turn_tools, if (map_walk) |*mw| mw else null, if (overlay) |*o| o else null);
+        const inner = runInnerAgentic(app, uid, conv, conv_dir, llm_dir, trio, &conv_buf, &ctx, &steer_cursor, &tool_obs, &tool_perf, tool_client, &no_ack_streak, &dud_fetches, &poll_timeouts, &tools_spent, tool_budget, token_ceiling, &echo_guard, &call_ledger, &file_ledger, foreign_mem.items, &foreign_warned, search_intent, &search_log, turn_tools, if (map_walk) |*mw| mw else null, if (overlay) |*o| o else null, if (store) |*s| s else null, net_on);
         replies.notePass(inner.tools_ran); // every outcome: a roll-on segment's tools ran this turn too
         followFreeze(app, conv_dir, conv_buf.items, assembled_msgs, &assembled_len); // the pass may have healed the prefix
         // TRAJECTORY THREAD (fine weave): a pass that LANDED file changes mints one provenance-labeled
@@ -4078,6 +4129,34 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
                 // asked to stop SPENDING; buying them another 90-second inference is the opposite of that, and
                 // the stopRequestedSince re-check covers a Stop that landed in the microseconds since the cut
                 // (llm.complete blocks and has no abort hook, unlike the streamed turn call).
+                // NO CARRY (NL_CONTEXT=net): every request is unfolded from the store, so the context did not grow
+                // and there is nothing to distil, drop or re-seed. The spend ceiling is what the design keeps it as —
+                // a runaway backstop: the turn goes on under the same earned allowance, and settles with a plain
+                // engine note once that is spent. The loop guard keeps its own path below (repetition is not cured by
+                // more of the same).
+                if (net_on and inner.engine_note.len > 0 and !std.mem.eql(u8, inner.engine_note, LOOP_STOP_NOTE)) {
+                    const seg_progress = file_ledger.files.items.len > seg_files or call_ledger.items.len > seg_calls;
+                    if (seg_progress and max_continues + earned < continue_hard_max) earned += 1;
+                    seg_files = file_ledger.files.items.len;
+                    seg_calls = call_ledger.items.len;
+                    const allowance: u32 = if (max_continues == 0) 0 else @min(max_continues + earned, continue_hard_max);
+                    if (continues < allowance and !stopRequestedSince(app, conv_dir, steer_cursor)) {
+                        if (token_cap != 0) token_ceiling = spendOf(llm.tokensSnapshot()) + token_cap;
+                        max_steps = @max(max_steps, drive + 1 + LOOP_MAX_STEPS);
+                        continues += 1;
+                        var sb3: [192]u8 = undefined;
+                        emitKV(app, conv_dir, "status", "text", std.fmt.bufPrint(&sb3, "spend ceiling reached — continuing (pass {d}/{d}); nothing is carried, every request is unfolded from the store", .{ continues, allowance }) catch "spend ceiling reached — continuing");
+                        gpa.free(inner.content);
+                        gpa.free(inner.engine_note);
+                        continue :outer;
+                    }
+                    appendMsg(app, conv_dir, "system", NET_CEILING_NOTE, "engine", nowSecs(app.io));
+                    emitEngineNote(app, conv_dir, NET_CEILING_NOTE);
+                    gpa.free(inner.content);
+                    gpa.free(inner.engine_note);
+                    finishTurn(app, conv_dir, usage_t0);
+                    return;
+                }
                 if (inner.engine_note.len > 0) {
                     var handoff: []u8 = &[_]u8{};
                     defer if (handoff.len > 0) gpa.free(handoff);
@@ -4197,8 +4276,10 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
                         seed.appendSlice(gpa, "}") catch break :roll;
                         // Drop the span that tripped the ceiling. The seed is orders of magnitude smaller than
                         // what was just dropped, so the append reuses retained capacity rather than growing.
+                        if (store) |*s| s.capture(conv_buf.items); // the store keeps what the roll drops
                         conv_buf.shrinkRetainingCapacity(cutEdge(app, conv_dir, conv_buf.items, assembled_len));
                         conv_buf.appendSlice(gpa, seed.items) catch break :roll;
+                        if (store) |*s| s.resync(conv_buf.items); // the re-seed is the engine's, not the work's
                         // A fresh allowance for the fresh context, and room in the drive loop to spend it —
                         // a plain turn's DRIVE_MAX of 6 would otherwise end the roll before the budget does.
                         if (token_cap != 0) token_ceiling = spendOf(llm.tokensSnapshot()) + token_cap;
@@ -4956,8 +5037,12 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     // and passes carried — goes to {conv}/net.jsonl, and the next turn's assembleHistory projects it (injectNets).
     // The rolling summary reads only messages.jsonl, where a turn's tool results never land, so before this the
     // only trace of a finished turn's work was the assistant's own closing words and whatever recall surfaced.
-    netRecordFromSpan(app, conv_dir, user_text, conv_buf.items[@min(assembled_len, conv_buf.items.len)..], &file_ledger, carryCap(ctx_plan.win_bytes, hist_win));
-    refreshSummary(app, conv_dir, llm_dir, think.base_url, think.key, think.model, ctx_plan);
+    // Under NL_CONTEXT=net neither runs: the store already holds every message of the turn (captured on the way out),
+    // and the next turn's requests are unfolded from it — no record of a net, no rolling summary to fold.
+    if (!net_on) {
+        netRecordFromSpan(app, conv_dir, user_text, conv_buf.items[@min(assembled_len, conv_buf.items.len)..], &file_ledger, carryCap(ctx_plan.win_bytes, hist_win));
+        refreshSummary(app, conv_dir, llm_dir, think.base_url, think.key, think.model, ctx_plan);
+    }
     // NO {done} here: it is emitted by signalDone after the caller releases the conversation slot, so the frame
     // that tells a client "the turn is over" is not followed by a 409 when the client believes it.
 }
@@ -5273,11 +5358,67 @@ fn containsCredentialKey(lower: []const u8) bool {
 /// documents — observing its output would re-mint an entire book back into memory, page by page.
 /// observe/skill acks are bookkeeping, not findings.
 fn memoryEchoTool(name: []const u8) bool {
-    const t = [_][]const u8{ "recall", "recall_hive", "read_doc", "observe", "skill" };
+    const t = [_][]const u8{ "recall", "recall_hive", "read_doc", "observe", "skill", "recall_node" };
     for (t) |n| {
         if (std.mem.eql(u8, name, n)) return true;
     }
     return false;
+}
+
+/// THE STORE'S GATE (store.zig): what of a tool result the conversation store keeps. A get_credential result, or one
+/// whose opening carries a credential-shaped key, is withheld entirely: the store re-shows earlier results in later
+/// turns, and a secret must never recirculate. Narrower than containsCredentialKey on purpose — the store is the
+/// conversation's memory, and a result merely MENTIONING tokens or secrets (code, docs) has to stay recallable.
+/// Memory output keeps its graph line but gets no neuron-db document (re-minting it would launder other scopes).
+fn storeGate(name: []const u8, head: []const u8) nstore.Gate {
+    if (std.mem.eql(u8, name, "get_credential")) return .withhold;
+    var lb: [512]u8 = undefined;
+    const lower = std.ascii.lowerString(lb[0..@min(head.len, lb.len)], head[0..@min(head.len, lb.len)]);
+    const keys = [_][]const u8{ "authorization:", "bearer ", "api_key", "api-key", "apikey", "password", "passwd", "set-cookie", "csrf", "client_secret", "secret_key", "access_token", "refresh_token", "private key" };
+    for (keys) |k| if (std.mem.indexOf(u8, lower, k) != null) return .withhold;
+    if (memoryEchoTool(name)) return .no_docs;
+    return .keep;
+}
+
+/// NL_CONTEXT=net: every request is unfolded from the conversation's store (store.zig) — no fold, no carry, no
+/// rolling summary. Off by default while it is measured against the fold-and-carry path.
+fn netContextOn(env_value: ?[]const u8) bool {
+    const v = std.mem.trim(u8, env_value orelse return false, " \r\n\t");
+    return std.ascii.eqlIgnoreCase(v, "net");
+}
+
+/// The store captures every turn unless NL_CONTEXT_CAPTURE says 0/off (it costs a file append per step and one
+/// neuron-db import per step that produced results).
+fn storeCaptureOn(env_value: ?[]const u8) bool {
+    const v = std.mem.trim(u8, env_value orelse return true, " \r\n\t");
+    return !(v.len == 0 or std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "off"));
+}
+
+const RECALL_NODE_DEF = "{\"type\":\"function\",\"function\":{\"name\":\"recall_node\",\"description\":\"Return one node of this conversation's store whole: an earlier ask, answer or tool result that the WORK SO FAR block names as n<id>. Use it when a line there was cut short and the full text matters.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\",\"description\":\"the number after n in n<id>\"}},\"required\":[\"id\"]}}}";
+
+/// recall_node: the stored line for an id, as the store holds it (role, content, stamps), clipped.
+fn recallNodeTool(app: *App, conv_dir: []const u8, args: []const u8) []u8 {
+    const gpa = app.gpa;
+    const raw_id = std.mem.trim(u8, dag.jsonStr(args, "id"), " n");
+    const id: u64 = std.fmt.parseInt(u64, raw_id, 10) catch blk: {
+        // an integer arrives unquoted: read the digits after "id":
+        const at = std.mem.indexOf(u8, args, "\"id\"") orelse break :blk 0;
+        var i = at + 4;
+        while (i < args.len and (args[i] == ':' or args[i] == ' ' or args[i] == 'n' or args[i] == '"')) i += 1;
+        const s = i;
+        while (i < args.len and std.ascii.isDigit(args[i])) i += 1;
+        break :blk std.fmt.parseInt(u64, args[s..i], 10) catch 0;
+    };
+    if (id == 0) return gpa.dupe(u8, "{\"ok\":false,\"tool\":\"recall_node\",\"error\":\"pass the node id: the number after n in n<id>\"}") catch emptyRes();
+    const line = nstore.nodeLine(gpa, app.io, conv_dir, id) orelse
+        return std.fmt.allocPrint(gpa, "{{\"ok\":false,\"tool\":\"recall_node\",\"error\":\"no node n{d} in this conversation's store\"}}", .{id}) catch emptyRes();
+    defer gpa.free(line);
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(gpa);
+    out.print(gpa, "{{\"ok\":true,\"tool\":\"recall_node\",\"id\":{d},\"node\":", .{id}) catch return emptyRes();
+    http.jstr(gpa, &out, clipBytes(line, 16 * 1024)) catch return emptyRes();
+    out.append(gpa, '}') catch return emptyRes();
+    return gpa.dupe(u8, out.items) catch emptyRes();
 }
 
 /// In-place atomization guard for a composed tool note: fold hard whitespace and SOFTEN sentence enders
@@ -9234,6 +9375,7 @@ fn orchTool(app: *App, uid: u64, ctx: *tools.ToolCtx, conv: []const u8, conv_dir
     if (std.mem.eql(u8, name, "steer_swarm")) return steerTool(app, uid, args);
     if (std.mem.eql(u8, name, "stop_swarm")) return stopTool(app, uid, args);
     if (std.mem.eql(u8, name, "swarm_status")) return statusTool(app, uid, conv_dir, ctrl_cursor, args);
+    if (std.mem.eql(u8, name, "recall_node")) return recallNodeTool(app, conv_dir, args);
     if (std.mem.eql(u8, name, "swarm_asks")) return asksTool(app, uid, args);
     if (std.mem.eql(u8, name, "answer_swarm")) return answerTool(app, uid, args);
     if (std.mem.eql(u8, name, "schedule_task")) return scheduleTool(app, uid, trio, args);
@@ -11840,6 +11982,10 @@ fn runInnerAgentic(
     /// close, answers the open_tools verb, and opens a known-but-closed name's group in the round it is called.
     walk: ?*toolmap.Walk,
     overlay: ?*ovl.Overlay, // the recall overlay: settled before every round's chat call, removed right after (overlay.zig)
+    /// The conversation's store (store.zig): every message is captured into it at each round and step boundary. With
+    /// `net_on` (NL_CONTEXT=net) every request is unfolded from it and nothing is folded.
+    store: ?*nstore.Store,
+    net_on: bool,
 ) InnerResult {
     const gpa = app.gpa;
     // THE MAPPED BELT changes as the walk opens and closes groups; `tools_cur` is what THIS inference advertises.
@@ -11965,7 +12111,10 @@ fn runInnerAgentic(
         if (token_ceiling > 0 and spendOf(llm.tokensSnapshot()) >= token_ceiling) {
             const spent = spendOf(llm.tokensSnapshot());
             var sb: [160]u8 = undefined;
-            emitKV(app, conv_dir, "status", "text", std.fmt.bufPrint(&sb, "compacting context (~{d}k input tokens spent this stretch) — carrying the net forward", .{spent / 1000}) catch "compacting context — carrying the net forward");
+            if (net_on)
+                emitKV(app, conv_dir, "status", "text", std.fmt.bufPrint(&sb, "spend ceiling reached (~{d}k input tokens spent this stretch)", .{spent / 1000}) catch "spend ceiling reached")
+            else
+                emitKV(app, conv_dir, "status", "text", std.fmt.bufPrint(&sb, "compacting context (~{d}k input tokens spent this stretch) — carrying the net forward", .{spent / 1000}) catch "compacting context — carrying the net forward");
             return .{
                 .outcome = .stopped,
                 .content = gpa.dupe(u8, last_content) catch empty,
@@ -11976,10 +12125,14 @@ fn runInnerAgentic(
 
         // CHECKED BEFORE IT IS SENT (mendBeforeSend): a broken message is mended out of conv_buf here, by the engine
         // that broke it, instead of costing a 400 per call and an answer from whatever prefix still parses.
+        const msgs_before_mend: usize = if (store != null) llm.msgCount(conv_buf.items) else 0;
         if (!mendBeforeSend(app, conv_dir, run_root, conv_buf, &base_len)) {
             emitKV(app, conv_dir, "error", "err", "the working context is corrupt and no message of it could be mended (an engine bug) - stopping rather than sending a conversation it no longer has");
             return .{ .outcome = .hard_error, .content = empty };
         }
+        // A mend that dropped messages leaves the store's count of what it has seen past the buffer's end, and every
+        // message appended after it would be skipped as already captured: what is in the buffer now is accounted for.
+        if (store) |s| if (llm.msgCount(conv_buf.items) < msgs_before_mend) s.resync(conv_buf.items);
 
         // STREAMING: the model's reply + reasoning type out via streamOnDelta as {kind:token|reasoning,delta}
         // frames. The returned Step is the SAME accumulated shape complete() gives (content + reasoning +
@@ -11988,6 +12141,17 @@ fn runInnerAgentic(
         // RECALL OVERLAY: settle the turn's working field around what the model is doing right now and ride the
         // result as the LAST message of this one request — removed the instant the model has answered, so it
         // never enters the transcript, a compaction, a summary, the store, or the next round's upload.
+        // THE STORE takes everything that landed since the last boundary (drive and steer messages, a settled
+        // answer) BEFORE the overlay is appended — the overlay is for this one request, never the record.
+        if (store) |s| {
+            s.capture(conv_buf.items);
+            // said once per refusal, never silently: a message that does not parse is in the request but not the store
+            if (s.refused > s.refused_told) {
+                var rb: [200]u8 = undefined;
+                emitKV(app, conv_dir, "status", "text", std.fmt.bufPrint(&rb, "the conversation store refused {d} message(s) that do not parse as JSON; they are kept out of graph.jsonl", .{s.refused - s.refused_told}) catch "the conversation store refused a message that does not parse as JSON");
+                s.refused_told = s.refused;
+            }
+        }
         const pre_overlay_len = conv_buf.items.len;
         if (overlay) |o| {
             if (o.render()) |blk| {
@@ -12002,11 +12166,32 @@ fn runInnerAgentic(
                 tools_cur = fresh;
             } else |_| {}
         };
+        // NL_CONTEXT=net: the request is UNFOLDED, not the buffer — the turn's prefix, the net of everything older
+        // than the newest rounds laid out from where the work stands, then those rounds verbatim. Its size is the
+        // working budget the fold used to defend, whatever the turn's length. Any failure sends the buffer as is.
+        var req_owned: ?[]u8 = null;
+        defer if (req_owned) |r| gpa.free(r);
+        const req_items: []const u8 = blk: {
+            if (!net_on) break :blk conv_buf.items;
+            const s = store orelse break :blk conv_buf.items;
+            const cut = s.cuts(conv_buf.items);
+            const span_budget = workingBudgetBytes(base_url, model, cut.prefix_end + tools_cur.len, turn_win_hint);
+            const live = conv_buf.items.len - cut.live_start;
+            // a third of the working budget the fold used to defend: retrieval is chosen by distance from where the
+            // work stands, so the net does not need the whole budget to carry what matters (measured: filling it
+            // all made every request half again larger and carried filler)
+            const net_budget = @max(NET_MIN_BUDGET_BYTES, span_budget / 3);
+            const r = s.assemble(conv_buf.items, net_budget) catch break :blk conv_buf.items;
+            req_owned = r;
+            var tb: [220]u8 = undefined;
+            emitKV(app, conv_dir, "trace", "text", std.fmt.bufPrint(&tb, "context: request unfolded from the store — {d} nodes, net {d} KB of {d} KB, newest rounds {d} KB, request {d} KB", .{ s.last_nodes, s.last_net_bytes / 1024, net_budget / 1024, live / 1024, r.len / 1024 }) catch "context: request unfolded from the store");
+            break :blk r;
+        };
         var sctx = StreamCtx{ .app = app, .conv_dir = conv_dir, .ctrl_cursor = steer_cursor.* };
         var chat_cm = meterBegin(app.io);
         traceFrame(app, "worker.llm", "completeStream", "enter", null, null);
         announcePhase(app, "chat");
-        var step = llm.completeStream(gpa, app.io, run_root, "chat", base_url, key, model, conv_buf.items, tools_cur, turnTokenBudget(ctx.environ, base_url, model, turn_reasoning), 0.7, &sctx, streamOnDelta, streamShouldAbort);
+        var step = llm.completeStream(gpa, app.io, run_root, "chat", base_url, key, model, req_items, tools_cur, turnTokenBudget(ctx.environ, base_url, model, turn_reasoning), 0.7, &sctx, streamOnDelta, streamShouldAbort);
         if (walk) |w| w.tick(); // one inference, for the map's least-recently-used bookkeeping
         conv_buf.shrinkRetainingCapacity(pre_overlay_len); // the overlay was for that inference alone
         traceFrame(app, "worker.llm", "completeStream", "exit", step.ok, null);
@@ -12731,9 +12916,22 @@ fn runInnerAgentic(
             for (tool_obs.items) |note| gpa.free(note);
             tool_obs.clearRetainingCapacity();
         }
+        // THE STORE (step boundary): this step's call and every result are captured before anything can fold them,
+        // and the results' payloads go to neuron-db as documents in one import.
+        if (store) |s| {
+            s.capture(conv_buf.items);
+            if (s.takeDocs()) |d| {
+                defer gpa.free(d);
+                _ = ctx.mem.importDocs(d);
+            }
+        }
         // WITHIN-TURN COMPACTION (step boundary): if this pass's working growth has crossed the budget, compress it
-        // into a progress note so a long/afk turn can keep going without overflowing the model window.
-        compactWorking(app, conv_dir, run_root, think.base_url, think.key, think.model, conv_buf, base_len, ctx, tool_obs, workingBudgetBytes(base_url, model, base_len + turn_tools.len, turn_win_hint));
+        // into a progress note so a long/afk turn can keep going without overflowing the model window. Not under
+        // NL_CONTEXT=net: there the request is unfolded from the store every round, so the buffer never has to shrink.
+        if (!net_on) {
+            compactWorking(app, conv_dir, run_root, think.base_url, think.key, think.model, conv_buf, base_len, ctx, tool_obs, workingBudgetBytes(base_url, model, base_len + turn_tools.len, turn_win_hint));
+            if (store) |s| s.resync(conv_buf.items);
+        }
         // GROUND-TRUTH CONFLICT SPLICE — after compaction (never folded into a summary), before any steer
         // (the user's live instruction stays last, i.e. most salient).
         if (post_note.items.len > 0)
@@ -13945,7 +14143,7 @@ fn dropEngineRows(dest: []u8, span: []const u8) []const u8 {
 /// of turns that have scrolled out of the recency window, the pinned original goal, and the recency window itself.
 /// Replaces "replay the whole transcript". Best-effort: any read/parse/summary failure degrades to less context,
 /// never a crash — the turn still runs on the system prompt + recall + whatever seeded.
-fn assembleHistory(app: *App, conv_dir: []const u8, user_text: []const u8, conv_buf: *std.ArrayListUnmanaged(u8), varying_frag: []const u8, plan: ContextPlan) void {
+fn assembleHistory(app: *App, conv_dir: []const u8, user_text: []const u8, conv_buf: *std.ArrayListUnmanaged(u8), varying_frag: []const u8, plan: ContextPlan, net_store: ?*nstore.Store) void {
     const gpa = app.gpa;
     const mpath = std.fmt.allocPrint(gpa, "{s}/messages.jsonl", .{conv_dir}) catch return;
     defer gpa.free(mpath);
@@ -13967,7 +14165,18 @@ fn assembleHistory(app: *App, conv_dir: []const u8, user_text: []const u8, conv_
     // is loaded here (a cheap file read) — the LLM fold-in of newly-dropped history is deferred to refreshSummary at
     // end-of-turn, so the first streamed token never waits on a summarization round-trip. The injected summary can
     // therefore lag by one turn's worth of dropped middle; the recency window + goal pin + relevance recall cover it.
-    if (view.gap) {
+    //
+    // NOT UNDER NL_CONTEXT=net (`net_store` set): there the earlier turns come back through the store's net, laid
+    // out verbatim from where the work stands, so no summary, no digest and no net record ride here. The store is
+    // told which turns the window already shows, so their asks and answers are not repeated in the net.
+    if (net_store) |s| {
+        var users: u32 = 0;
+        var wl = std.mem.splitScalar(u8, view.window, '\n');
+        while (wl.next()) |l| {
+            if (std.mem.indexOf(u8, l, "\"role\":\"user\"") != null) users += 1;
+        }
+        s.dialog_before_turn = if (users == 0) s.turn + 1 else if (s.turn >= users) s.turn - users + 1 else 1;
+    } else if (view.gap) {
         const sum = loadSummary(app, conv_dir);
         defer if (sum.len > 0) gpa.free(sum);
         if (sum.len > 0) {
@@ -13984,7 +14193,7 @@ fn assembleHistory(app: *App, conv_dir: []const u8, user_text: []const u8, conv_
     // THE NET LEDGER (Gary's 4tope across turns): what earlier turns established WITH TOOLS, verbatim, newest
     // first — gap or no gap, because a turn's tool results never reach messages.jsonl, so even the turn just
     // replayed whole above shows only its closing words without this (see netRecordFromSpan).
-    injectNets(app, conv_dir, conv_buf, plan.net_budget, view.window_start);
+    if (net_store == null) injectNets(app, conv_dir, conv_buf, plan.net_budget, view.window_start);
 
     // PINNED GOAL: the conversation's first user message anchors the arc even after it scrolls out of the window.
     if (view.goal_line.len > 0) seedLines(gpa, conv_buf, view.goal_line, cctx.GOAL_PIN_CAP);
