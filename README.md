@@ -1148,6 +1148,14 @@ ESTABLISHED. No model writes it, so nothing is paraphrased away, and a failure a
 not carried as current. Tool findings reach neuron-db at every step, so the carry is a layout of what is
 already remembered. `NL_HANDOFF=model` restores the model-written state. Before any of that, old tool
 results are stubbed before anything is summarized, and the working span grows with the model's window.
+The same net is the fold *inside* a turn: when the span passes its budget, the older rounds become one
+verbatim note — the chain's results at length, their payload rather than their envelope, the dead ends,
+what an earlier fold carried — and the newest rounds ride whole, with no model call. The carry at the
+ceiling is sized to the model's window (a 262k model carries 24 KB, not 4), every pass carries what the
+passes before it established, and each finished turn's net goes to the conversation's `net.jsonl`, where
+the next turns read what the tools showed — the rolling summary only ever saw the assistant's own words.
+The ceiling itself is floored at a dozen of the fullest prompt the turn may send, with cached tokens
+counted at a quarter, so a wide window is no longer cut sooner than a narrow one.
 
 Inside a turn, a [recall overlay](https://gary23w.github.io/nl-veil/#doc=worker/chat/overlay) keeps a small
 working field of the conversation's memory, your durable notes and the file ledger, grows it with every
@@ -1626,11 +1634,11 @@ what changed is that the dangerous verbs are now refused inside a turn, not just
 | `NL_ADMIN_EMAIL` / `NL_ADMIN_PASSWORD` | the admin account. Defaults to `admin@neuron-loops.local` with a password generated on first run and written to `data/admin-password.txt`; set `NL_ADMIN_PASSWORD` to pin your own and no file is written |
 | `NL_MAX_TURNS` | how many chat turns run at once, server-wide (default 64, ceiling 256). Size it to the rate limit of the provider key everyone shares |
 | `NL_MAX_TURNS_PER_USER` | how many of those one account may hold (default: an eighth of capacity). This is what stops one busy user starving everyone else |
-| `NL_TURN_TOKEN_CEILING` | input tokens one turn **segment** may spend before the engine compacts its working context and continues (default 400000; `0` disables the ceiling). A runaway backstop, not a budget — a thorough research turn lands well under it |
+| `NL_TURN_TOKEN_CEILING` | input tokens one turn **segment** may spend before the engine compacts its working context and continues (default 400000, floored at a dozen of the fullest prompt the turn may send — prefix plus working span — so a wide window is never cut sooner than a narrow one; cached prompt tokens count a quarter; `0` disables the ceiling). A runaway backstop, not a budget — a thorough research turn lands well under it. An explicit value is honoured as written |
 | `NL_TURN_CONTINUE_MAX` | how many times one turn may compact and keep going (default 3). **`0` restores beta-5's behaviour exactly**: the turn settles at the ceiling and waits for you |
 | `NL_TURN_CONTINUE_HARD_MAX` | the ceiling on the *earned* allowance (default 10). A segment that wrote a file or made a call it had not made before buys one more pass, up to this; a segment that only re-read its own context buys nothing, so a spinning turn still settles at `NL_TURN_CONTINUE_MAX` |
 | `NL_TOOL_MAP` | **experimental** — advertise the belt as a MAP the model walks (one `open_tools` verb, seven branches at a time) instead of a flat list. A small model keeps nine core verbs in hand and walks the rest; a large one walks only the discovered families (security tools, Cloudflare, plugins), the ones that grow without bound. A known tool name is always callable and opens its own branch. Default off (unset or `0`); `1` turns it on. See `worker/chat/belt` in the docs |
-| `NL_HANDOFF` | how the CONTINUATION STATE is written when a turn compacts and continues: `net` (default) unfolds the turn's own working span with Gary's 4tope — the frontier's last words, the file ledger, the failed calls, the results the frontier rests on, verbatim, no model call; `model` restores the model-written four-label state |
+| `NL_HANDOFF` | how a turn's working context is folded and carried: `net` (default) unfolds the turn's own working span with Gary's 4tope — the frontier's last words, the file ledger, the failed calls, the results the frontier rests on at length, what earlier folds and passes carried, verbatim, no model call — both for the fold inside a turn and for the CONTINUATION STATE at the ceiling; `model` restores the model-written fold and four-label state |
 | `NL_KEEPALIVE_REQUESTS` | requests one connection serves before recycling (default 200). Drop to 1 if you hit a stuck-socket worker thread |
 | `NL_DEFAULT_MODEL` / `NL_DEFAULT_BASE_URL` | **seeds** the default model on a fresh install, for unattended provisioning. Afterwards set it in **Admin → Default model** — that persists to `data/server-config.json` and wins over the environment, so a stale launch script cannot undo the admin on the next restart |
 | `NL_OPEN_REGISTRATION` | let people sign themselves up. Off by default; the admin creates accounts from the Admin tab instead |
