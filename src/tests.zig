@@ -49,6 +49,7 @@ test {
     _ = @import("worker/chat/context.zig");
     _ = @import("worker/chat/belt.zig"); // the tool map: the belt as a tree the model walks
     _ = @import("worker/chat/net.zig"); // the net: the working span as a DAG, the critical chain, the source unfolding
+    _ = @import("worker/chat/store.zig"); // the store: every message captured as the chat runs, prompts unfolded from it
     _ = @import("worker/chat/engine.zig");
     _ = @import("worker/chat/overlay.zig"); // recall overlay: the per-thought working field, refractory + firing
     _ = @import("worker/chat/paths.zig");

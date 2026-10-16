@@ -415,6 +415,25 @@ pub const Mem = struct {
         return jsonUint(out, "\"stored\":");
     }
 
+    /// Import a pack whose every line names its own scope (`{"scope":…,"fact":…}` per line) in ONE neuron
+    /// subprocess: the conversation store's raw documents (chat/store.zig), one scope per tool result, a whole
+    /// step at a time. The lines arrive already built and escaped; nothing here reshapes them. Returns facts
+    /// stored (0 on failure, or when the pack is empty).
+    pub fn importDocs(self: Mem, pack_lines: []const u8) u32 {
+        if (pack_lines.len == 0) return 0;
+        self.lockW();
+        defer self.unlockW();
+        var rnd: [8]u8 = undefined;
+        self.io.random(&rnd);
+        var pb: [820]u8 = undefined;
+        const pack = std.fmt.bufPrint(&pb, "{s}.{s}.docs.jsonl", .{ self.db, std.fmt.bytesToHex(rnd, .lower) }) catch return 0;
+        std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = pack, .data = pack_lines }) catch return 0;
+        defer std.Io.Dir.cwd().deleteFile(self.io, pack) catch {};
+        const out = self.run(&.{ "--json", "import", pack }) orelse return 0;
+        defer self.gpa.free(out);
+        return jsonUint(out, "\"stored\":");
+    }
+
     pub fn replace(self: Mem, scope: []const u8, fact: []const u8) void {
         self.lockW();
         if (self.run(&.{ "forget", scope })) |o| self.gpa.free(o);

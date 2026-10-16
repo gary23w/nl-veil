@@ -77,7 +77,42 @@ pub const Node = struct {
     /// byte offset of this message in the span it was read from, so a caller folding a span can say which nodes
     /// sit in the tail it keeps verbatim (Opts.tail_from)
     at: usize = 0,
+    /// THE STORE's stamps (store.zig; BuildOpts.store): the node's id in the conversation's store (`_n`), the turn
+    /// it belongs to (`_t`), and whether it is the user message that opened that turn (`"_k":"ask"`). 0/false for a
+    /// span that was never stored.
+    nid: u64 = 0,
+    turn: u32 = 0,
+    ask: bool = false,
+    /// where in `text` the rare word that links the FRONTIER to this node sits (store mode), or NO_FOCUS: such a node
+    /// renders as the window around that word — the line that matters — not as its head
+    focus: usize = NO_FOCUS,
 };
+
+pub const NO_FOCUS: usize = std.math.maxInt(usize);
+/// How much of a result the conversation store's graph keeps: deep enough that a fact in the middle of a long
+/// output can still be found by its rare word (results reach the span clipped to 10 KB already).
+pub const STORE_RESULT_KEEP: usize = 8 * 1024;
+/// The window a focused node renders: this much before the linking word, FOCUS_AFTER after it.
+const FOCUS_BEFORE: usize = 300;
+const FOCUS_AFTER: usize = 600;
+
+/// How a span becomes a graph. The default is one turn's working span, exactly as the fold and the carry read it.
+pub const BuildOpts = struct {
+    /// THE CONVERSATION STORE (store.zig): the span is every stored message of every turn. The `_n`/`_t`/`_k` stamps
+    /// are read; the message that opened a turn joins the thread like a step (the newest one is the frontier at a
+    /// turn's start) and reads what it names; and every step, ask and answer links to ANY earlier node that shares
+    /// one of its RARE distinctive tokens (LONG_RARE_MAX) — not only the previous round. That is the retrieval half
+    /// of the design: a word only a few nodes contain is how the work points back at them, and a word many contain
+    /// points nowhere, which is the rarity weighting a plain keyword overlap lacks.
+    store: bool = false,
+};
+
+/// A token in more earlier nodes than this is common: it links nothing (store mode).
+pub const LONG_RARE_MAX: usize = 6;
+/// The most long-range links one node makes (store mode), newest targets first.
+pub const LONG_PER_NODE: usize = 8;
+/// Distinctive tokens one store node is indexed and read by.
+const LONG_TOKENS: usize = 48;
 
 /// The line window a read_file call asked for, resolved the way tools.zig `readFile` resolves it: start_line (or
 /// its `offset` alias) through end_line (or offset+limit-1), 1-indexed and inclusive, a missing bound being the
@@ -174,6 +209,9 @@ const C_DEAD: u32 = 1;
 pub const Graph = struct {
     gpa: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
+    /// how much of each result the graph keeps (RESULT_KEEP; STORE_RESULT_KEEP for the conversation store, whose
+    /// nodes are what later turns can retrieve at all)
+    keep: usize = RESULT_KEEP,
     nodes: std.ArrayListUnmanaged(Node) = .empty,
     /// every call the steps issued, so a result finds its issuer by id
     calls: std.ArrayListUnmanaged(Call) = .empty,
@@ -192,7 +230,12 @@ pub const Graph = struct {
 
     /// Read a working span — comma-joined `{"role":...}` objects as conv_buf holds them — into the graph.
     pub fn fromSpan(gpa: std.mem.Allocator, span: []const u8) !Graph {
-        var g: Graph = .{ .gpa = gpa, .arena = std.heap.ArenaAllocator.init(gpa) };
+        return fromSpanWith(gpa, span, .{});
+    }
+
+    /// fromSpan with BuildOpts (see BuildOpts.store for the conversation store's graph).
+    pub fn fromSpanWith(gpa: std.mem.Allocator, span: []const u8, opts: BuildOpts) !Graph {
+        var g: Graph = .{ .gpa = gpa, .arena = std.heap.ArenaAllocator.init(gpa), .keep = if (opts.store) STORE_RESULT_KEEP else RESULT_KEEP };
         errdefer g.deinit();
         const a = g.arena.allocator();
         // each node's content as the span holds it (results only; "" otherwise), one per node: supersession needs
@@ -210,10 +253,24 @@ pub const Graph = struct {
             at = next;
             const role = jsonStr(obj, "role");
             var n: Node = .{ .kind = .engine, .bytes = obj.len, .at = start };
+            if (opts.store) {
+                n.nid = jsonUint(obj, "_n") orelse 0;
+                n.turn = @intCast(@min(jsonUint(obj, "_t") orelse 0, std.math.maxInt(u32)));
+                n.ask = std.mem.eql(u8, jsonStr(obj, "_k"), "ask");
+            }
             var n_raw: []const u8 = "";
             if (std.mem.eql(u8, role, "user")) {
                 n.kind = .user;
-                n.text = try excerpt(a, jsonStr(obj, "content"), EXCERPT_MAX);
+                // a stored request is worth as much room as an answer: it is what the turn was FOR
+                n.text = try excerpt(a, jsonStr(obj, "content"), if (n.ask) NEXT_MAX else EXCERPT_MAX);
+                n.round = round;
+                if (n.ask) {
+                    // the newest ask is the frontier until the turn it opened takes a step
+                    try g.nodes.append(gpa, n);
+                    try raws.append(gpa, n_raw);
+                    g.frontier = @intCast(g.nodes.items.len - 1);
+                    continue;
+                }
             } else if (std.mem.eql(u8, role, "assistant")) {
                 const calls = std.mem.indexOf(u8, obj, "\"tool_calls\":[") != null;
                 if (calls) round += 1;
@@ -263,7 +320,7 @@ pub const Graph = struct {
         // supersession between results
         var prev_step: u32 = NONE;
         for (g.nodes.items, 0..) |*n, i| {
-            if (n.kind != .step and n.kind != .note) continue;
+            if (n.kind != .step and n.kind != .note and !n.ask) continue;
             const idx: u32 = @intCast(i);
             if (prev_step != NONE) try n.deps.append(gpa, .{ .to = prev_step, .w = W_THREAD });
             // tokens the step reused: its own words plus the arguments of the calls it then made
@@ -287,8 +344,84 @@ pub const Graph = struct {
             }
             prev_step = idx;
         }
+        if (opts.store) try g.linkRare();
         g.markSuperseded(raws.items);
         return g;
+    }
+
+    /// LONG-RANGE LINKS (store mode): one pass in node order with an inverted index of the distinctive tokens seen
+    /// so far. A reader (a step — its words and the arguments of its calls —, an ask, or an answer) links W_USED to
+    /// the newest earlier nodes that share a token at most LONG_RARE_MAX earlier nodes contain, up to LONG_PER_NODE
+    /// links; then the node's own tokens join the index. A token in more nodes than that is how half the
+    /// conversation talks, not a pointer at any of it, so it links nothing.
+    fn linkRare(g: *Graph) !void {
+        const gpa = g.gpa;
+        const a = g.arena.allocator();
+        var postings: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(u32)) = .empty;
+        defer {
+            var it = postings.valueIterator();
+            while (it.next()) |v| v.deinit(gpa);
+            postings.deinit(gpa);
+        }
+        var toks_buf: [LONG_TOKENS][]const u8 = undefined;
+        var lower_buf: [64]u8 = undefined;
+        for (g.nodes.items, 0..) |*n, i| {
+            if (n.kind == .engine) continue;
+            const idx: u32 = @intCast(i);
+            var ntok = distinctiveTokens(n.text, &toks_buf);
+            if (n.kind == .step) for (g.calls.items) |c| if (c.step == idx and ntok < toks_buf.len) {
+                ntok += distinctiveTokens(c.args, toks_buf[ntok..]);
+            };
+            if (n.kind == .result and n.args.len > 0 and ntok < toks_buf.len) ntok += distinctiveTokens(n.args, toks_buf[ntok..]);
+            const reader = n.kind == .step or n.kind == .note or n.ask;
+            if (reader) {
+                var linked: usize = 0;
+                for (toks_buf[0..ntok]) |t| {
+                    if (linked >= LONG_PER_NODE) break;
+                    const low = std.ascii.lowerString(lower_buf[0..@min(t.len, lower_buf.len)], t[0..@min(t.len, lower_buf.len)]);
+                    const list = postings.get(low) orelse continue;
+                    if (list.items.len == 0 or list.items.len > LONG_RARE_MAX) continue;
+                    var k = list.items.len;
+                    while (k > 0 and linked < LONG_PER_NODE) {
+                        k -= 1;
+                        const to = list.items[k];
+                        if (to >= idx) continue;
+                        var dup = false;
+                        for (n.deps.items) |d| if (d.to == to and d.w == W_USED) {
+                            dup = true;
+                            break;
+                        };
+                        if (dup) continue;
+                        try n.deps.append(gpa, .{ .to = to, .w = W_USED });
+                        linked += 1;
+                        // what the FRONTIER points at renders around the word it pointed with
+                        if (idx == g.frontier) {
+                            const target = &g.nodes.items[to];
+                            if (target.focus == NO_FOCUS) {
+                                if (std.ascii.indexOfIgnoreCase(target.text, t)) |at| target.focus = at;
+                            }
+                        }
+                    }
+                }
+            }
+            // EVERY token the node holds joins the index — a fact sixty lines into an output has to be findable by its
+            // word (a token counts each node once)
+            var ti = TokenIter{ .text = n.text };
+            var targs = TokenIter{ .text = if (n.kind == .result) n.args else "" };
+            while (ti.next() orelse targs.next()) |t| {
+                const low = std.ascii.lowerString(lower_buf[0..@min(t.len, lower_buf.len)], t[0..@min(t.len, lower_buf.len)]);
+                const gop = try postings.getOrPut(gpa, low);
+                if (!gop.found_existing) {
+                    gop.key_ptr.* = try a.dupe(u8, low);
+                    gop.value_ptr.* = .empty;
+                }
+                const v = gop.value_ptr;
+                if (v.items.len > 0 and v.items[v.items.len - 1] == idx) continue;
+                // past the rarity bound the list only needs to know it is common; stop growing it
+                if (v.items.len > LONG_RARE_MAX) continue;
+                try v.append(gpa, idx);
+            }
+        }
     }
 
     fn addCalls(g: *Graph, a: std.mem.Allocator, step: u32, obj: []const u8) !void {
@@ -423,6 +556,15 @@ pub const Graph = struct {
         /// whole lines) — what cloud/tot.js carries the same way, so a second fold or a later pass keeps what the
         /// first established instead of knowing only its own rounds
         earlier: []const u8 = "",
+        /// THE STORE'S PROMPT NET (store.zig): earlier asks and answers are selectable too, rendered oldest first in
+        /// their own section — except those of turn `dialog_before_turn` and later, which the recency window
+        /// already shows verbatim
+        dialog: bool = false,
+        dialog_before_turn: u32 = std.math.maxInt(u32),
+        /// the frontier rides verbatim right after the net, so NEXT is not restated
+        no_next: bool = false,
+        /// every carried line names its store id (`n<id>`), so recall_node can return the node whole
+        ids: bool = false,
     };
 
     /// unfold with Opts. The critical chain's results render at RESULT_KEEP (what the frontier rests on is the
@@ -443,7 +585,17 @@ pub const Graph = struct {
         @memset(parent, NONE);
         @memset(done, false);
         dist[g.frontier] = 0;
-        // O(V^2) Dijkstra: spans hold a few hundred messages at most, and this runs once per cut
+        // the edges INTO each node (who depends on it), built once in node order, so a visit relaxes them in the
+        // same order the full scan did and the tree comes out identical — at a whole conversation's size the scan
+        // per visit was quadratic in the edges
+        const rev = try gpa.alloc(std.ArrayListUnmanaged(Dep), n);
+        defer {
+            for (rev) |*r| r.deinit(gpa);
+            gpa.free(rev);
+        }
+        for (rev) |*r| r.* = .empty;
+        for (g.nodes.items, 0..) |node, i| for (node.deps.items) |d| try rev[d.to].append(gpa, .{ .to = @intCast(i), .w = d.w });
+        // O(V^2) Dijkstra: one turn's span holds a few hundred messages, a stored conversation a few thousand
         var left: usize = n;
         while (left > 0) : (left -= 1) {
             var u: u32 = NONE;
@@ -454,7 +606,7 @@ pub const Graph = struct {
             done[u] = true;
             // edges out of u (its deps) and into u (nodes that depend on it)
             for (g.nodes.items[u].deps.items) |d| g.relax(dist, parent, u, d.to, d.w);
-            for (g.nodes.items, 0..) |node, i| for (node.deps.items) |d| if (d.to == u) g.relax(dist, parent, u, @intCast(i), d.w);
+            for (rev[u].items) |d| g.relax(dist, parent, u, d.to, d.w);
         }
         // AT LENGTH: the critical chain's results, and the frontier's own round — the results its calls returned
         // and, for a frontier that only spoke, the results it was answering. The chain walks BACK from the
@@ -486,8 +638,11 @@ pub const Graph = struct {
         // the frontier's own calls ride beside borrowed words (see nearestWords), clipped and counted
         const frontier_calls: ?[]const u8 = if (words.at != g.frontier) g.lastCallsOf(g.frontier) else null;
         const earlier = clipLines(opts.earlier, budget / 3);
-        var spent: usize = opts.next_label.len + next_text.len + 8 + @min(ground.len, budget / 4) + 200;
-        if (frontier_calls) |c| spent += @min(c.len, NEXT_CALLS_MAX) + 24;
+        var spent: usize = @min(ground.len, budget / 4) + 200;
+        if (!opts.no_next) {
+            spent += opts.next_label.len + next_text.len + 8;
+            if (frontier_calls) |c| spent += @min(c.len, NEXT_CALLS_MAX) + 24;
+        }
         if (earlier.len > 0) spent += EARLIER_HEAD.len + earlier.len + 1;
         const chosen = try gpa.alloc(bool, n);
         defer gpa.free(chosen);
@@ -510,6 +665,15 @@ pub const Graph = struct {
             const node = g.nodes.items[i];
             // the caller's verbatim tail rides whole after the note: never carried twice
             if (i >= opts.tail_from) continue;
+            // DIALOG (the store's net): an earlier ask, or an earlier answer, outside the recency window
+            if (opts.dialog and i != g.frontier and isDialog(node) and node.turn < opts.dialog_before_turn and node.text.len > 0) {
+                const cost = node.text.len + 40;
+                if (spent + cost > budget) continue;
+                spent += cost;
+                chosen[i] = true;
+                full[i] = true;
+                continue;
+            }
             // steps are the model's narration — their decisions show in what they then called, and the
             // frontier's own words are NEXT; a note rides only when it is a distillation (a fold note), and a
             // note the net itself wrote is carried by earlierLines, never as a node
@@ -519,43 +683,52 @@ pub const Graph = struct {
             // a chain result rides at length when the budget holds it, and as an excerpt when it does not: the
             // node the frontier rests on most is never the one a tight budget drops whole
             var s = shown(node, on_chain[i]);
-            var cost = s.text.len + @as(usize, if (s.more) 3 else 0) + node.name.len + node.args.len + 24;
+            var cost = s.text.len + @as(usize, if (s.more) 3 else 0) + @as(usize, if (s.lead) 3 else 0) + node.name.len + node.args.len + 24;
             if (spent + cost > budget and on_chain[i]) {
                 s = shown(node, false);
-                cost = s.text.len + @as(usize, if (s.more) 3 else 0) + node.name.len + node.args.len + 24;
+                cost = s.text.len + @as(usize, if (s.more) 3 else 0) + @as(usize, if (s.lead) 3 else 0) + node.name.len + node.args.len + 24;
             }
             if (spent + cost > budget) continue;
             spent += cost;
             chosen[i] = true;
             full[i] = !s.more;
         }
-        // LAY OUT: NEXT (the frontier's own words), ON DISK, RULED OUT (dead ends, nearest first), then
-        // ESTABLISHED in shortest-path-tree order — a depth-first walk from the frontier, children by distance —
-        // and EARLIER last
-        try out.appendSlice(gpa, opts.next_label);
-        if (next_text.len > 0) {
-            try out.appendSlice(gpa, next_text);
-            if (frontier_calls) |calls| {
-                try out.appendSlice(gpa, " — it had then called ");
+        // LAY OUT: NEXT (the frontier's own words), ON DISK, the dialog oldest first (the store's net), RULED OUT
+        // (dead ends, nearest first), then ESTABLISHED in shortest-path-tree order — a depth-first walk from the
+        // frontier, children by distance — and EARLIER last
+        if (!opts.no_next) {
+            try out.appendSlice(gpa, opts.next_label);
+            if (next_text.len > 0) {
+                try out.appendSlice(gpa, next_text);
+                if (frontier_calls) |calls| {
+                    try out.appendSlice(gpa, " — it had then called ");
+                    try out.appendSlice(gpa, clip(calls, NEXT_CALLS_MAX));
+                }
+            } else if (g.lastCallsOf(g.frontier)) |calls| {
+                try out.appendSlice(gpa, "it had just called ");
                 try out.appendSlice(gpa, clip(calls, NEXT_CALLS_MAX));
+            } else {
+                try out.appendSlice(gpa, "(no words; see the results below)");
             }
-        } else if (g.lastCallsOf(g.frontier)) |calls| {
-            try out.appendSlice(gpa, "it had just called ");
-            try out.appendSlice(gpa, clip(calls, NEXT_CALLS_MAX));
-        } else {
-            try out.appendSlice(gpa, "(no words; see the results below)");
+            try out.append(gpa, '\n');
         }
-        try out.append(gpa, '\n');
         if (ground.len > 0) {
             try out.appendSlice(gpa, "ON DISK: ");
             try out.appendSlice(gpa, std.mem.trim(u8, clip(ground, budget / 4), " \r\n\t"));
             try out.append(gpa, '\n');
         }
+        var any_dialog = false;
+        if (opts.dialog) for (g.nodes.items, 0..) |node, i| {
+            if (!chosen[i] or !isDialog(node)) continue;
+            if (!any_dialog) try out.appendSlice(gpa, "EARLIER IN THIS CONVERSATION (asks and answers, oldest first):\n");
+            any_dialog = true;
+            try g.line(gpa, &out, @intCast(i), true, opts.ids);
+        };
         var any_dead = false;
-        for (order) |i| if (chosen[i] and g.nodes.items[i].dead) {
+        for (order) |i| if (chosen[i] and g.nodes.items[i].dead and !(opts.dialog and isDialog(g.nodes.items[i]))) {
             if (!any_dead) try out.appendSlice(gpa, "RULED OUT (calls that failed; do not repeat them as they were):\n");
             any_dead = true;
-            try g.line(gpa, &out, i, full[i]);
+            try g.line(gpa, &out, i, full[i], opts.ids);
         };
         var any_est = false;
         var stack: std.ArrayListUnmanaged(u32) = .empty;
@@ -568,10 +741,10 @@ pub const Graph = struct {
             const u = stack.pop().?;
             if (visited[u]) continue;
             visited[u] = true;
-            if (chosen[u] and !g.nodes.items[u].dead) {
+            if (chosen[u] and !g.nodes.items[u].dead and !(opts.dialog and isDialog(g.nodes.items[u]))) {
                 if (!any_est) try out.appendSlice(gpa, "ESTABLISHED (what the frontier rests on, nearest first, each derivation contiguous):\n");
                 any_est = true;
-                try g.line(gpa, &out, u, full[u]);
+                try g.line(gpa, &out, u, full[u], opts.ids);
             }
             // children in the SPT: nodes whose parent is u; push farthest first so the nearest is walked first
             var kids: [64]u32 = undefined;
@@ -609,14 +782,25 @@ pub const Graph = struct {
     }
 
     /// One carried node as a line; a result `full` (the critical chain) renders all it kept, else an excerpt.
-    fn line(g: *const Graph, gpa: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), i: u32, full: bool) !void {
+    /// `ids` names the node's store id after its round (`- r12 n345 read_file …`).
+    fn line(g: *const Graph, gpa: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), i: u32, full: bool, ids: bool) !void {
         const node = g.nodes.items[i];
+        if (isDialog(node) and node.nid > 0) {
+            // the store's dialog: which turn, who, and the words (an answer can be recalled whole by its id)
+            try out.print(gpa, "- t{d}", .{node.turn});
+            if (ids) try out.print(gpa, " n{d}", .{node.nid});
+            try out.print(gpa, " {s}: {s}\n", .{ if (node.kind == .user) "asked" else "answered", node.text });
+            return;
+        }
         switch (node.kind) {
             .result => {
-                try out.print(gpa, "- r{d} {s}", .{ node.round, if (node.name.len > 0) node.name else "tool" });
+                try out.print(gpa, "- r{d}", .{node.round});
+                if (ids and node.nid > 0) try out.print(gpa, " n{d}", .{node.nid});
+                try out.print(gpa, " {s}", .{if (node.name.len > 0) node.name else "tool"});
                 if (node.args.len > 0) try out.print(gpa, " {s}", .{node.args});
                 try out.appendSlice(gpa, if (node.dead) " -> " else ": ");
                 const s = shown(node, full);
+                if (s.lead) try out.appendSlice(gpa, "...");
                 try out.appendSlice(gpa, s.text);
                 if (s.more) try out.appendSlice(gpa, "...");
                 try out.append(gpa, '\n');
@@ -661,11 +845,11 @@ pub const Graph = struct {
         const full = try unescapeAlloc(g.gpa, raw, RESULT_SCAN, false);
         defer g.gpa.free(full);
         const pay = payloadOf(full);
-        if (pay.ptr == full.ptr and pay.len == full.len) return try keepEnds(a, full, RESULT_KEEP);
+        if (pay.ptr == full.ptr and pay.len == full.len) return try keepEnds(a, full, g.keep);
         // the payload is a JSON string VALUE inside the result: one more level of escaping to strip
         const inner = try unescapeAlloc(g.gpa, pay, RESULT_SCAN, false);
         defer g.gpa.free(inner);
-        return try keepEnds(a, inner, RESULT_KEEP);
+        return try keepEnds(a, inner, g.keep);
     }
 
     /// "name args, name args" for the calls a step issued, or null.
@@ -896,6 +1080,12 @@ fn jsonUint(obj: []const u8, key: []const u8) ?u64 {
     return v;
 }
 
+/// A stored ask, or an answer (an assistant message that called nothing and is not a distillation): the dialog the
+/// store's net carries for turns the recency window no longer shows.
+fn isDialog(node: Node) bool {
+    return (node.kind == .user and node.ask) or (node.kind == .note and node.nid > 0 and !isDistillation(node.text));
+}
+
 /// A compaction note or a FACTS carrier is worth carrying; the model's own narration is not (its decisions show
 /// in what it then called). A net note the engine folded (NET_NOTE_HEAD) is a distillation too: nearestWords must
 /// never read it as the model's last stated intention, and the unfolding carries its lines through earlierLines,
@@ -942,6 +1132,29 @@ pub fn distinctiveTokens(text: []const u8, out: [][]const u8) usize {
     }
     return n;
 }
+
+/// distinctiveTokens one at a time and uncapped (repeats included; the caller dedups): what the store indexes.
+const TokenIter = struct {
+    text: []const u8,
+    i: usize = 0,
+    fn next(it: *TokenIter) ?[]const u8 {
+        while (it.i < it.text.len) {
+            while (it.i < it.text.len and !tokenChar(it.text[it.i])) it.i += 1;
+            const start = it.i;
+            while (it.i < it.text.len and tokenChar(it.text[it.i])) it.i += 1;
+            const tok = std.mem.trim(u8, it.text[start..it.i], "./-_");
+            if (tok.len < 5 or tok.len > 64) continue;
+            var has_letter = false;
+            for (tok) |c| if (std.ascii.isAlphabetic(c)) {
+                has_letter = true;
+                break;
+            };
+            if (!has_letter or isCommon(tok)) continue;
+            return tok;
+        }
+        return null;
+    }
+};
 
 fn tokenChar(c: u8) bool {
     return std.ascii.isAlphanumeric(c) or c == '_' or c == '.' or c == '/' or c == '-';
@@ -1069,8 +1282,28 @@ fn clipLines(s: []const u8, max: usize) []const u8 {
 
 /// What a node renders as: all it kept when `full` (the critical chain), else clipped to EXCERPT_MAX at a word,
 /// with `more` saying a "..." mark belongs after it.
-const Shown = struct { text: []const u8, more: bool };
+/// A FOCUSED node (store mode: the frontier linked to it by a rare word) renders as the window around that word,
+/// whatever `full` says, with `lead` marking text cut before it.
+const Shown = struct { text: []const u8, more: bool, lead: bool = false };
 fn shown(node: Node, full: bool) Shown {
+    if (node.focus != NO_FOCUS and node.focus < node.text.len and node.text.len > FOCUS_BEFORE + FOCUS_AFTER) {
+        const t = node.text;
+        var a = node.focus -| FOCUS_BEFORE;
+        if (a > 0) {
+            if (std.mem.indexOfScalarPos(u8, t, a, ' ')) |sp| if (sp < node.focus) {
+                a = sp + 1;
+            };
+            while (a < t.len and (t[a] & 0xC0) == 0x80) a += 1;
+        }
+        var b = @min(t.len, node.focus + FOCUS_AFTER);
+        if (b < t.len) {
+            if (std.mem.lastIndexOfScalar(u8, t[0..b], ' ')) |sp| if (sp > node.focus) {
+                b = sp;
+            };
+            while (b > a and (t[b] & 0xC0) == 0x80) b -= 1;
+        }
+        return .{ .text = t[a..b], .more = b < t.len, .lead = a > 0 };
+    }
     if (full or node.text.len <= EXCERPT_MAX) return .{ .text = node.text, .more = false };
     return .{ .text = clipWords(node.text, EXCERPT_MAX), .more = true };
 }
@@ -1903,4 +2136,133 @@ test "a net note the engine folded is never NEXT's borrowed words: a wordless fr
     // nothing the MODEL said is within reach, so NEXT names the call; the note's own words are not the model's
     try tt.expect(std.mem.startsWith(u8, net, "NEXT (the frontier, in its own last words): it had just called run_tests {}"));
     try tt.expect(std.mem.indexOf(u8, net, "reading the schema") == null);
+}
+
+/// One stored message: `obj` (a `{"role":…}` object without its closing brace) with the store's stamps.
+fn tStored(s: *std.ArrayListUnmanaged(u8), gpa: std.mem.Allocator, obj: []const u8, turn: u32, id: u64, ask: bool) !void {
+    try s.print(gpa, ",{s},\"_t\":{d},\"_n\":{d}{s}}}", .{ obj, turn, id, if (ask) ",\"_k\":\"ask\"" else "" });
+}
+
+/// Three stored turns: the first reads a ledger whose result carries a word nothing else has; the second does
+/// unrelated work; the third asks about that word.
+fn tStore(gpa: std.mem.Allocator) ![]u8 {
+    var s: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer s.deinit(gpa);
+    var b: [256]u8 = undefined;
+    try tStored(&s, gpa, "{\"role\":\"user\",\"content\":\"Read the alpha ledger and tell me its total.\"", 1, 1, true);
+    var st: std.ArrayListUnmanaged(u8) = .empty;
+    defer st.deinit(gpa);
+    try tStep(&st, gpa, "Reading ledger/alpha.md.", tCall("c1", "read_file", "{\\\"path\\\":\\\"ledger/alpha.md\\\"}", &b));
+    try tStored(&s, gpa, st.items[1 .. st.items.len - 1], 1, 2, false);
+    try tStored(&s, gpa, "{\"role\":\"tool\",\"tool_call_id\":\"c1\",\"content\":\"alpha ledger: account zebracorn42 holds 1180 units; total 1180\"", 1, 3, false);
+    try tStored(&s, gpa, "{\"role\":\"assistant\",\"content\":\"The alpha ledger totals 1180 units.\"", 1, 4, false);
+    try tStored(&s, gpa, "{\"role\":\"user\",\"content\":\"Now list the files in src.\"", 2, 5, true);
+    st.clearRetainingCapacity();
+    var b2: [256]u8 = undefined;
+    try tStep(&st, gpa, "Listing src.", tCall("c2", "list_dir", "{\\\"path\\\":\\\"src\\\"}", &b2));
+    try tStored(&s, gpa, st.items[1 .. st.items.len - 1], 2, 6, false);
+    try tStored(&s, gpa, "{\"role\":\"tool\",\"tool_call_id\":\"c2\",\"content\":\"main.zig server.zig worker.zig\"", 2, 7, false);
+    try tStored(&s, gpa, "{\"role\":\"assistant\",\"content\":\"src holds main.zig, server.zig and worker.zig.\"", 2, 8, false);
+    try tStored(&s, gpa, "{\"role\":\"user\",\"content\":\"What did zebracorn42 hold again?\"", 3, 9, true);
+    return s.toOwnedSlice(gpa);
+}
+
+test "the store's graph: a later ask reaches an early result through a rare word, and the net carries it with its id" {
+    const gpa = tt.allocator;
+    const span = try tStore(gpa);
+    defer gpa.free(span);
+    var g = try Graph.fromSpanWith(gpa, span, .{ .store = true });
+    defer g.deinit();
+    // the stamps were read, and the newest ask is the frontier
+    const front = g.nodes.items[g.frontier];
+    try tt.expect(front.ask and front.turn == 3 and front.nid == 9);
+    // the ask links straight back to turn 1's result through "zebracorn42", across the whole of turn 2
+    var reaches = false;
+    for (front.deps.items) |d| if (g.nodes.items[d.to].nid == 3 and d.w == W_USED) {
+        reaches = true;
+    };
+    try tt.expect(reaches);
+    // the default build reads no stamps: the same bytes as one turn's span are unchanged
+    var plain = try Graph.fromSpan(gpa, span);
+    defer plain.deinit();
+    for (plain.nodes.items) |n| try tt.expect(n.nid == 0 and !n.ask);
+    // the store's net: no NEXT (the ask rides verbatim after it), the result with its id, the dialog oldest first
+    const net = try g.unfoldWith(gpa, 4000, "", .{ .dialog = true, .no_next = true, .ids = true, .dialog_before_turn = 3 });
+    defer gpa.free(net);
+    try tt.expect(std.mem.indexOf(u8, net, "NEXT (") == null);
+    try tt.expect(std.mem.indexOf(u8, net, "n3 read_file {\"path\":\"ledger/alpha.md\"}: alpha ledger: account zebracorn42 holds 1180 units") != null);
+    try tt.expect(std.mem.indexOf(u8, net, "EARLIER IN THIS CONVERSATION") != null);
+    const t1 = std.mem.indexOf(u8, net, "- t1 n1 asked: Read the alpha ledger").?;
+    const t1a = std.mem.indexOf(u8, net, "- t1 n4 answered: The alpha ledger totals 1180 units.").?;
+    try tt.expect(t1 < t1a);
+    // the frontier's own turn is not restated as dialog
+    try tt.expect(std.mem.indexOf(u8, net, "What did zebracorn42 hold") == null);
+    // asks and answers the recency window already shows are left out
+    const windowed = try g.unfoldWith(gpa, 4000, "", .{ .dialog = true, .no_next = true, .ids = true, .dialog_before_turn = 2 });
+    defer gpa.free(windowed);
+    try tt.expect(std.mem.indexOf(u8, windowed, "- t1 n1 asked") != null);
+    try tt.expect(std.mem.indexOf(u8, windowed, "- t2 ") == null);
+}
+
+test "the store's net finds a fact sixty lines into an output by its rare word, and shows the lines around it" {
+    const gpa = tt.allocator;
+    var s: std.ArrayListUnmanaged(u8) = .empty;
+    defer s.deinit(gpa);
+    try tStored(&s, gpa, "{\"role\":\"user\",\"content\":\"Read part two of the ledger.\"", 1, 1, true);
+    var st: std.ArrayListUnmanaged(u8) = .empty;
+    defer st.deinit(gpa);
+    var b: [256]u8 = undefined;
+    try tStep(&st, gpa, "Reading ledger/part2.md.", tCall("c1", "read_file", "{\\\"path\\\":\\\"ledger/part2.md\\\"}", &b));
+    try tStored(&s, gpa, st.items[1 .. st.items.len - 1], 1, 2, false);
+    // sixty lines; the fact is line 35, far past any head excerpt and past the old 48-word index
+    var body: std.ArrayListUnmanaged(u8) = .empty;
+    defer body.deinit(gpa);
+    for (0..60) |r| {
+        if (r == 34) {
+            try body.appendSlice(gpa, "account quokkaplex2 holds 3180 units\\n");
+        } else try body.print(gpa, "ledger part 2 row {d}: value {d} checked balance total\\n", .{ r, 2000 + r });
+    }
+    var obj: std.ArrayListUnmanaged(u8) = .empty;
+    defer obj.deinit(gpa);
+    try obj.print(gpa, "{{\"role\":\"tool\",\"tool_call_id\":\"c1\",\"content\":\"{s}\"", .{body.items});
+    try tStored(&s, gpa, obj.items, 1, 3, false);
+    try tStored(&s, gpa, "{\"role\":\"assistant\",\"content\":\"Part two is read.\"", 1, 4, false);
+    try tStored(&s, gpa, "{\"role\":\"user\",\"content\":\"What does account quokkaplex2 hold?\"", 2, 5, true);
+    var g = try Graph.fromSpanWith(gpa, s.items, .{ .store = true });
+    defer g.deinit();
+    const net = try g.unfoldWith(gpa, 4000, "", .{ .dialog = true, .no_next = true, .ids = true });
+    defer gpa.free(net);
+    try tt.expect(std.mem.indexOf(u8, net, "account quokkaplex2 holds 3180 units") != null);
+    // the window around it, cut before and after (not the whole output, not just its head)
+    try tt.expect(std.mem.indexOf(u8, net, "n3 read_file {\"path\":\"ledger/part2.md\"}: ...") != null);
+    try tt.expect(std.mem.indexOf(u8, net, "row 0:") == null);
+}
+
+test "the store's links follow rare words only: a word in many earlier nodes points at none of them" {
+    const gpa = tt.allocator;
+    var s: std.ArrayListUnmanaged(u8) = .empty;
+    defer s.deinit(gpa);
+    // eight results share "widgetry"; one has "quokkaplex"
+    var id: u64 = 1;
+    for (0..8) |k| {
+        var ob: [160]u8 = undefined;
+        const obj = std.fmt.bufPrint(&ob, "{{\"role\":\"assistant\",\"content\":\"widgetry report {d} filed\"", .{k}) catch unreachable;
+        try tStored(&s, gpa, obj, 1, id, false);
+        id += 1;
+    }
+    try tStored(&s, gpa, "{\"role\":\"assistant\",\"content\":\"quokkaplex report filed\"", 1, id, false);
+    id += 1;
+    try tStored(&s, gpa, "{\"role\":\"user\",\"content\":\"Compare the widgetry with the quokkaplex.\"", 2, id, true);
+    var g = try Graph.fromSpanWith(gpa, s.items, .{ .store = true });
+    defer g.deinit();
+    const ask = g.nodes.items[g.frontier];
+    var to_quokka: usize = 0;
+    var to_widgetry: usize = 0;
+    for (ask.deps.items) |d| if (d.w == W_USED) {
+        const t = g.nodes.items[d.to].text;
+        if (std.mem.indexOf(u8, t, "quokkaplex") != null) to_quokka += 1;
+        if (std.mem.indexOf(u8, t, "widgetry") != null) to_widgetry += 1;
+    };
+    try tt.expectEqual(@as(usize, 1), to_quokka);
+    try tt.expectEqual(@as(usize, 0), to_widgetry);
 }
