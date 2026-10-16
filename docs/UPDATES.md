@@ -1,5 +1,9 @@
 # Desktop updates and release connectivity
 
+## v1.1.22
+
+Nothing to do after updating. A long turn now folds its working context with Gary's 4tope instead of a model-written summary, and each conversation keeps a `net.jsonl` beside its `messages.jsonl` that the next turn reads; existing conversations start it at their next turn. `NL_HANDOFF=model` now restores both model-written paths: the fold inside a turn and the continuation at the spend ceiling. An explicit `NL_TURN_TOKEN_CEILING` is honoured as written; without one, the default ceiling now grows with the prompt a turn may send.
+
 ## v1.1.16
 
 Nothing to do after updating. Gary's 4tope is on by default: when a long turn compacts, its continuation is written from the turn's own working log instead of by a model. To restore the model-written continuation, set `NL_HANDOFF=model` before starting the server. The tool tree is off until you set `NL_TOOL_MAP=1`; with it unset, the tool belt is exactly what v1.1.15 sent. Existing conversations continue as before.
