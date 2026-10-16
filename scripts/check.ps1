@@ -276,6 +276,17 @@ if ($Scan) {
     } else {
         Write-Host "[links] download links point at v$vMain" -ForegroundColor Green
     }
+    # The README carries no per-release text: no "Stable release" / "New in vX" blocks and no
+    # Current/Previously chain. A version's changes go in docs/release/RELEASE-vX.md and the GitHub release
+    # only. Twin of the same check in check.sh.
+    $blurbs = @(Select-String -Path (Join-Path $repo "README.md") `
+        -Pattern '^### (Stable release|New in v)|^\*\*(Current|Previously|Before it|Before that): \[')
+    if ($blurbs.Count -gt 0) {
+        $signals++
+        Write-Host "[readme] $($blurbs.Count) release announcement(s) in README.md (first at line $($blurbs[0].LineNumber)) -- put it in docs/release/RELEASE-v$vMain.md instead" -ForegroundColor Yellow
+    } else {
+        Write-Host "[readme] no release announcements in README.md" -ForegroundColor Green
+    }
     # All FOUR neuron build sites must request the same cargo features (twin of check.sh). CI builds neuron
     # into a path build-official.sh cannot guess and hands it over as NEURON=, which build-official.sh reuses
     # verbatim -- so its own cargo line never runs in CI, and a feature added only there ships nothing.
