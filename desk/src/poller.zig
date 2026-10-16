@@ -1458,7 +1458,10 @@ pub const Poller = struct {
             return;
         }
         if (resp.status < 200 or resp.status >= 300) {
-            self.store.pushNotif("Cloudflare login failed", "the server rejected the request", 2);
+            // The server's own reason when it gives one (409: it moved off the port the login returns to).
+            var ebuf: [320]u8 = undefined;
+            const why = valueForKey(resp.body, "err", &ebuf);
+            self.store.pushNotif("Cloudflare login unavailable", if (why.len > 0) why else "the server rejected the request", 2);
             return;
         }
         var ubuf: [1200]u8 = undefined;
@@ -1733,10 +1736,15 @@ pub const Poller = struct {
         const user_name = valueForKey(resp.body, "user_name", &ubuf);
         const acct_name = valueForKey(resp.body, "account_name", &nbuf);
         const display = if (user_name.len > 0) user_name else acct_name;
+        // Why a login cannot finish on this server, when it cannot ("" from a server that can, or that predates it).
+        var bbuf: [320]u8 = undefined;
+        const blocked = valueForKey(resp.body, "blocked", &bbuf);
         var just_connected = false;
         self.store.lock();
         self.store.cf_oauth_seen = true;
         self.store.cf_oauth_configured = configured;
+        @memcpy(self.store.cf_oauth_blocked[0..blocked.len], blocked);
+        self.store.cf_oauth_blocked_len = blocked.len;
         // The TRANSITION a login this session makes: pending (we opened the browser) → connected.
         // Flagged for the UI thread, which defaults the chat onto Workers AI exactly once.
         if (connected and !self.store.cf_oauth_connected and self.store.cf_oauth_pending) {

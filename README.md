@@ -9,6 +9,7 @@ let specialist agents share the work, and carry project memory
 into your next session. Use the built-in model, Ollama, or an OpenAI-compatible endpoint.
 
 **[Download the desktop app](https://github.com/gary23w/nl-veil/releases/latest)** ·
+**[Get it from the Microsoft Store](https://apps.microsoft.com/detail/9MVQ78SK0CW6)** (Windows) ·
 **[Screenshot walkthrough: setup & build with Cloudflare AI](https://gary23w.github.io/nl-veil/demos/)** ·
 [Installation and requirements](#install) · [Try your first task](#try-your-first-task) · [Email info](mailto:61893883+gary23w@users.noreply.github.com)
 
@@ -640,8 +641,9 @@ That single action starts the local server **and** opens the desktop app.
 > `install.ps1` inside is a *developer* script. The `veil-server-…` assets are the **headless** server
 > for remote boxes — no desktop app.
 
-> **The builds are unsigned.** Windows shows *"Windows protected your PC"* → **More info → Run
-> anyway**. macOS says the developer can't be verified → **right-click → Open** (or
+> **The downloads are unsigned.** On Windows, the [Microsoft Store version](https://apps.microsoft.com/detail/9MVQ78SK0CW6) is signed by
+> Microsoft and installs with no prompt. The zip from GitHub shows *"Windows protected your PC"* →
+> **More info → Run anyway**. macOS says the developer can't be verified → **right-click → Open** (or
 > `xattr -dr com.apple.quarantine <folder>`). Signing certificates are still on the list.
 
 <details><summary><b>Build from source instead</b> — contributors (needs Zig 0.16+)</summary>
@@ -788,7 +790,8 @@ step 5** — the rest is about letting other people in.
 Grab the bundle for your OS from the [latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.1.20)
 and unzip it somewhere you'll find again. Builds are unsigned, so:
 
-- **Windows** shows *"Windows protected your PC"* → **More info** → **Run anyway**.
+- **Windows** shows *"Windows protected your PC"* → **More info** → **Run anyway**. The
+  [Microsoft Store version](https://apps.microsoft.com/detail/9MVQ78SK0CW6) is signed by Microsoft and installs without it.
 - **macOS** says the developer can't be verified → **right-click the `veil` file → Open** → **Open**.
   (Or `xattr -dr com.apple.quarantine <folder>` in Terminal.)
 

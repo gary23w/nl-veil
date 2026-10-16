@@ -122,6 +122,19 @@ fi
 # An official desktop release must contain both native components. Never publish a degraded update.
 [ -n "$neuron" ] || { say "refusing incomplete desktop release"; exit 1; }
 
+# ---- 2b. Authenticode signing (Windows) ----
+# CODESIGN_CMD, when set, runs once per Windows binary with the file's path as its last argument and must sign
+# that file in place (signtool, Microsoft's `sign` tool, Azure Artifact Signing). It runs here, before anything
+# copies or packages the binaries, so the bundle, the update payloads and the checksums all carry the signed
+# bytes. Unset (local builds, forks, and CI until a signing account is set up), the binaries ship unsigned and
+# Windows SmartScreen names an "Unknown publisher"; set but failing, the build stops rather than ship half-signed.
+if [ -n "${CODESIGN_CMD:-}" ] && [ "$OS" = windows ]; then
+  for f in "$SERVER" "$neuron"; do
+    say "signing $(basename "$f")"
+    sh -c "$CODESIGN_CMD \"\$1\"" codesign "$f" || { say "signing failed: $f"; exit 1; }
+  done
+fi
+
 # ---- 3. assemble the full one-click bundle ----
 NAME="veil-v$VERSION-$OS-$ARCH"
 B="$OUT/$NAME"

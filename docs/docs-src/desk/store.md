@@ -22,6 +22,7 @@ store.zig defines `Store`, the one shared-state object the whole native app (Zig
 - `Store.lock`/`unlock` — take/release the internal spinlock around a manual critical section
 - `mkCmd`/`mkChatCmd` — free functions that pack (kind,id,text) slices into a fixed-size `Command`/`ChatCommand` value
 - Record types: `Command`, `Deleting`, `ChatCommand`, `Notif`, `Settings`, `TurnMetric`, `OllamaModel`, `ChatMsg`, `ConvRow`, `CastRow`, `MemRow`, `PropRow`; enums `Tab`, `CmdKind`, `ChatCmdKind`, `ChatRole`, `CastStatus`
+- `Settings.cf_default` + `cfDefaultOn(workers_ai_idx)` — the Cloudflare default in Settings > Models: 0 not decided yet (on for a chat already on Workers AI as one model), 1 on, 2 off (a custom setup). Persisted as `cf_default`; a Cloudflare login made in the desk turns it on. `cf_oauth_blocked` holds the server's reason a login cannot finish on its port.
 - `Settings.pinTarget(port, host)` — the launcher's seam for an attaching desk (main.zig `AttachTarget`): sets the server target and `target_pinned`, under which the chat thread's settings.json loader leaves port and host alone and its saver writes the file's own target back; the Settings tab's Apply clears the pin. Never persisted
 
 ## Dependencies

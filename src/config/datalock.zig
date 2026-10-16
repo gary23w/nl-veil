@@ -75,6 +75,24 @@ pub const Lock = struct {
             self.impl.close(io);
         }
     }
+
+    /// Write a new record into the held file: the port (and bind) this process ended up serving, when that is not
+    /// the one it took the lock with (main's app mode moves off a port another program holds). A desk that attaches
+    /// to this dir reads the record for its target, so it must name the port that answers. Best-effort: a failed
+    /// write leaves the old record, and the lock itself is untouched either way.
+    pub fn rewrite(self: *Lock, io: std.Io, port: u16, bind: []const u8) void {
+        var record_buf: [RECORD_CAP]u8 = undefined;
+        const record = std.fmt.bufPrint(&record_buf, "pid={d}\nport={d}\nbind={s}\n", .{ ownPid(), port, bind[0..@min(bind.len, 47)] }) catch return;
+        if (is_windows) {
+            if (win.SetFilePointerEx(self.impl, 0, null, 0) == 0) return; // FILE_BEGIN
+            var written: u32 = 0;
+            if (win.WriteFile(self.impl, record.ptr, @intCast(record.len), &written, null) == 0 or written != record.len) return;
+            _ = win.SetEndOfFile(self.impl); // a shorter record must not keep the old one's tail
+        } else {
+            self.impl.setLength(io, 0) catch return;
+            self.impl.writePositionalAll(io, record, 0) catch return;
+        }
+    }
 };
 
 pub const Outcome = union(enum) {
@@ -198,6 +216,8 @@ const win = if (is_windows) struct {
     extern "kernel32" fn CreateFileW(name: [*:0]const u16, access: u32, share: u32, sec: ?*anyopaque, disposition: u32, flags: u32, template: ?HANDLE) callconv(.winapi) HANDLE;
     extern "kernel32" fn ReadFile(h: HANDLE, buf: [*]u8, n: u32, read: *u32, overlapped: ?*anyopaque) callconv(.winapi) BOOL;
     extern "kernel32" fn WriteFile(h: HANDLE, buf: [*]const u8, n: u32, written: *u32, overlapped: ?*anyopaque) callconv(.winapi) BOOL;
+    extern "kernel32" fn SetFilePointerEx(h: HANDLE, distance: i64, new_pos: ?*i64, method: u32) callconv(.winapi) BOOL;
+    extern "kernel32" fn SetEndOfFile(h: HANDLE) callconv(.winapi) BOOL;
     extern "kernel32" fn DeleteFileW(name: [*:0]const u16) callconv(.winapi) BOOL;
     extern "kernel32" fn OpenProcess(access: u32, inherit: BOOL, pid: u32) callconv(.winapi) ?HANDLE;
     extern "kernel32" fn GetExitCodeProcess(h: HANDLE, code: *u32) callconv(.winapi) BOOL;
@@ -324,6 +344,17 @@ test "a data dir this process serves is refused to a second taker, who is told t
     var third_held = true;
     defer if (third_held) third.taken.release(io);
     try std.testing.expectEqual(@as(u16, 9999), holderOf(io, root).port);
+    // The holder moved to another port (app mode, its own port taken): the record says so, and a shorter record
+    // leaves no tail of the longer one behind.
+    third.taken.rewrite(io, 8788, "127.0.0.1");
+    const moved = holderOf(io, root);
+    try std.testing.expectEqual(ownPid(), moved.pid);
+    try std.testing.expectEqual(@as(u16, 8788), moved.port);
+    try std.testing.expectEqualStrings("127.0.0.1", moved.bindStr());
+    // ...and the lock is still held: a second taker is refused and told the new port.
+    const fourth = try take(io, root, 7000, "0.0.0.0");
+    try std.testing.expect(fourth == .held);
+    try std.testing.expectEqual(@as(u16, 8788), fourth.held.port);
     third_held = false;
     third.taken.release(io);
     // Nothing is left behind: a released dir has no lock file.

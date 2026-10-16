@@ -894,6 +894,13 @@ pub fn start(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         try res.json(.{ .ok = false, .err = "Cloudflare OAuth is not configured on this server (set NL_CF_OAUTH_CLIENT_ID)" }, .{});
         return;
     }
+    if (app.cf_oauth_blocked.len > 0) {
+        // Cloudflare would refuse to send the browser back here (main.zig cf_oauth_blocked): no consent URL that
+        // can only end on Cloudflare's own error page.
+        res.status = 409;
+        try res.json(.{ .ok = false, .err = app.cf_oauth_blocked }, .{});
+        return;
+    }
     var vbuf: [64]u8 = undefined;
     const verifier_len = randToken(app.io, 32, &vbuf); // 32 raw bytes -> 43-char verifier (RFC 7636 range)
     const verifier = vbuf[0..verifier_len];
@@ -998,6 +1005,9 @@ pub fn status(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     try http.jstr(app.gpa, &out, email);
     try out.appendSlice(app.gpa, ",\"user_name\":");
     try http.jstr(app.gpa, &out, user_name);
+    // Why a login cannot finish here, when it cannot (app mode moved off the redirect's port); "" otherwise.
+    try out.appendSlice(app.gpa, ",\"blocked\":");
+    try http.jstr(app.gpa, &out, app.cf_oauth_blocked);
     try out.append(app.gpa, '}');
     res.content_type = .JSON;
     res.body = try res.arena.dupe(u8, out.items);
@@ -1099,6 +1109,55 @@ test "pending store round-trips state->verifier and is single-use" {
     try std.testing.expectEqual(@as(u64, 7), got.uid);
     try std.testing.expectEqualStrings("VERIFIERXYZ", vbuf[0..got.verifier_len]);
     try std.testing.expect(takePending(io, "STATE123", &vbuf) == null); // consumed
+}
+
+test "a server that moved off the redirect's port says why on the status, and refuses a login that could not finish" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var ta = try http.testApp(gpa, io, "zig-cfoauth-blocked-tmp");
+    defer ta.deinit();
+    // A real account and session, through the doors the server uses (see keys_api's round trip). Auth fails
+    // open without a store, so a box with no neuron binary skips honestly.
+    ta.auth.register("someone@example.test", "correct horse battery") catch return error.SkipZigTest;
+    const token = ta.auth.login("someone@example.test", "correct horse battery") catch return error.SkipZigTest;
+    defer gpa.free(token);
+    const cookie = try std.fmt.allocPrint(gpa, http.COOKIE ++ "={s}", .{token});
+    defer gpa.free(cookie);
+    ta.app.cf_oauth_client_id = DEFAULT_CLIENT_ID;
+
+    // Not moved: the status carries an empty reason (the desk shows the login button).
+    {
+        var web = httpz.testing.init(.{});
+        defer web.deinit();
+        web.header("cookie", cookie);
+        try status(&ta.app, web.req, web.res);
+        try web.expectStatus(200);
+        try std.testing.expect(std.mem.indexOf(u8, try web.getBody(), "\"blocked\":\"\"") != null);
+    }
+    // Moved: the reason rides the status for the desk to show in place of the button...
+    const why = "Another program on this computer is using port 8787 (another veil?), so this veil is running on port 8788.";
+    ta.app.cf_oauth_blocked = why;
+    {
+        var web = httpz.testing.init(.{});
+        defer web.deinit();
+        web.header("cookie", cookie);
+        try status(&ta.app, web.req, web.res);
+        try web.expectStatus(200);
+        try std.testing.expect(std.mem.indexOf(u8, try web.getBody(), "\"blocked\":\"" ++ why ++ "\"") != null);
+    }
+    // ...and a login is refused with it: no consent URL that can only end on Cloudflare's redirect error.
+    {
+        var web = httpz.testing.init(.{});
+        defer web.deinit();
+        web.header("cookie", cookie);
+        try start(&ta.app, web.req, web.res);
+        try web.expectStatus(409);
+        const body = try web.getBody();
+        try std.testing.expect(std.mem.indexOf(u8, body, why) != null);
+        try std.testing.expect(std.mem.indexOf(u8, body, "dash.cloudflare.com") == null);
+    }
 }
 
 // ---------------------------------------------------------------------------
