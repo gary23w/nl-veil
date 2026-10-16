@@ -7,6 +7,7 @@ test {
     // ANALYZES, and nothing in a test build reaches theme's icon paths, so that import never pulls
     // assets in. Its tests were silently not running. Textual reachability is not collection.
     _ = @import("assets.zig");
+    _ = @import("garrett.zig");
     _ = @import("catalog.zig");
     _ = @import("chat.zig");
     _ = @import("gitvc.zig");

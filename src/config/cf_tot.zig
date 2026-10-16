@@ -38,19 +38,15 @@
 //!                                        garrett_url + garrett_token (an Agent Garrett the owner deployed by hand)
 //!   GET    /api/v1/tots/garrett          Agent Garrett: deployed or not, its address, what the runtime says
 //!                                        (?reveal=1 adds the password locking its chat UI)
-//!   POST   /api/v1/tots/garrett          deploy it now;  DELETE removes it
+//!   POST   /api/v1/tots/garrett          verify/save a dashboard API key; DELETE disconnects Veil
 //!
-//! AGENT GARRETT (github.com/gary23w/garrettstimpson.ca/agent): a Worker of its own, `veil-garrett`, with ninety-odd
-//! blue-team tools behind a stateless MCP endpoint (CVE/KEV/EPSS intel, DNS and certificate transparency, RDAP,
-//! email security posture, IOC extraction, evidence manifests...). It is the user's ACCOUNT-LEVEL deployment, not
-//! the tots': the desk's Settings button (Deploy Agent Garrett), `veil --tater garrett launch` or a tot's own
-//! garrett_launch puts it there, with or without a tot in the account. launchGarrett reads its wrangler.toml and
-//! every module under its src/ from the repo, LIVE, and uploads them through the same login, with derived secrets (its MCP bearer; a password locking the
-//! chat UI nobody asked for; its policy vars pin safe mode and no active or dark-web tools over MCP), enables its
-//! address, and - when the tots' Worker is in the account - points it at the agent with two secrets (a runtime
-//! uploaded later is pointed at it by ensureRuntime). WHO USES IT is opt-in, per thing: a chat turn that asked
-//! (`garrett` in the message body), a swarm deployed with `garrett`, a tot deployed or configured with `garrett`;
-//! config/cf_garrett.zig derives the pair for all of them. Removing the tots keeps it; DELETE removes it.
+//! AGENT GARRETT: setup, plans, deployment, keys, memory and updates now live at
+//! agent.garrettstimpson.ca. POST verifies a user-supplied gtt_ key over authenticated
+//! MCP and saves it sealed under that NL-Veil user. Chat and new swarms resolve it
+//! through cf_garrett; existing cloud tots get the pair through their secret bindings.
+//! Their opt-ins are unchanged. No new setup path fetches public source or launches
+//! a backend. Legacy connection state remains readable until explicitly replaced.
+//! DELETE disconnects this client; cloud agent deletion and billing stay in Garrett.
 //!
 //! THE LOCAL FOLDER: every deployment of a tot is mirrored into {data}/u<uid>/_tots/<name>-<deployed>/ (events.log
 //! to tail, events.jsonl, status.json, notes/), with the shared scratchpad at _tots/scratchpad.md. See mirrorTot.
@@ -140,6 +136,7 @@ const State = struct {
     garrett_hash: []const u8 = "", // the modules it was launched from (garrettHash)
     garrett_at: i64 = 0,
     garrett_account: []const u8 = "", // the account it was launched into (empty for a launch from before this field: the tots' account)
+    garrett_pair_hash: []const u8 = "", // last dashboard connection synced to the tots; no key material
     garrett_gen: u32 = 0, // the generation its secrets were derived under (likewise: the tots' token_gen then)
 };
 
@@ -487,7 +484,7 @@ fn ensureRuntime(app: *App, a: std.mem.Allocator, uid: u64, tok: Tok, st: *State
     st.last_error = "";
     // An Agent Garrett already in this account: the new runtime is pointed at it (its two secrets). Best effort:
     // the runtime is up either way, and a tot that asks for the agent is told in its words when it is not there.
-    if (st.garrett_url.len > 0 and std.mem.eql(u8, garrettAccount(st.*), acct)) {
+    if (cf_garrett.managedFor(app, uid, a).present or (st.garrett_url.len > 0 and std.mem.eql(u8, garrettAccount(st.*), acct))) {
         if (pointTotsAtGarrett(app, a, uid, tok, st.*)) |m| log.warn("the new tot runtime could not be pointed at Agent Garrett for u{d}: {s}", .{ uid, m });
     }
     uploaded.* = true;
@@ -621,8 +618,9 @@ pub fn listTots(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         if (i > 0) try out.append(app.gpa, ',');
         try http.jstr(app.gpa, &out, n);
     }
-    try out.print(app.gpa, "],\"python\":{},\"browser\":{},\"neuron\":{},\"garrett\":{},\"garrett_url\":", .{ st.python, st.browser, st.neuron, st.garrett_url.len > 0 });
-    try http.jstr(app.gpa, &out, st.garrett_url);
+    try out.print(app.gpa, "],\"python\":{},\"browser\":{},\"neuron\":{},\"garrett\":{},\"garrett_url\":", .{ st.python, st.browser, st.neuron, cf_garrett.connected(app, u.id, a) });
+    const managed_connection = cf_garrett.managedFor(app, u.id, a);
+    try http.jstr(app.gpa, &out, if (managed_connection.present) (if (managed_connection.creds != null) cf_garrett.MCP_URL else "") else st.garrett_url);
     try out.appendSlice(app.gpa, ",\"tools_note\":");
     try http.jstr(app.gpa, &out, st.tools_note);
     try out.appendSlice(app.gpa, ",\"last_error\":");
@@ -707,7 +705,7 @@ fn deploy(app: *App, a: std.mem.Allocator, uid: u64, tok: Tok, body: CreateReq) 
         return .{ .err = std.fmt.allocPrint(a, "on {s} a goal or a charter holds at most {d} characters - shorten it, or pick a model with a bigger window", .{ model, limit }) catch "goal too long for this model" };
 
     var st = readState(app, uid, a);
-    if (body.garrett and st.garrett_url.len == 0) return .{ .err = "Agent Garrett is not deployed in this account - Settings > Deploy Agent Garrett first (or untick 'use Agent Garrett')" };
+    if (body.garrett and !cf_garrett.connected(app, uid, a)) return .{ .err = "Agent Garrett is not connected - Settings > Agent Garrett > Connect API key first (or untick 'use Agent Garrett')" };
     var uploaded = false;
     if (ensureRuntime(app, a, uid, tok, &st, &uploaded)) |msg| {
         st.last_error = msg;
@@ -927,7 +925,7 @@ pub fn totConfig(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     var arena = std.heap.ArenaAllocator.init(app.gpa);
     defer arena.deinit();
     const a = arena.allocator();
-    if (body.garrett == true and readState(app, u.id, a).garrett_url.len == 0) return badReq(res, "Agent Garrett is not deployed in this account - Settings > Deploy Agent Garrett first");
+    if (body.garrett == true and !cf_garrett.connected(app, u.id, a)) return badReq(res, "Agent Garrett is not connected - Settings > Agent Garrett > Connect API key first");
     const path = try std.fmt.allocPrint(a, "/v1/tots/{s}/config", .{name});
     var json = std.json.Stringify.valueAlloc(a, body, .{ .emit_null_optional_fields = false }) catch return http.serverErr(res, "out of memory");
     // a new model brings its own text limit
@@ -1059,8 +1057,8 @@ pub fn setKey(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
 
 // ---------------------------------------------------------------------------------- Agent Garrett
 
-/// When the last launch was refused: a refused launch is not tried again for a quarter of an hour.
-var garrett_failed_s: std.atomic.Value(i64) = .init(0);
+// The module upload helpers below are retained only for legacy fixture coverage.
+// Public setup routes and background requests use the dashboard connection above.
 
 /// The port of a loopback stand-in the Cloudflare API is pointed at (NL_CF_API_ROOT, the tests), or null for the
 /// real API. While there is one, it plays the agent's repo too.
@@ -1396,6 +1394,10 @@ fn garrettGen(st: State) u32 {
 /// Point the tots' Worker at Agent Garrett: where it answers and the bearer it answers to, as two secrets on
 /// their script. What went wrong in words, or null.
 fn pointTotsAtGarrett(app: *App, a: std.mem.Allocator, uid: u64, tok: Tok, st: State) ?[]const u8 {
+    if (cf_garrett.managedFor(app, uid, a).present) {
+        var current = st;
+        return syncManagedGarrett(app, a, uid, tok, &current);
+    }
     const acct = garrettAccount(st);
     const tots_url = std.fmt.allocPrint(a, "{s}/accounts/{s}/workers/scripts/" ++ SCRIPT, .{ app.cf_api_root, acct }) catch return "out of memory";
     const mcp_url = std.fmt.allocPrint(a, "{s}/mcp", .{st.garrett_url}) catch return "out of memory";
@@ -1403,6 +1405,29 @@ fn pointTotsAtGarrett(app: *App, a: std.mem.Allocator, uid: u64, tok: Tok, st: S
     const mcp = garrettToken(app, uid, acct, garrettGen(st), &mb);
     if (putSecret(app, a, tots_url, tok.key, "GARRETT_MCP_URL", mcp_url, "pointing the tots at Agent Garrett")) |m| return m;
     if (putSecret(app, a, tots_url, tok.key, "GARRETT_MCP_TOKEN", mcp, "giving the tots Agent Garrett's token")) |m| return m;
+    return null;
+}
+
+fn managedPairHash(a: std.mem.Allocator, key: []const u8) []const u8 {
+    var hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(key, &hash, .{});
+    return a.dupe(u8, &std.fmt.bytesToHex(hash, .lower)) catch "";
+}
+
+// Retry connection synchronization without fetching source or creating agents.
+fn syncManagedGarrett(app: *App, a: std.mem.Allocator, uid: u64, tok: Tok, st: *State) ?[]const u8 {
+    const managed = cf_garrett.managedFor(app, uid, a);
+    if (!managed.present or st.url.len == 0) return null;
+    if (!std.mem.eql(u8, tok.account_id, st.account)) return "Reconnect Cloudflare to sync this connection to your cloud tater-tots.";
+    const key = if (managed.creds) |c| c.token else "";
+    const fingerprint = managedPairHash(a, key);
+    if (std.mem.eql(u8, fingerprint, st.garrett_pair_hash)) return null;
+    const script = std.fmt.allocPrint(a, "{s}/accounts/{s}/workers/scripts/" ++ SCRIPT, .{ app.cf_api_root, st.account }) catch return "out of memory";
+    if (putSecret(app, a, script, tok.key, "GARRETT_MCP_URL", if (key.len > 0) cf_garrett.MCP_URL else "", "syncing the Garrett connection")) |m| return m;
+    if (putSecret(app, a, script, tok.key, "GARRETT_MCP_TOKEN", key, "syncing the Garrett connection key")) |m| return m;
+    st.garrett_pair_hash = fingerprint;
+    writeState(app, uid, st.*);
+    garrettResult(app, a, uid, st.*, if (key.len > 0) cf_garrett.MCP_URL else "", if (key.len > 0) null else "Connect your Garrett API key in desktop Settings.");
     return null;
 }
 
@@ -1669,28 +1694,29 @@ fn syncGarrett(app: *App, a: std.mem.Allocator, uid: u64, st: *State) void {
 
 fn syncGarrettAs(app: *App, a: std.mem.Allocator, uid: u64, tok: Tok, st: *State) void {
     if (!std.mem.eql(u8, tok.account_id, st.account)) return;
-    const g = garrettState(app, a, uid, st.*);
-    if (!g.ok or !std.mem.eql(u8, g.status, "pending")) return;
-    const now = nowS(app.io);
-    if (now - garrett_failed_s.load(.monotonic) < 900) return;
-    if (launchGarrett(app, a, uid, tok, st)) |msg| {
-        garrett_failed_s.store(now, .monotonic);
-        log.warn("Agent Garrett could not be launched for u{d}: {s}", .{ uid, msg });
-        garrettResult(app, a, uid, st.*, "", msg);
+    if (cf_garrett.managedFor(app, uid, a).present) {
+        _ = syncManagedGarrett(app, a, uid, tok, st);
         return;
     }
-    const mcp_url = std.fmt.allocPrint(a, "{s}/mcp", .{st.garrett_url}) catch return;
-    garrettResult(app, a, uid, st.*, mcp_url, null);
+    const g = garrettState(app, a, uid, st.*);
+    if (!g.ok or !std.mem.eql(u8, g.status, "pending")) return;
+    garrettResult(app, a, uid, st.*, "", "Set up your plan and agent at https://agent.garrettstimpson.ca/dashboard, then connect its API key in NL-Veil Settings. Existing agents are retained.");
 }
 
 /// GET /api/v1/tots/garrett — Agent Garrett as this server and the runtime know it. `?reveal=1` adds the password
 /// that locks its chat UI (derived, so it can always be shown again).
 pub fn garrettStatus(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
-    const u = gate(app, req, res) orelse return;
+    const u = http.requireUser(app, req, res) orelse return;
     var arena = std.heap.ArenaAllocator.init(app.gpa);
     defer arena.deinit();
     const a = arena.allocator();
     const st = readState(app, u.id, a);
+    const managed = cf_garrett.managedFor(app, u.id, a);
+    if (managed.present) {
+        const paired = managed.creds != null;
+        const pending = st.url.len > 0 and !std.mem.eql(u8, st.garrett_pair_hash, managedPairHash(a, if (managed.creds) |c| c.token else ""));
+        return res.json(.{ .ok = true, .managed = true, .legacy = false, .launched = paired, .url = if (paired) cf_garrett.MCP_URL else "", .mcp_url = if (paired) cf_garrett.MCP_URL else "", .status = if (paired) "connected" else "disconnected", .runtime_phase = if (paired) "connected" else "none", .runtime_ready = paired, .runtime_building = false, .tools = managed.tools, .checked_at = managed.checked_at, .cloud_sync_pending = pending, .@"error" = if (pending) "Cloud tater-tot connection sync is pending. Reconnect Cloudflare if it persists; a disconnected cloud key can also be revoked in the Garrett dashboard." else "", .dashboard = cf_garrett.DASHBOARD }, .{});
+    }
     const g = garrettState(app, a, u.id, st);
     const q = try req.query();
     const launched = st.garrett_url.len > 0;
@@ -1712,36 +1738,52 @@ pub fn garrettStatus(app: *App, req: *httpz.Request, res: *httpz.Response) !void
     }
     const building = std.mem.eql(u8, runtime_phase, "building") or std.mem.eql(u8, runtime_phase, "not-started");
     const status: []const u8 = if (launched and std.mem.eql(u8, g.status, "none")) "deployed" else g.status;
-    try res.json(.{ .ok = true, .launched = launched, .url = st.garrett_url, .mcp_url = mcp_url, .account = if (launched) garrettAccount(st) else "", .launched_at = st.garrett_at, .sources = st.garrett_hash, .status = status, .runtime_phase = runtime_phase, .runtime_building = building, .runtime_ready = std.mem.eql(u8, runtime_phase, "ready"), .@"error" = if (runtime_error.len > 0) runtime_error else g.@"error", .asked_by = g.asked_by, .asked_at = g.asked_at, .password = password, .repo = "https://github.com/gary23w/garrettstimpson.ca/tree/main/agent" }, .{});
+    try res.json(.{ .ok = true, .launched = launched, .url = st.garrett_url, .mcp_url = mcp_url, .account = if (launched) garrettAccount(st) else "", .launched_at = st.garrett_at, .sources = st.garrett_hash, .status = status, .runtime_phase = runtime_phase, .runtime_building = building, .runtime_ready = std.mem.eql(u8, runtime_phase, "ready"), .@"error" = if (runtime_error.len > 0) runtime_error else g.@"error", .asked_by = g.asked_by, .asked_at = g.asked_at, .password = password, .managed = false, .legacy = launched, .dashboard = cf_garrett.DASHBOARD }, .{});
 }
 
-/// POST /api/v1/tots/garrett — launch Agent Garrett now (the owner asking; a tot asks through garrett_launch).
+/// POST verifies and saves a dashboard API key for the signed-in NL-Veil user.
 pub fn garrettLaunch(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
-    const u = gate(app, req, res) orelse return;
+    const u = http.requireUser(app, req, res) orelse return;
     var arena = std.heap.ArenaAllocator.init(app.gpa);
     defer arena.deinit();
     const a = arena.allocator();
-    const tok = tokOf(app, u.id, a) orelse return badReq(res, "not connected to Cloudflare - log in with Cloudflare first");
+    const Body = struct { api_key: []const u8 = "" };
+    const body = std.json.parseFromSliceLeaky(Body, a, req.body() orelse "{}", .{}) catch return badReq(res, "Paste the API key generated in your Garrett dashboard.");
+    const key = std.mem.trim(u8, body.api_key, " \r\n\t");
+    if (!cf_garrett.validKey(key)) return badReq(res, "Open the Garrett dashboard, activate Trial or Agent, deploy your agent, and paste its gtt_ API key here.");
+    const checked = security_runtime.checkConnection(.{ .gpa = a, .io = app.io, .scratch = app.data, .url = if (builtin.is_test) test_managed_mcp_url orelse cf_garrett.MCP_URL else cf_garrett.MCP_URL, .token = key });
+    if (!checked.ok) return badReq(res, "Garrett could not verify this key. Check your plan, ready agent, and API key in the dashboard, then retry. Your existing connection is unchanged.");
+    cf_garrett.saveManaged(app, u.id, key, checked.tools) catch return badReq(res, "Could not save the connection securely. Your existing connection is unchanged.");
     var st = readState(app, u.id, a);
-    if (launchGarrett(app, a, u.id, tok, &st)) |msg| {
-        garrettResult(app, a, u.id, st, "", msg);
-        return badReq(res, msg);
+    var warning: []const u8 = "";
+    if (st.url.len > 0) {
+        if (tokOf(app, u.id, a)) |tok| {
+            warning = syncManagedGarrett(app, a, u.id, tok, &st) orelse "";
+        } else {
+            warning = "Connected for desktop use. Reconnect Cloudflare to sync your existing cloud tater-tots.";
+        }
     }
-    const mcp_url = try std.fmt.allocPrint(a, "{s}/mcp", .{st.garrett_url});
-    garrettResult(app, a, u.id, st, mcp_url, null);
-    try res.json(.{ .ok = true, .url = st.garrett_url, .mcp_url = mcp_url }, .{});
+    try res.json(.{ .ok = true, .managed = true, .url = cf_garrett.MCP_URL, .tools = checked.tools, .warning = warning, .cloud_sync_pending = warning.len > 0 }, .{});
 }
+pub var test_managed_mcp_url: if (builtin.is_test) ?[]const u8 else void = if (builtin.is_test) null else {};
 
-/// DELETE /api/v1/tots/garrett — remove it: the Worker, the tots' two secrets, the runtime's record.
+/// DELETE disconnects Veil and clears tot pointers; the cloud agent is retained.
 pub fn garrettRemove(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
-    const u = gate(app, req, res) orelse return;
+    const u = http.requireUser(app, req, res) orelse return;
     var arena = std.heap.ArenaAllocator.init(app.gpa);
     defer arena.deinit();
     const a = arena.allocator();
-    const tok = tokOf(app, u.id, a) orelse return badReq(res, "not connected to Cloudflare - log in with Cloudflare first");
+    cf_garrett.saveManaged(app, u.id, "", 0) catch return badReq(res, "Could not save the local disconnect. Retry.");
     var st = readState(app, u.id, a);
-    if (removeGarrett(app, a, u.id, tok, &st)) |msg| return badReq(res, msg);
-    try res.json(.{ .ok = true, .removed = true }, .{});
+    var warning: []const u8 = "";
+    if (st.url.len > 0) {
+        if (tokOf(app, u.id, a)) |tok| {
+            warning = syncManagedGarrett(app, a, u.id, tok, &st) orelse "";
+        } else {
+            warning = "Disconnected locally. Reconnect Cloudflare to clear the cloud tater-tot connection, or revoke its key in the Garrett dashboard.";
+        }
+    }
+    try res.json(.{ .ok = true, .removed = true, .disconnected = true, .cloud_agent_retained = true, .warning = warning }, .{});
 }
 
 // ---------------------------------------------------------------------------------- the owner's machine
@@ -2647,7 +2689,7 @@ test "every tot route is gated: an anonymous caller gets 401 and nothing runs" {
     const io = threaded.io();
     var ta = try http.testApp(gpa, io, "zig-cftot-gate-tmp");
     defer ta.deinit();
-    inline for (.{ listTots, createTot, deleteTot, teardown, totEvents, totCommand, totConfig, padRead, padWrite, padClear, setKey, setLimit, listRuns, runEvents, deleteRun }) |h| {
+    inline for (.{ garrettStatus, garrettLaunch, garrettRemove, listTots, createTot, deleteTot, teardown, totEvents, totCommand, totConfig, padRead, padWrite, padClear, setKey, setLimit, listRuns, runEvents, deleteRun }) |h| {
         var web = httpz.testing.init(.{});
         defer web.deinit();
         web.param("name", "Gary");
@@ -2962,118 +3004,34 @@ test "Agent Garrett's upload is made from its repo's wrangler.toml: its bindings
     try tt.expect(std.mem.indexOf(u8, TOT_JS, "b.posture") != null and std.mem.indexOf(u8, TOT_JS, "b.leash_s") != null);
 }
 
-test "Agent Garrett is launched from its repo's modules beside the tots' Worker - locked, pointed at from the tots, reported to the runtime - and a refusal waits a quarter of an hour" {
-    const gpa = tt.allocator;
-    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+test "a cloud tot cannot fetch old public agent source or bypass dashboard onboarding" {
+    const a = tt.allocator;
+    var threaded = std.Io.Threaded.init(a, .{ .environ = http.testEnviron() });
     defer threaded.deinit();
     const io = threaded.io();
-    const root = "zig-cftot-garrett-tmp";
-    var ta = try http.testApp(gpa, io, root);
+    var ta = try http.testApp(a, io, "zig-cftot-dashboard-required-tmp");
     defer ta.deinit();
-    if (!curlRuns(gpa, io)) return error.SkipZigTest;
-    garrett_failed_s.store(0, .monotonic);
-
-    const routes = [_]fakehttp.Route{
-        .{ .method = "PUT", .path = "/workers/scripts/veil-garrett-upload", .reply = StandIn.ok },
-        .{ .method = "POST", .path = "/workers/scripts/veil-garrett-upload/subdomain", .reply = StandIn.ok },
-        .{ .method = "DELETE", .path = "/workers/scripts/veil-garrett-upload", .reply = StandIn.ok },
-        .{ .method = "PUT", .path = "/build/", .reply = fakehttp.wire("{\"success\":true}") },
-        .{ .method = "PUT", .path = "/workers/scripts/veil-garrett-gary", .reply = StandIn.ok },
-        .{ .method = "GET", .path = "/workers/durable_objects/namespaces", .reply = fakehttp.wire("{\"success\":true,\"result\":[{\"id\":\"gary-namespace\",\"script\":\"veil-garrett-gary\",\"class\":\"GaryContainer\"}]}") },
-
-        .{ .method = "GET", .path = "/v1/garrett", .reply = StandIn.garrett_pending },
-        .{ .method = "GET", .path = "/garrett/wrangler.toml", .reply = StandIn.toml },
-        .{ .method = "GET", .path = "/garrett/contents/src", .reply = StandIn.list },
-        .{ .method = "GET", .path = "/garrett/src/index.js", .reply = StandIn.src_index },
-        .{ .method = "GET", .path = "/garrett/src/neuron_core.wasm", .reply = StandIn.src_wasm },
-        .{ .method = "GET", .path = "/garrett/src/", .reply = StandIn.src_mjs },
-        .{ .method = "GET", .path = "/accounts/acct/workers/subdomain", .reply = StandIn.subdomain },
-        .{ .method = "GET", .path = "/workers/scripts/veil-garrett/settings", .reply = StandIn.no_script },
-        .{ .method = "PUT", .path = "/workers/scripts/veil-garrett/secrets", .reply = StandIn.ok },
-        // the first launch is refused both ways (with and without the class migration); the next is taken
-        .{ .method = "PUT", .path = "/workers/scripts/veil-garrett", .reply = StandIn.no_browser, .times = 2 },
-        .{ .method = "PUT", .path = "/workers/scripts/veil-garrett", .reply = StandIn.ok },
-        .{ .method = "POST", .path = "/workers/scripts/veil-garrett/subdomain", .reply = StandIn.ok },
-        .{ .method = "PUT", .path = "/workers/scripts/veil-tots/secrets", .reply = StandIn.ok },
-        .{ .method = "POST", .path = "/v1/garrett/result", .reply = StandIn.garrett_deployed },
-    };
+    if (!curlRuns(a, io)) return error.SkipZigTest;
     var srv: fakehttp.Server = undefined;
+    const routes = [_]fakehttp.Route{.{ .method = "GET", .path = "/v1/garrett", .reply = StandIn.garrett_pending }};
     try srv.startRouted(io, &routes, StandIn.ok);
     var running = true;
     defer if (running) srv.stop();
     var rb: [80]u8 = undefined;
     ta.app.cf_api_root = try std.fmt.bufPrint(&rb, "http://127.0.0.1:{d}/client/v4", .{srv.port});
     var ub: [80]u8 = undefined;
-    const stand_in = try std.fmt.bufPrint(&ub, "http://127.0.0.1:{d}", .{srv.port});
-
-    var arena = std.heap.ArenaAllocator.init(gpa);
+    const url = try std.fmt.bufPrint(&ub, "http://127.0.0.1:{d}", .{srv.port});
+    var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
-    const a = arena.allocator();
-    const tok: Tok = .{ .key = "oauth-bearer", .account_id = "acct" };
-    // a login that names no account is refused before any call (a launch needs no tot: see the next test)
-    var none: State = .{};
-    try tt.expect(launchGarrett(&ta.app, a, 1, .{ .key = "oauth-bearer", .account_id = "" }, &none) != null);
-    var st: State = .{ .account = "acct", .url = stand_in, .script_hash = "x" };
-    writeState(&ta.app, 1, st);
-
-    // 1: the runtime says a tot asked; the upload is refused, the refusal is reported, nothing is recorded
-    syncGarrettAs(&ta.app, a, 1, tok, &st);
-    try tt.expectEqualStrings("", st.garrett_url);
-    try tt.expect(garrett_failed_s.load(.monotonic) > 0);
-    // 2: within the quarter hour only the question is asked
-    const before = srv.call_count;
-    syncGarrettAs(&ta.app, a, 1, tok, &st);
-    try tt.expectEqual(before + 1, srv.call_count);
-    // 3: the backoff over, the launch goes through: the Worker, its secrets, its address, the tots' two secrets
-    garrett_failed_s.store(0, .monotonic);
-    syncGarrettAs(&ta.app, a, 1, tok, &st);
-    try tt.expectEqualStrings(stand_in, st.garrett_url);
-    var hb: [16]u8 = undefined;
-    try tt.expectEqualStrings(garrettHash(&[_][]const u8{ StandIn.src_index_body, StandIn.src_mjs_body, StandIn.src_mjs_body, StandIn.src_mjs_body, StandIn.src_wasm_body }, &hb), st.garrett_hash);
-    try tt.expect(st.garrett_at > 0);
-    try tt.expectEqualStrings("acct", st.garrett_account); // the launch records the account and generation its secrets were made under
-    try tt.expectEqual(@as(u32, 0), st.garrett_gen);
-    try tt.expectEqualStrings(stand_in, readState(&ta.app, 1, a).garrett_url);
-    // the state file holds no secret of Agent Garrett's
-    var mb: [64]u8 = undefined;
-    var pb: [64]u8 = undefined;
-    const on_disk = try std.Io.Dir.cwd().readFileAlloc(io, root ++ "/u1/" ++ STATE_FILE, a, .limited(64 << 10));
-    try tt.expect(std.mem.indexOf(u8, on_disk, garrettToken(&ta.app, 1, "acct", 0, &mb)) == null);
-    try tt.expect(std.mem.indexOf(u8, on_disk, garrettPassword(&ta.app, 1, "acct", 0, &pb)) == null);
-    try tt.expect(!std.mem.eql(u8, &mb, &pb)); // two derived secrets, two values
-    // removal: the Worker, the tots' two secrets, the runtime's record
-    try tt.expect(removeGarrett(&ta.app, a, 1, tok, &st) == null);
-    try tt.expectEqualStrings("", st.garrett_url);
-    try tt.expectEqualStrings("", readState(&ta.app, 1, a).garrett_url);
-
+    // This background pass receives the same request-scoped arena as production.
+    var state: State = .{ .account = "acct", .url = url };
+    syncGarrettAs(&ta.app, arena.allocator(), 1, .{ .key = "fake-cloudflare-key", .account_id = "acct" }, &state);
+    try tt.expectEqualStrings("", state.garrett_url);
     srv.stop();
     running = false;
-    // the repo is read before anything in the account is touched - its toml, the listing, the modules in the
-    // listing's order (the dotfile skipped) - then the subdomain, the script, the upload
-    try tt.expectEqual(@as(?usize, 0), srv.firstCall("GET", "/v1/garrett"));
-    try tt.expectEqual(@as(?usize, 1), srv.firstCall("GET", "/garrett/wrangler.toml"));
-    try tt.expectEqual(@as(?usize, 2), srv.firstCall("GET", "/garrett/contents/src"));
-    try tt.expectEqual(@as(?usize, 3), srv.firstCall("GET", "/garrett/src/index.js"));
-    try tt.expectEqual(@as(?usize, 4), srv.firstCall("GET", "/garrett/src/mcp.mjs"));
-    try tt.expectEqual(@as(?usize, 7), srv.firstCall("GET", "/garrett/src/neuron_core.wasm"));
-    try tt.expectEqual(@as(?usize, 8), srv.firstCall("GET", "/accounts/acct/workers/subdomain"));
-    try tt.expect(srv.firstCall("GET", "/workers/scripts/veil-garrett/settings") != null);
-    try tt.expect(srv.firstCall("PUT", "/accounts/acct/workers/scripts/veil-garrett") != null);
-    try tt.expect(srv.firstCall("POST", "/v1/garrett/result") != null);
-    try tt.expectEqual(@as(usize, 3), srv.countCalls("GET", "/v1/garrett"));
-    try tt.expectEqual(@as(usize, 2), srv.countCalls("GET", "/garrett/wrangler.toml")); // read again at the second launch: live, never cached
-    try tt.expectEqual(@as(usize, 2), srv.countCalls("GET", "/garrett/contents/src"));
-    try tt.expectEqual(@as(usize, 0), srv.countCalls("GET", "/garrett/src/.gitkeep"));
-    try tt.expectEqual(@as(usize, 3), srv.countCallsExact("PUT", "/client/v4/accounts/acct/workers/scripts/veil-garrett"));
-    try tt.expectEqual(@as(usize, 2), srv.countCallsExact("PUT", "/client/v4/accounts/acct/workers/scripts/veil-garrett-gary"));
-    try tt.expectEqual(@as(usize, 3), srv.countCalls("PUT", "/workers/scripts/veil-garrett/secrets"));
-    try tt.expectEqual(@as(usize, 1), srv.countCalls("POST", "/workers/scripts/veil-garrett/subdomain"));
-    try tt.expectEqual(@as(usize, 2), srv.countCalls("PUT", "/workers/scripts/veil-tots/secrets"));
-    try tt.expectEqual(@as(usize, 2), srv.countCalls("POST", "/v1/garrett/result"));
-    try tt.expectEqual(@as(usize, 1), srv.countCalls("DELETE", "/workers/scripts/veil-garrett?force=true"));
-    try tt.expectEqual(@as(usize, 2), srv.countCalls("DELETE", "/workers/scripts/veil-tots/secrets/GARRETT_MCP_"));
-    try tt.expectEqual(@as(usize, 1), srv.countCalls("POST", "/v1/garrett/clear"));
-    try tt.expect(srv.call_count > 36 and srv.call_count < 128);
+    try tt.expectEqual(@as(usize, 0), srv.countCalls("GET", "/garrett/"));
+    try tt.expectEqual(@as(usize, 0), srv.countCalls("PUT", "/workers/scripts/"));
+    try tt.expectEqual(@as(usize, 1), srv.countCalls("POST", "/v1/garrett/result"));
 }
 
 test "Agent Garrett deploys on its own, with no tater-tot in the account: its pair is derived for a chat or a swarm, a runtime that arrives later is pointed at it, removing the tots keeps it, and removing it touches no tots" {
@@ -3934,4 +3892,122 @@ test "failed security Container removal keeps state for an explicit retry" {
     try tt.expect(std.mem.indexOf(u8, why, "Disconnect and log in with Cloudflare again") != null);
     try tt.expectEqualStrings("https://agent.example.test", readState(&ta.app, 1, a).garrett_url);
     try tt.expect(srv.firstCall("DELETE", "/accounts/acct/workers/scripts/veil-garrett-gary?force=true") == null);
+}
+
+test "dashboard onboarding authenticates MCP, preserves a good key on refusal, and disconnects without deleting agents" {
+    const a = tt.allocator;
+    var threaded = std.Io.Threaded.init(a, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var ta = try http.testApp(a, io, "zig-cftot-dashboard-api-tmp");
+    defer ta.deinit();
+    if (!curlRuns(a, io)) return error.SkipZigTest;
+    try ta.auth.register("garrett-owner@example.test", "correct horse battery");
+    const token = try ta.auth.login("garrett-owner@example.test", "correct horse battery");
+    defer a.free(token);
+    const cookie = try std.fmt.allocPrint(a, http.COOKIE ++ "={s}", .{token});
+    defer a.free(cookie);
+    const user = ta.auth.whoami(token).?;
+    const init_reply = fakehttp.wire("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2025-03-26\",\"serverInfo\":{\"name\":\"Garrett\",\"version\":\"1\"},\"capabilities\":{\"tools\":{}}}}");
+    const tools_reply = fakehttp.wire("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[{\"name\":\"dns_records\"},{\"name\":\"gary_list_tasks\"}]}}");
+    const refused = fakehttp.wire("{\"error\":\"This key is revoked\"}");
+    const routes = [_]fakehttp.Route{ .{ .method = "POST", .path = "/mcp", .reply = init_reply, .times = 1 }, .{ .method = "POST", .path = "/mcp", .reply = tools_reply, .times = 1 } };
+    var srv: fakehttp.Server = undefined;
+    try srv.startRouted(io, &routes, refused);
+    var running = true;
+    defer if (running) srv.stop();
+    var ub: [80]u8 = undefined;
+    test_managed_mcp_url = try std.fmt.bufPrint(&ub, "http://127.0.0.1:{d}/mcp", .{srv.port});
+    defer test_managed_mcp_url = null;
+    const key = "gtt_" ++ "c" ** 64;
+    {
+        var web = httpz.testing.init(.{});
+        defer web.deinit();
+        web.header("cookie", cookie);
+        web.json(.{ .api_key = key });
+        try garrettLaunch(&ta.app, web.req, web.res);
+        try web.expectStatus(200);
+        try tt.expect(std.mem.indexOf(u8, web.res.body, key) == null);
+    }
+    try tt.expect(cf_garrett.connected(&ta.app, user.id, a));
+    {
+        var web = httpz.testing.init(.{});
+        defer web.deinit();
+        web.header("cookie", cookie);
+        web.json(.{ .api_key = "gtt_" ++ "d" ** 64 });
+        try garrettLaunch(&ta.app, web.req, web.res);
+        try web.expectStatus(400);
+    }
+    const still = cf_garrett.credsFor(&ta.app, user.id, a).?;
+    defer a.free(still.mcp_url);
+    defer a.free(still.token);
+    try tt.expectEqualStrings(key, still.token);
+    {
+        var web = httpz.testing.init(.{});
+        defer web.deinit();
+        web.header("cookie", cookie);
+        try garrettStatus(&ta.app, web.req, web.res);
+        try web.expectStatus(200);
+        try tt.expect(std.mem.indexOf(u8, web.res.body, key) == null);
+    }
+    {
+        var web = httpz.testing.init(.{});
+        defer web.deinit();
+        web.header("cookie", cookie);
+        try garrettRemove(&ta.app, web.req, web.res);
+        try web.expectStatus(200);
+    }
+    try tt.expect(!cf_garrett.connected(&ta.app, user.id, a));
+    srv.stop();
+    running = false;
+    try tt.expectEqual(@as(usize, 3), srv.countCalls("POST", "/mcp"));
+    try tt.expectEqual(@as(usize, 0), srv.countCalls("DELETE", "/"));
+    const wire = srv.request();
+    try tt.expect(std.mem.indexOf(u8, wire, "Authorization: Bearer " ++ key) != null);
+    try tt.expect(std.mem.indexOf(u8, wire, "initialize") != null);
+}
+
+test "dashboard connections sync to existing cloud tots, retry partial failure, and disconnect without agent deletion" {
+    const a = tt.allocator;
+    var threaded = std.Io.Threaded.init(a, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var ta = try http.testApp(a, io, "zig-cftot-dashboard-sync-tmp");
+    defer ta.deinit();
+    if (!curlRuns(a, io)) return error.SkipZigTest;
+    const routes = [_]fakehttp.Route{ .{ .method = "PUT", .path = "/workers/scripts/veil-tots/secrets", .reply = StandIn.ok, .times = 1 }, .{ .method = "PUT", .path = "/workers/scripts/veil-tots/secrets", .reply = StandIn.no_browser, .times = 1 } };
+    var srv: fakehttp.Server = undefined;
+    try srv.startRouted(io, &routes, StandIn.ok);
+    var running = true;
+    defer if (running) srv.stop();
+    var rb: [80]u8 = undefined;
+    ta.app.cf_api_root = try std.fmt.bufPrint(&rb, "http://127.0.0.1:{d}/client/v4", .{srv.port});
+    var ub: [80]u8 = undefined;
+    const url = try std.fmt.bufPrint(&ub, "http://127.0.0.1:{d}", .{srv.port});
+    try cf_garrett.saveManaged(&ta.app, 7, "gtt_" ++ "e" ** 64, 166);
+    // The bridge's caller owns its request arena, including decoded runtime state.
+    var request = std.heap.ArenaAllocator.init(a);
+    defer request.deinit();
+    const scratch = request.allocator();
+    var state: State = .{ .account = "acct", .url = url, .garrett_url = "https://legacy.workers.dev", .token_gen = 8 };
+    const token: Tok = .{ .key = "fake-cloudflare-token", .account_id = "acct" };
+    try tt.expect(syncManagedGarrett(&ta.app, scratch, 7, token, &state) != null);
+    try tt.expectEqualStrings("", state.garrett_pair_hash);
+    try tt.expect(syncManagedGarrett(&ta.app, scratch, 7, token, &state) == null);
+    try tt.expect(state.garrett_pair_hash.len > 0);
+    try tt.expect(syncManagedGarrett(&ta.app, scratch, 7, token, &state) == null);
+    try tt.expectEqualStrings("https://legacy.workers.dev", state.garrett_url);
+    try tt.expectEqual(@as(u32, 8), state.token_gen);
+    try cf_garrett.saveManaged(&ta.app, 7, "", 0);
+    try tt.expect(syncManagedGarrett(&ta.app, scratch, 7, token, &state) == null);
+    try tt.expect(!cf_garrett.connected(&ta.app, 7, a));
+    srv.stop();
+    running = false;
+    try tt.expectEqual(@as(usize, 6), srv.countCalls("PUT", "/workers/scripts/veil-tots/secrets"));
+    try tt.expectEqual(@as(usize, 2), srv.countCalls("POST", "/v1/garrett/result"));
+    try tt.expectEqual(@as(usize, 0), srv.countCalls("DELETE", "/"));
+    try tt.expectEqual(@as(usize, 0), srv.countCalls("GET", "/garrett/"));
+    const wire = srv.request();
+    try tt.expect(std.mem.indexOf(u8, wire, "GARRETT_MCP_URL") != null);
+    try tt.expect(std.mem.indexOf(u8, wire, cf_garrett.MCP_URL) != null);
 }

@@ -14,6 +14,7 @@ const t = @import("theme.zig");
 const store_mod = @import("store.zig");
 const scan = @import("scan.zig");
 const tots = @import("tots.zig");
+const garrett_setup = @import("garrett.zig");
 const poller_mod = @import("poller.zig");
 const chat_mod = @import("chat.zig");
 const llm = @import("llm.zig");
@@ -220,6 +221,7 @@ const Ui = struct {
     s_model: Field = .{},
     s_url: Field = .{},
     s_ckey: Field = .{},
+    s_garrett: Field = .{}, // transient dashboard key, never persisted in desktop settings
     s_cfacct: Field = .{}, // Cloudflare account id (chat BYOK, when the provider needs one)
     s_tunhost: Field = .{}, // Cloudflare tunnel: the hostname on one of the user's domains ("use my domain")
     tun_domain: bool = false, // the "use my domain" toggle (seeded once from the server's remembered choice)
@@ -364,7 +366,7 @@ const Ui = struct {
     log_follow: bool = true,
     details_scroll: f32 = 0, // swarm Details tab: the goal + config + blueprint can outgrow the panel
 
-    const Focus = enum { none, chat, d_name, d_key, d_cfacct, d_goal, d_gateway, d_lineage, c_input, c_rename, s_model, s_url, s_ckey, s_cfacct, s_tunhost, s_tkey, s_pkey, s_host, s_port, con_input, sc_name, sc_prompt, sc_details, sc_base, sc_model, sc_key, h_name, h_goal, h_charter, h_model, h_cmd, h_pad };
+    const Focus = enum { none, chat, d_name, d_key, d_cfacct, d_goal, d_gateway, d_lineage, c_input, c_rename, s_model, s_url, s_ckey, s_garrett, s_cfacct, s_tunhost, s_tkey, s_pkey, s_host, s_port, con_input, sc_name, sc_prompt, sc_details, sc_base, sc_model, sc_key, h_name, h_goal, h_charter, h_model, h_cmd, h_pad };
     // Per chat-table horizontal-scroll offset (px), keyed by a content hash so it survives vertical scroll +
     // stream-settle. A tiny FIFO (see tblScrollOff): a new table evicts the oldest.
     const TblHScroll = struct { id: u64 = 0, off: f32 = 0 };
@@ -1828,6 +1830,7 @@ fn focusedField() ?*Ui.Field {
         .s_model => &ui.s_model,
         .s_url => &ui.s_url,
         .s_ckey => &ui.s_ckey,
+        .s_garrett => &ui.s_garrett,
         .s_cfacct => &ui.s_cfacct,
         .s_tunhost => &ui.s_tunhost,
         .s_tkey => &ui.s_tkey,
@@ -3269,6 +3272,8 @@ fn agoStr(buf: []u8, secs: i64) []const u8 {
 /// flip. The switch is disabled while a flip is in flight so it cannot be double-sent.
 const GarrettSnap = struct {
     seen: bool = false,
+    managed: bool = false,
+    tools: usize = 0,
     deployed: bool = false,
     busy: bool = false,
     building: bool = false,
@@ -3283,7 +3288,7 @@ const GarrettSnap = struct {
     fn read(store: *Store) GarrettSnap {
         store.lock();
         defer store.unlock();
-        var g: GarrettSnap = .{ .seen = store.garrett_seen, .deployed = store.garrett_deployed, .busy = store.garrett_busy, .building = store.garrett_building, .ready = store.garrett_ready, .use = store.settings.use_garrett, .cf = store.cf_oauth_connected };
+        var g: GarrettSnap = .{ .seen = store.garrett_seen, .managed = store.garrett_managed, .tools = store.garrett_tools, .deployed = store.garrett_deployed, .busy = store.garrett_busy, .building = store.garrett_building, .ready = store.garrett_ready, .use = store.settings.use_garrett, .cf = store.cf_oauth_connected };
         g.url_len = @min(store.garrett_url_len, g.url.len);
         @memcpy(g.url[0..g.url_len], store.garrett_url[0..g.url_len]);
         g.err_len = @min(store.garrett_err_len, g.err.len);
@@ -3300,32 +3305,57 @@ const GarrettSnap = struct {
 
 fn drawGarrettOptIn(store: *Store, r: t.Rect, on: bool) bool {
     const g = GarrettSnap.read(store);
-    return t.checkboxEx(r, t.z("Agent Garrett", .{}), on and g.deployed, g.deployed, "Deploy security tools in Settings first.");
+    return t.checkboxEx(r, t.z("Agent Garrett", .{}), on and g.deployed, g.deployed, "Connect your dashboard API key in Settings > Agent Garrett first.");
 }
 
 fn drawGarrettRows(store: *Store, x: f32, y0: f32, colw: f32) f32 {
     const g = GarrettSnap.read(store);
-    const loading = g.busy or g.building;
-    var y = y0;
-    const label = t.zs(if (g.busy) "Deploying security tools..." else if (g.building) "Building security runtime..." else if (g.deployed) "Update security tools" else "Deploy security tools");
-    const bh = @max(t.BTN_MD, t.textH(13) + 18);
-    const rm = t.z("Remove", .{});
-    const rmw = if (g.deployed) t.btnW(rm, bh) + t.GAP else 0;
-    const width = @min(@max(1, colw - rmw), t.btnW(label, bh) + 16);
-    const button = t.Rect{ .x = x, .y = y, .width = width, .height = bh };
-    if (t.button(button, label, t.blue, g.cf and !loading)) store.pushCmd(store_mod.mkCmd(.garrett_deploy, "", ""));
-    if (loading) {
-        const track = t.Rect{ .x = x + 8, .y = y + bh - 6, .width = @max(1, width - 16), .height = 3 };
-        t.panel(track, t.withAlpha(t.blue, 35));
-        const chunk = track.width * 0.28;
-        const motion: f32 = @floatCast((@sin(rl.getTime() * 2) + 1) / 2);
-        t.panel(.{ .x = track.x + (track.width - chunk) * motion, .y = track.y, .width = chunk, .height = track.height }, t.blue);
+    var y = y0 + 14;
+    flabel(x, y, "AGENT GARRETT");
+    y += 22;
+    t.text(t.z("{s}", .{if (g.busy) "Checking connection..." else if (g.deployed and g.managed) "Connected to your Garrett account" else if (g.deployed) "Existing connection retained" else "Connect your cloud security agent"}), @intFromFloat(x), @intFromFloat(y), 14, if (g.deployed) t.green else t.fg);
+    y += 26;
+    const dash = t.z("Open Garrett dashboard", .{});
+    const dw = @min(colw, t.btnW(dash, t.BTN_MD));
+    if (t.button(.{ .x = x, .y = y, .width = dw, .height = t.BTN_MD }, dash, t.blue, !g.busy)) store.pushCmd(store_mod.mkCmd(.open_url, "", garrett_setup.dashboard));
+    y += t.BTN_MD + t.GAP;
+    y = helpPara("1. Sign in to Garrett with Cloudflare, activate Trial or Agent, and deploy your agent. 2. Generate an API key in the dashboard. 3. Paste the key here and connect. NL-Veil checks access and discovers the tools automatically.", x, y, colw) + t.GAP;
+    flabel(x, y, "GARRETT API KEY");
+    y += 16;
+    textField(.{ .x = x, .y = y, .width = colw, .height = t.FIELD_H }, &ui.s_garrett, ui.focus == .s_garrett, "gtt_... (key stays hidden)", .s_garrett);
+    y += t.FIELD_H + t.GAP;
+    const paste = t.z("Paste key / MCP config", .{});
+    const pw = @min(colw, t.btnW(paste, t.BTN_MD));
+    if (t.button(.{ .x = x, .y = y, .width = pw, .height = t.BTN_MD }, paste, t.blue, !g.busy)) {
+        const text = rl.getClipboardText();
+        if (garrett_setup.copiedKey(std.heap.page_allocator, text)) |key| {
+            fieldSet(&ui.s_garrett, key);
+            std.crypto.secureZero(u8, key);
+            std.heap.page_allocator.free(key);
+        } else {
+            store.pushNotif("Paste your Garrett key", "Copy a generated gtt_ key or the agent-garrett MCP configuration from your dashboard.", 2);
+        }
     }
-    if (g.deployed and t.button(.{ .x = x + width + t.GAP, .y = y, .width = rmw - t.GAP, .height = bh }, rm, t.red, !g.busy)) store.pushCmd(store_mod.mkCmd(.garrett_remove, "", ""));
-    y += bh + t.GAP;
-    if (g.err_len > 0) {
-        y = helpPara(g.errStr(), x, y, colw) + t.GAP;
+    y += t.BTN_MD + t.GAP;
+    const connect = t.zs(if (g.busy) "Checking..." else if (g.deployed) "Verify & replace connection" else "Connect Agent Garrett");
+    const cw = @min(colw, t.btnW(connect, t.BTN_MD));
+    if (t.button(.{ .x = x, .y = y, .width = cw, .height = t.BTN_MD }, connect, t.green, !g.busy and garrett_setup.validKey(ui.s_garrett.str()))) {
+        if (store.pushGarrettConnect(ui.s_garrett.str())) {
+            std.crypto.secureZero(u8, &ui.s_garrett.buf);
+            ui.s_garrett.clear();
+            ui.focus = .none;
+        } else store.pushNotif("Connection is busy", "Please try connecting again in a moment.", 2);
     }
+    y += t.BTN_MD + t.GAP;
+    if (g.deployed) {
+        if (g.managed) y = helpPara(t.z("{d} tools discovered. Garrett is available to chat, swarms, and tater-tots. Chat enables automatically after connecting; each swarm or tot keeps its own opt-in.", .{g.tools}), x, y, colw) + t.GAP;
+        if (t.button(.{ .x = x, .y = y, .width = @min(colw, 180), .height = t.BTN_MD }, t.z("Open live agent logs", .{}), t.blue, true)) store.pushCmd(store_mod.mkCmd(.open_url, "", garrett_setup.logs));
+        y += t.BTN_MD + t.GAP;
+        if (t.button(.{ .x = x, .y = y, .width = @min(colw, 180), .height = t.BTN_MD }, t.z("Disconnect from Veil", .{}), t.red, !g.busy)) store.pushCmd(store_mod.mkCmd(.garrett_remove, "", ""));
+        y += t.BTN_MD + t.GAP;
+    }
+    y = helpPara("Your plan, deployed agents, persistent memory, API keys, and agent settings stay in Garrett. Disconnecting here does not delete cloud agents or cancel billing. Website and identity protection keep running with Veil closed on eligible plans.", x, y, colw) + t.GAP;
+    if (g.err_len > 0) y = helpPara(g.errStr(), x, y, colw) + t.GAP;
     return y;
 }
 
@@ -5434,10 +5464,15 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
         t.textClip(status, @intFromFloat(r.x + 4), @intFromFloat(sy), 12, t.comment, status_clip_w);
     }
     const gtog = t.Rect{ .x = r.x + r.width - ltw - gtw - 24, .y = sy - 3, .width = gtw + 6, .height = t.textH(12) + 6 };
-    const ghot = gar.deployed and t.hovering(gtog);
+    const ghot = t.hovering(gtog);
     t.text(gtxt, @intFromFloat(gtog.x + 3), @intFromFloat(sy), 12, if (gar_on) t.green else if (ghot) t.fg_dim else t.comment);
     if (ghot) t.wantCursor(.pointing_hand);
-    if (ghot and rl.isMouseButtonPressed(.left)) {
+    if (ghot and !gar.deployed and rl.isMouseButtonPressed(.left)) {
+        ui.tab = .settings;
+        ui.settings_page = 5;
+        ui.settings_scroll = 0;
+    }
+    if (ghot and gar.deployed and rl.isMouseButtonPressed(.left)) {
         store.lock();
         store.settings.use_garrett = !store.settings.use_garrett;
         store.unlock();
@@ -9412,7 +9447,7 @@ fn drawSettings(store: *Store, frame: t.Rect) void {
     ui.settings_colw = colw;
     t.text(t.z("Settings", .{}), @intFromFloat(x), @intFromFloat(frame.y + t.PAD), 24, t.fg);
     t.textClip("Make the veil feel like yours.", @intFromFloat(x), @intFromFloat(frame.y + t.PAD + t.textH(24) + t.GAP), 13, t.fg_dim, @intFromFloat(colw));
-    const pages = [_][:0]const u8{ "General", "Models", "Connection", "Data", "Updates" };
+    const pages = [_][:0]const u8{ "General", "Models", "Connection", "Data", "Updates", "Agent Garrett" };
     t.setBlockClicks(ui.open_dd != .none);
     var nx = x;
     var ny = frame.y + t.PAD + t.textH(24) + t.GAP + t.textH(13) + t.GAP;
@@ -9459,6 +9494,7 @@ fn drawSettings(store: *Store, frame: t.Rect) void {
     }
     rl.beginScissorMode(@intFromFloat(body.x), @intFromFloat(body.y), @intFromFloat(body.width), @intFromFloat(body.height));
     var y: f32 = body.y + 8 - ui.settings_scroll;
+    if (ui.settings_page == 5) y = drawGarrettRows(store, x, y, colw);
     if (ui.settings_page == 4) {
         y = settingSection(x, y, colw, "APP UPDATES");
         y += @as(f32, @floatFromInt(drawMemText(updater.status(), x, y, 12, t.fg, colw))) * 16 + 12;
@@ -9865,7 +9901,6 @@ fn drawSettings(store: *Store, frame: t.Rect) void {
                 }
                 y += 44;
                 y = drawCfTunnelRows(store, x, y, colw);
-                y = drawGarrettRows(store, x, y, colw);
             } else if (cf_configured) {
                 // The login is the headline act, so it wears the vendor's own button (cfBrandButton),
                 // a size up from the form buttons around it.
@@ -10574,6 +10609,8 @@ fn textField(r: t.Rect, f: *Ui.Field, focused: bool, placeholder: [:0]const u8, 
     t.panelBordered(r, t.bg, if (focused) t.blue else t.border);
     if (t.hovering(r) and ui.open_dd == .none) t.wantCursor(.ibeam);
     f.clampCur();
+    const mask: [4096]u8 = @splat('*');
+    const shown = if (which == .s_garrett) mask[0..f.len] else f.str();
     const inner_x: i32 = @intFromFloat(r.x + 10);
     const inner_y: i32 = @intFromFloat(r.y + (r.height - t.textH(13)) / 2);
     // Don't grab focus while a dropdown is open: its option list is drawn OVER the fields below it, so a click
@@ -10582,13 +10619,13 @@ fn textField(r: t.Rect, f: *Ui.Field, focused: bool, placeholder: [:0]const u8, 
     if (t.hovering(r) and rl.isMouseButtonPressed(.left) and ui.open_dd == .none) {
         ui.focus = which;
         // place the caret at the clicked character (and anchor a drag-selection there)
-        f.cur = fieldColAt(f.str(), rl.getMousePosition().x - @as(f32, @floatFromInt(inner_x)));
+        f.cur = fieldColAt(shown, rl.getMousePosition().x - @as(f32, @floatFromInt(inner_x)));
         f.sel = f.cur;
         field_drag = true;
     }
     if (focused and field_drag) {
         if (rl.isMouseButtonDown(.left)) {
-            f.cur = fieldColAt(f.str(), rl.getMousePosition().x - @as(f32, @floatFromInt(inner_x)));
+            f.cur = fieldColAt(shown, rl.getMousePosition().x - @as(f32, @floatFromInt(inner_x)));
             ui.input_active = true;
         } else {
             if (f.selRange() == null) f.sel = null;
@@ -10599,13 +10636,13 @@ fn textField(r: t.Rect, f: *Ui.Field, focused: bool, placeholder: [:0]const u8, 
         t.text(placeholder, inner_x, inner_y, 13, t.comment);
     } else {
         if (focused) if (f.selRange()) |rg| {
-            const x0 = fieldPrefixPx(f.str(), rg[0]);
-            const x1 = fieldPrefixPx(f.str(), rg[1]);
+            const x0 = fieldPrefixPx(shown, rg[0]);
+            const x1 = fieldPrefixPx(shown, rg[1]);
             t.fillRect(inner_x + @as(i32, @intFromFloat(x0)), inner_y - 1, @intFromFloat(@max(2, x1 - x0)), 17, t.bg_sel);
         };
-        t.textClip(f.str(), inner_x, inner_y, 13, t.fg, @intFromFloat(r.width - 20));
+        t.textClip(shown, inner_x, inner_y, 13, t.fg, @intFromFloat(r.width - 20));
         if (focused) {
-            const cw = fieldPrefixPx(f.str(), f.cur);
+            const cw = fieldPrefixPx(shown, f.cur);
             if (@mod(rl.getTime(), 1.0) < 0.5) t.fillRect(inner_x + @as(i32, @intFromFloat(cw)) + 1, inner_y, 2, 15, t.blue);
         }
     }

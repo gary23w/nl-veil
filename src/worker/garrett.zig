@@ -16,7 +16,7 @@ pub const Ctx = struct {
 
 const UA = "veil/garrett (+https://github.com/gary23w/nl-veil)";
 const USAGE = "ERROR: name one of Agent Garrett's tools, as {\"name\": \"nvd_lookup\", \"args\": {\"cveId\": \"CVE-2026-1234\"}}; garrett_tools lists them";
-const NOT_ON = "Agent Garrett is not on this belt. Deploy security tools in Settings. They attach automatically to chat, swarms, and tater-tots.";
+const NOT_ON = "Agent Garrett is not connected. Open Settings > Agent Garrett, set up your plan and agent in the Garrett dashboard, then connect your API key.";
 const TEXT_MAX = 12000;
 const META_MAX = 600;
 
@@ -50,6 +50,27 @@ pub fn run(c: Ctx, name: []const u8, args_json: []const u8) []u8 {
 pub fn runtimeStatus(c: Ctx) []u8 {
     if (!on(c.url, c.token)) return dupe(c.gpa, "{}");
     return rpc(c, "gary/runtime/status", "{}") orelse dupe(c.gpa, "{}");
+}
+
+pub const ConnectionCheck = struct { ok: bool = false, tools: usize = 0 };
+/// Standard authenticated MCP discovery verifies access without running any
+/// security tool, waking an autonomous goal, or spending an AI allowance.
+pub fn checkConnection(c: Ctx) ConnectionCheck {
+    if (!on(c.url, c.token)) return .{};
+    const init = rpc(c, "initialize", "{\"protocolVersion\":\"2025-03-26\",\"capabilities\":{},\"clientInfo\":{\"name\":\"nl-veil\",\"version\":\"1.1.16\"}}") orelse return .{};
+    defer c.gpa.free(init);
+    const initialized = std.json.parseFromSlice(std.json.Value, c.gpa, init, .{}) catch return .{};
+    defer initialized.deinit();
+    const root = objOf(initialized.value) orelse return .{};
+    if (root.get("error") != null or objOf(root.get("result")) == null) return .{};
+    const raw = rpc(c, "tools/list", "{}") orelse return .{};
+    defer c.gpa.free(raw);
+    const p = std.json.parseFromSlice(std.json.Value, c.gpa, raw, .{}) catch return .{};
+    defer p.deinit();
+    const result = objOf((objOf(p.value) orelse return .{}).get("result")) orelse return .{};
+    const tools = result.get("tools") orelse return .{};
+    if (tools != .array or tools.array.items.len == 0 or tools.array.items.len > 1000) return .{};
+    return .{ .ok = true, .tools = tools.array.items.len };
 }
 
 pub fn discover(c: Ctx) []u8 {

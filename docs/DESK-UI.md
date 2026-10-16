@@ -1,15 +1,16 @@
 # Desktop experience
 
-Settings has five pages with fixed navigation and a scrollable content area. Its scrollbar is hidden; use the mouse wheel, Page Up/Page Down, Home or End:
+Settings has six pages with fixed navigation and a scrollable content area. Its scrollbar is hidden; use the mouse wheel, Page Up/Page Down, Home or End:
 
 
 | Page | Controls |
 | --- | --- |
 | General | Text size, accessibility, notifications, and task behavior |
-| Models | Chat provider, model roles, Cloudflare login, security-tool deployment and build progress, and built-in model installation |
+| Models | Chat provider, model roles, Cloudflare login, and built-in model installation |
 | Connection | Server address, port, API token, and data location |
 | Data | Dataset recording |
 | Updates | Release checks and installation |
+| Agent Garrett | Guided dashboard setup, authenticated MCP connection, tool discovery, and live logs |
 
 New chats offer starter prompts that fill the composer for editing. They do not
 send automatically.
@@ -55,7 +56,7 @@ server for the roster, the events and the scratchpad only while it is on screen.
 
 ## Security tools and spacing
 
-**Agent Garrett: on/off** is a plain clickable chat label beside auto-loop. Swarm and tater-tot deploy forms have independent **Agent Garrett** checkboxes. Settings → Models contains **Deploy security tools** (or **Update security tools** once deployed), with an animated bar during upload and cloud runtime preparation. See [the security guide](docs-src/guide/security-tools.md).
+**Agent Garrett: on/off** is a plain clickable chat label beside auto-loop. Swarm and tater-tot deploy forms have independent **Agent Garrett** checkboxes. Settings → Agent Garrett opens the dashboard setup flow. Paste a generated API key or the copied MCP configuration and connect; NL-Veil verifies access and discovers the tools automatically. Existing connections are kept until replaced. Disconnecting preserves the cloud agent, its memory, and billing. See [the security guide](docs-src/guide/security-tools.md).
 
 Tab content uses consistent outer margins. Form labels and controls reserve scaled text height. Rounded panel borders stay inside clipping bounds, so past-run cards and Settings fields retain all four edges.
 

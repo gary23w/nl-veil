@@ -24,6 +24,10 @@ either, download and run the [v1.1.16 bundle](https://github.com/gary23w/nl-veil
 Automatic updates do not downgrade an installed app. In this release, `NL_TOOL_MAP=1`
 enables the tool tree; Gary's 4tope is enabled by default.
 
+### Garrett dashboard connections
+
+Connect Agent Garrett from **Settings → Agent Garrett**. Open its dashboard to sign in, choose a plan and deploy, then paste your generated API key or copied MCP configuration. NL-Veil verifies authenticated MCP access and discovers the tools automatically. Your key is encrypted on the local server; cloud agents, memory, billing and updates stay in Garrett. Existing legacy connections are retained until you replace them. [Setup guide](docs/docs-src/guide/security-tools.md).
+
 ### New in v1.1.16
 
 **Gary's 4tope** carries a long chat forward by graph instead of by summary. When a turn has to
