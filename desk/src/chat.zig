@@ -5143,6 +5143,7 @@ pub const Chat = struct {
         var cfa: [64]u8 = undefined;
         var cfa_n: usize = 0;
         var unified = true;
+        var cf_default: u8 = 0;
         var use_garrett = false;
         var think_cfg: store_mod.RoleCfg = .{};
         var prompt_cfg: store_mod.RoleCfg = .{};
@@ -5150,6 +5151,7 @@ pub const Chat = struct {
             self.store.lock();
             defer self.store.unlock();
             const s = &self.store.settings;
+            cf_default = s.cf_default;
             kind = s.chat_kind;
             byok = s.chat_byok;
             theme = s.theme;
@@ -5205,6 +5207,8 @@ pub const Chat = struct {
         // MODEL TRIO: the "use one model for all three" flag + the thinking/prompting role overrides. Role keys
         // are NOT written here — they live in the OS secret store (secrets.zig), keyed by provider slug.
         jb.print(self.gpa, ",\"unified\":{}", .{unified}) catch return;
+        // The Cloudflare default: 0 not decided yet, 1 on, 2 off (Settings.cf_default).
+        jb.print(self.gpa, ",\"cf_default\":{d}", .{cf_default}) catch return;
         jb.print(self.gpa, ",\"garrett\":{}", .{use_garrett}) catch return;
         emitRoleCfg(&jb, self.gpa, "think", think_cfg) catch return;
         emitRoleCfg(&jb, self.gpa, "prompt", prompt_cfg) catch return;
@@ -5380,6 +5384,9 @@ pub const Chat = struct {
         // prompting role overrides. Missing keys leave the RoleCfg defaults (set=false) ⇒ fall back to coding,
         // so an old settings.json loads as today's single-model chat.
         s.chat_unified = std.mem.indexOf(u8, data, "\"unified\":false") == null;
+        // The Cloudflare default: absent (a file older than the setting) is "not decided yet", which Settings
+        // reads as on for a chat already on Workers AI as one model (Settings.cfDefaultOn).
+        s.cf_default = if (std.mem.indexOf(u8, data, "\"cf_default\":1") != null) 1 else if (std.mem.indexOf(u8, data, "\"cf_default\":2") != null) 2 else 0;
         s.use_garrett = std.mem.indexOf(u8, data, "\"garrett\":true") != null;
         parseRoleCfg(self.gpa, data, "think", &s.chat_think);
         parseRoleCfg(self.gpa, data, "prompt", &s.chat_prompt);
@@ -14087,6 +14094,40 @@ test "an attaching desk keeps the launcher's port and loopback host through a se
     const fresh = chat.saveTarget(dd);
     try std.testing.expectEqual(@as(u16, 8787), fresh.port);
     try std.testing.expectEqualStrings("", fresh.hostStr());
+}
+
+test "the Cloudflare default persists as decided, and a settings.json older than it loads as not decided yet" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{ .environ = llm.osEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dd = "zig-desk-cf-default-tmp";
+    Io.Dir.cwd().deleteTree(io, dd) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dd) catch {};
+    _ = Io.Dir.cwd().createDirPathStatus(io, dd ++ "/.veil-desk", .default_dir) catch {};
+
+    var store = std.testing.allocator.create(Store) catch unreachable;
+    defer std.testing.allocator.destroy(store);
+    store.* = .{};
+    @memcpy(store.settings.data_dir[0..dd.len], dd);
+    store.settings.data_dir_len = dd.len;
+    var chat = std.testing.allocator.create(Chat) catch unreachable;
+    defer std.testing.allocator.destroy(chat);
+    chat.* = .{ .io = io, .gpa = std.testing.allocator, .store = store };
+
+    // a file from before the setting: not decided yet (Settings.cfDefaultOn then reads the provider)
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = dd ++ "/.veil-desk/settings.json", .data = "{\"kind\":1,\"port\":8787,\"byok\":0,\"theme\":0}" });
+    store.settings.cf_default = 1;
+    chat.loadSettings(dd);
+    try std.testing.expectEqual(@as(u8, 0), store.settings.cf_default);
+
+    // each decision survives a save and a load
+    for ([_]u8{ 2, 1, 0 }) |v| {
+        store.settings.cf_default = v;
+        chat.saveSettings(dd);
+        store.settings.cf_default = 9;
+        chat.loadSettings(dd);
+        try std.testing.expectEqual(v, store.settings.cf_default);
+    }
 }
 
 test "jBool reads a bare true/false and reports MISSING as null, not false" {

@@ -19,6 +19,7 @@ Not a byte-range lock (what std's `lock = .exclusive` does on Windows through Nt
 - `FILE_NAME` — `.veil.lock`, the file under the data dir.
 - `take(io, data_dir, port, bind) !Outcome` — take the lock for this process, writing `pid=`, `port=` and `bind=` lines. `.taken` carries the `Lock`; `.held` carries the `Holder` read back from the file. Never blocks on a holder. An error is a dir the lock file cannot be created in at all, which the caller decides about.
 - `Lock.release(io)` — let the dir go and remove the file. POSIX unlinks THEN closes (closing first leaves a window in which a newcomer locks the still-linked inode, the unlink removes the path from under it, and a third process locks a fresh inode at the same path: two holders). Windows deletes after the close; a newcomer that already holds the file shares no delete, so that delete fails harmlessly.
+- `Lock.rewrite(io, port, bind)` — write a new record into the held file: main's app mode calls it when it had to serve another port than the one it took the lock with, so an attaching desk reads the port that answers. Best-effort; the lock itself is untouched.
 - `Holder` — `pid`, `port`, `bindStr()`, `known()`. `pid == 0` is a dir held by a process that left no record.
 - `holderOf(io, data_dir) Holder` — the record in the dir's lock file, whoever holds it.
 - `ownPid()`, `pidAlive(pid)` — this process's id, and whether a pid still names a running process (any process: the question is whether the record's writer is gone).

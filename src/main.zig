@@ -540,6 +540,22 @@ pub fn main(init: std.process.Init) !void {
     }
     defer if (claim == .serve) claim.serve.release(io);
 
+    // THE APP'S PORT, chosen once, here, before the listener, the lock record, the Cloudflare OAuth redirect, the
+    // browser-extension relay and the tunnel each read it. Measured 2026-10-16: a v1.1.20 bundle started while a
+    // veil from another install sat in the tray holding 8787, and again 13 s after that one was quit. Its own
+    // server never bound, nothing retried, and its window sat on "server down" and "checking the server..." for
+    // good, with the one line that said why written to a console a double-clicked veil does not have. App mode now
+    // waits a few seconds for a port a quitting veil is letting go of, then takes the next free one and points its
+    // desk there. A server-only start is left as it was: it runs in a terminal and is told plainly the port is taken.
+    const serve_port: u16 = if (desktop_mode and HAS_GUI) blk: {
+        const pick = pickAppPort(io, gpa, bind_all, cli_port, APP_PORT_SETTLE_MS);
+        if (pick != cli_port) {
+            log.warn("port {d} is in use by another program (another veil?) - this veil serves on port {d} instead", .{ cli_port, pick });
+            if (claim == .serve) claim.serve.rewrite(io, pick, bind_name); // an attaching desk reads its target here
+        }
+        break :blk pick;
+    } else cli_port;
+
     // Make local Ollama parallel + right-sized on launch (crucial for cast/chat steering; see tuneOllama).
     tuneOllama(gpa, io, init.environ_map);
 
@@ -613,7 +629,15 @@ pub fn main(init: std.process.Init) !void {
     // Cloudflare OAuth (self-managed public client): env-overridable so a deployment bakes only its public
     // client_id. The redirect defaults to this server's loopback callback on the resolved port.
     const cf_oauth_redirect = init.environ_map.get("NL_CF_OAUTH_REDIRECT") orelse
-        (std.fmt.allocPrint(gpa, "http://localhost:{d}/api/v1/oauth/cloudflare/callback", .{cli_port}) catch "http://localhost:8787/api/v1/oauth/cloudflare/callback");
+        (std.fmt.allocPrint(gpa, "http://localhost:{d}/api/v1/oauth/cloudflare/callback", .{serve_port}) catch "http://localhost:8787/api/v1/oauth/cloudflare/callback");
+    // The OAuth client registers ONE redirect, on the port the veil normally serves. A veil that had to move off it
+    // can run, but Cloudflare would refuse to send the browser back to it: say why on the login, instead of a
+    // button that ends on Cloudflare's "invalid redirect_uri" page. An operator redirect (NL_CF_OAUTH_REDIRECT) is
+    // theirs and is trusted as it stands.
+    const cf_oauth_blocked: []const u8 = if (serve_port != cli_port and init.environ_map.get("NL_CF_OAUTH_REDIRECT") == null)
+        std.fmt.allocPrint(gpa, "Another program on this computer is using port {d} (another veil?), so this veil is running on port {d}. Cloudflare's login returns to port {d}, so it cannot finish here: quit the other one and restart this veil to log in. An API token below works on any port.", .{ cli_port, serve_port, cli_port }) catch "Cloudflare's login cannot finish on this port: quit the other veil and restart this one."
+    else
+        "";
     // Admin-owned runtime settings. The env vars seed it on a fresh install; after that the admin
     // sets it from the web UI and it persists, so a stale launch script cannot undo them on restart.
     var server_cfg = server_config.ServerConfig.init(gpa, io, paths.data);
@@ -670,7 +694,7 @@ pub fn main(init: std.process.Init) !void {
         log.info("built-in model engine: not compiled in (-Dbuiltin=false)", .{});
     }
 
-    var app = App{ .gpa = gpa, .io = io, .auth = &auth, .sup = &sup, .audit = &audit, .login_guard = &login_guard, .vault = &vault, .data = paths.data, .server_key = sup.server_key, .open_registration = open_reg, .cf_account_id = cf_account, .workers_ai_token = wai_token, .retention_days = retention_days, .production = production, .recipes = recipe_registry, .plugs = plug_registry, .ledger = &ledger, .keys = &api_keys, .cf_oauth_client_id = init.environ_map.get("NL_CF_OAUTH_CLIENT_ID") orelse cf_oauth.DEFAULT_CLIENT_ID, .cf_oauth_scopes = init.environ_map.get("NL_CF_OAUTH_SCOPES") orelse http.CF_OAUTH_SCOPES_DEFAULT, .cf_oauth_redirect = cf_oauth_redirect, .cf_oauth_auth_url = init.environ_map.get("NL_CF_OAUTH_AUTH_URL") orelse "https://dash.cloudflare.com/oauth2/auth", .cf_oauth_token_url = init.environ_map.get("NL_CF_OAUTH_TOKEN_URL") orelse "https://dash.cloudflare.com/oauth2/token", .cf_oauth_accounts_url = init.environ_map.get("NL_CF_OAUTH_ACCOUNTS_URL") orelse "https://api.cloudflare.com/client/v4/accounts", .cfg = &server_cfg };
+    var app = App{ .gpa = gpa, .io = io, .auth = &auth, .sup = &sup, .audit = &audit, .login_guard = &login_guard, .vault = &vault, .data = paths.data, .server_key = sup.server_key, .open_registration = open_reg, .cf_account_id = cf_account, .workers_ai_token = wai_token, .retention_days = retention_days, .production = production, .recipes = recipe_registry, .plugs = plug_registry, .ledger = &ledger, .keys = &api_keys, .cf_oauth_client_id = init.environ_map.get("NL_CF_OAUTH_CLIENT_ID") orelse cf_oauth.DEFAULT_CLIENT_ID, .cf_oauth_scopes = init.environ_map.get("NL_CF_OAUTH_SCOPES") orelse http.CF_OAUTH_SCOPES_DEFAULT, .cf_oauth_redirect = cf_oauth_redirect, .cf_oauth_blocked = cf_oauth_blocked, .cf_oauth_auth_url = init.environ_map.get("NL_CF_OAUTH_AUTH_URL") orelse "https://dash.cloudflare.com/oauth2/auth", .cf_oauth_token_url = init.environ_map.get("NL_CF_OAUTH_TOKEN_URL") orelse "https://dash.cloudflare.com/oauth2/token", .cf_oauth_accounts_url = init.environ_map.get("NL_CF_OAUTH_ACCOUNTS_URL") orelse "https://api.cloudflare.com/client/v4/accounts", .cfg = &server_cfg };
     // SCHEDULED TASKS run on their own background thread (the second one beside Supervisor.bgLoop, same ~5s
     // cadence): a due task spawns a full chat turn, which must never ride an httpz request thread. Spawned here
     // — not next to the sup.bgLoop spawn above — because it needs the fully-wired App; like sup, `app` lives on
@@ -698,7 +722,7 @@ pub fn main(init: std.process.Init) !void {
     }
     if (cf_account.len > 0 and wai_token.len > 0) log.info("Workers AI: ENABLED (backbone) — provider \"workers-ai\" runs on the Cloudflare account's inference endpoint", .{}) else log.info("Workers AI: not configured (set NL_CF_ACCOUNT_ID + NL_WORKERS_AI_TOKEN to enable the backbone)", .{});
 
-    const port = cli_port; // resolved once above (NL_PORT else 8787), shared with the CLI client
+    const port = serve_port; // resolved once above: NL_PORT else 8787 (shared with the CLI client), or app mode's free port
     // On Windows httpz runs the BLOCKING thread-per-connection worker (one pool thread per live socket),
     // and its ONLY idle/half-open reaping is SO_RCVTIMEO — which is never set unless we pass timeouts here.
     // Without these, a keep-alive connection that dies without a clean FIN (laptop sleep, tab crash, network
@@ -992,7 +1016,9 @@ pub fn main(init: std.process.Init) !void {
     // "server offline" flash on every launch. Bounded and best-effort: never block the window on the backend.
     awaitServer(gpa, io, port, 3000);
 
-    desk.runApp(paths.data, null) catch |e| {
+    // A desk drives the port its settings.json names (8787 by default). When this veil had to move, pin the desk to
+    // the port it actually serves for this run (desk AttachTarget: never written to settings.json).
+    desk.runApp(paths.data, if (port != cli_port) desk.AttachTarget{ .port = port } else null) catch |e| {
         // NO WINDOW is not a reason to take the server down with it — the server is the useful half, and
         // the web UI is right there. Degrade instead of exiting silently (see serveWithoutDesk).
         if (e == error.WindowUnavailable) serveWithoutDesk(io, port, paths.data);
@@ -1049,12 +1075,77 @@ const ServerThread = struct {
 
     fn run(self: *ServerThread) void {
         self.server.listen() catch |e| {
-            // Almost always "port already in use" — another veil is up. Say so loudly: the GUI will come up
-            // regardless and would otherwise just look mysteriously disconnected.
+            // pickAppPort found this port free a moment ago, so this is rare: another program took it in between,
+            // or every port it tried was taken. The log line goes to a console a double-clicked veil does not have,
+            // so on Windows the one visible channel says it too: the window would otherwise just sit disconnected.
             log.err("HTTP server failed to listen on port {d}: {t} — the desktop window will open but has NO backend (is another veil already running?)", .{ self.port, e });
+            if (builtin.os.tag == .windows) {
+                var mb: [512]u8 = undefined;
+                const msg = std.fmt.bufPrintZ(&mb, "The veil's server could not start on port {d} ({t}).\n\n" ++
+                    "Another program, most likely another veil, is using it. Close the other one, then quit this veil " ++
+                    "from its tray icon and start it again.", .{ self.port, e }) catch
+                    "The veil's server could not start: its port is in use. Close the other veil, then quit this one from its tray icon and start it again.";
+                _ = winapp.MessageBoxA(null, msg, "the veil", 0x0000_0030 | 0x0001_0000); // MB_ICONWARNING | MB_SETFOREGROUND
+            }
         };
     }
 };
+
+/// How long app mode waits for its own port to come free before it moves to the next one: long enough for a veil
+/// that is quitting to let go of it (its listener closes with its window), short enough that a veil left running
+/// elsewhere costs this start a few seconds, once.
+const APP_PORT_SETTLE_MS: u64 = 4000;
+/// How many ports past its own app mode tries, one at a time, when its own stays taken.
+const APP_PORT_SPAN: u16 = 20;
+
+/// App mode's port: `want` when it is free or comes free within `settle_ms`, else the first free port of the
+/// APP_PORT_SPAN after it, else `want` (whose listen then fails and says so). Each look is made the way the server
+/// itself will bind (portFree).
+fn pickAppPort(io: std.Io, gpa: std.mem.Allocator, bind_all: bool, want: u16, settle_ms: u64) u16 {
+    var waited: u64 = 0;
+    while (true) {
+        if (portFree(io, gpa, bind_all, want)) return want;
+        if (waited >= settle_ms) break;
+        threadSleepMs(io, 250);
+        waited += 250;
+    }
+    var i: u16 = 1;
+    while (i <= APP_PORT_SPAN) : (i += 1) {
+        const p = std.math.add(u16, want, i) catch break;
+        if (portFree(io, gpa, bind_all, p)) return p;
+    }
+    return want;
+}
+
+/// Could this process listen on `port` right now? Asked of httpz itself, on the address the server will use, so the
+/// answer carries the server's own socket options (SO_EXCLUSIVEADDRUSE on Windows: a live listener is a reason to
+/// move, a TIME_WAIT leftover is not). A throwaway one-thread server binds it and lets go at once.
+fn portFree(io: std.Io, gpa: std.mem.Allocator, bind_all: bool, port: u16) bool {
+    var probe = httpz.Server(void).init(io, gpa, .{
+        .address = if (bind_all) .all(port) else .localhost(port),
+        .workers = .{ .count = 1, .min_conn = 1, .max_conn = 1, .large_buffer_count = 1, .large_buffer_size = 4096 },
+        .thread_pool = .{ .count = 1, .buffer_size = 4096 },
+    }, {}) catch return false;
+    defer probe.deinit();
+    // listenInNewThread's handshake, with the listen's error caught on its own thread: a thread function that
+    // returns an error has it printed to stderr, and a held port is an answer here, not a failure.
+    const Quiet = struct {
+        fn run(s: *httpz.Server(void)) void {
+            s.listen() catch {};
+        }
+    };
+    probe._mut.lockUncancelable(io);
+    const th = std.Thread.spawn(.{}, Quiet.run, .{&probe}) catch {
+        probe._mut.unlock(io);
+        return false;
+    };
+    probe._cond.waitUncancelable(io, &probe._mut); // listen() signals once it is up, or once its bind failed
+    probe._mut.unlock(io);
+    const bound = probe._listener != null;
+    if (bound) probe.stop();
+    th.join();
+    return bound;
+}
 
 /// Poll the loopback health endpoint until the server answers or `budget_ms` elapses. Best-effort and
 /// deliberately short: a slow bind must delay the window, never prevent it.
@@ -2300,6 +2391,60 @@ test "the listen port: a second server cannot share it, and a stopped server's p
     if (rebound) again.stop();
     again_thread.join();
     try std.testing.expect(rebound);
+}
+
+/// TEST: stop a server after `ms`, as a veil that is quitting lets go of its port.
+const StopLater = struct {
+    fn run(io: std.Io, server: *httpz.Server(void), ms: u64) void {
+        threadSleepMs(io, ms);
+        server.stop();
+    }
+};
+
+test "the app's port: a free one is kept, one a quitting veil lets go of is waited for, one held throughout is left for the next free one" {
+    // Measured 2026-10-16: a v1.1.20 bundle started while another install's veil held 8787 never got a server, and
+    // its window sat on "checking the server..." for good. pickAppPort is what app mode now asks first.
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const free_port = blk: {
+        const any: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+        var probe = try any.listen(io, .{ .mode = .stream, .protocol = .tcp });
+        defer probe.deinit(io);
+        break :blk probe.socket.address.getPort();
+    };
+    if (free_port > 65535 - APP_PORT_SPAN) return error.SkipZigTest; // no room above it for the fallback half
+    // Free: kept at once, no wait, no move.
+    try std.testing.expect(portFree(io, gpa, false, free_port));
+    try std.testing.expectEqual(free_port, pickAppPort(io, gpa, false, free_port, 0));
+
+    // Held throughout (another veil left running): after the wait, the next free port above it.
+    var holder = try httpz.Server(void).init(io, gpa, .{ .address = .localhost(free_port) }, {});
+    defer holder.deinit();
+    const holder_thread = try holder.listenInNewThread();
+    if (holder._listener == null) {
+        holder_thread.join();
+        return error.SkipZigTest; // another process took the port between the probe and this bind
+    }
+    var holding = true;
+    defer if (holding) {
+        holder.stop();
+        holder_thread.join();
+    };
+    try std.testing.expect(!portFree(io, gpa, false, free_port));
+    const moved = pickAppPort(io, gpa, false, free_port, 300);
+    try std.testing.expect(moved > free_port and moved <= free_port + APP_PORT_SPAN);
+    try std.testing.expect(portFree(io, gpa, false, moved)); // the probe let go of what it found
+
+    // Let go of within the wait (a veil that is quitting): the port is waited for and kept, not moved off.
+    const stopper = try std.Thread.spawn(.{}, StopLater.run, .{ io, &holder, 400 });
+    const kept = pickAppPort(io, gpa, false, free_port, 3000);
+    stopper.join();
+    holder_thread.join();
+    holding = false;
+    try std.testing.expectEqual(free_port, kept);
 }
 
 test "the desktop key is minted for the admin account whatever its password, and a stale file is replaced" {

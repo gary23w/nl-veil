@@ -339,6 +339,11 @@ pub const Settings = struct {
     chat_unified: bool = true,
     chat_think: RoleCfg = .{},
     chat_prompt: RoleCfg = .{},
+    // CLOUDFLARE DEFAULT (Settings > Models): chat on Workers AI through the Cloudflare login with one model for
+    // every role, and no provider, account or key fields to fill. 0 = not decided yet (on when the chat already
+    // runs on Workers AI as one model), 1 = on, 2 = off (a custom setup). A Cloudflare login made in this desk
+    // turns it on. Persisted as "cf_default".
+    cf_default: u8 = 0,
     // chat pane collapse state (persisted with the chat settings)
     chat_left_open: bool = true,
     chat_right_open: bool = true,
@@ -401,6 +406,15 @@ pub const Settings = struct {
         @memcpy(s.host[0..n], host[0..n]);
         s.host_len = @intCast(n);
         s.target_pinned = true;
+    }
+    /// Is the Cloudflare default in force? Decided either way it is what the user chose; not decided yet, it is on
+    /// for a chat that already runs on Workers AI (`workers_ai_idx` in the catalog) as one model.
+    pub fn cfDefaultOn(s: *const Settings, workers_ai_idx: u8) bool {
+        return switch (s.cf_default) {
+            1 => true,
+            2 => false,
+            else => s.chat_kind == 1 and s.chat_byok == workers_ai_idx and s.chat_unified,
+        };
     }
     pub fn tokenStr(s: *const Settings) []const u8 {
         return s.token[0..s.token_len];
@@ -1147,6 +1161,10 @@ pub const Store = struct {
     cf_oauth_account_len: usize = 0,
     cf_oauth_name: [96]u8 = undefined, // "signed in as": the user's name, else the account's display name
     cf_oauth_name_len: usize = 0,
+    // Why the browser login cannot finish on this server, when it cannot (the server moved off the port its OAuth
+    // redirect names, src/main.zig); the Settings login row shows it in place of the button. Empty otherwise.
+    cf_oauth_blocked: [320]u8 = undefined,
+    cf_oauth_blocked_len: usize = 0,
     // Set by the poller EXACTLY on the pending→connected transition (a login this session landing);
     // the UI thread consumes it once per frame loop: defaults the chat onto Workers AI + toasts.
     // Never set on a mere boot with an existing connection — that would override a user's later choice.

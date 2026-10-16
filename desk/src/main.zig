@@ -2085,17 +2085,35 @@ fn applyCfConnectedDefault(store: *Store) void {
         else
             catalog.defaults.cf_model;
         const s = &store.settings;
-        s.chat_kind = 1;
-        s.chat_byok = WORKERS_AI_IDX;
-        model_len = @min(mid.len, s.chat_model.len);
-        @memcpy(s.chat_model[0..model_len], mid[0..model_len]);
-        s.chat_model_len = @intCast(model_len);
-        @memcpy(model[0..model_len], mid[0..model_len]);
+        // A login is the Cloudflare default's switch: the box in Settings > Models reads checked from here on.
+        applyCfDefaultLocked(store, mid);
+        model_len = s.chat_model_len;
+        @memcpy(model[0..model_len], s.chat_model[0..model_len]);
     }
     store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
     var body: [128]u8 = undefined;
     const msg = std.fmt.bufPrint(&body, "{s} - switch any time in Settings", .{model[0..model_len]}) catch "switch any time in Settings";
     store.pushNotif("Chat: Workers AI", msg, 1);
+}
+
+/// THE CLOUDFLARE DEFAULT, applied (caller holds the store lock): chat on Workers AI through the login, one model
+/// for every role. `model` replaces the chat model when given; with null, a model that is already a Workers AI one
+/// (`@cf/...`) is kept and any other is replaced by the live list's first entry, else the catalog's default.
+fn applyCfDefaultLocked(store: *Store, model: ?[]const u8) void {
+    const s = &store.settings;
+    s.cf_default = 1;
+    s.chat_kind = 1;
+    s.chat_byok = WORKERS_AI_IDX;
+    s.chat_unified = true;
+    const keep = model == null and std.mem.startsWith(u8, s.chat_model[0..s.chat_model_len], "@cf/");
+    if (keep) return;
+    const mid: []const u8 = model orelse if (store.cf_model_count > 0)
+        store.cf_models[0][0..store.cf_model_lens[0]]
+    else
+        catalog.defaults.cf_model;
+    const n = @min(mid.len, s.chat_model.len);
+    @memcpy(s.chat_model[0..n], mid[0..n]);
+    s.chat_model_len = @intCast(n);
 }
 
 /// CLIENT — what this machine and session look like right now: OS/arch, cores, physical memory, the desk's
@@ -6859,6 +6877,53 @@ test "a lineage id in the deploy form reaches the deploy body, trimmed, and a bl
     try std.testing.expect(p2.value.object.get("lineage") == null);
 }
 
+test "the Cloudflare default: on puts the chat on Workers AI as one model, keeps a Workers AI model it already has, and an undecided install reads on only when it is there already" {
+    const s = try std.testing.allocator.create(Store);
+    defer std.testing.allocator.destroy(s);
+    s.* = .{};
+    // a custom setup: an OpenAI-compatible model, per-role models, nothing decided
+    s.settings.chat_kind = 2;
+    s.settings.chat_unified = false;
+    const custom = "gpt-4.1-mini";
+    @memcpy(s.settings.chat_model[0..custom.len], custom);
+    s.settings.chat_model_len = custom.len;
+    try std.testing.expect(!s.settings.cfDefaultOn(WORKERS_AI_IDX));
+
+    // the live list has landed: the default takes its first model
+    const live = "@cf/test/live-first";
+    @memcpy(s.cf_models[0][0..live.len], live);
+    s.cf_model_lens[0] = live.len;
+    s.cf_model_count = 1;
+    applyCfDefaultLocked(s, null);
+    try std.testing.expectEqual(@as(u8, 1), s.settings.cf_default);
+    try std.testing.expectEqual(@as(u8, 1), s.settings.chat_kind);
+    try std.testing.expectEqual(WORKERS_AI_IDX, s.settings.chat_byok);
+    try std.testing.expect(s.settings.chat_unified);
+    try std.testing.expectEqualStrings(live, s.settings.chatModel());
+    try std.testing.expect(s.settings.cfDefaultOn(WORKERS_AI_IDX));
+
+    // a Workers AI model the user already picked is kept; a login's model (given) replaces it
+    const mine = "@cf/test/my-pick";
+    @memcpy(s.settings.chat_model[0..mine.len], mine);
+    s.settings.chat_model_len = mine.len;
+    applyCfDefaultLocked(s, null);
+    try std.testing.expectEqualStrings(mine, s.settings.chatModel());
+    applyCfDefaultLocked(s, live);
+    try std.testing.expectEqualStrings(live, s.settings.chatModel());
+
+    // turned off: a custom setup, even on the same provider
+    s.settings.cf_default = 2;
+    try std.testing.expect(!s.settings.cfDefaultOn(WORKERS_AI_IDX));
+    // not decided yet: on for Workers AI as one model, off for Workers AI with per-role models or another provider
+    s.settings.cf_default = 0;
+    try std.testing.expect(s.settings.cfDefaultOn(WORKERS_AI_IDX));
+    s.settings.chat_unified = false;
+    try std.testing.expect(!s.settings.cfDefaultOn(WORKERS_AI_IDX));
+    s.settings.chat_unified = true;
+    s.settings.chat_kind = 0;
+    try std.testing.expect(!s.settings.cfDefaultOn(WORKERS_AI_IDX));
+}
+
 test "swarm deploy shares Cloudflare login and live models with Settings" {
     const s = try std.testing.allocator.create(Store);
     defer std.testing.allocator.destroy(s);
@@ -9751,15 +9816,23 @@ fn drawSettings(store: *Store, frame: t.Rect) void {
         }
         const half = (colw - 10) / 2;
 
-        // MODEL TRIO master toggle: one model for all three roles (default) vs a per-role coding/thinking/prompting
-        // trio. Turning the trio ON seeds the thinking + prompting roles from the current (coding) model so each
-        // panel starts identical, then the user tunes them; saveSettings' loadKey then loads each role's key.
-        const unified = blk_u: {
+        // THE CLOUDFLARE DEFAULT (Settings.cf_default) and the custom setup beside it. On, the chat runs on Workers AI
+        // through the Cloudflare login with one model for every role, and this page shows that model and the login
+        // only. Off is a custom setup: a provider, an account and a key, and per-role models. A login made in this
+        // desk turns it on (applyCfConnectedDefault); not decided yet, it reads on for a chat already on Workers AI.
+        var unified = true;
+        var cf_on = false;
+        {
             store.lock();
             defer store.unlock();
-            break :blk_u store.settings.chat_unified;
-        };
-        if (t.checkbox(.{ .x = x, .y = y, .width = colw, .height = 22 }, t.z("Use one model for every role", .{}), unified)) {
+            unified = store.settings.chat_unified;
+            cf_on = store.settings.cfDefaultOn(WORKERS_AI_IDX);
+        }
+        // MODEL TRIO master toggle, the custom setup's: one model for all three roles (default) vs a per-role
+        // coding/thinking/prompting trio. Turning the trio ON seeds the thinking + prompting roles from the current
+        // (coding) model so each panel starts identical, then the user tunes them; saveSettings' loadKey then loads
+        // each role's key. The Cloudflare default is one model by definition, so the box is held while it is on.
+        if (t.checkboxEx(.{ .x = x, .y = y, .width = colw, .height = 22 }, t.z("Use one model for every role", .{}), unified or cf_on, !cf_on, "The Cloudflare default uses one model for every role. Turn it off below for a custom setup: your own provider, key and per-role models.")) {
             const nv = !unified;
             store.lock();
             store.settings.chat_unified = nv;
@@ -9771,7 +9844,25 @@ fn drawSettings(store: *Store, frame: t.Rect) void {
             store.pushNotif(if (nv) "One model for everything" else "Per-role models", if (nv) "coding, thinking and prompting all use the model below, unless your server publishes its own" else "thinking + prompting start on the coding model; pick a provider below to override either", 1);
         }
         y += 30;
-        if (!unified) {
+        if (t.checkbox(.{ .x = x, .y = y, .width = colw, .height = 22 }, t.z("Use Cloudflare Workers AI (default)", .{}), cf_on)) {
+            store.lock();
+            if (cf_on) store.settings.cf_default = 2 else applyCfDefaultLocked(store, null);
+            store.unlock();
+            store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
+            store.pushNotif(if (cf_on) "Custom model setup" else "Chat: Cloudflare Workers AI", if (cf_on) "choose a provider, a key and per-role models below" else "one Workers AI model for every role, through your Cloudflare login", 1);
+        }
+        y += 30;
+        y = helpPara(if (cf_on)
+            "On: the chat runs on your Cloudflare login with one Workers AI model for every role, and there is nothing else to set up. Logging in with Cloudflare turns this on. Turn it off for a custom setup."
+        else
+            "Off: a custom setup. Choose any provider below, Cloudflare included, with your own key and per-role models.", x, y, colw) + 12;
+        if (cf_on) {
+            const model_disp: []const u8 = if (cmn > 0) cmb[0..cmn] else "(pick a model)";
+            selector(.{ .x = x, .y = y, .width = half, .height = 48 }, t.z("MODEL", .{}), model_disp, .chat_model);
+            drawModelsHint(store, &catalog.providers[WORKERS_AI_IDX], x + half + 10, y + 18);
+            y += 58;
+        }
+        if (!cf_on and !unified) {
             y = helpPara(
                 "Coding writes files, uses tools, and answers you.\n" ++
                     "Thinking plans the work and manages long conversations.\n" ++
@@ -9787,73 +9878,75 @@ fn drawSettings(store: *Store, frame: t.Rect) void {
             y += 20;
         }
 
-        // PROVIDER dropdown: Local / BYOK / Custom URL
-        const kind_lbl = switch (chat_kind) {
-            1 => t.z("BYOK (cloud key)", .{}),
-            2 => t.z("Custom URL", .{}),
-            else => t.z("Local (Ollama)", .{}),
-        };
-        selector(.{ .x = x, .y = y, .width = half, .height = 48 }, t.z("PROVIDER", .{}), kind_lbl, .chat_provider);
-        // BYOK cloud-provider dropdown
-        if (chat_kind == 1) {
-            const p = &catalog.providers[@min(chat_byok, catalog.providers.len - 1)];
-            selector(.{ .x = x + half + 10, .y = y, .width = half, .height = 48 }, t.z("CLOUD PROVIDER", .{}), t.zs(p.label), .chat_byok);
-        }
-        y += 58;
+        // PROVIDER dropdown: Local / BYOK / Custom URL (the custom setup's; the Cloudflare default has its model above)
+        if (!cf_on) {
+            const kind_lbl = switch (chat_kind) {
+                1 => t.z("BYOK (cloud key)", .{}),
+                2 => t.z("Custom URL", .{}),
+                else => t.z("Local (Ollama)", .{}),
+            };
+            selector(.{ .x = x, .y = y, .width = half, .height = 48 }, t.z("PROVIDER", .{}), kind_lbl, .chat_provider);
+            // BYOK cloud-provider dropdown
+            if (chat_kind == 1) {
+                const p = &catalog.providers[@min(chat_byok, catalog.providers.len - 1)];
+                selector(.{ .x = x + half + 10, .y = y, .width = half, .height = 48 }, t.z("CLOUD PROVIDER", .{}), t.zs(p.label), .chat_byok);
+            }
+            y += 58;
 
-        // MODEL: a populated dropdown for local/BYOK; a text field for a custom endpoint (models unknown).
-        if (chat_kind == 2) {
-            flabel(x, y, "MODEL");
-            textField(.{ .x = x, .y = y + t.labelH(), .width = half, .height = t.FIELD_H }, &ui.s_model, ui.focus == .s_model, "model id", .s_model);
-            flabel(x + half + 10, y, "ENDPOINT URL (OpenAI-compatible /v1)");
-            textField(.{ .x = x + half + 10, .y = y + t.labelH(), .width = half, .height = t.FIELD_H }, &ui.s_url, ui.focus == .s_url, "https://host/v1", .s_url);
-            y += 58;
-            const sem_label = t.z("Save endpoint + model", .{});
-            if (t.buttonSolid(.{ .x = x, .y = y, .width = t.btnW(sem_label, t.BTN_MD), .height = t.BTN_MD }, sem_label, t.blue, true)) {
-                store.lock();
-                const s = &store.settings;
-                const mn = @min(ui.s_model.len, s.chat_model.len);
-                @memcpy(s.chat_model[0..mn], ui.s_model.buf[0..mn]);
-                s.chat_model_len = @intCast(mn);
-                const bn2 = @min(ui.s_url.len, s.chat_base.len);
-                @memcpy(s.chat_base[0..bn2], ui.s_url.buf[0..bn2]);
-                s.chat_base_len = @intCast(bn2);
-                store.unlock();
-                store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
-                store.pushNotif("Chat endpoint saved", "custom model config persisted", 1);
-                ui.focus = .none;
+            // MODEL: a populated dropdown for local/BYOK; a text field for a custom endpoint (models unknown).
+            if (chat_kind == 2) {
+                flabel(x, y, "MODEL");
+                textField(.{ .x = x, .y = y + t.labelH(), .width = half, .height = t.FIELD_H }, &ui.s_model, ui.focus == .s_model, "model id", .s_model);
+                flabel(x + half + 10, y, "ENDPOINT URL (OpenAI-compatible /v1)");
+                textField(.{ .x = x + half + 10, .y = y + t.labelH(), .width = half, .height = t.FIELD_H }, &ui.s_url, ui.focus == .s_url, "https://host/v1", .s_url);
+                y += 58;
+                const sem_label = t.z("Save endpoint + model", .{});
+                if (t.buttonSolid(.{ .x = x, .y = y, .width = t.btnW(sem_label, t.BTN_MD), .height = t.BTN_MD }, sem_label, t.blue, true)) {
+                    store.lock();
+                    const s = &store.settings;
+                    const mn = @min(ui.s_model.len, s.chat_model.len);
+                    @memcpy(s.chat_model[0..mn], ui.s_model.buf[0..mn]);
+                    s.chat_model_len = @intCast(mn);
+                    const bn2 = @min(ui.s_url.len, s.chat_base.len);
+                    @memcpy(s.chat_base[0..bn2], ui.s_url.buf[0..bn2]);
+                    s.chat_base_len = @intCast(bn2);
+                    store.unlock();
+                    store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
+                    store.pushNotif("Chat endpoint saved", "custom model config persisted", 1);
+                    ui.focus = .none;
+                }
+                y += 42;
+            } else if (chat_kind == 0) {
+                // Local (Ollama) defaults to 127.0.0.1:11434, but the box may run Ollama on a different port, or
+                // the model may live on another machine on the LAN — let the user override the endpoint.
+                const model_disp: []const u8 = if (cmn > 0) cmb[0..cmn] else "(pick a model)";
+                selector(.{ .x = x, .y = y, .width = half, .height = 48 }, t.z("MODEL", .{}), model_disp, .chat_model);
+                flabel(x + half + 10, y, "ENDPOINT (optional - defaults to 127.0.0.1:11434)");
+                const sv2_label = t.z("Save", .{});
+                const sv2w = t.btnW(sv2_label, t.FIELD_H);
+                const ew = half - sv2w - 8;
+                textField(.{ .x = x + half + 10, .y = y + t.labelH(), .width = ew, .height = t.FIELD_H }, &ui.s_url, ui.focus == .s_url, "http://127.0.0.1:11434/v1", .s_url);
+                if (t.button(.{ .x = x + half + 10 + ew + 8, .y = y + 14, .width = sv2w, .height = t.FIELD_H }, sv2_label, t.blue, true)) {
+                    store.lock();
+                    const s = &store.settings;
+                    const bn2 = @min(ui.s_url.len, s.chat_base.len);
+                    @memcpy(s.chat_base[0..bn2], ui.s_url.buf[0..bn2]);
+                    s.chat_base_len = @intCast(bn2);
+                    store.unlock();
+                    store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
+                    store.pushNotif("Endpoint saved", if (bn2 > 0) "custom Ollama endpoint set" else "reset to default 127.0.0.1:11434", 1);
+                    ui.focus = .none;
+                }
+                y += 58;
+                const hint = if (ol_n > 0) t.z("{d} models installed on this machine", .{ol_n}) else t.z("Ollama not reachable - showing common models", .{});
+                t.text(hint, @intFromFloat(x), @intFromFloat(y), 11, t.comment);
+                y += 20;
+            } else {
+                const model_disp: []const u8 = if (cmn > 0) cmb[0..cmn] else "(pick a model)";
+                selector(.{ .x = x, .y = y, .width = half, .height = 48 }, t.z("MODEL", .{}), model_disp, .chat_model);
+                drawModelsHint(store, &catalog.providers[@min(chat_byok, catalog.providers.len - 1)], x + half + 10, y + 18);
+                y += 58;
             }
-            y += 42;
-        } else if (chat_kind == 0) {
-            // Local (Ollama) defaults to 127.0.0.1:11434, but the box may run Ollama on a different port, or
-            // the model may live on another machine on the LAN — let the user override the endpoint.
-            const model_disp: []const u8 = if (cmn > 0) cmb[0..cmn] else "(pick a model)";
-            selector(.{ .x = x, .y = y, .width = half, .height = 48 }, t.z("MODEL", .{}), model_disp, .chat_model);
-            flabel(x + half + 10, y, "ENDPOINT (optional - defaults to 127.0.0.1:11434)");
-            const sv2_label = t.z("Save", .{});
-            const sv2w = t.btnW(sv2_label, t.FIELD_H);
-            const ew = half - sv2w - 8;
-            textField(.{ .x = x + half + 10, .y = y + t.labelH(), .width = ew, .height = t.FIELD_H }, &ui.s_url, ui.focus == .s_url, "http://127.0.0.1:11434/v1", .s_url);
-            if (t.button(.{ .x = x + half + 10 + ew + 8, .y = y + 14, .width = sv2w, .height = t.FIELD_H }, sv2_label, t.blue, true)) {
-                store.lock();
-                const s = &store.settings;
-                const bn2 = @min(ui.s_url.len, s.chat_base.len);
-                @memcpy(s.chat_base[0..bn2], ui.s_url.buf[0..bn2]);
-                s.chat_base_len = @intCast(bn2);
-                store.unlock();
-                store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
-                store.pushNotif("Endpoint saved", if (bn2 > 0) "custom Ollama endpoint set" else "reset to default 127.0.0.1:11434", 1);
-                ui.focus = .none;
-            }
-            y += 58;
-            const hint = if (ol_n > 0) t.z("{d} models installed on this machine", .{ol_n}) else t.z("Ollama not reachable - showing common models", .{});
-            t.text(hint, @intFromFloat(x), @intFromFloat(y), 11, t.comment);
-            y += 20;
-        } else {
-            const model_disp: []const u8 = if (cmn > 0) cmb[0..cmn] else "(pick a model)";
-            selector(.{ .x = x, .y = y, .width = half, .height = 48 }, t.z("MODEL", .{}), model_disp, .chat_model);
-            drawModelsHint(store, &catalog.providers[@min(chat_byok, catalog.providers.len - 1)], x + half + 10, y + 18);
-            y += 58;
         }
 
         // LOG IN WITH CLOUDFLARE (OAuth) — one browser grant buys Workers AI, the live model list, and the
@@ -9869,8 +9962,12 @@ fn drawSettings(store: *Store, frame: t.Rect) void {
         var acct_len: usize = 0;
         var namebuf: [96]u8 = undefined;
         var name_len: usize = 0;
+        var blockbuf: [320]u8 = undefined;
+        var block_len: usize = 0;
         {
             store.lock();
+            block_len = @min(store.cf_oauth_blocked_len, blockbuf.len);
+            @memcpy(blockbuf[0..block_len], store.cf_oauth_blocked[0..block_len]);
             cf_configured = store.cf_oauth_configured;
             cf_connected = store.cf_oauth_connected;
             cf_pending = store.cf_oauth_pending;
@@ -9901,6 +9998,11 @@ fn drawSettings(store: *Store, frame: t.Rect) void {
                 }
                 y += 44;
                 y = drawCfTunnelRows(store, x, y, colw);
+            } else if (block_len > 0) {
+                // The server moved off the port its OAuth redirect names (src/main.zig): a button here would end on
+                // Cloudflare's own error page, so say why and what to do instead.
+                t.text(t.z("login unavailable on this port", .{}), @intFromFloat(x), @intFromFloat(y + 6), 13, t.orange);
+                y = helpPara(blockbuf[0..block_len], x, y + 26, colw) + 10;
             } else if (cf_configured) {
                 // The login is the headline act, so it wears the vendor's own button (cfBrandButton),
                 // a size up from the form buttons around it.
@@ -9924,47 +10026,50 @@ fn drawSettings(store: *Store, frame: t.Rect) void {
             y += 12;
         }
 
-        // Cloudflare account id (only when the BYOK provider needs one) — built into the Workers AI base_url.
-        if (chat_kind == 1 and catalog.providers[@min(chat_byok, catalog.providers.len - 1)].needs_account) {
-            flabel(x, y, "CLOUDFLARE ACCOUNT ID (paste manually - or use the login above)");
-            y += 14;
-            const sid_label = t.z("Save id", .{});
-            const sidw = t.btnW(sid_label, t.BTN_MD);
-            textField(.{ .x = x, .y = y, .width = colw - 240, .height = t.FIELD_H }, &ui.s_cfacct, ui.focus == .s_cfacct, "e.g. 0123456789abcdef0123456789abcdef", .s_cfacct);
-            if (t.button(.{ .x = x + colw - 240 + t.GAP, .y = y, .width = sidw, .height = t.BTN_MD }, sid_label, t.blue, true)) {
-                store.lock();
-                const s = &store.settings;
-                const n = @min(ui.s_cfacct.len, s.cf_account.len);
-                @memcpy(s.cf_account[0..n], ui.s_cfacct.buf[0..n]);
-                s.cf_account_len = @intCast(n);
-                store.unlock();
-                store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
-                store.pushNotif("Account id saved", "used to build the Workers AI endpoint", 1);
-                ui.focus = .none;
+        // The custom setup's account, key and per-role panels: the Cloudflare default rides the login and needs none.
+        if (!cf_on) {
+            // Cloudflare account id (only when the BYOK provider needs one) — built into the Workers AI base_url.
+            if (chat_kind == 1 and catalog.providers[@min(chat_byok, catalog.providers.len - 1)].needs_account) {
+                flabel(x, y, "CLOUDFLARE ACCOUNT ID (paste manually - or use the login above)");
+                y += 14;
+                const sid_label = t.z("Save id", .{});
+                const sidw = t.btnW(sid_label, t.BTN_MD);
+                textField(.{ .x = x, .y = y, .width = colw - 240, .height = t.FIELD_H }, &ui.s_cfacct, ui.focus == .s_cfacct, "e.g. 0123456789abcdef0123456789abcdef", .s_cfacct);
+                if (t.button(.{ .x = x + colw - 240 + t.GAP, .y = y, .width = sidw, .height = t.BTN_MD }, sid_label, t.blue, true)) {
+                    store.lock();
+                    const s = &store.settings;
+                    const n = @min(ui.s_cfacct.len, s.cf_account.len);
+                    @memcpy(s.cf_account[0..n], ui.s_cfacct.buf[0..n]);
+                    s.cf_account_len = @intCast(n);
+                    store.unlock();
+                    store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
+                    store.pushNotif("Account id saved", "used to build the Workers AI endpoint", 1);
+                    ui.focus = .none;
+                }
+                y += 44;
             }
-            y += 44;
-        }
 
-        // API key (BYOK only — local needs none, custom uses this too)
-        if (chat_kind != 0) {
-            const key_hint: [:0]const u8 = if (chat_kind == 1 and std.mem.eql(u8, catalog.providers[@min(chat_byok, catalog.providers.len - 1)].key, "huggingface")) t.z("hf_... (a Hugging Face fine-grained token with Inference Providers access)", .{}) else if (chat_kind == 1 and catalog.providers[@min(chat_byok, catalog.providers.len - 1)].needs_account) t.z("your Cloudflare API token (Workers AI)", .{}) else t.z("API KEY (stored in the OS-protected local store, never plaintext)", .{});
-            flabel(x, y, key_hint);
-            y += 14;
-            const sk_label = t.z("Save key", .{});
-            const skw = t.btnW(sk_label, t.BTN_MD);
-            textField(.{ .x = x, .y = y, .width = colw - 240, .height = t.FIELD_H }, &ui.s_ckey, ui.focus == .s_ckey, "sk-...", .s_ckey);
-            if (t.button(.{ .x = x + colw - 240 + t.GAP, .y = y, .width = skw, .height = t.BTN_MD }, sk_label, t.blue, ui.s_ckey.len > 0)) {
-                store.pushChatCmd(store_mod.mkChatCmd(.save_key, "", ui.s_ckey.str()));
-                ui.s_ckey.clear();
-                ui.focus = .none;
+            // API key (BYOK only — local needs none, custom uses this too)
+            if (chat_kind != 0) {
+                const key_hint: [:0]const u8 = if (chat_kind == 1 and std.mem.eql(u8, catalog.providers[@min(chat_byok, catalog.providers.len - 1)].key, "huggingface")) t.z("hf_... (a Hugging Face fine-grained token with Inference Providers access)", .{}) else if (chat_kind == 1 and catalog.providers[@min(chat_byok, catalog.providers.len - 1)].needs_account) t.z("your Cloudflare API token (Workers AI)", .{}) else t.z("API KEY (stored in the OS-protected local store, never plaintext)", .{});
+                flabel(x, y, key_hint);
+                y += 14;
+                const sk_label = t.z("Save key", .{});
+                const skw = t.btnW(sk_label, t.BTN_MD);
+                textField(.{ .x = x, .y = y, .width = colw - 240, .height = t.FIELD_H }, &ui.s_ckey, ui.focus == .s_ckey, "sk-...", .s_ckey);
+                if (t.button(.{ .x = x + colw - 240 + t.GAP, .y = y, .width = skw, .height = t.BTN_MD }, sk_label, t.blue, ui.s_ckey.len > 0)) {
+                    store.pushChatCmd(store_mod.mkChatCmd(.save_key, "", ui.s_ckey.str()));
+                    ui.s_ckey.clear();
+                    ui.focus = .none;
+                }
+                if (chat_key_n > 0) t.text(t.z("key set ({d} chars)", .{chat_key_n}), @intFromFloat(x + colw - 240 + t.GAP + skw + 12), @intFromFloat(y + 10), 12, t.green);
+                y += 48;
             }
-            if (chat_key_n > 0) t.text(t.z("key set ({d} chars)", .{chat_key_n}), @intFromFloat(x + colw - 240 + t.GAP + skw + 12), @intFromFloat(y + 10), 12, t.green);
-            y += 48;
-        }
-        // MODEL TRIO: the thinking + prompting override panels — shown only when the user split the models out.
-        if (!unified) {
-            y = chatRolePanel(store, x, y, colw, half, ol_n, 1, "THINKING MODEL", "sets the plan, the bar for done, and what survives compaction", .think_provider, .think_byok, .think_model, &ui.s_tkey, .s_tkey, "think");
-            y = chatRolePanel(store, x, y, colw, half, ol_n, 2, "PROMPTING MODEL", "writes the next instruction each step — small context, go cheap", .prompt_provider, .prompt_byok, .prompt_model, &ui.s_pkey, .s_pkey, "prompt");
+            // MODEL TRIO: the thinking + prompting override panels — shown only when the user split the models out.
+            if (!unified) {
+                y = chatRolePanel(store, x, y, colw, half, ol_n, 1, "THINKING MODEL", "sets the plan, the bar for done, and what survives compaction", .think_provider, .think_byok, .think_model, &ui.s_tkey, .s_tkey, "think");
+                y = chatRolePanel(store, x, y, colw, half, ol_n, 2, "PROMPTING MODEL", "writes the next instruction each step — small context, go cheap", .prompt_provider, .prompt_byok, .prompt_model, &ui.s_pkey, .s_pkey, "prompt");
+            }
         }
         y += 8;
     }

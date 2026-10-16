@@ -66,6 +66,9 @@ pub const App = struct {
     cf_oauth_client_id: []const u8 = "",
     cf_oauth_scopes: []const u8 = CF_OAUTH_SCOPES_DEFAULT,
     cf_oauth_redirect: []const u8 = "http://localhost:8787/api/v1/oauth/cloudflare/callback",
+    /// Non-empty: why the browser login cannot finish on this server (main.zig: app mode moved off the port the
+    /// OAuth client's one registered redirect names). status reports it and start refuses with it.
+    cf_oauth_blocked: []const u8 = "",
     cf_oauth_auth_url: []const u8 = "https://dash.cloudflare.com/oauth2/auth",
     cf_oauth_token_url: []const u8 = "https://dash.cloudflare.com/oauth2/token",
     cf_oauth_accounts_url: []const u8 = "https://api.cloudflare.com/client/v4/accounts",

@@ -15,7 +15,7 @@ The desk calls `POST .../start`; this module mints a CSRF `state` + PKCE verifie
 - `DEFAULT_CLIENT_ID` — compiled-in public OAuth client id (empty = feature stays "not set up"); `NL_CF_OAUTH_CLIENT_ID` still overrides
 - `CF_PROVIDER` — the vault slot `"cf-oauth"`, distinct from a manually pasted `workers-ai` BYOK key so the two never collide
 - `resolveToken` — the entry chat + cast use: current access token + Workers AI base_url + account id for a uid, refreshing within 120 s of expiry; null = not connected (caller falls back)
-- `start` / `callback` / `status` / `logout` — the `/api/v1/oauth/cloudflare/*` HTTP handlers (status never returns the token)
+- `start` / `callback` / `status` / `logout` — the `/api/v1/oauth/cloudflare/*` HTTP handlers (status never returns the token). `App.cf_oauth_blocked`, set by main when app mode had to move off the port the OAuth client's one registered redirect names, rides `status` as `blocked` and makes `start` answer 409 with it, so the desk shows why instead of a login that ends on Cloudflare's redirect error
 - `models` — `GET .../models`: the account's LIVE text-generation Workers AI model list for the desk dropdown (the catalog changes too fast to hardcode)
 - `curl` + `CurlOpts` — the one Cloudflare transport in the process: this module's token legs, `apiCall`, and the `cf_` tool belt (`cftools.call`) all send their calls through it. Each caller brings its own scratch dir, body-file prefix, `--max-time`, answer cap and any extra argv
 - `apiCall` — `curl` with the server's own options (the data dir, `.cfoauth-body-`, 30 s, 1 MiB); `cf_r2` and `cf_tunnel` make their v4 calls through it
