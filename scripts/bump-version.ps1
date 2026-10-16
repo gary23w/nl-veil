@@ -13,9 +13,9 @@
 #   docs\index.html               download links, the topbar and footer version chips
 #   docs\release\RELEASE-vX.md    stub created if missing (fill it before tagging)
 #
-# The stamps are the ONLY README edits a release makes. What a version changed goes in its
-# RELEASE-vX.md and nowhere in the README: no "Stable release" / "New in vX" block, no Current/Previously
-# chain (check.ps1 -Scan flags one as [readme]).
+# The stamps are the ONLY README and docs\index.html edits a release makes. What a version changed goes
+# in its RELEASE-vX.md and nowhere in either: no "Stable release" / "New in vX" block, no
+# Current/Previously/Before-it chain (check.ps1 -Scan flags one as [release-text]).
 #
 # NOT here, on purpose: scripts\build-release.{sh,ps1} and scripts\build-official.sh all READ the literal
 # out of src\main.zig at run time, so they cannot drift and must not be stamped.

@@ -104,11 +104,13 @@ if [ "${1:-}" = "--scan" ]; then
   # `builtin-assets-*` blob instead of the app. An explicit tag is correct but has to move with the version.
   bad=$(grep -roE 'releases/tag/v[^\s")]+' README.md docs/index.html | grep -v "releases/tag/v$vm\$" | wc -l | tr -d ' ')
   if [ "$bad" = "0" ]; then echo "[links] download links point at v$vm"; else echo "[links] $bad download link(s) in README/docs point at a tag other than v$vm (scripts/bump-version.ps1)"; fi
-  # The README carries no per-release text: no "Stable release" / "New in vX" blocks and no
-  # Current/Previously chain. A version's changes go in docs/release/RELEASE-vX.md and the GitHub release
-  # only. Twin of the same check in check.ps1.
-  nb=$(grep -cE '^### (Stable release|New in v)|^\*\*(Current|Previously|Before it|Before that): \[' README.md)
-  if [ "$nb" = "0" ]; then echo "[readme] no release announcements in README.md"; else echo "[readme] $nb release announcement(s) in README.md -- put it in docs/release/RELEASE-v$vm.md instead"; fi
+  # Neither the README nor the site carries per-release text: no "Stable release" / "New in vX" blocks,
+  # no Current/Previously/Before-it chain, no "Since vX" eyebrows. A version's changes go in
+  # docs/release/RELEASE-vX.md and the GitHub release only. Twin of the same check in check.ps1.
+  nr=$(grep -cE '^### (Stable release|New in v)|^\*\*(Current|Previously|Before it|Before that): \[' README.md)
+  ns=$(grep -cE 'section-eyebrow">(New in|Since) v|latest stable release|(Before it|Earlier): <code>v' docs/index.html)
+  nb=$((nr + ns))
+  if [ "$nb" = "0" ]; then echo "[release-text] no release announcements in README.md or docs/index.html"; else echo "[release-text] $nb release announcement(s) (README.md $nr, docs/index.html $ns) -- put it in docs/release/RELEASE-v$vm.md instead"; fi
   # All FOUR places that build neuron must ask for the same cargo features. CI builds it into a path
   # build-official.sh cannot guess and passes it as NEURON=, which build-official.sh then reuses verbatim --
   # so its own cargo line never runs in CI and a feature added there alone ships nothing. That is not
