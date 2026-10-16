@@ -4161,10 +4161,12 @@ fn detectQuirk(msg: []const u8) ?Quirk {
         std.mem.indexOf(u8, m, "default (1)") != null or std.mem.indexOf(u8, m, "equal to 1") != null)
         return .{ .temp = .force, .temp_val = 1.0 };
     // rejected OUTRIGHT (not a range/clamp constraint): "does not support temperature", "temperature is not
-    // supported", "unsupported". Deliberately NOT "cannot"/"not allowed" — those also phrase clamp limits
+    // supported", "unsupported", and "temperature is deprecated for this model." (Anthropic's 400 for every
+    // Claude model since Opus 4.7: sampling parameters were retired, and before this phrase was read every call
+    // to them failed unhealed). Deliberately NOT "cannot"/"not allowed" — those also phrase clamp limits
     // ("temperature cannot exceed 2"), where dropping the field is the wrong (and permanently-learned) fix.
     if (std.mem.indexOf(u8, m, "not support") != null or std.mem.indexOf(u8, m, "unsupported") != null or
-        std.mem.indexOf(u8, m, "does not accept") != null)
+        std.mem.indexOf(u8, m, "does not accept") != null or std.mem.indexOf(u8, m, "deprecated") != null)
         return .{ .temp = .drop };
     return null;
 }
@@ -5605,6 +5607,11 @@ test "self-healing quirks: detect temperature constraints, rewrite the body, ext
     try std.testing.expectEqual(@as(f32, 1.0), kimi.temp_val);
     // a reasoning-model "unsupported" phrasing → drop temperature
     try std.testing.expectEqual(TempRule.drop, detectQuirk("temperature is not supported with this model").?.temp);
+    // Anthropic's retirement of sampling parameters (Claude Opus 4.7 and every model since), in both of the
+    // envelopes it answers with: the OpenAI-compatible /chat/completions one and the native one, as the HTTP-error
+    // text post() hands over. Drop, not pin: the field is gone, not narrowed.
+    try std.testing.expectEqual(TempRule.drop, detectQuirk("HTTP 400: {\"error\":{\"code\":\"invalid_request_error\",\"message\":\"temperature is deprecated for this model.\",\"type\":\"invalid_request_error\"}}").?.temp);
+    try std.testing.expectEqual(TempRule.drop, detectQuirk("HTTP 400: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"`temperature` is deprecated for this model.\"},\"request_id\":\"req_011CVx\"}").?.temp);
     // an unrelated error is not a quirk we heal
     try std.testing.expect(detectQuirk("rate limit exceeded, please retry") == null);
     try std.testing.expect(detectQuirk("context length exceeded") == null);
@@ -5641,6 +5648,77 @@ test "self-healing quirks: detect temperature constraints, rewrite the body, ext
     // the model id rides out of the request body for the learn step
     try std.testing.expectEqualStrings("kimi-k3", bodyModel("{\"model\":\"kimi-k3\",\"messages\":[]}").?);
     try std.testing.expect(bodyModel("{\"messages\":[]}") == null);
+}
+
+test "a model that retired temperature (Anthropic's 'deprecated for this model' 400) is healed once and never sent it again, streamed or not" {
+    // The stand-in refuses any body that carries temperature with the error Anthropic returns for every Claude model
+    // since Opus 4.7, and answers one that does not. Before the heal read "deprecated", every such call failed.
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = if (builtin.os.tag == .windows) .{ .block = .global } else .{ .block = .{ .slice = std.mem.span(std.c.environ) } } });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const saved_tbl = quirk_tbl;
+    defer quirk_tbl = saved_tbl;
+    quirk_tbl = @splat(.{});
+
+    const root = "zig-llm-temp-retired-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, root, .default_dir) catch {};
+
+    const refused = "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"`temperature` is deprecated for this model.\"}}";
+    const R_REFUSED = 0;
+    const R_STREAM = 1;
+    const routes = [_]fakehttp.Route{
+        .{ .method = "POST", .path = "/chat/completions", .reply = std.fmt.comptimePrint("HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ refused.len, refused }), .has = &.{"\"temperature\":"} },
+        .{ .method = "POST", .path = "/chat/completions", .reply = fakehttp.wire("data: {\"choices\":[{\"delta\":{\"content\":\"streamed\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"), .has = &.{"\"stream\":true"} },
+    };
+    var srv: fakehttp.Server = undefined;
+    try srv.startRouted(io, &routes, fakehttp.wire("{\"choices\":[{\"message\":{\"content\":\"answered\"},\"finish_reason\":\"stop\"}]}"));
+    var srv_up = true;
+    defer if (srv_up) srv.stop();
+    var ub: [64]u8 = undefined;
+    const base = try std.fmt.bufPrint(&ub, "http://127.0.0.1:{d}/v1", .{srv.port});
+    const m = "test/sampling-retired";
+    const msgs = "{\"role\":\"user\",\"content\":\"next step\"}";
+    const Sink = struct {
+        fn onDelta(ctx: *anyopaque, kind: DeltaKind, text: []const u8) void {
+            _ = ctx;
+            _ = kind;
+            _ = text;
+        }
+    };
+    var ctx: u8 = 0;
+
+    // 1. the chat's reply, streamed at 0.7 as the engine sends it: the stream is refused, its blocking fallback is
+    //    refused too, healed by dropping the field and answered - and the drop is learned
+    {
+        var s = completeStream(gpa, io, root, "chat", base, "", m, msgs, "", 64, 0.7, &ctx, Sink.onDelta, null);
+        defer s.deinit(gpa);
+        try std.testing.expect(s.ok);
+        try std.testing.expectEqualStrings("answered", s.content);
+        try std.testing.expectEqual(TempRule.drop, quirkFor(io, m).temp);
+    }
+    // 2. the next reply leaves temperature out from the start and streams
+    {
+        var s = completeStream(gpa, io, root, "chat", base, "", m, msgs, "", 64, 0.7, &ctx, Sink.onDelta, null);
+        defer s.deinit(gpa);
+        try std.testing.expect(s.ok);
+        try std.testing.expectEqualStrings("streamed", s.content);
+    }
+    // 3. so does a one-shot classifier pinned at 0
+    {
+        const r = chatTemp(gpa, io, root, "flare", base, "", m, "classify", "the hive is calm", 64, 0);
+        defer gpa.free(r.content);
+        try std.testing.expect(r.ok);
+        try std.testing.expectEqualStrings("answered", r.content);
+    }
+    srv.stop(); // joins the serve thread; the route counts are final after it
+    srv_up = false;
+    // the first reply's two refusals (its stream, its fallback), then its healed retry, one stream, one classifier call
+    try std.testing.expectEqual(@as(u32, 2), srv.used[R_REFUSED]);
+    try std.testing.expectEqual(@as(u32, 1), srv.used[R_STREAM]);
+    try std.testing.expectEqual(@as(usize, 5), srv.countCalls("POST", "/chat/completions"));
 }
 
 test "malformed-body recovery: detect the error, truncate to the last intact turn, never end on a dangling tool-call" {

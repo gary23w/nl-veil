@@ -661,8 +661,12 @@ test "models.yaml parses: fields, flags, models, quoted scalars, defaults" {
     try std.testing.expectEqualStrings("Anthropic (Claude)", providers[0].label);
     try std.testing.expect(providers[0].needs_key and !providers[0].keyless);
     try std.testing.expect(providers[0].models.len >= 4);
-    try std.testing.expectEqualStrings("claude-opus-4-8", providers[0].models[0].id);
-    try std.testing.expectEqualStrings("Claude Opus 4.8", providers[0].models[0].label);
+    // the first row is the provider's default model: the current Opus
+    try std.testing.expectEqualStrings("claude-opus-5-5", providers[0].models[0].id);
+    try std.testing.expectEqualStrings("Claude Opus 5.5", providers[0].models[0].label);
+    // the models a BYOK Claude key resolves to by id alone (providerForModel), the current line among them
+    for ([_][]const u8{ "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5", "claude-fable-5-1", "claude-opus-4-8" }) |id|
+        try std.testing.expectEqualStrings("anthropic", providerForModel(id).?);
     // local/keyless flags drive the server's deploy logic
     try std.testing.expect(isKeyless("ollama") and isLocal("ollama"));
     try std.testing.expect(isKeyless("mock") and !isKeyless("anthropic") and !isKeyless("nope"));
