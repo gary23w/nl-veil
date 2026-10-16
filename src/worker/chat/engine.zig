@@ -3169,9 +3169,10 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     defer conv_buf.deinit(gpa);
 
     // THE STORE (store.zig, Gary's 4tope as the memory): every message of this turn is captured into
-    // {conv}/graph.jsonl as it lands, and each tool result's payload into neuron-db as a document of its own. Under
-    // NL_CONTEXT=net every request is then unfolded from the store: no fold, no carry, no rolling summary.
-    var store: ?nstore.Store = if (netContextOn(ctx.environ.get("NL_CONTEXT")) or storeCaptureOn(ctx.environ.get("NL_CONTEXT_CAPTURE")))
+    // {conv}/graph.jsonl as it lands, and each tool result's payload into neuron-db as a document of its own. Every
+    // request is then unfolded from the store (the default; NL_CONTEXT=fold restores the fold-and-carry path): no
+    // fold, no carry, no rolling summary.
+    var store: ?nstore.Store = if (storeCaptureOn(ctx.environ.get("NL_CONTEXT_CAPTURE")))
         (nstore.Store.init(gpa, app.io, conv_dir, mem_scope, storeGate) catch null)
     else
         null;
@@ -3201,7 +3202,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
             turn_tools = t;
         } else |_| {}
     }
-    if (net_on) emitKV(app, conv_dir, "trace", "text", "context: NL_CONTEXT=net — every request is unfolded from the conversation's store (Gary's 4tope); nothing is folded or carried");
+    if (net_on) emitKV(app, conv_dir, "trace", "text", "context: every request is unfolded from the conversation's store (Gary's 4tope); nothing is folded or carried (NL_CONTEXT=fold restores the fold)");
     conv_buf.appendSlice(gpa, "{\"role\":\"system\",\"content\":") catch return;
     // Tier-paired with the belt: the compact belt gets the compact prompt. One decides WHAT is advertised, the
     // other WHAT is taught — a small model must never be taught a verb its belt doesn't advertise (the
@@ -5380,18 +5381,33 @@ fn storeGate(name: []const u8, head: []const u8) nstore.Gate {
     return .keep;
 }
 
-/// NL_CONTEXT=net: every request is unfolded from the conversation's store (store.zig) — no fold, no carry, no
-/// rolling summary. Off by default while it is measured against the fold-and-carry path.
+/// Conversation context is captured and retrieved directly.
+/// from the conversation's store (store.zig) — no fold, no carry, no rolling summary. Measured before it was made the
+/// default: 5 of 5 facts planted in tool output recalled against the fold-and-carry path's 0 of 5. NL_CONTEXT=fold
+/// (or carry/off/0) restores the fold-and-carry path; anything else, unset included, is the net.
 fn netContextOn(env_value: ?[]const u8) bool {
-    const v = std.mem.trim(u8, env_value orelse return false, " \r\n\t");
-    return std.ascii.eqlIgnoreCase(v, "net");
+    const v = std.mem.trim(u8, env_value orelse return true, " \r\n\t");
+    for ([_][]const u8{ "fold", "carry", "off", "0" }) |old| if (std.ascii.eqlIgnoreCase(v, old)) return false;
+    return true;
 }
 
 /// The store captures every turn unless NL_CONTEXT_CAPTURE says 0/off (it costs a file append per step and one
-/// neuron-db import per step that produced results).
+/// neuron-db import per step that produced results). Without the store there is nothing to unfold a request from,
+/// so capture off is the fold-and-carry path whatever NL_CONTEXT says.
 fn storeCaptureOn(env_value: ?[]const u8) bool {
     const v = std.mem.trim(u8, env_value orelse return true, " \r\n\t");
     return !(v.len == 0 or std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "off"));
+}
+
+test "the store and its net are the default; NL_CONTEXT=fold or capture off restores the fold-and-carry path" {
+    try std.testing.expect(netContextOn(null));
+    try std.testing.expect(netContextOn(""));
+    try std.testing.expect(netContextOn("net"));
+    try std.testing.expect(netContextOn(" NET\r\n"));
+    for ([_][]const u8{ "fold", "Fold", "carry", "off", "0", " fold " }) |old| try std.testing.expect(!netContextOn(old));
+    try std.testing.expect(storeCaptureOn(null));
+    try std.testing.expect(storeCaptureOn("1"));
+    for ([_][]const u8{ "0", "off", "OFF", "" }) |off| try std.testing.expect(!storeCaptureOn(off));
 }
 
 const RECALL_NODE_DEF = "{\"type\":\"function\",\"function\":{\"name\":\"recall_node\",\"description\":\"Return one node of this conversation's store whole: an earlier ask, answer or tool result that the WORK SO FAR block names as n<id>. Use it when a line there was cut short and the full text matters.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\",\"description\":\"the number after n in n<id>\"}},\"required\":[\"id\"]}}}";

@@ -14,7 +14,7 @@
 //!   * THE GRAPH is the whole stored conversation read as one DAG (net.Graph.fromSpanWith .store): every edge the
 //!     one-turn net already records, plus long-range links from any step, ask or answer to the earlier nodes that
 //!     share a RARE word with it — the retrieval half.
-//!   * EVERY PROMPT IS UNFOLDED, not carried (behind NL_CONTEXT=net; the engine wires it). A request is the turn's
+//!   * EVERY PROMPT IS UNFOLDED, not carried (the default; NL_CONTEXT=fold restores the fold). A request is the turn's
 //!     assembled prefix, then ONE system message holding the net unfolded from where the work stands over the whole
 //!     store under a budget, then the newest KEEP_ROUNDS rounds verbatim. The prompt stays the same size at turn 5
 //!     and at turn 5,000; nothing older is summarized, it is either near enough to be shown or recallable by id.

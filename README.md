@@ -1040,7 +1040,16 @@ a large model with a 128k window replays 64 KB verbatim, and a small local summa
 fold it cannot hold
 ([context](https://gary23w.github.io/nl-veil/#doc=worker/chat/context)).
 
-**A long turn carries itself forward by graph, not by summary.** When a turn crosses its spend ceiling,
+**Every request is unfolded from the conversation's store.** Each message of a chat lands in the
+conversation's `graph.jsonl` the moment it exists (the ask, each step and its calls, each tool result as
+the model saw it, each answer), and each tool result's payload is indexed in neuron-db as a document of its
+own. A request is then the turn's prefix, one [store](https://gary23w.github.io/nl-veil/#doc=worker/chat/store)
+net laid out over every earlier ask, answer and result from where the work stands, and the newest two rounds
+verbatim, so it stays the same size at turn 5 and at turn 5,000 and nothing older is summarized: a word a later
+step uses links it to the earlier result that holds it, and `recall_node` returns any node whole by its id.
+A message that does not parse is never stored. `NL_CONTEXT=fold` restores the fold-and-carry path below.
+
+**With `NL_CONTEXT=fold`, a long turn carries itself forward by graph, not by summary.** When a turn crosses its spend ceiling,
 [Gary's 4tope](https://gary23w.github.io/nl-veil/#doc=worker/chat/net) reads the turn's working log as a
 dependency graph: each result hangs off the step that asked for it, a step depends on the results it
 reused, and a later read or write of the same file supersedes the earlier one. The longest path back from
@@ -1540,9 +1549,9 @@ what changed is that the dangerous verbs are now refused inside a turn, not just
 | `NL_TURN_CONTINUE_MAX` | how many times one turn may compact and keep going (default 3). **`0` restores beta-5's behaviour exactly**: the turn settles at the ceiling and waits for you |
 | `NL_TURN_CONTINUE_HARD_MAX` | the ceiling on the *earned* allowance (default 10). A segment that wrote a file or made a call it had not made before buys one more pass, up to this; a segment that only re-read its own context buys nothing, so a spinning turn still settles at `NL_TURN_CONTINUE_MAX` |
 | `NL_TOOL_MAP` | **experimental** — advertise the belt as a MAP the model walks (one `open_tools` verb, seven branches at a time) instead of a flat list. A small model keeps nine core verbs in hand and walks the rest; a large one walks only the discovered families (security tools, Cloudflare, plugins), the ones that grow without bound. A known tool name is always callable and opens its own branch. Default off (unset or `0`); `1` turns it on. See `worker/chat/belt` in the docs |
-| `NL_HANDOFF` | how a turn's working context is folded and carried: `net` (default) unfolds the turn's own working span with Gary's 4tope — the frontier's last words, the file ledger, the failed calls, the results the frontier rests on at length, what earlier folds and passes carried, verbatim, no model call — both for the fold inside a turn and for the CONTINUATION STATE at the ceiling; `model` restores the model-written fold and four-label state |
-| `NL_CONTEXT` | `net` builds every chat request from the conversation's store (Gary's 4tope as the memory): the turn's prefix, one net unfolded over every earlier ask, answer and tool result from where the work stands, then the newest two rounds verbatim; no fold, no carry, no rolling summary, and a `recall_node` tool that returns any stored node whole by its `n<id>`. Unset keeps the fold-and-carry path. Opt-in while it is measured |
-| `NL_CONTEXT_CAPTURE` | `0` stops capturing a conversation into its store (`graph.jsonl` beside the transcript, and each tool result's payload as a neuron-db document). On by default so a conversation already has its store when `NL_CONTEXT=net` is turned on; a result that looks like a credential is never stored |
+| `NL_HANDOFF` | under `NL_CONTEXT=fold`, how a turn's working context is folded and carried: `net` (default) unfolds the turn's own working span with Gary's 4tope — the frontier's last words, the file ledger, the failed calls, the results the frontier rests on at length, what earlier folds and passes carried, verbatim, no model call — both for the fold inside a turn and for the CONTINUATION STATE at the ceiling; `model` restores the model-written fold and four-label state |
+| `NL_CONTEXT` | how a chat request is built. Default: from the conversation's store (Gary's 4tope as the memory) — the turn's prefix, one net unfolded over every earlier ask, answer and tool result from where the work stands, then the newest two rounds verbatim; no fold, no carry, no rolling summary, and a `recall_node` tool that returns any stored node whole by its `n<id>`. `fold` (or `carry`) restores the fold-and-carry path |
+| `NL_CONTEXT_CAPTURE` | `0` stops capturing a conversation into its store (`graph.jsonl` beside the transcript, and each tool result's payload as a neuron-db document); with nothing to unfold a request from, the chat then runs the fold-and-carry path. A result that looks like a credential is never stored |
 | `NL_KEEPALIVE_REQUESTS` | requests one connection serves before recycling (default 200). Drop to 1 if you hit a stuck-socket worker thread |
 | `NL_DEFAULT_MODEL` / `NL_DEFAULT_BASE_URL` | **seeds** the default model on a fresh install, for unattended provisioning. Afterwards set it in **Admin → Default model** — that persists to `data/server-config.json` and wins over the environment, so a stale launch script cannot undo the admin on the next restart |
 | `NL_OPEN_REGISTRATION` | let people sign themselves up. Off by default; the admin creates accounts from the Admin tab instead |
