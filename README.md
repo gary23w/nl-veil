@@ -16,13 +16,22 @@ Windows · macOS · Linux · [MIT app code and AGPL security runtime](#license).
 hosted providers have their own data handling and costs. The built-in model requires a separate
 download, and coding tools require Python on `PATH` (some checks also use Node).
 
-### Stable release: v1.1.16
+### Stable release: v1.1.20
 
-The original v1.1.16 build from October 10, with Gary's 4tope and the tool tree, is the
-latest stable release again. v1.1.17 and v1.1.18 have been withdrawn. If you installed
-either, download and run the [v1.1.16 bundle](https://github.com/gary23w/nl-veil/releases/tag/v1.1.16).
-Automatic updates do not downgrade an installed app. In this release, `NL_TOOL_MAP=1`
-enables the tool tree; Gary's 4tope is enabled by default.
+v1.1.20 builds on v1.1.16; v1.1.17 and v1.1.18 were withdrawn before publication. If you
+installed either, download and run the [v1.1.20 bundle](https://github.com/gary23w/nl-veil/releases/tag/v1.1.20).
+In chat, `NL_TOOL_MAP=1` enables the tool tree; Gary's 4tope is enabled by default. Taters use
+both on their own.
+
+### New in v1.1.20
+
+Tater-tots are **Taters** now, and they run the v1.1.16 algorithms in the cloud: past 48 tools
+the belt is a map they walk with `open_tools`, a long step is folded by Gary's 4tope instead of
+cut, and each model's quirks are learned and healed as they show up. A runtime edit can always be
+reverted, and a newer veil's runtime reaches a running account as a revision of its own. Agent
+Garrett connects through its managed dashboard. On hosted reasoning models the effort dial learns
+per model and a starved survey ends planning, and one data directory is served by one veil at a
+time. [Release notes](docs/release/RELEASE-v1.1.20.md).
 
 ### Garrett dashboard connections
 
@@ -116,7 +125,7 @@ code and credentials from anything you share.
 
 <p>
   <a href="https://github.com/gary23w/nl-veil/actions/workflows/release.yml"><img alt="build" src="https://github.com/gary23w/nl-veil/actions/workflows/release.yml/badge.svg"></a>
-  <a href="https://github.com/gary23w/nl-veil/releases"><img alt="release" src="https://img.shields.io/badge/release-v1.1.16-A8241B"></a>
+  <a href="https://github.com/gary23w/nl-veil/releases"><img alt="release" src="https://img.shields.io/badge/release-v1.1.20-A8241B"></a>
   <img alt="zig" src="https://img.shields.io/badge/zig-0.16-F7A41D?logo=zig&logoColor=white">
   <a href="https://huggingface.co/gary23w/the-veil-12b"><img alt="built-in model" src="https://img.shields.io/badge/built--in%20model-the--veil--12b-6E4A27?logo=huggingface&logoColor=white"></a>
   <a href="https://huggingface.co/gary23w/gary-neuron-emergent"><img alt="memory cortex" src="https://img.shields.io/badge/cortex-gary--neuron--emergent-6E4A27?logo=huggingface&logoColor=white"></a>
@@ -615,7 +624,7 @@ raylib is a *lazy* dependency, so `-Dapp=false` never fetches it at all.
 ## Install
 
 **Download it and run it — no toolchain, nothing to build.** Grab your platform's bundle from the
-**[latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.1.16)**, unzip, and run `veil`:
+**[latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.1.20)**, unzip, and run `veil`:
 
 | You're on | Download | Then run |
 |---|---|---|
@@ -776,7 +785,7 @@ step 5** — the rest is about letting other people in.
 
 ### 1. Download and unblock it
 
-Grab the bundle for your OS from the [latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.1.16)
+Grab the bundle for your OS from the [latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.1.20)
 and unzip it somewhere you'll find again. Builds are unsigned, so:
 
 - **Windows** shows *"Windows protected your PC"* → **More info** → **Run anyway**.
@@ -812,7 +821,7 @@ On startup the server prints one complete URL per address this machine answers o
 (`src/main.zig:861-889`, using `src/config/lan.zig`):
 
 ```
-neuron-loops 1.1.16 on http://localhost:8787
+neuron-loops 1.1.20 on http://localhost:8787
     open from another machine (phone, laptop) at:
       http://192.168.1.42:8787
 ```
@@ -1704,7 +1713,14 @@ dependency entirely rather than compiling it unused.
 
 ## Release
 
-**Current: [`v1.1.16`](https://github.com/gary23w/nl-veil/releases/tag/v1.1.16)** — **Gary's 4tope**:
+**Current: [`v1.1.20`](https://github.com/gary23w/nl-veil/releases/tag/v1.1.20)** — **Taters**:
+tater-tots walk a belt of hundreds of tools as a map, fold a long step with Gary's 4tope instead of
+cutting it, and learn and heal each model's quirks; a runtime edit can always be reverted, and a
+newer veil's runtime reaches a running account as a revision. Agent Garrett connects through its
+managed dashboard, the reasoning-effort dial learns per model, and one data directory is served by
+one veil at a time. [Full notes](docs/release/RELEASE-v1.1.20.md).
+
+**Previously: [`v1.1.16`](https://github.com/gary23w/nl-veil/releases/tag/v1.1.16)** — **Gary's 4tope**:
 a long chat carries itself forward by graph instead of by summary, keeping the chain of results the current
 step rests on and writing the continuation from the turn's own text with no model call. Plus the opt-in
 **tool tree** that lets a small model walk a belt of hundreds of tools, a 60% lighter Agent Garrett belt,
