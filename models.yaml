@@ -45,7 +45,19 @@ providers:
     base: https://api.anthropic.com/v1
     needs_key: true
     sync: models.dev/anthropic litellm/anthropic
+    # The first row is the provider's default model. No Claude model since Opus 4.7 takes temperature (Anthropic
+    # answers "temperature is deprecated for this model."): llm.zig's quirk heal drops it on that first 400.
     models:
+      - id: claude-opus-5-5
+        label: Claude Opus 5.5
+      - id: claude-sonnet-5-5
+        label: Claude Sonnet 5.5
+      - id: claude-haiku-5-5
+        label: Claude Haiku 5.5
+      - id: claude-fable-5-1
+        label: Claude Fable 5.1
+      - id: claude-opus-5
+        label: Claude Opus 5
       - id: claude-opus-4-8
         label: Claude Opus 4.8
       - id: claude-fable-5
@@ -55,10 +67,6 @@ providers:
       - id: claude-haiku-4-5
         label: Claude Haiku 4.5
       # >>> synced from models.dev by scripts/sync-models.py — rewritten every run; move an entry above this line to keep it
-      - id: claude-fable-5-1
-        label: Claude Fable 5.1
-      - id: claude-opus-5
-        label: Claude Opus 5
       # <<< synced
 
   - key: openai
