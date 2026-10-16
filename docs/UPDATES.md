@@ -1,5 +1,9 @@
 # Desktop updates and release connectivity
 
+## v1.1.23
+
+Nothing to do after updating. Every chat request is now built from the conversation's store: each message is written to a `graph.jsonl` beside the conversation's `messages.jsonl` as it lands, and each tool result's payload is indexed in neuron-db. An existing conversation starts its store at its next turn, so its earlier turns reach the store only through what that turn's history window still holds. Set `NL_CONTEXT=fold` before starting the server to go back to the v1.1.22 fold-and-carry path (it still writes the store), or `NL_CONTEXT_CAPTURE=0` to write no store at all, which also runs the fold-and-carry path. Chats on Claude Opus 4.7 and later work again with nothing to change: the first call to such a model learns to drop `temperature` and remembers it in `provider_quirks.jsonl`. v1.1.22 was never published; its changes ship here.
+
 ## v1.1.22
 
 Nothing to do after updating. A long turn now folds its working context with Gary's 4tope instead of a model-written summary, and each conversation keeps a `net.jsonl` beside its `messages.jsonl` that the next turn reads; existing conversations start it at their next turn. `NL_HANDOFF=model` now restores both model-written paths: the fold inside a turn and the continuation at the spend ceiling. An explicit `NL_TURN_TOKEN_CEILING` is honoured as written; without one, the default ceiling now grows with the prompt a turn may send.
