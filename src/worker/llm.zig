@@ -2349,25 +2349,46 @@ pub fn complete(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []
     const sent_effort: []const u8 = if (dial_bare != null) "" else effort_frag;
     // MALFORMED-BODY RECOVERY: the provider rejected our REQUEST as invalid JSON — a conversation turn was
     // serialized broken somewhere upstream (an unterminated content string is the observed shape). Rather
-    // than surface a hard error, truncate the messages to the last INTACT turn and retry once. A degraded
-    // turn (missing the corrupt tail) beats a dead one, and it holds for ANY provider that validates bodies.
-    // The corrupt region is dumped to {run_dir}/.malformed-body-{tag} for root-causing (never sent anywhere).
-    if (!step.ok and isMalformedBodyError(step.content)) {
-        const safe = safeMessagePrefix(gpa, msgs_eff);
-        if (safe.len > 0 and safe.len < msgs_eff.len) {
-            dumpMalformed(io, run_dir, tag, msgs_eff, safe.len);
+    // than surface a hard error, retry once on a body that parses, and it holds for ANY provider that validates
+    // bodies. That body drops ONLY the messages that do not parse (mendMessages) and keeps the ones after them;
+    // the intact prefix (safeMessagePrefix) is the fallback when mending leaves nothing sendable. The prefix alone
+    // was the whole heal once, and when the broken turn sat early that was nearly the whole conversation: conv
+    // cf5c78765 (2026-10-16) answered ~70 calls from its first 13k tokens, without the turn brief, the subtask or a
+    // single tool result. The heal is ANNOUNCED either way (a status line through notify, a warn in the log): a
+    // request that went out missing part of its conversation is never silent. The corrupt region is dumped to
+    // {run_dir}/.malformed-body-{tag} for root-causing (never sent anywhere).
+    if (!step.ok and isMalformedBodyError(step.content)) heal: {
+        const mended: ?Mended = mendMessages(gpa, msgs_eff, 0) catch null;
+        defer if (mended) |m| gpa.free(m.buf);
+        const prefix = safeMessagePrefix(gpa, msgs_eff);
+        const cands = [_][]const u8{ if (mended) |m| m.buf else "", prefix };
+        for (cands, 0..) |safe, ci| {
+            if (safe.len == 0) continue;
+            // the prefix must be a real cut (a scrubbed mend can be LONGER: U+FFFD is 3 bytes for 1), and never the
+            // same body as a mend that just failed
+            if (ci == 1 and (safe.len >= msgs_eff.len or (mended != null and std.mem.eql(u8, safe, mended.?.buf)))) continue;
+            dumpMalformed(io, run_dir, tag, msgs_eff, if (ci == 0) mended.?.first_drop else safe.len);
             const body2 = if (tools_json.len > 0)
-                std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"tools\":[{s}]{s}{s}{s},\"max_tokens\":{d}}}", .{ model, safe, tools_json, temp_frag, think_frag, sent_effort, mt }) catch return step
+                std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"tools\":[{s}]{s}{s}{s},\"max_tokens\":{d}}}", .{ model, safe, tools_json, temp_frag, think_frag, sent_effort, mt }) catch break :heal
             else
-                std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}]{s}{s}{s},\"max_tokens\":{d}}}", .{ model, safe, temp_frag, think_frag, sent_effort, mt }) catch return step;
+                std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}]{s}{s}{s},\"max_tokens\":{d}}}", .{ model, safe, temp_frag, think_frag, sent_effort, mt }) catch break :heal;
             defer gpa.free(body2);
-            std.log.warn("llm[{s}/{s}] MALFORMED request body healed: {d} -> {d} msg bytes (dropped a corrupt turn)", .{ tag, model, msgs_eff.len, safe.len });
+            var nb: [200]u8 = undefined;
+            const note = if (ci == 0 and mended.?.dropped == 0)
+                std.fmt.bufPrint(&nb, "the request body held invalid UTF-8: replaced the bad bytes in {d} message(s) and sent it again", .{mended.?.scrubbed}) catch "the request body held invalid UTF-8: replaced the bad bytes"
+            else if (ci == 0)
+                std.fmt.bufPrint(&nb, "the request body was malformed: dropped {d} corrupt message(s) and sent the rest", .{mended.?.dropped}) catch "the request body was malformed: dropped the corrupt messages"
+            else
+                std.fmt.bufPrint(&nb, "the request body was malformed: sent only the conversation before its first corrupt message ({d} of {d} bytes)", .{ safe.len, msgs_eff.len }) catch "the request body was malformed: sent only the conversation before its first corrupt message";
+            std.log.warn("llm[{s}/{s}] MALFORMED request body healed: {d} -> {d} msg bytes ({s})", .{ tag, model, msgs_eff.len, safe.len, if (ci == 0) "dropped the corrupt messages" else "cut at the first corrupt turn" });
+            notify(note);
             var step2 = completeBody(gpa, io, run_dir, tag, base_url, key, model, body2, mt);
             if (step2.ok) {
                 step.deinit(gpa);
                 return step2;
             }
             step2.deinit(gpa);
+            if (stopRequested()) break :heal;
         }
     }
     // FAILURE RETRY: a failed call is retried after a wait, and the wait is announced as a status frame. On a
@@ -2527,7 +2548,7 @@ fn safeMessagePrefix(gpa: std.mem.Allocator, msgs: []const u8) []const u8 {
 /// Best-effort dump of a malformed messages payload for offline root-causing — the corrupt turn plus a
 /// little context around the truncation point. io-tolerant: a write failure is silently ignored (never
 /// blocks the heal). The file is local to the run dir; nothing leaves the machine.
-fn dumpMalformed(io: std.Io, run_dir: []const u8, tag: []const u8, msgs: []const u8, cut: usize) void {
+pub fn dumpMalformed(io: std.Io, run_dir: []const u8, tag: []const u8, msgs: []const u8, cut: usize) void {
     var pbuf: [1024]u8 = undefined;
     const path = std.fmt.bufPrint(&pbuf, "{s}/.malformed-body-{s}", .{ run_dir, if (tag.len > 0) tag else "chat" }) catch return;
     const lo = if (cut > 400) cut - 400 else 0;
@@ -3673,6 +3694,350 @@ pub fn validMessagePrefixLen(gpa: std.mem.Allocator, msgs: []const u8) usize {
         end = at; // shrink the search window past this failed boundary
     }
     return 0; // not even the first turn is well-formed
+}
+
+/// THE TURN EDGES OF A LIVE BUFFER. A conversation buffer is message objects joined by commas, and every object
+/// after the first opens on the raw head `,{"role":` - bytes no properly escaped string value can hold (jstr escapes
+/// every quote; see nextMissingEchoOffset). So the boundaries are found by that head alone, even in a buffer one
+/// message of which is corrupt: the heads on either side of a broken string are still real.
+pub const MSG_HEAD = ",{\"role\":";
+
+/// How many message objects `buf` holds. A buffer that opens on a bare object (`{"role":...`) counts it; a slice
+/// that opens on its comma (`,{"role":...`) counts by heads alone. Pure - tested.
+pub fn msgCount(buf: []const u8) usize {
+    var n: usize = if (buf.len > 0 and !std.mem.startsWith(u8, buf, MSG_HEAD)) 1 else 0;
+    var pos: usize = 0;
+    while (std.mem.indexOfPos(u8, buf, pos, MSG_HEAD)) |at| {
+        n += 1;
+        pos = at + MSG_HEAD.len;
+    }
+    return n;
+}
+
+/// Where the first `n` messages of `buf` end (where message n+1 opens), or buf.len when `buf` holds no more than `n`.
+/// A FREEZE LINE KEPT AS A COUNT survives what a byte offset does not: a heal rewrites messages IN PLACE - the
+/// reasoning echo splices `,"reasoning_content":""` into every bare assistant turn, and any quirk learned for any
+/// model later may add or strip a field the same way - so an offset saved before one runs lands inside a message,
+/// while the number of messages before it stays exact (no heal adds or removes a message). Measured on conv
+/// cf5c78765 (deepseek-v4-flash, 2026-10-16): the pass-entry echo grew the prefix by those 23 bytes, the turn's
+/// saved offset cut the TURN BRIEF 23 bytes short of its closing quote, and ~70 calls went out unparsable. Pure - tested.
+pub fn msgEdge(buf: []const u8, n: usize) usize {
+    if (n == 0) return 0;
+    var seen: usize = if (buf.len > 0 and !std.mem.startsWith(u8, buf, MSG_HEAD)) 1 else 0;
+    var pos: usize = 0;
+    while (std.mem.indexOfPos(u8, buf, pos, MSG_HEAD)) |at| {
+        if (seen == n) return at;
+        seen += 1;
+        pos = at + MSG_HEAD.len;
+    }
+    return buf.len;
+}
+
+/// Is `off` a turn edge of `buf`: its start, its end, or the head of a message? Pure - tested.
+pub fn onMsgEdge(buf: []const u8, off: usize) bool {
+    if (off == 0 or off == buf.len) return true;
+    if (off > buf.len) return false;
+    return std.mem.startsWith(u8, buf[off..], MSG_HEAD);
+}
+
+/// `off` when it is a turn edge, else the next edge after it (buf.len when none follows). Pure - tested.
+pub fn nextMsgEdge(buf: []const u8, off: usize) usize {
+    if (off >= buf.len) return buf.len;
+    if (onMsgEdge(buf, off)) return off;
+    return std.mem.indexOfPos(u8, buf, off, MSG_HEAD) orelse buf.len;
+}
+
+/// What mendMessages made of a broken buffer: a gpa-owned copy holding every message that parses and still pairs,
+/// how many messages it dropped, where the first dropped one began (an offset into the INPUT, for the dump), and how
+/// many of the input's first `edge_msgs` messages survived, so a caller's freeze line can follow the drop.
+/// `scrubbed` counts the messages that parsed once their invalid UTF-8 was replaced (scrubUtf8Copy): kept, not dropped.
+pub const Mended = struct { buf: []u8, dropped: usize, scrubbed: usize = 0, first_drop: usize, edge_msgs: usize };
+
+/// A copy of `s` with every byte that does not begin a valid UTF-8 sequence replaced by U+FFFD - the repair jstr makes
+/// as it serializes (see there), for bytes that reached a buffer without it: http.jstr, which builds the chat
+/// engine's buffer, copies bytes >= 0x80 as they come, and the strict parser refuses a message that holds them.
+fn scrubUtf8Copy(gpa: std.mem.Allocator, s: []const u8) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(gpa);
+    var i: usize = 0;
+    while (i < s.len) {
+        const c = s[i];
+        if (c < 0x80) {
+            try out.append(gpa, c);
+            i += 1;
+            continue;
+        }
+        if (std.unicode.utf8ByteSequenceLength(c)) |len| {
+            if (i + len <= s.len) {
+                if (std.unicode.utf8Decode(s[i .. i + len])) |_| {
+                    try out.appendSlice(gpa, s[i .. i + len]);
+                    i += len;
+                    continue;
+                } else |_| {}
+            }
+        } else |_| {}
+        try out.appendSlice(gpa, "\u{FFFD}");
+        i += 1;
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+/// The role a message piece's head names (`{"role":"tool"` -> "tool"), read from the raw head, so a piece whose
+/// body is corrupt still says what it was. "" for a piece with no recognizable head.
+fn pieceRole(piece: []const u8) []const u8 {
+    const p = if (std.mem.startsWith(u8, piece, ",")) piece[1..] else piece;
+    const h = "{\"role\":\"";
+    if (!std.mem.startsWith(u8, p, h)) return "";
+    const e = std.mem.indexOfScalarPos(u8, p, h.len, '"') orelse return "";
+    return p[h.len..e];
+}
+
+/// MEND A BROKEN BUFFER BY THE MESSAGE, NOT BY THE PREFIX. Every message is checked on its own with the real parser
+/// (the heads cut the buffer into messages; see MSG_HEAD) and only the ones that do not parse are dropped - the
+/// messages AFTER a broken one are kept. The prefix truncation (validMessagePrefixLen) drops everything after the
+/// first broken turn instead, and when that turn sits in the turn's frozen prefix that is the whole working span: on
+/// conv cf5c78765 every call after the cut went out as the system prompt and the user's first request, with no
+/// brief, no subtask and no tool result, and the model restarted the task ~70 times. A dropped message can strand a
+/// tool round, which is its own 400 ("tool_calls must be followed by tool messages"), so a round is kept WHOLE or not
+/// at all: an assistant tool_calls turn goes with its results when any of them, or it, is lost, and a tool result
+/// whose announcement is gone goes too. null: every message parses (send it as it is). error.Irreparable: none does.
+/// Pure - tested.
+pub fn mendMessages(gpa: std.mem.Allocator, buf: []const u8, edge_msgs: usize) error{ OutOfMemory, Irreparable }!?Mended {
+    var starts: std.ArrayListUnmanaged(usize) = .empty;
+    defer starts.deinit(gpa);
+    if (buf.len > 0 and !std.mem.startsWith(u8, buf, MSG_HEAD)) try starts.append(gpa, 0);
+    var pos: usize = 0;
+    while (std.mem.indexOfPos(u8, buf, pos, MSG_HEAD)) |at| {
+        try starts.append(gpa, at);
+        pos = at + MSG_HEAD.len;
+    }
+    const n = starts.items.len;
+    if (n == 0) return null;
+    const pieces = try gpa.alloc([]const u8, n);
+    defer gpa.free(pieces);
+    const keep = try gpa.alloc(bool, n);
+    defer gpa.free(keep);
+    var owned: std.ArrayListUnmanaged([]u8) = .empty; // the scrubbed copies pieces[] points into
+    defer {
+        for (owned.items) |o| gpa.free(o);
+        owned.deinit(gpa);
+    }
+    var any_bad = false;
+    var scrubbed: usize = 0;
+    for (starts.items, 0..) |s, i| {
+        const e = if (i + 1 < n) starts.items[i + 1] else buf.len;
+        const obj = if (std.mem.startsWith(u8, buf[s..e], ",")) buf[s + 1 .. e] else buf[s..e];
+        pieces[i] = obj;
+        const is_obj = std.mem.startsWith(u8, std.mem.trimStart(u8, obj, " \t\r\n"), "{");
+        keep[i] = is_obj and try std.json.validate(gpa, obj);
+        // MIS-ENCODED IS NOT BROKEN: a message whose only fault is invalid UTF-8 is repaired, never dropped - a
+        // lenient provider would have read it with the same replacement characters.
+        if (!keep[i] and is_obj and !std.unicode.utf8ValidateSlice(obj)) {
+            const clean = try scrubUtf8Copy(gpa, obj);
+            owned.append(gpa, clean) catch {
+                gpa.free(clean);
+                return error.OutOfMemory;
+            };
+            if (try std.json.validate(gpa, clean)) {
+                pieces[i] = clean;
+                keep[i] = true;
+                scrubbed += 1;
+            }
+        }
+        if (!keep[i]) any_bad = true;
+    }
+    if (!any_bad and scrubbed == 0) return null;
+
+    // ROUNDS, KEPT WHOLE OR NOT AT ALL - asked only when a message was dropped: a buffer that needed nothing but its
+    // encoding repaired keeps every message it had.
+    const Call = struct { id: []const u8 = "" };
+    const Shape = struct { tool_call_id: []const u8 = "", tool_calls: ?[]const Call = null };
+    var i: usize = if (any_bad) 0 else n;
+    while (i < n) {
+        const role = pieceRole(pieces[i]);
+        if (std.mem.eql(u8, role, "tool")) {
+            keep[i] = false; // a result no assistant turn right before it announced
+            i += 1;
+            continue;
+        }
+        if (!std.mem.eql(u8, role, "assistant")) {
+            i += 1;
+            continue;
+        }
+        var k = i + 1;
+        while (k < n and std.mem.eql(u8, pieceRole(pieces[k]), "tool")) k += 1;
+        if (!keep[i]) {
+            for (i + 1..k) |j| keep[j] = false; // its announcement is gone: every result after it is an orphan
+            i = k;
+            continue;
+        }
+        const ann = std.json.parseFromSlice(Shape, gpa, pieces[i], .{ .ignore_unknown_fields = true }) catch null;
+        defer if (ann) |a| a.deinit();
+        const calls: []const Call = if (ann) |a| (a.value.tool_calls orelse &.{}) else &.{};
+        if (calls.len == 0) {
+            for (i + 1..k) |j| keep[j] = false; // a plain turn announces nothing: results after it are orphans
+            i = k;
+            continue;
+        }
+        var whole = true;
+        for (i + 1..k) |j| {
+            if (!keep[j]) whole = false;
+        }
+        if (whole) {
+            for (calls) |c| {
+                var answered = false;
+                for (i + 1..k) |j| {
+                    const res = std.json.parseFromSlice(Shape, gpa, pieces[j], .{ .ignore_unknown_fields = true }) catch continue;
+                    defer res.deinit();
+                    if (c.id.len == 0 or std.mem.eql(u8, res.value.tool_call_id, c.id)) {
+                        answered = true;
+                        break;
+                    }
+                }
+                if (!answered) whole = false;
+            }
+        }
+        if (!whole) {
+            for (i..k) |j| keep[j] = false;
+        }
+        i = k;
+    }
+
+    var dropped: usize = 0;
+    var first_drop: usize = buf.len;
+    var edge_kept: usize = 0;
+    for (keep, 0..) |kp, j| {
+        if (!kp) {
+            dropped += 1;
+            if (first_drop == buf.len) first_drop = starts.items[j];
+        } else if (j < edge_msgs) edge_kept += 1;
+    }
+    if (dropped == n) return error.Irreparable;
+    // Same shape as the input: a buffer that opened on a bare object still does, a slice that opened on its comma
+    // still does.
+    const lead_comma = std.mem.startsWith(u8, buf, MSG_HEAD);
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(gpa);
+    for (keep, 0..) |kp, j| {
+        if (!kp) continue;
+        if (out.items.len > 0 or lead_comma) try out.append(gpa, ',');
+        try out.appendSlice(gpa, pieces[j]);
+    }
+    return .{ .buf = try out.toOwnedSlice(gpa), .dropped = dropped, .scrubbed = scrubbed, .first_drop = first_drop, .edge_msgs = edge_kept };
+}
+
+test "turn edges: a message-count freeze line survives the in-place echo heal that strands a byte offset (conv cf5c78765)" {
+    const gpa = std.testing.allocator;
+    // The incident's prefix: system, the first exchange (a PLAIN assistant turn), the request, then the TURN BRIEF.
+    const prefix = "{\"role\":\"system\",\"content\":\"sys\"}" ++
+        ",{\"role\":\"user\",\"content\":\"hello\"}" ++
+        ",{\"role\":\"assistant\",\"content\":\"Hey Gary.\"}" ++
+        ",{\"role\":\"user\",\"content\":\"build a marketplace app in php\"}" ++
+        ",{\"role\":\"system\",\"content\":\"TURN BRIEF ... WATCH FOR: PHP, Composer, or a database server may not be installed\"}";
+    const buf = prefix ++ ",{\"role\":\"user\",\"content\":\"subtask 4\"}";
+    try std.testing.expectEqual(@as(usize, 6), msgCount(buf));
+    const frozen_len = prefix.len;
+    const frozen_msgs = msgCount(prefix);
+    try std.testing.expectEqual(@as(usize, 5), frozen_msgs);
+    try std.testing.expectEqual(frozen_len, msgEdge(buf, frozen_msgs));
+    try std.testing.expectEqual(@as(usize, 0), msgEdge(buf, 0));
+    try std.testing.expectEqual(buf.len, msgEdge(buf, 6));
+    try std.testing.expectEqual(buf.len, msgEdge(buf, 99));
+
+    // The pass-entry heal: the "" echo spliced into every bare assistant turn, the prefix's own included.
+    const healed = withReasoningEcho(gpa, buf, "").?;
+    defer gpa.free(healed);
+    try std.testing.expectEqual(buf.len + ",\"reasoning_content\":\"\"".len, healed.len);
+    try std.testing.expectEqual(@as(usize, 6), msgCount(healed)); // no heal adds or removes a message
+    // The saved byte offset is now INSIDE the brief - where the incident's fold cut it open...
+    try std.testing.expect(!onMsgEdge(healed, frozen_len));
+    // ...while the count still names the brief's end exactly, and the catch snaps the stale offset to it.
+    const edge = msgEdge(healed, frozen_msgs);
+    try std.testing.expectEqual(frozen_len + 23, edge);
+    try std.testing.expect(onMsgEdge(healed, edge));
+    try std.testing.expectEqual(edge, nextMsgEdge(healed, frozen_len));
+
+    // A fold at each: cut, then append the net's note. Only the stale cut leaves a message that does not parse.
+    const note = ",{\"role\":\"assistant\",\"content\":\"CONTINUATION (Gary's 4tope)\"}";
+    const good_cut = try std.mem.concat(gpa, u8, &.{ healed[0..edge], note });
+    defer gpa.free(good_cut);
+    try std.testing.expect((try mendMessages(gpa, good_cut, 0)) == null);
+    const stale_cut = try std.mem.concat(gpa, u8, &.{ healed[0..frozen_len], note });
+    defer gpa.free(stale_cut);
+    const m = (try mendMessages(gpa, stale_cut, 0)).?;
+    defer gpa.free(m.buf);
+    try std.testing.expectEqual(@as(usize, 1), m.dropped); // the brief, cut open
+    try std.testing.expect(std.mem.endsWith(u8, m.buf, note)); // and the note after it is KEPT, not truncated away
+    try std.testing.expect(std.mem.indexOf(u8, m.buf, "TURN BRIEF") == null);
+
+    // a slice opening on its comma: counted by heads, edges relative to it
+    const slice = ",{\"role\":\"user\",\"content\":\"a\"},{\"role\":\"user\",\"content\":\"b\"}";
+    try std.testing.expectEqual(@as(usize, 2), msgCount(slice));
+    try std.testing.expectEqual(std.mem.lastIndexOf(u8, slice, MSG_HEAD).?, msgEdge(slice, 1));
+    try std.testing.expectEqual(@as(usize, 0), msgCount(""));
+}
+
+test "mendMessages: only the broken messages go, tool rounds stay whole, invalid UTF-8 is repaired rather than dropped" {
+    const gpa = std.testing.allocator;
+    const sys = "{\"role\":\"system\",\"content\":\"sys\"}";
+    const q = ",{\"role\":\"user\",\"content\":\"q\"}";
+    const next = ",{\"role\":\"user\",\"content\":\"next\"}";
+    const ann2 = ",{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"a\",\"type\":\"function\",\"function\":{\"name\":\"x\",\"arguments\":\"{}\"}},{\"id\":\"b\",\"type\":\"function\",\"function\":{\"name\":\"y\",\"arguments\":\"{}\"}}]}";
+    const res_a = ",{\"role\":\"tool\",\"tool_call_id\":\"a\",\"content\":\"A\"}";
+    const res_b = ",{\"role\":\"tool\",\"tool_call_id\":\"b\",\"content\":\"B\"}";
+    const res_b_broken = ",{\"role\":\"tool\",\"tool_call_id\":\"b\",\"content\":\"B is cut op";
+    const broken_user = ",{\"role\":\"user\",\"content\":\"cut op";
+
+    // clean: nothing to mend
+    try std.testing.expect((try mendMessages(gpa, sys ++ q ++ ann2 ++ res_a ++ res_b ++ next, 0)) == null);
+
+    // a broken RESULT takes its whole round with it (announcement + the sibling result), nothing else
+    {
+        const m = (try mendMessages(gpa, sys ++ q ++ ann2 ++ res_a ++ res_b_broken ++ next, 0)).?;
+        defer gpa.free(m.buf);
+        try std.testing.expectEqualStrings(sys ++ q ++ next, m.buf);
+        try std.testing.expectEqual(@as(usize, 3), m.dropped);
+    }
+    // a broken ANNOUNCEMENT orphans its results: they go too
+    {
+        const ann_broken = ",{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"a\"";
+        const m = (try mendMessages(gpa, sys ++ q ++ ann_broken ++ res_a ++ next, 0)).?;
+        defer gpa.free(m.buf);
+        try std.testing.expectEqualStrings(sys ++ q ++ next, m.buf);
+    }
+    // once mending, a round missing an answer goes whole as well (b announced, only a answered)
+    {
+        const m = (try mendMessages(gpa, sys ++ broken_user ++ ann2 ++ res_a ++ next, 0)).?;
+        defer gpa.free(m.buf);
+        try std.testing.expectEqualStrings(sys ++ next, m.buf);
+        try std.testing.expectEqual(@as(usize, 3), m.dropped);
+    }
+    // the freeze line follows the drop: of the first 2 messages (sys + the broken one) 1 survives
+    {
+        const m = (try mendMessages(gpa, sys ++ broken_user ++ q ++ next, 2)).?;
+        defer gpa.free(m.buf);
+        try std.testing.expectEqual(@as(usize, 1), m.edge_msgs);
+        try std.testing.expectEqual(sys.len, msgEdge(m.buf, m.edge_msgs));
+        try std.testing.expectEqual(sys.len, m.first_drop); // the first drop began right after sys
+    }
+    // invalid UTF-8 (a cp1252 apostrophe from a tool) is REPAIRED: kept, with U+FFFD, and nothing dropped
+    {
+        const m = (try mendMessages(gpa, sys ++ ",{\"role\":\"user\",\"content\":\"it\x92s\"}" ++ next, 0)).?;
+        defer gpa.free(m.buf);
+        try std.testing.expectEqual(@as(usize, 0), m.dropped);
+        try std.testing.expectEqual(@as(usize, 1), m.scrubbed);
+        try std.testing.expect(std.unicode.utf8ValidateSlice(m.buf));
+        try std.testing.expect(std.mem.indexOf(u8, m.buf, "it\u{FFFD}s") != null);
+        try std.testing.expectEqual(@as(usize, 3), msgCount(m.buf));
+    }
+    // a slice opening on its comma keeps that shape
+    {
+        const m = (try mendMessages(gpa, q ++ broken_user ++ next, 0)).?;
+        defer gpa.free(m.buf);
+        try std.testing.expectEqualStrings(q ++ next, m.buf);
+    }
+    // nothing parses: irreparable
+    try std.testing.expectError(error.Irreparable, mendMessages(gpa, "{\"role\":\"user\",\"content\":\"x", 0));
 }
 
 /// The exact head of an assistant object as BOTH agentic loops serialize it (the chat engine's tool-call

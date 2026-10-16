@@ -3649,7 +3649,15 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     // Everything appended past this by the drive loop (settled answers, synthetic drive steps, per-pass tool
     // notes) is compacted against it between drive steps so a multi-step turn stays bounded ACROSS steps, not
     // only within one pass. compactWorking (the sole reader) is the reason the brief is appended above this line.
-    const assembled_len = conv_buf.items.len;
+    //
+    // THE FREEZE LINE IS A MESSAGE COUNT; the byte offset is re-read from it after every pass (followFreeze). A pass
+    // heals the buffer IN PLACE - the reasoning echo splices a field into every bare assistant turn of the prefix,
+    // and any quirk learned for any model can do the same - so an offset taken here goes stale inside the prefix,
+    // and every reader below cuts there: the cross-step fold, the roll, the carry, the turn's net record. Measured
+    // on conv cf5c78765 (deepseek-v4-flash, 2026-10-16): the echo grew the prefix 23 bytes, the fold kept the stale
+    // offset and cut the TURN BRIEF 23 bytes short of its closing quote, and the next ~70 calls went out unparsable.
+    var assembled_len = conv_buf.items.len;
+    const assembled_msgs = llm.msgCount(conv_buf.items);
 
     // TERMINAL VERIFY, contract-aware: the generic paragraph plus THIS turn's done_when list, so the one
     // completeness check an armed loop gets before accepting DONE names the specific conditions that must hold
@@ -3963,6 +3971,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
         const mut_before = file_ledger.mutations;
         const inner = runInnerAgentic(app, uid, conv, conv_dir, llm_dir, trio, &conv_buf, &ctx, &steer_cursor, &tool_obs, &tool_perf, tool_client, &no_ack_streak, &dud_fetches, &poll_timeouts, &tools_spent, tool_budget, token_ceiling, &echo_guard, &call_ledger, &file_ledger, foreign_mem.items, &foreign_warned, search_intent, &search_log, turn_tools, if (map_walk) |*mw| mw else null, if (overlay) |*o| o else null);
         replies.notePass(inner.tools_ran); // every outcome: a roll-on segment's tools ran this turn too
+        followFreeze(app, conv_dir, conv_buf.items, assembled_msgs, &assembled_len); // the pass may have healed the prefix
         // TRAJECTORY THREAD (fine weave): a pass that LANDED file changes mints one provenance-labeled
         // progress fact pairing the step's language with the engine-observed effect — the lexical thread
         // that lets a later step's recall hop from "what am I doing" to "what already happened here".
@@ -4188,7 +4197,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
                         seed.appendSlice(gpa, "}") catch break :roll;
                         // Drop the span that tripped the ceiling. The seed is orders of magnitude smaller than
                         // what was just dropped, so the append reuses retained capacity rather than growing.
-                        conv_buf.shrinkRetainingCapacity(assembled_len);
+                        conv_buf.shrinkRetainingCapacity(cutEdge(app, conv_dir, conv_buf.items, assembled_len));
                         conv_buf.appendSlice(gpa, seed.items) catch break :roll;
                         // A fresh allowance for the fresh context, and room in the drive loop to spend it —
                         // a plain turn's DRIVE_MAX of 6 would otherwise end the roll before the budget does.
@@ -11965,6 +11974,13 @@ fn runInnerAgentic(
             };
         }
 
+        // CHECKED BEFORE IT IS SENT (mendBeforeSend): a broken message is mended out of conv_buf here, by the engine
+        // that broke it, instead of costing a 400 per call and an answer from whatever prefix still parses.
+        if (!mendBeforeSend(app, conv_dir, run_root, conv_buf, &base_len)) {
+            emitKV(app, conv_dir, "error", "err", "the working context is corrupt and no message of it could be mended (an engine bug) - stopping rather than sending a conversation it no longer has");
+            return .{ .outcome = .hard_error, .content = empty };
+        }
+
         // STREAMING: the model's reply + reasoning type out via streamOnDelta as {kind:token|reasoning,delta}
         // frames. The returned Step is the SAME accumulated shape complete() gives (content + reasoning +
         // tool_calls), so everything below is unchanged — and completeStream falls back to complete() itself
@@ -14470,10 +14486,9 @@ fn turnHandoff(app: *App, run_root: []const u8, base_url: []const u8, key: []con
     // where the ceiling routinely trips at iter 0 — the pass's own span is EMPTY and every byte of the turn's
     // work sits behind it. assembled_len is the caller's freeze line and covers every drive step.
     //
-    // It can be a few bytes STALE: the pass-entry reasoning-echo heal rewrites the whole buffer and updates only
-    // base_len. Heals only ever GROW the buffer so the offset stays in range (@min is belt and braces), and a
-    // stale offset merely prepends a few hundred bytes of prefix TEXT to the log — harmless where the slice
-    // rides as escaped characters, which is precisely what it would not be in compactWorking.
+    // It is re-read by message count after every pass (followFreeze in runTurn), so a heal that rewrote the prefix -
+    // the reasoning echo, which updates only the pass's base_len - no longer leaves it stale inside a message; the
+    // @min is belt and braces.
     const work = conv_items[@min(assembled_len, conv_items.len)..];
     var span: std.ArrayListUnmanaged(u8) = .empty;
     defer span.deinit(gpa);
@@ -14834,6 +14849,113 @@ fn foldSpanByNet(gpa: std.mem.Allocator, span: []const u8, keep_tail: usize, har
     return gpa.dupe(u8, out.items) catch null;
 }
 
+/// THE TURN'S FREEZE LINE, RE-READ BY COUNT (see assembled_msgs in runTurn): `len` becomes the edge after the
+/// prefix's first `msgs` messages. A move is traced, since it means something rewrote the prefix in place.
+fn followFreeze(app: *App, conv_dir: []const u8, buf: []const u8, msgs: usize, len: *usize) void {
+    const edge = llm.msgEdge(buf, msgs);
+    if (edge == len.*) return;
+    var tb: [240]u8 = undefined;
+    emitKV(app, conv_dir, "trace", "text", std.fmt.bufPrint(&tb, "the assembled prefix moved from byte {d} to {d} (a heal rewrote it in place): folds and rolls follow it by message count", .{ len.*, edge }) catch "the assembled prefix moved (a heal rewrote it in place): folds and rolls follow it by message count");
+    len.* = edge;
+}
+
+/// A CUT LANDS ON A TURN EDGE OR NOWHERE. Every fold and roll truncates the buffer at a saved offset and appends to
+/// it, so an offset a rewrite has moved inside a message cuts that message's string open, and the buffer stays
+/// unparsable for the rest of the turn (conv cf5c78765). This is the catch for any offset any caller kept stale,
+/// after any heal of any model: the cut moves to the NEXT edge - it keeps a little more, it never cuts a message -
+/// and the move is logged and shown, because it means a saved offset went stale and its owner has a bug.
+fn cutEdge(app: *App, conv_dir: []const u8, buf: []const u8, off: usize) usize {
+    if (llm.onMsgEdge(buf, off)) return off;
+    const edge = llm.nextMsgEdge(buf, off);
+    std.log.warn("chat: a cut at byte {d} fell inside a message; moved to the next message edge at {d} (a rewrite moved the buffer under a saved offset)", .{ off, edge });
+    emitKV(app, conv_dir, "status", "text", "engine: a fold boundary fell inside a message (a stale offset) - moved it to the next message edge instead of cutting the message open");
+    return edge;
+}
+
+/// THE BUFFER IS CHECKED BEFORE IT IS SENT. Every inference uploads conv_buf, and the engine writes every byte of it,
+/// so a message that does not parse is always the engine's own bug - a rewrite, a cut, a splice - and never the
+/// model's. The provider used to be the first to notice (a 400 on every call), and llm.zig's heal then sent a body
+/// cut down to the intact prefix while conv_buf itself stayed broken, so every later call paid the 400 again and
+/// answered from that prefix: conv cf5c78765 spent ~70 calls and 1.36M input tokens restarting a task whose plan
+/// board meanwhile ticked three steps done with nothing written. Here the broken messages are dropped from conv_buf
+/// ITSELF (llm.mendMessages: every other message kept, tool rounds whole, invalid UTF-8 repaired rather than
+/// dropped), once, loudly, and the pass's base follows the drop. false: no message parses - the caller ends the
+/// pass with an error rather than send a conversation it no longer has.
+fn mendBeforeSend(app: *App, conv_dir: []const u8, run_root: []const u8, conv_buf: *std.ArrayListUnmanaged(u8), base_len: *usize) bool {
+    const gpa = app.gpa;
+    const base_msgs = llm.msgCount(conv_buf.items[0..llm.nextMsgEdge(conv_buf.items, base_len.*)]);
+    const m = (llm.mendMessages(gpa, conv_buf.items, base_msgs) catch |e| switch (e) {
+        error.Irreparable => return false,
+        error.OutOfMemory => return true, // cannot check: send it as it is - the provider's heal is still behind it
+    }) orelse return true;
+    if (m.dropped > 0) llm.dumpMalformed(app.io, run_root, "context", conv_buf.items, m.first_drop);
+    const before = conv_buf.items.len;
+    conv_buf.deinit(gpa);
+    conv_buf.* = .fromOwnedSlice(m.buf);
+    base_len.* = llm.msgEdge(conv_buf.items, m.edge_msgs);
+    var sb: [240]u8 = undefined;
+    if (m.dropped == 0) {
+        std.log.warn("chat: {d} message(s) of the working context held invalid UTF-8; replaced the bad bytes before sending", .{m.scrubbed});
+        emitKV(app, conv_dir, "trace", "text", std.fmt.bufPrint(&sb, "the working context held invalid UTF-8 in {d} message(s): replaced the bad bytes before sending", .{m.scrubbed}) catch "the working context held invalid UTF-8: replaced the bad bytes before sending");
+        return true;
+    }
+    std.log.warn("chat: the working context had {d} unparsable message(s) (an engine rewrite broke them); dropped them, {d} -> {d} bytes, before sending", .{ m.dropped, before, conv_buf.items.len });
+    emitKV(app, conv_dir, "status", "text", std.fmt.bufPrint(&sb, "engine: the working context had {d} broken message(s) (an engine bug) - dropped them and kept the rest before sending", .{m.dropped}) catch "engine: the working context had broken messages (an engine bug) - dropped them and kept the rest before sending");
+    return true;
+}
+
+test "a broken working context is mended before it is sent, a stale cut moves to an edge, a moved prefix is followed (conv cf5c78765)" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-mendsend-tmp";
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    var ta = try http.testApp(gpa, io, root);
+    defer ta.deinit();
+    const conv_dir = root ++ "/conv";
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, conv_dir, .default_dir) catch {};
+
+    // The incident's buffer after the stale fold: the brief cut open 23 bytes short, the net note spliced on.
+    const sys = "{\"role\":\"system\",\"content\":\"sys\"}";
+    const brief_cut = ",{\"role\":\"system\",\"content\":\"TURN BRIEF ... PHP, Composer, or a d";
+    const note = ",{\"role\":\"assistant\",\"content\":\"CONTINUATION (Gary's 4tope)\"}";
+    const step = ",{\"role\":\"user\",\"content\":\"subtask 4\"}";
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(gpa);
+    try buf.appendSlice(gpa, sys ++ brief_cut ++ note ++ step);
+    var base: usize = (sys ++ brief_cut ++ note).len; // the pass's base, after the note
+    try std.testing.expect(mendBeforeSend(&ta.app, conv_dir, conv_dir, &buf, &base));
+    // only the broken brief went: the note and the subtask after it are still there, and the base followed
+    try std.testing.expectEqualStrings(sys ++ note ++ step, buf.items);
+    try std.testing.expectEqual((sys ++ note).len, base);
+    // a clean buffer goes out untouched
+    try std.testing.expect(mendBeforeSend(&ta.app, conv_dir, conv_dir, &buf, &base));
+    try std.testing.expectEqualStrings(sys ++ note ++ step, buf.items);
+    // nothing parses: refused, so the pass stops instead of sending
+    var bad: std.ArrayListUnmanaged(u8) = .empty;
+    defer bad.deinit(gpa);
+    try bad.appendSlice(gpa, "{\"role\":\"user\",\"content\":\"x");
+    var b0: usize = 0;
+    try std.testing.expect(!mendBeforeSend(&ta.app, conv_dir, conv_dir, &bad, &b0));
+
+    // cutEdge: an edge stays, an offset inside a message moves to the next edge
+    const s = sys ++ note ++ step;
+    try std.testing.expectEqual(sys.len, cutEdge(&ta.app, conv_dir, s, sys.len));
+    try std.testing.expectEqual((sys ++ note).len, cutEdge(&ta.app, conv_dir, s, sys.len + 5));
+    // followFreeze: a stale offset is re-read from the message count
+    var len: usize = sys.len - 3;
+    followFreeze(&ta.app, conv_dir, s, 1, &len);
+    try std.testing.expectEqual(sys.len, len);
+
+    // every catch said so where the user and the trace read it
+    const ev = std.Io.Dir.cwd().readFileAlloc(io, conv_dir ++ "/events.jsonl", gpa, .limited(64 << 10)) catch return error.TestUnexpectedResult;
+    defer gpa.free(ev);
+    try std.testing.expect(std.mem.indexOf(u8, ev, "dropped them and kept the rest") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ev, "fell inside a message") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ev, "the assembled prefix moved") != null);
+}
+
 /// If this pass's working growth (everything appended after `base_len`) exceeds the budget, first PRUNE the stale
 /// tool results older than the kept tail (pruneToolResults — no model call; on a wide window that alone usually
 /// brings the span back under budget) and, only if it is still over, replace the OLDER part with a single
@@ -14843,7 +14965,9 @@ fn foldSpanByNet(gpa: std.mem.Allocator, span: []const u8, keep_tail: usize, har
 /// protocol-valid (no dangling tool_calls). When no safe splice point exists the span is left alone, or folded
 /// whole past WORKING_HARD_FOLD_BYTES — see the two constants for both cases.
 /// Best-effort: a failed summary leaves the buffer as-is (the MAX_ITERS cap still bounds the pass).
-fn compactWorking(app: *App, conv_dir: []const u8, run_root: []const u8, base_url: []const u8, key: []const u8, model: []const u8, conv_buf: *std.ArrayListUnmanaged(u8), base_len: usize, ctx: *tools.ToolCtx, tool_obs: *std.ArrayListUnmanaged([]u8), budget: usize) void {
+/// A `base_in` that is not a turn edge is never cut at: cutEdge moves it to the next edge and says so.
+fn compactWorking(app: *App, conv_dir: []const u8, run_root: []const u8, base_url: []const u8, key: []const u8, model: []const u8, conv_buf: *std.ArrayListUnmanaged(u8), base_in: usize, ctx: *tools.ToolCtx, tool_obs: *std.ArrayListUnmanaged([]u8), budget: usize) void {
+    const base_len = cutEdge(app, conv_dir, conv_buf.items, base_in);
     if (conv_buf.items.len <= base_len or conv_buf.items.len - base_len <= budget) return;
     // The tail kept verbatim must be SMALLER than the trigger, or a fold cannot shrink the span. At the
     // stock 24 KB trigger / 32 KB tail it never did: folding only really began at 32 KB. That slack is
