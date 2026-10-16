@@ -17,12 +17,22 @@ Windows · macOS · Linux · [MIT app code and AGPL security runtime](#license).
 hosted providers have their own data handling and costs. The built-in model requires a separate
 download, and coding tools require Python on `PATH` (some checks also use Node).
 
-### Stable release: v1.1.20
+### Stable release: v1.1.21
 
-v1.1.20 builds on v1.1.16; v1.1.17 and v1.1.18 were withdrawn before publication. If you
-installed either, download and run the [v1.1.20 bundle](https://github.com/gary23w/nl-veil/releases/tag/v1.1.20).
+v1.1.21 builds on v1.1.16; v1.1.17 and v1.1.18 were withdrawn before publication. If you
+installed either, download and run the [v1.1.21 bundle](https://github.com/gary23w/nl-veil/releases/tag/v1.1.21).
 In chat, `NL_TOOL_MAP=1` enables the tool tree; Gary's 4tope is enabled by default. Taters use
 both on their own.
+
+### New in v1.1.21
+
+A veil started while another one already holds its port (another install, or a veil that is still
+quitting) no longer opens onto "server down". It waits a few seconds for the port, then takes the
+next free one and its window follows it. Cloudflare's login says plainly when it cannot finish on
+the new port. Settings › Models has a **Use Cloudflare Workers AI (default)** box: logging in with
+Cloudflare turns it on, and the page then shows just the model and the login. On Windows, the
+[Microsoft Store version](https://apps.microsoft.com/detail/9MVQ78SK0CW6) installs with no
+SmartScreen prompt. [Release notes](docs/release/RELEASE-v1.1.21.md).
 
 ### New in v1.1.20
 
@@ -126,7 +136,7 @@ code and credentials from anything you share.
 
 <p>
   <a href="https://github.com/gary23w/nl-veil/actions/workflows/release.yml"><img alt="build" src="https://github.com/gary23w/nl-veil/actions/workflows/release.yml/badge.svg"></a>
-  <a href="https://github.com/gary23w/nl-veil/releases"><img alt="release" src="https://img.shields.io/badge/release-v1.1.20-A8241B"></a>
+  <a href="https://github.com/gary23w/nl-veil/releases"><img alt="release" src="https://img.shields.io/badge/release-v1.1.21-A8241B"></a>
   <img alt="zig" src="https://img.shields.io/badge/zig-0.16-F7A41D?logo=zig&logoColor=white">
   <a href="https://huggingface.co/gary23w/the-veil-12b"><img alt="built-in model" src="https://img.shields.io/badge/built--in%20model-the--veil--12b-6E4A27?logo=huggingface&logoColor=white"></a>
   <a href="https://huggingface.co/gary23w/gary-neuron-emergent"><img alt="memory cortex" src="https://img.shields.io/badge/cortex-gary--neuron--emergent-6E4A27?logo=huggingface&logoColor=white"></a>
@@ -625,7 +635,7 @@ raylib is a *lazy* dependency, so `-Dapp=false` never fetches it at all.
 ## Install
 
 **Download it and run it — no toolchain, nothing to build.** Grab your platform's bundle from the
-**[latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.1.20)**, unzip, and run `veil`:
+**[latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.1.21)**, unzip, and run `veil`:
 
 | You're on | Download | Then run |
 |---|---|---|
@@ -787,7 +797,7 @@ step 5** — the rest is about letting other people in.
 
 ### 1. Download and unblock it
 
-Grab the bundle for your OS from the [latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.1.20)
+Grab the bundle for your OS from the [latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.1.21)
 and unzip it somewhere you'll find again. Builds are unsigned, so:
 
 - **Windows** shows *"Windows protected your PC"* → **More info** → **Run anyway**. The
@@ -824,7 +834,7 @@ On startup the server prints one complete URL per address this machine answers o
 (`src/main.zig:861-889`, using `src/config/lan.zig`):
 
 ```
-neuron-loops 1.1.20 on http://localhost:8787
+neuron-loops 1.1.21 on http://localhost:8787
     open from another machine (phone, laptop) at:
       http://192.168.1.42:8787
 ```
@@ -1716,7 +1726,13 @@ dependency entirely rather than compiling it unused.
 
 ## Release
 
-**Current: [`v1.1.20`](https://github.com/gary23w/nl-veil/releases/tag/v1.1.20)** — **Taters**:
+**Current: [`v1.1.21`](https://github.com/gary23w/nl-veil/releases/tag/v1.1.21)** — a veil whose port is taken finds a free one
+and its window follows it, instead of opening onto "server down"; the Cloudflare login says when it
+cannot finish there. Settings › Models gains a Cloudflare Workers AI default that a Cloudflare login
+turns on, and Windows users can install from the Microsoft Store with no SmartScreen prompt.
+[Full notes](docs/release/RELEASE-v1.1.21.md).
+
+**Previously: [`v1.1.20`](https://github.com/gary23w/nl-veil/releases/tag/v1.1.20)** — **Taters**:
 tater-tots walk a belt of hundreds of tools as a map, fold a long step with Gary's 4tope instead of
 cutting it, and learn and heal each model's quirks; a runtime edit can always be reverted, and a
 newer veil's runtime reaches a running account as a revision. Agent Garrett connects through its
