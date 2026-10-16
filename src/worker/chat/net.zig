@@ -59,7 +59,9 @@ pub const Node = struct {
     /// a result's tool name and (unescaped, clipped) arguments; "" otherwise
     name: []const u8 = "",
     args: []const u8 = "",
-    /// the message content, unescaped, one line, clipped to EXCERPT_MAX
+    /// the message content, unescaped, one line: a result's PAYLOAD (payloadOf) kept head and tail to RESULT_KEEP,
+    /// a step's or note's words to NEXT_MAX. The net renders a result at this length only when it is on the
+    /// critical chain; everything else is clipped to EXCERPT_MAX at render time (see `shown`).
     text: []const u8 = "",
     /// the round (step index) this message belongs to
     round: u32 = 0,
@@ -68,13 +70,40 @@ pub const Node = struct {
     dead: bool = false,
     /// bytes this message occupies in the span (for the budget)
     bytes: usize = 0,
+    /// byte offset of this message in the span it was read from, so a caller folding a span can say which nodes
+    /// sit in the tail it keeps verbatim (Opts.tail_from)
+    at: usize = 0,
 };
 
-/// How much of one message the net carries. Enough for a path and the line that matters; a 10 KB file read is a
-/// stub pointing at a file the next segment can read again.
+/// How much of one message the net carries when it is NOT on the critical chain. Enough for a path and the line
+/// that matters; a 10 KB file read the frontier never leaned on is a stub pointing at a file the next segment can
+/// read again.
 pub const EXCERPT_MAX: usize = 240;
 /// ...and of the frontier's last words, which are the one thing worth more room.
 pub const NEXT_MAX: usize = 700;
+/// How much of a result the graph KEEPS, and the critical chain carries: head and tail, one line. 240 bytes was
+/// the whole allowance before this existed, and on the first long chat it was measured against (conv c477179e8,
+/// 2026-10-14) every ESTABLISHED line was the first 240 bytes of a shell tool's JSON envelope — cursor, done_by,
+/// an empty output field — and none of the output the model had actually read. The tots keep a chain result to
+/// 3000 (cloud/tot.js PROTECT_MAX); the same figure here.
+pub const RESULT_KEEP: usize = 3000;
+/// How much of a raw result is unescaped to find its payload. Results append to the span elided past
+/// TOOL_RESULT_KEEP (10 KB), so this reads a whole one.
+const RESULT_SCAN: usize = 16 * 1024;
+/// How much of an earlier fold's note or carry row earlierLines reads.
+const EARLIER_SCAN: usize = 64 * 1024;
+
+/// What introduces the fold note compactWorking writes by the net (the engine's counterpart of cloud/tot.js
+/// NET_HEAD): the note is an assistant message in the span, so it must say what it is — an engine layout of tool
+/// results, not the assistant's own words — and earlierLines finds a previous fold by this head.
+pub const NET_NOTE_HEAD = "CONTINUATION (Gary's 4tope: the earlier rounds of this turn, laid out from where the work stands; every line below is verbatim from a tool result, so nothing here is a paraphrase):\n";
+/// The start of NET_NOTE_HEAD, as earlierLines matches it in the span's escaped bytes.
+pub const NET_MARK = "CONTINUATION (Gary's 4tope";
+/// What the engine's continuation row (the carry at the spend ceiling) always contains, so earlierLines finds a
+/// previous pass's carry the same way. The engine pins its header to this with a test.
+pub const CARRY_MARK = "CONTINUATION STATE";
+/// What introduces the lines an earlier fold or carry established, when a later net carries them on.
+pub const EARLIER_HEAD = "EARLIER (established by the fold or pass before this one; failed calls first):\n";
 /// Edge weights for the critical chain: a result the step demonstrably read, the step that issued a result, the
 /// model's own thread, and a previous-round result nothing points at.
 const W_USED: u8 = 2;
@@ -122,7 +151,7 @@ pub const Graph = struct {
             const obj = span[start..next];
             at = next;
             const role = jsonStr(obj, "role");
-            var n: Node = .{ .kind = .engine, .bytes = obj.len };
+            var n: Node = .{ .kind = .engine, .bytes = obj.len, .at = start };
             if (std.mem.eql(u8, role, "user")) {
                 n.kind = .user;
                 n.text = try excerpt(a, jsonStr(obj, "content"), EXCERPT_MAX);
@@ -143,7 +172,7 @@ pub const Graph = struct {
                 n.kind = .result;
                 n.id = try a.dupe(u8, jsonStr(obj, "tool_call_id"));
                 const raw = jsonStr(obj, "content");
-                n.text = try excerpt(a, raw, EXCERPT_MAX);
+                n.text = try g.resultText(a, raw);
                 n.dead = looksDead(n.text);
                 n.round = round;
                 // name/args from the issuing step's call list
@@ -290,6 +319,26 @@ pub const Graph = struct {
     /// each derivation chain is one contiguous run and no node appears twice. `ground` is the engine's own file
     /// ledger (verbatim, clipped) for ON DISK. Empty when the span has nothing to carry. gpa-owned.
     pub fn unfold(g: *Graph, gpa: std.mem.Allocator, budget: usize, ground: []const u8) ![]u8 {
+        return g.unfoldWith(gpa, budget, ground, .{});
+    }
+
+    /// How a net is unfolded beyond the defaults: the tail a fold keeps verbatim, what introduces the frontier's
+    /// words, and the lines an earlier fold or carry established.
+    pub const Opts = struct {
+        /// nodes from this index on are the caller's verbatim tail: never carried (they ride whole after the
+        /// note), still part of the distances the rest is chosen by
+        tail_from: u32 = NONE,
+        /// what introduces the frontier's own last words
+        next_label: []const u8 = "NEXT (the frontier, in its own last words): ",
+        /// earlierLines of the span this unfolds, carried under EARLIER inside the budget (at most a third of it,
+        /// whole lines) — what cloud/tot.js carries the same way, so a second fold or a later pass keeps what the
+        /// first established instead of knowing only its own rounds
+        earlier: []const u8 = "",
+    };
+
+    /// unfold with Opts. The critical chain's results render at RESULT_KEEP (what the frontier rests on is the
+    /// part worth bytes); every other result is clipped to EXCERPT_MAX with a "..." mark.
+    pub fn unfoldWith(g: *Graph, gpa: std.mem.Allocator, budget: usize, ground: []const u8, opts: Opts) ![]u8 {
         var out: std.ArrayListUnmanaged(u8) = .empty;
         errdefer out.deinit(gpa);
         if (g.frontier == NONE or budget < 200) return out.toOwnedSlice(gpa);
@@ -318,10 +367,21 @@ pub const Graph = struct {
             for (g.nodes.items[u].deps.items) |d| g.relax(dist, parent, u, d.to, d.w);
             for (g.nodes.items, 0..) |node, i| for (node.deps.items) |d| if (d.to == u) g.relax(dist, parent, u, @intCast(i), d.w);
         }
-        // SELECT in distance order under the budget: NEXT and ON DISK are reserved first (NEXT gets at most a
-        // third, ON DISK a quarter, and the section headers their room)
+        // THE CRITICAL CHAIN rides at length; everything else is an excerpt
+        const on_chain = try gpa.alloc(bool, n);
+        defer gpa.free(on_chain);
+        @memset(on_chain, false);
+        {
+            const chain = try g.criticalChain(gpa);
+            defer gpa.free(chain);
+            for (chain) |i| on_chain[i] = true;
+        }
+        // SELECT in distance order under the budget: NEXT, ON DISK and EARLIER are reserved first (NEXT gets at
+        // most a third, ON DISK a quarter, EARLIER a third, and the section headers their room)
         const next_text = clipWords(g.nodes.items[g.frontier].text, @max(80, budget / 3));
-        var spent: usize = next_text.len + 64 + @min(ground.len, budget / 4) + 200;
+        const earlier = clipLines(opts.earlier, budget / 3);
+        var spent: usize = opts.next_label.len + next_text.len + 8 + @min(ground.len, budget / 4) + 200;
+        if (earlier.len > 0) spent += EARLIER_HEAD.len + earlier.len + 1;
         const chosen = try gpa.alloc(bool, n);
         defer gpa.free(chosen);
         @memset(chosen, false);
@@ -337,19 +397,24 @@ pub const Graph = struct {
         for (order) |i| {
             if (dist[i] == std.math.maxInt(u32)) break;
             const node = g.nodes.items[i];
+            // the caller's verbatim tail rides whole after the note: never carried twice
+            if (i >= opts.tail_from) continue;
             // steps are the model's narration — their decisions show in what they then called, and the
-            // frontier's own words are NEXT; a note rides only when it is a distillation (a fold note)
+            // frontier's own words are NEXT; a note rides only when it is a distillation (a fold note), and a
+            // note the net itself wrote is carried by earlierLines, never as a node
             if (i == g.frontier or node.kind == .user or node.kind == .engine or node.kind == .step or node.superseded) continue;
-            if (node.kind == .note and !isDistillation(node.text)) continue;
+            if (node.kind == .note and (!isDistillation(node.text) or isNetNote(node.text))) continue;
             if (node.kind == .result and node.text.len == 0) continue;
-            const cost = node.text.len + node.name.len + node.args.len + 24;
+            const s = shown(node, on_chain[i]);
+            const cost = s.text.len + @as(usize, if (s.more) 3 else 0) + node.name.len + node.args.len + 24;
             if (spent + cost > budget) continue;
             spent += cost;
             chosen[i] = true;
         }
         // LAY OUT: NEXT (the frontier's own words), ON DISK, RULED OUT (dead ends, nearest first), then
-        // ESTABLISHED in shortest-path-tree order — a depth-first walk from the frontier, children by distance
-        try out.appendSlice(gpa, "NEXT (the frontier, in its own last words): ");
+        // ESTABLISHED in shortest-path-tree order — a depth-first walk from the frontier, children by distance —
+        // and EARLIER last
+        try out.appendSlice(gpa, opts.next_label);
         if (next_text.len > 0) {
             try out.appendSlice(gpa, next_text);
         } else if (g.lastCallsOf(g.frontier)) |calls| {
@@ -368,7 +433,7 @@ pub const Graph = struct {
         for (order) |i| if (chosen[i] and g.nodes.items[i].dead) {
             if (!any_dead) try out.appendSlice(gpa, "RULED OUT (calls that failed; do not repeat them as they were):\n");
             any_dead = true;
-            try g.line(gpa, &out, i);
+            try g.line(gpa, &out, i, on_chain[i]);
         };
         var any_est = false;
         var stack: std.ArrayListUnmanaged(u32) = .empty;
@@ -384,7 +449,7 @@ pub const Graph = struct {
             if (chosen[u] and !g.nodes.items[u].dead) {
                 if (!any_est) try out.appendSlice(gpa, "ESTABLISHED (what the frontier rests on, nearest first, each derivation contiguous):\n");
                 any_est = true;
-                try g.line(gpa, &out, u);
+                try g.line(gpa, &out, u, on_chain[u]);
             }
             // children in the SPT: nodes whose parent is u; push farthest first so the nearest is walked first
             var kids: [64]u32 = undefined;
@@ -399,6 +464,11 @@ pub const Graph = struct {
                 }
             }.farFirst);
             for (kids[0..nk]) |k| try stack.append(gpa, k);
+        }
+        if (earlier.len > 0) {
+            try out.appendSlice(gpa, EARLIER_HEAD);
+            try out.appendSlice(gpa, earlier);
+            try out.append(gpa, '\n');
         }
         return out.toOwnedSlice(gpa);
     }
@@ -416,14 +486,17 @@ pub const Graph = struct {
         }
     }
 
-    fn line(g: *const Graph, gpa: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), i: u32) !void {
+    /// One carried node as a line; a result `full` (the critical chain) renders all it kept, else an excerpt.
+    fn line(g: *const Graph, gpa: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), i: u32, full: bool) !void {
         const node = g.nodes.items[i];
         switch (node.kind) {
             .result => {
                 try out.print(gpa, "- r{d} {s}", .{ node.round, if (node.name.len > 0) node.name else "tool" });
                 if (node.args.len > 0) try out.print(gpa, " {s}", .{node.args});
                 try out.appendSlice(gpa, if (node.dead) " -> " else ": ");
-                try out.appendSlice(gpa, node.text);
+                const s = shown(node, full);
+                try out.appendSlice(gpa, s.text);
+                if (s.more) try out.appendSlice(gpa, "...");
                 try out.append(gpa, '\n');
             },
             .step, .note => {
@@ -431,6 +504,20 @@ pub const Graph = struct {
             },
             else => {},
         }
+    }
+
+    /// A result's text for the graph: its payload (payloadOf), unescaped, one line, head and tail to RESULT_KEEP.
+    /// The whole result is unescaped into scratch (g.gpa) to find the payload; only what is kept lands in the
+    /// arena, so a span of a hundred 10 KB results costs the graph three hundred KB, not a megabyte.
+    fn resultText(g: *Graph, a: std.mem.Allocator, raw: []const u8) ![]const u8 {
+        const full = try unescapeAlloc(g.gpa, raw, RESULT_SCAN, false);
+        defer g.gpa.free(full);
+        const pay = payloadOf(full);
+        if (pay.ptr == full.ptr and pay.len == full.len) return try keepEnds(a, full, RESULT_KEEP);
+        // the payload is a JSON string VALUE inside the result: one more level of escaping to strip
+        const inner = try unescapeAlloc(g.gpa, pay, RESULT_SCAN, false);
+        defer g.gpa.free(inner);
+        return try keepEnds(a, inner, RESULT_KEEP);
     }
 
     /// "name args, name args" for the calls a step issued, or null.
@@ -547,17 +634,22 @@ pub fn jsonStr(obj: []const u8, key: []const u8) []const u8 {
     return "";
 }
 
-/// Unescape a raw JSON string into the arena as ONE line, clipped to `max` at a word boundary when it is longer.
-fn excerpt(a: std.mem.Allocator, raw: []const u8, max: usize) ![]const u8 {
+/// Unescape a raw JSON string as the span holds it, into an `a`-owned buffer of at most `max` bytes: `\r` and
+/// `\t` become one space, `\n` too unless `newlines` keeps it, `\uXXXX` a '?', every other escape the character
+/// it escapes; runs of spaces collapse and a leading space is dropped. The first `max` bytes of the string, so
+/// a clipped result is an honest head.
+fn unescapeAlloc(a: std.mem.Allocator, raw: []const u8, max: usize, newlines: bool) ![]u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(a);
     var i: usize = 0;
     var last_space = false;
-    while (i < raw.len and out.items.len < max + 1) : (i += 1) {
+    while (i < raw.len and out.items.len < max) : (i += 1) {
         var c = raw[i];
         if (c == '\\' and i + 1 < raw.len) {
             i += 1;
             switch (raw[i]) {
-                'n', 't', 'r' => c = ' ',
+                'n' => c = if (newlines) '\n' else ' ',
+                't', 'r' => c = ' ',
                 'u' => {
                     c = '?';
                     i += @min(4, raw.len - i - 1);
@@ -571,7 +663,12 @@ fn excerpt(a: std.mem.Allocator, raw: []const u8, max: usize) ![]const u8 {
         } else last_space = false;
         try out.append(a, c);
     }
-    var s = out.items;
+    return out.toOwnedSlice(a);
+}
+
+/// Unescape a raw JSON string into the arena as ONE line, clipped to `max` at a word boundary when it is longer.
+fn excerpt(a: std.mem.Allocator, raw: []const u8, max: usize) ![]const u8 {
+    var s: []u8 = try unescapeAlloc(a, raw, max + 1, false);
     if (s.len > max) {
         var k = max;
         while (k > 0 and (s[k] & 0xC0) == 0x80) k -= 1;
@@ -597,6 +694,147 @@ fn clipWords(s: []const u8, max: usize) []const u8 {
     if (c.len == s.len) return c;
     const sp = std.mem.lastIndexOfScalar(u8, c, ' ') orelse return c;
     return if (sp > max / 2) c[0..sp] else c;
+}
+
+/// Whole lines of `s` under `max` bytes: the cut lands on a line boundary, so a clipped list never ends mid-line;
+/// nothing when not even the first line fits.
+fn clipLines(s: []const u8, max: usize) []const u8 {
+    if (s.len <= max) return s;
+    const c = clip(s, max);
+    const nl = std.mem.lastIndexOfScalar(u8, c, '\n') orelse return "";
+    return c[0..nl];
+}
+
+/// What a node renders as: all it kept when `full` (the critical chain), else clipped to EXCERPT_MAX at a word,
+/// with `more` saying a "..." mark belongs after it.
+const Shown = struct { text: []const u8, more: bool };
+fn shown(node: Node, full: bool) Shown {
+    if (full or node.text.len <= EXCERPT_MAX) return .{ .text = node.text, .more = false };
+    return .{ .text = clipWords(node.text, EXCERPT_MAX), .more = true };
+}
+
+/// A fold note the net itself wrote (NET_NOTE_HEAD). Never carried as a node: earlierLines carries its lines.
+fn isNetNote(text: []const u8) bool {
+    return std.mem.startsWith(u8, text, NET_MARK);
+}
+
+/// `s` whole when it fits `max`, else its head (two thirds) and tail (the rest) around an elision mark — the
+/// shape cloud/tot.js resultExcerpt gives the tots. A command's output keeps its first lines and its last ones,
+/// which is where a result says what happened. `a`-owned.
+fn keepEnds(a: std.mem.Allocator, s: []const u8, max: usize) ![]const u8 {
+    if (s.len <= max) return try a.dupe(u8, s);
+    const head = clip(s, max * 2 / 3);
+    var tail_start = s.len - (max - head.len);
+    while (tail_start < s.len and (s[tail_start] & 0xC0) == 0x80) tail_start += 1;
+    return try std.fmt.allocPrint(a, "{s} ...(middle omitted)... {s}", .{ std.mem.trimEnd(u8, head, " "), std.mem.trimStart(u8, s[tail_start..], " ") });
+}
+
+/// Keys a tool's envelope carries its payload under; one of these wins over an unknown key of similar size.
+fn isPayloadKey(key: []const u8) bool {
+    const keys = [_][]const u8{ "output", "stdout", "stderr", "content", "text", "body", "result", "data", "message", "error", "html", "markdown", "answer" };
+    for (keys) |k| if (std.ascii.eqlIgnoreCase(k, key)) return true;
+    return false;
+}
+
+/// The part of a result worth carrying. A tool that answers with a JSON envelope — Agent Garrett's shell tools
+/// answer {"cursor":..,"output":"...","running":..} inside an EVIDENCE wrapper — keeps what the model actually
+/// read in ONE string field, and the first bytes of such a result are all envelope. The longest string value is
+/// the payload when it is at least half the result, or at least a quarter of it under a payload key
+/// (isPayloadKey); anything else — prose, an error line, a listing whose strings are all short — is carried as
+/// it is. The value comes back still escaped as the JSON string it is: the caller unescapes it once more.
+pub fn payloadOf(text: []const u8) []const u8 {
+    const t = std.mem.trimStart(u8, text, " \t");
+    if (t.len < 24 or (t[0] != '{' and t[0] != '[')) return text;
+    var best: []const u8 = "";
+    var best_known = false;
+    var i: usize = 0;
+    while (i + 3 < t.len) : (i += 1) {
+        if (t[i] != '"') continue;
+        // a string: a key when ':' follows its closing quote, a value otherwise
+        const ks = i + 1;
+        var ke = ks;
+        while (ke < t.len and t[ke] != '"') : (ke += 1) {
+            if (t[ke] == '\\') ke += 1;
+        }
+        if (ke >= t.len) break;
+        var j = ke + 1;
+        while (j < t.len and t[j] == ' ') j += 1;
+        if (j >= t.len or t[j] != ':') {
+            i = ke; // a value or a stray string: step past it whole
+            continue;
+        }
+        j += 1;
+        while (j < t.len and t[j] == ' ') j += 1;
+        if (j >= t.len or t[j] != '"') {
+            i = ke; // a number, a bool, a nested object or array: walk on into it
+            continue;
+        }
+        const vs = j + 1;
+        var ve = vs;
+        while (ve < t.len and t[ve] != '"') : (ve += 1) {
+            if (t[ve] == '\\') ve += 1;
+        }
+        const val = t[vs..@min(ve, t.len)];
+        const known = isPayloadKey(t[ks..ke]);
+        if (val.len > best.len or (known and !best_known and val.len * 4 >= best.len)) {
+            best = val;
+            best_known = known;
+        }
+        i = @min(ve, t.len - 1);
+    }
+    if (best.len * 2 >= t.len or (best_known and best.len * 4 >= t.len)) return best;
+    return text;
+}
+
+/// What an earlier fold or carry in `span` established and ruled out, verbatim: every "- r" line of every net
+/// note (NET_MARK) and continuation row (CARRY_MARK) in the span — assistant and system messages only — the
+/// failed calls ("->") first, each line once, whole lines under `budget`. This is how a second fold keeps what
+/// the first one carried and a later pass keeps what an earlier pass carried (cloud/tot.js earlierLines): the
+/// net itself never selects a net note or an engine row as a node. gpa-owned; empty when the span holds none.
+pub fn earlierLines(gpa: std.mem.Allocator, span: []const u8, budget: usize) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(gpa);
+    if (budget < 16) return out.toOwnedSlice(gpa);
+    var dead: std.ArrayListUnmanaged([]u8) = .empty;
+    var live: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (dead.items) |l| gpa.free(l);
+        for (live.items) |l| gpa.free(l);
+        dead.deinit(gpa);
+        live.deinit(gpa);
+    }
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    defer seen.deinit(gpa);
+    const marker = "{\"role\":\"";
+    var at: usize = 0;
+    while (std.mem.indexOfPos(u8, span, at, marker)) |start| {
+        const next = std.mem.indexOfPos(u8, span, start + marker.len, "," ++ marker) orelse span.len;
+        const obj = span[start..next];
+        at = next;
+        const role = jsonStr(obj, "role");
+        if (!std.mem.eql(u8, role, "assistant") and !std.mem.eql(u8, role, "system")) continue;
+        const raw = jsonStr(obj, "content");
+        if (std.mem.indexOf(u8, raw, NET_MARK) == null and std.mem.indexOf(u8, raw, CARRY_MARK) == null) continue;
+        const text = try unescapeAlloc(gpa, raw, EARLIER_SCAN, true);
+        defer gpa.free(text);
+        var it = std.mem.splitScalar(u8, text, '\n');
+        while (it.next()) |l| {
+            const line = std.mem.trimEnd(u8, l, " \r");
+            if (!std.mem.startsWith(u8, line, "- r")) continue;
+            if (seen.contains(line)) continue;
+            const owned = try gpa.dupe(u8, line);
+            errdefer gpa.free(owned);
+            try seen.put(gpa, owned, {});
+            if (std.mem.indexOf(u8, line, " -> ") != null) try dead.append(gpa, owned) else try live.append(gpa, owned);
+        }
+    }
+    for ([_][]const []u8{ dead.items, live.items }) |group| for (group) |l| {
+        const sep: usize = if (out.items.len > 0) 1 else 0;
+        if (out.items.len + sep + l.len > budget) break;
+        if (sep == 1) try out.append(gpa, '\n');
+        try out.appendSlice(gpa, l);
+    };
+    return out.toOwnedSlice(gpa);
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -787,4 +1025,118 @@ test "the readers: raw JSON strings, failure shapes, distinctive tokens" {
     try tt.expectEqualStrings("one two", try excerpt(arena.allocator(), "one\\n\\n  two", 100));
     const cut = try excerpt(arena.allocator(), "alpha beta gamma delta epsilon", 14);
     try tt.expectEqualStrings("alpha beta...", cut);
+}
+
+test "payloadOf and keepEnds: an envelope's payload, a known key over an unknown one, prose untouched, both ends kept" {
+    try tt.expectEqualStrings("hello there world", payloadOf("{\"ok\":true,\"output\":\"hello there world\",\"n\":1}"));
+    // an envelope whose strings are all short is carried whole: a listing is not its longest filename
+    const listing = "{\"files\":[\"a.zig\",\"b.zig\",\"c.zig\"],\"dir\":\"src\"}";
+    try tt.expectEqualStrings(listing, payloadOf(listing));
+    // a payload key wins over an unknown key of similar size
+    try tt.expectEqualStrings("the real output text here", payloadOf("{\"evidenceBasis\":\"tool-reported medium confidence\",\"output\":\"the real output text here\"}"));
+    try tt.expectEqualStrings("plain prose, not JSON", payloadOf("plain prose, not JSON"));
+    try tt.expectEqualStrings("ERROR: 2 tests failed", payloadOf("ERROR: 2 tests failed"));
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const long = "0123456789" ** 40;
+    const kept = try keepEnds(arena.allocator(), long, 100);
+    try tt.expect(kept.len <= 100 + 30);
+    try tt.expect(std.mem.startsWith(u8, kept, "0123456789"));
+    try tt.expect(std.mem.endsWith(u8, kept, "0123456789"));
+    try tt.expect(std.mem.indexOf(u8, kept, "middle omitted") != null);
+    try tt.expectEqualStrings("short", try keepEnds(arena.allocator(), "short", 100));
+}
+
+test "a result carries its payload, not its envelope, and the critical chain carries it at length" {
+    const gpa = tt.allocator;
+    // the envelope Agent Garrett's shell tools answer with (conv c477179e8, 2026-10-14), as the span holds it: the
+    // result is a JSON string whose content is itself JSON, so its quotes are escaped once more
+    const listing = "total 3 notes.md 2200 bytes README.md 120 bytes install.sh 90 bytes ";
+    const out_field = listing ** 12;
+    var s: std.ArrayListUnmanaged(u8) = .empty;
+    defer s.deinit(gpa);
+    var b1: [256]u8 = undefined;
+    var b2: [256]u8 = undefined;
+    var b3: [256]u8 = undefined;
+    var b4: [256]u8 = undefined;
+    var b23: [512]u8 = undefined;
+    try tStep(&s, gpa, "Listing the workspace first.", tCall("c1", "security_gary_shell_read", "{\\\"session_id\\\":\\\"sh_1\\\"}", &b1));
+    try s.print(gpa, ",{{\"role\":\"tool\",\"tool_call_id\":\"c1\",\"content\":\"{{\\\"cursor\\\":8729,\\\"done_by\\\":\\\"prompt\\\",\\\"omitted\\\":false,\\\"output\\\":\\\"{s}\\\",\\\"running\\\":false,\\\"session_id\\\":\\\"sh_1\\\"}} EVIDENCE: {{\\\"tool\\\":\\\"gary_shell_read\\\",\\\"confidence\\\":\\\"medium\\\"}}\"}}", .{out_field});
+    const readme = "README.md explains the install steps: run make install, then make check. " ** 10;
+    const config = "[server] port = 8787 name = veil tunnel = quick retention_days = 30 " ** 12;
+    const two = std.fmt.bufPrint(&b23, "{s},{s}", .{ tCall("c2", "read_file", "{\\\"path\\\":\\\"README.md\\\"}", &b2), tCall("c3", "read_file", "{\\\"path\\\":\\\"config.toml\\\"}", &b3) }) catch unreachable;
+    try tStep(&s, gpa, "notes.md is 2200 bytes; reading README.md and config.toml next.", two);
+    try tResult(&s, gpa, "c2", readme);
+    try tResult(&s, gpa, "c3", config);
+    try tStep(&s, gpa, "The install steps are make install then make check; writing summary.md.", tCall("c4", "write_file", "{\\\"path\\\":\\\"summary.md\\\"}", &b4));
+    try tResult(&s, gpa, "c4", "wrote summary.md (210 B)");
+    var g = try Graph.fromSpan(gpa, s.items);
+    defer g.deinit();
+    // the shell result's text is its OUTPUT, not the cursor/done_by envelope, and it is kept past 240 bytes
+    const r1 = g.nodes.items[1];
+    try tt.expect(std.mem.startsWith(u8, r1.text, "total 3 notes.md"));
+    try tt.expect(std.mem.indexOf(u8, r1.text, "cursor") == null);
+    try tt.expect(r1.text.len > EXCERPT_MAX);
+    // every node knows where it sits in the span (past the joining comma), so a fold can tell its kept tail apart
+    try tt.expectEqual(@as(usize, 1), g.nodes.items[0].at);
+    try tt.expect(r1.at > 1 and r1.at < g.nodes.items[2].at);
+    const net = try g.unfold(gpa, 6000, "");
+    defer gpa.free(net);
+    try tt.expect(net.len <= 6000);
+    // on the chain (the next step reused "notes.md", the frontier reused "install"): the whole listing and the
+    // whole README ride
+    try tt.expectEqual(@as(usize, 12), std.mem.count(u8, net, "install.sh 90 bytes"));
+    try tt.expectEqual(@as(usize, 10), std.mem.count(u8, net, "then make check."));
+    // off the chain: the config read nothing used is an excerpt with a mark
+    try tt.expect(std.mem.indexOf(u8, net, "retention_days") != null);
+    try tt.expect(std.mem.count(u8, net, "retention_days = 30") < 12);
+    try tt.expect(std.mem.indexOf(u8, net, "...\n") != null);
+}
+
+test "a fold keeps its tail out of the net, labels the frontier as asked, and carries EARLIER lines whole" {
+    const gpa = tt.allocator;
+    const span = try sampleSpan(gpa);
+    defer gpa.free(span);
+    var g = try Graph.fromSpan(gpa, span);
+    defer g.deinit();
+    // the last round (the frontier's step and its passing run) is the tail a fold keeps verbatim
+    const earlier = "- r0 fetch_json {\"url\":\"x\"} -> ERROR: 500\n- r0 read_file {\"path\":\"old.md\"}: old notes about the parser, the config file and the spec page";
+    const net = try g.unfoldWith(gpa, 2000, "", .{ .tail_from = g.frontier, .next_label = "LAST WORDS: ", .earlier = earlier });
+    defer gpa.free(net);
+    try tt.expect(std.mem.startsWith(u8, net, "LAST WORDS: Re-running the tests"));
+    try tt.expect(std.mem.indexOf(u8, net, "All 12 tests passed.") == null); // in the tail, so never carried twice
+    try tt.expect(std.mem.indexOf(u8, net, "r3 edit_file") != null); // before the tail: carried
+    try tt.expect(std.mem.indexOf(u8, net, EARLIER_HEAD) != null);
+    try tt.expect(std.mem.indexOf(u8, net, "- r0 fetch_json {\"url\":\"x\"} -> ERROR: 500\n- r0 read_file") != null);
+    // EARLIER is clipped to whole lines under a third of the budget, and the budget still holds
+    const tight = try g.unfoldWith(gpa, 300, "", .{ .earlier = earlier });
+    defer gpa.free(tight);
+    try tt.expect(tight.len <= 300);
+    try tt.expect(std.mem.indexOf(u8, tight, "-> ERROR: 500") != null);
+    try tt.expect(std.mem.indexOf(u8, tight, "old notes") == null);
+}
+
+test "earlierLines: a previous fold note and a previous pass's carry give up their lines, failures first, once each" {
+    const gpa = tt.allocator;
+    var s: std.ArrayListUnmanaged(u8) = .empty;
+    defer s.deinit(gpa);
+    // a fold note the net wrote (assistant), a user line that never counts, then a carry row (system) that
+    // restates one of the note's lines
+    try s.appendSlice(gpa, ",{\"role\":\"assistant\",\"content\":\"CONTINUATION (Gary's 4tope: the earlier rounds of this turn):\\nNEXT (the frontier, in its own last words): fixing it\\nESTABLISHED (what the frontier rests on):\\n- r2 read_file {\\\"path\\\":\\\"a.zig\\\"}: pub fn a() void\\nRULED OUT (calls that failed):\\n- r1 run_tests {} -> ERROR: 1 failed\"}");
+    try s.appendSlice(gpa, ",{\"role\":\"user\",\"content\":\"- r9 not_a_tool {} -> a user line never counts\"}");
+    try s.appendSlice(gpa, ",{\"role\":\"system\",\"content\":\"engine: the working context for this stretch was COMPACTED.\\n\\nCONTINUATION STATE - written by the engine\\nNEXT: run it\\nESTABLISHED:\\n- r2 read_file {\\\"path\\\":\\\"a.zig\\\"}: pub fn a() void\\n- r3 edit_file {\\\"path\\\":\\\"a.zig\\\"}: edited a.zig (1 replacement)\"}");
+    const lines = try earlierLines(gpa, s.items, 4096);
+    defer gpa.free(lines);
+    try tt.expectEqualStrings("- r1 run_tests {} -> ERROR: 1 failed\n- r2 read_file {\"path\":\"a.zig\"}: pub fn a() void\n- r3 edit_file {\"path\":\"a.zig\"}: edited a.zig (1 replacement)", lines);
+    // under budget: whole lines, the failures kept longest
+    const few = try earlierLines(gpa, s.items, 60);
+    defer gpa.free(few);
+    try tt.expectEqualStrings("- r1 run_tests {} -> ERROR: 1 failed", few);
+    // a span with no earlier net gives nothing
+    const span = try sampleSpan(gpa);
+    defer gpa.free(span);
+    const none = try earlierLines(gpa, span, 4096);
+    defer gpa.free(none);
+    try tt.expectEqual(@as(usize, 0), none.len);
 }

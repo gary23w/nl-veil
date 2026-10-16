@@ -245,23 +245,51 @@ fn handoffCap(hist_win: usize) usize {
     return @max(stock, @min(HANDOFF_WIDE_BYTES, hist_win / 16));
 }
 
-/// How many inferences' worth of the prompt's FIXED prefix the spend ceiling must allow at minimum (see
+/// The most a carry may grow to on a WIDE window (see carryCap). HANDOFF_WIDE_BYTES was sized against the carry
+/// being re-uploaded in every later inference until the recency window rolls past it; the span it REPLACES is
+/// re-uploaded every inference of this turn and is 96-256 KB. Measured on conv c477179e8 (2026-10-14, a 262k
+/// window): the cut dropped up to 96 KB of shell output and carried 3.6 KB of it, and the user read the next
+/// pass as the harness losing the thread. 32 KB is ~8k tokens, 3% of that window, and carryCap bounds it by
+/// half the recency window so a later turn's replay is never mostly carry.
+const CARRY_WIDE_BYTES: usize = 32 * 1024;
+
+/// The continuation state's cap, sized to the model's WINDOW and not only to the recency window: handoffCap's
+/// figure, or a thirty-second of the window up to CARRY_WIDE_BYTES and half the recency window, whichever is
+/// larger. A small local model keeps today's figure to the byte; a 32k model carries 3 KB, a 262k model 24 KB,
+/// a 1M model 32 KB.
+fn carryCap(win_bytes: usize, hist_win: usize) usize {
+    return @max(handoffCap(hist_win), @min(CARRY_WIDE_BYTES, @min(win_bytes / 32, hist_win / 2)));
+}
+
+/// How many inferences' worth of the FULLEST prompt a turn may send the spend ceiling must allow at minimum (see
 /// segmentCeiling). Twelve is a short research turn: a plan, a handful of reads and calls, a write, a check.
 const CEILING_MIN_INFERENCES: u64 = 12;
 
 /// The spend ceiling a segment is actually held to. `token_cap` is the flat figure (the default or the
 /// operator's); `prefix_bytes` is what EVERY inference of the turn re-uploads before it has done anything —
-/// the assembled prefix plus the tools array. The flat 400k was written against a 20-tool belt. With Agent
-/// Garrett's catalogue on, the belt alone was ~110k tokens an inference (conv c940978d1, 2026-10-10): the
-/// ceiling tripped after three or four inferences, every three or four inferences, and each trip was a
-/// distillation the user watched. A ceiling that cannot afford a dozen uploads of the prompt itself is not
-/// a runaway backstop, it is a metronome — so the default is floored at CEILING_MIN_INFERENCES prefixes, at
-/// the same pessimistic 3 bytes/token the budgets use. An explicit NL_TURN_TOKEN_CEILING is honoured as
-/// written (an operator pinning a small ceiling to exercise the roll must get the roll), and 0 still disables.
-fn segmentCeiling(token_cap: u64, prefix_bytes: usize, explicit: bool) u64 {
+/// the assembled prefix plus the tools array — and `span_bytes` the most working span compaction lets one
+/// inference carry beside it (workingBudgetBytes). The flat 400k was written against a 20-tool belt and a 24 KB
+/// span. With Agent Garrett's catalogue on, the belt alone was ~110k tokens an inference (conv c940978d1,
+/// 2026-10-10) and the ceiling tripped every three or four inferences; floored at a dozen PREFIXES it still cut
+/// conv c477179e8 (2026-10-14) at 437k cumulative on a 262k window whose largest prompt was 21.6k tokens — the
+/// span budget had grown with the window and the ceiling had not, so a bigger window was cut in FEWER
+/// inferences. A ceiling that cannot afford a dozen uploads of the prompt the engine itself allows is not a
+/// runaway backstop, it is a metronome — so the default is floored at CEILING_MIN_INFERENCES of prefix plus
+/// span, at the same pessimistic 3 bytes/token the budgets use. An explicit NL_TURN_TOKEN_CEILING is honoured
+/// as written (an operator pinning a small ceiling to exercise the roll must get the roll), and 0 still disables.
+fn segmentCeiling(token_cap: u64, prefix_bytes: usize, span_bytes: usize, explicit: bool) u64 {
     if (token_cap == 0 or explicit) return token_cap;
-    const prefix_tokens: u64 = @intCast(prefix_bytes / 3);
-    return @max(token_cap, CEILING_MIN_INFERENCES * prefix_tokens);
+    const fullest_tokens: u64 = @intCast((prefix_bytes + span_bytes) / 3);
+    return @max(token_cap, CEILING_MIN_INFERENCES * fullest_tokens);
+}
+
+/// What a turn has SPENT, in input tokens weighted the way providers bill them: uncached tokens in full, cached
+/// ones at a quarter (every provider that reports a cache bills a hit at a steep discount; a quarter is the dear
+/// end of the published range). The ceiling used to count every prompt token at full weight, so a turn
+/// re-sending one cached prefix paid the ceiling for it anew each round.
+fn spendOf(t: llm.TokUsage) u64 {
+    const cached = @min(t.cached, t.in);
+    return (t.in - cached) + cached / 4;
 }
 
 /// STUCK-RECOVERY WRITER (prompting). Reads the same bounded transcript tail the drive picker rides and names the
@@ -3384,9 +3412,9 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     {
         // The projection this turn was sized to, on the record beside the working-span trace above: a chat that
         // forgets is diagnosed from what it was allowed to hold, not guessed at.
-        var tb: [200]u8 = undefined;
-        if (std.fmt.bufPrint(&tb, "context: history window {d} KB, summary {d} KB, facts {d} KB; a fold reads {d} KB and writes up to {d} words", .{
-            ctx_plan.hist_win / 1024, ctx_plan.summary_cap / 1024, ctx_plan.facts_budget / 1024, ctx_plan.chunk_bytes / 1024, ctx_plan.shape.words,
+        var tb: [240]u8 = undefined;
+        if (std.fmt.bufPrint(&tb, "context: history window {d} KB, summary {d} KB, facts {d} KB; a fold reads {d} KB and writes up to {d} words; nets {d} KB", .{
+            ctx_plan.hist_win / 1024, ctx_plan.summary_cap / 1024, ctx_plan.facts_budget / 1024, ctx_plan.chunk_bytes / 1024, ctx_plan.shape.words, ctx_plan.net_budget / 1024,
         })) |t| emitKV(app, conv_dir, "trace", "text", t) else |_| {}
     }
     assembleHistory(app, conv_dir, user_text, &conv_buf, ws_packed.varying, ctx_plan);
@@ -3676,11 +3704,12 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
         TURN_TOKEN_CEILING_DEFAULT;
     // NET OF THE BELT: the default is floored at a dozen uploads of this turn's own fixed prefix (the assembled
     // prompt plus the tools array), so a wide belt widens the ceiling instead of tripping it every few calls.
-    const token_cap: u64 = segmentCeiling(token_cap_flat, assembled_len + turn_tools.len, token_cap_env != null);
+    const token_cap: u64 = segmentCeiling(token_cap_flat, assembled_len + turn_tools.len, workingBudgetBytes(trio.coding.base_url, trio.coding.model, assembled_len + turn_tools.len, win_hint), token_cap_env != null);
     // VAR, and re-anchored per SEGMENT (see the ceiling arm below). The ceiling is an absolute thread
     // reading, not a delta, so a turn that rolls on past one must move its own goalposts or the very next
-    // inference re-trips it instantly and the roll becomes a spin.
-    var token_ceiling: u64 = if (token_cap == 0) 0 else usage_t0.in + token_cap;
+    // inference re-trips it instantly and the roll becomes a spin. Read as SPEND (spendOf): cached prompt
+    // tokens count a quarter.
+    var token_ceiling: u64 = if (token_cap == 0) 0 else spendOf(usage_t0) + token_cap;
     // How many times ONE turn may re-ground and keep going after the spend ceiling settles a segment.
     //
     // Rolling on is only affordable because a segment RESET is not a continuation of the expensive thing.
@@ -3785,7 +3814,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
         // across steps. No-op on the first step (nothing past the assembled prefix yet).
         // Budget keyed on the CODING model + this turn's tool array: coding is what consumes conv_buf, and
         // the schemas ride in the same window. `think` here is only who WRITES the fold.
-        compactWorking(app, llm_dir, think.base_url, think.key, think.model, &conv_buf, assembled_len, &ctx, &tool_obs, workingBudgetBytes(trio.coding.base_url, trio.coding.model, assembled_len + turn_tools.len, win_hint));
+        compactWorking(app, conv_dir, llm_dir, think.base_url, think.key, think.model, &conv_buf, assembled_len, &ctx, &tool_obs, workingBudgetBytes(trio.coding.base_url, trio.coding.model, assembled_len + turn_tools.len, win_hint));
 
         // PLAN STEP: when a plan is active, take the next pending subtask and inject it as this step's working turn
         // (so the agentic pass works THAT subtask, route-hinted). No plan → drive step 0 works the user's message
@@ -3972,6 +4001,9 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
                 if (inner.engine_note.len > 0) {
                     var handoff: []u8 = &[_]u8{};
                     defer if (handoff.len > 0) gpa.free(handoff);
+                    // Sized against the model's WINDOW (carryCap): the span this replaces is what every inference of
+                    // the turn re-uploaded, and a carry a thirtieth of the window is cheap beside it.
+                    const hcap = carryCap(ctx_plan.win_bytes, hist_win);
                     if (!stopRequestedSince(app, conv_dir, steer_cursor)) {
                         emitKV(app, conv_dir, "status", "text", "settling: writing what this turn established so the next one continues from it");
                         // Engine ground truth, so ON DISK is a fact the engine verified rather than a claim the
@@ -3982,16 +4014,23 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
                         // GARY'S 4TOPE FIRST (net.zig): the continuation state as the source unfolding of this turn's
                         // own working span — verbatim bytes, the dead ends included, no model call. The
                         // model-written state remains for NL_HANDOFF=model and for a span the net finds nothing in.
-                        const hcap = handoffCap(hist_win);
                         const by_model = if (ctx.environ.get("NL_HANDOFF")) |v| std.ascii.eqlIgnoreCase(std.mem.trim(u8, v, " \r\n\t"), "model") else false;
                         if (!by_model) {
-                            var g: ?dag.Graph = dag.Graph.fromSpan(gpa, conv_buf.items[@min(assembled_len, conv_buf.items.len)..]) catch null;
+                            const span = conv_buf.items[@min(assembled_len, conv_buf.items.len)..];
+                            var g: ?dag.Graph = dag.Graph.fromSpan(gpa, span) catch null;
                             defer if (g) |*gg| gg.deinit();
                             var paths: std.ArrayListUnmanaged(u8) = .empty;
                             defer paths.deinit(gpa);
                             ledgerPaths(gpa, &file_ledger, &paths);
+                            // WHAT THE PASSES BEFORE THIS ONE CARRIED rides on under EARLIER (net.zig earlierLines).
+                            // A rolled segment opens on the previous carry as a system row, which the net never
+                            // selects as a node — so without this a third pass knew nothing of what the first had
+                            // established or ruled out, and the next turn, replaying only the newest engine row,
+                            // knew only the last pass. The tots carry a fold's lines the same way.
+                            const earlier: []u8 = dag.earlierLines(gpa, span, hcap / 3) catch &[_]u8{};
+                            defer if (earlier.len > 0) gpa.free(earlier);
                             if (g) |*gg| {
-                                if (gg.unfold(gpa, hcap - @min(hcap / 4, 400), paths.items)) |rendered| {
+                                if (gg.unfoldWith(gpa, hcap - @min(hcap / 4, 400), paths.items, .{ .earlier = earlier })) |rendered| {
                                     if (rendered.len > 0) {
                                         handoff = rendered;
                                         emitKV(app, conv_dir, "trace", "text", "continuation state: unfolded by Gary's 4tope from the turn's own span (no model call)");
@@ -4024,7 +4063,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
                         hf.appendSlice(gpa, std.fmt.bufPrint(&fb2, "FACTS LEDGER: {s} in the workdir holds {d} lines of concrete values already established (ids, amounts, tokens, statuses). read_file it BEFORE re-querying anything.\n", .{ FACTS_LEDGER_NAME, fl }) catch "") catch {};
                         hf.appendSlice(gpa, handoff) catch {};
                     }
-                    const row = handoffRow(gpa, inner.engine_note, if (fl > 0) hf.items else handoff, handoffCap(hist_win), &hrow);
+                    const row = handoffRow(gpa, inner.engine_note, if (fl > 0) hf.items else handoff, hcap, &hrow);
                     // Best-effort, like every summary in this file: a Stop, an empty span, a refused, degenerate
                     // or markup completion, or any OOM leaves `row` bound to inner.engine_note and these two
                     // lines commit exactly the row they commit today.
@@ -4082,7 +4121,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
                         conv_buf.appendSlice(gpa, seed.items) catch break :roll;
                         // A fresh allowance for the fresh context, and room in the drive loop to spend it —
                         // a plain turn's DRIVE_MAX of 6 would otherwise end the roll before the budget does.
-                        if (token_cap != 0) token_ceiling = llm.tokensSnapshot().in + token_cap;
+                        if (token_cap != 0) token_ceiling = spendOf(llm.tokensSnapshot()) + token_cap;
                         max_steps = @max(max_steps, drive + 1 + LOOP_MAX_STEPS);
                         continues += 1;
                         var sb2: [192]u8 = undefined;
@@ -4091,6 +4130,11 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
                         gpa.free(inner.engine_note);
                         continue :outer;
                     }
+                    // THE NET OUTLIVES THE TURN: a settle (no roll) banks this carry to {conv}/net.jsonl as well,
+                    // where later turns' assembleHistory projects it once the engine row has scrolled out of the
+                    // recency window (netRecordAppend / injectNets; while the row is in the window it is replayed
+                    // verbatim and the record is skipped).
+                    if (ceiling_cut and handoff.len > 0) netRecordAppend(app, conv_dir, "cut", user_text, handoff);
                 }
                 gpa.free(inner.content);
                 gpa.free(inner.engine_note);
@@ -4749,6 +4793,12 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
         } else |_| {}
         if (map_learned) |*ml| beltLearnedSave(app, ml);
     }
+    // THE NET OUTLIVES THE TURN (Gary's 4tope across turns): what this turn established with tools — the unfolding
+    // of its whole working span from where it ended, the critical chain at length, the dead ends, what its folds
+    // and passes carried — goes to {conv}/net.jsonl, and the next turn's assembleHistory projects it (injectNets).
+    // The rolling summary reads only messages.jsonl, where a turn's tool results never land, so before this the
+    // only trace of a finished turn's work was the assistant's own closing words and whatever recall surfaced.
+    netRecordFromSpan(app, conv_dir, user_text, conv_buf.items[@min(assembled_len, conv_buf.items.len)..], &file_ledger, carryCap(ctx_plan.win_bytes, hist_win));
     refreshSummary(app, conv_dir, llm_dir, think.base_url, think.key, think.model, ctx_plan);
     // NO {done} here: it is emitted by signalDone after the caller releases the conversation slot, so the frame
     // that tells a client "the turn is over" is not followed by a 409 when the client believes it.
@@ -10041,6 +10091,8 @@ const ContextPlan = struct {
     summary_cap: usize,
     /// the FACTS FROM EARLIER TURNS block — the digest ledger's projection for this turn
     facts_budget: usize,
+    /// the WORK FROM EARLIER TURNS block — the net ledger's projection for this turn (netBudget)
+    net_budget: usize,
     /// bytes one fold reads from the uncovered span
     chunk_bytes: usize,
     /// the words / FACTS lines / completion budget the fold is asked for
@@ -10077,7 +10129,8 @@ fn planCore(win_tokens: usize, cap: cctx.Capacity, tools_bytes: usize, sum_win_t
     const sum_win_bytes = sum_win_tokens * 3;
     const summary_cap = @min(cctx.summaryInjectCap(win_bytes, cap), cctx.summaryInjectCap(sum_win_bytes, sum_cap));
     const facts_budget = cctx.factsBudget(win_bytes, cap);
-    const other = SYSTEM_BLOCKS_EST_BYTES + WORKSPACE_EST_BYTES + (summary_cap + 256) + (facts_budget + 256) +
+    const net_budget = netBudget(win_bytes, cap);
+    const other = SYSTEM_BLOCKS_EST_BYTES + WORKSPACE_EST_BYTES + (summary_cap + 256) + (facts_budget + 256) + (net_budget + 256) +
         cctx.GOAL_PIN_CAP + turnOutputReserveBytes + tools_bytes + WORKING_MIN_BUDGET_BYTES;
     const hist_win: usize = blk: {
         if (win_bytes <= other) break :blk HISTORY_WINDOW_MIN_BYTES;
@@ -10097,6 +10150,7 @@ fn planCore(win_tokens: usize, cap: cctx.Capacity, tools_bytes: usize, sum_win_t
         .hist_win = hist_win,
         .summary_cap = summary_cap,
         .facts_budget = facts_budget,
+        .net_budget = net_budget,
         .chunk_bytes = cctx.summaryChunkBytes(sum_win_bytes, summary_cap),
         .shape = cctx.foldShape(fold_cap, summary_cap),
         .win_bytes = win_bytes,
@@ -10147,7 +10201,7 @@ fn historyWindowBytes(base_url: []const u8, model: []const u8, tools_bytes: usiz
 /// message that describes the model as having misbehaved when in fact it was never given a prompt it could read.
 /// One line naming the shortfall and the term responsible turns a mystery into arithmetic.
 fn warnIfPromptCannotFit(model: []const u8, tools_bytes: usize, plan: ContextPlan) void {
-    const need = SYSTEM_BLOCKS_EST_BYTES + WORKSPACE_EST_BYTES + (plan.summary_cap + 256) + (plan.facts_budget + 256) +
+    const need = SYSTEM_BLOCKS_EST_BYTES + WORKSPACE_EST_BYTES + (plan.summary_cap + 256) + (plan.facts_budget + 256) + (plan.net_budget + 256) +
         cctx.GOAL_PIN_CAP + turnOutputReserveBytes + tools_bytes + WORKING_MIN_BUDGET_BYTES + plan.hist_win;
     if (need <= plan.win_bytes) return;
     memlog.warn("context: this turn's prompt needs ~{d} KB but {s} serves ~{d} KB — over by ~{d} KB with history already at its {d} KB floor; the tool schemas alone are ~{d} KB. Expect the provider to reject the request (it surfaces as an empty reply).", .{
@@ -10408,10 +10462,10 @@ fn runInnerAgentic(
         // That is untrue of an API caller, of an afk auto-loop, and of an unattended run — and it is barely true
         // of a watching human, who cannot stop a cost they have no way to see accruing. A call count is also the
         // wrong unit: that turn would have sailed through a 100-call budget while still spending 1.8M tokens.
-        if (token_ceiling > 0 and llm.tokensSnapshot().in >= token_ceiling) {
-            const spent = llm.tokensSnapshot().in;
+        if (token_ceiling > 0 and spendOf(llm.tokensSnapshot()) >= token_ceiling) {
+            const spent = spendOf(llm.tokensSnapshot());
             var sb: [160]u8 = undefined;
-            emitKV(app, conv_dir, "status", "text", std.fmt.bufPrint(&sb, "compacting context (~{d}k input tokens gathered this stretch) — distilling what was established", .{spent / 1000}) catch "compacting context — distilling what was established");
+            emitKV(app, conv_dir, "status", "text", std.fmt.bufPrint(&sb, "compacting context (~{d}k input tokens spent this stretch) — carrying the net forward", .{spent / 1000}) catch "compacting context — carrying the net forward");
             return .{
                 .outcome = .stopped,
                 .content = gpa.dupe(u8, last_content) catch empty,
@@ -11182,7 +11236,7 @@ fn runInnerAgentic(
         }
         // WITHIN-TURN COMPACTION (step boundary): if this pass's working growth has crossed the budget, compress it
         // into a progress note so a long/afk turn can keep going without overflowing the model window.
-        compactWorking(app, run_root, think.base_url, think.key, think.model, conv_buf, base_len, ctx, tool_obs, workingBudgetBytes(base_url, model, base_len + turn_tools.len, turn_win_hint));
+        compactWorking(app, conv_dir, run_root, think.base_url, think.key, think.model, conv_buf, base_len, ctx, tool_obs, workingBudgetBytes(base_url, model, base_len + turn_tools.len, turn_win_hint));
         // GROUND-TRUTH CONFLICT SPLICE — after compaction (never folded into a summary), before any steer
         // (the user's live instruction stays last, i.e. most salient).
         if (post_note.items.len > 0)
@@ -12430,6 +12484,10 @@ fn assembleHistory(app: *App, conv_dir: []const u8, user_text: []const u8, conv_
         // further than any rewritten summary can (see cctx "the transcript ledger").
         injectFactsLedger(app, conv_dir, user_text, view.goal_line, conv_buf, plan.facts_budget);
     }
+    // THE NET LEDGER (Gary's 4tope across turns): what earlier turns established WITH TOOLS, verbatim, newest
+    // first — gap or no gap, because a turn's tool results never reach messages.jsonl, so even the turn just
+    // replayed whole above shows only its closing words without this (see netRecordFromSpan).
+    injectNets(app, conv_dir, conv_buf, plan.net_budget, view.window_start);
 
     // PINNED GOAL: the conversation's first user message anchors the arc even after it scrolls out of the window.
     if (view.goal_line.len > 0) seedLines(gpa, conv_buf, view.goal_line, cctx.GOAL_PIN_CAP);
@@ -12490,6 +12548,193 @@ fn injectFactsLedger(app: *App, conv_dir: []const u8, user_text: []const u8, goa
     sc.appendSlice(gpa, FACTS_BLOCK_HEADER) catch return;
     sc.appendSlice(gpa, block) catch return;
     appendMsgObj(gpa, conv_buf, "system", sc.items, budget + FACTS_BLOCK_HEADER.len + 64);
+}
+
+/// The append-only net ledger beside messages.jsonl and digest.jsonl: one record per finished turn (and per cut
+/// the engine settled on), each the unfolding of that turn's working span by Gary's 4tope. Never rewritten.
+const NET_FILE = "net.jsonl";
+/// How much of the net ledger's newest end one assembly reads: a few dozen turns of nets; the read stays O(1) in
+/// the size of the conversation, as the digest ledger's does.
+const NET_SCAN_BYTES: usize = 256 * 1024;
+/// How much of the user message a record keeps, so a projected net says what its turn was asked.
+const NET_ASK_CAP: usize = 160;
+/// What introduces the net ledger's projection. Third person, and explicit about what a line IS.
+const NETS_BLOCK_HEADER = "WORK FROM EARLIER TURNS (engine-kept nets of what THIS conversation's earlier turns established with tools, newest first; every '- r' line is verbatim from a tool result as it was when it ran, and '->' marks a call that failed then; re-check with a tool anything that can change):\n";
+
+/// Bytes of the net ledger projected into one prompt: a thirty-second of the window, 512-byte quantized, between
+/// 1 KB and a capacity ceiling (4 / 8 / 16 KB). Its own figure rather than a cut of the FACTS budget because the
+/// two carry different things: FACTS are what a summarizer wrote down, nets are what the tools showed.
+fn netBudget(win_bytes: usize, cap: cctx.Capacity) usize {
+    const ceiling: usize = switch (cap) {
+        .small => 4 * 1024,
+        .mid => 8 * 1024,
+        .large => 16 * 1024,
+    };
+    const scaled = ((win_bytes / 32) / 512) * 512;
+    return std.math.clamp(scaled, 1024, ceiling);
+}
+
+/// CRITICAL PATH, no model call: project {conv}/net.jsonl for this turn — the newest record first (whole lines,
+/// up to half the budget), then the "- r" lines of older records newest-first that a newer one did not already
+/// carry — as one system turn after the FACTS ledger. `window_start` is where this turn's recency window begins in
+/// messages.jsonl: a "cut" record written at or past it is the engine row the window replays verbatim, so it is
+/// not projected twice. A conversation with no ledger seeds nothing.
+fn injectNets(app: *App, conv_dir: []const u8, conv_buf: *std.ArrayListUnmanaged(u8), budget: usize, window_start: usize) void {
+    const gpa = app.gpa;
+    if (budget == 0) return;
+    const npath = std.fmt.allocPrint(gpa, "{s}/{s}", .{ conv_dir, NET_FILE }) catch return;
+    defer gpa.free(npath);
+    const buf = gpa.alloc(u8, NET_SCAN_BYTES) catch return;
+    defer gpa.free(buf);
+    const tail = cctx.readTailTrimmed(app.io, npath, buf) orelse return;
+    const block = selectNets(gpa, tail, budget, window_start) orelse return;
+    defer gpa.free(block);
+    var sc: std.ArrayListUnmanaged(u8) = .empty;
+    defer sc.deinit(gpa);
+    sc.appendSlice(gpa, NETS_BLOCK_HEADER) catch return;
+    sc.appendSlice(gpa, block) catch return;
+    appendMsgObj(gpa, conv_buf, "system", sc.items, budget + NETS_BLOCK_HEADER.len + 64);
+}
+
+/// Whole lines of `s` under `max` bytes (the cut lands on a line boundary); nothing when not even the first fits.
+fn wholeLines(s: []const u8, max: usize) []const u8 {
+    if (s.len <= max) return s;
+    const c = clipBytes(s, max);
+    const nl = std.mem.lastIndexOfScalar(u8, c, '\n') orelse return "";
+    return c[0..nl];
+}
+
+fn noteSeen(gpa: std.mem.Allocator, seen: *std.StringHashMapUnmanaged(void), keys: *std.ArrayListUnmanaged([]u8), line: []const u8) void {
+    if (seen.contains(line)) return;
+    const k = gpa.dupe(u8, line) catch return;
+    keys.append(gpa, k) catch {
+        gpa.free(k);
+        return;
+    };
+    seen.put(gpa, k, {}) catch {};
+}
+
+/// The projection itself (see injectNets), over the ledger's newest `tail` as readTailTrimmed returns it. Each
+/// record is introduced by what its turn was asked; a line a newer record already carries is never repeated. Null
+/// when nothing fits.
+fn selectNets(gpa: std.mem.Allocator, tail: []const u8, budget: usize, window_start: usize) ?[]u8 {
+    if (budget == 0 or tail.len == 0) return null;
+    const Rec = struct { kind: []const u8 = "turn", at: usize = 0, ask: []const u8 = "", net: []const u8 = "" };
+    var lines: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer lines.deinit(gpa);
+    var it = std.mem.splitScalar(u8, tail, '\n');
+    while (it.next()) |raw| {
+        const ln = std.mem.trim(u8, raw, " \r\t");
+        if (ln.len > 0) lines.append(gpa, ln) catch return null;
+    }
+    if (lines.items.len == 0) return null;
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(gpa);
+    var keys: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (keys.items) |k| gpa.free(k);
+        keys.deinit(gpa);
+    }
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    defer seen.deinit(gpa);
+    var shown_n: usize = 0;
+    var i = lines.items.len;
+    while (i > 0) : (i -= 1) {
+        const p = std.json.parseFromSlice(Rec, gpa, lines.items[i - 1], .{ .ignore_unknown_fields = true }) catch continue;
+        defer p.deinit();
+        const r = p.value;
+        if (r.net.len == 0) continue;
+        const newest = shown_n == 0;
+        const cut = std.mem.eql(u8, r.kind, "cut");
+        // the newest cut at or past the window's start IS the engine row the window replays verbatim
+        if (newest and cut and r.at >= window_start) continue;
+        var hb: [NET_ASK_CAP + 64]u8 = undefined;
+        const header = std.fmt.bufPrint(&hb, "[{s}: {s}]\n", .{ if (cut) "a turn the engine cut" else "a finished turn", clipBytes(r.ask, 100) }) catch continue;
+        const used = out.items.len;
+        if (used + header.len + 8 >= budget) break;
+        var body: std.ArrayListUnmanaged(u8) = .empty;
+        defer body.deinit(gpa);
+        if (newest) {
+            // the whole net, whole lines, up to half the budget
+            const room = @min(budget / 2, budget - used - header.len - 1);
+            body.appendSlice(gpa, wholeLines(r.net, room)) catch return null;
+            var li = std.mem.splitScalar(u8, body.items, '\n');
+            while (li.next()) |l| if (std.mem.startsWith(u8, l, "- r")) noteSeen(gpa, &seen, &keys, l);
+        } else {
+            // only the lines a newer record did not already carry, in the record's own order (failures first)
+            const room = budget - used - header.len - 1;
+            var li = std.mem.splitScalar(u8, r.net, '\n');
+            while (li.next()) |l| {
+                if (!std.mem.startsWith(u8, l, "- r") or seen.contains(l)) continue;
+                const sep: usize = if (body.items.len > 0) 1 else 0;
+                if (body.items.len + sep + l.len > room) break;
+                if (sep == 1) body.append(gpa, '\n') catch return null;
+                body.appendSlice(gpa, l) catch return null;
+                noteSeen(gpa, &seen, &keys, l);
+            }
+        }
+        if (body.items.len == 0) continue;
+        if (out.items.len > 0) out.append(gpa, '\n') catch return null;
+        out.appendSlice(gpa, header) catch return null;
+        out.appendSlice(gpa, body.items) catch return null;
+        shown_n += 1;
+    }
+    if (out.items.len == 0) return null;
+    return out.toOwnedSlice(gpa) catch null;
+}
+
+fn fileSize(io: std.Io, path: []const u8) usize {
+    const f = std.Io.Dir.cwd().openFile(io, path, .{}) catch return 0;
+    defer f.close(io);
+    const n = f.length(io) catch return 0;
+    return std.math.cast(usize, n) orelse 0;
+}
+
+/// One record of {conv}/net.jsonl: `{"ts":T,"kind":"turn"|"cut","at":N,"ask":"…","net":"…"}` — `at` is
+/// messages.jsonl's size when it was written, so a reader can place it among the turns; `ask` the user message the
+/// turn answered, clipped. Best-effort, like every ledger append in this file.
+fn netRecordAppend(app: *App, conv_dir: []const u8, kind: []const u8, ask: []const u8, net: []const u8) void {
+    const gpa = app.gpa;
+    const mpath = std.fmt.allocPrint(gpa, "{s}/messages.jsonl", .{conv_dir}) catch return;
+    defer gpa.free(mpath);
+    const at = fileSize(app.io, mpath);
+    var rec: std.ArrayListUnmanaged(u8) = .empty;
+    defer rec.deinit(gpa);
+    const head = std.fmt.allocPrint(gpa, "{{\"ts\":{d},\"kind\":\"{s}\",\"at\":{d},\"ask\":", .{ nowSecs(app.io), kind, at }) catch return;
+    defer gpa.free(head);
+    rec.appendSlice(gpa, head) catch return;
+    http.jstr(gpa, &rec, clipBytes(ask, NET_ASK_CAP)) catch return;
+    rec.appendSlice(gpa, ",\"net\":") catch return;
+    http.jstr(gpa, &rec, net) catch return;
+    rec.appendSlice(gpa, "}\n") catch return;
+    const npath = std.fmt.allocPrint(gpa, "{s}/{s}", .{ conv_dir, NET_FILE }) catch return;
+    defer gpa.free(npath);
+    http.appendFile(app.io, gpa, npath, rec.items) catch {};
+}
+
+/// The record a FINISHED turn leaves (see the normal-completion tail): its whole working span unfolded from where
+/// it ended under `cap`, ON DISK from the engine's file ledger, EARLIER from any fold or pass inside it. A turn
+/// whose span holds no tool result leaves none — its reply is in messages.jsonl already and there is nothing a
+/// tool showed to carry.
+fn netRecordFromSpan(app: *App, conv_dir: []const u8, ask: []const u8, span: []const u8, ledger: *const FileLedger, cap: usize) void {
+    const gpa = app.gpa;
+    if (span.len == 0) return;
+    var g = dag.Graph.fromSpan(gpa, span) catch return;
+    defer g.deinit();
+    var results: usize = 0;
+    for (g.nodes.items) |n| {
+        if (n.kind == .result) results += 1;
+    }
+    if (results == 0) return;
+    var paths: std.ArrayListUnmanaged(u8) = .empty;
+    defer paths.deinit(gpa);
+    ledgerPaths(gpa, ledger, &paths);
+    const earlier: []u8 = dag.earlierLines(gpa, span, cap / 3) catch &[_]u8{};
+    defer if (earlier.len > 0) gpa.free(earlier);
+    const net = g.unfoldWith(gpa, cap, paths.items, .{ .next_label = "ENDED ON (the turn's last words): ", .earlier = earlier }) catch return;
+    defer gpa.free(net);
+    if (net.len == 0) return;
+    netRecordAppend(app, conv_dir, "turn", ask, net);
 }
 
 /// Serializes context.json reads/writes across the (rare) case of a deferred refreshSummary on one turn's thread
@@ -13052,6 +13297,60 @@ fn protectedResult(obj: []const u8, protect_ids: []const []const u8) bool {
     return false;
 }
 
+/// The note budget for a fold by the net: a quarter of the working budget, between 4 KB and 48 KB. With the kept
+/// tail at most a third of the budget (roomy) or half of it (tightened), a fold always brings the span under three
+/// quarters of the budget, so the loop is guaranteed to make progress without a model call.
+fn netNoteBudget(budget: usize) usize {
+    return std.math.clamp(budget / 4, 4 * 1024, 48 * 1024);
+}
+
+/// THE FOLD BY THE NET — compactWorking's main path, the shape cloud/tot.js netFold gives the tots. The span's
+/// rounds older than the kept tail become ONE assistant note: the unfolding of the whole span from its frontier
+/// (Gary's 4tope, net.zig) — the critical chain's results at length, the rest as excerpts, the calls that failed
+/// under RULED OUT, and whatever an earlier fold in the span established under EARLIER — and the tail rides after
+/// it verbatim. No model call, nothing paraphrased: every line is bytes a tool returned. `facts_pointer` (the
+/// FACTS LEDGER line, or "") closes the note. Null when the span has no safe splice and is under `hard_fold`
+/// (left alone, as before), when the net finds nothing to carry, or when the result would not be smaller — the
+/// caller then folds by the model, exactly as before this existed. gpa-owned: the replacement for the span,
+/// comma-led like the span it replaces.
+fn foldSpanByNet(gpa: std.mem.Allocator, span: []const u8, keep_tail: usize, hard_fold: usize, note_budget: usize, facts_pointer: []const u8) ?[]u8 {
+    const tail = msgTail(span, keep_tail);
+    const splice = tail.len < span.len;
+    if (!splice and span.len < hard_fold) return null;
+    const older_len: usize = if (splice) span.len - tail.len - 1 else span.len; // -1 drops msgTail's skipped comma
+    if (older_len == 0) return null;
+    var g = dag.Graph.fromSpan(gpa, span) catch return null;
+    defer g.deinit();
+    var tail_from: u32 = dag.Graph.NONE;
+    if (splice) for (g.nodes.items, 0..) |n, i| if (n.at >= older_len) {
+        tail_from = @intCast(i);
+        break;
+    };
+    const earlier = dag.earlierLines(gpa, span[0..older_len], note_budget / 3) catch return null;
+    defer gpa.free(earlier);
+    const net = g.unfoldWith(gpa, note_budget, "", .{ .tail_from = tail_from, .earlier = earlier }) catch return null;
+    defer gpa.free(net);
+    if (net.len == 0) return null;
+    var content: std.ArrayListUnmanaged(u8) = .empty;
+    defer content.deinit(gpa);
+    content.appendSlice(gpa, dag.NET_NOTE_HEAD) catch return null;
+    content.appendSlice(gpa, net) catch return null;
+    if (facts_pointer.len > 0) {
+        if (content.items[content.items.len - 1] != '\n') content.append(gpa, '\n') catch return null;
+        content.appendSlice(gpa, facts_pointer) catch return null;
+    }
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(gpa);
+    appendMsgObj(gpa, &out, "assistant", content.items, content.items.len);
+    if (out.items.len == 0) return null;
+    if (splice) {
+        out.append(gpa, ',') catch return null;
+        out.appendSlice(gpa, tail) catch return null;
+    }
+    if (out.items.len >= span.len) return null; // a fold that does not shrink the span is no fold
+    return gpa.dupe(u8, out.items) catch null;
+}
+
 /// If this pass's working growth (everything appended after `base_len`) exceeds the budget, first PRUNE the stale
 /// tool results older than the kept tail (pruneToolResults — no model call; on a wide window that alone usually
 /// brings the span back under budget) and, only if it is still over, replace the OLDER part with a single
@@ -13061,7 +13360,7 @@ fn protectedResult(obj: []const u8, protect_ids: []const []const u8) bool {
 /// protocol-valid (no dangling tool_calls). When no safe splice point exists the span is left alone, or folded
 /// whole past WORKING_HARD_FOLD_BYTES — see the two constants for both cases.
 /// Best-effort: a failed summary leaves the buffer as-is (the MAX_ITERS cap still bounds the pass).
-fn compactWorking(app: *App, run_root: []const u8, base_url: []const u8, key: []const u8, model: []const u8, conv_buf: *std.ArrayListUnmanaged(u8), base_len: usize, ctx: *tools.ToolCtx, tool_obs: *std.ArrayListUnmanaged([]u8), budget: usize) void {
+fn compactWorking(app: *App, conv_dir: []const u8, run_root: []const u8, base_url: []const u8, key: []const u8, model: []const u8, conv_buf: *std.ArrayListUnmanaged(u8), base_len: usize, ctx: *tools.ToolCtx, tool_obs: *std.ArrayListUnmanaged([]u8), budget: usize) void {
     if (conv_buf.items.len <= base_len or conv_buf.items.len - base_len <= budget) return;
     // The tail kept verbatim must be SMALLER than the trigger, or a fold cannot shrink the span. At the
     // stock 24 KB trigger / 32 KB tail it never did: folding only really began at 32 KB. That slack is
@@ -13093,6 +13392,30 @@ fn compactWorking(app: *App, run_root: []const u8, base_url: []const u8, key: []
     const protect_ids: []const []const u8 = if (chain_graph) |*cg| (cg.protectedIds(gpa) catch &.{}) else &.{};
     defer if (protect_ids.len > 0) gpa.free(protect_ids);
     if (pruneToolResults(gpa, conv_buf, base_len, keep_tail, protect_ids) and conv_buf.items.len - base_len <= budget) return;
+    // THE FOLD BY THE NET FIRST (foldSpanByNet; Gary's 4tope): the rounds older than the kept tail become one
+    // verbatim note and the tail rides whole — no model call, no paraphrase, the chain at length, the dead ends
+    // kept, an earlier fold's lines carried on. The model-written fold below is the fallback for a span the net
+    // finds nothing in, and the whole path for NL_HANDOFF=model, which restores the model's fold here as it does
+    // the model's continuation state at the ceiling.
+    const by_model = if (ctx.environ.get("NL_HANDOFF")) |v| std.ascii.eqlIgnoreCase(std.mem.trim(u8, v, " \r\n\t"), "model") else false;
+    if (!by_model) {
+        const fl0 = factsLedgerLines(app, ctx.workdir);
+        var pb: [320]u8 = undefined;
+        const pointer: []const u8 = if (fl0 > 0) (std.fmt.bufPrint(&pb, "FACTS LEDGER: {s} in the workdir holds {d} lines of values already established - read_file it before re-querying anything.", .{ FACTS_LEDGER_NAME, fl0 }) catch "") else "";
+        const before = conv_buf.items.len - base_len;
+        if (foldSpanByNet(gpa, conv_buf.items[base_len..], keep_tail, hard_fold, netNoteBudget(budget), pointer)) |folded| {
+            defer gpa.free(folded);
+            conv_buf.shrinkRetainingCapacity(base_len);
+            conv_buf.appendSliceAssumeCapacity(folded); // shorter than what it replaces, so the retained capacity holds it
+            // Under a learned echo quirk the note must carry reasoning_content like every assistant turn; an OOM
+            // leaves it bare and the in-pass heal repairs it at the cost of one round-trip (as for the model's note).
+            if (llm.reasoningEchoFor(app.io, model))
+                conv_buf.insertSlice(gpa, base_len + llm.ASSISTANT_OBJ_HEAD.len, ",\"reasoning_content\":\"\"") catch {};
+            var sb: [200]u8 = undefined;
+            emitKV(app, conv_dir, "status", "text", std.fmt.bufPrint(&sb, "the working context folded into a net (Gary's 4tope): {d} KB -> {d} KB, no model call", .{ before / 1024, (conv_buf.items.len - base_len) / 1024 }) catch "the working context folded into a net (Gary's 4tope)");
+            return;
+        }
+    }
     // TAIL-PRESERVING FOLD: summarize only the span OLDER than the newest WORKING_KEEP_TAIL_BYTES, then put that
     // tail back verbatim after the note. Folding the whole span deleted the model's own just-read bytes and it
     // re-read them (see WORKING_KEEP_TAIL_BYTES). msgTail picks the splice point because the splice MUST land on
@@ -13310,6 +13633,90 @@ test "rolling past the spend ceiling stays bounded, and hands the next segment a
     const row = handoffRow(gpa, TOKEN_CEILING_NOTE, "ESTABLISHED: sqlite WAL is default-off.\nNEXT: write notes.md.", HANDOFF_MAX_BYTES, &b);
     try std.testing.expect(std.mem.indexOf(u8, row, "CONTINUATION STATE") != null);
     try std.testing.expect(std.mem.indexOf(u8, row, "NEXT: write notes.md.") != null);
+    // ...and the row is what a LATER pass finds its EARLIER lines in (net.zig earlierLines matches this mark)
+    try std.testing.expect(std.mem.indexOf(u8, HANDOFF_HEADER, dag.CARRY_MARK) != null);
+}
+
+test "the spend ceiling is a dozen of the FULLEST prompt a turn may send, with cached tokens at a quarter" {
+    // conv c477179e8 (2026-10-14): a 262k window, prompts of at most 21.6k tokens, cut at 437k cumulative. The
+    // fullest prompt that turn could send was its ~45 KB prefix plus a 96 KB span; a dozen of those is ~564k.
+    try std.testing.expect(segmentCeiling(TURN_TOKEN_CEILING_DEFAULT, 45 * 1024, 96 * 1024, false) > 437_000);
+    // a small prefix and span keep the flat default: the floor only ever raises it
+    try std.testing.expectEqual(TURN_TOKEN_CEILING_DEFAULT, segmentCeiling(TURN_TOKEN_CEILING_DEFAULT, 20 * 1024, 24 * 1024, false));
+    // an explicit ceiling is honoured as written, and 0 still disables
+    try std.testing.expectEqual(@as(u64, 50_000), segmentCeiling(50_000, 45 * 1024, 96 * 1024, true));
+    try std.testing.expectEqual(@as(u64, 0), segmentCeiling(0, 45 * 1024, 96 * 1024, false));
+    // spend: uncached tokens in full, cached at a quarter, and a cache figure can never exceed the prompt
+    try std.testing.expectEqual(@as(u64, 100), spendOf(.{ .in = 100, .out = 5, .cached = 0 }));
+    try std.testing.expectEqual(@as(u64, 40), spendOf(.{ .in = 100, .out = 5, .cached = 80 }));
+    try std.testing.expectEqual(@as(u64, 25), spendOf(.{ .in = 100, .out = 5, .cached = 140 }));
+}
+
+test "the carry is sized to the WINDOW: a small model keeps its figure, a 262k model carries 24 KB, a 1M model 32 KB" {
+    try std.testing.expectEqual(handoffCap(8 * 1024), carryCap(8192 * 3, 8 * 1024)); // the built-in 8k: unchanged
+    try std.testing.expectEqual(@as(usize, 3 * 1024), carryCap(32768 * 3, cctx.HISTORY_WINDOW_BYTES)); // a 32k model
+    try std.testing.expectEqual(@as(usize, 24 * 1024), carryCap(262144 * 3, 64 * 1024));
+    try std.testing.expectEqual(@as(usize, 32 * 1024), carryCap(1_048_576 * 3, 64 * 1024));
+    // never more than half the recency window, however wide the model
+    try std.testing.expectEqual(@as(usize, 14 * 1024), carryCap(1_048_576 * 3, 28 * 1024));
+}
+
+test "compaction folds by the net: the older rounds become one verbatim note, the tail rides whole, a span with no splice is left alone" {
+    const gpa = std.testing.allocator;
+    var span: std.ArrayListUnmanaged(u8) = .empty;
+    defer span.deinit(gpa);
+    // six rounds of one read each, ~2.9 KB a round, so a 4 KB kept tail anchors on the last round's step and
+    // holds exactly that round
+    var r: usize = 0;
+    while (r < 6) : (r += 1) {
+        try span.print(gpa, ",{{\"role\":\"assistant\",\"content\":\"Reading part {d} of the ledger next.\",\"tool_calls\":[{{\"id\":\"c{d}\",\"type\":\"function\",\"function\":{{\"name\":\"read_file\",\"arguments\":\"{{\\\"path\\\":\\\"part{d}.md\\\"}}\"}}}}]}}", .{ r, r, r });
+        try span.print(gpa, ",{{\"role\":\"tool\",\"tool_call_id\":\"c{d}\",\"content\":\"part {d} begins here: ", .{ r, r });
+        var k: usize = 0;
+        while (k < 100) : (k += 1) try span.print(gpa, "ledger row {d}-{d} value {d} ", .{ r, k, r * 1000 + k });
+        try span.appendSlice(gpa, "and part ends.\"}");
+    }
+    const folded = foldSpanByNet(gpa, span.items, 4 * 1024, 48 * 1024, 8 * 1024, "FACTS LEDGER: .veil-facts.md holds 3 lines").?;
+    defer gpa.free(folded);
+    try std.testing.expect(folded.len < span.items.len);
+    try std.testing.expect(std.mem.startsWith(u8, folded, ",{\"role\":\"assistant\",\"content\":\"CONTINUATION (Gary's 4tope"));
+    // the newest round rides verbatim after the note, joined by a comma: its result's exact bytes are there
+    try std.testing.expect(std.mem.indexOf(u8, folded, "ledger row 5-99 value 5099 and part ends.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, folded, "\"},{\"role\":\"assistant\",\"content\":\"Reading part 5") != null);
+    // the previous round is in the note as a line at LENGTH (every read reused "ledger", so the thread is the
+    // chain), once, with the call that produced it; the oldest rounds fell outside the note's budget
+    try std.testing.expect(std.mem.indexOf(u8, folded, "- r5 read_file {\\\"path\\\":\\\"part4.md\\\"}: part 4 begins here") != null);
+    try std.testing.expect(std.mem.indexOf(u8, folded, "ledger row 4-99 value 4099") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, folded, "part 4 begins here"));
+    try std.testing.expect(std.mem.count(u8, folded, "part 0 begins here") <= 1);
+    try std.testing.expect(std.mem.indexOf(u8, folded, "FACTS LEDGER: .veil-facts.md holds 3 lines") != null);
+    // a span with no splice point under the hard fold is left alone (the model fold is not reached either)
+    const one = ",{\"role\":\"assistant\",\"content\":\"one step\",\"tool_calls\":[{\"id\":\"x\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{}\"}}]},{\"role\":\"tool\",\"tool_call_id\":\"x\",\"content\":\"a result that is small\"}";
+    try std.testing.expect(foldSpanByNet(gpa, one, 64 * 1024, 48 * 1024, 4 * 1024, "") == null);
+}
+
+test "the net ledger projects newest first, each line once, under budget, and never the row the window already replays" {
+    const gpa = std.testing.allocator;
+    const tail =
+        "{\"ts\":1,\"kind\":\"turn\",\"at\":100,\"ask\":\"first ask\",\"net\":\"ENDED ON: done one\\nESTABLISHED:\\n- r1 read_file {\\\"path\\\":\\\"a.md\\\"}: alpha\\n- r2 run_tests {} -> ERROR: 1 failed\"}\n" ++
+        "{\"ts\":2,\"kind\":\"turn\",\"at\":200,\"ask\":\"second ask\",\"net\":\"ENDED ON: done two\\nESTABLISHED:\\n- r1 read_file {\\\"path\\\":\\\"a.md\\\"}: alpha\\n- r3 write_file {\\\"path\\\":\\\"b.md\\\"}: wrote b.md\"}\n" ++
+        "{\"ts\":3,\"kind\":\"cut\",\"at\":300,\"ask\":\"third ask\",\"net\":\"NEXT: keep going\\n- r9 fetch {} -> ERROR: 500\"}\n";
+    // the newest record is a cut inside the recency window (replayed as the engine row): skipped; then the second
+    // turn whole, then only the first turn's lines the second did not already carry
+    const block = selectNets(gpa, tail, 4096, 250).?;
+    defer gpa.free(block);
+    try std.testing.expect(std.mem.indexOf(u8, block, "r9 fetch") == null);
+    const two = std.mem.indexOf(u8, block, "done two").?;
+    const one = std.mem.indexOf(u8, block, "r2 run_tests").?;
+    try std.testing.expect(two < one);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, block, "alpha"));
+    try std.testing.expect(std.mem.indexOf(u8, block, "second ask") != null);
+    try std.testing.expect(std.mem.indexOf(u8, block, "done one") == null); // an older record gives only its lines
+    // the same cut OUTSIDE the window is projected like any record
+    const all = selectNets(gpa, tail, 4096, 400).?;
+    defer gpa.free(all);
+    try std.testing.expect(std.mem.indexOf(u8, all, "r9 fetch") != null);
+    // a budget too small for anything projects nothing
+    try std.testing.expect(selectNets(gpa, tail, 40, 0) == null);
 }
 
 test "file ledger: mutation parsing, upsert, args-path extraction, and the woven ground-truth block" {
@@ -13540,6 +13947,9 @@ test "the context plan follows BOTH models: the reader sizes what is held, the s
     try t.expectEqual(HISTORY_WINDOW_MIN_BYTES, tiny.hist_win);
     try t.expectEqual(cctx.SUMMARY_INJECT_MIN, tiny.summary_cap);
     try t.expectEqual(cctx.FACTS_BUDGET_MIN, tiny.facts_budget);
+    // the net ledger's projection follows the window too: 12 KB at 128k (a thirty-second), the 1 KB floor at 8k
+    try t.expectEqual(@as(usize, 12 * 1024), big.net_budget);
+    try t.expectEqual(@as(usize, 1024), tiny.net_budget);
     try t.expect(tiny.chunk_bytes >= cctx.SUMMARY_CHUNK_MIN_BYTES);
     try t.expect(tiny.chunk_bytes + 4 * tiny.summary_cap + cctx.SUMMARY_PROMPT_OVERHEAD_BYTES <= 8 * 1024 * 3);
     try t.expect(tiny.shape.max_tokens <= 4096);
