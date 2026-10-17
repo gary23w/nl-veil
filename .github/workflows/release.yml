@@ -149,6 +149,8 @@ jobs:
           VERSION=$(sed -n 's/^const VERSION = "\(.*\)";$/\1/p' src/main.zig | head -1)
           BUNDLE="bin/veil-v$VERSION-${{ matrix.name }}.zip"
           [ -f "$BUNDLE" ] || BUNDLE="bin/veil-v$VERSION-${{ matrix.name }}.tar.gz"
+          python scripts/test_release_content.py
+          python scripts/verify-release-content.py "$BUNDLE"
           python scripts/smoke-release.py --bundle "$BUNDLE" --version "$VERSION" --cloudflare --output .release-smoke/native
 
       - name: Upload release diagnostics
@@ -172,12 +174,36 @@ jobs:
             bin/server-only/veil-server-v*
             bin/SHA256SUMS-*.txt
 
-      - name: Attach to release
-        if: startsWith(github.ref, 'refs/tags/')
+      - name: Read release identity
+        id: release
+        shell: bash
+        run: |
+          VERSION=$(sed -n 's/^const VERSION = "\(.*\)";$/\1/p' src/main.zig | head -1)
+          test -n "$VERSION"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Pin the manual release tag to this source commit
+        if: github.event_name == 'workflow_dispatch' && matrix.os == 'ubuntu-latest'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          EXISTING=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha' 2>/dev/null || true)
+          if [ -z "$EXISTING" ]; then
+            gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" -f "ref=refs/tags/$RELEASE_TAG" -f "sha=$GITHUB_SHA"
+          else
+            test "$EXISTING" = "$GITHUB_SHA"
+          fi
+
+      - name: Attach to draft release
+        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.release.outputs.tag }}
+          target_commitish: ${{ github.sha }}
           # Bump this to the current release's notes on every tag (one notes file per release under docs/release/).
-          body_path: docs/release/RELEASE-v1.1.23.md
+          body_path: docs/release/RELEASE-v1.1.24.md
           draft: true
           # A tag with a hyphen in it (v1.0.1-beta-7, v2.0.0-rc.1) is a prerelease; a bare version
           # (v1.1.0) is not. This was hardcoded `true` through every alpha and beta, which was correct
@@ -195,15 +221,20 @@ jobs:
 
   publish:
     needs: bundle
-    if: startsWith(github.ref, 'refs/tags/')
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
-      - name: Verify complete release and publish
+      - uses: actions/checkout@v4
+      - name: Verify complete release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+            VERSION=$(sed -n 's/^const VERSION = "\(.*\)";$/\1/p' src/main.zig | head -1)
+            RELEASE_TAG="v$VERSION"
+          fi
           gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name' > assets.txt
           for PLATFORM in windows-x86_64 linux-x86_64 macos-arm64 macos-x86_64; do
             grep -Fx "veil-$RELEASE_TAG-$PLATFORM.zip" assets.txt
@@ -211,6 +242,11 @@ jobs:
             grep -Fx "veil-update-$RELEASE_TAG-$PLATFORM-neuron" assets.txt
             grep -Fx "SHA256SUMS-$PLATFORM.txt" assets.txt
           done
+          for TARGET in windows-x86_64.exe linux-x86_64 linux-arm64 macos-arm64 macos-x86_64; do
+            grep -Fx "veil-server-$RELEASE_TAG-$TARGET" assets.txt
+          done
+          # Manual builds stay private drafts for content verification before the owner publishes.
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then exit 0; fi
           if [[ "$RELEASE_TAG" == *-* ]]; then
             gh release edit "$RELEASE_TAG" --draft=false --prerelease --latest=false
           else

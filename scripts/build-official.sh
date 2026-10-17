@@ -144,7 +144,6 @@ cp "$SERVER" "$B/veil$EXE"
 [ -n "$neuron" ] && cp "$neuron" "$B/bin/neuron$EXE"
 printf '%s\n' 'veil-bundle-v1' > "$B/veil-install.txt"
 cp "$ROOT/LICENSE" "$B/LICENSE"
-mkdir -p "$B/cloud"
 # Raw assets avoid needing Git or archive tools on the user's machine. GitHub supplies SHA-256 digests
 # in the release API; the updater requires them and verifies size + digest before staging either file.
 cp "$SERVER" "$OUT/veil-update-v$VERSION-$OS-$ARCH-app"
@@ -175,10 +174,10 @@ chmod +x "$B/start" "$B/veil$EXE" 2>/dev/null || true
 cat > "$B/README.txt" <<TXT
 the veil — v$VERSION ($OS/$ARCH)
 
-LICENSES AND SECURITY RUNTIME SOURCE
+LICENSES
   NL-Veil: MIT (LICENSE). Dependencies retain their own licenses.
   Optional security tools connect to an external service through an API key.
-  https://github.com/gary23w/nl-veil/tree/v$VERSION/cloud
+  https://github.com/gary23w/nl-veil/blob/v$VERSION/LICENSE
 
 RUN IT
   Windows        double-click start.cmd  (or veil.exe)
@@ -194,7 +193,7 @@ OTHER WAYS TO RUN
   veil cast "<goal>"     deploy a swarm
   veil list | stop <id>  fleet control
 
-Everything is local: your data lives in ./data, your keys stay on this machine.
+Local state lives in ./data. Hosted models and enabled cloud features use configured services.
 
 UPDATES (v1.1.3 and later)
   Settings -> App updates -> Update & restart. Finish active work first.

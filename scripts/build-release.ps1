@@ -89,10 +89,10 @@ veil.exe %*
 @"
 the veil - v$Version ($Os/$Arch)
 
-LICENSES AND SECURITY RUNTIME SOURCE
+LICENSES
   NL-Veil: MIT (LICENSE). Dependencies retain their own licenses.
   Optional security tools connect to an external service through an API key.
-  https://github.com/gary23w/nl-veil/tree/v$Version/cloud
+  https://github.com/gary23w/nl-veil/blob/v$Version/LICENSE
 
 Run:  double-click start.cmd  (or veil.exe directly - same thing)
 It opens the desktop dashboard and runs its server on http://127.0.0.1:8787,
