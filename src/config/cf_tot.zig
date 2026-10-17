@@ -2869,99 +2869,19 @@ test "a cloud tot cannot fetch old public agent source or bypass dashboard onboa
     try tt.expectEqual(@as(usize, 1), srv.countCalls("POST", "/v1/garrett/result"));
 }
 
-test "Agent Garrett deploys on its own, with no tater-tot in the account: its pair is derived for a chat or a swarm, a runtime that arrives later is pointed at it, removing the tots keeps it, and removing it touches no tots" {
+test "legacy security deployment directs users to the API-key integration without changing state" {
     const gpa = tt.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
     defer threaded.deinit();
-    const io = threaded.io();
-    const root = "zig-cftot-garrett-solo-tmp";
-    var ta = try http.testApp(gpa, io, root);
+    var ta = try http.testApp(gpa, threaded.io(), "zig-cftot-garrett-connect-tmp");
     defer ta.deinit();
-    if (!curlRuns(gpa, io)) return error.SkipZigTest;
-
-    const routes = [_]fakehttp.Route{
-        .{ .method = "PUT", .path = "/workers/scripts/veil-garrett-upload", .reply = StandIn.ok },
-        .{ .method = "POST", .path = "/workers/scripts/veil-garrett-upload/subdomain", .reply = StandIn.ok },
-        .{ .method = "DELETE", .path = "/workers/scripts/veil-garrett-upload", .reply = StandIn.ok },
-        .{ .method = "PUT", .path = "/build/", .reply = fakehttp.wire("{\"success\":true}") },
-        .{ .method = "PUT", .path = "/workers/scripts/veil-garrett-gary", .reply = StandIn.ok },
-        .{ .method = "GET", .path = "/workers/durable_objects/namespaces", .reply = fakehttp.wire("{\"success\":true,\"result\":[{\"id\":\"gary-namespace\",\"script\":\"veil-garrett-gary\",\"class\":\"GaryContainer\"}]}") },
-
-        .{ .method = "GET", .path = "/garrett/wrangler.toml", .reply = StandIn.toml },
-        .{ .method = "GET", .path = "/garrett/contents/src", .reply = StandIn.list },
-        .{ .method = "GET", .path = "/garrett/src/index.js", .reply = StandIn.src_index },
-        .{ .method = "GET", .path = "/garrett/src/neuron_core.wasm", .reply = StandIn.src_wasm },
-        .{ .method = "GET", .path = "/garrett/src/", .reply = StandIn.src_mjs },
-        .{ .method = "GET", .path = "/accounts/acct/workers/subdomain", .reply = StandIn.subdomain },
-        .{ .method = "GET", .path = "/workers/scripts/veil-garrett/settings", .reply = StandIn.no_script },
-    };
-    var srv: fakehttp.Server = undefined;
-    try srv.startRouted(io, &routes, StandIn.ok);
-    var running = true;
-    defer if (running) srv.stop();
-    var rb: [80]u8 = undefined;
-    ta.app.cf_api_root = try std.fmt.bufPrint(&rb, "http://127.0.0.1:{d}/client/v4", .{srv.port});
-    var ub: [80]u8 = undefined;
-    const stand_in = try std.fmt.bufPrint(&ub, "http://127.0.0.1:{d}", .{srv.port});
-    var arena = std.heap.ArenaAllocator.init(gpa);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const tok: Tok = .{ .key = "oauth-bearer", .account_id = "acct" };
-
-    // 1: no tot, no runtime - the launch goes through: the modules, the address, the upload, its three secrets,
-    //    its route. Nothing is put on a tots' Worker that is not there, and no runtime is told.
-    var st: State = .{ .token_gen = 2 };
-    if (launchGarrett(&ta.app, a, 1, tok, &st)) |msg| {
-        std.debug.print("launch refused: {s}\n", .{msg});
-        return error.TestUnexpectedResult;
-    }
-    try tt.expectEqualStrings(stand_in, st.garrett_url);
+    var st: State = .{ .token_gen = 2, .garrett_url = "https://existing.example.com", .garrett_account = "acct" };
+    const tok: Tok = .{ .key = "unused-test-token", .account_id = "acct" };
+    const message = launchGarrett(&ta.app, gpa, 1, tok, &st) orelse return error.TestUnexpectedResult;
+    try tt.expect(std.mem.indexOf(u8, message, "API key") != null);
+    try tt.expectEqualStrings("https://existing.example.com", st.garrett_url);
     try tt.expectEqualStrings("acct", st.garrett_account);
-    try tt.expectEqual(@as(u32, 2), st.garrett_gen);
-    try tt.expectEqualStrings("", st.url); // still no tots
-    try tt.expectEqualStrings(stand_in, readState(&ta.app, 1, a).garrett_url);
-    // what a chat turn or a swarm deployment derives IS the bearer the Worker was given
-    const creds = cf_garrett.credsFor(&ta.app, 1, a) orelse return error.TestUnexpectedResult;
-    var mb: [64]u8 = undefined;
-    try tt.expectEqualStrings(garrettToken(&ta.app, 1, "acct", 2, &mb), creds.token);
-    try tt.expectEqualStrings(try std.fmt.allocPrint(a, "{s}/mcp", .{stand_in}), creds.mcp_url);
-    // 2: the tots arrive later: their new runtime is pointed at it (ensureRuntime's step, on its own)
-    try tt.expect(pointTotsAtGarrett(&ta.app, a, 1, tok, st) == null);
-    // 3: the tots go (teardown): the agent stays, its account and generation pinned past the bump
-    st.account = "acct";
-    st.url = stand_in;
-    try tt.expect(removeScript(&ta.app, a, 1, tok, &st) == null);
-    try tt.expectEqual(@as(u32, 3), st.token_gen);
-    try tt.expectEqualStrings("", st.url);
-    try tt.expectEqualStrings(stand_in, st.garrett_url);
-    try tt.expectEqualStrings("acct", st.garrett_account);
-    try tt.expectEqual(@as(u32, 2), st.garrett_gen);
-    const still = cf_garrett.credsFor(&ta.app, 1, a) orelse return error.TestUnexpectedResult;
-    try tt.expectEqualStrings(creds.token, still.token);
-    // 4: removed on its own, with no runtime to tell and no tots' secrets to take
-    try tt.expect(removeGarrett(&ta.app, a, 1, tok, &st) == null);
-    try tt.expectEqualStrings("", st.garrett_url);
-    try tt.expectEqualStrings("", st.garrett_account);
-    try tt.expect(cf_garrett.credsFor(&ta.app, 1, a) == null);
-
-    srv.stop();
-    running = false;
-    try tt.expectEqual(@as(?usize, 0), srv.firstCall("GET", "/garrett/wrangler.toml"));
-    try tt.expectEqual(@as(?usize, 1), srv.firstCall("GET", "/garrett/contents/src"));
-    try tt.expectEqual(@as(usize, 5), srv.countCalls("GET", "/garrett/src/"));
-    try tt.expect(srv.firstCall("PUT", "/accounts/acct/workers/scripts/veil-garrett") != null);
-    try tt.expectEqual(@as(usize, 1), srv.countCallsExact("PUT", "/client/v4/accounts/acct/workers/scripts/veil-garrett"));
-    try tt.expectEqual(@as(usize, 1), srv.countCallsExact("PUT", "/client/v4/accounts/acct/workers/scripts/veil-garrett-gary"));
-    try tt.expectEqual(@as(usize, 3), srv.countCalls("PUT", "/workers/scripts/veil-garrett/secrets"));
-    try tt.expect(srv.firstCall("POST", "/workers/scripts/veil-garrett/subdomain") != null);
-    try tt.expect(srv.firstCall("PUT", "/workers/scripts/veil-tots/secrets") != null);
-    try tt.expectEqual(@as(usize, 2), srv.countCalls("PUT", "/workers/scripts/veil-tots/secrets"));
-    try tt.expectEqual(@as(usize, 0), srv.countCalls("POST", "/v1/garrett/result"));
-    try tt.expectEqual(@as(usize, 0), srv.countCalls("POST", "/v1/garrett/clear"));
-    try tt.expectEqual(@as(usize, 0), srv.countCalls("DELETE", "/workers/scripts/veil-tots/secrets/"));
-    try tt.expect(srv.firstCall("DELETE", "/workers/scripts/veil-tots?force=true") != null);
-    try tt.expect(srv.firstCall("DELETE", "/workers/scripts/veil-garrett?force=true") != null);
-    try tt.expect(srv.call_count > 19 and srv.call_count < 128);
+    try tt.expectEqual(@as(u32, 2), st.token_gen);
 }
 
 test "this build's tot.js is offered to the tots as the next runtime revision over a deployed host runtime, backs off a refusal, and is never offered over a tot's own" {
