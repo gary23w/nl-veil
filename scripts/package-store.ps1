@@ -109,16 +109,13 @@ if (-not $StageOnly -and (Test-Path -LiteralPath $packagePath)) {
 }
 $stage = Join-Path $OutputDirectory ('stage-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $stage | Out-Null
-foreach ($subdir in @('bin', 'cloud', 'Assets', 'licenses')) {
+foreach ($subdir in @('bin', 'Assets', 'licenses')) {
     New-Item -ItemType Directory -Path (Join-Path $stage $subdir) | Out-Null
 }
 Copy-Item -LiteralPath $AppPath -Destination (Join-Path $stage 'veil.exe')
 Copy-Item -LiteralPath $NeuronPath -Destination (Join-Path $stage 'bin\neuron.exe')
 Copy-Item -LiteralPath (Join-Path $RepoRoot 'LICENSE') -Destination (Join-Path $stage 'LICENSE')
 Copy-Item -LiteralPath (Join-Path $RepoRoot 'desk\assets\fonts\OFL.txt') -Destination (Join-Path $stage 'licenses\OpenDyslexic-OFL.txt')
-foreach ($file in @('GARY-LICENSE', 'gary-source.tar.gz', 'gary-bootstrap.py', 'gary-gateway.mjs', 'gary-worker.mjs', 'security-tools.txt')) {
-    Copy-Item -LiteralPath (Join-Path $RepoRoot "cloud\$file") -Destination (Join-Path $stage "cloud\$file")
-}
 # No veil-install.txt: this distribution is updated exclusively through the Store.
 # Generate required resolutions from the actual app artwork, preserving its alpha channel.
 Add-Type -AssemblyName System.Drawing
