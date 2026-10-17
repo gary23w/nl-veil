@@ -1,6 +1,6 @@
 # the veil v1.1.24
 
-Portable application downloads built from the current cleaned source.
+Portable application downloads built from cleaned main commit [7b54f295](https://github.com/gary23w/nl-veil/commit/7b54f2950a8957cbcdf82f312a44407db1a832c0).
 
 ## Changes
 
@@ -19,11 +19,11 @@ Download the full bundle for your platform from this release, extract it, and ru
 | macOS Apple Silicon | `veil-v1.1.24-macos-arm64.zip` |
 | macOS Intel | `veil-v1.1.24-macos-x86_64.zip` |
 
-Existing portable installations from v1.1.3 onward can use **Settings → Updates → App updates → Update & restart** once the release is published. Platform checksum files and standalone server builds are provided separately.
+Existing portable installations from v1.1.3 onward can use **Settings → Updates → App updates → Update & restart** with this release. Platform checksum files and standalone server builds are provided separately.
 
 ## Verification
 
-The release workflow runs the full acceptance gates and native bundle/version, installation, updater and Cloudflare transport checks. Every platform must pass before publication. Manual release builds remain drafts for final artifact-content verification.
+The full acceptance gates and native installation, version, updater and Cloudflare transport checks passed on Windows, Linux, Apple Silicon macOS and Intel macOS. All 21 assets passed GitHub SHA-256 and published-checksum verification. Each portable bundle contains exactly seven approved files. Targeted private-data and retired-runtime fingerprint checks passed before publication.
 
 ## License
 

@@ -1,5 +1,9 @@
 # Desktop updates and release connectivity
 
+## v1.1.24
+
+Portable downloads are available again for Windows, Linux and both Mac architectures. This release excludes the retired bundled security runtime and uses sanitized source examples. Optional security tools connect with an API key. Official bundles are checked against an explicit seven-file package list. [Release details](release/RELEASE-v1.1.24.md).
+
 ## v1.1.23
 
 Nothing to do after updating. Every chat request is now built from the conversation's store: each message is written to a `graph.jsonl` beside the conversation's `messages.jsonl` as it lands, and each tool result's payload is indexed in neuron-db. An existing conversation starts its store at its next turn, so its earlier turns reach the store only through what that turn's history window still holds. Set `NL_CONTEXT=fold` before starting the server to go back to the v1.1.22 fold-and-carry path (it still writes the store), or `NL_CONTEXT_CAPTURE=0` to write no store at all, which also runs the fold-and-carry path. Chats on Claude Opus 4.7 and later work again with nothing to change: the first call to such a model learns to drop `temperature` and remembers it in `provider_quirks.jsonl`. v1.1.22 was never published; its changes ship here.
@@ -14,7 +18,7 @@ Nothing to do after updating. Gary's 4tope is on by default: when a long turn co
 
 ## v1.1.12
 
-This release adds the full Agent Garrett toolset and dedicated Cloudflare runtime. After updating, reconnect an existing Cloudflare login once for Containers permissions, then choose **Settings → Models → Deploy security tools** (or **Update security tools**). The animated loading bar remains visible while the cloud runtime prepares. Re-enable Agent Garrett separately for each feature that should use it; the chat control is beside auto-loop. [Release results](release/RELEASE-v1.1.12.md) · [Security setup](docs-src/guide/security-tools.md).
+Historical release: v1.1.12 introduced a bundled security runtime. That runtime and its deployment path have since been retired; current versions connect to optional security tools with an API key. [Release results](release/RELEASE-v1.1.12.md) · [Security setup](docs-src/guide/security-tools.md).
 
 In v1.1.3, the updater is directly under Settings → App updates. In v1.1.4, use the Updates page.
 
