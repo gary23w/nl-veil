@@ -8,7 +8,7 @@ the Veil (nl-veil) is an open-source desktop app for building software with AI. 
 let specialist agents share the work, and carry project memory
 into your next session. Use the built-in model, Ollama, or an OpenAI-compatible endpoint.
 
-**[Download the desktop app](https://github.com/gary23w/nl-veil/releases/latest)** ·
+**[Build the desktop app](#install)** ·
 **[Get it from the Microsoft Store](https://apps.microsoft.com/detail/9MVQ78SK0CW6)** (Windows) ·
 **[Screenshot walkthrough: setup & build with Cloudflare AI](https://gary23w.github.io/nl-veil/demos/)** ·
 [Installation and requirements](#install) · [Try your first task](#try-your-first-task)
@@ -536,32 +536,9 @@ raylib is a *lazy* dependency, so `-Dapp=false` never fetches it at all.
 
 ## Install
 
-**Download it and run it — no toolchain, nothing to build.** Grab your platform's bundle from the
-**[latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.1.23)**, unzip, and run `veil`:
-
-| You're on | Download | Then run |
-|---|---|---|
-| **Windows** | `veil-…-windows-x86_64.zip` | `veil.exe` |
-| **macOS** (Apple Silicon) | `veil-…-macos-arm64.zip` | `./veil` |
-| **macOS** (Intel) | `veil-…-macos-x86_64.zip` | `./veil` |
-| **Linux** | `veil-…-linux-x86_64.zip` | `./veil` |
-
-That single action starts the local server **and** opens the desktop app.
-
-> **Take the `veil-…` bundle for your OS — not "Source code (zip)".** GitHub attaches a source archive
-> to every release automatically: it's the raw repo, building it needs the Zig compiler, and the
-> `install.ps1` inside is a *developer* script. The `veil-server-…` assets are the **headless** server
-> for remote boxes — no desktop app.
-
-> **The downloads are unsigned.** On Windows, the [Microsoft Store version](https://apps.microsoft.com/detail/9MVQ78SK0CW6) is signed by
-> Microsoft and installs with no prompt. The zip from GitHub shows *"Windows protected your PC"* →
-> **More info → Run anyway**. macOS says the developer can't be verified → **right-click → Open** (or
-> `xattr -dr com.apple.quarantine <folder>`). Signing certificates are still on the list.
-
-<details><summary><b>Build from source instead</b> — contributors (needs Zig 0.16+)</summary>
-
-These installers **clone the repo and build it**, so they need [Zig 0.16+](https://ziglang.org) on
-`PATH`. This is the contributor path, *not* the quick start.
+Historical portable application downloads have been withdrawn. Build from the current `main`
+source until replacement binaries are published. The source installers below clone and build
+the repository and require [Zig 0.16+](https://ziglang.org) on `PATH`.
 
 **macOS / Linux**
 ```sh
@@ -581,7 +558,6 @@ zig build run
 The `veil` binary (Zig) and the neuron-db memory engine (Rust) are built for you on first run — each
 with a prompt before it downloads anything. Point `--neuron-bin` / `--bin` at existing binaries to
 skip the builds.
-</details>
 
 ## Start it
 
@@ -696,15 +672,10 @@ a large model rather than an assumption borrowed from a 12B.
 Written for someone who is not a developer. **If you only want it on your own machine, stop after
 step 5** — the rest is about letting other people in.
 
-### 1. Download and unblock it
+### 1. Build the current source
 
-Grab the bundle for your OS from the [latest release](https://github.com/gary23w/nl-veil/releases/tag/v1.1.23)
-and unzip it somewhere you'll find again. Builds are unsigned, so:
-
-- **Windows** shows *"Windows protected your PC"* → **More info** → **Run anyway**. The
-  [Microsoft Store version](https://apps.microsoft.com/detail/9MVQ78SK0CW6) is signed by Microsoft and installs without it.
-- **macOS** says the developer can't be verified → **right-click the `veil` file → Open** → **Open**.
-  (Or `xattr -dr com.apple.quarantine <folder>` in Terminal.)
+Follow [Install](#install) to build the current `main` source. Historical portable application
+downloads are no longer distributed.
 
 ### 2. Run it
 
