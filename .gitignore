@@ -124,3 +124,10 @@ scripts/sim/tests/
 
 
 marketing/
+
+# Private assistant instructions and session logs
+.claude/
+.codex/
+AGENTS.md
+CLAUDE.md
+harness/LEDGER.md

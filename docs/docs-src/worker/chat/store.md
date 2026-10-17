@@ -8,7 +8,7 @@
 
 ## Why it exists
 
-Conversation context is captured and retrieved directly.
+The conversation store captures messages as a chat runs and retrieves relevant context directly from neuron-db. The first implementation used the [net](#doc=worker/chat/net) to package a carry when a turn's working context had to be compressed. This module stores and retrieves context directly: nothing is compressed and nothing is carried.
 
 ## Capture
 

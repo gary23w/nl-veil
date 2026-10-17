@@ -8,7 +8,7 @@
 
 ## The name
 
-A conversation is a higher-dimensional object that a model can only read one-dimensionally, the way a 4-polytope can only be seen through its net: cells joined along shared faces, cut along a spanning tree and laid flat. The whole question is which tree to cut along. The answer, is the shortest-path tree from where the work stands; and the part that must never be cut away is the longest path back from it. Its sibling is the [tool tree](#doc=worker/chat/belt): the same idea applied to the belt instead of the transcript.
+A conversation is a higher-dimensional object that a model can only read one-dimensionally, the way a 4-polytope can only be seen through its net: cells joined along shared faces, cut along a spanning tree and laid flat. The whole question is which tree to cut along. The design uses the shortest-path tree from where the work stands; and the part that must never be cut away is the longest path back from it. Its sibling is the [tool tree](#doc=worker/chat/belt): the same idea applied to the belt instead of the transcript.
 
 ## The problem
 

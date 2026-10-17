@@ -76,10 +76,6 @@ pub fn build(b: *std.Build) void {
     // The tot runtime (config/cf_tot.zig uploads it into the user's Cloudflare account as it is).
     exe.root_module.addAnonymousImport("tot.js", .{ .root_source_file = b.path("cloud/tot.js") });
     exe.root_module.addAnonymousImport("tot_py.py", .{ .root_source_file = b.path("cloud/tot_py.py") });
-    exe.root_module.addAnonymousImport("gary-worker.mjs", .{ .root_source_file = b.path("cloud/gary-worker.mjs") });
-    exe.root_module.addAnonymousImport("gary-gateway.mjs", .{ .root_source_file = b.path("cloud/gary-gateway.mjs") });
-    exe.root_module.addAnonymousImport("gary-bootstrap.py", .{ .root_source_file = b.path("cloud/gary-bootstrap.py") });
-    exe.root_module.addAnonymousImport("gary-source.tar.gz", .{ .root_source_file = b.path("cloud/gary-source.tar.gz") });
     exe.root_module.addAnonymousImport("security-tools.txt", .{ .root_source_file = b.path("cloud/security-tools.txt") });
     exe.root_module.addAnonymousImport("neuron-db.mjs", .{ .root_source_file = b.path("cloud/neuron-db.mjs") });
     exe.root_module.addAnonymousImport("neuron_core.wasm", .{ .root_source_file = b.path("cloud/neuron_core.wasm") });
@@ -230,10 +226,6 @@ pub fn build(b: *std.Build) void {
     }
     tests.root_module.addAnonymousImport("tot.js", .{ .root_source_file = b.path("cloud/tot.js") }); // config/cf_tot.zig
     tests.root_module.addAnonymousImport("tot_py.py", .{ .root_source_file = b.path("cloud/tot_py.py") });
-    tests.root_module.addAnonymousImport("gary-worker.mjs", .{ .root_source_file = b.path("cloud/gary-worker.mjs") });
-    tests.root_module.addAnonymousImport("gary-gateway.mjs", .{ .root_source_file = b.path("cloud/gary-gateway.mjs") });
-    tests.root_module.addAnonymousImport("gary-bootstrap.py", .{ .root_source_file = b.path("cloud/gary-bootstrap.py") });
-    tests.root_module.addAnonymousImport("gary-source.tar.gz", .{ .root_source_file = b.path("cloud/gary-source.tar.gz") });
     tests.root_module.addAnonymousImport("security-tools.txt", .{ .root_source_file = b.path("cloud/security-tools.txt") });
     tests.root_module.addAnonymousImport("neuron-db.mjs", .{ .root_source_file = b.path("cloud/neuron-db.mjs") });
     tests.root_module.addAnonymousImport("neuron_core.wasm", .{ .root_source_file = b.path("cloud/neuron_core.wasm") });

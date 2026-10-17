@@ -1,11 +1,8 @@
 //! GARY'S 4TOPE — the conversation's working span as a dependency graph, and the continuation as its unfolding.
 //!
-//! Conversation context is captured and retrieved directly.
-//! only read one-dimensionally, the way a 4-polytope can only be seen through its net — cells joined along shared
-//! faces, cut along a spanning tree and laid flat. The question is which tree to cut along. The answer, from the
-//! pages he pointed at, is the shortest-path tree from where the work stands, and the part that must never be cut
-//! away is the longest path back from it. Same family as the tool tree (belt.zig): both are bounded views of a
-//! structure too big to show whole, walked from the frontier, with the engine holding the map.
+//! A conversation is represented as a dependency graph. A shortest-path tree from the frontier
+//! determines its unfolding; the longest dependency path preserves the critical chain.
+//! The tool tree (belt.zig) applies the same bounded-view approach to tool discovery.
 //!
 //! Compaction and continuation used to be a writing problem: when the span grew past its budget a model was asked
 //! to paraphrase the older part, and when a turn crossed its spend ceiling a model was asked to write a ~180-word
@@ -13,7 +10,7 @@
 //! the second one is what the user watched scroll past four times in one task and read, correctly, as the harness
 //! losing the thread. Both are retrieval problems, and retrieval has algorithms.
 //!
-//! Conversation context is captured and retrieved directly.
+//! Three results underpin the design:
 //!
 //!   * LONGEST PATH is NP-hard on a general graph and LINEAR on a DAG: order the vertices topologically and take,
 //!     for each, one more than the best of its predecessors (the critical path method is this on a schedule). A

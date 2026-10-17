@@ -44,7 +44,7 @@ explain what the veil is; this page is only what changed.
 
 ### Memory rides every thought
 
-**Durable memory is an event the engine observes, never a step it drives.** Say *"I am now 29 years old"* and
+**Durable memory is an event the engine observes, never a step it drives.** Say *"I prefer concise answers"* and
 the veil writes the right `FORGET:`/`REMEMBER:` pair; the engine applies it, strips the lines from what you
 see, and — this is the new part — records that it did so, as an engine row under the reply and a status line
 on screen. Before, that silence read as "not done". In the armed loop the step picker named the directive

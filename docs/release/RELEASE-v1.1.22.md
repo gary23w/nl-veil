@@ -27,4 +27,4 @@ From v1.1.3 or later, finish active work and choose **Settings → Updates → A
 
 ## Licenses and corresponding source
 
-NL-Veil code is licensed under MIT. The Gary security runtime is licensed under AGPL-3.0. Its source archive and Cloudflare build sources are available in the repository and included in full release bundles. Dependencies retain their own licenses.
+NL-Veil app code is licensed under MIT. Dependencies and separately distributed components retain their own licenses. Current security-tool integration connects to an external service through an API key.

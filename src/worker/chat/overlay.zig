@@ -438,7 +438,7 @@ test "the overlay cannot recall its own rendering: a render adds no fact, and a 
     defer o.deinit();
     o.setGoal("write a container isolation article for example.com");
     _ = o.seedBlock("the site is a Jekyll blog: posts live in _posts with front matter and an excerpt under 160 chars\n" ++
-        "tool web_fetch spire cgroup spoofing: the article explains node attestation via cgroup paths\n", .conv);
+        "tool web_fetch container isolation: the article explains process namespaces\n", .conv);
     const n0 = o.field.facts.items.len;
     try std.testing.expectEqual(@as(usize, 2), n0);
     const blk = o.render() orelse return error.TestUnexpectedResult;

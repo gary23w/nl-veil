@@ -9332,7 +9332,7 @@ fn personalFact(fact: []const u8) ?[]const u8 {
     };
     // Does the fact refer to THIS user? First-person only — deliberately strict so a general-knowledge observe
     // ("that's the api key rotation interval") can't slip into the private store. Explicit third-person personal
-    // secrets ("gary's password …") are expected to go via a REMEMBER: line (which the prompt steers hard), not
+    // secrets ("alex's password …") are expected to go via a REMEMBER: line (which the prompt steers hard), not
     // through this observe backstop; missing them is the safe (false-negative) direction.
     const mine = H.has(low, "my ") or std.mem.startsWith(u8, low, "i ") or H.has(low, " i ") or std.mem.startsWith(u8, low, "i'");
     if (mine) {
@@ -9440,7 +9440,7 @@ test "the Memory tab follows the server: a memory frame re-reads the store mid-t
     const l1 = "{\"cat\":\"fact\",\"text\":\"User's name is Alex\"}\n";
     const l2 = "{\"cat\":\"fact\",\"text\":\"Alex is 29 years old\"}\n";
     const l3 = "{\"cat\":\"preference\",\"text\":\"deploys to us-west-2\"}\n";
-    const l4 = "{\"cat\":\"login\",\"text\":\"forum user is gary\"}\n";
+    const l4 = "{\"cat\":\"login\",\"text\":\"forum user is alex\"}\n";
     Io.Dir.cwd().writeFile(io, .{ .sub_path = mine, .data = l1 }) catch unreachable;
     var store = std.testing.allocator.create(Store) catch unreachable;
     defer std.testing.allocator.destroy(store);
@@ -12492,10 +12492,10 @@ test "personalFact mirrors personal observes but leaves general knowledge hive-o
     // personal credentials/prefs -> a category (mirrored into the private Memory tab)
     try std.testing.expectEqualStrings("key", personalFact("my openai api key is sk-abc123").?);
     try std.testing.expectEqualStrings("login", personalFact("my password is hunter2").?);
-    try std.testing.expectEqualStrings("login", personalFact("my login email is gary@x.com").?);
+    try std.testing.expectEqualStrings("login", personalFact("my login email is alex@example.com").?);
     // third-person possessive is intentionally NOT mirrored via observe (goes through REMEMBER: instead) — bias to
     // false-negative so a general-knowledge observe can never leak into the private secret store
-    try std.testing.expect(personalFact("gary's password is 123456") == null);
+    try std.testing.expect(personalFact("alex's password is 123456") == null);
     try std.testing.expectEqualStrings("preference", personalFact("I prefer dark mode and concise answers").?);
     try std.testing.expectEqualStrings("preference", personalFact("I always deploy to us-west-2").?);
     // GENERAL knowledge must NOT be mirrored (stays hive-only) — the false-positive class we must avoid
@@ -12510,7 +12510,7 @@ test "exchangeHasDurableSignal fires on personal facts + commitments, not ordina
     try std.testing.expect(exchangeHasDurableSignal("I always deploy to us-west-2 and I use pnpm"));
     try std.testing.expect(exchangeHasDurableSignal("my api key is sk-123"));
     try std.testing.expect(exchangeHasDurableSignal("please remember my staging host"));
-    try std.testing.expect(exchangeHasDurableSignal("my name is gary"));
+    try std.testing.expect(exchangeHasDurableSignal("my name is alex"));
     // commitments / schedule the user states in passing (the previously-missed cases)
     try std.testing.expect(exchangeHasDurableSignal("today we have to go to therapy at 12pm"));
     try std.testing.expect(exchangeHasDurableSignal("set an alarm to remind me before the meeting"));
@@ -14625,7 +14625,7 @@ test "announcesAction: catches the narrate-without-act fizzles, never final answ
     // real final answers must never trigger
     try std.testing.expect(!announcesAction("The output is: `2026-07-09`"));
     try std.testing.expect(!announcesAction("Done! The **ping** scheduled task is set and will trigger a message box saying \"ping\" in about 30 seconds from now. You'll see it pop up momentarily."));
-    try std.testing.expect(!announcesAction("Done! If you ever want to change the time, cancel it, or set another reminder, just let me know. Good luck with your appointment, Gary!"));
+    try std.testing.expect(!announcesAction("Done! If you ever want to change the time, cancel it, or set another reminder, just let me know. Good luck with your appointment, Alex!"));
     try std.testing.expect(!announcesAction("Should I run the command now?")); // a question hands the turn over
     try std.testing.expect(!announcesAction("")); // empty
     // courtesy closings commit to nothing — the verb must FOLLOW the ack, not float in the tail

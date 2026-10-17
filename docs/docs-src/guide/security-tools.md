@@ -53,7 +53,7 @@ MCP credentials stay on the NL-Veil server for desktop and CLI chat calls. Each 
 
 ## Licenses and corresponding source
 
-NL-Veil code uses its MIT license. Legacy v1.1.12 self-hosted Gary bundles include the Gary security runtime source under AGPL-3.0. The source archive and Cloudflare build sources remain available with that release. Current dashboard onboarding connects to the managed service. Dependencies retain their own licenses.
+NL-Veil code uses its [MIT license](https://github.com/gary23w/nl-veil/blob/main/LICENSE). The current integration connects to the managed service using an API key. Its implementation is not bundled in NL-Veil. Dependencies retain their own licenses.
 
 ## Tater-tot schema discovery
 

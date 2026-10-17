@@ -1,9 +1,7 @@
 //! store.zig — Gary's 4tope as the conversation's memory: the store, and the prompt that is unfolded from it.
 //!
-//! Conversation context is captured and retrieved directly.
-//! Conversation context is captured and retrieved directly.
-//! context". The first implementation (v1.1.16 to v1.1.22) used the net to PACKAGE a carry when a turn's working
-//! context had to be compressed. This module is the design as framed: nothing is compressed and nothing is carried.
+//! Earlier versions packaged a carry when a turn's working context had to be compressed.
+//! This module captures the conversation directly and retrieves relevant context without a rolling summary.
 //!
 //!   * CAPTURE as the chat runs. Every message of every turn — the ask that opened it, each step with its calls,
 //!     each tool result as the model saw it, each answer — is appended to `{conv}/graph.jsonl` the moment it

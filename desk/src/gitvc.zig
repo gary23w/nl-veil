@@ -303,16 +303,19 @@ pub fn strayTokenByte(pat: []const u8) ?StrayByte {
         if (std.ascii.isAlphanumeric(c) or c == '_') continue;
         // What the byte is, for the message. A classifier, not an escaper: every control byte is named by its value,
         // as the range arm below names the rest of them.
-        return .{ .at = i, .what = switch (c) {
-            '"', '\'' => "a quote",
-            '\\' => "a backslash",
-            0x0a, 0x0d => "a line break", // LF, CR
-            ' ' => "a space",
-            0x09 => "a tab",
-            0x00...0x08, 0x0b, 0x0c, 0x0e...0x1f, 0x7f => "a control character", // the rest below 0x20, and DEL
-            0x80...0xff => "a non-ASCII character",
-            else => "a symbol",
-        } };
+        return .{
+            .at = i,
+            .what = switch (c) {
+                '"', '\'' => "a quote",
+                '\\' => "a backslash",
+                0x0a, 0x0d => "a line break", // LF, CR
+                ' ' => "a space",
+                0x09 => "a tab",
+                0x00...0x08, 0x0b, 0x0c, 0x0e...0x1f, 0x7f => "a control character", // the rest below 0x20, and DEL
+                0x80...0xff => "a non-ASCII character",
+                else => "a symbol",
+            },
+        };
     }
     return null;
 }

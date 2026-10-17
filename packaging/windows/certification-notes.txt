@@ -26,12 +26,7 @@ the bundled app and Neuron engine remain in the read-only package directory.
 Microsoft Store manages app updates. The portable GitHub updater is disabled
 for packaged processes, including its direct apply entry point.
 
-The optional Gary security runtime is AGPL-3.0. Its license, notice and
-corresponding source archive are shipped in cloud/. The app code is MIT.
-
-Windows App Certification Kit's optional Archive files usage check flags
-cloud/gary-source.tar.gz. This is corresponding source for the optional Gary
-runtime, not an archive of executables extracted and launched on the host.
+The app code is MIT. Optional security tools connect to an external service using an API key. No security runtime source archive is embedded in the app or shipped in current bundles.
 The optional Blocked executables check flags the bundled Neuron subprocess
 and user-requested command execution. These are core developer-tool features
 covered by the runFullTrust justification. Windows in S mode is not supported.

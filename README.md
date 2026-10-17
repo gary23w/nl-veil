@@ -11,9 +11,9 @@ into your next session. Use the built-in model, Ollama, or an OpenAI-compatible 
 **[Download the desktop app](https://github.com/gary23w/nl-veil/releases/latest)** ·
 **[Get it from the Microsoft Store](https://apps.microsoft.com/detail/9MVQ78SK0CW6)** (Windows) ·
 **[Screenshot walkthrough: setup & build with Cloudflare AI](https://gary23w.github.io/nl-veil/demos/)** ·
-[Installation and requirements](#install) · [Try your first task](#try-your-first-task) · [Email info](mailto:61893883+gary23w@users.noreply.github.com)
+[Installation and requirements](#install) · [Try your first task](#try-your-first-task)
 
-Windows · macOS · Linux · [MIT app code and AGPL security runtime](#license). Local inference needs no provider account or API key;
+Windows · macOS · Linux · [MIT app code](#license). Local inference needs no provider account or API key;
 hosted providers have their own data handling and costs. The built-in model requires a separate
 download, and coding tools require Python on `PATH` (some checks also use Node).
 
@@ -348,7 +348,7 @@ so they never cross the public internet and need no API key.
   through them, names the tater-tot in every request it makes and holds it to read-only verification;
   `/leash 3600` holds the goal loop whenever your veil has not been heard from for an hour (the guard goes on)
   and releases it the moment it is back. A tater-tot never runs on with nobody's veil alive.
-- **Agent Garrett, the full security toolkit.** [The agent](https://github.com/gary23w/garrettstimpson.ca/tree/main/agent) contributes 166 tools: 94 existing security tools and 72 Gary tools. **Settings → Models → Deploy security tools** provisions its edge MCP Worker, private execution Worker, dedicated Cloudflare Container and R2 storage in your Cloudflare account. The first cloud build needs no local Docker or separate Linux host; the button shows an animated loading bar during preparation. Existing Cloudflare logins need to reconnect once for Containers permissions.
+- **Agent Garrett, the full security toolkit.** Connect the optional managed security service using its API key in **Settings → Models → Deploy security tools**. Tool availability depends on the connected service. NL-Veil does not bundle its implementation.
   Enable **Agent Garrett: on** beside the chat's auto-loop, or check **Agent Garrett** in the swarm or tater-tot deploy form. Each opted-in feature receives individual `security_<name>` tools with typed arguments; `garrett_tools` and `garrett` remain compatibility wrappers. Chat calls keep the MCP bearer on the server. The cloud filesystem is separate from your local machine, which NL-Veil supplies through its local harness when requested. [Setup, personal defense and lab workflows](docs/docs-src/guide/security-tools.md).
 
 - **A console you can read.** Each event is one line saying what happened; a row that went wrong is red.
@@ -613,8 +613,7 @@ prompt for auth. It is a file readable only by your OS user — opening the port
 make a local file more reachable. **Any `veil <verb>` auto-starts the server if it isn't already up.**
 
 **Where your stuff lives:** a `data/` folder **next to the `veil` binary** — conversations, memory,
-swarm workdirs, logs, all of it. Nothing is written to a system temp dir and nothing leaves the
-machine. Move the folder and you move the whole install; back it up and you've backed up everything.
+swarm workdirs, logs, all of it. Hosted model requests and enabled cloud features send data to the configured services. Cloudflare R2 backup is enabled once connected; review [data handling](docs/privacy.html) before connecting. Move the folder to move local state; back it up to preserve it.
 (From a source checkout it resolves to the repo's own `data/`, so dev and release never share state.)
 
 ## The built-in model — nothing to install
@@ -665,7 +664,7 @@ no restart. An install manifest beside the weights records what is installed and
 
 A tool array is JSON, and on the compact tier it is still ~3 KB of nested schema sitting far behind
 the conversation. Asked whether it has a browser, a 12B does not re-read that JSON — it answers from
-impression. Observed live (`cae8d34d5`): the model ran `list_dir` hunting for its browser tools *in
+impression. For example: the model ran `list_dir` hunting for its browser tools *in
 the filesystem*, read the empty directory as proof, and denied a browser it was holding.
 
 So the compact tier appends one generated line naming the belt it was actually handed
@@ -1700,4 +1699,4 @@ cortex).
 
 ## License
 
-NL-Veil code is licensed under MIT. The Gary security runtime is licensed under AGPL-3.0. Its source archive and Cloudflare build sources are available in the repository and included in full release bundles. Dependencies retain their own licenses.
+NL-Veil code is licensed under [MIT](LICENSE). Optional security tools connect to an external service; its implementation is not bundled in this repository. Dependencies retain their own licenses.

@@ -145,7 +145,6 @@ cp "$SERVER" "$B/veil$EXE"
 printf '%s\n' 'veil-bundle-v1' > "$B/veil-install.txt"
 cp "$ROOT/LICENSE" "$B/LICENSE"
 mkdir -p "$B/cloud"
-cp "$ROOT/cloud/GARY-LICENSE" "$ROOT/cloud/gary-source.tar.gz" "$ROOT/cloud/gary-bootstrap.py" "$ROOT/cloud/gary-gateway.mjs" "$ROOT/cloud/gary-worker.mjs" "$ROOT/cloud/security-tools.txt" "$B/cloud/"
 # Raw assets avoid needing Git or archive tools on the user's machine. GitHub supplies SHA-256 digests
 # in the release API; the updater requires them and verifies size + digest before staging either file.
 cp "$SERVER" "$OUT/veil-update-v$VERSION-$OS-$ARCH-app"
@@ -177,8 +176,8 @@ cat > "$B/README.txt" <<TXT
 the veil — v$VERSION ($OS/$ARCH)
 
 LICENSES AND SECURITY RUNTIME SOURCE
-  NL-Veil: MIT (LICENSE). Gary: AGPL-3.0 (cloud/GARY-LICENSE).
-  Source: cloud/gary-source.tar.gz.
+  NL-Veil: MIT (LICENSE). Dependencies retain their own licenses.
+  Optional security tools connect to an external service through an API key.
   https://github.com/gary23w/nl-veil/tree/v$VERSION/cloud
 
 RUN IT

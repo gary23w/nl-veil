@@ -1434,7 +1434,7 @@ test "wmFold: watermark typography folds; code fences and chunk splits survive" 
 
 test "scrubAccountIds: provider-error account tokens mask, prose survives" {
     var b: [420]u8 = undefined;
-    // the live shape: a suspension error quoting the org id and key alias
+    // Synthetic provider error with fictional organization and key identifiers
     const got = scrubAccountIds(&b, "Your account org-example0000000000000000000000000 <ak-example000000000000> is suspended due to insufficient balance");
     try std.testing.expect(std.mem.indexOf(u8, got, "org-exam**") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "example0000000000000000000000000") == null);
@@ -5381,7 +5381,7 @@ fn storeGate(name: []const u8, head: []const u8) nstore.Gate {
     return .keep;
 }
 
-/// Conversation context is captured and retrieved directly.
+/// THE DEFAULT SINCE v1.1.23 : every request is unfolded
 /// from the conversation's store (store.zig) — no fold, no carry, no rolling summary. Measured before it was made the
 /// default: 5 of 5 facts planted in tool output recalled against the fold-and-carry path's 0 of 5. NL_CONTEXT=fold
 /// (or carry/off/0) restores the fold-and-carry path; anything else, unset included, is the net.

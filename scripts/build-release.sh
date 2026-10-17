@@ -105,7 +105,6 @@ cp "$SERVER" "$OUT/veil$EXE"
 printf '%s\n' 'veil-bundle-v1' > "$OUT/veil-install.txt"
 cp "$ROOT/LICENSE" "$OUT/LICENSE"
 mkdir -p "$OUT/cloud"
-cp "$ROOT/cloud/GARY-LICENSE" "$ROOT/cloud/gary-source.tar.gz" "$ROOT/cloud/gary-bootstrap.py" "$ROOT/cloud/gary-gateway.mjs" "$ROOT/cloud/gary-worker.mjs" "$ROOT/cloud/security-tools.txt" "$OUT/cloud/"
 cp "$SERVER" "$DIST/veil-update-v$VERSION-$OS-$ARCH-app"
 cp "$neuron" "$DIST/veil-update-v$VERSION-$OS-$ARCH-neuron"
 
@@ -132,8 +131,8 @@ cat > "$OUT/README.txt" <<TXT
 the veil — v$VERSION ($OS/$ARCH)
 
 LICENSES AND SECURITY RUNTIME SOURCE
-  NL-Veil: MIT (LICENSE). Gary: AGPL-3.0 (cloud/GARY-LICENSE).
-  Source: cloud/gary-source.tar.gz.
+  NL-Veil: MIT (LICENSE). Dependencies retain their own licenses.
+  Optional security tools connect to an external service through an API key.
   https://github.com/gary23w/nl-veil/tree/v$VERSION/cloud
 
 Run:
