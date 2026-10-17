@@ -308,12 +308,16 @@ rm -rf "$STAGE"
 # binaries sitting in bin/ (veil-scratch.exe, veil-synapse.exe, ...) and the bundle DIRECTORY, which isn't a file.
 ( cd "$OUT"
   set --
-  for f in "veil-v$VERSION-$OS-$ARCH.tar.gz" "veil-v$VERSION-$OS-$ARCH.zip" veil-update-v"$VERSION"-"$OS"-"$ARCH"-* server-only/veil-server-v"$VERSION"-* MANIFEST.txt; do
+  for f in "veil-v$VERSION-$OS-$ARCH.tar.gz" "veil-v$VERSION-$OS-$ARCH.zip" veil-update-v"$VERSION"-"$OS"-"$ARCH"-* server-only/veil-server-v"$VERSION"-*; do
     [ -f "$f" ] && set -- "$@" "$f"
   done
   [ "$#" -gt 0 ] || exit 0
   if command -v sha256sum >/dev/null 2>&1; then sha256sum "$@" > SHA256SUMS.txt
   elif command -v shasum >/dev/null 2>&1; then shasum -a 256 "$@" > SHA256SUMS.txt
+  fi
+  if [ -f SHA256SUMS.txt ]; then
+    sed 's|server-only/||' SHA256SUMS.txt > SHA256SUMS.tmp
+    mv SHA256SUMS.tmp SHA256SUMS.txt
   fi )
 
 say "done → bin/"

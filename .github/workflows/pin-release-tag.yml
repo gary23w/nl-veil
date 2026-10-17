@@ -1,0 +1,40 @@
+name: Pin verified release tag
+
+# Repair a missing tag after native artifacts have already passed their checks.
+# GITHUB_TOKEN keeps this maintenance action from starting duplicate tag builds.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Stable version tag for verified artifacts
+        required: true
+        type: string
+      commit:
+        description: Exact 40-character source commit used to build the artifacts
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  pin:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Pin tag without replacing an existing ref
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_COMMIT: ${{ inputs.commit }}
+        run: |
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$RELEASE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          test "$(gh api "repos/$GITHUB_REPOSITORY/commits/$RELEASE_COMMIT" --jq '.sha')" = "$RELEASE_COMMIT"
+          if ! EXISTING=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha' 2>/dev/null); then
+            EXISTING=""
+          fi
+          if [ -z "$EXISTING" ]; then
+            gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" -f "ref=refs/tags/$RELEASE_TAG" -f "sha=$RELEASE_COMMIT"
+          else
+            test "$EXISTING" = "$RELEASE_COMMIT"
+          fi
