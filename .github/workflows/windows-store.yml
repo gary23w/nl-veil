@@ -174,10 +174,10 @@ jobs:
           if ($report.development -or (Get-FileHash -LiteralPath $package.FullName -Algorithm SHA256).Hash -ne $report.packageSha256) { throw 'Package integrity or identity check failed' }
           if ($env:USE_STORE_OIDC -eq 'true') {
             Import-Module ./scripts/store-oidc.psm1 -Force
-            Invoke-MicrosoftStoreWithOidc -Arguments @('publish', $packageRoot, '--appId', $env:STORE_PRODUCT_ID, '--inputFile', $package.FullName)
+            Invoke-MicrosoftStoreWithOidc -Arguments @('publish', $package.FullName, '--appId', $env:STORE_PRODUCT_ID)
             Invoke-MicrosoftStoreWithOidc -Arguments @('submission', 'status', $env:STORE_PRODUCT_ID)
           } else {
-            msstore publish $packageRoot --appId $env:STORE_PRODUCT_ID --inputFile $package.FullName
+            msstore publish $package.FullName --appId $env:STORE_PRODUCT_ID
             if ($LASTEXITCODE -ne 0) { throw 'Microsoft Store update submission failed' }
             msstore submission status $env:STORE_PRODUCT_ID
             if ($LASTEXITCODE -ne 0) { throw 'Could not verify submission status' }
