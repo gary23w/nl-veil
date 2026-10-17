@@ -731,7 +731,7 @@ pub const Poller = struct {
             self.refreshSched();
         }
 
-        // 1b'') swarm-lineage proposals awaiting review (Memory pane). Slow: they only appear when a cast ends,
+        // 1b'') swarm-lineage proposals awaiting review (Swarm tab > Lineages). Slow: they only appear when a cast ends,
         // and each lineage listed costs the server a few neuron subprocesses.
         if (online and now_s - self.last_lin_s >= 30) {
             self.last_lin_s = now_s;

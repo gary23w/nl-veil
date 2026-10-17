@@ -26,7 +26,7 @@ The end-of-run judge (`rsi.runJudge`) proposes durable lessons and skills into `
 
 ## Usage Context
 
-Called by the lineage review routes (`deploy/lineage_api.zig`), reached from `veil lineage accept|reject`, the desk's Memory pane, and the lineage bench's promote/gate arms. `run.proposeHabits` calls `habitKnown`, and `rsi.runJudge` reads `proposals-rejected` into its "never re-propose" list.
+Called by the lineage review routes (`deploy/lineage_api.zig`), reached from `veil lineage accept|reject`, the desk's Swarm > Lineages view, and the lineage bench's promote/gate arms. `run.proposeHabits` calls `habitKnown`, and `rsi.runJudge` reads `proposals-rejected` into its "never re-propose" list.
 
 ## Notable Implementation Details
 

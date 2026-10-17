@@ -23,7 +23,7 @@ A lineage (`veil cast … --lineage <id>`) keeps one neuron-db across casts at `
 
 ## Usage Context
 
-Registered in `main.zig` beside the swarm routes and listed in its router audit (`ROUTE_MODS`). Called by `veil lineage`, the desk poller (Memory pane), and `scripts/sim/lineage.py`.
+Registered in `main.zig` beside the swarm routes and listed in its router audit (`ROUTE_MODS`). Called by `veil lineage`, the desk poller (Swarm > Lineages view), and `scripts/sim/lineage.py`.
 
 ## Notable Implementation Details
 

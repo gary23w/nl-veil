@@ -6009,10 +6009,8 @@ fn drawMemText(text: []const u8, x: f32, y0: f32, size: i32, color: t.Color, max
 fn drawChatMemory(store: *Store, r: t.Rect) void {
     var rows: [128]store_mod.MemRow = undefined;
     var props: [12]store_mod.PropRow = undefined;
-    var lprops: [store_mod.MAX_LIN_PROPS]store_mod.LinPropRow = undefined;
     var n: usize = 0;
     var np: usize = 0;
-    var nl: usize = 0;
     {
         store.lock();
         defer store.unlock();
@@ -6020,15 +6018,13 @@ fn drawChatMemory(store: *Store, r: t.Rect) void {
         @memcpy(rows[0..n], store.chat_mem[0..n]);
         np = @min(store.chat_prop_count, props.len);
         @memcpy(props[0..np], store.chat_props[0..np]);
-        nl = @min(store.lin_prop_count, lprops.len);
-        @memcpy(lprops[0..nl], store.lin_props[0..nl]);
     }
     var yy0: f32 = r.y + 40;
     t.textClip("keys, logins & preferences the veil keeps for you", @intFromFloat(r.x + 12), @intFromFloat(yy0), 11, t.comment, @intFromFloat(r.width - 20));
     yy0 += 15;
     t.textClip(t.z("{d} saved  -  private to this machine", .{n}), @intFromFloat(r.x + 12), @intFromFloat(yy0), 11, t.comment, @intFromFloat(r.width - 20));
     yy0 += 22;
-    if (n == 0 and np == 0 and nl == 0) {
+    if (n == 0 and np == 0) {
         t.text(t.z("nothing saved yet", .{}), @intFromFloat(r.x + 12), @intFromFloat(yy0 + 6), 12, t.fg_dim);
         t.textClip("tell the veil something to keep -", @intFromFloat(r.x + 12), @intFromFloat(yy0 + 30), 11, t.comment, @intFromFloat(r.width - 20));
         t.textClip("\"my openai key is sk-...\", a login,", @intFromFloat(r.x + 12), @intFromFloat(yy0 + 46), 11, t.comment, @intFromFloat(r.width - 20));
@@ -6042,8 +6038,6 @@ fn drawChatMemory(store: *Store, r: t.Rect) void {
     {
         var pi: usize = 0;
         while (pi < np) : (pi += 1) total += 24 + @as(f32, @floatFromInt(memLineCount(props[pi].text_len, 12, txtw))) * 16 + 30;
-        var li: usize = 0;
-        while (li < nl) : (li += 1) total += 24 + @as(f32, @floatFromInt(memLineCount(lprops[li].text_len, 12, txtw))) * 16 + 30;
         var i: usize = 0;
         while (i < n) : (i += 1) total += 24 + @as(f32, @floatFromInt(memLineCount(rows[i].text_len, 12, txtw))) * 16 + 6;
     }
@@ -6085,33 +6079,6 @@ fn drawChatMemory(store: *Store, r: t.Rect) void {
         }
         y += card_h;
     }
-    // SWARM LINEAGES — what a cast's end-of-run judge and habit miner proposed for the lineage's memory. Keeping
-    // one promotes it into the live scope the NEXT cast of that lineage recalls from; dropping it is remembered
-    // so it is not proposed again. Decided by the poller over the server API, not by the chat thread.
-    var lin_accept: ?usize = null;
-    var lin_reject: ?usize = null;
-    var li: usize = 0;
-    while (li < nl) : (li += 1) {
-        const p = &lprops[li];
-        const lines = memLineCount(p.text_len, 12, txtw);
-        const card_h = 24 + @as(f32, @floatFromInt(lines)) * 16 + 30;
-        if (y + card_h >= view.y and y <= view.y + view.height) {
-            const card = t.Rect{ .x = view.x + 4, .y = y + 2, .width = view.width - 8, .height = card_h - 4 };
-            t.panelBordered(card, t.bg, t.blue);
-            const chip: []const u8 = switch (p.kind) {
-                1 => "skill?",
-                2 => "habit?",
-                3 => "fact?",
-                else => "lesson?",
-            };
-            t.textClip(t.z("[{s}] swarm lineage '{s}' - not yet binding", .{ chip, p.lineageStr() }), @intFromFloat(card.x + 8), @intFromFloat(card.y + 6), 11, t.blue, @intFromFloat(card.width - 16));
-            _ = drawMemText(p.textStr(), card.x + 8, card.y + 24, 12, t.fg, txtw);
-            const by = card.y + card_h - 30;
-            if (t.button(.{ .x = card.x + 8, .y = by, .width = t.btnW("keep", 22), .height = 22 }, t.z("keep", .{}), t.green, true)) lin_accept = li;
-            if (t.buttonGhost(.{ .x = card.x + 8 + t.btnW("keep", 22) + 8, .y = by, .width = t.btnW("drop", 22), .height = 22 }, t.z("drop", .{}), t.red, true)) lin_reject = li;
-        }
-        y += card_h;
-    }
     var i: usize = 0;
     while (i < n) : (i += 1) {
         const m = &rows[i];
@@ -6141,13 +6108,6 @@ fn drawChatMemory(store: *Store, r: t.Rect) void {
     if (reject_idx) |ri| {
         const tag = [1]u8{'0' + props[ri].scope};
         store.pushChatCmd(store_mod.mkChatCmd(.prop_reject, tag[0..1], props[ri].textStr()));
-    }
-    const lin_pick: ?usize = lin_accept orelse lin_reject;
-    if (lin_pick) |k| {
-        // "<scope>\n<exact text>" — the poller splits it back; the server decides by the exact stored text
-        var pk: [1024]u8 = undefined;
-        const packed_text = std.fmt.bufPrint(&pk, "{s}\n{s}", .{ lprops[k].scopeStr(), lprops[k].textStr() }) catch return;
-        store.pushCmd(store_mod.mkCmd(if (lin_accept != null) .lineage_accept else .lineage_reject, lprops[k].lineageStr(), packed_text));
     }
 }
 
@@ -7037,15 +6997,24 @@ fn miniBars(x: f32, y: f32, w: f32, h: f32, label: []const u8, vals: []const f32
 /// Swarm tab > Lineages: each lineage's memory, what waits for review, and its casts over time - the place to see
 /// whether a lineage is getting better. The history is the engine's own record (history.jsonl): the round score is
 /// the swarm's self-assessment, the rounds and tokens are what each cast actually spent.
+///
+/// What a cast's end-of-run judge and habit miner proposed for the lineage's memory is drawn under that lineage:
+/// one keep/drop card per proposal with its whole text word-wrapped (a reviewer has to read what they are judging).
+/// Keeping one promotes it into the live scope the NEXT cast of that lineage recalls from; dropping it is remembered
+/// so it is not proposed again. Decided by the poller over the server API, not by the chat thread.
 fn drawLineages(store: *Store, body: t.Rect) void {
     var rows: [store_mod.MAX_LINEAGES]store_mod.LineageRow = undefined;
+    var props: [store_mod.MAX_LIN_PROPS]store_mod.LinPropRow = undefined;
     var n: usize = 0;
+    var np: usize = 0;
     var seen = false;
     {
         store.lock();
         defer store.unlock();
         n = @min(store.lineage_count, rows.len);
         @memcpy(rows[0..n], store.lineages[0..n]);
+        np = @min(store.lin_prop_count, props.len);
+        @memcpy(props[0..np], store.lin_props[0..np]);
         seen = store.lineages_seen;
     }
     const x = body.x + t.PAD;
@@ -7059,8 +7028,23 @@ fn drawLineages(store: *Store, body: t.Rect) void {
         return;
     }
     const view = t.Rect{ .x = body.x, .y = y0, .width = body.width, .height = body.y + body.height - y0 - 4 };
-    const card_h: f32 = 196;
-    const total = @as(f32, @floatFromInt(n)) * (card_h + 10);
+    const base_h: f32 = 196; // a lineage card with nothing to review
+    const cw = w - 24; // inside the card
+    const pw = cw - 16; // inside a proposal sub-card: the width its text wraps at
+    const lh = @round(16 * t.uiScale()); // one wrapped line of 13px text
+    // a card grows by a sub-card per pending proposal, so the heights come first (the scroll range needs them all)
+    var card_hs: [store_mod.MAX_LINEAGES]f32 = undefined;
+    var total: f32 = 0;
+    for (rows[0..n], 0..) |*row, i| {
+        var h = base_h;
+        for (props[0..np]) |*p| {
+            if (!std.mem.eql(u8, p.lineageStr(), row.idStr())) continue;
+            var lines: [LIN_PROP_LINES][]const u8 = undefined;
+            h += linPropCardH(wrapInto(p.textStr(), pw, &lines), lh) + 6;
+        }
+        card_hs[i] = h;
+        total += h + 10;
+    }
     const max_scroll = if (total > view.height) total - view.height else 0;
     const wheel = rl.getMouseWheelMove();
     if (wheel != 0 and t.hovering(view)) ui.lin_scroll -= wheel * 3 * 18;
@@ -7068,17 +7052,18 @@ fn drawLineages(store: *Store, body: t.Rect) void {
     rl.beginScissorMode(@intFromFloat(view.x), @intFromFloat(view.y), @intFromFloat(view.width), @intFromFloat(view.height));
     defer rl.endScissorMode();
     var use_idx: ?usize = null;
-    var review = false;
+    var accept_idx: ?usize = null; // keep/drop clicks on a proposal - acted on after the draw loop, never mid-draw
+    var reject_idx: ?usize = null;
     var y = view.y - ui.lin_scroll;
     for (rows[0..n], 0..) |*row, i| {
+        const card_h = card_hs[i];
         defer y += card_h + 10;
         if (y + card_h < view.y or y > view.y + view.height) continue;
         const card = t.Rect{ .x = x, .y = y, .width = w, .height = card_h };
         t.panelBordered(card, t.bg, t.border);
         const cx = card.x + 12;
-        const cw = card.width - 24;
         t.text(t.z("{s}", .{row.idStr()}), @intFromFloat(cx), @intFromFloat(card.y + 10), 15, t.fg);
-        t.textClip(t.z("{d} cast(s)   {d} facts   {d} lessons   {d} skills   {d} playbook   {d} rejected", .{ row.casts, row.facts, row.lessons, row.skills, row.playbook, row.rejected }), @intFromFloat(cx), @intFromFloat(card.y + 32), 12, t.comment, @intFromFloat(cw));
+        t.textClip(t.z("{d} cast(s)   {d} facts   {d} lessons   {d} skills   {d} playbook   {d} rejected   {d} awaiting review", .{ row.casts, row.facts, row.lessons, row.skills, row.playbook, row.rejected, row.pending }), @intFromFloat(cx), @intFromFloat(card.y + 32), 12, t.comment, @intFromFloat(cw));
         // the per-cast trend: score up and cost down is a lineage getting better
         var pct: [store_mod.LINEAGE_HIST]f32 = undefined;
         var rnd: [store_mod.LINEAGE_HIST]f32 = undefined;
@@ -7115,22 +7100,61 @@ fn drawLineages(store: *Store, body: t.Rect) void {
         } else {
             t.textClip(if (hn == 0) "no casts recorded yet - history starts with the next cast" else "one cast so far - the trend starts at the second", @intFromFloat(cx), @intFromFloat(ty), 12, t.comment, @intFromFloat(cw));
         }
+        // PROPOSALS awaiting review, under the trend: a bordered sub-card each, the text wrapped in full
+        var py = ty + 22;
+        for (props[0..np], 0..) |*p, k| {
+            if (!std.mem.eql(u8, p.lineageStr(), row.idStr())) continue;
+            var lines: [LIN_PROP_LINES][]const u8 = undefined;
+            const ln = wrapInto(p.textStr(), pw, &lines);
+            const sub = t.Rect{ .x = cx, .y = py, .width = cw, .height = linPropCardH(ln, lh) };
+            t.panelBordered(sub, t.bg_dark, t.blue);
+            const chip: []const u8 = switch (p.kind) {
+                1 => "skill?",
+                2 => "habit?",
+                3 => "fact?",
+                else => "lesson?",
+            };
+            t.textClip(t.z("[{s}] proposed - not yet binding", .{chip}), @intFromFloat(sub.x + 8), @intFromFloat(sub.y + 6), 11, t.blue, @intFromFloat(pw));
+            var ly = sub.y + 22;
+            for (lines[0..ln]) |line| {
+                t.textClip(line, @intFromFloat(sub.x + 8), @intFromFloat(ly), 13, t.fg, @intFromFloat(pw));
+                ly += lh;
+            }
+            const ky = ly + 4;
+            if (t.button(.{ .x = sub.x + 8, .y = ky, .width = t.btnW("keep", 22), .height = 22 }, t.z("keep", .{}), t.green, true)) accept_idx = k;
+            if (t.buttonGhost(.{ .x = sub.x + 8 + t.btnW("keep", 22) + 8, .y = ky, .width = t.btnW("drop", 22), .height = 22 }, t.z("drop", .{}), t.red, true)) reject_idx = k;
+            py += sub.height + 6;
+        }
         const bty = card.y + card_h - 34;
         if (t.button(.{ .x = cx, .y = bty, .width = t.btnW("cast again", 24), .height = 24 }, t.z("cast again", .{}), t.blue, true)) use_idx = i;
-        if (row.pending > 0) {
-            const rl_lbl = t.z("review {d} proposal(s)", .{row.pending});
-            if (t.buttonGhost(.{ .x = cx + t.btnW("cast again", 24) + 10, .y = bty, .width = t.btnW(rl_lbl, 24), .height = 24 }, rl_lbl, t.green, true)) review = true;
-        }
     }
     if (use_idx) |i| {
         setField(&ui.d_lineage, rows[i].idStr());
         ui.swarm_inner = .deploy;
     }
-    if (review) {
-        // the keep/drop cards live in the Chat tab's Memory pane
-        ui.tab = .chat;
-        ui.right_tab = .memory;
+    const pick: ?usize = accept_idx orelse reject_idx;
+    if (pick) |k| {
+        // "<scope>\n<exact text>" - the poller splits it back; the server decides by the exact stored text
+        var pk: [1024]u8 = undefined;
+        const packed_text = std.fmt.bufPrint(&pk, "{s}\n{s}", .{ props[k].scopeStr(), props[k].textStr() }) catch return;
+        store.pushCmd(store_mod.mkCmd(if (accept_idx != null) .lineage_accept else .lineage_reject, props[k].lineageStr(), packed_text));
     }
+}
+
+/// Wrapped lines a proposal card can hold: a LinPropRow text (<= 900 bytes) never needs more at any width the
+/// Swarm tab can have.
+const LIN_PROP_LINES = 64;
+
+/// Height of one proposal sub-card in the Lineages view: its chip line, `lines` wrapped text lines of `lh` each
+/// (never fewer than one), and the keep/drop row. Pure.
+fn linPropCardH(lines: usize, lh: f32) f32 {
+    return 22 + @as(f32, @floatFromInt(@max(lines, 1))) * lh + 32;
+}
+
+test "linPropCardH: one line minimum, then one lh per wrapped line" {
+    try std.testing.expectEqual(@as(f32, 70), linPropCardH(0, 16));
+    try std.testing.expectEqual(@as(f32, 70), linPropCardH(1, 16));
+    try std.testing.expectEqual(linPropCardH(1, 16) + 4 * 16, linPropCardH(5, 16));
 }
 
 fn drawSwarmLive(store: *Store, body: t.Rect) void {

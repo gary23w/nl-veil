@@ -1039,7 +1039,7 @@ pub const Store = struct {
     chat_props: [12]PropRow = undefined,
     chat_prop_count: usize = 0,
 
-    // --- swarm-lineage proposals awaiting review (poller writes; Memory pane reads) ---
+    // --- swarm-lineage proposals awaiting review (poller writes; the Swarm tab's Lineages view reads) ---
     lin_props: [MAX_LIN_PROPS]LinPropRow = undefined,
     lin_prop_count: usize = 0,
     // --- swarm lineages + their cast history (poller writes; the Swarm tab's Lineages view reads) ---

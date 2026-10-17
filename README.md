@@ -1318,7 +1318,7 @@ model's own claims:
   a reviewed step like every other proposal.
 - **Review closes the loop across casts.** Under a lineage, the end-of-run judge's lessons and skills and
   the mined habits wait in the lineage's quarantine until someone decides: `veil lineage show <id>`, then
-  `veil lineage accept|reject <id> <n>`, or keep/drop on the card in the desktop's Memory pane. An accepted
+  `veil lineage accept|reject <id> <n>`, or keep/drop on the card under the lineage in the desktop's Swarm > Lineages view. An accepted
   proposal goes into the live memory the next cast of that lineage recalls; a rejected one is remembered so
   the judge and the miner do not propose it again. The same habit no longer comes back every run as a new line.
 - **What a lineage keeps is the task, not just the process.** The judge also proposes **facts**: requirements a
