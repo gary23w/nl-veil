@@ -1,5 +1,9 @@
 # Desktop updates and release connectivity
 
+## v1.1.25
+
+Nothing to do after updating. A swarm lineage's proposals awaiting review now appear under that lineage in **Swarm → Lineages** instead of the chat's Memory tab, each with its full text. [Release details](release/RELEASE-v1.1.25.md).
+
 ## v1.1.24
 
 Portable downloads are available again for Windows, Linux and both Mac architectures. This release excludes the retired bundled security runtime and uses sanitized source examples. Optional security tools connect with an API key. Official bundles are checked against an explicit seven-file package list. [Release details](release/RELEASE-v1.1.24.md).

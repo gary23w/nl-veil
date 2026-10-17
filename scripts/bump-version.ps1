@@ -57,7 +57,15 @@ $edits = @(
     # non-prerelease happened to be newest -- a `builtin-assets-*` blob with one irrelevant file in it. Every
     # Download button on the README and the docs site sent people there. An explicit tag cannot do that.
     @{ file = (Join-Path $repo "README.md");                 find = 'releases/tag/v[^\s")]+';             repl = "releases/tag/v$Version" },
-    @{ file = (Join-Path $repo "docs\index.html");           find = 'releases/tag/v[^\s")]+';             repl = "releases/tag/v$Version" },
+    # Since v1.1.24 the README's install table and the site's four Download buttons link each platform's bundle
+    # DIRECTLY (releases/download/vX/veil-vX-<platform>.zip), and the README names the release in the link text
+    # (**[vX](...)**). The releases/tag pattern sees none of them, and the site has no releases/tag link left, so
+    # these match the exact old version: nothing but that release's own links can be caught.
+    @{ file = (Join-Path $repo "README.md");                 find = ('releases/download/v' + [regex]::Escape($old) + '/'); repl = "releases/download/v$Version/" },
+    @{ file = (Join-Path $repo "README.md");                 find = ('veil-v' + [regex]::Escape($old) + '-');              repl = "veil-v$Version-" },
+    @{ file = (Join-Path $repo "README.md");                 find = ('(\*\*\[v)' + [regex]::Escape($old) + '(\]\()');      repl = "`${1}$Version`${2}" },
+    @{ file = (Join-Path $repo "docs\index.html");           find = ('releases/download/v' + [regex]::Escape($old) + '/'); repl = "releases/download/v$Version/" },
+    @{ file = (Join-Path $repo "docs\index.html");           find = ('veil-v' + [regex]::Escape($old) + '-');              repl = "veil-v$Version-" },
     # The shields.io badge needs its own entry: the badge path DOUBLES every literal hyphen
     # (1.0.1-beta-2 -> v1.0.1--beta--2), so the releases/tag pattern above cannot see it. It was the one
     # stamp this script missed on the beta-1 -> beta-2 bump.

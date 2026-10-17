@@ -8,7 +8,7 @@ the Veil (nl-veil) is an open-source desktop app for building software with AI. 
 let specialist agents share the work, and carry project memory
 into your next session. Use the built-in model, Ollama, or an OpenAI-compatible endpoint.
 
-**[Download the desktop app](https://github.com/gary23w/nl-veil/releases/tag/v1.1.24)** ·
+**[Download the desktop app](https://github.com/gary23w/nl-veil/releases/tag/v1.1.25)** ·
 **[Get it from the Microsoft Store](https://apps.microsoft.com/detail/9MVQ78SK0CW6)** (Windows) ·
 **[Screenshot walkthrough: setup & build with Cloudflare AI](https://gary23w.github.io/nl-veil/demos/)** ·
 [Installation and requirements](#install) · [Try your first task](#try-your-first-task)
@@ -38,7 +38,7 @@ code and credentials from anything you share.
 
 <p>
   <a href="https://github.com/gary23w/nl-veil/actions/workflows/release.yml"><img alt="build" src="https://github.com/gary23w/nl-veil/actions/workflows/release.yml/badge.svg"></a>
-  <a href="https://github.com/gary23w/nl-veil/releases"><img alt="release" src="https://img.shields.io/badge/release-v1.1.24-A8241B"></a>
+  <a href="https://github.com/gary23w/nl-veil/releases"><img alt="release" src="https://img.shields.io/badge/release-v1.1.25-A8241B"></a>
   <img alt="zig" src="https://img.shields.io/badge/zig-0.16-F7A41D?logo=zig&logoColor=white">
   <a href="https://huggingface.co/gary23w/the-veil-12b"><img alt="built-in model" src="https://img.shields.io/badge/built--in%20model-the--veil--12b-6E4A27?logo=huggingface&logoColor=white"></a>
   <a href="https://huggingface.co/gary23w/gary-neuron-emergent"><img alt="memory cortex" src="https://img.shields.io/badge/cortex-gary--neuron--emergent-6E4A27?logo=huggingface&logoColor=white"></a>
@@ -536,16 +536,16 @@ raylib is a *lazy* dependency, so `-Dapp=false` never fetches it at all.
 
 ## Install
 
-Download your platform's full application bundle from **[v1.1.24](https://github.com/gary23w/nl-veil/releases/tag/v1.1.24)**, extract it,
+Download your platform's full application bundle from **[v1.1.25](https://github.com/gary23w/nl-veil/releases/tag/v1.1.25)**, extract it,
 and run `veil.exe` on Windows or `./start` on macOS/Linux. The bundle includes the desktop
 application and memory engine; model weights are downloaded separately in the app.
 
 | Platform | Application bundle |
 |---|---|
-| Windows x86-64 | [veil-v1.1.24-windows-x86_64.zip](https://github.com/gary23w/nl-veil/releases/download/v1.1.24/veil-v1.1.24-windows-x86_64.zip) |
-| Linux x86-64 | [veil-v1.1.24-linux-x86_64.zip](https://github.com/gary23w/nl-veil/releases/download/v1.1.24/veil-v1.1.24-linux-x86_64.zip) |
-| macOS Apple Silicon | [veil-v1.1.24-macos-arm64.zip](https://github.com/gary23w/nl-veil/releases/download/v1.1.24/veil-v1.1.24-macos-arm64.zip) |
-| macOS Intel | [veil-v1.1.24-macos-x86_64.zip](https://github.com/gary23w/nl-veil/releases/download/v1.1.24/veil-v1.1.24-macos-x86_64.zip) |
+| Windows x86-64 | [veil-v1.1.25-windows-x86_64.zip](https://github.com/gary23w/nl-veil/releases/download/v1.1.25/veil-v1.1.25-windows-x86_64.zip) |
+| Linux x86-64 | [veil-v1.1.25-linux-x86_64.zip](https://github.com/gary23w/nl-veil/releases/download/v1.1.25/veil-v1.1.25-linux-x86_64.zip) |
+| macOS Apple Silicon | [veil-v1.1.25-macos-arm64.zip](https://github.com/gary23w/nl-veil/releases/download/v1.1.25/veil-v1.1.25-macos-arm64.zip) |
+| macOS Intel | [veil-v1.1.25-macos-x86_64.zip](https://github.com/gary23w/nl-veil/releases/download/v1.1.25/veil-v1.1.25-macos-x86_64.zip) |
 
 Choose the full `veil-v…` bundle, rather than GitHub's source archive or the standalone server.
 
@@ -721,7 +721,7 @@ On startup the server prints one complete URL per address this machine answers o
 (`src/main.zig:861-889`, using `src/config/lan.zig`):
 
 ```
-neuron-loops 1.1.24 on http://localhost:8787
+neuron-loops 1.1.25 on http://localhost:8787
     open from another machine (phone, laptop) at:
       http://192.168.1.42:8787
 ```

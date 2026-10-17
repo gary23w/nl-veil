@@ -205,7 +205,7 @@ jobs:
           tag_name: ${{ steps.release.outputs.tag }}
           target_commitish: ${{ github.sha }}
           # Bump this to the current release's notes on every tag (one notes file per release under docs/release/).
-          body_path: docs/release/RELEASE-v1.1.24.md
+          body_path: docs/release/RELEASE-v1.1.25.md
           draft: true
           # A tag with a hyphen in it (v1.0.1-beta-7, v2.0.0-rc.1) is a prerelease; a bare version
           # (v1.1.0) is not. This was hardcoded `true` through every alpha and beta, which was correct
