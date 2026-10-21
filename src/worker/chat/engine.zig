@@ -7452,7 +7452,7 @@ fn shouldPlan(user_text: []const u8) bool {
     // UNAMBIGUOUS multi-step markers — checked BEFORE the question guard so a task phrased with a leading verb like
     // "do a deep dive …" or "audit the engine and categorize …" still plans (these almost never occur in plain Q&A).
     const strong_markers = [_][]const u8{ "audit ", "deep dive", "deep-dive", "step by step", "step-by-step", "from scratch", "end to end", "end-to-end" };
-    for (strong_markers) |m| if (hasWordMarker(low, m)) return true;
+    for (strong_markers) |m| if (hasLiveMarker(low, m)) return true;
     // A clear question / explanation / lookup opener → answer directly, never plan (even if a build verb like
     // "write" appears later, as in "write 200 words explaining X" — that's Q&A, not a build).
     const q_openers = [_][]const u8{
@@ -7469,7 +7469,7 @@ fn shouldPlan(user_text: []const u8) bool {
         "crawl ",    "design a",   "design and", "from scratch", "step by step", "step-by-step", "and then ",  "an app",
         "a website", "a web app",  "a cli",      "a rest api",   "a full ",      "end to end",   "end-to-end",
     };
-    for (task_markers) |m| if (hasWordMarker(low, m)) return true;
+    for (task_markers) |m| if (hasLiveMarker(low, m)) return true;
     return false; // ambiguous / conversational → fast direct answer (no decomposition round-trip)
 }
 
@@ -7511,11 +7511,17 @@ fn planGate(environ: *const std.process.Environ.Map, user_text: []const u8) bool
 /// append-only? Prose only, no tools." read as action-shaped ("append-only" matched the verb "append"), the
 /// prose reply carried claim words, and the zero-tool continuation drove the model into 248 s of re-doing
 /// turn 16's work - fourteen tool calls against the books the user had just said not to touch.
+///
+/// ONLY THIS TURN'S OWN WORDS COUNT. A real-model family run (2026-10-21) opened a sub-chat with "Use open_subchat
+/// to open ONE sub-chat with exactly this goal: 'Without using any tool, ...' Do not read or create any file
+/// yourself. Reply OPENED." The quoted goal is the sub-chat's instruction and "do not read" forbids file work, yet
+/// both read as "no tools" for the primary's turn, which stood the zero-tool guard down: the model planned the
+/// open_subchat call in its reasoning, replied only "OPENED", and no sub-chat was opened. So quoted text is
+/// blanked first (unquotedLower), and a turn that tells the model to run a named tool (requestsTool) needs tools.
 fn toolsForbidden(user_text: []const u8) bool {
+    if (requestsTool(user_text)) return false;
     var buf: [512]u8 = undefined;
-    const n = @min(user_text.len, buf.len);
-    for (user_text[0..n], 0..) |c, i| buf[i] = std.ascii.toLower(c);
-    const low = buf[0..n];
+    const low = unquotedLower(user_text, &buf);
     const markers = [_][]const u8{ "no tools", "no tool ", "without tools", "without a tool", "without reading", "without using", "don't use tools", "do not use tools", "don't use any tool", "do not use any tool", "do not read", "don't read", "prose only", "from memory", "from this conversation only", "no file access", "without looking" };
     for (markers) |m| if (std.mem.indexOf(u8, low, m) != null) return true;
     return false;
@@ -7525,6 +7531,7 @@ fn actionShaped(user_text: []const u8) bool {
     const t = std.mem.trim(u8, user_text, " \r\n\t");
     if (t.len < 12) return false;
     if (toolsForbidden(t)) return false;
+    if (requestsTool(t)) return true; // "Use open_subchat to ..." asks for a tool run, whatever clause follows
     var buf: [256]u8 = undefined;
     const n = @min(t.len, buf.len);
     for (t[0..n], 0..) |c, i| buf[i] = std.ascii.toLower(c);
@@ -7543,6 +7550,96 @@ fn actionShaped(user_text: []const u8) bool {
         for (verbs) |v| if (std.mem.startsWith(u8, clause, v)) return true;
     }
     for (verbs) |v| if (hasWordMarker(low, v)) return true;
+    return false;
+}
+
+/// hasWordMarker, minus the NEGATED mentions (negatedAt); a later live mention of the same marker still counts.
+/// The family run above opened every sub-chat with "... Do not read or create any file yourself. Reply OPENED.",
+/// and shouldPlan's "create " planned each of those openers: one extra call of up to 1,536 output tokens, about
+/// 20 s per opening message.
+fn hasLiveMarker(low: []const u8, marker: []const u8) bool {
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, low, from, marker)) |at| {
+        if ((at == 0 or !std.ascii.isAlphabetic(low[at - 1])) and !negatedAt(low, at)) return true;
+        from = at + 1;
+    }
+    return false;
+}
+
+/// The phrase at `low[at..]` is negated: one of the two words before it is a negator ("do not create", "never
+/// create", "don't build a website"), or the word before it is "or" and the third word back is one ("do not read
+/// or create"). Only spaces may separate those words - any punctuation ends the clause - so "Don't stop: build
+/// the app" and "if it's missing, create it" still ask, and so does "do not forget to create", whose negator is
+/// three words back with no "or".
+fn negatedAt(low: []const u8, at: usize) bool {
+    var words = [3][]const u8{ "", "", "" };
+    var end = at;
+    for (&words) |*w| {
+        while (end > 0 and (low[end - 1] == ' ' or low[end - 1] == '\t')) end -= 1;
+        var start = end;
+        while (start > 0 and (std.ascii.isAlphanumeric(low[start - 1]) or low[start - 1] == '\'' or low[start - 1] >= 0x80)) start -= 1;
+        if (start == end) break; // punctuation or the start of the text: the clause ends here
+        w.* = low[start..end];
+        end = start;
+    }
+    if (isNegator(words[0]) or isNegator(words[1])) return true;
+    return std.mem.eql(u8, words[0], "or") and isNegator(words[2]);
+}
+
+fn isNegator(w: []const u8) bool {
+    for ([_][]const u8{ "not", "never", "nor", "without", "dont" }) |n| if (std.mem.eql(u8, w, n)) return true;
+    return std.mem.endsWith(u8, w, "n't") or std.mem.endsWith(u8, w, "n\u{2019}t");
+}
+
+/// `text` lowercased into `buf` with every CLOSED quoted span blanked to spaces: a goal handed to a sub-chat, a
+/// message forwarded, a phrase quoted back - words this turn passes on rather than says. A double quote or a
+/// backtick pairs with the next of its kind. A single quote opens only where no letter or digit comes before it
+/// and a non-space comes after, and closes only where a non-space comes before and no letter or digit after, so
+/// "don't" and "user's" neither open nor close one. A quote that never closes blanks nothing: an unbalanced quote
+/// never hides the instruction typed after it.
+fn unquotedLower(text: []const u8, buf: []u8) []u8 {
+    const n = @min(text.len, buf.len);
+    for (text[0..n], 0..) |c, i| buf[i] = std.ascii.toLower(c);
+    const low = buf[0..n];
+    var i: usize = 0;
+    while (i < low.len) : (i += 1) {
+        const q = low[i];
+        if (q != '"' and q != '`' and q != '\'') continue;
+        if (q == '\'' and !((i == 0 or !std.ascii.isAlphanumeric(low[i - 1])) and i + 1 < low.len and !std.ascii.isWhitespace(low[i + 1]))) continue;
+        var j = i + 1;
+        const close: ?usize = while (j < low.len) : (j += 1) {
+            if (low[j] != q) continue;
+            if (q != '\'' or (!std.ascii.isWhitespace(low[j - 1]) and (j + 1 == low.len or !std.ascii.isAlphanumeric(low[j + 1])))) break j;
+        } else null;
+        if (close) |c| {
+            @memset(low[i .. c + 1], ' ');
+            i = c;
+        }
+    }
+    return low;
+}
+
+/// The turn's own words tell the model to run a tool by name: a clause outside any quote that opens with "use" or
+/// "call" (after an optional "please"), then an optional "the", then a tool name the static tables know that has
+/// an underscore in it ("Use open_subchat to open ONE sub-chat ..."). A real tool, so "use snake_case" is not one;
+/// an underscore, so a tool named like an English word ("recall", "journal") is not either. Only a clause opener
+/// counts: "how do I use read_file?" asks about a tool, and "do not use web_search" forbids one.
+fn requestsTool(user_text: []const u8) bool {
+    var buf: [512]u8 = undefined;
+    const low = unquotedLower(user_text, &buf);
+    var it = std.mem.tokenizeAny(u8, low, ",.:;?!\n");
+    while (it.next()) |raw| {
+        var c = std.mem.trimStart(u8, raw, " \t-()");
+        if (std.mem.startsWith(u8, c, "please ")) c = std.mem.trimStart(u8, c["please ".len..], " ");
+        if (std.mem.startsWith(u8, c, "use ")) c = c["use ".len..] else if (std.mem.startsWith(u8, c, "call ")) c = c["call ".len..] else continue;
+        c = std.mem.trimStart(u8, c, " ");
+        if (std.mem.startsWith(u8, c, "the ")) c = std.mem.trimStart(u8, c["the ".len..], " ");
+        var e: usize = 0;
+        while (e < c.len and (std.ascii.isAlphanumeric(c[e]) or c[e] == '_')) e += 1;
+        const name = c[0..e];
+        if (name.len > 64 or std.mem.indexOfScalar(u8, name, '_') == null) continue; // knownToolName says yes to an overlong name
+        if (knownToolName("", name)) return true;
+    }
     return false;
 }
 
@@ -7694,6 +7791,64 @@ test "actionShaped: the first clause decides, and a no-tools request is never ac
     try std.testing.expect(actionShaped("Second half of the month's bank export, 300 rows, same format. Same rule: record ONLY `ops` rows."));
     try std.testing.expect(toolsForbidden("Explain, prose only, no tools, what a journal is."));
     try std.testing.expect(!toolsForbidden("Record these 6 transactions."));
+}
+
+// The family run's openers (2026-10-21), verbatim from its harness: every one says "Do not read or create any file
+// yourself", and T3's second one quotes a goal that opens "Without using any tool".
+const FAMILY_OPENER_T1 = "Use open_subchat to open ONE sub-chat with exactly this goal: 'Read intake/t1.md and write its harbour marker into notes/t1.md, then reply DONE.' Do not read or create any file yourself. Reply OPENED.";
+const FAMILY_OPENER_T3 = "Use open_subchat to open ONE sub-chat with exactly this goal: 'Without using any tool, state the channel depth that the other sub-chat of this family found, as DEPTH=<n>.' Do not read or create any file yourself. Reply OPENED.";
+
+test "toolsForbidden: a quoted goal is not this turn's instruction (family run T3)" {
+    const t = std.testing;
+    try t.expect(!toolsForbidden(FAMILY_OPENER_T3));
+    // the same goal handed over with no tool named, in double quotes, and with apostrophes inside single quotes
+    try t.expect(!toolsForbidden("Open a sub-chat whose goal is \"Without using any tool, state the channel depth that the other sub-chat of this family found, as DEPTH=<n>.\""));
+    try t.expect(!toolsForbidden("Open a sub-chat with this goal: 'Summarise the user's notes. Don't read files, do not use tools.' Reply OPENED."));
+    // a quote that never closes hides nothing typed after it
+    try t.expect(toolsForbidden("Explain 'append-only, no tools."));
+}
+
+test "toolsForbidden / actionShaped: a turn that names a tool to run needs tools, whatever else it forbids (family run T1, T3)" {
+    const t = std.testing;
+    try t.expect(knownToolName("", "open_subchat")); // not vacuous: the name is in the static tables
+    for ([_][]const u8{ FAMILY_OPENER_T1, FAMILY_OPENER_T3 }) |opener| {
+        try t.expect(!toolsForbidden(opener)); // "do not read" forbids file work, not the open_subchat call
+        try t.expect(actionShaped(opener));
+    }
+    // asked about, forbidden, inside a quote, or not a tool: no tool is requested
+    try t.expect(!requestsTool("How do I use read_file? Answer from memory."));
+    try t.expect(!requestsTool("Do not use web_search; answer from memory."));
+    try t.expect(!requestsTool("Open a sub-chat with this goal: 'Read the brief. Use web_search to find the tide table.'"));
+    try t.expect(!requestsTool("Without tools, explain when to use snake_case. Use snake_case names in your answer."));
+    try t.expect(requestsTool("Please call the read_file tool on notes/t1.md, then reply DONE."));
+    // so the genuine no-tool turns of the same run still stand the guard down
+    try t.expect(toolsForbidden("What harbour marker did your sub-chat find? Answer with the marker only. Do not use any tool."));
+    try t.expect(toolsForbidden("Which of your sub-chats finished, which failed, and which never ran? Answer as FINISHED=<labels> FAILED=<labels> EMPTY=<labels>. Do not use any tool."));
+    try t.expect(toolsForbidden("How do I use read_file? Answer from memory."));
+    try t.expect(toolsForbidden("Do not use web_search; answer from memory."));
+}
+
+test "emptyReplyRoute: the family T3 opener keeps the zero-tool guard on" {
+    const t = std.testing;
+    const facts = ReplyFacts{
+        .empty = false,
+        .claims_work = claimsWork("Done - the sub-chat is open."),
+        .action = actionShaped(FAMILY_OPENER_T3),
+        .tools_forbidden = toolsForbidden(FAMILY_OPENER_T3),
+        .afk = false,
+        .goal = false,
+        .truncated = false,
+        .reasoning_only = false,
+        .free_form = true,
+        .steps_left = true,
+        .stop_pending = false,
+    };
+    try t.expect(facts.claims_work); // not vacuous
+    try t.expectEqual(@as(?ReplyRoute, .zero_tool), emptyReplyRoute(facts));
+    var empty = facts;
+    empty.empty = true;
+    empty.claims_work = false;
+    try t.expectEqual(@as(?ReplyRoute, .zero_tool), emptyReplyRoute(empty));
 }
 
 test "asksAboutNow / ungroundedNumber: a figure from nowhere is found, a grounded or glued one is not" {
@@ -8523,6 +8678,22 @@ test "shouldPlan: a task marker matches at a word start, never inside one" {
     try std.testing.expect(shouldPlan("Write a small script stats/primes.py that counts the primes below 5000 and writes the count to stats/answer.txt."));
     try std.testing.expect(hasWordMarker("audit the engine", "audit "));
     try std.testing.expect(!hasWordMarker("preaudit the engine", "audit "));
+}
+
+test "shouldPlan: a negated marker does not plan, a genuine build still does (family run openers)" {
+    const t = std.testing;
+    // every family-run opener carries "Do not read or create any file yourself" inside the 192-byte window
+    try t.expect(!shouldPlan(FAMILY_OPENER_T1));
+    try t.expect(!shouldPlan("Use open_subchat to open ONE sub-chat with exactly this goal: 'Read intake/t4.md (a code word) and reply READY. Do not repeat the word.' Do not read or create any file yourself. Reply OPENED."));
+    try t.expect(!shouldPlan("Use open_subchat to open ONE sub-chat with exactly this goal: 'Reply DONE.' Do not read or create any file yourself. Reply OPENED."));
+    try t.expect(!shouldPlan("Please don't create any file; just tell me which config is newer."));
+    try t.expect(!shouldPlan("Please never build anything here, only list the folders."));
+    try t.expect(!shouldPlan("Please don't build a website for this, answer in one line."));
+    // genuine builds, alone and beside a negated mention (a later live mention still counts)
+    try t.expect(shouldPlan("Build a small Flask app with a login page and a dashboard. Do not create a database."));
+    try t.expect(shouldPlan("Please don't create a branch, create a patch file for the fix instead."));
+    try t.expect(shouldPlan("Write a small script stats/primes.py that counts the primes below 5000 and writes the count to stats/answer.txt."));
+    try t.expect(shouldPlan("Please do not forget to create the README for the CLI."));
 }
 
 test "planGate: NL_CHAT_PLAN turns planning off only when an operator means it, and never turns a question on" {
