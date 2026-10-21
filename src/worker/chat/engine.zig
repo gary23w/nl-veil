@@ -3025,6 +3025,17 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     defer gpa.free(gar_schema);
 
     var counters = [_]u32{0} ** 5;
+    // MEMORY WRITE ACCOUNTING for the turn (oscillation.WriteStats): every neuron-db write the turn's Mem makes,
+    // by how it ended, plus the time spent waiting for the user's hive write lock. Declared BEFORE every
+    // write-bearing defer of the turn (the store's final import below, the user-turn observe, the tool-finding
+    // batch, the trust reward, the overlay's strengthening), so this report runs LAST and counts all of them.
+    var mem_writes: osc.WriteStats = .{};
+    defer if (mem_writes.writes() > 0) {
+        var wb: [320]u8 = undefined;
+        const wl = mem_writes.line(&wb);
+        emitKV(app, conv_dir, "trace", "text", wl);
+        if (mem_writes.failed() > 0) memlog.warn("{s}", .{wl});
+    };
     // Lives for the whole turn: `ctx.cancel` borrows it, and a tool may consult it minutes from here.
     var tool_stop = ToolStopCtx{ .app = app, .conv_dir = conv_dir, .ctrl_cursor = ctrl_cursor };
     var ctx = tools.ToolCtx{
@@ -3060,12 +3071,11 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
         .garrett_url = gar_url,
         .garrett_token = gar_tok,
         .garrett_schema = gar_schema,
+        // initChat: the environ that carries each recall's k/hops to the CLI, trust-weighted ranking, the per-user
+        // hive write lock every turn of this user queues on, and the spawn bound (see oscillation.Mem.initChat).
         .mem = blk_mem: {
-            var m = osc.Mem.init(gpa, app.io, app.sup.neuron_bin, db);
-            // TRUST-WEIGHTED RANKING: the trust feature is compiled in; without this flag every assoc runs
-            // unweighted and a strengthen-reinforced fact from an unrelated project can outrank this
-            // conversation's own records on one shared generic stem.
-            m.trust = true;
+            var m = osc.Mem.initChat(gpa, app.io, app.sup.neuron_bin, db, environ);
+            m.stats = &mem_writes;
             break :blk_mem m;
         },
         .files_written = &counters[0],
@@ -3900,7 +3910,11 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
         const o = &overlay.?;
         o.budget = envUsize(environ, "NL_MEM_OVERLAY_BYTES", ovl.DEFAULT_BUDGET);
         o.setGoal(goal_text);
-        const wide = ctx.mem.assocAcross(cpaths.scopeFamilyBase(mem_scope), goal_text, osc.Mem.SATURATE_HOPS, 48);
+        // SEED BREADTH 64, measured (2026-10-20, stub A/B, a crowded conversation: five needle facts each among N
+        // near-duplicate records): the overlay showed 5/5 needles at k=64 with N=24 and N=60, against 5/5 and 0/5 at
+        // k=48 and 4/5 and 0/5 at k=10 (the CLI default every chat ran at while the chat Mem had no environ); 96 and
+        // 128 matched 64 exactly. The rendered block stays inside NL_MEM_OVERLAY_BYTES whatever the seed (+0-122 B).
+        const wide = ctx.mem.assocAcross(cpaths.scopeFamilyBase(mem_scope), goal_text, osc.Mem.SATURATE_HOPS, 64);
         defer if (wide.len > 0) gpa.free(wide);
         if (wide.len > 0) {
             scrubUtf8(wide);
@@ -6238,6 +6252,34 @@ fn memBank(app: *App, ctx: *tools.ToolCtx, scope: []const u8, notes: []const []c
     memlog.warn("memory: the store accepted {d} of {d} record(s) queued this step — recall will be thinner than the context that was dropped for it", .{ stored, notes.len });
 }
 const memlog = std.log.scoped(.chatmem);
+
+test "the turn's memory-write report runs after every write-bearing defer, the store's final import included" {
+    // Defers run last-declared-first. The report (mem_writes) must be declared ABOVE every runTurn defer that writes
+    // through ctx.mem, or the turn's last writes (the store's final import of the answer's raw documents, the user-turn
+    // observe, the tool-finding batch, the trust reward, the overlay's strengthening) land after it is printed and a
+    // failed one is never reported. Needles are split so they cannot match this test's own text.
+    const SRC = @embedFile("engine.zig");
+    const run_at = std.mem.indexOf(u8, SRC, "pub fn run" ++ "Turn(") orelse return error.RunTurnMissing;
+    const body = SRC[run_at..];
+    const report = std.mem.indexOf(u8, body, "defer if (mem_writes" ++ ".writes() > 0)") orelse return error.WriteReportMissing;
+    const wired = std.mem.indexOf(u8, body, "m.stats = &mem" ++ "_writes;") orelse return error.WriteStatsUnwired;
+    try std.testing.expect(report < wired);
+    // ...and the Mem it counts is the CHAT one: initChat carries the environ every recall's k/hops reach the CLI
+    // through, the per-user hive write lock and the spawn bound. A bare Mem.init here ran every chat recall at the
+    // CLI default k=10 and let two turns' writes race.
+    const built = std.mem.lastIndexOf(u8, body[0..wired], "osc.Mem.init" ++ "Chat(gpa, app.io, app.sup.neuron_bin, db, environ)") orelse return error.TurnMemNotChat;
+    try std.testing.expect(wired - built < 200);
+    for ([_][]const u8{
+        "_ = ctx.mem.import" ++ "Docs(d);",
+        "_ = ctx.mem.obse" ++ "rve(mem_scope, user_text[0..cut]);",
+        "memBank(app, &ctx, mem_scope, tool_obs" ++ ".items);",
+        "defer rewardTool" ++ "Trust(&ctx",
+        "o.strengthen" ++ "Fired(ctx.mem",
+    }) |needle| {
+        const at = std.mem.indexOf(u8, body, needle) orelse return error.WriteDeferMissing;
+        try std.testing.expect(report < at);
+    }
+}
 
 /// Does this call's outcome count toward the same-tool FAILURE STREAK (the nudge at 2, the arbiter at 3)?
 ///

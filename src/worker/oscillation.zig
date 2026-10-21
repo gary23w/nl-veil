@@ -4,32 +4,153 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const bounded = @import("bounded.zig");
+const bu = @import("browser/util.zig"); // sleepMs: a raw-thread sleep, no Io park (the lock-retry pause)
 
-/// COST PROBE — bumped only in test builds. `Mem.run` is where this file spawns neuron-db (runEnv aside),
-/// so this counts every neuron-db PROCESS SPAWN the hive memory makes, which is what this module's
-/// batching claims are actually about (`observeBatch`: "ONE subprocess instead of one spawn per
-/// fact", against a 40-tool storm that used to pay ~40 serialized launches).
+/// COST PROBE — bumped only in test builds. `Mem.exec` is the single spawn site in this file, reached by
+/// `run` and `runEnv` alike (every assoc/recall-breadth read goes through runEnv), so this counts every
+/// neuron-db PROCESS SPAWN the hive memory makes, which is what this module's batching claims are
+/// actually about (`observeBatch`: "ONE subprocess instead of one spawn per fact", against a 40-tool
+/// storm that used to pay ~40 serialized launches).
 ///
 /// Counted, never timed: a wall-clock budget on a dev box measures Defender and background load, so
 /// it flakes and then gets muted. A spawn count is exact and identical on every machine. Mirrors
 /// `neuron/client.zig`'s probe, which prices the OTHER neuron-db seam. See harness/TESTING.md.
 pub var spawn_probe: u64 = 0;
 
-/// The bound on one neuron-db run. It is a local sqlite store that answers in milliseconds to seconds, so this only
-/// ever cuts a wedged one.
+/// The bound on one neuron-db run when a Mem names none (Mem.bound_ms = 0). It is a local sqlite store that
+/// answers in milliseconds to seconds, so this only ever cuts a wedged one: under std.process.run a wedged
+/// neuron-db held the caller (often under the hive's write lock) forever, and an answer past 1 MiB, which read
+/// as a failure through StreamTooLong, could hang the call outright on Windows (see bounded.zig).
 const NEURON_BOUND_MS: u64 = 120_000;
 
-/// One neuron-db run (Mem.run, Mem.runEnv): its stdout, gpa-owned, or null when it did not exit 0. bounded.run, because
-/// under std.process.run a wedged neuron-db held the caller (often under the hive's write lock) forever, and an answer
-/// past 1 MiB, which read as null through StreamTooLong, could hang the call outright on Windows (see bounded.zig).
-/// Both still read null.
-fn neuronRun(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8, environ_map: ?*const std.process.Environ.Map) ?[]u8 {
-    var r = bounded.run(gpa, io, .{ .argv = argv, .environ_map = environ_map, .bound_ms = NEURON_BOUND_MS, .stdout_limit = 1 << 20, .stderr_limit = 16 << 10, .stderr_tail = true });
-    defer r.deinit(gpa);
-    if (!r.ok()) return null;
-    const out = r.stdout;
-    r.stdout = &.{};
-    return out;
+/// Why a write did not land. `lock`: neuron-db's single-writer pid lock refused it ("one db file = one
+/// writer", exit 1) and the retries below ran out; `missing`: the neuron binary could not be started;
+/// `pack`: the temp pack an import reads could not be written beside the db; `timeout`: still running at
+/// the Mem's bound, killed; `other`: any other nonzero exit or signal (two concurrent writers on one scope
+/// collide on its append-log seq and the loser panics, exit 101) or output that could not be read.
+pub const Fail = enum { lock, missing, pack, timeout, other };
+
+/// WRITE ACCOUNTING for one owner of a Mem (a chat turn, one delegated tool call): every write spawn is
+/// counted once by how it ended, with the time it spent waiting to write (the in-process write lock plus
+/// any pause between lock retries). A write that does not land used to look exactly like one that did:
+/// every caller discarded the count, so a step's raw-output documents could vanish with nothing said.
+/// Atomic, because nothing stops two threads from sharing one ToolCtx.
+pub const WriteStats = struct {
+    ok: std.atomic.Value(u32) = .init(0),
+    lock: std.atomic.Value(u32) = .init(0),
+    missing: std.atomic.Value(u32) = .init(0),
+    pack: std.atomic.Value(u32) = .init(0),
+    timeout: std.atomic.Value(u32) = .init(0),
+    other: std.atomic.Value(u32) = .init(0),
+    /// lock-refused attempts that were retried (a write retried twice and then landed counts 2 here, 1 in ok)
+    retries: std.atomic.Value(u32) = .init(0),
+    wait_ns: std.atomic.Value(u64) = .init(0),
+
+    pub fn note(s: *WriteStats, f: Fail) void {
+        const c = switch (f) {
+            .lock => &s.lock,
+            .missing => &s.missing,
+            .pack => &s.pack,
+            .timeout => &s.timeout,
+            .other => &s.other,
+        };
+        _ = c.fetchAdd(1, .monotonic);
+    }
+    pub fn failed(s: *const WriteStats) u32 {
+        return s.lock.load(.monotonic) + s.missing.load(.monotonic) + s.pack.load(.monotonic) +
+            s.timeout.load(.monotonic) + s.other.load(.monotonic);
+    }
+    pub fn writes(s: *const WriteStats) u32 {
+        return s.ok.load(.monotonic) + s.failed();
+    }
+    pub fn waitMs(s: *const WriteStats) u64 {
+        return s.wait_ns.load(.monotonic) / std.time.ns_per_ms;
+    }
+    /// One line for a trace or a log: "memory writes: 9 landed, 0 failed, 0 lock retries, waited 0 ms for the
+    /// write lock", naming each failure reason when any write failed.
+    pub fn line(s: *const WriteStats, buf: []u8) []const u8 {
+        const nf = s.failed();
+        if (nf == 0) return std.fmt.bufPrint(buf, "memory writes: {d} landed, 0 failed, {d} lock retr{s}, waited {d} ms for the write lock", .{
+            s.ok.load(.monotonic), s.retries.load(.monotonic), if (s.retries.load(.monotonic) == 1) "y" else "ies", s.waitMs(),
+        }) catch "memory writes";
+        return std.fmt.bufPrint(buf, "memory writes: {d} landed, {d} FAILED (lock {d}, missing binary {d}, pack write {d}, timeout {d}, other {d}), {d} lock retr{s}, waited {d} ms for the write lock", .{
+            s.ok.load(.monotonic),                               nf,                         s.lock.load(.monotonic),  s.missing.load(.monotonic),
+            s.pack.load(.monotonic),                             s.timeout.load(.monotonic), s.other.load(.monotonic), s.retries.load(.monotonic),
+            if (s.retries.load(.monotonic) == 1) "y" else "ies", s.waitMs(),
+        }) catch "memory writes failed";
+    }
+};
+
+/// A write refused by neuron-db's pid lock is retried up to LOCK_RETRIES times, pausing LOCK_PAUSE_MS
+/// doubled per attempt (capped at LOCK_PAUSE_MAX_MS): 0.1+0.2+0.4+0.8+1.6+2 s ≈ 5 s in all. In-process
+/// writers already queue on writeLockFor, so a refusal means ANOTHER process holds the db (`veil rag
+/// ingest` writes u1's chat hive by default). Measured 2026-10-20 on a 22 MB hive with the shipped
+/// neuron.exe: a step import took 0.11 s and the CLI's own liveness probe of a lock holder 0.15 s, so
+/// ~5 s covers a neighbour's ordinary write without stalling a turn for long behind a whole-book absorb.
+pub const LOCK_RETRIES: u32 = 6;
+const LOCK_PAUSE_MS: u64 = 100;
+const LOCK_PAUSE_MAX_MS: u64 = 2000;
+
+/// TEST SEAM: `pause_cap_ms` caps every lock-retry pause, so a test reaches the give-up path in milliseconds.
+pub const seam = if (builtin.is_test) struct {
+    pub var pause_cap_ms: ?u64 = null;
+} else struct {};
+
+/// The bound on one chat neuron spawn (Mem.bound_ms), so a hung child can never hold the write lock and
+/// every other turn of the user behind it. Measured 2026-10-20 (shipped neuron.exe, 22-43 MB synthetic
+/// hive): the heaviest ordinary write was 0.45 s (observe into a 20k-fact scope, compaction included) and a
+/// 20k-fact absorb import 0.86 s, so this is two orders of magnitude past any measured legitimate spawn.
+/// importStats (a whole document) gets BULK_BOUND_MS instead.
+pub const CHAT_BOUND_MS: u64 = 120_000;
+pub const BULK_BOUND_MS: u64 = 1_800_000;
+
+/// ONE WRITER PER DB FILE, IN THIS PROCESS. neuron-db's CLI refuses a second concurrent `import` on a db
+/// (its `<db>.lock` pid lock, exit 1), and two concurrent single-shot writers on one scope race its append
+/// log: both load seq N and the second INSERT panics on the primary key (exit 101), or a compaction
+/// snapshot deletes the other's fresh row. Every chat turn of one user (a primary and its sub-chats, two
+/// tabs, the desk's delegated tool endpoint) writes the same `{data}/u{uid}/_chat/hive.sqlite`, so their
+/// writes queue on the mutex this returns for that path. Keyed by the path itself (on Windows with `\`
+/// read as `/` and case folded), never by a hash bucket, so two users' hives never wait on each other.
+/// Entries live as long as the process. Null only for a path over 1 KiB or when the registry cannot
+/// allocate (writes then run unserialized, exactly as before).
+pub fn writeLockFor(io: std.Io, db: []const u8) ?*std.Io.Mutex {
+    var kb: [1024]u8 = undefined;
+    if (db.len == 0 or db.len > kb.len) return null;
+    for (db, 0..) |c, i| kb[i] = if (builtin.os.tag == .windows) (if (c == '\\') '/' else std.ascii.toLower(c)) else c;
+    const key = kb[0..db.len];
+    write_locks_mtx.lockUncancelable(io);
+    defer write_locks_mtx.unlock(io);
+    if (write_locks.get(key)) |m| return m;
+    const pa = std.heap.page_allocator;
+    const m = pa.create(std.Io.Mutex) catch return null;
+    m.* = .init;
+    const owned = pa.dupe(u8, key) catch {
+        pa.destroy(m);
+        return null;
+    };
+    write_locks.put(pa, owned, m) catch {
+        pa.free(owned);
+        pa.destroy(m);
+        return null;
+    };
+    return m;
+}
+var write_locks_mtx: std.Io.Mutex = .init;
+var write_locks: std.StringHashMapUnmanaged(*std.Io.Mutex) = .empty;
+
+/// stderr of an exit-1 the CLI's single-writer lock produced ("<db>.lock is held by a live neuron writer
+/// (pid N)." / "one db file = one writer: ..."): the shipped binary's exact wording.
+fn lockRefused(stderr: []const u8) bool {
+    return std.mem.indexOf(u8, stderr, "held by a live neuron writer") != null or
+        std.mem.indexOf(u8, stderr, "one db file = one writer") != null;
+}
+
+/// A spawn error that means the binary is not there to run (deps.isSpawnMissing's set).
+fn spawnMissing(err: anyerror) bool {
+    return switch (err) {
+        error.FileNotFound, error.NotDir, error.IsDir, error.InvalidExe, error.InvalidName, error.AccessDenied, error.PermissionDenied => true,
+        else => false,
+    };
 }
 
 // Operator preamble + build-time string tables (generated; do not hand-edit the byte tables or anchors).
@@ -325,8 +446,22 @@ pub const Mem = struct {
     bin: []const u8,
     db: []const u8,
     wmtx: ?*std.Io.Mutex = null,
+    /// The env every assoc read hands the CLI, with NEURON_K/NEURON_HOPS set from the caller's k/hops.
+    /// The CLI reads those two ONLY from its environment (the shipped binary takes no --k on assoc: a
+    /// `--k 3` there joins the query text), so a Mem without this runs every assoc at the CLI default
+    /// (k=10, hops unbounded) whatever the caller asked for.
     environ: ?*const std.process.Environ.Map = null,
     trust: bool = false,
+    /// Where this Mem's writes are counted (null = not counted). See WriteStats.
+    stats: ?*WriteStats = null,
+    /// The bound on every spawn in ms (0 = NEURON_BOUND_MS). See CHAT_BOUND_MS.
+    bound_ms: u64 = 0,
+    /// Operator overrides of every assoc breadth this Mem reads: k_pin > 0 replaces each caller's k,
+    /// hops_pin replaces each caller's hops (0 = spread until it settles). NL_MEM_K / NL_MEM_HOPS on the
+    /// chat surface (initChat); NL_MEM_K=10 NL_MEM_HOPS=0 is the breadth every chat read ran at before
+    /// the chat Mem carried an environ.
+    k_pin: u32 = 0,
+    hops_pin: ?u32 = null,
 
     /// Spread-to-SATURATION hop count for assoc(): neuron-db's recall_spreading loops `0..hops` but breaks
     /// the moment a hop lights no NEW episode (frontier drain), so a large count means "follow the threads
@@ -338,11 +473,108 @@ pub const Mem = struct {
         return .{ .gpa = gpa, .io = io, .bin = bin, .db = db };
     }
 
+    /// THE CHAT SURFACE'S Mem, built ONE way for every chat entry point (the turn's ToolCtx and the
+    /// desk-delegated tool endpoint), so a new one cannot forget a piece:
+    /// - `environ`, so the k/hops each recall asks for reach the CLI (both chat Mems used to be built
+    ///   without it, and every chat assoc ran at the CLI default k=10 whatever it asked);
+    /// - the per-db-path write lock (writeLockFor): every chat turn of a user writes ONE hive;
+    /// - CHAT_BOUND_MS on every spawn, so a hung child cannot hold that lock;
+    /// - trust-weighted assoc ranking (the trust feature is compiled in; without it every assoc runs
+    ///   unweighted and a strengthen-reinforced fact from an unrelated project can outrank this
+    ///   conversation's own records on one shared generic stem);
+    /// - the NL_MEM_K / NL_MEM_HOPS breadth overrides.
+    pub fn initChat(gpa: std.mem.Allocator, io: std.Io, bin: []const u8, db: []const u8, environ: *const std.process.Environ.Map) Mem {
+        var m = init(gpa, io, bin, db);
+        m.environ = environ;
+        m.trust = true;
+        m.wmtx = writeLockFor(io, db);
+        m.bound_ms = CHAT_BOUND_MS;
+        if (environ.get("NL_MEM_K")) |v| m.k_pin = std.fmt.parseInt(u32, std.mem.trim(u8, v, " \r\n\t"), 10) catch 0;
+        if (environ.get("NL_MEM_HOPS")) |v| m.hops_pin = std.fmt.parseInt(u32, std.mem.trim(u8, v, " \r\n\t"), 10) catch null;
+        return m;
+    }
+
     fn lockW(self: Mem) void {
         if (self.wmtx) |m| m.lockUncancelable(self.io);
     }
     fn unlockW(self: Mem) void {
         if (self.wmtx) |m| m.unlock(self.io);
+    }
+
+    const Spawned = struct { out: ?[]u8 = null, fail: Fail = .other };
+
+    /// The ONE spawn site (spawn_probe). Every child runs through bounded.run, under this Mem's bound or
+    /// NEURON_BOUND_MS when it names none: one deadline for the whole run, killed with everything it started
+    /// at it, and no std.process.run output limit, whose StreamTooLong can hang forever on Windows
+    /// (bounded.zig). stderr is read before it is dropped, which is how a lock refusal is told from any
+    /// other failed exit.
+    fn exec(self: Mem, argv: []const []const u8, env: ?*const std.process.Environ.Map) Spawned {
+        if (builtin.is_test) _ = @atomicRmw(u64, &spawn_probe, .Add, 1, .monotonic);
+        var r = bounded.run(self.gpa, self.io, .{
+            .argv = argv,
+            .environ_map = env,
+            .bound_ms = if (self.bound_ms > 0) self.bound_ms else NEURON_BOUND_MS,
+            .stdout_limit = 1 << 20,
+            .stderr_limit = 16 << 10,
+            .stderr_tail = true,
+        });
+        defer self.gpa.free(r.stderr);
+        if (r.ok()) return .{ .out = r.stdout };
+        self.gpa.free(r.stdout);
+        return .{ .fail = switch (r.end) {
+            .unstarted => if (r.err != null and spawnMissing(r.err.?)) .missing else .other,
+            .killed => .timeout,
+            .exited => if (lockRefused(r.stderr)) .lock else .other,
+            .signal, .overflow, .unread => .other,
+        } };
+    }
+
+    /// One WRITE: queued on this db's write lock, retried while neuron-db's pid lock refuses it, counted
+    /// in `stats` by how it ended. Returns the CLI's stdout (caller frees) or null when it did not land.
+    fn write(self: Mem, args: []const []const u8) ?[]u8 {
+        return self.writeBounded(args, self.bound_ms);
+    }
+    fn writeBounded(self: Mem, args: []const []const u8, bound_ms: u64) ?[]u8 {
+        const t0 = std.Io.Timestamp.now(self.io, .awake).nanoseconds;
+        self.lockW();
+        defer self.unlockW();
+        var waited: u64 = @intCast(@max(0, std.Io.Timestamp.now(self.io, .awake).nanoseconds - t0));
+        defer if (self.stats) |s| {
+            _ = s.wait_ns.fetchAdd(waited, .monotonic);
+        };
+        var m = self;
+        m.bound_ms = bound_ms;
+        var attempt: u32 = 0;
+        while (true) : (attempt += 1) {
+            const r = m.run2(args);
+            if (r.out) |o| {
+                if (self.stats) |s| _ = s.ok.fetchAdd(1, .monotonic);
+                return o;
+            }
+            if (r.fail == .lock and attempt < LOCK_RETRIES) {
+                if (self.stats) |s| _ = s.retries.fetchAdd(1, .monotonic);
+                const pause_full: u64 = @min(LOCK_PAUSE_MAX_MS, LOCK_PAUSE_MS << @intCast(attempt));
+                const pause_ms = if (builtin.is_test) @min(pause_full, seam.pause_cap_ms orelse pause_full) else pause_full;
+                // THE PAUSE SLEEPS ON THE OS (bu.sleepMs), NEVER io.sleep. Every chat write runs on a thread the Io
+                // runtime did not spawn (a turn's std.Thread from spawnTurn, an httpz worker for the delegated tool
+                // endpoint), and on Windows io.sleep there parks on the runtime's per-thread alert: a wake it did not
+                // ask for is `unreachable` (a Debug panic; in ReleaseFast it returns at once, and a loop over it
+                // spins). kernel32 Sleep is non-alertable (browser/util.zig sleepMs). Slept to the END of the pause,
+                // since a POSIX nanosleep can return early on a signal and an early wake shrinks the window a
+                // neighbouring writer gets to finish in.
+                const p0 = std.Io.Timestamp.now(self.io, .awake).nanoseconds;
+                const until = p0 + @as(i96, @intCast(pause_ms * std.time.ns_per_ms));
+                while (true) {
+                    const now = std.Io.Timestamp.now(self.io, .awake).nanoseconds;
+                    if (now >= until) break;
+                    bu.sleepMs(@intCast(@divTrunc(until - now + std.time.ns_per_ms - 1, std.time.ns_per_ms)));
+                }
+                waited += @intCast(@max(0, std.Io.Timestamp.now(self.io, .awake).nanoseconds - p0));
+                continue;
+            }
+            if (self.stats) |s| s.note(r.fail);
+            return null;
+        }
     }
 
     /// Per-scope fact ceiling passed as `--max` on EVERY neuron invocation. The CLI's own default is
@@ -354,6 +586,9 @@ pub const Mem = struct {
     pub const MAX_FACTS: u32 = 20_000;
 
     fn run(self: Mem, args: []const []const u8) ?[]u8 {
+        return self.run2(args).out;
+    }
+    fn run2(self: Mem, args: []const []const u8) Spawned {
         var argv: std.ArrayListUnmanaged([]const u8) = .empty;
         defer argv.deinit(self.gpa);
         var dbbuf: [768]u8 = undefined;
@@ -361,10 +596,9 @@ pub const Mem = struct {
         const dbp = if (d == 0) self.db else (std.fmt.bufPrint(&dbbuf, "{s}.{x}.q", .{ self.db, d }) catch "/x/nonexistent.q");
         var maxbuf: [12]u8 = undefined;
         const maxs = std.fmt.bufPrint(&maxbuf, "{d}", .{MAX_FACTS}) catch "20000";
-        argv.appendSlice(self.gpa, &.{ self.bin, "--db", dbp, "--max", maxs }) catch return null;
-        argv.appendSlice(self.gpa, args) catch return null;
-        if (builtin.is_test) spawn_probe += 1;
-        return neuronRun(self.gpa, self.io, argv.items, null);
+        argv.appendSlice(self.gpa, &.{ self.bin, "--db", dbp, "--max", maxs }) catch return .{};
+        argv.appendSlice(self.gpa, args) catch return .{};
+        return self.exec(argv.items, null);
     }
 
     /// Store one fact. Returns the running fact count (0 on failure). The fact is whitespace-normalized
@@ -374,8 +608,6 @@ pub const Mem = struct {
     pub fn observe(self: Mem, scope: []const u8, fact: []const u8) u32 {
         var nb: [1600]u8 = undefined;
         const clean = cleanFactInto(&nb, fact) orelse return 0;
-        self.lockW();
-        defer self.unlockW();
         // --json for the SAME reason observeBatch needs it one screen down: plain `observe` prints a
         // PROSE summary ("stored 1 fact(s)"), and parseInt on that fails every time, so this returned
         // 0 for every successful write. That sibling bug was found and fixed for `import`; this one
@@ -387,7 +619,7 @@ pub const Mem = struct {
         // (the pollution class this file exists to prevent). New binary = marks land in the
         // {scope}::contested sidecar for scored recall; old binary = no marks, and no recallscored to
         // read them either. jsonUint's field scan tolerates both output shapes.
-        const out = self.run(&.{ "--json", "observe", scope, clean }) orelse return 0;
+        const out = self.write(&.{ "--json", "observe", scope, clean }) orelse return 0;
         defer self.gpa.free(out);
         return jsonUint(out, "\"wrote\":");
     }
@@ -401,8 +633,6 @@ pub const Mem = struct {
     pub fn observeBatch(self: Mem, scope: []const u8, notes: []const []const u8) u32 {
         if (notes.len == 0) return 0;
         if (notes.len == 1) return self.observe(scope, notes[0]); // one fact: skip the temp-file dance
-        self.lockW();
-        defer self.unlockW();
         var rnd: [8]u8 = undefined;
         self.io.random(&rnd);
         var pb: [820]u8 = undefined;
@@ -418,11 +648,14 @@ pub const Mem = struct {
             kept = true;
         }
         if (!kept) return 0;
-        std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = pack, .data = body.items }) catch return 0;
+        std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = pack, .data = body.items }) catch {
+            if (self.stats) |s| s.note(.pack);
+            return 0;
+        };
         defer std.Io.Dir.cwd().deleteFile(self.io, pack) catch {};
         // --json is load-bearing: the non-json import summary ("imported N fact(s)…") prints to STDERR,
         // which run() discards — parsing it from stdout always yielded 0, under-reporting every batch.
-        const out = self.run(&.{ "--json", "import", pack, "--scope", scope }) orelse return 0;
+        const out = self.write(&.{ "--json", "import", pack, "--scope", scope }) orelse return 0;
         defer self.gpa.free(out);
         return jsonUint(out, "\"stored\":");
     }
@@ -433,23 +666,22 @@ pub const Mem = struct {
     /// stored (0 on failure, or when the pack is empty).
     pub fn importDocs(self: Mem, pack_lines: []const u8) u32 {
         if (pack_lines.len == 0) return 0;
-        self.lockW();
-        defer self.unlockW();
         var rnd: [8]u8 = undefined;
         self.io.random(&rnd);
         var pb: [820]u8 = undefined;
         const pack = std.fmt.bufPrint(&pb, "{s}.{s}.docs.jsonl", .{ self.db, std.fmt.bytesToHex(rnd, .lower) }) catch return 0;
-        std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = pack, .data = pack_lines }) catch return 0;
+        std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = pack, .data = pack_lines }) catch {
+            if (self.stats) |s| s.note(.pack);
+            return 0;
+        };
         defer std.Io.Dir.cwd().deleteFile(self.io, pack) catch {};
-        const out = self.run(&.{ "--json", "import", pack }) orelse return 0;
+        const out = self.write(&.{ "--json", "import", pack }) orelse return 0;
         defer self.gpa.free(out);
         return jsonUint(out, "\"stored\":");
     }
 
     pub fn replace(self: Mem, scope: []const u8, fact: []const u8) void {
-        self.lockW();
-        if (self.run(&.{ "forget", scope })) |o| self.gpa.free(o);
-        self.unlockW();
+        if (self.write(&.{ "forget", scope })) |o| self.gpa.free(o);
         _ = self.observe(scope, fact);
     }
 
@@ -463,9 +695,7 @@ pub const Mem = struct {
     /// went missing, so it is checked here rather than trusted to every call site.
     pub fn forgetMatch(self: Mem, scope: []const u8, match: []const u8) void {
         if (std.mem.trim(u8, match, " \t\r\n").len == 0) return;
-        self.lockW();
-        defer self.unlockW();
-        if (self.run(&.{ "forget", scope, match })) |o| self.gpa.free(o);
+        if (self.write(&.{ "forget", scope, match })) |o| self.gpa.free(o);
     }
 
     /// Single best fact (RecallOne) as a text block. Caller frees. Empty when recall abstains (no match).
@@ -502,11 +732,11 @@ pub const Mem = struct {
     /// was an ack of "3,152 stored" over a scope that had just evicted 2,652 of them. Callers that report
     /// success to a model/user must read `evicted` and say so.
     pub fn importStats(self: Mem, pack_path: []const u8, scope: []const u8, cap: u32) ImportStats {
-        self.lockW();
-        defer self.unlockW();
         var capbuf: [16]u8 = undefined;
         const caps = std.fmt.bufPrint(&capbuf, "{d}", .{cap}) catch "400";
-        const out = self.run(&.{ "--json", "import", pack_path, "--scope", scope, "--dedup", "--flush", caps }) orelse return .{};
+        // a whole document: its own, longer bound (BULK_BOUND_MS) on every Mem, never the one-call default
+        const bound = @max(self.bound_ms, BULK_BOUND_MS);
+        const out = self.writeBounded(&.{ "--json", "import", pack_path, "--scope", scope, "--dedup", "--flush", caps }, bound) orelse return .{};
         defer self.gpa.free(out);
         return .{ .stored = jsonUint(out, "\"stored\":"), .evicted = jsonUint64(out, "\"evicted\":") };
     }
@@ -591,15 +821,11 @@ pub const Mem = struct {
     pub fn strengthen(self: Mem, scope: []const u8, match: []const u8) void {
         const m = std.mem.trim(u8, match, " \r\n\t");
         if (m.len < 8) return;
-        self.lockW();
-        defer self.unlockW();
-        if (self.run(&.{ "strengthen", scope, m })) |o| self.gpa.free(o);
+        if (self.write(&.{ "strengthen", scope, m })) |o| self.gpa.free(o);
     }
 
     pub fn reinforce(self: Mem, scope: []const u8, topic: []const u8, feeling: []const u8) void {
-        self.lockW();
-        defer self.unlockW();
-        if (self.run(&.{ "reinforce", scope, topic, feeling })) |o| self.gpa.free(o);
+        if (self.write(&.{ "reinforce", scope, topic, feeling })) |o| self.gpa.free(o);
     }
 
     /// Reward the tag-classes recalled this round by the grounded fitness Δ (delta in [-1,1]). Writes the
@@ -607,15 +833,13 @@ pub const Mem = struct {
     /// DRIVEN ONLY — the minds never call this, so a mind cannot inflate its own class's trust.
     pub fn trustReward(self: Mem, delta: f32, classes: []const []const u8) void {
         if (classes.len == 0) return;
-        self.lockW();
-        defer self.unlockW();
         var argv: std.ArrayListUnmanaged([]const u8) = .empty;
         defer argv.deinit(self.gpa);
         var dbuf: [32]u8 = undefined;
         const ds = std.fmt.bufPrint(&dbuf, "{d:.4}", .{delta}) catch return;
         argv.appendSlice(self.gpa, &.{ "trust_reward", ds }) catch return;
         argv.appendSlice(self.gpa, classes) catch return;
-        if (self.run(argv.items)) |out| self.gpa.free(out);
+        if (self.write(argv.items)) |out| self.gpa.free(out);
     }
 
     /// The learned trust WEIGHT for a tag-class (via `trust_get`), so the engine can rank sources by earned
@@ -694,7 +918,8 @@ pub const Mem = struct {
     }
 
     /// Like `run`, but injects NEURON_HOPS/NEURON_K into a CLONE of the worker env (the CLI reads them only
-    /// from the environment). Falls back to inherited env (CLI defaults) when no environ is wired.
+    /// from the environment). Falls back to inherited env (CLI defaults) when no environ is wired. The
+    /// operator pins (k_pin/hops_pin) win over the caller's numbers.
     fn runEnv(self: Mem, args: []const []const u8, hops: u32, k: u32) ?[]u8 {
         var argv: std.ArrayListUnmanaged([]const u8) = .empty;
         defer argv.deinit(self.gpa);
@@ -702,27 +927,23 @@ pub const Mem = struct {
         argv.appendSlice(self.gpa, args) catch return null;
         var hbuf: [16]u8 = undefined;
         var kbuf: [16]u8 = undefined;
-        const hs = std.fmt.bufPrint(&hbuf, "{d}", .{hops}) catch "3";
-        const ks = std.fmt.bufPrint(&kbuf, "{d}", .{k}) catch "10";
+        const hs = std.fmt.bufPrint(&hbuf, "{d}", .{self.hops_pin orelse hops}) catch "3";
+        const ks = std.fmt.bufPrint(&kbuf, "{d}", .{if (self.k_pin > 0) self.k_pin else k}) catch "10";
         var env: ?std.process.Environ.Map = if (self.environ) |pe| (pe.clone(self.gpa) catch null) else null;
         defer if (env) |*m| m.deinit();
         if (env) |*m| {
             m.put("NEURON_HOPS", hs) catch {};
             m.put("NEURON_K", ks) catch {};
         }
-        return neuronRun(self.gpa, self.io, argv.items, if (env) |*m| m else null);
+        return self.exec(argv.items, if (env) |*m| m else null).out;
     }
 
     pub fn stance(self: Mem, scope: []const u8, topic: []const u8, feeling: []const u8) void {
-        self.lockW();
-        defer self.unlockW();
-        if (self.run(&.{ "stance", scope, topic, feeling })) |o| self.gpa.free(o);
+        if (self.write(&.{ "stance", scope, topic, feeling })) |o| self.gpa.free(o);
     }
 
     pub fn mood(self: Mem, scope: []const u8, m: []const u8) void {
-        self.lockW();
-        defer self.unlockW();
-        if (self.run(&.{ "mood", scope, m })) |o| self.gpa.free(o);
+        if (self.write(&.{ "mood", scope, m })) |o| self.gpa.free(o);
     }
 
     /// The dynamic persona directive: fuses the mind's Big-Five persona with its accumulated stances + mood
@@ -755,9 +976,7 @@ pub const Mem = struct {
         args[0] = "persona";
         args[1] = scope;
         for (vals, 0..) |v, i| args[2 + i] = std.fmt.bufPrint(&bufs[i], "{d:.2}", .{v}) catch "0.5";
-        self.lockW();
-        defer self.unlockW();
-        if (self.run(args[0..])) |o| self.gpa.free(o);
+        if (self.write(args[0..])) |o| self.gpa.free(o);
     }
 
     /// Real total facts under a scope, from `stats --json` ({"facts":N,...}). 0 on failure.
@@ -938,4 +1157,365 @@ test "observeBatch stores N facts in ONE spawn; the loop it replaced costs N" {
     spawn_probe = 0;
     _ = m.observeBatch("one_scope", notes[0..1]);
     try std.testing.expectEqual(@as(u64, 1), spawn_probe);
+}
+
+// ---------------------------------------------------------------------------
+// The chat Mem's two contracts, against the real binary: the breadth a caller asks for is the breadth the CLI
+// runs (initChat's environ), and a write either lands or is counted as lost (the per-path lock, the lock retry,
+// the bound, WriteStats). Each skips when bin/neuron.exe is absent, like every store-backed test here.
+// ---------------------------------------------------------------------------
+
+/// The real process environment as a Map (TESTING.md: an empty one leaves a Windows child without
+/// SystemRoot/PATH), with every variable that would steer these tests from the developer's shell removed.
+fn testEnvMap(gpa: std.mem.Allocator) !std.process.Environ.Map {
+    var m = try testEnvironOsc().createMap(gpa);
+    for ([_][]const u8{ "NEURON_K", "NEURON_HOPS", "NEURON_DB", "NEURON_MAX_FACTS", "NL_MEM_K", "NL_MEM_HOPS" }) |k| _ = m.swapRemove(k);
+    return m;
+}
+
+fn countLines(s: []const u8) usize {
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, s, '\n');
+    while (it.next()) |l| {
+        if (std.mem.trim(u8, l, " \r\t").len > 0) n += 1;
+    }
+    return n;
+}
+
+/// Plant `n` facts that all carry the rare stem "zorblax" (so one cue seeds every one) into `scope`, plus a
+/// four-fact chain in `chain_scope` reachable one hop at a time (alpha -> quuxlib -> gorbo -> frobnicate). False
+/// when the store wrote nothing (no binary): the caller skips.
+fn plantBreadth(m: Mem, scope: []const u8, n: usize, chain_scope: []const u8) !bool {
+    const gpa = m.gpa;
+    var notes: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer {
+        for (notes.items) |x| gpa.free(x);
+        notes.deinit(gpa);
+    }
+    for (0..n) |i| try notes.append(gpa, try std.fmt.allocPrint(gpa, "the zorblax module number {d} handles widget path src/w{d}.zig carefully", .{ i, i }));
+    if (m.observeBatch(scope, notes.items) == 0) return false;
+    const chain = [_][]const u8{
+        "alpha project uses the quuxlib library for parsing",
+        "quuxlib was written by the gorbo team in berlin",
+        "the gorbo team also maintains frobnicate tools",
+        "frobnicate tools ship with a zappa config file",
+    };
+    return m.observeBatch(chain_scope, &chain) > 0;
+}
+
+test "chat Mem: the k and hops each recall asks for reach the CLI; the old construction ran every one at k=10" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = testEnvironOsc() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-osc-breadth-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, root, .default_dir) catch {};
+    var env = try testEnvMap(gpa);
+    defer env.deinit();
+
+    const m = Mem.initChat(gpa, io, NEURON_BIN_T, root ++ "/n.db", &env);
+    if (!try plantBreadth(m, "chat:t", 40, "chat:h")) return error.SkipZigTest;
+
+    // k: assocAcross is the family-wide read every chat recall path uses (overlay seed, step weave, recall tool)
+    for ([_]u32{ 3, 25, 48 }) |k| {
+        const r = m.assocAcross("chat:t", "zorblax widget", Mem.SATURATE_HOPS, k);
+        defer gpa.free(r);
+        try std.testing.expectEqual(@as(usize, @min(k, 40)), countLines(r));
+    }
+    // hops, on the trust-ranked plain assoc (recall_hive's INTEL/SKILL reads): 1 hop stops at the neighbour,
+    // a saturating spread follows the chain to its end
+    {
+        const one = m.assoc("chat:h", "alpha project", 1, 10);
+        defer gpa.free(one);
+        try std.testing.expectEqual(@as(usize, 2), countLines(one));
+        const all = m.assoc("chat:h", "alpha project", Mem.SATURATE_HOPS, 10);
+        defer gpa.free(all);
+        try std.testing.expectEqual(@as(usize, 4), countLines(all));
+    }
+    // The construction both chat surfaces used before initChat (Mem.init + trust, no environ): whatever the caller
+    // asks, the CLI runs its own default, k=10 with an unbounded spread. This is what made every chat recall 10 wide.
+    {
+        var old = Mem.init(gpa, io, NEURON_BIN_T, root ++ "/n.db");
+        old.trust = true;
+        const r = old.assocAcross("chat:t", "zorblax widget", Mem.SATURATE_HOPS, 3);
+        defer gpa.free(r);
+        try std.testing.expectEqual(@as(usize, 10), countLines(r));
+        const h = old.assoc("chat:h", "alpha project", 1, 10);
+        defer gpa.free(h);
+        try std.testing.expectEqual(@as(usize, 4), countLines(h));
+    }
+    // The operator override: NL_MEM_K / NL_MEM_HOPS replace every caller's numbers (NL_MEM_K=10 NL_MEM_HOPS=0 is
+    // the old breadth exactly).
+    {
+        try env.put("NL_MEM_K", "5");
+        try env.put("NL_MEM_HOPS", "0");
+        const p = Mem.initChat(gpa, io, NEURON_BIN_T, root ++ "/n.db", &env);
+        const r = p.assocAcross("chat:t", "zorblax widget", Mem.SATURATE_HOPS, 25);
+        defer gpa.free(r);
+        try std.testing.expectEqual(@as(usize, 5), countLines(r));
+        const h = p.assoc("chat:h", "alpha project", 1, 10);
+        defer gpa.free(h);
+        try std.testing.expectEqual(@as(usize, 4), countLines(h));
+    }
+}
+
+test "spawn_probe counts the assoc spawns (runEnv) as well as run's" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = testEnvironOsc() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var env = try testEnvMap(gpa);
+    defer env.deinit();
+    // no binary needed: a spawn that fails to start is still a spawn the probe must see
+    const m = Mem.initChat(gpa, io, "zig-osc-no-such-neuron.exe", "zig-osc-no-such.db", &env);
+    spawn_probe = 0;
+    gpa.free(m.assocAcross("s", "query words", Mem.SATURATE_HOPS, 6));
+    gpa.free(m.assoc("s", "query words", 1, 6));
+    gpa.free(m.recall("s", "query words"));
+    try std.testing.expectEqual(@as(u64, 3), spawn_probe);
+}
+
+test "WriteStats names why a write did not land: missing binary, pack write" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = testEnvironOsc() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var env = try testEnvMap(gpa);
+    defer env.deinit();
+    var st: WriteStats = .{};
+    var m = Mem.initChat(gpa, io, "zig-osc-no-such-neuron.exe", "zig-osc-no-such.db", &env);
+    m.stats = &st;
+    try std.testing.expectEqual(@as(u32, 0), m.observe("s", "a fact that has more than enough signal to be stored"));
+    try std.testing.expectEqual(@as(u32, 1), st.missing.load(.monotonic));
+    // the pack an import reads lives beside the db: a db in a directory that does not exist cannot get one
+    var p = Mem.initChat(gpa, io, NEURON_BIN_T, "zig-osc-no-such-dir/x/n.db", &env);
+    p.stats = &st;
+    try std.testing.expectEqual(@as(u32, 0), p.importDocs("{\"scope\":\"d\",\"fact\":\"a raw output line with signal in it\"}\n"));
+    try std.testing.expectEqual(@as(u32, 1), st.pack.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 2), st.failed());
+    try std.testing.expectEqual(@as(u32, 0), st.ok.load(.monotonic));
+    var lb: [320]u8 = undefined;
+    try std.testing.expect(std.mem.indexOf(u8, st.line(&lb), "2 FAILED (lock 0, missing binary 1, pack write 1") != null);
+}
+
+/// The test process's own pid: a lock file naming it reads as held by a LIVE writer to the CLI.
+fn testSelfPid() u32 {
+    if (builtin.os.tag == .windows) {
+        const k = struct {
+            extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) u32;
+        };
+        return k.GetCurrentProcessId();
+    }
+    return @intCast(std.c.getpid());
+}
+
+const LockReleaser = struct {
+    io: std.Io,
+    path: []const u8,
+    after_ms: u64,
+    fn run(self: *LockReleaser) void {
+        self.io.sleep(.{ .nanoseconds = @intCast(self.after_ms * std.time.ns_per_ms) }, .awake) catch {};
+        std.Io.Dir.cwd().deleteFile(self.io, self.path) catch {};
+    }
+};
+
+test "a write the CLI's pid lock refuses is retried, and lands once the other writer lets go" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = testEnvironOsc() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-osc-lockretry-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, root, .default_dir) catch {};
+    var env = try testEnvMap(gpa);
+    defer env.deinit();
+    var st: WriteStats = .{};
+    var m = Mem.initChat(gpa, io, NEURON_BIN_T, root ++ "/n.db", &env);
+    m.stats = &st;
+    if (m.observe("probe", "a liveness probe fact with enough signal to land") == 0) return error.SkipZigTest;
+    st = .{};
+
+    // ANOTHER live writer holds the db (its pid is this very process, so the CLI's liveness probe says alive)
+    var pb: [32]u8 = undefined;
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/n.db.lock", .data = try std.fmt.bufPrint(&pb, "{d}", .{testSelfPid()}) });
+    var rel: LockReleaser = .{ .io = io, .path = root ++ "/n.db.lock", .after_ms = 250 };
+    const th = try std.Thread.spawn(.{}, LockReleaser.run, .{&rel});
+    const doc = "{\"scope\":\"chat:c__n1\",\"fact\":\"raw output line one says the build passed\"}\n" ++
+        "{\"scope\":\"chat:c__n1\",\"fact\":\"raw output line two says the deploy finished\"}\n";
+    const stored = m.importDocs(doc);
+    th.join();
+    try std.testing.expectEqual(@as(u32, 2), stored);
+    try std.testing.expect(st.retries.load(.monotonic) >= 1);
+    try std.testing.expectEqual(@as(u32, 1), st.ok.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 0), st.failed());
+    try std.testing.expect(st.waitMs() >= 100); // the pause it sat out is accounted
+
+    // held for good: the write gives up after LOCK_RETRIES and is COUNTED as lost to the lock, not silently zero
+    seam.pause_cap_ms = 1;
+    defer seam.pause_cap_ms = null;
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/n.db.lock", .data = try std.fmt.bufPrint(&pb, "{d}", .{testSelfPid()}) });
+    st = .{};
+    try std.testing.expectEqual(@as(u32, 0), m.importDocs(doc));
+    try std.testing.expectEqual(@as(u32, 1), st.lock.load(.monotonic));
+    try std.testing.expectEqual(LOCK_RETRIES, st.retries.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 0), st.ok.load(.monotonic));
+}
+
+test "the lock-retry pause never parks: a turn's raw thread with an alert pending retries, lands, and keeps the alert" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest; // the alert park is io.sleep's Windows backend
+    // Chat writes run on threads the Io runtime did not spawn (spawnTurn's std.Thread, httpz workers). There a wake
+    // io.sleep did not ask for is `unreachable` (the Debug test build panics in Threaded.zig), so a pause written as
+    // io.sleep dies the first time another process holds the db while a stray alert is pending. This thread alerts
+    // itself first, as a stray unpark would, then makes a write that must sit out at least one pause. Afterwards a
+    // zero-timeout NtWaitForAlertByThreadId takes the alert back: STATUS_ALERTED proves it stayed pending through the
+    // pause, so a landed write cannot come from an alert that never arrived (browser/util.zig's sleepMs test, here
+    // through the real retry path).
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = testEnvironOsc() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-osc-pausealert-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, root, .default_dir) catch {};
+    var env = try testEnvMap(gpa);
+    defer env.deinit();
+    var st: WriteStats = .{};
+    var m = Mem.initChat(gpa, io, NEURON_BIN_T, root ++ "/n.db", &env);
+    m.stats = &st;
+    if (m.observe("probe", "a liveness probe fact with enough signal to land") == 0) return error.SkipZigTest;
+    st = .{};
+
+    var pb: [32]u8 = undefined;
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/n.db.lock", .data = try std.fmt.bufPrint(&pb, "{d}", .{testSelfPid()}) });
+    var rel: LockReleaser = .{ .io = io, .path = root ++ "/n.db.lock", .after_ms = 250 };
+    const rth = try std.Thread.spawn(.{}, LockReleaser.run, .{&rel});
+    const Turn = struct {
+        m: Mem,
+        stored: u32 = 0,
+        drained: std.os.windows.NTSTATUS = .SUCCESS,
+        fn go(t: *@This()) void {
+            const nt = std.os.windows.ntdll;
+            _ = nt.NtAlertThreadByThreadId(std.Thread.getCurrentId());
+            t.stored = t.m.importDocs("{\"scope\":\"chat:c__n7\",\"fact\":\"raw output line one says the build passed\"}\n");
+            const no_wait: std.os.windows.LARGE_INTEGER = 0;
+            t.drained = nt.NtWaitForAlertByThreadId(null, &no_wait);
+        }
+    };
+    var turn: Turn = .{ .m = m };
+    const tth = try std.Thread.spawn(.{}, Turn.go, .{&turn});
+    tth.join();
+    rth.join();
+    try std.testing.expectEqual(@as(u32, 1), turn.stored);
+    try std.testing.expect(st.retries.load(.monotonic) >= 1);
+    try std.testing.expectEqual(@as(u32, 0), st.failed());
+    try std.testing.expect(turn.drained == .ALERTED);
+}
+
+test "a write still running at the bound is killed, counted as a timeout, and the db is writable again" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = testEnvironOsc() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-osc-bound-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, root, .default_dir) catch {};
+    var env = try testEnvMap(gpa);
+    defer env.deinit();
+    var st: WriteStats = .{};
+    var m = Mem.initChat(gpa, io, NEURON_BIN_T, root ++ "/n.db", &env);
+    m.stats = &st;
+    if (m.observe("probe", "a liveness probe fact with enough signal to land") == 0) return error.SkipZigTest;
+    st = .{};
+    // every bound capped to 1 ms: no neuron spawn finishes that fast, so this is the hung child's path
+    bounded.seam.cap_ms = 1;
+    const doc = "{\"scope\":\"chat:c__n2\",\"fact\":\"raw output line one says the build passed\"}\n";
+    const cut = m.importDocs(doc);
+    bounded.seam.cap_ms = null;
+    try std.testing.expectEqual(@as(u32, 0), cut);
+    try std.testing.expectEqual(@as(u32, 1), st.timeout.load(.monotonic));
+    // the write lock was released, and a killed import's leftover <db>.lock (its pid is gone) does not wedge the db
+    try std.testing.expectEqual(@as(u32, 1), m.importDocs(doc));
+    try std.testing.expectEqual(@as(u32, 1), st.ok.load(.monotonic));
+}
+
+const Writer = struct {
+    m: Mem,
+    tag: []const u8,
+    n: usize,
+    go: *std.atomic.Value(bool),
+    fn run(self: *Writer) void {
+        while (!self.go.load(.acquire)) std.atomic.spinLoopHint();
+        var b: [200]u8 = undefined;
+        var d: [400]u8 = undefined;
+        for (0..self.n) |i| {
+            // a shared scope every conversation of the user writes (KNOWLEDGE), and a step's own raw documents
+            _ = self.m.observe("knowledge", std.fmt.bufPrint(&b, "writer {s} recorded that widget build {d} passed its checks", .{ self.tag, i }) catch continue);
+            _ = self.m.importDocs(std.fmt.bufPrint(&d, "{{\"scope\":\"chat:{s}__n{d}\",\"fact\":\"raw output of step {d} from {s} says the widget deploy finished\"}}\n", .{ self.tag, i, i, self.tag }) catch continue);
+        }
+    }
+};
+
+test "two chat turns of one user write one hive at once: every write lands, none waits on the CLI's lock" {
+    // A primary chat and its sub-chat run in this process and write the SAME {data}/u{uid}/_chat/hive.sqlite.
+    // Unserialized, the shipped CLI refuses the second concurrent import (exit 1) and two observes on one scope
+    // collide on its append log (exit 101): measured 2026-10-20 on a 22 MB hive, 12 of 12 trials each. Two Mems
+    // built for one db path share ONE write lock, so here both turns' writes all land and none is ever refused.
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = testEnvironOsc() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-osc-twoturns-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, root, .default_dir) catch {};
+    var env = try testEnvMap(gpa);
+    defer env.deinit();
+
+    // a knowledge scope with some body, so each writer's load of it is not instant (the collision window)
+    {
+        const seed = Mem.initChat(gpa, io, NEURON_BIN_T, root ++ "/hive.sqlite", &env);
+        var notes: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer {
+            for (notes.items) |x| gpa.free(x);
+            notes.deinit(gpa);
+        }
+        for (0..3000) |i| try notes.append(gpa, try std.fmt.allocPrint(gpa, "seed fact number {d} about the shared knowledge scope widget cache", .{i}));
+        if (seed.observeBatch("knowledge", notes.items) == 0) return error.SkipZigTest;
+    }
+    const before = Mem.init(gpa, io, NEURON_BIN_T, root ++ "/hive.sqlite").factCount("knowledge");
+
+    var sa: WriteStats = .{};
+    var sb: WriteStats = .{};
+    var ma = Mem.initChat(gpa, io, NEURON_BIN_T, root ++ "/hive.sqlite", &env);
+    ma.stats = &sa;
+    var mb = Mem.initChat(gpa, io, NEURON_BIN_T, root ++ "/hive.sqlite", &env);
+    mb.stats = &sb;
+    try std.testing.expect(ma.wmtx != null and ma.wmtx == mb.wmtx); // one lock per path, shared
+    const per = 4;
+    var go = std.atomic.Value(bool).init(false);
+    var wa: Writer = .{ .m = ma, .tag = "p", .n = per, .go = &go };
+    var wb: Writer = .{ .m = mb, .tag = "p__s1", .n = per, .go = &go };
+    const ta = try std.Thread.spawn(.{}, Writer.run, .{&wa});
+    const tb = try std.Thread.spawn(.{}, Writer.run, .{&wb});
+    go.store(true, .release);
+    ta.join();
+    tb.join();
+
+    try std.testing.expectEqual(@as(u32, 0), sa.failed() + sb.failed());
+    try std.testing.expectEqual(@as(u32, 0), sa.retries.load(.monotonic) + sb.retries.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 2 * per), sa.ok.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 2 * per), sb.ok.load(.monotonic));
+    const reader = Mem.init(gpa, io, NEURON_BIN_T, root ++ "/hive.sqlite");
+    try std.testing.expectEqual(before + 2 * per, reader.factCount("knowledge"));
+    var sc: [64]u8 = undefined;
+    for ([_][]const u8{ "p", "p__s1" }) |tag| {
+        for (0..per) |i| try std.testing.expectEqual(@as(u32, 1), reader.factCount(try std.fmt.bufPrint(&sc, "chat:{s}__n{d}", .{ tag, i })));
+    }
+    // a different path is a different lock: two users' hives never queue on each other
+    try std.testing.expect(writeLockFor(io, root ++ "/other/hive.sqlite") != ma.wmtx);
 }

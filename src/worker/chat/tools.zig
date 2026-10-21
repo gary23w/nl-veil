@@ -366,6 +366,12 @@ fn runMindTool(app: *App, u: http.User, tool: []const u8, args: []const u8, conv
 
     // The executor increments these; the chat surface ignores them (one shared sink is fine).
     var counters = [_]u32{0} ** 5;
+    // This call's neuron-db writes, counted so one that does not land is logged instead of vanishing.
+    var mem_writes: osc.WriteStats = .{};
+    defer if (mem_writes.failed() > 0) {
+        var wb: [320]u8 = undefined;
+        std.log.scoped(.chatmem).warn("delegated {s}: {s}", .{ tool, mem_writes.line(&wb) });
+    };
     var ctx = tools.ToolCtx{
         .gpa = app.gpa,
         .io = app.io,
@@ -383,9 +389,12 @@ fn runMindTool(app: *App, u: http.User, tool: []const u8, args: []const u8, conv
         // hand any authed caller the owner's stored credentials through the delegated tool surface even
         // after the turn path was fixed. The two must move together.
         .durable_path = std.fmt.allocPrint(res.arena, "{s}/u{d}/.veil-desk/memories.jsonl", .{ app.data, uid }) catch "",
+        // the server drive loop's Mem, built the same one way (osc.Mem.initChat): the same per-user hive write
+        // lock, so a delegated write queues behind a running turn's instead of racing it, and the same environ
+        // carrying each recall's k/hops to the CLI.
         .mem = blk_mem: {
-            var m = osc.Mem.init(app.gpa, app.io, app.sup.neuron_bin, db);
-            m.trust = true; // trust-weighted assoc ranking, matching the server drive loop's Mem
+            var m = osc.Mem.initChat(app.gpa, app.io, app.sup.neuron_bin, db, environ);
+            m.stats = &mem_writes;
             break :blk_mem m;
         },
         .files_written = &counters[0],
@@ -600,6 +609,15 @@ fn tailLines(s: []const u8, max: usize) []const u8 {
 /// reads already-ingested tiles, while its siblings `pixel_capture`/`pixel_ingest` touch the host
 /// screen and are unambiguously admin-only. Left as the owner's call, and pinned by the test below.
 const KNOWN_CAP_OVERLAP = [_][]const u8{"pixel_search"};
+
+test "the delegated tool endpoint builds the chat Mem (initChat), so its writes queue on the turn's hive lock" {
+    // A bare Mem.init here gave a delegated write no share in the per-user hive write lock (it raced a running
+    // turn's imports) and ran every delegated recall at the CLI default k=10. Needles split so this test cannot
+    // match its own text.
+    const SRC = @embedFile("tools.zig");
+    try std.testing.expect(std.mem.indexOf(u8, SRC, "osc.Mem.init" ++ "Chat(app.gpa, app.io, app.sup.neuron_bin, db, environ)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, SRC, "osc.Mem.init" ++ "(app.gpa, app.io, app.sup.neuron_bin, db)") == null);
+}
 
 test "the capability split stays a partition, apart from the one overlap on record" {
     // Two lists describing the same tool registry from different surfaces is exactly how a hole

@@ -1676,7 +1676,12 @@ fn executeInner(ctx: *ToolCtx, name: []const u8, args_json: []const u8) []u8 {
         // breaks on frontier drain) — k + decay + trust bound the output, not a fixed hop budget.
         // FAMILY-WIDE for sub-chats: a "chat:<parent>__sN" scope recalls across its whole family base
         // (primary + sibling branches); every other scope is its own base — behavior unchanged.
-        const r = ctx.mem.assocAcross(cpaths.scopeFamilyBase(ctx.scope), p.value.query, Mem.SATURATE_HOPS, 8);
+        // BREADTH: 10 on the chat surfaces (durable_path is set there and nowhere else), measured 2026-10-20 on a
+        // crowded conversation (stub A/B): k=8 surfaced 3/5 needle facts where 10, 12, 16 and 24 all surfaced 4/5,
+        // so 8 was worse and wider only added bytes (~170 B per extra two lines). A swarm mind keeps the 8 it
+        // has always run at (its Mem carries an environ, so its number always reached the CLI); unmeasured there.
+        const recall_k: u32 = if (ctx.durable_path.len > 0) 10 else 8;
+        const r = ctx.mem.assocAcross(cpaths.scopeFamilyBase(ctx.scope), p.value.query, Mem.SATURATE_HOPS, recall_k);
         // DURABLE half: the user's cross-conversation facts live in memories.jsonl, which the associative
         // store never indexed. Without this join recall denied facts that were in the same prompt — see
         // durableRecall. Chat surfaces only (durable_path is empty for every swarm mind), so a mind's recall
