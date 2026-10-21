@@ -98,13 +98,13 @@ pub fn bootstrap(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process
         const cmd = stepCommand(&cmd_buf, s, deps.pythonBin(io, &env)) orelse continue;
         const argv: [3][]const u8 = if (builtin.os.tag == .windows) .{ "cmd", "/C", cmd } else .{ "/bin/sh", "-c", cmd };
         // ONE deadline for the install (bounded.run): std.process.run's timeout restarted at every line printed,
-        // and on Windows never fired for an install that printed nothing.
-        var r = bounded.run(gpa, io, .{ .argv = &argv, .cwd = .{ .path = workdir }, .environ_map = &env, .bound_ms = 360_000, .stdout_limit = 32 << 10, .stderr_limit = 32 << 10 });
+        // and on Windows never fired for an install that printed nothing. head_tail: a chatty install runs to its
+        // exit, where a 32 KB stop killed it mid-install; the note below reads the end of its output.
+        var r = bounded.run(gpa, io, .{ .argv = &argv, .cwd = .{ .path = workdir }, .environ_map = &env, .bound_ms = 360_000, .stdout_limit = 32 << 10, .stderr_limit = 32 << 10, .head_tail = true });
         defer r.deinit(gpa);
         if (!r.finished()) {
             switch (r.end) {
                 .killed => note.print(gpa, "{s}: did not finish (still running at the 360s bound; killed with everything it started)\n", .{s.label}) catch {},
-                .overflow => note.print(gpa, "{s}: did not finish (printed over 32 KB; stopped there)\n", .{s.label}) catch {},
                 else => note.print(gpa, "{s}: did not finish (could not be run: {s})\n", .{ s.label, r.why() }) catch {},
             }
             continue;
@@ -211,4 +211,55 @@ test "manifestFingerprint changes with manifest content and is 0 for a bare dir"
     try tmp.dir.writeFile(io, .{ .sub_path = "requirements.txt", .data = "flask\nrequests\n" });
     const b = manifestFingerprint(io, gpa, wd);
     try std.testing.expect(b != 0 and b != a);
+}
+
+test "an install is judged by its exit code however much it prints, and a failing one's note ends on its last line (real shell, fake npm)" {
+    const gpa = std.testing.allocator;
+    const win = builtin.os.tag == .windows;
+    // the real environment (TESTING.md): an empty one leaves a Windows child without SystemRoot/PATH
+    const environ: std.process.Environ = if (win) .{ .block = .global } else .{ .block = .{ .slice = std.mem.span(std.c.environ) } };
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = environ });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const cwd = std.Io.Dir.cwd();
+    const root = "zig-bootstrap-chatty-tmp";
+    cwd.deleteTree(io, root) catch {};
+    defer cwd.deleteTree(io, root) catch {};
+    _ = cwd.createDirPathStatus(io, root ++ "/work", .default_dir) catch {};
+    _ = cwd.createDirPathStatus(io, root ++ "/bin", .default_dir) catch {};
+    try cwd.writeFile(io, .{ .sub_path = root ++ "/work/package.json", .data = "{}" }); // the npm install step, and only it
+    // A fake npm first on PATH: ~200 KB of progress on stdout and ~200 KB of warnings on stderr, the most a 32 KB cap
+    // could ever have been, then its last line and its exit code.
+    const bin = try cwd.realPathFileAlloc(io, root ++ "/bin", gpa);
+    defer gpa.free(bin);
+    var env = try environ.createMap(gpa);
+    defer env.deinit();
+    const path = try std.fmt.allocPrint(gpa, "{s}{c}{s}", .{ bin, @as(u8, if (win) ';' else ':'), env.get("PATH") orelse "" });
+    defer gpa.free(path);
+    try env.put("PATH", path);
+    const npm = if (win) root ++ "/bin/npm.cmd" else root ++ "/bin/npm";
+    const ok_body = if (win)
+        "@echo off\r\nfor /L %%i in (1,1,6000) do echo added package-%%i from the registry\r\nfor /L %%i in (1,1,6000) do echo npm WARN deprecated package-%%i 1>&2\r\necho added 6000 packages\r\nexit /b 0\r\n"
+    else
+        "#!/bin/sh\ni=0; while [ $i -lt 6000 ]; do echo added package-$i from the registry; echo npm WARN deprecated package-$i >&2; i=$((i+1)); done\necho added 6000 packages\nexit 0\n";
+    const fail_body = if (win)
+        "@echo off\r\nfor /L %%i in (1,1,6000) do echo fetching package-%%i\r\nfor /L %%i in (1,1,6000) do echo npm WARN deprecated package-%%i 1>&2\r\necho npm ERR! code E404 1>&2\r\nexit /b 1\r\n"
+    else
+        "#!/bin/sh\ni=0; while [ $i -lt 6000 ]; do echo fetching package-$i; echo npm WARN deprecated package-$i >&2; i=$((i+1)); done\necho 'npm ERR! code E404' >&2\nexit 1\n";
+    const head = "dependency bootstrap (the deliverable's own manifests): ";
+    {
+        try cwd.writeFile(io, .{ .sub_path = npm, .data = ok_body, .flags = .{ .permissions = .executable_file } });
+        const note = bootstrap(gpa, io, &env, root ++ "/work");
+        defer gpa.free(note);
+        try std.testing.expectEqualStrings(head ++ "npm install: ok", note);
+    }
+    {
+        try cwd.writeFile(io, .{ .sub_path = npm, .data = fail_body, .flags = .{ .permissions = .executable_file } });
+        const note = bootstrap(gpa, io, &env, root ++ "/work");
+        defer gpa.free(note);
+        try std.testing.expect(std.mem.startsWith(u8, note, head ++ "npm install: FAILED (exit 1) — "));
+        // the end of stderr: its last warning, then the error npm closes on
+        try std.testing.expect(std.mem.endsWith(u8, note, "npm ERR! code E404"));
+        try std.testing.expect(std.mem.indexOf(u8, note, if (win) "npm WARN deprecated package-6000" else "npm WARN deprecated package-5999") != null);
+    }
 }

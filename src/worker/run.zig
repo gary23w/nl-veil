@@ -7231,13 +7231,16 @@ fn runDeclaredChecks(w: *Worker, run_dir: []const u8) BenchResult {
         // first `go build` legitimately takes minutes; per-test speed budgets belong in the declared command.
         // It is ONE deadline for the row: std.process.run's timeout restarted at every line the row printed,
         // and on Windows never fired for a row that printed nothing.
-        var r = bounded.run(gpa, w.io, .{ .argv = &argv, .cwd = .{ .path = workdir }, .environ_map = &env, .bound_ms = 240_000, .stdout_limit = 48 << 10, .stderr_limit = 48 << 10 });
+        // head_tail: the row runs to its exit and is scored by it however much it prints. Stopped at 48 KB, a passing
+        // `pytest -v` or verbose `cargo test` scored as a failure. The feedback below reads the first and last 48 KB of
+        // each stream: errorHeaders' first failing points and checkDiag's first error are at the top (a compiler's
+        // root cause), a test runner's summary and checkDiag's no-error fallback at the bottom.
+        var r = bounded.run(gpa, w.io, .{ .argv = &argv, .cwd = .{ .path = workdir }, .environ_map = &env, .bound_ms = 240_000, .stdout_limit = 48 << 10, .stderr_limit = 48 << 10, .head_tail = true });
         defer r.deinit(gpa);
         if (!r.finished()) {
             if (fl.items.len > 0) fl.appendSlice(gpa, "; ") catch {};
             switch (r.end) {
                 .killed => fl.print(gpa, "`{s}` did not finish (still running at the 240s bound; killed with everything it started)", .{cmd}) catch {},
-                .overflow => fl.print(gpa, "`{s}` did not finish (printed over 48 KB; stopped there)", .{cmd}) catch {},
                 else => fl.print(gpa, "`{s}` did not finish (could not be run: {s})", .{ cmd, r.why() }) catch {},
             }
             continue;
@@ -7351,6 +7354,56 @@ test "a declared check that hangs printing nothing is cut at its bound with ever
     try std.testing.expectEqual(@as(?[]const u8, null), probeRowExecutes(&w, root, hang));
     try std.testing.expectError(error.FileNotFound, cwd.statFile(io, root ++ "/work/end.txt", .{}));
     try bounded.expectTreeGone(io, root ++ "/work/held.txt");
+}
+
+test "a declared check is scored by its exit code however much it prints: a passing row far past 48 KB passes, a failing one keeps its first and last failing points (real shell)" {
+    const gpa = std.testing.allocator;
+    const environ: std.process.Environ = if (builtin.os.tag == .windows) .{ .block = .global } else .{ .block = .{ .slice = std.mem.span(std.c.environ) } };
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = environ });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const cwd = std.Io.Dir.cwd();
+    const root = "zig-declared-chatty-tmp";
+    cwd.deleteTree(io, root) catch {};
+    defer cwd.deleteTree(io, root) catch {};
+    _ = cwd.createDirPathStatus(io, root ++ "/work", .default_dir) catch {};
+    var env = try environ.createMap(gpa);
+    defer env.deinit();
+    var w = Worker{
+        .gpa = gpa,
+        .io = io,
+        .scratch = std.heap.ArenaAllocator.init(gpa),
+        .run_dir = root,
+        .ev_path = root ++ "/events.jsonl",
+        .ctl_path = root ++ "/control.jsonl",
+        .stop_path = root ++ "/STOP",
+        .mem = Mem.init(gpa, io, root ++ "/no-neuron.exe", root ++ "/hive.db"),
+        .base_url = "",
+        .key = "",
+        .model = "fake-model",
+    };
+    defer w.scratch.deinit();
+    w.mem.environ = &env;
+    // The passing rows print ~180 KB each, near four times the 48 KB they were stopped at: a `pytest -v` prints its run
+    // on stdout, jest on stderr. The failing row is a compiler's shape, ~300 KB: its first failing point at the top,
+    // its last one and the summary at the bottom, the bulk between, and enough of it that a kept tail alone would
+    // have been cut back past the first.
+    const rows = if (builtin.os.tag == .windows)
+        "for /L %i in (1,1,10000) do @echo test_%i PASSED\n" ++
+            "(for /L %i in (1,1,10000) do @echo PASS suite_%i 1>&2)& exit /b 0\n" ++
+            "echo error[E0001]: first failing point& (for /L %i in (1,1,16000) do @echo filler line %i)& echo error[E0002]: last failing point& echo 1 failed& exit /b 1"
+    else
+        "i=0; while [ $i -lt 10000 ]; do echo test_$i PASSED; i=$((i+1)); done\n" ++
+            "i=0; while [ $i -lt 10000 ]; do echo PASS suite_$i >&2; i=$((i+1)); done; exit 0\n" ++
+            "echo 'error[E0001]: first failing point'; i=0; while [ $i -lt 16000 ]; do echo filler line $i; i=$((i+1)); done; echo 'error[E0002]: last failing point'; echo '1 failed'; exit 1";
+    w.checks_str = rows;
+    const res = runDeclaredChecks(&w, root);
+    defer gpa.free(res.failures);
+    try std.testing.expectEqual(@as(u32, 3), res.total);
+    try std.testing.expectEqual(@as(u32, 2), res.passed);
+    try std.testing.expect(std.mem.indexOf(u8, res.failures, "did not finish") == null);
+    // errorHeaders found a failing point in each end of the output, and checkDiag's detail starts at the first
+    try std.testing.expect(std.mem.indexOf(u8, res.failures, " exit 1 — ALL failing points: error[E0001]: first failing point ; error[E0002]: last failing point || first in detail: error[E0001]: first failing point") != null);
 }
 
 /// GET `url`, returning just the HTTP status code (0 = nothing answered). Local-probe shaped: tight

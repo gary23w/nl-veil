@@ -44,19 +44,26 @@ pub const Options = struct {
     /// The bound: the whole run, spawn to exit, in milliseconds. Output never extends it.
     bound_ms: u64,
     /// stdout past this many bytes ends the run as `.overflow` (std.process.run's stdout_limit, whose
-    /// StreamTooLong also ended it).
+    /// StreamTooLong also ended it), unless `head_tail`.
     stdout_limit: usize,
-    /// The same for stderr, unless `stderr_tail`.
+    /// The same for stderr, unless `stderr_tail` or `head_tail`.
     stderr_limit: usize,
     /// Keep only stderr's TAIL instead, so it never ends the run: past 4x stderr_limit it is cut back to its last
     /// stderr_limit bytes. For a caller that shows stderr only as a tail, where a progress bar must not grow it
     /// unbounded.
     stderr_tail: bool = false,
+    /// Keep the HEAD and TAIL of both streams instead, so neither ever ends the run: past its limit a stream's first
+    /// `limit` bytes are set aside and the rest is cut back as stderr_tail's is. What a stream kept is its first and
+    /// last `limit` bytes with one line between them naming how many bytes were not kept (all of it, when it printed
+    /// no more than 2x its limit). For a caller that scores a run by its exit code however much it printed, and reads
+    /// both ends of its output: a compiler's first error is at the top, a test runner's summary at the bottom.
+    /// Overrides stderr_tail.
+    head_tail: bool = false,
 };
 
-/// How a run ended. `.killed` = still running at the bound; `.overflow` = printed past a limit; `.unread` = its output
-/// could not be read or its exit not collected; `.unstarted` = the spawn failed. `.killed`, `.overflow` and `.unread`
-/// were killed with everything they started.
+/// How a run ended. `.killed` = still running at the bound; `.overflow` = printed past a limit (never under
+/// `head_tail`); `.unread` = its output could not be read or its exit not collected; `.unstarted` = the spawn failed.
+/// `.killed`, `.overflow` and `.unread` were killed with everything they started.
 pub const End = enum { exited, signal, killed, overflow, unread, unstarted };
 
 pub const Result = struct {
@@ -90,6 +97,52 @@ pub const Result = struct {
     }
 };
 
+/// One stream kept as its head and tail (Options.head_tail).
+const Ends = struct {
+    /// Its first `limit` bytes, gpa-owned, set aside once it passed its limit. Empty before that, and also after
+    /// should that copy fail, when the stream is kept as a plain tail.
+    head: []u8 = &.{},
+    taken: bool = false,
+    /// Bytes tossed from the reader after the head.
+    dropped: usize = 0,
+
+    /// After each fill: past `limit`, set the head aside once, then cut what follows it back to its last `limit`
+    /// bytes whenever it passes 4x that, as stderr_tail does.
+    fn trim(e: *Ends, gpa: std.mem.Allocator, rd: *std.Io.Reader, limit: usize) void {
+        if (rd.buffered().len <= limit) return;
+        if (!e.taken) {
+            e.taken = true;
+            if (gpa.dupe(u8, rd.buffered()[0..limit])) |h| {
+                e.head = h;
+                rd.toss(limit);
+            } else |_| {}
+        }
+        const n = rd.buffered().len;
+        if (n > 4 * limit) {
+            rd.toss(n - limit);
+            e.dropped += n - limit;
+        }
+    }
+
+    /// What the stream kept, gpa-owned: the head, a line naming how many bytes were not kept, and the last `limit`
+    /// bytes of `rest` (what the reader still holds); the head and `rest` whole when nothing was dropped. Each side
+    /// of the cut is cut back to whole lines where a line ends within 512 bytes of it, so a caller reading lines
+    /// (checkDiag, errorHeaders) never meets half of one there.
+    fn join(e: *const Ends, gpa: std.mem.Allocator, rest: []const u8, limit: usize) []u8 {
+        if (e.head.len == 0) return gpa.dupe(u8, rest) catch &.{};
+        const tail = rest[rest.len -| limit..];
+        if (e.dropped == 0 and tail.len == rest.len) return std.mem.concat(gpa, u8, &.{ e.head, rest }) catch &.{};
+        const hs = e.head.len -| 512;
+        const h = if (std.mem.lastIndexOfScalar(u8, e.head[hs..], '\n')) |i| e.head[0 .. hs + i + 1] else e.head;
+        const t = if (std.mem.indexOfScalar(u8, tail[0..@min(tail.len, 512)], '\n')) |i| tail[i + 1 ..] else tail;
+        const not_kept = e.head.len + e.dropped + rest.len - h.len - t.len;
+        var mb: [64]u8 = undefined;
+        const mark = std.fmt.bufPrint(&mb, "[... {d} bytes not kept ...]\n", .{not_kept}) catch "";
+        const nl: []const u8 = if (h.len > 0 and h[h.len - 1] != '\n') "\n" else "";
+        return std.mem.concat(gpa, u8, &.{ h, nl, mark, t }) catch &.{};
+    }
+};
+
 /// Run `o.argv` to its end or its bound, whichever comes first, with both streams captured. Never fails: how it
 /// ended is `end`. stdin is closed (`.ignore`) and no console window opens on Windows.
 pub fn run(gpa: std.mem.Allocator, io: std.Io, o: Options) Result {
@@ -115,8 +168,15 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, o: Options) Result {
     const out = mr.reader(0);
     const er = mr.reader(1);
     const deadline = (std.Io.Timeout{ .duration = .{ .raw = .fromMilliseconds(@intCast(bound_ms)), .clock = .awake } }).toDeadline(io);
+    var ends: [2]Ends = .{ .{}, .{} }; // stdout, stderr under head_tail
+    defer for (ends) |e| gpa.free(e.head);
     var r: Result = .{ .end = .exited };
     while (mr.fill(256, deadline)) |_| {
+        if (o.head_tail) {
+            ends[0].trim(gpa, out, o.stdout_limit);
+            ends[1].trim(gpa, er, o.stderr_limit);
+            continue;
+        }
         if (out.buffered().len > o.stdout_limit) {
             r.end = .overflow;
             break;
@@ -146,8 +206,8 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, o: Options) Result {
     // heap we no longer owned (measured: a still-printing probe's bytes turned up in released blocks under a
     // quarantine allocator). The buffers stay the MultiReader's until its deferred deinit, whose batch cancel drains
     // those reads before it frees anything.
-    r.stdout = gpa.dupe(u8, out.buffered()) catch &.{};
-    r.stderr = gpa.dupe(u8, er.buffered()) catch &.{};
+    r.stdout = if (o.head_tail) ends[0].join(gpa, out.buffered(), o.stdout_limit) else gpa.dupe(u8, out.buffered()) catch &.{};
+    r.stderr = if (o.head_tail) ends[1].join(gpa, er.buffered(), o.stderr_limit) else gpa.dupe(u8, er.buffered()) catch &.{};
     if (r.end != .exited) {
         killTree(io, &child); // then the deferred child.kill reaps the direct child
         // Cancelled HERE, before the deferred deinit: its Windows batch cancel waits for an APC before it cancels
@@ -390,6 +450,54 @@ test "stdout past its limit ends the run as an overflow, as StreamTooLong did; s
         try std.testing.expectEqual(End.exited, r.end);
         try std.testing.expect(r.stderr.len <= 4 * 64 + 4096); // a tail: at most one read past the trim point
         try std.testing.expect(std.mem.endsWith(u8, std.mem.trimEnd(u8, r.stderr, " \r\n"), "LAST"));
+    }
+}
+
+test "head_tail runs a stream to its exit however much it prints, keeps both ends, and names every byte it did not keep (real shell)" {
+    const gpa = std.testing.allocator;
+    const root = "zig-bounded-headtail-tmp";
+    var f: Fixture = undefined;
+    f.init(gpa, root);
+    defer f.deinit(root);
+    const io = f.threaded.io();
+    const nl = if (win) "\r\n" else "\n";
+    {
+        // ~36 KB on each stream against 1 KB limits, far past every trim point, then the run's own exit code
+        const argv = shell(if (win)
+            "echo FIRST& (for /L %i in (1,1,3000) do @echo 0123456789)& echo LAST& echo EFIRST 1>&2& (for /L %i in (1,1,3000) do @echo 0123456789 1>&2)& echo ELAST 1>&2& exit /b 5"
+        else
+            "echo FIRST; i=0; while [ $i -lt 3000 ]; do echo 0123456789; i=$((i+1)); done; echo LAST; echo EFIRST >&2; i=0; while [ $i -lt 3000 ]; do echo 0123456789 >&2; i=$((i+1)); done; echo ELAST >&2; exit 5");
+        var r = run(gpa, io, .{ .argv = &argv, .bound_ms = 60_000, .stdout_limit = 1024, .stderr_limit = 1024, .head_tail = true });
+        defer r.deinit(gpa);
+        try std.testing.expectEqual(End.exited, r.end);
+        try std.testing.expectEqual(@as(?u32, 5), r.exited());
+        try std.testing.expect(std.mem.startsWith(u8, r.stdout, "FIRST" ++ nl) and std.mem.endsWith(u8, r.stdout, "LAST" ++ nl));
+        try std.testing.expect(std.mem.startsWith(u8, r.stderr, "EFIRST") and std.mem.endsWith(u8, std.mem.trimEnd(u8, r.stderr, " \r\n"), "ELAST"));
+        try std.testing.expect(r.stdout.len <= 2 * 1024 + 64 and r.stderr.len <= 2 * 1024 + 64);
+        // What it kept plus what the marker line says it did not keep is exactly what the script printed, and the
+        // cut fell between whole lines on both sides.
+        const printed = ("FIRST" ++ nl).len + 3000 * ("0123456789" ++ nl).len + ("LAST" ++ nl).len;
+        const at = std.mem.indexOf(u8, r.stdout, "\n[... ") orelse return error.NoMarker;
+        const line_end = std.mem.indexOfScalarPos(u8, r.stdout, at + 1, '\n') orelse return error.NoMarker;
+        const mark = r.stdout[at + 1 .. line_end + 1];
+        try std.testing.expect(std.mem.endsWith(u8, mark, " bytes not kept ...]\n"));
+        const num_end = std.mem.indexOfScalarPos(u8, mark, "[... ".len, ' ') orelse return error.NoMarker;
+        const not_kept = try std.fmt.parseInt(usize, mark["[... ".len..num_end], 10);
+        try std.testing.expectEqual(printed, r.stdout.len - mark.len + not_kept);
+        try std.testing.expect(std.mem.endsWith(u8, r.stdout[0 .. at + 1], "0123456789" ++ nl));
+        try std.testing.expect(std.mem.startsWith(u8, r.stdout[line_end + 1 ..], "0123456789" ++ nl));
+    }
+    {
+        // ~1.4 KB against a 1 KB limit: the head is set aside but nothing is dropped, so what it kept is byte for byte
+        // what an uncapped run of the same script keeps
+        const argv = shell(if (win) "for /L %i in (1,1,125) do @echo 0123456789" else "i=0; while [ $i -lt 125 ]; do echo 0123456789; i=$((i+1)); done");
+        var whole = run(gpa, io, .{ .argv = &argv, .bound_ms = 60_000, .stdout_limit = 1 << 20, .stderr_limit = 1024 });
+        defer whole.deinit(gpa);
+        var kept = run(gpa, io, .{ .argv = &argv, .bound_ms = 60_000, .stdout_limit = 1024, .stderr_limit = 1024, .head_tail = true });
+        defer kept.deinit(gpa);
+        try std.testing.expectEqual(End.exited, kept.end);
+        try std.testing.expect(whole.stdout.len > 1024 and whole.stdout.len <= 2 * 1024);
+        try std.testing.expectEqualStrings(whole.stdout, kept.stdout);
     }
 }
 
