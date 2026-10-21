@@ -246,8 +246,10 @@ const COMPACT_TOOLS = [_][]const u8{
     "read_file",    "write_file",
     "edit_file",    "list_dir",
     "delete_file",
-    // code
+    // code — run_shell and tool_env ride along because a machine without Python has only run_shell to get one,
+    // and a small local model is the usual tenant of such a machine
      "run_python",
+    "run_shell",    "tool_env",
     "run_tests",
     // memory + documents (one recall verb, not two)
        "recall",
@@ -267,7 +269,7 @@ pub fn compactAllowed(name: []const u8) bool {
 
 /// SMALL-TIER DESCRIPTIONS. The other half of fitting a small window — and the half that costs nothing.
 ///
-/// The membership lever (COMPACT_TOOLS) is spent: the belt is already 17 of ~70 verbs, and the only block left
+/// The membership lever (COMPACT_TOOLS) is spent: the belt is already 19 of ~70 verbs, and the only block left
 /// big enough to matter is the browser, which cannot go. Cutting all four makes SCOUT_BROWSER_SCHEMA
 /// (worker/run.zig) a bare ",\n" that is still spliced, handing every scout mind a malformed tools array; cutting
 /// below three disables beltDenial's family-level correction. Meanwhile the belt's REAL cost is prose written for
@@ -294,6 +296,8 @@ const TERSE_DESC = [_]struct { name: []const u8, desc: []const u8 }{
     .{ .name = "delete_file", .desc = "Delete a file from the workdir." },
     // code
     .{ .name = "run_python", .desc = "Run a Python script in the workdir. Returns stdout, stderr and the exit code." },
+    .{ .name = "run_shell", .desc = "Run a PowerShell, bash, sh or cmd script in the workdir. Returns stdout, stderr and the exit code. Use it for commands, and to install a missing program (winget / brew / apt) — then tool_env refresh_path." },
+    .{ .name = "tool_env", .desc = "Keep an environment change for every later tool run, with no restart. After installing a program with run_shell, call action refresh_path; or action set with name and value (NL_PYTHON_BIN names the Python that run_python uses)." },
     .{ .name = "run_tests", .desc = "Run the project's tests and return the result." },
     // memory + documents
     .{ .name = "recall", .desc = "Look up facts remembered earlier in this conversation." },

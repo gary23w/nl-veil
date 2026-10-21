@@ -627,7 +627,8 @@ const SYSTEM_PROMPT =
 const SYSTEM_PROMPT_COMPACT =
     "You are veil, a helpful coding and research assistant. You have tools: web_search / web_fetch for the " ++
     "live web; read_file / write_file / edit_file / list_dir / delete_file for files; " ++
-    "run_python / run_tests to run code; recall / observe / read_doc / pixel_search for memory " ++
+    "run_python / run_shell / run_tests to run code, tool_env to keep an environment change for later tool " ++
+    "runs; recall / observe / read_doc / pixel_search for memory " ++
     "and stored documents; browser_navigate / browser_read / browser_click / browser_type to drive a real " ++
     "browser page. Those are ALL your tools - call them by exactly those names. Use a tool when it genuinely " ++
     "helps, then reply in plain prose, grounded in what the tools actually returned.\n" ++
@@ -640,7 +641,9 @@ const SYSTEM_PROMPT_COMPACT =
     "body, APIs no dedicated tool covers, parsing, math, data and file work. Reach for it instead of telling " ++
     "the user something is impossible. Read the LAST line of a traceback - that is the actual error; a " ++
     "name-resolution failure means THAT hostname is wrong (check it against what you were told), not that the " ++
-    "network is down.\n" ++
+    "network is down. If run_python reports that python is not found, install it yourself with run_shell " ++
+    "(winget on Windows, brew on macOS, apt on Debian/Ubuntu), then tool_env with action refresh_path, then " ++
+    "retry - never tell the user the tools are broken.\n" ++
     "GROUND YOURSELF - you have NO live knowledge of the current world. For anything time-sensitive (news, " ++
     "prices, versions, 'latest'/'today'/'now'), recall first and, if that is thin, web_search - then answer FROM " ++
     "what you find. NEVER fabricate current events, dates, statistics, or news.\n" ++
@@ -1282,11 +1285,13 @@ test "the terse belt halves the small tier's schema bytes without hiding a singl
     const defs = p.value.array;
 
     // EVERY tool the belt served before is still served — the saving costs no capability at all.
+    // ...plus the two code verbs added on 2026-10-21 (run_shell, tool_env): a machine without Python has only
+    // run_shell to get one, and a small local model is the usual tenant of such a machine.
     const must = [_][]const u8{
-        "web_search",    "web_fetch",    "read_file",    "write_file",   "edit_file",
-        "list_dir",      "delete_file",  "run_python",   "run_tests",    "recall",
-        "observe",       "read_doc",     "pixel_search", "browser_read", "browser_navigate",
-        "browser_click", "browser_type",
+        "web_search",   "web_fetch",        "read_file",     "write_file",   "edit_file",
+        "list_dir",     "delete_file",      "run_python",    "run_shell",    "tool_env",
+        "run_tests",    "recall",           "observe",       "read_doc",     "pixel_search",
+        "browser_read", "browser_navigate", "browser_click", "browser_type",
     };
     for (must) |name| {
         var found = false;
@@ -1326,7 +1331,8 @@ test "the terse belt halves the small tier's schema bytes without hiding a singl
             try std.testing.expect(std.mem.indexOf(u8, fnobj.get("description").?.string, "browser_read") != null);
     }
 
-    // MATERIALLY SMALLER, and locked so the prose cannot creep back. The pre-terse belt measured 13,489 B.
+    // MATERIALLY SMALLER, and locked so the prose cannot creep back. The pre-terse belt measured 13,489 B; with
+    // run_shell and tool_env added (2026-10-21) this belt measured 6,747 B by this same length, under the line.
     try std.testing.expect(TURN_TOOLS_COMPACT.len < 9 * 1024);
     try std.testing.expect(TURN_TOOLS_COMPACT.len * 2 < TURN_TOOLS_FULL.len);
     // the sandboxed twin rides the same projection
@@ -12790,7 +12796,7 @@ fn runInnerAgentic(
                         // cleaned up here, so this offered a struggling 12B two verbs it cannot call — at the
                         // exact moment it is hunting for any new verb to try. Replaced with the browser pair,
                         // which the tier DOES serve and which is the real answer to "web_fetch didn't work".
-                        "files: write_file/edit_file/read_file/list_dir; web: web_search/web_fetch; a page needing JS or a login: browser_navigate then browser_read; run code: run_python/run_tests; stored docs: read_doc; memory: recall";
+                        "files: write_file/edit_file/read_file/list_dir; web: web_search/web_fetch; a page needing JS or a login: browser_navigate then browser_read; run code: run_python/run_shell/run_tests; stored docs: read_doc; memory: recall";
                     const nudged = std.fmt.allocPrint(gpa, "{s}\n(engine: {s} has produced a FAILED outcome {d} times in a row. STOP and weigh your options before the next call. Is there a dedicated tool for this job — {s}? Pick the SIMPLEST tool that does it, or fix the exact error shown above — never re-run the same approach unchanged.)", .{ result, c.name, fail_streak, option_space }) catch result;
                     if (nudged.ptr != result.ptr) {
                         gpa.free(result);
@@ -13100,7 +13106,7 @@ fn toolArbiter(app: *App, run_root: []const u8, p: Provider, intent: []const u8,
     ask.appendSlice(gpa, if (has_orch)
         "\n\nAVAILABLE TOOL FAMILIES: files (write_file/edit_file/read_file/list_dir/delete_file), waiting/watching (poll), web (web_fetch/read_url/web_search/fetch_json), stored docs & memory (read_doc/recall_hive/recall), side-thread (open_subchat), a team (cast), code (run_python/run_shell/run_tests). Your recommendation:"
     else
-        "\n\nAVAILABLE TOOL FAMILIES: files (write_file/edit_file/read_file/list_dir/delete_file), web (web_search/web_fetch), a page needing JS or a login (browser_navigate, then browser_read for refs, then browser_click/browser_type), stored docs & memory (read_doc/recall/observe), images (pixel_search), code (run_python/run_tests). Your recommendation:") catch return null;
+        "\n\nAVAILABLE TOOL FAMILIES: files (write_file/edit_file/read_file/list_dir/delete_file), web (web_search/web_fetch), a page needing JS or a login (browser_navigate, then browser_read for refs, then browser_click/browser_type), stored docs & memory (read_doc/recall/observe), images (pixel_search), code (run_python/run_shell/run_tests). Your recommendation:") catch return null;
     var msgs: std.ArrayListUnmanaged(u8) = .empty;
     defer msgs.deinit(gpa);
     msgs.appendSlice(gpa, "{\"role\":\"system\",\"content\":") catch return null;
