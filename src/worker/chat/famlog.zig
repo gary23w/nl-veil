@@ -118,8 +118,9 @@ fn lastSeq(gpa: std.mem.Allocator, io: std.Io, path: []const u8) Tail {
     return out;
 }
 
-/// `s` cut to at most `max` bytes on a character boundary.
-fn clipChars(s: []const u8, max: usize) []const u8 {
+/// `s` cut to at most `max` bytes on a character boundary. Whole when it fits: a text that ends on a multi-byte
+/// character keeps it (engine's FamilyTurn.note relies on that for a sub-chat's answer).
+pub fn clipChars(s: []const u8, max: usize) []const u8 {
     if (s.len <= max) return s;
     var n = max;
     while (n > 0 and (s[n] & 0xC0) == 0x80) n -= 1;
@@ -129,6 +130,13 @@ fn clipChars(s: []const u8, max: usize) []const u8 {
 // ---- tests ----
 
 const tt = std.testing;
+
+test "clipChars keeps a text that fits whole, even one ending on (or made only of) multi-byte characters" {
+    try tt.expectEqualStrings("done \u{2014} ok \u{1F600}", clipChars("done \u{2014} ok \u{1F600}", 64));
+    try tt.expectEqualStrings("\u{4E2D}\u{6587}", clipChars("\u{4E2D}\u{6587}", 64));
+    // cut inside the second character: back to the boundary, never a broken sequence
+    try tt.expectEqualStrings("\u{4E2D}", clipChars("\u{4E2D}\u{6587}", 4));
+}
 
 test "the ledger: seqs from 1 that never repeat, one whole JSON line per record, a long text clipped on a character" {
     const gpa = tt.allocator;

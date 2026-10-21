@@ -120,12 +120,15 @@ fn git(gpa: std.mem.Allocator, io: Io, workdir: []const u8, args: []const []cons
     av.appendSlice(gpa, args) catch return .{ .ok = false, .out = gpa.dupe(u8, "oom") catch @constCast("oom") };
     var env = gitEnviron(gpa) catch |e| return .{ .ok = false, .out = std.fmt.allocPrint(gpa, "git failed to run ({s})", .{@errorName(e)}) catch @constCast("oom") };
     defer env.deinit();
-    var r = bounded.run(gpa, io, .{ .argv = av.items, .environ_map = &env, .bound_ms = GIT_BOUND_MS, .stdout_limit = 64 << 10, .stderr_limit = 16 << 10 });
+    // head_tail: neither stream ends the run. A `git add -A` prints a warning per file to stderr (a CRLF note each), and
+    // a git stopped at a limit mid-index-write can leave .git/index.lock behind; the tool shows only 4000 bytes anyway.
+    var r = bounded.run(gpa, io, .{ .argv = av.items, .environ_map = &env, .bound_ms = GIT_BOUND_MS, .stdout_limit = 64 << 10, .stderr_limit = 16 << 10, .head_tail = true });
     defer r.deinit(gpa);
     switch (r.end) {
         .exited, .signal => {},
         .unstarted, .unread => return .{ .ok = false, .out = std.fmt.allocPrint(gpa, "git failed to run ({s}) — is git installed and on PATH?", .{r.why()}) catch @constCast("git not found") },
         .killed => return .{ .ok = false, .out = std.fmt.allocPrint(gpa, "git was still running after {d} minutes and was stopped", .{GIT_BOUND_MS / 60_000}) catch @constCast("git stopped") },
+        // never under head_tail
         .overflow => return .{ .ok = false, .out = gpa.dupe(u8, "git printed more than this tool reads (64 KB of output, 16 KB of messages) and was stopped") catch @constCast("git stopped") },
     }
     const ok = r.ok();
@@ -851,7 +854,7 @@ fn expectUntouched(gpa: std.mem.Allocator, io: Io, path: []const u8, want: []con
     try std.testing.expectEqualStrings(want, got);
 }
 
-test "git output past what the tool reads stops git and says so, instead of hanging the call (real git)" {
+test "git output past what the tool keeps runs git to its own exit and hands back its head, instead of stopping git or hanging the call (real git)" {
     const gpa = std.testing.allocator;
     var threaded = testThreaded(gpa);
     defer threaded.deinit();
@@ -875,11 +878,14 @@ test "git output past what the tool reads stops git and says so, instead of hang
     }
     {
         // ~200 KB of diff on stdout and nothing on stderr: std.process.run returned StreamTooLong past 64 KB, then
-        // waited in the reader's deinit for stderr, while git sat blocked writing to a pipe nobody read (Windows)
+        // waited in the reader's deinit for stderr, while git sat blocked writing to a pipe nobody read (Windows).
+        // Now git runs to its own exit (1: the files differ), and the tool hands back the diff's head.
         const r = git(gpa, io, root, &.{ "diff", "--no-index", "--no-color", "empty.txt", "big.txt" });
         defer gpa.free(r.out);
         try std.testing.expect(!r.ok);
-        try std.testing.expect(std.mem.indexOf(u8, r.out, "git printed more than this tool reads") != null);
+        try std.testing.expect(std.mem.startsWith(u8, r.out, "diff --git"));
+        try std.testing.expect(std.mem.indexOf(u8, r.out, "+xxxxxxxx") != null);
+        try std.testing.expect(r.out.len <= 4000);
     }
 }
 

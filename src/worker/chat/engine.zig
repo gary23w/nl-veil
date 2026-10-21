@@ -8131,27 +8131,59 @@ fn isNegator(w: []const u8) bool {
 /// backtick pairs with the next of its kind. A single quote opens only where no letter or digit comes before it
 /// and a non-space comes after, and closes only where a non-space comes before and no letter or digit after, so
 /// "don't" and "user's" neither open nor close one. A quote that never closes blanks nothing: an unbalanced quote
-/// never hides the instruction typed after it.
+/// never hides the instruction typed after it. Curly quotes pair the same way (U+201C with U+201D like a double
+/// quote, U+2018 with U+2019 like a single one, so "don’t" stays a word). A span holding one bare identifier
+/// (`open_subchat`, "read_file") is a NAME, not words passed on: only its quote marks are blanked, so
+/// "Use `open_subchat` to ..." still reads as asking for that tool.
 fn unquotedLower(text: []const u8, buf: []u8) []u8 {
     const n = @min(text.len, buf.len);
     for (text[0..n], 0..) |c, i| buf[i] = std.ascii.toLower(c);
     const low = buf[0..n];
     var i: usize = 0;
     while (i < low.len) : (i += 1) {
-        const q = low[i];
-        if (q != '"' and q != '`' and q != '\'') continue;
-        if (q == '\'' and !((i == 0 or !std.ascii.isAlphanumeric(low[i - 1])) and i + 1 < low.len and !std.ascii.isWhitespace(low[i + 1]))) continue;
-        var j = i + 1;
+        const q = quoteAt(low, i) orelse continue;
+        const after = i + q.open_len;
+        if (q.single and !((i == 0 or !std.ascii.isAlphanumeric(low[i - 1])) and after < low.len and !std.ascii.isWhitespace(low[after]))) continue;
+        var j = after;
         const close: ?usize = while (j < low.len) : (j += 1) {
-            if (low[j] != q) continue;
-            if (q != '\'' or (!std.ascii.isWhitespace(low[j - 1]) and (j + 1 == low.len or !std.ascii.isAlphanumeric(low[j + 1])))) break j;
+            if (!std.mem.startsWith(u8, low[j..], q.close)) continue;
+            const past = j + q.close.len;
+            if (!q.single or (!std.ascii.isWhitespace(low[j - 1]) and (past == low.len or !std.ascii.isAlphanumeric(low[past])))) break j;
         } else null;
         if (close) |c| {
-            @memset(low[i .. c + 1], ' ');
-            i = c;
+            const past = c + q.close.len;
+            if (bareIdent(low[after..c])) {
+                @memset(low[i..after], ' ');
+                @memset(low[c..past], ' ');
+            } else @memset(low[i..past], ' ');
+            i = past - 1;
         }
     }
     return low;
+}
+
+/// A quote mark opening at `low[i]`: its byte length, the mark that closes it, and whether it pairs by
+/// unquotedLower's single-quote word-edge rule.
+const QuoteMark = struct { open_len: usize, close: []const u8, single: bool };
+fn quoteAt(low: []const u8, i: usize) ?QuoteMark {
+    return switch (low[i]) {
+        '"' => .{ .open_len = 1, .close = "\"", .single = false },
+        '`' => .{ .open_len = 1, .close = "`", .single = false },
+        '\'' => .{ .open_len = 1, .close = "'", .single = true },
+        else => if (std.mem.startsWith(u8, low[i..], "\u{201C}"))
+            .{ .open_len = 3, .close = "\u{201D}", .single = false }
+        else if (std.mem.startsWith(u8, low[i..], "\u{2018}"))
+            .{ .open_len = 3, .close = "\u{2019}", .single = true }
+        else
+            null,
+    };
+}
+
+/// One identifier and nothing else: letters, digits and underscores, at least one of them.
+fn bareIdent(s: []const u8) bool {
+    if (s.len == 0) return false;
+    for (s) |c| if (!(std.ascii.isAlphanumeric(c) or c == '_')) return false;
+    return true;
 }
 
 /// The turn's own words tell the model to run a tool by name: a clause outside any quote that opens with "use" or
@@ -8341,6 +8373,22 @@ test "toolsForbidden: a quoted goal is not this turn's instruction (family run T
     try t.expect(!toolsForbidden("Open a sub-chat with this goal: 'Summarise the user's notes. Don't read files, do not use tools.' Reply OPENED."));
     // a quote that never closes hides nothing typed after it
     try t.expect(toolsForbidden("Explain 'append-only, no tools."));
+    // curly quotes pair like straight ones, and a curly apostrophe stays inside its word
+    try t.expect(!toolsForbidden("Open a sub-chat whose goal is \u{201C}Without using any tool, state the channel depth, as DEPTH=<n>.\u{201D}"));
+    try t.expect(!toolsForbidden("Open a sub-chat with this goal: \u{2018}Summarise the user\u{2019}s notes. Don\u{2019}t read files, do not use tools.\u{2019} Reply OPENED."));
+    try t.expect(toolsForbidden("Summarise the user\u{2019}s notes without using any tool, \u{2018}briefly\u{2019} please."));
+}
+
+test "requestsTool: a tool named inside backticks or quotes is still the tool being asked for" {
+    const t = std.testing;
+    try t.expect(requestsTool("Use `open_subchat` to open ONE sub-chat with exactly this goal: 'Read intake/t1.md.' Do not read or create any file yourself."));
+    try t.expect(requestsTool("Please call \"read_file\" on notes/t1.md, then reply DONE."));
+    try t.expect(requestsTool("Use \u{201C}open_subchat\u{201D} to open a sub-chat."));
+    try t.expect(!toolsForbidden("Use `open_subchat` to open ONE sub-chat with exactly this goal: 'Read intake/t1.md.' Do not read or create any file yourself."));
+    // a quoted SENTENCE that names a tool is still words passed on, not this turn's request
+    try t.expect(!requestsTool("Open a sub-chat with this goal: `Use web_search to find the tide table.`"));
+    // and a bare word that is not a tool stays a non-request
+    try t.expect(!requestsTool("Use `snake_case` names."));
 }
 
 test "toolsForbidden / actionShaped: a turn that names a tool to run needs tools, whatever else it forbids (family run T1, T3)" {
@@ -10350,7 +10398,9 @@ const FamilyTurn = struct {
     fn note(t: *FamilyTurn, gpa: std.mem.Allocator, text: []const u8) void {
         if (!t.on) return;
         t.answer.clearRetainingCapacity();
-        t.answer.appendSlice(gpa, clipBytes(text, famlog.TEXT_MAX)) catch t.answer.clearRetainingCapacity();
+        // famlog.clipChars, not clipBytes: clipBytes drops every trailing byte >= 0x80 even when nothing needs cutting,
+        // so an answer ending in an emoji lost its tail and one in CJK or Cyrillic came out empty.
+        t.answer.appendSlice(gpa, famlog.clipChars(text, famlog.TEXT_MAX)) catch t.answer.clearRetainingCapacity();
     }
 
     fn end(t: *FamilyTurn, app: *App, conv: []const u8, conv_dir: []const u8) void {

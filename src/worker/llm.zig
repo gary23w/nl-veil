@@ -1960,7 +1960,9 @@ const ERR_LOCAL_TIMED_OUT = "local model call timed out";
 const ERR_LOCAL_DROPPED = "local model call failed (connection dropped mid-reply)";
 const ERR_CURL_NO_CONFIG = "curl exited before it read its config";
 const ERR_CURL_NO_SPAWN = "curl failed to run";
-const ERR_CURL_BOUND = "curl was still running past its call's deadline and was stopped";
+/// "timed out" is the needle isTransientLlmError and run.zig's isRetryable both read: without one, a bound hit was
+/// never retried and never fell back.
+const ERR_CURL_BOUND = "curl timed out: it was still running past its call's deadline and was stopped";
 const ERR_CURL_OVERFLOW = "the reply passed 8 MiB and was cut off";
 const ERR_CURL_EXIT = "curl exit: "; // + the head of curl's own stderr
 const ERR_CURL_NONZERO = "curl nonzero exit"; // ERR_CURL_EXIT when its message could not be formatted
@@ -2585,6 +2587,8 @@ test "isTransientLlmError: provider hiccups retry, request errors do not" {
     try std.testing.expect(isTransientLlmError("HTTP 429: {\"success\":false,\"errors\":[{\"code\":3040,\"message\":\"rate limited\"}]}"));
     try std.testing.expect(isTransientLlmError("HTTP 503: upstream unavailable"));
     try std.testing.expect(isTransientLlmError("provider error 3040: Too many requests"));
+    // a call cut at its own bound (runCurl's `.killed`) is the transport's clock, as a curl (28) is
+    try std.testing.expect(isTransientLlmError(ERR_CURL_BOUND));
     try std.testing.expect(!isTransientLlmError("HTTP 400: {\"errors\":[{\"code\":5006,\"message\":\"invalid parameter\"}]}"));
     try std.testing.expect(!isTransientLlmError("provider error: Authentication Fails, Your api key: ****546c is invalid"));
     try std.testing.expect(!isTransientLlmError("provider error: model not found"));

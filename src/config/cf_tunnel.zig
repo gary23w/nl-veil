@@ -320,12 +320,27 @@ fn ensureBinary(app: *App, a: std.mem.Allocator, st: *State) union(enum) { path:
     const url = std.fmt.allocPrint(a, RELEASE_BASE ++ "{s}", .{asset}) catch return .{ .fail = "oom" };
     const is_tgz = std.mem.endsWith(u8, asset, ".tgz");
     const dest = if (is_tgz) (std.fmt.allocPrint(a, "{s}/cloudflared.tgz", .{dir}) catch return .{ .fail = "oom" }) else local;
+    // Fetched to `<dest>.part` and renamed into place only once curl succeeds: the file at `local` is trusted from then
+    // on with no check (above), so a download cut at its bound or failed part-way must never be left under that name.
+    const part = std.fmt.allocPrint(a, "{s}.part", .{dest}) catch return .{ .fail = "oom" };
+    std.Io.Dir.cwd().deleteFile(app.io, part) catch {};
     log.info("fetching the Cloudflare Tunnel connector from {s}", .{url});
-    // 10 minutes for a ~60 MB binary: a slow line still finishes, and a transfer that stalls gives the start back
-    if (!runs(app, &.{ "curl", "-sSL", "--fail", "--connect-timeout", "20", "--retry", "2", "--retry-delay", "2", "-o", dest, url }, 600))
-        return .{ .fail = "could not download cloudflared from Cloudflare's GitHub release (offline? curl missing?) - install it yourself and put it on PATH" };
+    // 10 minutes for a ~60 MB binary: a slow line still finishes, and a transfer that stalls gives the start back.
+    // --speed-limit/--speed-time: under 1 KB/s for a minute, curl gives up on its own rather than riding the bound.
+    if (!runs(app, &.{ "curl", "-sSL", "--fail", "--connect-timeout", "20", "--speed-limit", "1024", "--speed-time", "60", "--retry", "2", "--retry-delay", "2", "-o", part, url }, 600)) {
+        std.Io.Dir.cwd().deleteFile(app.io, part) catch {};
+        return .{ .fail = "could not download cloudflared from Cloudflare's GitHub release (no network or no curl, an HTTP error, or a transfer that stalled or ran past 10 minutes) - install it yourself and put it on PATH" };
+    }
+    std.Io.Dir.cwd().rename(part, std.Io.Dir.cwd(), dest, app.io) catch {
+        std.Io.Dir.cwd().deleteFile(app.io, part) catch {};
+        return .{ .fail = "could not move the downloaded cloudflared into place" };
+    };
     if (is_tgz) {
-        if (!runs(app, &.{ "tar", "-xzf", dest, "-C", dir }, 120)) return .{ .fail = "could not unpack the cloudflared release archive" };
+        if (!runs(app, &.{ "tar", "-xzf", dest, "-C", dir }, 120)) {
+            // a cut unpack can leave part of the binary at `local`, which would be trusted from then on as well
+            std.Io.Dir.cwd().deleteFile(app.io, local) catch {};
+            return .{ .fail = "could not unpack the cloudflared release archive" };
+        }
         std.Io.Dir.cwd().deleteFile(app.io, dest) catch {};
     }
     if (builtin.os.tag != .windows) _ = runs(app, &.{ "chmod", "+x", local }, QUICK_S);

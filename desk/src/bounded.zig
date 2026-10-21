@@ -65,15 +65,20 @@ pub const Options = struct {
     /// Overrides stderr_tail.
     head_tail: bool = false,
     /// Bytes for the child's stdin, written whole and then closed before anything is read; null = no stdin
-    /// (`.ignore`), as std.process.run. They must fit the pipe with no reader (4096 bytes: llm.KEY_CFG_MAX says
-    /// why), or the write waits on a child that is not reading and the bound is no bound. A child that is gone
-    /// before it takes them ends the run as `.unread` with error.StdinRefused.
+    /// (`.ignore`), as std.process.run. They must fit the pipe with no reader (STDIN_MAX: llm.KEY_CFG_MAX says
+    /// why), or the write waits on a child that is not reading and the bound is no bound; longer, run() spawns
+    /// nothing and ends `.unread` with error.StdinTooLarge. A child that is gone before it takes them ends the run
+    /// as `.unread` with error.StdinRefused.
     stdin: ?[]const u8 = null,
 };
 
+/// The most Options.stdin may hold: what fits the pipe with no reader (4096 bytes, llm.KEY_CFG_MAX).
+pub const STDIN_MAX: usize = 4096;
+
 /// How a run ended. `.killed` = still running at the bound; `.overflow` = printed past a limit (never under
 /// `head_tail`); `.unread` = its output could not be read, its exit not collected, or it refused its stdin;
-/// `.unstarted` = the spawn failed. `.killed`, `.overflow` and `.unread` were killed with everything they started.
+/// `.unstarted` = the spawn failed. `.killed`, `.overflow` and `.unread` were killed with everything they started,
+/// save an `.unread` for stdin past STDIN_MAX, which never started.
 pub const End = enum { exited, signal, killed, overflow, unread, unstarted };
 
 pub const Result = struct {
@@ -128,7 +133,7 @@ const Ends = struct {
             } else |_| {}
         }
         const n = rd.buffered().len;
-        if (n > 4 * limit) {
+        if (n > 4 *| limit) {
             rd.toss(n - limit);
             e.dropped += n - limit;
         }
@@ -158,6 +163,9 @@ const Ends = struct {
 /// on Windows.
 pub fn run(gpa: std.mem.Allocator, io: std.Io, o: Options) Result {
     const bound_ms = if (builtin.is_test) @min(o.bound_ms, seam.cap_ms orelse o.bound_ms) else o.bound_ms;
+    // Refused here, before the spawn, rather than left to each caller: past the pipe, feed() would wait on a child
+    // that is not reading, with no deadline running yet.
+    if (o.stdin) |bytes| if (bytes.len > STDIN_MAX) return .{ .end = .unread, .err = error.StdinTooLarge };
     // POSIX: its own process group, so killTree reaches what the child started. dash does not exec a nested
     // `sh -c` either: measured in WSL, killing the direct child alone left `sh -c sleep 6` and its sleep running.
     // The cost, accepted: a terminal's Ctrl-C signals only its foreground group, so it no longer reaches the child.
@@ -201,7 +209,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, o: Options) Result {
                 r.end = .overflow;
                 break;
             }
-            if (er.buffered().len > 4 * o.stderr_limit) er.toss(er.buffered().len - o.stderr_limit);
+            if (er.buffered().len > 4 *| o.stderr_limit) er.toss(er.buffered().len - o.stderr_limit);
         }
     } else |e| switch (e) {
         // both streams are done; one that ended on a read error rather than EOF says so here
@@ -564,5 +572,34 @@ test "stdin is handed over whole and closed, so a child reading to EOF finishes;
         defer r.deinit(gpa);
         try std.testing.expectEqual(End.overflow, r.end);
         try std.testing.expect(std.mem.startsWith(u8, r.stdout, "header = \"X-Fed: 1\""));
+    }
+}
+
+test "stdin past STDIN_MAX is refused before anything is spawned; exactly STDIN_MAX is handed over whole (real child)" {
+    const gpa = std.testing.allocator;
+    const root = "zig-bounded-stdinmax-tmp";
+    var f: Fixture = undefined;
+    f.init(gpa, root);
+    defer f.deinit(root);
+    const io = f.threaded.io();
+    const fed = try gpa.alloc(u8, STDIN_MAX + 1);
+    defer gpa.free(fed);
+    for (fed, 0..) |*c, i| c.* = if (i % 64 == 63) '\n' else 'x';
+    {
+        // the shell would leave ran.txt behind had it been started
+        const argv = shell(if (win) "echo ran>" ++ root ++ "\\ran.txt" else "echo ran > " ++ root ++ "/ran.txt");
+        var r = run(gpa, io, .{ .argv = &argv, .stdin = fed, .bound_ms = 30_000, .stdout_limit = 64, .stderr_limit = 64 });
+        defer r.deinit(gpa);
+        try std.testing.expectEqual(End.unread, r.end);
+        try std.testing.expectEqual(@as(?anyerror, error.StdinTooLarge), r.err);
+        try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, root ++ "/ran.txt", .{}));
+    }
+    {
+        const argv: []const []const u8 = if (win) &.{ "findstr", "/R", "." } else &.{"cat"};
+        const whole = fed[0..STDIN_MAX];
+        var r = run(gpa, io, .{ .argv = argv, .stdin = whole, .bound_ms = 30_000, .stdout_limit = 16 << 10, .stderr_limit = 4096 });
+        defer r.deinit(gpa);
+        try std.testing.expectEqual(End.exited, r.end);
+        try std.testing.expectEqual(std.mem.count(u8, whole, "x"), std.mem.count(u8, r.stdout, "x"));
     }
 }

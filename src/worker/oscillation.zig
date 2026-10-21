@@ -138,6 +138,49 @@ pub fn writeLockFor(io: std.Io, db: []const u8) ?*std.Io.Mutex {
 var write_locks_mtx: std.Io.Mutex = .init;
 var write_locks: std.StringHashMapUnmanaged(*std.Io.Mutex) = .empty;
 
+/// FAIL FAST BEHIND A HELD STORE. Once a write has sat out every lock retry (~5 s) and given up because
+/// another process holds the db, the next writes to that db within REFUSED_HOLD_MS make ONE attempt each
+/// instead of paying the same ~5 s again. A turn's exit makes many writes in a row (the user observe, the
+/// step bank, the imports, one strengthen per fired overlay fact), and each sitting out its own retries
+/// would hold the turn, and through writeLockFor every other turn of the user, for minutes. The writes are
+/// still counted as lost to the lock. A write that lands ends the window. Best effort: a slot is a hash of
+/// the db path, and a collision costs the other path one fail-fast window at most.
+const REFUSED_SLOTS = 64;
+pub const REFUSED_HOLD_MS: i64 = 30_000;
+var refused_key: [REFUSED_SLOTS]std.atomic.Value(u64) = [_]std.atomic.Value(u64){.init(0)} ** REFUSED_SLOTS;
+var refused_until_ms: [REFUSED_SLOTS]std.atomic.Value(i64) = [_]std.atomic.Value(i64){.init(0)} ** REFUSED_SLOTS;
+
+/// The db path keyed as writeLockFor keys it (on Windows `\` read as `/`, case folded), hashed; never 0.
+fn refusedKey(db: []const u8) u64 {
+    var h = std.hash.Wyhash.init(0);
+    var kb: [256]u8 = undefined;
+    var i: usize = 0;
+    while (i < db.len) {
+        const n = @min(kb.len, db.len - i);
+        for (db[i .. i + n], 0..) |c, j| kb[j] = if (builtin.os.tag == .windows) (if (c == '\\') '/' else std.ascii.toLower(c)) else c;
+        h.update(kb[0..n]);
+        i += n;
+    }
+    const k = h.final();
+    return if (k == 0) 1 else k;
+}
+fn awakeMs(io: std.Io) i64 {
+    return @intCast(@divTrunc(std.Io.Timestamp.now(io, .awake).nanoseconds, std.time.ns_per_ms));
+}
+fn refusedRecently(io: std.Io, db: []const u8) bool {
+    const k = refusedKey(db);
+    const i = k % REFUSED_SLOTS;
+    return refused_key[i].load(.monotonic) == k and awakeMs(io) < refused_until_ms[i].load(.monotonic);
+}
+fn markRefused(io: std.Io, db: []const u8, on: bool) void {
+    const k = refusedKey(db);
+    const i = k % REFUSED_SLOTS;
+    if (on) {
+        refused_until_ms[i].store(awakeMs(io) + REFUSED_HOLD_MS, .monotonic);
+        refused_key[i].store(k, .monotonic);
+    } else if (refused_key[i].load(.monotonic) == k) refused_key[i].store(0, .monotonic);
+}
+
 /// stderr of an exit-1 the CLI's single-writer lock produced ("<db>.lock is held by a live neuron writer
 /// (pid N)." / "one db file = one writer: ..."): the shipped binary's exact wording.
 fn lockRefused(stderr: []const u8) bool {
@@ -494,8 +537,17 @@ pub const Mem = struct {
         return m;
     }
 
+    /// tryLock with an OS-sleep backoff, never lockUncancelable: a contended Io.Mutex parks on the runtime's
+    /// per-thread alert, and every chat write runs on a thread the runtime did not spawn (a turn's std.Thread, an
+    /// httpz worker), where a wake it did not ask for is the hazard the lock-retry pause below already avoids. The
+    /// lock is held for one neuron spawn (0.1-1 s measured), so polling it costs nothing.
     fn lockW(self: Mem) void {
-        if (self.wmtx) |m| m.lockUncancelable(self.io);
+        const m = self.wmtx orelse return;
+        var pause_ms: u64 = 1;
+        while (!m.tryLock()) {
+            bu.sleepMs(pause_ms);
+            pause_ms = @min(pause_ms * 2, 20);
+        }
     }
     fn unlockW(self: Mem) void {
         if (self.wmtx) |m| m.unlock(self.io);
@@ -544,14 +596,16 @@ pub const Mem = struct {
         };
         var m = self;
         m.bound_ms = bound_ms;
+        const fail_fast = refusedRecently(self.io, self.db);
         var attempt: u32 = 0;
         while (true) : (attempt += 1) {
             const r = m.run2(args);
             if (r.out) |o| {
                 if (self.stats) |s| _ = s.ok.fetchAdd(1, .monotonic);
+                if (fail_fast) markRefused(self.io, self.db, false);
                 return o;
             }
-            if (r.fail == .lock and attempt < LOCK_RETRIES) {
+            if (r.fail == .lock and attempt < LOCK_RETRIES and !fail_fast) {
                 if (self.stats) |s| _ = s.retries.fetchAdd(1, .monotonic);
                 const pause_full: u64 = @min(LOCK_PAUSE_MAX_MS, LOCK_PAUSE_MS << @intCast(attempt));
                 const pause_ms = if (builtin.is_test) @min(pause_full, seam.pause_cap_ms orelse pause_full) else pause_full;
@@ -572,6 +626,7 @@ pub const Mem = struct {
                 waited += @intCast(@max(0, std.Io.Timestamp.now(self.io, .awake).nanoseconds - p0));
                 continue;
             }
+            if (r.fail == .lock) markRefused(self.io, self.db, true);
             if (self.stats) |s| s.note(r.fail);
             return null;
         }
@@ -1362,6 +1417,22 @@ test "a write the CLI's pid lock refuses is retried, and lands once the other wr
     try std.testing.expectEqual(@as(u32, 1), st.lock.load(.monotonic));
     try std.testing.expectEqual(LOCK_RETRIES, st.retries.load(.monotonic));
     try std.testing.expectEqual(@as(u32, 0), st.ok.load(.monotonic));
+
+    // ...and the next write behind the same held store does not sit the retries out again: one attempt, counted
+    st = .{};
+    try std.testing.expectEqual(@as(u32, 0), m.importDocs(doc));
+    try std.testing.expectEqual(@as(u32, 1), st.lock.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 0), st.retries.load(.monotonic));
+
+    // once the store is free a write lands, and the fail-fast window ends with it
+    try std.Io.Dir.cwd().deleteFile(io, root ++ "/n.db.lock");
+    st = .{};
+    try std.testing.expect(m.importDocs("{\"scope\":\"chat:c__n2\",\"fact\":\"raw output line three says the smoke test passed\"}\n") >= 1);
+    try std.testing.expectEqual(@as(u32, 0), st.failed());
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/n.db.lock", .data = try std.fmt.bufPrint(&pb, "{d}", .{testSelfPid()}) });
+    st = .{};
+    _ = m.importDocs("{\"scope\":\"chat:c__n3\",\"fact\":\"raw output line four says the release notes were written\"}\n");
+    try std.testing.expectEqual(LOCK_RETRIES, st.retries.load(.monotonic));
 }
 
 test "the lock-retry pause never parks: a turn's raw thread with an alert pending retries, lands, and keeps the alert" {

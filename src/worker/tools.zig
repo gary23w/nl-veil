@@ -2781,7 +2781,7 @@ fn runPython(ctx: *ToolCtx, args_json: []const u8) []u8 {
     const py = deps.pythonBin(ctx.io, &env);
     var cap_buf: [10]u8 = undefined;
     const argv = [_][]const u8{ py, "-c", PYRUN, pyrunCapArg(ctx.environ, &cap_buf), script_name };
-    var r = bounded.run(gpa, ctx.io, .{ .argv = &argv, .cwd = .{ .path = ctx.workdir }, .environ_map = &env, .bound_ms = pyrunBoundMs(ctx.environ), .stdout_limit = PYRUN_STDOUT_MAX, .stderr_limit = PYRUN_STDERR_MAX });
+    var r = pyrunRun(gpa, ctx.io, &argv, ctx.workdir, &env, ctx.environ);
     defer r.deinit(gpa);
     // A SPAWN error (python missing / unstartable) is not the same as a script that ran and crashed: the
     // latter exits non-zero and NEVER reaches this branch. So only the genuine "the interpreter itself is
@@ -2789,12 +2789,13 @@ fn runPython(ctx: *ToolCtx, args_json: []const u8) []u8 {
     // install the interpreter itself with run_shell, make the new PATH visible with tool_env, and retry, instead
     // of reporting the tools broken.
     if (r.end == .unstarted) return if (deps.isSpawnMissing(r.err.?)) pythonMissingForModel(gpa) else dupe(gpa, "python failed to run");
-    if (!r.finished()) return pyrunStopped(gpa, &r);
-    const exit = r.exited() orelse 255;
+    const exit = pyrunExit(&r);
+    const note = pyrunNote(gpa, ctx.environ, &r);
+    defer gpa.free(note);
     const head, const tail = clipEnds(r.stderr, 1500);
     if (tail.len == 0)
-        return std.fmt.allocPrint(gpa, "exit={d}\nstdout:\n{s}\nstderr:\n{s}", .{ exit, clip(r.stdout, 4000), head }) catch dupe(gpa, "ran");
-    return std.fmt.allocPrint(gpa, "exit={d}\nstdout:\n{s}\nstderr:\n{s}\n  ... [middle frames omitted — the LAST line below is the actual error] ...\n{s}", .{ exit, clip(r.stdout, 4000), head, tail }) catch dupe(gpa, "ran");
+        return std.fmt.allocPrint(gpa, "exit={d}\nstdout:\n{s}\nstderr:\n{s}{s}", .{ exit, clip(r.stdout, 4000), head, note }) catch dupe(gpa, "ran");
+    return std.fmt.allocPrint(gpa, "exit={d}\nstdout:\n{s}\nstderr:\n{s}\n  ... [middle frames omitted — the LAST line below is the actual error] ...\n{s}{s}", .{ exit, clip(r.stdout, 4000), head, tail, note }) catch dupe(gpa, "ran");
 }
 
 /// Head+tail clip for captured stderr. A plain head clip — what this used to be — is exactly backwards for a
@@ -3169,7 +3170,7 @@ test "a run_python cap hit keeps what the script printed and names the cap as ru
     }
 }
 
-test "a run_python script printing past what the call reads gets an answer that says so, instead of hanging the call (real python)" {
+test "a run_python script printing past what the call keeps runs to its own exit, and the reply keeps its exit code and its head, instead of hanging the call or reading as a success (real python)" {
     const gpa = std.testing.allocator;
     const environ: std.process.Environ = if (@import("builtin").os.tag == .windows) .{ .block = .global } else .{ .block = .{ .slice = std.mem.span(std.c.environ) } };
     var threaded = std.Io.Threaded.init(gpa, .{ .environ = environ });
@@ -3178,7 +3179,7 @@ test "a run_python script printing past what the call reads gets an answer that 
     var env = environ.createMap(gpa) catch return error.SkipZigTest;
     defer env.deinit();
     { // skip only on proof that the interpreter runPython spawns is not on this machine
-        const py = if (@import("builtin").os.tag == .windows) "python" else "python3";
+        const py = deps.pythonBin(io, &env);
         var probe = bounded.run(gpa, io, .{ .argv = &.{ py, "--version" }, .environ_map = &env, .bound_ms = 30_000, .stdout_limit = 256, .stderr_limit = 256 });
         defer probe.deinit(gpa);
         if (probe.end == .unstarted and deps.isSpawnMissing(probe.err.?)) return error.SkipZigTest;
@@ -3206,15 +3207,39 @@ test "a run_python script printing past what the call reads gets an answer that 
         .directives_set = &counters[3],
         .tools_made = &counters[4],
     };
-    // PYRUN holds what the script prints and writes it all as it exits: 300 KB of stdout, stderr silent. Past the
-    // 256 KB the call reads, std.process.run returned StreamTooLong, and the call answered "python failed to run".
-    const out = runPython(&ctx, "{\"code\":\"import sys\\nsys.stdout.write('HEAD-' + 'x' * 300000)\"}");
+    // PYRUN holds what the script prints and writes it all as it exits: 600 KB of stdout, past twice the 256 KB the
+    // call keeps of it, and 70 KB of stderr, past its 64 KB, ending on the line that matters. Under std.process.run
+    // that answered "python failed to run" (StreamTooLong); stopped at the limit, a "STOPPED:" line with no exit code.
+    const code =
+        \\import sys
+        \\sys.stdout.write('HEAD-' + 'x' * 600000)
+        \\sys.stderr.write('E' * 70000 + '\nLAST-ERR')
+        \\sys.exit(3)
+    ;
+    const Args = struct { code: []const u8 };
+    const args = try std.json.Stringify.valueAlloc(gpa, Args{ .code = code }, .{});
+    defer gpa.free(args);
+    const out = runPython(&ctx, args);
     defer gpa.free(out);
-    if (!std.mem.startsWith(u8, out, "STOPPED: its output passed the 256 KB")) {
-        std.debug.print("\nexpected the overflow answer, got:\n{s}\n", .{out[0..@min(out.len, 400)]});
-        return error.OverflowNotReported;
+    if (!std.mem.startsWith(u8, out, "exit=3\nstdout:\nHEAD-xxx")) {
+        std.debug.print("\nexpected the script's own exit code and the head of its output, got:\n{s}\n", .{out[0..@min(out.len, 400)]});
+        return error.ExitNotKept;
     }
-    try std.testing.expect(std.mem.indexOf(u8, out, "stdout (head):\nHEAD-xxx") != null); // what it printed first is kept
+    try std.testing.expect(std.mem.endsWith(u8, out, "LAST-ERR")); // stderr's tail survives its limit too
+    try std.testing.expect(std.mem.indexOf(u8, out, "TIMEOUT") == null);
+    // The reply shows only the head of stdout (4000 bytes); what the call kept counts the bytes it did not keep. The
+    // same launcher call again, from the script runPython left in the workdir:
+    var sb: [64]u8 = undefined;
+    const script_name = try std.fmt.allocPrint(gpa, ".tool-{s}.py", .{slugify(&sb, ctx.scope)});
+    defer gpa.free(script_name);
+    var cap_buf: [10]u8 = undefined;
+    const argv = [_][]const u8{ deps.pythonBin(io, &env), "-c", PYRUN, pyrunCapArg(&env, &cap_buf), script_name };
+    var r = pyrunRun(gpa, io, &argv, root, &env, &env);
+    defer r.deinit(gpa);
+    try std.testing.expectEqual(@as(?u32, 3), r.exited());
+    try std.testing.expect(std.mem.startsWith(u8, r.stdout, "HEAD-xxx"));
+    const not_kept = "HEAD-".len + 600_000 - 2 * PYRUN_STDOUT_MAX; // one line of x's: the cut moves to no line end
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, std.fmt.comptimePrint("\n[... {d} bytes not kept ...]\n", .{not_kept})) != null);
 }
 
 /// True if `n` is a built-in tool name. execute() checks built-ins FIRST and make_tool rejects these names, so
@@ -3323,13 +3348,12 @@ fn runAuthored(ctx: *ToolCtx, name: []const u8, body: []const u8, args_json: []c
     const py = deps.pythonBin(ctx.io, &env);
     var cap_buf: [10]u8 = undefined;
     const argv = [_][]const u8{ py, "-c", PYRUN, pyrunCapArg(ctx.environ, &cap_buf), script_name, aj };
-    var r = bounded.run(gpa, ctx.io, .{ .argv = &argv, .cwd = .{ .path = ctx.workdir }, .environ_map = &env, .bound_ms = pyrunBoundMs(ctx.environ), .stdout_limit = PYRUN_STDOUT_MAX, .stderr_limit = PYRUN_STDERR_MAX });
+    var r = pyrunRun(gpa, ctx.io, &argv, ctx.workdir, &env, ctx.environ);
     defer r.deinit(gpa);
     // spawn-missing (python absent) → the dep hint; a script that ran and failed exits non-zero and is
     // handled below, never here.
     if (r.end == .unstarted) return if (deps.isSpawnMissing(r.err.?)) deps.hint(gpa, "python") else dupe(gpa, "tool failed to run");
-    if (!r.finished()) return pyrunStopped(gpa, &r);
-    const exit = r.exited() orelse 255;
+    const exit = pyrunExit(&r);
     if (exit == 0) {
         var lines = std.mem.splitScalar(u8, std.mem.trim(u8, r.stdout, " \r\n\t"), '\n');
         var jline: ?[]const u8 = null;
@@ -3339,7 +3363,9 @@ fn runAuthored(ctx: *ToolCtx, name: []const u8, body: []const u8, args_json: []c
         }
         if (jline) |jl| return dupe(gpa, clip(jl, 4000));
     }
-    return std.fmt.allocPrint(gpa, "exit={d}\nstdout:\n{s}\nstderr:\n{s}", .{ exit, clip(r.stdout, 3000), clip(r.stderr, 1500) }) catch dupe(gpa, "ran");
+    const note = pyrunNote(gpa, ctx.environ, &r);
+    defer gpa.free(note);
+    return std.fmt.allocPrint(gpa, "exit={d}\nstdout:\n{s}\nstderr:\n{s}{s}", .{ exit, clip(r.stdout, 3000), clip(r.stderr, 1500), note }) catch dupe(gpa, "ran");
 }
 
 /// Strip mis-decoded control bytes that smart punctuation (curly quotes / em-dashes) lands as when the model's
@@ -5795,7 +5821,8 @@ fn listDir(ctx: *ToolCtx, args_json: []const u8) []u8 {
     var r = bounded.run(gpa, ctx.io, .{ .argv = &argv, .environ_map = &env, .bound_ms = 60_000, .stdout_limit = 64 << 10, .stderr_limit = 8 << 10 });
     defer r.deinit(gpa);
     if (r.end == .unstarted) return if (deps.isSpawnMissing(r.err.?)) deps.hint(gpa, "python") else dupe(gpa, "list_dir failed to run");
-    if (!r.finished()) return dupe(gpa, if (r.end == .killed) "list_dir did not finish within a minute and was stopped" else "list_dir failed to run");
+    // A stop reads as a failure to both graders: '(' to the chat engine's, "timed out" to run.zig's toolHardFail.
+    if (!r.finished()) return dupe(gpa, if (r.end == .killed) "(list_dir timed out: it did not finish within a minute and was stopped)" else "list_dir failed to run");
     if (std.mem.trim(u8, r.stdout, " \r\n\t").len == 0) return dupe(gpa, if (r.stderr.len > 0) clip(r.stderr, 400) else "(empty or not found)");
     return dupe(gpa, clip(r.stdout, 4000));
 }
@@ -7271,7 +7298,7 @@ fn osintScan(ctx: *ToolCtx, args_json: []const u8) []u8 {
     var r = bounded.run(gpa, ctx.io, .{ .argv = &argv, .environ_map = &env, .bound_ms = 60_000, .stdout_limit = 256 << 10, .stderr_limit = 32 << 10 });
     defer r.deinit(gpa);
     if (r.end == .unstarted) return if (deps.isSpawnMissing(r.err.?)) deps.hint(gpa, "python") else dupe(gpa, "osint_scan failed to run");
-    if (r.end == .killed) return dupe(gpa, "(osint_scan did not finish within 60 s and was stopped — the site is slow or not answering)");
+    if (r.end == .killed) return dupe(gpa, "(osint_scan timed out: it did not finish within 60 s and was stopped — the site is slow or not answering)");
     if (!r.finished()) return dupe(gpa, "osint_scan failed to run");
     const out = std.mem.trim(u8, r.stdout, " \r\n\t");
     if (out.len == 0) return std.fmt.allocPrint(gpa, "(no OSINT leads found: {s})", .{clip(std.mem.trim(u8, r.stderr, " \r\n\t"), 220)}) catch dupe(gpa, "(no OSINT leads)");
@@ -7306,11 +7333,13 @@ fn deepCrawl(ctx: *ToolCtx, args_json: []const u8) []u8 {
     const py = deps.pythonBin(ctx.io, &env);
     const argv = [_][]const u8{ py, "-c", DEEP_CRAWL_PY, p.value.url, ds, ps, same };
     // bounded.run: up to 120 pages at 16 s a fetch had no bound at all. 240 s keeps a swarm mind's call under the
-    // hang watchdog's 300 s; the crawl prints only at its end, so a cut one answers with nothing but the reason.
+    // hang watchdog's 300 s. The crawl prints only at its end, so a cut one answers with nothing but the reason:
+    // DEEP_CRAWL_PY therefore keeps a budget of its own, starting no fetch past 200 s and printing what it has, and
+    // 240 s is the backstop for a fetch still dripping in past that.
     var r = bounded.run(gpa, ctx.io, .{ .argv = &argv, .environ_map = &env, .bound_ms = 240_000, .stdout_limit = 512 << 10, .stderr_limit = 48 << 10 });
     defer r.deinit(gpa);
     if (r.end == .unstarted) return if (deps.isSpawnMissing(r.err.?)) deps.hint(gpa, "python") else dupe(gpa, "deep_crawl failed to run");
-    if (r.end == .killed) return dupe(gpa, "(deep_crawl did not finish within 240 s and was stopped — crawl fewer pages (max_pages) or less deep)");
+    if (r.end == .killed) return dupe(gpa, "(deep_crawl timed out: it did not finish within 240 s and was stopped — crawl fewer pages (max_pages) or less deep)");
     if (!r.finished()) return dupe(gpa, "deep_crawl failed to run");
     const out = std.mem.trim(u8, r.stdout, " \r\n\t");
     if (out.len == 0) return std.fmt.allocPrint(gpa, "(crawl returned no data: {s})", .{clip(std.mem.trim(u8, r.stderr, " \r\n\t"), 260)}) catch dupe(gpa, "(crawl returned no data)");
@@ -7656,7 +7685,9 @@ const OSINT_SCAN_PY =
 ;
 
 const DEEP_CRAWL_PY =
-    \\import sys,re,collections,urllib.request,urllib.parse
+    \\import sys,re,collections,time,urllib.request,urllib.parse
+    \\BUDGET_S=200
+    \\t0=time.monotonic()
     \\seed=sys.argv[1]
     \\max_depth=int(sys.argv[2])
     \\max_pages=int(sys.argv[3])
@@ -7717,7 +7748,10 @@ const DEEP_CRAWL_PY =
     \\seen=set([seed])
     \\pages=[]
     \\all_em=set(); all_hot=set(); all_docs=set()
+    \\cut=False
     \\while q and len(pages)<max_pages:
+    \\    if time.monotonic()-t0>=BUDGET_S:
+    \\        cut=True; break
     \\    u,d=q.popleft()
     \\    try:
     \\        b=fetch(u)
@@ -7734,6 +7768,7 @@ const DEEP_CRAWL_PY =
     \\print("Deep crawl seed: %s"%seed)
     \\print("pages_crawled: %d"%len(pages))
     \\print("seen_urls: %d"%len(seen))
+    \\if cut: print("stopped_early: the crawl's %d s budget ran out with %d queued urls not fetched"%(BUDGET_S,len(q)))
     \\print("emails_found: %d"%len(all_em))
     \\for e in sorted(all_em)[:80]: print("- email: "+e)
     \\print("lead_links_found: %d"%len(all_hot))
@@ -8151,7 +8186,8 @@ fn pyrunCapArg(environ: *const std.process.Environ.Map, buf: *[10]u8) []const u8
     return std.fmt.bufPrint(buf, "{d}", .{pyrunCapS(environ.get("NL_PYRUN_TIMEOUT_S"))}) catch unreachable;
 }
 
-/// The most a PYRUN call's stdout and stderr may hold before the call stops reading (bounded.run's limits).
+/// How much of a PYRUN call's stdout and stderr is kept at EACH end (bounded.run's head_tail): a script printing more
+/// still runs to its own exit, and what lies between the two ends is counted in one line instead of kept.
 const PYRUN_STDOUT_MAX: usize = 256 << 10;
 const PYRUN_STDERR_MAX: usize = 64 << 10;
 
@@ -8162,19 +8198,33 @@ fn pyrunBoundMs(environ: *const std.process.Environ.Map) u64 {
     return (@as(u64, pyrunCapS(environ.get("NL_PYRUN_TIMEOUT_S"))) + 30) * 1000;
 }
 
-/// What run_python and a made tool answer when the PYRUN call did not run to its own end: the head of what it printed,
-/// and why it was stopped. PYRUN prints everything only as it exits, so a script printing past PYRUN_STDOUT_MAX stops
-/// the read there. Under std.process.run that answered "python failed to run" (its StreamTooLong), which says nothing
-/// true about the script, and left the read loop's shape that hangs outright on Windows when the child keeps writing
-/// (bounded.zig); measured 2026-10-21 with a 300 KB print, the old path answered that line in seconds rather than
-/// hanging. Now the launcher is killed with what it started, and the call says what happened.
-fn pyrunStopped(gpa: std.mem.Allocator, r: *const bounded.Result) []u8 {
-    const why = switch (r.end) {
-        .overflow => std.fmt.comptimePrint("its output passed the {d} KB of stdout ({d} KB of stderr) this call reads, so the run was stopped there. Print less: write a large result to a file and read the part you need.", .{ PYRUN_STDOUT_MAX >> 10, PYRUN_STDERR_MAX >> 10 }),
-        .killed => "it was still running well past the run_python cap and its grace, and was stopped with everything it started.",
-        else => "its output could not be read, and the run was stopped.",
+/// One PYRUN call, as run_python and a made tool both make it. head_tail, so a script printing past PYRUN_STDOUT_MAX
+/// runs to its own exit and the reply keeps `exit=N`, which the failure graders key on (run.zig toolHardFail, the chat
+/// engine's tool_perf). Stopped at the limit instead, it answered a "STOPPED:" line with no exit code, which both read
+/// as a success. Under std.process.run before that, the same print answered "python failed to run" (its
+/// StreamTooLong); measured 2026-10-21 with a 300 KB print.
+fn pyrunRun(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8, workdir: []const u8, env: *const std.process.Environ.Map, environ: *const std.process.Environ.Map) bounded.Result {
+    return bounded.run(gpa, io, .{ .argv = argv, .cwd = .{ .path = workdir }, .environ_map = env, .bound_ms = pyrunBoundMs(environ), .stdout_limit = PYRUN_STDOUT_MAX, .stderr_limit = PYRUN_STDERR_MAX, .head_tail = true });
+}
+
+/// The exit a PYRUN reply states: the script's own; 124 for a launcher killed at its bound, as run_shell and PYRUN's
+/// own cap hit state it; else 255.
+fn pyrunExit(r: *const bounded.Result) u32 {
+    return switch (r.end) {
+        .exited => r.code,
+        .killed => 124,
+        else => 255,
     };
-    return std.fmt.allocPrint(gpa, "STOPPED: {s}\nstdout (head):\n{s}\nstderr (head):\n{s}", .{ why, clip(r.stdout, 3000), clip(r.stderr, 1000) }) catch dupe(gpa, "STOPPED");
+}
+
+/// What a PYRUN reply adds after stderr when the launcher did not reach its own end, gpa-owned ("" otherwise): for a
+/// launcher still running at pyrunBoundMs, a TIMEOUT line in the shape of run_shell's and of PYRUN's own cap hit.
+fn pyrunNote(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, r: *const bounded.Result) []const u8 {
+    return switch (r.end) {
+        .killed => std.fmt.allocPrint(gpa, "\nTIMEOUT: the run_python cap is {d} s, and this run was still going {d} s in, past the cap and its grace, so it was killed with everything it started; the output above is all of it that reached this call. A timeout= inside your code cannot raise this cap. Split the work into shorter runs, or start a long job in the background with its output sent to a file and watch that file with poll.", .{ pyrunCapS(environ.get("NL_PYRUN_TIMEOUT_S")), pyrunBoundMs(environ) / 1000 }) catch "",
+        .unread => std.fmt.allocPrint(gpa, "\n(this call could not read the run's output to its end ({s}), so it was stopped with everything it started)", .{r.why()}) catch "",
+        else => "",
+    };
 }
 
 /// The engine-owned RUNTIME SMOKE TEST — does the deliverable actually RUN, not just pass presence checks? Run
