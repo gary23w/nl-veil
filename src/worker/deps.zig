@@ -12,6 +12,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const launch = @import("browser/launch.zig");
 const bounded = @import("bounded.zig");
+const tools = @import("tools.zig"); // the tool-env overlay: the health probe resolves on the PATH a tool run gets
 
 pub const Dep = struct {
     /// "python" | "node" | "npm" | "curl" | "git" | "browser". A STATIC literal — the caller does NOT free it.
@@ -159,9 +160,30 @@ fn probeDirect(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Envir
     return gpa.dupe(u8, bin) catch null;
 }
 
+/// The interpreter a python spawn runs: NL_PYTHON_BIN when it names an existing file (the override probe()
+/// honours), else the bare name probe() resolves on PATH — "python" on Windows, "python3" elsewhere. The slice
+/// points into `env`, so it lives as long as the map does.
+pub fn pythonBin(io: std.Io, env: *const std.process.Environ.Map) []const u8 {
+    if (env.get("NL_PYTHON_BIN")) |ov| {
+        const t = std.mem.trim(u8, ov, " \r\n\t");
+        if (t.len > 0 and fileExists(io, t)) return t;
+    }
+    return if (builtin.os.tag == .windows) "python" else "python3";
+}
+
 /// Probe ONE dependency. gpa-owned strings; caller frees version+hint (name is a static literal). A missing
 /// binary is a normal answer, never an error, and NOTHING is installed, downloaded, or mutated.
 pub fn probe(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, name: []const u8) Dep {
+    // The tool-env overlay (tools.zig: `tool_env`, {data}/tool-env.json) is what every tool run's child gets, so
+    // the probe resolves on the same PATH and the same NL_*_BIN overrides — else the health page says "missing"
+    // for a python that run_python finds. No overlay registered ⇒ the caller's map, untouched.
+    var overlaid = tools.overlaidEnv(gpa, io, env);
+    defer if (overlaid) |*m| m.deinit();
+    const effective: *const std.process.Environ.Map = if (overlaid) |*m| m else env;
+    return probeIn(gpa, io, effective, name);
+}
+
+fn probeIn(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, name: []const u8) Dep {
     if (std.mem.eql(u8, name, "browser")) return probeBrowser(gpa, io, env);
 
     const spec = specFor(name) orelse return .{ .name = name, .present = false, .version = "", .hint = "" };
@@ -225,6 +247,29 @@ test "isSpawnMissing splits missing-binary from ran-and-failed" {
     try std.testing.expect(!isSpawnMissing(error.StreamTooLong));
     try std.testing.expect(!isSpawnMissing(error.OutOfMemory));
     try std.testing.expect(!isSpawnMissing(error.Timeout));
+}
+
+test "pythonBin: NL_PYTHON_BIN wins only when it names an existing file, else the bare name probe() resolves" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    const bare = if (builtin.os.tag == .windows) "python" else "python3";
+    try std.testing.expectEqualStrings(bare, pythonBin(io, &env));
+    // an override that points at nothing keeps today's spawn, as probe() ignores it too
+    try env.put("NL_PYTHON_BIN", "zig-deps-no-such-interpreter");
+    try std.testing.expectEqualStrings(bare, pythonBin(io, &env));
+    // blank is unset
+    try env.put("NL_PYTHON_BIN", "   ");
+    try std.testing.expectEqualStrings(bare, pythonBin(io, &env));
+    // an existing file wins, with the surrounding whitespace an operator's shell may leave trimmed off
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "py-stand-in", .data = "" });
+    var pb: [96]u8 = undefined;
+    const p = try std.fmt.bufPrint(&pb, " .zig-cache/tmp/{s}/py-stand-in \n", .{tmp.sub_path});
+    try env.put("NL_PYTHON_BIN", p);
+    try std.testing.expectEqualStrings(std.mem.trim(u8, p, " \r\n\t"), pythonBin(io, &env));
 }
 
 test "hint is specific and actionable for every standard dep" {

@@ -436,6 +436,10 @@ pub fn main(init: std.process.Init) !void {
         if (d.len > 0) paths.data = try gpa.dupe(u8, d);
     }
     _ = std.Io.Dir.cwd().createDirPathStatus(io, paths.data, .default_dir) catch {};
+    // The tool-env overlay ({data}/tool-env.json): what `tool_env` persisted — PATH entries, NL_PYTHON_BIN —
+    // merged into every tool child's environment. The same path `veil exec-tool` and a swarm worker register,
+    // so a change made from any of them reaches the others' next spawn with no restart.
+    tools.setToolEnvPath(paths.data);
     // DURABLE provider quirks: load what any previous process learned (and persist future lessons) before
     // any surface — chat engine, sched, tools — can dispatch an LLM call. A swarm worker does the same in
     // run.zig against the same path (`worker` short-circuits above, before paths resolve), so server and
@@ -574,7 +578,7 @@ pub fn main(init: std.process.Init) !void {
     var api_keys = @import("auth/api_keys.zig").ApiKeys.init(gpa, nb);
     api_keys.warm() catch |e| log.warn("api_keys warm: {t}", .{e});
     auth.setAdminEmail(init.environ_map.get("NL_ADMIN_EMAIL"));
-    auth.warm() catch |e| log.warn("auth warm: {t}", .{e});
+    try auth.warm();
     // How many requests one keep-alive socket serves before recycling. See the timeout block below.
     const keepalive_requests: u32 = if (init.environ_map.get("NL_KEEPALIVE_REQUESTS")) |v|
         (std.fmt.parseInt(u32, std.mem.trim(u8, v, " \r\n\t"), 10) catch 200)
@@ -587,10 +591,16 @@ pub fn main(init: std.process.Init) !void {
 
     try prepareAdminPassword(io, &auth, paths.data, init.environ_map.get("NL_ADMIN_EMAIL") orelse DEFAULT_ADMIN_EMAIL, init.environ_map.get("NL_ADMIN_PASSWORD"));
 
+    const production = if (init.environ_map.get("NL_PRODUCTION")) |v|
+        (std.mem.eql(u8, v, "1") or std.ascii.eqlIgnoreCase(v, "true") or std.ascii.eqlIgnoreCase(v, "yes") or std.ascii.eqlIgnoreCase(v, "on"))
+    else
+        false;
     var sup = Supervisor.init(gpa, io, paths.neuron_bin);
     sup.server_key = crypto.deriveServerKey(gpa, io, init.environ_map, paths.data);
     sup.parent_env = init.environ_map;
     sup.ledger = &ledger;
+    sup.budget_auth = &auth;
+    sup.budget_production = production;
     const readopted = sup.reattach(paths.data);
     const retention_days: u32 = if (init.environ_map.get("NL_RETENTION_DAYS")) |v| (std.fmt.parseInt(u32, std.mem.trim(u8, v, " \r\n\t"), 10) catch 14) else 14;
     // BYOK rate limiter: optional per-provider requests/min cap. Unset/0 = unlimited (the 429 cooldown is always
@@ -611,7 +621,14 @@ pub fn main(init: std.process.Init) !void {
     // wedges the server. Handlers now only read the in-memory roster.
     sup.gc_data_dir = paths.data;
     sup.gc_days = retention_days;
-    if (std.Thread.spawn(.{}, Supervisor.bgLoop, .{&sup})) |t| t.detach() else |_| {}
+    if (std.Thread.spawn(.{}, Supervisor.bgLoop, .{&sup})) |t| {
+        t.detach();
+    } else |err| {
+        // Production usage limits now depend on this loop, so a failed launch
+        // must stop startup instead of serving unmetered worker requests.
+        if (production) return err;
+        log.warn("swarm maintenance thread unavailable ({t})", .{err});
+    }
     var audit = AuditLog.init(gpa, io, paths.data);
     var login_guard = LoginGuard.init(gpa, io);
     var vault = KeyVault.init(gpa, io, nb, sup.server_key);
@@ -622,10 +639,6 @@ pub fn main(init: std.process.Init) !void {
         false;
     const cf_account = init.environ_map.get("NL_CF_ACCOUNT_ID") orelse "";
     const wai_token = init.environ_map.get("NL_WORKERS_AI_TOKEN") orelse "";
-    const production = if (init.environ_map.get("NL_PRODUCTION")) |v|
-        (std.mem.eql(u8, v, "1") or std.ascii.eqlIgnoreCase(v, "true") or std.ascii.eqlIgnoreCase(v, "yes") or std.ascii.eqlIgnoreCase(v, "on"))
-    else
-        false;
     // Cloudflare OAuth (self-managed public client): env-overridable so a deployment bakes only its public
     // client_id. The redirect defaults to this server's loopback callback on the resolved port.
     const cf_oauth_redirect = init.environ_map.get("NL_CF_OAUTH_REDIRECT") orelse
@@ -1197,7 +1210,10 @@ const DEFAULT_ADMIN_EMAIL = "admin@neuron-loops.local";
 
 fn ensureAdminPassword(auth: *Auth, email: []const u8, pw: []const u8) !void {
     if (std.mem.eql(u8, pw, "changeme")) return error.InsecureAdminPassword;
-    auth.seedDefaultAdmin(pw);
+    auth.register(email, pw) catch |e| switch (e) {
+        error.EmailTaken => {},
+        else => return e,
+    };
     if (try auth.passwordMatches(email, pw)) return;
     if (!auth.setPassword(email, pw)) return error.AdminPasswordNotApplied;
     if (!try auth.passwordMatches(email, pw)) return error.AdminPasswordNotApplied;
@@ -1212,8 +1228,8 @@ fn prepareAdminPassword(io: std.Io, auth: *Auth, data_dir: []const u8, email: []
     if (!try auth.adminRecordPersisted(email)) return error.AdminPasswordNotDurable;
 }
 
-/// Reconcile the in-memory account; the startup wrapper above also proves the resulting record was
-/// stored. Keeping this step separate lets logic tests cover every password state without Neuron.
+/// Reconcile the account and confirm new registrations before the startup wrapper checks the final
+/// stored password hash. Keeping this step separate lets tests cover each password state.
 fn prepareAdminPasswordCore(io: std.Io, auth: *Auth, data_dir: []const u8, email: []const u8, configured: ?[]const u8) !void {
     if (configured) |pw| return ensureAdminPassword(auth, email, pw);
 
@@ -1399,24 +1415,104 @@ test "admin startup refuses an account that cannot be read back from storage" {
     const io = threaded.io();
     var ta = try http.testApp(gpa, io, "zig-admin-durable-tmp");
     defer ta.deinit();
+    const bin = ta.auth.nb.bin;
     ta.auth.nb.bin = "definitely-not-a-real-neuron-binary";
 
-    // register still admits a new account into memory if its Neuron write fails. The startup
-    // wrapper must reject that state before either the listener or Tunnel can start.
-    try std.testing.expectError(error.FileNotFound, prepareAdminPassword(io, &ta.auth, ta.root, DEFAULT_ADMIN_EMAIL, null));
+    // A failed initial write cannot create a live-only admin or allow startup to continue.
+    try std.testing.expectError(error.StorageFailure, prepareAdminPassword(io, &ta.auth, ta.root, DEFAULT_ADMIN_EMAIL, null));
+    try std.testing.expect(ta.auth.idForEmail(DEFAULT_ADMIN_EMAIL) == null);
     var saved_buf: [48]u8 = undefined;
     const saved = readAdminPassword(io, ta.root, &saved_buf) orelse return error.TestUnexpectedResult;
-    try std.testing.expect(try ta.auth.passwordMatches(DEFAULT_ADMIN_EMAIL, saved));
+    ta.auth.nb.bin = bin;
+    ta.auth.register(DEFAULT_ADMIN_EMAIL, saved) catch return error.SkipZigTest;
 
-    // A failed replacement must keep the old in-memory hash and its existing sessions.
+    // A failed replacement on an existing stored account keeps its hash and sessions.
     const session = try ta.auth.login(DEFAULT_ADMIN_EMAIL, saved);
     defer {
         ta.auth.logout(session);
         gpa.free(session);
     }
+    ta.auth.nb.bin = "definitely-not-a-real-neuron-binary";
     try std.testing.expect(!ta.auth.setPassword(DEFAULT_ADMIN_EMAIL, "a new configured password"));
     try std.testing.expect(try ta.auth.passwordMatches(DEFAULT_ADMIN_EMAIL, saved));
     try std.testing.expect(ta.auth.whoami(session) != null);
+}
+
+test "startup refuses a partial user map when a stored user record is unreadable" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var ta = try http.testApp(gpa, io, "zig-auth-warm-partial-tmp");
+    defer ta.deinit();
+    const victim = "victim@example.test";
+    ta.auth.register(DEFAULT_ADMIN_EMAIL, "correct horse battery") catch return error.SkipZigTest;
+    try ta.auth.register(victim, "correct horse battery");
+    {
+        var control = Auth.init(gpa, ta.auth.nb);
+        defer control.deinit();
+        try control.warm();
+        try std.testing.expectEqual(@as(u64, 1), control.idForEmail(DEFAULT_ADMIN_EMAIL).?);
+        try std.testing.expectEqual(@as(u64, 2), control.idForEmail(victim).?);
+        try std.testing.expect(try control.adminRecordPersisted(DEFAULT_ADMIN_EMAIL));
+    }
+
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(victim, &digest, .{});
+    const hex = std.fmt.bytesToHex(digest[0..6], .lower);
+    var scope_buf: [16]u8 = undefined;
+    const scope = try std.fmt.bufPrint(&scope_buf, "u_{s}", .{hex});
+    const original_record = (try ta.auth.nb.get(scope)) orelse return error.TestUnexpectedResult;
+    defer gpa.free(original_record);
+    // neuron-db continues to list deleted scopes, but their export is empty. A live
+    // account missing this way must not be mistaken for an intentionally deleted one.
+    try ta.auth.nb.delChecked(scope);
+    try std.testing.expect((try ta.auth.nb.get(scope)) == null);
+    var empty_export = Auth.init(gpa, ta.auth.nb);
+    defer empty_export.deinit();
+    try std.testing.expectError(error.IncompleteUserIndex, empty_export.warm());
+    try ta.auth.nb.put(scope, original_record);
+    const index_scope = "auth_user_index_v1";
+    const original_index = (try ta.auth.nb.get(index_scope)) orelse return error.TestUnexpectedResult;
+    defer gpa.free(original_index);
+    // An interrupted forget-first index update leaves an empty export. The durable
+    // guard prevents startup from mistaking it for a pre-index legacy installation.
+    try ta.auth.nb.delChecked(index_scope);
+    var lost_index = Auth.init(gpa, ta.auth.nb);
+    defer lost_index.deinit();
+    try std.testing.expectError(error.InvalidUserIndex, lost_index.warm());
+    try ta.auth.nb.put(index_scope, original_index);
+    const corrupt_json = "{\"id\":\"unreadable\",\"email\":\"victim@example.test\",\"pwhash\":\"invalid\",\"plan\":\"free\",\"created\":123456789}";
+    const encoder = std.base64.standard.Encoder;
+    const corrupt_record = try gpa.alloc(u8, encoder.calcSize(corrupt_json.len));
+    defer gpa.free(corrupt_record);
+    _ = encoder.encode(corrupt_record, corrupt_json);
+    try ta.auth.nb.put(scope, corrupt_record);
+    const stored = (try ta.auth.nb.get(scope)) orelse return error.TestUnexpectedResult;
+    defer gpa.free(stored);
+    try std.testing.expectEqualStrings(corrupt_record, stored);
+
+    var partial = Auth.init(gpa, ta.auth.nb);
+    defer partial.deinit();
+    try std.testing.expectError(error.InvalidUserRecord, partial.warm());
+
+    // A readable row with another account's ID must also stop startup: keys and user data use IDs.
+    const vu = ta.auth.userById(2).?;
+    const duplicate_json = try std.fmt.allocPrint(gpa, "{{\"id\":1,\"email\":\"{s}\",\"pwhash\":\"{s}\",\"plan\":\"free\",\"created\":{d},\"session_generation\":{d}}}", .{ victim, vu.pwhash, vu.created, vu.session_generation });
+    defer gpa.free(duplicate_json);
+    const duplicate_record = try gpa.alloc(u8, encoder.calcSize(duplicate_json.len));
+    defer gpa.free(duplicate_record);
+    _ = encoder.encode(duplicate_record, duplicate_json);
+    try ta.auth.nb.put(scope, duplicate_record);
+    var duplicate = Auth.init(gpa, ta.auth.nb);
+    defer duplicate.deinit();
+    try std.testing.expectError(error.InvalidUserRecord, duplicate.warm());
+
+    try ta.auth.nb.put(scope, original_record);
+    var restored = Auth.init(gpa, ta.auth.nb);
+    defer restored.deinit();
+    try restored.warm();
+    try std.testing.expectEqual(@as(u64, 2), restored.idForEmail(victim).?);
 }
 
 test "admin startup stores a rotated legacy password that survives reload" {

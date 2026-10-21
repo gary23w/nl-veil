@@ -742,9 +742,14 @@ const DelegProc = struct {
     base_len: usize = 0,
     args_file: [900]u8 = undefined, // staged args JSON (deleted once the child is dead)
     af_len: usize = 0,
+    detail: [120]u8 = undefined, // what it is doing, for the Tasks tab (taskDetail, read off the args at launch)
+    detail_len: usize = 0,
 
     fn idStr(p: *const DelegProc) []const u8 {
         return p.id[0..p.id_len];
+    }
+    fn detailStr(p: *const DelegProc) []const u8 {
+        return p.detail[0..p.detail_len];
     }
     fn toolStr(p: *const DelegProc) []const u8 {
         return p.tool[0..p.tool_len];
@@ -1659,6 +1664,7 @@ pub const Chat = struct {
                 // because maybeLoop stands down via sc_serving (arming the toggle alone would do nothing).
                 .loop_kick => if (self.sc_serving) self.serverLoopKick(dd) else self.maybeLoop(dd),
                 .stop_turn => self.stopTurn(dd), // Stop button by the input: abort the in-flight turn + halt auto-loop
+                .task_cancel => self.cancelTaskByUser(dd, c.idStr(), ""), // Tasks tab / status line: end ONE delegated tool, the turn goes on
                 .chat_open_file => self.cmdChatOpenFile(dd, c.textStr()), // Files tab: load a file into the viewer
                 .chat_open_folder => self.cmdChatOpenFolder(dd), // Files tab: open this chat's build folder in the OS
                 .forget_mem => self.forgetMemory(dd, c.textStr()), // Memory tab: delete-button drops one saved memory
@@ -1778,6 +1784,11 @@ pub const Chat = struct {
             defer self.store.unlock();
             break :blk_fr self.store.settings.fast_reasoning;
         };
+        const tool_map: bool = blk_tm: {
+            self.store.lock();
+            defer self.store.unlock();
+            break :blk_tm self.store.settings.tool_map;
+        };
         const use_garrett: bool = blk_ug: {
             self.store.lock();
             defer self.store.unlock();
@@ -1838,6 +1849,8 @@ pub const Chat = struct {
             // Only sent when TRUE: the server default is advanced, so an absent field and a false one mean
             // the same thing, and saying nothing is the smaller wire contract.
             if (fast_reasoning) w.writeAll(",\"fast\":true") catch break :blk false;
+            // Send both states: OFF must override a server launched with NL_TOOL_MAP=1 too.
+            w.writeAll(if (tool_map) ",\"tool_map\":true" else ",\"tool_map\":false") catch break :blk false;
             if (use_garrett) w.writeAll(",\"garrett\":true") catch break :blk false;
             // Optional single-image attachment. base64's alphabet ([A-Za-z0-9+/=]) needs no JSON escaping.
             if (image_b64.len > 0) {
@@ -2619,6 +2632,7 @@ pub const Chat = struct {
                     q.conv_len = @min(conv.len, q.conv.len);
                     @memcpy(q.conv[0..q.conv_len], conv[0..q.conv_len]);
                     slot.* = q;
+                    self.publishTasks();
                     return;
                 }
             }
@@ -2717,7 +2731,12 @@ pub const Chat = struct {
         @memcpy(p.base[0..p.base_len], base[0..p.base_len]);
         p.af_len = @min(args_file.len, p.args_file.len);
         @memcpy(p.args_file[0..p.af_len], args_file[0..p.af_len]);
+        var db: [120]u8 = undefined;
+        const detail = taskDetail(tool, args_json, &db);
+        p.detail_len = @min(detail.len, p.detail.len);
+        @memcpy(p.detail[0..p.detail_len], detail[0..p.detail_len]);
         self.deleg = p;
+        self.publishTasks();
 
         // pickup ack: ends the server's short "is any client attached?" window; heartbeats take over from here
         self.postToolAck(conv, id);
@@ -2762,6 +2781,7 @@ pub const Chat = struct {
                 const fg = self.isForeground(p.convStr());
                 self.deleg = null;
                 if (fg) self.setStatus("tool canceled (turn stopped)");
+                self.publishTasks();
                 self.delegDequeue(dd); // a queued request for a LIVE turn may still be waiting its slot
                 return;
             }
@@ -2775,6 +2795,7 @@ pub const Chat = struct {
                 slot.* = null;
             }
         }
+        self.publishTasks();
     }
 
     fn pumpDelegated(self: *Chat, dd: []const u8) void {
@@ -2799,6 +2820,7 @@ pub const Chat = struct {
                 var stbuf: [96]u8 = undefined;
                 self.setStatus(std.fmt.bufPrint(&stbuf, "running {s} on this machine... {d}s", .{ p.toolStr()[0..@min(p.tool_len, 48)], now - p.started_s }) catch "running tool locally...");
             }
+            self.publishTasks(); // the Tasks tab's clock + foreground flag, fresh every tick
             if (now - p.last_hb_s >= DELEG_HEARTBEAT_S) {
                 p.last_hb_s = now;
                 self.postToolAck(p.convStr(), p.idStr());
@@ -2844,6 +2866,7 @@ pub const Chat = struct {
         const tnn = p.tool_len;
         @memcpy(tn[0..tnn], p.tool[0..tnn]);
         self.deleg = null; // clear BEFORE posting — postToolResult can take a beat and state must be settled
+        self.publishTasks();
 
         if (forced) |msg| {
             self.postToolResult(conv, idb[0..idn], msg);
@@ -2880,6 +2903,7 @@ pub const Chat = struct {
         while (i + 1 < self.deleg_q.len) : (i += 1) self.deleg_q[i] = self.deleg_q[i + 1];
         self.deleg_q[self.deleg_q.len - 1] = null;
         defer self.gpa.free(q.line);
+        defer self.publishTasks(); // the queue shrank whether or not the frame launches
         const id = scRawField(q.line, "id") orelse return;
         const tool = scRawField(q.line, "tool") orelse return;
         self.launchDelegated(dd, q.convStr(), id, tool, q.line);
@@ -2901,6 +2925,7 @@ pub const Chat = struct {
             if (slot.*) |q| self.gpa.free(q.line);
             slot.* = null;
         }
+        self.publishTasks();
     }
 
     /// Cancel only the delegated work belonging to `conv` (kill its in-flight tool if that is what the shared
@@ -2925,6 +2950,138 @@ pub const Chat = struct {
                     slot.* = null;
                 }
             }
+        }
+        self.publishTasks();
+    }
+
+    /// The Tasks tab's rows: the delegated tool running on this machine plus the queue behind it, in the order
+    /// they will run. Published on every change AND every tick while one runs (pumpDelegated), so the elapsed
+    /// time and the foreground flag never go stale across a conversation switch; the copy is five small rows.
+    fn publishTasks(self: *Chat) void {
+        var rows: [store_mod.MAX_TASKS]store_mod.TaskRow = undefined;
+        var n: usize = 0;
+        if (self.deleg) |*p| {
+            var row: store_mod.TaskRow = .{};
+            setTaskStr(&row.id, &row.id_len, p.idStr());
+            setTaskStr(&row.tool, &row.tool_len, p.toolStr());
+            setTaskStr(&row.detail, &row.detail_len, p.detailStr());
+            row.elapsed_s = @max(0, self.nowS() - p.started_s);
+            row.foreground = self.isForeground(p.convStr());
+            rows[n] = row;
+            n += 1;
+        }
+        for (self.deleg_q) |slot| {
+            const q = slot orelse continue;
+            if (n >= rows.len) break;
+            var row: store_mod.TaskRow = .{ .queued = true };
+            const tool = scRawField(q.line, "tool") orelse "";
+            setTaskStr(&row.id, &row.id_len, scRawField(q.line, "id") orelse "");
+            setTaskStr(&row.tool, &row.tool_len, tool);
+            // the frame carries its args JSON as an escaped string; a bounded head is all the detail reads
+            var ub: [520]u8 = undefined;
+            var db: [120]u8 = undefined;
+            const raw = scRawField(q.line, "args") orelse "";
+            setTaskStr(&row.detail, &row.detail_len, taskDetail(tool, scUnescape(raw[0..@min(raw.len, 500)], &ub), &db));
+            row.foreground = self.isForeground(q.convStr());
+            rows[n] = row;
+            n += 1;
+        }
+        self.store.lock();
+        defer self.store.unlock();
+        @memcpy(self.store.tasks[0..n], rows[0..n]);
+        self.store.task_count = n;
+    }
+
+    /// End ONE task on the user's say-so and answer its call, so the TURN goes on and the model hears it was the
+    /// user, not a failure — the Tasks tab's Cancel, the status line's, or a typed "stop that" (`said`, quoted
+    /// to the model when given). Stop by the composer is the whole turn's; this is one tool. A queued task is
+    /// dropped and answered the same way, before it ever launches.
+    fn cancelTaskByUser(self: *Chat, dd: []const u8, id: []const u8, said: []const u8) void {
+        var rb: [420]u8 = undefined;
+        const quote = said[0..@min(said.len, 120)];
+        if (self.deleg) |*p| {
+            if (taskIdIs(p.idStr(), id)) {
+                const result = if (quote.len > 0)
+                    std.fmt.bufPrint(&rb, "(canceled by the user, who said: \"{s}\" — this {s} call was stopped on their request, not failed. Do NOT run it again; say what state it left and act on their message.)", .{ quote, p.toolStr() }) catch "(canceled by the user — do NOT run it again.)"
+                else
+                    std.fmt.bufPrint(&rb, "(canceled by the user — this {s} call was stopped on their request, not failed. Do NOT run it again; say what state it left and ask what they want next.)", .{p.toolStr()}) catch "(canceled by the user — do NOT run it again.)";
+                self.endTaskByUser(dd, result, "task canceled");
+                return;
+            }
+        }
+        for (&self.deleg_q) |*slot| {
+            const q = slot.* orelse continue;
+            const qid = scRawField(q.line, "id") orelse continue;
+            if (!taskIdIs(qid, id)) continue;
+            var idb: [160]u8 = undefined;
+            const idn = @min(qid.len, idb.len);
+            @memcpy(idb[0..idn], qid[0..idn]);
+            var cvb: [64]u8 = undefined;
+            const cvn = q.conv_len;
+            @memcpy(cvb[0..cvn], q.conv[0..cvn]);
+            self.gpa.free(q.line);
+            slot.* = null;
+            self.postToolResult(cvb[0..cvn], idb[0..idn], "(canceled by the user before it started — this call was dropped on their request, not failed. Do NOT run it again.)");
+            self.publishTasks();
+            return;
+        }
+    }
+
+    /// Kill the running delegated tool, answer its call with `result`, and move on to the queue. The common
+    /// tail of a user's cancel and a poll giving way to a steer; cancelDelegated (the server's own abandonment)
+    /// stays separate because it must post nothing.
+    fn endTaskByUser(self: *Chat, dd: []const u8, result: []const u8, status: []const u8) void {
+        const p = if (self.deleg) |*pp| pp else return;
+        var exit_code: ?u32 = null;
+        if (!procExited(&p.child, &exit_code)) {
+            p.child.kill(self.io);
+            if (p.child.id != null) {
+                if (p.child.wait(self.io)) |_| {} else |_| {} // reap — a killed child must not zombie
+            }
+        }
+        var ob: [360]u8 = undefined;
+        var eb: [360]u8 = undefined;
+        if (std.fmt.bufPrint(&ob, "{s}.out", .{p.baseStr()})) |outp| Io.Dir.cwd().deleteFile(self.io, outp) catch {} else |_| {}
+        if (std.fmt.bufPrint(&eb, "{s}.err", .{p.baseStr()})) |errp| Io.Dir.cwd().deleteFile(self.io, errp) catch {} else |_| {}
+        Io.Dir.cwd().deleteFile(self.io, p.args_file[0..p.af_len]) catch {};
+        var idb: [160]u8 = undefined;
+        const idn = p.id_len;
+        @memcpy(idb[0..idn], p.id[0..idn]);
+        var cvb: [64]u8 = undefined;
+        const cvn = p.conv_len;
+        @memcpy(cvb[0..cvn], p.conv[0..cvn]);
+        var tn: [64]u8 = undefined;
+        const tnn = p.tool_len;
+        @memcpy(tn[0..tnn], p.tool[0..tnn]);
+        const elapsed = self.nowS() - p.started_s;
+        const fg = self.isForeground(cvb[0..cvn]);
+        self.deleg = null; // settled BEFORE the post, like finishDelegated
+        self.publishTasks();
+        self.postToolResult(cvb[0..cvn], idb[0..idn], result);
+        if (fg) self.setStatus(status);
+        var cb: [160]u8 = undefined;
+        self.store.consoleAppend(true, std.fmt.bufPrint(&cb, "  {s} -> ended by you after {d}s\n", .{ tn[0..tnn], elapsed }) catch "  ended by you\n");
+        log.info("delegated: {s} ended by the user after {d}s ({s})", .{ tn[0..tnn], elapsed, status });
+        self.delegDequeue(dd);
+    }
+
+    /// A message posted into a running turn reaches the task on this machine the way it reaches the server's
+    /// own tools (engine toolShouldStop): a `poll` — a wait and nothing else — gives way to it at once so the
+    /// turn can fold the message in; any other task runs on unless the message plainly asks to stop it.
+    /// Without this the desk's poll ran its full 180 s with the user's words sitting in control.jsonl behind
+    /// it — "stop polling" typed, nothing happening, the timer ticking on.
+    fn steerReachesDelegated(self: *Chat, dd: []const u8, conv: []const u8, text: []const u8) void {
+        const p = if (self.deleg) |*pp| pp else return;
+        if (!std.mem.eql(u8, p.convStr(), conv)) return;
+        if (std.mem.eql(u8, p.toolStr(), "poll")) {
+            self.endTaskByUser(dd, "poll -> interrupted — a user message arrived while you were waiting; it follows as the next user message. Act on it instead of polling again.", "poll interrupted by your message");
+            return;
+        }
+        if (looksLikeCancel(text)) {
+            var idb: [160]u8 = undefined;
+            const idn = p.id_len;
+            @memcpy(idb[0..idn], p.id[0..idn]);
+            self.cancelTaskByUser(dd, idb[0..idn], text);
         }
     }
 
@@ -4169,6 +4326,7 @@ pub const Chat = struct {
         }
         self.appendMsg(dd, .user, txt); // show the steer in the transcript
         self.setStatus("steer sent — the veil will fold it into the running turn");
+        self.steerReachesDelegated(dd, conv, txt); // a waiting poll yields to it; "stop that" ends the task
     }
 
     pub fn cmdSend(self: *Chat, dd: []const u8, text: []const u8) void {
@@ -5137,6 +5295,7 @@ pub const Chat = struct {
         var narrator = false;
         var browser_headful = false;
         var fast_reasoning = false;
+        var tool_map = false;
         var leftw: u16 = 230;
         var rightw: u16 = 320;
         var conh: u16 = 280;
@@ -5174,6 +5333,7 @@ pub const Chat = struct {
             narrator = s.narrator;
             browser_headful = s.browser_headful;
             fast_reasoning = s.fast_reasoning;
+            tool_map = s.tool_map;
             leftw = s.chat_left_w;
             rightw = s.chat_right_w;
             conh = s.chat_con_h;
@@ -5204,6 +5364,7 @@ pub const Chat = struct {
         // the new value), so every install with that build got silently pinned local and could never turn
         // server mode on. A fresh key on each break keeps a bad persisted state from surviving it.
         jb.print(self.gpa, "\",\"left\":{},\"right\":{},\"shell_allow\":{},\"speed\":{},\"srv_brain\":{},\"dyslexia\":{},\"font_scale\":{d},\"font_bold\":{},\"narrator\":{},\"browser_headful\":{},\"fast_reasoning\":{},\"leftw\":{d},\"rightw\":{d},\"conh\":{d}", .{ lopen, ropen, shell_allow, speed, server_chat, dyslexia, font_scale, font_bold, narrator, browser_headful, fast_reasoning, leftw, rightw, conh }) catch return;
+        jb.print(self.gpa, ",\"tool_map\":{}", .{tool_map}) catch return;
         // MODEL TRIO: the "use one model for all three" flag + the thinking/prompting role overrides. Role keys
         // are NOT written here — they live in the OS secret store (secrets.zig), keyed by provider slug.
         jb.print(self.gpa, ",\"unified\":{}", .{unified}) catch return;
@@ -5356,6 +5517,12 @@ pub const Chat = struct {
         // ABSENT in a settings file written before fast mode existed → false → ADVANCED. An upgrade must
         // never silently downgrade someone's reasoning, so the missing key has to mean the better default.
         s.fast_reasoning = std.mem.indexOf(u8, data, "\"fast_reasoning\":true") != null;
+        // An old settings file keeps the environment-seeded default; a saved choice wins over it.
+        if (std.mem.indexOf(u8, data, "\"tool_map\":true") != null) {
+            s.tool_map = true;
+        } else if (std.mem.indexOf(u8, data, "\"tool_map\":false") != null) {
+            s.tool_map = false;
+        }
         self.syncBrowserPref(s.browser_headful); // reflect the persisted choice to the daemon prefs file at startup
         if (jInt(data, "font_scale")) |v| {
             if (v >= 80 and v <= 140) s.font_scale = @intCast(v); // out-of-range hand-edit → keep the 100 default
@@ -7672,6 +7839,11 @@ pub const Chat = struct {
                     if (r.body.len > 0) self.gpa.free(r.body);
                 }
             }
+            // The task running on THIS machine for that turn ends with it. The server does answer the stop with
+            // a {tool_cancel} frame for it, but the poller is disarmed just below, before that frame could ever
+            // be read — so the subprocess ran on to its own timeout and its "running poll... 47s" overwrote
+            // the cleared status every tick: the poll the user could not stop. Kill it here, where the Stop is.
+            self.delegCancelFor(conv);
             self.scClearStream();
             self.setServerActive(false);
             self.appendMsg(dd, .cast_note, "(stopped)");
@@ -12075,6 +12247,74 @@ test "one conversation, one build tree: the desk resolves every conv id to the d
     }
 }
 
+/// Copy `s` into a TaskRow's fixed field (clipped), recording the length.
+fn setTaskStr(dst: []u8, len: *u8, s: []const u8) void {
+    const n = @min(s.len, dst.len);
+    @memcpy(dst[0..n], s[0..n]);
+    len.* = @intCast(n);
+}
+
+/// Does a task's id match what a cancel named? Exact, or a prefix when the name was clipped to the command
+/// ring's 96-byte id field (DelegProc keeps 160).
+fn taskIdIs(have: []const u8, want: []const u8) bool {
+    if (want.len == 0) return false;
+    if (std.mem.eql(u8, have, want)) return true;
+    return want.len >= 96 and std.mem.startsWith(u8, have, want);
+}
+
+/// What a delegated tool is doing, for its Tasks row — read off its args JSON without a parse (compact keys the
+/// desk already knows): a poll names its kind and target, a script its first line, a file tool its path, a
+/// fetch its url, a search its query; anything else shows the head of its args. One line, clipped to `buf`.
+fn taskDetail(tool: []const u8, args: []const u8, buf: *[120]u8) []const u8 {
+    var w = Io.Writer.fixed(buf);
+    const F = struct {
+        fn firstLine(wr: *Io.Writer, s: []const u8) void {
+            // a script's first line says what it is; the rest is its body (the args are JSON-escaped, so a
+            // newline is the two bytes `\n` — cut at either form)
+            var cut = std.mem.indexOfAny(u8, s, "\r\n") orelse s.len;
+            if (std.mem.indexOf(u8, s[0..cut], "\\n")) |e| cut = e;
+            wr.writeAll(std.mem.trim(u8, s[0..cut], " \t")) catch {};
+        }
+    };
+    if (std.mem.eql(u8, tool, "poll")) {
+        F.firstLine(&w, scRawField(args, "kind") orelse "");
+        w.writeAll(" ") catch {};
+        F.firstLine(&w, scRawField(args, "target") orelse "");
+    } else if (scRawField(args, "script")) |s| {
+        if (scRawField(args, "shell")) |sh| {
+            w.writeAll(sh) catch {};
+            w.writeAll(": ") catch {};
+        }
+        F.firstLine(&w, s);
+    } else if (scRawField(args, "code")) |c| {
+        F.firstLine(&w, c);
+    } else if (scRawField(args, "path")) |p| {
+        F.firstLine(&w, p);
+    } else if (scRawField(args, "url")) |u| {
+        F.firstLine(&w, u);
+    } else if (scRawField(args, "query")) |q| {
+        F.firstLine(&w, q);
+    } else {
+        F.firstLine(&w, std.mem.trim(u8, args, " \r\n\t{}"));
+    }
+    return std.mem.trimEnd(u8, w.buffered(), " :");
+}
+
+/// Does a message typed while a task runs read as "stop that task"? Short and carrying a stop word — a long
+/// message that mentions stopping in passing is not, and neither is a negated one ("don't stop it").
+/// ASCII case-folded.
+fn looksLikeCancel(text: []const u8) bool {
+    const tx = std.mem.trim(u8, text, " \r\n\t");
+    if (tx.len == 0 or tx.len > 80) return false;
+    var low: [80]u8 = undefined;
+    for (tx, 0..) |c, i| low[i] = std.ascii.toLower(c);
+    const l = low[0..tx.len];
+    for ([_][]const u8{ "never mind", "nevermind", "forget it", "give up" }) |w| if (std.mem.indexOf(u8, l, w) != null) return true;
+    for ([_][]const u8{ "don't ", "dont ", "do not ", "never ", "keep " }) |neg| if (std.mem.startsWith(u8, l, neg)) return false;
+    for ([_][]const u8{ "stop", "cancel", "kill", "abort", "halt", "enough", "quit" }) |w| if (std.mem.indexOf(u8, l, w) != null) return true;
+    return false;
+}
+
 fn scRawField(s: []const u8, key: []const u8) ?[]const u8 {
     var pat_buf: [40]u8 = undefined;
     // Match the KEY + its colon (`"tool":`), not the bare word (`"tool"`) — otherwise a value that equals the key
@@ -15867,4 +16107,44 @@ test "goal: a /goal send is classified for the loop toggle - start, resume, stop
     try std.testing.expectEqual(GoalSend.other, goalSendKind("/goal budget 9"));
     try std.testing.expectEqual(GoalSend.none, goalSendKind("/goals are good"));
     try std.testing.expectEqual(GoalSend.none, goalSendKind("my /goal is x"));
+}
+
+test "tasks: a typed message reads as a cancel only when it is short, plain, and not negated" {
+    try std.testing.expect(looksLikeCancel("stop"));
+    try std.testing.expect(looksLikeCancel("Stop polling, it already finished"));
+    try std.testing.expect(looksLikeCancel("cancel that"));
+    try std.testing.expect(looksLikeCancel("kill the build"));
+    try std.testing.expect(looksLikeCancel("never mind"));
+    try std.testing.expect(!looksLikeCancel("don't stop the server"));
+    try std.testing.expect(!looksLikeCancel("keep going"));
+    try std.testing.expect(!looksLikeCancel("use port 8080 instead"));
+    try std.testing.expect(!looksLikeCancel(""));
+    // a long message that mentions stopping in passing is a steer, not a cancel
+    try std.testing.expect(!looksLikeCancel("when the build finishes, stop the old server on 8787 and start the new one, then run the tests and report what changed"));
+}
+
+test "tasks: the detail line names what a tool is doing, from its args, on one line" {
+    var buf: [120]u8 = undefined;
+    try std.testing.expectEqualStrings("url http://localhost:3000/health", taskDetail("poll", "{\"kind\":\"url\",\"target\":\"http://localhost:3000/health\",\"timeout_s\":120}", &buf));
+    try std.testing.expectEqualStrings("powershell: winget install Python.Python.3", taskDetail("run_shell", "{\"shell\":\"powershell\",\"script\":\"winget install Python.Python.3\n$env:Path\"}", &buf));
+    try std.testing.expectEqualStrings("import time", taskDetail("run_python", "{\"code\":\"import time\ntime.sleep(90)\"}", &buf));
+    try std.testing.expectEqualStrings("src/app.py", taskDetail("read_file", "{\"path\":\"src/app.py\"}", &buf));
+    try std.testing.expectEqualStrings("https://example.com/docs", taskDetail("web_fetch", "{\"url\":\"https://example.com/docs\"}", &buf));
+    try std.testing.expectEqualStrings("\"x\":1", taskDetail("some_tool", "{\"x\":1}", &buf));
+    // clipped, never past the row's field
+    var long: [400]u8 = undefined;
+    @memset(&long, 'a');
+    var ab: [400]u8 = undefined;
+    const d = taskDetail("run_python", std.fmt.bufPrint(&ab, "{{\"code\":\"{s}\"}}", .{long[0..300]}) catch "", &buf);
+    try std.testing.expectEqual(@as(usize, 120), d.len);
+}
+
+test "tasks: a cancel names a task exactly, or by the command ring's clipped 96-byte prefix" {
+    try std.testing.expect(taskIdIs("call_abc", "call_abc"));
+    try std.testing.expect(!taskIdIs("call_abc", "call_abd"));
+    try std.testing.expect(!taskIdIs("call_abc", ""));
+    var wide: [120]u8 = undefined;
+    @memset(&wide, 'q');
+    try std.testing.expect(taskIdIs(&wide, wide[0..96]));
+    try std.testing.expect(!taskIdIs(&wide, wide[0..40])); // a short prefix is not a name
 }

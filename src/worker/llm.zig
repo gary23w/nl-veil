@@ -9016,7 +9016,7 @@ test "a call in a chat build dir survives a cast there being stopped or pruned b
         fn run() void {
             fired += 1;
             switch (how) {
-                .stop => sup.remove(cast_id),
+                .stop => sup.remove(cast_id) catch unreachable,
                 .retention => pruned = sup.pruneOldRuns(root, 14),
             }
             stripped = gone(cast ++ "/swarm.json") and gone(cast ++ "/events.jsonl");

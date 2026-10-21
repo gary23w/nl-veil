@@ -21,6 +21,17 @@ pub const ApiKeys = struct {
         return .{ .gpa = gpa, .nb = nb };
     }
 
+    pub fn deinit(self: *ApiKeys) void {
+        var it = self.keys.iterator();
+        while (it.next()) |e| {
+            self.gpa.free(e.key_ptr.*);
+            self.gpa.free(e.value_ptr.name);
+            self.gpa.free(e.value_ptr.prefix);
+        }
+        self.keys.deinit(self.gpa);
+        self.keys = .empty;
+    }
+
     fn hashHex(raw: []const u8, out: *[64]u8) []const u8 {
         var dig: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(raw, &dig, .{});
@@ -166,17 +177,41 @@ pub const ApiKeys = struct {
         return out.toOwnedSlice(gpa);
     }
 
-    pub fn revoke(self: *ApiKeys, uid: u64, id: []const u8) bool {
+    fn validId(id: []const u8) bool {
+        if (id.len != 64) return false;
+        for (id) |c| if (!std.ascii.isHex(c) or std.ascii.isUpper(c)) return false;
+        return true;
+    }
+
+    pub fn revoke(self: *ApiKeys, uid: u64, id: []const u8) !bool {
         self.mu.lockUncancelable(self.nb.io);
         defer self.mu.unlock(self.nb.io);
-        const info = self.keys.get(id) orelse return false;
-        if (info.uid != uid) return false;
+        if (!validId(id)) return false;
         var sbuf: [80]u8 = undefined;
-        if (std.fmt.bufPrint(&sbuf, "k_{s}", .{id})) |scope| self.nb.del(scope) else |_| {}
-        if (self.keys.fetchRemove(id)) |kv| {
-            self.gpa.free(kv.key);
-            self.gpa.free(kv.value.name);
-            self.gpa.free(kv.value.prefix);
+        const scope = try std.fmt.bufPrint(&sbuf, "k_{s}", .{id});
+        if (self.keys.get(id)) |info| {
+            if (info.uid != uid) return false;
+            // Stop accepting it now, even if the stored deletion later fails.
+            if (self.keys.fetchRemove(id)) |kv| {
+                self.gpa.free(kv.key);
+                self.gpa.free(kv.value.name);
+                self.gpa.free(kv.value.prefix);
+            }
+        } else {
+            // A previous failed delete may have removed the live entry. Check the stored owner so
+            // an idempotent retry can finish that revocation without deleting another user's key.
+            const enc = (try self.nb.get(scope)) orelse return false;
+            defer self.gpa.free(enc);
+            const json = try unb64(self.gpa, enc);
+            defer self.gpa.free(json);
+            const parsed = try std.json.parseFromSlice(struct { uid: u64 }, self.gpa, json, .{ .ignore_unknown_fields = true });
+            defer parsed.deinit();
+            if (parsed.value.uid != uid) return false;
+        }
+        try self.nb.delChecked(scope);
+        if (try self.nb.get(scope)) |remaining| {
+            self.gpa.free(remaining);
+            return error.ApiKeyNotDeleted;
         }
         return true;
     }
@@ -189,17 +224,9 @@ pub const ApiKeys = struct {
 // binary cannot be spawned makes every nb.put/get/del fail into the module's own `catch`es, which leaves
 // the in-memory half under test. The one round-trip test that needs the real store skips when bin/ is bare.
 
-/// TEST ONLY. ApiKeys owns every map key (the hash) plus both heap fields of each Info, and has no deinit —
-/// in main.zig it is a process-lifetime singleton, so nothing ever tears it down. Tests run on
-/// std.testing.allocator, which counts, so they hand the map back themselves.
+/// Existing test cleanup helper.
 fn drainKeysForTest(self: *ApiKeys) void {
-    var it = self.keys.iterator();
-    while (it.next()) |e| {
-        self.gpa.free(e.key_ptr.*);
-        self.gpa.free(e.value_ptr.name);
-        self.gpa.free(e.value_ptr.prefix);
-    }
-    self.keys.deinit(self.gpa);
+    self.deinit();
 }
 
 /// TEST ONLY. A neuron handle whose binary cannot be spawned — see the note above.
@@ -342,7 +369,7 @@ test "verify: the exact key only — empty, short, truncated, unprefixed, bent a
     try std.testing.expectEqual(@as(?u64, null), ks.verify(trailing));
 }
 
-test "revoke: ends acceptance for that key only, needs the owning uid, and does not repeat" {
+test "revoke: a failed stored delete still ends live acceptance and reports failure" {
     const gpa = std.testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -375,16 +402,16 @@ test "revoke: ends acceptance for that key only, needs the owning uid, and does 
     var id_a: [64]u8 = undefined;
     _ = ApiKeys.hashHex(mine_a, &id_a);
 
-    try std.testing.expect(!ks.revoke(8, &id_a)); // a different user cannot revoke this key
+    try std.testing.expect(!(try ks.revoke(8, &id_a))); // a different user cannot revoke this key
     try std.testing.expectEqual(@as(?u64, 7), ks.verify(mine_a)); // …and the failed attempt changed nothing
-    try std.testing.expect(!ks.revoke(7, "not-an-id")); // unknown id
+    try std.testing.expect(!(try ks.revoke(7, "not-an-id"))); // malformed id
 
-    try std.testing.expect(ks.revoke(7, &id_a));
+    if (ks.revoke(7, &id_a)) |_| return error.TestExpectedError else |_| {}
     try std.testing.expectEqual(@as(?u64, null), ks.verify(mine_a)); // revoked → rejected from here on
     try std.testing.expectEqual(@as(?u64, 7), ks.verify(mine_b)); // the owner's other key is untouched
     try std.testing.expectEqual(@as(?u64, 8), ks.verify(theirs));
 
-    try std.testing.expect(!ks.revoke(7, &id_a)); // already gone: false, and no double free
+    if (ks.revoke(7, &id_a)) |_| return error.TestExpectedError else |_| {} // retry cannot claim storage is clear
 
     // The point of the ownership change: a view read AFTER its key was revoked is still valid
     // memory. Under the old borrowing contract this line read freed heap.
@@ -437,9 +464,24 @@ test "live neuron-db: the stored record holds no plaintext, warm() restores by h
 
     // REVOKE, then restart again. `neuron list` still reports the scope after a forget, so this is a real
     // trap: warm() must skip a scope whose value is gone rather than resurrect a revoked credential.
-    try std.testing.expect(warmed.revoke(4242, id));
+    try std.testing.expect(try warmed.revoke(4242, id));
+    try std.testing.expect(!(try warmed.revoke(4242, id))); // confirmed absent after a successful revoke
     var after = ApiKeys.init(gpa, nb);
     defer drainKeysForTest(&after);
     try after.warm();
     try std.testing.expectEqual(@as(?u64, null), after.verify(raw));
+
+    // Exercise the retry path with no live map entry: it must read the stored owner before deleting.
+    const second = try ks.create(4242, "retry");
+    defer gpa.free(second);
+    var second_id_buf: [64]u8 = undefined;
+    const second_id = ApiKeys.hashHex(second, &second_id_buf);
+    var retry = ApiKeys.init(gpa, nb);
+    defer drainKeysForTest(&retry);
+    try std.testing.expect(!(try retry.revoke(9999, second_id))); // foreign uid cannot delete it
+    try std.testing.expect(try retry.revoke(4242, second_id));
+    var final = ApiKeys.init(gpa, nb);
+    defer drainKeysForTest(&final);
+    try final.warm();
+    try std.testing.expectEqual(@as(?u64, null), final.verify(second));
 }

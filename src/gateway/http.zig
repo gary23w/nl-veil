@@ -108,7 +108,15 @@ pub const App = struct {
 /// has a zone for.
 /// A login that pre-dates them simply lacks them; config/cf_tunnel.zig turns the resulting refusal
 /// into "log in again to grant the tunnel permissions".
-pub const CF_OAUTH_SCOPES_DEFAULT = "containers.read containers.write ai.read ai.write workers-r2.read workers-r2.write user-details.read account-settings.read offline_access workers-scripts.read workers-scripts.write workers-scripts.bind page.read page.write d1.read d1.write workers-kv-storage.read workers-kv-storage.write queues.read queues.write vectorize.read vectorize.write workers-routes.read workers-routes.write workers-tail.read workers-observability.read argotunnel.read argotunnel.write dns.read dns.write zone.read zone-access.read zone-access.write access-org.read";
+/// EVERY id here must be one the registered client is allowed to request: Cloudflare's authorize endpoint
+/// refuses the WHOLE request (error=invalid_scope, naming the first bad id) when any one is not, so a single
+/// ungranted scope breaks the login for every machine that still has to consent. containers.read /
+/// containers.write sat at the head of this list from v1.1.12 (76e9df11) without the client ever being
+/// granted them, and nothing in the tree used them; probed 2026-10-21 against the live authorize endpoint,
+/// each answered "The OAuth 2.0 Client is not allowed to request scope 'containers.read'", and the list
+/// without them reached the state check (the probe's next gate). A machine already holding a refresh token
+/// never re-consents, which is why the break only showed on a fresh install (v1.1.25, Edge).
+pub const CF_OAUTH_SCOPES_DEFAULT = "ai.read ai.write workers-r2.read workers-r2.write user-details.read account-settings.read offline_access workers-scripts.read workers-scripts.write workers-scripts.bind page.read page.write d1.read d1.write workers-kv-storage.read workers-kv-storage.write queues.read queues.write vectorize.read vectorize.write workers-routes.read workers-routes.write workers-tail.read workers-observability.read argotunnel.read argotunnel.write dns.read dns.write zone.read zone-access.read zone-access.write access-org.read";
 
 pub fn metered(app: *App, u: User) bool {
     return app.production and app.ledger != null and !app.auth.isAdmin(u);
@@ -160,13 +168,29 @@ pub fn viaProxy(req: *httpz.Request) bool {
     return req.header("cf-connecting-ip") != null or req.header("x-forwarded-for") != null or req.header("cf-ray") != null;
 }
 
-/// The address to rate-limit by: the visitor's real IP when Cloudflare carried it, else the socket peer.
-/// Through a tunnel every visitor shares one loopback peer, and a guard bucketed on that would lock the
-/// owner out on the first stranger's three bad passwords.
+fn isLoopbackPeer(addr: std.Io.net.IpAddress) bool {
+    return switch (addr) {
+        .ip4 => |a| a.bytes[0] == 127,
+        .ip6 => |a| blk: {
+            const loopback = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
+            const mapped_prefix = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff };
+            break :blk std.mem.eql(u8, &a.bytes, &loopback) or
+                (std.mem.eql(u8, a.bytes[0..12], &mapped_prefix) and a.bytes[12] == 127);
+        },
+    };
+}
+
+/// The address to rate-limit by: accept the visitor IP header only from a loopback socket peer,
+/// else use the peer. A direct network client can supply its own cf-connecting-ip header. A local
+/// proxy must overwrite that header rather than forward a value supplied by its client.
+/// Through a tunnel every visitor shares one loopback peer, and a guard bucketed on that would
+/// lock the owner out on the first stranger's five bad passwords.
 pub fn clientAddress(req: *httpz.Request) std.Io.net.IpAddress {
-    if (req.header("cf-connecting-ip")) |raw| {
-        const t = std.mem.trim(u8, raw, " \t");
-        if (std.Io.net.IpAddress.parse(t, 0)) |a| return a else |_| {}
+    if (isLoopbackPeer(req.address)) {
+        if (req.header("cf-connecting-ip")) |raw| {
+            const t = std.mem.trim(u8, raw, " \t");
+            if (std.Io.net.IpAddress.parse(t, 0)) |a| return a else |_| {}
+        }
     }
     return req.address;
 }
@@ -179,6 +203,27 @@ test "viaProxy / clientAddress: a tunneled request is never local, and is bucket
     try std.testing.expectEqual(@as(u8, 127), clientAddress(web.req).ip4.bytes[0]);
     web.header("cf-connecting-ip", "203.0.113.9");
     try std.testing.expect(viaProxy(web.req));
+    const a = clientAddress(web.req);
+    try std.testing.expectEqual(@as(u8, 203), a.ip4.bytes[0]);
+    try std.testing.expectEqual(@as(u8, 9), a.ip4.bytes[3]);
+}
+
+test "clientAddress: a direct peer cannot choose its login throttle bucket" {
+    var web = httpz.testing.init(.{});
+    defer web.deinit();
+    web.req.address = .{ .ip4 = .{ .bytes = .{ 192, 0, 2, 8 }, .port = 40000 } };
+    web.header("cf-connecting-ip", "203.0.113.9");
+    try std.testing.expect(viaProxy(web.req));
+    const a = clientAddress(web.req);
+    try std.testing.expectEqual(@as(u8, 192), a.ip4.bytes[0]);
+    try std.testing.expectEqual(@as(u8, 8), a.ip4.bytes[3]);
+}
+
+test "clientAddress: an IPv6 loopback tunnel uses the visitor address" {
+    var web = httpz.testing.init(.{});
+    defer web.deinit();
+    web.req.address = try std.Io.net.IpAddress.parse("::1", 40000);
+    web.header("cf-connecting-ip", "203.0.113.9");
     const a = clientAddress(web.req);
     try std.testing.expectEqual(@as(u8, 203), a.ip4.bytes[0]);
     try std.testing.expectEqual(@as(u8, 9), a.ip4.bytes[3]);
@@ -371,8 +416,9 @@ pub const TestApp = struct {
 
 /// TEST ONLY. A fully-wired `App` over a throwaway `root` data dir (created here, deleted by
 /// `deinit`). `keys`, `ledger` and `plugs` stay null — a test that needs one sets it. The neuron
-/// binary is pointed at the repo's `bin/` so a test CAN go live; when it is absent every
-/// neuron-backed call fails open, which is what keeps this usable in CI.
+/// binary is pointed at the repo's `bin/` so a test CAN go live; tests that need
+/// stored state skip when the binary is absent, while production auth and ledger
+/// paths now report storage failures or deny metered access.
 pub fn testApp(gpa: std.mem.Allocator, io: std.Io, root: []const u8) !*TestApp {
     const Neuron = @import("../worker/neuron/client.zig").Neuron;
     std.Io.Dir.cwd().deleteTree(io, root) catch {};

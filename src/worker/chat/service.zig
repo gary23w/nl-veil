@@ -412,6 +412,8 @@ pub fn postMessage(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         // client, and every API caller who has never heard of this field, gets the better reasoning without
         // changing anything. Opting OUT is the deliberate act, which is the right way round for a quality knob.
         fast: bool = false,
+        // Optional per-turn tool-tree preference. Absent keeps the server's NL_TOOL_MAP default.
+        tool_map: ?bool = null,
         trace: bool = false,
         // AGENT GARRETT: the client asked for the user's own blue-team agent (config/cf_garrett.zig) on this turn's
         // belt — the desk's "use Agent Garrett" box, `veil chat --garrett`. Absent = false. Nothing rides with it:
@@ -528,7 +530,7 @@ pub fn postMessage(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         _ = std.Io.Dir.cwd().createDirPathStatus(app.io, cdir, .default_dir) catch {};
     } else |_| {}
 
-    chat_engine.spawnTurn(app, u.id, seg, trio, text, loop_mode, b.tool_client, b.image_b64, b.fast, b.trace, b.garrett);
+    chat_engine.spawnTurn(app, u.id, seg, trio, text, loop_mode, b.tool_client, b.image_b64, b.fast, b.trace, b.garrett, b.tool_map);
 
     res.status = 202;
     const events_url = try std.fmt.allocPrint(res.arena, "/api/v1/chat/convs/{s}/events?from=0", .{seg});

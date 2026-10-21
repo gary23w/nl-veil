@@ -5,6 +5,7 @@ const httpz = @import("httpz");
 const http = @import("../gateway/http.zig");
 const ent = @import("../plan/entitlements.zig");
 const neurons = @import("../plan/neurons.zig");
+const Neuron = @import("../worker/neuron/client.zig").Neuron;
 const App = http.App;
 const COOKIE = http.COOKIE;
 const sessionToken = http.sessionToken;
@@ -27,7 +28,10 @@ pub fn register(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         return res.json(.{ .ok = false, .err = "registration is closed — neuron-loops is in private beta" }, .{});
     }
     const body = (req.json(Creds) catch return badReq(res, "malformed JSON body")) orelse return badReq(res, "missing email/password");
-    app.auth.register(body.email, body.password) catch |e| return authErr(res, e);
+    app.auth.register(body.email, body.password) catch |e| return switch (e) {
+        error.StorageFailure => http.serverErr(res, "could not persist account"),
+        else => authErr(res, e),
+    };
     res.status = 201;
     try res.json(.{ .ok = true }, .{});
 }
@@ -52,8 +56,8 @@ pub fn login(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
 }
 
 pub fn logout(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
-    if (sessionToken(req)) |tok| app.auth.logout(tok);
     res.header("Set-Cookie", COOKIE ++ "=; HttpOnly; Path=/; Max-Age=0");
+    if (sessionToken(req)) |tok| app.auth.logoutChecked(tok) catch return http.serverErr(res, "could not persist logout");
     try res.json(.{ .ok = true }, .{});
 }
 
@@ -66,7 +70,7 @@ pub fn me(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const user = u orelse return res.json(.{ .authed = false, .open_registration = app.open_registration, .default_model = sd.model, .default_base_url = sd.base_url }, .{});
     const admin = app.auth.isAdmin(user);
     const e = ent.entitlements(user.plan, admin);
-    const ns: neurons.Status = if (app.ledger) |l| l.status(user.id, user.plan) else .{ .granted = 0, .used = 0, .balance = 0, .period_start = 0 };
+    const ns: neurons.Status = if (app.ledger) |l| l.status(user.id, user.plan) catch return http.serverErr(res, "neuron ledger unavailable") else .{ .granted = 0, .used = 0, .balance = 0, .period_start = 0 };
     try res.json(.{ .authed = true, .email = user.email, .plan = @tagName(user.plan), .id = user.id, .admin = admin, .open_registration = app.open_registration, .workers_ai_available = (app.cf_account_id.len > 0 and app.workers_ai_token.len > 0), .entitlements = .{ .max_swarms = e.max_swarms, .max_minds = e.max_minds, .per_swarm_minds = e.per_swarm_minds, .workers_ai = e.workers_ai, .cloudflare_deploy = e.cloudflare_deploy, .encrypted = e.encrypted }, .neurons = .{ .metered = http.metered(app, user), .granted = ns.granted, .used = ns.used, .balance = ns.balance }, .default_model = sd.model, .default_base_url = sd.base_url }, .{});
 }
 
@@ -113,7 +117,7 @@ pub fn keyRevoke(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const u = http.requireUser(app, req, res) orelse return;
     const id = req.param("id") orelse return badReq(res, "no id");
     const ks = app.keys orelse return http.serverErr(res, "api keys unavailable");
-    const ok = ks.revoke(u.id, id);
+    const ok = ks.revoke(u.id, id) catch return http.serverErr(res, "could not persist API key revocation");
     try res.json(.{ .ok = ok, .revoked = ok }, .{});
 }
 
@@ -138,6 +142,49 @@ test "a private instance stays private: registration is refused and no account a
     try web.expectStatus(403);
     // Refused, not merely unreported: nobody can log in as that address afterwards.
     try std.testing.expectError(error.BadCredentials, ta.auth.login("stranger@example.test", "correct horse battery"));
+}
+
+test "registration reports storage failure without creating a live-only account" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var ta = try http.testApp(gpa, io, "zig-authapi-register-store-tmp");
+    defer ta.deinit();
+    ta.app.open_registration = true;
+    const email = "new@example.test";
+    const password = "correct horse battery";
+    const bin = ta.auth.nb.bin;
+    ta.auth.nb.bin = "__nl_no_such_neuron_bin__";
+    {
+        var web = httpz.testing.init(.{});
+        defer web.deinit();
+        web.json(.{ .email = email, .password = password });
+        try register(&ta.app, web.req, web.res);
+        try web.expectStatus(500);
+    }
+    try std.testing.expect(ta.auth.idForEmail(email) == null);
+    try std.testing.expectEqual(@as(u64, 1), ta.auth.next_id);
+    try std.testing.expectError(error.BadCredentials, ta.auth.login(email, password));
+
+    ta.auth.nb.bin = bin;
+    const probe = "bmxfdXNlcl9yZWdpc3RyYXRpb25fcHJvYmU=";
+    ta.auth.nb.put("nl_registration_probe", probe) catch return error.SkipZigTest;
+    const got = (ta.auth.nb.get("nl_registration_probe") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer gpa.free(got);
+    if (!std.mem.eql(u8, got, probe)) return error.SkipZigTest;
+    {
+        var web = httpz.testing.init(.{});
+        defer web.deinit();
+        web.json(.{ .email = email, .password = password });
+        try register(&ta.app, web.req, web.res);
+        try web.expectStatus(201);
+    }
+    try std.testing.expectEqual(@as(u64, 1), ta.auth.idForEmail(email).?);
+    var reloaded = http.Auth.init(gpa, ta.auth.nb);
+    defer reloaded.deinit();
+    try reloaded.warm();
+    try std.testing.expectEqual(@as(u64, 1), reloaded.idForEmail(email).?);
 }
 
 test "the login throttle answers 429 before it ever looks at the credentials" {
@@ -193,6 +240,264 @@ test "me tells an anonymous caller nothing beyond the public shape" {
     try std.testing.expect(body.get("plan") == null);
     try std.testing.expect(body.get("entitlements") == null);
     try std.testing.expect(body.get("admin") == null);
+}
+
+test "logout confirms stored revocation before success and rejects a failed delete" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var ta = try http.testApp(gpa, io, "zig-authapi-logout-tmp");
+    defer ta.deinit();
+
+    const probe = "bmxfdmVpbF9sb2dvdXRfcHJvYmU=";
+    ta.auth.nb.put("nl_logout_probe", probe) catch return error.SkipZigTest;
+    const got = (ta.auth.nb.get("nl_logout_probe") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer gpa.free(got);
+    if (!std.mem.eql(u8, got, probe)) return error.SkipZigTest;
+
+    ta.auth.register("u@example.test", "correct horse battery") catch return error.SkipZigTest;
+    const token = try ta.auth.login("u@example.test", "correct horse battery");
+    defer gpa.free(token);
+    {
+        const scope = try std.fmt.allocPrint(gpa, "s_{s}", .{token});
+        defer gpa.free(scope);
+        const stored = (try ta.auth.nb.get(scope)) orelse return error.SessionNotStored;
+        gpa.free(stored);
+    }
+    const cookie = try std.fmt.allocPrint(gpa, http.COOKIE ++ "={s}", .{token});
+    defer gpa.free(cookie);
+    {
+        var web = httpz.testing.init(.{});
+        defer web.deinit();
+        web.header("cookie", cookie);
+        try logout(&ta.app, web.req, web.res);
+        try web.expectStatus(200);
+    }
+    try std.testing.expect(ta.auth.whoami(token) == null);
+    {
+        var reloaded = http.Auth.init(gpa, ta.auth.nb);
+        defer reloaded.deinit();
+        try reloaded.warm();
+        try std.testing.expect(reloaded.whoami(token) == null);
+    }
+
+    const failed_token = try ta.auth.login("u@example.test", "correct horse battery");
+    defer gpa.free(failed_token);
+    {
+        const scope = try std.fmt.allocPrint(gpa, "s_{s}", .{failed_token});
+        defer gpa.free(scope);
+        const stored = (try ta.auth.nb.get(scope)) orelse return error.SessionNotStored;
+        gpa.free(stored);
+    }
+    const failed_cookie = try std.fmt.allocPrint(gpa, http.COOKIE ++ "={s}", .{failed_token});
+    defer gpa.free(failed_cookie);
+    const bin = ta.auth.nb.bin;
+    ta.auth.nb.bin = "__nl_no_such_neuron_bin__";
+    {
+        var web = httpz.testing.init(.{});
+        defer web.deinit();
+        web.header("cookie", failed_cookie);
+        try logout(&ta.app, web.req, web.res);
+        try web.expectStatus(500);
+    }
+    ta.auth.nb.bin = bin;
+    try std.testing.expect(ta.auth.whoami(failed_token) == null);
+}
+
+test "password change, ban, and account recreation reject stale stored sessions" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var ta = try http.testApp(gpa, io, "zig-authapi-session-generation-tmp");
+    defer ta.deinit();
+
+    const probe = "bmxfc2Vzc2lvbl9nZW5lcmF0aW9uX3Byb2Jl";
+    ta.auth.nb.put("nl_session_generation_probe", probe) catch return error.SkipZigTest;
+    const got = (ta.auth.nb.get("nl_session_generation_probe") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer gpa.free(got);
+    if (!std.mem.eql(u8, got, probe)) return error.SkipZigTest;
+
+    const email = "u@example.test";
+    const old_password = "correct horse battery";
+    const new_password = "new correct horse battery";
+    try ta.auth.register(email, old_password);
+    const original_id = ta.auth.idForEmail(email).?;
+
+    const password_token = try ta.auth.login(email, old_password);
+    defer gpa.free(password_token);
+    const password_scope = try std.fmt.allocPrint(gpa, "s_{s}", .{password_token});
+    defer gpa.free(password_scope);
+    const password_record = (try ta.auth.nb.get(password_scope)) orelse return error.SessionNotStored;
+    defer gpa.free(password_record);
+    try std.testing.expect(ta.auth.setPassword(email, new_password));
+    try std.testing.expect(ta.auth.whoami(password_token) == null);
+    // Simulate an individual cleanup delete failing while the old record remains on disk.
+    try ta.auth.nb.put(password_scope, password_record);
+    {
+        var reloaded = http.Auth.init(gpa, ta.auth.nb);
+        defer reloaded.deinit();
+        try reloaded.warm();
+        try std.testing.expect(reloaded.whoami(password_token) == null);
+    }
+
+    const ban_token = try ta.auth.login(email, new_password);
+    defer gpa.free(ban_token);
+    const ban_scope = try std.fmt.allocPrint(gpa, "s_{s}", .{ban_token});
+    defer gpa.free(ban_scope);
+    const ban_record = (try ta.auth.nb.get(ban_scope)) orelse return error.SessionNotStored;
+    defer gpa.free(ban_record);
+    try std.testing.expect(try ta.auth.setBanned(email, true));
+    try std.testing.expect(try ta.auth.setBanned(email, false));
+    try ta.auth.nb.put(ban_scope, ban_record);
+    {
+        var reloaded = http.Auth.init(gpa, ta.auth.nb);
+        defer reloaded.deinit();
+        try reloaded.warm();
+        try std.testing.expect(reloaded.whoami(ban_token) == null);
+    }
+
+    const deleted_token = try ta.auth.login(email, new_password);
+    defer gpa.free(deleted_token);
+    const deleted_scope = try std.fmt.allocPrint(gpa, "s_{s}", .{deleted_token});
+    defer gpa.free(deleted_scope);
+    const deleted_record = (try ta.auth.nb.get(deleted_scope)) orelse return error.SessionNotStored;
+    defer gpa.free(deleted_record);
+    try std.testing.expect(try ta.auth.deleteUser(email));
+    {
+        var recreated = http.Auth.init(gpa, ta.auth.nb);
+        defer recreated.deinit();
+        try recreated.warm();
+        try recreated.register(email, old_password);
+        // A new account must not inherit the deleted account's user-data namespace.
+        try std.testing.expect(recreated.idForEmail(email).? != original_id);
+        try ta.auth.nb.put(deleted_scope, deleted_record);
+        const valid_token = try recreated.login(email, old_password);
+        defer gpa.free(valid_token);
+        var reloaded = http.Auth.init(gpa, ta.auth.nb);
+        defer reloaded.deinit();
+        try reloaded.warm();
+        try std.testing.expect(reloaded.whoami(deleted_token) == null);
+        try std.testing.expect(reloaded.whoami(valid_token) != null);
+    }
+}
+
+test "a deleted user's persisted API key cannot become a replacement user's key" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var ta = try http.testApp(gpa, io, "zig-authapi-uid-reuse-tmp");
+    defer ta.deinit();
+
+    ta.auth.register("admin@example.test", "correct horse battery") catch return error.SkipZigTest;
+    try ta.auth.register("departed@example.test", "correct horse battery");
+    const old_id = ta.auth.idForEmail("departed@example.test").?;
+    var keys = http.ApiKeys.init(gpa, ta.auth.nb);
+    defer keys.deinit();
+    const old_key = try keys.create(old_id, "old account");
+    defer gpa.free(old_key);
+    try std.testing.expect(keys.persisted(old_key));
+    try std.testing.expect(try ta.auth.deleteUser("departed@example.test"));
+
+    var restarted = http.Auth.init(gpa, ta.auth.nb);
+    defer restarted.deinit();
+    try restarted.warm();
+    try restarted.register("replacement@example.test", "correct horse battery");
+
+    var restored_keys = http.ApiKeys.init(gpa, ta.auth.nb);
+    defer restored_keys.deinit();
+    try restored_keys.warm();
+    try std.testing.expectEqual(old_id, restored_keys.verify(old_key).?);
+    try std.testing.expect(restarted.userById(old_id) == null);
+    try std.testing.expect(restarted.idForEmail("replacement@example.test").? != old_id);
+}
+
+test "failed privilege readback restores the stored denial before restart" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var ta = try http.testApp(gpa, io, "zig-authapi-privilege-readback-tmp");
+    defer ta.deinit();
+    const email = "victim@example.test";
+    ta.auth.register("operator@example.test", "correct horse battery") catch return error.SkipZigTest;
+    ta.auth.register(email, "correct horse battery") catch return error.SkipZigTest;
+    const uid = ta.auth.idForEmail(email).?;
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(email, &digest, .{});
+    const hex = std.fmt.bytesToHex(digest[0..6], .lower);
+    var scope_buf: [16]u8 = undefined;
+    const scope = try std.fmt.bufPrint(&scope_buf, "u_{s}", .{hex});
+    var fault: Neuron.TestFault = .{};
+    ta.auth.nb.test_fault = &fault;
+
+    fault.fail_get_after_put_scope = scope;
+    try std.testing.expectError(error.TestInjectedReadFailure, ta.auth.setToolGrant(email, "research_brief", true));
+    try std.testing.expect(!http.Auth.hasToolGrant(ta.auth.userById(uid).?, "research_brief"));
+    {
+        var reloaded = http.Auth.init(gpa, ta.auth.nb);
+        defer reloaded.deinit();
+        try reloaded.warm();
+        try std.testing.expect(!http.Auth.hasToolGrant(reloaded.userById(uid).?, "research_brief"));
+    }
+
+    fault.fail_get_after_put_scope = scope;
+    try std.testing.expectError(error.TestInjectedReadFailure, ta.auth.setPlan(email, .pro));
+    try std.testing.expect(ta.auth.userById(uid).?.plan == .free);
+    {
+        var reloaded = http.Auth.init(gpa, ta.auth.nb);
+        defer reloaded.deinit();
+        try reloaded.warm();
+        try std.testing.expect(reloaded.userById(uid).?.plan == .free);
+    }
+
+    try std.testing.expect(try ta.auth.setBanned(email, true));
+    fault.fail_get_after_put_scope = scope;
+    try std.testing.expectError(error.TestInjectedReadFailure, ta.auth.setBanned(email, false));
+    try std.testing.expect(ta.auth.userById(uid).?.banned);
+    var reloaded = http.Auth.init(gpa, ta.auth.nb);
+    defer reloaded.deinit();
+    try reloaded.warm();
+    try std.testing.expect(reloaded.userById(uid).?.banned);
+}
+
+test "legacy deleted accounts and interrupted registrations leave no reusable ID" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var ta = try http.testApp(gpa, io, "zig-authapi-legacy-uid-tmp");
+    defer ta.deinit();
+
+    // Simulate a pre-reservation release: its user row was forgotten, while an old
+    // key still carries UID 2. A newly registered account must stay out of that namespace.
+    var keys = http.ApiKeys.init(gpa, ta.auth.nb);
+    defer keys.deinit();
+    const old_key = try keys.create(2, "legacy account");
+    defer gpa.free(old_key);
+    if (!keys.persisted(old_key)) return error.SkipZigTest;
+    try ta.auth.nb.put("u_legacy_deleted", "old-record");
+    try ta.auth.nb.delChecked("u_legacy_deleted");
+    var upgraded = http.Auth.init(gpa, ta.auth.nb);
+    defer upgraded.deinit();
+    try upgraded.warm();
+    try upgraded.register("new@example.test", "correct horse battery");
+    const first_id = upgraded.idForEmail("new@example.test").?;
+    try std.testing.expect(first_id >= (@as(u64, 1) << 40));
+    try std.testing.expect(upgraded.userById(2) == null);
+
+    // A reserved ID with no user is a safe gap after an interrupted registration.
+    const gap_id = first_id + 1;
+    const gap_scope = try std.fmt.allocPrint(gpa, "auth_uid_reserved_{d}", .{gap_id});
+    defer gpa.free(gap_scope);
+    try ta.auth.nb.put(gap_scope, "reserved-v1");
+    var restarted = http.Auth.init(gpa, ta.auth.nb);
+    defer restarted.deinit();
+    try restarted.warm();
+    try restarted.register("later@example.test", "correct horse battery");
+    try std.testing.expectEqual(gap_id + 1, restarted.idForEmail("later@example.test").?);
 }
 
 test "the API-key routes are gated, and a bogus session is not a session" {

@@ -21,6 +21,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const bounded = @import("bounded.zig");
+const deps = @import("deps.zig"); // pythonBin: the interpreter pip runs under (NL_PYTHON_BIN, else the bare name)
 
 fn readSmall(io: std.Io, gpa: std.mem.Allocator, dir: []const u8, name: []const u8, cap: usize) ?[]u8 {
     const p = std.fmt.allocPrint(gpa, "{s}/{s}", .{ dir, name }) catch return null;
@@ -43,17 +44,32 @@ pub fn manifestFingerprint(io: std.Io, gpa: std.mem.Allocator, workdir: []const 
     return h;
 }
 
-const InstallStep = struct { present_file: []const u8, label: []const u8, win: []const u8, nix: []const u8 };
+/// `py`: the command runs under the python interpreter, so win/nix hold the arguments after it and the
+/// interpreter is resolved at run time (deps.pythonBin).
+const InstallStep = struct { present_file: []const u8, label: []const u8, win: []const u8, nix: []const u8, py: bool = false };
 
 /// One canonical install per ecosystem. `npm ci` needs a lockfile; the plain install covers the rest.
 /// Ordered: a fullstack workdir runs each applicable step.
 const steps = [_]InstallStep{
     .{ .present_file = "package-lock.json", .label = "npm ci", .win = "npm ci --no-audit --no-fund --loglevel=error", .nix = "npm ci --no-audit --no-fund --loglevel=error" },
     .{ .present_file = "package.json", .label = "npm install", .win = "npm install --no-audit --no-fund --loglevel=error", .nix = "npm install --no-audit --no-fund --loglevel=error" },
-    .{ .present_file = "requirements.txt", .label = "pip install", .win = "python -m pip install -r requirements.txt --quiet --disable-pip-version-check", .nix = "python3 -m pip install -r requirements.txt --quiet --disable-pip-version-check" },
+    .{ .present_file = "requirements.txt", .label = "pip install", .py = true, .win = "-m pip install -r requirements.txt --quiet --disable-pip-version-check", .nix = "-m pip install -r requirements.txt --quiet --disable-pip-version-check" },
     .{ .present_file = "Cargo.toml", .label = "cargo fetch", .win = "cargo fetch --quiet", .nix = "cargo fetch --quiet" },
     .{ .present_file = "go.mod", .label = "go mod download", .win = "go mod download", .nix = "go mod download" },
 };
+
+/// The shell line a step runs: its own text, or for a `py` step the interpreter in front of it — the bare name
+/// as is (the same line as before NL_PYTHON_BIN was honoured here), an override path quoted, since a full path
+/// may hold spaces and the line goes through cmd /C or sh -c.
+fn stepCommand(buf: []u8, s: InstallStep, py: []const u8) ?[]const u8 {
+    const tail = if (builtin.os.tag == .windows) s.win else s.nix;
+    if (!s.py) return tail;
+    const bare = if (builtin.os.tag == .windows) "python" else "python3";
+    return if (std.mem.eql(u8, py, bare))
+        std.fmt.bufPrint(buf, "{s} {s}", .{ py, tail }) catch null
+    else
+        std.fmt.bufPrint(buf, "\"{s}\" {s}", .{ py, tail }) catch null;
+}
 
 fn fileIn(io: std.Io, gpa: std.mem.Allocator, dir: []const u8, name: []const u8) bool {
     const p = std.fmt.allocPrint(gpa, "{s}/{s}", .{ dir, name }) catch return false;
@@ -78,7 +94,8 @@ pub fn bootstrap(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process
             if (ran_npm) continue;
             ran_npm = true;
         }
-        const cmd = if (builtin.os.tag == .windows) s.win else s.nix;
+        var cmd_buf: [1024]u8 = undefined;
+        const cmd = stepCommand(&cmd_buf, s, deps.pythonBin(io, &env)) orelse continue;
         const argv: [3][]const u8 = if (builtin.os.tag == .windows) .{ "cmd", "/C", cmd } else .{ "/bin/sh", "-c", cmd };
         // ONE deadline for the install (bounded.run): std.process.run's timeout restarted at every line printed,
         // and on Windows never fired for an install that printed nothing.
@@ -165,6 +182,19 @@ test "deriveChecks adopts only what the project declares" {
     const rows2 = deriveChecks(gpa, io, wd);
     defer gpa.free(rows2);
     try std.testing.expect(std.mem.indexOf(u8, rows2, "npm test") == null);
+}
+
+test "stepCommand: the pip line is unchanged under the bare interpreter and quotes an NL_PYTHON_BIN path" {
+    var buf: [1024]u8 = undefined;
+    const pip = steps[2];
+    try std.testing.expect(pip.py and std.mem.eql(u8, pip.label, "pip install"));
+    const bare = if (builtin.os.tag == .windows) "python" else "python3";
+    const same = stepCommand(&buf, pip, bare).?;
+    try std.testing.expectEqualStrings(if (builtin.os.tag == .windows) "python -m pip install -r requirements.txt --quiet --disable-pip-version-check" else "python3 -m pip install -r requirements.txt --quiet --disable-pip-version-check", same);
+    const quoted = stepCommand(&buf, pip, "C:/Program Files/Py/python.exe").?;
+    try std.testing.expectEqualStrings("\"C:/Program Files/Py/python.exe\" -m pip install -r requirements.txt --quiet --disable-pip-version-check", quoted);
+    // a non-python step is its own text, whatever interpreter is in hand
+    try std.testing.expectEqualStrings("cargo fetch --quiet", stepCommand(&buf, steps[3], "C:/Program Files/Py/python.exe").?);
 }
 
 test "manifestFingerprint changes with manifest content and is 0 for a bare dir" {

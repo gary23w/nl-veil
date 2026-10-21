@@ -18,6 +18,15 @@ pub const Neuron = struct {
     io: Io,
     bin: []const u8,
     db: []const u8,
+    /// Test-only fault at the exact ambiguous boundary: a put succeeds, then its
+    /// first confirming export fails. Shared by Neuron copies through this pointer.
+    test_fault: ?*TestFault = null,
+
+    pub const TestFault = struct {
+        fail_get_after_put_scope: ?[]const u8 = null,
+        fail_put_scope_once: ?[]const u8 = null,
+        armed: bool = false,
+    };
 
     pub fn init(gpa: std.mem.Allocator, io: Io, bin: []const u8, db: []const u8) Neuron {
         return .{ .gpa = gpa, .io = io, .bin = bin, .db = db };
@@ -27,6 +36,16 @@ pub const Neuron = struct {
         if (builtin.is_test) spawn_probe += 1;
         const res = try std.process.run(self.gpa, self.io, .{ .argv = argv });
         self.gpa.free(res.stderr);
+        switch (res.term) {
+            .exited => |code| if (code != 0) {
+                self.gpa.free(res.stdout);
+                return error.NeuronCommandFailed;
+            },
+            else => {
+                self.gpa.free(res.stdout);
+                return error.NeuronCommandFailed;
+            },
+        }
         return res.stdout;
     }
 
@@ -35,13 +54,37 @@ pub const Neuron = struct {
     /// scope never takes (the KV callers here — vault, sessions, api keys, ledger, user records — all want the
     /// latest value, not an accumulation; the append-style memory use goes through Mem.observe, not this).
     pub fn put(self: Neuron, scope: []const u8, value: []const u8) !void {
+        if (builtin.is_test) if (self.test_fault) |fault| {
+            if (fault.fail_put_scope_once) |target| {
+                if (std.mem.eql(u8, scope, target)) {
+                    fault.fail_put_scope_once = null;
+                    return error.TestInjectedWriteFailure;
+                }
+            }
+        };
         self.del(scope);
         const argv = [_][]const u8{ self.bin, "--db", self.db, "observe", scope, value };
         const out = try self.exec(&argv);
         self.gpa.free(out);
+        if (builtin.is_test) if (self.test_fault) |fault| {
+            if (fault.fail_get_after_put_scope) |target| {
+                if (std.mem.eql(u8, scope, target)) fault.armed = true;
+            }
+        };
     }
 
     pub fn get(self: Neuron, scope: []const u8) !?[]u8 {
+        if (builtin.is_test) if (self.test_fault) |fault| {
+            if (fault.armed) {
+                if (fault.fail_get_after_put_scope) |target| {
+                    if (std.mem.eql(u8, scope, target)) {
+                        fault.armed = false;
+                        fault.fail_get_after_put_scope = null;
+                        return error.TestInjectedReadFailure;
+                    }
+                }
+            }
+        };
         const argv = [_][]const u8{ self.bin, "--db", self.db, "export", scope };
         const out = try self.exec(&argv);
         defer self.gpa.free(out);
@@ -54,10 +97,14 @@ pub const Neuron = struct {
         return null;
     }
 
-    pub fn del(self: Neuron, scope: []const u8) void {
+    pub fn delChecked(self: Neuron, scope: []const u8) !void {
         const argv = [_][]const u8{ self.bin, "--db", self.db, "forget", scope };
-        const out = self.exec(&argv) catch return;
+        const out = try self.exec(&argv);
         self.gpa.free(out);
+    }
+
+    pub fn del(self: Neuron, scope: []const u8) void {
+        self.delChecked(scope) catch {};
     }
 
     /// Scope names under `prefix`, EXCLUDING neuron-db's per-scope satellites (`<scope>::var`,
@@ -151,6 +198,22 @@ test "with no binary: reads and writes ERROR, deletes stay silent" {
     try std.testing.expectError(error.FileNotFound, nb.get("s"));
     try std.testing.expectError(error.FileNotFound, nb.scopes(""));
     nb.del("s"); // must not crash and must not propagate — the whole point of its `void` return
+}
+
+test "a launched neuron command that exits nonzero is reported as a failure" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const nb = Neuron.init(gpa, io, NEURON_BIN, "zig-neuron-unused-tmp.db");
+    const argv = [_][]const u8{ NEURON_BIN, "--definitely-invalid-option" };
+    const out = nb.exec(&argv) catch |e| {
+        if (e == error.FileNotFound) return error.SkipZigTest;
+        try std.testing.expect(e == error.NeuronCommandFailed);
+        return;
+    };
+    gpa.free(out);
+    return error.TestExpectedError;
 }
 
 test "live: put is an UPSERT — a second write wins, which the forget-first is there to guarantee" {

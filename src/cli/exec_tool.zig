@@ -18,6 +18,9 @@ const NEURON_EXE = if (builtin.os.tag == .windows) "neuron.exe" else "neuron";
 /// gpa-owned result string tools.execute produces (always a string, even on error, so it feeds back cleanly).
 pub fn runTool(ctx: *cli.Ctx, workdir: []const u8, name: []const u8, args_json: []const u8) []u8 {
     const gpa = ctx.gpa;
+    // The same overlay file the server registers (main.zig): a `tool_env` run here, on the user's machine, is what
+    // the server's next spawn reads, and vice versa.
+    tools.setToolEnvPath(ctx.data);
     var nb: [700]u8 = undefined;
     const neuron_bin = std.fmt.bufPrint(&nb, "{s}/bin/{s}", .{ ctx.home, NEURON_EXE }) catch "";
     var db: [700]u8 = undefined;

@@ -5,6 +5,8 @@ const builtin = @import("builtin");
 const crypto = @import("../../config/key_vault.zig");
 const dataset = @import("../dataset.zig"); // training-set root, injected so a mind records into the same set
 const NeuronLedger = @import("../../plan/neurons.zig").NeuronLedger;
+const Neuron = @import("../neuron/client.zig").Neuron;
+const Auth = @import("../../auth/auth_core.zig").Auth;
 const cpaths = @import("../chat/paths.zig"); // conv → build-tree mapping (scheduled runs → _sched/{task}/runs/)
 const llm = @import("../llm.zig"); // the call-scratch names and their age floor, for sweepKeyScratch and cleanCastMeta
 
@@ -109,6 +111,7 @@ pub const Swarm = struct {
     last_restart: i64 = 0,
     breaker_open: bool = false,
     metered_neurons: u64 = 0,
+    billing_run_id: []const u8 = "",
 };
 
 pub const Supervisor = struct {
@@ -121,11 +124,15 @@ pub const Supervisor = struct {
     // other's inheritable pipe handles, wedging the pipe reads. Spawns are ~2-6ms, so serializing them is
     // negligible latency and closes the race.
     launch_mu: std.Io.Mutex = .init,
+    /// Serializes run-directory replacement, removal and retention pruning.
+    lifecycle_mu: std.Io.Mutex = .init,
     swarms: std.StringHashMapUnmanaged(*Swarm) = .empty,
     server_key: [32]u8 = undefined,
     parent_env: ?*const std.process.Environ.Map = null,
     last_gc: i64 = 0,
     ledger: ?*NeuronLedger = null,
+    budget_auth: ?*Auth = null,
+    budget_production: bool = false,
     bg_stop: std.atomic.Value(bool) = .init(false),
     gc_data_dir: []const u8 = "",
     gc_days: u32 = 0,
@@ -137,12 +144,14 @@ pub const Supervisor = struct {
         return .{ .gpa = gpa, .io = io, .neuron_bin = neuron_bin };
     }
 
-    /// Background maintenance thread: reconcile swarm states + prune old runs every ~5s, OFF the httpz request
+    /// Background maintenance thread: reconcile swarm states, enforce metered budgets,
+    /// and prune old runs every ~5s, OFF the httpz request
     /// threads. reconcile() probes worker liveness and can respawn a worker; doing that inline in a request
     /// handler starves the pool and wedges the server. Request handlers just read the in-memory map; this loop
     /// keeps it fresh. Fire-and-forget (detached).
     pub fn bgLoop(self: *Supervisor) void {
         while (!self.bg_stop.load(.monotonic)) {
+            self.enforceBudget();
             self.reconcile();
             if (self.gc_days > 0) self.maybeGc(self.gc_data_dir, self.gc_days);
             // real sleep on a raw thread (see threadSleepMs) — 5s in 100ms slices so stop stays responsive
@@ -196,7 +205,7 @@ pub const Supervisor = struct {
         return .{ .child = child, .encrypted = if (child_env) |ce| ce.encrypted else false };
     }
 
-    pub fn spawn(self: *Supervisor, uid: u64, id: []const u8, name: []const u8, run_dir: []const u8, model: []const u8, minds: usize) !*Swarm {
+    pub fn spawn(self: *Supervisor, uid: u64, id: []const u8, name: []const u8, run_dir: []const u8, model: []const u8, minds: usize, billing_run_id: []const u8) !*Swarm {
         const launched = blk: {
             self.launch_mu.lockUncancelable(self.io); // serialize CreateProcess against concurrent spawns
             defer self.launch_mu.unlock(self.io);
@@ -215,6 +224,7 @@ pub const Supervisor = struct {
             .child = launched.child,
             .state = .running,
             .encrypted = launched.encrypted,
+            .billing_run_id = try self.gpa.dupe(u8, billing_run_id),
         };
         self.mu.lockUncancelable(self.io);
         defer self.mu.unlock(self.io);
@@ -419,7 +429,34 @@ pub const Supervisor = struct {
         } else |_| {}
     }
 
-    pub fn remove(self: *Supervisor, id: []const u8) void {
+    pub fn remove(self: *Supervisor, id: []const u8) !void {
+        self.lifecycle_mu.lockUncancelable(self.io);
+        defer self.lifecycle_mu.unlock(self.io);
+        if (self.ledger != null) {
+            var prior_buf: [1024]u8 = undefined;
+            var active = false;
+            var prior_dir: []const u8 = "";
+            {
+                self.mu.lockUncancelable(self.io);
+                defer self.mu.unlock(self.io);
+                const sw = self.swarms.get(id) orelse return;
+                active = sw.state == .running or sw.state == .starting or sw.state == .stopping;
+                prior_dir = std.fmt.bufPrint(&prior_buf, "{s}", .{sw.run_dir}) catch return error.InvalidRunDir;
+            }
+            // A hard kill can land after provider calls but before the round
+            // flush. Let the worker finish that round and write final usage.
+            if (!self.hasDoneMarker(prior_dir)) {
+                if (active) {
+                    self.stop(id);
+                    return error.WorkerStillStopping;
+                }
+                return error.FinalUsageNotReported;
+            }
+        }
+        // Keep the run and its report available if the final debit cannot be
+        // confirmed. A later DELETE or maintenance tick can settle it.
+        if (!self.kill(id)) return;
+        if (self.ledger != null and !self.meter()) return error.MeteringUnconfirmed;
         // Snapshot run_dir, take ownership of the ?Child, and UNLINK the map entry — all UNDER the lock — so
         // no other thread can race the ?Child (respawn writes it under the same lock) or get() a swarm that's
         // mid-teardown. The slow STOP-write + process kill + rmTree then run on LOCAL copies, lock released.
@@ -662,12 +699,22 @@ pub const Supervisor = struct {
         const idle_ns = @as(i96, days) * std.time.ns_per_day;
         var pruned: usize = 0;
         for (runs.list.items) |run| {
+            self.lifecycle_mu.lockUncancelable(self.io);
+            defer self.lifecycle_mu.unlock(self.io);
             var pb: [1100]u8 = undefined;
             const ev = std.fmt.bufPrint(&pb, "{s}/events.jsonl", .{run.path}) catch continue;
             const st = std.Io.Dir.cwd().statFile(self.io, ev, .{}) catch continue;
             if (now_ns - st.mtime.nanoseconds <= idle_ns) continue;
             if (self.runDirIsLive(run.path)) continue;
-            if (self.rmTree(run.path)) pruned += 1;
+            if (self.ledger != null and !self.hasDoneMarker(run.path)) continue;
+            // Retention must never erase the only report for a debit that may
+            // have committed without confirmation. Unknown run dirs need
+            // adoption/reconciliation before their usage can be discarded.
+            if (self.ledger != null and (!self.runDirTracked(run.path) or !self.meter())) continue;
+            if (self.rmTree(run.path)) {
+                self.forgetRunDir(run.path);
+                pruned += 1;
+            }
         }
         return pruned;
     }
@@ -748,39 +795,171 @@ pub const Supervisor = struct {
         return removed;
     }
 
-    fn runDirIsLive(self: *Supervisor, run_dir: []const u8) bool {
+    pub fn runDirIsLive(self: *Supervisor, run_dir: []const u8) bool {
         self.mu.lockUncancelable(self.io);
         defer self.mu.unlock(self.io);
         var it = self.swarms.valueIterator();
         while (it.next()) |sp| {
             const s = sp.*;
-            if ((s.state == .running or s.state == .starting) and sameRunDir(s.run_dir, run_dir)) return true;
+            if ((s.state == .running or s.state == .starting or s.state == .stopping) and sameRunDir(s.run_dir, run_dir)) return true;
         }
         return false;
     }
 
-    pub fn meter(self: *Supervisor) void {
-        const l = self.ledger orelse return;
-        const Charge = struct { uid: u64, n: u64 };
-        var charges: std.ArrayListUnmanaged(Charge) = .empty;
-        defer charges.deinit(self.gpa);
+    fn runDirTracked(self: *Supervisor, run_dir: []const u8) bool {
         self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        var it = self.swarms.valueIterator();
+        while (it.next()) |sp| if (sameRunDir(sp.*.run_dir, run_dir)) return true;
+        return false;
+    }
+
+    fn forgetRunDir(self: *Supervisor, run_dir: []const u8) void {
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        while (true) {
+            var victim: ?[]const u8 = null;
+            var it = self.swarms.iterator();
+            while (it.next()) |entry| {
+                if (sameRunDir(entry.value_ptr.*.run_dir, run_dir)) {
+                    victim = entry.key_ptr.*;
+                    break;
+                }
+            }
+            if (victim) |key| {
+                _ = self.swarms.remove(key);
+            } else break;
+        }
+    }
+
+    fn legacyBillingId(run_dir: []const u8) [17]u8 {
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(run_dir, &digest, .{});
+        const hex = std.fmt.bytesToHex(digest[0..8], .lower);
+        var id: [17]u8 = undefined;
+        id[0] = 'l';
+        @memcpy(id[1..], &hex);
+        return id;
+    }
+
+    /// Advance a run's high-water mark only after its usage is confirmed in the ledger.
+    /// Holding this lock across the write prevents concurrent meter ticks from charging
+    /// the same interval twice inside this process.
+    pub fn meter(self: *Supervisor) bool {
+        const l = self.ledger orelse return true;
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
         var it = self.swarms.valueIterator();
         while (it.next()) |sp| {
             const s = sp.*;
-            if (s.state != .running and s.state != .starting) continue;
             var pbuf: [1024]u8 = undefined;
-            const up = std.fmt.bufPrint(&pbuf, "{s}/.usage", .{s.run_dir}) catch continue;
-            const data = std.Io.Dir.cwd().readFileAlloc(self.io, up, self.gpa, .limited(64)) catch continue;
-            defer self.gpa.free(data);
-            const cur = std.fmt.parseInt(u64, std.mem.trim(u8, data, " \r\n\t"), 10) catch continue;
-            if (cur > s.metered_neurons) {
-                charges.append(self.gpa, .{ .uid = s.uid, .n = cur - s.metered_neurons }) catch {};
-                s.metered_neurons = cur;
+            const up = std.fmt.bufPrint(&pbuf, "{s}/.usage", .{s.run_dir}) catch return false;
+            const data: ?[]u8 = std.Io.Dir.cwd().readFileAlloc(self.io, up, self.gpa, .limited(64)) catch |err| switch (err) {
+                error.FileNotFound => null,
+                else => return false,
+            };
+            defer if (data) |d| self.gpa.free(d);
+            const sample = if (data) |d| @import("../../plan/run_usage.zig").parse(d) catch return false else @import("../../plan/run_usage.zig").Sample{ .neurons = 0 };
+            var legacy_id: [17]u8 = undefined;
+            const run_id = if (s.billing_run_id.len > 0) s.billing_run_id else blk: {
+                legacy_id = legacyBillingId(s.run_dir);
+                break :blk legacy_id[0..];
+            };
+            if (s.billing_run_id.len > 0 and !std.mem.eql(u8, sample.run_id, run_id)) {
+                // A completed cast can share this directory with its successor.
+                if (s.state == .stopped and sample.run_id.len > 0) continue;
+                return false;
+            }
+            if (s.billing_run_id.len == 0 and sample.run_id.len > 0) continue;
+            if (s.billing_run_id.len == 0) l.prepareRun(s.uid, run_id, sample.neurons) catch return false;
+            l.chargeRun(s.uid, run_id, sample.neurons) catch |err| {
+                log.warn("metering uid {d} failed ({t}); usage remains pending", .{ s.uid, err });
+                return false;
+            };
+            s.metered_neurons = sample.neurons;
+        }
+        return true;
+    }
+
+    /// A re-cast replaces both the manifest and usage report in a chat build
+    /// directory. Refuse replacement unless the previous report belongs to a
+    /// tracked run of this owner and has been settled.
+    pub fn settleBeforeRecast(self: *Supervisor, uid: u64, run_dir: []const u8) bool {
+        if (self.ledger == null) return true;
+        var mb: [1100]u8 = undefined;
+        const mp = std.fmt.bufPrint(&mb, "{s}/swarm.json", .{run_dir}) catch return false;
+        const manifest: ?[]u8 = std.Io.Dir.cwd().readFileAlloc(self.io, mp, self.gpa, .limited(256 << 10)) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => return false,
+        };
+        defer if (manifest) |m| self.gpa.free(m);
+        var ub: [1100]u8 = undefined;
+        const up = std.fmt.bufPrint(&ub, "{s}/.usage", .{run_dir}) catch return false;
+        const usage: ?[]u8 = std.Io.Dir.cwd().readFileAlloc(self.io, up, self.gpa, .limited(64)) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => return false,
+        };
+        defer if (usage) |u| self.gpa.free(u);
+        if (manifest == null and usage == null) return !self.runDirTracked(run_dir);
+        if (!self.hasDoneMarker(run_dir)) return false;
+        const raw_manifest = manifest orelse return false;
+        const raw_usage = usage orelse return false;
+        const parsed = std.json.parseFromSlice(Manifest, self.gpa, raw_manifest, .{ .ignore_unknown_fields = true }) catch return false;
+        defer parsed.deinit();
+        const sample = @import("../../plan/run_usage.zig").parse(raw_usage) catch return false;
+        if (!std.mem.eql(u8, parsed.value.billing_run_id, sample.run_id)) return false;
+        var tracked = false;
+        {
+            self.mu.lockUncancelable(self.io);
+            defer self.mu.unlock(self.io);
+            var it = self.swarms.valueIterator();
+            while (it.next()) |sp| {
+                const s = sp.*;
+                if (s.uid == uid and sameRunDir(s.run_dir, run_dir) and std.mem.eql(u8, s.billing_run_id, sample.run_id)) {
+                    tracked = true;
+                    break;
+                }
             }
         }
-        self.mu.unlock(self.io);
-        for (charges.items) |c| l.charge(c.uid, c.n);
+        return tracked and self.meter();
+    }
+
+    /// This runs on the maintenance thread even when no client polls the swarm list.
+    /// Banned/deleted owners are stopped in every mode; production also enforces
+    /// balances and pauses non-admin runs when a charge cannot be confirmed.
+    pub fn enforceBudget(self: *Supervisor) void {
+        const auth = self.budget_auth orelse return;
+        const l = self.ledger;
+        const metered = if (self.budget_production and l != null) self.meter() else !self.budget_production;
+        const uids = self.runningUids(self.gpa);
+        defer self.gpa.free(uids);
+        for (uids) |uid| {
+            const identity = auth.billingIdentity(uid) orelse {
+                const paused = self.pauseUserSwarms(uid);
+                if (paused > 0) log.warn("paused {d} swarm(s) for deleted uid {d}", .{ paused, uid });
+                continue;
+            };
+            if (identity.banned) {
+                const paused = self.pauseUserSwarms(uid);
+                if (paused > 0) log.warn("paused {d} swarm(s) for banned uid {d}", .{ paused, uid });
+                continue;
+            }
+            if (!self.budget_production or identity.admin) continue;
+            if (!metered) {
+                const paused = self.pauseUserSwarms(uid);
+                if (paused > 0) log.warn("paused {d} swarm(s) for uid {d} — metering could not be confirmed", .{ paused, uid });
+                continue;
+            }
+            const status = l.?.status(uid, identity.plan) catch {
+                const paused = self.pauseUserSwarms(uid);
+                if (paused > 0) log.warn("paused {d} swarm(s) for uid {d} — neuron ledger unavailable", .{ paused, uid });
+                continue;
+            };
+            if (status.balance <= 0) {
+                const paused = self.pauseUserSwarms(uid);
+                if (paused > 0) log.warn("paused {d} swarm(s) for uid {d} — out of neurons", .{ paused, uid });
+            }
+        }
     }
 
     pub fn runningUids(self: *Supervisor, gpa: std.mem.Allocator) []u64 {
@@ -823,7 +1002,7 @@ pub const Supervisor = struct {
     }
 
     const MindManifest = struct { name: []const u8 = "" };
-    const Manifest = struct { swarm: []const u8 = "swarm", model: []const u8 = "mock", encrypted: bool = false, minds: []const MindManifest = &.{} };
+    const Manifest = struct { swarm: []const u8 = "swarm", model: []const u8 = "mock", encrypted: bool = false, billing_run_id: []const u8 = "", minds: []const MindManifest = &.{} };
 
     /// Re-adopt `run_dir`, a run dir of account `uid` holding a manifest, under the key adoptKey picks. The account is
     /// the one whose dir listRunDirs found it in, never a "u<digits>" name further down the path, which a conversation
@@ -867,6 +1046,7 @@ pub const Supervisor = struct {
             .child = null,
             .state = state,
             .encrypted = m.encrypted,
+            .billing_run_id = try self.gpa.dupe(u8, m.billing_run_id),
         };
         try self.swarms.put(self.gpa, sw.id, sw);
     }
@@ -1964,4 +2144,227 @@ test "retiring a conversation's cast leaves the request bodies of calls still ru
         wrong += 1;
     }
     try std.testing.expectEqual(@as(usize, 0), wrong);
+}
+
+test "meter leaves usage pending when the ledger write fails" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = @import("../../gateway/http.zig").testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-supervisor-meter-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = try std.Io.Dir.cwd().createDirPathStatus(io, root, .default_dir);
+    const db = root ++ "/meter.db";
+    const bin = if (@import("builtin").os.tag == .windows) "bin/neuron.exe" else "bin/neuron";
+    var ledger = NeuronLedger.init(gpa, Neuron.init(gpa, io, bin, db));
+    _ = ledger.status(7, .free) catch return error.SkipZigTest;
+    try ledger.prepareRun(7, "r0123456789abcdef", 0);
+    var sup = Supervisor.init(gpa, io, bin);
+    defer sup.swarms.deinit(gpa);
+    sup.ledger = &ledger;
+    var sw: Swarm = .{ .id = "meter-run", .uid = 7, .name = "meter", .run_dir = root, .model = "mock", .minds = 1, .created = 1, .state = .running, .billing_run_id = "r0123456789abcdef" };
+    try sup.swarms.put(gpa, sw.id, &sw);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/.usage", .data = "v1 r0123456789abcdef 500\n" });
+
+    var fault: Neuron.TestFault = .{};
+    ledger.nb.test_fault = &fault;
+    fault.fail_put_scope_once = "n_7";
+    try std.testing.expect(!sup.meter());
+    try std.testing.expectEqual(@as(u64, 0), sw.metered_neurons);
+    try std.testing.expectEqual(@as(u64, 0), (try ledger.status(7, .free)).used);
+
+    try std.testing.expect(sup.meter());
+    try std.testing.expectEqual(@as(u64, 500), sw.metered_neurons);
+    try std.testing.expectEqual(@as(u64, 500), (try ledger.status(7, .free)).used);
+
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/.usage", .data = "v1 r0123456789abcdef 750" });
+    fault.fail_get_after_put_scope = "n_7";
+    try std.testing.expect(!sup.meter());
+    var reopened = NeuronLedger.init(gpa, ledger.nb);
+    sup.ledger = &reopened;
+    try std.testing.expect(sup.meter());
+    try std.testing.expectEqual(@as(u64, 750), (try reopened.status(7, .free)).used);
+    // A re-adopted map key and in-memory cursor cannot change the bill.
+    sw.id = "adopt-renamed";
+    sw.metered_neurons = 0;
+    try std.testing.expect(sup.meter());
+    try std.testing.expectEqual(@as(u64, 750), (try reopened.status(7, .free)).used);
+    sw.state = .stopped;
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/.usage", .data = "v1 r0123456789abcdef 1000" });
+    try std.testing.expect(sup.meter());
+    try std.testing.expectEqual(@as(u64, 1000), (try reopened.status(7, .free)).used);
+    try std.Io.Dir.cwd().deleteFile(io, root ++ "/.usage");
+    try std.testing.expect(!sup.meter());
+}
+
+test "retention keeps an old run until its final usage is confirmed" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = @import("../../gateway/http.zig").testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-supervisor-retention-billing-tmp";
+    const run_dir = root ++ "/u7/1111111111111111";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = try std.Io.Dir.cwd().createDirPathStatus(io, run_dir, .default_dir);
+    const events = run_dir ++ "/events.jsonl";
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = events, .data = "{}\n" });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = run_dir ++ "/DONE", .data = "finished" });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = run_dir ++ "/.usage", .data = "v1 r1111111111111111 500" });
+    {
+        const old = try std.Io.Dir.cwd().openFile(io, events, .{ .mode = .read_write });
+        defer old.close(io);
+        const now_ns = std.Io.Timestamp.now(io, .real).nanoseconds;
+        try old.setTimestamps(io, .{ .modify_timestamp = .{ .new = .fromNanoseconds(now_ns - 30 * std.time.ns_per_day) } });
+    }
+
+    const bin = if (builtin.os.tag == .windows) "bin/neuron.exe" else "bin/neuron";
+    var ledger = NeuronLedger.init(gpa, Neuron.init(gpa, io, bin, root ++ "/meter.db"));
+    _ = ledger.status(7, .free) catch return error.SkipZigTest;
+    try ledger.prepareRun(7, "r1111111111111111", 0);
+    var sup = Supervisor.init(gpa, io, bin);
+    defer sup.swarms.deinit(gpa);
+    sup.ledger = &ledger;
+    var sw: Swarm = .{ .id = "1111111111111111", .uid = 7, .name = "old", .run_dir = run_dir, .model = "mock", .minds = 1, .created = 1, .state = .stopped, .billing_run_id = "r1111111111111111" };
+    try sup.swarms.put(gpa, sw.id, &sw);
+    var fault: Neuron.TestFault = .{};
+    ledger.nb.test_fault = &fault;
+    fault.fail_put_scope_once = "n_7";
+    try std.testing.expectEqual(@as(usize, 0), sup.pruneOldRuns(root, 14));
+    try std.Io.Dir.cwd().access(io, run_dir ++ "/.usage", .{});
+    try std.testing.expectEqual(@as(u64, 0), (try ledger.status(7, .free)).used);
+    try std.testing.expectEqual(@as(usize, 1), sup.pruneOldRuns(root, 14));
+    try std.testing.expectEqual(@as(u64, 500), (try ledger.status(7, .free)).used);
+    try std.testing.expectEqual(@as(usize, 0), sup.swarms.count());
+}
+
+test "metered removal waits for the worker's final usage report" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = @import("../../gateway/http.zig").testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-supervisor-remove-billing-tmp";
+    const run_dir = root ++ "/run";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = try std.Io.Dir.cwd().createDirPathStatus(io, root, .default_dir);
+    const bin = if (builtin.os.tag == .windows) "bin/neuron.exe" else "bin/neuron";
+    var ledger = NeuronLedger.init(gpa, Neuron.init(gpa, io, bin, root ++ "/meter.db"));
+    _ = ledger.status(7, .free) catch return error.SkipZigTest;
+    try ledger.prepareRun(7, "r2222222222222222", 0);
+    var sup = Supervisor.init(gpa, io, bin);
+    defer sup.swarms.deinit(gpa);
+    sup.ledger = &ledger;
+    var sw: Swarm = .{ .id = "remove-run", .uid = 7, .name = "remove", .run_dir = run_dir, .model = "mock", .minds = 1, .created = 1, .state = .running, .billing_run_id = "r2222222222222222" };
+    _ = try std.Io.Dir.cwd().createDirPathStatus(io, run_dir, .default_dir);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = run_dir ++ "/.usage", .data = "v1 r2222222222222222 100" });
+    try sup.swarms.put(gpa, sw.id, &sw);
+    try std.testing.expectError(error.WorkerStillStopping, sup.remove(sw.id));
+    try std.Io.Dir.cwd().access(io, run_dir ++ "/.usage", .{});
+    try std.testing.expectEqual(@as(u64, 0), (try ledger.status(7, .free)).used);
+    // Simulate the worker observing STOP, finishing its last call, and writing
+    // usage before DONE. Deletion can now settle the final 150 exactly once.
+    sw.state = .stopped;
+    try std.testing.expectError(error.FinalUsageNotReported, sup.remove(sw.id));
+    try std.Io.Dir.cwd().access(io, run_dir ++ "/.usage", .{});
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = run_dir ++ "/.usage", .data = "v1 r2222222222222222 150" });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = run_dir ++ "/DONE", .data = "stopped" });
+    try sup.remove(sw.id);
+    try std.testing.expectEqual(@as(u64, 150), (try ledger.status(7, .free)).used);
+    try std.testing.expectEqual(@as(usize, 0), sup.swarms.count());
+}
+
+test "recast refuses to replace an untracked prior usage report" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = @import("../../gateway/http.zig").testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-supervisor-recast-billing-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = try std.Io.Dir.cwd().createDirPathStatus(io, root, .default_dir);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/swarm.json", .data = "{\"billing_run_id\":\"r3333333333333333\"}" });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/.usage", .data = "v1 r3333333333333333 500" });
+    const bin = if (builtin.os.tag == .windows) "bin/neuron.exe" else "bin/neuron";
+    var ledger = NeuronLedger.init(gpa, Neuron.init(gpa, io, bin, root ++ "/meter.db"));
+    _ = ledger.status(7, .free) catch return error.SkipZigTest;
+    try ledger.prepareRun(7, "r3333333333333333", 0);
+    var sup = Supervisor.init(gpa, io, bin);
+    defer sup.swarms.deinit(gpa);
+    sup.ledger = &ledger;
+    try std.testing.expect(!sup.settleBeforeRecast(7, root));
+    var sw: Swarm = .{ .id = "prior", .uid = 7, .name = "prior", .run_dir = root, .model = "mock", .minds = 1, .created = 1, .state = .stopped, .billing_run_id = "r3333333333333333" };
+    try sup.swarms.put(gpa, sw.id, &sw);
+    try std.testing.expect(!sup.settleBeforeRecast(7, root));
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/DONE", .data = "finished" });
+    try std.testing.expect(sup.settleBeforeRecast(7, root));
+    try std.testing.expectEqual(@as(u64, 500), (try ledger.status(7, .free)).used);
+    _ = sup.swarms.remove(sw.id);
+    try std.testing.expect(!sup.settleBeforeRecast(7, root));
+    try std.Io.Dir.cwd().access(io, root ++ "/.usage", .{});
+}
+
+test "background maintenance stops an over-budget swarm without a list request" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = @import("../../gateway/http.zig").testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-supervisor-periodic-budget-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = try std.Io.Dir.cwd().createDirPathStatus(io, root, .default_dir);
+    const db = root ++ "/meter.db";
+    const bin = if (builtin.os.tag == .windows) "bin/neuron.exe" else "bin/neuron";
+    const nb = Neuron.init(gpa, io, bin, db);
+    var auth = Auth.init(gpa, nb);
+    defer auth.deinit();
+    auth.register("operator@example.test", "correct horse battery") catch return error.SkipZigTest;
+    try auth.register("metered@example.test", "correct horse battery");
+    const uid = auth.idForEmail("metered@example.test").?;
+    var ledger = NeuronLedger.init(gpa, nb);
+    _ = try ledger.status(uid, .free);
+    try ledger.prepareRun(uid, "r1111111111111111", 0);
+
+    var sup = Supervisor.init(gpa, io, bin);
+    defer sup.swarms.deinit(gpa);
+    sup.ledger = &ledger;
+    sup.budget_auth = &auth;
+    sup.budget_production = true;
+    var sw: Swarm = .{ .id = "periodic-run", .uid = uid, .name = "metered", .run_dir = root, .model = "mock", .minds = 1, .created = 1, .state = .running, .billing_run_id = "r1111111111111111" };
+    try sup.swarms.put(gpa, sw.id, &sw);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/.usage", .data = "v1 r1111111111111111 600000\n" });
+
+    {
+        const bg = try std.Thread.spawn(.{}, Supervisor.bgLoop, .{&sup});
+        defer {
+            sup.bg_stop.store(true, .monotonic);
+            bg.join();
+        }
+        var waited: usize = 0;
+        while (waited < 100) : (waited += 1) {
+            if (std.Io.Dir.cwd().access(io, root ++ "/STOP", .{})) |_| break else |_| {}
+            threadSleepMs(io, 50);
+        }
+        try std.testing.expect(waited < 100);
+    }
+    try std.testing.expectEqual(State.stopped, sw.state);
+    try std.testing.expectEqual(@as(u64, 600_000), (try ledger.status(uid, .free)).used);
+
+    // Account revocation is independent of production metering. Beta workers
+    // must also stop when their owner is banned or deleted.
+    sup.budget_production = false;
+    try std.testing.expect(try auth.setBanned("metered@example.test", true));
+    sw.state = .running;
+    try std.Io.Dir.cwd().deleteFile(io, root ++ "/STOP");
+    sup.enforceBudget();
+    try std.testing.expectEqual(State.stopped, sw.state);
+    try std.Io.Dir.cwd().access(io, root ++ "/STOP", .{});
+
+    try std.testing.expect(try auth.deleteUser("metered@example.test"));
+    sw.state = .running;
+    try std.Io.Dir.cwd().deleteFile(io, root ++ "/STOP");
+    sup.enforceBudget();
+    try std.testing.expectEqual(State.stopped, sw.state);
+    try std.Io.Dir.cwd().access(io, root ++ "/STOP", .{});
 }

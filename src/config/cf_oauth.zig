@@ -34,8 +34,10 @@ const requireUser = http.requireUser;
 /// The registration recipe, should it ever need re-creating (dashboard → Manage Account → OAuth clients):
 /// response_type Code; grant types Authorization Code AND Refresh Token (without the second, the
 /// offline_access scope is refused and logins die at first token expiry); token auth method None (PKCE);
-/// redirect http://localhost:8787/api/v1/oauth/cloudflare/callback; scopes exactly the six catalog
-/// permissions in http.CF_OAUTH_SCOPES_DEFAULT. The client starts PRIVATE (only the owning account can
+/// redirect http://localhost:8787/api/v1/oauth/cloudflare/callback; every scope in
+/// http.CF_OAUTH_SCOPES_DEFAULT granted on the client (the authorize endpoint refuses the whole login with
+/// error=invalid_scope when the request names one the client was never granted — see the note on that
+/// constant). The client starts PRIVATE (only the owning account can
 /// authorize — fine for testing); flip visibility to public (one-time DNS TXT domain verification,
 /// permanent) before telling the world. A scope change after launch forces every connected user through
 /// consent again. NL_CF_OAUTH_CLIENT_ID still overrides this constant.
@@ -938,7 +940,7 @@ pub fn callback(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const q = try req.query();
     const code = q.get("code") orelse "";
     const state = q.get("state") orelse "";
-    if (q.get("error")) |e| return page(res, false, e);
+    if (q.get("error")) |e| return page(res, false, try refusalDetail(res.arena, e, q.get("error_description") orelse ""));
     if (code.len == 0 or state.len == 0) return page(res, false, "missing code/state");
 
     var vbuf: [64]u8 = undefined;
@@ -1054,6 +1056,51 @@ fn htmlEsc(alloc: std.mem.Allocator, s: []const u8) []const u8 {
 /// Render the post-callback browser page (the only HTML this module returns). The tab may have been
 /// opened by the WEB app (window.open) or the DESK (system browser): the script pokes an opener if one
 /// exists so the web app can react instantly, and both clients' status polls remain the source of truth.
+/// The text the error page shows for a refusal Cloudflare sent back on the redirect (`error` +
+/// `error_description` query fields). The bare code alone ("invalid_scope") was what a user saw on a fresh
+/// machine in v1.1.25, with no way to tell which scope or whose fault; Cloudflare's description names the
+/// scope, and for that one code the fix is on this side, so say so.
+fn refusalDetail(a: std.mem.Allocator, code: []const u8, description: []const u8) ![]const u8 {
+    const desc = std.mem.trim(u8, description, " \r\n\t");
+    if (std.mem.eql(u8, code, "invalid_scope"))
+        return std.fmt.allocPrint(a, "invalid_scope — {s}{s}This veil asked Cloudflare for a permission its OAuth client is not allowed to request; nothing on your account is wrong. Update the veil to a build whose scope list matches its client, or, if this server sets NL_CF_OAUTH_SCOPES, remove the named scope from it, then start the login again.", .{ desc, if (desc.len > 0) " " else "" });
+    if (desc.len == 0) return code;
+    return std.fmt.allocPrint(a, "{s} — {s}", .{ code, desc });
+}
+
+test "refusalDetail names the scope Cloudflare refused and says the fix is on this side" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const d = try refusalDetail(a, "invalid_scope", "The OAuth 2.0 Client is not allowed to request scope 'containers.read'.");
+    try std.testing.expect(std.mem.indexOf(u8, d, "'containers.read'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, d, "NL_CF_OAUTH_SCOPES") != null);
+    // other refusals: code + Cloudflare's own words, or the bare code when it sent none
+    try std.testing.expectEqualStrings("access_denied — The resource owner denied the request.", try refusalDetail(a, "access_denied", "The resource owner denied the request."));
+    try std.testing.expectEqualStrings("server_error", try refusalDetail(a, "server_error", ""));
+}
+
+test "the default scope list carries no scope the registered client refuses" {
+    // containers.read / containers.write were refused by the live authorize endpoint on 2026-10-21 (see the
+    // note on http.CF_OAUTH_SCOPES_DEFAULT); a list that names them again breaks every fresh login.
+    var it = std.mem.tokenizeScalar(u8, http.CF_OAUTH_SCOPES_DEFAULT, ' ');
+    var n: usize = 0;
+    while (it.next()) |scope| : (n += 1) {
+        try std.testing.expect(!std.mem.startsWith(u8, scope, "containers."));
+        for (scope) |c| try std.testing.expect(std.ascii.isAlphanumeric(c) or c == '.' or c == '-' or c == '_');
+    }
+    // the four the login itself needs (Workers AI, account + user details) plus the refresh grant
+    for ([_][]const u8{ "ai.read", "ai.write", "account-settings.read", "user-details.read", "offline_access" }) |need| {
+        var found = false;
+        var it2 = std.mem.tokenizeScalar(u8, http.CF_OAUTH_SCOPES_DEFAULT, ' ');
+        while (it2.next()) |s| if (std.mem.eql(u8, s, need)) {
+            found = true;
+        };
+        try std.testing.expect(found);
+    }
+    try std.testing.expect(n >= 5);
+}
+
 fn page(res: *httpz.Response, ok: bool, detail: []const u8) !void {
     res.content_type = .HTML;
     res.status = if (ok) 200 else 400;

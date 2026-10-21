@@ -54,6 +54,7 @@ const MindSpec = struct { name: []const u8 = "mind", role: []const u8 = "", duty
 const SCOUT_BROWSER_SCHEMA = ",\n" ++ tools.compactSchema(tools.BROWSER_SCHEMA);
 const Manifest = struct {
     swarm: []const u8 = "swarm",
+    billing_run_id: []const u8 = "",
     provider: []const u8 = "mock",
     model: []const u8 = "mock",
     base_url: []const u8 = "",
@@ -203,6 +204,8 @@ pub const Worker = struct {
     base_url: []const u8,
     key: []const u8,
     model: []const u8,
+    billing_run_id: []const u8 = "",
+    usage_base: u64 = 0,
     patch_root: []const u8 = "", // resolved engine source root (the executable's home) — the DEFAULT VM a mind's patch_system edits when NL_PATCH_SYSTEM_ROOT is unset (minds are root of their own VM)
     fence_writes: bool = false, // written ONLY between rounds (single-threaded); moments read it freely
     tool_parse_fails: std.atomic.Value(u32) = .init(0), // strikes recorded from parallel moments; flip applied between rounds
@@ -691,6 +694,9 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
             } else |_| {}
         }
         if (data_dir.len > 0) llm.initQuirkStore(io, data_dir);
+        // and the tool-env overlay, same path as the server's (tools.zig): a python the chat installed and
+        // `tool_env` made visible is found by this worker's minds too
+        if (data_dir.len > 0) tools.setToolEnvPath(data_dir);
     }
 
     const mani_path = try std.fmt.allocPrint(gpa, "{s}/swarm.json", .{run_dir});
@@ -731,6 +737,17 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
     const model = if (cli_model.len > 0 and !std.mem.eql(u8, cli_model, "mock")) cli_model else m.model;
     const live = key.len > 0 and !std.mem.eql(u8, key, "nl-brokered") and !std.mem.eql(u8, m.provider, "mock");
 
+    const usage_path = try std.fmt.allocPrint(gpa, "{s}/.usage", .{run_dir});
+    defer gpa.free(usage_path);
+    const prior_usage: ?[]u8 = std.Io.Dir.cwd().readFileAlloc(io, usage_path, gpa, .limited(64)) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+    defer if (prior_usage) |data| gpa.free(data);
+    // A crash respawn keeps the cumulative high-water mark; a re-cast sharing
+    // the directory has a different ID and starts its own counter at zero.
+    const usage_base = try @import("../plan/run_usage.zig").baseForRun(prior_usage, m.billing_run_id);
+
     // CROSS-RUN MEMORY: a lineage id points the brain at a stable per-user store so a re-cast inherits the
     // prior runs' knowledge/playbook/skills/trust instead of starting empty (lineage.zig). No id ⇒ the
     // historical per-run {run_dir}/mind.sqlite. `lineage_inherited` records that this store PRE-EXISTED, so
@@ -755,6 +772,8 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
         .lineage_inherited = lineage_inherited,
         .base_url = base_url,
         .model = model,
+        .billing_run_id = m.billing_run_id,
+        .usage_base = usage_base,
         .key = key,
         .garrett_url = garrett_url,
         .garrett_token = garrett_token,
@@ -1834,13 +1853,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
             const tcached = llm.tokens_cached.load(.monotonic);
             w.emit("cost", std.fmt.allocPrint(w.a(), ",\"round\":{d},\"in\":{d},\"out\":{d},\"calls\":{d},\"free\":{d},\"total_in\":{d},\"total_out\":{d},\"total_free\":{d},\"total_cached\":{d}", .{ round, din, dout, dcalls, dfree, llm.tokens_in.load(.monotonic), llm.tokens_out.load(.monotonic), llm.tokens_in_free.load(.monotonic) + llm.tokens_out_free.load(.monotonic), tcached }) catch ",\"round\":0");
             w.act("engine", round, "cost", std.fmt.allocPrint(w.a(), "round {d}", .{round}) catch "round", std.fmt.allocPrint(w.a(), "PAID {d} in + {d} out over {d} calls this round; FREE (local relay) {d} tokens. run total PAID {d} in / {d} out ({d} of the in served from the provider's prompt cache), FREE {d}", .{ din, dout, dcalls, dfree, llm.tokens_in.load(.monotonic), llm.tokens_out.load(.monotonic), tcached, llm.tokens_in_free.load(.monotonic) + llm.tokens_out_free.load(.monotonic) }) catch "cost");
-            if (std.mem.indexOf(u8, w.base_url, "api.cloudflare.com") != null and std.mem.indexOf(u8, w.base_url, "/ai") != null) {
-                const used_neurons = neuronsForCfModel(w.model, llm.tokens_in.load(.monotonic), llm.tokens_out.load(.monotonic));
-                var nbuf: [24]u8 = undefined;
-                const ns = std.fmt.bufPrint(&nbuf, "{d}", .{used_neurons}) catch "0";
-                const upath = std.fmt.allocPrint(w.a(), "{s}/.usage", .{w.run_dir}) catch "";
-                if (upath.len > 0) std.Io.Dir.cwd().writeFile(w.io, .{ .sub_path = upath, .data = ns }) catch {};
-            }
+            try flushUsage(&w);
         }
 
         // INTERACTIVE one-shot: after the single edit moment ran, stop — do not loop continuous.
@@ -1977,6 +1990,10 @@ fn writeDone(w: *Worker, reason: []const u8) void {
         proposeHabits(w); // deterministic counterpart to the LLM judge: propose recurring tool sequences
         recordLineageOutcome(w, reason, lineagePending(w) -| pending0);
     }
+    flushUsage(w) catch |err| {
+        log.warn("final usage report failed ({t}); leaving run unsettled", .{err});
+        return;
+    };
     const dp = std.fmt.allocPrint(w.gpa, "{s}/DONE", .{w.run_dir}) catch return;
     defer w.gpa.free(dp);
     std.Io.Dir.cwd().writeFile(w.io, .{ .sub_path = dp, .data = reason }) catch {};
@@ -1984,6 +2001,15 @@ fn writeDone(w: *Worker, reason: []const u8) void {
     defer w.gpa.free(pp);
     std.Io.Dir.cwd().deleteFile(w.io, pp) catch {};
     sweepKeyScratch(w);
+}
+
+fn flushUsage(w: *Worker) !void {
+    if (std.mem.indexOf(u8, w.base_url, "api.cloudflare.com") == null or std.mem.indexOf(u8, w.base_url, "/ai") == null) return;
+    const process_neurons = neuronsForCfModel(w.model, llm.tokens_in.load(.monotonic), llm.tokens_out.load(.monotonic));
+    var buf: [64]u8 = undefined;
+    const sample = try @import("../plan/run_usage.zig").format(&buf, w.billing_run_id, w.usage_base +| process_neurons);
+    const path = try std.fmt.allocPrint(w.a(), "{s}/.usage", .{w.run_dir});
+    try std.Io.Dir.cwd().writeFile(w.io, .{ .sub_path = path, .data = sample });
 }
 
 /// Proposals waiting in the lineage's three quarantine scopes (0 for a run without a lineage).
@@ -6159,7 +6185,7 @@ fn pySalvageCheck(w: *Worker, source: []const u8) u8 {
     var env = pe.clone(gpa) catch return 0;
     defer env.deinit();
     env.put("NL_SALVAGE_SRC", source) catch return 0;
-    const py = if (@import("builtin").os.tag == .windows) "python" else "python3";
+    const py = depprobe.pythonBin(w.io, &env);
     // dup check counts only UNDECORATED defs (@overload / @singledispatch.register legitimately repeat a name)
     const code = "import os,sys,ast\nsrc=os.environ.get('NL_SALVAGE_SRC','')\ntry:\n compile(src,'<salvage>','exec')\nexcept SyntaxError:\n sys.exit(7)\nexcept Exception:\n sys.exit(0)\ntry:\n seen=set()\n for n in ast.parse(src).body:\n  if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef,ast.ClassDef)) and not n.decorator_list:\n   if n.name in seen: sys.exit(8)\n   seen.add(n.name)\nexcept Exception:\n pass\nsys.exit(0)\n";
     const argv = [_][]const u8{ py, "-c", code };
@@ -6568,7 +6594,7 @@ fn importGraph(w: *Worker, run_dir: []const u8) []u8 {
     var env = pe.clone(gpa) catch return gpa.dupe(u8, "") catch @constCast("");
     defer env.deinit();
     inline for (.{ "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "NL_BROKER_AUTH" }) |k| env.put(k, "") catch {};
-    const py = if (@import("builtin").os.tag == .windows) "python" else "python3";
+    const py = depprobe.pythonBin(w.io, &env);
     const argv = [_][]const u8{ py, "-c", tools.DEPGRAPH_PY };
     const r = std.process.run(gpa, w.io, .{ .argv = &argv, .cwd = .{ .path = workdir }, .environ_map = &env, .stdout_limit = .limited(32 << 10), .stderr_limit = .limited(4 << 10) }) catch return gpa.dupe(u8, "") catch @constCast("");
     defer gpa.free(r.stdout);
@@ -6657,7 +6683,7 @@ fn smokeTest(w: *Worker, run_dir: []const u8, round: u32) void {
     var env = pe.clone(gpa) catch return;
     defer env.deinit();
     inline for (.{ "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "NL_BROKER_AUTH" }) |k| env.put(k, "") catch {};
-    const py = if (@import("builtin").os.tag == .windows) "python" else "python3";
+    const py = depprobe.pythonBin(w.io, &env);
     const argv = [_][]const u8{ py, "-c", tools.SMOKE_PY };
     const r = std.process.run(gpa, w.io, .{ .argv = &argv, .cwd = .{ .path = workdir }, .environ_map = &env, .stdout_limit = .limited(8 << 10), .stderr_limit = .limited(4 << 10) }) catch return;
     defer gpa.free(r.stdout);
@@ -6726,7 +6752,7 @@ fn interfaceScan(w: *Worker, run_dir: []const u8) void {
     const pe = w.mem.environ orelse return;
     var env = pe.clone(gpa) catch return;
     defer env.deinit();
-    const py = if (@import("builtin").os.tag == .windows) "python" else "python3";
+    const py = depprobe.pythonBin(w.io, &env);
     const argv = [_][]const u8{ py, "-c", tools.INTERFACES_PY };
     const r = std.process.run(gpa, w.io, .{ .argv = &argv, .cwd = .{ .path = workdir }, .environ_map = &env, .stdout_limit = .limited(16 << 10), .stderr_limit = .limited(4 << 10) }) catch return;
     defer gpa.free(r.stdout);
@@ -7544,7 +7570,7 @@ fn runBenchmark(w: *Worker, run_dir: []const u8, goal: []const u8, round: u32) B
         var fbuf: [16]u8 = undefined;
         env.put("NL_DOC_FILE_COUNT", std.fmt.bufPrint(&fbuf, "{d}", .{w.doc_files}) catch "0") catch {};
     }
-    const py = if (@import("builtin").os.tag == .windows) "python" else "python3";
+    const py = depprobe.pythonBin(w.io, &env);
     const argv = [_][]const u8{ py, "-c", tools.BENCH_PY };
     const r = std.process.run(gpa, w.io, .{ .argv = &argv, .cwd = .{ .path = workdir }, .environ_map = &env, .stdout_limit = .limited(64 << 10), .stderr_limit = .limited(8 << 10) }) catch return .{ .status = .err };
     defer gpa.free(r.stdout);

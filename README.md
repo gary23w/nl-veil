@@ -15,7 +15,8 @@ into your next session. Use the built-in model, Ollama, or an OpenAI-compatible 
 
 Windows · macOS · Linux · [MIT app code](#license). Local inference needs no provider account or API key;
 hosted providers have their own data handling and costs. The built-in model requires a separate
-download, and coding tools require Python on `PATH` (some checks also use Node).
+download, and coding tools require Python on `PATH` (some checks also use Node); on a machine without it, the
+agent can install it itself through `run_shell` and pick it up with `tool_env`, no restart needed.
 
 ### Try your first task
 
@@ -77,9 +78,13 @@ the server behind it, a web UI, the inference engine, the memory engine, and the
 Nothing to install first — no Docker, no cloud account, no database service, no API key — it will
 **[download a 12B model](https://huggingface.co/gary23w/the-veil-12b) and run it itself**, offline, on
 your GPU. One honest dependency: the agent's **tool belt shells out to Python** (`list_dir`, `run_tests`,
-`web_search`, `deep_crawl`, and its own executor `run_python`) and to Node for a JavaScript syntax check,
-so without `python` on `PATH` the agent can chat but cannot do much work — it tells you exactly which
-tool wanted what. Point it at Ollama or any OpenAI-compatible endpoint instead whenever you'd rather. Your
+`web_search`, `deep_crawl`, and its own executor `run_python`) and to Node for a JavaScript syntax check.
+Without `python` on `PATH` it tells you exactly which tool wanted what, and it can put that right itself:
+`run_shell` runs PowerShell, bash, sh or cmd (so it can `winget install` / `brew install` / `apt install`
+the interpreter), and `tool_env refresh_path` re-reads the machine's PATH — or `tool_env set
+NL_PYTHON_BIN=<path>` names the interpreter directly — for every tool run from then on, with no restart;
+the choice is kept in `tool-env.json` beside your data. Point it at Ollama or any OpenAI-compatible
+endpoint instead whenever you'd rather. Your
 local conversations, keys and memory are stored in a folder next to the binary. Hosted model calls,
 web tools, and optional Cloudflare backups send the data needed for those features to the services
 you connect.
@@ -1081,7 +1086,7 @@ live:
 | group | tools |
 |---|---|
 | **Files & code** | `read_file` `write_file` `edit_file` `delete_file` `list_dir` `stage_file` `stage_delivery` |
-| **Run things** | `host_command` `run_tests` `run_python` `host_status` `host_explore` `stop_process` `poll` `probe` |
+| **Run things** | `host_command` `run_tests` `run_python` `run_shell` `tool_env` `host_status` `host_explore` `stop_process` `poll` `probe` |
 | **Web & research** | `web_search` `web_fetch` `read_url` `fetch_json` `deep_crawl` `read_doc` `osint_scan` |
 | **Your browser** | `browser_navigate` `browser_read` `browser_click` `browser_click_at` `browser_type` `browser_type_text` `browser_key` `browser_scroll` `browser_eval` `browser_console` `browser_network` `browser_close` |
 | **Screen & images** | `pixel_capture` `pixel_ingest` `pixel_search` — screenshots and attached images become searchable text + regions, so a model that can't see gets the picture anyway |
@@ -1533,7 +1538,7 @@ what changed is that the dangerous verbs are now refused inside a turn, not just
 | `NL_TURN_TOKEN_CEILING` | input tokens one turn **segment** may spend before the engine compacts its working context and continues (default 400000, floored at a dozen of the fullest prompt the turn may send — prefix plus working span — so a wide window is never cut sooner than a narrow one; cached prompt tokens count a quarter; `0` disables the ceiling). A runaway backstop, not a budget — a thorough research turn lands well under it. An explicit value is honoured as written |
 | `NL_TURN_CONTINUE_MAX` | how many times one turn may compact and keep going (default 3). **`0` restores beta-5's behaviour exactly**: the turn settles at the ceiling and waits for you |
 | `NL_TURN_CONTINUE_HARD_MAX` | the ceiling on the *earned* allowance (default 10). A segment that wrote a file or made a call it had not made before buys one more pass, up to this; a segment that only re-read its own context buys nothing, so a spinning turn still settles at `NL_TURN_CONTINUE_MAX` |
-| `NL_TOOL_MAP` | **experimental** — advertise the belt as a MAP the model walks (one `open_tools` verb, seven branches at a time) instead of a flat list. A small model keeps nine core verbs in hand and walks the rest; a large one walks only the discovered families (security tools, Cloudflare, plugins), the ones that grow without bound. A known tool name is always callable and opens its own branch. Default off (unset or `0`); `1` turns it on. See `worker/chat/belt` in the docs |
+| `NL_TOOL_MAP` | **experimental** — advertise the belt as a MAP the model walks (one `open_tools` verb, seven branches at a time) instead of a flat list. A small model keeps nine core verbs in hand and walks the rest; a large one walks only the discovered families (security tools, Cloudflare, plugins), the ones that grow without bound. A known tool name is always callable and opens its own branch. Default off (unset or `0`); `1` turns it on. Desk also has a saved **tool map** toggle in Settings → General → Behavior, below reasoning; its choice overrides this default on the next server chat message. See `worker/chat/belt` in the docs |
 | `NL_HANDOFF` | under `NL_CONTEXT=fold`, how a turn's working context is folded and carried: `net` (default) unfolds the turn's own working span with Gary's 4tope — the frontier's last words, the file ledger, the failed calls, the results the frontier rests on at length, what earlier folds and passes carried, verbatim, no model call — both for the fold inside a turn and for the CONTINUATION STATE at the ceiling; `model` restores the model-written fold and four-label state |
 | `NL_CONTEXT` | how a chat request is built. Default: from the conversation's store (Gary's 4tope as the memory) — the turn's prefix, one net unfolded over every earlier ask, answer and tool result from where the work stands, then the newest two rounds verbatim; no fold, no carry, no rolling summary, and a `recall_node` tool that returns any stored node whole by its `n<id>`. `fold` (or `carry`) restores the fold-and-carry path |
 | `NL_CONTEXT_CAPTURE` | `0` stops capturing a conversation into its store (`graph.jsonl` beside the transcript, and each tool result's payload as a neuron-db document); with nothing to unfold a request from, the chat then runs the fold-and-carry path. A result that looks like a credential is never stored |

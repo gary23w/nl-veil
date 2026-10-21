@@ -138,7 +138,7 @@ const WORKERS_AI_IDX: u8 = blk: {
 };
 
 const ChatInner = enum { chat, metrics, files }; // the Chat center-pane inner tabs
-const RightTab = enum { activity, memory }; // the right pane's inner tabs (Swarm activity | Memory)
+const RightTab = enum { activity, tasks, memory }; // the right pane's inner tabs (Swarm activity | Tasks | Memory)
 const SchedInner = enum { tasks, build }; // the Tasks tab's inner tabs (task list | builder form)
 const SwarmInner = enum { live, deploy, lineages }; // the Swarm tab's inner tabs (live view | deploy form | lineages)
 const ChatsInner = enum { chats, sched }; // the chat LEFT pane's inner tabs (conversations | scheduled tasks)
@@ -196,6 +196,13 @@ const Ui = struct {
     chat_follow: bool = true,
     chat_reflow: bool = false,
     chat_view_h: f32 = 0,
+    chat_sb_drag: bool = false, // the transcript's scrollbar thumb is being dragged (vScrollbar)
+    chat_sb_grab: f32 = 0, // where inside the thumb the drag took hold (px from its top)
+    conv_sb_drag: bool = false, // the Chats list's scrollbar thumb is being dragged
+    conv_sb_grab: f32 = 0,
+    tasks_seen: usize = 0, // delegated tasks shown last frame — a rise from zero surfaces the Tasks tab once
+    run_task: [160]u8 = undefined, // the RUNNING foreground task's id this frame ("cancel" by the status line names it)
+    run_task_len: usize = 0,
     chat_inner: ChatInner = .chat, // center pane: conversation | Metrics (perf graphs) | Files (this chat's build dir)
     chat_file_scroll: f32 = 0, // scroll offset for the chat Files content viewer
     chat_file_hscroll: f32 = 0, // HORIZONTAL scroll offset (px) for the chat Files content viewer
@@ -662,7 +669,9 @@ pub fn runApp(data_dir: ?[]const u8, attach: ?AttachTarget) !void {
         // server running. With no tray icon to bring it back, it still means quit.
         if (os_close or ui.hide_req) {
             ui.hide_req = false;
-            if (can_hide) {
+            // Asked LIVE, not the startup answer: a NIM_ADD the shell timed out at startup can land on one of
+            // tray.pump's retries later, and from then on the close gesture has an icon to come back from.
+            if (tray.canHide()) {
                 hideDesk(&store, &tray, gpa);
             } else {
                 exitReason(&store, "close gesture with no tray icon to return to");
@@ -1516,6 +1525,10 @@ fn seedName(buf: []u8) usize {
 
 fn seedSettings(store: *Store, gpa: std.mem.Allocator, io: std.Io, pinned: ?[]const u8, attach: ?AttachTarget) void {
     seedChatDefaults(store);
+    if (std.c.getenv("NL_TOOL_MAP")) |p| {
+        const value = std.mem.span(p);
+        store.settings.tool_map = value.len > 0 and value[0] != '0' and !std.ascii.eqlIgnoreCase(value, "off");
+    }
     seedDataDir(store, gpa, io, pinned);
     // An attaching desk's server is decided before any settings file is read: the one holding the data dir. The chat
     // thread's loader sees the pin and leaves the target alone (chat.zig loadSettings).
@@ -1690,6 +1703,7 @@ fn pumpTray(store: *Store, tray: *tray_mod.Tray, gpa: std.mem.Allocator) void {
         }
     }
     store.unlock();
+    tray.pump(); // the once-per-process Windows chores (first-run promotion out of the overflow flyout, NIM_ADD retry); reads no messages
     if (tray.takeRestoreRequest()) showDesk();
 
     while (true) {
@@ -2482,6 +2496,9 @@ fn drawChat(store: *Store, body: t.Rect) void {
     var plan: [store_mod.MAX_PLAN]store_mod.PlanRow = undefined;
     const plan_n = store.plan_count;
     @memcpy(plan[0..plan_n], store.plan[0..plan_n]);
+    var tasks: [store_mod.MAX_TASKS]store_mod.TaskRow = undefined;
+    const task_n = store.task_count;
+    @memcpy(tasks[0..task_n], store.tasks[0..task_n]);
     if (store.console_show_veil) { // the AI just ran a command — surface its tab once, then clear the flag
         ui.con_tab = 1;
         store.console_show_veil = false;
@@ -2650,8 +2667,18 @@ fn drawChat(store: *Store, body: t.Rect) void {
     t.setBlockClicks(ui.open_dd == .chat_role);
     defer t.setBlockClicks(false); // never let it leak into the next tab's frame
     drawChatLeft(store, left, left_open, convs[0..conv_n], active[0..active_n], now_s);
+    // A task starting is worth a look: the first one to appear surfaces the Tasks tab, unless a live cast is
+    // being watched in Activity. Never switched back by itself — the tab the user picks is theirs.
+    if (task_n > 0 and ui.tasks_seen == 0 and ui.right_tab == .activity and !cast_live) ui.right_tab = .tasks;
+    ui.tasks_seen = task_n;
+    // the RUNNING foreground task, for the status line's own "cancel"
+    ui.run_task_len = 0;
+    if (task_n > 0 and !tasks[0].queued and tasks[0].foreground) {
+        ui.run_task_len = @min(tasks[0].id_len, ui.run_task.len);
+        @memcpy(ui.run_task[0..ui.run_task_len], tasks[0].id[0..ui.run_task_len]);
+    }
     drawChatCenter(store, center, msgs[0..msg_n], inflight, busy, status[0..status_n], cast_live, conv_title, convs[0..conv_n], active[0..active_n]);
-    drawChatRight(store, right, right_open, casts[0..cast_n], tail[0..tail_n], plan[0..plan_n]);
+    drawChatRight(store, right, right_open, casts[0..cast_n], tail[0..tail_n], plan[0..plan_n], tasks[0..task_n]);
     if (con_h > 0) drawMicroConsole(store, console, con_ai, con_buf[0..con_n], con_busy, con_cwd_buf[0..con_cwd_n]);
     // resize grips over the pane inner edges — drawn last so the pane fills don't overpaint them
     if (left_open) drawPaneGrip(pad + left_w, yv, ph, l_active);
@@ -3638,6 +3665,12 @@ fn drawChatLeft(store: *Store, r: t.Rect, open: bool, convs: []const store_mod.C
     if (wheel != 0 and t.hovering(list)) ui.conv_scroll -= wheel * row_h;
     if (ui.conv_scroll < 0) ui.conv_scroll = 0;
     if (ui.conv_scroll > max_scroll) ui.conv_scroll = max_scroll;
+    // The list's scrollbar: input BEFORE the rows so a drag moves them this frame, drawn AFTER them so the
+    // thumb sits on top; while the cursor is on its track the rows under it are not hot (a thumb press is
+    // not a row click).
+    ui.conv_scroll = vScrollbarInput(list, total, ui.conv_scroll, &ui.conv_sb_drag, &ui.conv_sb_grab);
+    const sb_busy = max_scroll > 0 and (ui.conv_sb_drag or t.hovering(vScrollbarTrack(list)));
+    defer vScrollbarDraw(list, total, ui.conv_scroll, ui.conv_sb_drag);
     rl.beginScissorMode(@intFromFloat(list.x), @intFromFloat(list.y), @intFromFloat(list.width), @intFromFloat(list.height));
     defer rl.endScissorMode();
     const bot = r.y + r.height - 8 - foot_h;
@@ -3666,7 +3699,7 @@ fn drawChatLeft(store: *Store, r: t.Rect, open: bool, convs: []const store_mod.C
         // A row straddling the list edge is scissor-clipped to pixels the user can't see, but its
         // hit rect still extends past `bot` — right over the profile card. Hovering must mean the
         // VISIBLE list, or a click on the card also selects the hidden row beneath it.
-        const hot = t.hovering(rr) and t.hovering(list);
+        const hot = t.hovering(rr) and t.hovering(list) and !sb_busy;
         if (is_active) t.panel(rr, t.bg_sel) else if (hot) t.panel(rr, t.bg_hl);
 
         if (is_active and ui.c_renaming) {
@@ -4750,6 +4783,88 @@ test "chat follow respects manual scrolling, resizing, collapse and large replac
     try std.testing.expectEqual(@as(f32, 100), chatScrollLimit(600, 500, 33, true, false, 38));
 }
 
+// ---- the vertical scrollbar (transcript + Chats list) --------------------------------------------------------
+// Until now both scrolled only by wheel: a desk without one (a trackpad with scrolling off, a remote session, a
+// tablet) had no way back through a long chat or a long list. The bar is light and translucent so it reads as
+// a hint at the edge, not a stripe over the text; it draws only while the content overflows.
+
+/// Thumb geometry: height proportional to the visible share (never under 28 px, so it can be grabbed), travel =
+/// what is left of the track, position = the offset's share of the scroll range. Pure, so it is tested.
+fn sbThumb(track_h: f32, view_h: f32, content_h: f32, offset: f32) struct { h: f32, y: f32 } {
+    const max_scroll = @max(0, content_h - view_h);
+    const h = @min(track_h, @max(28.0, track_h * (view_h / @max(content_h, 1))));
+    const travel = track_h - h;
+    const y = if (max_scroll > 0 and travel > 0) (std.math.clamp(offset, 0, max_scroll) / max_scroll) * travel else 0;
+    return .{ .h = h, .y = y };
+}
+
+test "scrollbar thumb: proportional, never too small to grab, and the bottom offset lands at the track's end" {
+    const half = sbThumb(400, 500, 1000, 0);
+    try std.testing.expectEqual(@as(f32, 200), half.h);
+    try std.testing.expectEqual(@as(f32, 0), half.y);
+    const end = sbThumb(400, 500, 1000, 500);
+    try std.testing.expectEqual(@as(f32, 200), end.y);
+    const tiny = sbThumb(400, 500, 100000, 0);
+    try std.testing.expectEqual(@as(f32, 28), tiny.h);
+    // nothing to scroll: a full-height thumb parked at the top
+    const none = sbThumb(400, 500, 300, 0);
+    try std.testing.expectEqual(@as(f32, 400), none.h);
+    try std.testing.expectEqual(@as(f32, 0), none.y);
+}
+
+/// The bar's track: a 6 px lane hugging `view`'s right edge. Callers that hit-test rows under it exclude it.
+fn vScrollbarTrack(view: t.Rect) t.Rect {
+    return .{ .x = view.x + view.width - 10, .y = view.y + 4, .width = 6, .height = @max(1, view.height - 8) };
+}
+
+/// The bar's INPUT for this frame: drag the thumb (grabbed where it was pressed, so it never jumps under the
+/// cursor), or click the track outside it to move a page toward the click. Returns the offset after this
+/// frame's input, clamped to the content; `drag`/`grab` are the caller's per-bar state.
+fn vScrollbarInput(view: t.Rect, content_h: f32, offset: f32, drag: *bool, grab: *f32) f32 {
+    const max_scroll = @max(0, content_h - view.height);
+    if (max_scroll <= 0) {
+        drag.* = false;
+        return 0;
+    }
+    const track = vScrollbarTrack(view);
+    const th = sbThumb(track.height, view.height, content_h, offset);
+    const thumb = t.Rect{ .x = track.x, .y = track.y + th.y, .width = track.width, .height = th.h };
+    const mp = rl.getMousePosition();
+    var off = std.math.clamp(offset, 0, max_scroll);
+    if (rl.isMouseButtonPressed(.left) and t.hovering(track)) {
+        if (t.hovering(thumb)) {
+            drag.* = true;
+            grab.* = mp.y - thumb.y;
+        } else {
+            off = std.math.clamp(off + (if (mp.y < thumb.y) -view.height else view.height) * 0.9, 0, max_scroll);
+        }
+    }
+    if (!rl.isMouseButtonDown(.left)) drag.* = false;
+    const travel = track.height - th.h;
+    if (drag.* and travel > 0) off = std.math.clamp((mp.y - grab.* - track.y) / travel, 0.0, 1.0) * max_scroll;
+    if (t.hovering(track) or drag.*) t.wantCursor(.pointing_hand);
+    return off;
+}
+
+/// Draw the bar for `offset` (after the caller stored this frame's input): a faint track, a thumb that brightens
+/// under the cursor or while dragged. Nothing while the content fits.
+fn vScrollbarDraw(view: t.Rect, content_h: f32, offset: f32, drag: bool) void {
+    if (content_h - view.height <= 0) return;
+    const track = vScrollbarTrack(view);
+    const th = sbThumb(track.height, view.height, content_h, offset);
+    const hot = drag or t.hovering(track);
+    t.panel(track, t.withAlpha(t.border, 70));
+    t.panel(.{ .x = track.x, .y = track.y + th.y, .width = track.width, .height = th.h }, t.withAlpha(t.fg_dim, if (hot) 210 else 120));
+}
+
+/// Input + draw in one call, for a surface that handles nothing else under the bar (the transcript's input
+/// runs after its messages, so a drag takes effect next frame — the immediate-mode norm here).
+fn vScrollbar(view: t.Rect, content_h: f32, offset: f32, drag: *bool, grab: *f32) f32 {
+    const off = vScrollbarInput(view, content_h, offset, drag, grab);
+    vScrollbarDraw(view, content_h, off, drag.*);
+    return off;
+}
+
 /// The collapsed reasoning-trace line — same shape as toolChip but labeled as the veil's own thinking. Shows
 /// an inline preview of the first line of the thinking so the user sees WHAT is being reasoned without expanding
 /// every trace. Click to expand the full text. Returns true on click (expand/collapse).
@@ -5269,6 +5384,27 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
         ui.chat_scroll -= wheel * 3 * MSG_LINE_H;
         ui.chat_follow = false;
     }
+    // Keys page the transcript too (no wheel needed): PageUp/PageDown always on this tab; Home/End only while
+    // the composer is not focused, where they move the caret. Each is the user's own scroll, so it parks follow
+    // like a wheel tick does — and a PageDown that lands at the bottom re-arms it, like a wheel-down there.
+    var paged_down = false;
+    if (ui.open_dd == .none) {
+        const page_h = @max(MSG_LINE_H * 3, view.height - MSG_LINE_H * 2);
+        const caret = ui.focus == .c_input or ui.focus == .c_rename;
+        if (rl.isKeyPressed(.page_up)) {
+            ui.chat_scroll -= page_h;
+            ui.chat_follow = false;
+        }
+        if (rl.isKeyPressed(.page_down)) {
+            ui.chat_scroll += page_h;
+            paged_down = true;
+        }
+        if (!caret and rl.isKeyPressed(.home)) {
+            ui.chat_scroll = 0;
+            ui.chat_follow = false;
+        }
+        if (!caret and rl.isKeyPressed(.end)) ui.chat_follow = true;
+    }
     const max_scroll = chatScrollLimit(total, view.height, ui.chat_scroll, ui.chat_follow, layout_changed or ui.chat_reflow or ui.chat_view_h != view.height, MSG_LINE_H * 2);
     ui.chat_reflow = false;
     ui.chat_view_h = view.height;
@@ -5281,7 +5417,7 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
     // frames mid-turn, so a reader who wheeled up got clamped to the shifting bottom for one frame and then
     // dragged along with it — the reported rubber-band. Being AT the bottom is not the same as having ASKED
     // to follow it.
-    if (wheel < 0 and t.hovering(view) and ui.chat_scroll >= max_scroll - 1) ui.chat_follow = true;
+    if (((wheel < 0 and t.hovering(view)) or paged_down) and ui.chat_scroll >= max_scroll - 1) ui.chat_follow = true;
 
     // floating "scroll to bottom" (drawn after endScissorMode below): visible only while scrolled away from the
     // bottom — follow re-arms only on a user's own wheel-down/jump/send now, so !chat_follow IS "reading back".
@@ -5410,8 +5546,9 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
     // line geometry captured above. A plain click (no drag) clears the selection. Ctrl+C (handled in handleKeys)
     // copies sel_text. Gated on hovering the chat view + not on a tool/copy chip row.
     const mp = rl.getMousePosition();
-    // (the jump button owns its press — a click on it must not also set an empty selection)
-    if (t.hovering(view) and rl.isMouseButtonPressed(.left) and !(show_jump and t.hovering(jump_r))) {
+    // (the jump button owns its press — a click on it must not also set an empty selection; the scrollbar's
+    // track likewise, and a thumb drag in progress is not a selection drag)
+    if (t.hovering(view) and rl.isMouseButtonPressed(.left) and !(show_jump and t.hovering(jump_r)) and !ui.chat_sb_drag and !t.hovering(vScrollbarTrack(view))) {
         if (selHit(mp.x, mp.y)) |h| {
             ui.sel_msg = h.msg;
             ui.sel_anchor = h.flat;
@@ -5447,6 +5584,17 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
             }
         }
     }
+    // The transcript's scrollbar, outside the scissor at the view's right edge. The wheel, the keys and this all
+    // move chat_scroll; a drag that lands at the bottom re-arms follow exactly as a wheel-down tick there does,
+    // and one that leaves it parks follow like any other reading-back.
+    {
+        const sb_before = ui.chat_scroll;
+        const sb_after = vScrollbar(view, max_scroll + view.height, ui.chat_scroll, &ui.chat_sb_drag, &ui.chat_sb_grab);
+        if (sb_after != sb_before) {
+            ui.chat_scroll = sb_after;
+            ui.chat_follow = sb_after >= max_scroll - 1;
+        }
+    }
 
     // status line — CLIPPED to leave room for the auto-loop label at the right (a long "subtask 5/6 (inline): ..."
     // status would otherwise run under the toggle). The auto-loop label geometry is computed FIRST so the clip
@@ -5478,6 +5626,16 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
         var sb: [128]u8 = undefined;
         const line = std.fmt.bufPrint(&sb, "{s}{s}", .{ if (status.len > 0) status else "working", dstr[dots] }) catch "working";
         t.textClip(line, @intFromFloat(r.x + 4), @intFromFloat(sy), 12, t.cyan, status_clip_w);
+        // the running task's own "cancel", right after its status ("running poll on this machine... 12s"):
+        // ends that one tool and lets the turn go on — Stop, in the send column, is for the whole turn
+        if (ui.run_task_len > 0) {
+            const cl = t.z("cancel", .{});
+            const cw = t.btnW(cl, 18);
+            const lw: f32 = @floatFromInt(@min(t.measure(t.zs(line), 12), status_clip_w));
+            const cr = t.Rect{ .x = r.x + 4 + lw + 10, .y = sy - 3, .width = cw, .height = 18 };
+            if (cr.x + cw < r.x + r.width - ltw - gtw - 28 and t.buttonGhost(cr, cl, t.red, true))
+                store.pushChatCmd(store_mod.mkChatCmd(.task_cancel, ui.run_task[0..ui.run_task_len], ""));
+        }
     } else if (status.len > 0) {
         t.textClip(status, @intFromFloat(r.x + 4), @intFromFloat(sy), 12, t.comment, status_clip_w);
     }
@@ -6111,23 +6269,75 @@ fn drawChatMemory(store: *Store, r: t.Rect) void {
     }
 }
 
-fn drawChatRight(store: *Store, r: t.Rect, open: bool, casts: []const store_mod.CastRow, tail: []const scan.Ev, plan: []const store_mod.PlanRow) void {
+/// "12s" / "2m 05s" — a task's elapsed time, the way a person reads a wait.
+fn fmtElapsed(secs: i64) [:0]const u8 {
+    const s = @max(0, secs);
+    return if (s < 60) t.z("{d}s", .{s}) else t.z("{d}m {d:0>2}s", .{ @divFloor(s, 60), @mod(s, 60) });
+}
+
+/// The right pane's Tasks tab: every program the veil started on this machine and is waiting on — the delegated
+/// tool running for a server turn and the ones queued behind it — with what it is doing, how long it has run,
+/// and a Cancel for each. Cancel ends THAT tool and lets the turn go on (the model is told it was the user);
+/// Stop by the composer ends the whole turn. A poll, a build or a script used to show only as a status-line
+/// timer the user could not act on.
+fn drawChatTasks(store: *Store, r: t.Rect, tasks: []const store_mod.TaskRow) void {
+    var yy: f32 = r.y + 40;
+    if (tasks.len == 0) {
+        t.text(t.z("no tasks running", .{}), @intFromFloat(r.x + 12), @intFromFloat(yy + 6), 13, t.comment);
+        t.text(t.z("a task is a program the veil started", .{}), @intFromFloat(r.x + 12), @intFromFloat(yy + 28), 11, t.comment);
+        t.text(t.z("on this machine and is waiting on:", .{}), @intFromFloat(r.x + 12), @intFromFloat(yy + 44), 11, t.comment);
+        t.text(t.z("a poll, a build, a script, a fetch.", .{}), @intFromFloat(r.x + 12), @intFromFloat(yy + 60), 11, t.comment);
+        t.text(t.z("each shows here with its time and", .{}), @intFromFloat(r.x + 12), @intFromFloat(yy + 84), 11, t.comment);
+        t.text(t.z("a Cancel; the chat stays yours.", .{}), @intFromFloat(r.x + 12), @intFromFloat(yy + 100), 11, t.comment);
+        return;
+    }
+    for (tasks) |*task| {
+        const card = t.Rect{ .x = r.x + 6, .y = yy, .width = r.width - 12, .height = if (task.foreground) 64 else 78 };
+        const accent = if (task.queued) t.border else t.cyan;
+        t.panelBordered(card, t.bg, accent);
+        t.statusDot(@intFromFloat(card.x + 14), @intFromFloat(card.y + 17), if (task.queued) t.comment else t.cyan);
+        const cb_label = t.z("Cancel", .{});
+        const cbw = t.btnW(cb_label, t.BTN_SM);
+        const cb = t.Rect{ .x = card.x + card.width - cbw - 8, .y = card.y + 8, .width = cbw, .height = t.BTN_SM };
+        const when = if (task.queued) t.z("queued", .{}) else fmtElapsed(task.elapsed_s);
+        const ww: f32 = @floatFromInt(t.measure(when, 11));
+        t.textClip(task.toolStr(), @intFromFloat(card.x + 26), @intFromFloat(card.y + 11), 13, t.fg, @intFromFloat(@max(20, cb.x - ww - 16 - (card.x + 26))));
+        t.text(when, @intFromFloat(cb.x - ww - 8), @intFromFloat(card.y + 13), 11, t.comment);
+        if (t.button(cb, cb_label, t.red, true)) store.pushChatCmd(store_mod.mkChatCmd(.task_cancel, task.idStr(), ""));
+        t.textClip(task.detailStr(), @intFromFloat(card.x + 14), @intFromFloat(card.y + 38), 11, t.fg_dim, @intFromFloat(card.width - 28));
+        if (!task.foreground) t.text(t.z("in another chat", .{}), @intFromFloat(card.x + 14), @intFromFloat(card.y + 56), 10, t.comment);
+        yy += card.height + 6;
+    }
+}
+
+fn drawChatRight(store: *Store, r: t.Rect, open: bool, casts: []const store_mod.CastRow, tail: []const scan.Ev, plan: []const store_mod.PlanRow, tasks: []const store_mod.TaskRow) void {
     t.panelBordered(r, t.bg_dark, t.border);
     if (!open) {
         // collapsed rail: a status dot when a cast is live so the user knows to expand it
         const live = casts.len > 0 and (casts[casts.len - 1].status == .deploying or casts[casts.len - 1].status == .running or casts[casts.len - 1].status == .collecting);
         if (live) t.statusDot(@intFromFloat(r.x + r.width / 2), @intFromFloat(r.y + 40), t.green);
+        if (tasks.len > 0) t.statusDot(@intFromFloat(r.x + r.width / 2), @intFromFloat(r.y + 58), t.cyan); // ...and when a task runs
         if (t.buttonGhost(.{ .x = r.x + 2, .y = r.y + 5, .width = r.width - 4, .height = 24 }, t.z("<", .{}), t.blue, true)) togglePane(store, false);
         return;
     }
-    // collapse chevron + the "Swarm activity | Memory" tab strip (Memory = durable keys/logins/prefs the AI keeps)
+    // collapse chevron + the "Activity | Tasks | Memory" tab strip (Tasks = programs running on this machine for a
+    // turn; Memory = durable keys/logins/prefs the AI keeps)
     if (t.buttonGhost(.{ .x = r.x + r.width - 32, .y = r.y + 7, .width = 26, .height = 24 }, t.z(">", .{}), t.blue, true)) togglePane(store, false);
     const tl_act = t.z("Activity", .{});
+    const tl_tasks = if (tasks.len > 0) t.z("Tasks ({d})", .{tasks.len}) else t.z("Tasks", .{});
     const tl_mem = t.z("Memory", .{});
-    if (t.tab(.{ .x = r.x + 8, .y = r.y + 7, .width = t.tabW(tl_act), .height = 24 }, tl_act, ui.right_tab == .activity)) ui.right_tab = .activity;
-    if (t.tab(.{ .x = r.x + 8 + t.tabW(tl_act) + 6, .y = r.y + 7, .width = t.tabW(tl_mem), .height = 24 }, tl_mem, ui.right_tab == .memory)) ui.right_tab = .memory;
+    var tx = r.x + 8;
+    if (t.tab(.{ .x = tx, .y = r.y + 7, .width = t.tabW(tl_act), .height = 24 }, tl_act, ui.right_tab == .activity)) ui.right_tab = .activity;
+    tx += t.tabW(tl_act) + 6;
+    if (t.tab(.{ .x = tx, .y = r.y + 7, .width = t.tabW(tl_tasks), .height = 24 }, tl_tasks, ui.right_tab == .tasks)) ui.right_tab = .tasks;
+    tx += t.tabW(tl_tasks) + 6;
+    if (t.tab(.{ .x = tx, .y = r.y + 7, .width = t.tabW(tl_mem), .height = 24 }, tl_mem, ui.right_tab == .memory)) ui.right_tab = .memory;
     if (ui.right_tab == .memory) {
         drawChatMemory(store, r);
+        return;
+    }
+    if (ui.right_tab == .tasks) {
+        drawChatTasks(store, r, tasks);
         return;
     }
 
@@ -9610,6 +9820,7 @@ fn drawSettings(store: *Store, frame: t.Rect) void {
     const narr_on = store.settings.narrator; // snapshot under THIS lock (these two were read unlocked below)
     const bh_on = store.settings.browser_headful;
     const fast_on = store.settings.fast_reasoning;
+    const tool_map_on = store.settings.tool_map;
     const online = store.server_online;
     const chat_kind = store.settings.chat_kind;
     const chat_byok = store.settings.chat_byok;
@@ -9710,6 +9921,8 @@ fn drawSettings(store: *Store, frame: t.Rect) void {
         tog_w = @max(tog_w, t.btnW(t.z("text weight: Normal", .{}), 32));
         tog_w = @max(tog_w, t.btnW(t.z("narrator: OFF", .{}), 32));
         tog_w = @max(tog_w, t.btnW(t.z("browser window: SHOWN", .{}), 32));
+        tog_w = @max(tog_w, t.btnW(t.z("reasoning: ADVANCED", .{}), 32));
+        tog_w = @max(tog_w, t.btnW(t.z("tool map: OFF", .{}), 32));
         tog_w = @max(tog_w, t.btnW(size_name, 32));
 
         // ---- APPEARANCE & ACCESSIBILITY -------------------------------------------------------------------
@@ -9792,6 +10005,12 @@ fn drawSettings(store: *Store, frame: t.Rect) void {
         if (settingRow(x, &y, tog_w, if (fast_on) t.z("reasoning: FAST", .{}) else t.z("reasoning: ADVANCED", .{}), !fast_on, t.z("advanced: look before planning, and re-check course mid-task. costs an extra model call per turn. fast: skip both.", .{}))) {
             store.lock();
             store.settings.fast_reasoning = !store.settings.fast_reasoning;
+            store.unlock();
+            store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
+        }
+        if (settingRow(x, &y, tog_w, if (tool_map_on) t.z("tool map: ON", .{}) else t.z("tool map: OFF", .{}), tool_map_on, t.z("experimental (NL_TOOL_MAP=1): let the model explore tools as a tree. applies to the next server chat message.", .{}))) {
+            store.lock();
+            store.settings.tool_map = !store.settings.tool_map;
             store.unlock();
             store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
         }

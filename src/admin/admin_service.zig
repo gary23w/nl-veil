@@ -6,6 +6,7 @@ const http = @import("../gateway/http.zig");
 const ent = @import("../plan/entitlements.zig");
 const chat_service = @import("../worker/chat/service.zig");
 const server_config = @import("../config/server_config.zig");
+const Swarm = @import("../worker/control/supervisor.zig").Swarm;
 const App = http.App;
 const requireAdmin = http.requireAdmin;
 const badReq = http.badReq;
@@ -53,7 +54,7 @@ pub fn adminSetRecipeGrant(app: *App, req: *httpz.Request, res: *httpz.Response)
     const target = app.auth.userById(uid) orelse return notFound(res);
     const body = (req.json(RecipeGrantReq) catch return badReq(res, "malformed JSON body")) orelse return badReq(res, "bad body");
     if (body.granted) _ = app.recipes.get(name) orelse return notFound(res);
-    _ = app.auth.setToolGrant(target.email, name, body.granted);
+    _ = app.auth.setToolGrant(target.email, name, body.granted) catch return serverErr(res, "could not persist recipe grant");
     // Record WHO the grant was for — the log could not previously answer "who holds this recipe?", which
     // is the first question asked when a recipe turns out to be dangerous.
     const what = std.fmt.allocPrint(res.arena, "{s} -> uid {d} ({s})", .{ name, uid, target.email }) catch name;
@@ -185,6 +186,7 @@ pub fn adminCreateUser(app: *App, req: *httpz.Request, res: *httpz.Response) !vo
         error.EmailTaken => badReq(res, "that email already has an account"),
         error.BadEmail => badReq(res, "that is not a valid email address"),
         error.WeakInput => badReq(res, "password must be 8-200 characters"),
+        error.StorageFailure => http.serverErr(res, "could not persist account"),
         else => badReq(res, "could not create the account"),
     };
     // Logged because account creation is exactly what an operator needs to reconstruct afterwards:
@@ -251,13 +253,20 @@ pub fn adminModerate(app: *App, req: *httpz.Request, res: *httpz.Response) !void
     const admin = requireAdmin(app, req, res) orelse return;
     const body = (req.json(ModReq) catch return badReq(res, "malformed JSON body")) orelse return badReq(res, "bad body");
     if (std.ascii.eqlIgnoreCase(body.email, admin.email)) return badReq(res, "cannot moderate your own admin account");
+    // A live worker holds the account's provider context even after sessions are
+    // revoked. Stop it on ban/delete, including when persistence reports an error.
+    const revokes = std.mem.eql(u8, body.action, "ban") or std.mem.eql(u8, body.action, "delete");
+    const target_uid = if (revokes) app.auth.idForEmail(body.email) else null;
+    defer {
+        if (target_uid) |uid| _ = app.sup.pauseUserSwarms(uid);
+    }
     var ok = false;
     if (std.mem.eql(u8, body.action, "ban")) {
-        ok = app.auth.setBanned(body.email, true);
+        ok = app.auth.setBanned(body.email, true) catch return serverErr(res, "could not persist moderation");
     } else if (std.mem.eql(u8, body.action, "unban")) {
-        ok = app.auth.setBanned(body.email, false);
+        ok = app.auth.setBanned(body.email, false) catch return serverErr(res, "could not persist moderation");
     } else if (std.mem.eql(u8, body.action, "delete")) {
-        ok = app.auth.deleteUser(body.email);
+        ok = app.auth.deleteUser(body.email) catch return serverErr(res, "could not persist account deletion");
     } else return badReq(res, "unknown action (ban|unban|delete)");
     if (!ok) return notFound(res);
     app.audit.record(admin.email, body.action, body.email);
@@ -285,7 +294,13 @@ pub fn adminKill(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const admin = requireAdmin(app, req, res) orelse return;
     const id = req.param("id") orelse return badReq(res, "no id");
     if (app.sup.get(id) == null) return notFound(res);
-    app.sup.remove(id);
+    app.sup.remove(id) catch |err| switch (err) {
+        error.WorkerStillStopping => {
+            res.status = 202;
+            return res.json(.{ .ok = true, .stopping = true, .killed = false }, .{});
+        },
+        else => return serverErr(res, "could not settle worker usage"),
+    };
     app.audit.record(admin.email, "kill_swarm", id);
     try res.json(.{ .ok = true, .killed = true }, .{});
 }
@@ -364,9 +379,9 @@ test "no god-mode route answers a stranger, or an ordinary logged-in user" {
     var ta = try http.testApp(gpa, io, "zig-admin-gate-tmp");
     defer ta.deinit();
 
-    // No store probe needed: Auth keeps users and sessions in memory and fails open on the write,
-    // so this runs on a clean checkout (ledger 0030). uid 1 is admin by default (isAdmin falls back
-    // to id == 1 with no admin_email), so the SECOND account is the ordinary user under test.
+    // A missing datastore skips this gate sweep because registration now requires a confirmed write.
+    // uid 1 is admin by default (isAdmin falls back to id == 1 with no admin_email), so the SECOND
+    // account is the ordinary user under test.
     ta.auth.register("boss@example.test", "correct horse battery") catch return error.SkipZigTest;
     ta.auth.register("normal@example.test", "correct horse battery") catch return error.SkipZigTest;
     const tok = ta.auth.login("normal@example.test", "correct horse battery") catch return error.SkipZigTest;
@@ -411,8 +426,32 @@ test "moderation: a ban bites, an admin cannot ban themselves, and the act lands
     var ta = try http.testApp(gpa, io, "zig-admin-mod-tmp");
     defer ta.deinit();
 
+    const probe = "bmxfdmVpbF9hZG1pbl9tb2RlcmF0aW9uX3Byb2Jl";
+    ta.auth.nb.put("nl_admin_moderation_probe", probe) catch return error.SkipZigTest;
+    const got = (ta.auth.nb.get("nl_admin_moderation_probe") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer gpa.free(got);
+    if (!std.mem.eql(u8, got, probe)) return error.SkipZigTest;
+
     ta.auth.register("boss@example.test", "correct horse battery") catch return error.SkipZigTest;
     ta.auth.register("victim@example.test", "correct horse battery") catch return error.SkipZigTest;
+    try std.testing.expect(try ta.auth.setToolGrant("victim@example.test", "research_brief", true));
+    try std.testing.expect(!(try ta.auth.setToolGrant("victim@example.test", "research_brief", true)));
+    try std.testing.expect(http.Auth.hasToolGrant(ta.auth.userById(2).?, "research_brief"));
+    {
+        var reloaded = http.Auth.init(gpa, ta.auth.nb);
+        defer reloaded.deinit();
+        try reloaded.warm();
+        try std.testing.expect(http.Auth.hasToolGrant(reloaded.userById(2).?, "research_brief"));
+    }
+    try std.testing.expect(try ta.auth.setToolGrant("victim@example.test", "research_brief", false));
+    try std.testing.expect(!(try ta.auth.setToolGrant("victim@example.test", "research_brief", false)));
+    try std.testing.expect(!http.Auth.hasToolGrant(ta.auth.userById(2).?, "research_brief"));
+    {
+        var reloaded = http.Auth.init(gpa, ta.auth.nb);
+        defer reloaded.deinit();
+        try reloaded.warm();
+        try std.testing.expect(!http.Auth.hasToolGrant(reloaded.userById(2).?, "research_brief"));
+    }
     const admin_tok = ta.auth.login("boss@example.test", "correct horse battery") catch return error.SkipZigTest;
     defer gpa.free(admin_tok);
     const cookie = try std.fmt.allocPrint(gpa, http.COOKIE ++ "={s}", .{admin_tok});
@@ -437,6 +476,13 @@ test "moderation: a ban bites, an admin cannot ban themselves, and the act lands
         try adminModerate(&ta.app, web.req, web.res);
         try web.expectStatus(400);
     }
+    const victim_uid = ta.auth.idForEmail("victim@example.test").?;
+    const run_dir = try std.fmt.allocPrint(gpa, "{s}/victim-swarm", .{ta.root});
+    defer gpa.free(run_dir);
+    _ = try std.Io.Dir.cwd().createDirPathStatus(io, run_dir, .default_dir);
+    var live: Swarm = .{ .id = "victim-live", .uid = victim_uid, .name = "victim", .run_dir = run_dir, .model = "mock", .minds = 1, .created = 1, .state = .running };
+    try ta.sup.swarms.put(gpa, live.id, &live);
+    defer ta.sup.swarms.deinit(gpa);
     // A real ban lands...
     {
         var web = httpz.testing.init(.{});
@@ -446,8 +492,29 @@ test "moderation: a ban bites, an admin cannot ban themselves, and the act lands
         try adminModerate(&ta.app, web.req, web.res);
         try web.expectStatus(200);
     }
+    try std.testing.expectEqual(@as(@TypeOf(live.state), .stopped), live.state);
+    const stop_path = try std.fmt.allocPrint(gpa, "{s}/STOP", .{run_dir});
+    defer gpa.free(stop_path);
+    try std.Io.Dir.cwd().access(io, stop_path, .{});
     // ...and bites: a banned account cannot log back in, which is the whole point of a ban.
     try std.testing.expectError(error.BadCredentials, ta.auth.login("victim@example.test", "correct horse battery"));
+    // A successful delete removes both the live user and its stored record (checked by deleteUser).
+    {
+        var web = httpz.testing.init(.{});
+        defer web.deinit();
+        web.header("cookie", cookie);
+        web.json(.{ .email = "victim@example.test", .action = "delete" });
+        try adminModerate(&ta.app, web.req, web.res);
+        try web.expectStatus(200);
+    }
+    try std.testing.expect(ta.auth.idForEmail("victim@example.test") == null);
+    {
+        var reloaded = http.Auth.init(gpa, ta.auth.nb);
+        defer reloaded.deinit();
+        try reloaded.warm();
+        try std.testing.expect(reloaded.idForEmail("victim@example.test") == null);
+        try std.testing.expect(reloaded.idForEmail("boss@example.test") != null);
+    }
     // Moderating someone who does not exist is a 404, not a silent success.
     {
         var web = httpz.testing.init(.{});

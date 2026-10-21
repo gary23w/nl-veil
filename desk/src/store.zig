@@ -387,6 +387,8 @@ pub const Settings = struct {
     // work is still aimed at the goal. Both cost an extra model call. Fast mode skips them for a quicker,
     // cheaper turn, and is sent per-message so it can be flipped without restarting anything.
     fast_reasoning: bool = false,
+    // Opt-in tool tree (NL_TOOL_MAP=1), sent per message so toggling needs no server restart.
+    tool_map: bool = false,
 
     pub fn dataDir(s: *const Settings) []const u8 {
         return s.data_dir[0..s.data_dir_len];
@@ -686,6 +688,33 @@ pub const PlanRow = struct {
 };
 pub const MAX_PLAN = 32; // == the server plan-board's MAX_TASKS cap
 
+/// One TASK: a program the veil started on this machine and is waiting on — the delegated tool the chat thread
+/// is running (or has queued) for a server turn. The right pane's Tasks tab lists these with their elapsed time
+/// and a Cancel, so a long wait (a poll, a build, a script) is visible and stoppable without stopping the whole
+/// turn. Chat thread writes (publishTasks, every tick while one runs), UI reads — the casts/plan discipline.
+pub const TaskRow = struct {
+    id: [160]u8 = [_]u8{0} ** 160, // the server's tool call id — what a cancel names
+    id_len: u8 = 0,
+    tool: [64]u8 = [_]u8{0} ** 64,
+    tool_len: u8 = 0,
+    detail: [120]u8 = [_]u8{0} ** 120, // what it is doing, from its args (a poll's target, a script's first line)
+    detail_len: u8 = 0,
+    elapsed_s: i64 = 0, // seconds since launch (0 while queued)
+    queued: bool = false, // waiting its turn behind the running one
+    foreground: bool = true, // belongs to the conversation on screen (false: a background chat's turn)
+
+    pub fn idStr(r: *const TaskRow) []const u8 {
+        return r.id[0..r.id_len];
+    }
+    pub fn toolStr(r: *const TaskRow) []const u8 {
+        return r.tool[0..r.tool_len];
+    }
+    pub fn detailStr(r: *const TaskRow) []const u8 {
+        return r.detail[0..r.detail_len];
+    }
+};
+pub const MAX_TASKS = 5; // the one running delegated tool + the chat thread's 4-slot queue
+
 pub const MAX_SCHED = 32;
 pub const MAX_CF_MODELS = 64; // live Workers AI models fetched from the connected Cloudflare account
 
@@ -866,7 +895,7 @@ pub const LlmModelRow = struct {
 /// One local day of activity (the 14-day bars). `day` = local epoch-day from the server.
 pub const LlmDay = struct { day: i64 = 0, tin: u64 = 0, tout: u64 = 0, calls: u64 = 0 };
 
-pub const ChatCmdKind = enum { none, send, steer_turn, new_conv, branch_conv, select_conv, rename_conv, delete_conv, stop_cast, save_settings, save_key, console_run, console_cancel, loop_kick, stop_turn, chat_open_file, chat_open_folder, forget_mem, console_approve, console_deny, prop_accept, prop_reject, set_github_pat, set_github_user };
+pub const ChatCmdKind = enum { none, send, steer_turn, new_conv, branch_conv, select_conv, rename_conv, delete_conv, stop_cast, save_settings, save_key, console_run, console_cancel, loop_kick, stop_turn, chat_open_file, chat_open_folder, forget_mem, console_approve, console_deny, prop_accept, prop_reject, set_github_pat, set_github_user, task_cancel };
 
 // ---- SUB-CHAT id convention (LOCAL TWIN of the server's chat/paths.zig branchParts/branchRoot — kept
 // verbatim so the two mappings can never drift). A sub-chat's conv id is "<parent>__s<N>" (N = 1..5):
@@ -1121,6 +1150,8 @@ pub const Store = struct {
     cast_tail_count: usize = 0,
     plan: [MAX_PLAN]PlanRow = undefined, // the ACTIVE conv's plan-board checklist (chat watchPlan writes, UI reads)
     plan_count: usize = 0,
+    tasks: [MAX_TASKS]TaskRow = undefined, // the delegated tools running/queued on this machine (chat publishTasks writes, UI reads)
+    task_count: usize = 0,
     // per-call chat performance ring (chat worker appends, Metrics tab reads)
     turn_metrics: [METRIC_RING]TurnMetric = undefined,
     turn_metric_count: usize = 0, // total samples recorded (may exceed the ring; @min with METRIC_RING to iterate)

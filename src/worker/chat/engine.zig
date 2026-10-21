@@ -422,7 +422,7 @@ const PLAN_PROMPT =
     "appear — not \"it works well\"), and a \"watch_for\" list of failure modes you expect on THIS task. Give each " ++
     "subtask its own short \"done_when\" too, and a \"tool_hint\" naming the single tool you expect it to use " ++
     "(e.g. write_file, edit_file, read_file, list_dir, poll, web_fetch, read_url, web_search, read_doc, " ++
-    "recall_hive, run_python, open_subchat, cast — or \"\" if unsure). PLAN ONLY WHAT WAS ASKED: a request to " ++
+    "recall_hive, run_python, run_shell, open_subchat, cast — or \"\" if unsure). PLAN ONLY WHAT WAS ASKED: a request to " ++
     "run, measure, count, check, compare or report something is satisfied by doing exactly that and reporting " ++
     "what came back — never add a subtask that fixes, refactors, extends or improves what the user did not ask " ++
     "to change, and never edit the thing you were asked to measure so that it matches an expectation; a failing " ++
@@ -541,7 +541,7 @@ var chat_vcs_mtx: std.Io.Mutex = .init;
 
 const SYSTEM_PROMPT =
     "You are veil, a helpful coding and research assistant. You have tools: web_search / web_fetch / read_url " ++
-    "for the live web, read_file / write_file / edit_file / list_dir / run_python / run_tests to build and run " ++
+    "for the live web, read_file / write_file / edit_file / list_dir / run_python / run_shell / run_tests to build and run " ++
     "code in your working directory, and observe / recall / recall_hive for memory. Use a tool when it genuinely " ++
     "helps; call tools one or more times, then when you have what you need reply to the user directly in plain " ++
     "prose. Keep answers concrete and grounded in what the tools actually returned.\n" ++
@@ -594,7 +594,9 @@ const SYSTEM_PROMPT =
     "BUILD DISCIPLINE -- write code to FILES with write_file/edit_file, do not paste whole files into the chat. " ++
     "DON'T THRASH: once a file is written, do not rewrite the whole thing next turn -- if it is correct, move to " ++
     "the next file/step; if it needs a change, edit_file the specific part. read_file before you edit. After " ++
-    "writing code, run_tests (or run_python) to verify, read the result, fix, and repeat until it actually works.\n" ++
+    "writing code, run_tests (or run_python) to verify, read the result, fix, and repeat until it actually works. " ++
+    "If run_python reports that python is not found, install it yourself with run_shell (winget on Windows, brew on " ++
+    "macOS, apt on Debian/Ubuntu), then tool_env refresh_path, then retry; never tell the user the tools are broken.\n" ++
     "DURABLE MEMORY. Anything PERSONAL to THIS user that should persist across conversations -- a key, login, " ++
     "credential, preference, or a fact about them or their environment -- record with a `REMEMBER:` line, NOT " ++
     "observe (observe is the shared hive's knowledge). Format, one per line, alongside your normal reply:\n" ++
@@ -2725,7 +2727,21 @@ test "a paste is spilled by size AND shape: a long request stays a request, 300 
     try std.testing.expectEqual(@as(usize, 303), countLines(big.items));
 }
 
-pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text_raw: []const u8, loop: u8, tool_client_req: bool, image_b64: []const u8, fast: bool, trace_req: bool, garrett_req: bool) void {
+fn toolMapEnabled(requested: ?bool, env_value: ?[]const u8) bool {
+    return requested orelse if (env_value) |v| (v.len > 0 and v[0] != '0' and !std.ascii.eqlIgnoreCase(v, "off")) else false;
+}
+
+test "tool map: per-turn preference overrides environment, absent preserves it" {
+    try std.testing.expect(toolMapEnabled(true, null));
+    try std.testing.expect(toolMapEnabled(true, "0"));
+    try std.testing.expect(!toolMapEnabled(false, "1"));
+    try std.testing.expect(toolMapEnabled(null, "1"));
+    for ([_]?[]const u8{ null, "", "0", "off", "OFF" }) |value| {
+        try std.testing.expect(!toolMapEnabled(null, value));
+    }
+}
+
+pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text_raw: []const u8, loop: u8, tool_client_req: bool, image_b64: []const u8, fast: bool, trace_req: bool, garrett_req: bool, tool_map_req: ?bool) void {
     const gpa = app.gpa;
 
     // TOOL DELEGATION IS ADMIN-ONLY, and the check belongs HERE rather than at the delegation branch.
@@ -3116,7 +3132,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
         }
     }
 
-    // THE TOOL MAP (belt.zig) — opt-in by NL_TOOL_MAP=1 while it proves itself live. The belt becomes a tree the
+    // THE TOOL MAP (belt.zig) — opt-in by Desk's setting or NL_TOOL_MAP=1. The belt becomes a tree the
     // model walks: a small model keeps toolmap.CORE_SMALL in hand and walks everything else; a mid/large model keeps
     // the whole built-in belt it reads fine today and walks only the discovered families (security / cloud /
     // plugins), the ones that grow without bound. The tools array is then whatever is OPEN — rebuilt by
@@ -3131,7 +3147,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     defer if (map_walk) |*mw| mw.deinit();
     var map_core: ?[]u8 = null;
     defer if (map_core) |c| gpa.free(c);
-    const map_on = if (ctx.environ.get("NL_TOOL_MAP")) |v| (v.len > 0 and v[0] != '0' and !std.ascii.eqlIgnoreCase(v, "off")) else false;
+    const map_on = toolMapEnabled(tool_map_req, ctx.environ.get("NL_TOOL_MAP"));
     if (map_on) map: {
         const split = toolmap.splitBelt(gpa, turn_tools, compact_belt) catch break :map;
         defer gpa.free(split.map);
@@ -6975,6 +6991,7 @@ pub const TurnArgs = struct {
     /// FAST MODE: this turn opted out of the advanced-reasoning passes (see the Body field in chat/service.zig).
     /// False = the default = advanced.
     fast: bool,
+    tool_map: ?bool,
     trace: bool,
     /// AGENT GARRETT: the client asked for the user's own blue-team agent on the belt (see the Body field in
     /// chat/service.zig). runTurn derives the pair itself; false = the default = no such verbs.
@@ -6984,7 +7001,7 @@ pub const TurnArgs = struct {
 /// Detached-thread entry: run the whole turn, then free the owned args. Any failure inside runTurn is already
 /// caught + surfaced as an event, so this thread returns cleanly (never propagates an error that could abort it).
 fn turnThread(args: *TurnArgs) void {
-    runTurn(args.app, args.uid, args.conv, args.trio, args.text, args.loop, args.tool_client, args.image_b64, args.fast, args.trace, args.garrett);
+    runTurn(args.app, args.uid, args.conv, args.trio, args.text, args.loop, args.tool_client, args.image_b64, args.fast, args.trace, args.garrett, args.tool_map);
     endTurn(args.app.io, args.conv); // release the per-conv turn lock (before freeing the blob `conv` points into)
     signalDone(args.app, args.uid, args.conv); // ...and only now is the turn genuinely over for the client
     if (llm.isLocal(args.trio.coding.base_url)) releaseLocal(args.app.io); // release the machine-sized local slot (admission keys on the coding/base model)
@@ -6998,7 +7015,7 @@ fn turnThread(args: *TurnArgs) void {
 /// block the client's /events poll for the whole turn). On an
 /// allocation or thread-spawn failure it runs the turn INLINE (blocking the caller) rather than drop it — the
 /// caller's arg slices are still valid at that point. The turn writes its frames to events.jsonl either way.
-pub fn spawnTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, text: []const u8, loop: u8, tool_client: bool, image_b64: []const u8, fast: bool, trace: bool, garrett_req: bool) void {
+pub fn spawnTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, text: []const u8, loop: u8, tool_client: bool, image_b64: []const u8, fast: bool, trace: bool, garrett_req: bool, tool_map_req: ?bool) void {
     const gpa = app.gpa;
     const c = trio.coding;
     const t = trio.thinking;
@@ -7013,7 +7030,7 @@ pub fn spawnTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, text: [
     // must release it. The detached/inline turnThread paths release in turnThread; the two alloc-failure inline
     // paths run the turn directly, so they release explicitly. Local-slot release keys on the coding/base model.
     const args = gpa.create(TurnArgs) catch {
-        runTurn(app, uid, conv, trio, text, loop, tool_client, image_b64, fast, trace, garrett_req);
+        runTurn(app, uid, conv, trio, text, loop, tool_client, image_b64, fast, trace, garrett_req, tool_map_req);
         endTurn(app.io, conv);
         signalDone(app, uid, conv);
         if (llm.isLocal(c.base_url)) releaseLocal(app.io);
@@ -7021,7 +7038,7 @@ pub fn spawnTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, text: [
     };
     const blob = gpa.alloc(u8, total) catch {
         gpa.destroy(args);
-        runTurn(app, uid, conv, trio, text, loop, tool_client, image_b64, fast, trace, garrett_req);
+        runTurn(app, uid, conv, trio, text, loop, tool_client, image_b64, fast, trace, garrett_req, tool_map_req);
         endTurn(app.io, conv);
         signalDone(app, uid, conv);
         if (llm.isLocal(c.base_url)) releaseLocal(app.io);
@@ -7037,7 +7054,7 @@ pub fn spawnTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, text: [
         .thinking = .{ .base_url = dupInto(blob, &o, t.base_url), .key = dupInto(blob, &o, t.key), .model = dupInto(blob, &o, t.model) },
         .prompting = .{ .base_url = dupInto(blob, &o, p.base_url), .key = dupInto(blob, &o, p.key), .model = dupInto(blob, &o, p.model) },
     };
-    args.* = .{ .app = app, .uid = uid, .blob = blob, .conv = cv, .trio = owned, .text = tx, .loop = loop, .tool_client = tool_client, .image_b64 = ib, .fast = fast, .trace = trace, .garrett = garrett_req };
+    args.* = .{ .app = app, .uid = uid, .blob = blob, .conv = cv, .trio = owned, .text = tx, .loop = loop, .tool_client = tool_client, .image_b64 = ib, .fast = fast, .tool_map = tool_map_req, .trace = trace, .garrett = garrett_req };
     if (std.Thread.spawn(.{}, turnThread, .{args})) |th| {
         th.detach();
     } else |_| {
@@ -9445,7 +9462,7 @@ fn openSubchatTool(app: *App, uid: u64, conv: []const u8, conv_dir: []const u8, 
     // A sub-chat runs on the DEFAULTS, exactly as this call site already does for loop and tool_client:
     // it works unattended on a branch nobody is watching, which is precisely where advanced reasoning
     // earns its cost. The parent's fast-mode choice was about the parent's own latency.
-    spawnTurn(app, uid, bid, trio, goal, 0, false, "", false, false, false);
+    spawnTurn(app, uid, bid, trio, goal, 0, false, "", false, false, false, null);
     return std.fmt.allocPrint(gpa, "{{\"ok\":true,\"tool\":\"open_subchat\",\"sub\":\"s{d}\",\"conv\":\"{s}\",\"note\":\"sub-chat s{d} opened and its first turn is RUNNING server-side on that goal. It shares this chat's workspace and memory — its findings become recallable here (recall) as it works. Tell the user it opened as tab s{d}; check its progress later via recall or by switching to the tab.\"}}", .{ free_n, bid, free_n, free_n }) catch emptyRes();
 }
 
@@ -10350,12 +10367,18 @@ fn delegateTool(app: *App, conv_dir: []const u8, id_in: []const u8, name: []cons
     const CLIENT_TOOL_TIMEOUT_S: i64 = 180; // patience from t0 AND from each fresh ack/heartbeat
     var acked = false;
     var stopped = false;
-    if (awaitClientResult(app, conv_dir, id, ctrl_cursor, start_offset, CLIENT_ACK_TIMEOUT_S, CLIENT_TOOL_TIMEOUT_S, &acked, &stopped)) |result| {
+    var steered = false;
+    // A delegated `poll` gives way to a user message exactly as the in-process one does (pollTool answers
+    // .steered at its next sample): the desk runs it as a subprocess that cannot see this turn's control
+    // channel, so the turn watches on its behalf. Any other tool runs to its end — a build or a script is not
+    // something a passing remark should kill; an explicit cancel is the desk's (it posts the result).
+    const yields_to_steer = std.mem.eql(u8, name, "poll");
+    if (awaitClientResult(app, conv_dir, id, ctrl_cursor, start_offset, CLIENT_ACK_TIMEOUT_S, CLIENT_TOOL_TIMEOUT_S, &acked, &stopped, yields_to_steer, &steered)) |result| {
         no_ack_streak.* = 0; // a real round-trip — the bridge is alive, forget any earlier silence
         return result;
     }
-    // The wait is being ABANDONED (stop / crash / silence) — tell the client so, by id. Without this frame the
-    // desk keeps running the tool to its own timeout (a poll runs up to 180s), keeps showing its "running"
+    // The wait is being ABANDONED (stop / steer / crash / silence) — tell the client so, by id. Without this frame
+    // the desk keeps running the tool to its own timeout (a poll runs up to 180s), keeps showing its "running"
     // chip, and its eventual result POST lands in a turn that no longer exists — observed live as a poll the
     // user could not stop and a chip that never cleared ("why does it show the poll still running?").
     {
@@ -10369,10 +10392,12 @@ fn delegateTool(app: *App, conv_dir: []const u8, id_in: []const u8, name: []cons
         };
         if (built_cancel) emitEvent(app, conv_dir, cv.items);
     }
-    if (acked) no_ack_streak.* = 0 // the client picked it up and then died mid-run — present, just crashed
+    if (acked or steered) no_ack_streak.* = 0 // the client picked it up and then died mid-run — present, just crashed
     else if (!stopped) no_ack_streak.* += 1; // pure silence counts toward absence (a stop is the user, not the bridge)
     return gpa.dupe(u8, if (stopped)
         "(STOP requested by the user — this tool call was canceled, not failed. Do NOT retry it; acknowledge the stop and end the turn.)"
+    else if (steered)
+        "poll -> interrupted — a user message arrived while you were waiting; it follows as the next user message. Act on it instead of polling again."
     else if (acked)
         "(the client started this tool but stopped answering before returning a result — it may have crashed mid-run; verify the state before retrying)"
     else
@@ -10390,8 +10415,10 @@ const CLIENT_HARD_CAP_S: i64 = 1200;
 /// not O(whole file) every 150ms). The deadline starts at `no_ack_timeout_s`; every fresh ack the client
 /// posts for this id (the desk heartbeats while its tool subprocess runs) extends it to now + `ack_patience_s`,
 /// capped at CLIENT_HARD_CAP_S total. `saw_ack` (optional) reports whether the client ever acked, so the caller
-/// can tell "client gone" from "client died mid-run". gpa-owned result; null = stopped or timed out.
-fn awaitClientResult(app: *App, conv_dir: []const u8, id: []const u8, ctrl_cursor: usize, start_offset: usize, no_ack_timeout_s: i64, ack_patience_s: i64, saw_ack: ?*bool, saw_stop: ?*bool) ?[]u8 {
+/// can tell "client gone" from "client died mid-run". With `yield_to_steer`, a mid-turn steer waiting on the
+/// control channel ends the wait too (`saw_steer` says so) — the peek the in-process tools get through
+/// toolShouldStop, for a wait that is only a wait. gpa-owned result; null = stopped, steered or timed out.
+fn awaitClientResult(app: *App, conv_dir: []const u8, id: []const u8, ctrl_cursor: usize, start_offset: usize, no_ack_timeout_s: i64, ack_patience_s: i64, saw_ack: ?*bool, saw_stop: ?*bool, yield_to_steer: bool, saw_steer: ?*bool) ?[]u8 {
     const t0 = nowSecs(app.io);
     var deadline = t0 + no_ack_timeout_s;
     const hard_cap = t0 + CLIENT_HARD_CAP_S;
@@ -10405,8 +10432,14 @@ fn awaitClientResult(app: *App, conv_dir: []const u8, id: []const u8, ctrl_curso
             if (saw_stop) |ss| ss.* = true;
             return null;
         }
+        // The result is read BEFORE the steer peek: a desk that already interrupted its own poll on the same
+        // message posted "interrupted" as the result, and that answer wins over abandoning the wait.
         const chan = scanToolChannel(app, conv_dir, id, &cursor);
         if (chan.result) |r| return r;
+        if (yield_to_steer and steerPendingSince(app, conv_dir, ctrl_cursor)) {
+            if (saw_steer) |ss| ss.* = true;
+            return null;
+        }
         if (chan.acks > 0) { // fresh acks since the last poll — client is alive and working
             if (saw_ack) |sa| sa.* = true;
             const fresh = nowSecs(app.io) + ack_patience_s;
@@ -10471,7 +10504,7 @@ fn syncExchange(app: *App, conv_dir: []const u8, workdir: []const u8, ctrl_curso
     if (!built) return null;
     const start_offset = toolResultsLen(app, conv_dir);
     emitEvent(app, conv_dir, ev.items);
-    const resp = awaitClientResult(app, conv_dir, id, ctrl_cursor, start_offset, SYNC_WAIT_S, SYNC_WAIT_S, null, null) orelse return null;
+    const resp = awaitClientResult(app, conv_dir, id, ctrl_cursor, start_offset, SYNC_WAIT_S, SYNC_WAIT_S, null, null, false, null) orelse return null;
     defer gpa.free(resp);
     // .alloc_always is load-bearing: parseFromSlice's default hands back every escape-free string as a slice
     // INTO `resp`, which is freed on the way out — and the manifest's paths and hashes outlive this function.
@@ -10581,7 +10614,7 @@ fn pullRequest(app: *App, conv_dir: []const u8, ctrl_cursor: usize, root: []cons
     if (!built) return null;
     const start_offset = toolResultsLen(app, conv_dir);
     emitEvent(app, conv_dir, ev.items);
-    const resp = awaitClientResult(app, conv_dir, id, ctrl_cursor, start_offset, SYNC_WAIT_S, SYNC_WAIT_S, null, null) orelse return null;
+    const resp = awaitClientResult(app, conv_dir, id, ctrl_cursor, start_offset, SYNC_WAIT_S, SYNC_WAIT_S, null, null, false, null) orelse return null;
     defer gpa.free(resp);
     // .alloc_always: the parsed paths and contents outlive `resp`, which is freed on the way out
     return std.json.parseFromSlice(cync.PullResp, gpa, resp, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch null;
@@ -10916,6 +10949,48 @@ fn runRouted(app: *App, ctx: *tools.ToolCtx, conv_dir: []const u8, ctrl_cursor: 
         .client => delegateTool(app, conv_dir, id, name, args, ctrl_cursor, no_ack_streak),
         .cloudflare => cfClientTool(app, ctx, conv_dir, ctrl_cursor, name, args, no_ack_streak),
     };
+}
+
+test "a delegated poll gives way to a mid-turn steer; a posted result still wins; any other tool waits on" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-await-steer-tmp";
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    var ta = try http.testApp(gpa, io, root);
+    defer ta.deinit();
+    const app = &ta.app;
+    const conv_dir = root ++ "/conv";
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, conv_dir, .default_dir) catch {};
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = conv_dir ++ "/control.jsonl", .data = "{\"op\":\"steer\",\"text\":\"stop polling\"}\n" });
+    // a poll: the steer ends the wait at once, and the caller learns it was a steer, not a stop
+    {
+        var steered = false;
+        var stopped = false;
+        const t0 = nowSecs(io);
+        try std.testing.expect(awaitClientResult(app, conv_dir, "c1", 0, 0, 5, 5, null, &stopped, true, &steered) == null);
+        try std.testing.expect(steered);
+        try std.testing.expect(!stopped);
+        try std.testing.expect(nowSecs(io) - t0 < 3);
+    }
+    // the same steer with the result already posted (a desk that interrupted its own poll): the result is read first
+    {
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = conv_dir ++ "/tool_results.jsonl", .data = "{\"id\":\"c1\",\"result\":\"poll -> interrupted\"}\n" });
+        var steered = false;
+        const r = awaitClientResult(app, conv_dir, "c1", 0, 0, 5, 5, null, null, true, &steered) orelse return error.NoResult;
+        defer gpa.free(r);
+        try std.testing.expectEqualStrings("poll -> interrupted", r);
+        try std.testing.expect(!steered);
+    }
+    // any other tool: a passing message is not its business — the wait runs to its (short) no-ack deadline
+    {
+        var steered = false;
+        const t0 = nowSecs(io);
+        try std.testing.expect(awaitClientResult(app, conv_dir, "c2", 0, 0, 1, 1, null, null, false, &steered) == null);
+        try std.testing.expect(!steered);
+        try std.testing.expect(nowSecs(io) - t0 >= 1);
+    }
 }
 
 test "recon probes take the turn's own route: the client's harness on a client-mode turn, this server otherwise" {
@@ -13023,7 +13098,7 @@ fn toolArbiter(app: *App, run_root: []const u8, p: Provider, intent: []const u8,
     // whatever it is told. The `cast` needle is the same ADVERTISED check the streak-2 nudge uses.
     const has_orch = if (tools_json) |tj| std.mem.indexOf(u8, tj, "\"name\":\"cast\"") != null else true;
     ask.appendSlice(gpa, if (has_orch)
-        "\n\nAVAILABLE TOOL FAMILIES: files (write_file/edit_file/read_file/list_dir/delete_file), waiting/watching (poll), web (web_fetch/read_url/web_search/fetch_json), stored docs & memory (read_doc/recall_hive/recall), side-thread (open_subchat), a team (cast), code (run_python/run_tests). Your recommendation:"
+        "\n\nAVAILABLE TOOL FAMILIES: files (write_file/edit_file/read_file/list_dir/delete_file), waiting/watching (poll), web (web_fetch/read_url/web_search/fetch_json), stored docs & memory (read_doc/recall_hive/recall), side-thread (open_subchat), a team (cast), code (run_python/run_shell/run_tests). Your recommendation:"
     else
         "\n\nAVAILABLE TOOL FAMILIES: files (write_file/edit_file/read_file/list_dir/delete_file), web (web_search/web_fetch), a page needing JS or a login (browser_navigate, then browser_read for refs, then browser_click/browser_type), stored docs & memory (read_doc/recall/observe), images (pixel_search), code (run_python/run_tests). Your recommendation:") catch return null;
     var msgs: std.ArrayListUnmanaged(u8) = .empty;

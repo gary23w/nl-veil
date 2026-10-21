@@ -7,6 +7,7 @@ const log = std.log.scoped(.billing);
 const http = @import("../../gateway/http.zig");
 const ent = @import("../../plan/entitlements.zig");
 const neurons = @import("../../plan/neurons.zig");
+const Neuron = @import("../neuron/client.zig").Neuron;
 const crypto = @import("../../config/key_vault.zig");
 const cf_oauth = @import("../../config/cf_oauth.zig");
 const cf_garrett = @import("../../config/cf_garrett.zig"); // the user's own Agent Garrett: the pair a swarm that asked for it carries in keys.env
@@ -129,8 +130,10 @@ pub fn deploySwarm(app: *App, arena: std.mem.Allocator, u: http.User, body: Depl
     if (app.sup.activeSwarmsForUser(u.id) >= e.max_swarms)
         return failCap("your plan's concurrent-swarm limit is reached — stop one or upgrade to Pro");
     if (http.metered(app, u)) {
-        if (app.ledger) |l| if (!l.hasBalance(u.id, u.plan))
-            return failCap("you're out of neurons for this billing period — upgrade your plan or add a top-up to run more swarms");
+        if (app.ledger) |l| {
+            const available = l.hasBalance(u.id, u.plan) catch return failSrv("neuron ledger unavailable");
+            if (!available) return failCap("you're out of neurons for this billing period — upgrade your plan or add a top-up to run more swarms");
+        }
     }
     // A cast targets a LOCAL model when the provider is ollama or builtin OR the base_url names a loopback
     // host. This set MUST match the worker's isLocal() (src/worker/llm.zig): a host the worker treats as
@@ -148,6 +151,7 @@ pub fn deploySwarm(app: *App, arena: std.mem.Allocator, u: http.User, body: Depl
 
     const spawn_id = app.sup.newSpawnId(); // a deploy's run dir is named by it, which is how reattach and retention know one
     const id = arena.dupe(u8, &spawn_id) catch return failSrv("out of memory");
+    const billing_run_id = std.fmt.allocPrint(arena, "r{s}", .{id}) catch return failSrv("out of memory");
     // run_dir is the override (a chat conversation dir) when the cast asked to build in place, else the default
     // per-swarm folder. Either way `{run_dir}/work` is the deliverable dir the worker uses — the worker needs no
     // change, it just inherits whichever run_dir we spawn it with.
@@ -266,21 +270,40 @@ pub fn deploySwarm(app: *App, arena: std.mem.Allocator, u: http.User, body: Depl
     // the manifest write, the dir holds the previous run's manifest with no DONE and no worker.pid, and a chat
     // turn reading the dir can take that for a finished run. The re-cast need not come from that turn (an HTTP
     // cast with `dir`, a sub-chat sibling's cast), so the window spans only the manifest build.
-    if (run_dir_override.len > 0) resetCastLifecycle(app, arena, run_dir);
+    const reused_dir = run_dir_override.len > 0;
+    if (reused_dir) app.sup.lifecycle_mu.lockUncancelable(app.io);
+    defer if (reused_dir) app.sup.lifecycle_mu.unlock(app.io);
+    if (reused_dir) {
+        if (app.sup.runDirIsLive(run_dir)) return failCap("the previous cast is still running");
+        if (!app.sup.settleBeforeRecast(u.id, run_dir)) return failSrv("previous usage could not be settled");
+        resetCastLifecycle(app, arena, run_dir);
+    }
 
-    const mani_items = buildManifest(arena, body, eff_provider, workdir, eff_base, eff_model, body.encrypt and e.encrypted) catch return failSrv("out of memory");
+    if (http.metered(app, u)) {
+        if (!app.sup.meter()) return failSrv("neuron usage could not be settled");
+        const available = app.ledger.?.hasBalance(u.id, u.plan) catch return failSrv("neuron ledger unavailable");
+        if (!available) return failCap("you're out of neurons for this billing period — upgrade your plan or add a top-up to run more swarms");
+    }
+
+    if (app.ledger) |l| l.prepareRun(u.id, billing_run_id, 0) catch return failSrv("neuron run ledger unavailable");
+    var usage_buf: [64]u8 = undefined;
+    const initial_usage = @import("../../plan/run_usage.zig").format(&usage_buf, billing_run_id, 0) catch return failSrv("could not initialize usage");
+    const usage_path = std.fmt.allocPrint(arena, "{s}/.usage", .{run_dir}) catch return failSrv("out of memory");
+    std.Io.Dir.cwd().writeFile(app.io, .{ .sub_path = usage_path, .data = initial_usage }) catch return failSrv("could not initialize usage");
+
+    const mani_items = buildManifest(arena, body, eff_provider, workdir, eff_base, eff_model, body.encrypt and e.encrypted, billing_run_id) catch return failSrv("out of memory");
     const mani_path = std.fmt.allocPrint(arena, "{s}/swarm.json", .{run_dir}) catch return failSrv("out of memory");
     std.Io.Dir.cwd().writeFile(app.io, .{ .sub_path = mani_path, .data = mani_items }) catch return failSrv("could not write manifest");
 
     if (eff_key.len > 0 or gar != null)
         writeKeysEnv(app, arena, run_dir, eff_key, eff_base, gar, body.encrypt and e.encrypted) catch return failSrv("could not prepare keys");
 
-    const sw = app.sup.spawn(u.id, id, body.name, run_dir, eff_model, body.minds.len) catch return failSrv("could not spawn worker");
+    const sw = app.sup.spawn(u.id, id, body.name, run_dir, eff_model, body.minds.len, billing_run_id) catch return failSrv("could not spawn worker");
     return .{ .ok = .{ .id = sw.id, .state = @tagName(sw.state), .minds = sw.minds, .run_dir = run_dir } };
 }
 
 /// Build the swarm.json manifest bytes into `arena` (freed with the arena).
-fn buildManifest(arena: std.mem.Allocator, body: DeployReq, eff_provider: []const u8, workdir: []const u8, eff_base: []const u8, eff_model: []const u8, encrypted: bool) ![]u8 {
+fn buildManifest(arena: std.mem.Allocator, body: DeployReq, eff_provider: []const u8, workdir: []const u8, eff_base: []const u8, eff_model: []const u8, encrypted: bool, billing_run_id: []const u8) ![]u8 {
     var mani: std.ArrayListUnmanaged(u8) = .empty;
     try mani.appendSlice(arena, "{\"swarm\":");
     try jstr(arena, &mani, body.name);
@@ -290,6 +313,8 @@ fn buildManifest(arena: std.mem.Allocator, body: DeployReq, eff_provider: []cons
     try jstr(arena, &mani, eff_base);
     try mani.appendSlice(arena, ",\"model\":");
     try jstr(arena, &mani, eff_model);
+    try mani.appendSlice(arena, ",\"billing_run_id\":");
+    try jstr(arena, &mani, billing_run_id);
     try mani.appendSlice(arena, ",\"style\":");
     try jstr(arena, &mani, body.style);
     try mani.appendSlice(arena, ",\"mode\":");
@@ -703,7 +728,7 @@ pub fn resolve(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const has_key = app.vault.has(u.id, body.provider);
     const blocked: ?[]const u8 =
         if (minds > e.per_swarm_minds) "exceeds this plan's minds-per-swarm" else if (live + minds > e.max_minds) "would exceed your live-mind limit" else if (active >= e.max_swarms) "concurrent-swarm limit reached" else null;
-    const ns: neurons.Status = if (app.ledger) |l| l.status(u.id, u.plan) else .{ .granted = 0, .used = 0, .balance = 0, .period_start = 0 };
+    const ns: neurons.Status = if (app.ledger) |l| l.status(u.id, u.plan) catch return serverErr(res, "neuron ledger unavailable") else .{ .granted = 0, .used = 0, .balance = 0, .period_start = 0 };
     const out_of_neurons = http.metered(app, u) and ns.balance <= 0;
     try res.json(.{
         .ok = true,
@@ -726,26 +751,9 @@ pub fn resolve(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     }, .{});
 }
 
-fn enforceBudget(app: *App) void {
-    if (!app.production) return;
-    const l = app.ledger orelse return;
-    app.sup.meter();
-    const uids = app.sup.runningUids(app.gpa);
-    defer app.gpa.free(uids);
-    for (uids) |uid| {
-        const u = app.auth.userById(uid) orelse continue;
-        if (app.auth.isAdmin(u)) continue;
-        if (l.status(uid, u.plan).balance <= 0) {
-            const paused = app.sup.pauseUserSwarms(uid);
-            if (paused > 0) log.warn("paused {d} swarm(s) for uid {d} — out of neurons", .{ paused, uid });
-        }
-    }
-}
-
 pub fn listSwarms(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const u = requireUser(app, req, res) orelse return;
     // retention GC runs on the supervisor's background thread, not on this request path
-    enforceBudget(app);
     const swarms = try app.sup.listForUser(u.id);
     defer app.gpa.free(swarms);
     var arr: std.ArrayListUnmanaged(u8) = .empty;
@@ -991,13 +999,18 @@ pub fn swarmDeployCf(app: *App, req: *httpz.Request, res: *httpz.Response) !void
     }, .{});
 }
 
-const BillingReq = struct { email: []const u8, plan: []const u8 = "", topup: u64 = 0 };
+const BillingReq = struct { email: []const u8, plan: []const u8 = "", topup: u64 = 0, topup_id: []const u8 = "" };
 
 pub fn adminBilling(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     _ = http.requireAdmin(app, req, res) orelse return;
     const body = (req.json(BillingReq) catch return badReq(res, "malformed JSON body")) orelse return badReq(res, "bad body");
     const want_plan = body.plan.len > 0;
     const want_topup = body.topup > 0;
+    // Two independent stores cannot commit this pair atomically. Require separate
+    // requests so a failed second write never hides a successful first change.
+    if (want_plan and want_topup) return badReq(res, "change plan and top-up in separate requests");
+    if (want_topup and !neurons.NeuronLedger.validTopupIdAt(body.topup_id, std.Io.Timestamp.now(app.io, .real).toSeconds()))
+        return badReq(res, "top-up requires topup_id t<unix-seconds>_<unique nonce> from the past 90 days; reuse it only when retrying the same grant");
     var plan_set = false;
     var topup_applied = false;
     if (want_plan) {
@@ -1005,12 +1018,22 @@ pub fn adminBilling(app: *App, req: *httpz.Request, res: *httpz.Response) !void 
         // still answering ok, so `{"plan":"Pro"}` silently downgraded a paying customer and the
         // admin had no way to tell.
         const plan = ent.parsePlan(body.plan) orelse return badReq(res, "unknown plan (want free, pro or max)");
-        plan_set = app.auth.setPlan(body.email, plan);
+        plan_set = app.auth.setPlan(body.email, plan) catch return serverErr(res, "could not persist plan change");
     }
     if (want_topup) {
         if (app.auth.idForEmail(body.email)) |uid| {
             if (app.ledger) |l| {
-                l.addTopup(uid, body.topup);
+                l.addTopup(uid, body.topup, body.topup_id) catch |err| switch (err) {
+                    error.TopupOperationConflict => {
+                        res.status = 409;
+                        return res.json(.{ .ok = false, .note = "topup_id was already used for a different amount" }, .{});
+                    },
+                    error.TopupHistoryFull => {
+                        res.status = 409;
+                        return res.json(.{ .ok = false, .note = "top-up history is full; reconcile this account before granting more credit" }, .{});
+                    },
+                    else => return serverErr(res, "could not persist neuron top-up"),
+                };
                 topup_applied = true;
             }
         }
@@ -1034,7 +1057,13 @@ pub fn swarmDelete(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     // the mismatch. Mutate via the swarm's OWN id.
     const sw = app.sup.resolve(u.id, id) orelse return notFound(res);
     if (sw.uid != u.id) return unauth(res);
-    app.sup.remove(sw.id);
+    app.sup.remove(sw.id) catch |err| switch (err) {
+        error.WorkerStillStopping => {
+            res.status = 202;
+            return res.json(.{ .ok = true, .stopping = true, .deleted = false }, .{});
+        },
+        else => return serverErr(res, "could not settle worker usage"),
+    };
     try res.json(.{ .ok = true, .deleted = true }, .{});
 }
 
@@ -1283,6 +1312,28 @@ test "admin billing: only an admin, and a plan name it does not recognise is ref
         try adminBilling(&ta.app, web.req, web.res);
         try web.expectStatus(400);
     }
+    {
+        var web = httpz.testing.init(.{});
+        defer web.deinit();
+        web.header("cookie", admin_cookie);
+        web.json(.{ .email = "normal@example.test", .plan = "pro", .topup = @as(u64, 100) });
+        try adminBilling(&ta.app, web.req, web.res);
+        try web.expectStatus(400);
+        try std.testing.expectEqual(ent.Plan.free, (ta.auth.whoami(user_tok) orelse return error.TestUnexpectedResult).plan);
+    }
+    // A failed stored upgrade cannot be reported as a successful billing change.
+    {
+        const bin = ta.auth.nb.bin;
+        ta.auth.nb.bin = "definitely-not-a-real-neuron-binary";
+        defer ta.auth.nb.bin = bin;
+        var web = httpz.testing.init(.{});
+        defer web.deinit();
+        web.header("cookie", admin_cookie);
+        web.json(.{ .email = "normal@example.test", .plan = "pro" });
+        try adminBilling(&ta.app, web.req, web.res);
+        try web.expectStatus(500);
+        try std.testing.expectEqual(ent.Plan.free, (ta.auth.whoami(user_tok) orelse return error.TestUnexpectedResult).plan);
+    }
     // the real thing still works, case-insensitively
     {
         var web = httpz.testing.init(.{});
@@ -1293,6 +1344,68 @@ test "admin billing: only an admin, and a plan name it does not recognise is ref
         try web.expectStatus(200);
     }
     try std.testing.expectEqual(ent.Plan.pro, (ta.auth.whoami(user_tok) orelse return error.TestUnexpectedResult).plan);
+
+    // A top-up is a credit grant, so a failed ledger write must reach the admin.
+    var ledger = neurons.NeuronLedger.init(gpa, ta.auth.nb);
+    ta.app.ledger = &ledger;
+    const uid = ta.auth.idForEmail("normal@example.test").?;
+    _ = try ledger.status(uid, .pro);
+    {
+        var web = httpz.testing.init(.{});
+        defer web.deinit();
+        web.header("cookie", admin_cookie);
+        web.json(.{ .email = "normal@example.test", .topup = @as(u64, 1_000) });
+        try adminBilling(&ta.app, web.req, web.res);
+        try web.expectStatus(400);
+    }
+    var scope_buf: [24]u8 = undefined;
+    const scope = try std.fmt.bufPrint(&scope_buf, "n_{d}", .{uid});
+    const issued = std.Io.Timestamp.now(io, .real).toSeconds();
+    var idbuf1: [96]u8 = undefined;
+    var idbuf2: [96]u8 = undefined;
+    const credit1 = try std.fmt.bufPrint(&idbuf1, "t{d}_admin-credit-0001", .{issued});
+    const credit2 = try std.fmt.bufPrint(&idbuf2, "t{d}_admin-credit-0002", .{issued});
+    var fault: Neuron.TestFault = .{};
+    ledger.nb.test_fault = &fault;
+    fault.fail_put_scope_once = scope;
+    {
+        var web = httpz.testing.init(.{});
+        defer web.deinit();
+        web.header("cookie", admin_cookie);
+        web.json(.{ .email = "normal@example.test", .topup = @as(u64, 1_000), .topup_id = credit1 });
+        try adminBilling(&ta.app, web.req, web.res);
+        try web.expectStatus(500);
+    }
+    try std.testing.expectEqual(@as(u64, 1_500_000), (try ledger.status(uid, .pro)).granted);
+
+    // A committed grant can still return 500 when its confirming read fails.
+    // Reusing its ID must report success without granting a second time.
+    fault.fail_get_after_put_scope = scope;
+    {
+        var web = httpz.testing.init(.{});
+        defer web.deinit();
+        web.header("cookie", admin_cookie);
+        web.json(.{ .email = "normal@example.test", .topup = @as(u64, 1_000), .topup_id = credit2 });
+        try adminBilling(&ta.app, web.req, web.res);
+        try web.expectStatus(500);
+    }
+    {
+        var web = httpz.testing.init(.{});
+        defer web.deinit();
+        web.header("cookie", admin_cookie);
+        web.json(.{ .email = "normal@example.test", .topup = @as(u64, 1_000), .topup_id = credit2 });
+        try adminBilling(&ta.app, web.req, web.res);
+        try web.expectStatus(200);
+    }
+    {
+        var web = httpz.testing.init(.{});
+        defer web.deinit();
+        web.header("cookie", admin_cookie);
+        web.json(.{ .email = "normal@example.test", .topup = @as(u64, 2_000), .topup_id = credit2 });
+        try adminBilling(&ta.app, web.req, web.res);
+        try web.expectStatus(409);
+    }
+    try std.testing.expectEqual(@as(u64, 1_501_000), (try ledger.status(uid, .pro)).granted);
 }
 
 test "a re-cast refused over its model or credentials keeps the previous run finished and synced; one that reaches its manifest write resets it" {
@@ -1378,10 +1491,10 @@ test "a swarm that asked for Agent Garrett says so in its manifest; one that did
     defer arena.deinit();
     const a = arena.allocator();
     var minds = [_]MindSpec{.{ .name = "nova", .lead = true }};
-    const with = try buildManifest(a, .{ .name = "s", .goal = "g", .garrett = true, .minds = &minds }, "mock", "/w", "", "mock", false);
+    const with = try buildManifest(a, .{ .name = "s", .goal = "g", .garrett = true, .minds = &minds }, "mock", "/w", "", "mock", false, "r0123456789abcdef");
     try std.testing.expect(std.mem.indexOf(u8, with, ",\"garrett\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, with, "GARRETT") == null); // the pair is keys.env's, like the model key
-    const without = try buildManifest(a, .{ .name = "s", .goal = "g", .minds = &minds }, "mock", "/w", "", "mock", false);
+    const without = try buildManifest(a, .{ .name = "s", .goal = "g", .minds = &minds }, "mock", "/w", "", "mock", false, "r0123456789abcdef");
     try std.testing.expect(std.mem.indexOf(u8, without, "garrett") == null);
     // an old client that never heard of the field deploys exactly as before
     const parsed = try std.json.parseFromSlice(DeployReq, a, "{\"name\":\"s\",\"minds\":[{\"name\":\"nova\"}]}", .{ .ignore_unknown_fields = true });

@@ -380,16 +380,16 @@ pub const Belt = struct {
 pub fn pathFor(name: []const u8) []const u8 {
     const S = struct { n: []const u8, p: []const u8 };
     const table = [_]S{
-        .{ .n = "read_file", .p = "build/files" },       .{ .n = "write_file", .p = "build/files" },       .{ .n = "edit_file", .p = "build/files" },
-        .{ .n = "list_dir", .p = "build/files" },        .{ .n = "delete_file", .p = "build/files" },      .{ .n = "stage_file", .p = "build/files" },
-        .{ .n = "absorb", .p = "build/files" },          .{ .n = "sync_dir", .p = "build/files" },         .{ .n = "run_python", .p = "build/code" },
-        .{ .n = "run_tests", .p = "build/code" },        .{ .n = "stop_process", .p = "build/code" },      .{ .n = "web_fetch", .p = "web/fetch" },
-        .{ .n = "web_search", .p = "web/fetch" },        .{ .n = "fetch_json", .p = "web/fetch" },         .{ .n = "read_url", .p = "web/fetch" },
-        .{ .n = "osint_scan", .p = "web/fetch" },        .{ .n = "deep_crawl", .p = "web/fetch" },         .{ .n = "recall", .p = "knowledge/memory" },
-        .{ .n = "observe", .p = "knowledge/memory" },    .{ .n = "recall_hive", .p = "knowledge/memory" }, .{ .n = "read_doc", .p = "knowledge/memory" },
-        .{ .n = "cast", .p = "delegate/swarm" },         .{ .n = "steer_swarm", .p = "delegate/swarm" },   .{ .n = "stop_swarm", .p = "delegate/swarm" },
-        .{ .n = "answer_swarm", .p = "delegate/swarm" }, .{ .n = "open_subchat", .p = "delegate/swarm" },  .{ .n = "poll", .p = "connect/mcp" },
-        .{ .n = "get_credential", .p = "connect/mcp" },
+        .{ .n = "read_file", .p = "build/files" },        .{ .n = "write_file", .p = "build/files" },    .{ .n = "edit_file", .p = "build/files" },
+        .{ .n = "list_dir", .p = "build/files" },         .{ .n = "delete_file", .p = "build/files" },   .{ .n = "stage_file", .p = "build/files" },
+        .{ .n = "absorb", .p = "build/files" },           .{ .n = "sync_dir", .p = "build/files" },      .{ .n = "run_python", .p = "build/code" },
+        .{ .n = "run_shell", .p = "build/code" },         .{ .n = "tool_env", .p = "build/code" },       .{ .n = "run_tests", .p = "build/code" },
+        .{ .n = "stop_process", .p = "build/code" },      .{ .n = "web_fetch", .p = "web/fetch" },       .{ .n = "web_search", .p = "web/fetch" },
+        .{ .n = "fetch_json", .p = "web/fetch" },         .{ .n = "read_url", .p = "web/fetch" },        .{ .n = "osint_scan", .p = "web/fetch" },
+        .{ .n = "deep_crawl", .p = "web/fetch" },         .{ .n = "recall", .p = "knowledge/memory" },   .{ .n = "observe", .p = "knowledge/memory" },
+        .{ .n = "recall_hive", .p = "knowledge/memory" }, .{ .n = "read_doc", .p = "knowledge/memory" }, .{ .n = "cast", .p = "delegate/swarm" },
+        .{ .n = "steer_swarm", .p = "delegate/swarm" },   .{ .n = "stop_swarm", .p = "delegate/swarm" }, .{ .n = "answer_swarm", .p = "delegate/swarm" },
+        .{ .n = "open_subchat", .p = "delegate/swarm" },  .{ .n = "poll", .p = "connect/mcp" },          .{ .n = "get_credential", .p = "connect/mcp" },
     };
     for (table) |e| if (std.mem.eql(u8, e.n, name)) return e.p;
     if (std.mem.startsWith(u8, name, "security_")) return securityPath(name["security_".len..]);

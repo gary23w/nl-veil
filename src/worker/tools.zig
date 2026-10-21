@@ -1228,7 +1228,9 @@ pub const MAX_TOOL_PARAMS = 4 * 1024;
 
 /// The OpenAI `tools` array contents (comma-separated function defs, no outer brackets).
 pub const SCHEMA =
-    \\{"type":"function","function":{"name":"run_python","description":"Run Python (no GUI) in the build workdir; returns stdout/stderr. This is your general-purpose EXECUTOR and the DEFAULT whenever no other tool fits, because it is the only way you can execute anything: HTTP and API calls with your own headers/auth/POST body (requests works, the network is up), computation, data wrangling, generating files. Provider API keys are stripped from the environment, but a credential written into the code itself is used as-is. Each run has a hard wall-clock cap (120 s unless the host set another): a timeout= inside your code cannot raise it, so start a longer job in the background with its output sent to a file, then watch that file with poll.","parameters":{"type":"object","properties":{"code":{"type":"string","description":"the Python source to execute"}},"required":["code"]}}},
+    \\{"type":"function","function":{"name":"run_python","description":"Run Python (no GUI) in the build workdir; returns stdout/stderr. This is your general-purpose EXECUTOR and the DEFAULT whenever no other tool fits, because it (with run_shell for plain commands) is the only way you can execute anything: HTTP and API calls with your own headers/auth/POST body (requests works, the network is up), computation, data wrangling, generating files. Provider API keys are stripped from the environment, but a credential written into the code itself is used as-is. Each run has a hard wall-clock cap (120 s unless the host set another): a timeout= inside your code cannot raise it, so start a longer job in the background with its output sent to a file, then watch that file with poll. If it answers that python is not found, install python with run_shell, then tool_env refresh_path, then retry.","parameters":{"type":"object","properties":{"code":{"type":"string","description":"the Python source to execute"}},"required":["code"]}}},
+    \\{"type":"function","function":{"name":"run_shell","description":"Run a shell script in the build workdir — PowerShell (the Windows default), bash or sh (the POSIX default), or cmd — and return exit code, stdout and stderr in the same shape as run_python. Use it for anything that is a command rather than Python: package managers, build tools, git, system utilities. This is also HOW YOU INSTALL MISSING TOOLING: when run_python reports that python is not found, install it here (Windows: winget install Python.Python.3; macOS: brew install python; Debian/Ubuntu: apt install python3), then call tool_env with action refresh_path (or tool_env set NL_PYTHON_BIN=<full path>) so the next run_python finds it — no veil restart needed. Provider API keys are stripped from the environment. Each run has a hard wall-clock cap (120 s unless the host set another): a sleep or timeout inside the script cannot raise it, so start a longer job in the background with its output sent to a file, then watch that file with poll.","parameters":{"type":"object","properties":{"script":{"type":"string","description":"the script text to run, in the chosen shell's own language"},"shell":{"type":"string","enum":["auto","powershell","bash","sh","cmd"],"description":"auto (the default) is powershell on Windows, bash if present else sh elsewhere"},"timeout_s":{"type":"integer","description":"optional cap for this call in seconds; never above the host's cap"}},"required":["script"]}}},
+    \\{"type":"function","function":{"name":"tool_env","description":"Persist an environment change for every tool run from now on in this veil — run_python, run_shell, run_tests and the rest — with no restart, and it survives restarts. action set: name + value (name PATH puts value in front of the tool PATH; NL_PYTHON_BIN points run_python at a specific interpreter). action refresh_path: re-read the machine's live PATH (the registry on Windows, a login shell elsewhere) so a program an installer just added (winget/brew/apt) is found without restarting veil. action show: print the stored overlay. The install flow: run_shell installs the program, tool_env refresh_path, then retry the tool that could not find it.","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["set","refresh_path","show"]},"name":{"type":"string","description":"for set: the variable name (PATH to prepend a directory)"},"value":{"type":"string","description":"for set: the value, or the directory for PATH"}},"required":["action"]}}},
     \\{"type":"function","function":{"name":"stop_process","description":"KILL a process YOU started (and its children) by pid — the background server, fuzzer, watcher or build you launched with run_python and no longer want. Ending a turn does NOT reap what a script spawned, so a run left behind keeps holding the machine and its ports. Use it when the user says stop, when you are done watching something, or before relaunching a service on the same port.","parameters":{"type":"object","properties":{"pid":{"type":"integer","description":"the process id to terminate, together with its child tree"}},"required":["pid"]}}},
     \\{"type":"function","function":{"name":"write_file","description":"Write a UTF-8 text file at a relative path inside the build workdir (creates parent dirs). To GROW a long document (e.g. add the next scene to a chapter) pass mode:\"append\" with ONLY the new text — it is concatenated onto the existing file, so you never resend (or truncate) prior content. mode:\"overwrite\" (default) replaces the file. To CHANGE an existing file, prefer edit_file (never re-emit a large file).","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"mode":{"type":"string","enum":["overwrite","append"]}},"required":["path","content"]}}},
     \\{"type":"function","function":{"name":"edit_file","description":"Make a SURGICAL edit to an EXISTING file WITHOUT resending the whole file — use this (NOT write_file) to change a file that already exists, especially a large one (write_file re-emits the whole file and truncates big ones). PREFERRED anchors: reads prefix every line with a tag like 42:abc:def — copy that tag as the op's anchor (add end = the range's LAST-line tag to cover several lines). Tags are verified against the CURRENT file and the batch is ATOMIC: all ops apply or none do, and a stale-tag error hands you FRESH tags — retry the whole batch with those (no re-read needed). Plain text anchors (a snippet copied VERBATIM, unique in the file) also work. op is: replace (swap the anchored line/range for text), insert_before / insert_after (add text around the anchor; anchor 0: = file start, EOF = file end), delete (remove the anchored lines).","parameters":{"type":"object","properties":{"path":{"type":"string"},"ops":{"type":"array","items":{"type":"object","properties":{"op":{"type":"string","enum":["replace","insert_before","insert_after","delete"]},"anchor":{"type":"string"},"end":{"type":"string"},"text":{"type":"string"}},"required":["op","anchor"]}}},"required":["path","ops"]}}},
@@ -1337,7 +1339,9 @@ pub const MCP_SCHEMA =
 /// and CHAT_ONLY_DEFS below, and the test there fails on any UNDECLARED difference — so an accidentally stale
 /// copy is caught, while an intentional adaptation has to be written down.
 pub const CHAT_SCHEMA =
-    \\{"type":"function","function":{"name":"run_python","description":"Run Python (no GUI) in the build workdir; returns stdout/stderr. This is your general-purpose EXECUTOR and the DEFAULT whenever no other tool fits, because it is the only way you can execute anything: HTTP and API calls with your own headers/auth/POST body (requests works, the network is up), computation, data wrangling, generating files. Provider API keys are stripped from the environment, but a credential written into the code itself is used as-is. Each run has a hard wall-clock cap (120 s unless the host set another): a timeout= inside your code cannot raise it, so start a longer job in the background with its output sent to a file, then watch that file with poll.","parameters":{"type":"object","properties":{"code":{"type":"string","description":"the Python source to execute"}},"required":["code"]}}},
+    \\{"type":"function","function":{"name":"run_python","description":"Run Python (no GUI) in the build workdir; returns stdout/stderr. This is your general-purpose EXECUTOR and the DEFAULT whenever no other tool fits, because it (with run_shell for plain commands) is the only way you can execute anything: HTTP and API calls with your own headers/auth/POST body (requests works, the network is up), computation, data wrangling, generating files. Provider API keys are stripped from the environment, but a credential written into the code itself is used as-is. Each run has a hard wall-clock cap (120 s unless the host set another): a timeout= inside your code cannot raise it, so start a longer job in the background with its output sent to a file, then watch that file with poll. If it answers that python is not found, install python with run_shell, then tool_env refresh_path, then retry.","parameters":{"type":"object","properties":{"code":{"type":"string","description":"the Python source to execute"}},"required":["code"]}}},
+    \\{"type":"function","function":{"name":"run_shell","description":"Run a shell script in the build workdir — PowerShell (the Windows default), bash or sh (the POSIX default), or cmd — and return exit code, stdout and stderr in the same shape as run_python. Use it for anything that is a command rather than Python: package managers, build tools, git, system utilities. This is also HOW YOU INSTALL MISSING TOOLING: when run_python reports that python is not found, install it here (Windows: winget install Python.Python.3; macOS: brew install python; Debian/Ubuntu: apt install python3), then call tool_env with action refresh_path (or tool_env set NL_PYTHON_BIN=<full path>) so the next run_python finds it — no veil restart needed. Provider API keys are stripped from the environment. Each run has a hard wall-clock cap (120 s unless the host set another): a sleep or timeout inside the script cannot raise it, so start a longer job in the background with its output sent to a file, then watch that file with poll.","parameters":{"type":"object","properties":{"script":{"type":"string","description":"the script text to run, in the chosen shell's own language"},"shell":{"type":"string","enum":["auto","powershell","bash","sh","cmd"],"description":"auto (the default) is powershell on Windows, bash if present else sh elsewhere"},"timeout_s":{"type":"integer","description":"optional cap for this call in seconds; never above the host's cap"}},"required":["script"]}}},
+    \\{"type":"function","function":{"name":"tool_env","description":"Persist an environment change for every tool run from now on in this veil — run_python, run_shell, run_tests and the rest — with no restart, and it survives restarts. action set: name + value (name PATH puts value in front of the tool PATH; NL_PYTHON_BIN points run_python at a specific interpreter). action refresh_path: re-read the machine's live PATH (the registry on Windows, a login shell elsewhere) so a program an installer just added (winget/brew/apt) is found without restarting veil. action show: print the stored overlay. The install flow: run_shell installs the program, tool_env refresh_path, then retry the tool that could not find it.","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["set","refresh_path","show"]},"name":{"type":"string","description":"for set: the variable name (PATH to prepend a directory)"},"value":{"type":"string","description":"for set: the value, or the directory for PATH"}},"required":["action"]}}},
     \\{"type":"function","function":{"name":"stop_process","description":"KILL a process YOU started (and its children) by pid — the background server, fuzzer, watcher or build you launched with run_python and no longer want. Ending a turn does NOT reap what a script spawned, so a run left behind keeps holding the machine and its ports. Use it when the user says stop, when you are done watching something, or before relaunching a service on the same port.","parameters":{"type":"object","properties":{"pid":{"type":"integer","description":"the process id to terminate, together with its child tree"}},"required":["pid"]}}},
     \\{"type":"function","function":{"name":"write_file","description":"Write a UTF-8 text file at a relative path inside the build workdir (creates parent dirs). To GROW a long document (e.g. add the next scene to a chapter) pass mode:\"append\" with ONLY the new text — it is concatenated onto the existing file, so you never resend (or truncate) prior content. mode:\"overwrite\" (default) replaces the file. To CHANGE an existing file, prefer edit_file (never re-emit a large file).","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"mode":{"type":"string","enum":["overwrite","append"]}},"required":["path","content"]}}},
     \\{"type":"function","function":{"name":"edit_file","description":"Make a SURGICAL edit to an EXISTING file WITHOUT resending the whole file — use this (NOT write_file) to change a file that already exists, especially a large one (write_file re-emits the whole file and truncates big ones). PREFERRED anchors: reads prefix every line with a tag like 42:abc:def — copy that tag as the op's anchor (add end = the range's LAST-line tag to cover several lines). Tags are verified against the CURRENT file and the batch is ATOMIC: all ops apply or none do, and a stale-tag error hands you FRESH tags — retry the whole batch with those (no re-read needed). Plain text anchors (a snippet copied VERBATIM, unique in the file) also work. op is: replace (swap the anchored line/range for text), insert_before / insert_after (add text around the anchor; anchor 0: = file start, EOF = file end), delete (remove the anchored lines).","parameters":{"type":"object","properties":{"path":{"type":"string"},"ops":{"type":"array","items":{"type":"object","properties":{"op":{"type":"string","enum":["replace","insert_before","insert_after","delete"]},"anchor":{"type":"string"},"end":{"type":"string"},"text":{"type":"string"}},"required":["op","anchor"]}}},"required":["path","ops"]}}},
@@ -1576,15 +1580,18 @@ fn executeInner(ctx: *ToolCtx, name: []const u8, args_json: []const u8) []u8 {
     // the loader's guard is a name list and name lists drift.
     if (grantedRecipe(ctx, name)) |rec| return runRecipe(ctx, rec, args_json);
 
-    if (ctx.discourse and (std.mem.eql(u8, name, "run_python") or std.mem.eql(u8, name, "run_tests") or
-        std.mem.eql(u8, name, "make_tool") or std.mem.eql(u8, name, "patch_system")))
+    if (ctx.discourse and (std.mem.eql(u8, name, "run_python") or std.mem.eql(u8, name, "run_shell") or std.mem.eql(u8, name, "tool_env") or
+        std.mem.eql(u8, name, "run_tests") or std.mem.eql(u8, name, "make_tool") or std.mem.eql(u8, name, "patch_system")))
         return dupe(gpa, "this is a research/writing task — there is no code repo or test suite; produce the written deliverable with write_file");
     // APP-ATTACH LEARN phase is READ-ONLY: code execution and tool authoring are disabled because they could
     // write the command bus (bypassing reservedBusName, which only guards the file tools) or actuate the app.
     // The mind maps the app with host_explore and reasons with read_file/recall — it never runs code here.
-    if (ctx.app_attach and (std.mem.eql(u8, name, "run_python") or std.mem.eql(u8, name, "make_tool") or std.mem.eql(u8, name, "patch_system")))
-        return dupe(gpa, "APP-ATTACH LEARN phase is read-only — run_python / make_tool / patch_system are disabled (they could actuate the app or write the bus). Map the app with host_explore (enumerate/expand/describe) and reason with read_file/recall/recall_hive; the learned surface persists in the lineage hive for the next attach.");
+    if (ctx.app_attach and (std.mem.eql(u8, name, "run_python") or std.mem.eql(u8, name, "run_shell") or std.mem.eql(u8, name, "tool_env") or
+        std.mem.eql(u8, name, "make_tool") or std.mem.eql(u8, name, "patch_system")))
+        return dupe(gpa, "APP-ATTACH LEARN phase is read-only — run_python / run_shell / tool_env / make_tool / patch_system are disabled (they could actuate the app or write the bus). Map the app with host_explore (enumerate/expand/describe) and reason with read_file/recall/recall_hive; the learned surface persists in the lineage hive for the next attach.");
     if (std.mem.eql(u8, name, "run_python")) return runPython(ctx, args_json);
+    if (std.mem.eql(u8, name, "run_shell")) return runShell(ctx, args_json);
+    if (std.mem.eql(u8, name, "tool_env")) return toolEnvTool(ctx, args_json);
     if (std.mem.eql(u8, name, "write_file")) return writeFile(ctx, args_json);
     if (std.mem.eql(u8, name, "edit_file")) return editFile(ctx, args_json);
     if (std.mem.eql(u8, name, "read_file")) return readFile(ctx, args_json);
@@ -2324,13 +2331,418 @@ fn mcpDispatch(ctx: *ToolCtx, name: []const u8, args_json: []const u8) []u8 {
     return std.fmt.allocPrint(gpa, "unknown mcp tool: {s}", .{name}) catch dupe(gpa, "unknown mcp tool");
 }
 
-/// Force Python children to UTF-8 IO. Windows Python defaults stdout/stderr to the ANSI codepage (cp1252),
-/// so the first non-ASCII char a script prints ('→', '·', any emoji) kills it with UnicodeEncodeError:
-/// 'charmap' — observed live when a build's own test runner printed an arrow. Harmless on POSIX and for
-/// non-Python children, so every tool spawn sets it.
-fn forcePyUtf8(env: *std.process.Environ.Map) void {
+/// The ONE preparation every child environment this file builds goes through, so no spawn site can forget half
+/// of it: (1) force Python children to UTF-8 IO — Windows Python defaults stdout/stderr to the ANSI codepage
+/// (cp1252), so the first non-ASCII char a script prints ('→', '·', any emoji) kills it with UnicodeEncodeError:
+/// 'charmap' — observed live when a build's own test runner printed an arrow; harmless on POSIX and for
+/// non-Python children. (2) Merge the tool-env overlay (below): what `tool_env` persisted — PATH entries an
+/// installer added after this process started, NL_PYTHON_BIN and the like — so the child sees it with no restart.
+pub fn prepChildEnv(gpa: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map) void {
     env.put("PYTHONUTF8", "1") catch {};
     env.put("PYTHONIOENCODING", "utf-8") catch {};
+    applyToolEnv(gpa, io, env);
+}
+
+// ------------------------------------------------------------------------------------ the tool-env overlay
+//
+// A PATH change an installer makes (winget/brew/apt) is invisible to the running veil: a process's environment
+// is a copy taken at start. So a model that just installed python with run_shell would still get "python not
+// found" from run_python until someone restarted veil. The overlay closes that: {data}/tool-env.json, a JSON
+// object of env name → value plus a "PATH_PREPEND" array of directories, merged into EVERY child environment
+// built here (prepChildEnv) and into deps.probe, and re-read on every spawn — so a `tool_env` run through `veil
+// exec-tool` (a separate process, the desk's route) is seen by the server's next spawn, and a restart changes
+// nothing. The path is registered once per process (setToolEnvPath); unregistered, nothing changes.
+
+const TOOL_ENV_BASENAME = "tool-env.json";
+const TOOL_ENV_MAX = 64 << 10;
+var tool_env_store: [4096 + 32]u8 = undefined;
+var tool_env_store_len: usize = 0;
+
+/// Point the overlay at {data}/tool-env.json. Called once at boot by every process that runs tools (the server
+/// in main.zig, a swarm worker in run.zig, `veil exec-tool`), all with the same data dir. Copied, so a caller's
+/// stack buffer may go. Unit tests point it at a scratch dir and clear it (clearToolEnvPath) when done.
+pub fn setToolEnvPath(data_dir: []const u8) void {
+    tool_env_store_len = 0;
+    const p = std.fmt.bufPrint(&tool_env_store, "{s}/" ++ TOOL_ENV_BASENAME, .{data_dir}) catch return;
+    tool_env_store_len = p.len;
+}
+
+pub fn clearToolEnvPath() void {
+    tool_env_store_len = 0;
+}
+
+fn toolEnvPath() ?[]const u8 {
+    return if (tool_env_store_len == 0) null else tool_env_store[0..tool_env_store_len];
+}
+
+fn readToolEnv(gpa: std.mem.Allocator, io: std.Io) ?[]u8 {
+    const path = toolEnvPath() orelse return null;
+    return std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(TOOL_ENV_MAX)) catch null;
+}
+
+/// Merge the registered overlay into `env`. A missing or unreadable file is "no overlay".
+fn applyToolEnv(gpa: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map) void {
+    const bytes = readToolEnv(gpa, io) orelse return;
+    defer gpa.free(bytes);
+    applyToolEnvJson(gpa, env, bytes);
+}
+
+/// A clone of `env` with the overlay applied, or null when no overlay is registered or readable (the caller
+/// then uses `env` as is). For a reader that takes a const map (deps.probe).
+pub fn overlaidEnv(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map) ?std.process.Environ.Map {
+    const bytes = readToolEnv(gpa, io) orelse return null;
+    defer gpa.free(bytes);
+    var m = env.clone(gpa) catch return null;
+    applyToolEnvJson(gpa, &m, bytes);
+    return m;
+}
+
+/// The pure merge: every string member becomes an env var (a name the map would refuse is skipped, never
+/// asserted on); "PATH_PREPEND" is an array of directories put in front of the child's PATH, in order, each
+/// once, and none that PATH already holds. Malformed JSON applies nothing.
+pub fn applyToolEnvJson(gpa: std.mem.Allocator, env: *std.process.Environ.Map, bytes: []const u8) void {
+    const parsed = std.json.parseFromSlice(std.json.Value, gpa, bytes, .{}) catch return;
+    defer parsed.deinit();
+    if (parsed.value != .object) return;
+    var it = parsed.value.object.iterator();
+    while (it.next()) |kv| {
+        if (std.mem.eql(u8, kv.key_ptr.*, "PATH_PREPEND")) {
+            if (kv.value_ptr.* != .array) continue;
+            var dirs: std.ArrayListUnmanaged([]const u8) = .empty;
+            defer dirs.deinit(gpa);
+            for (kv.value_ptr.array.items) |d| if (d == .string) dirs.append(gpa, d.string) catch {};
+            prependPath(gpa, env, dirs.items);
+            continue;
+        }
+        if (kv.value_ptr.* != .string) continue;
+        if (!std.process.Environ.Map.validateKeyForPut(kv.key_ptr.*)) continue;
+        env.put(kv.key_ptr.*, kv.value_ptr.string) catch {};
+    }
+}
+
+/// Two PATH entries name the same directory when they match byte for byte, or on Windows regardless of case
+/// (its file system is), with a trailing separator ignored on both sides.
+fn samePathEntry(a: []const u8, b: []const u8) bool {
+    const ta = std.mem.trimEnd(u8, a, "/\\");
+    const tb = std.mem.trimEnd(u8, b, "/\\");
+    return if (builtin.os.tag == .windows) std.ascii.eqlIgnoreCase(ta, tb) else std.mem.eql(u8, ta, tb);
+}
+
+/// Put `dirs` in front of the child's PATH: each once, skipping any PATH already holds, blanks dropped. The map
+/// is case-insensitive on Windows, so "PATH" finds the block's "Path" and the put keeps that key.
+fn prependPath(gpa: std.mem.Allocator, env: *std.process.Environ.Map, dirs: []const []const u8) void {
+    const existing = env.get("PATH") orelse "";
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(gpa);
+    var added: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer added.deinit(gpa);
+    for (dirs) |raw| {
+        const d = std.mem.trim(u8, raw, " \r\n\t");
+        if (d.len == 0) continue;
+        var dup = false;
+        for (added.items) |a| if (samePathEntry(a, d)) {
+            dup = true;
+            break;
+        };
+        if (!dup) {
+            var pit = std.mem.splitScalar(u8, existing, std.fs.path.delimiter);
+            while (pit.next()) |e| if (samePathEntry(e, d)) {
+                dup = true;
+                break;
+            };
+        }
+        if (dup) continue;
+        added.append(gpa, d) catch return;
+        out.appendSlice(gpa, d) catch return;
+        out.append(gpa, std.fs.path.delimiter) catch return;
+    }
+    if (added.items.len == 0) return;
+    out.appendSlice(gpa, existing) catch return;
+    env.put("PATH", std.mem.trimEnd(u8, out.items, &.{std.fs.path.delimiter})) catch {};
+}
+
+/// Read the overlay file as a JSON object to edit in `arena`; a missing or malformed file is an empty object.
+fn loadToolEnvObject(arena: std.mem.Allocator, io: std.Io) std.json.Value {
+    const empty = std.json.Value{ .object = .empty };
+    const bytes = readToolEnv(arena, io) orelse return empty;
+    const v = std.json.parseFromSliceLeaky(std.json.Value, arena, bytes, .{}) catch return empty;
+    return if (v == .object) v else empty;
+}
+
+fn saveToolEnvObject(gpa: std.mem.Allocator, io: std.Io, v: std.json.Value) bool {
+    const path = toolEnvPath() orelse return false;
+    const text = std.json.Stringify.valueAlloc(gpa, v, .{ .whitespace = .indent_2 }) catch return false;
+    defer gpa.free(text);
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = text }) catch return false;
+    return true;
+}
+
+/// A name `tool_env set` accepts: what every shell and the map itself take, so a bad name is refused in words
+/// rather than tripping the map's assert.
+fn validEnvName(name: []const u8) bool {
+    if (name.len == 0 or name.len > 256) return false;
+    for (name, 0..) |c, i| switch (c) {
+        'A'...'Z', 'a'...'z', '_' => {},
+        '0'...'9' => if (i == 0) return false,
+        else => return false,
+    };
+    return true;
+}
+
+const TOOL_ENV_APPLIES = "applies to every tool run from now on in this veil and after restarts; no restart needed";
+
+/// Windows: the machine + user PATH as the registry holds them NOW — what a fresh process would get — read with
+/// bounded `reg query` calls (an installer's change lands there, never in this process's copy). The value line
+/// is `    Path    REG_SZ|REG_EXPAND_SZ    <value>`; nothing is expanded, so a %SystemRoot% entry stays literal.
+/// POSIX: a login shell's PATH (`sh -lc`), which is where a package manager's profile edits take effect. Returns
+/// gpa-owned entries, machine first (the order Windows builds PATH in), or an error note when neither read ran.
+fn livePathEntries(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map) ![][]const u8 {
+    var out: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer {
+        for (out.items) |e| gpa.free(e);
+        out.deinit(gpa);
+    }
+    if (builtin.os.tag == .windows) {
+        const keys = [_][]const u8{ "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment", "HKCU\\Environment" };
+        var any = false;
+        for (keys) |key| {
+            const argv = [_][]const u8{ "reg", "query", key, "/v", "Path" };
+            var r = bounded.run(gpa, io, .{ .argv = &argv, .environ_map = env, .bound_ms = 10_000, .stdout_limit = 64 << 10, .stderr_limit = 8 << 10 });
+            defer r.deinit(gpa);
+            if (!r.ok()) continue; // HKCU may hold no Path at all: a normal answer, not an error
+            any = true;
+            var lines = std.mem.tokenizeAny(u8, r.stdout, "\r\n");
+            while (lines.next()) |ln| {
+                const t = std.mem.trim(u8, ln, " \t");
+                if (!std.mem.startsWith(u8, t, "Path")) continue;
+                const kind = std.mem.indexOf(u8, t, "REG_") orelse continue;
+                const after = std.mem.indexOfAnyPos(u8, t, kind, " \t") orelse continue;
+                var dirs = std.mem.splitScalar(u8, std.mem.trim(u8, t[after..], " \t"), ';');
+                while (dirs.next()) |d| {
+                    const dt = std.mem.trim(u8, d, " \t");
+                    if (dt.len > 0) try out.append(gpa, try gpa.dupe(u8, dt));
+                }
+            }
+        }
+        if (!any) return error.PathUnread;
+    } else {
+        const argv = [_][]const u8{ "sh", "-lc", "printf %s \"$PATH\"" };
+        var r = bounded.run(gpa, io, .{ .argv = &argv, .environ_map = env, .bound_ms = 10_000, .stdout_limit = 64 << 10, .stderr_limit = 8 << 10 });
+        defer r.deinit(gpa);
+        if (!r.ok()) return error.PathUnread;
+        var dirs = std.mem.splitScalar(u8, r.stdout, ':');
+        while (dirs.next()) |d| {
+            const dt = std.mem.trim(u8, d, " \r\n\t");
+            if (dt.len > 0) try out.append(gpa, try gpa.dupe(u8, dt));
+        }
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+/// tool_env — persist an env change for every tool run from now on (see the overlay note above).
+///   set:          name=value into the overlay; name "PATH" appends value to PATH_PREPEND instead
+///   refresh_path: PATH_PREPEND := the machine's live PATH (registry / login shell), so a just-installed program
+///                 is found without restarting veil
+///   show:         the overlay as stored
+fn toolEnvTool(ctx: *ToolCtx, args_json: []const u8) []u8 {
+    const gpa = ctx.gpa;
+    const A = struct { action: []const u8 = "", name: []const u8 = "", value: []const u8 = "" };
+    const p = std.json.parseFromSlice(A, gpa, args_json, .{ .ignore_unknown_fields = true }) catch return dupe(gpa, "bad args");
+    defer p.deinit();
+    const action = std.mem.trim(u8, p.value.action, " \r\n\t");
+    if (toolEnvPath() == null) return dupe(gpa, "tool_env is not available in this process (no data dir registered for the overlay)");
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var obj = loadToolEnvObject(arena, ctx.io);
+
+    if (std.mem.eql(u8, action, "show")) {
+        const text = std.json.Stringify.valueAlloc(gpa, obj, .{ .whitespace = .indent_2 }) catch return dupe(gpa, "oom");
+        defer gpa.free(text);
+        return std.fmt.allocPrint(gpa, "tool-env overlay ({s}):\n{s}", .{ TOOL_ENV_APPLIES, text }) catch dupe(gpa, "oom");
+    }
+    if (std.mem.eql(u8, action, "set")) {
+        const name = std.mem.trim(u8, p.value.name, " \r\n\t");
+        const value = std.mem.trim(u8, p.value.value, " \r\n\t");
+        if (!validEnvName(name)) return dupe(gpa, "tool_env set: name must be letters, digits and underscores, not starting with a digit");
+        if (std.mem.eql(u8, name, "PATH")) {
+            if (value.len == 0) return dupe(gpa, "tool_env set PATH: give the directory to put in front of PATH as value");
+            var list: std.json.Array = if (obj.object.get("PATH_PREPEND")) |cur| (if (cur == .array) cur.array else std.json.Array.init(arena)) else std.json.Array.init(arena);
+            for (list.items) |d| if (d == .string and samePathEntry(d.string, value)) {
+                return std.fmt.allocPrint(gpa, "already in front of the tool PATH: {s} ({s})", .{ value, TOOL_ENV_APPLIES }) catch dupe(gpa, "oom");
+            };
+            list.append(.{ .string = arena.dupe(u8, value) catch return dupe(gpa, "oom") }) catch return dupe(gpa, "oom");
+            obj.object.put(arena, "PATH_PREPEND", .{ .array = list }) catch return dupe(gpa, "oom");
+            if (!saveToolEnvObject(gpa, ctx.io, obj)) return dupe(gpa, "tool_env: could not write the overlay file");
+            return std.fmt.allocPrint(gpa, "PATH now starts with {s} for tool runs ({s})", .{ value, TOOL_ENV_APPLIES }) catch dupe(gpa, "oom");
+        }
+        obj.object.put(arena, arena.dupe(u8, name) catch return dupe(gpa, "oom"), .{ .string = arena.dupe(u8, value) catch return dupe(gpa, "oom") }) catch return dupe(gpa, "oom");
+        if (!saveToolEnvObject(gpa, ctx.io, obj)) return dupe(gpa, "tool_env: could not write the overlay file");
+        return std.fmt.allocPrint(gpa, "{s}={s} set for tool runs ({s})", .{ name, value, TOOL_ENV_APPLIES }) catch dupe(gpa, "oom");
+    }
+    if (std.mem.eql(u8, action, "refresh_path")) {
+        const entries = livePathEntries(gpa, ctx.io, ctx.environ) catch
+            return dupe(gpa, if (builtin.os.tag == .windows) "tool_env refresh_path: could not read the machine PATH from the registry (reg query failed)" else "tool_env refresh_path: could not read the login shell's PATH (sh -lc failed)");
+        defer {
+            for (entries) |e| gpa.free(e);
+            gpa.free(entries);
+        }
+        var list = std.json.Array.init(arena);
+        for (entries) |e| {
+            var dup = false;
+            for (list.items) |d| if (d == .string and samePathEntry(d.string, e)) {
+                dup = true;
+                break;
+            };
+            if (!dup) list.append(.{ .string = arena.dupe(u8, e) catch return dupe(gpa, "oom") }) catch return dupe(gpa, "oom");
+        }
+        obj.object.put(arena, "PATH_PREPEND", .{ .array = list }) catch return dupe(gpa, "oom");
+        if (!saveToolEnvObject(gpa, ctx.io, obj)) return dupe(gpa, "tool_env: could not write the overlay file");
+        return std.fmt.allocPrint(gpa, "tool PATH refreshed from the machine's live PATH: {d} entries now in front ({s}). Retry the tool that could not find its program.", .{ list.items.len, TOOL_ENV_APPLIES }) catch dupe(gpa, "oom");
+    }
+    return dupe(gpa, "tool_env: action must be set, refresh_path or show");
+}
+
+// ------------------------------------------------------------------------------------------------ run_shell
+
+/// NL_SHELL_TIMEOUT_S → run_shell's wall-clock cap: the same parser, default and ceiling as run_python's
+/// (pyrunCapS), read from the caller's environ the same way.
+pub fn shellCapS(environ: *const std.process.Environ.Map) u32 {
+    return pyrunCapS(environ.get("NL_SHELL_TIMEOUT_S"));
+}
+
+/// The cap one run_shell call gets: its own timeout_s when given, never above the host cap; absent, zero or
+/// negative means the host cap.
+pub fn shellRunCapS(timeout_s: i64, host_cap_s: u32) u32 {
+    if (timeout_s <= 0) return host_cap_s;
+    return @intCast(@min(timeout_s, @as(i64, host_cap_s)));
+}
+
+const Shell = enum { powershell, bash, sh, cmd };
+
+fn parseShell(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, name: []const u8) ?Shell {
+    const n = std.mem.trim(u8, name, " \r\n\t");
+    if (n.len == 0 or std.mem.eql(u8, n, "auto")) {
+        if (builtin.os.tag == .windows) return .powershell;
+        // bash when the machine has it, else sh: `which` prints only, never runs the target
+        const argv = [_][]const u8{ "which", "bash" };
+        var r = bounded.run(gpa, io, .{ .argv = &argv, .environ_map = env, .bound_ms = 5_000, .stdout_limit = 4096, .stderr_limit = 1024 });
+        defer r.deinit(gpa);
+        return if (r.ok()) .bash else .sh;
+    }
+    if (std.mem.eql(u8, n, "powershell") or std.mem.eql(u8, n, "pwsh")) return .powershell;
+    if (std.mem.eql(u8, n, "bash")) return .bash;
+    if (std.mem.eql(u8, n, "sh")) return .sh;
+    if (std.mem.eql(u8, n, "cmd")) return .cmd;
+    return null;
+}
+
+/// RUN_SHELL — the general executor beside run_python, and the only way the model can INSTALL what run_python
+/// lacks (python itself, a package manager's program) on a bare machine. The script goes to a per-scope file in
+/// the workdir exactly as run_python's does and the shell runs that file; the reply is run_python's own shape
+/// (`exit=N` / stdout / stderr, same clips) so every heuristic that reads a run_python result reads this one.
+/// bounded.run, not std.process.run: the latter's timeout never fires on Windows for a child that prints
+/// nothing, and a shell waiting on an installer's prompt prints nothing.
+fn runShell(ctx: *ToolCtx, args_json: []const u8) []u8 {
+    const gpa = ctx.gpa;
+    const A = struct { shell: []const u8 = "auto", script: []const u8 = "", timeout_s: i64 = 0 };
+    const p = std.json.parseFromSlice(A, gpa, args_json, .{ .ignore_unknown_fields = true }) catch return dupe(gpa, "bad args");
+    defer p.deinit();
+    if (std.mem.trim(u8, p.value.script, " \r\n\t").len == 0) return dupe(gpa, "no script");
+    const shell = parseShell(gpa, ctx.io, ctx.environ, p.value.shell) orelse return dupe(gpa, "run_shell: shell must be auto, powershell, bash, sh or cmd");
+    if (shell == .cmd and builtin.os.tag != .windows) return dupe(gpa, "run_shell: cmd is a Windows shell; on this host use bash, sh or powershell");
+
+    const ext: []const u8 = switch (shell) {
+        .powershell => "ps1",
+        .cmd => "cmd",
+        .bash, .sh => "sh",
+    };
+    // slugified scope, as run_python's script name: ':' in chat:{conv}/sched:{tid} is an ADS/portability hazard
+    var scope_buf: [64]u8 = undefined;
+    const script_name = std.fmt.allocPrint(gpa, ".tool-{s}.{s}", .{ slugify(&scope_buf, ctx.scope), ext }) catch return dupe(gpa, "oom");
+    defer gpa.free(script_name);
+    const script = std.fmt.allocPrint(gpa, "{s}/{s}", .{ ctx.workdir, script_name }) catch return dupe(gpa, "oom");
+    defer gpa.free(script);
+    // The shell gets the file as an EXPLICIT path relative to its cwd (the workdir), never a bare name: `cmd /c
+    // name.cmd` resolves a bare name through the exe search, which skips the current directory on a machine with
+    // NoDefaultCurrentDirectoryInExePath set (measured here: "'.tool-test.cmd' is not recognized", exit 1, with the
+    // file right there in the cwd), while `.\name.cmd` ran. Same form for -File and for sh, where it is harmless.
+    const script_arg = std.fmt.allocPrint(gpa, if (builtin.os.tag == .windows) ".\\{s}" else "./{s}", .{script_name}) catch return dupe(gpa, "oom");
+    defer gpa.free(script_arg);
+    // a trailing newline makes a last line without one run under cmd
+    const body = std.fmt.allocPrint(gpa, "{s}\n", .{p.value.script}) catch return dupe(gpa, "oom");
+    defer gpa.free(body);
+    std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = script, .data = body }) catch return dupe(gpa, "could not write script");
+
+    var env = ctx.environ.clone(gpa) catch return dupe(gpa, "oom");
+    defer env.deinit();
+    prepChildEnv(gpa, ctx.io, &env);
+    inline for (.{ "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "NL_BROKER_AUTH" }) |k| env.put(k, "") catch {};
+
+    const exe: []const u8 = switch (shell) {
+        .powershell => if (builtin.os.tag == .windows) "powershell" else "pwsh",
+        .bash => "bash",
+        .sh => "sh",
+        .cmd => "cmd",
+    };
+    var argv_buf: [7][]const u8 = undefined;
+    const argv: []const []const u8 = switch (shell) {
+        .powershell => blk: {
+            argv_buf = .{ exe, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", script_arg };
+            break :blk argv_buf[0..7];
+        },
+        .bash, .sh => blk: {
+            argv_buf[0] = exe;
+            argv_buf[1] = script_arg;
+            break :blk argv_buf[0..2];
+        },
+        .cmd => blk: {
+            argv_buf[0] = exe;
+            argv_buf[1] = "/d";
+            argv_buf[2] = "/c";
+            argv_buf[3] = script_arg;
+            break :blk argv_buf[0..4];
+        },
+    };
+    const cap_s = shellRunCapS(p.value.timeout_s, shellCapS(ctx.environ));
+    var r = bounded.run(gpa, ctx.io, .{ .argv = argv, .cwd = .{ .path = ctx.workdir }, .environ_map = &env, .bound_ms = @as(u64, cap_s) * 1000, .stdout_limit = 256 << 10, .stderr_limit = 64 << 10 });
+    defer r.deinit(gpa);
+    switch (r.end) {
+        .unstarted => return if (deps.isSpawnMissing(r.err.?))
+            std.fmt.allocPrint(gpa, "{s} not found on PATH — pick another shell (powershell on Windows, bash or sh elsewhere), or install it and run tool_env refresh_path", .{exe}) catch dupe(gpa, "shell not found on PATH")
+        else
+            std.fmt.allocPrint(gpa, "{s} failed to start: {s}", .{ exe, r.why() }) catch dupe(gpa, "shell failed to start"),
+        .unread => return std.fmt.allocPrint(gpa, "{s}: could not read the script's output ({s})", .{ exe, r.why() }) catch dupe(gpa, "shell output unread"),
+        else => {},
+    }
+    // run_python's contract, exactly: exit=N, stdout clipped at the head, stderr head+tail (clipEnds) so the
+    // actual error, which a shell prints LAST, survives the clip. A cut run reports as PYRUN does: exit 124 and
+    // a TIMEOUT line that names the cap as run_shell's own.
+    const exit: u32 = switch (r.end) {
+        .exited => r.code,
+        .killed => 124,
+        else => 255,
+    };
+    const note: []const u8 = switch (r.end) {
+        .killed => std.fmt.allocPrint(gpa, "\nTIMEOUT: the run_shell cap is {d} s and this run reached it. The script was killed with everything it started; the output above is what it printed before that. A sleep or timeout inside the script cannot raise this cap. Split the work into shorter runs, or start a long job in the background with its output sent to a file and watch that file with poll.", .{cap_s}) catch "",
+        .overflow => "\nOUTPUT LIMIT: the script printed past run_shell's limit (256 KB stdout / 64 KB stderr) and was stopped there. Send bulk output to a file and read it with read_file.",
+        .signal => "\n(the script ended on a signal)",
+        else => "",
+    };
+    defer if (r.end == .killed and note.len > 0) gpa.free(@constCast(note));
+    const head, const tail = clipEnds(r.stderr, 1500);
+    if (tail.len == 0)
+        return std.fmt.allocPrint(gpa, "exit={d}\nstdout:\n{s}\nstderr:\n{s}{s}", .{ exit, clip(r.stdout, 4000), head, note }) catch dupe(gpa, "ran");
+    return std.fmt.allocPrint(gpa, "exit={d}\nstdout:\n{s}\nstderr:\n{s}\n  ... [middle lines omitted — the LAST line below is the actual error] ...\n{s}{s}", .{ exit, clip(r.stdout, 4000), head, tail, note }) catch dupe(gpa, "ran");
+}
+
+/// The dep hint for a missing python, plus the sentence that turns it from a dead end into the next tool call.
+pub const PYTHON_MISSING_DOCTRINE = "You can fix this yourself: install it with run_shell (Windows: winget install Python.Python.3; macOS: brew install python; Debian/Ubuntu: apt install python3), then run tool_env with action refresh_path (or tool_env set NL_PYTHON_BIN=<full path>) so the next run_python finds it with no veil restart, and retry — do not tell the user the tools are broken.";
+
+fn pythonMissingForModel(gpa: std.mem.Allocator) []u8 {
+    const h = deps.hint(gpa, "python");
+    defer if (h.len > 0) gpa.free(h);
+    return std.fmt.allocPrint(gpa, "{s}. {s}", .{ h, PYTHON_MISSING_DOCTRINE }) catch dupe(gpa, PYTHON_MISSING_DOCTRINE);
 }
 
 fn runPython(ctx: *ToolCtx, args_json: []const u8) []u8 {
@@ -2353,18 +2765,20 @@ fn runPython(ctx: *ToolCtx, args_json: []const u8) []u8 {
     std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = script, .data = src }) catch return dupe(gpa, "could not write script");
 
     var env = ctx.environ.clone(gpa) catch return dupe(gpa, "oom");
-    forcePyUtf8(&env);
+    prepChildEnv(gpa, ctx.io, &env);
     defer env.deinit();
     inline for (.{ "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "NL_BROKER_AUTH" }) |k| env.put(k, "") catch {};
 
-    const py = if (@import("builtin").os.tag == .windows) "python" else "python3";
+    const py = deps.pythonBin(ctx.io, &env);
     var cap_buf: [10]u8 = undefined;
     const argv = [_][]const u8{ py, "-c", PYRUN, pyrunCapArg(ctx.environ, &cap_buf), script_name };
     // A SPAWN error (python missing / unstartable) is not the same as a script that ran and crashed: the
     // latter returns a RunResult with a non-zero exit and NEVER reaches this catch. So only the genuine
-    // "the interpreter itself is missing" case swaps the flat string for the actionable dep hint.
+    // "the interpreter itself is missing" case swaps the flat string for the actionable dep hint — and for the
+    // model, the way out: it can install the interpreter itself with run_shell, make the new PATH visible with
+    // tool_env, and retry, instead of reporting the tools broken.
     const r = std.process.run(gpa, ctx.io, .{ .argv = &argv, .cwd = .{ .path = ctx.workdir }, .environ_map = &env, .stdout_limit = .limited(256 << 10), .stderr_limit = .limited(64 << 10) }) catch |e|
-        return if (deps.isSpawnMissing(e)) deps.hint(gpa, "python") else dupe(gpa, "python failed to run");
+        return if (deps.isSpawnMissing(e)) pythonMissingForModel(gpa) else dupe(gpa, "python failed to run");
     defer gpa.free(r.stdout);
     defer gpa.free(r.stderr);
     const exit = if (r.term == .exited) r.term.exited else @as(u8, 255);
@@ -2428,7 +2842,195 @@ test "run_python's cap: NL_PYRUN_TIMEOUT_S is bounded both ways, and both belts 
         const def = findSchemaDef(block, "run_python") orelse return error.NoRunPythonDef;
         try std.testing.expect(std.mem.indexOf(u8, def, stated) != null);
         try std.testing.expect(std.mem.indexOf(u8, def, "a timeout= inside your code cannot raise it") != null);
+        // run_shell shares the parser, default and ceiling (shellCapS), so its def states the same number
+        const sh = findSchemaDef(block, "run_shell") orelse return error.NoRunShellDef;
+        try std.testing.expect(std.mem.indexOf(u8, sh, stated) != null);
     }
+}
+
+test "run_shell's cap: NL_SHELL_TIMEOUT_S takes run_python's parser and bounds; a call's timeout_s never exceeds the host cap" {
+    const gpa = std.testing.allocator;
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    try std.testing.expectEqual(PYRUN_CAP_DEFAULT_S, shellCapS(&env));
+    try env.put("NL_SHELL_TIMEOUT_S", "abc");
+    try std.testing.expectEqual(PYRUN_CAP_DEFAULT_S, shellCapS(&env));
+    try env.put("NL_SHELL_TIMEOUT_S", "30");
+    try std.testing.expectEqual(@as(u32, 30), shellCapS(&env));
+    try env.put("NL_SHELL_TIMEOUT_S", "99999");
+    try std.testing.expectEqual(PYRUN_CAP_MAX_S, shellCapS(&env));
+    // per call: absent/zero/negative = the host cap; a smaller value stands; a larger one clamps to the host cap
+    try std.testing.expectEqual(@as(u32, 120), shellRunCapS(0, 120));
+    try std.testing.expectEqual(@as(u32, 120), shellRunCapS(-5, 120));
+    try std.testing.expectEqual(@as(u32, 5), shellRunCapS(5, 120));
+    try std.testing.expectEqual(@as(u32, 120), shellRunCapS(100000, 120));
+    try std.testing.expectEqual(@as(u32, 1), shellRunCapS(1, 120));
+}
+
+test "run_shell answers in run_python's shape with a real shell: exit, stdout and stderr; a cut run says TIMEOUT and exit 124 (real cmd/sh)" {
+    const gpa = std.testing.allocator;
+    var f: PollFixture = undefined;
+    try f.init(gpa);
+    defer f.deinit();
+    const root = "zig-run-shell-tmp";
+    f.scratch(root);
+    defer std.Io.Dir.cwd().deleteTree(f.threaded.io(), root) catch {};
+    var ctx = f.ctx(gpa);
+    ctx.workdir = root;
+    ctx.run_dir = root;
+    { // skip only on proof that the shell the test names is not on this machine (it always is on Windows)
+        const probe_argv = [_][]const u8{ if (builtin.os.tag == .windows) "cmd" else "sh", if (builtin.os.tag == .windows) "/c" else "-c", "exit 0" };
+        var probe = bounded.run(gpa, ctx.io, .{ .argv = &probe_argv, .environ_map = &f.env, .bound_ms = 30_000, .stdout_limit = 256, .stderr_limit = 256 });
+        defer probe.deinit(gpa);
+        if (probe.end == .unstarted) return error.SkipZigTest;
+    }
+    const args = if (builtin.os.tag == .windows)
+        \\{"shell":"cmd","script":"@echo out-line\r\n@echo err-line 1>&2\r\n@exit /b 3"}
+    else
+        \\{"shell":"sh","script":"echo out-line\necho err-line >&2\nexit 3"}
+    ;
+    const out = runShell(&ctx, args);
+    defer gpa.free(out);
+    try std.testing.expect(std.mem.startsWith(u8, out, "exit=3\nstdout:\n"));
+    const so = std.mem.indexOf(u8, out, "\nstdout:\n").?;
+    const se = std.mem.indexOf(u8, out, "\nstderr:\n").?;
+    try std.testing.expectEqualStrings("out-line", std.mem.trim(u8, out[so + "\nstdout:\n".len .. se], " \r\n"));
+    try std.testing.expectEqualStrings("err-line", std.mem.trim(u8, out[se + "\nstderr:\n".len ..], " \r\n"));
+    // the script file lands beside run_python's, per scope, and is left for inspection as run_python leaves its own
+    const left = if (builtin.os.tag == .windows) root ++ "/.tool-test.cmd" else root ++ "/.tool-test.sh";
+    _ = try std.Io.Dir.cwd().statFile(ctx.io, left, .{});
+    if (builtin.os.tag == .windows) {
+        // the Windows DEFAULT (auto = powershell -File): same contract, same exit code, and the ps1 lands too
+        const ps = runShell(&ctx, "{\"script\":\"Write-Output 'out-line'\\n[Console]::Error.WriteLine('err-line')\\nexit 3\"}");
+        defer gpa.free(ps);
+        try std.testing.expect(std.mem.startsWith(u8, ps, "exit=3\nstdout:\n"));
+        try std.testing.expect(std.mem.indexOf(u8, ps, "out-line") != null and std.mem.indexOf(u8, ps, "err-line") != null);
+        _ = try std.Io.Dir.cwd().statFile(ctx.io, root ++ "/.tool-test.ps1", .{});
+    }
+    // a run past its cap is cut, keeps what was printed, and names the cap as run_shell's own
+    const slow = if (builtin.os.tag == .windows)
+        \\{"shell":"cmd","script":"@echo before\r\n@ping -n 30 127.0.0.1 >NUL\r\n@echo after","timeout_s":1}
+    else
+        \\{"shell":"sh","script":"echo before\nsleep 30\necho after","timeout_s":1}
+    ;
+    const cut = runShell(&ctx, slow);
+    defer gpa.free(cut);
+    try std.testing.expect(std.mem.startsWith(u8, cut, "exit=124\n"));
+    try std.testing.expect(std.mem.indexOf(u8, cut, "before") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cut, "after") == null);
+    try std.testing.expect(std.mem.indexOf(u8, cut, "TIMEOUT: the run_shell cap is 1 s") != null);
+    // an unknown shell name and an empty script are refused in words, before anything is written
+    const bad = runShell(&ctx, "{\"shell\":\"fish\",\"script\":\"echo hi\"}");
+    defer gpa.free(bad);
+    try std.testing.expect(std.mem.indexOf(u8, bad, "shell must be") != null);
+    const none = runShell(&ctx, "{\"script\":\"   \"}");
+    defer gpa.free(none);
+    try std.testing.expectEqualStrings("no script", none);
+}
+
+test "the tool-env overlay: string members become env vars, PATH_PREPEND goes in front once each, junk is skipped (pure)" {
+    const gpa = std.testing.allocator;
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    const d = std.fs.path.delimiter;
+    const existing = std.fmt.comptimePrint("/usr/bin{c}/opt/already/", .{d});
+    try env.put("PATH", existing);
+    try env.put("KEEP", "1");
+    // a bad name, a non-string value and a blank PATH entry are all skipped; a dir PATH already holds (trailing
+    // separator and, on Windows, case aside) is not re-added; a repeat inside PATH_PREPEND is added once
+    const overlay = if (builtin.os.tag == .windows)
+        \\{"NL_PYTHON_BIN":"C:/py/python.exe","bad=name":"x","NUM":5,"PATH_PREPEND":["C:/new/bin","/OPT/ALREADY"," ","C:/new/bin/","C:/other"]}
+    else
+        \\{"NL_PYTHON_BIN":"/py/bin/python3","bad=name":"x","NUM":5,"PATH_PREPEND":["/new/bin","/opt/already"," ","/new/bin/","/other"]}
+    ;
+    applyToolEnvJson(gpa, &env, overlay);
+    try std.testing.expectEqualStrings(if (builtin.os.tag == .windows) "C:/py/python.exe" else "/py/bin/python3", env.get("NL_PYTHON_BIN").?);
+    try std.testing.expectEqualStrings("1", env.get("KEEP").?);
+    try std.testing.expect(env.get("bad=name") == null);
+    try std.testing.expect(env.get("NUM") == null);
+    const want = if (builtin.os.tag == .windows)
+        std.fmt.comptimePrint("C:/new/bin{c}C:/other{c}/usr/bin{c}/opt/already/", .{ d, d, d })
+    else
+        std.fmt.comptimePrint("/new/bin{c}/other{c}/usr/bin{c}/opt/already/", .{ d, d, d });
+    try std.testing.expectEqualStrings(want, env.get("PATH").?);
+    // applied twice (every spawn re-reads the file) the PATH does not grow
+    applyToolEnvJson(gpa, &env, overlay);
+    try std.testing.expectEqualStrings(want, env.get("PATH").?);
+    // malformed JSON or a non-object applies nothing
+    applyToolEnvJson(gpa, &env, "{not json");
+    applyToolEnvJson(gpa, &env, "[1,2]");
+    try std.testing.expectEqualStrings(want, env.get("PATH").?);
+    // no PATH at all: the prepend becomes the whole PATH
+    var bare = std.process.Environ.Map.init(gpa);
+    defer bare.deinit();
+    applyToolEnvJson(gpa, &bare, "{\"PATH_PREPEND\":[\"/only\"]}");
+    try std.testing.expectEqualStrings("/only", bare.get("PATH").?);
+}
+
+test "tool_env set/show round trip through the overlay file, and a child env built afterwards carries it" {
+    const gpa = std.testing.allocator;
+    var f: PollFixture = undefined;
+    try f.init(gpa);
+    defer f.deinit();
+    const root = "zig-tool-env-tmp";
+    f.scratch(root);
+    defer std.Io.Dir.cwd().deleteTree(f.threaded.io(), root) catch {};
+    var ctx = f.ctx(gpa);
+    // unregistered: the tool says so and writes nothing
+    clearToolEnvPath();
+    const off = toolEnvTool(&ctx, "{\"action\":\"show\"}");
+    defer gpa.free(off);
+    try std.testing.expect(std.mem.indexOf(u8, off, "not available") != null);
+    setToolEnvPath(root);
+    defer clearToolEnvPath();
+    const s1 = toolEnvTool(&ctx, "{\"action\":\"set\",\"name\":\"NL_PYTHON_BIN\",\"value\":\" /py/bin/python3 \"}");
+    defer gpa.free(s1);
+    try std.testing.expect(std.mem.indexOf(u8, s1, "NL_PYTHON_BIN=/py/bin/python3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s1, TOOL_ENV_APPLIES) != null);
+    const s2 = toolEnvTool(&ctx, "{\"action\":\"set\",\"name\":\"PATH\",\"value\":\"/new/bin\"}");
+    defer gpa.free(s2);
+    try std.testing.expect(std.mem.indexOf(u8, s2, "PATH now starts with /new/bin") != null);
+    const again = toolEnvTool(&ctx, "{\"action\":\"set\",\"name\":\"PATH\",\"value\":\"/new/bin/\"}");
+    defer gpa.free(again);
+    try std.testing.expect(std.mem.indexOf(u8, again, "already in front") != null);
+    const bad = toolEnvTool(&ctx, "{\"action\":\"set\",\"name\":\"1bad\",\"value\":\"x\"}");
+    defer gpa.free(bad);
+    try std.testing.expect(std.mem.indexOf(u8, bad, "name must be") != null);
+    const unknown = toolEnvTool(&ctx, "{\"action\":\"drop\"}");
+    defer gpa.free(unknown);
+    try std.testing.expect(std.mem.indexOf(u8, unknown, "action must be") != null);
+    const shown = toolEnvTool(&ctx, "{\"action\":\"show\"}");
+    defer gpa.free(shown);
+    try std.testing.expect(std.mem.indexOf(u8, shown, "\"NL_PYTHON_BIN\": \"/py/bin/python3\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, shown, "\"/new/bin\"") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, shown, "/new/bin"));
+    // the file is what persists: a fresh env prepared the way every spawn site prepares one carries both
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    try env.put("PATH", "/usr/bin");
+    prepChildEnv(gpa, ctx.io, &env);
+    try std.testing.expectEqualStrings("/py/bin/python3", env.get("NL_PYTHON_BIN").?);
+    try std.testing.expectEqualStrings(std.fmt.comptimePrint("/new/bin{c}/usr/bin", .{std.fs.path.delimiter}), env.get("PATH").?);
+    try std.testing.expectEqualStrings("1", env.get("PYTHONUTF8").?);
+    // and deps.probe resolves on the same overlay (an override file that exists reads as present)
+    try std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = root ++ "/py-stand-in", .data = "" });
+    const s3 = toolEnvTool(&ctx, "{\"action\":\"set\",\"name\":\"NL_PYTHON_BIN\",\"value\":\"" ++ root ++ "/py-stand-in\"}");
+    defer gpa.free(s3);
+    var plain = std.process.Environ.Map.init(gpa);
+    defer plain.deinit();
+    var over = overlaidEnv(gpa, ctx.io, &plain) orelse return error.NoOverlay;
+    defer over.deinit();
+    try std.testing.expectEqualStrings(root ++ "/py-stand-in", deps.pythonBin(ctx.io, &over));
+    // refresh_path reads the machine's live PATH (reg query / sh -lc: both always present where the suite runs)
+    // and replaces PATH_PREPEND with it: at least one directory, and the earlier hand-set entry is gone
+    const refreshed = toolEnvTool(&ctx, "{\"action\":\"refresh_path\"}");
+    defer gpa.free(refreshed);
+    try std.testing.expect(std.mem.indexOf(u8, refreshed, "tool PATH refreshed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, refreshed, ": 0 entries") == null);
+    const after = toolEnvTool(&ctx, "{\"action\":\"show\"}");
+    defer gpa.free(after);
+    try std.testing.expect(std.mem.indexOf(u8, after, "\"/new/bin\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, after, "\"NL_PYTHON_BIN\"") != null); // other members survive a refresh
 }
 
 test "a run_python cap hit keeps what the script printed and names the cap as run_python's own; a pipe-holding child stretches the call by the grace at most, and one that finishes inside it is no cap hit (real python)" {
@@ -2444,7 +3046,7 @@ test "a run_python cap hit keeps what the script printed and names the cap as ru
     var env = environ.createMap(gpa) catch return error.SkipZigTest;
     defer env.deinit();
     { // skip only on proof that the interpreter runPython spawns is not on this machine
-        const py = if (@import("builtin").os.tag == .windows) "python" else "python3";
+        const py = deps.pythonBin(io, &env);
         const probe = std.process.run(gpa, io, .{ .argv = &.{ py, "--version" }, .environ_map = &env, .stdout_limit = .limited(256), .stderr_limit = .limited(256), .timeout = .{ .duration = .{ .raw = .fromSeconds(30), .clock = .awake } } }) catch |e| {
             if (deps.isSpawnMissing(e)) return error.SkipZigTest;
             return e;
@@ -2572,7 +3174,7 @@ pub fn isBuiltinTool(n: []const u8) bool {
     // families were listed only as their exact verbs, so "mcp_lookup" or "browser_summary" slipped through
     // as well. Keep this in sync with the dispatch chain in execute(); the test below reads execute()'s
     // source and fails if the two ever disagree again.
-    const builtins = [_][]const u8{ "run_python", "write_file", "edit_file", "read_file", "absorb", "stage_file", "patch_system", "list_dir", "run_tests", "delete_file", "web_fetch", "web_search", "fetch_json", "read_url", "osint_scan", "deep_crawl", "observe", "recall", "recall_hive", "read_doc", "poll", "stop_process", "share", "probe", "note_stance", "save_skill", "journal", "set_directive", "send_message", "add_task", "claim_task", "complete_task", "stage_delivery", "make_tool", "propose_change", "simulate_change", "propose_plan_change", "ask_veil", "host_status", "host_command", "host_explore", "get_credential", "garrett_tools", "garrett" };
+    const builtins = [_][]const u8{ "run_python", "run_shell", "tool_env", "write_file", "edit_file", "read_file", "absorb", "stage_file", "patch_system", "list_dir", "run_tests", "delete_file", "web_fetch", "web_search", "fetch_json", "read_url", "osint_scan", "deep_crawl", "observe", "recall", "recall_hive", "read_doc", "poll", "stop_process", "share", "probe", "note_stance", "save_skill", "journal", "set_directive", "send_message", "add_task", "claim_task", "complete_task", "stage_delivery", "make_tool", "propose_change", "simulate_change", "propose_plan_change", "ask_veil", "host_status", "host_command", "host_explore", "get_credential", "garrett_tools", "garrett" };
     for (builtins) |b| if (std.mem.eql(u8, b, n)) return true;
     // PREFIX families: execute() routes these with startsWith, so every suffix is reserved, not just the
     // verbs that happen to exist today.
@@ -2651,7 +3253,7 @@ fn runAuthored(ctx: *ToolCtx, name: []const u8, body: []const u8, args_json: []c
     defer gpa.free(script);
     std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = script, .data = src }) catch return dupe(gpa, "could not write tool script");
     var env = ctx.environ.clone(gpa) catch return dupe(gpa, "oom");
-    forcePyUtf8(&env);
+    prepChildEnv(gpa, ctx.io, &env);
     defer env.deinit();
     inline for (.{ "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "NL_BROKER_AUTH" }) |k| env.put(k, "") catch {};
     if (broker_port != 0) {
@@ -2661,7 +3263,7 @@ fn runAuthored(ctx: *ToolCtx, name: []const u8, body: []const u8, args_json: []c
         env.put("NL_BROWSER_KEY", ctx.run_dir) catch {};
     }
     const aj = if (std.mem.trim(u8, args_json, " \r\n\t").len == 0) "{}" else args_json;
-    const py = if (@import("builtin").os.tag == .windows) "python" else "python3";
+    const py = deps.pythonBin(ctx.io, &env);
     var cap_buf: [10]u8 = undefined;
     const argv = [_][]const u8{ py, "-c", PYRUN, pyrunCapArg(ctx.environ, &cap_buf), script_name, aj };
     // spawn-missing (python absent) → the dep hint; a script that ran and failed exits non-zero and is
@@ -3213,10 +3815,10 @@ fn pyCompileError(ctx: *ToolCtx, source: []const u8, orig: []const u8) ?[]u8 {
     if (source.len > 80_000) return null;
     var env = ctx.environ.clone(gpa) catch return null;
     defer env.deinit();
-    forcePyUtf8(&env);
+    prepChildEnv(gpa, ctx.io, &env);
     env.put("NL_CHK_SRC", source) catch return null;
     env.put("NL_CHK_ORIG", if (orig.len > 80_000) source else orig) catch return null;
-    const py = if (@import("builtin").os.tag == .windows) "python" else "python3";
+    const py = deps.pythonBin(ctx.io, &env);
     // dup check counts only UNDECORATED defs: @overload / @singledispatch.register / @property setters
     // legitimately repeat a top-level name — a decorator means "not a plain redefinition".
     const code = "import os,sys,ast\nsrc=os.environ.get('NL_CHK_SRC','')\ntry:\n compile(src,'<edit>','exec')\nexcept SyntaxError as e:\n sys.stdout.write('line %s: %s'%(getattr(e,'lineno','?'),(e.msg or 'syntax error')));sys.exit(7)\nexcept Exception:\n sys.exit(0)\ntry:\n def tops(s):\n  seen=set();d=set()\n  for n in ast.parse(s).body:\n   if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef,ast.ClassDef)) and not n.decorator_list:\n    if n.name in seen: d.add(n.name)\n    seen.add(n.name)\n  return d\n nd=sorted(tops(src)-tops(os.environ.get('NL_CHK_ORIG','')))\n if nd:\n  sys.stdout.write('duplicate top-level definition(s): '+', '.join(nd));sys.exit(8)\nexcept Exception:\n pass\nsys.exit(0)\n";
@@ -3237,7 +3839,7 @@ test "the python edit gate answers through its bounded run: a SyntaxError or a p
     defer f.deinit();
     var ctx = f.ctx(gpa);
     { // skip only on proof that the interpreter the gate spawns is not on this machine
-        const py = if (builtin.os.tag == .windows) "python" else "python3";
+        const py = deps.pythonBin(ctx.io, &f.env);
         var probe = bounded.run(gpa, ctx.io, .{ .argv = &.{ py, "--version" }, .environ_map = &f.env, .bound_ms = 30_000, .stdout_limit = 256, .stderr_limit = 256 });
         defer probe.deinit(gpa);
         if (!probe.ok()) return error.SkipZigTest; // missing, or the Store alias stub
@@ -5127,10 +5729,10 @@ fn listDir(ctx: *ToolCtx, args_json: []const u8) []u8 {
         (gpa.dupe(u8, base) catch return dupe(gpa, "oom"));
     defer gpa.free(full);
     var env = ctx.environ.clone(gpa) catch return dupe(gpa, "oom");
-    forcePyUtf8(&env);
+    prepChildEnv(gpa, ctx.io, &env);
     defer env.deinit();
     inline for (.{ "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "NL_BROKER_AUTH", "NL_LLM_KEY" }) |k| env.put(k, "") catch {};
-    const py = if (builtin.os.tag == .windows) "python" else "python3";
+    const py = deps.pythonBin(ctx.io, &env);
     const argv = [_][]const u8{ py, "-c", LIST_DIR_PY, full };
     const r = std.process.run(gpa, ctx.io, .{ .argv = &argv, .environ_map = &env, .stdout_limit = .limited(64 << 10), .stderr_limit = .limited(8 << 10) }) catch |e|
         return if (deps.isSpawnMissing(e)) deps.hint(gpa, "python") else dupe(gpa, "list_dir failed to run");
@@ -5164,10 +5766,10 @@ fn runTests(ctx: *ToolCtx, args_json: []const u8) []u8 {
     _ = args_json;
     const gpa = ctx.gpa;
     var env = ctx.environ.clone(gpa) catch return dupe(gpa, "oom");
-    forcePyUtf8(&env);
+    prepChildEnv(gpa, ctx.io, &env);
     defer env.deinit();
     inline for (.{ "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "NL_BROKER_AUTH", "NL_LLM_KEY" }) |k| env.put(k, "") catch {};
-    const py = if (builtin.os.tag == .windows) "python" else "python3";
+    const py = deps.pythonBin(ctx.io, &env);
     const argv = [_][]const u8{ py, "-c", RUN_TESTS_PY };
     const r = std.process.run(gpa, ctx.io, .{ .argv = &argv, .cwd = .{ .path = ctx.workdir }, .environ_map = &env, .stdout_limit = .limited(128 << 10), .stderr_limit = .limited(16 << 10) }) catch |e|
         return if (deps.isSpawnMissing(e)) deps.hint(gpa, "python") else dupe(gpa, "run_tests failed to run");
@@ -5591,10 +6193,10 @@ fn patchSystemPatch(ctx: *ToolCtx, root: []const u8, patch: []const u8, crit: []
     defer freePatchSnaps(gpa, &snaps);
 
     var env = ctx.environ.clone(gpa) catch return dupe(gpa, "oom");
-    forcePyUtf8(&env);
+    prepChildEnv(gpa, ctx.io, &env);
     defer env.deinit();
     inline for (.{ "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "NL_BROKER_AUTH" }) |k| env.put(k, "") catch {};
-    const py = if (@import("builtin").os.tag == .windows) "python" else "python3";
+    const py = deps.pythonBin(ctx.io, &env);
     const argv = [_][]const u8{ py, "-c", PATCH_SYSTEM_PATCH_PY, root, patch };
     const r = std.process.run(gpa, ctx.io, .{ .argv = &argv, .environ_map = &env, .stdout_limit = .limited(128 << 10), .stderr_limit = .limited(32 << 10) }) catch |e|
         return if (deps.isSpawnMissing(e)) deps.hint(gpa, "python") else dupe(gpa, "patch_system patch runner failed");
@@ -5756,7 +6358,7 @@ test "sandboxAllowed: every host-reaching tool is refused, the whole hive surfac
         "browser_eval",    "browser_close",    "pixel_ingest",     "pixel_capture",     "mcp_discover",
         "mcp_call",        "get_credential",   "deep_crawl",       "stage_file",        "ask_veil",
         "browser_console", "browser_network",  "browser_click_at", "browser_type_text", "browser_key",
-        "browser_scroll",
+        "browser_scroll",  "run_shell",        "tool_env",
     };
     for (denied) |n| {
         if (sandboxAllowed(n)) {
@@ -5809,7 +6411,7 @@ test "the sandbox gate actually fires in execute, before any tool runs" {
         .caps = .sandboxed,
     };
 
-    for ([_][]const u8{ "run_python", "host_command", "patch_system", "browser_eval", "get_credential" }) |name| {
+    for ([_][]const u8{ "run_python", "run_shell", "tool_env", "host_command", "patch_system", "browser_eval", "get_credential" }) |name| {
         const out = execute(&ctx, name, "{}");
         defer gpa.free(out);
         if (std.mem.indexOf(u8, out, "not available in this workspace") == null) {
@@ -5838,7 +6440,7 @@ test "a GRANT can never smuggle a built-in name past the sandbox gate" {
     var first: ?[]u8 = null;
     defer if (first) |f| gpa.free(f);
 
-    for ([_][]const u8{ "get_credential", "host_command", "host_explore", "ask_veil", "run_python", "mcp_call" }) |name| {
+    for ([_][]const u8{ "get_credential", "host_command", "host_explore", "ask_veil", "run_python", "run_shell", "mcp_call" }) |name| {
         const rec = recipes.Recipe{
             .name = name,
             .description = "innocuous-looking helper",
@@ -6599,10 +7201,10 @@ fn osintScan(ctx: *ToolCtx, args_json: []const u8) []u8 {
     if (!urlAllowed(p.value.url)) return dupe(gpa, "blocked url (only public http/https; no local/internal hosts)");
     if (ctx.egress_allow.len > 0) return dupe(gpa, "osint_scan is disabled under an egress allowlist (it fans out to arbitrary hosts) — use web_fetch/fetch_json on a specific allowlisted URL");
     var env = ctx.environ.clone(gpa) catch return dupe(gpa, "oom");
-    forcePyUtf8(&env);
+    prepChildEnv(gpa, ctx.io, &env);
     defer env.deinit();
     inline for (.{ "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "NL_BROKER_AUTH", "NL_LLM_KEY" }) |k| env.put(k, "") catch {};
-    const py = if (builtin.os.tag == .windows) "python" else "python3";
+    const py = deps.pythonBin(ctx.io, &env);
     const argv = [_][]const u8{ py, "-c", OSINT_SCAN_PY, p.value.url };
     const r = std.process.run(gpa, ctx.io, .{ .argv = &argv, .environ_map = &env, .stdout_limit = .limited(256 << 10), .stderr_limit = .limited(32 << 10) }) catch |e|
         return if (deps.isSpawnMissing(e)) deps.hint(gpa, "python") else dupe(gpa, "osint_scan failed to run");
@@ -6635,10 +7237,10 @@ fn deepCrawl(ctx: *ToolCtx, args_json: []const u8) []u8 {
     const same = if (p.value.same_host) "1" else "0";
 
     var env = ctx.environ.clone(gpa) catch return dupe(gpa, "oom");
-    forcePyUtf8(&env);
+    prepChildEnv(gpa, ctx.io, &env);
     defer env.deinit();
     inline for (.{ "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "NL_BROKER_AUTH", "NL_LLM_KEY" }) |k| env.put(k, "") catch {};
-    const py = if (builtin.os.tag == .windows) "python" else "python3";
+    const py = deps.pythonBin(ctx.io, &env);
     const argv = [_][]const u8{ py, "-c", DEEP_CRAWL_PY, p.value.url, ds, ps, same };
     const r = std.process.run(gpa, ctx.io, .{ .argv = &argv, .environ_map = &env, .stdout_limit = .limited(512 << 10), .stderr_limit = .limited(48 << 10) }) catch |e|
         return if (deps.isSpawnMissing(e)) deps.hint(gpa, "python") else dupe(gpa, "deep_crawl failed to run");
@@ -6738,11 +7340,11 @@ pub fn searchWeb(io: std.Io, gpa: std.mem.Allocator, environ: *const std.process
         gpa.free(@constCast(links));
         var env = environ.clone(gpa) catch return dupe(gpa, "");
         defer env.deinit();
-        forcePyUtf8(&env);
+        prepChildEnv(gpa, io, &env);
         inline for (.{ "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "NL_BROKER_AUTH" }) |k| env.put(k, "") catch {};
         var lbuf: [8]u8 = undefined;
         const ls = std.fmt.bufPrint(&lbuf, "{d}", .{limit}) catch "5";
-        const py = if (@import("builtin").os.tag == .windows) "python" else "python3";
+        const py = deps.pythonBin(io, &env);
         const argv = [_][]const u8{ py, "-c", SEARCH_PY, source, query, ls, workdir };
         // This returns immediately (not enriched), so a missing python can safely surface the dep hint
         // instead of a silent empty result. A python that ran and produced nothing keeps returning "".

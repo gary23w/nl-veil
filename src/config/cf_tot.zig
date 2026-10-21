@@ -1711,7 +1711,7 @@ fn launchJob(app: *App, a: std.mem.Allocator, uid: u64, name: []const u8, conv: 
     const trio: chat_engine.ModelTrio = .{ .coding = .{ .base_url = cf.base_url, .key = cf.key, .model = if (model.len > 0 and model[0] == '@') model else modelcfg.defaults.cf_model } };
     if (!chat_engine.tryBeginTurn(app.io, conv)) return false;
     // loop=1: the drive loop carries the turn to a finished answer with nobody there, as a scheduled run does.
-    chat_engine.spawnTurn(app, uid, conv, trio, text, 1, false, "", false, false, false); // no Agent Garrett: a job runs with the machine's own tools, as the grant said
+    chat_engine.spawnTurn(app, uid, conv, trio, text, 1, false, "", false, false, false, null); // no Agent Garrett: a job runs with the machine's own tools, as the grant said; tool map follows NL_TOOL_MAP
     log.info("tot {s}: job started on this machine in conversation {s}", .{ name, conv });
     return true;
 }
