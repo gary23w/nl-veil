@@ -4566,12 +4566,14 @@ pub const Chat = struct {
         self.refreshConvs(dd, true);
     }
 
-    /// Is a conv id already taken, locally (a desk chats file) or in the server conv list mirror?
+    /// Is a conv id already taken, locally (a desk chats file), in the server conv list mirror, or (NL_FAMILY_VIEW) in
+    /// the server's family view of the open chat, which still lists a sub-chat the 32-row mirror dropped?
     fn convKnown(self: *Chat, dd: []const u8, id: []const u8) bool {
         var pb: [700]u8 = undefined;
         if (std.fmt.bufPrint(&pb, "{s}/.veil-desk/chats/{s}.jsonl", .{ dd, id })) |p| {
             if (Io.Dir.cwd().statFile(self.io, p, .{})) |_| return true else |_| {}
         } else |_| {}
+        if (self.store.familyHas(id)) return true;
         self.store.lock();
         defer self.store.unlock();
         for (self.store.convs[0..self.store.conv_count]) |*cv| {
@@ -4743,6 +4745,9 @@ pub const Chat = struct {
                 _ = self.bgRemove(id);
             }
         }
+        // the family view drops it NOW (NL_FAMILY_VIEW): a lingering tab could be selected and minted again over this
+        // conversation's memory before the next poll says it is gone
+        self.store.familyEvict(id);
         var pb: [700]u8 = undefined;
         const path = std.fmt.bufPrint(&pb, "{s}/.veil-desk/chats/{s}.jsonl", .{ dd, id }) catch return;
         Io.Dir.cwd().deleteFile(self.io, path) catch {};
@@ -4769,6 +4774,9 @@ pub const Chat = struct {
         if (self.runner().chatDelete(self.io, self.gpa, id)) |r| {
             if (r.body.len > 0) self.gpa.free(r.body);
         }
+        // and once more now the server has deleted it: a poll begun after the first evict but answered before the
+        // server's delete still saw the dir, and its reading must not put the tab back
+        self.store.familyEvict(id);
         var was_active = false;
         {
             self.store.lock();
@@ -16146,4 +16154,61 @@ test "tasks: a cancel names a task exactly, or by the command ring's clipped 96-
     @memset(&wide, 'q');
     try std.testing.expect(taskIdIs(&wide, wide[0..96]));
     try std.testing.expect(!taskIdIs(&wide, wide[0..40])); // a short prefix is not a name
+}
+
+test "the family view guards sub-chat slots: a server member the conv mirror dropped is taken, and a local delete evicts it at once" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{ .environ = llm.osEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dd = "zig-family-slot-tmp";
+    Io.Dir.cwd().deleteTree(io, dd) catch {};
+    _ = Io.Dir.cwd().createDirPathStatus(io, dd ++ "/.veil-desk/chats", .default_dir) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dd) catch {};
+    // every server call this drives (the conv list, control, delete) meets a fast, harmless 404
+    const NF = "{\"ok\":false,\"err\":\"not found\"}";
+    var sv: llm.Standin = undefined;
+    try sv.start(io, std.fmt.comptimePrint("HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ NF.len, NF }), false);
+    defer sv.stop();
+    var store = std.testing.allocator.create(Store) catch unreachable;
+    defer std.testing.allocator.destroy(store);
+    store.* = .{};
+    @memcpy(store.settings.data_dir[0..dd.len], dd);
+    store.settings.data_dir_len = dd.len;
+    store.settings.port = sv.port;
+    store.settings.narrator = false;
+    store.settings.server_chat = false;
+    var chat = std.testing.allocator.create(Chat) catch unreachable;
+    defer std.testing.allocator.destroy(chat);
+    chat.* = .{ .io = io, .gpa = std.testing.allocator, .store = store };
+
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = dd ++ "/.veil-desk/chats/c42.jsonl", .data = "{\"title\":\"harbour\"}\n" });
+    const root = "c42";
+    @memcpy(store.conv_active[0..root.len], root);
+    store.conv_active_len = root.len;
+    @memcpy(store.family_root[0..root.len], root);
+    store.family_root_len = root.len;
+    for ([_][]const u8{ "c42", "c42__s1" }, 0..) |id, i| {
+        @memcpy(store.family[i].conv[0..id.len], id);
+        store.family[i].conv_len = @intCast(id.len);
+        store.family[i].status = .finished;
+    }
+    store.family_n = 2;
+    // s1 has no desk file and no mirror row: only the family view knows the server holds it
+    store.family_on = false;
+    try std.testing.expect(!chat.convKnown(dd, "c42__s1"));
+    store.family_on = true;
+    try std.testing.expect(chat.convKnown(dd, "c42__s1"));
+    // so a new sub-chat takes s2, never s1 over the server's s1 and its memory
+    chat.cmdBranchConv(dd);
+    {
+        store.lock();
+        defer store.unlock();
+        try std.testing.expectEqualStrings("c42__s2", store.conv_active[0..store.conv_active_len]);
+    }
+    // deleting s1 here drops it from the view at once, before any poll says so, and again once the server's delete
+    // returned: a poll begun between the two read the dir still there, and its reading is thrown away
+    const gen = store.family_gen;
+    chat.cmdDeleteConv(dd, "c42__s1");
+    try std.testing.expect(!store.familyHas("c42__s1"));
+    try std.testing.expectEqual(@as(u32, 2), store.family_gen -% gen);
 }

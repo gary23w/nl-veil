@@ -39,6 +39,11 @@ pub fn setHost(h: []const u8) void {
 /// Transient failures are retried for GET/DELETE; a POST is tried once (an empty reply might mean the server
 /// already processed it, and a retry would deploy a duplicate swarm).
 fn httpReq(io: Io, gpa: std.mem.Allocator, method: []const u8, port: u16, path: []const u8, token: []const u8, body_json: ?[]const u8, timeout_s: u32) ?Resp {
+    return httpReqTries(io, gpa, method, port, path, token, body_json, timeout_s, MAX_ATTEMPTS);
+}
+
+/// httpReq with its own attempt count: `tries` 1 is one round trip and no retry, for a poll whose next tick is the retry.
+fn httpReqTries(io: Io, gpa: std.mem.Allocator, method: []const u8, port: u16, path: []const u8, token: []const u8, body_json: ?[]const u8, timeout_s: u32, tries: u8) ?Resp {
     log.trace("netcli.httpReq {s} {s} timeout={d}s has_body={}", .{ method, path, timeout_s, body_json != null });
 
     // POST has side effects (deploy/cast); only idempotent GET/DELETE are retried on a transient failure.
@@ -48,7 +53,7 @@ fn httpReq(io: Io, gpa: std.mem.Allocator, method: []const u8, port: u16, path: 
     // calling a thread stuck on every poll that ran into its timeout; the beat on the way out ends the bound.
     defer nap.beat();
     var attempt: u8 = 0;
-    while (attempt < MAX_ATTEMPTS) : (attempt += 1) {
+    while (attempt < tries) : (attempt += 1) {
         if (attempt > 0) {
             // Linear backoff (120ms, 240ms): long enough for a starved worker thread to free, short enough
             // that a healthy call (which never reaches here) is unaffected. NOT io.sleep: this runs on the
@@ -84,12 +89,12 @@ fn httpReq(io: Io, gpa: std.mem.Allocator, method: []const u8, port: u16, path: 
                 return null;
             },
             // reset/short reply/unparseable: a starved pool freeing in tens of ms — worth a retry
-            .failed => log.warn("http: {s} {s} did not complete — server busy (attempt {d}/{d})", .{ method, path, attempt + 1, MAX_ATTEMPTS }),
+            .failed => log.warn("http: {s} {s} did not complete — server busy (attempt {d}/{d})", .{ method, path, attempt + 1, tries }),
         }
 
         if (!idempotent) return null; // side-effecting POST: one shot only, never retry
     }
-    log.err("http: {s} {s} failed after {d} attempts — server busy or down", .{ method, path, MAX_ATTEMPTS });
+    log.err("http: {s} {s} failed after {d} attempts — server busy or down", .{ method, path, tries });
     return null;
 }
 
@@ -181,6 +186,19 @@ pub fn chatConv(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8, co
     const path = std.fmt.bufPrint(&pbuf, "/api/v1/chat/convs/{s}", .{conv}) catch return null;
     return httpReq(io, gpa, "GET", port, path, token, null, 8);
 }
+
+/// GET /api/v1/chat/convs/<conv>/family — the server's family view of `conv` (its primary and every sub-chat, each with a
+/// status, a title and its newest answer; 404 while the server's NL_FAMILY_VIEW is off). The POLLER calls it every few
+/// seconds while a chat is on screen, and that thread also runs Deploy/Stop and every other refresh, so it is ONE
+/// attempt under a short ceiling: a busy server costs one skipped poll, never a held poller. The next tick is the retry.
+pub fn chatFamily(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8, conv: []const u8) ?Resp {
+    log.trace("netcli.chatFamily port={d} conv={s}", .{ port, conv });
+    var pbuf: [200]u8 = undefined;
+    const path = std.fmt.bufPrint(&pbuf, "/api/v1/chat/convs/{s}/family", .{conv}) catch return null;
+    return httpReqTries(io, gpa, "GET", port, path, token, null, FAMILY_TIMEOUT_S, 1);
+}
+/// The family poll's ceiling. A starting value, not a measurement.
+const FAMILY_TIMEOUT_S: u32 = 2;
 
 /// GET /api/v1/metrics/llm — the caller's per-model LLM usage aggregates + 14-day activity series
 /// (server worker/metrics.zig). Feeds the Dashboard's breakdown table and activity bars.

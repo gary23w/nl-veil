@@ -525,6 +525,7 @@ pub fn runApp(data_dir: ?[]const u8, attach: ?AttachTarget) !void {
 
     var store = Store{};
     seedSettings(&store, gpa, io, data_dir, attach);
+    store.family_on = familyEnvOn(gpa);
     if (data_dir != null) updater.start();
     defer if (data_dir != null) updater.finish();
     ui.d_name.len = seedName(&ui.d_name.buf);
@@ -1515,6 +1516,14 @@ fn applyPersistedTheme(store: *Store) void {
     const want = if (tid_len > 0) tid_buf[0..tid_len] else t.idForLegacyInt(legacy);
     if (std.mem.eql(u8, want, t.activeId())) return; // already showing it — nothing to do
     _ = t.applyById(want);
+}
+
+/// NL_FAMILY_VIEW in this process's environment (the family view's desk half, default OFF). Read ONCE, before the
+/// poller and chat threads start, into Store.family_on, so both threads read one field and never the environment.
+fn familyEnvOn(gpa: std.mem.Allocator) bool {
+    var env = std.process.Environ.createMap(llm.osEnviron(), gpa) catch return false;
+    defer env.deinit();
+    return store_mod.familyFlagOn(env.get("NL_FAMILY_VIEW"));
 }
 
 fn seedName(buf: []u8) usize {
@@ -5174,6 +5183,51 @@ fn drawChatProgress(r: t.Rect, status: []const u8) f32 {
     return height + 8;
 }
 
+/// The family view's mark on one chat tab: a status dot in the tab's corner and, under the pointer, what the server last
+/// said of that member (status, title, the head of its newest answer) and, with the server's NL_FAMILY_MSG, the newest
+/// family ledger record it sent or was sent. Nothing without a reading of the member.
+fn famMark(r: t.Rect, m: ?*const store_mod.FamMember, label: []const u8, logs: []const store_mod.FamLog) void {
+    const fm = m orelse return;
+    if (fm.status == .none) return;
+    t.statusDot(@intFromFloat(r.x + r.width - 7), @intFromFloat(r.y + 7), famStatusColor(fm.status));
+    if (t.hovering(r)) {
+        var newest: ?*const store_mod.FamLog = null;
+        for (logs) |*l| {
+            if (std.mem.eql(u8, l.fromStr(), fm.convStr()) or std.mem.eql(u8, l.toStr(), fm.convStr())) newest = l;
+        }
+        var lb: [200]u8 = undefined;
+        const log_line: []const u8 = if (newest) |l| std.fmt.bufPrint(&lb, "\nfamily #{d} {s}: {s}", .{ l.seq, l.kindStr(), l.textStr()[0..@min(l.text_len, 120)] }) catch "" else "";
+        var tb: [600]u8 = undefined;
+        const tip = std.fmt.bufPrint(&tb, "{s} {s}{s}{s}{s}{s}{s}", .{
+            label,
+            @tagName(fm.status),
+            @as([]const u8, if (fm.title_len > 0) ": " else ""),
+            fm.titleStr(),
+            @as([]const u8, if (fm.answer_len > 0) "\nlast answer: " else ""),
+            fm.answerStr(),
+            log_line,
+        }) catch tb[0..0];
+        t.tip(r, tip);
+    }
+}
+
+fn famStatusColor(st: store_mod.FamStatus) t.Color {
+    return switch (st) {
+        .running => t.yellow,
+        .finished => t.green,
+        .failed => t.red,
+        .interrupted => t.orange,
+        .empty, .none => t.comment,
+        .unknown => t.fg_dim,
+    };
+}
+
+/// The member of a family reading whose conv id is `conv`, or null.
+fn famFind(fam: []const store_mod.FamMember, conv: []const u8) ?*const store_mod.FamMember {
+    for (fam) |*m| if (std.mem.eql(u8, m.convStr(), conv)) return m;
+    return null;
+}
+
 fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, stream: []const u8, busy: bool, status: []const u8, cast_live: bool, conv_title: []const u8, convs: []const store_mod.ConvRow, active: []const u8) void {
     // The input row is USER-RESIZABLE (drag the grab strip above it): crafting a long prompt deserves
     // more than three lines. ui.input_extra persists for the session; the transcript view shrinks to
@@ -5205,6 +5259,25 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
     if (active.len > 0) {
         const primary = store_mod.branchConvRoot(active);
         const on_primary = std.mem.eql(u8, active, primary);
+        // THE FAMILY VIEW (NL_FAMILY_VIEW): the poller's last reading of THIS family, when there is one. Drawing it
+        // raises family_watch, so the poller polls the family on screen and no other.
+        var fam: [store_mod.FAMILY_MAX]store_mod.FamMember = undefined;
+        var fam_n: usize = 0;
+        var fam_log: [store_mod.FAMILY_LOG_MAX]store_mod.FamLog = undefined;
+        var fam_log_n: usize = 0;
+        {
+            store.lock();
+            defer store.unlock();
+            if (store.family_on) {
+                store.family_watch = true;
+                if (std.mem.eql(u8, store.family_root[0..store.family_root_len], primary)) {
+                    fam_n = store.family_n;
+                    @memcpy(fam[0..fam_n], store.family[0..fam_n]);
+                    fam_log_n = store.family_log_n;
+                    @memcpy(fam_log[0..fam_log_n], store.family_log[0..fam_log_n]);
+                }
+            }
+        }
         var have: [store_mod.MAX_BRANCHES]bool = @splat(false);
         var have_n: usize = 0;
         for (convs) |*cv| {
@@ -5215,6 +5288,13 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
                 }
             }
         }
+        // the server's family lists every sub-chat dir it holds, so one the 32-row conv mirror dropped is still a tab
+        for (fam[0..fam_n]) |*fm| if (store_mod.branchConvParts(fm.convStr())) |bp| {
+            if (!have[bp.n - 1]) {
+                have[bp.n - 1] = true;
+                have_n += 1;
+            }
+        };
         // the ACTIVE sub-chat may be brand-new (not yet mirrored into the server list) — still a tab
         if (!on_primary) if (store_mod.branchConvParts(active)) |bp| {
             if (!have[bp.n - 1]) {
@@ -5224,8 +5304,10 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
         };
         if (have_n > 0) {
             const tl_main = t.z("Main", .{});
-            if (t.tab(.{ .x = tx, .y = r.y, .width = t.tabW(tl_main), .height = tab_h }, tl_main, on_primary) and !on_primary)
+            const main_r = t.Rect{ .x = tx, .y = r.y, .width = t.tabW(tl_main), .height = tab_h };
+            if (t.tab(main_r, tl_main, on_primary) and !on_primary)
                 store.pushChatCmd(store_mod.mkChatCmd(.select_conv, primary, ""));
+            famMark(main_r, famFind(fam[0..fam_n], primary), "Main", fam_log[0..fam_log_n]);
             tx += t.tabW(tl_main) + 4;
             var bi: u8 = 0;
             while (bi < store_mod.MAX_BRANCHES) : (bi += 1) {
@@ -5234,8 +5316,10 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
                 const bid = std.fmt.bufPrint(&idb, "{s}__s{d}", .{ primary, bi + 1 }) catch continue;
                 const is_on = std.mem.eql(u8, active, bid);
                 const lbl = t.z("s{d}", .{bi + 1});
-                if (t.tab(.{ .x = tx, .y = r.y, .width = t.tabW(lbl), .height = tab_h }, lbl, is_on) and !is_on)
+                const tab_r = t.Rect{ .x = tx, .y = r.y, .width = t.tabW(lbl), .height = tab_h };
+                if (t.tab(tab_r, lbl, is_on) and !is_on)
                     store.pushChatCmd(store_mod.mkChatCmd(.select_conv, bid, ""));
+                famMark(tab_r, famFind(fam[0..fam_n], bid), lbl, fam_log[0..fam_log_n]);
                 tx += t.tabW(lbl) + 4;
                 // the ACTIVE sub-chat carries its delete — sub-chats have no rail row (delete lived there),
                 // so the tab is the one place the affordance can exist. Lands back on Main (cmdDeleteConv).

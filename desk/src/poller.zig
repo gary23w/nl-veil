@@ -80,6 +80,10 @@ pub const Poller = struct {
     last_tot_pad_s: i64 = 0, // the shared scratchpad
     last_bi_s: i64 = 0, // built-in model status poll throttle (0 = poll next tick; verbs reset it)
     last_ds_s: i64 = 0, // training-set capture poll throttle (fast while recording so counts climb live)
+    last_fam_s: i64 = 0, // family view poll throttle (only while a chat is on screen and NL_FAMILY_VIEW is on)
+    fam_seen: FamSeen = .{}, // the family finish notices' one seen map (poller-local)
+    fam_scratch: [store_mod.FAMILY_MAX]store_mod.FamMember = undefined,
+    fam_log_scratch: [store_mod.FAMILY_LOG_MAX]store_mod.FamLog = undefined,
     // built-in transition memory (poller-local): a transfer that lands or fails raises ONE toast,
     // not one per poll tick. Same for the update-check verdict.
     prev_bi_state: [16]u8 = undefined,
@@ -825,6 +829,10 @@ pub const Poller = struct {
                 }
             }
         }
+
+        // 1c'') THE FAMILY VIEW (NL_FAMILY_VIEW): the ON-SCREEN family only (the chat view raises family_watch each frame
+        // it draws), every FAMILY_EVERY_S. Nothing here polls any other family, so their sub-chats still finish silently.
+        self.familyTick(online, now_s);
 
         // 1d) built-in model status — fast (2s) while a transfer runs so the Settings progress bar
         // moves like one, lazy (10s) otherwise. last_bi_s starts 0 and every verb resets it, so the
@@ -2021,6 +2029,93 @@ pub const Poller = struct {
         self.store.pushNotif(if (deploy) "Agent Garrett connected" else "Garrett disconnected", if (warning.len > 0) warning else if (deploy) "Tools discovered. Agent Garrett is on for chat; enable it on each swarm or tater-tot." else "The cloud agent, billing, memory, and API keys are retained in Garrett.", if (warning.len > 0) 2 else 1);
     }
 
+    /// One tick of the family view: poll when NL_FAMILY_VIEW is on, a chat drew this frame (family_watch, lowered here
+    /// every tick), the server is up, and FAMILY_EVERY_S has passed. With the flag off this reads two bools and stops.
+    fn familyTick(self: *Poller, online: bool, now_s: i64) void {
+        const watched = blk: {
+            self.store.lock();
+            defer self.store.unlock();
+            const w = self.store.family_watch and self.store.family_on;
+            self.store.family_watch = false;
+            break :blk w;
+        };
+        if (online and watched and now_s - self.last_fam_s >= FAMILY_EVERY_S) {
+            self.last_fam_s = now_s;
+            self.refreshFamily();
+        }
+    }
+
+    /// GET the on-screen chat's family (netcli.chatFamily: one attempt, a short ceiling) and publish it. A 404 (the
+    /// server's NL_FAMILY_VIEW is off, or the primary is gone) or a refused login clears the view; any other failure
+    /// keeps the last one. A reading begun before a local delete (family_gen moved on) is discarded whole. Finish notices
+    /// go through the one seen map AFTER the publish, and say nothing the user wrote: the narrator speaks every notice.
+    fn refreshFamily(self: *Poller) void {
+        var cb: [64]u8 = undefined;
+        var gen: u32 = 0;
+        const active = blk: {
+            self.store.lock();
+            defer self.store.unlock();
+            const n = self.store.conv_active_len;
+            @memcpy(cb[0..n], self.store.conv_active[0..n]);
+            gen = self.store.family_gen;
+            break :blk cb[0..n];
+        };
+        if (active.len == 0) return;
+        const root = store_mod.branchConvRoot(active);
+        var tbuf: [128]u8 = undefined;
+        const tok = self.tokenSnap(&tbuf);
+        const resp = netcli.chatFamily(self.io, self.gpa, self.port(), tok, root) orelse return;
+        defer if (resp.body.len > 0) self.gpa.free(resp.body);
+        var rb: [64]u8 = undefined;
+        const got: ?FamilyReading = if (resp.status == 200) parseFamily(resp.body, &self.fam_scratch, &rb, &self.fam_log_scratch) else null;
+        if (resp.status == 200 and got == null) return; // a reply that does not parse changes nothing
+        if (resp.status != 200 and resp.status != 404 and resp.status != 401 and resp.status != 403) return; // transient
+        if (!self.publishFamily(gen, got)) return; // a delete landed while this was in flight
+        const members = if (got) |g| self.fam_scratch[0..g.n] else self.fam_scratch[0..0];
+        var notes: [store_mod.FAMILY_MAX]FamSeen.Note = undefined;
+        const nn = self.fam_seen.update(members, active, &notes);
+        for (notes[0..nn]) |note| {
+            var tb: [48]u8 = undefined;
+            const title = famNoteTitle(&tb, note);
+            self.store.pushNotif(title, if (note.failed) "its tab says why" else "its tab has the answer", if (note.failed) 2 else 1);
+        }
+        // the family ledger (server NL_FAMILY_MSG), read only from a reply that carried one: a sub-chat that reported
+        // back, once per record, naming only its tab; and a sub-chat turn too short for any poll to see it running, by
+        // its done record
+        const reading = got orelse return;
+        if (!reading.has_log) return;
+        var reps: [store_mod.FAMILY_LOG_MAX]FamSeen.LogNote = undefined;
+        const nr = self.fam_seen.updateLog(self.fam_log_scratch[0..reading.log_n], root, active, &reps);
+        for (reps[0..nr]) |rep| {
+            var tb: [48]u8 = undefined;
+            switch (rep.what) {
+                .reported => self.store.pushNotif(std.fmt.bufPrint(&tb, "Sub-chat s{d} reported back", .{rep.slot}) catch "Sub-chat reported back", "to the main chat; the main chat sees it", 1),
+                .finished, .failed => {
+                    const failed = rep.what == .failed;
+                    self.store.pushNotif(famNoteTitle(&tb, .{ .slot = rep.slot, .failed = failed }), if (failed) "its tab says why" else "its tab has the answer", if (failed) 2 else 1);
+                },
+            }
+        }
+    }
+
+    /// Publish a reading of fam_scratch (null clears the view) unless a local delete bumped family_gen since `gen` was
+    /// read, in which case nothing is published and false comes back.
+    fn publishFamily(self: *Poller, gen: u32, got: ?FamilyReading) bool {
+        const members = if (got) |g| self.fam_scratch[0..g.n] else self.fam_scratch[0..0];
+        self.store.lock();
+        defer self.store.unlock();
+        if (self.store.family_gen != gen) return false;
+        const r = if (got) |g| g.root else "";
+        @memcpy(self.store.family_root[0..r.len], r);
+        self.store.family_root_len = @intCast(r.len);
+        @memcpy(self.store.family[0..members.len], members);
+        self.store.family_n = @intCast(members.len);
+        const logs = if (got) |g| self.fam_log_scratch[0..g.log_n] else self.fam_log_scratch[0..0];
+        @memcpy(self.store.family_log[0..logs.len], logs);
+        self.store.family_log_n = @intCast(logs.len);
+        return true;
+    }
+
     fn notifyTransitions(self: *Poller, online: bool, swarms: []const scan.SwarmSummary, sel: []const u8, sel_metrics: scan.Metrics) void {
         log.trace("poller.notifyTransitions online={} swarms={d}", .{ online, swarms.len });
         // server up/down
@@ -2081,6 +2176,216 @@ pub const Poller = struct {
         return false;
     }
 };
+
+/// How often the on-screen family is polled. A starting value, not a measurement.
+const FAMILY_EVERY_S: i64 = 3;
+
+const FamilyReading = struct {
+    n: usize,
+    root: []const u8,
+    log_n: usize = 0,
+    /// the reply carried a "log" array (the server's NL_FAMILY_MSG is on), however few records it held
+    has_log: bool = false,
+};
+
+/// The family route's reply: `{"ok":true,"root":"<id>","members":[{"conv","status","title","answer"},...]}`. Members
+/// are read pair by pair (scan.nextJsonPair, strings through scan.unescapeInto, which clips at each field's size), never
+/// by jstr. A member that is neither the root nor one of the root's sub-chats is skipped, so a reply can never put
+/// another family's tab on screen. null when the reply names no root or carries no members array. `root_buf` backs the
+/// returned root. Pure.
+fn parseFamily(body: []const u8, out: []store_mod.FamMember, root_buf: *[64]u8, log_out: []store_mod.FamLog) ?FamilyReading {
+    const rk = "\"root\":\"";
+    const ra = std.mem.indexOf(u8, body, rk) orelse return null;
+    const rs = ra + rk.len;
+    const re = std.mem.indexOfScalarPos(u8, body, rs, '"') orelse return null;
+    const root_raw = body[rs..re];
+    if (root_raw.len == 0 or root_raw.len > root_buf.len) return null;
+    @memcpy(root_buf[0..root_raw.len], root_raw); // a conv id is a safe path segment: no escapes
+    const root = root_buf[0..root_raw.len];
+    const mk = "\"members\":[";
+    const ma = std.mem.indexOf(u8, body, mk) orelse return null;
+    var cur = ma + mk.len;
+    var members_end = cur; // nextJsonObj leaves `cur` at the body's end once it meets the array's ']'
+    var n: usize = 0;
+    while (n < out.len) {
+        const obj = scan.nextJsonObj(body, &cur) orelse break;
+        members_end = cur;
+        var m: store_mod.FamMember = .{};
+        var pc: usize = 0;
+        while (scan.nextJsonPair(obj, &pc)) |pr| {
+            if (!pr.is_str) continue;
+            if (std.mem.eql(u8, pr.key, "conv")) {
+                if (pr.raw.len == 0 or pr.raw.len > m.conv.len) break;
+                @memcpy(m.conv[0..pr.raw.len], pr.raw);
+                m.conv_len = @intCast(pr.raw.len);
+            } else if (std.mem.eql(u8, pr.key, "status")) {
+                var sb: [16]u8 = undefined;
+                m.status = store_mod.famStatusOf(scan.unescapeInto(pr.raw, &sb));
+            } else if (std.mem.eql(u8, pr.key, "title")) {
+                m.title_len = @intCast(scan.unescapeInto(pr.raw, &m.title).len);
+            } else if (std.mem.eql(u8, pr.key, "answer")) {
+                m.answer_len = @intCast(scan.unescapeInto(pr.raw, &m.answer).len);
+            }
+        }
+        const id = m.convStr();
+        if (id.len == 0) continue;
+        const ours = std.mem.eql(u8, id, root) or if (store_mod.branchConvParts(id)) |bp| std.mem.eql(u8, bp.parent, root) else false;
+        if (!ours) continue;
+        out[n] = m;
+        n += 1;
+    }
+    // the ledger (server NL_FAMILY_MSG), after the members: its newest records that fit, oldest first, of this family
+    var ln: usize = 0;
+    var has_log = false;
+    const lk = "\"log\":[";
+    if (std.mem.indexOfPos(u8, body, members_end, lk)) |la| {
+        has_log = true;
+        var lc = la + lk.len;
+        var ring: [store_mod.FAMILY_LOG_MAX * 4]store_mod.FamLog = undefined; // the route sends at most 20
+        var rn: usize = 0;
+        while (scan.nextJsonObj(body, &lc)) |obj| {
+            var r: store_mod.FamLog = .{};
+            var pc: usize = 0;
+            while (scan.nextJsonPair(obj, &pc)) |pr| {
+                if (!pr.is_str and std.mem.eql(u8, pr.key, "seq")) {
+                    r.seq = std.fmt.parseInt(u64, pr.raw, 10) catch 0;
+                } else if (pr.is_str and std.mem.eql(u8, pr.key, "kind")) {
+                    r.kind_len = @intCast(scan.unescapeInto(pr.raw, &r.kind).len);
+                } else if (pr.is_str and std.mem.eql(u8, pr.key, "from")) {
+                    if (pr.raw.len > r.from.len) break;
+                    @memcpy(r.from[0..pr.raw.len], pr.raw);
+                    r.from_len = @intCast(pr.raw.len);
+                } else if (pr.is_str and std.mem.eql(u8, pr.key, "to")) {
+                    if (pr.raw.len > r.to.len) break;
+                    @memcpy(r.to[0..pr.raw.len], pr.raw);
+                    r.to_len = @intCast(pr.raw.len);
+                } else if (pr.is_str and std.mem.eql(u8, pr.key, "text")) {
+                    r.text_len = @intCast(scan.unescapeInto(pr.raw, &r.text).len);
+                } else if (pr.is_str and std.mem.eql(u8, pr.key, "status")) {
+                    var sb: [16]u8 = undefined;
+                    r.failed = std.mem.eql(u8, scan.unescapeInto(pr.raw, &sb), "failed");
+                }
+            }
+            if (r.seq == 0 or store_mod.branchConvRoot(r.fromStr()).len == 0 or !std.mem.eql(u8, store_mod.branchConvRoot(r.fromStr()), root)) continue;
+            ring[rn % ring.len] = r;
+            rn += 1;
+        }
+        const keep = @min(rn, log_out.len);
+        for (0..keep) |i| log_out[i] = ring[(rn - keep + i) % ring.len];
+        ln = keep;
+    }
+    return .{ .n = n, .root = root, .log_n = ln, .has_log = has_log };
+}
+
+/// THE FAMILY FINISH NOTICES' ONE SEEN MAP (poller-local): an entry per member conv id, ARMED while the member reads
+/// running or interrupted, and FIRED once when it next reads finished or failed. So running -> interrupted -> finished
+/// is one finish: the server reads interrupted for the instant between a turn's slot release and its done frame. A
+/// member already finished the first time it is read fires nothing, a member the user has on screen is disarmed without
+/// a notice (they are watching it), and a member missing from a reading is forgotten, so a slot deleted and minted
+/// again starts unarmed. Every family notice goes through here, so a member is announced once whatever reports it:
+/// with the server's ledger on, a sub-chat's done record announces a finish no poll saw coming (a turn that began and
+/// ended between two polls), and a finish already announced from its status takes its done record's notice back.
+const FamSeen = struct {
+    conv: [store_mod.FAMILY_MAX][64]u8 = undefined,
+    len: [store_mod.FAMILY_MAX]u8 = @splat(0),
+    armed: [store_mod.FAMILY_MAX]bool = @splat(false),
+    /// finishes announced from status whose done record has not been read yet
+    fired: [store_mod.FAMILY_MAX]u8 = @splat(0),
+    n: usize = 0,
+    /// the ledger's high-water seq for `log_root`, so each report is announced once (the first reading sets it)
+    log_root: [64]u8 = undefined,
+    log_root_len: u8 = 0,
+    log_seq: u64 = 0,
+
+    const Note = struct { slot: u8, failed: bool };
+    const LogNote = struct { slot: u8, what: enum { reported, finished, failed } };
+
+    /// Fold a reading that carried the ledger in. Every record to the primary newer than the last one seen: a result
+    /// or an answer lands in `out` as a report; a done record lands as a finish, unless this map already announced
+    /// that finish from the member's status (then the record only takes that back), or the member is `on_screen`.
+    /// The first such reading of a family, or of a family other than the last one read, only sets the mark. Returns
+    /// how many.
+    fn updateLog(s: *FamSeen, logs: []const store_mod.FamLog, root: []const u8, on_screen: []const u8, out: []LogNote) usize {
+        const same = s.log_root_len == root.len and std.mem.eql(u8, s.log_root[0..s.log_root_len], root);
+        var top: u64 = if (same) s.log_seq else 0;
+        var k: usize = 0;
+        for (logs) |*r| {
+            defer top = @max(top, r.seq);
+            if (!same or r.seq <= s.log_seq or !std.mem.eql(u8, r.toStr(), root)) continue;
+            const bp = store_mod.branchConvParts(r.fromStr()) orelse continue;
+            if (std.mem.eql(u8, r.kindStr(), "result") or std.mem.eql(u8, r.kindStr(), "answer")) {
+                if (k < out.len) {
+                    out[k] = .{ .slot = bp.n, .what = .reported };
+                    k += 1;
+                }
+            } else if (std.mem.eql(u8, r.kindStr(), "done")) {
+                if (s.find(r.fromStr())) |i| {
+                    s.armed[i] = false; // this turn has ended: a later finished reading is not a new finish
+                    if (s.fired[i] > 0) {
+                        s.fired[i] -= 1;
+                        continue;
+                    }
+                }
+                if (std.mem.eql(u8, r.fromStr(), on_screen)) continue;
+                if (k < out.len) {
+                    out[k] = .{ .slot = bp.n, .what = if (r.failed) .failed else .finished };
+                    k += 1;
+                }
+            }
+        }
+        if (root.len <= s.log_root.len) {
+            @memcpy(s.log_root[0..root.len], root);
+            s.log_root_len = @intCast(root.len);
+        }
+        s.log_seq = top;
+        return k;
+    }
+
+    fn find(s: *const FamSeen, id: []const u8) ?usize {
+        for (0..s.n) |i| if (std.mem.eql(u8, s.conv[i][0..s.len[i]], id)) return i;
+        return null;
+    }
+
+    /// Fold one reading in; the notices it fires land in `out` (slot 0 = the primary). Returns how many.
+    fn update(s: *FamSeen, members: []const store_mod.FamMember, on_screen: []const u8, out: []Note) usize {
+        var next: FamSeen = .{ .log_root = s.log_root, .log_root_len = s.log_root_len, .log_seq = s.log_seq };
+        var k: usize = 0;
+        for (members) |*m| {
+            const id = m.convStr();
+            if (id.len == 0 or next.n >= next.conv.len) continue;
+            var armed = if (s.find(id)) |i| s.armed[i] else false;
+            var fired: u8 = if (s.find(id)) |i| s.fired[i] else 0;
+            switch (m.status) {
+                .running, .interrupted => armed = true,
+                .finished, .failed => if (armed) {
+                    if (!std.mem.eql(u8, id, on_screen) and k < out.len) {
+                        out[k] = .{ .slot = if (store_mod.branchConvParts(id)) |bp| bp.n else 0, .failed = m.status == .failed };
+                        k += 1;
+                    }
+                    // announced, or watched on screen: either way its done record must not announce it again
+                    fired +|= 1;
+                    armed = false;
+                },
+                else => {},
+            }
+            @memcpy(next.conv[next.n][0..id.len], id);
+            next.len[next.n] = @intCast(id.len);
+            next.armed[next.n] = armed;
+            next.fired[next.n] = fired;
+            next.n += 1;
+        }
+        s.* = next;
+        return k;
+    }
+};
+
+/// A family notice's title, naming the member by its tab and nothing the user wrote: "Sub-chat s2 finished", "Main chat
+/// failed".
+fn famNoteTitle(buf: []u8, note: FamSeen.Note) []const u8 {
+    const word: []const u8 = if (note.failed) "failed" else "finished";
+    if (note.slot == 0) return std.fmt.bufPrint(buf, "Main chat {s}", .{word}) catch "Main chat";
+    return std.fmt.bufPrint(buf, "Sub-chat s{d} {s}", .{ note.slot, word }) catch "Sub-chat";
+}
 
 /// Copy the string value of a top-level `"key":"..."` from a flat JSON object into `buf` (unescaping only \/
 /// which appears in the authorize URL). Empty when absent. Used for the OAuth status/start replies, whose
@@ -2972,4 +3277,304 @@ test "a tater-tot's console follows its run: the same name deployed again starts
     // an ended selection with no run to read is not one
     p.setTotSelLocked("", "", true);
     try std.testing.expect(!s.tot_sel_past);
+}
+
+test "the family reply parses pair by pair: escapes undone, fields clipped, another family's member refused" {
+    var out: [store_mod.FAMILY_MAX]store_mod.FamMember = undefined;
+    var rb: [64]u8 = undefined;
+    var lg: [store_mod.FAMILY_LOG_MAX]store_mod.FamLog = undefined;
+    const body =
+        \\{"ok":true,"root":"c42","members":[{"conv":"c42","status":"finished","title":"Map \"the\" charts","answer":"line one\nline two"},{"conv":"c42__s2","status":"running","title":"","answer":""},{"conv":"c99__s1","status":"failed","title":"not ours","answer":""},{"conv":"c42__s3","status":"exploded","title":"a title with \"answer\":\"bait\" in it","answer":""}]}
+    ;
+    const got = parseFamily(body, &out, &rb, &lg).?;
+    try std.testing.expectEqualStrings("c42", got.root);
+    try std.testing.expectEqual(@as(usize, 3), got.n); // c99__s1 belongs to another family
+    try std.testing.expectEqualStrings("c42", out[0].convStr());
+    try std.testing.expectEqual(store_mod.FamStatus.finished, out[0].status);
+    try std.testing.expectEqualStrings("Map \"the\" charts", out[0].titleStr());
+    try std.testing.expectEqualStrings("line one\nline two", out[0].answerStr());
+    try std.testing.expectEqualStrings("c42__s2", out[1].convStr());
+    try std.testing.expectEqual(store_mod.FamStatus.running, out[1].status);
+    // a key-shaped needle inside a title is text, not a field; a status word the desk does not know reads unknown
+    try std.testing.expectEqualStrings("c42__s3", out[2].convStr());
+    try std.testing.expectEqualStrings("a title with \"answer\":\"bait\" in it", out[2].titleStr());
+    try std.testing.expectEqualStrings("", out[2].answerStr());
+    try std.testing.expectEqual(store_mod.FamStatus.unknown, out[2].status);
+    // an answer longer than the row is clipped, never overrun
+    var big: [700]u8 = undefined;
+    @memset(&big, 'y');
+    var bb: [900]u8 = undefined;
+    const long = try std.fmt.bufPrint(&bb, "{{\"ok\":true,\"root\":\"c42\",\"members\":[{{\"conv\":\"c42\",\"status\":\"finished\",\"title\":\"t\",\"answer\":\"{s}\"}}]}}", .{big[0..]});
+    const g2 = parseFamily(long, &out, &rb, &lg).?;
+    try std.testing.expectEqual(@as(usize, 1), g2.n);
+    try std.testing.expectEqual(@as(usize, out[0].answer.len), out[0].answerStr().len);
+    // no root, no members: no reading
+    try std.testing.expect(parseFamily("{\"ok\":false,\"err\":\"not found\"}", &out, &rb, &lg) == null);
+    try std.testing.expect(parseFamily("{\"ok\":true,\"root\":\"c42\"}", &out, &rb, &lg) == null);
+}
+
+fn famRow(id: []const u8, st: store_mod.FamStatus) store_mod.FamMember {
+    var m: store_mod.FamMember = .{ .status = st };
+    @memcpy(m.conv[0..id.len], id);
+    m.conv_len = @intCast(id.len);
+    return m;
+}
+
+test "the family seen map: one notice per finish, running then interrupted then finished is one, nothing for what was already done" {
+    var seen: FamSeen = .{};
+    var notes: [store_mod.FAMILY_MAX]FamSeen.Note = undefined;
+    // first reading: s1 already finished (no notice), s2 running (armed), s3 interrupted (armed)
+    try std.testing.expectEqual(@as(usize, 0), seen.update(&.{ famRow("c42", .finished), famRow("c42__s1", .finished), famRow("c42__s2", .running), famRow("c42__s3", .interrupted) }, "c42", &notes));
+    // s2 passes through interrupted (a turn's slot released before its done frame): still no notice
+    try std.testing.expectEqual(@as(usize, 0), seen.update(&.{ famRow("c42", .finished), famRow("c42__s1", .finished), famRow("c42__s2", .interrupted), famRow("c42__s3", .interrupted) }, "c42", &notes));
+    // s2 finishes, s3 fails: one notice each
+    try std.testing.expectEqual(@as(usize, 2), seen.update(&.{ famRow("c42", .finished), famRow("c42__s1", .finished), famRow("c42__s2", .finished), famRow("c42__s3", .failed) }, "c42", &notes));
+    try std.testing.expectEqual(FamSeen.Note{ .slot = 2, .failed = false }, notes[0]);
+    try std.testing.expectEqual(FamSeen.Note{ .slot = 3, .failed = true }, notes[1]);
+    // the same reading again: nothing more
+    try std.testing.expectEqual(@as(usize, 0), seen.update(&.{ famRow("c42", .finished), famRow("c42__s1", .finished), famRow("c42__s2", .finished), famRow("c42__s3", .failed) }, "c42", &notes));
+    // the member on screen finishes: disarmed without a notice (the user is watching it)
+    _ = seen.update(&.{ famRow("c42", .running), famRow("c42__s1", .running) }, "c42__s1", &notes);
+    try std.testing.expectEqual(@as(usize, 1), seen.update(&.{ famRow("c42", .finished), famRow("c42__s1", .finished) }, "c42__s1", &notes));
+    try std.testing.expectEqual(FamSeen.Note{ .slot = 0, .failed = false }, notes[0]); // the primary is slot 0
+    // a member deleted between readings is forgotten: minted again and found finished, it fires nothing
+    _ = seen.update(&.{ famRow("c42", .finished), famRow("c42__s4", .running) }, "c42", &notes);
+    _ = seen.update(&.{famRow("c42", .finished)}, "c42", &notes);
+    try std.testing.expectEqual(@as(usize, 0), seen.update(&.{ famRow("c42", .finished), famRow("c42__s4", .finished) }, "c42", &notes));
+    var tb: [48]u8 = undefined;
+    try std.testing.expectEqualStrings("Sub-chat s2 finished", famNoteTitle(&tb, .{ .slot = 2, .failed = false }));
+    try std.testing.expectEqualStrings("Main chat failed", famNoteTitle(&tb, .{ .slot = 0, .failed = true }));
+}
+
+fn famReply(comptime body: []const u8) []const u8 {
+    return std.fmt.comptimePrint("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ body.len, body });
+}
+
+test "the family poll: one GET of the on-screen family, published, one notice per finish that speaks no user text, a 404 clears it" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const s = try gpa.create(Store);
+    defer gpa.destroy(s);
+    s.* = .{};
+    s.settings.narrator = true; // read the speech queue, never pumped to the OS here: the poller's tick is not run
+    const tok = "nlk_desk-family-test-token-not-a-real-credential";
+    @memcpy(s.settings.token[0..tok.len], tok);
+    s.settings.token_len = tok.len;
+    s.family_on = true;
+    const active = "c42__s1";
+    @memcpy(s.conv_active[0..active.len], active);
+    s.conv_active_len = active.len;
+    const p = try gpa.create(Poller);
+    defer gpa.destroy(p);
+    p.* = .{ .io = io, .gpa = gpa, .store = s };
+    defer p.log_buf.deinit(gpa);
+
+    const RUNNING = famReply(
+        \\{"ok":true,"root":"c42","members":[{"conv":"c42","status":"finished","title":"Map the charts","answer":"Charted the quay."},{"conv":"c42__s1","status":"finished","title":"","answer":""},{"conv":"c42__s2","status":"running","title":"Sound \"the\" channel","answer":""}]}
+    );
+    const DONE = famReply(
+        \\{"ok":true,"root":"c42","members":[{"conv":"c42","status":"finished","title":"Map the charts","answer":"Charted the quay."},{"conv":"c42__s1","status":"finished","title":"","answer":""},{"conv":"c42__s2","status":"finished","title":"Sound \"the\" channel","answer":"The channel is 12 m deep."}]}
+    );
+    {
+        var sv: @import("llm.zig").Standin = undefined;
+        try sv.start(io, RUNNING, false);
+        defer sv.stop();
+        s.settings.port = sv.port;
+        p.refreshFamily();
+        try std.testing.expectEqual(@as(u32, 1), sv.seen.load(.acquire)); // one attempt
+        const req = sv.request();
+        try std.testing.expect(std.mem.startsWith(u8, req, "GET /api/v1/chat/convs/c42/family ")); // the root, asked from a sub-chat
+        try std.testing.expect(std.mem.indexOf(u8, req, "Bearer " ++ tok) != null);
+    }
+    {
+        s.lock();
+        defer s.unlock();
+        try std.testing.expectEqualStrings("c42", s.family_root[0..s.family_root_len]);
+        try std.testing.expectEqual(@as(u8, 3), s.family_n);
+        try std.testing.expectEqualStrings("Sound \"the\" channel", s.family[2].titleStr());
+        try std.testing.expectEqual(store_mod.FamStatus.running, s.family[2].status);
+        try std.testing.expectEqual(@as(usize, 0), s.notif_count);
+    }
+    for (0..2) |_| {
+        var sv: @import("llm.zig").Standin = undefined;
+        try sv.start(io, DONE, false);
+        defer sv.stop();
+        s.settings.port = sv.port;
+        p.refreshFamily();
+    }
+    {
+        s.lock();
+        defer s.unlock();
+        try std.testing.expectEqual(@as(usize, 1), s.notif_count); // twice read finished, once announced
+        const n = s.notifs[s.notif_head % s.notifs.len];
+        try std.testing.expectEqualStrings("Sub-chat s2 finished", n.titleStr());
+        try std.testing.expectEqualStrings("its tab has the answer", n.bodyStr());
+        try std.testing.expectEqual(@as(usize, 1), s.narr_count);
+        const spoken = s.narr_q[s.narr_head][0..s.narr_lens[s.narr_head]];
+        try std.testing.expectEqualStrings("Sub-chat s2 finished. its tab has the answer", spoken);
+        try std.testing.expect(std.mem.indexOf(u8, spoken, "channel") == null); // nothing the user wrote is read aloud
+        try std.testing.expectEqualStrings("The channel is 12 m deep.", s.family[2].answerStr());
+    }
+    // a reading begun before a local delete is discarded whole
+    {
+        const gen = s.family_gen;
+        s.familyEvict("c42__s2");
+        try std.testing.expect(!p.publishFamily(gen, .{ .n = 3, .root = "c42" }));
+        s.lock();
+        defer s.unlock();
+        try std.testing.expectEqual(@as(u8, 2), s.family_n);
+    }
+    // the server's flag off (404): the view clears
+    {
+        var sv: @import("llm.zig").Standin = undefined;
+        const NF = "{\"ok\":false,\"err\":\"not found\"}";
+        try sv.start(io, std.fmt.comptimePrint("HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ NF.len, NF }), false);
+        defer sv.stop();
+        s.settings.port = sv.port;
+        p.refreshFamily();
+        s.lock();
+        defer s.unlock();
+        try std.testing.expectEqual(@as(u8, 0), s.family_n);
+    }
+    // back with the ledger on: the first reading that carries a log only sets the mark, so a report written while the
+    // desk could not read is not news; the next new one is, once
+    const LOGGED = famReply(
+        \\{"ok":true,"root":"c42","members":[{"conv":"c42","status":"finished","title":"","answer":""},{"conv":"c42__s1","status":"finished","title":"","answer":""}],"log":[{"seq":3,"kind":"result","from":"c42__s1","to":"c42","text":"x","re":0,"status":""}]}
+    );
+    const LOGGED2 = famReply(
+        \\{"ok":true,"root":"c42","members":[{"conv":"c42","status":"finished","title":"","answer":""},{"conv":"c42__s1","status":"finished","title":"","answer":""}],"log":[{"seq":3,"kind":"result","from":"c42__s1","to":"c42","text":"x","re":0,"status":""},{"seq":4,"kind":"result","from":"c42__s1","to":"c42","text":"y","re":0,"status":""}]}
+    );
+    const before = s.notif_count;
+    for ([_][]const u8{ LOGGED, LOGGED2 }) |reply| {
+        var sv: @import("llm.zig").Standin = undefined;
+        try sv.start(io, reply, false);
+        defer sv.stop();
+        s.settings.port = sv.port;
+        p.refreshFamily();
+    }
+    {
+        s.lock();
+        defer s.unlock();
+        try std.testing.expectEqual(before + 1, s.notif_count);
+        try std.testing.expectEqualStrings("Sub-chat s1 reported back", s.notifs[(s.notif_head + s.notif_count - 1) % s.notifs.len].titleStr());
+    }
+}
+
+test "the family tick asks nothing while NL_FAMILY_VIEW is off, or while no chat drew" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var sv: @import("llm.zig").Standin = undefined;
+    try sv.start(io, famReply("{\"ok\":true,\"root\":\"c42\",\"members\":[]}"), false);
+    defer sv.stop();
+    const s = try gpa.create(Store);
+    defer gpa.destroy(s);
+    s.* = .{};
+    s.settings.narrator = false;
+    s.settings.port = sv.port;
+    const active = "c42";
+    @memcpy(s.conv_active[0..active.len], active);
+    s.conv_active_len = active.len;
+    const p = try gpa.create(Poller);
+    defer gpa.destroy(p);
+    p.* = .{ .io = io, .gpa = gpa, .store = s };
+    defer p.log_buf.deinit(gpa);
+    // the flag off: a drawn chat asks nothing
+    s.family_watch = true;
+    p.familyTick(true, 1000);
+    try std.testing.expectEqual(@as(u32, 0), sv.seen.load(.acquire));
+    try std.testing.expect(!s.family_watch); // lowered every tick, so a stale raise never polls later
+    // the flag on, but no chat drew this frame: still nothing
+    s.family_on = true;
+    p.familyTick(true, 1000);
+    try std.testing.expectEqual(@as(u32, 0), sv.seen.load(.acquire));
+    // the server down: nothing
+    s.family_watch = true;
+    p.familyTick(false, 1000);
+    try std.testing.expectEqual(@as(u32, 0), sv.seen.load(.acquire));
+    // on, drawn and up: one poll, then none until FAMILY_EVERY_S has passed
+    s.family_watch = true;
+    p.familyTick(true, 1000);
+    try std.testing.expectEqual(@as(u32, 1), sv.seen.load(.acquire));
+    s.family_watch = true;
+    p.familyTick(true, 1000 + FAMILY_EVERY_S - 1);
+    try std.testing.expectEqual(@as(u32, 1), sv.seen.load(.acquire));
+}
+
+test "the family ledger on the desk: the newest records of this family, a report announced once by its tab, a finish once whichever reports it" {
+    var out: [store_mod.FAMILY_MAX]store_mod.FamMember = undefined;
+    var rb: [64]u8 = undefined;
+    var lg: [store_mod.FAMILY_LOG_MAX]store_mod.FamLog = undefined;
+    const body =
+        \\{"ok":true,"root":"c42","members":[{"conv":"c42","status":"finished","title":"","answer":""},{"conv":"c42__s1","status":"finished","title":"","answer":""}],"log":[{"seq":1,"kind":"question","from":"c42","to":"c42__s1","text":"How \"deep\"?","re":0,"status":""},{"seq":2,"kind":"answer","from":"c42__s1","to":"c42","text":"12 m.","re":1,"status":""},{"seq":3,"kind":"result","from":"c99__s1","to":"c99","text":"another family","re":0,"status":""},{"seq":4,"kind":"done","from":"c42__s1","to":"c42","text":"The channel is 12 m deep.","re":0,"status":"failed"}]}
+    ;
+    const got = parseFamily(body, &out, &rb, &lg).?;
+    try std.testing.expectEqual(@as(usize, 2), got.n);
+    try std.testing.expect(got.has_log);
+    try std.testing.expectEqual(@as(usize, 3), got.log_n); // the other family's record is not this family's
+    try std.testing.expectEqual(@as(u64, 1), lg[0].seq);
+    try std.testing.expectEqualStrings("How \"deep\"?", lg[0].textStr());
+    try std.testing.expectEqualStrings("answer", lg[1].kindStr());
+    try std.testing.expectEqualStrings("c42__s1", lg[1].fromStr());
+    try std.testing.expectEqualStrings("c42", lg[1].toStr());
+    try std.testing.expectEqual(@as(u64, 4), lg[2].seq);
+    try std.testing.expect(lg[2].failed and !lg[1].failed);
+    // a reply with no "log" (the server's ledger off) says so, however its members read
+    var lg2: [store_mod.FAMILY_LOG_MAX]store_mod.FamLog = undefined;
+    const bare = parseFamily("{\"ok\":true,\"root\":\"c42\",\"members\":[{\"conv\":\"c42\",\"status\":\"finished\",\"title\":\"\",\"answer\":\"\"}]}", &out, &rb, &lg2).?;
+    try std.testing.expect(!bare.has_log);
+    _ = parseFamily(body, &out, &rb, &lg).?;
+    // the first reading only sets the mark
+    var seen: FamSeen = .{};
+    var reps: [store_mod.FAMILY_LOG_MAX]FamSeen.LogNote = undefined;
+    try std.testing.expectEqual(@as(usize, 0), seen.updateLog(lg[0..got.log_n], "c42", "", &reps));
+    // a new result from s2, then s2's done record: a turn no poll saw running, so its done record announces the finish
+    var more = lg;
+    more[3] = testFamLog(5, "result", "c42__s2", "c42", false);
+    more[4] = testFamLog(6, "done", "c42__s2", "c42", false);
+    try std.testing.expectEqual(@as(usize, 2), seen.updateLog(more[0..5], "c42", "", &reps));
+    try std.testing.expectEqual(@as(u8, 2), reps[0].slot);
+    try std.testing.expect(reps[0].what == .reported);
+    try std.testing.expect(reps[1].slot == 2 and reps[1].what == .finished);
+    try std.testing.expectEqual(@as(usize, 0), seen.updateLog(more[0..5], "c42", "", &reps)); // read again: nothing
+    // the member seen map keeps the ledger's mark across its own updates
+    var notes: [store_mod.FAMILY_MAX]FamSeen.Note = undefined;
+    _ = seen.update(out[0..got.n], "c42", &notes);
+    try std.testing.expectEqual(@as(u64, 6), seen.log_seq);
+    // s1 seen running, then finished: announced from its status once; its done record then announces nothing
+    var m1: [2]store_mod.FamMember = .{ out[0], out[1] };
+    m1[1].status = .running;
+    try std.testing.expectEqual(@as(usize, 0), seen.update(&m1, "c42", &notes));
+    m1[1].status = .finished;
+    try std.testing.expectEqual(@as(usize, 1), seen.update(&m1, "c42", &notes));
+    more[5] = testFamLog(7, "done", "c42__s1", "c42", false);
+    try std.testing.expectEqual(@as(usize, 0), seen.updateLog(more[0..6], "c42", "", &reps));
+    // a done record read BEFORE the status reads finished: announced from the record, and the later finished reading
+    // fires nothing (the record disarmed it)
+    m1[1].status = .running;
+    _ = seen.update(&m1, "c42", &notes);
+    more[6] = testFamLog(8, "done", "c42__s1", "c42", true);
+    try std.testing.expectEqual(@as(usize, 1), seen.updateLog(more[0..7], "c42", "", &reps));
+    try std.testing.expect(reps[0].slot == 1 and reps[0].what == .failed);
+    m1[1].status = .failed;
+    try std.testing.expectEqual(@as(usize, 0), seen.update(&m1, "c42", &notes));
+    // the member on screen: its done record announces nothing
+    more[7] = testFamLog(9, "done", "c42__s2", "c42", false);
+    try std.testing.expectEqual(@as(usize, 0), seen.updateLog(more[0..8], "c42", "c42__s2", &reps));
+    // another family read: only its mark is set, nothing of the first family is announced
+    try std.testing.expectEqual(@as(usize, 0), seen.updateLog(more[0..8], "c77", "", &reps));
+}
+
+fn testFamLog(seq: u64, kind: []const u8, from: []const u8, to: []const u8, failed: bool) store_mod.FamLog {
+    var r: store_mod.FamLog = .{ .seq = seq, .failed = failed };
+    @memcpy(r.kind[0..kind.len], kind);
+    r.kind_len = @intCast(kind.len);
+    @memcpy(r.from[0..from.len], from);
+    r.from_len = @intCast(from.len);
+    @memcpy(r.to[0..to.len], to);
+    r.to_len = @intCast(to.len);
+    return r;
 }

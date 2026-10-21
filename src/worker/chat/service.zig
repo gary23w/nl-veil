@@ -15,6 +15,7 @@
 //!   GET    /api/v1/chat/convs/:id        -> {ok:true, id, messages:[{role,content,kind,ts}]}   (404 if absent)
 //!   DELETE /api/v1/chat/convs/:id        -> {ok:true}                                          (404 if absent)
 //!   GET    /api/v1/chat/convs/:id/events?from=N -> events.jsonl cursor poll (X-Next-Offset out) — swarmEvents twin
+//!   GET    /api/v1/chat/convs/:id/family -> {ok:true, root, members:[{conv,status,title,answer}]}  (NL_FAMILY_VIEW, default OFF: 404)
 
 const std = @import("std");
 const httpz = @import("httpz");
@@ -30,6 +31,7 @@ const builtin_mod = @import("../builtin.zig"); // the built-in engine's sentinel
 /// wholesale instead of inventing a second secret store.
 pub const SERVER_KEY_UID: u64 = 0;
 const cpaths = @import("paths.zig");
+const family = @import("family.zig"); // the read-only family view behind GET .../family (NL_FAMILY_VIEW)
 const evcursor = @import("../evcursor.zig"); // the poll cursor contract, shared with control/fanout swarmEvents
 const tools = @import("../tools.zig");
 
@@ -334,6 +336,42 @@ pub fn convEvents(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     // the socket — measured 5–60s per empty poll. .TEXT frames empty bodies as Content-Length: 0.
     res.content_type = .TEXT;
     res.body = body;
+}
+
+/// Is GET .../family routed at all? main.zig registers it only when NL_FAMILY_VIEW is on, so with the flag unset the
+/// path is no route, exactly as before the family view existed.
+pub fn familyRouteOn(env: ?*const std.process.Environ.Map) bool {
+    return family.Flags.read(env).view;
+}
+
+/// GET /api/v1/chat/convs/:id/family — the family `id` belongs to: its primary chat and every sub-chat dir, each
+/// with its status, title and newest answer, read by chat/family.zig (which writes nothing). Behind NL_FAMILY_VIEW,
+/// default OFF: unset, main.zig does not route it, and the handler itself answers a signed-in caller 404 as well. 404
+/// too for an unsafe id, a branch of a branch, or a primary with no conversation dir. Ownership is structural, as on
+/// every route here.
+pub fn convFamily(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
+    const u = requireUser(app, req, res) orelse return;
+    const flags = family.Flags.read(app.sup.parent_env);
+    if (!flags.view) return notFound(res);
+    const id = req.param("id") orelse return badReq(res, "no id");
+    const seg = safeSeg(id);
+    if (seg.len == 0) return notFound(res);
+    const base = try std.fmt.allocPrint(res.arena, "{s}/u{d}/_chat", .{ app.data, u.id });
+    var fam = (try family.load(app.gpa, app.io, base, u.id, seg, chat_engine.isTurnLiveFor)) orelse return notFound(res);
+    defer fam.deinit();
+    // NL_FAMILY_MSG: the ledger's newest records ride too, for the desk to show
+    var log: ?family.Log = if (flags.msg) blk: {
+        const pdir = try std.fmt.allocPrint(res.arena, "{s}/convs/{s}", .{ base, fam.root });
+        break :blk try family.readLog(app.gpa, app.io, pdir, family.LOG_TAIL_BYTES);
+    } else null;
+    defer if (log) |*l| l.deinit();
+    // ...and a sub-chat's answer is the one its turn settled on, from its done record
+    if (log) |*l| try family.answersFromLog(app.gpa, &fam, l);
+    var arr: std.ArrayListUnmanaged(u8) = .empty;
+    defer arr.deinit(app.gpa);
+    try family.familyJsonLog(app.gpa, &arr, &fam, if (log) |*l| l else null);
+    res.content_type = .JSON;
+    res.body = try res.arena.dupe(u8, arr.items);
 }
 
 /// POST /api/v1/chat/convs/:id/messages — run ONE server-side agentic turn for this conversation. ON by default
@@ -881,6 +919,7 @@ const CHAT_ROUTES = [_]struct { name: []const u8, f: Handler }{
     .{ .name = "getConv", .f = getConv },
     .{ .name = "deleteConv", .f = deleteConv },
     .{ .name = "convEvents", .f = convEvents },
+    .{ .name = "convFamily", .f = convFamily },
     .{ .name = "postMessage", .f = postMessage },
     .{ .name = "toolResult", .f = toolResult },
     .{ .name = "chatControl", .f = chatControl },
@@ -1029,5 +1068,156 @@ test "a malformed message body is 400, not 500, and never starts a turn" {
     switch (chat_engine.beginTurn(io, "badbody", 1)) {
         .ok => chat_engine.endTurn(io, "badbody"), // free: no turn was ever claimed, which is the point
         else => return error.MalformedBodyClaimedATurn,
+    }
+}
+
+test "the sub-chat gate today: a branch of a branch and a branch of an unknown primary are 400, and neither mints a conversation" {
+    // A GOLDEN of today's gate, pinned before the family view reads the same id grammar. It skips without
+    // bin/neuron.exe (no account can be made), like the malformed-body test above.
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-chatsvc-subgate-tmp";
+    var ta = try http.testApp(gpa, io, root);
+    defer ta.deinit();
+
+    ta.auth.register("sub@gate.test", "correct horse battery") catch return error.SkipZigTest;
+    const token = ta.auth.login("sub@gate.test", "correct horse battery") catch return error.SkipZigTest;
+    defer gpa.free(token);
+    const cookie = try std.fmt.allocPrint(gpa, http.COOKIE ++ "={s}", .{token});
+    defer gpa.free(cookie);
+    const uid = (ta.auth.whoami(token) orelse return error.TestUnexpectedResult).id;
+    // the nested case has a real primary AND a real first-level branch on disk, so only the nesting refuses it
+    for ([_][]const u8{ "a", "a__s1" }) |c| {
+        const d = try std.fmt.allocPrint(gpa, "{s}/u{d}/_chat/convs/{s}", .{ root, uid, c });
+        defer gpa.free(d);
+        _ = try std.Io.Dir.cwd().createDirPathStatus(io, d, .default_dir);
+    }
+
+    const Case = struct { id: []const u8, body: []const u8 };
+    for ([_]Case{
+        .{ .id = "a__s1__s2", .body = "{\"ok\":false,\"err\":\"a sub-chat cannot branch again — branch from the primary chat\"}" },
+        .{ .id = "nope__s1", .body = "{\"ok\":false,\"err\":\"unknown primary chat for this sub-chat\"}" },
+    }) |c| {
+        var web = httpz.testing.init(.{});
+        defer web.deinit();
+        web.header("cookie", cookie);
+        web.param("id", c.id);
+        web.body("{\"text\":\"hello there, a real message\"}");
+        try postMessage(&ta.app, web.req, web.res);
+        try web.expectStatus(400);
+        try web.expectBody(c.body);
+        // nothing minted, nothing claimed
+        const d = try std.fmt.allocPrint(gpa, "{s}/u{d}/_chat/convs/{s}", .{ root, uid, c.id });
+        defer gpa.free(d);
+        if (std.Io.Dir.cwd().access(io, d, .{})) |_| return error.GateMintedAConversation else |_| {}
+        switch (chat_engine.beginTurn(io, c.id, uid)) {
+            .ok => chat_engine.endTurn(io, c.id),
+            else => return error.GateClaimedATurn,
+        }
+    }
+}
+
+test "the family route: 404 after auth while NL_FAMILY_VIEW is unset or off, the family's members when it is on, and it writes nothing" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-chatsvc-family-tmp";
+    var ta = try http.testApp(gpa, io, root);
+    defer ta.deinit();
+
+    ta.auth.register("fam@view.test", "correct horse battery") catch return error.SkipZigTest;
+    const token = ta.auth.login("fam@view.test", "correct horse battery") catch return error.SkipZigTest;
+    defer gpa.free(token);
+    const cookie = try std.fmt.allocPrint(gpa, http.COOKIE ++ "={s}", .{token});
+    defer gpa.free(cookie);
+    const uid = (ta.auth.whoami(token) orelse return error.TestUnexpectedResult).id;
+
+    const files = [_]struct { conv: []const u8, name: []const u8, data: []const u8 }{
+        .{ .conv = "fv1", .name = "messages.jsonl", .data = "{\"role\":\"user\",\"content\":\"Map the harbour charts.\",\"kind\":\"user\",\"ts\":1}\n" ++
+            "{\"role\":\"assistant\",\"content\":\"Charted the north quay.\",\"kind\":\"veil\",\"ts\":2}\n" },
+        .{ .conv = "fv1", .name = "events.jsonl", .data = "{\"kind\":\"status\",\"text\":\"thinking\"}\n{\"kind\":\"done\"}\n" },
+        .{ .conv = "fv1__s2", .name = "messages.jsonl", .data = "{\"role\":\"user\",\"content\":\"Sound the channel.\",\"kind\":\"user\",\"ts\":3}\n" ++
+            "{\"role\":\"assistant\",\"content\":\"first pass\",\"kind\":\"veil\",\"ts\":4}\n" },
+        .{ .conv = "fv1__s2", .name = "events.jsonl", .data = "{\"kind\":\"error\",\"err\":\"provider said no\"}\n{\"kind\":\"done\"}\n" },
+    };
+    for (files) |f| {
+        const d = try std.fmt.allocPrint(gpa, "{s}/u{d}/_chat/convs/{s}", .{ root, uid, f.conv });
+        defer gpa.free(d);
+        _ = try std.Io.Dir.cwd().createDirPathStatus(io, d, .default_dir);
+        const p = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ d, f.name });
+        defer gpa.free(p);
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = p, .data = f.data });
+    }
+    const NOT_FOUND = "{\"ok\":false,\"err\":\"not found\"}";
+    const FAMILY = "{\"ok\":true,\"root\":\"fv1\",\"members\":[" ++
+        "{\"conv\":\"fv1\",\"status\":\"finished\",\"title\":\"Map the harbour charts.\",\"answer\":\"Charted the north quay.\"}," ++
+        "{\"conv\":\"fv1__s2\",\"status\":\"failed\",\"title\":\"Sound the channel.\",\"answer\":\"first pass\"}]}";
+
+    const Case = struct { flag: ?[]const u8, id: []const u8, status: u16, body: []const u8 };
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    for ([_]Case{
+        // the flag unset: no server env at all, then a server env without it
+        .{ .flag = null, .id = "fv1", .status = 404, .body = NOT_FOUND },
+        .{ .flag = "", .id = "fv1", .status = 404, .body = NOT_FOUND },
+        .{ .flag = "0", .id = "fv1", .status = 404, .body = NOT_FOUND },
+        .{ .flag = "off", .id = "fv1", .status = 404, .body = NOT_FOUND },
+        .{ .flag = "1", .id = "fv1", .status = 200, .body = FAMILY },
+        .{ .flag = "1", .id = "fv1__s2", .status = 200, .body = FAMILY }, // asked from a member: the same family
+        .{ .flag = "1", .id = "fv1__s4", .status = 200, .body = FAMILY }, // a slot with no dir: still the family
+        .{ .flag = "1", .id = "fv1__s1__s2", .status = 404, .body = NOT_FOUND }, // a branch of a branch
+        .{ .flag = "1", .id = "absent", .status = 404, .body = NOT_FOUND },
+        .{ .flag = "1", .id = "../fv1", .status = 404, .body = NOT_FOUND },
+    }, 0..) |c, i| {
+        if (i == 0) {
+            ta.sup.parent_env = null;
+        } else {
+            const v = c.flag orelse "";
+            if (v.len > 0) {
+                try env.put("NL_FAMILY_VIEW", v);
+            } else {
+                _ = env.swapRemove("NL_FAMILY_VIEW");
+            }
+            ta.sup.parent_env = &env;
+        }
+        defer ta.sup.parent_env = null;
+        var web = httpz.testing.init(.{});
+        defer web.deinit();
+        web.header("cookie", cookie);
+        web.param("id", c.id);
+        try convFamily(&ta.app, web.req, web.res);
+        errdefer std.debug.print("\nfamily route, flag {?s}, id {s}: {d}\n", .{ c.flag, c.id, web.res.status });
+        try web.expectStatus(c.status);
+        try web.expectBody(c.body);
+    }
+    // NL_FAMILY_MSG on beside it: the same members, and the ledger's records after them (none written here)
+    {
+        try env.put("NL_FAMILY_VIEW", "1");
+        try env.put("NL_FAMILY_MSG", "1");
+        ta.sup.parent_env = &env;
+        defer ta.sup.parent_env = null;
+        var web = httpz.testing.init(.{});
+        defer web.deinit();
+        web.header("cookie", cookie);
+        web.param("id", "fv1");
+        try convFamily(&ta.app, web.req, web.res);
+        try web.expectStatus(200);
+        try web.expectBody(FAMILY[0 .. FAMILY.len - 1] ++ ",\"log\":[]}");
+    }
+    // read-only: every file is byte-identical and no member dir was made
+    for (files) |f| {
+        const p = try std.fmt.allocPrint(gpa, "{s}/u{d}/_chat/convs/{s}/{s}", .{ root, uid, f.conv, f.name });
+        defer gpa.free(p);
+        const got = try std.Io.Dir.cwd().readFileAlloc(io, p, gpa, .limited(1 << 16));
+        defer gpa.free(got);
+        try std.testing.expectEqualStrings(f.data, got);
+    }
+    for ([_][]const u8{ "fv1__s1", "fv1__s4", "absent" }) |c| {
+        const d = try std.fmt.allocPrint(gpa, "{s}/u{d}/_chat/convs/{s}", .{ root, uid, c });
+        defer gpa.free(d);
+        if (std.Io.Dir.cwd().access(io, d, .{})) |_| return error.FamilyRouteMadeADir else |_| {}
     }
 }

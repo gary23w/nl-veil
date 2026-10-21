@@ -43,6 +43,8 @@ const deploy_service = @import("../deploy/service.zig");
 const sched = @import("../sched.zig"); // mutual import (sched spawns turns here); Zig resolves it lazily
 const metrics = @import("../metrics.zig"); // per-turn LLM usage lines behind the desk Dashboard
 const cpaths = @import("paths.zig"); // conv → build-tree mapping (scheduled runs live under _sched/{task}/runs/)
+const family = @import("family.zig"); // the read-only family view: members, true status words, the NL_FAMILY_* flags
+const famlog = @import("famlog.zig"); // the family ledger's one writer (NL_FAMILY_MSG)
 const continuity = @import("../continuity.zig"); // durable resume anchors, shared with the swarm + sched
 
 // Raw-thread sleep (supervisor.zig's threadSleepMs twin): the chat turn runs on a raw detached std.Thread
@@ -1022,6 +1024,9 @@ test "memory-weave gates: echo tools, credential-shaped results, note atomizatio
     try std.testing.expect(memoryEchoTool("observe"));
     try std.testing.expect(!memoryEchoTool("web_search"));
     try std.testing.expect(!memoryEchoTool("read_file"));
+    // the family's messages are a model's words, not findings (NL_FAMILY_MSG)
+    try std.testing.expect(memoryEchoTool("message_subchat"));
+    try std.testing.expect(memoryEchoTool("report_to_primary"));
     // result-side credential scan (the args were clean; the VALUE came back in the body)
     try std.testing.expect(containsCredentialKey("status=200, body={\"csrf\":\"cku...\"}"));
     try std.testing.expect(containsCredentialKey("set-cookie: session=abc"));
@@ -2199,6 +2204,7 @@ fn signalDone(app: *App, uid: u64, conv: []const u8) void {
     const dir = std.fmt.allocPrint(gpa, "{s}/u{d}/_chat/convs/{s}", .{ app.data, uid, conv }) catch return;
     defer gpa.free(dir);
     emitEvent(app, dir, "{\"kind\":\"done\"}");
+    familyAfterTurn(app, conv, dir); // NL_FAMILY_MSG: a sub-chat's done record
 }
 
 /// Append `obj` (a complete, already-escaped single-line JSON object) as one line to events.jsonl.
@@ -2749,6 +2755,12 @@ test "tool map: per-turn preference overrides environment, absent preserves it" 
 
 pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text_raw: []const u8, loop: u8, tool_client_req: bool, image_b64: []const u8, fast: bool, trace_req: bool, garrett_req: bool, tool_map_req: ?bool) void {
     const gpa = app.gpa;
+    // NL_FAMILY_MSG: did a family message start this turn (familyWake marks a conversation before its turn begins,
+    // one mark per conversation)? Read once, first, and cleared when the turn returns, before its caller releases the
+    // conversation's slot: so the mark is this turn's from its start to its end, and no later wake's mark is ever
+    // this turn's to clear. Without the flag nothing is ever marked, and this reads false.
+    const fam_woken = familyWoken(app.io, conv);
+    defer if (fam_woken) familyWakeClear(app.io, conv);
 
     // TOOL DELEGATION IS ADMIN-ONLY, and the check belongs HERE rather than at the delegation branch.
     // `tool_client` arrives as a plain bool on the request body (chat/service.zig), so it is caller-controlled:
@@ -2785,6 +2797,11 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     const conv_dir = std.fmt.allocPrint(gpa, "{s}/convs/{s}", .{ base, conv }) catch return;
     defer gpa.free(conv_dir);
     _ = std.Io.Dir.cwd().createDirPathStatus(app.io, conv_dir, .default_dir) catch {};
+    // NL_FAMILY_MSG, a sub-chat: the answer this turn settles on, and whether it failed, handed on to its done record
+    // when the turn returns (FamilyTurn). Off, or in a primary, it holds nothing and does nothing.
+    var fam_turn: FamilyTurn = .{};
+    fam_turn.begin(app, conv, conv_dir);
+    defer fam_turn.end(app, conv, conv_dir);
 
     // Arm this thread's per-call `llm` frame target. Same thread-local trick as metrics.beginTurn above, and for
     // the same reason: the ten labeled call sites live in helpers that mostly never see conv_dir. Disarmed on
@@ -3234,6 +3251,30 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
             turn_tools = t;
         } else |_| {}
     }
+    // THE FAMILY'S VERBS (NL_FAMILY_NET: recall_node's family definition; NL_FAMILY_MSG: the messaging verb), each
+    // chosen on its flag and this conversation's place in its family, both turn-stable, so the tools array holds still.
+    // `turn_tools` is the INSIDE of the request's "tools":[...] (llm.zig wraps it), so each is appended after a comma
+    // (withToolDef). The splice above looks for a closing ']' that inner list never ends with, so with every family
+    // flag off recall_node is advertised exactly as it is today. The messaging verb needs the net too: the ledger
+    // reaches a conversation only through its net (family.Pool), so without one there is nothing to promise. With the
+    // tool map on, each also joins the walk's core (familyMapKeep), so the array the walk rebuilds keeps it.
+    var fam_recall_owned: ?[]u8 = null;
+    defer if (fam_recall_owned) |t| gpa.free(t);
+    var fam_tools_owned: ?[]u8 = null;
+    defer if (fam_tools_owned) |t| gpa.free(t);
+    {
+        const ff = family.Flags.read(environ);
+        if (net_on and ff.net != .off and recall_tools_owned == null) if (withToolDef(gpa, turn_tools, recallNodeDef(ff.net))) |t| {
+            fam_recall_owned = t;
+            turn_tools = t;
+            familyMapKeep(gpa, &map_core, &map_walk, recallNodeDef(ff.net));
+        };
+        if (familyMsgDef(ff.msg and net_on, conv, ctx.caps == .sandboxed)) |def| if (withToolDef(gpa, turn_tools, def)) |t| {
+            fam_tools_owned = t;
+            turn_tools = t;
+            familyMapKeep(gpa, &map_core, &map_walk, def);
+        };
+    }
     if (net_on) emitKV(app, conv_dir, "trace", "text", "context: every request is unfolded from the conversation's store (Gary's 4tope); nothing is folded or carried (NL_CONTEXT=fold restores the fold)");
     conv_buf.appendSlice(gpa, "{\"role\":\"system\",\"content\":") catch return;
     // Tier-paired with the belt: the compact belt gets the compact prompt. One decides WHAT is advertised, the
@@ -3442,7 +3483,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     }
     // SUB-CHAT FAMILY CONTEXT: a branch re-anchors on the primary (live goal + latest progress); a primary
     // lists its live branches. Varies per turn → rides the recall-fragment channel, never the stable prefix.
-    injectFamilyContext(app, conv, base, &ws);
+    injectFamilyContext(app, conv, base, &ws, .{ .status = family.Flags.read(environ).status, .uid = uid });
     // PLUGIN PROMPT HOOKS: any loaded plugin's veil.on_prompt(fn) may add system-prompt text for this turn
     // (a house style, a compliance reminder, project context). Rides the per-turn recall channel — NEVER the
     // stable prefix — so the provider prompt-prefix cache is untouched (same discipline as recall above).
@@ -3570,10 +3611,10 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     // A SCHEDULED run's message ends in engine-authored boilerplate (RUN CONTEXT / WORKDIR / SELF-HEAL) — that
     // is chrome, not knowledge; stored, it resurfaced in later runs' recall as junk facts ("--- SCHEDULED RUN
     // CONTEXT ---", the workdir paragraph — observed live in sched:* scopes). Store the task's own words only.
-    defer {
+    defer if (!fam_woken) { // a turn a family message woke opens on the primary model's words: never observed
         const cut = std.mem.indexOf(u8, user_text, "--- SCHEDULED RUN CONTEXT") orelse user_text.len;
         _ = ctx.mem.observe(mem_scope, user_text[0..cut]);
-    }
+    };
 
     // TOOL-FINDING OBSERVES, BATCHED: each observe is a subprocess spawn, and doing one between every tool call
     // serialized big tool batches (a 40-tool storm paid ~40 spawns inline). The tool loop appends preformatted
@@ -3756,6 +3797,27 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
             verify_buf.append(gpa, '\n') catch break;
         }
         break :blk_vp verify_buf.items;
+    };
+
+    // ---- THE FAMILY IN THE NET (NL_FAMILY_NET, default OFF): the other members of this conversation's family, each
+    // one's 4tope built from its own store alone (family.Pool), ride in every request's net as one capped, labelled
+    // section (store.zig assemble). Read once here, again at most every family.REFRESH_MS. Off, or with no net, the store
+    // has no hook and every request is the one it has always been. ----
+    var fam_pool: ?family.Pool = null;
+    defer if (fam_pool) |*fp| fp.deinit();
+    defer if (store) |*s| {
+        s.family = null; // runs before the pool goes (defers run last-first): the store never holds a hook into it
+    };
+    const fam_flags = family.Flags.read(environ);
+    const fam_net = fam_flags.net;
+    if (net_on and (fam_net != .off or fam_flags.msg)) if (store) |*s| {
+        const t_load = nowMillis(app.io);
+        fam_pool = family.Pool.init(gpa, app.io, base, conv, fam_net, familyKeep, t_load, fam_flags.msg) catch null;
+        if (fam_pool) |*fp| {
+            s.family = .{ .ctx = fp, .refresh = familyRefresh, .render = familyRender };
+            var tb: [200]u8 = undefined;
+            emitKV(app, conv_dir, "trace", "text", std.fmt.bufPrint(&tb, "family net ({s}, ledger {s}): {d} other member(s) read in {d} ms", .{ @tagName(fam_net), if (fam_flags.msg) "on" else "off", fp.members.items.len, nowMillis(app.io) - t_load }) catch "family net on");
+        }
     };
 
     // ---- AUTO-LOOP DRIVE: settle one answer, then either take the next PLAN subtask (deterministic) or infer the
@@ -4142,6 +4204,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
                 if (shown.len > 0) {
                     appendMsg(app, conv_dir, "assistant", shown, "veil", nowSecs(app.io));
                     emitAssistant(app, conv_dir, shown);
+                    fam_turn.note(gpa, shown);
                 }
                 // The ENGINE's account of the stop is stored as its own `role:"system"` / `kind:"engine"` row —
                 // never merged into the assistant message above. Replay renders a system row as a system turn
@@ -4610,6 +4673,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
         if (route != .picker) {
             appendMsg(app, conv_dir, "assistant", answer, "veil", nowSecs(app.io));
             emitAssistant(app, conv_dir, answer);
+            fam_turn.note(gpa, answer);
             conv_buf.appendSlice(gpa, ",{\"role\":\"assistant\",\"content\":") catch break :outer;
             http.jstr(gpa, &conv_buf, answer) catch break :outer;
             conv_buf.append(gpa, '}') catch break :outer;
@@ -4999,6 +5063,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
                 if (mem_saved > 0) emitMemoryUpdated(app, conv_dir, mem_saved);
                 appendMsg(app, conv_dir, "assistant", said, "veil", nowSecs(app.io));
                 emitAssistant(app, conv_dir, said);
+                fam_turn.note(gpa, said);
                 appendMsgObj(gpa, &conv_buf, "assistant", said, said.len); // schedLearn's tail reads it below
                 break :pick_end;
             }
@@ -5393,9 +5458,11 @@ fn containsCredentialKey(lower: []const u8) bool {
 /// task's memory carrying an unrelated FPS-game description via one recall echo — the bleed class that
 /// relevance gates can't stop once the fact is laundered into the local scope). read_doc PAGES stored
 /// documents — observing its output would re-mint an entire book back into memory, page by page.
-/// observe/skill acks are bookkeeping, not findings.
+/// observe/skill acks are bookkeeping, not findings. message_subchat and report_to_primary carry a model's own words
+/// to another conversation of its family (the family ledger): banked, those words would come back through recall as
+/// if a tool had found them.
 fn memoryEchoTool(name: []const u8) bool {
-    const t = [_][]const u8{ "recall", "recall_hive", "read_doc", "observe", "skill", "recall_node" };
+    const t = [_][]const u8{ "recall", "recall_hive", "read_doc", "observe", "skill", "recall_node", "message_subchat", "report_to_primary" };
     for (t) |n| {
         if (std.mem.eql(u8, name, n)) return true;
     }
@@ -5415,6 +5482,24 @@ fn storeGate(name: []const u8, head: []const u8) nstore.Gate {
     for (keys) |k| if (std.mem.indexOf(u8, lower, k) != null) return .withhold;
     if (memoryEchoTool(name)) return .no_docs;
     return .keep;
+}
+
+/// May another member's tool result ride in this conversation's net (NL_FAMILY_NET)? Exactly what the store keeps of a
+/// result with its document (storeGate .keep), and only with a tool name: no memory echo, no credential-shaped head.
+fn familyKeep(name: []const u8, head: []const u8) bool {
+    return name.len > 0 and storeGate(name, head) == .keep;
+}
+
+/// The store's family hook (store.FamilyHook) over a family.Pool.
+fn familyRefresh(ctx: *anyopaque) void {
+    const p: *family.Pool = @ptrCast(@alignCast(ctx));
+    p.refresh(nowMillis(p.io));
+}
+
+fn familyRender(ctx: *anyopaque, gpa: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), cue: []const u8, cap: usize) void {
+    const p: *family.Pool = @ptrCast(@alignCast(ctx));
+    const before = out.items.len;
+    p.render(gpa, out, cue, cap) catch out.shrinkRetainingCapacity(before); // a section is whole or absent
 }
 
 /// THE DEFAULT SINCE v1.1.23 : every request is unfolded
@@ -5448,9 +5533,103 @@ test "the store and its net are the default; NL_CONTEXT=fold or capture off rest
 
 const RECALL_NODE_DEF = "{\"type\":\"function\",\"function\":{\"name\":\"recall_node\",\"description\":\"Return one node of this conversation's store whole: an earlier ask, answer or tool result that the WORK SO FAR block names as n<id>. Use it when a line there was cut short and the full text matters.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\",\"description\":\"the number after n in n<id>\"}},\"required\":[\"id\"]}}}";
 
-/// recall_node: the stored line for an id, as the store holds it (role, content, stamps), clipped.
-fn recallNodeTool(app: *App, conv_dir: []const u8, args: []const u8) []u8 {
+/// recall_node as it reads with NL_FAMILY_NET on: the same tool, which also takes a FAMILY line's qualified id.
+const RECALL_NODE_DEF_FAMILY = "{\"type\":\"function\",\"function\":{\"name\":\"recall_node\",\"description\":\"Return one node of a conversation's store whole: an earlier ask, answer or tool result that the WORK SO FAR block names as n<id> (this conversation's own), or that its FROM THIS CHAT'S FAMILY lines name as a qualified id like s2.n17@1a2b3c4d (another conversation of this family). Use it when a line there was cut short and the full text matters.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\",\"description\":\"the number after n (for s2.n17@1a2b3c4d, 17)\"},\"from\":{\"type\":\"string\",\"description\":\"for a FAMILY line only: the member before the dot (main, s1 to s5)\"},\"epoch\":{\"type\":\"string\",\"description\":\"for a FAMILY line only: the part after @\"}},\"required\":[\"id\"]}}}";
+
+/// One more definition on a turn's tools. `tools` is the INSIDE of a request's "tools":[...] (llm.zig wraps it), so the
+/// definition goes after a comma. gpa-owned; null on OOM or an empty list (then nothing is added).
+fn withToolDef(gpa: std.mem.Allocator, tools_inner: []const u8, def: []const u8) ?[]u8 {
+    if (tools_inner.len == 0) return null;
+    return std.fmt.allocPrint(gpa, "{s},{s}", .{ tools_inner, def }) catch null;
+}
+
+test "a family verb joins the tools as one more element of the list llm.zig wraps, which never ends in ']'" {
+    const gpa = std.testing.allocator;
+    for ([_][]const u8{ TURN_TOOLS_FULL, TURN_TOOLS_SANDBOXED, TURN_TOOLS_COMPACT }) |base| {
+        // the inner list: llm.zig writes "tools":[<this>], and its last byte closes a definition, never the array
+        try std.testing.expect(base[base.len - 1] != ']');
+        const with = withToolDef(gpa, base, RECALL_NODE_DEF_FAMILY).?;
+        defer gpa.free(with);
+        const wrapped = try std.fmt.allocPrint(gpa, "[{s}]", .{with});
+        defer gpa.free(wrapped);
+        const parsed = try std.json.parseFromSlice(std.json.Value, gpa, wrapped, .{});
+        defer parsed.deinit();
+        const arr = parsed.value.array.items;
+        try std.testing.expectEqualStrings("recall_node", arr[arr.len - 1].object.get("function").?.object.get("name").?.string);
+    }
+    try std.testing.expect(withToolDef(gpa, "", MESSAGE_SUBCHAT_DEF) == null);
+}
+
+/// The recall_node definition a turn advertises: chosen on NL_FAMILY_NET alone, never on which members exist, so the
+/// tools array (part of the cached prefix) holds still while sub-chats come and go. Off is today's definition.
+fn recallNodeDef(mode: family.NetMode) []const u8 {
+    return if (mode == .off) RECALL_NODE_DEF else RECALL_NODE_DEF_FAMILY;
+}
+
+/// What a recall_node call asks of the family: nothing (an own node), another member's node, or a refusal.
+const FamilyRecallArgs = union(enum) { own, qid: family.Qid, bad: []const u8 };
+
+/// Read recall_node's arguments for a family id: `{"id":"s2.n17@1a2b3c4d"}`, or `{"id":17,"from":"s2","epoch":".."}`.
+/// Anything without a qualified id or a `from` is the caller's own node. Pure.
+fn familyRecallArgs(args: []const u8) FamilyRecallArgs {
+    const raw_id = dag.jsonStr(args, "id");
+    if (family.parseQid(raw_id)) |q| return .{ .qid = q };
+    const from = std.mem.trim(u8, dag.jsonStr(args, "from"), " ");
+    if (from.len == 0) return .own;
+    const slot = family.labelSlot(from) orelse return .{ .bad = "from must name a member of this family: main, or s1 to s5" };
+    const id = dag.jsonUint(args, "id") orelse 0;
+    if (id == 0) return .{ .bad = "pass the node id: the number after n" };
+    return .{ .qid = .{ .slot = slot, .id = id, .epoch = std.mem.trim(u8, dag.jsonStr(args, "epoch"), " ") } };
+}
+
+/// recall_node for another member of the family (family.recallMember), answered with where the node came from.
+fn familyRecallNode(app: *App, conv_dir: []const u8, q: family.Qid) []u8 {
     const gpa = app.gpa;
+    var lb: [4]u8 = undefined;
+    const label = family.slotLabel(&lb, q.slot);
+    const r = family.recallMember(gpa, app.io, conv_dir, q.slot, q.id, q.epoch);
+    defer r.deinit(gpa);
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(gpa);
+    switch (r) {
+        .refused => |why| {
+            out.appendSlice(gpa, "{\"ok\":false,\"tool\":\"recall_node\",\"from\":") catch return emptyRes();
+            http.jstr(gpa, &out, label) catch return emptyRes();
+            out.appendSlice(gpa, ",\"error\":") catch return emptyRes();
+            http.jstr(gpa, &out, why) catch return emptyRes();
+            out.append(gpa, '}') catch return emptyRes();
+        },
+        .node => |n| {
+            out.appendSlice(gpa, "{\"ok\":true,\"tool\":\"recall_node\",\"from\":") catch return emptyRes();
+            http.jstr(gpa, &out, label) catch return emptyRes();
+            out.appendSlice(gpa, ",\"conv\":") catch return emptyRes();
+            http.jstr(gpa, &out, n.conv) catch return emptyRes();
+            out.appendSlice(gpa, ",\"epoch\":") catch return emptyRes();
+            http.jstr(gpa, &out, q.epoch) catch return emptyRes();
+            out.print(gpa, ",\"id\":{d},\"node\":", .{q.id}) catch return emptyRes();
+            http.jstr(gpa, &out, clipBytes(n.line, 16 * 1024)) catch return emptyRes();
+            out.append(gpa, '}') catch return emptyRes();
+        },
+    }
+    return gpa.dupe(u8, out.items) catch emptyRes();
+}
+
+/// recall_node: the stored line for an id, as the store holds it (role, content, stamps), clipped. With `fam`
+/// (NL_FAMILY_NET on) a family id reaches another member's store; off, every call reads exactly as it always has.
+fn recallNodeTool(app: *App, conv_dir: []const u8, args: []const u8, fam: bool) []u8 {
+    const gpa = app.gpa;
+    if (fam) switch (familyRecallArgs(args)) {
+        .own => {},
+        .qid => |q| return familyRecallNode(app, conv_dir, q),
+        .bad => |why| {
+            var out: std.ArrayListUnmanaged(u8) = .empty;
+            defer out.deinit(gpa);
+            out.appendSlice(gpa, "{\"ok\":false,\"tool\":\"recall_node\",\"error\":") catch return emptyRes();
+            http.jstr(gpa, &out, why) catch return emptyRes();
+            out.append(gpa, '}') catch return emptyRes();
+            return gpa.dupe(u8, out.items) catch emptyRes();
+        },
+    };
     const raw_id = std.mem.trim(u8, dag.jsonStr(args, "id"), " n");
     const id: u64 = std.fmt.parseInt(u64, raw_id, 10) catch blk: {
         // an integer arrives unquoted: read the digits after "id":
@@ -5471,6 +5650,107 @@ fn recallNodeTool(app: *App, conv_dir: []const u8, args: []const u8) []u8 {
     http.jstr(gpa, &out, clipBytes(line, 16 * 1024)) catch return emptyRes();
     out.append(gpa, '}') catch return emptyRes();
     return gpa.dupe(u8, out.items) catch emptyRes();
+}
+
+test "recall_node today: a qualified id is refused as no id, and a from field is ignored for the caller's own node" {
+    // A GOLDEN of today's behaviour. No qualified id ("s2.n17") reaches a node, and `from` is not read at all: the
+    // call answers with the CALLER's n17 even when the named sibling holds an n17 of its own.
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-recall-node-golden-tmp";
+    var ta = try http.testApp(gpa, io, root);
+    defer ta.deinit();
+    const app = &ta.app;
+    const own = root ++ "/u1/_chat/convs/fam2";
+    const sib = root ++ "/u1/_chat/convs/fam2__s2";
+    const cwd = std.Io.Dir.cwd();
+    _ = try cwd.createDirPathStatus(io, own, .default_dir);
+    _ = try cwd.createDirPathStatus(io, sib, .default_dir);
+    const own_line = "{\"role\":\"tool\",\"tool_call_id\":\"c9\",\"content\":\"own seventeen\",\"_t\":3,\"_n\":17}";
+    try cwd.writeFile(io, .{ .sub_path = own ++ "/" ++ nstore.FILE, .data = own_line ++ "\n" });
+    try cwd.writeFile(io, .{ .sub_path = sib ++ "/" ++ nstore.FILE, .data = "{\"role\":\"tool\",\"tool_call_id\":\"c4\",\"content\":\"sibling seventeen\",\"_t\":2,\"_n\":17}\n" });
+
+    const refused = recallNodeTool(app, own, "{\"id\":\"s2.n17\"}", false);
+    defer gpa.free(refused);
+    try std.testing.expectEqualStrings("{\"ok\":false,\"tool\":\"recall_node\",\"error\":\"pass the node id: the number after n in n<id>\"}", refused);
+
+    const mine = recallNodeTool(app, own, "{\"id\":17,\"from\":\"s2\"}", false);
+    defer gpa.free(mine);
+    try std.testing.expectEqualStrings("{\"ok\":true,\"tool\":\"recall_node\",\"id\":17,\"node\":\"{\\\"role\\\":\\\"tool\\\",\\\"tool_call_id\\\":\\\"c9\\\"," ++
+        "\\\"content\\\":\\\"own seventeen\\\",\\\"_t\\\":3,\\\"_n\\\":17}\"}", mine);
+}
+
+test "NL_FAMILY_NET recall_node: a family id reaches the named member's node at its epoch, and the tool def is chosen on the flag alone" {
+    const gpa = std.testing.allocator;
+    // the def: today's with the flag off, the family one for either on state; both are JSON
+    try std.testing.expectEqualStrings(RECALL_NODE_DEF, recallNodeDef(.off));
+    try std.testing.expectEqualStrings(RECALL_NODE_DEF_FAMILY, recallNodeDef(.on));
+    try std.testing.expectEqualStrings(RECALL_NODE_DEF_FAMILY, recallNodeDef(.results));
+    for ([_][]const u8{ RECALL_NODE_DEF, RECALL_NODE_DEF_FAMILY }) |d| try std.testing.expect(try std.json.validate(gpa, d));
+    // the arguments: a bare id is the caller's own, a QID or a `from` names a member, a bad `from` is refused
+    try std.testing.expect(familyRecallArgs("{\"id\":17}") == .own);
+    try std.testing.expect(familyRecallArgs("{\"id\":\"n17\"}") == .own);
+    const q = familyRecallArgs("{\"id\":\"s2.n17@1a2b3c4d\"}").qid;
+    try std.testing.expectEqual(@as(u8, 2), q.slot);
+    try std.testing.expectEqual(@as(u64, 17), q.id);
+    try std.testing.expectEqualStrings("1a2b3c4d", q.epoch);
+    const f = familyRecallArgs("{\"id\":17,\"from\":\"main\",\"epoch\":\"1a2b3c4d\"}").qid;
+    try std.testing.expectEqual(@as(u8, 0), f.slot);
+    try std.testing.expectEqual(@as(u64, 17), f.id);
+    try std.testing.expect(familyRecallArgs("{\"id\":17,\"from\":\"s9\"}") == .bad);
+    // the gate a member's result passes to cross: the store's own keep, and a tool name
+    try std.testing.expect(familyKeep("read_file", "alpha: zebracorn42"));
+    try std.testing.expect(!familyKeep("recall", "a recalled fact"));
+    try std.testing.expect(!familyKeep("", "a window-edge result"));
+    try std.testing.expect(!familyKeep("read_file", "api_key=sk-not-real"));
+
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-recall-node-family-tmp";
+    var ta = try http.testApp(gpa, io, root);
+    defer ta.deinit();
+    const app = &ta.app;
+    const own = root ++ "/u1/_chat/convs/fam2";
+    const sib = root ++ "/u1/_chat/convs/fam2__s2";
+    const cwd = std.Io.Dir.cwd();
+    _ = try cwd.createDirPathStatus(io, own, .default_dir);
+    _ = try cwd.createDirPathStatus(io, sib, .default_dir);
+    try cwd.writeFile(io, .{ .sub_path = own ++ "/" ++ nstore.FILE, .data = "{\"role\":\"tool\",\"tool_call_id\":\"c9\",\"content\":\"own seventeen\",\"_t\":3,\"_n\":17}\n" });
+    try cwd.writeFile(io, .{ .sub_path = sib ++ "/messages.jsonl", .data = "{\"role\":\"user\",\"content\":\"Sound the channel.\",\"kind\":\"user\",\"ts\":4}\n" });
+    try cwd.writeFile(io, .{ .sub_path = sib ++ "/" ++ nstore.FILE, .data = "{\"role\":\"tool\",\"tool_call_id\":\"c4\",\"content\":\"sibling seventeen\",\"_t\":2,\"_n\":17}\n" });
+    var eb: [family.EPOCH_LEN]u8 = undefined;
+    const ep = family.memberEpoch(gpa, io, sib, &eb).?;
+    var ab: [160]u8 = undefined;
+    for ([_][]const u8{
+        try std.fmt.bufPrint(&ab, "{{\"id\":\"s2.n17@{s}\"}}", .{ep}),
+    }) |args| {
+        const r = recallNodeTool(app, own, args, true);
+        defer gpa.free(r);
+        try std.testing.expect(std.mem.startsWith(u8, r, "{\"ok\":true,\"tool\":\"recall_node\",\"from\":\"s2\",\"conv\":\"fam2__s2\",\"epoch\":\""));
+        try std.testing.expect(std.mem.indexOf(u8, r, "sibling seventeen") != null);
+    }
+    {
+        var fb: [160]u8 = undefined;
+        const r = recallNodeTool(app, own, try std.fmt.bufPrint(&fb, "{{\"id\":17,\"from\":\"s2\",\"epoch\":\"{s}\"}}", .{ep}), true);
+        defer gpa.free(r);
+        try std.testing.expect(std.mem.indexOf(u8, r, "sibling seventeen") != null);
+    }
+    {
+        // a bare id is still the caller's own node with the flag on
+        const r = recallNodeTool(app, own, "{\"id\":17}", true);
+        defer gpa.free(r);
+        try std.testing.expect(std.mem.indexOf(u8, r, "own seventeen") != null);
+    }
+    {
+        // an id from before the slot was deleted and minted again: refused, never the new chat's node
+        const r = recallNodeTool(app, own, "{\"id\":\"s2.n17@deadbeef\"}", true);
+        defer gpa.free(r);
+        try std.testing.expect(std.mem.startsWith(u8, r, "{\"ok\":false,\"tool\":\"recall_node\",\"from\":\"s2\",\"error\":"));
+        try std.testing.expect(std.mem.indexOf(u8, r, "epoch has changed") != null);
+    }
 }
 
 /// In-place atomization guard for a composed tool note: fold hard whitespace and SOFTEN sentence enders
@@ -6461,7 +6741,9 @@ test "verifierNote: builds the caution note, drops invented indexes, null on non
 /// one-shot seed at branch creation. A primary with live branches gets them listed. Memory itself is
 /// shared structurally (scopeFamilyBase across-recall); this block is the CONVERSATIONAL half of "they
 /// must know the primary chat context".
-fn injectFamilyContext(app: *App, conv: []const u8, base: []const u8, ws: *wsp.Workspace) void {
+/// `opts` all OFF is today's block, byte for byte (pinned by the golden below).
+fn injectFamilyContext(app: *App, conv: []const u8, base: []const u8, ws: *wsp.Workspace, opts: FamilyBlockOpts) void {
+    if (opts.status) return injectFamilyStatus(app, conv, base, ws, opts.uid);
     const gpa = app.gpa;
     var block: std.ArrayListUnmanaged(u8) = .empty;
     defer block.deinit(gpa);
@@ -6514,6 +6796,78 @@ fn injectFamilyContext(app: *App, conv: []const u8, base: []const u8, ws: *wsp.W
     ws.bid(.family, "chat-family", block.items, 0.70, 0, 0);
 }
 
+/// What the family block says beyond today's text. Every field is OFF by default.
+const FamilyBlockOpts = struct {
+    /// NL_FAMILY_STATUS: each member's status from family.zig, empty dirs left out, and a true memory sentence
+    status: bool = false,
+    /// whose family it is (the turn table is read for this account's members)
+    uid: u64 = 0,
+};
+
+/// The family block with NL_FAMILY_STATUS on. The branch side is today's text with the primary's status and its
+/// siblings added; the primary side lists every branch that holds anything, with its status, and replaces "their
+/// findings are already in this conversation's shared memory" with what is true: a branch's tool findings are
+/// recallable here (each step's findings are observed into its own `chat:<primary>__sN` scope, which across-recall
+/// reaches), but its replies are not, because the engine never observes a reply.
+fn injectFamilyStatus(app: *App, conv: []const u8, base: []const u8, ws: *wsp.Workspace, uid: u64) void {
+    const gpa = app.gpa;
+    var fam = (family.load(gpa, app.io, base, uid, conv, isTurnLiveFor) catch return) orelse return;
+    defer fam.deinit();
+    var block: std.ArrayListUnmanaged(u8) = .empty;
+    defer block.deinit(gpa);
+    if (cpaths.branchParts(conv)) |bp| {
+        const pdir = std.fmt.allocPrint(gpa, "{s}/convs/{s}", .{ base, bp.parent }) catch return;
+        defer gpa.free(pdir);
+        block.print(gpa, "THIS IS SUB-CHAT {d} of a primary conversation. PRIMARY: [{s}]. ", .{ bp.n, @tagName(fam.members.items[0].status) }) catch return;
+        const goal = firstUserGoal(app, pdir);
+        defer if (goal) |g| gpa.free(g);
+        if (goal) |g| {
+            block.appendSlice(gpa, "PRIMARY'S GOAL: \"") catch return;
+            block.appendSlice(gpa, clipBytes(g, 300)) catch return;
+            block.appendSlice(gpa, "\". ") catch return;
+        }
+        const last = lastAssistantNote(app, pdir);
+        defer if (last) |l| gpa.free(l);
+        if (last) |l| {
+            scrubUtf8(l);
+            block.appendSlice(gpa, "PRIMARY'S LATEST PROGRESS: \"") catch return;
+            block.appendSlice(gpa, clipBytes(l, 500)) catch return;
+            block.appendSlice(gpa, "\". ") catch return;
+        }
+        var sib: u8 = 0;
+        for (fam.members.items[1..]) |m| {
+            if (m.status == .empty or std.mem.eql(u8, m.conv, conv)) continue;
+            block.appendSlice(gpa, if (sib == 0) "SIBLINGS: " else "; ") catch return;
+            familyMemberLabel(gpa, &block, m) catch return;
+            sib += 1;
+        }
+        if (sib > 0) block.appendSlice(gpa, ". ") catch return;
+        block.appendSlice(gpa, "Pursue THIS branch's angle in depth — do not re-do the primary's work. " ++
+            "The family shares ONE memory (recall reaches the primary and sibling branches) and ONE " ++
+            "workspace (the same files — coordinate through them, never clobber).") catch return;
+    } else {
+        var listed: u8 = 0;
+        for (fam.members.items[1..]) |m| {
+            if (m.status == .empty) continue;
+            block.appendSlice(gpa, if (listed == 0) "SUB-CHATS branched from this conversation: " else "; ") catch return;
+            familyMemberLabel(gpa, &block, m) catch return;
+            listed += 1;
+        }
+        if (listed > 0)
+            block.appendSlice(gpa, ". Their tool findings are recallable here (recall), but their replies are not in that memory; their files land in this same workspace.") catch return;
+    }
+    if (block.items.len == 0) return;
+    ws.bid(.family, "chat-family", block.items, 0.70, 0, 0);
+}
+
+/// `s<N> "title" [status]` for one sub-chat member (its slot read back through paths.zig).
+fn familyMemberLabel(gpa: std.mem.Allocator, block: *std.ArrayListUnmanaged(u8), m: family.Member) !void {
+    const bp = cpaths.branchParts(m.conv) orelse return;
+    try block.print(gpa, "s{d}", .{bp.n});
+    if (m.title.len > 0) try block.print(gpa, " \"{s}\"", .{m.title});
+    try block.print(gpa, " [{s}]", .{@tagName(m.status)});
+}
+
 fn firstUserGoal(app: *App, conv_dir: []const u8) ?[]u8 {
     const gpa = app.gpa;
     const mpath = std.fmt.allocPrint(gpa, "{s}/messages.jsonl", .{conv_dir}) catch return null;
@@ -6535,6 +6889,148 @@ fn firstUserGoal(app: *App, conv_dir: []const u8) ?[]u8 {
         return null; // first line is always the first user message by construction — anything else, abstain
     }
     return null;
+}
+
+test "the family block today, byte for byte: the branch side quotes the primary, the primary side calls every branch dir ACTIVE" {
+    // A GOLDEN of today's behaviour, pinned before the family view changes anything around it. It records two
+    // things the plan calls false and keeps as they are while every NL_FAMILY_* flag is unset: an empty branch dir
+    // (the kind POST /control creates for any id) is listed as ACTIVE, and the primary is told its branches'
+    // findings are already in its shared memory.
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-family-block-golden-tmp";
+    var ta = try http.testApp(gpa, io, root);
+    defer ta.deinit();
+    const app = &ta.app;
+    const base = root ++ "/u1/_chat";
+    const cwd = std.Io.Dir.cwd();
+    for ([_][]const u8{ "fam1", "fam1__s1", "fam1__s3", "solo" }) |c| {
+        var pb: [128]u8 = undefined;
+        _ = try cwd.createDirPathStatus(io, try std.fmt.bufPrint(&pb, base ++ "/convs/{s}", .{c}), .default_dir);
+    }
+    try cwd.writeFile(io, .{ .sub_path = base ++ "/convs/fam1/messages.jsonl", .data = "{\"role\":\"user\",\"content\":\"Map the harbour charts.\",\"kind\":\"user\",\"ts\":1}\n" ++
+        "{\"role\":\"assistant\",\"content\":\"Charted the north quay.\",\"kind\":\"veil\",\"ts\":2}\n" });
+    try cwd.writeFile(io, .{ .sub_path = base ++ "/convs/fam1__s1/messages.jsonl", .data = "{\"role\":\"user\",\"content\":\"Check the south quay depths.\",\"kind\":\"user\",\"ts\":3}\n" });
+    // what chatControl leaves behind for a branch id no turn ever ran in: the dir and one control line
+    try cwd.writeFile(io, .{ .sub_path = base ++ "/convs/fam1__s3/control.jsonl", .data = "{\"op\":\"stop\"}\n" });
+
+    {
+        var ws = wsp.Workspace.init(gpa);
+        defer ws.deinit();
+        injectFamilyContext(app, "fam1", base, &ws, .{});
+        try std.testing.expectEqual(@as(usize, 1), ws.bids.items.len);
+        const b = ws.bids.items[0];
+        try std.testing.expectEqual(wsp.Kind.family, b.kind);
+        try std.testing.expectEqualStrings("chat-family", b.src);
+        try std.testing.expectEqual(@as(f32, 0.70), b.score);
+        try std.testing.expectEqualStrings("ACTIVE SUB-CHATS branched from this conversation: s1 \"Check the south quay depths.\"; s3. " ++
+            "Their findings are already in this conversation's shared memory (recall), and their files land in this same workspace.", b.text);
+    }
+    for ([_][]const u8{ "fam1__s1", "fam1__s3" }, [_][]const u8{ "1", "3" }) |conv, n| {
+        var ws = wsp.Workspace.init(gpa);
+        defer ws.deinit();
+        injectFamilyContext(app, conv, base, &ws, .{});
+        try std.testing.expectEqual(@as(usize, 1), ws.bids.items.len);
+        const b = ws.bids.items[0];
+        try std.testing.expectEqual(wsp.Kind.family, b.kind);
+        try std.testing.expectEqualStrings("chat-family", b.src);
+        try std.testing.expectEqual(@as(f32, 0.70), b.score);
+        var eb: [600]u8 = undefined;
+        const want = try std.fmt.bufPrint(&eb, "THIS IS SUB-CHAT {s} of a primary conversation. PRIMARY'S GOAL: \"Map the harbour charts.\". " ++
+            "PRIMARY'S LATEST PROGRESS: \"Charted the north quay.\". Pursue THIS branch's angle in depth — do not re-do the primary's work. " ++
+            "The family shares ONE memory (recall reaches the primary and sibling branches) and ONE workspace (the same files — " ++
+            "coordinate through them, never clobber).", .{n});
+        try std.testing.expectEqualStrings(want, b.text);
+    }
+    {
+        // a primary with no branch dirs bids nothing at all
+        var ws = wsp.Workspace.init(gpa);
+        defer ws.deinit();
+        injectFamilyContext(app, "solo", base, &ws, .{});
+        try std.testing.expectEqual(@as(usize, 0), ws.bids.items.len);
+    }
+}
+
+test "NL_FAMILY_STATUS: the family block says each member's true status, leaves empty dirs out, and makes no false memory claim" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-family-status-block-tmp";
+    var ta = try http.testApp(gpa, io, root);
+    defer ta.deinit();
+    const app = &ta.app;
+    const base = root ++ "/u1/_chat";
+    const cwd = std.Io.Dir.cwd();
+    const D = "{\"kind\":\"done\"}\n";
+    const files = [_]struct { conv: []const u8, name: []const u8, data: []const u8 }{
+        .{ .conv = "fam3", .name = "messages.jsonl", .data = "{\"role\":\"user\",\"content\":\"Map the harbour charts.\",\"kind\":\"user\",\"ts\":1}\n{\"role\":\"assistant\",\"content\":\"Charted the north quay.\",\"kind\":\"veil\",\"ts\":2}\n" },
+        .{ .conv = "fam3", .name = "events.jsonl", .data = D },
+        .{ .conv = "fam3__s1", .name = "messages.jsonl", .data = "{\"role\":\"user\",\"content\":\"Check the south quay depths.\",\"kind\":\"user\",\"ts\":3}\n" },
+        .{ .conv = "fam3__s1", .name = "events.jsonl", .data = D },
+        .{ .conv = "fam3__s2", .name = "messages.jsonl", .data = "{\"role\":\"user\",\"content\":\"Sound the channel.\",\"kind\":\"user\",\"ts\":4}\n" },
+        .{ .conv = "fam3__s2", .name = "events.jsonl", .data = "{\"kind\":\"error\",\"err\":\"provider said no\"}\n" ++ D },
+        .{ .conv = "fam3__s3", .name = "control.jsonl", .data = "{\"op\":\"stop\"}\n" }, // the dir POST /control leaves
+        .{ .conv = "fam3__s4", .name = "messages.jsonl", .data = "{\"role\":\"user\",\"content\":\"Walk the breakwater.\",\"kind\":\"user\",\"ts\":5}\n" },
+    };
+    for (files) |f| {
+        var db: [128]u8 = undefined;
+        const d = try std.fmt.bufPrint(&db, base ++ "/convs/{s}", .{f.conv});
+        _ = try cwd.createDirPathStatus(io, d, .default_dir);
+        var pb: [160]u8 = undefined;
+        try cwd.writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&pb, "{s}/{s}", .{ d, f.name }), .data = f.data });
+    }
+    // s4 has a turn running for this account
+    try std.testing.expectEqual(TurnDenied.ok, beginTurn(io, "fam3__s4", 1));
+    defer endTurn(io, "fam3__s4");
+
+    {
+        var ws = wsp.Workspace.init(gpa);
+        defer ws.deinit();
+        injectFamilyContext(app, "fam3", base, &ws, .{ .status = true, .uid = 1 });
+        try std.testing.expectEqual(@as(usize, 1), ws.bids.items.len);
+        try std.testing.expectEqual(wsp.Kind.family, ws.bids.items[0].kind);
+        try std.testing.expectEqual(@as(f32, 0.70), ws.bids.items[0].score);
+        try std.testing.expectEqualStrings("SUB-CHATS branched from this conversation: s1 \"Check the south quay depths.\" [finished]; " ++
+            "s2 \"Sound the channel.\" [failed]; s4 \"Walk the breakwater.\" [running]. Their tool findings are recallable here (recall), " ++
+            "but their replies are not in that memory; their files land in this same workspace.", ws.bids.items[0].text);
+    }
+    {
+        var ws = wsp.Workspace.init(gpa);
+        defer ws.deinit();
+        injectFamilyContext(app, "fam3__s2", base, &ws, .{ .status = true, .uid = 1 });
+        try std.testing.expectEqual(@as(usize, 1), ws.bids.items.len);
+        try std.testing.expectEqualStrings("THIS IS SUB-CHAT 2 of a primary conversation. PRIMARY: [finished]. PRIMARY'S GOAL: \"Map the harbour charts.\". " ++
+            "PRIMARY'S LATEST PROGRESS: \"Charted the north quay.\". SIBLINGS: s1 \"Check the south quay depths.\" [finished]; " ++
+            "s4 \"Walk the breakwater.\" [running]. Pursue THIS branch's angle in depth — do not re-do the primary's work. " ++
+            "The family shares ONE memory (recall reaches the primary and sibling branches) and ONE workspace (the same files — " ++
+            "coordinate through them, never clobber).", ws.bids.items[0].text);
+    }
+    {
+        // another account's turn is not this one's: s4 reads from its files (messages, no events)
+        var ws = wsp.Workspace.init(gpa);
+        defer ws.deinit();
+        injectFamilyContext(app, "fam3", base, &ws, .{ .status = true, .uid = 2 });
+        try std.testing.expect(std.mem.indexOf(u8, ws.bids.items[0].text, "s4 \"Walk the breakwater.\" [unknown]") != null);
+    }
+    {
+        // the flag off is today's block on the same family: every dir ACTIVE, the empty one included
+        var ws = wsp.Workspace.init(gpa);
+        defer ws.deinit();
+        injectFamilyContext(app, "fam3", base, &ws, .{});
+        try std.testing.expect(std.mem.startsWith(u8, ws.bids.items[0].text, "ACTIVE SUB-CHATS branched from this conversation: s1 \"Check the south quay depths.\"; s2 \"Sound the channel.\"; s3; s4 \"Walk the breakwater.\"."));
+    }
+    {
+        // a primary whose only branch dir is empty bids nothing with the flag on
+        _ = try cwd.createDirPathStatus(io, base ++ "/convs/lone__s1", .default_dir);
+        _ = try cwd.createDirPathStatus(io, base ++ "/convs/lone", .default_dir);
+        var ws = wsp.Workspace.init(gpa);
+        defer ws.deinit();
+        injectFamilyContext(app, "lone", base, &ws, .{ .status = true, .uid = 1 });
+        try std.testing.expectEqual(@as(usize, 0), ws.bids.items.len);
+    }
 }
 
 /// RESTART RESUME (bootstrap): no files.jsonl entries, but the build workdir already holds files — a client
@@ -6609,6 +7105,43 @@ pub fn isTurnLive(io: std.Io, conv: []const u8) bool {
         if (active_lens[i] == conv.len and std.mem.eql(u8, active_convs[i][0..active_lens[i]], conv)) return true;
     }
     return false;
+}
+
+/// isTurnLive for ONE account's conversation (the family view asks this). Conv ids live under each account's own
+/// u{uid} tree, so two accounts can hold the same id; a slot claimed by another uid is not this account's turn. A
+/// slot claimed under uid 0 is read as live for every account: tryBeginTurn claims with no owner for the work the
+/// server starts itself (scheduled runs, tot jobs) while the turn runs as its owner, so there is no owner to compare.
+/// That case reads exactly as isTurnLive reads every slot. The table holds at most one slot per conv (beginTurn
+/// refuses a second claim whoever makes it), so the first match is the answer.
+pub fn isTurnLiveFor(io: std.Io, conv: []const u8, uid: u64) bool {
+    if (conv.len == 0 or conv.len > 64) return false;
+    turn_mtx.lockUncancelable(io);
+    defer turn_mtx.unlock(io);
+    for (0..MAX_ACTIVE_TURNS) |i| {
+        if (active_lens[i] == conv.len and std.mem.eql(u8, active_convs[i][0..active_lens[i]], conv))
+            return active_uids[i] == uid or active_uids[i] == 0;
+    }
+    return false;
+}
+
+test "isTurnLiveFor: live for the account that claimed the slot, and for every account when the server claimed it" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try std.testing.expectEqual(TurnDenied.ok, beginTurn(io, "livefor-a1", 4401));
+    defer endTurn(io, "livefor-a1");
+    try std.testing.expect(isTurnLiveFor(io, "livefor-a1", 4401));
+    try std.testing.expect(!isTurnLiveFor(io, "livefor-a1", 4402)); // another account's same-named conv is not running
+    try std.testing.expect(isTurnLive(io, "livefor-a1")); // the old question still answers for any account
+    try std.testing.expect(tryBeginTurn(io, "livefor-sched"));
+    try std.testing.expect(isTurnLiveFor(io, "livefor-sched", 4401));
+    try std.testing.expect(isTurnLiveFor(io, "livefor-sched", 4402));
+    endTurn(io, "livefor-sched");
+    try std.testing.expect(!isTurnLiveFor(io, "livefor-sched", 4401));
+    try std.testing.expect(!isTurnLiveFor(io, "livefor-none", 4401));
+    try std.testing.expect(!isTurnLiveFor(io, "", 4401));
+    try std.testing.expect(!isTurnLiveFor(io, "a" ** 65, 4401));
 }
 
 /// Release the in-flight slot for `conv` (matches tryBeginTurn). Copies nothing — safe to call before freeing any
@@ -7499,7 +8032,9 @@ fn hasWordMarker(low: []const u8, marker: []const u8) bool {
 /// so a machine that has not been told otherwise plans precisely as before. It is read from the server
 /// process's environment, so turning it off is a per-server profile choice, never a per-request one.
 fn planGate(environ: *const std.process.Environ.Map, user_text: []const u8) bool {
-    return shouldPlan(user_text) and !envDisabled(environ, "NL_CHAT_PLAN");
+    // NL_FAMILY_MSG: a turn a family message woke opens on the framed message; the plan is decided on the message
+    const text = if (family.Flags.read(environ).msg) familyUnframed(user_text) else user_text;
+    return shouldPlan(text) and !envDisabled(environ, "NL_CHAT_PLAN");
 }
 
 /// A request that asks for something to be DONE to the world — files written, code run, things deployed —
@@ -9627,7 +10162,7 @@ fn orchTool(app: *App, uid: u64, ctx: *tools.ToolCtx, conv: []const u8, conv_dir
     if (std.mem.eql(u8, name, "steer_swarm")) return steerTool(app, uid, args);
     if (std.mem.eql(u8, name, "stop_swarm")) return stopTool(app, uid, args);
     if (std.mem.eql(u8, name, "swarm_status")) return statusTool(app, uid, conv_dir, ctrl_cursor, args);
-    if (std.mem.eql(u8, name, "recall_node")) return recallNodeTool(app, conv_dir, args);
+    if (std.mem.eql(u8, name, "recall_node")) return recallNodeTool(app, conv_dir, args, family.Flags.read(ctx.environ).net != .off);
     if (std.mem.eql(u8, name, "swarm_asks")) return asksTool(app, uid, args);
     if (std.mem.eql(u8, name, "answer_swarm")) return answerTool(app, uid, args);
     if (std.mem.eql(u8, name, "schedule_task")) return scheduleTool(app, uid, trio, args);
@@ -9636,6 +10171,13 @@ fn orchTool(app: *App, uid: u64, ctx: *tools.ToolCtx, conv: []const u8, conv_dir
     if (std.mem.eql(u8, name, "schedule_delete")) return scheduleDeleteTool(app, uid, args);
     if (std.mem.eql(u8, name, "sync_dir")) return syncDirTool(app, conv, conv_dir, ctrl_cursor, args, tool_client);
     if (std.mem.eql(u8, name, "open_subchat")) return openSubchatTool(app, uid, conv, conv_dir, trio, args);
+    // NL_FAMILY_MSG: the family's messaging verbs, and no "family:" memory scope; off, these names fall through as before
+    if (family.Flags.read(ctx.environ).msg) {
+        if (std.mem.eql(u8, name, "message_subchat")) return messageSubchatTool(app, uid, ctx, conv, conv_dir, trio, args);
+        if (std.mem.eql(u8, name, "report_to_primary")) return reportToPrimaryTool(app, conv, conv_dir, args);
+        if (std.mem.eql(u8, name, "absorb") and familyScopeAbsorb(args))
+            return ctx.gpa.dupe(u8, "absorb: a \"family:\" scope is refused while the family ledger is on: a family shares no memory scope (each conversation writes its own), and what its conversations say to each other is in the family ledger") catch null;
+    }
     return null;
 }
 
@@ -9682,7 +10224,626 @@ fn openSubchatTool(app: *App, uid: u64, conv: []const u8, conv_dir: []const u8, 
     // it works unattended on a branch nobody is watching, which is precisely where advanced reasoning
     // earns its cost. The parent's fast-mode choice was about the parent's own latency.
     spawnTurn(app, uid, bid, trio, goal, 0, false, "", false, false, false, null);
+    familyOpened(app, conv_dir, primary, bid, goal); // NL_FAMILY_MSG: the ledger's open record
     return std.fmt.allocPrint(gpa, "{{\"ok\":true,\"tool\":\"open_subchat\",\"sub\":\"s{d}\",\"conv\":\"{s}\",\"note\":\"sub-chat s{d} opened and its first turn is RUNNING server-side on that goal. It shares this chat's workspace and memory — its findings become recallable here (recall) as it works. Tell the user it opened as tab s{d}; check its progress later via recall or by switching to the tab.\"}}", .{ free_n, bid, free_n, free_n }) catch emptyRes();
+}
+
+/// A family turn (familyWake): spawnTurn with the same defaults open_subchat starts a sub-chat with. The family's one
+/// call of spawnTurn, so a change to spawnTurn's arguments has a single family line to follow.
+fn spawnFamilyTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, text: []const u8) void {
+    if (builtin.is_test) if (test_family_spawn) |f| return f(conv, text);
+    spawnTurn(app, uid, conv, trio, text, 0, false, "", false, false, false, null);
+}
+
+/// TEST ONLY: where a family wake's turn goes instead of a thread and a model, so a test can see the wake itself.
+var test_family_spawn: ?*const fn (conv: []const u8, text: []const u8) void = null;
+
+// ---- THE FAMILY'S MESSAGING (NL_FAMILY_MSG, default OFF) -------------------------------------------------------------
+// The primary model can steer a sub-chat or ask it a question (message_subchat); a sub-chat can hand a result or an
+// answer back (report_to_primary); and when a sub-chat's turn ends the ENGINE writes its status and final answer
+// (familyAfterTurn), so the primary gets every branch's answer whether or not a model remembered to send it. Each is a
+// record of the family ledger (famlog.zig). A record reaches the conversation it is addressed to as a provenance-framed
+// line of that conversation's net (family.Pool), never as an observed reply and never through a neuron-db scope. A
+// message to an IDLE sub-chat wakes it for one turn. Depth 1: only a primary sends, and nothing a woken turn does wakes
+// anyone. A woken turn's opening message is the primary model's words, not the user's, and is never observed.
+
+const MESSAGE_SUBCHAT_DEF = "{\"type\":\"function\",\"function\":{\"name\":\"message_subchat\",\"description\":\"Send a message to one of THIS chat's sub-chats (s1 to s5, the tabs open_subchat makes): steer it (guidance it folds in at its next step, or one new turn when it is idle) or, with ask, put a question to it that it answers back. Its answers, its reports and the engine's note when each of its turns ends reach you as FAMILY LEDGER lines in your context. It cannot wake you.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"sub\":{\"type\":\"string\",\"description\":\"the sub-chat: s1 to s5\"},\"text\":{\"type\":\"string\",\"description\":\"the message, self-contained\"},\"ask\":{\"type\":\"boolean\",\"description\":\"true when you need an answer back\"}},\"required\":[\"sub\",\"text\"]}}}";
+const REPORT_TO_PRIMARY_DEF = "{\"type\":\"function\",\"function\":{\"name\":\"report_to_primary\",\"description\":\"Hand a result, or an answer to the primary chat's question, back to the primary chat of this family. It reaches the primary as a FAMILY LEDGER line (it does not wake it). When this turn ends the engine also sends the primary your final answer, so use this for a result worth sending sooner, or to answer a question (pass its number as re).\",\"parameters\":{\"type\":\"object\",\"properties\":{\"text\":{\"type\":\"string\",\"description\":\"the result or the answer, self-contained\"},\"re\":{\"type\":\"integer\",\"description\":\"the question's number, when this answers one\"}},\"required\":[\"text\"]}}}";
+
+/// The messaging verb a turn advertises: message_subchat in a primary, report_to_primary in a sub-chat, none with
+/// NL_FAMILY_MSG off. Chosen on the flag and the conversation's own id, both turn-stable, so the tools array holds
+/// still. A sandboxed caller is not offered message_subchat, which starts turns (orchTool refuses it as well). Pure.
+fn familyMsgDef(msg: bool, conv: []const u8, sandboxed: bool) ?[]const u8 {
+    if (!msg) return null;
+    if (cpaths.branchParts(conv) != null) return REPORT_TO_PRIMARY_DEF;
+    return if (sandboxed) null else MESSAGE_SUBCHAT_DEF;
+}
+
+/// Sub-chat turns started by a family message (familyWake), from the wake to their turn's end (familyAfterTurn).
+var woken_mtx: std.Io.Mutex = .init;
+var woken_ids: [16][64]u8 = undefined;
+var woken_lens: [16]usize = @splat(0);
+
+/// Mark `conv` woken; false when it cannot be (the table is full, the id is not one, or `conv` is still marked: its
+/// woken turn has released its slot but not yet returned), and then no turn is started.
+fn familyWakeMark(io: std.Io, conv: []const u8) bool {
+    if (conv.len == 0 or conv.len > 64) return false;
+    woken_mtx.lockUncancelable(io);
+    defer woken_mtx.unlock(io);
+    for (&woken_ids, woken_lens) |*id, len| if (len == conv.len and std.mem.eql(u8, id[0..len], conv)) return false;
+    for (&woken_ids, &woken_lens) |*id, *len| if (len.* == 0) {
+        @memcpy(id[0..conv.len], conv);
+        len.* = conv.len;
+        return true;
+    };
+    return false;
+}
+
+/// Is a turn of `conv` one a family message woke?
+fn familyWoken(io: std.Io, conv: []const u8) bool {
+    if (conv.len == 0 or conv.len > 64) return false;
+    woken_mtx.lockUncancelable(io);
+    defer woken_mtx.unlock(io);
+    for (&woken_ids, woken_lens) |*id, len| if (len == conv.len and std.mem.eql(u8, id[0..len], conv)) return true;
+    return false;
+}
+
+fn familyWakeClear(io: std.Io, conv: []const u8) void {
+    if (conv.len == 0 or conv.len > 64) return;
+    woken_mtx.lockUncancelable(io);
+    defer woken_mtx.unlock(io);
+    for (&woken_ids, &woken_lens) |*id, *len| if (len.* == conv.len and std.mem.eql(u8, id[0..len.*], conv)) {
+        len.* = 0;
+    };
+}
+
+/// Start one turn in an idle sub-chat on a family message, claiming its slot as a message POST does, marked woken.
+/// false when no slot was free (nothing started).
+fn familyWake(app: *App, uid: u64, bid: []const u8, trio: ModelTrio, text: []const u8) bool {
+    if (beginTurn(app.io, bid, uid) != .ok) return false;
+    const local = llm.isLocal(trio.coding.base_url);
+    if (local and !tryClaimLocal(app)) {
+        endTurn(app.io, bid);
+        return false;
+    }
+    if (!familyWakeMark(app.io, bid)) {
+        endTurn(app.io, bid);
+        if (local) releaseLocal(app.io);
+        return false;
+    }
+    spawnFamilyTurn(app, uid, bid, trio, text);
+    return true;
+}
+
+/// A family message as its receiver reads it: who sent it, its ledger number, and for a question how to answer.
+fn familyFramed(gpa: std.mem.Allocator, seq: u64, ask: bool, text: []const u8) ?[]u8 {
+    if (ask) return std.fmt.allocPrint(gpa, "[family message #{d} from the primary chat; it asks you this, answer it with report_to_primary and re {d}] {s}", .{ seq, seq, text }) catch null;
+    return std.fmt.allocPrint(gpa, "[family message #{d} from the primary chat] {s}", .{ seq, text }) catch null;
+}
+
+/// The message a family-framed opening carries (familyFramed: "[family message #N ...] text"), or `text` itself.
+fn familyUnframed(text: []const u8) []const u8 {
+    if (!std.mem.startsWith(u8, text, "[family message #")) return text;
+    const close = std.mem.indexOf(u8, text, "] ") orelse return text;
+    return text[close + 2 ..];
+}
+
+/// One sub-chat turn's part in its done record (NL_FAMILY_MSG): the answer it settles on, taken where the engine
+/// commits each answer (never read back from messages.jsonl, whose last row can be a plan's closing note, a critique
+/// note or a salvaged steer), and where its events began. runTurn hands it on when it returns (end), before the turn's
+/// slot is released; the done record takes it (familyAfterTurn).
+const FamilyTurn = struct {
+    on: bool = false,
+    events_at: u64 = 0,
+    answer: std.ArrayListUnmanaged(u8) = .empty,
+
+    fn begin(t: *FamilyTurn, app: *App, conv: []const u8, conv_dir: []const u8) void {
+        t.on = cpaths.branchParts(conv) != null and family.Flags.read(app.sup.parent_env).msg;
+        if (!t.on) return;
+        const path = std.fmt.allocPrint(app.gpa, "{s}/events.jsonl", .{conv_dir}) catch return;
+        defer app.gpa.free(path);
+        t.events_at = if (std.Io.Dir.cwd().statFile(app.io, path, .{})) |st| st.size else |_| 0;
+    }
+
+    /// The turn committed `text` as an answer: the newest one committed is the one the turn settles on. Kept to
+    /// famlog.TEXT_MAX, cut on a character.
+    fn note(t: *FamilyTurn, gpa: std.mem.Allocator, text: []const u8) void {
+        if (!t.on) return;
+        t.answer.clearRetainingCapacity();
+        t.answer.appendSlice(gpa, clipBytes(text, famlog.TEXT_MAX)) catch t.answer.clearRetainingCapacity();
+    }
+
+    fn end(t: *FamilyTurn, app: *App, conv: []const u8, conv_dir: []const u8) void {
+        defer t.answer.deinit(app.gpa);
+        if (!t.on) return;
+        familyDonePush(app, conv, t.answer.items, familyTurnFailed(app, conv_dir, t.events_at));
+    }
+};
+
+/// Did the turn whose events began at `from` write an error frame? Only the events tail is read (family's
+/// EVENTS_TAIL_BYTES), as the family's own status reads it.
+fn familyTurnFailed(app: *App, conv_dir: []const u8, from: u64) bool {
+    const gpa = app.gpa;
+    const path = std.fmt.allocPrint(gpa, "{s}/events.jsonl", .{conv_dir}) catch return false;
+    defer gpa.free(path);
+    const f = std.Io.Dir.cwd().openFile(app.io, path, .{}) catch return false;
+    defer f.close(app.io);
+    const size = f.length(app.io) catch return false;
+    const at = @max(from, size -| family.EVENTS_TAIL_BYTES);
+    if (at >= size) return false;
+    const n = std.math.cast(usize, size - at) orelse return false;
+    const buf = gpa.alloc(u8, n) catch return false;
+    defer gpa.free(buf);
+    const got = f.readPositionalAll(app.io, buf, at) catch return false;
+    var it = std.mem.splitScalar(u8, buf[0..got], '\n');
+    while (it.next()) |l| if (std.mem.startsWith(u8, l, "{\"kind\":\"error\"")) return true;
+    return false;
+}
+
+/// The finished sub-chat turns whose done records are still to be written, oldest first: runTurn hands each one on
+/// when it returns (FamilyTurn.end) and signalDone's familyAfterTurn takes the OLDEST of its conversation, so a turn
+/// woken in the instant after one released its slot never lends that one its answer. A full table drops the hand-off,
+/// and that done record then carries no answer.
+const FamilyDone = struct { conv: [64]u8 = undefined, conv_len: usize = 0, order: u64 = 0, answer: []u8 = &.{}, failed: bool = false };
+var fam_done_mtx: std.Io.Mutex = .init;
+var fam_done: [64]FamilyDone = @splat(.{});
+var fam_done_order: u64 = 0;
+
+fn familyDonePush(app: *App, conv: []const u8, answer: []const u8, failed: bool) void {
+    if (conv.len == 0 or conv.len > 64) return;
+    const a = app.gpa.dupe(u8, answer) catch return;
+    fam_done_mtx.lockUncancelable(app.io);
+    defer fam_done_mtx.unlock(app.io);
+    for (&fam_done) |*e| if (e.conv_len == 0) {
+        fam_done_order += 1;
+        e.* = .{ .conv_len = conv.len, .order = fam_done_order, .answer = a, .failed = failed };
+        @memcpy(e.conv[0..conv.len], conv);
+        return;
+    };
+    app.gpa.free(a);
+}
+
+/// The oldest hand-off of `conv`, removed; the caller frees its answer.
+fn familyDoneTake(io: std.Io, conv: []const u8) ?FamilyDone {
+    fam_done_mtx.lockUncancelable(io);
+    defer fam_done_mtx.unlock(io);
+    var best: ?*FamilyDone = null;
+    for (&fam_done) |*e| if (e.conv_len == conv.len and std.mem.eql(u8, e.conv[0..e.conv_len], conv)) {
+        if (best == null or e.order < best.?.order) best = e;
+    };
+    const b = best orelse return null;
+    const out = b.*;
+    b.* = .{};
+    return out;
+}
+
+/// With the tool map on, a family verb joins the walk's core as well, so every array the walk rebuilds keeps it.
+fn familyMapKeep(gpa: std.mem.Allocator, core: *?[]u8, walk: *?toolmap.Walk, def: []const u8) void {
+    const w = if (walk.*) |*wk| wk else return;
+    const old = core.* orelse return;
+    const fresh = (if (old.len == 0) gpa.dupe(u8, def) catch null else withToolDef(gpa, old, def)) orelse return;
+    gpa.free(old);
+    core.* = fresh;
+    w.core = fresh;
+}
+
+/// The ".../convs/" root a conversation dir sits in, trailing slash included, or null.
+fn convsRootOf(conv_dir: []const u8) ?[]const u8 {
+    const at = std.mem.lastIndexOf(u8, conv_dir, "/convs/") orelse return null;
+    return conv_dir[0 .. at + "/convs/".len];
+}
+
+/// message_subchat — the primary steers a sub-chat or asks it a question (see the section header).
+fn messageSubchatTool(app: *App, uid: u64, ctx: *tools.ToolCtx, conv: []const u8, conv_dir: []const u8, trio: ModelTrio, args: []const u8) []u8 {
+    const gpa = app.gpa;
+    if (ctx.caps == .sandboxed) return orchErr(gpa, "message_subchat is not available in this workspace: it starts a sub-chat's turn, which runs outside this conversation's sandbox");
+    if (cpaths.branchParts(conv) != null) return orchErr(gpa, "message_subchat belongs to the primary chat: a sub-chat hands its results back with report_to_primary");
+    const A = struct { sub: []const u8 = "", text: []const u8 = "", ask: bool = false };
+    const p = std.json.parseFromSlice(A, gpa, args, .{ .ignore_unknown_fields = true }) catch return orchErr(gpa, "message_subchat: could not parse args JSON");
+    defer p.deinit();
+    const text = std.mem.trim(u8, p.value.text, " \r\n\t");
+    if (text.len == 0) return orchErr(gpa, "message_subchat: 'text' is required, the message itself");
+    const slot = family.labelSlot(std.mem.trim(u8, p.value.sub, " ")) orelse return orchErr(gpa, "message_subchat: 'sub' must name a sub-chat, s1 to s5");
+    if (slot == 0) return orchErr(gpa, "message_subchat: 'sub' must name a sub-chat, s1 to s5 (main is this chat)");
+    var ib: [family.ID_MAX]u8 = undefined;
+    const bid = family.memberId(&ib, conv, slot) orelse return orchErr(gpa, "message_subchat: that sub-chat's id would pass the 64-byte ceiling");
+    const root = convsRootOf(conv_dir) orelse return orchErr(gpa, "message_subchat: cannot resolve the conversations root");
+    const bdir = std.fmt.allocPrint(gpa, "{s}{s}", .{ root, bid }) catch return emptyRes();
+    defer gpa.free(bdir);
+    std.Io.Dir.cwd().access(app.io, bdir, .{}) catch return orchErr(gpa, "message_subchat: there is no such sub-chat; open_subchat opens one");
+    // a dir with no first message is no conversation yet (POST /control makes one): nothing there to steer or ask, and
+    // the record would name no epoch
+    var teb: [family.EPOCH_LEN]u8 = undefined;
+    const to_ep = family.memberEpoch(gpa, app.io, bdir, &teb) orelse return orchErr(gpa, "message_subchat: that sub-chat has not started (it has no first message), so there is nothing to steer or ask; open_subchat opens one on a goal");
+    var feb: [family.EPOCH_LEN]u8 = undefined;
+    const from_ep = family.memberEpoch(gpa, app.io, conv_dir, &feb) orelse "";
+    const seq = famlog.append(gpa, app.io, conv_dir, .{ .kind = if (p.value.ask) .question else .steer, .from = conv, .to = bid, .text = text, .from_epoch = from_ep, .to_epoch = to_ep }, nowSecs(app.io));
+    if (seq == 0) return orchErr(gpa, "message_subchat: the family ledger could not be written; nothing was sent");
+    const framed = familyFramed(gpa, seq, p.value.ask, text) orelse return emptyRes();
+    defer gpa.free(framed);
+    const delivered: []const u8 = blk: {
+        if (isTurnLiveFor(app.io, bid, uid)) {
+            // a running turn folds a steer op in at its next step (drainChatControl), as it does a user's steer
+            const cpath = std.fmt.allocPrint(gpa, "{s}/control.jsonl", .{bdir}) catch break :blk "queued";
+            defer gpa.free(cpath);
+            const at: usize = if (std.Io.Dir.cwd().statFile(app.io, cpath, .{})) |st| (std.math.cast(usize, st.size) orelse 0) else |_| 0;
+            var line: std.ArrayListUnmanaged(u8) = .empty;
+            defer line.deinit(gpa);
+            line.appendSlice(gpa, "{\"op\":\"steer\",\"text\":") catch break :blk "queued";
+            http.jstr(gpa, &line, framed) catch break :blk "queued";
+            line.appendSlice(gpa, "}\n") catch break :blk "queued";
+            http.appendFile(app.io, gpa, cpath, line.items) catch break :blk "queued";
+            break :blk if (turnWillConsume(app.io, bid, at)) "live" else "queued";
+        }
+        break :blk if (familyWake(app, uid, bid, trio, framed)) "woken" else "queued";
+    };
+    const note: []const u8 = if (std.mem.eql(u8, delivered, "live"))
+        "it is running and folds this in at its next step"
+    else if (std.mem.eql(u8, delivered, "woken"))
+        "it was idle and is now running one turn on this message"
+    else
+        "it could not take it now (it is starting a turn, or no turn slot is free); the message is in the family ledger and reaches it in its family lines at its next turn";
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(gpa);
+    out.print(gpa, "{{\"ok\":true,\"tool\":\"message_subchat\",\"sub\":\"s{d}\",\"conv\":", .{slot}) catch return emptyRes();
+    http.jstr(gpa, &out, bid) catch return emptyRes();
+    out.print(gpa, ",\"seq\":{d},\"delivered\":\"{s}\",\"note\":", .{ seq, delivered }) catch return emptyRes();
+    http.jstr(gpa, &out, note) catch return emptyRes();
+    out.append(gpa, '}') catch return emptyRes();
+    return gpa.dupe(u8, out.items) catch emptyRes();
+}
+
+/// report_to_primary — a sub-chat hands a result, or an answer to a question, back to its primary (no wake).
+fn reportToPrimaryTool(app: *App, conv: []const u8, conv_dir: []const u8, args: []const u8) []u8 {
+    const gpa = app.gpa;
+    const bp = cpaths.branchParts(conv) orelse return orchErr(gpa, "report_to_primary belongs to a sub-chat: this is the primary chat");
+    const A = struct { text: []const u8 = "", re: u64 = 0 };
+    const p = std.json.parseFromSlice(A, gpa, args, .{ .ignore_unknown_fields = true }) catch return orchErr(gpa, "report_to_primary: could not parse args JSON");
+    defer p.deinit();
+    const text = std.mem.trim(u8, p.value.text, " \r\n\t");
+    if (text.len == 0) return orchErr(gpa, "report_to_primary: 'text' is required, the result or the answer itself");
+    const root = convsRootOf(conv_dir) orelse return orchErr(gpa, "report_to_primary: cannot resolve the conversations root");
+    const pdir = std.fmt.allocPrint(gpa, "{s}{s}", .{ root, bp.parent }) catch return emptyRes();
+    defer gpa.free(pdir);
+    var feb: [family.EPOCH_LEN]u8 = undefined;
+    const from_ep = family.memberEpoch(gpa, app.io, conv_dir, &feb) orelse return orchErr(gpa, "report_to_primary: this sub-chat has no first message yet, so its report could not be told apart from another sub-chat's in this slot");
+    var teb: [family.EPOCH_LEN]u8 = undefined;
+    const to_ep = family.memberEpoch(gpa, app.io, pdir, &teb) orelse "";
+    const seq = famlog.append(gpa, app.io, pdir, .{ .kind = if (p.value.re > 0) .answer else .result, .from = conv, .to = bp.parent, .text = text, .re = p.value.re, .from_epoch = from_ep, .to_epoch = to_ep }, nowSecs(app.io));
+    if (seq == 0) return orchErr(gpa, "report_to_primary: the family ledger could not be written; nothing was sent");
+    return std.fmt.allocPrint(gpa, "{{\"ok\":true,\"tool\":\"report_to_primary\",\"seq\":{d},\"note\":\"it reaches the primary chat as a FAMILY LEDGER line; it does not wake it\"}}", .{seq}) catch emptyRes();
+}
+
+/// open_subchat's record in the family ledger (NL_FAMILY_MSG): which sub-chat the primary opened, on what goal.
+fn familyOpened(app: *App, conv_dir: []const u8, primary: []const u8, bid: []const u8, goal: []const u8) void {
+    if (!family.Flags.read(app.sup.parent_env).msg) return;
+    const root = convsRootOf(conv_dir) orelse return;
+    const pdir = std.fmt.allocPrint(app.gpa, "{s}{s}", .{ root, primary }) catch return;
+    defer app.gpa.free(pdir);
+    var feb: [family.EPOCH_LEN]u8 = undefined;
+    const from_ep = family.memberEpoch(app.gpa, app.io, pdir, &feb) orelse "";
+    _ = famlog.append(app.gpa, app.io, pdir, .{ .kind = .open, .from = primary, .to = bid, .text = goal, .from_epoch = from_ep }, nowSecs(app.io));
+}
+
+/// After a turn's done frame (signalDone, so after every one of runTurn's own defers, the store's capture included,
+/// on whichever path the turn ended): with NL_FAMILY_MSG on, a SUB-CHAT's turn leaves its done record in the family
+/// ledger: the answer the turn settled on ("" when it committed none, never an earlier turn's) and whether it failed,
+/// as runTurn handed them on (FamilyTurn). A turn that returned before it could hand anything on gets "" and the
+/// status its files show.
+fn familyAfterTurn(app: *App, conv: []const u8, conv_dir: []const u8) void {
+    if (!family.Flags.read(app.sup.parent_env).msg) return;
+    const bp = cpaths.branchParts(conv) orelse return;
+    const gpa = app.gpa;
+    const took = familyDoneTake(app.io, conv);
+    defer if (took) |t| gpa.free(t.answer);
+    const root = convsRootOf(conv_dir) orelse return;
+    const pdir = std.fmt.allocPrint(gpa, "{s}{s}", .{ root, bp.parent }) catch return;
+    defer gpa.free(pdir);
+    std.Io.Dir.cwd().access(app.io, pdir, .{}) catch return; // the primary is gone: no family to tell
+    // a sub-chat with no first message has no epoch: no reader could tie the record to it
+    var feb: [family.EPOCH_LEN]u8 = undefined;
+    const from_ep = family.memberEpoch(gpa, app.io, conv_dir, &feb) orelse return;
+    var teb: [family.EPOCH_LEN]u8 = undefined;
+    const to_ep = family.memberEpoch(gpa, app.io, pdir, &teb) orelse "";
+    const answer: []const u8 = if (took) |t| t.answer else "";
+    const status: family.Status = if (took) |t| (if (t.failed) .failed else .finished) else family.doneStatus(gpa, app.io, conv_dir);
+    _ = famlog.append(gpa, app.io, pdir, .{ .kind = .done, .from = conv, .to = bp.parent, .text = answer, .status = @tagName(status), .from_epoch = from_ep, .to_epoch = to_ep }, nowSecs(app.io));
+}
+
+var fam_spawned_conv: [64]u8 = undefined;
+var fam_spawned_conv_len: usize = 0;
+var fam_spawned_text: [512]u8 = undefined;
+var fam_spawned_text_len: usize = 0;
+fn famSpawnCapture(conv: []const u8, text: []const u8) void {
+    @memcpy(fam_spawned_conv[0..conv.len], conv);
+    fam_spawned_conv_len = conv.len;
+    const n = @min(text.len, fam_spawned_text.len);
+    @memcpy(fam_spawned_text[0..n], text[0..n]);
+    fam_spawned_text_len = n;
+}
+
+test "NL_FAMILY_MSG: a running sub-chat is steered, an idle one woken for one turn, a busy one queued; a report and the engine's done record reach the primary" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-family-msg-tmp";
+    var ta = try http.testApp(gpa, io, root);
+    defer ta.deinit();
+    const app = &ta.app;
+    const pdir = root ++ "/u1/_chat/convs/fm1";
+    const s1 = root ++ "/u1/_chat/convs/fm1__s1";
+    const s2 = root ++ "/u1/_chat/convs/fm1__s2";
+    const cwd = std.Io.Dir.cwd();
+    for ([_][]const u8{ pdir, s1, s2 }) |d| {
+        _ = try cwd.createDirPathStatus(io, d, .default_dir);
+        var pb: [128]u8 = undefined;
+        try cwd.writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&pb, "{s}/messages.jsonl", .{d}), .data = "{\"role\":\"user\",\"content\":\"Map the harbour.\",\"kind\":\"user\",\"ts\":1}\n" });
+    }
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    try env.put("NL_FAMILY_MSG", "1");
+    ta.sup.parent_env = &env;
+    defer ta.sup.parent_env = null;
+    var counters = [_]u32{0} ** 6;
+    var ctx = tools.ToolCtx{ .gpa = gpa, .io = io, .environ = &env, .run_dir = root, .workdir = root, .scope = "test", .mind = "chat", .round = 0, .mem = undefined, .files_written = &counters[0], .observed = &counters[1], .skills_saved = &counters[2], .directives_set = &counters[3], .tools_made = &counters[4] };
+    const trio: ModelTrio = .{ .coding = .{ .base_url = "https://models.invalid/v1", .key = "k", .model = "m" } };
+    test_family_spawn = famSpawnCapture;
+    defer test_family_spawn = null;
+
+    // 1. s1 is running, reading control from offset 0: a question is folded into its turn as a steer
+    try std.testing.expectEqual(TurnDenied.ok, beginTurn(io, "fm1__s1", 1));
+    defer endTurn(io, "fm1__s1");
+    publishCtrlCursor(io, "fm1__s1", 0);
+    {
+        const r = orchTool(app, 1, &ctx, "fm1", pdir, 0, trio, "message_subchat", "{\"sub\":\"s1\",\"text\":\"How deep is the channel?\",\"ask\":true}", false).?;
+        defer gpa.free(r);
+        try std.testing.expect(std.mem.indexOf(u8, r, "\"seq\":1,\"delivered\":\"live\"") != null);
+        const ctl = try cwd.readFileAlloc(io, s1 ++ "/control.jsonl", gpa, .limited(1 << 16));
+        defer gpa.free(ctl);
+        try std.testing.expectEqualStrings("{\"op\":\"steer\",\"text\":\"[family message #1 from the primary chat; it asks you this, answer it with report_to_primary and re 1] How deep is the channel?\"}\n", ctl);
+    }
+    // 2. s2 is idle: woken for one turn on the framed message, its slot held, the turn marked woken
+    {
+        const r = orchTool(app, 1, &ctx, "fm1", pdir, 0, trio, "message_subchat", "{\"sub\":\"s2\",\"text\":\"Check the tide tables.\"}", false).?;
+        defer gpa.free(r);
+        try std.testing.expect(std.mem.indexOf(u8, r, "\"seq\":2,\"delivered\":\"woken\"") != null);
+        try std.testing.expectEqualStrings("fm1__s2", fam_spawned_conv[0..fam_spawned_conv_len]);
+        try std.testing.expectEqualStrings("[family message #2 from the primary chat] Check the tide tables.", fam_spawned_text[0..fam_spawned_text_len]);
+        try std.testing.expect(isTurnLiveFor(io, "fm1__s2", 1));
+        try std.testing.expect(familyWoken(io, "fm1__s2"));
+    }
+    // 3. s2 holds its slot but has not begun reading control: the message is queued in the ledger, not lost
+    {
+        const r = orchTool(app, 1, &ctx, "fm1", pdir, 0, trio, "message_subchat", "{\"sub\":\"s2\",\"text\":\"And the currents.\"}", false).?;
+        defer gpa.free(r);
+        try std.testing.expect(std.mem.indexOf(u8, r, "\"seq\":3,\"delivered\":\"queued\"") != null);
+    }
+    // the instant after a woken turn released its slot but before it returned: still marked, so a second message is
+    // queued, never a second wake (runTurn clears the mark as it returns, before its slot is released, so this is
+    // the one-mark rule's own guard)
+    endTurn(io, "fm1__s2");
+    {
+        const r = orchTool(app, 1, &ctx, "fm1", pdir, 0, trio, "message_subchat", "{\"sub\":\"s2\",\"text\":\"And the swell.\"}", false).?;
+        defer gpa.free(r);
+        try std.testing.expect(std.mem.indexOf(u8, r, "\"seq\":4,\"delivered\":\"queued\"") != null);
+        try std.testing.expect(!isTurnLiveFor(io, "fm1__s2", 1)); // the refused wake gave its slot back
+    }
+    familyWakeClear(io, "fm1__s2"); // what runTurn's return does
+    // s2's turn hands on the answer it settled on (FamilyTurn.end), and its done record carries it to the primary
+    try http.appendFile(io, gpa, s2 ++ "/messages.jsonl", "{\"role\":\"assistant\",\"content\":\"High water 06:12.\",\"kind\":\"veil\",\"ts\":2}\n{\"role\":\"assistant\",\"content\":\"Plan complete \u{2014} worked all 2 subtasks.\",\"kind\":\"veil\",\"ts\":3}\n");
+    try cwd.writeFile(io, .{ .sub_path = s2 ++ "/events.jsonl", .data = "{\"kind\":\"status\",\"text\":\"thinking\"}\n{\"kind\":\"done\"}\n" });
+    familyDonePush(app, "fm1__s2", "High water 06:12.", false);
+    familyAfterTurn(app, "fm1__s2", s2);
+    // 4. s1 answers the question by its number
+    {
+        const r = orchTool(app, 1, &ctx, "fm1__s1", s1, 0, trio, "report_to_primary", "{\"text\":\"12 m at low water.\",\"re\":1}", false).?;
+        defer gpa.free(r);
+        try std.testing.expect(std.mem.indexOf(u8, r, "\"ok\":true,\"tool\":\"report_to_primary\",\"seq\":6") != null);
+    }
+    var e1b: [family.EPOCH_LEN]u8 = undefined;
+    var e2b: [family.EPOCH_LEN]u8 = undefined;
+    const e1 = family.memberEpoch(gpa, io, s1, &e1b).?;
+    const e2 = family.memberEpoch(gpa, io, s2, &e2b).?;
+    {
+        var log = try family.readLog(gpa, io, pdir, family.LOG_TAIL_BYTES);
+        defer log.deinit();
+        try std.testing.expectEqual(@as(usize, 6), log.recs.len);
+        const want = [_]struct { kind: []const u8, from: []const u8, to: []const u8 }{
+            .{ .kind = "question", .from = "fm1", .to = "fm1__s1" },
+            .{ .kind = "steer", .from = "fm1", .to = "fm1__s2" },
+            .{ .kind = "steer", .from = "fm1", .to = "fm1__s2" },
+            .{ .kind = "steer", .from = "fm1", .to = "fm1__s2" },
+            .{ .kind = "done", .from = "fm1__s2", .to = "fm1" },
+            .{ .kind = "answer", .from = "fm1__s1", .to = "fm1" },
+        };
+        for (want, log.recs, 1..) |w, r, seq| {
+            try std.testing.expectEqual(@as(u64, seq), r.seq);
+            try std.testing.expectEqualStrings(w.kind, r.kind);
+            try std.testing.expectEqualStrings(w.from, r.from);
+            try std.testing.expectEqualStrings(w.to, r.to);
+        }
+        // the answer the turn settled on, not the file's last row (a plan's closing note here)
+        try std.testing.expectEqualStrings("finished", log.recs[4].status);
+        try std.testing.expectEqualStrings("High water 06:12.", log.recs[4].text);
+        try std.testing.expectEqual(@as(u64, 1), log.recs[5].re);
+        // every record names the sub-chat by the epoch it held
+        try std.testing.expectEqualStrings(e1, log.recs[0].to_epoch);
+        try std.testing.expectEqualStrings(e2, log.recs[1].to_epoch);
+        try std.testing.expectEqualStrings(e2, log.recs[4].from_epoch);
+        try std.testing.expectEqualStrings(e1, log.recs[5].from_epoch);
+    }
+    // a dir with no first message (POST /control made it) is no sub-chat to message yet
+    _ = try cwd.createDirPathStatus(io, root ++ "/u1/_chat/convs/fm1__s3", .default_dir);
+    try cwd.writeFile(io, .{ .sub_path = root ++ "/u1/_chat/convs/fm1__s3/control.jsonl", .data = "{\"op\":\"stop\"}\n" });
+    // refusals: each verb in the wrong place, a sub-chat that does not exist or has not started, a sandboxed caller, a
+    // family: scope
+    for ([_]struct { conv: []const u8, dir: []const u8, name: []const u8, args: []const u8, why: []const u8 }{
+        .{ .conv = "fm1", .dir = pdir, .name = "report_to_primary", .args = "{\"text\":\"x\"}", .why = "belongs to a sub-chat" },
+        .{ .conv = "fm1__s1", .dir = s1, .name = "message_subchat", .args = "{\"sub\":\"s2\",\"text\":\"x\"}", .why = "belongs to the primary" },
+        .{ .conv = "fm1", .dir = pdir, .name = "message_subchat", .args = "{\"sub\":\"s9\",\"text\":\"x\"}", .why = "s1 to s5" },
+        .{ .conv = "fm1", .dir = pdir, .name = "message_subchat", .args = "{\"sub\":\"s4\",\"text\":\"x\"}", .why = "no such sub-chat" },
+        .{ .conv = "fm1", .dir = pdir, .name = "message_subchat", .args = "{\"sub\":\"s3\",\"text\":\"x\"}", .why = "has not started" },
+        .{ .conv = "fm1", .dir = pdir, .name = "absorb", .args = "{\"path\":\"a.txt\",\"scope\":\"family:fm1\"}", .why = "scope is refused" },
+    }) |c| {
+        const r = orchTool(app, 1, &ctx, c.conv, c.dir, 0, trio, c.name, c.args, false).?;
+        defer gpa.free(r);
+        errdefer std.debug.print("{s} from {s}: {s}\n", .{ c.name, c.conv, r });
+        try std.testing.expect(std.mem.indexOf(u8, r, c.why) != null);
+    }
+    try std.testing.expect(!isTurnLiveFor(io, "fm1__s3", 1)); // and it was not woken
+    try std.testing.expect(orchTool(app, 1, &ctx, "fm1", pdir, 0, trio, "absorb", "{\"path\":\"a.txt\",\"scope\":\"knowledge__doc-a\"}", false) == null);
+    ctx.caps = .sandboxed;
+    {
+        const r = orchTool(app, 1, &ctx, "fm1", pdir, 0, trio, "message_subchat", "{\"sub\":\"s1\",\"text\":\"x\"}", false).?;
+        defer gpa.free(r);
+        try std.testing.expect(std.mem.indexOf(u8, r, "not available in this workspace") != null);
+    }
+    ctx.caps = .full;
+    // two turns of s2 handed on before either done record was written: each record takes its own turn's, oldest first
+    familyDonePush(app, "fm1__s2", "first turn's answer", false);
+    familyDonePush(app, "fm1__s2", "second turn's answer", true);
+    familyAfterTurn(app, "fm1__s2", s2);
+    familyAfterTurn(app, "fm1__s2", s2);
+    // a turn that returned before it handed anything on: no answer, never an earlier turn's, and its files' status
+    familyAfterTurn(app, "fm1__s2", s2);
+    {
+        var log = try family.readLog(gpa, io, pdir, family.LOG_TAIL_BYTES);
+        defer log.deinit();
+        try std.testing.expectEqual(@as(usize, 9), log.recs.len);
+        try std.testing.expectEqualStrings("first turn's answer", log.recs[6].text);
+        try std.testing.expectEqualStrings("finished", log.recs[6].status);
+        try std.testing.expectEqualStrings("second turn's answer", log.recs[7].text);
+        try std.testing.expectEqualStrings("failed", log.recs[7].status);
+        try std.testing.expectEqualStrings("", log.recs[8].text);
+        try std.testing.expectEqualStrings("finished", log.recs[8].status);
+    }
+    try std.testing.expect(familyDoneTake(io, "fm1__s2") == null); // every hand-off taken
+    // the flag off: every one of these names falls through as an unknown name does, and a turn's end writes nothing
+    _ = env.swapRemove("NL_FAMILY_MSG");
+    try std.testing.expect(orchTool(app, 1, &ctx, "fm1", pdir, 0, trio, "message_subchat", "{\"sub\":\"s1\",\"text\":\"x\"}", false) == null);
+    try std.testing.expect(orchTool(app, 1, &ctx, "fm1__s1", s1, 0, trio, "report_to_primary", "{\"text\":\"x\"}", false) == null);
+    try std.testing.expect(orchTool(app, 1, &ctx, "fm1", pdir, 0, trio, "absorb", "{\"path\":\"a.txt\",\"scope\":\"family:fm1\"}", false) == null);
+    familyAfterTurn(app, "fm1__s2", s2);
+    {
+        var log = try family.readLog(gpa, io, pdir, family.LOG_TAIL_BYTES);
+        defer log.deinit();
+        try std.testing.expectEqual(@as(usize, 9), log.recs.len);
+    }
+    // the verb a turn advertises: none with the flag off, the primary's or the sub-chat's, none for a sandboxed primary
+    try std.testing.expect(familyMsgDef(false, "fm1", false) == null);
+    try std.testing.expect(familyMsgDef(false, "fm1__s1", false) == null);
+    try std.testing.expectEqualStrings(MESSAGE_SUBCHAT_DEF, familyMsgDef(true, "fm1", false).?);
+    try std.testing.expect(familyMsgDef(true, "fm1", true) == null);
+    try std.testing.expectEqualStrings(REPORT_TO_PRIMARY_DEF, familyMsgDef(true, "fm1__s1", true).?);
+    for ([_][]const u8{ MESSAGE_SUBCHAT_DEF, REPORT_TO_PRIMARY_DEF }) |d| try std.testing.expect(try std.json.validate(gpa, d));
+    // wired: offered only beside a net, and kept by the tool map's rebuilds; the woken bit is runTurn's own, read
+    // first and cleared as it returns; a woken turn's plan is decided on the message, not its frame
+    const SRC = @embedFile("engine.zig");
+    for ([_][]const u8{
+        "familyMsgDef(ff.msg and " ++ "net_on, conv, ctx.caps == .sandboxed)",
+        "familyMapKeep(gpa, &map_core, &map_walk, " ++ "def);",
+        "    const gpa = app.gpa;\n    // NL_FAMILY_MSG: did a family message start this turn",
+        "    const fam_woken = familyWoken(app.io, conv);\n    defer if (fam_woken) " ++ "familyWakeClear(app.io, conv);\n",
+        "defer if (!fam_" ++ "woken) {",
+    }) |needle| {
+        errdefer std.debug.print("engine.zig no longer holds: {s}\n", .{needle});
+        try std.testing.expect(std.mem.indexOf(u8, SRC, needle) != null);
+    }
+    try std.testing.expectEqualStrings("Which code word did you read?", familyUnframed("[family message #4 from the primary chat; it asks you this, answer it with report_to_primary and re 4] Which code word did you read?"));
+    try std.testing.expectEqualStrings("[family note] Build it.", familyUnframed("[family note] Build it."));
+    var penv = std.process.Environ.Map.init(gpa);
+    defer penv.deinit();
+    const woken_q = "[family message #4 from the primary chat; it asks you this, answer it with report_to_primary and re 4] What does the build step do?";
+    try std.testing.expect(planGate(&penv, woken_q)); // the frame alone used to read as a task with "build "
+    try penv.put("NL_FAMILY_MSG", "1");
+    try std.testing.expect(!planGate(&penv, woken_q)); // with the ledger on, the message is a question: no plan
+    // the engine's own plan rows, as family.zig passes them over in a member's answer
+    try std.testing.expect(std.mem.indexOf(u8, SRC, "\"" ++ family.PLAN_DONE_NOTE ++ "{d} subtasks.\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, SRC, "\"Here's my plan:\\n\"") != null);
+    try std.testing.expectEqualStrings("Here's my plan:\n", family.PLAN_HEAD_NOTE);
+}
+
+test "a sub-chat turn hands its done record the answer it settled on and whether it failed; a primary's and a flag-off turn hand nothing" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-family-turn-tmp";
+    var ta = try http.testApp(gpa, io, root);
+    defer ta.deinit();
+    const app = &ta.app;
+    const s1 = root ++ "/u1/_chat/convs/ft1__s1";
+    const cwd = std.Io.Dir.cwd();
+    _ = try cwd.createDirPathStatus(io, s1, .default_dir);
+    // an earlier turn's error frame is not this turn's
+    try cwd.writeFile(io, .{ .sub_path = s1 ++ "/events.jsonl", .data = "{\"kind\":\"error\",\"err\":\"an older turn's\"}\n{\"kind\":\"done\"}\n" });
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    try env.put("NL_FAMILY_MSG", "1");
+    ta.sup.parent_env = &env;
+    defer ta.sup.parent_env = null;
+    {
+        var t: FamilyTurn = .{};
+        t.begin(app, "ft1__s1", s1);
+        t.note(gpa, "a first draft");
+        t.note(gpa, "The channel is 12 m deep."); // the newest answer committed is the one the turn settles on
+        t.end(app, "ft1__s1", s1);
+        const d = familyDoneTake(io, "ft1__s1").?;
+        defer gpa.free(d.answer);
+        try std.testing.expectEqualStrings("The channel is 12 m deep.", d.answer);
+        try std.testing.expect(!d.failed);
+    }
+    {
+        var t: FamilyTurn = .{};
+        t.begin(app, "ft1__s1", s1);
+        try http.appendFile(io, gpa, s1 ++ "/events.jsonl", "{\"kind\":\"status\",\"text\":\"thinking\"}\n{\"kind\":\"error\",\"err\":\"provider refused the call\"}\n");
+        t.end(app, "ft1__s1", s1); // no answer committed, and an error frame of its own
+        const d = familyDoneTake(io, "ft1__s1").?;
+        defer gpa.free(d.answer);
+        try std.testing.expectEqualStrings("", d.answer);
+        try std.testing.expect(d.failed);
+    }
+    // a primary's turn, and any turn with the flag off: nothing handed on
+    for ([_]bool{ true, false }) |flag| {
+        if (!flag) _ = env.swapRemove("NL_FAMILY_MSG");
+        const conv: []const u8 = if (flag) "ft1" else "ft1__s1";
+        var t: FamilyTurn = .{};
+        t.begin(app, conv, s1);
+        t.note(gpa, "x");
+        t.end(app, conv, s1);
+        try std.testing.expect(familyDoneTake(io, conv) == null);
+    }
+}
+
+test "with the tool map on, a family verb joins the walk's core, so the array the walk rebuilds keeps it" {
+    const gpa = std.testing.allocator;
+    var tree = try toolmap.Tree.init(gpa);
+    defer tree.deinit();
+    var w = try toolmap.Walk.init(gpa, &tree, "map the harbour");
+    defer w.deinit();
+    var core: ?[]u8 = try gpa.dupe(u8, RECALL_NODE_DEF);
+    defer if (core) |c| gpa.free(c);
+    w.core = core.?;
+    var walk: ?toolmap.Walk = w;
+    familyMapKeep(gpa, &core, &walk, MESSAGE_SUBCHAT_DEF);
+    try std.testing.expect(std.mem.indexOf(u8, core.?, "\"name\":\"message_subchat\"") != null);
+    try std.testing.expectEqualStrings(core.?, walk.?.core);
+    const rebuilt = try walk.?.tools(gpa, walk.?.core);
+    defer gpa.free(rebuilt);
+    try std.testing.expect(std.mem.indexOf(u8, rebuilt, "\"name\":\"message_subchat\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rebuilt, "\"name\":\"recall_node\"") != null);
+    // no walk: nothing changes
+    var none: ?toolmap.Walk = null;
+    const before = core.?;
+    familyMapKeep(gpa, &core, &none, REPORT_TO_PRIMARY_DEF);
+    try std.testing.expectEqual(before.ptr, core.?.ptr);
+}
+
+/// absorb into a "family:" scope, refused while NL_FAMILY_MSG is on: a family shares no memory scope (each
+/// conversation writes its own), and what it says to itself is the family ledger's.
+fn familyScopeAbsorb(args: []const u8) bool {
+    return std.mem.startsWith(u8, std.mem.trim(u8, dag.jsonStr(args, "scope"), " "), "family:");
 }
 
 /// sync_dir — PROJECT a directory from the CLIENT's machine into this conversation's workdir (read-only,
@@ -12495,6 +13656,12 @@ fn runInnerAgentic(
             req_owned = r;
             var tb: [220]u8 = undefined;
             emitKV(app, conv_dir, "trace", "text", std.fmt.bufPrint(&tb, "context: request unfolded from the store — {d} nodes, net {d} KB of {d} KB, newest rounds {d} KB, request {d} KB", .{ s.last_nodes, s.last_net_bytes / 1024, net_budget / 1024, live / 1024, r.len / 1024 }) catch "context: request unfolded from the store");
+            // NL_FAMILY_NET: what the family section carried in this request, against its cap
+            if (s.family) |f| {
+                const fp: *family.Pool = @ptrCast(@alignCast(f.ctx));
+                var fb: [200]u8 = undefined;
+                emitKV(app, conv_dir, "trace", "text", std.fmt.bufPrint(&fb, "family section: {d} B, {d} member line(s), {d} ledger line(s), {d} skipped by the {d} B cap", .{ fp.last_bytes, fp.last_lines, fp.last_ledger_lines, fp.last_skipped, @min(net_budget / 6, nstore.FAMILY_SECTION_MAX) }) catch "family section");
+            }
             break :blk r;
         };
         var sctx = StreamCtx{ .app = app, .conv_dir = conv_dir, .ctrl_cursor = steer_cursor.* };

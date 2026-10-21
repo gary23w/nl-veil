@@ -47,6 +47,19 @@ const WITHHELD = "(withheld from the conversation store: the result looked like 
 const NONE_OBJS: usize = std.math.maxInt(usize);
 const MARK = "{\"role\":\"";
 
+/// THE FAMILY (NL_FAMILY_NET and NL_FAMILY_MSG, set by engine.zig): the other members of this conversation's family,
+/// each one's 4tope built from its own store, and the family ledger's records for this conversation, rendered into
+/// this conversation's net (or in its place while it has none). `refresh` re-reads them (the hook decides how often)
+/// and `render` writes the capped section. Null, the default, is the net as it has always been.
+pub const FamilyHook = struct {
+    ctx: *anyopaque,
+    refresh: *const fn (ctx: *anyopaque) void,
+    render: *const fn (ctx: *anyopaque, gpa: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), cue: []const u8, cap: usize) void,
+};
+/// The family section's ceiling: a sixth of the net's budget, and never more than this. A starting bound, not a
+/// measurement.
+pub const FAMILY_SECTION_MAX: usize = 4096;
+
 /// One message object of a comma-joined message buffer (`{...},{...}` as conv_buf holds them).
 pub const Obj = struct { start: usize, end: usize };
 
@@ -115,6 +128,9 @@ pub const Store = struct {
     refused_told: usize = 0,
     /// graph.jsonl lines init skipped because they do not parse (a torn append)
     torn: usize = 0,
+    /// the family section's source (NL_FAMILY_NET), and the bytes the last assemble carried of it
+    family: ?FamilyHook = null,
+    last_family_bytes: usize = 0,
 
     const Call = struct { id: []u8, name: []u8 };
     pub const PREFIX_OBJ: usize = std.math.maxInt(usize);
@@ -272,21 +288,40 @@ pub const Store = struct {
         };
         var net: []u8 = &.{};
         defer if (net.len > 0) gpa.free(net);
+        var fam: std.ArrayListUnmanaged(u8) = .empty;
+        defer fam.deinit(gpa);
         if (span.items.len > 0) {
             var g = try dag.Graph.fromSpanWith(gpa, span.items, .{ .store = true });
             defer g.deinit();
             s.last_nodes = g.nodes.items.len;
             net = try g.unfoldWith(gpa, budget, "", .{ .tail_from = tail_from, .dialog = true, .no_next = true, .ids = true, .dialog_before_turn = s.dialog_before_turn });
+            // THE FAMILY: only with a hook, cued by where this conversation stands
+            if (s.family) |f| {
+                var cue: std.ArrayListUnmanaged(u8) = .empty;
+                defer cue.deinit(gpa);
+                try frontierCue(&g, gpa, &cue);
+                f.refresh(f.ctx);
+                f.render(f.ctx, gpa, &fam, cue.items, @min(budget / 6, FAMILY_SECTION_MAX));
+            }
+        } else if (s.family) |f| {
+            f.refresh(f.ctx);
+            f.render(f.ctx, gpa, &fam, "", @min(budget / 6, FAMILY_SECTION_MAX));
         }
         s.last_net_bytes = net.len;
+        s.last_family_bytes = fam.items.len;
         var out: std.ArrayListUnmanaged(u8) = .empty;
         errdefer out.deinit(gpa);
         try out.appendSlice(gpa, items[0..cut.prefix_end]);
-        if (net.len > 0) {
+        // the net's system message; with a family section and no net of its own, the section rides there alone (the
+        // ledger reaches a conversation whose work is all still in its newest rounds)
+        if (net.len > 0 or fam.items.len > 0) {
             var content: std.ArrayListUnmanaged(u8) = .empty;
             defer content.deinit(gpa);
-            try content.appendSlice(gpa, NET_HEAD);
-            try content.appendSlice(gpa, net);
+            if (net.len > 0) {
+                try content.appendSlice(gpa, NET_HEAD);
+                try content.appendSlice(gpa, net);
+            }
+            try content.appendSlice(gpa, fam.items);
             try out.appendSlice(gpa, ",{\"role\":\"system\",\"content\":");
             try http.jstr(gpa, &out, content.items);
             try out.append(gpa, '}');
@@ -408,6 +443,19 @@ pub const Store = struct {
         }
     }
 };
+
+/// What cues the family section: the frontier's own words and the calls it made, names and arguments (a step that only
+/// called a tool says nothing, and its call is where the work stands).
+fn frontierCue(g: *const dag.Graph, gpa: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8)) !void {
+    if (g.frontier == dag.Graph.NONE) return;
+    try out.appendSlice(gpa, g.nodes.items[g.frontier].text);
+    for (g.calls.items) |c| if (c.step == g.frontier) {
+        try out.append(gpa, ' ');
+        try out.appendSlice(gpa, c.name);
+        try out.append(gpa, ' ');
+        try out.appendSlice(gpa, c.args);
+    };
+}
 
 /// One stored node, the whole line, by its id — what recall_node returns. Null when the store has no such node.
 /// gpa-owned.
@@ -585,6 +633,150 @@ test "assemble: the prefix, one net of the earlier work with ids, then the newes
     const parsed = try std.json.parseFromSlice(std.json.Value, gpa, wrapped.items, .{});
     defer parsed.deinit();
     try tt.expectEqual(@as(usize, 2 + 1 + 4), parsed.value.array.items.len);
+}
+
+test "assemble today, byte for byte, on the assemble fixture" {
+    // A GOLDEN of today's request bytes, pinned before the family view goes near the net. The fixture is the
+    // assemble test's own (one turn, three read_file rounds, a 4000-byte budget).
+    const gpa = tt.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = "zig-store-assemble-golden-tmp";
+    std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    std.Io.Dir.cwd().createDirPath(io, dir) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    var s = try Store.init(gpa, io, dir, "chat:c2", testGate);
+    defer s.deinit();
+    var b: std.ArrayListUnmanaged(u8) = .empty;
+    defer b.deinit(gpa);
+    try testPrefix(&b, gpa);
+    s.captureAsk("Read the alpha ledger.");
+    s.setPrefix(b.items);
+    try testRound(&b, gpa, "c1", "read_file", "ledger/alpha.md", "alpha: zebracorn42 holds 1180");
+    try testRound(&b, gpa, "c2", "read_file", "ledger/beta.md", "beta: quokkaplex holds 75");
+    try testRound(&b, gpa, "c3", "read_file", "ledger/gamma.md", "gamma: the last part");
+    s.capture(b.items);
+    const req = try s.assemble(b.items, 4000);
+    defer gpa.free(req);
+    try tt.expectEqualStrings(
+        "{\"role\":\"system\",\"content\":\"you are the veil\"}" ++
+            ",{\"role\":\"user\",\"content\":\"Read the alpha ledger.\"}" ++
+            ",{\"role\":\"system\",\"content\":\"WORK SO FAR (Gary's 4tope: this conversation's earlier asks, answers and tool results, laid out from where the work stands; every line is verbatim from the conversation's store, and recall_node with an n<id> returns that node whole):\\nEARLIER IN THIS CONVERSATION (asks and answers, oldest first):\\n- t1 n1 asked: Read the alpha ledger.\\nESTABLISHED (what the frontier rests on, nearest first, each derivation contiguous):\\n- r1 n3 read_file {\\\"path\\\":\\\"ledger/alpha.md\\\"}: alpha: zebracorn42 holds 1180\\n\"}" ++
+            ",{\"role\":\"assistant\",\"content\":\"Calling read_file.\",\"tool_calls\":[{\"id\":\"c2\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"ledger/beta.md\\\"}\"}}]}" ++
+            ",{\"role\":\"tool\",\"tool_call_id\":\"c2\",\"content\":\"beta: quokkaplex holds 75\"}" ++
+            ",{\"role\":\"assistant\",\"content\":\"Calling read_file.\",\"tool_calls\":[{\"id\":\"c3\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"ledger/gamma.md\\\"}\"}}]}" ++
+            ",{\"role\":\"tool\",\"tool_call_id\":\"c3\",\"content\":\"gamma: the last part\"}",
+        req,
+    );
+}
+
+const FakeFamily = struct {
+    refreshes: usize = 0,
+    renders: usize = 0,
+    cue: [256]u8 = undefined,
+    cue_len: usize = 0,
+    cap: usize = 0,
+    /// render nothing: the family has nothing to say
+    quiet: bool = false,
+    fn refresh(ctx: *anyopaque) void {
+        const f: *FakeFamily = @ptrCast(@alignCast(ctx));
+        f.refreshes += 1;
+    }
+    fn render(ctx: *anyopaque, gpa: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), cue: []const u8, cap: usize) void {
+        const f: *FakeFamily = @ptrCast(@alignCast(ctx));
+        f.renders += 1;
+        const n = @min(cue.len, f.cue.len);
+        @memcpy(f.cue[0..n], cue[0..n]);
+        f.cue_len = n;
+        f.cap = cap;
+        if (f.quiet) return;
+        out.appendSlice(gpa, "FROM THE FAMILY:\n- s2.n5@00000000 web_search {}: tide \"tables\"\n") catch {};
+    }
+};
+
+test "the family hook: its section rides after the net inside the same system message, cued by the frontier's call, and alone where there is no net yet" {
+    const gpa = tt.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = "zig-store-family-hook-tmp";
+    std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    std.Io.Dir.cwd().createDirPath(io, dir) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    var fake: FakeFamily = .{};
+    var s = try Store.init(gpa, io, dir, "chat:c2", testGate);
+    defer s.deinit();
+    s.family = .{ .ctx = &fake, .refresh = FakeFamily.refresh, .render = FakeFamily.render };
+    var b: std.ArrayListUnmanaged(u8) = .empty;
+    defer b.deinit(gpa);
+    try testPrefix(&b, gpa);
+    const ALONE = ",{\"role\":\"system\",\"content\":\"FROM THE FAMILY:\\n- s2.n5@00000000 web_search {}: tide \\\"tables\\\"\\n\"}";
+    // nothing stored yet: no net of this conversation's own, so the family section rides alone in the net's place,
+    // with no cue to go by
+    {
+        const req = try s.assemble(b.items, 4000);
+        defer gpa.free(req);
+        try tt.expectEqual(@as(usize, 0), s.last_net_bytes);
+        try tt.expectEqual(@as(usize, 1), fake.renders);
+        try tt.expectEqual(@as(usize, 1), fake.refreshes);
+        try tt.expectEqual(@as(usize, 0), fake.cue_len);
+        try tt.expect(std.mem.startsWith(u8, req, b.items));
+        try tt.expectEqualStrings(ALONE, req[b.items.len..]);
+    }
+    // a family with nothing to say adds no message at all
+    fake.quiet = true;
+    {
+        const req = try s.assemble(b.items, 4000);
+        defer gpa.free(req);
+        try tt.expectEqualStrings(b.items, req);
+        try tt.expectEqual(@as(usize, 0), s.last_family_bytes);
+    }
+    fake.quiet = false;
+    s.captureAsk("Read the alpha ledger.");
+    s.setPrefix(b.items);
+    try testRound(&b, gpa, "c1", "read_file", "ledger/alpha.md", "alpha: zebracorn42 holds 1180");
+    // a stored span whose every node rides verbatim (one round, and this turn's ask is in the prefix): the net is
+    // empty, and the section again rides alone, with no NET head before it
+    s.capture(b.items);
+    s.dialog_before_turn = 1;
+    {
+        const req = try s.assemble(b.items, 4000);
+        defer gpa.free(req);
+        try tt.expectEqual(@as(usize, 0), s.last_net_bytes);
+        try tt.expectEqual(@as(usize, 3), fake.renders);
+        try tt.expect(std.mem.indexOf(u8, req, ALONE) != null);
+        try tt.expect(std.mem.indexOf(u8, req, "WORK SO FAR") == null);
+    }
+    try testRound(&b, gpa, "c2", "read_file", "ledger/beta.md", "beta: quokkaplex holds 75");
+    try testRound(&b, gpa, "c3", "web_search", "tide tables", "gamma: the last part");
+    s.capture(b.items);
+    const before_renders = fake.renders;
+    const req = try s.assemble(b.items, 6000);
+    defer gpa.free(req);
+    try tt.expect(s.last_net_bytes > 0);
+    try tt.expectEqual(before_renders + 1, fake.renders);
+    try tt.expectEqual(fake.renders, fake.refreshes); // every render is refreshed first
+    try tt.expectEqual(@as(usize, 1000), fake.cap); // a sixth of the net budget, under FAMILY_SECTION_MAX
+    // cued by the frontier: its words and the call it made (the frontier is the newest step)
+    try tt.expect(std.mem.indexOf(u8, fake.cue[0..fake.cue_len], "web_search") != null);
+    // the section sits after the net, inside the net's own system message, escaped as part of it
+    const net_at = std.mem.indexOf(u8, req, "WORK SO FAR (Gary's 4tope").?;
+    const fam_at = std.mem.indexOf(u8, req, "FROM THE FAMILY:\\n- s2.n5@00000000 web_search {}: tide \\\"tables\\\"\\n").?;
+    try tt.expect(fam_at > net_at);
+    const msg_end = std.mem.indexOfPos(u8, req, net_at, "\"},{\"role\":").?; // escaped content never holds this
+    try tt.expect(fam_at < msg_end);
+    try tt.expectEqual(s.last_family_bytes, "FROM THE FAMILY:\n- s2.n5@00000000 web_search {}: tide \"tables\"\n".len);
+    // and the request is still one well-formed message list
+    var wrapped: std.ArrayListUnmanaged(u8) = .empty;
+    defer wrapped.deinit(gpa);
+    try wrapped.append(gpa, '[');
+    try wrapped.appendSlice(gpa, req);
+    try wrapped.append(gpa, ']');
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, wrapped.items, .{});
+    defer parsed.deinit();
 }
 
 test "a message that does not parse is refused, the ones around it are stored, and a torn line is skipped on reload" {

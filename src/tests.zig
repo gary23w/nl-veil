@@ -51,6 +51,8 @@ test {
     _ = @import("worker/chat/net.zig"); // the net: the working span as a DAG, the critical chain, the source unfolding
     _ = @import("worker/chat/store.zig"); // the store: every message captured as the chat runs, prompts unfolded from it
     _ = @import("worker/chat/engine.zig");
+    _ = @import("worker/chat/family.zig"); // the family view: read-only, members through paths.zig, true status words
+    _ = @import("worker/chat/famlog.zig"); // the family ledger: one writer, seqs that never repeat, whole JSON lines
     _ = @import("worker/chat/overlay.zig"); // recall overlay: the per-thought working field, refractory + firing
     _ = @import("worker/chat/paths.zig");
     _ = @import("worker/chat/goal.zig"); // goal mode: the /goal grammar, the iteration log, the verdict and stop rules

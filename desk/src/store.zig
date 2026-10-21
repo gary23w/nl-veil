@@ -914,6 +914,81 @@ pub fn branchConvRoot(conv: []const u8) []const u8 {
     return if (branchConvParts(conv)) |bp| bp.parent else conv;
 }
 
+// ---- THE FAMILY VIEW (NL_FAMILY_VIEW in the desk's environment, default OFF): the server's GET
+// /api/v1/chat/convs/:id/family, polled by the poller while a chat is on screen. The server names every member by its
+// conv id and the slot comes from branchConvParts above, so the desk parses no grammar of its own.
+pub const FAMILY_MAX: usize = 1 + MAX_BRANCHES;
+/// A member's status as the server words it (src/worker/chat/family.zig Status). `none` = no reading yet.
+pub const FamStatus = enum(u8) { none, running, finished, failed, interrupted, empty, unknown };
+
+/// The server's status word as a FamStatus; a word the desk does not know reads `unknown`, never a guess.
+pub fn famStatusOf(word: []const u8) FamStatus {
+    inline for (.{ .running, .finished, .failed, .interrupted, .empty, .unknown }) |st| {
+        if (std.mem.eql(u8, word, @tagName(st))) return st;
+    }
+    return .unknown;
+}
+
+/// One member of the on-screen family, as the last poll read it.
+pub const FamMember = struct {
+    conv: [64]u8 = undefined,
+    conv_len: u8 = 0,
+    status: FamStatus = .none,
+    title: [80]u8 = undefined, // the server clips a title to 80 bytes (family.TITLE_MAX)
+    title_len: u8 = 0,
+    answer: [240]u8 = undefined, // a tooltip's share of the server's 500-byte answer
+    answer_len: u8 = 0,
+
+    pub fn convStr(m: *const FamMember) []const u8 {
+        return m.conv[0..m.conv_len];
+    }
+    pub fn titleStr(m: *const FamMember) []const u8 {
+        return m.title[0..m.title_len];
+    }
+    pub fn answerStr(m: *const FamMember) []const u8 {
+        return m.answer[0..m.answer_len];
+    }
+};
+
+/// The newest family ledger records the desk keeps (the server's NL_FAMILY_MSG; the route sends up to 20).
+pub const FAMILY_LOG_MAX: usize = 8;
+
+/// One family ledger record as the route sent it: who wrote to whom, of what kind, and the head of what it said.
+pub const FamLog = struct {
+    seq: u64 = 0,
+    kind: [12]u8 = undefined,
+    kind_len: u8 = 0,
+    from: [64]u8 = undefined,
+    from_len: u8 = 0,
+    to: [64]u8 = undefined,
+    to_len: u8 = 0,
+    text: [160]u8 = undefined,
+    text_len: u8 = 0,
+    /// a done record's status was "failed"
+    failed: bool = false,
+
+    pub fn kindStr(l: *const FamLog) []const u8 {
+        return l.kind[0..l.kind_len];
+    }
+    pub fn fromStr(l: *const FamLog) []const u8 {
+        return l.from[0..l.from_len];
+    }
+    pub fn toStr(l: *const FamLog) []const u8 {
+        return l.to[0..l.to_len];
+    }
+    pub fn textStr(l: *const FamLog) []const u8 {
+        return l.text[0..l.text_len];
+    }
+};
+
+/// NL_FAMILY_VIEW read the way the server reads every family flag (src/worker/chat/family.zig flagOn): on when set,
+/// non-empty, not starting with '0' and not "off". A desk twin, because the desk does not link the server's
+/// family.zig; its test lists the server test's cases one for one.
+pub fn familyFlagOn(value: ?[]const u8) bool {
+    const v = value orelse return false;
+    return v.len > 0 and v[0] != '0' and !std.ascii.eqlIgnoreCase(v, "off");
+}
+
 /// One durable memory the chat AI keeps for the user (a key, login, preference, fact). The value lives in
 /// neuron-db (the chat's local hippocampus, used for relevance recall) mirrored to memories.jsonl for display.
 /// This is a LOCAL, single-user store — secrets are fine to hold in plaintext here per the user's direction.
@@ -1253,6 +1328,19 @@ pub const Store = struct {
     // scratchpad, and ONLY while the Tots tab is being drawn - each poll is a call into the user's Cloudflare
     // account. The tab raises tots_watch every frame; the poller reads and lowers it every tick.
     tots_watch: bool = false,
+    // --- the FAMILY VIEW (NL_FAMILY_VIEW, read from the desk's environment once before the threads start; off, nothing
+    // below ever moves). The chat view raises family_watch every frame it draws; the poller reads and lowers it each
+    // tick and polls the ON-SCREEN family only, so other families' sub-chats still finish without a notice. A local
+    // delete evicts its member at once and bumps family_gen, and a poll begun before that bump is discarded.
+    family_on: bool = false,
+    family_watch: bool = false,
+    family_root: [64]u8 = undefined,
+    family_root_len: u8 = 0,
+    family: [FAMILY_MAX]FamMember = @splat(.{}),
+    family_n: u8 = 0,
+    family_gen: u32 = 0,
+    family_log: [FAMILY_LOG_MAX]FamLog = @splat(.{}), // the family ledger's newest records, oldest first (server NL_FAMILY_MSG)
+    family_log_n: u8 = 0,
     tots_seen: bool = false, //   a roster fetch has landed at least once
     tots_denied: bool = false, // the server refused this login (tots are admin-gated)
     tots_busy: bool = false, //   a deployment is in flight (the first one uploads the runtime: up to a minute)
@@ -1520,6 +1608,38 @@ pub const Store = struct {
         return c;
     }
 
+    /// Chat thread, after a local delete of `conv`: drop it from the family view NOW, so its tab does not linger to be
+    /// selected and minted again over the deleted conversation's memory, and void any family poll already in flight.
+    /// A deleted primary takes its whole family with it.
+    pub fn familyEvict(s: *Store, conv: []const u8) void {
+        s.lock();
+        defer s.unlock();
+        s.family_gen +%= 1;
+        if (branchConvParts(conv) == null and std.mem.eql(u8, s.family_root[0..s.family_root_len], conv)) {
+            s.family_n = 0;
+            s.family_log_n = 0;
+            return;
+        }
+        var w: u8 = 0;
+        for (s.family[0..s.family_n]) |m| {
+            if (std.mem.eql(u8, m.convStr(), conv)) continue;
+            s.family[w] = m;
+            w += 1;
+        }
+        s.family_n = w;
+    }
+
+    /// Does the server's family view list `conv` as a member? (A sub-chat the 32-row conv mirror dropped is still one.)
+    pub fn familyHas(s: *Store, conv: []const u8) bool {
+        s.lock();
+        defer s.unlock();
+        if (!s.family_on) return false;
+        for (s.family[0..s.family_n]) |*m| {
+            if (std.mem.eql(u8, m.convStr(), conv)) return true;
+        }
+        return false;
+    }
+
     /// Poller thread: raise a notification. Overwrites the oldest when full.
     pub fn pushNotif(s: *Store, title: []const u8, body: []const u8, accent: u8) void {
         log.trace("store.pushNotif title={s} accent={d}", .{ title, accent });
@@ -1670,4 +1790,42 @@ test "TurnMetric.streamed defaults FALSE so an older server's sample is never re
     try std.testing.expectEqual(false, s.turn_metrics[0].streamed);
     s.pushMetric(.{ .first_byte_ms = 120, .total_ms = 900, .streamed = true }, "m", 0, 0);
     try std.testing.expectEqual(true, s.turn_metrics[1].streamed);
+}
+
+test "the family flag reads as the server's family flags do, status words map one for one, and a local delete evicts at once" {
+    // the server test's cases (src/worker/chat/family.zig), one for one
+    try std.testing.expect(!familyFlagOn(null));
+    for ([_][]const u8{ "", "0", "00", "0x", "off", "OFF", "Off" }) |v| try std.testing.expect(!familyFlagOn(v));
+    for ([_][]const u8{ "1", "on", "yes", "true", "2", "false" }) |v| try std.testing.expect(familyFlagOn(v));
+    for ([_]FamStatus{ .running, .finished, .failed, .interrupted, .empty, .unknown }) |st| try std.testing.expectEqual(st, famStatusOf(@tagName(st)));
+    try std.testing.expectEqual(FamStatus.unknown, famStatusOf("exploded"));
+    try std.testing.expectEqual(FamStatus.unknown, famStatusOf(""));
+
+    const s = std.testing.allocator.create(Store) catch unreachable;
+    defer std.testing.allocator.destroy(s);
+    s.* = .{};
+    s.family_on = true;
+    const root = "c42";
+    @memcpy(s.family_root[0..root.len], root);
+    s.family_root_len = root.len;
+    for ([_][]const u8{ "c42", "c42__s1", "c42__s3" }, 0..) |id, i| {
+        @memcpy(s.family[i].conv[0..id.len], id);
+        s.family[i].conv_len = @intCast(id.len);
+        s.family[i].status = .finished;
+    }
+    s.family_n = 3;
+    try std.testing.expect(s.familyHas("c42__s3"));
+    s.familyEvict("c42__s3");
+    try std.testing.expectEqual(@as(u8, 2), s.family_n);
+    try std.testing.expect(!s.familyHas("c42__s3"));
+    try std.testing.expect(s.familyHas("c42__s1"));
+    try std.testing.expectEqual(@as(u32, 1), s.family_gen);
+    // a deleted primary takes the whole family with it
+    s.familyEvict("c42");
+    try std.testing.expectEqual(@as(u8, 0), s.family_n);
+    try std.testing.expectEqual(@as(u32, 2), s.family_gen);
+    // with the flag off nothing is a member, whatever the rows say
+    s.family_n = 1;
+    s.family_on = false;
+    try std.testing.expect(!s.familyHas("c42"));
 }

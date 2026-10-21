@@ -918,6 +918,8 @@ pub fn main(init: std.process.Init) !void {
     router.get("/api/v1/chat/convs/:id/file", chat_service.convFile, .{});
     router.delete("/api/v1/chat/convs/:id", chat_service.deleteConv, .{});
     router.get("/api/v1/chat/convs/:id/events", chat_service.convEvents, .{});
+    // the family view (NL_FAMILY_VIEW, default OFF) is routed only while it is on: unset, the path is no route at all
+    if (chat_service.familyRouteOn(init.environ_map)) router.get("/api/v1/chat/convs/:id/family", chat_service.convFamily, .{});
     router.post("/api/v1/chat/convs/:id/messages", chat_service.postMessage, .{});
     router.post("/api/v1/chat/convs/:id/control", chat_service.chatControl, .{});
     router.post("/api/v1/chat/convs/:id/tool_result", chat_service.toolResult, .{});

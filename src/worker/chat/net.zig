@@ -1056,7 +1056,7 @@ fn tagsCover(raw_new: []const u8, raw_old: []const u8) ?bool {
 /// The value of `key` in a flat JSON object as readFile's std.json parse reads a `usize` field: a number, or a string
 /// holding one, integral floats included. 0 when the key is absent (the field's default), null when it is present
 /// but std.json refuses it (a fraction, a negative, a word), which readFile answers with "bad args".
-fn jsonUint(obj: []const u8, key: []const u8) ?u64 {
+pub fn jsonUint(obj: []const u8, key: []const u8) ?u64 {
     const at = valueAt(obj, key) orelse return 0;
     // the value's own token: a string through its closing quote, anything else up to the next delimiter
     var end = at;
@@ -1079,7 +1079,7 @@ fn jsonUint(obj: []const u8, key: []const u8) ?u64 {
 
 /// A stored ask, or an answer (an assistant message that called nothing and is not a distillation): the dialog the
 /// store's net carries for turns the recency window no longer shows.
-fn isDialog(node: Node) bool {
+pub fn isDialog(node: Node) bool {
     return (node.kind == .user and node.ask) or (node.kind == .note and node.nid > 0 and !isDistillation(node.text));
 }
 
