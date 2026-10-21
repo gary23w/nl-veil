@@ -34,4 +34,7 @@ test {
     // Registered EXPLICITLY although httpc.zig imports it: its tests ran only because that import happened to
     // be analysed (the assets.zig lesson above). The twin of src/worker/wsock.zig; the loopback socket client.
     _ = @import("wsock.zig");
+    // The twin of src/worker/bounded.zig (whole file, header included): the git, curl, neuron-db and veil runs above
+    // ride it, and its real-shell tests prove the bound here too.
+    _ = @import("bounded.zig");
 }

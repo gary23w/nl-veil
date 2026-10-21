@@ -15,16 +15,17 @@ Zig 0.16's `std.process.run` `.timeout` is no bound on Windows for a child that 
 ## Key Exports
 
 - `run(gpa, io, Options) Result` — never fails; how the run ended is `Result.end`
-- `Options` — `argv`, `cwd`, `environ_map` (null = this process's own), `bound_ms` (spawn to exit, not extended by output), `stdout_limit`, `stderr_limit`, `stderr_tail` (keep stderr's tail instead of ending the run: past 4x the limit it is cut back to its last `stderr_limit` bytes), and `head_tail` (keep the first and last `limit` bytes of both streams instead, so neither ever ends the run; overrides `stderr_tail`)
-- `End` — `exited`, `signal`, `killed` (still running at the bound), `overflow` (printed past a limit, what `StreamTooLong` was; never under `head_tail`), `unread` (output not readable or exit not collected), `unstarted` (the spawn failed)
+- `Options` — `argv`, `cwd`, `environ_map` (null = this process's own), `bound_ms` (spawn to exit, not extended by output), `stdout_limit`, `stderr_limit`, `stderr_tail` (keep stderr's tail instead of ending the run: past 4x the limit it is cut back to its last `stderr_limit` bytes), `head_tail` (keep the first and last `limit` bytes of both streams instead, so neither ever ends the run; overrides `stderr_tail`), and `stdin` (bytes written whole, then closed, before anything is read; null = no stdin. They must fit the pipe with no reader, 4096 bytes, which is why `llm.runCurl` holds its configs to `KEY_CFG_MAX`)
+- `End` — `exited`, `signal`, `killed` (still running at the bound), `overflow` (printed past a limit, what `StreamTooLong` was; never under `head_tail`), `unread` (output not readable, exit not collected, or the child gone before it took its stdin: `error.StdinRefused`), `unstarted` (the spawn failed)
 - `Result` — `end`, `code`, `stdout`, `stderr` (gpa-owned), `err` (the spawn's own error for `.unstarted`, so `deps.isSpawnMissing` still tells a missing program from a failing one), plus `ok()`, `exited()` (the code, or null), `finished()` (exit or signal: exactly the runs `std.process.run` returned a `RunResult` for), `why()`, `deinit(gpa)`
+- `feed(io, *Child, bytes)` — write a child's stdin whole and close it; false when the child is already gone. `llm.keyToCurl` hands the streamed call's config over with it
 - `killTree(io, *Child)` — `taskkill /F /T` on Windows (cmd.exe never execs, so a shell's grandchild outlives a kill of the shell); the process group on POSIX, then the child itself
 - `spawnGuarded(io, argv, deadline_ms)` — spawn with no pipes and terminate by handle at the deadline from a watchdog thread (moved here from `tools.zig`, which aliases it); `killTree`'s taskkill runs through it
 - `seam.cap_ms` (tests only) — caps every bound, so a test can drive a caller whose real bound is minutes to its cut in a second
 
 ## Dependencies
 
-- `std`, `builtin` — no other repo modules (one test imports `deps.zig`)
+- `std`, `builtin` — no other repo modules, so `desk/src/bounded.zig` can be the same file byte for byte (the desk is a module of its own inside `veil` and cannot import `src/worker`; `scripts/check.ps1 -Scan` and `check.sh --scan` compare the two under `[twins]`)
 - `kernel32` — `CancelIoEx`, `GetProcessId`, `TerminateProcess`, `Sleep`
 
 ## Usage Context
@@ -33,8 +34,15 @@ Zig 0.16's `std.process.run` `.timeout` is no bound on Windows for a child that 
 - `worker/tools.zig` — `runProbe` (poll kind=command, the call's remaining `timeout_s`), the python edit gate `pyCompileError` (15 s), `nodeCheckOnce` (15 s), `zigAstCheckError` (20 s); `spawnGuarded` for curl fetches and `taskkill`
 - `worker/deps.zig` — `versionOf`, `onPath`, `probeDirect` (5 s each)
 - `worker/toolchain.zig` — `bootstrap` installs (360 s each, `head_tail`)
+- `worker/llm.zig` — `runCurl` (the call's `--max-time` + 30 s, its config over stdin) for `postUrl` and `cf_oauth.curl`; `probeCapabilities`' remote `/api/version` (15 s)
+- `worker/run.zig` (more) — `netProbe` (15 s); `importGraph` and `interfaceScan` (60 s); `smokeTest` and the bench (240 s)
+- `worker/tools.zig` (more) — `run_python` and made tools (the PYRUN cap + 30 s), `stop_process` (30 s), poll kind=process (15 s), `list_dir` (60 s), `run_tests` (270 s), `patch_system` (120 s), `osint_scan` (60 s), `deep_crawl` (240 s), the python web search (120 s), `curlForm` (40 s)
+- `worker/oscillation.zig` and `worker/neuron/client.zig` — every neuron-db run (120 s)
+- `worker/modelpull.zig` `httpGet` (75 s), `worker/net.zig` `probe`, `worker/ocr.zig` `runArgv` (120 s)
+- `config/cf_tunnel.zig` — `runs` (15 s; the connector download 600 s, its unpack 120 s) and the DoH check (25 s)
+- The desk's twin: `chat.zig` sync-manifest / sync-read (50 s, inside the server's 60 s wait), `gitvc.zig` git (600 s) and repo_create's curl, `neuron.zig` (120 s), `updater.zig` `command` (its own seconds)
 
-Registered directly in `src/tests.zig`.
+Registered directly in `src/tests.zig`, and the twin in `desk/src/tests.zig`.
 
 ## Notable Implementation Details
 
@@ -43,7 +51,7 @@ Registered directly in `src/tests.zig`.
 - `head_tail` keeps a run going to its exit however much it prints. Past its limit a stream's first `limit` bytes are set aside, and what follows is cut back to its last `limit` bytes each time it passes 4x that. The result is the head, a `[... N bytes not kept ...]` line, and the tail, each side cut back to whole lines where a line ends within 512 bytes of the cut. A stream that printed no more than 2x its limit is kept whole. VERIFY rows (`runDeclaredChecks`, 48 KB) and dependency installs (`toolchain.bootstrap`, 32 KB) use it. Stopped at the limit, a passing `pytest -v` or verbose `cargo test` past 48 KB was scored as a failed row, and a chatty `npm install` was killed mid-install. Both ends rather than the tail alone, because of what reads a failing row's output: `errorHeaders` lists the first 12 lines that start with "error" and `checkDiag` starts at the first line containing "error", and a compiler's root cause is at the top; a test runner's summary, and `checkDiag`'s fallback (the last 700 bytes when no line says "error"), are at the bottom. The install note reads the last 300 bytes.
 - POSIX children are spawned as process-group leaders (`pgid = 0`) so the tree kill reaches nested shells (dash does not exec a nested `sh -c`). The cost, accepted: a terminal's Ctrl-C no longer reaches the child directly.
 - Not bounded: a child that closes both pipes and keeps running is waited for, as `std.process.run` waited for it.
-- Tests (real shells): a child silent on its pipes is cut at 1 s with its grandchild dead and no natural-end marker; a child whose pipes are held by an orphan `taskkill /T` cannot reach (`start /B`) still ends at its bound (Windows, the `CancelIoEx` proof); a child printing every second is cut at a 3 s deadline; a run inside its bound keeps both streams and its exit code; stdout past its limit is an overflow while a stderr tail never is; under `head_tail`, ~36 KB on each stream against 1 KB limits exits with its own code, keeps both ends with the cut between whole lines, and what it kept plus the marker's count equals what the script printed, while ~1.4 KB against 1 KB is kept byte for byte as an uncapped run keeps it; a missing program reads as `.unstarted` with a spawn-missing error. `run.zig` drives `runDeclaredChecks` and `probeRowExecutes` through a silently hanging row with `seam.cap_ms`, and `runDeclaredChecks` through rows printing ~180 KB that pass and a ~300 KB failing row whose feedback names a failing point from each end. `toolchain.zig` drives `bootstrap` with a fake `npm` printing ~200 KB on each stream. `tools.zig` checks the python gate's verdicts through the bounded run.
+- Tests (real shells): a child silent on its pipes is cut at 1 s with its grandchild dead and no natural-end marker; a child whose pipes are held by an orphan `taskkill /T` cannot reach (`start /B`) still ends at its bound (Windows, the `CancelIoEx` proof); a child printing every second is cut at a 3 s deadline; a run inside its bound keeps both streams and its exit code; stdout past its limit is an overflow while a stderr tail never is; under `head_tail`, ~36 KB on each stream against 1 KB limits exits with its own code, keeps both ends with the cut between whole lines, and what it kept plus the marker's count equals what the script printed, while ~1.4 KB against 1 KB is kept byte for byte as an uncapped run keeps it; a missing program reads as `.unstarted` with the spawn's own error (`deps.zig` tests that it reads as missing); stdin reaches a child that reads to EOF, and a run fed stdin is still cut past its limit. `run.zig` drives `runDeclaredChecks` and `probeRowExecutes` through a silently hanging row with `seam.cap_ms`, and `runDeclaredChecks` through rows printing ~180 KB that pass and a ~300 KB failing row whose feedback names a failing point from each end. `toolchain.zig` drives `bootstrap` with a fake `npm` printing ~200 KB on each stream. `tools.zig` checks the python gate's verdicts through the bounded run.
 
 ---
 

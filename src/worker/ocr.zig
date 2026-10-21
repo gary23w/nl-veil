@@ -12,6 +12,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const bounded = @import("bounded.zig");
 
 const log = std.log.scoped(.ocr);
 
@@ -90,12 +91,19 @@ fn writeShimOnce(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, name: 
     return path;
 }
 
-/// Run `argv` (bounded stdout), returning its trimmed stdout; "" on a spawn failure or a non-zero exit.
+/// Run `argv` (bounded.run: 2 minutes, stdout up to 1 MiB), returning its trimmed stdout; "" on a spawn failure, a
+/// non-zero exit, or a run stopped at its bound or its limit. The bound covers swift compiling its shim on every call
+/// (macOS); nothing bounded a stuck PowerShell or swift before, and output past the limit could hang the call outright
+/// on Windows (see bounded.zig).
 fn runArgv(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8, label: []const u8) []u8 {
-    const res = std.process.run(gpa, io, .{ .argv = argv, .stdout_limit = .limited(1 << 20) }) catch return empty(gpa);
-    defer gpa.free(res.stdout);
-    defer gpa.free(res.stderr);
-    const exit = if (res.term == .exited) res.term.exited else @as(u8, 255);
+    var res = bounded.run(gpa, io, .{ .argv = argv, .bound_ms = 120_000, .stdout_limit = 1 << 20, .stderr_limit = 16 << 10, .stderr_tail = true });
+    defer res.deinit(gpa);
+    if (res.end == .unstarted) return empty(gpa);
+    if (!res.finished()) {
+        log.info("OCR {s} stopped ({s})", .{ label, @tagName(res.end) });
+        return empty(gpa);
+    }
+    const exit = res.exited() orelse 255;
     if (exit != 0) {
         log.info("OCR {s} failed (exit={d}): {s}", .{ label, exit, clip(res.stderr, 200) });
         return empty(gpa);

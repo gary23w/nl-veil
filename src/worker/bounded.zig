@@ -20,6 +20,11 @@
 //!
 //! NOT bounded: a child that closes both pipes and keeps running is waited for (child.wait), as std.process.run
 //! waited for it.
+//!
+//! TWO COPIES, ONE FILE: src/worker/bounded.zig and desk/src/bounded.zig are identical, header included (scripts/
+//! check.ps1 -Scan [twins]). The desk is compiled into `veil` as a module of its own, and a source file may belong to
+//! exactly one module, so it cannot import this one; so the file imports nothing but std and builtin, in either
+//! package.
 const std = @import("std");
 const builtin = @import("builtin");
 
@@ -59,11 +64,16 @@ pub const Options = struct {
     /// both ends of its output: a compiler's first error is at the top, a test runner's summary at the bottom.
     /// Overrides stderr_tail.
     head_tail: bool = false,
+    /// Bytes for the child's stdin, written whole and then closed before anything is read; null = no stdin
+    /// (`.ignore`), as std.process.run. They must fit the pipe with no reader (4096 bytes: llm.KEY_CFG_MAX says
+    /// why), or the write waits on a child that is not reading and the bound is no bound. A child that is gone
+    /// before it takes them ends the run as `.unread` with error.StdinRefused.
+    stdin: ?[]const u8 = null,
 };
 
 /// How a run ended. `.killed` = still running at the bound; `.overflow` = printed past a limit (never under
-/// `head_tail`); `.unread` = its output could not be read or its exit not collected; `.unstarted` = the spawn failed.
-/// `.killed`, `.overflow` and `.unread` were killed with everything they started.
+/// `head_tail`); `.unread` = its output could not be read, its exit not collected, or it refused its stdin;
+/// `.unstarted` = the spawn failed. `.killed`, `.overflow` and `.unread` were killed with everything they started.
 pub const End = enum { exited, signal, killed, overflow, unread, unstarted };
 
 pub const Result = struct {
@@ -144,7 +154,8 @@ const Ends = struct {
 };
 
 /// Run `o.argv` to its end or its bound, whichever comes first, with both streams captured. Never fails: how it
-/// ended is `end`. stdin is closed (`.ignore`) and no console window opens on Windows.
+/// ended is `end`. stdin is `o.stdin` then closed, or closed from the start (`.ignore`), and no console window opens
+/// on Windows.
 pub fn run(gpa: std.mem.Allocator, io: std.Io, o: Options) Result {
     const bound_ms = if (builtin.is_test) @min(o.bound_ms, seam.cap_ms orelse o.bound_ms) else o.bound_ms;
     // POSIX: its own process group, so killTree reaches what the child started. dash does not exec a nested
@@ -154,13 +165,17 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, o: Options) Result {
         .argv = o.argv,
         .cwd = o.cwd,
         .environ_map = o.environ_map,
-        .stdin = .ignore,
+        .stdin = if (o.stdin == null) .ignore else .pipe,
         .stdout = .pipe,
         .stderr = .pipe,
         .create_no_window = true,
         .pgid = if (win) null else 0,
     }) catch |e| return .{ .err = e };
     defer child.kill(io);
+    if (o.stdin) |bytes| if (!feed(io, &child, bytes)) {
+        killTree(io, &child);
+        return .{ .end = .unread, .err = error.StdinRefused };
+    };
     var bufs: std.Io.File.MultiReader.Buffer(2) = undefined;
     var mr: std.Io.File.MultiReader = undefined;
     mr.init(gpa, io, bufs.toStreams(), &.{ child.stdout.?, child.stderr.? });
@@ -229,6 +244,17 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, o: Options) Result {
         else => r.end = .signal,
     }
     return r;
+}
+
+/// Write `bytes` to the child's stdin and close it. Returns at once when they fit the pipe (Options.stdin). False when
+/// the child is already gone: the write fails instead of blocking (PIPE_CLOSING on Windows; EPIPE on POSIX, where
+/// Io.Threaded's SIGPIPE handler turns the signal into an error). The caller's child.kill then reaps it.
+pub fn feed(io: std.Io, child: *std.process.Child, bytes: []const u8) bool {
+    const pipe = child.stdin orelse return false;
+    child.stdin = null; // closed here, so child.kill never closes it a second time
+    defer pipe.close(io);
+    pipe.writeStreamingAll(io, bytes) catch return false;
+    return true;
 }
 
 /// Kill `child` and everything it started; the caller still reaps `child` itself (child.kill or child.wait).
@@ -501,7 +527,7 @@ test "head_tail runs a stream to its exit however much it prints, keeps both end
     }
 }
 
-test "a program that is not there reads as unstarted with the spawn's own error, so a missing one is told apart from a failing one" {
+test "a program that is not there reads as unstarted with the spawn's own error (deps.zig tells a missing one from a failing one by it)" {
     const gpa = std.testing.allocator;
     const root = "zig-bounded-missing-tmp";
     var f: Fixture = undefined;
@@ -510,6 +536,33 @@ test "a program that is not there reads as unstarted with the spawn's own error,
     var r = run(gpa, f.threaded.io(), .{ .argv = &.{"nl-bounded-no-such-program"}, .bound_ms = 30_000, .stdout_limit = 64, .stderr_limit = 64 });
     defer r.deinit(gpa);
     try std.testing.expectEqual(End.unstarted, r.end);
-    try std.testing.expect(@import("deps.zig").isSpawnMissing(r.err.?));
+    try std.testing.expectEqual(@as(?anyerror, error.FileNotFound), r.err);
     try std.testing.expect(!r.finished() and r.exited() == null);
+}
+
+test "stdin is handed over whole and closed, so a child reading to EOF finishes; a run fed stdin is still cut past its limit (real child)" {
+    const gpa = std.testing.allocator;
+    const root = "zig-bounded-stdin-tmp";
+    var f: Fixture = undefined;
+    f.init(gpa, root);
+    defer f.deinit(root);
+    const io = f.threaded.io();
+    const fed = "header = \"X-Fed: 1\"\nurl = \"fed-line\"\n";
+    {
+        // findstr and cat read to EOF: had the pipe been left open they would wait for more until the bound, and the
+        // run would end `.killed`, not `.exited`
+        const argv: []const []const u8 = if (win) &.{ "findstr", "/R", "." } else &.{"cat"};
+        var r = run(gpa, io, .{ .argv = argv, .stdin = fed, .bound_ms = 30_000, .stdout_limit = 4096, .stderr_limit = 4096 });
+        defer r.deinit(gpa);
+        try std.testing.expectEqual(End.exited, r.end);
+        try std.testing.expect(std.mem.indexOf(u8, r.stdout, "X-Fed: 1") != null and std.mem.indexOf(u8, r.stdout, "url = \"fed-line\"") != null);
+    }
+    {
+        // takes its stdin, then prints far past the limit for far longer than this test: only the limit ends it
+        const argv = shell(if (win) "findstr /R . & for /L %i in (1,1,200000) do @echo 0123456789" else "cat; i=0; while [ $i -lt 200000 ]; do echo 0123456789; i=$((i+1)); done");
+        var r = run(gpa, io, .{ .argv = &argv, .stdin = fed, .bound_ms = 60_000, .stdout_limit = 1024, .stderr_limit = 1024 });
+        defer r.deinit(gpa);
+        try std.testing.expectEqual(End.overflow, r.end);
+        try std.testing.expect(std.mem.startsWith(u8, r.stdout, "header = \"X-Fed: 1\""));
+    }
 }

@@ -226,7 +226,7 @@ pub fn curl(o: CurlOpts, method: []const u8, url: []const u8, body: []const u8, 
     const body_path = std.fmt.bufPrint(&body_path_buf, "{s}/{s}{s}", .{ o.scratch, o.body_prefix, tag }) catch return null;
     var data_at_buf: [710]u8 = undefined;
     const data_at = std.fmt.bufPrint(&data_at_buf, "@{s}", .{body_path}) catch return null;
-    // Armed before the write, so a half-written body goes too. It runs once curl has exited: runCurl waits for it.
+    // Armed before the write, so a half-written body goes too. It runs once curl is gone: runCurl reaps it, or kills it.
     defer if (in_file) std.Io.Dir.cwd().deleteFile(io, body_path) catch {};
     if (in_file) std.Io.Dir.cwd().writeFile(io, .{ .sub_path = body_path, .data = body }) catch return null;
 
@@ -240,13 +240,14 @@ pub fn curl(o: CurlOpts, method: []const u8, url: []const u8, body: []const u8, 
     av.append(gpa, url) catch return null;
 
     if (builtin.is_test) if (test_before_curl) |hold| hold();
-    const run = llm.runCurl(gpa, io, av.items, cfg.items, o.stdout_limit) catch return null;
-    gpa.free(run.stderr);
-    if (run.stdout.len == 0) {
-        gpa.free(run.stdout);
-        return null;
-    }
-    return run.stdout;
+    // Only a curl that ran to its own end answers: one stopped at the bound, past the limit or refusing its config is
+    // null, as its error was before.
+    var run = llm.runCurl(gpa, io, av.items, cfg.items, o.stdout_limit, llm.curlBoundMs(o.max_time_s));
+    defer run.deinit(gpa);
+    if (!run.finished() or run.stdout.len == 0) return null;
+    const out = run.stdout;
+    run.stdout = &.{};
+    return out;
 }
 
 /// TEST SEAM: runs on the calling thread once a Cloudflare call has written everything it writes, just before its curl

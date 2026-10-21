@@ -12,6 +12,7 @@ const httpc = @import("httpc.zig");
 const net = @import("net.zig"); // cached "is there internet?" — consulted ONLY on the hosted path
 const rate = @import("rate.zig");
 const bu = @import("browser/util.zig"); // sleepMs: a raw-thread sleep, no Io park (see the tail loop in streamAttempt)
+const bounded = @import("bounded.zig"); // runCurl: a curl call under a bound that holds, its config over stdin
 const fakehttp = @import("fakehttp.zig"); // TEST ONLY: the canned gateway the H11 test at the bottom dials
 const gemma4 = @import("gemma4.zig"); // engine-side wire format, used when a backend fails the name-binding probe
 const dataset = @import("dataset.zig"); // training-set capture — inert unless a set is recording
@@ -655,6 +656,7 @@ fn knobBlindFailure(err_text: []const u8) bool {
     const blind = [_][]const u8{
         ERR_LOCAL_REFUSED, ERR_LOCAL_TIMED_OUT, ERR_LOCAL_DROPPED, ERR_CURL_NO_CONFIG, ERR_CURL_NO_SPAWN, ERR_CURL_NONZERO,
         ERR_WRITE_BODY,    ERR_OOM,             KEY_STRAY_BYTE,    KEY_CFG_TOO_LONG,   net.MSG,           STOPPED,
+        ERR_CURL_BOUND,    ERR_CURL_OVERFLOW,
     };
     for (blind) |t| if (std.mem.eql(u8, err_text, t)) return true;
     return std.mem.startsWith(u8, err_text, ERR_CURL_EXIT);
@@ -673,6 +675,8 @@ test "knobBlindFailure: the credential, the provider's clock, the transport, the
         ERR_CURL_NONZERO,
         ERR_CURL_NO_CONFIG,
         ERR_CURL_NO_SPAWN,
+        ERR_CURL_BOUND,
+        ERR_CURL_OVERFLOW,
         ERR_LOCAL_TIMED_OUT,
         ERR_LOCAL_DROPPED,
         ERR_LOCAL_REFUSED,
@@ -1956,6 +1960,8 @@ const ERR_LOCAL_TIMED_OUT = "local model call timed out";
 const ERR_LOCAL_DROPPED = "local model call failed (connection dropped mid-reply)";
 const ERR_CURL_NO_CONFIG = "curl exited before it read its config";
 const ERR_CURL_NO_SPAWN = "curl failed to run";
+const ERR_CURL_BOUND = "curl was still running past its call's deadline and was stopped";
+const ERR_CURL_OVERFLOW = "the reply passed 8 MiB and was cut off";
 const ERR_CURL_EXIT = "curl exit: "; // + the head of curl's own stderr
 const ERR_CURL_NONZERO = "curl nonzero exit"; // ERR_CURL_EXIT when its message could not be formatted
 const ERR_WRITE_BODY = "could not write llm request";
@@ -2039,36 +2045,87 @@ fn chatCfg(gpa: std.mem.Allocator, key: []const u8, bearer: Bearer) error{ OutOf
 /// signal into an error). The caller's `child.kill` then reaps it.
 fn keyToCurl(io: std.Io, child: *std.process.Child, cfg: []const u8) bool {
     std.debug.assert(cfg.len <= KEY_CFG_MAX);
-    const pipe = child.stdin orelse return false;
-    child.stdin = null; // closed here, so Child.kill never closes it a second time
-    defer pipe.close(io);
-    pipe.writeStreamingAll(io, cfg) catch return false;
-    return true;
+    return bounded.feed(io, child, cfg);
 }
 
-/// std.process.run for a curl call whose config goes over stdin, which std.process.run ignores: spawn curl, hand it
-/// `cfg` (keyToCurl), then collect stdout (up to `stdout_limit` bytes) and stderr until it exits. The caller checks
-/// `cfg.len <= KEY_CFG_MAX` before it calls: keyToCurl asserts it. postUrl and cf_oauth.curl run their calls here.
-pub fn runCurl(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8, cfg: []const u8, stdout_limit: usize) !std.process.RunResult {
-    var child = try std.process.spawn(io, .{ .argv = argv, .stdin = .pipe, .stdout = .pipe, .stderr = .pipe, .create_no_window = true });
-    defer child.kill(io);
-    if (!keyToCurl(io, &child, cfg)) return error.CurlTookNoConfig;
-    var bufs: std.Io.File.MultiReader.Buffer(2) = undefined;
-    var streams: std.Io.File.MultiReader = undefined;
-    streams.init(gpa, io, bufs.toStreams(), &.{ child.stdout.?, child.stderr.? });
-    defer streams.deinit();
-    const stdout = streams.reader(0);
-    while (streams.fill(64, .none)) |_| {
-        if (stdout.buffered().len > stdout_limit) return error.StreamTooLong;
-    } else |e| switch (e) {
-        error.EndOfStream => {},
-        else => |other| return other,
+/// A curl call whose config goes over its stdin, which std.process.run cannot do: bounded.run, handing curl `cfg`
+/// before it reads anything, then collecting stdout (past `stdout_limit` bytes the run ends as `.overflow`) and a tail
+/// of stderr until curl exits or `bound_ms` passes. The caller checks `cfg.len <= KEY_CFG_MAX` before it calls, and
+/// the assert here holds it: the config is written whole before the reads start, and only that much fits the pipe.
+/// postUrl and cf_oauth.curl run their calls here; a curl that took no config ends `.unread` with error.StdinRefused.
+///
+/// The bound is the call's own, because curl's --max-time is none for a curl blocked on a full pipe. This used to be
+/// std.process.run's read loop with no deadline, returning StreamTooLong past the limit; on Windows that hangs when
+/// curl keeps writing stdout with stderr silent (the re-armed stdout read is only queued, and the reader's deinit waits
+/// on stderr's read alone; see bounded.zig), so a reply past the limit wedged the call for good.
+pub fn runCurl(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8, cfg: []const u8, stdout_limit: usize, bound_ms: u64) bounded.Result {
+    std.debug.assert(cfg.len <= KEY_CFG_MAX);
+    return bounded.run(gpa, io, .{ .argv = argv, .stdin = cfg, .bound_ms = bound_ms, .stdout_limit = stdout_limit, .stderr_limit = 16 << 10, .stderr_tail = true });
+}
+
+/// runCurl's bound for a call whose curl has `--max-time max_time_s`: that, plus room for curl to start, read its
+/// config and wind down. Only a curl that cannot reach its own timer (blocked on a full pipe) ever meets it.
+pub fn curlBoundMs(max_time_s: u32) u64 {
+    return (@as(u64, max_time_s) + 30) * 1000;
+}
+
+/// TEST ONLY: a scratch dir under the cwd with `small.txt` (its own name, one line) and `big.txt` (1 MiB), and the
+/// file:// url of each, for a curl that needs no server. `buf` holds both urls. pub: modelpull's and cf_oauth's tests
+/// read the same files.
+pub fn testFileUrls(io: std.Io, root: []const u8, buf: *[2][1200]u8) !struct { small: []const u8, big: []const u8 } {
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = try std.Io.Dir.cwd().createDirPathStatus(io, root, .default_dir);
+    var path_buf: [700]u8 = undefined;
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&path_buf, "{s}/small.txt", .{root}), .data = "small-body\n" });
+    const big = try std.testing.allocator.alloc(u8, 1 << 20);
+    defer std.testing.allocator.free(big);
+    @memset(big, 'x');
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&path_buf, "{s}/big.txt", .{root}), .data = big });
+    var abs_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const abs = abs_buf[0..try std.Io.Dir.cwd().realPathFile(io, root, &abs_buf)];
+    var urls: [2][]const u8 = undefined;
+    for ([_][]const u8{ "small.txt", "big.txt" }, 0..) |name, i| {
+        var w: std.Io.Writer = .fixed(&buf[i]);
+        try w.writeAll(if (abs[0] == '/') "file://" else "file:///");
+        for (abs) |c| switch (c) {
+            '\\' => try w.writeByte('/'),
+            ' ' => try w.writeAll("%20"),
+            else => try w.writeByte(c),
+        };
+        try w.print("/{s}", .{name});
+        urls[i] = w.buffered();
     }
-    try streams.checkAnyError();
-    const term = try child.wait(io);
-    const out = try streams.toOwnedSlice(0);
-    errdefer gpa.free(out);
-    return .{ .term = term, .stdout = out, .stderr = try streams.toOwnedSlice(1) };
+    return .{ .small = urls[0], .big = urls[1] };
+}
+
+test "runCurl hands curl its config over stdin, and a reply past the limit ends the call instead of hanging it (real curl)" {
+    const gpa = std.testing.allocator;
+    const environ: std.process.Environ = if (builtin.os.tag == .windows) .{ .block = .global } else .{ .block = .{ .slice = std.mem.span(std.c.environ) } };
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = environ });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-runcurl-limit-tmp";
+    var url_bufs: [2][1200]u8 = undefined;
+    const urls = try testFileUrls(io, root, &url_bufs);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    // The url is in the config and nowhere on the argv, so the body coming back is the proof the config went over stdin.
+    const argv = [_][]const u8{ "curl", "-sS", "-K", "-" };
+    var cfg_buf: [1300]u8 = undefined;
+    {
+        var r = runCurl(gpa, io, &argv, try std.fmt.bufPrint(&cfg_buf, "url = \"{s}\"\n", .{urls.small}), 4096, 60_000);
+        defer r.deinit(gpa);
+        if (r.end == .unstarted) return error.SkipZigTest; // no curl on this box
+        try std.testing.expect(r.ok());
+        try std.testing.expectEqualStrings("small-body\n", r.stdout);
+    }
+    {
+        // 1 MiB against a 4 KiB limit. std.process.run's loop returned StreamTooLong here and then waited, in the
+        // reader's deinit, for curl to exit, while curl sat blocked writing the rest to a pipe nobody read.
+        var r = runCurl(gpa, io, &argv, try std.fmt.bufPrint(&cfg_buf, "url = \"{s}\"\n", .{urls.big}), 4096, 60_000);
+        defer r.deinit(gpa);
+        try std.testing.expectEqual(bounded.End.overflow, r.end);
+        try std.testing.expect(r.stdout.len > 4096 and r.stdout.len < 1 << 20);
+    }
 }
 
 /// TEST SEAM: runs on the calling thread once a curl call's scratch files are on disk, just before its curl starts
@@ -2154,7 +2211,8 @@ fn postUrl(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const
     var av: std.ArrayListUnmanaged([]const u8) = .empty;
     defer av.deinit(gpa);
     var tt_buf: [16]u8 = undefined;
-    const tt = std.fmt.bufPrint(&tt_buf, "{d}", .{callTimeoutS(local, budget_tokens)}) catch "90";
+    const tt_s = callTimeoutS(local, budget_tokens);
+    const tt = std.fmt.bufPrint(&tt_buf, "{d}", .{tt_s}) catch "90";
     // --connect-timeout bounds the DEAD-HOST case on its own: a provider that never completes a TCP/TLS
     // handshake now fails in 20s instead of riding the (now budget-sized) total cap to the wall. This is the
     // only fast-fail available here — see below for why the idle detector cannot live on this path.
@@ -2167,10 +2225,18 @@ fn postUrl(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const
     if (!local) av.appendSlice(gpa, &.{ "--retry", "1", "--retry-delay", "1", "--retry-connrefused", "--retry-all-errors", "--retry-max-time", "3" }) catch return oom(gpa);
     av.appendSlice(gpa, &.{ "-K", "-", "--data-binary", data_at, "-w", STREAM_STAT ++ "%{http_code}", url }) catch return oom(gpa);
     if (builtin.is_test) if (test_before_curl) |hold| hold();
-    const run = runCurl(gpa, io, av.items, cfg, 8 << 20) catch |e| return err(gpa, if (e == error.CurlTookNoConfig) ERR_CURL_NO_CONFIG else ERR_CURL_NO_SPAWN);
-    defer gpa.free(run.stderr);
-    if (run.term != .exited or run.term.exited != 0) {
-        defer gpa.free(run.stdout);
+    // --retry-max-time 3 starts no retry after 3 s, so the one attempt that can run its full --max-time ends inside
+    // 3 + 1 + tt seconds: the bound's slack covers it.
+    var run = runCurl(gpa, io, av.items, cfg, 8 << 20, curlBoundMs(tt_s));
+    defer run.deinit(gpa);
+    switch (run.end) {
+        .exited, .signal => {},
+        .unread => return err(gpa, if (run.err.? == error.StdinRefused) ERR_CURL_NO_CONFIG else ERR_CURL_NO_SPAWN),
+        .killed => return err(gpa, ERR_CURL_BOUND),
+        .overflow => return err(gpa, ERR_CURL_OVERFLOW),
+        .unstarted => return err(gpa, ERR_CURL_NO_SPAWN),
+    }
+    if (!run.ok()) {
         // err() keeps its own copy, so the formatted message is freed here rather than orphaned per failed call.
         const why = std.fmt.allocPrint(gpa, ERR_CURL_EXIT ++ "{s}", .{run.stderr[0..@min(run.stderr.len, 200)]}) catch return err(gpa, ERR_CURL_NONZERO);
         defer gpa.free(why);
@@ -2182,11 +2248,12 @@ fn postUrl(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const
     // 429/503 puts the host into the cooldown every turn observes (rate.acquire) before anyone retries.
     const stat = splitStat(run.stdout);
     if (stat.code >= 400) {
-        defer gpa.free(run.stdout);
         if (stat.code == 429 or stat.code == 503 or stat.code == 529) rate.note429(io, url, 0);
         return .{ .content = std.fmt.allocPrint(gpa, "HTTP {d}: {s}", .{ stat.code, run.stdout[0..@min(stat.body_len, 300)] }) catch @constCast("HTTP error"), .ok = false, .status = stat.code };
     }
-    const trimmed = if (stat.body_len < run.stdout.len) (gpa.realloc(run.stdout, stat.body_len) catch run.stdout[0..stat.body_len]) else run.stdout;
+    const reply = run.stdout;
+    run.stdout = &.{}; // the reply's now, not run's to free
+    const trimmed = if (stat.body_len < reply.len) (gpa.realloc(reply, stat.body_len) catch reply[0..stat.body_len]) else reply;
     return .{ .content = trimmed, .ok = true, .status = stat.code };
 }
 
@@ -2898,17 +2965,14 @@ pub fn probeCapabilities(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8
                 else => break :blk null,
             }
         }
-        // non-loopback base (hosted/remote): curl still carries the TLS
-        const run = std.process.run(gpa, io, .{
-            .argv = &.{ "curl", "-sS", "--max-time", "5", ver_url },
-            .stdout_limit = .limited(64 << 10),
-        }) catch break :blk null;
-        gpa.free(run.stderr);
-        if (run.term != .exited or run.term.exited != 0) {
-            gpa.free(run.stdout);
-            break :blk null;
-        }
-        break :blk run.stdout;
+        // non-loopback base (hosted/remote): curl still carries the TLS. bounded.run: a reply past the limit hung
+        // std.process.run on Windows (see bounded.zig)
+        var run = bounded.run(gpa, io, .{ .argv = &.{ "curl", "-sS", "--max-time", "5", ver_url }, .bound_ms = 15_000, .stdout_limit = 64 << 10, .stderr_limit = 4096, .stderr_tail = true });
+        defer run.deinit(gpa);
+        if (!run.ok()) break :blk null;
+        const body = run.stdout;
+        run.stdout = &.{};
+        break :blk body;
     };
     if (ver == null) return;
     const ver_body = ver.?;

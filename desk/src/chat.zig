@@ -18,6 +18,7 @@ const httpc = @import("httpc.zig");
 const llm = @import("llm.zig");
 const secrets = @import("secrets.zig");
 const gitvc = @import("gitvc.zig");
+const bounded = @import("bounded.zig"); // the twin of src/worker/bounded.zig: a child run whose bound holds on Windows
 const catalog = @import("catalog.zig");
 const log = @import("log.zig");
 const neurondb = @import("neuron.zig");
@@ -2555,13 +2556,9 @@ pub const Chat = struct {
         var binb: [1100]u8 = undefined;
         const bin = self.veilBinPath(&binb);
         const argv = [_][]const u8{ bin, "sync-manifest", "--workdir", workdir };
-        const r = std.process.run(self.gpa, self.io, .{ .argv = &argv, .stdout_limit = .limited(1 << 20), .stderr_limit = .limited(8 << 10) }) catch {
-            self.postToolResult(conv, id, "{\"probe\":\"\",\"files\":[]}");
-            return;
-        };
-        defer self.gpa.free(r.stdout);
-        defer self.gpa.free(r.stderr);
-        self.postToolResult(conv, id, if (r.stdout.len > 0) r.stdout else "{\"probe\":\"\",\"files\":[]}");
+        var r = bounded.run(self.gpa, self.io, .{ .argv = &argv, .bound_ms = SYNC_VERB_BOUND_MS, .stdout_limit = 1 << 20, .stderr_limit = 8 << 10 });
+        defer r.deinit(self.gpa);
+        self.postToolResult(conv, id, if (r.finished() and r.stdout.len > 0) r.stdout else "{\"probe\":\"\",\"files\":[]}");
     }
 
     /// Answer a {kind:"file_pull"} frame: stage the frame as the args file, spawn `veil sync-read`, and post
@@ -2590,14 +2587,16 @@ pub const Chat = struct {
         const bin = self.veilBinPath(&binb);
         self.setStatus("sending your files to the hive...");
         const argv = [_][]const u8{ bin, "sync-read", "--workdir", workdir, "--args-file", args_file };
-        const r = std.process.run(self.gpa, self.io, .{ .argv = &argv, .stdout_limit = .limited(8 << 20), .stderr_limit = .limited(8 << 10) }) catch {
-            self.postToolResult(conv, id, "{\"files\":[]}");
-            return;
-        };
-        defer self.gpa.free(r.stdout);
-        defer self.gpa.free(r.stderr);
-        self.postToolResult(conv, id, if (r.stdout.len > 0) r.stdout else "{\"files\":[]}");
+        var r = bounded.run(self.gpa, self.io, .{ .argv = &argv, .bound_ms = SYNC_VERB_BOUND_MS, .stdout_limit = 8 << 20, .stderr_limit = 8 << 10 });
+        defer r.deinit(self.gpa);
+        self.postToolResult(conv, id, if (r.finished() and r.stdout.len > 0) r.stdout else "{\"files\":[]}");
     }
+
+    /// The bound on a `veil sync-manifest` / `veil sync-read` the desk runs to answer the server (bounded.run): inside
+    /// the 60 s the server waits for the answer (SYNC_WAIT_S in src/worker/chat/engine.zig), so a verb that hangs
+    /// still gets its empty answer there in time. Under std.process.run nothing bounded it, and a manifest past its
+    /// 1 MiB limit could hang the desk's executor outright on Windows (see bounded.zig).
+    const SYNC_VERB_BOUND_MS: u64 = 50_000;
 
     /// Resolve the `veil` server binary to invoke as `veil exec-tool` — it hosts the ONE tool executor, so the desk
     /// never re-implements a tool. Order: next to our own exe (release bundle colocates them) → the dev zig-out

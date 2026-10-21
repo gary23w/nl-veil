@@ -3,6 +3,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
+const bounded = @import("../bounded.zig");
 
 /// COST PROBE — bumped only in test builds. Every neuron-db call in the app funnels through `exec`,
 /// so this counts PROCESS SPAWNS, which is what this file's startup-cost claims are actually about.
@@ -32,21 +33,24 @@ pub const Neuron = struct {
         return .{ .gpa = gpa, .io = io, .bin = bin, .db = db };
     }
 
+    /// neuron-db's stdout when it exits 0; a non-zero exit or a signal is error.NeuronCommandFailed, and anything that
+    /// kept it from running to its end is that error. bounded.run, with no output limit, as before: under
+    /// std.process.run a wedged neuron-db held its caller (the vault, sessions, api keys, the ledger, user records)
+    /// forever. It is a local sqlite store that answers in milliseconds to seconds, so the bound only ever cuts a
+    /// wedged one, as error.Timeout.
     fn exec(self: Neuron, argv: []const []const u8) ![]u8 {
         if (builtin.is_test) spawn_probe += 1;
-        const res = try std.process.run(self.gpa, self.io, .{ .argv = argv });
-        self.gpa.free(res.stderr);
-        switch (res.term) {
-            .exited => |code| if (code != 0) {
-                self.gpa.free(res.stdout);
-                return error.NeuronCommandFailed;
-            },
-            else => {
-                self.gpa.free(res.stdout);
-                return error.NeuronCommandFailed;
-            },
+        var r = bounded.run(self.gpa, self.io, .{ .argv = argv, .bound_ms = 120_000, .stdout_limit = std.math.maxInt(usize), .stderr_limit = 16 << 10, .stderr_tail = true });
+        defer r.deinit(self.gpa);
+        switch (r.end) {
+            .exited => if (r.code != 0) return error.NeuronCommandFailed,
+            .signal => return error.NeuronCommandFailed,
+            .killed => return error.Timeout,
+            else => return r.err orelse error.Unexpected,
         }
-        return res.stdout;
+        const out = r.stdout;
+        r.stdout = &.{};
+        return out;
     }
 
     /// Single-value UPSERT for a scope: forget any prior value, then store this one. neuron `observe` APPENDS,

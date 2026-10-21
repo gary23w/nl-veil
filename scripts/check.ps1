@@ -243,6 +243,17 @@ if ($Scan) {
             Write-Host "[twins] wsock.zig twins identical (whole-file contract holds)" -ForegroundColor Green
         }
     }
+    #    bounded.zig is a whole-file twin too: the desk cannot import src/worker (it is a module of its own inside
+    #    `veil`), so it keeps an identical copy. Keep check.sh's twin of this check on the same rule.
+    $a = Join-Path $repo "src\worker\bounded.zig"; $b = Join-Path $repo "desk\src\bounded.zig"
+    if ((Test-Path $a) -and (Test-Path $b)) {
+        if ((Get-FileHash $a).Hash -ne (Get-FileHash $b).Hash) {
+            $signals++
+            Write-Host "[twins] bounded.zig twins differ (whole-file contract broken) -- make the two copies identical" -ForegroundColor Yellow
+        } else {
+            Write-Host "[twins] bounded.zig twins identical (whole-file contract holds)" -ForegroundColor Green
+        }
+    }
 
     # 3) version stamp drift across the hand-stamped locations.
     $vZon  = (Select-String -Path (Join-Path $repo "build.zig.zon") -Pattern '\.version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value

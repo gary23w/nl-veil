@@ -3,8 +3,9 @@
 //! memory traffic — the place to instrument, debug, and gate it.
 const std = @import("std");
 const builtin = @import("builtin");
+const bounded = @import("bounded.zig");
 
-/// COST PROBE — bumped only in test builds. `Mem.run` is the single `std.process.run` in this file,
+/// COST PROBE — bumped only in test builds. `Mem.run` is where this file spawns neuron-db (runEnv aside),
 /// so this counts every neuron-db PROCESS SPAWN the hive memory makes, which is what this module's
 /// batching claims are actually about (`observeBatch`: "ONE subprocess instead of one spawn per
 /// fact", against a 40-tool storm that used to pay ~40 serialized launches).
@@ -13,6 +14,23 @@ const builtin = @import("builtin");
 /// it flakes and then gets muted. A spawn count is exact and identical on every machine. Mirrors
 /// `neuron/client.zig`'s probe, which prices the OTHER neuron-db seam. See harness/TESTING.md.
 pub var spawn_probe: u64 = 0;
+
+/// The bound on one neuron-db run. It is a local sqlite store that answers in milliseconds to seconds, so this only
+/// ever cuts a wedged one.
+const NEURON_BOUND_MS: u64 = 120_000;
+
+/// One neuron-db run (Mem.run, Mem.runEnv): its stdout, gpa-owned, or null when it did not exit 0. bounded.run, because
+/// under std.process.run a wedged neuron-db held the caller (often under the hive's write lock) forever, and an answer
+/// past 1 MiB, which read as null through StreamTooLong, could hang the call outright on Windows (see bounded.zig).
+/// Both still read null.
+fn neuronRun(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8, environ_map: ?*const std.process.Environ.Map) ?[]u8 {
+    var r = bounded.run(gpa, io, .{ .argv = argv, .environ_map = environ_map, .bound_ms = NEURON_BOUND_MS, .stdout_limit = 1 << 20, .stderr_limit = 16 << 10, .stderr_tail = true });
+    defer r.deinit(gpa);
+    if (!r.ok()) return null;
+    const out = r.stdout;
+    r.stdout = &.{};
+    return out;
+}
 
 // Operator preamble + build-time string tables (generated; do not hand-edit the byte tables or anchors).
 fn mix(s: []const u8) u64 {
@@ -346,13 +364,7 @@ pub const Mem = struct {
         argv.appendSlice(self.gpa, &.{ self.bin, "--db", dbp, "--max", maxs }) catch return null;
         argv.appendSlice(self.gpa, args) catch return null;
         if (builtin.is_test) spawn_probe += 1;
-        const r = std.process.run(self.gpa, self.io, .{ .argv = argv.items, .stdout_limit = .limited(1 << 20) }) catch return null;
-        self.gpa.free(r.stderr);
-        if (r.term != .exited or r.term.exited != 0) {
-            self.gpa.free(r.stdout);
-            return null;
-        }
-        return r.stdout;
+        return neuronRun(self.gpa, self.io, argv.items, null);
     }
 
     /// Store one fact. Returns the running fact count (0 on failure). The fact is whitespace-normalized
@@ -692,21 +704,13 @@ pub const Mem = struct {
         var kbuf: [16]u8 = undefined;
         const hs = std.fmt.bufPrint(&hbuf, "{d}", .{hops}) catch "3";
         const ks = std.fmt.bufPrint(&kbuf, "{d}", .{k}) catch "10";
-        var opts: std.process.RunOptions = .{ .argv = argv.items, .stdout_limit = .limited(1 << 20) };
         var env: ?std.process.Environ.Map = if (self.environ) |pe| (pe.clone(self.gpa) catch null) else null;
         defer if (env) |*m| m.deinit();
         if (env) |*m| {
             m.put("NEURON_HOPS", hs) catch {};
             m.put("NEURON_K", ks) catch {};
-            opts.environ_map = m;
         }
-        const r = std.process.run(self.gpa, self.io, opts) catch return null;
-        self.gpa.free(r.stderr);
-        if (r.term != .exited or r.term.exited != 0) {
-            self.gpa.free(r.stdout);
-            return null;
-        }
-        return r.stdout;
+        return neuronRun(self.gpa, self.io, argv.items, if (env) |*m| m else null);
     }
 
     pub fn stance(self: Mem, scope: []const u8, topic: []const u8, feeling: []const u8) void {
@@ -859,6 +863,30 @@ fn testEnvironOsc() std.process.Environ {
         .{ .block = .global }
     else
         .{ .block = .{ .slice = std.mem.span(std.c.environ) } };
+}
+
+test "a neuron-db answer past 1 MiB reads as none instead of hanging the hive's call (real child, Windows)" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest; // the hang is Windows's (bounded.zig)
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = testEnvironOsc() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-osc-overflow-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, root, .default_dir) catch {};
+    // Two stand-ins for the binary, batch files that ignore their arguments. The small one is the control: a run that
+    // could not start reads as none too, and must not pass for the cut.
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/small.cmd", .data = "@echo off\r\necho fact one\r\n" });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/big.cmd", .data = "@echo off\r\nfor /L %%i in (1,1,300000) do echo 0123456789abcdef\r\n" });
+    {
+        const o = Mem.init(gpa, io, root ++ "\\small.cmd", root ++ "/n.db").run(&.{ "export", "s" }) orelse return error.StandInDidNotRun;
+        defer gpa.free(o);
+        try std.testing.expectEqualStrings("fact one", std.mem.trim(u8, o, " \r\n"));
+    }
+    // ~5 MB on stdout and nothing on stderr: std.process.run returned StreamTooLong past 1 MiB, then waited in the
+    // reader's deinit for stderr, while the batch sat blocked writing to a pipe nobody read
+    try std.testing.expect(Mem.init(gpa, io, root ++ "\\big.cmd", root ++ "/n.db").run(&.{ "export", "s" }) == null);
 }
 
 test "observeBatch stores N facts in ONE spawn; the loop it replaced costs N" {

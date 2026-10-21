@@ -91,6 +91,12 @@ if [ "${1:-}" = "--scan" ]; then
   else
     echo "[twins] wsock.zig twins differ -- make the two copies identical"
   fi
+  # bounded.zig is a whole-file twin too (the desk cannot import src/worker). Same rule as check.ps1's twin of this check.
+  if cmp -s src/worker/bounded.zig desk/src/bounded.zig; then
+    echo "[twins] bounded.zig twins identical (whole-file contract holds)"
+  else
+    echo "[twins] bounded.zig twins differ -- make the two copies identical"
+  fi
   vz=$(sed -n 's/.*\.version = "\([^"]*\)".*/\1/p' build.zig.zon | head -1)
   vm=$(sed -n 's/.*VERSION = "\([^"]*\)".*/\1/p' src/main.zig | head -1)
   # desk/build.zig.zon is checked too: it was in NEITHER this echo nor bump-version.ps1's edit list, so it

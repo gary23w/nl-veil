@@ -5,6 +5,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const nap = @import("nap.zig");
 const distribution = @import("distribution.zig");
+const bounded = @import("bounded.zig");
 const Io = std.Io;
 const dir = Io.Dir;
 const windows = builtin.os.tag == .windows;
@@ -134,14 +135,23 @@ fn select(a: std.mem.Allocator, rel: Release, component: []const u8) !Asset {
     return found orelse error.PlatformUpdateNotPublished;
 }
 
+/// Run `argv` to a 0 exit within `seconds` and return its stdout (`a`-owned). bounded.run: std.process.run's
+/// `.timeout` was no bound on Windows for a child that prints nothing (curl --silent writing to a file is one), and
+/// restarted at every read for one that does (see bounded.zig). It fails as before: the spawn's own error, Timeout at
+/// the bound, StreamTooLong past a limit, and DownloadOrProcessFailed for a failed exit.
 fn command(io: Io, a: std.mem.Allocator, argv: []const []const u8, seconds: u32) ![]u8 {
-    const r = try std.process.run(a, io, .{ .argv = argv, .stdout_limit = .limited(2 << 20), .stderr_limit = .limited(4096), .timeout = .{ .duration = .{ .raw = .fromSeconds(seconds), .clock = .awake } } });
-    defer a.free(r.stderr);
-    if (r.term != .exited or r.term.exited != 0) {
-        a.free(r.stdout);
-        return error.DownloadOrProcessFailed;
+    var r = bounded.run(a, io, .{ .argv = argv, .bound_ms = @as(u64, seconds) * 1000, .stdout_limit = 2 << 20, .stderr_limit = 4096 });
+    defer r.deinit(a);
+    switch (r.end) {
+        .exited, .signal => {},
+        .killed => return error.Timeout,
+        .overflow => return error.StreamTooLong,
+        .unstarted, .unread => return r.err orelse error.Unexpected,
     }
-    return r.stdout;
+    if (!r.ok()) return error.DownloadOrProcessFailed;
+    const out = r.stdout;
+    r.stdout = &.{};
+    return out;
 }
 
 fn download(io: Io, a: std.mem.Allocator, url: []const u8, path: []const u8) !void {
@@ -426,6 +436,28 @@ test "release selection requires exact platform assets and a valid GitHub SHA-25
     assets[0].digest = "sha256:" ++ "z" ** 64;
     try std.testing.expectError(error.InvalidReleaseDigest, select(a, rel, "app"));
     try std.testing.expectError(error.PlatformUpdateNotPublished, select(a, rel, "neuron"));
+}
+
+test "a command that prints nothing is stopped at its bound, with what it started, not waited out (real shell)" {
+    const a = std.testing.allocator;
+    // The REAL process environ (harness/TESTING.md): an empty one leaves the Windows shell without SystemRoot/PATH.
+    var threaded = Io.Threaded.init(a, .{ .environ = if (windows) .{ .block = .global } else .{ .block = .{ .slice = std.mem.span(std.c.environ) } } });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-updater-bound-tmp";
+    dir.cwd().deleteTree(io, root) catch {};
+    defer dir.cwd().deleteTree(io, root) catch {};
+    try dir.cwd().createDirPath(io, root);
+    // Silent on its pipes for ~10 s, the way curl --silent --output is (ping's output goes to held.txt, the loop's to a
+    // heartbeat), then end.txt, written only by a natural end. std.process.run's 1 s `.timeout` waited it out on
+    // Windows: no read ever completed to let the timeout through (bounded.zig).
+    const argv: []const []const u8 = if (windows)
+        &.{ "cmd", "/C", "ping -n 11 127.0.0.1 >" ++ root ++ "\\held.txt 2>&1 & echo natural>" ++ root ++ "\\end.txt" }
+    else
+        &.{ "/bin/sh", "-c", "sh -c 'i=0; while [ $i -lt 100 ]; do echo x >> " ++ root ++ "/held.txt; i=$((i+1)); sleep 0.1; done'; echo natural > " ++ root ++ "/end.txt" };
+    try std.testing.expectError(error.Timeout, command(io, a, argv, 1));
+    try std.testing.expectError(error.FileNotFound, dir.cwd().statFile(io, root ++ "/end.txt", .{}));
+    try bounded.expectTreeGone(io, root ++ "/held.txt"); // and the shell's child went with it: nothing is left to write it
 }
 
 test "replacement preserves user data and a missing engine rolls the app back" {

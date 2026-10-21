@@ -247,6 +247,22 @@ test "isSpawnMissing splits missing-binary from ran-and-failed" {
     try std.testing.expect(!isSpawnMissing(error.StreamTooLong));
     try std.testing.expect(!isSpawnMissing(error.OutOfMemory));
     try std.testing.expect(!isSpawnMissing(error.Timeout));
+    try std.testing.expect(!isSpawnMissing(error.StdinRefused)); // bounded.run: it started, then would not take its stdin
+}
+
+test "a program that is not there reads as missing from bounded.run's spawn error, so the caller gives the hint (real spawn)" {
+    const gpa = std.testing.allocator;
+    // The REAL process environ (TESTING.md): an empty one leaves the Windows child without SystemRoot/PATH.
+    const environ: std.process.Environ = if (builtin.os.tag == .windows)
+        .{ .block = .global }
+    else
+        .{ .block = .{ .slice = std.mem.span(std.c.environ) } };
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = environ });
+    defer threaded.deinit();
+    var r = bounded.run(gpa, threaded.io(), .{ .argv = &.{"nl-deps-no-such-program"}, .bound_ms = 30_000, .stdout_limit = 64, .stderr_limit = 64 });
+    defer r.deinit(gpa);
+    try std.testing.expectEqual(bounded.End.unstarted, r.end);
+    try std.testing.expect(isSpawnMissing(r.err.?));
 }
 
 test "pythonBin: NL_PYTHON_BIN wins only when it names an existing file, else the bare name probe() resolves" {

@@ -37,6 +37,7 @@ const http = @import("../gateway/http.zig");
 const App = http.App;
 const cf_oauth = @import("cf_oauth.zig");
 const modelpull = @import("../worker/modelpull.zig");
+const bounded = @import("../worker/bounded.zig"); // runs() and the DoH check: a bound that holds on Windows too
 const fakehttp = @import("../worker/fakehttp.zig"); // TEST ONLY: the stand-in v4 API the provisioning tests dial
 const requireUser = http.requireUser;
 const requireAdmin = http.requireAdmin;
@@ -267,12 +268,16 @@ fn localBinary(app: *App, buf: []u8) ?[]const u8 {
     return std.fmt.bufPrint(buf, "{s}/bin/cloudflared{s}", .{ app.data, if (builtin.os.tag == .windows) ".exe" else "" }) catch null;
 }
 
-fn runs(app: *App, argv: []const []const u8) bool {
-    const r = std.process.run(app.gpa, app.io, .{ .argv = argv, .stdout_limit = .limited(16 << 10) }) catch return false;
-    app.gpa.free(r.stdout);
-    app.gpa.free(r.stderr);
-    return r.term == .exited and r.term.exited == 0;
+/// Whether `argv` ran and exited 0 within `bound_s` (bounded.run). It used to have no bound at all, so a download that
+/// stalled held the tunnel's start forever; stdout past 16 KiB is still a failure, and stderr is kept as a tail only.
+fn runs(app: *App, argv: []const []const u8, bound_s: u32) bool {
+    var r = bounded.run(app.gpa, app.io, .{ .argv = argv, .bound_ms = @as(u64, bound_s) * 1000, .stdout_limit = 16 << 10, .stderr_limit = 16 << 10, .stderr_tail = true });
+    defer r.deinit(app.gpa);
+    return r.ok();
 }
+
+/// runs()'s bound for a command that reports and exits (a --version, a kill, a chmod).
+const QUICK_S: u32 = 15;
 
 /// The release asset for this OS/arch, or null on a platform Cloudflare does not ship for.
 fn releaseAsset() ?[]const u8 {
@@ -302,7 +307,7 @@ fn releaseAsset() ?[]const u8 {
 /// The cloudflared to run: on PATH, or already fetched, or fetched now from Cloudflare's GitHub release
 /// (TLS via curl, hash recorded in the state and the log). Returns the path, or an error message.
 fn ensureBinary(app: *App, a: std.mem.Allocator, st: *State) union(enum) { path: []const u8, fail: []const u8 } {
-    if (runs(app, &.{ "cloudflared", "--version" })) return .{ .path = "cloudflared" };
+    if (runs(app, &.{ "cloudflared", "--version" }, QUICK_S)) return .{ .path = "cloudflared" };
     var lb: [700]u8 = undefined;
     const local = localBinary(app, &lb) orelse return .{ .fail = "data dir path too long" };
     if (std.Io.Dir.cwd().statFile(app.io, local, .{})) |_| {
@@ -316,19 +321,20 @@ fn ensureBinary(app: *App, a: std.mem.Allocator, st: *State) union(enum) { path:
     const is_tgz = std.mem.endsWith(u8, asset, ".tgz");
     const dest = if (is_tgz) (std.fmt.allocPrint(a, "{s}/cloudflared.tgz", .{dir}) catch return .{ .fail = "oom" }) else local;
     log.info("fetching the Cloudflare Tunnel connector from {s}", .{url});
-    if (!runs(app, &.{ "curl", "-sSL", "--fail", "--connect-timeout", "20", "--retry", "2", "--retry-delay", "2", "-o", dest, url }))
+    // 10 minutes for a ~60 MB binary: a slow line still finishes, and a transfer that stalls gives the start back
+    if (!runs(app, &.{ "curl", "-sSL", "--fail", "--connect-timeout", "20", "--retry", "2", "--retry-delay", "2", "-o", dest, url }, 600))
         return .{ .fail = "could not download cloudflared from Cloudflare's GitHub release (offline? curl missing?) - install it yourself and put it on PATH" };
     if (is_tgz) {
-        if (!runs(app, &.{ "tar", "-xzf", dest, "-C", dir })) return .{ .fail = "could not unpack the cloudflared release archive" };
+        if (!runs(app, &.{ "tar", "-xzf", dest, "-C", dir }, 120)) return .{ .fail = "could not unpack the cloudflared release archive" };
         std.Io.Dir.cwd().deleteFile(app.io, dest) catch {};
     }
-    if (builtin.os.tag != .windows) _ = runs(app, &.{ "chmod", "+x", local });
+    if (builtin.os.tag != .windows) _ = runs(app, &.{ "chmod", "+x", local }, QUICK_S);
     var hx: [64]u8 = undefined;
     if (modelpull.sha256HexOfFile(app.io, local, &hx)) |h| {
         st.binary_sha256 = a.dupe(u8, h) catch "";
         log.info("cloudflared fetched: {s} sha256={s}", .{ local, h });
     }
-    if (!runs(app, &.{ local, "--version" })) return .{ .fail = "the fetched cloudflared does not run on this machine" };
+    if (!runs(app, &.{ local, "--version" }, QUICK_S)) return .{ .fail = "the fetched cloudflared does not run on this machine" };
     return .{ .path = a.dupe(u8, local) catch local };
 }
 
@@ -597,10 +603,10 @@ fn dohSaysPublished(a: std.mem.Allocator, body: []const u8) bool {
 /// Ask Cloudflare's own resolver (DNS over HTTPS) whether `host` is published. Never the machine's resolver.
 fn publishedAtCloudflare(app: *App, a: std.mem.Allocator, host: []const u8) bool {
     const url = std.fmt.allocPrint(a, DOH_URL ++ "?name={s}&type=A", .{host}) catch return false;
-    const r = std.process.run(app.gpa, app.io, .{ .argv = &.{ "curl", "-sS", "--max-time", "10", "-H", "accept: application/dns-json", url }, .stdout_limit = .limited(16 << 10) }) catch return false;
-    defer app.gpa.free(r.stdout);
-    defer app.gpa.free(r.stderr);
-    if (!(r.term == .exited and r.term.exited == 0)) return false;
+    // bounded.run: an answer past 16 KiB can hang std.process.run on Windows (see bounded.zig)
+    var r = bounded.run(app.gpa, app.io, .{ .argv = &.{ "curl", "-sS", "--max-time", "10", "-H", "accept: application/dns-json", url }, .bound_ms = 25_000, .stdout_limit = 16 << 10, .stderr_limit = 4096, .stderr_tail = true });
+    defer r.deinit(app.gpa);
+    if (!r.ok()) return false;
     return dohSaysPublished(a, r.stdout);
 }
 
@@ -742,7 +748,7 @@ fn pidAlive(app: *App, pid: u32) bool {
         defer app.gpa.free(r.stderr);
         return std.mem.indexOf(u8, r.stdout, "cloudflared") != null;
     }
-    return runs(app, &.{ "kill", "-0", ps });
+    return runs(app, &.{ "kill", "-0", ps }, QUICK_S);
 }
 
 /// OFF MEANS OFF, VERIFIED. Zig's Windows kill issues NtTerminateProcess and ignores a refusal; observed live,
@@ -759,9 +765,9 @@ fn killChild(app: *App, uid: u64) ?u32 {
         var b: [24]u8 = undefined;
         const ps = std.fmt.bufPrint(&b, "{d}", .{p}) catch "0";
         if (builtin.os.tag == .windows) {
-            _ = runs(app, &.{ "taskkill", "/PID", ps, "/T", "/F" });
+            _ = runs(app, &.{ "taskkill", "/PID", ps, "/T", "/F" }, QUICK_S);
         } else {
-            _ = runs(app, &.{ "kill", "-TERM", ps });
+            _ = runs(app, &.{ "kill", "-TERM", ps }, QUICK_S);
         }
     }
     var still: ?u32 = null;
@@ -770,7 +776,7 @@ fn killChild(app: *App, uid: u64) ?u32 {
         while (tries < 50 and pidAlive(app, p)) : (tries += 1) {
             if (tries == 20 and builtin.os.tag != .windows) {
                 var b: [24]u8 = undefined;
-                _ = runs(app, &.{ "kill", "-KILL", std.fmt.bufPrint(&b, "{d}", .{p}) catch "0" });
+                _ = runs(app, &.{ "kill", "-KILL", std.fmt.bufPrint(&b, "{d}", .{p}) catch "0" }, QUICK_S);
             }
             bu.sleepMs(100);
         }
@@ -1218,7 +1224,7 @@ test "a hostname change on the same zone retires the old DNS record and Access a
     const io = threaded.io();
     var ta = try http.testApp(gpa, io, "zig-cftun-rename-tmp");
     defer ta.deinit();
-    if (!runs(&ta.app, &.{ "curl", "--version" })) return error.SkipZigTest; // every v4 call rides curl
+    if (!runs(&ta.app, &.{ "curl", "--version" }, QUICK_S)) return error.SkipZigTest; // every v4 call rides curl
 
     const w = fakehttp.wire;
     const routes = [_]fakehttp.Route{
@@ -1270,7 +1276,7 @@ test "a move to another zone retires the old name on the OLD zone, and asking by
     const io = threaded.io();
     var ta = try http.testApp(gpa, io, "zig-cftun-move-tmp");
     defer ta.deinit();
-    if (!runs(&ta.app, &.{ "curl", "--version" })) return error.SkipZigTest;
+    if (!runs(&ta.app, &.{ "curl", "--version" }, QUICK_S)) return error.SkipZigTest;
     const w = fakehttp.wire;
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();

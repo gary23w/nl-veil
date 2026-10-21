@@ -29,6 +29,7 @@
 const std = @import("std");
 const httpc = @import("httpc.zig");
 const builtin_mod = @import("builtin.zig");
+const bounded = @import("bounded.zig");
 
 const log = std.log.scoped(.modelpull);
 
@@ -461,16 +462,13 @@ fn httpGet(gpa: std.mem.Allocator, io: std.Io, url: []const u8, cap: usize) ?[]u
             else => return null,
         }
     }
-    const run = std.process.run(gpa, io, .{
-        .argv = &.{ "curl", "-sS", "-L", "--fail", "--connect-timeout", "20", "--max-time", "60", url },
-        .stdout_limit = .limited(cap),
-    }) catch return null;
-    gpa.free(run.stderr);
-    if (run.term != .exited or run.term.exited != 0) {
-        gpa.free(run.stdout);
-        return null;
-    }
-    return run.stdout;
+    // bounded.run, past curl's own 60 s: a document past `cap` can hang std.process.run on Windows (see bounded.zig)
+    var run = bounded.run(gpa, io, .{ .argv = &.{ "curl", "-sS", "-L", "--fail", "--connect-timeout", "20", "--max-time", "60", url }, .bound_ms = 75_000, .stdout_limit = cap, .stderr_limit = 4096, .stderr_tail = true });
+    defer run.deinit(gpa);
+    if (!run.ok()) return null;
+    const body = run.stdout;
+    run.stdout = &.{};
+    return body;
 }
 
 /// Transfer `url` into `part`. True on a completed transfer (verification still pending).
@@ -925,6 +923,24 @@ test "election: q4_k_m wins over larger alternates; without one the largest gguf
         \\ {"path":"sub/dir.gguf","size":1,"lfs":{"oid":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","size":9}}]
     ;
     try std.testing.expect(electFromTree(gpa, evil) == null);
+}
+
+test "httpGet returns a document within its cap, and one past the cap reads as none instead of hanging the call (real curl)" {
+    const gpa = std.testing.allocator;
+    const environ: std.process.Environ = if (@import("builtin").os.tag == .windows) .{ .block = .global } else .{ .block = .{ .slice = std.mem.span(std.c.environ) } };
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = environ });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-modelpull-httpget-tmp";
+    var url_bufs: [2][1200]u8 = undefined;
+    const urls = try @import("llm.zig").testFileUrls(io, root, &url_bufs); // file://: a curl that needs no server
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    const small = httpGet(gpa, io, urls.small, 4096) orelse return error.SkipZigTest; // no curl on this box
+    defer gpa.free(small);
+    try std.testing.expectEqualStrings("small-body\n", small);
+    // 1 MiB against a 4 KiB cap: std.process.run returned StreamTooLong and then waited for curl to exit, while curl sat
+    // blocked writing the rest to a pipe nobody read (Windows; see bounded.zig)
+    try std.testing.expect(httpGet(gpa, io, urls.big, 4096) == null);
 }
 
 test "install manifest: written on promote, read back as the store's identity, absent reads as none" {

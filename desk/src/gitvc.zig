@@ -28,6 +28,7 @@ const Io = std.Io;
 const log = @import("log.zig");
 const nap = @import("nap.zig");
 const llm = @import("llm.zig");
+const bounded = @import("bounded.zig"); // the twin of src/worker/bounded.zig: git and curl under a bound that holds
 
 /// One git/GitHub operation's result, folded back into the chat like any tool result. `msg` is gpa-owned.
 pub const Res = struct {
@@ -91,7 +92,7 @@ var test_git_environ: ?*const std.process.Environ.Map = null;
 ///   /dev/tty, not on its stdin (the null device). With a terminal attached, git-remote-http held /dev/tty open and sat
 ///   waiting on it until killed: a desk started from a terminal would block its chat thread there until someone typed.
 ///   Now git gives up in milliseconds: "could not read Username for '<url>': terminal prompts disabled". On Windows git
-///   runs without a console (std.process.run's create_no_window), so its prompt already failed at once.
+///   runs without a console (create_no_window, as bounded.run spawns it), so its prompt already failed at once.
 /// - An empty GIT_ASKPASS. Before the terminal, git asks an askpass program: GIT_ASKPASS, else core.askPass, else
 ///   SSH_ASKPASS, whatever GIT_TERMINAL_PROMPT says. On both OSes an askpass named any of those three ways was run and
 ///   its answer went to the remote as credentials. The desk inherits whatever names one where it was started, such as an
@@ -119,22 +120,28 @@ fn git(gpa: std.mem.Allocator, io: Io, workdir: []const u8, args: []const []cons
     av.appendSlice(gpa, args) catch return .{ .ok = false, .out = gpa.dupe(u8, "oom") catch @constCast("oom") };
     var env = gitEnviron(gpa) catch |e| return .{ .ok = false, .out = std.fmt.allocPrint(gpa, "git failed to run ({s})", .{@errorName(e)}) catch @constCast("oom") };
     defer env.deinit();
-    const r = std.process.run(gpa, io, .{
-        .argv = av.items,
-        .environ_map = &env,
-        .stdout_limit = .limited(64 << 10),
-        .stderr_limit = .limited(16 << 10),
-    }) catch |e| return .{ .ok = false, .out = std.fmt.allocPrint(gpa, "git failed to run ({s}) — is git installed and on PATH?", .{@errorName(e)}) catch @constCast("git not found") };
-    defer gpa.free(r.stderr);
-    const ok = r.term == .exited and r.term.exited == 0;
+    var r = bounded.run(gpa, io, .{ .argv = av.items, .environ_map = &env, .bound_ms = GIT_BOUND_MS, .stdout_limit = 64 << 10, .stderr_limit = 16 << 10 });
+    defer r.deinit(gpa);
+    switch (r.end) {
+        .exited, .signal => {},
+        .unstarted, .unread => return .{ .ok = false, .out = std.fmt.allocPrint(gpa, "git failed to run ({s}) — is git installed and on PATH?", .{r.why()}) catch @constCast("git not found") },
+        .killed => return .{ .ok = false, .out = std.fmt.allocPrint(gpa, "git was still running after {d} minutes and was stopped", .{GIT_BOUND_MS / 60_000}) catch @constCast("git stopped") },
+        .overflow => return .{ .ok = false, .out = gpa.dupe(u8, "git printed more than this tool reads (64 KB of output, 16 KB of messages) and was stopped") catch @constCast("git stopped") },
+    }
+    const ok = r.ok();
     // git writes most human output to stderr; hand back whichever is substantial (stdout preferred when both).
     const out = std.mem.trim(u8, r.stdout, " \r\n\t");
     const err = std.mem.trim(u8, r.stderr, " \r\n\t");
     const body = if (out.len > 0) out else err;
     const dup = gpa.dupe(u8, body[0..@min(body.len, 4000)]) catch @constCast("");
-    gpa.free(r.stdout);
     return .{ .ok = ok, .out = dup };
 }
+
+/// The bound on one git run (bounded.run). Only a push touches the network, and the server waits up to 20 minutes for
+/// a delegated tool (CLIENT_HARD_CAP_S in src/worker/chat/engine.zig), so 10 minutes lets a slow push finish while a
+/// git stuck on a dead remote gives the tool back. Under std.process.run nothing bounded it, and output past the
+/// limits (a long log or diff) could hang the call outright on Windows (see bounded.zig).
+const GIT_BOUND_MS: u64 = 600_000;
 
 /// Ensure `workdir` is its OWN git repo (isolated), so neither the git tools NOR the model's `RUN: git` shell
 /// can walk UP to a parent repo and commit into it — with the data dir inside nl-veil's own source tree, a
@@ -451,13 +458,14 @@ pub fn repoCreate(gpa: std.mem.Allocator, io: Io, sidecar_dir: []const u8, pat: 
     const url = std.fmt.allocPrint(gpa, "{s}/user/repos", .{gh.api}) catch return res(gpa, false, "oom", .{});
     defer gpa.free(url);
     // THE TOKEN LEAVES WITH THE CALL. The delete is armed before the write, so a write that fails halfway or a curl that
-    // never launches leaves nothing, and std.process.run returns only once curl is gone.
+    // never launches leaves nothing, and bounded.run returns only once curl is gone (exited, or killed at its bound).
     defer dropTokenFile(io, cfg_path);
     Io.Dir.cwd().writeFile(io, .{ .sub_path = cfg_path, .data = cfg }) catch return res(gpa, false, "could not stage the request", .{});
     const argv = [_][]const u8{ gh.curl, "-sS", "--max-time", std.fmt.comptimePrint("{d}", .{REPO_CREATE_MAX_TIME_S}), "-K", cfg_path, "-X", "POST", url, "-d", payload };
-    const r = std.process.run(gpa, io, .{ .argv = &argv, .stdout_limit = .limited(64 << 10), .stderr_limit = .limited(8 << 10) }) catch return res(gpa, false, "curl failed to run — is curl installed?", .{});
-    defer gpa.free(r.stdout);
-    defer gpa.free(r.stderr);
+    // bounded.run, past curl's own --max-time: a reply past 64 KB can hang std.process.run on Windows (see bounded.zig)
+    var r = bounded.run(gpa, io, .{ .argv = &argv, .bound_ms = (REPO_CREATE_MAX_TIME_S + 15) * 1000, .stdout_limit = 64 << 10, .stderr_limit = 8 << 10 });
+    defer r.deinit(gpa);
+    if (!r.finished()) return res(gpa, false, "curl failed to run — is curl installed?", .{});
     const info = parseRepoCreate(r.stdout);
     if (info.ok) return res(gpa, true, "created {s} — {s}\n(remote will be set on the next git_push)", .{ info.full_name, info.html_url });
     const why = if (info.err.len > 0) info.err else std.mem.trim(u8, r.stderr, " \r\n\t");
@@ -531,7 +539,7 @@ pub fn push(gpa: std.mem.Allocator, io: Io, workdir: []const u8, sidecar_dir: []
     var helper_buf: [HELPER_ARG_CAP]u8 = undefined;
     const helper = credentialHelperArg(&helper_buf, cred_path) orelse return res(gpa, false, "path too long", .{});
     // THE TOKEN LEAVES WITH THE CALL. The delete is armed before the write, so a write that fails halfway or a git that
-    // never launches leaves nothing, and std.process.run returns only once git is gone.
+    // never launches leaves nothing, and bounded.run returns only once git is gone (exited, or killed at its bound).
     defer dropTokenFile(io, cred_path);
     Io.Dir.cwd().writeFile(io, .{ .sub_path = cred_path, .data = cred }) catch return res(gpa, false, "could not stage credentials", .{});
     const g = pushed: {
@@ -841,6 +849,38 @@ fn expectUntouched(gpa: std.mem.Allocator, io: Io, path: []const u8, want: []con
     };
     defer gpa.free(got);
     try std.testing.expectEqualStrings(want, got);
+}
+
+test "git output past what the tool reads stops git and says so, instead of hanging the call (real git)" {
+    const gpa = std.testing.allocator;
+    var threaded = testThreaded(gpa);
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-gitvc-overflow-tmp";
+    Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = try Io.Dir.cwd().createDirPathStatus(io, root, .default_dir);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/empty.txt", .data = "" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/small.txt", .data = "small line\n" });
+    const big = try gpa.alloc(u8, 200 << 10);
+    defer gpa.free(big);
+    for (big, 0..) |*c, i| c.* = if (i % 32 == 31) '\n' else 'x';
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/big.txt", .data = big });
+    // `diff --no-index` needs no repo, and exits 1 when the files differ
+    {
+        const r = git(gpa, io, root, &.{ "diff", "--no-index", "--no-color", "empty.txt", "small.txt" });
+        defer gpa.free(r.out);
+        if (std.mem.startsWith(u8, r.out, "git failed to run")) return error.SkipZigTest; // no git on this box
+        try std.testing.expect(std.mem.indexOf(u8, r.out, "+small line") != null);
+    }
+    {
+        // ~200 KB of diff on stdout and nothing on stderr: std.process.run returned StreamTooLong past 64 KB, then
+        // waited in the reader's deinit for stderr, while git sat blocked writing to a pipe nobody read (Windows)
+        const r = git(gpa, io, root, &.{ "diff", "--no-index", "--no-color", "empty.txt", "big.txt" });
+        defer gpa.free(r.out);
+        try std.testing.expect(!r.ok);
+        try std.testing.expect(std.mem.indexOf(u8, r.out, "git printed more than this tool reads") != null);
+    }
 }
 
 test "a repo_create call's token leaves with it: no curl config outlives a created repo, a rejection, a dead transfer or a curl that never launches" {

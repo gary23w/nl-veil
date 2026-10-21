@@ -3760,12 +3760,15 @@ fn netProbe(w: *Worker, round: u32, url: []const u8) void {
         if (allow.len > 0 and !tools.egressAllowed(allow, url)) return;
     }
     const argv = [_][]const u8{ "curl", "-sS", "-I", "--max-time", "4", "--connect-timeout", "3", url };
-    const r = std.process.run(w.gpa, w.io, .{ .argv = &argv, .stdout_limit = .limited(8 << 10), .stderr_limit = .limited(2 << 10) }) catch |e| {
+    // bounded.run: headers past the limit can hang std.process.run on Windows; 15 s is curl's own 4 s with room to spare
+    var r = bounded.run(w.gpa, w.io, .{ .argv = &argv, .bound_ms = 15_000, .stdout_limit = 8 << 10, .stderr_limit = 2 << 10 });
+    defer r.deinit(w.gpa);
+    if (!r.finished()) {
         // A MISSING curl is NOT a network signal — the box just has no curl. Flipping to "uplink lost" here
         // would strand the swarm on lexical recall forever even on a perfectly connected machine. Surface
         // the remediation ONCE (all remote HTTP runs through curl, so this names the real blocker) and leave
         // w.internet untouched. Only a curl that RAN and failed (non-zero/timeout below) is a real degrade.
-        if (depprobe.isSpawnMissing(e)) {
+        if (r.end == .unstarted and depprobe.isSpawnMissing(r.err.?)) {
             if (!w.curl_missing_warned) {
                 w.curl_missing_warned = true;
                 const h = depprobe.hint(w.gpa, "curl");
@@ -3776,10 +3779,8 @@ fn netProbe(w: *Worker, round: u32, url: []const u8) void {
         }
         if (w.internet) netFlip(w, round, false);
         return;
-    };
-    w.gpa.free(r.stdout);
-    w.gpa.free(r.stderr);
-    const reachable = (r.term == .exited and r.term.exited == 0);
+    }
+    const reachable = r.ok();
     if (reachable != w.internet) netFlip(w, round, reachable);
 }
 
@@ -6583,6 +6584,15 @@ fn assessGap(w: *Worker, goal: []const u8, round: u32, stalled: bool) void {
     }
 }
 
+/// The engine's own python passes over the workdir run under bounded.run. They used to run under std.process.run with
+/// no bound, so a python that hung (an import that blocks, a test's grandchild holding the pipes) or printed past a
+/// limit (which hangs outright on Windows, see bounded.zig) held the round until the hang watchdog (HANG_CHECK_S x
+/// HANG_STALE_CHECKS = 300 s) halted the whole swarm. A static scan of the files (DEPGRAPH_PY, INTERFACES_PY) gets a
+/// minute; a pass that runs the project's tests (SMOKE_PY, BENCH_PY: pytest at up to 60 s, unittest at 30 s a run)
+/// gets the declared checks' 240 s, still under the watchdog.
+const ENGINE_SCAN_MS: u64 = 60_000;
+const ENGINE_TESTS_MS: u64 = 240_000;
+
 /// Recompute the project IMPORT GRAPH each round (cwd = workdir) via DEPGRAPH_PY — structural RAG context so a
 /// change in one file coordinates with its importers (and the orchestrator can plan cross-file work). Best-effort;
 /// "" when there's nothing to analyze (no python, no .py files, a parse error). Caller frees.
@@ -6596,11 +6606,12 @@ fn importGraph(w: *Worker, run_dir: []const u8) []u8 {
     inline for (.{ "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "NL_BROKER_AUTH" }) |k| env.put(k, "") catch {};
     const py = depprobe.pythonBin(w.io, &env);
     const argv = [_][]const u8{ py, "-c", tools.DEPGRAPH_PY };
-    const r = std.process.run(gpa, w.io, .{ .argv = &argv, .cwd = .{ .path = workdir }, .environ_map = &env, .stdout_limit = .limited(32 << 10), .stderr_limit = .limited(4 << 10) }) catch return gpa.dupe(u8, "") catch @constCast("");
-    defer gpa.free(r.stdout);
-    defer gpa.free(r.stderr);
+    // bounded.run (ENGINE_SCAN_MS): a static scan; under std.process.run a python that hung or printed past a limit
+    // held the round for good
+    var r = bounded.run(gpa, w.io, .{ .argv = &argv, .cwd = .{ .path = workdir }, .environ_map = &env, .bound_ms = ENGINE_SCAN_MS, .stdout_limit = 32 << 10, .stderr_limit = 4 << 10 });
+    defer r.deinit(gpa);
     const t = std.mem.trim(u8, r.stdout, " \r\n\t");
-    if (r.term != .exited or r.term.exited != 0 or t.len == 0) return gpa.dupe(u8, "") catch @constCast("");
+    if (!r.ok() or t.len == 0) return gpa.dupe(u8, "") catch @constCast("");
     return gpa.dupe(u8, clip(t, 2500)) catch (gpa.dupe(u8, "") catch @constCast(""));
 }
 
@@ -6685,9 +6696,9 @@ fn smokeTest(w: *Worker, run_dir: []const u8, round: u32) void {
     inline for (.{ "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "NL_BROKER_AUTH" }) |k| env.put(k, "") catch {};
     const py = depprobe.pythonBin(w.io, &env);
     const argv = [_][]const u8{ py, "-c", tools.SMOKE_PY };
-    const r = std.process.run(gpa, w.io, .{ .argv = &argv, .cwd = .{ .path = workdir }, .environ_map = &env, .stdout_limit = .limited(8 << 10), .stderr_limit = .limited(4 << 10) }) catch return;
-    defer gpa.free(r.stdout);
-    defer gpa.free(r.stderr);
+    var r = bounded.run(gpa, w.io, .{ .argv = &argv, .cwd = .{ .path = workdir }, .environ_map = &env, .bound_ms = ENGINE_TESTS_MS, .stdout_limit = 8 << 10, .stderr_limit = 4 << 10 });
+    defer r.deinit(gpa);
+    if (!r.finished()) return; // stopped at its bound or past a limit: no verdict, as std.process.run's error was none
     const line = std.mem.trim(u8, r.stdout, " \r\n\t");
     if (line.len == 0 or line[0] != '{') return;
     const S = struct {
@@ -6754,9 +6765,9 @@ fn interfaceScan(w: *Worker, run_dir: []const u8) void {
     defer env.deinit();
     const py = depprobe.pythonBin(w.io, &env);
     const argv = [_][]const u8{ py, "-c", tools.INTERFACES_PY };
-    const r = std.process.run(gpa, w.io, .{ .argv = &argv, .cwd = .{ .path = workdir }, .environ_map = &env, .stdout_limit = .limited(16 << 10), .stderr_limit = .limited(4 << 10) }) catch return;
-    defer gpa.free(r.stdout);
-    defer gpa.free(r.stderr);
+    var r = bounded.run(gpa, w.io, .{ .argv = &argv, .cwd = .{ .path = workdir }, .environ_map = &env, .bound_ms = ENGINE_SCAN_MS, .stdout_limit = 16 << 10, .stderr_limit = 4 << 10 });
+    defer r.deinit(gpa);
+    if (!r.finished()) return; // stopped at its bound or past a limit: no verdict, as std.process.run's error was none
     const line = std.mem.trim(u8, r.stdout, " \r\n\t");
     if (line.len == 0 or line[0] != '{') return;
     const S = struct {
@@ -7625,9 +7636,9 @@ fn runBenchmark(w: *Worker, run_dir: []const u8, goal: []const u8, round: u32) B
     }
     const py = depprobe.pythonBin(w.io, &env);
     const argv = [_][]const u8{ py, "-c", tools.BENCH_PY };
-    const r = std.process.run(gpa, w.io, .{ .argv = &argv, .cwd = .{ .path = workdir }, .environ_map = &env, .stdout_limit = .limited(64 << 10), .stderr_limit = .limited(8 << 10) }) catch return .{ .status = .err };
-    defer gpa.free(r.stdout);
-    defer gpa.free(r.stderr);
+    var r = bounded.run(gpa, w.io, .{ .argv = &argv, .cwd = .{ .path = workdir }, .environ_map = &env, .bound_ms = ENGINE_TESTS_MS, .stdout_limit = 64 << 10, .stderr_limit = 8 << 10 });
+    defer r.deinit(gpa);
+    if (!r.finished()) return .{ .status = .err };
     var line: []const u8 = "";
     var it = std.mem.splitScalar(u8, r.stdout, '\n');
     while (it.next()) |ln| {

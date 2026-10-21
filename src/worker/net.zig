@@ -29,6 +29,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
 const depprobe = @import("deps.zig"); // aliased like run.zig: tells "curl is missing" apart from "network down"
+const bounded = @import("bounded.zig"); // probe: a curl run whose bound holds on Windows too
 const bu = @import("browser/util.zig"); // sleepMs: a raw-thread sleep, no Io park
 
 /// Where to knock. Two anycast resolvers — IP literals, so a dead DNS resolver cannot masquerade as a dead
@@ -114,15 +115,17 @@ pub fn probe(io: Io, gpa: std.mem.Allocator, environ: ?*const std.process.Enviro
     const urls: []const []const u8 = if (override.len > 0) &.{override} else &PROBE_URLS;
     for (urls) |u| {
         const argv = [_][]const u8{ "curl", "-sS", "-I", "--max-time", PROBE_TIMEOUT_ARG, "--connect-timeout", PROBE_TIMEOUT_ARG, u };
-        const r = std.process.run(gpa, io, .{ .argv = &argv, .stdout_limit = .limited(8 << 10), .stderr_limit = .limited(2 << 10) }) catch |e| {
+        // bounded.run: headers past the limit can hang std.process.run on Windows (see bounded.zig)
+        var r = bounded.run(gpa, io, .{ .argv = &argv, .bound_ms = PROBE_TIMEOUT_S * 1000 + 10_000, .stdout_limit = 8 << 10, .stderr_limit = 2 << 10 });
+        defer r.deinit(gpa);
+        if (r.end == .unstarted) {
             // A MISSING curl is not a network signal (run.zig's probe makes the same distinction). Treat the
             // whole probe as unusable rather than let a toolchain gap masquerade as an outage and refuse work.
-            if (depprobe.isSpawnMissing(e)) probe_unusable = true;
+            if (depprobe.isSpawnMissing(r.err.?)) probe_unusable = true;
             continue;
-        };
-        gpa.free(r.stdout);
-        gpa.free(r.stderr);
-        if (r.term == .exited and r.term.exited == 0) {
+        }
+        if (!r.finished()) continue; // stopped at its bound, past a limit or unread: as its error was, no evidence
+        if (r.ok()) {
             any_reachable = true;
             break; // one good host is proof; don't pay for the second
         }
@@ -131,7 +134,7 @@ pub fn probe(io: Io, gpa: std.mem.Allocator, environ: ?*const std.process.Enviro
         // nothing about the uplink, and reading it as an outage is the fail-CLOSED direction this module
         // must never take. That is not hypothetical: with an environ-less Io the child dies in ~20ms and the
         // first cut of this file reported a perfectly online machine as offline.
-        const code: u8 = if (r.term == .exited) r.term.exited else 0;
+        const code: u32 = r.exited() orelse 0;
         const network_evidence = switch (code) {
             6, // couldn't resolve host
             7, // couldn't connect

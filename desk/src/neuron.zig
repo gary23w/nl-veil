@@ -6,6 +6,7 @@
 const std = @import("std");
 const Io = std.Io;
 const log = @import("log.zig");
+const bounded = @import("bounded.zig");
 
 pub const Db = struct {
     gpa: std.mem.Allocator,
@@ -20,13 +21,15 @@ pub const Db = struct {
         defer argv.deinit(self.gpa);
         argv.appendSlice(self.gpa, &.{ self.bin, "--db", self.db }) catch return null;
         argv.appendSlice(self.gpa, args) catch return null;
-        const r = std.process.run(self.gpa, self.io, .{ .argv = argv.items, .stdout_limit = .limited(256 << 10) }) catch return null;
-        self.gpa.free(r.stderr);
-        if (r.term != .exited) {
-            self.gpa.free(r.stdout);
-            return null;
-        }
-        return r.stdout; // caller frees
+        // bounded.run: neuron-db is a local sqlite store that answers in milliseconds to seconds, so the 2 minutes only
+        // ever cut a wedged one, which held the chat thread forever under std.process.run; and an answer past 256 KB
+        // could hang it outright on Windows (see bounded.zig). Both still read null.
+        var r = bounded.run(self.gpa, self.io, .{ .argv = argv.items, .bound_ms = 120_000, .stdout_limit = 256 << 10, .stderr_limit = 16 << 10, .stderr_tail = true });
+        defer r.deinit(self.gpa);
+        if (r.end != .exited) return null;
+        const out = r.stdout;
+        r.stdout = &.{};
+        return out; // caller frees
     }
 
     pub fn enabled(self: Db) bool {
