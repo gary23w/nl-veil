@@ -1,5 +1,9 @@
 # Desktop updates and release connectivity
 
+## v1.1.26
+
+If you use the web app, sign in once more after updating: sessions stored by earlier versions are signed out on the first start. The desktop app and the `veil` command line are not affected. A machine without Python can now have the agent install it and pick it up with no restart; what the agent changes is kept in `tool-env.json` beside your data. Chat recall now uses the breadth it asks neuron-db for; set `NL_MEM_K=10` and `NL_MEM_HOPS=0` before starting the server to keep the breadth earlier versions ran at. [Release details](release/RELEASE-v1.1.26.md).
+
 ## v1.1.25
 
 Nothing to do after updating. A swarm lineage's proposals awaiting review now appear under that lineage in **Swarm → Lineages** instead of the chat's Memory tab, each with its full text. [Release details](release/RELEASE-v1.1.25.md).
