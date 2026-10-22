@@ -23,6 +23,8 @@ const recipes = @import("../recipes.zig");
 const osc = @import("../oscillation.zig");
 const sup_mod = @import("../control/supervisor.zig"); // readTail (bounded event-log reads for swarm_status)
 const cpaths = @import("paths.zig"); // conv → build-tree mapping (scheduled runs live under _sched/{task}/runs/)
+const garrett = @import("../garrett.zig");
+const cf_garrett = @import("../../config/cf_garrett.zig");
 const plugins = @import("../../plug/plugins.zig"); // plugin registry: policy gate + plug_* tool dispatch on the direct tool surface
 
 const App = http.App;
@@ -55,11 +57,11 @@ const ToolReq = struct {
 // confined by tools.safeRel to the per-conversation workdir; the rest write only into the chat's own run_dir /
 // memory DB, or degrade gracefully with no swarm context (probe → "no spatial grid", send_message → a note).
 const SAFE_TOOLS = [_][]const u8{
-    "web_search",   "web_fetch",   "fetch_json",    "read_url",  "deep_crawl",
-    "recall_hive",  "recall",      "read_doc",      "observe",   "share",
-    "note_stance",  "save_skill",  "journal",       "set_directive", "add_task",
-    "complete_task", "send_message", "probe",       "write_file", "edit_file",
-    "read_file",    "list_dir",    "delete_file",
+    "web_search",    "web_fetch",    "fetch_json",  "read_url",      "deep_crawl",
+    "recall_hive",   "recall",       "read_doc",    "observe",       "share",
+    "note_stance",   "save_skill",   "journal",     "set_directive", "add_task",
+    "complete_task", "send_message", "probe",       "write_file",    "edit_file",
+    "read_file",     "list_dir",     "delete_file",
 };
 
 // ADMIN_TOOLS are the powerful ones — arbitrary code exec, HOST control, engine self-modification, tool
@@ -67,13 +69,12 @@ const SAFE_TOOLS = [_][]const u8{
 // has none and serves "any external client", so gate them to ADMINS. The desktop is admin on localhost, so it
 // gets the FULL hive-mind surface; a hosted non-admin tenant gets the safe subset.
 const ADMIN_TOOLS = [_][]const u8{
-    "run_python",      "run_shell",        "tool_env",     "run_tests",     "patch_system",
-    "make_tool",       "propose_change",
-    "simulate_change", "stage_delivery",   "osint_scan",   "host_status",   "host_command",
-    "host_explore",    "browser_navigate", "browser_read", "browser_click", "browser_type",
-    "browser_eval",    "browser_close",    "pixel_ingest", "pixel_capture", "pixel_search",
-    "mcp_discover",    "mcp_call",         "browser_console", "browser_network",
-    "browser_click_at", "browser_type_text", "browser_key", "browser_scroll",
+    "run_python",      "run_shell",        "tool_env",          "run_tests",        "patch_system",
+    "make_tool",       "propose_change",   "simulate_change",   "stage_delivery",   "osint_scan",
+    "host_status",     "host_command",     "host_explore",      "browser_navigate", "browser_read",
+    "browser_click",   "browser_type",     "browser_eval",      "browser_close",    "pixel_ingest",
+    "pixel_capture",   "pixel_search",     "mcp_discover",      "mcp_call",         "browser_console",
+    "browser_network", "browser_click_at", "browser_type_text", "browser_key",      "browser_scroll",
 };
 
 /// Runnable by any authed user on this endpoint. Delegates to the ENGINE'S sandbox predicate so the two
@@ -142,6 +143,25 @@ pub fn chatTool(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const body = (req.json(ToolReq) catch return badReq(res, "malformed JSON body")) orelse return badReq(res, "bad body");
     const tool = std.mem.trim(u8, body.tool, " \r\n\t");
     if (tool.len == 0) return badReq(res, "missing tool");
+
+    // Garrett executes in the caller's own remote workspace. Resolve only that
+    // authenticated user's sealed connection; never grant local execution caps.
+    if (garrett.isTool(tool)) {
+        const pair = cf_garrett.credsFor(app, u.id, app.gpa);
+        defer if (pair) |c| {
+            app.gpa.free(c.mcp_url);
+            std.crypto.secureZero(u8, @constCast(c.token));
+            app.gpa.free(c.token);
+        };
+        const denial = if (plugins.current(&app.plugs)) |preg|
+            preg.policyGate(app.gpa, u.id, app.auth.isAdmin(u), safeSeg(body.dir), tool, body.args)
+        else
+            null;
+        const result = denial orelse garrett.run(.{ .gpa = app.gpa, .io = app.io, .scratch = app.data, .url = if (pair) |c| c.mcp_url else "", .token = if (pair) |c| c.token else "" }, tool, body.args);
+        scrubUtf8(result);
+        defer if (result.len > 0) app.gpa.free(result);
+        return res.json(.{ .ok = true, .tool = tool, .result = result }, .{});
+    }
 
     // --- orchestration tools (wrap the supervisor + run dir) -------------------------------
     if (std.mem.eql(u8, tool, "list_swarms")) return listSwarms(app, u.id, res);
@@ -751,4 +771,30 @@ test "the tool endpoint refuses a stranger before it looks at the tool name" {
     web.json(.{ .tool = "host_command", .args = "{\"cmd\":\"whoami\"}" });
     try chatTool(&ta.app, web.req, web.res);
     try web.expectStatus(401);
+}
+
+test "Garrett direct tools use only the authenticated owner's connection without local admin privileges" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var ta = try http.testApp(gpa, io, "zig-chattool-garrett-owner-tmp");
+    defer ta.deinit();
+    ta.auth.register("boss@example.test", "correct horse battery") catch return error.SkipZigTest;
+    ta.auth.register("tenant@example.test", "correct horse battery") catch return error.SkipZigTest;
+    try cf_garrett.saveManaged(&ta.app, 1, "gtt_" ++ "a" ** 64, 175);
+    const tok = ta.auth.login("tenant@example.test", "correct horse battery") catch return error.SkipZigTest;
+    defer gpa.free(tok);
+    const cookie = try std.fmt.allocPrint(gpa, http.COOKIE ++ "={s}", .{tok});
+    defer gpa.free(cookie);
+    for ([_][]const u8{ "garrett_tools", "security_cidr" }) |tool| {
+        var web = httpz.testing.init(.{});
+        defer web.deinit();
+        web.header("cookie", cookie);
+        web.json(.{ .tool = tool, .args = "{\"cidr\":\"10.0.0.0/24\"}" });
+        try chatTool(&ta.app, web.req, web.res);
+        try web.expectStatus(200);
+        const body = try web.getBody();
+        try std.testing.expect(std.mem.indexOf(u8, body, "not connected") != null);
+    }
 }
