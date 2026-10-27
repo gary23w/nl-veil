@@ -1,5 +1,9 @@
 # Desktop updates and release connectivity
 
+## v1.1.27
+
+Nothing to do after updating. A veil started while another one is running, for example one still in the tray, now gets a working server on the next free port instead of an empty window. If a veil cannot start, it shows the reason and saves it as `startup-error.txt` in its data folder. [Release details](release/RELEASE-v1.1.27.md).
+
 ## v1.1.26
 
 If you use the web app, sign in once more after updating: sessions stored by earlier versions are signed out on the first start. The desktop app and the `veil` command line are not affected. A machine without Python can now have the agent install it and pick it up with no restart; what the agent changes is kept in `tool-env.json` beside your data. Chat recall now uses the breadth it asks neuron-db for; set `NL_MEM_K=10` and `NL_MEM_HOPS=0` before starting the server to keep the breadth earlier versions ran at. [Release details](release/RELEASE-v1.1.26.md).
