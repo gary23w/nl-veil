@@ -497,6 +497,12 @@ pub fn main(init: std.process.Init) !void {
         return std.process.exit(cli.dispatch(&cctx, cli_sub, cli_args.items));
     }
 
+    // NEVER FAIL SILENTLY IN APP MODE. Past the CLI verbs, an error returned from main — an account store the
+    // stricter loader refuses (auth.warm, fatal since v1.1.26), a folder it cannot create — ended a double-clicked
+    // veil with nothing on screen: it relaunches itself without a console, and the window was not up yet. Say it
+    // once, where the user will see it, and leave the reason in the data folder for whoever is asked to help.
+    errdefer |e| if (desktop_mode and HAS_GUI) startupFailed(io, paths.data, e);
+
     // Store activation has no useful writable CWD. Keep relative runtime files in LocalState;
     // CLI commands and worker subprocesses retain the working directory their caller supplied.
     if (HAS_GUI) {
@@ -626,7 +632,12 @@ pub fn main(init: std.process.Init) !void {
     } else |err| {
         // Production usage limits now depend on this loop, so a failed launch
         // must stop startup instead of serving unmetered worker requests.
-        if (production) return err;
+        // Returned as an error UNION: a bare error value is refused here by Zig 0.16 ("expected error union type")
+        // while main's errdefer captures its error (the startup-failure notice). Same return, same error.
+        if (production) {
+            const failed: anyerror!void = err;
+            return failed;
+        }
         log.warn("swarm maintenance thread unavailable ({t})", .{err});
     }
     var audit = AuditLog.init(gpa, io, paths.data);
@@ -695,7 +706,9 @@ pub fn main(init: std.process.Init) !void {
         llamaeng.configure(gpa, io, init.environ_map, builtin_state.modelPath());
         modelpull.on_store_change = builtinStoreChanged;
         modelpull.on_before_swap = builtinBeforeSwap;
-        if (builtin_endpoint.start(gpa, io, llamaeng.engine(), init.environ_map)) |bport| {
+        // serve_port: the app's own port, picked above and bound only later by the listen thread — the endpoint's
+        // scan must leave it alone (builtin_endpoint.scanPort says what taking it did).
+        if (builtin_endpoint.start(gpa, io, llamaeng.engine(), init.environ_map, serve_port)) |bport| {
             const winf = llamaeng.info();
             log.info("built-in model engine: {s} on 127.0.0.1:{d}{s} (weights: {s})", .{ builtin_state.MODEL_ID, bport, builtin_state.PATH_PREFIX, @tagName(winf.state) });
         } else |e| {
@@ -1051,6 +1064,48 @@ pub fn main(init: std.process.Init) !void {
     threadSleepMs(io, 150);
     if (claim == .serve) claim.serve.release(io); // exit() runs no defer: let the data dir go by hand
     std.process.exit(0);
+}
+
+/// App mode's last word when startup returns an error before its window is up (the errdefer in main): the reason
+/// on screen in a message box (Windows), in the log, and in {data}/startup-error.txt.
+fn startupFailed(io: std.Io, data_dir: []const u8, err: anyerror) void {
+    var tb: [1400]u8 = undefined;
+    const text = startupFailureText(&tb, @errorName(err), data_dir);
+    log.err("{s}", .{text});
+    var pb: [700]u8 = undefined;
+    if (std.fmt.bufPrint(&pb, "{s}/startup-error.txt", .{data_dir})) |p| {
+        std.Io.Dir.cwd().writeFile(io, .{ .sub_path = p, .data = text }) catch {};
+    } else |_| {}
+    if (builtin.os.tag == .windows) {
+        var zb: [1404]u8 = undefined;
+        const z = std.fmt.bufPrintZ(&zb, "{s}", .{text}) catch "The veil could not start.";
+        _ = winapp.MessageBoxA(null, z, "the veil", 0x0000_0010 | 0x0001_0000); // MB_ICONERROR | MB_SETFOREGROUND
+    }
+}
+
+fn startupFailureText(buf: []u8, err_name: []const u8, data_dir: []const u8) []const u8 {
+    // NeuronCommandFailed at startup = the memory engine ran but did not finish its read of the account store: it
+    // could not run here, or the store is unreadable. bin/neuron.exe imports VCRUNTIME140.dll (read off its import
+    // table), the one dependency a Windows machine can lack; since v1.1.26 a failed neuron run is an error.
+    const hint: []const u8 = if (std.mem.eql(u8, err_name, "NeuronCommandFailed"))
+        "\n\nThe memory engine (bin/neuron beside the veil) did not run, or could not read the account store in the data folder. On Windows it needs the Microsoft Visual C++ runtime (VCRUNTIME140.dll): if Windows also said that file is missing, installing the Microsoft Visual C++ Redistributable (x64) fixes it."
+    else
+        "";
+    return std.fmt.bufPrint(buf, "The veil could not start: {s}.{s}\n\nThe same reason is saved in {s}/startup-error.txt, for whoever helps you with it.", .{ err_name, hint, data_dir }) catch "The veil could not start.";
+}
+
+test "a startup failure names its reason and where it was saved" {
+    var buf: [1400]u8 = undefined;
+    const t = startupFailureText(&buf, "InvalidUserIndex", "C:/Users/someone/veil/data");
+    try std.testing.expect(std.mem.indexOf(u8, t, "InvalidUserIndex") != null);
+    try std.testing.expect(std.mem.indexOf(u8, t, "C:/Users/someone/veil/data/startup-error.txt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, t, "VCRUNTIME140") == null); // the runtime hint is for the engine only
+    const n = startupFailureText(&buf, "NeuronCommandFailed", "C:/Users/someone/veil/data");
+    try std.testing.expect(std.mem.indexOf(u8, n, "VCRUNTIME140.dll") != null);
+    try std.testing.expect(std.mem.indexOf(u8, n, "startup-error.txt") != null);
+    // a buffer too small for it still yields a sentence, never garbage or a panic
+    var tiny: [8]u8 = undefined;
+    try std.testing.expectEqualStrings("The veil could not start.", startupFailureText(&tiny, "InvalidUserIndex", "C:/x"));
 }
 
 /// The desktop could not open a window (no OpenGL 3.3: a VM, an RDP session, a missing or stale graphics

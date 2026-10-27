@@ -48,8 +48,9 @@ var g_server: ?*httpz.Server(*EndpointApp) = null;
 
 /// Bind the endpoint on 127.0.0.1 and serve it from a detached thread. Returns the bound port
 /// (also published via builtin.setPort). NL_BUILTIN_PORT pins it; default scans a small range so
-/// two veil instances on one box each get their own engine.
-pub fn start(gpa: std.mem.Allocator, io: std.Io, eng: builtin_mod.Engine, environ: *const std.process.Environ.Map) !u16 {
+/// two veil instances on one box each get their own engine. `app_port` is the port this process's own
+/// server will listen on, which the scan never takes (see scanPort); null when there is none to keep clear.
+pub fn start(gpa: std.mem.Allocator, io: std.Io, eng: builtin_mod.Engine, environ: *const std.process.Environ.Map, app_port: ?u16) !u16 {
     const pinned: ?u16 = if (environ.get("NL_BUILTIN_PORT")) |v|
         (std.fmt.parseInt(u16, std.mem.trim(u8, v, " \r\n\t"), 10) catch null)
     else
@@ -59,17 +60,67 @@ pub fn start(gpa: std.mem.Allocator, io: std.Io, eng: builtin_mod.Engine, enviro
     errdefer gpa.destroy(app);
     app.* = .{ .gpa = gpa, .io = io, .eng = eng };
 
-    var port: u16 = pinned orelse 8788;
-    const last: u16 = if (pinned) |p| p else 8797;
-    while (true) : (port += 1) {
-        if (tryStart(gpa, io, app, port)) {
-            g_app = app;
-            builtin_mod.setPort(port);
-            log.info("built-in engine endpoint on 127.0.0.1:{d}{s}", .{ port, builtin_mod.PATH_PREFIX });
-            return port;
+    const Try = struct {
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        app: *EndpointApp,
+        fn call(t: @This(), port: u16) bool {
+            return tryStart(t.gpa, t.io, t.app, port);
         }
-        if (port >= last) return error.NoFreePort;
+    };
+    // A pinned port is the operator's word, taken as given even if it is the app's own.
+    const port = scanPort(pinned orelse 8788, if (pinned) |p| p else 8797, if (pinned == null) app_port else null, Try{ .gpa = gpa, .io = io, .app = app }) orelse
+        return error.NoFreePort;
+    g_app = app;
+    builtin_mod.setPort(port);
+    log.info("built-in engine endpoint on 127.0.0.1:{d}{s}", .{ port, builtin_mod.PATH_PREFIX });
+    return port;
+}
+
+/// The first port of `first`..`last` that `try_port.call` takes, never `skip`.
+///
+/// `skip` is the app's own port. main picks it (pickAppPort) BEFORE this endpoint starts, but the server only
+/// binds it later, on its listen thread, so to the held-port ask in tryStart it still looks free. Measured
+/// 2026-10-23 with the v1.1.26 bundle started beside a running veil that held 8787 and 8788: the app moved to
+/// 8789, this scan then found 8788 held and took 8789, and the app's own listen failed with AddressInUse — the
+/// desktop window opened onto no backend at all, a dead GUI, behind a "could not start on port 8789" box.
+fn scanPort(first: u16, last: u16, skip: ?u16, try_port: anytype) ?u16 {
+    var port = first;
+    while (true) : (port += 1) {
+        if (skip == null or port != skip.?) {
+            if (try_port.call(port)) return port;
+        }
+        if (port >= last) return null;
     }
+}
+
+test "the endpoint's port scan never takes the app's own port, even when it is the first free one" {
+    const Fake = struct {
+        held: []const u16,
+        tried: *std.ArrayListUnmanaged(u16),
+        gpa: std.mem.Allocator,
+        fn call(f: @This(), port: u16) bool {
+            f.tried.append(f.gpa, port) catch {};
+            for (f.held) |h| if (h == port) return false;
+            return true;
+        }
+    };
+    const gpa = std.testing.allocator;
+    var tried: std.ArrayListUnmanaged(u16) = .empty;
+    defer tried.deinit(gpa);
+    // the measured case: another veil holds 8787 + 8788, this app moved to 8789
+    try std.testing.expectEqual(@as(?u16, 8790), scanPort(8788, 8797, 8789, Fake{ .held = &.{8788}, .tried = &tried, .gpa = gpa }));
+    try std.testing.expectEqualSlices(u16, &.{ 8788, 8790 }, tried.items); // 8789 was never even tried
+    // the usual start: the app on 8787, so the endpoint keeps its own 8788
+    tried.clearRetainingCapacity();
+    try std.testing.expectEqual(@as(?u16, 8788), scanPort(8788, 8797, 8787, Fake{ .held = &.{}, .tried = &tried, .gpa = gpa }));
+    // a range that holds nothing but the app's port: no port, never the app's
+    tried.clearRetainingCapacity();
+    try std.testing.expectEqual(@as(?u16, null), scanPort(8789, 8789, 8789, Fake{ .held = &.{}, .tried = &tried, .gpa = gpa }));
+    try std.testing.expectEqual(@as(usize, 0), tried.items.len);
+    // nothing to skip: the first free port, as before
+    tried.clearRetainingCapacity();
+    try std.testing.expectEqual(@as(?u16, 8789), scanPort(8788, 8797, null, Fake{ .held = &.{8788}, .tried = &tried, .gpa = gpa }));
 }
 
 fn tryStart(gpa: std.mem.Allocator, io: std.Io, app: *EndpointApp, port: u16) bool {
@@ -1142,7 +1193,7 @@ test "a pinned port another socket already holds is refused before anything bind
         defer env.deinit();
         var pbuf: [8]u8 = undefined;
         try env.put("NL_BUILTIN_PORT", std.fmt.bufPrint(&pbuf, "{d}", .{h.socket.address.getPort()}) catch unreachable);
-        if (start(gpa, io, mock.engine(), &env)) |_| {} else |e| refused += @intFromBool(e == error.NoFreePort);
+        if (start(gpa, io, mock.engine(), &env, null)) |_| {} else |e| refused += @intFromBool(e == error.NoFreePort);
     }
     try std.testing.expectEqual(N, refused);
     try std.testing.expect(g_server == server_before); // no httpz server was built for a held port
