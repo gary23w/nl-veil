@@ -1,5 +1,9 @@
 # Desktop updates and release connectivity
 
+## v1.1.28
+
+If v1.1.26 or v1.1.27 never opened on your computer, download the regular bundle for your platform and extract it; the in-app updater of a version that does not start cannot fetch it for you. That bundle runs on any 64-bit processor of its platform. Windows and Linux also have an `-avx2` bundle for processors with AVX2, which keeps updating from the `-avx2` downloads. [Release details](release/RELEASE-v1.1.28.md).
+
 ## v1.1.27
 
 Nothing to do after updating. A veil started while another one is running, for example one still in the tray, now gets a working server on the next free port instead of an empty window. If a veil cannot start, it shows the reason and saves it as `startup-error.txt` in its data folder. [Release details](release/RELEASE-v1.1.27.md).
