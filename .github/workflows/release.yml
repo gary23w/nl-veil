@@ -169,6 +169,21 @@ jobs:
           done
           python scripts/check-cpu-level.py --level "${{ matrix.variant || 'baseline' }}" "$@"
 
+      # Before anything is attached: no Mac binary asks for a newer macOS than 13.0, the floor build.zig sets.
+      # A native Mac build otherwise records the runner's own macOS (the v1.1.28 apps asked for 15.8.2 and
+      # 15.7.9). The Mac runners check their whole bundle; the Linux runner checks the Mac servers it cross-built.
+      - name: Check the macOS minimum
+        if: startsWith(matrix.name, 'macos-') || matrix.xc == 'yes'
+        shell: bash
+        run: |
+          VERSION=$(sed -n 's/^const VERSION = "\(.*\)";$/\1/p' src/main.zig | head -1)
+          set --
+          [ "$RUNNER_OS" = macOS ] && set -- "bin/veil-v$VERSION-${{ matrix.name }}"
+          for f in bin/server-only/veil-server-v"$VERSION"-macos-*; do
+            [ -f "$f" ] && set -- "$@" "$f"
+          done
+          python scripts/check-macos-min.py --max 13.0 "$@"
+
       - name: Exercise packaged app and Cloudflare transports
         shell: bash
         env:

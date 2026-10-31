@@ -21,7 +21,12 @@ pub fn build(b: *std.Build) void {
     // and v1.1.27 came off AVX-512 runners and crashed before opening a window on every machine without
     // AVX-512. Baseline runs on any 64-bit CPU of the arch (Apple silicon resolves to M1). A build for one
     // newer CPU says so: -Dcpu=x86_64_v3 is the AVX2 bundle, -Dcpu=native a local build for this machine.
-    const target = b.standardTargetOptions(.{ .default_target = .{ .cpu_model = .baseline } });
+    // The macOS version leaks the same way: a native build records the build machine's macOS as the oldest
+    // it runs on (minos in LC_BUILD_VERSION), so the v1.1.28 Mac apps asked for 15.8.2 and 15.7.9. Built on
+    // a Mac, the default target asks for macOS 13.0 instead: Zig 0.16's own default floor, the minimum the
+    // Mac servers cross-compiled on Linux already carry. Zig still links against the build machine's SDK.
+    const mac_floor: ?std.Target.Query.OsVersion = if (builtin.os.tag == .macos) .{ .semver = .{ .major = 13, .minor = 0, .patch = 0 } } else null;
+    const target = b.standardTargetOptions(.{ .default_target = .{ .cpu_model = .baseline, .os_version_min = mac_floor } });
     // ReleaseFast by DEFAULT — and this time the code actually does it. `standardOptimizeOption` with a
     // preferred mode only applies that preference when `--release` is passed with NO value, so a bare
     // `zig build` shipped a DEBUG binary while this comment claimed otherwise, `--release=small` was a
