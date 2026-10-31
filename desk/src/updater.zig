@@ -104,15 +104,19 @@ fn stable(tag: []const u8) !std.SemanticVersion {
     return v;
 }
 
+// An AVX2 build (the -avx2 bundles, -Dcpu=x86_64_v3) updates from the AVX2 assets so it stays one;
+// every other build takes the baseline assets, which run on any CPU of the platform.
+const avx2 = builtin.cpu.arch == .x86_64 and std.Target.x86.featureSetHas(builtin.cpu.features, .avx2);
+
 fn platform() ![]const u8 {
     return switch (builtin.os.tag) {
-        .windows => if (builtin.cpu.arch == .x86_64) "windows-x86_64" else error.UnsupportedPlatform,
+        .windows => if (builtin.cpu.arch == .x86_64) (if (avx2) "windows-x86_64-avx2" else "windows-x86_64") else error.UnsupportedPlatform,
         .macos => switch (builtin.cpu.arch) {
             .aarch64 => "macos-arm64",
             .x86_64 => "macos-x86_64",
             else => error.UnsupportedPlatform,
         },
-        .linux => if (builtin.cpu.arch == .x86_64) "linux-x86_64" else error.UnsupportedPlatform,
+        .linux => if (builtin.cpu.arch == .x86_64) (if (avx2) "linux-x86_64-avx2" else "linux-x86_64") else error.UnsupportedPlatform,
         else => error.UnsupportedPlatform,
     };
 }

@@ -59,6 +59,10 @@ jobs:
       # Local equivalents: `sh scripts/check.sh --full`, or on Windows `.\scripts\check.ps1 -Full`.
       - name: acceptance gates (scripts/check.sh --full)
         run: sh scripts/check.sh --full
+      # The default build --full just made, the one every bundle ships, must run on any x86-64 CPU. v1.1.26
+      # and v1.1.27 were compiled for the runner's own AVX-512 CPU and crashed on every machine without it.
+      - name: CPU level of the default build
+        run: python3 scripts/check-cpu-level.py --level baseline "${TMPDIR:-/tmp}/nlveil-check-out/bin/veil"
 
   # full bundles: only on a tag or a manual dispatch
   bundle:
@@ -80,6 +84,11 @@ jobs:
           # and attached, this job was silently cancelled, and each release page shipped three bundles while
           # its download table promised four. macos-15-intel is the current free-tier Intel label.
           - { os: macos-15-intel,  name: macos-x86_64,   xc: 'no'  }
+          # The bundles above are built for the baseline CPU and run on any 64-bit CPU of their platform.
+          # These two are the newer-CPU builds: x86-64-v3 (AVX2, FMA, BMI2), so the built-in model's CPU
+          # kernels use AVX2. Their updater stays on the -avx2 assets.
+          - { os: windows-latest,  name: windows-x86_64-avx2, xc: 'no', variant: avx2 }
+          - { os: ubuntu-latest,   name: linux-x86_64-avx2,   xc: 'no', variant: avx2 }
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout nl-veil
@@ -124,6 +133,7 @@ jobs:
         shell: bash
         env:
           NO_BOOTSTRAP: '1'
+          CPU_VARIANT: ${{ matrix.variant }}
         run: |
           EXT=""
           [ "$RUNNER_OS" = "Windows" ] && EXT=".exe"
@@ -140,6 +150,22 @@ jobs:
       - name: Install Python for release verification
         uses: actions/setup-python@v5
         with: { python-version: '3.12' }
+
+      # Before anything is attached: the app binary, and the Linux and Windows standalone servers when this
+      # runner built them, use nothing beyond their CPU level. The runner's GNU objdump cannot read the
+      # macOS server; the macOS Intel bundle is checked on its own runner. Apple silicon has no such split.
+      - name: Check the CPU instruction level
+        if: matrix.name != 'macos-arm64'
+        shell: bash
+        run: |
+          VERSION=$(sed -n 's/^const VERSION = "\(.*\)";$/\1/p' src/main.zig | head -1)
+          EXT=""
+          [ "$RUNNER_OS" = "Windows" ] && EXT=".exe"
+          set -- "bin/veil-v$VERSION-${{ matrix.name }}/veil$EXT"
+          for f in bin/server-only/veil-server-v"$VERSION"-linux-x86_64 bin/server-only/veil-server-v"$VERSION"-windows-x86_64.exe; do
+            [ -f "$f" ] && set -- "$@" "$f"
+          done
+          python scripts/check-cpu-level.py --level "${{ matrix.variant || 'baseline' }}" "$@"
 
       - name: Exercise packaged app and Cloudflare transports
         shell: bash
@@ -183,7 +209,7 @@ jobs:
           echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Pin the manual release tag to this source commit
-        if: github.event_name == 'workflow_dispatch' && matrix.os == 'ubuntu-latest'
+        if: github.event_name == 'workflow_dispatch' && matrix.name == 'linux-x86_64'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -205,7 +231,7 @@ jobs:
           tag_name: ${{ steps.release.outputs.tag }}
           target_commitish: ${{ github.sha }}
           # Bump this to the current release's notes on every tag (one notes file per release under docs/release/).
-          body_path: docs/release/RELEASE-v1.1.27.md
+          body_path: docs/release/RELEASE-v1.1.28.md
           draft: true
           # A tag with a hyphen in it (v1.0.1-beta-7, v2.0.0-rc.1) is a prerelease; a bare version
           # (v1.1.0) is not. This was hardcoded `true` through every alpha and beta, which was correct
@@ -238,7 +264,7 @@ jobs:
             RELEASE_TAG="v$VERSION"
           fi
           gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name' > assets.txt
-          for PLATFORM in windows-x86_64 linux-x86_64 macos-arm64 macos-x86_64; do
+          for PLATFORM in windows-x86_64 linux-x86_64 macos-arm64 macos-x86_64 windows-x86_64-avx2 linux-x86_64-avx2; do
             grep -Fx "veil-$RELEASE_TAG-$PLATFORM.zip" assets.txt
             grep -Fx "veil-update-$RELEASE_TAG-$PLATFORM-app" assets.txt
             grep -Fx "veil-update-$RELEASE_TAG-$PLATFORM-neuron" assets.txt

@@ -30,6 +30,7 @@
 #   sh scripts/build-official.sh --host-only  skip the cross-compiled servers
 #
 # Env: ZIG=<zig>  NEURON=<prebuilt neuron>  VERSION=<override>  NO_BOOTSTRAP=1
+#      CPU_VARIANT=avx2  the newer-CPU bundle instead (x86-64 only; host bundle only, no server targets)
 # ============================================================================
 set -eu
 
@@ -54,6 +55,17 @@ case "$(uname -m)" in
 esac
 EXE=""
 [ "$OS" = windows ] && EXE=".exe"
+
+# The default bundle is built for the BASELINE CPU (build.zig's default) and runs on every 64-bit CPU of
+# its platform. CPU_VARIANT=avx2 builds the newer-CPU bundle instead: x86-64-v3 (AVX2, FMA, BMI2), its own
+# -avx2 asset names, and an updater that stays on the -avx2 assets.
+CPU_VARIANT=${CPU_VARIANT:-}
+case "$CPU_VARIANT" in
+  "")   ZCPU=""; VARIANT="" ;;
+  avx2) [ "$ARCH" = x86_64 ] || { echo "CPU_VARIANT=avx2 is an x86-64 build"; exit 1; }
+        ZCPU="-Dcpu=x86_64_v3"; VARIANT="-avx2" ;;
+  *)    echo "unknown CPU_VARIANT: $CPU_VARIANT (expected avx2)"; exit 1 ;;
+esac
 
 say()  { printf '\033[1;31m▌\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m▌\033[0m %s\n' "$*"; }
@@ -103,7 +115,7 @@ mkdir -p "$STAGE"
 # stack present. A desktop release must fail if the GUI does not link; a headless fallback cannot
 # replace an installed desktop. Standalone server artifacts are built separately below.
 say "building the app for $OS/$ARCH (ReleaseFast, stripped, GUI linked in)"
-( cd "$ROOT" && "$ZIG" build --release=fast --cache-dir "$CACHE" --prefix "$STAGE/server" )
+( cd "$ROOT" && "$ZIG" build --release=fast $ZCPU --cache-dir "$CACHE" --prefix "$STAGE/server" )
 SERVER="$STAGE/server/bin/veil$EXE"
 [ -f "$SERVER" ] || { say "veil binary missing at $SERVER"; exit 1; }
 
@@ -136,7 +148,7 @@ if [ -n "${CODESIGN_CMD:-}" ] && [ "$OS" = windows ]; then
 fi
 
 # ---- 3. assemble the full one-click bundle ----
-NAME="veil-v$VERSION-$OS-$ARCH"
+NAME="veil-v$VERSION-$OS-$ARCH$VARIANT"
 B="$OUT/$NAME"
 rm -rf "$B"
 mkdir -p "$B/bin"
@@ -146,8 +158,8 @@ printf '%s\n' 'veil-bundle-v1' > "$B/veil-install.txt"
 cp "$ROOT/LICENSE" "$B/LICENSE"
 # Raw assets avoid needing Git or archive tools on the user's machine. GitHub supplies SHA-256 digests
 # in the release API; the updater requires them and verifies size + digest before staging either file.
-cp "$SERVER" "$OUT/veil-update-v$VERSION-$OS-$ARCH-app"
-cp "$neuron" "$OUT/veil-update-v$VERSION-$OS-$ARCH-neuron"
+cp "$SERVER" "$OUT/veil-update-v$VERSION-$OS-$ARCH$VARIANT-app"
+cp "$neuron" "$OUT/veil-update-v$VERSION-$OS-$ARCH$VARIANT-neuron"
 
 # Launcher. A bare `veil` now boots the server AND opens the desk (the one-click default), so the
 # launcher needs no flag at all — it exists purely so double-clicking works on every OS.
@@ -172,7 +184,7 @@ chmod +x "$B/start" "$B/veil$EXE" 2>/dev/null || true
 [ -n "$neuron" ] && chmod +x "$B/bin/neuron$EXE" 2>/dev/null || true
 
 cat > "$B/README.txt" <<TXT
-the veil — v$VERSION ($OS/$ARCH)
+the veil — v$VERSION ($OS/$ARCH$VARIANT)
 
 LICENSES
   NL-Veil: MIT (LICENSE). Dependencies retain their own licenses.
@@ -210,6 +222,14 @@ the veil — by gary23w
   author   https://github.com/gary23w
   project  https://github.com/gary23w/nl-veil
 TXT
+if [ -n "$VARIANT" ]; then
+  cat >> "$B/README.txt" <<TXT
+
+CPU
+  This build needs a CPU with AVX2 (x86-64-v3). If it does not start, use the
+  regular veil-v$VERSION-$OS-$ARCH bundle, which is built for any 64-bit x86 CPU.
+TXT
+fi
 
 # ---- 3b. SCRUB the bundle before it is sealed ----
 # Anything that ran veil out of this directory — a smoke test, a manual double-click, an interrupted
@@ -259,7 +279,8 @@ aarch64-linux-gnu:linux:arm64:
 x86_64-macos:macos:x86_64:
 aarch64-macos:macos:arm64:"
 
-if [ "${1:-}" != "--host-only" ]; then
+# The variant bundle builds no server targets: those are the baseline build's, under the same names.
+if [ "${1:-}" != "--host-only" ] && [ -z "$VARIANT" ]; then
   say "cross-compiling the server for every target"
   # Stale binaries from a previous run would otherwise be re-listed in MANIFEST.txt and re-checksummed
   # even if this run's build for that target FAILED.
@@ -289,7 +310,7 @@ rm -rf "$STAGE"
   echo "the veil v$VERSION — release artifacts"
   echo
   echo "FULL BUNDLE (server + desktop + neuron, one-click):"
-  echo "  $NAME/            built here on $OS/$ARCH"
+  echo "  $NAME/            built here on $OS/$ARCH${CPU_VARIANT:+ for $CPU_VARIANT CPUs}"
   echo
   # Only claim a server-only section if something is actually in it (--host-only runs have none).
   have_xc=0
@@ -308,8 +329,12 @@ rm -rf "$STAGE"
 # binaries sitting in bin/ (veil-scratch.exe, veil-synapse.exe, ...) and the bundle DIRECTORY, which isn't a file.
 ( cd "$OUT"
   set --
-  for f in "veil-v$VERSION-$OS-$ARCH.tar.gz" "veil-v$VERSION-$OS-$ARCH.zip" veil-update-v"$VERSION"-"$OS"-"$ARCH"-* server-only/veil-server-v"$VERSION"-*; do
-    [ -f "$f" ] && set -- "$@" "$f"
+  # The update payloads by exact name: a -$ARCH-* glob would sweep the other CPU build's payloads into this
+  # checksum file whenever both were built into the same bin/.
+  for f in "$NAME.tar.gz" "$NAME.zip" "veil-update-v$VERSION-$OS-$ARCH$VARIANT-app" "veil-update-v$VERSION-$OS-$ARCH$VARIANT-neuron" server-only/veil-server-v"$VERSION"-*; do
+    [ -f "$f" ] || continue
+    if [ -n "$VARIANT" ]; then case "$f" in server-only/*) continue ;; esac; fi
+    set -- "$@" "$f"
   done
   [ "$#" -gt 0 ] || exit 0
   if command -v sha256sum >/dev/null 2>&1; then sha256sum "$@" > SHA256SUMS.txt

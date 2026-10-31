@@ -16,7 +16,12 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
+    // BASELINE CPU by default, not the build machine's. With no -Dtarget/-Dcpu, Zig otherwise compiles for
+    // the CPU it happens to run on, and every release is built on whatever CPU the CI runner had: v1.1.26
+    // and v1.1.27 came off AVX-512 runners and crashed before opening a window on every machine without
+    // AVX-512. Baseline runs on any 64-bit CPU of the arch (Apple silicon resolves to M1). A build for one
+    // newer CPU says so: -Dcpu=x86_64_v3 is the AVX2 bundle, -Dcpu=native a local build for this machine.
+    const target = b.standardTargetOptions(.{ .default_target = .{ .cpu_model = .baseline } });
     // ReleaseFast by DEFAULT — and this time the code actually does it. `standardOptimizeOption` with a
     // preferred mode only applies that preference when `--release` is passed with NO value, so a bare
     // `zig build` shipped a DEBUG binary while this comment claimed otherwise, `--release=small` was a
@@ -254,8 +259,9 @@ pub fn build(b: *std.Build) void {
 /// Compile the embedded inference library (the lazy `llama_cpp` dependency) into `mod`, CPU
 /// backend only, plus the veil_ll_* C shim (src/worker/llamashim.c) that src/worker/llamaeng.zig
 /// binds. Mirrors the library's own CPU build recipe: base + backend registry + one CPU variant
-/// with the x86-64 AVX2 baseline (its default x64 release configuration) or the arm sources on
-/// aarch64; anything else falls back to the generic kernels. C++17 with exceptions (the library
+/// with the x86-64 AVX2 kernels when the target CPU has AVX2, the same x86 sources on the target's
+/// own features otherwise (the library's plain x64 variant: each kernel falls back to C), or the arm
+/// sources on aarch64; anything else falls back to the generic kernels. C++17 with exceptions (the library
 /// throws), UBSan off for the same reason as Lua below: its intentional aliasing is not ours to trap.
 fn addLlamaCpp(b: *std.Build, mod: *std.Build.Module, dep: *std.Build.Dependency, target: std.Build.ResolvedTarget, vulkan: bool) void {
     mod.link_libc = true;
@@ -296,9 +302,13 @@ fn addLlamaCpp(b: *std.Build, mod: *std.Build.Module, dep: *std.Build.Dependency
     const cxxflags = cxxflags_list.items;
 
     const arch = target.result.cpu.arch;
-    const arch_flags: []const []const u8 = if (arch == .x86_64)
+    // The AVX2 flags only when the TARGET CPU has AVX2. Passed unconditionally they made every x86-64
+    // build need AVX2 in the model engine whatever -Dcpu said, so a baseline build would still crash
+    // the first time a CPU without AVX2 ran the built-in model.
+    const x86_avx2 = arch == .x86_64 and std.Target.x86.featureSetHasAll(target.result.cpu.features, .{ .avx2, .fma, .f16c, .bmi2 });
+    const arch_flags: []const []const u8 = if (x86_avx2)
         &.{ "-msse4.2", "-mf16c", "-mfma", "-mbmi2", "-mavx", "-mavx2", "-DGGML_SSE42", "-DGGML_F16C", "-DGGML_FMA", "-DGGML_BMI2", "-DGGML_AVX", "-DGGML_AVX2" }
-    else if (arch == .aarch64)
+    else if (arch == .x86_64 or arch == .aarch64)
         &.{}
     else
         &.{"-DGGML_CPU_GENERIC"};

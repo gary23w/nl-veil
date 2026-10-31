@@ -86,6 +86,11 @@ jobs:
           } finally { Pop-Location }
           zig build --prefix dist/windows-store/build
           if ($LASTEXITCODE -ne 0) { throw 'Desktop build failed' }
+      - name: Check the CPU instruction level
+        shell: pwsh
+        run: |
+          python scripts/check-cpu-level.py --level baseline dist/windows-store/build/bin/veil.exe
+          if ($LASTEXITCODE -ne 0) { throw 'Store build uses instructions beyond the baseline CPU' }
       - name: Package for Store upload
         shell: pwsh
         run: |
