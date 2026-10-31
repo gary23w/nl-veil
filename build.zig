@@ -24,7 +24,8 @@ pub fn build(b: *std.Build) void {
     // The macOS version leaks the same way: a native build records the build machine's macOS as the oldest
     // it runs on (minos in LC_BUILD_VERSION), so the v1.1.28 Mac apps asked for 15.8.2 and 15.7.9. Built on
     // a Mac, the default target asks for macOS 13.0 instead: Zig 0.16's own default floor, the minimum the
-    // Mac servers cross-compiled on Linux already carry. Zig still links against the build machine's SDK.
+    // Mac servers cross-compiled on Linux already carry. libc still comes from the build machine's SDK; its
+    // framework folder has to be added by hand (see the macOS note at the raylib link below).
     const mac_floor: ?std.Target.Query.OsVersion = if (builtin.os.tag == .macos) .{ .semver = .{ .major = 13, .minor = 0, .patch = 0 } } else null;
     const target = b.standardTargetOptions(.{ .default_target = .{ .cpu_model = .baseline, .os_version_min = mac_floor } });
     // ReleaseFast by DEFAULT — and this time the code actually does it. `standardOptimizeOption` with a
@@ -182,6 +183,15 @@ pub fn build(b: *std.Build) void {
         // LLD, and -Dapp=false never reaches this block because it links no raylib at all. ubuntu-latest
         // ships cc, and the workflow already installs the GL/X11 dev packages this needs.
         if (target.result.os.tag == .linux) exe.use_lld = false;
+
+        // MACOS: the final link needs the SDK's framework folder. raylib names AppKit, IOKit and the rest, and
+        // Zig adds that folder by itself only for a build it considers native; one that sets an OS version
+        // (mac_floor above) is not, and its link failed with "unable to find framework 'Foundation'".
+        if (builtin.os.tag == .macos and target.result.os.tag == .macos) {
+            if (std.zig.system.darwin.getSdk(b.allocator, b.graph.io, &target.result)) |sdk| {
+                exe.root_module.addSystemFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "System/Library/Frameworks" }) });
+            }
+        }
     }
     // DELIBERATELY NOT `exe.subsystem = .Windows`, even though desk/build.zig sets it for veil-desk. `veil`
     // is also the CLI: a GUI-subsystem binary makes cmd.exe/PowerShell stop waiting for it and throws away
