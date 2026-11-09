@@ -1,6 +1,7 @@
 //! Supervisor — spawns + tracks one native Zig worker process per swarm, and enforces the per-user mind cap
 
 const std = @import("std");
+const vthread = @import("../../threads.zig"); // every thread: small Windows stack commit + a name
 const builtin = @import("builtin");
 const crypto = @import("../../config/key_vault.zig");
 const dataset = @import("../dataset.zig"); // training-set root, injected so a mind records into the same set
@@ -2336,7 +2337,7 @@ test "background maintenance stops an over-budget swarm without a list request" 
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/.usage", .data = "v1 r1111111111111111 600000\n" });
 
     {
-        const bg = try std.Thread.spawn(.{}, Supervisor.bgLoop, .{&sup});
+        const bg = try vthread.spawn("test-supervisor", Supervisor.bgLoop, .{&sup});
         defer {
             sup.bg_stop.store(true, .monotonic);
             bg.join();

@@ -2,6 +2,7 @@
 //! server — or dispatches a CLI verb / the worker entry when invoked as a subcommand.
 
 const std = @import("std");
+const vthread = @import("threads.zig"); // every thread: small Windows stack commit + a name (threads.zig)
 const builtin = @import("builtin");
 const httpz = @import("httpz");
 
@@ -354,8 +355,9 @@ pub fn main(init: std.process.Init) !void {
     // request leg runs unwatched), which froze the merged GUI+server process solid during tool-heavy turns: a
     // losing race timer holds its slot for its full 5-8s on Windows (blocked sockets can't be canceled at all),
     // so ordinary chat traffic pinned the pool at saturation and every caller degraded to serial inline waits.
-    // Threads spawn on demand only, so a high ceiling costs nothing when quiet.
-    var threaded = std.Io.Threaded.init(gpa, .{ .environ = environ, .async_limit = .limited(512) });
+    // Threads spawn on demand only, so a high ceiling costs nothing when quiet. stack_size: the pool's threads
+    // go through std.Thread.spawn too, so they take the same small Windows commit as every other (threads.zig).
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = environ, .async_limit = .limited(512), .stack_size = vthread.io_stack_size });
     defer threaded.deinit();
     const io = threaded.io();
     if (HAS_GUI) {
@@ -627,7 +629,7 @@ pub fn main(init: std.process.Init) !void {
     // wedges the server. Handlers now only read the in-memory roster.
     sup.gc_data_dir = paths.data;
     sup.gc_days = retention_days;
-    if (std.Thread.spawn(.{}, Supervisor.bgLoop, .{&sup})) |t| {
+    if (vthread.spawn("supervisor", Supervisor.bgLoop, .{&sup})) |t| {
         t.detach();
     } else |err| {
         // Production usage limits now depend on this loop, so a failed launch
@@ -725,10 +727,10 @@ pub fn main(init: std.process.Init) !void {
     // cadence): a due task spawns a full chat turn, which must never ride an httpz request thread. Spawned here
     // — not next to the sup.bgLoop spawn above — because it needs the fully-wired App; like sup, `app` lives on
     // main's stack for the life of the process (listen() below never returns in normal operation).
-    if (std.Thread.spawn(.{}, sched.bgLoop, .{&app})) |t| t.detach() else |_| {}
+    if (vthread.spawn("sched", sched.bgLoop, .{&app})) |t| t.detach() else |_| {}
     // TOTS allowed onto this machine queue jobs in the cloud; this thread polls for them and runs each as an
     // unattended chat turn (config/cf_tot.zig). It idles at no cost for a user who approved none.
-    if (std.Thread.spawn(.{}, cf_tot.bgLoop, .{&app})) |t| t.detach() else |_| {}
+    if (vthread.spawn("tots", cf_tot.bgLoop, .{&app})) |t| t.detach() else |_| {}
     log.info("billing: {s} (NL_PRODUCTION)", .{if (production) "PRODUCTION — non-admins metered by neuron plan" else "BETA — unmetered full use"});
     if (!open_reg) log.info("registration: CLOSED (private beta) — set NL_OPEN_REGISTRATION=1 to open public signups", .{});
     // NL_CF_API_ROOT: a stand-in for api.cloudflare.com, for the simulation suite (scripts/sim/cfworld.py).
@@ -790,10 +792,18 @@ pub fn main(init: std.process.Init) !void {
         // connections: one thread owns one socket for that socket's whole life. Measured by holding N sockets
         // open and counting requests to the first stall — the stall lands at exactly (held + in-flight) ==
         // count, every time, and the request over the line HANGS 15-25s instead of queueing or being refused.
-        // Left at 128 deliberately: each worker charges ~30 MB of commit (its buffer + stack), so 512 pushed
-        // this process from 4.5 GB to 16.9 GB of commit charge for headroom the keepalive fix above already
-        // buys far more cheaply. Raise it only with that cost in mind.
+        // Left at 128. A worker used to charge ~32 MiB of commit up front (a 16 MiB stack and a 16 MiB body
+        // buffer), so 512 pushed this process from 4.5 GB to 16.9 GB of commit charge for headroom the keepalive
+        // fix above already buys far more cheaply. Both halves are now small: worker stacks commit 256 KiB and
+        // grow on demand (vendor/httpz/src/spawn_cfg.zig, see threads.zig), and the body buffers are the small
+        // fixed pool below. Raising the count still adds a thread, its 32 KiB pool buffer and its stack.
         .thread_pool = .{ .count = 128 },
+        // httpz preallocates large_buffer_count body buffers of large_buffer_size. Unset, blocking mode takes
+        // one per pool thread sized to max_body_size: 128 x 16 MiB committed before the first request, for
+        // bodies that are almost always a few KB. A body larger than a pooled buffer, or one that arrives while
+        // all 16 are lent out, is allocated for its own request (buffer.zig allocType), so a 16 MiB image
+        // upload still works; only the idle commit goes.
+        .workers = .{ .large_buffer_count = 16, .large_buffer_size = 256 << 10 },
     }, &app);
     defer {
         cf_tunnel.shutdown(&app); // the public URL first: it must not outlive the server it fronts
@@ -1032,7 +1042,7 @@ pub fn main(init: std.process.Init) !void {
     // hard-killed (Task Manager) and no defer or watcher ever runs.
     ownProcessTree(init.environ_map);
     var st = ServerThread{ .server = &server, .port = port };
-    const server_thread = std.Thread.spawn(.{}, ServerThread.run, .{&st}) catch |e| {
+    const server_thread = vthread.spawn("server", ServerThread.run, .{&st}) catch |e| {
         // No server thread = no backend for the GUI to talk to. Fall back to the blocking listen rather than
         // opening a window onto nothing.
         log.err("could not start the HTTP thread ({t}) — running server-only on this thread instead", .{e});
@@ -1205,7 +1215,7 @@ fn portFree(io: std.Io, gpa: std.mem.Allocator, bind_all: bool, port: u16) bool 
         }
     };
     probe._mut.lockUncancelable(io);
-    const th = std.Thread.spawn(.{}, Quiet.run, .{&probe}) catch {
+    const th = vthread.spawn("port-probe", Quiet.run, .{&probe}) catch {
         probe._mut.unlock(io);
         return false;
     };
@@ -2501,7 +2511,7 @@ test "the listen port: a second server cannot share it, and a stopped server's p
         var second = try httpz.Server(void).init(io, gpa, .{ .address = .localhost(port) }, {});
         defer second.deinit();
         var attempt: ListenAttempt = .{ .server = &second };
-        const t = try std.Thread.spawn(.{}, ListenAttempt.run, .{&attempt});
+        const t = try vthread.spawn("test-listen", ListenAttempt.run, .{&attempt});
         const deadline = std.Io.Timestamp.now(io, .awake).nanoseconds + 5 * std.time.ns_per_s;
         while (!attempt.done.load(.acquire) and std.Io.Timestamp.now(io, .awake).nanoseconds < deadline) threadSleepMs(io, 5);
         if (!attempt.done.load(.acquire)) {
@@ -2592,7 +2602,7 @@ test "the app's port: a free one is kept, one a quitting veil lets go of is wait
     try std.testing.expect(portFree(io, gpa, false, moved)); // the probe let go of what it found
 
     // Let go of within the wait (a veil that is quitting): the port is waited for and kept, not moved off.
-    const stopper = try std.Thread.spawn(.{}, StopLater.run, .{ io, &holder, 400 });
+    const stopper = try vthread.spawn("test-stopper", StopLater.run, .{ io, &holder, 400 });
     const kept = pickAppPort(io, gpa, false, free_port, 3000);
     stopper.join();
     holder_thread.join();

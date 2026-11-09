@@ -283,6 +283,13 @@ pub fn killTree(io: std.Io, child: *const std.process.Child) void {
     }
 }
 
+/// The watcher's SpawnConfig. This whole-file twin cannot import threads.zig (src/ and desk/ keep separate
+/// copies at different paths), so it spells out the same rule: on Windows std.Thread.spawn commits its whole
+/// stack_size up front, so commit 256 KiB and let the stack grow on demand; POSIX keeps the std default.
+const guard_spawn: std.Thread.SpawnConfig = .{
+    .stack_size = if (win) 256 << 10 else std.Thread.SpawnConfig.default_stack_size,
+};
+
 const KillGuard = struct {
     id: std.process.Child.Id,
     deadline_ms: u32,
@@ -318,7 +325,7 @@ pub fn spawnGuarded(io: std.Io, argv: []const []const u8, deadline_ms: u32) ?any
     var child = std.process.spawn(io, .{ .argv = argv, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore, .create_no_window = true }) catch |e| return e;
     var done = std.atomic.Value(bool).init(false);
     const th: ?std.Thread = if (child.id != null)
-        (std.Thread.spawn(.{}, KillGuard.watch, .{KillGuard{ .id = child.id.?, .deadline_ms = deadline_ms, .done = &done }}) catch null)
+        (std.Thread.spawn(guard_spawn, KillGuard.watch, .{KillGuard{ .id = child.id.?, .deadline_ms = deadline_ms, .done = &done }}) catch null)
     else
         null;
     _ = child.wait(io) catch {};

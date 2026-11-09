@@ -20,6 +20,7 @@ test {
     _ = @import("worker/garrett.zig"); // Agent Garrett's belt: the two verbs over one JSON-RPC POST each — via fakehttp
     _ = @import("config/cf_tunnel.zig"); // the tunnel: gated routes, token-free state, the permission explanation, Access claims, hostname changes — via fakehttp
     _ = @import("worker/wsock.zig"); // the loopback client's blocking round trip: IPv4 literals, the sockaddr layout
+    _ = @import("threads.zig"); // every thread: a 256 KiB Windows stack commit (not 16 MiB), deep stacks still grow, names
     _ = @import("config/key_vault.zig"); // registered DIRECTLY: reaching the root through another
     // module is not proof of collection — lazy analysis silently dropped desk/assets.zig's tests
     // the same way (ledger 0029).

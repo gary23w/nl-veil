@@ -2,6 +2,7 @@
 //! recall, chain, reinforce, assoc) plus the operator preamble + baseline tables. One seam for all
 //! memory traffic — the place to instrument, debug, and gate it.
 const std = @import("std");
+const vthread = @import("../threads.zig"); // every thread: small Windows stack commit + a name
 const builtin = @import("builtin");
 const bounded = @import("bounded.zig");
 const bu = @import("browser/util.zig"); // sleepMs: a raw-thread sleep, no Io park (the lock-retry pause)
@@ -1397,7 +1398,7 @@ test "a write the CLI's pid lock refuses is retried, and lands once the other wr
     var pb: [32]u8 = undefined;
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/n.db.lock", .data = try std.fmt.bufPrint(&pb, "{d}", .{testSelfPid()}) });
     var rel: LockReleaser = .{ .io = io, .path = root ++ "/n.db.lock", .after_ms = 250 };
-    const th = try std.Thread.spawn(.{}, LockReleaser.run, .{&rel});
+    const th = try vthread.spawn("test-lock-release", LockReleaser.run, .{&rel});
     const doc = "{\"scope\":\"chat:c__n1\",\"fact\":\"raw output line one says the build passed\"}\n" ++
         "{\"scope\":\"chat:c__n1\",\"fact\":\"raw output line two says the deploy finished\"}\n";
     const stored = m.importDocs(doc);
@@ -1463,7 +1464,7 @@ test "the lock-retry pause never parks: a turn's raw thread with an alert pendin
     var pb: [32]u8 = undefined;
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/n.db.lock", .data = try std.fmt.bufPrint(&pb, "{d}", .{testSelfPid()}) });
     var rel: LockReleaser = .{ .io = io, .path = root ++ "/n.db.lock", .after_ms = 250 };
-    const rth = try std.Thread.spawn(.{}, LockReleaser.run, .{&rel});
+    const rth = try vthread.spawn("test-lock-release", LockReleaser.run, .{&rel});
     const Turn = struct {
         m: Mem,
         stored: u32 = 0,
@@ -1477,7 +1478,7 @@ test "the lock-retry pause never parks: a turn's raw thread with an alert pendin
         }
     };
     var turn: Turn = .{ .m = m };
-    const tth = try std.Thread.spawn(.{}, Turn.go, .{&turn});
+    const tth = try vthread.spawn("test-turn", Turn.go, .{&turn});
     tth.join();
     rth.join();
     try std.testing.expectEqual(@as(u32, 1), turn.stored);
@@ -1571,8 +1572,8 @@ test "two chat turns of one user write one hive at once: every write lands, none
     var go = std.atomic.Value(bool).init(false);
     var wa: Writer = .{ .m = ma, .tag = "p", .n = per, .go = &go };
     var wb: Writer = .{ .m = mb, .tag = "p__s1", .n = per, .go = &go };
-    const ta = try std.Thread.spawn(.{}, Writer.run, .{&wa});
-    const tb = try std.Thread.spawn(.{}, Writer.run, .{&wb});
+    const ta = try vthread.spawn("test-writer", Writer.run, .{&wa});
+    const tb = try vthread.spawn("test-writer", Writer.run, .{&wb});
     go.store(true, .release);
     ta.join();
     tb.join();

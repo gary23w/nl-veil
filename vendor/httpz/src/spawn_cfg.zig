@@ -2,7 +2,7 @@
 //! (default 16 MiB) to NtCreateThreadEx as the stack COMMIT on Windows, so the 128 blocking-mode workers charged
 //! 2 GiB of commit before serving a request. Commit 256 KiB instead; the stack still grows on demand to the
 //! executable's 16 MiB reserve (StackReserve stays the header default). POSIX keeps the std default. Mirrors
-//! nl-veil's src/threads.zig, which every non-httpz thread in the app goes through.
+//! nl-veil's src/threads.zig (the server's spawn helper) and its desk twin.
 const std = @import("std");
 const builtin = @import("builtin");
 
@@ -13,7 +13,8 @@ pub const config: std.Thread.SpawnConfig = .{
 extern "kernel32" fn SetThreadDescription(thread: std.os.windows.HANDLE, desc: [*:0]const u16) callconv(.winapi) i32;
 extern "kernel32" fn GetCurrentThread() callconv(.winapi) std.os.windows.HANDLE;
 
-/// Name the calling thread (Windows only, best effort) so the app's vitals line can count httpz workers.
+/// Name the calling thread (Windows only, best effort) so a debugger or Process Explorer can tell httpz's
+/// request-pool threads apart from the rest.
 pub fn nameCurrent(comptime name: []const u8) void {
     if (builtin.os.tag != .windows) return;
     const wide = comptime blk: {

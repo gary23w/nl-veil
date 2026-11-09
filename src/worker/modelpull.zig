@@ -27,6 +27,7 @@
 //! dropped in the store themselves.
 
 const std = @import("std");
+const vthread = @import("../threads.zig"); // every thread: small Windows stack commit + a name
 const httpc = @import("httpc.zig");
 const builtin_mod = @import("builtin.zig");
 const bounded = @import("bounded.zig");
@@ -244,7 +245,7 @@ pub fn startPull() !void {
         st.running = false;
         unlock();
     }
-    const t = try std.Thread.spawn(.{}, pullThread, .{});
+    const t = try vthread.spawn("model-pull", pullThread, .{});
     t.detach();
 }
 
@@ -572,7 +573,7 @@ pub fn startImport(explicit: ?[]const u8) !void {
         st.running = false;
         unlock();
     }
-    const t = try std.Thread.spawn(.{}, importThread, .{});
+    const t = try vthread.spawn("model-import", importThread, .{});
     t.detach();
 }
 
@@ -820,7 +821,7 @@ pub fn startCheck() !void {
         st.checking = false;
         unlock();
     }
-    const t = try std.Thread.spawn(.{}, checkThread, .{});
+    const t = try vthread.spawn("model-check", checkThread, .{});
     t.detach();
 }
 

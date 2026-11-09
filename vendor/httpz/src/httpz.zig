@@ -1,4 +1,5 @@
 const std = @import("std");
+const spawn_cfg = @import("spawn_cfg.zig"); // NOTE: local patch to vendored httpz (small Windows stack commit)
 const builtin = @import("builtin");
 
 pub const testing = @import("testing.zig");
@@ -408,7 +409,7 @@ pub fn Server(comptime H: type) type {
                 workers[0] = try worker.Blocking(*Self, WebsocketHandler).init(io, allocator, self, &config);
                 defer workers[0].deinit();
 
-                const thrd = try Thread.spawn(.{}, worker.Blocking(*Self, WebsocketHandler).listen, .{ &workers[0], listener });
+                const thrd = try Thread.spawn(spawn_cfg.config, worker.Blocking(*Self, WebsocketHandler).listen, .{ &workers[0], listener });
 
                 // incase listenInNewThread was used and is waiting for us to start
                 self._cond.signal(io);
@@ -435,7 +436,7 @@ pub fn Server(comptime H: type) type {
                         workers[i].stop();
                         workers[i].deinit();
                     }
-                    threads[i] = try Thread.spawn(.{}, Worker.run, .{ &workers[i], listener, &ready_sem });
+                    threads[i] = try Thread.spawn(spawn_cfg.config, Worker.run, .{ &workers[i], listener, &ready_sem });
                     started += 1;
                 }
 
@@ -457,7 +458,7 @@ pub fn Server(comptime H: type) type {
             const io = self.io;
             self._mut.lockUncancelable(io);
             defer self._mut.unlock(io);
-            const thrd = try std.Thread.spawn(.{}, listen, .{self});
+            const thrd = try std.Thread.spawn(spawn_cfg.config, listen, .{self});
 
             // we don't return until listen() signals us that the server is up
             self._cond.waitUncancelable(io, &self._mut);
@@ -2137,7 +2138,7 @@ test "websocket: stress" {
 
     var threads: [num_clients]Thread = undefined;
     for (0..num_clients) |i| {
-        threads[i] = Thread.spawn(.{}, struct {
+        threads[i] = Thread.spawn(spawn_cfg.config, struct {
             fn run(_: usize) void {
                 const stream = testStream(5998);
                 defer stream.close(t.io);

@@ -4,6 +4,7 @@
 //! chat/monitor/stop them, and watch the live event console + metrics.
 
 const std = @import("std");
+const vthread = @import("threads.zig"); // every thread: small Windows stack commit + a name (threads.zig)
 const builtin = @import("builtin");
 const nap = @import("nap.zig");
 pub const updater = @import("updater.zig");
@@ -61,7 +62,7 @@ fn deskPanic(msg: []const u8, first_trace_addr: ?usize) noreturn {
 fn writeCrashReport(msg: []const u8, ra: ?usize) void {
     // The app's gpa may be corrupt mid-panic, so stand up a throwaway blocking Io on the page allocator
     // (lock-free VirtualAlloc, no shared state). Skip deinit: we abort in defaultPanic right after.
-    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{ .stack_size = vthread.io_stack_size });
     const io = threaded.io();
     const base = @intFromPtr(GetModuleHandleW(null)); // this module's load base → RVA = ret_addr - base
     // The desk's cwd varies (repo root, zig-out/bin, Explorer double-click) and createFile makes no parent
@@ -519,7 +520,8 @@ pub fn runApp(data_dir: ?[]const u8, attach: ?AttachTarget) !void {
     // timeout race then blocks its calling thread for request+timeout, and a saturated pool froze the window
     // (poller probes inline on whoever calls them). Losing race timers hold slots ~5-8s each on Windows, so
     // the default saturates under ordinary polling; a high ceiling only spawns threads when actually needed.
-    var threaded = std.Io.Threaded.init(gpa, .{ .environ = llm.osEnviron(), .async_limit = .limited(256) });
+    // stack_size: those pool threads take the same small Windows stack commit as every desk thread (threads.zig).
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = llm.osEnviron(), .async_limit = .limited(256), .stack_size = vthread.io_stack_size });
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -531,7 +533,7 @@ pub fn runApp(data_dir: ?[]const u8, attach: ?AttachTarget) !void {
     ui.d_name.len = seedName(&ui.d_name.buf);
 
     var poller = poller_mod.Poller{ .io = io, .gpa = gpa, .store = &store };
-    const th = try std.Thread.spawn(.{}, poller_mod.Poller.run, .{&poller});
+    const th = try vthread.spawn("desk-poller", poller_mod.Poller.run, .{&poller});
     defer {
         poller.stop.store(true, .monotonic);
         th.join();
@@ -539,10 +541,10 @@ pub fn runApp(data_dir: ?[]const u8, attach: ?AttachTarget) !void {
 
     // The chat worker is the third thread (model turns + swarm casting); it owns its own Io instance so
     // the poller's cadence and the chat's long-running streams never contend.
-    var chat_threaded = std.Io.Threaded.init(gpa, .{ .environ = llm.osEnviron(), .async_limit = .limited(256) });
+    var chat_threaded = std.Io.Threaded.init(gpa, .{ .environ = llm.osEnviron(), .async_limit = .limited(256), .stack_size = vthread.io_stack_size });
     defer chat_threaded.deinit();
     var chat_worker = chat_mod.Chat{ .io = chat_threaded.io(), .gpa = gpa, .store = &store };
-    const cth = try std.Thread.spawn(.{}, chat_mod.Chat.run, .{&chat_worker});
+    const cth = try vthread.spawn("desk-chat", chat_mod.Chat.run, .{&chat_worker});
     defer {
         chat_worker.stop.store(true, .monotonic);
         cth.join();

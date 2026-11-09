@@ -97,6 +97,22 @@ if [ "${1:-}" = "--scan" ]; then
   else
     echo "[twins] bounded.zig twins differ -- make the two copies identical"
   fi
+  # threads.zig twin: identical BELOW the //! header (the desk cannot import the server's copy). Same rule as check.ps1's.
+  if [ "$(grep -v '^//!' src/threads.zig)" = "$(grep -v '^//!' desk/src/threads.zig)" ]; then
+    echo "[twins] threads.zig twins in sync (below-header contract holds)"
+  else
+    echo "[twins] threads.zig twin BODIES differ -- mirror them"
+  fi
+  # thread stacks: on Windows a default-config spawn commits its whole 16 MiB stack up front (Zig 0.16); threads go
+  # through vthread.spawn, httpz through spawn_cfg.config. Comment lines skipped. Same rule as check.ps1's 2b.
+  bare_spawns=$(grep -rnE 'Thread\.spawn\([[:space:]]*\.\{[[:space:]]*\}' src desk/src vendor/httpz/src --include=*.zig \
+    | grep -vE '^[^:]+:[0-9]+:[[:space:]]*//' || true)
+  if [ -z "$bare_spawns" ]; then
+    echo "[threads] no default-config thread spawns (every stack commits small on Windows)"
+  else
+    echo "[threads] default-config thread spawns (16 MiB commit each on Windows) -- use vthread.spawn:"
+    echo "$bare_spawns" | sed 's/^/    /'
+  fi
   vz=$(sed -n 's/.*\.version = "\([^"]*\)".*/\1/p' build.zig.zon | head -1)
   vm=$(sed -n 's/.*VERSION = "\([^"]*\)".*/\1/p' src/main.zig | head -1)
   # desk/build.zig.zon is checked too: it was in NEITHER this echo nor bump-version.ps1's edit list, so it

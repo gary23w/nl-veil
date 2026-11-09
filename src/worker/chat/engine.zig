@@ -15,6 +15,7 @@
 //! is admin-only. The desk prefers this backend turn and falls back to its own local engine on any failure.
 
 const std = @import("std");
+const vthread = @import("../../threads.zig"); // every thread: small Windows stack commit + a name
 const builtin = @import("builtin");
 const http = @import("../../gateway/http.zig");
 const tools = @import("../tools.zig");
@@ -2523,7 +2524,7 @@ fn pulseStart(app: *App, conv_dir: []const u8) void {
     }
     @memcpy(p.dir[0..conv_dir.len], conv_dir);
     p.dir_len = conv_dir.len;
-    p.thread = std.Thread.spawn(.{}, Pulse.run, .{p}) catch {
+    p.thread = vthread.spawn("chat-pulse", Pulse.run, .{p}) catch {
         app.gpa.destroy(p);
         return;
     };
@@ -7636,7 +7637,7 @@ pub fn spawnTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, text: [
         .prompting = .{ .base_url = dupInto(blob, &o, p.base_url), .key = dupInto(blob, &o, p.key), .model = dupInto(blob, &o, p.model) },
     };
     args.* = .{ .app = app, .uid = uid, .blob = blob, .conv = cv, .trio = owned, .text = tx, .loop = loop, .tool_client = tool_client, .image_b64 = ib, .fast = fast, .tool_map = tool_map_req, .trace = trace, .garrett = garrett_req };
-    if (std.Thread.spawn(.{}, turnThread, .{args})) |th| {
+    if (vthread.spawn("chat-turn", turnThread, .{args})) |th| {
         th.detach();
     } else |_| {
         turnThread(args); // spawn failed → run inline (blocks) + free, rather than drop the turn
@@ -12649,7 +12650,7 @@ const TestSyncClient = struct {
     thread: ?std.Thread = null,
 
     fn start(self: *TestSyncClient) !void {
-        self.thread = try std.Thread.spawn(.{}, loop, .{self});
+        self.thread = try vthread.spawn("test-sync", loop, .{self});
     }
 
     fn stop(self: *TestSyncClient) void {

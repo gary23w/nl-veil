@@ -21,6 +21,7 @@
 //! AMD + NVIDIA setup) — not our code. Anything else names our code and narrows it to one section.
 
 const std = @import("std");
+const vthread = @import("threads.zig"); // every thread: small Windows stack commit + a name (threads.zig)
 const builtin = @import("builtin");
 const Io = std.Io;
 const log = @import("log.zig");
@@ -123,7 +124,7 @@ pub fn start(io: Io, data_dir: []const u8, hwnd: ?*anyopaque) void {
         ctx.hang_len = p.len;
     } else |_| ctx.hang_len = 0;
     beat_ms.store(nowMs(io), .monotonic);
-    _ = std.Thread.spawn(.{}, watch, .{}) catch {
+    _ = vthread.spawn("desk-watchdog", watch, .{}) catch {
         running.store(false, .release);
         log.warn("watchdog: could not start — a UI hang will go unreported", .{});
     };

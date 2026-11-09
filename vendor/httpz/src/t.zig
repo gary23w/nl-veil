@@ -3,6 +3,7 @@
 // httpz.Request and httpz.Response, checkout testing.zig
 // which is exposed as httpz.testing.
 const std = @import("std");
+const spawn_cfg = @import("spawn_cfg.zig"); // NOTE: local patch to vendored httpz (small Windows stack commit)
 const httpz = @import("httpz.zig");
 const posix = @import("posix.zig");
 
@@ -159,7 +160,7 @@ pub const Context = struct {
         var len: posix.socklen_t = @sizeOf(posix.Address);
         try posix.getsockname(listener, &address.any, &len);
 
-        var thread = try std.Thread.spawn(.{}, struct {
+        var thread = try std.Thread.spawn(spawn_cfg.config, struct {
             fn accept(l: posix.socket_t, server_side: *posix.socket_t) !void {
                 server_side.* = try posix.accept(l, null, null, 0);
             }

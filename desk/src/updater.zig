@@ -2,6 +2,7 @@
 //! archive extraction, package manager or installer runtime. A copy of the current executable waits
 //! for shutdown, replaces the app/engine together, and restores both on an installation error.
 const std = @import("std");
+const vthread = @import("threads.zig"); // every thread: small Windows stack commit + a name (threads.zig)
 const builtin = @import("builtin");
 const nap = @import("nap.zig");
 const distribution = @import("distribution.zig");
@@ -70,7 +71,7 @@ pub fn launch(install: bool) void {
     if (thread) |th| th.join();
     thread = null;
     phase.store(if (install) .installing else .checking, .release);
-    thread = std.Thread.spawn(.{}, work, .{install}) catch {
+    thread = vthread.spawn("updater", work, .{install}) catch {
         failure = "Could not start the update worker.";
         phase.store(.failed, .release);
         return;
