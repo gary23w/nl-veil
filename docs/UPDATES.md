@@ -1,5 +1,9 @@
 # Desktop updates and release connectivity
 
+## v1.1.29
+
+Nothing to do after updating. On Windows an idle veil now holds far less of the computer's commit limit: threads commit their stacks as they use them, and the server keeps a small pool of request buffers. [Release details](release/RELEASE-v1.1.29.md).
+
 ## v1.1.28
 
 If v1.1.26 or v1.1.27 never opened on your computer, download the regular bundle for your platform and extract it; the in-app updater of a version that does not start cannot fetch it for you. That bundle runs on any 64-bit processor of its platform. Windows and Linux also have an `-avx2` bundle for processors with AVX2, which keeps updating from the `-avx2` downloads. [Release details](release/RELEASE-v1.1.28.md).
