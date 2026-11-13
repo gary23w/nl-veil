@@ -13,7 +13,7 @@ window.VEIL_WEB = {
   deploy_url: "https://deploy.workers.cloudflare.com/?url=https://github.com/gary23w/nl-veil/tree/main/cloud/veil-web",
   script: "veil-web",
   /* The harness version this page was written for. An older one is offered its update. */
-  harness_version: 3,
+  harness_version: 4,
 
   /* Offered until the harness answers with the account's own model list. Any other id can be typed in. */
   models: ["@cf/meta/llama-3.3-70b-instruct-fp8-fast"],
@@ -21,10 +21,17 @@ window.VEIL_WEB = {
   /* Agent Garrett: where its key comes from, and where it is written about. */
   garrett: {
     dashboard: "https://agent.garrettstimpson.ca/dashboard",
+    login: "https://agent.garrettstimpson.ca/login",
+    plans: "https://agent.garrettstimpson.ca/#landing-plans",
+    agents: "https://agent.garrettstimpson.ca/connections#instances-panel",
+    keys: "https://agent.garrettstimpson.ca/connections#keys-panel",
     blog: "https://garrettstimpson.ca/topics/agent-garrett/",
     what: "https://garrettstimpson.ca/posts/2026/11/04/what-is-agent-garrett-system-design/",
     how: "https://garrettstimpson.ca/posts/2026/10/16/how-to-use-agent-garrett/",
   },
+
+  /* The browser link extension's folder in the public repo (Chrome or Edge, loaded unpacked). */
+  extension: "https://github.com/gary23w/nl-veil/tree/main/extension",
 
   /* Every link the chat carries, in the order shown. */
   links: [
