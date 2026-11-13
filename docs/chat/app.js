@@ -1521,7 +1521,11 @@ async function repoPick() {
     root = await window.showDirectoryPicker({ mode: 'readwrite' });
   } catch (e) {
     // closing the picker is not an error; a folder the browser will not hand over is, and is said
-    if (e?.name !== 'AbortError') { console.error('open folder', e); toast('The browser did not open that folder: ' + (e?.message || e?.name || 'no reason given')); }
+    if (e?.name === 'AbortError') return;
+    // this browser has the call but will not hand a folder over: its files are taken as an upload instead
+    console.error('open folder', e);
+    toast('This browser will not open a folder in place (' + (e?.message || e?.name || 'no reason given') + '). Pick it once more to add its files to this chat instead.');
+    uploadPick();
     return;
   }
   try {
@@ -1579,6 +1583,13 @@ async function repoRefreshOpen() {
   if (changed && document.activeElement?.id !== 'editor') drawSide();
 }
 window.addEventListener('focus', () => { repoRefreshOpen(); });
+
+/* The folder chooser every browser has: its files are read into the chat. */
+function uploadPick() {
+  const input = h('input', { type: 'file', webkitdirectory: '', multiple: '', hidden: '', onchange: (e) => { uploadFolder([...e.target.files]); input.remove(); } });
+  document.body.append(input);
+  input.click();
+}
 
 /* Where no folder can be opened (Firefox, Safari): a folder is uploaded into the chat's own files instead. */
 const UPLOAD_MAX = 24 * 1024 * 1024;
@@ -2381,7 +2392,7 @@ async function openConv(id) {
 
 async function deleteConv(id) {
   if (S.live) return;
-  if (!confirm('Delete this conversation and its files, here and on your harness?')) return;
+  if (!(await askSure('Delete this conversation and its files, here and on your harness?', 'Delete'))) return;
   await db.del('conv:' + id);
   await repoForget(id);
   S.convs = S.convs.filter((x) => x.id !== id);
@@ -2425,6 +2436,27 @@ function toast(text) {
   box.append(t);
   setTimeout(() => { t.classList.add('out'); setTimeout(() => t.remove(), 300); }, 5000);
 }
+
+/* The page's own questions: a line of text to give, or a yes to give. (A browser's prompt() and confirm() are
+   not there in every browser this page runs in.) */
+function dialogBox(build) {
+  return new Promise((res) => {
+    const d = h('dialog', { class: 'ask' });
+    const done = (v) => { if (d.open) d.close(); d.remove(); res(v); };
+    d.addEventListener('cancel', (e) => { e.preventDefault(); done(null); });
+    d.addEventListener('click', (e) => { if (e.target === d) done(null); });
+    d.append(h('div', { class: 'ask-in' }, build(done)));
+    document.body.append(d);
+    if (typeof d.showModal === 'function') d.showModal(); else d.setAttribute('open', '');
+  });
+}
+const askText = (label, initial = '') => dialogBox((done) => {
+  const input = h('input', { type: 'text', id: 'askInput', value: initial, 'aria-label': label, autocomplete: 'off', spellcheck: 'false', onkeydown: (e) => { if (e.key === 'Enter') { e.preventDefault(); done(input.value); } } });
+  queueMicrotask(() => { input.focus(); input.select(); });
+  return [h('p', {}, label), input, h('div', { class: 'ask-acts' }, h('button', { class: 'btn btn-ghost btn-sm', onclick: () => done(null) }, 'Cancel'), h('button', { class: 'btn btn-solid btn-sm', id: 'askOk', onclick: () => done(input.value) }, 'OK'))];
+});
+const askSure = (text, yes = 'OK') => dialogBox((done) => [h('p', {}, text),
+  h('div', { class: 'ask-acts' }, h('button', { class: 'btn btn-ghost btn-sm', onclick: () => done(null) }, 'Cancel'), h('button', { class: 'btn btn-solid btn-sm', id: 'askOk', autofocus: '', onclick: () => done(true) }, yes))]).then(Boolean);
 
 function toolChip(t) {
   return h('details', { class: 'tool' + (t.failed ? ' failed' : '') + (t.running ? ' running' : '') },
@@ -2499,8 +2531,8 @@ function inlined(html, files) {
 const previewable = (name) => ['html', 'htm', 'svg', 'md', 'markdown'].includes(ext(name));
 const BADGE = { js: 'JS', ts: 'TS', json: '{}', html: '<>', css: '#', py: 'py', md: 'M', zig: 'Z', sh: '$', yml: 'Y', toml: 'T', sql: 'Q', go: 'go', rs: 'rs', c: 'C' };
 
-function newFile(dir = '') {
-  const name = fileName(prompt('New file name (for example index.html, or src/app.js):', dir) ?? '');
+async function newFile(dir = '') {
+  const name = fileName((await askText('New file name (for example index.html, or src/app.js)', dir)) ?? '');
   if (!name || name.endsWith('/') || name.includes('..') || name.length > 200) return;
   if (repo.on()) {
     (repoHas(name) ? Promise.resolve() : repoWriteNow(name, '')).then(() => showFile(name)).catch((e) => toast(e.message));
@@ -2511,11 +2543,11 @@ function newFile(dir = '') {
   drawSide();
   queueMicrotask(() => document.getElementById('editor')?.focus());
 }
-function renameFile(old) {
-  const name = fileName(prompt('Rename ' + old + ' to:', old) ?? '');
+async function renameFile(old) {
+  const name = fileName((await askText('Rename ' + old + ' to', old)) ?? '');
   if (!name || name === old || name.includes('..') || name.length > 200) return;
   if (repo.on()) {
-    if (repoHas(name) && !confirm(name + ' exists. Replace it?')) return;
+    if (repoHas(name) && !(await askSure(name + ' exists. Replace it?', 'Replace'))) return;
     (async () => {
       await repoLoad(old);
       if (repo.partial.has(old)) throw new Error(old + ' is too large to rename from here');
@@ -2529,7 +2561,7 @@ function renameFile(old) {
     })().catch((e) => toast(e.message));
     return;
   }
-  if (name in S.conv.files && !confirm(name + ' exists. Replace it?')) return;
+  if (name in S.conv.files && !(await askSure(name + ' exists. Replace it?', 'Replace'))) return;
   S.conv.files[name] = S.conv.files[old];
   delete S.conv.files[old];
   S.open = S.open.map((n) => (n === old ? name : n));
@@ -2537,8 +2569,8 @@ function renameFile(old) {
   touchConv();
   drawSide();
 }
-function deleteFile(name) {
-  if (!confirm('Delete ' + name + (repo.on() ? ' from the folder?' : '?'))) return;
+async function deleteFile(name) {
+  if (!(await askSure('Delete ' + name + (repo.on() ? ' from the folder?' : '?'), 'Delete'))) return;
   if (repo.on()) {
     repoRemoveNow(name).then(() => { delete S.conv.files[name]; closeFile(name); drawSide(); }).catch((e) => toast(e.message));
     return;
@@ -2745,7 +2777,7 @@ function editorNode(name, status) {
     if (completer.key(e, ta, ghost, changed)) return;   // Ctrl+Enter writes; Tab takes a suggestion, Escape drops it
     if (mod && e.key.toLowerCase() === 's') { e.preventDefault(); saveNow(); return; }
     if (mod && e.key.toLowerCase() === 'p') { e.preventDefault(); S.explorer = true; drawSide(); queueMicrotask(() => document.getElementById('fileFilter')?.focus()); return; }
-    if (mod && e.key.toLowerCase() === 'g') { e.preventDefault(); const to = Number(prompt('Go to line (1 to ' + starts.length + '):') ?? 0); if (to >= 1) goto(to); return; }
+    if (mod && e.key.toLowerCase() === 'g') { e.preventDefault(); askText('Go to line (1 to ' + starts.length.toLocaleString() + ')').then((v) => { const to = Number(v ?? 0); if (to >= 1) goto(to); }); return; }
     if (part) return;
     if (e.key === 'Tab' && !e.shiftKey && !e.altKey && !mod) {
       e.preventDefault();   // Tab indents; Escape then Tab leaves the editor
@@ -2860,10 +2892,10 @@ function codeTab() {
   const names = inRepo ? repo.paths : Object.keys(S.conv.files);
   const lost = !inRepo && S.conv.repo;   // this chat works in a folder that is not connected right now
   const writing = S.live?.writing ?? null;
-  const upload = h('input', { type: 'file', webkitdirectory: '', multiple: '', hidden: '', onchange: (e) => { uploadFolder([...e.target.files]); e.target.value = ''; } });
-  const openFolder = () => (repo.canPick() ? repoPick() : upload.click());
+  const upload = null;
+  const openFolder = () => (repo.canPick() ? repoPick() : uploadPick());
   const folderWord = repo.canPick() ? 'Open folder' : 'Upload folder';
-  const clone = () => { const url = prompt('Clone a repository: its https address (for example https://github.com/owner/name)'); if (url) gitClone(url); };
+  const clone = async () => { const url = await askText('Clone a repository: its https address (for example https://github.com/owner/name)'); if (url) gitClone(url); };
   const canClone = Number(S.status?.version) >= 9 && !!navigator.storage?.getDirectory;
   const open = writing ? null : S.file !== null && S.file in S.conv.files ? S.file : null;
   if (open && !S.open.includes(open)) S.open.push(open);
@@ -2888,7 +2920,7 @@ function codeTab() {
     h('div', { class: 'exp-acts' },
       h('button', { class: 'btn btn-ghost btn-sm', title: repo.canPick() ? 'Work in a folder on this computer: files are read as you open them and edits are written straight to it' : 'Add a folder\'s text files to this chat', onclick: openFolder }, folderWord),
       canClone ? h('button', { class: 'btn btn-ghost btn-sm', title: 'Clone a git repository by its address into this browser', onclick: clone }, 'Clone repo') : null,
-      inRepo ? h('button', { class: 'btn btn-ghost btn-sm', title: repo.kind === 'disk' ? 'Close this folder (nothing in it is deleted)' : 'Remove this clone from the browser', onclick: async () => { if (repo.kind === 'private' && !confirm('Remove this clone from the browser? Commits that were not pushed are lost.')) return; repoClose(); delete S.conv.repo; S.conv.files = {}; S.open = []; S.file = null; await repoForget(S.conv.id); touchConv(); draw(); } }, repo.kind === 'disk' ? 'Close folder' : 'Remove clone') : null),
+      inRepo ? h('button', { class: 'btn btn-ghost btn-sm', title: repo.kind === 'disk' ? 'Close this folder (nothing in it is deleted)' : 'Remove this clone from the browser', onclick: async () => { if (repo.kind === 'private' && !(await askSure('Remove this clone from the browser? Commits that were not pushed are lost.', 'Remove'))) return; repoClose(); delete S.conv.repo; S.conv.files = {}; S.open = []; S.file = null; await repoForget(S.conv.id); touchConv(); draw(); } }, repo.kind === 'disk' ? 'Close folder' : 'Remove clone') : null),
     names.length > 4 ? filter : null,
     repo.busy || (!inRepo && gitx.busy) ? h('div', { class: 'empty', id: 'repoBusy' }, repo.busy || gitx.busy) : null,
     lost ? h('div', { class: 'empty' }, `This chat works in the folder “${S.conv.repo.name}”. `, h('button', { class: 'btn btn-sm', onclick: async () => { if (!(await repoReconnect(true))) toast('The browser no longer has that folder: open it again.'); drawSide(); } }, 'Reconnect it')) : null,
@@ -3118,7 +3150,7 @@ function harnessTab() {
       h('p', {}, 'Anything logged in to this Cloudflare account can use this harness: this page in any browser, and other veils that hold your login.'),
       h('div', { class: 'acts' },
         outdated() ? null : h('button', { class: 'btn btn-sm', disabled: !!S.busy, onclick: () => act('update', updateHarness) }, S.busy === 'update' ? 'Updating…' : 'Check for a newer harness'),
-        h('button', { class: 'btn btn-sm btn-danger', onclick: () => { if (confirm('Forget this harness in this browser? The Worker stays in your Cloudflare account until you delete it there.')) { ls.del('veilweb.harness'); S.harness = null; S.status = null; draw(); } } }, 'Forget this harness'))),
+        h('button', { class: 'btn btn-sm btn-danger', onclick: async () => { if (await askSure('Forget this harness in this browser? The Worker stays in your Cloudflare account until you delete it there.', 'Forget')) { ls.del('veilweb.harness'); S.harness = null; S.status = null; draw(); } } }, 'Forget this harness'))),
   ];
 }
 
@@ -3185,7 +3217,7 @@ function splitter() {
 function sidePane() {
   const tab = (id, label) => h('button', { class: S.tab === id ? 'on' : '', role: 'tab', 'aria-selected': String(S.tab === id), onclick: () => { S.tab = id; S.note = ''; drawSide(); if (id === 'jobs') refreshJobs(); if (id === 'harness') refreshStatus(); } }, label);
   const active = S.jobs.filter((j) => j.state === 'queued' || j.state === 'running').length;
-  const files = repo.on() ? repo.name : Object.keys(S.conv.files).length;
+  const files = repo.on() ? 0 : Object.keys(S.conv.files).length;
   return h('aside', { class: 'side', id: 'side' },
     h('div', { class: 'tabs', role: 'tablist' }, tab('code', files ? `Code (${files})` : 'Code'), tab('jobs', active ? `Jobs (${active})` : 'Jobs'), tab('harness', outdated() ? 'Harness •' : 'Harness'),
       h('span', { class: 'grow' }),
@@ -3326,9 +3358,9 @@ function setup() {
     h('div', { class: 'gate-acts' }, h('button', { class: 'btn btn-ghost btn-sm', onclick: () => logout() }, 'Log out'))));
 }
 
-function pickModel(sel) {
+async function pickModel(sel) {
   if (sel.value === '+') {
-    const id = (prompt('Workers AI model id (starts with @cf/ or @hf/):', S.model) ?? '').trim();
+    const id = ((await askText('Workers AI model id (starts with @cf/ or @hf/)', S.model)) ?? '').trim();
     if (id.startsWith('@')) S.model = id;
   } else S.model = sel.value;
   ls.set('veilweb.model', S.model);

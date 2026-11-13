@@ -175,6 +175,12 @@ button:disabled, .btn[aria-disabled=true] { opacity: .5; cursor: default; pointe
 .git-who { display: grid; gap: 4px; }
 .git .tree-row .badge { font-weight: 700; }
 .git-added .badge { color: var(--success); } .git-changed .badge { color: var(--accent); } .git-deleted .badge { color: var(--danger); } .git-deleted .name { text-decoration: line-through; }
+dialog.ask { border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface-raised); color: var(--text); padding: 0; width: min(92vw, 440px); box-shadow: 0 12px 40px rgb(0 0 0 / .35); }
+dialog.ask::backdrop { background: rgb(0 0 0 / .4); }
+.ask-in { display: grid; gap: 10px; padding: 16px; }
+.ask-in p { margin: 0; font-size: var(--fs-ui); overflow-wrap: anywhere; }
+.ask-in input { width: 100%; }
+.ask-acts { display: flex; justify-content: flex-end; gap: 8px; }
 .exp-acts { display: flex; flex-wrap: wrap; gap: 2px; padding: 0 6px 6px; }
 .exp-acts .btn { padding: 2px 8px; font-size: var(--fs-micro); }
 .row-btns { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; }
