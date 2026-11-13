@@ -59,7 +59,7 @@
 // No imports and no platform globals beyond fetch/Response/crypto, so a test can run this file under node with
 // a Map for storage and a scripted env.AI.
 
-export const VERSION = "8";
+export const VERSION = "9";
 const API_ROOT = "https://api.cloudflare.com/client/v4";
 const PY_SOURCE = "https://raw.githubusercontent.com/gary23w/nl-veil/main/cloud/tot_py.py";
 const SELF_SCRIPT = "veil-web";
@@ -96,6 +96,7 @@ const AUTH_TTL_MS = 5 * 60 * 1000;
 const QUIET_KNOBS = [{ enable_thinking: false }, { chat_template_kwargs: { thinking: false } }, { chat_template_kwargs: { enable_thinking: false } }, { reasoning_effort: "low" }];
 const THINK_PATIENCE = 6000; // characters of reasoning, with no word of a reply yet, before a job's call is given up on
 const TRIAL_PATIENCE = 1500; // the same, for a call sent with a knob that is meant to switch reasoning off
+const SOCKETS_MAX = 16; // sockets the harness holds open at once
 const EXTRA_KEYS = new Set(["enable_thinking", "chat_template_kwargs", "reasoning_effort"]); // what a caller may add to a model request
 const DENY_TTL_MS = 60 * 1000; // a refused token is not asked about again for this long
 const MODELS_TTL_MS = 15 * 60 * 1000;
@@ -123,6 +124,7 @@ function cors(req, env) {
     h["access-control-allow-origin"] = origin;
     h["access-control-allow-methods"] = "GET, POST, DELETE, OPTIONS";
     h["access-control-allow-headers"] = "authorization, content-type";
+    h["access-control-expose-headers"] = "x-git-status, x-git-type";
     h["access-control-max-age"] = "86400";
   }
   return h;
@@ -405,6 +407,25 @@ export function answerText(r) {
   return modelText(r).replace(/<think>[\s\S]*?<\/think>/gi, "").replace(/<think>[\s\S]*$/i, "").trim();
 }
 
+/// A model's completion made fit to insert: no code fence, no repeat of the line being typed, nothing that runs
+/// on into what is already after the cursor, a dozen lines at most.
+export function tidyCompletion(text, prefix, suffix) {
+  let t = String(text ?? "");
+  const fence = /^\s*```[\w-]*\r?\n([\s\S]*?)(?:\r?\n```\s*$|$)/.exec(t);
+  if (fence) t = fence[1];
+  const line = prefix.slice(prefix.lastIndexOf("\n") + 1);
+  if (line.trim()) {
+    if (t.startsWith(line)) t = t.slice(line.length);
+    else if (t.trimStart().startsWith(line.trimStart())) t = t.trimStart().slice(line.trimStart().length);
+  }
+  const next = suffix.trimStart().split("\n")[0].trim();
+  if (next.length > 3) {
+    const i = t.indexOf(next);
+    if (i >= 0) t = t.slice(0, i);
+  }
+  return t.split("\n").slice(0, 12).join("\n").trimEnd();
+}
+
 /// What a job's reply asks for: {tool, args, cut?}, {broken}, or null when it is the answer.
 export function parseAction(reply, known) {
   return toolCall(reply, known);
@@ -461,6 +482,7 @@ export default {
     } catch (e) {
       r = bad("veil-web error: " + clip(e?.message ?? e, 300), 500);
     }
+    if (r.status === 101) return r; // a WebSocket, handed over as it is
     const h = new Headers(r.headers);
     for (const [k, v] of Object.entries(headers)) h.set(k, v);
     return new Response(r.body, { status: r.status, headers: h });
@@ -471,6 +493,7 @@ export default {
 
 export class Harness {
   constructor(state, env) {
+    this.state = state;
     this.store = state.storage;
     this.env = env;
     this.authed = new Map(); // sha256(token) -> {account, sub, until}
@@ -1259,7 +1282,92 @@ export class Harness {
     };
   }
 
+  // ---------------------------------------------------------------- the socket (suggestions for the editor)
+
+  /// A WebSocket for the page's editor. A browser cannot send a login header with one, so the socket is taken
+  /// first and its FIRST message must be the login: until then it is answered nothing. Sockets hibernate, so an
+  /// idle one costs the account nothing.
+  socket(req) {
+    if (new URL(req.url).pathname !== "/v1/socket") return bad("not found", 404);
+    if (this.state.getWebSockets().length >= SOCKETS_MAX) return bad("too many open sockets", 429);
+    const pair = new WebSocketPair();
+    this.state.acceptWebSocket(pair[1]);
+    pair[1].serializeAttachment({ url: req.url, ok: false });
+    return new Response(null, { status: 101, webSocket: pair[0] });
+  }
+
+  async webSocketMessage(ws, data) {
+    let m;
+    try {
+      m = JSON.parse(typeof data === "string" ? data : new TextDecoder().decode(data));
+    } catch {
+      return ws.close(4400, "not JSON");
+    }
+    const att = ws.deserializeAttachment() ?? {};
+    try {
+      if (!att.ok) {
+        const who = await this.owner(new Request(att.url, { headers: { authorization: "Bearer " + String(m?.auth ?? "") } }));
+        if (!who) return ws.close(4401, "unauthorized");
+        ws.serializeAttachment({ ...att, ok: true });
+        return ws.send(JSON.stringify({ hello: VERSION }));
+      }
+      if (m?.op === "complete") return ws.send(JSON.stringify({ id: m.id, ...(await this.complete(m)) }));
+      ws.send(JSON.stringify({ id: m?.id, err: "unknown op" }));
+    } catch (e) {
+      try {
+        ws.send(JSON.stringify({ id: m?.id, err: clip(e?.message ?? e, 200) }));
+      } catch {}
+    }
+  }
+
+  webSocketClose(ws) {
+    try {
+      ws.close();
+    } catch {}
+  }
+
+  /// What a model would type next at the caret: {text}, or {text: "", why} when the day's limit is spent.
+  async complete(b) {
+    const prefix = String(b?.prefix ?? "").slice(-6000);
+    const suffix = String(b?.suffix ?? "").slice(0, 1500);
+    const model = String(b?.model ?? "");
+    if (!model.startsWith("@") || !prefix.trim()) return { text: "" };
+    const why = await this.spent(true);
+    if (why) return { text: "", why };
+    const reply = await this.model(model, [
+      { role: "system", content: "You complete code inside an editor. You are given the text BEFORE the cursor and the text AFTER it. Reply with ONLY the text to insert at the cursor: no explanation, no code fence, nothing that is already before or after the cursor. Finish the statement or the small block being typed, a dozen lines at most. If nothing should be inserted, reply with an empty line." },
+      { role: "user", content: `File: ${clip(String(b?.path ?? ""), 200)}\n<before>\n${prefix}</before>\n<after>\n${suffix}</after>` },
+    ], 192);
+    return { text: tidyCompletion(reply, prefix, suffix) };
+  }
+
+  /// One git smart-HTTP request, passed on for the page's clone, fetch or push: a browser cannot make it itself
+  /// (git hosts send no CORS headers). Only the three git endpoints of a public https host are reached.
+  async git(body) {
+    let u;
+    try {
+      u = new URL(String(body.url ?? ""));
+    } catch {
+      return bad("url is not a URL");
+    }
+    const service = u.searchParams.get("service") ?? "";
+    const refs = u.pathname.endsWith("/info/refs") && (service === "git-upload-pack" || service === "git-receive-pack");
+    const rpc = u.pathname.endsWith("/git-upload-pack") || u.pathname.endsWith("/git-receive-pack");
+    if (u.protocol !== "https:" || privateHost(u.hostname) || !(refs || rpc)) return bad("only git's own endpoints on a public https host are reached");
+    const method = rpc ? "POST" : "GET";
+    const headers = { "user-agent": "git/veil-web" };
+    for (const k of ["accept", "content-type", "git-protocol", "authorization"]) {
+      const v = body.headers?.[k];
+      if (typeof v === "string" && v.length < 4000) headers[k] = v;
+    }
+    const sent = rpc ? Uint8Array.from(atob(String(body.body ?? "")), (c) => c.charCodeAt(0)) : undefined;
+    const r = await fetch(u.toString(), { method, headers, body: sent, redirect: "follow", signal: AbortSignal.timeout(120000) });
+    await this.spend(0, (sent?.length ?? 0) + (Number(r.headers.get("content-length")) || 0));
+    return new Response(r.body, { status: 200, headers: { "content-type": "application/octet-stream", "x-git-status": String(r.status), "x-git-type": r.headers.get("content-type") ?? "", "cache-control": "no-store" } });
+  }
+
   async route(req) {
+    if ((req.headers.get("upgrade") ?? "").toLowerCase() === "websocket") return this.socket(req);
     const who = await this.owner(req);
     if (!who) return bad("unauthorized: log in with the Cloudflare account that owns this Worker", 401);
     const url = new URL(req.url);
@@ -1433,6 +1541,9 @@ export class Harness {
       if (m !== "tools/list" && m !== "tools/call") return bad("method must be tools/list or tools/call");
       return say({ ok: true, text: await this.garrettCall(m, body.params && typeof body.params === "object" ? body.params : {}, body.query) });
     }
+
+    if (method === "POST" && at === "complete") return say({ ok: true, ...(await this.complete(body)) });
+    if (method === "POST" && at === "git") return this.git(body);
 
     if (method === "POST" && at === "clef") {
       const why = await this.spent(true);
