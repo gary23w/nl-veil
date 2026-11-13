@@ -28,6 +28,15 @@
 //   - SCHEDULES: a task that queues itself as a job every so often.
 //   - CHATS: the page's conversations and their files, kept here so every browser the owner logs in from (and
 //     anything else holding their login) sees the same ones.
+//   - PICTURES: the account's image models make one from words, or from words and pictures; its vision models
+//     read one back into words. Which image models there are and what each takes (a size, steps, guidance, a
+//     seed, a negative prompt, a picture to start from, a mask, reference pictures) is read from the account:
+//     the model list, and each model's own input schema. A setting is sent only to a model whose schema names
+//     it. Nothing is decided by a model's name. No picture is kept here: one comes in and goes out as base64.
+//     WHICH model: a request may name one, or leave it to the harness ("auto"). The harness then takes the best
+//     working one the account has NOW for that kind of work (make, change, repaint under a mask, read): working
+//     before failing, staying before retiring, newer before older, by how each has done when asked. When it
+//     fails the next is tried. So as Cloudflare adds and retires models, nothing here has to be changed.
 //   - WHAT IT KNOWS ABOUT ITS MAKER: a daily read of garrettstimpson.ca/llms.txt, cut down to what is about
 //     Agent Garrett and the veil, handed to the model as reference.
 //
@@ -64,6 +73,16 @@
 //   POST python/enable (re-upload this Worker with the LOADER binding) | python/run {code, files?, args?, packages?}
 //   POST garrett {key} or {url, token} (neither forgets it) | garrett/call {method, params}
 //   GET  models                 the account's Workers AI text models
+//   GET  image/models[?fresh=1] the account's image models, each with what it takes, and its vision models:
+//                               {models: [{id, about, form, schema, prompt_max, negative, width, height, steps,
+//                               guidance, strength, seed, init, mask, refs, ref_px, beta, partner, retires, terms,
+//                               price, created, health}], vision: [{id, about, how, health}],
+//                               order: {make, edit, inpaint, look: [ids, best first]}, picks: {the first of each}}
+//   (in the two below, model may be "auto" or left out: the harness chooses, and says which in `model`)
+//   POST image                  {model, prompt, negative?, width?, height?, steps?, guidance?, seed?, strength?,
+//                               images?: [data: URL, ..] (to start from, or to take after), mask?: data: URL}
+//                               ->  {image (base64), type, model}
+//   POST look                   {model, image: data: URL, question?}  ->  {text, model}
 //   GET  schedules   POST schedules {task, model, every_s}   DELETE schedules/<id>
 //   GET  convs | convs/<id>     POST convs/<id> {title, at, msgs, files}   DELETE convs/<id>
 //   GET  context                the reference text the model is handed (llms.txt digest)
@@ -74,7 +93,7 @@
 // No imports and no platform globals beyond fetch/Response/crypto, so a test can run this file under node with
 // a Map for storage and a scripted env.AI.
 
-export const VERSION = "13";
+export const VERSION = "14";
 const API_ROOT = "https://api.cloudflare.com/client/v4";
 const PY_SOURCE = "https://raw.githubusercontent.com/gary23w/nl-veil/main/cloud/tot_py.py";
 const SELF_SCRIPT = "veil-web";
@@ -127,6 +146,18 @@ const LLMS_DIGEST_MAX = 3500;
 export const SCHEDULES_MAX = 12;
 export const IMAGE_BYTES_MAX = 6 * MB; // one picture sent in (as base64 text, so about 4.5 MB of image)
 export const IMAGE_INPUTS_MAX = 4; // pictures one request may send in
+const IMAGE_CATALOG_TTL_MS = 6 * 3600 * 1000; // the image models and what each takes are asked of Cloudflare this often
+const IMAGE_PROMPT_MAX = 8000; // characters of a prompt, when the model's own schema names no limit
+const MODEL_REST_MS = 6 * 3600 * 1000; // a model whose last calls failed is passed over this long, then tried again
+const RETIRE_SOON_MS = 30 * 86400 * 1000; // a model Cloudflare retires within this long is chosen after the ones that stay
+const AUTO_TRIES = 3; // models one request may go through when the harness does the choosing
+const HEALTH_MAX = 64; // models whose record of working or failing is kept
+// a refusal that is about the request (its words, its pictures), not about the model: no other model is tried for it
+const REQUEST_REFUSAL = /flagged|safety|nsfw|content policy|could not be read|must be|say what/i;
+// A model whose input schema is a single `multipart` field takes a form, and the schema says nothing of the
+// form's fields. These are the ones Cloudflare's changelog documents for its multipart image models (FLUX.2,
+// 2025-11-25 and 2026-01-28): width and height 256 to 1920, and up to four input pictures of 512 px at the most.
+const MULTIPART_IMAGE = { width: { min: 256, max: 1920, def: 1024 }, height: { min: 256, max: 1920, def: 768 }, refs: 4, ref_px: 512 };
 export const SWARMS_MAX = 8; // swarms kept, running or ended
 export const SWARM_WORKERS_MAX = 6; // tasks one cycle hands out
 export const SWARM_CYCLES_MAX = 40; // cycles one swarm may take
@@ -476,6 +507,95 @@ async function pictureOut(r) {
   const b64 = bytes ? toBase64(bytes) : String(r?.image ?? r?.result?.image ?? r?.images?.[0] ?? r?.data?.[0]?.b64_json ?? "");
   const pic = pictureFrom(b64);
   return pic ? { b64: pic.b64, type: pic.type } : null;
+}
+
+/// Every property a model's input schema names, whichever of its alternative forms (oneOf, anyOf) names it.
+export function schemaProps(input) {
+  const out = {};
+  const walk = (s, depth) => {
+    if (!s || typeof s !== "object" || depth > 3) return;
+    for (const [k, v] of Object.entries(s.properties ?? {})) if (v && typeof v === "object") out[k] ??= v;
+    for (const alt of [...(Array.isArray(s.oneOf) ? s.oneOf : []), ...(Array.isArray(s.anyOf) ? s.anyOf : [])]) walk(alt, depth + 1);
+  };
+  walk(input, 0);
+  return out;
+}
+
+const propOf = (m, id) => (Array.isArray(m?.properties) ? m.properties.find((p) => p?.property_id === id)?.value : undefined);
+
+/// The models of `list` in the order the harness would choose them, best first. Nothing here knows a model's
+/// name: one that is working is put before one whose last calls failed (`health`), one that stays before one
+/// Cloudflare retires soon, one the caller leads with (`lead`), a finished one before a beta, a newer one before
+/// an older. A model past its retirement date is left out. So when Cloudflare's list changes, the choice follows.
+export function rankModels(list, health, now) {
+  const today = dayOf(now);
+  const soon = dayOf(now + RETIRE_SOON_MS);
+  const failing = (id) => {
+    const h = health?.[id];
+    return !!h && h.streak >= (h.ok > 0 ? 2 : 1) && now - h.at < MODEL_REST_MS;
+  };
+  const key = (m) => [failing(m.id) ? 0 : 1, m.retires && m.retires <= soon ? 0 : 1, Number(m.lead) || 0, m.beta ? 0 : 1, String(m.created ?? "")];
+  return list
+    .filter((m) => !(m.retires && m.retires <= today))
+    .map((m) => ({ m, k: key(m) }))
+    .sort((a, b) => {
+      for (let i = 0; i < a.k.length; i++) if (a.k[i] !== b.k[i]) return a.k[i] < b.k[i] ? 1 : -1;
+      return a.m.id.localeCompare(b.m.id);
+    })
+    .map((x) => x.m);
+}
+
+/// One image model as the page is told of it: what it takes, and within what limits. Built from the model's row
+/// in the account's list and its input schema. `schema: false` when Cloudflare gave no schema for it (how it
+/// wants to be asked is then learned by asking). Nothing here is decided by the model's name.
+export function imageSpec(m, input) {
+  const P = schemaProps(input);
+  const multipart = !!P.multipart && !P.prompt;
+  const num = (k) => {
+    const p = P[k];
+    if (!p || (p.type !== "integer" && p.type !== "number")) return null;
+    const n = (x) => (x !== null && x !== undefined && x !== "" && Number.isFinite(Number(x)) ? Number(x) : null);
+    return { key: k, int: p.type === "integer", min: n(p.minimum), max: n(p.maximum), def: n(p.default) };
+  };
+  const price = propOf(m, "price");
+  const spec = {
+    id: m.name,
+    about: clip(String(m.description ?? "").trim(), 400),
+    created: clip(String(m.created_at ?? ""), 30),
+    form: multipart ? "multipart" : "json",
+    schema: Object.keys(P).length > 0,
+    prompt_max: Number(P.prompt?.maxLength) || IMAGE_PROMPT_MAX,
+    negative: !!P.negative_prompt,
+    width: num("width"),
+    height: num("height"),
+    steps: num("num_steps") ?? num("steps"),
+    guidance: num("guidance"),
+    strength: num("strength"),
+    seed: !!P.seed,
+    init: P.image_b64 ? "image_b64" : P.image ? "image" : "",
+    mask: !!P.mask,
+    refs: 0,
+    ref_px: 0,
+    beta: String(propOf(m, "beta")) === "true",
+    partner: String(propOf(m, "partner")) === "true",
+    retires: clip(String(propOf(m, "planned_deprecation_date") ?? ""), 20),
+    terms: clip(String(propOf(m, "terms") ?? ""), 300),
+    info: clip(String(propOf(m, "info") ?? ""), 300),
+    price: (Array.isArray(price) ? price : []).slice(0, 4).map((x) => ({ unit: clip(String(x?.unit ?? ""), 60), price: Number(x?.price) || 0, currency: clip(String(x?.currency ?? ""), 8) })),
+  };
+  if (multipart) {
+    const F = MULTIPART_IMAGE;
+    Object.assign(spec, {
+      width: { key: "width", int: true, ...F.width },
+      height: { key: "height", int: true, ...F.height },
+      steps: { key: "steps", int: true, min: 1, max: null, def: null },
+      guidance: { key: "guidance", int: false, min: null, max: null, def: null },
+      seed: true,
+      refs: F.refs,
+      ref_px: F.ref_px,
+    });
+  }
+  return spec;
 }
 
 /// A model's completion made fit to insert: no code fence, no repeat of the line being typed, nothing that runs
@@ -1344,49 +1464,187 @@ export class Harness {
 
   // ---------------------------------------------------------------- images
 
-  /// The account's image models (Workers AI's Text-to-Image list), kept a while.
+  /// The account's image models (Workers AI's Text-to-Image list), each with what it takes, read from its own
+  /// input schema; and the account's vision models. Kept a while; `fresh` asks Cloudflare again now.
+  async imageCatalog(who, fresh = false) {
+    const kept = await this.store.get("image_catalog");
+    if (kept?.v === 2 && !fresh && Date.now() - kept.at < IMAGE_CATALOG_TTL_MS) return kept;
+    const rows = async (task) => {
+      const j = await this.api(who.token, "GET", `/accounts/${who.account}/ai/models/search?task=${encodeURIComponent(task)}&hide_experimental=true&per_page=100`);
+      return (Array.isArray(j?.result) ? j.result : []).filter((m) => typeof m?.name === "string" && m.name.startsWith("@"));
+    };
+    const schema = async (m) => m.schema?.input ?? (await this.api(who.token, "GET", `/accounts/${who.account}/ai/models/schema?model=${encodeURIComponent(m.name)}`))?.result?.input ?? null;
+    const [makers, lookers, texts] = await Promise.all([rows("Text-to-Image"), rows("Image-to-Text"), rows("Text Generation")]);
+    if (makers.length === 0) return kept?.v === 2 ? kept : { v: 2, at: 0, models: [], vision: [] };
+    const models = (await Promise.all(makers.map(async (m) => imageSpec(m, await schema(m))))).sort((a, b) => a.id.localeCompare(b.id));
+    // A vision model is one that can be shown a picture and asked about it in words. The account's list also
+    // marks models that read pictures to another end (decisions, typed values): each one's schema says which
+    // it is, and how it is asked ("" = not a model to ask about a picture; no schema at all = try it).
+    const lookShape = (input) => {
+      const P = schemaProps(input);
+      if (Object.keys(P).length === 0) return "parts";
+      return Array.isArray(P.task?.enum) && P.question ? "skill" : P.messages ? "parts" : P.image && P.prompt ? "bytes" : "";
+    };
+    const seen = new Set();
+    const vision = (await Promise.all([...lookers, ...texts.filter((m) => String(propOf(m, "vision")) === "true")]
+      .filter((m) => !seen.has(m.name) && seen.add(m.name))
+      .map(async (m) => ({ id: m.name, about: clip(String(m.description ?? "").trim(), 160), how: lookShape(await schema(m)), created: clip(String(m.created_at ?? ""), 30), beta: String(propOf(m, "beta")) === "true", retires: clip(String(propOf(m, "planned_deprecation_date") ?? ""), 20), dedicated: lookers.includes(m) }))))
+      .filter((v) => v.how)
+      .sort((a, b) => a.id.localeCompare(b.id));
+    const now = { v: 2, at: Date.now(), models, vision };
+    await this.store.put("image_catalog", now);
+    return now;
+  }
+
   async imageModels(who) {
-    const kept = await this.store.get("image_models");
-    if (kept && Date.now() - kept.at < MODELS_TTL_MS) return kept.list;
-    const j = await this.api(who.token, "GET", `/accounts/${who.account}/ai/models/search?task=Text-to-Image&hide_experimental=true&per_page=100`);
-    const list = (Array.isArray(j?.result) ? j.result : []).filter((m) => typeof m?.name === "string" && m.name.startsWith("@")).map((m) => ({ id: m.name, about: clip(String(m.description ?? ""), 160) })).sort((a, b) => a.id.localeCompare(b.id));
-    if (list.length === 0) return kept?.list ?? [];
-    await this.store.put("image_models", { at: Date.now(), list });
-    return list;
+    return (await this.imageCatalog(who)).models;
+  }
+
+  /// The catalog as the page is told it: a model that was found, by asking, not to take a picture to start from
+  /// (whatever its schema says) is listed without that.
+  /// and with the harness's own choice for each kind of work (`picks`: the first of each `order`), made from the
+  /// models listed now and how each has done when asked.
+  async imageCatalogNow(who, fresh) {
+    const cat = await this.imageCatalog(who, fresh);
+    const quirks = (await this.store.get("quirks")) ?? {};
+    const health = (await this.store.get("model_health")) ?? {};
+    const now = Date.now();
+    const brief = (id) => (health[id] ? { ok: health[id].ok, fail: health[id].fail, streak: health[id].streak, ms: health[id].ms, err: health[id].err } : null);
+    const models = cat.models.map((m) => ({ ...(quirks[m.id]?.init === false ? { ...m, init: "", mask: false, strength: null } : m), health: brief(m.id) }));
+    const ids = (list) => rankModels(list, health, now).map((m) => m.id);
+    const order = {
+      make: ids(models),
+      edit: ids(models.filter((m) => m.init || m.refs > 0)),
+      inpaint: ids(models.filter((m) => m.init && m.mask)),
+      // to read a picture: one that has answered before, then one made for it, then the rest
+      look: ids(cat.vision.map((v) => ({ ...v, lead: health[v.id]?.ok > 0 ? 2 : v.dedicated ? 1 : 0 }))),
+    };
+    return { ...cat, models, vision: cat.vision.map((v) => ({ ...v, health: brief(v.id) })), order, picks: Object.fromEntries(Object.entries(order).map(([k, v]) => [k, v[0] ?? ""])) };
+  }
+
+  /// How a model did when it was asked: what the choosing goes by.
+  async noteModel(model, ok, ms, err) {
+    const all = (await this.store.get("model_health")) ?? {};
+    const h = all[model] ?? { ok: 0, fail: 0, streak: 0, ms: 0, err: "", at: 0 };
+    if (ok) Object.assign(h, { ok: h.ok + 1, streak: 0, ms: h.ms ? Math.round(h.ms * 0.7 + ms * 0.3) : ms, err: "" });
+    else Object.assign(h, { fail: h.fail + 1, streak: h.streak + 1, err: clip(err, 200) });
+    h.at = Date.now();
+    all[model] = h;
+    const names = Object.keys(all);
+    if (names.length > HEALTH_MAX) delete all[names.reduce((a, b) => (all[a].at <= all[b].at ? a : b))];
+    await this.store.put("model_health", all);
+  }
+
+  /// A request that names a model is that model's to answer. One that names none (or "auto") is the harness's to
+  /// place: the best working model the account has now for this kind of work, and the next one when that fails.
+  /// When every one fails and the list is not fresh, Cloudflare is asked for its list again and the new ones tried.
+  async chosen(body, who, kind, one) {
+    const asked = String(body.model ?? "").trim();
+    const run = async (model) => {
+      const t0 = Date.now();
+      const got = await one({ ...body, model });
+      const theirs = !!got.err && REQUEST_REFUSAL.test(got.err);
+      // a refusal of the request says nothing of the model; nor does learning that it takes no start picture
+      if (!theirs && !/does not take a picture to start from/.test(got.err ?? "")) await this.noteModel(model, !got.err, Date.now() - t0, got.err ?? "");
+      return { got, theirs };
+    };
+    if (asked && asked !== "auto") return (await run(asked)).got;
+    const tried = [];
+    for (const fresh of [false, true]) {
+      const cat = await this.imageCatalogNow(who, fresh);
+      const order = cat.order[kind].filter((id) => !tried.some((t) => t.model === id)).slice(0, AUTO_TRIES);
+      for (const model of order) {
+        const { got, theirs } = await run(model);
+        if (!got.err) return { ...got, auto: true, tried };
+        if (theirs) return got;
+        tried.push({ model, err: got.err });
+      }
+      if (Date.now() - cat.at < 10 * 60 * 1000) break; // the list is fresh: there is nothing newer to try
+    }
+    const what = { make: "makes pictures", edit: "takes a picture to work from", inpaint: "repaints a masked part of a picture", look: "reads pictures" }[kind];
+    if (!tried.length) return { err: `none of your account's models ${what}` };
+    return { err: "no model answered. " + tried.map((t) => `${t.model.split("/").pop()}: ${t.err}`).join(" | ") };
+  }
+
+  image(body, who) {
+    const pictures = Array.isArray(body.images) ? body.images.length : body.image ? 1 : 0;
+    return this.chosen(body, who, body.mask ? "inpaint" : pictures ? "edit" : "make", (b) => this.imageOne(b));
+  }
+
+  look(body, who) {
+    return this.chosen(body, who, "look", (b) => this.lookOne(b));
   }
 
   /// One picture from words, or from words and pictures (an edit, or a new picture that takes after them).
-  /// HOW a model wants to be asked differs (plain fields, or a form with the pictures in it) and is LEARNED, never
-  /// read off the model's name: the plain way is tried first unless pictures are sent, and what worked is kept.
-  async image(body) {
+  /// HOW a model wants to be asked differs (plain fields, or a form with the pictures in it). It is never read off
+  /// the model's name: the model's own schema says (the catalog), and a setting is sent only to a model whose
+  /// schema names it, under the name the schema gives it. For a model with no schema the plain way is tried first
+  /// unless pictures are sent, the common settings go along, and what worked is kept.
+  async imageOne(body) {
     const model = String(body.model ?? "");
-    const prompt = clip(String(body.prompt ?? "").trim(), 2048);
+    const spec = ((await this.store.get("image_catalog"))?.models ?? []).find((m) => m.id === model) ?? null;
+    const known = spec?.schema === true;
+    const prompt = clip(String(body.prompt ?? "").trim(), spec?.prompt_max ?? 2048);
     if (!model.startsWith("@")) return { err: "model must be a Workers AI model id" };
     if (!prompt) return { err: "say what the picture should show" };
     const sent = (Array.isArray(body.images) ? body.images : body.image ? [body.image] : []).slice(0, IMAGE_INPUTS_MAX);
     const pics = sent.map(pictureFrom);
     if (pics.some((x) => !x)) return { err: "an input picture could not be read: send PNG, JPEG, WebP or GIF as a data: URL, each under about 4 MB" };
-    const int = (v, lo, hi) => (Number.isFinite(Number(v)) && v !== null && v !== "" ? Math.min(hi, Math.max(lo, Math.floor(Number(v)))) : undefined);
-    const opts = { width: int(body.width, 256, 2048), height: int(body.height, 256, 2048), steps: int(body.steps, 1, 50), seed: int(body.seed, 0, 2 ** 31 - 1) };
-    for (const k of Object.keys(opts)) if (opts[k] === undefined) delete opts[k];
+    const mask = body.mask ? pictureFrom(body.mask) : null;
+    if (body.mask && !mask) return { err: "the mask could not be read: send it as a PNG data: URL" };
+    // a number as the model's schema bounds it (or, with no schema, as most models do)
+    const num = (v, d, lo, hi, whole) => {
+      if (v === null || v === undefined || v === "" || !Number.isFinite(Number(v))) return undefined;
+      const x = Math.min(d?.max ?? hi, Math.max(d?.min ?? lo, lo, Number(v)));
+      return whole ? Math.floor(x) : x;
+    };
+    const opts = {}; // as plain fields, under the schema's own names
+    const formOpts = {}; // as form fields
+    const put = (k, v) => {
+      if (v === undefined) return;
+      opts[k] = v;
+      formOpts[k === "num_steps" ? "steps" : k] = v;
+    };
+    if (!known || (spec.width && spec.height)) {
+      put("width", num(body.width, spec?.width, 256, 2048, true));
+      put("height", num(body.height, spec?.height, 256, 2048, true));
+    }
+    if (!known || spec.steps) put(spec?.steps?.key ?? "steps", num(body.steps, spec?.steps, 1, 50, true));
+    if (known && spec.guidance) put("guidance", num(body.guidance, spec.guidance, 0, 30, false));
+    if (!known || spec.seed) put("seed", num(body.seed, null, 0, 2 ** 31 - 1, true));
+    const negative = clip(String(body.negative ?? body.negative_prompt ?? "").trim(), 2000);
+    if (known && spec.negative && negative) opts.negative_prompt = negative;
+    // the picture to start from, how far to move from it, and the part of it to paint again
+    const edit = {};
+    if (pics.length) {
+      if (spec?.init === "image") edit.image = [...pics[0].bytes];
+      else edit.image_b64 = pics[0].b64;
+      const strength = num(body.strength, null, 0, 1, false);
+      if (known && spec.strength && strength !== undefined) edit.strength = strength;
+      if (mask && known && spec.mask) edit.mask = [...mask.bytes];
+    }
     const quirks = (await this.store.get("quirks")) ?? {};
     const asForm = async () => {
       const form = new FormData();
       form.append("prompt", prompt);
-      for (const [k, v] of Object.entries(opts)) form.append(k, String(v));
+      for (const [k, v] of Object.entries(formOpts)) form.append(k, String(v));
       pics.forEach((pic, i) => form.append("input_image_" + i, new Blob([pic.bytes], { type: pic.type }), "input_" + i + "." + pic.type.split("/")[1]));
       const req = new Request("http://form.invalid/", { method: "POST", body: form });
       return this.env.AI.run(model, { multipart: { body: req.body, contentType: req.headers.get("content-type") } });
     };
-    const asFields = () => this.env.AI.run(model, { prompt, ...opts, ...(pics.length ? { image_b64: pics[0].b64 } : {}) });
-    const order = quirks[model]?.form === true || (pics.length > 0 && quirks[model]?.form !== false) ? [asForm, asFields] : [asFields, asForm];
+    const asFields = () => this.env.AI.run(model, { prompt, ...opts, ...edit });
+    // A model whose schema is known is asked the one way its schema names, so a refusal is the model's own
+    // answer. (Nothing learned overrides a schema: a model can accept a form and still refuse what is in it.)
+    // One with no schema is asked both ways, the way that worked before first.
+    const formFirst = known ? spec.form === "multipart" : (quirks[model]?.form ?? pics.length > 0);
+    const order = known ? [formFirst ? asForm : asFields] : formFirst ? [asForm, asFields] : [asFields, asForm];
     let out = null, why = "";
     for (const ask of order) {
       try {
         out = await pictureOut(await ask());
         if (out) {
           const form = ask === asForm;
-          if (quirks[model]?.form !== form) {
+          if (!known && quirks[model]?.form !== form) {
             quirks[model] = { ...quirks[model], form };
             await this.store.put("quirks", quirks);
           }
@@ -1394,15 +1652,22 @@ export class Harness {
         }
         why = why || "the model answered without a picture";
       } catch (e) {
-        why = clip(e?.message ?? e, 300);
+        why = (why ? why + " | " : "") + clip(e?.message ?? e, 300); // every way's refusal, in the order they were tried
       }
+    }
+    // A model whose schema names a picture to start from, and which then answers that it has no such input:
+    // remembered, so the catalog stops offering it, and said plainly.
+    if (!out && pics.length && /image`? is not present in the model/.test(why)) {
+      quirks[model] = { ...quirks[model], init: false };
+      await this.store.put("quirks", quirks);
+      why = "this model does not take a picture to start from, whatever its schema says (its own words: " + why + ")";
     }
     await this.spend(1, prompt.length + pics.reduce((n, x) => n + x.bytes.length, 0) + (out ? out.b64.length : 0));
     return out ? { image: out.b64, type: out.type, model } : { err: "no picture came back: " + why };
   }
 
   /// A vision model's answer about one picture.
-  async look(body) {
+  async lookOne(body) {
     const model = String(body.model ?? "");
     if (!model.startsWith("@")) return { err: "model must be a Workers AI model id" };
     const pic = pictureFrom(body.image);
@@ -1410,16 +1675,23 @@ export class Harness {
     const question = clip(String(body.question ?? "").trim(), 4000) || "Describe this picture in detail, for someone who cannot see it. Copy any text in it exactly.";
     const url = `data:${pic.type};base64,${pic.b64}`;
     const quirks = (await this.store.get("quirks")) ?? {};
-    // the chat shape with the picture as a part of the message; and the older shape, a prompt beside the bytes
-    const asParts = async () => answerText(await this.env.AI.run(model, { messages: [{ role: "user", content: [{ type: "text", text: question }, { type: "image_url", image_url: { url } }] }], max_tokens: 1024 }));
-    const asBytes = async () => answerText(await this.env.AI.run(model, { prompt: question, image: [...pic.bytes], max_tokens: 1024 }));
-    const order = quirks[model]?.look === "bytes" ? [asBytes, asParts] : [asParts, asBytes];
+    // the chat shape with the picture as a part of the message; the older shape, a prompt beside the bytes; and
+    // the shape of a model that is asked for a skill (a task, a picture, a question). Their answers come back
+    // under different names too.
+    const said = (r) => answerText(r) || String(r?.description ?? r?.answer ?? r?.caption ?? r?.result?.description ?? r?.result?.answer ?? r?.result?.caption ?? "").trim();
+    const asParts = async () => said(await this.env.AI.run(model, { messages: [{ role: "user", content: [{ type: "text", text: question }, { type: "image_url", image_url: { url } }] }], max_tokens: 1024 }));
+    const asBytes = async () => said(await this.env.AI.run(model, { prompt: question, image: [...pic.bytes], max_tokens: 1024 }));
+    const asSkill = async () => said(await this.env.AI.run(model, { task: "query", image: url, question, reasoning: false }));
+    const asSkillBytes = async () => said(await this.env.AI.run(model, { task: "query", image: [...pic.bytes], question, reasoning: false })); // the same, for a host that wants the picture as bytes
+    const ways = [["parts", asParts], ["bytes", asBytes], ["skill", asSkill], ["skillbytes", asSkillBytes]];
+    // first the shape that answered before; else the one this model's schema names (the catalog)
+    const first = quirks[model]?.look ?? ((await this.store.get("image_catalog"))?.vision ?? []).find((v) => v.id === model)?.how;
+    const order = [...ways.filter(([k]) => k === first), ...ways.filter(([k]) => k !== first)];
     let text = "", why = "";
-    for (const ask of order) {
+    for (const [how, ask] of order) {
       try {
         text = await ask();
         if (text) {
-          const how = ask === asBytes ? "bytes" : "parts";
           if (quirks[model]?.look !== how) {
             quirks[model] = { ...quirks[model], look: how };
             await this.store.put("quirks", quirks);
@@ -1428,7 +1700,7 @@ export class Harness {
         }
         why = why || "the model answered nothing";
       } catch (e) {
-        why = clip(e?.message ?? e, 300);
+        why = (why ? why + " | " : "") + how + ": " + clip(e?.message ?? e, 200); // every shape's refusal, in the order they were tried
       }
     }
     await this.spend(1, pic.bytes.length + question.length + text.length);
@@ -2064,12 +2336,12 @@ export class Harness {
     if (method === "POST" && at === "git") return this.git(body);
 
     // Images: make one, look at one. (The body is JSON; a picture travels as a data: URL.)
-    if (method === "GET" && at === "image/models") return say({ ok: true, models: await this.imageModels(who) });
+    if (method === "GET" && at === "image/models") return say({ ok: true, ...(await this.imageCatalogNow(who, url.searchParams.get("fresh") === "1")) });
     if (method === "POST" && (at === "image" || at === "look")) {
       if (!this.env.AI) return bad("this Worker has no AI binding", 500);
       const why = await this.spent(true);
       if (why) return bad(why, 429);
-      const got = at === "image" ? await this.image(body) : await this.look(body);
+      const got = at === "image" ? await this.image(body, who) : await this.look(body, who);
       return got.err ? bad(got.err, /could not be read|must be|say what/.test(got.err) ? 400 : 502) : say({ ok: true, ...got });
     }
 
