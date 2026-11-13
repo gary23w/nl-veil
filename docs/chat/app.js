@@ -1026,6 +1026,24 @@ const CRITIQUE_CLEF_QUESTION =
 
 const clefOn = () => ls.get('veilweb.clef', true) && !!S.status?.clef;
 
+/* A model that never calls: asked for work, it pastes code or says what it would do. */
+const IDLE_CLEF_QUESTION =
+  'Did the user ask for something to be DONE with tools (a file written or changed in the workspace, a script ' +
+  'run, a page fetched, a search made, a job queued), while the reply did none of it and only showed text or ' +
+  'code? Answer no when the user only asked a question, asked for an explanation, or asked to be shown a snippet.';
+const CLEF_IDLE = 0.6;   // a wrong yes costs one more model call, so this asks for less than a correction does
+
+/* The probability that a reply given with no tool run left asked-for work undone, or null. */
+async function clefIdle(userText, reply, signal) {
+  try {
+    const state = 'THE USER ASKED:\n' + clip(userText, 8000) + '\n\nTHE REPLY (no tool ran this turn):\n' + clip(reply, 12000);
+    const j = await harnessJson('/v1/clef', { body: { state, questions: [IDLE_CLEF_QUESTION] }, signal });
+    return Array.isArray(j.probs) ? j.probs[0] : null;
+  } catch {
+    return null;
+  }
+}
+
 /* The probability that the answer has a material problem, or null when clef has no usable answer. */
 async function clefReview(userText, answer, rounds, signal) {
   const record = rounds.length
@@ -1253,7 +1271,7 @@ async function runTurn(text) {
   S.live = { tools: [], text: '', status: 'thinking…', abort };
   draw();
   const rounds = [];
-  let answer = '', error = '', review = null, nudged = false;
+  let answer = '', error = '', review = null, nudged = false, idled = false;
   const record = (name, args, say, result, raw) => rounds.push({ id: 'c' + (rounds.length + 1), name, args, say, result, ...(raw ? { raw } : {}) });
   try {
     for (let n = 0; ; n++) {
@@ -1272,6 +1290,17 @@ async function runTurn(text) {
           nudged = true;
           record('(answer before the plan was done)', {}, '', `The plan still has ${open.length} open step(s):\n${planText(conv.plan)}\nCarry on with the next open step now. If a step cannot be done, say plainly why and tick the ones that are done.`, clip(reply, 1500));
           continue;
+        }
+        // an answer with no tool run at all, to a request for work: clef decides, and it is sent back once
+        if (!rounds.length && !idled && clefOn()) {
+          idled = true;
+          S.live.status = 'checking that the work was done (clef)…';
+          drawLive();
+          const p = await clefIdle(text, reply, abort.signal);
+          if (p !== null && p >= CLEF_IDLE) {
+            record('(answer without doing the work)', {}, '', 'No tool has run this turn, so nothing was written, run, fetched or searched. Do what the user asked now, with a tool call: exactly ONE JSON object {"tool": "<name>", "args": {...}} and nothing else. Code belongs in a file (write_file), not in the answer.', clip(reply, 1500));
+            continue;
+          }
         }
         answer = lastReply.cut ? reply + '\n\n*(This answer was cut off at the reply limit. Ask me to continue.)*' : reply;
         break;
