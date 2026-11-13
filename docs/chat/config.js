@@ -13,7 +13,7 @@ window.VEIL_WEB = {
   deploy_url: "https://deploy.workers.cloudflare.com/?url=https://github.com/gary23w/nl-veil/tree/main/cloud/veil-web",
   script: "veil-web",
   /* The harness version this page was written for. An older one is offered its update. */
-  harness_version: 10,
+  harness_version: 11,
 
   /* Suggestions in the editor come from the first of these the account has; else from the chat's model. */
   complete_models: ["@cf/qwen/qwen2.5-coder-32b-instruct"],

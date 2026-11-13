@@ -170,6 +170,7 @@ const S = {
   filter: '',                            // the explorer's find-a-file text
   search: null,                          // the last search inside the files: {q, hits, note}
   gitOpen: ui.gitOpen === true,          // the explorer's git strip is unfolded
+  pyHere: false,                         // packages were installed into this tab's Python: runs stay here
   goto: 0,                               // a line the editor should go to when it next opens a file
   explorer: ui.explorer !== false,       // the explorer column is showing
   preview: false,                        // false: source; 'split': source beside its preview; true: preview only
@@ -868,6 +869,7 @@ const TOOLS = {
   swarm: { args: '{"task": "<the question>", "angles": ["<a way to look at it>", "..."]}', does: 'ask up to ' + SWARM_MAX + ' minds at once, one per angle, and get every answer back to weigh' },
   queue_job: { args: '{"task": "<the whole task, self-contained>"}', does: 'hand a long task to the worker harness; it runs there in turn (first in, first out) even with this tab closed, and the user reads the result in the Jobs tab' },
   schedule_job: { args: '{"task": "<the whole task, self-contained>", "every_minutes": 60}', does: 'have the harness queue this task again and again, every so many minutes (5 at the least)', when: () => !outdated() },
+  run_command: { args: '{"command": "<one line>"}', does: 'run a line in the workspace terminal and get what it printed: ls, cat, grep, find, head, tail, mv, cp, rm, mkdir, python file.py, pip install name, node file.js, curl url, git status|commit|push (a clone). It is a browser tab, not a computer: no npm, apt or compilers' },
   run_python: { args: '{"code": "<python>"}', does: 'run a Python script; the workspace files are beside it and text files it creates or changes come back into the workspace. Print what you want to see' },
   garrett_tools: { args: '{"query": "<words, optional>"}', does: 'list Agent Garrett\'s security tools (those matching the words)', when: () => S.status?.garrett?.connected },
   garrett: { args: '{"name": "<tool>", "args": {...}}', does: 'call one of Agent Garrett\'s tools', when: () => S.status?.garrett?.connected },
@@ -943,6 +945,14 @@ async function runToolInner(name, args, signal) {
       const from = Math.min(lines.length, Math.max(1, Math.floor(Number(args.from ?? args.start ?? 1)) || 1));
       const to = Math.max(from, Math.min(lines.length, from + READ_LINES - 1, asked !== undefined ? Math.floor(Number(asked)) || from : Infinity));
       return `${f}, lines ${from}-${to} of ${lines.length}${repo.partial.has(f) ? ' loaded (the file is larger: only its first part is loaded)' : ''}:\n` + lines.slice(from - 1, to).join('\n') + (to < lines.length ? `\n(more below: read on with "from": ${to + 1})` : '');
+    }
+    case 'run_command': {
+      const line = String(args.command ?? args.cmd ?? args.line ?? '').trim();
+      if (!line) return 'error: command is empty';
+      termPrint('veil $ ' + line, 'in');
+      const r = await termRun(line, signal);
+      if (r.out) termPrint(r.out, r.ok ? 'out' : 'err');
+      return (r.ok ? '' : 'error: ') + (r.out || '(no output)');
     }
     case 'find_files': {
       const hits = findPaths(String(args.query ?? args.pattern ?? args.name ?? ''), 80);
@@ -1042,7 +1052,7 @@ async function runToolInner(name, args, signal) {
       // in the harness when it has a Python runtime of its own, otherwise right here in the browser
       const code = String(args.code ?? args.script ?? '');
       if (!code.trim()) return 'error: run_python needs the script, as {"tool": "run_python", "args": {"code": "print(1)"}}';
-      const run = S.status?.python?.worker ? (await harnessJson('/v1/python/run', { body: { code, files }, signal })).run : await pyBrowser.run(code, files);
+      const run = S.status?.python?.worker && !S.pyHere ? (await harnessJson('/v1/python/run', { body: { code, files }, signal })).run : await pyBrowser.run(code, files);
       for (const [n, c] of Object.entries(run.files ?? {})) if (typeof c === 'string') files[fileName(n)] = c;
       return (run.ok ? '' : 'error: ') + (run.out || '(no output)');
     }
@@ -1880,6 +1890,27 @@ const completer = (() => {
   let timer = 0;
   let shown = null;            // {text} the suggestion on screen
   let latest = 0;
+  /* BUFFERS. A suggestion that came back is kept under the text it was asked for, so the same place asks
+     nobody twice; the one on screen stays while what is typed follows it; and the last piece the model wrote
+     into each file is remembered, so asking again for the same request replaces it instead of adding a copy. */
+  const KEPT_MAX = 300;
+  const sugg = new Map();        // where it was asked -> the suggestion
+  const wrote = new Map();       // where it was asked -> what was written (ghostwriting)
+  const lastWrite = new Map();   // file -> {ask, text}: the block the last write left in it
+  let held = null;               // {name, at, text}: the suggestion on screen, and where in the file it starts
+  let quiet = false;             // the keystroke that took a suggestion asks for no new one
+  const keep = (map, k, v) => { map.delete(k); map.set(k, v); if (map.size > KEPT_MAX) map.delete(map.keys().next().value); };
+  const keyOf = (name, before, after) => name + '\u0000' + before.slice(-800) + '\u0000' + after.slice(0, 120);
+  /* A suggestion worth showing: not empty, and not a repeat of what is already around the caret. */
+  const fresh = (text, before, after) => {
+    const t = text.trim();
+    if (!t) return false;
+    if (before.trimEnd().endsWith(t) || after.trimStart().startsWith(t)) return false;
+    const lines = t.split('\n').map((l) => l.trim()).filter((l) => l.length > 3);
+    const near = new Set(before.split('\n').slice(-80).map((l) => l.trim()));
+    if (lines.length >= 2) return lines.filter((l) => near.has(l)).length < Math.ceil(lines.length * 0.6);
+    return !(lines.length === 1 && before.split('\n').slice(-4).some((l) => l.trim() === lines[0]));
+  };
   const on = () => ls.get('veilweb.complete', true) && !!S.status && Number(S.status.version) >= 9 && !S.live;
   const model = () => (CFG.complete_models ?? []).find((m) => S.models.some((x) => x.id === m)) ?? S.model;
 
@@ -1932,6 +1963,7 @@ const completer = (() => {
     ghost.style.top = (c.line - 1) * c.lh + 'px';
     ghost.replaceChildren(h('span', { class: 'pad' }, c.lineText), h('span', { class: 'g' }, first), rest.length ? h('span', { class: 'g more' }, rest.join('\n')) : null);
     shown = { text };
+    held = { name: c.name, at: c.at, text };
   };
 
   /* ---- ghostwriting: a comment that asks for code, then Ctrl+Enter, and the model writes it in place ---- */
@@ -1964,6 +1996,10 @@ const completer = (() => {
     let start = ta.selectionStart + (at - c.at);
     if (start < 0 || start > ta.value.length) return toast('Scroll the request into view first.');
     const lead = req ? '\n' : '';
+    // the block the last write left under this same request is replaced, not added to
+    const prev = lastWrite.get(name);
+    const again = !!(prev && req && prev.ask === req.ask && prev.text && c.doc.slice(at, at + prev.text.length) === prev.text);
+    const wk = keyOf(name + '\u0000' + (req?.ask ?? ''), c.doc.slice(0, at), c.doc.slice(again ? at + prev.text.length : at));
     const abort = new AbortController();
     writing = abort;
     ta.readOnly = true;
@@ -1971,19 +2007,22 @@ const completer = (() => {
     const dot = document.getElementById('completeDot');
     const label = dot?.textContent;
     if (dot) { dot.textContent = '✦ writing… Esc stops'; dot.classList.add('busy'); }
-    let len = 0;
+    let len = again ? prev.text.length : 0, final = '';
     const put = (text) => {
       const clean = lead + text.replace(/^\s*```[\w.+-]*[ \t]*\r?\n/, '').replace(/\r?\n```\s*$/, '');
       ta.setRangeText(clean, start, start + len, 'end');
       len = clean.length;
+      final = clean;
       changed(true);
     };
     try {
-      const reply = await callModel([
+      // asked before, here, with the same text around it (and not asking for another go): the buffer answers
+      const reply = !again && wrote.has(wk) ? wrote.get(wk) : await callModel([
         { role: 'system', content: 'You write code straight into a file that is open in an editor. Reply with ONLY the text to insert at the cursor: no explanation before or after, no code fence. Write in the language and the style of the file. ' + (req ? 'The comment just before the cursor asks for something: write the complete code that does it, and do not repeat the comment.' : 'Carry on from the cursor: finish what is being written there.') },
         { role: 'user', content: `File: ${name}\n<before>\n${c.doc.slice(Math.max(0, at - 8000), at)}</before>\n<after>\n${c.doc.slice(at, at + 2000)}</after>` + (req ? `\n\nThe request: ${req.ask}` : '') },
       ], (t) => { if (!abort.signal.aborted && t) put(t); }, abort.signal, 4096);
-      if (reply && !abort.signal.aborted) put(reply);
+      if (reply && !abort.signal.aborted) { put(reply); keep(wrote, wk, reply); }
+      if (final) lastWrite.set(name, { ask: req?.ask ?? '', text: final });
     } catch (e) {
       if (!abort.signal.aborted) toast('Not written: ' + e.message);
     }
@@ -2003,8 +2042,18 @@ const completer = (() => {
     /* After a keystroke: a pause in the typing, at the end of a line, asks for a suggestion. */
     typed(ta, ghost, name, context) {
       if (writing) return;
+      const was = held;
       drop(ghost);
       if (!on() || ta.readOnly || ta.selectionStart !== ta.selectionEnd) return;
+      if (quiet) { quiet = false; return; }
+      {
+        // typed along the suggestion that was showing: the rest of it stays, and nobody is asked
+        const c = context();
+        const k = was && was.name === name ? c.at - was.at : 0;
+        if (k > 0 && k < was.text.length && c.doc.slice(was.at, c.at) === was.text.slice(0, k)) {
+          return show(ghost, was.text.slice(k), { ...c, name, lineText: c.doc.slice(c.doc.lastIndexOf('\n', c.at - 1) + 1, c.at) });
+        }
+      }
       const mine = ++latest;
       timer = setTimeout(async () => {
         const c = context();
@@ -2019,13 +2068,19 @@ const completer = (() => {
           return;
         }
         if (after.trim().replace(/[)\]}'"`;,]/g, '') || c.doc.slice(Math.max(0, c.at - 400), c.at).trim().length < 3) return;   // only at the end of a line, with something to go on
-        const dot = document.getElementById('completeDot');
-        if (dot) dot.classList.add('busy');
-        const got = await ask({ model: model(), path: name, prefix: c.doc.slice(Math.max(0, c.at - 4000), c.at), suffix: c.doc.slice(c.at, c.at + 1000) });
-        if (dot) dot.classList.remove('busy');
+        const before = c.doc.slice(Math.max(0, c.at - 4000), c.at), next = c.doc.slice(c.at, c.at + 1000);
+        const k = keyOf(name, before, next);
+        let text = sugg.get(k);
+        if (text === undefined) {
+          const dot = document.getElementById('completeDot');
+          if (dot) dot.classList.add('busy');
+          const got = await ask({ model: model(), path: name, prefix: before, suffix: next });
+          if (dot) dot.classList.remove('busy');
+          text = String(got?.text ?? '');
+          if (!got?.err) keep(sugg, k, text);
+        }
         if (mine !== latest || !ghost.isConnected || document.activeElement !== ta) return;   // the typing moved on
-        const text = String(got?.text ?? '');
-        if (text.trim()) show(ghost, text, { ...c, lineText });
+        if (fresh(text, before, next)) show(ghost, text, { ...c, name, lineText });
       }, 380);
     },
     /* Tab takes the suggestion on screen, Escape drops it. True when the key was used up. */
@@ -2041,6 +2096,8 @@ const completer = (() => {
         e.preventDefault();
         const text = shown.text;
         drop(ghost);
+        held = null;
+        quiet = true;   // what was just taken is not answered with the same again
         ta.setRangeText(text, ta.selectionStart, ta.selectionEnd, 'end');
         changed();
         return true;
@@ -2287,6 +2344,334 @@ function gitPanel() {
       h('div', { class: 'git-who' }, field('gitName', 'veilweb.git.name', 'Your name, for commits'), field('gitEmail', 'veilweb.git.email', 'Your email, for commits'),
         field('gitToken', '', 'Git token (private repos, push)', 'password')),
       h('p', { class: 'fine' }, 'The token stays in this tab\'s memory and goes only to your harness, then the git host.')));
+}
+
+/* ============================================================ terminal: a command line over the workspace */
+
+/* The Code tab's own command line. A browser tab has no operating system under it, so this is not bash: it is a
+   small shell that works on THIS workspace (the chat's files, or the folder or clone that is open) with what a
+   tab and your harness can really run: file commands, Python (your harness's runtime, or Pyodide in this tab,
+   where pip installs pure-Python packages), JavaScript in a worker, curl through your harness, and git for a
+   clone. Nothing here reaches your computer's own shell. The model has the same line as the run_command tool. */
+const term = {
+  open: ui.term === true,
+  cwd: '',            // a folder of the workspace, '' the top
+  lines: [],          // [{kind: 'in' | 'out' | 'err', text}]
+  history: ls.get('veilweb.term.history', []),
+  at: -1,             // where the up arrow is in the history
+  busy: false,
+};
+const TERM_LINES_MAX = 2000;
+
+const termPrint = (text, kind = 'out') => {
+  for (const line of String(text).replace(/\n$/, '').split('\n')) term.lines.push({ kind, text: line });
+  if (term.lines.length > TERM_LINES_MAX) term.lines.splice(0, term.lines.length - TERM_LINES_MAX);
+};
+
+/* A path as the user typed it, made whole against the current folder. */
+const termPath = (p = '') => {
+  const parts = [];
+  for (const seg of (p.startsWith('/') ? p : term.cwd + '/' + p).split('/')) {
+    if (!seg || seg === '.') continue;
+    if (seg === '..') parts.pop(); else parts.push(seg);
+  }
+  return parts.join('/');
+};
+const termAll = () => (repo.on() ? repo.paths : Object.keys(S.conv.files).sort());
+const termIsDir = (p) => p === '' || termAll().some((f) => f.startsWith(p + '/'));
+const termIsFile = (p) => (repo.on() ? repoHas(p) : p in S.conv.files);
+const termRead = async (p) => {
+  if (!termIsFile(p)) throw new Error(`${p || '.'}: no such file`);
+  if (repo.on()) await repoLoad(p);
+  return S.conv.files[p];
+};
+const termWrite = async (p, text) => {
+  const out = await runTool('write_file', { name: p, content: text });
+  if (/^error/.test(out)) throw new Error(out.replace(/^error:\s*/, ''));
+};
+/* One folder's entries: [name, isDir]. */
+const termList = (dir) => {
+  const prefix = dir ? dir + '/' : '';
+  const seen = new Map();
+  for (const f of termAll()) {
+    if (!f.startsWith(prefix)) continue;
+    const rest = f.slice(prefix.length), cut = rest.indexOf('/');
+    seen.set(cut < 0 ? rest : rest.slice(0, cut), cut >= 0);
+  }
+  return [...seen].sort((a, b) => Number(b[1]) - Number(a[1]) || a[0].localeCompare(b[0]));
+};
+
+/* A line cut into words: quotes keep spaces, a backslash keeps the next character. */
+function termWords(line) {
+  const out = [];
+  let cur = '', quote = '', had = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (quote) { if (ch === quote) quote = ''; else if (ch === '\\' && quote === '"' && i + 1 < line.length) cur += line[++i]; else cur += ch; continue; }
+    if (ch === '"' || ch === "'") { quote = ch; had = true; continue; }
+    if (ch === '\\' && i + 1 < line.length) { cur += line[++i]; continue; }
+    if (/\s/.test(ch)) { if (cur || had) out.push(cur); cur = ''; had = false; continue; }
+    if (ch === '|' || ch === '>') { if (cur || had) out.push(cur); cur = ''; had = false; if (ch === '>' && line[i + 1] === '>') { out.push('>>'); i++; } else out.push(ch); continue; }
+    cur += ch;
+  }
+  if (cur || had) out.push(cur);
+  return out;
+}
+
+const TERM_HELP = `Files      ls [-l] [dir] · cd dir · pwd · cat file · head/tail [-n N] file · touch file · mkdir dir · rm [-r] path
+           mv from to · cp from to · find [text] · grep [-i] [-n] text [path] · wc file · open file · echo text
+Run        python file.py | python -c "code"   (your harness's Python, or Pyodide in this tab)
+           pip install name                     (pure-Python packages, into this tab's Python)
+           node file.js | node -e "code"        (JavaScript in a worker of this tab; no npm modules)
+Network    curl [-o file] url                   (through your harness)
+Git        git status | add | commit -m "msg" | log | pull | push | branch | clone url   (a cloned repo)
+Other      clear · help · history · date · whoami
+Joining    cmd | grep text · cmd | head -n N · cmd | tail -n N · cmd | wc -l · cmd > file · cmd >> file
+This is not your computer's shell: npm, apt, gcc, docker and the like cannot run in a browser tab.`;
+
+/* JavaScript in a worker of its own: console output comes back, the workspace's loaded files are in \`files\`. */
+function termJs(code) {
+  return new Promise((res) => {
+    const src = `const __out=[];const __fmt=(a)=>a.map((x)=>typeof x==='string'?x:(()=>{try{return JSON.stringify(x)}catch{return String(x)}})()).join(' ');
+for (const k of ['log','info','warn','error','debug']) console[k]=(...a)=>__out.push(__fmt(a));
+onmessage=async(e)=>{const files=e.data.files;try{const r=await (new (Object.getPrototypeOf(async function(){}).constructor)('files',e.data.code))(files);if(r!==undefined)__out.push(__fmt([r]));postMessage({ok:true,out:__out.join('\\n')})}catch(err){postMessage({ok:false,out:__out.concat(String(err&&err.stack||err)).join('\\n')})}};`;
+    let w;
+    try { w = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' }))); } catch (e) { return res({ ok: false, out: 'this browser could not start a worker: ' + e.message }); }
+    const timer = setTimeout(() => { w.terminate(); res({ ok: false, out: 'stopped: the script ran for more than 20 seconds' }); }, 20000);
+    w.onmessage = (e) => { clearTimeout(timer); w.terminate(); res(e.data); };
+    w.onerror = (e) => { clearTimeout(timer); w.terminate(); res({ ok: false, out: String(e.message || 'the script failed to load') }); };
+    w.postMessage({ code, files: S.conv.files });
+  });
+}
+
+/* One command (no pipes): its output as text. Throws with the message a shell would print. */
+async function termCommand(argv, signal) {
+  const [cmd, ...args] = argv;
+  const flags = new Set(args.filter((a) => /^-[a-zA-Z]+$/.test(a)).flatMap((a) => [...a.slice(1)]));
+  const rest = args.filter((a) => !/^-[a-zA-Z]+$/.test(a));
+  const count = (def) => { const i = args.indexOf('-n'); return i >= 0 ? Math.max(1, Number(args[i + 1]) || def) : def; };
+  const operands = () => { const i = args.indexOf('-n'); return args.filter((a, k) => !/^-[a-zA-Z]+$/.test(a) && !(i >= 0 && k === i + 1)); };
+  switch (cmd) {
+    case 'help': return TERM_HELP;
+    case 'clear': term.lines = []; return '';
+    case 'pwd': return '/' + term.cwd;
+    case 'date': return new Date().toString();
+    case 'whoami': return S.me?.email || S.me?.account_name || 'you';
+    case 'history': return term.history.map((h, i) => `${String(i + 1).padStart(4)}  ${h}`).join('\n');
+    case 'echo': return args.join(' ');
+    case 'cd': {
+      const to = termPath(rest[0] ?? '/');
+      if (!termIsDir(to)) throw new Error(`cd: ${rest[0]}: no such folder`);
+      term.cwd = to;
+      return '';
+    }
+    case 'ls': {
+      const dir = termPath(rest[0] ?? '');
+      if (termIsFile(dir)) return dir.split('/').pop();
+      if (!termIsDir(dir)) throw new Error(`ls: ${rest[0]}: no such file or folder`);
+      const rows = termList(dir);
+      if (!flags.has('l')) return rows.map(([n, d]) => n + (d ? '/' : '')).join('  ');
+      return rows.map(([n, d]) => (d ? 'd ' : '- ') + (d ? '' : String((S.conv.files[(dir ? dir + '/' : '') + n] ?? '').length || '').padStart(8)).padEnd(8) + ' ' + n + (d ? '/' : '')).join('\n');
+    }
+    case 'cat': {
+      if (!rest.length) throw new Error('cat: which file?');
+      const texts = [];
+      for (const f of rest) texts.push(await termRead(termPath(f)));
+      return texts.join('\n');
+    }
+    case 'head': case 'tail': {
+      const f = operands()[0];
+      if (!f) throw new Error(cmd + ': which file?');
+      const lines = (await termRead(termPath(f))).split('\n');
+      return (cmd === 'head' ? lines.slice(0, count(10)) : lines.slice(-count(10))).join('\n');
+    }
+    case 'wc': {
+      const text = await termRead(termPath(rest[0] ?? ''));
+      return flags.has('l') ? String(text.split('\n').length) : `${text.split('\n').length} lines, ${text.split(/\s+/).filter(Boolean).length} words, ${text.length} characters  ${rest[0]}`;
+    }
+    case 'touch': {
+      for (const f of rest) if (!termIsFile(termPath(f))) await termWrite(termPath(f), '');
+      return '';
+    }
+    case 'mkdir': {
+      for (const d of rest) if (!termIsDir(termPath(d))) await termWrite(termPath(d) + '/.keep', '');
+      return '';
+    }
+    case 'rm': {
+      if (!rest.length) throw new Error('rm: which file?');
+      for (const f of rest) {
+        const p = termPath(f);
+        const targets = termIsFile(p) ? [p] : termIsDir(p) && p ? (flags.has('r') ? termAll().filter((x) => x.startsWith(p + '/')) : (() => { throw new Error(`rm: ${f} is a folder (use rm -r)`); })()) : (() => { throw new Error(`rm: ${f}: no such file`); })();
+        for (const t of [...targets]) { const out = await runTool('delete_file', { name: t }); if (/^error/.test(out)) throw new Error(out); }
+      }
+      return '';
+    }
+    case 'cp': case 'mv': {
+      if (rest.length !== 2) throw new Error(`${cmd}: give a source and a destination`);
+      const from = termPath(rest[0]);
+      let to = termPath(rest[1]);
+      if (termIsDir(to) && to !== from) to = (to ? to + '/' : '') + from.split('/').pop();
+      await termWrite(to, await termRead(from));
+      if (cmd === 'mv') await runTool('delete_file', { name: from });
+      return '';
+    }
+    case 'find': {
+      const q = (rest.at(-1) ?? '').replace(/^\*|\*$/g, '');
+      const under = term.cwd ? term.cwd + '/' : '';
+      const hits = termAll().filter((f) => f.startsWith(under) && f.toLowerCase().includes(q.toLowerCase()));
+      return hits.slice(0, 500).join('\n') + (hits.length > 500 ? `\n… ${hits.length - 500} more` : '');
+    }
+    case 'grep': {
+      if (!rest.length) throw new Error('grep: what text?');
+      const target = rest[1] !== undefined ? termPath(rest[1]) : term.cwd;
+      const one = rest[1] !== undefined && termIsFile(target);
+      if (one) {
+        const needle = flags.has('i') ? rest[0].toLowerCase() : rest[0];
+        return (await termRead(target)).split('\n').map((l, i) => [i + 1, l]).filter(([, l]) => (flags.has('i') ? l.toLowerCase() : l).includes(needle)).map(([n, l]) => (flags.has('n') ? n + ':' : '') + l).join('\n');
+      }
+      const r = await searchText(rest[0], { dir: target, max: 200, signal });
+      return r.hits.map((x) => `${x.path}:${x.line}: ${x.text}`).join('\n') + (r.stopped ? `\n(${r.stopped})` : '');
+    }
+    case 'open': {
+      const p = termPath(rest[0] ?? '');
+      if (!termIsFile(p)) throw new Error(`open: ${rest[0]}: no such file`);
+      await showFile(p);
+      return '';
+    }
+    case 'python': case 'python3': case 'py': {
+      let code;
+      if (flags.has('c')) code = args[args.indexOf('-c') + 1] ?? '';
+      else if (rest[0]) code = await termRead(termPath(rest[0]));
+      else throw new Error('python: give a file, or -c "code"');
+      return runTool('run_python', { code }, signal);
+    }
+    case 'pip': case 'pip3': {
+      if (rest[0] !== 'install' || !rest[1]) throw new Error('pip: only "pip install name" is here');
+      const r = await pyBrowser.run(`import micropip\nawait micropip.install(${JSON.stringify(rest.slice(1))})\nprint("installed: " + ", ".join(${JSON.stringify(rest.slice(1))}))`, {});
+      if (!r.ok) throw new Error(r.out.trim() || 'the install failed');
+      S.pyHere = true;   // what was installed lives in this tab's Python: later runs use it
+      return r.out.trim() + '\n(into this tab\'s Python; it lasts until the tab is reloaded)';
+    }
+    case 'node': case 'js': {
+      let code;
+      if (flags.has('e')) code = args[args.indexOf('-e') + 1] ?? '';
+      else if (rest[0]) code = await termRead(termPath(rest[0]));
+      else throw new Error('node: give a file, or -e "code"');
+      const r = await termJs(code);
+      if (!r.ok) throw new Error(r.out);
+      return r.out;
+    }
+    case 'curl': {
+      const url = rest.find((a) => /^https?:\/\//.test(a));
+      if (!url) throw new Error('curl: give an http(s) address');
+      const out = await runTool('http_request', { url, method: 'GET' }, signal);
+      const o = args.indexOf('-o');
+      if (o >= 0 && args[o + 1]) { await termWrite(termPath(args[o + 1]), out.replace(/^HTTP \d+ [^\n]*\n\n/, '')); return `saved to ${args[o + 1]}`; }
+      return out;
+    }
+    case 'git': {
+      const sub = rest[0];
+      if (sub === 'clone') { if (!rest[1]) throw new Error('git clone: give the repository\'s https address'); await gitClone(rest[1]); return repo.on() ? `cloned into ${repo.name}` : ''; }
+      if (!repo.on()) throw new Error('git: no repository is open (git clone <address>, or Clone repo)');
+      if (repo.kind === 'disk') { if (sub === 'branch' || sub === 'status') return `on ${repo.branch || '(no branch)'}\n(this is a folder on your computer: commit and push with your own git there)`; throw new Error('git: this folder is on your computer; use your own git there'); }
+      if (sub === 'status') { await gitChanges(); return `on ${repo.branch}\n` + (gitx.changes.length ? gitx.changes.map((c) => `  ${c.state.padEnd(8)} ${c.path}`).join('\n') : 'nothing has changed since the last commit'); }
+      if (sub === 'add') return 'every change is taken by git commit here';
+      if (sub === 'commit') { const m = args.indexOf('-m'); if (m < 0 || !args[m + 1]) throw new Error('git commit: give -m "message"'); await gitCommit(args[m + 1]); return gitx.note; }
+      if (sub === 'push') { await gitPush(); return gitx.note; }
+      if (sub === 'pull') { await gitPull(); return gitx.note; }
+      if (sub === 'branch') return '* ' + repo.branch;
+      if (sub === 'log') { const git = await gitLib(); return (await git.log({ fs: gitFs(repo.root), dir: '/', depth: 10 })).map((c) => `${c.oid.slice(0, 8)}  ${c.commit.message.split('\n')[0]}  (${c.commit.author.name})`).join('\n'); }
+      throw new Error(`git: "${sub ?? ''}" is not here (status, commit, push, pull, log, branch, clone)`);
+    }
+    case undefined: return '';
+    default:
+      throw new Error(`${cmd}: not available here. This line runs inside your browser tab and your harness, not on a computer's own shell: type help for what it can do.`);
+  }
+}
+
+/* A whole line: commands joined by | (the filters), with > or >> a file at the end. Resolves {ok, out}. */
+async function termRun(line, signal) {
+  const words = termWords(line.trim());
+  let redirect = null;
+  const r = words.findIndex((w) => w === '>' || w === '>>');
+  if (r >= 0) { redirect = { append: words[r] === '>>', file: words[r + 1] }; words.splice(r); }
+  const stages = [[]];
+  for (const w of words) { if (w === '|') stages.push([]); else stages.at(-1).push(w); }
+  try {
+    if (redirect && !redirect.file) throw new Error('a file name is missing after >');
+    let out = await termCommand(stages[0], signal);
+    for (const st of stages.slice(1)) {
+      const lines = String(out).replace(/\n$/, '').split('\n');
+      const n = (() => { const i = st.indexOf('-n'); return i >= 0 ? Math.max(1, Number(st[i + 1]) || 10) : 10; })();
+      if (st[0] === 'grep') { const ci = st.includes('-i'); const needle = st.filter((a) => !a.startsWith('-'))[1] ?? ''; out = lines.filter((l) => (ci ? l.toLowerCase().includes(needle.toLowerCase()) : l.includes(needle))).join('\n'); }
+      else if (st[0] === 'head') out = lines.slice(0, n).join('\n');
+      else if (st[0] === 'tail') out = lines.slice(-n).join('\n');
+      else if (st[0] === 'wc') out = String(out ? lines.length : 0);
+      else if (st[0] === 'sort') out = lines.sort().join('\n');
+      else throw new Error(`| ${st[0] ?? ''}: only grep, head, tail, wc and sort can follow a |`);
+    }
+    if (redirect) {
+      const p = termPath(redirect.file);
+      await termWrite(p, (redirect.append && termIsFile(p) ? (await termRead(p)).replace(/\n?$/, '\n') : '') + out + '\n');
+      out = '';
+    }
+    return { ok: true, out: String(out ?? '') };
+  } catch (e) {
+    return { ok: false, out: e.message || String(e) };
+  }
+}
+
+/* A line typed at the prompt. */
+async function termEnter(line) {
+  if (term.busy || !line.trim()) return;
+  term.history = [...term.history.filter((h) => h !== line), line].slice(-200);
+  ls.set('veilweb.term.history', term.history);
+  term.at = -1;
+  termPrint((term.cwd ? '/' + term.cwd : '~') + ' $ ' + line, 'in');
+  term.busy = true;
+  drawTerm();
+  const r = await termRun(line);
+  term.busy = false;
+  if (r.out) termPrint(r.out, r.ok ? 'out' : 'err');
+  drawSide();
+  queueMicrotask(() => document.getElementById('termIn')?.focus());
+}
+
+function drawTerm() {
+  const old = document.getElementById('term');
+  if (old) old.replaceWith(termPanel());
+  const box = document.getElementById('termOut');
+  if (box) box.scrollTop = box.scrollHeight;
+}
+
+/* The panel under the editor: a bar that folds it, what was printed, and the prompt. */
+function termPanel() {
+  const toggle = () => { term.open = !term.open; ui.term = term.open; saveUi(); drawSide(); if (term.open) queueMicrotask(() => document.getElementById('termIn')?.focus()); };
+  const bar = h('button', { class: 'term-bar', 'aria-expanded': String(term.open), title: 'Terminal (Ctrl+`)', onclick: toggle },
+    h('span', { 'aria-hidden': 'true' }, term.open ? '▾' : '▸'), ' Terminal', h('span', { class: 'grow' }), term.busy ? h('span', { class: 'fine' }, 'running…') : h('span', { class: 'fine' }, term.open ? '' : (term.cwd ? '/' + term.cwd : '~')));
+  const head = h('div', { class: 'term-head' }, bar, term.open ? h('button', { class: 'term-size', title: 'Make the terminal ' + (ui.termTall ? 'smaller' : 'larger'), onclick: () => { ui.termTall = !ui.termTall; saveUi(); drawSide(); } }, ui.termTall ? 'Smaller' : 'Larger') : null);
+  if (!term.open) return h('div', { class: 'term shut', id: 'term' }, head);
+  const out = h('div', { class: 'term-out', id: 'termOut', role: 'log', 'aria-live': 'polite', onclick: () => { if (!String(getSelection())) document.getElementById('termIn')?.focus(); } },
+    term.lines.length ? term.lines.map((l) => h('div', { class: 'term-line ' + l.kind }, l.text || ' ')) : h('div', { class: 'term-line fine' }, 'A command line over this workspace. Type help.'));
+  const input = h('input', { id: 'termIn', type: 'text', class: 'term-in', 'aria-label': 'Command', autocomplete: 'off', autocapitalize: 'off', spellcheck: 'false', disabled: term.busy,
+    onkeydown: (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); const v = e.target.value; e.target.value = ''; termEnter(v); }
+      else if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
+        e.preventDefault();
+        const n = term.history.length;
+        if (!n) return;
+        term.at = e.key === 'ArrowUp' ? (term.at < 0 ? n - 1 : Math.max(0, term.at - 1)) : (term.at < 0 || term.at >= n - 1 ? -1 : term.at + 1);
+        e.target.value = term.at < 0 ? '' : term.history[term.at];
+      } else if (e.key === 'l' && e.ctrlKey) { e.preventDefault(); term.lines = []; drawTerm(); document.getElementById('termIn')?.focus(); }
+      else if (e.key === 'Tab') {
+        e.preventDefault();   // the file or folder name being typed is finished
+        const v = e.target.value, word = v.split(/\s+/).pop() ?? '';
+        const dir = word.includes('/') ? word.slice(0, word.lastIndexOf('/')) : '', stem = word.slice(word.lastIndexOf('/') + 1);
+        const hits = termList(termPath(dir)).filter(([n]) => n.startsWith(stem));
+        if (hits.length === 1) e.target.value = v.slice(0, v.length - stem.length) + hits[0][0] + (hits[0][1] ? '/' : ' ');
+      }
+    } });
+  return h('div', { class: 'term' + (ui.termTall ? ' tall' : ''), id: 'term' }, head, out, h('div', { class: 'term-prompt' }, h('span', { class: 'term-cwd' }, (term.cwd ? '/' + term.cwd : '~') + ' $'), input));
 }
 
 /* ============================================================ the loop */
@@ -3250,6 +3635,7 @@ function codeTab() {
           h('span', { class: 'badge lang-' + langKey(ext(writing.name)), 'aria-hidden': 'true' }, BADGE[langKey(ext(writing.name))] ?? '·'), h('span', { class: 'name' }, writing.name.split('/').pop()), h('span', { class: 'dot', 'aria-hidden': 'true' }))),
         h('div', { class: 'ide-bar' }, h('span', { class: 'crumbs' }, writing.name.split('/').flatMap((part, i, all) => [i ? h('span', { class: 'sep', 'aria-hidden': 'true' }, '›') : null, h('span', { class: i === all.length - 1 ? 'here' : '' }, part)])), h('span', { class: 'fine' }, 'the veil is writing…')),
         h('div', { class: 'ide-body' }, streamNode(writing)),
+        termPanel(),
         h('div', { class: 'ide-status' }, h('span', {}, LANGS[ext(writing.name)] ?? 'Plain text'), h('span', { id: 'streamCount' }, writing.text.split('\n').length + ' lines'), h('span', { class: 'grow' }), h('span', {}, 'writing')))
     : open === null
     ? h('div', { class: 'ide-empty' }, h('p', {}, names.length ? 'Pick a file from the explorer.' : 'Code the veil writes shows up here as it is written. You can edit it, preview a web page beside it, and download it.'),
@@ -3271,11 +3657,12 @@ function codeTab() {
         h('div', { class: 'ide-body' + (S.preview === 'split' ? ' split' : '') },
           S.preview === true ? null : editorNode(open, status),
           S.preview ? previewNode(open) : null),
+        termPanel(),
         h('div', { class: 'ide-status' }, inRepo && repo.branch ? h('span', { title: 'The branch the folder is on' }, '⎇ ' + repo.branch) : null, h('span', {}, LANGS[ext(open)] ?? LANGS[langOfName(open)] ?? 'Plain text'), h('span', {}, S.conv.files[open].split('\n').length.toLocaleString() + ' lines'),
           repo.partial.has(open) ? h('span', { title: 'Too large to edit here' }, `first ${(REPO_TEXT_MAX / 1048576).toFixed(0)} MB of ${(repo.partial.get(open) / 1048576).toFixed(1)} MB · read-only`) : null, status, h('span', { class: 'grow' }),
           Number(S.status?.version) >= 9 ? h('button', { class: 'status-btn', id: 'completeDot', 'aria-pressed': String(ls.get('veilweb.complete', true)), title: 'Suggestions as you type, from your harness: Tab takes one, Escape drops it. Ctrl+Enter writes what a comment asks for, right under it.', onclick: () => { ls.set('veilweb.complete', !ls.get('veilweb.complete', true)); if (!ls.get('veilweb.complete', true)) completer.close(); drawSide(); } }, ls.get('veilweb.complete', true) ? '✦ Suggestions on' : '✧ Suggestions off') : null,
           h('span', {}, indentOf(open) === '\t' ? 'Tabs' : 'Spaces: ' + indentOf(open).length), h('span', {}, 'UTF-8')));
-  return [h('div', { class: 'ide' + (S.explorer ? '' : ' no-exp') }, explorer, main)];
+  return [h('div', { class: 'ide' + (S.explorer ? '' : ' no-exp') }, explorer, open === null && !writing ? h('div', { class: 'ide-col' }, main, termPanel()) : main)];
 }
 
 /* ---- side pane: Jobs (the harness's FIFO queue and its schedules) ---- */
@@ -3536,6 +3923,14 @@ function splitter() {
   return el;
 }
 
+document.addEventListener('keydown', (e) => {
+  if (e.key !== '`' || !(e.ctrlKey || e.metaKey) || !S.status) return;
+  e.preventDefault();   // Ctrl+`: the terminal, as in an editor
+  S.tab = 'code'; term.open = !term.open; ui.term = term.open;
+  drawSide();
+  if (term.open) queueMicrotask(() => document.getElementById('termIn')?.focus());
+});
+
 function sidePane() {
   const tab = (id, label) => h('button', { class: S.tab === id ? 'on' : '', role: 'tab', 'aria-selected': String(S.tab === id), onclick: () => { S.tab = id; S.note = ''; drawSide(); if (id === 'jobs') refreshJobs(); if (id === 'harness') refreshStatus(); } }, label);
   const active = S.jobs.filter((j) => j.state === 'queued' || j.state === 'running').length;
@@ -3571,6 +3966,8 @@ function drawSide() {
   for (const [id, v] of Object.entries(keep)) { const el = document.getElementById(id); if (el) el.value = v; }
   const pane = document.querySelector('#side .pane');
   if (pane) pane.scrollTop = scroll;
+  const termOut = document.getElementById('termOut');
+  if (termOut) termOut.scrollTop = termOut.scrollHeight;
   const codeNow = document.querySelector('#side .code');
   if (codeNow && codeAt) { codeNow.scrollTop = codeAt[0]; codeNow.scrollLeft = codeAt[1]; }
   const again = focus && document.getElementById(focus);
