@@ -74,7 +74,7 @@
 // No imports and no platform globals beyond fetch/Response/crypto, so a test can run this file under node with
 // a Map for storage and a scripted env.AI.
 
-export const VERSION = "10";
+export const VERSION = "11";
 const API_ROOT = "https://api.cloudflare.com/client/v4";
 const PY_SOURCE = "https://raw.githubusercontent.com/gary23w/nl-veil/main/cloud/tot_py.py";
 const SELF_SCRIPT = "veil-web";
@@ -433,6 +433,8 @@ export function answerText(r) {
 /// on into what is already after the cursor, a dozen lines at most.
 export function tidyCompletion(text, prefix, suffix) {
   let t = String(text ?? "");
+  const ins = /<ins>([\s\S]*?)(?:<\/ins>|$)/.exec(t);
+  if (ins) t = ins[1];
   const fence = /^\s*```[\w-]*\r?\n([\s\S]*?)(?:\r?\n```\s*$|$)/.exec(t);
   if (fence) t = fence[1];
   const line = prefix.slice(prefix.lastIndexOf("\n") + 1);
@@ -445,7 +447,12 @@ export function tidyCompletion(text, prefix, suffix) {
     const i = t.indexOf(next);
     if (i >= 0) t = t.slice(0, i);
   }
-  return t.split("\n").slice(0, 12).join("\n").trimEnd();
+  t = t.split("\n").slice(0, 13).join("\n").trimEnd();
+  // a model that answers with what the file already says just above the cursor is suggesting nothing
+  const said = t.split("\n").map((l) => l.trim()).filter((l) => l.length > 3);
+  const near = new Set(prefix.split("\n").slice(-80).map((l) => l.trim()));
+  if (said.length >= 2 && said.filter((l) => near.has(l)).length >= Math.ceil(said.length * 0.6)) return "";
+  return t.trim() ? t : "";
 }
 
 /// What a job's reply asks for: {tool, args, cut?}, {broken}, or null when it is the answer.
@@ -1385,13 +1392,20 @@ export class Harness {
     const suffix = String(b?.suffix ?? "").slice(0, 1500);
     const model = String(b?.model ?? "");
     if (!model.startsWith("@") || !prefix.trim()) return { text: "" };
+    // the buffer: the same text around the caret is answered from memory
+    const key = model + "\u0000" + prefix.slice(-800) + "\u0000" + suffix.slice(0, 120);
+    this.completions ??= new Map();
+    if (this.completions.has(key)) return { text: this.completions.get(key), kept: true };
     const why = await this.spent(true);
     if (why) return { text: "", why };
     const reply = await this.model(model, [
-      { role: "system", content: "You complete code inside an editor. You are given the text BEFORE the cursor and the text AFTER it. Reply with ONLY the text to insert at the cursor: no explanation, no code fence, nothing that is already before or after the cursor. Finish the statement or the small block being typed, a dozen lines at most. If nothing should be inserted, reply with an empty line." },
+      { role: "system", content: "You complete code inside an editor. You are given the text BEFORE the cursor and the text AFTER it. Reply with the text to insert at the cursor between <ins> and </ins>, and nothing else: no explanation, no code fence, nothing that is already before or after the cursor. What is between the tags is taken exactly as it is: when the insertion starts on a NEW line, begin with a line break right after <ins>. Finish the statement or the small block being typed, a dozen lines at most, and never repeat code the file already has. If nothing should be inserted, reply <ins></ins>." },
       { role: "user", content: `File: ${clip(String(b?.path ?? ""), 200)}\n<before>\n${prefix}</before>\n<after>\n${suffix}</after>` },
     ], 192);
-    return { text: tidyCompletion(reply, prefix, suffix) };
+    const text = tidyCompletion(reply, prefix, suffix);
+    this.completions.set(key, text);
+    if (this.completions.size > 300) this.completions.delete(this.completions.keys().next().value);
+    return { text };
   }
 
   /// One git smart-HTTP request, passed on for the page's clone, fetch or push: a browser cannot make it itself
