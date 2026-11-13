@@ -117,30 +117,54 @@
   color-scheme: dark;
 }
 
-/* The third shipped theme (theme.zig matrix_palette). Like the desk, it also
+/* The third shipped theme: the palette, the mono face and the glow of the Agent Garrett blog. Like the desk, it also
    puts the WHOLE page in the mono face — the console font is as much the theme
    as the palette. */
 :root[data-theme="matrix"] {
-  --bg:      #061106;
-  --bg-dark: #030a03;
-  --bg-hl:   #0b200e;
-  --bg-sel:  #134020;
-  --fg:      #4aff7f;
-  --fg-dim:  #2fd465;
-  --comment: #1d9448;
-  --border:  #15421f;
-  --blue:    #3bff9d;
-  --cyan:    #00ffd0;
-  --green:   #00ff41;
-  --magenta: #bd66ff;
-  --orange:  #ffa028;
-  --red:     #ff4d4d;
-  --yellow:  #ffd93b;
-  --teal:    #00c9a0;
-  --on-accent: #030a03;
+  --bg:      #000000;
+  --bg-dark: #07100b;
+  --bg-hl:   #0b140e;
+  --bg-sel:  #174d2f;
+  --fg:      #c5d4c8;
+  --fg-dim:  #8da494;
+  --comment: #718579;
+  --border:  #0c3b21;
+  --blue:    #00ef72;
+  --cyan:    #7eb7ff;
+  --green:   #16c56b;
+  --magenta: #d7a0e8;
+  --orange:  #ffa000;
+  --red:     #ff2d55;
+  --yellow:  #ffcc44;
+  --teal:    #00aacc;
+  --on-accent: #03150a;
+  /* said outright, where the mixes above would dull them */
+  --accent:         #00ef72;
+  --brand:          #00ef72;
+  --role-assistant: #00ef72;
+  --role-user:      #7eb7ff;
+  --text-muted:     #8da494;
+  --heading:        #f3f7f1;
+  --glow:           rgba(0, 239, 114, 0.15);
+  --font-mono: "JetBrains Mono", "Fira Code", "Cascadia Code", "Courier New", monospace;
   --font-ui: var(--font-mono);
+  --lh-body: 1.7;
+  --radius:     3px;
+  --radius-btn: 2px;
   color-scheme: dark;
 }
+:root[data-theme="matrix"] body { background: #000 radial-gradient(ellipse at 80% 15%, #031a12 0, #010706 40%, #000 75%) fixed; }
+:root[data-theme="matrix"] ::selection { background: #00ef72; color: #000; }
+:root[data-theme="matrix"] :is(h1, h2, h3, h4) { color: var(--heading); }
+:root[data-theme="matrix"] :is(strong, b) { color: #fff; }
+:root[data-theme="matrix"] a:hover { color: #fff; text-decoration: none; text-shadow: 0 0 8px rgba(0, 239, 114, 0.4); }
+:root[data-theme="matrix"] .topbar { background: rgba(0, 0, 0, 0.97); border-bottom: 1px solid rgba(0, 239, 114, 0.20); box-shadow: 0 0 20px rgba(0, 239, 114, 0.06); }
+:root[data-theme="matrix"] .btn-solid { background: #00ef72; color: #03150a; box-shadow: 0 0 18px var(--glow); }
+:root[data-theme="matrix"] .btn-solid:hover { background: #54ff9c; filter: none; }
+:root[data-theme="matrix"] * { scrollbar-color: #174d2f #000; }
+:root[data-theme="matrix"] ::-webkit-scrollbar-thumb { background: #174d2f; border-radius: 3px; }
+:root[data-theme="matrix"] ::-webkit-scrollbar-thumb:hover { background: #16c56b; }
+:root[data-theme="matrix"] :is(pre, code) { background: #06100a; }
 
 /* ============================================================ base */
 * { box-sizing: border-box; margin: 0; padding: 0; }

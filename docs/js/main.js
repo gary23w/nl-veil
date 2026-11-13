@@ -12,7 +12,7 @@
   const THEMES = [
     { id: 'light',  name: 'Light',       chrome: '#e9edf5' },
     { id: 'dark',   name: 'Tokyo Night', chrome: '#16161e' },
-    { id: 'matrix', name: 'Matrix',      chrome: '#030a03' }
+    { id: 'matrix', name: 'Matrix',      chrome: '#000000' }
   ];
   const ICONS = {
     // sun / moon / terminal — the same stroke language as the app's icon set
