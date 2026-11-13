@@ -31,6 +31,14 @@
 //!   GET    /api/v1/harness/settings       the account's shared settings {name: {v, at}}
 //!   POST   /api/v1/harness/settings       {set?: {name: value}, del?: [name]}
 //!   POST   /api/v1/harness/share          bring the Agent Garrett connection level with the harness's, now
+//!   POST   /api/v1/harness/deploy         put the harness into the user's Cloudflare account, when none answers
+//!
+//! DEPLOYING: a user with no harness does not have to go to the website for one. With the Cloudflare login this
+//! server holds, `deploy` uploads the harness this binary was built with (cloud/veil-web/veil-web.js, compiled in)
+//! as the Worker "veil-web" in their own account, with the bindings wrangler.jsonc declares, switches on its
+//! workers.dev address and waits for it to answer. It is asked for (the route, the desk's and the web app's button,
+//! or the chat's mesh_deploy_runtime verb once the user has said yes), never done on this server's own initiative.
+//! From then on the harness keeps itself current from the public repo, as one deployed from the website does.
 //!
 //! THE MESH: a machine whose harness has answered gets an id (16 random hex characters, kept in the state file with
 //! a name) and tells the harness it is here on every pass of the harness thread: its name, kind, operating system,
@@ -75,6 +83,15 @@ const Tok = cf_tot.Tok;
 const log = std.log.scoped(.cf_harness);
 
 pub const SCRIPT = "veil-web"; // veil-web.js SELF_SCRIPT, and the name in cloud/veil-web/wrangler.jsonc
+/// The harness this binary deploys: cloud/veil-web/veil-web.js as it was when this was built.
+const HARNESS_JS = @embedFile("veil-web.js");
+const MODULE = "veil-web.js"; // wrangler.jsonc "main"
+const COMPAT_DATE = "2025-09-01"; // wrangler.jsonc, and veil-web.js COMPAT_DATE
+const MIGRATION_TAG = "v1"; // wrangler.jsonc: the migration that creates the Harness class, accepted once per script
+const ALLOW_ORIGIN = "https://gary23w.github.io"; // wrangler.jsonc vars: the page whose cross-origin calls the harness answers
+/// After an upload, how long this server waits for the new address to answer, and how often it asks.
+const DEPLOY_WAIT_MS: u64 = 24_000;
+const DEPLOY_ASK_MS: u64 = 3_000;
 const STATE_FILE = "cf_harness.json";
 pub const TASK_MAX = 8000; // veil-web.js refuses a longer task; refused here first, without a call
 const JOB_ID_MAX = 32;
@@ -669,6 +686,137 @@ pub fn setNode(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     try res.json(.{ .ok = true, .node = st.node, .name = st.name }, .{});
 }
 
+// ---------------------------------------------------------------------------------- deploying the harness
+
+/// The version of the harness this binary carries (veil-web.js `export const VERSION = "N"`), "?" if it has none.
+fn harnessVersion() []const u8 {
+    const key = "export const VERSION = \"";
+    const at = std.mem.indexOf(u8, HARNESS_JS, key) orelse return "?";
+    const rest = HARNESS_JS[at + key.len ..];
+    return rest[0 .. std.mem.indexOfScalar(u8, rest, '"') orelse return "?"];
+}
+
+/// The script upload: a multipart body of the metadata and the module. The metadata is what wrangler.jsonc
+/// declares (the AI binding, the Harness object class, the page's origin) and KEEPS any secret already on the
+/// script. `fresh` adds the migration that creates the class, which Cloudflare accepts exactly once per script.
+/// The Worker Loader binding (Python) is not asked for: Cloudflare offers it on the Workers Paid plan, and the
+/// harness adds it to itself when its owner asks (/v1/python/enable).
+fn deployBody(a: std.mem.Allocator, boundary: []const u8, fresh: bool) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    try out.print(a, "--{s}\r\nContent-Disposition: form-data; name=\"metadata\"; filename=\"metadata.json\"\r\nContent-Type: application/json\r\n\r\n", .{boundary});
+    try out.appendSlice(a, "{\"main_module\":\"" ++ MODULE ++ "\",\"compatibility_date\":\"" ++ COMPAT_DATE ++ "\",\"compatibility_flags\":[\"global_fetch_strictly_public\"]," ++
+        "\"bindings\":[{\"type\":\"ai\",\"name\":\"AI\"},{\"type\":\"durable_object_namespace\",\"name\":\"HARNESS\",\"class_name\":\"Harness\"}," ++
+        "{\"type\":\"plain_text\",\"name\":\"ALLOW_ORIGIN\",\"text\":\"" ++ ALLOW_ORIGIN ++ "\"}],\"keep_bindings\":[\"secret_text\"]");
+    if (fresh) try out.appendSlice(a, ",\"migrations\":{\"new_tag\":\"" ++ MIGRATION_TAG ++ "\",\"new_sqlite_classes\":[\"Harness\"]}");
+    try out.print(a, "}}\r\n--{s}\r\nContent-Disposition: form-data; name=\"" ++ MODULE ++ "\"; filename=\"" ++ MODULE ++ "\"\r\nContent-Type: application/javascript+module\r\n\r\n", .{boundary});
+    try out.appendSlice(a, HARNESS_JS);
+    try out.print(a, "\r\n--{s}--\r\n", .{boundary});
+    return out.items;
+}
+
+const Envelope = struct { success: bool = false, errors: []const struct { message: []const u8 = "" } = &.{} };
+
+/// The first error of a Cloudflare v4 reply, "" when it succeeded.
+fn apiError(a: std.mem.Allocator, raw: []const u8) []const u8 {
+    const p = std.json.parseFromSliceLeaky(Envelope, a, raw, .{ .ignore_unknown_fields = true }) catch return "unreadable reply from the Cloudflare API";
+    if (p.success) return "";
+    return if (p.errors.len > 0 and p.errors[0].message.len > 0) p.errors[0].message else "the Cloudflare API refused the request";
+}
+
+fn apiV4(app: *App, a: std.mem.Allocator, method: []const u8, url: []const u8, body: []const u8, bearer: []const u8, content_type: []const u8) ?[]const u8 {
+    const raw = cf_oauth.apiCall(app, method, url, body, bearer, content_type) orelse return null;
+    defer app.gpa.free(raw);
+    return a.dupe(u8, raw) catch null;
+}
+
+/// What a deploy came to.
+const Deployed = union(enum) {
+    /// A harness already answers at this address; nothing was uploaded.
+    already: []const u8,
+    /// The harness was uploaded and its address switched on. `answering`: it answered within the wait.
+    deployed: struct { url: []const u8, answering: bool },
+    /// Nothing usable was deployed, and why, in words the user can act on.
+    failed: []const u8,
+};
+
+/// Put the harness into the user's own Cloudflare account, unless one already answers. The same three steps the
+/// tots' runtime takes (cf_tot.ensureRuntime): the account's workers.dev subdomain, the script upload (with the
+/// class migration when the script is new), and its workers.dev address switched on. Then it is asked for its
+/// status until it answers or `wait_ms` has passed (0 in a test that has no clock to spend).
+fn deployHarness(app: *App, a: std.mem.Allocator, uid: u64, tok: Tok, wait_ms: u64) Deployed {
+    var url: []const u8 = "";
+    if (harnessCall(app, a, uid, tok, "GET", "/v1/status", "", &url) == .ok) return .{ .already = url };
+    const acct = tok.account_id;
+    if (acct.len == 0) return .{ .failed = "your Cloudflare login names no account - Disconnect and log in with Cloudflare again" };
+
+    var why: []const u8 = "";
+    const sub = cf_tot.workersSubdomain(app, a, tok, &why) orelse return .{ .failed = why };
+    const base = cf_tot.workerUrl(app, a, SCRIPT, sub) orelse return .{ .failed = "out of memory" };
+    if (!harnessUrlOk(app, base)) return .{ .failed = "the harness's address is not one this server sends a login to" };
+
+    const script_url = std.fmt.allocPrint(a, "{s}/accounts/{s}/workers/scripts/" ++ SCRIPT, .{ app.cf_api_root, acct }) catch return .{ .failed = "out of memory" };
+    // Is a script of that name already there (one that does not answer as a harness)? Its class migration applies
+    // once, so a second upload must not carry it. The read is only a hint: both forms are tried, the likelier first.
+    const settings_url = std.fmt.allocPrint(a, "{s}/settings", .{script_url}) catch return .{ .failed = "out of memory" };
+    const exists = if (apiV4(app, a, "GET", settings_url, "", tok.key, "")) |r| apiError(a, r).len == 0 else false;
+
+    var bb: [8]u8 = undefined;
+    app.io.random(&bb);
+    const boundary = std.fmt.allocPrint(a, "----veilharness{s}", .{std.fmt.bytesToHex(bb, .lower)}) catch return .{ .failed = "out of memory" };
+    const ctype = std.fmt.allocPrint(a, "multipart/form-data; boundary={s}", .{boundary}) catch return .{ .failed = "out of memory" };
+    var refusal: []const u8 = "";
+    var up_ok = false;
+    for ([_]bool{ !exists, exists }) |fresh| {
+        const body = deployBody(a, boundary, fresh) catch return .{ .failed = "out of memory" };
+        const up = apiV4(app, a, "PUT", script_url, body, tok.key, ctype) orelse return .{ .failed = "could not reach the Cloudflare API to upload the harness" };
+        const e = apiError(a, up);
+        if (e.len == 0) {
+            up_ok = true;
+            break;
+        }
+        if (refusal.len == 0) refusal = e;
+    }
+    if (!up_ok) {
+        const perm = std.mem.indexOf(u8, refusal, "Authentication error") != null or std.mem.indexOf(u8, refusal, "not authorized") != null or std.mem.indexOf(u8, refusal, "permission") != null;
+        return .{ .failed = if (perm) "Cloudflare refused the upload: your Cloudflare login has not granted the permission to deploy Workers - Disconnect and log in with Cloudflare again to grant it" else (std.fmt.allocPrint(a, "Cloudflare refused the upload: {s}", .{refusal}) catch "Cloudflare refused the upload") };
+    }
+
+    // An accepted upload is not reachable until its workers.dev route is enabled.
+    const route_url = std.fmt.allocPrint(a, "{s}/subdomain", .{script_url}) catch return .{ .failed = "out of memory" };
+    const route = apiV4(app, a, "POST", route_url, "{\"enabled\":true}", tok.key, "application/json") orelse return .{ .failed = "the harness was uploaded, but Cloudflare could not be reached to switch on its workers.dev address - deploy again" };
+    const route_err = apiError(a, route);
+    if (route_err.len > 0) return .{ .failed = std.fmt.allocPrint(a, "the harness was uploaded, but its workers.dev address could not be switched on: {s}", .{route_err}) catch "the harness was uploaded, but its address could not be switched on" };
+    log.info("harness: deployed veil-web (version {s}) into the user's Cloudflare account", .{harnessVersion()});
+
+    var waited: u64 = 0;
+    while (true) {
+        if (harnessCall(app, a, uid, tok, "GET", "/v1/status", "", null) == .ok) return .{ .deployed = .{ .url = base, .answering = true } };
+        if (waited >= wait_ms) return .{ .deployed = .{ .url = base, .answering = false } };
+        var slept: u64 = 0;
+        while (slept < DEPLOY_ASK_MS) : (slept += 100) bu.sleepMs(100);
+        waited += DEPLOY_ASK_MS;
+    }
+}
+
+/// POST /api/v1/harness/deploy — put the harness into the caller's own Cloudflare account, with the login this
+/// server holds. Answers `{ok, deployed, answering, url, version}`: `deployed` false when a harness already
+/// answered (nothing was uploaded), `answering` false when the new address had not answered yet within the wait.
+pub fn deploy(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
+    const u = gate(app, req, res) orelse return;
+    var arena = std.heap.ArenaAllocator.init(app.gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tok = tokOf(app, u.id, a) orelse return badReq(res, NOT_CONNECTED);
+    switch (deployHarness(app, a, u.id, tok, DEPLOY_WAIT_MS)) {
+        .already => |url| try res.json(.{ .ok = true, .deployed = false, .answering = true, .url = url, .version = harnessVersion() }, .{}),
+        .deployed => |d| try res.json(.{ .ok = true, .deployed = true, .answering = d.answering, .url = d.url, .version = harnessVersion() }, .{}),
+        .failed => |why| {
+            res.status = 502;
+            try res.json(.{ .ok = false, .err = why }, .{});
+        },
+    }
+}
+
 // ---------------------------------------------------------------------------------- shared settings
 
 const SETTINGS_BODY_MAX: usize = 64 << 10;
@@ -783,11 +931,12 @@ pub fn share(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
 pub const MESH_SCHEMA =
     \\{"type":"function","function":{"name":"mesh_inventory","description":"List every veil logged in to the user's Cloudflare account (their mesh): this machine, their other computers and their open web veil tabs. For each: id, name, kind (desk, server or web), operating system, version, whether it is online now, whether it runs work sent to it, whether it has a controllable browser, whether it has Agent Garrett, the MCP servers it has, and how many jobs wait for it. Call this before mesh_run, and whenever the user asks what is connected or which machine is which.","parameters":{"type":"object","properties":{},"required":[]}}},
     \\{"type":"function","function":{"name":"mesh_run","description":"Send a task to ONE other veil of the user's mesh, to be done there with that veil's own tools and files (a desktop veil runs it as a full unattended chat turn on that computer; a web veil runs it in its tab, with its browser tools when it has them). The task must stand on its own: the other veil sees only this text. Returns a job id at once; the work takes a while, so ask mesh_result for the outcome. Only a node whose inventory line says it runs work will take it.","parameters":{"type":"object","properties":{"node":{"type":"string","description":"The node's id or its exact name, from mesh_inventory."},"task":{"type":"string","description":"What to do there, complete and self-contained, and what to report back."},"model":{"type":"string","description":"Optional Workers AI model id (starts with @) for the other veil to use; the default model when left out."}},"required":["node","task"]}}},
-    \\{"type":"function","function":{"name":"mesh_result","description":"The state of a job sent with mesh_run and, once it has ended, what the other veil reported. States: queued (not taken yet), running, done, failed, cancelled.","parameters":{"type":"object","properties":{"job":{"type":"string","description":"The job id mesh_run returned."}},"required":["job"]}}}
+    \\{"type":"function","function":{"name":"mesh_result","description":"The state of a job sent with mesh_run and, once it has ended, what the other veil reported. States: queued (not taken yet), running, done, failed, cancelled.","parameters":{"type":"object","properties":{"job":{"type":"string","description":"The job id mesh_run returned."}},"required":["job"]}}},
+    \\{"type":"function","function":{"name":"mesh_deploy_runtime","description":"Deploy the user's runtime: one Worker named veil-web, put into THEIR OWN Cloudflare account with the login they already gave this veil. The runtime is what the mesh, cloud jobs and the web veil run on. Call this ONLY after the user has said yes to deploying it in this conversation, and only when a mesh tool reported that no runtime was reached. It does nothing when a runtime already answers. Returns the runtime's address, or why it could not be deployed.","parameters":{"type":"object","properties":{},"required":[]}}}
 ;
 
 pub fn isMeshTool(name: []const u8) bool {
-    return std.mem.eql(u8, name, "mesh_inventory") or std.mem.eql(u8, name, "mesh_run") or std.mem.eql(u8, name, "mesh_result");
+    return std.mem.eql(u8, name, "mesh_inventory") or std.mem.eql(u8, name, "mesh_run") or std.mem.eql(u8, name, "mesh_result") or std.mem.eql(u8, name, "mesh_deploy_runtime");
 }
 
 const MeshNode = struct {
@@ -841,13 +990,21 @@ fn outText(a: std.mem.Allocator, what: []const u8, out: Out) []const u8 {
     return switch (out) {
         .ok => |r| r,
         .refused => |m| std.fmt.allocPrint(a, "{s}: the harness refused ({s})", .{ what, m }) catch "the harness refused",
-        .unreachable_ => |m| std.fmt.allocPrint(a, "{s}: no harness was reached ({s})", .{ what, m }) catch "no harness was reached",
+        .unreachable_ => |m| std.fmt.allocPrint(a, "{s}: no runtime was reached ({s}). If the user has no runtime (their veil-web harness) yet, ask them whether to deploy one into their Cloudflare account; when they say yes, call mesh_deploy_runtime.", .{ what, m }) catch "no runtime was reached",
     };
 }
 
 /// One mesh verb for a chat turn, with `tok` the turn's user's Cloudflare login. The text is in `a`.
 fn meshRun(app: *App, a: std.mem.Allocator, uid: u64, tok: Tok, name: []const u8, args_json: []const u8) []const u8 {
     const args = std.json.parseFromSliceLeaky(MeshArgs, a, if (args_json.len > 0) args_json else "{}", .{ .ignore_unknown_fields = true }) catch return "bad arguments: send a JSON object";
+    if (std.mem.eql(u8, name, "mesh_deploy_runtime")) return switch (deployHarness(app, a, uid, tok, DEPLOY_WAIT_MS)) {
+        .already => |url| std.fmt.allocPrint(a, "a runtime already answers at {s}: nothing was deployed", .{url}) catch "a runtime already answers",
+        .deployed => |d| if (d.answering)
+            (std.fmt.allocPrint(a, "deployed: the runtime (version {s}) answers at {s}", .{ harnessVersion(), d.url }) catch "deployed")
+        else
+            (std.fmt.allocPrint(a, "uploaded: the runtime (version {s}) is in the user's account at {s}, but it has not answered yet. A new address can take a minute to come up: try the mesh tool again shortly.", .{ harnessVersion(), d.url }) catch "uploaded"),
+        .failed => |why| std.fmt.allocPrint(a, "the runtime was not deployed: {s}", .{why}) catch "the runtime was not deployed",
+    };
     var st = readState(app, uid, a);
     if (std.mem.eql(u8, name, "mesh_result")) {
         if (!validId(args.job)) return "give the job id mesh_run returned";
@@ -1053,7 +1210,7 @@ test "every harness route is gated: an anonymous caller gets 401 and nothing run
     defer threaded.deinit();
     var ta = try http.testApp(gpa, threaded.io(), "zig-cfharness-gate-tmp");
     defer ta.deinit();
-    inline for (.{ status, listJobs, queueJob, getJob, cancelJob, listSchedules, setLocal, listConvs, getConv, pushConv, listNodes, forgetNode, setNode, getSettings, putSettings, share }) |h| {
+    inline for (.{ status, listJobs, queueJob, getJob, cancelJob, listSchedules, setLocal, listConvs, getConv, pushConv, listNodes, forgetNode, setNode, getSettings, putSettings, share, deploy }) |h| {
         var web = httpz.testing.init(.{});
         defer web.deinit();
         web.param("id", "mabc12");
@@ -1544,7 +1701,7 @@ test "the mesh from a chat turn: the inventory marks this machine, a task goes t
     try tt.expectEqual(@as(usize, 1), srv.countCalls("POST", "/v1/jobs")); // one job, for the one node that could take it
     try tt.expectEqual(@as(usize, 1), srv.countCalls("GET", "/v1/local?node=desk0000aaaa1111"));
     try tt.expect(isMeshTool("mesh_inventory") and isMeshTool("mesh_run") and isMeshTool("mesh_result") and !isMeshTool("mesh_") and !isMeshTool("cast"));
-    inline for (.{ "mesh_inventory", "mesh_run", "mesh_result" }) |n| try tt.expect(std.mem.indexOf(u8, MESH_SCHEMA, "\"name\":\"" ++ n ++ "\"") != null);
+    inline for (.{ "mesh_inventory", "mesh_run", "mesh_result", "mesh_deploy_runtime" }) |n| try tt.expect(std.mem.indexOf(u8, MESH_SCHEMA, "\"name\":\"" ++ n ++ "\"") != null);
 }
 
 test "the Agent Garrett connection is brought level: taken once from the harness, not taken again after a disconnect here, given when only this server has one" {
@@ -1602,4 +1759,143 @@ test "the Agent Garrett connection is brought level: taken once from the harness
     // the state file never holds a key
     const on_disk = try std.Io.Dir.cwd().readFileAlloc(io, "zig-cfharness-share-tmp/u1/" ++ STATE_FILE, a, .limited(64 << 10));
     try tt.expect(std.mem.indexOf(u8, on_disk, "gtt_") == null);
+}
+
+test "deploying the harness: the upload is what wrangler.jsonc declares, the class migration rides a new script only, and the module is this binary's" {
+    var arena = std.heap.ArenaAllocator.init(tt.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const fresh = try deployBody(a, "BOUND", true);
+    const again = try deployBody(a, "BOUND", false);
+    const meta_at = std.mem.indexOf(u8, fresh, "\r\n\r\n").? + 4;
+    const meta = fresh[meta_at .. std.mem.indexOfPos(u8, fresh, meta_at, "\r\n--BOUND").?];
+    const M = struct {
+        main_module: []const u8,
+        compatibility_date: []const u8,
+        compatibility_flags: []const []const u8,
+        bindings: []const struct { type: []const u8, name: []const u8, class_name: []const u8 = "", text: []const u8 = "" },
+        keep_bindings: []const []const u8,
+        migrations: ?struct { new_tag: []const u8, new_sqlite_classes: []const []const u8 } = null,
+    };
+    const m = try std.json.parseFromSliceLeaky(M, a, meta, .{});
+    try tt.expectEqualStrings("veil-web.js", m.main_module);
+    try tt.expectEqualStrings("global_fetch_strictly_public", m.compatibility_flags[0]);
+    try tt.expectEqual(@as(usize, 3), m.bindings.len); // AI, the object class, the page's origin; no Worker Loader
+    try tt.expectEqualStrings("ai", m.bindings[0].type);
+    try tt.expectEqualStrings("Harness", m.bindings[1].class_name);
+    try tt.expectEqualStrings("ALLOW_ORIGIN", m.bindings[2].name);
+    try tt.expectEqualStrings("https://gary23w.github.io", m.bindings[2].text);
+    try tt.expectEqualStrings("secret_text", m.keep_bindings[0]);
+    try tt.expectEqualStrings("v1", m.migrations.?.new_tag);
+    try tt.expectEqualStrings("Harness", m.migrations.?.new_sqlite_classes[0]);
+    try tt.expect(std.mem.indexOf(u8, again, "migrations") == null);
+    try tt.expect(std.mem.indexOf(u8, fresh, "Content-Type: application/javascript+module\r\n\r\n") != null);
+    try tt.expect(std.mem.indexOf(u8, fresh, "export class Harness") != null); // the harness itself rides the upload
+    try tt.expect(std.mem.endsWith(u8, fresh, "\r\n--BOUND--\r\n"));
+    // the values this file repeats are the ones the harness and its wrangler.jsonc carry
+    try tt.expect(std.mem.indexOf(u8, HARNESS_JS, "const COMPAT_DATE = \"" ++ COMPAT_DATE ++ "\";") != null);
+    try tt.expect(std.mem.indexOf(u8, HARNESS_JS, "const SELF_SCRIPT = \"" ++ SCRIPT ++ "\";") != null);
+    const v = harnessVersion();
+    try tt.expect(v.len > 0 and !std.mem.eql(u8, v, "?"));
+    for (v) |c| try tt.expect(std.ascii.isDigit(c));
+}
+
+test "deploying the harness: nothing is uploaded when one answers; with none, it is uploaded, its address switched on, and it is asked until it answers; a refusal says why" {
+    const gpa = tt.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var ta = try http.testApp(gpa, io, "zig-cfharness-deploy-tmp");
+    defer ta.deinit();
+    if (!curlRuns(gpa, io)) return error.SkipZigTest;
+
+    const w = fakehttp.wire;
+    const okv4 = w("{\"success\":true,\"errors\":[],\"result\":{}}");
+    const bearer: []const []const u8 = &.{"Authorization: Bearer oauth-bearer"};
+    const routes = [_]fakehttp.Route{
+        .{ .method = "GET", .path = "/accounts/acct/workers/subdomain", .reply = StandIn.subdomain, .has = bearer },
+        // no harness answers before the upload
+        .{ .method = "GET", .path = "/v1/status", .reply = StandIn.no_worker, .times = 1 },
+        .{ .method = "GET", .path = "/accounts/acct/workers/scripts/veil-web/settings", .reply = w("{\"success\":false,\"errors\":[{\"code\":10007,\"message\":\"This Worker does not exist on your account.\"}]}"), .has = bearer },
+        // a new script: the upload carries the migration, the bindings and the module
+        .{ .method = "PUT", .path = "/accounts/acct/workers/scripts/veil-web", .reply = okv4, .has = &.{ "Authorization: Bearer oauth-bearer", "\"new_sqlite_classes\":[\"Harness\"]", "\"name\":\"ALLOW_ORIGIN\"", "export class Harness" } },
+        .{ .method = "POST", .path = "/accounts/acct/workers/scripts/veil-web/subdomain", .reply = okv4, .has = &.{ "Authorization: Bearer oauth-bearer", "{\"enabled\":true}" } },
+        // the new address answers on the first ask after the upload
+        .{ .method = "GET", .path = "/v1/status", .reply = StandIn.status_ok, .has = bearer },
+    };
+    var srv: fakehttp.Server = undefined;
+    try srv.startRouted(io, &routes, StandIn.unauthorized);
+    var running = true;
+    defer if (running) srv.stop();
+    var rb: [80]u8 = undefined;
+    ta.app.cf_api_root = try std.fmt.bufPrint(&rb, "http://127.0.0.1:{d}/client/v4", .{srv.port});
+    var ub: [80]u8 = undefined;
+    const stand_in = try std.fmt.bufPrint(&ub, "http://127.0.0.1:{d}", .{srv.port});
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tok: Tok = .{ .key = "oauth-bearer", .account_id = "acct" };
+
+    const first = deployHarness(&ta.app, a, 1, tok, 0);
+    try tt.expect(first == .deployed);
+    try tt.expect(first.deployed.answering);
+    try tt.expectEqualStrings(stand_in, first.deployed.url);
+    try tt.expectEqualStrings(stand_in, readState(&ta.app, 1, a).url); // remembered once it answered
+
+    // asked again: a harness answers, so nothing is uploaded
+    const second = deployHarness(&ta.app, a, 1, tok, 0);
+    try tt.expect(second == .already);
+    try tt.expectEqualStrings(stand_in, second.already);
+    // and from a chat turn it says so
+    try tt.expect(std.mem.indexOf(u8, meshRun(&ta.app, a, 1, tok, "mesh_deploy_runtime", "{}"), "a runtime already answers") != null);
+
+    srv.stop();
+    running = false;
+    try tt.expectEqual(@as(usize, 1), srv.countCalls("PUT", "/workers/scripts/veil-web"));
+    try tt.expectEqual(@as(usize, 1), srv.countCalls("POST", "/workers/scripts/veil-web/subdomain"));
+}
+
+test "deploying the harness: an account with no workers.dev subdomain, and an upload Cloudflare refuses, are told in words; nothing is switched on" {
+    const gpa = tt.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var ta = try http.testApp(gpa, io, "zig-cfharness-deployno-tmp");
+    defer ta.deinit();
+    if (!curlRuns(gpa, io)) return error.SkipZigTest;
+
+    const w = fakehttp.wire;
+    const bearer: []const []const u8 = &.{"Authorization: Bearer oauth-bearer"};
+    const routes = [_]fakehttp.Route{
+        // the first deploy: the account has no subdomain yet. The second: it has one, and the upload is refused.
+        .{ .method = "GET", .path = "/accounts/acct/workers/subdomain", .reply = w("{\"success\":false,\"errors\":[{\"code\":10007,\"message\":\"There is no subdomain for this account\"}],\"result\":null}"), .times = 2, .has = bearer },
+        .{ .method = "GET", .path = "/accounts/acct/workers/subdomain", .reply = StandIn.subdomain, .has = bearer },
+        .{ .method = "GET", .path = "/v1/status", .reply = StandIn.no_worker },
+        .{ .method = "PUT", .path = "/accounts/acct/workers/scripts/veil-web", .reply = w("{\"success\":false,\"errors\":[{\"code\":10000,\"message\":\"Authentication error\"}]}") },
+    };
+    var srv: fakehttp.Server = undefined;
+    try srv.startRouted(io, &routes, w("{\"success\":false,\"errors\":[{\"message\":\"not found\"}]}"));
+    var running = true;
+    defer if (running) srv.stop();
+    var rb: [80]u8 = undefined;
+    ta.app.cf_api_root = try std.fmt.bufPrint(&rb, "http://127.0.0.1:{d}/client/v4", .{srv.port});
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tok: Tok = .{ .key = "oauth-bearer", .account_id = "acct" };
+
+    const none = deployHarness(&ta.app, a, 1, tok, 0);
+    try tt.expect(none == .failed);
+    try tt.expect(std.mem.indexOf(u8, none.failed, "no workers.dev subdomain yet") != null);
+
+    const refused = deployHarness(&ta.app, a, 1, tok, 0);
+    try tt.expect(refused == .failed);
+    try tt.expect(std.mem.indexOf(u8, refused.failed, "has not granted the permission to deploy Workers") != null);
+
+    srv.stop();
+    running = false;
+    try tt.expectEqual(@as(usize, 2), srv.countCalls("PUT", "/workers/scripts/veil-web")); // with the migration, then without
+    try tt.expectEqual(@as(usize, 0), srv.countCalls("POST", "/subdomain"));
+    // a mesh verb that reaches no runtime tells the model what to offer
+    try tt.expect(std.mem.indexOf(u8, outText(a, "mesh_inventory", .{ .unreachable_ = "x" }), "mesh_deploy_runtime") != null);
 }

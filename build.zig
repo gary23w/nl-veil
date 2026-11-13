@@ -86,6 +86,8 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addImport("httpz", httpz.module("httpz"));
     // The tot runtime (config/cf_tot.zig uploads it into the user's Cloudflare account as it is).
     exe.root_module.addAnonymousImport("tot.js", .{ .root_source_file = b.path("cloud/tot.js") });
+    // The web veil's harness (config/cf_harness.zig deploys it into the user's Cloudflare account when they ask).
+    exe.root_module.addAnonymousImport("veil-web.js", .{ .root_source_file = b.path("cloud/veil-web/veil-web.js") });
     exe.root_module.addAnonymousImport("tot_py.py", .{ .root_source_file = b.path("cloud/tot_py.py") });
     exe.root_module.addAnonymousImport("security-tools.txt", .{ .root_source_file = b.path("cloud/security-tools.txt") });
     exe.root_module.addAnonymousImport("neuron-db.mjs", .{ .root_source_file = b.path("cloud/neuron-db.mjs") });
@@ -245,6 +247,7 @@ pub fn build(b: *std.Build) void {
         tests.root_module.addAnonymousImport(asset, .{ .root_source_file = b.path("web/public/" ++ asset) });
     }
     tests.root_module.addAnonymousImport("tot.js", .{ .root_source_file = b.path("cloud/tot.js") }); // config/cf_tot.zig
+    tests.root_module.addAnonymousImport("veil-web.js", .{ .root_source_file = b.path("cloud/veil-web/veil-web.js") }); // config/cf_harness.zig
     tests.root_module.addAnonymousImport("tot_py.py", .{ .root_source_file = b.path("cloud/tot_py.py") });
     tests.root_module.addAnonymousImport("security-tools.txt", .{ .root_source_file = b.path("cloud/security-tools.txt") });
     tests.root_module.addAnonymousImport("neuron-db.mjs", .{ .root_source_file = b.path("cloud/neuron-db.mjs") });

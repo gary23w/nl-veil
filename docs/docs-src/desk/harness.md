@@ -22,7 +22,7 @@ Under the queue is the list of chats the harness keeps (the web chat's conversat
 
 The poller asks the server only while this view is on screen: the view raises `Store.harness_watch` each frame and the poller reads and lowers it, then polls every 10 seconds (`GET /api/v1/harness`, then the jobs and schedules when a harness answered). A selected job is fetched once, and again on each poll while it has not ended. A list that does not answer keeps the rows it showed last. Queueing, cancelling, selecting and the switch ride the poller's command ring (`harness_queue`, `harness_cancel`, `harness_select`, `harness_local`, `harness_chat_select`, `harness_push`).
 
-When there is nothing to show, the view says why: the admin token is missing, the server is offline, the login has no Cloudflare connection, or no harness answered (with the server's reason).
+When there is nothing to show, the view says why: the admin token is missing, the server is offline, the login has no Cloudflare connection, or no harness answered (with the server's reason). In that last case, logged in and with no harness answering, a **Deploy my runtime** button puts the harness into the user's own Cloudflare account (`harness_deploy`; see [cf_harness](../config/cf_harness.md), "Deploying the harness"). The button reads **Deploying...** while it runs, and a notification says how it ended.
 
 ## Key Exports
 
@@ -38,4 +38,4 @@ When there is nothing to show, the view says why: the admin token is missing, th
 
 ## The local web app
 
-The web app's Tasks page (`web/public/app.js`) has a **Web harness** section on the same routes: the status line, a box that queues a job, the jobs newest first with **Result** and **Cancel**/**Delete**, the schedules, the mesh's nodes (when another node runs work, a menu beside **Queue** sends the job to it instead), a button for the local-jobs switch that asks before turning it on, and the harness's chats: each opens as a transcript, and **Push the open chat** copies the conversation open in the Chat tab up. It reads when the page opens and when **Refresh** is pressed; it does not poll.
+The web app's Tasks page (`web/public/app.js`) has a **Web harness** section on the same routes: the status line, a box that queues a job, the jobs newest first with **Result** and **Cancel**/**Delete**, the schedules, a **Deploy my runtime** button when the login reaches no harness (it asks first), the mesh's nodes (when another node runs work, a menu beside **Queue** sends the job to it instead), a button for the local-jobs switch that asks before turning it on, and the harness's chats: each opens as a transcript, and **Push the open chat** copies the conversation open in the Chat tab up. It reads when the page opens and when **Refresh** is pressed; it does not poll.

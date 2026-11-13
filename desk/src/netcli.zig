@@ -471,6 +471,12 @@ pub fn harnessLocal(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8
     return httpReq(io, gpa, "POST", port, "/api/v1/harness/local", token, if (on) "{\"on\":true}" else "{\"on\":false}", 15);
 }
 
+/// POST /api/v1/harness/deploy — put the harness into the user's own Cloudflare account. The server uploads it,
+/// switches on its address and waits for it to answer, so the ceiling is long.
+pub fn harnessDeploy(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8) ?Resp {
+    return httpReq(io, gpa, "POST", port, "/api/v1/harness/deploy", token, "{}", 120);
+}
+
 /// GET /api/v1/harness/nodes — every veil of the account on the mesh, as the harness lists them.
 pub fn harnessNodes(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8) ?Resp {
     return httpReq(io, gpa, "GET", port, "/api/v1/harness/nodes", token, null, 40);

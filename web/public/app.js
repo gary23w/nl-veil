@@ -261,6 +261,7 @@ const api = {
   harnessJob:     (id) => jget('/api/v1/harness/jobs/' + encodeURIComponent(id), 45000),
   harnessQueue:   (task, node) => jpost('/api/v1/harness/jobs', node ? { task: task, node: node } : { task: task }, 45000),
   harnessNodes:   ()   => jget('/api/v1/harness/nodes', 45000),
+  harnessDeploy:  ()   => jpost('/api/v1/harness/deploy', {}, 150000),
   harnessCancel:  (id) => jdel('/api/v1/harness/jobs/' + encodeURIComponent(id)),
   harnessScheds:  ()   => jget('/api/v1/harness/schedules', 45000),
   harnessLocal:   (on) => jpost('/api/v1/harness/local', { on: !!on }),
@@ -3266,7 +3267,21 @@ async function refreshHarness() {
     return;
   }
   if (!st.reachable || !st.harness) {
-    host.innerHTML = `<div class="empty">${esc(st.err || 'no veil-web harness answered')}</div>`;
+    host.innerHTML = `<div class="empty">${esc(st.err || 'no veil-web harness answered')}</div>
+      <div class="task-actions">
+        <button class="btn btn-solid btn-sm" id="harDeploy">Deploy my runtime</button>
+        <span class="muted">Puts one Worker, veil-web, in your own Cloudflare account: the runtime that cloud jobs, the mesh and the web veil use.</span>
+      </div>`;
+    el('harDeploy').addEventListener('click', async (ev) => {
+      const b = ev.currentTarget;
+      if (!confirm('Deploy the veil-web Worker into your Cloudflare account now?')) return;
+      b.disabled = true; b.textContent = 'Deploying…';
+      try {
+        const r = await api.harnessDeploy();
+        toast(r.deployed ? 'Runtime deployed' : 'Runtime already there', r.answering ? 'Your harness answers in your Cloudflare account.' : 'It is in your account; its address can take a minute to answer.', 'ok');
+      } catch (e) { toast('Runtime not deployed', e.message, 'err'); }
+      refreshHarness();
+    });
     return;
   }
   const h = st.harness;

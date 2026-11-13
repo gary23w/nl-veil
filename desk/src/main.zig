@@ -9303,6 +9303,7 @@ fn drawSchedHarness(store: *Store, r: t.Rect) void {
     const seen = store.harness_seen;
     const denied = store.harness_denied;
     const busy = store.harness_busy;
+    const deploying = store.harness_deploying;
     const online = store.server_online;
     const n = store.harness_job_n;
     @memcpy(har_jobs_view[0..n], store.harness_jobs[0..n]);
@@ -9350,6 +9351,15 @@ fn drawSchedHarness(store: *Store, r: t.Rect) void {
         null;
     if (why) |w| {
         t.textClip(w, @intFromFloat(r.x), @intFromFloat(y + 2), 13, if (seen and online and !denied and st.connected) t.orange else t.comment, @intFromFloat(r.width));
+        // Logged in, and no harness answers: it can be put into the account from here, with the login the server holds.
+        if (seen and online and !denied and st.connected and !st.reachable) {
+            const dl = if (deploying) t.z("Deploying...", .{}) else t.z("Deploy my runtime", .{});
+            const dw = @max(170, t.btnW(dl, t.FIELD_H));
+            if (t.button(.{ .x = r.x, .y = y + 28, .width = dw, .height = t.FIELD_H }, dl, t.blue, !deploying)) store.pushCmd(store_mod.mkCmd(.harness_deploy, "", ""));
+            t.textClip("puts one Worker, veil-web, in your own Cloudflare account: the runtime that cloud jobs, the mesh and the web veil use", @intFromFloat(r.x + dw + 12), @intFromFloat(y + 28 + (t.FIELD_H - 14) / 2), 11, t.comment, @intFromFloat(@max(r.width - dw - 12, 1)));
+            if (n == 0 and conv_n == 0) return;
+            y += t.FIELD_H + 12;
+        }
         if (!st.connected or !seen or denied or !online or (n == 0 and conv_n == 0)) return;
         y += 24;
     } else {
