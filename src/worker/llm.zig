@@ -4904,7 +4904,11 @@ fn handleSseStreamLine(st: *StreamState, gpa: std.mem.Allocator, line: []const u
     for (parsed.value.choices) |ch| {
         if (ch.delta) |d| {
             if (d.reasoning) |r| st.fire(gpa, .reasoning, r);
-            if (d.reasoning_content) |r| st.fire(gpa, .reasoning, r);
+            // Some providers send one reasoning delta under BOTH names; firing both typed every fragment twice.
+            if (d.reasoning_content) |r| {
+                const same = if (d.reasoning) |first| std.mem.eql(u8, first, r) else false;
+                if (!same) st.fire(gpa, .reasoning, r);
+            }
             if (d.content) |c| st.fire(gpa, .content, c);
             if (d.tool_calls) |tcs| {
                 for (tcs) |tc| {
@@ -6422,6 +6426,22 @@ test "completeStream SSE parser: reasoning + content deltas fire on_delta, accum
     try std.testing.expectEqualStrings("think ", cap.reasoning.items);
     try std.testing.expect(st.metered and st.p_in == 11 and st.p_out == 2);
     try std.testing.expect(!st.finish_seen); // this stream named no finish_reason; its [DONE] is what ended it
+}
+
+test "completeStream SSE parser: a reasoning delta sent under both reasoning and reasoning_content is taken once" {
+    const gpa = std.testing.allocator;
+    var cap: StreamCapture = .{};
+    defer cap.deinit(gpa);
+    var st = StreamState{ .native = false, .ctx = &cap, .on_delta = StreamCapture.onDelta };
+    defer st.deinit(gpa);
+    feedStream(&st, gpa, "data: {\"choices\":[{\"delta\":{\"reasoning\":\"Search\",\"reasoning_content\":\"Search\"}}]}\n\n" ++
+        "data: {\"choices\":[{\"delta\":{\"reasoning\":\" is noisy.\",\"reasoning_content\":\" is noisy.\"}}]}\n\n" ++
+        // either name alone still counts
+        "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\" Let me\"}}]}\n\n" ++
+        "data: {\"choices\":[{\"delta\":{\"reasoning\":\" try.\"}}]}\n\ndata: [DONE]\n");
+    try std.testing.expect(st.done and !st.failed);
+    try std.testing.expectEqualStrings("Search is noisy. Let me try.", st.reasoning.items);
+    try std.testing.expectEqualStrings("Search is noisy. Let me try.", cap.reasoning.items);
 }
 
 test "completeStream SSE parser: per-chunk usage meters a cut stream for what it read and wrote, and a finished one's restated total once" {
