@@ -339,6 +339,8 @@ function applyTheme(t) {
   // mono_ui: render the whole UI in the mono face, not just code. The CSS rule
   // `.mono-ui { --font-ui: var(--font-mono) }` does the work; we only toggle it.
   root.classList.toggle('mono-ui', !!t.mono_ui);
+  // the theme's id, for the few rules one theme has beyond its palette (styles.css: Matrix)
+  root.setAttribute('data-theme-id', t.id || '');
   LS.set('veil.themeId', t.id || '');
   // setTheme reads veil.themeId (via activeThemeObj) for the chrome colour and
   // the button title, so persist the id first, then let it stamp data-theme.

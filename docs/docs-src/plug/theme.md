@@ -8,7 +8,7 @@
 
 ## Purpose Summary
 
-A theme is a single `*.lua` file in `<data>/themes/` that returns a table: `id` (slug, what gets persisted as "my theme"), `name`, `dark` (web picks its base scheme from this), `mono_ui` (render the whole UI in the mono/code font), and `colors` — any subset of the 16 slots; missing slots default to the dark/light base implied by `dark`. The three shipped themes (dark/light/matrix) are SEEDED into the workspace as real files on first boot; the files are the source of truth from then on (edit them, they win), and the compiled-in copies are only the fallback when a seeded file is deleted or unparseable — the app can never boot themeless.
+A theme is a single `*.lua` file in `<data>/themes/` that returns a table: `id` (slug, what gets persisted as "my theme"), `name`, `dark` (web picks its base scheme from this), `mono_ui` (render the whole UI in the mono/code font), and `colors` — any subset of the 16 slots; missing slots default to the dark/light base implied by `dark`. The three shipped themes (dark/light/matrix) are SEEDED into the workspace as real files on first boot; the files are the source of truth from then on (edit them, they win), and the compiled-in copies are only the fallback when a seeded file is deleted or unparseable — the app can never boot themeless. A seeded file is never overwritten once it exists, with one exception that is not an edit: a `matrix.lua` that is still byte for byte the file first shipped is replaced by today's, whose palette is the Agent Garrett blog's (the same sixteen values as the site's `docs/css/theme.css`). A `matrix.lua` the user changed is left as it is.
 
 ## Key Exports
 

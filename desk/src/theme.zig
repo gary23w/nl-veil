@@ -89,28 +89,27 @@ const light_palette = Palette{
     .teal = hex("0f8a83"),
 };
 
-// Matrix / cyber-console palette: phosphor green on near-black. While it is active the whole shell
-// also renders in the mono (code) face — see theFont()/fontForKind() — so the app reads like a
-// terminal, not a dimmed dark theme. Accents keep their SEMANTIC jobs (red is still the alarm,
-// orange still the warn); the neutrals and the primary accent (`blue`) lean green, cyan/teal stay
-// in the phosphor family, and magenta goes neon violet so the brand mark still reads as itself.
+// Matrix palette: the Agent Garrett blog's own, the same sixteen values the site and the web
+// veil use (docs/css/theme.css). A black ground, soft grey-green text, and one bright green accent (`blue`: links
+// and buttons). While it is active the whole shell also renders in the mono (code) face — see
+// theFont()/fontForKind(). Accents keep their SEMANTIC jobs: red is still the alarm, orange still the warn.
 const matrix_palette = Palette{
-    .bg = hex("061106"),
-    .bg_dark = hex("030a03"),
-    .bg_hl = hex("0b200e"),
-    .bg_sel = hex("134020"),
-    .fg = hex("4aff7f"),
-    .fg_dim = hex("2fd465"),
-    .comment = hex("1d9448"),
-    .border = hex("15421f"),
-    .blue = hex("3bff9d"),
-    .cyan = hex("00ffd0"),
-    .green = hex("00ff41"),
-    .magenta = hex("bd66ff"),
-    .orange = hex("ffa028"),
-    .red = hex("ff4d4d"),
-    .yellow = hex("ffd93b"),
-    .teal = hex("00c9a0"),
+    .bg = hex("000000"),
+    .bg_dark = hex("07100b"),
+    .bg_hl = hex("0b140e"),
+    .bg_sel = hex("174d2f"),
+    .fg = hex("c5d4c8"),
+    .fg_dim = hex("8da494"),
+    .comment = hex("718579"),
+    .border = hex("0c3b21"),
+    .blue = hex("00ef72"),
+    .cyan = hex("7eb7ff"),
+    .green = hex("16c56b"),
+    .magenta = hex("d7a0e8"),
+    .orange = hex("ffa000"),
+    .red = hex("ff2d55"),
+    .yellow = hex("ffcc44"),
+    .teal = hex("00aacc"),
 };
 
 pub var bg: Color = light_palette.bg;

@@ -127,6 +127,22 @@
    /api/v1/themes endpoint, so there is nothing else theme-specific to add here. */
 :root.mono-ui, .mono-ui { --font-ui: var(--font-mono); }
 
+/* Matrix is the Agent Garrett blog's theme (the site's docs/css/theme.css holds the same values). Its sixteen
+   colours arrive with the palette; these are the parts a palette cannot say: the text on the accent, the mono
+   face (named, never bundled: the next one in the list is used where it is not installed), square corners, the
+   selection and the scrollbar. */
+:root[data-theme-id="matrix"] {
+  --on-accent: #03150a;
+  --font-mono: "JetBrains Mono", "Fira Code", "Cascadia Code", "Courier New", monospace;
+  --radius: 3px;
+  --radius-btn: 2px;
+}
+:root[data-theme-id="matrix"] ::selection { background: #00ef72; color: #000000; }
+:root[data-theme-id="matrix"] h1, :root[data-theme-id="matrix"] h2, :root[data-theme-id="matrix"] h3 { color: #f3f7f1; }
+:root[data-theme-id="matrix"] * { scrollbar-color: #174d2f transparent; }
+:root[data-theme-id="matrix"] ::-webkit-scrollbar-thumb { background: #174d2f; }
+:root[data-theme-id="matrix"] ::-webkit-scrollbar-thumb:hover { background: #16c56b; }
+
 /* ============================================================ base */
 * { box-sizing: border-box; margin: 0; padding: 0; }
 

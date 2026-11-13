@@ -8,7 +8,7 @@
 //!     name    = "Matrix",        -- display name
 //!     dark    = true,            -- dark ground? (web picks its base scheme from this)
 //!     mono_ui = true,            -- render the whole UI in the mono/code font (desk + web)
-//!     colors  = { bg = "#061106", fg = "#4aff7f", ... },  -- any subset; missing slots default
+//!     colors  = { bg = "#000000", fg = "#c5d4c8", ... },  -- any subset; missing slots default
 //!   }
 //!
 //! The three shipped themes (dark/light/matrix) are SEEDED into the workspace as real files on first
@@ -99,8 +99,8 @@ const light_colors = [SLOT_COUNT]u32{
     0x2f6feb, 0x0b84a5, 0x2f8f46, 0x8a3ffc, 0xc27a00, 0xc93a4a, 0xa06a00, 0x0f8a83,
 };
 const matrix_colors = [SLOT_COUNT]u32{
-    0x061106, 0x030a03, 0x0b200e, 0x134020, 0x4aff7f, 0x2fd465, 0x1d9448, 0x15421f,
-    0x3bff9d, 0x00ffd0, 0x00ff41, 0xbd66ff, 0xffa028, 0xff4d4d, 0xffd93b, 0x00c9a0,
+    0x000000, 0x07100b, 0x0b140e, 0x174d2f, 0xc5d4c8, 0x8da494, 0x718579, 0x0c3b21,
+    0x00ef72, 0x7eb7ff, 0x16c56b, 0xd7a0e8, 0xffa000, 0xff2d55, 0xffcc44, 0x00aacc,
 };
 
 pub const builtin_ids = [3][]const u8{ "dark", "light", "matrix" };
@@ -216,6 +216,40 @@ const seed_light =
 ;
 
 const seed_matrix =
+    \\-- veil theme: Matrix (shipped; the Agent Garrett blog's palette)
+    \\-- mono_ui = true is what makes this one feel like a terminal: every frontend renders its
+    \\-- whole UI in the mono/code face while this theme is active. Palette rules of thumb:
+    \\-- keep `red` alarming and `orange` warm even in a stylized theme — they carry meaning.
+    \\return {
+    \\  id      = "matrix",
+    \\  name    = "Matrix",
+    \\  dark    = true,
+    \\  mono_ui = true,
+    \\  colors  = {
+    \\    bg      = "#000000",
+    \\    bg_dark = "#07100b",
+    \\    bg_hl   = "#0b140e",
+    \\    bg_sel  = "#174d2f",
+    \\    fg      = "#c5d4c8",
+    \\    fg_dim  = "#8da494",
+    \\    comment = "#718579",
+    \\    border  = "#0c3b21",
+    \\    blue    = "#00ef72",
+    \\    cyan    = "#7eb7ff",
+    \\    green   = "#16c56b",
+    \\    magenta = "#d7a0e8",
+    \\    orange  = "#ffa000",
+    \\    red     = "#ff2d55",
+    \\    yellow  = "#ffcc44",
+    \\    teal    = "#00aacc",
+    \\  },
+    \\}
+    \\
+;
+
+/// The Matrix file as it was shipped before the palette became the blog's. A workspace file that is still exactly
+/// this was never edited, so seedDir replaces it; one the user changed is theirs and stays.
+const seed_matrix_first =
     \\-- veil theme: Matrix (shipped, phosphor console)
     \\-- mono_ui = true is what makes this one feel like a terminal: every frontend renders its
     \\-- whole UI in the mono/code face while this theme is active. Palette rules of thumb:
@@ -247,8 +281,9 @@ const seed_matrix =
     \\
 ;
 
-/// Write the shipped theme files into `dir` when absent. Never overwrites — the workspace belongs
-/// to the user once seeded.
+/// Write the shipped theme files into `dir` when absent. A file the user edited is never overwritten — the
+/// workspace belongs to the user once seeded. The one exception is not an edit: a matrix.lua that is byte for byte
+/// the file first shipped (seed_matrix_first) is replaced by today's.
 pub fn seedDir(io: std.Io, dir: std.Io.Dir) void {
     const seeds = [_]struct { file: []const u8, body: []const u8 }{
         .{ .file = "dark.lua", .body = seed_dark },
@@ -259,6 +294,34 @@ pub fn seedDir(io: std.Io, dir: std.Io.Dir) void {
         if (dir.access(io, s.file, .{})) |_| continue else |_| {}
         dir.writeFile(io, .{ .sub_path = s.file, .data = s.body }) catch {};
     }
+    var buf: [seed_matrix_first.len + 1]u8 = undefined;
+    if (dir.readFile(io, "matrix.lua", &buf)) |have| {
+        if (std.mem.eql(u8, have, seed_matrix_first)) dir.writeFile(io, .{ .sub_path = "matrix.lua", .data = seed_matrix }) catch {};
+    } else |_| {}
+}
+
+test "an unedited first Matrix file takes today's palette; an edited one is left alone" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [4096]u8 = undefined;
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "matrix.lua", .data = seed_matrix_first });
+    seedDir(io, tmp.dir);
+    try std.testing.expectEqualStrings(seed_matrix, try tmp.dir.readFile(io, "matrix.lua", &buf));
+    try std.testing.expect(std.mem.indexOf(u8, seed_matrix, "\"#00ef72\"") != null and std.mem.indexOf(u8, seed_matrix, "#4aff7f") == null);
+
+    const edited = seed_matrix_first ++ "-- mine\n";
+    try tmp.dir.writeFile(io, .{ .sub_path = "matrix.lua", .data = edited });
+    seedDir(io, tmp.dir);
+    try std.testing.expectEqualStrings(edited, try tmp.dir.readFile(io, "matrix.lua", &buf));
+
+    // the compiled fallback and the seeded file say the same sixteen colours
+    var eb: [200]u8 = undefined;
+    const t = try parseTheme(std.testing.allocator, io, seed_matrix, &eb);
+    try std.testing.expectEqualSlices(u32, &matrix_colors, &t.colors);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -555,7 +618,7 @@ test "writeJson emits an array with hex colors" {
     try writeJson(&set, std.testing.allocator, &out);
     try std.testing.expect(std.mem.startsWith(u8, out.items, "[{\"id\":\"dark\""));
     try std.testing.expect(std.mem.indexOf(u8, out.items, "\"matrix\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "#00ff41") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "#16c56b") != null); // Matrix's green
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, out.items, .{});
     defer parsed.deinit();
     try std.testing.expectEqual(@as(usize, 3), parsed.value.array.items.len);
