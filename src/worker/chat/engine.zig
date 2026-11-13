@@ -3371,6 +3371,8 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
             scrubUtf8(rs_raw);
             const parsed = std.json.parseFromSlice(ScoredRecall, gpa, rs_raw, .{ .ignore_unknown_fields = true }) catch break :scored;
             defer parsed.deinit();
+            // The parser allocated the hits in its own arena, so reordering them in place is safe.
+            newerFirstOnTies(@constCast(parsed.value.hits));
             const hits = parsed.value.hits;
             if (hits.len == 0) break :scored;
             scored_ok = true;
@@ -6663,6 +6665,62 @@ fn lastAssistantNote(app: *App, conv_dir: []const u8) ?[]u8 {
 /// `with`). Shared by the turn's parse and the test below so the contract drifts loudly, not silently.
 const ScoredHit = struct { fact: []const u8 = "", coverage: f64 = 0, overlap: u32 = 0, exact: u32 = 0, idx: u32 = 0, contested: bool = false, with: ?[]const u8 = null };
 const ScoredRecall = struct { hits: []const ScoredHit = &.{} };
+
+/// Where neuron scores two recalled facts EXACTLY the same (coverage, overlap and exact count), put the newer
+/// one first. The store breaks such ties by insertion order, oldest first, so a fact the user corrected later
+/// ("the budget was raised to 55 thousand") scored level with the one it replaced ("the budget is 40
+/// thousand"), and the outdated value was numbered 1 in RELEVANT MEMORY. Measured on a 300-turn chat: 3 of 5
+/// corrected facts tied this way. Only a run of consecutive, fully tied hits is reordered, newest (highest
+/// `idx`) first; every other position keeps neuron's ranking, and the top hit's coverage is unchanged.
+fn newerFirstOnTies(hits: []ScoredHit) void {
+    var start: usize = 0;
+    while (start < hits.len) {
+        var end = start + 1;
+        while (end < hits.len and hits[end].coverage == hits[start].coverage and
+            hits[end].overlap == hits[start].overlap and hits[end].exact == hits[start].exact) : (end += 1)
+        {}
+        // insertion sort: a recall block holds a handful of hits, and equal idx keeps its order
+        var i: usize = start + 1;
+        while (i < end) : (i += 1) {
+            const h = hits[i];
+            var j = i;
+            while (j > start and hits[j - 1].idx < h.idx) : (j -= 1) hits[j] = hits[j - 1];
+            hits[j] = h;
+        }
+        start = end;
+    }
+}
+
+test "newerFirstOnTies puts the later of two equally scored facts first and moves nothing else" {
+    var hits = [_]ScoredHit{
+        .{ .fact = "budget is 40 thousand", .coverage = 0.8333, .overlap = 5, .exact = 5, .idx = 7 },
+        .{ .fact = "budget was raised to 55 thousand", .coverage = 0.8333, .overlap = 5, .exact = 5, .idx = 147 },
+        .{ .fact = "heron moved to cockroachdb", .coverage = 0.1667, .overlap = 1, .exact = 0, .idx = 143 },
+    };
+    newerFirstOnTies(&hits);
+    try std.testing.expectEqualStrings("budget was raised to 55 thousand", hits[0].fact);
+    try std.testing.expectEqualStrings("budget is 40 thousand", hits[1].fact);
+    try std.testing.expectEqualStrings("heron moved to cockroachdb", hits[2].fact);
+
+    // a better-scored OLD fact keeps its place: only exact ties move
+    var ranked = [_]ScoredHit{
+        .{ .fact = "standup in room cedar", .coverage = 0.8, .overlap = 4, .exact = 3, .idx = 5 },
+        .{ .fact = "standup moved to room birch", .coverage = 0.6, .overlap = 3, .exact = 3, .idx = 145 },
+    };
+    newerFirstOnTies(&ranked);
+    try std.testing.expectEqualStrings("standup in room cedar", ranked[0].fact);
+
+    // same coverage but a different exact count is not a tie
+    var near = [_]ScoredHit{
+        .{ .fact = "a", .coverage = 0.5, .overlap = 2, .exact = 2, .idx = 1 },
+        .{ .fact = "b", .coverage = 0.5, .overlap = 2, .exact = 1, .idx = 9 },
+    };
+    newerFirstOnTies(&near);
+    try std.testing.expectEqualStrings("a", near[0].fact);
+
+    var none = [_]ScoredHit{};
+    newerFirstOnTies(&none);
+}
 
 test "ScoredRecall parses the neuron CLI's recallscored wire shape verbatim" {
     const gpa = std.testing.allocator;
