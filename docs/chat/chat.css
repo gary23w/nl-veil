@@ -166,6 +166,8 @@ button:disabled, .btn[aria-disabled=true] { opacity: .5; cursor: default; pointe
 .git .tree-row .badge { font-weight: 700; }
 .git-added .badge { color: var(--success); } .git-changed .badge { color: var(--accent); } .git-deleted .badge { color: var(--danger); } .git-deleted .name { text-decoration: line-through; }
 dialog.ask { border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface-raised); color: var(--text); padding: 0; width: min(92vw, 440px); box-shadow: 0 12px 40px rgb(0 0 0 / .35); }
+/* the site's reset takes a dialog's own centring away: it is put back, and a tall one scrolls inside the window */
+dialog.ask { position: fixed; inset: 0; margin: auto; max-height: calc(100dvh - 32px); overflow: auto; }
 dialog.ask::backdrop { background: rgb(0 0 0 / .4); }
 .ask-in { display: grid; gap: 10px; padding: 16px; }
 .ask-in p { margin: 0; font-size: var(--fs-ui); overflow-wrap: anywhere; }
@@ -374,4 +376,23 @@ details.tool pre { padding: 8px 10px; border-top: 1px solid var(--border); max-h
 .term-prompt { flex: 0 0 auto; display: flex; align-items: center; gap: 8px; padding: 2px 12px 6px; }
 .term-cwd { color: var(--tok-k, var(--accent)); white-space: nowrap; }
 .term-in { flex: 1; min-width: 0; background: transparent !important; border: 0 !important; box-shadow: none !important; outline: none; padding: 0; height: var(--code-line); min-height: 0; font: inherit; color: var(--text); border-radius: 0; }
+
+/* ---- the Swarm tab ---- */
+#swarmGoal { width: 100%; resize: vertical; min-height: 84px; }
+.swarm-form { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 6px; margin-top: 6px; }
+.swarm-row { display: flex; align-items: center; gap: 8px; width: 100%; padding: 7px 8px; border: 0; border-radius: var(--radius-btn); background: transparent; color: var(--text); text-align: left; cursor: pointer; }
+.swarm-row:hover { background: var(--surface-hover); }
+.swarm-row .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.swarm-top { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-bottom: 6px; }
+.chip.swarm-running { color: var(--success); border-color: color-mix(in srgb, var(--success) 50%, transparent); }
+.chip.swarm-done { color: var(--accent); }
+.chip.swarm-failed, .chip.swarm-stopped { color: var(--text-muted); }
+.chip.swarm-paused { color: var(--warn); }
+.swarm-detail details { border-top: 1px solid var(--border); padding: 6px 0; }
+.swarm-detail summary { cursor: pointer; font-weight: 600; font-size: var(--fs-ui); }
+.swarm-mind { margin-left: 10px; border-top: 0 !important; }
+.swarm-mind summary { font-weight: 400; }
+.swarm-summary { margin: 8px 0; }
+.swarm-log { font: var(--fs-micro)/1.6 var(--font-mono); max-height: 260px; overflow: auto; }
+#swarmSay { flex: 1; min-width: 0; }
 

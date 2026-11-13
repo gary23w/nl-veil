@@ -162,7 +162,7 @@ const S = {
   convs: [],                             // [{id, title, at}] newest first; the harness's copy and this browser's, merged
   conv: null,                            // the open conversation: {id, title, at, msgs, files}
   live: null,                            // the running turn: {tools, text, status, abort}
-  tab: ['code', 'jobs', 'harness'].includes(ui.tab) ? ui.tab : 'code',   // the side pane: code | jobs | harness
+  tab: ['code', 'swarm', 'jobs', 'harness'].includes(ui.tab) ? ui.tab : 'code',   // the side pane: code | jobs | harness
   lay: { rail: true, chat: true, side: 0, ...ls.get('veilweb.layout', {}) },   // wide screens: which panes show, and the side pane's width in px (0 = its own)
   file: null,                            // the file showing in the editor
   open: [],                              // the files open as editor tabs
@@ -316,6 +316,7 @@ function loadHarnessData() {
   pullConvs();
   pullShared();
   meshHello();
+  refreshSwarms();
 }
 
 async function refreshStatus() {
@@ -869,6 +870,12 @@ const TOOLS = {
   swarm: { args: '{"task": "<the question>", "angles": ["<a way to look at it>", "..."]}', does: 'ask up to ' + SWARM_MAX + ' minds at once, one per angle, and get every answer back to weigh' },
   queue_job: { args: '{"task": "<the whole task, self-contained>"}', does: 'hand a long task to the worker harness; it runs there in turn (first in, first out) even with this tab closed, and the user reads the result in the Jobs tab' },
   schedule_job: { args: '{"task": "<the whole task, self-contained>", "every_minutes": 60}', does: 'have the harness queue this task again and again, every so many minutes (5 at the least)', when: () => !outdated() },
+  swarm_deploy: { args: '{"goal": "<what done looks like>", "name": "<short name>", "minds": 3, "rounds": 8, "where": "harness"}', does: 'deploy a swarm that works toward a goal ON ITS OWN in the harness, round by round, with the tab closed (minds 1-6, rounds up to 40; where "mesh" sends the tasks to the user\'s own machines). For big work that should go on without the user: wide research, a build with many parts', when: () => swarmOn() },
+  swarm_list: { args: '{}', does: 'list the swarms and how each stands', when: () => swarmOn() },
+  swarm_status: { args: '{"id": "<swarm id or name>"}', does: 'how a swarm stands: its round, what its minds brought back, its lessons, its files (id is optional: the running one)', when: () => swarmOn() },
+  swarm_say: { args: '{"id": "<swarm>", "text": "<guidance>"}', does: 'tell a running swarm something: its coordinator follows it from the next round', when: () => swarmOn() },
+  swarm_stop: { args: '{"id": "<swarm>"}', does: 'stop a swarm', when: () => swarmOn() },
+  swarm_files: { args: '{"id": "<swarm>"}', does: 'copy a swarm\'s shared files into this workspace', when: () => swarmOn() },
   run_command: { args: '{"command": "<one line>"}', does: 'run a line in the workspace terminal and get what it printed: ls, cat, grep, find, head, tail, mv, cp, rm, mkdir, python file.py, pip install name, node file.js, curl url, git status|commit|push (a clone). It is a browser tab, not a computer: no npm, apt or compilers' },
   run_python: { args: '{"code": "<python>"}', does: 'run a Python script; the workspace files are beside it and text files it creates or changes come back into the workspace. Print what you want to see' },
   garrett_tools: { args: '{"query": "<words, optional>"}', does: 'list Agent Garrett\'s security tools (those matching the words)', when: () => S.status?.garrett?.connected },
@@ -946,6 +953,8 @@ async function runToolInner(name, args, signal) {
       const to = Math.max(from, Math.min(lines.length, from + READ_LINES - 1, asked !== undefined ? Math.floor(Number(asked)) || from : Infinity));
       return `${f}, lines ${from}-${to} of ${lines.length}${repo.partial.has(f) ? ' loaded (the file is larger: only its first part is loaded)' : ''}:\n` + lines.slice(from - 1, to).join('\n') + (to < lines.length ? `\n(more below: read on with "from": ${to + 1})` : '');
     }
+    case 'swarm_deploy': case 'swarm_list': case 'swarm_status': case 'swarm_say': case 'swarm_stop': case 'swarm_files':
+      return swarmTool(name, args);
     case 'run_command': {
       const line = String(args.command ?? args.cmd ?? args.line ?? '').trim();
       if (!line) return 'error: command is empty';
@@ -2675,6 +2684,178 @@ function termPanel() {
   return h('div', { class: 'term' + (ui.termTall ? ' tall' : ''), id: 'term' }, head, out, h('div', { class: 'term-prompt' }, h('span', { class: 'term-cwd' }, (term.cwd ? '/' + term.cwd : '~') + ' $'), input));
 }
 
+/* ============================================================ swarms: minds at work toward a goal, on their own */
+
+/* A swarm is deployed with a goal and left to it. It runs in your harness, so it goes on with this tab closed:
+   each round a coordinator reads what the minds brought back, keeps what was learned, and hands out the next
+   tasks; every mind is a job with the harness's tools and the swarm's shared files. On the mesh, the minds' tasks
+   go to your own machines instead. Any veil of yours (this tab, the desk) sees the same swarms, because they
+   live in the harness. The chat can deploy and steer one through its tools; the Swarm tab is the same thing by hand. */
+const hive = {
+  list: [],        // the harness's swarms, newest first
+  open: null,      // the swarm being looked at (whole record)
+  lessons: [],     // the lineage: what ended swarms learned
+  limits: { minds: 6, rounds: 40 },
+  busy: '',
+  note: '',
+};
+const swarmOn = () => !!S.status && Number(S.status.version) >= 12;
+const SWARM_STATE = { running: 'LIVE', paused: 'paused', done: 'done', stopped: 'stopped', failed: 'failed' };
+
+async function refreshSwarms() {
+  if (!swarmOn()) return;
+  try {
+    const j = await harnessJson('/v1/swarms');
+    hive.list = [...j.swarms].sort((a, b) => b.created - a.created);
+    hive.lessons = j.lessons ?? [];
+    hive.limits = { minds: j.workers_max ?? 6, rounds: j.cycles_max ?? 40 };
+    if (hive.open) {
+      if (!hive.list.some((x) => x.id === hive.open.id)) hive.open = null;
+      else hive.open = (await harnessJson('/v1/swarms/' + hive.open.id)).swarm;
+    }
+  } catch (e) {
+    hive.note = e.message;
+  }
+  if (S.tab === 'swarm' && !['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement?.tagName)) drawSide();   // not under what is being typed
+}
+setInterval(() => { if (swarmOn() && !document.hidden && (S.tab === 'swarm' || hive.list.some((x) => x.state === 'running'))) refreshSwarms(); }, 5000);
+
+async function swarmDeploy(body) {
+  const j = await harnessJson('/v1/swarms', { body: { model: S.model, ...body } });
+  await refreshSwarms();
+  hive.open = (await harnessJson('/v1/swarms/' + j.id)).swarm;
+  return j.id;
+}
+
+async function swarmOp(id, body) {
+  const j = await harnessJson('/v1/swarms/' + id, { body });
+  if (hive.open?.id === id) hive.open = j.swarm;
+  await refreshSwarms();
+  return j.swarm;
+}
+
+/* How a swarm stands, in words: for the chat's tools, and for a reader. */
+function swarmReport(sw) {
+  const now = sw.tasks.filter((t) => t.cycle === sw.cycle);
+  return `Swarm "${sw.name}" (${sw.id}): ${SWARM_STATE[sw.state] ?? sw.state}, round ${Math.min(sw.cycle + 1, sw.cycles)} of ${sw.cycles}, ${sw.workers} minds, on ${sw.where === 'mesh' ? 'the mesh' : 'the harness'}${sw.note ? ' (' + sw.note + ')' : ''}.\n` +
+    (sw.summary ? `Where it stands: ${sw.summary}\n` : '') +
+    (now.length ? `This round:\n${now.map((t) => `- ${t.role}: ${t.state}${t.result ? '. ' + clip(t.result, 300) : ''}`).join('\n')}\n` : '') +
+    (sw.lessons.length ? `Lessons: ${sw.lessons.slice(-6).join(' | ')}\n` : '') +
+    (Object.keys(sw.files).length ? `Shared files: ${Object.keys(sw.files).join(', ')}` : '');
+}
+
+/* The chat's swarm tools. */
+async function swarmTool(name, args) {
+  if (!swarmOn()) return 'error: this harness is older than swarms: update it in the Harness tab';
+  try {
+    await refreshSwarms();
+    const pick = () => {
+      const id = String(args.id ?? '').trim();
+      const row = id ? hive.list.find((x) => x.id === id || x.name.toLowerCase() === id.toLowerCase()) : hive.list.find((x) => x.state === 'running') ?? hive.list[0];
+      if (!row) throw new Error(id ? `no swarm "${id}". Swarms: ${hive.list.map((x) => x.name + ' (' + x.id + ')').join(', ') || 'none'}` : 'there is no swarm yet');
+      return row.id;
+    };
+    switch (name) {
+      case 'swarm_deploy': {
+        const goal = String(args.goal ?? args.task ?? '').trim();
+        if (!goal) return 'error: swarm_deploy needs a goal';
+        const id = await swarmDeploy({ goal, name: args.name, minds: args.minds ?? args.workers, rounds: args.rounds ?? args.cycles, where: args.where === 'mesh' ? 'mesh' : 'harness' });
+        S.tab = 'swarm';
+        drawSide();
+        return `deployed swarm ${id}. It works on its own in the harness, round by round, and goes on with this tab closed. Look in with swarm_status; the user watches it in the Swarm tab.`;
+      }
+      case 'swarm_list':
+        return hive.list.length ? hive.list.map((x) => `${x.id}  ${x.name}  ${SWARM_STATE[x.state] ?? x.state}  round ${Math.min(x.cycle + 1, x.cycles)}/${x.cycles}`).join('\n') : 'no swarms yet';
+      case 'swarm_status': {
+        const sw = (await harnessJson('/v1/swarms/' + pick())).swarm;
+        return swarmReport(sw);
+      }
+      case 'swarm_say': {
+        const text = String(args.text ?? args.message ?? '').trim();
+        if (!text) return 'error: swarm_say needs text';
+        await swarmOp(pick(), { op: 'say', text });
+        return 'told the swarm: its coordinator takes it into account from the next round';
+      }
+      case 'swarm_stop':
+        return 'stopped. ' + swarmReport(await swarmOp(pick(), { op: 'stop' }));
+      case 'swarm_files': {
+        const sw = (await harnessJson('/v1/swarms/' + pick())).swarm;
+        const names = Object.keys(sw.files);
+        if (!names.length) return 'that swarm has no shared files yet';
+        for (const n of names) await runTool('write_file', { name: n, content: sw.files[n] });
+        return `copied into this workspace: ${names.join(', ')}`;
+      }
+    }
+  } catch (e) {
+    return 'error: ' + e.message;
+  }
+  return 'error: no such swarm tool';
+}
+
+/* ---- the Swarm tab ---- */
+
+function swarmDetail(sw) {
+  const live = sw.state === 'running' || sw.state === 'paused';
+  const act = (label, body, cls = 'btn btn-sm') => h('button', { class: cls, disabled: !!hive.busy, onclick: async () => { hive.busy = label; drawSide(); try { await swarmOp(sw.id, body); } catch (e) { toast(e.message); } hive.busy = ''; drawSide(); } }, label);
+  const say = h('input', { id: 'swarmSay', type: 'text', placeholder: 'Say something to the swarm (its coordinator reads it next round)', 'aria-label': 'Say something to the swarm', autocomplete: 'off',
+    onkeydown: async (e) => { if (e.key !== 'Enter' || !e.target.value.trim()) return; const text = e.target.value.trim(); e.target.value = ''; try { await swarmOp(sw.id, { op: 'say', text }); } catch (err) { toast(err.message); } drawSide(); } });
+  const rounds = [...new Set(sw.tasks.map((t) => t.cycle))].sort((a, b) => b - a);
+  const files = Object.keys(sw.files);
+  return h('div', { class: 'block swarm-detail' },
+    h('div', { class: 'swarm-top' }, h('button', { class: 'btn btn-ghost btn-sm', onclick: () => { hive.open = null; drawSide(); } }, '‹ Swarms'),
+      h('strong', {}, sw.name), h('span', { class: 'chip swarm-' + sw.state }, SWARM_STATE[sw.state] ?? sw.state),
+      h('span', { class: 'fine' }, `round ${Math.min(sw.cycle + 1, sw.cycles)} of ${sw.cycles} · ${sw.workers} minds · ${sw.where === 'mesh' ? 'mesh' : 'harness'} · ${sw.calls} model calls`)),
+    sw.note ? h('p', { class: 'fine' }, sw.note) : null,
+    h('details', { class: 'swarm-goal' }, h('summary', {}, 'Goal'), h('p', {}, sw.goal)),
+    sw.summary ? h('div', { class: 'swarm-summary md', html: render(sw.summary) }) : h('p', { class: 'fine' }, 'The coordinator is planning the first round…'),
+    live ? h('div', { class: 'acts' }, say) : null,
+    h('div', { class: 'acts' },
+      sw.state === 'running' ? act('Pause', { op: 'pause' }) : null,
+      sw.state === 'paused' ? act('Resume', { op: 'resume' }) : null,
+      live ? act('Stop', { op: 'stop' }, 'btn btn-sm btn-danger') : null,
+      live ? h('button', { class: 'btn btn-sm', onclick: async () => { const goal = await askText('The swarm\'s new goal', sw.goal); if (goal && goal.trim() !== sw.goal) { try { await swarmOp(sw.id, { op: 'set_goal', goal }); } catch (e) { toast(e.message); } drawSide(); } } }, 'Set goal') : null,
+      files.length ? h('button', { class: 'btn btn-sm', title: 'Copy the swarm\'s shared files into this chat\'s workspace', onclick: async () => { toast(await swarmTool('swarm_files', { id: sw.id })); S.tab = 'code'; drawSide(); } }, `Open its ${files.length} file${files.length === 1 ? '' : 's'} in Code`) : null,
+      live ? null : h('button', { class: 'btn btn-sm btn-ghost', onclick: async () => { if (!(await askSure('Delete this swarm and what it kept?', 'Delete'))) return; await harnessJson('/v1/swarms/' + sw.id, { method: 'DELETE' }).catch((e) => toast(e.message)); hive.open = null; refreshSwarms(); } }, 'Delete')),
+    rounds.map((c) => h('details', { class: 'swarm-round', open: c === sw.cycle ? '' : null }, h('summary', {}, `Round ${c + 1}`),
+      sw.tasks.filter((t) => t.cycle === c).map((t) => h('details', { class: 'swarm-mind' },
+        h('summary', {}, h('span', { class: 'chip swarm-' + (t.state === 'working' ? 'running' : t.state === 'done' ? 'done' : 'failed') }, t.state === 'working' ? 'at work' : t.state), ' ', t.role, t.node ? h('span', { class: 'fine' }, ' on ' + t.node) : null),
+        h('p', { class: 'fine' }, t.task), t.result ? h('div', { class: 'md', html: render(t.result) }) : null)))),
+    sw.lessons.length ? h('details', { class: 'swarm-round' }, h('summary', {}, `Lessons (${sw.lessons.length})`), h('ul', {}, sw.lessons.map((x) => h('li', {}, x)))) : null,
+    h('details', { class: 'swarm-round' }, h('summary', {}, 'Console'), h('div', { class: 'swarm-log' }, sw.log.slice().reverse().map((l) => h('div', {}, h('span', { class: 'fine' }, new Date(l.at).toLocaleTimeString() + '  '), l.text)))));
+}
+
+function swarmTab() {
+  if (!swarmOn()) return [h('div', { class: 'block' }, h('h3', {}, 'Swarms'), h('p', {}, 'Swarms need a newer harness. Update it in the Harness tab, then come back.'))];
+  if (hive.open) return [swarmDetail(hive.open)];
+  const nodes = (typeof mesh !== 'undefined' ? mesh.nodes : []).filter((n) => n.online && n.runs && n.kind !== 'web');
+  const opt = (v, label, sel) => h('option', { value: String(v), selected: sel }, label);
+  const goal = h('textarea', { id: 'swarmGoal', rows: '4', placeholder: 'The goal. Say what done looks like: "Research the five biggest open-source vector databases, compare them on licence, speed and hosting cost, and write report.md with sources."', 'aria-label': 'The swarm\'s goal' });
+  const name = h('input', { id: 'swarmName', type: 'text', placeholder: 'Name (optional)', 'aria-label': 'Name', autocomplete: 'off', maxlength: '60' });
+  const minds = h('select', { id: 'swarmMinds', 'aria-label': 'Minds' }, [1, 2, 3, 4, 5, 6].filter((n) => n <= hive.limits.minds).map((n) => opt(n, n + (n === 1 ? ' mind' : ' minds'), n === 3)));
+  const rounds = h('select', { id: 'swarmRounds', 'aria-label': 'Rounds' }, [3, 5, 8, 12, 20, 40].filter((n) => n <= hive.limits.rounds).map((n) => opt(n, 'up to ' + n + ' rounds', n === 8)));
+  const where = h('select', { id: 'swarmWhere', 'aria-label': 'Where it runs' }, opt('harness', 'In the harness (runs with every tab closed)', true), h('option', { value: 'mesh', disabled: !nodes.length }, nodes.length ? `On my machines: ${nodes.map((n) => n.name).join(', ')}` : 'On my machines (none is online and set to run work)'));
+  const deploy = async () => {
+    if (goal.value.trim().length < 8) return toast('Write the goal first.');
+    hive.busy = 'deploy';
+    drawSide();
+    try { await swarmDeploy({ goal: goal.value.trim(), name: name.value.trim(), minds: Number(minds.value), rounds: Number(rounds.value), where: where.value }); goal.value = ''; name.value = ''; } catch (e) { toast(e.message); }
+    hive.busy = '';
+    drawSide();
+  };
+  return [
+    h('div', { class: 'block' }, h('h3', {}, 'Deploy a swarm'),
+      h('p', {}, 'Give it a goal and let it work. A coordinator plans round by round, the minds do the tasks with the harness\'s tools (web, files, Python, your MCP servers), and what they learn is kept. It runs in your harness, so you can close this tab; the chat can deploy and steer one too.'),
+      goal, h('div', { class: 'swarm-form' }, name, minds, rounds, where),
+      h('p', { class: 'fine' }, 'Model: ' + S.model.split('/').pop() + ' (the chat\'s). Every round and every mind spends model calls from your harness\'s daily limit.'),
+      h('div', { class: 'acts' }, h('button', { class: 'btn btn-solid', disabled: hive.busy === 'deploy', onclick: deploy }, hive.busy === 'deploy' ? 'Deploying…' : 'Deploy swarm'))),
+    h('div', { class: 'block' }, h('h3', {}, 'Swarms'),
+      hive.list.length ? hive.list.map((x) => h('button', { class: 'swarm-row', onclick: async () => { try { hive.open = (await harnessJson('/v1/swarms/' + x.id)).swarm; } catch (e) { toast(e.message); } drawSide(); } },
+        h('span', { class: 'chip swarm-' + x.state }, SWARM_STATE[x.state] ?? x.state), h('span', { class: 'name' }, x.name), h('span', { class: 'fine' }, `r${Math.min(x.cycle + 1, x.cycles)}/${x.cycles} · ${x.workers} minds${x.where === 'mesh' ? ' · mesh' : ''}`)))
+        : h('p', { class: 'fine' }, 'None yet.')),
+    hive.lessons.length ? h('div', { class: 'block' }, h('h3', {}, 'Lineage'), h('p', { class: 'fine' }, 'What ended swarms learned. The next swarm starts with these.'), h('ul', {}, hive.lessons.slice(-12).reverse().map((x) => h('li', {}, x)))) : null,
+  ];
+}
+
 /* ============================================================ the loop */
 
 /* What a reply asks for: {tool, args, say, cut?}, {broken}, or null when it is the answer (toolCall, above). */
@@ -3933,16 +4114,15 @@ document.addEventListener('keydown', (e) => {
 });
 
 function sidePane() {
-  const tab = (id, label) => h('button', { class: S.tab === id ? 'on' : '', role: 'tab', 'aria-selected': String(S.tab === id), onclick: () => { S.tab = id; S.note = ''; drawSide(); if (id === 'jobs') refreshJobs(); if (id === 'harness') refreshStatus(); } }, label);
+  const tab = (id, label) => h('button', { class: S.tab === id ? 'on' : '', role: 'tab', 'aria-selected': String(S.tab === id), onclick: () => { S.tab = id; S.note = ''; drawSide(); if (id === 'jobs') refreshJobs(); if (id === 'swarm') refreshSwarms(); if (id === 'harness') refreshStatus(); } }, label);
   const active = S.jobs.filter((j) => j.state === 'queued' || j.state === 'running').length;
-  const files = repo.on() ? 0 : Object.keys(S.conv.files).length;
   return h('aside', { class: 'side', id: 'side' },
-    h('div', { class: 'tabs', role: 'tablist' }, tab('code', files ? `Code (${files})` : 'Code'), tab('jobs', active ? `Jobs (${active})` : 'Jobs'), tab('harness', outdated() ? 'Harness •' : 'Harness'),
+    h('div', { class: 'tabs', role: 'tablist' }, tab('code', 'Code'), tab('swarm', hive.list.some((x) => x.state === 'running') ? 'Swarm •' : 'Swarm'), tab('jobs', active ? `Jobs (${active})` : 'Jobs'), tab('harness', outdated() ? 'Harness •' : 'Harness'),
       h('span', { class: 'grow' }),
       S.tab === 'code' ? h('button', { class: 'widen', 'aria-label': S.explorer ? 'Hide the explorer' : 'Show the explorer', 'aria-pressed': String(S.explorer), title: 'Explorer', onclick: () => { S.explorer = !S.explorer; drawSide(); } }, '☰') : null,
       h('button', { class: 'widen', 'aria-label': S.lay.chat ? 'Hide the chat' : 'Show the chat', 'aria-pressed': String(!S.lay.chat), title: S.lay.chat ? 'Hide the chat (more room for code)' : 'Show the chat', onclick: () => setLayout({ chat: !S.lay.chat }) }, S.lay.chat ? 'Hide chat' : 'Show chat'),
       h('button', { class: 'widen', 'aria-label': fullCode() ? 'Leave full screen' : 'Full screen', 'aria-pressed': String(fullCode()), title: fullCode() ? 'Leave full screen (Esc)' : 'Full screen', onclick: () => toggleFull() }, fullCode() ? 'Exit full screen' : 'Full screen')),
-    h('div', { class: 'pane tab-' + S.tab + (S.tab !== shownTab ? ' enter' : '') }, S.tab === 'code' ? codeTab() : S.tab === 'jobs' ? jobsTab() : harnessTab()));
+    h('div', { class: 'pane tab-' + S.tab + (S.tab !== shownTab ? ' enter' : '') }, S.tab === 'code' ? codeTab() : S.tab === 'swarm' ? swarmTab() : S.tab === 'jobs' ? jobsTab() : harnessTab()));
 }
 let shownTab = 'code';   // the tab the pane last drew: only a change of tab is an entrance
 
