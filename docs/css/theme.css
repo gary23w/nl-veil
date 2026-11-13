@@ -7,6 +7,9 @@
    LIGHT is the default in all three (theme.zig:207).
    ========================================================================= */
 
+/* JetBrains Mono is served from this site: the matrix theme and the code editor ask for it by name. */
+@import url("../fonts/JetBrainsMono.css");
+
 :root {
   /* ---- palette: light (theme.zig light_palette) ---- */
   --bg:      #f5f7fb;
