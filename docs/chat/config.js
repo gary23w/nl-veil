@@ -36,7 +36,8 @@ window.VEIL_WEB = {
   /* The browser link extension's folder in the public repo (Chrome or Edge, loaded unpacked). */
   extension: "https://github.com/gary23w/nl-veil/tree/main/extension",
   extension_raw: "https://raw.githubusercontent.com/gary23w/nl-veil/main/extension/",
-  extension_files: ["manifest.json", "background.js", "bridge.js", "popup.html", "popup.js"],
+  extension_files: ["manifest.json", "background.js", "bridge.js", "popup.html", "popup.js",
+    "icons/icon16.png", "icons/icon32.png", "icons/icon48.png", "icons/icon128.png"],
   /* Its store listings. Empty until it is published; with one, "Install extension" is the store's one click. */
   extension_store: { chrome: "", edge: "" },
 

@@ -1,0 +1,171 @@
+name: extension-stores
+
+# Keeps the "nl-veil browser link" extension in the Chrome Web Store and Microsoft Edge Add-ons in step with
+# extension/ on main. Whenever a push to main changes extension/, this zips the folder (manifest.json at the zip's
+# root) and sends it to each store as a new version, then submits it for that store's review. Each store publishes
+# it once its review passes.
+#
+# A store refuses a package whose version it already has, so every change to extension/ must raise "version" in
+# extension/manifest.json. A push that changes extension/ without a higher version fails the `check` job and
+# uploads nothing.
+#
+# ONE-TIME SETUP (neither store's API can create an item, so the first version is submitted by hand in each
+# dashboard; this workflow only updates it). Repository secrets, under Settings -> Secrets and variables -> Actions:
+#   Chrome Web Store (API v2; the Google account must own the item and have 2-step verification on):
+#     CWS_PUBLISHER_ID, CWS_EXTENSION_ID           the developer dashboard shows both
+#     CWS_CLIENT_ID, CWS_CLIENT_SECRET, CWS_REFRESH_TOKEN
+#                                                  an OAuth client of a Google Cloud project with the Chrome Web
+#                                                  Store API enabled, and a refresh token for the
+#                                                  https://www.googleapis.com/auth/chromewebstore scope
+#   Edge Add-ons (Update REST API v1.1):
+#     EDGE_PRODUCT_ID                              Partner Center -> Microsoft Edge -> the extension's overview
+#     EDGE_CLIENT_ID, EDGE_API_KEY                 Partner Center -> Microsoft Edge -> Publish API
+# A store whose secrets are not all set is skipped with a notice, so the workflow is harmless before setup.
+# Edge API keys expire: Partner Center shows the date; renew the key there and update EDGE_API_KEY.
+
+on:
+  push:
+    branches: [main]
+    paths: ['extension/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: extension-stores
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Version must rise with every change to extension/
+        id: v
+        env:
+          BEFORE: ${{ github.event.before }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          now=$(jq -r .version extension/manifest.json)
+          echo "version=$now" >> "$GITHUB_OUTPUT"
+          echo "extension/manifest.json version: $now"
+          if [ "$EVENT" != push ] || [ -z "$BEFORE" ] || [ "$BEFORE" = 0000000000000000000000000000000000000000 ] \
+             || ! git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+            exit 0   # a manual run, or no previous commit to compare with: send what is there
+          fi
+          was=$(git show "$BEFORE:extension/manifest.json" 2>/dev/null | jq -r .version 2>/dev/null || echo 0)
+          echo "before this push: $was"
+          higher=$(printf '%s\n%s\n' "$was" "$now" | sort -V | tail -n1)
+          if [ "$now" = "$was" ] || [ "$higher" != "$now" ]; then
+            echo "::error file=extension/manifest.json::extension/ changed but the version did not rise ($was -> $now). The stores refuse a version they already have: raise \"version\" in extension/manifest.json."
+            exit 1
+          fi
+
+  package:
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Zip extension/
+        run: |
+          cd extension
+          zip -r -X "$RUNNER_TEMP/nl-veil-browser-link.zip" . -x '.*'
+          unzip -l "$RUNNER_TEMP/nl-veil-browser-link.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nl-veil-browser-link-${{ needs.check.outputs.version }}
+          path: ${{ runner.temp }}/nl-veil-browser-link.zip
+
+  chrome:
+    needs: [check, package]
+    runs-on: ubuntu-latest
+    env:
+      PUB: ${{ secrets.CWS_PUBLISHER_ID }}
+      ITEM: ${{ secrets.CWS_EXTENSION_ID }}
+      CLIENT_ID: ${{ secrets.CWS_CLIENT_ID }}
+      CLIENT_SECRET: ${{ secrets.CWS_CLIENT_SECRET }}
+      REFRESH: ${{ secrets.CWS_REFRESH_TOKEN }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: nl-veil-browser-link-${{ needs.check.outputs.version }}
+          path: pkg
+      - name: Upload to the Chrome Web Store and submit for review
+        run: |
+          if [ -z "$PUB" ] || [ -z "$ITEM" ] || [ -z "$CLIENT_ID" ] || [ -z "$CLIENT_SECRET" ] || [ -z "$REFRESH" ]; then
+            echo "::notice::Chrome Web Store secrets are not set; skipped (see the setup notes at the top of this workflow)."
+            exit 0
+          fi
+          token=$(curl -sS --fail-with-body https://oauth2.googleapis.com/token \
+            --data-urlencode "client_id=$CLIENT_ID" --data-urlencode "client_secret=$CLIENT_SECRET" \
+            --data-urlencode "refresh_token=$REFRESH" -d grant_type=refresh_token | jq -r .access_token)
+          [ -n "$token" ] && [ "$token" != null ] || { echo "::error::could not get a Chrome Web Store access token"; exit 1; }
+          echo "::add-mask::$token"
+          api=https://chromewebstore.googleapis.com
+          up=$(curl -sS --fail-with-body -X POST -H "Authorization: Bearer $token" -H "Content-Type: application/zip" \
+            --data-binary @pkg/nl-veil-browser-link.zip "$api/upload/v2/publishers/$PUB/items/$ITEM:upload")
+          echo "upload: $up"
+          state=$(echo "$up" | jq -r '.uploadState // empty')
+          for i in $(seq 1 30); do
+            [ "$state" = IN_PROGRESS ] || break
+            sleep 10
+            st=$(curl -sS --fail-with-body -H "Authorization: Bearer $token" "$api/v2/publishers/$PUB/items/$ITEM:fetchStatus")
+            state=$(echo "$st" | jq -r '.lastAsyncUploadState // empty')
+            echo "upload state: $state"
+          done
+          case "$state" in SUCC*) ;; *) echo "::error::Chrome Web Store upload did not succeed (state: ${state:-none})"; exit 1 ;; esac
+          pub=$(curl -sS --fail-with-body -X POST -H "Authorization: Bearer $token" -H "Content-Length: 0" \
+            "$api/v2/publishers/$PUB/items/$ITEM:publish")
+          echo "publish: $pub"
+          echo "::notice::Chrome Web Store: version ${{ needs.check.outputs.version }} uploaded and submitted for review."
+
+  edge:
+    needs: [check, package]
+    runs-on: ubuntu-latest
+    env:
+      PRODUCT: ${{ secrets.EDGE_PRODUCT_ID }}
+      CLIENT_ID: ${{ secrets.EDGE_CLIENT_ID }}
+      API_KEY: ${{ secrets.EDGE_API_KEY }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: nl-veil-browser-link-${{ needs.check.outputs.version }}
+          path: pkg
+      - name: Upload to Edge Add-ons and submit for review
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          if [ -z "$PRODUCT" ] || [ -z "$CLIENT_ID" ] || [ -z "$API_KEY" ]; then
+            echo "::notice::Edge Add-ons secrets are not set; skipped (see the setup notes at the top of this workflow)."
+            exit 0
+          fi
+          api="https://api.addons.microsoftedge.microsoft.com/v1/products/$PRODUCT/submissions"
+          auth=(-H "Authorization: ApiKey $API_KEY" -H "X-ClientID: $CLIENT_ID")
+          # wait out an operation (upload or publish) by its Location header
+          wait_op() {
+            local url=$1 body status
+            for i in $(seq 1 60); do
+              body=$(curl -sS --fail-with-body "${auth[@]}" "$url")
+              status=$(echo "$body" | jq -r '.status // empty')
+              echo "$2: $status"
+              [ "$status" = InProgress ] || break
+              sleep 10
+            done
+            [ "$status" = Succeeded ] || { echo "::error::Edge Add-ons $2 did not succeed: $body"; exit 1; }
+          }
+          op=$(curl -sS --fail-with-body -D - -o /dev/null -X POST "${auth[@]}" -H "Content-Type: application/zip" \
+            --data-binary @pkg/nl-veil-browser-link.zip "$api/draft/package" | tr -d '\r' | awk -F': ' 'tolower($1)=="location"{print $2}')
+          [ -n "$op" ] || { echo "::error::Edge Add-ons upload returned no operation id"; exit 1; }
+          wait_op "$api/draft/package/operations/${op##*/}" upload
+          notes=$(jq -n --arg v "$VERSION" '{notes: ("Automated update to version " + $v + " from extension/ in https://github.com/gary23w/nl-veil")}')
+          op=$(curl -sS --fail-with-body -D - -o /dev/null -X POST "${auth[@]}" -H "Content-Type: application/json" \
+            -d "$notes" "$api" | tr -d '\r' | awk -F': ' 'tolower($1)=="location"{print $2}')
+          [ -n "$op" ] || { echo "::error::Edge Add-ons publish returned no operation id"; exit 1; }
+          wait_op "$api/operations/${op##*/}" publish
+          echo "::notice::Edge Add-ons: version $VERSION uploaded and submitted for review."

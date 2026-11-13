@@ -1286,7 +1286,7 @@ function zipOf(files) {
   let at = 0;
   const u16 = (v) => [v & 255, (v >>> 8) & 255], u32 = (v) => [v & 255, (v >>> 8) & 255, (v >>> 16) & 255, (v >>> 24) & 255];
   for (const [name, text] of Object.entries(files)) {
-    const n = enc.encode(name), d = enc.encode(text), c = crc(d);
+    const n = enc.encode(name), d = typeof text === 'string' ? enc.encode(text) : text, c = crc(d);
     const head = [0x50, 0x4B, 3, 4, ...u16(20), ...u16(0x0800), ...u16(0), ...u16(0), ...u16(0x21), ...u32(c), ...u32(d.length), ...u32(d.length), ...u16(n.length), ...u16(0)];
     parts.push(new Uint8Array(head), n, d);
     central.push(new Uint8Array([0x50, 0x4B, 1, 2, ...u16(20), ...u16(20), ...u16(0x0800), ...u16(0), ...u16(0), ...u16(0x21), ...u32(c), ...u32(d.length), ...u32(d.length), ...u16(n.length), ...u16(0), ...u16(0), ...u16(0), ...u16(0), ...u32(0), ...u32(at)]), n);
@@ -3080,7 +3080,7 @@ async function downloadExtension() {
   for (const name of CFG.extension_files) {
     const r = await fetch(CFG.extension_raw + name, { cache: 'no-store' });
     if (!r.ok) throw new Error('could not fetch ' + name + ' (HTTP ' + r.status + ')');
-    files['nl-veil-browser-link/' + name] = await r.text();
+    files['nl-veil-browser-link/' + name] = name.endsWith('.png') ? new Uint8Array(await r.arrayBuffer()) : await r.text();
   }
   const a = h('a', { href: URL.createObjectURL(zipOf(files)), download: 'nl-veil-browser-link.zip' });
   a.click();
