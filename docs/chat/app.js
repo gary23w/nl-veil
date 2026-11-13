@@ -895,6 +895,8 @@ const TOOL_RUNNERS = {};   // tool name -> async (args, signal, name) => the res
 const PROMPT_NOTES = [];   // () => a paragraph, or ''
 const CHIP_EXTRAS = [];    // (the chip's record) => a node, or null
 const SIDE_TABS = [];      // {id, label: () => text, draw: () => [nodes], open?: () => void}
+const SLASH = {};          // word -> (the rest of the line, the attached pictures' names) => void: "/word ..." in the composer goes here, not to the model
+const PREVIEW_PASSES = []; // (html, the workspace's files) => html: a pass over a page before it is previewed
 const toolsNow = () => Object.entries(TOOLS).filter(([, t]) => !t.when || t.when());
 const toolDoes = (t) => (typeof t.does === 'function' ? t.does() : t.does);
 
@@ -3566,6 +3568,7 @@ function download(name, text) {
    so the preview shows the page the files make together. */
 function inlined(html, files) {
   const at = (ref) => files[fileName(ref.split(/[?#]/)[0])];
+  for (const pass of PREVIEW_PASSES) html = pass(String(html), files);
   return String(html)
     .replace(/<link\b[^>]*\bhref=["']([^"']+)["'][^>]*>/gi, (tag, ref) => (/stylesheet/i.test(tag) && at(ref) !== undefined ? `<style>${at(ref)}</style>` : tag))
     .replace(/<script\b([^>]*)\bsrc=["']([^"']+)["']([^>]*)>\s*<\/script>/gi, (tag, a, ref, b) => (at(ref) !== undefined ? `<script${a}${b}>${at(ref).replace(/<\/script/gi, '<\\/script')}</` + 'script>' : tag));
@@ -4328,6 +4331,8 @@ function send(text) {
   box.style.height = 'auto';
   // the pictures that were waiting go into the chat with this message
   const names = pics.attached.splice(0).map((a) => { picsOf()[a.name] = a.url; return a.name; });
+  const slash = /^\/([a-z][\w-]*)(?:\s+([\s\S]*))?$/i.exec(said);
+  if (slash && SLASH[slash[1].toLowerCase()]) return SLASH[slash[1].toLowerCase()](slash[2] ?? '', names);   // a section's own command
   runTurn(said || (names.length === 1 ? 'Look at this picture.' : 'Look at these pictures.'), names);
 }
 
