@@ -13,7 +13,7 @@ window.VEIL_WEB = {
   deploy_url: "https://deploy.workers.cloudflare.com/?url=https://github.com/gary23w/nl-veil/tree/main/cloud/veil-web",
   script: "veil-web",
   /* The harness version this page was written for. An older one is offered its update. */
-  harness_version: 5,
+  harness_version: 7,
 
   /* Offered until the harness answers with the account's own model list. Any other id can be typed in. */
   models: ["@cf/meta/llama-3.3-70b-instruct-fp8-fast"],

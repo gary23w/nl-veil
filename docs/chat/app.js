@@ -1075,6 +1075,28 @@ async function clefIdle(userText, reply, signal) {
   }
 }
 
+/* A model that stops short: asked to write and run, it writes, never runs, and reports a result anyway. */
+const UNDONE_CLEF_QUESTION =
+  'Did the user ask for a step that the tool record shows never happened (for example: asked to run a script, ' +
+  'and no run is in the record), or does the reply state a result that no tool result in the record shows? The ' +
+  'tool record is complete and is ground truth. Answer no when every step asked for is in the record and the ' +
+  'reply matches the results.';
+const CLEF_UNDONE = 0.3;   // low on purpose: a yes only has the model look at its own record once more
+
+const toolRecord = (rounds) => rounds.map((r) => `${r.name} ${clip(JSON.stringify(r.args), 160)} -> ${clip(r.result, 400)}`).join('\n');
+
+/* The probability that an answer given after tools ran left a step undone or claims what none showed, or null. */
+async function clefUndone(userText, reply, rounds, signal) {
+  try {
+    const state = 'THE USER ASKED:\n' + clip(userText, 8000) + '\n\nTHE REPLY:\n' + clip(reply, 12000) +
+      '\n\nTOOL RECORD for this turn (every tool that ran, with its result):\n' + clip(toolRecord(rounds), 16000);
+    const j = await harnessJson('/v1/clef', { body: { state, questions: [UNDONE_CLEF_QUESTION] }, signal });
+    return Array.isArray(j.probs) ? j.probs[0] : null;
+  } catch {
+    return null;
+  }
+}
+
 /* The probability that the answer has a material problem, or null when clef has no usable answer. */
 async function clefReview(userText, answer, rounds, signal) {
   const record = rounds.length
@@ -1302,7 +1324,7 @@ async function runTurn(text) {
   S.live = { tools: [], text: '', status: 'thinking…', abort };
   draw();
   const rounds = [];
-  let answer = '', error = '', review = null, nudged = false, idled = false;
+  let answer = '', error = '', review = null, nudged = false, idled = false, checked = false;
   const record = (name, args, say, result, raw) => rounds.push({ id: 'c' + (rounds.length + 1), name, args, say, result, ...(raw ? { raw } : {}) });
   try {
     for (let n = 0; ; n++) {
@@ -1330,6 +1352,19 @@ async function runTurn(text) {
           const p = await clefIdle(text, reply, abort.signal);
           if (p !== null && p >= CLEF_IDLE) {
             record('(answer without doing the work)', {}, '', 'No tool has run this turn, so nothing was written, run, fetched or searched. Do what the user asked now, with a tool call: exactly ONE JSON object {"tool": "<name>", "args": {...}} and nothing else. Code belongs in a file (write_file), not in the answer.', clip(reply, 1500));
+            continue;
+          }
+        }
+        // an answer after tools ran: clef looks for a step that was asked for and never happened, or a result
+        // no tool showed. Its yes is cheap to be wrong about: the model is shown its own record, once.
+        if (rounds.length && !checked && n < ROUNDS_MAX && clefOn()) {
+          checked = true;
+          S.live.status = 'checking the work against the tool record (clef)…';
+          drawLive();
+          const p = await clefUndone(text, reply, rounds, abort.signal);
+          if (p !== null && p >= CLEF_UNDONE) {
+            const ran = rounds.filter((r) => !r.name.startsWith('(')).map((r) => r.name + (/^error/.test(r.result) ? ' (failed)' : '')).join(', ');
+            record('(check before answering)', {}, '', `CHECK before this answer goes to the user. The only tools that ran this turn: ${ran || 'none'}. Read the request again. If a step it asks for is not in that list (a script run, a file saved, a page fetched), do that step now with a tool call. If your answer states a result that no tool result above shows, do not state it: get it with a tool, or say it was not done. If every step is done and the answer is true to the results, send the answer again.`, clip(reply, 1500));
             continue;
           }
         }
