@@ -471,6 +471,16 @@ pub fn harnessLocal(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8
     return httpReq(io, gpa, "POST", port, "/api/v1/harness/local", token, if (on) "{\"on\":true}" else "{\"on\":false}", 15);
 }
 
+/// GET /api/v1/harness/nodes — every veil of the account on the mesh, as the harness lists them.
+pub fn harnessNodes(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8) ?Resp {
+    return httpReq(io, gpa, "GET", port, "/api/v1/harness/nodes", token, null, 40);
+}
+
+/// GET /api/v1/harness/settings (body null), or POST it ({set: {name: value}}): the account's shared settings.
+pub fn harnessSettings(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8, body_json: ?[]const u8) ?Resp {
+    return httpReq(io, gpa, if (body_json == null) "GET" else "POST", port, "/api/v1/harness/settings", token, body_json, 40);
+}
+
 /// GET or DELETE /api/v1/harness/jobs/<id> — one job whole, or cancel/delete it.
 pub fn harnessJob(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8, method: []const u8, id: []const u8) ?Resp {
     var pbuf: [96]u8 = undefined;

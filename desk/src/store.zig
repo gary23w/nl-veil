@@ -24,7 +24,7 @@ const SpinLock = struct {
 
 pub const Tab = enum { dashboard, chat, swarm, tots, hub, scheduled, settings }; // deploy = the Swarm tab's inner form
 
-pub const CmdKind = enum { none, select, say, set_goal, stop, deploy, delete, open_folder, refresh_now, open_file, sched_create, sched_update, sched_toggle, sched_delete, sched_run, oauth_cf_login, oauth_cf_logout, open_url, builtin_pull, builtin_cancel, builtin_import, builtin_remove, builtin_check, dataset_start, dataset_stop, cf_tunnel_on, cf_tunnel_off, lineage_accept, lineage_reject, tot_select, tot_deploy, tot_command, tot_config, tot_delete, tot_pad_write, tot_open_folder, tot_pad_clear, tot_limit, tot_select_run, tot_delete_run, garrett_deploy, garrett_connect, garrett_remove, harness_queue, harness_cancel, harness_select, harness_local, harness_chat_select, harness_push };
+pub const CmdKind = enum { none, select, say, set_goal, stop, deploy, delete, open_folder, refresh_now, open_file, sched_create, sched_update, sched_toggle, sched_delete, sched_run, oauth_cf_login, oauth_cf_logout, open_url, builtin_pull, builtin_cancel, builtin_import, builtin_remove, builtin_check, dataset_start, dataset_stop, cf_tunnel_on, cf_tunnel_off, lineage_accept, lineage_reject, tot_select, tot_deploy, tot_command, tot_config, tot_delete, tot_pad_write, tot_open_folder, tot_pad_clear, tot_limit, tot_select_run, tot_delete_run, garrett_deploy, garrett_connect, garrett_remove, harness_queue, harness_cancel, harness_select, harness_local, harness_chat_select, harness_push, harness_send };
 
 /// A UI→poller command. Fixed-size, copied by value into the ring, so no cross-thread allocation.
 pub const Command = struct {
@@ -394,6 +394,10 @@ pub const Settings = struct {
     // ON by default (NL_CLEF=0 seeds it off): it does nothing until the user is logged in to Cloudflare, so logging
     // in is what turns it on. Sent per message so toggling needs no server restart.
     clef: bool = true,
+    // MESH SYNC (default on): this desk's shared settings (meshsync.zig lists them) are kept level with the user's
+    // other veils through their harness. It does nothing until the user is logged in to Cloudflare and a harness
+    // answers. Persisted as "mesh_sync".
+    mesh_sync: bool = true,
 
     pub fn dataDir(s: *const Settings) []const u8 {
         return s.data_dir[0..s.data_dir_len];
@@ -1343,6 +1347,8 @@ pub const Store = struct {
     harness: harness.Status = .{},
     harness_jobs: [harness.MAX_JOBS]harness.Job = undefined, // newest first
     harness_job_n: usize = 0,
+    harness_nodes: [harness.MAX_NODES]harness.Node = undefined, // the mesh: every veil of the account
+    harness_node_n: usize = 0,
     harness_scheds: [harness.MAX_SCHED]harness.Sched = undefined,
     harness_sched_n: usize = 0,
     harness_sel: [harness.ID_MAX]u8 = [_]u8{0} ** harness.ID_MAX, // the job whose result is shown

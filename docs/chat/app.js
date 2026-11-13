@@ -297,6 +297,8 @@ function loadHarnessData() {
   harnessJson('/v1/context').then((j) => { S.context = j.digest || ''; }).catch(() => {});
   harnessJson('/v1/schedules').then((j) => { S.schedules = j.schedules; drawSide(); }).catch(() => {});
   pullConvs();
+  pullShared();
+  meshHello();
 }
 
 async function refreshStatus() {
@@ -2301,6 +2303,111 @@ async function runTurn(text) {
   refreshStatus();
 }
 
+/* ============================================================ the mesh */
+
+/* Every veil logged in to this Cloudflare account can tell the harness it is here: a NODE. This tab is one, for as
+   long as it is open. It says so on a timer (nothing calls a tab; a tab asks), and, only when the user ticked the
+   box in the Harness pane, it takes the jobs another veil of theirs addressed to it: each runs here as a chat turn
+   in a conversation of its own, with this tab's tools (its browser tools when the extension is linked), and its
+   last answer goes back as the job's result. A tab never takes a job that is addressed to nobody: those are for
+   the owner's machines. */
+const mesh = {
+  id: ls.get('veilweb.node') || '',
+  name: ls.get('veilweb.nodename') || '',
+  runs: ls.get('veilweb.noderuns') === '1',
+  nodes: [],        // the harness's list, for the Harness pane
+  working: false,   // a job sent here is running
+};
+if (!/^[a-z0-9]{8,32}$/.test(mesh.id)) {
+  mesh.id = [...crypto.getRandomValues(new Uint8Array(8))].map((b) => b.toString(16).padStart(2, '0')).join('');
+  ls.set('veilweb.node', mesh.id);
+}
+const meshOn = () => !!S.status && !outdated();
+const meshName = () => mesh.name || 'Web veil (' + (navigator.userAgentData?.platform || navigator.platform || 'browser') + ')';
+
+async function meshHello() {
+  if (!meshOn()) return;
+  try {
+    await harnessJson('/v1/nodes/' + mesh.id, { body: {
+      name: meshName(), kind: 'web', os: String(navigator.userAgentData?.platform || navigator.platform || '').toLowerCase(), version: String(CFG.harness_version),
+      runs: mesh.runs, browser: browserLink.on(), garrett: !!S.status.garrett?.connected, mcp: (S.status.mcp || []).map((m) => m.name),
+    } });
+    mesh.nodes = (await harnessJson('/v1/nodes')).nodes;
+    if (S.tab === 'harness' && document.activeElement?.tagName !== 'INPUT') drawSide();   // not under a name being typed
+  } catch {}
+}
+
+/* Take the next job addressed to this tab, run it, post how it ended. One at a time, and never over the user's own turn. */
+async function meshWork() {
+  if (!meshOn() || !mesh.runs || mesh.working || S.live) return;
+  let jobs;
+  try { jobs = (await harnessJson('/v1/local?node=' + mesh.id)).jobs.filter((j) => j.node === mesh.id); } catch { return; }
+  const post = (id, body) => harnessJson('/v1/local/' + id, { body }).catch(() => {});
+  // a job this tab took and never answered (the tab was closed or reloaded mid-run) cannot be picked up again
+  for (const j of jobs.filter((j) => j.state === 'running')) await post(j.id, { ok: false, result: 'the web veil tab was closed or reloaded before the job ended' });
+  const job = jobs.find((j) => j.state === 'queued');
+  if (!job || S.live) return;
+  mesh.working = true;
+  try {
+    await post(job.id, { started: true });
+    newConv();
+    const conv = S.conv;
+    await runTurn(job.task + '\n\n(This task was sent to this web veil tab by another veil of the same owner, through their harness. Nobody is watching: do the work with your tools, do not ask a question and wait, and end with a plain report of what was done and what the tool results showed. Your final message goes back as the result.)');
+    const last = conv.msgs[conv.msgs.length - 1];
+    const ok = last?.role === 'assistant' && !!last.content;
+    await post(job.id, { ok, result: ok ? last.content : (last?.role === 'error' ? last.content : 'the web veil ended the task without an answer') });
+    toast('A job another veil sent here has ended.');
+  } finally {
+    mesh.working = false;
+    drawSide();
+  }
+}
+setInterval(() => { if (meshOn()) meshHello().then(meshWork); }, 20000);
+
+/* SHARED SETTINGS: small named values the harness keeps for every veil of the account. This page shares its model
+   choice ("web.model"): the last veil to change it wins, and another browser takes it the next time it loads. */
+const sharedAt = (() => { try { return JSON.parse(ls.get('veilweb.shared') || '{}') || {}; } catch { return {}; } })();
+const keepSharedAt = (name, at) => { sharedAt[name] = at; ls.set('veilweb.shared', JSON.stringify(sharedAt)); };
+
+async function pullShared() {
+  if (!meshOn()) return;
+  let all;
+  try { all = (await harnessJson('/v1/settings')).settings; } catch { return; }
+  const m = all['web.model'];
+  if (!m) return giveShared('web.model', S.model);   // nobody has said yet: this browser does
+  if (typeof m.v !== 'string' || !m.v.startsWith('@') || !(m.at > (sharedAt['web.model'] || 0))) return;
+  keepSharedAt('web.model', m.at);
+  if (m.v === S.model) return;
+  S.model = m.v;
+  ls.set('veilweb.model', S.model);
+  draw();
+}
+
+async function giveShared(name, value) {
+  if (!meshOn()) return;
+  try {
+    const kept = (await harnessJson('/v1/settings', { body: { set: { [name]: value } } })).settings[name];
+    if (kept) keepSharedAt(name, kept.at);
+  } catch {}
+}
+
+function meshBlock() {
+  const rows = mesh.nodes.map((n) => h('p', { class: 'mono' },
+    (n.online ? '● ' : '○ ') + n.name + (n.id === mesh.id ? ' (this tab)' : '') + ' · ' + [n.kind, n.os, n.version].filter(Boolean).join(' ')
+    + (n.runs ? ' · runs work' : '') + (n.browser ? ' · browser' : '') + (n.garrett ? ' · Agent Garrett' : '') + ((n.mcp || []).length ? ' · MCP: ' + n.mcp.join(' ') : '') + (n.waiting ? ' · ' + n.waiting + ' waiting' : '')));
+  const name = h('input', { type: 'text', maxlength: 48, value: mesh.name, placeholder: meshName() });
+  return h('div', { class: 'block' }, h('h3', {}, 'Mesh'),
+    h('p', {}, 'Every veil logged in to this Cloudflare account is listed here while it is running: this tab, your desktop veils, other browsers. A desktop veil\'s chat can list them and send one a task.'),
+    ...rows,
+    h('label', {}, 'This tab\'s name', name),
+    h('div', { class: 'acts' }, h('button', { class: 'btn btn-sm', onclick: () => { mesh.name = name.value.trim(); ls.set('veilweb.nodename', mesh.name); meshHello(); } }, 'Save name')),
+    h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: mesh.runs, onchange: (e) => {
+      if (e.target.checked && !confirm('Let your other veils send tasks to this tab? Each runs here as a chat turn with this tab\'s tools' + (browserLink.on() ? ', including the browser tab the extension drives' : '') + ', while the tab is open.')) { e.target.checked = false; return; }
+      mesh.runs = e.target.checked; ls.set('veilweb.noderuns', mesh.runs ? '1' : '0'); meshHello();
+    } }), ' Run tasks my other veils send to this tab'),
+    mesh.working ? h('p', {}, 'A task sent here is running now, in its own chat.') : null);
+}
+
 /* ============================================================ conversations */
 
 /* A conversation lives in this browser (IndexedDB) and, when the harness is new enough, in the harness too, so
@@ -3144,6 +3251,7 @@ function harnessTab() {
         const v = (id) => Number(document.getElementById(id).value);
         S.status = await harnessJson('/v1/config', { body: { calls_max: v('limCalls'), bytes_max: v('limBytes') * MB, storage_max: v('limStore') * MB } });
       }) }, 'Save limits'))),
+    outdated() ? null : meshBlock(),
     h('div', { class: 'block' }, h('h3', {}, 'This harness'),
       h('p', { class: 'mono' }, S.harness.replace(/^https?:\/\//, '') + ' · version ' + st.version),
       h('p', {}, 'Context fold: ' + (core.x ? 'veil_core.wasm (4tope) loaded.' : 'the wasm core did not load; the oldest rounds are dropped instead.')),
@@ -3364,6 +3472,7 @@ async function pickModel(sel) {
     if (id.startsWith('@')) S.model = id;
   } else S.model = sel.value;
   ls.set('veilweb.model', S.model);
+  giveShared('web.model', S.model);
   draw();
 }
 

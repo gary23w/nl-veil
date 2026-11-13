@@ -22,7 +22,41 @@ From version 6 the harness accepts a job queued with `local: true`. It does not 
 
 The owner turns it on with `POST /api/v1/harness/local {on: true}` (the desk's checkbox, the web app's button). The choice is kept in this server's state file, off until set. The harness is not told and cannot set it. Whoever holds the account's Cloudflare login can queue a local job, and its turn has this machine's tools: that is what the switch grants.
 
-While the switch is on, a background thread (`bgLoop`) asks the harness for its unfinished local jobs (`GET /v1/local`) every 20 seconds. Each job runs as an unattended chat turn, through the same entry points a scheduled task and a tater-tot's job use, in a conversation named `harness_<job id>`, on the Cloudflare login and the job's model. One runs at a time. When a turn starts the server tells the harness (`POST /v1/local/<id> {started: true}`); when it has ended the server posts the turn's last answer (`{ok: true, result}`, cut to 10000 bytes), or a failure when the turn left no answer. The thread makes no call for a user who has not set the switch, runs only for an admin account, and stops when `VEIL_CHAT_BACKEND=0`. A harness older than version 6 has no such route and nothing is started. A harness whose address is not known is looked for again every 5 minutes.
+While the switch is on, a background thread (`bgLoop`) asks the harness for its unfinished local jobs (`GET /v1/local`, with this machine's node id once it has one) every 20 seconds. Each job runs as an unattended chat turn, through the same entry points a scheduled task and a tater-tot's job use, in a conversation named `harness_<job id>`, on the Cloudflare login and the job's model. One runs at a time. When a turn starts the server tells the harness (`POST /v1/local/<id> {started: true}`); when it has ended the server posts the turn's last answer (`{ok: true, result}`, cut to 10000 bytes), or a failure when the turn left no answer. The thread makes no call for a user who has neither set the switch nor reached a harness from this server, runs only for an admin account, and stops when `VEIL_CHAT_BACKEND=0`. A harness older than version 6 has no such route and nothing is started. A harness whose address is not known is looked for again every 5 minutes.
+
+## The mesh
+
+From version 10 the harness keeps a list of **nodes**: every veil logged in to the account that has told it "I am here". A machine joins when its harness first answers this server (`GET /api/v1/harness`): it is given an id, 16 random hex characters kept in the state file, and a name, the computer's own name until the owner sets one (`POST /api/v1/harness/node {name}`). From then on the harness thread says it is here on every pass (`POST /v1/nodes/<id>`, every 20 seconds): the name, `desk` or `server`, the operating system, the veil's version, whether the local-jobs switch is on (`runs`), whether this server has an Agent Garrett connection, and the names of the MCP servers found in this machine's MCP config files (names only, read again every 5 minutes). The harness lists a node as offline once it has not heard from it for 90 seconds. Nothing calls a machine: each one asks.
+
+A job can be addressed to one node (`POST /api/v1/harness/jobs {task, model?, node}`). The harness hands it to that node only; this machine asks for `GET /v1/local?node=<its id>` and so receives the jobs addressed to it and the ones addressed to nobody, never another machine's. The switch is unchanged: a machine runs work only while its owner has it on, and it is what `runs` reports.
+
+`GET /api/v1/harness/nodes` relays the harness's list (this machine says it is here first, so the list has it as it is now). `DELETE /api/v1/harness/nodes/:id` has the harness forget a node; one that is still running is listed again on its next pass.
+
+### The chat's verbs
+
+A chat turn whose user is logged in with Cloudflare and is not sandboxed is offered three more tools:
+
+- `mesh_inventory` lists the nodes, one a line: id, name (this machine marked), kind, operating system, version, online or how long ago it was seen, whether it runs work, whether it has a browser, Agent Garrett, its MCP server names, and how many jobs wait for it.
+- `mesh_run {node, task, model?}` sends a task to one node, named by its id or by its exact name when only one node has it. It refuses this machine itself, a node that does not run work, and a name no node (or more than one) has. It answers with the job id at once and says when the node is offline.
+- `mesh_result {job}` reads that job: its state while it waits or runs, the other veil's report once it is done, its error when it failed.
+
+They are refused for a sandboxed caller and for a user who is not the server's admin, like the routes.
+
+## Shared settings
+
+`GET` and `POST /api/v1/harness/settings` relay the harness's shared settings: small named values, each with the time the harness took it, where the last write of a name wins. The server checks only that a write is a JSON object of at most 64 KB; the harness checks the names and values. The desk is the user of these routes (see [meshsync](../desk/meshsync.md)).
+
+## Agent Garrett, shared
+
+The harness can hold an Agent Garrett connection (the web veil's Harness pane sets it). This server brings its own connection level with it, every 5 minutes and on `POST /api/v1/harness/share`:
+
+- connected here and nothing on the harness: the key is given to the harness, which checks it with the agent before keeping it;
+- nothing here and a key on the harness: it is taken, once for each connection the harness holds, so a disconnect made here afterwards is not undone;
+- both hold a key and they differ: nothing is changed.
+
+Only a key for the hosted agent travels; an agent of the owner's own, reached by address and token, stays where it was set up. The route answers what happened (`pushed`, `pulled`, `same`, `differs`, `none`) and never the key. The state file records the time of the harness connection last taken or given, never the key.
+
+MCP servers are not copied between machines. A machine's MCP servers are named in the inventory, and a task sent to that machine with `mesh_run` can use them there.
 
 ## Chats
 
@@ -41,7 +75,12 @@ The harness keeps the web chat's conversations. Reading them is a relay: `GET /a
 - `setLocal` — `POST /api/v1/harness/local {on}`: the owner's switch for local jobs on this machine; `status` reports it as `local`
 - `listConvs` / `getConv` — `GET /api/v1/harness/convs` and `/convs/:id`: the harness's chats, and one whole (the id must be 6 to 24 lower-case letters and digits)
 - `pushConv` — `POST /api/v1/harness/convs {conv}`: copy one of this server's conversations up; answers `{ok, id, msgs, stale}`
-- `bgLoop` — the thread that polls an allowed harness for local jobs and runs them (above)
+- `listNodes` / `forgetNode` / `setNode` — `GET /api/v1/harness/nodes`, `DELETE /api/v1/harness/nodes/:id`, `POST /api/v1/harness/node {name}`
+- `getSettings` / `putSettings` — `GET` and `POST /api/v1/harness/settings`
+- `share` — `POST /api/v1/harness/share`
+- `MESH_SCHEMA`, `isMeshTool`, `meshTool` — the chat's three mesh verbs and their entry from the chat engine
+- `node_kind`, `node_version` — what this process tells the harness it is; `main.zig` sets them
+- `bgLoop` — the thread that says this machine is here, brings the Agent Garrett connection level, and polls an allowed harness for local jobs and runs them (above)
 
 ## Answers
 
@@ -49,4 +88,4 @@ The harness's JSON is passed through as it is. A refusal by the harness (a full 
 
 ## Tests
 
-The Cloudflare API and the harness are one `fakehttp` stand-in. The tests cover the gate on every route, the address rule, the checks on a queued job, discovery and the remembered address, the relayed calls and the harness's refusals, an absent harness, a state file edited to name another host, the switch, a pushed conversation's body and id, a newer harness copy, and the bridge posting an ended turn's answer or its failure. No test starts a chat turn. The harness's local-job routes are tested under node (`cloud/veil-web/veil-web.test.mjs`); that file is not one of the check script's gates.
+The Cloudflare API and the harness are one `fakehttp` stand-in. The tests cover the gate on every route, the address rule, the checks on a queued job, discovery and the remembered address, the relayed calls and the harness's refusals, an absent harness, a state file edited to name another host, the switch, a pushed conversation's body and id, a newer harness copy, and the bridge posting an ended turn's answer or its failure. The mesh tests cover the machine's id (made once, kept through a forgotten address), what it says about itself, an addressed job's body, the inventory text, `mesh_run`'s refusals and its one queued job, `mesh_result`, the node id on the local-jobs poll, and the Agent Garrett connection taken, not taken again after a disconnect, and given. No test starts a chat turn. The harness's local-job routes are tested under node (`cloud/veil-web/veil-web.test.mjs`); that file is not one of the check script's gates.

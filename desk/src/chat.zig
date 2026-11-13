@@ -5310,6 +5310,7 @@ pub const Chat = struct {
         var browser_headful = false;
         var fast_reasoning = false;
         var tool_map = false;
+        var mesh_sync = true;
         var clef_mode = false;
         var leftw: u16 = 230;
         var rightw: u16 = 320;
@@ -5349,6 +5350,7 @@ pub const Chat = struct {
             browser_headful = s.browser_headful;
             fast_reasoning = s.fast_reasoning;
             tool_map = s.tool_map;
+            mesh_sync = s.mesh_sync;
             clef_mode = s.clef;
             leftw = s.chat_left_w;
             rightw = s.chat_right_w;
@@ -5381,6 +5383,7 @@ pub const Chat = struct {
         // server mode on. A fresh key on each break keeps a bad persisted state from surviving it.
         jb.print(self.gpa, "\",\"left\":{},\"right\":{},\"shell_allow\":{},\"speed\":{},\"srv_brain\":{},\"dyslexia\":{},\"font_scale\":{d},\"font_bold\":{},\"narrator\":{},\"browser_headful\":{},\"fast_reasoning\":{},\"leftw\":{d},\"rightw\":{d},\"conh\":{d}", .{ lopen, ropen, shell_allow, speed, server_chat, dyslexia, font_scale, font_bold, narrator, browser_headful, fast_reasoning, leftw, rightw, conh }) catch return;
         jb.print(self.gpa, ",\"tool_map\":{}", .{tool_map}) catch return;
+        jb.print(self.gpa, ",\"mesh_sync\":{}", .{mesh_sync}) catch return;
         jb.print(self.gpa, ",\"clef\":{}", .{clef_mode}) catch return;
         // MODEL TRIO: the "use one model for all three" flag + the thinking/prompting role overrides. Role keys
         // are NOT written here — they live in the OS secret store (secrets.zig), keyed by provider slug.
@@ -5535,6 +5538,7 @@ pub const Chat = struct {
         // never silently downgrade someone's reasoning, so the missing key has to mean the better default.
         s.fast_reasoning = std.mem.indexOf(u8, data, "\"fast_reasoning\":true") != null;
         // An old settings file keeps the environment-seeded default; a saved choice wins over it.
+        if (std.mem.indexOf(u8, data, "\"mesh_sync\":false") != null) s.mesh_sync = false;
         if (std.mem.indexOf(u8, data, "\"tool_map\":true") != null) {
             s.tool_map = true;
         } else if (std.mem.indexOf(u8, data, "\"tool_map\":false") != null) {

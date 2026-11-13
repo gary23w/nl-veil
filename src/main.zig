@@ -734,6 +734,8 @@ pub fn main(init: std.process.Init) !void {
     if (vthread.spawn("tots", cf_tot.bgLoop, .{&app})) |t| t.detach() else |_| {}
     // LOCAL JOBS queued on the owner's veil-web harness: this thread asks for them and runs each as an unattended
     // chat turn (config/cf_harness.zig). It makes no call for a user who has not allowed them onto this machine.
+    cf_harness.node_kind = if (desktop_mode and HAS_GUI) "desk" else "server"; // what this machine says it is on the mesh
+    cf_harness.node_version = VERSION;
     if (vthread.spawn("harness", cf_harness.bgLoop, .{&app})) |t| t.detach() else |_| {}
     log.info("billing: {s} (NL_PRODUCTION)", .{if (production) "PRODUCTION — non-admins metered by neuron plan" else "BETA — unmetered full use"});
     if (!open_reg) log.info("registration: CLOSED (private beta) — set NL_OPEN_REGISTRATION=1 to open public signups", .{});
@@ -923,6 +925,14 @@ pub fn main(init: std.process.Init) !void {
     router.get("/api/v1/harness/convs", cf_harness.listConvs, .{});
     router.post("/api/v1/harness/convs", cf_harness.pushConv, .{});
     router.get("/api/v1/harness/convs/:id", cf_harness.getConv, .{});
+    // The mesh: every veil of the account on one harness. Who is here, this machine's name, shared settings,
+    // and the Agent Garrett connection brought level.
+    router.get("/api/v1/harness/nodes", cf_harness.listNodes, .{});
+    router.delete("/api/v1/harness/nodes/:id", cf_harness.forgetNode, .{});
+    router.post("/api/v1/harness/node", cf_harness.setNode, .{});
+    router.get("/api/v1/harness/settings", cf_harness.getSettings, .{});
+    router.post("/api/v1/harness/settings", cf_harness.putSettings, .{});
+    router.post("/api/v1/harness/share", cf_harness.share, .{});
     router.get("/api/v1/swarms/:id/events", tail_fanout.swarmEvents, .{});
     router.get("/api/v1/swarms/:id/stream", tail_fanout.swarmStream, .{});
     router.get("/api/v1/swarms/:id/files", deploy_service.swarmFiles, .{});

@@ -44,7 +44,7 @@ async function harness(say = "all done") {
 }
 
 test("the version this file tests", () => {
-  assert.equal(VERSION, "9");
+  assert.equal(VERSION, "10");
 });
 
 test("a local job is queued, never run by the alarm, and keeps no alarm going while it waits", async () => {
@@ -146,4 +146,101 @@ test("a cancelled local job leaves the machine's list, and local jobs count towa
   assert.equal((await call("POST", "local/" + id, { ok: true, result: "late" })).status, 404);
   for (let i = 0; i < QUEUE_MAX; i++) assert.equal((await call("POST", "jobs", { task: "job " + i, model: "@cf/x/y", local: true })).status, 200);
   assert.equal((await call("POST", "jobs", { task: "one too many", model: "@cf/x/y", local: true })).status, 429);
+});
+
+// ---------------------------------------------------------------- the mesh
+
+const DESK = "desk0000aaaa1111";
+const SHOP = "shop0000bbbb2222";
+
+test("a node says it is here, is listed online, and goes offline when it stops saying so", async () => {
+  const { storage, call } = await harness();
+  assert.equal((await call("POST", "nodes/" + DESK, { name: "  Office   desk ", kind: "desk", os: "windows", version: "1.2.3", runs: true, mcp: ["files", "git"], garrett: true })).status, 200);
+  assert.equal((await call("POST", "nodes/" + SHOP, { name: "Shop tab", kind: "web", browser: true })).status, 200);
+  let got = (await call("GET", "nodes")).j;
+  assert.deepEqual(got.nodes.map((n) => [n.id, n.name, n.kind, n.runs, n.browser, n.garrett, n.online, n.waiting]), [[DESK, "Office desk", "desk", true, false, true, true, 0], [SHOP, "Shop tab", "web", false, true, false, true, 0]]);
+  assert.deepEqual(got.nodes[0].mcp, ["files", "git"]);
+  assert.deepEqual((await call("GET", "status")).j.nodes, { count: 2, online: 2, max: 16 });
+
+  // the shop tab was last seen two minutes ago
+  const nodes = await storage.get("nodes");
+  nodes[1].seen -= 120000;
+  await storage.put("nodes", nodes);
+  got = (await call("GET", "nodes")).j;
+  assert.deepEqual(got.nodes.map((n) => n.online), [true, false]);
+
+  // saying it again keeps when it was first seen, and a forgotten node is gone
+  const first = got.nodes[0].first;
+  await call("POST", "nodes/" + DESK, { name: "Office desk", kind: "desk" });
+  assert.equal((await call("GET", "nodes")).j.nodes[0].first, first);
+  assert.equal((await call("DELETE", "nodes/" + SHOP)).j.deleted, SHOP);
+  assert.equal((await call("GET", "nodes")).j.nodes.length, 1);
+});
+
+test("a node is refused without a name, with an unknown kind or with a bad id", async () => {
+  const { call } = await harness();
+  assert.equal((await call("POST", "nodes/" + DESK, { kind: "desk" })).status, 400);
+  assert.equal((await call("POST", "nodes/" + DESK, { name: "x", kind: "toaster" })).status, 400);
+  assert.equal((await call("POST", "nodes/Short", { name: "x", kind: "desk" })).status, 400);
+});
+
+test("a job addressed to a node is handed to that node only; one addressed to nobody goes to whoever asks", async () => {
+  const { h, calls, call } = await harness();
+  await call("POST", "nodes/" + DESK, { name: "Office", kind: "desk", runs: true });
+  await call("POST", "nodes/" + SHOP, { name: "Shop", kind: "desk", runs: true });
+  const forShop = (await call("POST", "jobs", { task: "count the stock files", model: "@cf/x/y", node: SHOP, from: DESK })).j;
+  assert.equal(forShop.local, true); // an addressed job is a local job
+  assert.equal(forShop.node, SHOP);
+  const forAny = (await call("POST", "jobs", { task: "say hello", model: "@cf/x/y", local: true })).j;
+
+  await h.alarm();
+  assert.equal(calls.length, 0); // the cloud runs neither
+
+  const ids = async (q) => (await call("GET", "local" + q)).j.jobs.map((j) => j.id);
+  assert.deepEqual(await ids("?node=" + SHOP), [forShop.id, forAny.id]);
+  assert.deepEqual(await ids("?node=" + DESK), [forAny.id]);
+  assert.deepEqual(await ids(""), [forAny.id]); // a machine that names no node never sees an addressed job
+  const mine = (await call("GET", "local?node=" + SHOP)).j.jobs[0];
+  assert.equal(mine.node, SHOP);
+  assert.equal(mine.from, DESK);
+  assert.equal((await call("GET", "nodes")).j.nodes.find((n) => n.id === SHOP).waiting, 1);
+
+  await call("POST", "local/" + forShop.id, { ok: true, result: "41 files" });
+  assert.equal((await call("GET", "jobs/" + forShop.id)).j.job.result, "41 files");
+  assert.equal((await call("GET", "nodes")).j.nodes.find((n) => n.id === SHOP).waiting, 0);
+});
+
+test("a job cannot be addressed to a node the harness has not heard from", async () => {
+  const { call } = await harness();
+  const r = await call("POST", "jobs", { task: "x", model: "@cf/x/y", node: "nobody00cccc3333" });
+  assert.equal(r.status, 404);
+  assert.equal((await call("GET", "jobs")).j.jobs.length, 0);
+});
+
+test("shared settings: the last write of a name wins, each carries its time, a bad name or value is refused whole", async () => {
+  const { call } = await harness();
+  const a = (await call("POST", "settings", { set: { "desk.model": "@cf/x/y", "desk.clef": true, "desk.font_scale": 110 } })).j;
+  assert.equal(a.settings["desk.model"].v, "@cf/x/y");
+  assert.ok(a.settings["desk.model"].at > 0);
+  await call("POST", "settings", { set: { "desk.model": "@cf/z/w" }, del: ["desk.clef"] });
+  const got = (await call("GET", "settings")).j.settings;
+  assert.equal(got["desk.model"].v, "@cf/z/w");
+  assert.equal(got["desk.font_scale"].v, 110);
+  assert.equal(got["desk.clef"], undefined);
+
+  assert.equal((await call("POST", "settings", { set: { "Bad Name": 1 } })).status, 400);
+  assert.equal((await call("POST", "settings", { set: { "desk.ok": "fine", "desk.obj": { a: 1 } } })).status, 400);
+  assert.equal((await call("GET", "settings")).j.settings["desk.ok"], undefined); // the refused write kept nothing
+  assert.equal((await call("POST", "settings", { set: { "desk.long": "x".repeat(2001) } })).status, 400);
+});
+
+test("share hands the owner the kept connections whole; status still shows no token", async () => {
+  const { storage, call } = await harness();
+  assert.deepEqual((await call("GET", "share")).j, { ok: true, garrett: null, mcp: [] });
+  await storage.put("garrett", { url: "https://agent.example.com/mcp", token: "gtt_secret", tools: 7, at: 5 });
+  await storage.put("mcp", [{ name: "files", url: "https://mcp.example.com/", token: "tok", session: "s", tools: 3 }]);
+  const got = (await call("GET", "share")).j;
+  assert.deepEqual(got.garrett, { url: "https://agent.example.com/mcp", token: "gtt_secret", tools: 7, at: 5 });
+  assert.deepEqual(got.mcp, [{ name: "files", url: "https://mcp.example.com/", token: "tok" }]);
+  assert.ok(!JSON.stringify((await call("GET", "status")).j).includes("gtt_secret"));
 });

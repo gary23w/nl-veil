@@ -12,6 +12,7 @@ const scan = @import("scan.zig");
 const netcli = @import("netcli.zig");
 const tots = @import("tots.zig");
 const harness = @import("harness.zig");
+const meshsync = @import("meshsync.zig"); // the shared settings: what travels and the take/give decision
 const log = @import("log.zig");
 
 const Store = store_mod.Store;
@@ -79,6 +80,7 @@ pub const Poller = struct {
     last_tots_s: i64 = 0, // tot roster throttle (only while the Tots tab is drawn; 0 = poll next tick)
     last_har_s: i64 = 0, // web harness throttle (only while its view is drawn; 0 = poll next tick)
     last_har_convs_s: i64 = 0, // its chat list, asked less often than its queue
+    last_mesh_sync_s: i64 = 0, // the shared-settings pass (meshsync.zig), whatever tab is drawn
     har_jobs_scratch: [harness.MAX_JOBS]harness.Job = undefined,
     last_tot_ev_s: i64 = 0, // the selected tot's event tail
     last_tot_pad_s: i64 = 0, // the shared scratchpad
@@ -209,6 +211,7 @@ pub const Poller = struct {
                 .harness_local => self.doHarnessLocal(std.mem.eql(u8, c.textStr(), "1")),
                 .harness_chat_select => self.doHarnessChatSelect(c.idStr()),
                 .harness_push => self.doHarnessPush(c.idStr()),
+                .harness_send => self.doHarnessSend(c.idStr(), c.textStr()),
                 .tot_command => self.doTotCommand(c.idStr(), c.textStr()),
                 .tot_config => self.doTotPost(c.idStr(), "config", c.textStr()),
                 .tot_delete => self.doTotDelete(c.idStr()),
@@ -860,6 +863,13 @@ pub const Poller = struct {
             }
         }
 
+        // 1c++) Shared settings: kept level with the user's other veils through their harness, whatever tab is
+        // drawn. The server answers a login with no Cloudflare connection without calling anything.
+        if (online and now_s - self.last_mesh_sync_s >= MESH_SYNC_EVERY_S) {
+            self.last_mesh_sync_s = now_s;
+            self.syncSettings();
+        }
+
         // 1c'') THE FAMILY VIEW (NL_FAMILY_VIEW): the ON-SCREEN family only (the chat view raises family_watch each frame
         // it draws), every FAMILY_EVERY_S. Nothing here polls any other family, so their sub-chats still finish silently.
         self.familyTick(online, now_s);
@@ -1047,6 +1057,8 @@ pub const Poller = struct {
         var jobs_n: ?usize = null;
         var scheds: [harness.MAX_SCHED]harness.Sched = undefined;
         var scheds_n: ?usize = null;
+        var nodes: [harness.MAX_NODES]harness.Node = undefined;
+        var nodes_n: ?usize = null;
         if (st.reachable) {
             if (netcli.harnessJobs(self.io, self.gpa, self.port(), tok)) |r| {
                 defer if (r.body.len > 0) self.gpa.free(r.body);
@@ -1056,6 +1068,11 @@ pub const Poller = struct {
                 defer if (r.body.len > 0) self.gpa.free(r.body);
                 if (r.status == 200) scheds_n = harness.parseScheds(self.gpa, r.body, &scheds);
             }
+            // the mesh; an older harness has no such list and the rows stay empty
+            if (netcli.harnessNodes(self.io, self.gpa, self.port(), tok)) |r| {
+                defer if (r.body.len > 0) self.gpa.free(r.body);
+                nodes_n = if (r.status == 200) harness.parseNodes(self.gpa, r.body, &nodes) else 0;
+            }
         }
         {
             self.store.lock();
@@ -1063,6 +1080,11 @@ pub const Poller = struct {
             self.store.harness = st;
             self.store.harness_seen = true;
             self.store.harness_denied = false;
+            if (!st.reachable) self.store.harness_node_n = 0;
+            if (nodes_n) |n| {
+                @memcpy(self.store.harness_nodes[0..n], nodes[0..n]);
+                self.store.harness_node_n = n;
+            }
             // A list that did not answer this once keeps the rows it showed last; a login that is gone shows none.
             if (!st.connected) {
                 self.store.harness_job_n = 0;
@@ -1150,6 +1172,110 @@ pub const Poller = struct {
         if (!self.harnessRespOk(resp, "Job not queued")) return;
         self.store.pushNotif("Job queued", "the harness has it", 1);
         self.last_har_s = 0; // the new row shows on the next tick
+    }
+
+    /// Send a task to one node of the mesh: the harness keeps it as a job only that node is handed.
+    fn doHarnessSend(self: *Poller, node: []const u8, task: []const u8) void {
+        if (task.len == 0) return;
+        var bb: [harness.TASK_MAX * 6 + 320]u8 = undefined;
+        const body = harness.sendBody(&bb, task, node) orelse {
+            self.store.pushNotif("Not sent", "pick a machine from the list first", 2);
+            return;
+        };
+        {
+            self.store.lock();
+            defer self.store.unlock();
+            self.store.harness_busy = true;
+        }
+        defer {
+            self.store.lock();
+            self.store.harness_busy = false;
+            self.store.unlock();
+        }
+        var tbuf: [128]u8 = undefined;
+        const tok = self.tokenSnap(&tbuf);
+        const resp = netcli.harnessQueue(self.io, self.gpa, self.port(), tok, body);
+        defer if (resp) |r| if (r.body.len > 0) self.gpa.free(r.body);
+        if (!self.harnessRespOk(resp, "Not sent")) return;
+        self.store.pushNotif("Sent", "the job waits for that machine to take it", 1);
+        self.last_har_s = 0;
+    }
+
+    /// One pass of the shared settings (meshsync.zig): take what another veil changed, give what changed here.
+    /// What this desk and the harness last agreed on is kept in {data}/.veil-desk/mesh-sync.json. Quiet on every
+    /// failure: no Cloudflare login, no harness, an older harness - the settings simply stay as they are.
+    fn syncSettings(self: *Poller) void {
+        var snap: store_mod.Settings = undefined;
+        {
+            self.store.lock();
+            defer self.store.unlock();
+            if (!self.store.settings_loaded or !self.store.settings.mesh_sync) return;
+            snap = self.store.settings;
+        }
+        var tbuf: [128]u8 = undefined;
+        const tok = self.tokenSnap(&tbuf);
+        const resp = netcli.harnessSettings(self.io, self.gpa, self.port(), tok, null) orelse return;
+        defer if (resp.body.len > 0) self.gpa.free(resp.body);
+        if (resp.status != 200) return;
+        const remote = meshsync.parse(self.gpa, resp.body) orelse return;
+
+        var pb: [700]u8 = undefined;
+        const path = std.fmt.bufPrint(&pb, "{s}/.veil-desk/mesh-sync.json", .{snap.dataDir()}) catch return;
+        var synced: meshsync.Table = .{};
+        if (Io.Dir.cwd().readFileAlloc(self.io, path, self.gpa, .limited(64 << 10))) |data| {
+            defer self.gpa.free(data);
+            if (meshsync.parse(self.gpa, data)) |t| synced = t;
+        } else |_| {}
+
+        var take: meshsync.Table = .{};
+        var give: meshsync.Table = .{};
+        var changed = false;
+        for (meshsync.KEYS) |k| {
+            var vb: [meshsync.VALUE_MAX]u8 = undefined;
+            const local = meshsync.localValue(&snap, k, &vb) orelse continue;
+            const r = remote.find(k);
+            const sy = synced.find(k);
+            switch (meshsync.decide(local, if (sy) |e| e.vStr() else null, if (sy) |e| e.at else 0, if (r) |e| e.vStr() else null, if (r) |e| e.at else 0)) {
+                .take => take.set(k, r.?.vStr(), r.?.at),
+                .give => give.set(k, local, 0),
+                .none => if (r) |e| if (sy == null or sy.?.at != e.at) {
+                    synced.set(k, e.vStr(), e.at); // already level: remember the harness's time for it
+                    changed = true;
+                },
+            }
+        }
+        if (take.n > 0) {
+            var took: usize = 0;
+            {
+                self.store.lock();
+                defer self.store.unlock();
+                for (take.rows[0..take.n]) |*e| if (meshsync.apply(&self.store.settings, e.keyStr(), e.vStr())) {
+                    took += 1;
+                };
+            }
+            // agreed either way: a value this desk cannot take is not asked about again until it changes
+            for (take.rows[0..take.n]) |*e| synced.set(e.keyStr(), e.vStr(), e.at);
+            changed = true;
+            if (took > 0) {
+                self.store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
+                self.store.pushNotif("Settings updated", "taken from your other veils", 1);
+            }
+        }
+        if (give.n > 0) {
+            const body = meshsync.giveBody(self.gpa, &give) orelse return;
+            defer self.gpa.free(body);
+            if (netcli.harnessSettings(self.io, self.gpa, self.port(), tok, body)) |r| {
+                defer if (r.body.len > 0) self.gpa.free(r.body);
+                if (r.status == 200) if (meshsync.parse(self.gpa, r.body)) |now| {
+                    for (give.rows[0..give.n]) |*e| if (now.find(e.keyStr())) |kept| synced.set(kept.keyStr(), kept.vStr(), kept.at);
+                    changed = true;
+                };
+            }
+        }
+        if (!changed) return;
+        const out = meshsync.write(self.gpa, &synced) orelse return;
+        defer self.gpa.free(out);
+        Io.Dir.cwd().writeFile(self.io, .{ .sub_path = path, .data = out }) catch {};
     }
 
     /// Cancel a waiting or running job, or delete a finished one. A job already gone is not a failure.
@@ -2685,6 +2811,8 @@ fn famNoteTitle(buf: []u8, note: FamSeen.Note) []const u8 {
 const HARNESS_EVERY_S: i64 = 10;
 /// How often its chat list is asked (a push asks again at once).
 const HARNESS_CONVS_EVERY_S: i64 = 30;
+/// How often the shared settings are brought level with the harness's (one call to the user's Worker a pass).
+const MESH_SYNC_EVERY_S: i64 = 60;
 
 fn valueForKey(json: []const u8, key: []const u8, buf: []u8) []const u8 {
     var kb: [40]u8 = undefined;
