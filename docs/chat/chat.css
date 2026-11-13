@@ -87,10 +87,14 @@ button:disabled, .btn[aria-disabled=true] { opacity: .5; cursor: default; pointe
 .tabs { display: flex; gap: 2px; padding: 8px 8px 0; border-bottom: 1px solid var(--border); align-items: flex-end; }
 .tabs button { padding: 7px 11px; border: 0; background: transparent; color: var(--text-secondary); border-radius: var(--radius-btn) var(--radius-btn) 0 0; font-size: var(--fs-ui); transition: background var(--quick), color var(--quick); }
 .tabs button:hover { background: var(--surface-hover); color: var(--text); }
-.tabs button.on { color: var(--accent); background: var(--tonal); font-weight: 600; box-shadow: inset 0 -2px 0 var(--accent); }
+.tabs button.on { color: var(--accent); background: var(--tonal); box-shadow: inset 0 -2px 0 var(--accent); }
+.tabs button[role=tab] { font-weight: 600; transition: background var(--calm) var(--ease), color var(--calm) var(--ease), box-shadow var(--calm) var(--ease); }
 .tabs .widen { margin-bottom: 4px; padding: 3px 8px; border-radius: var(--radius-btn); color: var(--text-muted); }
-.pane { flex: 1; min-height: 0; overflow: auto; display: flex; flex-direction: column; animation: fade var(--quick) both; }
-.pane.tab-code { overflow: hidden; animation: none; }
+.pane { flex: 1; min-height: 0; overflow: auto; display: flex; flex-direction: column; }
+/* a change of tab eases in; a redraw of the same tab (fresh data) does not move at all */
+@keyframes tab-in { from { opacity: .35; transform: translateY(5px); } to { opacity: 1; transform: none; } }
+.pane.enter { animation: tab-in var(--calm) var(--ease) both; }
+.pane.tab-code { overflow: hidden; }
 .block { padding: 12px var(--pad-in); border-bottom: 1px solid var(--border); }
 .block.feature { background: var(--tonal); }
 .block h3 { font-size: var(--fs-ui); margin-bottom: 6px; }
@@ -231,6 +235,8 @@ details.tool.running .mark::before { content: ""; display: inline-block; width: 
 details.tool pre { padding: 8px 10px; border-top: 1px solid var(--border); max-height: 260px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font: var(--fs-small) var(--font-mono); }
 
 .welcome { color: var(--text-secondary); max-width: 640px; margin: 7vh auto 0; text-align: center; animation: rise var(--calm) var(--ease) both; }
+/* a redraw of the view already on screen replays no entrance */
+#app.same-view .welcome, #app.same-view .gate-card, #app.same-view .link-group, #app.same-view .preview { animation: none; }
 .welcome h1 { color: var(--text); font-size: var(--fs-display); margin-bottom: 8px; letter-spacing: -.015em; }
 .chips { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 8px; margin: 18px 0; text-align: left; }
 .suggest { padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface-raised); color: var(--text); font-size: var(--fs-ui); text-align: left; transition: border-color var(--quick), transform var(--quick) var(--ease), background var(--quick); }

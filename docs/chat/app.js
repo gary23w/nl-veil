@@ -457,8 +457,11 @@ const browserLink = {
     }
     return { url: location.href, title: document.title, text: (document.body ? document.body.innerText : '').replace(/\\n{3,}/g, '\\n\\n').slice(0, 9000), items };
   })()`,
+  /* A page that asks the visitor to prove they are human. The veil does not work through those: it says so. */
+  BOT_CHECK: /just a moment|verify (that )?you are (a )?human|performing security verification|unusual traffic|are you a robot|not a robot|checking your browser|captcha/i,
   async snapshot() {
     const s = await this.js(this.SNAPSHOT);
+    if (this.BOT_CHECK.test(s.title) || (s.text.length < 1500 && this.BOT_CHECK.test(s.text))) return `BOT CHECK: ${s.url} is showing a human-verification page. The veil does not work through those. The user can pass it themselves in the veil's tab and then ask for the page to be read again (browser_read).`;
     return `PAGE ${s.url}\nTITLE ${s.title}\n\n${s.text}\n\nCONTROLS (use the number as ref):\n${s.items.join('\n') || '(none found)'}`;
   },
   async settle(ms = 15000) {
@@ -601,7 +604,11 @@ async function runTool(name, args, signal) {
       const raw = name === 'http_request';
       const j = await harnessJson('/v1/fetch', { body: { url: String(args.url ?? ''), method: raw ? args.method : 'GET', headers: raw ? args.headers : undefined, body: raw ? args.body : undefined, raw }, signal });
       if (j.blocked && !raw && browserLink.on()) {
-        try { return '(the site refused the harness; read through your own browser)\n' + await browserLink.open(String(args.url ?? '')); } catch {}
+        try {
+          const seen = await browserLink.open(String(args.url ?? ''));
+          // a verification page in the browser too: the Archive's copy, when there is one, is the better answer
+          if (!seen.startsWith('BOT CHECK') || !j.via) return '(the site refused the harness; read through your own browser)\n' + seen;
+        } catch {}
       }
       if (j.via) return `HTTP ${j.status} ${j.url}\n(read from ${j.via})\n\n${j.text}`;
       if (j.blocked) return `HTTP ${j.status} ${j.url}\n(this site refuses reads from a datacenter address and the Internet Archive has no copy of it)\n\n${j.text}`;
@@ -1211,7 +1218,14 @@ function toolChip(t) {
     h('pre', {}, t.running ? 'running…' : t.result));
 }
 
+const drawnMsgs = new WeakSet();   // messages already shown once: a redraw must not replay their entrance
 function message(m) {
+  const node = messageNode(m);
+  if (drawnMsgs.has(m)) node.classList.add('settled');
+  drawnMsgs.add(m);
+  return node;
+}
+function messageNode(m) {
   if (m.role === 'user') return h('div', { class: 'msg user' }, h('div', { class: 'role' }, 'you'), h('div', { class: 'body' }, m.content));
   if (m.role === 'error') return h('div', { class: 'msg error' }, h('div', { class: 'role' }, 'error'), h('div', { class: 'body' }, m.content));
   return h('div', { class: 'msg assistant' }, h('div', { class: 'role' }, 'veil'),
@@ -1519,8 +1533,39 @@ function browserBlock() {
       : B.seen
         ? [h('p', {}, 'The nl-veil browser link extension is installed, but this page is not allowed to use it yet. Click the extension\'s icon and tick "Let the web chat drive a tab", then:'),
            h('div', { class: 'acts' }, h('button', { class: 'btn btn-sm btn-solid', onclick: () => { B.hello(); setTimeout(drawSide, 400); } }, 'Check again'))]
-        : [h('p', {}, 'A web page cannot drive other tabs by itself. With the nl-veil browser link extension (Chrome or Edge), the veil gets a tab of its own in your browser: it reads pages over your connection, which sites that block datacenters accept, and it can click and type.'),
-           h('p', {}, 'Install it from the project\'s ', link({ label: 'extension folder', href: CFG.extension }), ': download the folder, open chrome://extensions, switch on Developer mode, choose "Load unpacked". Then reload this page.')]);
+        : installSteps());
+}
+
+/* Installing the extension. A store listing is one click (the store's own button); without one, the browser
+   only takes an extension from a folder, so the page hands over the folder as a zip and names the three steps. */
+async function downloadExtension() {
+  const files = {};
+  for (const name of CFG.extension_files) {
+    const r = await fetch(CFG.extension_raw + name, { cache: 'no-store' });
+    if (!r.ok) throw new Error('could not fetch ' + name + ' (HTTP ' + r.status + ')');
+    files['nl-veil-browser-link/' + name] = await r.text();
+  }
+  const a = h('a', { href: URL.createObjectURL(zipOf(files)), download: 'nl-veil-browser-link.zip' });
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+
+function installSteps() {
+  const edge = navigator.userAgent.includes('Edg/');
+  const store = edge ? CFG.extension_store.edge : CFG.extension_store.chrome;
+  const where = edge ? 'edge://extensions' : 'chrome://extensions';
+  const intro = h('p', {}, 'A web page cannot drive other tabs by itself. With the nl-veil browser link extension, the veil gets a tab of its own in this browser: it reads pages over your connection, which sites that block datacenters accept, and it can click and type.');
+  if (store) return [intro, h('div', { class: 'acts' }, h('a', { class: 'btn btn-sm btn-solid', href: store, target: '_blank', rel: 'noopener' }, edge ? 'Install extension (Edge Add-ons)' : 'Install extension (Chrome Web Store)')),
+    h('p', { class: 'fine' }, 'After it is added, reload this page and tick "Let the web chat drive a tab" in the extension\'s popup.')];
+  return [intro,
+    h('div', { class: 'acts' }, h('button', { class: 'btn btn-sm btn-solid', disabled: !!S.busy, onclick: () => act('ext', downloadExtension) }, S.busy === 'ext' ? 'Preparing…' : 'Install extension'),
+      h('button', { class: 'btn btn-sm', onclick: async () => { try { await navigator.clipboard.writeText(where); toast('Copied ' + where + '. Paste it in the address bar.'); } catch { toast('Open ' + where + ' in a new tab.'); } } }, 'Copy ' + where),
+      h('button', { class: 'btn btn-sm btn-ghost', onclick: () => location.reload() }, 'Reload this page')),
+    h('ol', { class: 'steps' },
+      h('li', {}, '"Install extension" downloads nl-veil-browser-link.zip. Unzip it.'),
+      h('li', {}, 'Open ' + where + ' (a page cannot open that address for you), switch on Developer mode, choose "Load unpacked" and pick the unzipped folder.'),
+      h('li', {}, 'Reload this page, then tick "Let the web chat drive a tab" in the extension\'s popup.')),
+    h('p', { class: 'fine' }, 'The extension is not in the Chrome Web Store or Edge Add-ons yet; a browser installs in one click only from its store.')];
 }
 
 function harnessTab() {
@@ -1581,8 +1626,9 @@ function sidePane() {
       h('span', { class: 'grow' }),
       S.tab === 'code' ? h('button', { class: 'widen', 'aria-label': S.explorer ? 'Hide the explorer' : 'Show the explorer', 'aria-pressed': String(S.explorer), title: 'Explorer', onclick: () => { S.explorer = !S.explorer; drawSide(); } }, '☰') : null,
       h('button', { class: 'widen', 'aria-label': S.wide ? 'Narrow this panel' : 'Widen this panel', 'aria-pressed': String(S.wide), title: S.wide ? 'Narrow' : 'Widen', onclick: () => { S.wide = !S.wide; document.querySelector('.shell')?.classList.toggle('wide', S.wide); drawSide(); } }, S.wide ? '⇥' : '⇤')),
-    h('div', { class: 'pane tab-' + S.tab }, S.tab === 'code' ? codeTab() : S.tab === 'jobs' ? jobsTab() : harnessTab()));
+    h('div', { class: 'pane tab-' + S.tab + (S.tab !== shownTab ? ' enter' : '') }, S.tab === 'code' ? codeTab() : S.tab === 'jobs' ? jobsTab() : harnessTab()));
 }
+let shownTab = 'code';   // the tab the pane last drew: only a change of tab is an entrance
 
 function drawSide() {
   const old = document.getElementById('side');
@@ -1592,10 +1638,16 @@ function drawSide() {
   for (const el of old.querySelectorAll('input, textarea, select')) if (el.id && el.id !== 'editor' && el.id !== 'fileFilter' && (document.activeElement === el || (el.value && el.type !== 'number'))) keep[el.id] = el.value;
   const focus = document.activeElement?.id;
   const caret = focus === 'editor' ? [document.activeElement.selectionStart, document.activeElement.selectionEnd, document.activeElement.scrollTop] : null;
-  const scroll = old.querySelector('.pane')?.scrollTop ?? 0;
+  const scroll = S.tab === shownTab ? (old.querySelector('.pane')?.scrollTop ?? 0) : 0;
   const code = old.querySelector('.code');
   const codeAt = code ? [code.scrollTop, code.scrollLeft] : null;
-  old.replaceWith(sidePane());
+  const fresh = sidePane();
+  if (S.tab === shownTab) {
+    // the same tab with newer data: its pane stays where it is (and keeps any entrance still playing)
+    old.querySelector('.tabs').replaceWith(fresh.querySelector('.tabs'));
+    old.querySelector('.pane').replaceChildren(...fresh.querySelector('.pane').childNodes);
+  } else old.replaceWith(fresh);
+  shownTab = S.tab;
   for (const [id, v] of Object.entries(keep)) { const el = document.getElementById(id); if (el) el.value = v; }
   const pane = document.querySelector('#side .pane');
   if (pane) pane.scrollTop = scroll;
@@ -1728,6 +1780,7 @@ function modelSelect() {
     h('option', { value: '+' }, 'Other model…'));
 }
 
+let shownView = '';
 function draw() {
   const on = !!(S.session && S.status);
   const draft = document.getElementById('prompt')?.value ?? '';
@@ -1742,7 +1795,11 @@ function draw() {
       : h('span', { class: 'chip', title: S.harness }, h('span', { class: 'chip-dot' }), 'harness connected'),
     h('button', { class: 'icon-btn only-narrow', 'aria-label': 'Code, jobs and harness', onclick: () => { S.panes.side = !S.panes.side; S.panes.rail = false; draw(); } }, '▤'),
   ] : []));
+  const view = !S.session ? 'gate' : on ? 'chat:' + S.conv.id : 'setup';
+  app.classList.toggle('same-view', view === shownView);
+  shownView = view;
   app.replaceChildren(!S.session ? gate() : on ? dashboard() : setup());
+  shownTab = S.tab;
   const box = document.getElementById('prompt');
   if (box && draft) box.value = draft;
   const a = document.getElementById('hname');
