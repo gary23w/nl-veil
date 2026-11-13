@@ -116,7 +116,10 @@ pub const App = struct {
 /// each answered "The OAuth 2.0 Client is not allowed to request scope 'containers.read'", and the list
 /// without them reached the state check (the probe's next gate). A machine already holding a refresh token
 /// never re-consents, which is why the break only showed on a fresh install (v1.1.25, Edge).
-pub const CF_OAUTH_SCOPES_DEFAULT = "ai.read ai.write workers-r2.read workers-r2.write user-details.read account-settings.read offline_access workers-scripts.read workers-scripts.write workers-scripts.bind page.read page.write d1.read d1.write workers-kv-storage.read workers-kv-storage.write queues.read queues.write vectorize.read vectorize.write workers-routes.read workers-routes.write workers-tail.read workers-observability.read argotunnel.read argotunnel.write dns.read dns.write zone.read zone-access.read zone-access.write access-org.read";
+/// workers-scripts.bind went the same way on 2026-11-13: Cloudflare's scope catalogue no longer has the id, so
+/// saving the client's edit form dropped it from the client, and the probe then answered invalid_scope for it.
+/// Nothing in the tree used it.
+pub const CF_OAUTH_SCOPES_DEFAULT = "ai.read ai.write workers-r2.read workers-r2.write user-details.read account-settings.read offline_access workers-scripts.read workers-scripts.write page.read page.write d1.read d1.write workers-kv-storage.read workers-kv-storage.write queues.read queues.write vectorize.read vectorize.write workers-routes.read workers-routes.write workers-tail.read workers-observability.read argotunnel.read argotunnel.write dns.read dns.write zone.read zone-access.read zone-access.write access-org.read";
 
 pub fn metered(app: *App, u: User) bool {
     return app.production and app.ledger != null and !app.auth.isAdmin(u);

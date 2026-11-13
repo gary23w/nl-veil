@@ -1088,6 +1088,8 @@ test "the default scope list carries no scope the registered client refuses" {
     var n: usize = 0;
     while (it.next()) |scope| : (n += 1) {
         try std.testing.expect(!std.mem.startsWith(u8, scope, "containers."));
+        // retired from Cloudflare's catalogue and dropped from the client on 2026-11-13
+        try std.testing.expect(!std.mem.eql(u8, scope, "workers-scripts.bind"));
         for (scope) |c| try std.testing.expect(std.ascii.isAlphanumeric(c) or c == '.' or c == '-' or c == '_');
     }
     // the four the login itself needs (Workers AI, account + user details) plus the refresh grant
