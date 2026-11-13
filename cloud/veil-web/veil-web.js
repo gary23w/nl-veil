@@ -6,12 +6,16 @@
 // its tool loop in the browser; this Worker is what a tab cannot be:
 //   - the MODEL: the account's own AI binding (env.AI). No API key, and the call never crosses the public internet.
 //   - the WEB: fetch a page, run a search. A page on another site cannot read those itself (same-origin policy).
-//   - the CLOUDFLARE API: it answers no cross-origin page, so the few calls the page needs (who logged in, putting
-//     the Python Worker in place) are made here, with the user's own login.
+//   - the CLOUDFLARE API: it answers no cross-origin page, so the few calls the page needs (who logged in, the
+//     model list, updating this Worker) are made here, with the user's own login.
 //   - JOBS: work that goes on with the tab closed. A FIFO queue (one job at a time, in arrival order) run by an
 //     alarm, each job the same pick-a-tool loop the page runs.
-//   - PYTHON: a companion Worker ("veil-web-py": cloud/tot_py.py behind a key) this harness uploads on request.
+//   - PYTHON: cloud/tot_py.py loaded as a Dynamic Worker inside this one (the LOADER binding). Nothing else is
+//     deployed. Cloudflare offers that binding on the Workers Paid plan; without it the page runs a chat's
+//     Python in the browser and jobs are told Python is not available here.
 //   - AGENT GARRETT: the user's agent, reached over MCP (tools/list, tools/call) with the key its dashboard gives.
+//   - MCP: any MCP server the owner adds (name, address, token), its tools callable from chat and from jobs.
+//   - CLEF: yes/no decisions answered as probabilities by Cloudflare's decision model, as the desktop veil does.
 //   - SCHEDULES: a task that queues itself as a job every so often.
 //   - CHATS: the page's conversations and their files, kept here so every browser the owner logs in from (and
 //     anything else holding their login) sees the same ones.
@@ -24,7 +28,7 @@
 // There is no shared key to paste or leak. Cross-origin calls are answered for ALLOW_ORIGIN (the page) only.
 //
 // WHAT IT KEEPS (one Durable Object, "main"): the queue and each job's record, today's usage, the limits, the
-// Python Worker's address and key, Agent Garrett's address and token. All of it in the user's account.
+// Python source's cached copy, Agent Garrett's address and token. All of it in the user's account.
 //
 // LIMITS (DEFAULTS; the owner can change them, within CEIL): model calls and transferred bytes per UTC day, and
 // bytes of job data kept. A spent day's budget refuses new work until 00:00 UTC; the queue holds QUEUE_MAX waiting
@@ -36,20 +40,21 @@
 //   POST chat | fetch | search  one model call (stream:true = SSE) | one HTTP call | a web search
 //   GET  jobs | jobs/<id>       the queue, oldest first | one job whole
 //   POST jobs  {task, model}    queue a job          DELETE jobs/<id>   cancel or delete one
-//   POST python/deploy | python/run {code, files?, args?, packages?}
+//   POST python/enable (re-upload this Worker with the LOADER binding) | python/run {code, files?, args?, packages?}
 //   POST garrett {key} or {url, token} (neither forgets it) | garrett/call {method, params}
 //   GET  models                 the account's Workers AI text models
 //   GET  schedules   POST schedules {task, model, every_s}   DELETE schedules/<id>
 //   GET  convs | convs/<id>     POST convs/<id> {title, at, msgs, files}   DELETE convs/<id>
 //   GET  context                the reference text the model is handed (llms.txt digest)
 //   POST update                 replace this Worker with the current source from the public repo
+//   POST clef  {state, questions: [...]}    yes/no decisions as probabilities (Cloudflare's Clef), or probs: null
+//   GET  mcp   POST mcp {name, url, token?}   DELETE mcp/<name>   POST mcp/call {server, method, params, query?}
 //
 // No imports and no platform globals beyond fetch/Response/crypto, so a test can run this file under node with
 // a Map for storage and a scripted env.AI.
 
-export const VERSION = "3";
+export const VERSION = "4";
 const API_ROOT = "https://api.cloudflare.com/client/v4";
-const PY_SCRIPT = "veil-web-py";
 const PY_SOURCE = "https://raw.githubusercontent.com/gary23w/nl-veil/main/cloud/tot_py.py";
 const SELF_SCRIPT = "veil-web";
 const SELF_SOURCE = "https://raw.githubusercontent.com/gary23w/nl-veil/main/cloud/veil-web/veil-web.js";
@@ -57,6 +62,11 @@ const LLMS_URL = "https://garrettstimpson.ca/llms.txt";
 export const GARRETT_MCP = "https://agent.garrettstimpson.ca/mcp";
 export const GARRETT_DASHBOARD = "https://agent.garrettstimpson.ca/dashboard";
 const COMPAT_DATE = "2025-09-01";
+export const CLEF_MODEL = "@cf/cloudflare/clef-flash"; // the id src/worker/chat/clef.zig calls
+const CLEF_QUESTIONS_MAX = 64;
+export const MCP_MAX = 8; // MCP servers one harness keeps
+// what a site answers a datacenter address when it will not serve it
+const BLOCKED = new Set([202, 401, 403, 406, 409, 419, 429, 451, 503]);
 const UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36";
 const MB = 1 << 20;
 
@@ -222,7 +232,12 @@ export function parseAction(reply, known) {
       args = {};
     }
   }
-  if (!args || typeof args !== "object" || Array.isArray(args)) args = {};
+  if (!args || typeof args !== "object" || Array.isArray(args)) {
+    // a model that writes {"tool": "swarm", "task": "...", "angles": [...]} means those fields as the arguments
+    const skip = new Set(["tool", "name", "tool_name", "args", "arguments", "parameters", "input", "type", "id"]);
+    args = {};
+    for (const [k, v] of Object.entries(c)) if (!skip.has(k)) args[k] = v;
+  }
   return { tool: name, args };
 }
 
@@ -248,22 +263,6 @@ export function llmsDigest(text) {
   return clip(keep.join("\n"), LLMS_DIGEST_MAX);
 }
 
-// The Python Worker's entry: cloud/tot_py.py has no door of its own (the tot runtime reaches it over a service
-// binding), so here it sits behind a key only this harness holds.
-const PY_ENTRY = `import hmac
-from workers import Response, WorkerEntrypoint
-import tot_py
-
-
-class Default(WorkerEntrypoint):
-    async def fetch(self, request):
-        sent = str(request.headers.get("authorization") or "")
-        want = "Bearer " + str(getattr(self.env, "PY_TOKEN", "") or "")
-        if len(want) < 40 or not hmac.compare_digest(sent.encode(), want.encode()):
-            return Response('{"ok": false, "out": "unauthorized"}', status=401, headers={"content-type": "application/json"})
-        return await tot_py.Default.fetch(self, request)
-`;
-
 const JOB_TOOLS = {
   web_search: '{"query": "<words>"} : search the web',
   web_fetch: '{"url": "<https://...>"} : read a web page as text',
@@ -275,6 +274,8 @@ const JOB_TOOLS = {
   swarm: '{"task": "<the question>", "angles": ["<a way to look at it>", "..."]} : ask up to 4 minds at once, one per angle',
   garrett_tools: '{"query": "<words, optional>"} : list the tools of Agent Garrett (those matching the words)',
   garrett: '{"name": "<tool>", "args": {...}} : call one of Agent Garrett\'s tools',
+  mcp_tools: '{"server": "<name>", "query": "<words, optional>"} : list the tools of a connected MCP server',
+  mcp_call: '{"server": "<name>", "tool": "<tool>", "args": {...}} : call a tool of a connected MCP server',
 };
 
 // ------------------------------------------------------------------------------------------ the Worker (door)
@@ -414,7 +415,103 @@ export class Harness {
     const type = r.headers.get("content-type") ?? "";
     const raw = (await r.text()).slice(0, 2000000);
     await this.spend(0, raw.length);
-    return { status: r.status, content_type: type, url: r.url || u.toString(), text: clip(spec.raw === true || !/html/i.test(type) ? raw : readable(raw), FETCH_TEXT_MAX) };
+    const text = clip(spec.raw === true || !/html/i.test(type) ? raw : readable(raw), FETCH_TEXT_MAX);
+    const out = { status: r.status, content_type: type, url: r.url || u.toString(), text };
+    // A site that refuses Cloudflare's addresses answers a block status or an empty shell. A plain page read
+    // then falls back to the Internet Archive's newest copy, and says so: it may be days or months old.
+    const refused = BLOCKED.has(r.status) || (/html/i.test(type) && text.trim().length < 200);
+    if (!refused) return out;
+    out.blocked = true;
+    if (method !== "GET" || spec.raw === true || spec.archive === false) return out;
+    try {
+      const a = await fetch("https://archive.org/wayback/available?url=" + encodeURIComponent(u.toString()), { signal: AbortSignal.timeout(8000) });
+      const snap = (await a.json())?.archived_snapshots?.closest;
+      if (!snap?.available || !/^\d{14}$/.test(String(snap.timestamp))) return out;
+      // the Archive refuses a datacenter address that claims to be a browser (HTTP 429) and serves one that says what it is
+      const copy = await fetch(`https://web.archive.org/web/${snap.timestamp}id_/${u.toString()}`, { headers: { "user-agent": `nl-veil-web/${VERSION} (+https://github.com/gary23w/nl-veil)` }, redirect: "follow", signal: AbortSignal.timeout(20000) });
+      const body = (await copy.text()).slice(0, 2000000);
+      await this.spend(0, body.length);
+      const read = clip(readable(body), FETCH_TEXT_MAX);
+      if (copy.status !== 200 || read.trim().length < 200) return out;
+      const t = String(snap.timestamp);
+      return { status: 200, content_type: "text/html", url: u.toString(), text: read, blocked: true, via: `the Internet Archive's copy of ${t.slice(0, 4)}-${t.slice(4, 6)}-${t.slice(6, 8)} (the site refused a direct read)` };
+    } catch {
+      return out;
+    }
+  }
+
+  // ---------------------------------------------------------------- clef (yes/no decisions)
+
+  /// Ask Cloudflare's Clef every question about `state`: the probability that each answer is yes, or null when
+  /// there is no usable answer (the caller then decides as it would without clef). The account's AI binding is
+  /// tried first; with a login in hand the REST route the desktop veil uses is the second try.
+  async clef(who, state, questions) {
+    const qs = (Array.isArray(questions) ? questions : []).map(String).filter(Boolean);
+    if (qs.length === 0 || qs.length > CLEF_QUESTIONS_MAX) return null;
+    const body = { model: "clef-flash", state: clip(state, 60000), questions: Object.fromEntries(qs.map((q, i) => ["q" + i, { type: "noul", instructions: q }])) };
+    const read = (raw) => {
+      const root = raw?.result && typeof raw.result === "object" ? raw.result : raw;
+      const probs = qs.map((_, i) => Number(root?.answers?.["q" + i]?.noul));
+      return probs.every((x) => x >= 0 && x <= 1) ? probs : null;
+    };
+    await this.spend(1, JSON.stringify(body).length);
+    let probs = null;
+    try {
+      probs = read(await this.env.AI.run(CLEF_MODEL, body));
+    } catch {}
+    if (!probs && who?.token) probs = read(await this.api(who.token, "POST", `/accounts/${who.account}/ai/run/${CLEF_MODEL}`, body));
+    return probs;
+  }
+
+  // ---------------------------------------------------------------- MCP servers
+
+  async mcpServers() {
+    return (await this.store.get("mcp")) ?? [];
+  }
+
+  /// Greet an MCP server and count its tools. {tools, session} or {err}. No tool is run.
+  async mcpHello(server) {
+    const hello = await this.garrettRpc(server, "initialize", { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "nl-veil-web", version: VERSION } });
+    if (hello.err) return hello;
+    const withSession = { ...server, session: hello.session || "" };
+    if (withSession.session) await this.garrettRpc(withSession, "notifications/initialized", undefined, true);
+    const listed = await this.garrettRpc(withSession, "tools/list", {});
+    if (listed.err) return listed;
+    const tools = Array.isArray(listed.j?.result?.tools) ? listed.j.result.tools : [];
+    return { tools, session: withSession.session };
+  }
+
+  /// One call to a named MCP server, as text for a model. A server that has forgotten its session is greeted again.
+  async mcpCall(name, method, params, query = "") {
+    const list = await this.mcpServers();
+    const server = list.find((x) => x.name === String(name ?? ""));
+    if (!server) return `ERROR: no MCP server named ${clip(name, 40)}. Connected: ${list.map((x) => x.name).join(", ") || "(none)"}`;
+    let got = await this.garrettRpc(server, method, params);
+    if (got.err && server.session) {
+      const again = await this.mcpHello(server);
+      if (!again.err) {
+        server.session = again.session;
+        await this.store.put("mcp", list);
+        got = await this.garrettRpc(server, method, params);
+      }
+    }
+    if (got.err) return `ERROR: ${server.name} ${got.err}`;
+    return this.mcpText(server.name, method, got.j, query);
+  }
+
+  /// An MCP answer as text: a tool list (narrowed by `query`, names only when long) or a tool's text content.
+  mcpText(label, method, j, query = "") {
+    if (method === "tools/list") {
+      const all = Array.isArray(j.result?.tools) ? j.result.tools : [];
+      if (all.length === 0) return `(${label} lists no tools)`;
+      const words = String(query ?? "").toLowerCase().split(/[^a-z0-9]+/).filter((w) => w.length > 1);
+      const tools = words.length === 0 ? all : all.filter((t) => words.every((w) => `${t.name} ${t.description ?? ""}`.toLowerCase().includes(w)));
+      if (tools.length === 0) return `none of ${label}'s ${all.length} tools match "${clip(query, 80)}". Try fewer or other words.`;
+      if (tools.length > 40) return `${tools.length} tools. Names: ${tools.map((t) => t.name).join(", ")}\nAsk again with a query (for example {"query": "dns"}) to see what a group does.`;
+      return tools.map((t) => `- ${t.name}: ${clip(String(t.description ?? ""), 200)}${t.inputSchema?.properties ? "\n  args: " + clip(Object.keys(t.inputSchema.properties).join(", "), 200) : ""}`).join("\n");
+    }
+    const out = (Array.isArray(j.result?.content) ? j.result.content : []).filter((c) => c?.type === "text").map((c) => c.text).join("\n");
+    return (j.result?.isError ? "FAILED: " : "") + clip(out || "(no text)", 12000);
   }
 
   async search(query) {
@@ -531,7 +628,7 @@ export class Harness {
   /// Replace this Worker with the current source from the public repo, with the caller's login. The bindings are
   /// the ones wrangler.jsonc declares; the Durable Object and its data stay. {err} in words, {same} when the
   /// repo has nothing newer, or {version} of what was put in place.
-  async selfUpdate(who) {
+  async selfUpdate(who, loader = !!this.env.LOADER) {
     let source;
     try {
       const r = await fetch(this.env.SELF_SOURCE || SELF_SOURCE, { headers: { "cache-control": "no-cache" } });
@@ -543,14 +640,14 @@ export class Harness {
     const version = /export const VERSION = "(\d+)";/.exec(source)?.[1];
     if (!version || !source.includes("export class Harness")) return { err: "what the repo serves is not a harness" };
     if (Number(version) < Number(VERSION)) return { err: `the repo's harness (version ${version}) is older than this one (${VERSION})` };
-    if (Number(version) === Number(VERSION)) return { same: true, version };
+    if (Number(version) === Number(VERSION) && loader === !!this.env.LOADER) return { same: true, version };
     const origin = String(this.env.ALLOW_ORIGIN ?? "");
     const form = new FormData();
     form.append("metadata", new Blob([JSON.stringify({
       main_module: "veil-web.js",
       compatibility_date: COMPAT_DATE,
       compatibility_flags: ["global_fetch_strictly_public"],
-      bindings: [{ type: "ai", name: "AI" }, { type: "durable_object_namespace", name: "HARNESS", class_name: "Harness" }, { type: "plain_text", name: "ALLOW_ORIGIN", text: origin }],
+      bindings: [{ type: "ai", name: "AI" }, { type: "durable_object_namespace", name: "HARNESS", class_name: "Harness" }, { type: "plain_text", name: "ALLOW_ORIGIN", text: origin }, ...(loader ? [{ type: "worker_loader", name: "LOADER" }] : [])],
       keep_bindings: ["secret_text"],
     })], { type: "application/json" }), "metadata.json");
     form.append("veil-web.js", new Blob([source], { type: "application/javascript+module" }), "veil-web.js");
@@ -592,56 +689,57 @@ export class Harness {
 
   // ---------------------------------------------------------------- Python
 
-  /// Put the Python Worker in the account, with the caller's login. Returns what went wrong in words, or "".
-  async pythonDeploy(who) {
-    let source;
+  /// cloud/tot_py.py from the public repo, kept for a day. "" when it cannot be had.
+  async pySource() {
+    const kept = await this.store.get("py_src");
+    if (kept && Date.now() - kept.at < LLMS_TTL_MS) return kept.text;
     try {
       const r = await fetch(this.env.PY_SOURCE || PY_SOURCE);
-      source = await r.text();
-      if (r.status !== 200 || !source.includes("class Default(WorkerEntrypoint)")) return "could not fetch the Python Worker's source (HTTP " + r.status + ")";
-    } catch (e) {
-      return "could not fetch the Python Worker's source: " + clip(e?.message ?? e, 120);
+      const text = await r.text();
+      if (r.status !== 200 || !text.includes("class Default(WorkerEntrypoint)")) return kept?.text ?? "";
+      await this.store.put("py_src", { at: Date.now(), text });
+      return text;
+    } catch {
+      return kept?.text ?? "";
     }
-    const token = hex(crypto.getRandomValues(new Uint8Array(32)));
-    const form = new FormData();
-    form.append("metadata", new Blob([JSON.stringify({ main_module: "entry.py", compatibility_date: COMPAT_DATE, compatibility_flags: ["python_workers"], bindings: [{ type: "secret_text", name: "PY_TOKEN", text: token }] })], { type: "application/json" }), "metadata.json");
-    form.append("entry.py", new Blob([PY_ENTRY], { type: "text/x-python" }), "entry.py");
-    form.append("tot_py.py", new Blob([source], { type: "text/x-python" }), "tot_py.py");
-    const base = `/accounts/${who.account}/workers/scripts/${PY_SCRIPT}`;
-    const up = await this.api(who.token, "PUT", base, form, "");
-    if (!up.success) return "Cloudflare refused the Python Worker: " + clip(up.errors?.[0]?.message ?? "no reason given", 300);
-    const on = await this.api(who.token, "POST", base + "/subdomain", { enabled: true });
-    if (!on.success) return "could not switch the Python Worker's address on: " + clip(on.errors?.[0]?.message ?? "no reason given", 300);
-    await this.store.put("py", { url: (this.env.PY_URL || `https://${PY_SCRIPT}.${who.sub}.workers.dev`) + "/run", token, at: Date.now() });
-    return "";
   }
 
+  /// Run one script in Python INSIDE this Worker: tot_py.py as a Dynamic Worker (env.LOADER), the same module
+  /// the tot runtime runs behind a service binding. Nothing else is deployed and nothing listens anywhere.
   async pythonRun(spec) {
-    const py = await this.store.get("py");
-    if (!py) return { ok: false, out: "Python is not set up for this harness yet. The owner deploys it from the web veil's Harness tab.", files: {} };
+    if (!this.env.LOADER) return { ok: false, out: "This harness has no Python runtime of its own: Cloudflare's Worker Loader is not bound to it (the Harness tab enables it; Cloudflare offers it on the Workers Paid plan). In a chat the page runs Python in the browser instead.", files: {} };
+    const source = await this.pySource();
+    if (!source) return { ok: false, out: "the Python runtime's source could not be fetched from the repo", files: {} };
     try {
-      const r = await fetch(py.url, { method: "POST", headers: { "content-type": "application/json", authorization: "Bearer " + py.token }, body: JSON.stringify({ code: String(spec.code ?? ""), files: spec.files ?? {}, args: spec.args ?? null, packages: spec.packages ?? [] }), signal: AbortSignal.timeout(120000) });
+      const id = "py-" + hex(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(source))).slice(0, 16);
+      const worker = this.env.LOADER.get(id, () => ({ compatibilityDate: COMPAT_DATE, compatibilityFlags: ["python_workers"], mainModule: "tot_py.py", modules: { "tot_py.py": { py: source } } }));
+      const r = await worker.getEntrypoint().fetch(new Request("https://py/run", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ code: String(spec.code ?? ""), files: spec.files ?? {}, args: spec.args ?? null, packages: spec.packages ?? [] }) }));
       const text = await r.text();
       await this.spend(0, text.length);
       const j = JSON.parse(text);
       return { ok: j.ok === true, out: String(j.out ?? ""), files: j.files && typeof j.files === "object" ? j.files : {} };
     } catch (e) {
-      return { ok: false, out: "the Python Worker did not answer: " + clip(e?.message ?? e, 200) + " (a new one can take a minute to come up)", files: {} };
+      return { ok: false, out: "Python did not run: " + clip(e?.message ?? e, 300), files: {} };
     }
   }
 
   // ---------------------------------------------------------------- Agent Garrett (MCP)
 
   /// One JSON-RPC request to an MCP endpoint: {j} the parsed answer, or {err} in words.
-  async garrettRpc(g, method, params) {
+  async garrettRpc(g, method, params, notify = false) {
     let r, text;
+    const headers = { "content-type": "application/json", accept: "application/json, text/event-stream" };
+    if (g.token) headers.authorization = "Bearer " + g.token;
+    if (g.session) headers["mcp-session-id"] = g.session;
     try {
-      r = await fetch(g.url, { method: "POST", headers: { "content-type": "application/json", accept: "application/json, text/event-stream", authorization: "Bearer " + g.token }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }), signal: AbortSignal.timeout(30000) });
+      r = await fetch(g.url, { method: "POST", headers, body: JSON.stringify(notify ? { jsonrpc: "2.0", method } : { jsonrpc: "2.0", id: 1, method, params }), signal: AbortSignal.timeout(30000) });
       text = await r.text();
       await this.spend(0, text.length);
     } catch (e) {
       return { err: `did not answer: ${clip(e?.message ?? e, 200)}` };
     }
+    if (notify) return { j: {} };
+    const session = r.headers.get("mcp-session-id") ?? "";
     // a server may answer a single request as one SSE event: the JSON is its data line
     const data = /^data:\s*(\{[\s\S]*\})\s*$/m.exec(text)?.[1] ?? text;
     let j = null;
@@ -650,7 +748,7 @@ export class Harness {
     } catch {}
     if (!j || typeof j !== "object") return { err: `answered HTTP ${r.status}: ${clip(text, 300)}` };
     if (j.error) return { err: clip(j.error.message ?? JSON.stringify(j.error), 400) };
-    return { j };
+    return { j, session };
   }
 
   /// One MCP call. `query` narrows a tools/list to the tools whose name or description holds every word of it;
@@ -660,17 +758,7 @@ export class Harness {
     if (!g) return "ERROR: Agent Garrett is not connected to this harness";
     const { j, err } = await this.garrettRpc(g, method, params);
     if (err) return "ERROR: Agent Garrett " + err;
-    if (method === "tools/list") {
-      const all = Array.isArray(j.result?.tools) ? j.result.tools : [];
-      if (all.length === 0) return "(Agent Garrett lists no tools)";
-      const words = String(query ?? "").toLowerCase().split(/[^a-z0-9]+/).filter((w) => w.length > 1);
-      const tools = words.length === 0 ? all : all.filter((t) => words.every((w) => `${t.name} ${t.description ?? ""}`.toLowerCase().includes(w)));
-      if (tools.length === 0) return `none of Agent Garrett's ${all.length} tools match "${clip(query, 80)}". Try fewer or other words.`;
-      if (tools.length > 40) return `${tools.length} tools. Names: ${tools.map((t) => t.name).join(", ")}\nCall garrett_tools with a query (for example {"query": "dns"}) to see what a group does.`;
-      return tools.map((t) => `- ${t.name}: ${clip(String(t.description ?? ""), 200)}`).join("\n");
-    }
-    const out = (Array.isArray(j.result?.content) ? j.result.content : []).filter((c) => c?.type === "text").map((c) => c.text).join("\n");
-    return (j.result?.isError ? "FAILED: " : "") + clip(out || "(no text)", 12000);
+    return this.mcpText("Agent Garrett", method, j, query);
   }
 
   // ---------------------------------------------------------------- jobs (FIFO)
@@ -739,7 +827,7 @@ export class Harness {
       case "swarm": {
         const task = String(args.task ?? "").trim();
         const angles = (Array.isArray(args.angles) ? args.angles : []).map(String).filter(Boolean).slice(0, 4);
-        if (!task || angles.length < 2) return "error: swarm needs a task and at least two angles";
+        if (!task || angles.length < 2) return 'error: swarm needs a task and at least two angles, as {"tool": "swarm", "args": {"task": "...", "angles": ["...", "..."]}}';
         const minds = await Promise.all(angles.map(async (angle, i) => {
           try {
             const t = await this.model(job.model, [
@@ -758,6 +846,10 @@ export class Harness {
         return this.garrettCall("tools/list", {}, args.query);
       case "garrett":
         return this.garrettCall("tools/call", { name: String(args.name ?? ""), arguments: args.args && typeof args.args === "object" ? args.args : {} });
+      case "mcp_tools":
+        return this.mcpCall(args.server, "tools/list", {}, args.query);
+      case "mcp_call":
+        return this.mcpCall(args.server, "tools/call", { name: String(args.tool ?? args.name ?? ""), arguments: args.args && typeof args.args === "object" ? args.args : {} });
       default:
         return `error: no tool named ${name}. Tools: ${Object.keys(JOB_TOOLS).join(", ")}`;
     }
@@ -788,6 +880,12 @@ export class Harness {
     if (job.rounds.length >= JOB_ROUNDS) {
       job.state = "failed";
       job.error = `stopped after ${JOB_ROUNDS} tool calls without finishing`;
+      return true;
+    }
+    const same = (r) => r.tool === act.tool && JSON.stringify(r.args) === JSON.stringify(act.args) && /^(error|ERROR|FAILED)/.test(r.result);
+    if (job.rounds.slice(-2).filter(same).length === 2) {
+      job.state = "failed";
+      job.error = `stopped: the same ${act.tool} call failed three times in a row (${clip(job.rounds.at(-1).result, 200)})`;
       return true;
     }
     let result;
@@ -870,7 +968,7 @@ export class Harness {
   // ---------------------------------------------------------------- routes
 
   async status(who) {
-    const [cfg, usage, index, py, g, chats, sched] = [await this.cfg(), await this.usage(), await this.jobs(), await this.store.get("py"), await this.store.get("garrett"), await this.convs(), await this.schedules()];
+    const [cfg, usage, index, py, g, chats, sched] = [await this.cfg(), await this.usage(), await this.jobs(), null, await this.store.get("garrett"), await this.convs(), await this.schedules()];
     return {
       ok: true,
       version: VERSION,
@@ -882,9 +980,11 @@ export class Harness {
       queue: { waiting: index.filter((j) => j.state === "queued").length, running: index.filter((j) => j.state === "running").length, max: QUEUE_MAX, kept: index.length, keep: JOBS_KEEP },
       schedules: { count: sched.length, max: SCHEDULES_MAX, shortest_s: EVERY_MIN_S },
       chats: { count: chats.length, max: CONVS_MAX },
-      python: py ? { deployed: true, at: py.at } : { deployed: false },
+      python: { worker: !!this.env.LOADER },
       garrett: g ? { connected: true, host: new URL(g.url).hostname, tools: g.tools ?? 0 } : { connected: false },
       garrett_dashboard: GARRETT_DASHBOARD,
+      mcp: (await this.mcpServers()).map((x) => ({ name: x.name, host: new URL(x.url).hostname, tools: x.tools ?? 0 })),
+      clef: CLEF_MODEL,
     };
   }
 
@@ -980,9 +1080,10 @@ export class Harness {
       }
     }
 
-    if (method === "POST" && at === "python/deploy") {
-      const err = await this.pythonDeploy(who);
-      return err ? bad(err, 502) : say(await this.status(who));
+    if (method === "POST" && at === "python/enable") {
+      if (this.env.LOADER) return say({ ok: true, already: true });
+      const u = await this.selfUpdate(who, true);
+      return u.err ? bad(u.err + ". Cloudflare offers the Worker Loader on the Workers Paid plan; without it, Python in a chat runs in your browser.", 502) : say({ ok: true, version: u.version });
     }
     if (method === "POST" && at === "python/run") {
       const why = await this.spent(false);
@@ -1021,6 +1122,43 @@ export class Harness {
       const m = String(body.method ?? "");
       if (m !== "tools/list" && m !== "tools/call") return bad("method must be tools/list or tools/call");
       return say({ ok: true, text: await this.garrettCall(m, body.params && typeof body.params === "object" ? body.params : {}, body.query) });
+    }
+
+    if (method === "POST" && at === "clef") {
+      const why = await this.spent(true);
+      if (why) return say({ ok: true, probs: null, why });
+      return say({ ok: true, probs: await this.clef(who, String(body.state ?? ""), body.questions) });
+    }
+
+    if (at === "mcp" && method === "GET") return say({ ok: true, servers: (await this.mcpServers()).map((x) => ({ name: x.name, url: x.url, tools: x.tools ?? 0 })), max: MCP_MAX });
+    if (at === "mcp" && method === "POST") {
+      const name = String(body.name ?? "").trim().toLowerCase();
+      if (!/^[a-z][a-z0-9_-]{0,23}$/.test(name) || name === "garrett") return bad("give the server a short name: a letter, then letters, digits, - or _ (24 at most)");
+      let parsed;
+      try {
+        parsed = new URL(String(body.url ?? "").trim());
+      } catch {
+        return bad("that is not a URL");
+      }
+      if (parsed.protocol !== "https:" || privateHost(parsed.hostname)) return bad("an MCP server's address must be a public https URL");
+      const list = await this.mcpServers();
+      if (list.length >= MCP_MAX && !list.some((x) => x.name === name)) return bad(`this harness keeps at most ${MCP_MAX} MCP servers; remove one first`, 429);
+      const server = { name, url: parsed.toString(), token: String(body.token ?? "") };
+      const hello = await this.mcpHello(server);
+      if (hello.err) return bad(`that server did not answer as MCP (${hello.err})`, 502);
+      const kept = { ...server, session: hello.session, tools: hello.tools.length, at: Date.now() };
+      await this.store.put("mcp", [...list.filter((x) => x.name !== name), kept]);
+      return say(await this.status(who));
+    }
+    if (seg[1] === "mcp" && seg.length === 3 && method === "DELETE") {
+      const list = await this.mcpServers();
+      await this.store.put("mcp", list.filter((x) => x.name !== seg[2]));
+      return say(await this.status(who));
+    }
+    if (method === "POST" && at === "mcp/call") {
+      const m = String(body.method ?? "");
+      if (m !== "tools/list" && m !== "tools/call") return bad("method must be tools/list or tools/call");
+      return say({ ok: true, text: await this.mcpCall(body.server, m, body.params && typeof body.params === "object" ? body.params : {}, body.query) });
     }
 
     if (method === "GET" && at === "models") return say({ ok: true, models: await this.models(who) });
