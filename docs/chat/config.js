@@ -13,7 +13,7 @@ window.VEIL_WEB = {
   deploy_url: "https://deploy.workers.cloudflare.com/?url=https://github.com/gary23w/nl-veil/tree/main/cloud/veil-web",
   script: "veil-web",
   /* The harness version this page was written for. An older one is offered its update. */
-  harness_version: 16,
+  harness_version: 18,
 
   /* Pictures: the first of each list that the account has is used (the harness learns how each wants to be asked).
      Making one from words; changing one or taking after one; reading one. */

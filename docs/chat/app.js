@@ -4283,12 +4283,14 @@ PREVIEW_PASSES.push(artInline);
 
 /* ============================================================ video: films made of pictures, with a voice */
 
-/* A film here is a list of SHOTS. A shot is one picture, or several made one from the last (frame by frame), shown
-   for as long as its narration takes or as long as it is given, with a camera move over it and a cut or a fade
-   into the next. The pictures come from the account's image models through the harness (or are pictures the user
+/* A film here is a list of SHOTS. A shot is made of FRAMES: pictures, each made from the one before it (moved the
+   way the shot's camera moves), and the film TRAVELS from each frame to the next: the renderer finds the motion
+   between two frames and draws every moment between them along it (veil_core.wasm, src/web/render.zig). A shot
+   runs as long as its narration takes or as long as it is given, and its first frame comes out of the last
+   frame of the shot before. A shot of one picture is that picture under a moving camera. The pictures come from the account's image models through the harness (or are pictures the user
    already has); the narration is spoken by the account's speech models; music is a sound file of the user's own.
-   Everything is put together HERE, in the browser: the player draws the film on a canvas as it plays, and the
-   export records that canvas and its sound into one video file. Nothing sets a length: a film has as many shots
+   Everything is put together HERE, in the browser: the wasm core composes each frame, the browser's own
+   encoders compress them, and the core lays out the MP4 they go into. Nothing sets a length: a film has as many shots
    as it is given, and each call for a picture or a line of speech is one model call of the harness's daily
    limit, which is the owner's own to raise. Projects, pictures and sound are kept in this browser. */
 
@@ -4298,7 +4300,7 @@ const MOTIONS = {   // a camera move: scale and offset (in parts of the frame) a
   'pan left': [1.16, 0.07, 0, 1.16, -0.07, 0], 'pan right': [1.16, -0.07, 0, 1.16, 0.07, 0],
   'pan up': [1.16, 0, 0.07, 1.16, 0, -0.07], 'pan down': [1.16, 0, -0.07, 1.16, 0, 0.07],
 };
-const CUTS = ['cut', 'fade', 'dissolve'];
+const CUTS = ['morph', 'dissolve', 'fade', 'cut'];   // how a shot comes in: its first frame travels out of the last one's (morph), or mixes in, or comes up from black, or is just there
 const VID_SIDES = [480, 720, 1080, 1440, 2160];   // the short side of an exported film, in pixels
 const SAY_CHARS = 900;        // a narration longer than this is spoken in parts
 const WRITE_BATCH = 10;       // shots one call to the chat's model writes
@@ -4318,8 +4320,8 @@ const vid = {
   rec: null,           // the export in flight: {recorder, abort}
 };
 const vidId = (p) => p + Date.now().toString(36) + Math.random().toString(36).slice(2, 5);
-const newShot = (o = {}) => ({ id: vidId('s'), prompt: '', say: '', secs: 4, motion: 'zoom in', cut: 'dissolve', frames: 1, pics: [], voice: [], voiceSecs: 0, voiceFor: '', ...o });
-const newFilm = (o = {}) => ({ id: vidId('v'), title: 'Untitled film', at: Date.now(), ratio: '16:9', size: 'M', side: 720, fps: 30, model: '', look: '', negative: '', keep: true, captions: true, voiceModel: '', speaker: '', lang: '', music: '', musicVol: 0.25, shots: [], ...o });
+const newShot = (o = {}) => ({ id: vidId('s'), prompt: '', say: '', secs: 4, motion: 'zoom in', cut: 'morph', frames: 1, pics: [], voice: [], voiceSecs: 0, voiceFor: '', ...o });
+const newFilm = (o = {}) => ({ id: vidId('v'), title: 'Untitled film', at: Date.now(), ratio: '16:9', size: 'M', side: 720, fps: 30, frames: 4, gen: 8, blend: 'flow', model: '', look: '', negative: '', keep: true, captions: true, voiceModel: '', speaker: '', lang: '', music: '', musicVol: 0.25, shots: [], ...o });
 
 async function vidOpen() {
   if (!vid.ready) {
@@ -4329,6 +4331,7 @@ async function vidOpen() {
     if (last && vid.list.some((x) => x.id === last)) vid.cur = (await db.get('vid:' + last)) ?? null;
   }
   await artLoad();
+  await rLoad();
   if (voiceOn() && !vid.voices.length) {
     try { vid.voices = (await harnessJson('/v1/image/models')).voices ?? []; } catch {}
   }
@@ -4382,6 +4385,7 @@ function readShots(reply) {
     prompt: clip(String(x?.prompt ?? x?.picture ?? x?.image ?? '').trim(), 1500),
     say: clip(String(x?.say ?? x?.narration ?? x?.voice ?? '').trim(), 1200),
     secs: Math.max(1, Math.min(60, Number(x?.secs ?? x?.seconds) || 4)),
+    act: clip(String(x?.action ?? x?.act ?? '').trim(), 300),
     motion: MOTIONS[String(x?.motion ?? '').toLowerCase().replace(/[-_]/g, ' ')] ? String(x.motion).toLowerCase().replace(/[-_]/g, ' ') : Object.keys(MOTIONS)[1 + Math.floor(Math.random() * 6)],
   })).filter((x) => x.prompt);
 }
@@ -4389,7 +4393,7 @@ async function vidWrite(idea, count, signal, onProgress) {
   const out = [];
   while (out.length < count) {
     const want = Math.min(WRITE_BATCH, count - out.length);
-    const sys = 'You write the storyboard of a short film that will be made of still pictures from a text-to-image model, with a narrator speaking over them. Reply with ONE JSON array and nothing else. Each item is one shot: {"prompt": "<the picture, described for an image model: subject, action, setting, composition and camera, light, colours, style; complete in itself, never referring to another shot>", "say": "<what the narrator says over this shot: one or two spoken sentences, or \\"\\" for a silent shot>", "secs": <seconds for a silent shot, 3 to 8>, "motion": "<one of: ' + Object.keys(MOTIONS).join(', ') + '>"}. Keep the same characters, places and visual style from shot to shot by describing them the same way each time. The narration, read in order, tells the whole story.';
+    const sys = 'You write the storyboard of a short film that will be made of still pictures from a text-to-image model, with a narrator speaking over them. Reply with ONE JSON array and nothing else. Each item is one shot: {"prompt": "<the picture, described for an image model: subject, action, setting, composition and camera, light, colours, style; complete in itself, never referring to another shot>", "say": "<what the narrator says over this shot: one or two spoken sentences, or \\"\\" for a silent shot>", "secs": <seconds for a silent shot, 3 to 8>, "action": "<what moves or changes during the shot, in one short sentence: small, continuous movement>", "motion": "<one of: ' + Object.keys(MOTIONS).join(', ') + '>"}. Keep the same characters, places and visual style from shot to shot by describing them the same way each time. The narration, read in order, tells the whole story.';
     const user = `THE FILM: ${idea}\n\n` + (out.length ? `SHOTS WRITTEN SO FAR (${out.length} of ${count}):\n${out.slice(-6).map((s, i) => `${out.length - Math.min(6, out.length) + i + 1}. ${clip(s.prompt, 160)} | narrator: ${clip(s.say, 120)}`).join('\n')}\n\nWrite the next ${want} shots, carrying the story on${out.length + want >= count ? ' to its end' : ''}.` : `Write ${count <= WRITE_BATCH ? 'all ' + want : 'the first ' + want + ' of ' + count} shots${count <= WRITE_BATCH ? ', from the opening to the end' : ''}.`);
     const got = readShots(await callModel([{ role: 'system', content: sys }, { role: 'user', content: user }], null, signal, 4000));
     if (!got.length) { if (out.length) break; throw new Error('the model did not answer with a list of shots; try again, or another model from the picker'); }
@@ -4397,6 +4401,181 @@ async function vidWrite(idea, count, signal, onProgress) {
     onProgress?.(out.length);
   }
   return out;
+}
+
+/* ---- does a frame follow? ----
+   A frame an image model makes from another is not always a frame of the same shot: a figure appears, the style
+   turns, the room changes. So every frame made from another is JUDGED before it is kept, twice over.
+   The renderer first (it costs nothing): it finds the motion from the frame before to the new one, and measures
+   what that motion leaves unexplained. Two frames of one shot leave little; a frame with something new in it
+   leaves a lot. Then Clef, Cloudflare's decision model, is shown the frames and asked: the same scene, nothing
+   added, nothing taken away, and would one blend into the other. A frame that fails is made again; after
+   FRAME_TRIES the closest one is kept and the film says so. */
+const MISS_MAX = 55;       // thousandths of full brightness the motion may leave unexplained (measured on Workers AI
+                           // frames, 2026-11-13: 16 to 39 between frames of one shot, 78 to 110 between two shots)
+const WORST_MAX = 150;     // the same, for the WORST part of the frame: the test of shape. One thing a frame has that the
+                           // frame before does not lead to (a figure, an object, a face redrawn) shows here, where the
+                           // average hides it. Measured on Workers AI frames (2026-11-13): 35 to 99 between consecutive
+                           // frames of one shot; 215 for the same frame with one object painted in (whose average,
+                           // 28, passed); 323 to 567 between two shots
+const CLEF_FRAME = 0.5;    // Clef's probability that a frame follows, below which it is made again
+const FRAME_TRIES = 3;
+const FITS_Q = [
+  'Is the second picture the same scene as the first, with the same people and things in nearly the same places, and nothing added and nothing taken away?',
+  'Would the first picture blend smoothly into the second as two consecutive frames of one continuous shot?',
+];
+const BETWEEN_Q = [
+  'Is the second picture the same scene as the first and the third, with the same people and things, and nothing added and nothing taken away?',
+  'Does the second picture lie between the first and the third, so that the three would play smoothly in that order as consecutive frames of one continuous shot?',
+];
+/* How far apart two frames are, by the renderer: the travel of the motion between them, more when the motion does
+   not explain the second (so a gap between two unlike pictures counts as wide). */
+async function frameGap(a, b) {
+  await vidImg(a); await vidImg(b);
+  const x = rcore.x, sa = x ? rSlot(a) : -1, sb = x ? rSlot(b) : -1;
+  if (sa < 0 || sb < 0 || !x.veil_r_flow(sa, sb)) return 1;
+  return x.veil_r_flow_travel() + x.veil_r_flow_miss();
+}
+/* [miss over the whole frame, miss of its worst part] from a to b, by the renderer. */
+function frameMiss(a, b) {
+  const x = rcore.x, sa = x ? rSlot(a) : -1, sb = x ? rSlot(b) : -1;
+  if (sa < 0 || sb < 0 || !x.veil_r_flow(sa, sb)) return [0, 0];
+  return [x.veil_r_flow_miss(), x.veil_r_flow_worst ? x.veil_r_flow_worst() : 0];
+}
+/* {ok, score (0 to 1, higher follows better), why}. `after`: the frame the new one must also lead to (a frame
+   made between two). */
+async function frameFits(p, before, id, after, signal) {
+  await vidImg(before); await vidImg(id);
+  if (after) await vidImg(after);
+  const [m1, w1] = frameMiss(before, id);
+  const [m2, w2] = after ? frameMiss(id, after) : [0, 0];
+  const miss = Math.max(m1, m2), worst = Math.max(w1, w2);
+  if (miss > MISS_MAX) return { ok: false, score: Math.max(0, 0.5 - miss / 400), why: 'it does not follow from the frame ' + (after ? 'on either side of it' : 'before it') + ' (the renderer finds no motion that leads to it)' };
+  if (worst > WORST_MAX) return { ok: false, score: Math.max(0, 0.45 - worst / 1200), why: 'one part of it has a shape the frame ' + (after ? 'on either side' : 'before') + ' does not lead to (something added, lost or redrawn)' };
+  const base = Math.min(1 - miss / 200, 1 - worst / (WORST_MAX * 2.5));
+  if (p.check === false || !clefOn() || Number(S.status.version) < 17) return { ok: true, score: base, why: '' };
+  try {
+    const shown = [before, id, ...(after ? [after] : [])];
+    const images = [];
+    for (const one of shown) images.push(await artDataUrl(one, 'fit', 768, 0, 'image/jpeg', 0.85));
+    const j = await harnessJson('/v1/clef', { body: { state: after ? 'Three frames of one shot of a film, in order: the first picture is a frame, the third is a later frame, and the second was made to go between them.' : 'Two consecutive frames of one shot of a film: the first picture is the earlier frame, the second is the frame right after it.', questions: after ? BETWEEN_Q : FITS_Q, images }, signal });
+    if (!Array.isArray(j.probs)) return { ok: true, score: base, why: '' };   // Clef could not say: that is not held against the frame
+    const score = Math.min(...j.probs);
+    return { ok: score >= CLEF_FRAME, score: score * base, why: j.probs[0] < CLEF_FRAME ? 'Clef finds something added, missing or changed in it' : 'Clef finds it would not blend with its neighbour' };
+  } catch (e) {
+    if (signal?.aborted) throw e;
+    return { ok: true, score: base, why: '' };
+  }
+}
+/* The picture half-way between two frames, as the renderer composes it: where the image model starts from when
+   it fills a gap. A data: URL. */
+async function midFrame(a, b) {
+  const ia = await vidImg(a), ib = await vidImg(b);
+  const k = Math.min(1, 1344 / Math.max(ia.naturalWidth, ia.naturalHeight));
+  const W = Math.round(ia.naturalWidth * k), H = Math.round(ia.naturalHeight * k);
+  const c = document.createElement('canvas');
+  c.width = W; c.height = H;
+  const g = c.getContext('2d');
+  const x = rcore.x, sa = x ? rSlot(a) : -1, sb = x ? rSlot(b) : -1;
+  const ptr = sa >= 0 && sb >= 0 ? x.veil_r_canvas(W, H) : 0;
+  if (ptr && (x.veil_r_clear(), x.veil_r_morph(sa, sb, 0.5, 1, 0, 0, 1))) g.putImageData(new ImageData(new Uint8ClampedArray(x.memory.buffer, ptr, W * H * 4), W, H), 0, 0);
+  else { g.drawImage(ia, 0, 0, W, H); g.globalAlpha = 0.5; g.drawImage(ib, 0, 0, W, H); g.globalAlpha = 1; }
+  return c.toDataURL('image/jpeg', 0.92);
+}
+
+/* ---- steadying: one frame's detail carried through a shot ----
+   Frames an image model makes one from another keep their shapes and repaint their detail, so a shot played in
+   order shimmers. The core (render.zig, "steadying") redraws each frame from the ANCHOR frame's own pixels, moved
+   along the motion to where things are now, and keeps the frame's own pixels only where the picture really
+   changed. When too little of a frame can be carried (the shot has moved on), that frame becomes the new anchor. */
+const R_ANCHOR = 20, R_CUR = 21, R_OUT = 22;   // slots of the core kept for this, apart from the player's
+const STEADY_MIN = 450;                        // thousandths of a frame that must be carried, or it becomes the anchor
+const steady = { shot: '', last: '' };         // the chain the core holds: which shot, and its last frame
+function rPut(slot, src) {
+  const c = src instanceof HTMLCanvasElement ? src : drawn(src, 'fit', R_SIDE);
+  const data = c.getContext('2d', { willReadFrequently: true }).getImageData(0, 0, c.width, c.height);
+  const ptr = rcore.x.veil_r_image(slot, c.width, c.height);
+  if (!ptr) return false;
+  new Uint8Array(rcore.x.memory.buffer, ptr, data.data.length).set(data.data);
+  return true;
+}
+/* The frame `id`, steadied against the chain; the chain is started at `before` when it is not already there.
+   Gives the steadied picture as a canvas and how much of it was carried, or null when it could not be done. */
+async function steadyFrame(shotId, before, id) {
+  const x = rcore.x;
+  if (!x?.veil_r_chain_next) return null;
+  if (steady.shot !== shotId || steady.last !== before) {
+    if (!rPut(R_ANCHOR, await vidImg(before)) || !x.veil_r_chain_begin(R_ANCHOR)) return null;
+  }
+  steady.shot = ''; steady.last = '';
+  if (!rPut(R_CUR, await vidImg(id))) return null;
+  const carried = x.veil_r_chain_next(R_CUR, R_OUT, 1);
+  if (carried === 0xFFFFFFFF) return null;
+  const W = x.veil_r_image_w(R_OUT), H = x.veil_r_image_h(R_OUT);
+  const c = document.createElement('canvas');
+  c.width = W; c.height = H;
+  c.getContext('2d').putImageData(new ImageData(new Uint8ClampedArray(x.memory.buffer, x.veil_r_image_ptr(R_OUT), W * H * 4).slice(), W, H), 0, 0);
+  // the shot has moved on from its anchor: this frame, as steadied, is what detail is carried from next
+  if (carried < STEADY_MIN && !(rPut(R_ANCHOR, c) && x.veil_r_chain_begin(R_ANCHOR))) return { canvas: c, carried };
+  steady.shot = shotId;
+  return { canvas: c, carried };
+}
+/* Keep a steadied frame in place of the frame it was made from. Gives the new row. */
+async function steadyKeep(shotId, before, row, keepRaw) {
+  const got = await steadyFrame(shotId, before, row.id);
+  if (!got) return row;
+  const { id, at, thumb, bytes, w, h: hh, type, ...meta } = row;
+  const kept = await artKeep(await canvasBlob(got.canvas, 'image/jpeg', 0.93), { ...meta, steadied: got.carried });
+  if (!keepRaw) await artForget([row.id]);
+  steady.last = kept.id;
+  return kept;
+}
+/* A whole shot, steadied in order from its first frame. */
+async function steadyShot(s, signal, keepRaw) {
+  if (!rcore.x?.veil_r_chain_next) throw new Error('the renderer in this browser cannot steady a shot (reload the page)');
+  s.pics = s.pics.filter(artRow);
+  steady.shot = ''; steady.last = '';
+  for (let k = 1; k < s.pics.length; k++) {
+    if (signal?.aborted) break;
+    if (vid.run) { vid.run.what = `steadying frame ${k + 1} of ${s.pics.length}…`; vid.run.done = k; vidRefresh(); }
+    s.pics[k] = (await steadyKeep(s.id, s.pics[k - 1], artRow(s.pics[k]), keepRaw)).id;
+    await new Promise((r) => setTimeout(r, 0));
+  }
+  s.steadied = true;
+}
+
+/* ---- directing: the harness makes each frame the way a director would ----
+   Asked for "the next frame" in the same words every time, an image model repaints the picture as it pleases and
+   the shot drifts. So the harness (POST /v1/frame) goes back over every frame: it LOOKS at the frame just made,
+   writes the next prompt from what is actually in it (all that must stay, and the one small change), has the
+   frame made, and has Clef confirm it follows and is not a broken picture, correcting the prompt and trying
+   again when it does not. This page hands it the frame before (as it is, and as the camera has moved it), the
+   shot's first frame, the shot and where it is going; and adds the renderer's own check of the motion. */
+const directing = (p) => p.direct !== false && !!S.status && Number(S.status.version) >= 18;
+async function directFrame(p, s, model, d, before, at, want, signal) {
+  const body = {
+    shot: s.prompt.trim() || artRow(s.pics[0])?.prompt || 'the same scene',
+    style: p.look.trim(),
+    beat: (s.act ?? '').trim() ? `${s.act.trim()} (this is frame ${at + 1} of ${want}: the shot is about ${Math.round(at / Math.max(1, want - 1) * 100)}% of the way there)` : '',
+    before: await artDataUrl(before, 'fit', 1024, 0, 'image/jpeg', 0.9),
+    start: await stepFrame(before, s.motion, want - 1),
+    anchor: at > 1 ? await artDataUrl(s.pics[0], 'fit', 1024, 0, 'image/jpeg', 0.9) : undefined,
+    model: model === 'auto' ? '' : model,
+    width: d?.w, height: d?.h, negative: p.negative, tries: 2,
+  };
+  const t0 = performance.now();
+  const j = await harnessJson('/v1/frame', { body, signal });
+  const row = await artKeep(b64Blob(j.image, j.type), { model: j.model, prompt: j.prompt, kind: 'frame', parent: before, batch: p.id, ms: Math.round(performance.now() - t0) });
+  row.clef = { ok: j.fits, probs: j.probs, tries: j.tries, directed: j.directed };
+  return row;
+}
+/* The renderer's verdict and Clef's (given in the harness), as one. */
+function directedFit(mine, clef) {
+  if (!mine.ok) return mine;
+  const probs = Array.isArray(clef?.probs) ? clef.probs : null;
+  if (!probs) return mine;
+  const score = Math.min(...probs);
+  return { ok: clef.ok !== false, score: score * mine.score, why: probs[0] < CLEF_FRAME ? 'Clef finds something added, missing or changed in it' : probs[2] < CLEF_FRAME ? 'Clef finds the picture broken (a face, a hand or a shape gone wrong)' : 'Clef finds it would not blend with its neighbour' };
 }
 
 /* ---- making: the pictures of every shot that lacks them, then the voice of every line that lacks it ---- */
@@ -4439,19 +4618,59 @@ async function vidMake(only) {
       const want = Math.max(1, Number(s.frames) || 1);
       if (!s.prompt.trim() && !s.pics.length) continue;
       while (s.pics.length < want) {
-        const k = s.pics.length;
-        const from = k > 0 ? s.pics[k - 1] : '';   // a further frame is made from the one before it
-        const look = p.keep && !from ? anchor() : '';   // a first frame may take after the film's first picture
-        const kind = from || look ? 'edit' : 'make';
+        const n = p.shots.indexOf(s) + 1;
+        const words = [s.prompt.trim() || artRow(s.pics[0])?.prompt || 'the same scene', p.look.trim()].filter(Boolean).join(', ');
+        // WHERE the new frame goes. A shot given its frames (two or more pictures of the user's, in order) has
+        // its blanks filled: the new frame goes into the widest gap between two neighbours. Otherwise the shot
+        // grows at its end: the new frame follows the last.
+        const between = s.fill === true && s.pics.length >= 2;
+        let at = s.pics.length, before = at > 0 ? s.pics[at - 1] : '', after = '';
+        if (between) {
+          at = 1;
+          let widest = -1;
+          for (let k = 0; k + 1 < s.pics.length; k++) { const gap = await frameGap(s.pics[k], s.pics[k + 1]); if (gap > widest) { widest = gap; at = k + 1; } }
+          before = s.pics[at - 1]; after = s.pics[at];
+        }
+        const look = p.keep && !before ? anchor() : '';   // a first frame may take after the film's first picture
+        const kind = before || look ? 'edit' : 'make';
         const able = model !== 'auto' || kind === 'make' || !!art.picks.edit;
         const spec = specOf(model, able ? kind : 'make');
         const d = artDims(spec, { ratio: p.ratio, size: p.size });
-        const words = [s.prompt.trim() || artRow(s.pics[0])?.prompt || 'the same scene', p.look.trim()].filter(Boolean).join(', ');
-        vid.run.what = `painting shot ${p.shots.indexOf(s) + 1}${want > 1 ? `, frame ${k + 1} of ${want}` : ''}…`;
-        vidRefresh();
-        const row = await artMake({ model, prompt: from ? `${words}. The next moment of the same shot: the same subjects, place and framing, a little further on in the action` : words, negative: p.negative, w: d?.w, h: d?.h,
-          init: able && from ? from : '', refs: able && look && look !== from ? [look] : [], strength: 0.45, kind: 'frame', batch: p.id, conv: '' }, abort.signal);
-        s.pics.push(row.id);
+        let best = null;
+        for (let go = 0; go < FRAME_TRIES; go++) {
+          vid.run.what = `painting shot ${n}${want > 1 ? `, frame ${at + 1} of ${want}` : ''}${go ? ` again (try ${go + 1})` : ''}…`;
+          vidRefresh();
+          let ask;
+          if (between && able) {
+            // the renderer's own half-way picture (each neighbour carried along the motion between them, and mixed)
+            // is what the model starts from; the two neighbours go along as what it lies between
+            ask = { prompt: `${words}. This is a frame of the same shot that lies between two frames that exist. The first picture given is a rough blend of those two; the next two pictures are the frame before it and the frame after it. Redraw the blend as one clean, sharp frame: everything placed between where it is in the frame before and where it is in the frame after, the same subjects, faces, clothes, objects and art style. Add nothing and take nothing away`, init: await midFrame(before, after), refs: [before, after], parent: before, strength: 0.4 };
+          } else if (before && able) {
+            // A further frame starts from the frame before it, moved the way the shot's camera moves, so the model
+            // carries the move on. From the third on, the shot's first frame goes along too: what the style and the
+            // faces are to stay like, so a long shot does not wander off.
+            ask = { prompt: `${words}. This is the very next frame of the same shot, a fraction of a second later. Keep everything in the frame given exactly as it is: the same subjects, the same objects, faces, clothes, composition and art style. Add nothing and take nothing away. Only the smallest natural movement: a slight shift of pose, of light, of the weather`, init: await stepFrame(before, s.motion, want - 1), refs: at > 1 ? [s.pics[0]] : [], parent: before, strength: 0.45 };
+          } else ask = { prompt: words, init: '', refs: able && look ? [look] : [], parent: '' };
+          const directed = !!before && able && !between && directing(p);
+          if (directed) { vid.run.what = `directing shot ${n}, frame ${at + 1} of ${want}${go ? ` again (try ${go + 1})` : ''}…`; vidRefresh(); }
+          const row = directed ? await directFrame(p, s, model, d, before, at, want, abort.signal)
+            : await artMake({ model, negative: p.negative, w: d?.w, h: d?.h, kind: 'frame', batch: p.id, conv: '', ...ask }, abort.signal);
+          if (!before || !able) { best = { row, fit: { ok: true, score: 1 } }; break; }
+          // does it follow? (a first frame has nothing to follow)
+          vid.run.what = `checking shot ${n}, frame ${at + 1}…`;
+          vidRefresh();
+          // a directed frame has had Clef's word in the harness: here the renderer's own check is added to it
+          const fit = directed ? directedFit(await frameFits({ check: false }, before, row.id, after, abort.signal), row.clef) : await frameFits(p, before, row.id, after, abort.signal);
+          if (!best || fit.score > best.fit.score) { if (best) await artForget([best.row.id]); best = { row, fit }; } else await artForget([row.id]);
+          if (fit.ok) break;
+          s.redone = (s.redone ?? 0) + 1;
+          vid.note = `Shot ${n}, frame ${at + 1}: ${fit.why}. Making it again.`;
+        }
+        if (best.fit.ok) vid.note = '';
+        else vid.note = `Shot ${n}, frame ${at + 1} was kept as the closest of ${FRAME_TRIES} tries: ${best.fit.why}.`;
+        // steadied when asked: the detail of the shot's anchor frame carried along the motion into this one
+        if (p.steady === true && before && !between && rcore.x?.veil_r_chain_next) best.row = await steadyKeep(s.id, before, best.row, false);
+        s.pics.splice(at, 0, best.row.id);
         vid.run.done++;
         await vidSave(true);
         vidRefresh();
@@ -4546,7 +4765,7 @@ function drawCaption(g, W, H, text) {
   g.lineJoin = 'round'; g.lineWidth = Math.max(3, size / 5); g.strokeStyle = 'rgba(0,0,0,.85)'; g.fillStyle = '#fff';
   shown.forEach((line, i) => { const y = H - H * 0.06 - (shown.length - 1 - i) * size * 1.25; g.strokeText(line, W / 2, y); g.fillText(line, W / 2, y); });
 }
-function vidDraw(g, W, H, p, t) {
+function vidDraw2d(g, W, H, p, t) {
   const { starts, total } = vidTimes(p);
   g.globalAlpha = 1; g.fillStyle = '#000'; g.fillRect(0, 0, W, H);
   if (!p.shots.length) return;
@@ -4568,9 +4787,269 @@ function vidDraw(g, W, H, p, t) {
   if (p.captions && s.say.trim() && dark < 0.6) drawCaption(g, W, H, s.say.trim());
 }
 
+/* ---- the renderer: veil_core.wasm composes every frame ----
+   The film's pictures are handed to the wasm core (src/web/render.zig). It finds the MOTION between two frames
+   (an optical flow) and draws the moment between them with each frame carried along that motion, so a shot made
+   of several frames moves instead of fading from one to the next. The same core lays out the MP4 file. What the
+   browser adds: the picture and sound encoders (WebCodecs), and the captions' lettering. Without the core, or
+   without the encoders, the film is still drawn (plainly, on the canvas) and recorded as it plays. */
+const rcore = { x: null, asked: null, slots: new Map(), clock: 0 };
+const R_SLOTS = 10;      // pictures held in the core at once (it has room for more)
+const R_SIDE = 1600;     // a picture's longer side, as the core is handed it
+function rLoad() {
+  return (rcore.asked ??= (async () => {
+    try {
+      const { instance } = await WebAssembly.instantiate(await (await fetch('veil_core.wasm?r=1')).arrayBuffer(), {});
+      if (instance.exports.veil_r_abi?.() !== 1) throw new Error('abi');
+      rcore.x = instance.exports;
+    } catch { rcore.x = null; }
+    return rcore.x;
+  })());
+}
+/* The slot a picture is in, putting it there first (the one unused longest gives way). -1 when it is not decoded yet. */
+function rSlot(id) {
+  const have = rcore.slots.get(id);
+  if (have) { have.used = ++rcore.clock; return have.slot; }
+  const img = vid.imgs.get(id);
+  if (!img) return -1;
+  let slot = 0;
+  if (rcore.slots.size >= R_SLOTS) {
+    const [oldId, old] = [...rcore.slots].reduce((a, b) => (a[1].used <= b[1].used ? a : b));
+    rcore.slots.delete(oldId);
+    slot = old.slot;
+  } else {
+    const taken = new Set([...rcore.slots.values()].map((s) => s.slot));
+    while (taken.has(slot)) slot++;
+  }
+  const c = drawn(img, 'fit', R_SIDE);
+  const data = c.getContext('2d').getImageData(0, 0, c.width, c.height);
+  const ptr = rcore.x.veil_r_image(slot, c.width, c.height);
+  if (!ptr) return -1;
+  new Uint8Array(rcore.x.memory.buffer, ptr, data.data.length).set(data.data);
+  rcore.slots.set(id, { slot, used: ++rcore.clock });
+  return slot;
+}
+const rTake = (packed) => {
+  const v = BigInt.asUintN(64, BigInt(packed));
+  if (v === 0n) return null;
+  const ptr = Number(v >> 32n), len = Number(v & 0xFFFFFFFFn);
+  const out = new Uint8Array(rcore.x.memory.buffer, ptr, len).slice();
+  rcore.x.veil_free(ptr, len);
+  return out;
+};
+/* A shot's camera at a moment of it: [scale, dx, dy]. A shot of several frames has its move in the frames. */
+function shotCam(s, u, frames) {
+  if (frames > 1) return [1, 0, 0];
+  const m = MOTIONS[s.motion] ?? MOTIONS.still;
+  const e = u * u * (3 - 2 * u);
+  return [m[0] + (m[3] - m[0]) * e, m[1] + (m[4] - m[1]) * e, m[2] + (m[5] - m[2]) * e];
+}
+/* One shot at the moment u of it, laid over the frame: a single picture under its camera, or the moment between
+   two of its frames. */
+function rShot(s, u, alpha) {
+  const x = rcore.x;
+  const ids = s.pics.filter((id) => vid.imgs.has(id));
+  if (!ids.length) return;
+  if (ids.length === 1) { const [sc, dx, dy] = shotCam(s, u, 1); const a = rSlot(ids[0]); if (a >= 0) x.veil_r_draw(a, sc, dx, dy, alpha); return; }
+  const blend = vid.cur?.blend ?? 'flow';
+  if (blend === 'hold') {
+    // every frame is a made frame, shown whole for its turn: nothing is invented between two of them
+    const a = rSlot(ids[Math.min(ids.length - 1, Math.floor(Math.max(0, u) * ids.length))]);
+    if (a >= 0) x.veil_r_draw(a, 1, 0, 0, alpha);
+    return;
+  }
+  const pos = Math.min(ids.length - 1 - 1e-6, Math.max(0, u) * (ids.length - 1));
+  const k = Math.floor(pos);
+  const a = rSlot(ids[k]), b = rSlot(ids[k + 1]);
+  if (a < 0 || b < 0) return;
+  // 'flow': each frame carried along the motion toward the next. 'mix': one frame fading into the next.
+  if (blend === 'flow') {
+    // stitched only where the renderer finds the way from one frame to the next; two frames it cannot connect are cut
+    if (x.veil_r_flow(a, b) === 1 && x.veil_r_flow_miss() <= MISS_MAX && x.veil_r_morph(a, b, pos - k, 1, 0, 0, alpha)) return;
+    x.veil_r_draw(pos - k < 0.5 ? a : b, 1, 0, 0, alpha);
+    return;
+  }
+  x.veil_r_draw(a, 1, 0, 0, alpha);
+  x.veil_r_draw(b, 1, 0, 0, alpha * (pos - k));
+}
+/* The film at the moment t, composed by the core and put on the canvas. False when the core cannot do it. */
+function rFrame(g, W, H, p, t) {
+  const x = rcore.x;
+  if (!x) return false;
+  const ptr = x.veil_r_canvas(W, H);
+  if (!ptr) return false;
+  x.veil_r_clear();
+  const { starts, total } = vidTimes(p);
+  let caption = '', dark = 0;
+  if (p.shots.length) {
+    t = Math.max(0, Math.min(total - 1e-3, t));
+    let i = starts.length - 1;
+    while (i > 0 && starts[i] > t) i--;
+    const s = p.shots[i], len = shotSecs(s), into = t - starts[i];
+    const turn = Math.min(0.9, len / 3);
+    const prev = i > 0 ? p.shots[i - 1] : null;
+    const mine = s.pics.filter((id) => vid.imgs.has(id)), theirs = prev ? prev.pics.filter((id) => vid.imgs.has(id)) : [];
+    if (prev && s.cut === 'morph' && mine.length && theirs.length && (p.blend ?? 'flow') === 'flow') {
+      // the last frame of the shot before travels into the first frame of this one; this shot's own time starts after
+      if (into < turn) {
+        const a = rSlot(theirs.at(-1)), b = rSlot(mine[0]);
+        const ca = shotCam(prev, 1, theirs.length), cb = shotCam(s, 0, mine.length);
+        // only two pictures the renderer can find a way between: unlike ones are mixed where they stand
+        const kin = a >= 0 && b >= 0 && x.veil_r_flow(a, b) === 1 && x.veil_r_flow_miss() <= MISS_MAX;
+        if (!kin || !x.veil_r_morph2(a, b, into / turn, ca[0], ca[1], ca[2], cb[0], cb[1], cb[2], 1)) { rShot(prev, 1, 1); rShot(s, 0, into / turn); }
+      } else rShot(s, (into - turn) / Math.max(0.01, len - turn), 1);
+    } else if (prev && (s.cut === 'dissolve' || s.cut === 'morph') && into < turn) { rShot(prev, 1, 1); rShot(s, into / len, into / turn); }
+    else rShot(s, into / len, 1);
+    const next = p.shots[i + 1];
+    if (s.cut === 'fade' && into < turn) dark = 1 - into / turn;
+    if (next?.cut === 'fade' && len - into < turn) dark = Math.max(dark, 1 - (len - into) / turn);
+    if (i === 0 && into < 0.4) dark = Math.max(dark, 1 - into / 0.4);
+    if (i === p.shots.length - 1 && len - into < 0.6) dark = Math.max(dark, 1 - (len - into) / 0.6);
+    if (dark > 0) x.veil_r_fade(dark);
+    if (p.captions && s.say.trim() && dark < 0.6) caption = s.say.trim();
+  }
+  g.putImageData(new ImageData(new Uint8ClampedArray(x.memory.buffer, ptr, W * H * 4), W, H), 0, 0);
+  if (caption) drawCaption(g, W, H, caption);
+  return true;
+}
+function vidDraw(g, W, H, p, t) {
+  if (!rFrame(g, W, H, p, t)) vidDraw2d(g, W, H, p, t);
+}
+
+/* ---- rendering: every frame of the film, in order, encoded and written into one MP4 ----
+   Not a recording of the film playing: each frame is composed for its exact moment, however long that takes,
+   so nothing is dropped and the film is as smooth as its frame rate. The sound is mixed whole first. */
+const AVC = (w, h) => (w * h > 2073600 ? 'avc1.640033' : 'avc1.640028');
+async function canRender(W, H, fps) {
+  if (!rcore.x || typeof VideoEncoder === 'undefined' || typeof AudioEncoder === 'undefined' || typeof OfflineAudioContext === 'undefined') return false;
+  try {
+    const v = await VideoEncoder.isConfigSupported({ codec: AVC(W, H), width: W, height: H, framerate: fps, bitrate: 4e6, avc: { format: 'avc' } });
+    const a = await AudioEncoder.isConfigSupported({ codec: 'mp4a.40.2', sampleRate: 48000, numberOfChannels: 2, bitrate: 128000 });
+    return !!v.supported && !!a.supported;
+  } catch { return false; }
+}
+async function vidRender() {
+  const p = vid.cur;
+  if (!p || vid.rec) return;
+  vidStop();
+  try { await vidLoad(p); } catch (e) { return toast(e.message); }
+  await rLoad();
+  const [W, H] = vidSize(p);
+  if (!(await canRender(W, H, p.fps))) return vidRecord();   // this browser lacks an encoder: the film is recorded as it plays
+  const { total } = vidTimes(p);
+  const frames = Math.max(1, Math.round(total * p.fps));
+  const abort = new AbortController();
+  vid.rec = { abort, at: 0, total };
+  vidRefresh();
+  const say = (text) => { const bar = document.getElementById('vidRec'); if (bar) bar.textContent = text; };
+  const x = rcore.x;
+  let failed = '';
+  const video = [], audio = [];
+  let avcc = null, asc = null;
+  try {
+    // 1. the sound, mixed whole
+    const sounded = p.shots.some((s) => s.voice.some((id) => vid.sound.has(id))) || (p.music && vid.sound.has(p.music));
+    let mix = null;
+    if (sounded) {
+      say('Mixing the sound…');
+      const off = new OfflineAudioContext(2, Math.ceil(total * 48000), 48000);
+      vidAudio(p, off.destination, 0, 0, off);
+      mix = await off.startRendering();
+    }
+    // 2. the pictures, frame by frame
+    const c = document.createElement('canvas');
+    c.width = W; c.height = H;
+    const g = c.getContext('2d', { willReadFrequently: false });
+    const venc = new VideoEncoder({
+      output: (chunk, meta) => { if (meta?.decoderConfig?.description) avcc = new Uint8Array(meta.decoderConfig.description.slice ? meta.decoderConfig.description.slice(0) : meta.decoderConfig.description); const u8 = new Uint8Array(chunk.byteLength); chunk.copyTo(u8); video.push({ u8, key: chunk.type === 'key' }); },
+      error: (e) => { failed = failed || e.message; },
+    });
+    venc.configure({ codec: AVC(W, H), width: W, height: H, framerate: p.fps, bitrate: Math.round(W * H * p.fps * 0.12), avc: { format: 'avc' }, latencyMode: 'quality' });
+    const t0 = performance.now();
+    for (let f = 0; f < frames && !abort.signal.aborted && !failed; f++) {
+      vidDraw(g, W, H, p, f / p.fps);
+      const frame = new VideoFrame(c, { timestamp: Math.round(f * 1e6 / p.fps), duration: Math.round(1e6 / p.fps) });
+      venc.encode(frame, { keyFrame: f % (p.fps * 2) === 0 });
+      frame.close();
+      if (f % 6 === 0 || venc.encodeQueueSize > 6) {
+        vid.rec.at = f / p.fps;
+        const left = (performance.now() - t0) / (f + 1) * (frames - f - 1) / 1000;
+        say(`Rendering frame ${f + 1} of ${frames}${f > 20 ? ' · about ' + (left > 90 ? Math.round(left / 60) + ' min' : Math.ceil(left) + ' s') + ' left' : ''}`);
+        do { await new Promise((r) => setTimeout(r, 0)); } while (venc.encodeQueueSize > 6 && !failed);
+      }
+    }
+    await venc.flush();
+    venc.close();
+    // 3. the sound, encoded
+    if (mix && !abort.signal.aborted && !failed) {
+      say('Encoding the sound…');
+      const aenc = new AudioEncoder({
+        output: (chunk, meta) => { if (meta?.decoderConfig?.description) asc = new Uint8Array(meta.decoderConfig.description.slice ? meta.decoderConfig.description.slice(0) : meta.decoderConfig.description); const u8 = new Uint8Array(chunk.byteLength); chunk.copyTo(u8); audio.push({ u8 }); },
+        error: (e) => { failed = failed || e.message; },
+      });
+      aenc.configure({ codec: 'mp4a.40.2', sampleRate: 48000, numberOfChannels: 2, bitrate: 128000 });
+      const L = mix.getChannelData(0), R = mix.numberOfChannels > 1 ? mix.getChannelData(1) : L;
+      const STEP = 48000;
+      for (let at = 0; at < mix.length; at += STEP) {
+        const n = Math.min(STEP, mix.length - at);
+        const data = new Float32Array(n * 2);
+        data.set(L.subarray(at, at + n), 0);
+        data.set(R.subarray(at, at + n), n);
+        const ad = new AudioData({ format: 'f32-planar', sampleRate: 48000, numberOfFrames: n, numberOfChannels: 2, timestamp: Math.round(at * 1e6 / 48000), data });
+        aenc.encode(ad);
+        ad.close();
+      }
+      await aenc.flush();
+      aenc.close();
+    }
+  } catch (e) { failed = failed || e.message; }
+  const stopped = abort.signal.aborted;
+  if (!stopped && !failed && (!video.length || !avcc)) failed = 'the encoder gave no pictures';
+  if (!stopped && !failed) {
+    // 4. the file: a second of pictures, then the sound of that second, and so on; the core writes where each lies
+    say('Writing the file…');
+    const put = (track, bytes) => { const ptr = x.veil_alloc(bytes.length); new Uint8Array(x.memory.buffer, ptr, bytes.length).set(bytes); x.veil_r_mp4_config(track, ptr, bytes.length); x.veil_free(ptr, bytes.length); };
+    x.veil_r_mp4_begin(W, H, p.fps, 48000, 2);
+    put(0, avcc);
+    const sound = audio.length > 0 && !!asc;
+    if (sound) put(1, asc);
+    const parts = [];
+    let ai = 0;
+    for (let vi = 0; vi < video.length; vi += p.fps) {
+      for (const s of video.slice(vi, vi + p.fps)) { x.veil_r_mp4_sample(0, s.u8.length, s.key ? 1 : 0); parts.push(s.u8); }
+      const until = sound ? Math.min(audio.length, Math.ceil((vi / p.fps + 1) * 48000 / 1024)) : 0;
+      for (; ai < until; ai++) { x.veil_r_mp4_sample(1, audio[ai].u8.length, 0); parts.push(audio[ai].u8); }
+    }
+    for (; sound && ai < audio.length; ai++) { x.veil_r_mp4_sample(1, audio[ai].u8.length, 0); parts.push(audio[ai].u8); }
+    const head = rTake(x.veil_r_mp4_head()), moov = rTake(x.veil_r_mp4_moov());
+    if (head && moov) await saveBlob(`${fileStem(p.title)}.mp4`, new Blob([head, ...parts, moov], { type: 'video/mp4' }));
+    else failed = 'the file could not be written';
+  }
+  vid.rec = null;
+  if (failed) vid.note = 'The film was not rendered: ' + failed;
+  if (S.tab === 'video') drawSide();
+}
+
+/* The next frame's starting point: the frame before it, moved the way the shot's camera moves, so the model
+   carries the move on. A data: URL at the frame's own size. */
+const STEPS = { 'zoom in': [1.2, 0, 0], 'zoom out': [1 / 1.2, 0, 0], 'pan left': [1, -0.16, 0], 'pan right': [1, 0.16, 0], 'pan up': [1, 0, -0.16], 'pan down': [1, 0, 0.16] };   // a whole shot's move
+async function stepFrame(id, motion, steps = 3) {
+  const img = await vidImg(id);
+  const whole = STEPS[motion];
+  const n = Math.max(1, steps);
+  const st = whole ? [Math.pow(whole[0], 1 / n), whole[1] / n, whole[2] / n] : null;   // one frame's share of it
+  const w = img.naturalWidth, hh = img.naturalHeight;
+  const k = Math.min(1, 1344 / Math.max(w, hh));
+  const c = document.createElement('canvas');
+  c.width = Math.round(w * k); c.height = Math.round(hh * k);
+  const g = c.getContext('2d');
+  g.drawImage(img, 0, 0, c.width, c.height);   // under the moved copy, so no edge is left bare
+  if (st) g.drawImage(img, (c.width - c.width * st[0]) / 2 - st[1] * c.width, (c.height - c.height * st[0]) / 2 - st[2] * c.height, c.width * st[0], c.height * st[0]);
+  return c.toDataURL('image/jpeg', 0.92);
+}
+
 /* ---- sound: every line at its shot's start, the music under them and quieter while someone speaks ---- */
-function vidAudio(p, out, t0, from) {
-  const ctx = vidCtx();
+function vidAudio(p, out, t0, from, ctx = vidCtx()) {
   const { starts, total } = vidTimes(p);
   const sources = [];
   const music = p.music && vid.sound.get(p.music) ? ctx.createGain() : null;
@@ -4646,12 +5125,12 @@ async function vidPlay() {
   vidRefresh();
 }
 
-/* ---- export: the canvas and its sound recorded into one file, at the film's own pace ---- */
+/* ---- recording: where a browser has no encoder to render with, the canvas and its sound are recorded as the film plays ---- */
 function recType() {
   const kinds = ['video/mp4;codecs=avc1.640028,mp4a.40.2', 'video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm', 'video/mp4'];
   return typeof MediaRecorder === 'undefined' ? '' : kinds.find((k) => MediaRecorder.isTypeSupported(k)) ?? '';
 }
-async function vidExport() {
+async function vidRecord() {
   const p = vid.cur;
   if (!p || vid.rec) return;
   const type = recType();
@@ -4727,6 +5206,19 @@ function vidAddPictures(ids) {
   S.tab = 'video'; S.panes.side = true;
   draw();
 }
+/* Frames the user already has, in order, as one shot. The frames missing between them are made: one into every
+   gap to begin with (more by raising the shot's Frames). */
+function vidAddSeries(ids, o = {}) {
+  const p = vid.cur ?? (vid.cur = newFilm());
+  const rows = ids.map(artRow).filter(Boolean);
+  if (!rows.length) return null;
+  const shot = newShot({ prompt: rows.find((r) => r.prompt)?.prompt ?? '', pics: rows.map((r) => r.id), fill: rows.length >= 2, frames: Math.max(rows.length, rows.length * 2 - 1), secs: Math.max(3, rows.length), ...o });
+  p.shots.push(shot);
+  vidSave(true);
+  S.tab = 'video'; S.panes.side = true;
+  draw();
+  return shot;
+}
 function vidFromGallery() {
   if (!art.list.length) return toast('The gallery is empty. Add pictures from your computer, or make some in the Images tab.');
   const picked = new Set();
@@ -4778,29 +5270,32 @@ function vidActs() {
     vid.run ? h('button', { class: 'btn btn-sm btn-danger', onclick: () => vid.run.abort.abort() }, 'Stop')
       : h('button', { class: 'btn btn-sm btn-solid', disabled: !work || !!vid.rec, title: 'Makes every picture and every spoken line the film still lacks. Each is one model call of your harness\'s daily limit.', onclick: () => vidMake() }, work ? `Generate (${work})` : 'All made'),
     vid.rec ? h('button', { class: 'btn btn-sm btn-danger', onclick: () => vid.rec.abort.abort() }, 'Stop recording')
-      : h('button', { class: 'btn btn-sm', disabled: !p.shots.some((s) => s.pics.some(artRow)) || !!vid.run, title: 'Records the film into one video file, at the film\'s own pace: a three-minute film takes three minutes', onclick: () => vidExport() }, 'Export video'),
+      : h('button', { class: 'btn btn-sm', disabled: !p.shots.some((s) => s.pics.some(artRow)) || !!vid.run, title: 'Renders every frame of the film and writes one MP4, with its sound. A browser without the encoders records the film as it plays instead.', onclick: () => vidRender() }, 'Render video'),
     h('button', { class: 'btn btn-ghost btn-sm', disabled: !p.shots.length, title: 'Every frame, every spoken line, the captions (.srt) and the storyboard, as one .zip', onclick: () => vidFiles().catch((e) => toast(e.message)) }, 'Files (.zip)'),
-    vid.rec ? h('span', { class: 'fine', id: 'vidRec' }, 'Recording…') : null);
+    vid.rec ? h('span', { class: 'fine', id: 'vidRec' }, 'Rendering…') : null);
 }
 
 function shotCard(p, s, i) {
   const set = (k, v, redraw) => { s[k] = v; vidSave(); if (redraw) drawSide(); else { const st = document.getElementById('vidStatus'); if (st) st.textContent = vidStatus(); } };
   const move = (by) => { const j = i + by; if (j < 0 || j >= p.shots.length) return; p.shots.splice(j, 0, p.shots.splice(i, 1)[0]); vidSave(); drawSide(); };
-  const pick = () => { const inp = h('input', { type: 'file', accept: 'image/*', multiple: '', onchange: async () => { for (const f of inp.files) { try { s.pics.push((await artTake(f)).id); } catch (e) { toast(e.message); } } if (s.pics.length > s.frames) s.frames = s.pics.length; vidSave(); drawSide(); } }); inp.click(); };
+  const pick = () => { const inp = h('input', { type: 'file', accept: 'image/*', multiple: '', onchange: async () => { for (const f of inp.files) { try { s.pics.push((await artTake(f)).id); } catch (e) { toast(e.message); } } if (s.pics.length > s.frames) s.frames = s.pics.length; if (s.pics.length >= 2) s.fill = true; vidSave(); drawSide(); } }); inp.click(); };
   return h('div', { class: 'vid-shot' },
-    h('div', { class: 'vid-shot-top' }, h('strong', {}, `Shot ${i + 1}`), h('span', { class: 'fine' }, clock(vidTimes(p).starts[i]) + ' · ' + shotSecs(s).toFixed(1) + ' s'), h('span', { class: 'grow' }),
+    h('div', { class: 'vid-shot-top' }, h('strong', {}, `Shot ${i + 1}`), h('span', { class: 'fine' }, clock(vidTimes(p).starts[i]) + ' · ' + shotSecs(s).toFixed(1) + ' s' + (s.redone ? ` · ${s.redone} frame${s.redone === 1 ? '' : 's'} made again` : '')), h('span', { class: 'grow' }),
       h('button', { class: 'btn btn-ghost btn-sm', 'aria-label': 'Move the shot up', disabled: i === 0, onclick: () => move(-1) }, '↑'),
       h('button', { class: 'btn btn-ghost btn-sm', 'aria-label': 'Move the shot down', disabled: i === p.shots.length - 1, onclick: () => move(1) }, '↓'),
+      s.pics.filter(artRow).length > 1 && rcore.x?.veil_r_chain_next ? h('button', { class: 'btn btn-ghost btn-sm', title: 'Carry the first frame\'s detail along the motion through the shot, so surfaces stop shimmering from frame to frame', disabled: !!vid.run, onclick: async () => { const abort = new AbortController(); vid.run = { abort, done: 0, of: s.pics.length, what: 'steadying…' }; vidRefresh(); try { await steadyShot(s, abort.signal, false); } catch (e) { vid.note = e.message; } vid.run = null; await vidSave(true); artRefresh(); drawSide(); } }, 'Steady') : null,
       h('button', { class: 'btn btn-ghost btn-sm', title: 'Throw this shot\'s pictures away and make them again', disabled: !!vid.run || !s.prompt.trim(), onclick: () => { s.pics = []; vidSave(); vidMake(s.id); } }, 'Repaint'),
       h('button', { class: 'btn btn-ghost btn-sm', title: 'Use pictures from your computer for this shot', onclick: pick }, 'Picture…'),
       h('button', { class: 'btn btn-ghost btn-sm', 'aria-label': 'Delete the shot', onclick: () => { p.shots.splice(i, 1); vidSave(); drawSide(); } }, '✕')),
     h('div', { class: 'vid-shot-body' }, shotPics(s),
       h('div', { class: 'vid-shot-text' },
         h('textarea', { id: 'vs-' + s.id + '-p', rows: '2', placeholder: 'The picture: what this shot shows', 'aria-label': `Shot ${i + 1}: the picture`, value: s.prompt, oninput: (e) => set('prompt', e.target.value) }),
+        h('input', { id: 'vs-' + s.id + '-a', type: 'text', placeholder: 'What happens in the shot (he turns a page, the rain eases…)', 'aria-label': `Shot ${i + 1}: what happens`, title: 'Where the shot goes. The harness directs every frame toward it, a little at a time.', value: s.act ?? '', autocomplete: 'off', oninput: (e) => set('act', e.target.value) }),
         h('textarea', { id: 'vs-' + s.id + '-s', rows: '2', placeholder: 'The narrator says… (leave empty for a silent shot)', 'aria-label': `Shot ${i + 1}: the narration`, value: s.say, oninput: (e) => set('say', e.target.value) }),
         h('div', { class: 'vid-shot-row' },
           h('label', {}, 'Seconds', h('input', { id: 'vs-' + s.id + '-t', type: 'number', min: '0.5', step: '0.5', value: String(s.secs), title: 'How long the shot runs. A spoken line longer than this makes it longer.', onchange: (e) => set('secs', Math.max(0.5, Number(e.target.value) || 4), true) })),
-          h('label', {}, 'Frames', h('input', { id: 'vs-' + s.id + '-f', type: 'number', min: '1', step: '1', value: String(s.frames), title: 'More than one: each further frame is made from the one before it, so the shot moves', onchange: (e) => set('frames', Math.max(1, Math.floor(Number(e.target.value)) || 1), true) })),
+          h('label', {}, 'Frames', h('input', { id: 'vs-' + s.id + '-f', type: 'number', min: '1', step: '1', value: String(s.frames), title: 'The pictures this shot is made of. Each further one is made from the one before it, moved the way the camera moves; the film travels from each to the next.', onchange: (e) => set('frames', Math.max(1, Math.floor(Number(e.target.value)) || 1), true) })),
+          s.pics.filter(artRow).length >= 2 ? h('label', {}, 'New frames go', h('select', { id: 'vs-' + s.id + '-g', title: 'After the last: the shot carries on from its last frame. Between: the blanks between the frames it has are filled, widest gap first.', onchange: (e) => set('fill', e.target.value === 'between') }, h('option', { value: 'after', selected: s.fill !== true }, 'after the last'), h('option', { value: 'between', selected: s.fill === true }, 'between them'))) : null,
           h('label', {}, 'Camera', h('select', { id: 'vs-' + s.id + '-m', onchange: (e) => set('motion', e.target.value) }, Object.keys(MOTIONS).map((m) => h('option', { value: m, selected: m === s.motion }, m)))),
           h('label', {}, 'Comes in by', h('select', { id: 'vs-' + s.id + '-c', onchange: (e) => set('cut', e.target.value) }, CUTS.map((c) => h('option', { value: c, selected: c === s.cut }, c))))))));
 }
@@ -4826,7 +5321,7 @@ function videoTab() {
     drawSide();
     try {
       const shots = await vidWrite(text, n, abort.signal, (k) => { vid.run.done = k; vidRefresh(); });
-      film.shots.push(...shots.map((x) => newShot(x)));
+      film.shots.push(...shots.map((x) => newShot({ ...x, frames: film.frames ?? 4 })));
       idea.value = '';
     } catch (e) { vid.note = abort.signal.aborted ? 'Stopped.' : e.message; }
     vid.run = null;
@@ -4842,7 +5337,8 @@ function videoTab() {
     idea, h('div', { class: 'vid-bar' }, h('label', { class: 'fine', for: 'vidCount' }, 'Shots'), count,
       h('button', { class: 'btn btn-sm btn-solid', disabled: !!vid.run, onclick: write }, 'Write the storyboard'),
       h('button', { class: 'btn btn-sm', title: 'Each picture you choose becomes a shot', onclick: () => { const inp = h('input', { type: 'file', accept: 'image/*', multiple: '', onchange: async () => { const ids = []; for (const f of inp.files) { try { ids.push((await artTake(f)).id); } catch (e) { toast(e.message); } } if (ids.length) vidAddPictures(ids); } }); inp.click(); } }, 'From my pictures…'),
-      h('button', { class: 'btn btn-sm', title: 'Pictures kept in the Images tab\'s gallery', onclick: vidFromGallery }, 'From the gallery…')));
+      h('button', { class: 'btn btn-sm', title: 'Pictures kept in the Images tab\'s gallery', onclick: vidFromGallery }, 'From the gallery…'),
+      h('button', { class: 'btn btn-sm', title: 'Frames you already have, in order, as ONE moving shot: the frames missing between them are made', onclick: () => { const inp = h('input', { type: 'file', accept: 'image/*', multiple: '', onchange: async () => { const ids = []; for (const f of [...inp.files].sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }))) { try { ids.push((await artTake(f)).id); } catch (e) { toast(e.message); } } if (ids.length) vidAddSeries(ids); } }); inp.click(); } }, 'A series of frames…')));
   if (!p) return [head, writer, vid.note ? h('div', { class: 'block' }, h('div', { class: 'err' }, vid.note)) : null];
   const [W, H] = vidSize(p);
   const { total } = vidTimes(p);
@@ -4865,10 +5361,20 @@ function videoTab() {
         h('div', {}, h('label', { for: 'vidSide' }, 'Exported at'), h('select', { id: 'vidSide', onchange: (e) => setP('side', Number(e.target.value), true) }, VID_SIDES.map((n) => h('option', { value: String(n), selected: p.side === n }, n + 'p')))),
         h('div', {}, h('label', { for: 'vidFps' }, 'Frames a second'), h('select', { id: 'vidFps', onchange: (e) => setP('fps', Number(e.target.value)) }, [24, 30, 60].map((n) => h('option', { value: String(n), selected: p.fps === n }, String(n))))),
         h('div', {}, h('label', { for: 'vidModel' }, 'Pictures by'), h('select', { id: 'vidModel', onchange: (e) => setP('model', e.target.value === 'auto' ? '' : e.target.value) }, h('option', { value: 'auto', selected: !artListed(p.model) }, 'Auto: ' + shortModel(art.picks.make || 'none listed') + ' now'), art.models.map((m) => h('option', { value: m.id, selected: m.id === p.model }, shortModel(m.id))))),
-        h('div', {}, h('label', { for: 'vidPx' }, 'Picture size'), h('select', { id: 'vidPx', onchange: (e) => setP('size', e.target.value) }, ART_SIZES.map(([n]) => h('option', { value: n, selected: p.size === n }, n))))),
+        h('div', {}, h('label', { for: 'vidPx' }, 'Picture size'), h('select', { id: 'vidPx', onchange: (e) => setP('size', e.target.value) }, ART_SIZES.map(([n]) => h('option', { value: n, selected: p.size === n }, n)))),
+        h('div', {}, h('label', { for: 'vidGen' }, 'Frames made a second'), h('div', { class: 'art-neg' },
+          h('select', { id: 'vidGen', title: 'How many pictures the model makes for each second of film. Every one is a model call (and one more when Clef judges it). 8 to 12 reads as animation; 24 is film.', onchange: (e) => setP('gen', Number(e.target.value)) }, [1, 2, 4, 8, 12, 24].map((n) => h('option', { value: String(n), selected: (p.gen ?? 8) === n }, String(n)))),
+          h('button', { class: 'btn btn-ghost btn-sm', title: 'Set every shot\'s frames from its length and this speed', onclick: () => { const n = Number(document.getElementById('vidGen').value) || 8; p.gen = n; for (const s of p.shots) s.frames = Math.max(1, Math.round(shotSecs(s) * n)); vidSave(); drawSide(); } }, 'All shots'))),
+        h('div', {}, h('label', { for: 'vidBlend' }, 'Between two frames'), h('select', { id: 'vidBlend', title: 'Stitch: the renderer finds the motion from each frame to the next and makes the frames between, so the film runs at its full frame rate; it needs frames that are close together (8 or more made a second). Hold: each made frame shown for its turn, as in animation. Mix: one fades into the next.', onchange: (e) => { setP('blend', e.target.value); vidPaint(); } }, [['flow', 'stitch them (follow the motion)'], ['hold', 'hold each frame'], ['mix', 'fade into the next']].map(([v, label]) => h('option', { value: v, selected: (p.blend ?? 'flow') === v }, label)))),
+        h('div', {}, h('label', { for: 'vidFrames' }, 'Frames a shot'), h('div', { class: 'art-neg' },
+          h('input', { id: 'vidFrames', type: 'number', min: '1', step: '1', value: String(p.frames ?? 4), title: 'How many pictures a new shot is made of. Each is made from the one before; the film moves between them. More frames: more movement, more model calls.', onchange: (e) => setP('frames', Math.max(1, Math.floor(Number(e.target.value)) || 1)) }),
+          h('button', { class: 'btn btn-ghost btn-sm', title: 'Give every shot of the film this many frames', onclick: () => { const n = Math.max(1, Math.floor(Number(document.getElementById('vidFrames').value)) || 1); p.frames = n; for (const s of p.shots) s.frames = n; vidSave(); drawSide(); } }, 'All shots')))),
       h('label', { for: 'vidLook' }, 'The look, added to every shot (style, palette, medium)'),
       h('input', { id: 'vidLook', type: 'text', value: p.look, placeholder: 'storybook watercolour, muted blues and amber, soft grain', autocomplete: 'off', oninput: (e) => setP('look', e.target.value) }),
       h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: p.keep, onchange: (e) => setP('keep', e.target.checked) }), ' Keep the look: show the film\'s first picture to the model for every later shot (when the model takes a reference)'),
+      h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: p.direct !== false, onchange: (e) => setP('direct', e.target.checked) }), ' Direct every frame: before each one, your harness looks at the frame just made, writes the next prompt from what is in it, and has Clef confirm the result (three model calls a frame)'),
+      h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: p.steady === true, onchange: (e) => setP('steady', e.target.checked) }), ' Steady the picture: carry each shot\'s detail along its motion instead of taking every frame\'s fresh paint'),
+      h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: p.check !== false, onchange: (e) => setP('check', e.target.checked) }), ' Have Clef judge every frame made from another (the same scene, nothing added, a frame that blends), and make it again when it does not follow. The renderer\'s own check of the motion is always made.'),
       h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: p.captions, onchange: (e) => { setP('captions', e.target.checked); vidPaint(); } }), ' Show the narration as captions'),
       h('label', { for: 'vidVoice' }, 'Narrator'),
       voiceOn() ? h('div', { class: 'art-fields' },
@@ -4882,7 +5388,7 @@ function videoTab() {
         p.music ? [h('input', { id: 'vidVol', type: 'range', min: '0', max: '1', step: '0.05', value: String(p.musicVol), 'aria-label': 'Music volume', onchange: (e) => setP('musicVol', Number(e.target.value)) }), h('button', { class: 'btn btn-ghost btn-sm', onclick: () => { db.del('aud:' + p.music); setP('music', '', true); } }, 'Remove')] : null))),
     h('div', { class: 'block vid-shots' },
       p.shots.map((s, i) => shotCard(p, s, i)),
-      h('div', { class: 'acts' }, h('button', { class: 'btn btn-sm', onclick: () => { p.shots.push(newShot()); vidSave(); drawSide(); } }, '+ Shot'))),
+      h('div', { class: 'acts' }, h('button', { class: 'btn btn-sm', onclick: () => { p.shots.push(newShot({ frames: p.frames ?? 4 })); vidSave(); drawSide(); } }, '+ Shot'))),
     writer];
 }
 
@@ -4891,12 +5397,26 @@ async function videoTool(args, signal) {
   if (!artOn()) return 'error: this harness is older than films: update it in the Harness tab';
   try {
     await vidOpen();
-    const given = readShots(JSON.stringify(Array.isArray(args.shots) ? args.shots : []));
+    const raw = (Array.isArray(args.shots) ? args.shots : []).filter((x) => x && typeof x === 'object');
+    // a shot may name pictures of this chat as its frames; such a shot needs no prompt of its own
+    const named = raw.map((x) => [x.pictures ?? x.frames_from ?? []].flat().map((n) => String(n).trim()).filter(Boolean));
+    const missing = named.flat().find((n) => !picsOf()[n]);
+    if (missing) return `error: no picture named ${missing}. Pictures: ${Object.keys(picsOf()).join(', ') || '(none)'}`;
+    const given = raw.map((x, i) => readShots(JSON.stringify([{ ...x, prompt: String(x.prompt ?? '').trim() || (named[i].length ? 'the same scene' : '') }]))[0]).map((x, i) => (x ? { ...x, names: named[i] } : null)).filter(Boolean);
     if (!given.length) return 'error: video_make needs shots: [{"prompt": "<the picture>", "say": "<the narrator\'s line>", "seconds": 4}, …]';
     if (vid.run) return 'error: a film is being made already; wait for it or stop it in the Video tab';
     const film = newFilm({ title: clip(String(args.title ?? 'Film').trim(), 60) || 'Film', ratio: ['16:9', '9:16', '1:1', '4:5', '4:3', '21:9'].includes(args.aspect) ? args.aspect : '16:9', look: clip(String(args.look ?? '').trim(), 300) });
-    const frames = Math.max(1, Math.floor(Number(args.frames)) || 1);
-    film.shots = given.map((x) => newShot({ ...x, frames }));
+    const frames = Math.max(1, Math.floor(Number(args.frames)) || 4);
+    film.shots = [];
+    for (const { names, ...x } of given) {
+      // this chat's pictures become frames kept in the gallery (once each)
+      const ids = [];
+      for (const name of names) {
+        const had = art.list.find((r) => r.conv === S.conv.id && r.name === name);
+        ids.push((had ?? await artKeep(await (await fetch(picsOf()[name])).blob(), { kind: 'upload', conv: S.conv.id, name })).id);
+      }
+      film.shots.push(newShot({ ...x, prompt: x.prompt === 'the same scene' ? '' : x.prompt, pics: ids, fill: ids.length >= 2, frames: Math.max(frames, ids.length >= 2 ? ids.length * 2 - 1 : ids.length) }));
+    }
     vidStop();
     vid.cur = film;
     await vidSave(true);
@@ -4919,7 +5439,7 @@ async function videoSlash(rest) {
 }
 
 SIDE_TABS.push({ id: 'video', label: () => (vid.run || vid.rec ? 'Video •' : 'Video'), draw: videoTab, open: () => vidOpen() });
-TOOLS.video_make = { args: '{"title": "<short>", "aspect": "16:9", "look": "<the style every shot shares>", "frames": 1, "shots": [{"prompt": "<the picture, complete in itself>", "say": "<what the narrator says over it, or empty>", "seconds": 4, "motion": "zoom in"}]}', does: 'start a film in the Video tab: each shot is a picture (made by the image model) with a narrator\'s line (spoken by the speech model) and a camera move (' + Object.keys(MOTIONS).join(', ') + '). Write as many shots as the film needs; describe recurring characters and places the same way in every prompt. frames above 1 makes each shot move, frame by frame', when: () => artOn() };
+TOOLS.video_make = { args: '{"title": "<short>", "aspect": "16:9", "look": "<the style every shot shares>", "frames": 4, "shots": [{"prompt": "<the picture, complete in itself>", "say": "<what the narrator says over it, or empty>", "seconds": 4, "action": "<what moves in the shot: small, continuous>", "motion": "zoom in", "pictures": ["<optional: pictures of this chat that ARE this shot\'s frames, in order>"]}]}', does: 'start a film in the Video tab: each shot is a picture (made by the image model) with a narrator\'s line (spoken by the speech model) and a camera move (' + Object.keys(MOTIONS).join(', ') + '). Write as many shots as the film needs; describe recurring characters and places the same way in every prompt. frames (4 unless given) is how many pictures each shot is made of: each is made from the one before it, and the film moves between them. A shot given "pictures" (frames the user attached or that were made here) keeps them and has the frames missing between them made: that is how a series of frames from the user becomes a moving shot', when: () => artOn() };
 TOOL_RUNNERS.video_make = (args, signal) => videoTool(args, signal);
 SLASH.video = videoSlash;
 CHIP_EXTRAS.push(() => null);
