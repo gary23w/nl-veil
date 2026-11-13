@@ -37,6 +37,9 @@
 //     working one the account has NOW for that kind of work (make, change, repaint under a mask, read): working
 //     before failing, staying before retiring, newer before older, by how each has done when asked. When it
 //     fails the next is tried. So as Cloudflare adds and retires models, nothing here has to be changed.
+//   - SPEECH: the account's text-to-speech models say a text aloud (a narration for a video the page puts
+//     together). Which there are, the voices each one has and how each is asked are read from the account, as
+//     the image models are, and the harness chooses among them the same way when none is named.
 //   - WHAT IT KNOWS ABOUT ITS MAKER: a daily read of garrettstimpson.ca/llms.txt, cut down to what is about
 //     Agent Garrett and the veil, handed to the model as reference.
 //
@@ -83,6 +86,9 @@
 //                               images?: [data: URL, ..] (to start from, or to take after), mask?: data: URL}
 //                               ->  {image (base64), type, model}
 //   POST look                   {model, image: data: URL, question?}  ->  {text, model}
+//   POST speak                  {model, text, voice?, lang?}  ->  {audio (base64), type, model}
+//                               (image/models also lists the speech models: voices: [{id, about, key, speakers,
+//                               speaker, lang, created, health}], with order.speak and picks.speak)
 //   GET  schedules   POST schedules {task, model, every_s}   DELETE schedules/<id>
 //   GET  convs | convs/<id>     POST convs/<id> {title, at, msgs, files}   DELETE convs/<id>
 //   GET  context                the reference text the model is handed (llms.txt digest)
@@ -93,7 +99,7 @@
 // No imports and no platform globals beyond fetch/Response/crypto, so a test can run this file under node with
 // a Map for storage and a scripted env.AI.
 
-export const VERSION = "15";
+export const VERSION = "16";
 const API_ROOT = "https://api.cloudflare.com/client/v4";
 const PY_SOURCE = "https://raw.githubusercontent.com/gary23w/nl-veil/main/cloud/tot_py.py";
 const SELF_SCRIPT = "veil-web";
@@ -151,6 +157,7 @@ const IMAGE_PROMPT_MAX = 8000; // characters of a prompt, when the model's own s
 const MODEL_REST_MS = 6 * 3600 * 1000; // a model whose last calls failed is passed over this long, then tried again
 const RETIRE_SOON_MS = 30 * 86400 * 1000; // a model Cloudflare retires within this long is chosen after the ones that stay
 const AUTO_TRIES = 3; // models one request may go through when the harness does the choosing
+const SPEAK_CHARS = 4000; // characters one request to a speech model carries (the page sends a long text in parts)
 const HEALTH_MAX = 64; // models whose record of working or failing is kept
 // a refusal that is about the request (its words, its pictures), not about the model: no other model is tried for it
 const REQUEST_REFUSAL = /flagged|safety|nsfw|content policy|could not be read|must be|say what/i;
@@ -526,10 +533,42 @@ export function schemaProps(input) {
 
 const propOf = (m, id) => (Array.isArray(m?.properties) ? m.properties.find((p) => p?.property_id === id)?.value : undefined);
 
+/// What kind of sound these bytes are, by how the file starts. Speech models answer MP3 unless asked otherwise,
+/// so bytes that are none of the others are taken for that.
+export function audioType(u8) {
+  const at = (i, s) => [...s].every((c, k) => u8[i + k] === c.charCodeAt(0));
+  if (at(0, "RIFF") && at(8, "WAVE")) return "audio/wav";
+  if (at(0, "OggS")) return "audio/ogg";
+  if (at(0, "fLaC")) return "audio/flac";
+  return "audio/mpeg";
+}
+
+const speaks = (v, lang) => (v.tongue === lang ? 2 : !v.tongue ? 1 : 0);
+
+/// One speech model as the page is told of it: the field its text goes in, its voices, whether it takes a language.
+export function voiceSpec(m, input) {
+  const P = schemaProps(input);
+  return {
+    id: m.name,
+    about: clip(String(m.description ?? "").trim(), 300),
+    schema: Object.keys(P).length > 0,
+    key: P.text ? "text" : P.prompt ? "prompt" : "",
+    speakers: Array.isArray(P.speaker?.enum) ? P.speaker.enum.slice(0, 200).map((x) => clip(String(x), 40)) : [],
+    speaker: clip(String(P.speaker?.default ?? ""), 40),
+    lang: !!P.lang,
+    tongue: /-([a-z]{2})$/.exec(m.name)?.[1] ?? "", // the language a model's id ends in, when it ends in one
+    created: clip(String(m.created_at ?? ""), 30),
+    beta: String(propOf(m, "beta")) === "true",
+    partner: String(propOf(m, "partner")) === "true",
+    retires: clip(String(propOf(m, "planned_deprecation_date") ?? ""), 20),
+  };
+}
+
 /// The models of `list` in the order the harness would choose them, best first. Nothing here knows a model's
-/// name: one that is working is put before one whose last calls failed (`health`), one that stays before one
-/// Cloudflare retires soon, one the caller leads with (`lead`), a finished one before a beta, a newer one before
-/// an older. A model past its retirement date is left out. So when Cloudflare's list changes, the choice follows.
+/// name: one that is working is put before one whose last calls failed (`health`), one the caller leads with
+/// (`lead`: fit for the work, like a voice of the text's language), one that stays before one Cloudflare retires
+/// soon, a finished one before a beta, a newer one before an older. A model past its retirement date is left
+/// out. So when Cloudflare's list changes, the choice follows.
 export function rankModels(list, health, now) {
   const today = dayOf(now);
   const soon = dayOf(now + RETIRE_SOON_MS);
@@ -537,7 +576,7 @@ export function rankModels(list, health, now) {
     const h = health?.[id];
     return !!h && h.streak >= (h.ok > 0 ? 2 : 1) && now - h.at < MODEL_REST_MS;
   };
-  const key = (m) => [failing(m.id) ? 0 : 1, m.retires && m.retires <= soon ? 0 : 1, Number(m.lead) || 0, m.beta ? 0 : 1, String(m.created ?? "")];
+  const key = (m) => [failing(m.id) ? 0 : 1, Number(m.lead) || 0, m.retires && m.retires <= soon ? 0 : 1, m.beta ? 0 : 1, String(m.created ?? "")];
   return list
     .filter((m) => !(m.retires && m.retires <= today))
     .map((m) => ({ m, k: key(m) }))
@@ -1471,14 +1510,14 @@ export class Harness {
   /// input schema; and the account's vision models. Kept a while; `fresh` asks Cloudflare again now.
   async imageCatalog(who, fresh = false) {
     const kept = await this.store.get("image_catalog");
-    if (kept?.v === 2 && !fresh && Date.now() - kept.at < IMAGE_CATALOG_TTL_MS) return kept;
+    if (kept?.v === 3 && !fresh && Date.now() - kept.at < IMAGE_CATALOG_TTL_MS) return kept;
     const rows = async (task) => {
       const j = await this.api(who.token, "GET", `/accounts/${who.account}/ai/models/search?task=${encodeURIComponent(task)}&hide_experimental=true&per_page=100`);
       return (Array.isArray(j?.result) ? j.result : []).filter((m) => typeof m?.name === "string" && m.name.startsWith("@"));
     };
     const schema = async (m) => m.schema?.input ?? (await this.api(who.token, "GET", `/accounts/${who.account}/ai/models/schema?model=${encodeURIComponent(m.name)}`))?.result?.input ?? null;
-    const [makers, lookers, texts] = await Promise.all([rows("Text-to-Image"), rows("Image-to-Text"), rows("Text Generation")]);
-    if (makers.length === 0) return kept?.v === 2 ? kept : { v: 2, at: 0, models: [], vision: [] };
+    const [makers, lookers, texts, talkers] = await Promise.all([rows("Text-to-Image"), rows("Image-to-Text"), rows("Text Generation"), rows("Text-to-Speech")]);
+    if (makers.length === 0) return kept?.v === 3 ? kept : { v: 3, at: 0, models: [], vision: [], voices: [] };
     const models = (await Promise.all(makers.map(async (m) => imageSpec(m, await schema(m))))).sort((a, b) => a.id.localeCompare(b.id));
     // A vision model is one that can be shown a picture and asked about it in words. The account's list also
     // marks models that read pictures to another end (decisions, typed values): each one's schema says which
@@ -1494,7 +1533,8 @@ export class Harness {
       .map(async (m) => ({ id: m.name, about: clip(String(m.description ?? "").trim(), 160), how: lookShape(await schema(m)), created: clip(String(m.created_at ?? ""), 30), beta: String(propOf(m, "beta")) === "true", retires: clip(String(propOf(m, "planned_deprecation_date") ?? ""), 20), dedicated: lookers.includes(m) }))))
       .filter((v) => v.how)
       .sort((a, b) => a.id.localeCompare(b.id));
-    const now = { v: 2, at: Date.now(), models, vision };
+    const voices = (await Promise.all(talkers.map(async (m) => voiceSpec(m, await schema(m))))).sort((a, b) => a.id.localeCompare(b.id));
+    const now = { v: 3, at: Date.now(), models, vision, voices };
     await this.store.put("image_catalog", now);
     return now;
   }
@@ -1521,8 +1561,9 @@ export class Harness {
       inpaint: ids(models.filter((m) => m.init && m.mask)),
       // to read a picture: one that has answered before, then one made for it, then the rest
       look: ids(cat.vision.map((v) => ({ ...v, lead: health[v.id]?.ok > 0 ? 2 : v.dedicated ? 1 : 0 }))),
+      speak: ids((cat.voices ?? []).map((v) => ({ ...v, lead: speaks(v, "en") }))),
     };
-    return { ...cat, models, vision: cat.vision.map((v) => ({ ...v, health: brief(v.id) })), order, picks: Object.fromEntries(Object.entries(order).map(([k, v]) => [k, v[0] ?? ""])) };
+    return { ...cat, models, vision: cat.vision.map((v) => ({ ...v, health: brief(v.id) })), voices: (cat.voices ?? []).map((v) => ({ ...v, health: brief(v.id) })), order, picks: Object.fromEntries(Object.entries(order).map(([k, v]) => [k, v[0] ?? ""])) };
   }
 
   /// How a model did when it was asked: what the choosing goes by.
@@ -1541,7 +1582,7 @@ export class Harness {
   /// A request that names a model is that model's to answer. One that names none (or "auto") is the harness's to
   /// place: the best working model the account has now for this kind of work, and the next one when that fails.
   /// When every one fails and the list is not fresh, Cloudflare is asked for its list again and the new ones tried.
-  async chosen(body, who, kind, one) {
+  async chosen(body, who, kind, one, orderOf) {
     const asked = String(body.model ?? "").trim();
     const run = async (model) => {
       const t0 = Date.now();
@@ -1555,7 +1596,7 @@ export class Harness {
     const tried = [];
     for (const fresh of [false, true]) {
       const cat = await this.imageCatalogNow(who, fresh);
-      const order = cat.order[kind].filter((id) => !tried.some((t) => t.model === id)).slice(0, AUTO_TRIES);
+      const order = (orderOf ? orderOf(cat, (await this.store.get("model_health")) ?? {}) : cat.order[kind]).filter((id) => !tried.some((t) => t.model === id)).slice(0, AUTO_TRIES);
       for (const model of order) {
         const { got, theirs } = await run(model);
         if (!got.err) return { ...got, auto: true, tried };
@@ -1564,7 +1605,7 @@ export class Harness {
       }
       if (Date.now() - cat.at < 10 * 60 * 1000) break; // the list is fresh: there is nothing newer to try
     }
-    const what = { make: "makes pictures", edit: "takes a picture to work from", inpaint: "repaints a masked part of a picture", look: "reads pictures" }[kind];
+    const what = { make: "makes pictures", edit: "takes a picture to work from", inpaint: "repaints a masked part of a picture", look: "reads pictures", speak: "speaks a text" }[kind];
     if (!tried.length) return { err: `none of your account's models ${what}` };
     return { err: "no model answered. " + tried.map((t) => `${t.model.split("/").pop()}: ${t.err}`).join(" | ") };
   }
@@ -1572,6 +1613,53 @@ export class Harness {
   image(body, who) {
     const pictures = Array.isArray(body.images) ? body.images.length : body.image ? 1 : 0;
     return this.chosen(body, who, body.mask ? "inpaint" : pictures ? "edit" : "make", (b) => this.imageOne(b));
+  }
+
+  /// A text is spoken by a model of its language: one whose id ends in that language first, then one that
+  /// names no language (or takes one as a setting), and one of another language last.
+  speak(body, who) {
+    const lang = String(body.lang ?? "").slice(0, 2).toLowerCase() || "en";
+    return this.chosen(body, who, "speak", (b) => this.speakOne(b), (cat, health) => rankModels((cat.voices ?? []).map((v) => ({ ...v, lead: speaks(v, lang) })), health, Date.now()).map((m) => m.id));
+  }
+
+  /// A text said aloud by one speech model: {audio (base64), type, model}. The text goes in the field the
+  /// model's schema names, a voice is passed only when the schema lists it, a language only when it takes one.
+  /// With no schema known, both field names are tried.
+  async speakOne(body) {
+    const model = String(body.model ?? "");
+    if (!model.startsWith("@")) return { err: "model must be a Workers AI model id" };
+    const text = clip(String(body.text ?? "").trim(), SPEAK_CHARS);
+    if (!text) return { err: "say what is to be spoken" };
+    const spec = ((await this.store.get("image_catalog"))?.voices ?? []).find((v) => v.id === model) ?? null;
+    const extra = {};
+    const voice = String(body.voice ?? "").trim();
+    if (voice && spec?.speakers.includes(voice)) extra.speaker = voice;
+    const lang = String(body.lang ?? "").trim();
+    if (lang && spec?.lang && /^[a-zA-Z-]{2,10}$/.test(lang)) extra.lang = lang;
+    const keys = spec?.key ? [spec.key] : ["text", "prompt"];
+    let out = null, why = "";
+    for (const key of keys) {
+      try {
+        const r = await this.env.AI.run(model, { [key]: text, ...extra });
+        let bytes = null;
+        if (r instanceof ReadableStream) bytes = new Uint8Array(await new Response(r).arrayBuffer());
+        else if (r instanceof ArrayBuffer) bytes = new Uint8Array(r);
+        else if (r instanceof Uint8Array) bytes = r;
+        else {
+          const b64 = String(r?.audio ?? r?.result?.audio ?? "").replace(/^data:[^,]*,/, "").replace(/\s+/g, "");
+          if (b64.length > 100 && /^[A-Za-z0-9+/]+=*$/.test(b64)) bytes = fromBase64(b64);
+        }
+        if (bytes && bytes.length > 100) {
+          out = { audio: toBase64(bytes), type: audioType(bytes), bytes: bytes.length };
+          break;
+        }
+        why = (why ? why + " | " : "") + "the model answered without sound";
+      } catch (e) {
+        why = (why ? why + " | " : "") + clip(e?.message ?? e, 300);
+      }
+    }
+    await this.spend(1, text.length + (out ? out.bytes : 0));
+    return out ? { audio: out.audio, type: out.type, model } : { err: "no speech came back: " + why };
   }
 
   look(body, who) {
@@ -2568,11 +2656,11 @@ export class Harness {
 
     // Images: make one, look at one. (The body is JSON; a picture travels as a data: URL.)
     if (method === "GET" && at === "image/models") return say({ ok: true, ...(await this.imageCatalogNow(who, url.searchParams.get("fresh") === "1")) });
-    if (method === "POST" && (at === "image" || at === "look")) {
+    if (method === "POST" && (at === "image" || at === "look" || at === "speak")) {
       if (!this.env.AI) return bad("this Worker has no AI binding", 500);
       const why = await this.spent(true);
       if (why) return bad(why, 429);
-      const got = at === "image" ? await this.image(body, who) : await this.look(body, who);
+      const got = at === "image" ? await this.image(body, who) : at === "look" ? await this.look(body, who) : await this.speak(body, who);
       return got.err ? bad(got.err, /could not be read|must be|say what/.test(got.err) ? 400 : 502) : say({ ok: true, ...got });
     }
 

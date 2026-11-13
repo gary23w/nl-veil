@@ -44,7 +44,7 @@ async function harness(say = "all done") {
 }
 
 test("the version this file tests", () => {
-  assert.equal(VERSION, "15");
+  assert.equal(VERSION, "16");
 });
 
 test("a local job is queued, never run by the alarm, and keeps no alarm going while it waits", async () => {
@@ -498,4 +498,47 @@ test("left to choose, the harness takes the best working model listed now, and t
 
   // reading a picture: the model made for it first, until another has answered
   assert.equal(after.picks.look, "@cf/moondream/moondream3.1-9B-A2B");
+});
+
+test("speech: each model's own field and voices, the harness's choice when none is named, sound back as base64", async () => {
+  const VOICE_ROWS = [
+    { name: "@cf/deepgram/aura-2-en", description: "Aura 2", created_at: "2025-10-09 22:19:34.483", input: { type: "object", properties: { speaker: { type: "string", default: "luna", enum: ["luna", "orion", "zeus"] }, text: { type: "string" } } } },
+    { name: "@cf/deepgram/aura-2-es", description: "Aura 2, Spanish", created_at: "2025-10-09 22:42:37.002", input: { type: "object", properties: { speaker: { type: "string", default: "aquila", enum: ["aquila", "diana"] }, text: { type: "string" } } } },
+    { name: "@cf/myshell-ai/melotts", description: "MeloTTS", created_at: "2024-07-19 15:51:04.819", properties: [{ property_id: "planned_deprecation_date", value: "2026-11-20" }], input: { type: "object", properties: { prompt: { type: "string" }, lang: { type: "string", default: "en" } }, required: ["prompt"] } },
+  ];
+  const MP3 = Uint8Array.from({ length: 400 }, (_, i) => (i === 0 ? 0xff : i === 1 ? 0xfb : i % 251));
+  const WAV = new Uint8Array(400);
+  WAV.set([..."RIFF"].map((c) => c.charCodeAt(0)), 0);
+  WAV.set([..."WAVE"].map((c) => c.charCodeAt(0)), 8);
+  const { h, call, runs } = await studio((model, input) => (model.includes("aura") ? new ReadableStream({ start(c) { c.enqueue(MP3); c.close(); } }) : { audio: btoa(String.fromCharCode(...WAV)) }));
+  const images = h.api;
+  h.api = async (token, method, path) => {
+    const u = new URL("https://x" + path);
+    if (u.pathname.endsWith("/ai/models/search") && u.searchParams.get("task") === "Text-to-Speech") return { success: true, result: VOICE_ROWS.map(({ input, ...row }) => row) };
+    const row = VOICE_ROWS.find((r) => r.name === u.searchParams.get("model"));
+    if (u.pathname.endsWith("/ai/models/schema") && row) return { success: true, result: { input: row.input } };
+    return images(token, method, path);
+  };
+  const cat = (await call("GET", "image/models")).j;
+  const aura = cat.voices.find((v) => v.id.endsWith("aura-2-en")), melo = cat.voices.find((v) => v.id.endsWith("melotts"));
+  assert.equal(aura.key, "text");
+  assert.deepEqual(aura.speakers, ["luna", "orion", "zeus"]);
+  assert.equal(aura.speaker, "luna");
+  assert.equal(melo.key, "prompt");
+  assert.equal(melo.lang, true);
+  assert.equal(cat.picks.speak, "@cf/deepgram/aura-2-en"); // English unless told otherwise, though the Spanish one is newer; never the one retiring next week
+  assert.equal((await call("POST", "speak", { text: "Buenas noches.", lang: "es-MX" })).j.model, "@cf/deepgram/aura-2-es"); // a text is spoken by a model of its language
+
+  assert.equal((await call("POST", "speak", { text: "Bonsoir.", lang: "fr" })).j.model, "@cf/myshell-ai/melotts"); // no French model: the one that takes a language, though it is leaving
+  const said = await call("POST", "speak", { text: "The lamp turned once more.", voice: "orion", lang: "en-GB" });
+  assert.equal(said.status, 200);
+  assert.equal(said.j.model, "@cf/deepgram/aura-2-en");
+  assert.equal(said.j.type, "audio/mpeg");
+  assert.equal(atob(said.j.audio).length, 400);
+  assert.deepEqual(runs.at(-1).input, { text: "The lamp turned once more.", speaker: "orion" }); // a voice it lists; no language, it takes none
+
+  const melod = await call("POST", "speak", { model: "@cf/myshell-ai/melotts", text: "Bonsoir.", voice: "orion", lang: "fr" });
+  assert.equal(melod.j.type, "audio/wav"); // told from the bytes, whatever the model was expected to send
+  assert.deepEqual(runs.at(-1).input, { prompt: "Bonsoir.", lang: "fr" }); // its own field; a voice it does not list is not sent
+  assert.equal((await call("POST", "speak", { text: "  " })).status, 400);
 });
