@@ -1791,6 +1791,8 @@ test "deploying the harness: the upload is what wrangler.jsonc declares, the cla
     try tt.expect(std.mem.indexOf(u8, again, "migrations") == null);
     try tt.expect(std.mem.indexOf(u8, fresh, "Content-Type: application/javascript+module\r\n\r\n") != null);
     try tt.expect(std.mem.indexOf(u8, fresh, "export class Harness") != null); // the harness itself rides the upload
+    try tt.expect(std.mem.indexOf(u8, fresh, "Content-Type: application/javascript+module\r\n\r\n// veil-web.js") != null); // ... from its first line
+    try tt.expect(std.mem.endsWith(u8, HARNESS_JS, fresh[fresh.len - "\r\n--BOUND--\r\n".len - 200 .. fresh.len - "\r\n--BOUND--\r\n".len])); // ... to its last, whatever its size
     try tt.expect(std.mem.endsWith(u8, fresh, "\r\n--BOUND--\r\n"));
     // the values this file repeats are the ones the harness and its wrangler.jsonc carry
     try tt.expect(std.mem.indexOf(u8, HARNESS_JS, "const COMPAT_DATE = \"" ++ COMPAT_DATE ++ "\";") != null);
@@ -1817,8 +1819,10 @@ test "deploying the harness: nothing is uploaded when one answers; with none, it
         // no harness answers before the upload
         .{ .method = "GET", .path = "/v1/status", .reply = StandIn.no_worker, .times = 1 },
         .{ .method = "GET", .path = "/accounts/acct/workers/scripts/veil-web/settings", .reply = w("{\"success\":false,\"errors\":[{\"code\":10007,\"message\":\"This Worker does not exist on your account.\"}]}"), .has = bearer },
-        // a new script: the upload carries the migration, the bindings and the module
-        .{ .method = "PUT", .path = "/accounts/acct/workers/scripts/veil-web", .reply = okv4, .has = &.{ "Authorization: Bearer oauth-bearer", "\"new_sqlite_classes\":[\"Harness\"]", "\"name\":\"ALLOW_ORIGIN\"", "export class Harness" } },
+        // a new script: the upload carries the migration, the bindings and the module. The stand-in keeps the first
+        // 32 KiB of a body, so the module is recognised by its opening line: what the whole upload holds is the
+        // test above's to say (the harness is far longer than 32 KiB, and grows).
+        .{ .method = "PUT", .path = "/accounts/acct/workers/scripts/veil-web", .reply = okv4, .has = &.{ "Authorization: Bearer oauth-bearer", "\"new_sqlite_classes\":[\"Harness\"]", "\"name\":\"ALLOW_ORIGIN\"", "Content-Type: application/javascript+module\r\n\r\n// veil-web.js" } },
         .{ .method = "POST", .path = "/accounts/acct/workers/scripts/veil-web/subdomain", .reply = okv4, .has = &.{ "Authorization: Bearer oauth-bearer", "{\"enabled\":true}" } },
         // the new address answers on the first ask after the upload
         .{ .method = "GET", .path = "/v1/status", .reply = StandIn.status_ok, .has = bearer },
