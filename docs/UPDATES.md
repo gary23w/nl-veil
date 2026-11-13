@@ -1,5 +1,9 @@
 # Desktop updates and release connectivity
 
+## v1.1.30
+
+If you are logged in to Cloudflare, clef mode is on after updating: a chat turn's yes/no decisions go first to Cloudflare's Clef model on your own login, and to the chat model when Clef is not sure. To turn it off, use the desk's **clef mode** toggle in Settings or the **Clef mode** box in the web app's server configuration, or set `NL_CLEF=0` before the first start. Nothing changes for a user who is not logged in to Cloudflare. [Release details](release/RELEASE-v1.1.30.md).
+
 ## v1.1.29
 
 Nothing to do after updating. On Windows an idle veil now holds far less of the computer's commit limit: threads commit their stacks as they use them, and the server keeps a small pool of request buffers. [Release details](release/RELEASE-v1.1.29.md).
