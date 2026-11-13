@@ -1,0 +1,16 @@
+// The web veil's worker harness (veil-web.js): what Cloudflare's deploy page reads to put it in an account.
+{
+  "name": "veil-web",
+  "main": "veil-web.js",
+  "compatibility_date": "2025-09-01",
+  // the harness calls its own Python Worker by its workers.dev address: route that as the public internet would
+  "compatibility_flags": ["global_fetch_strictly_public"],
+  "workers_dev": true,
+  // the model: the account's own Workers AI
+  "ai": { "binding": "AI" },
+  // the queue, the usage counters and the limits: one Durable Object
+  "durable_objects": { "bindings": [{ "name": "HARNESS", "class_name": "Harness" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Harness"] }],
+  // the one page this Worker answers across origins (the web veil)
+  "vars": { "ALLOW_ORIGIN": "https://gary23w.github.io" }
+}
