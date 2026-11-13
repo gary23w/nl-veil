@@ -1104,18 +1104,37 @@ test "the default scope list carries no scope the registered client refuses" {
     try std.testing.expect(n >= 5);
 }
 
+/// The result page's tab icon: the veil's mark, the same inline image the web app's index.html carries. Inline, so
+/// the page asks the server for nothing more (a browser's own /favicon.ico request finds no file here).
+const PAGE_ICON = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%238a3ffc'/%3E%3Cpath d='M8 10l8 13 8-13' fill='none' stroke='%23fff' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E";
+
+/// The page's head: charset, the icon, the title.
+fn pageHead(a: std.mem.Allocator, title: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(a, "<!doctype html><meta charset=\"utf-8\"><link rel=\"icon\" href=\"{s}\"><title>{s}</title>", .{ PAGE_ICON, title });
+}
+
+test "the login result page carries the veil's icon inline" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const head = try pageHead(arena.allocator(), "Connected to Cloudflare");
+    try std.testing.expect(std.mem.indexOf(u8, head, "<link rel=\"icon\" href=\"data:image/svg+xml,") != null);
+    try std.testing.expect(std.mem.endsWith(u8, head, "<title>Connected to Cloudflare</title>"));
+    // the image sits inside a double-quoted attribute: nothing in it may end the attribute or the tag
+    try std.testing.expect(std.mem.indexOfAny(u8, PAGE_ICON, "\"<>") == null);
+}
+
 fn page(res: *httpz.Response, ok: bool, detail: []const u8) !void {
     res.content_type = .HTML;
     res.status = if (ok) 200 else 400;
     const title = if (ok) "Connected to Cloudflare" else "Cloudflare login failed";
     const msg = if (ok) "You're connected. You can close this tab and return to the veil." else "Something went wrong.";
     res.body = try std.fmt.allocPrint(res.arena,
-        \\<!doctype html><meta charset="utf-8"><title>{s}</title>
+        \\{s}
         \\<div style="font:16px/1.5 system-ui,sans-serif;max-width:32rem;margin:16vh auto;padding:0 1rem;color:#1a1b26">
         \\<h2 style="color:{s}">{s}</h2><p>{s}</p><p style="color:#565f89;font-size:14px">{s}</p></div>
         \\<script>try{{if(window.opener)window.opener.postMessage('nl-cf-oauth','*');}}catch(e){{}}
         \\if({s})setTimeout(function(){{try{{window.close();}}catch(e){{}}}},1500);</script>
-    , .{ title, if (ok) "#f6821f" else "#f7768e", title, msg, htmlEsc(res.arena, detail), if (ok) "true" else "false" });
+    , .{ try pageHead(res.arena, title), if (ok) "#f6821f" else "#f7768e", title, msg, htmlEsc(res.arena, detail), if (ok) "true" else "false" });
 }
 
 test "pkce challenge is base64url sha256 of the verifier" {
