@@ -398,3 +398,18 @@ details.tool pre { padding: 8px 10px; border-top: 1px solid var(--border); max-h
 .swarm-log { font: var(--fs-micro)/1.6 var(--font-mono); max-height: 260px; overflow: auto; }
 #swarmSay { flex: 1; min-width: 0; }
 
+/* ---- pictures: waiting in the composer, in the transcript, at full size ---- */
+.attached { display: flex; flex-wrap: wrap; gap: 6px; padding: 8px var(--pad-in) 0; }
+.attached[hidden] { display: none; }
+.attach { display: inline-flex; align-items: center; gap: 6px; padding: 3px 4px 3px 3px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface-raised); font-size: var(--fs-micro); color: var(--text-secondary); }
+.attach img { width: 34px; height: 34px; object-fit: cover; border-radius: calc(var(--radius) - 2px); }
+.attach .name { max-width: 14ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.attach-btn { flex: 0 0 auto; align-self: flex-end; font-size: 20px; line-height: 1; }
+.pics { display: flex; flex-wrap: wrap; gap: 8px; margin: 6px 0; }
+.pic { padding: 0; border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; background: var(--surface-raised); cursor: zoom-in; line-height: 0; }
+.pic img { display: block; max-width: min(100%, 360px); max-height: 300px; }
+.msg.user .pic img { max-width: 180px; max-height: 140px; }
+dialog.ask.wide { width: min(96vw, 1100px); }
+.pic-full { display: block; max-width: 100%; max-height: calc(100dvh - 150px); margin: 0 auto; border-radius: calc(var(--radius) - 2px); }
+.ask-acts .grow { flex: 1; align-self: center; }
+

@@ -162,7 +162,7 @@ const S = {
   convs: [],                             // [{id, title, at}] newest first; the harness's copy and this browser's, merged
   conv: null,                            // the open conversation: {id, title, at, msgs, files}
   live: null,                            // the running turn: {tools, text, status, abort}
-  tab: ['code', 'swarm', 'jobs', 'harness'].includes(ui.tab) ? ui.tab : 'code',   // the side pane: code | jobs | harness
+  tab: typeof ui.tab === 'string' ? ui.tab : 'code',   // the side pane: code | jobs | harness
   lay: { rail: true, chat: true, side: 0, ...ls.get('veilweb.layout', {}) },   // wide screens: which panes show, and the side pane's width in px (0 = its own)
   file: null,                            // the file showing in the editor
   open: [],                              // the files open as editor tabs
@@ -317,6 +317,7 @@ function loadHarnessData() {
   pullShared();
   meshHello();
   refreshSwarms();
+  loadImageModels();
 }
 
 async function refreshStatus() {
@@ -888,6 +889,12 @@ const TOOLS = {
   browser_type: { args: '{"ref": 3, "text": "<text>", "enter": false}', does: 'type into a numbered field in the browser tab (enter: true submits)', when: () => browserLink.on() },
   browser_close: { args: '{}', does: 'close the browser tab', when: () => browserLink.on() },
 };
+/* What another section may add to, without editing this one: a tool's runner (its entry goes in TOOLS), a
+   paragraph for the system prompt, something to show under a tool's chip, a tab in the side pane. */
+const TOOL_RUNNERS = {};   // tool name -> async (args, signal, name) => the result as text
+const PROMPT_NOTES = [];   // () => a paragraph, or ''
+const CHIP_EXTRAS = [];    // (the chip's record) => a node, or null
+const SIDE_TABS = [];      // {id, label: () => text, draw: () => [nodes], open?: () => void}
 const toolsNow = () => Object.entries(TOOLS).filter(([, t]) => !t.when || t.when());
 const toolDoes = (t) => (typeof t.does === 'function' ? t.does() : t.does);
 
@@ -919,6 +926,7 @@ async function runTool(name, args, signal) {
 const READ_LINES = 400;   // lines of a long file one read_file gives
 
 async function runToolInner(name, args, signal) {
+  if (TOOL_RUNNERS[name]) return TOOL_RUNNERS[name](args, signal, name);
   const files = S.conv.files;
   const f = fileName(args.name ?? args.path ?? args.file ?? args.filename);
   switch (name) {
@@ -2856,6 +2864,148 @@ function swarmTab() {
   ];
 }
 
+/* ============================================================ images: pictures in, pictures out */
+
+/* Pictures are the harness's work: it asks your account's image models for a picture, and a vision model what a
+   picture shows. This page carries them. A picture you attach (the button, a paste, a drop) is made small enough to
+   send, read once by a vision model so that ANY chat model can work with it, and kept with the chat; the chat's
+   model can look again with a question of its own (image_look) and make or change pictures (image_generate).
+   Pictures stay in this browser with their chat: they are not copied to the harness's storage. */
+const IMAGE_SIDE_MAX = 1568;     // a picture's longer side, as it is sent and kept
+const IMAGES_PER_CHAT = 60;
+const imageOn = () => !!S.status && Number(S.status.version) >= 13;
+const pics = {
+  attached: [],    // [{name, url}] waiting in the composer for the next message
+  models: [],      // the account's image models, from the harness
+};
+const picsOf = (conv = S.conv) => (conv.images ??= {});
+const firstHad = (wanted, have) => (wanted ?? []).find((m) => have.includes(m));
+/* Which model does what. A choice the user saved wins; then the first of the page's list the account has. */
+const imageModel = (edit) => ls.get(edit ? 'veilweb.image.edit' : 'veilweb.image.make') || firstHad(edit ? CFG.image_edit_models : CFG.image_models, pics.models.map((m) => m.id)) || (edit ? CFG.image_edit_models : CFG.image_models)?.[0];
+const visionModel = () => ls.get('veilweb.image.look') || firstHad(CFG.vision_models, S.models.map((m) => m.id)) || CFG.vision_models?.[0] || S.model;
+
+async function loadImageModels() {
+  if (!imageOn()) return;
+  try { pics.models = (await harnessJson('/v1/image/models')).models; } catch {}
+}
+
+/* A file or blob as a data: URL no larger than the harness takes: drawn down to IMAGE_SIDE_MAX, JPEG unless it
+   has to stay a PNG (it is small and may be see-through). */
+async function pictureUrl(blob) {
+  const bmp = await createImageBitmap(blob);
+  const scale = Math.min(1, IMAGE_SIDE_MAX / Math.max(bmp.width, bmp.height));
+  const c = document.createElement('canvas');
+  c.width = Math.max(1, Math.round(bmp.width * scale));
+  c.height = Math.max(1, Math.round(bmp.height * scale));
+  c.getContext('2d').drawImage(bmp, 0, 0, c.width, c.height);
+  bmp.close?.();
+  const png = blob.type === 'image/png' && blob.size < 900 * 1024 && scale === 1;
+  return c.toDataURL(png ? 'image/png' : 'image/jpeg', 0.9);
+}
+
+function pictureName(base, type) {
+  const ext = type.includes('png') ? 'png' : type.includes('webp') ? 'webp' : 'jpg';
+  const stem = (String(base || 'image').replace(/\.[a-z0-9]+$/i, '').replace(/[^\w.-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40)) || 'image';
+  const have = new Set([...Object.keys(picsOf()), ...pics.attached.map((a) => a.name)]);
+  for (let i = 0; ; i++) { const name = `${stem}${i ? '-' + (i + 1) : ''}.${ext}`; if (!have.has(name)) return name; }
+}
+
+/* Pictures picked, pasted or dropped: they wait in the composer until the message is sent. */
+async function attachPictures(files) {
+  if (!imageOn()) return toast('Pictures need a newer harness: update it in the Harness tab.');
+  for (const f of files) {
+    if (!f.type?.startsWith('image/')) continue;
+    if (pics.attached.length >= 4) { toast('Four pictures to a message.'); break; }
+    try {
+      const url = await pictureUrl(f);
+      pics.attached.push({ name: pictureName(f.name, url.slice(5, 20)), url });
+    } catch {
+      toast(`${f.name || 'That picture'} could not be read.`);
+    }
+  }
+  drawAttached();
+}
+
+function drawAttached() {
+  const old = document.getElementById('attached');
+  if (!old) return;
+  old.replaceChildren(...pics.attached.map((a, i) => h('span', { class: 'attach' }, h('img', { src: a.url, alt: a.name }), h('span', { class: 'name' }, a.name),
+    h('button', { class: 'x show', 'aria-label': 'Remove ' + a.name, onclick: () => { pics.attached.splice(i, 1); drawAttached(); } }, '✕'))));
+  old.hidden = pics.attached.length === 0;
+}
+
+/* A picture at its full size, with what can be done with it. */
+function showPicture(name, conv = S.conv) {
+  const url = picsOf(conv)[name];
+  if (!url) return toast('That picture is not kept in this browser.');
+  dialogBox((done) => [h('img', { class: 'pic-full', src: url, alt: name }),
+    h('div', { class: 'ask-acts' }, h('span', { class: 'fine grow' }, name),
+      h('button', { class: 'btn btn-ghost btn-sm', onclick: () => { const a = h('a', { href: url, download: name }); a.click(); } }, 'Download'),
+      h('button', { class: 'btn btn-ghost btn-sm', title: 'Attach it to your next message', onclick: () => { if (!pics.attached.some((a) => a.name === name)) pics.attached.push({ name, url }); drawAttached(); done(null); document.getElementById('prompt')?.focus(); } }, 'Attach'),
+      h('button', { class: 'btn btn-solid btn-sm', id: 'askOk', onclick: () => done(null) }, 'Close'))]).then(() => {});
+  document.querySelector('dialog.ask')?.classList.add('wide');
+}
+const thumbs = (names, conv = S.conv) => (names?.length ? h('div', { class: 'pics' }, names.filter((n) => picsOf(conv)[n]).map((n) => h('button', { class: 'pic', title: n, onclick: () => showPicture(n, conv) }, h('img', { src: picsOf(conv)[n], alt: n, loading: 'lazy' })))) : null);
+
+/* What a vision model says about a kept picture. */
+async function lookAt(name, question, signal) {
+  const url = picsOf()[name];
+  if (!url) throw new Error(`no picture named ${name}. Pictures: ${Object.keys(picsOf()).join(', ') || '(none)'}`);
+  return (await harnessJson('/v1/look', { body: { model: visionModel(), image: url, question }, signal })).text;
+}
+
+/* The pictures sent with a message, read once so the chat's model has them in words. */
+async function readAttached(names, said, signal) {
+  let notes = '';
+  for (const name of names) {
+    try {
+      const text = await lookAt(name, 'Describe this picture in detail for someone who cannot see it: what it shows, its layout, colours and style, and any text in it, copied exactly.' + (said ? ' The person who sent it wrote: "' + clip(said, 400) + '". Make sure the description covers what they are asking about.' : ''), signal);
+      notes += `\n\n[The user attached a picture, ${name}. A vision model describes it: ${text}]`;
+    } catch (e) {
+      if (signal?.aborted) throw e;
+      notes += `\n\n[The user attached a picture, ${name}, but it could not be read: ${e.message}]`;
+    }
+  }
+  return notes + (names.length ? '\n(You can ask more about a picture with image_look, and change one with image_generate and its name as "from".)' : '');
+}
+
+/* The chat's picture tools. */
+async function imageTool(name, args, signal) {
+  if (!imageOn()) return 'error: this harness is older than pictures: update it in the Harness tab';
+  try {
+    if (name === 'image_look') {
+      const which = String(args.name ?? args.image ?? '').trim() || Object.keys(picsOf()).at(-1) || '';
+      return await lookAt(which, String(args.question ?? args.prompt ?? ''), signal);
+    }
+    const prompt = String(args.prompt ?? args.description ?? '').trim();
+    if (!prompt) return 'error: image_generate needs a prompt that says what the picture shows';
+    if (Object.keys(picsOf()).length >= IMAGES_PER_CHAT) return `error: this chat already keeps ${IMAGES_PER_CHAT} pictures; start a new chat for more`;
+    const from = [args.from ?? args.image ?? []].flat().map((x) => String(x).trim()).filter(Boolean);
+    const missing = from.find((n) => !picsOf()[n]);
+    if (missing) return `error: no picture named ${missing}. Pictures: ${Object.keys(picsOf()).join(', ') || '(none)'}`;
+    const model = String(args.model ?? '').startsWith('@') ? args.model : imageModel(from.length > 0);
+    const j = await harnessJson('/v1/image', { body: { model, prompt, width: args.width, height: args.height, steps: args.steps, seed: args.seed, images: from.map((n) => picsOf()[n]) }, signal });
+    const saved = pictureName(args.name || prompt.split(/\s+/).slice(0, 4).join('-'), j.type);
+    picsOf()[saved] = `data:${j.type};base64,${j.image}`;
+    touchConv();
+    return `made ${saved} with ${model.split('/').pop()}${from.length ? ' from ' + from.join(', ') : ''}. The user sees it in the chat. (Look at it with image_look before describing it.)`;
+  } catch (e) {
+    if (signal?.aborted) throw e;
+    return 'error: ' + e.message;
+  }
+}
+
+/* The picture a tool chip made, to show under it. */
+const madeBy = (t) => (t.name === 'image_generate' && !t.failed ? /^made (\S+) with/.exec(String(t.result ?? ''))?.[1] : null);
+
+/* ---- the hooks: this section adds its tools, its words for the model, and the picture under a tool's chip ---- */
+TOOLS.image_generate = { args: '{"prompt": "<the whole picture in words: subject, setting, style, light, framing>", "name": "<short file name>", "from": "<a picture\'s name, to change it or take after it>", "width": 1024, "height": 1024}', does: 'make a picture (or, with "from", a changed version of one of this chat\'s pictures); it is shown to the user and kept with the chat. name, from, width and height are optional', when: () => imageOn() };
+TOOLS.image_look = { args: '{"name": "<a picture\'s name>", "question": "<what you want to know>"}', does: 'have a vision model look at one of this chat\'s pictures (attached by the user, or made here) and answer a question about it', when: () => imageOn() };
+TOOL_RUNNERS.image_generate = (args, signal) => imageTool('image_generate', args, signal);
+TOOL_RUNNERS.image_look = (args, signal) => imageTool('image_look', args, signal);
+PROMPT_NOTES.push(() => (imageOn() ? 'PICTURES: you can make pictures with image_generate and see pictures only through image_look (or the description you are given when the user attaches one). Write a full prompt for a picture. Never say what a picture shows unless a description or image_look told you.' + (Object.keys(picsOf()).length ? ' Pictures in this chat: ' + Object.keys(picsOf()).join(', ') + '.' : '') : ''));
+CHIP_EXTRAS.push((t) => { const name = madeBy(t); return name ? thumbs([name]) : null; });
+
 /* ============================================================ the loop */
 
 /* What a reply asks for: {tool, args, say, cut?}, {broken}, or null when it is the answer (toolCall, above). */
@@ -2889,6 +3039,7 @@ function systemPrompt() {
     'A tool call that failed is not repeated unchanged: read its error and change the call, or go another way. ' +
     'A web page some sites refuse to serve may come back from the Internet Archive; its result says so and gives the copy\'s date, which you pass on to the user. If web_search fails, fetch a likely page directly with web_fetch. You cannot reach the user\'s computer or its files from here; say so when it matters.\n' +
     plan + inRepo + browser + garrett + '\n' +
+    PROMPT_NOTES.map((f) => f()).filter(Boolean).map((x) => x + '\n').join('') +
     (S.context ? '\nREFERENCE (from garrettstimpson.ca/llms.txt, about the people and projects behind this veil; answer questions about Agent Garrett, NL-VEIL and their author from it, with its links):\n' + S.context + '\n' : '') +
     'Today is ' + new Date().toISOString().slice(0, 10) + '.';
 }
@@ -2900,7 +3051,7 @@ function pastTurns(msgs) {
   for (let i = msgs.length - 1; i >= 0 && room > 0; i--) {
     const m = msgs[i];
     if (m.role !== 'user' && m.role !== 'assistant') continue;
-    const content = clip(m.content, m.role === 'assistant' ? 4000 : 6000);
+    const content = clip(m.content + (m.seen ?? ''), m.role === 'assistant' ? 4000 : 6000);
     room -= content.length;
     out.unshift({ role: m.role, content });
   }
@@ -2950,13 +3101,14 @@ function shownWhileStreaming(t) {
   return cut >= 0 ? t.slice(0, cut).trim() : /^\s*(```\w*\s*)?\{/.test(t) ? '' : t;
 }
 
-async function runTurn(text) {
+async function runTurn(text, images = []) {
   const conv = S.conv;
   conv.plan = [];   // a plan belongs to the turn that made it
   const history = pastTurns(conv.msgs);
   // the system prompt is rebuilt for every call: it carries the plan as it stands
   const headNow = () => [{ role: 'system', content: systemPrompt() }, ...history, { role: 'user', content: text }];
-  conv.msgs.push({ role: 'user', content: text });
+  const mine = { role: 'user', content: text, ...(images.length ? { images } : {}) };
+  conv.msgs.push(mine);
   if (conv.msgs.length === 1) conv.title = clip(text.replace(/\s+/g, ' '), 48);
   const abort = new AbortController();
   S.live = { tools: [], text: '', status: 'thinking…', abort };
@@ -2965,6 +3117,13 @@ async function runTurn(text) {
   let answer = '', error = '', review = null, nudged = false, idled = false, checked = false;
   const record = (name, args, say, result, raw) => rounds.push({ id: 'c' + (rounds.length + 1), name, args, say, result, ...(raw ? { raw } : {}) });
   try {
+    if (images.length) {
+      // the pictures are read once, in words, so that any model can work with them
+      S.live.status = images.length === 1 ? 'looking at the picture…' : 'looking at the pictures…';
+      drawLive();
+      mine.seen = await readAttached(images, text, abort.signal);
+      text += mine.seen;
+    }
     for (let n = 0; ; n++) {
       const { messages, folded } = buildMessages(headNow(), text, rounds);
       const step = n > 0 ? ` (step ${n + 1})` : '';
@@ -3234,7 +3393,7 @@ async function pullConvs() {
 
 function newConv() {
   repoClose();
-  S.conv = { id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6), title: 'New chat', at: Date.now(), msgs: [], files: {} };
+  S.conv = { id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6), title: 'New chat', at: Date.now(), msgs: [], files: {}, images: {} };
   S.file = null;
   S.open = [];
   S.filter = '';
@@ -3249,7 +3408,8 @@ async function openConv(id, quiet = false) {
   if (row?.fetch || !c) {
     try {
       const far = (await harnessJson('/v1/convs/' + id)).conv;
-      if (c?.repo) far.repo = c.repo;   // which folder a chat works in is this browser's own knowledge
+      if (c?.repo) far.repo = c.repo;
+      if (c?.images) far.images = c.images;   // a chat's pictures are kept in this browser only   // which folder a chat works in is this browser's own knowledge
       c = far;
       await db.put('conv:' + id, c);
       if (row) delete row.fetch;
@@ -3342,9 +3502,9 @@ const askSure = (text, yes = 'OK') => dialogBox((done) => [h('p', {}, text),
   h('div', { class: 'ask-acts' }, h('button', { class: 'btn btn-ghost btn-sm', onclick: () => done(null) }, 'Cancel'), h('button', { class: 'btn btn-solid btn-sm', id: 'askOk', autofocus: '', onclick: () => done(true) }, yes))]).then(Boolean);
 
 function toolChip(t) {
-  return h('details', { class: 'tool' + (t.failed ? ' failed' : '') + (t.running ? ' running' : '') },
+  return [h('details', { class: 'tool' + (t.failed ? ' failed' : '') + (t.running ? ' running' : '') },
     h('summary', {}, h('span', { class: 'mark' }, t.running ? '' : t.failed ? '✕' : '✓'), (t.name ?? t.tool) + ' ' + clip(JSON.stringify(t.args), 120)),
-    h('pre', {}, t.running ? 'running…' : t.result));
+    h('pre', {}, t.running ? 'running…' : t.result)), ...CHIP_EXTRAS.map((f) => f(t)).filter(Boolean)];
 }
 
 const drawnMsgs = new WeakSet();   // messages already shown once: a redraw must not replay their entrance
@@ -3359,11 +3519,11 @@ function planNode(plan) {
 }
 
 function messageNode(m) {
-  if (m.role === 'user') return h('div', { class: 'msg user' }, h('div', { class: 'role' }, 'you'), h('div', { class: 'body' }, m.content));
+  if (m.role === 'user') return h('div', { class: 'msg user' }, h('div', { class: 'role' }, 'you'), h('div', { class: 'body' }, m.content), thumbs(m.images));
   if (m.role === 'error') return h('div', { class: 'msg error' }, h('div', { class: 'role' }, 'error'), h('div', { class: 'body' }, m.content));
   return h('div', { class: 'msg assistant' }, h('div', { class: 'role' }, 'veil'),
     planNode(m.plan),
-    (m.tools ?? []).map(toolChip),
+    (m.tools ?? []).flatMap(toolChip),
     m.content ? h('div', { class: 'body md', html: render(m.content) }) : null,
     m.review && m.review.verdict !== 'unsure' ? h('div', { class: 'review ' + m.review.verdict, title: 'Clef answered "does this answer have a material problem?" with probability ' + m.review.p.toFixed(2) },
       m.review.verdict === 'clear' ? 'clef: reviewed, no problem found' : 'clef: flagged a problem; this is the corrected answer') : null);
@@ -3373,7 +3533,7 @@ function liveNode() {
   const L = S.live;
   return h('div', { class: 'msg assistant live', id: 'live' }, h('div', { class: 'role' }, 'veil'),
     planNode(S.conv.plan),
-    L.tools.map(toolChip),
+    L.tools.flatMap(toolChip),
     L.text ? h('div', { class: 'body md', html: render(L.text) }) : h('div', { class: 'status' }, h('span', { class: 'dots', 'aria-hidden': 'true' }, h('i'), h('i'), h('i')), L.status));
 }
 
@@ -4114,15 +4274,15 @@ document.addEventListener('keydown', (e) => {
 });
 
 function sidePane() {
-  const tab = (id, label) => h('button', { class: S.tab === id ? 'on' : '', role: 'tab', 'aria-selected': String(S.tab === id), onclick: () => { S.tab = id; S.note = ''; drawSide(); if (id === 'jobs') refreshJobs(); if (id === 'swarm') refreshSwarms(); if (id === 'harness') refreshStatus(); } }, label);
+  const tab = (id, label) => h('button', { class: S.tab === id ? 'on' : '', role: 'tab', 'aria-selected': String(S.tab === id), onclick: () => { S.tab = id; S.note = ''; drawSide(); if (id === 'jobs') refreshJobs(); if (id === 'swarm') refreshSwarms(); if (id === 'harness') refreshStatus(); SIDE_TABS.find((t) => t.id === id)?.open?.(); } }, label);
   const active = S.jobs.filter((j) => j.state === 'queued' || j.state === 'running').length;
   return h('aside', { class: 'side', id: 'side' },
-    h('div', { class: 'tabs', role: 'tablist' }, tab('code', 'Code'), tab('swarm', hive.list.some((x) => x.state === 'running') ? 'Swarm •' : 'Swarm'), tab('jobs', active ? `Jobs (${active})` : 'Jobs'), tab('harness', outdated() ? 'Harness •' : 'Harness'),
+    h('div', { class: 'tabs', role: 'tablist' }, tab('code', 'Code'), tab('swarm', hive.list.some((x) => x.state === 'running') ? 'Swarm •' : 'Swarm'), SIDE_TABS.map((t) => tab(t.id, t.label())), tab('jobs', active ? `Jobs (${active})` : 'Jobs'), tab('harness', outdated() ? 'Harness •' : 'Harness'),
       h('span', { class: 'grow' }),
       S.tab === 'code' ? h('button', { class: 'widen', 'aria-label': S.explorer ? 'Hide the explorer' : 'Show the explorer', 'aria-pressed': String(S.explorer), title: 'Explorer', onclick: () => { S.explorer = !S.explorer; drawSide(); } }, '☰') : null,
       h('button', { class: 'widen', 'aria-label': S.lay.chat ? 'Hide the chat' : 'Show the chat', 'aria-pressed': String(!S.lay.chat), title: S.lay.chat ? 'Hide the chat (more room for code)' : 'Show the chat', onclick: () => setLayout({ chat: !S.lay.chat }) }, S.lay.chat ? 'Hide chat' : 'Show chat'),
       h('button', { class: 'widen', 'aria-label': fullCode() ? 'Leave full screen' : 'Full screen', 'aria-pressed': String(fullCode()), title: fullCode() ? 'Leave full screen (Esc)' : 'Full screen', onclick: () => toggleFull() }, fullCode() ? 'Exit full screen' : 'Full screen')),
-    h('div', { class: 'pane tab-' + S.tab + (S.tab !== shownTab ? ' enter' : '') }, S.tab === 'code' ? codeTab() : S.tab === 'swarm' ? swarmTab() : S.tab === 'jobs' ? jobsTab() : harnessTab()));
+    h('div', { class: 'pane tab-' + S.tab + (S.tab !== shownTab ? ' enter' : '') }, S.tab === 'code' ? codeTab() : S.tab === 'swarm' ? swarmTab() : S.tab === 'jobs' ? jobsTab() : S.tab === 'harness' ? harnessTab() : (SIDE_TABS.find((t) => t.id === S.tab)?.draw() ?? codeTab())));
 }
 let shownTab = 'code';   // the tab the pane last drew: only a change of tab is an entrance
 
@@ -4163,10 +4323,12 @@ function drawSide() {
 function send(text) {
   const box = document.getElementById('prompt');
   const said = (text ?? box.value).trim();
-  if (!said || S.live) return;
+  if ((!said && !pics.attached.length) || S.live) return;
   box.value = '';
   box.style.height = 'auto';
-  runTurn(said);
+  // the pictures that were waiting go into the chat with this message
+  const names = pics.attached.splice(0).map((a) => { picsOf()[a.name] = a.url; return a.name; });
+  runTurn(said || (names.length === 1 ? 'Look at this picture.' : 'Look at these pictures.'), names);
 }
 
 const SUGGESTIONS = [
@@ -4213,17 +4375,20 @@ function dashboard() {
       linksBlock(),
       h('div', { class: 'who' }, h('span', { class: 'name', title: S.me?.email || '' }, S.me?.email || S.me?.account_name || 'Logged in with Cloudflare'),
         h('button', { class: 'btn btn-ghost btn-sm', onclick: () => logout() }, 'Log out'))),
-    h('main', { class: 'chat' },
+    h('main', { class: 'chat', ondragover: (e) => { if ([...(e.dataTransfer?.types ?? [])].includes('Files')) e.preventDefault(); },
+      ondrop: (e) => { const fs = [...(e.dataTransfer?.files ?? [])].filter((f) => f.type.startsWith('image/')); if (fs.length) { e.preventDefault(); attachPictures(fs); } } },
       S.lay.rail ? null : h('button', { class: 'btn btn-ghost btn-sm only-wide rail-reopen', title: 'Show the chats list', onclick: () => setLayout({ rail: true }) }, '☰ Chats'),
       transcript,
+      h('div', { class: 'attached', id: 'attached', hidden: '' }),
       h('div', { class: 'composer' },
-        h('textarea', { id: 'prompt', rows: '1', placeholder: 'Message the veil', 'aria-label': 'Message', onkeydown: (e) => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); } }, oninput: (e) => { e.target.style.height = 'auto'; e.target.style.height = Math.min(220, e.target.scrollHeight) + 'px'; } }),
+        imageOn() ? h('button', { class: 'icon-btn attach-btn', title: 'Attach a picture (or paste one, or drop one here)', 'aria-label': 'Attach a picture', onclick: () => { const i = h('input', { type: 'file', accept: 'image/*', multiple: '', hidden: '', onchange: () => { attachPictures([...i.files]); i.remove(); } }); document.body.append(i); i.click(); } }, '+') : null,
+        h('textarea', { id: 'prompt', rows: '1', placeholder: 'Message the veil', 'aria-label': 'Message', onpaste: (e) => { const fs = [...(e.clipboardData?.files ?? [])].filter((f) => f.type.startsWith('image/')); if (fs.length) { e.preventDefault(); attachPictures(fs); } }, onkeydown: (e) => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); } }, oninput: (e) => { e.target.style.height = 'auto'; e.target.style.height = Math.min(220, e.target.scrollHeight) + 'px'; } }),
         S.live ? h('button', { class: 'btn', onclick: () => S.live.abort.abort() }, 'Stop') : h('button', { class: 'btn btn-solid', onclick: () => send() }, 'Send'))),
     splitter(),
     sidePane(),
     h('div', { class: 'scrim', onclick: close }));
   applyLayout(shell);
-  queueMicrotask(() => { transcript.scrollTop = transcript.scrollHeight; if (!S.live && !S.panes.rail && !S.panes.side && matchMedia('(min-width: 981px)').matches) document.getElementById('prompt')?.focus(); });
+  queueMicrotask(() => { drawAttached(); transcript.scrollTop = transcript.scrollHeight; if (!S.live && !S.panes.rail && !S.panes.side && matchMedia('(min-width: 981px)').matches) document.getElementById('prompt')?.focus(); });
   return shell;
 }
 

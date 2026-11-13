@@ -13,7 +13,13 @@ window.VEIL_WEB = {
   deploy_url: "https://deploy.workers.cloudflare.com/?url=https://github.com/gary23w/nl-veil/tree/main/cloud/veil-web",
   script: "veil-web",
   /* The harness version this page was written for. An older one is offered its update. */
-  harness_version: 12,
+  harness_version: 13,
+
+  /* Pictures: the first of each list that the account has is used (the harness learns how each wants to be asked).
+     Making one from words; changing one or taking after one; reading one. */
+  image_models: ["@cf/black-forest-labs/flux-1-schnell", "@cf/black-forest-labs/flux-2-klein-4b"],
+  image_edit_models: ["@cf/black-forest-labs/flux-2-klein-4b", "@cf/black-forest-labs/flux-2-klein-9b", "@cf/black-forest-labs/flux-2-dev"],
+  vision_models: ["@cf/meta/llama-4-scout-17b-16e-instruct", "@cf/mistralai/mistral-small-3.1-24b-instruct"],
 
   /* Suggestions in the editor come from the first of these the account has; else from the chat's model. */
   complete_models: ["@cf/qwen/qwen2.5-coder-32b-instruct"],
