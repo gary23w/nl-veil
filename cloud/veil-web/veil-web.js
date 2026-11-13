@@ -53,7 +53,7 @@
 // No imports and no platform globals beyond fetch/Response/crypto, so a test can run this file under node with
 // a Map for storage and a scripted env.AI.
 
-export const VERSION = "4";
+export const VERSION = "5";
 const API_ROOT = "https://api.cloudflare.com/client/v4";
 const PY_SOURCE = "https://raw.githubusercontent.com/gary23w/nl-veil/main/cloud/tot_py.py";
 const SELF_SCRIPT = "veil-web";
@@ -82,6 +82,11 @@ const RESULT_MAX = 10000;
 const FETCH_TEXT_MAX = 200000;
 const MAX_TOKENS_CEIL = 16384;
 const AUTH_TTL_MS = 5 * 60 * 1000;
+// A model that spends its whole reply reasoning answers nothing. Which request field switches that off differs
+// by model and is LEARNED, never assumed from the model's name: each is tried in turn when a reply comes back
+// empty, and the one that produced an answer is remembered for that model.
+const QUIET_KNOBS = [{ enable_thinking: false }, { chat_template_kwargs: { thinking: false } }, { chat_template_kwargs: { enable_thinking: false } }, { reasoning_effort: "low" }];
+const EXTRA_KEYS = new Set(["enable_thinking", "chat_template_kwargs", "reasoning_effort"]); // what a caller may add to a model request
 const DENY_TTL_MS = 60 * 1000; // a refused token is not asked about again for this long
 const MODELS_TTL_MS = 15 * 60 * 1000;
 const LLMS_TTL_MS = 24 * 3600 * 1000;
@@ -175,71 +180,224 @@ export function searchResults(html, engine) {
   return out;
 }
 
-/// The text of a model answer, whatever envelope the model's family uses, reasoning blocks removed.
-export function answerText(r) {
-  const flat = (c) => (typeof c === "string" ? c : Array.isArray(c) ? c.map((p) => (typeof p === "string" ? p : (p?.text ?? p?.content ?? ""))).join("") : "");
-  let t = "";
-  if (typeof r === "string") t = r;
-  else if (r && typeof r === "object") {
-    for (const c of [r.response, r.result?.response, r.output_text, r.choices?.[0]?.message?.content, r.choices?.[0]?.text]) {
-      t = flat(c);
-      if (t) break;
-    }
+// ---- reading what a model sent: one reader for every dialect measured on Workers AI (2026-11-13) ----
+// Models asked for `{"tool": ..., "args": {...}}` answer in many shapes: the JSON as text, fenced, or pretty
+// printed; the JSON already parsed into an OBJECT by the API; an OpenAI `tool_calls` list; their own markup
+// (`<|tool_call>call:write_file {content: \`...\`, path: "x"}<tool_call|>`, `<tool_call>{...}</tool_call>`,
+// `name<|tool_call_argument_begin|>{...}`); arguments flat beside the tool's name; a first key that lost a
+// quote; `write\_file`. A reply can also be cut off at its length limit in the middle of a call.
+
+/// The text of a model reply, whatever envelope its family uses. An object where text was expected is the
+/// model's JSON already parsed: it is put back as JSON. A reply that is only `tool_calls` becomes the call.
+function modelText(r) {
+  const flat = (c) => (typeof c === "string" ? c : Array.isArray(c) ? c.map((p) => (typeof p === "string" ? p : (p?.text ?? p?.content ?? ""))).join("") : c && typeof c === "object" ? JSON.stringify(c) : "");
+  if (typeof r === "string") return r;
+  if (!r || typeof r !== "object") return "";
+  const msg = r.choices?.[0]?.message ?? r.choices?.[0]?.delta;
+  for (const c of [r.response, r.result?.response, r.output_text, msg?.content, r.choices?.[0]?.text]) {
+    const t = flat(c);
+    if (t) return t;
   }
-  return t.replace(/<think>[\s\S]*?<\/think>/gi, "").replace(/<think>[\s\S]*$/i, "").trim();
+  const call = (r.tool_calls ?? msg?.tool_calls ?? [])[0];
+  if (call && typeof call === "object") {
+    const f = call.function && typeof call.function === "object" ? call.function : call;
+    let args = f.arguments ?? f.args ?? {};
+    if (typeof args === "string") {
+      try {
+        args = JSON.parse(args);
+      } catch {
+        args = {};
+      }
+    }
+    if (typeof f.name === "string" && f.name) return JSON.stringify({ tool: f.name, args });
+  }
+  return "";
 }
 
-/// The first JSON object in a reply and where it starts (cloud/tot.js firstJson).
-function firstJson(text) {
-  const s = String(text ?? "");
-  for (let from = s.indexOf("{"); from >= 0; from = s.indexOf("{", from + 1)) {
-    let depth = 0, inStr = false, esc = false;
-    for (let i = from; i < s.length; i++) {
-      const c = s[i];
-      if (inStr) {
-        if (esc) esc = false;
-        else if (c === "\\") esc = true;
-        else if (c === '"') inStr = false;
+/// One value in JSON or in the looser object syntax models write (unquoted keys, single quotes, backtick
+/// strings, raw line breaks in strings, trailing commas), starting at s[i]. Returns [value, index after it].
+/// Throws "cut" when the text ends before the value does, and "bad" on anything it cannot read.
+function looseValue(s, i) {
+  const ws = () => {
+    while (i < s.length && /\s/.test(s[i])) i++;
+  };
+  const end = () => {
+    if (i >= s.length) throw new Error("cut");
+  };
+  ws();
+  end();
+  const c = s[i];
+  if (c === "{") {
+    const out = {};
+    i++;
+    for (;;) {
+      ws();
+      end();
+      if (s[i] === "}") return [out, i + 1];
+      let key;
+      if (s[i] === '"' || s[i] === "'" || s[i] === "`") [key, i] = looseValue(s, i);
+      else {
+        const m = /^[A-Za-z_$][\w$-]*/.exec(s.slice(i, i + 80));
+        if (!m) throw new Error("bad");
+        key = m[0];
+        i += key.length;
+      }
+      ws();
+      end();
+      if (s[i] !== ":" && s[i] !== "=") throw new Error("bad");
+      i++;
+      let v;
+      [v, i] = looseValue(s, i);
+      out[String(key)] = v;
+      ws();
+      end();
+      if (s[i] === ",") i++;
+      else if (s[i] !== "}") throw new Error("bad");
+    }
+  }
+  if (c === "[") {
+    const out = [];
+    i++;
+    for (;;) {
+      ws();
+      end();
+      if (s[i] === "]") return [out, i + 1];
+      let v;
+      [v, i] = looseValue(s, i);
+      out.push(v);
+      ws();
+      end();
+      if (s[i] === ",") i++;
+      else if (s[i] !== "]") throw new Error("bad");
+    }
+  }
+  if (c === '"' || c === "'" || c === "`") {
+    let out = "";
+    i++;
+    for (;;) {
+      end();
+      const ch = s[i];
+      if (ch === c) return [out, i + 1];
+      if (ch === "\\") {
+        i++;
+        end();
+        const e = s[i];
+        if (e === "u" && /^[0-9a-fA-F]{4}$/.test(s.slice(i + 1, i + 5))) {
+          out += String.fromCharCode(parseInt(s.slice(i + 1, i + 5), 16));
+          i += 5;
+          continue;
+        }
+        out += { n: "\n", t: "\t", r: "\r", b: "\b", f: "\f", 0: "\0" }[e] ?? e;
+        i++;
         continue;
       }
-      if (c === '"') inStr = true;
-      else if (c === "{") depth++;
-      else if (c === "}" && --depth === 0) {
+      out += ch;
+      i++;
+    }
+  }
+  const lit = /^(?:-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|true|false|null|undefined)/.exec(s.slice(i, i + 40));
+  if (!lit) throw new Error("bad");
+  const word = lit[0];
+  return [word === "true" ? true : word === "false" ? false : word === "null" || word === "undefined" ? null : Number(word), i + word.length];
+}
+
+/// What a reply asks for. {tool, args, say, cut?} when it is a tool call (`say` = what was said before it;
+/// `cut` = a fenced block it relied on never closed); {broken: why} when it began a call that cannot be read,
+/// which is what a reply cut off at its length limit looks like; null when it is the answer.
+/// `known` is the list of tool names: prose that merely contains JSON stays an answer.
+function toolCall(reply, known) {
+  const text = String(reply ?? "").replace(/\\_/g, "_");
+  const names = new Set(known);
+  const finish = (name, args, at, endAt) => {
+    if (!args || typeof args !== "object" || Array.isArray(args)) args = {};
+    // {"arguments": {...}} or {"args": {...}} alone is a wrapper, not the arguments
+    for (const k of ["args", "arguments", "parameters", "input"]) {
+      if (Object.keys(args).length === 1 && args[k] && typeof args[k] === "object" && !Array.isArray(args[k])) args = args[k];
+      else if (Object.keys(args).length === 1 && typeof args[k] === "string") {
         try {
-          const v = JSON.parse(s.slice(from, i + 1));
-          if (v && typeof v === "object" && !Array.isArray(v)) return v;
+          const inner = JSON.parse(args[k]);
+          if (inner && typeof inner === "object") args = inner;
         } catch {}
-        break;
       }
     }
+    const out = { tool: String(name).replace(/^functions?[.:]/, ""), args, say: text.slice(0, at).replace(/```\w*\s*$/, "").replace(/<\|?[\w|]*$/, "").trim().slice(0, 700) };
+    // A long file sent as a call WITHOUT its content, followed by the text in a fenced block: nothing to escape.
+    if ((out.tool === "write_file" || out.tool === "append_file") && typeof args.content !== "string" && typeof args.text !== "string") {
+      // (a call that was itself fenced closes its fence first; a model's closing tag may sit between)
+      const fence = /^\s*(?:```[ \t]*\r?\n\s*)?(?:<\|?\/?tool_call\|?>\s*)?```[\w.+-]*[ \t]*\r?\n([\s\S]*?)(\r?\n```|$)/.exec(text.slice(endAt));
+      if (fence) {
+        args.content = fence[1] + (fence[2] ? "\n" : "");   // a whole block is whole lines, so parts join cleanly
+        if (!fence[2]) out.cut = true;
+      }
+    }
+    return out;
+  };
+
+  // 1. a model's own tool-call markup
+  const mark = /<\|?tool_call(?:_begin)?\|?>\s*(?:call\s*[:=]\s*)?(?:functions?[.:])?([A-Za-z_][\w-]*)?(?::\d+)?\s*(?:<\|tool_call_argument_begin\|>)?\s*(?=\{)|(?:functions?[.:])?([A-Za-z_][\w-]*)(?::\d+)?\s*<\|tool_call_argument_begin\|>\s*(?=\{)/.exec(text);
+  if (mark) {
+    const at = mark.index + mark[0].length;
+    let obj, endAt;
+    try {
+      [obj, endAt] = looseValue(text, at);
+    } catch (e) {
+      return { broken: e.message === "cut" ? "cut off before the call ended" : "not readable as a tool call" };
+    }
+    const named = mark[1] ?? mark[2];
+    if (named) return finish(named, obj, mark.index, endAt);
+    const inner = [obj.tool, obj.name, obj.tool_name].find((v) => typeof v === "string" && v);
+    if (!inner) return { broken: "a tool call with no tool name" };
+    return finish(inner, obj.args ?? obj.arguments ?? obj.parameters ?? obj.input ?? Object.fromEntries(Object.entries(obj).filter(([k]) => !["tool", "name", "tool_name", "type", "id"].includes(k))), mark.index, endAt);
+  }
+
+  // 2. an object: at the start of the reply (after an optional fence), or the first one anywhere that names a tool
+  const lead = /^\s*(?:```[\w-]*\s*)?(?=\{)/.exec(text);
+  const tries = [];
+  if (lead) tries.push(lead[0].length);
+  for (let at = text.indexOf("{"); at >= 0 && tries.length < 12; at = text.indexOf("{", at + 1)) if (!tries.includes(at)) tries.push(at);
+  for (const at of tries) {
+    let obj, endAt;
+    try {
+      [obj, endAt] = looseValue(text, at);
+    } catch (e) {
+      // an object the reply OPENS with, that begins like a call and never closes, is a call that was cut off
+      if (lead && at === lead[0].length && /^\{\s*["'`]?(?:tool|name|tool_name|tool_calls|function)["'`]?\s*[:=]/.test(text.slice(at, at + 60))) return { broken: e.message === "cut" ? "cut off before the call ended" : "not readable as a tool call" };
+      continue;
+    }
+    let c = obj;
+    if (!c || typeof c !== "object" || Array.isArray(c)) continue;
+    if (Array.isArray(c.tool_calls) && c.tool_calls[0] && typeof c.tool_calls[0] === "object") c = c.tool_calls[0];
+    if (c.function && typeof c.function === "object") c = c.function;
+    const name = [c.tool, c.name, c.tool_name].find((v) => typeof v === "string" && v.length > 0);
+    const opens = !!lead && at === lead[0].length;
+    if (!name || !(names.has(name.replace(/^functions?[.:]/, "")) || (opens && typeof c.tool === "string"))) continue;
+    let args = [c.args, c.arguments, c.parameters, c.input].find((v) => v !== undefined && v !== null);
+    if (typeof args === "string") {
+      try {
+        args = JSON.parse(args);
+      } catch {
+        args = undefined;
+      }
+    }
+    if (!args || typeof args !== "object" || Array.isArray(args)) {
+      // the fields flat beside the tool's name are its arguments; a first key that lost a quote reads `args: {url`
+      const skip = new Set(["tool", "name", "tool_name", "args", "arguments", "parameters", "input", "type", "id"]);
+      args = {};
+      for (const [k, v] of Object.entries(c)) if (!skip.has(k)) args[/^(?:args|arguments|parameters|input)\W+(\w+)$/.exec(k)?.[1] ?? k] = v;
+    }
+    return finish(name, args, at, endAt);
   }
   return null;
 }
 
-/// What a job's reply asks for: {tool, args} or null when it is the answer.
+/// The text of a model answer with any reasoning block removed.
+export function answerText(r) {
+  return modelText(r).replace(/<think>[\s\S]*?<\/think>/gi, "").replace(/<think>[\s\S]*$/i, "").trim();
+}
+
+/// What a job's reply asks for: {tool, args, cut?}, {broken}, or null when it is the answer.
 export function parseAction(reply, known) {
-  let c = firstJson(reply);
-  if (!c) return null;
-  if (Array.isArray(c.tool_calls) && c.tool_calls[0] && typeof c.tool_calls[0] === "object") c = c.tool_calls[0];
-  if (c.function && typeof c.function === "object") c = c.function;
-  const name = [c.tool, c.name, c.tool_name].find((v) => typeof v === "string" && v.length > 0);
-  if (!name || !(known.includes(name) || typeof c.tool === "string")) return null;
-  let args = [c.args, c.arguments, c.parameters, c.input].find((v) => v !== undefined && v !== null);
-  if (typeof args === "string") {
-    try {
-      args = JSON.parse(args);
-    } catch {
-      args = {};
-    }
-  }
-  if (!args || typeof args !== "object" || Array.isArray(args)) {
-    // a model that writes {"tool": "swarm", "task": "...", "angles": [...]} means those fields as the arguments
-    const skip = new Set(["tool", "name", "tool_name", "args", "arguments", "parameters", "input", "type", "id"]);
-    args = {};
-    // and one that drops a quote writes the first key as `args: {url`: the name after the brace is the key
-    for (const [k, v] of Object.entries(c)) if (!skip.has(k)) args[/^(?:args|arguments|parameters|input)\W+(\w+)$/.exec(k)?.[1] ?? k] = v;
-  }
-  return { tool: name, args };
+  return toolCall(reply, known);
 }
 
 /// llms.txt cut down to what the veil should carry: its opening, About, Topics, and only the posts that are
@@ -268,7 +426,8 @@ const JOB_TOOLS = {
   web_search: '{"query": "<words>"} : search the web',
   web_fetch: '{"url": "<https://...>"} : read a web page as text',
   http_request: '{"url": "<https://...>", "method": "GET", "headers": {}, "body": ""} : any HTTP call, raw answer',
-  write_file: '{"name": "<path>", "content": "<the whole file>"} : keep a file with this job',
+  write_file: '{"name": "<path>", "content": "<text>"} : keep a file with this job',
+  append_file: '{"name": "<path>", "content": "<text>"} : add to the end of one of this job\'s files',
   read_file: '{"name": "<path>"} : read one of this job\'s files',
   list_files: "{} : list this job's files",
   run_python: '{"code": "<python>"} : run Python (the job\'s files are beside the script; files it changes are kept)',
@@ -394,9 +553,29 @@ export class Harness {
 
   async model(model, messages, maxTokens) {
     const sent = messages.reduce((n, m) => n + m.content.length, 0);
-    const reply = answerText(await this.env.AI.run(model, { messages, max_tokens: maxTokens }));
-    await this.spend(1, sent + reply.length);
-    return reply;
+    const quirks = (await this.store.get("quirks")) ?? {};
+    const known = quirks[model]?.quiet;
+    const ask = async (extra, room) => {
+      const reply = answerText(await this.env.AI.run(model, { messages, max_tokens: room, ...(extra ?? {}) }));
+      await this.spend(1, sent + reply.length);
+      return reply;
+    };
+    let reply = await ask(known !== undefined ? QUIET_KNOBS[known] : null, maxTokens);
+    if (reply) return reply;
+    // nothing came back: the room went on reasoning. Try the knobs, then three times the room.
+    for (let i = 0; i < QUIET_KNOBS.length && !reply; i++) {
+      if (i === known) continue;
+      try {
+        reply = await ask(QUIET_KNOBS[i], maxTokens);
+      } catch {
+        continue; // a model that rejects the field is not one it works on
+      }
+      if (reply) {
+        quirks[model] = { quiet: i };
+        await this.store.put("quirks", quirks);
+      }
+    }
+    return reply || (await ask(null, Math.min(MAX_TOKENS_CEIL, maxTokens * 3)));
   }
 
   async httpCall(spec) {
@@ -813,9 +992,11 @@ export class Harness {
         return `HTTP ${r.status} ${r.url}\n\n${r.text}`;
       }
       case "write_file":
+      case "append_file":
         if (!f || f.length > 200 || f.includes("..")) return "error: bad file name";
-        job.files[f] = String(args.content ?? "");
-        return `wrote ${f} (${job.files[f].length} characters)`;
+        if (typeof (args.content ?? args.text) !== "string") return `error: ${name} needs content: put it in args, or leave it out and follow the call with the text in one fenced code block`;
+        job.files[f] = (name === "append_file" ? (job.files[f] ?? "") : "") + String(args.content ?? args.text);
+        return `${name === "append_file" ? "appended to" : "wrote"} ${f} (${job.files[f].length} characters now)`;
       case "read_file":
         return f in job.files ? job.files[f] : `error: no file named ${f}`;
       case "list_files":
@@ -861,7 +1042,7 @@ export class Harness {
     const tools = Object.entries(JOB_TOOLS).map(([n, t]) => `- ${n} ${t}`).join("\n");
     const ref = (await this.context()).digest;
     const head = [
-      { role: "system", content: "You are the veil, working on a queued job with nobody watching. Work the task to the end with these tools:\n" + tools + '\n\nTo use a tool, reply with exactly ONE JSON object and nothing else: {"tool": "<name>", "args": {...}}. When the job is done, or cannot go further, reply in plain text with what was done and what the tool results showed. Never claim something no tool result shows.' + (ref ? "\n\nREFERENCE (from garrettstimpson.ca/llms.txt, about the people and projects behind this veil):\n" + ref : "") },
+      { role: "system", content: "You are the veil, working on a queued job with nobody watching. Work the task to the end with these tools:\n" + tools + '\n\nTo use a tool, reply with exactly ONE JSON object and nothing else: {"tool": "<name>", "args": {...}}. When the job is done, or cannot go further, reply in plain text with what was done and what the tool results showed. Never claim something no tool result shows. A long file is easier sent as the call WITHOUT content followed by the file text in one fenced code block, and in parts: write_file the first part, append_file the rest.' + (ref ? "\n\nREFERENCE (from garrettstimpson.ca/llms.txt, about the people and projects behind this veil):\n" + ref : "") },
       { role: "user", content: job.task },
     ];
     const pairs = job.rounds.map((r) => [
@@ -877,6 +1058,17 @@ export class Harness {
       job.result = reply;
       job.state = "done";
       return true;
+    }
+    if (act.broken) {
+      // a call that could not be read is told so, as a round, and counts toward the same-failure stop
+      const last = job.rounds.at(-1);
+      if (job.rounds.slice(-2).filter((r) => r.tool === "(unreadable call)").length === 2) {
+        job.state = "failed";
+        job.error = "stopped: three tool calls in a row could not be read (" + act.broken + ")";
+        return true;
+      }
+      job.rounds.push({ tool: "(unreadable call)", args: {}, result: `error: that tool call was ${act.broken}. Replies have a length limit. Send the call again, complete; for a long file send write_file with the first part (about 100 lines) and append_file for the rest.` });
+      return false;
     }
     if (job.rounds.length >= JOB_ROUNDS) {
       job.state = "failed";
@@ -895,6 +1087,7 @@ export class Harness {
     } catch (e) {
       result = "error: " + clip(e?.message ?? e, 300);
     }
+    if (act.cut) result += " NOTE: the code block was cut off before its closing fence. Continue the file from exactly where it stops with append_file.";
     job.rounds.push({ tool: act.tool, args: act.args, result: clip(result, RESULT_MAX) });
     return false;
   }
@@ -1028,9 +1221,11 @@ export class Harness {
       const maxTokens = Math.min(MAX_TOKENS_CEIL, Math.max(16, Number.parseInt(body.max_tokens, 10) || 2048));
       const messages = body.messages.map((m) => ({ role: String(m?.role ?? "user"), content: String(m?.content ?? "") }));
       const sent = messages.reduce((n, m) => n + m.content.length, 0);
+      const extra = {};
+      if (body.extra && typeof body.extra === "object") for (const [k, v] of Object.entries(body.extra)) if (EXTRA_KEYS.has(k)) extra[k] = v;
       try {
         if (body.stream === true) {
-          const stream = await this.env.AI.run(model, { messages, max_tokens: maxTokens, stream: true });
+          const stream = await this.env.AI.run(model, { messages, max_tokens: maxTokens, stream: true, ...extra });
           if (stream instanceof ReadableStream) {
             let got = 0;
             const meter = new TransformStream({ transform: (chunk, c) => { got += chunk.byteLength ?? chunk.length ?? 0; c.enqueue(chunk); }, flush: () => this.spend(1, sent + got) });
@@ -1039,7 +1234,7 @@ export class Harness {
           await this.spend(1, sent + JSON.stringify(stream ?? "").length);
           return say({ ok: true, reply: stream });
         }
-        const reply = await this.env.AI.run(model, { messages, max_tokens: maxTokens });
+        const reply = await this.env.AI.run(model, { messages, max_tokens: maxTokens, ...extra });
         await this.spend(1, sent + JSON.stringify(reply ?? "").length);
         return say({ ok: true, reply });
       } catch (e) {
