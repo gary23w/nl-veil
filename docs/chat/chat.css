@@ -222,6 +222,11 @@ button:disabled, .btn[aria-disabled=true] { opacity: .5; cursor: default; pointe
 .md th, .md td { border: 1px solid var(--border); padding: 4px 9px; }
 .md th { background: var(--table-head-bg); }
 .md blockquote { border-left: 3px solid var(--border); padding-left: 10px; color: var(--text-secondary); }
+.plan { list-style: none; margin: 4px 0 8px; padding: 8px 10px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface-raised); font-size: var(--fs-ui); }
+.plan li { display: flex; gap: 8px; padding: 2px 0; color: var(--text-secondary); transition: color var(--calm) var(--ease); }
+.plan li.done { color: var(--text-muted); text-decoration: line-through; text-decoration-color: color-mix(in srgb, var(--text-muted) 50%, transparent); }
+.plan .tick { flex: 0 0 auto; width: 1.1em; text-align: center; color: var(--text-muted); }
+.plan li.done .tick { color: var(--success); }
 .status { color: var(--text-muted); font-size: var(--fs-ui); font-style: italic; display: flex; align-items: center; gap: 8px; }
 .dots { display: inline-flex; gap: 3px; }
 .dots i { width: 5px; height: 5px; border-radius: 50%; background: var(--brand); animation: blink 1.1s infinite; }
