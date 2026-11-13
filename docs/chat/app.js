@@ -878,6 +878,10 @@ const TOOLS = {
   swarm_say: { args: '{"id": "<swarm>", "text": "<guidance>"}', does: 'tell a running swarm something: its coordinator follows it from the next round', when: () => swarmOn() },
   swarm_stop: { args: '{"id": "<swarm>"}', does: 'stop a swarm', when: () => swarmOn() },
   swarm_files: { args: '{"id": "<swarm>"}', does: 'copy a swarm\'s shared files into this workspace', when: () => swarmOn() },
+  swarm_pause: { args: '{"id": "<swarm>"}', does: 'pause a running swarm: it keeps its place and goes on when resumed', when: () => swarmOn() },
+  swarm_resume: { args: '{"id": "<swarm>"}', does: 'resume a paused swarm', when: () => swarmOn() },
+  swarm_goal: { args: '{"id": "<swarm>", "goal": "<the new goal: what done looks like>"}', does: 'give a running or paused swarm a new goal; it works toward it from its next round', when: () => swarmOn() },
+  swarm_delete: { args: '{"id": "<swarm>"}', does: 'delete a swarm that has ended, with its record and files (stop a live one first)', when: () => swarmOn() },
   run_command: { args: '{"command": "<one line>"}', does: 'run a line in the workspace terminal and get what it printed. It is a small shell over the workspace: pipes, && || ;, > file, $VARS; ls cat grep find sed sort head tail wc diff tree; python file.py, pip install name, node file.js, curl url, git status|commit|push (a clone); uname, date, env. A command that needs a real computer (npm, gcc, docker) is sent to one of the machines the user owns when one is online and set to run work; otherwise it says so' },
   run_python: { args: '{"code": "<python>"}', does: 'run a Python script; the workspace files are beside it and text files it creates or changes come back into the workspace. Print what you want to see' },
   garrett_tools: { args: '{"query": "<words, optional>"}', does: 'list Agent Garrett\'s security tools (those matching the words)', when: () => S.status?.garrett?.connected },
@@ -965,6 +969,7 @@ async function runToolInner(name, args, signal) {
       return `${f}, lines ${from}-${to} of ${lines.length}${repo.partial.has(f) ? ' loaded (the file is larger: only its first part is loaded)' : ''}:\n` + lines.slice(from - 1, to).join('\n') + (to < lines.length ? `\n(more below: read on with "from": ${to + 1})` : '');
     }
     case 'swarm_deploy': case 'swarm_list': case 'swarm_status': case 'swarm_say': case 'swarm_stop': case 'swarm_files':
+    case 'swarm_pause': case 'swarm_resume': case 'swarm_goal': case 'swarm_delete':
       return swarmTool(name, args);
     case 'run_command': {
       const line = String(args.command ?? args.cmd ?? args.line ?? '').trim();
@@ -2984,6 +2989,24 @@ async function swarmTool(name, args) {
       }
       case 'swarm_stop':
         return 'stopped. ' + swarmReport(await swarmOp(pick(), { op: 'stop' }));
+      case 'swarm_pause': case 'swarm_resume': {
+        const sw = await swarmOp(pick(), { op: name === 'swarm_pause' ? 'pause' : 'resume' });
+        return (name === 'swarm_pause' ? 'paused. ' : 'resumed. ') + swarmReport(sw);
+      }
+      case 'swarm_goal': {
+        const goal = String(args.goal ?? args.text ?? '').trim();
+        if (goal.length < 8) return 'error: swarm_goal needs the new goal, 8 characters or more';
+        await swarmOp(pick(), { op: 'set_goal', goal });
+        return 'the swarm works toward the new goal from its next round';
+      }
+      case 'swarm_delete': {
+        const row = hive.list.find((x) => x.id === pick());
+        if (row.state === 'running' || row.state === 'paused') return `error: swarm ${row.name} is ${row.state}: stop it first with swarm_stop`;
+        await harnessJson('/v1/swarms/' + row.id, { method: 'DELETE' });
+        if (hive.open?.id === row.id) hive.open = null;
+        await refreshSwarms();
+        return `deleted swarm ${row.name} (${row.id})`;
+      }
       case 'swarm_files': {
         const sw = (await harnessJson('/v1/swarms/' + pick())).swarm;
         const names = Object.keys(sw.files);
@@ -3115,6 +3138,324 @@ function doorBlock() {
     h('div', { class: 'acts' }, name, h('button', { class: 'btn btn-sm', disabled: door.busy, onclick: make }, door.busy ? 'Making…' : 'Make a key')),
     h('p', { class: 'fine' }, 'Tasks a key\'s holder hands over run on the chat\'s model as it was when the key was made (' + S.model.split('/').pop() + ' now).'));
 }
+
+/* ============================================================ studio: the chat at the controls of pictures and films */
+
+/* What the Images and Video tabs do by hand, as tools the chat can use: read the gallery, bring a picture into the
+   chat, mark or delete pictures, fill the Images tab's queue, change its settings; open, write, edit, make, play,
+   export and delete films. The harness makes pictures and plans films too (its jobs, a swarm's minds, a program at
+   the MCP door): what it keeps is brought into this browser's gallery and film list here. Deleting asks the user. */
+
+const studio = {
+  seen: new Set(ls.get('veilweb.studio.seen', [])),   // harness pictures already taken into the gallery
+  opened: ls.get('veilweb.studio.films', {}),        // harness storyboard id -> the film made of it here
+  films: [],     // the harness's storyboards: [{id, at, title, shots, by}]
+  at: 0,
+  note: '',
+};
+const keepsOn = () => imageOn() && !!S.status && Number(S.status.version) >= 17;
+
+/* Take what the harness keeps into this browser: its pictures into the gallery (oldest first, so the newest ends
+   on top), its storyboards into the film list. At most once a minute unless asked. */
+async function studioSync(force) {
+  if (!keepsOn() || (!force && Date.now() - studio.at < 60000)) return 0;
+  studio.at = Date.now();
+  let n = 0;
+  try {
+    await artLoad();
+    const { pics } = await harnessJson('/v1/pics');
+    for (const r of [...pics].reverse()) {
+      if (studio.seen.has(r.id) || art.list.some((x) => x.hid === r.id)) continue;
+      const { picture } = await harnessJson('/v1/pics/' + r.id);
+      await artKeep(b64Blob(picture.image, picture.type), { model: picture.model, prompt: picture.prompt, kind: 'harness', hid: r.id, by: picture.by, at: picture.at });
+      studio.seen.add(r.id);
+      n++;
+    }
+    studio.films = (await harnessJson('/v1/films')).films ?? [];
+    studio.note = '';
+  } catch (e) {
+    studio.note = e.message;
+  }
+  if (n) { ls.set('veilweb.studio.seen', [...studio.seen].slice(-400)); artRefresh(); }
+  return n;
+}
+setInterval(() => { if (!document.hidden && keepsOn()) studioSync(); }, 15000);
+
+/* A picture of the gallery, by its id, or by the name it has in this chat. */
+function studioPic(x) {
+  const k = String(x ?? '').trim();
+  return artRow(k) ?? art.list.find((r) => r.hid === k) ?? art.list.find((r) => r.name === k && r.conv === S.conv?.id) ?? null;
+}
+const picLine = (r) => `${r.id}  ${r.w}x${r.h}  ${r.model ? shortModel(r.model) : r.kind}${r.fav ? '  ★' : ''}${r.name && r.conv === S.conv?.id ? `  (in this chat as ${r.name})` : ''}${r.by ? '  made by ' + r.by : ''}  ${clip(r.prompt || '(no prompt)', 110)}`;
+const nums = (v) => [v ?? []].flat().map((x) => Math.floor(Number(x))).filter((x) => Number.isFinite(x));
+
+async function studioImageTool(name, args, signal) {
+  if (!artOn()) return 'error: this harness is older than the gallery tools: update it in the Harness tab';
+  await artLoad();
+  await studioSync(name === 'image_list');
+  switch (name) {
+    case 'image_list': {
+      const words = String(args.query ?? '').toLowerCase().split(/\s+/).filter(Boolean);
+      const rows = art.list.filter((r) => (!args.favourites || r.fav) && words.every((w) => (r.prompt + ' ' + r.model + ' ' + r.kind + ' ' + (r.by ?? '')).toLowerCase().includes(w)));
+      const limit = Math.min(100, Math.max(1, Math.floor(Number(args.limit)) || 20));
+      const waiting = art.queue.filter((q) => q.state === 'waiting' || q.state === 'making').length;
+      return `${art.list.length} pictures in the gallery${rows.length !== art.list.length ? `, ${rows.length} match` : ''}${waiting ? `; ${waiting} in the queue` : ''}. Newest first:\n` + (rows.slice(0, limit).map(picLine).join('\n') || '(none)') + (rows.length > limit ? `\n(${rows.length - limit} more: raise "limit")` : '');
+    }
+    case 'image_pick': {
+      const r = studioPic(args.id ?? args.picture);
+      if (!r) return `error: no picture ${args.id ?? ''} in the gallery. image_list shows them`;
+      if (r.name && r.conv === S.conv.id && picsOf()[r.name]) return `picture ${r.id} is already in this chat as ${r.name}`;
+      if (Object.keys(picsOf()).length >= IMAGES_PER_CHAT) return `error: this chat already keeps ${IMAGES_PER_CHAT} pictures`;
+      const nm = await artToChat(r, args.name);
+      await artIndex();
+      touchConv();
+      return `picture ${r.id} is in this chat as ${nm}: image_look reads it, image_generate takes it as "from", image_save puts it in the workspace, video_edit puts it in a shot`;
+    }
+    case 'image_manage': {
+      const rows = [args.ids ?? args.id ?? args.pictures ?? []].flat().map(studioPic).filter(Boolean);
+      if (!rows.length) return 'error: name the pictures by id (image_list shows them)';
+      const act = String(args.action ?? '').toLowerCase();
+      if (act === 'favourite' || act === 'unfavourite') {
+        for (const r of rows) r.fav = act === 'favourite';
+        await artIndex();
+        artRefresh();
+        return `${act === 'favourite' ? 'marked' : 'unmarked'} ${rows.length} picture${rows.length === 1 ? '' : 's'}`;
+      }
+      if (act === 'delete') {
+        if (!(await askSure(`The chat asks to delete ${rows.length} picture${rows.length === 1 ? '' : 's'} from the gallery: ${rows.slice(0, 4).map((r) => clip(r.prompt || r.id, 40)).join('; ')}${rows.length > 4 ? '…' : ''}. This cannot be undone.`, 'Delete'))) return 'the user said no: nothing was deleted';
+        await artForget(rows.map((r) => r.id));
+        artRefresh();
+        return `deleted ${rows.length} picture${rows.length === 1 ? '' : 's'}`;
+      }
+      return 'error: action is favourite, unfavourite or delete';
+    }
+    case 'image_settings': {
+      const f = art.form;
+      if (args.model !== undefined) {
+        const want = String(args.model).trim().toLowerCase();
+        const m = want === 'auto' || !want ? null : art.models.find((x) => x.id.toLowerCase() === want) ?? art.models.find((x) => x.id.toLowerCase().includes(want));
+        if (want && want !== 'auto' && !m) return `error: no image model like "${args.model}". image_models lists them`;
+        f.model = m?.id ?? '';
+        f.multi = [];
+      }
+      if (args.aspect !== undefined) { if (!RATIOS.some((r) => r[0] === args.aspect)) return 'error: aspect is one of ' + RATIOS.map((r) => r[0]).join(', '); f.ratio = args.aspect; }
+      if (args.size !== undefined) { const z = String(args.size).toUpperCase(); if (!ART_SIZES.some((x) => x[0] === z)) return 'error: size is S, M, L or XL'; f.size = z; }
+      if (args.negative !== undefined) f.negative = clip(String(args.negative), 2000);
+      if (args.styles !== undefined) f.styles = [args.styles].flat().map((x) => STYLES.find((s) => s[0].toLowerCase() === String(x).toLowerCase())?.[0]).filter(Boolean);
+      for (const k of ['steps', 'guidance', 'seed']) if (args[k] !== undefined) f[k] = args[k] === '' || args[k] === null ? '' : String(Number(args[k]));
+      artSave();
+      if (S.tab === 'images') drawSide();
+      return `Images tab settings: model ${artModel() === 'auto' ? 'auto (the harness picks; ' + shortModel(art.picks.make || 'none') + ' now)' : shortModel(artModel())}, shape ${f.ratio}, size ${f.size}${f.negative ? ', keep out: ' + clip(f.negative, 80) : ''}${f.styles.length ? ', styles: ' + f.styles.join(', ') : ''}${f.steps ? ', steps ' + f.steps : ''}${f.guidance ? ', guidance ' + f.guidance : ''}${f.seed ? ', seed ' + f.seed : ''}. Styles there are: ${STYLES.map((s) => s[0]).join(', ')}. image_generate uses this model too when it names none.`;
+    }
+    case 'image_queue': {
+      if (args.stop) {
+        let n = 0;
+        for (const q of art.queue) { if (q.state === 'making') { q.abort?.abort(); n++; } else if (q.state === 'waiting') { q.state = 'stopped'; n++; } }
+        art.queue = art.queue.filter((q) => q.state !== 'stopped');
+        artRefresh();
+        return n ? `stopped ${n} picture${n === 1 ? '' : 's'} in the queue` : 'the queue was empty';
+      }
+      const prompt = String(args.prompt ?? '').trim();
+      if (!prompt) {
+        if (!art.queue.length) return 'the queue is empty';
+        return art.queue.map((q) => `${q.state}: ${q.label} · ${clip(q.p.prompt, 80)}${q.err ? ' (' + q.err + ')' : ''}`).join('\n');
+      }
+      const want = String(args.model ?? '').trim().toLowerCase();
+      const model = want ? (art.models.find((x) => x.id.toLowerCase().includes(want))?.id ?? '') : artModel();
+      if (!model) return want ? `error: no image model like "${args.model}"` : 'error: ' + (art.err || 'the account lists no image model');
+      const count = Math.min(ART_COUNT_MAX, Math.max(1, Math.floor(Number(args.count)) || 1));
+      const d = artDims(specOf(model, 'make'), { ratio: RATIOS.some((r) => r[0] === args.aspect) ? args.aspect : art.form.ratio, size: String(args.size ?? art.form.size).toUpperCase() });
+      const base = Number.isFinite(Number(args.seed)) && args.seed !== '' && args.seed !== undefined ? Math.floor(Number(args.seed)) : randomSeed();
+      const batch = 'b' + Date.now().toString(36);
+      const prompts = expandPrompt(prompt, count, /\{[^{}]*\|[^{}]*\}/.test(prompt)).slice(0, ART_COUNT_MAX);   // {a|b}: one of each
+      artQueue(prompts.map((p, i) => ({ p: { model, prompt: p, negative: String(args.negative ?? art.form.negative ?? ''), w: d?.w, h: d?.h, steps: art.form.steps, guidance: art.form.guidance, seed: base + i, strength: art.form.strength, init: '', mask: '', refs: [], batch, conv: S.conv?.id ?? '' }, label: shortModel(model) })));
+      return `queued ${prompts.length} picture${prompts.length === 1 ? '' : 's'} with ${model === 'auto' ? 'the harness\'s pick' : shortModel(model)}. They are made one by one into the gallery (the Images tab) while you go on; image_list shows them when done, image_pick brings one into the chat`;
+    }
+  }
+  return 'error: no such tool';
+}
+
+/* ---- films ---- */
+
+const vidShow = () => { S.tab = 'video'; S.panes.side = true; drawSide(); };
+function filmReport(p) {
+  const todo = vidTodo(p), { starts, total } = vidTimes(p);
+  return `Film "${p.title}" (${p.id}): ${p.shots.length} shots, ${clock(total)}, shape ${p.ratio}, pictures ${p.size} by ${artListed(p.model) ? shortModel(p.model) : 'auto'}${p.look ? ', look: ' + clip(p.look, 120) : ''}; narrator ${p.voiceModel ? shortModel(p.voiceModel) : 'auto'}${p.speaker ? ' (' + p.speaker + ')' : ''}${p.lang ? ', ' + p.lang : ''}; captions ${p.captions ? 'on' : 'off'}${p.music ? ', music under it' : ''}; new shots get ${p.frames ?? 1} frames, frames ${p.blend === 'hold' ? 'held' : p.blend === 'mix' ? 'mixed' : 'stitched'}${p.direct !== false ? ', every frame directed' : ''}${p.check !== false ? ', Clef checks frames' : ''}${p.steady ? ', steadied' : ''}.\n` +
+    (vid.run ? `Being made now: ${vid.run.what} (${vid.run.done} of ${vid.run.of}).\n` : todo.pics || todo.lines ? `Still to make: ${todo.pics} picture${todo.pics === 1 ? '' : 's'}, ${todo.lines} spoken line${todo.lines === 1 ? '' : 's'} (video_generate).\n` : 'Everything is made.\n') +
+    (vid.rec ? 'Being exported now.\n' : '') + (vid.note ? `Note: ${vid.note}\n` : '') +
+    p.shots.map((s, i) => `${i + 1}. at ${clock(starts[i])}, ${shotSecs(s).toFixed(1)} s, ${s.motion}, ${s.cut} in · pictures ${s.pics.filter(artRow).length}/${Math.max(1, s.frames)}${s.say.trim() ? (s.voice.length && s.voiceFor === vidVoiceKey(p, s) ? ', voiced' : ', not voiced yet') : ''}\n   picture: ${clip(s.prompt || '(none)', 220)}${s.say.trim() ? '\n   says: ' + clip(s.say, 220) : ''}`).join('\n');
+}
+/* A shot's fields from what the chat sent: only those it sent. */
+function shotFields(x) {
+  const o = {};
+  if (x.prompt !== undefined) o.prompt = clip(String(x.prompt), 1500);
+  if (x.say !== undefined) o.say = clip(String(x.say), 1200);
+  if (x.seconds !== undefined || x.secs !== undefined) o.secs = Math.max(0.5, Math.min(60, Number(x.seconds ?? x.secs) || 4));
+  if (x.frames !== undefined) o.frames = Math.max(1, Math.min(1000, Math.floor(Number(x.frames)) || 1));
+  const mo = String(x.motion ?? '').toLowerCase().replace(/[-_]/g, ' ');
+  if (MOTIONS[mo]) o.motion = mo;
+  if (CUTS.includes(String(x.cut ?? '').toLowerCase())) o.cut = String(x.cut).toLowerCase();
+  if (x.picture !== undefined) { const r = studioPic(x.picture); if (r) o.pics = [r.id]; else if (x.picture) throw new Error(`no picture ${x.picture} in the gallery (image_list shows them)`); }
+  return o;
+}
+
+async function studioFilmTool(name, args) {
+  if (!artOn()) return 'error: this harness is older than films: update it in the Harness tab';
+  await vidOpen();
+  await studioSync(name === 'video_list' || name === 'video_open');
+  const p = () => vid.cur;
+  const need = () => { if (!vid.cur) throw new Error('no film is open: video_open one, or video_edit with "new": true'); return vid.cur; };
+  try {
+    switch (name) {
+      case 'video_list': {
+        const here = vid.list.map((x) => `${x.id}  ${x.title}  ${x.shots} shots${x.id === p()?.id ? '  (open)' : ''}`);
+        const there = studio.films.filter((f) => !studio.opened[f.id] || !vid.list.some((x) => x.id === studio.opened[f.id])).map((f) => `${f.id}  ${f.title}  ${f.shots} shots  (a storyboard ${f.by} kept in the harness; video_open brings it here)`);
+        return [...here, ...there].join('\n') || 'no films yet: video_make writes and starts one, or video_edit with "new": true and shots';
+      }
+      case 'video_open': {
+        const id = String(args.id ?? '').trim();
+        if (vid.list.some((x) => x.id === id)) { await vidPick(id); vidShow(); return filmReport(vid.cur); }
+        const local = studio.opened[id];
+        if (local && vid.list.some((x) => x.id === local)) { await vidPick(local); vidShow(); return filmReport(vid.cur); }
+        const byTitle = vid.list.find((x) => x.title.toLowerCase() === id.toLowerCase());
+        if (byTitle) { await vidPick(byTitle.id); vidShow(); return filmReport(vid.cur); }
+        if (!/^f[0-9a-z]+$/.test(id) || !keepsOn()) return `error: no film ${id}. video_list shows them`;
+        const { film } = await harnessJson('/v1/films/' + id);
+        const made = newFilm({ title: film.title, ratio: film.aspect, look: film.look });
+        made.shots = film.shots.map((x) => newShot({ prompt: x.prompt, say: x.say, secs: x.seconds, motion: x.motion, frames: made.frames ?? 1, pics: x.picture ? [art.list.find((r) => r.hid === x.picture)?.id].filter(Boolean) : [] }));
+        vidStop();
+        vid.cur = made;
+        vid.at = 0;
+        await vidSave(true);
+        studio.opened[id] = made.id;
+        ls.set('veilweb.studio.films', studio.opened);
+        vidShow();
+        return 'brought the harness\'s storyboard into the Video tab. ' + filmReport(made);
+      }
+      case 'video_status':
+        return p() ? filmReport(p()) : 'no film is open. ' + (vid.list.length ? 'Films: ' + vid.list.map((x) => `${x.title} (${x.id})`).join(', ') : 'There are none yet.');
+      case 'video_edit': {
+        // worked on a copy: a mistake part way leaves the film as it was
+        if (vid.run || vid.rec) return 'error: the film is being made or exported now: wait for it (video_status), or video_control "stop" first';
+        const fresh = !!args.new || !p();
+        const f = fresh ? newFilm({ title: clip(String(args.title ?? 'Film'), 60) || 'Film' }) : structuredClone(p());
+        const said = [];
+        if (args.title !== undefined) f.title = clip(String(args.title).trim(), 60) || f.title;
+        if (args.aspect !== undefined) { if (!['16:9', '9:16', '1:1', '4:5', '4:3', '21:9'].includes(args.aspect)) return 'error: aspect is 16:9, 9:16, 1:1, 4:5, 4:3 or 21:9'; f.ratio = args.aspect; }
+        if (args.size !== undefined) { const z = String(args.size).toUpperCase(); if (ART_SIZES.some((x) => x[0] === z)) f.size = z; }
+        if (args.export_height !== undefined && VID_SIDES.includes(Number(args.export_height))) f.side = Number(args.export_height);
+        if (args.fps !== undefined && [24, 30, 60].includes(Number(args.fps))) f.fps = Number(args.fps);
+        if (args.look !== undefined) f.look = clip(String(args.look), 300);
+        if (args.negative !== undefined) f.negative = clip(String(args.negative), 2000);
+        if (args.keep_look !== undefined) f.keep = !!args.keep_look;
+        if (args.captions !== undefined) f.captions = !!args.captions;
+        if (args.frames !== undefined) f.frames = Math.max(1, Math.min(1000, Math.floor(Number(args.frames)) || 1));
+        if (args.blend !== undefined) { if (!['flow', 'hold', 'mix'].includes(args.blend)) return 'error: blend is flow (stitch the motion between frames), hold or mix'; f.blend = args.blend; }
+        for (const k of ['direct', 'steady', 'check']) if (args[k] !== undefined) f[k] = !!args[k];
+        if (args.music_volume !== undefined) f.musicVol = Math.max(0, Math.min(1, Number(args.music_volume) || 0));
+        if (args.model !== undefined) { const w = String(args.model).toLowerCase(); f.model = w && w !== 'auto' ? art.models.find((m) => m.id.toLowerCase().includes(w))?.id ?? f.model : ''; }
+        if (args.voice !== undefined) { const w = String(args.voice).toLowerCase(); f.voiceModel = w && w !== 'auto' ? vid.voices.find((v) => v.id.toLowerCase().includes(w))?.id ?? f.voiceModel : ''; }
+        if (args.speaker !== undefined) f.speaker = String(args.speaker);
+        if (args.lang !== undefined) f.lang = String(args.lang).trim();
+        for (const x of [args.shots ?? []].flat()) {
+          const i = Math.floor(Number(x?.n)) - 1;
+          if (!f.shots[i]) return `error: there is no shot ${x?.n} (the film has ${f.shots.length})`;
+          const o = shotFields(x);
+          if (o.prompt !== undefined && o.prompt !== f.shots[i].prompt && f.shots[i].pics.length && !o.pics) said.push(`shot ${i + 1} keeps the pictures made from its old words until video_generate redoes it`);
+          Object.assign(f.shots[i], o);
+        }
+        for (const n of nums(args.remove).sort((a, b) => b - a)) {
+          if (!f.shots[n - 1]) return `error: there is no shot ${n} to remove (the film has ${f.shots.length})`;
+          f.shots.splice(n - 1, 1);
+        }
+        const add = [args.add ?? []].flat().filter((x) => x && typeof x === 'object');
+        if (add.length) {
+          const at = args.at !== undefined ? Math.max(0, Math.min(f.shots.length, Math.floor(Number(args.at)) - 1)) : f.shots.length;
+          f.shots.splice(at, 0, ...add.map((x) => newShot({ frames: f.frames ?? 1, ...shotFields(x) })));
+        }
+        if (args.move !== undefined) {
+          const [a, b] = nums(args.move);
+          if (!f.shots[a - 1] || !(b >= 1 && b <= f.shots.length)) return `error: move is [from, to], shot numbers after the other changes (the film then has ${f.shots.length} shots)`;
+          f.shots.splice(b - 1, 0, f.shots.splice(a - 1, 1)[0]);
+        }
+        if (fresh) { vidStop(); vid.cur = f; vid.at = 0; } else Object.assign(vid.cur, f);
+        await vidSave(true);
+        vidShow();
+        return filmReport(f) + (said.length ? '\n' + said.join('; ') : '');
+      }
+      case 'video_generate': {
+        const f = need();
+        if (vid.run) return 'error: the film is being made already: wait, or video_control "stop"';
+        const redo = nums(args.redo);
+        for (const n of redo) {
+          const s = f.shots[n - 1];
+          if (!s) return `error: there is no shot ${n}`;
+          if (args.what !== 'voice') s.pics = [];
+          if (args.what !== 'picture') s.voiceFor = '';
+        }
+        const one = args.shot !== undefined ? f.shots[Math.floor(Number(args.shot)) - 1] : null;
+        if (args.shot !== undefined && !one) return `error: there is no shot ${args.shot}`;
+        await vidSave(true);
+        const todo = vidTodo(f);
+        if (!todo.pics && !(voiceOn() && todo.lines)) return 'everything in the film is made already. ' + (redo.length ? '' : 'To make a shot again, pass "redo": [its number].');
+        vidShow();
+        vidMake(one?.id);   // it works on in the Video tab; the chat does not wait for it
+        const many = (n, w) => `${n} ${w}${n === 1 ? '' : 's'}`;
+        return `making ${one ? 'shot ' + args.shot : 'the film'}: ${many(todo.pics, 'picture')}${voiceOn() ? ' and ' + many(todo.lines, 'spoken line') : ''} in all. It works on in the Video tab; video_status shows how far it is.`;
+      }
+      case 'video_control': {
+        const act = String(args.action ?? '').toLowerCase();
+        if (act === 'stop') {
+          const was = [vid.run && 'the making', vid.rec && 'the export', vid.play && 'playing'].filter(Boolean);
+          vid.run?.abort.abort();
+          vid.rec?.abort.abort();
+          vidStop();
+          return was.length ? 'stopped ' + was.join(' and ') + '. What was made is kept.' : 'nothing was running';
+        }
+        const f = need();
+        if (act === 'play' || act === 'pause') { vidShow(); if (act === 'pause' || vid.play) { vidStop(); return 'paused at ' + clock(vid.at); } await vidPlay(); return `playing from ${clock(vid.at)} in the Video tab`; }
+        if (act === 'export') {
+          if (vid.run) return 'error: the film is still being made; export when it is done';
+          if (!f.shots.some((s) => s.pics.some(artRow))) return 'error: the film has no pictures yet: video_generate first';
+          vidShow();
+          vidRender();
+          return `rendering the film (${clock(vidTimes(f).total)}) into one MP4 with its sound; it downloads when done. A browser without the encoders records it as it plays instead, with this tab kept in front.`;
+        }
+        if (act === 'files') { await vidFiles(); return 'the film\'s frames, spoken lines, captions and storyboard download as one .zip'; }
+        if (act === 'delete') {
+          if (!(await askSure(`The chat asks to delete the film “${f.title}”. Its pictures stay in the gallery.`, 'Delete'))) return 'the user said no: the film is kept';
+          vidStop();
+          for (const s of f.shots) for (const id of s.voice) db.del('aud:' + id);
+          await db.del('vid:' + f.id);
+          vid.list = vid.list.filter((x) => x.id !== f.id);
+          await db.put('vids', vid.list);
+          vid.cur = null;
+          if (S.tab === 'video') drawSide();
+          return `deleted the film "${f.title}"`;
+        }
+        return 'error: action is play, pause, stop, export, files or delete';
+      }
+    }
+  } catch (e) {
+    return 'error: ' + e.message;
+  }
+  return 'error: no such tool';
+}
+
+TOOLS.image_list = { args: '{"query": "<words, optional>", "favourites": false, "limit": 20}', does: 'list the pictures in the gallery (the Images tab), newest first: id, size, model, who made it, its prompt. Pictures the harness made (its jobs, swarms, MCP callers) are among them', when: () => artOn() };
+TOOLS.image_pick = { args: '{"id": "<a gallery picture\'s id>", "name": "<short name, optional>"}', does: 'bring a gallery picture into this chat by name, so image_look, image_generate "from", image_save and films can use it', when: () => artOn() };
+TOOLS.image_manage = { args: '{"action": "favourite", "ids": ["<picture id>"]}', does: 'mark (favourite), unmark (unfavourite) or delete gallery pictures. Deleting asks the user first', when: () => artOn() };
+TOOLS.image_settings = { args: '{"model": "<a word of a model\'s name, or auto>", "aspect": "16:9", "size": "M", "negative": "<what to keep out>", "styles": ["Cinematic"], "steps": 6, "guidance": 7, "seed": 7}', does: 'change the Images tab\'s settings (every field optional; with none, say what they are). Its model is also the one image_generate uses when it names none', when: () => artOn() };
+TOOLS.image_queue = { args: '{"prompt": "<the picture>", "count": 4, "aspect": "1:1", "size": "M", "model": "<word, optional>", "negative": "", "seed": 7, "stop": false}', does: 'with a prompt: put up to 8 pictures into the Images tab\'s queue; they are made one by one into the gallery while you go on ({a|b} in the prompt makes one of each, up to 8). With "stop": true: stop the queue. With neither: how the queue stands', when: () => artOn() };
+TOOLS.video_list = { args: '{}', does: 'list the films in the Video tab, and storyboards the harness keeps (planned by its jobs, swarms or MCP callers)', when: () => artOn() };
+TOOLS.video_open = { args: '{"id": "<film id or title>"}', does: 'open a film in the Video tab (a harness storyboard is brought in as a film) and say how it stands', when: () => artOn() };
+TOOLS.video_status = { args: '{}', does: 'the open film: its settings, every shot (picture words, narration, length, camera, what is made) and the work in progress', when: () => artOn() };
+TOOLS.video_edit = { args: '{"new": false, "title": "<title>", "aspect": "16:9", "look": "<style of every shot>", "size": "M", "model": "<image model word or auto>", "voice": "<speech model word or auto>", "speaker": "<voice>", "lang": "en", "captions": true, "keep_look": true, "frames": 4, "blend": "flow", "direct": true, "check": true, "steady": false, "fps": 30, "export_height": 720, "shots": [{"n": 2, "prompt": "<picture>", "say": "<narration>", "seconds": 4, "frames": 1, "motion": "zoom in", "cut": "dissolve", "picture": "<gallery id>"}], "add": [{"prompt": "...", "say": "..."}], "at": 3, "remove": [5], "move": [4, 1]}', does: () => 'change the open film (every field optional): its settings ("frames": how many pictures a new shot is made of; "blend": flow stitches the motion between frames, hold shows each in turn, mix fades; "direct": the harness writes each next frame from the one before; "check": Clef judges each frame); "shots" edits shots by number; "remove" deletes shots; "add" inserts new shots (before shot "at", or at the end); "move" is [from, to]. They apply in that order, each to the numbering the one before left; a mistake changes nothing. "new": true starts a new film. Cameras: ' + Object.keys(MOTIONS).join(', ') + '; cuts (how a shot comes in): ' + CUTS.join(', '), when: () => artOn() };
+TOOLS.video_generate = { args: '{"shot": 2, "redo": [3], "what": "both"}', does: 'make what the open film lacks (pictures, then spoken lines); it works on in the Video tab while you go on. "shot" makes only that one; "redo" throws away and makes again the given shots ("what": picture, voice or both)', when: () => artOn() };
+TOOLS.video_control = { args: '{"action": "play"}', does: 'the open film: play, pause, stop (stops making, export and playing), export (records it into one video file, in real time), files (frames, voice, captions and storyboard as a .zip) or delete (asks the user)', when: () => artOn() };
+for (const n of ['image_list', 'image_pick', 'image_manage', 'image_settings', 'image_queue']) TOOL_RUNNERS[n] = (args, signal) => studioImageTool(n, args, signal);
+for (const n of ['video_list', 'video_open', 'video_status', 'video_edit', 'video_generate', 'video_control']) TOOL_RUNNERS[n] = (args) => studioFilmTool(n, args);
+PROMPT_NOTES.push(() => (artOn() ? 'STUDIO: you are at the controls of the Images and Video tabs. The gallery: image_list, image_pick (into this chat), image_manage, image_settings, image_queue (many pictures in the background). Films: video_make writes and starts one in a call; video_list, video_open, video_status, video_edit, video_generate and video_control do everything the Video tab does. Queued jobs and swarms in the harness have image_generate, image_look and video_plan too: what they make arrives in the gallery and the film list. You cannot see a film; never describe how one looks.' : ''));
 
 /* ============================================================ images: pictures in, pictures out */
 

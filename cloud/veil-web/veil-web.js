@@ -93,6 +93,10 @@
 //   POST speak                  {model, text, voice?, lang?}  ->  {audio (base64), type, model}
 //                               (image/models also lists the speech models: voices: [{id, about, key, speakers,
 //                               speaker, lang, created, health}], with order.speak and picks.speak)
+//   GET  pics | pics/<id>       the pictures jobs, swarm minds and MCP callers made, newest first: {id, at, model,
+//                               prompt, by, type, bytes} | one whole, with image (base64)      DELETE pics/<id>
+//   GET  films | films/<id>     the films' storyboards they planned: {id, at, title, shots, by} | one whole:
+//                               {title, aspect, look, shots: [{prompt, say, seconds, motion, picture}]}  DELETE films/<id>
 //   GET  schedules   POST schedules {task, model, every_s}   DELETE schedules/<id>
 //   GET  convs | convs/<id>     POST convs/<id> {title, at, msgs, files}   DELETE convs/<id>
 //   GET  context                the reference text the model is handed (llms.txt digest)
@@ -104,7 +108,7 @@
 // No imports and no platform globals beyond fetch/Response/crypto, so a test can run this file under node with
 // a Map for storage and a scripted env.AI.
 
-export const VERSION = "18";
+export const VERSION = "19";
 const API_ROOT = "https://api.cloudflare.com/client/v4";
 const PY_SOURCE = "https://raw.githubusercontent.com/gary23w/nl-veil/main/cloud/tot_py.py";
 const SELF_SCRIPT = "veil-web";
@@ -200,6 +204,10 @@ export const MCP_KEYS_MAX = 8; // keys other programs may hold to this harness's
 const MCP_WAIT_MS = 45000; // how long an MCP call waits for a queued task before handing back its id
 const MCP_FILES_BYTES = 512 * 1024; // the files the MCP door's file tools keep
 export const SWARMS_MAX = 8; // swarms kept, running or ended
+export const PICS_MAX = 60; // pictures kept that jobs, swarm minds and MCP callers made (the oldest go first)
+export const FILMS_MAX = 30; // films' storyboards kept that they planned
+const FILM_SHOTS_MAX = 200; // shots in one storyboard
+const MOTION_NAMES = ["still", "zoom in", "zoom out", "pan left", "pan right", "pan up", "pan down"];
 export const SWARM_WORKERS_MAX = 6; // tasks one cycle hands out
 export const SWARM_CYCLES_MAX = 40; // cycles one swarm may take
 const SWARM_TICK_MS = 5000; // how often a running swarm looks at its workers
@@ -738,7 +746,13 @@ const JOB_TOOLS = {
   garrett: '{"name": "<tool>", "args": {...}} : call one of Agent Garrett\'s tools',
   mcp_tools: '{"server": "<name>", "query": "<words, optional>"} : list the tools of a connected MCP server',
   mcp_call: '{"server": "<name>", "tool": "<tool>", "args": {...}} : call a tool of a connected MCP server',
+  image_generate: '{"prompt": "<the whole picture in words: subject, setting, style, light, framing>", "width": 1024, "height": 1024, "from": "<a picture id, to change that picture>"} : make a picture with the account\'s image models. It is kept in the harness (the owner sees it in the chat page\'s gallery) and you get its id. width, height and from are optional',
+  image_look: '{"picture": "<a picture id>", "question": "<what you want to know>"} : have a vision model answer a question about a picture kept in the harness',
+  image_list: "{} : the pictures kept in the harness, newest first: id, who made it, its prompt",
+  video_plan: '{"title": "<short>", "aspect": "16:9", "look": "<the style every shot shares>", "shots": [{"prompt": "<the picture, complete in itself>", "say": "<the narrator\'s line, or empty>", "seconds": 4, "motion": "zoom in", "picture": "<a picture id, optional>"}]} : keep a film\'s storyboard in the harness. The owner opens it in the chat page\'s Video tab, where the pictures it lacks are painted, its lines spoken and the film exported. Describe recurring characters and places the same way in every shot',
 };
+// the MCP door's own versions of these (a picture comes back as a picture)
+const MCP_OWN = new Set(["image_generate", "image_look"]);
 
 // ------------------------------------------------------------------------------------------ the Worker (door)
 
@@ -1398,6 +1412,8 @@ export class Harness {
         job.calls += angles.length;
         return minds.join("\n\n");
       }
+      case "image_generate": case "image_look": case "image_list": case "video_plan":
+        return this.studioTool(job, name, args);
       case "garrett_tools":
         return this.garrettCall("tools/list", {}, args.query);
       case "garrett":
@@ -1409,6 +1425,77 @@ export class Harness {
       default:
         return `error: no tool named ${name}. Tools: ${Object.keys(JOB_TOOLS).join(", ")}`;
     }
+  }
+
+  /// Who made a picture or a film: a swarm, a job, an MCP caller.
+  static maker(job) {
+    return job.swarm ? "swarm " + job.swarm : job.id === "mcp" ? "an MCP caller" : "job " + job.id;
+  }
+
+  /// A picture made here is kept, for the owner's page to take into its gallery; the oldest go past PICS_MAX.
+  async keepPicture(got, prompt, by) {
+    const id = "p" + Date.now().toString(36) + hex(crypto.getRandomValues(new Uint8Array(3)));
+    const row = { id, at: Date.now(), model: got.model, prompt: clip(String(prompt), 600), by, type: got.type, bytes: Math.round((got.image.length * 3) / 4) };
+    await this.store.put("pic:" + id, { ...row, image: got.image });
+    const list = [row, ...((await this.store.get("pics")) ?? [])];
+    for (const old of list.splice(PICS_MAX)) await this.store.delete("pic:" + old.id);
+    await this.store.put("pics", list);
+    return row;
+  }
+
+  async picsLine() {
+    const list = (await this.store.get("pics")) ?? [];
+    return list.length ? "Pictures: " + list.slice(0, 12).map((r) => r.id).join(", ") : "No pictures are kept yet.";
+  }
+
+  /// The picture and film tools of a job, a swarm's mind and the MCP door.
+  async studioTool(job, name, args) {
+    if (!this.env.AI) return "error: this Worker has no AI binding";
+    if (name === "image_list") {
+      const list = (await this.store.get("pics")) ?? [];
+      return list.length ? list.map((r) => `${r.id}  by ${r.by}  ${r.model.split("/").pop()}  ${clip(r.prompt, 120)}`).join("\n") : "no pictures are kept yet";
+    }
+    if (name === "video_plan") {
+      const shots = (Array.isArray(args.shots) ? args.shots : []).slice(0, FILM_SHOTS_MAX).map((x) => ({
+        prompt: clip(String(x?.prompt ?? x?.picture_prompt ?? "").trim(), 1500),
+        say: clip(String(x?.say ?? x?.narration ?? "").trim(), 1200),
+        seconds: Math.max(1, Math.min(60, Number(x?.seconds ?? x?.secs) || 4)),
+        motion: MOTION_NAMES.includes(String(x?.motion ?? "").toLowerCase()) ? String(x.motion).toLowerCase() : "zoom in",
+        picture: /^p[0-9a-z]{6,20}$/.test(String(x?.picture ?? "")) ? String(x.picture) : "",
+      })).filter((x) => x.prompt || x.picture);
+      if (!shots.length) return 'error: video_plan needs shots: [{"prompt": "<the picture>", "say": "<the narrator\'s line>", "seconds": 4}, ...]';
+      const id = "f" + Date.now().toString(36) + hex(crypto.getRandomValues(new Uint8Array(3)));
+      const title = clip(String(args.title ?? "Film").trim(), 60) || "Film";
+      const film = { id, at: Date.now(), title, aspect: ["16:9", "9:16", "1:1", "4:5", "4:3", "21:9"].includes(args.aspect) ? args.aspect : "16:9", look: clip(String(args.look ?? "").trim(), 300), shots, by: Harness.maker(job) };
+      await this.store.put("film:" + id, film);
+      const list = [{ id, at: film.at, title, shots: shots.length, by: film.by }, ...((await this.store.get("films")) ?? [])];
+      for (const old of list.splice(FILMS_MAX)) await this.store.delete("film:" + old.id);
+      await this.store.put("films", list);
+      return `kept film ${id} "${title}" (${shots.length} shots) in the harness. The owner opens it in the Video tab of the chat page, where its pictures are painted, its lines spoken and the film exported.`;
+    }
+    const why = await this.spent(true);
+    if (why) return "error: " + why;
+    const kept = async (id) => {
+      const pic = id ? await this.store.get("pic:" + id) : null;
+      return pic ? `data:${pic.type};base64,${pic.image}` : null;
+    };
+    const model = String(args.model ?? "").startsWith("@") ? String(args.model) : "auto";
+    if (name === "image_look") {
+      const id = String(args.picture ?? args.id ?? args.name ?? "").trim();
+      const image = await kept(id);
+      if (!image) return `error: no picture ${id || "named"}. ${await this.picsLine()}`;
+      const got = await this.look({ image, question: args.question, model }, null);
+      return got.err ? "error: " + got.err : got.text;
+    }
+    const prompt = String(args.prompt ?? "").trim();
+    if (!prompt) return "error: image_generate needs a prompt that says what the picture shows";
+    const from = String(args.from ?? "").trim();
+    const image = from ? await kept(from) : null;
+    if (from && !image) return `error: no picture ${from}. ${await this.picsLine()}`;
+    const got = await this.image({ prompt, model, width: args.width, height: args.height, seed: args.seed, negative: args.negative, ...(image ? { image } : {}) }, null);
+    if (got.err) return "error: " + got.err;
+    const row = await this.keepPicture(got, prompt, Harness.maker(job));
+    return `made picture ${row.id} with ${got.model}. It is kept in the harness and the owner sees it in the chat page's gallery. Use its id with image_look, as "from" to change it, or as a shot's "picture" in video_plan.`;
   }
 
   /// One step of a job: one model call, and the tool it asked for. True when the job ended.
@@ -1550,6 +1637,8 @@ export class Harness {
   async imageCatalog(who, fresh = false) {
     const kept = await this.store.get("image_catalog");
     if (kept?.v === 3 && !fresh && Date.now() - kept.at < IMAGE_CATALOG_TTL_MS) return kept;
+    // a job, a swarm's mind or an MCP key has no login to ask Cloudflare with: the list kept is what there is
+    if (!who?.token) return kept?.v === 3 ? kept : { v: 3, at: 0, models: [], vision: [], voices: [] };
     const rows = async (task) => {
       const j = await this.api(who.token, "GET", `/accounts/${who.account}/ai/models/search?task=${encodeURIComponent(task)}&hide_experimental=true&per_page=100`);
       return (Array.isArray(j?.result) ? j.result : []).filter((m) => typeof m?.name === "string" && m.name.startsWith("@"));
@@ -1997,20 +2086,24 @@ export class Harness {
       } catch {}
       return { description: text.slice(cut + 3), inputSchema: { type: "object", properties: Object.fromEntries(Object.entries(example).map(([k, v]) => [k, { ...prop(v), ...(typeof v === "string" && v ? { description: v } : {}) }])) } };
     };
-    const own = Object.entries(JOB_TOOLS).map(([name, text]) => ({ name, ...fromExample(text) }));
+    const own = Object.entries(JOB_TOOLS).filter(([name]) => !MCP_OWN.has(name)).map(([name, text]) => ({ name, ...fromExample(text) }));
     const t = (name, description, properties, required = []) => ({ name, description, inputSchema: { type: "object", properties, required } });
     const S = { type: "string" }, N = { type: "number" };
     return [
       t("veil_task", "Hand the veil a whole task. It works it on its own with all of its tools (web, files, Python, pictures, Agent Garrett, connected MCP servers) and answers in words. Waits up to 45 seconds; a longer task returns its job id for veil_job.", { task: S, model: { ...S, description: "a Workers AI model id; optional" } }, ["task"]),
       t("veil_job", "The state and the result of a task or a mesh task, by its id.", { id: S }, ["id"]),
       ...own,
-      t("image_generate", "Make a picture from words with one of the account's image models. Returns the picture.", { prompt: S, model: S, width: N, height: N }, ["prompt"]),
-      t("image_look", "Have a vision model answer a question about a picture (a data: URL).", { image: S, question: S, model: S }, ["image"]),
+      t("image_generate", "Make a picture from words with one of the account's image models (from: a kept picture's id, to change it). Returns the picture, and keeps it in the harness under an id.", { prompt: S, model: S, width: N, height: N, from: S }, ["prompt"]),
+      t("image_look", "Have a vision model answer a question about a picture: one kept in the harness (picture: its id) or one you send (image: a data: URL).", { picture: S, image: S, question: S, model: S }),
       t("swarm_deploy", "Deploy a swarm that works toward a goal on its own in the harness, round by round.", { goal: S, name: S, minds: N, rounds: N, where: { ...S, description: '"harness" (default) or "mesh" (the owner\'s machines)' }, model: S }, ["goal"]),
       t("swarm_list", "The swarms and how each stands.", {}),
       t("swarm_status", "One swarm: its round, what its minds brought back, its lessons, its files.", { id: S }, ["id"]),
       t("swarm_say", "Tell a running swarm something; its coordinator follows it from the next round.", { id: S, text: S }, ["id", "text"]),
       t("swarm_stop", "Stop a swarm.", { id: S }, ["id"]),
+      t("swarm_pause", "Pause a running swarm: it keeps its place and goes on when resumed.", { id: S }, ["id"]),
+      t("swarm_resume", "Resume a paused swarm.", { id: S }, ["id"]),
+      t("swarm_goal", "Give a running or paused swarm a new goal; it works toward it from the next round.", { id: S, goal: S }, ["id", "goal"]),
+      t("swarm_delete", "Delete a swarm that has ended, with its record and files.", { id: S }, ["id"]),
       t("mesh_nodes", "The owner's veils that are logged in to this harness (desktops, servers, browser tabs): which are online and which run work.", {}),
       t("mesh_run", "Send a task to one of the owner's machines. The veil there does it with ALL of its own tools (its shell, its files, its browser, Agent Garrett). Waits up to 45 seconds; a longer task returns its job id for veil_job.", { node: { ...S, description: "a node's id or exact name, from mesh_nodes" }, task: S, model: S }, ["node", "task"]),
     ];
@@ -2044,7 +2137,7 @@ export class Harness {
     const text = (t) => [{ type: "text", text: String(t) }];
     const model = String(args.model ?? "").startsWith("@") ? String(args.model) : key.model || (await this.store.get("mcp_model")) || "";
     const needModel = () => (model ? null : text("error: no model is set for this key: pass \"model\" (a Workers AI id such as one from the account's list), or make the key again from the chat page"));
-    if (name in JOB_TOOLS) {
+    if (name in JOB_TOOLS && !MCP_OWN.has(name)) {
       const files = (await this.store.get("mcp_files")) ?? {};
       const job = { id: "mcp", model, files, calls: 0, rounds: [] };
       if (name === "swarm" && !model) return needModel();
@@ -2073,11 +2166,26 @@ export class Harness {
         return text(`${job.state}${job.note ? " (" + job.note + ")" : ""}\n` + (job.state === "done" ? job.result : job.state === "failed" ? job.error || job.result : `${job.rounds.length} steps so far: ${job.rounds.slice(-3).map((r) => r.tool).join(", ")}`) + (Object.keys(job.files ?? {}).length ? `\nfiles: ${Object.keys(job.files).join(", ")}` : ""));
       }
       case "image_generate": {
-        const got = await this.mcpPicture(() => this.image({ ...args, model: String(args.model ?? "").startsWith("@") ? args.model : "auto" }, owner));
-        return got.err ? text("error: " + got.err) : [{ type: "image", data: got.image, mimeType: got.type }, { type: "text", text: `made with ${got.model}` }];
+        let start = {};
+        if (args.from) {
+          const pic = await this.store.get("pic:" + String(args.from));
+          if (!pic) return text(`error: no picture ${args.from}. ${await this.picsLine()}`);
+          start = { image: `data:${pic.type};base64,${pic.image}` };
+        }
+        const got = await this.mcpPicture(() => this.image({ ...args, ...start, model: String(args.model ?? "").startsWith("@") ? args.model : "auto" }, owner));
+        if (got.err) return text("error: " + got.err);
+        const row = await this.keepPicture(got, args.prompt ?? "", "an MCP caller");
+        return [{ type: "image", data: got.image, mimeType: got.type }, { type: "text", text: `made picture ${row.id} with ${got.model}; it is kept in the harness (image_look, video_plan and image_generate "from" take its id)` }];
       }
       case "image_look": {
-        const got = await this.mcpPicture(() => this.look({ ...args, model: String(args.model ?? "").startsWith("@") ? args.model : "auto" }, owner));
+        let image = args.image;
+        if (args.picture) {
+          const pic = await this.store.get("pic:" + String(args.picture));
+          if (!pic) return text(`error: no picture ${args.picture}. ${await this.picsLine()}`);
+          image = `data:${pic.type};base64,${pic.image}`;
+        }
+        if (!image) return text("error: pass picture (an id from image_list) or image (a data: URL)");
+        const got = await this.mcpPicture(() => this.look({ ...args, image, model: String(args.model ?? "").startsWith("@") ? args.model : "auto" }, owner));
         return text(got.err ? "error: " + got.err : got.text);
       }
       case "swarm_deploy": {
@@ -2088,7 +2196,7 @@ export class Harness {
       }
       case "swarm_list":
         return text((await this.swarms()).map((x) => `${x.id}  ${x.name}  ${x.state}  round ${Math.min(x.cycle + 1, x.cycles)}/${x.cycles}`).join("\n") || "no swarms yet");
-      case "swarm_status": case "swarm_say": case "swarm_stop": {
+      case "swarm_status": case "swarm_say": case "swarm_stop": case "swarm_pause": case "swarm_resume": case "swarm_goal": case "swarm_delete": {
         const list = await this.swarms();
         const want = String(args.id ?? "");
         const row = list.find((x) => x.id === want || x.name.toLowerCase() === want.toLowerCase());
@@ -2102,6 +2210,30 @@ export class Harness {
           sw.log.push({ at: Date.now(), text: "an MCP caller: " + clip(said, 200) });
           await this.saveSwarm(sw, list);
           return text("told the swarm");
+        }
+        if (name === "swarm_delete") {
+          if (live) return text("error: stop the swarm first (swarm_stop)");
+          await this.store.delete("swarm:" + sw.id);
+          await this.store.put("swarms", list.filter((x) => x.id !== sw.id));
+          return text("deleted");
+        }
+        if (name === "swarm_pause" || name === "swarm_resume") {
+          const want = name === "swarm_pause" ? "running" : "paused";
+          if (sw.state !== want) return text(`error: that swarm is ${sw.state}`);
+          sw.state = name === "swarm_pause" ? "paused" : "running";
+          sw.log.push({ at: Date.now(), text: (name === "swarm_pause" ? "paused" : "resumed") + " by an MCP caller" });
+          await this.saveSwarm(sw, list);
+          if (sw.state === "running") await this.store.setAlarm(Date.now() + 100);
+          return text(sw.state);
+        }
+        if (name === "swarm_goal") {
+          const goal = String(args.goal ?? "").trim();
+          if (goal.length < 8 || goal.length > 12000) return text("error: the goal must be 8 to 12000 characters");
+          if (!live) return text("error: that swarm has ended");
+          sw.goal = goal;
+          sw.log.push({ at: Date.now(), text: "an MCP caller set a new goal" });
+          await this.saveSwarm(sw, list);
+          return text("the swarm works toward the new goal from its next round");
         }
         if (name === "swarm_stop") {
           if (!live) return text("that swarm had already ended");
@@ -2644,6 +2776,20 @@ export class Harness {
         await this.saveSwarm(sw, list);
         if (sw.state === "running") await this.store.setAlarm(Date.now() + 100);
         return say({ ok: true, swarm: sw });
+      }
+    }
+
+    // Pictures and films' storyboards that jobs, swarm minds and MCP callers made, for the owner's page.
+    if ((at === "pics" || at === "films") && method === "GET") return say({ ok: true, [at]: (await this.store.get(at)) ?? [], max: at === "pics" ? PICS_MAX : FILMS_MAX });
+    if ((seg[1] === "pics" || seg[1] === "films") && seg.length === 3) {
+      const kind = seg[1] === "pics" ? "pic" : "film";
+      const one = await this.store.get(kind + ":" + seg[2]);
+      if (!one) return bad("no such " + (kind === "pic" ? "picture" : "film"), 404);
+      if (method === "GET") return say({ ok: true, [kind === "pic" ? "picture" : "film"]: one });
+      if (method === "DELETE") {
+        await this.store.delete(kind + ":" + one.id);
+        await this.store.put(seg[1], ((await this.store.get(seg[1])) ?? []).filter((x) => x.id !== one.id));
+        return say({ ok: true });
       }
     }
 
