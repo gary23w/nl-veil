@@ -44,7 +44,7 @@ async function harness(say = "all done") {
 }
 
 test("the version this file tests", () => {
-  assert.equal(VERSION, "6");
+  assert.equal(VERSION, "7");
 });
 
 test("a local job is queued, never run by the alarm, and keeps no alarm going while it waits", async () => {

@@ -59,7 +59,7 @@
 // No imports and no platform globals beyond fetch/Response/crypto, so a test can run this file under node with
 // a Map for storage and a scripted env.AI.
 
-export const VERSION = "6";
+export const VERSION = "7";
 const API_ROOT = "https://api.cloudflare.com/client/v4";
 const PY_SOURCE = "https://raw.githubusercontent.com/gary23w/nl-veil/main/cloud/tot_py.py";
 const SELF_SCRIPT = "veil-web";
@@ -94,6 +94,8 @@ const AUTH_TTL_MS = 5 * 60 * 1000;
 // by model and is LEARNED, never assumed from the model's name: each is tried in turn when a reply comes back
 // empty, and the one that produced an answer is remembered for that model.
 const QUIET_KNOBS = [{ enable_thinking: false }, { chat_template_kwargs: { thinking: false } }, { chat_template_kwargs: { enable_thinking: false } }, { reasoning_effort: "low" }];
+const THINK_PATIENCE = 6000; // characters of reasoning, with no word of a reply yet, before a job's call is given up on
+const TRIAL_PATIENCE = 1500; // the same, for a call sent with a knob that is meant to switch reasoning off
 const EXTRA_KEYS = new Set(["enable_thinking", "chat_template_kwargs", "reasoning_effort"]); // what a caller may add to a model request
 const DENY_TTL_MS = 60 * 1000; // a refused token is not asked about again for this long
 const MODELS_TTL_MS = 15 * 60 * 1000;
@@ -559,31 +561,81 @@ export class Harness {
 
   // ---------------------------------------------------------------- the model and the web
 
+  /// One streamed model call, read here. Resolves {reply, gaveUp}: with `patience`, a call still only reasoning
+  /// after that many characters is dropped (`gaveUp`) rather than waited out.
+  async ask(model, messages, room, extra, patience) {
+    const out = await this.env.AI.run(model, { messages, max_tokens: room, stream: true, ...(extra ?? {}) });
+    if (!(out instanceof ReadableStream)) return { reply: answerText(out), gaveUp: false };
+    const reader = out.getReader();
+    const dec = new TextDecoder();
+    const calls = [];
+    let buf = "", text = "", whole = null, reasoning = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let nl;
+      while ((nl = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, nl).trim();
+        buf = buf.slice(nl + 1);
+        if (!line.startsWith("data:")) continue;
+        let j;
+        try {
+          j = JSON.parse(line.slice(5).trim());
+        } catch {
+          continue; // [DONE], or a line that is not JSON
+        }
+        const d = j.choices?.[0]?.delta;
+        for (const tc of d?.tool_calls ?? j.tool_calls ?? []) {
+          const c = (calls[tc.index ?? 0] ??= { name: "", args: "" });
+          c.name += tc.function?.name ?? tc.name ?? "";
+          const g = tc.function?.arguments ?? tc.arguments;
+          c.args += typeof g === "string" ? g : g ? JSON.stringify(g) : "";
+        }
+        const piece = d?.content ?? j.response;
+        if (typeof piece === "string") text += piece;
+        else if (piece && typeof piece === "object") whole = piece; // a reply the model's host already parsed
+        const think = String(d?.reasoning_content ?? d?.reasoning ?? "");
+        reasoning += think.length;
+        if (patience && !text && !whole && !calls.length && reasoning > patience) {
+          reader.cancel().catch(() => {});
+          return { reply: "", gaveUp: true };
+        }
+      }
+    }
+    const message = { content: text || null, ...(calls[0]?.name ? { tool_calls: calls.map((c) => ({ function: { name: c.name, arguments: c.args } })) } : {}) };
+    return { reply: answerText(whole !== null ? { response: whole } : { choices: [{ message }] }), gaveUp: false };
+  }
+
+  /// A model call for a job. A model that reasons on without a word of reply is not waited out: the call is
+  /// dropped and asked again with each knob that may quiet it; the one that did is remembered for the model, and
+  /// so is that none does (it then gets three times the room and all the time it wants).
   async model(model, messages, maxTokens) {
     const sent = messages.reduce((n, m) => n + m.content.length, 0);
     const quirks = (await this.store.get("quirks")) ?? {};
     const known = quirks[model]?.quiet;
-    const ask = async (extra, room) => {
-      const reply = answerText(await this.env.AI.run(model, { messages, max_tokens: room, ...(extra ?? {}) }));
-      await this.spend(1, sent + reply.length);
-      return reply;
+    const ask = async (extra, room, patience) => {
+      const got = await this.ask(model, messages, room, extra, patience);
+      await this.spend(1, sent + got.reply.length);
+      return got.reply;
     };
-    let reply = await ask(known !== undefined ? QUIET_KNOBS[known] : null, maxTokens);
+    const roomy = () => ask(null, Math.min(MAX_TOKENS_CEIL, maxTokens * 3), 0);
+    if (known === -1) return roomy();
+    let reply = await ask(known !== undefined ? QUIET_KNOBS[known] : null, maxTokens, known === undefined ? THINK_PATIENCE : 0);
     if (reply) return reply;
-    // nothing came back: the room went on reasoning. Try the knobs, then three times the room.
-    for (let i = 0; i < QUIET_KNOBS.length && !reply; i++) {
+    let quiet = -1;
+    for (let i = 0; i < QUIET_KNOBS.length && quiet < 0; i++) {
       if (i === known) continue;
       try {
-        reply = await ask(QUIET_KNOBS[i], maxTokens);
+        reply = await ask(QUIET_KNOBS[i], maxTokens, TRIAL_PATIENCE);
       } catch {
         continue; // a model that rejects the field is not one it works on
       }
-      if (reply) {
-        quirks[model] = { quiet: i };
-        await this.store.put("quirks", quirks);
-      }
+      if (reply) quiet = i;
     }
-    return reply || (await ask(null, Math.min(MAX_TOKENS_CEIL, maxTokens * 3)));
+    quirks[model] = { quiet };
+    await this.store.put("quirks", quirks);
+    return reply || (await roomy());
   }
 
   async httpCall(spec) {
