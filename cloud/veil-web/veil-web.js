@@ -11,7 +11,12 @@
 //   - JOBS: work that goes on with the tab closed. A FIFO queue (one job at a time, in arrival order) run by an
 //     alarm, each job the same pick-a-tool loop the page runs.
 //   - PYTHON: a companion Worker ("veil-web-py": cloud/tot_py.py behind a key) this harness uploads on request.
-//   - AGENT GARRETT: the user's own agent, reached over its stateless MCP endpoint (tools/list, tools/call).
+//   - AGENT GARRETT: the user's agent, reached over MCP (tools/list, tools/call) with the key its dashboard gives.
+//   - SCHEDULES: a task that queues itself as a job every so often.
+//   - CHATS: the page's conversations and their files, kept here so every browser the owner logs in from (and
+//     anything else holding their login) sees the same ones.
+//   - WHAT IT KNOWS ABOUT ITS MAKER: a daily read of garrettstimpson.ca/llms.txt, cut down to what is about
+//     Agent Garrett and the veil, handed to the model as reference.
 //
 // WHO MAY CALL IT: only someone logged in to the Cloudflare account that owns it. Every request carries the
 // caller's Cloudflare OAuth access token as `Authorization: Bearer`; the harness asks Cloudflare for that
@@ -32,15 +37,25 @@
 //   GET  jobs | jobs/<id>       the queue, oldest first | one job whole
 //   POST jobs  {task, model}    queue a job          DELETE jobs/<id>   cancel or delete one
 //   POST python/deploy | python/run {code, files?, args?, packages?}
-//   POST garrett {url, token} (empty url forgets it) | garrett/call {method, params}
+//   POST garrett {key} or {url, token} (neither forgets it) | garrett/call {method, params}
+//   GET  models                 the account's Workers AI text models
+//   GET  schedules   POST schedules {task, model, every_s}   DELETE schedules/<id>
+//   GET  convs | convs/<id>     POST convs/<id> {title, at, msgs, files}   DELETE convs/<id>
+//   GET  context                the reference text the model is handed (llms.txt digest)
+//   POST update                 replace this Worker with the current source from the public repo
 //
 // No imports and no platform globals beyond fetch/Response/crypto, so a test can run this file under node with
 // a Map for storage and a scripted env.AI.
 
-export const VERSION = "2";
+export const VERSION = "3";
 const API_ROOT = "https://api.cloudflare.com/client/v4";
 const PY_SCRIPT = "veil-web-py";
 const PY_SOURCE = "https://raw.githubusercontent.com/gary23w/nl-veil/main/cloud/tot_py.py";
+const SELF_SCRIPT = "veil-web";
+const SELF_SOURCE = "https://raw.githubusercontent.com/gary23w/nl-veil/main/cloud/veil-web/veil-web.js";
+const LLMS_URL = "https://garrettstimpson.ca/llms.txt";
+export const GARRETT_MCP = "https://agent.garrettstimpson.ca/mcp";
+export const GARRETT_DASHBOARD = "https://agent.garrettstimpson.ca/dashboard";
 const COMPAT_DATE = "2025-09-01";
 const UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36";
 const MB = 1 << 20;
@@ -57,6 +72,14 @@ const RESULT_MAX = 10000;
 const FETCH_TEXT_MAX = 200000;
 const MAX_TOKENS_CEIL = 16384;
 const AUTH_TTL_MS = 5 * 60 * 1000;
+const DENY_TTL_MS = 60 * 1000; // a refused token is not asked about again for this long
+const MODELS_TTL_MS = 15 * 60 * 1000;
+const LLMS_TTL_MS = 24 * 3600 * 1000;
+const LLMS_DIGEST_MAX = 3500;
+export const SCHEDULES_MAX = 12;
+export const EVERY_MIN_S = 300; // the shortest repeat a schedule may have
+const CONV_BYTES_MAX = 1500000; // one conversation with its files
+export const CONVS_MAX = 200;
 
 const clip = (s, n) => {
   s = String(s ?? "");
@@ -69,9 +92,9 @@ const hex = (buf) => Array.from(new Uint8Array(buf), (b) => b.toString(16).padSt
 
 function cors(req, env) {
   const origin = req.headers.get("origin") ?? "";
-  const allow = String(env.ALLOW_ORIGIN ?? "");
+  const allow = String(env.ALLOW_ORIGIN ?? "").split(",").map((x) => x.trim()).filter(Boolean);
   const h = { vary: "Origin" };
-  if (origin && allow && origin === allow) {
+  if (origin && allow.includes(origin)) {
     h["access-control-allow-origin"] = origin;
     h["access-control-allow-methods"] = "GET, POST, DELETE, OPTIONS";
     h["access-control-allow-headers"] = "authorization, content-type";
@@ -121,7 +144,7 @@ export function searchResults(html, engine) {
       const m = /[?&]uddg=([^&]+)/.exec(u); // DuckDuckGo wraps the real link
       if (m) u = decodeURIComponent(m[1]);
       const host = new URL(u).hostname;
-      if (/duckduckgo\.com|bing\.com|microsoft\.com|go\.microsoft/.test(host) || seen.has(u)) return;
+      if (/duckduckgo\.com|bing\.com|microsoft\.com|go\.microsoft|mojeek\.com/.test(host) || seen.has(u)) return;
       const ti = text(title);
       if (ti.length < 2) return;
       seen.add(u);
@@ -132,9 +155,12 @@ export function searchResults(html, engine) {
   if (engine === "duckduckgo") {
     const re = /<a[^>]+class="[^"]*result__a[^"]*"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>([\s\S]*?)(?=<a[^>]+class="[^"]*result__a|$)/g;
     while ((m = re.exec(html)) && out.length < 10) add(m[1], m[2], (/class="[^"]*result__snippet[^"]*"[^>]*>([\s\S]*?)<\/a>/.exec(m[3]) ?? [])[1]);
-  } else {
+  } else if (engine === "bing") {
     const re = /<li class="b_algo"[\s\S]*?<h2[^>]*>\s*<a[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>([\s\S]*?)<\/li>/g;
     while ((m = re.exec(html)) && out.length < 10) add(m[1], m[2], (/<p[^>]*>([\s\S]*?)<\/p>/.exec(m[3]) ?? [])[1]);
+  } else {
+    const re = /<a[^>]+href="(https?:\/\/[^"]+)"[^>]*>([\s\S]*?)<\/a>/g;
+    while ((m = re.exec(html)) && out.length < 10) add(m[1], m[2], "");
   }
   return out;
 }
@@ -200,6 +226,28 @@ export function parseAction(reply, known) {
   return { tool: name, args };
 }
 
+/// llms.txt cut down to what the veil should carry: its opening, About, Topics, and only the posts that are
+/// about Agent Garrett or the veil. Everything else on that site is its own subject and stays there.
+export function llmsDigest(text) {
+  const keep = [];
+  let section = "";
+  for (const raw of String(text ?? "").split(/\r?\n/)) {
+    const line = raw.trimEnd();
+    if (line.startsWith("## ")) {
+      section = line.slice(3).trim().toLowerCase();
+      if (section !== "posts") keep.push(line);
+      else keep.push("## Posts about Agent Garrett and the veil");
+      continue;
+    }
+    if (section === "posts") {
+      if (/agent garrett|nl-veil|the veil/i.test(line)) keep.push(clip(line, 420));
+      continue;
+    }
+    if (line.trim()) keep.push(clip(line, 420));
+  }
+  return clip(keep.join("\n"), LLMS_DIGEST_MAX);
+}
+
 // The Python Worker's entry: cloud/tot_py.py has no door of its own (the tot runtime reaches it over a service
 // binding), so here it sits behind a key only this harness holds.
 const PY_ENTRY = `import hmac
@@ -224,7 +272,8 @@ const JOB_TOOLS = {
   read_file: '{"name": "<path>"} : read one of this job\'s files',
   list_files: "{} : list this job's files",
   run_python: '{"code": "<python>"} : run Python (the job\'s files are beside the script; files it changes are kept)',
-  garrett_tools: "{} : list Agent Garrett's tools",
+  swarm: '{"task": "<the question>", "angles": ["<a way to look at it>", "..."]} : ask up to 4 minds at once, one per angle',
+  garrett_tools: '{"query": "<words, optional>"} : list the tools of Agent Garrett (those matching the words)',
   garrett: '{"name": "<tool>", "args": {...}} : call one of Agent Garrett\'s tools',
 };
 
@@ -285,13 +334,19 @@ export class Harness {
     if (token.length < 20) return null;
     const key = hex(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(token)));
     const hit = this.authed.get(key);
-    if (hit && hit.until > Date.now()) return { token, account: hit.account, sub: hit.sub };
+    if (hit && hit.until > Date.now()) return hit.account ? { token, account: hit.account, sub: hit.sub } : null;
     const m = /^[a-z0-9-]+\.([a-z0-9-]+)\.workers\.dev$/.exec(new URL(req.url).hostname);
     if (!m) return null;
+    // a refused token is remembered briefly, so repeating it costs the owner no further API calls
+    const deny = () => {
+      if (this.authed.size > 256) this.authed.clear();
+      this.authed.set(key, { account: "", sub: "", until: Date.now() + DENY_TTL_MS });
+      return null;
+    };
     const owns = async (id) => (await this.api(token, "GET", `/accounts/${id}/workers/subdomain`))?.result?.subdomain === m[1];
     let account = await this.store.get("owner");
     if (account) {
-      if (!(await owns(account))) return null;
+      if (!(await owns(account))) return deny();
     } else {
       account = null;
       const list = await this.api(token, "GET", "/accounts?per_page=50");
@@ -301,10 +356,10 @@ export class Harness {
           break;
         }
       }
-      if (!account) return null;
+      if (!account) return deny();
       await this.store.put("owner", account);
     }
-    if (this.authed.size > 64) this.authed.clear();
+    if (this.authed.size > 256) this.authed.clear();
     this.authed.set(key, { account, sub: m[1], until: Date.now() + AUTH_TTL_MS });
     return { token, account, sub: m[1] };
   }
@@ -366,22 +421,173 @@ export class Harness {
     const q = encodeURIComponent(String(query ?? "").trim());
     if (!q) throw new Error("the query is empty");
     const tried = [];
-    for (const [engine, url] of [
-      ["duckduckgo", `https://html.duckduckgo.com/html/?q=${q}`],
-      ["bing", `https://www.bing.com/search?q=${q}&setlang=en`],
-    ]) {
+    const get = async (url, accept, ms) => {
+      const r = await fetch(url, { headers: { "user-agent": UA, accept, "accept-language": "en-US,en;q=0.9" }, signal: AbortSignal.timeout(ms) });
+      const text = (await r.text()).slice(0, 800000);
+      await this.spend(0, text.length);
+      return { r, text };
+    };
+    const json = (text) => {
       try {
-        const r = await fetch(url, { headers: { "user-agent": UA, accept: "text/html" }, signal: AbortSignal.timeout(9000) });
-        const html = (await r.text()).slice(0, 800000);
-        await this.spend(0, html.length);
-        const results = searchResults(html, engine);
-        if (results.length >= 2) return results;
-        tried.push(`${engine}: HTTP ${r.status}, nothing readable`);
+        return JSON.parse(text);
+      } catch {
+        return null;
+      }
+    };
+    // The same ladder cloud/tot.js climbs: the engines' own pages refuse a datacenter address more often than
+    // not, so the open ones are asked first.
+    // 1. public SearXNG instances answer JSON; two are tried per search, starting at a different one each time
+    const searx = ["https://searx.be", "https://search.disroot.org", "https://priv.au", "https://searx.tiekoetter.com", "https://search.bus-hit.me", "https://baresearch.org"];
+    const start = ((await this.store.get("searx_i")) ?? 0) % searx.length;
+    for (let k = 0; k < 2; k++) {
+      const host = searx[(start + k) % searx.length];
+      try {
+        const { r, text } = await get(`${host}/search?q=${q}&format=json&categories=general`, "application/json", 7000);
+        const results = (json(text)?.results ?? []).slice(0, 8).map((x) => ({ title: clip(x.title ?? "", 160), url: x.url ?? "", snippet: clip(x.content ?? "", 300) })).filter((x) => x.url && x.title);
+        if (results.length > 0) {
+          await this.store.put("searx_i", (start + k) % searx.length); // this one works: start here next time
+          return results;
+        }
+        tried.push(`${new URL(host).hostname}: HTTP ${r.status}, no results`);
       } catch (e) {
-        tried.push(`${engine}: ${clip(e?.message ?? e, 60)}`);
+        tried.push(`${new URL(host).hostname}: ${clip(e?.message ?? e, 60)}`);
       }
     }
-    throw new Error("no search engine answered (" + tried.join("; ") + ")");
+    await this.store.put("searx_i", start + 2);
+    // 2. the engines' HTML pages
+    for (const [engine, url] of [
+      ["duckduckgo", `https://html.duckduckgo.com/html/?q=${q}`],
+      ["links", `https://lite.duckduckgo.com/lite/?q=${q}`],
+      ["bing", `https://www.bing.com/search?q=${q}&setlang=en`],
+      ["links", `https://www.mojeek.com/search?q=${q}`],
+    ]) {
+      try {
+        const { r, text } = await get(url, "text/html", 9000);
+        const results = searchResults(text, engine);
+        if (results.length >= 2) return results;
+        tried.push(`${new URL(url).hostname}: HTTP ${r.status}, nothing readable`);
+      } catch (e) {
+        tried.push(`${new URL(url).hostname}: ${clip(e?.message ?? e, 60)}`);
+      }
+    }
+    // 3. DuckDuckGo's instant answers, then Wikipedia: reference lookups that still answer a datacenter address
+    try {
+      const d = json((await get(`https://api.duckduckgo.com/?q=${q}&format=json&no_html=1&no_redirect=1`, "application/json", 7000)).text) ?? {};
+      const results = [];
+      if (d.AbstractText) results.push({ title: d.Heading || String(query), url: d.AbstractURL || "", snippet: clip(d.AbstractText, 400) });
+      for (const t of d.RelatedTopics ?? []) if (t?.Text && t?.FirstURL) results.push({ title: clip(t.Text, 80), url: t.FirstURL, snippet: clip(t.Text, 300) });
+      if (results.length > 0) return results.slice(0, 8);
+      tried.push("duckduckgo instant answers: nothing");
+    } catch (e) {
+      tried.push(`duckduckgo instant answers: ${clip(e?.message ?? e, 60)}`);
+    }
+    try {
+      const j = json((await get(`https://en.wikipedia.org/w/api.php?action=opensearch&limit=8&format=json&search=${q}`, "application/json", 7000)).text);
+      if (Array.isArray(j?.[1]) && j[1].length > 0) return j[1].map((ti, i) => ({ title: ti, url: j[3]?.[i] ?? "", snippet: j[2]?.[i] || "(Wikipedia article)" }));
+      tried.push("wikipedia: nothing");
+    } catch (e) {
+      tried.push(`wikipedia: ${clip(e?.message ?? e, 60)}`);
+    }
+    throw new Error("no search source answered (" + tried.join("; ") + "). Fetch a likely page directly with web_fetch instead.");
+  }
+
+  // ---------------------------------------------------------------- what the account and the maker's site offer
+
+  /// The account's Workers AI text models, asked of Cloudflare with the caller's login and kept for a while.
+  async models(who) {
+    const kept = await this.store.get("models");
+    if (kept && Date.now() - kept.at < MODELS_TTL_MS) return kept.list;
+    const j = await this.api(who.token, "GET", `/accounts/${who.account}/ai/models/search?task=Text%20Generation&hide_experimental=true&per_page=100`);
+    const prop = (m, id) => (Array.isArray(m?.properties) ? m.properties.find((p) => p?.property_id === id)?.value : undefined);
+    const list = (Array.isArray(j?.result) ? j.result : [])
+      .filter((m) => typeof m?.name === "string" && m.name.startsWith("@"))
+      .map((m) => ({ id: m.name, context: Number(prop(m, "context_window")) || 0, tools: String(prop(m, "function_calling")) === "true", reasoning: String(prop(m, "reasoning")) === "true" }))
+      .sort((a, b) => a.id.localeCompare(b.id));
+    if (list.length === 0) return kept?.list ?? [];
+    await this.store.put("models", { at: Date.now(), list });
+    return list;
+  }
+
+  /// garrettstimpson.ca/llms.txt, read once a day and cut to what is about Agent Garrett and the veil. Never throws.
+  async context() {
+    const kept = await this.store.get("llms");
+    if (kept && Date.now() - kept.at < LLMS_TTL_MS) return kept;
+    try {
+      const r = await fetch(this.env.LLMS_URL || LLMS_URL, { headers: { "user-agent": UA, accept: "text/plain" }, signal: AbortSignal.timeout(10000) });
+      const text = (await r.text()).slice(0, 400000);
+      await this.spend(0, text.length);
+      if (r.status !== 200 || !text.startsWith("#")) throw new Error("HTTP " + r.status);
+      const fresh = { at: Date.now(), source: LLMS_URL, digest: llmsDigest(text) };
+      await this.store.put("llms", fresh);
+      return fresh;
+    } catch {
+      // a failed read is not retried on every request: the old copy (or nothing) stands for an hour
+      const stale = { at: Date.now() - LLMS_TTL_MS + 3600 * 1000, source: LLMS_URL, digest: kept?.digest ?? "" };
+      await this.store.put("llms", stale);
+      return stale;
+    }
+  }
+
+  /// Replace this Worker with the current source from the public repo, with the caller's login. The bindings are
+  /// the ones wrangler.jsonc declares; the Durable Object and its data stay. {err} in words, {same} when the
+  /// repo has nothing newer, or {version} of what was put in place.
+  async selfUpdate(who) {
+    let source;
+    try {
+      const r = await fetch(this.env.SELF_SOURCE || SELF_SOURCE, { headers: { "cache-control": "no-cache" } });
+      source = await r.text();
+      if (r.status !== 200) return { err: "could not fetch the harness's source (HTTP " + r.status + ")" };
+    } catch (e) {
+      return { err: "could not fetch the harness's source: " + clip(e?.message ?? e, 120) };
+    }
+    const version = /export const VERSION = "(\d+)";/.exec(source)?.[1];
+    if (!version || !source.includes("export class Harness")) return { err: "what the repo serves is not a harness" };
+    if (Number(version) < Number(VERSION)) return { err: `the repo's harness (version ${version}) is older than this one (${VERSION})` };
+    if (Number(version) === Number(VERSION)) return { same: true, version };
+    const origin = String(this.env.ALLOW_ORIGIN ?? "");
+    const form = new FormData();
+    form.append("metadata", new Blob([JSON.stringify({
+      main_module: "veil-web.js",
+      compatibility_date: COMPAT_DATE,
+      compatibility_flags: ["global_fetch_strictly_public"],
+      bindings: [{ type: "ai", name: "AI" }, { type: "durable_object_namespace", name: "HARNESS", class_name: "Harness" }, { type: "plain_text", name: "ALLOW_ORIGIN", text: origin }],
+      keep_bindings: ["secret_text"],
+    })], { type: "application/json" }), "metadata.json");
+    form.append("veil-web.js", new Blob([source], { type: "application/javascript+module" }), "veil-web.js");
+    const up = await this.api(who.token, "PUT", `/accounts/${who.account}/workers/scripts/${SELF_SCRIPT}`, form, "");
+    if (!up.success) return { err: "Cloudflare refused the update: " + clip(up.errors?.[0]?.message ?? "no reason given", 300) };
+    return { version };
+  }
+
+  // ---------------------------------------------------------------- schedules
+
+  async schedules() {
+    return (await this.store.get("schedules")) ?? [];
+  }
+
+  /// Queue a job for every schedule that is due. A schedule whose last job is still waiting or running is passed
+  /// over this time, so a slow task never stacks up behind itself.
+  async runSchedules(index) {
+    const list = await this.schedules();
+    const now = Date.now();
+    let changed = false;
+    for (const s of list) {
+      if (s.next > now) continue;
+      s.next = now + s.every_s * 1000;
+      changed = true;
+      const busy = index.some((j) => j.id === s.last_job && ["queued", "running"].includes(j.state));
+      if (busy || index.filter((j) => j.state === "queued").length >= QUEUE_MAX) continue;
+      s.last_job = await this.enqueue(index, s.task, s.model, s.id);
+      s.runs = (s.runs ?? 0) + 1;
+    }
+    if (changed) await this.store.put("schedules", list);
+    return list.reduce((t, s) => Math.min(t, s.next), Infinity);
+  }
+
+  // ---------------------------------------------------------------- chats kept for every browser
+
+  async convs() {
+    return (await this.store.get("convs")) ?? [];
   }
 
   // ---------------------------------------------------------------- Python
@@ -426,26 +632,42 @@ export class Harness {
 
   // ---------------------------------------------------------------- Agent Garrett (MCP)
 
-  async garrettCall(method, params) {
-    const g = await this.store.get("garrett");
-    if (!g) return "ERROR: Agent Garrett is not connected to this harness";
+  /// One JSON-RPC request to an MCP endpoint: {j} the parsed answer, or {err} in words.
+  async garrettRpc(g, method, params) {
     let r, text;
     try {
-      r = await fetch(g.url, { method: "POST", headers: { "content-type": "application/json", accept: "application/json", authorization: "Bearer " + g.token }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }), signal: AbortSignal.timeout(30000) });
+      r = await fetch(g.url, { method: "POST", headers: { "content-type": "application/json", accept: "application/json, text/event-stream", authorization: "Bearer " + g.token }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }), signal: AbortSignal.timeout(30000) });
       text = await r.text();
       await this.spend(0, text.length);
     } catch (e) {
-      return `ERROR: Agent Garrett did not answer: ${clip(e?.message ?? e, 200)}`;
+      return { err: `did not answer: ${clip(e?.message ?? e, 200)}` };
     }
+    // a server may answer a single request as one SSE event: the JSON is its data line
+    const data = /^data:\s*(\{[\s\S]*\})\s*$/m.exec(text)?.[1] ?? text;
     let j = null;
     try {
-      j = JSON.parse(text);
+      j = JSON.parse(data);
     } catch {}
-    if (!j || typeof j !== "object") return `ERROR: Agent Garrett answered HTTP ${r.status}: ${clip(text, 300)}`;
-    if (j.error) return `ERROR: Agent Garrett: ${clip(j.error.message ?? JSON.stringify(j.error), 400)}`;
+    if (!j || typeof j !== "object") return { err: `answered HTTP ${r.status}: ${clip(text, 300)}` };
+    if (j.error) return { err: clip(j.error.message ?? JSON.stringify(j.error), 400) };
+    return { j };
+  }
+
+  /// One MCP call. `query` narrows a tools/list to the tools whose name or description holds every word of it;
+  /// a long unfiltered catalogue is answered as names only, so it fits a model's room.
+  async garrettCall(method, params, query = "") {
+    const g = await this.store.get("garrett");
+    if (!g) return "ERROR: Agent Garrett is not connected to this harness";
+    const { j, err } = await this.garrettRpc(g, method, params);
+    if (err) return "ERROR: Agent Garrett " + err;
     if (method === "tools/list") {
-      const tools = Array.isArray(j.result?.tools) ? j.result.tools : [];
-      return tools.length === 0 ? "(Agent Garrett lists no tools)" : tools.map((t) => `- ${t.name}: ${clip(String(t.description ?? ""), 160)}`).join("\n");
+      const all = Array.isArray(j.result?.tools) ? j.result.tools : [];
+      if (all.length === 0) return "(Agent Garrett lists no tools)";
+      const words = String(query ?? "").toLowerCase().split(/[^a-z0-9]+/).filter((w) => w.length > 1);
+      const tools = words.length === 0 ? all : all.filter((t) => words.every((w) => `${t.name} ${t.description ?? ""}`.toLowerCase().includes(w)));
+      if (tools.length === 0) return `none of Agent Garrett's ${all.length} tools match "${clip(query, 80)}". Try fewer or other words.`;
+      if (tools.length > 40) return `${tools.length} tools. Names: ${tools.map((t) => t.name).join(", ")}\nCall garrett_tools with a query (for example {"query": "dns"}) to see what a group does.`;
+      return tools.map((t) => `- ${t.name}: ${clip(String(t.description ?? ""), 200)}`).join("\n");
     }
     const out = (Array.isArray(j.result?.content) ? j.result.content : []).filter((c) => c?.type === "text").map((c) => c.text).join("\n");
     return (j.result?.isError ? "FAILED: " : "") + clip(out || "(no text)", 12000);
@@ -460,7 +682,8 @@ export class Harness {
   /// Drop finished jobs, oldest first, while there are more than JOBS_KEEP or their data is past the limit.
   async evict(index) {
     const { storage_max } = await this.cfg();
-    const total = () => index.reduce((n, j) => n + (j.bytes ?? 0), 0);
+    const chats = (await this.convs()).reduce((n, c) => n + (c.bytes ?? 0), 0);
+    const total = () => chats + index.reduce((n, j) => n + (j.bytes ?? 0), 0);
     const done = () => index.filter((j) => !["queued", "running"].includes(j.state));
     while (done().length > 0 && (done().length > JOBS_KEEP || total() > storage_max)) {
       const oldest = done()[0];
@@ -513,8 +736,26 @@ export class Harness {
         for (const [n, c] of Object.entries(r.files)) if (typeof c === "string") job.files[n] = c;
         return (r.ok ? "" : "error: ") + (r.out || "(no output)");
       }
+      case "swarm": {
+        const task = String(args.task ?? "").trim();
+        const angles = (Array.isArray(args.angles) ? args.angles : []).map(String).filter(Boolean).slice(0, 4);
+        if (!task || angles.length < 2) return "error: swarm needs a task and at least two angles";
+        const minds = await Promise.all(angles.map(async (angle, i) => {
+          try {
+            const t = await this.model(job.model, [
+              { role: "system", content: "You are one mind of a small swarm. Answer the task from the one angle you are given, in under 250 words. Say what you are unsure of." },
+              { role: "user", content: `TASK: ${task}\n\nYOUR ANGLE: ${angle}` },
+            ], 700);
+            return `MIND ${i + 1} (${angle}):\n${t || "(answered nothing)"}`;
+          } catch (e) {
+            return `MIND ${i + 1} (${angle}): error: ${clip(e?.message ?? e, 200)}`;
+          }
+        }));
+        job.calls += angles.length;
+        return minds.join("\n\n");
+      }
       case "garrett_tools":
-        return this.garrettCall("tools/list", {});
+        return this.garrettCall("tools/list", {}, args.query);
       case "garrett":
         return this.garrettCall("tools/call", { name: String(args.name ?? ""), arguments: args.args && typeof args.args === "object" ? args.args : {} });
       default:
@@ -525,8 +766,9 @@ export class Harness {
   /// One step of a job: one model call, and the tool it asked for. True when the job ended.
   async jobStep(job) {
     const tools = Object.entries(JOB_TOOLS).map(([n, t]) => `- ${n} ${t}`).join("\n");
+    const ref = (await this.context()).digest;
     const head = [
-      { role: "system", content: "You are the veil, working on a queued job with nobody watching. Work the task to the end with these tools:\n" + tools + '\n\nTo use a tool, reply with exactly ONE JSON object and nothing else: {"tool": "<name>", "args": {...}}. When the job is done, or cannot go further, reply in plain text with what was done and what the tool results showed. Never claim something no tool result shows.' },
+      { role: "system", content: "You are the veil, working on a queued job with nobody watching. Work the task to the end with these tools:\n" + tools + '\n\nTo use a tool, reply with exactly ONE JSON object and nothing else: {"tool": "<name>", "args": {...}}. When the job is done, or cannot go further, reply in plain text with what was done and what the tool results showed. Never claim something no tool result shows.' + (ref ? "\n\nREFERENCE (from garrettstimpson.ca/llms.txt, about the people and projects behind this veil):\n" + ref : "") },
       { role: "user", content: job.task },
     ];
     const pairs = job.rounds.map((r) => [
@@ -558,11 +800,29 @@ export class Harness {
     return false;
   }
 
-  /// The heartbeat: the job at the head of the queue takes up to ALARM_STEPS steps, then the next alarm goes on.
+  /// Put a job at the back of the queue. The caller has checked there is room. Returns its id.
+  async enqueue(index, task, model, schedule = "") {
+    const id = Date.now().toString(36) + hex(crypto.getRandomValues(new Uint8Array(3)));
+    const job = { id, task, model, schedule, state: "queued", created: Date.now(), started: 0, finished: 0, rounds: [], files: {}, result: "", error: "", note: "", calls: 0 };
+    index.push({ id, task: clip(task.replace(/\s+/g, " "), 120), state: "queued", created: job.created, finished: 0, bytes: 0, note: "", schedule });
+    await this.saveJob(job, index);
+    return id;
+  }
+
+  /// Wake when there is next something to do: a job to step (`wait` ms from now) or a schedule coming due.
+  async rearm(wait, nextDue) {
+    const active = (await this.jobs()).some((j) => ["queued", "running"].includes(j.state));
+    const at = Math.min(active ? Date.now() + wait : Infinity, nextDue);
+    if (at !== Infinity) await this.store.setAlarm(Math.max(at, Date.now() + 100));
+  }
+
+  /// The heartbeat: due schedules queue their jobs, then the job at the head of the queue takes up to ALARM_STEPS
+  /// steps, then the next alarm goes on.
   async alarm() {
     const index = await this.jobs();
+    const nextDue = await this.runSchedules(index);
     const row = index.find((j) => j.state === "running") ?? index.find((j) => j.state === "queued");
-    if (!row) return;
+    if (!row) return this.rearm(1000, nextDue);
     const job = await this.store.get("job:" + row.id);
     if (!job) {
       index.splice(index.indexOf(row), 1);
@@ -604,13 +864,13 @@ export class Harness {
       }
     }
     await this.saveJob(job, index);
-    if ((await this.jobs()).some((j) => ["queued", "running"].includes(j.state))) await this.store.setAlarm(Date.now() + wait);
+    await this.rearm(wait, nextDue);
   }
 
   // ---------------------------------------------------------------- routes
 
   async status(who) {
-    const [cfg, usage, index, py, g] = [await this.cfg(), await this.usage(), await this.jobs(), await this.store.get("py"), await this.store.get("garrett")];
+    const [cfg, usage, index, py, g, chats, sched] = [await this.cfg(), await this.usage(), await this.jobs(), await this.store.get("py"), await this.store.get("garrett"), await this.convs(), await this.schedules()];
     return {
       ok: true,
       version: VERSION,
@@ -618,10 +878,13 @@ export class Harness {
       account: who.account,
       limits: cfg,
       usage,
-      storage_bytes: index.reduce((n, j) => n + (j.bytes ?? 0), 0),
+      storage_bytes: index.reduce((n, j) => n + (j.bytes ?? 0), 0) + chats.reduce((n, c) => n + (c.bytes ?? 0), 0),
       queue: { waiting: index.filter((j) => j.state === "queued").length, running: index.filter((j) => j.state === "running").length, max: QUEUE_MAX, kept: index.length, keep: JOBS_KEEP },
+      schedules: { count: sched.length, max: SCHEDULES_MAX, shortest_s: EVERY_MIN_S },
+      chats: { count: chats.length, max: CONVS_MAX },
       python: py ? { deployed: true, at: py.at } : { deployed: false },
-      garrett: g ? { connected: true, host: new URL(g.url).hostname } : { connected: false },
+      garrett: g ? { connected: true, host: new URL(g.url).hostname, tools: g.tools ?? 0 } : { connected: false },
+      garrett_dashboard: GARRETT_DASHBOARD,
     };
   }
 
@@ -700,11 +963,8 @@ export class Harness {
       if (!model.startsWith("@")) return bad("model must be a Workers AI model id");
       const index = await this.jobs();
       if (index.filter((j) => j.state === "queued").length >= QUEUE_MAX) return bad(`the queue is full (${QUEUE_MAX} jobs waiting); a job joins when one starts`, 429);
-      const id = Date.now().toString(36) + hex(crypto.getRandomValues(new Uint8Array(3)));
-      const job = { id, task, model, state: "queued", created: Date.now(), started: 0, finished: 0, rounds: [], files: {}, result: "", error: "", note: "", calls: 0 };
-      index.push({ id, task: clip(task.replace(/\s+/g, " "), 120), state: "queued", created: job.created, finished: 0, bytes: 0, note: "" });
-      await this.saveJob(job, index);
-      if ((await this.store.getAlarm()) === null) await this.store.setAlarm(Date.now() + 100);
+      const id = await this.enqueue(index, task, model);
+      await this.store.setAlarm(Date.now() + 100);
       return say({ ok: true, id, position: index.filter((j) => j.state === "queued").length });
     }
     if (seg[1] === "jobs" && seg.length === 3) {
@@ -731,11 +991,15 @@ export class Harness {
     }
 
     if (method === "POST" && at === "garrett") {
-      const u = String(body.url ?? "").trim();
+      // {key}: the key Agent Garrett's dashboard gives, for the hosted agent. {url, token}: an agent of your own.
+      const key = String(body.key ?? "").trim();
+      const u = key ? this.env.GARRETT_MCP || GARRETT_MCP : String(body.url ?? "").trim();
+      const token = key || String(body.token ?? "");
       if (!u) {
         await this.store.delete("garrett");
         return say(await this.status(who));
       }
+      if (key && !/^gtt_[0-9a-f]{64}$/.test(key)) return bad("that is not an Agent Garrett key. It starts with gtt_ and comes from " + GARRETT_DASHBOARD);
       let parsed;
       try {
         parsed = new URL(u);
@@ -743,19 +1007,85 @@ export class Harness {
         return bad("that is not a URL");
       }
       if (parsed.protocol !== "https:" || privateHost(parsed.hostname)) return bad("Agent Garrett's address must be a public https URL");
-      if (String(body.token ?? "").length < 8) return bad("Agent Garrett's token is missing");
-      await this.store.put("garrett", { url: parsed.toString(), token: String(body.token) });
-      const listed = await this.garrettCall("tools/list", {});
-      if (listed.startsWith("ERROR")) {
-        await this.store.delete("garrett");
-        return bad(listed.slice(7), 502);
-      }
+      if (token.length < 8) return bad("Agent Garrett's token is missing");
+      // the same check the desktop veil makes: an MCP handshake, then the tool list. No tool is run.
+      const g = { url: parsed.toString(), token };
+      const hello = await this.garrettRpc(g, "initialize", { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "nl-veil-web", version: VERSION } });
+      const listed = hello.err ? hello : await this.garrettRpc(g, "tools/list", {});
+      const count = Array.isArray(listed.j?.result?.tools) ? listed.j.result.tools.length : 0;
+      if (listed.err || count === 0) return bad("Agent Garrett could not verify this " + (key ? "key. Check your plan, that your agent is ready, and the key in its dashboard" : "address and token") + (listed.err ? ` (${listed.err})` : ""), 502);
+      await this.store.put("garrett", { ...g, tools: count, at: Date.now() });
       return say(await this.status(who));
     }
     if (method === "POST" && at === "garrett/call") {
       const m = String(body.method ?? "");
       if (m !== "tools/list" && m !== "tools/call") return bad("method must be tools/list or tools/call");
-      return say({ ok: true, text: await this.garrettCall(m, body.params && typeof body.params === "object" ? body.params : {}) });
+      return say({ ok: true, text: await this.garrettCall(m, body.params && typeof body.params === "object" ? body.params : {}, body.query) });
+    }
+
+    if (method === "GET" && at === "models") return say({ ok: true, models: await this.models(who) });
+    if (method === "GET" && at === "context") return say({ ok: true, ...(await this.context()) });
+    if (method === "POST" && at === "update") {
+      const u = await this.selfUpdate(who);
+      return u.err ? bad(u.err, 502) : say({ ok: true, was: VERSION, now: u.version, same: u.same === true });
+    }
+
+    if (at === "schedules" && method === "GET") return say({ ok: true, schedules: await this.schedules(), max: SCHEDULES_MAX });
+    if (at === "schedules" && method === "POST") {
+      const task = String(body.task ?? "").trim();
+      const model = String(body.model ?? "");
+      const every = Math.floor(Number(body.every_s));
+      if (!task || task.length > 8000) return bad("task must be 1 to 8000 characters");
+      if (!model.startsWith("@")) return bad("model must be a Workers AI model id");
+      if (!Number.isFinite(every) || every < EVERY_MIN_S || every > 30 * 86400) return bad(`every_s must be between ${EVERY_MIN_S} seconds and 30 days`);
+      const list = await this.schedules();
+      if (list.length >= SCHEDULES_MAX) return bad(`this harness keeps at most ${SCHEDULES_MAX} schedules; delete one first`, 429);
+      const s = { id: "s" + Date.now().toString(36) + hex(crypto.getRandomValues(new Uint8Array(2))), task, model, every_s: every, next: Date.now() + every * 1000, created: Date.now(), runs: 0, last_job: "" };
+      list.push(s);
+      await this.store.put("schedules", list);
+      await this.rearm(1000, list.reduce((t, x) => Math.min(t, x.next), Infinity));
+      return say({ ok: true, schedule: s });
+    }
+    if (seg[1] === "schedules" && seg.length === 3 && method === "DELETE") {
+      const list = await this.schedules();
+      const i = list.findIndex((s) => s.id === seg[2]);
+      if (i < 0) return bad("no such schedule", 404);
+      list.splice(i, 1);
+      await this.store.put("schedules", list);
+      return say({ ok: true, deleted: seg[2] });
+    }
+
+    if (at === "convs" && method === "GET") return say({ ok: true, convs: await this.convs(), max: CONVS_MAX });
+    if (seg[1] === "convs" && seg.length === 3) {
+      const id = seg[2];
+      if (!/^[a-z0-9]{6,24}$/.test(id)) return bad("bad conversation id");
+      const list = await this.convs();
+      const i = list.findIndex((c) => c.id === id);
+      if (method === "GET") return i < 0 ? bad("no such conversation", 404) : say({ ok: true, conv: await this.store.get("conv:" + id) });
+      if (method === "DELETE") {
+        if (i >= 0) list.splice(i, 1);
+        await this.store.delete("conv:" + id);
+        await this.store.put("convs", list);
+        return say({ ok: true, deleted: id });
+      }
+      if (method === "POST") {
+        const conv = { id, title: clip(String(body.title ?? "Chat"), 120), at: Number(body.at) || Date.now(), msgs: Array.isArray(body.msgs) ? body.msgs : [], files: body.files && typeof body.files === "object" ? body.files : {} };
+        const size = JSON.stringify(conv).length;
+        if (size > CONV_BYTES_MAX) return bad("this conversation and its files are larger than one the harness keeps (1.5 MB); it stays in this browser only", 413);
+        const { storage_max } = await this.cfg();
+        const others = list.reduce((n, c) => n + (c.id === id ? 0 : c.bytes ?? 0), 0);
+        if (others + size > storage_max) return bad("the harness's storage limit is reached; delete old chats or raise the limit", 413);
+        // a copy from another browser that is newer than what is being sent wins: the sender is told to take it
+        if (i >= 0 && list[i].at > conv.at) return say({ ok: true, stale: true, at: list[i].at });
+        const row = { id, title: conv.title, at: conv.at, bytes: size };
+        if (i >= 0) list[i] = row;
+        else list.push(row);
+        list.sort((a, b) => b.at - a.at);
+        while (list.length > CONVS_MAX) await this.store.delete("conv:" + list.pop().id);
+        await this.store.put("conv:" + id, conv);
+        await this.store.put("convs", list);
+        return say({ ok: true, at: conv.at });
+      }
     }
     return bad("not found", 404);
   }
