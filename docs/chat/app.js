@@ -1708,12 +1708,75 @@ const completer = (() => {
     shown = { text };
   };
 
+  /* ---- ghostwriting: a comment that asks for code, then Ctrl+Enter, and the model writes it in place ---- */
+  const COMMENT = /^\s*(#|\/\/|--|;|%|\/\*+|\*|<!--)\s*\S/;
+  let writing = null;   // the AbortController of a write in progress
+
+  /* The request at the caret: the run of comment lines the caret is on or just under. {ask, at} or null;
+     `at` is where the code goes (the end of the comment's last line). */
+  const requestAt = (doc, at) => {
+    const lines = doc.split('\n');
+    let n = doc.slice(0, at).split('\n').length - 1;
+    if (!lines[n].trim() && n > 0) n--;   // on the empty line under the comment
+    if (!COMMENT.test(lines[n])) return null;
+    let first = n;
+    while (first > 0 && COMMENT.test(lines[first - 1])) first--;
+    let end = 0;
+    for (let i = 0; i <= n; i++) end += lines[i].length + 1;
+    return { ask: lines.slice(first, n + 1).map((l) => l.replace(/^\s*(#+|\/\/+|--|;+|%+|\/\*+|\*+|<!--)\s?/, '').replace(/\s*(\*\/|-->)\s*$/, '')).join('\n').trim(), at: end - 1 };
+  };
+
+  /* Writes at the caret, live. With a request comment the code that fulfils it goes under the comment;
+     without one the model carries on from the caret. Escape stops it and keeps what is there. */
+  const write = async (ta, ghost, name, context, changed) => {
+    if (writing || ta.readOnly || !S.status) return;
+    drop(ghost);
+    const c = context();
+    const req = requestAt(c.doc, c.at);
+    const at = req ? req.at : c.at;
+    // the place in the textarea: the window's own offset
+    let start = ta.selectionStart + (at - c.at);
+    if (start < 0 || start > ta.value.length) return toast('Scroll the request into view first.');
+    const lead = req ? '\n' : '';
+    const abort = new AbortController();
+    writing = abort;
+    ta.readOnly = true;
+    ta.classList.add('ghostwriting');
+    const dot = document.getElementById('completeDot');
+    const label = dot?.textContent;
+    if (dot) { dot.textContent = '✦ writing… Esc stops'; dot.classList.add('busy'); }
+    let len = 0;
+    const put = (text) => {
+      const clean = lead + text.replace(/^\s*```[\w.+-]*[ \t]*\r?\n/, '').replace(/\r?\n```\s*$/, '');
+      ta.setRangeText(clean, start, start + len, 'end');
+      len = clean.length;
+      changed(true);
+    };
+    try {
+      const reply = await callModel([
+        { role: 'system', content: 'You write code straight into a file that is open in an editor. Reply with ONLY the text to insert at the cursor: no explanation before or after, no code fence. Write in the language and the style of the file. ' + (req ? 'The comment just before the cursor asks for something: write the complete code that does it, and do not repeat the comment.' : 'Carry on from the cursor: finish what is being written there.') },
+        { role: 'user', content: `File: ${name}\n<before>\n${c.doc.slice(Math.max(0, at - 8000), at)}</before>\n<after>\n${c.doc.slice(at, at + 2000)}</after>` + (req ? `\n\nThe request: ${req.ask}` : '') },
+      ], (t) => { if (!abort.signal.aborted && t) put(t); }, abort.signal, 4096);
+      if (reply && !abort.signal.aborted) put(reply);
+    } catch (e) {
+      if (!abort.signal.aborted) toast('Not written: ' + e.message);
+    }
+    writing = null;
+    ta.readOnly = false;
+    ta.classList.remove('ghostwriting');
+    if (dot) { dot.textContent = label; dot.classList.remove('busy'); }
+    changed();
+  };
+
   return {
     on,
     drop,
+    write,
+    writing: () => !!writing,
     close: () => { ready?.then((s) => { try { s?.close(); } catch {} }); ready = null; },
     /* After a keystroke: a pause in the typing, at the end of a line, asks for a suggestion. */
     typed(ta, ghost, name, context) {
+      if (writing) return;
       drop(ghost);
       if (!on() || ta.readOnly || ta.selectionStart !== ta.selectionEnd) return;
       const mine = ++latest;
@@ -1723,6 +1786,12 @@ const completer = (() => {
         const after = c.doc.slice(c.at, lineEnd < 0 ? c.doc.length : lineEnd);
         const lineStart = c.doc.lastIndexOf('\n', c.at - 1) + 1;
         const lineText = c.doc.slice(lineStart, c.at);
+        if (COMMENT.test(lineText) && !after.trim() && lineText.trim().length > 8) {
+          // a comment may be a request: say how to have it written (this is a hint, Tab does not take it)
+          ghost.style.top = (c.line - 1) * c.lh + 'px';
+          ghost.replaceChildren(h('span', { class: 'pad' }, lineText), h('span', { class: 'g hint' }, '   Ctrl+Enter writes this'));
+          return;
+        }
         if (after.trim().replace(/[)\]}'"`;,]/g, '') || c.doc.slice(Math.max(0, c.at - 400), c.at).trim().length < 3) return;   // only at the end of a line, with something to go on
         const dot = document.getElementById('completeDot');
         if (dot) dot.classList.add('busy');
@@ -1735,6 +1804,12 @@ const completer = (() => {
     },
     /* Tab takes the suggestion on screen, Escape drops it. True when the key was used up. */
     key(e, ta, ghost, changed) {
+      if (writing) {
+        if (e.key === 'Escape') writing.abort();
+        e.preventDefault();   // nothing is typed into a file that is being written
+        return true;
+      }
+      if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); write(ta, ghost, e.fileName, e.context, changed); return true; }
       if (!shown) return false;
       if (e.key === 'Tab' && !e.shiftKey) {
         e.preventDefault();
@@ -2636,7 +2711,8 @@ function editorNode(name, status) {
     return { line, col: before.length - at };
   };
   const where = () => { const c = caret(); status.textContent = `Ln ${c.line.toLocaleString()}, Col ${c.col}`; };
-  const changed = () => {
+  const context = () => ({ doc, at: segStart() + ta.selectionStart, ...caret(), lh: lh() });
+  const changed = (quiet = false) => {
     // the window's text goes back into the file
     doc = doc.slice(0, segStart()) + ta.value + doc.slice(segEnd());
     let lines = 1;
@@ -2646,16 +2722,18 @@ function editorNode(name, status) {
     if (!whole()) ta.style.height = (wb - wa) * lh() + 48 + 'px';
     fileEdited(name, doc);
     paint(true); where();
-    completer.typed(ta, ghost, name, () => ({ doc, at: segStart() + ta.selectionStart, ...caret(), lh: lh() }));
+    if (quiet === true) { code.scrollTop = Math.max(code.scrollTop, (caret().line + 3) * lh() - code.clientHeight); return; }   // being written: follow the last line
+    completer.typed(ta, ghost, name, context);
     if (S.preview === 'split') { clearTimeout(previewTimer); previewTimer = setTimeout(() => { const old = document.querySelector('.ide-body .preview, .ide-body .doc'); if (old) old.replaceWith(previewNode(name)); }, 500); }
   };
-  ta.addEventListener('input', changed);
+  ta.addEventListener('input', () => changed());
   ta.addEventListener('keyup', where);
   ta.addEventListener('click', () => { where(); completer.drop(ghost); });
   ta.addEventListener('blur', () => completer.drop(ghost));
   ta.addEventListener('keydown', (e) => {
     const mod = e.ctrlKey || e.metaKey;
-    if (completer.key(e, ta, ghost, changed)) return;   // Tab takes a suggestion, Escape drops it
+    e.fileName = name; e.context = context;
+    if (completer.key(e, ta, ghost, changed)) return;   // Ctrl+Enter writes; Tab takes a suggestion, Escape drops it
     if (mod && e.key.toLowerCase() === 's') { e.preventDefault(); saveNow(); return; }
     if (mod && e.key.toLowerCase() === 'p') { e.preventDefault(); S.explorer = true; drawSide(); queueMicrotask(() => document.getElementById('fileFilter')?.focus()); return; }
     if (mod && e.key.toLowerCase() === 'g') { e.preventDefault(); const to = Number(prompt('Go to line (1 to ' + starts.length + '):') ?? 0); if (to >= 1) goto(to); return; }
@@ -2816,6 +2894,7 @@ function codeTab() {
     : open === null
     ? h('div', { class: 'ide-empty' }, h('p', {}, names.length ? 'Pick a file from the explorer.' : 'Code the veil writes shows up here as it is written. You can edit it, preview a web page beside it, and download it.'),
         h('p', { class: 'fine' }, 'Ctrl+S saves · Ctrl+P finds a file · F2 renames · Tab indents'),
+        h('p', { class: 'fine' }, 'Write a comment that asks for code (# write a script that…), press Ctrl+Enter, and it is written there.'),
         h('div', { class: 'row-btns' }, h('button', { class: 'btn btn-sm', onclick: () => newFile() }, 'New file'),
           inRepo || !canClone ? null : h('button', { class: 'btn btn-sm', title: 'Clone a git repository by its address into this browser, work in it, commit and push', onclick: clone }, 'Clone a repo'),
           inRepo ? null : h('button', { class: 'btn btn-sm', title: repo.canPick() ? 'Work in a folder on this computer: files are read as you open them and edits are written straight to it, so your own git sees them' : 'Add a folder\'s text files to this chat', onclick: openFolder }, folderWord)))
@@ -2832,7 +2911,7 @@ function codeTab() {
           S.preview ? previewNode(open) : null),
         h('div', { class: 'ide-status' }, inRepo && repo.branch ? h('span', { title: 'The branch the folder is on' }, '⎇ ' + repo.branch) : null, h('span', {}, LANGS[ext(open)] ?? 'Plain text'), h('span', {}, S.conv.files[open].split('\n').length.toLocaleString() + ' lines'),
           repo.partial.has(open) ? h('span', { title: 'Too large to edit here' }, `first ${(REPO_TEXT_MAX / 1048576).toFixed(0)} MB of ${(repo.partial.get(open) / 1048576).toFixed(1)} MB · read-only`) : null, status, h('span', { class: 'grow' }),
-          Number(S.status?.version) >= 9 ? h('button', { class: 'status-btn', id: 'completeDot', 'aria-pressed': String(ls.get('veilweb.complete', true)), title: 'Suggestions as you type, from your harness. Tab takes one, Escape drops it.', onclick: () => { ls.set('veilweb.complete', !ls.get('veilweb.complete', true)); if (!ls.get('veilweb.complete', true)) completer.close(); drawSide(); } }, ls.get('veilweb.complete', true) ? '✦ Suggestions on' : '✧ Suggestions off') : null,
+          Number(S.status?.version) >= 9 ? h('button', { class: 'status-btn', id: 'completeDot', 'aria-pressed': String(ls.get('veilweb.complete', true)), title: 'Suggestions as you type, from your harness: Tab takes one, Escape drops it. Ctrl+Enter writes what a comment asks for, right under it.', onclick: () => { ls.set('veilweb.complete', !ls.get('veilweb.complete', true)); if (!ls.get('veilweb.complete', true)) completer.close(); drawSide(); } }, ls.get('veilweb.complete', true) ? '✦ Suggestions on' : '✧ Suggestions off') : null,
           h('span', {}, 'Spaces: 2'), h('span', {}, 'UTF-8')));
   return [h('div', { class: 'ide' + (S.explorer ? '' : ' no-exp') }, explorer, main)];
 }
