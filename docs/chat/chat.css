@@ -121,18 +121,19 @@ button:disabled, .btn[aria-disabled=true] { opacity: .5; cursor: default; pointe
 .tabs button.on { color: var(--accent); background: var(--tonal); box-shadow: inset 0 -2px 0 var(--accent); }
 .tabs button[role=tab] { font-weight: 600; transition: background var(--calm) var(--ease), color var(--calm) var(--ease), box-shadow var(--calm) var(--ease); }
 .tabs .widen { margin-bottom: 4px; padding: 3px 8px; border-radius: var(--radius-btn); color: var(--text-muted); }
-/* With the tabs in a .tab-row of their own, the strip is ONE line: the tabs scroll sideways inside their row when the
-   pane is narrow, and the pane's buttons stay put at the right instead of taking a second line or being pushed off. */
+/* The tabs sit in a .tab-row of their own, and the pane's buttons stay at the right of it, never pushed off. Every tab
+   stays in view: a pane too narrow for them all on one line gives the row a second line rather than hiding any. */
 .tabs:has(> .tab-row) { flex-wrap: nowrap; }
-.tab-row { display: flex; gap: 2px; flex: 1 1 auto; min-width: 0; overflow-x: auto; overflow-y: hidden; scrollbar-width: none; align-items: flex-end; }
-.tab-row::-webkit-scrollbar { display: none; }
+.tab-row { display: flex; flex-wrap: wrap; gap: 2px; flex: 1 1 auto; min-width: 0; align-items: flex-end; }
 .tab-row > button, .tabs:has(> .tab-row) > .widen { flex: 0 0 auto; white-space: nowrap; }
 .tabs:has(> .tab-row) > .widen:first-of-type { margin-left: 6px; }
-/* a narrow pane tightens the strip before anything has to scroll */
-.side:has(.tab-row) { container-type: inline-size; }
-@container (max-width: 480px) {
-  .tab-row > button { padding: 7px 8px; }
-  .tabs:has(> .tab-row) > .widen { padding: 3px 5px; }
+/* a narrower pane tightens the strip first, so the usual width still holds every tab on one line */
+@container (max-width: 520px) {
+  .tab-row { gap: 0; }
+  .tab-row > button { padding: 7px 7px; }
+  .tabs:has(> .tab-row) { padding-left: 4px; padding-right: 4px; }
+  .tabs:has(> .tab-row) > .widen { padding: 3px 4px; }
+  .tabs:has(> .tab-row) > .widen:first-of-type { margin-left: 2px; }
 }
 .pane { flex: 1; min-height: 0; overflow: auto; display: flex; flex-direction: column; }
 /* a change of tab eases in; a redraw of the same tab (fresh data) does not move at all */
