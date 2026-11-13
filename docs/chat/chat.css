@@ -166,6 +166,22 @@ button:disabled, .btn[aria-disabled=true] { opacity: .5; cursor: default; pointe
 .tree-row .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .tree-row .twist { width: 12px; flex: 0 0 auto; color: var(--text-muted); }
 .tree-row .x { visibility: hidden; }
+.tree-row.hit { align-items: flex-start; white-space: normal; text-align: left; font-family: var(--font-mono); font-size: var(--fs-micro); }
+.tree-row.hit .where { color: var(--accent); }
+.row-btns { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; }
+.code.windowed .hl { min-height: 0; }
+.code.windowed .gutter { box-sizing: border-box; }
+.ta[readonly] { cursor: default; }
+.code.ta-window .ta { inset: auto 0 auto 0; }
+/* a suggestion at the caret */
+.ghost { position: absolute; left: 0; right: 0; margin: 0; padding: 8px 14px 0 12px; font: inherit; tab-size: inherit; white-space: pre; pointer-events: none; background: transparent; border: 0; color: var(--text-muted); z-index: 1; }
+.ghost:empty { display: none; }
+.ghost .pad { visibility: hidden; }
+.ghost .g { opacity: .75; font-style: italic; }
+.ghost .g.more { display: block; width: max-content; max-width: 100%; background: var(--surface-raised); box-shadow: 0 2px 10px rgb(0 0 0 / .18); border-radius: 4px; padding: 0 6px 0 0; }
+.status-btn { background: transparent; border: 0; color: inherit; font: inherit; padding: 0 4px; cursor: pointer; border-radius: 3px; }
+.status-btn:hover { background: rgb(255 255 255 / .18); }
+.status-btn.busy { animation: blink 1s steps(2, start) infinite; }
 .tree-row:hover .x, .tree-row:focus-within .x { visibility: visible; }
 .badge { flex: 0 0 auto; width: 18px; text-align: center; font: 700 9px/14px var(--font-mono); letter-spacing: -.02em; color: var(--text-muted); }
 .badge.lang-js, .badge.lang-ts { color: var(--tok-n); } .badge.lang-html { color: var(--tok-t); } .badge.lang-css { color: var(--tok-f); }
