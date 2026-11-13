@@ -2632,6 +2632,7 @@ async function termEnter(line) {
   drawTerm();
   const r = await termRun(line);
   term.busy = false;
+  if (!repo.on()) touchConv();   // files a command made are the chat's files: kept like any edit
   if (r.out) termPrint(r.out, r.ok ? 'out' : 'err');
   drawSide();
   queueMicrotask(() => document.getElementById('termIn')?.focus());
