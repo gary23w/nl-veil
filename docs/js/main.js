@@ -25,10 +25,10 @@
 
   function currentTheme() { return root.getAttribute('data-theme') || 'matrix'; }
 
-  function setTheme(id) {
+  function setTheme(id, chosen) {
     const t = THEMES.find((x) => x.id === id) || THEMES[0];
     root.setAttribute('data-theme', t.id);
-    try { localStorage.setItem('veil.theme', t.id); } catch (e) {}
+    if (chosen) { try { localStorage.setItem('veil.theme', t.id); localStorage.setItem('veil.theme.chosen', '1'); } catch (e) {} }
     // one theme-color meta, rewritten — the media-query pair in <head> only
     // covers the unset case, and an explicit choice has to beat it
     document.querySelectorAll('meta[name=theme-color]').forEach((m) => m.remove());
@@ -50,7 +50,7 @@
   if (themeBtn) {
     themeBtn.addEventListener('click', () => {
       const i = THEMES.findIndex((x) => x.id === currentTheme());
-      setTheme(THEMES[(i + 1) % THEMES.length].id);
+      setTheme(THEMES[(i + 1) % THEMES.length].id, true);
     });
   }
 

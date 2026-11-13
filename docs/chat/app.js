@@ -4147,15 +4147,15 @@ const THEME_ICONS = {
   dark: '<svg viewBox="0 0 24 24"><path d="M20.5 14.5A8.5 8.5 0 0 1 9.5 3.5a8.5 8.5 0 1 0 11 11z"/></svg>',
   matrix: '<svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9l3 3-3 3M13 15h4"/></svg>',
 };
-function setTheme(id) {
-  if (!THEMES.includes(id)) id = 'light';
+function setTheme(id, chosen = false) {
+  if (!THEMES.includes(id)) id = 'matrix';
   document.documentElement.setAttribute('data-theme', id);
-  try { localStorage.setItem('veil.theme', id); } catch {}
+  if (chosen) { try { localStorage.setItem('veil.theme', id); localStorage.setItem('veil.theme.chosen', '1'); } catch {} }
   const btn = document.getElementById('themeBtn');
   btn.innerHTML = THEME_ICONS[id];
   btn.title = 'Theme: ' + id + ' (click to cycle)';
 }
-document.getElementById('themeBtn').addEventListener('click', () => setTheme(THEMES[(THEMES.indexOf(document.documentElement.getAttribute('data-theme')) + 1) % THEMES.length]));
+document.getElementById('themeBtn').addEventListener('click', () => setTheme(THEMES[(THEMES.indexOf(document.documentElement.getAttribute('data-theme')) + 1) % THEMES.length], true));
 setTheme(document.documentElement.getAttribute('data-theme'));
 
 /* ============================================================ boot */

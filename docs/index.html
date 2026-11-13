@@ -21,7 +21,7 @@
      scheme. An explicit choice wins; otherwise follow the OS — the same rule
      the web client uses (web/public/index.html). */
   try {
-    var t = localStorage.getItem('veil.theme');
+    var t = localStorage.getItem('veil.theme.chosen') ? localStorage.getItem('veil.theme') : null;   /* only a theme the reader picked */
     if (!t) t = 'matrix';   /* the Agent Garrett theme, until the reader picks another */
     document.documentElement.setAttribute('data-theme', t);
   } catch (e) {}
