@@ -63,6 +63,8 @@ const db = (() => {
   const mem = new Map();
   let opened = null;
   const open = () => (opened ??= new Promise((res) => {
+    // a database another tab is upgrading or deleting can keep an open waiting for good: the page must not
+    setTimeout(() => res(null), 1500);
     try {
       const r = indexedDB.open('veilweb', 1);
       r.onupgradeneeded = () => r.result.createObjectStore('kv');
@@ -139,16 +141,22 @@ const S = {
   me: null,                              // {email, account_name}
   checking: false,                       // looking for the harness right now
   model: ls.get('veilweb.model') || CFG.models[0],
-  convs: [],                             // [{id, title, at}] newest first
+  models: [],                            // the account's Workers AI text models, from the harness
+  context: '',                           // the harness's reference text (llms.txt digest)
+  convs: [],                             // [{id, title, at}] newest first; the harness's copy and this browser's, merged
   conv: null,                            // the open conversation: {id, title, at, msgs, files}
   live: null,                            // the running turn: {tools, text, status, abort}
-  tab: 'files',                          // the side pane: files | jobs | harness
-  file: null,                            // the file open in the viewer
+  tab: 'code',                           // the side pane: code | jobs | harness
+  wide: false,                           // the side pane takes half the window (for reading code)
+  file: null,                            // the file open in the editor
+  preview: false,                        // the open file is shown rendered, not as text
   jobs: [],                              // the harness's queue, oldest first
+  schedules: [],                         // the harness's repeating tasks
   job: null,                             // the job open in the viewer (whole record)
   err: '',                               // the gate's or the setup card's message
-  note: '',                              // the Harness tab's last message
+  note: '',                              // the side pane's last message
   busy: '',                              // which side-pane action is in flight
+  linksOpen: ls.get('veilweb.links', true),
   panes: { rail: false, side: false },   // narrow screens: which drawer is open
 };
 
@@ -206,7 +214,7 @@ function logout(why = '') {
 /* ============================================================ the harness */
 
 /* One call to the harness with the login. An access token near its end is renewed first; a 401 is retried once
-   with a renewed one. `lost` login sends the user back to the gate. */
+   with a renewed one. A lost login sends the user back to the gate. */
 async function harness(path, init = {}, base = S.harness) {
   const call = () => fetch(base + path, {
     method: init.method ?? (init.body === undefined ? 'GET' : 'POST'),
@@ -244,7 +252,10 @@ function harnessUrl(typed) {
   return u.origin;
 }
 
-/* Is there a harness at `url` that this login owns? Sets S.harness + S.status when there is. */
+const outdated = () => !!S.status && Number(S.status.version) < CFG.harness_version;
+
+/* Is there a harness at `url` that this login owns? Sets S.harness + S.status when there is, then loads what
+   the harness keeps: who is logged in, the model list, the reference text, the chats, the jobs. */
 async function findHarness(url, quiet = false) {
   S.checking = true;
   if (!quiet) S.err = '';
@@ -258,13 +269,27 @@ async function findHarness(url, quiet = false) {
     S.status = j;
     ls.set('veilweb.harness', url);
     harnessJson('/v1/me').then((me) => { S.me = me; draw(); }).catch(() => {});
-    refreshJobs();
+    loadHarnessData();
   } catch (e) {
     if (!quiet) S.err = e instanceof TypeError ? 'Nothing answered at that address. A new Worker can take a minute to come up; check the name and try again.' : e.message;
     else if (!(e instanceof TypeError)) S.err = e.message;
   }
   S.checking = false;
   draw();
+}
+
+/* Everything past /v1/status. A harness older than this page lacks some of these routes; each is optional. */
+function loadHarnessData() {
+  refreshJobs();
+  if (outdated()) return;
+  harnessJson('/v1/models').then((j) => {
+    S.models = j.models;
+    if (S.models.length && !S.models.some((m) => m.id === S.model) && !ls.get('veilweb.model')) S.model = S.models[0].id;
+    draw();
+  }).catch(() => {});
+  harnessJson('/v1/context').then((j) => { S.context = j.digest || ''; }).catch(() => {});
+  harnessJson('/v1/schedules').then((j) => { S.schedules = j.schedules; drawSide(); }).catch(() => {});
+  pullConvs();
 }
 
 async function refreshStatus() {
@@ -283,9 +308,9 @@ async function refreshJobs() {
   }
   if (S.tab === 'jobs') drawSide();
 }
-setInterval(() => { if (S.status && !document.hidden && (S.tab === 'jobs' || S.jobs.some((j) => j.state === 'queued' || j.state === 'running'))) refreshJobs(); }, 5000);
+setInterval(() => { if (S.status && !document.hidden && (S.tab === 'jobs' || S.jobs.some((j) => j.state === 'queued' || j.state === 'running') || S.schedules.length)) refreshJobs(); }, 5000);
 
-/* A side-pane action: one at a time, its failure shown in the Harness tab. */
+/* A side-pane action: one at a time, its failure shown in the pane. */
 async function act(name, fn) {
   if (S.busy) return;
   S.busy = name; S.note = '';
@@ -293,6 +318,26 @@ async function act(name, fn) {
   try { await fn(); } catch (e) { S.note = e.message; }
   S.busy = '';
   drawSide();
+}
+
+/* Replace the harness with the current one from the public repo, then wait for the new version to answer. */
+async function updateHarness() {
+  const was = S.status.version;
+  try {
+    const u = await harnessJson('/v1/update', { body: {} });
+    if (u.same) return toast('Your harness is already the newest (version ' + u.now + ').');
+  } catch (e) {
+    if (/not found|HTTP 404/i.test(e.message)) throw new Error('This harness is from before it could update itself. Deploy it once more from Cloudflare\'s deploy page (the same button as before); later updates are one click here.');
+    throw e;
+  }
+  // Cloudflare takes the new code at once but the harness's Durable Object can keep the old for some minutes
+  toast('Update accepted. Cloudflare can take a few minutes to switch over; this page will say when it has.');
+  for (let i = 0; i < 60; i++) {
+    await new Promise((r) => setTimeout(r, 6000));
+    try { S.status = await harnessJson('/v1/status'); } catch {}
+    if (S.status.version !== was) { loadHarnessData(); draw(); toast('Harness updated to version ' + S.status.version + '.'); return; }
+  }
+  throw new Error('The update was accepted but the new version has not answered yet. Reload in a minute.');
 }
 
 /* ============================================================ the model */
@@ -359,8 +404,9 @@ const TOOLS = {
   http_request: { args: '{"url": "<https://...>", "method": "GET", "headers": {}, "body": ""}', does: 'make any HTTP call and see the raw answer' },
   swarm: { args: '{"task": "<the question>", "angles": ["<a way to look at it>", "..."]}', does: 'ask up to ' + SWARM_MAX + ' minds at once, one per angle, and get every answer back to weigh' },
   queue_job: { args: '{"task": "<the whole task, self-contained>"}', does: 'hand a long task to the worker harness; it runs there in turn (first in, first out) even with this tab closed, and the user reads the result in the Jobs tab' },
+  schedule_job: { args: '{"task": "<the whole task, self-contained>", "every_minutes": 60}', does: 'have the harness queue this task again and again, every so many minutes (5 at the least)', when: () => !outdated() },
   run_python: { args: '{"code": "<python>"}', does: 'run Python on the harness\'s Python Worker; the workspace files are beside the script and files it changes come back', when: () => S.status?.python?.deployed },
-  garrett_tools: { args: '{}', does: 'list Agent Garrett\'s tools (the user\'s own agent, over MCP)', when: () => S.status?.garrett?.connected },
+  garrett_tools: { args: '{"query": "<words, optional>"}', does: 'list Agent Garrett\'s security tools (those matching the words)', when: () => S.status?.garrett?.connected },
   garrett: { args: '{"name": "<tool>", "args": {...}}', does: 'call one of Agent Garrett\'s tools', when: () => S.status?.garrett?.connected },
 };
 const toolsNow = () => Object.entries(TOOLS).filter(([, t]) => !t.when || t.when());
@@ -375,6 +421,7 @@ async function runTool(name, args, signal) {
       if (!f || f.length > 200 || f.includes('..')) return 'error: bad file name';
       const body = String(args.content ?? args.text ?? '');
       files[f] = body;
+      S.file = f;   // the Code tab follows what is being written
       return `wrote ${f} (${body.length} characters)`;
     }
     case 'read_file':
@@ -386,6 +433,7 @@ async function runTool(name, args, signal) {
       const n = files[f].split(find).length - 1;
       if (n !== 1) return `error: find matches ${n} places in ${f}; it must match exactly one`;
       files[f] = files[f].replace(find, () => String(args.replace ?? args.new ?? ''));
+      S.file = f;
       return `edited ${f} (${files[f].length} characters now)`;
     }
     case 'list_files':
@@ -427,13 +475,19 @@ async function runTool(name, args, signal) {
       refreshJobs();
       return `queued as job ${j.id}, number ${j.position} in line. It runs on the harness; its result appears in the Jobs tab.`;
     }
+    case 'schedule_job': {
+      const minutes = Math.max(5, Math.floor(Number(args.every_minutes) || 60));
+      const j = await harnessJson('/v1/schedules', { body: { task: String(args.task ?? ''), model: S.model, every_s: minutes * 60 }, signal });
+      S.schedules = (await harnessJson('/v1/schedules')).schedules;
+      return `scheduled: the harness queues this task every ${minutes} minutes, first at ${new Date(j.schedule.next).toISOString().slice(11, 16)} UTC. It is listed in the Jobs tab, where it can be deleted.`;
+    }
     case 'run_python': {
       const j = await harnessJson('/v1/python/run', { body: { code: String(args.code ?? ''), files }, signal });
       for (const [n, c] of Object.entries(j.run.files)) if (typeof c === 'string') files[fileName(n)] = c;
       return (j.run.ok ? '' : 'error: ') + (j.run.out || '(no output)');
     }
     case 'garrett_tools':
-      return (await harnessJson('/v1/garrett/call', { body: { method: 'tools/list', params: {} }, signal })).text;
+      return (await harnessJson('/v1/garrett/call', { body: { method: 'tools/list', params: {}, query: String(args.query ?? '') }, signal })).text;
     case 'garrett':
       return (await harnessJson('/v1/garrett/call', { body: { method: 'tools/call', params: { name: String(args.name ?? ''), arguments: args.args && typeof args.args === 'object' ? args.args : {} } }, signal })).text;
     default:
@@ -489,11 +543,17 @@ function parseAction(reply) {
 
 function systemPrompt() {
   const tools = toolsNow().map(([n, t]) => `- ${n} ${t.args} : ${t.does}`).join('\n');
+  const garrett = S.status?.garrett?.connected
+    ? 'Agent Garrett, the security agent by the same author as this veil, is connected: its tools are on your belt as garrett_tools (find one) and garrett (call one). Use them for security work.'
+    : 'Agent Garrett is a security agent by the same author as this veil. It is NOT connected here. When the user asks for security work that needs tools you lack (CVE, KEV or EPSS lookups, DNS and certificate-transparency recon, RDAP, email security posture, IOC extraction, evidence manifests), first do what you honestly can with your own tools, then say once, in a sentence, that connecting Agent Garrett adds those tools to this chat: Harness tab, with a key from ' + CFG.garrett.dashboard + '. Do not bring it up for other work, do not repeat it, and never state a result its tools would have given.';
   return 'You are the veil, running as the veil\'s web chat: a chat in the user\'s browser. Your model calls and web requests go through a worker harness in the user\'s own Cloudflare account.\n' +
-    'You have a workspace of files that lives in this browser tab (the user sees it beside the chat and can download any file) and these tools:\n' + tools + '\n\n' +
+    'You have a workspace of files (the user watches it in the Code tab beside the chat, can edit it, and can preview a web page live) and these tools:\n' + tools + '\n\n' +
     'To use a tool, reply with exactly ONE JSON object and nothing else: {"tool": "<name>", "args": {...}}. You are then given the result and may use another tool or answer.\n' +
     'When you are done, answer the user in plain text (markdown is fine), never as JSON. Do not say a file was written or a page was read unless a tool result shows it. ' +
-    'You cannot reach the user\'s computer from here; say so when it matters.\n' +
+    'When asked to build an app, page or script, write it as files with write_file (a web page as index.html plus its own .css and .js files) so the user sees it in the Code tab; do not paste whole files into the answer. ' +
+    'If web_search fails, fetch a likely page directly with web_fetch. You cannot reach the user\'s computer from here; say so when it matters.\n' +
+    garrett + '\n' +
+    (S.context ? '\nREFERENCE (from garrettstimpson.ca/llms.txt, about the people and projects behind this veil; answer questions about Agent Garrett, NL-VEIL and their author from it, with its links):\n' + S.context + '\n' : '') +
     'Today is ' + new Date().toISOString().slice(0, 10) + '.';
 }
 
@@ -590,6 +650,7 @@ async function runTurn(text) {
       chip.failed = /^error: /.test(result);
       chip.running = false;
       rounds.push({ id: 'c' + (rounds.length + 1), name: act.tool, args: act.args, say: act.say, result });
+      if (['write_file', 'edit_file'].includes(act.tool) && !chip.failed) S.tab = 'code';   // watch the code as it lands
       drawSide();
     }
   } catch (e) {
@@ -607,38 +668,108 @@ async function runTurn(text) {
 
 /* ============================================================ conversations */
 
+/* A conversation lives in this browser (IndexedDB) and, when the harness is new enough, in the harness too, so
+   another browser logged in to the same account finds it. The newer copy wins by its `at` stamp. */
+
+const putIndex = () => db.put('convs', S.convs);
+
 async function saveConv() {
   const c = S.conv;
   if (!c || c.msgs.length === 0) return;
   c.at = Date.now();
   await db.put('conv:' + c.id, c);
   S.convs = [{ id: c.id, title: c.title, at: c.at }, ...S.convs.filter((x) => x.id !== c.id)];
-  await db.put('convs', S.convs);
+  await putIndex();
+  pushConv(c);
+}
+
+/* Best effort: a conversation the harness cannot take (too large, storage full) stays in this browser. */
+let pushTimer = null;
+function pushConv(c) {
+  if (!S.status || outdated()) return;
+  clearTimeout(pushTimer);
+  pushTimer = setTimeout(async () => {
+    try {
+      await harnessJson('/v1/convs/' + c.id, { body: { title: c.title, at: c.at, msgs: c.msgs, files: c.files } });
+    } catch (e) {
+      toast('Not synced to the harness: ' + e.message);
+    }
+  }, 800);
+}
+
+/* The harness's list, merged into this browser's: what only the harness has, or has newer, is marked to fetch. */
+async function pullConvs() {
+  let remote;
+  try { remote = (await harnessJson('/v1/convs')).convs; } catch { return; }
+  const mine = new Map(S.convs.map((c) => [c.id, c]));
+  for (const r of remote) {
+    const m = mine.get(r.id);
+    if (!m || r.at > m.at) mine.set(r.id, { id: r.id, title: r.title, at: r.at, fetch: true });
+  }
+  S.convs = [...mine.values()].sort((a, b) => b.at - a.at);
+  await putIndex();
+  // what this browser has and the harness lacks goes up, a few at a time
+  const theirs = new Set(remote.map((r) => r.id));
+  for (const c of S.convs.filter((x) => !theirs.has(x.id)).slice(0, 5)) {
+    const full = await db.get('conv:' + c.id);
+    if (full) harnessJson('/v1/convs/' + c.id, { body: { title: full.title, at: full.at, msgs: full.msgs, files: full.files } }).catch(() => {});
+  }
+  draw();
 }
 
 function newConv() {
   S.conv = { id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6), title: 'New chat', at: Date.now(), msgs: [], files: {} };
   S.file = null;
+  S.preview = false;
 }
 
 async function openConv(id) {
   if (S.live) return;
-  const c = await db.get('conv:' + id);
-  if (!c) return;
+  const row = S.convs.find((x) => x.id === id);
+  let c = await db.get('conv:' + id);
+  if (row?.fetch || !c) {
+    try {
+      c = (await harnessJson('/v1/convs/' + id)).conv;
+      await db.put('conv:' + id, c);
+      if (row) delete row.fetch;
+      await putIndex();
+    } catch (e) {
+      if (!c) return toast('Could not open that chat: ' + e.message);
+    }
+  }
   S.conv = c;
-  S.file = null;
+  S.file = Object.keys(c.files)[0] ?? null;
+  S.preview = false;
   S.panes.rail = false;
   draw();
 }
 
 async function deleteConv(id) {
   if (S.live) return;
-  if (!confirm('Delete this conversation and its files from this browser?')) return;
+  if (!confirm('Delete this conversation and its files, here and on your harness?')) return;
   await db.del('conv:' + id);
   S.convs = S.convs.filter((x) => x.id !== id);
-  await db.put('convs', S.convs);
+  await putIndex();
+  if (S.status && !outdated()) harnessJson('/v1/convs/' + id, { method: 'DELETE' }).catch(() => {});
   if (S.conv?.id === id) newConv();
   draw();
+}
+
+/* A workspace file changed by hand in the editor: kept at once, saved a moment after the typing stops. */
+let editTimer = null;
+function fileEdited(name, text) {
+  S.conv.files[name] = text;
+  touchConv();
+}
+function touchConv() {
+  clearTimeout(editTimer);
+  editTimer = setTimeout(() => {
+    if (S.conv.msgs.length === 0) S.conv.title = S.conv.title === 'New chat' ? 'Workspace' : S.conv.title;
+    S.conv.at = Date.now();
+    db.put('conv:' + S.conv.id, S.conv);
+    if (!S.convs.some((x) => x.id === S.conv.id)) { S.convs.unshift({ id: S.conv.id, title: S.conv.title, at: S.conv.at }); putIndex(); }
+    pushConv(S.conv);
+  }, 700);
 }
 
 /* ============================================================ drawing */
@@ -646,10 +777,21 @@ async function deleteConv(id) {
 const app = document.getElementById('app');
 const barSlot = document.getElementById('barSlot');
 const render = (md) => window.NVMarkdown.render(String(md ?? ''));
+const ext = (name) => (/\.([a-z0-9]+)$/i.exec(name)?.[1] ?? '').toLowerCase();
+const link = (item, cls = '') => h('a', { class: cls, href: item.href, ...(item.href.startsWith('http') ? { target: '_blank', rel: 'noopener' } : {}) }, item.label);
+
+/* A short message that needs no answer: shown at the bottom for a few seconds. */
+function toast(text) {
+  let box = document.getElementById('toasts');
+  if (!box) { box = h('div', { id: 'toasts', class: 'toasts', role: 'status', 'aria-live': 'polite' }); document.body.append(box); }
+  const t = h('div', { class: 'toast' }, text);
+  box.append(t);
+  setTimeout(() => { t.classList.add('out'); setTimeout(() => t.remove(), 300); }, 5000);
+}
 
 function toolChip(t) {
-  return h('details', { class: 'tool' + (t.failed ? ' failed' : '') },
-    h('summary', {}, (t.running ? '… ' : t.failed ? '✕ ' : '✓ ') + (t.name ?? t.tool) + ' ' + clip(JSON.stringify(t.args), 120)),
+  return h('details', { class: 'tool' + (t.failed ? ' failed' : '') + (t.running ? ' running' : '') },
+    h('summary', {}, h('span', { class: 'mark' }, t.running ? '' : t.failed ? '✕' : '✓'), (t.name ?? t.tool) + ' ' + clip(JSON.stringify(t.args), 120)),
     h('pre', {}, t.running ? 'running…' : t.result));
 }
 
@@ -663,9 +805,9 @@ function message(m) {
 
 function liveNode() {
   const L = S.live;
-  return h('div', { class: 'msg assistant', id: 'live' }, h('div', { class: 'role' }, 'veil'),
+  return h('div', { class: 'msg assistant live', id: 'live' }, h('div', { class: 'role' }, 'veil'),
     L.tools.map(toolChip),
-    L.text ? h('div', { class: 'body md', html: render(L.text) }) : h('div', { class: 'status' }, L.status));
+    L.text ? h('div', { class: 'body md', html: render(L.text) }) : h('div', { class: 'status' }, h('span', { class: 'dots', 'aria-hidden': 'true' }, h('i'), h('i'), h('i')), L.status));
 }
 
 let liveQueued = false;
@@ -678,7 +820,9 @@ function drawLive() {
     if (!old || !S.live) return;
     const box = old.parentElement;
     const pinned = box.scrollHeight - box.scrollTop - box.clientHeight < 80;
-    old.replaceWith(liveNode());
+    const next = liveNode();
+    next.classList.add('settled');   // only a message's first appearance animates
+    old.replaceWith(next);
     if (pinned) box.scrollTop = box.scrollHeight;
   });
 }
@@ -689,46 +833,93 @@ function download(name, text) {
   setTimeout(() => URL.revokeObjectURL(a.href), 1000);
 }
 
-/* ---- side pane: Files ---- */
-function filesTab() {
+/* ---- side pane: Code (the workspace as an editor, with a live preview) ---- */
+
+/* An HTML file as one self-contained document: the workspace stylesheets and scripts it names are put inline,
+   so the preview shows the page the files make together. */
+function inlined(html, files) {
+  const at = (ref) => files[fileName(ref.split(/[?#]/)[0])];
+  return String(html)
+    .replace(/<link\b[^>]*\bhref=["']([^"']+)["'][^>]*>/gi, (tag, ref) => (/stylesheet/i.test(tag) && at(ref) !== undefined ? `<style>${at(ref)}</style>` : tag))
+    .replace(/<script\b([^>]*)\bsrc=["']([^"']+)["']([^>]*)>\s*<\/script>/gi, (tag, a, ref, b) => (at(ref) !== undefined ? `<script${a}${b}>${at(ref).replace(/<\/script/gi, '<\\/script')}</` + 'script>' : tag));
+}
+
+const previewable = (name) => ['html', 'htm', 'svg', 'md', 'markdown'].includes(ext(name));
+
+function codeTab() {
   const files = Object.keys(S.conv.files).sort();
   const open = S.file !== null && S.file in S.conv.files ? S.file : null;
+  const addFile = () => {
+    const name = fileName(prompt('New file name (for example index.html):') ?? '');
+    if (!name || name.includes('..') || name.length > 200) return;
+    if (!(name in S.conv.files)) fileEdited(name, '');
+    S.file = name; S.preview = false;
+    drawSide();
+  };
+  let body = null;
+  if (open !== null) {
+    const text = S.conv.files[open];
+    const kind = ext(open);
+    if (S.preview && (kind === 'md' || kind === 'markdown')) body = h('div', { class: 'doc md', html: render(text) });
+    else if (S.preview && previewable(open)) body = h('iframe', { class: 'preview', title: 'Preview of ' + open, sandbox: 'allow-scripts', srcdoc: kind === 'svg' ? text : inlined(text, S.conv.files) });
+    else body = h('textarea', { id: 'editor', class: 'editor', spellcheck: 'false', autocapitalize: 'off', autocomplete: 'off', 'aria-label': 'Contents of ' + open, value: text, oninput: (e) => fileEdited(open, e.target.value), onkeydown: (e) => {
+      if (e.key !== 'Tab' || e.shiftKey || e.altKey || e.ctrlKey || e.metaKey) return;
+      e.preventDefault();   // Tab indents; Escape then Tab leaves the editor
+      const el = e.target, at = el.selectionStart;
+      el.setRangeText('  ', at, el.selectionEnd, 'end');
+      fileEdited(open, el.value);
+    } });
+  }
   return [
-    h('div', { class: 'list' },
-      files.length === 0 ? h('div', { class: 'empty' }, 'Files the veil writes appear here. They live in this browser; download the ones you want to keep.') : null,
-      files.map((n) => h('button', { class: 'item' + (n === open ? ' on' : ''), onclick: () => { S.file = n; drawSide(); } },
-        h('span', { class: 'name' }, n), h('span', { class: 'meta' }, String(S.conv.files[n].length))))),
-    open === null ? null : h('div', { class: 'viewer' },
-      h('div', { class: 'vh' }, h('span', { class: 'name' }, open),
-        h('button', { class: 'btn btn-ghost btn-sm', onclick: () => download(open, S.conv.files[open]) }, 'Download'),
-        h('button', { class: 'btn btn-ghost btn-sm', 'aria-label': 'Close file', onclick: () => { S.file = null; drawSide(); } }, '✕')),
-      h('pre', {}, S.conv.files[open])),
+    h('div', { class: 'filebar' },
+      files.map((n) => h('button', { class: 'file' + (n === open ? ' on' : ''), title: n, onclick: () => { S.file = n; S.preview = false; drawSide(); } }, n)),
+      h('button', { class: 'file add', 'aria-label': 'New file', onclick: addFile }, '+ file')),
+    open === null
+      ? h('div', { class: 'empty' }, files.length ? 'Pick a file.' : 'Code the veil writes shows up here as it is written. You can edit it, preview a web page live, and download what you want to keep. Ask for something to be built, or start a file yourself.')
+      : h('div', { class: 'viewer' },
+          h('div', { class: 'vh' }, h('span', { class: 'name' }, open), h('span', { class: 'meta' }, S.conv.files[open].length + ' chars'),
+            previewable(open) ? h('button', { class: 'btn btn-sm' + (S.preview ? ' btn-solid' : ''), 'aria-pressed': String(S.preview), onclick: () => { S.preview = !S.preview; drawSide(); } }, S.preview ? 'Code' : 'Preview') : null,
+            h('button', { class: 'btn btn-ghost btn-sm', onclick: () => download(open, S.conv.files[open]) }, 'Download'),
+            h('button', { class: 'btn btn-ghost btn-sm', 'aria-label': 'Delete ' + open, onclick: () => { if (!confirm('Delete ' + open + '?')) return; delete S.conv.files[open]; S.file = null; touchConv(); drawSide(); } }, 'Delete')),
+          body),
   ];
 }
 
-/* ---- side pane: Jobs (the harness's FIFO queue) ---- */
+/* ---- side pane: Jobs (the harness's FIFO queue and its schedules) ---- */
+const REPEATS = [['0', 'Once'], ['900', 'Every 15 minutes'], ['3600', 'Every hour'], ['21600', 'Every 6 hours'], ['86400', 'Every day']];
+const everyWords = (s) => (s % 86400 === 0 ? `${s / 86400} d` : s % 3600 === 0 ? `${s / 3600} h` : `${Math.round(s / 60)} min`);
+
 function jobsTab() {
   const q = S.status?.queue;
   const task = h('textarea', { id: 'jobTask', rows: '3', placeholder: 'A task for the harness to work through on its own', 'aria-label': 'Job task' });
+  const repeat = h('select', { id: 'jobRepeat', 'aria-label': 'Repeat', disabled: outdated() }, REPEATS.map(([v, l]) => h('option', { value: v }, l)));
   const queue = () => act('queue', async () => {
     const text = task.value.trim();
     if (!text) return;
-    await harnessJson('/v1/jobs', { body: { task: text, model: S.model } });
+    const every = Number(repeat.value);
+    if (every > 0) await harnessJson('/v1/schedules', { body: { task: text, model: S.model, every_s: every } });
+    else await harnessJson('/v1/jobs', { body: { task: text, model: S.model } });
     task.value = '';
-    S.tab = 'jobs';
+    if (every > 0) S.schedules = (await harnessJson('/v1/schedules')).schedules;
     await refreshJobs();
     await refreshStatus();
   });
   const J = S.job;
   return [
     h('div', { class: 'block' },
-      h('p', {}, `Jobs run on your worker harness, one at a time, first in first out, and go on with this tab closed.${q ? ` Up to ${q.max} can wait; the newest ${q.keep} finished are kept.` : ''}`),
+      h('p', {}, `Jobs run on your worker harness, one at a time, first in first out, and go on with this tab closed.${q ? ` Up to ${q.max} can wait; the newest ${q.keep} finished are kept.` : ''} A repeating task queues itself each time it comes due.`),
       task,
-      h('div', { class: 'acts' }, h('button', { class: 'btn btn-solid btn-sm', disabled: !!S.busy, onclick: queue }, S.busy === 'queue' ? 'Queuing…' : 'Queue job')),
+      h('div', { class: 'acts' }, repeat, h('button', { class: 'btn btn-solid btn-sm', disabled: !!S.busy, onclick: queue }, S.busy === 'queue' ? 'Queuing…' : 'Queue job')),
       S.note && S.tab === 'jobs' ? h('div', { class: 'err' }, S.note) : null),
+    S.schedules.length === 0 ? null : h('div', { class: 'block' }, h('h3', {}, 'Repeating'),
+      S.schedules.map((s) => h('div', { class: 'item static' },
+        h('span', { class: 'state running' }, everyWords(s.every_s)),
+        h('span', { class: 'name', title: s.task }, s.task),
+        h('span', { class: 'meta' }, 'next ' + new Date(s.next).toISOString().slice(11, 16) + ' UTC'),
+        h('button', { class: 'x show', 'aria-label': 'Delete schedule', onclick: () => act('sched', async () => { await harnessJson('/v1/schedules/' + s.id, { method: 'DELETE' }); S.schedules = S.schedules.filter((x) => x.id !== s.id); }) }, '✕')))),
     h('div', { class: 'list' },
       S.jobs.length === 0 ? h('div', { class: 'empty' }, 'No jobs yet.') : null,
-      S.jobs.map((j) => h('button', { class: 'item' + (J?.id === j.id ? ' on' : ''), onclick: async () => { try { S.job = (await harnessJson('/v1/jobs/' + j.id)).job; } catch (e) { S.note = e.message; } drawSide(); } },
+      [...S.jobs].reverse().map((j) => h('button', { class: 'item' + (J?.id === j.id ? ' on' : ''), onclick: async () => { try { S.job = (await harnessJson('/v1/jobs/' + j.id)).job; } catch (e) { S.note = e.message; } drawSide(); } },
         h('span', { class: 'state ' + j.state }, j.state), h('span', { class: 'name' }, j.task)))),
     !J ? null : h('div', { class: 'viewer' },
       h('div', { class: 'vh' }, h('span', { class: 'state ' + J.state }, J.state), h('span', { class: 'name' }, `${J.calls} model calls`),
@@ -740,11 +931,13 @@ function jobsTab() {
         J.rounds.map(toolChip),
         J.error ? h('div', { class: 'err' }, J.error) : null,
         J.result ? h('div', { class: 'md', html: render(J.result) }) : null,
-        Object.keys(J.files).map((n) => h('button', { class: 'item', onclick: () => download(n, J.files[n]) }, h('span', { class: 'name' }, n), h('span', { class: 'meta' }, 'download'))))),
+        Object.keys(J.files).map((n) => h('div', { class: 'item static' }, h('span', { class: 'name' }, n),
+          h('button', { class: 'btn btn-ghost btn-sm', onclick: () => { fileEdited(n, J.files[n]); S.file = n; S.tab = 'code'; drawSide(); } }, 'Open in Code'),
+          h('button', { class: 'btn btn-ghost btn-sm', onclick: () => download(n, J.files[n]) }, 'Download'))))),
   ];
 }
 
-/* ---- side pane: Harness (usage, limits, Python, Agent Garrett) ---- */
+/* ---- side pane: Harness (update, usage, limits, Python, Agent Garrett) ---- */
 function meter(label, used, max, fmt = String) {
   const part = max > 0 ? Math.min(1, used / max) : 0;
   return h('div', { class: 'meter' + (part >= 0.9 ? ' hot' : '') },
@@ -752,99 +945,157 @@ function meter(label, used, max, fmt = String) {
     h('div', { class: 'track', role: 'progressbar', 'aria-label': label, 'aria-valuemin': '0', 'aria-valuemax': '100', 'aria-valuenow': String(Math.round(part * 100)) }, h('div', { class: 'fill', style: `width:${(part * 100).toFixed(1)}%` })));
 }
 
+function garrettBlock(st) {
+  const G = CFG.garrett;
+  if (st.garrett.connected) return h('div', { class: 'block', id: 'garrett' }, h('h3', {}, 'Agent Garrett'),
+    h('p', {}, `Connected to ${st.garrett.host}${st.garrett.tools ? ` (${st.garrett.tools} tools)` : ''}. Its security tools are on the veil's belt in chat and in jobs.`),
+    h('div', { class: 'acts' }, h('a', { class: 'btn btn-sm', href: G.dashboard, target: '_blank', rel: 'noopener' }, 'Open dashboard'),
+      h('button', { class: 'btn btn-sm btn-ghost', disabled: !!S.busy, onclick: () => act('garrett', async () => { S.status = await harnessJson('/v1/garrett', { body: {} }); }) }, 'Disconnect')));
+  const key = h('input', { id: 'gKey', type: 'password', placeholder: 'gtt_…', 'aria-label': 'Agent Garrett key', autocomplete: 'off', spellcheck: 'false' });
+  const gUrl = h('input', { id: 'gUrl', type: 'url', placeholder: 'https://…/mcp', 'aria-label': 'Agent Garrett MCP address' });
+  const gTok = h('input', { id: 'gTok', type: 'password', placeholder: 'its MCP token', 'aria-label': 'Agent Garrett MCP token', autocomplete: 'off' });
+  return h('div', { class: 'block feature', id: 'garrett' }, h('h3', {}, 'Agent Garrett: security tools for this veil'),
+    h('p', {}, 'Agent Garrett is a security agent by the same author as the veil. Connected, it puts its tools on the veil\'s belt here: CVE, KEV and EPSS intelligence, DNS and certificate transparency, RDAP, email security posture, IOC extraction, evidence manifests and more.'),
+    h('p', {}, link({ label: 'What is Agent Garrett?', href: G.what }), ' · ', link({ label: 'How to use it', href: G.how }), ' · ', link({ label: 'Blog', href: G.blog })),
+    h('ol', { class: 'steps' },
+      h('li', {}, 'Get a key: ', link({ label: 'open the Agent Garrett dashboard', href: G.dashboard }), ', set up your agent, and copy its API key.'),
+      h('li', {}, 'Paste it here. It is kept in your harness, not in this browser.')),
+    key,
+    h('div', { class: 'acts' }, h('button', { class: 'btn btn-sm btn-solid', disabled: !!S.busy || outdated(), onclick: () => act('garrett', async () => { S.status = await harnessJson('/v1/garrett', { body: { key: key.value.trim() } }); toast('Agent Garrett is connected.'); }) }, S.busy === 'garrett' ? 'Connecting…' : 'Connect Agent Garrett')),
+    h('details', { class: 'more' }, h('summary', {}, 'Running an agent of your own?'),
+      gUrl, h('div', { style: 'height:6px' }), gTok,
+      h('div', { class: 'acts' }, h('button', { class: 'btn btn-sm', disabled: !!S.busy, onclick: () => act('garrett', async () => { S.status = await harnessJson('/v1/garrett', { body: { url: gUrl.value.trim(), token: gTok.value } }); }) }, 'Connect by address'))));
+}
+
 function harnessTab() {
   const st = S.status;
   if (!st) return [h('div', { class: 'empty' }, 'Asking the harness…')];
   const num = (id, label, value) => [h('label', { for: id }, label), h('input', { id, type: 'number', min: '1', value: String(value) })];
-  const gUrl = h('input', { id: 'gUrl', type: 'url', placeholder: 'https://…/mcp', 'aria-label': 'Agent Garrett MCP address' });
-  const gTok = h('input', { id: 'gTok', type: 'password', placeholder: 'its MCP token', 'aria-label': 'Agent Garrett MCP token', autocomplete: 'off' });
   return [
+    outdated() ? h('div', { class: 'block feature' }, h('h3', {}, 'Update your harness'),
+      h('p', {}, `Your harness is version ${st.version}; this page is written for version ${CFG.harness_version}. Until it is updated, the model list, schedules, chat sync, the better web search and one-step Agent Garrett are off.`),
+      h('div', { class: 'acts' }, h('button', { class: 'btn btn-sm btn-solid', disabled: !!S.busy, onclick: () => act('update', updateHarness) }, S.busy === 'update' ? 'Updating…' : 'Update harness'))) : null,
+    S.note && S.tab === 'harness' ? h('div', { class: 'block' }, h('div', { class: 'err' }, S.note)) : null,
     h('div', { class: 'block' }, h('h3', {}, 'Today (UTC)'),
       meter('Model calls', st.usage.calls, st.limits.calls_max),
       meter('Data moved', st.usage.bytes, st.limits.bytes_max, mb),
-      meter('Job data kept', st.storage_bytes, st.limits.storage_max, mb),
+      meter('Chats and job data kept', st.storage_bytes, st.limits.storage_max, mb),
       meter('Jobs waiting', st.queue.waiting, st.queue.max),
       h('p', {}, 'A spent daily budget refuses new work until 00:00 UTC. Past the storage limit, the oldest finished jobs are dropped first.')),
-    h('div', { class: 'block' }, h('h3', {}, 'Limits'),
-      num('limCalls', 'Model calls a day', st.limits.calls_max),
-      num('limBytes', 'Data a day (MB)', Math.round(st.limits.bytes_max / MB)),
-      num('limStore', 'Job data kept (MB)', Math.round(st.limits.storage_max / MB)),
-      h('div', { class: 'acts' }, h('button', { class: 'btn btn-sm', disabled: !!S.busy, onclick: () => act('limits', async () => {
-        const v = (id) => Number(document.getElementById(id).value);
-        S.status = await harnessJson('/v1/config', { body: { calls_max: v('limCalls'), bytes_max: v('limBytes') * MB, storage_max: v('limStore') * MB } });
-      }) }, 'Save limits'))),
+    garrettBlock(st),
     h('div', { class: 'block' }, h('h3', {}, 'Python'),
       st.python.deployed
         ? h('p', {}, 'The Python Worker is in place (veil-web-py). The veil can run Python in chat and in jobs.')
         : h('p', {}, 'The veil\'s Python runs in a second Worker in your account (veil-web-py). The harness puts it there with your login.'),
       h('div', { class: 'acts' }, h('button', { class: 'btn btn-sm' + (st.python.deployed ? '' : ' btn-solid'), disabled: !!S.busy, onclick: () => act('python', async () => { S.status = await harnessJson('/v1/python/deploy', { body: {} }); }) },
         S.busy === 'python' ? 'Deploying…' : st.python.deployed ? 'Deploy again' : 'Deploy Python'))),
-    h('div', { class: 'block' }, h('h3', {}, 'Agent Garrett (MCP)'),
-      st.garrett.connected
-        ? [h('p', {}, `Connected to ${st.garrett.host}. Its tools are on the veil's belt in chat and in jobs.`),
-           h('div', { class: 'acts' }, h('button', { class: 'btn btn-sm', disabled: !!S.busy, onclick: () => act('garrett', async () => { S.status = await harnessJson('/v1/garrett', { body: { url: '' } }); }) }, 'Disconnect'))]
-        : [h('p', {}, 'If you run Agent Garrett, give the harness its MCP address and token. They are kept in your harness, not in this browser.'),
-           gUrl, h('div', { style: 'height:6px' }), gTok,
-           h('div', { class: 'acts' }, h('button', { class: 'btn btn-sm', disabled: !!S.busy, onclick: () => act('garrett', async () => { S.status = await harnessJson('/v1/garrett', { body: { url: gUrl.value.trim(), token: gTok.value } }); }) }, S.busy === 'garrett' ? 'Connecting…' : 'Connect'))]),
+    h('div', { class: 'block' }, h('h3', {}, 'Limits'),
+      num('limCalls', 'Model calls a day', st.limits.calls_max),
+      num('limBytes', 'Data a day (MB)', Math.round(st.limits.bytes_max / MB)),
+      num('limStore', 'Chats and job data kept (MB)', Math.round(st.limits.storage_max / MB)),
+      h('div', { class: 'acts' }, h('button', { class: 'btn btn-sm', disabled: !!S.busy, onclick: () => act('limits', async () => {
+        const v = (id) => Number(document.getElementById(id).value);
+        S.status = await harnessJson('/v1/config', { body: { calls_max: v('limCalls'), bytes_max: v('limBytes') * MB, storage_max: v('limStore') * MB } });
+      }) }, 'Save limits'))),
     h('div', { class: 'block' }, h('h3', {}, 'This harness'),
-      h('p', { class: 'mono' }, S.harness.replace(/^https?:\/\//, '')),
+      h('p', { class: 'mono' }, S.harness.replace(/^https?:\/\//, '') + ' · version ' + st.version),
       h('p', {}, 'Context fold: ' + (core.x ? 'veil_core.wasm (4tope) loaded.' : 'the wasm core did not load; the oldest rounds are dropped instead.')),
-      h('div', { class: 'acts' }, h('button', { class: 'btn btn-sm btn-danger', onclick: () => { if (confirm('Forget this harness in this browser? The Worker stays in your Cloudflare account until you delete it there.')) { ls.del('veilweb.harness'); S.harness = null; S.status = null; draw(); } } }, 'Forget this harness')),
-      S.note && S.tab === 'harness' ? h('div', { class: 'err' }, S.note) : null),
+      h('p', {}, 'Anything logged in to this Cloudflare account can use this harness: this page in any browser, and other veils that hold your login.'),
+      h('div', { class: 'acts' },
+        outdated() ? null : h('button', { class: 'btn btn-sm', disabled: !!S.busy, onclick: () => act('update', updateHarness) }, S.busy === 'update' ? 'Updating…' : 'Check for a newer harness'),
+        h('button', { class: 'btn btn-sm btn-danger', onclick: () => { if (confirm('Forget this harness in this browser? The Worker stays in your Cloudflare account until you delete it there.')) { ls.del('veilweb.harness'); S.harness = null; S.status = null; draw(); } } }, 'Forget this harness'))),
   ];
 }
 
 function sidePane() {
   const tab = (id, label) => h('button', { class: S.tab === id ? 'on' : '', role: 'tab', 'aria-selected': String(S.tab === id), onclick: () => { S.tab = id; S.note = ''; drawSide(); if (id === 'jobs') refreshJobs(); if (id === 'harness') refreshStatus(); } }, label);
   const active = S.jobs.filter((j) => j.state === 'queued' || j.state === 'running').length;
+  const files = Object.keys(S.conv.files).length;
   return h('aside', { class: 'side', id: 'side' },
-    h('div', { class: 'tabs', role: 'tablist' }, tab('files', 'Files'), tab('jobs', active ? `Jobs (${active})` : 'Jobs'), tab('harness', 'Harness')),
-    h('div', { class: 'pane' }, S.tab === 'files' ? filesTab() : S.tab === 'jobs' ? jobsTab() : harnessTab()));
+    h('div', { class: 'tabs', role: 'tablist' }, tab('code', files ? `Code (${files})` : 'Code'), tab('jobs', active ? `Jobs (${active})` : 'Jobs'), tab('harness', outdated() ? 'Harness •' : 'Harness'),
+      h('span', { class: 'grow' }),
+      h('button', { class: 'widen', 'aria-label': S.wide ? 'Narrow this panel' : 'Widen this panel', 'aria-pressed': String(S.wide), title: S.wide ? 'Narrow' : 'Widen', onclick: () => { S.wide = !S.wide; document.querySelector('.shell')?.classList.toggle('wide', S.wide); drawSide(); } }, S.wide ? '⇥' : '⇤')),
+    h('div', { class: 'pane tab-' + S.tab }, S.tab === 'code' ? codeTab() : S.tab === 'jobs' ? jobsTab() : harnessTab()));
 }
 
 function drawSide() {
   const old = document.getElementById('side');
   if (!old) return;
-  // what is half-typed in the pane survives its redraw
+  // what is half-typed in the pane survives its redraw, and so does the caret
   const keep = {};
-  for (const el of old.querySelectorAll('input, textarea')) if (el.id && (document.activeElement === el || (el.value && el.type !== 'number'))) keep[el.id] = el.value;
+  for (const el of old.querySelectorAll('input, textarea, select')) if (el.id && el.id !== 'editor' && (document.activeElement === el || (el.value && el.type !== 'number'))) keep[el.id] = el.value;
   const focus = document.activeElement?.id;
+  const caret = focus === 'editor' ? [document.activeElement.selectionStart, document.activeElement.selectionEnd, document.activeElement.scrollTop] : null;
+  const scroll = old.querySelector('.pane')?.scrollTop ?? 0;
   old.replaceWith(sidePane());
   for (const [id, v] of Object.entries(keep)) { const el = document.getElementById(id); if (el) el.value = v; }
-  if (focus && keep[focus] !== undefined) document.getElementById(focus)?.focus();
+  const pane = document.querySelector('#side .pane');
+  if (pane) pane.scrollTop = scroll;
+  const again = focus && document.getElementById(focus);
+  if (again && (keep[focus] !== undefined || caret)) {
+    again.focus();
+    if (caret) { again.setSelectionRange(caret[0], caret[1]); again.scrollTop = caret[2]; }
+  }
 }
 
-function send() {
+function send(text) {
   const box = document.getElementById('prompt');
-  const text = box.value.trim();
-  if (!text || S.live) return;
+  const said = (text ?? box.value).trim();
+  if (!said || S.live) return;
   box.value = '';
-  runTurn(text);
+  box.style.height = 'auto';
+  runTurn(said);
+}
+
+const SUGGESTIONS = [
+  'Build a one-page site for a coffee shop and show it in the Code tab',
+  'Put three minds on this: should a small team self-host its git?',
+  'Queue a job: read today\'s Cloudflare blog and write me a summary file',
+  'Who is Agent Garrett?',
+];
+
+function welcome() {
+  const G = CFG.garrett;
+  return h('div', { class: 'welcome' }, h('h1', {}, 'What are we working on?'),
+    h('p', {}, 'The veil can search and read the web, write code you watch and preview in the Code tab, put several minds on one question, and hand long or repeating work to your harness as jobs.'),
+    h('div', { class: 'chips' }, SUGGESTIONS.map((s) => h('button', { class: 'suggest', onclick: () => send(s) }, s))),
+    S.status?.garrett?.connected ? null : h('div', { class: 'panel promo' },
+      h('div', {}, h('strong', {}, 'Add Agent Garrett\'s security tools'),
+        h('p', {}, 'CVE and KEV intelligence, DNS and certificate recon, IOC extraction and more, called by the veil in this chat. ', link({ label: 'What is Agent Garrett?', href: G.what }))),
+      h('button', { class: 'btn btn-solid btn-sm', onclick: () => { S.tab = 'harness'; S.panes.side = true; draw(); queueMicrotask(() => document.getElementById('garrett')?.scrollIntoView({ block: 'start' })); } }, 'Connect')));
+}
+
+function linksBlock() {
+  return h('div', { class: 'links' },
+    h('button', { class: 'pane-head toggle', 'aria-expanded': String(!!S.linksOpen), onclick: () => { S.linksOpen = !S.linksOpen; ls.set('veilweb.links', S.linksOpen); draw(); } }, 'Links', h('span', { 'aria-hidden': 'true' }, S.linksOpen ? '–' : '+')),
+    S.linksOpen ? CFG.links.map((g) => h('div', { class: 'link-group' }, h('div', { class: 'link-head' }, g.group), g.items.map((i) => link(i, 'item')))) : null);
 }
 
 function dashboard() {
   const c = S.conv;
   const transcript = h('div', { class: 'transcript' },
-    c.msgs.length === 0 && !S.live ? h('div', { class: 'welcome' }, h('h1', {}, 'What are we working on?'),
-      h('p', {}, 'The veil can search and read the web, keep files in this tab\'s workspace, put several minds on one question, and hand long work to your harness as a job.')) : null,
+    c.msgs.length === 0 && !S.live ? welcome() : null,
     c.msgs.map(message),
     S.live ? liveNode() : null);
-  const shell = h('div', { class: 'shell' + (S.panes.rail ? ' show-rail' : '') + (S.panes.side ? ' show-side' : '') },
+  const close = () => { S.panes.rail = false; S.panes.side = false; draw(); };
+  const shell = h('div', { class: 'shell' + (S.wide ? ' wide' : '') + (S.panes.rail ? ' show-rail' : '') + (S.panes.side ? ' show-side' : '') },
     h('aside', { class: 'rail' },
       h('div', { class: 'pane-head' }, 'Chats', h('button', { class: 'btn btn-ghost btn-sm', disabled: !!S.live, onclick: () => { newConv(); S.panes.rail = false; draw(); } }, '+ New')),
       h('div', { class: 'list' },
-        S.convs.length === 0 ? h('div', { class: 'empty' }, 'Conversations are kept in this browser only.') : null,
+        S.convs.length === 0 ? h('div', { class: 'empty' }, 'Your chats are kept in your harness, so they follow your login to any browser.') : null,
         S.convs.map((x) => h('div', { class: 'item' + (x.id === c.id ? ' on' : ''), role: 'button', tabindex: '0', onclick: () => openConv(x.id), onkeydown: (e) => { if (e.key === 'Enter') openConv(x.id); } },
           h('span', { class: 'name' }, x.title),
           h('button', { class: 'x', 'aria-label': 'Delete conversation', onclick: (e) => { e.stopPropagation(); deleteConv(x.id); } }, '✕')))),
+      linksBlock(),
       h('div', { class: 'who' }, h('span', { class: 'name', title: S.me?.email || '' }, S.me?.email || S.me?.account_name || 'Logged in with Cloudflare'),
         h('button', { class: 'btn btn-ghost btn-sm', onclick: () => logout() }, 'Log out'))),
     h('main', { class: 'chat' }, transcript,
       h('div', { class: 'composer' },
         h('textarea', { id: 'prompt', rows: '1', placeholder: 'Message the veil', 'aria-label': 'Message', onkeydown: (e) => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); } }, oninput: (e) => { e.target.style.height = 'auto'; e.target.style.height = Math.min(220, e.target.scrollHeight) + 'px'; } }),
-        S.live ? h('button', { class: 'btn', onclick: () => S.live.abort.abort() }, 'Stop') : h('button', { class: 'btn btn-solid', onclick: send }, 'Send'))),
-    sidePane());
-  queueMicrotask(() => { transcript.scrollTop = transcript.scrollHeight; if (!S.live) document.getElementById('prompt')?.focus(); });
+        S.live ? h('button', { class: 'btn', onclick: () => S.live.abort.abort() }, 'Stop') : h('button', { class: 'btn btn-solid', onclick: () => send() }, 'Send'))),
+    sidePane(),
+    h('div', { class: 'scrim', onclick: close }));
+  queueMicrotask(() => { transcript.scrollTop = transcript.scrollHeight; if (!S.live && !S.panes.rail && !S.panes.side && matchMedia('(min-width: 981px)').matches) document.getElementById('prompt')?.focus(); });
   return shell;
 }
 
@@ -856,11 +1107,12 @@ function gate() {
     h('p', {}, 'The chat runs in this tab on your own Cloudflare account: the model is your account\'s Workers AI, and the work is done by a worker harness that lives in your account.'),
     h('ul', {},
       h('li', {}, 'The login happens between this page and Cloudflare. No server of ours sees it.'),
-      h('li', {}, 'Conversations and files stay in this browser.'),
+      h('li', {}, 'Chats, code and jobs are kept in your harness, so they follow your login.'),
       h('li', {}, 'The login is kept for this tab only; closing the tab ends it.')),
     h('div', { class: 'gate-acts' }, h('button', { class: 'btn btn-solid btn-lg', onclick: login }, 'Log in with Cloudflare'),
       h('a', { class: 'btn btn-ghost', href: '../#get' }, 'Or get the desktop app')),
-    h('div', { class: 'err', role: 'alert' }, S.err)));
+    h('div', { class: 'err', role: 'alert' }, S.err),
+    h('p', { class: 'fine gate-links' }, CFG.links[0].items.flatMap((i, n) => [n ? ' · ' : '', link(i)]))));
 }
 
 /* Logged in, no harness yet: deploy one, or find the one already there. */
@@ -870,7 +1122,7 @@ function setup() {
   return h('div', { class: 'gate' }, h('div', { class: 'panel gate-card' },
     h('div', { class: 'section-eyebrow' }, 'logged in · one step left'),
     h('h1', {}, 'Deploy your worker harness'),
-    h('p', {}, 'The harness is one Worker in your Cloudflare account. It calls the model, reads the web, runs queued jobs in turn, and keeps to daily limits you can change. Only a login to your account can use it.'),
+    h('p', {}, 'The harness is one Worker in your Cloudflare account. It calls the model, reads the web, keeps your chats, runs queued and repeating jobs in turn, and keeps to daily limits you can change. Only a login to your account can use it.'),
     h('div', { class: 'gate-acts' }, h('a', { class: 'btn btn-solid btn-lg', href: CFG.deploy_url, target: '_blank', rel: 'noopener' }, 'Deploy to Cloudflare'),
       h('span', { class: 'fine' }, 'Opens Cloudflare\'s deploy page. It builds the Worker from a copy of its source in a GitHub or GitLab account of yours.')),
     h('hr', { class: 'gate-sep' }),
@@ -890,23 +1142,40 @@ function pickModel(sel) {
   draw();
 }
 
+/* The model picker: the account's own list from the harness, grouped by who made the model. */
+function modelSelect() {
+  const ids = [...new Set([...(S.models.length ? S.models.map((m) => m.id) : CFG.models), S.model])].sort();
+  const groups = new Map();
+  for (const id of ids) {
+    const maker = id.split('/')[1] ?? 'other';
+    if (!groups.has(maker)) groups.set(maker, []);
+    groups.get(maker).push(id);
+  }
+  return h('select', { 'aria-label': 'Model', title: S.model, disabled: !!S.live, onchange: (e) => pickModel(e.target) },
+    [...groups].map(([maker, list]) => h('optgroup', { label: maker }, list.map((m) => h('option', { value: m, selected: m === S.model }, m.split('/').slice(2).join('/') || m)))),
+    h('option', { value: '+' }, 'Other model…'));
+}
+
 function draw() {
   const on = !!(S.session && S.status);
-  const models = [...new Set([...CFG.models, S.model])];
   const draft = document.getElementById('prompt')?.value ?? '';
   const typed = document.getElementById('hname')?.value ?? '';
+  const sideKeep = {};
+  for (const el of document.querySelectorAll('#side input, #side textarea:not(#editor), #side select')) if (el.id && el.value && el.type !== 'number') sideKeep[el.id] = el.value;
   barSlot.replaceChildren(...(on ? [
-    h('button', { class: 'icon-btn only-narrow', 'aria-label': 'Chats', onclick: () => { S.panes.rail = !S.panes.rail; S.panes.side = false; draw(); } }, '☰'),
-    h('select', { 'aria-label': 'Model', disabled: !!S.live, onchange: (e) => pickModel(e.target) },
-      models.map((m) => h('option', { value: m, selected: m === S.model }, m.replace(/^@cf\//, ''))), h('option', { value: '+' }, 'Other model…')),
-    h('span', { class: 'chip', title: S.harness }, h('span', { class: 'chip-dot' }), 'harness connected'),
-    h('button', { class: 'icon-btn only-narrow', 'aria-label': 'Files, jobs and harness', onclick: () => { S.panes.side = !S.panes.side; S.panes.rail = false; draw(); } }, '▤'),
+    h('button', { class: 'icon-btn only-narrow', 'aria-label': 'Chats and links', onclick: () => { S.panes.rail = !S.panes.rail; S.panes.side = false; draw(); } }, '☰'),
+    modelSelect(),
+    outdated()
+      ? h('button', { class: 'chip warn', onclick: () => { S.tab = 'harness'; S.panes.side = true; draw(); } }, h('span', { class: 'chip-dot' }), 'update harness')
+      : h('span', { class: 'chip', title: S.harness }, h('span', { class: 'chip-dot' }), 'harness connected'),
+    h('button', { class: 'icon-btn only-narrow', 'aria-label': 'Code, jobs and harness', onclick: () => { S.panes.side = !S.panes.side; S.panes.rail = false; draw(); } }, '▤'),
   ] : []));
   app.replaceChildren(!S.session ? gate() : on ? dashboard() : setup());
   const box = document.getElementById('prompt');
   if (box && draft) box.value = draft;
   const a = document.getElementById('hname');
   if (a && typed) a.value = typed;
+  for (const [id, v] of Object.entries(sideKeep)) { const el = document.getElementById(id); if (el) el.value = v; }
 }
 
 /* ============================================================ theme (the site's three, the site's key) */
