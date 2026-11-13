@@ -1042,6 +1042,36 @@ pub fn tabW(label: [:0]const u8) f32 {
     return @as(f32, @floatFromInt(measure(label, 13))) + 26;
 }
 
+/// Make a row of tabs fit `avail`: `widths` are the tabs' natural widths, `gap` the space between two. When the row
+/// is too wide every tab gives up the same share of its width (never below TAB_MIN_W), so the row ends inside its
+/// pane; a row that already fits is left as it is. `tab` cuts a label that no longer fits its tab.
+pub const TAB_MIN_W: f32 = 28;
+pub fn fitTabs(widths: []f32, gap: f32, avail: f32) void {
+    if (widths.len == 0) return;
+    var sum: f32 = 0;
+    for (widths) |w| sum += w;
+    const room = avail - gap * @as(f32, @floatFromInt(widths.len - 1));
+    if (sum <= room or sum <= 0) return;
+    const k = @max(room, 0) / sum;
+    for (widths) |*w| w.* = @max(TAB_MIN_W, @floor(w.* * k));
+}
+
+test "a tab row that is too wide for its pane shrinks to fit; one that fits is left alone" {
+    var fits = [_]f32{ 90, 70, 80 };
+    fitTabs(&fits, 6, 300);
+    try std.testing.expectEqualSlices(f32, &.{ 90, 70, 80 }, &fits);
+
+    var wide = [_]f32{ 100, 80, 90 }; // 270 + 12 of gaps in a 200 pane
+    fitTabs(&wide, 6, 200);
+    try std.testing.expect(wide[0] + wide[1] + wide[2] + 12 <= 200);
+    try std.testing.expect(wide[0] > wide[2] and wide[2] > wide[1]); // each keeps its share
+    try std.testing.expect(wide[1] >= TAB_MIN_W);
+
+    var tiny = [_]f32{ 100, 80, 90 };
+    fitTabs(&tiny, 6, 20); // no pane is this narrow; a tab still keeps a width that can be clicked
+    for (tiny) |w| try std.testing.expectEqual(TAB_MIN_W, w);
+}
+
 /// A tab in a tab strip: active = a soft accent pill (works on ANY backdrop, unlike a bg-fill pill which
 /// vanishes on same-color panels); hover = a quiet highlight. Minimal: no underline.
 pub fn tab(r: Rect, label: [:0]const u8, active: bool) bool {
@@ -1054,7 +1084,11 @@ pub fn tab(r: Rect, label: [:0]const u8, active: bool) bool {
     }
     const c = if (active) fg else if (hot) fg_dim else comment;
     const tw = measure(label, 13);
-    text(label, @intFromFloat(r.x + (r.width - @as(f32, @floatFromInt(tw))) / 2), @intFromFloat(r.y + (r.height - textH(13)) / 2), 13, c);
+    // a label wider than its tab (a row made to fit a narrow pane, fitTabs) is cut inside it, never drawn past it
+    if (@as(f32, @floatFromInt(tw)) > r.width - 8)
+        textClip(label, @intFromFloat(r.x + 4), @intFromFloat(r.y + (r.height - textH(13)) / 2), 13, c, @intFromFloat(@max(r.width - 8, 1)))
+    else
+        text(label, @intFromFloat(r.x + (r.width - @as(f32, @floatFromInt(tw))) / 2), @intFromFloat(r.y + (r.height - textH(13)) / 2), 13, c);
     if (hot and !active and !clicks_blocked) wantCursor(.pointing_hand);
     const kb = kbRegister(r, label, "tab");
     return kb or (hot and rl.isMouseButtonPressed(.left) and !clicks_blocked);

@@ -6425,12 +6425,16 @@ fn drawChatRight(store: *Store, r: t.Rect, open: bool, casts: []const store_mod.
     const tl_act = t.z("Activity", .{});
     const tl_tasks = if (tasks.len > 0) t.z("Tasks ({d})", .{tasks.len}) else t.z("Tasks", .{});
     const tl_mem = t.z("Memory", .{});
+    // The row ends before the chevron, whatever the pane's width and the face's (the mono face of a theme like
+    // Matrix is wider): too wide, and the three tabs share the squeeze (t.fitTabs).
+    var tw = [3]f32{ t.tabW(tl_act), t.tabW(tl_tasks), t.tabW(tl_mem) };
+    t.fitTabs(&tw, 6, r.width - 8 - 36);
     var tx = r.x + 8;
-    if (t.tab(.{ .x = tx, .y = r.y + 7, .width = t.tabW(tl_act), .height = 24 }, tl_act, ui.right_tab == .activity)) ui.right_tab = .activity;
-    tx += t.tabW(tl_act) + 6;
-    if (t.tab(.{ .x = tx, .y = r.y + 7, .width = t.tabW(tl_tasks), .height = 24 }, tl_tasks, ui.right_tab == .tasks)) ui.right_tab = .tasks;
-    tx += t.tabW(tl_tasks) + 6;
-    if (t.tab(.{ .x = tx, .y = r.y + 7, .width = t.tabW(tl_mem), .height = 24 }, tl_mem, ui.right_tab == .memory)) ui.right_tab = .memory;
+    if (t.tab(.{ .x = tx, .y = r.y + 7, .width = tw[0], .height = 24 }, tl_act, ui.right_tab == .activity)) ui.right_tab = .activity;
+    tx += tw[0] + 6;
+    if (t.tab(.{ .x = tx, .y = r.y + 7, .width = tw[1], .height = 24 }, tl_tasks, ui.right_tab == .tasks)) ui.right_tab = .tasks;
+    tx += tw[1] + 6;
+    if (t.tab(.{ .x = tx, .y = r.y + 7, .width = tw[2], .height = 24 }, tl_mem, ui.right_tab == .memory)) ui.right_tab = .memory;
     if (ui.right_tab == .memory) {
         drawChatMemory(store, r);
         return;
@@ -6477,12 +6481,14 @@ fn drawChatRight(store: *Store, r: t.Rect, open: bool, casts: []const store_mod.
 
     if (casts.len == 0) {
         if (plan.len == 0) {
-            t.text(t.z("no casts yet", .{}), @intFromFloat(r.x + 12), @intFromFloat(yy + 6), 13, t.comment);
-            t.text(t.z("when a message needs real work", .{}), @intFromFloat(r.x + 12), @intFromFloat(yy + 28), 11, t.comment);
-            t.text(t.z("- research, current facts, web", .{}), @intFromFloat(r.x + 12), @intFromFloat(yy + 44), 11, t.comment);
-            t.text(t.z("- building or fixing code", .{}), @intFromFloat(r.x + 12), @intFromFloat(yy + 60), 11, t.comment);
-            t.text(t.z("the veil casts the hive and its", .{}), @intFromFloat(r.x + 12), @intFromFloat(yy + 84), 11, t.comment);
-            t.text(t.z("live progress appears here.", .{}), @intFromFloat(r.x + 12), @intFromFloat(yy + 100), 11, t.comment);
+            // each line is cut at the pane's edge: in a wide (mono) face they do not all fit a narrow pane
+            const lw: i32 = @intFromFloat(@max(r.width - 24, 1));
+            t.textClip("no casts yet", @intFromFloat(r.x + 12), @intFromFloat(yy + 6), 13, t.comment, lw);
+            t.textClip("when a message needs real work", @intFromFloat(r.x + 12), @intFromFloat(yy + 28), 11, t.comment, lw);
+            t.textClip("- research, current facts, web", @intFromFloat(r.x + 12), @intFromFloat(yy + 44), 11, t.comment, lw);
+            t.textClip("- building or fixing code", @intFromFloat(r.x + 12), @intFromFloat(yy + 60), 11, t.comment, lw);
+            t.textClip("the veil casts the hive and its", @intFromFloat(r.x + 12), @intFromFloat(yy + 84), 11, t.comment, lw);
+            t.textClip("live progress appears here.", @intFromFloat(r.x + 12), @intFromFloat(yy + 100), 11, t.comment, lw);
         } else {
             t.text(t.z("no casts yet", .{}), @intFromFloat(r.x + 12), @intFromFloat(yy + 6), 11, t.comment);
         }
