@@ -296,7 +296,8 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
       return;
     }
     if (msg.type === "web-allow") {
-      if (sender.tab) return reply({ ok: false }); // only the popup sets this, never a page
+      // only this extension's own pages (the popup) set this; a content script's sender is the web page's address
+      if (!String(sender.url || "").startsWith(chrome.runtime.getURL(""))) return reply({ ok: false });
       await chrome.storage.local.set({ web_allowed: !!msg.allowed });
       if (!msg.allowed) {
         const tabId = await getTab();
