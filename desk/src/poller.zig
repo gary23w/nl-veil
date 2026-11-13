@@ -11,6 +11,7 @@ const store_mod = @import("store.zig");
 const scan = @import("scan.zig");
 const netcli = @import("netcli.zig");
 const tots = @import("tots.zig");
+const harness = @import("harness.zig");
 const log = @import("log.zig");
 
 const Store = store_mod.Store;
@@ -76,6 +77,9 @@ pub const Poller = struct {
     last_tun_s: i64 = 0, // Cloudflare Tunnel snapshot throttle (3s while a flip is in flight, else 15s)
     last_gar_s: i64 = 0, // Security tools snapshot throttle (only while connected; 3s while a deploy is in flight, else 20s)
     last_tots_s: i64 = 0, // tot roster throttle (only while the Tots tab is drawn; 0 = poll next tick)
+    last_har_s: i64 = 0, // web harness throttle (only while its view is drawn; 0 = poll next tick)
+    last_har_convs_s: i64 = 0, // its chat list, asked less often than its queue
+    har_jobs_scratch: [harness.MAX_JOBS]harness.Job = undefined,
     last_tot_ev_s: i64 = 0, // the selected tot's event tail
     last_tot_pad_s: i64 = 0, // the shared scratchpad
     last_bi_s: i64 = 0, // built-in model status poll throttle (0 = poll next tick; verbs reset it)
@@ -199,6 +203,12 @@ pub const Poller = struct {
                     self.setTotSelLocked(c.idStr(), c.textStr(), false);
                 },
                 .tot_deploy => self.doTotDeploy(),
+                .harness_queue => self.doHarnessQueue(c.idStr(), c.textStr()),
+                .harness_cancel => self.doHarnessCancel(c.idStr()),
+                .harness_select => self.doHarnessSelect(c.idStr()),
+                .harness_local => self.doHarnessLocal(std.mem.eql(u8, c.textStr(), "1")),
+                .harness_chat_select => self.doHarnessChatSelect(c.idStr()),
+                .harness_push => self.doHarnessPush(c.idStr()),
                 .tot_command => self.doTotCommand(c.idStr(), c.textStr()),
                 .tot_config => self.doTotPost(c.idStr(), "config", c.textStr()),
                 .tot_delete => self.doTotDelete(c.idStr()),
@@ -830,6 +840,26 @@ pub const Poller = struct {
             }
         }
 
+        // 1c+) The web harness - polled ONLY while the Tasks tab's Web harness view is on screen (it raises
+        // harness_watch each frame), for the same reason as the tots: every poll is a call into the user's account.
+        {
+            const watched = blk: {
+                self.store.lock();
+                defer self.store.unlock();
+                const w = self.store.harness_watch;
+                self.store.harness_watch = false;
+                break :blk w;
+            };
+            if (online and watched and now_s - self.last_har_s >= HARNESS_EVERY_S) {
+                self.last_har_s = now_s;
+                self.refreshHarness();
+                if (now_s - self.last_har_convs_s >= HARNESS_CONVS_EVERY_S) {
+                    self.last_har_convs_s = now_s;
+                    self.refreshHarnessConvs();
+                }
+            }
+        }
+
         // 1c'') THE FAMILY VIEW (NL_FAMILY_VIEW): the ON-SCREEN family only (the chat view raises family_watch each frame
         // it draws), every FAMILY_EVERY_S. Nothing here polls any other family, so their sub-chats still finish silently.
         self.familyTick(online, now_s);
@@ -990,6 +1020,267 @@ pub const Poller = struct {
 
         // 5) notifications on transitions (poller-local memory, so no lock)
         self.notifyTransitions(online, self.swarm_scratch[0..nsw], selbuf[0..sel_len], metrics);
+    }
+
+    // ------------------------------------------------------------------------------------ the web harness
+
+    /// GET /api/v1/harness, then its jobs and schedules when a harness answered -> the Store, under one lock. An
+    /// unreachable server keeps what was shown; 401/403 marks the view denied so it can say why it is empty.
+    fn refreshHarness(self: *Poller) void {
+        var tbuf: [128]u8 = undefined;
+        const tok = self.tokenSnap(&tbuf);
+        const resp = netcli.harnessStatus(self.io, self.gpa, self.port(), tok) orelse return;
+        defer if (resp.body.len > 0) self.gpa.free(resp.body);
+        if (resp.status == 401 or resp.status == 403) {
+            self.store.lock();
+            defer self.store.unlock();
+            self.store.harness_denied = true;
+            self.store.harness_seen = true;
+            self.store.harness = .{};
+            self.store.harness_job_n = 0;
+            self.store.harness_sched_n = 0;
+            return;
+        }
+        if (resp.status != 200) return;
+        var st: harness.Status = .{};
+        if (!harness.parseStatus(self.gpa, resp.body, &st)) return;
+        var jobs_n: ?usize = null;
+        var scheds: [harness.MAX_SCHED]harness.Sched = undefined;
+        var scheds_n: ?usize = null;
+        if (st.reachable) {
+            if (netcli.harnessJobs(self.io, self.gpa, self.port(), tok)) |r| {
+                defer if (r.body.len > 0) self.gpa.free(r.body);
+                if (r.status == 200) jobs_n = harness.parseJobs(self.gpa, r.body, &self.har_jobs_scratch);
+            }
+            if (netcli.harnessSchedules(self.io, self.gpa, self.port(), tok)) |r| {
+                defer if (r.body.len > 0) self.gpa.free(r.body);
+                if (r.status == 200) scheds_n = harness.parseScheds(self.gpa, r.body, &scheds);
+            }
+        }
+        {
+            self.store.lock();
+            defer self.store.unlock();
+            self.store.harness = st;
+            self.store.harness_seen = true;
+            self.store.harness_denied = false;
+            // A list that did not answer this once keeps the rows it showed last; a login that is gone shows none.
+            if (!st.connected) {
+                self.store.harness_job_n = 0;
+                self.store.harness_sched_n = 0;
+            }
+            if (jobs_n) |n| {
+                @memcpy(self.store.harness_jobs[0..n], self.har_jobs_scratch[0..n]);
+                self.store.harness_job_n = n;
+            }
+            if (scheds_n) |n| {
+                @memcpy(self.store.harness_scheds[0..n], scheds[0..n]);
+                self.store.harness_sched_n = n;
+            }
+        }
+        if (st.reachable) self.refreshHarnessDetail();
+    }
+
+    /// The selected job whole: fetched when it is not held yet, and again while it has not ended. A job the harness
+    /// no longer has drops the selection.
+    fn refreshHarnessDetail(self: *Poller) void {
+        var idb: [harness.ID_MAX]u8 = undefined;
+        var id_n: usize = 0;
+        {
+            self.store.lock();
+            defer self.store.unlock();
+            id_n = self.store.harness_sel_len;
+            @memcpy(idb[0..id_n], self.store.harness_sel[0..id_n]);
+            const d = &self.store.harness_detail;
+            if (id_n > 0 and std.mem.eql(u8, d.idStr(), idb[0..id_n]) and !harness.activeState(d.stateStr())) return;
+        }
+        if (id_n == 0) return;
+        const id = idb[0..id_n];
+        var tbuf: [128]u8 = undefined;
+        const tok = self.tokenSnap(&tbuf);
+        const resp = netcli.harnessJob(self.io, self.gpa, self.port(), tok, "GET", id) orelse return;
+        defer if (resp.body.len > 0) self.gpa.free(resp.body);
+        var d: harness.Detail = .{};
+        const got = resp.status == 200 and harness.parseJob(self.gpa, resp.body, &d);
+        self.store.lock();
+        defer self.store.unlock();
+        if (!std.mem.eql(u8, self.store.harness_sel[0..self.store.harness_sel_len], id)) return; // another row was picked meanwhile
+        if (got) {
+            self.store.harness_detail = d;
+        } else if (resp.status == 400) {
+            self.store.harness_sel_len = 0; // the harness has no such job (deleted, or dropped as the oldest)
+            self.store.harness_detail = .{};
+        }
+    }
+
+    /// What a harness call's failure reads as. True when the reply says it landed.
+    fn harnessRespOk(self: *Poller, resp: ?netcli.Resp, what: []const u8) bool {
+        const r = resp orelse {
+            self.store.pushNotif(what, "server unreachable - is it running?", 2);
+            return false;
+        };
+        if (r.status >= 200 and r.status < 300) return true;
+        var eb: [200]u8 = undefined;
+        const err = valueForKey(r.body, "err", &eb);
+        self.store.pushNotif(what, if (r.status == 401 or r.status == 403) "admin only - set the admin token in Settings" else if (err.len > 0) err else "the server refused", 2);
+        return false;
+    }
+
+    /// Queue a job on the harness: `task` as typed, `model` a Workers AI id or "" for the server's default.
+    fn doHarnessQueue(self: *Poller, model: []const u8, task: []const u8) void {
+        if (task.len == 0) return;
+        var bb: [harness.TASK_MAX * 6 + 320]u8 = undefined; // every byte of a task as a \u00XX escape still fits
+        const body = harness.queueBody(&bb, task, model) orelse {
+            self.store.pushNotif("Job not queued", "the task is too long", 2);
+            return;
+        };
+        {
+            self.store.lock();
+            defer self.store.unlock();
+            self.store.harness_busy = true;
+        }
+        defer {
+            self.store.lock();
+            self.store.harness_busy = false;
+            self.store.unlock();
+        }
+        var tbuf: [128]u8 = undefined;
+        const tok = self.tokenSnap(&tbuf);
+        const resp = netcli.harnessQueue(self.io, self.gpa, self.port(), tok, body);
+        defer if (resp) |r| if (r.body.len > 0) self.gpa.free(r.body);
+        if (!self.harnessRespOk(resp, "Job not queued")) return;
+        self.store.pushNotif("Job queued", "the harness has it", 1);
+        self.last_har_s = 0; // the new row shows on the next tick
+    }
+
+    /// Cancel a waiting or running job, or delete a finished one. A job already gone is not a failure.
+    fn doHarnessCancel(self: *Poller, id: []const u8) void {
+        if (!harness.validId(id)) return;
+        var tbuf: [128]u8 = undefined;
+        const tok = self.tokenSnap(&tbuf);
+        const resp = netcli.harnessJob(self.io, self.gpa, self.port(), tok, "DELETE", id);
+        defer if (resp) |r| if (r.body.len > 0) self.gpa.free(r.body);
+        self.last_har_s = 0; // ALWAYS re-list after a delete attempt: the row must show what the harness has
+        const gone = if (resp) |r| r.status == 400 and std.mem.indexOf(u8, r.body, "no such job") != null else false;
+        if (!gone and !self.harnessRespOk(resp, "Job not removed")) return;
+        self.store.lock();
+        defer self.store.unlock();
+        if (std.mem.eql(u8, self.store.harness_sel[0..self.store.harness_sel_len], id)) {
+            self.store.harness_sel_len = 0;
+            self.store.harness_detail = .{};
+        }
+    }
+
+    /// The owner's switch: may the harness's local jobs run on this machine. `on` is the DESIRED state the click
+    /// computed; the server keeps it, and the next status poll shows what it kept.
+    fn doHarnessLocal(self: *Poller, on: bool) void {
+        var tbuf: [128]u8 = undefined;
+        const tok = self.tokenSnap(&tbuf);
+        const resp = netcli.harnessLocal(self.io, self.gpa, self.port(), tok, on);
+        defer if (resp) |r| if (r.body.len > 0) self.gpa.free(r.body);
+        if (!self.harnessRespOk(resp, "Not changed")) return;
+        {
+            self.store.lock();
+            defer self.store.unlock();
+            self.store.harness.local = on;
+        }
+        self.last_har_s = 0;
+    }
+
+    /// GET /api/v1/harness/convs -> the chat list. Skipped while no harness answers; a failed read keeps the rows.
+    fn refreshHarnessConvs(self: *Poller) void {
+        {
+            self.store.lock();
+            defer self.store.unlock();
+            if (!self.store.harness.reachable) {
+                if (!self.store.harness.connected) self.store.harness_conv_n = 0;
+                return;
+            }
+        }
+        var tbuf: [128]u8 = undefined;
+        const tok = self.tokenSnap(&tbuf);
+        const resp = netcli.harnessConvs(self.io, self.gpa, self.port(), tok) orelse return;
+        defer if (resp.body.len > 0) self.gpa.free(resp.body);
+        if (resp.status != 200) return;
+        var rows: [harness.MAX_CONVS]harness.Conv = undefined;
+        const n = harness.parseConvs(self.gpa, resp.body, &rows) orelse return;
+        self.store.lock();
+        defer self.store.unlock();
+        @memcpy(self.store.harness_convs[0..n], rows[0..n]);
+        self.store.harness_conv_n = n;
+    }
+
+    /// Show one harness chat's transcript: the selection moves at once (off any job), the chat is fetched right after.
+    fn doHarnessChatSelect(self: *Poller, id: []const u8) void {
+        if (!harness.validConvId(id)) return;
+        {
+            self.store.lock();
+            defer self.store.unlock();
+            @memcpy(self.store.harness_chat_sel[0..id.len], id);
+            self.store.harness_chat_sel_len = @intCast(id.len);
+            self.store.harness_chat.id_len = 0; // not fetched yet (the rest is overwritten whole when it is)
+            self.store.harness_sel_len = 0;
+            self.store.harness_detail = .{};
+        }
+        var tbuf: [128]u8 = undefined;
+        const tok = self.tokenSnap(&tbuf);
+        const resp = netcli.harnessConv(self.io, self.gpa, self.port(), tok, id);
+        defer if (resp) |r| if (r.body.len > 0) self.gpa.free(r.body);
+        if (!self.harnessRespOk(resp, "Chat not opened")) {
+            self.store.lock();
+            defer self.store.unlock();
+            if (std.mem.eql(u8, self.store.harness_chat_sel[0..self.store.harness_chat_sel_len], id)) self.store.harness_chat_sel_len = 0;
+            return;
+        }
+        const chat = self.gpa.create(harness.Chat) catch return; // 12 KB: off this thread's stack
+        defer self.gpa.destroy(chat);
+        chat.* = .{};
+        if (!harness.parseChat(self.gpa, resp.?.body, chat)) return;
+        self.store.lock();
+        defer self.store.unlock();
+        if (!std.mem.eql(u8, self.store.harness_chat_sel[0..self.store.harness_chat_sel_len], id)) return; // another row was picked meanwhile
+        self.store.harness_chat = chat.*;
+    }
+
+    /// Copy one of the server's conversations up to the harness. `conv` empty: the chat open in the desk.
+    fn doHarnessPush(self: *Poller, conv_in: []const u8) void {
+        var cb: [64]u8 = undefined;
+        var conv: []const u8 = conv_in;
+        if (conv.len == 0) {
+            self.store.lock();
+            defer self.store.unlock();
+            const n = self.store.conv_active_len;
+            @memcpy(cb[0..n], self.store.conv_active[0..n]);
+            conv = cb[0..n];
+        }
+        if (conv.len == 0) {
+            self.store.pushNotif("Chat not pushed", "open a chat in the Chat tab first", 2);
+            return;
+        }
+        var bb: [160]u8 = undefined;
+        const body = harness.pushBody(&bb, conv) orelse return;
+        var tbuf: [128]u8 = undefined;
+        const tok = self.tokenSnap(&tbuf);
+        const resp = netcli.harnessPush(self.io, self.gpa, self.port(), tok, body);
+        defer if (resp) |r| if (r.body.len > 0) self.gpa.free(r.body);
+        if (!self.harnessRespOk(resp, "Chat not pushed")) return;
+        const stale = std.mem.indexOf(u8, resp.?.body, "\"stale\":true") != null;
+        if (stale) self.store.pushNotif("Chat not replaced", "the harness holds a newer copy of it and kept that one", 2) else self.store.pushNotif("Chat pushed", "it is in the web chat's list now", 1);
+        self.last_har_convs_s = 0;
+        self.last_har_s = 0;
+    }
+
+    /// Show one job's result: the selection moves at once, the job is fetched right after.
+    fn doHarnessSelect(self: *Poller, id: []const u8) void {
+        if (id.len > 0 and !harness.validId(id)) return;
+        {
+            self.store.lock();
+            defer self.store.unlock();
+            self.store.harness_chat_sel_len = 0; // a job or a chat, never both
+            @memcpy(self.store.harness_sel[0..id.len], id);
+            self.store.harness_sel_len = @intCast(id.len);
+            self.store.harness_detail = .{};
+        }
+        self.refreshHarnessDetail();
     }
 
     // ------------------------------------------------------------------------------------ tots
@@ -2390,6 +2681,11 @@ fn famNoteTitle(buf: []u8, note: FamSeen.Note) []const u8 {
 /// Copy the string value of a top-level `"key":"..."` from a flat JSON object into `buf` (unescaping only \/
 /// which appears in the authorize URL). Empty when absent. Used for the OAuth status/start replies, whose
 /// shapes are simple and server-controlled.
+/// How often the web harness is asked while its view is on screen.
+const HARNESS_EVERY_S: i64 = 10;
+/// How often its chat list is asked (a push asks again at once).
+const HARNESS_CONVS_EVERY_S: i64 = 30;
+
 fn valueForKey(json: []const u8, key: []const u8, buf: []u8) []const u8 {
     var kb: [40]u8 = undefined;
     const pat = std.fmt.bufPrint(&kb, "\"{s}\":\"", .{key}) catch return "";
@@ -3181,6 +3477,184 @@ test "removing a saved run calls the history route and clears that run's console
     try std.testing.expectEqual(@as(u8, 0), s.tot_sel_leaf_len);
     try std.testing.expectEqual(@as(usize, 0), s.tot_event_count);
     try std.testing.expectEqual(@as(u64, 0), s.tot_event_seq);
+}
+
+fn harnessTestPoller(gpa: std.mem.Allocator, io: std.Io, s: *Store, port_: u16) !*Poller {
+    s.* = .{};
+    s.settings.narrator = false;
+    s.settings.port = port_;
+    const tok = "nlk_desk-harness-test-token-not-a-real-credential";
+    @memcpy(s.settings.token[0..tok.len], tok);
+    s.settings.token_len = tok.len;
+    const p = try gpa.create(Poller);
+    p.* = .{ .io = io, .gpa = gpa, .store = s };
+    return p;
+}
+
+test "a job queued from the desk is posted to the harness route as the exact task, and the queue is asked again at once" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const OK_BODY = "{\"ok\":true,\"id\":\"mabc13\",\"position\":1}";
+    const reply = std.fmt.comptimePrint("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ OK_BODY.len, OK_BODY });
+    var sv: @import("llm.zig").Standin = undefined;
+    try sv.start(io, reply, false);
+    defer sv.stop();
+    const s = try gpa.create(Store);
+    defer gpa.destroy(s);
+    const p = try harnessTestPoller(gpa, io, s, sv.port);
+    defer gpa.destroy(p);
+    defer p.log_buf.deinit(gpa);
+    p.last_har_s = 12345;
+
+    const task = "read the \"tide\" tables\nthen say when high tide is";
+    s.pushCmd(store_mod.mkCmd(.harness_queue, "", task));
+    p.drainCommands();
+    try sv.awaitSeen(1);
+    const req = sv.request();
+    try std.testing.expect(std.mem.startsWith(u8, req, "POST /api/v1/harness/jobs "));
+    try std.testing.expect(std.mem.indexOf(u8, req, "Bearer nlk_desk-harness-test-token") != null);
+    const at = std.mem.indexOf(u8, req, "{\"task\"") orelse return error.NoBody;
+    const parsed = try std.json.parseFromSlice(struct { task: []const u8 }, gpa, req[at..], .{}); // strict: no model named, so none is sent
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(task, parsed.value.task);
+    try std.testing.expectEqual(@as(i64, 0), p.last_har_s);
+    try std.testing.expect(!s.harness_busy);
+    try std.testing.expectEqual(@as(usize, 1), s.notif_count); // "Job queued"
+}
+
+test "the desk's switch for harness jobs on this machine posts the state that was asked for and shows it at once" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const OK_BODY = "{\"ok\":true,\"local\":true}";
+    const reply = std.fmt.comptimePrint("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ OK_BODY.len, OK_BODY });
+    var sv: @import("llm.zig").Standin = undefined;
+    try sv.start(io, reply, false);
+    defer sv.stop();
+    const s = try gpa.create(Store);
+    defer gpa.destroy(s);
+    const p = try harnessTestPoller(gpa, io, s, sv.port);
+    defer gpa.destroy(p);
+    defer p.log_buf.deinit(gpa);
+    p.last_har_s = 12345;
+    s.pushCmd(store_mod.mkCmd(.harness_local, "", "1"));
+    p.drainCommands();
+    try sv.awaitSeen(1);
+    const req = sv.request();
+    try std.testing.expect(std.mem.startsWith(u8, req, "POST /api/v1/harness/local "));
+    try std.testing.expect(std.mem.endsWith(u8, req, "{\"on\":true}"));
+    try std.testing.expect(s.harness.local);
+    try std.testing.expectEqual(@as(i64, 0), p.last_har_s);
+    try std.testing.expectEqual(@as(usize, 0), s.notif_count);
+}
+
+test "the chat open in the desk is pushed to the harness route by its id, and a harness chat picked in the desk is read as a transcript" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    {
+        const OK_BODY = "{\"ok\":true,\"id\":\"d0123456789abcdef0123\",\"msgs\":2,\"stale\":false}";
+        const reply = std.fmt.comptimePrint("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ OK_BODY.len, OK_BODY });
+        var sv: @import("llm.zig").Standin = undefined;
+        try sv.start(io, reply, false);
+        defer sv.stop();
+        const s = try gpa.create(Store);
+        defer gpa.destroy(s);
+        const p = try harnessTestPoller(gpa, io, s, sv.port);
+        defer gpa.destroy(p);
+        defer p.log_buf.deinit(gpa);
+        p.last_har_convs_s = 12345;
+        s.pushCmd(store_mod.mkCmd(.harness_push, "", "")); // no chat is open: nothing is sent
+        p.drainCommands();
+        try std.testing.expectEqual(@as(usize, 1), s.notif_count);
+        try std.testing.expectEqual(@as(i64, 12345), p.last_har_convs_s);
+        const conv = "c6acfeae2";
+        @memcpy(s.conv_active[0..conv.len], conv);
+        s.conv_active_len = conv.len;
+        s.pushCmd(store_mod.mkCmd(.harness_push, "", ""));
+        p.drainCommands();
+        try sv.awaitSeen(1);
+        const req = sv.request();
+        try std.testing.expect(std.mem.startsWith(u8, req, "POST /api/v1/harness/convs "));
+        try std.testing.expect(std.mem.endsWith(u8, req, "{\"conv\":\"c6acfeae2\"}"));
+        try std.testing.expectEqual(@as(i64, 0), p.last_har_convs_s); // the list is asked again at once
+        try std.testing.expectEqual(@as(usize, 2), s.notif_count);
+    }
+    {
+        const CHAT = "{\"ok\":true,\"conv\":{\"id\":\"mabc1234\",\"title\":\"Tide times\",\"at\":5,\"msgs\":[{\"role\":\"user\",\"content\":\"when is high tide?\"},{\"role\":\"assistant\",\"content\":\"At 04:10.\"}],\"files\":{}}}";
+        const reply = std.fmt.comptimePrint("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ CHAT.len, CHAT });
+        var sv: @import("llm.zig").Standin = undefined;
+        try sv.start(io, reply, false);
+        defer sv.stop();
+        const s = try gpa.create(Store);
+        defer gpa.destroy(s);
+        const p = try harnessTestPoller(gpa, io, s, sv.port);
+        defer gpa.destroy(p);
+        defer p.log_buf.deinit(gpa);
+        @memcpy(s.harness_sel[0..6], "mabc01"); // a job was selected: picking a chat lets go of it
+        s.harness_sel_len = 6;
+        s.pushCmd(store_mod.mkCmd(.harness_chat_select, "mabc1234", ""));
+        p.drainCommands();
+        try sv.awaitSeen(1);
+        try std.testing.expect(std.mem.startsWith(u8, sv.request(), "GET /api/v1/harness/convs/mabc1234 "));
+        try std.testing.expectEqual(@as(u8, 0), s.harness_sel_len);
+        try std.testing.expectEqualStrings("mabc1234", s.harness_chat.idStr());
+        try std.testing.expectEqualStrings("You:\nwhen is high tide?\n\nVeil:\nAt 04:10.", s.harness_chat.textStr());
+    }
+}
+
+test "a harness job picked in the desk is fetched whole; one the harness refuses to queue says why in the harness's words" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    {
+        const JOB = "{\"ok\":true,\"job\":{\"id\":\"mabc01\",\"task\":\"read the tide tables\",\"model\":\"@cf/x/y\",\"state\":\"done\",\"rounds\":[],\"files\":{},\"result\":\"High tide is at 04:10.\",\"error\":\"\",\"calls\":2}}";
+        const reply = std.fmt.comptimePrint("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ JOB.len, JOB });
+        var sv: @import("llm.zig").Standin = undefined;
+        try sv.start(io, reply, false);
+        defer sv.stop();
+        const s = try gpa.create(Store);
+        defer gpa.destroy(s);
+        const p = try harnessTestPoller(gpa, io, s, sv.port);
+        defer gpa.destroy(p);
+        defer p.log_buf.deinit(gpa);
+        s.pushCmd(store_mod.mkCmd(.harness_select, "mabc01", ""));
+        s.pushCmd(store_mod.mkCmd(.harness_select, "../x", "")); // not an id the server takes: ignored, the selection stays
+        p.drainCommands();
+        try sv.awaitSeen(1);
+        try std.testing.expect(std.mem.startsWith(u8, sv.request(), "GET /api/v1/harness/jobs/mabc01 "));
+        try std.testing.expectEqualStrings("mabc01", s.harness_sel[0..s.harness_sel_len]);
+        try std.testing.expectEqualStrings("mabc01", s.harness_detail.idStr());
+        try std.testing.expectEqualStrings("High tide is at 04:10.", s.harness_detail.textStr());
+        // it has ended: the next tick does not fetch it again
+        p.refreshHarnessDetail();
+        try std.testing.expectEqual(@as(u32, 1), sv.seen.load(.acquire));
+    }
+    {
+        const FULL = "{\"ok\":false,\"err\":\"the queue is full (16 jobs waiting); a job joins when one starts\"}";
+        const reply = std.fmt.comptimePrint("HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ FULL.len, FULL });
+        var sv: @import("llm.zig").Standin = undefined;
+        try sv.start(io, reply, false);
+        defer sv.stop();
+        const s = try gpa.create(Store);
+        defer gpa.destroy(s);
+        const p = try harnessTestPoller(gpa, io, s, sv.port);
+        defer gpa.destroy(p);
+        defer p.log_buf.deinit(gpa);
+        p.last_har_s = 12345;
+        s.pushCmd(store_mod.mkCmd(.harness_queue, "@cf/x/y", "one more"));
+        p.drainCommands();
+        try sv.awaitSeen(1);
+        try std.testing.expect(std.mem.indexOf(u8, sv.request(), "{\"task\":\"one more\",\"model\":\"@cf/x/y\"}") != null);
+        try std.testing.expectEqual(@as(usize, 1), s.notif_count);
+        try std.testing.expect(std.mem.startsWith(u8, s.notifs[0].bodyStr(), "the queue is full"));
+        try std.testing.expectEqual(@as(i64, 12345), p.last_har_s); // nothing changed up there
+    }
 }
 
 test "a message for a tot is posted to that tot as the exact text, and the roster and its console are asked again at once" {

@@ -256,6 +256,16 @@ const api = {
   send:     (id, b) => jpost('/api/v1/chat/convs/' + encodeURIComponent(id) + '/messages', b, 30000),
   control:  (id, b) => jpost('/api/v1/chat/convs/' + encodeURIComponent(id) + '/control', b),
   sched:    ()      => jget('/api/v1/sched'),
+  harness:        ()   => jget('/api/v1/harness', 45000),
+  harnessJobs:    ()   => jget('/api/v1/harness/jobs', 45000),
+  harnessJob:     (id) => jget('/api/v1/harness/jobs/' + encodeURIComponent(id), 45000),
+  harnessQueue:   (task) => jpost('/api/v1/harness/jobs', { task: task }, 45000),
+  harnessCancel:  (id) => jdel('/api/v1/harness/jobs/' + encodeURIComponent(id)),
+  harnessScheds:  ()   => jget('/api/v1/harness/schedules', 45000),
+  harnessLocal:   (on) => jpost('/api/v1/harness/local', { on: !!on }),
+  harnessConvs:   ()   => jget('/api/v1/harness/convs', 45000),
+  harnessConv:    (id) => jget('/api/v1/harness/convs/' + encodeURIComponent(id), 45000),
+  harnessPush:    (conv) => jpost('/api/v1/harness/convs', { conv: conv }, 60000),
   swarms:   ()      => jget('/api/v1/swarms'),
   convFiles:(id)    => jget('/api/v1/chat/convs/' + encodeURIComponent(id) + '/files'),
   adminUsers:  ()   => jget('/api/v1/admin/users'),
@@ -3219,9 +3229,187 @@ async function renderTasks(host) {
       </div>
       <div id="taskForm" class="hide"></div>
       <div id="taskList"><div class="empty">loading…</div></div>
+      <div class="section-head">
+        <h2>Web harness</h2>
+        <button class="btn btn-sm btn-ghost" id="harRefresh">Refresh</button>
+      </div>
+      <div id="harnessBox"><div class="empty">loading…</div></div>
     </div></div>`;
   el('newTask').addEventListener('click', () => showTaskForm(null));
-  await refreshTasks();
+  el('harRefresh').addEventListener('click', refreshHarness);
+  await Promise.all([refreshTasks(), refreshHarness()]);
+}
+
+/* ------------------------------------------------------------ web harness
+   The job queue of the user's own "veil-web" Worker (the one the browser chat
+   works through), read by this server with the Cloudflare login
+   (config/cf_harness.zig). Admin-gated like the tasks above. Nothing here
+   polls: each view is one read, and Refresh is another. */
+
+async function refreshHarness() {
+  const host = el('harnessBox');
+  if (!host) return;
+  let st;
+  try {
+    st = await api.harness();
+  } catch (e) {
+    host.innerHTML = e.status === 403
+      ? '<div class="empty">The web harness is admin-only on this server.</div>'
+      : `<div class="empty">could not ask the harness — ${esc(e.message)}</div>`;
+    return;
+  }
+  if (!st.connected) {
+    host.innerHTML = '<div class="empty">Not logged in with Cloudflare. Log in from Settings to see your harness.</div>';
+    return;
+  }
+  if (!st.reachable || !st.harness) {
+    host.innerHTML = `<div class="empty">${esc(st.err || 'no veil-web harness answered')}</div>`;
+    return;
+  }
+  const h = st.harness;
+  const [jobs, scheds, chats] = await Promise.all([
+    api.harnessJobs().then((j) => j.jobs || []).catch(() => null),
+    api.harnessScheds().then((j) => j.schedules || []).catch(() => null),
+    api.harnessConvs().then((j) => j.convs || []).catch(() => null),
+  ]);
+  if (!el('harnessBox')) return;   // the tab changed while the harness was answering
+  const q = h.queue || {};
+  const newest = (jobs || []).slice().reverse();   // the harness lists oldest first
+  host.innerHTML = `
+    <div class="task-stats muted">
+      <span>veil-web v${esc(h.version || '?')}</span>
+      <span class="mono ellip">${esc(st.url || '')}</span>
+      <span>model calls today ${Number((h.usage || {}).calls) || 0} of ${Number((h.limits || {}).calls_max) || 0}</span>
+      <span>${Number(q.waiting) || 0} waiting, ${Number(q.running) || 0} running</span>
+    </div>
+    <div class="panel task-form">
+      <div class="field"><label for="harTask">Queue a job (runs in your Cloudflare account on ${esc(st.default_model || '')})</label>
+        <textarea id="harTask" rows="2" maxlength="8000"></textarea></div>
+      <div class="row"><button class="btn btn-solid btn-sm" id="harQueue">Queue</button></div>
+    </div>
+    <div class="task-actions">
+      <span class="pill ${st.local ? 'on' : ''}">local jobs ${st.local ? 'run on this server\'s machine' : 'are not run here'}</span>
+      <button class="btn btn-sm btn-ghost" id="harLocal" data-on="${st.local ? 'true' : 'false'}">${st.local ? 'Stop allowing them' : 'Allow them here'}</button>
+    </div>
+    ${jobs === null ? '<div class="empty">could not read the queue</div>'
+      : newest.length ? newest.map(harnessJobCard).join('') : '<div class="empty">no jobs yet</div>'}
+    ${scheds && scheds.length ? `<div class="task-card panel">
+      <div class="task-name">Schedules (kept by the harness)</div>
+      ${scheds.map((x) => `<div class="task-sched muted">every ${esc(harnessEvery(x.every_s))} · ${Number(x.runs) || 0} runs · ${esc(String(x.task || '').slice(0, 160))}</div>`).join('')}
+    </div>` : ''}
+    <div class="task-card panel">
+      <div class="task-head">
+        <div class="task-name grow">Chats (kept by the harness)</div>
+        ${S.conv ? '<button class="btn btn-sm btn-ghost" id="harPush">Push the open chat</button>' : ''}
+      </div>
+      ${chats === null ? '<div class="task-sched muted">could not read the chats</div>'
+        : chats.length ? chats.map((c) => `<div class="task-card">
+            <button class="run-row" data-har-chat="${esc(c.id)}">
+              <span class="run-title grow ellip">${esc(c.title || c.id)}</span>
+              <span class="run-when">${esc(fmtWhen(Math.floor((Number(c.at) || 0) / 1000)))}</span>
+            </button>
+            <div class="task-prompt hide" style="white-space:pre-wrap"></div>
+          </div>`).join('') : '<div class="task-sched muted">none yet</div>'}
+    </div>`;
+  el('harQueue').addEventListener('click', queueHarnessJob);
+  $$('[data-har-chat]', host).forEach((b) => b.addEventListener('click', () => openHarnessChat(b)));
+  if (el('harPush')) el('harPush').addEventListener('click', pushHarnessChat);
+  el('harLocal').addEventListener('click', async (ev) => {
+    const on = ev.currentTarget.dataset.on !== 'true';
+    // A local job is a full-tool turn on the machine this server runs on, queued by whoever holds the Cloudflare login.
+    if (on && !confirm('Let jobs queued on your harness for this machine run here, with this machine\'s tools?')) return;
+    try { await api.harnessLocal(on); refreshHarness(); } catch (e) { toast('Not changed', e.message, 'err'); }
+  });
+  $$('[data-har-open]', host).forEach((b) => b.addEventListener('click', () => openHarnessJob(b)));
+  $$('[data-har-del]', host).forEach((b) => b.addEventListener('click', () => cancelHarnessJob(b.dataset.harDel, b.dataset.active === 'true')));
+}
+
+function harnessEvery(s) {
+  s = Number(s) || 0;
+  if (s >= 86400 && s % 86400 === 0) return (s / 86400) + 'd';
+  if (s >= 3600 && s % 3600 === 0) return (s / 3600) + 'h';
+  if (s >= 60 && s % 60 === 0) return (s / 60) + 'm';
+  return s + 's';
+}
+
+function harnessJobCard(j) {
+  const active = j.state === 'queued' || j.state === 'running';
+  return `<div class="task-card panel">
+    <div class="task-head">
+      <div class="grow">
+        <div class="task-name">${esc(j.task || j.id)}</div>
+        <div class="task-sched muted mono">${esc(j.id)}${j.local ? ' · for this machine' : ''}${j.schedule ? ' · from a schedule' : ''}${j.note ? ' · ' + esc(j.note) : ''}</div>
+      </div>
+      <span class="pill ${j.state === 'done' ? 'on' : ''}">${esc(j.state || '')}</span>
+    </div>
+    <div class="task-prompt hide" style="white-space:pre-wrap"></div>
+    <div class="task-actions">
+      <button class="btn btn-sm btn-ghost" data-har-open="${esc(j.id)}">Result</button>
+      <span class="grow"></span>
+      <button class="btn btn-sm btn-danger" data-har-del="${esc(j.id)}" data-active="${active}">${active ? 'Cancel' : 'Delete'}</button>
+    </div>
+  </div>`;
+}
+
+async function queueHarnessJob() {
+  const task = (el('harTask').value || '').trim();
+  if (!task) return toast('Nothing to queue', 'Write the task first.', 'err');
+  try {
+    await api.harnessQueue(task);
+    toast('Job queued', 'The harness has it.', 'ok');
+    refreshHarness();
+  } catch (e) { toast('Could not queue', e.message, 'err'); }
+}
+
+/** Show one job's result in its card. The panel is found through the CARD, so an id cannot break a selector. */
+async function openHarnessJob(btn) {
+  const card = btn.closest('.task-card');
+  const panel = card && card.querySelector('.task-prompt');
+  if (!panel) return;
+  if (!panel.classList.contains('hide')) { panel.classList.add('hide'); return; }
+  panel.textContent = 'fetching…';
+  panel.classList.remove('hide');
+  try {
+    const j = (await api.harnessJob(btn.dataset.harOpen)).job || {};
+    const used = `${Number(j.calls) || 0} model calls, ${(j.rounds || []).length} tool calls, ${Object.keys(j.files || {}).length} files`;
+    const said = j.state === 'failed' && j.error ? j.error : (j.result || (j.state === 'queued' || j.state === 'running' ? '(no result yet)' : '(it ended with no result)'));
+    panel.textContent = used + '\n\n' + said;   // textContent: a job's words are never markup
+  } catch (e) { panel.textContent = 'could not fetch the job — ' + e.message; }
+}
+
+/** Show one harness chat as a transcript under its row. Text only: what the chat said is never markup. */
+async function openHarnessChat(btn) {
+  const panel = btn.parentElement && btn.parentElement.querySelector('.task-prompt');
+  if (!panel) return;
+  if (!panel.classList.contains('hide')) { panel.classList.add('hide'); return; }
+  panel.textContent = 'fetching…';
+  panel.classList.remove('hide');
+  try {
+    const c = (await api.harnessConv(btn.dataset.harChat)).conv || {};
+    const who = { user: 'You', assistant: 'Veil', error: 'Error' };
+    const said = (c.msgs || []).filter((m) => who[m.role] && typeof m.content === 'string' && m.content)
+      .map((m) => who[m.role] + ':\n' + m.content).join('\n\n');
+    panel.textContent = said || '(no messages)';
+  } catch (e) { panel.textContent = 'could not fetch the chat — ' + e.message; }
+}
+
+/** Copy the conversation open in the Chat tab up to the harness: its user and assistant text, nothing else. */
+async function pushHarnessChat() {
+  if (!S.conv) return;
+  try {
+    const r = await api.harnessPush(S.conv);
+    if (r.stale) toast('Chat not replaced', 'The harness holds a newer copy of it and kept that one.', 'err');
+    else toast('Chat pushed', (r.msgs || 0) + ' messages are in the web chat\'s list now.', 'ok');
+    refreshHarness();
+  } catch (e) { toast('Could not push', e.message, 'err'); }
+}
+
+async function cancelHarnessJob(id, active) {
+  if (!confirm(active ? 'Cancel this job?' : 'Delete this job and its files from the harness?')) return;
+  try {
+    await api.harnessCancel(id);
+    refreshHarness();
+  } catch (e) { toast('Could not remove', e.message, 'err'); }
 }
 
 async function refreshTasks() {

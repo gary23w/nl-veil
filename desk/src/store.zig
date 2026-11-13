@@ -6,6 +6,7 @@
 const std = @import("std");
 const scan = @import("scan.zig");
 const tots = @import("tots.zig");
+const harness = @import("harness.zig");
 const log = @import("log.zig");
 
 /// A tiny io-free spinlock. std.Thread.Mutex is gone in this Zig and std.Io.Mutex needs an io handle the
@@ -23,7 +24,7 @@ const SpinLock = struct {
 
 pub const Tab = enum { dashboard, chat, swarm, tots, hub, scheduled, settings }; // deploy = the Swarm tab's inner form
 
-pub const CmdKind = enum { none, select, say, set_goal, stop, deploy, delete, open_folder, refresh_now, open_file, sched_create, sched_update, sched_toggle, sched_delete, sched_run, oauth_cf_login, oauth_cf_logout, open_url, builtin_pull, builtin_cancel, builtin_import, builtin_remove, builtin_check, dataset_start, dataset_stop, cf_tunnel_on, cf_tunnel_off, lineage_accept, lineage_reject, tot_select, tot_deploy, tot_command, tot_config, tot_delete, tot_pad_write, tot_open_folder, tot_pad_clear, tot_limit, tot_select_run, tot_delete_run, garrett_deploy, garrett_connect, garrett_remove };
+pub const CmdKind = enum { none, select, say, set_goal, stop, deploy, delete, open_folder, refresh_now, open_file, sched_create, sched_update, sched_toggle, sched_delete, sched_run, oauth_cf_login, oauth_cf_logout, open_url, builtin_pull, builtin_cancel, builtin_import, builtin_remove, builtin_check, dataset_start, dataset_stop, cf_tunnel_on, cf_tunnel_off, lineage_accept, lineage_reject, tot_select, tot_deploy, tot_command, tot_config, tot_delete, tot_pad_write, tot_open_folder, tot_pad_clear, tot_limit, tot_select_run, tot_delete_run, garrett_deploy, garrett_connect, garrett_remove, harness_queue, harness_cancel, harness_select, harness_local, harness_chat_select, harness_push };
 
 /// A UI→poller command. Fixed-size, copied by value into the ring, so no cross-thread allocation.
 pub const Command = struct {
@@ -1332,6 +1333,26 @@ pub const Store = struct {
     // scratchpad, and ONLY while the Tots tab is being drawn - each poll is a call into the user's Cloudflare
     // account. The tab raises tots_watch every frame; the poller reads and lowers it every tick.
     tots_watch: bool = false,
+    // --- the web harness (harness.zig): the user's veil-web Worker, as GET /api/v1/harness and its jobs and schedules
+    // report it. Polled ONLY while the Tasks tab's Web harness view draws (it raises harness_watch each frame; the
+    // poller reads and lowers it): each poll is a call into the user's Cloudflare account.
+    harness_watch: bool = false,
+    harness_seen: bool = false, //   a status fetch has landed at least once
+    harness_denied: bool = false, // the server refused this login (the harness routes are admin-gated)
+    harness_busy: bool = false, //   a job is being queued
+    harness: harness.Status = .{},
+    harness_jobs: [harness.MAX_JOBS]harness.Job = undefined, // newest first
+    harness_job_n: usize = 0,
+    harness_scheds: [harness.MAX_SCHED]harness.Sched = undefined,
+    harness_sched_n: usize = 0,
+    harness_sel: [harness.ID_MAX]u8 = [_]u8{0} ** harness.ID_MAX, // the job whose result is shown
+    harness_sel_len: u8 = 0,
+    harness_detail: harness.Detail = .{}, // that job whole, once fetched (its id says whose it is)
+    harness_convs: [harness.MAX_CONVS]harness.Conv = undefined, // the chats the harness keeps, newest first
+    harness_conv_n: usize = 0,
+    harness_chat_sel: [harness.CONV_ID_MAX]u8 = [_]u8{0} ** harness.CONV_ID_MAX, // the chat whose transcript is shown (a job or a chat, never both)
+    harness_chat_sel_len: u8 = 0,
+    harness_chat: harness.Chat = .{}, // that chat, once fetched (its id says whose it is)
     // --- the FAMILY VIEW (NL_FAMILY_VIEW, read from the desk's environment once before the threads start; off, nothing
     // below ever moves). The chat view raises family_watch every frame it draws; the poller reads and lowers it each
     // tick and polls the ON-SCREEN family only, so other families' sub-chats still finish without a notice. A local

@@ -14,6 +14,7 @@ test {
     _ = @import("httpc.zig");
     _ = @import("llm.zig");
     _ = @import("log.zig");
+    _ = @import("harness.zig"); // the web harness: status, queue, schedules and one job read from the server's replies
     _ = @import("tots.zig"); // the tot roster, event tail and scratchpad readers; the deploy body round-trip
     _ = @import("tray.zig"); // the tray chores' pure parts: the retry schedule, the exe-path compare, the REG_SZ/GUID readers
     _ = @import("main.zig"); // the pure helpers under the drawing: formatters + index wrap
