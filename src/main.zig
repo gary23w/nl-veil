@@ -37,6 +37,7 @@ const cftools = @import("worker/cftools.zig"); // isLoopbackRoot — the NL_CF_A
 const cf_r2 = @import("config/cf_r2.zig");
 const cf_tunnel = @import("config/cf_tunnel.zig");
 const cf_tot = @import("config/cf_tot.zig");
+const cf_harness = @import("config/cf_harness.zig");
 const server_config = @import("config/server_config.zig");
 const datalock = @import("config/datalock.zig"); // one server per data dir: the lock every serving start takes
 const lan_mod = @import("config/lan.zig");
@@ -731,6 +732,9 @@ pub fn main(init: std.process.Init) !void {
     // TOTS allowed onto this machine queue jobs in the cloud; this thread polls for them and runs each as an
     // unattended chat turn (config/cf_tot.zig). It idles at no cost for a user who approved none.
     if (vthread.spawn("tots", cf_tot.bgLoop, .{&app})) |t| t.detach() else |_| {}
+    // LOCAL JOBS queued on the owner's veil-web harness: this thread asks for them and runs each as an unattended
+    // chat turn (config/cf_harness.zig). It makes no call for a user who has not allowed them onto this machine.
+    if (vthread.spawn("harness", cf_harness.bgLoop, .{&app})) |t| t.detach() else |_| {}
     log.info("billing: {s} (NL_PRODUCTION)", .{if (production) "PRODUCTION — non-admins metered by neuron plan" else "BETA — unmetered full use"});
     if (!open_reg) log.info("registration: CLOSED (private beta) — set NL_OPEN_REGISTRATION=1 to open public signups", .{});
     // NL_CF_API_ROOT: a stand-in for api.cloudflare.com, for the simulation suite (scripts/sim/cfworld.py).
@@ -907,6 +911,18 @@ pub fn main(init: std.process.Init) !void {
     router.get("/api/v1/tots/:name/events", cf_tot.totEvents, .{});
     router.post("/api/v1/tots/:name/command", cf_tot.totCommand, .{});
     router.post("/api/v1/tots/:name/config", cf_tot.totConfig, .{});
+    // The web veil's worker harness (config/cf_harness.zig): the user's own "veil-web" Worker, called with their
+    // Cloudflare login. Admin-gated.
+    router.get("/api/v1/harness", cf_harness.status, .{});
+    router.get("/api/v1/harness/jobs", cf_harness.listJobs, .{});
+    router.post("/api/v1/harness/jobs", cf_harness.queueJob, .{});
+    router.get("/api/v1/harness/jobs/:id", cf_harness.getJob, .{});
+    router.delete("/api/v1/harness/jobs/:id", cf_harness.cancelJob, .{});
+    router.get("/api/v1/harness/schedules", cf_harness.listSchedules, .{});
+    router.post("/api/v1/harness/local", cf_harness.setLocal, .{});
+    router.get("/api/v1/harness/convs", cf_harness.listConvs, .{});
+    router.post("/api/v1/harness/convs", cf_harness.pushConv, .{});
+    router.get("/api/v1/harness/convs/:id", cf_harness.getConv, .{});
     router.get("/api/v1/swarms/:id/events", tail_fanout.swarmEvents, .{});
     router.get("/api/v1/swarms/:id/stream", tail_fanout.swarmStream, .{});
     router.get("/api/v1/swarms/:id/files", deploy_service.swarmFiles, .{});
@@ -2247,6 +2263,7 @@ const ROUTE_MODS = [_]struct { alias: []const u8, src: []const u8 }{
     .{ .alias = "auth_api", .src = @embedFile("auth/auth_api.zig") },
     .{ .alias = "cf_tunnel", .src = @embedFile("config/cf_tunnel.zig") },
     .{ .alias = "cf_tot", .src = @embedFile("config/cf_tot.zig") },
+    .{ .alias = "cf_harness", .src = @embedFile("config/cf_harness.zig") },
     .{ .alias = "deploy_service", .src = @embedFile("worker/deploy/service.zig") },
     .{ .alias = "lineage_api", .src = @embedFile("worker/deploy/lineage_api.zig") },
     .{ .alias = "tail_fanout", .src = @embedFile("worker/control/fanout.zig") },

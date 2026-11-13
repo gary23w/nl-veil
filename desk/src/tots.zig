@@ -145,7 +145,7 @@ pub const Roster = struct {
 
 /// Copy `src` into a fixed field as ONE line: line breaks and tabs become spaces, the cut lands on a UTF-8
 /// boundary. Returns the length kept.
-fn put(dst: []u8, src: []const u8) usize {
+pub fn put(dst: []u8, src: []const u8) usize {
     var n = @min(src.len, dst.len);
     while (n > 0 and n < src.len and (src[n] & 0xC0) == 0x80) n -= 1;
     for (src[0..n], 0..) |c, i| dst[i] = if (c == '\n' or c == '\r' or c == '\t') ' ' else c;
@@ -154,7 +154,7 @@ fn put(dst: []u8, src: []const u8) usize {
 
 /// Copy `src` into a fixed field KEEPING its line breaks (the tab wraps them): CRs dropped, tabs become spaces, the
 /// cut lands on a UTF-8 boundary and a cut text ends in "...". Returns the length kept.
-fn putText(dst: []u8, src: []const u8) usize {
+pub fn putText(dst: []u8, src: []const u8) usize {
     var n: usize = 0;
     var cut = false;
     for (src) |c| {

@@ -16,6 +16,9 @@
 //   - AGENT GARRETT: the user's agent, reached over MCP (tools/list, tools/call) with the key its dashboard gives.
 //   - MCP: any MCP server the owner adds (name, address, token), its tools callable from chat and from jobs.
 //   - CLEF: yes/no decisions answered as probabilities by Cloudflare's decision model, as the desktop veil does.
+//   - LOCAL JOBS: a job queued with `local: true` is not run here. It waits for the owner's own machine: a
+//     desktop veil whose owner allowed it asks for these jobs (nothing here calls the machine), runs each one
+//     there and posts the result back. Until one does, the job stays queued.
 //   - SCHEDULES: a task that queues itself as a job every so often.
 //   - CHATS: the page's conversations and their files, kept here so every browser the owner logs in from (and
 //     anything else holding their login) sees the same ones.
@@ -39,7 +42,10 @@
 //   POST config                 {calls_max?, bytes_max?, storage_max?}
 //   POST chat | fetch | search  one model call (stream:true = SSE) | one HTTP call | a web search
 //   GET  jobs | jobs/<id>       the queue, oldest first | one job whole
-//   POST jobs  {task, model}    queue a job          DELETE jobs/<id>   cancel or delete one
+//   POST jobs  {task, model, local?}   queue a job (local: true = for the owner's machine)
+//   DELETE jobs/<id>            cancel or delete one
+//   GET  local                  the local jobs not finished yet, oldest first: {id, t, task, model, state}
+//   POST local/<id>             {started: true} when the machine takes one | {ok, result} when it has ended
 //   POST python/enable (re-upload this Worker with the LOADER binding) | python/run {code, files?, args?, packages?}
 //   POST garrett {key} or {url, token} (neither forgets it) | garrett/call {method, params}
 //   GET  models                 the account's Workers AI text models
@@ -53,7 +59,7 @@
 // No imports and no platform globals beyond fetch/Response/crypto, so a test can run this file under node with
 // a Map for storage and a scripted env.AI.
 
-export const VERSION = "5";
+export const VERSION = "6";
 const API_ROOT = "https://api.cloudflare.com/client/v4";
 const PY_SOURCE = "https://raw.githubusercontent.com/gary23w/nl-veil/main/cloud/tot_py.py";
 const SELF_SCRIPT = "veil-web";
@@ -79,6 +85,8 @@ const JOB_ROUNDS = 24; // tool calls one job may make
 const ALARM_STEPS = 6; // model calls one alarm makes before handing over to the next alarm
 const JOB_LOOP_BYTES = 40000; // a job's messages; older rounds go first
 const RESULT_MAX = 10000;
+const LOCAL_WAITING = "waiting for the owner's machine"; // a local job's note until a machine takes it
+const LOCAL_RUNNING = "running on the owner's machine";
 const FETCH_TEXT_MAX = 200000;
 const MAX_TOKENS_CEIL = 16384;
 const AUTH_TTL_MS = 5 * 60 * 1000;
@@ -1093,17 +1101,22 @@ export class Harness {
   }
 
   /// Put a job at the back of the queue. The caller has checked there is room. Returns its id.
-  async enqueue(index, task, model, schedule = "") {
+  /// `local`: the job is for the owner's machine. The alarm never runs it; it waits for /v1/local.
+  async enqueue(index, task, model, schedule = "", local = false) {
     const id = Date.now().toString(36) + hex(crypto.getRandomValues(new Uint8Array(3)));
-    const job = { id, task, model, schedule, state: "queued", created: Date.now(), started: 0, finished: 0, rounds: [], files: {}, result: "", error: "", note: "", calls: 0 };
-    index.push({ id, task: clip(task.replace(/\s+/g, " "), 120), state: "queued", created: job.created, finished: 0, bytes: 0, note: "", schedule });
+    const note = local ? LOCAL_WAITING : "";
+    const job = { id, task, model, schedule, state: "queued", created: Date.now(), started: 0, finished: 0, rounds: [], files: {}, result: "", error: "", note, calls: 0 };
+    const row = { id, task: clip(task.replace(/\s+/g, " "), 120), state: "queued", created: job.created, finished: 0, bytes: 0, note, schedule };
+    if (local) job.local = row.local = true;
+    index.push(row);
     await this.saveJob(job, index);
     return id;
   }
 
   /// Wake when there is next something to do: a job to step (`wait` ms from now) or a schedule coming due.
   async rearm(wait, nextDue) {
-    const active = (await this.jobs()).some((j) => ["queued", "running"].includes(j.state));
+    // a local job is the owner's machine's to run: it keeps no alarm going while it waits
+    const active = (await this.jobs()).some((j) => !j.local && ["queued", "running"].includes(j.state));
     const at = Math.min(active ? Date.now() + wait : Infinity, nextDue);
     if (at !== Infinity) await this.store.setAlarm(Math.max(at, Date.now() + 100));
   }
@@ -1113,7 +1126,7 @@ export class Harness {
   async alarm() {
     const index = await this.jobs();
     const nextDue = await this.runSchedules(index);
-    const row = index.find((j) => j.state === "running") ?? index.find((j) => j.state === "queued");
+    const row = index.find((j) => !j.local && j.state === "running") ?? index.find((j) => !j.local && j.state === "queued");
     if (!row) return this.rearm(1000, nextDue);
     const job = await this.store.get("job:" + row.id);
     if (!job) {
@@ -1171,7 +1184,7 @@ export class Harness {
       limits: cfg,
       usage,
       storage_bytes: index.reduce((n, j) => n + (j.bytes ?? 0), 0) + chats.reduce((n, c) => n + (c.bytes ?? 0), 0),
-      queue: { waiting: index.filter((j) => j.state === "queued").length, running: index.filter((j) => j.state === "running").length, max: QUEUE_MAX, kept: index.length, keep: JOBS_KEEP },
+      queue: { waiting: index.filter((j) => j.state === "queued").length, running: index.filter((j) => j.state === "running").length, max: QUEUE_MAX, kept: index.length, keep: JOBS_KEEP, local: index.filter((j) => j.local && ["queued", "running"].includes(j.state)).length },
       schedules: { count: sched.length, max: SCHEDULES_MAX, shortest_s: EVERY_MIN_S },
       chats: { count: chats.length, max: CONVS_MAX },
       python: { worker: !!this.env.LOADER },
@@ -1259,9 +1272,46 @@ export class Harness {
       if (!model.startsWith("@")) return bad("model must be a Workers AI model id");
       const index = await this.jobs();
       if (index.filter((j) => j.state === "queued").length >= QUEUE_MAX) return bad(`the queue is full (${QUEUE_MAX} jobs waiting); a job joins when one starts`, 429);
-      const id = await this.enqueue(index, task, model);
-      await this.store.setAlarm(Date.now() + 100);
-      return say({ ok: true, id, position: index.filter((j) => j.state === "queued").length });
+      const local = body.local === true;
+      const id = await this.enqueue(index, task, model, "", local);
+      if (!local) await this.store.setAlarm(Date.now() + 100);
+      return say({ ok: true, id, local, position: index.filter((j) => j.state === "queued").length });
+    }
+
+    // The owner's machine: it asks for the local jobs, says when it takes one, and posts how each ended.
+    if (at === "local" && method === "GET") {
+      const index = await this.jobs();
+      const jobs = [];
+      for (const row of index.filter((j) => j.local && ["queued", "running"].includes(j.state))) {
+        const job = await this.store.get("job:" + row.id);
+        if (job) jobs.push({ id: job.id, t: job.created, task: job.task, model: job.model, state: job.state });
+      }
+      return say({ ok: true, jobs });
+    }
+    if (seg[1] === "local" && seg.length === 3 && method === "POST") {
+      const index = await this.jobs();
+      const row = index.find((j) => j.id === seg[2]);
+      const job = row && row.local ? await this.store.get("job:" + row.id) : null;
+      if (!job) return bad("no such local job", 404);
+      if (!["queued", "running"].includes(job.state)) return bad("that job has already ended", 409);
+      if (body.started === true) {
+        if (job.state === "queued") {
+          job.state = "running";
+          job.started = Date.now();
+        }
+        job.note = LOCAL_RUNNING;
+      } else {
+        if (typeof body.ok !== "boolean") return bad("send {started: true}, or {ok, result}");
+        const text = clip(String(body.result ?? ""), RESULT_MAX);
+        job.state = body.ok ? "done" : "failed";
+        if (body.ok) job.result = text;
+        else job.error = text || "the owner's machine reported a failure";
+        job.note = "";
+        if (!job.started) job.started = Date.now();
+        job.finished = Date.now();
+      }
+      await this.saveJob(job, index);
+      return say({ ok: true, id: job.id, state: job.state });
     }
     if (seg[1] === "jobs" && seg.length === 3) {
       const index = await this.jobs();

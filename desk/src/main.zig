@@ -15,6 +15,7 @@ const t = @import("theme.zig");
 const store_mod = @import("store.zig");
 const scan = @import("scan.zig");
 const tots = @import("tots.zig");
+const harness = @import("harness.zig");
 const garrett_setup = @import("garrett.zig");
 const poller_mod = @import("poller.zig");
 const chat_mod = @import("chat.zig");
@@ -140,7 +141,7 @@ const WORKERS_AI_IDX: u8 = blk: {
 
 const ChatInner = enum { chat, metrics, files }; // the Chat center-pane inner tabs
 const RightTab = enum { activity, tasks, memory }; // the right pane's inner tabs (Swarm activity | Tasks | Memory)
-const SchedInner = enum { tasks, build }; // the Tasks tab's inner tabs (task list | builder form)
+const SchedInner = enum { tasks, build, harness }; // the Tasks tab's inner tabs (task list | builder form | the web harness's queue)
 const SwarmInner = enum { live, deploy, lineages }; // the Swarm tab's inner tabs (live view | deploy form | lineages)
 const ChatsInner = enum { chats, sched }; // the chat LEFT pane's inner tabs (conversations | scheduled tasks)
 const PaneDrag = enum { none, left, right, console }; // which divider is being drag-resized (else none)
@@ -313,6 +314,11 @@ const Ui = struct {
     // Tasks tab: task list + builder form ("once" fires at now+N; "every" repeats; "daily" at HH:MM)
     sched_inner: SchedInner = .tasks,
     sched_scroll: f32 = 0,
+    // Tasks tab, Web harness view: the task line, the queue's scroll, the selected job's result scroll
+    har_task: Field = .{},
+    har_scroll: f32 = 0,
+    har_res_scroll: f32 = 0,
+    har_chats_scroll: f32 = 0,
     sc_name: Field = .{},
     sc_prompt: Field = .{},
     sc_details: Field = .{},
@@ -374,7 +380,7 @@ const Ui = struct {
     log_follow: bool = true,
     details_scroll: f32 = 0, // swarm Details tab: the goal + config + blueprint can outgrow the panel
 
-    const Focus = enum { none, chat, d_name, d_key, d_cfacct, d_goal, d_gateway, d_lineage, c_input, c_rename, s_model, s_url, s_ckey, s_garrett, s_cfacct, s_tunhost, s_tkey, s_pkey, s_host, s_port, con_input, sc_name, sc_prompt, sc_details, sc_base, sc_model, sc_key, h_name, h_goal, h_charter, h_model, h_cmd, h_pad };
+    const Focus = enum { none, chat, d_name, d_key, d_cfacct, d_goal, d_gateway, d_lineage, c_input, c_rename, s_model, s_url, s_ckey, s_garrett, s_cfacct, s_tunhost, s_tkey, s_pkey, s_host, s_port, con_input, sc_name, sc_prompt, sc_details, sc_base, sc_model, sc_key, h_name, h_goal, h_charter, h_model, h_cmd, h_pad, hw_task };
     // Per chat-table horizontal-scroll offset (px), keyed by a content hash so it survives vertical scroll +
     // stream-settle. A tiny FIFO (see tblScrollOff): a new table evicts the oldest.
     const TblHScroll = struct { id: u64 = 0, off: f32 = 0 };
@@ -1879,6 +1885,7 @@ fn focusedField() ?*Ui.Field {
         .h_model => &ui.tot_model,
         .h_cmd => &ui.tot_cmd,
         .h_pad => &ui.tot_padline,
+        .hw_task => &ui.har_task,
     };
 }
 
@@ -9253,10 +9260,306 @@ fn drawScheduled(store: *Store, body: t.Rect) void {
     if (t.tab(.{ .x = tx, .y = body.y + pad, .width = t.tabW(tl_tasks), .height = tab_h }, tl_tasks, ui.sched_inner == .tasks)) ui.sched_inner = .tasks;
     tx += t.tabW(tl_tasks) + 6;
     if (t.tab(.{ .x = tx, .y = body.y + pad, .width = t.tabW(tl_build), .height = tab_h }, tl_build, ui.sched_inner == .build)) ui.sched_inner = .build;
+    tx += t.tabW(tl_build) + 6;
+    const tl_har = t.z("Web harness", .{});
+    if (t.tab(.{ .x = tx, .y = body.y + pad, .width = t.tabW(tl_har), .height = tab_h }, tl_har, ui.sched_inner == .harness)) ui.sched_inner = .harness;
     const r = t.Rect{ .x = pad, .y = body.y + pad + tab_h + 8, .width = body.width - pad * 2, .height = body.height - pad * 2 - tab_h - 8 };
     switch (ui.sched_inner) {
         .tasks => drawSchedTasks(store, r),
         .build => drawSchedBuild(store, r),
+        .harness => drawSchedHarness(store, r),
+    }
+}
+
+// The draw's own copies of the Store's harness rows and selected job (too large for the UI thread's stack frame).
+var har_jobs_view: [harness.MAX_JOBS]harness.Job = undefined;
+var har_detail_view: harness.Detail = .{};
+var har_convs_view: [harness.MAX_CONVS]harness.Conv = undefined;
+var har_chat_view: harness.Chat = .{};
+var har_chat_lines: [1400][]const u8 = undefined; // one transcript's wrapped lines
+
+fn harStateColor(state: []const u8) t.Color {
+    if (std.mem.eql(u8, state, "running")) return t.blue;
+    if (std.mem.eql(u8, state, "done")) return t.green;
+    if (std.mem.eql(u8, state, "failed")) return t.red;
+    return t.comment; // queued
+}
+
+/// The Tasks tab's Web harness view: the job queue of the user's veil-web Worker (the one the browser chat works
+/// through), as this server reads it with the Cloudflare login. A line queues a job; a row opens its result; the x
+/// cancels a waiting or running job and deletes a finished one. The harness's schedules are listed, not edited here.
+fn drawSchedHarness(store: *Store, r: t.Rect) void {
+    store.lock();
+    store.harness_watch = true; // the poller asks the account only while this view draws
+    const st = store.harness;
+    const seen = store.harness_seen;
+    const denied = store.harness_denied;
+    const busy = store.harness_busy;
+    const online = store.server_online;
+    const n = store.harness_job_n;
+    @memcpy(har_jobs_view[0..n], store.harness_jobs[0..n]);
+    var scheds: [harness.MAX_SCHED]harness.Sched = undefined;
+    const sched_n = store.harness_sched_n;
+    @memcpy(scheds[0..sched_n], store.harness_scheds[0..sched_n]);
+    var selb: [harness.ID_MAX]u8 = undefined;
+    const sel_n = store.harness_sel_len;
+    @memcpy(selb[0..sel_n], store.harness_sel[0..sel_n]);
+    har_detail_view = store.harness_detail;
+    const conv_n = store.harness_conv_n;
+    @memcpy(har_convs_view[0..conv_n], store.harness_convs[0..conv_n]);
+    var chat_selb: [harness.CONV_ID_MAX]u8 = undefined;
+    const chat_sel_n = store.harness_chat_sel_len;
+    @memcpy(chat_selb[0..chat_sel_n], store.harness_chat_sel[0..chat_sel_n]);
+    if (chat_sel_n > 0) har_chat_view = store.harness_chat;
+    const has_open_chat = store.conv_active_len > 0;
+    store.unlock();
+    const sel = selb[0..sel_n];
+    const chat_sel = chat_selb[0..chat_sel_n];
+
+    // what this login reaches, or why it reaches nothing
+    var y = r.y;
+    const why: ?[]const u8 = if (denied)
+        "admin token required - connect the admin key in Settings"
+    else if (!online)
+        "server offline - start it to see the harness"
+    else if (!seen)
+        "asking the harness..."
+    else if (!st.connected)
+        "not logged in with Cloudflare - log in from Settings"
+    else if (!st.reachable)
+        (if (st.err_len > 0) st.errStr() else "no veil-web harness answered")
+    else
+        null;
+    if (why) |w| {
+        t.textClip(w, @intFromFloat(r.x), @intFromFloat(y + 2), 13, if (seen and online and !denied and st.connected) t.orange else t.comment, @intFromFloat(r.width));
+        if (!st.connected or !seen or denied or !online or (n == 0 and conv_n == 0)) return;
+        y += 24;
+    } else {
+        var hb: [260]u8 = undefined;
+        const head = std.fmt.bufPrint(&hb, "veil-web v{s}  -  {s}", .{ st.versionStr(), st.urlStr() }) catch "";
+        t.textClip(head, @intFromFloat(r.x), @intFromFloat(y + 2), 13, t.fg, @intFromFloat(r.width));
+        var ub: [200]u8 = undefined;
+        const usage = std.fmt.bufPrint(&ub, "model calls today {d} of {d}  -  queue: {d} waiting, {d} running (holds {d} waiting)", .{ st.calls, st.calls_max, st.waiting, st.running, st.queue_max }) catch "";
+        t.textClip(usage, @intFromFloat(r.x), @intFromFloat(y + 22), 12, t.comment, @intFromFloat(r.width));
+        y += 46;
+
+        // the line that queues a job
+        const ql = t.z("Queue", .{});
+        const qw = @max(84, t.btnW(ql, t.FIELD_H));
+        const qf = t.Rect{ .x = r.x, .y = y, .width = r.width - qw - 8, .height = t.FIELD_H };
+        textField(qf, &ui.har_task, ui.focus == .hw_task, "a task for the harness to work on its own - Enter to queue", .hw_task);
+        const qb = t.Rect{ .x = r.x + r.width - qw, .y = y, .width = qw, .height = t.FIELD_H };
+        const task = std.mem.trim(u8, ui.har_task.str(), " \t\r\n");
+        const can = task.len > 0 and !busy;
+        if (t.button(qb, ql, t.blue, can) or (ui.focus == .hw_task and can and rl.isKeyPressed(.enter))) {
+            if (task.len > harness.TASK_MAX) {
+                store.pushNotif("Task too long", "the desk queues tasks of up to 3000 bytes", 2);
+            } else {
+                store.pushCmd(store_mod.mkCmd(.harness_queue, "", task));
+                ui.har_task.clear();
+                ui.har_scroll = 0;
+            }
+        }
+        y += t.FIELD_H + 4;
+        var mb: [160]u8 = undefined;
+        const mline = if (busy) "queueing..." else std.fmt.bufPrint(&mb, "runs in your Cloudflare account on {s}", .{st.defaultModelStr()}) catch "";
+        t.textClip(mline, @intFromFloat(r.x), @intFromFloat(y), 11, t.comment, @intFromFloat(r.width));
+        y += 20;
+        // the owner's switch for LOCAL jobs: jobs queued on the harness for this machine run here only while it is on
+        const ll = if (st.local_waiting > 0) t.z("run the harness's local jobs on this machine ({d} waiting)", .{st.local_waiting}) else t.z("run the harness's local jobs on this machine", .{});
+        if (t.checkbox(.{ .x = r.x, .y = y, .width = @min(r.width, 460), .height = 26 }, ll, st.local))
+            store.pushCmd(store_mod.mkCmd(.harness_local, "", if (st.local) "0" else "1"));
+        y += 32;
+    }
+
+    // left: the queue, newest first. right: the selected job over the schedules.
+    const gap: f32 = t.GAP;
+    const body_h = r.y + r.height - y;
+    if (body_h < 60) return;
+    const left_w = @round((r.width - gap) * 0.56);
+    // the left column: the queue over the harness's chats
+    const chats_h: f32 = if (body_h >= 260) @round(body_h * 0.36) else 0;
+    const list = t.Rect{ .x = r.x, .y = y, .width = left_w, .height = body_h - chats_h - (if (chats_h > 0) gap else 0) };
+    if (chats_h > 0) drawHarnessChats(store, .{ .x = r.x, .y = list.y + list.height + gap, .width = left_w, .height = chats_h }, har_convs_view[0..conv_n], chat_sel, has_open_chat and st.reachable);
+    t.panelBordered(list, t.bg_dark, t.border);
+    if (n == 0) {
+        t.text(t.z("no jobs yet - queue one above", .{}), @intFromFloat(list.x + t.PAD_IN), @intFromFloat(list.y + t.PAD_IN), 13, t.comment);
+    } else {
+        const row_h: f32 = 46;
+        const inner = t.Rect{ .x = list.x + 1, .y = list.y + 1, .width = list.width - 2, .height = list.height - 2 };
+        const total: f32 = @as(f32, @floatFromInt(n)) * row_h + 8;
+        const max_scroll = if (total > inner.height) total - inner.height else 0;
+        const wheel = rl.getMouseWheelMove();
+        if (wheel != 0 and t.hovering(inner)) ui.har_scroll -= wheel * row_h;
+        ui.har_scroll = std.math.clamp(ui.har_scroll, 0, max_scroll);
+        rl.beginScissorMode(@intFromFloat(inner.x), @intFromFloat(inner.y), @intFromFloat(inner.width), @intFromFloat(inner.height));
+        defer rl.endScissorMode();
+        var yy: f32 = inner.y + 4 - ui.har_scroll;
+        for (har_jobs_view[0..n]) |*job| {
+            if (yy + row_h < inner.y or yy > inner.y + inner.height) {
+                yy += row_h;
+                continue;
+            }
+            const rr = t.Rect{ .x = inner.x + 4, .y = yy, .width = inner.width - 8, .height = row_h - 4 };
+            const hot = t.hovering(rr) and t.hovering(inner);
+            const picked = std.mem.eql(u8, job.idStr(), sel);
+            if (picked or hot) t.panel(rr, t.bg_hl);
+            t.textClip(job.stateStr(), @intFromFloat(rr.x + 8), @intFromFloat(rr.y + 5), 12, harStateColor(job.stateStr()), 64);
+            t.textClip(job.taskStr(), @intFromFloat(rr.x + 76), @intFromFloat(rr.y + 4), 13, t.fg, @intFromFloat(rr.width - 76 - 36));
+            var sb: [280]u8 = undefined;
+            const sub = std.fmt.bufPrint(&sb, "{s}{s}{s}{s}{s}", .{ job.idStr(), if (job.local) "  -  for this machine" else "", if (job.scheduled) "  -  from a schedule" else "", if (job.note_len > 0) "  -  " else "", job.noteStr() }) catch "";
+            t.textClip(sub, @intFromFloat(rr.x + 76), @intFromFloat(rr.y + 23), 11, if (job.note_len > 0) t.orange else t.comment, @intFromFloat(rr.width - 76 - 36));
+            // x: cancel a waiting or running job, delete a finished one. Only while the chip is whole inside the list.
+            const xb = t.Rect{ .x = rr.x + rr.width - 30, .y = rr.y + (rr.height - 24) / 2, .width = 24, .height = 24 };
+            const x_in = xb.y >= inner.y and xb.y + xb.height <= inner.y + inner.height;
+            const x_hot = x_in and t.hovering(xb);
+            if (hot and x_in and t.buttonGhost(xb, t.z("x", .{}), t.red, true)) store.pushCmd(store_mod.mkCmd(.harness_cancel, job.idStr(), ""));
+            if (hot and !x_hot) t.wantCursor(.pointing_hand);
+            if (hot and !x_hot and rl.isMouseButtonPressed(.left) and !picked) {
+                store.pushCmd(store_mod.mkCmd(.harness_select, job.idStr(), ""));
+                ui.har_res_scroll = 0;
+            }
+            yy += row_h;
+        }
+    }
+
+    const rx = r.x + left_w + gap;
+    const rw = r.x + r.width - rx;
+    const sched_h: f32 = @min(body_h * 0.34, 22 + @as(f32, @floatFromInt(@max(sched_n, 1))) * 20 + 14);
+    const res = t.Rect{ .x = rx, .y = y, .width = rw, .height = body_h - sched_h - gap };
+    if (chat_sel.len > 0) drawHarnessChat(res, chat_sel) else drawHarnessResult(res, sel);
+    // the schedules: each queues its task as a job on its own clock, in the harness
+    const sr = t.Rect{ .x = rx, .y = res.y + res.height + gap, .width = rw, .height = sched_h };
+    t.panelBordered(sr, t.bg_dark, t.border);
+    flabel(sr.x + 10, sr.y + 6, t.z("SCHEDULES (kept by the harness)", .{}));
+    rl.beginScissorMode(@intFromFloat(sr.x + 1), @intFromFloat(sr.y + 1), @intFromFloat(sr.width - 2), @intFromFloat(sr.height - 2));
+    defer rl.endScissorMode();
+    if (sched_n == 0) t.text(t.z("none", .{}), @intFromFloat(sr.x + 10), @intFromFloat(sr.y + 26), 12, t.comment);
+    var sy = sr.y + 26;
+    for (scheds[0..sched_n]) |*sc| {
+        var eb: [24]u8 = undefined;
+        var lb: [240]u8 = undefined;
+        const line = std.fmt.bufPrint(&lb, "{s}  -  {d} runs  -  {s}", .{ harness.everyStr(&eb, sc.every_s), sc.runs, sc.taskStr() }) catch "";
+        t.textClip(line, @intFromFloat(sr.x + 10), @intFromFloat(sy), 12, t.fg_dim, @intFromFloat(sr.width - 20));
+        sy += 20;
+    }
+}
+
+/// The chats the harness keeps (the web chat's conversations), newest first. A row opens its transcript on the
+/// right. "Push open chat" copies the conversation open in the Chat tab up to the harness, as text.
+fn drawHarnessChats(store: *Store, r: t.Rect, rows: []const harness.Conv, chat_sel: []const u8, can_push: bool) void {
+    t.panelBordered(r, t.bg_dark, t.border);
+    flabel(r.x + 10, r.y + 8, t.z("CHATS (kept by the harness)", .{}));
+    const pl = t.z("Push open chat", .{});
+    const pw = t.btnW(pl, 24);
+    const pb = t.Rect{ .x = r.x + r.width - pw - 8, .y = r.y + 4, .width = pw, .height = 24 };
+    if (t.buttonGhost(pb, pl, t.blue, can_push)) store.pushCmd(store_mod.mkCmd(.harness_push, "", ""));
+    const inner = t.Rect{ .x = r.x + 1, .y = r.y + 32, .width = r.width - 2, .height = r.height - 33 };
+    if (inner.height < 12) return;
+    if (rows.len == 0) {
+        t.text(t.z("none yet", .{}), @intFromFloat(r.x + 10), @intFromFloat(inner.y + 2), 12, t.comment);
+        return;
+    }
+    const row_h: f32 = 26;
+    const total: f32 = @as(f32, @floatFromInt(rows.len)) * row_h + 4;
+    const max_scroll = if (total > inner.height) total - inner.height else 0;
+    const wheel = rl.getMouseWheelMove();
+    if (wheel != 0 and t.hovering(inner)) ui.har_chats_scroll -= wheel * row_h;
+    ui.har_chats_scroll = std.math.clamp(ui.har_chats_scroll, 0, max_scroll);
+    rl.beginScissorMode(@intFromFloat(inner.x), @intFromFloat(inner.y), @intFromFloat(inner.width), @intFromFloat(inner.height));
+    defer rl.endScissorMode();
+    var yy: f32 = inner.y - ui.har_chats_scroll;
+    for (rows) |*c| {
+        if (yy + row_h >= inner.y and yy <= inner.y + inner.height) {
+            const rr = t.Rect{ .x = inner.x + 4, .y = yy, .width = inner.width - 8, .height = row_h - 2 };
+            const hot = t.hovering(rr) and t.hovering(inner);
+            const picked = std.mem.eql(u8, c.idStr(), chat_sel);
+            if (picked or hot) t.panel(rr, t.bg_hl);
+            t.textClip(if (c.title_len > 0) c.titleStr() else c.idStr(), @intFromFloat(rr.x + 8), @intFromFloat(rr.y + 5), 13, t.fg, @intFromFloat(rr.width - 16));
+            if (hot) t.wantCursor(.pointing_hand);
+            if (hot and rl.isMouseButtonPressed(.left) and !picked) {
+                store.pushCmd(store_mod.mkCmd(.harness_chat_select, c.idStr(), ""));
+                ui.har_res_scroll = 0;
+            }
+        }
+        yy += row_h;
+    }
+}
+
+/// The selected harness chat as a transcript: its title, its counts, then who spoke and what they said.
+fn drawHarnessChat(r: t.Rect, chat_sel: []const u8) void {
+    t.panelBordered(r, t.bg_dark, t.border);
+    const c = &har_chat_view;
+    if (!std.mem.eql(u8, c.idStr(), chat_sel)) {
+        t.text(t.z("fetching the chat...", .{}), @intFromFloat(r.x + t.PAD_IN), @intFromFloat(r.y + t.PAD_IN), 13, t.comment);
+        return;
+    }
+    const maxw = r.width - 24;
+    var hb: [240]u8 = undefined;
+    const head = std.fmt.bufPrint(&hb, "{s}  -  {d} messages, {d} files{s}", .{ c.titleStr(), c.msgs, c.files, if (c.cut) "  -  showing its end" else "" }) catch "";
+    t.textClip(head, @intFromFloat(r.x + 10), @intFromFloat(r.y + 9), 12, t.comment, @intFromFloat(@max(0, r.width - 20)));
+    const view = t.Rect{ .x = r.x + 1, .y = r.y + 32, .width = r.width - 2, .height = r.height - 34 };
+    if (view.height < 20) return;
+    const lh: f32 = @round(16.0 * t.uiScale());
+    const ln = wrapInto(if (c.text_len > 0) c.textStr() else "(no messages)", maxw, &har_chat_lines);
+    const total: f32 = @as(f32, @floatFromInt(ln)) * lh + 12;
+    const max_scroll = @max(0, total - view.height);
+    const wheel = rl.getMouseWheelMove();
+    if (wheel != 0 and t.hovering(view)) ui.har_res_scroll -= wheel * 3 * lh;
+    ui.har_res_scroll = std.math.clamp(ui.har_res_scroll, 0, max_scroll);
+    rl.beginScissorMode(@intFromFloat(view.x), @intFromFloat(view.y), @intFromFloat(view.width), @intFromFloat(view.height));
+    defer rl.endScissorMode();
+    var yy = view.y + 4 - ui.har_res_scroll;
+    for (har_chat_lines[0..ln]) |l| {
+        if (yy + lh >= view.y and yy <= view.y + view.height) {
+            const who = std.mem.eql(u8, l, "You:") or std.mem.eql(u8, l, "Veil:") or std.mem.eql(u8, l, "Error:");
+            t.textClip(l, @intFromFloat(r.x + 10), @intFromFloat(yy), 13, if (who) t.cyan else t.fg, @intFromFloat(maxw + 4));
+        }
+        yy += lh;
+    }
+}
+
+/// The selected job: how it ended, what it used, and its result (or its error) wrapped and scrollable.
+fn drawHarnessResult(r: t.Rect, sel: []const u8) void {
+    t.panelBordered(r, t.bg_dark, t.border);
+    const d = &har_detail_view;
+    if (sel.len == 0) {
+        t.text(t.z("select a job to read its result", .{}), @intFromFloat(r.x + t.PAD_IN), @intFromFloat(r.y + t.PAD_IN), 13, t.comment);
+        return;
+    }
+    if (!std.mem.eql(u8, d.idStr(), sel)) {
+        t.text(t.z("fetching the job...", .{}), @intFromFloat(r.x + t.PAD_IN), @intFromFloat(r.y + t.PAD_IN), 13, t.comment);
+        return;
+    }
+    const maxw = r.width - 24;
+    t.textClip(d.stateStr(), @intFromFloat(r.x + 10), @intFromFloat(r.y + 8), 13, harStateColor(d.stateStr()), 70);
+    var hb: [220]u8 = undefined;
+    const head = std.fmt.bufPrint(&hb, "{s}  -  {d} model calls, {d} tool calls, {d} files", .{ d.modelStr(), d.calls, d.rounds, d.files }) catch "";
+    t.textClip(head, @intFromFloat(r.x + 84), @intFromFloat(r.y + 9), 12, t.comment, @intFromFloat(@max(0, r.width - 96)));
+    const view = t.Rect{ .x = r.x + 1, .y = r.y + 32, .width = r.width - 2, .height = r.height - 34 };
+    if (view.height < 20) return;
+    const lh: f32 = @round(16.0 * t.uiScale());
+    var task_lines: [24][]const u8 = undefined;
+    const tn = wrapInto(d.taskStr(), maxw, &task_lines);
+    var lines: [600][]const u8 = undefined;
+    const body: []const u8 = if (d.text_len > 0) d.textStr() else if (harness.activeState(d.stateStr())) "(no result yet)" else "(it ended with no result)";
+    const ln = wrapInto(body, maxw, &lines);
+    const total: f32 = @as(f32, @floatFromInt(tn + ln)) * lh + 22;
+    const max_scroll = @max(0, total - view.height);
+    const wheel = rl.getMouseWheelMove();
+    if (wheel != 0 and t.hovering(view)) ui.har_res_scroll -= wheel * 3 * lh;
+    ui.har_res_scroll = std.math.clamp(ui.har_res_scroll, 0, max_scroll);
+    rl.beginScissorMode(@intFromFloat(view.x), @intFromFloat(view.y), @intFromFloat(view.width), @intFromFloat(view.height));
+    defer rl.endScissorMode();
+    var yy = view.y + 4 - ui.har_res_scroll;
+    for (task_lines[0..tn]) |l| {
+        if (yy + lh >= view.y and yy <= view.y + view.height) t.textClip(l, @intFromFloat(r.x + 10), @intFromFloat(yy), 12, t.comment, @intFromFloat(maxw + 4));
+        yy += lh;
+    }
+    yy += 10;
+    for (lines[0..ln]) |l| {
+        if (yy + lh >= view.y and yy <= view.y + view.height) t.textClip(l, @intFromFloat(r.x + 10), @intFromFloat(yy), 13, if (d.failed) t.red else t.fg, @intFromFloat(maxw + 4));
+        yy += lh;
     }
 }
 

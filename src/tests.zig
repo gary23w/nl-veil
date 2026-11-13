@@ -16,6 +16,7 @@ test {
     _ = @import("config/datalock.zig"); // one server per data dir: the lock is exclusive across processes, stale-safe, and names its holder
     _ = @import("config/cf_r2.zig"); // the R2 backup: gated routes, object-key charset, state defaults, per-account bucket, a deleted bucket re-created — via fakehttp
     _ = @import("config/cf_tot.zig"); // tots: gated routes, the derived token, the upload, the owner's-machine bridge — via fakehttp
+    _ = @import("config/cf_harness.zig"); // the web veil's harness: gated routes, the address rule, discovery and relay - via fakehttp
     _ = @import("config/cf_garrett.zig"); // Agent Garrett's derived pair, read back from the state file
     _ = @import("worker/garrett.zig"); // Agent Garrett's belt: the two verbs over one JSON-RPC POST each — via fakehttp
     _ = @import("config/cf_tunnel.zig"); // the tunnel: gated routes, token-free state, the permission explanation, Access claims, hostname changes — via fakehttp

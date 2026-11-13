@@ -215,7 +215,7 @@ fn sourceHash(source: []const u8, out: *[16]u8) []const u8 {
 /// The runtime's address carries the token on every call, so it is one of two things: a workers.dev address over
 /// https, or - only while the Cloudflare API itself is pointed at a loopback stand-in (NL_CF_API_ROOT, tests) -
 /// a loopback address. A state file edited to name any other host gets no call.
-fn allowedUrl(app: *App, url: []const u8) bool {
+pub fn allowedUrl(app: *App, url: []const u8) bool {
     if (url.len < 12 or url.len > 200) return false;
     for (url) |c| if (c <= 0x20 or c == '@' or c == '\\' or c == '#' or c == '?' or c == 0x7F) return false;
     if (std.mem.startsWith(u8, url, "https://")) {
@@ -333,7 +333,7 @@ fn uploadPython(app: *App, a: std.mem.Allocator, url: []const u8, key: []const u
     return null;
 }
 
-const Tok = struct { key: []const u8, account_id: []const u8 };
+pub const Tok = struct { key: []const u8, account_id: []const u8 };
 
 /// Where the uploaded runtime answers: the account's workers.dev address. While the Cloudflare API is a loopback
 /// stand-in (NL_CF_API_ROOT, the simulation suite, the tests below) the stand-in plays the account, so it plays
@@ -343,7 +343,7 @@ fn runtimeUrl(app: *App, a: std.mem.Allocator, sub: []const u8) ?[]const u8 {
 }
 
 /// Where a script of this account answers: its workers.dev address, or the stand-in's origin (runtimeUrl).
-fn workerUrl(app: *App, a: std.mem.Allocator, script: []const u8, sub: []const u8) ?[]const u8 {
+pub fn workerUrl(app: *App, a: std.mem.Allocator, script: []const u8, sub: []const u8) ?[]const u8 {
     const root = app.cf_api_root;
     inline for (.{ "http://127.0.0.1:", "http://localhost:" }) |loop| {
         if (std.mem.startsWith(u8, root, loop)) {
@@ -356,7 +356,7 @@ fn workerUrl(app: *App, a: std.mem.Allocator, script: []const u8, sub: []const u
 }
 
 /// The account's workers.dev subdomain: every script's address hangs off it. Null with the reason in `why`.
-fn workersSubdomain(app: *App, a: std.mem.Allocator, tok: Tok, why: *[]const u8) ?[]const u8 {
+pub fn workersSubdomain(app: *App, a: std.mem.Allocator, tok: Tok, why: *[]const u8) ?[]const u8 {
     const sub_url = std.fmt.allocPrint(a, "{s}/accounts/{s}/workers/subdomain", .{ app.cf_api_root, tok.account_id }) catch {
         why.* = "out of memory";
         return null;
@@ -1647,7 +1647,7 @@ fn jobText(a: std.mem.Allocator, name: []const u8, instruction: []const u8) ?[]c
 
 /// The conversation's newest assistant message (in `a`), or null. `started` reports whether the conversation
 /// has any message at all: a job whose turn ran and left no answer is a failure, not a job still to run.
-fn lastAssistant(app: *App, a: std.mem.Allocator, uid: u64, conv: []const u8, started: *bool) ?[]const u8 {
+pub fn lastAssistant(app: *App, a: std.mem.Allocator, uid: u64, conv: []const u8, started: *bool) ?[]const u8 {
     started.* = false;
     const path = std.fmt.allocPrint(a, "{s}/u{d}/_chat/convs/{s}/messages.jsonl", .{ app.data, uid, conv }) catch return null;
     const body = std.Io.Dir.cwd().readFileAlloc(app.io, path, a, .limited(8 << 20)) catch return null;

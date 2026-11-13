@@ -428,6 +428,56 @@ pub fn totsDeploy(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8, 
     return httpReq(io, gpa, "POST", port, "/api/v1/tots", token, body_json, 120);
 }
 
+/// GET /api/v1/harness — whether this login reaches the user's veil-web harness, and the harness's own status
+/// (config/cf_harness.zig). The server asks the harness in the user's Cloudflare account, so the ceiling is long.
+pub fn harnessStatus(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8) ?Resp {
+    return httpReq(io, gpa, "GET", port, "/api/v1/harness", token, null, 40);
+}
+
+/// GET /api/v1/harness/jobs — the harness's queue, oldest first.
+pub fn harnessJobs(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8) ?Resp {
+    return httpReq(io, gpa, "GET", port, "/api/v1/harness/jobs", token, null, 40);
+}
+
+/// GET /api/v1/harness/schedules — the harness's schedules.
+pub fn harnessSchedules(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8) ?Resp {
+    return httpReq(io, gpa, "GET", port, "/api/v1/harness/schedules", token, null, 40);
+}
+
+/// POST /api/v1/harness/jobs — queue a job ({task, model?}). One shot, like every POST here.
+pub fn harnessQueue(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8, body_json: []const u8) ?Resp {
+    return httpReq(io, gpa, "POST", port, "/api/v1/harness/jobs", token, body_json, 40);
+}
+
+/// GET /api/v1/harness/convs — the chats the harness keeps, newest first.
+pub fn harnessConvs(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8) ?Resp {
+    return httpReq(io, gpa, "GET", port, "/api/v1/harness/convs", token, null, 40);
+}
+
+/// GET /api/v1/harness/convs/<id> — one harness chat whole.
+pub fn harnessConv(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8, id: []const u8) ?Resp {
+    var pbuf: [96]u8 = undefined;
+    const path = std.fmt.bufPrint(&pbuf, "/api/v1/harness/convs/{s}", .{id}) catch return null;
+    return httpReq(io, gpa, "GET", port, path, token, null, 40);
+}
+
+/// POST /api/v1/harness/convs — copy one of the server's conversations up to the harness ({conv}).
+pub fn harnessPush(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8, body_json: []const u8) ?Resp {
+    return httpReq(io, gpa, "POST", port, "/api/v1/harness/convs", token, body_json, 60);
+}
+
+/// POST /api/v1/harness/local — allow the harness's local jobs onto this machine, or stop allowing them.
+pub fn harnessLocal(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8, on: bool) ?Resp {
+    return httpReq(io, gpa, "POST", port, "/api/v1/harness/local", token, if (on) "{\"on\":true}" else "{\"on\":false}", 15);
+}
+
+/// GET or DELETE /api/v1/harness/jobs/<id> — one job whole, or cancel/delete it.
+pub fn harnessJob(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8, method: []const u8, id: []const u8) ?Resp {
+    var pbuf: [96]u8 = undefined;
+    const path = std.fmt.bufPrint(&pbuf, "/api/v1/harness/jobs/{s}", .{id}) catch return null;
+    return httpReq(io, gpa, method, port, path, token, null, 40);
+}
+
 /// GET /api/v1/tots/<name>/events?after=N — the tot's event tail past seq N.
 pub fn totEvents(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8, name: []const u8, after: u64) ?Resp {
     var pbuf: [160]u8 = undefined;
