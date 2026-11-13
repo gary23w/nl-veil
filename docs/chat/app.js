@@ -147,7 +147,7 @@ const S = {
   conv: null,                            // the open conversation: {id, title, at, msgs, files}
   live: null,                            // the running turn: {tools, text, status, abort}
   tab: 'code',                           // the side pane: code | jobs | harness
-  wide: false,                           // the side pane takes half the window (for reading code)
+  lay: { rail: true, chat: true, side: 0, ...ls.get('veilweb.layout', {}) },   // wide screens: which panes show, and the side pane's width in px (0 = its own)
   file: null,                            // the file showing in the editor
   open: [],                              // the files open as editor tabs
   shut: new Set(),                       // explorer folders that are folded
@@ -1351,7 +1351,8 @@ async function runTurn(text) {
       S.live.status = (folded ? 'thinking… earlier steps folded by the 4tope' : 'thinking…') + step;
       S.live.text = '';
       drawLive();
-      const reply = await callModel(messages, (t) => { S.live.text = shownWhileStreaming(t); drawLive(); }, abort.signal);
+      const reply = await callModel(messages, (t) => { S.live.text = shownWhileStreaming(t); drawLive(); drawStream(t); }, abort.signal);
+      if (S.live.writing) S.live.writing = null;   // the call is whole now: the tool writes the file itself
       if (!reply) throw new Error(`${S.model.split('/').pop()} answered nothing, even with its reasoning switched off and three times the room. Try another model from the picker.`);
       const act = parseAction(reply);
       if (!act) {
@@ -1761,14 +1762,72 @@ function previewNode(name) {
   return h('iframe', { class: 'preview', title: 'Preview of ' + name, sandbox: 'allow-scripts', srcdoc: kind === 'svg' ? text : inlined(text, S.conv.files) });
 }
 
+/* A file on its way from the model: what has arrived so far, read out of the half-sent tool call. Null when the
+   reply so far is not a file being written. */
+function writingNow(t) {
+  const tool = /["'`]?tool["'`]?\s*:\s*["'`]?(write_file|append_file)\b|call:(write_file|append_file)\b/.exec(t);
+  if (!tool) return null;
+  const name = /["'`]?(?:name|path|file|filename)["'`]?\s*:\s*["'`]([^"'`\n]{1,200})["'`]/.exec(t.slice(tool.index));
+  if (!name) return null;
+  const rest = t.slice(tool.index);
+  let text = null;
+  const inJson = /["'`]?(?:content|text)["'`]?\s*:\s*"/.exec(rest);
+  if (inJson) {
+    // a JSON string still being sent: up to its closing quote, or to the last whole escape
+    let raw = rest.slice(inJson.index + inJson[0].length);
+    const end = /(?:^|[^\\])(?:\\\\)*"/.exec(raw);
+    if (end) raw = raw.slice(0, end.index + end[0].length - 1);
+    raw = raw.replace(/\\(u[0-9a-fA-F]{0,3})?$/, '');
+    try { text = JSON.parse('"' + raw.replace(/[\n\r\t]/g, (c) => ({ '\n': '\\n', '\r': '\\r', '\t': '\\t' })[c]) + '"'); } catch { text = null; }
+  }
+  if (text === null) {
+    const fence = /\}\s*(?:```[ \t]*\r?\n\s*)?(?:<\|?\/?tool_call\|?>\s*)?```[\w.+-]*[ \t]*\r?\n([\s\S]*?)(?:\r?\n```|$)/.exec(rest);
+    if (fence) text = fence[1];
+  }
+  if (text === null) return null;
+  const file = fileName(name[1]);
+  if (!file) return null;
+  const append = (tool[1] ?? tool[2]) === 'append_file';
+  return { name: file, text: (append ? (S.conv.files[file] ?? '') : '') + text };
+}
+
+/* The editor while a file streams in: read-only, coloured, following the last line. */
+let streamPaint = 0;
+function streamNode(w) {
+  const gutter = h('div', { class: 'gutter', 'aria-hidden': 'true' });
+  const hl = h('pre', { class: 'hl' });
+  const node = h('div', { class: 'code stream', id: 'stream', 'data-name': w.name, 'aria-label': w.name + ', being written', 'aria-live': 'off' }, gutter, h('div', { class: 'code-inner' }, hl));
+  paintStream(node, w);
+  return node;
+}
+function paintStream(node, w) {
+  const follow = node.scrollHeight - node.scrollTop - node.clientHeight < 60;
+  node.querySelector('.hl').innerHTML = highlight(w.text, ext(w.name)) + '<span class="caret" aria-hidden="true"></span>\n';
+  node.querySelector('.gutter').textContent = Array.from({ length: w.text.split('\n').length }, (_, i) => i + 1).join('\n');
+  if (follow) node.scrollTop = node.scrollHeight;
+}
+/* Called with every piece of a reply: shows a file being written in the Code tab as it arrives. */
+function drawStream(t) {
+  if (!S.live) return;
+  const w = writingNow(t);
+  const was = S.live.writing;
+  S.live.writing = w;
+  if (!w) { if (was) drawSide(); return; }
+  const node = document.getElementById('stream');
+  if (!node || node.dataset.name !== w.name || S.tab !== 'code') { S.tab = 'code'; S.preview = false; drawSide(); return; }
+  if (streamPaint) return;
+  streamPaint = setTimeout(() => { streamPaint = 0; const n = document.getElementById('stream'); if (n && S.live?.writing) { paintStream(n, S.live.writing); const c = document.getElementById('streamCount'); if (c) c.textContent = S.live.writing.text.split('\n').length + ' lines'; } }, 50);
+}
+
 function codeTab() {
   S.open = S.open.filter((n) => n in S.conv.files);
   const names = Object.keys(S.conv.files);
-  const open = S.file !== null && S.file in S.conv.files ? S.file : null;
+  const writing = S.live?.writing ?? null;
+  const open = writing ? null : S.file !== null && S.file in S.conv.files ? S.file : null;
   if (open && !S.open.includes(open)) S.open.push(open);
   if (open && !previewable(open)) S.preview = false;
   const status = h('span', { class: 'pos' }, '');
-  const view = (id, label) => h('button', { class: S.preview === id ? 'on' : '', 'aria-pressed': String(S.preview === id), onclick: () => { S.preview = id; if (id === 'split' && !S.wide) { S.wide = true; document.querySelector('.shell')?.classList.add('wide'); } drawSide(); } }, label);
+  const view = (id, label) => h('button', { class: S.preview === id ? 'on' : '', 'aria-pressed': String(S.preview === id), onclick: () => { S.preview = id; if (id === 'split' && (document.getElementById('side')?.clientWidth ?? 9999) < 700 && S.lay.chat) setLayout({ side: Math.round(innerWidth * 0.52) }); drawSide(); } }, label);
   const filter = h('input', { id: 'fileFilter', type: 'text', placeholder: 'Find a file (Ctrl+P)', 'aria-label': 'Find a file', value: S.filter, autocomplete: 'off', spellcheck: 'false',
     oninput: (e) => { S.filter = e.target.value.trim().toLowerCase(); drawSide(); },
     onkeydown: (e) => { if (e.key === 'Enter') { const first = names.sort().find((n) => n.toLowerCase().includes(S.filter)); if (first) { openFile(first); S.filter = ''; drawSide(); queueMicrotask(() => document.getElementById('editor')?.focus()); } } else if (e.key === 'Escape') { S.filter = ''; drawSide(); } } });
@@ -1778,7 +1837,14 @@ function codeTab() {
       names.length ? h('button', { class: 'x show', title: 'Download everything as a .zip', 'aria-label': 'Download the workspace as a zip', onclick: () => { const a = h('a', { href: URL.createObjectURL(zipOf(S.conv.files)), download: (S.conv.title || 'workspace').replace(/[^\w-]+/g, '-').slice(0, 40) + '.zip' }); a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 1000); } }, '⇩') : null),
     names.length > 4 ? filter : null,
     h('div', { class: 'tree', role: 'tree' }, names.length ? treeRows(fileTree(names), 0, '') : h('div', { class: 'empty' }, 'No files yet.')));
-  const main = open === null
+  const main = writing
+    ? h('div', { class: 'ide-main' },
+        h('div', { class: 'ide-tabs', role: 'tablist' }, h('div', { class: 'ide-tab on writing', role: 'tab', 'aria-selected': 'true', title: writing.name },
+          h('span', { class: 'badge lang-' + langKey(ext(writing.name)), 'aria-hidden': 'true' }, BADGE[langKey(ext(writing.name))] ?? '·'), h('span', { class: 'name' }, writing.name.split('/').pop()), h('span', { class: 'dot', 'aria-hidden': 'true' }))),
+        h('div', { class: 'ide-bar' }, h('span', { class: 'crumbs' }, writing.name.split('/').flatMap((part, i, all) => [i ? h('span', { class: 'sep', 'aria-hidden': 'true' }, '›') : null, h('span', { class: i === all.length - 1 ? 'here' : '' }, part)])), h('span', { class: 'fine' }, 'the veil is writing…')),
+        h('div', { class: 'ide-body' }, streamNode(writing)),
+        h('div', { class: 'ide-status' }, h('span', {}, LANGS[ext(writing.name)] ?? 'Plain text'), h('span', { id: 'streamCount' }, writing.text.split('\n').length + ' lines'), h('span', { class: 'grow' }), h('span', {}, 'writing')))
+    : open === null
     ? h('div', { class: 'ide-empty' }, h('p', {}, names.length ? 'Pick a file from the explorer.' : 'Code the veil writes shows up here as it is written. You can edit it, preview a web page beside it, and download it.'),
         h('p', { class: 'fine' }, 'Ctrl+S saves · Ctrl+P finds a file · F2 renames · Tab indents'),
         h('button', { class: 'btn btn-sm', onclick: () => newFile() }, 'New file'))
@@ -1993,6 +2059,66 @@ function harnessTab() {
   ];
 }
 
+/* ---- the layout on a wide screen: the chats list and the chat close, the side pane drags and goes full screen ---- */
+const fullCode = () => !S.lay.rail && !S.lay.chat;
+let beforeFull = null;   // the layout full screen was entered from
+
+function applyLayout(shell = document.querySelector('.shell')) {
+  if (!shell) return;
+  shell.classList.toggle('no-rail', !S.lay.rail);
+  shell.classList.toggle('no-chat', !S.lay.chat);
+  if (S.lay.side) shell.style.setProperty('--side-w', S.lay.side + 'px'); else shell.style.removeProperty('--side-w');
+}
+
+function setLayout(change) {
+  Object.assign(S.lay, change);
+  ls.set('veilweb.layout', S.lay);
+  applyLayout();
+  drawBar();
+  drawSide();
+}
+
+function toggleFull() {
+  if (fullCode()) {
+    setLayout(beforeFull ?? { rail: true, chat: true });
+    beforeFull = null;
+    if (document.fullscreenElement) document.exitFullscreen?.().catch(() => {});
+  } else {
+    beforeFull = { rail: S.lay.rail, chat: S.lay.chat };
+    setLayout({ rail: false, chat: false });
+    document.documentElement.requestFullscreen?.().catch(() => {});   // the browser's own full screen, where it is allowed
+  }
+}
+document.addEventListener('fullscreenchange', () => { if (!document.fullscreenElement && fullCode() && beforeFull) toggleFull(); });
+
+/* The bar between the chat and the side pane: drag it, or use the arrow keys; a double click gives the width back. */
+function splitter() {
+  const el = h('div', { class: 'splitter', role: 'separator', 'aria-orientation': 'vertical', 'aria-label': 'Resize the code panel', tabindex: '0', title: 'Drag to resize · double-click to reset' });
+  const width = (w) => {
+    const shell = el.parentElement;
+    const max = shell.clientWidth - (S.lay.rail ? 240 : 0) - 260;
+    return Math.round(Math.max(280, Math.min(max, w)));
+  };
+  el.addEventListener('pointerdown', (e) => {
+    e.preventDefault();
+    el.setPointerCapture(e.pointerId);
+    const shell = el.parentElement;
+    shell.classList.add('dragging');
+    const move = (ev) => { S.lay.side = width(shell.getBoundingClientRect().right - ev.clientX); shell.style.setProperty('--side-w', S.lay.side + 'px'); };
+    const up = () => { el.removeEventListener('pointermove', move); shell.classList.remove('dragging'); ls.set('veilweb.layout', S.lay); };
+    el.addEventListener('pointermove', move);
+    el.addEventListener('pointerup', up, { once: true });
+    el.addEventListener('pointercancel', up, { once: true });
+  });
+  el.addEventListener('dblclick', () => setLayout({ side: 0 }));
+  el.addEventListener('keydown', (e) => {
+    if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+    e.preventDefault();
+    setLayout({ side: width((document.getElementById('side')?.clientWidth ?? 400) + (e.key === 'ArrowLeft' ? 32 : -32)) });
+  });
+  return el;
+}
+
 function sidePane() {
   const tab = (id, label) => h('button', { class: S.tab === id ? 'on' : '', role: 'tab', 'aria-selected': String(S.tab === id), onclick: () => { S.tab = id; S.note = ''; drawSide(); if (id === 'jobs') refreshJobs(); if (id === 'harness') refreshStatus(); } }, label);
   const active = S.jobs.filter((j) => j.state === 'queued' || j.state === 'running').length;
@@ -2001,7 +2127,8 @@ function sidePane() {
     h('div', { class: 'tabs', role: 'tablist' }, tab('code', files ? `Code (${files})` : 'Code'), tab('jobs', active ? `Jobs (${active})` : 'Jobs'), tab('harness', outdated() ? 'Harness •' : 'Harness'),
       h('span', { class: 'grow' }),
       S.tab === 'code' ? h('button', { class: 'widen', 'aria-label': S.explorer ? 'Hide the explorer' : 'Show the explorer', 'aria-pressed': String(S.explorer), title: 'Explorer', onclick: () => { S.explorer = !S.explorer; drawSide(); } }, '☰') : null,
-      h('button', { class: 'widen', 'aria-label': S.wide ? 'Narrow this panel' : 'Widen this panel', 'aria-pressed': String(S.wide), title: S.wide ? 'Narrow' : 'Widen', onclick: () => { S.wide = !S.wide; document.querySelector('.shell')?.classList.toggle('wide', S.wide); drawSide(); } }, S.wide ? '⇥' : '⇤')),
+      h('button', { class: 'widen', 'aria-label': S.lay.chat ? 'Hide the chat' : 'Show the chat', 'aria-pressed': String(!S.lay.chat), title: S.lay.chat ? 'Hide the chat (more room for code)' : 'Show the chat', onclick: () => setLayout({ chat: !S.lay.chat }) }, S.lay.chat ? '⇤' : '⇥'),
+      h('button', { class: 'widen', 'aria-label': fullCode() ? 'Leave full screen' : 'Full screen', 'aria-pressed': String(fullCode()), title: fullCode() ? 'Leave full screen (Esc)' : 'Full screen', onclick: () => toggleFull() }, fullCode() ? '⤡' : '⛶')),
     h('div', { class: 'pane tab-' + S.tab + (S.tab !== shownTab ? ' enter' : '') }, S.tab === 'code' ? codeTab() : S.tab === 'jobs' ? jobsTab() : harnessTab()));
 }
 let shownTab = 'code';   // the tab the pane last drew: only a change of tab is an entrance
@@ -2078,9 +2205,10 @@ function dashboard() {
     c.msgs.map(message),
     S.live ? liveNode() : null);
   const close = () => { S.panes.rail = false; S.panes.side = false; draw(); };
-  const shell = h('div', { class: 'shell' + (S.wide ? ' wide' : '') + (S.panes.rail ? ' show-rail' : '') + (S.panes.side ? ' show-side' : '') },
+  const shell = h('div', { class: 'shell' + (S.panes.rail ? ' show-rail' : '') + (S.panes.side ? ' show-side' : '') },
     h('aside', { class: 'rail' },
-      h('div', { class: 'pane-head' }, 'Chats', h('button', { class: 'btn btn-ghost btn-sm', disabled: !!S.live, onclick: () => { newConv(); S.panes.rail = false; draw(); } }, '+ New')),
+      h('div', { class: 'pane-head' }, 'Chats', h('span', { class: 'grow' }), h('button', { class: 'btn btn-ghost btn-sm', disabled: !!S.live, onclick: () => { newConv(); S.panes.rail = false; draw(); } }, '+ New'),
+        h('button', { class: 'btn btn-ghost btn-sm only-wide', 'aria-label': 'Hide the chats list', title: 'Hide the chats list', onclick: () => setLayout({ rail: false }) }, '«')),
       h('div', { class: 'list' },
         S.convs.length === 0 ? h('div', { class: 'empty' }, 'Your chats are kept in your harness, so they follow your login to any browser.') : null,
         S.convs.map((x) => h('div', { class: 'item' + (x.id === c.id ? ' on' : ''), role: 'button', tabindex: '0', onclick: () => openConv(x.id), onkeydown: (e) => { if (e.key === 'Enter') openConv(x.id); } },
@@ -2093,8 +2221,10 @@ function dashboard() {
       h('div', { class: 'composer' },
         h('textarea', { id: 'prompt', rows: '1', placeholder: 'Message the veil', 'aria-label': 'Message', onkeydown: (e) => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); } }, oninput: (e) => { e.target.style.height = 'auto'; e.target.style.height = Math.min(220, e.target.scrollHeight) + 'px'; } }),
         S.live ? h('button', { class: 'btn', onclick: () => S.live.abort.abort() }, 'Stop') : h('button', { class: 'btn btn-solid', onclick: () => send() }, 'Send'))),
+    splitter(),
     sidePane(),
     h('div', { class: 'scrim', onclick: close }));
+  applyLayout(shell);
   queueMicrotask(() => { transcript.scrollTop = transcript.scrollHeight; if (!S.live && !S.panes.rail && !S.panes.side && matchMedia('(min-width: 981px)').matches) document.getElementById('prompt')?.focus(); });
   return shell;
 }
@@ -2163,14 +2293,7 @@ function draw() {
   const typed = document.getElementById('hname')?.value ?? '';
   const sideKeep = {};
   for (const el of document.querySelectorAll('#side input, #side textarea:not(#editor), #side select')) if (el.id && el.value && el.type !== 'number') sideKeep[el.id] = el.value;
-  barSlot.replaceChildren(...(on ? [
-    h('button', { class: 'icon-btn only-narrow', 'aria-label': 'Chats and links', onclick: () => { S.panes.rail = !S.panes.rail; S.panes.side = false; draw(); } }, '☰'),
-    modelSelect(),
-    outdated()
-      ? h('button', { class: 'chip warn', onclick: () => { S.tab = 'harness'; S.panes.side = true; draw(); } }, h('span', { class: 'chip-dot' }), 'update harness')
-      : h('span', { class: 'chip', title: S.harness }, h('span', { class: 'chip-dot' }), 'harness connected'),
-    h('button', { class: 'icon-btn only-narrow', 'aria-label': 'Code, jobs and harness', onclick: () => { S.panes.side = !S.panes.side; S.panes.rail = false; draw(); } }, '▤'),
-  ] : []));
+  drawBar();
   const view = !S.session ? 'gate' : on ? 'chat:' + S.conv.id : 'setup';
   app.classList.toggle('same-view', view === shownView);
   shownView = view;
@@ -2181,6 +2304,21 @@ function draw() {
   const a = document.getElementById('hname');
   if (a && typed) a.value = typed;
   for (const [id, v] of Object.entries(sideKeep)) { const el = document.getElementById(id); if (el) el.value = v; }
+}
+
+function drawBar() {
+  const on = !!(S.session && S.status);
+  const pane = (key, label, glyph) => h('button', { class: 'icon-btn only-wide' + (S.lay[key] ? ' on' : ''), 'aria-label': (S.lay[key] ? 'Hide ' : 'Show ') + label, 'aria-pressed': String(S.lay[key]), title: (S.lay[key] ? 'Hide ' : 'Show ') + label, onclick: () => setLayout({ [key]: !S.lay[key] }) }, glyph);
+  barSlot.replaceChildren(...(on ? [
+    h('button', { class: 'icon-btn only-narrow', 'aria-label': 'Chats and links', onclick: () => { S.panes.rail = !S.panes.rail; S.panes.side = false; draw(); } }, '☰'),
+    pane('rail', 'the chats list', '☰'),
+    pane('chat', 'the chat', '✎'),
+    modelSelect(),
+    outdated()
+      ? h('button', { class: 'chip warn', onclick: () => { S.tab = 'harness'; S.panes.side = true; draw(); } }, h('span', { class: 'chip-dot' }), 'update harness')
+      : h('span', { class: 'chip', title: S.harness }, h('span', { class: 'chip-dot' }), 'harness connected'),
+    h('button', { class: 'icon-btn only-narrow', 'aria-label': 'Code, jobs and harness', onclick: () => { S.panes.side = !S.panes.side; S.panes.rail = false; draw(); } }, '▤'),
+  ] : []));
 }
 
 /* ============================================================ theme (the site's three, the site's key) */

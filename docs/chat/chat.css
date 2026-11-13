@@ -55,8 +55,30 @@ button:disabled, .btn[aria-disabled=true] { opacity: .5; cursor: default; pointe
 .fine { font-size: var(--fs-small); color: var(--text-muted); }
 
 /* ---- the dashboard: three panes ---- */
-.shell { flex: 1; min-height: 0; display: grid; grid-template-columns: 240px minmax(0, 1fr) clamp(320px, 30vw, 460px); position: relative; transition: grid-template-columns var(--calm) var(--ease); }
-.shell.wide { grid-template-columns: 240px minmax(0, 1fr) minmax(420px, 52vw); }
+.shell { flex: 1; min-height: 0; display: grid; grid-template-columns: 240px minmax(0, 1fr) 5px var(--side-w, clamp(320px, 30vw, 460px)); position: relative; }
+/* wide screens: the chats list and the chat close; with both closed the code has the whole window */
+@media (min-width: 981px) {
+  .shell.no-rail { grid-template-columns: minmax(0, 1fr) 5px var(--side-w, clamp(320px, 30vw, 460px)); }
+  .shell.no-chat { grid-template-columns: 240px minmax(0, 1fr); }
+  .shell.no-rail.no-chat { grid-template-columns: minmax(0, 1fr); }
+  .shell.no-rail .rail, .shell.no-chat .chat, .shell.no-chat .splitter { display: none; }
+  .shell.no-chat .side { border-left: 0; }
+  .only-wide { display: inline-grid; }
+}
+.only-wide { display: none; }
+.splitter { cursor: col-resize; background: transparent; position: relative; z-index: 2; touch-action: none; transition: background var(--quick); }
+.splitter::after { content: ''; position: absolute; inset: 0 -3px; }
+.splitter:hover, .splitter:focus-visible, .shell.dragging .splitter { background: var(--accent); outline: none; }
+.shell.dragging { cursor: col-resize; user-select: none; }
+.shell.dragging iframe { pointer-events: none; }
+.icon-btn.on { color: var(--accent); }
+.pane-head .grow { flex: 1; }
+/* a file as it is written */
+.code.stream .hl { pointer-events: auto; user-select: text; }
+.caret { display: inline-block; width: 7px; height: 1.05em; vertical-align: text-bottom; background: var(--accent); animation: blink 1s steps(2, start) infinite; }
+@keyframes blink { to { visibility: hidden; } }
+.ide-tab.writing .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); animation: blink 1s steps(2, start) infinite; }
+@media (prefers-reduced-motion: reduce) { .caret, .ide-tab.writing .dot { animation: none; } }
 .rail, .side { background: var(--surface-raised); display: flex; flex-direction: column; min-height: 0; min-width: 0; }
 .rail { border-right: 1px solid var(--border); }
 .side { border-left: 1px solid var(--border); }
@@ -259,7 +281,8 @@ details.tool pre { padding: 8px 10px; border-top: 1px solid var(--border); max-h
 
 /* ---- narrow screens: the rail and the side pane slide over the chat ---- */
 @media (max-width: 980px) {
-  .shell, .shell.wide { grid-template-columns: minmax(0, 1fr); }
+  .shell { grid-template-columns: minmax(0, 1fr); }
+  .splitter { display: none; }
   .rail, .side { position: absolute; top: 0; bottom: 0; z-index: 6; width: min(360px, 90vw); box-shadow: 0 8px 30px rgb(0 0 0 / .25); transition: transform var(--calm) var(--ease), visibility var(--calm); visibility: hidden; }
   .side { width: min(560px, 94vw); }
   .rail { left: 0; transform: translateX(-102%); }
