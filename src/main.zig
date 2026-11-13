@@ -933,6 +933,7 @@ pub fn main(init: std.process.Init) !void {
     router.get("/api/v1/harness/settings", cf_harness.getSettings, .{});
     router.post("/api/v1/harness/settings", cf_harness.putSettings, .{});
     router.post("/api/v1/harness/share", cf_harness.share, .{});
+    router.post("/api/v1/harness/deploy", cf_harness.deploy, .{}); // put the harness in the user's account, from here
     router.get("/api/v1/swarms/:id/events", tail_fanout.swarmEvents, .{});
     router.get("/api/v1/swarms/:id/stream", tail_fanout.swarmStream, .{});
     router.get("/api/v1/swarms/:id/files", deploy_service.swarmFiles, .{});

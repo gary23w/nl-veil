@@ -24,6 +24,20 @@ The owner turns it on with `POST /api/v1/harness/local {on: true}` (the desk's c
 
 While the switch is on, a background thread (`bgLoop`) asks the harness for its unfinished local jobs (`GET /v1/local`, with this machine's node id once it has one) every 20 seconds. Each job runs as an unattended chat turn, through the same entry points a scheduled task and a tater-tot's job use, in a conversation named `harness_<job id>`, on the Cloudflare login and the job's model. One runs at a time. When a turn starts the server tells the harness (`POST /v1/local/<id> {started: true}`); when it has ended the server posts the turn's last answer (`{ok: true, result}`, cut to 10000 bytes), or a failure when the turn left no answer. The thread makes no call for a user who has neither set the switch nor reached a harness from this server, runs only for an admin account, and stops when `VEIL_CHAT_BACKEND=0`. A harness older than version 6 has no such route and nothing is started. A harness whose address is not known is looked for again every 5 minutes.
 
+## Deploying the harness
+
+A user with no harness does not have to go to the website for one. `POST /api/v1/harness/deploy` puts it into their own Cloudflare account with the login this server holds:
+
+1. If a harness already answers, nothing is uploaded and the route says so (`deployed: false`).
+2. The account's workers.dev subdomain is read. An account that has none yet is told to open Workers & Pages in the Cloudflare dashboard once.
+3. The harness is uploaded as the Worker `veil-web`. The source is the copy compiled into this binary (`cloud/veil-web/veil-web.js` as it was at build time), not one fetched at deploy time. The upload carries what `cloud/veil-web/wrangler.jsonc` declares: the AI binding, the `Harness` object class, the page's origin, and, when the script is new, the migration that creates the class. The Worker Loader binding (Python) is not asked for; the harness adds it to itself when its owner asks.
+4. Its workers.dev address is switched on.
+5. The new address is asked for its status every 3 seconds for up to 24 seconds. The route answers `answering: false` when it had not answered by then; a new address can take longer to come up.
+
+A refusal by Cloudflare comes back as a 502 with the reason; a login that lacks the permission to deploy Workers is told to log in again. A harness deployed this way keeps itself current from the public repo afterwards, as one deployed from the website does.
+
+Nothing deploys on this server's own initiative. The route is called by the desk's and the web app's **Deploy my runtime** button, and by the chat verb `mesh_deploy_runtime`, whose description tells the model to call it only after the user has said yes. When a mesh verb reaches no runtime, its answer tells the model to ask the user whether to deploy one.
+
 ## The mesh
 
 From version 10 the harness keeps a list of **nodes**: every veil logged in to the account that has told it "I am here". A machine joins when its harness first answers this server (`GET /api/v1/harness`): it is given an id, 16 random hex characters kept in the state file, and a name, the computer's own name until the owner sets one (`POST /api/v1/harness/node {name}`). From then on the harness thread says it is here on every pass (`POST /v1/nodes/<id>`, every 20 seconds): the name, `desk` or `server`, the operating system, the veil's version, whether the local-jobs switch is on (`runs`), whether this server has an Agent Garrett connection, and the names of the MCP servers found in this machine's MCP config files (names only, read again every 5 minutes). The harness lists a node as offline once it has not heard from it for 90 seconds. Nothing calls a machine: each one asks.
@@ -34,10 +48,11 @@ A job can be addressed to one node (`POST /api/v1/harness/jobs {task, model?, no
 
 ### The chat's verbs
 
-A chat turn whose user is logged in with Cloudflare and is not sandboxed is offered three more tools:
+A chat turn whose user is logged in with Cloudflare and is not sandboxed is offered four more tools:
 
 - `mesh_inventory` lists the nodes, one a line: id, name (this machine marked), kind, operating system, version, online or how long ago it was seen, whether it runs work, whether it has a browser, Agent Garrett, its MCP server names, and how many jobs wait for it.
 - `mesh_run {node, task, model?}` sends a task to one node, named by its id or by its exact name when only one node has it. It refuses this machine itself, a node that does not run work, and a name no node (or more than one) has. It answers with the job id at once and says when the node is offline.
+- `mesh_deploy_runtime` deploys the harness as described above; it does nothing when one already answers.
 - `mesh_result {job}` reads that job: its state while it waits or runs, the other veil's report once it is done, its error when it failed.
 
 They are refused for a sandboxed caller and for a user who is not the server's admin, like the routes.
@@ -78,7 +93,8 @@ The harness keeps the web chat's conversations. Reading them is a relay: `GET /a
 - `listNodes` / `forgetNode` / `setNode` — `GET /api/v1/harness/nodes`, `DELETE /api/v1/harness/nodes/:id`, `POST /api/v1/harness/node {name}`
 - `getSettings` / `putSettings` — `GET` and `POST /api/v1/harness/settings`
 - `share` — `POST /api/v1/harness/share`
-- `MESH_SCHEMA`, `isMeshTool`, `meshTool` — the chat's three mesh verbs and their entry from the chat engine
+- `deploy` — `POST /api/v1/harness/deploy`: answers `{ok, deployed, answering, url, version}`
+- `MESH_SCHEMA`, `isMeshTool`, `meshTool` — the chat's four mesh verbs and their entry from the chat engine
 - `node_kind`, `node_version` — what this process tells the harness it is; `main.zig` sets them
 - `bgLoop` — the thread that says this machine is here, brings the Agent Garrett connection level, and polls an allowed harness for local jobs and runs them (above)
 
@@ -88,4 +104,4 @@ The harness's JSON is passed through as it is. A refusal by the harness (a full 
 
 ## Tests
 
-The Cloudflare API and the harness are one `fakehttp` stand-in. The tests cover the gate on every route, the address rule, the checks on a queued job, discovery and the remembered address, the relayed calls and the harness's refusals, an absent harness, a state file edited to name another host, the switch, a pushed conversation's body and id, a newer harness copy, and the bridge posting an ended turn's answer or its failure. The mesh tests cover the machine's id (made once, kept through a forgotten address), what it says about itself, an addressed job's body, the inventory text, `mesh_run`'s refusals and its one queued job, `mesh_result`, the node id on the local-jobs poll, and the Agent Garrett connection taken, not taken again after a disconnect, and given. No test starts a chat turn. The harness's local-job routes are tested under node (`cloud/veil-web/veil-web.test.mjs`); that file is not one of the check script's gates.
+The Cloudflare API and the harness are one `fakehttp` stand-in. The tests cover the gate on every route, the address rule, the checks on a queued job, discovery and the remembered address, the relayed calls and the harness's refusals, an absent harness, a state file edited to name another host, the switch, a pushed conversation's body and id, a newer harness copy, and the bridge posting an ended turn's answer or its failure. The mesh tests cover the machine's id (made once, kept through a forgotten address), what it says about itself, an addressed job's body, the inventory text, `mesh_run`'s refusals and its one queued job, `mesh_result`, the node id on the local-jobs poll, and the Agent Garrett connection taken, not taken again after a disconnect, and given. The deploy tests cover the upload's metadata against `wrangler.jsonc`, the migration riding a new script only, nothing uploaded when a harness answers, the upload then the address then the wait, an account with no subdomain, and a refused upload. No test deploys to a real account. No test starts a chat turn. The harness's local-job routes are tested under node (`cloud/veil-web/veil-web.test.mjs`); that file is not one of the check script's gates.

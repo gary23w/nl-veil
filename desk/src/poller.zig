@@ -212,6 +212,7 @@ pub const Poller = struct {
                 .harness_chat_select => self.doHarnessChatSelect(c.idStr()),
                 .harness_push => self.doHarnessPush(c.idStr()),
                 .harness_send => self.doHarnessSend(c.idStr(), c.textStr()),
+                .harness_deploy => self.doHarnessDeploy(),
                 .tot_command => self.doTotCommand(c.idStr(), c.textStr()),
                 .tot_config => self.doTotPost(c.idStr(), "config", c.textStr()),
                 .tot_delete => self.doTotDelete(c.idStr()),
@@ -1172,6 +1173,35 @@ pub const Poller = struct {
         if (!self.harnessRespOk(resp, "Job not queued")) return;
         self.store.pushNotif("Job queued", "the harness has it", 1);
         self.last_har_s = 0; // the new row shows on the next tick
+    }
+
+    /// Put the harness into the user's own Cloudflare account (the server does it with the login it holds), then
+    /// read the status again. One at a time: a second press while one runs is dropped.
+    fn doHarnessDeploy(self: *Poller) void {
+        {
+            self.store.lock();
+            defer self.store.unlock();
+            if (self.store.harness_deploying) return;
+            self.store.harness_deploying = true;
+        }
+        defer {
+            self.store.lock();
+            self.store.harness_deploying = false;
+            self.store.unlock();
+        }
+        var tbuf: [128]u8 = undefined;
+        const tok = self.tokenSnap(&tbuf);
+        const resp = netcli.harnessDeploy(self.io, self.gpa, self.port(), tok);
+        defer if (resp) |r| if (r.body.len > 0) self.gpa.free(r.body);
+        if (!self.harnessRespOk(resp, "Runtime not deployed")) return;
+        const body = resp.?.body;
+        if (std.mem.indexOf(u8, body, "\"deployed\":false") != null)
+            self.store.pushNotif("Runtime already there", "a harness answers in your account", 1)
+        else if (std.mem.indexOf(u8, body, "\"answering\":false") != null)
+            self.store.pushNotif("Runtime deployed", "it is in your account; its address can take a minute to answer", 1)
+        else
+            self.store.pushNotif("Runtime deployed", "your harness answers in your Cloudflare account", 1);
+        self.last_har_s = 0;
     }
 
     /// Send a task to one node of the mesh: the harness keeps it as a job only that node is handed.
