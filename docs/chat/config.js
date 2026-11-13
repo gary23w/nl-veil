@@ -49,12 +49,6 @@ window.VEIL_WEB = {
 
   /* Every link the chat carries, in the order shown. */
   links: [
-    { group: "Agent Garrett", items: [
-      { label: "Agent Garrett dashboard", href: "https://agent.garrettstimpson.ca/dashboard" },
-      { label: "What is Agent Garrett?", href: "https://garrettstimpson.ca/posts/2026/11/04/what-is-agent-garrett-system-design/" },
-      { label: "How to use Agent Garrett", href: "https://garrettstimpson.ca/posts/2026/10/16/how-to-use-agent-garrett/" },
-      { label: "Agent Garrett blog", href: "https://garrettstimpson.ca/topics/agent-garrett/" },
-    ] },
     { group: "The veil", items: [
       { label: "Home", href: "../" },
       { label: "Download the desktop app", href: "../#get" },
@@ -66,6 +60,7 @@ window.VEIL_WEB = {
       { label: "Microsoft Store", href: "https://apps.microsoft.com/detail/9MVQ78SK0CW6" },
     ] },
     { group: "Related", items: [
+      { label: "Agent Garrett", href: "https://garrettstimpson.ca/topics/agent-garrett/" },
       { label: "garrettstimpson.ca", href: "https://garrettstimpson.ca/" },
       { label: "neuron-db", href: "https://gary23w.github.io/neuron-db/" },
       { label: "the-veil-12b", href: "https://huggingface.co/gary23w/the-veil-12b" },
