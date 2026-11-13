@@ -520,3 +520,9 @@ dialog.ask.art-mask { width: min(96vw, 720px); }
   .art-view-in { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 55%) minmax(0, 1fr); }
   .art-info { border-left: 0; border-top: 1px solid var(--border); }
 }
+
+/* ---- the MCP door (Harness tab) ---- */
+.door-url { overflow-wrap: anywhere; }
+.door-fresh { border: 1px solid var(--accent); border-radius: var(--radius); padding: 10px; margin: 8px 0; background: var(--tonal); }
+.door-key { margin: 6px 0; padding: 8px; background: var(--surface); border-radius: calc(var(--radius) - 2px); font: var(--fs-small)/1.5 var(--font-mono); overflow-wrap: anywhere; white-space: pre-wrap; user-select: all; }
+#doorName { flex: 1; min-width: 0; }

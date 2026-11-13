@@ -318,6 +318,7 @@ function loadHarnessData() {
   meshHello();
   refreshSwarms();
   loadImageModels();
+  refreshDoor();
 }
 
 async function refreshStatus() {
@@ -3061,6 +3062,60 @@ function swarmTab() {
   ];
 }
 
+/* ============================================================ the MCP door: other AIs working with this veil */
+
+/* Your harness is an MCP server at <its address>/mcp. Another AI (a coding agent, a desktop assistant, a script)
+   connects with a KEY you make here and gets the veil's tools: the web, files, Python, pictures, whole tasks, swarms,
+   Agent Garrett and the MCP servers you connected, and your own machines on the mesh. A key is shown once, when
+   it is made; the harness keeps only its hash. Whoever holds a key can do what this chat can do with your
+   account's allowance, so make one per program and revoke it when the program is done with. */
+const door = { keys: [], url: '', fresh: null, busy: false };
+const doorOn = () => !!S.status && Number(S.status.version) >= 15;
+
+async function refreshDoor() {
+  if (!doorOn()) return;
+  try {
+    const j = await harnessJson('/v1/keys');
+    door.keys = j.keys;
+    door.url = j.url;
+  } catch {}
+  if (S.tab === 'harness' && !['INPUT', 'TEXTAREA'].includes(document.activeElement?.tagName)) drawSide();
+}
+
+function doorBlock() {
+  if (!doorOn()) return null;
+  const url = door.url || S.harness + '/mcp';
+  const name = h('input', { id: 'doorName', type: 'text', placeholder: 'What the key is for (for example: my coding agent)', 'aria-label': 'What the key is for', autocomplete: 'off', maxlength: '40' });
+  const make = async () => {
+    door.busy = true;
+    drawSide();
+    try {
+      const j = await harnessJson('/v1/keys', { body: { name: name.value.trim(), model: S.model } });
+      door.fresh = { key: j.key, name: j.name };
+      await refreshDoor();
+    } catch (e) { toast(e.message); }
+    door.busy = false;
+    drawSide();
+  };
+  const copy = (text, what) => navigator.clipboard?.writeText(text).then(() => toast(what + ' copied.'), () => toast('Could not copy: select it and copy by hand.'));
+  const config = (key) => JSON.stringify({ mcpServers: { 'nl-veil': { type: 'http', url, headers: { Authorization: 'Bearer ' + key } } } }, null, 2);
+  const when = (ms) => (ms ? new Date(ms).toLocaleString() : 'never');
+  return h('div', { class: 'block', id: 'door' }, h('h3', {}, 'Connect another AI (MCP)'),
+    h('p', {}, 'Your harness is an MCP server. A coding agent, a desktop assistant or a script connects to the address below with a key, and works with this veil\'s tools: the web, files, Python, pictures, whole tasks, swarms, Agent Garrett and your connected MCP servers, and your own machines on the mesh.'),
+    h('p', { class: 'mono door-url' }, url, ' ', h('button', { class: 'btn btn-ghost btn-sm', onclick: () => copy(url, 'The address') }, 'Copy')),
+    door.fresh ? h('div', { class: 'door-fresh' },
+      h('strong', {}, `Key for “${door.fresh.name}”. It is shown this once.`),
+      h('pre', { class: 'door-key' }, door.fresh.key),
+      h('div', { class: 'acts' }, h('button', { class: 'btn btn-sm', onclick: () => copy(door.fresh.key, 'The key') }, 'Copy key'),
+        h('button', { class: 'btn btn-sm', title: 'The block most MCP clients take in their settings file', onclick: () => copy(config(door.fresh.key), 'The settings block') }, 'Copy settings block'),
+        h('button', { class: 'btn btn-ghost btn-sm', onclick: () => { door.fresh = null; drawSide(); } }, 'Done, hide it')),
+      h('p', { class: 'fine' }, 'Send it as the header Authorization: Bearer <key>. Whoever holds it can use your account\'s allowance through this harness.')) : null,
+    door.keys.map((k) => h('p', { class: 'mono' }, k.name + ' · made ' + when(k.created) + ' · last used ' + when(k.used) + ' ',
+      h('button', { class: 'btn btn-ghost btn-sm', onclick: async () => { if (!(await askSure(`Revoke the key “${k.name}”? The program using it loses its way in at once.`, 'Revoke'))) return; await harnessJson('/v1/keys/' + k.id, { method: 'DELETE' }).catch((e) => toast(e.message)); refreshDoor(); } }, 'Revoke'))),
+    h('div', { class: 'acts' }, name, h('button', { class: 'btn btn-sm', disabled: door.busy, onclick: make }, door.busy ? 'Making…' : 'Make a key')),
+    h('p', { class: 'fine' }, 'Tasks a key\'s holder hands over run on the chat\'s model as it was when the key was made (' + S.model.split('/').pop() + ' now).'));
+}
+
 /* ============================================================ images: pictures in, pictures out */
 
 /* Pictures are the harness's work: it asks your account's image models for a picture, and a vision model what a
@@ -5429,6 +5484,7 @@ function harnessTab() {
         S.status = await harnessJson('/v1/config', { body: { calls_max: v('limCalls'), bytes_max: v('limBytes') * MB, storage_max: v('limStore') * MB } });
       }) }, 'Save limits'))),
     outdated() ? null : meshBlock(),
+    doorBlock(),
     h('div', { class: 'block' }, h('h3', {}, 'This harness'),
       h('p', { class: 'mono' }, S.harness.replace(/^https?:\/\//, '') + ' · version ' + st.version),
       h('p', {}, 'Context fold: ' + (core.x ? 'veil_core.wasm (4tope) loaded.' : 'the wasm core did not load; the oldest rounds are dropped instead.')),
@@ -5509,7 +5565,7 @@ document.addEventListener('keydown', (e) => {
 });
 
 function sidePane() {
-  const tab = (id, label) => h('button', { class: S.tab === id ? 'on' : '', role: 'tab', 'aria-selected': String(S.tab === id), onclick: () => { S.tab = id; S.note = ''; drawSide(); if (id === 'jobs') refreshJobs(); if (id === 'swarm') refreshSwarms(); if (id === 'harness') refreshStatus(); SIDE_TABS.find((t) => t.id === id)?.open?.(); } }, label);
+  const tab = (id, label) => h('button', { class: S.tab === id ? 'on' : '', role: 'tab', 'aria-selected': String(S.tab === id), onclick: () => { S.tab = id; S.note = ''; drawSide(); if (id === 'jobs') refreshJobs(); if (id === 'swarm') refreshSwarms(); if (id === 'harness') { refreshStatus(); refreshDoor(); } SIDE_TABS.find((t) => t.id === id)?.open?.(); } }, label);
   const active = S.jobs.filter((j) => j.state === 'queued' || j.state === 'running').length;
   return h('aside', { class: 'side', id: 'side' },
     h('div', { class: 'tabs', role: 'tablist' }, tab('code', 'Code'), tab('swarm', hive.list.some((x) => x.state === 'running') ? 'Swarm •' : 'Swarm'), SIDE_TABS.map((t) => tab(t.id, t.label())), tab('jobs', active ? `Jobs (${active})` : 'Jobs'), tab('harness', outdated() ? 'Harness •' : 'Harness'),
