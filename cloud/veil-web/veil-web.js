@@ -74,7 +74,7 @@
 // No imports and no platform globals beyond fetch/Response/crypto, so a test can run this file under node with
 // a Map for storage and a scripted env.AI.
 
-export const VERSION = "11";
+export const VERSION = "12";
 const API_ROOT = "https://api.cloudflare.com/client/v4";
 const PY_SOURCE = "https://raw.githubusercontent.com/gary23w/nl-veil/main/cloud/tot_py.py";
 const SELF_SCRIPT = "veil-web";
@@ -125,6 +125,14 @@ const MODELS_TTL_MS = 15 * 60 * 1000;
 const LLMS_TTL_MS = 24 * 3600 * 1000;
 const LLMS_DIGEST_MAX = 3500;
 export const SCHEDULES_MAX = 12;
+export const SWARMS_MAX = 8; // swarms kept, running or ended
+export const SWARM_WORKERS_MAX = 6; // tasks one cycle hands out
+export const SWARM_CYCLES_MAX = 40; // cycles one swarm may take
+const SWARM_TICK_MS = 5000; // how often a running swarm looks at its workers
+const SWARM_TASK_WAIT_MS = 45 * 60 * 1000; // a task on a machine that never answers is given up on
+const SWARM_FILES_BYTES = 240 * 1024; // the files a swarm's workers share
+const LESSONS_MAX = 40; // lessons kept for later swarms (the harness's lineage)
+const MIND_NAMES = ["nova", "ada", "rex", "lux", "sol"]; // the desk's names for a swarm's minds; past them, mind6, mind7
 export const EVERY_MIN_S = 300; // the shortest repeat a schedule may have
 const CONV_BYTES_MAX = 1500000; // one conversation with its files
 export const CONVS_MAX = 200;
@@ -1236,7 +1244,7 @@ export class Harness {
   async rearm(wait, nextDue) {
     // a local job is the owner's machine's to run: it keeps no alarm going while it waits
     const active = (await this.jobs()).some((j) => !j.local && ["queued", "running"].includes(j.state));
-    const at = Math.min(active ? Date.now() + wait : Infinity, nextDue);
+    const at = Math.min(active ? Date.now() + wait : Infinity, nextDue, this.swarmDue ?? Infinity);
     if (at !== Infinity) await this.store.setAlarm(Math.max(at, Date.now() + 100));
   }
 
@@ -1245,6 +1253,8 @@ export class Harness {
   async alarm() {
     const index = await this.jobs();
     const nextDue = await this.runSchedules(index);
+    const swarmWait = await this.runSwarms(index);
+    this.swarmDue = swarmWait ? Date.now() + swarmWait : Infinity;
     const row = index.find((j) => !j.local && j.state === "running") ?? index.find((j) => !j.local && j.state === "queued");
     if (!row) return this.rearm(1000, nextDue);
     const job = await this.store.get("job:" + row.id);
@@ -1291,6 +1301,211 @@ export class Harness {
     await this.rearm(wait, nextDue);
   }
 
+  // ---------------------------------------------------------------- swarms
+
+  /// A SWARM works toward one goal with nobody watching. It runs here, in the harness, so it goes on with every
+  /// tab closed. Each CYCLE a coordinator (one model call) reads what the workers brought back, writes down what
+  /// was learned, decides whether the goal is met, and hands out the next tasks; each task is a job in the queue
+  /// (or, when the swarm runs on the mesh, a job for one of the owner's machines), with the swarm's shared files
+  /// beside it. Lessons outlive the swarm: the next one starts with what earlier ones learned.
+  async swarms() {
+    return (await this.store.get("swarms")) ?? [];
+  }
+
+  async saveSwarm(sw, list) {
+    sw.updated = Date.now();
+    sw.log = sw.log.slice(-120);
+    await this.store.put("swarm:" + sw.id, sw);
+    const row = { id: sw.id, name: sw.name, state: sw.state, phase: sw.phase, cycle: sw.cycle, cycles: sw.cycles, workers: sw.workers, where: sw.where, created: sw.created, updated: sw.updated, note: sw.note ?? "" };
+    const i = list.findIndex((x) => x.id === sw.id);
+    if (i >= 0) list[i] = row;
+    else list.push(row);
+    await this.store.put("swarms", list);
+  }
+
+  /// What a coordinator's reply says: {done, summary, lessons, tasks}, or null when it cannot be read.
+  swarmPlan(reply, workers) {
+    const at = reply.indexOf("{");
+    if (at < 0) return null;
+    let v;
+    try {
+      [v] = looseValue(reply, at);
+    } catch {
+      return null;
+    }
+    if (!v || typeof v !== "object") return null;
+    const text = (x, n) => clip(String(x ?? "").trim(), n);
+    const tasks = (Array.isArray(v.tasks) ? v.tasks : []).map((t) => ({ role: text(t?.role ?? t?.name ?? "worker", 60) || "worker", task: text(t?.task ?? t?.brief ?? (typeof t === "string" ? t : ""), 4000) })).filter((t) => t.task).slice(0, workers);
+    return { done: v.done === true || (v.done === "true"), summary: text(v.summary ?? v.report, 6000), lessons: (Array.isArray(v.lessons) ? v.lessons : []).map((x) => text(x, 300)).filter(Boolean).slice(0, 6), tasks };
+  }
+
+  /// One step of one running swarm. Returns how soon it wants to be looked at again (ms), or 0 when none runs.
+  async runSwarms(index) {
+    const list = await this.swarms();
+    const row = list.filter((x) => x.state === "running").sort((a, b) => a.updated - b.updated)[0]; // the one that has waited longest
+    if (!row) return 0;
+    const sw = await this.store.get("swarm:" + row.id);
+    if (!sw) {
+      await this.store.put("swarms", list.filter((x) => x.id !== row.id));
+      return SWARM_TICK_MS;
+    }
+    const say = (text) => sw.log.push({ at: Date.now(), text: clip(text, 400) });
+
+    if (sw.phase === "work") {
+      // the cycle's tasks: each is a job; the cycle ends when every one of them has
+      const now = Date.now();
+      let open = 0;
+      for (const t of sw.tasks.filter((x) => x.cycle === sw.cycle && x.state === "working")) {
+        const jr = index.find((j) => j.id === t.job);
+        if (jr && ["queued", "running"].includes(jr.state) && now - t.started < SWARM_TASK_WAIT_MS) {
+          open++;
+          continue;
+        }
+        const job = jr ? await this.store.get("job:" + t.job) : null;
+        if (!job) {
+          t.state = "lost";
+          t.result = "the job was removed before it ended";
+        } else if (["queued", "running"].includes(job.state)) {
+          t.state = "failed";
+          t.result = "no answer in time from " + (t.node ? "the machine it was sent to" : "the queue");
+        } else {
+          t.state = job.state === "done" ? "done" : "failed";
+          t.result = clip(job.state === "done" ? job.result : job.error || job.result || "failed", 3000);
+          sw.calls += job.calls ?? 0;
+          // what the worker wrote joins the swarm's shared files, while there is room
+          let room = SWARM_FILES_BYTES - Object.values(sw.files).reduce((n, c) => n + c.length, 0);
+          for (const [name, text] of Object.entries(job.files ?? {})) {
+            if (typeof text !== "string" || sw.files[name] === text) continue;
+            const grow = text.length - (sw.files[name]?.length ?? 0);
+            if (grow > room) {
+              say(`${name} from ${t.role} was not kept: the swarm's shared files are full`);
+              continue;
+            }
+            sw.files[name] = text;
+            room -= grow;
+          }
+        }
+        t.finished = now;
+        say(`${t.role}: ${t.state}`);
+      }
+      if (open === 0) sw.phase = "plan";
+      await this.saveSwarm(sw, list);
+      return SWARM_TICK_MS;
+    }
+
+    // phase "plan": the coordinator
+    const why = await this.spent(true);
+    if (why) {
+      sw.note = "waiting: " + why;
+      await this.saveSwarm(sw, list);
+      return 15 * 60 * 1000;
+    }
+    sw.note = "";
+    const last = sw.tasks.filter((t) => t.cycle === sw.cycle);
+    const earlier = sw.tasks.filter((t) => t.cycle < sw.cycle).slice(-12);
+    const lessons = [...new Set([...((await this.store.get("lessons")) ?? []), ...sw.lessons])].slice(-24);
+    const nodes = sw.where === "mesh" ? (await this.nodes()).filter((n) => n.runs && Date.now() - n.seen < NODE_ONLINE_MS) : [];
+    const head = `You coordinate a swarm of up to ${sw.workers} workers toward ONE goal, with nobody watching. This is cycle ${sw.cycle + 1} of at most ${sw.cycles}.\n` +
+      "Each cycle you read what the workers brought back, write down what was learned, decide whether the goal is met, and hand out the next tasks.\n" +
+      `A worker knows ONLY the task you write for it (plus the shared files and the lessons): write each task whole, with what to produce and where to put it. A worker has these tools: ${Object.keys(JOB_TOOLS).join(", ")}. Files a worker writes are shared with the whole swarm.\n` +
+      "Be adaptive: when an approach failed, change it; split work so workers do not repeat each other; verify what matters with a second worker.\n" +
+      'Reply with exactly ONE JSON object and nothing else.\nTo go on: {"done": false, "summary": "<where things stand>", "lessons": ["<a short thing worth remembering>"], "tasks": [{"role": "<a short name>", "task": "<the whole brief>"}]}\n' +
+      'When the goal is met, or nothing more can move it: {"done": true, "summary": "<the final report for the owner: what was achieved, where the results are, what was not done>", "lessons": ["..."]}';
+    const body = `THE GOAL:\n${sw.goal}\n\n` +
+      (sw.steer.length ? `FROM THE OWNER, since the start (follow these):\n${sw.steer.map((x) => "- " + x).join("\n")}\n\n` : "") +
+      (lessons.length ? `LESSONS (from this swarm and earlier ones):\n${lessons.map((x) => "- " + x).join("\n")}\n\n` : "") +
+      (Object.keys(sw.files).length ? `SHARED FILES: ${Object.entries(sw.files).map(([n, c]) => `${n} (${c.length} characters)`).join(", ")}\n\n` : "") +
+      (earlier.length ? `EARLIER CYCLES, in short:\n${earlier.map((t) => `- cycle ${t.cycle + 1}, ${t.role}: ${t.state}. ${clip(t.result, 300)}`).join("\n")}\n\n` : "") +
+      (last.length ? `THE LAST CYCLE'S RESULTS:\n${last.map((t) => `## ${t.role} (${t.state})\nTask: ${clip(t.task, 400)}\nResult: ${t.result}`).join("\n\n")}\n\n` : "Nothing has been done yet: this is the first cycle.\n\n") +
+      (nodes.length ? `Tasks go to the owner's machines this cycle: ${nodes.map((n) => n.name).join(", ")}.\n` : "") +
+      (sw.cycle + 1 >= sw.cycles ? "This is the LAST cycle allowed: reply with done true and the final report.\n" : "");
+    let plan = null;
+    try {
+      const reply = await this.model(sw.model, [{ role: "system", content: head }, { role: "user", content: body }], 3000);
+      sw.calls += 1;
+      plan = this.swarmPlan(reply, sw.workers);
+      if (!plan) say("the coordinator's reply could not be read; asking again");
+    } catch (e) {
+      say("the coordinator's model call failed: " + clip(e?.message ?? e, 200));
+    }
+    if (!plan) {
+      sw.fails = (sw.fails ?? 0) + 1;
+      if (sw.fails >= 3) {
+        sw.state = "failed";
+        sw.summary = sw.summary || "The coordinator could not plan three times in a row. " + (sw.log.at(-1)?.text ?? "");
+      }
+      await this.saveSwarm(sw, list);
+      return 30000;
+    }
+    sw.fails = 0;
+    if (plan.lessons.length) sw.lessons = [...new Set([...sw.lessons, ...plan.lessons])].slice(-24);
+    if (plan.summary) sw.summary = plan.summary;
+    const lastCycle = sw.cycle + 1 >= sw.cycles;
+    if (plan.done || !plan.tasks.length || lastCycle) {
+      sw.state = plan.done ? "done" : "stopped";
+      if (!plan.done) sw.summary = (sw.summary ? sw.summary + "\n\n" : "") + (lastCycle ? `(Stopped at its limit of ${sw.cycles} cycles.)` : "(Stopped: the coordinator handed out no more tasks.)");
+      sw.finished = Date.now();
+      say(plan.done ? "goal met" : "stopped");
+      // what this swarm learned is there for the next one
+      if (sw.lessons.length) await this.store.put("lessons", [...new Set([...((await this.store.get("lessons")) ?? []), ...sw.lessons])].slice(-LESSONS_MAX));
+      await this.saveSwarm(sw, list);
+      return SWARM_TICK_MS;
+    }
+    if (last.length) sw.cycle += 1;
+    const room = Math.max(0, QUEUE_MAX - index.filter((j) => j.state === "queued").length);
+    const shared = Object.keys(sw.files).length ? `\n\nThe swarm's shared files are beside you: ${Object.keys(sw.files).join(", ")}. Read what you need; write your results as files.` : "\n\nWrite your results as files: they are shared with the rest of the swarm.";
+    const known = sw.lessons.length ? `\n\nLessons so far:\n${sw.lessons.slice(-8).map((x) => "- " + x).join("\n")}` : "";
+    let n = 0;
+    for (const t of plan.tasks.slice(0, Math.max(1, room))) {
+      const node = nodes.length ? nodes[n % nodes.length] : null;
+      const brief = `You are ${MIND_NAMES[n] ?? "mind" + (n + 1)}, "${t.role}", one mind of a swarm working toward this goal:\n${clip(sw.goal, 1500)}\n\nYOUR TASK:\n${t.task}${shared}${known}\n\nEnd with a short written result: what you did, what you found, which files you wrote.`;
+      const id = await this.enqueue(index, brief, sw.model, "", !!node, node?.id ?? "", "");
+      t.role = `${MIND_NAMES[n] ?? "mind" + (n + 1)} · ${t.role}`;
+      const job = await this.store.get("job:" + id);
+      job.swarm = sw.id;
+      if (!node) job.files = { ...sw.files };
+      await this.store.put("job:" + id, job);
+      sw.tasks.push({ cycle: sw.cycle, role: t.role, task: t.task, job: id, node: node?.name ?? "", state: "working", result: "", started: Date.now(), finished: 0 });
+      n++;
+    }
+    sw.tasks = sw.tasks.slice(-80);
+    sw.phase = "work";
+    say(`cycle ${sw.cycle + 1}: ${n} task${n === 1 ? "" : "s"} handed out (${plan.tasks.slice(0, n).map((t) => t.role).join(", ")})`);
+    await this.saveSwarm(sw, list);
+    return 1000;
+  }
+
+  /// A new swarm from what the owner set. {err} in words when it cannot start.
+  async swarmStart(body) {
+    const goal = String(body.goal ?? "").trim();
+    const model = String(body.model ?? "");
+    if (goal.length < 8 || goal.length > 12000) return { err: "the goal must be 8 to 12000 characters" };
+    if (!model.startsWith("@")) return { err: "model must be a Workers AI model id" };
+    const list = await this.swarms();
+    if (list.filter((x) => x.state === "running" || x.state === "paused").length >= 2) return { err: "two swarms are already at work; stop one first" };
+    // room is made by letting the oldest ended swarm go
+    while (list.length >= SWARMS_MAX) {
+      const old = list.find((x) => !["running", "paused"].includes(x.state));
+      if (!old) return { err: `the harness keeps ${SWARMS_MAX} swarms; delete one` };
+      list.splice(list.indexOf(old), 1);
+      await this.store.delete("swarm:" + old.id);
+    }
+    const int = (v, lo, hi, d) => Math.min(hi, Math.max(lo, Math.floor(Number(v)) || d));
+    const now = Date.now();
+    const sw = {
+      id: now.toString(36) + hex(crypto.getRandomValues(new Uint8Array(3))),
+      name: clip(String(body.name ?? "").replace(/\s+/g, " ").trim(), 60) || clip(goal.replace(/\s+/g, " "), 48),
+      goal, model,
+      workers: int(body.minds ?? body.workers, 1, SWARM_WORKERS_MAX, 3),
+      cycles: int(body.rounds ?? body.cycles, 1, SWARM_CYCLES_MAX, 8),
+      where: body.where === "mesh" ? "mesh" : "harness",
+      state: "running", phase: "plan", cycle: 0, tasks: [], lessons: [], steer: [], files: {}, log: [{ at: now, text: "deployed" }], summary: "", note: "", calls: 0, created: now, updated: now, finished: 0,
+    };
+    await this.saveSwarm(sw, list);
+    await this.store.setAlarm(Date.now() + 100);
+    return { id: sw.id };
+  }
+
   // ---------------------------------------------------------------- the mesh
 
   async nodes() {
@@ -1332,6 +1547,7 @@ export class Harness {
       storage_bytes: index.reduce((n, j) => n + (j.bytes ?? 0), 0) + chats.reduce((n, c) => n + (c.bytes ?? 0), 0),
       queue: { waiting: index.filter((j) => j.state === "queued").length, running: index.filter((j) => j.state === "running").length, max: QUEUE_MAX, kept: index.length, keep: JOBS_KEEP, local: index.filter((j) => j.local && ["queued", "running"].includes(j.state)).length },
       schedules: { count: sched.length, max: SCHEDULES_MAX, shortest_s: EVERY_MIN_S },
+      swarms: { count: (await this.swarms()).length, running: (await this.swarms()).filter((x) => x.state === "running").length, max: SWARMS_MAX },
       chats: { count: chats.length, max: CONVS_MAX },
       nodes: await this.nodeCounts(),
       python: { worker: !!this.env.LOADER },
@@ -1500,6 +1716,51 @@ export class Harness {
         return say(at === "fetch" ? { ok: true, ...(await this.httpCall(body)) } : { ok: true, results: await this.search(body.q) });
       } catch (e) {
         return bad(clip(e?.message ?? e, 300), /private|not a URL|only http|not allowed|empty/.test(String(e?.message)) ? 400 : 502);
+      }
+    }
+
+    // Swarms: deploy one toward a goal, watch it, steer it, stop it.
+    if (at === "swarms" && method === "GET") return say({ ok: true, swarms: await this.swarms(), max: SWARMS_MAX, workers_max: SWARM_WORKERS_MAX, cycles_max: SWARM_CYCLES_MAX, lessons: (await this.store.get("lessons")) ?? [] });
+    if (at === "swarms" && method === "POST") {
+      const made = await this.swarmStart(body);
+      return made.err ? bad(made.err) : say({ ok: true, id: made.id });
+    }
+    if (seg[1] === "swarms" && seg.length === 3) {
+      const list = await this.swarms();
+      const sw = await this.store.get("swarm:" + seg[2]);
+      if (!sw) return bad("no such swarm", 404);
+      if (method === "GET") return say({ ok: true, swarm: sw });
+      if (method === "DELETE") {
+        await this.store.delete("swarm:" + sw.id);
+        await this.store.put("swarms", list.filter((x) => x.id !== sw.id));
+        return say({ ok: true });
+      }
+      if (method === "POST") {
+        const op = String(body.op ?? "");
+        const live = ["running", "paused"].includes(sw.state);
+        if (op === "set_goal") {
+          const goal = String(body.goal ?? body.text ?? "").trim();
+          if (goal.length < 8 || goal.length > 12000) return bad("the goal must be 8 to 12000 characters");
+          if (!live) return bad("that swarm has ended");
+          sw.goal = goal;
+          sw.log.push({ at: Date.now(), text: "the owner set a new goal" });
+        } else if (op === "steer" || op === "say") {
+          const text = clip(String(body.text ?? "").trim(), 1000);
+          if (!text) return bad("say what the swarm should take into account");
+          if (!live) return bad("that swarm has ended");
+          sw.steer = [...sw.steer, text].slice(-12);
+          sw.log.push({ at: Date.now(), text: "the owner: " + clip(text, 200) });
+        } else if (op === "pause" && sw.state === "running") sw.state = "paused";
+        else if (op === "resume" && sw.state === "paused") sw.state = "running";
+        else if (op === "stop" && live) {
+          sw.state = "stopped";
+          sw.finished = Date.now();
+          sw.summary = (sw.summary ? sw.summary + "\n\n" : "") + "(Stopped by the owner.)";
+          sw.log.push({ at: Date.now(), text: "stopped by the owner" });
+        } else return bad("op must be say, set_goal, pause, resume or stop, and fit the swarm's state");
+        await this.saveSwarm(sw, list);
+        if (sw.state === "running") await this.store.setAlarm(Date.now() + 100);
+        return say({ ok: true, swarm: sw });
       }
     }
 
