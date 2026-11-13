@@ -153,6 +153,7 @@ const S = {
   shut: new Set(),                       // explorer folders that are folded
   filter: '',                            // the explorer's find-a-file text
   search: null,                          // the last search inside the files: {q, hits, note}
+  gitOpen: false,                        // the explorer's git strip is unfolded
   goto: 0,                               // a line the editor should go to when it next opens a file
   explorer: true,                        // the explorer column is showing
   preview: false,                        // false: source; 'split': source beside its preview; true: preview only
@@ -1501,7 +1502,16 @@ async function repoMount(root, kind, name = root.name) {
 function repoClose() {
   for (const t of repo.saving.values()) clearTimeout(t);
   Object.assign(repo, { root: null, name: '', kind: '', paths: [], capped: false, branch: '', busy: '' });
+  Object.assign(gitx, { changes: null, note: '', busy: '' });
   repo.openDirs.clear(); repo.partial.clear(); repo.stamps.clear(); repo.saving.clear();
+}
+
+/* Forgets a conversation's folder. A clone the browser kept for it is deleted; a folder on disk is only let go. */
+async function repoForget(convId) {
+  const kept = await db.get('repo:' + convId);
+  await db.del('repo:' + convId);
+  if (kept?.kind !== 'private' || !kept.root) return;
+  try { await (await (await navigator.storage.getDirectory()).getDirectoryHandle('repos')).removeEntry(kept.root.name, { recursive: true }); } catch {}
 }
 
 /* "Open folder": the user picks one, and grants this page reading and writing in it. */
@@ -1739,6 +1749,244 @@ const completer = (() => {
     },
   };
 })();
+
+/* ============================================================ git: clone, commit and push from the page */
+
+/* A repository cloned by its URL lands in a folder the browser keeps for this site (the origin's private file
+   system) and is mounted as a repo. Git itself is isomorphic-git (MIT), loaded from a CDN the first time it is
+   needed and checked against the hash below (1.33.0: the newest build that still carries its own Buffer). It runs in this tab; its requests to the git host go through your
+   own harness, because a git host sends no CORS headers. A token for a private repository or a push is typed
+   by you, kept in this tab's memory only, and travels only to your harness and from there to the git host.
+   The clone is shallow (the newest commit), which is what keeps a large repository workable here.
+   A folder opened from your disk is left to your own git: the page never writes to its .git. */
+const GIT_LIB = 'https://cdn.jsdelivr.net/npm/isomorphic-git@1.33.0/index.umd.min.js';
+const GIT_LIB_HASH = 'sha384-+hRqpHFPa42dnWJSoTDnEKfSGPmaDtkdSsOmGLQfUqhq6y7wgYdbsrDFr2P2O8mc';
+
+const gitx = {
+  lib: null,
+  token: '',        // this tab only, never stored
+  busy: '',
+  changes: null,    // [{path, state}] after "Changes"
+  note: '',
+  has: false,       // the mounted repo has a .git the page may use (a clone)
+};
+
+const gitLib = () => (gitx.lib ??= new Promise((res, rej) => {
+  if (window.git?.clone) return res(window.git);
+  const s = document.createElement('script');
+  s.src = GIT_LIB; s.integrity = GIT_LIB_HASH; s.crossOrigin = 'anonymous';
+  s.onload = () => (window.git?.clone ? res(window.git) : rej(new Error('git did not load')));
+  s.onerror = () => { gitx.lib = null; rej(new Error('git could not be loaded from the CDN')); };
+  document.head.append(s);
+}));
+
+/* A folder handle as the file system git works on: the handful of calls isomorphic-git makes, with the error
+   codes it reads (ENOENT, ENOTDIR, EEXIST, ENOTEMPTY). */
+function gitFs(root) {
+  const err = (code, path) => Object.assign(new Error(`${code}: ${path}`), { code });
+  const split = (p) => String(p).split('/').filter((x) => x && x !== '.');
+  const dirAt = async (parts) => {
+    let d = root;
+    for (const name of parts) {
+      try { d = await d.getDirectoryHandle(name); } catch (e) { throw err(e.name === 'TypeMismatchError' ? 'ENOTDIR' : 'ENOENT', parts.join('/')); }
+    }
+    return d;
+  };
+  const stats = (type, size, ms) => ({ type, mode: type === 'dir' ? 0o40000 : 0o100644, size, ino: 0, mtimeMs: ms, ctimeMs: ms, uid: 1, gid: 1, dev: 1, isFile: () => type === 'file', isDirectory: () => type === 'dir', isSymbolicLink: () => false });
+  const stat = async (p) => {
+    const parts = split(p);
+    if (!parts.length) return stats('dir', 0, 0);
+    const dir = await dirAt(parts.slice(0, -1));
+    try {
+      const f = await (await dir.getFileHandle(parts.at(-1))).getFile();
+      return stats('file', f.size, f.lastModified);
+    } catch (e) {
+      if (e.name === 'TypeMismatchError') return stats('dir', 0, 0);
+      throw err('ENOENT', p);
+    }
+  };
+  return { promises: {
+    async readFile(p, o) {
+      const parts = split(p);
+      const dir = await dirAt(parts.slice(0, -1));
+      let f;
+      try { f = await (await dir.getFileHandle(parts.at(-1))).getFile(); } catch { throw err('ENOENT', p); }
+      return (typeof o === 'string' ? o : o?.encoding) === 'utf8' ? f.text() : new Uint8Array(await f.arrayBuffer());
+    },
+    async writeFile(p, data) {
+      const parts = split(p);
+      const dir = await dirAt(parts.slice(0, -1));
+      const w = await (await dir.getFileHandle(parts.at(-1), { create: true })).createWritable();
+      await w.write(data);
+      await w.close();
+    },
+    async unlink(p) {
+      const parts = split(p);
+      try { await (await dirAt(parts.slice(0, -1))).removeEntry(parts.at(-1)); } catch { throw err('ENOENT', p); }
+    },
+    async readdir(p) {
+      const d = await dirAt(split(p));
+      const names = [];
+      for await (const name of d.keys()) names.push(name);
+      return names;
+    },
+    async mkdir(p) {
+      const parts = split(p);
+      if (!parts.length) throw err('EEXIST', p);
+      const dir = await dirAt(parts.slice(0, -1));
+      let there = true;
+      try { await dir.getDirectoryHandle(parts.at(-1)); } catch (e) { there = e.name === 'TypeMismatchError'; }
+      if (there) throw err('EEXIST', p);
+      await dir.getDirectoryHandle(parts.at(-1), { create: true });
+    },
+    async rmdir(p) {
+      const parts = split(p);
+      try { await (await dirAt(parts.slice(0, -1))).removeEntry(parts.at(-1)); } catch (e) { throw err(e.name === 'InvalidModificationError' ? 'ENOTEMPTY' : 'ENOENT', p); }
+    },
+    stat,
+    lstat: stat,
+    // these folders hold no symbolic links: a repository that has one gets it as a plain file
+    async readlink(p) { throw err('ENOENT', p); },
+    async symlink(target, p) { await this.writeFile(p, String(target)); },
+  } };
+}
+
+/* Git's requests, sent through the harness. */
+const gitHttp = {
+  async request({ url, method = 'GET', headers = {}, body }) {
+    let sent = '';
+    if (body) {
+      const chunks = [];
+      for await (const c of body) chunks.push(c);
+      let bin = '';
+      for (const c of chunks) for (let i = 0; i < c.length; i += 0x8000) bin += String.fromCharCode.apply(null, c.subarray(i, i + 0x8000));
+      sent = btoa(bin);
+    }
+    const lower = Object.fromEntries(Object.entries(headers).map(([k, v]) => [k.toLowerCase(), String(v)]));
+    const r = await harness('/v1/git', { body: { url, method, headers: lower, body: sent } });
+    const status = r.headers.get('x-git-status');
+    if (status === null) {
+      const j = await r.json().catch(() => null);
+      throw new Error(j?.err || 'the harness did not pass the git request on (HTTP ' + r.status + ')');
+    }
+    return { url, method, statusCode: Number(status), statusMessage: '', headers: { 'content-type': r.headers.get('x-git-type') ?? '' }, body: [new Uint8Array(await r.arrayBuffer())] };
+  },
+};
+
+const gitAuth = () => (gitx.token ? { username: gitx.token, password: 'x-oauth-basic' } : { cancel: true });
+const gitSay = (text) => { gitx.busy = text; const el = document.getElementById('gitBusy') ?? document.getElementById('repoBusy'); if (el) el.textContent = text; else drawSide(); };
+
+/* Clones `url` (its newest commit) into a private folder and opens it as the workspace. */
+async function gitClone(url) {
+  let u;
+  try { u = new URL(String(url).trim()); } catch { return toast('That is not a repository URL.'); }
+  if (u.protocol !== 'https:') return toast('Give the repository\'s https address.');
+  if (!S.status || Number(S.status.version) < 9) return toast('Update your harness first: cloning goes through it.');
+  const name = (u.pathname.replace(/\.git$/, '').split('/').filter(Boolean).pop() || 'repo').replace(/[^\w.-]/g, '-').slice(0, 60);
+  let git;
+  try { git = await gitLib(); } catch (e) { return toast(e.message); }
+  const store = await (await navigator.storage.getDirectory()).getDirectoryHandle('repos', { create: true });
+  const folder = name + '-' + Date.now().toString(36);
+  const dir = await store.getDirectoryHandle(folder, { create: true });
+  S.tab = 'code';
+  gitSay('cloning ' + name + '…');
+  try {
+    await git.clone({ fs: gitFs(dir), http: gitHttp, dir: '/', url: u.toString(), depth: 1, singleBranch: true, onAuth: gitAuth,
+      onProgress: (p) => gitSay(`cloning ${name}: ${p.phase}${p.total ? ` ${Math.round((p.loaded / p.total) * 100)}%` : p.loaded ? ' ' + p.loaded : ''}`) });
+  } catch (e) {
+    gitx.busy = '';
+    await store.removeEntry(folder, { recursive: true }).catch(() => {});
+    drawSide();
+    return toast(/401|403|auth|cancel/i.test(e.message) ? 'The git host wants a login for that repository: add a token under “Git token”, then clone again.' : 'Clone failed: ' + e.message);
+  }
+  gitx.busy = '';
+  await repoMount(dir, 'private', name);
+}
+
+/* What differs from the last commit: [{path, state}], state one of added, changed, deleted. */
+async function gitChanges() {
+  const git = await gitLib();
+  gitSay('comparing with the last commit…');
+  const rows = await git.statusMatrix({ fs: gitFs(repo.root), dir: '/' });
+  gitx.changes = rows.filter(([, head, work, stage]) => !(head === 1 && work === 1 && stage === 1))
+    .map(([path, head, work]) => ({ path, state: head === 0 ? 'added' : work === 0 ? 'deleted' : 'changed' }));
+  gitx.busy = '';
+  gitx.note = gitx.changes.length ? '' : 'Nothing has changed since the last commit.';
+  drawSide();
+}
+
+async function gitCommit(message) {
+  const who = { name: ls.get('veilweb.git.name', ''), email: ls.get('veilweb.git.email', '') };
+  if (!who.name || !who.email) return toast('Give the name and the email your commits carry.');
+  if (!message.trim()) return toast('Write a commit message.');
+  const git = await gitLib();
+  const fs = gitFs(repo.root);
+  if (!gitx.changes) await gitChanges();
+  if (!gitx.changes.length) return toast('Nothing to commit.');
+  gitSay('committing…');
+  try {
+    for (const c of gitx.changes) await (c.state === 'deleted' ? git.remove({ fs, dir: '/', filepath: c.path }) : git.add({ fs, dir: '/', filepath: c.path }));
+    const sha = await git.commit({ fs, dir: '/', message: message.trim(), author: who });
+    gitx.changes = [];
+    gitx.note = `Committed ${sha.slice(0, 8)}. Push sends it to the git host.`;
+  } catch (e) {
+    gitx.note = 'Commit failed: ' + e.message;
+  }
+  gitx.busy = '';
+  drawSide();
+}
+
+async function gitPush() {
+  if (!gitx.token) return toast('A push needs a token for the git host: add it under “Git token”.');
+  const git = await gitLib();
+  gitSay('pushing…');
+  try {
+    const r = await git.push({ fs: gitFs(repo.root), http: gitHttp, dir: '/', remote: 'origin', onAuth: gitAuth });
+    gitx.note = r?.ok === false ? 'The git host refused the push: ' + (r.error ?? 'no reason given') : 'Pushed to ' + (repo.branch || 'the remote') + '.';
+  } catch (e) {
+    gitx.note = 'Push failed: ' + e.message;
+  }
+  gitx.busy = '';
+  drawSide();
+}
+
+/* The newest commits from the git host, when this clone can simply move forward to them. */
+async function gitPull() {
+  const git = await gitLib();
+  gitSay('pulling…');
+  try {
+    await git.pull({ fs: gitFs(repo.root), http: gitHttp, dir: '/', singleBranch: true, fastForwardOnly: true, onAuth: gitAuth, author: { name: ls.get('veilweb.git.name', 'veil'), email: ls.get('veilweb.git.email', 'veil@localhost') } });
+    S.conv.files = {}; S.open = []; S.file = null;
+    await repoIndex();
+    gitx.note = 'Up to date with the git host.';
+  } catch (e) {
+    gitx.note = 'Pull failed: ' + e.message;
+  }
+  gitx.busy = '';
+  drawSide();
+}
+
+/* The explorer's git strip, for a cloned repo. */
+function gitPanel() {
+  if (!repo.on() || repo.kind !== 'private' || !repo.branch) return null;
+  const field = (id, key, label, type = 'text') => h('input', { id, type, placeholder: label, 'aria-label': label, autocomplete: 'off', spellcheck: 'false', value: key ? ls.get(key, '') : gitx.token, onchange: (e) => { if (key) ls.set(key, e.target.value.trim()); else gitx.token = e.target.value.trim(); } });
+  const msg = h('input', { id: 'gitMsg', type: 'text', placeholder: 'Commit message', 'aria-label': 'Commit message', autocomplete: 'off', onkeydown: (e) => { if (e.key === 'Enter') gitCommit(e.target.value); } });
+  const busy = !!gitx.busy;
+  return h('details', { class: 'git', open: S.gitOpen ? '' : null, ontoggle: (e) => { S.gitOpen = e.target.open; } },
+    h('summary', {}, 'Git · ' + repo.branch, gitx.changes?.length ? ` · ${gitx.changes.length} changed` : ''),
+    h('div', { class: 'git-body' },
+      h('div', { class: 'git-acts' },
+        h('button', { class: 'btn btn-sm', disabled: busy, onclick: () => gitChanges().catch((e) => { gitx.busy = ''; toast(e.message); drawSide(); }) }, 'Changes'),
+        h('button', { class: 'btn btn-sm', disabled: busy, onclick: () => gitPull() }, 'Pull'),
+        h('button', { class: 'btn btn-sm', disabled: busy, onclick: () => gitPush() }, 'Push')),
+      gitx.busy ? h('div', { class: 'fine', id: 'gitBusy' }, gitx.busy) : gitx.note ? h('div', { class: 'fine' }, gitx.note) : null,
+      (gitx.changes ?? []).slice(0, 200).map((c) => h('button', { class: 'tree-row git-' + c.state, title: c.path + ' (' + c.state + ')', onclick: () => (c.state === 'deleted' ? null : showFile(c.path)) }, h('span', { class: 'badge' }, c.state[0].toUpperCase()), h('span', { class: 'name' }, c.path))),
+      msg,
+      h('button', { class: 'btn btn-sm btn-solid', disabled: busy, onclick: () => gitCommit(document.getElementById('gitMsg').value) }, 'Commit all changes'),
+      h('div', { class: 'git-who' }, field('gitName', 'veilweb.git.name', 'Your name, for commits'), field('gitEmail', 'veilweb.git.email', 'Your email, for commits'),
+        field('gitToken', '', 'Git token (private repos, push)', 'password')),
+      h('p', { class: 'fine' }, 'The token stays in this tab\'s memory and goes only to your harness, then the git host.')));
+}
 
 /* ============================================================ the loop */
 
@@ -2051,7 +2299,7 @@ async function deleteConv(id) {
   if (S.live) return;
   if (!confirm('Delete this conversation and its files, here and on your harness?')) return;
   await db.del('conv:' + id);
-  await db.del('repo:' + id);
+  await repoForget(id);
   S.convs = S.convs.filter((x) => x.id !== id);
   await putIndex();
   if (S.status && !outdated()) harnessJson('/v1/convs/' + id, { method: 'DELETE' }).catch(() => {});
@@ -2528,6 +2776,8 @@ function codeTab() {
   const upload = h('input', { type: 'file', webkitdirectory: '', multiple: '', hidden: '', onchange: (e) => { uploadFolder([...e.target.files]); e.target.value = ''; } });
   const openFolder = () => (repo.canPick() ? repoPick() : upload.click());
   const folderWord = repo.canPick() ? 'Open folder' : 'Upload folder';
+  const clone = () => { const url = prompt('Clone a repository: its https address (for example https://github.com/owner/name)'); if (url) gitClone(url); };
+  const canClone = Number(S.status?.version) >= 9 && !!navigator.storage?.getDirectory;
   const open = writing ? null : S.file !== null && S.file in S.conv.files ? S.file : null;
   if (open && !S.open.includes(open)) S.open.push(open);
   if (open && !previewable(open)) S.preview = false;
@@ -2547,13 +2797,15 @@ function codeTab() {
       upload,
       h('button', { class: 'x show', title: 'New file', 'aria-label': 'New file', onclick: () => newFile() }, '+'),
       inRepo ? h('button', { class: 'x show', title: 'Read the folder again', 'aria-label': 'Read the folder again', onclick: async () => { repo.busy = 'reading the folder…'; drawSide(); await repoIndex(); drawSide(); } }, '⟳') : null,
-      inRepo ? h('button', { class: 'x show', title: 'Close this folder (nothing in it is deleted)', 'aria-label': 'Close this folder', onclick: () => { repoClose(); delete S.conv.repo; S.conv.files = {}; S.open = []; S.file = null; db.del('repo:' + S.conv.id); touchConv(); draw(); } }, '⏏')
-        : h('button', { class: 'x show', title: folderWord + (repo.canPick() ? ': work in a folder on this computer' : ': add a folder\'s files to this chat'), 'aria-label': folderWord, onclick: openFolder }, '🗀'),
+      inRepo ? h('button', { class: 'x show', title: repo.kind === 'disk' ? 'Close this folder (nothing in it is deleted)' : 'Remove this clone from the browser', 'aria-label': 'Close this folder', onclick: async () => { if (repo.kind === 'private' && !confirm('Remove this clone from the browser? Commits that were not pushed are lost.')) return; repoClose(); delete S.conv.repo; S.conv.files = {}; S.open = []; S.file = null; await repoForget(S.conv.id); touchConv(); draw(); } }, '⏏')
+        : canClone ? h('button', { class: 'x show', title: 'Clone a git repository by its address', 'aria-label': 'Clone a repository', onclick: clone }, '⎘') : null,
+      inRepo ? null : h('button', { class: 'x show', title: folderWord + (repo.canPick() ? ': work in a folder on this computer' : ': add a folder\'s files to this chat'), 'aria-label': folderWord, onclick: openFolder }, '🗀'),
       names.length && !inRepo ? h('button', { class: 'x show', title: 'Download everything as a .zip', 'aria-label': 'Download the workspace as a zip', onclick: () => { const a = h('a', { href: URL.createObjectURL(zipOf(S.conv.files)), download: (S.conv.title || 'workspace').replace(/[^\w-]+/g, '-').slice(0, 40) + '.zip' }); a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 1000); } }, '⇩') : null),
     names.length > 4 ? filter : null,
-    repo.busy ? h('div', { class: 'empty', id: 'repoBusy' }, repo.busy) : null,
+    repo.busy || (!inRepo && gitx.busy) ? h('div', { class: 'empty', id: 'repoBusy' }, repo.busy || gitx.busy) : null,
     lost ? h('div', { class: 'empty' }, `This chat works in the folder “${S.conv.repo.name}”. `, h('button', { class: 'btn btn-sm', onclick: async () => { if (!(await repoReconnect(true))) toast('The browser no longer has that folder: open it again.'); drawSide(); } }, 'Reconnect it')) : null,
-    h('div', { class: 'tree', role: 'tree' }, S.filter && names.length ? findRows(names) : inRepo ? repoRows('', 0, []) : names.length ? treeRows(fileTree(names), 0, '') : repo.busy || lost ? null : h('div', { class: 'empty' }, 'No files yet.')));
+    h('div', { class: 'tree', role: 'tree' }, S.filter && names.length ? findRows(names) : inRepo ? repoRows('', 0, []) : names.length ? treeRows(fileTree(names), 0, '') : repo.busy || gitx.busy || lost ? null : h('div', { class: 'empty' }, 'No files yet.')),
+    gitPanel());
   const main = writing
     ? h('div', { class: 'ide-main' },
         h('div', { class: 'ide-tabs', role: 'tablist' }, h('div', { class: 'ide-tab on writing', role: 'tab', 'aria-selected': 'true', title: writing.name },
@@ -2565,6 +2817,7 @@ function codeTab() {
     ? h('div', { class: 'ide-empty' }, h('p', {}, names.length ? 'Pick a file from the explorer.' : 'Code the veil writes shows up here as it is written. You can edit it, preview a web page beside it, and download it.'),
         h('p', { class: 'fine' }, 'Ctrl+S saves · Ctrl+P finds a file · F2 renames · Tab indents'),
         h('div', { class: 'row-btns' }, h('button', { class: 'btn btn-sm', onclick: () => newFile() }, 'New file'),
+          inRepo || !canClone ? null : h('button', { class: 'btn btn-sm', title: 'Clone a git repository by its address into this browser, work in it, commit and push', onclick: clone }, 'Clone a repo'),
           inRepo ? null : h('button', { class: 'btn btn-sm', title: repo.canPick() ? 'Work in a folder on this computer: files are read as you open them and edits are written straight to it, so your own git sees them' : 'Add a folder\'s text files to this chat', onclick: openFolder }, folderWord)))
     : h('div', { class: 'ide-main' },
         h('div', { class: 'ide-tabs', role: 'tablist' }, S.open.map((n) => h('div', { class: 'ide-tab' + (n === open ? ' on' : ''), role: 'tab', 'aria-selected': String(n === open), tabindex: '0', title: n, onclick: () => { openFile(n); S.preview = previewable(n) ? S.preview : false; drawSide(); }, onkeydown: (e) => { if (e.key === 'Enter') { openFile(n); drawSide(); } } },

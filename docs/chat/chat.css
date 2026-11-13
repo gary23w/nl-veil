@@ -168,6 +168,13 @@ button:disabled, .btn[aria-disabled=true] { opacity: .5; cursor: default; pointe
 .tree-row .x { visibility: hidden; }
 .tree-row.hit { align-items: flex-start; white-space: normal; text-align: left; font-family: var(--font-mono); font-size: var(--fs-micro); }
 .tree-row.hit .where { color: var(--accent); }
+.git { border-top: 1px solid var(--border); font-size: var(--fs-ui); flex: 0 0 auto; max-height: 55%; overflow: auto; }
+.git summary { cursor: pointer; padding: 6px 12px; font-size: var(--fs-micro); letter-spacing: .08em; text-transform: uppercase; color: var(--text-muted); font-weight: 600; }
+.git-body { display: grid; gap: 6px; padding: 2px 10px 10px; }
+.git-acts { display: flex; gap: 6px; flex-wrap: wrap; }
+.git-who { display: grid; gap: 4px; }
+.git .tree-row .badge { font-weight: 700; }
+.git-added .badge { color: var(--success); } .git-changed .badge { color: var(--accent); } .git-deleted .badge { color: var(--danger); } .git-deleted .name { text-decoration: line-through; }
 .row-btns { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; }
 .code.windowed .hl { min-height: 0; }
 .code.windowed .gutter { box-sizing: border-box; }
