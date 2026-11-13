@@ -109,6 +109,8 @@ main > section:last-child { padding-bottom: var(--section-gap); }
   margin-bottom: 24px;
 }
 .hero-cta { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 14px; }
+/* a row of buttons under a section's cards or intro: same rhythm as the hero's */
+.cta-row { display: flex; flex-wrap: wrap; gap: 10px; margin: 24px 0 14px; }
 .hero-note { font-size: var(--fs-small); color: var(--text-muted); }
 .hero-note code { font-size: var(--fs-small); }
 
