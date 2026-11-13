@@ -3662,7 +3662,7 @@ function gate() {
     h('div', { class: 'gate-acts' }, h('button', { class: 'btn btn-solid btn-lg', onclick: login }, 'Log in with Cloudflare'),
       h('a', { class: 'btn btn-ghost', href: '../#get' }, 'Or get the desktop app')),
     h('div', { class: 'err', role: 'alert' }, S.err),
-    h('p', { class: 'fine gate-links' }, CFG.links[0].items.map((i, n) => [n ? ' · ' : '', link(i)]))));
+    h('p', { class: 'fine gate-links' }, CFG.links[0].items.flatMap((i, n) => [n ? ' · ' : '', link(i)]))));
 }
 
 /* Logged in, no harness yet: deploy one, or find the one already there. */
