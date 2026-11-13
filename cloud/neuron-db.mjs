@@ -29,6 +29,9 @@
 
 const SENTINEL = String.fromCharCode(1); // mem() prefixes an unknown-op error with this; never appears in real output.
 
+/** The binding version (matches the npm package). */
+export const VERSION = "0.1.2";
+
 export class NeuronDB {
   /** Wrap an already-instantiated wasm `exports`. Prefer fromModule / fromBytes. */
   constructor(exports) {
@@ -46,14 +49,59 @@ export class NeuronDB {
     this.hasCortex = typeof this.ex.gary === "function" || typeof this.ex.run === "function";
   }
 
-  /** From a WebAssembly.Module (Cloudflare's CompiledWasm import gives you one). Synchronous. */
-  static fromModule(mod, imports = {}) {
-    return new NeuronDB(new WebAssembly.Instance(mod, imports).exports);
+  /**
+   * From a WebAssembly.Module (Cloudflare's CompiledWasm import gives you one). Synchronous.
+   * opts: { httpHandler?: (url: string) => Promise<string>, imports?: object }. httpHandler wires the
+   * wasm's `host_http` (the `http` feature) so a FETCH route / the `fetch` op can reach the network.
+   */
+  static fromModule(mod, opts = {}) {
+    const holder = {};
+    const inst = new WebAssembly.Instance(mod, NeuronDB._imports(opts, holder));
+    holder.ex = inst.exports;
+    return new NeuronDB(inst.exports);
   }
   /** From wasm bytes (browser fetch, Node fs.readFile). Async — compiles then instantiates. */
-  static async fromBytes(bytes, imports = {}) {
-    const { instance } = await WebAssembly.instantiate(bytes, imports);
+  static async fromBytes(bytes, opts = {}) {
+    const holder = {};
+    const { instance } = await WebAssembly.instantiate(bytes, NeuronDB._imports(opts, holder));
+    holder.ex = instance.exports;
     return new NeuronDB(instance.exports);
+  }
+  /** Node convenience: read a .wasm file and instantiate — `await NeuronDB.forNode("./neuron_core.wasm")`. */
+  static async forNode(path, opts = {}) {
+    const { readFileSync } = await import(/* @vite-ignore */ "node:fs"); // @vite-ignore: keep browser bundlers quiet
+    return NeuronDB.fromBytes(readFileSync(path), opts);
+  }
+  /** Browser / Deno convenience: fetch a .wasm URL and instantiate. */
+  static async forBrowser(url, opts = {}) {
+    return NeuronDB.fromBytes(await (await fetch(url)).arrayBuffer(), opts);
+  }
+  /** Build the wasm imports: a `host_http` shim (wired to opts.httpHandler, else a no-transport stub),
+   *  merged with any caller-supplied imports. Harmless on builds without the `http` feature (ignored). */
+  static _imports(opts, holder) {
+    const env = { ...(opts.imports && opts.imports.env) };
+    if (typeof env.host_http !== "function") {
+      const handler = opts.httpHandler, td = new TextDecoder(), te = new TextEncoder();
+      let tok = 0;
+      env.host_http = (ptr, len) => {
+        const ex = holder.ex;
+        if (!handler || !ex) return -1; // no transport -> the wasm's fetch op reports unavailable
+        const url = td.decode(new Uint8Array(ex.memory.buffer, ptr, len));
+        const t = ++tok;
+        Promise.resolve(handler(url)).then((body) => {
+          if (typeof ex.http_deliver !== "function") {
+            throw new Error("host_http fired but this wasm lacks http_deliver — build the core with --features http");
+          }
+          const b = te.encode(String(body == null ? "" : body));
+          const p = ex.alloc(b.length);
+          new Uint8Array(ex.memory.buffer, p, b.length).set(b);
+          ex.http_deliver(t, p, b.length);
+          if (ex.dealloc) ex.dealloc(p, b.length);
+        }).catch((e) => { try { console.error("[neuron-db] http delivery failed:", (e && e.message) || e); } catch {} });
+        return t;
+      };
+    }
+    return { ...opts.imports, env };
   }
 
   // ── low-level FFI (the dance, written once) ──────────────────────────────────
@@ -106,6 +154,16 @@ export class NeuronDB {
       return { fact, coverage: parseFloat(coverage) || 0, overlap: parseInt(overlap, 10) || 0 };
     });
   }
+  /** recallScored plus the key each hit was stored under: [{fact, coverage, overlap, key}]; key is
+   *  null for a fact stored without one. */
+  recallKeyed(scope, query, k = 6) {
+    const out = this._call("recallkeyed", scope, this._clean(query), String(k));
+    if (!out) return [];
+    return out.split("\n").filter(Boolean).map((line) => {
+      const [fact, coverage, overlap, key] = line.split("\t");
+      return { fact, coverage: parseFloat(coverage) || 0, overlap: parseInt(overlap, 10) || 0, key: key || null };
+    });
+  }
   /** A single best-matching value for a direct question, or null. */
   recallValue(scope, query) { return this._call("value", scope, this._clean(query)) || null; }
   /** The knowledge-gap signal: how well memory covers a query (drive escalate/fetch decisions off this). */
@@ -140,8 +198,14 @@ export class NeuronDB {
   delVar(scope, key) { return this._call("delvar", scope, this._clean(key)) === "1"; }
 
   // ── lifecycle ────────────────────────────────────────────────────────────────
-  /** Drop facts containing `match` (substring), or the whole scope if omitted. Returns count removed. */
-  forget(scope, match) { return parseInt(this._call("forget", scope, match ? this._clean(match) : ""), 10) || 0; }
+  /** Drop facts containing `match` (substring), or the whole scope if omitted. Returns count removed.
+   *  The match is used as given: a trailing space is part of it, so "rec12 " does not match "rec120". */
+  forget(scope, match) { return parseInt(this._call("forget", scope, match ? String(match).replace(/[\t\r\n]/g, " ") : ""), 10) || 0; }
+  /** Store `fact` under `key`, replacing what the key held (exact key match). Returns episodes stored;
+   *  0 means the fact did not encode and the key's previous facts are untouched. */
+  upsert(scope, key, fact) { return parseInt(this._call("upsert", scope, this._clean(key), this._clean(fact)), 10) || 0; }
+  /** Drop the facts stored under `key` (exact match, never a substring scan). Returns count removed. */
+  forgetKey(scope, key) { return parseInt(this._call("forgetkey", scope, this._clean(key)), 10) || 0; }
   /** Fact count held by a scope. */
   stats(scope) { return parseInt(this._call("stats", scope), 10) || 0; }
   /** Every live scope as [{scope, count}]. */

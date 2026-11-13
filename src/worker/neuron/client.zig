@@ -4,6 +4,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
 const bounded = @import("../bounded.zig");
+const keyed = @import("keyed.zig");
 
 /// COST PROBE — bumped only in test builds. Every neuron-db call in the app funnels through `exec`,
 /// so this counts PROCESS SPAWNS, which is what this file's startup-cost claims are actually about.
@@ -43,7 +44,10 @@ pub const Neuron = struct {
         var r = bounded.run(self.gpa, self.io, .{ .argv = argv, .bound_ms = 120_000, .stdout_limit = std.math.maxInt(usize), .stderr_limit = 16 << 10, .stderr_tail = true });
         defer r.deinit(self.gpa);
         switch (r.end) {
-            .exited => if (r.code != 0) return error.NeuronCommandFailed,
+            .exited => if (r.code != 0) {
+                if (std.mem.indexOf(u8, r.stderr, keyed.UNSUPPORTED) != null) return error.UpsertUnsupported;
+                return error.NeuronCommandFailed;
+            },
             .signal => return error.NeuronCommandFailed,
             .killed => return error.Timeout,
             else => return r.err orelse error.Unexpected,
@@ -57,6 +61,14 @@ pub const Neuron = struct {
     /// and `get` (export → first line) returns the oldest — so without the forget, an update to an existing
     /// scope never takes (the KV callers here — vault, sessions, api keys, ledger, user records — all want the
     /// latest value, not an accumulation; the append-style memory use goes through Mem.observe, not this).
+    ///
+    /// The forget runs on EVERY put, keyed or not. Another writer — a second process, an nl-veil build from
+    /// before keyed writes, this build's own fallback — can leave an unkeyed value in the scope, which an
+    /// upsert alone would leave in place and export lists first; nothing in this process can see that happen,
+    /// so only forgetting the whole scope makes the value read back the one just written (keyed.zig).
+    /// With a binary that has `upsert` (neuron-db v0.4.0+) the value is then stored under the key `scope`;
+    /// an older binary, or a keyed write that fails any other way, stores it with `observe` as before. Only a
+    /// timeout is returned as is, since a further bounded spawn behind a wedged store would only add to the wait.
     pub fn put(self: Neuron, scope: []const u8, value: []const u8) !void {
         if (builtin.is_test) if (self.test_fault) |fault| {
             if (fault.fail_put_scope_once) |target| {
@@ -67,9 +79,22 @@ pub const Neuron = struct {
             }
         };
         self.del(scope);
-        const argv = [_][]const u8{ self.bin, "--db", self.db, "observe", scope, value };
-        const out = try self.exec(&argv);
-        self.gpa.free(out);
+        stored: {
+            if (!keyed.lacksUpsert(self.io, self.bin)) {
+                const kargv = [_][]const u8{ self.bin, "--db", self.db, "upsert", scope, scope, value };
+                if (self.exec(&kargv)) |out| {
+                    self.gpa.free(out);
+                    break :stored;
+                } else |e| switch (e) {
+                    error.Timeout => return e,
+                    error.UpsertUnsupported => keyed.markLacksUpsert(self.io, self.bin),
+                    else => {},
+                }
+            }
+            const argv = [_][]const u8{ self.bin, "--db", self.db, "observe", scope, value };
+            const out = try self.exec(&argv);
+            self.gpa.free(out);
+        }
         if (builtin.is_test) if (self.test_fault) |fault| {
             if (fault.fail_get_after_put_scope) |target| {
                 if (std.mem.eql(u8, scope, target)) fault.armed = true;
@@ -363,4 +388,90 @@ test "live: a value neuron-db cannot atomise is dropped SILENTLY — put still r
     // fix is to re-read this contract, not to delete the assertion.
     try nb.put("kv_tiny", "hello world");
     try std.testing.expect((try nb.get("kv_tiny")) == null);
+}
+
+/// Lines of `export <scope>` that hold a fact (header and blanks dropped). The keyed tests need to see that a
+/// scope holds ONE value, not just that `get` reads the right first line.
+fn factLines(nb: Neuron, scope: []const u8) !usize {
+    const out = try nb.exec(&[_][]const u8{ nb.bin, "--db", nb.db, "export", scope });
+    defer nb.gpa.free(out);
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, out, '\n');
+    while (it.next()) |line| {
+        const t = std.mem.trim(u8, line, " \r\t");
+        if (t.len > 0 and t[0] != '#') n += 1;
+    }
+    return n;
+}
+
+test "live: a keyed put reads back what it wrote after ANOTHER writer stored the scope unkeyed" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const root = "zig-neuron-keyed-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, root, .default_dir) catch {};
+    const nb = Neuron.init(gpa, io, NEURON_BIN, root ++ "/n.db");
+    try probeStore(nb, gpa);
+    if (keyed.lacksUpsert(io, nb.bin)) return error.SkipZigTest; // a pre-v0.4.0 binary: the fallback test covers it
+    const VAL_THREE = "eyJ2IjozLCJ3aG8iOiJ0aGlyZCB3cml0ZSJ9";
+
+    // This process writes the scope keyed, twice, so any "already moved onto keys" shortcut would be armed.
+    try nb.put("kv_mixed", VAL_ONE);
+    try nb.put("kv_mixed", VAL_ONE);
+    // Another writer stores the scope the unkeyed way: a second process, an nl-veil build from before keyed
+    // writes, or this build's fallback. Nothing in this process sees it happen.
+    gpa.free(try nb.exec(&[_][]const u8{ nb.bin, "--db", nb.db, "forget", "kv_mixed" }));
+    gpa.free(try nb.exec(&[_][]const u8{ nb.bin, "--db", nb.db, "observe", "kv_mixed", VAL_TWO }));
+    // The next keyed put must still be what a read returns: upsert alone left VAL_TWO first in export order.
+    spawn_probe = 0;
+    try nb.put("kv_mixed", VAL_THREE);
+    const spent = spawn_probe;
+    const now = (try nb.get("kv_mixed")) orelse return error.TestUnexpectedResult;
+    defer gpa.free(now);
+    try std.testing.expectEqualStrings(VAL_THREE, now);
+    try std.testing.expectEqual(@as(usize, 1), try factLines(nb, "kv_mixed"));
+    try std.testing.expectEqual(@as(u64, 2), spent); // forget + upsert, on every put
+
+    // A record as every earlier build wrote it (observe, no key) is replaced the same way.
+    gpa.free(try nb.exec(&[_][]const u8{ nb.bin, "--db", nb.db, "observe", "kv_legacy", VAL_ONE }));
+    try nb.put("kv_legacy", VAL_TWO);
+    const back = (try nb.get("kv_legacy")) orelse return error.TestUnexpectedResult;
+    defer gpa.free(back);
+    try std.testing.expectEqualStrings(VAL_TWO, back);
+    try std.testing.expectEqual(@as(usize, 1), try factLines(nb, "kv_legacy"));
+
+    // A value the store cannot atomise leaves the scope empty, as forget-then-observe did.
+    try nb.put("kv_legacy", "hello world");
+    try std.testing.expect((try nb.get("kv_legacy")) == null);
+}
+
+test "live: a binary without upsert still gets an update; it is asked once, then put costs two spawns as before" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest; // the stand-in is a batch file
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const root = "zig-neuron-oldbin-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, root, .default_dir) catch {};
+    // Every neuron build before v0.4.0 answers `upsert` like this; anything else goes to the real binary.
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/old.cmd", .data = "@echo off\r\necho %* | find \" upsert \" >nul && (echo unknown command: upsert 1>&2& exit /b 2)\r\n\"%~dp0..\\bin\\neuron.exe\" %*\r\n" });
+    const nb = Neuron.init(gpa, io, root ++ "\\old.cmd", root ++ "/n.db");
+    try probeStore(nb, gpa);
+    try std.testing.expect(keyed.lacksUpsert(io, nb.bin)); // the probe's put asked, and the answer was kept
+
+    try nb.put("kv_old", VAL_ONE);
+    spawn_probe = 0;
+    try nb.put("kv_old", VAL_TWO);
+    try std.testing.expectEqual(@as(u64, 2), spawn_probe); // forget + observe, no upsert attempt
+    const now = (try nb.get("kv_old")) orelse return error.TestUnexpectedResult;
+    defer gpa.free(now);
+    try std.testing.expectEqualStrings(VAL_TWO, now);
+    try std.testing.expectEqual(@as(usize, 1), try factLines(nb, "kv_old"));
 }

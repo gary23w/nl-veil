@@ -5,6 +5,7 @@ const std = @import("std");
 const vthread = @import("../threads.zig"); // every thread: small Windows stack commit + a name
 const builtin = @import("builtin");
 const bounded = @import("bounded.zig");
+const keyed = @import("neuron/keyed.zig");
 const bu = @import("browser/util.zig"); // sleepMs: a raw-thread sleep, no Io park (the lock-retry pause)
 
 /// COST PROBE — bumped only in test builds. `Mem.exec` is the single spawn site in this file, reached by
@@ -29,7 +30,9 @@ const NEURON_BOUND_MS: u64 = 120_000;
 /// `pack`: the temp pack an import reads could not be written beside the db; `timeout`: still running at
 /// the Mem's bound, killed; `other`: any other nonzero exit or signal (two concurrent writers on one scope
 /// collide on its append-log seq and the loser panics, exit 101) or output that could not be read.
-pub const Fail = enum { lock, missing, pack, timeout, other };
+/// `unsupported` is an older binary refusing `upsert` (keyed.UNSUPPORTED). It is not a lost write: the caller
+/// falls back to forget-then-observe and that write is the one counted, so WriteStats does not count it.
+pub const Fail = enum { lock, missing, pack, timeout, other, unsupported };
 
 /// WRITE ACCOUNTING for one owner of a Mem (a chat turn, one delegated tool call): every write spawn is
 /// counted once by how it ended, with the time it spent waiting to write (the in-process write lock plus
@@ -54,6 +57,7 @@ pub const WriteStats = struct {
             .pack => &s.pack,
             .timeout => &s.timeout,
             .other => &s.other,
+            .unsupported => return,
         };
         _ = c.fetchAdd(1, .monotonic);
     }
@@ -577,7 +581,7 @@ pub const Mem = struct {
         return .{ .fail = switch (r.end) {
             .unstarted => if (r.err != null and spawnMissing(r.err.?)) .missing else .other,
             .killed => .timeout,
-            .exited => if (lockRefused(r.stderr)) .lock else .other,
+            .exited => if (lockRefused(r.stderr)) .lock else if (std.mem.indexOf(u8, r.stderr, keyed.UNSUPPORTED) != null) .unsupported else .other,
             .signal, .overflow, .unread => .other,
         } };
     }
@@ -628,6 +632,7 @@ pub const Mem = struct {
                 continue;
             }
             if (r.fail == .lock) markRefused(self.io, self.db, true);
+            if (r.fail == .unsupported) keyed.markLacksUpsert(self.io, self.bin);
             if (self.stats) |s| s.note(r.fail);
             return null;
         }
@@ -736,8 +741,23 @@ pub const Mem = struct {
         return jsonUint(out, "\"stored\":");
     }
 
+    /// Single-value scope (plan, state, a resume anchor): the new fact takes the place of whatever the scope
+    /// held. The whole scope is forgotten on EVERY replace: another writer (a second process, an nl-veil build
+    /// from before keyed writes, this build's own fallback) can leave an unkeyed value there, which an upsert
+    /// alone would keep and the readers (list, readPage) would show beside the new one (neuron/keyed.zig). With a
+    /// binary that has `upsert` (neuron-db v0.4.0+) the fact is then stored under the key `scope`; an older binary,
+    /// or a keyed write that did not land, stores it with observe as before. A fact with no signal
+    /// (cleanFactInto) is the forget alone, as it always was (continuity.clear relies on it).
     pub fn replace(self: Mem, scope: []const u8, fact: []const u8) void {
         if (self.write(&.{ "forget", scope })) |o| self.gpa.free(o);
+        var nb: [1600]u8 = undefined;
+        const clean = cleanFactInto(&nb, fact) orelse return;
+        if (!keyed.lacksUpsert(self.io, self.bin)) {
+            if (self.write(&.{ "upsert", scope, scope, clean })) |o| {
+                self.gpa.free(o);
+                return;
+            }
+        }
         _ = self.observe(scope, fact);
     }
 
@@ -1590,4 +1610,75 @@ test "two chat turns of one user write one hive at once: every write lands, none
     }
     // a different path is a different lock: two users' hives never queue on each other
     try std.testing.expect(writeLockFor(io, root ++ "/other/hive.sqlite") != ma.wmtx);
+}
+
+test "replace: a keyed replace shows only its own fact after ANOTHER writer stored the scope unkeyed; clear empties it" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = testEnvironOsc() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-osc-keyed-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, root, .default_dir) catch {};
+    var ws: WriteStats = .{};
+    var m = Mem.init(gpa, io, NEURON_BIN_T, root ++ "/n.db");
+    m.stats = &ws;
+    if (m.observe("plan", "step one is to read the config file and list its keys") == 0) return error.SkipZigTest; // no binary
+    // That observe is the plan as every earlier build stored it: no key. A keyed replace must still replace it.
+    m.replace("plan", "step two is to write the migration script for the new schema");
+    if (keyed.lacksUpsert(io, m.bin)) return error.SkipZigTest; // a pre-v0.4.0 binary: the fallback test covers it
+    {
+        const now = m.list("plan");
+        defer gpa.free(now);
+        try std.testing.expectEqualStrings("step two is to write the migration script for the new schema", now);
+    }
+    m.replace("plan", "step two and a half is to review the migration script with the team");
+    // Another writer stores the scope the unkeyed way (a second process, an older nl-veil, this build's
+    // fallback). Nothing in this process sees it, so the next replace must clear it without being told.
+    if (m.write(&.{ "forget", "plan" })) |o| gpa.free(o);
+    _ = m.observe("plan", "step nine is an unkeyed plan written by some other writer");
+    spawn_probe = 0;
+    m.replace("plan", "step three is to run the migration against the staging database");
+    const spent = spawn_probe;
+    {
+        const now = m.list("plan");
+        defer gpa.free(now);
+        try std.testing.expectEqualStrings("step three is to run the migration against the staging database", now);
+    }
+    try std.testing.expectEqual(@as(u64, 2), spent); // forget + upsert, on every replace
+    m.replace("plan", ""); // continuity.clear: a whole-scope forget, as always
+    {
+        const now = m.list("plan");
+        defer gpa.free(now);
+        try std.testing.expectEqualStrings("", now);
+    }
+    try std.testing.expectEqual(@as(u32, 0), ws.failed());
+}
+
+test "replace: a binary without upsert gets forget-then-observe, and its refusal is not counted as a lost write" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest; // the stand-in is a batch file
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = testEnvironOsc() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-osc-oldbin-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, root, .default_dir) catch {};
+    // Every neuron build before v0.4.0 answers `upsert` like this; anything else goes to the real binary.
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/old.cmd", .data = "@echo off\r\necho %* | find \" upsert \" >nul && (echo unknown command: upsert 1>&2& exit /b 2)\r\n\"%~dp0..\\bin\\neuron.exe\" %*\r\n" });
+    var ws: WriteStats = .{};
+    var m = Mem.init(gpa, io, root ++ "\\old.cmd", root ++ "/n.db");
+    m.stats = &ws;
+    if (m.observe("state", "state probe fact holding enough letters to store") == 0) return error.SkipZigTest; // no binary
+    m.replace("state", "the build is green on linux and the tests take four minutes");
+    try std.testing.expect(keyed.lacksUpsert(io, m.bin));
+    spawn_probe = 0;
+    m.replace("state", "the build is red on windows since the cache moved to a new drive");
+    try std.testing.expectEqual(@as(u64, 2), spawn_probe); // forget + observe, no upsert attempt
+    const now = m.list("state");
+    defer gpa.free(now);
+    try std.testing.expectEqualStrings("the build is red on windows since the cache moved to a new drive", now);
+    try std.testing.expectEqual(@as(u32, 0), ws.failed());
 }
