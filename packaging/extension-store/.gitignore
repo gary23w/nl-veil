@@ -1,0 +1,4 @@
+# the upload zip is built from extension/ by make-zip.py
+*.zip
+# private notes about the submission (accounts, review status)
+NOTES.md
