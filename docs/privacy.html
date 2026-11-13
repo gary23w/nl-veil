@@ -16,6 +16,7 @@
     a { overflow-wrap: anywhere; }
     a { color: light-dark(#244caf, #9bbcff); } .date { opacity: .7; }
   </style>
+<script src="js/analytics.js"></script>
 </head>
 <body>
   <a href="./">the Veil</a>
@@ -24,7 +25,7 @@
   <h1>Terms, responsibility &amp; privacy</h1>
   <p class="date">Effective October 12, 2026; updated November 13, 2026</p>
   <p class="date">November 13 update: the Privacy section now covers the nl-veil browser
-    link extension for Chrome and Edge.</p>
+    link extension for Chrome and Edge, and Google Analytics on this website.</p>
   <p class="date">October 12 update: section 8 extends the indemnity to project partners
     and supporting organizations, subject to its stated limits.</p>
   <p>nl-veil (the Veil) is a free, open-source project maintained as an independent project.
@@ -224,6 +225,25 @@
     off in the app. Cloud tasks upload their task inputs and runtime to your account
     and may continue while the desktop app is closed. Cloudflare's terms and privacy
     practices apply.</p>
+
+  <h3 id="site-analytics">Analytics on this website</h3>
+  <p>The pages of this website (gary23w.github.io/nl-veil, including the web chat page) use
+    Google Analytics 4, loaded through Google Tag Manager. It records page views, scrolling,
+    clicks on links that leave the site, site searches, form interactions, embedded video
+    plays and file downloads, together with what Google Analytics collects with every visit:
+    the page address and title, the referring page, browser, device, language and an
+    approximate location derived from your IP address. Google processes this data under its
+    own privacy policy.</p>
+  <p>A banner asks before analytics cookies are set. Until you press Accept, or if you press
+    Decline, Google's consent mode sends only cookieless pings without an identifier. Ad
+    storage, ad user data and ad personalization are always off. Your choice is kept in your
+    browser's local storage.
+    <button type="button" onclick="window.nlvAnalytics &amp;&amp; window.nlvAnalytics.reset()">Change your analytics choice</button></p>
+  <p>On the web chat page, the tag never receives what you type, your messages, files, keys
+    or the model's replies; the login code from Cloudflare is cleared from the address before
+    the tag loads. Following a link out of the site, including one in a chat reply, is
+    recorded as an outbound click with that link's address. The desktop app, its server and
+    the browser link extension contain no analytics.</p>
 
   <h3 id="browser-link">nl-veil browser link extension</h3>
   <p>The optional nl-veil browser link extension for Chrome and Edge lets the veil drive
