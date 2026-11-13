@@ -44,7 +44,7 @@ async function harness(say = "all done") {
 }
 
 test("the version this file tests", () => {
-  assert.equal(VERSION, "16");
+  assert.equal(VERSION, "18");
 });
 
 test("a local job is queued, never run by the alarm, and keeps no alarm going while it waits", async () => {
@@ -541,4 +541,79 @@ test("speech: each model's own field and voices, the harness's choice when none 
   assert.equal(melod.j.type, "audio/wav"); // told from the bytes, whatever the model was expected to send
   assert.deepEqual(runs.at(-1).input, { prompt: "Bonsoir.", lang: "fr" }); // its own field; a voice it does not list is not sent
   assert.equal((await call("POST", "speak", { text: "  " })).status, 400);
+});
+
+test("clef is shown the pictures a question is about; a picture that cannot be read gives no answer at all", async () => {
+  const { call, runs } = await studio((model, input) => ({ answers: Object.fromEntries(Object.keys(input.questions).map((k) => [k, { noul: input.images ? 0.9 : 0.1 }])) }));
+  const pic = "data:image/png;base64," + PNG_B64;
+  const seen = await call("POST", "clef", { state: "Two frames of one shot.", questions: ["Is the second the same scene as the first?"], images: [pic, pic] });
+  assert.deepEqual(seen.j.probs, [0.9]);
+  assert.deepEqual(runs.at(-1).input.images, [{ content_type: "image/png", base64: PNG_B64 }, { content_type: "image/png", base64: PNG_B64 }]);
+  const plain = await call("POST", "clef", { state: "Text only.", questions: ["Is it text?"] });
+  assert.deepEqual(plain.j.probs, [0.1]);
+  assert.equal(runs.at(-1).input.images, undefined); // as before, when no picture is sent
+  const n = runs.length;
+  assert.equal((await call("POST", "clef", { state: "x", questions: ["q?"], images: [pic, "not a picture"] })).j.probs, null);
+  assert.equal(runs.length, n); // and Clef was not asked
+});
+
+test("a frame is directed: the harness looks, writes the prompt, has it made, and has Clef confirm it; a frame that fails is corrected and made again", async () => {
+  let clefAsks = 0;
+  const { call, runs, storage } = await studio((model, input) => {
+    if (input.questions) { clefAsks++; return { answers: Object.fromEntries(Object.keys(input.questions).map((k, i) => [k, { noul: clefAsks === 1 && i === 0 ? 0.1 : 0.9 }])) }; } // the first frame has something added
+    const says = (m) => (m.includes("moondream") ? "Sure! Your prompt must say VERBATIM what the image model never sees." : '{"stays": "A red fox sits at the left of a snowy field under a pale sky, facing right, in soft watercolour.", "change": "The ear of the fox turns slightly toward the camera."}');
+    if (input.task) return { answer: says(model) };
+    if (input.messages) return { response: says(model) };
+    return { image: PNG_B64 };
+  });
+  await call("GET", "image/models");
+  const pic = "data:image/png;base64," + PNG_B64;
+  const r = await call("POST", "frame", { shot: "a fox in snow", style: "watercolour", beat: "the fox looks up", before: pic, start: pic, anchor: pic, model: "@cf/black-forest-labs/flux-2-dev", width: 1024, height: 576 });
+  assert.equal(r.status, 200);
+  assert.equal(r.j.fits, true);
+  assert.equal(r.j.tries, 2); // made, refused by Clef, corrected, made again
+  assert.equal(r.j.directed, true);
+  assert.deepEqual(r.j.probs, [0.9, 0.9, 0.9]);
+  // the order of the work: one look, then (a picture, then Clef) twice
+  const kinds = runs.map((x) => (x.input.messages || x.input.task ? "look" : x.input.questions ? "clef" : "image"));
+  // the first vision model talked about the task instead of the picture: its answer was not used, the next was asked
+  assert.deepEqual(kinds, ["look", "look", "image", "clef", "image", "clef"]);
+  assert.match(runs[0].model, /moondream/);
+  runs.shift();
+  assert.equal((await storage.get("quirks"))["@cf/moondream/moondream3.1-9B-A2B"].directs, false); // and that is remembered
+  assert.equal(r.j.director, runs[0].model);
+  // the director was shown the frame and told the shot, its style and where it is going
+  const asked = runs[0].input.messages[0].content;
+  assert.match(asked.find((x) => x.type === "text").text, /THE SHOT: a fox in snow[\s\S]*THE STYLE: watercolour[\s\S]*WHERE THE SHOT IS GOING: the fox looks up/);
+  // the image model was given the director's words, the frame as the camera moved it, and the shot's first frame
+  assert.match(runs[1].form.prompt, /^A red fox sits at the left of a snowy field[\s\S]*Add nothing and take nothing away\.$/);
+  assert.equal(runs[1].form.input_image_0, "<image/png>");
+  assert.equal(runs[1].form.input_image_1, "<image/png>");
+  // Clef saw both frames; and the second try carries the correction for what the first failed
+  assert.equal(runs[2].input.images.length, 2);
+  assert.equal(Object.keys(runs[2].input.questions).length, 3);
+  assert.match(runs[3].form.prompt, /IMPORTANT: exactly the same people and things/);
+  assert.equal(r.j.prompt, runs[3].form.prompt);
+  // without a frame to go from there is nothing to direct
+  assert.equal((await call("POST", "frame", { shot: "a fox", before: "nope" })).status, 400);
+});
+
+test("with no word from Clef, a vision model is shown both frames and confirms the frame in its place", async () => {
+  const { call, runs, storage } = await studio((model, input) => {
+    if (input.questions) throw new Error("5007: clef is not here");
+    const parts = input.messages?.[0]?.content;
+    if (Array.isArray(parts) && parts.filter((x) => x.type === "image_url").length === 2) return { response: model.includes("scout") ? '{"same": false, "follows": true, "sound": true}' : "They look alike to me." };
+    if (input.messages || input.task) return { response: '{"stays": "A red fox sits at the left of a snowy field under a pale sky, facing right, in soft watercolour.", "change": "The ear of the fox turns slightly."}', answer: '{"stays": "A red fox sits at the left of a snowy field under a pale sky, facing right, in soft watercolour.", "change": "The ear of the fox turns slightly."}' };
+    return { image: PNG_B64 };
+  });
+  await call("GET", "image/models");
+  const pic = "data:image/png;base64," + PNG_B64;
+  const r = await call("POST", "frame", { shot: "a fox in snow", before: pic, model: "@cf/black-forest-labs/flux-2-dev", tries: 1 });
+  assert.equal(r.status, 200);
+  assert.equal(r.j.judge, "@cf/meta/llama-4-scout-17b-16e-instruct"); // who confirmed it
+  assert.deepEqual(r.j.probs, [0.1, 0.9, 0.9]); // and it said the scene is not the same
+  assert.equal(r.j.fits, false);
+  const twin = runs.find((x) => Array.isArray(x.input.messages?.[0]?.content) && x.input.messages[0].content.filter((p) => p.type === "image_url").length === 2);
+  assert.ok(twin, "a model was shown both frames in one message");
+  assert.equal((await storage.get("quirks"))["@cf/meta/llama-4-scout-17b-16e-instruct"].pair, true);
 });

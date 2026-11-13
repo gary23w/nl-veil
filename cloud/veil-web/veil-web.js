@@ -86,6 +86,10 @@
 //                               images?: [data: URL, ..] (to start from, or to take after), mask?: data: URL}
 //                               ->  {image (base64), type, model}
 //   POST look                   {model, image: data: URL, question?}  ->  {text, model}
+//   POST frame                  {shot, before, start?, anchor?, style?, beat?, model?, vision?, width?, height?,
+//                               tries?, pass?}  ->  {image (base64), type, model, prompt, probs, tries, fits}
+//                               the next frame of a shot, directed: the harness looks at the frame before, writes
+//                               the prompt for the next from what is in it, has it made, and has Clef confirm it
 //   POST speak                  {model, text, voice?, lang?}  ->  {audio (base64), type, model}
 //                               (image/models also lists the speech models: voices: [{id, about, key, speakers,
 //                               speaker, lang, created, health}], with order.speak and picks.speak)
@@ -93,13 +97,14 @@
 //   GET  convs | convs/<id>     POST convs/<id> {title, at, msgs, files}   DELETE convs/<id>
 //   GET  context                the reference text the model is handed (llms.txt digest)
 //   POST update                 replace this Worker with the current source from the public repo
-//   POST clef  {state, questions: [...]}    yes/no decisions as probabilities (Cloudflare's Clef), or probs: null
+//   POST clef  {state, questions: [...], images?: [data: URL, ..4]}   yes/no decisions as probabilities
+//                               (Cloudflare's Clef), about the state and the pictures; or probs: null
 //   GET  mcp   POST mcp {name, url, token?}   DELETE mcp/<name>   POST mcp/call {server, method, params, query?}
 //
 // No imports and no platform globals beyond fetch/Response/crypto, so a test can run this file under node with
 // a Map for storage and a scripted env.AI.
 
-export const VERSION = "16";
+export const VERSION = "18";
 const API_ROOT = "https://api.cloudflare.com/client/v4";
 const PY_SOURCE = "https://raw.githubusercontent.com/gary23w/nl-veil/main/cloud/tot_py.py";
 const SELF_SCRIPT = "veil-web";
@@ -158,6 +163,32 @@ const MODEL_REST_MS = 6 * 3600 * 1000; // a model whose last calls failed is pas
 const RETIRE_SOON_MS = 30 * 86400 * 1000; // a model Cloudflare retires within this long is chosen after the ones that stay
 const AUTO_TRIES = 3; // models one request may go through when the harness does the choosing
 const SPEAK_CHARS = 4000; // characters one request to a speech model carries (the page sends a long text in parts)
+/// What a director said of the next frame: {stays, change}, or null when the answer is not that. An answer that
+/// talks about the task (the prompt, the model, "you") instead of the picture is not a description of a picture.
+export function readDirection(reply) {
+  const text = String(reply ?? "");
+  const at = text.indexOf("{");
+  if (at < 0) return null;
+  let v;
+  try {
+    [v] = looseValue(text, at);
+  } catch {
+    return null;
+  }
+  if (!v || typeof v !== "object") return null;
+  const stays = clip(String(v.stays ?? v.keep ?? "").replace(/\s+/g, " ").trim(), 1300);
+  const change = clip(String(v.change ?? v.changes ?? "").replace(/\s+/g, " ").trim(), 400);
+  if (stays.length < 40 || change.length < 8) return null;
+  if (/\b(prompt|image model|verbatim|you must|your (answer|reply|prompt)|the frame given to you|json)\b/i.test(stays + " " + change)) return null;
+  return { stays, change };
+}
+
+// what Clef is asked of a frame made to follow another (frame(), below): each must be a yes
+const FRAME_QUESTIONS = [
+  "Is the second picture the same scene as the first, with the same people and things in nearly the same places, and nothing added and nothing taken away?",
+  "Would the first picture blend smoothly into the second as two consecutive frames of one continuous shot?",
+  "Is the second picture a sound picture: faces, hands and objects well formed, with nothing smeared, melted, doubled or garbled?",
+];
 const HEALTH_MAX = 64; // models whose record of working or failing is kept
 // a refusal that is about the request (its words, its pictures), not about the model: no other model is tried for it
 const REQUEST_REFUSAL = /flagged|safety|nsfw|content policy|could not be read|must be|say what/i;
@@ -960,10 +991,18 @@ export class Harness {
   /// Ask Cloudflare's Clef every question about `state`: the probability that each answer is yes, or null when
   /// there is no usable answer (the caller then decides as it would without clef). The account's AI binding is
   /// tried first; with a login in hand the REST route the desktop veil uses is the second try.
-  async clef(who, state, questions) {
+  async clef(who, state, questions, images) {
     const qs = (Array.isArray(questions) ? questions : []).map(String).filter(Boolean);
     if (qs.length === 0 || qs.length > CLEF_QUESTIONS_MAX) return null;
     const body = { model: "clef-flash", state: clip(state, 60000), questions: Object.fromEntries(qs.map((q, i) => ["q" + i, { type: "noul", instructions: q }])) };
+    // pictures the questions are about (Clef reads up to four, placed before the state): a film's frames, to be
+    // told whether one follows from another. One that cannot be read fails the whole ask, so no answer is given
+    // about pictures that were not all seen.
+    if (Array.isArray(images) && images.length) {
+      const pics = images.slice(0, 4).map(pictureFrom);
+      if (pics.some((x) => !x)) return null;
+      body.images = pics.map((x) => ({ content_type: x.type, base64: x.b64 }));
+    }
     const read = (raw) => {
       const root = raw?.result && typeof raw.result === "object" ? raw.result : raw;
       const probs = qs.map((_, i) => Number(root?.answers?.["q" + i]?.noul));
@@ -1617,6 +1656,125 @@ export class Harness {
 
   /// A text is spoken by a model of its language: one whose id ends in that language first, then one that
   /// names no language (or takes one as a setting), and one of another language last.
+  /// The NEXT FRAME of a shot, directed. An image model asked for "the next frame" with the same words every time
+  /// repaints the picture as it pleases, and the shot drifts. So each frame is directed the way a person would:
+  ///   1. LOOK at the frame just made (a vision model), and write the prompt for the next one from what is
+  ///      actually in it: everything that must stay as it is, and the one small change that moves the shot on.
+  ///   2. MAKE the frame from that prompt, shown the frame before (and the shot's first frame, when given, as
+  ///      what the style and the faces are to stay like).
+  ///   3. CONFIRM it (Clef, shown both frames): the same scene with nothing added or lost, a frame that would
+  ///      blend with the one before, and not a broken picture. A frame that fails is made again with the prompt
+  ///      corrected for what failed; the best of the tries is the one given back, with Clef's answers.
+  /// `before` is the frame before as it is; `start` the same frame as the camera has moved it (what the image
+  /// model starts from; `before` when not given). Every model here may be named or left to the harness.
+  async frame(body, who) {
+    const shot = clip(String(body.shot ?? "").trim(), 2000);
+    if (!shot) return { err: "say what the shot shows" };
+    const before = pictureFrom(body.before);
+    if (!before) return { err: "the frame before could not be read: send it as a data: URL" };
+    const start = body.start ? pictureFrom(body.start) : before;
+    const anchor = body.anchor ? pictureFrom(body.anchor) : null;
+    if (!start || (body.anchor && !anchor)) return { err: "a picture sent with the frame could not be read" };
+    const url = (pic) => `data:${pic.type};base64,${pic.b64}`;
+    const style = clip(String(body.style ?? "").trim(), 400);
+    const beat = clip(String(body.beat ?? "").trim(), 500);
+    const tries = Math.min(4, Math.max(1, Math.floor(Number(body.tries)) || 2));
+    const pass = Math.min(0.95, Math.max(0.05, Number(body.pass) || 0.5));
+    const keepAll = "Keep everything in the frame given exactly as it is: the same people and things in the same places, the same faces, clothes, colours, light and art style. Add nothing and take nothing away.";
+
+    // 1. the director looks at the frame and writes the next prompt. Its answer has a SHAPE (what stays, what
+    // changes), and an answer in any other shape, or one that talks about the task instead of the picture, is
+    // not used: the next vision model is asked. Which models can direct is learned (quirks[model].directs).
+    const question = `You direct an animated shot one frame at a time. This picture is the frame that was just made.\nTHE SHOT: ${shot}${style ? "\nTHE STYLE: " + style : ""}${beat ? "\nWHERE THE SHOT IS GOING: " + beat : ""}\nDescribe the VERY NEXT frame, a fraction of a second later. Reply with ONE JSON object and nothing else:\n{"stays": "<what is in THIS picture and must stay exactly as it is: each person and thing, where it is in the picture, its pose, its clothes and colours, the light, the art style; written as a description of a picture>", "change": "<the ONE small movement that carries the shot on${beat ? " toward where it is going" : ""}: slight, nothing new appearing, nothing vanishing>"}`;
+    const quirks = (await this.store.get("quirks")) ?? {};
+    let asking = [String(body.vision ?? "").trim()].filter((id) => id && id !== "auto");
+    if (asking.length === 0) {
+      const order = (await this.imageCatalogNow(who)).order.look;
+      asking = [...order.filter((id) => quirks[id]?.directs === true), ...order.filter((id) => quirks[id]?.directs === undefined)].slice(0, 3);
+    }
+    let direction = null, director = "";
+    for (const id of asking) {
+      const seen = await this.look({ model: id, image: url(before), question }, who);
+      direction = seen.err ? null : readDirection(seen.text);
+      if (!seen.err && quirks[id]?.directs !== !!direction) {
+        quirks[id] = { ...quirks[id], directs: !!direction };
+        await this.store.put("quirks", quirks);
+      }
+      if (direction) {
+        director = id;
+        break;
+      }
+    }
+    const directed = !!direction;
+    const base = directed ? `${direction.stays} ${direction.change}` : `${shot}${style ? ", " + style : ""}. This is the very next frame of the same shot, a fraction of a second later.`;
+
+    // 2 and 3. made, then confirmed; corrected and made again when it fails
+    let best = null, fix = "", why = "", judged = "";
+    for (let go = 0; go < tries; go++) {
+      const prompt = `${base} ${keepAll}${fix ? " " + fix : ""}`;
+      const made = await this.image({ model: body.model, prompt, images: [url(start), ...(anchor ? [url(anchor)] : [])], width: body.width, height: body.height, strength: body.strength ?? 0.45, negative: body.negative }, who);
+      if (made.err) {
+        why = made.err;
+        if (REQUEST_REFUSAL.test(made.err)) break;
+        continue;
+      }
+      // Clef's word; when Clef has none (it is not there, or cannot say), a vision model is shown the two frames
+      // and asked the same things. `judge: "vision"` asks the vision model in Clef's place.
+      const pair = [url(before), `data:${made.type};base64,${made.image}`];
+      let probs = body.judge === "vision" ? null : await this.clef(who, "Two consecutive frames of one shot of a film: the first picture is the earlier frame, the second is the frame made to come right after it.", FRAME_QUESTIONS, pair);
+      let judge = probs ? "clef" : "";
+      if (!probs) {
+        const seen = await this.sameFrame(who, pair);
+        if (seen) {
+          probs = seen.probs;
+          judge = seen.model;
+        }
+      }
+      judged = judge || judged;
+      const score = probs ? Math.min(...probs) : 1; // when nobody can say, that is not held against the frame
+      if (!best || score > best.score) best = { ...made, prompt, probs, score, tries: go + 1 };
+      if (score >= pass) break;
+      // the correction is for what failed
+      fix = probs[0] < pass ? "IMPORTANT: exactly the same people and things as in the frame given, each in its place; no new figure, no new object, nothing missing."
+        : probs[2] < pass ? "IMPORTANT: clean, well-formed faces and hands; no smeared, melted, doubled or garbled shapes."
+        : "IMPORTANT: change even less: almost the same picture as the frame given, moved on by the smallest amount.";
+    }
+    if (!best) return { err: "no frame came back: " + (why || "the image model gave nothing") };
+    return { image: best.image, type: best.type, model: best.model, prompt: best.prompt, probs: best.probs, tries: best.tries, fits: best.score >= pass, directed, director, judge: judged };
+  }
+
+  /// Two frames shown to a vision model in one message, and asked what Clef is asked: the same scene with
+  /// nothing added or lost, a frame that follows, a sound picture. {probs: [..3], model}, or null when no model
+  /// answered in the shape asked. Models that take a message with picture parts are asked, the ones that have
+  /// answered this before first (quirks[model].pair). Measured 2026-11-13: llama-4-scout answers with the JSON
+  /// already parsed, mistral-small in a code fence, gemma-4 and inkling-2 with nothing at all. The shape questions
+  /// (the same scene, a frame that follows) decide; a vision model's "not sound" is too quick to trust alone, so
+  /// it lowers the frame's score without failing it.
+  async sameFrame(who, pair) {
+    const cat = await this.imageCatalogNow(who);
+    const quirks = (await this.store.get("quirks")) ?? {};
+    const able = cat.order.look.filter((id) => (cat.vision.find((v) => v.id === id)?.how ?? "parts") === "parts" && quirks[id]?.pair !== false);
+    const order = [...able.filter((id) => quirks[id]?.pair === true), ...able.filter((id) => quirks[id]?.pair === undefined)].slice(0, 4);
+    const question = 'Two frames of one shot of a film, in order: the first picture is the earlier frame, the second is the frame that comes right after it. Compare them closely, shape by shape. Reply with ONE JSON object and nothing else: {"same": <true when the second shows the same scene with the same people and things in nearly the same places, nothing added and nothing taken away>, "follows": <true when the first would blend into the second as consecutive frames of one continuous shot>, "sound": <true when the second has well-formed faces, hands and objects, nothing smeared, melted, doubled or garbled>}';
+    for (const id of order) {
+      let v = null;
+      try {
+        const text = answerText(await this.env.AI.run(id, { messages: [{ role: "user", content: [{ type: "text", text: question }, { type: "image_url", image_url: { url: pair[0] } }, { type: "image_url", image_url: { url: pair[1] } }] }], max_tokens: 600 }));
+        const at = text.indexOf("{");
+        if (at >= 0) [v] = looseValue(text, at);
+      } catch {}
+      await this.spend(1, question.length + pair[0].length + pair[1].length);
+      const ok = !!v && typeof v === "object" && ["same", "follows", "sound"].every((k) => typeof v[k] === "boolean" || v[k] === "true" || v[k] === "false");
+      if (quirks[id]?.pair !== ok) {
+        quirks[id] = { ...quirks[id], pair: ok };
+        await this.store.put("quirks", quirks);
+      }
+      const yes = (k) => v[k] === true || v[k] === "true";
+      if (ok) return { probs: [yes("same") ? 0.9 : 0.1, yes("follows") ? 0.9 : 0.1, yes("sound") ? 0.9 : 0.5], model: id };
+    }
+    return null;
+  }
+
   speak(body, who) {
     const lang = String(body.lang ?? "").slice(0, 2).toLowerCase() || "en";
     return this.chosen(body, who, "speak", (b) => this.speakOne(b), (cat, health) => rankModels((cat.voices ?? []).map((v) => ({ ...v, lead: speaks(v, lang) })), health, Date.now()).map((m) => m.id));
@@ -2656,18 +2814,18 @@ export class Harness {
 
     // Images: make one, look at one. (The body is JSON; a picture travels as a data: URL.)
     if (method === "GET" && at === "image/models") return say({ ok: true, ...(await this.imageCatalogNow(who, url.searchParams.get("fresh") === "1")) });
-    if (method === "POST" && (at === "image" || at === "look" || at === "speak")) {
+    if (method === "POST" && (at === "image" || at === "look" || at === "speak" || at === "frame")) {
       if (!this.env.AI) return bad("this Worker has no AI binding", 500);
       const why = await this.spent(true);
       if (why) return bad(why, 429);
-      const got = at === "image" ? await this.image(body, who) : at === "look" ? await this.look(body, who) : await this.speak(body, who);
+      const got = at === "image" ? await this.image(body, who) : at === "look" ? await this.look(body, who) : at === "frame" ? await this.frame(body, who) : await this.speak(body, who);
       return got.err ? bad(got.err, /could not be read|must be|say what/.test(got.err) ? 400 : 502) : say({ ok: true, ...got });
     }
 
     if (method === "POST" && at === "clef") {
       const why = await this.spent(true);
       if (why) return say({ ok: true, probs: null, why });
-      return say({ ok: true, probs: await this.clef(who, String(body.state ?? ""), body.questions) });
+      return say({ ok: true, probs: await this.clef(who, String(body.state ?? ""), body.questions, body.images) });
     }
 
     // Keys to the MCP door. A key is shown once, when it is made; the harness keeps its hash.
