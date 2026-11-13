@@ -17,6 +17,8 @@ body.chat-page { height: 100dvh; display: flex; flex-direction: column; overflow
    their first row shows. */
 .chat-page .topbar .nav { flex-wrap: wrap; font-size: var(--fs-ui); max-height: 34px; max-height: calc(1lh + 14px); }
 .chat-page .topbar .nav a { white-space: nowrap; }
+/* In the chat itself the bar is the brand and the chat's own controls; the site's pages are under Links in the chats list. */
+.chat-page.chat-on .topbar .nav { display: none; }
 .bar-slot { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .bar-slot select { min-height: 30px; max-width: 30ch; padding: 0 8px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); color: var(--text); font-size: var(--fs-small); transition: border-color var(--quick); }
 .bar-slot select:hover { border-color: var(--accent); }

@@ -48,10 +48,13 @@ svg.mark-lg { width: 44px; height: 44px; }
 .nav a.active { color: var(--accent); background: var(--tonal); }
 
 .topbar .chip { flex: 0 0 auto; }
+/* On a phone the nav is hidden, so the chat keeps a button of its own in the bar. */
+.topbar .nav-chat { display: none; flex: 0 0 auto; }
 
 @media (max-width: 900px) {
   .nav { display: none; }
   .topbar .chip { display: none; }
+  .topbar .nav-chat { display: inline-flex; }
 }
 
 /* ============================================================ sections */

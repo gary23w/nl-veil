@@ -56,8 +56,10 @@ window.VEIL_WEB = {
       { label: "Agent Garrett blog", href: "https://garrettstimpson.ca/topics/agent-garrett/" },
     ] },
     { group: "The veil", items: [
+      { label: "Home", href: "../" },
       { label: "Download the desktop app", href: "../#get" },
       { label: "Quick start", href: "../demos/" },
+      { label: "Architecture", href: "../#map" },
       { label: "Source docs", href: "../#documents" },
       { label: "nl-veil on GitHub", href: "https://github.com/gary23w/nl-veil" },
       { label: "Releases", href: "https://github.com/gary23w/nl-veil/releases" },

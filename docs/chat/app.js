@@ -6397,6 +6397,7 @@ function draw() {
   const typed = document.getElementById('hname')?.value ?? '';
   const sideKeep = {};
   for (const el of document.querySelectorAll('#side input, #side textarea:not(#editor), #side select')) if (el.id && el.value && el.type !== 'number') sideKeep[el.id] = el.value;
+  document.body.classList.toggle('chat-on', on);   // in the chat the top bar keeps only the brand; the site's links are in the chats list
   drawBar();
   const view = !S.session ? 'gate' : on ? 'chat:' + S.conv.id : 'setup';
   app.classList.toggle('same-view', view === shownView);
