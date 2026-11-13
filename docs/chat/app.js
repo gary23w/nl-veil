@@ -4029,7 +4029,8 @@ function artView(id) {
             row.prompt && row.seed !== null ? use('Same seed', 'Put its prompt, settings and seed into the form. On a model that honours the seed, the same words make the same picture again', () => artRemix(row, true)) : null,
             row.prompt && art.models.length ? h('button', { class: 'btn btn-sm', title: 'Four more from the same prompt, each with a new seed', onclick: () => { const batch = 'b' + Date.now().toString(36); artQueue([0, 1, 2, 3].map(() => ({ p: { model: artListed(row.model) || 'auto', prompt: row.prompt, negative: row.negative, w: row.w, h: row.h, steps: row.steps, guidance: row.guidance, seed: randomSeed(), parent: row.id, kind: 'variation', batch, conv: row.conv }, label: shortModel(artListed(row.model) || 'auto') + ' · variation' }))); toast('Four variations are on their way: see the Images tab.'); } }, 'Variations') : null,
             use('Edit this', 'Start from this picture: write what it should become', () => { art.init = id; art.mask = ''; }),
-            use('Use as reference', 'Give it to a model that takes reference pictures', () => { if (!art.refs.includes(id)) art.refs = [...art.refs, id].slice(-4); })),
+            use('Use as reference', 'Give it to a model that takes reference pictures', () => { if (!art.refs.includes(id)) art.refs = [...art.refs, id].slice(-4); }),
+            h('button', { class: 'btn btn-sm', title: 'Make it a shot of the film open in the Video tab (a new film if none is open)', onclick: () => { done(null); vidAddPictures([id]); } }, 'Add to film')),
           h('div', { class: 'acts' }, look('describe', 'Describe'), look('prompt', 'Prompt from picture'),
             h('button', { class: 'btn btn-sm', title: 'Attach it to your next message in the chat', onclick: async () => {
               if (pics.attached.length >= 4) return toast('Four pictures to a message.');
@@ -4279,6 +4280,649 @@ PROMPT_NOTES.push(() => (artOn() ? 'PICTURE PROMPTS: the prompt decides the pict
 CHIP_EXTRAS.push((t) => { const names = t.name === 'image_generate' && !t.failed ? /^made \d+ pictures with [^:]*: (.+?) \(/.exec(String(t.result ?? ''))?.[1] : null; return names ? thumbs(names.split(', ')) : null; });
 SLASH.imagine = artImagine;
 PREVIEW_PASSES.push(artInline);
+
+/* ============================================================ video: films made of pictures, with a voice */
+
+/* A film here is a list of SHOTS. A shot is one picture, or several made one from the last (frame by frame), shown
+   for as long as its narration takes or as long as it is given, with a camera move over it and a cut or a fade
+   into the next. The pictures come from the account's image models through the harness (or are pictures the user
+   already has); the narration is spoken by the account's speech models; music is a sound file of the user's own.
+   Everything is put together HERE, in the browser: the player draws the film on a canvas as it plays, and the
+   export records that canvas and its sound into one video file. Nothing sets a length: a film has as many shots
+   as it is given, and each call for a picture or a line of speech is one model call of the harness's daily
+   limit, which is the owner's own to raise. Projects, pictures and sound are kept in this browser. */
+
+const voiceOn = () => imageOn() && Number(S.status.version) >= 16;
+const MOTIONS = {   // a camera move: scale and offset (in parts of the frame) at the start and at the end
+  'still': [1, 0, 0, 1, 0, 0], 'zoom in': [1, 0, 0, 1.16, 0, 0], 'zoom out': [1.16, 0, 0, 1, 0, 0],
+  'pan left': [1.16, 0.07, 0, 1.16, -0.07, 0], 'pan right': [1.16, -0.07, 0, 1.16, 0.07, 0],
+  'pan up': [1.16, 0, 0.07, 1.16, 0, -0.07], 'pan down': [1.16, 0, -0.07, 1.16, 0, 0.07],
+};
+const CUTS = ['cut', 'fade', 'dissolve'];
+const VID_SIDES = [480, 720, 1080, 1440, 2160];   // the short side of an exported film, in pixels
+const SAY_CHARS = 900;        // a narration longer than this is spoken in parts
+const WRITE_BATCH = 10;       // shots one call to the chat's model writes
+
+const vid = {
+  ready: false,
+  list: [],            // [{id, title, at, shots}] newest first
+  cur: null,           // the open project
+  voices: [],          // the account's speech models, from the harness's catalog
+  run: null,           // the work in flight: {abort, done, of, what}
+  note: '',
+  play: null,          // the player while it plays: {t0, from, sources, raf}
+  at: 0,               // where the player stands, in seconds
+  imgs: new Map(),     // picture id -> a decoded image
+  sound: new Map(),    // sound id -> a decoded AudioBuffer
+  ctx: null,           // one AudioContext
+  rec: null,           // the export in flight: {recorder, abort}
+};
+const vidId = (p) => p + Date.now().toString(36) + Math.random().toString(36).slice(2, 5);
+const newShot = (o = {}) => ({ id: vidId('s'), prompt: '', say: '', secs: 4, motion: 'zoom in', cut: 'dissolve', frames: 1, pics: [], voice: [], voiceSecs: 0, voiceFor: '', ...o });
+const newFilm = (o = {}) => ({ id: vidId('v'), title: 'Untitled film', at: Date.now(), ratio: '16:9', size: 'M', side: 720, fps: 30, model: '', look: '', negative: '', keep: true, captions: true, voiceModel: '', speaker: '', lang: '', music: '', musicVol: 0.25, shots: [], ...o });
+
+async function vidOpen() {
+  if (!vid.ready) {
+    vid.ready = true;
+    vid.list = (await db.get('vids')) ?? [];
+    const last = ls.get('veilweb.video');
+    if (last && vid.list.some((x) => x.id === last)) vid.cur = (await db.get('vid:' + last)) ?? null;
+  }
+  await artLoad();
+  if (voiceOn() && !vid.voices.length) {
+    try { vid.voices = (await harnessJson('/v1/image/models')).voices ?? []; } catch {}
+  }
+  if (S.tab === 'video') drawSide();
+}
+let vidTimer = null;
+function vidSave(now) {
+  const p = vid.cur;
+  if (!p) return;
+  const put = async () => {
+    p.at = Date.now();
+    await db.put('vid:' + p.id, p);
+    vid.list = [{ id: p.id, title: p.title, at: p.at, shots: p.shots.length }, ...vid.list.filter((x) => x.id !== p.id)];
+    await db.put('vids', vid.list);
+    ls.set('veilweb.video', p.id);
+  };
+  clearTimeout(vidTimer);
+  if (now) return put();
+  vidTimer = setTimeout(put, 500);
+}
+async function vidPick(id) {
+  vidStop();
+  vid.cur = id ? (await db.get('vid:' + id)) ?? null : null;
+  vid.at = 0;
+  if (vid.cur) ls.set('veilweb.video', id);
+  drawSide();
+}
+
+/* ---- time: how long each shot runs, and where each starts ---- */
+const shotSecs = (s) => Math.max(0.5, Number(s.secs) || 0, s.voiceSecs ? s.voiceSecs + 0.6 : 0);
+function vidTimes(p) {
+  const starts = [];
+  let t = 0;
+  for (const s of p.shots) { starts.push(t); t += shotSecs(s); }
+  return { starts, total: t };
+}
+const clock = (t) => `${Math.floor(t / 60)}:${String(Math.floor(t % 60)).padStart(2, '0')}`;
+function vidSize(p) {
+  const r = RATIOS.find((x) => x[0] === p.ratio) ?? RATIOS.find((x) => x[0] === '16:9');
+  const even = (n) => Math.max(2, Math.round(n / 2) * 2);
+  return r[1] >= r[2] ? [even(p.side * r[1] / r[2]), even(p.side)] : [even(p.side), even(p.side * r[2] / r[1])];
+}
+
+/* ---- the storyboard: the chat's model writes the shots, ten at a time, for as many as are asked for ---- */
+function readShots(reply) {
+  const a = reply.indexOf('['), b = reply.lastIndexOf(']');
+  if (a < 0 || b <= a) return [];
+  let list;
+  try { list = JSON.parse(reply.slice(a, b + 1)); } catch { return []; }
+  return (Array.isArray(list) ? list : []).map((x) => ({
+    prompt: clip(String(x?.prompt ?? x?.picture ?? x?.image ?? '').trim(), 1500),
+    say: clip(String(x?.say ?? x?.narration ?? x?.voice ?? '').trim(), 1200),
+    secs: Math.max(1, Math.min(60, Number(x?.secs ?? x?.seconds) || 4)),
+    motion: MOTIONS[String(x?.motion ?? '').toLowerCase().replace(/[-_]/g, ' ')] ? String(x.motion).toLowerCase().replace(/[-_]/g, ' ') : Object.keys(MOTIONS)[1 + Math.floor(Math.random() * 6)],
+  })).filter((x) => x.prompt);
+}
+async function vidWrite(idea, count, signal, onProgress) {
+  const out = [];
+  while (out.length < count) {
+    const want = Math.min(WRITE_BATCH, count - out.length);
+    const sys = 'You write the storyboard of a short film that will be made of still pictures from a text-to-image model, with a narrator speaking over them. Reply with ONE JSON array and nothing else. Each item is one shot: {"prompt": "<the picture, described for an image model: subject, action, setting, composition and camera, light, colours, style; complete in itself, never referring to another shot>", "say": "<what the narrator says over this shot: one or two spoken sentences, or \\"\\" for a silent shot>", "secs": <seconds for a silent shot, 3 to 8>, "motion": "<one of: ' + Object.keys(MOTIONS).join(', ') + '>"}. Keep the same characters, places and visual style from shot to shot by describing them the same way each time. The narration, read in order, tells the whole story.';
+    const user = `THE FILM: ${idea}\n\n` + (out.length ? `SHOTS WRITTEN SO FAR (${out.length} of ${count}):\n${out.slice(-6).map((s, i) => `${out.length - Math.min(6, out.length) + i + 1}. ${clip(s.prompt, 160)} | narrator: ${clip(s.say, 120)}`).join('\n')}\n\nWrite the next ${want} shots, carrying the story on${out.length + want >= count ? ' to its end' : ''}.` : `Write ${count <= WRITE_BATCH ? 'all ' + want : 'the first ' + want + ' of ' + count} shots${count <= WRITE_BATCH ? ', from the opening to the end' : ''}.`);
+    const got = readShots(await callModel([{ role: 'system', content: sys }, { role: 'user', content: user }], null, signal, 4000));
+    if (!got.length) { if (out.length) break; throw new Error('the model did not answer with a list of shots; try again, or another model from the picker'); }
+    out.push(...got.slice(0, want));
+    onProgress?.(out.length);
+  }
+  return out;
+}
+
+/* ---- making: the pictures of every shot that lacks them, then the voice of every line that lacks it ---- */
+function vidTodo(p) {
+  let pics = 0, lines = 0;
+  for (const s of p.shots) {
+    const have = s.pics.filter(artRow).length;
+    if (s.prompt.trim() || have) pics += Math.max(0, Math.max(1, Number(s.frames) || 1) - have);
+    if (s.say.trim() && (s.voiceFor !== vidVoiceKey(p, s) || !s.voice.length)) lines++;
+  }
+  return { pics, lines };
+}
+const vidVoiceKey = (p, s) => [s.say.trim(), p.voiceModel, p.speaker, p.lang].join('\u0001');
+const sayParts = (text) => {
+  const out = [];
+  let cur = '';
+  for (const piece of text.trim().split(/(?<=[.!?…])\s+/)) {
+    if (cur && (cur + ' ' + piece).length > SAY_CHARS) { out.push(cur); cur = piece; } else cur = cur ? cur + ' ' + piece : piece;
+    while (cur.length > SAY_CHARS) { out.push(cur.slice(0, SAY_CHARS)); cur = cur.slice(SAY_CHARS); }
+  }
+  if (cur) out.push(cur);
+  return out;
+};
+async function soundSecs(id) { return (await vidSound(id)).duration; }
+
+async function vidMake(only) {
+  const p = vid.cur;
+  if (!p || vid.run) return;
+  const todo = vidTodo(p);
+  const abort = new AbortController();
+  vid.run = { abort, done: 0, of: todo.pics + (voiceOn() ? todo.lines : 0), what: 'starting…' };
+  vid.note = '';
+  vidRefresh();
+  try {
+    const model = artListed(p.model) || 'auto';
+    const anchor = () => p.shots.map((s) => s.pics.find(artRow)).find(Boolean) ?? '';
+    for (const s of p.shots) {
+      if (only && s.id !== only) continue;
+      s.pics = s.pics.filter(artRow);
+      const want = Math.max(1, Number(s.frames) || 1);
+      if (!s.prompt.trim() && !s.pics.length) continue;
+      while (s.pics.length < want) {
+        const k = s.pics.length;
+        const from = k > 0 ? s.pics[k - 1] : '';   // a further frame is made from the one before it
+        const look = p.keep && !from ? anchor() : '';   // a first frame may take after the film's first picture
+        const kind = from || look ? 'edit' : 'make';
+        const able = model !== 'auto' || kind === 'make' || !!art.picks.edit;
+        const spec = specOf(model, able ? kind : 'make');
+        const d = artDims(spec, { ratio: p.ratio, size: p.size });
+        const words = [s.prompt.trim() || artRow(s.pics[0])?.prompt || 'the same scene', p.look.trim()].filter(Boolean).join(', ');
+        vid.run.what = `painting shot ${p.shots.indexOf(s) + 1}${want > 1 ? `, frame ${k + 1} of ${want}` : ''}…`;
+        vidRefresh();
+        const row = await artMake({ model, prompt: from ? `${words}. The next moment of the same shot: the same subjects, place and framing, a little further on in the action` : words, negative: p.negative, w: d?.w, h: d?.h,
+          init: able && from ? from : '', refs: able && look && look !== from ? [look] : [], strength: 0.45, kind: 'frame', batch: p.id, conv: '' }, abort.signal);
+        s.pics.push(row.id);
+        vid.run.done++;
+        await vidSave(true);
+        vidRefresh();
+      }
+    }
+    if (voiceOn()) for (const s of p.shots) {
+      if (only && s.id !== only) continue;
+      const text = s.say.trim();
+      if (!text) { if (s.voice.length) { s.voice = []; s.voiceSecs = 0; s.voiceFor = ''; } continue; }
+      if (s.voiceFor === vidVoiceKey(p, s) && s.voice.length) continue;
+      vid.run.what = `voicing shot ${p.shots.indexOf(s) + 1}…`;
+      vidRefresh();
+      const ids = [];
+      let secs = 0;
+      for (const part of sayParts(text)) {
+        const j = await harnessJson('/v1/speak', { body: { model: p.voiceModel || 'auto', text: part, voice: p.speaker, lang: p.lang || String(navigator.language || 'en').slice(0, 2) }, signal: abort.signal });
+        const id = vidId('a');
+        await db.put('aud:' + id, { blob: b64Blob(j.audio, j.type) });
+        secs += await soundSecs(id);
+        ids.push(id);
+      }
+      for (const old of s.voice) { db.del('aud:' + old); vid.sound.delete(old); }
+      Object.assign(s, { voice: ids, voiceSecs: Math.round(secs * 100) / 100, voiceFor: vidVoiceKey(p, s) });
+      vid.run.done++;
+      await vidSave(true);
+      vidRefresh();
+    }
+  } catch (e) {
+    vid.note = abort.signal.aborted ? 'Stopped. What was made is kept; Generate carries on from here.' : e.message;
+  }
+  vid.run = null;
+  await vidSave(true);
+  artRefresh();
+  if (S.tab === 'video') drawSide();
+  refreshStatus();
+}
+
+/* ---- pictures and sound, decoded once ---- */
+async function vidImg(id) {
+  if (!vid.imgs.has(id)) vid.imgs.set(id, await loadImg(await artUrl(id)));
+  return vid.imgs.get(id);
+}
+function vidCtx() {
+  vid.ctx ??= new (window.AudioContext || window.webkitAudioContext)();
+  return vid.ctx;
+}
+async function vidSound(id) {
+  if (!vid.sound.has(id)) {
+    const kept = await db.get('aud:' + id);
+    if (!kept?.blob) throw new Error('a sound of this film is not kept in this browser');
+    vid.sound.set(id, await vidCtx().decodeAudioData(await kept.blob.arrayBuffer()));
+  }
+  return vid.sound.get(id);
+}
+async function vidLoad(p) {
+  for (const s of p.shots) for (const id of s.pics.filter(artRow)) await vidImg(id);
+  for (const s of p.shots) for (const id of s.voice) await vidSound(id).catch(() => {});
+  if (p.music) await vidSound(p.music).catch(() => { p.music = ''; });
+}
+
+/* ---- drawing the film at one moment ---- */
+function drawShot(g, W, H, s, u, alpha) {
+  const pics = s.pics.map((id) => vid.imgs.get(id)).filter(Boolean);
+  if (!pics.length) return;
+  const m = MOTIONS[s.motion] ?? MOTIONS.still;
+  const e = u * u * (3 - 2 * u);   // the move eases in and out
+  const scale = m[0] + (m[3] - m[0]) * e, dx = m[1] + (m[4] - m[1]) * e, dy = m[2] + (m[5] - m[2]) * e;
+  const put = (img, a) => {
+    const k = Math.max(W / img.naturalWidth, H / img.naturalHeight) * scale;
+    const w = img.naturalWidth * k, hh = img.naturalHeight * k;
+    g.globalAlpha = a;
+    g.drawImage(img, (W - w) / 2 + dx * W, (H - hh) / 2 + dy * H, w, hh);
+  };
+  // several frames: each has its turn, and melts into the next over the last part of it
+  const pos = Math.min(pics.length - 1e-6, u * pics.length);
+  const k = Math.floor(pos), into = pos - k;
+  put(pics[k], alpha);
+  if (k + 1 < pics.length && into > 0.55) put(pics[k + 1], alpha * (into - 0.55) / 0.45);
+  g.globalAlpha = 1;
+}
+function drawCaption(g, W, H, text) {
+  const size = Math.max(14, Math.round(H * 0.045));
+  g.font = `600 ${size}px system-ui, -apple-system, "Segoe UI", sans-serif`;
+  g.textAlign = 'center'; g.textBaseline = 'bottom';
+  const lines = [];
+  let cur = '';
+  for (const word of text.split(/\s+/)) {
+    if (cur && g.measureText(cur + ' ' + word).width > W * 0.84) { lines.push(cur); cur = word; } else cur = cur ? cur + ' ' + word : word;
+  }
+  if (cur) lines.push(cur);
+  const shown = lines.slice(-3);
+  g.lineJoin = 'round'; g.lineWidth = Math.max(3, size / 5); g.strokeStyle = 'rgba(0,0,0,.85)'; g.fillStyle = '#fff';
+  shown.forEach((line, i) => { const y = H - H * 0.06 - (shown.length - 1 - i) * size * 1.25; g.strokeText(line, W / 2, y); g.fillText(line, W / 2, y); });
+}
+function vidDraw(g, W, H, p, t) {
+  const { starts, total } = vidTimes(p);
+  g.globalAlpha = 1; g.fillStyle = '#000'; g.fillRect(0, 0, W, H);
+  if (!p.shots.length) return;
+  t = Math.max(0, Math.min(total - 1e-3, t));
+  let i = starts.length - 1;
+  while (i > 0 && starts[i] > t) i--;
+  const s = p.shots[i], len = shotSecs(s), into = t - starts[i];
+  const turn = Math.min(0.7, len / 3);
+  if (i > 0 && s.cut === 'dissolve' && into < turn) { drawShot(g, W, H, p.shots[i - 1], 1, 1); drawShot(g, W, H, s, into / len, into / turn); }
+  else drawShot(g, W, H, s, into / len, 1);
+  // a fade goes through black: out at the end of the shot before a faded one, in at the start of it
+  const next = p.shots[i + 1];
+  let dark = 0;
+  if (s.cut === 'fade' && into < turn) dark = 1 - into / turn;
+  if (next?.cut === 'fade' && len - into < turn) dark = Math.max(dark, 1 - (len - into) / turn);
+  if (i === 0 && into < 0.4) dark = Math.max(dark, 1 - into / 0.4);
+  if (i === p.shots.length - 1 && len - into < 0.6) dark = Math.max(dark, 1 - (len - into) / 0.6);
+  if (dark > 0) { g.globalAlpha = dark; g.fillStyle = '#000'; g.fillRect(0, 0, W, H); g.globalAlpha = 1; }
+  if (p.captions && s.say.trim() && dark < 0.6) drawCaption(g, W, H, s.say.trim());
+}
+
+/* ---- sound: every line at its shot's start, the music under them and quieter while someone speaks ---- */
+function vidAudio(p, out, t0, from) {
+  const ctx = vidCtx();
+  const { starts, total } = vidTimes(p);
+  const sources = [];
+  const music = p.music && vid.sound.get(p.music) ? ctx.createGain() : null;
+  if (music) {
+    music.gain.value = p.musicVol;
+    music.connect(out);
+    const src = ctx.createBufferSource();
+    src.buffer = vid.sound.get(p.music); src.loop = true;
+    src.connect(music);
+    src.start(t0, from % src.buffer.duration);
+    src.stop(t0 + (total - from));
+    music.gain.setValueAtTime(p.musicVol, t0 + Math.max(0, total - from - 1.2));
+    music.gain.linearRampToValueAtTime(0, t0 + (total - from));
+    sources.push(src);
+  }
+  p.shots.forEach((s, i) => {
+    let at = starts[i] + 0.25;
+    for (const id of s.voice) {
+      const buf = vid.sound.get(id);
+      if (!buf) continue;
+      const end = at + buf.duration;
+      if (end > from) {
+        const src = ctx.createBufferSource();
+        src.buffer = buf;
+        src.connect(out);
+        const skip = Math.max(0, from - at);
+        src.start(t0 + Math.max(0, at - from), skip);
+        sources.push(src);
+        if (music) {
+          const a = t0 + Math.max(0, at - from), b = t0 + (end - from);
+          music.gain.setTargetAtTime(p.musicVol * 0.35, a, 0.15);
+          music.gain.setTargetAtTime(p.musicVol, b, 0.3);
+        }
+      }
+      at = end;
+    }
+  });
+  return sources;
+}
+
+/* ---- the player ---- */
+function vidStop() {
+  if (!vid.play) return;
+  clearTimeout(vid.play.raf);
+  for (const src of vid.play.sources) { try { src.stop(); } catch {} }
+  vid.play = null;
+  vidRefresh();
+}
+function vidPaint() {
+  const c = document.getElementById('vidCanvas'), p = vid.cur;
+  if (c && p) vidDraw(c.getContext('2d'), c.width, c.height, p, !vid.play && vid.at < 0.4 ? 0.4 : vid.at);   // at rest at the very start, past the fade from black
+  const seek = document.getElementById('vidSeek'), now = document.getElementById('vidNow');
+  if (seek && document.activeElement !== seek) seek.value = String(vid.at);
+  if (now && p) now.textContent = `${clock(vid.at)} / ${clock(vidTimes(p).total)}`;
+}
+async function vidPlay() {
+  const p = vid.cur;
+  if (!p || vid.play) return vidStop();
+  try { await vidLoad(p); } catch (e) { return toast(e.message); }
+  const ctx = vidCtx();
+  await ctx.resume();
+  const { total } = vidTimes(p);
+  if (vid.at >= total - 0.05) vid.at = 0;
+  const from = vid.at, t0 = ctx.currentTime + 0.05;
+  const tick = () => {
+    if (!vid.play) return;
+    vid.at = from + Math.max(0, ctx.currentTime - t0);
+    if (vid.at >= total) { vid.at = total; vidPaint(); return vidStop(); }
+    vidPaint();
+    vid.play.raf = setTimeout(tick, 1000 / 30);   // a timer: it keeps time when the pane is not being painted
+  };
+  vid.play = { sources: vidAudio(p, ctx.destination, t0, from), raf: setTimeout(tick, 1000 / 30) };
+  vidRefresh();
+}
+
+/* ---- export: the canvas and its sound recorded into one file, at the film's own pace ---- */
+function recType() {
+  const kinds = ['video/mp4;codecs=avc1.640028,mp4a.40.2', 'video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm', 'video/mp4'];
+  return typeof MediaRecorder === 'undefined' ? '' : kinds.find((k) => MediaRecorder.isTypeSupported(k)) ?? '';
+}
+async function vidExport() {
+  const p = vid.cur;
+  if (!p || vid.rec) return;
+  const type = recType();
+  if (!type) return toast('This browser cannot record video. The film\'s pictures and sound can still be downloaded as files.');
+  vidStop();
+  try { await vidLoad(p); } catch (e) { return toast(e.message); }
+  const [W, H] = vidSize(p);
+  const c = document.createElement('canvas');
+  c.width = W; c.height = H;
+  const g = c.getContext('2d');
+  const ctx = vidCtx();
+  await ctx.resume();
+  const dest = ctx.createMediaStreamDestination();
+  const stream = new MediaStream([...c.captureStream(p.fps).getVideoTracks(), ...dest.stream.getAudioTracks()]);
+  const recorder = new MediaRecorder(stream, { mimeType: type, videoBitsPerSecond: Math.round(W * H * p.fps * 0.14) });
+  const chunks = [];
+  recorder.ondataavailable = (e) => { if (e.data.size) chunks.push(e.data); };
+  const { total } = vidTimes(p);
+  const abort = new AbortController();
+  vid.rec = { abort, at: 0, total };
+  vidRefresh();
+  const done = new Promise((res) => { recorder.onstop = res; });
+  vidDraw(g, W, H, p, 0);
+  recorder.start(1000);
+  const t0 = ctx.currentTime + 0.1;
+  const sources = vidAudio(p, dest, t0, 0);
+  await new Promise((res) => {
+    // a timer, not animation frames: it keeps going (slower) when the tab is not in front
+    const step = setInterval(() => {
+      const t = ctx.currentTime - t0;
+      vid.rec.at = Math.max(0, t);
+      vidDraw(g, W, H, p, Math.max(0, t));
+      const bar = document.getElementById('vidRec');
+      if (bar) bar.textContent = `Recording ${clock(Math.max(0, t))} of ${clock(total)}… keep this tab in front`;
+      if (t >= total + 0.15 || abort.signal.aborted) { clearInterval(step); res(); }
+    }, 1000 / p.fps);
+  });
+  for (const src of sources) { try { src.stop(); } catch {} }
+  recorder.stop();
+  await done;
+  const stopped = abort.signal.aborted;
+  vid.rec = null;
+  if (!stopped) saveBlob(`${fileStem(p.title)}.${type.startsWith('video/mp4') ? 'mp4' : 'webm'}`, new Blob(chunks, { type: type.split(';')[0] }));
+  if (S.tab === 'video') drawSide();
+}
+const fileStem = (title) => String(title).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 50) || 'film';
+
+/* The film as files, for an editor elsewhere: every frame, every spoken line, the captions and the storyboard. */
+async function vidFiles() {
+  const p = vid.cur;
+  if (!p) return;
+  const files = [];
+  const { starts } = vidTimes(p);
+  const stamp = (t) => { const ms = Math.round(t * 1000); const pad = (n, w = 2) => String(n).padStart(w, '0'); return `${pad(Math.floor(ms / 3600000))}:${pad(Math.floor(ms / 60000) % 60)}:${pad(Math.floor(ms / 1000) % 60)},${pad(ms % 1000, 3)}`; };
+  let srt = '', n = 0;
+  for (const [i, s] of p.shots.entries()) {
+    const num = String(i + 1).padStart(3, '0');
+    for (const [k, id] of s.pics.filter(artRow).entries()) { const b = await artBlob(id); files.push({ name: `frames/shot-${num}-${String(k + 1).padStart(2, '0')}.${b.type.split('/')[1].replace('jpeg', 'jpg')}`, u8: new Uint8Array(await b.arrayBuffer()) }); }
+    for (const [k, id] of s.voice.entries()) { const kept = await db.get('aud:' + id); if (kept?.blob) files.push({ name: `voice/shot-${num}${s.voice.length > 1 ? '-' + (k + 1) : ''}.${kept.blob.type.includes('wav') ? 'wav' : kept.blob.type.includes('ogg') ? 'ogg' : 'mp3'}`, u8: new Uint8Array(await kept.blob.arrayBuffer()) }); }
+    if (s.say.trim()) srt += `${++n}\n${stamp(starts[i] + 0.25)} --> ${stamp(starts[i] + shotSecs(s) - 0.1)}\n${s.say.trim()}\n\n`;
+  }
+  const enc = new TextEncoder();
+  if (srt) files.push({ name: 'captions.srt', u8: enc.encode(srt) });
+  files.push({ name: 'storyboard.json', u8: enc.encode(JSON.stringify({ title: p.title, ratio: p.ratio, fps: p.fps, look: p.look, shots: p.shots.map((s, i) => ({ n: i + 1, starts: Math.round(starts[i] * 100) / 100, seconds: Math.round(shotSecs(s) * 100) / 100, prompt: s.prompt, say: s.say, motion: s.motion, cut: s.cut, frames: s.pics.length })) }, null, 2)) });
+  saveBlob(`${fileStem(p.title)}-files.zip`, zipStore(files));
+}
+
+/* ---- pictures the user already has, as shots ---- */
+function vidAddPictures(ids) {
+  const p = vid.cur ?? (vid.cur = newFilm());
+  for (const id of ids) { const r = artRow(id); if (r) p.shots.push(newShot({ prompt: r.prompt || '', pics: [id] })); }
+  vidSave(true);
+  S.tab = 'video'; S.panes.side = true;
+  draw();
+}
+function vidFromGallery() {
+  if (!art.list.length) return toast('The gallery is empty. Add pictures from your computer, or make some in the Images tab.');
+  const picked = new Set();
+  artDialog('art-pick', (done) => {
+    const grid = h('div', { class: 'art-grid' });
+    const paint = () => grid.replaceChildren(...art.list.map((r) => h('button', { class: 'art-cell' + (picked.has(r.id) ? ' picked' : ''), title: r.prompt ? clip(r.prompt, 160) : r.kind, onclick: () => { if (picked.has(r.id)) picked.delete(r.id); else picked.add(r.id); paint(); } }, h('img', { src: r.thumb, alt: clip(r.prompt || r.kind, 80), loading: 'lazy' }))));
+    paint();
+    return [h('p', {}, 'Choose the pictures, in the order they should play. Each becomes a shot.'), grid,
+      h('div', { class: 'ask-acts' }, h('button', { class: 'btn btn-ghost btn-sm', onclick: () => done(null) }, 'Cancel'), h('button', { class: 'btn btn-solid btn-sm', onclick: () => done([...picked]) }, 'Add to the film'))];
+  }).then((ids) => { if (ids?.length) vidAddPictures(ids); });
+}
+
+/* ---- the Video tab ---- */
+function vidStatus() {
+  const p = vid.cur;
+  if (!p) return '';
+  const todo = vidTodo(p), { total } = vidTimes(p);
+  const bits = [`${p.shots.length} shot${p.shots.length === 1 ? '' : 's'}`, clock(total)];
+  if (vid.run) bits.push(`${vid.run.what} (${vid.run.done} of ${vid.run.of})`);
+  else {
+    if (todo.pics) bits.push(`${todo.pics} picture${todo.pics === 1 ? '' : 's'} to make`);
+    if (todo.lines) bits.push(voiceOn() ? `${todo.lines} line${todo.lines === 1 ? '' : 's'} to voice` : `${todo.lines} line${todo.lines === 1 ? '' : 's'} with no voice yet (the voice needs a newer harness)`);
+  }
+  return bits.join(' · ');
+}
+function shotPics(s) {
+  const have = s.pics.filter(artRow);
+  return h('div', { class: 'vid-pics', id: 'vp-' + s.id }, have.length ? have.map((id) => artThumb(id)) : h('div', { class: 'vid-blank' }, s.prompt.trim() ? 'not made yet' : 'no picture'));
+}
+/* What changes while work goes on, redrawn where it is: nothing being typed is disturbed. */
+function vidRefresh() {
+  if (S.tab !== 'video') return;
+  const p = vid.cur;
+  const st = document.getElementById('vidStatus');
+  if (!p || !st) return drawSide();
+  st.textContent = vidStatus();
+  const note = document.getElementById('vidNote');
+  if (note) note.textContent = vid.note;
+  for (const s of p.shots) document.getElementById('vp-' + s.id)?.replaceWith(shotPics(s));
+  const acts = document.getElementById('vidActs');
+  if (acts) acts.replaceWith(vidActs());
+  vidPaint();
+}
+function vidActs() {
+  const p = vid.cur, todo = vidTodo(p);
+  const work = todo.pics + (voiceOn() ? todo.lines : 0);
+  return h('div', { class: 'acts', id: 'vidActs' },
+    h('button', { class: 'btn btn-sm', disabled: !p.shots.length || !!vid.rec, onclick: () => vidPlay() }, vid.play ? 'Pause' : 'Play'),
+    vid.run ? h('button', { class: 'btn btn-sm btn-danger', onclick: () => vid.run.abort.abort() }, 'Stop')
+      : h('button', { class: 'btn btn-sm btn-solid', disabled: !work || !!vid.rec, title: 'Makes every picture and every spoken line the film still lacks. Each is one model call of your harness\'s daily limit.', onclick: () => vidMake() }, work ? `Generate (${work})` : 'All made'),
+    vid.rec ? h('button', { class: 'btn btn-sm btn-danger', onclick: () => vid.rec.abort.abort() }, 'Stop recording')
+      : h('button', { class: 'btn btn-sm', disabled: !p.shots.some((s) => s.pics.some(artRow)) || !!vid.run, title: 'Records the film into one video file, at the film\'s own pace: a three-minute film takes three minutes', onclick: () => vidExport() }, 'Export video'),
+    h('button', { class: 'btn btn-ghost btn-sm', disabled: !p.shots.length, title: 'Every frame, every spoken line, the captions (.srt) and the storyboard, as one .zip', onclick: () => vidFiles().catch((e) => toast(e.message)) }, 'Files (.zip)'),
+    vid.rec ? h('span', { class: 'fine', id: 'vidRec' }, 'Recording…') : null);
+}
+
+function shotCard(p, s, i) {
+  const set = (k, v, redraw) => { s[k] = v; vidSave(); if (redraw) drawSide(); else { const st = document.getElementById('vidStatus'); if (st) st.textContent = vidStatus(); } };
+  const move = (by) => { const j = i + by; if (j < 0 || j >= p.shots.length) return; p.shots.splice(j, 0, p.shots.splice(i, 1)[0]); vidSave(); drawSide(); };
+  const pick = () => { const inp = h('input', { type: 'file', accept: 'image/*', multiple: '', onchange: async () => { for (const f of inp.files) { try { s.pics.push((await artTake(f)).id); } catch (e) { toast(e.message); } } if (s.pics.length > s.frames) s.frames = s.pics.length; vidSave(); drawSide(); } }); inp.click(); };
+  return h('div', { class: 'vid-shot' },
+    h('div', { class: 'vid-shot-top' }, h('strong', {}, `Shot ${i + 1}`), h('span', { class: 'fine' }, clock(vidTimes(p).starts[i]) + ' · ' + shotSecs(s).toFixed(1) + ' s'), h('span', { class: 'grow' }),
+      h('button', { class: 'btn btn-ghost btn-sm', 'aria-label': 'Move the shot up', disabled: i === 0, onclick: () => move(-1) }, '↑'),
+      h('button', { class: 'btn btn-ghost btn-sm', 'aria-label': 'Move the shot down', disabled: i === p.shots.length - 1, onclick: () => move(1) }, '↓'),
+      h('button', { class: 'btn btn-ghost btn-sm', title: 'Throw this shot\'s pictures away and make them again', disabled: !!vid.run || !s.prompt.trim(), onclick: () => { s.pics = []; vidSave(); vidMake(s.id); } }, 'Repaint'),
+      h('button', { class: 'btn btn-ghost btn-sm', title: 'Use pictures from your computer for this shot', onclick: pick }, 'Picture…'),
+      h('button', { class: 'btn btn-ghost btn-sm', 'aria-label': 'Delete the shot', onclick: () => { p.shots.splice(i, 1); vidSave(); drawSide(); } }, '✕')),
+    h('div', { class: 'vid-shot-body' }, shotPics(s),
+      h('div', { class: 'vid-shot-text' },
+        h('textarea', { id: 'vs-' + s.id + '-p', rows: '2', placeholder: 'The picture: what this shot shows', 'aria-label': `Shot ${i + 1}: the picture`, value: s.prompt, oninput: (e) => set('prompt', e.target.value) }),
+        h('textarea', { id: 'vs-' + s.id + '-s', rows: '2', placeholder: 'The narrator says… (leave empty for a silent shot)', 'aria-label': `Shot ${i + 1}: the narration`, value: s.say, oninput: (e) => set('say', e.target.value) }),
+        h('div', { class: 'vid-shot-row' },
+          h('label', {}, 'Seconds', h('input', { id: 'vs-' + s.id + '-t', type: 'number', min: '0.5', step: '0.5', value: String(s.secs), title: 'How long the shot runs. A spoken line longer than this makes it longer.', onchange: (e) => set('secs', Math.max(0.5, Number(e.target.value) || 4), true) })),
+          h('label', {}, 'Frames', h('input', { id: 'vs-' + s.id + '-f', type: 'number', min: '1', step: '1', value: String(s.frames), title: 'More than one: each further frame is made from the one before it, so the shot moves', onchange: (e) => set('frames', Math.max(1, Math.floor(Number(e.target.value)) || 1), true) })),
+          h('label', {}, 'Camera', h('select', { id: 'vs-' + s.id + '-m', onchange: (e) => set('motion', e.target.value) }, Object.keys(MOTIONS).map((m) => h('option', { value: m, selected: m === s.motion }, m)))),
+          h('label', {}, 'Comes in by', h('select', { id: 'vs-' + s.id + '-c', onchange: (e) => set('cut', e.target.value) }, CUTS.map((c) => h('option', { value: c, selected: c === s.cut }, c))))))));
+}
+
+function videoTab() {
+  if (!artOn()) return [h('div', { class: 'block' }, h('h3', {}, 'Video'), h('p', {}, 'Making films needs a newer harness. Update it in the Harness tab, then come back.'))];
+  if (!vid.ready) vidOpen();
+  const p = vid.cur;
+  const start = async (film) => { vidStop(); vid.cur = film; vid.at = 0; await vidSave(true); drawSide(); };
+  const idea = h('textarea', { id: 'vidIdea', rows: '3', placeholder: 'What is the film? "A two-minute documentary about a lighthouse keeper\'s last night on the job, painted like an old storybook."', 'aria-label': 'The film\'s idea' });
+  const count = h('input', { id: 'vidCount', type: 'number', min: '1', step: '1', value: '8', 'aria-label': 'Shots', title: 'As many as the film needs: there is no limit here. Each shot is at least one picture.' });
+  const write = async () => {
+    const text = idea.value.trim();
+    if (text.length < 8) return toast('Say what the film is first.');
+    if (S.live) return toast('The chat is busy: wait for its answer, then write the storyboard.');
+    const n = Math.max(1, Math.floor(Number(count.value)) || 8);
+    const abort = new AbortController();
+    vid.run = { abort, done: 0, of: n, what: 'writing the storyboard…' };
+    vid.note = '';
+    const film = p && !p.shots.length ? p : newFilm();
+    film.title = clip(text.replace(/\s+/g, ' '), 60);
+    vid.cur = film;
+    drawSide();
+    try {
+      const shots = await vidWrite(text, n, abort.signal, (k) => { vid.run.done = k; vidRefresh(); });
+      film.shots.push(...shots.map((x) => newShot(x)));
+      idea.value = '';
+    } catch (e) { vid.note = abort.signal.aborted ? 'Stopped.' : e.message; }
+    vid.run = null;
+    await vidSave(true);
+    drawSide();
+  };
+  const head = h('div', { class: 'block' }, h('div', { class: 'vid-bar' },
+    h('select', { id: 'vidFilm', 'aria-label': 'Film', onchange: (e) => vidPick(e.target.value) }, h('option', { value: '', selected: !p }, vid.list.length ? 'Choose a film…' : 'No film yet'), vid.list.map((x) => h('option', { value: x.id, selected: x.id === p?.id }, `${x.title} (${x.shots})`))),
+    h('button', { class: 'btn btn-sm', onclick: () => start(newFilm()) }, 'New film'),
+    p ? h('button', { class: 'btn btn-ghost btn-sm', onclick: async () => { if (!(await askSure('Delete this film? Its pictures stay in the gallery.', 'Delete'))) return; vidStop(); for (const s of p.shots) for (const id of s.voice) db.del('aud:' + id); await db.del('vid:' + p.id); vid.list = vid.list.filter((x) => x.id !== p.id); await db.put('vids', vid.list); vid.cur = null; drawSide(); } }, 'Delete') : null));
+  const writer = h('div', { class: 'block' }, h('h3', {}, p?.shots.length ? 'Write more shots' : 'Start from an idea'),
+    h('p', {}, 'The chat\'s model (' + shortModel(S.model) + ') writes the storyboard: a picture and a narrator\'s line for every shot. Or build the film by hand below, from pictures you already have.'),
+    idea, h('div', { class: 'vid-bar' }, h('label', { class: 'fine', for: 'vidCount' }, 'Shots'), count,
+      h('button', { class: 'btn btn-sm btn-solid', disabled: !!vid.run, onclick: write }, 'Write the storyboard'),
+      h('button', { class: 'btn btn-sm', title: 'Each picture you choose becomes a shot', onclick: () => { const inp = h('input', { type: 'file', accept: 'image/*', multiple: '', onchange: async () => { const ids = []; for (const f of inp.files) { try { ids.push((await artTake(f)).id); } catch (e) { toast(e.message); } } if (ids.length) vidAddPictures(ids); } }); inp.click(); } }, 'From my pictures…'),
+      h('button', { class: 'btn btn-sm', title: 'Pictures kept in the Images tab\'s gallery', onclick: vidFromGallery }, 'From the gallery…')));
+  if (!p) return [head, writer, vid.note ? h('div', { class: 'block' }, h('div', { class: 'err' }, vid.note)) : null];
+  const [W, H] = vidSize(p);
+  const { total } = vidTimes(p);
+  const setP = (k, v, redraw) => { p[k] = v; vidSave(); if (redraw) drawSide(); };
+  const canvas = h('canvas', { id: 'vidCanvas', class: 'vid-canvas', width: String(Math.round(W * 480 / Math.max(W, H))), height: String(Math.round(H * 480 / Math.max(W, H))), 'aria-label': 'The film' });
+  const voice = vid.voices.find((v) => v.id === p.voiceModel) ?? vid.voices.find((v) => v.id === (art.picks.speak ?? '')) ?? null;
+  queueMicrotask(() => vidLoad(p).then(vidPaint, vidPaint));
+  return [head,
+    h('div', { class: 'block vid-stage' },
+      h('input', { id: 'vidTitle', type: 'text', class: 'vid-title', value: p.title, 'aria-label': 'Title', autocomplete: 'off', oninput: (e) => setP('title', e.target.value) }),
+      canvas,
+      h('div', { class: 'vid-bar' }, h('input', { id: 'vidSeek', type: 'range', min: '0', max: String(Math.max(0.1, total)), step: '0.05', value: String(vid.at), 'aria-label': 'Where in the film', oninput: (e) => { const was = !!vid.play; vidStop(); vid.at = Number(e.target.value); vidPaint(); if (was) vidPlay(); } }), h('span', { class: 'fine', id: 'vidNow' }, `${clock(vid.at)} / ${clock(total)}`)),
+      vidActs(),
+      h('p', { class: 'fine', id: 'vidStatus' }, vidStatus()),
+      h('div', { class: 'err', id: 'vidNote', role: 'alert' }, vid.note)),
+    h('div', { class: 'block' }, h('details', { class: 'more', open: ui.vidMore ? '' : null, ontoggle: (e) => { ui.vidMore = e.target.open; saveUi(); } }, h('summary', {}, 'The film\'s settings'),
+      h('label', {}, 'Shape'),
+      h('div', { class: 'art-ratios', role: 'group', 'aria-label': 'Shape' }, ['16:9', '9:16', '1:1', '4:5', '4:3', '21:9'].map((r) => h('button', { class: 'art-ratio' + (p.ratio === r ? ' on' : ''), 'aria-pressed': String(p.ratio === r), onclick: () => setP('ratio', r, true) }, r))),
+      h('div', { class: 'art-fields' },
+        h('div', {}, h('label', { for: 'vidSide' }, 'Exported at'), h('select', { id: 'vidSide', onchange: (e) => setP('side', Number(e.target.value), true) }, VID_SIDES.map((n) => h('option', { value: String(n), selected: p.side === n }, n + 'p')))),
+        h('div', {}, h('label', { for: 'vidFps' }, 'Frames a second'), h('select', { id: 'vidFps', onchange: (e) => setP('fps', Number(e.target.value)) }, [24, 30, 60].map((n) => h('option', { value: String(n), selected: p.fps === n }, String(n))))),
+        h('div', {}, h('label', { for: 'vidModel' }, 'Pictures by'), h('select', { id: 'vidModel', onchange: (e) => setP('model', e.target.value === 'auto' ? '' : e.target.value) }, h('option', { value: 'auto', selected: !artListed(p.model) }, 'Auto: ' + shortModel(art.picks.make || 'none listed') + ' now'), art.models.map((m) => h('option', { value: m.id, selected: m.id === p.model }, shortModel(m.id))))),
+        h('div', {}, h('label', { for: 'vidPx' }, 'Picture size'), h('select', { id: 'vidPx', onchange: (e) => setP('size', e.target.value) }, ART_SIZES.map(([n]) => h('option', { value: n, selected: p.size === n }, n))))),
+      h('label', { for: 'vidLook' }, 'The look, added to every shot (style, palette, medium)'),
+      h('input', { id: 'vidLook', type: 'text', value: p.look, placeholder: 'storybook watercolour, muted blues and amber, soft grain', autocomplete: 'off', oninput: (e) => setP('look', e.target.value) }),
+      h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: p.keep, onchange: (e) => setP('keep', e.target.checked) }), ' Keep the look: show the film\'s first picture to the model for every later shot (when the model takes a reference)'),
+      h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: p.captions, onchange: (e) => { setP('captions', e.target.checked); vidPaint(); } }), ' Show the narration as captions'),
+      h('label', { for: 'vidVoice' }, 'Narrator'),
+      voiceOn() ? h('div', { class: 'art-fields' },
+        h('div', {}, h('select', { id: 'vidVoice', 'aria-label': 'Speech model', onchange: (e) => { p.voiceModel = e.target.value === 'auto' ? '' : e.target.value; p.speaker = ''; vidSave(); drawSide(); } }, h('option', { value: 'auto', selected: !p.voiceModel }, 'Auto: ' + shortModel(art.picks.speak || 'none listed') + ' now'), vid.voices.map((v) => h('option', { value: v.id, selected: v.id === p.voiceModel }, shortModel(v.id))))),
+        voice?.speakers.length ? h('div', {}, h('select', { id: 'vidSpeaker', 'aria-label': 'Voice', onchange: (e) => setP('speaker', e.target.value, true) }, h('option', { value: '', selected: !p.speaker }, 'Its own voice' + (voice.speaker ? ` (${voice.speaker})` : '')), voice.speakers.map((x) => h('option', { value: x, selected: x === p.speaker }, x)))) : null,
+        voice?.lang ? h('div', {}, h('input', { id: 'vidLang', type: 'text', value: p.lang, placeholder: 'language: en, fr, es…', 'aria-label': 'Language', autocomplete: 'off', oninput: (e) => setP('lang', e.target.value.trim()) })) : null)
+        : h('p', { class: 'fine' }, 'The narrator\'s voice needs a newer harness. Update it in the Harness tab.'),
+      h('label', {}, 'Music (a sound file of your own, played under the film)'),
+      h('div', { class: 'vid-bar' },
+        h('button', { class: 'btn btn-sm', onclick: () => { const inp = h('input', { type: 'file', accept: 'audio/*', onchange: async () => { const f = inp.files[0]; if (!f) return; const id = vidId('a'); await db.put('aud:' + id, { blob: f }); try { await vidSound(id); } catch { await db.del('aud:' + id); return toast('This browser could not read that sound file.'); } if (p.music) db.del('aud:' + p.music); setP('music', id, true); } }); inp.click(); } }, p.music ? 'Change the music' : 'Choose music…'),
+        p.music ? [h('input', { id: 'vidVol', type: 'range', min: '0', max: '1', step: '0.05', value: String(p.musicVol), 'aria-label': 'Music volume', onchange: (e) => setP('musicVol', Number(e.target.value)) }), h('button', { class: 'btn btn-ghost btn-sm', onclick: () => { db.del('aud:' + p.music); setP('music', '', true); } }, 'Remove')] : null))),
+    h('div', { class: 'block vid-shots' },
+      p.shots.map((s, i) => shotCard(p, s, i)),
+      h('div', { class: 'acts' }, h('button', { class: 'btn btn-sm', onclick: () => { p.shots.push(newShot()); vidSave(); drawSide(); } }, '+ Shot'))),
+    writer];
+}
+
+/* ---- the chat: a film from one call ---- */
+async function videoTool(args, signal) {
+  if (!artOn()) return 'error: this harness is older than films: update it in the Harness tab';
+  try {
+    await vidOpen();
+    const given = readShots(JSON.stringify(Array.isArray(args.shots) ? args.shots : []));
+    if (!given.length) return 'error: video_make needs shots: [{"prompt": "<the picture>", "say": "<the narrator\'s line>", "seconds": 4}, …]';
+    if (vid.run) return 'error: a film is being made already; wait for it or stop it in the Video tab';
+    const film = newFilm({ title: clip(String(args.title ?? 'Film').trim(), 60) || 'Film', ratio: ['16:9', '9:16', '1:1', '4:5', '4:3', '21:9'].includes(args.aspect) ? args.aspect : '16:9', look: clip(String(args.look ?? '').trim(), 300) });
+    const frames = Math.max(1, Math.floor(Number(args.frames)) || 1);
+    film.shots = given.map((x) => newShot({ ...x, frames }));
+    vidStop();
+    vid.cur = film;
+    await vidSave(true);
+    S.tab = 'video'; S.panes.side = true;
+    drawSide();
+    vidMake();   // it works on in the Video tab; the chat does not wait for it
+    const todo = vidTodo(film);
+    return `film "${film.title}" is started in the Video tab: ${film.shots.length} shots, ${todo.pics} pictures${voiceOn() && todo.lines ? ' and ' + todo.lines + ' spoken lines' : ''} being made now. The user watches it there, plays it, and exports it as a video file. You cannot see it; do not describe how it looks.`;
+  } catch (e) {
+    return 'error: ' + e.message;
+  }
+}
+async function videoSlash(rest) {
+  const m = /\s--shots\s+(\d+)/i.exec(' ' + rest);
+  const idea = rest.replace(/\s*--shots\s+\d+/i, '').trim();
+  S.tab = 'video'; S.panes.side = true;
+  draw();
+  await vidOpen();
+  queueMicrotask(() => { const box = document.getElementById('vidIdea'), n = document.getElementById('vidCount'); if (box) { box.value = idea; box.focus(); } if (n && m) n.value = m[1]; });
+}
+
+SIDE_TABS.push({ id: 'video', label: () => (vid.run || vid.rec ? 'Video •' : 'Video'), draw: videoTab, open: () => vidOpen() });
+TOOLS.video_make = { args: '{"title": "<short>", "aspect": "16:9", "look": "<the style every shot shares>", "frames": 1, "shots": [{"prompt": "<the picture, complete in itself>", "say": "<what the narrator says over it, or empty>", "seconds": 4, "motion": "zoom in"}]}', does: 'start a film in the Video tab: each shot is a picture (made by the image model) with a narrator\'s line (spoken by the speech model) and a camera move (' + Object.keys(MOTIONS).join(', ') + '). Write as many shots as the film needs; describe recurring characters and places the same way in every prompt. frames above 1 makes each shot move, frame by frame', when: () => artOn() };
+TOOL_RUNNERS.video_make = (args, signal) => videoTool(args, signal);
+SLASH.video = videoSlash;
+CHIP_EXTRAS.push(() => null);
 
 /* ============================================================ the loop */
 

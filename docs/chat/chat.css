@@ -521,6 +521,33 @@ dialog.ask.art-mask { width: min(96vw, 720px); }
   .art-info { border-left: 0; border-top: 1px solid var(--border); }
 }
 
+/* ---- the Video tab: a player, the film's settings, and its shots ---- */
+.vid-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 6px; }
+.vid-bar select { flex: 1; min-width: 0; width: auto; }
+.vid-bar input[type=range] { flex: 1; min-width: 80px; }
+.vid-bar input[type=number] { width: 8ch; }
+.vid-stage input[type=text], .tab-video .block input[type=text] { width: 100%; min-height: var(--field-h); padding: 7px 11px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); color: var(--text); font: inherit; }
+.vid-stage .vid-title { font-weight: 600; margin-bottom: 8px; }
+.vid-canvas { display: block; width: 100%; height: auto; max-height: 52vh; object-fit: contain; background: #000; border-radius: var(--radius); }
+.vid-stage .err:empty { display: none; }
+#vidIdea { resize: vertical; min-height: 68px; }
+.vid-shot { border: 1px solid var(--border); border-radius: var(--radius); padding: 8px; margin-bottom: 8px; background: var(--surface-raised); }
+.vid-shot-top { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; font-size: var(--fs-ui); flex-wrap: wrap; }
+.vid-shot-top .grow { flex: 1; }
+.vid-shot-body { display: grid; grid-template-columns: 132px minmax(0, 1fr); gap: 8px; }
+.vid-pics { display: flex; flex-wrap: wrap; gap: 3px; align-content: flex-start; }
+.vid-pics .art-pic { flex: 1 1 60px; }
+.vid-pics .art-pic img { width: 100%; aspect-ratio: 16 / 10; object-fit: cover; }
+.vid-blank { width: 100%; aspect-ratio: 16 / 10; display: grid; place-items: center; border: 1px dashed var(--border); border-radius: var(--radius); color: var(--text-muted); font-size: var(--fs-micro); }
+.vid-shot-text { display: grid; gap: 5px; min-width: 0; }
+.vid-shot-text textarea { resize: vertical; min-height: 44px; line-height: 1.35; font-size: var(--fs-ui); }
+.vid-shot-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(92px, 1fr)); gap: 6px; }
+.vid-shot-row label { margin: 0; }
+.vid-shot-row input, .vid-shot-row select { min-height: 28px; padding: 2px 8px; font-size: var(--fs-small); }
+dialog.ask.art-pick { width: min(96vw, 860px); }
+dialog.art-pick .art-grid { max-height: 60dvh; overflow-y: auto; }
+@media (max-width: 520px) { .vid-shot-body { grid-template-columns: minmax(0, 1fr); } }
+
 /* ---- the MCP door (Harness tab) ---- */
 .door-url { overflow-wrap: anywhere; }
 .door-fresh { border: 1px solid var(--accent); border-radius: var(--radius); padding: 10px; margin: 8px 0; background: var(--tonal); }
