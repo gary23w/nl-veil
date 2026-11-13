@@ -561,10 +561,24 @@ const noThink = (t) => String(t).replace(/<think>[\s\S]*?<\/think>/gi, '').repla
 const QUIET_KNOBS = [{ enable_thinking: false }, { chat_template_kwargs: { thinking: false } }, { chat_template_kwargs: { enable_thinking: false } }, { reasoning_effort: 'low' }];
 const quirks = ls.get('veilweb.quirks', {});
 let lastReply = { text: '', cut: false, reasoning: 0 };   // how the last model call ended
+const THINK_PATIENCE = 10000;   // characters of reasoning, with no word of a reply yet, before a call is given up on
+const TRIAL_PATIENCE = 1500;    // the same, for a call sent with a knob that is meant to switch reasoning off
 
 /* One request to the model through the harness. Resolves {text, cut, reasoning}: `cut` when the reply ended at
-   its length limit, `reasoning` the characters of thinking that came before (or instead of) the text. */
-async function modelRequest(messages, onText, signal, maxTokens, extra, onThink) {
+   its length limit, `reasoning` the characters of thinking that came before (or instead of) the text. With
+   `patience`, a call still only reasoning after that many characters is dropped and comes back `gaveUp`. */
+async function modelRequest(messages, onText, signal, maxTokens, extra, onThink, patience = 0) {
+  const own = new AbortController();
+  const stop = () => own.abort();
+  signal?.addEventListener('abort', stop);
+  try {
+    return await modelRequestInner(messages, onText, own.signal, maxTokens, extra, onThink, patience, own);
+  } finally {
+    signal?.removeEventListener('abort', stop);
+  }
+}
+
+async function modelRequestInner(messages, onText, signal, maxTokens, extra, onThink, patience, own) {
   const r = await harness('/v1/chat', { body: { model: S.model, messages, max_tokens: maxTokens, stream: true, ...(extra ? { extra } : {}) }, signal });
   const type = r.headers.get('content-type') ?? '';
   if (!type.includes('event-stream')) {
@@ -605,7 +619,15 @@ async function modelRequest(messages, onText, signal, maxTokens, extra, onThink)
       const piece = modelText(j.choices ? { choices: [{ delta: { content: d?.content } }] } : { response: j.response });
       if (piece) { text += piece; onText?.(noThink(text)); continue; }
       const think = String(d?.reasoning_content ?? d?.reasoning ?? '');
-      if (think) { reasoning += think.length; onThink?.(reasoning); }
+      if (think) {
+        reasoning += think.length;
+        onThink?.(reasoning);
+        if (patience && !text && !calls.length && reasoning > patience) {
+          own.abort();   // ours, not the user's Stop
+          reader.cancel().catch(() => {});
+          return { text: '', cut: false, reasoning, gaveUp: true };
+        }
+      }
     }
   }
   text = noThink(text);
@@ -617,28 +639,37 @@ async function modelRequest(messages, onText, signal, maxTokens, extra, onThink)
   return { text, cut: finish === 'length', reasoning };
 }
 
-/* One model call. `onText` is handed the reply so far as it streams. A reply that came back empty because the
-   model only reasoned is asked again: with each knob that may quiet it, then with three times the room. */
+/* One model call. `onText` is handed the reply so far as it streams. A model that reasons on and on without a
+   word of reply is not waited out: the call is dropped and asked again with each knob that may quiet it; the knob
+   that did (reasoning stayed short and an answer came) is remembered. A model no knob quiets is remembered as
+   that, and is given three times the room and all the time it wants. */
 async function callModel(messages, onText, signal, maxTokens = 8192) {
   const say = (s) => { if (S.live) { S.live.status = s; drawLive(); } };
   const think = (n) => say(`thinking… ${(n / 1000).toFixed(1)}k characters of reasoning so far`);
+  const roomy = () => modelRequest(messages, onText, signal, Math.min(16384, maxTokens * 3), null, think);
   const known = quirks[S.model]?.quiet;
-  let got = await modelRequest(messages, onText, signal, maxTokens, known !== undefined ? QUIET_KNOBS[known] : null, think);
-  if (!got.text) {
-    for (let i = 0; i < QUIET_KNOBS.length && !got.text; i++) {
+  let got;
+  if (known === -1) got = await roomy();
+  else got = await modelRequest(messages, onText, signal, maxTokens, known !== undefined ? QUIET_KNOBS[known] : null, think, known === undefined ? THINK_PATIENCE : 0);
+  if (!got.text && known !== -1) {
+    let quiet = -1;
+    for (let i = 0; i < QUIET_KNOBS.length && quiet < 0; i++) {
       if (i === known) continue;
-      say('the model spent its whole reply reasoning; asking again with its reasoning switched off…');
+      say(`the model only reasoned; asking again with its reasoning switched off (${i + 1} of ${QUIET_KNOBS.length})…`);
+      let trial;
       try {
-        got = await modelRequest(messages, onText, signal, maxTokens, QUIET_KNOBS[i], think);
+        trial = await modelRequest(messages, onText, signal, maxTokens, QUIET_KNOBS[i], null, TRIAL_PATIENCE);
       } catch (e) {
         if (signal?.aborted) throw e;
         continue;   // a model that rejects the field is not one it works on
       }
-      if (got.text) { quirks[S.model] = { quiet: i }; ls.set('veilweb.quirks', quirks); }
+      if (trial.text) { quiet = i; got = trial; }
     }
-    if (!got.text) {
-      say('asking once more with three times the room…');
-      got = await modelRequest(messages, onText, signal, Math.min(16384, maxTokens * 3), null, think);
+    quirks[S.model] = { quiet };
+    ls.set('veilweb.quirks', quirks);
+    if (quiet < 0) {
+      say('no switch quiets this model; giving it three times the room…');
+      got = await roomy();
     }
   }
   lastReply = got;
