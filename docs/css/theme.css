@@ -164,7 +164,7 @@
 :root[data-theme="matrix"] * { scrollbar-color: #174d2f #000; }
 :root[data-theme="matrix"] ::-webkit-scrollbar-thumb { background: #174d2f; border-radius: 3px; }
 :root[data-theme="matrix"] ::-webkit-scrollbar-thumb:hover { background: #16c56b; }
-:root[data-theme="matrix"] :is(pre, code) { background: #06100a; }
+:root[data-theme="matrix"] :is(pre, code):not(.hl, .ghost) { background: #06100a; }
 
 /* ============================================================ base */
 * { box-sizing: border-box; margin: 0; padding: 0; }
