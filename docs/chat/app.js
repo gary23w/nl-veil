@@ -134,6 +134,22 @@ const core = {
 
 /* ============================================================ state */
 
+/* What the user has chosen in this browser, kept across reloads: the side tab, the explorer, the chat that was
+   open, and each chat's open files. (The theme, the model, the layout and the editor's switches keep themselves.) */
+const ui = { views: {}, ...ls.get('veilweb.ui', {}) };
+let uiReady = false;   // nothing is saved until the last session's choices have been put back
+function saveUi() {
+  if (!uiReady || !S.conv) return;
+  const c = S.conv;
+  const kept = c.msgs.length || c.repo || Object.keys(c.files).length;
+  Object.assign(ui, { tab: S.tab, explorer: S.explorer, gitOpen: S.gitOpen, conv: kept ? c.id : null });
+  // (a chat whose folder is not back yet has no files to show: what it had open is left as it was)
+  if (kept && !(c.repo && (typeof repo === 'undefined' || !repo.on() || repo.busy))) ui.views[c.id] = { open: S.open.slice(0, 12), file: S.file, preview: S.preview };
+  const ids = Object.keys(ui.views);
+  for (const id of ids.slice(0, Math.max(0, ids.length - 40))) delete ui.views[id];
+  ls.set('veilweb.ui', ui);
+}
+
 const S = {
   session: ss.get('veilweb.session'),    // {access, refresh, exp} once logged in with Cloudflare
   harness: ls.get('veilweb.harness'),    // the worker harness's address, once one answered this login
@@ -146,16 +162,16 @@ const S = {
   convs: [],                             // [{id, title, at}] newest first; the harness's copy and this browser's, merged
   conv: null,                            // the open conversation: {id, title, at, msgs, files}
   live: null,                            // the running turn: {tools, text, status, abort}
-  tab: 'code',                           // the side pane: code | jobs | harness
+  tab: ['code', 'jobs', 'harness'].includes(ui.tab) ? ui.tab : 'code',   // the side pane: code | jobs | harness
   lay: { rail: true, chat: true, side: 0, ...ls.get('veilweb.layout', {}) },   // wide screens: which panes show, and the side pane's width in px (0 = its own)
   file: null,                            // the file showing in the editor
   open: [],                              // the files open as editor tabs
   shut: new Set(),                       // explorer folders that are folded
   filter: '',                            // the explorer's find-a-file text
   search: null,                          // the last search inside the files: {q, hits, note}
-  gitOpen: false,                        // the explorer's git strip is unfolded
+  gitOpen: ui.gitOpen === true,          // the explorer's git strip is unfolded
   goto: 0,                               // a line the editor should go to when it next opens a file
-  explorer: true,                        // the explorer column is showing
+  explorer: ui.explorer !== false,       // the explorer column is showing
   preview: false,                        // false: source; 'split': source beside its preview; true: preview only
   jobs: [],                              // the harness's queue, oldest first
   schedules: [],                         // the harness's repeating tasks
@@ -1192,64 +1208,245 @@ async function clefReview(userText, answer, rounds, signal) {
 
 /* ============================================================ code: highlighting and files */
 
-const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-const LANGS = {
-  js: 'JavaScript', mjs: 'JavaScript', cjs: 'JavaScript', jsx: 'JavaScript', ts: 'TypeScript', tsx: 'TypeScript', json: 'JSON',
-  html: 'HTML', htm: 'HTML', svg: 'SVG', xml: 'XML', css: 'CSS', py: 'Python', md: 'Markdown', markdown: 'Markdown',
-  zig: 'Zig', sh: 'Shell', yml: 'YAML', yaml: 'YAML', toml: 'TOML', txt: 'Plain text', sql: 'SQL', go: 'Go', rs: 'Rust', c: 'C', h: 'C',
-};
-const KEYWORDS = {
-  js: 'async await break case catch class const continue debugger default delete do else export extends finally for from function if import in instanceof let new of return static super switch this throw try typeof var void while with yield true false null undefined',
-  py: 'and as assert async await break class continue def del elif else except finally for from global if import in is lambda nonlocal not or pass raise return try while with yield True False None self',
-  zig: 'const var fn pub return if else while for switch break continue defer errdefer try catch struct enum union error comptime inline export extern test and or orelse unreachable null undefined true false',
-  go: 'break case chan const continue default defer else fallthrough for func go goto if import interface map package range return select struct switch type var true false nil',
-  rs: 'as async await break const continue crate dyn else enum extern false fn for if impl in let loop match mod move mut pub ref return self Self static struct super trait true type unsafe use where while',
-  c: 'auto break case char const continue default do double else enum extern float for goto if inline int long register return short signed sizeof static struct switch typedef union unsigned void volatile while',
-  sql: 'select from where and or not insert into values update set delete create table index drop alter join left right inner outer on group by order having limit as distinct null is in like between union',
-  sh: 'if then else elif fi for in do done while until case esac function return exit export local echo cd',
-};
-KEYWORDS.ts = KEYWORDS.js + ' interface type enum implements private public protected readonly declare namespace abstract as any unknown never string number boolean';
-const kwSets = Object.fromEntries(Object.entries(KEYWORDS).map(([k, v]) => [k, new Set(v.split(' '))]));
-const langKey = (e) => ({ mjs: 'js', cjs: 'js', jsx: 'js', tsx: 'ts', h: 'c', htm: 'html', svg: 'html', xml: 'html', markdown: 'md', yaml: 'yml' }[e] ?? e);
+/* ---- syntax: source text as coloured HTML, by language ----
+   Every language is a short description (its comments, its strings, its words) read by one lexer; markup,
+   stylesheets, data files, Markdown and diffs have small readers of their own. Token classes:
+     tok-c comment   tok-s string     tok-r regex or escape   tok-n number     tok-k keyword
+     tok-y type      tok-f function   tok-b constant/builtin  tok-v variable   tok-d decorator, directive
+     tok-o operator  tok-u punctuation   tok-t tag   tok-a attribute   tok-p property or key
+     tok-h heading   tok-i inserted   tok-x deleted
+   The lexer has no memory of earlier lines: a long file is coloured from a little above the screen, so a
+   block comment that began far above may show uncoloured until its end. */
 
-/* Source text as HTML with its tokens wrapped: tok-c comment, tok-s string, tok-n number, tok-k keyword, tok-f
-   a name being called, tok-t tag, tok-a attribute, tok-p property. One pass of one regular expression per
-   language family; text that matches nothing passes through escaped. Past 200,000 characters it is not coloured. */
-function highlight(text, e) {
-  const lang = langKey(e);
-  if (text.length > 200000) return esc(text);
-  const span = (cls, s) => `<span class="tok-${cls}">${esc(s)}</span>`;
-  if (lang === 'html') {
-    return text.replace(/(<!--[\s\S]*?-->)|(<\/?)([A-Za-z][\w:-]*)((?:\s+[^\s"'<>\/=]+(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s"'<>]+))?)*)(\s*\/?>)|([^<]+|<)/g,
-      (m, com, open, tag, attrs, close, other) => {
-        if (com) return span('c', com);
-        if (tag) return esc(open) + span('t', tag) + attrs.replace(/([^\s"'<>\/=]+)(\s*=\s*)?("[^"]*"|'[^']*'|[^\s"'<>]+)?/g, (a, n, eq, v) => span('a', n) + esc(eq ?? '') + (v ? span('s', v) : '')) + esc(close);
-        return esc(other);
-      });
-  }
-  if (lang === 'css') {
-    return text.replace(/(\/\*[\s\S]*?\*\/)|("(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*')|(#[0-9a-fA-F]{3,8}\b|-?\d*\.?\d+(?:px|em|rem|%|vh|vw|s|ms|deg|fr|ch)?\b)|(@[\w-]+)|([\w-]+)(?=\s*:)|([^\/"'#@\w-]+|.)/g,
-      (m, com, str, num, at, prop, other) => (com ? span('c', com) : str ? span('s', str) : num ? span('n', num) : at ? span('k', at) : prop ? span('p', prop) : esc(other ?? m)));
-  }
-  if (lang === 'json') {
-    return text.replace(/("(?:[^"\\\n]|\\.)*")(\s*:)?|(-?\d+\.?\d*(?:[eE][+-]?\d+)?)|\b(true|false|null)\b|([^"\d\w-]+|.)/g,
-      (m, str, colon, num, lit, other) => (str ? span(colon ? 'p' : 's', str) + (colon ?? '') : num ? span('n', num) : lit ? span('k', lit) : esc(other ?? m)));
-  }
-  if (lang === 'md') {
-    return text.split('\n').map((line) => (/^#{1,6}\s/.test(line) ? span('k', line) : /^\s*(```|~~~)/.test(line) ? span('c', line) : /^\s*([-*+]|\d+\.)\s/.test(line) ? line.replace(/^(\s*(?:[-*+]|\d+\.))(.*)$/, (m, b, rest) => span('p', b) + esc(rest)) : esc(line).replace(/(`[^`]+`)/g, '<span class="tok-s">$1</span>'))).join('\n');
-  }
-  const hash = ['py', 'sh', 'yml', 'toml'].includes(lang);
-  const words = kwSets[lang] ?? (hash ? kwSets.py : kwSets.js);
-  const re = hash
-    ? /(#[^\n]*)|("""[\s\S]*?"""|'''[\s\S]*?'''|"(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*')|(\b\d[\d_]*\.?\d*(?:[eE][+-]?\d+)?\b)|([A-Za-z_]\w*)(\s*\()?|([^#"'\w]+|.)/g
-    : /(\/\/[^\n]*|\/\*[\s\S]*?\*\/)|(`(?:[^`\\]|\\.)*`|"(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*')|(\b0x[\da-fA-F]+\b|\b\d[\d_]*\.?\d*(?:[eE][+-]?\d+)?\b)|([A-Za-z_$][\w$]*)(\s*\()?|([^\/`"'\w$]+|.)/g;
-  return text.replace(re, (m, com, str, num, word, call, other) => {
-    if (com) return span('c', com);
-    if (str) return span('s', str);
-    if (num) return span('n', num);
-    if (word) return (words.has(word) ? span('k', word) : call ? span('f', word) : esc(word)) + esc(call ?? '');
-    return esc(other ?? m);
+const LANGS = {
+  js: 'JavaScript', mjs: 'JavaScript', cjs: 'JavaScript', jsx: 'JavaScript JSX', ts: 'TypeScript', tsx: 'TypeScript JSX', json: 'JSON', jsonc: 'JSON', jsonl: 'JSON Lines',
+  html: 'HTML', htm: 'HTML', svg: 'SVG', xml: 'XML', vue: 'Vue', css: 'CSS', scss: 'SCSS', less: 'Less', py: 'Python', pyi: 'Python', md: 'Markdown', markdown: 'Markdown',
+  zig: 'Zig', go: 'Go', rs: 'Rust', c: 'C', h: 'C', cpp: 'C++', cc: 'C++', hpp: 'C++', cs: 'C#', java: 'Java', kt: 'Kotlin', kts: 'Kotlin', swift: 'Swift', php: 'PHP', rb: 'Ruby', lua: 'Lua',
+  sh: 'Shell', bash: 'Shell', zsh: 'Shell', ps1: 'PowerShell', psm1: 'PowerShell', psd1: 'PowerShell', bat: 'Batch', cmd: 'Batch', sql: 'SQL',
+  yml: 'YAML', yaml: 'YAML', toml: 'TOML', ini: 'INI', cfg: 'INI', conf: 'INI', env: 'Environment', dockerfile: 'Dockerfile', makefile: 'Makefile', mk: 'Makefile',
+  diff: 'Diff', patch: 'Diff', txt: 'Plain text', log: 'Log', csv: 'CSV',
+};
+
+/* The language a file name's ending stands for (the key of SYNTAX, and of the explorer's badges). */
+const LANG_OF = {
+  mjs: 'js', cjs: 'js', jsx: 'js', tsx: 'ts', jsonc: 'json', jsonl: 'json', htm: 'html', svg: 'html', xml: 'html', vue: 'html', scss: 'css', less: 'css', pyi: 'py', markdown: 'md',
+  h: 'c', cc: 'cpp', hpp: 'cpp', kts: 'kt', bash: 'sh', zsh: 'sh', env: 'sh', psm1: 'ps1', psd1: 'ps1', cmd: 'bat', yaml: 'yml', cfg: 'ini', conf: 'ini', mk: 'makefile', patch: 'diff',
+};
+const langKey = (e) => LANG_OF[e] ?? e;
+/* A file's language from its whole name: Dockerfile and Makefile have no ending. */
+const langOfName = (name) => { const base = String(name).split('/').pop().toLowerCase(); return /^dockerfile/.test(base) ? 'dockerfile' : /^(gnu)?makefile$/.test(base) ? 'makefile' : langKey((/\.([a-z0-9]+)$/.exec(base)?.[1] ?? '')); };
+/* How a language is indented: its unit, and how wide a tab is drawn. */
+const INDENT = { py: '    ', go: '\t', makefile: '\t', c: '    ', cpp: '    ', cs: '    ', java: '    ', kt: '    ', swift: '    ', rs: '    ', zig: '    ', php: '    ', ps1: '    ', lua: '    ', sql: '    ', bat: '    ' };
+const indentOf = (name) => INDENT[langOfName(name)] ?? '  ';
+
+const words = (s) => new Set(s.split(/\s+/).filter(Boolean));
+const rx = (s) => s.replace(/[.*+?^${}()|[\]\\\/]/g, '\\$&');
+const Q2 = String.raw`"(?:[^"\\\n]|\\.)*"?`;
+const Q1 = String.raw`'(?:[^'\\\n]|\\.)*'?`;
+const QT = '`(?:[^`\\\\]|\\\\[\\s\\S])*`?';
+const CONSTS = 'true false null';
+const SYNTAX = {
+  js: { line: ['//'], block: [['/*', '*/']], strs: [Q2, Q1, QT], regex: true, vars: [[String.raw`@[A-Za-z_]\w*`, 'd']], typed: true,
+    kw: words('async await break case catch class const continue debugger default delete do else export extends finally for from function get if import in instanceof let new of return set static super switch this throw try typeof var void while with yield as'),
+    consts: words(CONSTS + ' undefined NaN Infinity globalThis arguments'), builtins: words('console window document Math JSON Object Array String Number Boolean Promise Map Set WeakMap WeakSet Symbol Date RegExp Error fetch setTimeout setInterval clearTimeout clearInterval parseInt parseFloat require module exports process') },
+  ts: { base: 'js', kw: words('abstract declare enum implements interface is keyof namespace override private protected public readonly satisfies type unique infer asserts'), types: words('any bigint boolean never number object string symbol unknown void undefined Record Partial Readonly Pick Omit') },
+  py: { line: ['#'], strs: [String.raw`[rRbBfFuU]{0,2}"""[\s\S]*?(?:"""|$)`, String.raw`[rRbBfFuU]{0,2}'''[\s\S]*?(?:'''|$)`, String.raw`[rRbBfFuU]{0,2}"(?:[^"\\\n]|\\.)*"?`, String.raw`[rRbBfFuU]{0,2}'(?:[^'\\\n]|\\.)*'?`], vars: [[String.raw`@[A-Za-z_][\w.]*`, 'd']], typed: true,
+    kw: words('and as assert async await break class continue def del elif else except finally for from global if import in is lambda nonlocal not or pass raise return try while with yield match case'),
+    consts: words('True False None self cls __name__ __main__ NotImplemented Ellipsis'), types: words('int float str bool bytes list dict set tuple object type'),
+    builtins: words('print len range enumerate zip map filter sorted reversed sum min max abs any all open isinstance issubclass hasattr getattr setattr super input repr iter next round divmod id hash callable format vars dir Exception ValueError TypeError KeyError IndexError RuntimeError StopIteration') },
+  go: { line: ['//'], block: [['/*', '*/']], strs: [Q2, String.raw`'(?:[^'\\\n]|\\.)+'`, '`[^`]*`?'], typed: true,
+    kw: words('break case chan const continue default defer else fallthrough for func go goto if import interface map package range return select struct switch type var'),
+    consts: words(CONSTS.replace('null', 'nil') + ' iota'), types: words('bool byte complex64 complex128 error float32 float64 int int8 int16 int32 int64 rune string uint uint8 uint16 uint32 uint64 uintptr any'),
+    builtins: words('append cap close copy delete len make new panic print println recover min max clear') },
+  rs: { line: ['//'], block: [['/*', '*/']], strs: [String.raw`b?r#*"[\s\S]*?(?:"#*|$)`, 'b?' + Q2, String.raw`b?'(?:[^'\\\n]|\\.{1,9})'`], vars: [[String.raw`#!?\[[^\]\n]*\]`, 'd'], [String.raw`'[a-z_]\w*\b(?!')`, 'v'], [String.raw`[A-Za-z_]\w*!(?=\s*[(\[{])`, 'f']], typed: true,
+    kw: words('as async await break const continue crate dyn else enum extern fn for if impl in let loop match mod move mut pub ref return static struct super trait type unsafe use where while'),
+    consts: words('true false self Self None Some Ok Err'), types: words('bool char f32 f64 i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize str String Vec Option Result Box Rc Arc HashMap HashSet') },
+  c: { line: ['//'], block: [['/*', '*/']], strs: [Q2, String.raw`'(?:[^'\\\n]|\\.)+'`], pre: [[String.raw`^[ \t]*#[ \t]*[a-z_]+`, 'd'], [String.raw`<[\w./+-]+\.h(?:pp)?>`, 's']], typed: true,
+    kw: words('auto break case const continue default do else enum extern for goto if inline register restrict return sizeof static struct switch typedef union volatile while'),
+    consts: words('NULL true false EOF stdin stdout stderr'), types: words('bool char double float int long short signed unsigned void size_t ssize_t int8_t int16_t int32_t int64_t uint8_t uint16_t uint32_t uint64_t uintptr_t FILE') },
+  cpp: { base: 'c', kw: words('alignas alignof catch class concept consteval constexpr constinit co_await co_return co_yield decltype delete explicit export final friend mutable namespace new noexcept operator override private protected public requires static_assert template this throw try typename using virtual'), consts: words('nullptr'), types: words('string vector map set unordered_map unordered_set unique_ptr shared_ptr optional variant tuple pair array wchar_t char8_t char16_t char32_t auto') },
+  cs: { base: 'c', strs: [String.raw`[$@]{0,2}"(?:[^"\\\n]|\\.|"")*"?`, String.raw`'(?:[^'\\\n]|\\.)+'`], vars: [[String.raw`\[[A-Z]\w*(?:\([^)\n]*\))?\]`, 'd']],
+    kw: words('abstract as async await base catch checked class delegate event explicit finally fixed foreach get implicit in interface internal is lock namespace new operator out override params partial private protected public readonly record ref sealed set stackalloc this throw try typeof unchecked unsafe using var virtual when where yield'),
+    consts: words('null'), types: words('byte decimal dynamic object sbyte string uint ulong ushort nint nuint Task List Dictionary IEnumerable') },
+  java: { base: 'c', vars: [[String.raw`@[A-Za-z_]\w*`, 'd']], pre: [],
+    kw: words('abstract assert catch class extends final finally implements import instanceof interface native new package private protected public record sealed strictfp super synchronized this throw throws transient try var yield permits'),
+    consts: words('null'), types: words('boolean byte String Integer Long Double Float Boolean Character Object List Map Set Optional') },
+  kt: { base: 'java', strs: [String.raw`"""[\s\S]*?(?:"""|$)`, Q2, String.raw`'(?:[^'\\\n]|\\.)+'`], kw: words('as by companion constructor data fun in init inline internal is lateinit object open operator out override sealed suspend typealias val when where'), types: words('Any Unit Nothing Int Long Short Byte Double Float Boolean Char String Array') },
+  swift: { base: 'c', pre: [[String.raw`^[ \t]*#[a-z]+`, 'd']], vars: [[String.raw`@[A-Za-z_]\w*`, 'd']],
+    kw: words('actor associatedtype async await catch class defer deinit extension fallthrough fileprivate func guard import in init inout internal is lazy let mutating nonisolated open operator override private protocol public repeat rethrows self some subscript super throw throws try var weak where'),
+    consts: words('nil'), types: words('Int Double Float Bool String Character Array Dictionary Set Optional Any AnyObject Void') },
+  php: { line: ['//', '#'], block: [['/*', '*/']], strs: [Q2, Q1], vars: [[String.raw`\$[A-Za-z_]\w*`, 'v'], [String.raw`<\?(?:php|=)?|\?>`, 'd']], typed: true,
+    kw: words('abstract and array as break callable case catch class clone const continue declare default do echo else elseif empty enddeclare endfor endforeach endif endswitch endwhile enum extends final finally fn for foreach function global goto if implements include include_once instanceof insteadof interface isset list match namespace new or print private protected public readonly require require_once return static switch throw trait try unset use var while xor yield'),
+    consts: words(CONSTS + ' TRUE FALSE NULL self parent'), types: words('int float string bool mixed void iterable object') },
+  rb: { line: ['#'], block: [['=begin', '=end']], strs: [Q2, Q1, '`[^`\\n]*`?'], vars: [[String.raw`[@$]{1,2}[A-Za-z_]\w*`, 'v'], [String.raw`:[A-Za-z_]\w*[?!]?`, 'b']], typed: true, ident: String.raw`[A-Za-z_]\w*[?!]?`,
+    kw: words('alias and begin break case class def defined? do else elsif end ensure for if in module next not or redo rescue retry return super then undef unless until when while yield require require_relative include extend attr_reader attr_writer attr_accessor private protected public raise'),
+    consts: words('true false nil self') },
+  lua: { line: ['--'], block: [['--[[', ']]']], strs: [Q2, Q1, String.raw`\[\[[\s\S]*?(?:\]\]|$)`],
+    kw: words('and break do else elseif end for function goto if in local not or repeat return then until while'), consts: words('true false nil self _G'),
+    builtins: words('print pairs ipairs type tostring tonumber require setmetatable getmetatable pcall error assert select unpack next string table math os io') },
+  zig: { line: ['//'], strs: [Q2, String.raw`'(?:[^'\\\n]|\\.{1,9})'`, String.raw`\\\\[^\n]*`], vars: [[String.raw`@[A-Za-z_]\w*`, 'b']], typed: true,
+    kw: words('addrspace align allowzero and anyframe asm async await break callconv catch comptime const continue defer else enum errdefer error export extern fn for if inline linksection noalias noinline nosuspend opaque or orelse packed pub resume return struct suspend switch test threadlocal try union unreachable usingnamespace var volatile while'),
+    consts: words('true false null undefined'), types: words('anyerror anyopaque anytype bool comptime_float comptime_int f16 f32 f64 f80 f128 i8 i16 i32 i64 i128 isize noreturn type u1 u8 u16 u32 u64 u128 usize void c_int c_uint c_long c_char') },
+  sh: { line: ['#'], strs: [Q2, String.raw`'[^']*'?`, '`[^`\\n]*`?'], vars: [[String.raw`\$(?:\{[^}\n]*\}|\([^)\n]*\)|[A-Za-z_]\w*|[0-9@#?$!*-])`, 'v'], [String.raw`^[ \t]*[A-Za-z_]\w*(?==)`, 'p']], ident: String.raw`[A-Za-z_][\w-]*`,
+    kw: words('if then else elif fi for while until do done case esac in function select time return break continue local export readonly declare typeset unset shift exit trap source alias set'),
+    builtins: words('echo printf read cd pwd ls cat grep sed awk find sort uniq head tail cut tr wc xargs tee mkdir rm cp mv ln chmod chown touch test curl wget tar git make docker npm node python python3 pip sudo kill sleep date env true false') },
+  ps1: { line: ['#'], block: [['<#', '#>']], strs: [String.raw`@"[\s\S]*?(?:\n"@|$)`, String.raw`@'[\s\S]*?(?:\n'@|$)`, '"(?:[^"`\\n]|`.)*"?', String.raw`'(?:[^'\n]|'')*'?`], nocase: true,
+    vars: [[String.raw`\$(?:\{[^}\n]*\}|[A-Za-z_][\w:]*|[$?^_])`, 'v'], [String.raw`\[[A-Za-z_][\w.]*(?:\[\])?\]`, 'y'], [String.raw`-[A-Za-z][A-Za-z]*\b`, 'o'], [String.raw`[A-Za-z]+-[A-Za-z][\w]*`, 'f']],
+    kw: words('begin break catch class configuration continue data define do dynamicparam else elseif end enum exit filter finally for foreach from function hidden if in inlinescript param process return static switch throw trap try until using var while workflow'),
+    consts: words('$true $false $null') },
+  bat: { pre: [[String.raw`^[ \t]*@?(?:[rR][eE][mM]\b|::)[^\n]*`, 'c']], strs: [Q2], nocase: true, vars: [[String.raw`%[\w~]+%|%%?~?[A-Za-z0-9]|![\w]+!`, 'v'], [String.raw`^[ \t]*:[\w.-]+`, 'd']],
+    kw: words('call cd chdir cls copy del dir do echo else endlocal equ errorlevel exist exit for geq goto gtr if in leq lss md mkdir move neq not off on pause popd pushd rd ren rmdir set setlocal shift start title type') },
+  sql: { line: ['--'], block: [['/*', '*/']], strs: [String.raw`'(?:[^']|'')*'?`, Q2], nocase: true,
+    kw: words('add all alter and as asc begin between by case check column commit constraint create cross database default delete desc distinct drop else end exists foreign from full group having if in index inner insert into is join key left like limit not null offset on or order outer primary references returning right rollback select set table then transaction union unique update values view when where with'),
+    types: words('bigint binary bit blob boolean char date datetime decimal double float int integer json jsonb numeric real serial smallint text time timestamp tinyint uuid varchar'),
+    builtins: words('avg coalesce concat count current_date current_timestamp length lower max min now nullif round substr substring sum trim upper') },
+  yml: { line: ['#'], strs: [Q2, Q1], ident: String.raw`[A-Za-z_][\w.-]*`,
+    pre: [[String.raw`^[ \t]*(?:-[ \t]+)*[^\s#:'"\[\]{},&*!|>-][^\n:#]*(?=:(?:[ \t]|$))`, 'p'], [String.raw`^---|^\.\.\.`, 'd'], [String.raw`[&*][A-Za-z_][\w-]*`, 'v'], [String.raw`![A-Za-z!][\w/-]*`, 'y']],
+    consts: words('true false null yes no on off True False Null ~') },
+  toml: { line: ['#'], strs: [String.raw`"""[\s\S]*?(?:"""|$)`, String.raw`'''[\s\S]*?(?:'''|$)`, Q2, String.raw`'[^'\n]*'?`], ident: String.raw`[A-Za-z_][\w.-]*`,
+    pre: [[String.raw`^[ \t]*\[\[?[^\]\n]*\]\]?`, 'y'], [String.raw`^[ \t]*[A-Za-z0-9_."'-]+(?=[ \t]*=)`, 'p'], [String.raw`\d{4}-\d\d-\d\d(?:[T ][\d:.]+(?:Z|[+-]\d\d:\d\d)?)?`, 'n']],
+    consts: words('true false inf nan') },
+  ini: { line: ['#', ';'], strs: [Q2, Q1], ident: String.raw`[A-Za-z_][\w.-]*`, pre: [[String.raw`^[ \t]*\[[^\]\n]*\]`, 'y'], [String.raw`^[ \t]*[^\s=#;\[][^=\n#;]*(?=[ \t]*=)`, 'p']], consts: words('true false yes no on off') },
+  dockerfile: { line: ['#'], strs: [Q2, Q1], vars: [[String.raw`\$(?:\{[^}\n]*\}|[A-Za-z_]\w*)`, 'v']], ident: String.raw`[A-Za-z_][\w.-]*`,
+    pre: [[String.raw`^[ \t]*(?:FROM|RUN|CMD|LABEL|MAINTAINER|EXPOSE|ENV|ADD|COPY|ENTRYPOINT|VOLUME|USER|WORKDIR|ARG|ONBUILD|STOPSIGNAL|HEALTHCHECK|SHELL)\b`, 'k']], kw: words('AS as') },
+  makefile: { line: ['#'], strs: [Q2, Q1], ident: String.raw`[A-Za-z_][\w.-]*`,
+    pre: [[String.raw`^[A-Za-z0-9_.%/$(){}-]+(?=[ \t]*::?(?!=))`, 'f'], [String.raw`^[ \t]*[A-Za-z_][\w.-]*(?=[ \t]*[:+?!]?=)`, 'p']], vars: [[String.raw`\$(?:\([^)\n]*\)|\{[^}\n]*\}|[@<^?*%+|$])`, 'v']],
+    kw: words('ifeq ifneq ifdef ifndef else endif include define endef export unexport override vpath .PHONY') },
+};
+
+/* A description made whole (its base's fields under its own), and its one regular expression. */
+const lexers = {};
+function lexerFor(lang) {
+  if (lexers[lang] !== undefined) return lexers[lang];
+  const own = SYNTAX[lang];
+  if (!own) return (lexers[lang] = null);
+  const base = own.base ? lexerFor(own.base).L : {};
+  const join = (k) => (own[k] || base[k] ? new Set([...(base[k] ?? []), ...(own[k] ?? [])]) : null);
+  const L = { ...base, ...own, kw: join('kw'), consts: join('consts'), types: join('types'), builtins: join('builtins') };
+  const parts = [], cls = [];
+  const END = String.raw`(?![\s\S])`;   // the end of the text (a bare $ would be the end of a line here)
+  const add = (src, c) => { parts.push('(' + src.split('|$)').join('|' + END + ')') + ')'); cls.push(c); };
+  for (const [a, b] of L.block ?? []) add(rx(a) + '[\\s\\S]*?(?:' + rx(b) + '|$)', 'c');
+  for (const [src, c] of L.pre ?? []) add(src, c);
+  if (L.line?.length) add('(?:' + L.line.map(rx).join('|') + ')[^\\n]*', 'c');
+  for (const src of L.strs ?? []) add(src, 's');
+  if (L.regex) add(String.raw`(?<=(?:^|[=(,:;!&|?{}\[+\-*%<>~^]|\breturn|\btypeof)[ \t]*)\/(?![/*\s])(?:[^/\\\n\[]|\\.|\[(?:[^\]\\\n]|\\.)*\])+\/[dgimsuvy]*`, 'r');
+  for (const [src, c] of L.vars ?? []) add(src, c);
+  add(String.raw`\b0[xX][\da-fA-F_]+\b|\b0[bB][01_]+\b|\b0[oO][0-7_]+\b|\b\d[\d_]*(?:\.\d[\d_]*)?(?:[eE][+-]?\d+)?[A-Za-z_%]*`, 'n');
+  const identAt = parts.length;
+  parts.push('(' + (L.ident ?? String.raw`[A-Za-z_$][\w$]*`) + ')(?=(\\s*\\()?)');
+  const opAt = identAt + 2;
+  parts.push(String.raw`([+\-*/%=<>!&|^~?:@\\]+)`, String.raw`([{}()\[\];,.])`, String.raw`(\s+)`);
+  return (lexers[lang] = { L, re: new RegExp(parts.join('|') + '|[\\s\\S]', 'gm'), cls, identAt, opAt });
+}
+
+const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+const tok = (c, s) => `<span class="tok-${c}">${esc(s)}</span>`;
+
+function lexed(text, lang) {
+  const lx = lexerFor(lang);
+  if (!lx) return esc(text);
+  const { L, re, cls, identAt, opAt } = lx;
+  return text.replace(re, (m, ...g) => {
+    for (let i = 0; i < identAt; i++) if (g[i] !== undefined) return tok(cls[i], m);
+    const word = g[identAt];
+    if (word !== undefined) {
+      const w = L.nocase ? word.toLowerCase() : word;
+      const at = g[g.length - 2], whole = g[g.length - 1];
+      if (L.kw?.has(w)) return tok('k', word);
+      if (L.consts?.has(w)) return tok('b', word);
+      if (L.types?.has(w)) return tok('y', word);
+      if (whole[at - 1] === '.' && whole[at - 2] !== '.') return tok(g[identAt + 1] !== undefined ? 'f' : 'p', word);
+      if (g[identAt + 1] !== undefined) return tok('f', word);
+      if (L.builtins?.has(w)) return tok('b', word);
+      if (L.typed && /^[A-Z][A-Z0-9_]{2,}$/.test(word)) return tok('b', word);
+      if (L.typed && /^[A-Z]\w*[a-z]/.test(word)) return tok('y', word);
+      return esc(word);
+    }
+    if (g[opAt] !== undefined) return tok('o', m);
+    if (g[opAt + 1] !== undefined) return tok('u', m);
+    return esc(m);
   });
+}
+
+/* ---- the readers that are not word-and-string languages ---- */
+
+function cssed(text) {
+  return text.replace(/(\/\*[\s\S]*?(?:\*\/|$)|\/\/[^\n]*)|("(?:[^"\\\n]|\\.)*"?|'(?:[^'\\\n]|\\.)*'?)|(#[0-9a-fA-F]{3,8}\b|-?\d*\.?\d+(?:[a-z%]+)?\b)|(@[\w-]+|!important\b)|(--[\w-]+)|([\w-]+)(?=\s*\()|((?:^|(?<=[{;\s]))[\w-]+)(?=\s*:(?![:\w-]*[^;{}]*\{))|([.#][\w-]+|&|::?[\w-]+)|([$@][\w-]+)|([{}()\[\];:,>+~*=])|([\s\S])/g,
+    (m, com, str, num, at, custom, fn, prop, sel, variable, punct) => (com ? tok('c', com) : str ? tok('s', str) : num ? tok('n', num) : at ? tok('k', at) : custom ? tok('v', custom) : fn ? tok('f', fn) : prop ? tok('p', prop) : sel ? tok('y', sel) : variable ? tok('v', variable) : punct ? tok('u', punct) : esc(m)));
+}
+
+function jsoned(text) {
+  return text.replace(/(\/\/[^\n]*|\/\*[\s\S]*?(?:\*\/|$))|("(?:[^"\\\n]|\\.)*"?)(\s*:)?|(-?\d+\.?\d*(?:[eE][+-]?\d+)?)|\b(true|false|null)\b|([{}\[\],:])|([\s\S])/g,
+    (m, com, str, colon, num, lit, punct) => (com ? tok('c', com) : str ? tok(colon ? 'p' : 's', str) + (colon ? tok('u', colon) : '') : num ? tok('n', num) : lit ? tok('b', lit) : punct ? tok('u', punct) : esc(m)));
+}
+
+function tagged(text) {
+  return text.replace(/(<!--[\s\S]*?(?:-->|$))|(<!\[CDATA\[[\s\S]*?(?:\]\]>|$))|(<[!?][^>]*>?)|(<\/?)([A-Za-z][\w:.-]*)((?:\s+[^\s"'<>\/=]+(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s"'<>]+))?)*)(\s*\/?>?)|(&[#\w]+;)|([^<&]+|[<&])/g,
+    (m, com, cdata, decl, open, tag, attrs, close, entity, other) => {
+      if (com) return tok('c', com);
+      if (cdata) return tok('s', cdata);
+      if (decl) return tok('d', decl);
+      if (tag) return tok('u', open) + tok('t', tag) + attrs.replace(/([^\s"'<>\/=]+)(\s*=\s*)?("[^"]*"|'[^']*'|[^\s"'<>]+)?/g, (a, n, eq, v) => tok('a', n) + (eq ? tok('o', eq) : '') + (v ? tok('s', v) : '')) + tok('u', close);
+      if (entity) return tok('b', entity);
+      return esc(other ?? m);
+    });
+}
+
+/* Markup, with the script and the style inside it read as what they are. */
+function htmled(text) {
+  let out = '', last = 0;
+  const re = /(<script\b[^>]*>)([\s\S]*?)(<\/script>|$)|(<style\b[^>]*>)([\s\S]*?)(<\/style>|$)/gi;
+  for (let m; (m = re.exec(text)); ) {
+    out += tagged(text.slice(last, m.index));
+    out += m[1] !== undefined ? tagged(m[1]) + (/type=["']?(?:application\/(?:ld\+)?json|importmap)/i.test(m[1]) ? jsoned(m[2]) : lexed(m[2], 'js')) + tagged(m[3]) : tagged(m[4]) + cssed(m[5]) + tagged(m[6]);
+    last = m.index + m[0].length;
+    if (!m[0].length) re.lastIndex++;
+  }
+  return out + tagged(text.slice(last));
+}
+
+function marked(text) {
+  let fence = null;   // the language of the code block being read
+  return text.split('\n').map((line) => {
+    const f = /^\s*(```|~~~)\s*([\w+-]*)/.exec(line);
+    if (f) { const open = fence === null; fence = open ? (f[2] || '') : null; return tok('d', line); }
+    if (fence !== null) return highlight(line, fence);
+    if (/^#{1,6}\s/.test(line)) return tok('h', line);
+    if (/^\s*>/.test(line)) return tok('c', line);
+    if (/^\s*(?:[-*_]\s*){3,}$/.test(line)) return tok('d', line);
+    return line.replace(/(`[^`\n]+`)|(!?\[[^\]\n]*\]\([^)\n]*\))|(\*\*[^*\n]+\*\*|__[^_\n]+__)|(\*[^*\s][^*\n]*\*|\b_[^_\n]+_\b)|(^\s*(?:[-*+]|\d+[.)])\s)|(<\/?[A-Za-z][^>\n]*>)|([\s\S])/g,
+      (m, code, link, bold, em, bullet, html) => (code ? tok('s', code) : link ? tok('f', link) : bold ? tok('k', bold) : em ? tok('v', em) : bullet ? tok('o', bullet) : html ? tok('t', html) : esc(m)));
+  }).join('\n');
+}
+
+const diffed = (text) => text.split('\n').map((line) => (/^(\+\+\+|---|diff |index )/.test(line) ? tok('d', line) : line.startsWith('@@') ? tok('k', line) : line.startsWith('+') ? tok('i', line) : line.startsWith('-') ? tok('x', line) : esc(line))).join('\n');
+
+/* Source text as HTML. `e` is a file's ending or a language's name; text that no reader knows passes through
+   escaped. Past a megabyte nothing is coloured. */
+function highlight(text, e) {
+  if (text.length > 1000000) return esc(text);
+  const lang = langKey(String(e ?? '').toLowerCase());
+  switch (lang) {
+    case 'html': return htmled(text);
+    case 'css': return cssed(text);
+    case 'json': return jsoned(text);
+    case 'md': return marked(text);
+    case 'diff': return diffed(text);
+    case 'javascript': return lexed(text, 'js');
+    case 'typescript': return lexed(text, 'ts');
+    case 'python': return lexed(text, 'py');
+    case 'shell': case 'console': return lexed(text, 'sh');
+    case 'powershell': case 'pwsh': return lexed(text, 'ps1');
+    case 'rust': return lexed(text, 'rs');
+    case 'golang': return lexed(text, 'go');
+    case 'c++': return lexed(text, 'cpp');
+    case 'csharp': return lexed(text, 'cs');
+    case 'kotlin': return lexed(text, 'kt');
+    case 'ruby': return lexed(text, 'rb');
+    case 'yaml': return lexed(text, 'yml');
+    default: return lexed(text, lang);
+  }
 }
 
 /* The files open as editor tabs, per conversation. */
@@ -1543,6 +1740,7 @@ async function repoPick() {
 /* A conversation that had a repo, opened again: the browser kept the folder's handle, and the user's click
    gives the permission back. A private folder needs no asking. */
 async function repoReconnect(ask) {
+  const view = ui.views[S.conv.id];   // read now: the page redraws, and saves, while the folder is read
   const kept = await db.get('repo:' + S.conv.id);
   if (!kept?.root) return false;
   try {
@@ -1556,6 +1754,12 @@ async function repoReconnect(ask) {
     repo.busy = 'reading the folder…';
     drawSide();
     await repoIndex();
+    // the files that were open in this chat are open again
+    for (const p of (view?.open ?? []).slice(0, 12)) { try { if (await repoLoad(p)) S.open.push(p); } catch {} }
+    S.open = [...new Set(S.open)];
+    const first = S.open.includes(view?.file) ? view.file : S.open[0];
+    if (first) openFile(first);
+    repo.busy = '';
     drawSide();
     return true;
   } catch (e) {
@@ -2470,18 +2674,21 @@ function newConv() {
   S.preview = false;
 }
 
-async function openConv(id) {
+async function openConv(id, quiet = false) {
   if (S.live) return;
+  saveUi();
   const row = S.convs.find((x) => x.id === id);
   let c = await db.get('conv:' + id);
   if (row?.fetch || !c) {
     try {
-      c = (await harnessJson('/v1/convs/' + id)).conv;
+      const far = (await harnessJson('/v1/convs/' + id)).conv;
+      if (c?.repo) far.repo = c.repo;   // which folder a chat works in is this browser's own knowledge
+      c = far;
       await db.put('conv:' + id, c);
       if (row) delete row.fetch;
       await putIndex();
     } catch (e) {
-      if (!c) return toast('Could not open that chat: ' + e.message);
+      if (!c) return quiet ? undefined : toast('Could not open that chat: ' + e.message);
     }
   }
   repoClose();
@@ -2489,10 +2696,12 @@ async function openConv(id) {
   S.open = [];
   S.file = null;
   S.filter = '';
-  if (c.repo) { c.files = {}; repoReconnect(false); }   // the folder comes back by itself when the browser still allows it
-  const first = Object.keys(c.files).sort()[0];
+  if (c.repo) { c.files = {}; repoReconnect(false).then(() => drawSide()); }   // the folder comes back by itself when the browser still allows it
+  const view = ui.views[id];
+  S.open = (view?.open ?? []).filter((n) => n in c.files);
+  const first = view?.file in c.files ? view.file : S.open[0] ?? Object.keys(c.files).sort()[0];
   if (first) openFile(first);
-  S.preview = false;
+  S.preview = first && view?.file === first ? (view.preview ?? false) : false;
   S.panes.rail = false;
   draw();
 }
@@ -2636,7 +2845,7 @@ function inlined(html, files) {
 }
 
 const previewable = (name) => ['html', 'htm', 'svg', 'md', 'markdown'].includes(ext(name));
-const BADGE = { js: 'JS', ts: 'TS', json: '{}', html: '<>', css: '#', py: 'py', md: 'M', zig: 'Z', sh: '$', yml: 'Y', toml: 'T', sql: 'Q', go: 'go', rs: 'rs', c: 'C' };
+const BADGE = { js: 'JS', ts: 'TS', json: '{}', html: '<>', css: '#', py: 'py', md: 'M', zig: 'Z', sh: '$', ps1: 'PS', bat: '>_', yml: 'Y', toml: 'T', ini: 'T', sql: 'Q', go: 'go', rs: 'rs', c: 'C', cpp: 'C+', cs: 'C#', java: 'J', kt: 'K', swift: 'S', php: 'P', rb: 'rb', lua: 'L', diff: '±' };
 
 async function newFile(dir = '') {
   const name = fileName((await askText('New file name (for example index.html, or src/app.js)', dir)) ?? '');
@@ -2788,7 +2997,8 @@ let edWin = { name: '', wa: 0 };   // the window the editor last held, so a redr
      TA_LINES lines around the screen, moved as the view scrolls. An edit is spliced from the window into `doc`.
    In a windowed file Select All and Undo reach the window, not the whole file. */
 function editorNode(name, status) {
-  const kind = ext(name);
+  const kind = langOfName(name);
+  const unit = indentOf(name);
   const part = repo.partial.has(name);
   const gutter = h('div', { class: 'gutter', 'aria-hidden': 'true' });
   const hl = h('pre', { class: 'hl', 'aria-hidden': 'true' });
@@ -2796,6 +3006,7 @@ function editorNode(name, status) {
   const ta = h('textarea', { id: 'editor', class: 'ta', spellcheck: 'false', autocapitalize: 'off', autocomplete: 'off', wrap: 'off', 'aria-label': 'Contents of ' + name, ...(part ? { readonly: '' } : {}) });
   const inner = h('div', { class: 'code-inner' }, hl, ghost, ta);
   const code = h('div', { class: 'code' }, gutter, inner);
+  code.style.tabSize = unit === '  ' ? 2 : 4;
   let doc = S.conv.files[name];
   let starts = [0], longest = 0;   // where each line of doc begins
   let wa = 0, wb = 1;              // the textarea holds lines [wa, wb)
@@ -2888,7 +3099,7 @@ function editorNode(name, status) {
     if (part) return;
     if (e.key === 'Tab' && !e.shiftKey && !e.altKey && !mod) {
       e.preventDefault();   // Tab indents; Escape then Tab leaves the editor
-      ta.setRangeText('  ', ta.selectionStart, ta.selectionEnd, 'end');
+      ta.setRangeText(unit, ta.selectionStart, ta.selectionEnd, 'end');
       changed();
     } else if (e.key === 'Enter' && !mod && !e.shiftKey && !e.isComposing) {
       e.preventDefault();   // a new line starts where the last one did
@@ -2976,7 +3187,7 @@ function streamNode(w) {
 }
 function paintStream(node, w) {
   const follow = node.scrollHeight - node.scrollTop - node.clientHeight < 60;
-  node.querySelector('.hl').innerHTML = highlight(w.text, ext(w.name)) + '<span class="caret" aria-hidden="true"></span>\n';
+  node.querySelector('.hl').innerHTML = highlight(w.text, langOfName(w.name)) + '<span class="caret" aria-hidden="true"></span>\n';
   node.querySelector('.gutter').textContent = Array.from({ length: w.text.split('\n').length }, (_, i) => i + 1).join('\n');
   if (follow) node.scrollTop = node.scrollHeight;
 }
@@ -3044,7 +3255,9 @@ function codeTab() {
     ? h('div', { class: 'ide-empty' }, h('p', {}, names.length ? 'Pick a file from the explorer.' : 'Code the veil writes shows up here as it is written. You can edit it, preview a web page beside it, and download it.'),
         h('p', { class: 'fine' }, 'Ctrl+S saves · Ctrl+P finds a file · F2 renames · Tab indents'),
         h('p', { class: 'fine' }, 'Write a comment that asks for code (# write a script that…), press Ctrl+Enter, and it is written there.'),
-        h('div', { class: 'row-btns' }, h('button', { class: 'btn btn-sm', onclick: () => newFile() }, 'New file'),
+        h('div', { class: 'row-btns' },
+          lost ? h('button', { class: 'btn btn-solid btn-sm', title: 'The browser asks before it lets a page back into a folder', onclick: async () => { if (!(await repoReconnect(true))) toast('The browser no longer has that folder: open it again.'); drawSide(); } }, 'Reconnect ' + S.conv.repo.name) : null,
+          h('button', { class: 'btn btn-sm', onclick: () => newFile() }, 'New file'),
           inRepo || !canClone ? null : h('button', { class: 'btn btn-sm', title: 'Clone a git repository by its address into this browser, work in it, commit and push', onclick: clone }, 'Clone a repo'),
           inRepo ? null : h('button', { class: 'btn btn-sm', title: repo.canPick() ? 'Work in a folder on this computer: files are read as you open them and edits are written straight to it, so your own git sees them' : 'Add a folder\'s text files to this chat', onclick: openFolder }, folderWord)))
     : h('div', { class: 'ide-main' },
@@ -3058,10 +3271,10 @@ function codeTab() {
         h('div', { class: 'ide-body' + (S.preview === 'split' ? ' split' : '') },
           S.preview === true ? null : editorNode(open, status),
           S.preview ? previewNode(open) : null),
-        h('div', { class: 'ide-status' }, inRepo && repo.branch ? h('span', { title: 'The branch the folder is on' }, '⎇ ' + repo.branch) : null, h('span', {}, LANGS[ext(open)] ?? 'Plain text'), h('span', {}, S.conv.files[open].split('\n').length.toLocaleString() + ' lines'),
+        h('div', { class: 'ide-status' }, inRepo && repo.branch ? h('span', { title: 'The branch the folder is on' }, '⎇ ' + repo.branch) : null, h('span', {}, LANGS[ext(open)] ?? LANGS[langOfName(open)] ?? 'Plain text'), h('span', {}, S.conv.files[open].split('\n').length.toLocaleString() + ' lines'),
           repo.partial.has(open) ? h('span', { title: 'Too large to edit here' }, `first ${(REPO_TEXT_MAX / 1048576).toFixed(0)} MB of ${(repo.partial.get(open) / 1048576).toFixed(1)} MB · read-only`) : null, status, h('span', { class: 'grow' }),
           Number(S.status?.version) >= 9 ? h('button', { class: 'status-btn', id: 'completeDot', 'aria-pressed': String(ls.get('veilweb.complete', true)), title: 'Suggestions as you type, from your harness: Tab takes one, Escape drops it. Ctrl+Enter writes what a comment asks for, right under it.', onclick: () => { ls.set('veilweb.complete', !ls.get('veilweb.complete', true)); if (!ls.get('veilweb.complete', true)) completer.close(); drawSide(); } }, ls.get('veilweb.complete', true) ? '✦ Suggestions on' : '✧ Suggestions off') : null,
-          h('span', {}, 'Spaces: 2'), h('span', {}, 'UTF-8')));
+          h('span', {}, indentOf(open) === '\t' ? 'Tabs' : 'Spaces: ' + indentOf(open).length), h('span', {}, 'UTF-8')));
   return [h('div', { class: 'ide' + (S.explorer ? '' : ' no-exp') }, explorer, main)];
 }
 
@@ -3276,6 +3489,7 @@ function applyLayout(shell = document.querySelector('.shell')) {
 function setLayout(change) {
   Object.assign(S.lay, change);
   ls.set('veilweb.layout', S.lay);
+  if ('rail' in change || 'chat' in change) return draw();   // the panes carry each other's switches
   applyLayout();
   drawBar();
   drawSide();
@@ -3330,8 +3544,8 @@ function sidePane() {
     h('div', { class: 'tabs', role: 'tablist' }, tab('code', files ? `Code (${files})` : 'Code'), tab('jobs', active ? `Jobs (${active})` : 'Jobs'), tab('harness', outdated() ? 'Harness •' : 'Harness'),
       h('span', { class: 'grow' }),
       S.tab === 'code' ? h('button', { class: 'widen', 'aria-label': S.explorer ? 'Hide the explorer' : 'Show the explorer', 'aria-pressed': String(S.explorer), title: 'Explorer', onclick: () => { S.explorer = !S.explorer; drawSide(); } }, '☰') : null,
-      h('button', { class: 'widen', 'aria-label': S.lay.chat ? 'Hide the chat' : 'Show the chat', 'aria-pressed': String(!S.lay.chat), title: S.lay.chat ? 'Hide the chat (more room for code)' : 'Show the chat', onclick: () => setLayout({ chat: !S.lay.chat }) }, S.lay.chat ? '⇤' : '⇥'),
-      h('button', { class: 'widen', 'aria-label': fullCode() ? 'Leave full screen' : 'Full screen', 'aria-pressed': String(fullCode()), title: fullCode() ? 'Leave full screen (Esc)' : 'Full screen', onclick: () => toggleFull() }, fullCode() ? '⤡' : '⛶')),
+      h('button', { class: 'widen', 'aria-label': S.lay.chat ? 'Hide the chat' : 'Show the chat', 'aria-pressed': String(!S.lay.chat), title: S.lay.chat ? 'Hide the chat (more room for code)' : 'Show the chat', onclick: () => setLayout({ chat: !S.lay.chat }) }, S.lay.chat ? 'Hide chat' : 'Show chat'),
+      h('button', { class: 'widen', 'aria-label': fullCode() ? 'Leave full screen' : 'Full screen', 'aria-pressed': String(fullCode()), title: fullCode() ? 'Leave full screen (Esc)' : 'Full screen', onclick: () => toggleFull() }, fullCode() ? 'Exit full screen' : 'Full screen')),
     h('div', { class: 'pane tab-' + S.tab + (S.tab !== shownTab ? ' enter' : '') }, S.tab === 'code' ? codeTab() : S.tab === 'jobs' ? jobsTab() : harnessTab()));
 }
 let shownTab = 'code';   // the tab the pane last drew: only a change of tab is an entrance
@@ -3365,6 +3579,7 @@ function drawSide() {
     again.focus();
     if (caret) again.setSelectionRange(caret[0], caret[1]);
   }
+  saveUi();
 }
 
 function send(text) {
@@ -3420,7 +3635,9 @@ function dashboard() {
       linksBlock(),
       h('div', { class: 'who' }, h('span', { class: 'name', title: S.me?.email || '' }, S.me?.email || S.me?.account_name || 'Logged in with Cloudflare'),
         h('button', { class: 'btn btn-ghost btn-sm', onclick: () => logout() }, 'Log out'))),
-    h('main', { class: 'chat' }, transcript,
+    h('main', { class: 'chat' },
+      S.lay.rail ? null : h('button', { class: 'btn btn-ghost btn-sm only-wide rail-reopen', title: 'Show the chats list', onclick: () => setLayout({ rail: true }) }, '☰ Chats'),
+      transcript,
       h('div', { class: 'composer' },
         h('textarea', { id: 'prompt', rows: '1', placeholder: 'Message the veil', 'aria-label': 'Message', onkeydown: (e) => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); } }, oninput: (e) => { e.target.style.height = 'auto'; e.target.style.height = Math.min(220, e.target.scrollHeight) + 'px'; } }),
         S.live ? h('button', { class: 'btn', onclick: () => S.live.abort.abort() }, 'Stop') : h('button', { class: 'btn btn-solid', onclick: () => send() }, 'Send'))),
@@ -3552,6 +3769,9 @@ setTheme(document.documentElement.getAttribute('data-theme'));
   browserLink.init();
   await finishLogin();
   draw();
+  // the chat that was open comes back, and with it its files or its folder
+  if (S.session && ui.conv && S.convs.some((x) => x.id === ui.conv)) { try { await openConv(ui.conv, true); } catch {} }
+  uiReady = true;
   core.load();
   if (S.session && S.harness) findHarness(S.harness, true);
 })();

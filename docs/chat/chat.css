@@ -63,9 +63,8 @@ button:disabled, .btn[aria-disabled=true] { opacity: .5; cursor: default; pointe
   .shell.no-rail.no-chat { grid-template-columns: minmax(0, 1fr); }
   .shell.no-rail .rail, .shell.no-chat .chat, .shell.no-chat .splitter { display: none; }
   .shell.no-chat .side { border-left: 0; }
-  .only-wide { display: inline-grid; }
 }
-.only-wide { display: none; }
+@media (max-width: 980px) { .only-wide { display: none !important; } }
 .splitter { cursor: col-resize; background: transparent; position: relative; z-index: 2; touch-action: none; transition: background var(--quick); }
 .splitter::after { content: ''; position: absolute; inset: 0 -3px; }
 .splitter:hover, .splitter:focus-visible, .shell.dragging .splitter { background: var(--accent); outline: none; }
@@ -139,15 +138,6 @@ button:disabled, .btn[aria-disabled=true] { opacity: .5; cursor: default; pointe
 /* ---- the Code tab: an editor in the manner of VS Code, in the theme's own colours ---- */
 .side { container-type: inline-size; container-name: side; }
 .ide {
-  --tok-k: color-mix(in srgb, var(--magenta) 86%, var(--fg));
-  --tok-s: color-mix(in srgb, var(--green) 82%, var(--fg));
-  --tok-n: color-mix(in srgb, var(--orange) 80%, var(--fg));
-  --tok-c: var(--text-muted);
-  --tok-f: color-mix(in srgb, var(--blue) 84%, var(--fg));
-  --tok-t: color-mix(in srgb, var(--red) 84%, var(--fg));
-  --tok-a: color-mix(in srgb, var(--orange) 80%, var(--fg));
-  --tok-p: color-mix(in srgb, var(--teal) 80%, var(--fg));
-  --code-font: var(--font-mono);
   --code-size: 13px;
   --code-line: 20px;
   flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(150px, 210px) minmax(0, 1fr);
@@ -233,8 +223,6 @@ dialog.ask::backdrop { background: rgb(0 0 0 / .4); }
 .ta { position: absolute; inset: 0; width: 100%; height: 100%; min-height: 0; resize: none; overflow: hidden; background: transparent; color: transparent; caret-color: var(--text); border-radius: 0; outline: none; }
 .ta:focus { box-shadow: none; border: 0; }
 .ta::selection { background: color-mix(in srgb, var(--accent) 30%, transparent); color: transparent; }
-.tok-k { color: var(--tok-k); } .tok-s { color: var(--tok-s); } .tok-n { color: var(--tok-n); } .tok-c { color: var(--tok-c); font-style: italic; }
-.tok-f { color: var(--tok-f); } .tok-t { color: var(--tok-t); } .tok-a { color: var(--tok-a); } .tok-p { color: var(--tok-p); }
 .preview { flex: 1; min-height: 0; min-width: 0; width: 100%; border: 0; background: #fff; animation: fade var(--calm) both; }
 .ide-status { display: flex; align-items: center; gap: 14px; padding: 2px 12px; min-height: 22px; flex: 0 0 auto; font-size: var(--fs-micro); color: var(--on-accent); background: var(--accent); white-space: nowrap; overflow: hidden; }
 
@@ -336,3 +324,32 @@ details.tool pre { padding: 8px 10px; border-top: 1px solid var(--border); max-h
   *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
   .transcript { scroll-behavior: auto; }
 }
+
+/* ---- code: one type face and one palette per theme, the same in the editor and in a file being written ---- */
+.ide {
+  --code-font: "JetBrains Mono", "Cascadia Code", "Fira Code", "SF Mono", Menlo, Consolas, "DejaVu Sans Mono", "Liberation Mono", monospace;
+  --tok-c: #6b7689; --tok-s: #1f7a37; --tok-r: #b3261e; --tok-n: #a85400; --tok-k: #8a3ffc; --tok-y: #0b7285; --tok-f: #2f6feb; --tok-b: #a85400;
+  --tok-v: #b3261e; --tok-d: #8a5a00; --tok-o: #46557a; --tok-u: #5b6784; --tok-t: #c93a4a; --tok-a: #a85400; --tok-p: #0f6f8f; --tok-h: #2f6feb;
+  --tok-i: #1f7a37; --tok-x: #c93a4a; --code-fg: var(--text);
+}
+:root[data-theme="dark"] .ide {
+  --tok-c: #6f78a3; --tok-s: #9ece6a; --tok-r: #b4f9f8; --tok-n: #ff9e64; --tok-k: #bb9af7; --tok-y: #2ac3de; --tok-f: #7aa2f7; --tok-b: #ff9e64;
+  --tok-v: #e0af68; --tok-d: #e0af68; --tok-o: #89ddff; --tok-u: #8089b3; --tok-t: #f7768e; --tok-a: #e0af68; --tok-p: #73daca; --tok-h: #7aa2f7;
+  --tok-i: #9ece6a; --tok-x: #f7768e; --code-fg: #c0caf5;
+}
+:root[data-theme="matrix"] .ide {
+  --tok-c: #4a964a; --tok-s: #90e890; --tok-r: #d7a0e8; --tok-n: #ffcc44; --tok-k: #00ef72; --tok-y: #7eb7ff; --tok-f: #7eb7ff; --tok-b: #00aacc;
+  --tok-v: #5fd7c7; --tok-d: #d7a0e8; --tok-o: #16c56b; --tok-u: #88aa88; --tok-t: #00aacc; --tok-a: #5fd7c7; --tok-p: #5fd7c7; --tok-h: #f3f7f1;
+  --tok-i: #90e890; --tok-x: #ff2d55; --code-fg: #c8f0c8;
+}
+.code { font-feature-settings: "liga" 0, "calt" 0; font-kerning: none; -webkit-font-smoothing: antialiased; }
+.hl { color: var(--code-fg); }
+.tok-c { color: var(--tok-c); font-style: italic; } .tok-s { color: var(--tok-s); } .tok-r { color: var(--tok-r); } .tok-n { color: var(--tok-n); }
+.tok-k { color: var(--tok-k); } .tok-y { color: var(--tok-y); } .tok-f { color: var(--tok-f); } .tok-b { color: var(--tok-b); }
+.tok-v { color: var(--tok-v); } .tok-d { color: var(--tok-d); } .tok-o { color: var(--tok-o); } .tok-u { color: var(--tok-u); }
+.tok-t { color: var(--tok-t); } .tok-a { color: var(--tok-a); } .tok-p { color: var(--tok-p); } .tok-h { color: var(--tok-h); font-weight: 700; }
+.tok-i { color: var(--tok-i); } .tok-x { color: var(--tok-x); }
+:root[data-theme="matrix"] .tok-k { font-weight: 700; }
+.rail-reopen { align-self: flex-start; margin: 6px 0 0 8px; }
+.tabs .widen { font-size: var(--fs-micro); white-space: nowrap; }
+
