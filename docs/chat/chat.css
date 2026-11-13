@@ -13,6 +13,9 @@ body.chat-page { height: 100dvh; display: flex; flex-direction: column; overflow
 /* the app fills the window, so its top bar does too (the site's is held to its reading width) */
 .chat-page .topbar-inner { max-width: none; }
 .chat-page .topbar .nav { flex: 0 1 auto; min-width: 0; overflow: hidden; }
+/* A link that does not fit beside the chat's own controls goes whole, never cut mid-word: the links wrap, and only
+   their first row shows. */
+.chat-page .topbar .nav { flex-wrap: wrap; font-size: var(--fs-ui); max-height: 34px; max-height: calc(1lh + 14px); }
 .chat-page .topbar .nav a { white-space: nowrap; }
 .bar-slot { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .bar-slot select { min-height: 30px; max-width: 30ch; padding: 0 8px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); color: var(--text); font-size: var(--fs-small); transition: border-color var(--quick); }
@@ -55,10 +58,12 @@ button:disabled, .btn[aria-disabled=true] { opacity: .5; cursor: default; pointe
 .fine { font-size: var(--fs-small); color: var(--text-muted); }
 
 /* ---- the dashboard: three panes ---- */
-.shell { flex: 1; min-height: 0; display: grid; grid-template-columns: 240px minmax(0, 1fr) 5px var(--side-w, clamp(320px, 30vw, 460px)); position: relative; }
+/* The side pane is as wide as the reader dragged it (--side-w), but never so wide that the chat beside it drops
+   under 260px: a width set in a large window still fits after the window is made smaller. */
+.shell { flex: 1; min-height: 0; display: grid; grid-template-columns: 240px minmax(0, 1fr) 5px min(var(--side-w, clamp(320px, 30vw, 460px)), calc(100% - 505px)); position: relative; }
 /* wide screens: the chats list and the chat close; with both closed the code has the whole window */
 @media (min-width: 981px) {
-  .shell.no-rail { grid-template-columns: minmax(0, 1fr) 5px var(--side-w, clamp(320px, 30vw, 460px)); }
+  .shell.no-rail { grid-template-columns: minmax(0, 1fr) 5px min(var(--side-w, clamp(320px, 30vw, 460px)), calc(100% - 265px)); }
   .shell.no-chat { grid-template-columns: 240px minmax(0, 1fr); }
   .shell.no-rail.no-chat { grid-template-columns: minmax(0, 1fr); }
   .shell.no-rail .rail, .shell.no-chat .chat, .shell.no-chat .splitter { display: none; }
@@ -105,7 +110,10 @@ button:disabled, .btn[aria-disabled=true] { opacity: .5; cursor: default; pointe
 .who { padding: 10px var(--pad-in); border-top: 1px solid var(--border); font-size: var(--fs-small); color: var(--text-secondary); display: flex; align-items: center; gap: 8px; }
 .who .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-.tabs { display: flex; gap: 2px; padding: 8px 8px 0; border-bottom: 1px solid var(--border); align-items: flex-end; }
+/* The row wraps: in a pane too narrow for the tabs and the pane's own buttons on one line, the buttons take a
+   second line (right-aligned) instead of running off the pane's edge. */
+.tabs { display: flex; flex-wrap: wrap; gap: 2px; padding: 8px 8px 0; border-bottom: 1px solid var(--border); align-items: flex-end; }
+.tabs .grow + .widen { margin-left: auto; }
 .tabs button { padding: 7px 11px; border: 0; background: transparent; color: var(--text-secondary); border-radius: var(--radius-btn) var(--radius-btn) 0 0; font-size: var(--fs-ui); transition: background var(--quick), color var(--quick); }
 .tabs button:hover { background: var(--surface-hover); color: var(--text); }
 .tabs button.on { color: var(--accent); background: var(--tonal); box-shadow: inset 0 -2px 0 var(--accent); }
