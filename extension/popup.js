@@ -13,6 +13,7 @@ async function refresh() {
     : "start the veil, then press Connect";
   $("pause").textContent = s.paused ? "Resume" : "Pause";
   if (s.port && !$("port").value) $("port").value = s.port;
+  $("web").checked = !!s.web_allowed;
 }
 
 $("connect").onclick = async () => {
@@ -31,6 +32,12 @@ $("pause").onclick = async () => {
 
 $("disconnect").onclick = async () => {
   await ask({ type: "disconnect" });
+  refresh();
+};
+
+// The web chat may drive the veil's tab only while this box is ticked.
+$("web").onchange = async () => {
+  await ask({ type: "web-allow", allowed: $("web").checked });
   refresh();
 };
 

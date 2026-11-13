@@ -1,10 +1,17 @@
 {
   "manifest_version": 3,
   "name": "nl-veil browser link",
-  "version": "0.1.0",
-  "description": "Lets a local nl-veil server drive one tab in this browser, using your own profile and logins.",
+  "version": "0.2.0",
+  "description": "Lets a local nl-veil server, or the nl-veil web chat when you allow it, drive one tab in this browser, using your own profile and logins.",
   "permissions": ["debugger", "tabs", "storage", "alarms"],
   "host_permissions": ["http://127.0.0.1/*", "http://localhost/*"],
+  "content_scripts": [
+    {
+      "matches": ["https://gary23w.github.io/nl-veil/chat/*"],
+      "js": ["bridge.js"],
+      "run_at": "document_start"
+    }
+  ],
   "background": {
     "service_worker": "background.js",
     "type": "module"

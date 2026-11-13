@@ -263,12 +263,51 @@ chrome.debugger.onDetach.addListener(async (source) => {
   if (source.tabId && (await getTab()) === source.tabId) await setTab(0);
 });
 
-// The popup's controls.
-chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
+// THE WEB CHAT (bridge.js): the nl-veil chat page has no local server to pair with, so its commands arrive here
+// as messages from the one content script the manifest injects into that page. Three gates, all here:
+//   1. the sender must be that content script on the chat page (a tab of this browser, at that address);
+//   2. the user must have ticked "Let the web chat drive a tab" in the popup (off until they do);
+//   3. execute() only ever touches the one tab the veil opened itself, never the tab the user is reading.
+const WEB_CHAT = "https://gary23w.github.io/nl-veil/chat/";
+const fromWebChat = (sender) => !!sender.tab && typeof sender.url === "string" && sender.url.startsWith(WEB_CHAT);
+
+async function webAllowed() {
+  return !!(await chrome.storage.local.get("web_allowed")).web_allowed;
+}
+
+// The popup's controls, and the web chat's commands.
+chrome.runtime.onMessage.addListener((msg, sender, reply) => {
   (async () => {
+    if (msg.type === "web-status") {
+      reply({ version: VERSION, browser: BROWSER, allowed: fromWebChat(sender) && (await webAllowed()) });
+      return;
+    }
+    if (msg.type === "web") {
+      if (!fromWebChat(sender)) return reply({ err: "only the nl-veil web chat may send commands" });
+      if (!(await webAllowed())) return reply({ err: "not allowed: open the nl-veil browser link popup and tick 'Let the web chat drive a tab'" });
+      try {
+        // No sessionId is taken from the page: a page that could name a tab could reach the tabs you are
+        // reading. execute() then falls back to the veil's own tab, the only one this path may touch.
+        const cmd = msg.cmd || {};
+        reply({ result: await execute({ method: String(cmd.method || ""), params: cmd.params || {} }) });
+      } catch (e) {
+        reply({ err: String((e && e.message) || e) });
+      }
+      return;
+    }
+    if (msg.type === "web-allow") {
+      if (sender.tab) return reply({ ok: false }); // only the popup sets this, never a page
+      await chrome.storage.local.set({ web_allowed: !!msg.allowed });
+      if (!msg.allowed) {
+        const tabId = await getTab();
+        if (tabId) await closeTab(tabId); // taking the permission back takes the tab back
+      }
+      reply({ ok: true });
+      return;
+    }
     if (msg.type === "status") {
       const c = await cfg();
-      reply({ ...c, tabId: await getTab(), browser: BROWSER, version: VERSION, running });
+      reply({ ...c, tabId: await getTab(), browser: BROWSER, version: VERSION, running, web_allowed: await webAllowed() });
       return;
     }
     if (msg.type === "connect") {
