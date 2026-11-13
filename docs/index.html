@@ -22,7 +22,7 @@
      the web client uses (web/public/index.html). */
   try {
     var t = localStorage.getItem('veil.theme');
-    if (!t) t = matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+    if (!t) t = 'matrix';   /* the Agent Garrett theme, until the reader picks another */
     document.documentElement.setAttribute('data-theme', t);
   } catch (e) {}
 </script>

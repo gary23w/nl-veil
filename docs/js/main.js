@@ -23,7 +23,7 @@
 
   const themeBtn = document.getElementById('themeBtn');
 
-  function currentTheme() { return root.getAttribute('data-theme') || 'light'; }
+  function currentTheme() { return root.getAttribute('data-theme') || 'matrix'; }
 
   function setTheme(id) {
     const t = THEMES.find((x) => x.id === id) || THEMES[0];
