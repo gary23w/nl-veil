@@ -86,3 +86,9 @@ export fn veil_net_head() u64 {
     const out = gpa.dupe(u8, net.NET_NOTE_HEAD) catch return 0;
     return pack(out);
 }
+
+/// The video renderer (render.zig) is part of this module: its exports ride beside the ones above.
+pub const render = @import("render.zig");
+comptime {
+    _ = render;
+}
