@@ -6216,11 +6216,13 @@ function sidePane() {
   const active = S.jobs.filter((j) => j.state === 'queued' || j.state === 'running').length;
   return h('aside', { class: 'side', id: 'side' },
     h('div', { class: 'tabs' },
-      h('div', { class: 'tab-row', role: 'tablist' }, tab('code', 'Code'), tab('swarm', hive.list.some((x) => x.state === 'running') ? 'Swarm •' : 'Swarm'), SIDE_TABS.map((t) => tab(t.id, t.label())), tab('jobs', active ? `Jobs (${active})` : 'Jobs'), tab('harness', outdated() ? 'Harness •' : 'Harness')),
+      h('div', { class: 'tab-row', role: 'tablist' }, tab('code', 'Code'), tab('swarm', hive.list.some((x) => x.state === 'running') ? 'Swarm •' : 'Swarm'), SIDE_TABS.map((t) => tab(t.id, t.label())), tab('jobs', active ? `Jobs (${active})` : 'Jobs'), tab('harness', outdated() ? 'Harness •' : 'Harness'))),
+    h('div', { class: 'pane tab-' + S.tab + (S.tab !== shownTab ? ' enter' : '') }, S.tab === 'code' ? codeTab() : S.tab === 'swarm' ? swarmTab() : S.tab === 'jobs' ? jobsTab() : S.tab === 'harness' ? harnessTab() : (SIDE_TABS.find((t) => t.id === S.tab)?.draw() ?? codeTab())),
+    // the pane's own buttons, in a footer pinned under it
+    h('div', { class: 'side-foot' },
       S.tab === 'code' ? h('button', { class: 'widen', 'aria-label': S.explorer ? 'Hide the explorer' : 'Show the explorer', 'aria-pressed': String(S.explorer), title: 'Explorer', onclick: () => { S.explorer = !S.explorer; drawSide(); } }, '☰') : null,
       h('button', { class: 'widen', 'aria-label': S.lay.chat ? 'Hide the chat' : 'Show the chat', 'aria-pressed': String(!S.lay.chat), title: S.lay.chat ? 'Hide the chat (more room for code)' : 'Show the chat', onclick: () => setLayout({ chat: !S.lay.chat }) }, S.lay.chat ? 'Hide chat' : 'Show chat'),
-      h('button', { class: 'widen', 'aria-label': fullCode() ? 'Leave full screen' : 'Full screen', 'aria-pressed': String(fullCode()), title: fullCode() ? 'Leave full screen (Esc)' : 'Full screen', onclick: () => toggleFull() }, fullCode() ? 'Exit full screen' : 'Full screen')),
-    h('div', { class: 'pane tab-' + S.tab + (S.tab !== shownTab ? ' enter' : '') }, S.tab === 'code' ? codeTab() : S.tab === 'swarm' ? swarmTab() : S.tab === 'jobs' ? jobsTab() : S.tab === 'harness' ? harnessTab() : (SIDE_TABS.find((t) => t.id === S.tab)?.draw() ?? codeTab())));
+      h('button', { class: 'widen', 'aria-label': fullCode() ? 'Leave full screen' : 'Full screen', 'aria-pressed': String(fullCode()), title: fullCode() ? 'Leave full screen (Esc)' : 'Full screen', onclick: () => toggleFull() }, fullCode() ? 'Exit full screen' : 'Full screen')));
 }
 let shownTab = 'code';   // the tab the pane last drew: only a change of tab is an entrance
 
@@ -6239,6 +6241,7 @@ function drawSide() {
   if (S.tab === shownTab) {
     // the same tab with newer data: its pane stays where it is (and keeps any entrance still playing)
     old.querySelector('.tabs').replaceWith(fresh.querySelector('.tabs'));
+    old.querySelector('.side-foot')?.replaceWith(fresh.querySelector('.side-foot'));
     old.querySelector('.pane').replaceChildren(...fresh.querySelector('.pane').childNodes);
   } else old.replaceWith(fresh);
   shownTab = S.tab;

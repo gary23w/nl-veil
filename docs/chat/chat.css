@@ -135,6 +135,13 @@ button:disabled, .btn[aria-disabled=true] { opacity: .5; cursor: default; pointe
   .tabs:has(> .tab-row) > .widen { padding: 3px 4px; }
   .tabs:has(> .tab-row) > .widen:first-of-type { margin-left: 2px; }
 }
+/* The pane's own buttons (the explorer switch, Hide chat, Full screen) in a footer pinned under the pane, so the tab
+   strip above holds the tabs alone. The side panel is a column and the pane takes the rest, so it stays at the bottom. */
+.side-foot { flex: 0 0 auto; display: flex; align-items: center; justify-content: flex-end; gap: 4px; padding: 4px 8px max(4px, env(safe-area-inset-bottom)); border-top: 1px solid var(--border); background: var(--surface-raised); }
+.side-foot .widen { padding: 4px 9px; border: 0; border-radius: var(--radius-btn); background: transparent; color: var(--text-secondary); font-size: var(--fs-small); white-space: nowrap; transition: background var(--quick), color var(--quick); }
+.side-foot .widen:hover { background: var(--surface-hover); color: var(--text); }
+.side-foot .widen[aria-pressed=true] { color: var(--accent); }
+.side-foot .widen[title=Explorer] { margin-right: auto; }
 .pane { flex: 1; min-height: 0; overflow: auto; display: flex; flex-direction: column; }
 /* a change of tab eases in; a redraw of the same tab (fresh data) does not move at all */
 @keyframes tab-in { from { opacity: .35; transform: translateY(5px); } to { opacity: 1; transform: none; } }
@@ -339,7 +346,7 @@ details.tool pre { padding: 8px 10px; border-top: 1px solid var(--border); max-h
   .shell.show-rail .rail, .shell.show-side .side { transform: none; visibility: visible; }
   .scrim { display: block; position: absolute; inset: 0; z-index: 5; background: rgb(0 0 0 / .35); opacity: 0; pointer-events: none; transition: opacity var(--calm); }
   .shell.show-rail .scrim, .shell.show-side .scrim { opacity: 1; pointer-events: auto; }
-  .tabs .widen { display: none; }
+  .tabs .widen, .side-foot { display: none; }
   .only-narrow { display: grid; }
   .bar-slot .chip:not(.warn) { display: none; }
   .bar-slot select { max-width: 13ch; }
