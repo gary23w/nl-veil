@@ -74,7 +74,7 @@
 // No imports and no platform globals beyond fetch/Response/crypto, so a test can run this file under node with
 // a Map for storage and a scripted env.AI.
 
-export const VERSION = "12";
+export const VERSION = "13";
 const API_ROOT = "https://api.cloudflare.com/client/v4";
 const PY_SOURCE = "https://raw.githubusercontent.com/gary23w/nl-veil/main/cloud/tot_py.py";
 const SELF_SCRIPT = "veil-web";
@@ -125,6 +125,8 @@ const MODELS_TTL_MS = 15 * 60 * 1000;
 const LLMS_TTL_MS = 24 * 3600 * 1000;
 const LLMS_DIGEST_MAX = 3500;
 export const SCHEDULES_MAX = 12;
+export const IMAGE_BYTES_MAX = 6 * MB; // one picture sent in (as base64 text, so about 4.5 MB of image)
+export const IMAGE_INPUTS_MAX = 4; // pictures one request may send in
 export const SWARMS_MAX = 8; // swarms kept, running or ended
 export const SWARM_WORKERS_MAX = 6; // tasks one cycle hands out
 export const SWARM_CYCLES_MAX = 40; // cycles one swarm may take
@@ -435,6 +437,45 @@ function toolCall(reply, known) {
 /// The text of a model answer with any reasoning block removed.
 export function answerText(r) {
   return modelText(r).replace(/<think>[\s\S]*?<\/think>/gi, "").replace(/<think>[\s\S]*$/i, "").trim();
+}
+
+/// Bytes as base64, and back. (A Worker has btoa/atob, which take binary strings.)
+function toBase64(bytes) {
+  let bin = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  return btoa(bin);
+}
+function fromBase64(text) {
+  const bin = atob(text);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+/// A picture as it was sent in: a data: URL or bare base64. {type, b64, bytes}, or null when it is not one.
+export function pictureFrom(v) {
+  const text = String(v ?? "");
+  const m = /^data:(image\/[a-z0-9.+-]+);base64,([A-Za-z0-9+/=\s]+)$/i.exec(text);
+  const b64 = (m ? m[2] : text).replace(/\s+/g, "");
+  if (b64.length < 16 || b64.length > IMAGE_BYTES_MAX || !/^[A-Za-z0-9+/]+=*$/.test(b64)) return null;
+  let bytes;
+  try {
+    bytes = fromBase64(b64);
+  } catch {
+    return null;
+  }
+  // the type is read from the bytes themselves, not from what the sender called it
+  const type = bytes[0] === 0x89 && bytes[1] === 0x50 ? "image/png" : bytes[0] === 0xff && bytes[1] === 0xd8 ? "image/jpeg" : bytes[0] === 0x47 && bytes[1] === 0x49 ? "image/gif" : bytes[0] === 0x52 && bytes[8] === 0x57 ? "image/webp" : "";
+  return type ? { type, b64, bytes } : null;
+}
+/// What an image model gave back, as {b64, type}: models answer with base64 in a field, or with the bytes themselves.
+async function pictureOut(r) {
+  let bytes = null;
+  if (r instanceof ReadableStream) bytes = new Uint8Array(await new Response(r).arrayBuffer());
+  else if (r instanceof ArrayBuffer) bytes = new Uint8Array(r);
+  else if (r instanceof Uint8Array) bytes = r;
+  const b64 = bytes ? toBase64(bytes) : String(r?.image ?? r?.result?.image ?? r?.images?.[0] ?? r?.data?.[0]?.b64_json ?? "");
+  const pic = pictureFrom(b64);
+  return pic ? { b64: pic.b64, type: pic.type } : null;
 }
 
 /// A model's completion made fit to insert: no code fence, no repeat of the line being typed, nothing that runs
@@ -1301,6 +1342,99 @@ export class Harness {
     await this.rearm(wait, nextDue);
   }
 
+  // ---------------------------------------------------------------- images
+
+  /// The account's image models (Workers AI's Text-to-Image list), kept a while.
+  async imageModels(who) {
+    const kept = await this.store.get("image_models");
+    if (kept && Date.now() - kept.at < MODELS_TTL_MS) return kept.list;
+    const j = await this.api(who.token, "GET", `/accounts/${who.account}/ai/models/search?task=Text-to-Image&hide_experimental=true&per_page=100`);
+    const list = (Array.isArray(j?.result) ? j.result : []).filter((m) => typeof m?.name === "string" && m.name.startsWith("@")).map((m) => ({ id: m.name, about: clip(String(m.description ?? ""), 160) })).sort((a, b) => a.id.localeCompare(b.id));
+    if (list.length === 0) return kept?.list ?? [];
+    await this.store.put("image_models", { at: Date.now(), list });
+    return list;
+  }
+
+  /// One picture from words, or from words and pictures (an edit, or a new picture that takes after them).
+  /// HOW a model wants to be asked differs (plain fields, or a form with the pictures in it) and is LEARNED, never
+  /// read off the model's name: the plain way is tried first unless pictures are sent, and what worked is kept.
+  async image(body) {
+    const model = String(body.model ?? "");
+    const prompt = clip(String(body.prompt ?? "").trim(), 2048);
+    if (!model.startsWith("@")) return { err: "model must be a Workers AI model id" };
+    if (!prompt) return { err: "say what the picture should show" };
+    const sent = (Array.isArray(body.images) ? body.images : body.image ? [body.image] : []).slice(0, IMAGE_INPUTS_MAX);
+    const pics = sent.map(pictureFrom);
+    if (pics.some((x) => !x)) return { err: "an input picture could not be read: send PNG, JPEG, WebP or GIF as a data: URL, each under about 4 MB" };
+    const int = (v, lo, hi) => (Number.isFinite(Number(v)) && v !== null && v !== "" ? Math.min(hi, Math.max(lo, Math.floor(Number(v)))) : undefined);
+    const opts = { width: int(body.width, 256, 2048), height: int(body.height, 256, 2048), steps: int(body.steps, 1, 50), seed: int(body.seed, 0, 2 ** 31 - 1) };
+    for (const k of Object.keys(opts)) if (opts[k] === undefined) delete opts[k];
+    const quirks = (await this.store.get("quirks")) ?? {};
+    const asForm = async () => {
+      const form = new FormData();
+      form.append("prompt", prompt);
+      for (const [k, v] of Object.entries(opts)) form.append(k, String(v));
+      pics.forEach((pic, i) => form.append("input_image_" + i, new Blob([pic.bytes], { type: pic.type }), "input_" + i + "." + pic.type.split("/")[1]));
+      const req = new Request("http://form.invalid/", { method: "POST", body: form });
+      return this.env.AI.run(model, { multipart: { body: req.body, contentType: req.headers.get("content-type") } });
+    };
+    const asFields = () => this.env.AI.run(model, { prompt, ...opts, ...(pics.length ? { image_b64: pics[0].b64 } : {}) });
+    const order = quirks[model]?.form === true || (pics.length > 0 && quirks[model]?.form !== false) ? [asForm, asFields] : [asFields, asForm];
+    let out = null, why = "";
+    for (const ask of order) {
+      try {
+        out = await pictureOut(await ask());
+        if (out) {
+          const form = ask === asForm;
+          if (quirks[model]?.form !== form) {
+            quirks[model] = { ...quirks[model], form };
+            await this.store.put("quirks", quirks);
+          }
+          break;
+        }
+        why = why || "the model answered without a picture";
+      } catch (e) {
+        why = clip(e?.message ?? e, 300);
+      }
+    }
+    await this.spend(1, prompt.length + pics.reduce((n, x) => n + x.bytes.length, 0) + (out ? out.b64.length : 0));
+    return out ? { image: out.b64, type: out.type, model } : { err: "no picture came back: " + why };
+  }
+
+  /// A vision model's answer about one picture.
+  async look(body) {
+    const model = String(body.model ?? "");
+    if (!model.startsWith("@")) return { err: "model must be a Workers AI model id" };
+    const pic = pictureFrom(body.image);
+    if (!pic) return { err: "the picture could not be read: send PNG, JPEG, WebP or GIF as a data: URL, under about 4 MB" };
+    const question = clip(String(body.question ?? "").trim(), 4000) || "Describe this picture in detail, for someone who cannot see it. Copy any text in it exactly.";
+    const url = `data:${pic.type};base64,${pic.b64}`;
+    const quirks = (await this.store.get("quirks")) ?? {};
+    // the chat shape with the picture as a part of the message; and the older shape, a prompt beside the bytes
+    const asParts = async () => answerText(await this.env.AI.run(model, { messages: [{ role: "user", content: [{ type: "text", text: question }, { type: "image_url", image_url: { url } }] }], max_tokens: 1024 }));
+    const asBytes = async () => answerText(await this.env.AI.run(model, { prompt: question, image: [...pic.bytes], max_tokens: 1024 }));
+    const order = quirks[model]?.look === "bytes" ? [asBytes, asParts] : [asParts, asBytes];
+    let text = "", why = "";
+    for (const ask of order) {
+      try {
+        text = await ask();
+        if (text) {
+          const how = ask === asBytes ? "bytes" : "parts";
+          if (quirks[model]?.look !== how) {
+            quirks[model] = { ...quirks[model], look: how };
+            await this.store.put("quirks", quirks);
+          }
+          break;
+        }
+        why = why || "the model answered nothing";
+      } catch (e) {
+        why = clip(e?.message ?? e, 300);
+      }
+    }
+    await this.spend(1, pic.bytes.length + question.length + text.length);
+    return text ? { text, model } : { err: "the vision model gave no answer: " + why };
+  }
+
   // ---------------------------------------------------------------- swarms
 
   /// A SWARM works toward one goal with nobody watching. It runs here, in the harness, so it goes on with every
@@ -1928,6 +2062,16 @@ export class Harness {
 
     if (method === "POST" && at === "complete") return say({ ok: true, ...(await this.complete(body)) });
     if (method === "POST" && at === "git") return this.git(body);
+
+    // Images: make one, look at one. (The body is JSON; a picture travels as a data: URL.)
+    if (method === "GET" && at === "image/models") return say({ ok: true, models: await this.imageModels(who) });
+    if (method === "POST" && (at === "image" || at === "look")) {
+      if (!this.env.AI) return bad("this Worker has no AI binding", 500);
+      const why = await this.spent(true);
+      if (why) return bad(why, 429);
+      const got = at === "image" ? await this.image(body) : await this.look(body);
+      return got.err ? bad(got.err, /could not be read|must be|say what/.test(got.err) ? 400 : 502) : say({ ok: true, ...got });
+    }
 
     if (method === "POST" && at === "clef") {
       const why = await this.spent(true);
