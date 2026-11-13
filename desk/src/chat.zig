@@ -1790,6 +1790,11 @@ pub const Chat = struct {
             defer self.store.unlock();
             break :blk_tm self.store.settings.tool_map;
         };
+        const clef_mode: bool = blk_cl: {
+            self.store.lock();
+            defer self.store.unlock();
+            break :blk_cl self.store.settings.clef;
+        };
         const use_garrett: bool = blk_ug: {
             self.store.lock();
             defer self.store.unlock();
@@ -1852,6 +1857,8 @@ pub const Chat = struct {
             if (fast_reasoning) w.writeAll(",\"fast\":true") catch break :blk false;
             // Send both states: OFF must override a server launched with NL_TOOL_MAP=1 too.
             w.writeAll(if (tool_map) ",\"tool_map\":true" else ",\"tool_map\":false") catch break :blk false;
+            // Both states, for the same reason: OFF must override a server whose clef default is on.
+            w.writeAll(if (clef_mode) ",\"clef\":true" else ",\"clef\":false") catch break :blk false;
             if (use_garrett) w.writeAll(",\"garrett\":true") catch break :blk false;
             // Optional single-image attachment. base64's alphabet ([A-Za-z0-9+/=]) needs no JSON escaping.
             if (image_b64.len > 0) {
@@ -5303,6 +5310,7 @@ pub const Chat = struct {
         var browser_headful = false;
         var fast_reasoning = false;
         var tool_map = false;
+        var clef_mode = false;
         var leftw: u16 = 230;
         var rightw: u16 = 320;
         var conh: u16 = 280;
@@ -5341,6 +5349,7 @@ pub const Chat = struct {
             browser_headful = s.browser_headful;
             fast_reasoning = s.fast_reasoning;
             tool_map = s.tool_map;
+            clef_mode = s.clef;
             leftw = s.chat_left_w;
             rightw = s.chat_right_w;
             conh = s.chat_con_h;
@@ -5372,6 +5381,7 @@ pub const Chat = struct {
         // server mode on. A fresh key on each break keeps a bad persisted state from surviving it.
         jb.print(self.gpa, "\",\"left\":{},\"right\":{},\"shell_allow\":{},\"speed\":{},\"srv_brain\":{},\"dyslexia\":{},\"font_scale\":{d},\"font_bold\":{},\"narrator\":{},\"browser_headful\":{},\"fast_reasoning\":{},\"leftw\":{d},\"rightw\":{d},\"conh\":{d}", .{ lopen, ropen, shell_allow, speed, server_chat, dyslexia, font_scale, font_bold, narrator, browser_headful, fast_reasoning, leftw, rightw, conh }) catch return;
         jb.print(self.gpa, ",\"tool_map\":{}", .{tool_map}) catch return;
+        jb.print(self.gpa, ",\"clef\":{}", .{clef_mode}) catch return;
         // MODEL TRIO: the "use one model for all three" flag + the thinking/prompting role overrides. Role keys
         // are NOT written here — they live in the OS secret store (secrets.zig), keyed by provider slug.
         jb.print(self.gpa, ",\"unified\":{}", .{unified}) catch return;
@@ -5529,6 +5539,11 @@ pub const Chat = struct {
             s.tool_map = true;
         } else if (std.mem.indexOf(u8, data, "\"tool_map\":false") != null) {
             s.tool_map = false;
+        }
+        if (std.mem.indexOf(u8, data, "\"clef\":true") != null) {
+            s.clef = true;
+        } else if (std.mem.indexOf(u8, data, "\"clef\":false") != null) {
+            s.clef = false;
         }
         self.syncBrowserPref(s.browser_headful); // reflect the persisted choice to the daemon prefs file at startup
         if (jInt(data, "font_scale")) |v| {

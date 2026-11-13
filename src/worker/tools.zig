@@ -1616,6 +1616,13 @@ fn executeInner(ctx: *ToolCtx, name: []const u8, args_json: []const u8) []u8 {
         if (!ctx.internet) return dupe(gpa, "web disabled: this is an OFFLINE run, and Agent Garrett answers over the internet. Answer from the hive's preloaded memory.");
         return garrett.run(.{ .gpa = gpa, .io = ctx.io, .scratch = ctx.run_dir, .url = ctx.garrett_url, .token = ctx.garrett_token }, name, args_json);
     }
+    // ...and an mcp_call that names Agent Garrett is the same tool, asked for by the generic verb's name
+    // (garrett.fromMcpCall): it runs here, never as a lookup in the machine's MCP config files.
+    if (garrett.fromMcpCall(gpa, name, args_json)) |gar_args| {
+        defer gpa.free(gar_args);
+        if (!ctx.internet) return dupe(gpa, "web disabled: this is an OFFLINE run, and Agent Garrett answers over the internet. Answer from the hive's preloaded memory.");
+        return garrett.run(.{ .gpa = gpa, .io = ctx.io, .scratch = ctx.run_dir, .url = ctx.garrett_url, .token = ctx.garrett_token }, "garrett", gar_args);
+    }
     if (!ctx.internet and (std.mem.eql(u8, name, "web_fetch") or std.mem.eql(u8, name, "web_search") or
         std.mem.eql(u8, name, "fetch_json") or std.mem.eql(u8, name, "read_url") or
         std.mem.eql(u8, name, "osint_scan") or std.mem.eql(u8, name, "deep_crawl")))

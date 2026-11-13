@@ -389,6 +389,10 @@ pub const Settings = struct {
     fast_reasoning: bool = false,
     // Opt-in tool tree (NL_TOOL_MAP=1), sent per message so toggling needs no server restart.
     tool_map: bool = false,
+    // Clef mode: the turn's yes/no decisions go to Cloudflare's Clef model first, on the user's Cloudflare login.
+    // ON by default (NL_CLEF=0 seeds it off): it does nothing until the user is logged in to Cloudflare, so logging
+    // in is what turns it on. Sent per message so toggling needs no server restart.
+    clef: bool = true,
 
     pub fn dataDir(s: *const Settings) []const u8 {
         return s.data_dir[0..s.data_dir_len];

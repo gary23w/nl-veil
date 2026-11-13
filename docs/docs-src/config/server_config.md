@@ -29,6 +29,7 @@ Constructed and `load`ed in main.zig; `gateway/http.zig` re-exports the type and
 - Concurrency: fixed-size buffers behind a mutex, copied in and out — no slice handed out that could dangle when the value changes underneath a request, and no allocation on the read path (`defaults` copies into the caller's allocator; `defaultsRaw` is the internal lock-and-slice form).
 - `check` rejects rather than truncates (TooLong / BadInput on quotes and control bytes): a silently clipped model id would fail later as a confusing provider 404 instead of an error where it was typed.
 - The env is a SEED, not an override: once the file exists, a stale `NL_DEFAULT_MODEL` in some launch script must not silently win on restart and undo the admin.
+- Clef mode's server default (`clef()`, `setClef`, `"clef"` in the file) is orthogonal the same way: it is what a chat turn gets when its client did not choose ([clef](#doc=worker/chat/clef)). It is ON unless `NL_CLEF` says off (`0`, `off`) on a fresh install or over a file written before the key existed; a saved value wins after that.
 - The browser preference is orthogonal by contract — `setAll` never touches it, `setBrowser` never touches the models — and normalizes to `"" | "chrome" | "edge" | "chromium"`; junk degrades to `""` (the Edge-first default order) rather than persisting. It is a NAME preference, never a path (an arbitrary executable stays the `NL_BROWSER_BIN` operator escape).
 - A failed save never fails the request; the value is already live in memory.
 

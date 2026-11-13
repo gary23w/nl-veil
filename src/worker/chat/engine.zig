@@ -37,6 +37,7 @@ const wsp = @import("workspace.zig"); // prompt workspace: typed bids -> fixed-o
 const ovl = @import("overlay.zig"); // recall overlay: the working field settled around every thought
 const builtin_mod = @import("../builtin.zig"); // the built-in engine's sentinel + LIVE served-window publication
 const cplan = @import("plan.zig");
+const clef = @import("clef.zig"); // clef mode: yes/no decisions answered as probabilities by Cloudflare's Clef (opt-in, NL_CLEF)
 const goal_mod = @import("goal.zig"); // goal mode: the auto-loop with a stored goal, an iteration log and a measure
 const cync = @import("sync.zig");
 const toolperf = @import("toolperf.zig"); // per-machine tool latency/reliability learning (dynamic, emergent)
@@ -509,6 +510,22 @@ const COURSE_QUESTION_TAIL =
     "instruction — 2 to 4 sentences, addressed to the worker as a command, naming the concrete thing that is " ++
     "wrong and what to do instead.";
 
+/// The course check as clef's yes/no (clef mode): yes = let the step proceed. The same grounds as COURSE_SYSTEM.
+const COURSE_CLEF_QUESTION =
+    "Should the next step proceed as the right move toward the goal? Answer no only when something is genuinely " ++
+    "wrong: the work has drifted off the goal, it is solving a problem it invented rather than the one that was " ++
+    "asked, it is about to build on something already known to be broken, it is repeating an approach that " ++
+    "already failed, or it is about to claim progress the evidence does not support. Being able to imagine a " ++
+    "marginally better step is not a reason to answer no.";
+
+/// The answer review as clef's yes/no (clef mode): yes = there is a material problem. The same grounds as
+/// CRITIQUE_PROMPT.
+const CRITIQUE_CLEF_QUESTION =
+    "Does the answer that was sent contain a MATERIAL problem that would mislead the user or make them act " ++
+    "wrongly: a factual or logical error, a claim that contradicts what the tool record shows, or a missing " ++
+    "caveat that changes the conclusion? Style, tone, polish and depth are not material. The tool record is " ++
+    "ground truth: a tool it lists did run.";
+
 const REFLECT_MIN: usize = 240;
 /// The reply that means "nothing worth saying", and the shortest note that is worth appending. ABSTAIN IS THE
 /// DESIGNED COMMON CASE: an always-on footer is noise the user learns to skip past, and it bills output tokens on
@@ -832,6 +849,12 @@ fn buildTurnTools(gpa: std.mem.Allocator, ctx: *const tools.ToolCtx, compact: bo
             return base;
         };
         b.appendSlice(gpa, if (ctx.garrett_schema.len > 0) ctx.garrett_schema else garrett.SCHEMA) catch {
+            b.deinit(gpa);
+            return base;
+        };
+        // The catalogue's own defs say what each tool does, never what they are together or how many: the list
+        // verb rides beside them, so "what is Agent Garrett, how many tools" has an answer (garrett.LIST_DEF).
+        if (ctx.garrett_schema.len > 0) b.appendSlice(gpa, ",\n" ++ garrett.LIST_DEF) catch {
             b.deinit(gpa);
             return base;
         };
@@ -2314,6 +2337,36 @@ threadlocal var turn_ctrl_cursor: ?usize = null;
 threadlocal var turn_win_hint: ?usize = null;
 /// Whether the catalog marks the coding model as a reasoning model (see turnTokenBudget).
 threadlocal var turn_reasoning: bool = false;
+/// CLEF MODE for the turn on this thread: where its clef calls go, or null when the mode is off for the turn (not
+/// asked for, or the user is not logged in to Cloudflare). Set by runTurn; every slice is the turn's.
+threadlocal var turn_clef: ?clef.Target = null;
+
+/// A clef probability at or above CLEF_YES is a yes, and one at or below CLEF_NO is a no. Anything between is
+/// "not sure", and the decision goes to the model that made it before clef mode.
+const CLEF_YES: f64 = 0.85;
+const CLEF_NO: f64 = 0.15;
+
+/// One clef call for the turn on this thread: `probs[i]` is the probability that `questions[i]` is a yes about
+/// `state`. False when clef mode is off or the call gave no usable answer; the caller then decides the old way.
+/// `phase` is the label of the model call this stands in for (its status line), `label` this call's own name on
+/// the `llm` frame, which carries clef's model, time and input tokens so the two can be compared.
+fn clefAsk(app: *App, comptime phase: []const u8, role: Role, state: []const u8, questions: []const []const u8, probs: []f64) bool {
+    const t = turn_clef orelse return false;
+    const t0 = nowMillis(app.io);
+    announcePhase(app, phase);
+    const usage = clef.ask(t, state, questions, probs);
+    if (turn_pulse) |p| p.phase.store(PHASE_NONE, .release);
+    if (llm_frame_dir_len > 0) {
+        const ms: u64 = @intCast(@max(nowMillis(app.io) - t0, 0));
+        const u: clef.Usage = usage orelse .{};
+        var ev: std.ArrayListUnmanaged(u8) = .empty;
+        defer ev.deinit(app.gpa);
+        if (renderLlmFrame(app.gpa, &ev, "clef-" ++ phase, role, clef.MODEL, ms, ms, false, u.in, u.out, usage != null, nowSecs(app.io), if (usage != null) "" else "clef gave no usable answer")) |_| {
+            emitEvent(app, llm_frame_dir[0..llm_frame_dir_len], ev.items);
+        } else |_| {}
+    }
+    return usage != null;
+}
 
 /// llm.zig's retry ladder reports each wait here: "provider failed (HTTP 401: Authentication error): retrying
 /// in 20s (4/10)" lands as a status frame on the running turn, so the desk shows the pause and its reason
@@ -2754,7 +2807,7 @@ test "tool map: per-turn preference overrides environment, absent preserves it" 
     }
 }
 
-pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text_raw: []const u8, loop: u8, tool_client_req: bool, image_b64: []const u8, fast: bool, trace_req: bool, garrett_req: bool, tool_map_req: ?bool) void {
+pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text_raw: []const u8, loop: u8, tool_client_req: bool, image_b64: []const u8, fast: bool, trace_req: bool, garrett_req: bool, tool_map_req: ?bool, clef_req: ?bool) void {
     const gpa = app.gpa;
     // NL_FAMILY_MSG: did a family message start this turn (familyWake marks a conversation before its turn begins,
     // one mark per conversation)? Read once, first, and cleared when the turn returns, before its caller releases the
@@ -3029,6 +3082,12 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     }
     defer if (cf_tok.len > 0) gpa.free(cf_tok);
     defer if (cf_acct.len > 0) gpa.free(cf_acct);
+    // CLEF MODE: on only for a turn that asked for it (or, when the turn did not choose, a server whose admin
+    // turned it on: config/server_config.zig, seeded by NL_CLEF) AND whose user is logged in to Cloudflare, since
+    // the calls run on that login. Off, nothing below changes.
+    if (cf_tok.len > 0 and cf_acct.len > 0 and (clef_req orelse app.cfg.clef()))
+        turn_clef = .{ .gpa = gpa, .io = app.io, .scratch = conv_dir, .api_root = app.cf_api_root, .account = cf_acct, .token = cf_tok };
+    defer turn_clef = null;
     var gar_url: []const u8 = "";
     var gar_tok: []const u8 = "";
     const gar_pair = if (garrett_req) cf_garrett.credsFor(app, uid, gpa) else null;
@@ -7636,12 +7695,14 @@ pub const TurnArgs = struct {
     /// AGENT GARRETT: the client asked for the user's own blue-team agent on the belt (see the Body field in
     /// chat/service.zig). runTurn derives the pair itself; false = the default = no such verbs.
     garrett: bool,
+    /// CLEF MODE: the turn's own choice (see the Body field in chat/service.zig); null follows NL_CLEF.
+    clef: ?bool,
 };
 
 /// Detached-thread entry: run the whole turn, then free the owned args. Any failure inside runTurn is already
 /// caught + surfaced as an event, so this thread returns cleanly (never propagates an error that could abort it).
 fn turnThread(args: *TurnArgs) void {
-    runTurn(args.app, args.uid, args.conv, args.trio, args.text, args.loop, args.tool_client, args.image_b64, args.fast, args.trace, args.garrett, args.tool_map);
+    runTurn(args.app, args.uid, args.conv, args.trio, args.text, args.loop, args.tool_client, args.image_b64, args.fast, args.trace, args.garrett, args.tool_map, args.clef);
     endTurn(args.app.io, args.conv); // release the per-conv turn lock (before freeing the blob `conv` points into)
     signalDone(args.app, args.uid, args.conv); // ...and only now is the turn genuinely over for the client
     if (llm.isLocal(args.trio.coding.base_url)) releaseLocal(args.app.io); // release the machine-sized local slot (admission keys on the coding/base model)
@@ -7655,7 +7716,7 @@ fn turnThread(args: *TurnArgs) void {
 /// block the client's /events poll for the whole turn). On an
 /// allocation or thread-spawn failure it runs the turn INLINE (blocking the caller) rather than drop it — the
 /// caller's arg slices are still valid at that point. The turn writes its frames to events.jsonl either way.
-pub fn spawnTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, text: []const u8, loop: u8, tool_client: bool, image_b64: []const u8, fast: bool, trace: bool, garrett_req: bool, tool_map_req: ?bool) void {
+pub fn spawnTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, text: []const u8, loop: u8, tool_client: bool, image_b64: []const u8, fast: bool, trace: bool, garrett_req: bool, tool_map_req: ?bool, clef_req: ?bool) void {
     const gpa = app.gpa;
     const c = trio.coding;
     const t = trio.thinking;
@@ -7670,7 +7731,7 @@ pub fn spawnTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, text: [
     // must release it. The detached/inline turnThread paths release in turnThread; the two alloc-failure inline
     // paths run the turn directly, so they release explicitly. Local-slot release keys on the coding/base model.
     const args = gpa.create(TurnArgs) catch {
-        runTurn(app, uid, conv, trio, text, loop, tool_client, image_b64, fast, trace, garrett_req, tool_map_req);
+        runTurn(app, uid, conv, trio, text, loop, tool_client, image_b64, fast, trace, garrett_req, tool_map_req, clef_req);
         endTurn(app.io, conv);
         signalDone(app, uid, conv);
         if (llm.isLocal(c.base_url)) releaseLocal(app.io);
@@ -7678,7 +7739,7 @@ pub fn spawnTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, text: [
     };
     const blob = gpa.alloc(u8, total) catch {
         gpa.destroy(args);
-        runTurn(app, uid, conv, trio, text, loop, tool_client, image_b64, fast, trace, garrett_req, tool_map_req);
+        runTurn(app, uid, conv, trio, text, loop, tool_client, image_b64, fast, trace, garrett_req, tool_map_req, clef_req);
         endTurn(app.io, conv);
         signalDone(app, uid, conv);
         if (llm.isLocal(c.base_url)) releaseLocal(app.io);
@@ -7694,7 +7755,7 @@ pub fn spawnTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, text: [
         .thinking = .{ .base_url = dupInto(blob, &o, t.base_url), .key = dupInto(blob, &o, t.key), .model = dupInto(blob, &o, t.model) },
         .prompting = .{ .base_url = dupInto(blob, &o, p.base_url), .key = dupInto(blob, &o, p.key), .model = dupInto(blob, &o, p.model) },
     };
-    args.* = .{ .app = app, .uid = uid, .blob = blob, .conv = cv, .trio = owned, .text = tx, .loop = loop, .tool_client = tool_client, .image_b64 = ib, .fast = fast, .tool_map = tool_map_req, .trace = trace, .garrett = garrett_req };
+    args.* = .{ .app = app, .uid = uid, .blob = blob, .conv = cv, .trio = owned, .text = tx, .loop = loop, .tool_client = tool_client, .image_b64 = ib, .fast = fast, .tool_map = tool_map_req, .trace = trace, .garrett = garrett_req, .clef = clef_req };
     if (vthread.spawn("chat-turn", turnThread, .{args})) |th| {
         th.detach();
     } else |_| {
@@ -9553,6 +9614,7 @@ fn courseCheck(app: *App, run_root: []const u8, p: Provider, role: Role, goal: [
         }
     }
     http.jstr(gpa, &msgs, gl.items) catch return null;
+    if (clefCourseProceeds(app, role, gl.items, next_step, conv_items)) return null; // clef mode
     msgs.appendSlice(gpa, "},") catch return null;
     msgs.appendSlice(gpa, msgTail(conv_items, LOOP_CTX_BYTES)) catch return null;
     msgs.appendSlice(gpa, ",{\"role\":\"user\",\"content\":") catch return null;
@@ -9573,6 +9635,24 @@ fn courseCheck(app: *App, run_root: []const u8, p: Provider, role: Role, goal: [
 
     const verdict = courseVerdict(step.content) orelse return null;
     return gpa.dupe(u8, verdict) catch null;
+}
+
+/// CLEF MODE's course check. "Let it proceed" is the overwhelmingly common answer, and it is a yes/no: a
+/// confident yes from clef IS that answer, with no reviewer call. False for anything else (clef mode off, unsure,
+/// a no, a failed call), and the reviewer runs as before: only a model can write the replacement step.
+/// `goal_block` is courseCheck's goal and "done means" text.
+fn clefCourseProceeds(app: *App, role: Role, goal_block: []const u8, next_step: []const u8, conv_items: []const u8) bool {
+    if (turn_clef == null) return false;
+    const gpa = app.gpa;
+    var st: std.ArrayListUnmanaged(u8) = .empty;
+    defer st.deinit(gpa);
+    st.appendSlice(gpa, goal_block) catch return false;
+    st.appendSlice(gpa, "\n\nTHE RECENT WORK (the conversation's latest messages):\n") catch return false;
+    st.appendSlice(gpa, msgTail(conv_items, LOOP_CTX_BYTES)) catch return false;
+    st.appendSlice(gpa, "\n\nTHE NEXT STEP ABOUT TO BE TAKEN:\n") catch return false;
+    st.appendSlice(gpa, clipBytes(next_step, 1200)) catch return false;
+    var prob: [1]f64 = undefined;
+    return clefAsk(app, "course", role, st.items, &.{COURSE_CLEF_QUESTION}, &prob) and prob[0] >= CLEF_YES;
 }
 
 /// Does this reviewer reply actually redirect the loop? Pure, so the ABSTAIN DISCIPLINE is testable without a
@@ -9747,6 +9827,7 @@ fn planReconcile(app: *App, llm_dir: []const u8, conv_dir: []const u8, trio: Mod
         if (std.mem.eql(u8, t.status, cplan.STATUS_PENDING)) pending_n += 1;
     }
     if (pending_n == 0) return;
+    if (pending_n <= clef.MAX_QUESTIONS and clefPlanVerdict(app, conv_dir, plan, ledger, answer)) return; // clef mode
     var msgs: std.ArrayListUnmanaged(u8) = .empty;
     defer msgs.deinit(gpa);
     msgs.appendSlice(gpa, "{\"role\":\"user\",\"content\":") catch return;
@@ -9780,10 +9861,51 @@ fn planReconcile(app: *App, llm_dir: []const u8, conv_dir: []const u8, trio: Mod
         cplan.setStatus(gpa, &plan[n - 1], cplan.STATUS_DONE);
         advanced += 1;
     }
-    if (advanced > 0) {
-        var nb: [96]u8 = undefined;
-        emitKV(app, conv_dir, "status", "text", std.fmt.bufPrint(&nb, "plan reconciled — {d} more subtask(s) were already complete", .{advanced}) catch "plan reconciled");
+    planReconciled(app, conv_dir, advanced);
+}
+
+/// CLEF MODE's plan reconcile: one yes/no question per remaining task (the caller keeps them to
+/// clef.MAX_QUESTIONS), all in one call, over the evidence planReconcile shows its model. A task advances only on
+/// a confident yes. True when clef gave the verdict; false (clef mode off, or the call failed) leaves it to the
+/// prompting model.
+fn clefPlanVerdict(app: *App, conv_dir: []const u8, plan: []cplan.Task, ledger: *const FileLedger, answer: []const u8) bool {
+    if (turn_clef == null) return false;
+    var arena = std.heap.ArenaAllocator.init(app.gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var state: std.ArrayListUnmanaged(u8) = .empty;
+    state.appendSlice(a, "A work step just finished.\n\nENGINE FILE LEDGER (ground truth of what exists on disk):\n") catch return false;
+    ledgerBlock(a, ledger, &state);
+    state.appendSlice(a, "\nTHE STEP'S SETTLED RESULT:\n") catch return false;
+    state.appendSlice(a, clipBytes(answer, 700)) catch return false;
+    var qs: [clef.MAX_QUESTIONS][]const u8 = undefined;
+    var at: [clef.MAX_QUESTIONS]usize = undefined;
+    var probs: [clef.MAX_QUESTIONS]f64 = undefined;
+    var n: usize = 0;
+    for (plan, 0..) |t, i| {
+        if (!std.mem.eql(u8, t.status, cplan.STATUS_PENDING)) continue;
+        if (n == clef.MAX_QUESTIONS) return false;
+        const dw: []const u8 = if (t.done_when.len > 0) clipBytes(t.done_when, 160) else "the evidence shows it";
+        qs[n] = std.fmt.allocPrint(a, "Is this plan task ALREADY fully complete? Count it complete only when the evidence (files in the ledger, verified outcomes in the step result) shows it; a stated intention is not completion. TASK: {s} (done when: {s})", .{ clipBytes(t.text, 200), dw }) catch return false;
+        at[n] = i;
+        n += 1;
     }
+    if (n == 0 or !clefAsk(app, "planrec", .prompting, state.items, qs[0..n], probs[0..n])) return false;
+    var advanced: usize = 0;
+    for (at[0..n], probs[0..n]) |i, p| {
+        if (p < CLEF_YES) continue;
+        cplan.setStatus(app.gpa, &plan[i], cplan.STATUS_DONE);
+        advanced += 1;
+    }
+    planReconciled(app, conv_dir, advanced);
+    return true;
+}
+
+/// The status line a reconcile that moved the board ends with (planReconcile, either way it reached its verdict).
+fn planReconciled(app: *App, conv_dir: []const u8, advanced: usize) void {
+    if (advanced == 0) return;
+    var nb: [96]u8 = undefined;
+    emitKV(app, conv_dir, "status", "text", std.fmt.bufPrint(&nb, "plan reconciled — {d} more subtask(s) were already complete", .{advanced}) catch "plan reconciled");
 }
 
 /// The brief lives beside plan.jsonl so a "continue" turn resumes under the SAME acceptance contract the work was
@@ -10330,7 +10452,7 @@ fn openSubchatTool(app: *App, uid: u64, conv: []const u8, conv_dir: []const u8, 
     // A sub-chat runs on the DEFAULTS, exactly as this call site already does for loop and tool_client:
     // it works unattended on a branch nobody is watching, which is precisely where advanced reasoning
     // earns its cost. The parent's fast-mode choice was about the parent's own latency.
-    spawnTurn(app, uid, bid, trio, goal, 0, false, "", false, false, false, null);
+    spawnTurn(app, uid, bid, trio, goal, 0, false, "", false, false, false, null, null);
     familyOpened(app, conv_dir, primary, bid, goal); // NL_FAMILY_MSG: the ledger's open record
     return std.fmt.allocPrint(gpa, "{{\"ok\":true,\"tool\":\"open_subchat\",\"sub\":\"s{d}\",\"conv\":\"{s}\",\"note\":\"sub-chat s{d} opened and its first turn is RUNNING server-side on that goal. It shares this chat's workspace and memory — its findings become recallable here (recall) as it works. Tell the user it opened as tab s{d}; check its progress later via recall or by switching to the tab.\"}}", .{ free_n, bid, free_n, free_n }) catch emptyRes();
 }
@@ -10339,7 +10461,7 @@ fn openSubchatTool(app: *App, uid: u64, conv: []const u8, conv_dir: []const u8, 
 /// call of spawnTurn, so a change to spawnTurn's arguments has a single family line to follow.
 fn spawnFamilyTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, text: []const u8) void {
     if (builtin.is_test) if (test_family_spawn) |f| return f(conv, text);
-    spawnTurn(app, uid, conv, trio, text, 0, false, "", false, false, false, null);
+    spawnTurn(app, uid, conv, trio, text, 0, false, "", false, false, false, null, null);
 }
 
 /// TEST ONLY: where a family wake's turn goes instead of a thread and a model, so a test can see the wake itself.
@@ -12433,6 +12555,12 @@ fn toolRoute(tool_client: bool, name: []const u8) ClientRoute {
 
 /// Run one mind tool by the turn's route (toolRoute). `id` is the call's id for the client bridge, "" to mint one.
 fn runRouted(app: *App, ctx: *tools.ToolCtx, conv_dir: []const u8, ctrl_cursor: usize, tool_client: bool, id: []const u8, name: []const u8, args: []const u8, no_ack_streak: *u32) []u8 {
+    // An mcp_call that names Agent Garrett is the built-in tool's call, and the pair is this server's: it must
+    // not be delegated to the client, whose MCP config files have never held it (garrett.fromMcpCall).
+    if (garrett.fromMcpCall(app.gpa, name, args)) |gar_args| {
+        defer app.gpa.free(gar_args);
+        return tools.execute(ctx, "garrett", gar_args);
+    }
     return switch (toolRoute(tool_client, name)) {
         .server => tools.execute(ctx, name, args),
         .client => delegateTool(app, conv_dir, id, name, args, ctrl_cursor, no_ack_streak),
@@ -14796,6 +14924,21 @@ fn afkNextStep(app: *App, run_root: []const u8, p: Provider, goal: []const u8, c
 /// default. A rewrite getting through is not.
 fn critiqueAnswer(app: *App, run_root: []const u8, base_url: []const u8, key: []const u8, model: []const u8, user_text: []const u8, answer: []const u8, tool_ledger: []const u8) ?[]u8 {
     const gpa = app.gpa;
+    // CLEF MODE: silence is the designed common case, and whether there is anything to say is a yes/no. A
+    // confident no from clef IS that silence, with no review call. Anything else (unsure, yes, a failed call)
+    // goes to the review below as before: only a model can write the correction.
+    if (turn_clef != null) clef_try: {
+        var st: std.ArrayListUnmanaged(u8) = .empty;
+        defer st.deinit(gpa);
+        st.appendSlice(gpa, "THE USER ASKED:\n") catch break :clef_try;
+        st.appendSlice(gpa, clipBytes(user_text, 8 << 10)) catch break :clef_try;
+        st.appendSlice(gpa, "\n\nTHE ANSWER THAT WAS SENT:\n") catch break :clef_try;
+        st.appendSlice(gpa, clipBytes(answer, 24 << 10)) catch break :clef_try;
+        st.appendSlice(gpa, "\n\nTOOL RECORD for the turn that produced that answer (every tool that actually ran, with call counts): ") catch break :clef_try;
+        st.appendSlice(gpa, if (tool_ledger.len > 0) tool_ledger else "no tools ran") catch break :clef_try;
+        var p: [1]f64 = undefined;
+        if (clefAsk(app, "reflect", .thinking, st.items, &.{CRITIQUE_CLEF_QUESTION}, &p) and p[0] <= CLEF_NO) return null;
+    }
     var msgs: std.ArrayListUnmanaged(u8) = .empty;
     defer msgs.deinit(gpa);
     msgs.appendSlice(gpa, "{\"role\":\"system\",\"content\":") catch return null;

@@ -28,6 +28,8 @@ pub fn run(
     var say: []const u8 = "";
     var once = false;
     var use_garrett = false;
+    // `--clef` asks for clef mode on every turn: the turn's yes/no decisions go to Cloudflare's Clef model first.
+    var use_clef = false;
     {
         var i: usize = 0;
         while (i < args.len) : (i += 1) {
@@ -41,6 +43,8 @@ pub fn run(
                 once = true;
             } else if (std.mem.eql(u8, a, "--garrett")) {
                 use_garrett = true;
+            } else if (std.mem.eql(u8, a, "--clef")) {
+                use_clef = true;
             } else if (a.len > 0 and a[0] != '-' and conv.len == 0) {
                 const n = @min(a.len, conv_buf.len);
                 @memcpy(conv_buf[0..n], a[0..n]);
@@ -149,6 +153,8 @@ pub fn run(
         jb.appendSlice(ctx.gpa, ",\"tool_client\":true,\"loop\":0") catch continue;
         // Agent Garrett's belt, when asked for: the server derives the pair; a missing deployment is a turn without the verbs
         if (use_garrett) jb.appendSlice(ctx.gpa, ",\"garrett\":true") catch continue;
+        // clef mode, when asked for: without the flag the server's default stands
+        if (use_clef) jb.appendSlice(ctx.gpa, ",\"clef\":true") catch continue;
         jb.appendSlice(ctx.gpa, "}") catch continue;
 
         var pb: [220]u8 = undefined;

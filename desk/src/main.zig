@@ -1540,6 +1540,10 @@ fn seedSettings(store: *Store, gpa: std.mem.Allocator, io: std.Io, pinned: ?[]co
         const value = std.mem.span(p);
         store.settings.tool_map = value.len > 0 and value[0] != '0' and !std.ascii.eqlIgnoreCase(value, "off");
     }
+    if (std.c.getenv("NL_CLEF")) |p| {
+        const value = std.mem.span(p);
+        store.settings.clef = value.len > 0 and value[0] != '0' and !std.ascii.eqlIgnoreCase(value, "off");
+    }
     seedDataDir(store, gpa, io, pinned);
     // An attaching desk's server is decided before any settings file is read: the one holding the data dir. The chat
     // thread's loader sees the pin and leaves the target alone (chat.zig loadSettings).
@@ -1893,7 +1897,7 @@ fn editField(store: *Store, f: *Ui.Field) void {
             // handled as an attachment — skip the text-paste path this keypress
         } else {
             _ = f.delSel();
-            const clip = rl.getClipboardText();
+            const clip = clipboardText();
             for (clip) |raw_ch| {
                 // multi-line pastes flatten to spaces instead of being silently dropped
                 const ch: u8 = if (raw_ch == '\n' or raw_ch == '\t') ' ' else raw_ch;
@@ -3383,7 +3387,7 @@ fn drawGarrettRows(store: *Store, x: f32, y0: f32, colw: f32) f32 {
     const paste = t.z("Paste key / MCP config", .{});
     const pw = @min(colw, t.btnW(paste, t.BTN_MD));
     if (t.button(.{ .x = x, .y = y, .width = pw, .height = t.BTN_MD }, paste, t.blue, !g.busy)) {
-        const text = rl.getClipboardText();
+        const text = clipboardText();
         if (garrett_setup.copiedKey(std.heap.page_allocator, text)) |key| {
             fieldSet(&ui.s_garrett, key);
             std.crypto.secureZero(u8, key);
@@ -8967,6 +8971,25 @@ fn submitTot(store: *Store, first: bool) void {
 /// The runs list as the tab drew it last (a Store copy too big for the stack of a frame).
 var tot_runs_view: [tots.MAX_RUNS]tots.RunRow = undefined;
 
+/// The clipboard's text, or "" when it holds none. raylib answers NULL when the clipboard is empty, holds
+/// something that is not text (a screenshot, copied files), or another program has it open; rl.getClipboardText
+/// measures that NULL as a string, which is a read of address 0 and the end of the app. It ended it on the
+/// Agent Garrett card's paste button (2026-11-13). Every clipboard read in the desk goes through here.
+fn clipboardText() [:0]const u8 {
+    return clipSpan(rl.cdef.GetClipboardText());
+}
+
+/// A C string as a slice, with NULL as "".
+fn clipSpan(p: [*c]const u8) [:0]const u8 {
+    if (p == null) return "";
+    return std.mem.span(@as([*:0]const u8, @ptrCast(p)));
+}
+
+test "a clipboard with no text reads as empty, never as a string at address 0" {
+    try std.testing.expectEqualStrings("", clipSpan(null));
+    try std.testing.expectEqualStrings("gtt_abc", clipSpan("gtt_abc"));
+}
+
 fn fieldSet(f: anytype, s: []const u8) void {
     const n = @min(s.len, f.buf.len);
     @memcpy(f.buf[0..n], s[0..n]);
@@ -9907,6 +9930,7 @@ fn drawSettings(store: *Store, frame: t.Rect) void {
     const bh_on = store.settings.browser_headful;
     const fast_on = store.settings.fast_reasoning;
     const tool_map_on = store.settings.tool_map;
+    const clef_on = store.settings.clef;
     const online = store.server_online;
     const chat_kind = store.settings.chat_kind;
     const chat_byok = store.settings.chat_byok;
@@ -10009,6 +10033,7 @@ fn drawSettings(store: *Store, frame: t.Rect) void {
         tog_w = @max(tog_w, t.btnW(t.z("browser window: SHOWN", .{}), 32));
         tog_w = @max(tog_w, t.btnW(t.z("reasoning: ADVANCED", .{}), 32));
         tog_w = @max(tog_w, t.btnW(t.z("tool map: OFF", .{}), 32));
+        tog_w = @max(tog_w, t.btnW(t.z("clef mode: OFF", .{}), 32));
         tog_w = @max(tog_w, t.btnW(size_name, 32));
 
         // ---- APPEARANCE & ACCESSIBILITY -------------------------------------------------------------------
@@ -10097,6 +10122,12 @@ fn drawSettings(store: *Store, frame: t.Rect) void {
         if (settingRow(x, &y, tog_w, if (tool_map_on) t.z("tool map: ON", .{}) else t.z("tool map: OFF", .{}), tool_map_on, t.z("experimental (NL_TOOL_MAP=1): let the model explore tools as a tree. applies to the next server chat message.", .{}))) {
             store.lock();
             store.settings.tool_map = !store.settings.tool_map;
+            store.unlock();
+            store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
+        }
+        if (settingRow(x, &y, tog_w, if (clef_on) t.z("clef mode: ON", .{}) else t.z("clef mode: OFF", .{}), clef_on, t.z("put the turn's yes/no decisions to Cloudflare's Clef model first. only runs while you are logged in to Cloudflare. applies to the next server chat message.", .{}))) {
+            store.lock();
+            store.settings.clef = !store.settings.clef;
             store.unlock();
             store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
         }

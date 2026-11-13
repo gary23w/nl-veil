@@ -3633,7 +3633,34 @@ async function renderServerConfig() {
       <span class="muted" id="cfgState">${cur.default_model
         ? 'currently <b>' + esc(cur.default_model) + '</b>'
         : 'no default — every user must pick a model before they can chat'}</span>
+    </div>
+    <div class="set-row" style="margin-top:14px">
+      <div><b>Clef mode</b>
+        <div class="muted">On by default. A chat turn's yes/no decisions (plan reconcile, course check, answer
+          review) go to Cloudflare's Clef model first, and to the chat model only when Clef is not sure. It runs
+          on each user's own Cloudflare login and does nothing for a user without one. Applies to the next
+          message, for every client that does not choose for itself.</div></div>
+      <input type="checkbox" id="cfgClef" class="w-auto" ${cur.clef ? 'checked' : ''}>
     </div>`;
+
+  el('cfgClef').addEventListener('change', async () => {
+    const on = el('cfgClef').checked;
+    try {
+      // The SAVED models ride along unchanged: this route sets them on every post, and a toggle must not
+      // save (or blank) whatever is half-typed in the fields above.
+      await jpost('/api/v1/admin/config', {
+        default_model: cur.default_model || '', default_base_url: cur.default_base_url || '',
+        think_model: cur.think_model || '', think_base_url: cur.think_base_url || '',
+        prompt_model: cur.prompt_model || '', prompt_base_url: cur.prompt_base_url || '',
+        clef: on,
+      });
+      cur.clef = on;
+      toast('Clef mode ' + (on ? 'on' : 'off'), 'applies to the next message', 'ok');
+    } catch (e) {
+      el('cfgClef').checked = !on;
+      toast('Could not save', e.message, 'err');
+    }
+  });
 
   el('cfgOne').addEventListener('change', () => {
     // Toggle which role panels are VISIBLE — do NOT persist here. Nothing is saved

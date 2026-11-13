@@ -52,6 +52,11 @@ pub const ServerConfig = struct {
     browser_buf: [BROWSER_MAX]u8 = undefined,
     browser_len: usize = 0,
 
+    // CLEF MODE's server default (worker/chat/clef.zig): what a chat turn gets when its client did not choose.
+    // Orthogonal to the models and the browser, like the browser: setClef() touches nothing else. ON by default:
+    // it only ever runs for a user logged in to Cloudflare, so a user gets it by logging in.
+    clef_on: bool = true,
+
     pub fn init(gpa: std.mem.Allocator, io: std.Io, data: []const u8) ServerConfig {
         return .{ .io = io, .gpa = gpa, .data = data };
     }
@@ -66,7 +71,30 @@ pub const ServerConfig = struct {
         prompt_model: []const u8 = "",
         prompt_base_url: []const u8 = "",
         browser: []const u8 = "", // "" | "chrome" | "edge" | "chromium"; blank = Edge-first default order
+        clef: bool = true, // clef mode for a turn whose client did not choose
     };
+
+    /// The server's clef mode default. Read on every chat turn that did not choose for itself.
+    pub fn clef(self: *ServerConfig) bool {
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        return self.clef_on;
+    }
+
+    /// Set the server's clef mode default, live. It leaves every model value and the browser untouched.
+    pub fn setClef(self: *ServerConfig, on: bool) void {
+        self.mu.lockUncancelable(self.io);
+        self.clef_on = on;
+        self.mu.unlock(self.io);
+        self.save() catch {}; // a failed persist must not fail the request; the value is already live
+    }
+
+    /// What NL_CLEF seeds the default with. Unset is ON. Set, it is a switch read by the rule NL_TOOL_MAP is read
+    /// with: on when non-empty, not starting with `0` and not `off`. So `NL_CLEF=0` is how a launch turns it off.
+    fn envSeed(value: ?[]const u8) bool {
+        const v = value orelse return true;
+        return v.len > 0 and v[0] != '0' and !std.ascii.eqlIgnoreCase(v, "off");
+    }
 
     pub fn defaults(self: *ServerConfig, alloc: std.mem.Allocator) Defaults {
         self.mu.lockUncancelable(self.io);
@@ -79,6 +107,7 @@ pub const ServerConfig = struct {
             .prompt_model = alloc.dupe(u8, self.prompt_model_buf[0..self.prompt_model_len]) catch "",
             .prompt_base_url = alloc.dupe(u8, self.prompt_base_buf[0..self.prompt_base_len]) catch "",
             .browser = alloc.dupe(u8, self.browser_buf[0..self.browser_len]) catch "",
+            .clef = self.clef_on,
         };
     }
 
@@ -148,6 +177,7 @@ pub const ServerConfig = struct {
             .prompt_model = self.prompt_model_buf[0..self.prompt_model_len],
             .prompt_base_url = self.prompt_base_buf[0..self.prompt_base_len],
             .browser = self.browser_buf[0..self.browser_len],
+            .clef = self.clef_on,
         };
     }
 
@@ -194,11 +224,12 @@ pub const ServerConfig = struct {
             "{{\"default_model\":\"{s}\",\"default_base_url\":\"{s}\"," ++
             "\"think_model\":\"{s}\",\"think_base_url\":\"{s}\"," ++
             "\"prompt_model\":\"{s}\",\"prompt_base_url\":\"{s}\"," ++
-            "\"browser\":\"{s}\"}}\n", .{
+            "\"browser\":\"{s}\",\"clef\":{}}}\n", .{
             self.model_buf[0..self.model_len],        self.base_buf[0..self.base_len],
             self.think_model_buf[0..self.think_model_len],  self.think_base_buf[0..self.think_base_len],
             self.prompt_model_buf[0..self.prompt_model_len], self.prompt_base_buf[0..self.prompt_base_len],
             self.browser_buf[0..self.browser_len],
+            self.clef_on,
         }) catch {
             self.mu.unlock(self.io);
             return;
@@ -223,16 +254,26 @@ pub const ServerConfig = struct {
                     prompt_model: []const u8 = "",
                     prompt_base_url: []const u8 = "",
                     browser: []const u8 = "",
+                    clef: ?bool = null,
                 };
                 if (std.json.parseFromSlice(P, self.gpa, data, .{ .ignore_unknown_fields = true })) |parsed| {
                     defer parsed.deinit();
                     const v = parsed.value;
+                    // A file from before clef mode says nothing about it: NL_CLEF seeds it, as on a fresh install.
+                    const clef_v = v.clef orelse envSeed(environ.get("NL_CLEF"));
+                    self.mu.lockUncancelable(self.io);
+                    self.clef_on = clef_v;
+                    self.mu.unlock(self.io);
                     self.applyBrowser(v.browser); // populate + publish before setAll's save() captures the full config
                     self.setAll(v.default_model, v.default_base_url, v.think_model, v.think_base_url, v.prompt_model, v.prompt_base_url) catch {};
                     return;
                 } else |_| {}
             } else |_| {}
         }
+        const clef_seed = envSeed(environ.get("NL_CLEF"));
+        self.mu.lockUncancelable(self.io);
+        self.clef_on = clef_seed;
+        self.mu.unlock(self.io);
         const m = environ.get("NL_DEFAULT_MODEL") orelse "";
         const b = environ.get("NL_DEFAULT_BASE_URL") orelse "";
         if (m.len > 0) self.set(m, b) catch {};
@@ -279,6 +320,25 @@ test "browser preference normalizes and round-trips independently of the model t
     // an unknown family degrades to "" (default order) rather than persisting junk
     cfg.setBrowser("firefox");
     try t.expectEqual(@as(usize, 0), cfg.defaultsRaw().browser.len);
+}
+
+test "clef mode default: on until turned off, independent of the model trio, and only a set NL_CLEF turns the seed off" {
+    const t = std.testing;
+    var threaded = std.Io.Threaded.init(t.allocator, .{});
+    defer threaded.deinit();
+    var cfg = ServerConfig{ .io = threaded.io(), .gpa = t.allocator, .data = "." };
+    try t.expect(cfg.clef());
+    try cfg.setAll("m", "b", "", "", "", "");
+    cfg.setClef(false);
+    try t.expect(!cfg.clef());
+    try t.expect(!cfg.defaultsRaw().clef);
+    try cfg.setAll("m2", "b2", "", "", "", ""); // re-setting the models must not turn it back on
+    try t.expect(!cfg.clef());
+    try t.expectEqualStrings("m2", cfg.defaultsRaw().model);
+    cfg.setClef(true);
+    try t.expect(cfg.clef());
+    for ([_]?[]const u8{ null, "1", "on" }) |v| try t.expect(ServerConfig.envSeed(v));
+    for ([_]?[]const u8{ "", "0", "off", "OFF" }) |v| try t.expect(!ServerConfig.envSeed(v));
 }
 
 test "clearing is expressible: empty values really do empty the config" {

@@ -69,6 +69,8 @@ const ConfigReq = struct {
     think_base_url: []const u8 = "",
     prompt_model: []const u8 = "",
     prompt_base_url: []const u8 = "",
+    /// Clef mode's server default. Absent leaves it as it is: the model form saves without it.
+    clef: ?bool = null,
 };
 
 const ServerKeyReq = struct { provider: []const u8, key: []const u8, base_url: []const u8 = "" };
@@ -143,6 +145,7 @@ fn configJson(sd: server_config.ServerConfig.Defaults) struct {
     think_base_url: []const u8,
     prompt_model: []const u8,
     prompt_base_url: []const u8,
+    clef: bool,
 } {
     return .{
         .ok = true,
@@ -152,6 +155,7 @@ fn configJson(sd: server_config.ServerConfig.Defaults) struct {
         .think_base_url = sd.think_base_url,
         .prompt_model = sd.prompt_model,
         .prompt_base_url = sd.prompt_base_url,
+        .clef = sd.clef,
     };
 }
 
@@ -166,6 +170,10 @@ pub fn adminSetConfig(app: *App, req: *httpz.Request, res: *httpz.Response) !voi
         error.BadInput => badReq(res, "model id and base URL must not contain quotes or control characters"),
     };
     app.audit.record(admin.email, "set_default_model", body.default_model);
+    if (body.clef) |on| {
+        app.cfg.setClef(on);
+        app.audit.record(admin.email, "set_clef_mode", if (on) "on" else "off");
+    }
     const sd = app.cfg.defaults(res.arena);
     try res.json(configJson(sd), .{});
 }

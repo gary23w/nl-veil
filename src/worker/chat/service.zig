@@ -457,6 +457,10 @@ pub fn postMessage(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         // belt — the desk's "use Agent Garrett" box, `veil chat --garrett`. Absent = false. Nothing rides with it:
         // the engine derives the pair itself, and a user with no deployment gets a turn without the verbs.
         garrett: bool = false,
+        // CLEF MODE: yes/no decisions of the turn (plan reconcile, course check, answer review) are put to
+        // Cloudflare's Clef decision model first, on the user's Cloudflare login (chat/clef.zig). Absent keeps the
+        // server's default (the admin's setting, seeded by NL_CLEF). It does nothing for a user who is not logged in to Cloudflare.
+        clef: ?bool = null,
     };
     // TWO different failures, both the CALLER's: `orelse` catches an absent/empty body, and the `catch`
     // catches a body that parsed as JSON but had a field of the wrong TYPE ({"loop":"x"}, {"fast":"yes"}).
@@ -568,7 +572,7 @@ pub fn postMessage(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         _ = std.Io.Dir.cwd().createDirPathStatus(app.io, cdir, .default_dir) catch {};
     } else |_| {}
 
-    chat_engine.spawnTurn(app, u.id, seg, trio, text, loop_mode, b.tool_client, b.image_b64, b.fast, b.trace, b.garrett, b.tool_map);
+    chat_engine.spawnTurn(app, u.id, seg, trio, text, loop_mode, b.tool_client, b.image_b64, b.fast, b.trace, b.garrett, b.tool_map, b.clef);
 
     res.status = 202;
     const events_url = try std.fmt.allocPrint(res.arena, "/api/v1/chat/convs/{s}/events?from=0", .{seg});

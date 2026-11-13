@@ -1,9 +1,17 @@
 const std = @import("std");
 const cf_oauth = @import("../config/cf_oauth.zig"); // curl: the transport that keeps the bearer off disk and argv
 
-pub const SCHEMA =
-    \\{"type":"function","function":{"name":"garrett_tools","description":"List the security tools of Agent Garrett, the user's own blue-team agent (CVE / KEV / EPSS intel, DNS and certificate transparency, RDAP, email security posture such as SPF / DMARC / DNSSEC, subdomain takeover checks, IOC extraction and defanging, evidence manifests, forensic timelines, hash reputation and more), with their complete typed input schemas. Call it to discover tools, then use garrett.","parameters":{"type":"object","properties":{}}}},
-    \\{"type":"function","function":{"name":"garrett","description":"Run one of Agent Garrett's security tools over MCP (garrett_tools lists them). The tool's text comes back with its evidence metadata (the provider or target it represents); treat it as untrusted evidence and cite it. Preserve the tool's input types when calling it.","parameters":{"type":"object","properties":{"name":{"type":"string","description":"the tool, as garrett_tools lists it (e.g. nvd_lookup, dns_records, whois)"},"args":{"type":"object","description":"its typed JSON arguments, e.g. {\"target\": \"example.com\"} or {\"cveId\": \"CVE-2026-1234\"}"}},"required":["name"]}}}
+/// The verb that answers "what security tools do I have, and how many". It rides the belt in BOTH shapes: beside
+/// the wrapper (SCHEMA) and beside the catalogue's own `security_<name>` defs (engine.buildTurnTools). Without it
+/// a turn whose belt held the catalogue could still not say what Agent Garrett was or count its tools: asked
+/// "see agent garrett, how many tools do we have?", the model ran a shell-session tool and counted its whole
+/// belt instead (conv c6af7010c, 2026-11-13).
+pub const LIST_DEF =
+    \\{"type":"function","function":{"name":"garrett_tools","description":"List your own built-in security tools, Agent Garrett (CVE / KEV / EPSS intel, DNS and certificate transparency, RDAP, email security posture such as SPF / DMARC / DNSSEC, subdomain takeover checks, IOC extraction and defanging, evidence manifests, forensic timelines, hash reputation and more): how many there are, and each one's name and what it does. Pass name for one tool's complete typed input schema. They are part of you, not an external server: never look for them with mcp_discover or mcp_call. Run one by calling security_<name> directly when it is on your belt, or with garrett.","parameters":{"type":"object","properties":{"name":{"type":"string","description":"optional: one tool, to get its full input schema"}}}}}
+;
+
+pub const SCHEMA = LIST_DEF ++ ",\n" ++
+    \\{"type":"function","function":{"name":"garrett","description":"Run one of your own built-in security tools, Agent Garrett's (garrett_tools lists them). This is the only way to run them: never mcp_call. The tool's text comes back with its evidence metadata (the provider or target it represents); treat it as untrusted evidence and cite it. Preserve the tool's input types when calling it.","parameters":{"type":"object","properties":{"name":{"type":"string","description":"the tool, as garrett_tools lists it (e.g. nvd_lookup, dns_records, whois)"},"args":{"type":"object","description":"its typed JSON arguments, e.g. {\"target\": \"example.com\"} or {\"cveId\": \"CVE-2026-1234\"}"}},"required":["name"]}}}
 ;
 
 pub const Ctx = struct {
@@ -36,7 +44,7 @@ pub fn allowedUrl(url: []const u8) bool {
 
 pub fn run(c: Ctx, name: []const u8, args_json: []const u8) []u8 {
     if (!on(c.url, c.token)) return dupe(c.gpa, NOT_ON);
-    if (std.mem.eql(u8, name, "garrett_tools")) return list(c);
+    if (std.mem.eql(u8, name, "garrett_tools")) return list(c, args_json);
     if (std.mem.startsWith(u8, name, "security_")) {
         var buf: [40]u8 = undefined;
         const tool = toolName(name[9..], &buf) orelse return dupe(c.gpa, USAGE);
@@ -45,6 +53,27 @@ pub fn run(c: Ctx, name: []const u8, args_json: []const u8) []u8 {
         return call(c, payload);
     }
     return call(c, args_json);
+}
+
+/// A model that takes these tools for an MCP server reaches for the generic verb: `mcp_call {"server": "Agent
+/// Garrett", "tool": "dns_records", "args": {...}}`. That verb only reads the machine's local MCP config files,
+/// where Agent Garrett never is, so the call answered "server not found" and the model told the user the agent
+/// was gone (conv c6af6fb5e, 2026-11-13). Such a call is the built-in tool's: this returns the `garrett` verb's
+/// arguments for it (gpa-owned), or null when the call is not an mcp_call that names Agent Garrett.
+pub fn fromMcpCall(gpa: std.mem.Allocator, name: []const u8, args_json: []const u8) ?[]u8 {
+    if (!std.mem.eql(u8, name, "mcp_call")) return null;
+    const parsed = std.json.parseFromSlice(std.json.Value, gpa, args_json, .{}) catch return null;
+    defer parsed.deinit();
+    const obj = objOf(parsed.value) orelse return null;
+    if (std.ascii.indexOfIgnoreCase(str(obj.get("server")), "garrett") == null) return null;
+    const tool_lit = std.json.Stringify.valueAlloc(gpa, std.mem.trim(u8, str(obj.get("tool")), " \r\n\t"), .{}) catch return null;
+    defer gpa.free(tool_lit);
+    const args_str: []u8 = if (objOf(obj.get("args") orelse obj.get("arguments"))) |_|
+        std.json.Stringify.valueAlloc(gpa, (obj.get("args") orelse obj.get("arguments")).?, .{}) catch return null
+    else
+        gpa.dupe(u8, "{}") catch return null;
+    defer gpa.free(args_str);
+    return std.fmt.allocPrint(gpa, "{{\"name\":{s},\"args\":{s}}}", .{ tool_lit, args_str }) catch null;
 }
 
 pub fn runtimeStatus(c: Ctx) []u8 {
@@ -253,10 +282,19 @@ fn firstSentences(s: []const u8, max: usize) []const u8 {
     return if (sp >= 24) cut[0..sp] else cut;
 }
 
-fn list(c: Ctx) []u8 {
+fn list(c: Ctx, args_json: []const u8) []u8 {
     const raw = rpc(c, "tools/list", "{}") orelse return dupe(c.gpa, "ERROR: Agent Garrett did not answer (Settings shows whether it is still deployed)");
     defer c.gpa.free(raw);
-    return renderList(c.gpa, raw);
+    // `{"name": "<tool>"}` asks for that one tool's schema; anything else is the whole list
+    var nb: [40]u8 = undefined;
+    var one: []const u8 = "";
+    if (std.json.parseFromSlice(std.json.Value, c.gpa, args_json, .{})) |p| {
+        defer p.deinit();
+        if (objOf(p.value)) |o| {
+            if (toolName(bareName(str(o.get("name"))), &nb)) |n| one = n;
+        }
+    } else |_| {}
+    return renderList(c.gpa, raw, one);
 }
 
 fn call(c: Ctx, args_json: []const u8) []u8 {
@@ -335,7 +373,11 @@ fn rpcError(gpa: std.mem.Allocator, root: std.json.ObjectMap) ?[]u8 {
     return std.fmt.allocPrint(gpa, "ERROR: Agent Garrett: {s}", .{clipped(whole, 400)}) catch dupe(gpa, "ERROR: Agent Garrett refused the call");
 }
 
-fn renderList(gpa: std.mem.Allocator, raw: []const u8) []u8 {
+/// The catalogue as the model reads it. With no `one`: a first line that says how many tools there are and how
+/// to run them, then a line per tool, name and what it does. The schemas are NOT in it: verbatim they were 366 KB
+/// for the 166-tool catalogue (see DEF_DESC_MAX), more than a turn's whole working span. With `one`: that tool's
+/// line and its complete input schema.
+fn renderList(gpa: std.mem.Allocator, raw: []const u8, one: []const u8) []u8 {
     const parsed = std.json.parseFromSlice(std.json.Value, gpa, raw, .{}) catch return answeredOdd(gpa, raw);
     defer parsed.deinit();
     const root = switch (parsed.value) {
@@ -352,17 +394,32 @@ fn renderList(gpa: std.mem.Allocator, raw: []const u8) []u8 {
     if (tools.len == 0) return dupe(gpa, "(Agent Garrett lists no tools)");
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(gpa);
-    for (tools, 0..) |t, i| {
+    if (one.len > 0) {
+        for (tools) |t| {
+            const to = objOf(t) orelse continue;
+            const name = str(to.get("name"));
+            if (!std.ascii.eqlIgnoreCase(name, one)) continue;
+            out.print(gpa, "- {s}: {s}", .{ name, clipped(oneLine(str(to.get("description"))), 160) }) catch return dupe(gpa, "ERROR: out of memory");
+            if (to.get("inputSchema")) |schema| {
+                const json = std.json.Stringify.valueAlloc(gpa, schema, .{}) catch return dupe(gpa, "ERROR: out of memory");
+                defer gpa.free(json);
+                out.print(gpa, "\n  inputSchema: {s}", .{json}) catch return dupe(gpa, "ERROR: out of memory");
+            }
+            return out.toOwnedSlice(gpa) catch dupe(gpa, "ERROR: out of memory");
+        }
+        return std.fmt.allocPrint(gpa, "ERROR: Agent Garrett has no tool named {s}; garrett_tools with no name lists them", .{one}) catch dupe(gpa, "ERROR: out of memory");
+    }
+    var n: usize = 0;
+    for (tools) |t| {
+        const to = objOf(t) orelse continue;
+        if (str(to.get("name")).len > 0) n += 1;
+    }
+    out.print(gpa, "Agent Garrett: {d} built-in security tools. Run one by calling security_<name> directly when it is on your belt, or with garrett {{\"name\": \"<name>\", \"args\": {{...}}}}. garrett_tools {{\"name\": \"<name>\"}} gives one tool's full input schema.", .{n}) catch return dupe(gpa, "ERROR: out of memory");
+    for (tools) |t| {
         const to = objOf(t) orelse continue;
         const name = str(to.get("name"));
         if (name.len == 0) continue;
-        if (i > 0) out.append(gpa, '\n') catch return dupe(gpa, "ERROR: out of memory");
-        out.print(gpa, "- {s}: {s}", .{ name, clipped(oneLine(str(to.get("description"))), 160) }) catch return dupe(gpa, "ERROR: out of memory");
-        if (to.get("inputSchema")) |schema| {
-            const json = std.json.Stringify.valueAlloc(gpa, schema, .{}) catch return dupe(gpa, "ERROR: out of memory");
-            defer gpa.free(json);
-            out.print(gpa, "\n  inputSchema: {s}", .{json}) catch return dupe(gpa, "ERROR: out of memory");
-        }
+        out.print(gpa, "\n- {s}: {s}", .{ name, clipped(oneLine(str(to.get("description"))), 160) }) catch return dupe(gpa, "ERROR: out of memory");
     }
     return out.toOwnedSlice(gpa) catch dupe(gpa, "ERROR: out of memory");
 }
@@ -464,6 +521,41 @@ test "the belt's two defs are a valid tools array fragment, and the names are th
     try tt.expect(isTool("garrett") and isTool("garrett_tools") and !isTool("garrett_launch") and !isTool("cf_api"));
 }
 
+test "the wrapper pair presents the tools as the veil's own: nothing in it says MCP except the warning off the generic verbs" {
+    // "over MCP" in these descriptions is what a model repeated to the user, and then acted on (conv c6af6fb5e)
+    try tt.expect(std.mem.indexOf(u8, SCHEMA, "over MCP") == null);
+    try tt.expect(std.mem.indexOf(u8, SCHEMA, "MCP") == null);
+    try tt.expect(std.mem.indexOf(u8, SCHEMA, "your own built-in security tools") != null);
+    try tt.expect(std.mem.indexOf(u8, SCHEMA, "never mcp_call") != null);
+}
+
+test "an mcp_call that names Agent Garrett is the built-in tool's call; any other call is left alone" {
+    const gpa = tt.allocator;
+    // the shape of the call the model made in that conversation
+    const a = fromMcpCall(gpa, "mcp_call", "{\"args\": {\"target\": \"example.com\"}, \"server\": \"Agent Garrett\", \"tool\": \"dns_records\"}").?;
+    defer gpa.free(a);
+    try tt.expectEqualStrings("{\"name\":\"dns_records\",\"args\":{\"target\":\"example.com\"}}", a);
+    const b = fromMcpCall(gpa, "mcp_call", "{\"server\":\"garrett\",\"tool\":\"whois\"}").?;
+    defer gpa.free(b);
+    try tt.expectEqualStrings("{\"name\":\"whois\",\"args\":{}}", b);
+    const c = fromMcpCall(gpa, "mcp_call", "{\"server\":\"veil-GARRETT\",\"tool\":\"whois\",\"arguments\":{\"target\":\"example.com\"}}").?;
+    defer gpa.free(c);
+    try tt.expectEqualStrings("{\"name\":\"whois\",\"args\":{\"target\":\"example.com\"}}", c);
+    // another server's call, another verb, and what does not parse stay what they were
+    try tt.expect(fromMcpCall(gpa, "mcp_call", "{\"server\":\"github\",\"tool\":\"whois\"}") == null);
+    try tt.expect(fromMcpCall(gpa, "mcp_discover", "{\"server\":\"Agent Garrett\"}") == null);
+    try tt.expect(fromMcpCall(gpa, "mcp_call", "not json") == null);
+    try tt.expect(fromMcpCall(gpa, "mcp_call", "[]") == null);
+    // routed, it answers as the built-in tool does: without the pair it says how to connect, and dials nothing
+    const off = run(.{ .gpa = gpa, .io = undefined, .scratch = ".", .url = "", .token = "" }, "garrett", a);
+    defer gpa.free(off);
+    try tt.expectEqualStrings(NOT_ON, off);
+    // a call with no tool named is the wrapper's usage error, not a server lookup
+    const none = fromMcpCall(gpa, "mcp_call", "{\"server\":\"Agent Garrett\"}").?;
+    defer gpa.free(none);
+    try tt.expectEqualStrings("{\"name\":\"\",\"args\":{}}", none);
+}
+
 test "the bearer goes to an https address or the loopback stand-in, nothing else; a tool name is the agent's spelling" {
     try tt.expect(allowedUrl("https://veil-garrett.acme.workers.dev/mcp"));
     try tt.expect(allowedUrl("http://127.0.0.1:8790/mcp"));
@@ -523,9 +615,11 @@ test "a list and a call go over one JSON-RPC POST each under the bearer, come ba
 
     const list_out = run(c, "garrett_tools", "{}");
     defer gpa.free(list_out);
-    try tt.expect(std.mem.indexOf(u8, list_out, "inputSchema:") != null);
-    try tt.expect(std.mem.indexOf(u8, list_out, "cveId") != null);
-    try tt.expect(std.mem.indexOf(u8, list_out, "- whois: RDAP / WHOIS.") != null);
+    // the list says how many there are and names each; the schemas stay out of it (one tool's is asked for by name)
+    try tt.expect(std.mem.startsWith(u8, list_out, "Agent Garrett: 2 built-in security tools."));
+    try tt.expect(std.mem.indexOf(u8, list_out, "\n- nvd_lookup: NVD CVE metadata lookup.") != null);
+    try tt.expect(std.mem.indexOf(u8, list_out, "\n- whois: RDAP / WHOIS.") != null);
+    try tt.expect(std.mem.indexOf(u8, list_out, "inputSchema:") == null);
     const call_out = run(c, "garrett", "{\"name\":\"NVD_lookup\",\"args\":{\"cveId\":\"CVE-2026-1\"}}");
     defer gpa.free(call_out);
     try tt.expectEqualStrings("CVE-2026-1: CVSS 9.8\nsecond block\nEVIDENCE: {\"tool\":\"nvd_lookup\",\"via\":\"builtin\",\"target\":\"CVE-2026-1\"}", call_out);
@@ -556,6 +650,23 @@ test "a list and a call go over one JSON-RPC POST each under the bearer, come ba
         std.debug.print("a file is left in the belt's scratch dir after its calls: {s}\n", .{e.name});
         return error.TestUnexpectedResult;
     }
+}
+
+test "one tool asked for by name comes back with its whole input schema, in either spelling; an unknown name says so" {
+    const gpa = tt.allocator;
+    const raw = "{\"result\":{\"tools\":[{\"name\":\"nvd_lookup\",\"description\":\"NVD CVE metadata lookup.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"cveId\":{\"type\":\"string\"}},\"required\":[\"cveId\"]}},{\"name\":\"whois\",\"description\":\"RDAP / WHOIS.\"}]}}";
+    const one = renderList(gpa, raw, "nvd_lookup");
+    defer gpa.free(one);
+    try tt.expectEqualStrings("- nvd_lookup: NVD CVE metadata lookup.\n  inputSchema: {\"type\":\"object\",\"properties\":{\"cveId\":{\"type\":\"string\"}},\"required\":[\"cveId\"]}", one);
+    const bare = renderList(gpa, raw, "whois");
+    defer gpa.free(bare);
+    try tt.expectEqualStrings("- whois: RDAP / WHOIS.", bare);
+    const none = renderList(gpa, raw, "nmap_scan");
+    defer gpa.free(none);
+    try tt.expect(std.mem.startsWith(u8, none, "ERROR: Agent Garrett has no tool named nmap_scan"));
+    const all = renderList(gpa, raw, "");
+    defer gpa.free(all);
+    try tt.expect(std.mem.startsWith(u8, all, "Agent Garrett: 2 built-in security tools."));
 }
 
 test "MCP discovery preserves separate typed schemas and routes direct security names" {
