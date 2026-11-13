@@ -122,6 +122,8 @@ button:disabled, .btn[aria-disabled=true] { opacity: .5; cursor: default; pointe
 .block p { font-size: var(--fs-small); color: var(--text-secondary); margin-bottom: 8px; }
 .block .steps { margin: 0 0 8px 18px; font-size: var(--fs-small); color: var(--text-secondary); }
 .block .steps li { margin-bottom: 4px; }
+.block ul:not(.steps) { margin: 0 0 8px 18px; font-size: var(--fs-small); color: var(--text-secondary); }
+.block ul:not(.steps) li { margin-bottom: 3px; }
 .block .acts { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; align-items: center; }
 .block .acts select { width: auto; min-height: 28px; padding: 0 8px; font-size: var(--fs-small); }
 .block label { display: block; font-size: var(--fs-micro); color: var(--text-muted); margin: 6px 0 2px; }

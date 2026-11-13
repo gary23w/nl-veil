@@ -509,7 +509,9 @@ main > section:last-child { padding-bottom: var(--section-gap); }
 /* ============================================================ document viewer
    The reader is the app's own surface: a raised panel, a sticky head, the
    markdown styled exactly like a chat message body (styles.css .msg-body). */
+/* (the reset takes a dialog's own centring away: it is put back here) */
 .docview {
+  position: fixed; inset: 0; margin: auto;
   width: min(980px, calc(100vw - 32px));
   max-width: none;
   height: min(88vh, 900px);
@@ -541,7 +543,7 @@ main > section:last-child { padding-bottom: var(--section-gap); }
 .docview-head .icon-btn { margin-left: auto; }
 
 .docview-paper { flex: 1; min-height: 0; overflow-y: auto; }
-.docview-body { padding: var(--pad) clamp(16px, 4vw, 40px) 30px; max-width: 82ch; }
+.docview-body { padding: var(--pad) clamp(16px, 4vw, 40px) 30px; max-width: 92ch; margin-inline: auto; }
 .docview-body > *:first-child { margin-top: 0; }
 
 .docview-body h1, .docview-body h2, .docview-body h3,
