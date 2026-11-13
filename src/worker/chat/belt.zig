@@ -399,6 +399,7 @@ pub fn pathFor(name: []const u8) []const u8 {
     if (std.mem.startsWith(u8, name, "pixel_")) return "knowledge/images";
     if (std.mem.startsWith(u8, name, "mcp_")) return "connect/mcp";
     if (std.mem.startsWith(u8, name, "schedule_")) return "delegate/schedule";
+    if (std.mem.startsWith(u8, name, "mesh_")) return "delegate/mesh";
     if (std.mem.startsWith(u8, name, "swarm_")) return "delegate/swarm";
     return "other";
 }

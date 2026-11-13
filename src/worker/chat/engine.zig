@@ -22,6 +22,7 @@ const tools = @import("../tools.zig");
 const cf_oauth = @import("../../config/cf_oauth.zig"); // per-turn Cloudflare credentials for the cf_ tool family
 const cftools = @import("../cftools.zig"); // and the belt entries those tools are advertised by
 const cf_garrett = @import("../../config/cf_garrett.zig"); // the user's own Agent Garrett: where it answers, the derived bearer
+const cf_harness = @import("../../config/cf_harness.zig"); // the mesh verbs: the user's other veils, through their own harness (mutual import, resolved lazily)
 const garrett = @import("../garrett.zig"); // and the two verbs that put it on a turn's belt
 const recipes = @import("../recipes.zig"); // recipe tools: the per-turn granted set advertised in turn_tools + resolved onto ctx.grants
 const plugins = @import("../../plug/plugins.zig"); // user extensions: prompt/policy/tool hooks over the sandboxed Lua runtime
@@ -827,7 +828,10 @@ fn buildTurnTools(gpa: std.mem.Allocator, ctx: *const tools.ToolCtx, compact: bo
     const cf_block: []const u8 = if (ctx.caps == .sandboxed) CF_TOOLS_SANDBOXED else cftools.SCHEMA;
     const cf_on = ctx.cf_token.len > 0 and ctx.cf_account.len > 0 and cf_block.len > 0;
     const gar_on = garrett.on(ctx.garrett_url, ctx.garrett_token);
-    if (ctx.grants.len == 0 and !cf_on and !gar_on) return base; // common case ⇒ the exact static string, zero allocation
+    // The mesh verbs (the user's other veils, through their own harness) ride on the same login, and only for a
+    // caller who is not sandboxed: a job sent to another machine runs a full-tool turn there.
+    const mesh_on = ctx.caps != .sandboxed and ctx.cf_token.len > 0 and ctx.cf_account.len > 0;
+    if (ctx.grants.len == 0 and !cf_on and !gar_on and !mesh_on) return base; // common case ⇒ the exact static string, zero allocation
     var b: std.ArrayListUnmanaged(u8) = .empty;
     b.appendSlice(gpa, base) catch {
         b.deinit(gpa);
@@ -839,6 +843,12 @@ fn buildTurnTools(gpa: std.mem.Allocator, ctx: *const tools.ToolCtx, compact: bo
             return base;
         };
         b.appendSlice(gpa, cf_block) catch {
+            b.deinit(gpa);
+            return base;
+        };
+    }
+    if (mesh_on) {
+        b.appendSlice(gpa, ",\n" ++ cf_harness.MESH_SCHEMA) catch {
             b.deinit(gpa);
             return base;
         };
@@ -10382,6 +10392,7 @@ fn orchTool(app: *App, uid: u64, ctx: *tools.ToolCtx, conv: []const u8, conv_dir
         const escalates = std.mem.eql(u8, name, "cast") or std.mem.eql(u8, name, "steer_swarm") or
             std.mem.eql(u8, name, "answer_swarm") or std.mem.eql(u8, name, "sync_dir") or
             std.mem.eql(u8, name, "open_subchat") or // mints a new server-side turn — execution, not observation
+            cf_harness.isMeshTool(name) or // work on the user's other machines: execution well outside this sandbox
             std.mem.startsWith(u8, name, "schedule_");
         if (escalates)
             return ctx.gpa.dupe(u8, "that is not available in this workspace — deploying swarms and scheduling runs are reserved for the server's admin, because they execute outside this conversation's sandbox.") catch null;
@@ -10397,6 +10408,7 @@ fn orchTool(app: *App, uid: u64, ctx: *tools.ToolCtx, conv: []const u8, conv_dir
     if (std.mem.eql(u8, name, "schedule_task")) return scheduleTool(app, uid, trio, args);
     if (std.mem.eql(u8, name, "schedule_update")) return scheduleUpdateTool(app, uid, ctx, args);
     if (std.mem.eql(u8, name, "schedule_list")) return scheduleListTool(app, uid);
+    if (cf_harness.isMeshTool(name)) return cf_harness.meshTool(app, uid, name, args);
     if (std.mem.eql(u8, name, "schedule_delete")) return scheduleDeleteTool(app, uid, args);
     if (std.mem.eql(u8, name, "sync_dir")) return syncDirTool(app, conv, conv_dir, ctrl_cursor, args, tool_client);
     if (std.mem.eql(u8, name, "open_subchat")) return openSubchatTool(app, uid, conv, conv_dir, trio, args);

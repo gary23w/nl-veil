@@ -259,7 +259,8 @@ const api = {
   harness:        ()   => jget('/api/v1/harness', 45000),
   harnessJobs:    ()   => jget('/api/v1/harness/jobs', 45000),
   harnessJob:     (id) => jget('/api/v1/harness/jobs/' + encodeURIComponent(id), 45000),
-  harnessQueue:   (task) => jpost('/api/v1/harness/jobs', { task: task }, 45000),
+  harnessQueue:   (task, node) => jpost('/api/v1/harness/jobs', node ? { task: task, node: node } : { task: task }, 45000),
+  harnessNodes:   ()   => jget('/api/v1/harness/nodes', 45000),
   harnessCancel:  (id) => jdel('/api/v1/harness/jobs/' + encodeURIComponent(id)),
   harnessScheds:  ()   => jget('/api/v1/harness/schedules', 45000),
   harnessLocal:   (on) => jpost('/api/v1/harness/local', { on: !!on }),
@@ -3267,10 +3268,11 @@ async function refreshHarness() {
     return;
   }
   const h = st.harness;
-  const [jobs, scheds, chats] = await Promise.all([
+  const [jobs, scheds, chats, nodes] = await Promise.all([
     api.harnessJobs().then((j) => j.jobs || []).catch(() => null),
     api.harnessScheds().then((j) => j.schedules || []).catch(() => null),
     api.harnessConvs().then((j) => j.convs || []).catch(() => null),
+    api.harnessNodes().then((j) => j.nodes || []).catch(() => []),   // an older harness keeps no mesh
   ]);
   if (!el('harnessBox')) return;   // the tab changed while the harness was answering
   const q = h.queue || {};
@@ -3285,8 +3287,19 @@ async function refreshHarness() {
     <div class="panel task-form">
       <div class="field"><label for="harTask">Queue a job (runs in your Cloudflare account on ${esc(st.default_model || '')})</label>
         <textarea id="harTask" rows="2" maxlength="8000"></textarea></div>
-      <div class="row"><button class="btn btn-solid btn-sm" id="harQueue">Queue</button></div>
+      <div class="row"><button class="btn btn-solid btn-sm" id="harQueue">Queue</button>
+        ${nodes.some((n) => n.runs && n.id !== st.node) ? `<select id="harNode" class="input" style="max-width:20rem">
+          <option value="">in the cloud queue</option>
+          ${nodes.filter((n) => n.runs && n.id !== st.node).map((n) => `<option value="${esc(n.id)}">on ${esc(n.name)}${n.online ? '' : ' (offline: it waits)'}</option>`).join('')}
+        </select>` : ''}</div>
     </div>
+    ${nodes.length ? `<div class="task-card panel">
+      <div class="task-name">Mesh (every veil on this Cloudflare login)</div>
+      ${nodes.map((n) => `<div class="task-sched muted"><span class="pill ${n.online ? 'on' : ''}">${n.online ? 'online' : 'offline'}</span>
+        <b>${esc(n.name)}</b>${n.id === st.node ? ' (this server\'s machine)' : ''} · ${esc([n.kind, n.os, n.version].filter(Boolean).join(' '))}
+        · ${n.runs ? 'runs work sent to it' : 'does not run work'}${n.browser ? ' · browser' : ''}${n.garrett ? ' · Agent Garrett' : ''}${(n.mcp || []).length ? ' · MCP: ' + esc(n.mcp.join(' ')) : ''}${Number(n.waiting) ? ' · ' + Number(n.waiting) + ' waiting' : ''}
+        <span class="mono">${esc(n.id)}</span></div>`).join('')}
+    </div>` : ''}
     <div class="task-actions">
       <span class="pill ${st.local ? 'on' : ''}">local jobs ${st.local ? 'run on this server\'s machine' : 'are not run here'}</span>
       <button class="btn btn-sm btn-ghost" id="harLocal" data-on="${st.local ? 'true' : 'false'}">${st.local ? 'Stop allowing them' : 'Allow them here'}</button>
@@ -3355,8 +3368,9 @@ async function queueHarnessJob() {
   const task = (el('harTask').value || '').trim();
   if (!task) return toast('Nothing to queue', 'Write the task first.', 'err');
   try {
-    await api.harnessQueue(task);
-    toast('Job queued', 'The harness has it.', 'ok');
+    const node = el('harNode') ? el('harNode').value : '';
+    await api.harnessQueue(task, node);
+    toast(node ? 'Sent' : 'Job queued', node ? 'The job waits for that machine to take it.' : 'The harness has it.', 'ok');
     refreshHarness();
   } catch (e) { toast('Could not queue', e.message, 'err'); }
 }

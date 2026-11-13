@@ -20,6 +20,8 @@ pub const Status = struct {
     reachable: bool = false, // a harness answered
     local: bool = false, // the owner allowed the harness's local jobs onto this machine (the server keeps the choice)
     local_waiting: u32 = 0, // local jobs on the harness that have not ended
+    node: [NODE_ID_MAX]u8 = [_]u8{0} ** NODE_ID_MAX, // this machine's id on the mesh ("" until the harness has answered)
+    node_len: u8 = 0,
     url: [120]u8 = [_]u8{0} ** 120,
     url_len: u8 = 0,
     err: [200]u8 = [_]u8{0} ** 200, // why there is no harness, in the server's or the harness's words
@@ -36,6 +38,9 @@ pub const Status = struct {
 
     pub fn urlStr(s: *const Status) []const u8 {
         return s.url[0..s.url_len];
+    }
+    pub fn nodeStr(s: *const Status) []const u8 {
+        return s.node[0..s.node_len];
     }
     pub fn errStr(s: *const Status) []const u8 {
         return s.err[0..s.err_len];
@@ -80,6 +85,98 @@ pub const Job = struct {
         return activeState(j.stateStr());
     }
 };
+
+pub const MAX_NODES = 16; // the harness lists at most 16 nodes
+pub const NODE_ID_MAX = 32;
+
+/// One veil of the account, as the harness lists it: a machine or a browser tab on the mesh.
+pub const Node = struct {
+    id: [NODE_ID_MAX]u8 = [_]u8{0} ** NODE_ID_MAX,
+    id_len: u8 = 0,
+    name: [48]u8 = [_]u8{0} ** 48,
+    name_len: u8 = 0,
+    kind: [8]u8 = [_]u8{0} ** 8, // desk / server / web
+    kind_len: u8 = 0,
+    os: [24]u8 = [_]u8{0} ** 24,
+    os_len: u8 = 0,
+    version: [24]u8 = [_]u8{0} ** 24,
+    version_len: u8 = 0,
+    mcp: [120]u8 = [_]u8{0} ** 120, // its MCP servers' names, space separated
+    mcp_len: u8 = 0,
+    runs: bool = false, // it runs work sent to it (its owner's switch)
+    browser: bool = false, // a web veil with the browser link on
+    garrett: bool = false,
+    online: bool = false,
+    waiting: u32 = 0, // jobs addressed to it that have not ended
+    ago_s: u32 = 0, // seconds since it last said it was here
+
+    pub fn idStr(n: *const Node) []const u8 {
+        return n.id[0..n.id_len];
+    }
+    pub fn nameStr(n: *const Node) []const u8 {
+        return n.name[0..n.name_len];
+    }
+    pub fn kindStr(n: *const Node) []const u8 {
+        return n.kind[0..n.kind_len];
+    }
+    pub fn osStr(n: *const Node) []const u8 {
+        return n.os[0..n.os_len];
+    }
+    pub fn versionStr(n: *const Node) []const u8 {
+        return n.version[0..n.version_len];
+    }
+    pub fn mcpStr(n: *const Node) []const u8 {
+        return n.mcp[0..n.mcp_len];
+    }
+};
+
+/// A node id as the server accepts one: 8 to 32 lower-case letters and digits.
+pub fn validNode(id: []const u8) bool {
+    if (id.len < 8 or id.len > NODE_ID_MAX) return false;
+    for (id) |c| if (!(std.ascii.isDigit(c) or (c >= 'a' and c <= 'z'))) return false;
+    return true;
+}
+
+/// Read a GET /api/v1/harness/nodes reply. How many, or null for anything that is not that reply.
+pub fn parseNodes(gpa: std.mem.Allocator, body: []const u8, out: *[MAX_NODES]Node) ?usize {
+    const JN = struct { id: []const u8 = "", name: []const u8 = "", kind: []const u8 = "", os: []const u8 = "", version: []const u8 = "", runs: bool = false, browser: bool = false, garrett: bool = false, mcp: []const []const u8 = &.{}, seen: i64 = 0, online: bool = false, waiting: i64 = 0 };
+    const J = struct { ok: bool = false, now: i64 = 0, nodes: []const JN = &.{} };
+    const p = std.json.parseFromSlice(J, gpa, body, .{ .ignore_unknown_fields = true }) catch return null;
+    defer p.deinit();
+    if (!p.value.ok) return null;
+    var n: usize = 0;
+    for (p.value.nodes) |j| {
+        if (n == MAX_NODES) break;
+        if (!validNode(j.id)) continue; // an id the server would refuse cannot be sent to
+        var r: Node = .{ .runs = j.runs, .browser = j.browser, .garrett = j.garrett, .online = j.online, .waiting = u32of(j.waiting), .ago_s = u32of(@divTrunc(p.value.now - j.seen, 1000)) };
+        r.id_len = @intCast(tots.put(&r.id, j.id));
+        r.name_len = @intCast(tots.put(&r.name, j.name));
+        r.kind_len = @intCast(tots.put(&r.kind, j.kind));
+        r.os_len = @intCast(tots.put(&r.os, j.os));
+        r.version_len = @intCast(tots.put(&r.version, j.version));
+        var m: usize = 0;
+        for (j.mcp) |nm| {
+            if (nm.len == 0 or m + nm.len + 1 > r.mcp.len) continue;
+            if (m > 0) {
+                r.mcp[m] = ' ';
+                m += 1;
+            }
+            m += tots.put(r.mcp[m..], nm);
+        }
+        r.mcp_len = @intCast(m);
+        out[n] = r;
+        n += 1;
+    }
+    return n;
+}
+
+/// {"task": ..., "node": ...}: the body of POST /api/v1/harness/jobs for a job sent to one node of the mesh.
+pub fn sendBody(buf: []u8, task: []const u8, node: []const u8) ?[]const u8 {
+    if (!validNode(node)) return null;
+    var w = std.Io.Writer.fixed(buf);
+    std.json.Stringify.value(.{ .task = task, .node = node }, .{}, &w) catch return null;
+    return w.buffered();
+}
 
 pub fn activeState(state: []const u8) bool {
     return std.mem.eql(u8, state, "queued") or std.mem.eql(u8, state, "running");
@@ -268,13 +365,14 @@ pub fn parseStatus(gpa: std.mem.Allocator, body: []const u8, out: *Status) bool 
         limits: struct { calls_max: i64 = 0 } = .{},
         queue: struct { waiting: i64 = 0, running: i64 = 0, max: i64 = 0, local: i64 = 0 } = .{},
     };
-    const J = struct { ok: bool = false, connected: bool = false, reachable: bool = false, local: bool = false, url: []const u8 = "", err: []const u8 = "", default_model: []const u8 = "", harness: ?JH = null };
+    const J = struct { ok: bool = false, connected: bool = false, reachable: bool = false, local: bool = false, node: []const u8 = "", url: []const u8 = "", err: []const u8 = "", default_model: []const u8 = "", harness: ?JH = null };
     const p = std.json.parseFromSlice(J, gpa, body, .{ .ignore_unknown_fields = true }) catch return false;
     defer p.deinit();
     const v = p.value;
     if (!v.ok) return false;
     var s: Status = .{ .connected = v.connected, .reachable = v.reachable and v.harness != null, .local = v.local };
     s.url_len = @intCast(tots.put(&s.url, v.url));
+    if (validNode(v.node)) s.node_len = @intCast(tots.put(&s.node, v.node));
     s.err_len = @intCast(tots.put(&s.err, v.err));
     s.default_model_len = @intCast(tots.put(&s.default_model, v.default_model));
     if (v.harness) |h| {
@@ -566,4 +664,29 @@ test "harness: its chats are listed as it lists them, and one reads as a transcr
     var pb: [96]u8 = undefined;
     try tt.expectEqualStrings("{\"conv\":\"c6acfeae2\"}", pushBody(&pb, "c6acfeae2").?);
     try tt.expect(validConvId("mabc1234") and !validConvId("abc") and !validConvId("a" ** 25) and !validConvId("ABCDEF1"));
+}
+
+test "the mesh's nodes are read with how long ago each was seen; a bad id is left out; a job sent to one names it" {
+    const gpa = std.testing.allocator;
+    const body = "{\"ok\":true,\"now\":1790000100000,\"online_ms\":90000,\"max\":16,\"nodes\":[" ++
+        "{\"id\":\"desk0000aaaa1111\",\"name\":\"Office\",\"kind\":\"desk\",\"os\":\"windows\",\"version\":\"1.2.3\",\"runs\":true,\"browser\":false,\"garrett\":true,\"mcp\":[\"files\",\"git\"],\"first\":1,\"seen\":1790000099000,\"online\":true,\"waiting\":0}," ++
+        "{\"id\":\"../x\",\"name\":\"bad\",\"kind\":\"desk\"}," ++
+        "{\"id\":\"tab00000cccc3333\",\"name\":\"Laptop tab\",\"kind\":\"web\",\"browser\":true,\"seen\":1790000000000,\"online\":false,\"waiting\":2}]}";
+    var rows: [MAX_NODES]Node = undefined;
+    const n = parseNodes(gpa, body, &rows).?;
+    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expectEqualStrings("Office", rows[0].nameStr());
+    try std.testing.expectEqualStrings("files git", rows[0].mcpStr());
+    try std.testing.expect(rows[0].runs and rows[0].garrett and rows[0].online and rows[0].ago_s == 1);
+    try std.testing.expectEqualStrings("web", rows[1].kindStr());
+    try std.testing.expect(rows[1].browser and !rows[1].runs and !rows[1].online and rows[1].waiting == 2 and rows[1].ago_s == 100);
+    try std.testing.expect(parseNodes(gpa, "{\"ok\":false,\"err\":\"x\"}", &rows) == null);
+
+    var st: Status = .{};
+    try std.testing.expect(parseStatus(gpa, "{\"ok\":true,\"connected\":true,\"reachable\":true,\"local\":true,\"node\":\"desk0000aaaa1111\",\"name\":\"Office\",\"url\":\"https://veil-web.acme.workers.dev\",\"err\":\"\",\"default_model\":\"@cf/x/y\",\"harness\":{\"version\":\"9\"}}", &st));
+    try std.testing.expectEqualStrings("desk0000aaaa1111", st.nodeStr());
+
+    var bb: [200]u8 = undefined;
+    try std.testing.expectEqualStrings("{\"task\":\"count the files\",\"node\":\"tab00000cccc3333\"}", sendBody(&bb, "count the files", "tab00000cccc3333").?);
+    try std.testing.expect(sendBody(&bb, "x", "../x") == null);
 }

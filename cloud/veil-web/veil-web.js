@@ -19,6 +19,12 @@
 //   - LOCAL JOBS: a job queued with `local: true` is not run here. It waits for the owner's own machine: a
 //     desktop veil whose owner allowed it asks for these jobs (nothing here calls the machine), runs each one
 //     there and posts the result back. Until one does, the job stays queued.
+//   - THE MESH: every veil logged in to this account (a desktop veil, a browser tab of the web veil) can tell
+//     the harness it is here: a NODE with an id, a name, what kind it is and whether it runs work sent to it.
+//     A local job may be addressed to one node; only that node is handed it. Nothing here calls a node: each
+//     one asks. A node that has not said it is here for NODE_ONLINE_MS is listed as offline.
+//   - SHARED SETTINGS: small named values (a model choice, a theme) every veil of the account reads and writes.
+//     The last write of a name wins; each carries the time the harness took it.
 //   - SCHEDULES: a task that queues itself as a job every so often.
 //   - CHATS: the page's conversations and their files, kept here so every browser the owner logs in from (and
 //     anything else holding their login) sees the same ones.
@@ -31,7 +37,8 @@
 // There is no shared key to paste or leak. Cross-origin calls are answered for ALLOW_ORIGIN (the page) only.
 //
 // WHAT IT KEEPS (one Durable Object, "main"): the queue and each job's record, today's usage, the limits, the
-// Python source's cached copy, Agent Garrett's address and token. All of it in the user's account.
+// Python source's cached copy, Agent Garrett's address and token, the nodes that said they are here, and the
+// shared settings. All of it in the user's account.
 //
 // LIMITS (DEFAULTS; the owner can change them, within CEIL): model calls and transferred bytes per UTC day, and
 // bytes of job data kept. A spent day's budget refuses new work until 00:00 UTC; the queue holds QUEUE_MAX waiting
@@ -42,9 +49,17 @@
 //   POST config                 {calls_max?, bytes_max?, storage_max?}
 //   POST chat | fetch | search  one model call (stream:true = SSE) | one HTTP call | a web search
 //   GET  jobs | jobs/<id>       the queue, oldest first | one job whole
-//   POST jobs  {task, model, local?}   queue a job (local: true = for the owner's machine)
+//   POST jobs  {task, model, local?, node?, from?}   queue a job (local: true = for the owner's machine;
+//                               node: <id> = for that one node, which makes it local; from: the node asking)
 //   DELETE jobs/<id>            cancel or delete one
-//   GET  local                  the local jobs not finished yet, oldest first: {id, t, task, model, state}
+//   GET  local[?node=<id>]      the local jobs not finished yet, oldest first: {id, t, task, model, state, node}.
+//                               With node: that node's jobs and the ones addressed to nobody. Without: only those.
+//   GET  nodes                  every node: {id, name, kind, os, version, runs, browser, garrett, mcp, seen, online, waiting}
+//   POST nodes/<id>             {name, kind, os?, version?, runs?, browser?, garrett?, mcp?}  "I am here" (again)
+//   DELETE nodes/<id>           forget one
+//   GET  settings               {settings: {name: {v, at}}}      POST settings {set?: {name: value}, del?: [name]}
+//   GET  share                  the connections kept here, whole, for another veil of the owner to use the same
+//                               ones: {garrett: {url, token} | null, mcp: [{name, url, token}]}
 //   POST local/<id>             {started: true} when the machine takes one | {ok, result} when it has ended
 //   POST python/enable (re-upload this Worker with the LOADER binding) | python/run {code, files?, args?, packages?}
 //   POST garrett {key} or {url, token} (neither forgets it) | garrett/call {method, params}
@@ -59,7 +74,7 @@
 // No imports and no platform globals beyond fetch/Response/crypto, so a test can run this file under node with
 // a Map for storage and a scripted env.AI.
 
-export const VERSION = "9";
+export const VERSION = "10";
 const API_ROOT = "https://api.cloudflare.com/client/v4";
 const PY_SOURCE = "https://raw.githubusercontent.com/gary23w/nl-veil/main/cloud/tot_py.py";
 const SELF_SCRIPT = "veil-web";
@@ -87,6 +102,13 @@ const JOB_LOOP_BYTES = 40000; // a job's messages; older rounds go first
 const RESULT_MAX = 10000;
 const LOCAL_WAITING = "waiting for the owner's machine"; // a local job's note until a machine takes it
 const LOCAL_RUNNING = "running on the owner's machine";
+export const NODES_MAX = 16; // nodes one harness lists; the one unseen longest goes first
+export const NODE_ONLINE_MS = 90 * 1000; // a node says it is here more often than this
+const NODE_KINDS = new Set(["desk", "server", "web"]);
+const NODE_ID = /^[a-z0-9]{8,32}$/;
+export const SETTINGS_MAX = 128; // shared settings one harness keeps
+const SETTING_NAME = /^[a-z][a-z0-9_.]{0,47}$/;
+const SETTING_BYTES = 2000; // one value
 const FETCH_TEXT_MAX = 200000;
 const MAX_TOKENS_CEIL = 16384;
 const AUTH_TTL_MS = 5 * 60 * 1000;
@@ -1189,12 +1211,15 @@ export class Harness {
 
   /// Put a job at the back of the queue. The caller has checked there is room. Returns its id.
   /// `local`: the job is for the owner's machine. The alarm never runs it; it waits for /v1/local.
-  async enqueue(index, task, model, schedule = "", local = false) {
+  /// `node`: the one node it is for ("" = any of the owner's machines). `from`: the node that asked ("" = not said).
+  async enqueue(index, task, model, schedule = "", local = false, node = "", from = "") {
     const id = Date.now().toString(36) + hex(crypto.getRandomValues(new Uint8Array(3)));
     const note = local ? LOCAL_WAITING : "";
     const job = { id, task, model, schedule, state: "queued", created: Date.now(), started: 0, finished: 0, rounds: [], files: {}, result: "", error: "", note, calls: 0 };
     const row = { id, task: clip(task.replace(/\s+/g, " "), 120), state: "queued", created: job.created, finished: 0, bytes: 0, note, schedule };
     if (local) job.local = row.local = true;
+    if (node) job.node = row.node = node;
+    if (from) job.from = row.from = from;
     index.push(row);
     await this.saveJob(job, index);
     return id;
@@ -1259,6 +1284,33 @@ export class Harness {
     await this.rearm(wait, nextDue);
   }
 
+  // ---------------------------------------------------------------- the mesh
+
+  async nodes() {
+    return (await this.store.get("nodes")) ?? [];
+  }
+
+  async nodeCounts() {
+    const list = await this.nodes();
+    const now = Date.now();
+    return { count: list.length, online: list.filter((n) => now - n.seen < NODE_ONLINE_MS).length, max: NODES_MAX };
+  }
+
+  /// A node's own words about itself, cut to what is kept. {err} in words when it cannot be kept.
+  nodeFrom(id, body, old) {
+    const name = clip(String(body.name ?? "").replace(/\s+/g, " ").trim(), 48);
+    if (!name) return { err: "a node needs a name" };
+    const kind = String(body.kind ?? "");
+    if (!NODE_KINDS.has(kind)) return { err: "kind must be desk, server or web" };
+    const mcp = Array.isArray(body.mcp) ? body.mcp.slice(0, 16).map((x) => clip(String(x), 32)).filter(Boolean) : [];
+    const now = Date.now();
+    return { id, name, kind, os: clip(String(body.os ?? ""), 24), version: clip(String(body.version ?? ""), 24), runs: body.runs === true, browser: body.browser === true, garrett: body.garrett === true, mcp, first: old?.first ?? now, seen: now };
+  }
+
+  async settings() {
+    return (await this.store.get("settings")) ?? {};
+  }
+
   // ---------------------------------------------------------------- routes
 
   async status(who) {
@@ -1274,6 +1326,7 @@ export class Harness {
       queue: { waiting: index.filter((j) => j.state === "queued").length, running: index.filter((j) => j.state === "running").length, max: QUEUE_MAX, kept: index.length, keep: JOBS_KEEP, local: index.filter((j) => j.local && ["queued", "running"].includes(j.state)).length },
       schedules: { count: sched.length, max: SCHEDULES_MAX, shortest_s: EVERY_MIN_S },
       chats: { count: chats.length, max: CONVS_MAX },
+      nodes: await this.nodeCounts(),
       python: { worker: !!this.env.LOADER },
       garrett: g ? { connected: true, host: new URL(g.url).hostname, tools: g.tools ?? 0 } : { connected: false },
       garrett_dashboard: GARRETT_DASHBOARD,
@@ -1444,19 +1497,75 @@ export class Harness {
       if (!model.startsWith("@")) return bad("model must be a Workers AI model id");
       const index = await this.jobs();
       if (index.filter((j) => j.state === "queued").length >= QUEUE_MAX) return bad(`the queue is full (${QUEUE_MAX} jobs waiting); a job joins when one starts`, 429);
-      const local = body.local === true;
-      const id = await this.enqueue(index, task, model, "", local);
+      const node = String(body.node ?? "");
+      const from = String(body.from ?? "");
+      if (node && !(await this.nodes()).some((n) => n.id === node)) return bad("no such node: ask for the nodes first", 404);
+      if (from && !NODE_ID.test(from)) return bad("from must be a node id");
+      const local = body.local === true || node !== "";
+      const id = await this.enqueue(index, task, model, "", local, node, from);
       if (!local) await this.store.setAlarm(Date.now() + 100);
-      return say({ ok: true, id, local, position: index.filter((j) => j.state === "queued").length });
+      return say({ ok: true, id, local, node, position: index.filter((j) => j.state === "queued").length });
+    }
+
+    // The mesh: who is here.
+    if (at === "nodes" && method === "GET") {
+      const now = Date.now();
+      const index = await this.jobs();
+      const waiting = (id) => index.filter((j) => j.local && j.node === id && ["queued", "running"].includes(j.state)).length;
+      return say({ ok: true, now, online_ms: NODE_ONLINE_MS, max: NODES_MAX, nodes: (await this.nodes()).map((n) => ({ ...n, online: now - n.seen < NODE_ONLINE_MS, waiting: waiting(n.id) })) });
+    }
+    if (seg[1] === "nodes" && seg.length === 3 && (method === "POST" || method === "DELETE")) {
+      if (!NODE_ID.test(seg[2])) return bad("a node id is 8 to 32 lower-case letters and digits");
+      const list = await this.nodes();
+      const old = list.find((n) => n.id === seg[2]);
+      const rest = list.filter((n) => n.id !== seg[2]);
+      if (method === "DELETE") {
+        await this.store.put("nodes", rest);
+        return say({ ok: true, deleted: seg[2] });
+      }
+      const node = this.nodeFrom(seg[2], body, old);
+      if (node.err) return bad(node.err);
+      rest.push(node);
+      rest.sort((a, b) => a.first - b.first);
+      while (rest.length > NODES_MAX) rest.splice(rest.indexOf(rest.filter((n) => n.id !== node.id).reduce((a, b) => (a.seen <= b.seen ? a : b))), 1);
+      await this.store.put("nodes", rest);
+      return say({ ok: true, id: node.id, nodes: rest.length });
+    }
+
+    // Shared settings: the last write of a name wins.
+    if (at === "settings" && method === "GET") return say({ ok: true, now: Date.now(), settings: await this.settings(), max: SETTINGS_MAX });
+    if (at === "settings" && method === "POST") {
+      const all = await this.settings();
+      const now = Date.now();
+      const set = body.set && typeof body.set === "object" ? Object.entries(body.set) : [];
+      for (const [k, v] of set) {
+        if (!SETTING_NAME.test(k)) return bad(`"${clip(k, 60)}" is not a setting name: a letter, then letters, digits, . or _ (48 at most)`);
+        if (!["string", "number", "boolean"].includes(typeof v) || (typeof v === "number" && !Number.isFinite(v))) return bad(`${k} must be text, a number or true/false`);
+        if (typeof v === "string" && v.length > SETTING_BYTES) return bad(`${k} is longer than ${SETTING_BYTES} characters`);
+        all[k] = { v, at: now };
+      }
+      for (const k of Array.isArray(body.del) ? body.del : []) delete all[String(k)];
+      if (Object.keys(all).length > SETTINGS_MAX) return bad(`this harness keeps at most ${SETTINGS_MAX} settings`, 429);
+      await this.store.put("settings", all);
+      return say({ ok: true, now, settings: all });
+    }
+
+    // The connections kept here, whole. The caller is the owner (every route's check): it is how another veil of
+    // theirs uses the same Agent Garrett and the same MCP servers without the key being typed again.
+    if (at === "share" && method === "GET") {
+      const g = await this.store.get("garrett");
+      return say({ ok: true, garrett: g ? { url: g.url, token: g.token, tools: g.tools ?? 0, at: g.at ?? 0 } : null, mcp: (await this.mcpServers()).map((x) => ({ name: x.name, url: x.url, token: x.token ?? "" })) });
     }
 
     // The owner's machine: it asks for the local jobs, says when it takes one, and posts how each ended.
     if (at === "local" && method === "GET") {
       const index = await this.jobs();
+      const me = url.searchParams.get("node") ?? "";
       const jobs = [];
-      for (const row of index.filter((j) => j.local && ["queued", "running"].includes(j.state))) {
+      // a job addressed to a node goes to that node only; one addressed to nobody goes to whoever asks
+      for (const row of index.filter((j) => j.local && ["queued", "running"].includes(j.state) && (!j.node || j.node === me))) {
         const job = await this.store.get("job:" + row.id);
-        if (job) jobs.push({ id: job.id, t: job.created, task: job.task, model: job.model, state: job.state });
+        if (job) jobs.push({ id: job.id, t: job.created, task: job.task, model: job.model, state: job.state, node: job.node ?? "", from: job.from ?? "" });
       }
       return say({ ok: true, jobs });
     }

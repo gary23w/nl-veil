@@ -316,6 +316,8 @@ const Ui = struct {
     sched_scroll: f32 = 0,
     // Tasks tab, Web harness view: the task line, the queue's scroll, the selected job's result scroll
     har_task: Field = .{},
+    har_target: [harness.NODE_ID_MAX]u8 = [_]u8{0} ** harness.NODE_ID_MAX, // the mesh node the task line sends to ("" = the cloud queue)
+    har_target_len: u8 = 0,
     har_scroll: f32 = 0,
     har_res_scroll: f32 = 0,
     har_chats_scroll: f32 = 0,
@@ -9312,7 +9314,17 @@ fn drawSchedHarness(store: *Store, r: t.Rect) void {
     @memcpy(chat_selb[0..chat_sel_n], store.harness_chat_sel[0..chat_sel_n]);
     if (chat_sel_n > 0) har_chat_view = store.harness_chat;
     const has_open_chat = store.conv_active_len > 0;
+    var nodes: [harness.MAX_NODES]harness.Node = undefined;
+    const node_n = store.harness_node_n;
+    @memcpy(nodes[0..node_n], store.harness_nodes[0..node_n]);
+    const mesh_sync = store.settings.mesh_sync;
     store.unlock();
+    // the node the task line sends to: gone from the list, or no longer running work, and the line is the cloud's again
+    var target: ?*const harness.Node = null;
+    for (nodes[0..node_n]) |*nd| if (ui.har_target_len > 0 and std.mem.eql(u8, nd.idStr(), ui.har_target[0..ui.har_target_len]) and nd.runs) {
+        target = nd;
+    };
+    if (target == null) ui.har_target_len = 0;
     const sel = selb[0..sel_n];
     const chat_sel = chat_selb[0..chat_sel_n];
 
@@ -9344,10 +9356,10 @@ fn drawSchedHarness(store: *Store, r: t.Rect) void {
         y += 46;
 
         // the line that queues a job
-        const ql = t.z("Queue", .{});
+        const ql = if (target != null) t.z("Send", .{}) else t.z("Queue", .{});
         const qw = @max(84, t.btnW(ql, t.FIELD_H));
         const qf = t.Rect{ .x = r.x, .y = y, .width = r.width - qw - 8, .height = t.FIELD_H };
-        textField(qf, &ui.har_task, ui.focus == .hw_task, "a task for the harness to work on its own - Enter to queue", .hw_task);
+        textField(qf, &ui.har_task, ui.focus == .hw_task, if (target != null) "a task for that machine to do on its own - Enter to send" else "a task for the harness to work on its own - Enter to queue", .hw_task);
         const qb = t.Rect{ .x = r.x + r.width - qw, .y = y, .width = qw, .height = t.FIELD_H };
         const task = std.mem.trim(u8, ui.har_task.str(), " \t\r\n");
         const can = task.len > 0 and !busy;
@@ -9355,20 +9367,27 @@ fn drawSchedHarness(store: *Store, r: t.Rect) void {
             if (task.len > harness.TASK_MAX) {
                 store.pushNotif("Task too long", "the desk queues tasks of up to 3000 bytes", 2);
             } else {
-                store.pushCmd(store_mod.mkCmd(.harness_queue, "", task));
+                if (target) |nd| store.pushCmd(store_mod.mkCmd(.harness_send, nd.idStr(), task)) else store.pushCmd(store_mod.mkCmd(.harness_queue, "", task));
                 ui.har_task.clear();
                 ui.har_scroll = 0;
             }
         }
         y += t.FIELD_H + 4;
         var mb: [160]u8 = undefined;
-        const mline = if (busy) "queueing..." else std.fmt.bufPrint(&mb, "runs in your Cloudflare account on {s}", .{st.defaultModelStr()}) catch "";
-        t.textClip(mline, @intFromFloat(r.x), @intFromFloat(y), 11, t.comment, @intFromFloat(r.width));
+        const mline = if (busy) "queueing..." else if (target) |nd| (std.fmt.bufPrint(&mb, "goes to {s}, to run there with that machine's own tools - click its row again for the cloud queue", .{nd.nameStr()}) catch "") else std.fmt.bufPrint(&mb, "runs in your Cloudflare account on {s}", .{st.defaultModelStr()}) catch "";
+        t.textClip(mline, @intFromFloat(r.x), @intFromFloat(y), 11, if (target != null) t.blue else t.comment, @intFromFloat(r.width));
         y += 20;
         // the owner's switch for LOCAL jobs: jobs queued on the harness for this machine run here only while it is on
         const ll = if (st.local_waiting > 0) t.z("run the harness's local jobs on this machine ({d} waiting)", .{st.local_waiting}) else t.z("run the harness's local jobs on this machine", .{});
         if (t.checkbox(.{ .x = r.x, .y = y, .width = @min(r.width, 460), .height = 26 }, ll, st.local))
             store.pushCmd(store_mod.mkCmd(.harness_local, "", if (st.local) "0" else "1"));
+        // the shared settings: model choice, theme and the rest (meshsync.zig), level with the user's other veils
+        if (r.width >= 900 and t.checkbox(.{ .x = r.x + 480, .y = y, .width = @min(r.width - 480, 420), .height = 26 }, t.z("keep this desk's settings level with my other veils", .{}), mesh_sync)) {
+            store.lock();
+            store.settings.mesh_sync = !mesh_sync;
+            store.unlock();
+            store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
+        }
         y += 32;
     }
 
@@ -9425,11 +9444,14 @@ fn drawSchedHarness(store: *Store, r: t.Rect) void {
 
     const rx = r.x + left_w + gap;
     const rw = r.x + r.width - rx;
-    const sched_h: f32 = @min(body_h * 0.34, 22 + @as(f32, @floatFromInt(@max(sched_n, 1))) * 20 + 14);
-    const res = t.Rect{ .x = rx, .y = y, .width = rw, .height = body_h - sched_h - gap };
+    const sched_h: f32 = @min(body_h * 0.22, 22 + @as(f32, @floatFromInt(@max(sched_n, 1))) * 20 + 14);
+    // the mesh: every veil of the account. Shown once a harness that keeps one has answered.
+    const mesh_h: f32 = if (st.reachable and body_h >= 300) @min(body_h * 0.30, 26 + @as(f32, @floatFromInt(@max(node_n, 1))) * 38 + 8) else 0;
+    const res = t.Rect{ .x = rx, .y = y, .width = rw, .height = body_h - sched_h - gap - (if (mesh_h > 0) mesh_h + gap else 0) };
     if (chat_sel.len > 0) drawHarnessChat(res, chat_sel) else drawHarnessResult(res, sel);
+    if (mesh_h > 0) drawHarnessMesh(.{ .x = rx, .y = res.y + res.height + gap, .width = rw, .height = mesh_h }, nodes[0..node_n], st.nodeStr());
     // the schedules: each queues its task as a job on its own clock, in the harness
-    const sr = t.Rect{ .x = rx, .y = res.y + res.height + gap, .width = rw, .height = sched_h };
+    const sr = t.Rect{ .x = rx, .y = r.y + r.height - sched_h, .width = rw, .height = sched_h };
     t.panelBordered(sr, t.bg_dark, t.border);
     flabel(sr.x + 10, sr.y + 6, t.z("SCHEDULES (kept by the harness)", .{}));
     rl.beginScissorMode(@intFromFloat(sr.x + 1), @intFromFloat(sr.y + 1), @intFromFloat(sr.width - 2), @intFromFloat(sr.height - 2));
@@ -9442,6 +9464,59 @@ fn drawSchedHarness(store: *Store, r: t.Rect) void {
         const line = std.fmt.bufPrint(&lb, "{s}  -  {d} runs  -  {s}", .{ harness.everyStr(&eb, sc.every_s), sc.runs, sc.taskStr() }) catch "";
         t.textClip(line, @intFromFloat(sr.x + 10), @intFromFloat(sy), 12, t.fg_dim, @intFromFloat(sr.width - 20));
         sy += 20;
+    }
+}
+
+/// The mesh: every veil logged in to the account that has told the harness it is here - this machine, the user's
+/// other computers, their open web veil tabs. A row that runs work is a target: click it and the task line above
+/// sends to that machine; click it again and the line is the cloud queue's.
+fn drawHarnessMesh(r: t.Rect, rows: []const harness.Node, self_id: []const u8) void {
+    t.panelBordered(r, t.bg_dark, t.border);
+    flabel(r.x + 10, r.y + 6, t.z("MESH (every veil on this Cloudflare login)", .{}));
+    const inner = t.Rect{ .x = r.x + 1, .y = r.y + 26, .width = r.width - 2, .height = r.height - 27 };
+    if (inner.height < 12) return;
+    if (rows.len == 0) {
+        t.textClip("none listed yet - a harness of version 10 or newer lists them", @intFromFloat(r.x + 10), @intFromFloat(inner.y + 2), 12, t.comment, @intFromFloat(r.width - 20));
+        return;
+    }
+    rl.beginScissorMode(@intFromFloat(inner.x), @intFromFloat(inner.y), @intFromFloat(inner.width), @intFromFloat(inner.height));
+    defer rl.endScissorMode();
+    const row_h: f32 = 38;
+    var yy: f32 = inner.y;
+    for (rows) |*nd| {
+        const rr = t.Rect{ .x = inner.x + 4, .y = yy, .width = inner.width - 8, .height = row_h - 2 };
+        const me = self_id.len > 0 and std.mem.eql(u8, nd.idStr(), self_id);
+        const picked = ui.har_target_len > 0 and std.mem.eql(u8, nd.idStr(), ui.har_target[0..ui.har_target_len]);
+        const can = nd.runs and !me;
+        const hot = can and t.hovering(rr) and t.hovering(inner);
+        if (picked or hot) t.panel(rr, t.bg_hl);
+        var nb: [120]u8 = undefined;
+        const title = std.fmt.bufPrint(&nb, "{s}{s}", .{ nd.nameStr(), if (me) "  (this machine)" else "" }) catch nd.nameStr();
+        t.textClip(if (nd.online) "online" else "offline", @intFromFloat(rr.x + 8), @intFromFloat(rr.y + 3), 12, if (nd.online) t.green else t.comment, 56);
+        t.textClip(title, @intFromFloat(rr.x + 68), @intFromFloat(rr.y + 2), 13, t.fg, @intFromFloat(rr.width - 76));
+        var sb: [360]u8 = undefined;
+        var w = std.Io.Writer.fixed(&sb);
+        w.print("{s}", .{nd.kindStr()}) catch {};
+        if (nd.os_len > 0) w.print(" {s}", .{nd.osStr()}) catch {};
+        if (nd.version_len > 0) w.print(" {s}", .{nd.versionStr()}) catch {};
+        w.print("  -  {s}", .{if (nd.runs) "runs work sent to it" else "does not run work"}) catch {};
+        if (nd.browser) w.writeAll("  -  browser") catch {};
+        if (nd.garrett) w.writeAll("  -  Agent Garrett") catch {};
+        if (nd.mcp_len > 0) w.print("  -  MCP: {s}", .{nd.mcpStr()}) catch {};
+        if (nd.waiting > 0) w.print("  -  {d} waiting", .{nd.waiting}) catch {};
+        if (!nd.online) w.print("  -  last seen {d} s ago", .{nd.ago_s}) catch {};
+        t.textClip(w.buffered(), @intFromFloat(rr.x + 68), @intFromFloat(rr.y + 19), 11, if (picked) t.blue else t.comment, @intFromFloat(rr.width - 76));
+        if (hot) t.wantCursor(.pointing_hand);
+        if (hot and rl.isMouseButtonPressed(.left)) {
+            if (picked) {
+                ui.har_target_len = 0;
+            } else {
+                const id = nd.idStr();
+                @memcpy(ui.har_target[0..id.len], id);
+                ui.har_target_len = @intCast(id.len);
+            }
+        }
+        yy += row_h;
     }
 }
 
