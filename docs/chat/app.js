@@ -353,7 +353,7 @@ async function updateHarness() {
 /// The text of a model reply, whatever envelope its family uses. An object where text was expected is the
 /// model's JSON already parsed: it is put back as JSON. A reply that is only `tool_calls` becomes the call.
 function modelText(r) {
-  const flat = (c) => (typeof c === "string" ? c : Array.isArray(c) ? c.map((p) => (typeof p === "string" ? p : (p?.text ?? p?.content ?? ""))).join("") : c && typeof c === "object" ? JSON.stringify(c) : "");
+  const flat = (c) => (typeof c === "string" ? c : Array.isArray(c) ? c.map((p) => (typeof p === "string" ? p : (p?.text ?? p?.content ?? ""))).join("") : c && typeof c === "object" ? JSON.stringify(c) : typeof c === "number" || typeof c === "boolean" ? String(c) : "");
   if (typeof r === "string") return r;
   if (!r || typeof r !== "object") return "";
   const msg = r.choices?.[0]?.message ?? r.choices?.[0]?.delta;
@@ -568,6 +568,17 @@ const TRIAL_PATIENCE = 1500;    // the same, for a call sent with a knob that is
    its length limit, `reasoning` the characters of thinking that came before (or instead of) the text. With
    `patience`, a call still only reasoning after that many characters is dropped and comes back `gaveUp`. */
 async function modelRequest(messages, onText, signal, maxTokens, extra, onThink, patience = 0) {
+  // a model whose host re-parses streamed tokens is asked for its reply whole
+  if (quirks[S.model]?.flat) return modelRequestInner(messages, onText, signal, maxTokens, extra, onThink, patience, null, false);
+  const got = await modelRequestOnce(messages, onText, signal, maxTokens, extra, onThink, patience);
+  if (!got.reparsed) return got;
+  quirks[S.model] = { ...quirks[S.model], flat: true };
+  ls.set('veilweb.quirks', quirks);
+  onText?.('');
+  return modelRequestInner(messages, onText, signal, maxTokens, extra, onThink, patience, null, false);
+}
+
+async function modelRequestOnce(messages, onText, signal, maxTokens, extra, onThink, patience) {
   const own = new AbortController();
   const stop = () => own.abort();
   signal?.addEventListener('abort', stop);
@@ -578,8 +589,8 @@ async function modelRequest(messages, onText, signal, maxTokens, extra, onThink,
   }
 }
 
-async function modelRequestInner(messages, onText, signal, maxTokens, extra, onThink, patience, own) {
-  const r = await harness('/v1/chat', { body: { model: S.model, messages, max_tokens: maxTokens, stream: true, ...(extra ? { extra } : {}) }, signal });
+async function modelRequestInner(messages, onText, signal, maxTokens, extra, onThink, patience, own, stream = true) {
+  const r = await harness('/v1/chat', { body: { model: S.model, messages, max_tokens: maxTokens, stream, ...(extra ? { extra } : {}) }, signal });
   const type = r.headers.get('content-type') ?? '';
   if (!type.includes('event-stream')) {
     const j = await r.json().catch(() => null);
@@ -615,6 +626,13 @@ async function modelRequestInner(messages, onText, signal, maxTokens, extra, onT
         c.name += tc.function?.name ?? tc.name ?? '';
         const a = tc.function?.arguments ?? tc.arguments;
         c.args += typeof a === 'string' ? a : a ? JSON.stringify(a) : '';
+      }
+      // a token that arrives as a number or a boolean was text the host parsed: this stream cannot be trusted
+      // (a quoted word has lost its quotes the same way, and that cannot be seen or undone)
+      if (typeof j.response === 'number' || typeof j.response === 'boolean') {
+        own.abort();
+        reader.cancel().catch(() => {});
+        return { text: '', cut: false, reasoning, reparsed: true };
       }
       const piece = modelText(j.choices ? { choices: [{ delta: { content: d?.content } }] } : { response: j.response });
       if (piece) { text += piece; onText?.(noThink(text)); continue; }
@@ -665,7 +683,7 @@ async function callModel(messages, onText, signal, maxTokens = 8192) {
       }
       if (trial.text) { quiet = i; got = trial; }
     }
-    quirks[S.model] = { quiet };
+    quirks[S.model] = { ...quirks[S.model], quiet };
     ls.set('veilweb.quirks', quirks);
     if (quiet < 0) {
       say('no switch quiets this model; giving it three times the room…');
@@ -845,7 +863,7 @@ const fileName = (v) => String(v ?? '').trim().replace(/\\/g, '/').replace(/^\.?
 
 async function runTool(name, args, signal) {
   const files = S.conv.files;
-  const f = fileName(args.name ?? args.path ?? args.file);
+  const f = fileName(args.name ?? args.path ?? args.file ?? args.filename);
   switch (name) {
     case 'write_file':
     case 'append_file': {

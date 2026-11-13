@@ -59,7 +59,7 @@
 // No imports and no platform globals beyond fetch/Response/crypto, so a test can run this file under node with
 // a Map for storage and a scripted env.AI.
 
-export const VERSION = "7";
+export const VERSION = "8";
 const API_ROOT = "https://api.cloudflare.com/client/v4";
 const PY_SOURCE = "https://raw.githubusercontent.com/gary23w/nl-veil/main/cloud/tot_py.py";
 const SELF_SCRIPT = "veil-web";
@@ -200,7 +200,7 @@ export function searchResults(html, engine) {
 /// The text of a model reply, whatever envelope its family uses. An object where text was expected is the
 /// model's JSON already parsed: it is put back as JSON. A reply that is only `tool_calls` becomes the call.
 function modelText(r) {
-  const flat = (c) => (typeof c === "string" ? c : Array.isArray(c) ? c.map((p) => (typeof p === "string" ? p : (p?.text ?? p?.content ?? ""))).join("") : c && typeof c === "object" ? JSON.stringify(c) : "");
+  const flat = (c) => (typeof c === "string" ? c : Array.isArray(c) ? c.map((p) => (typeof p === "string" ? p : (p?.text ?? p?.content ?? ""))).join("") : c && typeof c === "object" ? JSON.stringify(c) : typeof c === "number" || typeof c === "boolean" ? String(c) : "");
   if (typeof r === "string") return r;
   if (!r || typeof r !== "object") return "";
   const msg = r.choices?.[0]?.message ?? r.choices?.[0]?.delta;
@@ -563,7 +563,9 @@ export class Harness {
 
   /// One streamed model call, read here. Resolves {reply, gaveUp}: with `patience`, a call still only reasoning
   /// after that many characters is dropped (`gaveUp`) rather than waited out.
-  async ask(model, messages, room, extra, patience) {
+  async ask(model, messages, room, extra, patience, flat = false) {
+    // a model whose host re-parses streamed tokens (`reparsed`, below) is asked for its reply whole
+    if (flat) return { reply: answerText(await this.env.AI.run(model, { messages, max_tokens: room, ...(extra ?? {}) })), gaveUp: false };
     const out = await this.env.AI.run(model, { messages, max_tokens: room, stream: true, ...(extra ?? {}) });
     if (!(out instanceof ReadableStream)) return { reply: answerText(out), gaveUp: false };
     const reader = out.getReader();
@@ -593,6 +595,11 @@ export class Harness {
           c.args += typeof g === "string" ? g : g ? JSON.stringify(g) : "";
         }
         const piece = d?.content ?? j.response;
+        if (typeof piece === "number" || typeof piece === "boolean") {
+          // text the host parsed token by token: digits come as numbers, quoted words lose their quotes
+          reader.cancel().catch(() => {});
+          return { reply: "", gaveUp: false, reparsed: true };
+        }
         if (typeof piece === "string") text += piece;
         else if (piece && typeof piece === "object") whole = piece; // a reply the model's host already parsed
         const think = String(d?.reasoning_content ?? d?.reasoning ?? "");
@@ -615,7 +622,12 @@ export class Harness {
     const quirks = (await this.store.get("quirks")) ?? {};
     const known = quirks[model]?.quiet;
     const ask = async (extra, room, patience) => {
-      const got = await this.ask(model, messages, room, extra, patience);
+      let got = await this.ask(model, messages, room, extra, patience, quirks[model]?.flat === true);
+      if (got.reparsed) {
+        quirks[model] = { ...quirks[model], flat: true };
+        await this.store.put("quirks", quirks);
+        got = await this.ask(model, messages, room, extra, patience, true);
+      }
       await this.spend(1, sent + got.reply.length);
       return got.reply;
     };
@@ -633,7 +645,7 @@ export class Harness {
       }
       if (reply) quiet = i;
     }
-    quirks[model] = { quiet };
+    quirks[model] = { ...quirks[model], quiet };
     await this.store.put("quirks", quirks);
     return reply || (await roomy());
   }
@@ -1041,7 +1053,7 @@ export class Harness {
   }
 
   async jobTool(job, name, args) {
-    const f = String(args.name ?? args.path ?? "").trim().replace(/^\.?\/+/, "");
+    const f = String(args.name ?? args.path ?? args.file ?? args.filename ?? "").trim().replace(/^\.?\/+/, "");
     switch (name) {
       case "web_search":
         return (await this.search(args.query ?? args.q)).map((r, i) => `${i + 1}. ${r.title}\n   ${r.url}\n   ${r.snippet}`).join("\n");
