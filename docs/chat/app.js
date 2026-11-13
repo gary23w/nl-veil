@@ -1474,7 +1474,7 @@ async function repoBranch() {
    keeps them: the repo opens in a new conversation. */
 async function repoMount(root, kind, name = root.name) {
   if (S.live) return toast('Wait for the running turn to end.');
-  if (!S.conv.repo && (Object.keys(S.conv.files).length || S.conv.msgs.length)) newConv();
+  if (S.conv.repo || Object.keys(S.conv.files).length || S.conv.msgs.length) newConv();   // a chat with a workspace of its own keeps it
   repoClose();
   Object.assign(repo, { root, kind, name });
   S.conv.repo = { name, kind };
@@ -1491,7 +1491,7 @@ async function repoMount(root, kind, name = root.name) {
     draw();
     return toast('Could not read that folder: ' + e.message);
   }
-  await db.put('repo:' + S.conv.id, { root, kind, name });
+  try { await db.put('repo:' + S.conv.id, { root, kind, name }); } catch (e) { console.error('the folder could not be remembered', e); }
   touchConv();
   const readme = repo.paths.find((p) => /^readme(\.md|\.txt)?$/i.test(p));
   if (readme) { try { await repoLoad(readme); openFile(readme); } catch {} }
@@ -1519,10 +1519,19 @@ async function repoPick() {
   let root;
   try {
     root = await window.showDirectoryPicker({ mode: 'readwrite' });
-  } catch {
-    return;   // the picker was closed
+  } catch (e) {
+    // closing the picker is not an error; a folder the browser will not hand over is, and is said
+    if (e?.name !== 'AbortError') { console.error('open folder', e); toast('The browser did not open that folder: ' + (e?.message || e?.name || 'no reason given')); }
+    return;
   }
-  await repoMount(root, 'disk');
+  try {
+    await repoMount(root, 'disk');
+  } catch (e) {
+    console.error('open folder', e);
+    repo.busy = '';
+    draw();
+    toast('That folder could not be opened: ' + (e?.message || e));
+  }
 }
 
 /* A conversation that had a repo, opened again: the browser kept the folder's handle, and the user's click
@@ -2874,11 +2883,12 @@ function codeTab() {
     h('div', { class: 'exp-head' }, h('span', { title: inRepo ? repo.name + (repo.kind === 'disk' ? ' (a folder on this computer)' : ' (kept by this browser)') : '' }, inRepo ? repo.name : 'Explorer'),
       upload,
       h('button', { class: 'x show', title: 'New file', 'aria-label': 'New file', onclick: () => newFile() }, '+'),
-      inRepo ? h('button', { class: 'x show', title: 'Read the folder again', 'aria-label': 'Read the folder again', onclick: async () => { repo.busy = 'reading the folder…'; drawSide(); await repoIndex(); drawSide(); } }, '⟳') : null,
-      inRepo ? h('button', { class: 'x show', title: repo.kind === 'disk' ? 'Close this folder (nothing in it is deleted)' : 'Remove this clone from the browser', 'aria-label': 'Close this folder', onclick: async () => { if (repo.kind === 'private' && !confirm('Remove this clone from the browser? Commits that were not pushed are lost.')) return; repoClose(); delete S.conv.repo; S.conv.files = {}; S.open = []; S.file = null; await repoForget(S.conv.id); touchConv(); draw(); } }, '⏏')
-        : canClone ? h('button', { class: 'x show', title: 'Clone a git repository by its address', 'aria-label': 'Clone a repository', onclick: clone }, '⎘') : null,
-      inRepo ? null : h('button', { class: 'x show', title: folderWord + (repo.canPick() ? ': work in a folder on this computer' : ': add a folder\'s files to this chat'), 'aria-label': folderWord, onclick: openFolder }, '🗀'),
+      inRepo ? h('button', { class: 'x show', title: 'Read the folder again', 'aria-label': 'Read the folder again', onclick: async () => { repo.busy = 'reading the folder…'; drawSide(); await repoIndex(); drawSide(); } }, '↻') : null,
       names.length && !inRepo ? h('button', { class: 'x show', title: 'Download everything as a .zip', 'aria-label': 'Download the workspace as a zip', onclick: () => { const a = h('a', { href: URL.createObjectURL(zipOf(S.conv.files)), download: (S.conv.title || 'workspace').replace(/[^\w-]+/g, '-').slice(0, 40) + '.zip' }); a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 1000); } }, '⇩') : null),
+    h('div', { class: 'exp-acts' },
+      h('button', { class: 'btn btn-ghost btn-sm', title: repo.canPick() ? 'Work in a folder on this computer: files are read as you open them and edits are written straight to it' : 'Add a folder\'s text files to this chat', onclick: openFolder }, folderWord),
+      canClone ? h('button', { class: 'btn btn-ghost btn-sm', title: 'Clone a git repository by its address into this browser', onclick: clone }, 'Clone repo') : null,
+      inRepo ? h('button', { class: 'btn btn-ghost btn-sm', title: repo.kind === 'disk' ? 'Close this folder (nothing in it is deleted)' : 'Remove this clone from the browser', onclick: async () => { if (repo.kind === 'private' && !confirm('Remove this clone from the browser? Commits that were not pushed are lost.')) return; repoClose(); delete S.conv.repo; S.conv.files = {}; S.open = []; S.file = null; await repoForget(S.conv.id); touchConv(); draw(); } }, repo.kind === 'disk' ? 'Close folder' : 'Remove clone') : null),
     names.length > 4 ? filter : null,
     repo.busy || (!inRepo && gitx.busy) ? h('div', { class: 'empty', id: 'repoBusy' }, repo.busy || gitx.busy) : null,
     lost ? h('div', { class: 'empty' }, `This chat works in the folder “${S.conv.repo.name}”. `, h('button', { class: 'btn btn-sm', onclick: async () => { if (!(await repoReconnect(true))) toast('The browser no longer has that folder: open it again.'); drawSide(); } }, 'Reconnect it')) : null,

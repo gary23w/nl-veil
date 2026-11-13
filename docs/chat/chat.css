@@ -175,6 +175,8 @@ button:disabled, .btn[aria-disabled=true] { opacity: .5; cursor: default; pointe
 .git-who { display: grid; gap: 4px; }
 .git .tree-row .badge { font-weight: 700; }
 .git-added .badge { color: var(--success); } .git-changed .badge { color: var(--accent); } .git-deleted .badge { color: var(--danger); } .git-deleted .name { text-decoration: line-through; }
+.exp-acts { display: flex; flex-wrap: wrap; gap: 2px; padding: 0 6px 6px; }
+.exp-acts .btn { padding: 2px 8px; font-size: var(--fs-micro); }
 .row-btns { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; }
 .code.windowed .hl { min-height: 0; }
 .code.windowed .gutter { box-sizing: border-box; }
