@@ -2882,9 +2882,12 @@ const pics = {
 };
 const picsOf = (conv = S.conv) => (conv.images ??= {});
 const firstHad = (wanted, have) => (wanted ?? []).find((m) => have.includes(m));
-/* Which model does what. A choice the user saved wins; then the first of the page's list the account has. */
-const imageModel = (edit) => ls.get(edit ? 'veilweb.image.edit' : 'veilweb.image.make') || firstHad(edit ? CFG.image_edit_models : CFG.image_models, pics.models.map((m) => m.id)) || (edit ? CFG.image_edit_models : CFG.image_models)?.[0];
-const visionModel = () => ls.get('veilweb.image.look') || firstHad(CFG.vision_models, S.models.map((m) => m.id)) || CFG.vision_models?.[0] || S.model;
+/* Which model does what. A choice the user saved wins. Past that, a harness that does its own choosing (version
+   14) is told "auto": it takes the best working model the account has now, so nothing here has to follow
+   Cloudflare's list. An older harness gets the first of the page's list that the account has. */
+const autoPick = () => imageOn() && Number(S.status.version) >= 14;
+const imageModel = (edit) => ls.get(edit ? 'veilweb.image.edit' : 'veilweb.image.make') || (autoPick() ? 'auto' : firstHad(edit ? CFG.image_edit_models : CFG.image_models, pics.models.map((m) => m.id)) || (edit ? CFG.image_edit_models : CFG.image_models)?.[0]);
+const visionModel = () => ls.get('veilweb.image.look') || (autoPick() ? 'auto' : firstHad(CFG.vision_models, S.models.map((m) => m.id)) || CFG.vision_models?.[0] || S.model);
 
 async function loadImageModels() {
   if (!imageOn()) return;
@@ -3007,6 +3010,1025 @@ TOOL_RUNNERS.image_generate = (args, signal) => imageTool('image_generate', args
 TOOL_RUNNERS.image_look = (args, signal) => imageTool('image_look', args, signal);
 PROMPT_NOTES.push(() => (imageOn() ? 'PICTURES: you can make pictures with image_generate and see pictures only through image_look (or the description you are given when the user attaches one). Write a full prompt for a picture. Never say what a picture shows unless a description or image_look told you.' + (Object.keys(picsOf()).length ? ' Pictures in this chat: ' + Object.keys(picsOf()).join(', ') + '.' : '') : ''));
 CHIP_EXTRAS.push((t) => { const name = madeBy(t); return name ? thumbs([name]) : null; });
+
+/* ============================================================ images studio: every model's controls, a queue and a gallery */
+
+/* The Images tab, and the chat's fuller image_generate. Which image models the account has and what each one
+   takes (a size, steps, guidance, a seed, a negative prompt, a picture to start from, a mask, reference pictures)
+   is read from the account by the harness, never assumed from a model's name: a control is shown only for what
+   the chosen model takes. Every picture made here is kept in THIS browser (IndexedDB) with the settings that
+   made it, so any of them can be made again, varied, edited or read back into words. A picture the chat makes is
+   also kept with its chat, by name, as the section above keeps them. This section adds itself through that
+   section's hooks (SIDE_TABS, TOOLS and TOOL_RUNNERS, PROMPT_NOTES, CHIP_EXTRAS, SLASH, PREVIEW_PASSES). */
+
+const artOn = () => imageOn() && Number(S.status.version) >= 14;   // the harness that tells what each model takes
+const RATIOS = [['1:1', 1, 1], ['4:5', 4, 5], ['3:4', 3, 4], ['2:3', 2, 3], ['9:16', 9, 16], ['5:4', 5, 4], ['4:3', 4, 3], ['3:2', 3, 2], ['16:9', 16, 9], ['21:9', 21, 9]];
+const ART_SIZES = [['S', 768], ['M', 1024], ['L', 1280], ['XL', 1536]];   // the side of the square with as many pixels
+const ART_COUNT_MAX = 8;       // pictures one press of Generate may ask for, per model
+const ART_COMBOS_MAX = 24;     // pictures one {a|b} prompt may open out into
+const ART_TOOL_MAX = 4;        // pictures one tool call from the chat may make
+const LOOK_SIDE = 1024;        // a picture is sent to a vision model no larger than this
+const SEED_MAX = 2147483647;
+/* Words a style adds to the end of a prompt. They are the user's to switch on; nothing adds them unasked. */
+const STYLES = [
+  ['Photo', 'photograph, natural light, 50mm lens, shallow depth of field, fine detail'],
+  ['Cinematic', 'cinematic film still, anamorphic lens, dramatic lighting, subtle film grain, colour graded'],
+  ['Portrait', 'studio portrait, 85mm lens, soft key light, catchlights in the eyes, detailed skin texture'],
+  ['Product', 'product photograph, seamless studio background, softbox lighting, crisp reflections'],
+  ['Macro', 'macro photograph, extreme close-up, razor-thin depth of field, intricate detail'],
+  ['Noir', 'film noir, black and white, hard shadows, light through venetian blinds'],
+  ['Anime', 'anime illustration, clean line art, cel shading, vibrant colours'],
+  ['Comic', 'comic book panel, bold ink outlines, halftone shading, dynamic composition'],
+  ['Watercolour', 'watercolour painting, soft washes, bleeding edges, visible paper texture'],
+  ['Oil', 'oil painting, visible brushwork, rich impasto, classical composition'],
+  ['Ink', 'black ink drawing, confident line work, cross-hatching, high contrast'],
+  ['Pixel art', 'pixel art, 16-bit, limited palette, crisp pixels'],
+  ['Vector', 'flat vector illustration, bold shapes, minimal palette, clean edges'],
+  ['Isometric', 'isometric view, miniature diorama, clean geometry, soft shadows'],
+  ['3D render', '3D render, physically based materials, global illumination, soft studio light'],
+  ['Concept art', 'concept art, matte painting, atmospheric perspective, epic scale'],
+];
+const AVOID_COMMON = 'blurry, low quality, distorted, deformed, extra limbs, watermark, signature, text, jpeg artifacts';
+
+const art = {
+  models: [],          // the account's image models, each with what it takes (the harness's /v1/image/models)
+  vision: [],          // its vision models: [{id, about, how}]
+  picks: {},           // the harness's own choice for each kind of work: {make, edit, inpaint, look}
+  asked: false,        // the models were asked for
+  err: '',
+  ready: false,        // the gallery's list was read from this browser
+  list: [],            // every picture kept, newest first: {id, at, type, bytes, w, h, thumb, fav, model, prompt, negative, seed, steps, guidance, strength, kind, parent, batch, conv, ms}
+  form: { model: '', prompt: '', negative: '', ratio: '1:1', size: 'M', w: 1024, h: 1024, steps: '', guidance: '', seed: '', count: 1, strength: 0.6, styles: [], multi: [], sweep: '', sweepValues: '', combos: false, vision: '', ...ls.get('veilweb.art', {}) },
+  init: '',            // the id of the picture to start from (an edit)
+  mask: '',            // a mask over it, as a data: URL at the picture's own size (white = paint again)
+  refs: [],            // ids of reference pictures, for a model that takes them
+  queue: [],           // what is waiting or being made: {id, p, label, state, err, abort}
+  pumping: false,
+  urls: new Map(),     // id -> an object URL of the whole picture
+  filter: '',
+  favOnly: false,
+  picking: false,      // the gallery is in select mode
+  picked: new Set(),
+  busy: '',
+};
+const artSave = () => ls.set('veilweb.art', art.form);
+const shortModel = (id) => String(id).split('/').slice(2).join('/') || String(id);
+const randomSeed = () => Math.floor(Math.random() * SEED_MAX);
+
+/* One model as the page uses it: what the harness said of it, with nothing assumed where it said nothing. */
+function specOf(id, kind = 'make') {
+  // "auto": the harness chooses when the picture is asked for; the page shows what its choice takes now
+  if (id === 'auto') return { ...specOf(art.picks[kind] || art.picks.make || ''), id: 'auto', chosen: art.picks[kind] || '' };
+  return { id, about: '', form: 'json', schema: false, prompt_max: 2048, negative: false, width: null, height: null, steps: null, guidance: null, strength: null, seed: false, init: '', mask: false, refs: 0, ref_px: 0, beta: false, partner: false, retires: '', terms: '', info: '', price: [], ...(art.models.find((m) => m.id === id) ?? {}) };
+}
+/* The model pictures are made with: the one picked in the Images tab while the account still lists it; else
+   "auto", which leaves the choice to the harness (the best working model the account has now). */
+const artListed = (id) => (art.models.some((m) => m.id === id) ? id : '');
+const artModel = () => artListed(art.form.model) || (art.picks.make ? 'auto' : art.models[0]?.id ?? '');
+const artKind = (init, mask, refs) => (mask ? 'inpaint' : init || refs?.length ? 'edit' : 'make');
+const artFailing = (m) => !!m.health && m.health.streak >= (m.health.ok > 0 ? 2 : 1);
+const artLooker = () => (visionModel() === 'auto' ? shortModel(art.picks.look || 'a vision model') : shortModel(visionModel()));
+
+async function artLoad(fresh = false) {
+  if (!art.ready) { art.ready = true; art.list = (await db.get('imgs')) ?? []; }
+  if (!artOn() || (art.asked && !fresh)) return;
+  art.asked = true;
+  try {
+    const j = await harnessJson('/v1/image/models' + (fresh ? '?fresh=1' : ''));
+    art.models = j.models ?? [];
+    art.vision = j.vision ?? [];
+    art.picks = j.picks ?? {};
+    art.err = art.models.length ? '' : 'Your account listed no image models.';
+  } catch (e) {
+    art.err = e.message;
+    art.asked = false;
+  }
+  if (S.tab === 'images') drawSide();
+}
+
+/* ---- pixels: reading, fitting and keeping pictures ---- */
+
+const loadImg = (src) => new Promise((res, rej) => { const i = new Image(); i.onload = () => res(i); i.onerror = () => rej(new Error('that is not a picture this browser can read')); i.src = src; });
+const blobData = (blob) => new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(String(r.result)); r.onerror = () => rej(new Error('the picture could not be read')); r.readAsDataURL(blob); });
+const b64Blob = (b64, type) => new Blob([Uint8Array.from(atob(b64), (c) => c.charCodeAt(0))], { type });
+const canvasBlob = (c, type = 'image/png', q) => new Promise((res, rej) => c.toBlob((b) => (b ? res(b) : rej(new Error('the browser could not encode the picture'))), type, q));
+
+/* A picture drawn onto a canvas: 'cover' fills w by h exactly (the middle kept, the overhang cut), 'fit' keeps
+   the whole picture inside `side` pixels a side and never enlarges it. */
+function drawn(img, mode, w, h) {
+  const iw = img.naturalWidth ?? img.width, ih = img.naturalHeight ?? img.height;
+  const c = document.createElement('canvas');
+  if (mode === 'cover') {
+    c.width = w; c.height = h;
+    const k = Math.max(w / iw, h / ih);
+    c.getContext('2d').drawImage(img, (w - iw * k) / 2, (h - ih * k) / 2, iw * k, ih * k);
+  } else {
+    const k = Math.min(1, w / Math.max(iw, ih));
+    c.width = Math.max(1, Math.round(iw * k)); c.height = Math.max(1, Math.round(ih * k));
+    c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+  }
+  return c;
+}
+
+async function artBlob(id) {
+  const kept = await db.get('img:' + id);
+  if (!kept?.blob) throw new Error(`picture ${id} is not kept in this browser`);
+  return kept.blob;
+}
+/* Where a picture is: a kept one by its id (an object URL of the whole of it), or a data: URL as it stands. */
+async function artUrl(id) {
+  if (String(id).startsWith('data:')) return id;
+  if (!art.urls.has(id)) art.urls.set(id, URL.createObjectURL(await artBlob(id)));
+  return art.urls.get(id);
+}
+const artRow = (id) => art.list.find((r) => r.id === id);
+const artIndex = () => db.put('imgs', art.list);
+
+/* Keep a picture: the whole of it under its own key, and a row in the list with a small copy for the grid. */
+async function artKeep(blob, meta) {
+  const url = URL.createObjectURL(blob);
+  let img;
+  try { img = await loadImg(url); } catch (e) { URL.revokeObjectURL(url); throw e; }
+  const id = 'i' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5);
+  const row = { id, at: Date.now(), type: blob.type, bytes: blob.size, w: img.naturalWidth, h: img.naturalHeight, thumb: drawn(img, 'fit', 224).toDataURL('image/jpeg', 0.72), fav: false, model: '', prompt: '', negative: '', seed: null, steps: null, guidance: null, strength: null, kind: 'new', parent: '', batch: '', conv: '', ms: 0, ...meta };
+  await db.put('img:' + id, { blob });
+  art.urls.set(id, url);
+  art.list.unshift(row);
+  await artIndex();
+  return row;
+}
+
+async function artForget(ids) {
+  for (const id of ids) {
+    await db.del('img:' + id);
+    const u = art.urls.get(id);
+    if (u) URL.revokeObjectURL(u);
+    art.urls.delete(id); art.picked.delete(id);
+    if (art.init === id) { art.init = ''; art.mask = ''; }
+    art.refs = art.refs.filter((x) => x !== id);
+  }
+  art.list = art.list.filter((r) => !ids.includes(r.id));
+  await artIndex();
+}
+
+/* A picture as a data: URL, made to fit: what is sent to a model. */
+async function artDataUrl(id, mode, w, h, type = 'image/png', q) {
+  const img = await loadImg(await artUrl(id));
+  return drawn(img, mode, w, h).toDataURL(type, q);
+}
+
+/* A picture from outside (a file, a paste, a drop) joins the gallery. A PNG that carries its settings as text
+   (the "parameters" other image tools write) brings them along, so it can be made again from here. */
+async function artTake(file) {
+  if (!/^image\//.test(file.type)) throw new Error('that file is not a picture');
+  if (file.size > 30 * MB) throw new Error('that picture is larger than 30 MB');
+  let meta = {};
+  if (file.type === 'image/png') {
+    try { meta = readParams(pngText(new Uint8Array(await file.arrayBuffer())).parameters ?? ''); } catch {}
+  }
+  return artKeep(file, { kind: 'upload', ...meta });
+}
+
+/* ---- PNG text and a zip, so a picture leaves with its settings and many leave together ---- */
+
+const CRC_TABLE = (() => { const t = new Uint32Array(256); for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; } return t; })();
+function crc32(u8) {
+  let c = 0xFFFFFFFF;
+  for (let i = 0; i < u8.length; i++) c = CRC_TABLE[(c ^ u8[i]) & 0xFF] ^ (c >>> 8);
+  return (c ^ 0xFFFFFFFF) >>> 0;
+}
+const isPng = (u8) => u8.length > 33 && u8[0] === 0x89 && u8[1] === 0x50 && u8[2] === 0x4E && u8[3] === 0x47;
+
+/* A PNG with one more text chunk, right after its header: tEXt when the text is Latin-1, iTXt (UTF-8) otherwise. */
+function pngAddText(u8, key, text) {
+  if (!isPng(u8)) throw new Error('not a PNG');
+  u8 = pngDropText(u8, key);   // one chunk of a name: what was there under it goes
+  const latin = !/[^\x00-\xFF]/.test(text);
+  const k = new TextEncoder().encode(key);
+  const body = latin ? Uint8Array.from(text, (ch) => ch.charCodeAt(0)) : new TextEncoder().encode(text);
+  const data = new Uint8Array(4 + k.length + (latin ? 1 : 5) + body.length);
+  data.set(new TextEncoder().encode(latin ? 'tEXt' : 'iTXt'), 0);
+  data.set(k, 4);
+  data.set(body, 4 + k.length + (latin ? 1 : 5));   // the separator bytes between are zeros already
+  const chunk = new Uint8Array(4 + data.length + 4);
+  const v = new DataView(chunk.buffer);
+  v.setUint32(0, data.length - 4);
+  chunk.set(data, 4);
+  v.setUint32(4 + data.length, crc32(data));
+  const out = new Uint8Array(u8.length + chunk.length);
+  out.set(u8.subarray(0, 33), 0);
+  out.set(chunk, 33);
+  out.set(u8.subarray(33), 33 + chunk.length);
+  return out;
+}
+
+/* A PNG without its text chunks of one keyword. */
+function pngDropText(u8, key) {
+  const v = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+  const keep = [u8.subarray(0, 8)];
+  let dropped = false;
+  for (let at = 8; at + 12 <= u8.length;) {
+    const len = v.getUint32(at);
+    const type = String.fromCharCode(u8[at + 4], u8[at + 5], u8[at + 6], u8[at + 7]);
+    const mine = (type === 'tEXt' || type === 'iTXt') && String.fromCharCode(...u8.subarray(at + 8, at + 8 + key.length + 1)) === key + '\0';
+    if (type === 'IDAT') { keep.push(u8.subarray(at)); break; }   // nothing past here is looked at
+    if (mine) dropped = true; else keep.push(u8.subarray(at, at + 12 + len));
+    at += 12 + len;
+  }
+  if (!dropped) return u8;
+  const out = new Uint8Array(keep.reduce((n, x) => n + x.length, 0));
+  let at = 0;
+  for (const part of keep) { out.set(part, at); at += part.length; }
+  return out;
+}
+
+/* The text chunks of a PNG: {keyword: text}. Compressed ones are passed over. */
+function pngText(u8) {
+  const out = {};
+  if (!isPng(u8)) return out;
+  const v = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+  for (let at = 8; at + 12 <= u8.length;) {
+    const len = v.getUint32(at);
+    const type = String.fromCharCode(u8[at + 4], u8[at + 5], u8[at + 6], u8[at + 7]);
+    const data = u8.subarray(at + 8, at + 8 + len);
+    if (type === 'tEXt' || type === 'iTXt') {
+      const z = data.indexOf(0);
+      const key = String.fromCharCode(...data.subarray(0, Math.max(0, z)));
+      if (type === 'tEXt') out[key] = Array.from(data.subarray(z + 1), (b) => String.fromCharCode(b)).join('');
+      else if (data[z + 1] === 0) {
+        const lang = data.indexOf(0, z + 3);
+        const tr = data.indexOf(0, lang + 1);
+        out[key] = new TextDecoder().decode(data.subarray(tr + 1));
+      }
+    }
+    if (type === 'IEND' || type === 'IDAT') break;   // text written by image tools sits before the pixels
+    at += 12 + len;
+  }
+  return out;
+}
+
+/* A picture's settings as the line of text image tools exchange ("parameters"), and that text read back. */
+function artParams(r) {
+  const tail = [r.steps ? 'Steps: ' + r.steps : '', r.guidance !== null && r.guidance !== undefined ? 'CFG scale: ' + r.guidance : '', r.seed !== null && r.seed !== undefined ? 'Seed: ' + r.seed : '', `Size: ${r.w}x${r.h}`, r.model ? 'Model: ' + r.model : '', r.strength ? 'Denoising strength: ' + r.strength : ''].filter(Boolean).join(', ');
+  return (r.prompt || '') + (r.negative ? '\nNegative prompt: ' + r.negative : '') + '\n' + tail;
+}
+function readParams(text) {
+  text = String(text ?? '').trim();
+  if (!text) return {};
+  const lines = text.split('\n');
+  const tailAt = lines.findLastIndex((l) => /(^|, )(Steps|Seed|Size|Model|CFG scale): /.test(l));
+  const tail = tailAt >= 0 ? lines[tailAt] : '';
+  const body = (tailAt >= 0 ? lines.slice(0, tailAt) : lines).join('\n');
+  const negAt = body.indexOf('\nNegative prompt:');
+  const neg0 = body.startsWith('Negative prompt:');
+  const get = (name) => new RegExp('(?:^|, )' + name + ': ([^,]+)').exec(tail)?.[1]?.trim();
+  const num = (name) => { const x = Number(get(name)); return get(name) !== undefined && Number.isFinite(x) ? x : null; };
+  return {
+    prompt: clip((neg0 ? '' : negAt >= 0 ? body.slice(0, negAt) : body).trim(), 8000),
+    negative: clip((neg0 ? body.slice(16) : negAt >= 0 ? body.slice(negAt + 17) : '').trim(), 4000),
+    seed: num('Seed'), steps: num('Steps'), guidance: num('CFG scale'), strength: num('Denoising strength'), model: clip(get('Model') ?? '', 120),
+  };
+}
+
+/* Files as one .zip, stored as they are (pictures are compressed already). */
+function zipStore(files) {
+  const enc = new TextEncoder();
+  const now = new Date();
+  const time = (now.getHours() << 11) | (now.getMinutes() << 5) | (now.getSeconds() >> 1);
+  const date = ((now.getFullYear() - 1980) << 9) | ((now.getMonth() + 1) << 5) | now.getDate();
+  const parts = [], central = [];
+  let at = 0;
+  for (const f of files) {
+    const name = enc.encode(f.name);
+    const crc = crc32(f.u8);
+    const head = new DataView(new ArrayBuffer(30));
+    head.setUint32(0, 0x04034b50, true); head.setUint16(4, 20, true); head.setUint16(6, 0x0800, true);
+    head.setUint16(10, time, true); head.setUint16(12, date, true); head.setUint32(14, crc, true);
+    head.setUint32(18, f.u8.length, true); head.setUint32(22, f.u8.length, true); head.setUint16(26, name.length, true);
+    parts.push(head.buffer, name, f.u8);
+    const row = new DataView(new ArrayBuffer(46));
+    row.setUint32(0, 0x02014b50, true); row.setUint16(4, 20, true); row.setUint16(6, 20, true); row.setUint16(8, 0x0800, true);
+    row.setUint16(12, time, true); row.setUint16(14, date, true); row.setUint32(16, crc, true);
+    row.setUint32(20, f.u8.length, true); row.setUint32(24, f.u8.length, true); row.setUint16(28, name.length, true); row.setUint32(42, at, true);
+    central.push(row.buffer, name);
+    at += 30 + name.length + f.u8.length;
+  }
+  const size = central.reduce((n, x) => n + x.byteLength, 0);
+  const end = new DataView(new ArrayBuffer(22));
+  end.setUint32(0, 0x06054b50, true); end.setUint16(8, files.length, true); end.setUint16(10, files.length, true); end.setUint32(12, size, true); end.setUint32(16, at, true);
+  return new Blob([...parts, ...central, end.buffer], { type: 'application/zip' });
+}
+
+function saveBlob(name, blob) {
+  const a = h('a', { href: URL.createObjectURL(blob), download: name });
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+}
+
+/* A kept picture as a PNG that carries its settings, the way it is downloaded. */
+async function artPng(row) {
+  let blob = await artBlob(row.id);
+  if (blob.type !== 'image/png') blob = await canvasBlob(drawn(await loadImg(await artUrl(row.id)), 'fit', 1e9));
+  const u8 = new Uint8Array(await blob.arrayBuffer());
+  return row.prompt || row.model ? pngAddText(u8, 'parameters', artParams(row)) : u8;
+}
+const artFileName = (row) => `veil-${(row.prompt || row.kind || 'picture').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 40) || 'picture'}-${row.id}.png`;
+
+async function artDownload(ids) {
+  const rows = ids.map(artRow).filter(Boolean);
+  if (rows.length === 1) return saveBlob(artFileName(rows[0]), new Blob([await artPng(rows[0])], { type: 'image/png' }));
+  const files = [];
+  for (const r of rows) files.push({ name: artFileName(r), u8: await artPng(r) });
+  saveBlob(`veil-pictures-${new Date().toISOString().slice(0, 10)}.zip`, zipStore(files));
+}
+
+/* ---- making pictures ---- */
+
+/* The size a model is asked for: the chosen shape at the chosen number of pixels, on a grid of 64, inside the
+   model's own limits. null for a model that takes no size (it chooses its own). */
+function artDims(spec, f = art.form) {
+  if (!spec.width || !spec.height) return null;
+  const lo = (d) => Math.ceil(Math.max(256, d.min ?? 256) / 64) * 64;
+  const hi = (d) => Math.floor((d.max ?? 2048) / 64) * 64;
+  const snap = (v, d) => Math.min(hi(d), Math.max(lo(d), Math.round(v / 64) * 64));
+  if (f.ratio === 'custom') return { w: snap(Number(f.w) || 1024, spec.width), h: snap(Number(f.h) || 1024, spec.height) };
+  const named = RATIOS.find((r) => r[0] === f.ratio);
+  const typed = /^(\d+(?:\.\d+)?)\s*[:x\/]\s*(\d+(?:\.\d+)?)$/.exec(String(f.ratio ?? ''));   // any shape, as 7:5
+  const [rw, rh] = named ? [named[1], named[2]] : typed && Number(typed[1]) > 0 && Number(typed[2]) > 0 ? [Number(typed[1]), Number(typed[2])] : [1, 1];
+  const base = (ART_SIZES.find((s) => s[0] === f.size) ?? ART_SIZES[1])[1];
+  let w = Math.sqrt(base * base * rw / rh), hgt = w * rh / rw;
+  const k = Math.min(1, hi(spec.width) / w, hi(spec.height) / hgt);
+  w *= k; hgt *= k;
+  return { w: snap(w, spec.width), h: snap(hgt, spec.height) };
+}
+
+const inRange = (v, d) => (d ? Math.min(d.max ?? Infinity, Math.max(d.min ?? -Infinity, d.int ? Math.round(v) : v)) : v);
+
+/* One picture from the harness, kept. `p`: {model, prompt, negative, w, h, steps, guidance, seed, strength, init
+   (a kept picture's id, or a data: URL), mask (a data: URL), refs (ids or data: URLs), kind, parent, batch, conv,
+   name}. Only what the model takes is sent. */
+async function artMake(p, signal) {
+  const kind0 = artKind(p.init, p.mask, p.refs);
+  if (p.model === 'auto' && kind0 !== 'make' && !art.picks[kind0]) throw new Error(kind0 === 'inpaint' ? 'none of your image models repaints under a mask' : 'none of your image models takes a picture to work from');
+  const spec = specOf(p.model, kind0);
+  const prompt = String(p.prompt ?? '').trim();
+  if (!prompt) throw new Error('the prompt is empty');
+  if (prompt.length > spec.prompt_max) throw new Error(`the prompt is ${prompt.length} characters; ${shortModel(p.model)} takes ${spec.prompt_max} at the most`);
+  const body = { model: p.model, prompt };
+  if (spec.negative && p.negative) body.negative = String(p.negative).trim();
+  if (spec.width && spec.height && p.w && p.h) { body.width = p.w; body.height = p.h; }
+  const given = (v) => v !== null && v !== undefined && v !== '' && Number.isFinite(Number(v));
+  if (spec.steps && given(p.steps)) body.steps = inRange(Number(p.steps), spec.steps);
+  if (spec.guidance && given(p.guidance)) body.guidance = inRange(Number(p.guidance), spec.guidance);
+  const seed = spec.seed ? (given(p.seed) ? Math.abs(Math.floor(Number(p.seed))) % (SEED_MAX + 1) : randomSeed()) : null;
+  if (seed !== null) body.seed = seed;
+  const pictures = [];   // what goes in: for a model that starts from a picture, that one; for one that takes references, those
+  if (p.init && spec.init) {
+    // the picture to start from is cut to the size being asked for, and the mask with it, so the two line up
+    const side = body.width ? [body.width, body.height] : null;
+    pictures.push(side ? await artDataUrl(p.init, 'cover', side[0], side[1]) : await artDataUrl(p.init, 'fit', 1024));
+    if (spec.strength) body.strength = Math.min(1, Math.max(0.05, given(p.strength) ? Number(p.strength) : 0.6));
+    if (p.mask && spec.mask) {
+      const m = await loadImg(p.mask);
+      const src = await loadImg(await artUrl(p.init));
+      const c = side ? drawn(m, 'cover', side[0], side[1]) : drawn(m, 'fit', Math.min(1024, Math.max(src.naturalWidth, src.naturalHeight)));
+      body.mask = c.toDataURL('image/png');
+    }
+  } else if (p.init && spec.refs) {
+    p = { ...p, refs: [p.init, ...(p.refs ?? [])] };   // a model that edits by reference takes the picture as its first reference
+  } else if (p.init && !spec.schema) {
+    pictures.push(await artDataUrl(p.init, 'fit', 1024));   // nothing is known of what this model takes: the harness finds out
+  }
+  const edit = pictures.length > 0;
+  if (!edit && p.refs?.length && spec.refs) for (const id of p.refs.slice(0, spec.refs)) pictures.push(await artDataUrl(id, 'fit', spec.ref_px || 512, 0, 'image/png'));
+  if (pictures.length) body.images = pictures;
+  const t0 = performance.now();
+  let j;
+  try {
+    j = await harnessJson('/v1/image', { body, signal });
+  } catch (e) {
+    if (/does not take a picture to start from/.test(e.message)) artLoad(true);   // the harness just learned it: the list is read again
+    throw e;
+  }
+  const kind = p.kind ?? (body.mask ? 'inpaint' : edit ? 'edit' : pictures.length ? 'reference' : 'new');
+  const from = [p.parent, p.init].find((x) => x && !String(x).startsWith('data:')) ?? '';
+  return artKeep(b64Blob(j.image, j.type), { model: j.model || p.model, prompt, negative: body.negative ?? '', seed, steps: body.steps ?? null, guidance: body.guidance ?? null, strength: edit ? body.strength ?? null : null, kind, parent: from, batch: p.batch ?? '', conv: p.conv ?? '', name: p.name ?? '', ms: Math.round(performance.now() - t0) });
+}
+
+/* {a|b|c} in a prompt: one of them for each picture, or every combination when asked. */
+function expandPrompt(text, count, all) {
+  const groups = [...text.matchAll(/\{([^{}]*\|[^{}]*)\}/g)].map((m) => m[1].split('|').map((x) => x.trim()));
+  if (!groups.length) return Array.from({ length: count }, () => text);
+  const fill = (pick) => { let i = 0; return text.replace(/\{([^{}]*\|[^{}]*)\}/g, () => pick(groups[i], i++)); };
+  if (!all) return Array.from({ length: count }, () => fill((g) => g[Math.floor(Math.random() * g.length)]));
+  let combos = [[]];
+  for (const g of groups) combos = combos.flatMap((c) => g.map((x) => [...c, x])).slice(0, ART_COMBOS_MAX);
+  return combos.map((c) => fill((g, i) => c[i]));
+}
+
+/* What Generate asks for, from the form: one job per picture, per model, per value of a sweep. */
+function artJobs() {
+  const f = art.form;
+  const idea = f.prompt.trim();
+  if (!idea) throw new Error('Write a prompt first.');
+  const styled = [idea, ...f.styles.map((n) => STYLES.find((s) => s[0] === n)?.[1]).filter(Boolean)].join(', ');
+  const models = (f.multi.length ? f.multi.filter((id) => art.models.some((m) => m.id === id)) : [artModel()]).filter(Boolean);
+  if (!models.length) throw new Error('There is no image model to ask.');
+  const prompts = expandPrompt(styled, Math.min(ART_COUNT_MAX, Math.max(1, Number(f.count) || 1)), f.combos);
+  const base = f.seed !== '' && Number.isFinite(Number(f.seed)) ? Math.floor(Number(f.seed)) : randomSeed();
+  const batch = 'b' + Date.now().toString(36);
+  const sweep = f.sweep ? f.sweepValues.split(/[,\s]+/).map(Number).filter((x) => Number.isFinite(x)).slice(0, 8) : [];
+  if (f.sweep && sweep.length < 2) throw new Error('A sweep needs at least two values, like 3, 5, 7.5');
+  const jobs = [];
+  for (const model of models) {
+    const spec = specOf(model, artKind(art.init, art.mask, art.refs));
+    const d = artDims(spec);
+    prompts.forEach((prompt, i) => {
+      // a sweep or a comparison keeps one seed, so the pictures differ only in what is being compared
+      const seed = sweep.length ? base : base + i;
+      const p = { model, prompt, negative: f.negative, w: d?.w, h: d?.h, steps: f.steps, guidance: f.guidance, seed, strength: f.strength, init: art.init, mask: art.mask, refs: art.refs, batch, conv: S.conv?.id ?? '' };
+      if (!sweep.length) return jobs.push({ p, label: shortModel(model) });
+      for (const v of sweep) jobs.push({ p: { ...p, [f.sweep]: v }, label: `${shortModel(model)} · ${f.sweep} ${v}` });
+    });
+  }
+  return jobs;
+}
+
+function artQueue(jobs) {
+  for (const j of jobs) art.queue.push({ id: 'q' + Math.random().toString(36).slice(2, 8), p: j.p, label: j.label, state: 'waiting', err: '', abort: null });
+  artPump();
+}
+
+/* One picture at a time, in order. A spent daily budget ends the rest of the queue with it. */
+async function artPump() {
+  if (art.pumping) return;
+  art.pumping = true;
+  for (;;) {
+    const q = art.queue.find((x) => x.state === 'waiting');
+    if (!q) break;
+    q.state = 'making';
+    q.abort = new AbortController();
+    artRefresh();
+    try {
+      await artMake(q.p, q.abort.signal);
+      art.queue = art.queue.filter((x) => x !== q);
+    } catch (e) {
+      q.state = q.abort.signal.aborted ? 'stopped' : 'failed';
+      q.err = q.abort.signal.aborted ? 'stopped' : e.message;
+      if (/budget|resets at/.test(e.message)) for (const w of art.queue) if (w.state === 'waiting') { w.state = 'failed'; w.err = e.message; }
+    }
+    artRefresh();
+  }
+  art.pumping = false;
+  art.queue = art.queue.filter((x) => x.state !== 'stopped');
+  artRefresh();
+  refreshStatus();
+}
+
+/* The chat's model, asked to turn an idea into a prompt an image model does well with. */
+async function artEnhance(idea, spec, structured) {
+  const sys = structured
+    ? 'You write prompts for a text-to-image model that reads structured JSON. Turn the user\'s idea into ONE JSON object with these keys: "scene" (the setting), "subjects" (a list of {"type", "description", "pose", "position": "foreground" | "midground" | "background"}), "style", "color_palette" (exactly three colours), "lighting", "mood", "background", "composition", "camera" ({"angle", "distance", "focus", "lens", "f-number", "ISO"}) and "effects" (a list). Keep everything the user specified. Reply with the JSON only.'
+    : 'You write prompts for text-to-image models. Turn the user\'s idea into ONE detailed prompt in plain descriptive language: the subject and what it is doing, the setting, the composition and camera (angle, distance, lens), the light, the colours, the medium and the style, the mood. Concrete, visual words. No instructions to the model, no quotation marks around it, 120 words at the most. Keep everything the user specified.' +
+      (spec.negative ? ' Then, on a new line that starts with NEGATIVE:, list what to keep out of the picture (flaws and unwanted things), as a short comma-separated list.' : '') + ' Reply with the prompt' + (spec.negative ? ' and the NEGATIVE line' : '') + ' only.';
+  const reply = (await callModel([{ role: 'system', content: sys }, { role: 'user', content: idea }], null, undefined, 700)).trim();
+  if (!reply) throw new Error('the model answered nothing');
+  if (structured) {
+    const a = reply.indexOf('{'), b = reply.lastIndexOf('}');
+    if (a < 0 || b <= a) throw new Error('the model did not answer with JSON');
+    return { prompt: reply.slice(a, b + 1), negative: '' };
+  }
+  const at = reply.search(/^\s*NEGATIVE:/mi);
+  return { prompt: clip((at >= 0 ? reply.slice(0, at) : reply).replace(/^["'\s]+|["'\s]+$/g, ''), spec.prompt_max), negative: at >= 0 ? reply.slice(at).replace(/^\s*NEGATIVE:\s*/i, '').trim() : '' };
+}
+
+/* A kept picture read back into words by a vision model (the one the section above chose, or the one picked here). */
+const LOOK_ASK = {
+  describe: 'Describe this picture in detail: the subject, the setting, the composition, the colours, the light, the style, and any text in it, copied exactly.',
+  prompt: 'Write the text-to-image prompt that would recreate this picture: one detailed paragraph naming the subject, the setting, the composition and camera, the light, the colours, the medium and the style. Reply with the prompt only.',
+};
+async function artLook(id, mode, signal) {
+  const image = await artDataUrl(id, 'fit', LOOK_SIDE, 0, 'image/jpeg', 0.9);
+  return (await harnessJson('/v1/look', { body: { model: visionModel(), image, question: LOOK_ASK[mode] ?? LOOK_ASK.describe }, signal })).text;
+}
+
+/* ---- pictures of the chat: kept by name with the chat (the section above), and here in the gallery ---- */
+
+/* A gallery picture joins the chat's pictures under a name, so the chat's tools and the transcript can show it. */
+async function artToChat(row, base) {
+  const name = pictureName(base || (row.prompt || 'picture').split(/\s+/).slice(0, 4).join('-'), row.type);
+  picsOf()[name] = await blobData(await artBlob(row.id));
+  row.name = name;
+  row.conv = S.conv.id;
+  return name;
+}
+
+/* A picture of the chat put into the workspace under a file name, so a page the veil writes can show it. In a
+   repo the file itself is written to the folder; in a chat's own workspace the picture stands behind the name
+   and the preview puts it in. */
+async function artPlace(name, path) {
+  path = fileName(path);
+  const url = picsOf()[name];
+  if (!url) throw new Error(`no picture named ${name}. Pictures: ${Object.keys(picsOf()).join(', ') || '(none)'}`);
+  if (!path || path.length > 200 || path.includes('..') || !/\.(png|jpe?g|webp)$/i.test(path)) throw new Error('give the picture a file name ending in .png, .jpg or .webp');
+  if (repo.on()) {
+    const type = /\.png$/i.test(path) ? 'image/png' : /\.webp$/i.test(path) ? 'image/webp' : 'image/jpeg';
+    await repoWriteNow(path, await canvasBlob(drawn(await loadImg(url), 'fit', 1e9), type, 0.92));
+    return path;
+  }
+  (S.conv.art ??= {})[path] = name;
+  touchConv();
+  return path;
+}
+/* A previewed page with the workspace's pictures put in where their file names are: in the page itself, and in
+   a workspace stylesheet it links (which is put inline here, since the picture has to be written into it). */
+function artInline(html, files) {
+  const placed = S.conv?.art;
+  if (!placed || !Object.keys(placed).length) return html;
+  const at = (ref) => picsOf()[placed[fileName(String(ref).split(/[?#]/)[0])]] ?? null;
+  const inCss = (css) => css.replace(/url\((["']?)([^"')]+)\1\)/gi, (tag, q, ref) => { const d = at(ref); return d ? `url(${q}${d}${q})` : tag; });
+  return inCss(String(html)
+    .replace(/<link\b[^>]*\bhref=["']([^"']+)["'][^>]*>/gi, (tag, ref) => { const css = files?.[fileName(ref.split(/[?#]/)[0])]; return /stylesheet/i.test(tag) && typeof css === 'string' && inCss(css) !== css ? `<style>${inCss(css)}</style>` : tag; })
+    .replace(/\b(src|poster)=(["'])([^"']+)\2/gi, (tag, attr, q, ref) => { const d = at(ref); return d ? `${attr}=${q}${d}${q}` : tag; }));
+}
+
+/* ---- the chat's tools ---- */
+
+/* Which model a tool call means: an id, the end of one, or a word in one; else the one chosen in the Images tab;
+   else, when that one cannot do what is needed, `prefer` (when it can), else the first that can. */
+function artPickModel(want, need, prefer) {
+  const pool = art.models.filter((m) => !need || need(specOf(m.id)));
+  const w = String(want ?? '').trim().toLowerCase();
+  if (w) {
+    const hit = pool.find((m) => m.id.toLowerCase() === w) ?? pool.find((m) => m.id.toLowerCase().endsWith('/' + w)) ?? pool.find((m) => m.id.toLowerCase().includes(w));
+    if (hit) return hit.id;
+  }
+  const mine = artModel();
+  if (mine === 'auto' || prefer === 'auto') return 'auto';   // nothing was picked by hand: the harness chooses
+  return pool.some((m) => m.id === mine) ? mine : pool.some((m) => m.id === prefer) ? prefer : pool[0]?.id ?? '';
+}
+function artModelLine(m) {
+  const s = specOf(m.id);
+  const span = (d, unit = '') => (d ? `${d.min ?? '?'}-${d.max ?? '?'}${unit}${d.def !== null && d.def !== undefined ? ' (default ' + d.def + ')' : ''}` : '');
+  return `${m.id}: ` + [s.width ? `size ${span(s.width, ' px')}` : 'its own size', s.steps ? `steps ${span(s.steps)}` : '', s.guidance ? `guidance ${span(s.guidance)}` : '', s.negative ? 'negative prompt' : '', s.seed ? 'seed' : '', s.init ? 'changes a picture ("from")' : '', s.refs ? `takes up to ${s.refs} pictures as references ("from")` : '', s.retires ? `retires ${s.retires}` : ''].filter(Boolean).join('; ') + (s.about ? `. ${clip(s.about, 140)}` : '');
+}
+
+/* image_generate: a picture from words, or from words and pictures of the chat ("from"). */
+async function artGenerate(args, signal) {
+  if (!artOn()) return imageTool('image_generate', args, signal);   // an older harness: the plain way of the section above
+  try {
+    await artLoad();
+    const prompt = String(args.prompt ?? args.description ?? '').trim();
+    if (!prompt) return 'error: image_generate needs a prompt that says what the picture shows';
+    const from = [args.from ?? args.image ?? []].flat().map((x) => String(x).trim()).filter(Boolean);
+    const missing = from.find((n) => !picsOf()[n]);
+    if (missing) return `error: no picture named ${missing}. Pictures: ${Object.keys(picsOf()).join(', ') || '(none)'}`;
+    const n = Math.min(ART_TOOL_MAX, Math.max(1, Math.floor(Number(args.count ?? args.n)) || 1));
+    if (Object.keys(picsOf()).length + n > IMAGES_PER_CHAT) return `error: this chat already keeps ${Object.keys(picsOf()).length} pictures of the ${IMAGES_PER_CHAT} it may; start a new chat for more`;
+    const model = (String(args.model ?? '').startsWith('@') ? String(args.model) : artPickModel(args.model, from.length ? (s) => s.init || s.refs : null, imageModel(from.length > 0))) || imageModel(from.length > 0);
+    if (!model) return 'error: ' + (art.err || 'the account lists no image model');
+    const spec = specOf(model, from.length ? 'edit' : 'make');
+    let d;
+    if (args.width && args.height) d = artDims(spec, { ratio: 'custom', w: args.width, h: args.height });
+    else if (args.aspect) d = artDims(spec, { ratio: String(args.aspect), size: String(args.size ?? 'M').toUpperCase() });
+    else if (from.length) { const src = await loadImg(picsOf()[from[0]]); const k = Math.min(1, 1024 / Math.max(src.naturalWidth, src.naturalHeight)); d = artDims(spec, { ratio: 'custom', w: src.naturalWidth * k, h: src.naturalHeight * k }); }
+    else d = artDims(spec, { ratio: '1:1', size: String(args.size ?? 'M').toUpperCase() });
+    const base = args.seed !== undefined && args.seed !== null && args.seed !== '' && Number.isFinite(Number(args.seed)) ? Math.floor(Number(args.seed)) : randomSeed();
+    const prompts = args.expand === true ? expandPrompt(prompt, n, false) : Array.from({ length: n }, () => prompt);
+    const batch = n > 1 ? 'b' + Date.now().toString(36) : '';
+    const names = [];
+    let last = null;
+    for (let i = 0; i < n; i++) {
+      if (S.live) { S.live.status = (n > 1 ? `painting ${i + 1} of ${n}` : 'painting') + (model === 'auto' ? '…' : ` with ${shortModel(model)}…`); drawLive(); }
+      last = await artMake({ model, prompt: prompts[i], negative: args.negative ?? args.negative_prompt ?? '', w: d?.w, h: d?.h, steps: args.steps, guidance: args.guidance, seed: base + i, strength: args.strength, init: from.length ? picsOf()[from[0]] : '', refs: from.slice(1).map((x) => picsOf()[x]), batch, conv: S.conv.id }, signal);
+      names.push(await artToChat(last, args.name || prompts[i].split(/\s+/).slice(0, 4).join('-')));
+    }
+    await artIndex();
+    touchConv();
+    artRefresh();
+    const how = `${shortModel(last.model)}${from.length ? ' from ' + from.join(', ') : ''}`;
+    const facts = `${last.w}x${last.h}${last.seed !== null ? ', seed ' + (n > 1 ? base + ' to ' + (base + n - 1) : base) : ''}`;
+    return (n === 1 ? `made ${names[0]} with ${how} (${facts})` : `made ${n} pictures with ${how}: ${names.join(', ')} (${facts})`) + `. The user sees ${n === 1 ? 'it' : 'them'} in the chat. (Look at a picture with image_look before describing it.)`;
+  } catch (e) {
+    if (signal?.aborted) throw e;
+    return 'error: ' + e.message;
+  }
+}
+
+async function artModelsTool() {
+  if (!artOn()) return 'error: this harness cannot say what its image models take yet: update it in the Harness tab';
+  await artLoad();
+  if (!art.models.length) return 'error: ' + (art.err || 'the account lists no image model');
+  const mine = artModel();
+  return art.models.map(artModelLine).join('\n') + '\n' + (mine === 'auto'
+    ? `Left alone, image_generate lets the harness choose the best working model the account has now: ${art.picks.make || 'none'} to make a picture, ${art.picks.edit || 'none'} to change one ("from"); image_look reads with ${art.picks.look || 'none'}. When one fails the next is tried. "model" names another (a word of its name is enough).`
+    : `image_generate uses ${mine} (the user picked it) unless "model" names another (a word of its name is enough).`);
+}
+
+async function artSaveTool(args) {
+  try {
+    const name = String(args.picture ?? args.image ?? args.from ?? '').trim() || Object.keys(picsOf()).at(-1) || '';
+    const path = await artPlace(name, String(args.name ?? args.path ?? name));
+    if (S.tab === 'code') drawSide();
+    return `picture ${name} is in the workspace as ${path}. A page shows it with <img src="${path}">, or url(${path}) in its CSS.`;
+  } catch (e) {
+    return 'error: ' + e.message;
+  }
+}
+
+/* /imagine in the composer: straight to the image model, no chat model between. Flags: --ar 16:9, --size L,
+   --n 4, --seed 7, --steps 6, --cfg 5, --model <word>, --no <what to keep out>. {a|b|c} tries one of each. */
+function parseImagine(text) {
+  const out = { prompt: '', expand: true };
+  const parts = text.replace(/^\/imagine\s*/i, '').split(/\s+--/);
+  out.prompt = parts.shift().trim();
+  for (const part of parts) {
+    const sp = part.search(/\s/);
+    const key = (sp < 0 ? part : part.slice(0, sp)).toLowerCase();
+    const val = sp < 0 ? '' : part.slice(sp + 1).trim();
+    if (key === 'ar' || key === 'aspect') out.aspect = val;
+    else if (key === 'size') out.size = val;
+    else if (key === 'n' || key === 'count') out.count = val;
+    else if (key === 'seed') out.seed = val;
+    else if (key === 'steps') out.steps = val;
+    else if (key === 'cfg' || key === 'guidance') out.guidance = val;
+    else if (key === 'model' || key === 'm') out.model = val;
+    else if (key === 'no' || key === 'neg' || key === 'negative') out.negative = val;
+    else throw new Error(`/imagine does not know --${key}. It knows --ar, --size, --n, --seed, --steps, --cfg, --model and --no.`);
+  }
+  if (!out.prompt) throw new Error('Say what to paint: /imagine a lighthouse in a storm --ar 16:9 --n 2');
+  return out;
+}
+
+async function artImagine(rest, names = []) {
+  const conv = S.conv;
+  const text = '/imagine ' + rest;
+  conv.msgs.push({ role: 'user', content: text, ...(names.length ? { images: names } : {}) });
+  if (conv.msgs.length === 1) conv.title = clip(rest.replace(/\s+/g, ' '), 48) || 'Pictures';
+  const abort = new AbortController();
+  S.live = { tools: [], text: '', status: 'painting…', abort };
+  draw();
+  let error = '';
+  try {
+    const args = parseImagine(text);
+    if (names.length) args.from = names;   // pictures attached to the line are what it works from
+    else if (!args.aspect && art.form.ratio !== 'custom') { args.aspect = art.form.ratio; args.size ??= art.form.size; }
+    const chip = { name: 'image_generate', args: { ...args, expand: undefined }, result: '', failed: false, running: true };
+    S.live.tools.push(chip);
+    drawLive();
+    chip.result = await artGenerate(args, abort.signal);
+    chip.failed = /^error: /.test(chip.result);
+    chip.running = false;
+  } catch (e) {
+    error = abort.signal.aborted ? 'stopped' : e.message;
+  }
+  if (!S.live) return;   // logged out meanwhile
+  const tools = S.live.tools.filter((t) => !t.running).map(({ name, args, result, failed }) => ({ name, args, result, failed }));
+  if (tools.length) conv.msgs.push({ role: 'assistant', content: '', tools });
+  if (error) conv.msgs.push({ role: 'error', content: error });
+  S.live = null;
+  await saveConv();
+  draw();
+  refreshStatus();
+}
+
+function artThumb(id) {
+  const row = artRow(id);
+  if (!row) return null;
+  return h('button', { class: 'art-pic', title: row.prompt ? clip(row.prompt, 300) : id, 'aria-label': 'Open picture ' + id, onclick: () => artView(id) }, h('img', { src: row.thumb, alt: clip(row.prompt || 'picture ' + id, 200), loading: 'lazy' }));
+}
+
+/* ---- the picture viewer ---- */
+
+function artDialog(cls, build) {
+  return new Promise((res) => {
+    const d = h('dialog', { class: 'ask ' + cls });
+    const done = (v) => { if (d.open) d.close(); d.remove(); res(v); };
+    d.addEventListener('cancel', (e) => { e.preventDefault(); done(null); });
+    d.addEventListener('click', (e) => { if (e.target === d) done(null); });
+    d.append(h('div', { class: 'ask-in' }, build(done, d)));
+    document.body.append(d);
+    if (typeof d.showModal === 'function') d.showModal(); else d.setAttribute('open', '');
+  });
+}
+
+/* Put a kept picture's settings back into the form, so it can be made again or changed. */
+function artRemix(row, withSeed) {
+  const f = art.form;
+  f.prompt = row.prompt || f.prompt;
+  f.negative = row.negative || '';
+  f.styles = [];
+  f.model = artListed(row.model);   // a model the account no longer lists: the harness chooses
+  f.multi = [];
+  f.steps = row.steps ?? '';
+  f.guidance = row.guidance ?? '';
+  f.seed = withSeed && row.seed !== null ? row.seed : '';
+  if (row.strength) f.strength = row.strength;
+  f.ratio = 'custom'; f.w = row.w; f.h = row.h;
+  const near = RATIOS.find((r) => Math.abs(r[1] / r[2] - row.w / row.h) < 0.02);
+  if (near) f.ratio = near[0];
+  artSave();
+  artPush();
+  S.tab = 'images'; S.panes.side = true;
+  draw();
+}
+
+function artView(id) {
+  const order = () => artShown().map((r) => r.id);
+  return artDialog('art-view', (done, d) => {
+    const box = h('div', { class: 'art-view-in' });
+    const show = (now) => {
+      const row = artRow(now);
+      if (!row) return done(null);
+      id = now;
+      const img = h('img', { class: 'art-full', src: row.thumb, alt: clip(row.prompt || 'picture', 200), onclick: () => img.classList.toggle('actual') });
+      artUrl(id).then((u) => { img.src = u; }).catch(() => {});
+      const said = h('div', { class: 'art-said' });
+      const look = (mode, label) => h('button', { class: 'btn btn-sm', title: 'Asks ' + artLooker(), onclick: async (e) => {
+        e.target.disabled = true;
+        said.replaceChildren(h('p', { class: 'fine' }, 'Looking…'));
+        try {
+          const text = await artLook(id, mode);
+          said.replaceChildren(...[h('div', { class: 'md', html: render(text) }), mode === 'prompt' ? h('div', { class: 'acts' }, h('button', { class: 'btn btn-sm', onclick: () => { art.form.prompt = text; artSave(); artPush(); done(null); S.tab = 'images'; S.panes.side = true; draw(); } }, 'Use as the prompt')) : null].filter(Boolean));
+        } catch (err) { said.replaceChildren(h('p', { class: 'err' }, err.message)); }
+        e.target.disabled = false;
+      } }, label);
+      const use = (label, title, fn) => h('button', { class: 'btn btn-sm', title, onclick: () => { fn(); done(null); S.tab = 'images'; S.panes.side = true; draw(); } }, label);
+      const fact = (k, v) => (v === null || v === undefined || v === '' ? null : h('div', { class: 'fact' }, h('span', {}, k), h('b', {}, String(v))));
+      const sibs = row.batch ? art.list.filter((r) => r.batch === row.batch).reverse() : [];
+      const copy = (text) => navigator.clipboard?.writeText(text).then(() => toast('Copied.'), () => toast('The browser did not allow copying.'));
+      box.replaceChildren(
+        h('div', { class: 'art-stage' }, img,
+          sibs.length > 1 ? h('div', { class: 'art-sibs' }, sibs.map((r) => h('button', { class: 'art-sib' + (r.id === id ? ' on' : ''), title: `${shortModel(r.model)}${r.seed !== null ? ' · seed ' + r.seed : ''}${r.guidance !== null ? ' · guidance ' + r.guidance : ''}${r.steps ? ' · ' + r.steps + ' steps' : ''}`, onclick: () => show(r.id) }, h('img', { src: r.thumb, alt: '' })))) : null),
+        h('div', { class: 'art-info' },
+          h('div', { class: 'art-info-top' }, h('strong', {}, shortModel(row.model) || (row.kind === 'upload' ? 'Added by you' : 'Picture')),
+            h('span', { class: 'grow' }),
+            h('button', { class: 'btn btn-ghost btn-sm', 'aria-label': 'Previous picture', onclick: () => nav(-1) }, '‹'),
+            h('button', { class: 'btn btn-ghost btn-sm', 'aria-label': 'Next picture', onclick: () => nav(1) }, '›'),
+            h('button', { class: 'btn btn-ghost btn-sm', 'aria-label': 'Close', onclick: () => done(null) }, '✕')),
+          row.prompt ? h('div', { class: 'art-prompt' }, h('p', {}, row.prompt), h('button', { class: 'btn btn-ghost btn-sm', onclick: () => copy(row.prompt) }, 'Copy prompt')) : null,
+          row.negative ? h('p', { class: 'fine' }, 'Kept out: ' + row.negative) : null,
+          h('div', { class: 'facts' }, fact('Size', `${row.w} × ${row.h}`), fact('Seed', row.seed), fact('Steps', row.steps), fact('Guidance', row.guidance), fact('Strength', row.strength),
+            fact('Made', new Date(row.at).toLocaleString()), fact('Took', row.ms ? (row.ms / 1000).toFixed(1) + ' s' : ''), fact('Kind', row.kind), fact('From', row.parent && artRow(row.parent) ? row.parent : ''), fact('File', `${row.type.split('/')[1]} · ${row.bytes < MB ? Math.round(row.bytes / 1024) + ' KB' : mb(row.bytes)}`), fact('Id', row.id)),
+          h('div', { class: 'acts' },
+            h('button', { class: 'btn btn-sm' + (row.fav ? ' on' : ''), 'aria-pressed': String(!!row.fav), onclick: async () => { row.fav = !row.fav; await artIndex(); show(id); artRefresh(); } }, row.fav ? '★ Favourite' : '☆ Favourite'),
+            h('button', { class: 'btn btn-sm btn-solid', onclick: () => artDownload([id]).catch((e) => toast(e.message)), title: 'A PNG that carries its prompt and settings' }, 'Download'),
+            row.prompt ? h('button', { class: 'btn btn-sm', onclick: () => copy(artParams(row)) }, 'Copy settings') : null),
+          h('div', { class: 'acts' },
+            row.prompt ? use('Remix', 'Put its prompt and settings into the form, with a new seed', () => artRemix(row, false)) : null,
+            row.prompt && row.seed !== null ? use('Same seed', 'Put its prompt, settings and seed into the form. On a model that honours the seed, the same words make the same picture again', () => artRemix(row, true)) : null,
+            row.prompt && art.models.length ? h('button', { class: 'btn btn-sm', title: 'Four more from the same prompt, each with a new seed', onclick: () => { const batch = 'b' + Date.now().toString(36); artQueue([0, 1, 2, 3].map(() => ({ p: { model: artListed(row.model) || 'auto', prompt: row.prompt, negative: row.negative, w: row.w, h: row.h, steps: row.steps, guidance: row.guidance, seed: randomSeed(), parent: row.id, kind: 'variation', batch, conv: row.conv }, label: shortModel(artListed(row.model) || 'auto') + ' · variation' }))); toast('Four variations are on their way: see the Images tab.'); } }, 'Variations') : null,
+            use('Edit this', 'Start from this picture: write what it should become', () => { art.init = id; art.mask = ''; }),
+            use('Use as reference', 'Give it to a model that takes reference pictures', () => { if (!art.refs.includes(id)) art.refs = [...art.refs, id].slice(-4); })),
+          h('div', { class: 'acts' }, look('describe', 'Describe'), look('prompt', 'Prompt from picture'),
+            h('button', { class: 'btn btn-sm', title: 'Attach it to your next message in the chat', onclick: async () => {
+              if (pics.attached.length >= 4) return toast('Four pictures to a message.');
+              try { const blob = await artBlob(id); pics.attached.push({ name: pictureName(row.name || (row.prompt || 'picture').split(/\s+/).slice(0, 4).join('-'), blob.type), url: await pictureUrl(blob) }); } catch (e) { return toast(e.message); }
+              done(null); drawAttached(); document.getElementById('prompt')?.focus();
+            } }, 'Attach to chat'),
+            h('button', { class: 'btn btn-sm btn-danger', onclick: async () => { if (!(await askSure('Delete this picture from this browser?', 'Delete'))) return; const list = order(); const next = list[list.indexOf(id) + 1] ?? list[list.indexOf(id) - 1]; await artForget([id]); artRefresh(); if (next) show(next); else done(null); } }, 'Delete')),
+          said));
+    };
+    const nav = (step) => { const list = order(); const i = list.indexOf(id); const next = list[i + step]; if (next) show(next); };
+    d.addEventListener('keydown', (e) => { if (e.key === 'ArrowLeft') nav(-1); else if (e.key === 'ArrowRight') nav(1); });
+    show(id);
+    return box;
+  });
+}
+
+/* Paint over the part of a picture that should be made again. Gives back a mask (white = paint again, black =
+   keep) at the picture's own size, as a data: URL; null when the dialog is left. */
+async function artMaskPaint(id) {
+  const src = await loadImg(await artUrl(id));
+  return artDialog('art-mask', (done) => {
+    const k = Math.min(1, 640 / Math.max(src.naturalWidth, src.naturalHeight));
+    const w = Math.round(src.naturalWidth * k), hgt = Math.round(src.naturalHeight * k);
+    const c = h('canvas', { width: String(w), height: String(hgt), class: 'art-mask-canvas', 'aria-label': 'Paint over the part to change' });
+    const ink = document.createElement('canvas');
+    ink.width = w; ink.height = hgt;
+    const size = h('input', { type: 'range', min: '6', max: '120', value: '36', 'aria-label': 'Brush size' });
+    const paint = () => { const g = c.getContext('2d'); g.globalAlpha = 1; g.drawImage(src, 0, 0, w, hgt); g.globalAlpha = 0.55; g.drawImage(ink, 0, 0); g.globalAlpha = 1; };
+    let last = null, used = false;
+    const at = (e) => { const r = c.getBoundingClientRect(); return [(e.clientX - r.left) * w / r.width, (e.clientY - r.top) * hgt / r.height]; };
+    const stroke = (e) => {
+      const p = at(e);
+      const g = ink.getContext('2d');
+      g.strokeStyle = g.fillStyle = '#ff2d6f'; g.lineWidth = Number(size.value); g.lineCap = 'round'; g.lineJoin = 'round';
+      g.beginPath(); g.moveTo(...(last ?? p)); g.lineTo(...p); g.stroke();
+      last = p; used = true;
+      paint();
+    };
+    c.addEventListener('pointerdown', (e) => { c.setPointerCapture(e.pointerId); last = null; stroke(e); });
+    c.addEventListener('pointermove', (e) => { if (e.buttons & 1) stroke(e); });
+    c.addEventListener('pointerup', () => { last = null; });
+    paint();
+    const finish = () => {
+      if (!used) return done('');
+      const out = document.createElement('canvas');
+      out.width = src.naturalWidth; out.height = src.naturalHeight;
+      const g = out.getContext('2d');
+      g.fillStyle = '#000'; g.fillRect(0, 0, out.width, out.height);
+      // the strokes, turned white: drawn through a filter that leaves only their shape
+      const white = document.createElement('canvas');
+      white.width = w; white.height = hgt;
+      const wg = white.getContext('2d');
+      wg.drawImage(ink, 0, 0);
+      wg.globalCompositeOperation = 'source-in';
+      wg.fillStyle = '#fff'; wg.fillRect(0, 0, w, hgt);
+      g.drawImage(white, 0, 0, out.width, out.height);
+      done(out.toDataURL('image/png'));
+    };
+    return [h('p', {}, 'Paint over what should be made again. The rest of the picture is kept.'), c,
+      h('div', { class: 'art-mask-bar' }, h('label', { class: 'fine' }, 'Brush'), size,
+        h('button', { class: 'btn btn-ghost btn-sm', onclick: () => { ink.getContext('2d').clearRect(0, 0, w, hgt); used = false; paint(); } }, 'Clear')),
+      h('div', { class: 'ask-acts' }, h('button', { class: 'btn btn-ghost btn-sm', onclick: () => done(null) }, 'Cancel'), h('button', { class: 'btn btn-solid btn-sm', onclick: finish }, 'Use this mask'))];
+  });
+}
+
+/* ---- the Images tab ---- */
+
+/* The pictures the gallery is showing now: the filter's words in the prompt or the model, favourites only when asked. */
+function artShown() {
+  const words = art.filter.toLowerCase().split(/\s+/).filter(Boolean);
+  return art.list.filter((r) => (!art.favOnly || r.fav) && words.every((w) => (r.prompt + ' ' + r.model + ' ' + r.kind + ' ' + r.id).toLowerCase().includes(w)));
+}
+
+function artQueueNode() {
+  const live = art.queue.filter((q) => q.state === 'waiting' || q.state === 'making').length;
+  return h('div', { id: 'artQueue', class: 'art-queue' + (art.queue.length ? '' : ' none') },
+    art.queue.length ? h('div', { class: 'art-queue-top' }, h('strong', {}, live ? `Making ${live} picture${live === 1 ? '' : 's'}` : 'Not made'),
+      h('span', { class: 'grow' }),
+      live ? h('button', { class: 'btn btn-ghost btn-sm', onclick: () => { for (const q of art.queue) { if (q.state === 'waiting') q.state = 'stopped'; else q.abort?.abort(); } artRefresh(); } }, 'Stop all') : h('button', { class: 'btn btn-ghost btn-sm', onclick: () => { art.queue = []; artRefresh(); } }, 'Clear')) : null,
+    art.queue.map((q) => h('div', { class: 'art-q ' + q.state }, h('span', { class: 'mark', 'aria-hidden': 'true' }), h('span', { class: 'name' }, q.label + ' · ' + clip(q.p.prompt, 60)),
+      q.err ? h('span', { class: 'err' }, clip(q.err, 160)) : null,
+      q.state === 'failed' ? h('button', { class: 'btn btn-ghost btn-sm', onclick: () => { q.state = 'waiting'; q.err = ''; artPump(); artRefresh(); } }, 'Retry') : null,
+      h('button', { class: 'x', 'aria-label': 'Remove from the queue', onclick: () => { if (q.state === 'making') q.abort?.abort(); else art.queue = art.queue.filter((x) => x !== q); artRefresh(); } }, '✕'))));
+}
+
+function artGalleryNode() {
+  const rows = artShown();
+  const pick = (id) => { if (art.picked.has(id)) art.picked.delete(id); else art.picked.add(id); artRefresh(); };
+  const picked = [...art.picked].filter(artRow);
+  return h('div', { id: 'artGallery' },
+    art.picking ? h('div', { class: 'acts art-bulk' }, h('span', { class: 'fine' }, `${picked.length} chosen`),
+      h('button', { class: 'btn btn-sm', onclick: () => { for (const r of rows) art.picked.add(r.id); artRefresh(); } }, 'All'),
+      h('button', { class: 'btn btn-sm', disabled: !picked.length, onclick: () => artDownload(picked).catch((e) => toast(e.message)) }, picked.length > 1 ? 'Download as .zip' : 'Download'),
+      h('button', { class: 'btn btn-sm', disabled: !picked.length, onclick: async () => { for (const id of picked) artRow(id).fav = true; await artIndex(); artRefresh(); } }, '★'),
+      h('button', { class: 'btn btn-sm btn-danger', disabled: !picked.length, onclick: async () => { if (!(await askSure(`Delete ${picked.length} picture${picked.length === 1 ? '' : 's'} from this browser?`, 'Delete'))) return; await artForget(picked); art.picking = false; artRefresh(); } }, 'Delete'),
+      h('button', { class: 'btn btn-ghost btn-sm', onclick: () => { art.picking = false; art.picked.clear(); artRefresh(); } }, 'Done')) : null,
+    rows.length ? h('div', { class: 'art-grid' }, rows.map((r) => h('button', { class: 'art-cell' + (art.picked.has(r.id) ? ' picked' : ''), title: (r.prompt ? clip(r.prompt, 200) + '\n' : '') + `${shortModel(r.model) || r.kind} · ${r.w}×${r.h}${r.seed !== null ? ' · seed ' + r.seed : ''}`, 'aria-label': 'Picture ' + r.id, onclick: () => (art.picking ? pick(r.id) : artView(r.id)) },
+      h('img', { src: r.thumb, alt: clip(r.prompt || r.kind, 120), loading: 'lazy' }),
+      r.fav ? h('span', { class: 'fav', 'aria-hidden': 'true' }, '★') : null,
+      r.kind !== 'new' ? h('span', { class: 'kind' }, r.kind) : null)))
+      : h('p', { class: 'fine' }, art.list.length ? 'No picture matches.' : 'Nothing yet. Pictures you make are kept here, in this browser, with the settings that made them.'));
+}
+
+/* The queue and the gallery, redrawn where they are: a prompt being typed is never disturbed. */
+function artRefresh() {
+  if (S.tab !== 'images') return drawTabsOnly();
+  const q = document.getElementById('artQueue'), g = document.getElementById('artGallery');
+  if (!q || !g) return drawSide();
+  q.replaceWith(artQueueNode());
+  g.replaceWith(artGalleryNode());
+  drawTabsOnly();
+}
+function drawTabsOnly() {
+  const old = document.querySelector('#side .tabs');
+  if (old && S.session && S.status) old.replaceWith(sidePane().querySelector('.tabs'));
+}
+
+function artModelNote(spec) {
+  const bits = [spec.partner ? 'partner model' : '', spec.beta ? 'beta' : '', spec.retires ? 'Cloudflare retires it on ' + spec.retires : '',
+    ...spec.price.map((p) => `${p.price ? p.price + ' ' + p.currency : 'free'} ${p.unit}`)].filter(Boolean);
+  return h('p', { class: 'fine art-note' }, clip(spec.about, 220), bits.length ? ' (' + bits.join(' · ') + ')' : '', spec.terms.startsWith('http') ? [' ', link({ label: 'Terms', href: spec.terms })] : null,
+    spec.schema ? null : ' Cloudflare gave no parameter list for this model: only the prompt is sent.');
+}
+
+/* The form's fields as they stand on the page, made to say what the form holds. (A redraw of the side pane puts
+   back what its fields held, so a change made from code is written into them first.) */
+function artPush() {
+  const f = art.form;
+  for (const [id, v] of [['artPrompt', f.prompt], ['artNeg', f.negative], ['artModel', artModel()], ['artSteps', f.steps], ['artGuide', f.guidance], ['artSeed', f.seed], ['artN', f.count], ['artSweep', f.sweep], ['artSweepV', f.sweepValues]]) {
+    const el = document.getElementById(id);
+    if (el) el.value = String(v ?? '');
+  }
+}
+
+function imagesTab() {
+  if (!artOn()) return [h('div', { class: 'block' }, h('h3', {}, 'Images'), h('p', {}, 'The Images tab needs a newer harness: one that tells this page what each of your image models takes. Update it in the Harness tab, then come back.'),
+    h('div', { class: 'acts' }, h('button', { class: 'btn btn-sm btn-solid', onclick: () => { S.tab = 'harness'; drawSide(); refreshStatus(); } }, 'Open the Harness tab')))];
+  if (!art.asked || !art.ready) artLoad();
+  const f = art.form;
+  const model = artModel();
+  const kind = artKind(artRow(art.init) ? art.init : '', art.mask, art.refs.filter(artRow));
+  const spec = specOf(model, kind);
+  // under "auto" the controls for working from a picture are those of the model that would do that work
+  const espec = model === 'auto' && kind === 'make' && art.picks.edit ? specOf('auto', 'edit') : spec;
+  const set = (k, v, redraw) => { f[k] = v; artSave(); if (redraw) { artPush(); drawSide(); } };
+  const d = artDims(spec);
+  const range = (dd) => (!dd ? '' : dd.min !== null && dd.max !== null ? `${dd.min}–${dd.max}` : dd.max !== null ? `up to ${dd.max}` : dd.min !== null ? `from ${dd.min}` : '');
+  const numIn = (id, key, dd, ph) => h('input', { id, type: 'text', inputmode: 'decimal', value: String(f[key] ?? ''), placeholder: ph, autocomplete: 'off', 'aria-label': key, oninput: (e) => set(key, e.target.value.trim()) });
+  const prompt = h('textarea', { id: 'artPrompt', rows: '4', placeholder: 'What should the picture show? The subject, the setting, the light, the style. {red|blue|green} tries each word.', 'aria-label': 'Prompt', value: f.prompt,
+    oninput: (e) => { f.prompt = e.target.value; artSave(); const n = document.getElementById('artCount'); if (n) n.textContent = `${f.prompt.length} / ${spec.prompt_max}`; },
+    onkeydown: (e) => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); go(); } } });
+  const go = () => { try { const jobs = artJobs(); artQueue(jobs); } catch (e) { toast(e.message); } };
+  const enhance = (structured) => async () => {
+    if (!f.prompt.trim()) return toast('Write a few words first: the idea.');
+    art.busy = 'enhance'; drawSide();
+    try { const got = await artEnhance(f.prompt.trim(), spec, structured); f.prompt = got.prompt; if (got.negative && spec.negative) f.negative = got.negative; artSave(); } catch (e) { toast('Not rewritten: ' + e.message); }
+    art.busy = ''; artPush(); drawSide();
+  };
+  const pickFile = (multiple, fn) => { const i = h('input', { type: 'file', accept: 'image/*', multiple, onchange: async () => { for (const file of i.files) { try { await fn(await artTake(file)); } catch (e) { toast(e.message); } } drawSide(); } }); i.click(); };
+  const dropOn = (fn) => ({ ondragover: (e) => e.preventDefault(), ondrop: async (e) => { e.preventDefault(); e.stopPropagation(); for (const file of [...(e.dataTransfer?.files ?? [])].filter((x) => /^image\//.test(x.type))) { try { await fn(await artTake(file)); } catch (err) { toast(err.message); } } drawSide(); } });
+  const initRow = artRow(art.init);
+  const canEdit = !!espec.init || espec.refs > 0;
+  const many = f.multi.length > 1;
+  const jobsNow = (() => { try { return artJobs().length; } catch { return 0; } })();
+  return [
+    h('div', { class: 'block art-make', ...dropOn(async (row) => { if (canEdit) { art.init = row.id; art.mask = ''; } }) },
+      art.err ? h('div', { class: 'err' }, art.err, ' ', h('button', { class: 'btn btn-ghost btn-sm', onclick: () => artLoad(true) }, 'Ask again')) : null,
+      prompt,
+      h('div', { class: 'art-under' },
+        h('button', { class: 'btn btn-sm', disabled: art.busy === 'enhance' || !!S.live, title: 'The chat\'s model (' + shortModel(S.model) + ') rewrites your idea as a detailed prompt', onclick: enhance(false) }, art.busy === 'enhance' ? 'Rewriting…' : 'Enhance'),
+        spec.form === 'multipart' ? h('button', { class: 'btn btn-sm', disabled: art.busy === 'enhance' || !!S.live, title: 'Rewrite the idea as the structured JSON prompt this model reads: scene, subjects, camera, palette', onclick: enhance(true) }, 'As JSON') : null,
+        h('span', { class: 'grow' }), h('span', { class: 'fine', id: 'artCount' }, `${f.prompt.length} / ${spec.prompt_max}`)),
+      h('div', { class: 'art-styles', role: 'group', 'aria-label': 'Styles' }, STYLES.map(([name, words]) => h('button', { class: 'art-style' + (f.styles.includes(name) ? ' on' : ''), 'aria-pressed': String(f.styles.includes(name)), title: 'Adds: ' + words, onclick: () => set('styles', f.styles.includes(name) ? f.styles.filter((x) => x !== name) : [...f.styles, name], true) }, name))),
+      spec.negative ? [h('label', { for: 'artNeg' }, 'Keep out of the picture (negative prompt)'),
+        h('div', { class: 'art-neg' }, h('input', { id: 'artNeg', type: 'text', value: f.negative, placeholder: 'blurry, watermark, text', autocomplete: 'off', oninput: (e) => set('negative', e.target.value) }),
+          h('button', { class: 'btn btn-ghost btn-sm', title: 'Fill in: ' + AVOID_COMMON, onclick: () => set('negative', f.negative ? f.negative : AVOID_COMMON, true) }, 'Common'))] : null,
+      h('label', { for: 'artModel' }, 'Model'),
+      h('select', { id: 'artModel', onchange: (e) => { f.model = e.target.value === 'auto' ? '' : e.target.value; f.multi = []; artSave(); drawSide(); } },
+        art.picks.make ? h('option', { value: 'auto', selected: model === 'auto' }, 'Auto: ' + shortModel(spec.chosen || art.picks.make) + ' now') : null,
+        art.models.map((m) => h('option', { value: m.id, selected: m.id === model }, shortModel(m.id) + (artFailing(m) ? '  (failing)' : m.retires ? '  (retiring)' : '')))),
+      model === 'auto' ? h('p', { class: 'fine art-note' }, 'Your harness chooses: the best working model your account has now for this kind of picture, and the next one if that fails. As Cloudflare adds and retires models, the choice follows.') : null,
+      model ? artModelNote(spec) : null,
+      spec.width ? [h('label', {}, 'Shape'),
+        h('div', { class: 'art-ratios', role: 'group', 'aria-label': 'Shape' }, RATIOS.map(([name, rw, rh]) => h('button', { class: 'art-ratio' + (f.ratio === name ? ' on' : ''), 'aria-pressed': String(f.ratio === name), onclick: () => set('ratio', name, true) }, h('i', { style: `width:${Math.round(18 * Math.min(1, rw / rh))}px;height:${Math.round(18 * Math.min(1, rh / rw))}px` }), name)),
+          h('button', { class: 'art-ratio' + (f.ratio === 'custom' ? ' on' : ''), 'aria-pressed': String(f.ratio === 'custom'), onclick: () => { if (d) { f.w = d.w; f.h = d.h; } set('ratio', 'custom', true); } }, 'Custom')),
+        f.ratio === 'custom'
+          ? h('div', { class: 'art-row' }, h('input', { id: 'artW', type: 'number', min: String(spec.width.min ?? 256), max: String(spec.width.max ?? 2048), step: '64', value: String(d.w), 'aria-label': 'Width', onchange: (e) => set('w', Number(e.target.value), true) }), h('span', { class: 'fine' }, '×'),
+              h('input', { id: 'artH', type: 'number', min: String(spec.height.min ?? 256), max: String(spec.height.max ?? 2048), step: '64', value: String(d.h), 'aria-label': 'Height', onchange: (e) => set('h', Number(e.target.value), true) }), h('span', { class: 'fine' }, 'px'))
+          : h('div', { class: 'art-row' }, h('div', { class: 'art-sizes', role: 'group', 'aria-label': 'Size' }, ART_SIZES.map(([name]) => h('button', { class: 'art-ratio' + (f.size === name ? ' on' : ''), 'aria-pressed': String(f.size === name), onclick: () => set('size', name, true) }, name))),
+              h('span', { class: 'fine' }, `${d.w} × ${d.h} px`))]
+        : model ? h('p', { class: 'fine' }, 'This model takes no size: it chooses its own.') : null,
+      canEdit ? [h('label', {}, espec.init ? 'Start from a picture (optional)' : 'Reference pictures (optional)'),
+        espec.init ? h('div', { class: 'art-init' },
+          initRow ? [artThumb(initRow.id),
+            h('div', { class: 'art-init-side' },
+              espec.strength ? [h('label', { for: 'artStrength' }, `How much to change it: ${Math.round(f.strength * 100)}%`), h('input', { id: 'artStrength', type: 'range', min: '0.05', max: '1', step: '0.05', value: String(f.strength), onchange: (e) => set('strength', Number(e.target.value), true) })] : null,
+              h('div', { class: 'acts' },
+                espec.mask ? h('button', { class: 'btn btn-sm' + (art.mask ? ' on' : ''), title: 'Paint over the part to make again; the rest is kept', onclick: async () => { const m = await artMaskPaint(initRow.id).catch((e) => { toast(e.message); return null; }); if (m !== null) { art.mask = m; drawSide(); } } }, art.mask ? 'Mask painted ✓' : 'Paint a mask') : null,
+                art.mask ? h('button', { class: 'btn btn-ghost btn-sm', onclick: () => { art.mask = ''; drawSide(); } }, 'Drop mask') : null,
+                h('button', { class: 'btn btn-ghost btn-sm', onclick: () => { art.init = ''; art.mask = ''; drawSide(); } }, 'Remove')))]
+            : h('button', { class: 'art-drop', onclick: () => pickFile(false, async (row) => { art.init = row.id; art.mask = ''; }) }, 'Choose a picture, drop one here, or use "Edit this" on one below')) : null,
+        espec.refs ? h('div', { class: 'art-refs' }, art.refs.filter(artRow).map((id) => h('span', { class: 'art-chip' }, artThumb(id), h('button', { class: 'x', 'aria-label': 'Remove the reference', onclick: () => { art.refs = art.refs.filter((x) => x !== id); drawSide(); } }, '✕'))),
+          art.refs.length < espec.refs ? h('button', { class: 'art-drop small', onclick: () => pickFile(true, async (row) => { if (art.refs.length < espec.refs) art.refs.push(row.id); }) }, `+ reference (${art.refs.length}/${espec.refs})`) : null,
+          h('p', { class: 'fine' }, `Sent at ${espec.ref_px || 512} px at the most. In the prompt, call them image 0, image 1…`)) : null] : null,
+      h('details', { class: 'more art-more', open: ui.artMore ? '' : null, ontoggle: (e) => { ui.artMore = e.target.open; saveUi(); } }, h('summary', {}, 'Settings'),
+        h('div', { class: 'art-fields' },
+          spec.steps ? h('div', {}, h('label', { for: 'artSteps' }, `Steps ${range(spec.steps)}`), numIn('artSteps', 'steps', spec.steps, spec.steps.def !== null ? 'default ' + spec.steps.def : 'default')) : null,
+          spec.guidance ? h('div', {}, h('label', { for: 'artGuide' }, `Guidance ${range(spec.guidance)}`), numIn('artGuide', 'guidance', spec.guidance, spec.guidance.def !== null ? 'default ' + spec.guidance.def : 'default')) : null,
+          spec.seed ? h('div', {}, h('label', { for: 'artSeed' }, 'Seed'), h('div', { class: 'art-neg' }, numIn('artSeed', 'seed', null, 'random'), h('button', { class: 'btn btn-ghost btn-sm', title: 'A new random seed, kept until you change it', onclick: () => set('seed', randomSeed(), true) }, 'Roll'), f.seed !== '' ? h('button', { class: 'btn btn-ghost btn-sm', title: 'Back to a random seed for every picture', onclick: () => set('seed', '', true) }, '✕') : null)) : null,
+          h('div', {}, h('label', { for: 'artN' }, 'Pictures'), h('select', { id: 'artN', onchange: (e) => set('count', Number(e.target.value), true) }, Array.from({ length: ART_COUNT_MAX }, (_, i) => h('option', { value: String(i + 1), selected: Number(f.count) === i + 1 }, String(i + 1)))))),
+        h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: f.combos, onchange: (e) => set('combos', e.target.checked, true) }), ' Make every combination of {a|b} choices (up to ' + ART_COMBOS_MAX + ')'),
+        art.models.length > 1 ? h('details', { class: 'more' }, h('summary', {}, many ? `Compare ${f.multi.length} models` : 'Compare models'),
+          h('p', { class: 'fine' }, 'The same prompt and seed on each model ticked, side by side.'),
+          art.models.map((m) => h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: f.multi.includes(m.id), onchange: (e) => set('multi', e.target.checked ? [...f.multi, m.id] : f.multi.filter((x) => x !== m.id), true) }), ' ' + shortModel(m.id)))) : null,
+        spec.steps || spec.guidance || spec.strength ? h('details', { class: 'more' }, h('summary', {}, f.sweep ? `Sweep ${f.sweep}` : 'Sweep a setting'),
+          h('p', { class: 'fine' }, 'One picture for each value, same prompt and seed: see what a setting does. (It shows cleanly only on a model that honours the seed; some make a new picture every time.)'),
+          h('div', { class: 'art-row' }, h('select', { id: 'artSweep', 'aria-label': 'Setting to sweep', onchange: (e) => set('sweep', e.target.value, true) }, h('option', { value: '', selected: !f.sweep }, 'No sweep'),
+            spec.guidance ? h('option', { value: 'guidance', selected: f.sweep === 'guidance' }, 'Guidance') : null, spec.steps ? h('option', { value: 'steps', selected: f.sweep === 'steps' }, 'Steps') : null, spec.strength && initRow ? h('option', { value: 'strength', selected: f.sweep === 'strength' }, 'Strength') : null),
+            h('input', { id: 'artSweepV', type: 'text', value: f.sweepValues, placeholder: '3, 5, 7.5', 'aria-label': 'Values', autocomplete: 'off', oninput: (e) => set('sweepValues', e.target.value) }))) : null,
+        h('label', { for: 'artVision' }, 'Vision model (reads pictures into words, here and in the chat)'),
+        h('select', { id: 'artVision', onchange: (e) => { if (e.target.value === 'auto') ls.del('veilweb.image.look'); else ls.set('veilweb.image.look', e.target.value); drawSide(); } },
+          h('option', { value: 'auto', selected: visionModel() === 'auto' }, 'Auto: ' + shortModel(art.picks.look || 'none listed') + ' now'),
+          [...new Set([visionModel(), ...art.vision.map((v) => v.id)])].filter((id) => id && id !== 'auto').map((id) => h('option', { value: id, selected: id === visionModel() }, shortModel(id) + (artFailing(art.vision.find((v) => v.id === id) ?? {}) ? '  (failing)' : ''))))),
+      h('div', { class: 'acts' }, h('button', { class: 'btn btn-solid', disabled: !model, title: 'Ctrl+Enter', onclick: go }, jobsNow > 1 ? `Generate ${jobsNow}` : 'Generate'),
+        h('span', { class: 'fine' }, 'Each picture is one model call from your harness\'s daily limit.'))),
+    h('div', { class: 'block art-out' },
+      artQueueNode(),
+      h('div', { class: 'art-bar' }, h('h3', {}, `Gallery${art.list.length ? ' (' + art.list.length + ')' : ''}`), h('span', { class: 'grow' }),
+        h('input', { id: 'artFilter', type: 'text', value: art.filter, placeholder: 'Find', 'aria-label': 'Find a picture', autocomplete: 'off', oninput: (e) => { art.filter = e.target.value; document.getElementById('artGallery')?.replaceWith(artGalleryNode()); } }),
+        h('button', { class: 'btn btn-ghost btn-sm' + (art.favOnly ? ' on' : ''), 'aria-pressed': String(art.favOnly), title: 'Favourites only', onclick: () => { art.favOnly = !art.favOnly; drawSide(); } }, '★'),
+        h('button', { class: 'btn btn-ghost btn-sm' + (art.picking ? ' on' : ''), 'aria-pressed': String(art.picking), title: 'Choose several: download as a .zip, or delete', onclick: () => { art.picking = !art.picking; art.picked.clear(); drawSide(); } }, 'Select'),
+        h('button', { class: 'btn btn-ghost btn-sm', title: 'Add pictures from your computer. A PNG that carries its settings brings them along.', onclick: () => pickFile(true, async () => {}) }, 'Add')),
+      artGalleryNode(),
+      h('p', { class: 'fine' }, 'Pictures are kept in this browser only. A downloaded PNG carries its prompt and settings; add one back here, or to another image tool, and they come with it.')),
+  ];
+}
+
+/* ---- the hooks: the tab, the tools, the words for the model, the pictures under a chip, /imagine, the preview ---- */
+SIDE_TABS.push({ id: 'images', label: () => (art.queue.some((q) => q.state === 'waiting' || q.state === 'making') ? 'Images •' : 'Images'), draw: imagesTab, open: () => artLoad() });
+TOOLS.image_generate = { args: '{"prompt": "<the whole picture in words: subject, setting, composition, light, colours, style>", "aspect": "16:9", "name": "<short file name>", "from": "<a picture\'s name, to change it or take after it>", "negative": "<what to keep out>", "model": "<a word of a model\'s name; leave it out and the best working model is used>", "seed": 7, "count": 1}', does: 'make a picture (or, with "from", a changed version of one of this chat\'s pictures); it is shown to the user and kept with the chat. Only prompt is needed. aspect is the shape (1:1, 4:5, 3:4, 2:3, 9:16, 5:4, 4:3, 3:2, 16:9, 21:9), or give width and height; size is S, M, L or XL; steps, guidance and strength (0 to 1: how much "from" is changed) go to models that take them; on a model that honours it, the same seed and words make the same picture again; count makes up to ' + ART_TOOL_MAX + ' at once', when: () => imageOn() };
+TOOLS.image_models = { args: '{}', does: 'list the account\'s image models and what each one takes: sizes, steps, guidance, a negative prompt, pictures to work from', when: () => artOn() };
+TOOLS.image_save = { args: '{"picture": "<a picture\'s name>", "name": "<path, like assets/hero.jpg>"}', does: 'put one of this chat\'s pictures into the workspace as a file, so a page you write can show it with <img src="assets/hero.jpg">', when: () => imageOn() };
+TOOL_RUNNERS.image_generate = (args, signal) => artGenerate(args, signal);
+TOOL_RUNNERS.image_models = () => artModelsTool();
+TOOL_RUNNERS.image_save = (args) => artSaveTool(args);
+PROMPT_NOTES.push(() => (artOn() ? 'PICTURE PROMPTS: the prompt decides the picture, and it is yours to write. Describe the picture concretely in plain language: the subject and what it is doing, the setting, the composition and camera (angle, distance, lens), the light, the colours, the medium and the style, the mood. One or two sentences for a simple picture, several for a rich one. No instructions ("make", "draw") in it. What must stay out goes in "negative" (only some models read it; image_models says which). For a page or an app that needs art, make the pictures first, put each into the workspace with image_save, then write the page around their file names.' + (Object.keys(S.conv.art ?? {}).length ? ' Pictures in the workspace: ' + Object.entries(S.conv.art).map(([p, n]) => `${p} (${n})`).join(', ') + '.' : '') : ''));
+CHIP_EXTRAS.push((t) => { const names = t.name === 'image_generate' && !t.failed ? /^made \d+ pictures with [^:]*: (.+?) \(/.exec(String(t.result ?? ''))?.[1] : null; return names ? thumbs(names.split(', ')) : null; });
+SLASH.imagine = artImagine;
+PREVIEW_PASSES.push(artInline);
 
 /* ============================================================ the loop */
 
