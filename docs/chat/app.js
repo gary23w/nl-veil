@@ -6215,8 +6215,8 @@ function sidePane() {
   const tab = (id, label) => h('button', { class: S.tab === id ? 'on' : '', role: 'tab', 'aria-selected': String(S.tab === id), onclick: () => { S.tab = id; S.note = ''; drawSide(); if (id === 'jobs') refreshJobs(); if (id === 'swarm') refreshSwarms(); if (id === 'harness') { refreshStatus(); refreshDoor(); } SIDE_TABS.find((t) => t.id === id)?.open?.(); } }, label);
   const active = S.jobs.filter((j) => j.state === 'queued' || j.state === 'running').length;
   return h('aside', { class: 'side', id: 'side' },
-    h('div', { class: 'tabs', role: 'tablist' }, tab('code', 'Code'), tab('swarm', hive.list.some((x) => x.state === 'running') ? 'Swarm •' : 'Swarm'), SIDE_TABS.map((t) => tab(t.id, t.label())), tab('jobs', active ? `Jobs (${active})` : 'Jobs'), tab('harness', outdated() ? 'Harness •' : 'Harness'),
-      h('span', { class: 'grow' }),
+    h('div', { class: 'tabs' },
+      h('div', { class: 'tab-row', role: 'tablist' }, tab('code', 'Code'), tab('swarm', hive.list.some((x) => x.state === 'running') ? 'Swarm •' : 'Swarm'), SIDE_TABS.map((t) => tab(t.id, t.label())), tab('jobs', active ? `Jobs (${active})` : 'Jobs'), tab('harness', outdated() ? 'Harness •' : 'Harness')),
       S.tab === 'code' ? h('button', { class: 'widen', 'aria-label': S.explorer ? 'Hide the explorer' : 'Show the explorer', 'aria-pressed': String(S.explorer), title: 'Explorer', onclick: () => { S.explorer = !S.explorer; drawSide(); } }, '☰') : null,
       h('button', { class: 'widen', 'aria-label': S.lay.chat ? 'Hide the chat' : 'Show the chat', 'aria-pressed': String(!S.lay.chat), title: S.lay.chat ? 'Hide the chat (more room for code)' : 'Show the chat', onclick: () => setLayout({ chat: !S.lay.chat }) }, S.lay.chat ? 'Hide chat' : 'Show chat'),
       h('button', { class: 'widen', 'aria-label': fullCode() ? 'Leave full screen' : 'Full screen', 'aria-pressed': String(fullCode()), title: fullCode() ? 'Leave full screen (Esc)' : 'Full screen', onclick: () => toggleFull() }, fullCode() ? 'Exit full screen' : 'Full screen')),
