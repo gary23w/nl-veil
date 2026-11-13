@@ -114,7 +114,7 @@ button:disabled, .btn[aria-disabled=true] { opacity: .5; cursor: default; pointe
    second line (right-aligned) instead of running off the pane's edge. */
 .tabs { display: flex; flex-wrap: wrap; gap: 2px; padding: 8px 8px 0; border-bottom: 1px solid var(--border); align-items: flex-end; }
 .tabs .grow + .widen { margin-left: auto; }
-.tabs button { padding: 7px 11px; border: 0; background: transparent; color: var(--text-secondary); border-radius: var(--radius-btn) var(--radius-btn) 0 0; font-size: var(--fs-ui); transition: background var(--quick), color var(--quick); }
+.tabs button { padding: 7px 11px; border: 0; background: transparent; color: var(--text-secondary); border-radius: 0; font-size: var(--fs-ui); transition: background var(--quick), color var(--quick); }
 .tabs button:hover { background: var(--surface-hover); color: var(--text); }
 .tabs button.on { color: var(--accent); background: var(--tonal); box-shadow: inset 0 -2px 0 var(--accent); }
 .tabs button[role=tab] { font-weight: 600; transition: background var(--calm) var(--ease), color var(--calm) var(--ease), box-shadow var(--calm) var(--ease); }
