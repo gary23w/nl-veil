@@ -6123,10 +6123,13 @@ function harnessTab() {
       num('limCalls', 'Model calls a day', st.limits.calls_max),
       num('limBytes', 'Data a day (MB)', Math.round(st.limits.bytes_max / MB)),
       num('limStore', 'Chats and job data kept (MB)', Math.round(st.limits.storage_max / MB)),
-      h('div', { class: 'acts' }, h('button', { class: 'btn btn-sm', disabled: !!S.busy, onclick: () => act('limits', async () => {
+      h('div', { class: 'acts' }, h('button', { class: 'btn btn-sm', disabled: !!S.busy, onclick: () => {
+        // the numbers are read NOW: act() redraws the pane before it runs, and a redraw puts the old limits back in the fields
         const v = (id) => Number(document.getElementById(id).value);
-        S.status = await harnessJson('/v1/config', { body: { calls_max: v('limCalls'), bytes_max: v('limBytes') * MB, storage_max: v('limStore') * MB } });
-      }) }, 'Save limits'))),
+        const body = { calls_max: v('limCalls'), bytes_max: v('limBytes') * MB, storage_max: v('limStore') * MB };
+        if (Object.values(body).some((n) => !Number.isFinite(n) || n < 1)) return toast('Each limit is a number, 1 or more.');
+        act('limits', async () => { S.status = await harnessJson('/v1/config', { body }); toast('Limits saved.'); });
+      } }, 'Save limits'))),
     outdated() ? null : meshBlock(),
     doorBlock(),
     h('div', { class: 'block' }, h('h3', {}, 'This harness'),
