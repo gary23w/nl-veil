@@ -22,7 +22,9 @@
 
   <nav aria-label="Policy sections"><a href="#terms">Terms and responsibility</a> &middot; <a href="#privacy">Privacy</a> &middot; <a href="https://github.com/gary23w/nl-veil/blob/main/LICENSE">MIT license</a></nav>
   <h1>Terms, responsibility &amp; privacy</h1>
-  <p class="date">Effective and updated October 12, 2026</p>
+  <p class="date">Effective October 12, 2026; updated November 13, 2026</p>
+  <p class="date">November 13 update: the Privacy section now covers the nl-veil browser
+    link extension for Chrome and Edge.</p>
   <p class="date">October 12 update: section 8 extends the indemnity to project partners
     and supporting organizations, subject to its stated limits.</p>
   <p>nl-veil (the Veil) is a free, open-source project maintained as an independent project.
@@ -222,6 +224,25 @@
     off in the app. Cloud tasks upload their task inputs and runtime to your account
     and may continue while the desktop app is closed. Cloudflare's terms and privacy
     practices apply.</p>
+
+  <h3 id="browser-link">nl-veil browser link extension</h3>
+  <p>The optional nl-veil browser link extension for Chrome and Edge lets the veil drive
+    one tab in your browser. The extension opens that tab itself, pinned and in the
+    background, and attaches the browser's debugger only to it. The tab uses your browser
+    profile, so the sites it opens see your existing logins.</p>
+  <p>What the extension handles: the commands it is sent for that tab and their replies,
+    which can include the content of the pages it opens, plus that tab's console messages
+    and network requests (addresses, status and headers). It passes these only to whoever
+    drives the tab: a veil server on your own computer at 127.0.0.1, or the nl-veil web
+    chat at gary23w.github.io/nl-veil/chat/ open in the same browser, and the web chat
+    only after you tick &ldquo;Let the web chat drive a tab&rdquo; in the extension's popup.
+    The web chat then sends what it reads to the model and harness in your own Cloudflare
+    account, as described above.</p>
+  <p>What it stores, in the browser's extension storage: the local server's port and
+    pairing token, the pause setting, your web chat choice and the id of the veil's tab.
+    The extension sends nothing to the developers or any project server, and has no
+    analytics or telemetry. Pausing, disconnecting or unticking the web chat box closes
+    the veil's tab; removing the extension removes its stored settings.</p>
 
   <h3>Updates and distribution</h3>
   <p>Official portable bundles check GitHub for app releases. Microsoft Store manages
