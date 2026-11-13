@@ -877,7 +877,7 @@ const TOOLS = {
   swarm_say: { args: '{"id": "<swarm>", "text": "<guidance>"}', does: 'tell a running swarm something: its coordinator follows it from the next round', when: () => swarmOn() },
   swarm_stop: { args: '{"id": "<swarm>"}', does: 'stop a swarm', when: () => swarmOn() },
   swarm_files: { args: '{"id": "<swarm>"}', does: 'copy a swarm\'s shared files into this workspace', when: () => swarmOn() },
-  run_command: { args: '{"command": "<one line>"}', does: 'run a line in the workspace terminal and get what it printed: ls, cat, grep, find, head, tail, mv, cp, rm, mkdir, python file.py, pip install name, node file.js, curl url, git status|commit|push (a clone). It is a browser tab, not a computer: no npm, apt or compilers' },
+  run_command: { args: '{"command": "<one line>"}', does: 'run a line in the workspace terminal and get what it printed. It is a small shell over the workspace: pipes, && || ;, > file, $VARS; ls cat grep find sed sort head tail wc diff tree; python file.py, pip install name, node file.js, curl url, git status|commit|push (a clone); uname, date, env. A command that needs a real computer (npm, gcc, docker) is sent to one of the machines the user owns when one is online and set to run work; otherwise it says so' },
   run_python: { args: '{"code": "<python>"}', does: 'run a Python script; the workspace files are beside it and text files it creates or changes come back into the workspace. Print what you want to see' },
   garrett_tools: { args: '{"query": "<words, optional>"}', does: 'list Agent Garrett\'s security tools (those matching the words)', when: () => S.status?.garrett?.connected },
   garrett: { args: '{"name": "<tool>", "args": {...}}', does: 'call one of Agent Garrett\'s tools', when: () => S.status?.garrett?.connected },
@@ -2420,33 +2420,67 @@ const termList = (dir) => {
   return [...seen].sort((a, b) => Number(b[1]) - Number(a[1]) || a[0].localeCompare(b[0]));
 };
 
-/* A line cut into words: quotes keep spaces, a backslash keeps the next character. */
-function termWords(line) {
+/* ---- the shell: words, variables, pipes, && || ; and redirects, over commands that are written here ---- */
+
+const termEnv = { HOME: '/', USER: 'veil', SHELL: 'veil-web', TERM: 'veil', LANG: 'en_US.UTF-8' };
+let termStatus = 0;   // $? of the last command
+
+/* A line cut into tokens: {w: word, glob: may be a pattern} or {op}. Quotes keep spaces; single quotes keep
+   everything; $NAME, ${NAME} and $? are put in outside single quotes. */
+function termTokens(line) {
   const out = [];
-  let cur = '', quote = '', had = false;
+  let cur = '', quote = '', had = false, glob = false;
+  const push = () => { if (cur || had) out.push({ w: cur, glob }); cur = ''; had = false; glob = false; };
   for (let i = 0; i < line.length; i++) {
     const ch = line[i];
-    if (quote) { if (ch === quote) quote = ''; else if (ch === '\\' && quote === '"' && i + 1 < line.length) cur += line[++i]; else cur += ch; continue; }
+    if (quote === "'") { if (ch === "'") quote = ''; else cur += ch; continue; }
+    if (ch === '$' && /[A-Za-z_?{]/.test(line[i + 1] ?? '')) {
+      const m = /^\$(?:\{([A-Za-z_]\w*)\}|([A-Za-z_]\w*)|(\?))/.exec(line.slice(i));
+      if (m) { cur += '\u0001' + (m[1] ?? m[2] ?? m[3]) + '\u0002'; had = true; i += m[0].length - 1; continue; }
+    }
+    if (quote === '"') { if (ch === '"') quote = ''; else if (ch === '\\' && '"\\$`'.includes(line[i + 1] ?? '')) cur += line[++i]; else cur += ch; continue; }
     if (ch === '"' || ch === "'") { quote = ch; had = true; continue; }
     if (ch === '\\' && i + 1 < line.length) { cur += line[++i]; continue; }
-    if (/\s/.test(ch)) { if (cur || had) out.push(cur); cur = ''; had = false; continue; }
-    if (ch === '|' || ch === '>') { if (cur || had) out.push(cur); cur = ''; had = false; if (ch === '>' && line[i + 1] === '>') { out.push('>>'); i++; } else out.push(ch); continue; }
+    if (/\s/.test(ch)) { push(); continue; }
+    if (ch === '#' && !cur && !had) break;   // a comment to the end of the line
+    const two = line.slice(i, i + 2);
+    if (two === '&&' || two === '||' || two === '>>') { push(); out.push({ op: two }); i++; continue; }
+    if (two === '2>') { push(); i += line.slice(i + 2, i + 4) === '&1' ? 3 : 1; if (line.slice(i - 1, i + 1) !== '&1') out.push({ op: '2>' }); continue; }
+    if (ch === '|' || ch === ';' || ch === '>' || ch === '<' || ch === '&') { push(); if (ch !== '&') out.push({ op: ch }); continue; }
+    if (ch === '*' || ch === '?') glob = true;
     cur += ch;
   }
-  if (cur || had) out.push(cur);
+  push();
   return out;
 }
 
-const TERM_HELP = `Files      ls [-l] [dir] · cd dir · pwd · cat file · head/tail [-n N] file · touch file · mkdir dir · rm [-r] path
-           mv from to · cp from to · find [text] · grep [-i] [-n] text [path] · wc file · open file · echo text
-Run        python file.py | python -c "code"   (your harness's Python, or Pyodide in this tab)
-           pip install name                     (pure-Python packages, into this tab's Python)
-           node file.js | node -e "code"        (JavaScript in a worker of this tab; no npm modules)
-Network    curl [-o file] url                   (through your harness)
-Git        git status | add | commit -m "msg" | log | pull | push | branch | clone url   (a cloned repo)
-Other      clear · help · history · date · whoami
-Joining    cmd | grep text · cmd | head -n N · cmd | tail -n N · cmd | wc -l · cmd > file · cmd >> file
-This is not your computer's shell: npm, apt, gcc, docker and the like cannot run in a browser tab.`;
+/* The variables in a word, read now. */
+const termVars = (w) => w.replace(/\u0001([^\u0002]*)\u0002/g, (m, name) => (name === '?' ? String(termStatus) : name === 'PWD' ? '/' + term.cwd : termEnv[name] ?? ''));
+
+/* A pattern with * or ? as the workspace paths it names (from the current folder); itself when it names none. */
+function termGlob(word) {
+  const base = term.cwd ? term.cwd + '/' : '';
+  const re = new RegExp('^' + word.split('').map((c) => (c === '*' ? '[^/]*' : c === '?' ? '[^/]' : c.replace(/[.+^${}()|[\]\\]/g, '\\$&'))).join('') + '$');
+  const seen = new Set();
+  for (const f of termAll()) {
+    if (!f.startsWith(base)) continue;
+    const rest = f.slice(base.length), depth = word.split('/').length;
+    const head = rest.split('/').slice(0, depth).join('/');
+    if (re.test(head)) seen.add(head);
+  }
+  return seen.size ? [...seen].sort() : [word];
+}
+
+const TERM_HELP = `Files    ls [-la] [dir] · cd · pwd · cat · head/tail [-n N] · touch · mkdir · rm [-r] · mv · cp · find [text] · tree · du · stat · open file
+Text     echo · printf · grep [-i -n -v -c] · sort [-r -n -u] · uniq [-c] · cut -d X -f N · tr · sed s/a/b/[g] · wc [-l -w -c] · nl · rev · tee · seq · diff a b · base64 [-d] · sha256sum · xargs
+Run      python file.py | python -c "code"  ·  pip install name  ·  node file.js | node -e "code"
+Network  curl [-o file] url · wget url (through your harness)
+Git      git status | add | commit -m "msg" | log | pull | push | branch | clone url   (a cloned repo)
+System   uname [-a] · hostname · whoami · date · env · export NAME=value · unset · which · sleep N · test · true · false · time cmd · history · clear · help
+Shell    a | b   a && b   a || b   a ; b   > file   >> file   < file   $NAME   "quotes"   *.js
+Windows  dir · type · copy · move · del · ren · md · cls · ver work too
+This runs in your browser tab and your harness, not on a computer. A command that needs a real machine (npm, gcc,
+docker, apt...) is sent to one of your own machines when a desktop veil of yours is online and set to run work.`;
 
 /* JavaScript in a worker of its own: console output comes back, the workspace's loaded files are in \`files\`. */
 function termJs(code) {
@@ -2463,21 +2497,89 @@ onmessage=async(e)=>{const files=e.data.files;try{const r=await (new (Object.get
   });
 }
 
-/* One command (no pipes): its output as text. Throws with the message a shell would print. */
-async function termCommand(argv, signal) {
-  const [cmd, ...args] = argv;
+/* What this runtime is, said the way uname would. */
+const termUname = (all) => {
+  const where = navigator.userAgentData?.platform || navigator.platform || 'browser';
+  return all ? `veil-web ${S.harness ? new URL(S.harness).hostname : 'no-harness'} ${S.status?.version ?? '?'} (browser tab on ${where}; harness: a Cloudflare Worker) wasm32` : 'veil-web';
+};
+
+/* A command this tab cannot run, sent to one of the owner's own machines on the mesh that is set to run work. */
+async function termRemote(line, signal) {
+  const nodes = (typeof mesh !== 'undefined' ? mesh.nodes : []).filter((n) => n.online && n.runs && n.kind !== 'web' && n.id !== mesh.id);
+  const word = line.trim().split(/\s+/)[0];
+  if (!nodes.length) throw new Error(`${word}: not in this terminal, and it needs a real computer. This line runs in your browser tab and your harness. To run it for real, open a desktop veil of yours and let it run work for the mesh (Harness tab > Mesh): such commands are then sent there. Type help for what runs here.`);
+  const node = nodes[0];
+  const sent = await harnessJson('/v1/jobs', { body: { model: S.model, node: node.id, from: mesh.id,
+    task: 'Run exactly this one shell command on this machine with your shell tool, in the default working folder. Reply with ONLY what it printed (standard output, then standard error), unchanged, and then one last line "exit: <its exit code>". Do not explain, do not fix it, do not run anything else.\n\n' + line } });
+  for (let i = 0; i < 100; i++) {
+    await new Promise((r) => setTimeout(r, 3000));
+    if (signal?.aborted) throw new Error('stopped');
+    const job = (await harnessJson('/v1/jobs/' + sent.id)).job;
+    if (job.state === 'done' || job.state === 'failed') {
+      const text = String(job.state === 'done' ? job.result : job.error || job.result || 'failed');
+      const code = /exit:\s*(-?\d+)\s*$/.exec(text)?.[1];
+      const out = `[ran on ${node.name}]\n` + text.replace(/\n?exit:\s*-?\d+\s*$/, '');
+      if (job.state === 'failed' || (code !== undefined && code !== '0')) throw Object.assign(new Error(out), { printed: true });
+      return out;
+    }
+  }
+  throw new Error(`${node.name} did not answer in five minutes: the command is still queued there as job ${sent.id}`);
+}
+
+/* One command: its output as text. `stdin` is what was piped in ('' when nothing was). Throws with the message
+   a shell would print. */
+async function termCommand(argv, stdin, signal, raw) {
+  const WIN = { dir: 'ls', copy: 'cp', move: 'mv', del: 'rm', erase: 'rm', ren: 'mv', rename: 'mv', md: 'mkdir', cls: 'clear' };
+  let [cmd, ...args] = argv;
+  cmd = WIN[cmd?.toLowerCase()] ?? cmd;
   const flags = new Set(args.filter((a) => /^-[a-zA-Z]+$/.test(a)).flatMap((a) => [...a.slice(1)]));
-  const rest = args.filter((a) => !/^-[a-zA-Z]+$/.test(a));
-  const count = (def) => { const i = args.indexOf('-n'); return i >= 0 ? Math.max(1, Number(args[i + 1]) || def) : def; };
-  const operands = () => { const i = args.indexOf('-n'); return args.filter((a, k) => !/^-[a-zA-Z]+$/.test(a) && !(i >= 0 && k === i + 1)); };
+  const opt = (f) => { const i = args.indexOf(f); return i >= 0 ? args[i + 1] : undefined; };
+  const takes = TERM_TAKES[cmd] ?? [];
+  const rest = args.filter((a, i) => !/^-[a-zA-Z]+$/.test(a) && !(i > 0 && takes.includes(args[i - 1])));
+  const count = (def) => Math.max(0, Number(opt('-n')) || def);
+  const lines = (t) => String(t).replace(/\n$/, '').split('\n');
+  /* the text a filter works on: the files named, or what was piped in */
+  const input = async (names = rest) => { if (!names.length) return stdin; const parts = []; for (const f of names) parts.push(await termRead(termPath(f))); return parts.join(parts.every((p) => p.endsWith('\n')) ? '' : '\n'); };
   switch (cmd) {
+    case undefined: return '';
     case 'help': return TERM_HELP;
     case 'clear': term.lines = []; return '';
+    case 'exit': case 'logout': return 'there is nothing to leave: fold the terminal with its bar';
+    case 'true': case ':': return '';
+    case 'false': throw new Error('');
     case 'pwd': return '/' + term.cwd;
     case 'date': return new Date().toString();
     case 'whoami': return S.me?.email || S.me?.account_name || 'you';
+    case 'hostname': return S.harness ? new URL(S.harness).hostname : 'veil-web';
+    case 'uname': return termUname(flags.has('a'));
+    case 'ver': case 'systeminfo': return termUname(true);
     case 'history': return term.history.map((h, i) => `${String(i + 1).padStart(4)}  ${h}`).join('\n');
-    case 'echo': return args.join(' ');
+    case 'echo': return (args[0] === '-n' ? args.slice(1) : args).join(' ');
+    case 'printf': { let i = 0; return String(args[0] ?? '').replace(/\\n/g, '\n').replace(/\\t/g, '\t').replace(/%[sd]/g, () => args[++i] ?? ''); }
+    case 'env': case 'printenv': return Object.entries({ ...termEnv, PWD: '/' + term.cwd }).map(([k, v]) => `${k}=${v}`).join('\n');
+    case 'export': case 'set': { for (const a of args) { const m = /^([A-Za-z_]\w*)=(.*)$/s.exec(a); if (m) termEnv[m[1]] = m[2]; } return args.length ? '' : termCommand(['env'], '', signal); }
+    case 'unset': { for (const a of args) delete termEnv[a]; return ''; }
+    case 'sleep': await new Promise((r) => setTimeout(r, Math.min(60, Math.max(0, Number(args[0]) || 0)) * 1000)); return '';
+    case 'seq': { const a = Number(args.length > 1 ? args[0] : 1), b = Number(args.at(-1)); if (!Number.isFinite(b) || Math.abs(b - a) > 100000) throw new Error('seq: give one or two numbers'); const out = []; for (let i = a; a <= b ? i <= b : i >= b; i += a <= b ? 1 : -1) out.push(i); return out.join('\n'); }
+    case 'basename': return String(args[0] ?? '').replace(/\/+$/, '').split('/').pop();
+    case 'dirname': return String(args[0] ?? '').replace(/\/+$/, '').split('/').slice(0, -1).join('/') || '.';
+    case 'which': case 'command': {
+      const name = rest.at(-1) ?? '';
+      if (TERM_COMMANDS.has(WIN[name] ?? name)) return `${name}: built into this terminal`;
+      throw new Error(`${name}: not in this terminal`);
+    }
+    case 'type': {
+      if (rest[0] && termIsFile(termPath(rest[0]))) return input();   // Windows: type prints a file
+      return termCommand(['which', ...rest], stdin, signal);
+    }
+    case 'test': case '[': {
+      const a = args.filter((x) => x !== ']');
+      const yes = a[0] === '-f' ? termIsFile(termPath(a[1] ?? '')) : a[0] === '-d' ? termIsDir(termPath(a[1] ?? '')) : a[0] === '-e' ? termIsFile(termPath(a[1] ?? '')) || termIsDir(termPath(a[1] ?? '')) : a[0] === '-z' ? !a[1] : a[0] === '-n' ? !!a[1]
+        : a[1] === '=' || a[1] === '==' ? a[0] === a[2] : a[1] === '!=' ? a[0] !== a[2] : a[1] === '-eq' ? Number(a[0]) === Number(a[2]) : a[1] === '-ne' ? Number(a[0]) !== Number(a[2]) : a[1] === '-lt' ? Number(a[0]) < Number(a[2]) : a[1] === '-gt' ? Number(a[0]) > Number(a[2]) : a[1] === '-le' ? Number(a[0]) <= Number(a[2]) : a[1] === '-ge' ? Number(a[0]) >= Number(a[2]) : !!a[0];
+      if (!yes) throw new Error('');
+      return '';
+    }
+    case 'time': { const t0 = performance.now(); const r = await termCommand(args, stdin, signal, args.join(' ')); return (r ? r + '\n' : '') + `real ${((performance.now() - t0) / 1000).toFixed(3)}s`; }
     case 'cd': {
       const to = termPath(rest[0] ?? '/');
       if (!termIsDir(to)) throw new Error(`cd: ${rest[0]}: no such folder`);
@@ -2485,84 +2587,133 @@ async function termCommand(argv, signal) {
       return '';
     }
     case 'ls': {
-      const dir = termPath(rest[0] ?? '');
-      if (termIsFile(dir)) return dir.split('/').pop();
-      if (!termIsDir(dir)) throw new Error(`ls: ${rest[0]}: no such file or folder`);
-      const rows = termList(dir);
-      if (!flags.has('l')) return rows.map(([n, d]) => n + (d ? '/' : '')).join('  ');
-      return rows.map(([n, d]) => (d ? 'd ' : '- ') + (d ? '' : String((S.conv.files[(dir ? dir + '/' : '') + n] ?? '').length || '').padStart(8)).padEnd(8) + ' ' + n + (d ? '/' : '')).join('\n');
+      const targets = rest.length ? rest : [''];
+      const out = [];
+      for (const t of targets) {
+        const dir = termPath(t);
+        if (termIsFile(dir)) { out.push(t); continue; }
+        if (!termIsDir(dir)) throw new Error(`ls: ${t}: no such file or folder`);
+        const rows = termList(dir).filter(([n]) => flags.has('a') || !n.startsWith('.'));
+        if (targets.length > 1) out.push(`${t}:`);
+        out.push(flags.has('l') ? rows.map(([n, d]) => (d ? 'd ' : '- ') + (d ? '' : String((S.conv.files[(dir ? dir + '/' : '') + n] ?? '').length || '')).padStart(8) + ' ' + n + (d ? '/' : '')).join('\n') : rows.map(([n, d]) => n + (d ? '/' : '')).join(outPiped ? '\n' : '  '));
+      }
+      return out.join('\n');
     }
-    case 'cat': {
-      if (!rest.length) throw new Error('cat: which file?');
-      const texts = [];
-      for (const f of rest) texts.push(await termRead(termPath(f)));
-      return texts.join('\n');
+    case 'tree': {
+      const top = termPath(rest[0] ?? '');
+      if (!termIsDir(top)) throw new Error(`tree: ${rest[0]}: no such folder`);
+      const out = [top || '.'];
+      const walk = (dir, pad) => { const rows = termList(dir).filter(([n]) => !n.startsWith('.')); rows.forEach(([n, d], i) => { if (out.length > 400) return; const last = i === rows.length - 1; out.push(pad + (last ? '└── ' : '├── ') + n); if (d) walk((dir ? dir + '/' : '') + n, pad + (last ? '    ' : '│   ')); }); };
+      walk(top, '');
+      return out.join('\n') + (out.length > 400 ? '\n… (cut at 400 lines)' : '');
     }
+    case 'du': { const top = termPath(rest[0] ?? ''); const under = top ? top + '/' : ''; let n = 0, bytes = 0; for (const f of termAll()) if (f === top || f.startsWith(under)) { n++; bytes += (S.conv.files[f] ?? '').length; } return `${n} files${repo.on() ? '' : `, ${(bytes / 1024).toFixed(1)} KB`}\t${top || '.'}`; }
+    case 'stat': { const p = termPath(rest[0] ?? ''); if (termIsFile(p)) { const t = await termRead(p); return `${p}: file, ${t.length} characters, ${t.split('\n').length} lines`; } if (termIsDir(p)) return `${p || '.'}: folder, ${termList(p).length} entries`; throw new Error(`stat: ${rest[0]}: no such file or folder`); }
+    case 'cat': return input();
+    case 'tac': return lines(await input()).reverse().join('\n');
+    case 'rev': return lines(await input()).map((l) => [...l].reverse().join('')).join('\n');
+    case 'nl': return lines(await input()).map((l, i) => `${String(i + 1).padStart(6)}\t${l}`).join('\n');
     case 'head': case 'tail': {
-      const f = operands()[0];
-      if (!f) throw new Error(cmd + ': which file?');
-      const lines = (await termRead(termPath(f))).split('\n');
-      return (cmd === 'head' ? lines.slice(0, count(10)) : lines.slice(-count(10))).join('\n');
+      const names = args.filter((a, i) => !a.startsWith('-') && args[i - 1] !== '-n');
+      const n = Number(/^-(\d+)$/.exec(args.find((a) => /^-\d+$/.test(a)) ?? '')?.[1]) || count(10);
+      const ls = lines(await input(names));
+      return (cmd === 'head' ? ls.slice(0, n) : ls.slice(-n)).join('\n');
     }
     case 'wc': {
-      const text = await termRead(termPath(rest[0] ?? ''));
-      return flags.has('l') ? String(text.split('\n').length) : `${text.split('\n').length} lines, ${text.split(/\s+/).filter(Boolean).length} words, ${text.length} characters  ${rest[0]}`;
+      const text = await input();
+      const l = text ? lines(text).length : 0, w = text.split(/\s+/).filter(Boolean).length, c = text.length;
+      return flags.has('l') ? String(l) : flags.has('w') ? String(w) : flags.has('c') || flags.has('m') ? String(c) : `${l} ${w} ${c}${rest[0] ? ' ' + rest[0] : ''}`;
     }
-    case 'touch': {
-      for (const f of rest) if (!termIsFile(termPath(f))) await termWrite(termPath(f), '');
+    case 'sort': { let ls = lines(await input()); ls = flags.has('n') ? ls.sort((a, b) => parseFloat(a) - parseFloat(b)) : ls.sort(); if (flags.has('u')) ls = [...new Set(ls)]; if (flags.has('r')) ls.reverse(); return ls.join('\n'); }
+    case 'uniq': { const out = []; for (const l of lines(await input())) { if (out.length && out.at(-1)[0] === l) out.at(-1)[1]++; else out.push([l, 1]); } return out.map(([l, n]) => (flags.has('c') ? String(n).padStart(7) + ' ' : '') + l).join('\n'); }
+    case 'cut': { const d = opt('-d') ?? '\t', f = String(opt('-f') ?? '1').split(',').map((x) => Number(x) - 1); return lines(await input(args.filter((a, i) => !a.startsWith('-') && !['-d', '-f'].includes(args[i - 1])))).map((l) => f.map((i) => l.split(d)[i] ?? '').join(d)).join('\n'); }
+    case 'tr': { const text = stdin; if (flags.has('d')) { const set = new Set([...(rest[0] ?? '')]); return [...text].filter((c) => !set.has(c)).join(''); } const [a = '', b = ''] = rest.map((x) => x.replace(/a-z/g, 'abcdefghijklmnopqrstuvwxyz').replace(/A-Z/g, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ').replace(/\\n/g, '\n')); return [...text].map((c) => { const i = a.indexOf(c); return i < 0 ? c : b[Math.min(i, b.length - 1)] ?? ''; }).join(''); }
+    case 'sed': {
+      const script = rest[0] ?? '';
+      const m = /^s(.)(.*?)\1(.*?)\1([gi]*)$/.exec(script);
+      if (!m) throw new Error('sed: only s/find/replace/[g] is here');
+      let re;
+      try { re = new RegExp(m[2], m[4].includes('g') ? 'g' + (m[4].includes('i') ? 'i' : '') : m[4].includes('i') ? 'i' : ''); } catch (e) { throw new Error('sed: ' + e.message); }
+      return lines(await input(rest.slice(1))).map((l) => l.replace(re, m[3].replace(/\\(\d)/g, '$$$1'))).join('\n');
+    }
+    case 'grep': {
+      const pattern = rest[0];
+      if (pattern === undefined) throw new Error('grep: what text?');
+      const targets = rest.slice(1);
+      const test = (l) => (flags.has('i') ? l.toLowerCase().includes(pattern.toLowerCase()) : l.includes(pattern)) !== flags.has('v');
+      if (!targets.length && (stdinPiped || stdin)) { const hit = lines(stdin).map((l, i) => [i + 1, l]).filter(([, l]) => test(l)); if (!hit.length) throw new Error(''); return flags.has('c') ? String(hit.length) : hit.map(([n, l]) => (flags.has('n') ? n + ':' : '') + l).join('\n'); }
+      const target = targets[0] !== undefined ? termPath(targets[0]) : term.cwd;
+      if (targets.length && targets.every((t) => termIsFile(termPath(t)))) {
+        const out = [];
+        for (const t of targets) for (const [n, l] of lines(await termRead(termPath(t))).map((l, i) => [i + 1, l])) if (test(l)) out.push((targets.length > 1 ? t + ':' : '') + (flags.has('n') ? n + ':' : '') + l);
+        if (!out.length) throw new Error('');
+        return flags.has('c') ? String(out.length) : out.join('\n');
+      }
+      const r = await searchText(pattern, { dir: target, max: 200, signal });
+      if (!r.hits.length) throw new Error('');
+      return r.hits.map((x) => `${x.path}:${x.line}: ${x.text}`).join('\n') + (r.stopped ? `\n(${r.stopped})` : '');
+    }
+    case 'find': {
+      const name = opt('-name') ?? (rest.at(-1) && !termIsDir(termPath(rest.at(-1))) ? rest.at(-1) : '');
+      const top = termPath(rest[0] && termIsDir(termPath(rest[0])) ? rest[0] : '');
+      const under = top ? top + '/' : '';
+      const q = String(name).replace(/^\*|\*$/g, '').toLowerCase();
+      const hits = termAll().filter((f) => f.startsWith(under) && f.split('/').pop().toLowerCase().includes(q));
+      return hits.slice(0, 500).join('\n') + (hits.length > 500 ? `\n… ${hits.length - 500} more` : '');
+    }
+    case 'diff': {
+      if (rest.length !== 2) throw new Error('diff: give two files');
+      const a = lines(await termRead(termPath(rest[0]))), b = lines(await termRead(termPath(rest[1])));
+      const out = [];
+      for (let i = 0; i < Math.max(a.length, b.length); i++) if (a[i] !== b[i]) { if (a[i] !== undefined) out.push(`${i + 1}< ${a[i]}`); if (b[i] !== undefined) out.push(`${i + 1}> ${b[i]}`); }
+      if (out.length) throw Object.assign(new Error(out.slice(0, 400).join('\n')), { printed: true });
       return '';
     }
-    case 'mkdir': {
-      for (const d of rest) if (!termIsDir(termPath(d))) await termWrite(termPath(d) + '/.keep', '');
-      return '';
-    }
-    case 'rm': {
+    case 'base64': { const text = (await input()).replace(/\n$/, ''); try { return flags.has('d') ? decodeURIComponent(escape(atob(text.replace(/\s+/g, '')))) : btoa(unescape(encodeURIComponent(text))); } catch { throw new Error('base64: that is not base64'); } }
+    case 'sha256sum': { const text = await input(); const d = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text)); return [...new Uint8Array(d)].map((b) => b.toString(16).padStart(2, '0')).join('') + '  ' + (rest[0] ?? '-'); }
+    case 'tee': { for (const f of rest) await termWrite(termPath(f), (flags.has('a') && termIsFile(termPath(f)) ? await termRead(termPath(f)) : '') + stdin); return stdin; }
+    case 'xargs': { const words = stdin.split(/\s+/).filter(Boolean); return termCommand([...(args.length ? args : ['echo']), ...words], '', signal); }
+    case 'touch': { for (const f of rest) if (!termIsFile(termPath(f))) await termWrite(termPath(f), ''); return ''; }
+    case 'mkdir': { for (const d of rest) if (!termIsDir(termPath(d))) await termWrite(termPath(d) + '/.keep', ''); return ''; }
+    case 'rm': case 'rmdir': {
       if (!rest.length) throw new Error('rm: which file?');
       for (const f of rest) {
         const p = termPath(f);
-        const targets = termIsFile(p) ? [p] : termIsDir(p) && p ? (flags.has('r') ? termAll().filter((x) => x.startsWith(p + '/')) : (() => { throw new Error(`rm: ${f} is a folder (use rm -r)`); })()) : (() => { throw new Error(`rm: ${f}: no such file`); })();
+        let targets;
+        if (termIsFile(p)) targets = [p];
+        else if (termIsDir(p) && p) { if (!flags.has('r') && !flags.has('R') && cmd !== 'rmdir') throw new Error(`rm: ${f} is a folder (use rm -r)`); targets = termAll().filter((x) => x.startsWith(p + '/')); }
+        else if (flags.has('f')) continue;
+        else throw new Error(`rm: ${f}: no such file`);
         for (const t of [...targets]) { const out = await runTool('delete_file', { name: t }); if (/^error/.test(out)) throw new Error(out); }
       }
       return '';
     }
     case 'cp': case 'mv': {
-      if (rest.length !== 2) throw new Error(`${cmd}: give a source and a destination`);
-      const from = termPath(rest[0]);
-      let to = termPath(rest[1]);
-      if (termIsDir(to) && to !== from) to = (to ? to + '/' : '') + from.split('/').pop();
-      await termWrite(to, await termRead(from));
-      if (cmd === 'mv') await runTool('delete_file', { name: from });
-      return '';
-    }
-    case 'find': {
-      const q = (rest.at(-1) ?? '').replace(/^\*|\*$/g, '');
-      const under = term.cwd ? term.cwd + '/' : '';
-      const hits = termAll().filter((f) => f.startsWith(under) && f.toLowerCase().includes(q.toLowerCase()));
-      return hits.slice(0, 500).join('\n') + (hits.length > 500 ? `\n… ${hits.length - 500} more` : '');
-    }
-    case 'grep': {
-      if (!rest.length) throw new Error('grep: what text?');
-      const target = rest[1] !== undefined ? termPath(rest[1]) : term.cwd;
-      const one = rest[1] !== undefined && termIsFile(target);
-      if (one) {
-        const needle = flags.has('i') ? rest[0].toLowerCase() : rest[0];
-        return (await termRead(target)).split('\n').map((l, i) => [i + 1, l]).filter(([, l]) => (flags.has('i') ? l.toLowerCase() : l).includes(needle)).map(([n, l]) => (flags.has('n') ? n + ':' : '') + l).join('\n');
+      if (rest.length < 2) throw new Error(`${cmd}: give a source and a destination`);
+      const dest = termPath(rest.at(-1));
+      for (const src of rest.slice(0, -1)) {
+        const from = termPath(src);
+        const to = termIsDir(dest) && dest !== from || rest.length > 2 ? (dest ? dest + '/' : '') + from.split('/').pop() : dest;
+        await termWrite(to, await termRead(from));
+        if (cmd === 'mv') await runTool('delete_file', { name: from });
       }
-      const r = await searchText(rest[0], { dir: target, max: 200, signal });
-      return r.hits.map((x) => `${x.path}:${x.line}: ${x.text}`).join('\n') + (r.stopped ? `\n(${r.stopped})` : '');
-    }
-    case 'open': {
-      const p = termPath(rest[0] ?? '');
-      if (!termIsFile(p)) throw new Error(`open: ${rest[0]}: no such file`);
-      await showFile(p);
       return '';
+    }
+    case 'open': case 'code': case 'edit': case 'nano': case 'vim': case 'vi': case 'notepad': {
+      const p = termPath(rest[0] ?? '');
+      if (!termIsFile(p)) { if (cmd === 'open') throw new Error(`open: ${rest[0]}: no such file`); await termWrite(p, ''); }
+      await showFile(p);
+      return cmd === 'open' ? '' : `${p} is open in the editor above`;
     }
     case 'python': case 'python3': case 'py': {
       let code;
-      if (flags.has('c')) code = args[args.indexOf('-c') + 1] ?? '';
+      if (args.includes('-c')) code = opt('-c') ?? '';
       else if (rest[0]) code = await termRead(termPath(rest[0]));
+      else if (stdin) code = stdin;
       else throw new Error('python: give a file, or -c "code"');
-      return runTool('run_python', { code }, signal);
+      const out = await runTool('run_python', { code }, signal);
+      if (/^(error|ERROR|FAILED)/.test(out)) throw Object.assign(new Error(out), { printed: true });
+      return out;
     }
     case 'pip': case 'pip3': {
       if (rest[0] !== 'install' || !rest[1]) throw new Error('pip: only "pip install name" is here');
@@ -2573,71 +2724,115 @@ async function termCommand(argv, signal) {
     }
     case 'node': case 'js': {
       let code;
-      if (flags.has('e')) code = args[args.indexOf('-e') + 1] ?? '';
+      if (args.includes('-e')) code = opt('-e') ?? '';
       else if (rest[0]) code = await termRead(termPath(rest[0]));
+      else if (stdin) code = stdin;
       else throw new Error('node: give a file, or -e "code"');
       const r = await termJs(code);
-      if (!r.ok) throw new Error(r.out);
+      if (!r.ok) throw Object.assign(new Error(r.out), { printed: true });
       return r.out;
     }
-    case 'curl': {
-      const url = rest.find((a) => /^https?:\/\//.test(a));
-      if (!url) throw new Error('curl: give an http(s) address');
+    case 'curl': case 'wget': {
+      const url = args.find((a) => /^https?:\/\//.test(a));
+      if (!url) throw new Error(cmd + ': give an http(s) address');
       const out = await runTool('http_request', { url, method: 'GET' }, signal);
-      const o = args.indexOf('-o');
-      if (o >= 0 && args[o + 1]) { await termWrite(termPath(args[o + 1]), out.replace(/^HTTP \d+ [^\n]*\n\n/, '')); return `saved to ${args[o + 1]}`; }
-      return out;
+      if (/^error/.test(out)) throw new Error(out.replace(/^error:\s*/, cmd + ': '));
+      const body = out.replace(/^HTTP \d+ [^\n]*\n\n/, '');
+      const file = opt('-o') ?? opt('-O') ?? (cmd === 'wget' ? url.split(/[?#]/)[0].split('/').pop() || 'index.html' : undefined);
+      if (file) { await termWrite(termPath(file), body); return `saved to ${file}`; }
+      return flags.has('i') || flags.has('I') ? out : body;
     }
     case 'git': {
       const sub = rest[0];
       if (sub === 'clone') { if (!rest[1]) throw new Error('git clone: give the repository\'s https address'); await gitClone(rest[1]); return repo.on() ? `cloned into ${repo.name}` : ''; }
       if (!repo.on()) throw new Error('git: no repository is open (git clone <address>, or Clone repo)');
-      if (repo.kind === 'disk') { if (sub === 'branch' || sub === 'status') return `on ${repo.branch || '(no branch)'}\n(this is a folder on your computer: commit and push with your own git there)`; throw new Error('git: this folder is on your computer; use your own git there'); }
+      if (repo.kind === 'disk') { if (sub === 'branch' || sub === 'status') return `on ${repo.branch || '(no branch)'}\n(this is a folder on your computer: commit and push with your own git there)`; return termRemote(raw ?? argv.join(' '), signal); }
       if (sub === 'status') { await gitChanges(); return `on ${repo.branch}\n` + (gitx.changes.length ? gitx.changes.map((c) => `  ${c.state.padEnd(8)} ${c.path}`).join('\n') : 'nothing has changed since the last commit'); }
       if (sub === 'add') return 'every change is taken by git commit here';
-      if (sub === 'commit') { const m = args.indexOf('-m'); if (m < 0 || !args[m + 1]) throw new Error('git commit: give -m "message"'); await gitCommit(args[m + 1]); return gitx.note; }
+      if (sub === 'commit') { const m = opt('-m'); if (!m) throw new Error('git commit: give -m "message"'); await gitCommit(m); return gitx.note; }
       if (sub === 'push') { await gitPush(); return gitx.note; }
       if (sub === 'pull') { await gitPull(); return gitx.note; }
       if (sub === 'branch') return '* ' + repo.branch;
       if (sub === 'log') { const git = await gitLib(); return (await git.log({ fs: gitFs(repo.root), dir: '/', depth: 10 })).map((c) => `${c.oid.slice(0, 8)}  ${c.commit.message.split('\n')[0]}  (${c.commit.author.name})`).join('\n'); }
       throw new Error(`git: "${sub ?? ''}" is not here (status, commit, push, pull, log, branch, clone)`);
     }
-    case undefined: return '';
     default:
-      throw new Error(`${cmd}: not available here. This line runs inside your browser tab and your harness, not on a computer's own shell: type help for what it can do.`);
+      // not one of this terminal's: a real computer's command, for one of the owner's own machines
+      return termRemote(raw ?? argv.join(' '), signal);
   }
 }
+/* The flags of a command that are followed by a value (everywhere else a word after a flag is an operand). */
+const TERM_TAKES = { head: ['-n'], tail: ['-n'], cut: ['-d', '-f'], curl: ['-o', '-O'], wget: ['-o', '-O'], git: ['-m'], python: ['-c'], python3: ['-c'], py: ['-c'], node: ['-e'], js: ['-e'], find: ['-name'] };
+const TERM_COMMANDS = new Set('help clear exit true false pwd date whoami hostname uname ver history echo printf env printenv export set unset sleep seq basename dirname which command type test time cd ls tree du stat cat tac rev nl head tail wc sort uniq cut tr sed grep find diff base64 sha256sum tee xargs touch mkdir rm rmdir cp mv open code edit python python3 py pip pip3 node js curl wget git'.split(' '));
+let stdinPiped = false;   // the command being run has something piped into it
+let outPiped = false;     // and what it prints goes on to another command, or into a file
 
-/* A whole line: commands joined by | (the filters), with > or >> a file at the end. Resolves {ok, out}. */
+/* A whole line: pipelines joined by && || ;, each a chain of commands joined by |, with < > >> on a command.
+   Resolves {ok, out}: what was printed (errors too, where a shell would print them), and how the last command ended. */
 async function termRun(line, signal) {
-  const words = termWords(line.trim());
-  let redirect = null;
-  const r = words.findIndex((w) => w === '>' || w === '>>');
-  if (r >= 0) { redirect = { append: words[r] === '>>', file: words[r + 1] }; words.splice(r); }
-  const stages = [[]];
-  for (const w of words) { if (w === '|') stages.push([]); else stages.at(-1).push(w); }
+  const toks = termTokens(line.trim());
+  const printed = [];
+  let ok = true, i = 0;
+  const pipeline = async () => {
+    // commands up to the next && || ;
+    const cmds = [{ words: [], raw: [] }];
+    for (; i < toks.length && !['&&', '||', ';'].includes(toks[i].op); i++) {
+      const t = toks[i], c = cmds.at(-1);
+      if (t.op === '|') { cmds.push({ words: [], raw: [] }); continue; }
+      if (t.op === '>' || t.op === '>>' || t.op === '<' || t.op === '2>') { const f = toks[++i]?.w; if (f === undefined) throw new Error('a file name is missing after ' + t.op); if (t.op === '<') c.from = f; else if (t.op !== '2>') { c.to = f; c.append = t.op === '>>'; } continue; }
+      c.raw.push(/\s/.test(t.w) ? JSON.stringify(t.w) : t.w);
+      c.words.push(...(t.glob ? termGlob(t.w) : [t.w]));
+    }
+    let stdin = '';
+    for (let k = 0; k < cmds.length; k++) {
+      const c = cmds[k];
+      c.words = c.words.map(termVars); c.raw = c.raw.map(termVars);
+      if (c.from !== undefined) c.from = termVars(c.from);
+      if (c.to !== undefined) c.to = termVars(c.to);
+      // NAME=value words before a command set variables
+      while (c.words.length && /^[A-Za-z_]\w*=/.test(c.words[0])) { const m = /^([A-Za-z_]\w*)=(.*)$/s.exec(c.words.shift()); termEnv[m[1]] = m[2]; c.raw.shift(); }
+      if (c.from !== undefined) stdin = await termRead(termPath(c.from));
+      stdinPiped = k > 0 || c.from !== undefined;
+      outPiped = k < cmds.length - 1 || c.to !== undefined;
+      let out = await termCommand(c.words, stdin, signal, c.raw.join(' '));
+      out = String(out ?? '');
+      if (c.to !== undefined) {
+        const p = termPath(c.to);
+        await termWrite(p, (c.append && termIsFile(p) ? (await termRead(p)).replace(/\n?$/, '\n') : '') + out + (out.endsWith('\n') || !out ? '' : '\n'));
+        out = '';
+      }
+      stdin = out && !out.endsWith('\n') ? out + '\n' : out;
+    }
+    return stdin.replace(/\n$/, '');
+  };
   try {
-    if (redirect && !redirect.file) throw new Error('a file name is missing after >');
-    let out = await termCommand(stages[0], signal);
-    for (const st of stages.slice(1)) {
-      const lines = String(out).replace(/\n$/, '').split('\n');
-      const n = (() => { const i = st.indexOf('-n'); return i >= 0 ? Math.max(1, Number(st[i + 1]) || 10) : 10; })();
-      if (st[0] === 'grep') { const ci = st.includes('-i'); const needle = st.filter((a) => !a.startsWith('-'))[1] ?? ''; out = lines.filter((l) => (ci ? l.toLowerCase().includes(needle.toLowerCase()) : l.includes(needle))).join('\n'); }
-      else if (st[0] === 'head') out = lines.slice(0, n).join('\n');
-      else if (st[0] === 'tail') out = lines.slice(-n).join('\n');
-      else if (st[0] === 'wc') out = String(out ? lines.length : 0);
-      else if (st[0] === 'sort') out = lines.sort().join('\n');
-      else throw new Error(`| ${st[0] ?? ''}: only grep, head, tail, wc and sort can follow a |`);
+    while (i < toks.length) {
+      let out = '';
+      try {
+        out = await pipeline();
+        ok = true;
+      } catch (e) {
+        if (signal?.aborted) throw e;
+        ok = false;
+        out = e.message || '';
+        while (i < toks.length && !['&&', '||', ';'].includes(toks[i].op)) i++;   // the rest of a pipeline that broke
+      }
+      termStatus = ok ? 0 : 1;
+      if (out) printed.push(out);
+      // what comes next, by how this one ended
+      while (i < toks.length) {
+        const op = toks[i++].op;
+        if (op === ';' || (op === '&&' && ok) || (op === '||' && !ok)) break;
+        // skipped: pass over the next pipeline
+        while (i < toks.length && !['&&', '||', ';'].includes(toks[i].op)) i++;
+      }
     }
-    if (redirect) {
-      const p = termPath(redirect.file);
-      await termWrite(p, (redirect.append && termIsFile(p) ? (await termRead(p)).replace(/\n?$/, '\n') : '') + out + '\n');
-      out = '';
-    }
-    return { ok: true, out: String(out ?? '') };
   } catch (e) {
-    return { ok: false, out: e.message || String(e) };
+    return { ok: false, out: [...printed, e.message || String(e)].join('\n') };
+  } finally {
+    stdinPiped = outPiped = false;
   }
+  return { ok, out: printed.join('\n') };
 }
 
 /* A line typed at the prompt. */
