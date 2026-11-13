@@ -93,7 +93,7 @@
 // No imports and no platform globals beyond fetch/Response/crypto, so a test can run this file under node with
 // a Map for storage and a scripted env.AI.
 
-export const VERSION = "14";
+export const VERSION = "15";
 const API_ROOT = "https://api.cloudflare.com/client/v4";
 const PY_SOURCE = "https://raw.githubusercontent.com/gary23w/nl-veil/main/cloud/tot_py.py";
 const SELF_SCRIPT = "veil-web";
@@ -158,6 +158,9 @@ const REQUEST_REFUSAL = /flagged|safety|nsfw|content policy|could not be read|mu
 // form's fields. These are the ones Cloudflare's changelog documents for its multipart image models (FLUX.2,
 // 2025-11-25 and 2026-01-28): width and height 256 to 1920, and up to four input pictures of 512 px at the most.
 const MULTIPART_IMAGE = { width: { min: 256, max: 1920, def: 1024 }, height: { min: 256, max: 1920, def: 768 }, refs: 4, ref_px: 512 };
+export const MCP_KEYS_MAX = 8; // keys other programs may hold to this harness's MCP door
+const MCP_WAIT_MS = 45000; // how long an MCP call waits for a queued task before handing back its id
+const MCP_FILES_BYTES = 512 * 1024; // the files the MCP door's file tools keep
 export const SWARMS_MAX = 8; // swarms kept, running or ended
 export const SWARM_WORKERS_MAX = 6; // tasks one cycle hands out
 export const SWARM_CYCLES_MAX = 40; // cycles one swarm may take
@@ -1707,6 +1710,233 @@ export class Harness {
     return text ? { text, model } : { err: "the vision model gave no answer: " + why };
   }
 
+  // ---------------------------------------------------------------- the veil as an MCP server
+
+  /// Another AI (a coding agent, a desktop assistant, a script) connects to POST /mcp and works with the veil:
+  /// the harness's own tools (the web, files, Python, pictures, Agent Garrett and the MCP servers connected here),
+  /// whole tasks handed to the veil, swarms, and the owner's machines on the mesh (where a desktop veil does a
+  /// task with ALL of its tools). The door speaks MCP's streamable HTTP in its plain form: one JSON-RPC message in,
+  /// one JSON answer out. It opens to a KEY the owner made in the page (kept here only as its hash), or to the
+  /// owner's own Cloudflare login. A key can do what the owner's chat can do, so it is the owner's to give out.
+  async mcpKeys() {
+    return (await this.store.get("mcp_keys")) ?? [];
+  }
+
+  async mcpWho(req) {
+    const auth = req.headers.get("authorization") ?? "";
+    const token = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
+    if (/^veil_[0-9a-f]{48}$/.test(token)) {
+      const hash = hex(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(token)));
+      const keys = await this.mcpKeys();
+      const key = keys.find((k) => k.hash === hash);
+      if (!key) return null;
+      if (Date.now() - (key.used ?? 0) > 60000) {
+        key.used = Date.now();
+        await this.store.put("mcp_keys", keys);
+      }
+      return { key };
+    }
+    const who = await this.owner(req);
+    return who ? { key: { id: "owner", name: "owner", model: "" }, owner: who } : null;
+  }
+
+  /// The tools the door offers, as MCP wants them listed.
+  mcpToolList() {
+    const prop = (v) => (typeof v === "number" ? { type: "number" } : typeof v === "boolean" ? { type: "boolean" } : Array.isArray(v) ? { type: "array", items: { type: "string" } } : v && typeof v === "object" ? { type: "object" } : { type: "string" });
+    const fromExample = (text) => {
+      const cut = text.lastIndexOf(" : ");
+      let example = {};
+      try {
+        example = JSON.parse(text.slice(0, cut).replace(/\{\.\.\.\}/g, "{}"));
+      } catch {}
+      return { description: text.slice(cut + 3), inputSchema: { type: "object", properties: Object.fromEntries(Object.entries(example).map(([k, v]) => [k, { ...prop(v), ...(typeof v === "string" && v ? { description: v } : {}) }])) } };
+    };
+    const own = Object.entries(JOB_TOOLS).map(([name, text]) => ({ name, ...fromExample(text) }));
+    const t = (name, description, properties, required = []) => ({ name, description, inputSchema: { type: "object", properties, required } });
+    const S = { type: "string" }, N = { type: "number" };
+    return [
+      t("veil_task", "Hand the veil a whole task. It works it on its own with all of its tools (web, files, Python, pictures, Agent Garrett, connected MCP servers) and answers in words. Waits up to 45 seconds; a longer task returns its job id for veil_job.", { task: S, model: { ...S, description: "a Workers AI model id; optional" } }, ["task"]),
+      t("veil_job", "The state and the result of a task or a mesh task, by its id.", { id: S }, ["id"]),
+      ...own,
+      t("image_generate", "Make a picture from words with one of the account's image models. Returns the picture.", { prompt: S, model: S, width: N, height: N }, ["prompt"]),
+      t("image_look", "Have a vision model answer a question about a picture (a data: URL).", { image: S, question: S, model: S }, ["image"]),
+      t("swarm_deploy", "Deploy a swarm that works toward a goal on its own in the harness, round by round.", { goal: S, name: S, minds: N, rounds: N, where: { ...S, description: '"harness" (default) or "mesh" (the owner\'s machines)' }, model: S }, ["goal"]),
+      t("swarm_list", "The swarms and how each stands.", {}),
+      t("swarm_status", "One swarm: its round, what its minds brought back, its lessons, its files.", { id: S }, ["id"]),
+      t("swarm_say", "Tell a running swarm something; its coordinator follows it from the next round.", { id: S, text: S }, ["id", "text"]),
+      t("swarm_stop", "Stop a swarm.", { id: S }, ["id"]),
+      t("mesh_nodes", "The owner's veils that are logged in to this harness (desktops, servers, browser tabs): which are online and which run work.", {}),
+      t("mesh_run", "Send a task to one of the owner's machines. The veil there does it with ALL of its own tools (its shell, its files, its browser, Agent Garrett). Waits up to 45 seconds; a longer task returns its job id for veil_job.", { node: { ...S, description: "a node's id or exact name, from mesh_nodes" }, task: S, model: S }, ["node", "task"]),
+    ];
+  }
+
+  /// Waits for a job to end, up to MCP_WAIT_MS. The text to answer with.
+  async mcpAwait(id, what) {
+    const until = Date.now() + MCP_WAIT_MS;
+    while (Date.now() < until) {
+      await new Promise((r) => setTimeout(r, 1500));
+      const job = await this.store.get("job:" + id);
+      if (!job) return `error: ${what} ${id} is gone`;
+      if (job.state === "done") return job.result || "(done, with no words)";
+      if (job.state === "failed") return "error: " + (job.error || job.result || "failed");
+    }
+    return `${what} ${id} is still at work. Ask again with veil_job {"id": "${id}"}.`;
+  }
+
+  /// A picture call for a key's holder. Choosing a model needs the account's model list, which the harness can
+  /// only read with the owner's login: it keeps the list for hours, and when it has none it says what to do.
+  async mcpPicture(run) {
+    try {
+      return await run();
+    } catch (e) {
+      return { err: 'the harness has no fresh list of the account\'s picture models, and a key cannot fetch one. Pass "model" (a Workers AI image or vision model id), or open the veil\'s chat page once: it refreshes the list. (' + clip(e?.message ?? e, 120) + ')' };
+    }
+  }
+
+  /// One tool call from the door. Resolves MCP content: [{type: "text", text}] or a picture.
+  async mcpTool(key, name, args, owner = null) {
+    const text = (t) => [{ type: "text", text: String(t) }];
+    const model = String(args.model ?? "").startsWith("@") ? String(args.model) : key.model || (await this.store.get("mcp_model")) || "";
+    const needModel = () => (model ? null : text("error: no model is set for this key: pass \"model\" (a Workers AI id such as one from the account's list), or make the key again from the chat page"));
+    if (name in JOB_TOOLS) {
+      const files = (await this.store.get("mcp_files")) ?? {};
+      const job = { id: "mcp", model, files, calls: 0, rounds: [] };
+      if (name === "swarm" && !model) return needModel();
+      const out = await this.jobTool(job, name, args);
+      if (["write_file", "append_file", "run_python"].includes(name)) {
+        if (Object.values(job.files).reduce((n, c) => n + c.length, 0) > MCP_FILES_BYTES) return text("error: the files kept for MCP callers are full: read what you need and write less");
+        await this.store.put("mcp_files", job.files);
+      }
+      return text(out);
+    }
+    switch (name) {
+      case "veil_task": {
+        const task = String(args.task ?? "").trim();
+        if (!task || task.length > 8000) return text("error: task must be 1 to 8000 characters");
+        const miss = needModel();
+        if (miss) return miss;
+        const index = await this.jobs();
+        if (index.filter((j) => j.state === "queued").length >= QUEUE_MAX) return text("error: the queue is full; try again when a job has started");
+        const id = await this.enqueue(index, task, model, "", false, "", "");
+        await this.store.setAlarm(Date.now() + 100);
+        return text(await this.mcpAwait(id, "task"));
+      }
+      case "veil_job": {
+        const job = await this.store.get("job:" + String(args.id ?? ""));
+        if (!job) return text("error: no such job");
+        return text(`${job.state}${job.note ? " (" + job.note + ")" : ""}\n` + (job.state === "done" ? job.result : job.state === "failed" ? job.error || job.result : `${job.rounds.length} steps so far: ${job.rounds.slice(-3).map((r) => r.tool).join(", ")}`) + (Object.keys(job.files ?? {}).length ? `\nfiles: ${Object.keys(job.files).join(", ")}` : ""));
+      }
+      case "image_generate": {
+        const got = await this.mcpPicture(() => this.image({ ...args, model: String(args.model ?? "").startsWith("@") ? args.model : "auto" }, owner));
+        return got.err ? text("error: " + got.err) : [{ type: "image", data: got.image, mimeType: got.type }, { type: "text", text: `made with ${got.model}` }];
+      }
+      case "image_look": {
+        const got = await this.mcpPicture(() => this.look({ ...args, model: String(args.model ?? "").startsWith("@") ? args.model : "auto" }, owner));
+        return text(got.err ? "error: " + got.err : got.text);
+      }
+      case "swarm_deploy": {
+        const miss = needModel();
+        if (miss) return miss;
+        const made = await this.swarmStart({ ...args, model });
+        return text(made.err ? "error: " + made.err : `deployed swarm ${made.id}. It works on its own; look in with swarm_status.`);
+      }
+      case "swarm_list":
+        return text((await this.swarms()).map((x) => `${x.id}  ${x.name}  ${x.state}  round ${Math.min(x.cycle + 1, x.cycles)}/${x.cycles}`).join("\n") || "no swarms yet");
+      case "swarm_status": case "swarm_say": case "swarm_stop": {
+        const list = await this.swarms();
+        const want = String(args.id ?? "");
+        const row = list.find((x) => x.id === want || x.name.toLowerCase() === want.toLowerCase());
+        const sw = row ? await this.store.get("swarm:" + row.id) : null;
+        if (!sw) return text("error: no such swarm");
+        const live = ["running", "paused"].includes(sw.state);
+        if (name === "swarm_say") {
+          const said = clip(String(args.text ?? "").trim(), 1000);
+          if (!said || !live) return text(said ? "error: that swarm has ended" : "error: say what the swarm should take into account");
+          sw.steer = [...sw.steer, said].slice(-12);
+          sw.log.push({ at: Date.now(), text: "an MCP caller: " + clip(said, 200) });
+          await this.saveSwarm(sw, list);
+          return text("told the swarm");
+        }
+        if (name === "swarm_stop") {
+          if (!live) return text("that swarm had already ended");
+          sw.state = "stopped";
+          sw.finished = Date.now();
+          sw.summary = (sw.summary ? sw.summary + "\n\n" : "") + "(Stopped by an MCP caller.)";
+          await this.saveSwarm(sw, list);
+          return text("stopped");
+        }
+        const now = sw.tasks.filter((x) => x.cycle === sw.cycle);
+        return text(`${sw.name}: ${sw.state}, round ${Math.min(sw.cycle + 1, sw.cycles)} of ${sw.cycles}\n${sw.summary}\n` + now.map((x) => `- ${x.role}: ${x.state}. ${clip(x.result, 400)}`).join("\n") + (sw.lessons.length ? `\nlessons: ${sw.lessons.join(" | ")}` : "") + (Object.keys(sw.files).length ? `\nfiles: ${Object.keys(sw.files).join(", ")}` : ""));
+      }
+      case "mesh_nodes": {
+        const now = Date.now();
+        return text((await this.nodes()).map((n) => `${n.id}  ${n.name}  ${n.kind} ${n.os}  ${now - n.seen < NODE_ONLINE_MS ? "online" : "offline"}${n.runs ? "  runs work" : ""}${n.browser ? "  browser" : ""}${n.garrett ? "  Agent Garrett" : ""}`).join("\n") || "no veil of the owner's is logged in to this harness right now");
+      }
+      case "mesh_run": {
+        const task = String(args.task ?? "").trim();
+        if (!task || task.length > 8000) return text("error: task must be 1 to 8000 characters");
+        const want = String(args.node ?? "");
+        const nodes = (await this.nodes()).filter((n) => n.id === want || n.name.toLowerCase() === want.toLowerCase());
+        if (nodes.length !== 1) return text(nodes.length ? "error: several nodes have that name: use the id from mesh_nodes" : "error: no such node: ask mesh_nodes");
+        if (!nodes[0].runs) return text(`error: ${nodes[0].name} is not set to run work for the mesh; its owner switches that on there`);
+        if (Date.now() - nodes[0].seen >= NODE_ONLINE_MS) return text(`error: ${nodes[0].name} is offline`);
+        const index = await this.jobs();
+        const id = await this.enqueue(index, task, model || "@cf/meta/llama-3.3-70b-instruct-fp8-fast", "", true, nodes[0].id, "");
+        return text(await this.mcpAwait(id, "mesh task"));
+      }
+    }
+    return text(`error: no tool named ${name}`);
+  }
+
+  /// POST /mcp: JSON-RPC, one message or a batch.
+  async mcpServe(req) {
+    if (req.method !== "POST") return new Response(JSON.stringify({ jsonrpc: "2.0", error: { code: -32000, message: "this MCP server answers POST only (no event stream)" }, id: null }), { status: 405, headers: { "content-type": "application/json", allow: "POST" } });
+    const who = await this.mcpWho(req);
+    if (!who) return new Response(JSON.stringify({ jsonrpc: "2.0", error: { code: -32001, message: "unauthorized: send Authorization: Bearer <a key made in the veil's chat page, Harness tab>" }, id: null }), { status: 401, headers: { "content-type": "application/json", "www-authenticate": "Bearer" } });
+    let body;
+    try {
+      body = await req.json();
+    } catch {
+      return new Response(JSON.stringify({ jsonrpc: "2.0", error: { code: -32700, message: "not JSON" }, id: null }), { status: 400, headers: { "content-type": "application/json" } });
+    }
+    const one = async (m) => {
+      if (!m || typeof m !== "object" || m.jsonrpc !== "2.0" || typeof m.method !== "string") return { jsonrpc: "2.0", error: { code: -32600, message: "not a JSON-RPC 2.0 request" }, id: m?.id ?? null };
+      if (m.id === undefined) return null; // a notification: nothing to answer
+      const ok = (result) => ({ jsonrpc: "2.0", id: m.id, result });
+      try {
+        switch (m.method) {
+          case "initialize":
+            return ok({ protocolVersion: typeof m.params?.protocolVersion === "string" ? m.params.protocolVersion : "2025-03-26", capabilities: { tools: { listChanged: false } }, serverInfo: { name: "nl-veil", title: "the veil", version: VERSION },
+              instructions: "This is a veil: one person's own agent runtime on their Cloudflare account. Use its tools directly (web_search, web_fetch, files, run_python, pictures), or hand it a whole task with veil_task. garrett_tools and garrett reach Agent Garrett's security tools when its owner connected them; mcp_tools and mcp_call reach the other MCP servers connected here. mesh_nodes and mesh_run reach the owner's own machines, where a desktop veil works with all of its tools. Everything spends the owner's Workers AI allowance." });
+          case "ping":
+            return ok({});
+          case "tools/list":
+            return ok({ tools: this.mcpToolList() });
+          case "tools/call": {
+            const name = String(m.params?.name ?? "");
+            const args = m.params?.arguments && typeof m.params.arguments === "object" ? m.params.arguments : {};
+            const why = await this.spent(false);
+            if (why) return ok({ content: [{ type: "text", text: "error: " + why }], isError: true });
+            const content = await this.mcpTool(who.key, name, args, who.owner ?? null);
+            return ok({ content, isError: content.length === 1 && content[0].type === "text" && /^error: /.test(content[0].text) });
+          }
+          case "resources/list":
+            return ok({ resources: [] });
+          case "prompts/list":
+            return ok({ prompts: [] });
+          default:
+            return { jsonrpc: "2.0", id: m.id, error: { code: -32601, message: "no such method: " + m.method } };
+        }
+      } catch (e) {
+        return ok({ content: [{ type: "text", text: "error: " + clip(e?.message ?? e, 400) }], isError: true });
+      }
+    };
+    const batch = Array.isArray(body);
+    const answers = (await Promise.all((batch ? body.slice(0, 20) : [body]).map(one))).filter(Boolean);
+    if (!answers.length) return new Response(null, { status: 202 });
+    return new Response(JSON.stringify(batch ? answers : answers[0]), { headers: { "content-type": "application/json", "cache-control": "no-store" } });
+  }
+
   // ---------------------------------------------------------------- swarms
 
   /// A SWARM works toward one goal with nobody watching. It runs here, in the harness, so it goes on with every
@@ -2057,6 +2287,7 @@ export class Harness {
 
   async route(req) {
     if ((req.headers.get("upgrade") ?? "").toLowerCase() === "websocket") return this.socket(req);
+    if (new URL(req.url).pathname === "/mcp") return this.mcpServe(req); // the MCP door has keys of its own
     const who = await this.owner(req);
     if (!who) return bad("unauthorized: log in with the Cloudflare account that owns this Worker", 401);
     const url = new URL(req.url);
@@ -2349,6 +2580,27 @@ export class Harness {
       const why = await this.spent(true);
       if (why) return say({ ok: true, probs: null, why });
       return say({ ok: true, probs: await this.clef(who, String(body.state ?? ""), body.questions) });
+    }
+
+    // Keys to the MCP door. A key is shown once, when it is made; the harness keeps its hash.
+    if (at === "keys" && method === "GET") return say({ ok: true, keys: (await this.mcpKeys()).map((k) => ({ id: k.id, name: k.name, model: k.model, created: k.created, used: k.used ?? 0 })), max: MCP_KEYS_MAX, url: new URL(req.url).origin + "/mcp" });
+    if (at === "keys" && method === "POST") {
+      const keys = await this.mcpKeys();
+      if (keys.length >= MCP_KEYS_MAX) return bad(`the harness keeps ${MCP_KEYS_MAX} keys; revoke one first`);
+      const name = clip(String(body.name ?? "").replace(/\s+/g, " ").trim(), 40) || "key " + (keys.length + 1);
+      const model = String(body.model ?? "").startsWith("@") ? String(body.model) : "";
+      const key = "veil_" + hex(crypto.getRandomValues(new Uint8Array(24)));
+      const id = hex(crypto.getRandomValues(new Uint8Array(4)));
+      keys.push({ id, name, model, hash: hex(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(key))), created: Date.now(), used: 0 });
+      await this.store.put("mcp_keys", keys);
+      if (model) await this.store.put("mcp_model", model);
+      return say({ ok: true, id, name, key, url: new URL(req.url).origin + "/mcp" });
+    }
+    if (seg[1] === "keys" && seg.length === 3 && method === "DELETE") {
+      const keys = await this.mcpKeys();
+      if (!keys.some((k) => k.id === seg[2])) return bad("no such key", 404);
+      await this.store.put("mcp_keys", keys.filter((k) => k.id !== seg[2]));
+      return say({ ok: true });
     }
 
     if (at === "mcp" && method === "GET") return say({ ok: true, servers: (await this.mcpServers()).map((x) => ({ name: x.name, url: x.url, tools: x.tools ?? 0 })), max: MCP_MAX });
