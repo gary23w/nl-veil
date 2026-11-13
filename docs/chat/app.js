@@ -918,7 +918,8 @@ function parseAction(reply) {
     // a model that writes {"tool": "swarm", "task": "...", "angles": [...]} means the fields flat beside the name
     const skip = new Set(['tool', 'name', 'tool_name', 'args', 'arguments', 'parameters', 'input', 'type', 'id']);
     args = {};
-    for (const [k, v] of Object.entries(c)) if (!skip.has(k)) args[k] = v;
+    // and one that drops a quote writes the first key as `args: {url`: the name after the brace is the key
+    for (const [k, v] of Object.entries(c)) if (!skip.has(k)) args[/^(?:args|arguments|parameters|input)\W+(\w+)$/.exec(k)?.[1] ?? k] = v;
   }
   return { tool: name, args, say: clip(String(reply).slice(0, found.at).replace(/```\w*\s*$/, '').trim(), 700) };
 }
