@@ -4255,6 +4255,7 @@ function systemPrompt() {
     'When you are done, answer the user in plain text (markdown is fine), never as JSON. Do not say a file was written, a page was read or a script was run unless a tool result shows it. ' +
     'When asked to build an app, page or script, write it as files with write_file (a web page as index.html plus its own .css and .js files) so the user sees it in the Code tab; do not paste whole files into the answer. ' +
     'To compute, test or transform something, write a Python script and run it with run_python rather than working it out in your head. ' +
+    'WHAT RUNS HERE: Python (run_python, or run_command "python file.py"), JavaScript (run_command "node file.js") and the terminal\'s own commands (run_command: ls, cat, grep, find and the like, with pipes) run in this tab on the workspace. To look in the workspace, CALL list_files, find_files, search_files or read_file: do not say you will look, look. A script in another language (PowerShell, bash, a compiled program) cannot run in this tab: read it and say what it does, and say that running it needs the user\'s own machine. Never answer with only what you are about to do: do it in the same reply, with a tool call. ' +
     'A tool call that failed is not repeated unchanged: read its error and change the call, or go another way. ' +
     'A web page some sites refuse to serve may come back from the Internet Archive; its result says so and gives the copy\'s date, which you pass on to the user. If web_search fails, fetch a likely page directly with web_fetch. You cannot reach the user\'s computer or its files from here; say so when it matters.\n' +
     plan + inRepo + browser + garrett + '\n' +
@@ -4320,6 +4321,13 @@ function shownWhileStreaming(t) {
   return cut >= 0 ? t.slice(0, cut).trim() : /^\s*(```\w*\s*)?\{/.test(t) ? '' : t;
 }
 
+/* A reply that is only an announcement: short, opens with what is about to happen, and asks nothing. */
+function announces(reply) {
+  const t = reply.trim();
+  if (t.length > 400 || /\?\s*$/.test(t) || /```/.test(t)) return false;
+  return /^(?:(?:ok(?:ay)?|sure|alright|right|got it|understood|of course|certainly)[,.! ]+)?(?:let me\b(?! know)|let['’]s\b|i['’]ll\b|i will\b|i['’]m going to\b|i am going to\b|first,? (?:let me|i['’]ll|i will)\b|now,? (?:let me|i['’]ll|i will)\b|one moment\b|just a moment\b|checking\b|looking\b|running\b|searching\b)/i.test(t);
+}
+
 async function runTurn(text, images = []) {
   const conv = S.conv;
   conv.plan = [];   // a plan belongs to the turn that made it
@@ -4333,7 +4341,7 @@ async function runTurn(text, images = []) {
   S.live = { tools: [], text: '', status: 'thinking…', abort };
   draw();
   const rounds = [];
-  let answer = '', error = '', review = null, nudged = false, idled = false, checked = false;
+  let answer = '', error = '', review = null, nudged = false, idled = false, checked = false, promised = 0;
   const record = (name, args, say, result, raw) => rounds.push({ id: 'c' + (rounds.length + 1), name, args, say, result, ...(raw ? { raw } : {}) });
   try {
     if (images.length) {
@@ -4354,6 +4362,13 @@ async function runTurn(text, images = []) {
       if (!reply) throw new Error(`${S.model.split('/').pop()} answered nothing, even with its reasoning switched off and three times the room. Try another model from the picker.`);
       const act = parseAction(reply);
       if (!act) {
+        // "Let me check that first." and then nothing: a model that says what it is about to do and stops has
+        // done nothing. It is told so, and to do it (twice at most in a turn).
+        if (announces(reply) && promised < 2 && n < ROUNDS_MAX) {
+          promised++;
+          record('(said it, did not do it)', {}, '', 'You said what you were about to do and then stopped: nothing has run. Do it NOW. Reply with exactly ONE JSON object {"tool": "<name>", "args": {...}} and nothing else. If no tool here can do it, say plainly that it cannot be done here, and why.', clip(reply, 600));
+          continue;
+        }
         // an answer while the plan still has open steps: asked once to carry on, or to say why it cannot
         const open = planOpen(conv.plan);
         if (open.length && !nudged && n < ROUNDS_MAX) {
