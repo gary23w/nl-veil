@@ -55,7 +55,9 @@ const store = (area) => ({
   del(k) { try { area.removeItem(k); } catch {} },
 });
 const ls = store(localStorage);      // what outlives the tab: the harness address, the model, the theme
-const ss = store(sessionStorage);    // the Cloudflare login: this tab only
+const ss = store(localStorage);      // the Cloudflare login: kept by this browser, so a reload or a new tab stays logged in
+// a login an older page kept in this one tab moves across once
+try { if (!localStorage.getItem('veilweb.session') && sessionStorage.getItem('veilweb.session')) localStorage.setItem('veilweb.session', sessionStorage.getItem('veilweb.session')); } catch {}
 
 /* Conversations and their files live in IndexedDB, in this browser only. A browser that refuses storage
    (some private windows) gets a Map: the session works, and nothing outlives the tab. */
@@ -224,6 +226,10 @@ async function finishLogin() {
 
 let refreshing = null;
 function refresh() {
+  // another tab of this browser may have renewed the login already: its token is taken, not renewed again (a
+  // renewal spends the refresh token, so two tabs renewing the same one would log each other out)
+  const kept = ss.get('veilweb.session');
+  if (kept?.access && kept.exp > (S.session?.exp ?? 0) + 1000) { S.session = kept; return Promise.resolve(); }
   if (!S.session?.refresh) return Promise.reject(new Error('the Cloudflare login expired'));
   return (refreshing ??= tokenCall({ grant_type: 'refresh_token', refresh_token: S.session.refresh }).finally(() => { refreshing = null; }));
 }
@@ -3883,6 +3889,106 @@ for (const n of ['image_list', 'image_pick', 'image_manage', 'image_settings', '
 for (const n of ['video_list', 'video_open', 'video_status', 'video_edit', 'video_generate', 'video_control']) TOOL_RUNNERS[n] = (args) => studioFilmTool(n, args);
 PROMPT_NOTES.push(() => (artOn() ? 'STUDIO: you are at the controls of the Images and Video tabs. The gallery: image_list, image_pick (into this chat), image_manage, image_settings, image_queue (many pictures in the background). Films: video_make writes and starts one in a call; video_list, video_open, video_status, video_edit, video_generate and video_control do everything the Video tab does. Queued jobs and swarms in the harness have image_generate, image_look and video_plan too: what they make arrives in the gallery and the film list. You cannot see a film; never describe how one looks.' : ''));
 
+/* ============================================================ settings: kept in the harness, the same in every veil */
+
+/* The page's settings are kept in the harness (its shared settings), not only in this browser: they come back after
+   a reload, in a new tab, in another browser and on another machine logged in to the same account. A setting a
+   desktop veil has too (Clef, the theme) goes under the desk's own name, so changing it on the desk changes it here,
+   and back. The harness's copy wins when this browser has never agreed with it; after that, the newer one wins.
+   What stays with this browser: the harness address, the pane sizes, this tab's name on the mesh, the terminal's
+   history, and the login itself (a browser keeps its own). The model choice travels through the mesh's own
+   "web.model" (the section above). */
+const SYNCED = [
+  { key: 'veilweb.clef', name: 'desk.clef', put: (raw) => (JSON.parse(raw) === false ? '0' : '1'), take: (v) => JSON.stringify(v !== '0' && v !== false && v !== 'false') },
+  { key: 'veil.theme', name: 'desk.theme', raw: true, ok: (v) => ['light', 'dark', 'matrix'].includes(v) },
+  { key: 'veilweb.complete', name: 'web.complete' },
+  { key: 'veilweb.ui', name: 'web.ui' },
+  { key: 'veilweb.art', name: 'web.art' },
+  { key: 'veilweb.image.look', name: 'web.image_look' },
+  { key: 'veilweb.git.name', name: 'web.git_name' },
+  { key: 'veilweb.git.email', name: 'web.git_email' },
+  { key: 'veilweb.links', name: 'web.links' },
+];
+const SYNC_VALUE_MAX = 2000;   // the harness keeps a value this long at most
+const sync = { agreed: ls.get('veilweb.sync', {}) || {}, pulled: false, busy: false };
+const rawOf = (k) => { try { return localStorage.getItem(k); } catch { return null; } };
+const syncOn = () => !!S.session && !!S.status && typeof meshOn === 'function' && meshOn();
+
+/* This browser's value of a synced setting, as the harness keeps it (text), or null when it has none. */
+function syncValue(it) {
+  const raw = rawOf(it.key);
+  if (raw === null) return null;
+  try { return it.put ? it.put(raw) : raw; } catch { return null; }
+}
+
+/* A value from the harness taken into this browser, and into what the page already shows. False when it is not one
+   this page can use. */
+function syncTake(it, v) {
+  let raw;
+  try { raw = it.take ? it.take(v) : String(v); } catch { return false; }
+  if (it.ok && !it.ok(raw)) return false;
+  // this page keeps its settings as JSON; plain text written by another program is taken as a text value
+  if (!it.raw) { try { JSON.parse(raw); } catch { raw = JSON.stringify(raw); } }
+  try { localStorage.setItem(it.key, raw); } catch { return false; }
+  try {
+    if (it.key === 'veil.theme') { try { localStorage.setItem('veil.theme.chosen', '1'); } catch {} setTheme(raw); }
+    else if (it.key === 'veilweb.ui') Object.assign(ui, JSON.parse(raw));
+    else if (it.key === 'veilweb.art' && typeof art !== 'undefined') Object.assign(art.form, JSON.parse(raw));
+    else if (it.key === 'veilweb.links') S.linksOpen = JSON.parse(raw);
+  } catch {}
+  return true;
+}
+
+/* One pass: take what the harness has that is newer than this browser's last agreement with it, then give the
+   harness what changed here since. `pull` asks the harness even when this page already has (a focus, a minute). */
+async function syncPass(pull) {
+  if (!syncOn() || sync.busy || S.live) return;
+  sync.busy = true;
+  try {
+    let changed = false;
+    if (pull || !sync.pulled) {
+      const all = (await harnessJson('/v1/settings')).settings ?? {};
+      for (const it of SYNCED) {
+        const r = all[it.name];
+        const a = sync.agreed[it.name];
+        if (!r || (a && r.at <= a.at)) continue;
+        const mine = syncValue(it);
+        if (mine === String(r.v) || syncTake(it, r.v)) { sync.agreed[it.name] = { at: r.at, v: String(r.v) }; changed ||= mine !== String(r.v); }
+      }
+      sync.pulled = true;
+    }
+    const set = {};
+    for (const it of SYNCED) {
+      const v = syncValue(it);
+      if (v === null || v.length > SYNC_VALUE_MAX || sync.agreed[it.name]?.v === v) continue;
+      set[it.name] = v;
+    }
+    if (Object.keys(set).length) {
+      const j = await harnessJson('/v1/settings', { body: { set } });
+      for (const [n, v] of Object.entries(set)) sync.agreed[n] = { at: j.settings?.[n]?.at ?? Date.now(), v };
+    }
+    ls.set('veilweb.sync', sync.agreed);
+    if (changed) draw();
+  } catch {
+    // the harness is away or older: this browser keeps its settings, and the next pass tries again
+  } finally {
+    sync.busy = false;
+  }
+}
+setInterval(() => { if (!document.hidden) syncPass(false); }, 4000);   // what changed here goes up within seconds
+setInterval(() => { if (!document.hidden) syncPass(true); }, 60000);   // what changed elsewhere comes down
+window.addEventListener('focus', () => syncPass(true));
+
+/* The login is this browser's, for every tab of it: a tab that logs out logs them all out, a renewed login is
+   taken up by the others, and a tab that was logged out joins a login made in another. */
+window.addEventListener('storage', (e) => {
+  if (e.key !== 'veilweb.session') return;
+  const now = ss.get('veilweb.session');
+  if (!now?.access) { if (S.session) logout(''); return; }
+  if (!S.session) { location.reload(); return; }
+  if (now.access !== S.session.access) S.session = now;
+});
+
 /* ============================================================ images: pictures in, pictures out */
 
 /* Pictures are the harness's work: it asks your account's image models for a picture, and a vision model what a
@@ -7415,6 +7521,8 @@ function installSteps() {
       h('li', {}, '"Install extension" downloads nl-veil-browser-link.zip. Unzip it.'),
       h('li', {}, 'Open ' + where + ' (a page cannot open that address for you), switch on Developer mode, choose "Load unpacked" and pick the unzipped folder.'),
       h('li', {}, 'Reload this page, then tick "Let the web chat drive a tab" in the extension\'s popup.')),
+    // an extension copy from before the chat's move knows only the old address, and never answers here
+    h('p', { class: 'fine' }, 'Installed it already and this page still offers to install it? A copy from before version 0.2.2 only works on the chat\'s old address. Download it again (or update its folder), then press ↻ on its card in ' + where + ' and reload this page.'),
     h('p', { class: 'fine' }, 'The extension is not in the Chrome Web Store or Edge Add-ons yet; a browser installs in one click only from its store.')];
 }
 
