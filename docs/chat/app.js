@@ -944,7 +944,7 @@ const READ_LINES = 400;   // lines of a long file one read_file gives
 /* The repository files a Python script is handed: those its quoted names point at (a folder brings what is under
    it), or the whole repository when it walks the tree or names nothing that is there. Text files only, within
    PY_REPO_FILES and PY_REPO_BYTES. */
-const PY_REPO_FILES = 2000, PY_REPO_BYTES = 12e6;
+const PY_REPO_FILES = 2000, PY_REPO_BYTES = 6e6;
 async function pyRepoFiles(code) {
   const all = repo.paths.filter((p) => !/\.(png|jpe?g|gif|webp|ico|pdf|zip|gz|tgz|wasm|woff2?|ttf|otf|mp[34]|mov|exe|dll|so|dylib|bin|lock)$/i.test(p) && !p.split('/').some((x) => x === '.git' || x === 'node_modules'));
   const named = [...code.matchAll(/(['"])((?:(?!\1)[^\n]){1,200})\1/g)].map((m) => m[2].replace(/^\.\/+/, '').replace(/\/+$/, ''));

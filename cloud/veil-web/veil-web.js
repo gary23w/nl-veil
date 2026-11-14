@@ -2692,7 +2692,13 @@ export class Harness {
       if (typeof v === "string" && v.length < 4000) headers[k] = v;
     }
     const sent = rpc ? Uint8Array.from(atob(String(body.body ?? "")), (c) => c.charCodeAt(0)) : undefined;
-    const r = await fetch(u.toString(), { method, headers, body: sent, redirect: "follow", signal: AbortSignal.timeout(120000) });
+    let r;
+    try {
+      r = await fetch(u.toString(), { method, headers, body: sent, redirect: "follow", signal: AbortSignal.timeout(120000) });
+    } catch (e) {
+      // a host that cannot be reached is the caller's answer, not this Worker's crash
+      return bad(`could not reach ${u.hostname}: ${clip(e?.message ?? e, 200)}`, 502);
+    }
     await this.spend(0, (sent?.length ?? 0) + (Number(r.headers.get("content-length")) || 0));
     return new Response(r.body, { status: 200, headers: { "content-type": "application/octet-stream", "x-git-status": String(r.status), "x-git-type": r.headers.get("content-type") ?? "", "cache-control": "no-store" } });
   }
