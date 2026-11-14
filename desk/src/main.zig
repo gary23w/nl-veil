@@ -1986,7 +1986,7 @@ fn wordJumpRight(f: *const Ui.Field) usize {
 // -------------------------------------------------------------------------------- tab bar
 
 /// The web chat: the veil in a browser, on the user's own live runtime (their harness Worker).
-pub const web_chat_url = "https://gary23w.github.io/nl-veil/chat/";
+pub const web_chat_url = "https://veil.garrettstimpson.ca/chat/";
 
 fn drawTabbar(store: *Store) void {
     const sw: f32 = @floatFromInt(rl.getScreenWidth());

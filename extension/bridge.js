@@ -1,6 +1,6 @@
 // nl-veil browser link — the bridge to the web chat.
 //
-// The web chat (https://gary23w.github.io/nl-veil/chat/) has no local veil server to long-poll, and a web page
+// The web chat (https://veil.garrettstimpson.ca/chat/) has no local veil server to long-poll, and a web page
 // cannot talk to chrome.debugger. This content script is the only thing the manifest injects, and only into that
 // one page. It carries messages between the page and the extension's background worker and does nothing else:
 //

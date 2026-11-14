@@ -12,5 +12,5 @@
   "durable_objects": { "bindings": [{ "name": "HARNESS", "class_name": "Harness" }] },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Harness"] }],
   // the one page this Worker answers across origins (the web veil)
-  "vars": { "ALLOW_ORIGIN": "https://gary23w.github.io" }
+  "vars": { "ALLOW_ORIGIN": "https://veil.garrettstimpson.ca" }
 }

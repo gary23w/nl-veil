@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "nl-veil browser link",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Lets a local nl-veil server, or the nl-veil web chat when you allow it, drive one tab in this browser with your own logins.",
   "icons": {
     "16": "icons/icon16.png",
@@ -13,7 +13,7 @@
   "host_permissions": ["http://127.0.0.1/*"],
   "content_scripts": [
     {
-      "matches": ["https://gary23w.github.io/nl-veil/chat/*"],
+      "matches": ["https://veil.garrettstimpson.ca/chat/*", "https://gary23w.github.io/nl-veil/chat/*"],
       "js": ["bridge.js"],
       "run_at": "document_start"
     }

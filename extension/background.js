@@ -265,11 +265,12 @@ chrome.debugger.onDetach.addListener(async (source) => {
 
 // THE WEB CHAT (bridge.js): the nl-veil chat page has no local server to pair with, so its commands arrive here
 // as messages from the one content script the manifest injects into that page. Three gates, all here:
-//   1. the sender must be that content script on the chat page (a tab of this browser, at that address);
+//   1. the sender must be that content script on the chat page (a tab of this browser, at one of its addresses);
 //   2. the user must have ticked "Let the web chat drive a tab" in the popup (off until they do);
 //   3. execute() only ever touches the one tab the veil opened itself, never the tab the user is reading.
-const WEB_CHAT = "https://gary23w.github.io/nl-veil/chat/";
-const fromWebChat = (sender) => !!sender.tab && typeof sender.url === "string" && sender.url.startsWith(WEB_CHAT);
+// The chat moved to its own domain; its old github.io address redirects there and stays in the list for that move.
+const WEB_CHATS = ["https://veil.garrettstimpson.ca/chat/", "https://gary23w.github.io/nl-veil/chat/"];
+const fromWebChat = (sender) => !!sender.tab && typeof sender.url === "string" && WEB_CHATS.some((u) => sender.url.startsWith(u));
 
 async function webAllowed() {
   return !!(await chrome.storage.local.get("web_allowed")).web_allowed;
