@@ -477,7 +477,8 @@ function looseValue(s, i) {
           i += 5;
           continue;
         }
-        out += { n: "\n", t: "\t", r: "\r", b: "\b", f: "\f", 0: "\0" }[e] ?? e;
+        // an escape JSON does not have (\s, \d, \. in a regex, \( in a shell line) is the code's own: kept whole
+        out += { n: "\n", t: "\t", r: "\r", b: "\b", f: "\f", 0: "\0" }[e] ?? (`"\\/'\``.includes(e) || e === c ? e : "\\" + e);
         i++;
         continue;
       }
@@ -584,6 +585,10 @@ function toolCall(reply, known) {
     }
     return finish(name, args, at, endAt);
   }
+  // a call to one of the tools that could not be read anywhere in the reply (a quote escaped once too often, a
+  // brace missing): not an answer, a call to send again
+  const named = /\{\s*["'`]?(?:tool|name|tool_name)["'`]?\s*[:=]\s*["'`]([A-Za-z_][\w-]*)["'`]/.exec(text);
+  if (named && names.has(named[1])) return { broken: "not readable as a tool call (check its quotes and escapes: inside a JSON string a backslash is written \\\\ and a quote \\\")" };
   return null;
 }
 
