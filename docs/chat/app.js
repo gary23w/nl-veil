@@ -512,12 +512,19 @@ function toolCall(reply, known) {
     }
     const out = { tool: String(name).replace(/^functions?[.:]/, ""), args, say: text.slice(0, at).replace(/```\w*\s*$/, "").replace(/<\|?[\w|]*$/, "").trim().slice(0, 700) };
     // A long file sent as a call WITHOUT its content, followed by the text in a fenced block: nothing to escape.
-    if ((out.tool === "write_file" || out.tool === "append_file") && typeof args.content !== "string" && typeof args.text !== "string") {
+    if ((out.tool === "write_file" || out.tool === "append_file") && !(typeof args.content === "string" && args.content) && typeof args.text !== "string") {
       // (a call that was itself fenced closes its fence first; a model's closing tag may sit between)
-      const fence = /^\s*(?:```[ \t]*\r?\n\s*)?(?:<\|?\/?tool_call\|?>\s*)?```[\w.+-]*[ \t]*\r?\n([\s\S]*?)(\r?\n```|$)/.exec(text.slice(endAt));
-      if (fence) {
-        args.content = fence[1] + (fence[2] ? "\n" : "");   // a whole block is whole lines, so parts join cleanly
-        if (!fence[2]) out.cut = true;
+      const fence = /^\s*(?:```[ \t]*\r?\n\s*)?(?:<\|?\/?tool_call\|?>\s*)?(```|~~~)[\w.+-]*[ \t]*\r?\n([\s\S]*?)(\r?\n\1|$)/.exec(text.slice(endAt));
+      // words may sit between the call and its block ("Here is the file:"); or the block came first, before the call
+      const later = !fence && /^[^\n`~]{0,200}\r?\n(?:[^\n`~]{0,200}\r?\n)?\s*(```|~~~)[\w.+-]*[ \t]*\r?\n([\s\S]*?)(\r?\n\1|$)/.exec(text.slice(endAt).replace(/^\s*(?:```[ \t]*\r?\n)?/, ""));
+      const blockEnd = /(```|~~~)[\w.+-]*[ \t]*\r?\n([\s\S]*?)\r?\n\1\s*$/;
+      const head = text.slice(0, at);
+      const before = !fence && !later && (blockEnd.exec(head.replace(/<\|?[\w|]*\s*$/, "")) ?? blockEnd.exec(head.replace(/```\w*\s*$/, "")));
+      const got = fence ?? later ?? before;
+      if (got) {
+        args.content = got[2] + (got[3] || before ? "\n" : "");   // a whole block is whole lines, so parts join cleanly
+        if (!before && !got[3]) out.cut = true;
+        if (before) out.say = text.slice(0, at).slice(0, before.index).trim().slice(0, 700);
       }
     }
     return out;
@@ -934,6 +941,30 @@ async function runTool(name, args, signal) {
 
 const READ_LINES = 400;   // lines of a long file one read_file gives
 
+/* The repository files a Python script is handed: those its quoted names point at (a folder brings what is under
+   it), or the whole repository when it walks the tree or names nothing that is there. Text files only, within
+   PY_REPO_FILES and PY_REPO_BYTES. */
+const PY_REPO_FILES = 2000, PY_REPO_BYTES = 12e6;
+async function pyRepoFiles(code) {
+  const all = repo.paths.filter((p) => !/\.(png|jpe?g|gif|webp|ico|pdf|zip|gz|tgz|wasm|woff2?|ttf|otf|mp[34]|mov|exe|dll|so|dylib|bin|lock)$/i.test(p) && !p.split('/').some((x) => x === '.git' || x === 'node_modules'));
+  const named = [...code.matchAll(/(['"])((?:(?!\1)[^\n]){1,200})\1/g)].map((m) => m[2].replace(/^\.\/+/, '').replace(/\/+$/, ''));
+  const whole = named.some((n) => n === '.' || n === '') || /os\.walk\(\s*\)|rglob|glob\(\s*['"]\*\*/.test(code);
+  let pick = whole ? all : all.filter((p) => named.some((n) => n && (p === n || p.startsWith(n + '/'))));
+  if (!pick.length) pick = all;
+  const out = {};
+  let bytes = 0, n = 0, cut = false;
+  for (const p of pick) {
+    if (n >= PY_REPO_FILES || bytes > PY_REPO_BYTES) { cut = true; break; }
+    let text = S.conv.files[p];
+    try { if (text === undefined || repo.partial.has(p)) text = (await repoReadText(p, true)).text; } catch { continue; }
+    if (typeof text !== 'string') continue;
+    out[p] = text; bytes += text.length; n++;
+  }
+  // what this page holds (edits not yet saved, files the chat made) goes along too
+  for (const [p, t] of Object.entries(S.conv.files)) if (!(p in out) && typeof t === 'string') out[p] = t;
+  return { files: out, note: cut ? `(the script was handed ${n} of the repository's ${pick.length} files that fit; name a folder in it to be handed that folder whole)` : '' };
+}
+
 async function runToolInner(name, args, signal) {
   if (TOOL_RUNNERS[name]) return TOOL_RUNNERS[name](args, signal, name);
   const files = S.conv.files;
@@ -1079,9 +1110,20 @@ async function runToolInner(name, args, signal) {
       // in the harness when it has a Python runtime of its own, otherwise right here in the browser
       const code = String(args.code ?? args.script ?? '');
       if (!code.trim()) return 'error: run_python needs the script, as {"tool": "run_python", "args": {"code": "print(1)"}}';
-      const run = S.status?.python?.worker && !S.pyHere ? (await harnessJson('/v1/python/run', { body: { code, files }, signal })).run : await pyBrowser.run(code, files);
-      for (const [n, c] of Object.entries(run.files ?? {})) if (typeof c === 'string') files[fileName(n)] = c;
-      return (run.ok ? '' : 'error: ') + (run.out || '(no output)');
+      // in a repository, the script is handed the repository's files (not only those this page has read), and what
+      // it writes is saved into the repository
+      const given = repo.on() ? await pyRepoFiles(code) : { files, note: '' };
+      const run = S.status?.python?.worker && !S.pyHere ? (await harnessJson('/v1/python/run', { body: { code, files: given.files }, signal })).run : await pyBrowser.run(code, given.files);
+      const saved = [];
+      for (const [n, c] of Object.entries(run.files ?? {})) {
+        if (typeof c !== 'string') continue;
+        const f = fileName(n);
+        if (!repo.on()) { files[f] = c; continue; }
+        if (given.files[f] === c) continue;
+        const w = await runToolInner('write_file', { name: f, content: c }, signal);
+        if (!/^error/.test(w)) saved.push(f);
+      }
+      return (run.ok ? '' : 'error: ') + (run.out || '(no output)') + (given.note ? '\n' + given.note : '') + (saved.length ? `\n(saved into the repository: ${saved.slice(0, 20).join(', ')}${saved.length > 20 ? ` and ${saved.length - 20} more` : ''})` : '');
     }
     case 'garrett_tools':
       return (await harnessJson('/v1/garrett/call', { body: { method: 'tools/list', params: {}, query: String(args.query ?? '') }, signal })).text;
@@ -2531,18 +2573,70 @@ Windows  dir · type · copy · move · del · ren · md · cls · ver work too
 This runs in your browser tab and your harness, not on a computer. A command that needs a real machine (npm, gcc,
 docker, apt...) is sent to one of your own machines when a desktop veil of yours is online and set to run work.`;
 
-/* JavaScript in a worker of its own: console output comes back, the workspace's loaded files are in \`files\`. */
-function termJs(code) {
+/* JavaScript in a worker of its own, the way node runs a script: require('fs') and require('path') work over the
+   workspace's files (in a repository, those the script names, or all of them), console output comes back, and the
+   files it writes or deletes are handed back to be saved. The worker's body is the function below, sent as text. */
+function termJsWorker() {
+  const out = [];
+  const fmt = (a) => a.map((x) => (typeof x === 'string' ? x : (() => { try { return JSON.stringify(x, null, 2); } catch { return String(x); } })())).join(' ');
+  for (const k of ['log', 'info', 'warn', 'error', 'debug']) console[k] = (...a) => out.push(fmt(a));
+  onmessage = async (e) => {
+    const store = e.data.files, cwd = e.data.cwd || '', written = {};
+    const norm = (p) => { const parts = []; for (const s of (String(p).startsWith('/') ? String(p) : cwd + '/' + p).split('/')) { if (!s || s === '.') continue; if (s === '..') parts.pop(); else parts.push(s); } return parts.join('/'); };
+    const isDir = (k) => k === '' || Object.keys(store).some((f) => f.startsWith(k + '/'));
+    const noent = (p) => Object.assign(new Error(`ENOENT: no such file or directory, '${p}'`), { code: 'ENOENT' });
+    const fs = {
+      readFileSync: (p) => { const k = norm(p); if (!(k in store)) throw noent(p); return store[k]; },
+      writeFileSync: (p, d) => { const k = norm(p); store[k] = String(d); written[k] = store[k]; },
+      appendFileSync: (p, d) => { const k = norm(p); store[k] = (store[k] ?? '') + String(d); written[k] = store[k]; },
+      existsSync: (p) => { const k = norm(p); return k in store || isDir(k); },
+      readdirSync: (p = '.', o) => {
+        const k = norm(p);
+        if (!isDir(k)) throw noent(p);
+        const pre = k ? k + '/' : '', names = new Map();
+        for (const f of Object.keys(store)) if (f.startsWith(pre)) { const rest = f.slice(pre.length), i = rest.indexOf('/'); names.set(i < 0 ? rest : rest.slice(0, i), i >= 0); }
+        return [...names].sort((x, y) => (x[0] < y[0] ? -1 : 1)).map(([n, d]) => (o && o.withFileTypes ? { name: n, isDirectory: () => d, isFile: () => !d } : n));
+      },
+      statSync: (p) => { const k = norm(p); if (k in store) return { size: store[k].length, isFile: () => true, isDirectory: () => false, mtime: new Date() }; if (isDir(k)) return { size: 0, isFile: () => false, isDirectory: () => true, mtime: new Date() }; throw noent(p); },
+      mkdirSync: () => undefined,
+      unlinkSync: (p) => { const k = norm(p); delete store[k]; written[k] = null; },
+      rmSync: (p) => { const k = norm(p); for (const f of Object.keys(store)) if (f === k || f.startsWith(k + '/')) { delete store[f]; written[f] = null; } },
+    };
+    fs.promises = Object.fromEntries(Object.entries(fs).map(([n, f]) => [n.replace(/Sync$/, ''), async (...a) => f(...a)]));
+    fs.readFile = (p, o, cb) => { cb = typeof o === 'function' ? o : cb; try { cb(null, fs.readFileSync(p)); } catch (err) { cb(err); } };
+    const path = {
+      sep: '/',
+      join: (...a) => a.filter((x) => x !== '').join('/').replace(/\/+/g, '/'),
+      resolve: (...a) => '/' + norm(a.join('/')),
+      basename: (p, ext) => { const b = String(p).replace(/\/+$/, '').split('/').pop(); return ext && b.endsWith(ext) ? b.slice(0, -ext.length) : b; },
+      dirname: (p) => String(p).replace(/\/+$/, '').split('/').slice(0, -1).join('/') || '.',
+      extname: (p) => { const m = /\.[^./]*$/.exec(String(p).split('/').pop()); return m ? m[0] : ''; },
+    };
+    const mods = { fs, 'node:fs': fs, 'fs/promises': fs.promises, 'node:fs/promises': fs.promises, path, 'node:path': path };
+    const require = (n) => { if (n in mods) return mods[n]; throw new Error(`Cannot find module '${n}' (this terminal has fs and path)`); };
+    const process = { argv: ['node', '/script.js', ...(e.data.argv || [])], env: {}, platform: 'browser', cwd: () => '/' + cwd, exit: (c) => { throw { exited: c ?? 0 }; }, stdout: { write: (x) => { out.push(String(x).replace(/\n$/, '')); return true; } }, stderr: { write: (x) => { out.push(String(x).replace(/\n$/, '')); return true; } } };
+    globalThis.files = store;   // the workspace by name, as it always was here
+    try {
+      const code = String(e.data.code).replace(/^#!.*\n/, '');
+      const AsyncFn = Object.getPrototypeOf(async function () {}).constructor;
+      const r = await new AsyncFn('require', 'process', 'module', 'exports', '__filename', '__dirname', code)(require, process, { exports: {} }, {}, '/script.js', '/' + cwd);
+      if (r !== undefined) out.push(fmt([r]));
+      postMessage({ ok: true, out: out.join('\n'), written });
+    } catch (err) {
+      if (err && 'exited' in err) return postMessage({ ok: !err.exited, out: out.join('\n'), written });
+      postMessage({ ok: false, out: out.concat(String((err && err.stack) || err)).join('\n'), written });
+    }
+  };
+}
+function termJs(code, files = S.conv.files, argv = []) {
   return new Promise((res) => {
-    const src = `const __out=[];const __fmt=(a)=>a.map((x)=>typeof x==='string'?x:(()=>{try{return JSON.stringify(x)}catch{return String(x)}})()).join(' ');
-for (const k of ['log','info','warn','error','debug']) console[k]=(...a)=>__out.push(__fmt(a));
-onmessage=async(e)=>{const files=e.data.files;try{const r=await (new (Object.getPrototypeOf(async function(){}).constructor)('files',e.data.code))(files);if(r!==undefined)__out.push(__fmt([r]));postMessage({ok:true,out:__out.join('\\n')})}catch(err){postMessage({ok:false,out:__out.concat(String(err&&err.stack||err)).join('\\n')})}};`;
+    const src = '(' + termJsWorker.toString() + ')()';
     let w;
     try { w = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' }))); } catch (e) { return res({ ok: false, out: 'this browser could not start a worker: ' + e.message }); }
     const timer = setTimeout(() => { w.terminate(); res({ ok: false, out: 'stopped: the script ran for more than 20 seconds' }); }, 20000);
     w.onmessage = (e) => { clearTimeout(timer); w.terminate(); res(e.data); };
     w.onerror = (e) => { clearTimeout(timer); w.terminate(); res({ ok: false, out: String(e.message || 'the script failed to load') }); };
-    w.postMessage({ code, files: S.conv.files });
+    w.postMessage({ code, files, cwd: term.cwd, argv });
   });
 }
 
@@ -2581,6 +2675,8 @@ async function termCommand(argv, stdin, signal, raw) {
   const WIN = { dir: 'ls', copy: 'cp', move: 'mv', del: 'rm', erase: 'rm', ren: 'mv', rename: 'mv', md: 'mkdir', cls: 'clear' };
   let [cmd, ...args] = argv;
   cmd = WIN[cmd?.toLowerCase()] ?? cmd;
+  // a value glued to its flag (grep -m1, -A2, head -n5, cut -d, -f2) is the flag and its value
+  args = args.flatMap((a) => { const m = /^(-[a-zA-Z])(.+)$/s.exec(a); return m && (TERM_TAKES[cmd] ?? []).includes(m[1]) && !/^[a-zA-Z]+$/.test(m[2]) || (m && ['-d', '-f'].includes(m[1]) && cmd === 'cut') ? [m[1], m[2]] : [a]; });
   const flags = new Set(args.filter((a) => /^-[a-zA-Z]+$/.test(a)).flatMap((a) => [...a.slice(1)]));
   const longs = new Map(args.filter((a) => /^--[a-z][\w-]*(=.*)?$/s.test(a)).map((a) => { const k = a.indexOf('='); return k < 0 ? [a, true] : [a.slice(0, k), a.slice(k + 1)]; }));
   const opt = (f) => { const i = args.indexOf(f); return i >= 0 ? args[i + 1] : undefined; };
@@ -2685,11 +2781,16 @@ async function termCommand(argv, stdin, signal, raw) {
       const files = rest.filter((x, i) => !scripts.includes(x) || args[args.indexOf(x) - 1] !== '-e');
       if (!scripts.length) scripts.push(files.shift() ?? '');
       const edits = scripts.flatMap((sc) => sc.split(/;\s*(?=s.)/)).map((sc) => {
-        const m = /^s(.)(.*?)\1(.*?)\1([gI]*)$/i.exec(sc.trim());
+        const m = /^s(.)(.*?)\1(.*?)\1([gIp]*)$/i.exec(sc.trim());
         if (!m) throw new Error(`sed: only s/find/replace/[g] is here (got "${sc}")`);
-        try { return [new RegExp(m[2].replace(/\\([|(){}+?])|([|(){}+?])/g, (x, esc, bare) => (esc ? esc : '\\' + bare)), (m[4].includes('g') ? 'g' : '') + (/[iI]/.test(m[4]) ? 'i' : '')), m[3].replace(/\\(\d)/g, '$$$1').replace(/&/g, '$$&')]; } catch (e) { throw new Error('sed: ' + e.message); }
+        try { return [m[4].includes('p'), new RegExp(m[2].replace(/\\([|(){}+?])|([|(){}+?])/g, (x, esc, bare) => (esc ? esc : '\\' + bare)), (m[4].includes('g') ? 'g' : '') + (/[iI]/.test(m[4]) ? 'i' : '')), m[3].replace(/\\(\d)/g, '$$$1').replace(/&/g, '$$&')]; } catch (e) { throw new Error('sed: ' + e.message); }
       });
-      const apply = (text) => lines(text).map((l) => edits.reduce((x, [re, to]) => x.replace(re, to), l)).join('\n');
+      const quiet = flags.has('n');
+      const apply = (text) => lines(text).flatMap((l) => {
+        let shown = false;
+        const x = edits.reduce((acc, [print, re, to]) => { const y = acc.replace(re, to); if (print && y !== acc) shown = true; re.lastIndex = 0; return y; }, l);
+        return quiet ? (shown ? [x] : []) : shown ? [x, x] : [x];
+      }).join('\n');
       if (flags.has('i') || [...longs.keys()].includes('--in-place')) {
         if (!files.length) throw new Error('sed -i: which file?');
         for (const f of files) { const p = termPath(f); const was = await termRead(p); await termWrite(p, apply(was) + (was.endsWith('\n') ? '\n' : '')); }
@@ -2848,7 +2949,12 @@ async function termCommand(argv, stdin, signal, raw) {
       else if (rest[0]) code = await termRead(termPath(rest[0]));
       else if (stdin) code = stdin;
       else throw new Error('node: give a file, or -e "code"');
-      const r = await termJs(code);
+      // in a repository the script is handed the repository's files, as Python is
+      const given = repo.on() ? (await pyRepoFiles(code)).files : { ...S.conv.files };
+      const r = await termJs(code, given, rest.slice(1));
+      for (const [f, c] of Object.entries(r.written ?? {})) {
+        if (c === null) await runTool('delete_file', { name: f }); else await termWrite(f, c);
+      }
       if (!r.ok) throw Object.assign(new Error(r.out), { printed: true });
       return r.out;
     }
@@ -6197,6 +6303,24 @@ function announces(reply) {
   return promise.test(t) || (last !== t && /[.:…]$|\w$/.test(last) && promise.test(last));
 }
 
+/* A model call failed for a reason that passes (the host or the model was busy, the stream dropped, the network
+   blinked): asked again after a wait, up to MODEL_RETRIES times. A spent daily limit, a refused request or a stop
+   by the user is not asked again. */
+const MODEL_RETRIES = 4;
+const passing = (msg) => /HTTP 5\d\d|HTTP 429|\b5\d\d\b|429|timed? ?out|timeout|network|fetch failed|failed to fetch|load failed|connection|socket|stream|overloaded|capacity|busy|temporarily|try again|internal (?:server )?error|unavailable|gateway|reset|aborted by the host|ECONN/i.test(msg) && !/budget|daily|resets at|limit of|unauthor|log in|not logged|refused your request|content policy/i.test(msg);
+async function callModelSteady(messages, onText, signal) {
+  for (let k = 0; ; k++) {
+    try {
+      return await callModel(messages, onText, signal);
+    } catch (e) {
+      if (signal?.aborted || k >= MODEL_RETRIES || !passing(String(e?.message ?? e))) throw e;
+      const wait = [2, 5, 12, 25][k] * 1000;
+      if (S.live) { S.live.status = `the model call failed (${clip(String(e.message), 80)}); asking again in ${wait / 1000} s (${k + 1} of ${MODEL_RETRIES})…`; drawLive(); }
+      await new Promise((r) => setTimeout(r, wait));
+    }
+  }
+}
+
 async function runTurn(text, images = []) {
   const conv = S.conv;
   conv.plan = [];   // a plan belongs to the turn that made it
@@ -6210,7 +6334,10 @@ async function runTurn(text, images = []) {
   S.live = { tools: [], text: '', status: 'thinking…', abort };
   draw();
   const rounds = [];
-  let answer = '', error = '', review = null, nudged = false, idled = false, checked = false, promised = 0;
+  let answer = '', error = '', review = null, nudged = 0, idled = false, checked = false, promised = 0, looped = 0;
+  // real progress since the last nudge: a tool that ran (not one of the loop's own notes)
+  const progressed = (since) => rounds.slice(since).some((r) => !r.name.startsWith('('));
+  let nudgedAt = -1;
   const record = (name, args, say, result, raw) => rounds.push({ id: 'c' + (rounds.length + 1), name, args, say, result, ...(raw ? { raw } : {}) });
   try {
     if (images.length) {
@@ -6226,22 +6353,25 @@ async function runTurn(text, images = []) {
       S.live.status = (folded ? 'thinking… earlier steps folded by the 4tope' : 'thinking…') + step;
       S.live.text = '';
       drawLive();
-      const reply = await callModel(messages, (t) => { S.live.text = shownWhileStreaming(t); drawLive(); drawStream(t); }, abort.signal);
+      const reply = await callModelSteady(messages, (t) => { S.live.text = shownWhileStreaming(t); drawLive(); drawStream(t); }, abort.signal);
       if (S.live.writing) S.live.writing = null;   // the call is whole now: the tool writes the file itself
       if (!reply) throw new Error(`${S.model.split('/').pop()} answered nothing, even with its reasoning switched off and three times the room. Try another model from the picker.`);
       const act = parseAction(reply);
       if (!act) {
         // "Let me check that first." and then nothing: a model that says what it is about to do and stops has
         // done nothing. It is told so, and to do it (twice at most in a turn).
-        if (announces(reply) && promised < 2 && n < ROUNDS_MAX) {
+        // three in a row at most; a tool that runs in between starts the count again
+        if (promised && progressed(rounds.findLastIndex((r) => r.name === '(said it, did not do it)') + 1)) promised = 0;
+        if (announces(reply) && promised < 3 && n < ROUNDS_MAX) {
           promised++;
           record('(said it, did not do it)', {}, '', 'You said what you were about to do and then stopped: nothing has run. Do it NOW. Reply with exactly ONE JSON object {"tool": "<name>", "args": {...}} and nothing else. If no tool here can do it, say plainly that it cannot be done here, and why.', clip(reply, 600));
           continue;
         }
         // an answer while the plan still has open steps: asked once to carry on, or to say why it cannot
         const open = planOpen(conv.plan);
-        if (open.length && !nudged && n < ROUNDS_MAX) {
-          nudged = true;
+        if (open.length && nudged < 6 && (nudgedAt < 0 || progressed(nudgedAt)) && n < ROUNDS_MAX) {
+          nudged++;
+          nudgedAt = rounds.length + 1;
           record('(answer before the plan was done)', {}, '', `The plan still has ${open.length} open step(s):\n${planText(conv.plan)}\nCarry on with the next open step now. If a step cannot be done, say plainly why and tick the ones that are done.`, clip(reply, 1500));
           continue;
         }
@@ -6283,7 +6413,12 @@ async function runTurn(text, images = []) {
       }
       // the same call failing again and again is a loop, not progress: it is not run a third time
       const same = (r) => r.name === act.tool && JSON.stringify(r.args) === JSON.stringify(act.args) && /^(error|ERROR|FAILED)/.test(r.result);
-      if (rounds.slice(-2).filter(same).length === 2) { answer = `I stopped: the same ${act.tool} call failed three times in a row. The last error was: ${clip(rounds.at(-1).result, 300)}`; break; }
+      if (rounds.slice(-2).filter(same).length === 2) {
+        if (looped >= 2) { answer = `I stopped: the same ${act.tool} call failed three times in a row. The last error was: ${clip(rounds.at(-1).result, 300)}`; break; }
+        looped++;
+        record('(the same call failed again)', {}, '', `That exact ${act.tool} call has now failed three times with the same error, so it was not run again: ${clip(rounds.at(-1).result, 400)}\nDo not send it again. Work out why it fails and take a different route: other arguments, another tool, or a smaller step. If the goal cannot be reached here, say so plainly.`, clip(reply, 600));
+        continue;
+      }
       const chip = { name: act.tool, args: act.args, result: '', failed: false, running: true };
       S.live.tools.push(chip);
       S.live.text = '';

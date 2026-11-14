@@ -108,7 +108,7 @@
 // No imports and no platform globals beyond fetch/Response/crypto, so a test can run this file under node with
 // a Map for storage and a scripted env.AI.
 
-export const VERSION = "19";
+export const VERSION = "20";
 const API_ROOT = "https://api.cloudflare.com/client/v4";
 const PY_SOURCE = "https://raw.githubusercontent.com/gary23w/nl-veil/main/cloud/tot_py.py";
 const SELF_SCRIPT = "veil-web";
@@ -134,6 +134,12 @@ const JOB_ROUNDS = 24; // tool calls one job may make
 const ALARM_STEPS = 6; // model calls one alarm makes before handing over to the next alarm
 const JOB_LOOP_BYTES = 40000; // a job's messages; older rounds go first
 const RESULT_MAX = 10000;
+// the sight check: a plain red and a plain blue 64x64 PNG, and how long a model's verdict is kept
+const SIGHT_RED = "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAT0lEQVR42u3PQQkAAAgEsAtx/ZMZxgi+hcEKLNO+FgEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQGBywKqxUDxqh7TUQAAAABJRU5ErkJggg==";
+const SIGHT_BLUE = "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAUElEQVR42u3PQQkAAAgEsAthCPvnMYwRfAuDFViq57UICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICFwWbcSBAMU++S8AAAAASUVORK5CYII=";
+const SIGHT_CHECK_MS = 7 * 24 * 60 * 60 * 1000;
+// what a page put up in front of a datacenter address says (a bot check, a JavaScript gate, a refusal)
+const CHALLENGE = /just a moment|checking your browser|enable javascript|javascript is (?:disabled|required)|are you a (?:robot|human)|verify you are (?:a )?human|captcha|access denied|cf-chl|attention required|request blocked|unusual traffic/i;
 const LOCAL_WAITING = "waiting for the owner's machine"; // a local job's note until a machine takes it
 const LOCAL_RUNNING = "running on the owner's machine";
 export const NODES_MAX = 16; // nodes one harness lists; the one unseen longest goes first
@@ -244,7 +250,8 @@ function cors(req, env) {
 
 /// A page's HTML as the text a reader would see.
 function readable(html) {
-  return String(html)
+  const title = /<title[^>]*>([\s\S]*?)<\/title>/i.exec(String(html))?.[1]?.replace(/\s+/g, " ").trim();
+  return (title ? title + "\n\n" : "") + String(html)
     .replace(/<(script|style|noscript|svg|head)[\s\S]*?<\/\1>/gi, " ")
     .replace(/<\/(p|div|li|tr|h[1-6]|section|article)>|<br\s*\/?>/gi, "\n")
     .replace(/<[^>]+>/g, " ")
@@ -979,7 +986,9 @@ export class Harness {
     const out = { status: r.status, content_type: type, url: r.url || u.toString(), text };
     // A site that refuses Cloudflare's addresses answers a block status or an empty shell. A plain page read
     // then falls back to the Internet Archive's newest copy, and says so: it may be days or months old.
-    const refused = BLOCKED.has(r.status) || (/html/i.test(type) && text.trim().length < 200);
+    // a short page is not a refusal by itself: only an empty one, or a challenge page, is
+    const shown = text.trim().length;
+    const refused = BLOCKED.has(r.status) || (/html/i.test(type) && (shown < 40 || (shown < 600 && CHALLENGE.test(raw))));
     if (!refused) return out;
     out.blocked = true;
     if (method !== "GET" || spec.raw === true || spec.archive === false) return out;
@@ -1688,7 +1697,8 @@ export class Harness {
       edit: ids(models.filter((m) => m.init || m.refs > 0)),
       inpaint: ids(models.filter((m) => m.init && m.mask)),
       // to read a picture: one that has answered before, then one made for it, then the rest
-      look: ids(cat.vision.map((v) => ({ ...v, lead: health[v.id]?.ok > 0 ? 2 : v.dedicated ? 1 : 0 }))),
+      // a model that failed the sight check goes last, whatever else it has answered
+      look: ids(cat.vision.map((v) => ({ ...v, lead: quirks[v.id]?.sight?.ok === false ? -1 : quirks[v.id]?.sight?.ok ? 3 : health[v.id]?.ok > 0 ? 2 : v.dedicated ? 1 : 0 }))),
       speak: ids((cat.voices ?? []).map((v) => ({ ...v, lead: speaks(v, "en") }))),
     };
     return { ...cat, models, vision: cat.vision.map((v) => ({ ...v, health: brief(v.id) })), voices: (cat.voices ?? []).map((v) => ({ ...v, health: brief(v.id) })), order, picks: Object.fromEntries(Object.entries(order).map(([k, v]) => [k, v[0] ?? ""])) };
@@ -1909,8 +1919,32 @@ export class Harness {
     return out ? { audio: out.audio, type: out.type, model } : { err: "no speech came back: " + why };
   }
 
+  /// Left to choose, the harness only reads a picture with a model that has passed its sight check.
   look(body, who) {
-    return this.chosen(body, who, "look", (b) => this.lookOne(b));
+    const auto = !body.model || body.model === "auto";
+    return this.chosen(body, who, "look", async (b) => {
+      if (auto && !(await this.sees(b.model))) return { err: "it failed the harness's sight check (it misread a plain red or blue picture), so it is not trusted to read pictures" };
+      return this.lookOne(b);
+    });
+  }
+
+  /// Whether a vision model really reads what is in a picture: shown a plain red and a plain blue picture, it has to
+  /// name both colours. A model that answers without error can still answer about a picture it never saw. The
+  /// verdict is kept on the model for SIGHT_CHECK_MS; a model that could not be asked at all is not judged.
+  async sees(model) {
+    const quirks = (await this.store.get("quirks")) ?? {};
+    const was = quirks[model]?.sight;
+    if (was && Date.now() - was.at < SIGHT_CHECK_MS) return was.ok;
+    const q = "What single colour fills this picture? Answer with one word.";
+    const red = await this.lookOne({ model, image: "data:image/png;base64," + SIGHT_RED, question: q });
+    if (red.err) return true;
+    const blue = await this.lookOne({ model, image: "data:image/png;base64," + SIGHT_BLUE, question: q });
+    if (blue.err) return true;
+    const ok = /\bred\b/i.test(red.text) && /\bblue\b/i.test(blue.text) && !/\bblue\b/i.test(red.text) && !/\bred\b/i.test(blue.text);
+    const now = (await this.store.get("quirks")) ?? {};
+    now[model] = { ...now[model], sight: { ok, at: Date.now(), said: clip(`${red.text} / ${blue.text}`, 160) } };
+    await this.store.put("quirks", now);
+    return ok;
   }
 
   /// One picture from words, or from words and pictures (an edit, or a new picture that takes after them).
