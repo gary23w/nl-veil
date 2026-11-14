@@ -1708,9 +1708,15 @@ async function repoBranch() {
 
 /* Mounts a folder handle as this conversation's workspace. A conversation that already has files of its own
    keeps them: the repo opens in a new conversation. */
-async function repoMount(root, kind, name = root.name) {
-  if (S.live) return toast('Wait for the running turn to end.');
-  if (S.conv.repo || Object.keys(S.conv.files).length || S.conv.msgs.length) newConv();   // a chat with a workspace of its own keeps it
+/* `here`: the chat itself asked for it (git clone from its tools, mid-turn): the folder becomes THIS chat's
+   workspace, so the turn that asked goes on in it. The files the chat had written are kept aside on the chat. */
+async function repoMount(root, kind, name = root.name, { here = false } = {}) {
+  if (!here) {
+    if (S.live) return toast('Wait for the running turn to end.');
+    if (S.conv.repo || Object.keys(S.conv.files).length || S.conv.msgs.length) newConv();   // a chat with a workspace of its own keeps it
+  } else if (!S.conv.repo && Object.keys(S.conv.files).length) {
+    S.conv.filesBefore = { ...(S.conv.filesBefore ?? {}), ...S.conv.files };
+  }
   repoClose();
   Object.assign(repo, { root, kind, name });
   S.conv.repo = { name, kind };
@@ -2289,8 +2295,9 @@ async function gitClone(url, { ref = '', name: want = '', strict = false } = {})
     return fail(/401|403|auth|cancel/i.test(e.message) ? 'The git host wants a login for that repository (or it does not exist): add a token under “Git token” in the Code tab, then clone again.' : 'Clone failed: ' + e.message);
   }
   gitx.busy = '';
-  await repoMount(dir, 'private', name);
-  return { name, files: repo.paths.length, branch: repo.branch };
+  await repoMount(dir, 'private', name, { here: strict });
+  if (!repo.on() || repo.name !== name) return fail(`the clone was made but could not be opened as the workspace`);
+  return { name, files: repo.paths.length, branch: repo.branch, kept: Object.keys(S.conv.filesBefore ?? {}).length };
 }
 
 /* What differs from the last commit: [{path, state}], state one of added, changed, deleted. */
@@ -2865,7 +2872,7 @@ async function termCommand(argv, stdin, signal, raw) {
         const got = await gitClone(url, { strict: true, name, ref: typeof ref === 'string' ? ref : '' });
         term.cwd = '';
         if (name) repo.alias = name;
-        return `Cloned ${url} (${got.files} files, branch ${got.branch || 'default'}). The clone is now this chat's workspace: its files are at the top (ls shows them), and "${got.name}/..."${name && name !== got.name ? ` or "${name}/..."` : ''} names the same files. Read and search them with the file tools or here; git status / commit / push work in it.`;
+        return `Cloned ${url} (${got.files} files, branch ${got.branch || 'default'}). The clone is now this chat's workspace: its files are at the top (ls shows them), and "${got.name}/..."${name && name !== got.name ? ` or "${name}/..."` : ''} names the same files. Read and search them with the file tools or here; git status / commit / push work in it.${got.kept ? ` The ${got.kept} file${got.kept === 1 ? '' : 's'} this chat had written before ${got.kept === 1 ? 'is' : 'are'} kept aside on the chat.` : ''}`;
       }
       if (!repo.on()) throw new Error('git: no repository is open (git clone <address>, or Clone repo)');
       if (repo.kind === 'disk') { if (sub === 'branch' || sub === 'status') return `on ${repo.branch || '(no branch)'}\n(this is a folder on your computer: commit and push with your own git there)`; return termRemote(raw ?? argv.join(' '), signal); }
