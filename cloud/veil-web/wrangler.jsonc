@@ -11,6 +11,6 @@
   // the queue, the usage counters and the limits: one Durable Object
   "durable_objects": { "bindings": [{ "name": "HARNESS", "class_name": "Harness" }] },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Harness"] }],
-  // the one page this Worker answers across origins (the web veil)
-  "vars": { "ALLOW_ORIGIN": "https://veil.garrettstimpson.ca" }
+  // the pages this Worker answers across origins (the web veil at the site's address, and at its old one while both are in use)
+  "vars": { "ALLOW_ORIGIN": "https://veil.garrettstimpson.ca,https://gary23w.github.io" }
 }

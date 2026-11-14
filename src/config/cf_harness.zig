@@ -88,7 +88,7 @@ const HARNESS_JS = @embedFile("veil-web.js");
 const MODULE = "veil-web.js"; // wrangler.jsonc "main"
 const COMPAT_DATE = "2025-09-01"; // wrangler.jsonc, and veil-web.js COMPAT_DATE
 const MIGRATION_TAG = "v1"; // wrangler.jsonc: the migration that creates the Harness class, accepted once per script
-const ALLOW_ORIGIN = "https://veil.garrettstimpson.ca"; // wrangler.jsonc vars: the page whose cross-origin calls the harness answers
+const ALLOW_ORIGIN = "https://veil.garrettstimpson.ca,https://gary23w.github.io"; // wrangler.jsonc vars: the pages whose cross-origin calls the harness answers (the site's address, and its old one while both are in use)
 /// After an upload, how long this server waits for the new address to answer, and how often it asks.
 const DEPLOY_WAIT_MS: u64 = 24_000;
 const DEPLOY_ASK_MS: u64 = 3_000;
@@ -1784,7 +1784,7 @@ test "deploying the harness: the upload is what wrangler.jsonc declares, the cla
     try tt.expectEqualStrings("ai", m.bindings[0].type);
     try tt.expectEqualStrings("Harness", m.bindings[1].class_name);
     try tt.expectEqualStrings("ALLOW_ORIGIN", m.bindings[2].name);
-    try tt.expectEqualStrings("https://veil.garrettstimpson.ca", m.bindings[2].text);
+    try tt.expectEqualStrings("https://veil.garrettstimpson.ca,https://gary23w.github.io", m.bindings[2].text);
     try tt.expectEqualStrings("secret_text", m.keep_bindings[0]);
     try tt.expectEqualStrings("v1", m.migrations.?.new_tag);
     try tt.expectEqualStrings("Harness", m.migrations.?.new_sqlite_classes[0]);
