@@ -1985,8 +1985,10 @@ fn wordJumpRight(f: *const Ui.Field) usize {
 
 // -------------------------------------------------------------------------------- tab bar
 
+/// The web chat: the veil in a browser, on the user's own live runtime (their harness Worker).
+pub const web_chat_url = "https://gary23w.github.io/nl-veil/chat/";
+
 fn drawTabbar(store: *Store) void {
-    _ = store;
     const sw: f32 = @floatFromInt(rl.getScreenWidth());
     t.fillRect(0, TITLE_H, @intFromFloat(sw), TAB_H, t.bg_dark);
     t.hline(0, TITLE_H + TAB_H - 1, @intFromFloat(sw), t.border);
@@ -1998,6 +2000,14 @@ fn drawTabbar(store: *Store) void {
         const r = t.Rect{ .x = x, .y = TITLE_H + 5, .width = w, .height = TAB_H - 10 };
         if (t.tab(r, lb, ui.tab == tabv)) setTab(tabv);
         x += w + 6;
+    }
+    // At the right end: the web chat, opened in the user's browser. Shown only where it fits beside the tabs.
+    const web = t.z("Web chat", .{});
+    const ww = t.tabW(web);
+    const wx = sw - t.PAD - ww;
+    if (wx >= x + 12) {
+        if (t.buttonGhost(.{ .x = wx, .y = TITLE_H + 5, .width = ww, .height = TAB_H - 10 }, web, t.blue, true))
+            store.pushCmd(store_mod.mkCmd(.open_url, "", web_chat_url));
     }
 }
 
