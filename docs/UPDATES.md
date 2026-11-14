@@ -1,5 +1,9 @@
 # Desktop updates and release connectivity
 
+## v1.1.31
+
+Nothing to do after updating. The desk's tab bar has a **Web chat** button that opens the web chat. When you are logged in to Cloudflare, the desk's **Tasks** tab has a **Web harness** view for your web chat's harness, with a **Deploy my runtime** button if you have none yet. A desktop veil runs tasks sent to it from your other veils only after you turn that on. [Release details](release/RELEASE-v1.1.31.md).
+
 ## v1.1.30
 
 If you are logged in to Cloudflare, clef mode is on after updating: a chat turn's yes/no decisions go first to Cloudflare's Clef model on your own login, and to the chat model when Clef is not sure. To turn it off, use the desk's **clef mode** toggle in Settings or the **Clef mode** box in the web app's server configuration, or set `NL_CLEF=0` before the first start. Nothing changes for a user who is not logged in to Cloudflare. [Release details](release/RELEASE-v1.1.30.md).
