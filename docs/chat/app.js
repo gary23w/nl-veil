@@ -6191,7 +6191,10 @@ function shownWhileStreaming(t) {
 function announces(reply) {
   const t = reply.trim();
   if (t.length > 400 || /\?\s*$/.test(t) || /```/.test(t)) return false;
-  return /^(?:(?:ok(?:ay)?|sure|alright|right|got it|understood|of course|certainly)[,.! ]+)?(?:let me\b(?! know)|let['’]s\b|i['’]ll\b|i will\b|i['’]m going to\b|i am going to\b|first,? (?:let me|i['’]ll|i will)\b|now,? (?:let me|i['’]ll|i will)\b|one moment\b|just a moment\b|checking\b|looking\b|running\b|searching\b)/i.test(t);
+  const promise = /^(?:(?:ok(?:ay)?|sure|alright|right|got it|understood|of course|certainly|great|good|done)[,.! ]+)?(?:let me\b(?! know)|let['’]s\b|i['’]ll\b|i will\b|i['’]m going to\b|i am going to\b|first,? (?:let me|i['’]ll|i will)\b|(?:now|next|then),? (?:let me|i['’]ll|i will|i need to)\b|one moment\b|just a moment\b|checking\b|looking\b|running\b|searching\b)/i;
+  // the promise may close a reply that first says what was done ("The clone is done. Now let me look at…")
+  const last = t.split(/(?<=[.!:])\s+/).filter(Boolean).pop() ?? t;
+  return promise.test(t) || (last !== t && /[.:…]$|\w$/.test(last) && promise.test(last));
 }
 
 async function runTurn(text, images = []) {
