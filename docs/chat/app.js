@@ -882,7 +882,7 @@ const TOOLS = {
   swarm_resume: { args: '{"id": "<swarm>"}', does: 'resume a paused swarm', when: () => swarmOn() },
   swarm_goal: { args: '{"id": "<swarm>", "goal": "<the new goal: what done looks like>"}', does: 'give a running or paused swarm a new goal; it works toward it from its next round', when: () => swarmOn() },
   swarm_delete: { args: '{"id": "<swarm>"}', does: 'delete a swarm that has ended, with its record and files (stop a live one first)', when: () => swarmOn() },
-  run_command: { args: '{"command": "<one line>"}', does: 'run a line in the workspace terminal and get what it printed. It is a small shell over the workspace: pipes, && || ;, > file, $VARS; ls cat grep find sed sort head tail wc diff tree; python file.py, pip install name, node file.js, curl url, git status|commit|push (a clone); uname, date, env. A command that needs a real computer (npm, gcc, docker) is sent to one of the machines the user owns when one is online and set to run work; otherwise it says so' },
+  run_command: { args: '{"command": "<a line, or several>"}', does: 'run shell lines in the workspace terminal and get what they printed. It is a small shell over the workspace (no operating system under it): pipes, && || ;, > file, 2>/dev/null, 2>&1, heredocs (cat > f <<\'EOF\' … EOF), for/if/while, $VARS; ls [-laR] cat grep [-rnilcvwoE --include] find [-name -type -maxdepth] sed sort head tail wc diff tree mkdir cp mv rm; python file.py, pip install name, node file.js, curl url. git clone <https url> [name] downloads a repository and makes it the workspace: its files are then at the top (ls), and git status|commit|push work in it. No tar/unzip: clone a repository instead of downloading its archive. A command that needs a real computer (npm, gcc, docker) is sent to one of the machines the user owns when one is online and set to run work; otherwise it says so' },
   run_python: { args: '{"code": "<python>"}', does: 'run a Python script; the workspace files are beside it and text files it creates or changes come back into the workspace. Print what you want to see' },
   garrett_tools: { args: '{"query": "<words, optional>"}', does: 'list Agent Garrett\'s security tools (those matching the words)', when: () => S.status?.garrett?.connected },
   garrett: { args: '{"name": "<tool>", "args": {...}}', does: 'call one of Agent Garrett\'s tools', when: () => S.status?.garrett?.connected },
@@ -977,7 +977,7 @@ async function runToolInner(name, args, signal) {
       termPrint('veil $ ' + line, 'in');
       const r = await termRun(line, signal);
       if (r.out) termPrint(r.out, r.ok ? 'out' : 'err');
-      return (r.ok ? '' : 'error: ') + (r.out || '(no output)');
+      return r.ok ? r.out || '(no output)' : 'error: ' + (r.out || '(it printed nothing; exit status 1: for grep, no line matched)');
     }
     case 'find_files': {
       const hits = findPaths(String(args.query ?? args.pattern ?? args.name ?? ''), 80);
@@ -2259,31 +2259,36 @@ const gitHttp = {
 const gitAuth = () => (gitx.token ? { username: gitx.token, password: 'x-oauth-basic' } : { cancel: true });
 const gitSay = (text) => { gitx.busy = text; const el = document.getElementById('gitBusy') ?? document.getElementById('repoBusy'); if (el) el.textContent = text; else drawSide(); };
 
-/* Clones `url` (its newest commit) into a private folder and opens it as the workspace. */
-async function gitClone(url) {
+/* Clones `url` (its newest commit) into a private folder and opens it as the workspace. From the Code tab a failure
+   is a toast; with `strict` (the shell, the chat's tools) it is thrown, so whoever asked reads why. `ref` clones that
+   branch, `name` names the workspace. Resolves {name, files, branch}. */
+async function gitClone(url, { ref = '', name: want = '', strict = false } = {}) {
+  const fail = (msg) => { if (strict) throw new Error(msg); toast(msg); return null; };
   let u;
-  try { u = new URL(String(url).trim()); } catch { return toast('That is not a repository URL.'); }
-  if (u.protocol !== 'https:') return toast('Give the repository\'s https address.');
-  if (!S.status || Number(S.status.version) < 9) return toast('Update your harness first: cloning goes through it.');
-  const name = (u.pathname.replace(/\.git$/, '').split('/').filter(Boolean).pop() || 'repo').replace(/[^\w.-]/g, '-').slice(0, 60);
+  try { u = new URL(String(url).trim()); } catch { return fail('That is not a repository URL: give its https address, like https://github.com/owner/name'); }
+  if (u.protocol !== 'https:') return fail('Give the repository\'s https address.');
+  if (!S.status || Number(S.status.version) < 9) return fail('Update your harness first (Harness tab): cloning goes through it.');
+  const name = (String(want).replace(/\/+$/, '').split('/').pop() || u.pathname.replace(/\.git$/, '').split('/').filter(Boolean).pop() || 'repo').replace(/[^\w.-]/g, '-').slice(0, 60);
   let git;
-  try { git = await gitLib(); } catch (e) { return toast(e.message); }
-  const store = await (await navigator.storage.getDirectory()).getDirectoryHandle('repos', { create: true });
+  try { git = await gitLib(); } catch (e) { return fail('git could not be loaded in this tab: ' + e.message); }
+  let store;
+  try { store = await (await navigator.storage.getDirectory()).getDirectoryHandle('repos', { create: true }); } catch (e) { return fail('this browser keeps no private folders for a clone (' + e.message + '). Use Open folder in the Code tab instead.'); }
   const folder = name + '-' + Date.now().toString(36);
   const dir = await store.getDirectoryHandle(folder, { create: true });
   S.tab = 'code';
   gitSay('cloning ' + name + '…');
   try {
-    await git.clone({ fs: gitFs(dir), http: gitHttp, dir: '/', url: u.toString(), depth: 1, singleBranch: true, onAuth: gitAuth,
+    await git.clone({ fs: gitFs(dir), http: gitHttp, dir: '/', url: u.toString(), depth: 1, singleBranch: true, ...(ref ? { ref } : {}), onAuth: gitAuth,
       onProgress: (p) => gitSay(`cloning ${name}: ${p.phase}${p.total ? ` ${Math.round((p.loaded / p.total) * 100)}%` : p.loaded ? ' ' + p.loaded : ''}`) });
   } catch (e) {
     gitx.busy = '';
     await store.removeEntry(folder, { recursive: true }).catch(() => {});
     drawSide();
-    return toast(/401|403|auth|cancel/i.test(e.message) ? 'The git host wants a login for that repository: add a token under “Git token”, then clone again.' : 'Clone failed: ' + e.message);
+    return fail(/401|403|auth|cancel/i.test(e.message) ? 'The git host wants a login for that repository (or it does not exist): add a token under “Git token” in the Code tab, then clone again.' : 'Clone failed: ' + e.message);
   }
   gitx.busy = '';
   await repoMount(dir, 'private', name);
+  return { name, files: repo.paths.length, branch: repo.branch };
 }
 
 /* What differs from the last commit: [{path, state}], state one of added, changed, deleted. */
@@ -2397,9 +2402,12 @@ const termPrint = (text, kind = 'out') => {
 const termPath = (p = '') => {
   const parts = [];
   for (const seg of (p.startsWith('/') ? p : term.cwd + '/' + p).split('/')) {
-    if (!seg || seg === '.') continue;
+    if (!seg || seg === '.' || seg === '~') continue;
     if (seg === '..') parts.pop(); else parts.push(seg);
   }
+  // the open repository is the workspace itself: "<its name>/x" (how a shell after git clone names it) is "x",
+  // and so are the usual names of a workspace (/workspace, ~/repo, /tmp are not places here)
+  if (parts.length && (repo.on() ? [repo.name, ...(repo.alias ? [repo.alias] : [])] : []).concat(['workspace', 'home', 'root']).includes(parts[0]) && !termAll().some((f) => f === parts[0] || f.startsWith(parts[0] + '/'))) parts.shift();
   return parts.join('/');
 };
 const termAll = () => (repo.on() ? repo.paths : Object.keys(S.conv.files).sort());
@@ -2440,6 +2448,24 @@ function termTokens(line) {
   for (let i = 0; i < line.length; i++) {
     const ch = line[i];
     if (quote === "'") { if (ch === "'") quote = ''; else cur += ch; continue; }
+    if ((ch === '$' && line[i + 1] === '(' && line[i + 2] !== '(') || (ch === '`' && quote !== "'")) {
+      // a command's output in place of it: the text inside, to its matching ) or `, is run when the word is used
+      let depth = 0, j = i + (ch === '$' ? 2 : 1), q = '';
+      for (; j < line.length; j++) {
+        const c = line[j];
+        if (q) { if (c === q) q = ''; continue; }
+        if (c === "'" || c === '"') { q = c; continue; }
+        if (ch === '`') { if (c === '`') break; continue; }
+        if (c === '(') depth++;
+        else if (c === ')') { if (depth === 0) break; depth--; }
+      }
+      if (j >= line.length) throw new Error('syntax error: ' + (ch === '$' ? '$( has no closing )' : 'a ` has no closing `'));
+      termSubs.push(line.slice(i + (ch === '$' ? 2 : 1), j));
+      cur += (quote === '"' ? '\u0004' : '\u0005') + (termSubs.length - 1) + (quote === '"' ? '\u0004' : '\u0005');
+      had = true;
+      i = j;
+      continue;
+    }
     if (ch === '$' && /[A-Za-z_?{]/.test(line[i + 1] ?? '')) {
       const m = /^\$(?:\{([A-Za-z_]\w*)\}|([A-Za-z_]\w*)|(\?))/.exec(line.slice(i));
       if (m) { cur += '\u0001' + (m[1] ?? m[2] ?? m[3]) + '\u0002'; had = true; i += m[0].length - 1; continue; }
@@ -2447,11 +2473,15 @@ function termTokens(line) {
     if (quote === '"') { if (ch === '"') quote = ''; else if (ch === '\\' && '"\\$`'.includes(line[i + 1] ?? '')) cur += line[++i]; else cur += ch; continue; }
     if (ch === '"' || ch === "'") { quote = ch; had = true; continue; }
     if (ch === '\\' && i + 1 < line.length) { cur += line[++i]; continue; }
+    if (ch === '\n') { push(); out.push({ op: ';' }); continue; }
     if (/\s/.test(ch)) { push(); continue; }
-    if (ch === '#' && !cur && !had) break;   // a comment to the end of the line
+    if (ch === '#' && !cur && !had) { while (i + 1 < line.length && line[i + 1] !== '\n') i++; continue; }   // a comment to the end of the line
+    if (ch === '\u0003') { push(); const m = /^\u0003(\d+)\u0003/.exec(line.slice(i)); out.push({ op: '<<', doc: Number(m[1]) }); i += m[0].length - 1; continue; }
     const two = line.slice(i, i + 2);
+    if (line.slice(i, i + 4) === '2>&1' && !cur) { push(); out.push({ op: '2>&1' }); i += 3; continue; }
+    if ((two === '2>' || two === '&>') && !cur) { push(); const app = line[i + 2] === '>'; out.push({ op: two === '&>' ? '&>' : '2>' }); i += app ? 2 : 1; continue; }
+    if (line.slice(i, i + 3) === '>&2') { push(); i += 2; continue; }   // to standard error: shown all the same
     if (two === '&&' || two === '||' || two === '>>') { push(); out.push({ op: two }); i++; continue; }
-    if (two === '2>') { push(); i += line.slice(i + 2, i + 4) === '&1' ? 3 : 1; if (line.slice(i - 1, i + 1) !== '&1') out.push({ op: '2>' }); continue; }
     if (ch === '|' || ch === ';' || ch === '>' || ch === '<' || ch === '&') { push(); if (ch !== '&') out.push({ op: ch }); continue; }
     if (ch === '*' || ch === '?') glob = true;
     cur += ch;
@@ -2459,6 +2489,8 @@ function termTokens(line) {
   push();
   return out;
 }
+
+const termSubs = [];   // the text of each $( ) met while cutting a line into words
 
 /* The variables in a word, read now. */
 const termVars = (w) => w.replace(/\u0001([^\u0002]*)\u0002/g, (m, name) => (name === '?' ? String(termStatus) : name === 'PWD' ? '/' + term.cwd : termEnv[name] ?? ''));
@@ -2477,13 +2509,15 @@ function termGlob(word) {
   return seen.size ? [...seen].sort() : [word];
 }
 
-const TERM_HELP = `Files    ls [-la] [dir] · cd · pwd · cat · head/tail [-n N] · touch · mkdir · rm [-r] · mv · cp · find [text] · tree · du · stat · open file
-Text     echo · printf · grep [-i -n -v -c] · sort [-r -n -u] · uniq [-c] · cut -d X -f N · tr · sed s/a/b/[g] · wc [-l -w -c] · nl · rev · tee · seq · diff a b · base64 [-d] · sha256sum · xargs
+const TERM_HELP = `Files    ls [-laR] [dir] · cd · pwd · cat · head/tail [-n N -c N] · touch · mkdir [-p] · rm [-r] · mv · cp · find [dir] [-name -type f|d -maxdepth N -path] · tree · du · stat · open file
+Text     echo · printf · grep [-rnilcvwoEF --include=*.x] · sed [-i] s/a/b/[g] · sort [-r -n -u] · uniq [-c] · cut -d X -f N · tr · wc [-l -w -c] · nl · rev · tee · seq · diff a b · base64 [-d] · sha256sum · xargs
 Run      python file.py | python -c "code"  ·  pip install name  ·  node file.js | node -e "code"
 Network  curl [-o file] url · wget url (through your harness)
-Git      git status | add | commit -m "msg" | log | pull | push | branch | clone url   (a cloned repo)
+Git      git clone url [name] [-b branch]: the clone becomes the workspace (its files at the top; "name/" works too)
+         git status | add | commit -m "msg" | log | pull | push | branch   (in a clone)
 System   uname [-a] · hostname · whoami · date · env · export NAME=value · unset · which · sleep N · test · true · false · time cmd · history · clear · help
-Shell    a | b   a && b   a || b   a ; b   > file   >> file   < file   $NAME   "quotes"   *.js
+Shell    a | b   a && b   a || b   a ; b   > file   >> file   < file   2>/dev/null   2>&1   cat <<'EOF' … EOF   $NAME   "quotes"   *.js
+         for x in a b; do …; done   if [ -f x ]; then …; else …; fi   while …; do …; done   (one line or several)
 Windows  dir · type · copy · move · del · ren · md · cls · ver work too
 This runs in your browser tab and your harness, not on a computer. A command that needs a real machine (npm, gcc,
 docker, apt...) is sent to one of your own machines when a desktop veil of yours is online and set to run work.`;
@@ -2539,9 +2573,10 @@ async function termCommand(argv, stdin, signal, raw) {
   let [cmd, ...args] = argv;
   cmd = WIN[cmd?.toLowerCase()] ?? cmd;
   const flags = new Set(args.filter((a) => /^-[a-zA-Z]+$/.test(a)).flatMap((a) => [...a.slice(1)]));
+  const longs = new Map(args.filter((a) => /^--[a-z][\w-]*(=.*)?$/s.test(a)).map((a) => { const k = a.indexOf('='); return k < 0 ? [a, true] : [a.slice(0, k), a.slice(k + 1)]; }));
   const opt = (f) => { const i = args.indexOf(f); return i >= 0 ? args[i + 1] : undefined; };
   const takes = TERM_TAKES[cmd] ?? [];
-  const rest = args.filter((a, i) => !/^-[a-zA-Z]+$/.test(a) && !(i > 0 && takes.includes(args[i - 1])));
+  const rest = args.filter((a, i) => !/^-[a-zA-Z]+$/.test(a) && !/^--[a-z][\w-]*(=.*)?$/s.test(a) && !(i > 0 && takes.includes(args[i - 1])));
   const count = (def) => Math.max(0, Number(opt('-n')) || def);
   const lines = (t) => String(t).replace(/\n$/, '').split('\n');
   /* the text a filter works on: the files named, or what was piped in */
@@ -2593,6 +2628,7 @@ async function termCommand(argv, stdin, signal, raw) {
       return '';
     }
     case 'ls': {
+      if (flags.has('R')) { const top = termPath(rest[0] ?? ''); if (!termIsDir(top)) throw new Error(`ls: ${rest[0]}: no such folder`); const under = top ? top + '/' : ''; const all = termAll().filter((f) => f.startsWith(under) && (flags.has('a') || !f.slice(under.length).split('/').some((x) => x.startsWith('.')))); return all.slice(0, 2000).map((f) => f.slice(under.length)).join('\n') + (all.length > 2000 ? `\n… ${all.length - 2000} more` : ''); }
       const targets = rest.length ? rest : [''];
       const out = [];
       for (const t of targets) {
@@ -2620,7 +2656,8 @@ async function termCommand(argv, stdin, signal, raw) {
     case 'rev': return lines(await input()).map((l) => [...l].reverse().join('')).join('\n');
     case 'nl': return lines(await input()).map((l, i) => `${String(i + 1).padStart(6)}\t${l}`).join('\n');
     case 'head': case 'tail': {
-      const names = args.filter((a, i) => !a.startsWith('-') && args[i - 1] !== '-n');
+      const names = args.filter((a, i) => !a.startsWith('-') && args[i - 1] !== '-n' && args[i - 1] !== '-c');
+      if (opt('-c') !== undefined) { const c = Math.max(0, Number(opt('-c')) || 0), text = await input(names); return cmd === 'head' ? text.slice(0, c) : text.slice(-c); }
       const n = Number(/^-(\d+)$/.exec(args.find((a) => /^-\d+$/.test(a)) ?? '')?.[1]) || count(10);
       const ls = lines(await input(names));
       return (cmd === 'head' ? ls.slice(0, n) : ls.slice(-n)).join('\n');
@@ -2635,37 +2672,105 @@ async function termCommand(argv, stdin, signal, raw) {
     case 'cut': { const d = opt('-d') ?? '\t', f = String(opt('-f') ?? '1').split(',').map((x) => Number(x) - 1); return lines(await input(args.filter((a, i) => !a.startsWith('-') && !['-d', '-f'].includes(args[i - 1])))).map((l) => f.map((i) => l.split(d)[i] ?? '').join(d)).join('\n'); }
     case 'tr': { const text = stdin; if (flags.has('d')) { const set = new Set([...(rest[0] ?? '')]); return [...text].filter((c) => !set.has(c)).join(''); } const [a = '', b = ''] = rest.map((x) => x.replace(/a-z/g, 'abcdefghijklmnopqrstuvwxyz').replace(/A-Z/g, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ').replace(/\\n/g, '\n')); return [...text].map((c) => { const i = a.indexOf(c); return i < 0 ? c : b[Math.min(i, b.length - 1)] ?? ''; }).join(''); }
     case 'sed': {
-      const script = rest[0] ?? '';
-      const m = /^s(.)(.*?)\1(.*?)\1([gi]*)$/.exec(script);
-      if (!m) throw new Error('sed: only s/find/replace/[g] is here');
-      let re;
-      try { re = new RegExp(m[2], m[4].includes('g') ? 'g' + (m[4].includes('i') ? 'i' : '') : m[4].includes('i') ? 'i' : ''); } catch (e) { throw new Error('sed: ' + e.message); }
-      return lines(await input(rest.slice(1))).map((l) => l.replace(re, m[3].replace(/\\(\d)/g, '$$$1'))).join('\n');
-    }
-    case 'grep': {
-      const pattern = rest[0];
-      if (pattern === undefined) throw new Error('grep: what text?');
-      const targets = rest.slice(1);
-      const test = (l) => (flags.has('i') ? l.toLowerCase().includes(pattern.toLowerCase()) : l.includes(pattern)) !== flags.has('v');
-      if (!targets.length && (stdinPiped || stdin)) { const hit = lines(stdin).map((l, i) => [i + 1, l]).filter(([, l]) => test(l)); if (!hit.length) throw new Error(''); return flags.has('c') ? String(hit.length) : hit.map(([n, l]) => (flags.has('n') ? n + ':' : '') + l).join('\n'); }
-      const target = targets[0] !== undefined ? termPath(targets[0]) : term.cwd;
-      if (targets.length && targets.every((t) => termIsFile(termPath(t)))) {
-        const out = [];
-        for (const t of targets) for (const [n, l] of lines(await termRead(termPath(t))).map((l, i) => [i + 1, l])) if (test(l)) out.push((targets.length > 1 ? t + ':' : '') + (flags.has('n') ? n + ':' : '') + l);
-        if (!out.length) throw new Error('');
-        return flags.has('c') ? String(out.length) : out.join('\n');
+      const scripts = args.flatMap((x, i) => (args[i - 1] === '-e' ? [x] : []));
+      const files = rest.filter((x, i) => !scripts.includes(x) || args[args.indexOf(x) - 1] !== '-e');
+      if (!scripts.length) scripts.push(files.shift() ?? '');
+      const edits = scripts.flatMap((sc) => sc.split(/;\s*(?=s.)/)).map((sc) => {
+        const m = /^s(.)(.*?)\1(.*?)\1([gI]*)$/i.exec(sc.trim());
+        if (!m) throw new Error(`sed: only s/find/replace/[g] is here (got "${sc}")`);
+        try { return [new RegExp(m[2].replace(/\\([|(){}+?])|([|(){}+?])/g, (x, esc, bare) => (esc ? esc : '\\' + bare)), (m[4].includes('g') ? 'g' : '') + (/[iI]/.test(m[4]) ? 'i' : '')), m[3].replace(/\\(\d)/g, '$$$1').replace(/&/g, '$$&')]; } catch (e) { throw new Error('sed: ' + e.message); }
+      });
+      const apply = (text) => lines(text).map((l) => edits.reduce((x, [re, to]) => x.replace(re, to), l)).join('\n');
+      if (flags.has('i') || [...longs.keys()].includes('--in-place')) {
+        if (!files.length) throw new Error('sed -i: which file?');
+        for (const f of files) { const p = termPath(f); const was = await termRead(p); await termWrite(p, apply(was) + (was.endsWith('\n') ? '\n' : '')); }
+        return '';
       }
-      const r = await searchText(pattern, { dir: target, max: 200, signal });
-      if (!r.hits.length) throw new Error('');
-      return r.hits.map((x) => `${x.path}:${x.line}: ${x.text}`).join('\n') + (r.stopped ? `\n(${r.stopped})` : '');
+      return apply(await input(files));
+    }
+    case 'grep': case 'egrep': case 'fgrep': {
+      const pattern = opt('-e') ?? rest[0];
+      if (pattern === undefined) throw new Error('grep: what text?');
+      const targets = opt('-e') !== undefined ? rest : rest.slice(1);
+      // grep's own regular expressions: basic by default (\| \( \) \{ \} \+ \? mean what they mean in -E)
+      const literal = flags.has('F') || cmd === 'fgrep';
+      const ext = flags.has('E') || flags.has('P') || cmd === 'egrep';
+      let src = literal ? pattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') : ext ? pattern : pattern.replace(/\\([|(){}+?])|([|(){}+?])/g, (m, esc, bare) => (esc ? esc : '\\' + bare));
+      if (flags.has('w')) src = '\\b(?:' + src + ')\\b';
+      let re;
+      try { re = new RegExp(src, flags.has('i') ? 'i' : ''); } catch { re = new RegExp(pattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), flags.has('i') ? 'i' : ''); }
+      const test = (l) => re.test(l) !== flags.has('v');
+      const max = Number(opt('-m')) || Infinity;
+      const inc = [longs.get('--include')].flat().filter((x) => typeof x === 'string'), exc = [longs.get('--exclude')].flat().filter((x) => typeof x === 'string');
+      const globRe = (g) => new RegExp('^' + g.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.') + '$');
+      const wanted = (f) => { const base = f.split('/').pop(); return (!inc.length || inc.some((g) => globRe(g).test(base))) && !exc.some((g) => globRe(g).test(base)); };
+      const fmt = (path, n, l) => (flags.has('o') ? (l.match(re)?.[0] ?? l) : l);
+      const report = (rows, many) => {
+        if (flags.has('l')) return [...new Set(rows.map((r) => r[0]))].join('\n');
+        if (flags.has('c')) { if (!many) return String(rows.length); const per = new Map(); for (const r of rows) per.set(r[0], (per.get(r[0]) ?? 0) + 1); return [...per].map(([f, n]) => `${f}:${n}`).join('\n'); }
+        return rows.map(([path, n, l]) => (many && !flags.has('h') ? path + ':' : '') + (flags.has('n') ? n + ':' : '') + fmt(path, n, l)).join('\n');
+      };
+      if (!targets.length && (stdinPiped || stdin) && !flags.has('r') && !flags.has('R')) {
+        const rows = lines(stdin).map((l, i) => ['(standard input)', i + 1, l]).filter(([, , l]) => test(l)).slice(0, max);
+        if (!rows.length) throw new Error('');
+        return report(rows, false);
+      }
+      // files named, or every file under the folders named (or here)
+      const files = [];
+      for (const t of targets.length ? targets : ['.']) {
+        const tp = termPath(t);
+        if (termIsFile(tp)) files.push(tp);
+        else if (termIsDir(tp)) { const under = tp ? tp + '/' : ''; for (const f of termAll()) if (f.startsWith(under) && wanted(f) && !f.split('/').some((x) => x === '.git' || x === 'node_modules')) files.push(f); }
+        else throw new Error(`grep: ${t}: no such file or folder`);
+      }
+      const rows = [];
+      const t0 = Date.now();
+      let stopped = '';
+      for (const f of files) {
+        if (signal?.aborted) break;
+        if (rows.length >= 2000) { stopped = 'stopped at 2000 matching lines'; break; }
+        if (Date.now() - t0 > 20000) { stopped = 'stopped after 20 s'; break; }
+        if (/\.(png|jpe?g|gif|webp|ico|pdf|zip|gz|tgz|wasm|woff2?|ttf|otf|mp[34]|mov|exe|dll|so|dylib|bin)$/i.test(f)) continue;
+        let text;
+        try { text = S.conv.files[f]; if (text === undefined || (repo.on() && repo.partial.has(f))) text = repo.on() ? (await repoReadText(f, true)).text : await termRead(f); } catch { continue; }
+        let k = 0;
+        for (const [n, l] of String(text ?? '').split('\n').map((l, i) => [i + 1, l])) if (test(l)) { rows.push([f, n, l.length > 400 ? l.slice(0, 400) + '…' : l]); if (++k >= max || flags.has('l')) break; }
+      }
+      if (!rows.length) throw new Error(stopped ? `(no match; ${stopped})` : '');
+      return report(rows, files.length > 1 || flags.has('r') || flags.has('R')) + (stopped ? `\n(${stopped})` : '');
     }
     case 'find': {
-      const name = opt('-name') ?? (rest.at(-1) && !termIsDir(termPath(rest.at(-1))) ? rest.at(-1) : '');
-      const top = termPath(rest[0] && termIsDir(termPath(rest[0])) ? rest[0] : '');
-      const under = top ? top + '/' : '';
-      const q = String(name).replace(/^\*|\*$/g, '').toLowerCase();
-      const hits = termAll().filter((f) => f.startsWith(under) && f.split('/').pop().toLowerCase().includes(q));
-      return hits.slice(0, 500).join('\n') + (hits.length > 500 ? `\n… ${hits.length - 500} more` : '');
+      const starts = args.filter((x, i) => !x.startsWith('-') && !(i > 0 && takes.includes(args[i - 1])));
+      const tops = starts.filter((x) => termIsDir(termPath(x)));
+      const loose = starts.filter((x) => !termIsDir(termPath(x)));   // find <words>: the old way, a name to look for
+      const name = opt('-name') ?? opt('-iname') ?? (loose[0] ? '*' + loose[0].replace(/^\*|\*$/g, '') + '*' : '');
+      const nameRe = name ? new RegExp('^' + name.replace(/[.+^${}()|\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.') + '$', opt('-name') !== undefined ? '' : 'i') : null;
+      const pathRe = opt('-path') ? new RegExp('^' + opt('-path').replace(/^\.\//, '').replace(/[.+^${}()|\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.') + '$') : null;
+      const maxd = opt('-maxdepth') !== undefined ? Number(opt('-maxdepth')) : Infinity, mind = Number(opt('-mindepth') ?? 0);
+      const type = opt('-type');
+      const out = [];
+      for (const t of tops.length ? tops : ['.']) {
+        const top = termPath(t), under = top ? top + '/' : '';
+        const shown = (rel) => (t === '.' || t === './' ? './' + rel : (t.replace(/\/$/, '') + '/' + rel));
+        const entries = new Map();   // rel -> isDir
+        for (const f of termAll()) {
+          if (!f.startsWith(under)) continue;
+          const parts = f.slice(under.length).split('/');
+          for (let d = 1; d <= parts.length; d++) entries.set(parts.slice(0, d).join('/'), d < parts.length);
+        }
+        if (mind === 0 && (!type || type === 'd') && !nameRe && !pathRe) out.push(t);
+        for (const [rel, isDir] of [...entries].sort((x, y) => x[0].localeCompare(y[0]))) {
+          const depth = rel.split('/').length;
+          if (depth > maxd || depth < mind) continue;
+          if (type === 'f' && isDir) continue;
+          if (type === 'd' && !isDir) continue;
+          if (nameRe && !nameRe.test(rel.split('/').pop())) continue;
+          if (pathRe && !pathRe.test(rel)) continue;
+          out.push(shown(rel));
+          if (out.length > 2000) break;
+        }
+      }
+      return out.slice(0, 2000).join('\n') + (out.length > 2000 ? '\n… (cut at 2000)' : '');
     }
     case 'diff': {
       if (rest.length !== 2) throw new Error('diff: give two files');
@@ -2750,7 +2855,16 @@ async function termCommand(argv, stdin, signal, raw) {
     }
     case 'git': {
       const sub = rest[0];
-      if (sub === 'clone') { if (!rest[1]) throw new Error('git clone: give the repository\'s https address'); await gitClone(rest[1]); return repo.on() ? `cloned into ${repo.name}` : ''; }
+      if (sub === 'clone') {
+        const url = rest.find((x) => /^https?:\/\//.test(x)) ?? rest[1];
+        if (!url) throw new Error('git clone: give the repository\'s https address');
+        const name = rest.slice(rest.indexOf(url) + 1).find((x) => x !== '.') ?? '';
+        const ref = opt('-b') ?? opt('--branch') ?? longs.get('--branch');
+        const got = await gitClone(url, { strict: true, name, ref: typeof ref === 'string' ? ref : '' });
+        term.cwd = '';
+        if (name) repo.alias = name;
+        return `Cloned ${url} (${got.files} files, branch ${got.branch || 'default'}). The clone is now this chat's workspace: its files are at the top (ls shows them), and "${got.name}/..."${name && name !== got.name ? ` or "${name}/..."` : ''} names the same files. Read and search them with the file tools or here; git status / commit / push work in it.`;
+      }
       if (!repo.on()) throw new Error('git: no repository is open (git clone <address>, or Clone repo)');
       if (repo.kind === 'disk') { if (sub === 'branch' || sub === 'status') return `on ${repo.branch || '(no branch)'}\n(this is a folder on your computer: commit and push with your own git there)`; return termRemote(raw ?? argv.join(' '), signal); }
       if (sub === 'status') { await gitChanges(); return `on ${repo.branch}\n` + (gitx.changes.length ? gitx.changes.map((c) => `  ${c.state.padEnd(8)} ${c.path}`).join('\n') : 'nothing has changed since the last commit'); }
@@ -2762,83 +2876,266 @@ async function termCommand(argv, stdin, signal, raw) {
       if (sub === 'log') { const git = await gitLib(); return (await git.log({ fs: gitFs(repo.root), dir: '/', depth: 10 })).map((c) => `${c.oid.slice(0, 8)}  ${c.commit.message.split('\n')[0]}  (${c.commit.author.name})`).join('\n'); }
       throw new Error(`git: "${sub ?? ''}" is not here (status, commit, push, pull, log, branch, clone)`);
     }
+    case 'break': case 'continue': throw Object.assign(new Error(cmd + ': only inside a for or while'), { loop: cmd });
+    case 'chmod': case 'chown': case 'chgrp': case 'umask': return '';   // files here have no owners or modes: nothing to change
+    case 'source': case '.': { const f = rest[0]; if (!f) throw new Error(cmd + ': which file?'); const r = await termRun(await termRead(termPath(f)), signal); if (!r.ok) throw Object.assign(new Error(r.out), { printed: true }); return r.out; }
+    case 'tar': case 'unzip': case 'gunzip': case 'zcat':
+      throw new Error(`${cmd}: archives are not unpacked in this terminal. For a repository use git clone <its https address>; for one file, curl its raw address.`);
     default:
       // not one of this terminal's: a real computer's command, for one of the owner's own machines
       return termRemote(raw ?? argv.join(' '), signal);
   }
 }
 /* The flags of a command that are followed by a value (everywhere else a word after a flag is an operand). */
-const TERM_TAKES = { head: ['-n'], tail: ['-n'], cut: ['-d', '-f'], curl: ['-o', '-O'], wget: ['-o', '-O'], git: ['-m'], python: ['-c'], python3: ['-c'], py: ['-c'], node: ['-e'], js: ['-e'], find: ['-name'] };
-const TERM_COMMANDS = new Set('help clear exit true false pwd date whoami hostname uname ver history echo printf env printenv export set unset sleep seq basename dirname which command type test time cd ls tree du stat cat tac rev nl head tail wc sort uniq cut tr sed grep find diff base64 sha256sum tee xargs touch mkdir rm rmdir cp mv open code edit python python3 py pip pip3 node js curl wget git'.split(' '));
+const TERM_TAKES = { sed: ['-e'], head: ['-n', '-c'], tail: ['-n', '-c'], cut: ['-d', '-f'], curl: ['-o', '-O', '-H', '-X', '-d', '-A'], wget: ['-o', '-O'], git: ['-m', '-b', '--branch', '--depth', '-C'], python: ['-c'], python3: ['-c'], py: ['-c'], node: ['-e'], js: ['-e'], find: ['-name', '-iname', '-maxdepth', '-mindepth', '-type', '-path'], grep: ['-e', '-m', '-A', '-B', '-C'] };
+const TERM_COMMANDS = new Set('help clear exit true false pwd date whoami hostname uname ver history echo printf env printenv export set unset sleep seq basename dirname which command type test time cd ls tree du stat cat tac rev nl head tail wc sort uniq cut tr sed grep egrep fgrep find diff base64 sha256sum tee xargs touch mkdir rm rmdir cp mv open code edit python python3 py pip pip3 node js curl wget git chmod chown umask source for if while'.split(' '));
 let stdinPiped = false;   // the command being run has something piped into it
 let outPiped = false;     // and what it prints goes on to another command, or into a file
 
-/* A whole line: pipelines joined by && || ;, each a chain of commands joined by |, with < > >> on a command.
-   Resolves {ok, out}: what was printed (errors too, where a shell would print them), and how the last command ended. */
-async function termRun(line, signal) {
-  const toks = termTokens(line.trim());
-  const printed = [];
-  let ok = true, i = 0;
-  const pipeline = async () => {
-    // commands up to the next && || ;
-    const cmds = [{ words: [], raw: [] }];
+/* Heredocs (<<EOF … EOF, <<'EOF', <<-EOF) taken out of the text before it is cut into words: each becomes a mark
+   the words carry, and its body is what that command reads. An unquoted delimiter has its $NAMEs put in. */
+function termDocs(text) {
+  const docs = [];
+  const lines = String(text).replace(/\r\n?/g, '\n').split('\n');
+  const out = [];
+  for (let k = 0; k < lines.length; k++) {
+    let line = lines[k];
+    const ends = [];
+    line = line.replace(/<<(-?)\s*(['"]?)([A-Za-z_][\w-]*)\2/g, (m, dash, q, word) => { ends.push({ word, dash: !!dash, raw: !!q }); return '\u0003' + (docs.length + ends.length - 1) + '\u0003'; });
+    out.push(line);
+    for (const e of ends) {
+      const body = [];
+      while (++k < lines.length && (e.dash ? lines[k].replace(/^\t+/, '') : lines[k]) !== e.word) body.push(e.dash ? lines[k].replace(/^\t+/, '') : lines[k]);
+      const text = body.join('\n') + (body.length ? '\n' : '');
+      docs.push({ text, raw: e.raw });
+    }
+  }
+  return { text: out.join('\n'), docs };
+}
+
+/* The words cut into a tree: a list of steps joined by && || ;, a step being a pipeline of commands (each with its
+   redirects), or for / if / while around lists of their own. */
+function termParse(toks) {
+  let i = 0;
+  const KEYS = ['then', 'do', 'done', 'fi', 'else', 'elif', 'esac'];
+  const kw = (w) => !!toks[i] && toks[i].op === undefined && toks[i].w === w && !toks[i].glob;
+  const expect = (w) => { if (!kw(w)) throw new Error(`syntax error: "${w}" was expected${toks[i] ? ` near "${toks[i].w ?? toks[i].op}"` : ' before the end'}`); i++; };
+  const semis = () => { while (toks[i]?.op === ';') i++; };
+  const list = (stops) => {
+    const items = [];
+    for (;;) {
+      semis();
+      if (i >= toks.length || stops.some(kw)) return items;
+      const node = step();
+      let op = ';';
+      if (toks[i] && ['&&', '||', ';'].includes(toks[i].op)) op = toks[i++].op;
+      items.push({ node, op });
+    }
+  };
+  const TAILS = ['|', '>', '>>', '2>', '&>', '2>&1'];
+  const step = () => {
+    const node = compound();
+    if (node.kind === 'pipe' || !toks[i] || !TAILS.includes(toks[i].op)) return node;
+    const tail = pipeline();
+    if (!tail.cmds[0].words.length) tail.cmds[0].words = [{ w: 'cat' }];   // "done > f": what it printed, into f
+    return { kind: 'piped', first: node, tail };
+  };
+  const compound = () => {
+    if (kw('for')) {
+      i++;
+      const v = toks[i++]?.w;
+      if (!v || !/^[A-Za-z_]\w*$/.test(v)) throw new Error('syntax error: for needs a name');
+      const words = [];
+      if (kw('in')) { i++; while (i < toks.length && toks[i].op === undefined && !kw('do')) words.push(toks[i++]); }
+      semis();
+      expect('do');
+      const body = list(['done']);
+      expect('done');
+      return { kind: 'for', v, words, body };
+    }
+    if (kw('while') || kw('until')) {
+      const until = toks[i++].w === 'until';
+      const cond = list(['do']);
+      expect('do');
+      const body = list(['done']);
+      expect('done');
+      return { kind: 'while', until, cond, body };
+    }
+    if (kw('if')) {
+      i++;
+      const cond = list(['then']);
+      expect('then');
+      const then = list(['elif', 'else', 'fi']);
+      let other = [];
+      if (kw('elif')) { toks[i] = { w: 'if', glob: false }; other = [{ node: compound(), op: ';' }]; return { kind: 'if', cond, then, other }; }
+      if (kw('else')) { i++; other = list(['fi']); }
+      expect('fi');
+      return { kind: 'if', cond, then, other };
+    }
+    if (toks[i]?.op === undefined && KEYS.includes(toks[i]?.w)) throw new Error(`syntax error near "${toks[i].w}"`);
+    return pipeline();
+  };
+  const pipeline = () => {
+    const cmds = [{ words: [], redir: [] }];
     for (; i < toks.length && !['&&', '||', ';'].includes(toks[i].op); i++) {
       const t = toks[i], c = cmds.at(-1);
-      if (t.op === '|') { cmds.push({ words: [], raw: [] }); continue; }
-      if (t.op === '>' || t.op === '>>' || t.op === '<' || t.op === '2>') { const f = toks[++i]?.w; if (f === undefined) throw new Error('a file name is missing after ' + t.op); if (t.op === '<') c.from = f; else if (t.op !== '2>') { c.to = f; c.append = t.op === '>>'; } continue; }
-      c.raw.push(/\s/.test(t.w) ? JSON.stringify(t.w) : t.w);
-      c.words.push(...(t.glob ? termGlob(t.w) : [t.w]));
+      if (t.op === '|') { cmds.push({ words: [], redir: [] }); continue; }
+      if (t.op === '<<') { c.doc = t.doc; continue; }
+      if (t.op === '2>&1') { c.errOut = true; continue; }
+      if (t.op === '>' || t.op === '>>' || t.op === '<' || t.op === '2>' || t.op === '&>') {
+        const f = toks[++i]?.w;
+        if (f === undefined) throw new Error('syntax error: a file name is missing after ' + t.op);
+        c.redir.push({ op: t.op, f });
+        continue;
+      }
+      c.words.push(t);
     }
-    let stdin = '';
-    for (let k = 0; k < cmds.length; k++) {
-      const c = cmds[k];
-      c.words = c.words.map(termVars); c.raw = c.raw.map(termVars);
-      if (c.from !== undefined) c.from = termVars(c.from);
-      if (c.to !== undefined) c.to = termVars(c.to);
+    return { kind: 'pipe', cmds };
+  };
+  const tree = list([]);
+  if (i < toks.length) throw new Error(`syntax error near "${toks[i].w ?? toks[i].op}"`);
+  return tree;
+}
+
+const TERM_LOOPS = 1000;  // turns one for or while may take
+
+/* A whole line, or several: lists, pipelines, for / if / while, redirects, heredocs. Resolves {ok, out}: what was
+   printed (errors too, where a shell would print them, unless sent to /dev/null), and how the last step ended. */
+async function termRun(line, signal) {
+  const printed = [];
+  let docs;
+  const subst = async (w) => {
+    if (!/[\u0004\u0005]/.test(w)) return w;
+    let out = '';
+    for (const part of w.split(/([\u0004\u0005]\d+[\u0004\u0005])/)) {
+      const m = /^[\u0004\u0005](\d+)[\u0004\u0005]$/.exec(part);
+      if (!m) { out += part; continue; }
+      const keep = [stdinPiped, outPiped];
+      const r = await termRun(termSubs[Number(m[1])], signal);
+      [stdinPiped, outPiped] = keep;
+      out += r.out.replace(/\n+$/, '');
+    }
+    return out;
+  };
+  const expand = async (t) => {
+    const split = t.w.includes('\u0005');
+    const w = await subst(termVars(t.w));
+    const parts = split ? w.split(/\s+/).filter(Boolean) : [w];
+    return parts.flatMap((x) => (t.glob ? termGlob(x) : [x]));
+  };
+  // one pipeline: true when its last command ended well
+  const pipe = async (node, fed) => {
+    let stdin = fed ?? '', ok = true;
+    for (let k = 0; k < node.cmds.length; k++) {
+      const c = node.cmds[k];
+      const words = [];
+      for (const t of c.words) words.push(...(await expand(t)));
+      const raw = words.map((w) => (/\s/.test(w) ? JSON.stringify(w) : w));
       // NAME=value words before a command set variables
-      while (c.words.length && /^[A-Za-z_]\w*=/.test(c.words[0])) { const m = /^([A-Za-z_]\w*)=(.*)$/s.exec(c.words.shift()); termEnv[m[1]] = m[2]; c.raw.shift(); }
-      if (c.from !== undefined) stdin = await termRead(termPath(c.from));
-      stdinPiped = k > 0 || c.from !== undefined;
-      outPiped = k < cmds.length - 1 || c.to !== undefined;
-      let out = await termCommand(c.words, stdin, signal, c.raw.join(' '));
-      out = String(out ?? '');
-      if (c.to !== undefined) {
-        const p = termPath(c.to);
-        await termWrite(p, (c.append && termIsFile(p) ? (await termRead(p)).replace(/\n?$/, '\n') : '') + out + (out.endsWith('\n') || !out ? '' : '\n'));
+      while (words.length && /^[A-Za-z_]\w*=/.test(words[0])) { const m = /^([A-Za-z_]\w*)=(.*)$/s.exec(words.shift()); termEnv[m[1]] = m[2]; raw.shift(); }
+      let to, append = false, errTo = c.errOut ? 'out' : '';
+      for (const r of c.redir) {
+        const f = await subst(termVars(r.f));
+        if (r.op === '<') stdin = await termRead(termPath(f));
+        else if (r.op === '2>') errTo = f === '/dev/null' ? 'null' : 'file:' + f;
+        else { to = f; append = r.op === '>>'; if (r.op === '&>') errTo = f === '/dev/null' ? 'null' : 'out'; }
+      }
+      if (c.doc !== undefined) {
+        const d = docs[c.doc] ?? { text: '', raw: true };
+        stdin = d.text;
+        if (!d.raw) {
+          let t = '';
+          for (const part of stdin.split(/(\$\([^()]*\))/)) {
+            if (!/^\$\(/.test(part)) { t += part; continue; }
+            const keep = [stdinPiped, outPiped];
+            t += (await termRun(part.slice(2, -1), signal)).out.replace(/\n+$/, '');
+            [stdinPiped, outPiped] = keep;
+          }
+          stdin = t.replace(/\$(?:\{([A-Za-z_]\w*)\}|([A-Za-z_]\w*)|(\?))/g, (m, a, b, q) => (q ? String(termStatus) : termEnv[a ?? b] ?? ''));
+        }
+      }
+      stdinPiped = k > 0 || fed !== undefined || c.redir.some((r) => r.op === '<') || c.doc !== undefined;
+      outPiped = k < node.cmds.length - 1 || to !== undefined;
+      let out;
+      try {
+        out = String((await termCommand(words, stdin, signal, raw.join(' '))) ?? '');
+        ok = true;
+      } catch (e) {
+        if (signal?.aborted || e.loop) throw e;
+        ok = false;
+        const msg = e.message || '';
+        if (errTo === 'out') out = msg;
+        else {
+          out = '';
+          if (errTo.startsWith('file:')) { const p = termPath(errTo.slice(5)); await termWrite(p, msg + (msg ? '\n' : '')); }
+          else if (errTo !== 'null' && msg) printed.push(msg);
+          if (k === node.cmds.length - 1) { stdin = ''; break; }
+        }
+      }
+      if (to !== undefined) {
+        if (to !== '/dev/null') {
+          const p = termPath(to);
+          await termWrite(p, (append && termIsFile(p) ? (await termRead(p)).replace(/\n?$/, '\n') : '') + out + (out.endsWith('\n') || !out ? '' : '\n'));
+        }
         out = '';
       }
       stdin = out && !out.endsWith('\n') ? out + '\n' : out;
     }
-    return stdin.replace(/\n$/, '');
+    const text = stdin.replace(/\n$/, '');
+    if (text) printed.push(text);
+    return ok;
+  };
+  const runNode = async (node) => {
+    if (signal?.aborted) throw new Error('stopped');
+    if (node.kind === 'pipe') return pipe(node);
+    if (node.kind === 'piped') {
+      const at = printed.length;
+      await runNode(node.first);
+      const out = printed.splice(at).join('\n');
+      return pipe(node.tail, out && !out.endsWith('\n') ? out + '\n' : out);
+    }
+    if (node.kind === 'for') {
+      const items = [];
+      for (const t of node.words) items.push(...(await expand(t)));
+      if (items.length > TERM_LOOPS) throw new Error(`for: more than ${TERM_LOOPS} turns`);
+      let ok = true;
+      for (const x of items) {
+        termEnv[node.v] = x;
+        try { ok = await runList(node.body); } catch (e) { if (e.loop === 'break') break; if (e.loop === 'continue') continue; throw e; }
+      }
+      return ok;
+    }
+    if (node.kind === 'while') {
+      let ok = true, n = 0;
+      for (;;) {
+        const c = await runList(node.cond);
+        if (c === node.until) break;
+        if (++n > TERM_LOOPS) throw new Error(`while: stopped after ${TERM_LOOPS} turns`);
+        try { ok = await runList(node.body); } catch (e) { if (e.loop === 'break') break; if (e.loop === 'continue') continue; throw e; }
+      }
+      return ok;
+    }
+    if (node.kind === 'if') return (await runList(node.cond)) ? runList(node.then) : node.other.length ? runList(node.other) : true;
+    return true;
+  };
+  const runList = async (items) => {
+    let ok = true, skip = false;
+    for (const { node, op } of items) {
+      if (!skip) { ok = await runNode(node); termStatus = ok ? 0 : 1; }
+      skip = op === '&&' ? !ok : op === '||' ? ok : false;
+    }
+    return ok;
   };
   try {
-    while (i < toks.length) {
-      let out = '';
-      try {
-        out = await pipeline();
-        ok = true;
-      } catch (e) {
-        if (signal?.aborted) throw e;
-        ok = false;
-        out = e.message || '';
-        while (i < toks.length && !['&&', '||', ';'].includes(toks[i].op)) i++;   // the rest of a pipeline that broke
-      }
-      termStatus = ok ? 0 : 1;
-      if (out) printed.push(out);
-      // what comes next, by how this one ended
-      while (i < toks.length) {
-        const op = toks[i++].op;
-        if (op === ';' || (op === '&&' && ok) || (op === '||' && !ok)) break;
-        // skipped: pass over the next pipeline
-        while (i < toks.length && !['&&', '||', ';'].includes(toks[i].op)) i++;
-      }
-    }
+    const d = termDocs(line.trim());
+    docs = d.docs;
+    const ok = await runList(termParse(termTokens(d.text)));
+    return { ok, out: printed.join('\n') };
   } catch (e) {
     return { ok: false, out: [...printed, e.message || String(e)].join('\n') };
   } finally {
     stdinPiped = outPiped = false;
   }
-  return { ok, out: printed.join('\n') };
 }
 
 /* A line typed at the prompt. */
