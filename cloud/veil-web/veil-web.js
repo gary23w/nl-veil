@@ -108,7 +108,7 @@
 // No imports and no platform globals beyond fetch/Response/crypto, so a test can run this file under node with
 // a Map for storage and a scripted env.AI.
 
-export const VERSION = "20";
+export const VERSION = "21";
 const API_ROOT = "https://api.cloudflare.com/client/v4";
 const PY_SOURCE = "https://raw.githubusercontent.com/gary23w/nl-veil/main/cloud/tot_py.py";
 const SELF_SCRIPT = "veil-web";
@@ -1269,12 +1269,13 @@ export class Harness {
   /// cloud/tot_py.py from the public repo, kept for a day. "" when it cannot be had.
   async pySource() {
     const kept = await this.store.get("py_src");
-    if (kept && Date.now() - kept.at < LLMS_TTL_MS) return kept.text;
+    // a new harness fetches the runtime afresh: it may need what changed with it
+    if (kept && kept.v === VERSION && Date.now() - kept.at < LLMS_TTL_MS) return kept.text;
     try {
       const r = await fetch(this.env.PY_SOURCE || PY_SOURCE);
       const text = await r.text();
       if (r.status !== 200 || !text.includes("class Default(WorkerEntrypoint)")) return kept?.text ?? "";
-      await this.store.put("py_src", { at: Date.now(), text });
+      await this.store.put("py_src", { at: Date.now(), text, v: VERSION });
       return text;
     } catch {
       return kept?.text ?? "";

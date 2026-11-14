@@ -123,7 +123,12 @@ class _NeedInstall(BaseException):
 
 
 def _safe_name(name):
-    return isinstance(name, str) and 0 < len(name) <= 64 and all(c.isalnum() or c in "._-" for c in name) and name not in (".", "..")
+    """A file's name, or a path of names under the script's folder ("_posts/2026-01-01-a.md"): never absolute,
+    never "." or ".." as a part."""
+    if not isinstance(name, str) or not 0 < len(name) <= 400 or name.startswith("/"):
+        return False
+    parts = name.split("/")
+    return all(0 < len(p) <= 200 and p not in (".", "..") and all(c.isalnum() or c in "._-+@" for c in p) for p in parts)
 
 
 # ------------------------------------------------------------------------------------------ HTTP
@@ -468,7 +473,10 @@ async def run(data):
     for name, text in files.items():
         if not _safe_name(name) or not isinstance(text, str):
             continue
-        with open(os.path.join(work, name), "w", encoding="utf-8") as f:
+        path = os.path.join(work, *name.split("/"))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        # newline="": the text exactly as given, so a file the script never touched reads back the same
+        with open(path, "w", encoding="utf-8", newline="") as f:
             f.write(text)
         before[name] = text
     old_cwd = os.getcwd()
@@ -546,14 +554,19 @@ async def run(data):
     changed = {}
     binary = []
     try:
-        for name in sorted(os.listdir(work)):
-            path = os.path.join(work, name)
+        found = []
+        for top, dirs, names in os.walk(work):
+            dirs[:] = sorted(d for d in dirs if d != "__pycache__")
+            rel = os.path.relpath(top, work).replace(os.sep, "/")
+            found += [n if rel == "." else rel + "/" + n for n in sorted(names)]
+        for name in found:
+            path = os.path.join(work, *name.split("/"))
             if len(changed) >= FILES_MAX or not _safe_name(name) or not os.path.isfile(path):
                 continue
             if os.path.getsize(path) > FILE_MAX * 4:
                 continue
             try:
-                with open(path, "r", encoding="utf-8") as f:
+                with open(path, "r", encoding="utf-8", newline="") as f:
                     text = f.read()
             except UnicodeDecodeError:
                 binary.append(name)

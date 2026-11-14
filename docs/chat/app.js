@@ -945,6 +945,7 @@ const READ_LINES = 400;   // lines of a long file one read_file gives
    it), or the whole repository when it walks the tree or names nothing that is there. Text files only, within
    PY_REPO_FILES and PY_REPO_BYTES. */
 const PY_REPO_FILES = 2000, PY_REPO_BYTES = 6e6;
+const sameText = (a, b) => a.replace(/\r\n/g, '\n') === b.replace(/\r\n/g, '\n');
 async function pyRepoFiles(code) {
   const all = repo.paths.filter((p) => !/\.(png|jpe?g|gif|webp|ico|pdf|zip|gz|tgz|wasm|woff2?|ttf|otf|mp[34]|mov|exe|dll|so|dylib|bin|lock)$/i.test(p) && !p.split('/').some((x) => x === '.git' || x === 'node_modules'));
   const named = [...code.matchAll(/(['"])((?:(?!\1)[^\n]){1,200})\1/g)].map((m) => m[2].replace(/^\.\/+/, '').replace(/\/+$/, ''));
@@ -1119,7 +1120,8 @@ async function runToolInner(name, args, signal) {
         if (typeof c !== 'string') continue;
         const f = fileName(n);
         if (!repo.on()) { files[f] = c; continue; }
-        if (given.files[f] === c) continue;
+        // unchanged, or changed only in its line endings by a runtime that read it as text: not saved
+        if (given.files[f] === c || (typeof given.files[f] === 'string' && sameText(given.files[f], c))) continue;
         const w = await runToolInner('write_file', { name: f, content: c }, signal);
         if (!/^error/.test(w)) saved.push(f);
       }
@@ -6200,7 +6202,18 @@ CHIP_EXTRAS.push(() => null);
 /* ============================================================ the loop */
 
 /* What a reply asks for: {tool, args, say, cut?}, {broken}, or null when it is the answer (toolCall, above). */
-const parseAction = (reply) => toolCall(reply, Object.keys(TOOLS));
+const parseAction = (reply) => mendCall(toolCall(reply, Object.keys(TOOLS)));
+/* A call whose name carries more than the name ("plan_check (1) {"step": 1}"): the tool it begins with, and the
+   arguments it carries when the call itself brought none. */
+function mendCall(a) {
+  if (!a || a.broken || a.tool in TOOLS || TOOL_RUNNERS[a.tool]) return a;
+  const m = /^([A-Za-z_][\w-]*)\W/.exec(a.tool);
+  if (!m || !(m[1] in TOOLS)) return a;
+  let args = a.args ?? {};
+  const j = a.tool.indexOf('{');
+  if (j >= 0 && !Object.keys(args).length) { try { const got = JSON.parse(a.tool.slice(j, a.tool.lastIndexOf('}') + 1)); if (got && typeof got === 'object') args = got; } catch {} }
+  return { ...a, tool: m[1], args };
+}
 
 /* The plan a long task is worked through: steps the model set, ticked as it goes. Shown to the user, and put in
    front of the model on every call so a long run keeps to its path. */
