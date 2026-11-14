@@ -1016,7 +1016,9 @@ async function runToolInner(name, args, signal) {
       termPrint('veil $ ' + line, 'in');
       const r = await termRun(line, signal);
       if (r.out) termPrint(r.out, r.ok ? 'out' : 'err');
-      return r.ok ? r.out || '(no output)' : 'error: ' + (r.out || '(it printed nothing; exit status 1: for grep, no line matched)');
+      // the terminal keeps its folder from one command to the next: said, so a relative path is not a surprise
+      const where = term.cwd ? `\n(the terminal is in /${term.cwd}; other tools work from the top of the workspace)` : '';
+      return (r.ok ? r.out || '(no output)' : 'error: ' + (r.out || '(it printed nothing; exit status 1: for grep, no line matched)')) + where;
     }
     case 'find_files': {
       const hits = findPaths(String(args.query ?? args.pattern ?? args.name ?? ''), 80);
@@ -2741,7 +2743,10 @@ async function termCommand(argv, stdin, signal, raw) {
     }
     case 'ls': {
       if (flags.has('R')) { const top = termPath(rest[0] ?? ''); if (!termIsDir(top)) throw new Error(`ls: ${rest[0]}: no such folder`); const under = top ? top + '/' : ''; const all = termAll().filter((f) => f.startsWith(under) && (flags.has('a') || !f.slice(under.length).split('/').some((x) => x.startsWith('.')))); return all.slice(0, 2000).map((f) => f.slice(under.length)).join('\n') + (all.length > 2000 ? `\n… ${all.length - 2000} more` : ''); }
-      const targets = rest.length ? rest : [''];
+      // -1 (one name a line) is how ls is read here anyway when its output goes on
+      const one = rest.includes('-1');
+      const named = rest.filter((x) => x !== '-1');
+      const targets = named.length ? named : [''];
       const out = [];
       for (const t of targets) {
         const dir = termPath(t);
@@ -2749,7 +2754,7 @@ async function termCommand(argv, stdin, signal, raw) {
         if (!termIsDir(dir)) throw new Error(`ls: ${t}: no such file or folder`);
         const rows = termList(dir).filter(([n]) => flags.has('a') || !n.startsWith('.'));
         if (targets.length > 1) out.push(`${t}:`);
-        out.push(flags.has('l') ? rows.map(([n, d]) => (d ? 'd ' : '- ') + (d ? '' : String((S.conv.files[(dir ? dir + '/' : '') + n] ?? '').length || '')).padStart(8) + ' ' + n + (d ? '/' : '')).join('\n') : rows.map(([n, d]) => n + (d ? '/' : '')).join(outPiped ? '\n' : '  '));
+        out.push(flags.has('l') ? rows.map(([n, d]) => (d ? 'd ' : '- ') + (d ? '' : String((S.conv.files[(dir ? dir + '/' : '') + n] ?? '').length || '')).padStart(8) + ' ' + n + (d ? '/' : '')).join('\n') : rows.map(([n, d]) => n + (d ? '/' : '')).join(outPiped || one ? '\n' : '  '));
       }
       return out.join('\n');
     }
@@ -2939,6 +2944,8 @@ async function termCommand(argv, stdin, signal, raw) {
       else if (rest[0]) code = await termRead(termPath(rest[0]));
       else if (stdin) code = stdin;
       else throw new Error('python: give a file, or -c "code"');
+      // run where the terminal is, as python would in a shell (one line ahead of the script's own)
+      if (term.cwd) code = `import os as _veil_os; _veil_os.chdir(${JSON.stringify(term.cwd)}); del _veil_os\n` + code;
       const out = await runTool('run_python', { code }, signal);
       if (/^(error|ERROR|FAILED)/.test(out)) throw Object.assign(new Error(out), { printed: true });
       return out;
