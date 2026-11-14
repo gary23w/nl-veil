@@ -353,7 +353,9 @@ async function act(name, fn) {
 async function updateHarness() {
   const was = S.status.version;
   try {
-    await harnessJson('/v1/update', { body: {} });
+    const j = await harnessJson('/v1/update', { body: {} });
+    // already the newest: nothing was replaced, so no new version will answer
+    if (j.same) { toast(`This harness is already the newest (version ${j.now ?? was}).`); return; }
   } catch (e) {
     if (/not found|HTTP 404/i.test(e.message)) throw new Error('This harness is from before it could update itself. Deploy it once more from Cloudflare\'s deploy page (the same button as before); later updates are one click here.');
     throw e;
