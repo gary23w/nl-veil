@@ -7,15 +7,17 @@
 #                                 this list AND from check.sh's drift echo, so it silently sat at 1.0.0
 #                                 through every alpha; a stamp nothing checks is a stamp that drifts)
 #   src\main.zig                  const VERSION = "X"   (served at /api/v1/health + startup banner)
-#   bin\MANIFEST.txt              every literal occurrence of the old version
+#   bin\MANIFEST.txt              every occurrence of the old version, if built locally
 #   .github\workflows\release.yml body_path: docs/release/RELEASE-vX.md
-#   README.md                     download links, the shields badge, the sample startup banner
-#   docs\index.html               download links, the topbar and footer version chips
+#   README.md                     the shields badge and the sample startup banner
 #   docs\release\RELEASE-vX.md    stub created if missing (fill it before tagging)
 #
-# The stamps are the ONLY README and docs\index.html edits a release makes. What a version changed goes
+# The stamps are the only README edits a release makes. What a version changed goes
 # in its RELEASE-vX.md and nowhere in either: no "Stable release" / "New in vX" block, no
 # Current/Previously/Before-it chain (check.ps1 -Scan flags one as [release-text]).
+#
+# The install page pins a tested public release for offline/JavaScript-free visits. Its browser
+# check can discover newer complete releases. Keep that fallback independent of the build version.
 #
 # NOT here, on purpose: scripts\build-release.{sh,ps1} and scripts\build-official.sh all READ the literal
 # out of src\main.zig at run time, so they cannot drift and must not be stamped.
@@ -49,33 +51,18 @@ $edits = @(
     @{ file = $zon;                                          find = '(\.version\s*=\s*")[^"]+(")';        repl = "`${1}$Version`${2}" },
     @{ file = (Join-Path $repo "desk\build.zig.zon");        find = '(\.version\s*=\s*")[^"]+(")';        repl = "`${1}$Version`${2}" },
     @{ file = (Join-Path $repo "src\main.zig");              find = '(const VERSION\s*=\s*")[^"]+(")';    repl = "`${1}$Version`${2}" },
-    @{ file = (Join-Path $repo "bin\MANIFEST.txt");          find = [regex]::Escape($old);                repl = $Version },
     @{ file = (Join-Path $repo ".github\workflows\release.yml"); find = 'RELEASE-v[^\s]+\.md';            repl = "RELEASE-v$Version.md" },
-    # The download links point at an EXPLICIT tag, not /releases/latest, and so they have to move with the
-    # version. /releases/latest was the obvious spelling and it was wrong: GitHub skips prereleases when
-    # resolving it, every app release so far has been one, and the link therefore resolved to whichever
-    # non-prerelease happened to be newest -- a `builtin-assets-*` blob with one irrelevant file in it. Every
-    # Download button on the README and the docs site sent people there. An explicit tag cannot do that.
-    @{ file = (Join-Path $repo "README.md");                 find = 'releases/tag/v[^\s")]+';             repl = "releases/tag/v$Version" },
-    # Since v1.1.24 the README's install table and the site's four Download buttons link each platform's bundle
-    # DIRECTLY (releases/download/vX/veil-vX-<platform>.zip), and the README names the release in the link text
-    # (**[vX](...)**). The releases/tag pattern sees none of them, and the site has no releases/tag link left, so
-    # these match the exact old version: nothing but that release's own links can be caught.
-    @{ file = (Join-Path $repo "README.md");                 find = ('releases/download/v' + [regex]::Escape($old) + '/'); repl = "releases/download/v$Version/" },
-    @{ file = (Join-Path $repo "README.md");                 find = ('veil-v' + [regex]::Escape($old) + '-');              repl = "veil-v$Version-" },
-    @{ file = (Join-Path $repo "README.md");                 find = ('(\*\*\[v)' + [regex]::Escape($old) + '(\]\()');      repl = "`${1}$Version`${2}" },
-    @{ file = (Join-Path $repo "docs\index.html");           find = ('releases/download/v' + [regex]::Escape($old) + '/'); repl = "releases/download/v$Version/" },
-    @{ file = (Join-Path $repo "docs\index.html");           find = ('veil-v' + [regex]::Escape($old) + '-');              repl = "veil-v$Version-" },
     # The shields.io badge needs its own entry: the badge path DOUBLES every literal hyphen
     # (1.0.1-beta-2 -> v1.0.1--beta--2), so the releases/tag pattern above cannot see it. It was the one
     # stamp this script missed on the beta-1 -> beta-2 bump.
     @{ file = (Join-Path $repo "README.md");                 find = 'badge/release-v[^-]*(?:--[^-]*)*-A8241B'; repl = ("badge/release-v" + ($Version -replace '-','--') + "-A8241B") },
-    # The site's two version chips (topbar + footer) and the README's sample startup banner. None of the
-    # patterns above can see them, so the 1.1.0 -> 1.1.1 bump stamped every download link and left the site
-    # announcing v1.1.0 in two places while it linked to v1.1.1.
-    @{ file = (Join-Path $repo "docs\index.html");           find = '(chip-dot"></span>v)\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?'; repl = "`${1}$Version" },
     @{ file = (Join-Path $repo "README.md");                 find = '(neuron-loops )\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?( on http)'; repl = "`${1}$Version`${2}" }
 )
+
+$manifest = Join-Path $repo "bin\MANIFEST.txt"
+if (Test-Path -LiteralPath $manifest) {
+    $edits += @{ file = $manifest; find = [regex]::Escape($old); repl = $Version }
+}
 
 $failed = $false
 foreach ($e in $edits) {

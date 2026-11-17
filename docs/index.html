@@ -6,9 +6,9 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>the Veil — an agentic coding desktop app that runs a team of AI agents locally</title>
-<meta name="description" content="A free desktop app for building software with AI, running a whole team of agents on your own machine. Ships its own model — no API key, no account, no cloud.">
+<meta name="description" content="Download the Veil, a free AI coding app for Windows, macOS and Linux. Run a local model or connect a provider of your choice.">
 <meta property="og:title" content="the Veil — agentic coding, on your machine">
-<meta property="og:description" content="A desktop app for building software with AI. Where most tools hand the job to one assistant, the Veil can split it across a swarm of agents on one shared memory. Ships its own model, so there is no key and no account, and local conversation state is stored in a folder next to the binary.">
+<meta property="og:description" content="A desktop app for building software with AI. Where most tools hand the job to one assistant, the Veil can split it across a swarm of agents on one shared memory. Get the desktop app for Windows, macOS or Linux, then set up a local model or connect a hosted provider.">
 <meta property="og:type" content="website">
 <meta property="og:url" content="https://veil.garrettstimpson.ca/">
 <meta property="og:site_name" content="the Veil">
@@ -35,7 +35,7 @@
   "license": "https://github.com/gary23w/nl-veil/blob/main/LICENSE",
   "isAccessibleForFree": true,
   "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
-  "downloadUrl": "https://github.com/gary23w/nl-veil/releases",
+  "downloadUrl": "https://veil.garrettstimpson.ca/#get",
   "screenshot": "https://veil.garrettstimpson.ca/demos/slides/build-plan.png",
   "image": "https://veil.garrettstimpson.ca/img/social-card.png",
   "sameAs": [
@@ -82,7 +82,6 @@
       the veil <small>nl-veil</small>
     </a>
     <nav class="nav" id="nav">
-      <a href="#get">Download</a>
       <a href="chat/">Chat</a>
       <a href="#gary-4tope">Gary&rsquo;s 4tope</a>
       <a href="demos/">Quick start</a>
@@ -93,7 +92,7 @@
     </nav>
     <span class="grow"></span>
     <a class="btn btn-solid btn-sm nav-chat" href="chat/">Chat</a>
-    <span class="chip"><span class="chip-dot"></span>v1.1.31</span>
+    <a class="btn btn-solid btn-sm nav-install" href="#get">Download</a>
     <button class="icon-btn" id="themeBtn" type="button" title="Toggle theme" aria-label="Toggle theme"></button>
     <a class="icon-btn" href="https://github.com/gary23w/nl-veil" target="_blank" rel="noopener" title="Source on GitHub" aria-label="Source on GitHub">
       <svg viewBox="0 0 24 24"><path d="M9 19c-5 1.5-5-2.5-7-3m14 6v-3.9a3.4 3.4 0 0 0-.9-2.6c3-.3 6.2-1.5 6.2-6.7A5.2 5.2 0 0 0 20 4.8a4.9 4.9 0 0 0-.1-3.6s-1.1-.3-3.7 1.4a12.6 12.6 0 0 0-6.6 0C7 .9 5.9 1.2 5.9 1.2A4.9 4.9 0 0 0 5.8 4.8a5.2 5.2 0 0 0-1.4 3.6c0 5.2 3.2 6.4 6.2 6.7a3.4 3.4 0 0 0-.9 2.6V22"/></svg>
@@ -111,11 +110,9 @@
         <p class="hero-eyebrow">local-first &middot; one binary &middot; written in Zig</p>
         <h1>Agentic coding, on your machine.<br><em>Many minds</em>, one shared memory.</h1>
         <p class="hero-lede">
-          <strong>the Veil</strong> is a desktop app for building software with AI. Unzip the application bundle and run
-          <code>veil</code> &mdash; a native three-pane workspace opens, and you give it a goal. Where most
-          tools hand the job to a single assistant, this one can split it across a <em>swarm</em> of agents
-          working the same files in parallel. It ships its own model, so there is no key and no account, and
-          local conversation state is stored in a <code>data/</code> folder next to the binary.
+          <strong>the Veil</strong> is a desktop app for building software with AI. Give a team of agents a task,
+          review their changes and carry project memory into your next session. Run a local model or connect a
+          hosted provider in Settings.
         </p>
         <div class="hero-cta">
           <a class="btn btn-solid btn-lg" href="#get">
@@ -127,9 +124,7 @@
             See the build walkthrough
           </a>
         </div>
-        <p class="hero-note">Free and open source (MIT) for Windows, macOS and Linux &middot; <a href="#get">every download, and the Microsoft Store</a>.<br>
-          Local models or optional cloud AI; the built-in model is a separate download. Python required for coding tools; some checks also use Node.
-          Release downloads aren&rsquo;t code-signed yet, so your OS may ask before the first launch.</p>
+        <p class="hero-note">Free and open source (MIT) for Windows, macOS and Linux.</p>
       </div>
 
       <!-- veil-desk, drawn in the desk's own tokens -->
@@ -166,6 +161,105 @@
       <div class="stat"><b>3</b><span>clients over one API: web, desk, CLI</span></div>
       <div class="stat"><b id="statDocs">100+</b><span>modules with annotated source docs</span></div>
       <div class="stat"><b>0</b><span>bytes of telemetry leave the machine</span></div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ download ============ -->
+<section id="get" aria-labelledby="install-title" tabindex="-1" data-release="v1.1.31">
+  <div class="wrap">
+    <div class="section-head">
+      <h2 id="install-title">Install the Veil</h2>
+      <p class="section-sub">Choose your desktop. Each ZIP includes the app and memory engine.</p>
+    </div>
+
+    <p class="install-hint" data-install-hint="mobile" hidden>The desktop app runs on Windows, macOS and Linux. Open this page on your computer to install it.</p>
+    <p class="install-hint" data-install-hint="chromeos" hidden>On a Chromebook, check the architecture and glibc version of your Linux environment before downloading.</p>
+    <p class="install-hint" data-install-hint="linux-arm" hidden>This Linux desktop ZIP requires x86-64. You can <a href="#install-build">build from source</a> for a different Linux architecture.</p>
+
+    <div class="dl-grid">
+      <article class="dl-card" data-platform="windows">
+        <h3>Windows</h3>
+        <p>64-bit Intel or AMD</p>
+        <a class="btn btn-solid" href="https://apps.microsoft.com/detail/9MVQ78SK0CW6">Microsoft Store</a>
+        <a class="btn" data-release-asset="veil-{tag}-windows-x86_64.zip" href="https://github.com/gary23w/nl-veil/releases/download/v1.1.31/veil-v1.1.31-windows-x86_64.zip">Download Windows ZIP</a>
+      </article>
+      <article class="dl-card" data-platform="macos">
+        <h3>Mac <span>Apple silicon</span></h3>
+        <p>macOS 13 or later</p>
+        <a class="btn btn-solid" data-release-asset="veil-{tag}-macos-arm64.zip" href="https://github.com/gary23w/nl-veil/releases/download/v1.1.31/veil-v1.1.31-macos-arm64.zip">Download for Apple silicon</a>
+      </article>
+      <article class="dl-card" data-platform="macos">
+        <h3>Mac <span>Intel</span></h3>
+        <p>macOS 13 or later</p>
+        <a class="btn btn-solid" data-release-asset="veil-{tag}-macos-x86_64.zip" href="https://github.com/gary23w/nl-veil/releases/download/v1.1.31/veil-v1.1.31-macos-x86_64.zip">Download for Intel Mac</a>
+      </article>
+      <article class="dl-card" data-platform="linux">
+        <h3>Linux</h3>
+        <p>x86-64 &middot; glibc 2.39 or later</p>
+        <a class="btn btn-solid" data-release-asset="veil-{tag}-linux-x86_64.zip" href="https://github.com/gary23w/nl-veil/releases/download/v1.1.31/veil-v1.1.31-linux-x86_64-compat.zip">Download Linux ZIP</a>
+      </article>
+    </div>
+    <div class="install-links">
+      <p>On a Mac, open <strong>Apple menu &rarr; About This Mac</strong>. Choose Apple silicon if you see <strong>Chip</strong>, or Intel if you see <strong>Processor</strong>.</p>
+      <p><a data-release-notes href="https://github.com/gary23w/nl-veil/releases/tag/v1.1.31">v1.1.31 release notes</a> &middot; <a href="https://github.com/gary23w/nl-veil/releases">All releases</a></p>
+    </div>
+
+    <div class="install-next">
+      <div class="panel install-step">
+        <h3>Open the app</h3>
+        <ul>
+          <li><strong>Microsoft Store.</strong> Select <strong>Get</strong>, then open <strong>nl-veil</strong> from Start.</li>
+          <li><strong>Windows ZIP.</strong> Choose <strong>Extract All</strong>, then open <code>veil.exe</code> in the extracted folder.</li>
+          <li><strong>Mac or Linux ZIP.</strong> Extract the ZIP, open a terminal in the extracted folder and run <code>./start</code>.</li>
+        </ul>
+        <p>Use a folder you can write to. Keep <code>bin/</code> and <code>veil-install.txt</code> beside the executable.</p>
+      </div>
+      <div class="panel install-step">
+        <h3>Set up your first chat</h3>
+        <p>Open <strong>Settings &rarr; Models</strong>. For local AI, select <strong>Download the-veil-12b (~7 GB)</strong>, then <strong>Use built-in for chat</strong>. You can also select a running Ollama model or connect a hosted provider.</p>
+        <p>Open <strong>Chat</strong> and send <q>Reply with Veil is ready.</q> When you are ready to edit a project, the coding tools use Python on <code>PATH</code>. Some JavaScript checks also use Node.js.</p>
+        <p><a href="demos/">See the Cloudflare setup and build walkthrough</a></p>
+      </div>
+    </div>
+
+    <div class="install-help">
+      <details>
+        <summary>System requirements</summary>
+        <ul>
+          <li><strong>Windows.</strong> The Store package requires Windows 10 version 2004 or later. Windows 11 on Arm can emulate x64 apps. <a href="https://learn.microsoft.com/en-us/windows/arm/apps-on-arm-x86-emulation">Windows on Arm details</a></li>
+          <li><strong>Mac.</strong> Choose the build for your chip and use macOS 13 or later. <a href="https://support.apple.com/en-us/116943">Identify your Mac</a></li>
+          <li><strong>Linux.</strong> Use an x86-64 desktop with glibc 2.39 or later (such as Ubuntu 24.04), X11 or XWayland, and OpenGL drivers. Run <code>uname -m</code> and <code>ldd --version</code> to check your architecture and glibc. Install <code>curl</code> for app updates.</li>
+        </ul>
+      </details>
+      <details>
+        <summary>Verify a ZIP download</summary>
+        <p>Compute the SHA-256 of the downloaded ZIP, then compare it with the line for that filename in its checksum file.</p>
+        <ul>
+          <li>Windows PowerShell <code>Get-FileHash -Algorithm SHA256 .\filename.zip</code> &middot; <a data-release-asset="SHA256SUMS-windows-x86_64.txt" href="https://github.com/gary23w/nl-veil/releases/download/v1.1.31/SHA256SUMS-windows-x86_64.txt">Windows checksum</a></li>
+          <li>macOS Terminal <code>shasum -a 256 filename.zip</code> &middot; <a data-release-asset="SHA256SUMS-macos-arm64.txt" href="https://github.com/gary23w/nl-veil/releases/download/v1.1.31/SHA256SUMS-macos-arm64.txt">Apple silicon checksum</a> or <a data-release-asset="SHA256SUMS-macos-x86_64.txt" href="https://github.com/gary23w/nl-veil/releases/download/v1.1.31/SHA256SUMS-macos-x86_64.txt">Intel Mac checksum</a></li>
+          <li>Linux terminal <code>sha256sum filename.zip</code> &middot; <a data-release-asset="SHA256SUMS-linux-x86_64-glibc239.txt" href="https://github.com/gary23w/nl-veil/releases/download/v1.1.31/SHA256SUMS-linux-x86_64-compat.txt">Linux checksum</a></li>
+        </ul>
+      </details>
+      <details>
+        <summary>Download or launch problems</summary>
+        <ul>
+          <li><strong>Download failed.</strong> Retry from the <a href="https://github.com/gary23w/nl-veil/releases">official releases</a>, or use Microsoft Store on Windows. On GitHub choose a ZIP beginning with <code>veil-v</code>. For Linux v1.1.31, choose the ZIP ending in <code>-compat.zip</code>.</li>
+          <li><strong>Windows SmartScreen or macOS Gatekeeper.</strong> The ZIPs are unsigned. On Windows, Microsoft Store provides the signed install. On macOS, <a href="https://support.apple.com/en-ca/guide/mac-help/mh40616/mac">Apple explains how to open an app from an unknown developer</a> after you verify its source. If your device is managed, contact your administrator.</li>
+          <li><strong>Open Terminal in the extracted folder.</strong> Type <code>cd</code> followed by a space, drag the folder into Terminal and press Enter. Then run <code>./start</code>.</li>
+          <li><strong>Terminal says permission denied.</strong> From the extracted folder on macOS or Linux, run <code>chmod +x start veil bin/neuron</code>, then <code>./start</code>.</li>
+          <li><strong>Need help?</strong> Include your platform, the ZIP filename and the error in the <a href="https://github.com/gary23w/nl-veil/issues/new">project issue tracker</a>.</li>
+        </ul>
+      </details>
+      <details>
+        <summary>Update an existing install</summary>
+        <p>For a Store install, use Microsoft Store updates. For a ZIP install, finish active work and open
+          <strong>Settings &rarr; Updates &rarr; App updates &rarr; Update &amp; restart</strong>. If your copy predates the updater or cannot start, use the <a href="UPDATES.md">manual update and recovery guide</a>.</p>
+      </details>
+      <details id="install-build">
+        <summary>Build from source</summary>
+        <p>Use <a href="https://github.com/gary23w/nl-veil#install">the source build instructions</a> to install dependencies and build with Zig 0.16 or later.</p>
+      </details>
     </div>
   </div>
 </section>
@@ -250,75 +344,6 @@
     </div>
     <p class="cta-row"><a class="btn btn-solid" href="#doc=guide/security-tools">Set up security tools</a></p>
     <p class="hero-note">Live cloud command, shell-list and indicator-extraction calls verified through NL-Veil.</p>
-  </div>
-</section>
-
-<!-- ============ download ============ -->
-<section id="get">
-  <div class="wrap">
-    <div class="section-head">
-      <p class="section-eyebrow">Download</p>
-      <h2>Unzip the app, then run <code>veil</code>.</h2>
-      <p class="section-sub">Full bundles include the desktop application and memory engine. Extract the bundle for your platform and run the app; model weights are downloaded separately.</p>
-    </div>
-
-    <div class="dl-grid" id="dlGrid">
-      <div class="dl-card" data-os="win">
-        <span class="dl-os">
-          <svg viewBox="0 0 24 24"><path d="M3 5.5l8-1.2v7.2H3zM13 4l8-1.2v8.7h-8zM3 12.5h8v7.2l-8-1.2zM13 12.5h8v8.7L13 20z"/></svg>
-          Windows <span class="dl-arch">x86-64</span>
-        </span>
-        <span class="dl-file">veil-&hellip;-windows-x86_64.zip</span>
-        <a class="btn btn-solid" href="https://github.com/gary23w/nl-veil/releases/download/v1.1.31/veil-v1.1.31-windows-x86_64.zip" target="_blank" rel="noopener">Download</a>
-        <a class="btn" href="https://apps.microsoft.com/detail/9MVQ78SK0CW6" target="_blank" rel="noopener">Microsoft Store</a>
-      </div>
-      <div class="dl-card" data-os="macarm">
-        <span class="dl-os">
-          <svg viewBox="0 0 24 24"><path d="M16.4 12.8c0-2.4 2-3.5 2.1-3.6-1.1-1.7-2.9-1.9-3.6-1.9-1.5-.2-3 .9-3.8.9s-2-.9-3.3-.9c-1.7 0-3.2 1-4.1 2.5-1.7 3-.4 7.5 1.3 10 .8 1.2 1.8 2.5 3.1 2.5 1.2 0 1.7-.8 3.2-.8s1.9.8 3.2.8 2.2-1.2 3-2.4c.9-1.4 1.3-2.7 1.3-2.8-.1 0-2.4-1-2.4-3.7zM14 5.4c.7-.8 1.1-2 1-3.2-1 0-2.2.7-2.9 1.5-.6.7-1.2 1.9-1 3.1 1.1.1 2.2-.6 2.9-1.4z"/></svg>
-          macOS <span class="dl-arch">Apple Silicon</span>
-        </span>
-        <span class="dl-file">veil-&hellip;-macos-arm64.zip</span>
-        <a class="btn btn-solid" href="https://github.com/gary23w/nl-veil/releases/download/v1.1.31/veil-v1.1.31-macos-arm64.zip" target="_blank" rel="noopener">Download</a>
-      </div>
-      <div class="dl-card" data-os="macintel">
-        <span class="dl-os">
-          <svg viewBox="0 0 24 24"><path d="M16.4 12.8c0-2.4 2-3.5 2.1-3.6-1.1-1.7-2.9-1.9-3.6-1.9-1.5-.2-3 .9-3.8.9s-2-.9-3.3-.9c-1.7 0-3.2 1-4.1 2.5-1.7 3-.4 7.5 1.3 10 .8 1.2 1.8 2.5 3.1 2.5 1.2 0 1.7-.8 3.2-.8s1.9.8 3.2.8 2.2-1.2 3-2.4c.9-1.4 1.3-2.7 1.3-2.8-.1 0-2.4-1-2.4-3.7zM14 5.4c.7-.8 1.1-2 1-3.2-1 0-2.2.7-2.9 1.5-.6.7-1.2 1.9-1 3.1 1.1.1 2.2-.6 2.9-1.4z"/></svg>
-          macOS <span class="dl-arch">Intel</span>
-        </span>
-        <span class="dl-file">veil-&hellip;-macos-x86_64.zip</span>
-        <a class="btn btn-solid" href="https://github.com/gary23w/nl-veil/releases/download/v1.1.31/veil-v1.1.31-macos-x86_64.zip" target="_blank" rel="noopener">Download</a>
-      </div>
-      <div class="dl-card" data-os="linux">
-        <span class="dl-os">
-          <svg viewBox="0 0 24 24"><path d="M12 2c2.5 0 3.5 2 3.4 4.6-.1 1.8.8 2.7 1.7 4.3.9 1.7 2.4 3.7 2.4 5.6 0 2-1.4 3.5-3.4 3.5-1.3 0-2-.6-2.6-.6h-3c-.6 0-1.3.6-2.6.6-2 0-3.4-1.5-3.4-3.5 0-1.9 1.5-3.9 2.4-5.6.9-1.6 1.8-2.5 1.7-4.3C8.5 4 9.5 2 12 2z"/><path d="M10.3 7.2h.01M13.7 7.2h.01M10.6 9.6c.9.7 1.9.7 2.8 0"/></svg>
-          Linux <span class="dl-arch">x86-64</span>
-        </span>
-        <span class="dl-file">veil-&hellip;-linux-x86_64.zip</span>
-        <a class="btn btn-solid" href="https://github.com/gary23w/nl-veil/releases/download/v1.1.31/veil-v1.1.31-linux-x86_64.zip" target="_blank" rel="noopener">Download</a>
-      </div>
-    </div>
-
-    <div class="panel dl-notes">
-      <p>What changed in each version is in its release notes, on the <a href="https://github.com/gary23w/nl-veil/releases" target="_blank" rel="noopener">Releases page</a>.</p>
-      <p><strong>Take the <code>veil-&hellip;</code> archive</strong> &mdash; not &ldquo;Source code (zip)&rdquo;, which GitHub staples to every release and which needs a compiler, and not <code>veil-server-&hellip;</code>, the headless build for remote boxes with no desktop app.</p>
-      <div class="note-warn">
-        <svg viewBox="0 0 24 24"><path d="M12 9v4M12 17h.01M10.3 3.9L1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/></svg>
-        <span>On Windows, the Microsoft Store version is signed by Microsoft and installs with no prompt. The downloads here aren&rsquo;t signed yet: Windows SmartScreen or macOS Gatekeeper may require launch approval; follow the OS approval flow for a release you trust. Managed devices may require an administrator. This is separate from Cloudflare network access.</span>
-      </div>
-      <p><strong>The model comes too.</strong> The inference engine is compiled into the binary, so
-        <a href="https://huggingface.co/gary23w/the-veil-12b" target="_blank" rel="noopener">the-veil-12b</a>
-        is served by the server itself &mdash; no separate model runtime, no API key. Click <em>download the
-        model</em> in the app (or run <code>veil model pull</code>) and the whole thing works offline. Point it
-        at Ollama or any OpenAI-compatible endpoint instead whenever you would rather.</p>
-      <p><strong>Already on v1.1.3 or later?</strong> Finish active work, then use <em>Settings &rarr; Updates
-        &rarr; App updates &rarr; Update &amp; restart</em>.
-        Older versions need a manual installation of the full bundle.
-        <a href="#doc=guide/updates">Updates and connection guide &rarr;</a></p>
-      <p class="dim">Building it yourself instead &mdash; needs Zig 0.16+:</p>
-      <pre class="md-code"><code>git clone https://github.com/gary23w/nl-veil
-cd nl-veil
-zig build run</code></pre>
-    </div>
   </div>
 </section>
 
@@ -560,7 +585,7 @@ zig build run</code></pre>
 
 <footer class="foot">
   <div class="wrap foot-inner">
-    <span class="chip"><span class="chip-dot"></span>v1.1.31 &middot; open source</span>
+    <span class="chip"><span class="chip-dot"></span>Open source</span>
     <span class="dim" style="font-size:var(--fs-small)">Built by <a href="https://github.com/gary23w" target="_blank" rel="noopener">gary23w</a></span>
     <nav class="foot-links">
       <a href="https://github.com/gary23w/nl-veil" target="_blank" rel="noopener">nl-veil on GitHub</a>
@@ -599,20 +624,6 @@ zig build run</code></pre>
 <script src="js/markdown.js"></script>
 <script src="js/docs.js"></script>
 <script src="js/main.js"></script>
-<script>
-  /* One click to the right bundle. main.js marks the visitor's download card (.is-yours) and names the OS on the
-     hero button; on Windows and Linux the button then takes that card's own link, so the URL lives in one place
-     (the card, which the release bump keeps current). Macs keep the jump to the cards, because the Apple Silicon
-     guess can be wrong, and with no guess the button still goes to #get. */
-  (function () {
-    var card = document.querySelector('#dlGrid .dl-card.is-yours');
-    var hero = document.querySelector('.hero-cta .btn-solid');
-    if (!card || !hero) return;
-    var os = card.getAttribute('data-os');
-    if (os !== 'win' && os !== 'linux') return;
-    var link = card.querySelector('a.btn-solid');
-    if (link && link.href) hero.href = link.href;
-  })();
-</script>
+<script type="module" src="js/install.mjs"></script>
 </body>
 </html>

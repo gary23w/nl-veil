@@ -115,7 +115,30 @@ mkdir -p "$STAGE"
 # stack present. A desktop release must fail if the GUI does not link; a headless fallback cannot
 # replace an installed desktop. Standalone server artifacts are built separately below.
 say "building the app for $OS/$ARCH (ReleaseFast, stripped, GUI linked in)"
-( cd "$ROOT" && "$ZIG" build --release=fast $ZCPU --cache-dir "$CACHE" --prefix "$STAGE/server" )
+(
+  cd "$ROOT"
+  set --
+  if [ "$OS" = linux ]; then
+    # Pin the glibc ABI used by the Ubuntu 24.04 release runner. Zig treats an
+    # explicit glibc target as non-native, so pass the system X11/GL search paths.
+    if ! pkg-config --exists x11 gl; then
+      say "install pkg-config and the Linux X11 and OpenGL development libraries"
+      exit 1
+    fi
+    libdir=$(pkg-config --variable=libdir x11)
+    includedir=$(pkg-config --variable=includedir x11)
+    mkdir -p "$STAGE/linux-system/include"
+    ln -s "$libdir" "$STAGE/linux-system/lib"
+    # Keep Zig's target libc headers ahead of the host headers.
+    for headers in GL EGL KHR X11 xcb; do
+      if [ -d "$includedir/$headers" ]; then
+        ln -s "$includedir/$headers" "$STAGE/linux-system/include/$headers"
+      fi
+    done
+    set -- "-Dtarget=$ARCH-linux-gnu.2.39" --search-prefix "$STAGE/linux-system"
+  fi
+  "$ZIG" build --release=fast $ZCPU "$@" --cache-dir "$CACHE" --prefix "$STAGE/server"
+)
 SERVER="$STAGE/server/bin/veil$EXE"
 [ -f "$SERVER" ] || { say "veil binary missing at $SERVER"; exit 1; }
 

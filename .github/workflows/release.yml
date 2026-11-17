@@ -23,6 +23,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Test the install site
+        run: node --test scripts/test-install-site.mjs
       # Admin startup must prove its password was stored in neuron-db before the listener opens.
       # Without this executable the storage-backed tests skip, so build it for the check job too.
       - uses: actions/checkout@v4
@@ -76,7 +78,7 @@ jobs:
           # (raylib links the platform GUI stack) and neuron (Rust) per platform. `xc: yes` additionally
           # cross-compiles the standalone SERVER for every target; one runner doing that is enough.
           - { os: windows-latest,  name: windows-x86_64, xc: 'no'  }
-          - { os: ubuntu-latest,   name: linux-x86_64,   xc: 'yes' }
+          - { os: ubuntu-24.04,    name: linux-x86_64,   xc: 'yes' }
           # macos-15, NOT macos-14. GitHub retires the macOS 14 runners on 2026-11-02 and fails every job
           # on them during its scheduled brownouts before that; the v1.1.28 tag run lost this bundle to one.
           - { os: macos-15,        name: macos-arm64,    xc: 'no'  }
@@ -90,7 +92,7 @@ jobs:
           # These two are the newer-CPU builds: x86-64-v3 (AVX2, FMA, BMI2), so the built-in model's CPU
           # kernels use AVX2. Their updater stays on the -avx2 assets.
           - { os: windows-latest,  name: windows-x86_64-avx2, xc: 'no', variant: avx2 }
-          - { os: ubuntu-latest,   name: linux-x86_64-avx2,   xc: 'no', variant: avx2 }
+          - { os: ubuntu-24.04,    name: linux-x86_64-avx2,   xc: 'no', variant: avx2 }
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout nl-veil
@@ -105,7 +107,7 @@ jobs:
           path: neuron-db
 
       - name: Linux desktop deps (raylib GL/X11/wayland)
-        if: matrix.os == 'ubuntu-latest'
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y libgl1-mesa-dev libx11-dev libxrandr-dev \
@@ -183,6 +185,18 @@ jobs:
             [ -f "$f" ] && set -- "$@" "$f"
           done
           python scripts/check-macos-min.py --max 13.0 "$@"
+
+      - name: Check the Linux glibc floor
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          VERSION=$(sed -n 's/^const VERSION = "\(.*\)";$/\1/p' src/main.zig | head -1)
+          BUNDLE="bin/veil-v$VERSION-${{ matrix.name }}"
+          python scripts/check-linux-glibc.py "$BUNDLE/veil" "$BUNDLE/bin/neuron"
+          # The website uses this checksum name to find releases with a tested Linux build.
+          if [ "${{ matrix.name }}" = "linux-x86_64" ]; then
+            cp bin/SHA256SUMS-linux-x86_64.txt bin/SHA256SUMS-linux-x86_64-glibc239.txt
+          fi
 
       - name: Exercise packaged app and Cloudflare transports
         shell: bash
@@ -287,6 +301,7 @@ jobs:
             grep -Fx "veil-update-$RELEASE_TAG-$PLATFORM-neuron" assets.txt
             grep -Fx "SHA256SUMS-$PLATFORM.txt" assets.txt
           done
+          grep -Fx "SHA256SUMS-linux-x86_64-glibc239.txt" assets.txt
           for TARGET in windows-x86_64.exe linux-x86_64 linux-arm64 macos-arm64 macos-x86_64; do
             grep -Fx "veil-server-$RELEASE_TAG-$TARGET" assets.txt
           done

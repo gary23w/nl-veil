@@ -236,54 +236,89 @@ main > section:last-child { padding-bottom: var(--section-gap); }
 .stat span { display: block; margin-top: 3px; font-size: var(--fs-small); color: var(--text-muted); }
 
 /* ============================================================ download */
-.dl-grid {
-  display: grid; gap: var(--gap);
-  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
-  margin-bottom: var(--gap);
+.topbar .nav-install { flex: 0 0 auto; }
+@media (max-width: 420px) {
+  .topbar:has(.nav-install) .brand small,
+  .topbar .nav-install ~ a.icon-btn { display: none; }
 }
+
+#get { margin-top: var(--section-gap); padding-top: 0; }
+#get a:not(.btn) { text-decoration: underline; text-underline-offset: .16em; }
+.install-hint {
+  margin: 0 0 16px;
+  padding: 12px 14px;
+  border-radius: var(--radius);
+  background: var(--tonal);
+  color: var(--text);
+}
+
+.dl-grid, .install-next {
+  display: grid;
+  gap: var(--gap);
+}
+.dl-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.install-next { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+@media (max-width: 1000px) { .dl-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 550px) {
+  .dl-grid, .install-next { grid-template-columns: minmax(0, 1fr); }
+}
+
 .dl-card {
-  position: relative;
-  display: flex; flex-direction: column; gap: 4px;
-  padding: 15px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 16px;
   background: var(--surface-raised);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  transition: border-color .13s ease, background .13s ease;
 }
-.dl-card:hover { border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); }
-.dl-os { display: flex; align-items: center; gap: 8px; font-weight: 650; font-size: var(--fs-body); }
-.dl-os svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; color: var(--text-secondary); }
-.dl-arch { font-size: var(--fs-micro); color: var(--text-muted); font-weight: 400; }
-.dl-file {
-  font-family: var(--font-mono); font-size: var(--fs-micro);
-  color: var(--text-muted);
-  overflow-wrap: anywhere;
-  margin-bottom: 10px;
+.dl-card h3 { font-size: var(--fs-body); }
+.dl-card h3 span { font-size: var(--fs-small); font-weight: 500; color: var(--text-secondary); }
+.dl-card p, .install-links p { font-size: var(--fs-small); color: var(--text-secondary); }
+.dl-card p { margin-bottom: 6px; }
+.dl-card .btn { min-height: 44px; height: auto; text-align: center; white-space: normal; }
+.dl-card .btn:not(.btn-solid) {
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border);
 }
-.dl-card .btn { margin-top: auto; }
-/* the row for the machine that is reading — additive only, every card stays live */
-.dl-card.is-yours {
-  border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
-  background: color-mix(in srgb, var(--accent) 6%, var(--surface-raised));
+.dl-card .btn:not(.btn-solid):hover { background: var(--surface-hover); }
+.dl-card .btn:first-of-type { margin-top: auto; }
+#get[data-device="windows"] [data-platform="windows"],
+#get[data-device="macos"] [data-platform="macos"],
+#get[data-device="linux"] [data-platform="linux"] {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 5%, var(--surface-raised));
 }
-.dl-yours {
-  position: absolute; top: -9px; right: 12px;
-  padding: 2px 8px; border-radius: var(--radius-pill);
-  background: var(--accent); color: var(--on-accent);
-  font-size: var(--fs-micro); font-weight: 600;
+.install-links {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 6px 16px;
+  margin: 12px 0 22px;
 }
-
-.dl-notes { display: grid; gap: 10px; padding: var(--pad-in) var(--pad); }
-.dl-notes p { font-size: var(--fs-small); color: var(--text-secondary); }
-.dl-notes strong { color: var(--text); }
-.note-warn {
-  display: flex; gap: 9px; align-items: flex-start;
-  padding: 10px 12px; border-radius: var(--radius);
-  background: color-mix(in srgb, var(--warn) 12%, transparent);
+.install-step { padding: var(--pad-in) var(--pad); }
+.install-step h3 { font-size: var(--fs-body); }
+.install-step p, .install-step ul, .install-help details > :not(summary) {
+  margin-top: 8px;
   color: var(--text-secondary);
+  overflow-wrap: anywhere;
 }
-.note-warn svg { width: 16px; height: 16px; flex: 0 0 auto; margin-top: 2px; fill: none; stroke: var(--warn); stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
-.dl-notes pre.md-code { margin: 4px 0 0; }
+.install-step ul, .install-help ul { padding-left: 1.3em; }
+.install-step li + li, .install-help li + li { margin-top: 6px; }
+.install-help { margin-top: 14px; }
+.install-help details {
+  border-bottom: 1px solid var(--border);
+  padding: 0 4px;
+}
+.install-help details[open] { padding-bottom: 12px; }
+.install-help summary {
+  min-height: 44px;
+  padding: 12px 0;
+  font-weight: 650;
+  cursor: pointer;
+}
+.install-help summary:hover { color: var(--accent); }
 
 /* ============================================================ the map */
 .map-viewport {

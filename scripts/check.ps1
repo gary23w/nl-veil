@@ -311,18 +311,6 @@ if ($Scan) {
         $signals++
         Write-Host "[version] bin/MANIFEST.txt carries no '$vZon' stamp -- run scripts\bump-version.ps1" -ForegroundColor Yellow
     }
-    # Download links (twin of the same check in check.sh). They name an explicit release tag because
-    # /releases/latest resolves by SKIPPING prereleases -- every app release so far has been one, so those
-    # buttons pointed at a `builtin-assets-*` blob rather than the app. Explicit is right, but it drifts.
-    $badLinks = @(Select-String -Path (Join-Path $repo "README.md"), (Join-Path $repo "docs\index.html") `
-        -Pattern 'releases/tag/v([^\s")]+)' -AllMatches |
-        ForEach-Object { $_.Matches } | Where-Object { $_.Groups[1].Value -ne $vMain })
-    if ($badLinks.Count -gt 0) {
-        $signals++
-        Write-Host "[links] $($badLinks.Count) download link(s) in README/docs point at a tag other than v$vMain" -ForegroundColor Yellow
-    } else {
-        Write-Host "[links] download links point at v$vMain" -ForegroundColor Green
-    }
     # Neither the README nor the site carries per-release text: no "Stable release" / "New in vX" blocks,
     # no Current/Previously/Before-it chain, no "Since vX" eyebrows. A version's changes go in
     # docs/release/RELEASE-vX.md and the GitHub release only. Twin of the same check in check.sh.

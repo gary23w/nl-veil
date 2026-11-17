@@ -120,12 +120,9 @@ if [ "${1:-}" = "--scan" ]; then
   # drifts.
   vd=$(sed -n 's/.*\.version = "\([^"]*\)".*/\1/p' desk/build.zig.zon | head -1)
   if [ "$vz" = "$vm" ] && [ "$vd" = "$vm" ]; then echo "[version] $vz (zon + desk/zon match main.zig)"; else echo "[version] zon=$vz desk/zon=$vd main.zig=$vm -- stamp all three (scripts/bump-version.ps1)"; fi
-  grep -q "$vz" bin/MANIFEST.txt || echo "[version] bin/MANIFEST.txt carries no '$vz' stamp"
-  # The docs' download links name an explicit release tag. They used to say /releases/latest, which GitHub
-  # resolves by SKIPPING prereleases -- and every app release so far has been one, so the buttons pointed at a
-  # `builtin-assets-*` blob instead of the app. An explicit tag is correct but has to move with the version.
-  bad=$(grep -roE 'releases/tag/v[^\s")]+' README.md docs/index.html | grep -v "releases/tag/v$vm\$" | wc -l | tr -d ' ')
-  if [ "$bad" = "0" ]; then echo "[links] download links point at v$vm"; else echo "[links] $bad download link(s) in README/docs point at a tag other than v$vm (scripts/bump-version.ps1)"; fi
+  if [ -f bin/MANIFEST.txt ] && ! grep -q "$vz" bin/MANIFEST.txt; then
+    echo "[version] bin/MANIFEST.txt carries no '$vz' stamp"
+  fi
   # Neither the README nor the site carries per-release text: no "Stable release" / "New in vX" blocks,
   # no Current/Previously/Before-it chain, no "Since vX" eyebrows. A version's changes go in
   # docs/release/RELEASE-vX.md and the GitHub release only. Twin of the same check in check.ps1.

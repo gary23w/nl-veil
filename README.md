@@ -8,7 +8,7 @@ the Veil (nl-veil) is an open-source desktop app for building software with AI. 
 let specialist agents share the work, and carry project memory
 into your next session. Use the built-in model, Ollama, or an OpenAI-compatible endpoint.
 
-**[Download the desktop app](https://github.com/gary23w/nl-veil/releases/tag/v1.1.31)** ·
+**[Download the desktop app](https://veil.garrettstimpson.ca/#get)** ·
 **[Get it from the Microsoft Store](https://apps.microsoft.com/detail/9MVQ78SK0CW6)** (Windows) ·
 **[Screenshot walkthrough: setup & build with Cloudflare AI](https://veil.garrettstimpson.ca/demos/)** ·
 [Website](https://veil.garrettstimpson.ca/) ·
@@ -548,18 +548,12 @@ raylib is a *lazy* dependency, so `-Dapp=false` never fetches it at all.
 
 ## Install
 
-Download your platform's full application bundle from **[v1.1.31](https://github.com/gary23w/nl-veil/releases/tag/v1.1.31)**, extract it,
-and run `veil.exe` on Windows or `./start` on macOS/Linux. The bundle includes the desktop
-application and memory engine; model weights are downloaded separately in the app.
+Choose your platform on the **[download page](https://veil.garrettstimpson.ca/#get)**. It has
+the Microsoft Store link for Windows and ZIPs for Windows, both Mac architectures and Linux.
 
-| Platform | Application bundle |
-|---|---|
-| Windows x86-64 | [veil-v1.1.31-windows-x86_64.zip](https://github.com/gary23w/nl-veil/releases/download/v1.1.31/veil-v1.1.31-windows-x86_64.zip) |
-| Linux x86-64 | [veil-v1.1.31-linux-x86_64.zip](https://github.com/gary23w/nl-veil/releases/download/v1.1.31/veil-v1.1.31-linux-x86_64.zip) |
-| macOS Apple Silicon | [veil-v1.1.31-macos-arm64.zip](https://github.com/gary23w/nl-veil/releases/download/v1.1.31/veil-v1.1.31-macos-arm64.zip) |
-| macOS Intel | [veil-v1.1.31-macos-x86_64.zip](https://github.com/gary23w/nl-veil/releases/download/v1.1.31/veil-v1.1.31-macos-x86_64.zip) |
-
-Choose the full `veil-v…` bundle, rather than GitHub's source archive or the standalone server.
+Extract the entire ZIP to a writable folder. Open `veil.exe` on Windows or run `./start` from
+the extracted folder on macOS or Linux. Keep `bin/` and `veil-install.txt` beside the executable.
+Open **Settings → Models** in the app to set up your model.
 
 <details><summary>Build from source (requires Zig 0.16+)</summary>
 

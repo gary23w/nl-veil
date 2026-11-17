@@ -67,32 +67,6 @@
     revealables.forEach((el) => io.observe(el));
   }
 
-  /* ---------------- platform detection ----------------
-     Purely additive: every card stays visible and every link stays live, so a
-     wrong guess (or no guess) costs nobody a download. */
-  (() => {
-    const grid = document.getElementById('dlGrid');
-    if (!grid) return;
-    const ua = navigator.userAgent || '';
-    const plat = navigator.platform || '';
-    let os = null, label = '';
-    if (/Win/i.test(plat) || /Windows/i.test(ua)) { os = 'win'; label = 'for Windows'; }
-    // Apple Silicon still reports as Intel in the UA and userAgentData is no
-    // better, so Macs guess arm64 (the majority now). Both mac cards sit right
-    // there, so a miss is a glance, not a dead end.
-    else if (/Mac/i.test(plat) || /Mac OS X/i.test(ua)) { os = 'macarm'; label = 'for macOS'; }
-    else if (/Linux/i.test(plat) && !/Android/i.test(ua)) { os = 'linux'; label = 'for Linux'; }
-    const card = os && grid.querySelector('.dl-card[data-os="' + os + '"]');
-    if (!card) return;
-    card.classList.add('is-yours');
-    const badge = document.createElement('span');
-    badge.className = 'dl-yours';
-    badge.textContent = 'your machine';
-    card.appendChild(badge);
-    const heroBtn = document.querySelector('.hero-cta .btn-solid');
-    if (heroBtn && label) heroBtn.appendChild(document.createTextNode(' ' + label));
-  })();
-
   /* ---------------- nav scroll spy ---------------- */
   (() => {
     const links = Array.from(document.querySelectorAll('.nav a[href^="#"]'));
