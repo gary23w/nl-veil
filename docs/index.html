@@ -127,7 +127,9 @@
             See the build walkthrough
           </a>
         </div>
-        <p class="hero-note">Windows &middot; macOS &middot; Linux. Local models or optional cloud AI. Python required for coding tools; some checks also use Node.</p>
+        <p class="hero-note">Free and open source (MIT) for Windows, macOS and Linux &middot; <a href="#get">every download, and the Microsoft Store</a>.<br>
+          Local models or optional cloud AI; the built-in model is a separate download. Python required for coding tools; some checks also use Node.
+          Release downloads aren&rsquo;t code-signed yet, so your OS may ask before the first launch.</p>
       </div>
 
       <!-- veil-desk, drawn in the desk's own tokens -->
@@ -316,6 +318,60 @@
       <pre class="md-code"><code>git clone https://github.com/gary23w/nl-veil
 cd nl-veil
 zig build run</code></pre>
+    </div>
+  </div>
+</section>
+
+<!-- ============ short answers ============
+     Each answer is written from README.md, docs-src/guide/ and packaging/windows/store-listing.json; keep them
+     true to those, and change them when they change. -->
+<section id="faq">
+  <div class="wrap">
+    <div class="section-head">
+      <p class="section-eyebrow">Questions</p>
+      <h2>The short answers.</h2>
+    </div>
+    <div class="note-grid">
+      <article class="note-card">
+        <h3>What is the Veil?</h3>
+        <p>The Veil (nl-veil) is a free, open-source desktop app for building software with AI, under the MIT license.
+          You give it a goal in a native three-pane workspace. It can split the job across a team of specialist agents,
+          each owning real files, working in parallel on one shared memory, and it carries what it learns about your
+          project into the next session. It runs on Windows, macOS and Linux.</p>
+      </article>
+      <article class="note-card">
+        <h3>Does it need an API key or an account?</h3>
+        <p>Not for local models. The built-in model, <a href="https://huggingface.co/gary23w/the-veil-12b" target="_blank" rel="noopener">the-veil-12b</a>,
+          is served by the app itself, and Ollama runs on your own machine; neither needs a provider account or an API key.
+          The model weights are a separate download: click <em>download the model</em> in the app, or run
+          <code>veil model pull</code>. A hosted provider you connect has its own account, key and costs.</p>
+      </article>
+      <article class="note-card">
+        <h3>Which models does it run?</h3>
+        <p>Its built-in engine serves the-veil-12b from a GGUF file on disk, with no separate model runtime. It also works
+          with a local Ollama, any OpenAI-compatible endpoint, and, once you log in with Cloudflare, your own account&rsquo;s
+          Workers AI models. Each turn&rsquo;s calls are labelled coding, thinking or prompting, and each role can use a
+          different model.</p>
+      </article>
+      <article class="note-card">
+        <h3>What does my machine need?</h3>
+        <p>The bundle for your platform: Windows x86-64, macOS on Apple Silicon or Intel, or Linux x86-64. The coding tools
+          need Python on <code>PATH</code>, and some JavaScript checks use Node.js; if Python is missing, the agent can
+          install it itself. The built-in engine uses your GPU through Vulkan when there is one and falls back to the CPU;
+          macOS builds run it on the CPU. Hardware needs depend on the model you choose.</p>
+      </article>
+      <article class="note-card">
+        <h3>Where does my data go?</h3>
+        <p>Local conversations, keys and memory are stored in a <code>data/</code> folder next to the app. Hosted model
+          calls, web tools and optional Cloudflare backups send the data those features need to the services you connect.
+          The app itself has no analytics. The details are in the <a href="privacy.html">privacy policy</a>.</p>
+      </article>
+      <article class="note-card">
+        <h3>What should I try first?</h3>
+        <p>Pick a model, open a small project you can safely edit, and ask for one concrete change: find a missing
+          input-validation test, add it, make the smallest fix and run the tests. Review the diff and the test output.
+          Then start a new conversation on the same project and ask what test command you used and what changed last time.</p>
+      </article>
     </div>
   </div>
 </section>
@@ -543,5 +599,20 @@ zig build run</code></pre>
 <script src="js/markdown.js"></script>
 <script src="js/docs.js"></script>
 <script src="js/main.js"></script>
+<script>
+  /* One click to the right bundle. main.js marks the visitor's download card (.is-yours) and names the OS on the
+     hero button; on Windows and Linux the button then takes that card's own link, so the URL lives in one place
+     (the card, which the release bump keeps current). Macs keep the jump to the cards, because the Apple Silicon
+     guess can be wrong, and with no guess the button still goes to #get. */
+  (function () {
+    var card = document.querySelector('#dlGrid .dl-card.is-yours');
+    var hero = document.querySelector('.hero-cta .btn-solid');
+    if (!card || !hero) return;
+    var os = card.getAttribute('data-os');
+    if (os !== 'win' && os !== 'linux') return;
+    var link = card.querySelector('a.btn-solid');
+    if (link && link.href) hero.href = link.href;
+  })();
+</script>
 </body>
 </html>
