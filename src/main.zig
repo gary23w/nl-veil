@@ -449,11 +449,11 @@ pub fn main(init: std.process.Init) !void {
     // worker lessons compound instead of each process re-paying a known model's failed round-trip.
     @import("worker/llm.zig").initQuirkStore(io, paths.data);
 
-    // The one place the port is resolved (CLI client + server bind share it): NL_PORT else 8787.
+    // The one place the port is resolved (CLI client + server bind share it): NL_PORT falls back to the default desktop port.
     const cli_port: u16 = if (init.environ_map.get("NL_PORT")) |v|
-        (std.fmt.parseInt(u16, std.mem.trim(u8, v, " \r\n\t"), 10) catch 8787)
+        (std.fmt.parseInt(u16, std.mem.trim(u8, v, " \r\n\t"), 10) catch DEFAULT_APP_PORT)
     else
-        8787;
+        DEFAULT_APP_PORT;
     // BIND 0.0.0.0 BY DEFAULT. The veil is meant to be reachable from the other machines around it —
     // a phone on the sofa, a laptop in the next room — and a loopback default meant every one of those
     // people had to discover NL_BIND before the web UI existed for them at all. `NL_BIND=127.0.0.1`
@@ -1081,9 +1081,9 @@ pub fn main(init: std.process.Init) !void {
     // "server offline" flash on every launch. Bounded and best-effort: never block the window on the backend.
     awaitServer(gpa, io, port, 3000);
 
-    // A desk drives the port its settings.json names (8787 by default). When this veil had to move, pin the desk to
-    // the port it actually serves for this run (desk AttachTarget: never written to settings.json).
-    desk.runApp(paths.data, if (port != cli_port) desk.AttachTarget{ .port = port } else null) catch |e| {
+    // The desk honors its saved connection on the default server port. Use the actual local
+    // listener for this run when NL_PORT or a port conflict moves the integrated server.
+    desk.runApp(paths.data, if (desktopAttachPort(port)) |actual| desk.AttachTarget{ .port = actual } else null) catch |e| {
         // NO WINDOW is not a reason to take the server down with it — the server is the useful half, and
         // the web UI is right there. Degrade instead of exiting silently (see serveWithoutDesk).
         if (e == error.WindowUnavailable) serveWithoutDesk(io, port, paths.data);
@@ -1204,6 +1204,18 @@ const ServerThread = struct {
 const APP_PORT_SETTLE_MS: u64 = 4000;
 /// How many ports past its own app mode tries, one at a time, when its own stays taken.
 const APP_PORT_SPAN: u16 = 20;
+
+const DEFAULT_APP_PORT: u16 = 8787;
+
+fn desktopAttachPort(server_port: u16) ?u16 {
+    return if (server_port == DEFAULT_APP_PORT) null else server_port;
+}
+
+test "integrated desk follows a non-default server port" {
+    try std.testing.expectEqual(@as(?u16, null), desktopAttachPort(DEFAULT_APP_PORT));
+    try std.testing.expectEqual(@as(?u16, 8789), desktopAttachPort(8789));
+    try std.testing.expectEqual(@as(?u16, 57177), desktopAttachPort(57177));
+}
 
 /// App mode's port: `want` when it is free or comes free within `settle_ms`, else the first free port of the
 /// APP_PORT_SPAN after it, else `want` (whose listen then fails and says so). Each look is made the way the server

@@ -19,8 +19,11 @@ test('every platform has a pinned ZIP and verification file without JavaScript',
   for (const [, pattern, href] of anchors) {
     const name = pattern.replace('{tag}', pinned);
     const prefix = root + '/download/' + pinned + '/';
-    const compatible = name.replace(/linux-x86_64(?:-glibc239)?\.(zip|txt)$/, 'linux-x86_64-compat.$1');
-    assert.ok(href === prefix + name || href === prefix + compatible, href);
+    const pinnedAsset = pinned === 'v1.1.31'
+      ? name.replace(/windows-x86_64\.(zip|txt)$/, 'windows-x86_64-desktop-fix.$1')
+          .replace(/linux-x86_64(?:-glibc239)?\.(zip|txt)$/, 'linux-x86_64-compat.$1')
+      : name;
+    assert.equal(href, prefix + pinnedAsset);
   }
   assert.ok(index.includes(`data-release-notes href="${root}/tag/${pinned}">${pinned} release notes`));
   assert.ok(index.includes('https://apps.microsoft.com/detail/9MVQ78SK0CW6'));

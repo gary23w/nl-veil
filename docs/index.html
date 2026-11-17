@@ -182,7 +182,7 @@
         <h3>Windows</h3>
         <p>64-bit Intel or AMD</p>
         <a class="btn btn-solid" href="https://apps.microsoft.com/detail/9MVQ78SK0CW6">Microsoft Store</a>
-        <a class="btn" data-release-asset="veil-{tag}-windows-x86_64.zip" href="https://github.com/gary23w/nl-veil/releases/download/v1.1.31/veil-v1.1.31-windows-x86_64.zip">Download Windows ZIP</a>
+        <a class="btn" data-release-asset="veil-{tag}-windows-x86_64.zip" href="https://github.com/gary23w/nl-veil/releases/download/v1.1.31/veil-v1.1.31-windows-x86_64-desktop-fix.zip">Download Windows ZIP</a>
       </article>
       <article class="dl-card" data-platform="macos">
         <h3>Mac <span>Apple silicon</span></h3>
@@ -236,7 +236,7 @@
         <summary>Verify a ZIP download</summary>
         <p>Compute the SHA-256 of the downloaded ZIP, then compare it with the line for that filename in its checksum file.</p>
         <ul>
-          <li>Windows PowerShell <code>Get-FileHash -Algorithm SHA256 .\filename.zip</code> &middot; <a data-release-asset="SHA256SUMS-windows-x86_64.txt" href="https://github.com/gary23w/nl-veil/releases/download/v1.1.31/SHA256SUMS-windows-x86_64.txt">Windows checksum</a></li>
+          <li>Windows PowerShell <code>Get-FileHash -Algorithm SHA256 .\filename.zip</code> &middot; <a data-release-asset="SHA256SUMS-windows-x86_64.txt" href="https://github.com/gary23w/nl-veil/releases/download/v1.1.31/SHA256SUMS-windows-x86_64-desktop-fix.txt">Windows checksum</a></li>
           <li>macOS Terminal <code>shasum -a 256 filename.zip</code> &middot; <a data-release-asset="SHA256SUMS-macos-arm64.txt" href="https://github.com/gary23w/nl-veil/releases/download/v1.1.31/SHA256SUMS-macos-arm64.txt">Apple silicon checksum</a> or <a data-release-asset="SHA256SUMS-macos-x86_64.txt" href="https://github.com/gary23w/nl-veil/releases/download/v1.1.31/SHA256SUMS-macos-x86_64.txt">Intel Mac checksum</a></li>
           <li>Linux terminal <code>sha256sum filename.zip</code> &middot; <a data-release-asset="SHA256SUMS-linux-x86_64-glibc239.txt" href="https://github.com/gary23w/nl-veil/releases/download/v1.1.31/SHA256SUMS-linux-x86_64-compat.txt">Linux checksum</a></li>
         </ul>
@@ -244,7 +244,7 @@
       <details>
         <summary>Download or launch problems</summary>
         <ul>
-          <li><strong>Download failed.</strong> Retry from the <a href="https://github.com/gary23w/nl-veil/releases">official releases</a>, or use Microsoft Store on Windows. On GitHub choose a ZIP beginning with <code>veil-v</code>. For Linux v1.1.31, choose the ZIP ending in <code>-compat.zip</code>.</li>
+          <li><strong>Download failed.</strong> Retry from the <a href="https://github.com/gary23w/nl-veil/releases">official releases</a>, or use Microsoft Store on Windows. On GitHub choose a ZIP beginning with <code>veil-v</code>. For v1.1.31, choose <code>-desktop-fix.zip</code> on Windows or <code>-compat.zip</code> on Linux.</li>
           <li><strong>Windows SmartScreen or macOS Gatekeeper.</strong> The ZIPs are unsigned. On Windows, Microsoft Store provides the signed install. On macOS, <a href="https://support.apple.com/en-ca/guide/mac-help/mh40616/mac">Apple explains how to open an app from an unknown developer</a> after you verify its source. If your device is managed, contact your administrator.</li>
           <li><strong>Open Terminal in the extracted folder.</strong> Type <code>cd</code> followed by a space, drag the folder into Terminal and press Enter. Then run <code>./start</code>.</li>
           <li><strong>Terminal says permission denied.</strong> From the extracted folder on macOS or Linux, run <code>chmod +x start veil bin/neuron</code>, then <code>./start</code>.</li>

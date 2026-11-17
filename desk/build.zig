@@ -38,7 +38,10 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addImport("raylib", raylib_dep.module("raylib"));
     exe.root_module.addImport("modelcfg", modelcfg);
     addDeskAssets(b, exe.root_module);
-    exe.root_module.linkLibrary(raylib_dep.artifact("raylib"));
+    const raylib_lib = raylib_dep.artifact("raylib");
+    if (target.result.os.tag == .windows)
+        guardWindowsGlfw(b, raylib_lib, "src/veil_glfw_focus.h");
+    exe.root_module.linkLibrary(raylib_lib);
     // GUI subsystem on Windows release builds: no console window behind the dashboard.
     if (target.result.os.tag == .windows and optimize != .Debug) exe.subsystem = .Windows;
     // The Windows FILE icon — same resource the merged `veil` binary embeds (see the root build.zig), so a
@@ -85,10 +88,59 @@ pub fn build(b: *std.Build) void {
     // tests.zig pulls theme.zig, which reaches assets.zig — the test module needs the same embeds or the
     // @embedFile names do not resolve.
     addDeskAssets(b, tests.root_module);
-    tests.root_module.linkLibrary(raylib_dep.artifact("raylib"));
+    tests.root_module.linkLibrary(raylib_lib);
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run veil-desk unit tests");
     test_step.dependOn(&run_tests.step);
+}
+
+/// Splice the guard into the bundled GLFW translation unit after GLFW has
+/// configured the Win32 headers. Keep the fetched Raylib package immutable.
+pub fn guardWindowsGlfw(b: *std.Build, raylib_lib: *std.Build.Step.Compile, header: []const u8) void {
+    const module = raylib_lib.root_module;
+    for (module.link_objects.items, 0..) |link, link_index| {
+        if (link != .c_source_files) continue;
+        const sources = link.c_source_files;
+        for (sources.files, 0..) |file, i| {
+            if (!std.mem.eql(u8, std.fs.path.basename(file), "rglfw.c")) continue;
+            const original_path = sources.root.path(b, file).getPath(b);
+            const original = std.Io.Dir.cwd().readFileAlloc(b.graph.io, original_path, b.allocator, .limited(64 * 1024)) catch
+                @panic("could not read Raylib's bundled GLFW source");
+            const include = "#include \"external/glfw/src/win32_window.c\"";
+            const offset = std.mem.indexOf(u8, original, include) orelse
+                @panic("could not find the bundled GLFW Win32 implementation");
+            const guarded =
+                \\#include "veil_glfw_focus.h"
+                \\#include "external/glfw/src/win32_window.c"
+                \\#undef GetActiveWindow
+            ;
+            const patched = std.mem.concat(b.allocator, u8, &.{
+                original[0..offset],
+                guarded,
+                original[offset + include.len ..],
+            }) catch @panic("out of memory adding the GLFW focus guard");
+            const flags = std.mem.concat(b.allocator, []const u8, &.{ sources.flags, &.{
+                "-I",
+                std.fs.path.dirname(original_path).?,
+                "-I",
+                std.fs.path.dirname(b.path(header).getPath(b)).?,
+            } }) catch @panic("out of memory adding the GLFW include paths");
+            if (sources.files.len == 1) {
+                _ = module.link_objects.orderedRemove(link_index);
+            } else {
+                sources.files = std.mem.concat(b.allocator, []const u8, &.{
+                    sources.files[0..i],
+                    sources.files[i + 1 ..],
+                }) catch @panic("out of memory separating the GLFW translation unit");
+            }
+            module.addCSourceFile(.{
+                .file = b.addWriteFiles().add("veil-rglfw.c", patched),
+                .flags = flags,
+                .language = sources.language,
+            });
+            return;
+        }
+    }
 }
 
 /// Register the bundled art + type as anonymous imports so src/assets.zig can @embedFile them.

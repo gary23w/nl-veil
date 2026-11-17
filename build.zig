@@ -166,7 +166,10 @@ pub fn build(b: *std.Build) void {
         addDeskAssets(b, desk_mod);
 
         exe.root_module.addImport("desk", desk_mod);
-        exe.root_module.linkLibrary(raylib.artifact("raylib"));
+        const raylib_lib = raylib.artifact("raylib");
+        if (target.result.os.tag == .windows)
+            @import("desk/build.zig").guardWindowsGlfw(b, raylib_lib, "desk/src/veil_glfw_focus.h");
+        exe.root_module.linkLibrary(raylib_lib);
         // desk/src/main.zig runs on std.heap.c_allocator, and raylib is a C library: the merged binary links
         // libc. (The server-only build does not.)
         exe.root_module.link_libc = true;
