@@ -37,6 +37,10 @@ const S = {
                         // runs live only here, and the Tasks tab reads them back out (taskRuns)
                         // — filtering the rail must not amount to deleting the only route to them.
   conv: null,           // active conversation id
+  loadingConv: false,
+  convLoadError: '',
+  posting: false,
+  onThread: false,      // phone layout
   subsOpen: {},         // primary conv id -> its sub-chat drop-down is expanded (session-local)
   msgs: [],             // [{role,content,kind,ts}]
   live: false,          // a turn is running for the active conv
@@ -1086,8 +1090,18 @@ async function loadLocalModels() {
 function onSignedOut() {
   stopPoll();
   stopHealthPoll();
+  el('transcript')?.follow.dispose();
+  chatViewEpoch++;
+  chatDrafts.clear();
   S.me = null;
   S.conv = null;
+  S.loadingConv = false;
+  S.convLoadError = '';
+  S.posting = false;
+  S.onThread = false;
+  S.live = false;
+  S.msgs = [];
+  resetStream();
   // Everything below is per-ACCOUNT, and this tab may well be signed into another
   // one next. keysLoaded is the flag that licenses missingKeyProvider to make a
   // statement about keys at all, so leaving it set hands the next user the previous
@@ -1116,8 +1130,9 @@ function renderAuth(msg, msgCls) {
   el('app').innerHTML = `
     <div class="auth-wrap">
       <form class="auth-card" id="authForm" autocomplete="on">
-        <div class="auth-brand">the veil</div>
-        <div class="auth-tag">a hive mind you talk to — running on your machine</div>
+        <div class="workspace-emblem">${VeilWorkspace.mark}</div>
+        <h1 class="auth-brand">Sign in to the veil</h1>
+        <p class="auth-tag">Use your account on this Veil server.</p>
 
         <div class="field">
           <label for="auEmail">Email</label>
@@ -1208,7 +1223,7 @@ function enterApp(user) {
 
   el('app').innerHTML = `
     <header class="topbar">
-      <div class="brand">the veil <small>${esc(user.email || '')}</small></div>
+      <div class="brand">${VeilWorkspace.mark} the veil <small>${esc(user.email || '')}</small></div>
       <div class="grow"></div>
       <div class="status-chip"><i class="status-dot" id="statusDot"></i><span id="statusText">checking…</span><span id="statusCf" class="hide"></span></div>
       <button class="icon-btn" id="themeBtn" title="Toggle light / dark" aria-label="Toggle theme">${themeIcon()}</button>
@@ -1259,12 +1274,17 @@ function visibleTabs() {
 }
 
 function setTab(id) {
+  if (id === S.tab && el('chatRoot')) return;
   S.tab = id;
   LS.set('veil.tab', id);
   $$('[data-tab]').forEach((b) => b.classList.toggle('active', b.dataset.tab === id));
   // Leaving chat must not leave a poll running against a conversation nobody is
   // looking at — that is one request per second, forever, on cellular.
-  if (id !== 'chat') stopPoll();
+  if (id !== 'chat') {
+    chatViewEpoch++;
+    stopPoll();
+    el('transcript')?.follow.dispose();
+  }
   const v = el('view');
   if (id === 'dashboard') return renderDashboard(v);
   if (id === 'chat')      return renderChat(v);
@@ -1487,83 +1507,82 @@ function newConvId() {
 
 function renderChat(host) {
   host.innerHTML = `
-    <div class="chat" id="chatRoot">
-      <aside class="chat-list">
+    <div class="chat${S.onThread ? ' on-thread' : ''}" id="chatRoot">
+      <aside class="chat-list" aria-label="Conversations">
         <div class="chat-list-head">
           <button class="btn btn-solid btn-sm grow" id="newConv">+ New chat</button>
           <button class="icon-btn rail-toggle" id="railToggle" title="Collapse the list" aria-label="Collapse the conversation list">
             <svg viewBox="0 0 24 24"><path d="M15 18l-6-6 6-6"/></svg>
           </button>
         </div>
-        <div class="scroller" id="convScroll"><div class="empty">loading…</div></div>
+        <div class="scroller" id="convScroll"><div class="empty">Loading chats…</div></div>
         <button class="cf-card hide" id="cfChip" type="button"></button>
       </aside>
 
       <div class="rail-grip" id="railGrip" role="separator" aria-orientation="vertical"
            aria-label="Resize the conversation list" tabindex="0"></div>
 
-      <section class="chat-main">
-        <div class="chat-topline">
+      <section class="chat-main workspace" aria-label="Chat">
+        <div class="workspace-heading">
           <button class="icon-btn rail-restore hide" id="railRestore" title="Show the conversation list" aria-label="Show the conversation list">
             <svg viewBox="0 0 24 24"><path d="M9 18l6-6-6-6"/></svg>
           </button>
           <button class="icon-btn chat-back" id="backBtn" aria-label="Back to conversations">
             <svg viewBox="0 0 24 24"><path d="M15 18l-6-6 6-6"/></svg>
           </button>
-          <div class="grow mono ellip" id="convTitle">—</div>
-          <button class="icon-btn" id="filesBtn" title="Files this conversation built" aria-label="Files">
+          <div class="workspace-title" id="convTitle">New chat</div>
+          <button class="icon-btn" id="filesBtn" title="Files this conversation built" aria-label="Files" aria-controls="filesPane" aria-expanded="false" disabled>
             <svg viewBox="0 0 24 24"><path d="M4 6a2 2 0 0 1 2-2h4l2 2h6a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2z"/></svg>
           </button>
-          <button class="icon-btn" id="delConv" title="Delete conversation" aria-label="Delete conversation">
+          <button class="icon-btn" id="delConv" title="Delete conversation" aria-label="Delete conversation" disabled>
             <svg viewBox="0 0 24 24"><path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6M10 11v6M14 11v6"/></svg>
           </button>
         </div>
 
-        <div class="scroller transcript" id="transcript"><div class="empty">pick a conversation, or start a new one</div></div>
+        <div class="scroller transcript workspace-transcript" id="transcript" role="region" aria-label="Conversation messages" tabindex="0"></div>
         <div class="files-pane hide" id="filesPane"></div>
 
-        <div class="composer" id="composer">
-          <button class="jump-latest hide" id="jumpLatest" aria-label="Jump to the latest message">
-            <svg viewBox="0 0 24 24"><path d="M12 5v14M6 13l6 6 6-6"/></svg> Latest
-          </button>
-          <div class="composer-chips hide" id="chips"></div>
-          <div class="composer-row">
-            <textarea id="input" rows="1" placeholder="Ask the veil…" enterkeyhint="send"></textarea>
-            <button class="icon-btn" id="attachBtn" title="Attach an image" aria-label="Attach an image">
-              <svg viewBox="0 0 24 24"><path d="M21.4 11.05l-9.2 9.2a6 6 0 0 1-8.5-8.5l9.2-9.2a4 4 0 0 1 5.7 5.7l-9.2 9.2a2 2 0 0 1-2.9-2.9l8.5-8.5"/></svg>
-            </button>
-            <input type="file" id="fileInput" accept="image/*" class="hide">
-            <button class="btn btn-solid" id="sendBtn">Send</button>
-            <!-- Steering, as a REAL control. Enter cannot be the only way in: on touch
-                 Enter inserts a newline (see the keydown handler), so a keyboard-only
-                 affordance would leave every phone with no way to redirect a running
-                 turn at all. Visible exactly while a turn is live, beside Stop —
-                 the two things you can do to a turn in flight, in one place. -->
-            <button class="btn btn-steer hide" id="steerBtn"
-                    title="Send this to the running turn — it folds in as your next instruction">Post</button>
-            <button class="btn btn-danger hide" id="stopBtn">Stop</button>
+        <div class="workspace-composer" id="composer">
+          <button class="workspace-latest" id="jumpLatest" aria-label="Jump to latest message" hidden>↓ Latest</button>
+          <div class="workspace-panel">
+            <div class="composer-chips hide" id="chips"></div>
+            <textarea id="input" rows="1" aria-label="Message" placeholder="Message the veil…"></textarea>
+            <div class="workspace-controls">
+              <button class="icon-btn" id="attachBtn" title="Attach an image" aria-label="Attach an image">
+                ${VeilWorkspace.attachIcon}
+              </button>
+              <input type="file" id="fileInput" accept="image/*" hidden>
+              <button class="workspace-model" id="chatModel"></button>
+              <span class="workspace-spacer"></span>
+              <button class="btn btn-solid" id="sendBtn">Send</button>
+              <button class="btn btn-steer hide" id="steerBtn" title="Send an instruction to the running turn">Post</button>
+              <button class="btn btn-danger hide" id="stopBtn">Stop</button>
+            </div>
           </div>
-          <div class="composer-foot">
-            <span class="muted" id="charCount"></span>
-            <span class="grow"></span>
-            <span class="muted" id="turnStatus"></span>
+          <div class="workspace-meta">
+            <span class="workspace-shortcut" id="chatShortcut">↵ Send · Shift + ↵ New line</span>
+            <span id="turnStatus" role="status"></span>
+            <span id="charCount"></span>
           </div>
         </div>
       </section>
     </div>`;
 
-  el('newConv').addEventListener('click', () => openConv(newConvId(), true));
-  el('backBtn').addEventListener('click', () => el('chatRoot').classList.remove('on-thread'));
+  const transcript = el('transcript');
+  transcript.follow = VeilWorkspace.followTranscript(transcript, el('jumpLatest'));
+  el('newConv').addEventListener('click', () => {
+    openConv(newConvId(), true, true);
+    if (matchMedia('(pointer: fine)').matches) el('input').focus({ preventScroll: true });
+  });
+  el('backBtn').addEventListener('click', () => {
+    showThread(false);
+    ($('.conv-row.active') || el('newConv')).focus();
+  });
   el('delConv').addEventListener('click', deleteActiveConv);
   el('filesBtn').addEventListener('click', toggleFiles);
   el('railToggle').addEventListener('click', toggleRail);
   el('railRestore').addEventListener('click', toggleRail);
-  el('jumpLatest').addEventListener('click', () => {
-    const t = el('transcript');
-    resumeFollowing(t);
-    stickToBottom(t);
-    el('jumpLatest').classList.add('hide');
-  });
+  el('chatModel').addEventListener('click', () => setTab('settings'));
   wireRailGrip();
   setRailCollapsed(LS.get('veil.railCollapsed', '0') === '1');
   // With no model this control is relabelled into a link to Settings (syncSetupState),
@@ -1583,11 +1602,18 @@ function renderChat(host) {
   el('fileInput').addEventListener('change', (e) => { if (e.target.files[0]) attachImage(e.target.files[0]); });
 
   const input = el('input');
-  input.addEventListener('input', () => { autoGrow(input); updateCharCount(); });
+  input.addEventListener('input', () => {
+    const draft = draftFor(S.conv);
+    draft.text = input.value;
+    saveChatDraft(S.conv, draft);
+    VeilWorkspace.growPrompt(input);
+    updateCharCount();
+    transcript.follow.afterPaint();
+  });
   input.addEventListener('keydown', (e) => {
     // Enter sends on a real keyboard. On touch it must insert a newline, or the
     // on-screen return key becomes send-and-lose-your-draft.
-    if (e.key === 'Enter' && !e.shiftKey && matchMedia('(pointer: fine)').matches) {
+    if (VeilWorkspace.shouldSend(e)) {
       e.preventDefault();
       // MID-TURN, Enter steers instead of starting a turn. Posting to /messages
       // while a turn runs can only 409 (service.zig refuses a second turn for the
@@ -1608,8 +1634,12 @@ function renderChat(host) {
   });
 
   const drop = el('composer');
-  drop.addEventListener('dragover', (e) => { e.preventDefault(); drop.classList.add('drag'); });
-  drop.addEventListener('dragleave', () => drop.classList.remove('drag'));
+  drop.addEventListener('dragover', (e) => {
+    if (!e.dataTransfer.types.includes('Files')) return;
+    e.preventDefault();
+    drop.classList.add('drag');
+  });
+  drop.addEventListener('dragleave', (e) => { if (!drop.contains(e.relatedTarget)) drop.classList.remove('drag'); });
   drop.addEventListener('drop', (e) => {
     e.preventDefault();
     drop.classList.remove('drag');
@@ -1617,20 +1647,27 @@ function renderChat(host) {
     if (f && f.type.indexOf('image/') === 0) attachImage(f);
   });
 
-  syncSetupState();   // before the list resolves, so the composer never lies on first paint
-  refreshConvs();
   if (S.conv) openConv(S.conv, false);
+  else loadChatDraft();
+  if (S.convsLoaded) drawConvRail();
+  syncSetupState();
+  refreshConvs();
 }
 
-function autoGrow(ta) {
-  ta.style.height = 'auto';
-  ta.style.height = Math.min(ta.scrollHeight, 180) + 'px';
+function showThread(open) {
+  S.onThread = open;
+  el('chatRoot')?.classList.toggle('on-thread', open);
+  if (open) {
+    const input = el('input');
+    if (input) VeilWorkspace.growPrompt(input);
+    el('transcript')?.follow.afterPaint();
+  }
 }
 
 /** The desk scales the input cap to the model's size (inputCharLimit): a small
     local 8B gets 500 characters, a mid model 2000, a frontier model 4000. */
 function inputCharLimit() {
-  const m = (S.settings.model || '').toLowerCase();
+  const m = effectiveModel().toLowerCase();
   if (!m) return 4000;
   if (/(^|[^0-9])([1-9]|1[0-3])b\b/.test(m)) return 500;
   if (/(1[4-9]|[2-3][0-9])b\b/.test(m)) return 2000;
@@ -1648,40 +1685,73 @@ function updateCharCount() {
   const n = input.value.length;
   const cap = inputCharLimit();
   c.textContent = n ? (n + ' / ' + cap) : '';
-  c.style.color = n > cap ? 'var(--danger)' : '';
+  c.classList.toggle('over-limit', n > cap);
+  const hasText = !!input.value.trim();
+  el('sendBtn').disabled = S.loadingConv || !!S.convLoadError || (!!effectiveModel() && !hasText);
+  el('steerBtn').disabled = S.posting || !hasText;
+  el('stopBtn').disabled = S.posting;
 }
 
-let _attach = null;   // {b64, name, url}
+const chatDrafts = new Map();
+let chatViewEpoch = 0;
 
+function draftFor(id) {
+  return chatDrafts.get(id) || { text: '', attach: null };
+}
+function saveChatDraft(id, draft) {
+  if (draft.text || draft.attach) chatDrafts.set(id, draft);
+  else chatDrafts.delete(id);
+}
+function loadChatDraft() {
+  const input = el('input');
+  if (!input) return;
+  input.value = draftFor(S.conv).text;
+  VeilWorkspace.growPrompt(input);
+  drawAttachment();
+  updateCharCount();
+}
 function attachImage(file) {
+  const id = S.conv, account = S.me;
   const rd = new FileReader();
   rd.onload = () => {
+    if (account !== S.me) return;
     const url = String(rd.result);
-    _attach = { b64: url.slice(url.indexOf(',') + 1), name: file.name || 'image', url: url };
-    const chips = el('chips');
-    chips.classList.remove('hide');
-    chips.innerHTML = `<div class="chip">
-        <img src="${esc(url)}" alt="">
-        <span class="ellip">${esc(_attach.name)}</span>
-        <button class="chip-x" id="chipX" aria-label="Remove attachment">&times;</button>
-      </div>`;
-    el('chipX').addEventListener('click', clearAttach);
+    const draft = draftFor(id);
+    draft.attach = { b64: url.slice(url.indexOf(',') + 1), name: file.name || 'image', url };
+    saveChatDraft(id, draft);
+    if (S.conv === id) drawAttachment();
   };
+  rd.onerror = () => toast('Could not read image', file.name, 'err');
   rd.readAsDataURL(file);
 }
 
 function clearAttach() {
-  _attach = null;
+  const draft = draftFor(S.conv);
+  draft.attach = null;
+  saveChatDraft(S.conv, draft);
+  if (el('fileInput')) el('fileInput').value = '';
+  drawAttachment();
+}
+
+function drawAttachment() {
   const chips = el('chips');
   if (!chips) return;
-  chips.classList.add('hide');
-  chips.innerHTML = '';
-  el('fileInput').value = '';
+  const attachment = draftFor(S.conv).attach;
+  chips.classList.toggle('hide', !attachment);
+  chips.innerHTML = attachment ? `<div class="chip">
+    <img src="${esc(attachment.url)}" alt="">
+    <span class="ellip">${esc(attachment.name)}</span>
+    <button class="chip-x" id="chipX" aria-label="Remove attachment">&times;</button>
+  </div>` : '';
+  el('chipX')?.addEventListener('click', clearAttach);
+  el('transcript').follow.afterPaint();
 }
 
 async function refreshConvs() {
+  const account = S.me;
   try {
     const j = await api.convs();
+    if (S.me !== account) return;
     // Two rules, both the desk's, both applied HERE rather than asked of the server —
     // /convs is meant to be the complete list, and other callers depend on that.
     //   - membership: scheduled-task runs are not chats (chatConvs);
@@ -1696,15 +1766,12 @@ async function refreshConvs() {
     S.allConvs = j.convs || [];
     S.convs = chatConvs(S.allConvs).sort(convByRecent);
   } catch (e) {
-    S.allConvs = [];
-    S.convs = [];
+    if (S.me !== account) return;
   }
-  // Set on BOTH paths: a failed fetch is still an answer as far as the transcript is concerned, and
-  // leaving it false would hold the blank state forever on an account whose list genuinely errored.
+  const first = !S.convsLoaded;
   S.convsLoaded = true;
-  // The transcript's no-conversation state depends on whether this account has any
-  // history at all, and that is only known once this call lands.
-  if (!S.conv) drawTranscript();
+  if (first && !S.conv && !S.convs.length && S.tab === 'chat') showThread(true);
+  syncConvHeading();
   drawConvRail();
 }
 
@@ -1717,16 +1784,17 @@ function drawConvRail() {
   const host = el('convScroll');
   if (!host) return;
   if (!S.convs.length) {
-    host.innerHTML = '<div class="empty">no conversations yet</div>';
+    host.innerHTML = '<div class="empty">Your conversations will appear here.</div>';
     return;
   }
   // Group sub-chats under their primary; an ORPHANED branch (its primary gone) stays a plain row so
   // it never becomes unreachable. Primaries keep the newest-first order and the date tiers.
-  const subs = {};
+  const ids = new Set(S.convs.map((c) => c.id));
+  const subs = Object.create(null);
   const tops = [];
   for (const c of S.convs) {
     const b = branchOf(c.id);
-    if (b && S.convs.some((p) => p.id === b.parent)) (subs[b.parent] = subs[b.parent] || []).push(c);
+    if (b && ids.has(b.parent)) (subs[b.parent] = subs[b.parent] || []).push(c);
     else tops.push(c);
   }
   for (const k in subs) subs[k].sort((a, b) => branchOf(a.id).n - branchOf(b.id).n);
@@ -1735,7 +1803,7 @@ function drawConvRail() {
   // wherever the tier CHANGES — no grouping pass, no second sort, and the order
   // inside a tier stays exactly the order above.
   let tier = '';
-  host.innerHTML = tops.map((c) => {
+  const html = tops.map((c) => {
     const g = convGroup(c.updated);
     const head = g === tier ? '' : `<div class="conv-group">${esc(g)}</div>`;
     tier = g;
@@ -1743,11 +1811,11 @@ function drawConvRail() {
     const open = kids.length && (S.subsOpen[c.id] || (activeBranch && activeBranch.parent === c.id));
     const chev = kids.length ? `
       <button class="conv-sub-toggle ${open ? 'open' : ''}" data-subs="${esc(c.id)}"
-              title="${kids.length} sub-chat${kids.length > 1 ? 's' : ''}" aria-label="Toggle sub-chats">
+              title="${kids.length} sub-chat${kids.length > 1 ? 's' : ''}" aria-label="Toggle sub-chats" aria-expanded="${!!open}">
         <svg viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg>${kids.length}
       </button>` : '';
     const inner = open ? `<div class="conv-subs">` + kids.map((k) => `
-      <button class="conv-row conv-sub ${k.id === S.conv ? 'active' : ''}" data-conv="${esc(k.id)}">
+      <button class="conv-row conv-sub ${k.id === S.conv ? 'active' : ''}" aria-current="${k.id === S.conv}" data-conv="${esc(k.id)}">
         <div class="conv-title ellip">${esc(k.title || ('sub-chat ' + branchOf(k.id).n))}</div>
         <div class="conv-meta"><span>${esc(fmtWhen(k.updated))}</span><span>${k.msgs || 0} msgs</span></div>
       </button>`).join('') +
@@ -1755,12 +1823,20 @@ function drawConvRail() {
       `</div>` : '';
     return head + `
     <div class="conv-wrap">
-      <button class="conv-row ${c.id === S.conv ? 'active' : ''} ${kids.length ? 'has-subs' : ''}" data-conv="${esc(c.id)}">
+      <button class="conv-row ${c.id === S.conv ? 'active' : ''} ${kids.length ? 'has-subs' : ''}" aria-current="${c.id === S.conv}" data-conv="${esc(c.id)}">
         <div class="conv-title ellip">${esc(c.title || c.id)}</div>
         <div class="conv-meta"><span>${esc(fmtWhen(c.updated))}</span><span>${c.msgs || 0} msgs</span></div>
       </button>${chev}${inner}
     </div>`;
   }).join('');
+  if (host._railHtml === html) return;
+  const focused = document.activeElement?.dataset;
+  const focusConv = focused?.conv, focusSubs = focused?.subs;
+  host._railHtml = html;
+  host.innerHTML = html;
+  $$('[data-conv], [data-subs]', host).find((b) =>
+    (focusConv && b.dataset.conv === focusConv) || (focusSubs && b.dataset.subs === focusSubs)
+  )?.focus({ preventScroll: true });
   // Still every row: the headings are siblings of the wrappers, not parents, so
   // this selector reaches the same set it always did.
   $$('[data-conv]', host).forEach((b) => b.addEventListener('click', () => openConv(b.dataset.conv, true)));
@@ -1775,53 +1851,95 @@ function drawConvRail() {
     while (n <= 5 && taken.includes(n)) n++;
     if (n > 5) return;
     S.subsOpen[p] = true;
-    openConv(p + '__s' + n, true); // client-minted like every conv; the server gate validates the primary
+    openConv(p + '__s' + n, true, true); // client-minted like every conv; the server gate validates the primary
   }));
 }
 
-async function openConv(id, focus) {
+function syncConvHeading() {
+  const heading = el('convTitle');
+  if (!heading) return;
+  const row = S.allConvs.find((c) => c.id === S.conv);
+  const firstPrompt = S.msgs.find((m) => m.role === 'user')?.content;
+  const title = row?.title || (firstPrompt ? String(firstPrompt).trim().replace(/\s+/g, ' ').slice(0, 95) : '') || 'New chat';
+  heading.textContent = title;
+  heading.title = title;
+  const hasHistory = !!(row || S.msgs.length) && !S.loadingConv;
+  el('filesBtn').disabled = !hasHistory;
+  el('delConv').disabled = !hasHistory;
+}
+
+async function openConv(id, focus, fresh = false) {
+  const epoch = ++chatViewEpoch;
   stopPoll();
   S.conv = id;
   S.msgs = [];
-  S.live = false;
+  S.cursor = 0;
+  S.loadingConv = !fresh;
+  S.convLoadError = '';
+  S.posting = false;
   resetStream();
-  el('convTitle').textContent = id;
-  $$('[data-conv]').forEach((b) => b.classList.toggle('active', b.dataset.conv === id));
-  // On a phone the list and the thread are one column each; opening slides to
-  // the thread and Back slides home.
-  if (focus) el('chatRoot').classList.add('on-thread');
-
-  try {
-    const j = await api.conv(id);
-    S.msgs = j.messages || [];
-    S.live = !!j.live;
-  } catch (e) {
-    S.msgs = [];   // a freshly minted id 404s until the first message lands
+  setTurnUi(false);
+  closeFiles();
+  loadChatDraft();
+  syncConvHeading();
+  drawConvRail();
+  if (focus) {
+    showThread(true);
+    if (matchMedia('(max-width: 720px)').matches) el('backBtn').focus({ preventScroll: true });
   }
   drawTranscript();
-  await baselineCursor();
-  setTurnUi(S.live);
-  if (S.live) startPoll();
+  if (fresh) return;
+
+  let result;
+  try {
+    result = await api.conv(id);
+  } catch (e) {
+    if (epoch !== chatViewEpoch) return;
+    if (e.status !== 404 || S.allConvs.some((c) => c.id === id)) S.convLoadError = e.message;
+  }
+  if (epoch !== chatViewEpoch) return;
+  S.loadingConv = false;
+  S.msgs = result?.messages || [];
+  setTurnUi(!!result?.live);
+  syncConvHeading();
+  drawTranscript();
+  if (S.live) {
+    const cursor = await readEventCursor(id);
+    if (epoch === chatViewEpoch && S.live) {
+      S.cursor = cursor;
+      startPoll();
+    }
+  }
 }
 
 async function deleteActiveConv() {
   if (!S.conv) return;
   if (!confirm('Delete this conversation? This cannot be undone.')) return;
-  const wasBranch = branchOf(S.conv);
+  const id = S.conv, epoch = chatViewEpoch;
+  const wasBranch = branchOf(id);
   // DELETE STOPS FIRST: a live server turn must not keep streaming into a removed tree.
   // Best-effort — an idle conversation ignores the op.
-  try { await api.control(S.conv, { op: 'stop' }); } catch (e) {}
+  try { await api.control(id, { op: 'stop' }); } catch (e) {}
   try {
-    await api.convDel(S.conv);
-    toast('Deleted', S.conv, 'ok');
+    await api.convDel(id);
+    toast('Chat deleted', '', 'ok');
   } catch (e) {
     toast('Could not delete', e.message, 'err');
+    return;
   }
+  chatDrafts.delete(id);
+  if (epoch !== chatViewEpoch) { refreshConvs(); return; }
+  chatViewEpoch++;
   stopPoll();
   S.conv = null;
   S.msgs = [];
+  resetStream();
+  setTurnUi(false);
+  loadChatDraft();
+  closeFiles();
+  syncConvHeading();
   drawTranscript();
-  el('chatRoot').classList.remove('on-thread');
+  showThread(false);
   await refreshConvs();
   // a deleted SUB-CHAT lands back on its primary, matching the desk
   if (wasBranch && S.convs.some((c) => c.id === wasBranch.parent)) openConv(wasBranch.parent, true);
@@ -1952,18 +2070,30 @@ function setRailCollapsed(collapsed) {
 }
 
 function toggleRail() {
-  setRailCollapsed(!el('chatRoot').classList.contains('rail-collapsed'));
+  const collapsed = !el('chatRoot').classList.contains('rail-collapsed');
+  setRailCollapsed(collapsed);
+  el(collapsed ? 'railRestore' : 'railToggle').focus({ preventScroll: true });
+}
+
+function closeFiles() {
+  el('filesPane').classList.add('hide');
+  el('filesBtn').setAttribute('aria-expanded', 'false');
+  el('transcript').follow.afterPaint();
 }
 
 async function toggleFiles() {
   const pane = el('filesPane');
   if (!pane) return;
-  if (!pane.classList.contains('hide')) { pane.classList.add('hide'); return; }
+  if (!pane.classList.contains('hide')) { closeFiles(); return; }
   if (!S.conv) return toast('No conversation', 'Open one first.', 'err');
+  const epoch = chatViewEpoch;
+  el('filesBtn').setAttribute('aria-expanded', 'true');
   pane.classList.remove('hide');
   pane.innerHTML = '<div class="files-head"><b>Files</b><span class="muted">reading…</span></div>';
+  el('transcript').follow.afterPaint();
   try {
     const j = await api.convFiles(S.conv);
+    if (epoch !== chatViewEpoch || pane.classList.contains('hide')) return;
     const files = j.files || [];
     S.files = files;
     pane.innerHTML = '<div class="files-head"><b>Files</b>'
@@ -1983,8 +2113,10 @@ async function toggleFiles() {
     $$('[data-file]', pane).forEach((b) => b.addEventListener('click', () => openConvFile(b.dataset.file)));
     if (el('dlAll')) el('dlAll').addEventListener('click', downloadAllFiles);
   } catch (e) {
+    if (epoch !== chatViewEpoch) return;
     pane.innerHTML = '<div class="files-head"><b>Files</b><span class="muted">' + esc(e.message) + '</span></div>';
   }
+  el('transcript').follow.afterPaint();
 }
 
 /** The URL for one of this conversation's files. Shared by the viewer and the
@@ -2163,105 +2295,75 @@ function missingKeyProvider() {
 function setupHintHtml() {
   const model = effectiveModel();
   const need = missingKeyProvider();
-  const steps = [];
-
-  // With no model, the Cloudflare login is the shortest path there is — one click, free Workers AI,
-  // the model list filled from the account — so it leads. Connected-but-unpicked (a user who
-  // declined the auto-default, or switched away) gets the one-click "use it" instead.
-  if (model) {
-    steps.push('<li class="done">Model: <span class="mono">' + esc(model) + '</span></li>');
-  } else if (S.cf.connected) {
-    steps.push('<li class="now"><button class="linkbtn cf-link" data-cf-use>' + cfCloudSvg()
-      + 'Use Workers AI</button> — you are signed in as ' + esc(cfDisplayName())
-      + ' · or pick a model in <button class="linkbtn" data-goto="settings">Settings</button></li>');
-  } else if (S.cf.configured && !S.cf.pending) {
-    steps.push('<li class="now"><button class="linkbtn cf-link" data-cf-login>' + cfCloudSvg()
-      + 'Log in with Cloudflare</button> — one click, free Workers AI, your live model list'
-      + ' · or pick a model in <button class="linkbtn" data-goto="settings">Settings</button></li>');
-  } else {
-    steps.push('<li class="now">Pick a model in <button class="linkbtn" data-goto="settings">Settings</button></li>');
-  }
-
-  // Only speak about keys when there is something true to say. A local model needs
-  // none, and an unknown endpoint is not ours to guess at.
+  const settings = '<button class="linkbtn" data-goto="settings">Settings</button>';
   if (need) {
-    steps.push('<li class="now">Add your <span class="mono">' + esc(need)
-      + '</span> key in <button class="linkbtn" data-goto="settings">Settings</button></li>');
-  } else if (model && !S.keysLoaded && !modelIsLocal()) {
-    steps.push('<li>If that model needs a provider key, add it in '
-      + '<button class="linkbtn" data-goto="settings">Settings</button></li>');
+    return 'Add your ' + esc(providerLabel(need)) + ' key in ' + settings + ' to send a message.';
   }
-
-  // "Ready" has to mean every blocking step is done, not just the model — saying it
-  // above an outstanding "add your key" line contradicts the list underneath it.
-  const ready = model && !need;
-  steps.push(ready
-    ? '<li class="now">Ask it something below</li>'
-    : '<li>Then ask it something below</li>');
-
-  return '<div class="empty setup-hint">'
-    + '<b>' + (ready ? 'Ready when you are' : 'One thing first') + '</b>'
-    + '<ol class="setup-steps">' + steps.join('') + '</ol>'
-    + '</div>';
-}
-
-/** Paint an empty-transcript message, but only when it actually changed. The hint
-    holds real buttons, and rebuilding the markup underneath a reader is how a
-    click lands on a node that no longer exists. */
-function paintEmpty(host, html) {
-  if (host._emptyHtml !== html) { host._emptyHtml = html; host.innerHTML = html; }
+  if (model) return '';
+  if (S.cf.connected) {
+    return '<button class="linkbtn" data-cf-use>' + cfCloudSvg() + 'Use Workers AI</button> or choose a model in ' + settings + '.';
+  }
+  if (S.cf.configured && !S.cf.pending) {
+    return '<button class="linkbtn" data-cf-login>' + cfCloudSvg() + 'Log in with Cloudflare</button> or choose a model in ' + settings + '.';
+  }
+  return 'Choose a model in ' + settings + ' to send a message.';
 }
 
 function drawTranscript() {
   const host = el('transcript');
   if (!host) return;
-  if (!S.conv) {
-    // No conversation selected. Someone with history wants the list; someone with
-    // none is brand new and wants the order of operations.
-    //
-    // Until refreshConvs answers, S.convs is [] because it is UNKNOWN, not because the account is
-    // empty — same distinction keysLoaded draws for S.keys. Asserting on it painted the first-run
-    // setup nudge at every returning user before flipping to "pick a conversation" one round trip
-    // later. Stay quiet while unknown; refreshConvs calls back here the moment it lands.
-    paintEmpty(host, !S.convsLoaded
-      ? ''
-      : (S.convs.length
-        ? '<div class="empty">pick a conversation, or start a new one</div>'
-        : setupHintHtml()));
+  host.follow.beforePaint();
+  // A different chat can have the same number of messages as the old one.
+  if (host._chatId !== S.conv || host._chatEpoch !== chatViewEpoch || S.msgs.length < host._rendered) {
+    host.replaceChildren();
+    host._chatId = S.conv;
+    host._chatEpoch = chatViewEpoch;
     host._rendered = 0;
+    host.follow.jump();
+  }
+  if (S.loadingConv) {
+    if (!host.firstChild) host.innerHTML = '<div class="workspace-notice" role="status">Loading conversation…</div>';
     return;
   }
-  let stick = following(host);
-
-  // A shorter list than we have drawn means a different conversation (or a
-  // delete) — start over. Otherwise append only what is new.
-  if (typeof host._rendered !== 'number' || S.msgs.length < host._rendered) {
-    host.innerHTML = '';
-    host._emptyHtml = '';
-    host._rendered = 0;
-    // Different conversation: the old one's reading position says nothing about this
-    // one, so open it at the bottom the way a freshly opened chat should read.
-    resumeFollowing(host);
-    stick = true;
-  }
-  // An empty conversation gets the same nudge, which by now is usually one line:
-  // an account that already has a model and a key sees only "ask it something".
-  if (host._rendered === 0 && !S.msgs.length && !S.live) {
-    paintEmpty(host, setupHintHtml());
+  host.querySelector('.workspace-notice')?.remove();
+  if (S.convLoadError) {
+    const notice = document.createElement('div');
+    notice.className = 'workspace-notice';
+    notice.innerHTML = '<span role="status">Could not open this conversation. ' + esc(S.convLoadError) + '</span>'
+      + '<button type="button" class="btn btn-sm">Try again</button>';
+    notice.lastElementChild.addEventListener('click', () => openConv(S.conv, true));
+    host.replaceChildren(notice);
     return;
   }
-  if (host._rendered === 0) { host.innerHTML = ''; host._emptyHtml = ''; }
+  if (!S.msgs.length && !S.live && !S.stream.status) {
+    let welcome = host.querySelector('.workspace-welcome');
+    if (!welcome) {
+      welcome = VeilWorkspace.welcome((prompt) => VeilWorkspace.insertPrompt(el('input'), prompt));
+      const hint = document.createElement('p');
+      hint.className = 'workspace-setup';
+      welcome.appendChild(hint);
+      host.replaceChildren(welcome);
+    }
+    const hint = welcome.lastElementChild;
+    const html = setupHintHtml();
+    if (hint._html !== html) { hint._html = html; hint.innerHTML = html; }
+    hint.hidden = !html;
+    return;
+  }
+  host.querySelector('.workspace-welcome')?.remove();
 
+  const added = document.createDocumentFragment();
   for (let i = host._rendered; i < S.msgs.length; i++) {
     const node = document.createElement('div');
     node.innerHTML = renderMsg(S.msgs[i]);
     const msg = node.firstElementChild;
-    if (msg) { host.insertBefore(msg, liveNode(host)); wireCodeCopy(msg); }
+    if (msg) { added.append(msg); wireCodeCopy(msg); }
   }
+  host.insertBefore(added, liveNode(host));
   host._rendered = S.msgs.length;
 
   renderLive(host);
-  if (stick) stickToBottom(host);
+  host.follow.afterPaint();
 }
 
 /** The live block always sits last; committed messages insert before it. */
@@ -2278,33 +2380,33 @@ function renderLive(host) {
   }
   if (!live) {
     live = document.createElement('div');
-    live.className = 'msg assistant live';
+    live.className = 'msg workspace-message assistant live';
     // Status and tools sit BELOW the answer, not above it. Above, they scroll out
     // of view the moment a reply runs long — the reader is pinned to the bottom
     // watching text arrive, and the one thing they want to know ("is it still
     // working, and on what?") had drifted off the top of the screen.
-    live.innerHTML = '<div class="msg-role">veil <span class="live-dot"></span></div>'
-      + '<div class="msg-body"></div>'
+    live.innerHTML = '<div class="msg-role workspace-role">' + VeilWorkspace.mark + ' Veil</div>'
+      + '<div class="msg-body workspace-body"></div>'
       + '<div class="tools"></div>'
       + '<div class="host-activity"></div>';
     host.appendChild(live);
   }
 
-  const act = live.querySelector('.host-activity');
-  const html = hostActivityHtml();
-  if (act.innerHTML !== html) act.innerHTML = html;
+  live.classList.toggle('error', !S.live && !!S.stream.status);
+  updateHostActivity(live);
 
   const tools = live.querySelector('.tools');
   const th = S.stream.tools.map(toolChip).join('') + toolDetail();
-  if (tools.innerHTML !== th) {
+  if (tools._html !== th) {
+    tools._html = th;
     tools.innerHTML = th;
     $$('[data-tool-idx]', tools).forEach((b) => b.addEventListener('click', () => {
       const i = Number(b.dataset.toolIdx);
       S.openTool = (S.openTool === i) ? -1 : i;   // clicking the open one closes it
-      renderLive(el('transcript'));
+      drawTranscript();
     }));
     const c = el('toolClose');
-    if (c) c.addEventListener('click', () => { S.openTool = -1; renderLive(el('transcript')); });
+    if (c) c.addEventListener('click', () => { S.openTool = -1; drawTranscript(); });
   }
   tools.classList.toggle('hide', !S.stream.tools.length);
 
@@ -2325,9 +2427,9 @@ function hostActivityHtml() {
       + (cleanPreview(t.preview) ? ' <span class="muted ellip">' + esc(cleanPreview(t.preview)) + '</span>' : '')
       + (secs > 1 ? ' <span class="muted">' + secs + 's</span>' : ''));
   } else if (S.stream.status) {
-    bits.push('<span class="spin"></span>' + esc(S.stream.status));
+    bits.push((S.live ? '<span class="spin" aria-hidden="true"></span>' : '') + esc(S.stream.status));
   } else if (S.live && !S.stream.text) {
-    bits.push('<span class="spin"></span>thinking');
+    bits.push('<span class="spin"></span>Preparing your reply…');
   }
   return bits.join('');
 }
@@ -2341,6 +2443,8 @@ function hostActivityHtml() {
 
 let _typeRaf = 0;
 let _typeLastPaint = 0;
+let _toolClock = 0;
+const reducedChatMotion = matchMedia('(prefers-reduced-motion: reduce)');
 
 function scheduleType() {
   if (_typeRaf) return;
@@ -2358,7 +2462,9 @@ function typeTick() {
     // Drain the backlog over roughly a dozen frames (~200ms): fast enough that a
     // long paste does not crawl, slow enough that a short sentence still types.
     const backlog = total - S.stream.shown;
-    S.stream.shown = Math.min(total, S.stream.shown + Math.max(2, Math.ceil(backlog / 12)));
+    S.stream.shown = reducedChatMotion.matches ? total : Math.min(total, S.stream.shown + Math.max(2, Math.ceil(backlog / 12)));
+    const next = S.stream.text.charCodeAt(S.stream.shown);
+    if (next >= 0xDC00 && next <= 0xDFFF) S.stream.shown++;
   }
 
   const now = performance.now();
@@ -2366,23 +2472,38 @@ function typeTick() {
   // 60fps from ~25fps here, and this keeps a long code block from stuttering.
   if (now - _typeLastPaint > 40 || S.stream.shown >= total) {
     _typeLastPaint = now;
-    const stick = following(host);
+    host.follow.beforePaint();
     paintTyped(live.querySelector('.msg-body'));
-    const act = live.querySelector('.host-activity');
-    const html = hostActivityHtml();
-    if (act && act.innerHTML !== html) act.innerHTML = html;
-    if (stick) stickToBottom(host);
+    updateHostActivity(live);
+    host.follow.afterPaint();
   }
 
-  // Keep ticking while there is text to reveal, or while a tool is running (the
-  // elapsed counter and spinner need frames of their own).
-  if (S.stream.shown < total || S.live) scheduleType();
+  if (S.stream.shown < total) scheduleType();
+}
+
+function updateHostActivity(live) {
+  const act = live.querySelector('.host-activity');
+  const html = hostActivityHtml();
+  if (act._html !== html) { act._html = html; act.innerHTML = html; }
+  if (!_toolClock && S.live && S.stream.tools.some((t) => t.state !== 'done' && t.state !== 'error')) {
+    _toolClock = setTimeout(() => {
+      _toolClock = 0;
+      const host = el('transcript');
+      const current = host && liveNode(host);
+      if (current && S.live) updateHostActivity(current);
+    }, 1000);
+  }
 }
 
 function paintTyped(body) {
   if (!body) return;
+  const typing = S.stream.shown < S.stream.text.length;
+  if (body._stream === S.stream && body._shown === S.stream.shown && body._typing === typing) return;
+  body._stream = S.stream;
+  body._shown = S.stream.shown;
+  body._typing = typing;
   if (!S.stream.text) {
-    if (!body.querySelector('.shimmer-line')) body.innerHTML = '<span class="shimmer-line"></span>';
+    body.innerHTML = S.live ? '<span class="shimmer-line" aria-hidden="true"></span>' : '';
     return;
   }
   const revealed = S.stream.text.slice(0, S.stream.shown);
@@ -2390,12 +2511,8 @@ function paintTyped(body) {
   // they arrive — mdRender tolerates a half-finished fence by design, which is
   // exactly the streaming case. renderBody adds the same tolerance for a <think>
   // block whose closing tag has not arrived yet: it stays open and keeps filling.
-  const html = renderBody(revealed, true) + (S.stream.shown < S.stream.text.length ? '<span class="caret"></span>' : '');
-  if (body._html !== html) {
-    body._html = html;
-    body.innerHTML = html;
-    wireCodeCopy(body);
-  }
+  body.innerHTML = renderBody(revealed, true) + (typing && !reducedChatMotion.matches ? '<span class="caret" aria-hidden="true"></span>' : '');
+  wireCodeCopy(body);
 }
 
 /** Is the view still FOLLOWING new content? A latch on the reader's intent, not a
@@ -2425,12 +2542,6 @@ function following(host) {
   // Arriving back at the bottom — by drag, wheel, keyboard or the jump below — resumes
   // following. This is the only way back, and it is deliberately the reader's own act.
   if (host.scrollHeight - host.scrollTop - host.clientHeight < 4) host._follow = true;
-  // Scrolling away now means new text lands off-screen, so say so. Every path that can
-  // change the answer runs through here, which is why the toggle lives here too.
-  if (host.id === 'transcript') {
-    const j = el('jumpLatest');
-    if (j) j.classList.toggle('hide', host._follow);
-  }
   return host._follow;
 }
 
@@ -2513,9 +2624,9 @@ function renderBody(src, live) {
 
 function renderMsg(m) {
   const role = m.role === 'user' ? 'user' : 'assistant';
-  return `<div class="msg ${role}">
-    <div class="msg-role">${role === 'user' ? 'you' : 'veil'}${m.ts ? ' <span class="muted">· ' + esc(fmtWhen(m.ts)) + '</span>' : ''}</div>
-    <div class="msg-body">${renderBody(m.content || '', false)}</div>
+  return `<div class="msg workspace-message ${role}">
+    <div class="msg-role workspace-role">${role === 'user' ? 'You' : VeilWorkspace.mark + ' Veil'}${m.ts ? ' <span class="muted">· ' + esc(fmtWhen(m.ts)) + '</span>' : ''}</div>
+    <div class="msg-body workspace-body">${renderBody(m.content || '', false)}</div>
   </div>`;
 }
 
@@ -2723,8 +2834,10 @@ function setTurnUi(live) {
   if (steer) steer.classList.toggle('hide', !live);
   stop.classList.toggle('hide', !live);
   const input = el('input');
-  if (input) input.placeholder = live ? 'Steer the running turn…' : 'Ask the veil…';
-  if (st && !live) st.textContent = '';
+  input.placeholder = live ? 'Steer the running turn…' : 'Message the veil…';
+  el('chatShortcut').textContent = live ? '↵ Post · Shift + ↵ New line' : '↵ Send · Shift + ↵ New line';
+  st.textContent = live ? (S.posting ? 'Sending…' : 'In progress') : '';
+  updateCharCount();
 }
 
 /** Reflect "can this account run a turn at all?" in the composer, and keep the
@@ -2750,16 +2863,20 @@ function syncSetupState() {
   // Gated on the model actually CHANGING. Resetting unconditionally looked equivalent and was not:
   // renderChat calls this on every Chat-tab render, so bouncing between tabs re-probed the backend on
   // every following health tick and the 60s throttle never held.
-  const ready = !!effectiveModel();
-  if (effectiveModel() !== _probedModel) {
-    _probedModel = effectiveModel();
+  const model = effectiveModel();
+  if (model !== _probedModel) {
+    _probedModel = model;
     _localProbeAt = 0;
   }
   const send = el('sendBtn');
   if (send) {
-    send.textContent = ready ? 'Send' : 'Pick a model in Settings';
-    send.classList.toggle('needs-model', !ready);
-    send.title = ready ? '' : 'No model is configured — this opens Settings.';
+    send.textContent = model ? 'Send' : 'Choose model';
+    send.title = model ? '' : 'Choose a model in Settings';
+    const picker = el('chatModel');
+    picker.hidden = !model;
+    picker.textContent = modelById(model)?.label || model.split('/').pop();
+    picker.title = 'Change model in Settings · ' + model;
+    updateCharCount();
   }
   drawTranscript();   // null-guarded itself; the nudge reads the same facts as the button
 }
@@ -2787,6 +2904,7 @@ document.addEventListener('click', (e) => {
  */
 async function sendTurn(opts) {
   const input = el('input');
+  if (!input || S.loadingConv || S.convLoadError || S.posting) return;
   const given = opts && opts.text ? String(opts.text).trim() : '';
   const text = given || input.value.trim();
   if (!text) return;
@@ -2799,7 +2917,14 @@ async function sendTurn(opts) {
     toast('No model picked yet', 'Choose one in Settings — nothing can run until then.', 'err');
     return setTab('settings');
   }
-  if (!S.conv) { S.conv = newConvId(); el('convTitle').textContent = S.conv; }
+  const draft = draftFor(S.conv);
+  if (!S.conv) {
+    chatDrafts.delete(null);
+    S.conv = newConvId();
+    saveChatDraft(S.conv, draft);
+  }
+  const id = S.conv, epoch = chatViewEpoch, account = S.me;
+  const exists = !!S.msgs.length || S.allConvs.some((c) => c.id === id);
 
   const body = {
     text: text,
@@ -2820,20 +2945,23 @@ async function sendTurn(opts) {
     body.prompt_model = S.settings.prompt_model;
     body.prompt_api_key = S.settings.prompt_api_key;
   }
-  if (_attach) body.image_b64 = _attach.b64;
+  const attachment = draft.attach;
+  if (attachment) body.image_b64 = attachment.b64;
 
   // Optimistic echo: show the line immediately, then let the stream's own
   // `message` frame become the source of truth.
-  S.msgs.push({ role: 'user', content: text, ts: Math.floor(Date.now() / 1000) });
+  const echo = { role: 'user', content: text, ts: Math.floor(Date.now() / 1000) };
+  S.msgs.push(echo);
   // Sending is an explicit act: resume following even if they had scrolled up to read
   // history. Without this the reply would stream in off-screen, below the fold.
-  resumeFollowing(el('transcript'));
+  el('transcript').follow.jump();
   // Only when the line CAME from the composer. A re-send carries its own text and
   // must leave whatever the user has typed since exactly where it is.
   if (!given) {
     input.value = '';
-    autoGrow(input);
-    updateCharCount();
+    draft.text = '';
+    saveChatDraft(id, draft);
+    VeilWorkspace.growPrompt(input);
   }
   clearAttach();
   // What the client currently knows about a turn. The next three lines throw it
@@ -2843,26 +2971,42 @@ async function sendTurn(opts) {
   // rewindStream.
   const snap = { stream: S.stream, openTool: S.openTool, cursor: S.cursor, rebased: 0 };
   resetStream();
+  S.posting = true;
   setTurnUi(true);
+  syncConvHeading();
   drawTranscript();
 
-  await baselineCursor();
-  snap.rebased = S.cursor;   // where baselineCursor left it; rewinding is only safe from here
+  const cursor = exists ? await readEventCursor(id) : 0;
+  if (S.me !== account) return;
+  snap.rebased = cursor;
+  if (epoch === chatViewEpoch) S.cursor = cursor;
 
   try {
-    await api.send(S.conv, body);
-    startPoll();
+    await api.send(id, body);
+    if (epoch === chatViewEpoch) {
+      S.posting = false;
+      setTurnUi(true);
+      startPoll();
+    } else if (S.tab === 'chat' && S.conv === id && !S.live) {
+      openConv(id, false);
+    }
     refreshConvs();
   } catch (e) {
+    if (S.me !== account) return;
+    if (epoch !== chatViewEpoch) { restoreDraft(text, id, attachment); return; }
+    S.posting = false;
     // 409 is its own thing and must NOT fall through to setTurnUi(false) — see onSendBusy.
-    if (e.status === 409) return onSendBusy(e, text, opts, snap);
+    if (e.status === 409) return onSendBusy(e, text, opts, snap, attachment);
     setTurnUi(false);
+    if (S.msgs.at(-1) === echo) S.msgs.pop();
+    restoreDraft(text, id, attachment);
+    syncConvHeading();
     // The 403 here is NOT "chat is admin-only" — that gate is gone (service.zig:292
     // opened postMessage to every authed user). The only 403 this route can still
     // produce is a banned account (http.zig:62,66), so the old label sent a
     // suspended user hunting for an admin setting that does not exist.
     failToast(e.status === 403 ? 'Account suspended' : 'Could not send', e.message);
-    S.stream.status = 'failed: ' + (e.message || 'unknown');
+    S.stream.status = 'Could not send. ' + (e.message || '');
     drawTranscript();
   }
 }
@@ -2881,7 +3025,8 @@ async function sendTurn(opts) {
  *  conversation is busy" is the local-model budget (service.zig:431-435), where a
  *  DIFFERENT chat holds the machine's only local slot and this conversation is
  *  genuinely idle — steering there would write to a control file nobody reads. */
-async function onSendBusy(e, text, opts, snap) {
+async function onSendBusy(e, text, opts, snap, attachment) {
+  const id = S.conv, epoch = chatViewEpoch, account = S.me;
   const msg = String(e.message || '');
   const otherChat = /local model busy/i.test(msg);
 
@@ -2892,7 +3037,7 @@ async function onSendBusy(e, text, opts, snap) {
     rewindStream(snap);
     setTurnUi(true);          // the server just said the turn IS running; believe it
     if (!S.poll) startPoll();  // and go back to watching it
-    if (!(opts && opts.noSteer)) {
+    if (!attachment && !opts?.noSteer) {
       // Reuse the echo already in the transcript: the same words, delivered the
       // way a running turn accepts them. postSteer re-checks liveness itself, so
       // a stale 409 cannot strand the text here either.
@@ -2904,13 +3049,15 @@ async function onSendBusy(e, text, opts, snap) {
   // Undeliverable: take the optimistic echo back out and give the words to the
   // person who typed them, rather than leaving a message in the transcript that
   // the model never saw.
+  if (S.me !== account) return;
+  restoreDraft(text, id, attachment);
+  if (epoch !== chatViewEpoch) return;
   dropEcho(text);
-  restoreDraft(text);
   toast('Busy', msg, 'err');
   drawTranscript();
 }
 
-/** Undo sendTurn's speculative resetStream()+baselineCursor() after the POST turned
+/** Undo sendTurn's speculative stream and cursor reset after the POST turned
     out to be a 409 against a turn that is STILL RUNNING.
  *
  *  Stream and cursor are rewound TOGETHER, and that is what makes it safe: the
@@ -2941,12 +3088,13 @@ function dropEcho(text) {
 }
 
 /** Give an undelivered line back to the composer, without clobbering a newer draft. */
-function restoreDraft(text) {
-  const input = el('input');
-  if (!input || input.value.trim()) return;
-  input.value = text;
-  autoGrow(input);
-  updateCharCount();
+function restoreDraft(text, id = S.conv, attachment = null) {
+  const draft = draftFor(id);
+  // If typing continued while the request was in flight, keep both drafts.
+  if (draft.text.trim() !== text) draft.text = draft.text.trim() ? text + '\n\n' + draft.text : text;
+  if (!draft.attach) draft.attach = attachment;
+  saveChatDraft(id, draft);
+  if (id === S.conv) loadChatDraft();
 }
 
 /** Is a turn still running for the open conversation? Only asked when the
@@ -2970,15 +3118,16 @@ async function convIsLive() {
     whenever there turns out to be nothing running to steer. */
 async function steerTurn() {
   const input = el('input');
-  if (!input) return;
+  if (!input || S.posting) return;
   const text = input.value.trim();
   if (!text) return;
   if (!S.conv || !S.live) return sendTurn();   // nothing in flight — this is just a message
-  const conv = S.conv;
+  const conv = S.conv, epoch = chatViewEpoch, account = S.me;
 
   // An image cannot ride a control op (the route takes op + text only), so say so
   // rather than dropping it. The attachment stays put for the next real turn.
-  if (_attach) toast('Image not sent', 'A steer carries text only — the image stays attached for your next message.', '');
+  const draft = draftFor(conv);
+  if (draft.attach) toast('Image kept for your next message', 'The running turn accepts text instructions.', '');
 
   // THE ECHO, and it is not cosmetic: the engine persists a folded steer to
   // messages.jsonl (engine.zig:5051) but emits no `message` frame for it, and
@@ -2987,9 +3136,11 @@ async function steerTurn() {
   // reloaded, which reads exactly like the steer was ignored.
   S.msgs.push({ role: 'user', content: text, ts: Math.floor(Date.now() / 1000) });
   input.value = '';
-  autoGrow(input);
+  draft.text = '';
+  saveChatDraft(conv, draft);
+  VeilWorkspace.growPrompt(input);
   updateCharCount();
-  resumeFollowing(el('transcript'));   // posting is an explicit act; follow the answer again
+  el('transcript').follow.jump();
   drawTranscript();
 
   // postSteer returns false for exactly one thing: the control POST itself failed
@@ -2999,16 +3150,17 @@ async function steerTurn() {
   // transcript keeps drawing a line the model was never given, which is precisely
   // the silent text-loss this whole path exists to remove.
   if (await postSteer(text, { echoed: true })) return;
-  if (S.conv !== conv) return;   // they moved on; do not paste this into another chat
+  if (account !== S.me) return;
+  restoreDraft(text, conv);
+  if (epoch !== chatViewEpoch) return;
   dropEcho(text);
-  restoreDraft(text);
   drawTranscript();
 }
 
 /** Deliver `text` to a running turn. Returns true when the words are on their way
     to the model — by steer OR by the ordinary-message fallback. */
 async function postSteer(text, opts) {
-  const conv = S.conv;
+  const conv = S.conv, epoch = chatViewEpoch;
   let live = null;                    // tri-state: true / false / unknown
   try {
     const j = await api.control(conv, { op: 'steer', text: text });
@@ -3017,13 +3169,14 @@ async function postSteer(text, opts) {
     failToast('Could not steer', e.message);
     return false;
   }
-  if (S.conv !== conv) return true;   // they switched conversations while we waited
+  if (epoch !== chatViewEpoch) return true;
 
   // The silent-loss window: a steer appended AFTER the turn ended sits in
   // control.jsonl, and the next turn snapshots its cursor past it — the words are
   // on disk, read by nobody, with no error anywhere. The server's `live` flag
   // closes it; an older server omits the field, so ask outright instead of hoping.
   if (live === null) live = await convIsLive();
+  if (epoch !== chatViewEpoch) return true;
 
   if (live === false) {
     if (opts && opts.echoed) dropEcho(text);
@@ -3063,27 +3216,15 @@ async function sendControl(op, text) {
 
 const CURSOR_PROBE = '18446744073709551615';
 
-async function baselineCursor() {
-  S.cursor = 0;
-  if (!S.conv) return;
-  // A brand-new conversation has no directory on the server yet — the client mints
-  // the id and the dir springs into existence on the first postMessage — so probing
-  // it 404s. The 404 was already harmless (the cursor stays 0, which is correct for
-  // an empty log), but it printed a red error in the console on every first message,
-  // which reads like a fault. Nothing to baseline against, so do not ask.
-  // allConvs, not convs: the question is "does the SERVER have this conversation",
-  // and a scheduled run opened from a task card is a conversation the server has
-  // and the rail's filter hides. Asking the filtered list would call a real
-  // transcript brand-new and skip its baseline.
-  if (!S.msgs.length && !S.allConvs.some((c) => c.id === S.conv)) return;
+async function readEventCursor(id) {
   try {
-    const r = await req('/api/v1/chat/convs/' + encodeURIComponent(S.conv) + '/events?from=' + CURSOR_PROBE, null, 8000);
-    if (!r.ok) return;
-    const txt = await r.text();
-    if (!txt) return;               // older server: the sentinel reads as past-the-end
-    const j = JSON.parse(txt);
-    if (j && typeof j.len === 'number') S.cursor = j.len;
+    const r = await req('/api/v1/chat/convs/' + encodeURIComponent(id) + '/events?from=' + CURSOR_PROBE, null, 8000);
+    if (r.ok) {
+      const j = await r.json();
+      if (typeof j.len === 'number') return j.len;
+    }
   } catch (e) { /* leave the cursor at 0 and replay — correctness over economy */ }
+  return 0;
 }
 
 function startPoll() {
@@ -3096,16 +3237,18 @@ function stopPoll() {
   if (S.poll) { clearInterval(S.poll); S.poll = null; }
 }
 
-let _polling = false;
+let _polling = null;
 async function pollEvents() {
-  if (_polling || !S.conv) return;
+  const epoch = chatViewEpoch;
+  if (_polling === epoch || !S.conv) return;
   if (document.hidden) return;   // a backgrounded tab must not poll
-  _polling = true;
+  _polling = epoch;
   try {
     const r = await req('/api/v1/chat/convs/' + encodeURIComponent(S.conv) + '/events?from=' + S.cursor, null, 12000);
     if (!r.ok) return;
     const next = r.headers.get('X-Next-Offset');
     const body = await r.text();
+    if (epoch !== chatViewEpoch || !S.poll) return;
     if (!body) {
       if (next) S.cursor = Number(next) || S.cursor;
       return;
@@ -3143,7 +3286,7 @@ async function pollEvents() {
     /* A dropped poll is not an error: the cursor is durable, so the next tick
        resumes exactly where this one failed. */
   } finally {
-    _polling = false;
+    if (_polling === epoch) _polling = null;
   }
 }
 
@@ -3169,7 +3312,6 @@ function applyFrame(f) {
         S.stream.tools.push({ tool: f.tool, state: f.state, preview: f.preview || '', started: Date.now(), ended: 0 });
       }
       cfToastLive(f);           // a Worker going live is worth a toast, not just a chip
-      scheduleType();           // keeps the elapsed counter and spinner ticking
       return true;
     }
     case 'message':

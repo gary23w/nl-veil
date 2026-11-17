@@ -95,6 +95,7 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addAnonymousImport("index.html", .{ .root_source_file = b.path("web/public/index.html") });
     exe.root_module.addAnonymousImport("app.js", .{ .root_source_file = b.path("web/public/app.js") });
     exe.root_module.addAnonymousImport("styles.css", .{ .root_source_file = b.path("web/public/styles.css") });
+    addChatWorkspace(b, exe.root_module);
     exe.root_module.addAnonymousImport("models.json", .{ .root_source_file = b.path("web/public/models.json") });
     exe.root_module.addImport("modelcfg", modelcfg);
     // The Windows FILE icon (Explorer, shortcuts, pinned taskbar entries). setWindowIcon only dresses a
@@ -246,6 +247,7 @@ pub fn build(b: *std.Build) void {
     inline for (.{ "index.html", "app.js", "styles.css", "models.json" }) |asset| {
         tests.root_module.addAnonymousImport(asset, .{ .root_source_file = b.path("web/public/" ++ asset) });
     }
+    addChatWorkspace(b, tests.root_module);
     tests.root_module.addAnonymousImport("tot.js", .{ .root_source_file = b.path("cloud/tot.js") }); // config/cf_tot.zig
     tests.root_module.addAnonymousImport("veil-web.js", .{ .root_source_file = b.path("cloud/veil-web/veil-web.js") }); // config/cf_harness.zig
     tests.root_module.addAnonymousImport("tot_py.py", .{ .root_source_file = b.path("cloud/tot_py.py") });
@@ -486,6 +488,12 @@ const llama_sources = [_][]const u8{
 /// runtime (src/plug/lua.zig) declares the C API as externs, so no translate-c step is needed — just
 /// the objects + libc. UBSan is disabled for these files: Lua's GC and VM do intentional
 /// aliasing/overflow the standard C sanitizer flags, and they are not our bugs to trap.
+fn addChatWorkspace(b: *std.Build, mod: *std.Build.Module) void {
+    inline for (.{ "workspace.js", "workspace.css" }) |asset| {
+        mod.addAnonymousImport(asset, .{ .root_source_file = b.path("docs/chat/" ++ asset) });
+    }
+}
+
 fn addLua(b: *std.Build, mod: *std.Build.Module) void {
     const lua_sources = [_][]const u8{
         "lapi.c",    "lauxlib.c",  "lbaselib.c", "lcode.c",    "lcorolib.c", "lctype.c",

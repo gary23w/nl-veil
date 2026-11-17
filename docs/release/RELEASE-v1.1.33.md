@@ -1,0 +1,14 @@
+# the veil v1.1.33
+
+NL-Veil Desk, the web app served by your Veil instance, and [website chat](https://veil.garrettstimpson.ca/chat/) share the same chat layout, Veil mark, and starter prompts.
+
+- Start with a prompt card and edit the draft before sending. The compact layout keeps the prompt choices within reach.
+- In the browser, drafts stay with their conversation. The web app restores the draft after a failed send.
+- Read older messages while a reply streams. Use **Latest** to return to the end of the conversation.
+- Website chat puts the model picker beside the message field and keeps the consent choice clear of the composer.
+
+This release also includes the post-v1.1.31 changes from `main`, including the website install guide, the Linux compatibility checks, and the updated browser harness with better repository and Python support.
+
+## Install or update
+
+Use **Settings → Updates → App updates → Update & restart** in an existing portable installation, or choose your platform on the [download page](https://veil.garrettstimpson.ca/#get). The Desk and local web app update together. Website chat runs directly from the site.

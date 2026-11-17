@@ -1,6 +1,6 @@
 .{
     .name = .veil,
-    .version = "1.1.31",
+    .version = "1.1.33",
     .fingerprint = 0xd137d40acdb7c43e,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
@@ -65,6 +65,8 @@
         "models.yaml",
         "vendor",
         "web",
+        "docs/chat/workspace.css",
+        "docs/chat/workspace.js",
         "LICENSE",
         "README.md",
     },

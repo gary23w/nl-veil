@@ -77,11 +77,11 @@ const log = std.log.scoped(.server);
 // THE single source of release identity. scripts/build-official.sh seds this literal out of this file to
 // name every artifact (veil-v<VERSION>-<os>-<arch>.zip, veil-server-v<VERSION>-…), so the binary can never
 // report a version its own bundle disagrees with. Bump it here and the whole release follows.
-const VERSION = "1.1.31";
+const VERSION = "1.1.33";
 
 const ASSET_HTML = @embedFile("index.html");
-const ASSET_JS = @embedFile("app.js");
-const ASSET_CSS = @embedFile("styles.css");
+const ASSET_JS = @embedFile("workspace.js") ++ "\n" ++ @embedFile("app.js");
+const ASSET_CSS = @embedFile("styles.css") ++ "\n" ++ @embedFile("workspace.css");
 const ASSET_MODELS = @embedFile("models.json");
 
 /// One embedded static asset plus everything prepareStatics derives from it at boot: a gzip of the body and
@@ -2151,18 +2151,25 @@ fn staticModels(_: *App, req: *httpz.Request, res: *httpz.Response) !void {
 //
 // Icons are inline SVG rather than PNG files: Chromium accepts `sizes:"any"` SVG for installability, and
 // keeping them here avoids adding two binaries to web/public (each of which is its own build.zig module).
+const PWA_MARK =
+    \\<path d="M16 1c1.6 8.2 6.8 13.4 15 15-8.2 1.6-13.4 6.8-15 15-1.6-8.2-6.8-13.4-15-15C9.2 14.4 14.4 9.2 16 1z" fill="#fff"/>
+;
 const PWA_ICON_SVG =
-    \\<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="the veil">
-    \\<rect width="512" height="512" rx="112" fill="#8a3ffc"/>
-    \\<path d="M128 160l128 208 128-208" fill="none" stroke="#fff" stroke-width="48" stroke-linecap="round" stroke-linejoin="round"/>
+    \\<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="the veil">
+    \\<rect width="32" height="32" rx="7" fill="#8a3ffc"/>
+    \\<g transform="translate(5 5) scale(.6875)">
+++ PWA_MARK ++
+    \\</g>
     \\</svg>
 ;
 // MASKABLE: full-bleed fill (the OS applies its own mask/rounding) with the mark pulled inside the inner
-// 80% safe circle, so a circular or squircle mask can never clip the V.
+// 80% safe circle.
 const PWA_ICON_MASKABLE_SVG =
-    \\<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="the veil">
-    \\<rect width="512" height="512" fill="#8a3ffc"/>
-    \\<path d="M166 198l90 146 90-146" fill="none" stroke="#fff" stroke-width="42" stroke-linecap="round" stroke-linejoin="round"/>
+    \\<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="the veil">
+    \\<rect width="32" height="32" fill="#8a3ffc"/>
+    \\<g transform="translate(7 7) scale(.5625)">
+++ PWA_MARK ++
+    \\</g>
     \\</svg>
 ;
 

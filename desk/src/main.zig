@@ -97,13 +97,7 @@ const HIDDEN_SLEEP_MS: u64 = 200;
 const TITLE_H = 34;
 const TAB_H = 38;
 
-// The transcript's background lattice — the same pitch and weight the web client uses (styles.css
-// .transcript), so a chat has one grain across both clients. Fine and very faint on purpose: this is the
-// texture of the surface, not a ruler, and it must never compete with a message for attention. Both
-// palettes carry it, since the line colour is `border`, which re-tints with the active theme.
-// The alpha is NOT the web's 0.30 verbatim: the desk paints this on `bg_dark`, which sits closer to
-// `border` than the web transcript's `bg` does, so the same alpha would come out fainter here. 58/255
-// lands the composited line within a shade or two of the web client's in both palettes.
+// The empty transcript has the same grid pitch as the browser workspace.
 const CHAT_GRID_CELL: f32 = 22;
 const CHAT_GRID_ALPHA: u8 = 58;
 
@@ -160,15 +154,14 @@ const Ui = struct {
     mh: [store_mod.MAX_CHAT_MSGS]f32 = undefined,
     mh_mfp: [store_mod.MAX_CHAT_MSGS]u64 = undefined,
     mh_count: usize = 0,
-    mh_cols: usize = 0,
     mh_width: f32 = 0,
     mh_scale: f32 = 0,
+    mh_mono: bool = false,
     mh_fp: u64 = 0,
     // live-stream measure cache: the growing preview only re-wraps when its length actually changed (not
     // every frame at 30-60fps while busy).
     stream_h: f32 = 0,
     stream_h_len: usize = std.math.maxInt(usize),
-    stream_h_cols: usize = 0,
     stream_h_fp: u64 = 0,
     // SMOOTH REVEAL, paced by latency: how much of the in-flight reply is on screen, and the arrival cadence it
     // is paced to (see Reveal). Dumping each poll batch at once made a slow reply appear in visible jumps, and
@@ -2553,9 +2546,7 @@ fn drawChat(store: *Store, body: t.Rect) void {
     var right_w_open: f32 = std.math.clamp(@as(f32, @floatFromInt(store.settings.chat_right_w)), CHAT_RIGHT_MIN, CHAT_RIGHT_MAX);
     store.unlock();
 
-    // RESPONSIVE COLLAPSE: both side panes at full width can starve the center column on a narrow window —
-    // the old fixed math drove center.width negative, drawing a degenerate/"broken" empty bordered box AND
-    // underflowing monoCols(view.width-28) (a panic in the desk's ReleaseSafe build). Collapse the panes to
+    // Both open side panes can starve the center column on a narrow window. Collapse the panes to
     // their strip state (a first-class supported layout), right pane first then left, until the center keeps
     // a usable minimum. Derived from the live window width each frame, so widening the window restores them.
     const min_center: f32 = 260;
@@ -2657,8 +2648,7 @@ fn drawChat(store: *Store, body: t.Rect) void {
     const con_gap: f32 = con_gapFor(con_h, pad);
     const right = t.Rect{ .x = body.width - pad - right_w, .y = yv, .width = right_w, .height = ph - con_h - con_gap };
     const console = t.Rect{ .x = right.x, .y = right.y + right.height + con_gap, .width = right_w, .height = con_h };
-    // Final safety net: even with both panes collapsed to strips, an extreme window must never feed a
-    // negative width downstream (monoCols underflow / degenerate panel rect). 28 keeps view.width-28 >= 0.
+    // Keep the minimum content inset even if the window is smaller than both side strips.
     const center = t.Rect{ .x = left.x + left_w + pad, .y = yv, .width = @max(28, right.x - (left.x + left_w) - pad * 2), .height = ph };
 
     // The in-flight reply, with any live reasoning prepended as a blockquote so thinking shows line-by-line.
@@ -3642,12 +3632,6 @@ fn drawChatLeft(store: *Store, r: t.Rect, open: bool, convs: []const store_mod.C
     tx += t.tabW(tl_chats) + 6;
     if (t.tab(.{ .x = tx, .y = r.y + 6, .width = t.tabW(tl_sched), .height = 26 }, tl_sched, ui.chats_inner == .sched)) ui.chats_inner = .sched;
     if (t.buttonGhost(.{ .x = r.x + r.width - 32, .y = r.y + 7, .width = 26, .height = 24 }, t.z("<", .{}), t.blue, true)) togglePane(store, true);
-    if (ui.chats_inner == .chats) {
-        if (t.buttonGhost(.{ .x = r.x + r.width - 62, .y = r.y + 7, .width = 26, .height = 24 }, t.z("+", .{}), t.blue, true)) {
-            store.pushChatCmd(store_mod.mkChatCmd(.new_conv, "", ""));
-            ui.c_renaming = false;
-        }
-    }
     // The profile card claims the pane's bottom edge first (on BOTH inner tabs — it is a pane
     // fixture, not a list row); everything below lays out inside what is left.
     const foot_h = drawCfProfileCard(store, r, now_s);
@@ -3656,6 +3640,12 @@ fn drawChatLeft(store: *Store, r: t.Rect, open: bool, convs: []const store_mod.C
         rs.height -= foot_h;
         drawChatsSchedList(store, rs);
         return;
+    }
+    const new_chat = t.Rect{ .x = r.x + 10, .y = r.y + 40, .width = r.width - 20, .height = 32 };
+    if (t.buttonSolid(new_chat, "+ New chat", t.blue, true)) {
+        store.pushChatCmd(store_mod.mkChatCmd(.new_conv, "", ""));
+        ui.c_renaming = false;
+        ui.chat_follow = true;
     }
 
     // SUB-CHATS never appear as top-level rail rows — they live as TABS inside their primary chat
@@ -3670,7 +3660,7 @@ fn drawChatLeft(store: *Store, r: t.Rect, open: bool, convs: []const store_mod.C
     }
     const rows = shown[0..shown_n];
 
-    const list = t.Rect{ .x = r.x + 1, .y = r.y + 38, .width = r.width - 2, .height = r.height - 42 - foot_h };
+    const list = t.Rect{ .x = r.x + 1, .y = r.y + 79, .width = r.width - 2, .height = @max(0, r.height - 83 - foot_h) };
     const row_h: f32 = 42;
     const head_h: f32 = 22; // a tier heading, inserted ABOVE the first row of each group
     // Dating needs a wall clock, and the UI thread's only one is the poller's. Before its first pass (now_s
@@ -3708,7 +3698,7 @@ fn drawChatLeft(store: *Store, r: t.Rect, open: bool, convs: []const store_mod.C
     rl.beginScissorMode(@intFromFloat(list.x), @intFromFloat(list.y), @intFromFloat(list.width), @intFromFloat(list.height));
     defer rl.endScissorMode();
     const bot = r.y + r.height - 8 - foot_h;
-    var yy: f32 = r.y + 42 - ui.conv_scroll;
+    var yy: f32 = list.y - ui.conv_scroll;
     var prev_tier: ?ConvTier = null;
     for (rows) |*cv| {
         // The tier walk runs for EVERY row, culled or not — it is what positions everything below it. Only the
@@ -3734,7 +3724,10 @@ fn drawChatLeft(store: *Store, r: t.Rect, open: bool, convs: []const store_mod.C
         // hit rect still extends past `bot` — right over the profile card. Hovering must mean the
         // VISIBLE list, or a click on the card also selects the hidden row beneath it.
         const hot = t.hovering(rr) and t.hovering(list) and !sb_busy;
-        if (is_active) t.panel(rr, t.bg_sel) else if (hot) t.panel(rr, t.bg_hl);
+        if (is_active) {
+            t.panelBordered(rr, t.withAlpha(t.blue, 34), t.border);
+            t.fillRect(@intFromFloat(rr.x + 1), @intFromFloat(rr.y + 7), 2, @intFromFloat(rr.height - 14), t.blue);
+        } else if (hot) t.panel(rr, t.bg_hl);
 
         if (is_active and ui.c_renaming) {
             textField(.{ .x = rr.x + 4, .y = rr.y + 4, .width = rr.width - 8, .height = rr.height - 8 }, &ui.c_rename, ui.focus == .c_rename, "new title - Enter", .c_rename);
@@ -3775,8 +3768,7 @@ fn drawChatLeft(store: *Store, r: t.Rect, open: bool, convs: []const store_mod.C
         yy += row_h;
     }
     if (rows.len == 0) {
-        t.text(t.z("no chats yet", .{}), @intFromFloat(r.x + 12), @intFromFloat(r.y + 42), 12, t.comment);
-        t.text(t.z("type below to start one", .{}), @intFromFloat(r.x + 12), @intFromFloat(r.y + 60), 12, t.comment);
+        _ = helpPara("Your conversations will appear here.", r.x + 13, list.y + 8, @max(1, r.width - 26));
     }
 }
 
@@ -3990,7 +3982,14 @@ fn renderMsg(view: t.Rect, y0: f32, role: store_mod.ChatRole, text_in: []const u
         var lx = view.x + 14;
         // the LIVE reply (cursor=true only on the streaming message) carries the animated BRAND MARK +
         // thought dots — both paced by real stream activity (see thinkEnergy)
-        if (cursor and role == .veil) lx += drawThinkingMark(lx, yy);
+        if (role == .veil) {
+            if (cursor) {
+                lx += drawThinkingMark(lx, yy);
+            } else {
+                t.drawMark(lx + 7, yy + t.textH(11) / 2, 9, false);
+                lx += 20;
+            }
+        }
         if (gview) |g| {
             const gl = t.z("goal", .{});
             t.text(gl, @intFromFloat(lx), @intFromFloat(yy), 11, t.orange);
@@ -4486,11 +4485,12 @@ fn renderInline(view: t.Rect, y0: f32, il: *const md.Inline, size: i32, line_h: 
     var yy = y0;
     const x_base = view.x + 14;
     const max_x = view.x + view.width - 12;
-    const space_w: f32 = @floatFromInt(@max(2, t.measureStyled(t.z(" ", .{}), size, base_kind)));
+    // Fractional advances keep a line of short words from losing space at each seam.
+    const space_w = @max(2, t.measureStyledF(" ", size, base_kind));
     // Inline code renders in the MONO face; a proportional space between wide mono glyphs looks cramped and
     // lets adjacent code chips visually merge. Use the (wider) mono space for any gap flanking a code span so
     // `npx tsc --noEmit` reads with terminal-like breathing room. Prose spacing is untouched.
-    const code_space_w: f32 = @floatFromInt(@max(2, t.measureStyled(t.z(" ", .{}), size, .mono)));
+    const code_space_w = @max(2, t.measureStyledF(" ", size, .mono));
     var x = x_base + first_indent;
     var row_x0 = x;
     var row_text: [1024]u8 = undefined; // the row's plain bytes, for the selection/copy capture
@@ -4535,7 +4535,7 @@ fn renderInline(view: t.Rect, y0: f32, il: *const md.Inline, size: i32, line_h: 
                 const sp = il.spans[si];
                 const pe = @min(wend, @as(usize, sp.off) + sp.len);
                 if (pe <= p) break; // degenerate span table — never spin
-                ww += @floatFromInt(t.measureStyled(t.zs(il.text[p..pe]), size, spanKind(sp.style, base_kind)));
+                ww += t.measureStyledF(t.zs(il.text[p..pe]), size, spanKind(sp.style, base_kind));
                 p = pe;
             }
         }
@@ -4578,7 +4578,7 @@ fn renderInline(view: t.Rect, y0: f32, il: *const md.Inline, size: i32, line_h: 
             const color = spanColor(sp.style, base_color);
             while (piece.len > 0) {
                 var z = t.zs(piece);
-                var w: f32 = @floatFromInt(t.measureStyled(z, size, kind));
+                var w = t.measureStyledF(z, size, kind);
                 var taken = piece.len;
                 if (x + w > max_x and !line_start) { // no room mid-row: wrap, then retry on the fresh row
                     if (draw) captureSelLine(inView(view, yy, line_h), yy, row_x0, size, false, row_text[0..row_len]);
@@ -4594,10 +4594,10 @@ fn renderInline(view: t.Rect, y0: f32, il: *const md.Inline, size: i32, line_h: 
                     taken = 1;
                     while (taken < piece.len) : (taken += 1) {
                         const zc = t.zs(piece[0 .. taken + 1]);
-                        if (x + @as(f32, @floatFromInt(t.measureStyled(zc, size, kind))) > max_x) break;
+                        if (x + t.measureStyledF(zc, size, kind) > max_x) break;
                     }
                     z = t.zs(piece[0..taken]);
-                    w = @floatFromInt(t.measureStyled(z, size, kind));
+                    w = t.measureStyledF(z, size, kind);
                 }
                 const shown = inView(view, yy, line_h);
                 if (draw and shown) drawPieceDecorated(il, sp, z, x, yy, w, size, line_h, color, kind);
@@ -4737,8 +4737,8 @@ test "goal row: the slash command never shows - body is the goal, flags ride bes
 
 fn roleLabel(role: store_mod.ChatRole) [:0]const u8 {
     return switch (role) {
-        .user => t.z("you", .{}),
-        .veil => t.z("veil", .{}),
+        .user => "You",
+        .veil => "Veil",
         .cast_note => t.z("cast", .{}),
         .thought => t.z("reasoning", .{}),
     };
@@ -5116,7 +5116,7 @@ fn selPrefixPx(g: *const SelLine, c: usize) f32 {
     var b: [2049]u8 = undefined;
     @memcpy(b[0..n], g.bytes[0..n]);
     b[n] = 0;
-    return @floatFromInt(if (g.mono) t.measureMono(b[0..n :0], g.size) else t.measure(b[0..n :0], g.size));
+    return t.measureStyledF(b[0..n :0], g.size, if (g.mono) .mono else .ui);
 }
 
 fn selColAt(g: *const SelLine, mx: f32) usize {
@@ -5253,15 +5253,148 @@ fn famFind(fam: []const store_mod.FamMember, conv: []const u8) ?*const store_mod
     return null;
 }
 
+const chat_starters = [_]struct { title: [:0]const u8, description: []const u8, prompt: []const u8 }{
+    .{ .title = "Explore my project", .description = "See how it fits together", .prompt = "Help me understand this project. Explain the main parts and suggest one useful place to start." },
+    .{ .title = "Build something small", .description = "Plan a first feature", .prompt = "I want to build a small feature. Help me clarify the idea and break it into a few achievable steps." },
+    .{ .title = "Find an improvement", .description = "Review one practical change", .prompt = "Review this project for one practical improvement. Explain why it matters before making changes." },
+};
+
+const ChatWelcome = struct {
+    width: f32,
+    heading_size: i32,
+    heading_wrap: bool,
+    intro: [4][]const u8 = undefined,
+    intro_count: usize = 0,
+    stacked: bool,
+    emblem_h: f32,
+    lead_gap: f32,
+    cards_gap: f32,
+    card_h: f32,
+    content_h: f32 = 0,
+    cloud_label: ?[:0]const u8,
+
+    const heading = "What would you like to make?";
+    const gap: f32 = 8;
+
+    fn init(view: t.Rect, cloud_label: ?[:0]const u8) ChatWelcome {
+        const w = @max(1, @min(690, view.width - 36));
+        const compact = view.height < 320;
+        const fs: i32 = if (compact) 22 else if (w >= 480) 32 else 24;
+        const heading_wrap = @as(f32, @floatFromInt(t.measure(heading, fs))) > w;
+        const stacked = w < 557 * @max(1, t.uiScale());
+        const padding: f32 = if (compact) 9 else 18;
+        const card_min: f32 = if (compact) 37 else if (stacked) 49 else 66;
+        const card_h = @max(card_min, t.textH(14) + t.textH(12) + padding);
+        var result: ChatWelcome = .{
+            .width = w,
+            .heading_size = fs,
+            .heading_wrap = heading_wrap,
+            .stacked = stacked,
+            .emblem_h = if (compact) 36 else 58,
+            .lead_gap = if (compact) 8 else 18,
+            .cards_gap = if (compact) 10 else 22,
+            .card_h = card_h,
+            .cloud_label = cloud_label,
+        };
+        result.intro_count = wrapInto("Start with an idea, a question, or one thing you want to improve.", w, &result.intro);
+        const lines: f32 = @floatFromInt(result.intro_count);
+        result.content_h = result.emblem_h + result.lead_gap + t.textH(fs) * (if (heading_wrap) @as(f32, 2) else 1) + 9 +
+            lines * (t.textH(13) + 3) + result.cards_gap + (if (stacked) card_h * 3 + gap * 2 else card_h) +
+            (if (cloud_label != null) @as(f32, 42) else 0);
+        return result;
+    }
+
+    fn offset(w: ChatWelcome, view: t.Rect) f32 {
+        return @max(12, (view.height - w.content_h) * 0.5);
+    }
+
+    fn centerText(s: []const u8, view: t.Rect, y: f32, size: i32, color: t.Color) void {
+        const width = @min(@as(f32, @floatFromInt(t.measure(t.zs(s), size))), view.width);
+        t.textClip(s, @intFromFloat(view.x + (view.width - width) / 2), @intFromFloat(y), size, color, @intFromFloat(@max(1, width)));
+    }
+
+    fn draw(w: ChatWelcome, view: t.Rect, store: *Store) bool {
+        const cx = view.x + view.width / 2;
+        var y = view.y + w.offset(view) - ui.chat_scroll;
+        const tile = t.Rect{ .x = cx - w.emblem_h / 2, .y = y, .width = w.emblem_h, .height = w.emblem_h };
+        t.panelBordered(tile, t.bg_hl, t.border);
+        t.drawMark(cx, y + w.emblem_h / 2, w.emblem_h * 0.45, false);
+        y += w.emblem_h + w.lead_gap;
+        if (w.heading_wrap) {
+            centerText("What would you", view, y, w.heading_size, t.fg);
+            y += t.textH(w.heading_size);
+            centerText("like to make?", view, y, w.heading_size, t.fg);
+        } else {
+            centerText(heading, view, y, w.heading_size, t.fg);
+        }
+        y += t.textH(w.heading_size) + 9;
+        for (w.intro[0..w.intro_count]) |line| {
+            centerText(std.mem.trimEnd(u8, line, " "), view, y, 13, t.fg_dim);
+            y += t.textH(13) + 3;
+        }
+        y += w.cards_gap;
+
+        t.setInteractionClip(view);
+        defer t.setInteractionClip(null);
+        const cards_w = if (w.stacked) @min(355, w.width) else w.width;
+        const card_w = if (w.stacked) cards_w else (cards_w - gap * 2) / 3;
+        const x = cx - cards_w / 2;
+        var staged = false;
+        for (chat_starters, 0..) |starter, i| {
+            const step: f32 = @floatFromInt(i);
+            const card = t.Rect{
+                .x = if (w.stacked) x else x + step * (card_w + gap),
+                .y = if (w.stacked) y + step * (w.card_h + gap) else y,
+                .width = card_w,
+                .height = w.card_h,
+            };
+            if (inView(view, card.y, card.height) and t.chatStarter(card, starter.title, starter.description)) {
+                const current = std.mem.trimEnd(u8, ui.c_input.str(), " \t\r\n");
+                if (!std.mem.endsWith(u8, current, starter.prompt)) {
+                    const sep: []const u8 = if (current.len > 0) "\n\n" else "";
+                    if (current.len + sep.len + starter.prompt.len <= ui.c_input.buf.len) {
+                        var next: [4096]u8 = undefined;
+                        const prompt = std.fmt.bufPrint(&next, "{s}{s}{s}", .{ current, sep, starter.prompt }) catch unreachable;
+                        setField(&ui.c_input, prompt);
+                    } else {
+                        store.pushNotif("Draft is full", "Shorten the draft to add a starter prompt.", 1);
+                    }
+                }
+                ui.focus = .c_input;
+                staged = true; // Enter on a focused card fills the draft for review.
+            }
+        }
+        if (w.cloud_label) |label| {
+            y += (if (w.stacked) w.card_h * 3 + gap * 2 else w.card_h) + 10;
+            const bw = t.btnW(label, 30);
+            const button = t.Rect{ .x = cx - bw / 2, .y = y, .width = bw, .height = 30 };
+            if (bw <= view.width and inView(view, button.y, button.height) and t.buttonGhost(button, label, CF_ORANGE, true))
+                store.pushCmd(store_mod.mkCmd(.oauth_cf_login, "", ""));
+        }
+        return staged;
+    }
+};
+
+fn chatReadingBand(r: t.Rect, width: f32) t.Rect {
+    const w = @min(r.width, width);
+    return .{ .x = r.x + (r.width - w) / 2, .y = r.y, .width = w, .height = r.height };
+}
+
+fn chatMessageBand(r: t.Rect, role: store_mod.ChatRole) t.Rect {
+    if (role != .user) return r;
+    const w = @max(28, @min(r.width * 0.88, 620));
+    return .{ .x = r.x + r.width - w, .y = r.y, .width = w, .height = r.height };
+}
+
 fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, stream: []const u8, busy: bool, status: []const u8, cast_live: bool, conv_title: []const u8, convs: []const store_mod.ConvRow, active: []const u8) void {
-    // The input row is USER-RESIZABLE (drag the grab strip above it): crafting a long prompt deserves
-    // more than three lines. ui.input_extra persists for the session; the transcript view shrinks to
-    // make room because everything below derives from input_h. Clamped so the transcript keeps space.
-    ui.input_extra = std.math.clamp(ui.input_extra, 0, @max(0, r.height * 0.5 - 66));
+    // Only the text area grows under the resize grip; the toolbar keeps its height.
+    const input_min: f32 = 96;
+    const input_extra_max = @max(0, r.height * 0.5 - input_min);
+    ui.input_extra = std.math.clamp(ui.input_extra, 0, input_extra_max);
     // When an image is attached, the composer grows by a chip row so the thumbnail sits ABOVE the text (which is
     // inset by the same amount) instead of covering it. Folded into input_h, so `view` shrinks + the box grows.
     const chip_row_h: f32 = if (ui.c_attach.tex != null) 56 else 0;
-    const input_h: f32 = 66 + ui.input_extra + chip_row_h;
+    const input_h: f32 = input_min + ui.input_extra + chip_row_h;
     const status_h: f32 = 22;
     // A slim row reserved BELOW the input for the role picker. Always reserved (not gated on the picker being
     // visible) so the transcript height doesn't jump as busy/idle toggles; the anchor itself is idle-only.
@@ -5271,13 +5404,18 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
     const tl_chat = t.z("Chat", .{});
     const tl_metrics = t.z("Metrics", .{});
     const tl_files = t.z("Files", .{});
+    const task_label = "Make a task";
+    const task_width = if (msgs.len > 0 and r.width >= 265) t.btnW(task_label, 24) else 0;
+    var widths = [_]f32{ t.tabW(tl_chat), t.tabW(tl_metrics), t.tabW(tl_files) };
+    t.fitTabs(&widths, 6, r.width - task_width - 10);
     var tx = r.x;
-    if (t.tab(.{ .x = tx, .y = r.y, .width = t.tabW(tl_chat), .height = tab_h }, tl_chat, ui.chat_inner == .chat)) ui.chat_inner = .chat;
-    tx += t.tabW(tl_chat) + 6;
-    if (t.tab(.{ .x = tx, .y = r.y, .width = t.tabW(tl_metrics), .height = tab_h }, tl_metrics, ui.chat_inner == .metrics)) ui.chat_inner = .metrics;
-    tx += t.tabW(tl_metrics) + 6;
-    if (t.tab(.{ .x = tx, .y = r.y, .width = t.tabW(tl_files), .height = tab_h }, tl_files, ui.chat_inner == .files)) ui.chat_inner = .files;
-    tx += t.tabW(tl_files) + 14;
+    if (t.tab(.{ .x = tx, .y = r.y, .width = widths[0], .height = tab_h }, tl_chat, ui.chat_inner == .chat)) ui.chat_inner = .chat;
+    tx += widths[0] + 6;
+    if (t.tab(.{ .x = tx, .y = r.y, .width = widths[1], .height = tab_h }, tl_metrics, ui.chat_inner == .metrics)) ui.chat_inner = .metrics;
+    tx += widths[1] + 6;
+    if (t.tab(.{ .x = tx, .y = r.y, .width = widths[2], .height = tab_h }, tl_files, ui.chat_inner == .files)) ui.chat_inner = .files;
+    tx += widths[2] + 14;
+    var tab_end = r.y + tab_h + 6;
     // ---- SUB-CHAT FAMILY TABS: Main | s1..s5 | +sub (max 5) ----
     // A sub-chat is a full conversation ("<primary>__sN") shown as a TAB here instead of a rail row:
     // same family workspace and shared memory server-side, so an idea branches without forking the work.
@@ -5327,9 +5465,25 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
                 have_n += 1;
             }
         };
+        const can_branch = have_n < store_mod.MAX_BRANCHES and msgs.len > 0;
+        const plus_label: [:0]const u8 = if (r.width >= 380) "+ Sub-chat" else "+ Sub";
+        const plus_w = if (can_branch) t.btnW(plus_label, 22) + 2 else 0;
+        const delete_w: f32 = if (!on_primary) 22 else 0;
+        var family_tabs: [store_mod.MAX_BRANCHES + 1]f32 = @splat(t.tabW("s1"));
+        family_tabs[0] = t.tabW("Main");
+        const family_w = (if (have_n > 0) family_tabs[0] + 4 + @as(f32, @floatFromInt(have_n)) * (family_tabs[1] + 4) + delete_w else 0) + plus_w;
+        var family_y = r.y;
+        if (family_w > 0 and tx + family_w > r.x + r.width - task_width - 8) {
+            // Use a second row when the family and the task action need the same space.
+            tx = r.x;
+            family_y = tab_end;
+            tab_end += tab_h + 3;
+        }
         if (have_n > 0) {
+            const limit = r.x + r.width - tx - plus_w - delete_w - 4;
+            t.fitTabs(family_tabs[0 .. have_n + 1], 4, limit);
             const tl_main = t.z("Main", .{});
-            const main_r = t.Rect{ .x = tx, .y = r.y, .width = t.tabW(tl_main), .height = tab_h };
+            const main_r = t.Rect{ .x = tx, .y = family_y, .width = family_tabs[0], .height = tab_h };
             if (t.tab(main_r, tl_main, on_primary) and !on_primary)
                 store.pushChatCmd(store_mod.mkChatCmd(.select_conv, primary, ""));
             famMark(main_r, famFind(fam[0..fam_n], primary), "Main", fam_log[0..fam_log_n]);
@@ -5341,7 +5495,7 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
                 const bid = std.fmt.bufPrint(&idb, "{s}__s{d}", .{ primary, bi + 1 }) catch continue;
                 const is_on = std.mem.eql(u8, active, bid);
                 const lbl = t.z("s{d}", .{bi + 1});
-                const tab_r = t.Rect{ .x = tx, .y = r.y, .width = t.tabW(lbl), .height = tab_h };
+                const tab_r = t.Rect{ .x = tx, .y = family_y, .width = family_tabs[1], .height = tab_h };
                 if (t.tab(tab_r, lbl, is_on) and !is_on)
                     store.pushChatCmd(store_mod.mkChatCmd(.select_conv, bid, ""));
                 famMark(tab_r, famFind(fam[0..fam_n], bid), lbl, fam_log[0..fam_log_n]);
@@ -5349,26 +5503,24 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
                 // the ACTIVE sub-chat carries its delete — sub-chats have no rail row (delete lived there),
                 // so the tab is the one place the affordance can exist. Lands back on Main (cmdDeleteConv).
                 if (is_on) {
-                    const xr = t.Rect{ .x = tx, .y = r.y + 3, .width = 18, .height = 20 };
+                    const xr = t.Rect{ .x = tx, .y = family_y + 3, .width = 18, .height = 20 };
                     if (t.buttonGhost(xr, t.z("x", .{}), t.red, true))
                         store.pushChatCmd(store_mod.mkChatCmd(.delete_conv, bid, ""));
                     tx += 22;
                 }
             }
         }
-        if (have_n < store_mod.MAX_BRANCHES and msgs.len > 0) {
-            const tl_plus = t.z("+sub", .{});
-            const pb = t.Rect{ .x = tx + 2, .y = r.y + 2, .width = t.btnW(tl_plus, 22), .height = 22 };
-            if (t.buttonGhost(pb, tl_plus, t.blue, true))
+        if (can_branch) {
+            const pb = t.Rect{ .x = tx + 2, .y = family_y + 2, .width = t.btnW(plus_label, 22), .height = 22 };
+            if (t.buttonGhost(pb, plus_label, t.blue, true))
                 store.pushChatCmd(store_mod.mkChatCmd(.branch_conv, "", ""));
         }
     }
     // right-aligned in the same tab row: seed a task from THIS conversation (its first user ask becomes
     // the prompt, the latest answer the key details). Pure UI-thread prefill — no commands fired.
-    if (msgs.len > 0) {
-        const tl_sched = t.z("make a task", .{});
-        const sb = t.Rect{ .x = r.x + r.width - t.btnW(tl_sched, 22) - 2, .y = r.y + 2, .width = t.btnW(tl_sched, 22), .height = 22 };
-        if (t.buttonGhost(sb, tl_sched, t.blue, true)) {
+    if (task_width > 0) {
+        const sb = t.Rect{ .x = r.x + r.width - task_width - 2, .y = r.y + 2, .width = task_width, .height = 24 };
+        if (t.buttonGhost(sb, task_label, t.blue, true)) {
             schedResetForm(); // a CREATE seed must never inherit a half-open edit's id/provider fields
             setField(&ui.sc_name, if (conv_title.len > 0) conv_title else "chat task");
             for (msgs) |*m| {
@@ -5390,24 +5542,35 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
         }
     }
     if (ui.chat_inner == .metrics) {
-        drawChatMetrics(store, .{ .x = r.x, .y = r.y + tab_h + 6, .width = r.width, .height = r.height - tab_h - 6 });
+        drawChatMetrics(store, .{ .x = r.x, .y = tab_end, .width = r.width, .height = r.y + r.height - tab_end });
         return;
     }
     if (ui.chat_inner == .files) {
-        drawChatFiles(store, .{ .x = r.x, .y = r.y + tab_h + 6, .width = r.width, .height = r.height - tab_h - 6 });
+        drawChatFiles(store, .{ .x = r.x, .y = tab_end, .width = r.width, .height = r.y + r.height - tab_end });
         return;
     }
-    const progress_h = if (busy or cast_live) drawChatProgress(.{ .x = r.x, .y = r.y + tab_h + 6, .width = r.width, .height = 0 }, status) else 0;
-    const view = t.Rect{ .x = r.x, .y = r.y + tab_h + 6 + progress_h, .width = r.width, .height = @max(1, r.height - input_h - status_h - role_h - 14 - tab_h - 6 - progress_h) };
-    t.panelBordered(view, t.bg_dark, t.border);
-    // The transcript reads as a surface rather than a void. Drawn on the panel, BEFORE the messages and
-    // outside the scroll scissor, so it stays pinned to the frame instead of sliding with the text — the
-    // same behaviour the web client gets from a non-`local` background-attachment.
-    t.grid(view, CHAT_GRID_CELL, t.withAlpha(t.border, CHAT_GRID_ALPHA));
+    const title_h = t.textH(14) + 15;
+    const title_row = t.Rect{ .x = r.x, .y = tab_end, .width = r.width, .height = title_h };
+    t.panel(title_row, t.bg_dark);
+    t.textClip(conv_title, @intFromFloat(r.x + 12), @intFromFloat(tab_end + 7), 14, t.fg, @intFromFloat(@max(1, r.width - 24)));
+    const progress_y = tab_end + title_h + 5;
+    const progress_h = if (busy or cast_live) drawChatProgress(.{ .x = r.x, .y = progress_y, .width = r.width, .height = 0 }, status) else 0;
+    const view_y = progress_y + progress_h;
+    const view = t.Rect{ .x = r.x, .y = view_y, .width = r.width, .height = @max(2, r.y + r.height - input_h - status_h - role_h - 14 - view_y) };
+    const reading = chatReadingBand(view, 800);
+    t.panelBordered(view, t.bg, t.border);
+    const welcome: ?ChatWelcome = if (msgs.len == 0 and !busy and !cast_live and stream.len == 0) blk: {
+        const cloud_label: ?[:0]const u8 = blk_cloud: {
+            store.lock();
+            defer store.unlock();
+            if (!store.cf_oauth_configured or store.cf_oauth_connected) break :blk_cloud null;
+            break :blk_cloud if (store.cf_oauth_pending) "Retry Cloudflare login" else "Log in with Cloudflare";
+        };
+        t.grid(view, CHAT_GRID_CELL, t.withAlpha(t.border, CHAT_GRID_ALPHA));
+        break :blk ChatWelcome.init(reading, cloud_label);
+    } else null;
 
     const fsz: i32 = 14;
-    const cols = monoCols(view.width - 28, fsz);
-
     // EXPAND STATE belongs to ONE conversation: uids are per-Store and a switch renumbers every row, so a uid
     // held over from the previous chat would open an unrelated block here. Drop the set and treat everything
     // the switch loaded as already-seen history (no auto-expand on a chat you just opened).
@@ -5418,6 +5581,7 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
         ui.mh_width = 0;
         ui.open_n = 0;
         ui.thought_uid_hi = 0;
+        if (welcome != null) ui.chat_scroll = 0;
         for (msgs) |*m| ui.thought_uid_hi = @max(ui.thought_uid_hi, m.uid);
     }
     // A reasoning trace the user has not seen yet opens BY ITSELF — it was just streaming live as a blockquote,
@@ -5437,11 +5601,11 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
     // total content height — from the per-message height CACHE (renderMsg word-wrap is expensive on long
     // chats). Rebuild the cache only when the message set or wrap width actually changed; otherwise reuse.
     var fp: u64 = 0;
-    for (msgs) |*m| fp = fp *% 1000003 +% m.text_len +% (@as(u64, @intFromEnum(m.role)) << 56);
+    for (msgs) |*m| fp = fp *% 1000003 +% m.uid +% m.text_len +% (@as(u64, @intFromEnum(m.role)) << 56);
     for (ui.open_uids[0..ui.open_n]) |u| fp = fp *% 31 +% u; // expand/collapse changes a row's height
     // message set / wrap width changed → drop a stale selection — but NOT mid-drag, or a background message commit
     // (a cast_note row, the finalized veil answer) during an active drag would silently kill the in-progress select.
-    const layout_changed = ui.mh_width != view.width or ui.mh_scale != t.uiScale();
+    const layout_changed = ui.mh_width != reading.width or ui.mh_scale != t.uiScale() or ui.mh_mono != t.activeMonoUi();
     // A resize can happen between streams; invalidate even when no preview is drawn.
     if (layout_changed) ui.stream_h_len = std.math.maxInt(usize);
     if ((ui.mh_fp != fp or layout_changed) and !ui.sel_dragging) ui.sel_msg = null;
@@ -5458,29 +5622,29 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
             ui.mh[i] = if ((m.role == .thought or toolName(m.textStr()) != null) and !open)
                 TOOL_CHIP_H // collapsed tool call / reasoning trace = a one-line chip
             else
-                renderMsg(view, 0, m.role, m.textStr(), fsz, false, false, m.imgStr());
+                renderMsg(chatMessageBand(reading, m.role), 0, m.role, m.textStr(), fsz, false, false, m.imgStr());
             ui.mh_mfp[i] = mfp;
         }
         ui.mh_count = msgs.len;
-        ui.mh_cols = cols;
-        ui.mh_width = view.width;
+        ui.mh_width = reading.width;
         ui.mh_scale = t.uiScale();
+        ui.mh_mono = t.activeMonoUi();
         ui.mh_fp = fp;
     }
     // Keep the reading cushion through stream -> committed-message transitions.
-    var total: f32 = 8 + MSG_LINE_H;
+    var total: f32 = if (welcome) |w| w.offset(reading) + w.content_h + 12 else 14 + MSG_LINE_H;
     for (msgs, 0..) |_, i| total += ui.mh[i];
     if (stream.len > 0) {
         // re-measure the live preview only when it actually grew (it only ever grows within a step)
-        if (stream.len != ui.stream_h_len or layout_changed or std.hash.Wyhash.hash(0, stream) != ui.stream_h_fp) {
-            ui.stream_h = renderMsg(view, 0, .veil, stream, fsz, false, false, "");
+        const stream_fp = std.hash.Wyhash.hash(0, stream);
+        if (stream.len != ui.stream_h_len or layout_changed or stream_fp != ui.stream_h_fp) {
+            ui.stream_h = renderMsg(reading, 0, .veil, stream, fsz, false, false, "");
             ui.stream_h_len = stream.len;
-            ui.stream_h_cols = cols;
-            ui.stream_h_fp = std.hash.Wyhash.hash(0, stream);
+            ui.stream_h_fp = stream_fp;
         }
         total += ui.stream_h;
     }
-    if (cast_live) total += renderCastLive(view, 0, status, false);
+    if (cast_live) total += renderCastLive(reading, 0, status, false);
 
     // Release any table-scrollbar drag on mouse-up here, ONCE per frame and unconditionally — renderTable's own
     // release is gated on the table being on-screen, so a table dragged off-screen and released there would
@@ -5517,7 +5681,7 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
     const max_scroll = chatScrollLimit(total, view.height, ui.chat_scroll, ui.chat_follow, layout_changed or ui.chat_reflow or ui.chat_view_h != view.height, MSG_LINE_H * 2);
     ui.chat_reflow = false;
     ui.chat_view_h = view.height;
-    if (ui.chat_follow) ui.chat_scroll = max_scroll;
+    if (ui.chat_follow and welcome == null) ui.chat_scroll = max_scroll;
     if (ui.chat_scroll < 0) ui.chat_scroll = 0;
     if (ui.chat_scroll > max_scroll) ui.chat_scroll = max_scroll;
     // Re-arm follow ONLY on user intent: a wheel-DOWN tick that lands at the bottom (the jump button and
@@ -5530,12 +5694,14 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
 
     // floating "scroll to bottom" (drawn after endScissorMode below): visible only while scrolled away from the
     // bottom — follow re-arms only on a user's own wheel-down/jump/send now, so !chat_follow IS "reading back".
-    const show_jump = !ui.chat_follow;
-    const jump_r = t.Rect{ .x = view.x + view.width - 40, .y = view.y + view.height - 40, .width = 28, .height = 28 };
+    const show_jump = welcome == null and !ui.chat_follow and max_scroll - ui.chat_scroll > 4;
+    const jump_label = "Latest";
+    const jump_w = t.btnW(jump_label, 30);
+    const jump_r = t.Rect{ .x = view.x + (view.width - jump_w) / 2, .y = view.y + view.height - 39, .width = jump_w, .height = 30 };
 
     rl.beginScissorMode(@intFromFloat(view.x + 1), @intFromFloat(view.y + 1), @intFromFloat(view.width - 2), @intFromFloat(view.height - 2));
     sel_line_n = 0; // rebuild this frame's selection line-geometry as we draw
-    var yy: f32 = view.y + 8 - ui.chat_scroll;
+    var yy: f32 = view.y + 14 - ui.chat_scroll;
     const vtop = view.y;
     const vbot = view.y + view.height;
     for (msgs, 0..) |*m, i| {
@@ -5545,23 +5711,24 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
         // CULL: a message fully above or below the viewport costs nothing — skip the word-wrap+draw entirely.
         // This is the big win on long scrollback (render ~a screenful, not the whole history, every frame).
         if (yy < vtop or y0 > vbot) continue;
+        const band = chatMessageBand(reading, m.role);
         if (m.role == .thought) {
             // The reasoning trace stays OPEN once it is open — a fresh one auto-expands (it was just streaming
             // live) and nothing but the user's own click on the header collapses it. Excluded from the model's
             // history, so leaving it open costs nothing but screen.
             if (rowOpen(m.uid)) {
-                _ = renderMsg(view, y0, m.role, m.textStr(), fsz, true, false, m.imgStr());
+                _ = renderMsg(band, y0, m.role, m.textStr(), fsz, true, false, m.imgStr());
                 // copy chip: flush RIGHT and only while the row is hovered (a reasoning block has no token-cost
                 // label to its right, so a mid-row chip would read as floating).
-                if (t.hovering(t.Rect{ .x = view.x + 2, .y = y0, .width = view.width - 4, .height = yy - y0 }) and t.hovering(view)) {
-                    if (copyChip(view.x + view.width - 60, y0 + 3)) {
+                if (t.hovering(t.Rect{ .x = band.x + 2, .y = y0, .width = band.width - 4, .height = yy - y0 }) and t.hovering(view)) {
+                    if (copyChip(band.x + band.width - 60, y0 + 3)) {
                         copyToClipboard(m.textStr());
                         markCopied();
                     }
                 }
-                const hdr = t.Rect{ .x = view.x + 2, .y = y0, .width = view.width - 132, .height = 20 };
+                const hdr = t.Rect{ .x = band.x + 2, .y = y0, .width = band.width - 132, .height = 20 };
                 if (t.hovering(hdr) and t.hovering(view) and rl.isMouseButtonPressed(.left)) rowToggleByUser(m.uid, false);
-            } else if (thoughtChip(view, y0, false, m.textStr())) {
+            } else if (thoughtChip(band, y0, false, m.textStr())) {
                 rowToggleByUser(m.uid, true);
             }
             continue;
@@ -5571,32 +5738,33 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
             // text is untouched in the message, so the model still receives it and copy still grabs it. Each
             // chip is independent — opening one no longer closes whatever else the user left open.
             if (rowOpen(m.uid)) {
-                _ = renderMsg(view, y0, m.role, m.textStr(), fsz, true, false, m.imgStr());
+                _ = renderMsg(band, y0, m.role, m.textStr(), fsz, true, false, m.imgStr());
                 // the token cost lives in the expanded dropdown (top-right), not the collapsed line
-                t.text(t.z("~{d} tok", .{tokCostOf(m.textStr())}), @intFromFloat(view.x + view.width - 76), @intFromFloat(y0 + 6), 11, t.comment);
+                t.text(t.z("~{d} tok", .{tokCostOf(m.textStr())}), @intFromFloat(band.x + band.width - 76), @intFromFloat(y0 + 6), 11, t.comment);
                 // expanded tool text is copyable like any other message
-                if (copyChip(view.x + view.width - 126, y0 + 3)) {
+                if (copyChip(band.x + band.width - 126, y0 + 3)) {
                     copyToClipboard(m.textStr());
                     markCopied();
                 }
                 // …and a Cloudflare deploy's live URL is one click from the browser
                 if (liveUrlIn(m.textStr())) |url| {
-                    if (openChip(view.x + view.width - 196, y0 + 3)) store.pushCmd(store_mod.mkCmd(.open_url, "", url));
+                    if (openChip(band.x + band.width - 196, y0 + 3)) store.pushCmd(store_mod.mkCmd(.open_url, "", url));
                 }
-                const hdr = t.Rect{ .x = view.x + 2, .y = y0, .width = view.width - 132, .height = 20 };
+                const hdr = t.Rect{ .x = band.x + 2, .y = y0, .width = band.width - 132, .height = 20 };
                 if (t.hovering(hdr) and t.hovering(view) and rl.isMouseButtonPressed(.left)) rowToggleByUser(m.uid, false);
-            } else if (toolChipEx(view, y0, tn, false, liveUrlIn(m.textStr()), store)) {
+            } else if (toolChipEx(band, y0, tn, false, liveUrlIn(m.textStr()), store)) {
                 rowToggleByUser(m.uid, true);
             }
             continue;
         }
         cur_sel_msg = i; // capture THIS message's text-line geometry for selection
         cur_sel_char0 = 0;
-        _ = renderMsg(view, y0, m.role, m.textStr(), fsz, true, false, m.imgStr());
+        const mrect = t.Rect{ .x = band.x + 2, .y = y0 - 4, .width = band.width - 8, .height = yy - y0 };
+        if (m.role == .user) t.panelBordered(mrect, t.withAlpha(t.cyan, 18), t.border);
+        _ = renderMsg(band, y0, m.role, m.textStr(), fsz, true, false, m.imgStr());
         // whole-message copy chip on hover (beside the role label)
-        const mrect = t.Rect{ .x = view.x + 2, .y = y0, .width = view.width - 4, .height = yy - y0 };
         if (m.text_len > 0 and t.hovering(mrect) and t.hovering(view)) {
-            if (copyChip(view.x + view.width - 60, y0)) {
+            if (copyChip(band.x + band.width - 60, y0)) {
                 copyToClipboard(m.textStr());
                 markCopied();
             }
@@ -5609,48 +5777,10 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
             ui.live_len_prev = stream.len;
             ui.live_change_t = rl.getTime();
         }
-        yy = renderMsg(view, yy, .veil, stream, fsz, true, true, "");
+        yy = renderMsg(reading, yy, .veil, stream, fsz, true, true, "");
     }
-    if (cast_live) yy = renderCastLive(view, yy, status, true);
-    if (msgs.len == 0 and !busy and stream.len == 0) {
-        t.textClip("What would you like to make?", @intFromFloat(view.x + 20), @intFromFloat(view.y + 22), 20, t.fg, @intFromFloat(@max(1, view.width - 40)));
-        const intro_bottom = helpPara("Start with an idea, a question, or one thing you want to improve.", view.x + 20, view.y + 56, @max(1, view.width - 40));
-        const starters = [_]struct { title: [:0]const u8, prompt: []const u8 }{
-            .{ .title = "Explore my project", .prompt = "Help me understand this project. Explain the main parts and suggest one useful place to start." },
-            .{ .title = "Build something small", .prompt = "I want to build a small feature. Help me clarify the idea and break it into a few achievable steps." },
-            .{ .title = "Find an improvement", .prompt = "Review this project for one practical improvement. Explain why it matters before making changes." },
-        };
-        var starter_y = intro_bottom + 24;
-        for (starters) |starter| {
-            const card = t.Rect{ .x = view.x + 20, .y = starter_y, .width = @max(1, @min(360, view.width - 40)), .height = 38 };
-            if (card.y + card.height <= view.y + view.height and t.button(card, starter.title, t.blue, true)) {
-                setField(&ui.c_input, starter.prompt);
-                ui.focus = .c_input;
-            }
-            starter_y += 48;
-        }
-        // The one-click on-ramp, right where a first-timer is looking: when the server offers the
-        // Cloudflare login and this user has not taken it yet, say what it buys and let them click.
-        var cfg = false;
-        var cfc = false;
-        var cfp = false;
-        {
-            store.lock();
-            defer store.unlock();
-            cfg = store.cf_oauth_configured;
-            cfc = store.cf_oauth_connected;
-            cfp = store.cf_oauth_pending;
-        }
-        if (cfg and !cfc) {
-            const lbl: [:0]const u8 = if (cfp) t.z("waiting for cloudflare... (click to retry)", .{}) else t.z("+ log in with cloudflare - free workers ai, your live model list, r2 backup", .{});
-            const lw: f32 = @floatFromInt(t.measure(lbl, 12));
-            const lr = t.Rect{ .x = view.x + 20, .y = starter_y + 8, .width = @min(lw + 8, @max(1, view.width - 40)), .height = 18 };
-            const lhot = t.hovering(lr) and t.hovering(view) and lr.y + lr.height <= view.y + view.height;
-            t.textClip(lbl, @intFromFloat(lr.x + 2), @intFromFloat(lr.y + 2), 12, if (cfp) t.orange else if (lhot) CF_ORANGE else t.fg_dim, @intFromFloat(lr.width));
-            if (lhot) t.wantCursor(.pointing_hand);
-            if (lhot and rl.isMouseButtonPressed(.left)) store.pushCmd(store_mod.mkCmd(.oauth_cf_login, "", ""));
-        }
-    }
+    if (cast_live) yy = renderCastLive(reading, yy, status, true);
+    const staged_starter = if (welcome) |w| w.draw(reading, store) else false;
     // TEXT SELECTION: drag over the message text to select; the highlight + cached copy text are computed from the
     // line geometry captured above. A plain click (no drag) clears the selection. Ctrl+C (handled in handleKeys)
     // copies sel_text. Gated on hovering the chat view + not on a tool/copy chip row.
@@ -5679,18 +5809,10 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
     // Drawn OUTSIDE the scissor so it floats above the messages; click snaps to the bottom + re-arms sticky
     // follow.
     if (show_jump) {
-        const jhot = t.hovering(jump_r);
-        rl.drawRectangleRounded(jump_r, 1.0, 12, t.withAlpha(if (jhot) t.bg_sel else t.bg_hl, if (jhot) 235 else 170));
-        rl.drawRectangleRoundedLinesEx(jump_r, 1.0, 12, 1.0, t.withAlpha(if (jhot) t.blue else t.border, 200));
-        const g = t.z("v", .{});
-        const gw: f32 = @floatFromInt(t.measure(g, 14));
-        t.text(g, @intFromFloat(jump_r.x + (jump_r.width - gw) / 2), @intFromFloat(jump_r.y + (jump_r.height - 14) / 2 - 1), 14, if (jhot) t.fg else t.fg_dim);
-        if (jhot) {
-            t.wantCursor(.pointing_hand);
-            if (rl.isMouseButtonPressed(.left)) {
-                ui.chat_follow = true; // sticky follow re-armed; takes visual effect next frame (immediate-mode)
-                ui.chat_scroll = max_scroll;
-            }
+        t.panelBordered(jump_r, t.bg, t.border);
+        if (t.buttonGhost(jump_r, jump_label, t.blue, true)) {
+            ui.chat_follow = true;
+            ui.chat_scroll = max_scroll;
         }
     }
     // The transcript's scrollbar, outside the scissor at the view's right edge. The wheel, the keys and this all
@@ -5821,9 +5943,7 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
     }
     sy += status_h;
 
-    // input row — a growing/scrolling text area; the GRAB STRIP above it drag-resizes the row (crafting
-    // a long prompt deserves room). Rows follow the dragged height so the extra space is real lines.
-    const send_w: f32 = 92;
+    // One panel groups the prompt and its actions. The grip adds room for the draft.
     const grab = t.Rect{ .x = r.x, .y = sy - 5, .width = r.width, .height = 8 };
     const grab_hot = t.hovering(grab) or ui.input_dragging;
     if (grab_hot) {
@@ -5834,20 +5954,39 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
     if (grab_hot and rl.isMouseButtonPressed(.left)) ui.input_dragging = true;
     if (ui.input_dragging) {
         if (rl.isMouseButtonDown(.left)) {
-            ui.input_extra = std.math.clamp(ui.input_extra - rl.getMouseDelta().y, 0, @max(0, r.height * 0.5 - 66));
+            ui.input_extra = std.math.clamp(ui.input_extra - rl.getMouseDelta().y, 0, input_extra_max);
         } else ui.input_dragging = false;
     }
-    const input_rows: usize = @intFromFloat(@max(3, @divTrunc(input_h - chip_row_h - 16, 18))); // rows in the text region BELOW the chip
-    const cf = t.Rect{ .x = r.x, .y = sy, .width = r.width - send_w - t.GAP, .height = input_h };
-    textArea(cf, &ui.c_input, ui.focus == .c_input, if (afk_on) t.z("auto-loop-afk - the veil never stops; type to steer, Stop to end", .{}) else if (loop_on) t.z("auto-loop on - type to steer, or let the veil drive", .{}) else t.z("message the veil - Enter to send   (/goal <what to achieve> starts a goal loop)", .{}), .c_input, input_rows, chip_row_h);
+    var composer = chatReadingBand(r, 800);
+    composer.y = sy;
+    composer.height = input_h;
+    const input_focused = ui.focus == .c_input;
+    t.panelBordered(.{ .x = composer.x, .y = composer.y + 2, .width = composer.width, .height = composer.height }, t.withAlpha(t.fg, 12), t.withAlpha(t.border, 0));
+    t.panelBordered(composer, t.bg, if (input_focused) t.blue else t.border);
+    const controls_h: f32 = 40;
+    const cf = t.Rect{ .x = composer.x + 4, .y = sy, .width = composer.width - 8, .height = input_h - controls_h };
+    const input_rows: usize = @intFromFloat(@max(2, @divTrunc(cf.height - chip_row_h - 12, 18)));
+    var model_buf: [96]u8 = undefined;
+    const model_len, const is_local, const server_steerable = blk: {
+        store.lock();
+        defer store.unlock();
+        const settings = &store.settings;
+        const n = @min(settings.chat_model_len, model_buf.len);
+        @memcpy(model_buf[0..n], settings.chat_model[0..n]);
+        break :blk .{ n, settings.chat_kind == 0, store.chat_server_turn };
+    };
+    const running = busy or loop_on or server_steerable;
+    const placeholder: [:0]const u8 = if (server_steerable) "Steer the running turn..." else "Message the veil...";
+    textArea(cf, &ui.c_input, input_focused, placeholder, .c_input, input_rows, chip_row_h);
     // ATTACHMENT CHIP: the pending image's thumbnail sits at the composer's top-left (above the first text line),
     // with a ✕ to drop it. drawTexturePro is legal here — drawChatCenter runs on the main/GL thread.
     if (ui.c_attach.tex) |atex| {
         const cpad: f32 = 6;
-        const chip_h: f32 = 46;
         const aw: f32 = @floatFromInt(@max(1, ui.c_attach.w));
         const ah: f32 = @floatFromInt(@max(1, ui.c_attach.h));
-        const chip_w = aw * (chip_h / ah);
+        const scale = @min(46 / ah, @min(220, @max(1, cf.width - 38)) / aw);
+        const chip_w = aw * scale;
+        const chip_h = ah * scale;
         const cx = cf.x + cpad;
         const cy = cf.y + cpad;
         // opaque backdrop + border so the thumbnail reads over any typed text behind it
@@ -5857,85 +5996,44 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
         const adst = t.Rect{ .x = cx, .y = cy, .width = chip_w, .height = chip_h };
         rl.drawTexturePro(atex, asrc, adst, .{ .x = 0, .y = 0 }, 0, .{ .r = 255, .g = 255, .b = 255, .a = 255 });
         const xs: f32 = 18;
-        const xr = t.Rect{ .x = cx + chip_w - xs + 4, .y = cy - xs + 4, .width = xs, .height = xs };
+        const xr = t.Rect{ .x = cx + chip_w + 5, .y = cy, .width = xs, .height = xs };
         if (t.buttonSolid(xr, t.z("x", .{}), t.red, true)) ui.c_attach.clear();
-    }
-    // MODEL-SCALED CHARACTER BUDGET: a live count in the composer's bottom-right against a limit sensed from the
-    // current (coding/input) model — a small 8B model gets ~500, a frontier one ~4000 (inputCharLimit). Soft: it
-    // only recolors (dim → orange near the cap → red over); the [4096]u8 buffer is the hard stop. Shown while
-    // composing or focused so an idle empty box stays clean.
-    if (ui.c_input.len > 0 or ui.focus == .c_input) {
-        var mbuf: [96]u8 = undefined;
-        var mlen: usize = 0;
-        var is_local = false;
-        {
-            store.lock();
-            const s = &store.settings;
-            mlen = @min(s.chat_model_len, mbuf.len);
-            @memcpy(mbuf[0..mlen], s.chat_model[0..mlen]);
-            is_local = s.chat_kind == 0;
-            store.unlock();
-        }
-        const limit = inputCharLimit(mbuf[0..mlen], is_local);
-        const used = ui.c_input.len;
-        const label = t.z("{d}/{d}", .{ used, limit });
-        const lw: f32 = @floatFromInt(t.measure(label, 11));
-        const col = if (used > limit) t.red else if (used * 5 > limit * 4) t.orange else t.withAlpha(t.comment, 150);
-        const lx = cf.x + cf.width - lw - 8;
-        const ly = cf.y + cf.height - 16;
-        t.fillRect(@intFromFloat(lx - 4), @intFromFloat(ly - 1), @intFromFloat(lw + 8), 14, t.withAlpha(t.bg, 210)); // faint backdrop so it stays legible over typed text
-        t.text(label, @intFromFloat(lx), @intFromFloat(ly), 11, col);
     }
     // Shift+Enter inserts a literal newline in EVERY turn state (drafting a multi-paragraph or blank-line
     // message / steer) — every send/post key below gates on !shift, so this never doubles with a send.
-    if (ui.focus == .c_input and (rl.isKeyPressed(.enter) or rl.isKeyPressed(.kp_enter)) and
+    if (!staged_starter and ui.focus == .c_input and (rl.isKeyPressed(.enter) or rl.isKeyPressed(.kp_enter)) and
         (rl.isKeyDown(.left_shift) or rl.isKeyDown(.right_shift)))
     {
         _ = ui.c_input.delSel();
         ui.c_input.insert('\n');
     }
-    // Send/Stop buttons DON'T stretch with a tall (dragged) input — fixed height, anchored to the TOP of the
-    // send column. send_bh caps the single Send/Stop; the split Post/Stop caps each half below.
-    const send_bh: f32 = @min(input_h, 46);
-    const sendb = t.Rect{ .x = r.x + r.width - send_w, .y = sy, .width = send_w, .height = send_bh };
-    // While a turn is generating (or auto-loop is driving), the send column offers control. For a SERVER turn
-    // (steerable) it SPLITS into two stacked buttons — POST (blue: send the typed text as a live steer the running
-    // turn folds in) over STOP (red: abort + halt auto-loop), making steering an explicit, discoverable action.
-    // A local-engine turn has no steer sink, so it shows Stop alone.
-    // A LIVE SERVER TURN always offers the control column, even when the local busy/loop flags happen to be
-    // clear. An afk turn is one long server-side turn, so those flags can read false while the veil is very
-    // much working — and then the composer showed a plain Send that cmdSend refused ("finish or Stop the
-    // current reply"), which is posting and steering silently disabled for the whole run. Steering a running
-    // turn is the one thing that must never be unreachable.
-    if (busy or loop_on or store.chat_server_turn) {
-        const server_steerable = store.chat_server_turn;
-        const shift = rl.isKeyDown(.left_shift) or rl.isKeyDown(.right_shift);
-        const enter = (rl.isKeyPressed(.enter) or rl.isKeyPressed(.kp_enter)) and !shift and ui.focus == .c_input;
+    const button_h: f32 = 32;
+    const send_w = @min(composer.width * 0.41, @max(t.btnW("Send", button_h), t.btnW("Stop", button_h)));
+    const sendb = t.Rect{ .x = composer.x + composer.width - send_w - 7, .y = sy + input_h - button_h - 6, .width = send_w, .height = button_h };
+    var meta_right = sendb.x - 10;
+    const shift = rl.isKeyDown(.left_shift) or rl.isKeyDown(.right_shift);
+    const enter = !staged_starter and !shift and ui.focus == .c_input and (rl.isKeyPressed(.enter) or rl.isKeyPressed(.kp_enter));
+    if (running) {
         if (server_steerable) {
-            const g: f32 = 6;
-            const bh: f32 = @min(44, (input_h - g) / 2); // fixed height, top-anchored — never stretch to a tall input
-            const postb = t.Rect{ .x = sendb.x, .y = sy, .width = send_w, .height = bh };
-            const stopb = t.Rect{ .x = sendb.x, .y = sy + bh + g, .width = send_w, .height = bh };
+            var postb = sendb;
+            postb.x -= send_w + 6;
+            meta_right = postb.x - 10;
             const can_post = ui.c_input.len > 0;
-            const post_click = t.buttonSolid(postb, t.z("Post", .{}), t.blue, can_post);
-            if (t.buttonSolid(stopb, t.z("Stop", .{}), t.red, true)) store.pushChatCmd(store_mod.mkChatCmd(.stop_turn, "", ""));
+            const post_click = t.buttonSolid(postb, "Post", t.blue, can_post);
+            if (t.button(sendb, "Stop", t.red, true)) store.pushChatCmd(store_mod.mkChatCmd(.stop_turn, "", ""));
             if (can_post and (post_click or enter)) {
                 store.pushChatCmd(store_mod.mkChatCmd(.steer_turn, "", ui.c_input.str()));
                 ui.c_input.clear();
-                ui.c_attach.clear(); // a steer carries no image in v1; drop any staged attachment so it can't linger
+                if (ui.c_attach.tex != null) store.pushNotif("Image kept for your next message", "The running turn accepts text instructions.", 1);
                 ui.chat_follow = true;
             }
         } else {
-            if (t.buttonSolid(sendb, t.z("Stop", .{}), t.red, true)) store.pushChatCmd(store_mod.mkChatCmd(.stop_turn, "", ""));
+            if (t.button(sendb, "Stop", t.red, true)) store.pushChatCmd(store_mod.mkChatCmd(.stop_turn, "", ""));
         }
     } else {
         const can_send = ui.c_input.len > 0;
-        const clicked = t.buttonSolid(sendb, t.z("Send", .{}), t.blue, can_send);
-        // Enter sends; Shift+Enter (handled above, in every turn state) already inserted the newline.
-        const shift = rl.isKeyDown(.left_shift) or rl.isKeyDown(.right_shift);
-        const enter_key = rl.isKeyPressed(.enter) or rl.isKeyPressed(.kp_enter);
-        const enter = enter_key and !shift;
-        if (can_send and (clicked or (ui.focus == .c_input and enter))) {
+        const clicked = t.buttonSolid(sendb, "Send", t.blue, can_send);
+        if (can_send and (clicked or enter)) {
             var cmd = store_mod.mkChatCmd(.send, "", ui.c_input.str());
             const ap = ui.c_attach.pathStr(); // carry the SOURCE image path (not pixels) to the chat thread
             if (ap.len > 0) {
@@ -5949,6 +6047,26 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
             ui.chat_follow = true;
         }
     }
+    const model = model_buf[0..model_len];
+    const meta_y: i32 = @intFromFloat(sendb.y + (button_h - t.textH(12)) / 2);
+    const used = ui.c_input.len;
+    if (used > 0 and meta_right - composer.x > 76) {
+        const limit = inputCharLimit(model, is_local);
+        const count = t.z("{d}/{d}", .{ used, limit });
+        const count_w: f32 = @floatFromInt(t.measure(count, 11));
+        const color = if (used > limit) t.red else if (used * 5 > limit * 4) t.orange else t.fg_dim;
+        t.text(count, @intFromFloat(meta_right - count_w), meta_y, 11, color);
+        meta_right -= count_w + 10;
+    }
+    const model_x = composer.x + 13;
+    const short = if (std.mem.lastIndexOfScalar(u8, model, '/')) |i| model[i + 1 ..] else model;
+    const label = if (short.len > 0) short else "Drop or paste an image";
+    if (meta_right > model_x) {
+        t.textClip(label, @intFromFloat(model_x), meta_y, 12, t.fg_dim, @intFromFloat(meta_right - model_x));
+        const label_width: f32 = @floatFromInt(t.measure(t.zs(label), 12));
+        if (model.len > 0 and (short.len != model.len or label_width > meta_right - model_x))
+            t.tip(.{ .x = model_x, .y = sendb.y, .width = meta_right - model_x, .height = button_h }, model);
+    }
 
     // ROLE PICKER anchor — BELOW the input, in the row reserved by role_h. Idle-only (not busy, not looping,
     // no status) so it never fires mid-turn. Clicking opens the list (flushChatRoleDropdown, drawn on top at
@@ -5956,7 +6074,7 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
     // list auto-flips ABOVE the anchor since it sits near the pane bottom (drawList handles the cramped case).
     const role_y = sy + input_h + 3;
     if (!busy and !loop_on and status.len == 0 and roles_mod.all().len > 0) {
-        const rlbl = t.z("+ give the veil a role", .{});
+        const rlbl = t.z("+ Give the veil a role", .{});
         const rw_lbl: f32 = @floatFromInt(t.measure(rlbl, 12));
         const ra = t.Rect{ .x = r.x + 2, .y = role_y, .width = rw_lbl + 16, .height = role_h - 4 };
         const open = ui.open_dd == .chat_role;
@@ -5974,6 +6092,10 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
     } else if (ui.open_dd == .chat_role) {
         ui.open_dd = .none; // the row went busy/looping out from under an open list — drop it
     }
+    const keys: [:0]const u8 = if (server_steerable) "Enter to post  |  Shift+Enter for a new line" else "Enter to send  |  Shift+Enter for a new line";
+    const keys_w: f32 = @floatFromInt(t.measure(keys, 11));
+    if ((!running or server_steerable) and r.width > keys_w + 155)
+        t.text(keys, @intFromFloat(r.x + r.width - keys_w - 3), @intFromFloat(role_y + 3), 11, t.fg_dim);
     // (The Cloudflare login/profile used to share this row as a chip; it now lives as a card
     // pinned under the chats list — drawCfProfileCard — where it stays visible mid-turn too.)
 }
@@ -11385,7 +11507,7 @@ var field_drag: bool = false;
 /// up to `rows` visible rows and keeps the CARET's row in view. Click to place the caret, drag to select,
 /// arrows/Home/End move it (editField owns the keys; this owns the pixels).
 fn textArea(r: t.Rect, f: *Ui.Field, focused: bool, placeholder: [:0]const u8, which: Ui.Focus, rows: usize, top_pad: f32) void {
-    t.panelBordered(r, t.bg, if (focused) t.blue else t.border);
+    if (which != .c_input) t.panelBordered(r, t.bg, if (focused) t.blue else t.border);
     if (t.hovering(r) and ui.open_dd == .none) t.wantCursor(.ibeam);
     f.clampCur();
     const inner_x: i32 = @intFromFloat(r.x + 10);
@@ -11393,10 +11515,10 @@ fn textArea(r: t.Rect, f: *Ui.Field, focused: bool, placeholder: [:0]const u8, w
     // Text starts below any reserved top strip (top_pad) — e.g. the composer's image-attachment chip — so a
     // pending thumbnail never covers what the user is typing. The border/box still spans the full rect.
     const text_top: f32 = r.y + 8 + top_pad;
-    if (f.len == 0 and !focused) {
+    if (f.len == 0) {
         if (t.hovering(r) and rl.isMouseButtonPressed(.left) and ui.open_dd == .none) ui.focus = which;
-        t.text(placeholder, inner_x, @intFromFloat(text_top), 13, t.comment);
-        return;
+        t.textClip(placeholder, inner_x, @intFromFloat(text_top), 13, t.fg_dim, @intFromFloat(@max(1, r.width - 24)));
+        if (!focused) return;
     }
     var lines: [96][]const u8 = undefined;
     const nl = wrapInto(f.str(), r.width - 20, &lines);

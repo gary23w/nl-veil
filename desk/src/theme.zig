@@ -769,9 +769,13 @@ pub fn textStyled(s: [:0]const u8, x: f32, y: f32, size: i32, c: Color, kind: Fo
 }
 
 pub fn measureStyled(s: [:0]const u8, size: i32, kind: FontKind) i32 {
-    if (kind == .mono) return @intFromFloat(rl.measureTextEx(theMono(), s, scaledMono(size), 0.5).x);
+    return @intFromFloat(measureStyledF(s, size, kind));
+}
+
+pub fn measureStyledF(s: [:0]const u8, size: i32, kind: FontKind) f32 {
+    if (kind == .mono) return measureMonoF(s, size);
     const px = scaledUi(size);
-    return @intFromFloat(rl.measureTextEx(fontForKind(kind), s, px, spacingFor(px)).x);
+    return rl.measureTextEx(fontForKind(kind), s, px, spacingFor(px)).x;
 }
 
 /// Left-aligned label, clipped to max_w px with an ellipsis, for rows that must not overflow.
@@ -1038,6 +1042,24 @@ pub fn buttonGhost(r: Rect, label: [:0]const u8, accent: Color, enabled: bool) b
 }
 
 /// The width a tab label wants (tabs render at 13px).
+pub fn chatStarter(r: Rect, label: [:0]const u8, description: []const u8) bool {
+    const hot = mouse.over(r);
+    const pressed = hot and rl.isMouseButtonDown(.left) and !clicks_blocked;
+    const fill = if (pressed) blend(bg, blue, 0.14) else if (hot) blend(bg, blue, 0.07) else bg;
+    panelBordered(r, fill, if (hot) blue else blend(border, fg_dim, 0.24));
+    const text_x: i32 = @intFromFloat(r.x + 12);
+    const text_w: i32 = @intFromFloat(@max(1, r.width - 34));
+    const label_y = r.y + (r.height - textH(14) - textH(12) - 3) / 2;
+    textClip(label, text_x, @intFromFloat(label_y), 14, fg, text_w);
+    textClip(description, text_x, @intFromFloat(label_y + textH(14) + 3), 12, fg_dim, text_w);
+    const x = r.x + r.width - 11;
+    const y = r.y + r.height / 2;
+    rl.drawLineEx(.{ .x = x - 4, .y = y - 4 }, .{ .x = x, .y = y }, 1.5, blue);
+    rl.drawLineEx(.{ .x = x, .y = y }, .{ .x = x - 4, .y = y + 4 }, 1.5, blue);
+    if (hot and !clicks_blocked) wantCursor(.pointing_hand);
+    return kbRegister(r, label, "button") or (hot and rl.isMouseButtonPressed(.left) and !clicks_blocked);
+}
+
 pub fn tabW(label: [:0]const u8) f32 {
     return @as(f32, @floatFromInt(measure(label, 13))) + 26;
 }

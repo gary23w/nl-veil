@@ -46,10 +46,6 @@
   --tonal:         color-mix(in srgb, var(--accent) 14%, transparent);
   --tonal-hover:   color-mix(in srgb, var(--accent) 25%, transparent);
   --on-accent:     #fafbff;
-  /* the transcript's background lattice — derived from the border so it
-     re-tints with any fetched theme, exactly like every other surface fill */
-  --grid-line:     color-mix(in srgb, var(--border) 30%, transparent);
-
   /* chat roles */
   --role-user:      var(--cyan);
   --role-assistant: var(--magenta);
@@ -233,26 +229,6 @@ button {
 .btn-steer { background: var(--accent); color: var(--on-accent); }
 .btn-steer:hover { filter: brightness(1.08); }
 
-/* Send, when there is no model to send to. It must NOT look like the primary
-   action — it does not send — but it is still a live control that goes to
-   Settings, so it must not look inert either: amber tonal, the same colour the
-   status chip uses for the same class of problem.
-
-   The label is a sentence rather than a word, so on a narrow screen it is allowed
-   to wrap and shrink instead of shoving the textarea off the row. Everything else
-   in .composer-row assumes a button that stays one short word. */
-.btn.needs-model {
-  background: color-mix(in srgb, var(--warn) 15%, transparent);
-  color: var(--warn);
-  font-weight: 600;
-  white-space: normal;
-  line-height: 1.2;
-  max-width: 46%;
-  padding: 0 10px;
-  font-size: calc(var(--fs-small) * var(--text-scale));
-}
-.btn.needs-model:hover { background: color-mix(in srgb, var(--warn) 27%, transparent); }
-
 input[type=text], input[type=email], input[type=password], input[type=number], select, textarea {
   width: 100%;
   min-height: var(--field-h);
@@ -294,22 +270,25 @@ label, .label {
   place-items: center;
   padding: var(--pad);
   overflow-y: auto;
+  background: radial-gradient(ellipse at 50% 20%, var(--tonal), transparent 70%);
 }
 .auth-card {
   width: 100%;
   max-width: 380px;
   padding: 26px;
-  background: var(--surface-raised);
+  background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: 12px;
+  border-radius: calc(var(--radius-btn) + 8px);
+  box-shadow: 0 16px 44px color-mix(in srgb, var(--fg) 8%, transparent);
 }
 .auth-brand {
   font-size: calc(var(--fs-h1) * var(--text-scale));
   font-weight: 700;
-  color: var(--brand);
+  color: var(--text);
+  text-align: center;
   letter-spacing: -.01em;
 }
-.auth-tag { color: var(--text-muted); font-size: calc(var(--fs-small) * var(--text-scale)); margin: 4px 0 20px; }
+.auth-tag { color: var(--text-secondary); text-align: center; margin: 4px 0 20px; }
 .auth-card .field { margin-bottom: 14px; }
 .auth-actions { display: flex; gap: 10px; margin-top: 20px; }
 .auth-actions .btn { flex: 1; }
@@ -332,11 +311,11 @@ label, .label {
   border-bottom: 1px solid var(--border);
 }
 .brand {
-  display: flex; align-items: baseline; gap: 7px;
+  display: flex; align-items: center; gap: 8px; min-width: 0; white-space: nowrap;
   font-weight: 700; font-size: calc(var(--fs-title) * var(--text-scale));
-  color: var(--brand); letter-spacing: -.01em;
+  color: var(--text); letter-spacing: -.02em;
 }
-.brand small { font-weight: 400; font-size: calc(var(--fs-micro) * var(--text-scale)); color: var(--text-muted); }
+.brand small { font-weight: 400; font-size: calc(var(--fs-micro) * var(--text-scale)); color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; }
 
 .status-chip {
   display: inline-flex; align-items: center; gap: 6px;
@@ -402,56 +381,6 @@ label, .label {
   color: var(--text-muted);
   font-size: calc(var(--fs-small) * var(--text-scale));
 }
-
-/* ---------------- the first-run nudge ----------------
-   A short ordered list in the blank transcript. It is deliberately built out of
-   .empty rather than beside it: this is the same "nothing here yet" slot, just
-   with the order of operations in it, and it must read as quiet guidance rather
-   than as an onboarding panel that has taken over the screen.
-
-   The block centres; the text inside does NOT. A numbered list centred line by
-   line is unreadable, so the list gets its own left-aligned column with a width
-   cap that also keeps it comfortable on a phone. */
-.setup-hint { gap: 12px; }
-.setup-hint b {
-  color: var(--text-secondary);
-  font-size: calc(var(--fs-ui) * var(--text-scale));
-}
-.setup-steps {
-  list-style: none;
-  counter-reset: step;
-  display: grid; gap: 7px;
-  text-align: left;
-  max-width: 300px;
-}
-.setup-steps li {
-  display: flex; align-items: baseline; gap: 9px;
-  counter-increment: step;
-  line-height: 1.45;
-}
-/* The marker is a real element rather than a list bullet so a finished step can
-   swap the number for a tick without the row shifting sideways. */
-.setup-steps li::before {
-  content: counter(step);
-  flex: 0 0 auto;
-  width: 18px; height: 18px;
-  display: inline-grid; place-items: center;
-  border-radius: 50%;
-  background: var(--surface-hover);
-  color: var(--text-muted);
-  font-size: calc(var(--fs-micro) * var(--text-scale));
-  font-weight: 600;
-  transform: translateY(2px);   /* baseline alignment fights a fixed-height circle */
-}
-.setup-steps li.now::before { background: var(--tonal); color: var(--accent); }
-.setup-steps li.now  { color: var(--text); }
-.setup-steps li.done { color: var(--text-muted); }
-.setup-steps li.done::before {
-  content: '✓';
-  background: color-mix(in srgb, var(--success) 16%, transparent);
-  color: var(--success);
-}
-.setup-steps .mono { color: var(--text-secondary); word-break: break-all; }
 
 /* ============================================================ dashboard */
 .stat-grid {
@@ -563,6 +492,7 @@ table.data td.num { text-align: right; font-variant-numeric: tabular-nums; }
 .toast.ok  { border-left-color: var(--success); }
 .toast b { display: block; font-size: calc(var(--fs-ui) * var(--text-scale)); }
 .toast span { display: block; margin-top: 2px; font-size: calc(var(--fs-small) * var(--text-scale)); color: var(--text-secondary); }
+@media (max-width: 720px) { .toasts { top: calc(var(--topbar-h) + 9px); bottom: auto; } }
 @keyframes toast-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
 
 @media (prefers-reduced-motion: reduce) {
@@ -599,17 +529,25 @@ table.data td.num { text-align: right; font-variant-numeric: tabular-nums; }
 .chat-list-head { min-width: 0; }
 .chat-list-head .btn { min-width: 0; overflow: hidden; }
 .conv-row { min-width: 0; }
-.chat-list-head { display: flex; padding: 10px; border-bottom: 1px solid var(--border); }
+.chat-list-head { display: flex; gap: 6px; padding: 10px 10px 6px; }
+#convScroll { padding: 0 7px 8px; }
 
 .conv-row {
   display: block; width: 100%; text-align: left;
-  padding: 10px 12px;
-  border-bottom: 1px solid var(--border);
+  padding: 8px 10px;
+  border-radius: var(--radius-btn);
+  border: 1px solid transparent;
   color: var(--text);
+  transition: background 130ms ease;
 }
 .conv-row:hover { background: var(--surface-hover); }
-.conv-row.active { background: var(--surface-selected); }
+.conv-row.active {
+  background: var(--tonal);
+  border-color: color-mix(in srgb, var(--accent) 22%, var(--border));
+  box-shadow: inset 2px 0 var(--accent);
+}
 .conv-title { font-size: calc(var(--fs-ui) * var(--text-scale)); }
+.conv-row.active .conv-title { font-weight: 700; }
 
 /* Sub-chats: an inner drop-down under the primary conversation row ("<primary>__sN").
    The chevron is a SIBLING of the row button (a button can't nest a button), floated over
@@ -645,7 +583,7 @@ table.data td.num { text-align: right; font-variant-numeric: tabular-nums; }
    there to stop the passing row showing through, not to draw a band. */
 .conv-group {
   position: sticky; top: 0; z-index: 1;
-  padding: 9px 12px 3px;
+  padding: 11px 11px 4px;
   background: var(--surface-raised);
   font-size: calc(var(--fs-micro) * var(--text-scale));
   letter-spacing: .07em; text-transform: uppercase;
@@ -656,58 +594,20 @@ table.data td.num { text-align: right; font-variant-numeric: tabular-nums; }
 
 .chat-main { flex: 1; min-width: 0; display: flex; flex-direction: column; min-height: 0; }
 
-/* Shown only while the reader has scrolled away from a live answer, so they can get
-   back to the tail without a long drag on a phone. Anchored to the composer rather
-   than the pane, because the composer grows with the draft and the button has to
-   ride above it. */
-.jump-latest {
-  position: absolute; left: 50%; transform: translateX(-50%); bottom: 100%;
-  margin-bottom: 8px;
-  display: inline-flex; align-items: center; gap: 6px;
-  padding: 7px 14px; border-radius: 999px;
-  background: var(--surface-raised); color: var(--text);
-  border: 1px solid var(--border); box-shadow: 0 4px 14px rgba(0,0,0,.22);
-  font-size: calc(var(--fs-micro) * var(--text-scale)); letter-spacing: .06em;
-  text-transform: uppercase; z-index: 4;
-}
-.jump-latest svg { width: 13px; height: 13px; fill: none; stroke: currentColor; stroke-width: 2; }
-.jump-latest:hover { background: var(--tonal-hover); }
-
-.chat-topline {
-  flex: 0 0 auto;
-  display: flex; align-items: center; gap: 8px;
-  padding: 8px 12px;
-  border-bottom: 1px solid var(--border);
-  font-size: calc(var(--fs-small) * var(--text-scale));
-  color: var(--text-secondary);
-}
 .chat-back { display: none; }
+.workspace-heading .icon-btn:disabled { opacity: .38; cursor: default; background: transparent; }
+.workspace-message.error .host-activity { color: var(--danger); }
 
-/* The transcript reads as a surface rather than a void: a fine, very faint
-   lattice at the same pitch the desk draws (main.zig CHAT_GRID_CELL), so a chat
-   has one grain across both clients.
-
-   background-attachment stays at its `scroll` default, which on an overflow
-   container pins the background to the element's own box — the grid holds still
-   while the messages move over it. `local` would drag it along with them. */
-.transcript {
-  padding: var(--pad);
-  background-image:
-    linear-gradient(to right, var(--grid-line) 1px, transparent 1px),
-    linear-gradient(to bottom, var(--grid-line) 1px, transparent 1px);
-  background-size: 22px 22px;
+.workspace-notice { display: flex; align-items: center; justify-content: center; flex-wrap: wrap; gap: 8px 14px; padding: 20px 0; text-align: center; color: var(--text-secondary); }
+.workspace-welcome .workspace-setup {
+  max-width: none;
+  margin-top: 16px;
+  color: var(--text-secondary);
+  font-size: calc(var(--fs-ui) * var(--text-scale));
 }
+.workspace-setup .cf-cloud { width: 13px; height: 13px; color: #f6821f; vertical-align: -2px; margin-right: 4px; }
 
 /* ---------------- messages ---------------- */
-.msg { margin-bottom: 18px; max-width: 900px; }
-.msg-role {
-  font-size: calc(var(--fs-micro) * var(--text-scale));
-  letter-spacing: .09em; text-transform: uppercase;
-  margin-bottom: 5px;
-}
-.msg.user .msg-role { color: var(--role-user); }
-.msg.assistant .msg-role { color: var(--role-assistant); }
-.msg-body { font-size: calc(var(--fs-body) * var(--text-scale)); line-height: var(--lh-body); }
 .msg-body > *:first-child { margin-top: 0; }
 .msg-body > *:last-child { margin-bottom: 0; }
 
@@ -862,12 +762,6 @@ table.data td.num { text-align: right; font-variant-numeric: tabular-nums; }
 }
 @keyframes veil-spin { to { transform: rotate(360deg); } }
 
-.live-dot {
-  display: inline-block; width: 6px; height: 6px; border-radius: 50%;
-  background: var(--role-assistant);
-  animation: veil-pulse 1.6s ease-in-out infinite;
-  vertical-align: middle;
-}
 @keyframes veil-pulse { 0%,100% { opacity: .35; } 50% { opacity: 1; } }
 
 /* The typewriter's cursor: a block that blinks in steps, not a fade — a fading
@@ -917,35 +811,6 @@ table.data td.num { text-align: right; font-variant-numeric: tabular-nums; }
   animation: veil-shimmer .83s linear infinite;
 }
 @keyframes veil-shimmer { from { background-position: 140% 0; } to { background-position: -140% 0; } }
-
-/* ---------------- composer ---------------- */
-.composer {
-  flex: 0 0 auto;
-  position: relative;          /* anchors .jump-latest just above the composer */
-  padding: 10px var(--pad);
-  padding-bottom: calc(10px + env(safe-area-inset-bottom));
-  border-top: 1px solid var(--border);
-  background: var(--surface-raised);
-}
-.composer.drag { background: var(--surface-selected); }
-.composer-row { display: flex; align-items: flex-end; gap: 8px; }
-.composer textarea {
-  flex: 1; min-width: 0;
-  min-height: 40px; max-height: 180px;
-  resize: none;
-  line-height: 1.45;
-  font-size: max(16px, calc(var(--fs-body) * var(--text-scale)));  /* 16px floor: no iOS focus zoom */
-  background: var(--surface);
-}
-@media (pointer: fine) {
-  .composer textarea { font-size: calc(var(--fs-body) * var(--text-scale)); }
-}
-.composer-foot {
-  display: flex; align-items: center; gap: 8px;
-  margin-top: 5px;
-  font-size: calc(var(--fs-micro) * var(--text-scale));
-  min-height: 1em;
-}
 
 /* ============================================================ cloudflare
    The login button wears the brand: the PLATE is Cloudflare orange with a white cloud and label —
@@ -1037,11 +902,6 @@ table.data td.num { text-align: right; font-variant-numeric: tabular-nums; }
 .tool-live:hover { filter: brightness(1.07); }
 .host-activity .cf-cloud { width: 12px; height: 12px; color: #f6821f; vertical-align: -2px; margin-right: 2px; }
 
-/* the first-run nudge's Cloudflare actions read as the brand, not as a generic link */
-.setup-steps .cf-link { color: #f6821f; font-weight: 650; display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }
-.setup-steps .cf-link .cf-cloud { width: 13px; height: 13px; }
-
-
 /* settings row: the auto checkbox + sync button stack right of the R2 status */
 .cf-r2-controls { display: flex; align-items: center; gap: 10px; flex: 0 0 auto; }
 .cf-r2-controls label { display: inline-flex; align-items: center; gap: 5px; margin: 0;
@@ -1055,7 +915,7 @@ table.data td.num { text-align: right; font-variant-numeric: tabular-nums; }
   gap: var(--gap); padding: 14px; flex-wrap: wrap; }
 .cf-dash-row .muted { flex: 1 1 260px; }
 
-.composer-chips { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 8px; }
+.composer-chips { display: flex; flex-wrap: wrap; gap: 8px; padding: 8px 10px 0; }
 .chip {
   display: inline-flex; align-items: center; gap: 7px;
   max-width: 220px;
@@ -1293,9 +1153,6 @@ table.data td.num { text-align: right; font-variant-numeric: tabular-nums; }
   .chat.on-thread .chat-list { display: none; }
   .chat.on-thread .chat-main { display: flex; flex: 1 0 100%; }
   .chat-back { display: grid; }
-  .transcript { padding: 12px; }
-  .composer { padding-left: 12px; padding-right: 12px; }
-  .msg { margin-bottom: 15px; }
   .tool-chip span { max-width: 22ch; }
 }
 

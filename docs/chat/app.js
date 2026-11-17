@@ -56,8 +56,14 @@ const store = (area) => ({
 });
 const ls = store(localStorage);      // what outlives the tab: the harness address, the model, the theme
 const ss = store(localStorage);      // the Cloudflare login: kept by this browser, so a reload or a new tab stays logged in
-// a login an older page kept in this one tab moves across once
-try { if (!localStorage.getItem('veilweb.session') && sessionStorage.getItem('veilweb.session')) localStorage.setItem('veilweb.session', sessionStorage.getItem('veilweb.session')); } catch {}
+// Move a login from an older page out of the tab store so logout clears it.
+try {
+  const legacySession = sessionStorage.getItem('veilweb.session');
+  if (legacySession) {
+    if (!localStorage.getItem('veilweb.session')) localStorage.setItem('veilweb.session', legacySession);
+    sessionStorage.removeItem('veilweb.session');
+  }
+} catch {}
 
 /* Conversations and their files live in IndexedDB, in this browser only. A browser that refuses storage
    (some private windows) gets a Map: the session works, and nothing outlives the tab. */
@@ -236,6 +242,9 @@ function refresh() {
 
 function logout(why = '') {
   ss.del('veilweb.session');
+  chatOpenEpoch++;
+  chatDrafts.clear();
+  pics.attached = [];
   S.session = null; S.status = null; S.me = null; S.live = null;
   S.err = why;
   draw();
@@ -4031,27 +4040,30 @@ async function pictureUrl(blob) {
   return c.toDataURL(png ? 'image/png' : 'image/jpeg', 0.9);
 }
 
-function pictureName(base, type) {
+function pictureName(base, type, conv = S.conv, attached = pics.attached) {
   const ext = type.includes('png') ? 'png' : type.includes('webp') ? 'webp' : 'jpg';
   const stem = (String(base || 'image').replace(/\.[a-z0-9]+$/i, '').replace(/[^\w.-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40)) || 'image';
-  const have = new Set([...Object.keys(picsOf()), ...pics.attached.map((a) => a.name)]);
+  const have = new Set([...Object.keys(picsOf(conv)), ...attached.map((a) => a.name)]);
   for (let i = 0; ; i++) { const name = `${stem}${i ? '-' + (i + 1) : ''}.${ext}`; if (!have.has(name)) return name; }
 }
 
 /* Pictures picked, pasted or dropped: they wait in the composer until the message is sent. */
 async function attachPictures(files) {
   if (!imageOn()) return toast('Pictures need a newer harness: update it in the Harness tab.');
+  const conv = S.conv, attached = pics.attached;
   for (const f of files) {
     if (!f.type?.startsWith('image/')) continue;
-    if (pics.attached.length >= 4) { toast('Four pictures to a message.'); break; }
+    if (attached.length >= 4) { toast('Four pictures to a message.'); break; }
     try {
       const url = await pictureUrl(f);
-      pics.attached.push({ name: pictureName(f.name, url.slice(5, 20)), url });
+      if (!S.session || !chatDrafts.has(conv.id) || chatDrafts.get(conv.id).pictures !== attached) return;
+      if (attached.length >= 4) { toast('Four pictures to a message.'); break; }
+      attached.push({ name: pictureName(f.name, url.slice(5, 20), conv, attached), url });
     } catch {
       toast(`${f.name || 'That picture'} could not be read.`);
     }
   }
-  drawAttached();
+  if (S.session && S.conv.id === conv.id) drawAttached();
 }
 
 function drawAttached() {
@@ -4060,6 +4072,8 @@ function drawAttached() {
   old.replaceChildren(...pics.attached.map((a, i) => h('span', { class: 'attach' }, h('img', { src: a.url, alt: a.name }), h('span', { class: 'name' }, a.name),
     h('button', { class: 'x show', 'aria-label': 'Remove ' + a.name, onclick: () => { pics.attached.splice(i, 1); drawAttached(); } }, '✕'))));
   old.hidden = pics.attached.length === 0;
+  syncChatComposer();
+  document.getElementById('chatTranscript')?.follow.afterPaint();
 }
 
 /* A picture at its full size, with what can be done with it. */
@@ -4810,6 +4824,7 @@ async function artImagine(rest, names = []) {
   if (tools.length) conv.msgs.push({ role: 'assistant', content: '', tools });
   if (error) conv.msgs.push({ role: 'error', content: error });
   S.live = null;
+  drawChat();
   await saveConv();
   draw();
   refreshStatus();
@@ -6760,9 +6775,19 @@ async function pullConvs() {
   draw();
 }
 
+const chatDrafts = new Map();
+let chatOpenEpoch = 0;
+
+function selectChatDraft(id) {
+  if (!chatDrafts.has(id)) chatDrafts.set(id, { text: '', pictures: [] });
+  pics.attached = chatDrafts.get(id).pictures;
+}
+
 function newConv() {
+  chatOpenEpoch++;
   repoClose();
   S.conv = { id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6), title: 'New chat', at: Date.now(), msgs: [], files: {}, images: {} };
+  selectChatDraft(S.conv.id);
   S.file = null;
   S.open = [];
   S.filter = '';
@@ -6771,6 +6796,7 @@ function newConv() {
 
 async function openConv(id, quiet = false) {
   if (S.live) return;
+  const epoch = ++chatOpenEpoch;
   saveUi();
   const row = S.convs.find((x) => x.id === id);
   let c = await db.get('conv:' + id);
@@ -6784,11 +6810,16 @@ async function openConv(id, quiet = false) {
       if (row) delete row.fetch;
       await putIndex();
     } catch (e) {
-      if (!c) return quiet ? undefined : toast('Could not open that chat: ' + e.message);
+      if (!c) {
+        if (!quiet && epoch === chatOpenEpoch) toast('Could not open that chat: ' + e.message);
+        return;
+      }
     }
   }
+  if (epoch !== chatOpenEpoch || S.live) return;
   repoClose();
   S.conv = c;
+  selectChatDraft(c.id);
   S.open = [];
   S.file = null;
   S.filter = '';
@@ -6800,12 +6831,14 @@ async function openConv(id, quiet = false) {
   S.preview = first && view?.file === first ? (view.preview ?? false) : false;
   S.panes.rail = false;
   draw();
+  if (!quiet && matchMedia('(max-width: 980px)').matches) document.getElementById('chatTranscript')?.focus({ preventScroll: true });
 }
 
 async function deleteConv(id) {
   if (S.live) return;
   if (!(await askSure('Delete this conversation and its files, here and on your harness?', 'Delete'))) return;
   await db.del('conv:' + id);
+  chatDrafts.delete(id);
   await repoForget(id);
   S.convs = S.convs.filter((x) => x.id !== id);
   await putIndex();
@@ -6876,51 +6909,84 @@ function toolChip(t) {
     h('pre', {}, t.running ? 'running…' : t.result)), ...CHIP_EXTRAS.map((f) => f(t)).filter(Boolean)];
 }
 
-const drawnMsgs = new WeakSet();   // messages already shown once: a redraw must not replay their entrance
-function message(m) {
-  const node = messageNode(m);
-  if (drawnMsgs.has(m)) node.classList.add('settled');
-  drawnMsgs.add(m);
-  return node;
-}
 function planNode(plan) {
   return !plan?.length ? null : h('ul', { class: 'plan', 'aria-label': 'Plan' }, plan.map((s) => h('li', { class: s.done ? 'done' : '' }, h('span', { class: 'tick', 'aria-hidden': 'true' }, s.done ? '✓' : '○'), s.text)));
 }
 
 function messageNode(m) {
-  if (m.role === 'user') return h('div', { class: 'msg user' }, h('div', { class: 'role' }, 'you'), h('div', { class: 'body' }, m.content), thumbs(m.images));
-  if (m.role === 'error') return h('div', { class: 'msg error' }, h('div', { class: 'role' }, 'error'), h('div', { class: 'body' }, m.content));
-  return h('div', { class: 'msg assistant' }, h('div', { class: 'role' }, 'veil'),
+  if (m.role === 'user') return h('div', { class: 'msg workspace-message user' }, h('div', { class: 'workspace-role' }, 'You'), h('div', { class: 'body workspace-body' }, m.content), thumbs(m.images));
+  if (m.role === 'error') return h('div', { class: 'msg workspace-message error' }, h('div', { class: 'workspace-role' }, 'Error'), h('div', { class: 'body workspace-body' }, m.content));
+  return h('div', { class: 'msg workspace-message assistant' }, h('div', { class: 'workspace-role', html: VeilWorkspace.mark + ' Veil' }),
     planNode(m.plan),
     (m.tools ?? []).flatMap(toolChip),
-    m.content ? h('div', { class: 'body md', html: render(m.content) }) : null,
+    m.content ? h('div', { class: 'body workspace-body md', html: render(m.content) }) : null,
     m.review && m.review.verdict !== 'unsure' ? h('div', { class: 'review ' + m.review.verdict, title: 'Clef answered "does this answer have a material problem?" with probability ' + m.review.p.toFixed(2) },
       m.review.verdict === 'clear' ? 'clef: reviewed, no problem found' : 'clef: flagged a problem; this is the corrected answer') : null);
 }
 
 function liveNode() {
-  const L = S.live;
-  return h('div', { class: 'msg assistant live', id: 'live' }, h('div', { class: 'role' }, 'veil'),
-    planNode(S.conv.plan),
-    L.tools.flatMap(toolChip),
-    L.text ? h('div', { class: 'body md', html: render(L.text) }) : h('div', { class: 'status' }, h('span', { class: 'dots', 'aria-hidden': 'true' }, h('i'), h('i'), h('i')), L.status));
+  const node = h('div', { class: 'msg workspace-message assistant live', id: 'live' },
+    h('div', { class: 'workspace-role', html: VeilWorkspace.mark + ' Veil' }),
+    h('div', { class: 'live-plan' }),
+    h('div', { class: 'live-tools' }),
+    h('div', { class: 'body workspace-body md live-answer', hidden: true }),
+    h('div', { class: 'status', role: 'status' },
+      h('span', { class: 'dots', 'aria-hidden': 'true' }, h('i'), h('i'), h('i')), h('span', { class: 'live-status' })));
+  paintLive(node);
+  return node;
 }
 
-let liveQueued = false;
-function drawLive() {
-  if (liveQueued) return;
-  liveQueued = true;
-  requestAnimationFrame(() => {
-    liveQueued = false;
-    const old = document.getElementById('live');
-    if (!old || !S.live) return;
-    const box = old.parentElement;
-    const pinned = box.scrollHeight - box.scrollTop - box.clientHeight < 80;
-    const next = liveNode();
-    next.classList.add('settled');   // only a message's first appearance animates
-    old.replaceWith(next);
-    if (pinned) box.scrollTop = box.scrollHeight;
+function paintLive(node) {
+  const live = S.live;
+  const plan = S.conv.plan || [];
+  const planKey = JSON.stringify(plan);
+  if (node.planKey !== planKey) {
+    node.planKey = planKey;
+    const list = planNode(plan);
+    node.querySelector('.live-plan').replaceChildren(...(list ? [list] : []));
+  }
+  const tools = node.querySelector('.live-tools');
+  live.tools.forEach((tool, i) => {
+    const previous = tools.children[i];
+    const state = previous?.toolState;
+    if (state?.tool === tool && state.running === tool.running && state.failed === tool.failed && state.result === tool.result) return;
+    const group = h('div', {}, toolChip(tool));
+    group.toolState = { tool, running: tool.running, failed: tool.failed, result: tool.result };
+    if (previous) {
+      const detail = previous.querySelector('details');
+      const keepFocus = detail?.contains(document.activeElement);
+      group.querySelector('details').open = detail?.open || false;
+      previous.replaceWith(group);
+      if (keepFocus) group.querySelector('summary').focus({ preventScroll: true });
+    } else tools.appendChild(group);
   });
+  while (tools.children.length > live.tools.length) tools.lastElementChild.remove();
+  if (node.liveText !== live.text) {
+    node.liveText = live.text;
+    const answer = node.querySelector('.live-answer');
+    answer.hidden = !live.text;
+    answer.innerHTML = live.text ? render(live.text) : '';
+  }
+  const status = node.querySelector('.live-status');
+  if (status.textContent !== live.status) status.textContent = live.status;
+  status.parentElement.hidden = !!live.text;
+}
+
+let livePaint = 0;
+function drawLive() {
+  if (livePaint) return;
+  // Coalesce streamed chunks before parsing markdown. The committed history,
+  // the live tool details and the composer keep their DOM nodes.
+  livePaint = setTimeout(() => {
+    livePaint = 0;
+    if (!S.live) return;
+    const node = document.getElementById('live');
+    if (!node) return;
+    const transcript = node.parentElement;
+    transcript.follow.beforePaint();
+    paintLive(node);
+    transcript.follow.afterPaint();
+  }, 32);
 }
 
 function download(name, text) {
@@ -7588,8 +7654,28 @@ function applyLayout(shell = document.querySelector('.shell')) {
   if (!shell) return;
   shell.classList.toggle('no-rail', !S.lay.rail);
   shell.classList.toggle('no-chat', !S.lay.chat);
+  shell.classList.toggle('show-rail', S.panes.rail);
+  shell.classList.toggle('show-side', S.panes.side);
   if (S.lay.side) shell.style.setProperty('--side-w', S.lay.side + 'px'); else shell.style.removeProperty('--side-w');
 }
+
+function setDrawer(which) {
+  const wasOpen = S.panes[which];
+  S.panes.rail = !wasOpen && which === 'rail';
+  S.panes.side = !wasOpen && which === 'side';
+  applyLayout();
+  document.getElementById('showChats')?.setAttribute('aria-expanded', String(S.panes.rail));
+  document.getElementById('showWorkspace')?.setAttribute('aria-expanded', String(S.panes.side));
+  const focus = wasOpen ? document.getElementById(which === 'rail' ? 'showChats' : 'showWorkspace')
+    : document.querySelector(which === 'rail' ? '#newChatBtn' : '#side [aria-selected="true"]');
+  focus?.focus({ preventScroll: true });
+}
+
+document.addEventListener('keydown', (e) => {
+  if (e.key !== 'Escape' || !matchMedia('(max-width: 980px)').matches || document.querySelector('dialog[open]')) return;
+  if (S.panes.rail) setDrawer('rail');
+  else if (S.panes.side) setDrawer('side');
+});
 
 function setLayout(change) {
   Object.assign(S.lay, change);
@@ -7699,36 +7785,20 @@ function drawSide() {
   saveUi();
 }
 
-function send(text) {
+function send() {
   const box = document.getElementById('prompt');
-  const said = (text ?? box.value).trim();
+  const said = box.value.trim();
   if ((!said && !pics.attached.length) || S.live) return;
   box.value = '';
-  box.style.height = 'auto';
+  chatDrafts.get(S.conv.id).text = '';
+  VeilWorkspace.growPrompt(box);
+  document.getElementById('chatTranscript').follow.jump();
   // the pictures that were waiting go into the chat with this message
   const names = pics.attached.splice(0).map((a) => { picsOf()[a.name] = a.url; return a.name; });
+  drawAttached();
   const slash = /^\/([a-z][\w-]*)(?:\s+([\s\S]*))?$/i.exec(said);
   if (slash && SLASH[slash[1].toLowerCase()]) return SLASH[slash[1].toLowerCase()](slash[2] ?? '', names);   // a section's own command
   runTurn(said || (names.length === 1 ? 'Look at this picture.' : 'Look at these pictures.'), names);
-}
-
-const SUGGESTIONS = [
-  'Build a small 3D scene in three.js: plan it, then write it file by file',
-  'Put three minds on this: should a small team self-host its git?',
-  'Write a Python script that prints the first 20 primes, and run it',
-  'Queue a job: read today\'s Cloudflare blog and write me a summary file',
-  'Who is Agent Garrett?',
-];
-
-function welcome() {
-  const G = CFG.garrett;
-  return h('div', { class: 'welcome' }, h('h1', {}, 'What are we working on?'),
-    h('p', {}, 'The veil can search and read the web, write code you watch, edit and preview in the Code tab, run Python, put several minds on one question, and hand long or repeating work to your harness as jobs.'),
-    h('div', { class: 'chips' }, SUGGESTIONS.map((s) => h('button', { class: 'suggest', onclick: () => send(s) }, s))),
-    S.status?.garrett?.connected ? null : h('div', { class: 'panel promo' },
-      h('div', {}, h('strong', {}, 'Add Agent Garrett\'s security tools'),
-        h('p', {}, 'CVE and KEV intelligence, DNS and certificate recon, IOC extraction and more, called by the veil in this chat. ', link({ label: 'What is Agent Garrett?', href: G.what }))),
-      h('button', { class: 'btn btn-solid btn-sm', onclick: () => { S.tab = 'harness'; S.panes.side = true; draw(); queueMicrotask(() => document.getElementById('garrett')?.scrollIntoView({ block: 'start' })); } }, 'Connect')));
 }
 
 function linksBlock() {
@@ -7737,56 +7807,163 @@ function linksBlock() {
     S.linksOpen ? CFG.links.map((g) => h('div', { class: 'link-group' }, h('div', { class: 'link-head' }, g.group), g.items.map((i) => link(i, 'item')))) : null);
 }
 
-function dashboard() {
+function chatRail() {
+  return h('aside', { class: 'rail', id: 'chatRail', 'aria-label': 'Conversations' },
+    h('div', { class: 'pane-head rail-head' },
+      h('button', { id: 'newChatBtn', class: 'btn btn-solid btn-sm', disabled: !!S.live, onclick: () => {
+        newConv(); S.panes.rail = false; draw();
+        if (matchMedia('(pointer: fine)').matches) document.getElementById('prompt')?.focus({ preventScroll: true });
+      } }, '+ New chat'),
+      h('button', { class: 'icon-btn only-wide', 'aria-label': 'Hide the chats list', title: 'Hide the chats list', onclick: () => setLayout({ rail: false }) }, '‹')),
+    h('div', { class: 'list' },
+      S.convs.length === 0 ? h('div', { class: 'empty' }, 'Your conversations will appear here.') : null,
+      S.convs.map((x) => h('div', { class: 'chat-list-row' },
+        h('button', { class: 'item chat-list-button' + (x.id === S.conv.id ? ' on' : ''), 'aria-current': String(x.id === S.conv.id), 'data-chat': x.id, disabled: !!S.live, onclick: () => openConv(x.id) },
+          h('span', { class: 'name' }, x.title || 'New chat')),
+        h('button', { class: 'chat-delete', 'aria-label': 'Delete ' + (x.title || 'conversation'), disabled: !!S.live, onclick: () => deleteConv(x.id) }, '×')))),
+    linksBlock(),
+    h('div', { class: 'who' }, h('span', { class: 'name', title: S.me?.email || '' }, S.me?.email || S.me?.account_name || 'Logged in with Cloudflare'),
+      h('button', { class: 'btn btn-ghost btn-sm', onclick: () => logout() }, 'Log out')));
+}
+
+function syncChatComposer() {
+  const input = document.getElementById('prompt');
+  if (!input) return;
+  const sendButton = document.getElementById('sendChat');
+  const stopButton = document.getElementById('stopChat');
+  input.placeholder = S.live ? 'Draft your next message…' : 'Message the veil…';
+  sendButton.hidden = !!S.live;
+  sendButton.disabled = !input.value.trim() && !pics.attached.length;
+  stopButton.hidden = !S.live;
+  stopButton.disabled = !!S.live?.abort.signal.aborted;
+  document.getElementById('attachChat').hidden = !imageOn();
+  const note = document.getElementById('chatNote');
+  const label = S.live ? (stopButton.disabled ? 'Stopping…' : 'In progress') : '';
+  if (note.textContent !== label) note.textContent = label;
+  document.getElementById('chatShortcut').hidden = !!S.live;
+  const model = document.getElementById('chatModel');
+  model.disabled = !!S.live;
+}
+
+function chatPane() {
+  selectChatDraft(S.conv.id);
+  const transcript = h('div', { id: 'chatTranscript', class: 'transcript workspace-transcript', role: 'region', 'aria-label': 'Conversation messages', tabindex: 0 });
+  const latest = h('button', { class: 'workspace-latest', hidden: true, 'aria-label': 'Jump to latest message' }, '↓ Latest');
+  transcript.follow = VeilWorkspace.followTranscript(transcript, latest);
+  const input = h('textarea', {
+    id: 'prompt', rows: '1', value: chatDrafts.get(S.conv.id).text, placeholder: 'Message the veil…', 'aria-label': 'Message',
+    onpaste: (e) => {
+      const fs = [...(e.clipboardData?.files ?? [])].filter((f) => f.type.startsWith('image/'));
+      if (fs.length && imageOn()) { e.preventDefault(); attachPictures(fs); }
+    },
+    onkeydown: (e) => { if (VeilWorkspace.shouldSend(e)) { e.preventDefault(); send(); } },
+    oninput: () => {
+      chatDrafts.get(S.conv.id).text = input.value;
+      VeilWorkspace.growPrompt(input);
+      syncChatComposer();
+      transcript.follow.afterPaint();
+    },
+  });
+  const files = h('input', { type: 'file', accept: 'image/*', multiple: true, hidden: true, onchange: () => {
+    attachPictures([...files.files]); files.value = '';
+  } });
+  return h('main', {
+    class: 'chat workspace', 'aria-label': 'Chat',
+    ondragover: (e) => {
+      if (!imageOn() || !e.dataTransfer?.types.includes('Files')) return;
+      e.preventDefault();
+      input.closest('.workspace-composer').classList.add('drag');
+    },
+    ondragleave: (e) => {
+      if (!e.currentTarget.contains(e.relatedTarget)) input.closest('.workspace-composer').classList.remove('drag');
+    },
+    ondrop: (e) => {
+      input.closest('.workspace-composer').classList.remove('drag');
+      const fs = [...(e.dataTransfer?.files ?? [])].filter((f) => f.type.startsWith('image/'));
+      if (fs.length) { e.preventDefault(); attachPictures(fs); }
+    },
+  },
+    h('div', { class: 'workspace-heading' },
+      h('button', { class: 'icon-btn only-wide rail-reopen', 'aria-label': 'Show the chats list', title: 'Show the chats list', onclick: () => setLayout({ rail: true }) }, '›'),
+      h('div', { class: 'workspace-title', id: 'chatTitle' })),
+    transcript,
+    h('div', { class: 'workspace-composer' }, latest,
+      h('div', { class: 'workspace-panel' },
+        h('div', { class: 'attached', id: 'attached', hidden: true }),
+        input,
+        h('div', { class: 'workspace-controls' },
+          h('button', { id: 'attachChat', class: 'icon-btn', type: 'button', 'aria-label': 'Attach an image', title: 'Attach an image', html: VeilWorkspace.attachIcon, onclick: () => files.click() }),
+          files,
+          modelSelect(true),
+          h('span', { class: 'workspace-spacer' }),
+          h('button', { id: 'sendChat', class: 'btn btn-solid', type: 'button', onclick: send }, 'Send'),
+          h('button', { id: 'stopChat', class: 'btn btn-danger', type: 'button', onclick: () => {
+            S.live?.abort.abort(); syncChatComposer();
+          } }, 'Stop'))),
+      h('div', { class: 'workspace-meta' },
+        h('span', { class: 'workspace-shortcut', id: 'chatShortcut' }, '↵ Send · Shift + ↵ New line'),
+        h('span', { id: 'chatNote' }))));
+}
+
+function drawChat() {
+  const transcript = document.getElementById('chatTranscript');
+  if (!transcript) return;
   const c = S.conv;
-  const transcript = h('div', { class: 'transcript' },
-    c.msgs.length === 0 && !S.live ? welcome() : null,
-    c.msgs.map(message),
-    S.live ? liveNode() : null);
-  const close = () => { S.panes.rail = false; S.panes.side = false; draw(); };
-  const shell = h('div', { class: 'shell' + (S.panes.rail ? ' show-rail' : '') + (S.panes.side ? ' show-side' : '') },
-    h('aside', { class: 'rail' },
-      h('div', { class: 'pane-head' }, 'Chats', h('span', { class: 'grow' }), h('button', { class: 'btn btn-ghost btn-sm', disabled: !!S.live, onclick: () => { newConv(); S.panes.rail = false; draw(); } }, '+ New'),
-        h('button', { class: 'btn btn-ghost btn-sm only-wide', 'aria-label': 'Hide the chats list', title: 'Hide the chats list', onclick: () => setLayout({ rail: false }) }, '«')),
-      h('div', { class: 'list' },
-        S.convs.length === 0 ? h('div', { class: 'empty' }, 'Your chats are kept in your harness, so they follow your login to any browser.') : null,
-        S.convs.map((x) => h('div', { class: 'item' + (x.id === c.id ? ' on' : ''), role: 'button', tabindex: '0', onclick: () => openConv(x.id), onkeydown: (e) => { if (e.key === 'Enter') openConv(x.id); } },
-          h('span', { class: 'name' }, x.title),
-          h('button', { class: 'x', 'aria-label': 'Delete conversation', onclick: (e) => { e.stopPropagation(); deleteConv(x.id); } }, '✕')))),
-      linksBlock(),
-      h('div', { class: 'who' }, h('span', { class: 'name', title: S.me?.email || '' }, S.me?.email || S.me?.account_name || 'Logged in with Cloudflare'),
-        h('button', { class: 'btn btn-ghost btn-sm', onclick: () => logout() }, 'Log out'))),
-    h('main', { class: 'chat', ondragover: (e) => { if ([...(e.dataTransfer?.types ?? [])].includes('Files')) e.preventDefault(); },
-      ondrop: (e) => { const fs = [...(e.dataTransfer?.files ?? [])].filter((f) => f.type.startsWith('image/')); if (fs.length) { e.preventDefault(); attachPictures(fs); } } },
-      S.lay.rail ? null : h('button', { class: 'btn btn-ghost btn-sm only-wide rail-reopen', title: 'Show the chats list', onclick: () => setLayout({ rail: true }) }, '☰ Chats'),
-      transcript,
-      h('div', { class: 'attached', id: 'attached', hidden: '' }),
-      h('div', { class: 'composer' },
-        imageOn() ? h('button', { class: 'icon-btn attach-btn', title: 'Attach a picture (or paste one, or drop one here)', 'aria-label': 'Attach a picture', onclick: () => { const i = h('input', { type: 'file', accept: 'image/*', multiple: '', hidden: '', onchange: () => { attachPictures([...i.files]); i.remove(); } }); document.body.append(i); i.click(); } }, '+') : null,
-        h('textarea', { id: 'prompt', rows: '1', placeholder: 'Message the veil', 'aria-label': 'Message', onpaste: (e) => { const fs = [...(e.clipboardData?.files ?? [])].filter((f) => f.type.startsWith('image/')); if (fs.length) { e.preventDefault(); attachPictures(fs); } }, onkeydown: (e) => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); } }, oninput: (e) => { e.target.style.height = 'auto'; e.target.style.height = Math.min(220, e.target.scrollHeight) + 'px'; } }),
-        S.live ? h('button', { class: 'btn', onclick: () => S.live.abort.abort() }, 'Stop') : h('button', { class: 'btn btn-solid', onclick: () => send() }, 'Send'))),
-    splitter(),
-    sidePane(),
-    h('div', { class: 'scrim', onclick: close }));
+  const title = document.getElementById('chatTitle');
+  title.textContent = title.title = c.title || 'New chat';
+  const model = document.getElementById('chatModel');
+  if (model.value !== S.model || model.optionsSource !== S.models) {
+    const fresh = modelSelect(true);
+    const focused = document.activeElement === model;
+    model.replaceWith(fresh);
+    if (focused) fresh.focus({ preventScroll: true });
+  }
+  transcript.follow.beforePaint();
+  if (transcript.conversation !== c) {
+    transcript.conversation = c;
+    transcript.rendered = 0;
+    transcript.replaceChildren();
+    transcript.follow.jump();
+  }
+  if (!c.msgs.length && !S.live) {
+    if (!transcript.firstElementChild) {
+      transcript.append(VeilWorkspace.welcome((prompt) => VeilWorkspace.insertPrompt(document.getElementById('prompt'), prompt)));
+    }
+  } else {
+    transcript.querySelector('.workspace-welcome')?.remove();
+    const oldLive = document.getElementById('live');
+    const added = document.createDocumentFragment();
+    for (const m of c.msgs.slice(transcript.rendered)) {
+      const node = messageNode(m);
+      if (transcript.rendered === 0 && !S.live) node.classList.add('settled');
+      added.append(node);
+    }
+    transcript.rendered = c.msgs.length;
+    transcript.insertBefore(added, oldLive);
+    if (S.live && !oldLive) transcript.append(liveNode());
+    else if (!S.live) oldLive?.remove();
+  }
+  syncChatComposer();
+  transcript.follow.afterPaint();
+}
+
+function dashboard() {
+  const shell = h('div', { class: 'shell' }, chatRail(), chatPane(), splitter(), sidePane(),
+    h('div', { class: 'scrim', onclick: () => setDrawer(S.panes.rail ? 'rail' : 'side') }));
   applyLayout(shell);
-  queueMicrotask(() => { drawAttached(); transcript.scrollTop = transcript.scrollHeight; if (!S.live && !S.panes.rail && !S.panes.side && matchMedia('(min-width: 981px)').matches) document.getElementById('prompt')?.focus(); });
   return shell;
 }
 
 /* Arrival: nothing but the login. */
 function gate() {
   return h('div', { class: 'gate' }, h('div', { class: 'panel gate-card' },
-    h('div', { class: 'section-eyebrow' }, 'the veil · in your browser'),
+    h('div', { class: 'workspace-emblem', html: VeilWorkspace.mark }),
     h('h1', {}, 'Log in with Cloudflare to chat'),
-    h('p', {}, 'The chat runs in this tab on your own Cloudflare account: the model is your account\'s Workers AI, and the work is done by a worker harness that lives in your account.'),
-    h('ul', {},
-      h('li', {}, 'The login happens between this page and Cloudflare. No server of ours sees it.'),
-      h('li', {}, 'Chats, code and jobs are kept in your harness, so they follow your login.'),
-      h('li', {}, 'The login is kept for this tab only; closing the tab ends it.')),
+    h('p', {}, 'Use Workers AI on your own account. Your Cloudflare Worker keeps your chats, files, and jobs available when you sign in again.'),
     h('div', { class: 'gate-acts' }, h('button', { class: 'btn btn-solid btn-lg', onclick: login }, 'Log in with Cloudflare'),
-      h('a', { class: 'btn btn-ghost', href: '../#get' }, 'Or get the desktop app')),
-    h('div', { class: 'err', role: 'alert' }, S.err),
-    h('p', { class: 'fine gate-links' }, CFG.links[0].items.flatMap((i, n) => [n ? ' · ' : '', link(i)]))));
+      h('a', { class: 'btn btn-ghost', href: '../#get' }, 'Get the desktop app')),
+    h('p', { class: 'fine' }, 'This browser keeps your Cloudflare sign-in between visits. You can log out from the chat list. ', h('a', { href: '../privacy.html' }, 'Privacy policy')),
+    h('div', { class: 'err', role: 'alert' }, S.err)));
 }
 
 /* Logged in, no harness yet: deploy one, or find the one already there. */
@@ -7794,9 +7971,9 @@ function setup() {
   const name = h('input', { id: 'hname', type: 'text', placeholder: 'your workers.dev name, or the Worker\'s address', 'aria-label': 'Your workers.dev name or the Worker\'s address', autocomplete: 'off', spellcheck: 'false', value: S.harness ? S.harness.replace(/^https?:\/\//, '') : '', onkeydown: (e) => { if (e.key === 'Enter') go(); } });
   const go = () => { const u = harnessUrl(name.value); if (!u) { S.err = `That is not a workers.dev name or a Worker address. The address looks like ${CFG.script}.<your-name>.workers.dev`; return draw(); } findHarness(u); };
   return h('div', { class: 'gate' }, h('div', { class: 'panel gate-card' },
-    h('div', { class: 'section-eyebrow' }, 'logged in · one step left'),
-    h('h1', {}, 'Deploy your worker harness'),
-    h('p', {}, 'The harness is one Worker in your Cloudflare account. It calls the model, reads the web, keeps your chats, runs queued and repeating jobs in turn, and keeps to daily limits you can change. Only a login to your account can use it.'),
+    h('div', { class: 'workspace-emblem', html: VeilWorkspace.mark }),
+    h('h1', {}, 'Connect your Cloudflare Worker'),
+    h('p', {}, 'The Worker runs chat and scheduled jobs in your account. Connect an existing Veil Worker or deploy one to get started.'),
     h('div', { class: 'gate-acts' }, h('a', { class: 'btn btn-solid btn-lg', href: CFG.deploy_url, target: '_blank', rel: 'noopener' }, 'Deploy to Cloudflare'),
       h('span', { class: 'fine' }, 'Opens Cloudflare\'s deploy page. It builds the Worker from a copy of its source in a GitHub or GitLab account of yours.')),
     h('hr', { class: 'gate-sep' }),
@@ -7818,7 +7995,7 @@ async function pickModel(sel) {
 }
 
 /* The model picker: the account's own list from the harness, grouped by who made the model. */
-function modelSelect() {
+function modelSelect(inComposer = false) {
   const ids = [...new Set([...(S.models.length ? S.models.map((m) => m.id) : CFG.models), S.model])].sort();
   const groups = new Map();
   for (const id of ids) {
@@ -7826,44 +8003,68 @@ function modelSelect() {
     if (!groups.has(maker)) groups.set(maker, []);
     groups.get(maker).push(id);
   }
-  return h('select', { 'aria-label': 'Model', title: S.model, disabled: !!S.live, onchange: (e) => pickModel(e.target) },
+  const select = h('select', {
+    id: inComposer ? 'chatModel' : null,
+    class: inComposer ? 'workspace-model' : '',
+    'aria-label': 'Model', title: S.model, disabled: !!S.live, onchange: (e) => pickModel(e.target),
+  },
     [...groups].map(([maker, list]) => h('optgroup', { label: maker }, list.map((m) => h('option', { value: m, selected: m === S.model }, m.split('/').slice(2).join('/') || m)))),
     h('option', { value: '+' }, 'Other model…'));
+  select.optionsSource = S.models;
+  return select;
 }
 
 let shownView = '';
 function draw() {
   const on = !!(S.session && S.status);
-  const draft = document.getElementById('prompt')?.value ?? '';
   const typed = document.getElementById('hname')?.value ?? '';
-  const sideKeep = {};
-  for (const el of document.querySelectorAll('#side input, #side textarea:not(#editor), #side select')) if (el.id && el.value && el.type !== 'number') sideKeep[el.id] = el.value;
   document.body.classList.toggle('chat-on', on);   // in the chat the top bar keeps only the brand; the site's links are in the chats list
   drawBar();
   const view = !S.session ? 'gate' : on ? 'chat:' + S.conv.id : 'setup';
-  app.classList.toggle('same-view', view === shownView);
+  const sameView = view === shownView;
+  app.classList.toggle('same-view', sameView);
   shownView = view;
+  if (on && sameView) {
+    const rail = document.getElementById('chatRail');
+    const list = rail.querySelector('.list');
+    const oldScroll = list.scrollTop;
+    const focus = rail.contains(document.activeElement) ? document.activeElement : null;
+    const fresh = chatRail();
+    rail.replaceWith(fresh);
+    fresh.querySelector('.list').scrollTop = oldScroll;
+    if (focus?.id) document.getElementById(focus.id)?.focus({ preventScroll: true });
+    else if (focus?.dataset.chat) {
+      [...fresh.querySelectorAll('[data-chat]')].find((b) => b.dataset.chat === focus.dataset.chat)?.focus({ preventScroll: true });
+    }
+    applyLayout();
+    drawChat();
+    drawSide();
+    return;
+  }
+  document.getElementById('chatTranscript')?.follow.dispose();
   app.replaceChildren(!S.session ? gate() : on ? dashboard() : setup());
   shownTab = S.tab;
-  const box = document.getElementById('prompt');
-  if (box && draft) box.value = draft;
+  if (on) {
+    VeilWorkspace.growPrompt(document.getElementById('prompt'));
+    drawAttached();
+    drawChat();
+  }
   const a = document.getElementById('hname');
   if (a && typed) a.value = typed;
-  for (const [id, v] of Object.entries(sideKeep)) { const el = document.getElementById(id); if (el) el.value = v; }
 }
 
 function drawBar() {
   const on = !!(S.session && S.status);
   const pane = (key, label, glyph) => h('button', { class: 'icon-btn only-wide' + (S.lay[key] ? ' on' : ''), 'aria-label': (S.lay[key] ? 'Hide ' : 'Show ') + label, 'aria-pressed': String(S.lay[key]), title: (S.lay[key] ? 'Hide ' : 'Show ') + label, onclick: () => setLayout({ [key]: !S.lay[key] }) }, glyph);
   barSlot.replaceChildren(...(on ? [
-    h('button', { class: 'icon-btn only-narrow', 'aria-label': 'Chats and links', onclick: () => { S.panes.rail = !S.panes.rail; S.panes.side = false; draw(); } }, '☰'),
+    h('button', { id: 'showChats', class: 'icon-btn only-narrow', 'aria-label': 'Chats and links', 'aria-controls': 'chatRail', 'aria-expanded': String(S.panes.rail), onclick: () => setDrawer('rail') }, '☰'),
     pane('rail', 'the chats list', '☰'),
     pane('chat', 'the chat', '✎'),
-    modelSelect(),
+    ...(!S.lay.chat ? [modelSelect()] : []),
     outdated()
       ? h('button', { class: 'chip warn', onclick: () => { S.tab = 'harness'; S.panes.side = true; draw(); } }, h('span', { class: 'chip-dot' }), 'update harness')
       : h('span', { class: 'chip', title: S.harness }, h('span', { class: 'chip-dot' }), 'harness connected'),
-    h('button', { class: 'icon-btn only-narrow', 'aria-label': 'Code, jobs and harness', onclick: () => { S.panes.side = !S.panes.side; S.panes.rail = false; draw(); } }, '▤'),
+    h('button', { id: 'showWorkspace', class: 'icon-btn only-narrow', 'aria-label': 'Workspace tools', 'aria-controls': 'side', 'aria-expanded': String(S.panes.side), onclick: () => setDrawer('side') }, '▤'),
   ] : []));
 }
 
