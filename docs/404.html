@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Page not found — the Veil</title>
+<meta name="robots" content="noindex">
+<meta name="description" content="This page does not exist. The Veil is a free desktop app for building software with AI: download it, read the walkthrough, or open the web chat.">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#e9edf5" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#16161e" media="(prefers-color-scheme: dark)">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M16 1c1.6 8.2 6.8 13.4 15 15-8.2 1.6-13.4 6.8-15 15-1.6-8.2-6.8-13.4-15-15C9.2 14.4 14.4 9.2 16 1z' fill='%238a3ffc'/%3E%3C/svg%3E">
+<!-- GitHub Pages serves this file for a missing path at any depth, so every URL here is root-absolute. -->
+<link rel="stylesheet" href="/css/theme.css">
+<link rel="stylesheet" href="/css/site.css">
+<script>
+  /* The theme before first paint: the same key and rule as the rest of the site. */
+  try {
+    var t = localStorage.getItem('veil.theme.chosen') ? localStorage.getItem('veil.theme') : null;   /* only a theme the reader picked */
+    if (!t) t = 'light';   /* the light theme, until the reader picks another */
+    document.documentElement.setAttribute('data-theme', t);
+  } catch (e) {}
+</script>
+<script src="/js/analytics.js"></script>
+</head>
+<body>
+
+<svg width="0" height="0" aria-hidden="true" style="position:absolute">
+  <defs>
+    <linearGradient id="veilGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" style="stop-color:var(--magenta)"/>
+      <stop offset="0.55" style="stop-color:var(--blue)"/>
+      <stop offset="1" style="stop-color:var(--cyan)"/>
+    </linearGradient>
+  </defs>
+</svg>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="/">
+      <svg class="mark" viewBox="0 0 32 32" aria-hidden="true"><path d="M16 1c1.6 8.2 6.8 13.4 15 15-8.2 1.6-13.4 6.8-15 15-1.6-8.2-6.8-13.4-15-15C9.2 14.4 14.4 9.2 16 1z" fill="url(#veilGrad)"/></svg>
+      the veil <small>nl-veil</small>
+    </a>
+    <span class="grow"></span>
+    <button class="icon-btn" id="themeBtn" type="button" title="Toggle theme" aria-label="Toggle theme"></button>
+  </div>
+</header>
+
+<main id="top">
+<section class="hero">
+  <div class="wrap">
+    <div class="section-head">
+      <p class="section-eyebrow">404</p>
+      <h1>This page isn&rsquo;t here.</h1>
+      <p class="hero-lede">The address may be old or mistyped. <strong>the Veil</strong> is a free, open-source desktop app
+        for building software with AI, and everything on this site starts from one of these:</p>
+    </div>
+    <div class="hero-cta">
+      <a class="btn btn-solid btn-lg" href="/#get">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v12M7 12l5 5 5-5M4 20h16"/></svg>
+        Download
+      </a>
+      <a class="btn btn-lg" href="/">Home</a>
+      <a class="btn btn-lg" href="/demos/">Screenshot walkthrough</a>
+      <a class="btn btn-lg" href="/chat/">Web chat</a>
+    </div>
+    <p class="hero-note">Looking for the code? It is on <a href="https://github.com/gary23w/nl-veil" target="_blank" rel="noopener">GitHub</a>,
+      and the annotated source documents open from the <a href="/#documents">home page</a>.</p>
+  </div>
+</section>
+</main>
+
+<script src="/js/main.js"></script>
+</body>
+</html>
