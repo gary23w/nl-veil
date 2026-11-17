@@ -618,3 +618,34 @@ main > section:last-child { padding-bottom: var(--section-gap); }
 @media (max-width: 620px) {
   .docview { width: 100vw; height: 100dvh; border-radius: 0; border: 0; }
 }
+
+/* Decorative snowfall on page load. */
+html::after {
+  position: fixed;
+  z-index: 200;
+  inset: -7rem 0 auto;
+  height: calc(7rem + min(52vh, 24rem));
+  pointer-events: none;
+  content: "";
+  background-image:
+    radial-gradient(circle at 23px 37px, #fff 1.35px, #516d8073 1.55px, transparent 2.35px),
+    radial-gradient(circle at 91px 103px, #fff 1px, #516d8073 1.2px, transparent 1.9px),
+    radial-gradient(circle at 164px 52px, #fff 1.6px, #516d8073 1.8px, transparent 2.6px),
+    radial-gradient(circle at 253px 139px, #fff 1.2px, #516d8073 1.4px, transparent 2.1px),
+    radial-gradient(circle at 39px 118px, #fff 1.15px, #516d8073 1.35px, transparent 2.1px),
+    radial-gradient(circle at 177px 86px, #fff .8px, #516d8073 1px, transparent 1.7px),
+    radial-gradient(circle at 225px 170px, #fff 1.45px, #516d8073 1.65px, transparent 2.4px);
+  background-size: 277px 179px, 311px 163px, 257px 211px, 307px 191px, 241px 193px, 293px 211px, 331px 227px;
+  mask-image: linear-gradient(to bottom, #000 40%, transparent 100%);
+  animation: christmas-snowfall 5s linear both;
+}
+
+@keyframes christmas-snowfall {
+  from { opacity: .88; transform: translateY(0); }
+  68% { opacity: .88; }
+  to { opacity: 0; transform: translateY(105px); }
+}
+
+@media (prefers-reduced-motion: reduce), print {
+  html::after { content: none; animation: none; }
+}
