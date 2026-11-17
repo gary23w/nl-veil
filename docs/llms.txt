@@ -1,0 +1,43 @@
+# the Veil (nl-veil)
+
+> the Veil is a free, MIT-licensed desktop app for building software with AI. Give it a task: specialist agents can share the work on one shared project memory, and that memory carries into your next session. It runs its own built-in model (the-veil-12b), Ollama, or an OpenAI-compatible endpoint, on Windows, macOS and Linux.
+
+- One Zig binary carries the desktop app, the server behind it, a web UI, the inference engine, the memory engine and the `veil` command line.
+- Local inference needs no provider account or API key. The built-in model's weights are a separate download: the download button in the app, or `veil model pull`. Hosted providers have their own accounts, keys and costs.
+- The built-in engine uses the GPU through Vulkan when there is one and falls back to the CPU. macOS builds run it on the CPU.
+- Coding tools need Python on `PATH`; some JavaScript checks also use Node.js.
+- Local conversations, keys and memory live in a `data/` folder next to the binary. Hosted model calls, web tools and optional Cloudflare backups send the data those features need to the services you connect.
+- The Microsoft Store build is signed by Microsoft. The release downloads are not code-signed yet, so Windows SmartScreen or macOS Gatekeeper may ask before the first launch.
+
+## Download
+
+- [Releases](https://github.com/gary23w/nl-veil/releases): take the `veil-v…` bundle for Windows x86-64, macOS Apple Silicon, macOS Intel or Linux x86-64, extract it, and run `veil.exe` (Windows) or `./start` (macOS, Linux). Not "Source code (zip)", and not `veil-server-…`, the headless build.
+- [Microsoft Store](https://apps.microsoft.com/detail/9MVQ78SK0CW6): the Windows build, signed by Microsoft.
+- [Source](https://github.com/gary23w/nl-veil): build it yourself with Zig 0.16+ (`git clone https://github.com/gary23w/nl-veil`, then `zig build run`).
+
+## Start here
+
+- [README](https://github.com/gary23w/nl-veil/blob/main/README.md): what it is, install, the first task to try, and every feature in detail.
+- [Screenshot walkthrough](https://veil.garrettstimpson.ca/demos/): real screenshots of setup, the Cloudflare login and a build rehearsal.
+- [Web chat](https://veil.garrettstimpson.ca/chat/): the Veil in a browser tab, logged in with Cloudflare, on your own account's Workers AI.
+- [Architecture](https://veil.garrettstimpson.ca/docs-src/guide/architecture.md): one server process; the web app, the native desktop and the `veil` CLI are three clients of one `/api/v1` surface.
+- [The model trio](https://veil.garrettstimpson.ca/docs-src/guide/models.md): the three roles a turn's model calls are split into, and how to pick a model for each.
+- [Running a server](https://veil.garrettstimpson.ca/docs-src/guide/server.md): first login, the default model, the shared provider key, accounts, and keeping it private.
+- [Desktop experience](https://veil.garrettstimpson.ca/docs-src/guide/desktop.md): the settings pages, task progress, streaming and code formatting.
+- [Desktop updates](https://veil.garrettstimpson.ca/docs-src/guide/updates.md): in-app updates without Git, recovery, and Cloudflare connectivity.
+- [Accounts and the sandbox](https://veil.garrettstimpson.ca/docs-src/guide/accounts.md): what a non-admin account can and cannot do on a shared server.
+
+## Extend it
+
+- [Themes and plugins](https://veil.garrettstimpson.ca/docs-src/guide/extensions.md): re-skin the product or add tools, both as small files you drop into the data folder, with no rebuild.
+- [Writing a plugin](https://veil.garrettstimpson.ca/docs-src/guide/plugins.md): tools, a policy and prompt text, in a sandboxed Lua 5.4 manifest.
+- [Authoring a theme](https://veil.garrettstimpson.ca/docs-src/guide/themes.md): one Lua file that returns a color table.
+
+## Optional
+
+- [Module index](https://veil.garrettstimpson.ca/docs-src/index.md): the annotated source documents, one per module, and how the modules divide.
+- [the-veil-12b](https://huggingface.co/gary23w/the-veil-12b): the built-in model on Hugging Face, served in-process from a GGUF.
+- [neuron-db](https://github.com/gary23w/neuron-db): the associative memory store behind recall; its own project.
+- [Agent Garrett security tools](https://veil.garrettstimpson.ca/docs-src/guide/security-tools.md): connecting chats, swarms and tater-tots to the Agent Garrett service.
+- [Terms and privacy](https://veil.garrettstimpson.ca/privacy.html)
+- [Release notes](https://github.com/gary23w/nl-veil/releases)

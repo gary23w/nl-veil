@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://veil.garrettstimpson.ca/sitemap.xml
