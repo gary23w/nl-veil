@@ -7840,7 +7840,6 @@ function syncChatComposer() {
   const note = document.getElementById('chatNote');
   const label = S.live ? (stopButton.disabled ? 'Stopping…' : 'In progress') : '';
   if (note.textContent !== label) note.textContent = label;
-  document.getElementById('chatShortcut').hidden = !!S.live;
   const model = document.getElementById('chatModel');
   model.disabled = !!S.live;
 }
@@ -7901,7 +7900,6 @@ function chatPane() {
             S.live?.abort.abort(); syncChatComposer();
           } }, 'Stop'))),
       h('div', { class: 'workspace-meta' },
-        h('span', { class: 'workspace-shortcut', id: 'chatShortcut' }, '↵ Send · Shift + ↵ New line'),
         h('span', { id: 'chatNote' }))));
 }
 

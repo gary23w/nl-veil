@@ -5375,17 +5375,6 @@ const ChatWelcome = struct {
     }
 };
 
-fn chatReadingBand(r: t.Rect, width: f32) t.Rect {
-    const w = @min(r.width, width);
-    return .{ .x = r.x + (r.width - w) / 2, .y = r.y, .width = w, .height = r.height };
-}
-
-fn chatMessageBand(r: t.Rect, role: store_mod.ChatRole) t.Rect {
-    if (role != .user) return r;
-    const w = @max(28, @min(r.width * 0.88, 620));
-    return .{ .x = r.x + r.width - w, .y = r.y, .width = w, .height = r.height };
-}
-
 fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, stream: []const u8, busy: bool, status: []const u8, cast_live: bool, conv_title: []const u8, convs: []const store_mod.ConvRow, active: []const u8) void {
     // Only the text area grows under the resize grip; the toolbar keeps its height.
     const input_min: f32 = 96;
@@ -5552,12 +5541,11 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
     const title_h = t.textH(14) + 15;
     const title_row = t.Rect{ .x = r.x, .y = tab_end, .width = r.width, .height = title_h };
     t.panel(title_row, t.bg_dark);
-    t.textClip(conv_title, @intFromFloat(r.x + 12), @intFromFloat(tab_end + 7), 14, t.fg, @intFromFloat(@max(1, r.width - 24)));
+    t.textClip(conv_title, @intFromFloat(r.x + 14), @intFromFloat(tab_end + 7), 14, t.fg, @intFromFloat(@max(1, r.width - 28)));
     const progress_y = tab_end + title_h + 5;
     const progress_h = if (busy or cast_live) drawChatProgress(.{ .x = r.x, .y = progress_y, .width = r.width, .height = 0 }, status) else 0;
     const view_y = progress_y + progress_h;
     const view = t.Rect{ .x = r.x, .y = view_y, .width = r.width, .height = @max(2, r.y + r.height - input_h - status_h - role_h - 14 - view_y) };
-    const reading = chatReadingBand(view, 800);
     t.panelBordered(view, t.bg, t.border);
     const welcome: ?ChatWelcome = if (msgs.len == 0 and !busy and !cast_live and stream.len == 0) blk: {
         const cloud_label: ?[:0]const u8 = blk_cloud: {
@@ -5567,7 +5555,7 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
             break :blk_cloud if (store.cf_oauth_pending) "Retry Cloudflare login" else "Log in with Cloudflare";
         };
         t.grid(view, CHAT_GRID_CELL, t.withAlpha(t.border, CHAT_GRID_ALPHA));
-        break :blk ChatWelcome.init(reading, cloud_label);
+        break :blk ChatWelcome.init(view, cloud_label);
     } else null;
 
     const fsz: i32 = 14;
@@ -5605,7 +5593,7 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
     for (ui.open_uids[0..ui.open_n]) |u| fp = fp *% 31 +% u; // expand/collapse changes a row's height
     // message set / wrap width changed → drop a stale selection — but NOT mid-drag, or a background message commit
     // (a cast_note row, the finalized veil answer) during an active drag would silently kill the in-progress select.
-    const layout_changed = ui.mh_width != reading.width or ui.mh_scale != t.uiScale() or ui.mh_mono != t.activeMonoUi();
+    const layout_changed = ui.mh_width != view.width or ui.mh_scale != t.uiScale() or ui.mh_mono != t.activeMonoUi();
     // A resize can happen between streams; invalidate even when no preview is drawn.
     if (layout_changed) ui.stream_h_len = std.math.maxInt(usize);
     if ((ui.mh_fp != fp or layout_changed) and !ui.sel_dragging) ui.sel_msg = null;
@@ -5622,29 +5610,29 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
             ui.mh[i] = if ((m.role == .thought or toolName(m.textStr()) != null) and !open)
                 TOOL_CHIP_H // collapsed tool call / reasoning trace = a one-line chip
             else
-                renderMsg(chatMessageBand(reading, m.role), 0, m.role, m.textStr(), fsz, false, false, m.imgStr());
+                renderMsg(view, 0, m.role, m.textStr(), fsz, false, false, m.imgStr());
             ui.mh_mfp[i] = mfp;
         }
         ui.mh_count = msgs.len;
-        ui.mh_width = reading.width;
+        ui.mh_width = view.width;
         ui.mh_scale = t.uiScale();
         ui.mh_mono = t.activeMonoUi();
         ui.mh_fp = fp;
     }
     // Keep the reading cushion through stream -> committed-message transitions.
-    var total: f32 = if (welcome) |w| w.offset(reading) + w.content_h + 12 else 14 + MSG_LINE_H;
+    var total: f32 = if (welcome) |w| w.offset(view) + w.content_h + 12 else 14 + MSG_LINE_H;
     for (msgs, 0..) |_, i| total += ui.mh[i];
     if (stream.len > 0) {
         // re-measure the live preview only when it actually grew (it only ever grows within a step)
         const stream_fp = std.hash.Wyhash.hash(0, stream);
         if (stream.len != ui.stream_h_len or layout_changed or stream_fp != ui.stream_h_fp) {
-            ui.stream_h = renderMsg(reading, 0, .veil, stream, fsz, false, false, "");
+            ui.stream_h = renderMsg(view, 0, .veil, stream, fsz, false, false, "");
             ui.stream_h_len = stream.len;
             ui.stream_h_fp = stream_fp;
         }
         total += ui.stream_h;
     }
-    if (cast_live) total += renderCastLive(reading, 0, status, false);
+    if (cast_live) total += renderCastLive(view, 0, status, false);
 
     // Release any table-scrollbar drag on mouse-up here, ONCE per frame and unconditionally — renderTable's own
     // release is gated on the table being on-screen, so a table dragged off-screen and released there would
@@ -5711,24 +5699,23 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
         // CULL: a message fully above or below the viewport costs nothing — skip the word-wrap+draw entirely.
         // This is the big win on long scrollback (render ~a screenful, not the whole history, every frame).
         if (yy < vtop or y0 > vbot) continue;
-        const band = chatMessageBand(reading, m.role);
         if (m.role == .thought) {
             // The reasoning trace stays OPEN once it is open — a fresh one auto-expands (it was just streaming
             // live) and nothing but the user's own click on the header collapses it. Excluded from the model's
             // history, so leaving it open costs nothing but screen.
             if (rowOpen(m.uid)) {
-                _ = renderMsg(band, y0, m.role, m.textStr(), fsz, true, false, m.imgStr());
+                _ = renderMsg(view, y0, m.role, m.textStr(), fsz, true, false, m.imgStr());
                 // copy chip: flush RIGHT and only while the row is hovered (a reasoning block has no token-cost
                 // label to its right, so a mid-row chip would read as floating).
-                if (t.hovering(t.Rect{ .x = band.x + 2, .y = y0, .width = band.width - 4, .height = yy - y0 }) and t.hovering(view)) {
-                    if (copyChip(band.x + band.width - 60, y0 + 3)) {
+                if (t.hovering(t.Rect{ .x = view.x + 2, .y = y0, .width = view.width - 4, .height = yy - y0 }) and t.hovering(view)) {
+                    if (copyChip(view.x + view.width - 60, y0 + 3)) {
                         copyToClipboard(m.textStr());
                         markCopied();
                     }
                 }
-                const hdr = t.Rect{ .x = band.x + 2, .y = y0, .width = band.width - 132, .height = 20 };
+                const hdr = t.Rect{ .x = view.x + 2, .y = y0, .width = view.width - 132, .height = 20 };
                 if (t.hovering(hdr) and t.hovering(view) and rl.isMouseButtonPressed(.left)) rowToggleByUser(m.uid, false);
-            } else if (thoughtChip(band, y0, false, m.textStr())) {
+            } else if (thoughtChip(view, y0, false, m.textStr())) {
                 rowToggleByUser(m.uid, true);
             }
             continue;
@@ -5738,33 +5725,32 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
             // text is untouched in the message, so the model still receives it and copy still grabs it. Each
             // chip is independent — opening one no longer closes whatever else the user left open.
             if (rowOpen(m.uid)) {
-                _ = renderMsg(band, y0, m.role, m.textStr(), fsz, true, false, m.imgStr());
+                _ = renderMsg(view, y0, m.role, m.textStr(), fsz, true, false, m.imgStr());
                 // the token cost lives in the expanded dropdown (top-right), not the collapsed line
-                t.text(t.z("~{d} tok", .{tokCostOf(m.textStr())}), @intFromFloat(band.x + band.width - 76), @intFromFloat(y0 + 6), 11, t.comment);
+                t.text(t.z("~{d} tok", .{tokCostOf(m.textStr())}), @intFromFloat(view.x + view.width - 76), @intFromFloat(y0 + 6), 11, t.comment);
                 // expanded tool text is copyable like any other message
-                if (copyChip(band.x + band.width - 126, y0 + 3)) {
+                if (copyChip(view.x + view.width - 126, y0 + 3)) {
                     copyToClipboard(m.textStr());
                     markCopied();
                 }
                 // …and a Cloudflare deploy's live URL is one click from the browser
                 if (liveUrlIn(m.textStr())) |url| {
-                    if (openChip(band.x + band.width - 196, y0 + 3)) store.pushCmd(store_mod.mkCmd(.open_url, "", url));
+                    if (openChip(view.x + view.width - 196, y0 + 3)) store.pushCmd(store_mod.mkCmd(.open_url, "", url));
                 }
-                const hdr = t.Rect{ .x = band.x + 2, .y = y0, .width = band.width - 132, .height = 20 };
+                const hdr = t.Rect{ .x = view.x + 2, .y = y0, .width = view.width - 132, .height = 20 };
                 if (t.hovering(hdr) and t.hovering(view) and rl.isMouseButtonPressed(.left)) rowToggleByUser(m.uid, false);
-            } else if (toolChipEx(band, y0, tn, false, liveUrlIn(m.textStr()), store)) {
+            } else if (toolChipEx(view, y0, tn, false, liveUrlIn(m.textStr()), store)) {
                 rowToggleByUser(m.uid, true);
             }
             continue;
         }
         cur_sel_msg = i; // capture THIS message's text-line geometry for selection
         cur_sel_char0 = 0;
-        const mrect = t.Rect{ .x = band.x + 2, .y = y0 - 4, .width = band.width - 8, .height = yy - y0 };
-        if (m.role == .user) t.panelBordered(mrect, t.withAlpha(t.cyan, 18), t.border);
-        _ = renderMsg(band, y0, m.role, m.textStr(), fsz, true, false, m.imgStr());
+        const mrect = t.Rect{ .x = view.x + 2, .y = y0 - 4, .width = view.width - 8, .height = yy - y0 };
+        _ = renderMsg(view, y0, m.role, m.textStr(), fsz, true, false, m.imgStr());
         // whole-message copy chip on hover (beside the role label)
         if (m.text_len > 0 and t.hovering(mrect) and t.hovering(view)) {
-            if (copyChip(band.x + band.width - 60, y0)) {
+            if (copyChip(view.x + view.width - 60, y0)) {
                 copyToClipboard(m.textStr());
                 markCopied();
             }
@@ -5777,10 +5763,10 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
             ui.live_len_prev = stream.len;
             ui.live_change_t = rl.getTime();
         }
-        yy = renderMsg(reading, yy, .veil, stream, fsz, true, true, "");
+        yy = renderMsg(view, yy, .veil, stream, fsz, true, true, "");
     }
-    if (cast_live) yy = renderCastLive(reading, yy, status, true);
-    const staged_starter = if (welcome) |w| w.draw(reading, store) else false;
+    if (cast_live) yy = renderCastLive(view, yy, status, true);
+    const staged_starter = if (welcome) |w| w.draw(view, store) else false;
     // TEXT SELECTION: drag over the message text to select; the highlight + cached copy text are computed from the
     // line geometry captured above. A plain click (no drag) clears the selection. Ctrl+C (handled in handleKeys)
     // copies sel_text. Gated on hovering the chat view + not on a tool/copy chip row.
@@ -5957,9 +5943,7 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
             ui.input_extra = std.math.clamp(ui.input_extra - rl.getMouseDelta().y, 0, input_extra_max);
         } else ui.input_dragging = false;
     }
-    var composer = chatReadingBand(r, 800);
-    composer.y = sy;
-    composer.height = input_h;
+    const composer = t.Rect{ .x = r.x, .y = sy, .width = r.width, .height = input_h };
     const input_focused = ui.focus == .c_input;
     t.panelBordered(.{ .x = composer.x, .y = composer.y + 2, .width = composer.width, .height = composer.height }, t.withAlpha(t.fg, 12), t.withAlpha(t.border, 0));
     t.panelBordered(composer, t.bg, if (input_focused) t.blue else t.border);
@@ -6058,15 +6042,11 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
         t.text(count, @intFromFloat(meta_right - count_w), meta_y, 11, color);
         meta_right -= count_w + 10;
     }
-    const model_x = composer.x + 13;
+    const model_x = composer.x + 14;
     const short = if (std.mem.lastIndexOfScalar(u8, model, '/')) |i| model[i + 1 ..] else model;
     const label = if (short.len > 0) short else "Drop or paste an image";
-    if (meta_right > model_x) {
+    if (meta_right > model_x)
         t.textClip(label, @intFromFloat(model_x), meta_y, 12, t.fg_dim, @intFromFloat(meta_right - model_x));
-        const label_width: f32 = @floatFromInt(t.measure(t.zs(label), 12));
-        if (model.len > 0 and (short.len != model.len or label_width > meta_right - model_x))
-            t.tip(.{ .x = model_x, .y = sendb.y, .width = meta_right - model_x, .height = button_h }, model);
-    }
 
     // ROLE PICKER anchor — BELOW the input, in the row reserved by role_h. Idle-only (not busy, not looping,
     // no status) so it never fires mid-turn. Clicking opens the list (flushChatRoleDropdown, drawn on top at
@@ -6076,7 +6056,7 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
     if (!busy and !loop_on and status.len == 0 and roles_mod.all().len > 0) {
         const rlbl = t.z("+ Give the veil a role", .{});
         const rw_lbl: f32 = @floatFromInt(t.measure(rlbl, 12));
-        const ra = t.Rect{ .x = r.x + 2, .y = role_y, .width = rw_lbl + 16, .height = role_h - 4 };
+        const ra = t.Rect{ .x = r.x + 8, .y = role_y, .width = rw_lbl + 16, .height = role_h - 4 };
         const open = ui.open_dd == .chat_role;
         const rhot = t.hovering(ra);
         // Raw rl input (like the `selector` widget), so the anchor toggles even while its own list holds the
@@ -6092,10 +6072,6 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
     } else if (ui.open_dd == .chat_role) {
         ui.open_dd = .none; // the row went busy/looping out from under an open list — drop it
     }
-    const keys: [:0]const u8 = if (server_steerable) "Enter to post  |  Shift+Enter for a new line" else "Enter to send  |  Shift+Enter for a new line";
-    const keys_w: f32 = @floatFromInt(t.measure(keys, 11));
-    if ((!running or server_steerable) and r.width > keys_w + 155)
-        t.text(keys, @intFromFloat(r.x + r.width - keys_w - 3), @intFromFloat(role_y + 3), 11, t.fg_dim);
     // (The Cloudflare login/profile used to share this row as a chip; it now lives as a card
     // pinned under the chats list — drawCfProfileCard — where it stays visible mid-turn too.)
 }

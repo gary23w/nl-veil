@@ -1,8 +1,9 @@
 /* Chat primitives used by both browser entry points. Their palettes come from
    the enclosing product theme (including user themes on the embedded app). */
 .workspace {
-  --workspace-measure: 780px;
-  --workspace-inset: max(clamp(14px, 2.2vw, 28px), calc((100% - var(--workspace-measure)) / 2));
+  --workspace-gutter: clamp(8px, 1.2vw, 16px);
+  --workspace-input-padding: 13px;
+  --workspace-inset: calc(var(--workspace-gutter) + var(--workspace-input-padding) + 1px);
   --workspace-radius: calc(var(--radius-btn) + 6px);
   --workspace-edge: color-mix(in srgb, var(--border) 76%, var(--fg-dim));
   --workspace-muted: color-mix(in srgb, var(--text-muted) 68%, var(--fg));
@@ -40,7 +41,7 @@
   flex: 0 0 auto;
   align-items: center;
   gap: 8px;
-  padding: 4px 14px;
+  padding: 4px var(--workspace-inset);
   border-bottom: 1px solid var(--border);
   color: var(--text);
   background: color-mix(in srgb, var(--surface-raised) 50%, var(--surface));
@@ -141,17 +142,6 @@
   margin: 0 0 23px;
   overflow-wrap: anywhere;
 }
-.workspace .workspace-message.user {
-  box-sizing: border-box;
-  width: fit-content;
-  min-width: min(110px, 100%);
-  max-width: min(90%, 620px);
-  margin-left: auto;
-  padding: 10px 14px;
-  border: 1px solid color-mix(in srgb, var(--role-user) 25%, var(--border));
-  border-radius: var(--workspace-radius) var(--workspace-radius) 4px var(--workspace-radius);
-  background: color-mix(in srgb, var(--role-user) 7%, var(--surface));
-}
 .workspace .workspace-role {
   display: flex;
   align-items: center;
@@ -173,7 +163,7 @@
 .workspace .workspace-composer {
   flex: 0 0 auto;
   position: relative;
-  padding: 7px var(--workspace-inset) max(10px, env(safe-area-inset-bottom));
+  padding: 7px var(--workspace-gutter) max(10px, env(safe-area-inset-bottom));
 }
 .workspace-panel {
   min-width: 0;
@@ -192,7 +182,7 @@
   width: 100%;
   min-height: 50px;
   max-height: min(180px, 30dvh);
-  padding: 12px 13px 6px;
+  padding: 12px var(--workspace-input-padding) 6px;
   border: 0;
   border-radius: var(--workspace-radius);
   background: transparent;
@@ -248,6 +238,7 @@ button.workspace-model:hover { color: var(--workspace-accent); }
   font-size: calc(11px * var(--text-scale, 1));
 }
 .workspace-meta > span { min-width: 0; overflow-wrap: anywhere; }
+.workspace-meta:not(:has(> :not(:empty))) { display: none; }
 .workspace-meta .over-limit { color: var(--danger); }
 
 .workspace-latest {
@@ -275,7 +266,6 @@ button.workspace-model:hover { color: var(--workspace-accent); }
   .workspace-controls :is(.btn, .icon-btn, .workspace-model), .workspace-latest { min-height: 44px; }
   .workspace-controls .icon-btn { min-width: 44px; }
   .workspace-controls select.workspace-model { font-size: 16px; }
-  .workspace-shortcut { display: none; }
 }
 @media (max-height: 700px) {
   .workspace .workspace-transcript { padding-block: 10px; }

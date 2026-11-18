@@ -1560,7 +1560,6 @@ function renderChat(host) {
             </div>
           </div>
           <div class="workspace-meta">
-            <span class="workspace-shortcut" id="chatShortcut">↵ Send · Shift + ↵ New line</span>
             <span id="turnStatus" role="status"></span>
             <span id="charCount"></span>
           </div>
@@ -2835,7 +2834,6 @@ function setTurnUi(live) {
   stop.classList.toggle('hide', !live);
   const input = el('input');
   input.placeholder = live ? 'Steer the running turn…' : 'Message the veil…';
-  el('chatShortcut').textContent = live ? '↵ Post · Shift + ↵ New line' : '↵ Send · Shift + ↵ New line';
   st.textContent = live ? (S.posting ? 'Sending…' : 'In progress') : '';
   updateCharCount();
 }
