@@ -209,6 +209,7 @@ const Ui = struct {
     tbl_hgrab: u64 = 0, // id of the chat table whose h-scrollbar thumb is being dragged (0 = none)
     msg_thumbs: [8]MsgThumb = .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, // path-keyed transcript-image texture cache (FIFO)
     pane_drag: PaneDrag = .none, // which side-panel divider is being dragged (drag-to-resize)
+    prefer_right_pane: bool = false, // last opened sidebar wins when both cannot fit
     right_tab: RightTab = .activity, // right pane: Swarm activity | Memory (durable keys/logins/prefs)
     mem_scroll: f32 = 0, // scroll offset for the Memory tab list
     conv_scroll: f32 = 0, // scroll offset for the Chats list (left pane)
@@ -2418,7 +2419,7 @@ fn drawRoster(store: *Store, r: t.Rect) void {
 
 const CHAT_LEFT_W: f32 = 230; // default left pane width (drag-to-resize; persisted in settings.chat_left_w)
 const CHAT_RIGHT_W: f32 = 320; // default right pane width (drag-to-resize; persisted in settings.chat_right_w)
-const CHAT_STRIP_W: f32 = 24;
+const CHAT_ARROW_W: f32 = 26;
 const CHAT_LEFT_MIN: f32 = 150;
 const CHAT_LEFT_MAX: f32 = 460;
 const CHAT_RIGHT_MIN: f32 = 210;
@@ -2546,13 +2547,17 @@ fn drawChat(store: *Store, body: t.Rect) void {
     var right_w_open: f32 = std.math.clamp(@as(f32, @floatFromInt(store.settings.chat_right_w)), CHAT_RIGHT_MIN, CHAT_RIGHT_MAX);
     store.unlock();
 
-    // Both open side panes can starve the center column on a narrow window. Collapse the panes to
-    // their strip state (a first-class supported layout), right pane first then left, until the center keeps
-    // a usable minimum. Derived from the live window width each frame, so widening the window restores them.
+    // Keep a usable center on narrow windows. When both panes are requested, give the last
+    // opened pane priority until they can fit side by side again.
     const min_center: f32 = 260;
-    const lwf: f32 = if (left_open) left_w_open else CHAT_STRIP_W; // left width before any collapse
-    if (lwf + (if (right_open) right_w_open else CHAT_STRIP_W) + pad * 4 + min_center > body.width) right_open = false;
-    if (lwf + (if (right_open) right_w_open else CHAT_STRIP_W) + pad * 4 + min_center > body.width) left_open = false;
+    const side_budget = @max(0, body.width - pad * 3 - min_center);
+    left_open = left_open and side_budget >= CHAT_LEFT_MIN;
+    right_open = right_open and side_budget >= CHAT_RIGHT_MIN;
+    if (left_open and right_open and left_w_open + right_w_open + pad > side_budget) {
+        if (ui.prefer_right_pane) left_open = false else right_open = false;
+    }
+    left_w_open = @min(left_w_open, side_budget);
+    right_w_open = @min(right_w_open, side_budget);
 
     const ph = body.height - pad * 2;
     const yv = body.y + pad;
@@ -2577,7 +2582,8 @@ fn drawChat(store: *Store, body: t.Rect) void {
             if (m_down) {
                 // Track the cursor AND commit to the store every frame: left_w below uses it this frame, and
                 // next frame re-seeds from the live width instead of snapping back to the pre-drag value.
-                left_w_open = std.math.clamp(mx - pad, CHAT_LEFT_MIN, CHAT_LEFT_MAX);
+                const limit = side_budget - (if (right_open) right_w_open + pad else 0);
+                left_w_open = std.math.clamp(mx - pad, CHAT_LEFT_MIN, @min(CHAT_LEFT_MAX, limit));
                 store.lock();
                 store.settings.chat_left_w = @intFromFloat(left_w_open);
                 store.unlock();
@@ -2595,7 +2601,8 @@ fn drawChat(store: *Store, body: t.Rect) void {
         if (hot and m_press) ui.pane_drag = .right;
         if (ui.pane_drag == .right) {
             if (m_down) {
-                right_w_open = std.math.clamp(body.width - pad - mx, CHAT_RIGHT_MIN, CHAT_RIGHT_MAX);
+                const limit = side_budget - (if (left_open) left_w_open + pad else 0);
+                right_w_open = std.math.clamp(body.width - pad - mx, CHAT_RIGHT_MIN, @min(CHAT_RIGHT_MAX, limit));
                 store.lock();
                 store.settings.chat_right_w = @intFromFloat(right_w_open);
                 store.unlock();
@@ -2606,8 +2613,8 @@ fn drawChat(store: *Store, body: t.Rect) void {
         }
     }
 
-    const left_w: f32 = if (left_open) left_w_open else CHAT_STRIP_W;
-    const right_w: f32 = if (right_open) right_w_open else CHAT_STRIP_W;
+    const left_w: f32 = if (left_open) left_w_open else 0;
+    const right_w: f32 = if (right_open) right_w_open else 0;
     const left = t.Rect{ .x = pad, .y = yv, .width = left_w, .height = ph };
     // The right column stacks the swarm-activity panel over a micro-console. The height is the USER'S, from
     // the horizontal grip between the two; it was a hardcoded min(280, 42%) before, which is why the shell was
@@ -2648,8 +2655,9 @@ fn drawChat(store: *Store, body: t.Rect) void {
     const con_gap: f32 = con_gapFor(con_h, pad);
     const right = t.Rect{ .x = body.width - pad - right_w, .y = yv, .width = right_w, .height = ph - con_h - con_gap };
     const console = t.Rect{ .x = right.x, .y = right.y + right.height + con_gap, .width = right_w, .height = con_h };
-    // Keep the minimum content inset even if the window is smaller than both side strips.
-    const center = t.Rect{ .x = left.x + left_w + pad, .y = yv, .width = @max(28, right.x - (left.x + left_w) - pad * 2), .height = ph };
+    const center_x = pad + (if (left_open) left_w + pad else 0);
+    const center_end = right.x - (if (right_open) pad else 0);
+    const center = t.Rect{ .x = center_x, .y = yv, .width = @max(28, center_end - center_x), .height = ph };
 
     // The in-flight reply, with any live reasoning prepended as a blockquote so thinking shows line-by-line.
     // Sized for the draft-mode worst case: quoted reasoning (4096 + "> " per line) + separator + "— drafting —"
@@ -2690,7 +2698,7 @@ fn drawChat(store: *Store, body: t.Rect) void {
     // dropdowns. flushChatRoleDropdown clears the block before drawing the list so its own rows stay clickable.
     t.setBlockClicks(ui.open_dd == .chat_role);
     defer t.setBlockClicks(false); // never let it leak into the next tab's frame
-    drawChatLeft(store, left, left_open, convs[0..conv_n], active[0..active_n], now_s);
+    if (left_open) drawChatLeft(store, left, convs[0..conv_n], active[0..active_n], now_s);
     // A task starting is worth a look: the first one to appear surfaces the Tasks tab, unless a live cast is
     // being watched in Activity. Never switched back by itself — the tab the user picks is theirs.
     if (task_n > 0 and ui.tasks_seen == 0 and ui.right_tab == .activity and !cast_live) ui.right_tab = .tasks;
@@ -2701,8 +2709,23 @@ fn drawChat(store: *Store, body: t.Rect) void {
         ui.run_task_len = @min(tasks[0].id_len, ui.run_task.len);
         @memcpy(ui.run_task[0..ui.run_task_len], tasks[0].id[0..ui.run_task_len]);
     }
-    drawChatCenter(store, center, msgs[0..msg_n], inflight, busy, status[0..status_n], cast_live, conv_title, convs[0..conv_n], active[0..active_n]);
-    drawChatRight(store, right, right_open, casts[0..cast_n], tail[0..tail_n], plan[0..plan_n], tasks[0..task_n]);
+    // A closed pane occupies only an arrow at the edge of the tab row.
+    const tab_h = @max(30, t.textH(13) + 12);
+    var tabs = t.Rect{ .x = center.x, .y = center.y, .width = center.width, .height = tab_h };
+    if (!left_open) {
+        const arrow = t.Rect{ .x = center.x, .y = center.y, .width = CHAT_ARROW_W, .height = tab_h };
+        if (t.chevron(arrow, true, "Show left panel")) setChatPaneOpen(store, true, true);
+        tabs.x += CHAT_ARROW_W;
+        tabs.width -= CHAT_ARROW_W;
+    }
+    if (!right_open) tabs.width -= CHAT_ARROW_W;
+    drawChatCenter(store, center, tabs, msgs[0..msg_n], inflight, busy, status[0..status_n], cast_live, conv_title, convs[0..conv_n], active[0..active_n]);
+    if (right_open) {
+        drawChatRight(store, right, casts[0..cast_n], tail[0..tail_n], plan[0..plan_n], tasks[0..task_n]);
+    } else {
+        const arrow = t.Rect{ .x = center_end - CHAT_ARROW_W, .y = center.y, .width = CHAT_ARROW_W, .height = tab_h };
+        if (t.chevron(arrow, false, "Show right panel")) setChatPaneOpen(store, false, true);
+    }
     if (con_h > 0) drawMicroConsole(store, console, con_ai, con_buf[0..con_n], con_busy, con_cwd_buf[0..con_cwd_n]);
     // resize grips over the pane inner edges — drawn last so the pane fills don't overpaint them
     if (left_open) drawPaneGrip(pad + left_w, yv, ph, l_active);
@@ -3179,10 +3202,11 @@ fn buildInflight(buf: []u8, reasoning: []const u8, content: []const u8, draft: b
     return buf[0..w];
 }
 
-fn togglePane(store: *Store, left: bool) void {
+fn setChatPaneOpen(store: *Store, left: bool, open: bool) void {
     store.lock();
-    if (left) store.settings.chat_left_open = !store.settings.chat_left_open else store.settings.chat_right_open = !store.settings.chat_right_open;
+    if (left) store.settings.chat_left_open = open else store.settings.chat_right_open = open;
     store.unlock();
+    if (open) ui.prefer_right_pane = !left;
     store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", "")); // persist the pane state
 }
 
@@ -3617,21 +3641,19 @@ fn drawCfProfileCard(store: *Store, r: t.Rect, now_s: i64) f32 {
     return foot_h;
 }
 
-fn drawChatLeft(store: *Store, r: t.Rect, open: bool, convs: []const store_mod.ConvRow, active: []const u8, now_s: i64) void {
+fn drawChatLeft(store: *Store, r: t.Rect, convs: []const store_mod.ConvRow, active: []const u8, now_s: i64) void {
     t.panelBordered(r, t.bg_dark, t.border);
-    if (!open) {
-        if (t.buttonGhost(.{ .x = r.x + 2, .y = r.y + 5, .width = r.width - 4, .height = 24 }, t.z(">", .{}), t.blue, true)) togglePane(store, true);
-        return;
-    }
     // INNER TABS: Chats | Tasks — the tasks live beside the conversations they mint, so a task's runs
     // are one click away from the chats they produced (the Tasks TOP tab remains the full manager).
     const tl_chats = t.z("Chats", .{});
     const tl_sched = t.z("Tasks", .{});
+    var widths = [_]f32{ t.tabW(tl_chats), t.tabW(tl_sched) };
+    t.fitTabs(&widths, 6, r.width - t.PAD_IN - 36);
     var tx: f32 = r.x + t.PAD_IN;
-    if (t.tab(.{ .x = tx, .y = r.y + 6, .width = t.tabW(tl_chats), .height = 26 }, tl_chats, ui.chats_inner == .chats)) ui.chats_inner = .chats;
-    tx += t.tabW(tl_chats) + 6;
-    if (t.tab(.{ .x = tx, .y = r.y + 6, .width = t.tabW(tl_sched), .height = 26 }, tl_sched, ui.chats_inner == .sched)) ui.chats_inner = .sched;
-    if (t.buttonGhost(.{ .x = r.x + r.width - 32, .y = r.y + 7, .width = 26, .height = 24 }, t.z("<", .{}), t.blue, true)) togglePane(store, true);
+    if (t.tab(.{ .x = tx, .y = r.y + 6, .width = widths[0], .height = 26 }, tl_chats, ui.chats_inner == .chats)) ui.chats_inner = .chats;
+    tx += widths[0] + 6;
+    if (t.tab(.{ .x = tx, .y = r.y + 6, .width = widths[1], .height = 26 }, tl_sched, ui.chats_inner == .sched)) ui.chats_inner = .sched;
+    if (t.chevron(.{ .x = r.x + r.width - 32, .y = r.y + 7, .width = CHAT_ARROW_W, .height = 24 }, false, "Hide left panel")) setChatPaneOpen(store, true, false);
     // The profile card claims the pane's bottom edge first (on BOTH inner tabs — it is a pane
     // fixture, not a list row); everything below lays out inside what is left.
     const foot_h = drawCfProfileCard(store, r, now_s);
@@ -5290,7 +5312,7 @@ const ChatWelcome = struct {
             .heading_size = fs,
             .heading_wrap = heading_wrap,
             .stacked = stacked,
-            .emblem_h = if (compact) 36 else 58,
+            .emblem_h = if (compact) 30 else 42,
             .lead_gap = if (compact) 8 else 18,
             .cards_gap = if (compact) 10 else 22,
             .card_h = card_h,
@@ -5316,9 +5338,7 @@ const ChatWelcome = struct {
     fn draw(w: ChatWelcome, view: t.Rect, store: *Store) bool {
         const cx = view.x + view.width / 2;
         var y = view.y + w.offset(view) - ui.chat_scroll;
-        const tile = t.Rect{ .x = cx - w.emblem_h / 2, .y = y, .width = w.emblem_h, .height = w.emblem_h };
-        t.panelBordered(tile, t.bg_hl, t.border);
-        t.drawMark(cx, y + w.emblem_h / 2, w.emblem_h * 0.45, false);
+        t.drawMark(cx, y + w.emblem_h / 2, w.emblem_h * 0.62, false);
         y += w.emblem_h + w.lead_gap;
         if (w.heading_wrap) {
             centerText("What would you", view, y, w.heading_size, t.fg);
@@ -5375,7 +5395,7 @@ const ChatWelcome = struct {
     }
 };
 
-fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, stream: []const u8, busy: bool, status: []const u8, cast_live: bool, conv_title: []const u8, convs: []const store_mod.ConvRow, active: []const u8) void {
+fn drawChatCenter(store: *Store, r: t.Rect, tabs: t.Rect, msgs: []const store_mod.ChatMsg, stream: []const u8, busy: bool, status: []const u8, cast_live: bool, conv_title: []const u8, convs: []const store_mod.ConvRow, active: []const u8) void {
     // Only the text area grows under the resize grip; the toolbar keeps its height.
     const input_min: f32 = 96;
     const input_extra_max = @max(0, r.height * 0.5 - input_min);
@@ -5388,16 +5408,17 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
     // A slim row reserved BELOW the input for the role picker. Always reserved (not gated on the picker being
     // visible) so the transcript height doesn't jump as busy/idle toggles; the anchor itself is idle-only.
     const role_h: f32 = @max(26, t.textH(12) + 10);
-    const tab_h: f32 = @max(30, t.textH(13) + 12);
+    const tab_h = tabs.height;
+    const tab_right = tabs.x + tabs.width;
     // Chat | Metrics | Files inner tabs (Metrics = per-turn perf graphs; Files = this chat's own build dir)
     const tl_chat = t.z("Chat", .{});
     const tl_metrics = t.z("Metrics", .{});
     const tl_files = t.z("Files", .{});
     const task_label = "Make a task";
-    const task_width = if (msgs.len > 0 and r.width >= 265) t.btnW(task_label, 24) else 0;
+    const task_width = if (msgs.len > 0 and tabs.width >= 265) t.btnW(task_label, 24) else 0;
     var widths = [_]f32{ t.tabW(tl_chat), t.tabW(tl_metrics), t.tabW(tl_files) };
-    t.fitTabs(&widths, 6, r.width - task_width - 10);
-    var tx = r.x;
+    t.fitTabs(&widths, 6, tabs.width - task_width - 10);
+    var tx = tabs.x;
     if (t.tab(.{ .x = tx, .y = r.y, .width = widths[0], .height = tab_h }, tl_chat, ui.chat_inner == .chat)) ui.chat_inner = .chat;
     tx += widths[0] + 6;
     if (t.tab(.{ .x = tx, .y = r.y, .width = widths[1], .height = tab_h }, tl_metrics, ui.chat_inner == .metrics)) ui.chat_inner = .metrics;
@@ -5462,33 +5483,37 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
         family_tabs[0] = t.tabW("Main");
         const family_w = (if (have_n > 0) family_tabs[0] + 4 + @as(f32, @floatFromInt(have_n)) * (family_tabs[1] + 4) + delete_w else 0) + plus_w;
         var family_y = r.y;
-        if (family_w > 0 and tx + family_w > r.x + r.width - task_width - 8) {
+        var family_right = tab_right - task_width - 8;
+        if (family_w > 0 and tx + family_w > family_right) {
             // Use a second row when the family and the task action need the same space.
             tx = r.x;
             family_y = tab_end;
+            family_right = r.x + r.width;
             tab_end += tab_h + 3;
         }
         if (have_n > 0) {
-            const limit = r.x + r.width - tx - plus_w - delete_w - 4;
+            const limit = family_right - tx - plus_w - delete_w - 4;
             t.fitTabs(family_tabs[0 .. have_n + 1], 4, limit);
             const tl_main = t.z("Main", .{});
             const main_r = t.Rect{ .x = tx, .y = family_y, .width = family_tabs[0], .height = tab_h };
             if (t.tab(main_r, tl_main, on_primary) and !on_primary)
                 store.pushChatCmd(store_mod.mkChatCmd(.select_conv, primary, ""));
             famMark(main_r, famFind(fam[0..fam_n], primary), "Main", fam_log[0..fam_log_n]);
-            tx += t.tabW(tl_main) + 4;
+            tx += family_tabs[0] + 4;
             var bi: u8 = 0;
+            var ti: usize = 1;
             while (bi < store_mod.MAX_BRANCHES) : (bi += 1) {
                 if (!have[bi]) continue;
                 var idb: [72]u8 = undefined;
                 const bid = std.fmt.bufPrint(&idb, "{s}__s{d}", .{ primary, bi + 1 }) catch continue;
                 const is_on = std.mem.eql(u8, active, bid);
                 const lbl = t.z("s{d}", .{bi + 1});
-                const tab_r = t.Rect{ .x = tx, .y = family_y, .width = family_tabs[1], .height = tab_h };
+                const tab_r = t.Rect{ .x = tx, .y = family_y, .width = family_tabs[ti], .height = tab_h };
                 if (t.tab(tab_r, lbl, is_on) and !is_on)
                     store.pushChatCmd(store_mod.mkChatCmd(.select_conv, bid, ""));
                 famMark(tab_r, famFind(fam[0..fam_n], bid), lbl, fam_log[0..fam_log_n]);
-                tx += t.tabW(lbl) + 4;
+                tx += family_tabs[ti] + 4;
+                ti += 1;
                 // the ACTIVE sub-chat carries its delete — sub-chats have no rail row (delete lived there),
                 // so the tab is the one place the affordance can exist. Lands back on Main (cmdDeleteConv).
                 if (is_on) {
@@ -5508,7 +5533,7 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
     // right-aligned in the same tab row: seed a task from THIS conversation (its first user ask becomes
     // the prompt, the latest answer the key details). Pure UI-thread prefill — no commands fired.
     if (task_width > 0) {
-        const sb = t.Rect{ .x = r.x + r.width - task_width - 2, .y = r.y + 2, .width = task_width, .height = 24 };
+        const sb = t.Rect{ .x = tab_right - task_width - 2, .y = r.y + 2, .width = task_width, .height = 24 };
         if (t.buttonGhost(sb, task_label, t.blue, true)) {
             schedResetForm(); // a CREATE seed must never inherit a half-open edit's id/provider fields
             setField(&ui.sc_name, if (conv_title.len > 0) conv_title else "chat task");
@@ -6517,19 +6542,11 @@ fn drawChatTasks(store: *Store, r: t.Rect, tasks: []const store_mod.TaskRow) voi
     }
 }
 
-fn drawChatRight(store: *Store, r: t.Rect, open: bool, casts: []const store_mod.CastRow, tail: []const scan.Ev, plan: []const store_mod.PlanRow, tasks: []const store_mod.TaskRow) void {
+fn drawChatRight(store: *Store, r: t.Rect, casts: []const store_mod.CastRow, tail: []const scan.Ev, plan: []const store_mod.PlanRow, tasks: []const store_mod.TaskRow) void {
     t.panelBordered(r, t.bg_dark, t.border);
-    if (!open) {
-        // collapsed rail: a status dot when a cast is live so the user knows to expand it
-        const live = casts.len > 0 and (casts[casts.len - 1].status == .deploying or casts[casts.len - 1].status == .running or casts[casts.len - 1].status == .collecting);
-        if (live) t.statusDot(@intFromFloat(r.x + r.width / 2), @intFromFloat(r.y + 40), t.green);
-        if (tasks.len > 0) t.statusDot(@intFromFloat(r.x + r.width / 2), @intFromFloat(r.y + 58), t.cyan); // ...and when a task runs
-        if (t.buttonGhost(.{ .x = r.x + 2, .y = r.y + 5, .width = r.width - 4, .height = 24 }, t.z("<", .{}), t.blue, true)) togglePane(store, false);
-        return;
-    }
     // collapse chevron + the "Activity | Tasks | Memory" tab strip (Tasks = programs running on this machine for a
     // turn; Memory = durable keys/logins/prefs the AI keeps)
-    if (t.buttonGhost(.{ .x = r.x + r.width - 32, .y = r.y + 7, .width = 26, .height = 24 }, t.z(">", .{}), t.blue, true)) togglePane(store, false);
+    if (t.chevron(.{ .x = r.x + r.width - 32, .y = r.y + 7, .width = CHAT_ARROW_W, .height = 24 }, true, "Hide right panel")) setChatPaneOpen(store, false, false);
     const tl_act = t.z("Activity", .{});
     const tl_tasks = if (tasks.len > 0) t.z("Tasks ({d})", .{tasks.len}) else t.z("Tasks", .{});
     const tl_mem = t.z("Memory", .{});

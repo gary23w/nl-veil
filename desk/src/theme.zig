@@ -1041,6 +1041,20 @@ pub fn buttonGhost(r: Rect, label: [:0]const u8, accent: Color, enabled: bool) b
     return buttonEx(r, label, accent, enabled, .ghost);
 }
 
+pub fn chevron(r: Rect, points_right: bool, label: []const u8) bool {
+    const hot = mouse.over(r) and !clicks_blocked;
+    if (hot) wantCursor(.pointing_hand);
+    const color = if (hot) blue else fg_dim;
+    const x = r.x + r.width / 2;
+    const y = r.y + r.height / 2;
+    const dx: f32 = if (points_right) 2.5 else -2.5;
+    const tip_point = rl.Vector2{ .x = x + dx, .y = y };
+    rl.drawLineEx(.{ .x = x - dx, .y = y - 4 }, tip_point, 1.5, color);
+    rl.drawLineEx(tip_point, .{ .x = x - dx, .y = y + 4 }, 1.5, color);
+    const activated = kbRegister(r, label, "button");
+    return !clicks_blocked and (activated or (hot and rl.isMouseButtonPressed(.left)));
+}
+
 /// The width a tab label wants (tabs render at 13px).
 pub fn chatStarter(r: Rect, label: [:0]const u8, description: []const u8) bool {
     const hot = mouse.over(r);
