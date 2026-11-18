@@ -102,7 +102,6 @@ button:disabled, .btn[aria-disabled=true] { opacity: .5; cursor: default; pointe
 .chat-list-row .chat-list-button.on {
   background: var(--tonal);
   border-color: color-mix(in srgb, var(--accent) 22%, var(--border));
-  box-shadow: inset 2px 0 var(--accent);
   font-weight: 700;
 }
 .chat-delete {
@@ -277,7 +276,6 @@ dialog.ask::backdrop { background: rgb(0 0 0 / .4); }
 .crumbs .sep { margin: 0 5px; } .crumbs .here { color: var(--text); }
 .seg { display: inline-flex; border: 1px solid var(--border); border-radius: var(--radius-btn); overflow: hidden; flex: 0 0 auto; }
 .seg button { border: 0; background: transparent; color: var(--text-secondary); padding: 2px 9px; font-size: var(--fs-small); }
-.seg button + button { border-left: 1px solid var(--border); }
 .seg button:hover { background: var(--surface-hover); color: var(--text); }
 .seg button.on { background: var(--tonal); color: var(--accent); font-weight: 600; }
 .ide-body { flex: 1; min-height: 0; display: flex; min-width: 0; }

@@ -359,7 +359,6 @@ main > section:last-child { padding-bottom: var(--section-gap); }
   padding: 9px 11px;
   background: var(--surface);
   border: 1px solid var(--border);
-  border-left: 3px solid var(--kind, var(--accent));
   border-radius: var(--radius);
   box-shadow: 0 6px 18px -12px color-mix(in srgb, var(--fg) 55%, transparent);
   transition: box-shadow .15s ease, border-color .15s ease, opacity .15s ease, transform .12s ease;

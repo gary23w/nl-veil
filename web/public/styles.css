@@ -544,7 +544,6 @@ table.data td.num { text-align: right; font-variant-numeric: tabular-nums; }
 .conv-row.active {
   background: var(--tonal);
   border-color: color-mix(in srgb, var(--accent) 22%, var(--border));
-  box-shadow: inset 2px 0 var(--accent);
 }
 .conv-title { font-size: calc(var(--fs-ui) * var(--text-scale)); }
 .conv-row.active .conv-title { font-weight: 700; }
@@ -564,7 +563,7 @@ table.data td.num { text-align: right; font-variant-numeric: tabular-nums; }
 .conv-sub-toggle:hover { background: var(--surface-hover); color: var(--text); }
 .conv-sub-toggle svg { width: 11px; height: 11px; fill: none; stroke: currentColor; stroke-width: 2.4; transition: transform .12s ease; }
 .conv-sub-toggle.open svg { transform: rotate(90deg); }
-.conv-subs { margin-left: 16px; border-left: 2px solid var(--border); }
+.conv-subs { margin-left: 16px; }
 .conv-row.conv-sub { padding: 7px 10px; }
 .conv-row.conv-sub .conv-title { font-size: calc(var(--fs-micro) * var(--text-scale) * 1.15); }
 .conv-sub-add { color: var(--text-muted); font-size: calc(var(--fs-micro) * var(--text-scale)); }
@@ -688,8 +687,8 @@ table.data td.num { text-align: right; font-variant-numeric: tabular-nums; }
    follow along with no theme-specific rule. */
 .msg-body .think {
   margin: 0 0 12px;
-  border-left: 2px solid color-mix(in srgb, var(--role-thought) 60%, transparent);
-  border-radius: 0 var(--radius) var(--radius) 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
   background: var(--code-bg);
 }
 .msg-body .think > summary {
