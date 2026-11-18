@@ -368,8 +368,8 @@
         <h3>Does it need an API key or an account?</h3>
         <p>Not for local models. The built-in model, <a href="https://huggingface.co/gary23w/the-veil-12b" target="_blank" rel="noopener">the-veil-12b</a>,
           is served by the app itself, and Ollama runs on your own machine; neither needs a provider account or an API key.
-          The model weights are a separate download: click <em>download the model</em> in the app, or run
-          <code>veil model pull</code>. A hosted provider you connect has its own account, key and costs.</p>
+          The model weights are a separate download: open <strong>Settings &rarr; Models</strong> and select
+          <strong>Download the-veil-12b (~7 GB)</strong>, or run <code>veil model pull</code>. A hosted provider you connect has its own account, key and costs.</p>
       </article>
       <article class="note-card">
         <h3>Which models does it run?</h3>
@@ -380,7 +380,9 @@
       </article>
       <article class="note-card">
         <h3>What does my machine need?</h3>
-        <p>The bundle for your platform: Windows x86-64, macOS on Apple Silicon or Intel, or Linux x86-64. The coding tools
+        <p>The <a href="#get">download</a> for your platform: Windows x86-64 (the Store package needs Windows 10
+          version 2004 or later), macOS 13 or later on Apple silicon or Intel, or Linux x86-64 with glibc 2.39 or
+          later. The coding tools
           need Python on <code>PATH</code>, and some JavaScript checks use Node.js; if Python is missing, the agent can
           install it itself. The built-in engine uses your GPU through Vulkan when there is one and falls back to the CPU;
           macOS builds run it on the CPU. Hardware needs depend on the model you choose.</p>
