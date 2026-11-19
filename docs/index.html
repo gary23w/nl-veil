@@ -49,7 +49,7 @@
 <meta name="theme-color" content="#16161e" media="(prefers-color-scheme: dark)">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M16 1c1.6 8.2 6.8 13.4 15 15-8.2 1.6-13.4 6.8-15 15-1.6-8.2-6.8-13.4-15-15C9.2 14.4 14.4 9.2 16 1z' fill='%238a3ffc'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="css/theme.css">
-<link rel="stylesheet" href="css/site.css?v=1.1.37">
+<link rel="stylesheet" href="css/site.css?v=1.1.38">
 <script>
   /* Resolve the theme before first paint so there is no flash of the wrong
      scheme. An explicit choice wins; otherwise follow the OS — the same rule
@@ -166,7 +166,7 @@
 </section>
 
 <!-- ============ download ============ -->
-<section id="get" aria-labelledby="install-title" tabindex="-1" data-release="v1.1.37">
+<section id="get" aria-labelledby="install-title" tabindex="-1" data-release="v1.1.38">
   <div class="wrap">
     <div class="section-head">
       <h2 id="install-title">Install the Veil</h2>
@@ -182,27 +182,27 @@
         <h3>Windows</h3>
         <p>64-bit Intel or AMD</p>
         <a class="btn btn-solid" href="https://apps.microsoft.com/detail/9MVQ78SK0CW6">Microsoft Store</a>
-        <a class="btn" data-release-asset="veil-{tag}-windows-x86_64.zip" href="https://github.com/gary23w/nl-veil/releases/download/v1.1.37/veil-v1.1.37-windows-x86_64.zip">Download Windows ZIP</a>
+        <a class="btn" data-release-asset="veil-{tag}-windows-x86_64.zip" href="https://github.com/gary23w/nl-veil/releases/download/v1.1.38/veil-v1.1.38-windows-x86_64.zip">Download Windows ZIP</a>
       </article>
       <article class="dl-card" data-platform="macos">
         <h3>Mac <span>Apple silicon</span></h3>
         <p>macOS 13 or later</p>
-        <a class="btn btn-solid" data-release-asset="veil-{tag}-macos-arm64.zip" href="https://github.com/gary23w/nl-veil/releases/download/v1.1.37/veil-v1.1.37-macos-arm64.zip">Download for Apple silicon</a>
+        <a class="btn btn-solid" data-release-asset="veil-{tag}-macos-arm64.zip" href="https://github.com/gary23w/nl-veil/releases/download/v1.1.38/veil-v1.1.38-macos-arm64.zip">Download for Apple silicon</a>
       </article>
       <article class="dl-card" data-platform="macos">
         <h3>Mac <span>Intel</span></h3>
         <p>macOS 13 or later</p>
-        <a class="btn btn-solid" data-release-asset="veil-{tag}-macos-x86_64.zip" href="https://github.com/gary23w/nl-veil/releases/download/v1.1.37/veil-v1.1.37-macos-x86_64.zip">Download for Intel Mac</a>
+        <a class="btn btn-solid" data-release-asset="veil-{tag}-macos-x86_64.zip" href="https://github.com/gary23w/nl-veil/releases/download/v1.1.38/veil-v1.1.38-macos-x86_64.zip">Download for Intel Mac</a>
       </article>
       <article class="dl-card" data-platform="linux">
         <h3>Linux</h3>
         <p>x86-64 &middot; glibc 2.39 or later</p>
-        <a class="btn btn-solid" data-release-asset="veil-{tag}-linux-x86_64.zip" href="https://github.com/gary23w/nl-veil/releases/download/v1.1.37/veil-v1.1.37-linux-x86_64.zip">Download Linux ZIP</a>
+        <a class="btn btn-solid" data-release-asset="veil-{tag}-linux-x86_64.zip" href="https://github.com/gary23w/nl-veil/releases/download/v1.1.38/veil-v1.1.38-linux-x86_64.zip">Download Linux ZIP</a>
       </article>
     </div>
     <div class="install-links">
       <p>On a Mac, open <strong>Apple menu &rarr; About This Mac</strong>. Choose Apple silicon if you see <strong>Chip</strong>, or Intel if you see <strong>Processor</strong>.</p>
-      <p><a data-release-notes href="https://github.com/gary23w/nl-veil/releases/tag/v1.1.37">v1.1.37 release notes</a> &middot; <a href="https://github.com/gary23w/nl-veil/releases">All releases</a></p>
+      <p><a data-release-notes href="https://github.com/gary23w/nl-veil/releases/tag/v1.1.38">v1.1.38 release notes</a> &middot; <a href="https://github.com/gary23w/nl-veil/releases">All releases</a></p>
     </div>
 
     <div class="install-next">
@@ -236,9 +236,9 @@
         <summary>Verify a ZIP download</summary>
         <p>Compute the SHA-256 of the downloaded ZIP, then compare it with the line for that filename in its checksum file.</p>
         <ul>
-          <li>Windows PowerShell <code>Get-FileHash -Algorithm SHA256 .\filename.zip</code> &middot; <a data-release-asset="SHA256SUMS-windows-x86_64.txt" href="https://github.com/gary23w/nl-veil/releases/download/v1.1.37/SHA256SUMS-windows-x86_64.txt">Windows checksum</a></li>
-          <li>macOS Terminal <code>shasum -a 256 filename.zip</code> &middot; <a data-release-asset="SHA256SUMS-macos-arm64.txt" href="https://github.com/gary23w/nl-veil/releases/download/v1.1.37/SHA256SUMS-macos-arm64.txt">Apple silicon checksum</a> or <a data-release-asset="SHA256SUMS-macos-x86_64.txt" href="https://github.com/gary23w/nl-veil/releases/download/v1.1.37/SHA256SUMS-macos-x86_64.txt">Intel Mac checksum</a></li>
-          <li>Linux terminal <code>sha256sum filename.zip</code> &middot; <a data-release-asset="SHA256SUMS-linux-x86_64-glibc239.txt" href="https://github.com/gary23w/nl-veil/releases/download/v1.1.37/SHA256SUMS-linux-x86_64-glibc239.txt">Linux checksum</a></li>
+          <li>Windows PowerShell <code>Get-FileHash -Algorithm SHA256 .\filename.zip</code> &middot; <a data-release-asset="SHA256SUMS-windows-x86_64.txt" href="https://github.com/gary23w/nl-veil/releases/download/v1.1.38/SHA256SUMS-windows-x86_64.txt">Windows checksum</a></li>
+          <li>macOS Terminal <code>shasum -a 256 filename.zip</code> &middot; <a data-release-asset="SHA256SUMS-macos-arm64.txt" href="https://github.com/gary23w/nl-veil/releases/download/v1.1.38/SHA256SUMS-macos-arm64.txt">Apple silicon checksum</a> or <a data-release-asset="SHA256SUMS-macos-x86_64.txt" href="https://github.com/gary23w/nl-veil/releases/download/v1.1.38/SHA256SUMS-macos-x86_64.txt">Intel Mac checksum</a></li>
+          <li>Linux terminal <code>sha256sum filename.zip</code> &middot; <a data-release-asset="SHA256SUMS-linux-x86_64-glibc239.txt" href="https://github.com/gary23w/nl-veil/releases/download/v1.1.38/SHA256SUMS-linux-x86_64-glibc239.txt">Linux checksum</a></li>
         </ul>
       </details>
       <details>
