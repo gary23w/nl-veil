@@ -3871,7 +3871,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
         break :blk_vp verify_buf.items;
     };
 
-    // ---- THE FAMILY IN THE NET (NL_FAMILY_NET, default OFF): the other members of this conversation's family, each
+    // ---- THE FAMILY IN THE NET (NL_FAMILY_NET, default ON): the other members of this conversation's family, each
     // one's 4tope built from its own store alone (family.Pool), ride in every request's net as one capped, labelled
     // section (store.zig assemble). Read once here, again at most every family.REFRESH_MS. Off, or with no net, the store
     // has no hook and every request is the one it has always been. ----
@@ -10479,7 +10479,7 @@ fn spawnFamilyTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, text:
 /// TEST ONLY: where a family wake's turn goes instead of a thread and a model, so a test can see the wake itself.
 var test_family_spawn: ?*const fn (conv: []const u8, text: []const u8) void = null;
 
-// ---- THE FAMILY'S MESSAGING (NL_FAMILY_MSG, default OFF) -------------------------------------------------------------
+// ---- THE FAMILY'S MESSAGING (NL_FAMILY_MSG, default ON) -------------------------------------------------------------
 // The primary model can steer a sub-chat or ask it a question (message_subchat); a sub-chat can hand a result or an
 // answer back (report_to_primary); and when a sub-chat's turn ends the ENGINE writes its status and final answer
 // (familyAfterTurn), so the primary gets every branch's answer whether or not a model remembered to send it. Each is a
@@ -10963,7 +10963,7 @@ test "NL_FAMILY_MSG: a running sub-chat is steered, an idle one woken for one tu
     }
     try std.testing.expect(familyDoneTake(io, "fm1__s2") == null); // every hand-off taken
     // the flag off: every one of these names falls through as an unknown name does, and a turn's end writes nothing
-    _ = env.swapRemove("NL_FAMILY_MSG");
+    try env.put("NL_FAMILY_MSG", "0"); // SET off: unset is on (family.flagDefaultOn)
     try std.testing.expect(orchTool(app, 1, &ctx, "fm1", pdir, 0, trio, "message_subchat", "{\"sub\":\"s1\",\"text\":\"x\"}", false) == null);
     try std.testing.expect(orchTool(app, 1, &ctx, "fm1__s1", s1, 0, trio, "report_to_primary", "{\"text\":\"x\"}", false) == null);
     try std.testing.expect(orchTool(app, 1, &ctx, "fm1", pdir, 0, trio, "absorb", "{\"path\":\"a.txt\",\"scope\":\"family:fm1\"}", false) == null);
@@ -10998,7 +10998,10 @@ test "NL_FAMILY_MSG: a running sub-chat is steered, an idle one woken for one tu
     var penv = std.process.Environ.Map.init(gpa);
     defer penv.deinit();
     const woken_q = "[family message #4 from the primary chat; it asks you this, answer it with report_to_primary and re 4] What does the build step do?";
+    try penv.put("NL_FAMILY_MSG", "0"); // SET off: unset is on (family.flagDefaultOn)
     try std.testing.expect(planGate(&penv, woken_q)); // the frame alone used to read as a task with "build "
+    _ = penv.swapRemove("NL_FAMILY_MSG");
+    try std.testing.expect(!planGate(&penv, woken_q)); // the default: the ledger is on, the message is a question
     try penv.put("NL_FAMILY_MSG", "1");
     try std.testing.expect(!planGate(&penv, woken_q)); // with the ledger on, the message is a question: no plan
     // the engine's own plan rows, as family.zig passes them over in a member's answer
@@ -11049,7 +11052,7 @@ test "a sub-chat turn hands its done record the answer it settled on and whether
     }
     // a primary's turn, and any turn with the flag off: nothing handed on
     for ([_]bool{ true, false }) |flag| {
-        if (!flag) _ = env.swapRemove("NL_FAMILY_MSG");
+        if (!flag) try env.put("NL_FAMILY_MSG", "0"); // SET off: unset is on (family.flagDefaultOn)
         const conv: []const u8 = if (flag) "ft1" else "ft1__s1";
         var t: FamilyTurn = .{};
         t.begin(app, conv, s1);

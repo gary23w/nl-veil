@@ -76,8 +76,17 @@ pub fn netMode(value: ?[]const u8) NetMode {
     return if (flagOn(v)) .on else .off;
 }
 
-/// Every family flag, read from one environment. Each is default OFF and gates only its own piece, so the decision a
-/// turn makes from a flag is this struct's field and can be tested with the flag unset.
+/// A family flag's value in an environment that exists: ON when the variable is unset (the default since
+/// 2026-11-19), otherwise what flagOn reads from it, so "0", "off" or an empty value still switches the piece off.
+pub fn flagDefaultOn(value: ?[]const u8) bool {
+    const v = value orelse return true;
+    return flagOn(v);
+}
+
+/// Every family flag, read from one environment. Each gates only its own piece, so the decision a turn makes from a
+/// flag is this struct's field and can be tested without an environment. DEFAULT ON since 2026-11-19: unset, every
+/// piece is on (NL_FAMILY_NET as `on`), and a variable set to an off value ("0", "off", "") switches its piece off.
+/// With no environment at all (read(null), and this struct's own defaults) every piece is off.
 pub const Flags = struct {
     /// NL_FAMILY_VIEW: GET /api/v1/chat/convs/:id/family answers (and the desk polls it)
     view: bool = false,
@@ -91,10 +100,10 @@ pub const Flags = struct {
     pub fn read(env: ?*const std.process.Environ.Map) Flags {
         const e = env orelse return .{};
         return .{
-            .view = flagOn(e.get("NL_FAMILY_VIEW")),
-            .status = flagOn(e.get("NL_FAMILY_STATUS")),
-            .net = netMode(e.get("NL_FAMILY_NET")),
-            .msg = flagOn(e.get("NL_FAMILY_MSG")),
+            .view = flagDefaultOn(e.get("NL_FAMILY_VIEW")),
+            .status = flagDefaultOn(e.get("NL_FAMILY_STATUS")),
+            .net = if (e.get("NL_FAMILY_NET")) |v| netMode(v) else .on,
+            .msg = flagDefaultOn(e.get("NL_FAMILY_MSG")),
         };
     }
 };
@@ -1182,19 +1191,25 @@ test "an opt-in flag is off unless set to something that does not start with 0 a
     for ([_][]const u8{ "1", "on", "yes", "true", "2", "false" }) |v| try tt.expect(flagOn(v));
 }
 
-test "every family flag is off with nothing set, each reads only its own variable, and NL_FAMILY_NET has three states" {
+test "every family flag is on with nothing set and off with no environment, each reads only its own variable, and NL_FAMILY_NET has three states" {
     const gpa = tt.allocator;
-    try tt.expectEqual(Flags{}, Flags.read(null));
+    try tt.expectEqual(Flags{}, Flags.read(null)); // no environment at all: every piece off
     var env = std.process.Environ.Map.init(gpa);
     defer env.deinit();
+    const all_on = Flags{ .view = true, .status = true, .net = .on, .msg = true };
+    try tt.expectEqual(all_on, Flags.read(&env)); // an environment with nothing set: the default, every piece on
+    try env.put("NL_FAMILY_STATUS", "0"); // one variable switches off its own piece and no other
+    try tt.expectEqual(Flags{ .view = true, .net = .on, .msg = true }, Flags.read(&env));
+    try env.put("NL_FAMILY_VIEW", "off");
+    try env.put("NL_FAMILY_MSG", "");
+    try env.put("NL_FAMILY_NET", "0");
     try tt.expectEqual(Flags{}, Flags.read(&env));
-    try env.put("NL_FAMILY_STATUS", "1");
-    try tt.expectEqual(Flags{ .status = true }, Flags.read(&env));
-    try env.put("NL_FAMILY_STATUS", "0");
     try env.put("NL_FAMILY_VIEW", "on");
     try env.put("NL_FAMILY_MSG", "yes");
     try env.put("NL_FAMILY_NET", "Results");
     try tt.expectEqual(Flags{ .view = true, .msg = true, .net = .results }, Flags.read(&env));
+    try tt.expect(flagDefaultOn(null));
+    for ([_][]const u8{ "", "0", "off" }) |v| try tt.expect(!flagDefaultOn(v));
     try tt.expectEqual(NetMode.off, netMode(null));
     for ([_][]const u8{ "", "0", "off" }) |v| try tt.expectEqual(NetMode.off, netMode(v));
     for ([_][]const u8{ "1", "on" }) |v| try tt.expectEqual(NetMode.on, netMode(v));

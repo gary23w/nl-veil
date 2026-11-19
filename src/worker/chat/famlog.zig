@@ -1,4 +1,4 @@
-//! famlog.zig — THE FAMILY LEDGER (NL_FAMILY_MSG, default OFF): `convs/<primary>/family.jsonl`, the one typed,
+//! famlog.zig — THE FAMILY LEDGER (NL_FAMILY_MSG, default ON): `convs/<primary>/family.jsonl`, the one typed,
 //! append-only record of what the conversations of a family say to each other.
 //!
 //!   {"seq":N,"ts":S,"kind":"<kind>","from":"<conv>","from_epoch":"<8 hex>","to":"<conv>","to_epoch":"<8 hex>",

@@ -1522,12 +1522,15 @@ fn applyPersistedTheme(store: *Store) void {
     _ = t.applyById(want);
 }
 
-/// NL_FAMILY_VIEW in this process's environment (the family view's desk half, default OFF). Read ONCE, before the
-/// poller and chat threads start, into Store.family_on, so both threads read one field and never the environment.
+/// NL_FAMILY_VIEW in this process's environment (the family view's desk half). DEFAULT ON since 2026-11-19, the
+/// server's rule (family.flagDefaultOn): unset is on, and "0", "off" or an empty value switches it off. Read ONCE,
+/// before the poller and chat threads start, into Store.family_on, so both threads read one field and never the
+/// environment.
 fn familyEnvOn(gpa: std.mem.Allocator) bool {
     var env = std.process.Environ.createMap(llm.osEnviron(), gpa) catch return false;
     defer env.deinit();
-    return store_mod.familyFlagOn(env.get("NL_FAMILY_VIEW"));
+    const v = env.get("NL_FAMILY_VIEW") orelse return true;
+    return store_mod.familyFlagOn(v);
 }
 
 fn seedName(buf: []u8) usize {
@@ -2696,7 +2699,7 @@ fn drawChat(store: *Store, body: t.Rect) void {
     // While the role-picker list is open, block clicks to everything under it (composer, panes) so a click on
     // an option can't leak through to the widget beneath — same overlay discipline as the Settings/deploy
     // dropdowns. flushChatRoleDropdown clears the block before drawing the list so its own rows stay clickable.
-    t.setBlockClicks(ui.open_dd == .chat_role);
+    t.setBlockClicks(ui.open_dd == .chat_role or ui.open_dd == .chat_model); // .chat_model: the composer's model list
     defer t.setBlockClicks(false); // never let it leak into the next tab's frame
     if (left_open) drawChatLeft(store, left, convs[0..conv_n], active[0..active_n], now_s);
     // A task starting is worth a look: the first one to appear surfaces the Tasks tab, unless a live cast is
@@ -2705,9 +2708,12 @@ fn drawChat(store: *Store, body: t.Rect) void {
     ui.tasks_seen = task_n;
     // the RUNNING foreground task, for the status line's own "cancel"
     ui.run_task_len = 0;
-    if (task_n > 0 and !tasks[0].queued and tasks[0].foreground) {
-        ui.run_task_len = @min(tasks[0].id_len, ui.run_task.len);
-        @memcpy(ui.run_task[0..ui.run_task_len], tasks[0].id[0..ui.run_task_len]);
+    // (several tools can run at once now, one per chat: this chat's own is the row that is running and foreground)
+    for (tasks[0..task_n]) |*row| {
+        if (row.queued or !row.foreground) continue;
+        ui.run_task_len = @min(row.id_len, ui.run_task.len);
+        @memcpy(ui.run_task[0..ui.run_task_len], row.id[0..ui.run_task_len]);
+        break;
     }
     // A closed pane occupies only an arrow at the edge of the tab row.
     const tab_h = @max(30, t.textH(13) + 12);
@@ -2732,6 +2738,10 @@ fn drawChat(store: *Store, body: t.Rect) void {
     if (right_open) drawPaneGrip(body.width - pad - right_w, yv, ph, r_active);
     if (con_h > 0) drawPaneGripH(console.x, console.y - con_gap / 2, console.width, c_active);
     flushChatRoleDropdown(store); // the role list, on top of everything (no-op unless .chat_role is open)
+    if (ui.open_dd == .chat_model) { // the composer's model list: the Settings list, drawn here over the chat
+        t.setBlockClicks(false); // its own rows must be clickable though the chat under it is blocked
+        flushChatDropdown(store);
+    }
 }
 
 /// The role-picker's option list, drawn over the whole Chat tab. Mirrors flushChatDropdown: unblock so the
@@ -5976,12 +5986,14 @@ fn drawChatCenter(store: *Store, r: t.Rect, tabs: t.Rect, msgs: []const store_mo
     const cf = t.Rect{ .x = composer.x + 4, .y = sy, .width = composer.width - 8, .height = input_h - controls_h };
     const input_rows: usize = @intFromFloat(@max(2, @divTrunc(cf.height - chip_row_h - 12, 18)));
     var model_buf: [96]u8 = undefined;
+    var model_pickable = false;
     const model_len, const is_local, const server_steerable = blk: {
         store.lock();
         defer store.unlock();
         const settings = &store.settings;
         const n = @min(settings.chat_model_len, model_buf.len);
         @memcpy(model_buf[0..n], settings.chat_model[0..n]);
+        model_pickable = settings.chat_kind != 2; // a custom URL's model is typed in Settings: there is no list to pick from
         break :blk .{ n, settings.chat_kind == 0, store.chat_server_turn };
     };
     const running = busy or loop_on or server_steerable;
@@ -6070,8 +6082,30 @@ fn drawChatCenter(store: *Store, r: t.Rect, tabs: t.Rect, msgs: []const store_mo
     const model_x = composer.x + 14;
     const short = if (std.mem.lastIndexOfScalar(u8, model, '/')) |i| model[i + 1 ..] else model;
     const label = if (short.len > 0) short else "Drop or paste an image";
-    if (meta_right > model_x)
-        t.textClip(label, @intFromFloat(model_x), meta_y, 12, t.fg_dim, @intFromFloat(meta_right - model_x));
+    // THE MODEL, PICKED IN THE CHAT: the name by the Send button is the anchor of the same MODEL list Settings
+    // shows (flushChatDropdown, role 0), so changing model no longer means leaving the conversation. The pick
+    // is saved like a Settings change and the next message is sent on it; a turn already running keeps the model
+    // it started with. Raw rl input, like `selector`, so the anchor still toggles while its own list holds the
+    // block-clicks overlay.
+    if (meta_right > model_x) {
+        const avail = meta_right - model_x;
+        const pick = model_pickable and short.len > 0;
+        const open = ui.open_dd == .chat_model;
+        const lw: f32 = @min(avail, @as(f32, @floatFromInt(t.measure(t.zs(label), 12))) + (if (pick) @as(f32, 16) else 0));
+        const anchor = t.Rect{ .x = model_x - 6, .y = sendb.y, .width = lw + 12, .height = button_h };
+        const hot = pick and t.hovering(anchor);
+        const can_toggle = ui.open_dd == .none or open;
+        t.textClip(label, @intFromFloat(model_x), meta_y, 12, if (open or (hot and can_toggle)) t.blue else t.fg_dim, @intFromFloat(@max(1, lw - (if (pick) @as(f32, 16) else 0))));
+        if (pick and lw > 24) t.text(t.z("v", .{}), @intFromFloat(model_x + lw - 9), meta_y, 12, if (open or (hot and can_toggle)) t.blue else t.comment);
+        if (hot and can_toggle) t.wantCursor(.pointing_hand);
+        if (hot and can_toggle and rl.isMouseButtonPressed(.left)) {
+            ui.open_dd = if (open) .none else .chat_model;
+            ui.dd_rect = .{ .x = anchor.x, .y = anchor.y, .width = @max(300, anchor.width), .height = anchor.height };
+            ui.dd_scroll = 0;
+        }
+    } else if (ui.open_dd == .chat_model) {
+        ui.open_dd = .none; // the composer got too narrow to show the anchor: drop its list
+    }
 
     // ROLE PICKER anchor — BELOW the input, in the row reserved by role_h. Idle-only (not busy, not looping,
     // no status) so it never fires mid-turn. Clicking opens the list (flushChatRoleDropdown, drawn on top at
@@ -6525,6 +6559,7 @@ fn drawChatTasks(store: *Store, r: t.Rect, tasks: []const store_mod.TaskRow) voi
     }
     for (tasks) |*task| {
         const card = t.Rect{ .x = r.x + 6, .y = yy, .width = r.width - 12, .height = if (task.foreground) 64 else 78 };
+        if (card.y + card.height > r.y + r.height) break; // up to 32 rows now: never draw past the pane
         const accent = if (task.queued) t.border else t.cyan;
         t.panelBordered(card, t.bg, accent);
         t.statusDot(@intFromFloat(card.x + 14), @intFromFloat(card.y + 17), if (task.queued) t.comment else t.cyan);

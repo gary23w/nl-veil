@@ -77,7 +77,7 @@ const log = std.log.scoped(.server);
 // THE single source of release identity. scripts/build-official.sh seds this literal out of this file to
 // name every artifact (veil-v<VERSION>-<os>-<arch>.zip, veil-server-v<VERSION>-…), so the binary can never
 // report a version its own bundle disagrees with. Bump it here and the whole release follows.
-const VERSION = "1.1.37";
+const VERSION = "1.1.38";
 
 const ASSET_HTML = @embedFile("index.html");
 const ASSET_JS = @embedFile("workspace.js") ++ "\n" ++ @embedFile("app.js");
@@ -596,7 +596,7 @@ pub fn main(init: std.process.Init) !void {
 
     // How many turns this box runs at once, and how many any one account may hold. Defaults suit a
     // shared server; the right numbers depend on the rate limit of the provider key everyone shares.
-    chat_service.configureTurnLimits(init.environ_map);
+    chat_service.configureTurnLimits(init.environ_map, desktop_mode and HAS_GUI);
 
     try prepareAdminPassword(io, &auth, paths.data, init.environ_map.get("NL_ADMIN_EMAIL") orelse DEFAULT_ADMIN_EMAIL, init.environ_map.get("NL_ADMIN_PASSWORD"));
 
@@ -968,7 +968,7 @@ pub fn main(init: std.process.Init) !void {
     router.get("/api/v1/chat/convs/:id/file", chat_service.convFile, .{});
     router.delete("/api/v1/chat/convs/:id", chat_service.deleteConv, .{});
     router.get("/api/v1/chat/convs/:id/events", chat_service.convEvents, .{});
-    // the family view (NL_FAMILY_VIEW, default OFF) is routed only while it is on: unset, the path is no route at all
+    // the family view (NL_FAMILY_VIEW, default ON) is routed only while it is on: set off, the path is no route at all
     if (chat_service.familyRouteOn(init.environ_map)) router.get("/api/v1/chat/convs/:id/family", chat_service.convFamily, .{});
     router.post("/api/v1/chat/convs/:id/messages", chat_service.postMessage, .{});
     router.post("/api/v1/chat/convs/:id/control", chat_service.chatControl, .{});

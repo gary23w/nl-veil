@@ -2,7 +2,7 @@
 
 **File:** `src/worker/chat/famlog.zig`  
 **Module:** `worker/chat`  
-**Description:** The family ledger: `convs/<primary>/family.jsonl`, the one typed, append-only record of what the conversations of a family send each other, with one writer in the process. Behind `NL_FAMILY_MSG`, default OFF.
+**Description:** The family ledger: `convs/<primary>/family.jsonl`, the one typed, append-only record of what the conversations of a family send each other, with one writer in the process. Behind `NL_FAMILY_MSG`, default ON.
 
 ---
 

@@ -10,11 +10,11 @@
 
 A family is a primary conversation and its sub-chats, `<root>__s1` to `<root>__s5` ([paths](#doc=worker/chat/paths)). Every member keeps its own store: its own `graph.jsonl`, its own `_n` ids, its own `chat:<conv>` scope. This module reads a family without merging any of that. It is handed an allocator, io, the user's chat base and a liveness probe, never a Store or a Mem, and it opens files for reading only. A test holds the code above the module's tests to that: it fails on the write calls it lists (appending, writing, creating, deleting, renaming, a file opened for writing and its writers, a copy, a truncate, a link) and on any import of the store, the engine or the memory client.
 
-Everything it feeds is behind a default-OFF flag. With every flag unset the route is not registered, and no request, file or memory scope changes.
+Everything it feeds is behind a flag that is on by default. With every flag set off the route is not registered, and no request, file or memory scope changes.
 
 ## Flags
 
-`Flags.read(env)` reads all four from one environment. Each is on when set, non-empty, not starting with `0` and not `off`: the rule the engine reads `NL_TOOL_MAP` with, so `false` reads as on.
+`Flags.read(env)` reads all four from one environment. Each is on when unset (`NL_FAMILY_NET` as `on`). A set value is on when non-empty, not starting with `0` and not `off`: the rule the engine reads `NL_TOOL_MAP` with, so `false` reads as on, and `0`, `off` or an empty value switches the piece off.
 
 | Flag | What it turns on |
 |---|---|
@@ -46,7 +46,7 @@ A member's **epoch** (`memberEpoch`) is 8 hex digits of the hash of its `message
 
 ## The route
 
-`GET /api/v1/chat/convs/:id/family` (`service.convFamily`) is registered only while `NL_FAMILY_VIEW` is on; unset, the path is no route at all. The handler checks auth first, and the flag again (404). It is 404 too for an unsafe id, a branch of a branch, or a primary with no conversation dir. Asked from any member, it returns the same family:
+`GET /api/v1/chat/convs/:id/family` (`service.convFamily`) is registered only while `NL_FAMILY_VIEW` is on; set off, the path is no route at all. The handler checks auth first, and the flag again (404). It is 404 too for an unsafe id, a branch of a branch, or a primary with no conversation dir. Asked from any member, it returns the same family:
 
 ```
 {"ok":true,"root":"<id>","members":[{"conv":"<id>","status":"<word>","title":"..","answer":".."}]}

@@ -722,7 +722,7 @@ pub const TaskRow = struct {
         return r.detail[0..r.detail_len];
     }
 };
-pub const MAX_TASKS = 5; // the one running delegated tool + the chat thread's 4-slot queue
+pub const MAX_TASKS = 32; // the chat thread's running delegated tools (MAX_DELEG, 8) + its queue (DELEG_Q, 24)
 
 pub const MAX_SCHED = 32;
 pub const MAX_CF_MODELS = 64; // live Workers AI models fetched from the connected Cloudflare account
@@ -923,7 +923,7 @@ pub fn branchConvRoot(conv: []const u8) []const u8 {
     return if (branchConvParts(conv)) |bp| bp.parent else conv;
 }
 
-// ---- THE FAMILY VIEW (NL_FAMILY_VIEW in the desk's environment, default OFF): the server's GET
+// ---- THE FAMILY VIEW (NL_FAMILY_VIEW in the desk's environment, default ON): the server's GET
 // /api/v1/chat/convs/:id/family, polled by the poller while a chat is on screen. The server names every member by its
 // conv id and the slot comes from branchConvParts above, so the desk parses no grammar of its own.
 pub const FAMILY_MAX: usize = 1 + MAX_BRANCHES;

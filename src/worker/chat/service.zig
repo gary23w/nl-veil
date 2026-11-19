@@ -15,7 +15,7 @@
 //!   GET    /api/v1/chat/convs/:id        -> {ok:true, id, messages:[{role,content,kind,ts}]}   (404 if absent)
 //!   DELETE /api/v1/chat/convs/:id        -> {ok:true}                                          (404 if absent)
 //!   GET    /api/v1/chat/convs/:id/events?from=N -> events.jsonl cursor poll (X-Next-Offset out) — swarmEvents twin
-//!   GET    /api/v1/chat/convs/:id/family -> {ok:true, root, members:[{conv,status,title,answer}]}  (NL_FAMILY_VIEW, default OFF: 404)
+//!   GET    /api/v1/chat/convs/:id/family -> {ok:true, root, members:[{conv,status,title,answer}]}  (NL_FAMILY_VIEW, default ON; set off: 404)
 
 const std = @import("std");
 const httpz = @import("httpz");
@@ -107,11 +107,17 @@ fn resolveRole(app: *App, uid: u64, arena: std.mem.Allocator, base_url: []const 
 
 /// Read the turn limits from the environment. Lives here rather than in the engine so main() has one
 /// place to configure the chat surface, and so the parsing (and its fallbacks) are testable as one unit.
-pub fn configureTurnLimits(environ: *const std.process.Environ.Map) void {
+///
+/// `desk`: this process is the desktop app (`veil --desk`), one person's own machine. The per-account share
+/// exists so one busy account cannot starve the others on a shared server; on a desk it only stopped that one
+/// person's ninth chat. So with NL_MAX_TURNS_PER_USER unset, a desk gives an account the whole capacity. A set
+/// variable still wins, and the built-in model keeps its own machine-sized budget (engine.tryClaimLocal).
+pub fn configureTurnLimits(environ: *const std.process.Environ.Map, desk: bool) void {
     const WS = " \r\n\t";
     const cap = if (environ.get("NL_MAX_TURNS")) |v| (std.fmt.parseInt(usize, std.mem.trim(u8, v, WS), 10) catch 0) else 0;
     const per = if (environ.get("NL_MAX_TURNS_PER_USER")) |v| (std.fmt.parseInt(usize, std.mem.trim(u8, v, WS), 10) catch 0) else 0;
-    chat_engine.configureTurnLimits(if (cap == 0) 64 else cap, per);
+    const capacity: usize = if (cap == 0) 64 else cap;
+    chat_engine.configureTurnLimits(capacity, if (per == 0 and desk) capacity else per);
 }
 
 /// Sanitize a conversation id into ONE safe path segment (alnum / - / _ only, no separators, no "..",
@@ -346,7 +352,7 @@ pub fn familyRouteOn(env: ?*const std.process.Environ.Map) bool {
 
 /// GET /api/v1/chat/convs/:id/family — the family `id` belongs to: its primary chat and every sub-chat dir, each
 /// with its status, title and newest answer, read by chat/family.zig (which writes nothing). Behind NL_FAMILY_VIEW,
-/// default OFF: unset, main.zig does not route it, and the handler itself answers a signed-in caller 404 as well. 404
+/// default ON: set off, main.zig does not route it, and the handler itself answers a signed-in caller 404 as well. 404
 /// too for an unsafe id, a branch of a branch, or a primary with no conversation dir. Ownership is structural, as on
 /// every route here.
 pub fn convFamily(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
@@ -555,7 +561,9 @@ pub fn postMessage(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         chat_engine.endTurn(app.io, seg); // give back the per-conv slot tryBeginTurn just took
         res.status = 409;
         const msg = try std.fmt.allocPrint(res.arena, "local model busy — this machine's budget of {d} concurrent local chat(s) is full. Finish or stop one, or use a hosted/BYOK model for unlimited parallel chats.", .{chat_engine.localChatBudget(app)});
-        return res.json(.{ .ok = false, .err = msg }, .{});
+        // "limit" names WHICH refusal this is: the same 409 also means "this conversation already has a turn"
+        // (above), and the desk steers into that one but must only report this one.
+        return res.json(.{ .ok = false, .err = msg, .limit = "local" }, .{});
     }
 
     // Fire the turn on a background thread and return 202 AT ONCE, so the desk streams the turn's event frames
@@ -1163,8 +1171,9 @@ test "the family route: 404 after auth while NL_FAMILY_VIEW is unset or off, the
     const Case = struct { flag: ?[]const u8, id: []const u8, status: u16, body: []const u8 };
     var env = std.process.Environ.Map.init(gpa);
     defer env.deinit();
+    try env.put("NL_FAMILY_MSG", "0"); // these rows read NL_FAMILY_VIEW alone: the ledger (on when unset) is set off
     for ([_]Case{
-        // the flag unset: no server env at all, then a server env without it
+        // no server env at all (row 0), then the flag set to each off value
         .{ .flag = null, .id = "fv1", .status = 404, .body = NOT_FOUND },
         .{ .flag = "", .id = "fv1", .status = 404, .body = NOT_FOUND },
         .{ .flag = "0", .id = "fv1", .status = 404, .body = NOT_FOUND },
@@ -1179,12 +1188,7 @@ test "the family route: 404 after auth while NL_FAMILY_VIEW is unset or off, the
         if (i == 0) {
             ta.sup.parent_env = null;
         } else {
-            const v = c.flag orelse "";
-            if (v.len > 0) {
-                try env.put("NL_FAMILY_VIEW", v);
-            } else {
-                _ = env.swapRemove("NL_FAMILY_VIEW");
-            }
+            try env.put("NL_FAMILY_VIEW", c.flag orelse ""); // "" is SET and empty: an off value, like "0" and "off"
             ta.sup.parent_env = &env;
         }
         defer ta.sup.parent_env = null;
@@ -1196,6 +1200,21 @@ test "the family route: 404 after auth while NL_FAMILY_VIEW is unset or off, the
         errdefer std.debug.print("\nfamily route, flag {?s}, id {s}: {d}\n", .{ c.flag, c.id, web.res.status });
         try web.expectStatus(c.status);
         try web.expectBody(c.body);
+    }
+    // THE DEFAULT (since 2026-11-19): a server env with NO family variable in it answers, ledger included, exactly
+    // as with every flag set on
+    {
+        _ = env.swapRemove("NL_FAMILY_VIEW");
+        _ = env.swapRemove("NL_FAMILY_MSG");
+        ta.sup.parent_env = &env;
+        defer ta.sup.parent_env = null;
+        var web = httpz.testing.init(.{});
+        defer web.deinit();
+        web.header("cookie", cookie);
+        web.param("id", "fv1");
+        try convFamily(&ta.app, web.req, web.res);
+        try web.expectStatus(200);
+        try web.expectBody(FAMILY[0 .. FAMILY.len - 1] ++ ",\"log\":[]}");
     }
     // NL_FAMILY_MSG on beside it: the same members, and the ledger's records after them (none written here)
     {
