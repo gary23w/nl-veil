@@ -41,7 +41,8 @@ svg.mark-lg { width: 44px; height: 44px; }
 
 .nav { display: flex; align-items: center; gap: 2px; margin-left: 8px; }
 .nav a {
-  padding: 7px 11px;
+  padding: 7px 9px;
+  white-space: nowrap;
   border-radius: var(--radius-btn);
   font-size: var(--fs-ui);
   color: var(--text-secondary);
@@ -53,7 +54,8 @@ svg.mark-lg { width: 44px; height: 44px; }
 /* On a phone the nav is hidden, so the chat keeps a button of its own in the bar. */
 .topbar .nav-chat { display: none; flex: 0 0 auto; }
 
-@media (max-width: 900px) {
+/* the mono face runs wider, so the nav folds away a little sooner */
+@media (max-width: 1120px) {
   .nav { display: none; }
   .topbar .chip { display: none; }
   .topbar .nav-chat { display: inline-flex; }
@@ -562,7 +564,7 @@ main > section:last-child { padding-bottom: var(--section-gap); }
   color: var(--text);
   overflow: hidden;
 }
-.docview::backdrop { background: color-mix(in srgb, #05070e 62%, transparent); backdrop-filter: blur(2px); }
+.docview::backdrop { background: color-mix(in srgb, var(--ag-bg) 78%, transparent); backdrop-filter: blur(2px); }
 .docview[open] { display: flex; flex-direction: column; }
 
 .docview-head {

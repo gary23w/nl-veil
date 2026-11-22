@@ -8068,22 +8068,18 @@ function drawBar() {
 
 /* ============================================================ theme (the site's three, the site's key) */
 
-const THEMES = ['light', 'dark', 'matrix'];
-const THEME_ICONS = {
-  light: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="4.5"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M19.1 4.9l-1.4 1.4M6.3 17.7l-1.4 1.4"/></svg>',
-  dark: '<svg viewBox="0 0 24 24"><path d="M20.5 14.5A8.5 8.5 0 0 1 9.5 3.5a8.5 8.5 0 1 0 11 11z"/></svg>',
-  matrix: '<svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9l3 3-3 3M13 15h4"/></svg>',
-};
-function setTheme(id, chosen = false) {
-  if (!THEMES.includes(id)) id = 'light';
-  document.documentElement.setAttribute('data-theme', id);
-  if (chosen) { try { localStorage.setItem('veil.theme', id); localStorage.setItem('veil.theme.chosen', '1'); } catch {} }
-  const btn = document.getElementById('themeBtn');
-  btn.innerHTML = THEME_ICONS[id];
-  btn.title = 'Theme: ' + id + ' (click to cycle)';
+/* Light and dark come from the shared switch (../js/garrett-mode.js). The desktop app's theme still travels through
+   'veil.theme' (see SYNCED): a theme from the desk sets the mode here, and a click here writes the desk's name for it,
+   'light' or 'matrix' (the desk's green palette), unless the stored name already means that mode. */
+function setTheme(id) {
+  const mode = window.garrettColorMode?.fromVeilTheme(id);
+  if (mode) window.garrettColorMode.set(mode);
 }
-document.getElementById('themeBtn').addEventListener('click', () => setTheme(THEMES[(THEMES.indexOf(document.documentElement.getAttribute('data-theme')) + 1) % THEMES.length], true));
-setTheme(document.documentElement.getAttribute('data-theme'));
+document.addEventListener('garrett:color-mode', (e) => {
+  const mode = e.detail.mode;
+  if (window.garrettColorMode?.fromVeilTheme(rawOf('veil.theme')) === mode) return;
+  try { localStorage.setItem('veil.theme', mode === 'light' ? 'light' : 'matrix'); localStorage.setItem('veil.theme.chosen', '1'); } catch {}
+});
 
 /* ============================================================ boot */
 

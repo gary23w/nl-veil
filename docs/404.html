@@ -7,23 +7,26 @@
 <meta name="robots" content="noindex">
 <meta name="description" content="This page does not exist. The Veil is a free desktop app for building software with AI: download it, read the walkthrough, or open the web chat.">
 <meta name="color-scheme" content="light dark">
-<meta name="theme-color" content="#e9edf5" media="(prefers-color-scheme: light)">
-<meta name="theme-color" content="#16161e" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#ffffff">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M16 1c1.6 8.2 6.8 13.4 15 15-8.2 1.6-13.4 6.8-15 15-1.6-8.2-6.8-13.4-15-15C9.2 14.4 14.4 9.2 16 1z' fill='%238a3ffc'/%3E%3C/svg%3E">
 <!-- GitHub Pages serves this file for a missing path at any depth, so every URL here is root-absolute. -->
 <link rel="stylesheet" href="/css/theme.css">
 <link rel="stylesheet" href="/css/site.css">
-<script>
-  /* The theme before first paint: the same key and rule as the rest of the site. */
-  try {
-    var t = localStorage.getItem('veil.theme.chosen') ? localStorage.getItem('veil.theme') : null;   /* only a theme the reader picked */
-    if (!t) t = 'light';   /* the light theme, until the reader picks another */
-    document.documentElement.setAttribute('data-theme', t);
-  } catch (e) {}
-</script>
+<link rel="stylesheet" href="/css/garrett-mode.css?v=1">
+<script src="/js/garrett-mode.js?v=1"></script>
 <script src="/js/analytics.js"></script>
 </head>
 <body>
+<nav class="garrett-family" aria-label="Garrett projects">
+  <ul>
+    <li><a href="https://agent.garrettstimpson.ca/">Agent Garrett</a></li>
+    <li><a href="https://veil.garrettstimpson.ca/" aria-current="true">nl-veil</a></li>
+    <li><a href="https://gary23w.github.io/neuron-db/">neuron-db</a></li>
+    <li><a href="https://gary23w.github.io/sentinels/">Sentinels</a></li>
+    <li><a href="https://garrettstimpson.ca/">Blog</a></li>
+    <li class="garrett-family-mode"><button type="button" class="color-mode-toggle" data-color-mode-toggle></button></li>
+  </ul>
+</nav>
 
 <svg width="0" height="0" aria-hidden="true" style="position:absolute">
   <defs>
@@ -42,7 +45,6 @@
       the veil <small>nl-veil</small>
     </a>
     <span class="grow"></span>
-    <button class="icon-btn" id="themeBtn" type="button" title="Toggle theme" aria-label="Toggle theme"></button>
   </div>
 </header>
 

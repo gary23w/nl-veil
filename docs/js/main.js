@@ -1,58 +1,15 @@
-/* nl-veil docs — page shell: theme, reveals, platform detection, scroll spy.
-   The theme cycle mirrors the product: the three built-ins the desk compiles in
-   (theme.zig initThemes) in the same order, persisted under the same key the
-   web client uses so a reader who flips to dark here lands in dark there. */
+/* nl-veil docs — page shell: reveals, platform detection, scroll spy.
+   Light and dark come from the shared switch (garrett-mode.js). */
 (function () {
   'use strict';
 
   const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
   const root = document.documentElement;
 
-  /* ---------------- theme ---------------- */
-  const THEMES = [
-    { id: 'light',  name: 'Light',       chrome: '#e9edf5' },
-    { id: 'dark',   name: 'Tokyo Night', chrome: '#16161e' },
-    { id: 'matrix', name: 'Matrix',      chrome: '#000000' }
-  ];
-  const ICONS = {
-    // sun / moon / terminal — the same stroke language as the app's icon set
-    light:  '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="4.5"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M19.1 4.9l-1.4 1.4M6.3 17.7l-1.4 1.4"/></svg>',
-    dark:   '<svg viewBox="0 0 24 24"><path d="M20.5 14.5A8.5 8.5 0 0 1 9.5 3.5a8.5 8.5 0 1 0 11 11z"/></svg>',
-    matrix: '<svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9l3 3-3 3M13 15h4"/></svg>'
-  };
-
-  const themeBtn = document.getElementById('themeBtn');
-
-  function currentTheme() { return root.getAttribute('data-theme') || 'light'; }
-
-  function setTheme(id, chosen) {
-    const t = THEMES.find((x) => x.id === id) || THEMES[0];
-    root.setAttribute('data-theme', t.id);
-    if (chosen) { try { localStorage.setItem('veil.theme', t.id); localStorage.setItem('veil.theme.chosen', '1'); } catch (e) {} }
-    // one theme-color meta, rewritten — the media-query pair in <head> only
-    // covers the unset case, and an explicit choice has to beat it
-    document.querySelectorAll('meta[name=theme-color]').forEach((m) => m.remove());
-    const meta = document.createElement('meta');
-    meta.name = 'theme-color';
-    meta.content = t.chrome;
-    document.head.appendChild(meta);
-    if (themeBtn) {
-      themeBtn.innerHTML = ICONS[t.id];
-      themeBtn.title = 'Theme: ' + t.name + ' (click to cycle)';
-      themeBtn.setAttribute('aria-label', 'Theme: ' + t.name + '. Click to cycle.');
-    }
-    // the map paints its links on a canvas, so a palette change has to be
-    // repainted by hand — CSS cannot reach inside a 2D context
-    if (window.VeilMap) window.VeilMap.repaint();
-  }
-
-  setTheme(currentTheme());
-  if (themeBtn) {
-    themeBtn.addEventListener('click', () => {
-      const i = THEMES.findIndex((x) => x.id === currentTheme());
-      setTheme(THEMES[(i + 1) % THEMES.length].id, true);
-    });
-  }
+  /* ---------------- colour mode ---------------- */
+  // the map paints its links on a canvas, so a mode change has to be
+  // repainted by hand — CSS cannot reach inside a 2D context
+  document.addEventListener('garrett:color-mode', () => { if (window.VeilMap) window.VeilMap.repaint(); });
 
   /* ---------------- scroll reveals ---------------- */
   const revealables = document.querySelectorAll('.reveal');

@@ -6,19 +6,36 @@
   <title>the Veil — Terms, responsibility &amp; privacy</title>
   <meta name="description" content="nl-veil terms, ZERO involvement in user activities, warranty and liability limits, user responsibilities and privacy policy.">
   <link rel="canonical" href="https://veil.garrettstimpson.ca/privacy.html">
+  <meta name="theme-color" content="#ffffff">
+  <link rel="stylesheet" href="css/garrett-mode.css?v=1">
+  <script src="js/garrett-mode.js?v=1"></script>
   <style>
-    :root { color-scheme: light dark; font: 17px/1.65 system-ui, sans-serif; }
+    :root { font: 16px/1.7 var(--ag-mono); --surface-raised: var(--ag-surface); --text: var(--ag-text); --accent: var(--ag-accent); --on-accent: var(--ag-on-accent); }
+    body { color: var(--ag-text); }
+    h1, h2, h3, strong { color: var(--ag-heading); }
     body { max-width: 760px; margin: 0 auto; padding: 40px 24px 72px; }
     h1, h2, h3 { line-height: 1.3; } h2 { margin-top: 40px; font-size: 1.5rem; }
     h3 { margin-top: 28px; font-size: 1.15rem; }
-    .notice { border: 1px solid currentColor; border-radius: 8px; padding: 0 20px; margin: 24px 0; }
+    .notice { border: 1px solid currentColor; border-radius: 0; padding: 0 20px; margin: 24px 0; }
     section { scroll-margin-top: 24px; } nav { margin-top: 16px; }
     a { overflow-wrap: anywhere; }
-    a { color: light-dark(#244caf, #9bbcff); } .date { opacity: .7; }
+    a { color: var(--ag-link); } .date { opacity: .7; }
+    .garrett-family { margin: -40px 0 32px; }
+    .garrett-family ul { padding: 0; }
   </style>
 <script src="js/analytics.js"></script>
 </head>
 <body>
+<nav class="garrett-family" aria-label="Garrett projects">
+  <ul>
+    <li><a href="https://agent.garrettstimpson.ca/">Agent Garrett</a></li>
+    <li><a href="https://veil.garrettstimpson.ca/" aria-current="true">nl-veil</a></li>
+    <li><a href="https://gary23w.github.io/neuron-db/">neuron-db</a></li>
+    <li><a href="https://gary23w.github.io/sentinels/">Sentinels</a></li>
+    <li><a href="https://garrettstimpson.ca/">Blog</a></li>
+    <li class="garrett-family-mode"><button type="button" class="color-mode-toggle" data-color-mode-toggle></button></li>
+  </ul>
+</nav>
   <a href="./">the Veil</a>
 
   <nav aria-label="Policy sections"><a href="#terms">Terms and responsibility</a> &middot; <a href="#privacy">Privacy</a> &middot; <a href="https://github.com/gary23w/nl-veil/blob/main/LICENSE">MIT license</a></nav>

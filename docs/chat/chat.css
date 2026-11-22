@@ -388,12 +388,7 @@ details.tool pre { padding: 8px 10px; border-top: 1px solid var(--border); max-h
   --tok-v: #b3261e; --tok-d: #8a5a00; --tok-o: #46557a; --tok-u: #5b6784; --tok-t: #c93a4a; --tok-a: #a85400; --tok-p: #0f6f8f; --tok-h: #2f6feb;
   --tok-i: #1f7a37; --tok-x: #c93a4a; --code-fg: var(--text);
 }
-:root[data-theme="dark"] .ide {
-  --tok-c: #6f78a3; --tok-s: #9ece6a; --tok-r: #b4f9f8; --tok-n: #ff9e64; --tok-k: #bb9af7; --tok-y: #2ac3de; --tok-f: #7aa2f7; --tok-b: #ff9e64;
-  --tok-v: #e0af68; --tok-d: #e0af68; --tok-o: #89ddff; --tok-u: #8089b3; --tok-t: #f7768e; --tok-a: #e0af68; --tok-p: #73daca; --tok-h: #7aa2f7;
-  --tok-i: #9ece6a; --tok-x: #f7768e; --code-fg: #c0caf5;
-}
-:root[data-theme="matrix"] .ide {
+:root[data-color-mode="dark"] .ide {
   --tok-c: #4a964a; --tok-s: #90e890; --tok-r: #d7a0e8; --tok-n: #ffcc44; --tok-k: #00ef72; --tok-y: #7eb7ff; --tok-f: #7eb7ff; --tok-b: #00aacc;
   --tok-v: #5fd7c7; --tok-d: #d7a0e8; --tok-o: #16c56b; --tok-u: #88aa88; --tok-t: #00aacc; --tok-a: #5fd7c7; --tok-p: #5fd7c7; --tok-h: #f3f7f1;
   --tok-i: #90e890; --tok-x: #ff2d55; --code-fg: #c8f0c8;
@@ -405,7 +400,7 @@ details.tool pre { padding: 8px 10px; border-top: 1px solid var(--border); max-h
 .tok-v { color: var(--tok-v); } .tok-d { color: var(--tok-d); } .tok-o { color: var(--tok-o); } .tok-u { color: var(--tok-u); }
 .tok-t { color: var(--tok-t); } .tok-a { color: var(--tok-a); } .tok-p { color: var(--tok-p); } .tok-h { color: var(--tok-h); font-weight: 700; }
 .tok-i { color: var(--tok-i); } .tok-x { color: var(--tok-x); }
-:root[data-theme="matrix"] .tok-k { font-weight: 700; }
+:root[data-color-mode="dark"] .tok-k { font-weight: 700; }
 .tabs .widen { font-size: var(--fs-micro); white-space: nowrap; }
 
 /* ---- the terminal under the editor ---- */

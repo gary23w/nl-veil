@@ -62,7 +62,7 @@
       '#nlv-consent .acts{display:flex;gap:8px}' +
       '#nlv-consent button{font:inherit;cursor:pointer;padding:6px 14px;border-radius:8px;' +
       'border:1px solid var(--border,GrayText);background:transparent;color:inherit}' +
-      '#nlv-consent button.yes{background:var(--accent,LinkText);border-color:var(--accent,LinkText);color:#fff}';
+      '#nlv-consent button.yes{background:var(--accent,LinkText);border-color:var(--accent,LinkText);color:var(--on-accent,#fff)}';
     var root = /\/nl-veil\//.test(location.pathname) ? '/nl-veil/' : '/';
     var b = d.createElement('div');
     b.id = 'nlv-consent';

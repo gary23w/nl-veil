@@ -1,0 +1,47 @@
+/* Agent Garrett's theme: the monochrome light palette by default, the green palette in dark mode.
+   The light and dark values are the ones Agent Garrett uses.
+   JetBrains Mono comes from ../fonts/JetBrainsMono.css, which theme.css imports. */
+
+:root,:root[data-color-mode="light"]{
+ color-scheme:light;
+ --ag-bg:#fff;--ag-surface:#fafafa;--ag-card:#fff;--ag-code:#f4f4f4;
+ --ag-accent:#111;--ag-accent-strong:#000;--ag-accent-dim:#454545;--ag-accent-dark:#d0d0d0;--ag-glow:rgba(0,0,0,.06);
+ --ag-accent-hover:#000;--ag-on-accent:#efefef;
+ --ag-heading:#111;--ag-text:#252525;--ag-muted:#555;--ag-faint:#666;
+ --ag-link:#111;--ag-focus:#111;--ag-danger:#111;--ag-blue:#111;
+ --ag-border:rgba(0,0,0,.2);--ag-border-dim:rgba(0,0,0,.1);--ag-field-border:#767676;
+ --ag-scroll-track:#fff;--ag-scroll-thumb:#999;--ag-scroll-hover:#555;
+ --ag-mono:'JetBrains Mono','Cascadia Code','Courier New',monospace;
+}
+:root[data-color-mode="dark"]{
+ color-scheme:dark;
+ --ag-bg:#000;--ag-surface:#07100b;--ag-card:#0b140e;--ag-code:#06100a;
+ --ag-accent:#00ef72;--ag-accent-strong:#09f77b;--ag-accent-dim:#16c56b;--ag-accent-dark:#174d2f;--ag-glow:rgba(0,239,114,.15);
+ --ag-accent-hover:#9effbd;--ag-on-accent:#03150a;
+ --ag-heading:#f3f7f1;--ag-text:#c5d4c8;--ag-muted:#8da494;--ag-faint:#8da494;
+ --ag-link:#00ef72;--ag-focus:#7eb7ff;--ag-danger:#ff2d55;--ag-blue:#7eb7ff;
+ --ag-border:rgba(0,239,114,.2);--ag-border-dim:rgba(0,239,114,.1);--ag-field-border:#16c56b;
+ --ag-scroll-track:#000;--ag-scroll-thumb:#174d2f;--ag-scroll-hover:#16c56b;
+}
+html{background:var(--ag-bg);scrollbar-color:var(--ag-scroll-thumb) var(--ag-scroll-track)}
+::selection{background:var(--ag-accent);color:var(--ag-on-accent)}
+
+/* The light/dark switch, as Agent Garrett draws it. */
+.color-mode-toggle{box-sizing:border-box;display:inline-flex;flex:0 0 auto;align-items:center;justify-content:center;gap:7px;min-width:44px;min-height:44px;margin:0;padding:8px 11px;border:1px solid var(--ag-border);border-radius:4px;background:var(--ag-bg);color:var(--ag-text);font:600 12px/1.2 var(--ag-mono);white-space:nowrap;cursor:pointer;box-shadow:none;letter-spacing:0;text-transform:none}
+.color-mode-toggle svg{display:block;width:19px;height:19px;flex:none;fill:none;stroke:currentColor;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
+.color-mode-toggle:hover{border-color:var(--ag-accent);color:var(--ag-heading)}
+.color-mode-toggle:focus-visible{outline:2px solid var(--ag-focus);outline-offset:4px}
+.color-mode-fallback{position:fixed;top:max(14px,env(safe-area-inset-top));right:max(14px,env(safe-area-inset-right));z-index:200}
+@media(max-width:700px){.color-mode-toggle{width:44px;padding:9px}.color-mode-label{display:none}}
+
+/* The links bar every Garrett site shares. */
+.garrett-family{position:relative;z-index:60;border-bottom:1px solid var(--ag-border-dim);background:var(--ag-bg);font:600 11px/1.3 var(--ag-mono);letter-spacing:.02em}
+.garrett-family ul{box-sizing:border-box;display:flex;flex-wrap:wrap;align-items:center;gap:0 clamp(14px,2.4vw,26px);max-width:1248px;margin:0 auto;padding:0 max(16px,env(safe-area-inset-left));list-style:none}
+.garrett-family li{margin:0;padding:0}
+.garrett-family a{display:inline-flex;align-items:center;min-height:36px;color:var(--ag-muted);text-decoration:none;white-space:nowrap}
+.garrett-family a:hover{color:var(--ag-heading);text-decoration:underline;text-underline-offset:.25em}
+.garrett-family a[aria-current]{color:var(--ag-heading);text-decoration:underline;text-decoration-thickness:2px;text-underline-offset:.35em}
+.garrett-family a:focus-visible{outline:2px solid var(--ag-focus);outline-offset:2px}
+.garrett-family .garrett-family-mode{margin-left:auto}
+.color-mode-toggle:empty{visibility:hidden}
+@media(prefers-reduced-motion:reduce){.color-mode-toggle{transition:none}}
