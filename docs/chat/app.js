@@ -3902,14 +3902,13 @@ PROMPT_NOTES.push(() => (artOn() ? 'STUDIO: you are at the controls of the Image
 
 /* The page's settings are kept in the harness (its shared settings), not only in this browser: they come back after
    a reload, in a new tab, in another browser and on another machine logged in to the same account. A setting a
-   desktop veil has too (Clef, the theme) goes under the desk's own name, so changing it on the desk changes it here,
+   desktop veil has too (Clef) goes under the desk's own name, so changing it on the desk changes it here,
    and back. The harness's copy wins when this browser has never agreed with it; after that, the newer one wins.
    What stays with this browser: the harness address, the pane sizes, this tab's name on the mesh, the terminal's
    history, and the login itself (a browser keeps its own). The model choice travels through the mesh's own
    "web.model" (the section above). */
 const SYNCED = [
   { key: 'veilweb.clef', name: 'desk.clef', put: (raw) => (JSON.parse(raw) === false ? '0' : '1'), take: (v) => JSON.stringify(v !== '0' && v !== false && v !== 'false') },
-  { key: 'veil.theme', name: 'desk.theme', raw: true, ok: (v) => ['light', 'dark', 'matrix'].includes(v) },
   { key: 'veilweb.complete', name: 'web.complete' },
   { key: 'veilweb.ui', name: 'web.ui' },
   { key: 'veilweb.art', name: 'web.art' },
@@ -3940,8 +3939,7 @@ function syncTake(it, v) {
   if (!it.raw) { try { JSON.parse(raw); } catch { raw = JSON.stringify(raw); } }
   try { localStorage.setItem(it.key, raw); } catch { return false; }
   try {
-    if (it.key === 'veil.theme') { try { localStorage.setItem('veil.theme.chosen', '1'); } catch {} setTheme(raw); }
-    else if (it.key === 'veilweb.ui') Object.assign(ui, JSON.parse(raw));
+    if (it.key === 'veilweb.ui') Object.assign(ui, JSON.parse(raw));
     else if (it.key === 'veilweb.art' && typeof art !== 'undefined') Object.assign(art.form, JSON.parse(raw));
     else if (it.key === 'veilweb.links') S.linksOpen = JSON.parse(raw);
   } catch {}
@@ -8065,21 +8063,6 @@ function drawBar() {
     h('button', { id: 'showWorkspace', class: 'icon-btn only-narrow', 'aria-label': 'Workspace tools', 'aria-controls': 'side', 'aria-expanded': String(S.panes.side), onclick: () => setDrawer('side') }, '▤'),
   ] : []));
 }
-
-/* ============================================================ theme (the site's three, the site's key) */
-
-/* Light and dark come from the shared switch (../js/garrett-mode.js). The desktop app's theme still travels through
-   'veil.theme' (see SYNCED): a theme from the desk sets the mode here, and a click here writes the desk's name for it,
-   'light' or 'matrix' (the desk's green palette), unless the stored name already means that mode. */
-function setTheme(id) {
-  const mode = window.garrettColorMode?.fromVeilTheme(id);
-  if (mode) window.garrettColorMode.set(mode);
-}
-document.addEventListener('garrett:color-mode', (e) => {
-  const mode = e.detail.mode;
-  if (window.garrettColorMode?.fromVeilTheme(rawOf('veil.theme')) === mode) return;
-  try { localStorage.setItem('veil.theme', mode === 'light' ? 'light' : 'matrix'); localStorage.setItem('veil.theme.chosen', '1'); } catch {}
-});
 
 /* ============================================================ boot */
 

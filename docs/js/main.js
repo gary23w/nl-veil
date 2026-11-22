@@ -1,15 +1,10 @@
 /* nl-veil docs — page shell: reveals, platform detection, scroll spy.
-   Light and dark come from the shared switch (garrett-mode.js). */
+   The page is light only (garrett-mode.css). */
 (function () {
   'use strict';
 
   const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
   const root = document.documentElement;
-
-  /* ---------------- colour mode ---------------- */
-  // the map paints its links on a canvas, so a mode change has to be
-  // repainted by hand — CSS cannot reach inside a 2D context
-  document.addEventListener('garrett:color-mode', () => { if (window.VeilMap) window.VeilMap.repaint(); });
 
   /* ---------------- scroll reveals ---------------- */
   const revealables = document.querySelectorAll('.reveal');

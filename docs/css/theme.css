@@ -1,9 +1,8 @@
 /* ============================================================================
    nl-veil docs — the design system
-   The site wears Agent Garrett's theme (garrett-mode.css): the monochrome light
-   palette by default and the green palette in dark mode, JetBrains Mono
-   throughout and square corners. The 16 palette slots below keep the product's
-   names (desk/src/theme.zig), so every rule that reads them follows the mode.
+   The site wears Agent Garrett's light theme (garrett-mode.css): a monochrome
+   palette, JetBrains Mono throughout and square corners. The 16 palette slots
+   below keep the product's names (desk/src/theme.zig).
    ========================================================================= */
 
 /* JetBrains Mono is served from this site: the whole page and the code editor ask for it by name. */
@@ -94,51 +93,9 @@
   color-scheme: light;
 }
 
-/* Dark mode: Agent Garrett's green palette (the desk's matrix theme). */
-:root[data-color-mode="dark"] {
-  --bg:      #000000;
-  --bg-dark: #07100b;
-  --bg-hl:   #0b140e;
-  --bg-sel:  #174d2f;
-  --fg:      #c5d4c8;
-  --fg-dim:  #8da494;
-  --comment: #718579;
-  --border:  #0c3b21;
-  --blue:    #00ef72;
-  --cyan:    #7eb7ff;
-  --green:   #16c56b;
-  --magenta: #d7a0e8;
-  --orange:  #ffa000;
-  --red:     #ff2d55;
-  --yellow:  #ffcc44;
-  --teal:    #00aacc;
-  --on-accent: #03150a;
-  /* said outright, where the mixes above would dull them */
-  --accent:         #00ef72;
-  --brand:          #00ef72;
-  --role-assistant: #00ef72;
-  --role-user:      #7eb7ff;
-  --text-muted:     #8da494;
-  --heading:        #f3f7f1;
-  --glow:           rgba(0, 239, 114, 0.15);
-  color-scheme: dark;
-}
-:root[data-color-mode="dark"] body { background: #000; }
-:root[data-color-mode="dark"] ::selection { background: #00ef72; color: #000; }
-:root[data-color-mode="dark"] :is(h1, h2, h3, h4) { color: var(--heading); }
-:root[data-color-mode="dark"] :is(strong, b) { color: #fff; }
-:root[data-color-mode="dark"] a:hover { color: #fff; }
-:root[data-color-mode="dark"] .topbar { background: rgba(0, 0, 0, 0.97); border-bottom: 1px solid rgba(0, 239, 114, 0.20); }
-:root[data-color-mode="dark"] .btn-solid { background: #00ef72; color: #03150a; }
-:root[data-color-mode="dark"] .btn-solid:hover { background: #9effbd; filter: none; }
-:root[data-color-mode="dark"] * { scrollbar-color: #174d2f #000; }
-:root[data-color-mode="dark"] ::-webkit-scrollbar-thumb { background: #174d2f; border-radius: 0; }
-:root[data-color-mode="dark"] ::-webkit-scrollbar-thumb:hover { background: #16c56b; }
-:root[data-color-mode="dark"] :is(pre, code):not(.hl, .ghost) { background: #06100a; }
-
-/* Light mode, as Agent Garrett draws it: headings and bold in the heading colour, flat buttons. */
-:root:not([data-color-mode="dark"]) :is(h1, h2, h3, h4, strong, b) { color: var(--heading); }
-:root:not([data-color-mode="dark"]) .btn-solid:hover { background: #000; filter: none; }
+/* As Agent Garrett draws it: headings and bold in the heading colour, flat buttons. */
+:is(h1, h2, h3, h4, strong, b) { color: var(--heading); }
+.btn-solid:hover { background: #000; filter: none; }
 
 /* ============================================================ base */
 * { box-sizing: border-box; margin: 0; padding: 0; }
