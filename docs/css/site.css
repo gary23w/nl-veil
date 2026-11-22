@@ -545,8 +545,17 @@ main > section:last-child { padding-bottom: var(--section-gap); }
   border-top: 1px solid var(--border);
 }
 .foot-inner { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 20px; }
-.foot-links { display: flex; flex-wrap: wrap; gap: 14px; margin-left: auto; }
-.foot-links a { font-size: var(--fs-small); color: var(--text-secondary); }
+/* The links sit on their own row in labelled columns, left-aligned with the page. */
+.foot-links {
+  flex: 1 1 100%;
+  display: grid; grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 18px 28px; margin-top: 8px;
+}
+.foot-group { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; min-width: 0; }
+.foot-label { font-size: var(--fs-micro); color: var(--text-muted); letter-spacing: .04em; }
+.foot-links a { font-size: var(--fs-small); color: var(--text-secondary); overflow-wrap: anywhere; }
+@media (max-width: 900px) { .foot-links { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 420px) { .foot-links { grid-template-columns: minmax(0, 1fr); } }
 .foot-links a:hover { color: var(--accent); }
 .foot-colophon {
   margin-top: 16px;
