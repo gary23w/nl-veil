@@ -34,6 +34,7 @@ The block says the lines are recollections, not instructions, and the engine beh
 - The cue is built from engine-held strings, never from the working context, so one block cannot seed the next.
 - Every render is bounded by fixed numbers (field cap, settle passes, byte budget, fired and strengthened caps) and spends zero subprocesses — a test pins that count.
 - Inhibition can only remove lines. Nothing here can grow the transcript or the store on its own; the block is removed from the working context before anything else is appended, so it is never compacted, summarized, observed, or re-uploaded.
+- A finding the engine withdraws is gone for good. When the provider declines a request, the engine sets aside the round that request was the newest work in, and `forgetFinding` takes each of that round's findings out of the field (`hyperspace.Field.forgetLine`), out of the shown and tag maps, and off the fired queue, so it is neither offered again nor strengthened in the store; `clearRound` drops the round's cue fragments (thought, call, result, hot tail), so the next render is not settled around it.
 
 ## Provenance without pollution
 

@@ -169,6 +169,21 @@ pub const Field = struct {
         self.deg_dirty = true;
     }
 
+    /// Withdraw ONE fact by the line it was observed from (observeLine's own trim, cap and key), when its writer has
+    /// learned it must not be offered again. True when the field held it.
+    pub fn forgetLine(self: *Field, raw: []const u8) bool {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        const line = if (trimmed.len > MAX_FACT_LEN) trimmed[0..MAX_FACT_LEN] else trimmed;
+        const key = fnv(line);
+        if (!self.seen.contains(key)) return false;
+        for (self.facts.items, 0..) |f, i| if (fnv(f.text) == key) {
+            self.evictAt(i);
+            return true;
+        };
+        _ = self.seen.remove(key);
+        return false;
+    }
+
     /// Fold a newline-joined recall block into the field via observeLine (one dedupe/stem/evict path).
     pub fn ingest(self: *Field, block: []const u8) void {
         var it = std.mem.splitScalar(u8, block, '\n');

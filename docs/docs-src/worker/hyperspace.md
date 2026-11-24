@@ -18,6 +18,7 @@ A per-mind grounding field that sits in RAM over neuron-db. Instead of clipping 
 - `Field` — `init`/`deinit`, plus:
   - `observeLine(raw)` — absorb ONE fact the instant it is created, deduped by content hash, with focus-independent eviction at capacity
   - `ingest(block)` — fold a newline-joined recall block through observeLine
+  - `forgetLine(raw)` — withdraw ONE fact by the line it was observed from (observeLine's trim, cap and key); the chat overlay uses it for a finding from a round the provider declined
   - `warmFrom(mem, scope, focus)` — the single tolerated subprocess: one wide `mem.assoc` bulk pull merged in (lazily on first use, cheaply re-called every few rounds)
   - `pack(focus_text, budget)` — settle around the focus and return a dense newline-joined block within `budget` (caller owns)
 - `recall(gpa, mem, scope, focus, budget)` — drop-in replacement for `mem.assoc(...)` + clip: one wide pull, in-process settle, dense hierarchy-aware pack

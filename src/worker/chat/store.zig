@@ -134,6 +134,9 @@ pub const Store = struct {
 
     const Call = struct { id: []u8, name: []u8 };
     pub const PREFIX_OBJ: usize = std.math.maxInt(usize);
+    /// A node whose conv_buf message is gone (decline took it out), or a decline marker, which never had one: neither
+    /// is in the live rounds, so neither starts them.
+    pub const DROPPED_OBJ: usize = std.math.maxInt(usize) - 1;
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, conv_dir: []const u8, scope: []const u8, gate: GateFn) !Store {
         const path = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ conv_dir, FILE });
@@ -264,6 +267,68 @@ pub const Store = struct {
         if (lines.items.len > 0) http.appendFile(s.io, s.gpa, s.path, lines.items) catch {};
     }
 
+    /// THE PROVIDER DECLINED the request whose newest work was conv_buf messages `removed` (ascending indices: the round
+    /// the engine took back out of conv_buf). This turn's stored nodes captured from them are declined by a marker line
+    /// naming their id range (net.zig Graph.decline), kept for this turn's graph and appended to graph.jsonl, so every
+    /// later turn reads them the same way; every other node's conv_buf index follows the removal, so the live rounds
+    /// are found where they now are. Returns how many stored nodes it declined and their id range (`nodes` 0: none of
+    /// them was stored, and no marker is written), so the caller can withdraw their documents already imported.
+    pub const Declined = struct { nodes: usize = 0, lo: u64 = 0, hi: u64 = 0 };
+    pub fn decline(s: *Store, removed: []const usize) Declined {
+        if (removed.len == 0 or s.prefix_objs == NONE_OBJS) return .{};
+        var lo: u64 = std.math.maxInt(u64);
+        var hi: u64 = 0;
+        var n: usize = 0;
+        var it = ObjIter{ .items = s.cur.items };
+        var j: usize = 0;
+        while (it.next()) |o| : (j += 1) {
+            if (j >= s.cur_obj.items.len) break;
+            const ci = s.cur_obj.items[j];
+            if (ci == PREFIX_OBJ or ci == DROPPED_OBJ) continue;
+            if (std.mem.indexOfScalar(usize, removed, ci) != null) {
+                if (stampVal(s.cur.items[o.start..o.end], "_n")) |id| {
+                    lo = @min(lo, id);
+                    hi = @max(hi, id);
+                    n += 1;
+                }
+                s.cur_obj.items[j] = DROPPED_OBJ;
+            } else {
+                var below: usize = 0;
+                for (removed) |r| below += @intFromBool(r < ci);
+                s.cur_obj.items[j] = ci - below;
+            }
+        }
+        var below_cap: usize = 0;
+        for (removed) |r| below_cap += @intFromBool(r < s.captured_objs);
+        s.captured_objs = @max(s.captured_objs - below_cap, s.prefix_objs);
+        if (n == 0) return .{};
+        const got: Declined = .{ .nodes = n, .lo = lo, .hi = hi };
+        // their payloads are not imported into neuron-db either: the documents still pending for them are dropped (one
+        // imported at an earlier step boundary is the caller's to withdraw, by the range returned)
+        if (s.docs.items.len > 0) {
+            var kept: std.ArrayListUnmanaged(u8) = .empty;
+            var dl = std.mem.splitScalar(u8, s.docs.items, '\n');
+            while (dl.next()) |doc| {
+                if (doc.len == 0) continue;
+                if (docNode(doc)) |id| if (id >= lo and id <= hi) continue;
+                kept.appendSlice(s.gpa, doc) catch break;
+                kept.append(s.gpa, '\n') catch break;
+            }
+            s.docs.deinit(s.gpa);
+            s.docs = kept;
+        }
+        var obj: std.ArrayListUnmanaged(u8) = .empty;
+        defer obj.deinit(s.gpa);
+        obj.print(s.gpa, "{{\"role\":\"system\",\"content\":\"(engine: the provider declined the request this work was the newest part of)\",\"_k\":\"{s}\",\"_lo\":{d},\"_hi\":{d}", .{ dag.DECLINED_KIND, lo, hi }) catch return got;
+        var line: std.ArrayListUnmanaged(u8) = .empty;
+        defer line.deinit(s.gpa);
+        s.stampInto(&line, obj.items, false) catch return got;
+        s.keep(line.items, DROPPED_OBJ) catch return got;
+        line.append(s.gpa, '\n') catch return got;
+        http.appendFile(s.io, s.gpa, s.path, line.items) catch {};
+        return got;
+    }
+
     /// The queued neuron-db document lines, or null when none are pending. gpa-owned.
     pub fn takeDocs(s: *Store) ?[]u8 {
         if (s.docs.items.len == 0) return null;
@@ -282,7 +347,7 @@ pub const Store = struct {
         span.appendSliceAssumeCapacity(s.past.items);
         span.appendSliceAssumeCapacity(s.cur.items);
         var tail_from: u32 = dag.Graph.NONE;
-        for (s.cur_obj.items, 0..) |ci, j| if (ci != PREFIX_OBJ and ci >= cut.live_obj) {
+        for (s.cur_obj.items, 0..) |ci, j| if (ci != PREFIX_OBJ and ci != DROPPED_OBJ and ci >= cut.live_obj) {
             tail_from = s.past_nodes + @as(u32, @intCast(j));
             break;
         };
@@ -458,18 +523,41 @@ fn frontierCue(g: *const dag.Graph, gpa: std.mem.Allocator, out: *std.ArrayListU
 }
 
 /// One stored node, the whole line, by its id — what recall_node returns. Null when the store has no such node.
-/// gpa-owned.
+/// A node a decline marker covers comes back as its id and DECLINED_SHOWN only: recalling it whole would send the
+/// provider the very request it declined (Store.decline). gpa-owned.
 pub fn nodeLine(gpa: std.mem.Allocator, io: std.Io, conv_dir: []const u8, id: u64) ?[]u8 {
     const path = std.fmt.allocPrint(gpa, "{s}/{s}", .{ conv_dir, FILE }) catch return null;
     defer gpa.free(path);
     const raw = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 30)) catch return null;
     defer gpa.free(raw);
+    var found: ?[]const u8 = null;
+    var declined = false;
     var lines = std.mem.splitScalar(u8, raw, '\n');
     while (lines.next()) |l| {
         const line = std.mem.trim(u8, l, " \r\t");
-        if ((stampVal(line, "_n") orelse continue) == id) return gpa.dupe(u8, line) catch null;
+        if (found == null) {
+            if ((stampVal(line, "_n") orelse continue) == id) found = line;
+            continue;
+        }
+        // a marker is written after the nodes it declines
+        if (std.mem.indexOf(u8, line, "\"_k\":\"" ++ dag.DECLINED_KIND ++ "\"") == null) continue;
+        const lo = dag.jsonUint(line, "_lo") orelse continue;
+        const hi = dag.jsonUint(line, "_hi") orelse continue;
+        if (id >= lo and id <= hi) declined = true;
     }
-    return null;
+    const line = found orelse return null;
+    if (declined) return std.fmt.allocPrint(gpa, "{{\"content\":\"{s}\",\"_n\":{d}}}", .{ dag.DECLINED_SHOWN, id }) catch null;
+    return gpa.dupe(u8, line) catch null;
+}
+
+/// The node id a pending neuron-db document line belongs to: the `<id>` of its `"scope":"<scope>__n<id>"`.
+fn docNode(doc: []const u8) ?u64 {
+    const head = "{\"scope\":\"";
+    if (!std.mem.startsWith(u8, doc, head)) return null;
+    const end = std.mem.indexOfScalarPos(u8, doc, head.len, '"') orelse return null;
+    const scope = doc[head.len..end];
+    const at = std.mem.lastIndexOf(u8, scope, "__n") orelse return null;
+    return std.fmt.parseInt(u64, scope[at + 3 ..], 10) catch null;
 }
 
 /// The integer value of a stamp (`"_n":123`) in a stored line, from its LAST occurrence (the stamps close the line,
@@ -633,6 +721,87 @@ test "assemble: the prefix, one net of the earlier work with ids, then the newes
     const parsed = try std.json.parseFromSlice(std.json.Value, gpa, wrapped.items, .{});
     defer parsed.deinit();
     try tt.expectEqual(@as(usize, 2 + 1 + 4), parsed.value.array.items.len);
+}
+
+test "decline: a declined round leaves the request, stays out of later turns but as a RULED OUT line, and is not recalled whole" {
+    const gpa = tt.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = "zig-store-decline-tmp";
+    std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    std.Io.Dir.cwd().createDirPath(io, dir) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    const payload = "delta: kelpwraith91 is the declined payload";
+
+    var s = try Store.init(gpa, io, dir, "chat:c3", testGate);
+    defer s.deinit();
+    var b: std.ArrayListUnmanaged(u8) = .empty;
+    defer b.deinit(gpa);
+    try testPrefix(&b, gpa);
+    s.captureAsk("Read the alpha ledger.");
+    s.setPrefix(b.items);
+    try testRound(&b, gpa, "c1", "read_file", "ledger/alpha.md", "alpha: zebracorn42 holds 1180");
+    try testRound(&b, gpa, "c2", "read_file", "ledger/beta.md", "beta: quokkaplex holds 75");
+    try testRound(&b, gpa, "c3", "read_file", "ledger/gamma.md", "gamma: the last part");
+    const before_delta = b.items.len;
+    try testRound(&b, gpa, "c4", "read_file", "ledger/delta.md", payload);
+    s.capture(b.items); // ids: ask 1, steps 2 4 6 8, results 3 5 7 9
+    // THE ENGINE'S HALF: the round goes back out of conv_buf (messages 8 and 9), the store declines it, and the
+    // engine's note takes its place
+    b.shrinkRetainingCapacity(before_delta);
+    const dec = s.decline(&.{ 8, 9 });
+    try tt.expectEqual(@as(usize, 2), dec.nodes);
+    try tt.expect(dec.lo == 8 and dec.hi == 9);
+    {
+        // its payload is not queued for neuron-db any more; the rest still is
+        const docs = s.takeDocs().?;
+        defer gpa.free(docs);
+        try tt.expect(std.mem.indexOf(u8, docs, "kelpwraith91") == null);
+        try tt.expect(std.mem.indexOf(u8, docs, "zebracorn42") != null);
+    }
+    try b.appendSlice(gpa, ",{\"role\":\"user\",\"content\":\"(engine note)\"}");
+    s.capture(b.items);
+    try tt.expect(std.mem.indexOf(u8, s.cur.items, "\"(engine note)\",\"_t\":1,\"_n\":11}") != null); // captured once, after the marker
+    {
+        const req = try s.assemble(b.items, 16 * 1024);
+        defer gpa.free(req);
+        try tt.expect(std.mem.indexOf(u8, req, "kelpwraith91") == null);
+        try tt.expect(std.mem.endsWith(u8, req, ",{\"role\":\"user\",\"content\":\"(engine note)\"}"));
+        // the live rounds are found where they now are: beta and gamma verbatim, once each
+        try tt.expectEqual(@as(usize, 1), std.mem.count(u8, req, "quokkaplex holds 75"));
+        try tt.expectEqual(@as(usize, 1), std.mem.count(u8, req, "gamma: the last part"));
+    }
+    // persisted: the marker names the round's ids
+    const raw = try std.Io.Dir.cwd().readFileAlloc(io, dir ++ "/" ++ FILE, gpa, .limited(1 << 20));
+    defer gpa.free(raw);
+    try tt.expect(std.mem.indexOf(u8, raw, "\"_k\":\"declined\",\"_lo\":8,\"_hi\":9,\"_t\":1,\"_n\":10}") != null);
+
+    // THE NEXT TURN opens from the ask, not from the declined round: the call is a RULED OUT line without its payload
+    var r = try Store.init(gpa, io, dir, "chat:c3", testGate);
+    defer r.deinit();
+    var b2: std.ArrayListUnmanaged(u8) = .empty;
+    defer b2.deinit(gpa);
+    try b2.appendSlice(gpa, "{\"role\":\"system\",\"content\":\"you are the veil\"},{\"role\":\"user\",\"content\":\"go for it\"}");
+    r.captureAsk("go for it");
+    r.setPrefix(b2.items);
+    {
+        const req = try r.assemble(b2.items, 16 * 1024);
+        defer gpa.free(req);
+        try tt.expect(std.mem.indexOf(u8, req, "kelpwraith91") == null);
+        try tt.expect(std.mem.indexOf(u8, req, "RULED OUT") != null);
+        try tt.expect(std.mem.indexOf(u8, req, "n9 read_file -> " ++ dag.DECLINED_SHOWN) != null);
+        try tt.expect(std.mem.indexOf(u8, req, "ledger/delta.md") == null); // nor its arguments
+        try tt.expect(std.mem.indexOf(u8, req, "zebracorn42 holds 1180") != null); // what was not declined still rides
+    }
+    // recall_node gives a declined node back as its id only, and anything else whole
+    const declined_line = nodeLine(gpa, io, dir, 9).?;
+    defer gpa.free(declined_line);
+    try tt.expect(std.mem.indexOf(u8, declined_line, "kelpwraith91") == null);
+    try tt.expect(std.mem.indexOf(u8, declined_line, dag.DECLINED_SHOWN) != null);
+    const kept_line = nodeLine(gpa, io, dir, 3).?;
+    defer gpa.free(kept_line);
+    try tt.expect(std.mem.indexOf(u8, kept_line, "zebracorn42") != null);
 }
 
 test "assemble today, byte for byte, on the assemble fixture" {

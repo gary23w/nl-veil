@@ -67,6 +67,12 @@ pub const Node = struct {
     deps: std.ArrayListUnmanaged(Dep) = .empty,
     superseded: bool = false,
     dead: bool = false,
+    /// THE PROVIDER DECLINED the request this node was the newest work in (store mode: a DECLINED_KIND marker line
+    /// names its id range). A declined node is never the frontier, nothing later links to it, and a declined result
+    /// is a dead end whose payload is never shown again (DECLINED_SHOWN): a request that carries it is the request
+    /// the provider refused. Conv c6b018d92 (2026-11-24): the refused round stayed the frontier, so every later request
+    /// - the next turns' first included - opened with its results at length and was refused in turn.
+    declined: bool = false,
     /// bytes this message occupies in the span (for the budget)
     bytes: usize = 0,
     /// a read_file result's line window, read from its arguments; the whole file for every other node
@@ -189,6 +195,10 @@ pub const NET_MARK = "CONTINUATION (Gary's 4tope";
 pub const CARRY_MARK = "CONTINUATION STATE";
 /// What introduces the lines an earlier fold or carry established, when a later net carries them on.
 pub const EARLIER_HEAD = "EARLIER (established by the fold or pass before this one; failed calls first):\n";
+/// The `_k` of the store's marker line that declines a range of node ids (`_lo`..`_hi`, inclusive; store.zig decline).
+pub const DECLINED_KIND = "declined";
+/// What a declined result shows in place of its payload.
+pub const DECLINED_SHOWN = "(declined by the provider: the result is not shown again)";
 /// Edge weights for the critical chain: a result the step demonstrably read, the step that issued a result, the
 /// model's own thread, and a previous-round result nothing points at.
 const W_USED: u8 = 2;
@@ -308,6 +318,9 @@ pub const Graph = struct {
                 n.kind = .engine;
                 n.text = try excerpt(a, jsonStr(obj, "content"), EXCERPT_MAX);
                 n.round = round;
+                // the store's decline marker: it follows the nodes it names, so they are all here already
+                if (opts.store and std.mem.eql(u8, jsonStr(obj, "_k"), DECLINED_KIND))
+                    g.decline(jsonUint(obj, "_lo") orelse 0, jsonUint(obj, "_hi") orelse 0);
             }
             try g.nodes.append(gpa, n); // the graph owns n.deps from here, so the append below cannot leak them
             try raws.append(gpa, n_raw);
@@ -331,7 +344,8 @@ pub const Graph = struct {
             var j: usize = if (prev_step == NONE) 0 else prev_step + 1;
             while (j < i) : (j += 1) {
                 const r = &g.nodes.items[j];
-                if (r.kind != .result) continue;
+                // a declined result is never what a later step read: nothing pulls it nearer the frontier
+                if (r.kind != .result or r.declined) continue;
                 var used = false;
                 for (toks) |t| if (std.ascii.indexOfIgnoreCase(r.text, t) != null) {
                     used = true;
@@ -363,7 +377,8 @@ pub const Graph = struct {
         var toks_buf: [LONG_TOKENS][]const u8 = undefined;
         var lower_buf: [64]u8 = undefined;
         for (g.nodes.items, 0..) |*n, i| {
-            if (n.kind == .engine) continue;
+            // a declined node neither reads nor is read by a rare word (Node.declined)
+            if (n.kind == .engine or n.declined) continue;
             const idx: u32 = @intCast(i);
             var ntok = distinctiveTokens(n.text, &toks_buf);
             if (n.kind == .step) for (g.calls.items) |c| if (c.step == idx and ntok < toks_buf.len) {
@@ -417,6 +432,32 @@ pub const Graph = struct {
                 // past the rarity bound the list only needs to know it is common; stop growing it
                 if (v.items.len > LONG_RARE_MAX) continue;
                 try v.append(gpa, idx);
+            }
+        }
+    }
+
+    /// THE PROVIDER DECLINED the request whose newest work was the nodes stored as ids `lo`..`hi` (Node.declined): the
+    /// steps, notes and results among them are declined, a declined result is a dead end, and a declined frontier
+    /// gives way to the newest node that was not declined. Asks and other user messages keep their place: what the
+    /// user said is never set aside.
+    fn decline(g: *Graph, lo: u64, hi: u64) void {
+        if (lo == 0 or hi < lo) return;
+        for (g.nodes.items) |*n| {
+            if (n.nid < lo or n.nid > hi) continue;
+            if (n.kind != .step and n.kind != .note and n.kind != .result) continue;
+            n.declined = true;
+            if (n.kind == .result) n.dead = true;
+        }
+        if (g.frontier == NONE or !g.nodes.items[g.frontier].declined) return;
+        g.frontier = NONE;
+        var i = g.nodes.items.len;
+        while (i > 0) {
+            i -= 1;
+            const n = g.nodes.items[i];
+            if (n.declined) continue;
+            if (n.kind == .step or n.kind == .note or n.ask) {
+                g.frontier = @intCast(i);
+                return;
             }
         }
     }
@@ -662,6 +703,8 @@ pub const Graph = struct {
             const node = g.nodes.items[i];
             // the caller's verbatim tail rides whole after the note: never carried twice
             if (i >= opts.tail_from) continue;
+            // of a declined round only its calls ride, each as a RULED OUT line without its payload (shown)
+            if (node.declined and node.kind != .result) continue;
             // DIALOG (the store's net): an earlier ask, or an earlier answer, outside the recency window
             if (opts.dialog and i != g.frontier and isDialog(node) and node.turn < opts.dialog_before_turn and node.text.len > 0) {
                 const cost = node.text.len + 40;
@@ -794,7 +837,9 @@ pub const Graph = struct {
                 try out.print(gpa, "- r{d}", .{node.round});
                 if (ids and node.nid > 0) try out.print(gpa, " n{d}", .{node.nid});
                 try out.print(gpa, " {s}", .{if (node.name.len > 0) node.name else "tool"});
-                if (node.args.len > 0) try out.print(gpa, " {s}", .{node.args});
+                // a declined call's arguments are part of what was declined (the code it ran, the text it wrote): the
+                // line names the tool and no more
+                if (node.args.len > 0 and !node.declined) try out.print(gpa, " {s}", .{node.args});
                 try out.appendSlice(gpa, if (node.dead) " -> " else ": ");
                 const s = shown(node, full);
                 if (s.lead) try out.appendSlice(gpa, "...");
@@ -1080,6 +1125,7 @@ pub fn jsonUint(obj: []const u8, key: []const u8) ?u64 {
 /// A stored ask, or an answer (an assistant message that called nothing and is not a distillation): the dialog the
 /// store's net carries for turns the recency window no longer shows.
 pub fn isDialog(node: Node) bool {
+    if (node.declined) return false; // a declined answer is not carried as dialog (Node.declined)
     return (node.kind == .user and node.ask) or (node.kind == .note and node.nid > 0 and !isDistillation(node.text));
 }
 
@@ -1283,6 +1329,7 @@ fn clipLines(s: []const u8, max: usize) []const u8 {
 /// whatever `full` says, with `lead` marking text cut before it.
 const Shown = struct { text: []const u8, more: bool, lead: bool = false };
 fn shown(node: Node, full: bool) Shown {
+    if (node.declined) return .{ .text = DECLINED_SHOWN, .more = false };
     if (node.focus != NO_FOCUS and node.focus < node.text.len and node.text.len > FOCUS_BEFORE + FOCUS_AFTER) {
         const t = node.text;
         var a = node.focus -| FOCUS_BEFORE;
@@ -2162,6 +2209,39 @@ fn tStore(gpa: std.mem.Allocator) ![]u8 {
     try tStored(&s, gpa, "{\"role\":\"assistant\",\"content\":\"src holds main.zig, server.zig and worker.zig.\"", 2, 8, false);
     try tStored(&s, gpa, "{\"role\":\"user\",\"content\":\"What did zebracorn42 hold again?\"", 3, 9, true);
     return s.toOwnedSlice(gpa);
+}
+
+test "a decline marker sets a round aside: never the frontier, its result a RULED OUT line without its payload" {
+    const gpa = tt.allocator;
+    var s: std.ArrayListUnmanaged(u8) = .empty;
+    defer s.deinit(gpa);
+    try tStored(&s, gpa, "{\"role\":\"user\",\"content\":\"Read the ledgers.\"", 1, 1, true);
+    try tStored(&s, gpa, "{\"role\":\"assistant\",\"content\":\"Reading alpha.\",\"tool_calls\":[{\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"a.md\\\"}\"}}]", 1, 2, false);
+    try tStored(&s, gpa, "{\"role\":\"tool\",\"tool_call_id\":\"c1\",\"content\":\"alpha holds zebracorn42\"", 1, 3, false);
+    try tStored(&s, gpa, "{\"role\":\"assistant\",\"content\":\"Diffing the patch.\",\"tool_calls\":[{\"id\":\"c2\",\"type\":\"function\",\"function\":{\"name\":\"run_python\",\"arguments\":\"{\\\"code\\\":\\\"diff()\\\"}\"}}]", 1, 4, false);
+    try tStored(&s, gpa, "{\"role\":\"tool\",\"tool_call_id\":\"c2\",\"content\":\"kelpwraith91 is in the diff\"", 1, 5, false);
+    const unmarked = s.items.len;
+    try tStored(&s, gpa, "{\"role\":\"system\",\"content\":\"(engine: declined)\",\"_k\":\"declined\",\"_lo\":4,\"_hi\":5", 1, 6, false);
+    // without the marker the round is the frontier and its result rides at length
+    {
+        var g = try Graph.fromSpanWith(gpa, s.items[0..unmarked], .{ .store = true });
+        defer g.deinit();
+        try tt.expectEqual(@as(u64, 4), g.nodes.items[g.frontier].nid);
+        const net = try g.unfoldWith(gpa, 8000, "", .{ .dialog = true, .no_next = true, .ids = true });
+        defer gpa.free(net);
+        try tt.expect(std.mem.indexOf(u8, net, "kelpwraith91") != null);
+    }
+    var g = try Graph.fromSpanWith(gpa, s.items, .{ .store = true });
+    defer g.deinit();
+    try tt.expectEqual(@as(u64, 2), g.nodes.items[g.frontier].nid);
+    for (g.nodes.items) |n| try tt.expectEqual(n.nid == 4 or n.nid == 5, n.declined);
+    const net = try g.unfoldWith(gpa, 8000, "", .{ .dialog = true, .no_next = true, .ids = true });
+    defer gpa.free(net);
+    try tt.expect(std.mem.indexOf(u8, net, "kelpwraith91") == null);
+    // the call by name alone: its arguments were part of what was declined
+    try tt.expect(std.mem.indexOf(u8, net, "- r2 n5 run_python -> " ++ DECLINED_SHOWN) != null);
+    try tt.expect(std.mem.indexOf(u8, net, "diff()") == null);
+    try tt.expect(std.mem.indexOf(u8, net, "alpha holds zebracorn42") != null);
 }
 
 test "the store's graph: a later ask reaches an early result through a rare word, and the net carries it with its id" {

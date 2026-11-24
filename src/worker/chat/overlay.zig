@@ -237,6 +237,34 @@ pub const Overlay = struct {
         _ = self.absorb(text, .found);
     }
 
+    /// A finding the engine withdrew - the round it came from was declined by the provider (engine.zig setAsideRound):
+    /// out of the field, never offered again, and never queued for the store. Takes the note as noteFinding got it.
+    pub fn forgetFinding(self: *Overlay, text: []const u8) void {
+        const line = cleanLine(text);
+        const stored = line[0..@min(line.len, hs.MAX_FACT_LEN)];
+        const key = fnv(stored);
+        _ = self.field.forgetLine(line);
+        _ = self.tags.remove(key);
+        _ = self.shown.remove(key);
+        var i: usize = 0;
+        while (i < self.fired.items.len) {
+            if (std.mem.eql(u8, self.fired.items[i].text, stored)) {
+                self.gpa.free(self.fired.items[i].text);
+                _ = self.fired.orderedRemove(i);
+            } else i += 1;
+        }
+    }
+
+    /// The cue of a round the engine withdrew: what the model said, called and read in it, and the lines that fired
+    /// from it - the next rendering is not settled around a declined round.
+    pub fn clearRound(self: *Overlay) void {
+        for ([_]*[]u8{ &self.thought, &self.call, &self.result }) |slot| {
+            if (slot.len > 0) self.gpa.free(slot.*);
+            slot.* = &[_]u8{};
+        }
+        self.hot.clearRetainingCapacity();
+    }
+
     fn absorb(self: *Overlay, raw: []const u8, source: Source) bool {
         const line = cleanLine(raw);
         if (line.len < LINE_MIN) return false;
@@ -559,6 +587,32 @@ test "a full field keeps every finding of a round: each is recallable at the nex
     const next = o.render() orelse return error.TestUnexpectedResult;
     defer gpa.free(next);
     try std.testing.expect(std.mem.indexOf(u8, next, "[found] tool read_file inventory.csv") != null);
+}
+
+test "a withdrawn finding is never offered again, and the withdrawn round's cue goes with it" {
+    const gpa = std.testing.allocator;
+    var o = Overlay.init(gpa, 64);
+    defer o.deinit();
+    o.setGoal("write up the widget ledger audit");
+    _ = o.seedBlock("the audit names widget ledger 2.4 as the release that closed the restock path", .conv);
+    const declined = "tool run_python kelpwraith91 diff of the widget restock path: the patch leaves kelpwraith91 open";
+    o.noteFinding(declined);
+    o.noteThought("diff the widget restock path for kelpwraith91");
+    o.noteCall("run_python", "kelpwraith91 diff");
+    const before = o.render() orelse return error.TestUnexpectedResult;
+    defer gpa.free(before);
+    try std.testing.expect(std.mem.indexOf(u8, before, "kelpwraith91") != null);
+    _ = o.observeFiring("kelpwraith91 diff of the widget restock path"); // it fired: queued for the store
+    // the round is declined: the finding and the round's cue are withdrawn
+    o.forgetFinding(declined);
+    o.clearRound();
+    try std.testing.expect(!o.field.seen.contains(fnv(declined)));
+    for (o.fired.items) |f| try std.testing.expect(std.mem.indexOf(u8, f.text, "kelpwraith91") == null);
+    try std.testing.expectEqual(@as(usize, 0), o.thought.len + o.call.len + o.result.len + o.hot.items.len);
+    if (o.render()) |after| {
+        defer gpa.free(after);
+        try std.testing.expect(std.mem.indexOf(u8, after, "kelpwraith91") == null);
+    }
 }
 
 test "a source tag rides beside the line, never inside its stems, and the overlay's keys are the field's own" {

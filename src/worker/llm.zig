@@ -1661,6 +1661,13 @@ pub const Step = struct {
     // A signal for the caller: this file acts on it only to keep it out of the dataset's "stop" label and off the
     // retry budget's "the provider answered" (completeStream).
     incomplete: bool = false,
+    // The provider DECLINED this request: it answered (HTTP 200) with finish_reason "content_filter", or with a
+    // refusal and nothing else. That is a safety classifier's verdict on what the request carries, not a transport
+    // fault and not a model that had nothing to say. content, reasoning and calls are empty: what streamed before a
+    // mid-stream decline is discarded, as the provider's own guidance says. Never re-sent - the same body gets the
+    // same verdict (conv c6b018d92, 2026-11-24: every refused stream was re-sent whole as a blocking call and refused
+    // again, then re-asked twice more by the empty-reply routes). The caller changes what it sends instead.
+    refused: bool = false,
 
     pub fn deinit(self: *Step, gpa: std.mem.Allocator) void {
         gpa.free(self.content);
@@ -4392,6 +4399,8 @@ fn completeBodyH(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: [
                     id: []const u8 = "",
                     function: struct { name: []const u8 = "", arguments: []const u8 = "" },
                 } = null,
+                // a decline in words (OpenAI's chat completions)
+                refusal: ?[]const u8 = null,
             },
             finish_reason: ?[]const u8 = null,
         } = &.{},
@@ -4477,6 +4486,29 @@ fn completeBodyH(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: [
     const content = gpa.dupe(u8, msg.content orelse "") catch return stepErr(gpa, "oom");
     const reasoning = gpa.dupe(u8, msg.reasoning orelse msg.reasoning_content orelse "") catch return stepErr(gpa, "oom");
     const trunc = if (parsed.value.choices[0].finish_reason) |fr| std.mem.eql(u8, fr, "length") else false;
+    // DECLINED (Step.refused): finish_reason "content_filter", or a refusal with no answer and no call beside it. What
+    // came with it is dropped - a reply the provider withdrew is not an answer - and nothing is retried or healed.
+    const filtered = if (parsed.value.choices[0].finish_reason) |fr| std.mem.eql(u8, fr, "content_filter") else false;
+    const refusal_len: usize = if (msg.refusal) |said| said.len else 0;
+    const refusal_only = refusal_len > 0 and calls.items.len == 0 and std.mem.trim(u8, content, " \r\n\t").len == 0;
+    if (filtered or refusal_only) {
+        gpa.free(content);
+        gpa.free(reasoning);
+        for (calls.items) |c| {
+            gpa.free(c.id);
+            gpa.free(c.name);
+            gpa.free(c.args);
+        }
+        calls.deinit(gpa);
+        const c0 = gpa.dupe(u8, "") catch return stepErr(gpa, "oom");
+        const r0 = gpa.dupe(u8, "") catch {
+            gpa.free(c0);
+            return stepErr(gpa, "oom");
+        };
+        const step = Step{ .content = c0, .reasoning = r0, .calls = &.{}, .ok = true, .refused = true };
+        recordDataset(gpa, tag, model, base_url, body, &step, @intCast(@max(call_ms, 0)), ds_in, ds_out, false);
+        return step;
+    }
     // STARVED-REASONING HEAL - the third transport-level backstop, alongside healParamError and healEchoError.
     //
     // The signature is unambiguous and provider-agnostic: the call SUCCEEDED, the model produced hidden
@@ -4651,6 +4683,8 @@ const StreamState = struct {
     // The stream SAID it ended with a finish_reason on some choice (SSE). [DONE] (native: done:true) sets `done`.
     // A stream with neither that we did not stop ourselves ended early: Step.incomplete.
     finish_seen: bool = false,
+    // The provider declined the request (finish_reason "content_filter"): Step.refused.
+    refused: bool = false,
 
     fn deinit(st: *StreamState, gpa: std.mem.Allocator) void {
         st.content.deinit(gpa);
@@ -4922,6 +4956,7 @@ fn handleSseStreamLine(st: *StreamState, gpa: std.mem.Allocator, line: []const u
             if (fr.len > 0) st.finish_seen = true;
             if (std.mem.eql(u8, fr, "length")) st.truncated = true;
             if (std.mem.eql(u8, fr, "tool_calls")) st.saw_tool_calls = true;
+            if (std.mem.eql(u8, fr, "content_filter")) st.refused = true;
         }
     }
     if (parsed.value.usage) |u| {
@@ -5094,7 +5129,8 @@ pub fn completeStream(
         // A streamed reply counts: the provider's failures in a row are over. A stream that never said it ended
         // (Step.incomplete) does not: a cut transfer is not the provider answering. Nor does one that brought nothing
         // at all, which only a Stop returns (stoppedStream, or a kill before the first byte): nobody answered.
-        if (step.ok and !step.incomplete and (step.content.len > 0 or step.reasoning.len > 0 or step.calls.len > 0)) noteProviderOk(base_url, model);
+        // A decline is the provider answering too (Step.refused): it is not one of its failures.
+        if (step.ok and !step.incomplete and (step.refused or step.content.len > 0 or step.reasoning.len > 0 or step.calls.len > 0)) noteProviderOk(base_url, model);
         return step;
     }
     // THE FALLBACK IS THE SAME CALL, so the one-shot reasoning-off override the engine set for it (think_off_once: the
@@ -5505,6 +5541,23 @@ fn streamAttempt(
     // ---- decide: return a clean streamed Step, or null → complete() reparses authoritatively ----
     if (st.failed) return null; // an error line — let complete() surface the exact error
 
+    // DECLINED (Step.refused): the provider answered, and its answer is that it will not take this request. Returned
+    // as it is, never null: complete() would send the same body again for the same verdict, which is what every
+    // refused stream did (conv c6b018d92: each refused chat call billed twice its prompt). What streamed before a
+    // mid-stream decline is dropped, tool calls included - a partial the provider withdrew is not an answer.
+    if (st.refused) {
+        const c_owned = gpa.dupe(u8, "") catch return null;
+        const r_owned = gpa.dupe(u8, "") catch {
+            gpa.free(c_owned);
+            return null;
+        };
+        meterStream(&st, local, streamAttrib(io, tag, model, base_url, call_t0));
+        reported = true;
+        const step = Step{ .content = c_owned, .reasoning = r_owned, .calls = &.{}, .ok = true, .refused = true };
+        recordDataset(gpa, tag, model, base_url, body, &step, @intCast(@max(@divTrunc(std.Io.Timestamp.now(io, .real).nanoseconds - call_t0, std.time.ns_per_ms), 0)), st.p_in, st.p_out, false);
+        return step;
+    }
+
     // DID THE STREAM SAY IT ENDED? A provider ends a stream with a finish_reason and [DONE] (native: done:true).
     // Reaching curl's -w marker proves only that curl stopped: curl writes it after a --max-time cut or a dropped
     // transfer too. Measured: a reasoning-only reply cut at the 240 s --max-time, with neither, came back ok and
@@ -5604,7 +5657,7 @@ fn recordDataset(
         .reasoning = step.reasoning,
         .tool_calls = tc.items,
         // "incomplete": a stream that never said it ended (Step.incomplete) - not a "stop", whatever arrived
-        .finish_reason = if (step.truncated) "length" else if (step.incomplete) "incomplete" else if (step.calls.len > 0) "tool_calls" else "stop",
+        .finish_reason = if (step.refused) "content_filter" else if (step.truncated) "length" else if (step.incomplete) "incomplete" else if (step.calls.len > 0) "tool_calls" else "stop",
         .ok = step.ok,
         .ms = ms,
         .tokens_in = tok_in,
@@ -6510,6 +6563,79 @@ test "completeStream SSE parser: an error chunk fails the stream; finish_reason 
     defer t.deinit(gpa);
     feedStream(&t, gpa, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"read_file\"}}]},\"finish_reason\":\"tool_calls\"}]}\n");
     try std.testing.expect(t.saw_tool_calls);
+}
+
+test "completeStream parser: a content_filter finish reads as declined, an ordinary one does not" {
+    const gpa = std.testing.allocator;
+    var cap: StreamCapture = .{};
+    defer cap.deinit(gpa);
+    // the chunk Anthropic's chat-completions endpoint ended conv c6b018d92's refused calls with
+    var a = StreamState{ .native = false, .ctx = &cap, .on_delta = StreamCapture.onDelta };
+    defer a.deinit(gpa);
+    feedStream(&a, gpa, "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"content_filter\"}],\"usage\":{\"completion_tokens\":0,\"prompt_tokens\":67768}}\n");
+    try std.testing.expect(a.refused and a.finish_seen and !a.truncated and a.p_in == 67768);
+    // an ordinary end is not a decline
+    var b = StreamState{ .native = false, .ctx = &cap, .on_delta = StreamCapture.onDelta };
+    defer b.deinit(gpa);
+    feedStream(&b, gpa, "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n");
+    try std.testing.expect(!b.refused and b.finish_seen);
+}
+
+test "a declined call comes back refused and is sent ONCE: no blocking re-send, nothing it streamed kept" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const Hooks = struct {
+        fn onDelta(ctx: *anyopaque, kind: DeltaKind, text: []const u8) void {
+            _ = ctx;
+            _ = kind;
+            _ = text;
+        }
+    };
+    const root = "zig-llm-declined-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, root, .default_dir) catch {};
+    const m = "test/declined";
+    const msgs = "{\"role\":\"user\",\"content\":\"diff the patch\"}";
+
+    // STREAMED: it starts answering, then the provider withdraws it (a mid-stream decline). The blocking reply is what
+    // the old fallback would have been given; it must never be asked for.
+    {
+        const routes = [_]fakehttp.Route{.{ .method = "POST", .path = "/chat/completions", .reply = fakehttp.wire("data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n" ++
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"content_filter\"}],\"usage\":{\"prompt_tokens\":40,\"completion_tokens\":2}}\n\ndata: [DONE]\n\n"), .has = &.{"\"stream\":true"} }};
+        var srv: fakehttp.Server = undefined;
+        try srv.startRouted(io, &routes, fakehttp.wire("{\"choices\":[{\"message\":{\"content\":\"answered\"},\"finish_reason\":\"stop\"}]}"));
+        var ub: [64]u8 = undefined;
+        const base = try std.fmt.bufPrint(&ub, "http://127.1:{d}/v1", .{srv.port});
+        var ctx: u8 = 0;
+        var s = completeStream(gpa, io, root, "chat", base, "key-a", m, msgs, "", 64, -1, &ctx, Hooks.onDelta, null);
+        defer s.deinit(gpa);
+        srv.stop();
+        try std.testing.expect(s.ok and s.refused);
+        try std.testing.expectEqual(@as(usize, 0), s.content.len + s.reasoning.len + s.calls.len);
+        try std.testing.expectEqual(@as(usize, 1), srv.countCalls("POST", "/chat/completions"));
+    }
+    // BLOCKING: content_filter with words beside it, and a refusal with nothing else, are both declines; a reply that
+    // answered is not, whatever its refusal field holds.
+    const Case = struct { reply: []const u8, refused: bool, content: []const u8 };
+    const cases = [_]Case{
+        .{ .reply = "{\"choices\":[{\"message\":{\"content\":\"half an answer\"},\"finish_reason\":\"content_filter\"}]}", .refused = true, .content = "" },
+        .{ .reply = "{\"choices\":[{\"message\":{\"content\":null,\"refusal\":\"I can't help with that.\"},\"finish_reason\":\"stop\"}]}", .refused = true, .content = "" },
+        .{ .reply = "{\"choices\":[{\"message\":{\"content\":\"the answer\",\"refusal\":\"\"},\"finish_reason\":\"stop\"}]}", .refused = false, .content = "the answer" },
+    };
+    inline for (cases) |cs| {
+        var srv: fakehttp.Server = undefined;
+        try srv.startRouted(io, &[_]fakehttp.Route{}, fakehttp.wire(cs.reply));
+        var ub: [64]u8 = undefined;
+        const base = try std.fmt.bufPrint(&ub, "http://127.1:{d}/v1", .{srv.port});
+        var s = complete(gpa, io, root, "chat", base, "key-a", m, msgs, "", 64, -1);
+        defer s.deinit(gpa);
+        srv.stop();
+        try std.testing.expect(s.ok);
+        try std.testing.expectEqual(cs.refused, s.refused);
+        try std.testing.expectEqualStrings(cs.content, s.content);
+        try std.testing.expectEqual(@as(usize, 1), srv.countCalls("POST", "/chat/completions"));
+    }
 }
 
 test "completeStream native parser: streams thinking + content, reconstructs a tool call, meters on done" {

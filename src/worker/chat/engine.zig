@@ -2677,6 +2677,16 @@ const ZERO_TOOL_NUDGE = "(You reported a result, but you made NO tool call this 
 const NOW_NUDGE = "(You answered a question about the CURRENT state without running any tool this turn. What you recall may be stale: files change after they are read, and a partial view is not the whole file. Read or compute the current value with a tool now, then reply with what the tool shows.)";
 const EMPTY_NUDGE = "(Your previous response came back empty before any work was done, so nothing from it survived. Continue the request from the start: use tools to read or compute whatever it needs, then reply in the format it asked for.)";
 const CUT_NUDGE = "(Your previous reply was cut off at the output-token limit before it produced an answer, so nothing from it survived. Do not re-derive at length. If a computation is needed, make ONE tool call that prints the result; then reply with the final answer only, in the format the request asked for.)";
+/// What the engine tells the model, in place, after the provider declined a request and the round it was the newest
+/// work in was set aside (llm.Step.refused, setAsideRound): that round's call and its results are gone from every
+/// later request, and the engine follows this with "(Set aside: <the calls>.)". A user-slot message like the nudges
+/// above, so it stays where it happened - a system row is moved to the top by an endpoint that hoists system
+/// messages (Anthropic's chat-completions endpoint does) - and the store keeps it for later turns.
+const DECLINE_NOTE = "(The provider declined to continue from your last step, so that step and its results were taken out of this conversation. Do not repeat it or pursue that line again. Finish the task from what is already established, by another route.)";
+/// What a turn commits when the provider declined its request and nothing of the turn's own work was left to set
+/// aside. Engine-attributed, third person, committed as a system/engine row like NET_CEILING_NOTE, and only what the
+/// engine knows: which part of the request the provider objects to, it never says.
+const DECLINED_END_NOTE = "engine: the provider declined this turn's request (finish_reason content_filter), and it still declined with this turn's own work set aside, so the turn stopped here.";
 /// What the drive loop posts, once per turn, when the step picker names a durable-memory change and this turn has
 /// recorded none: the model is asked for the bare lines the engine applies — never handed the picker's prose as a
 /// user instruction (see the memory rule under the drive inference in runTurn).
@@ -4277,6 +4287,17 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
                     appendMsg(app, conv_dir, "assistant", shown, "veil", nowSecs(app.io));
                     emitAssistant(app, conv_dir, shown);
                     fam_turn.note(gpa, shown);
+                }
+                // DECLINED with nothing of the turn left to set aside (InnerResult.declined): say what happened, in the
+                // engine's voice, and end - neither the spend ceiling's roll nor its note, which would name the wrong cause.
+                if (inner.declined) {
+                    appendMsg(app, conv_dir, "system", DECLINED_END_NOTE, "engine", nowSecs(app.io));
+                    emitEngineNote(app, conv_dir, DECLINED_END_NOTE);
+                    salvageSteers(app, conv_dir, &steer_cursor);
+                    gpa.free(inner.content);
+                    gpa.free(inner.engine_note);
+                    finishTurn(app, conv_dir, usage_t0);
+                    return;
                 }
                 // The ENGINE's account of the stop is stored as its own `role:"system"` / `kind:"engine"` row —
                 // never merged into the assistant message above. Replay renders a system row as a system turn
@@ -7790,6 +7811,9 @@ const InnerResult = struct {
     // no agentic work in flight to continue, so the drive loop's LOOP_QUESTION "are you done?" completion is pure
     // wasted latency (it delayed {done}/usage + the turn-lock release by a full round-trip on every simple Q&A).
     tools_ran: bool = false,
+    /// A `.stopped` because the provider declined the turn's request and nothing of the turn's own work was left to
+    /// set aside (llm.Step.refused, setAsideRound): runTurn commits DECLINED_END_NOTE, never the spend ceiling's path.
+    declined: bool = false,
     /// The provider cut the settling reply at the output-token limit (finish_reason "length"). With an empty
     /// `content` that is a reply that never got to answer, not an answer of nothing - see the cut continuation.
     truncated: bool = false,
@@ -8853,6 +8877,76 @@ fn idleStep(tools_ran: bool, route: ?ReplyRoute) IdleStep {
     return if (route == .picker) .hold else .idle;
 }
 
+/// THE ROUND A DECLINE SETS ASIDE (llm.Step.refused): conv_buf's newest assistant message at or past message `floor`,
+/// and every tool result after it. What the user said (the ask, a steer, a drive message) and the engine's own system
+/// messages stay where they are. Null when no message at or past `floor` is an assistant's: the turn has no work of
+/// its own left to set aside. Message indices are counted the way the store counts them (nstore.ObjIter).
+const SetAside = struct {
+    /// conv_buf without the round, joined the way conv_buf holds messages
+    buf: []u8,
+    /// the round's message indices, ascending (Store.decline)
+    removed: []usize,
+    /// where the round began in the old buffer: everything before it is unchanged
+    start: usize,
+    /// the names of the calls the round made, comma-separated ("" for a round with no call)
+    calls: []u8,
+
+    fn deinit(s: *SetAside, gpa: std.mem.Allocator) void {
+        gpa.free(s.buf);
+        gpa.free(s.removed);
+        gpa.free(s.calls);
+    }
+};
+
+fn setAsideRound(gpa: std.mem.Allocator, items: []const u8, floor: usize) !?SetAside {
+    var asst: ?usize = null;
+    {
+        var it = nstore.ObjIter{ .items = items };
+        var k: usize = 0;
+        while (it.next()) |o| : (k += 1) {
+            if (k >= floor and std.mem.eql(u8, dag.jsonStr(items[o.start..o.end], "role"), "assistant")) asst = k;
+        }
+    }
+    const a = asst orelse return null;
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(gpa);
+    var removed: std.ArrayListUnmanaged(usize) = .empty;
+    errdefer removed.deinit(gpa);
+    var calls: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer calls.deinit(gpa);
+    var start: usize = items.len;
+    const leading_comma = !std.mem.startsWith(u8, items, "{\"role\":\"");
+    var it = nstore.ObjIter{ .items = items };
+    var k: usize = 0;
+    while (it.next()) |o| : (k += 1) {
+        const obj = items[o.start..o.end];
+        if (k == a or (k > a and std.mem.eql(u8, dag.jsonStr(obj, "role"), "tool"))) {
+            try removed.append(gpa, k);
+            if (k == a) {
+                start = if (o.start > 0) o.start - 1 else 0; // the comma before it
+                if (std.mem.indexOf(u8, obj, "\"tool_calls\":[")) |tc| {
+                    var at = tc;
+                    while (std.mem.indexOfPos(u8, obj, at, "\"name\":\"")) |ni| {
+                        const ns = ni + "\"name\":\"".len;
+                        const ne = std.mem.indexOfScalarPos(u8, obj, ns, '"') orelse break;
+                        if (calls.items.len > 0) try calls.appendSlice(gpa, ", ");
+                        try calls.appendSlice(gpa, obj[ns..ne]);
+                        at = ne;
+                    }
+                }
+            }
+            continue;
+        }
+        if (buf.items.len > 0 or leading_comma) try buf.append(gpa, ',');
+        try buf.appendSlice(gpa, obj);
+    }
+    const out_buf = try buf.toOwnedSlice(gpa);
+    errdefer gpa.free(out_buf);
+    const out_removed = try removed.toOwnedSlice(gpa);
+    errdefer gpa.free(out_removed);
+    return .{ .buf = out_buf, .removed = out_removed, .start = start, .calls = try calls.toOwnedSlice(gpa) };
+}
+
 /// THE PLAIN-TEXT RESCUE (see its block in runTurn): one tool-less re-ask over the conversation so far, for a reply
 /// that came back empty with the work's results already in context. Returns the answer after the settled path's
 /// own strips, gpa-owned and non-empty, or null when the call failed or answered nothing. Blocking, with no abort
@@ -8887,6 +8981,38 @@ fn plainTextRescue(app: *App, llm_dir: []const u8, conv_dir: []const u8, rp: Pro
         return null;
     }
     return r;
+}
+
+test "DECLINE_NOTE: a user-slot note like the nudges - written, and parenthesized" {
+    const n = std.mem.trim(u8, DECLINE_NOTE, " ");
+    try std.testing.expect(n.len > 0);
+    try std.testing.expect(n[0] == '(' and n[n.len - 1] == ')');
+}
+
+test "setAsideRound: a decline takes the turn's newest round and its results, keeps what the user said, and walks back" {
+    const t = std.testing;
+    const gpa = t.allocator;
+    const sys = "{\"role\":\"system\",\"content\":\"you are the veil\"}";
+    const ask = ",{\"role\":\"user\",\"content\":\"Research it.\"}";
+    const r1 = ",{\"role\":\"assistant\",\"content\":\"Reading.\",\"tool_calls\":[{\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"read_url\",\"arguments\":\"{}\"}}]},{\"role\":\"tool\",\"tool_call_id\":\"c1\",\"content\":\"page\"}";
+    const r2 = ",{\"role\":\"assistant\",\"content\":\"Diffing.\",\"tool_calls\":[{\"id\":\"c2\",\"type\":\"function\",\"function\":{\"name\":\"run_python\",\"arguments\":\"{\\\"code\\\":\\\"x\\\"}\"}},{\"id\":\"c3\",\"type\":\"function\",\"function\":{\"name\":\"read_url\",\"arguments\":\"{}\"}}]}" ++
+        ",{\"role\":\"tool\",\"tool_call_id\":\"c2\",\"content\":\"diff\"},{\"role\":\"tool\",\"tool_call_id\":\"c3\",\"content\":\"page2\"}";
+    const steer = ",{\"role\":\"user\",\"content\":\"also check X\"}";
+    // messages: system 0, ask 1 (the prefix: floor 2), round one 2-3, round two 4-6, the steer 7
+    var sa = (try setAsideRound(gpa, sys ++ ask ++ r1 ++ r2 ++ steer, 2)).?;
+    defer sa.deinit(gpa);
+    try t.expectEqualSlices(usize, &.{ 4, 5, 6 }, sa.removed);
+    try t.expectEqualStrings("run_python, read_url", sa.calls);
+    try t.expectEqualStrings(sys ++ ask ++ r1 ++ steer, sa.buf);
+    try t.expectEqual((sys ++ ask ++ r1).len, sa.start);
+    // a decline right after it takes the round before
+    var sb = (try setAsideRound(gpa, sa.buf, 2)).?;
+    defer sb.deinit(gpa);
+    try t.expectEqualSlices(usize, &.{ 2, 3 }, sb.removed);
+    try t.expectEqualStrings("read_url", sb.calls);
+    try t.expectEqualStrings(sys ++ ask ++ steer, sb.buf);
+    // and then nothing of the turn's own work is left: the prefix is never set aside
+    try t.expect((try setAsideRound(gpa, sb.buf, 2)) == null);
 }
 
 test "reasoningOnly: a reply cut while still thinking is told apart from an empty answer and a malformed one" {
@@ -13753,6 +13879,20 @@ fn runInnerAgentic(
     // stop still means the warnings were ignored across LOOP_STOP_REFUSALS consecutive inferences —
     // a model making real progress never sees it.
     var loop_refusals: u32 = 0;
+    // Each round of THIS pass, newest last: where its findings begin in tool_obs, and copies of the findings its step
+    // boundary banked into memory (MEMORY AS THE CHAT RUNS, below). A decline sets aside the turn's newest round
+    // (setAsideRound) and withdraws its findings with it - out of the overlay's field and out of memory, banked or not
+    // - popped in the same order the rounds are set aside. Smoke-tested 2026-11-24: without the withdrawal the
+    // declined call came straight back in the next request's RECALL OVERLAY as a [found] line, and was declined again.
+    const Round = struct { mark: usize, banked: std.ArrayListUnmanaged([]u8) = .empty };
+    var rounds: std.ArrayListUnmanaged(Round) = .empty;
+    defer {
+        for (rounds.items) |*r| {
+            for (r.banked.items) |n| gpa.free(n);
+            r.banked.deinit(gpa);
+        }
+        rounds.deinit(gpa);
+    }
 
     // Everything already in conv_buf when this pass begins (system + bounded history + prior drive steps). This
     // pass's tool-call/result growth is measured against it so within-turn compaction can bound just the growth.
@@ -13945,6 +14085,68 @@ fn runInnerAgentic(
             return .{ .outcome = .stopped, .content = gpa.dupe(u8, partial) catch empty };
         }
 
+        // DECLINED (llm.Step.refused): the provider answered that it will not take this request. Not an empty reply, and
+        // not a failure to retry - the same request gets the same verdict, and in conv c6b018d92 (2026-11-24) the stream,
+        // its blocking re-send, the empty-reply re-ask and the plain-text rescue were all declined, five turns running,
+        // each ending "(no reply)". What changes the verdict is what the request carries: the round it was the newest
+        // work in is SET ASIDE - taken out of conv_buf, declined in the store so no later request unfolds it again - and
+        // the turn goes on toward its goal with the engine's note in its place. A decline right after a decline sets
+        // aside the round before that one; once nothing of the turn's own work is left, the request itself is what is
+        // declined, and the turn ends saying so (InnerResult.declined). Bounded by the turn's rounds and MAX_ITERS.
+        if (step.refused) {
+            const floor: usize = if (store) |s| @min(s.prefix_objs, nstore.countObjects(conv_buf.items)) else nstore.countObjects(conv_buf.items[0..@min(base_len, conv_buf.items.len)]);
+            var sa = (setAsideRound(gpa, conv_buf.items, floor) catch null) orelse {
+                emitKV(app, conv_dir, "status", "text", "the provider declined this turn's request (content_filter), and nothing of the turn's own work is left to set aside - stopping");
+                return .{ .outcome = .stopped, .content = gpa.dupe(u8, last_content) catch empty, .tools_ran = any_tool, .declined = true };
+            };
+            defer sa.deinit(gpa);
+            conv_buf.deinit(gpa);
+            conv_buf.* = .fromOwnedSlice(sa.buf);
+            sa.buf = &.{};
+            if (sa.start < base_len) base_len = sa.start;
+            const dec: nstore.Store.Declined = if (store) |s| s.decline(sa.removed) else .{};
+            // the round's findings: out of the overlay's field, and out of memory whether its step boundary banked them
+            // already or not. A round set aside from an earlier drive pass has no record here; what that pass banked
+            // stays in memory.
+            if (rounds.pop()) |r0| {
+                var r = r0;
+                defer {
+                    for (r.banked.items) |n| gpa.free(n);
+                    r.banked.deinit(gpa);
+                }
+                if (r.mark <= tool_obs.items.len) {
+                    for (tool_obs.items[r.mark..]) |note| {
+                        if (overlay) |o| o.forgetFinding(note);
+                        gpa.free(note);
+                    }
+                    tool_obs.shrinkRetainingCapacity(r.mark);
+                }
+                for (r.banked.items) |note| {
+                    if (overlay) |o| o.forgetFinding(note);
+                    ctx.mem.forgetFact(ctx.scope, note);
+                }
+            }
+            // and its results' documents, imported at that step boundary (Store.decline drops the ones still pending)
+            if (store) |s| if (dec.nodes > 0) {
+                var id = dec.lo;
+                while (id <= dec.hi) : (id += 1) {
+                    var sb: [320]u8 = undefined;
+                    ctx.mem.forgetNodeDocs(std.fmt.bufPrint(&sb, "{s}__n{d}", .{ s.scope, id }) catch continue);
+                }
+            };
+            if (overlay) |o| o.clearRound();
+            // the reasoning saved for the newest tool-call turn belonged to the round just set aside
+            if (asst_reasoning.len > 0) gpa.free(asst_reasoning);
+            asst_reasoning = empty;
+            const what: []const u8 = if (sa.calls.len > 0) sa.calls else "your last reply";
+            if (std.fmt.allocPrint(gpa, "{s} (Set aside: {s}.)", .{ DECLINE_NOTE, what })) |note| {
+                defer gpa.free(note);
+                appendMsgObj(gpa, conv_buf, "user", note, note.len);
+            } else |_| appendMsgObj(gpa, conv_buf, "user", DECLINE_NOTE, DECLINE_NOTE.len);
+            var db: [240]u8 = undefined;
+            emitKV(app, conv_dir, "status", "text", std.fmt.bufPrint(&db, "the provider declined the request (content_filter): set aside the last step ({s}) and continuing without it", .{clipBytes(what, 120)}) catch "the provider declined the request (content_filter): set aside the last step and continuing without it");
+            continue;
+        }
         if (!step.ok) {
             // THINKING-MODE HEAL: this request was rejected because an assistant turn somewhere in it
             // omitted reasoning_content — the newest tool-call turn, an older one, or a PLAIN turn in the
@@ -14045,6 +14247,7 @@ fn runInnerAgentic(
             return .{ .outcome = .settled, .content = gpa.dupe(u8, step.content) catch empty, .tools_ran = any_tool, .truncated = step.truncated, .reasoning_only = reasoningOnly(step.content, step.reasoning) };
 
         any_tool = true; // this iteration is running tools — the turn did agentic work, so the drive loop may continue
+        rounds.append(gpa, .{ .mark = tool_obs.items.len }) catch {}; // this round's findings begin here (a decline withdraws them)
 
         // remember the last narrated content in case we run out of iterations mid-tool-loop
         if (step.content.len > 0) {
@@ -14641,6 +14844,15 @@ fn runInnerAgentic(
         // for a fold or the turn's exit; a launch costs ~300 ms, paid once per step with results, against
         // inferences that take seconds.
         if (tool_obs.items.len > 0) {
+            // a copy for the decline path: a round the next request is declined for withdraws what it banked here
+            if (rounds.items.len > 0) {
+                const top = &rounds.items[rounds.items.len - 1];
+                for (tool_obs.items) |note| {
+                    const d = gpa.dupe(u8, note) catch continue;
+                    top.banked.append(gpa, d) catch gpa.free(d);
+                }
+                top.mark = 0;
+            }
             memBank(app, ctx, ctx.scope, tool_obs.items);
             for (tool_obs.items) |note| gpa.free(note);
             tool_obs.clearRetainingCapacity();

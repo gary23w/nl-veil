@@ -774,6 +774,23 @@ pub const Mem = struct {
         if (self.write(&.{ "forget", scope, match })) |o| self.gpa.free(o);
     }
 
+    /// Withdraw a fact stored by `observe` / `observeBatch`: the normalization they apply (cleanFactInto), then
+    /// forget by that text. The chat engine's decline path: a round the provider declined is not recalled into a
+    /// later request.
+    pub fn forgetFact(self: Mem, scope: []const u8, fact: []const u8) void {
+        var nb: [1600]u8 = undefined;
+        const clean = cleanFactInto(&nb, fact) orelse return;
+        self.forgetMatch(scope, clean);
+    }
+
+    /// Withdraw EVERY fact of one stored node's document scope (`<scope>__n<id>`, chat/store.zig queueDoc). The CLI's
+    /// `forget <scope> ""` empties the whole scope (measured on neuron.exe, 2026-11-24), so any other scope is refused
+    /// (isNodeDocScope).
+    pub fn forgetNodeDocs(self: Mem, scope: []const u8) void {
+        if (!isNodeDocScope(scope)) return;
+        if (self.write(&.{ "forget", scope, "" })) |o| self.gpa.free(o);
+    }
+
     /// Single best fact (RecallOne) as a text block. Caller frees. Empty when recall abstains (no match).
     pub fn recall(self: Mem, scope: []const u8, query: []const u8) []u8 {
         const out = self.run(&.{ "recall", scope, query }) orelse return self.gpa.dupe(u8, "") catch @constCast("");
@@ -1082,6 +1099,23 @@ fn jsonUint64(out: []const u8, key: []const u8) u64 {
 /// into fine sentence-facts); raw newlines are NOT — they shred one note into a junk row per line. Returns
 /// null when nothing worth storing survives: under 12 alphanumeric characters is line noise (navigation
 /// crumbs, lone braces), not knowledge.
+/// A stored node's document scope, `<base>__n<digits>` with a non-empty base: the only kind Mem.forgetNodeDocs empties.
+pub fn isNodeDocScope(scope: []const u8) bool {
+    const at = std.mem.lastIndexOf(u8, scope, "__n") orelse return false;
+    if (at == 0 or at + 3 == scope.len) return false;
+    for (scope[at + 3 ..]) |c| if (!std.ascii.isDigit(c)) return false;
+    return true;
+}
+
+test "isNodeDocScope: only a stored node's document scope, never the conversation's own" {
+    try std.testing.expect(isNodeDocScope("chat:c6b018d92__n1211"));
+    try std.testing.expect(!isNodeDocScope("chat:c6b018d92"));
+    try std.testing.expect(!isNodeDocScope("chat:c6b018d92__n"));
+    try std.testing.expect(!isNodeDocScope("chat:c6b018d92__n12x"));
+    try std.testing.expect(!isNodeDocScope("__n12"));
+    try std.testing.expect(!isNodeDocScope(""));
+}
+
 pub fn cleanFactInto(buf: []u8, fact: []const u8) ?[]const u8 {
     var w: usize = 0;
     var alnum: usize = 0;

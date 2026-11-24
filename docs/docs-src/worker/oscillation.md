@@ -14,7 +14,7 @@ One seam for all memory traffic: every neuron-db operation the worker (and chat 
 
 - `Mem` — the gateway struct (`init(gpa, io, bin, db)`, optional write mutex + environ + trust flag + `stats` + `bound_ms` + `k_pin`/`hops_pin`), with:
   - `initChat(gpa, io, bin, db, environ)` — the one way every chat surface builds its Mem: the process environ (so the k/hops each recall asks for reach the CLI), trust-weighted ranking, the per-path write lock (`writeLockFor`), `CHAT_BOUND_MS` on every spawn, and the `NL_MEM_K` / `NL_MEM_HOPS` overrides (`10` and `0` reproduce the breadth every chat read ran at before).
-  - writes: `observe` (single fact, normalized), `observeBatch` (many facts via one temp-pack `import` instead of a spawn per fact), `replace`, `forgetMatch` (drops only the facts containing a match; an empty match is refused), `reinforce`, `strengthen` (strength bump for facts containing a match, never mints — see below), `stance`, `mood`, `persona`.
+  - writes: `observe` (single fact, normalized), `observeBatch` (many facts via one temp-pack `import` instead of a spawn per fact), `replace`, `forgetMatch` (drops only the facts containing a match; an empty match is refused), `forgetFact` (withdraws a fact `observe`/`observeBatch` stored: the same `cleanFactInto` normalization, then `forgetMatch`), `forgetNodeDocs` (empties one stored node's document scope `<scope>__n<id>` with the CLI's empty-match forget, which empties a whole scope; `isNodeDocScope` refuses any other scope; both used when the chat engine withdraws a round the provider declined), `reinforce`, `strengthen` (strength bump for facts containing a match, never mints — see below), `stance`, `mood`, `persona`.
   - reads: `recall` (single best fact), `recallScored` (top-k scored hits as raw JSON; empty on any failure, including an older binary without the verb), `coverage` (lexical presence gate from `recall --json`), `assoc` (spreading-activation neighborhood), `assocAcross` (fans over `<scope>__*` document sub-scopes), `chain`, `readPage` (insertion-order paging), `list` (full small-scope export), `scopeIds`, `factCount`, `affect`.
   - bulk: `import` / `importStats` (`ImportStats` carries the CLI's `evicted` count).
   - trust: `trustReward` (engine-driven only), `classTrust` (neutral 1.0 fail-safe), `trustDump`, `sampleClassesAlloc` (honest un-trusted class sample).
@@ -22,6 +22,7 @@ One seam for all memory traffic: every neuron-db operation the worker (and chat 
   - constants: `SATURATE_HOPS = 1024` (spread until the activation wave settles — bounded by convergence, not the counter), `MAX_FACTS = 20_000` (per-scope ceiling passed on every invocation).
 - `writeLockFor(io, db)` — the process-wide mutex for one db path (Windows `\` read as `/`, case folded); every chat turn of a user writes one hive, so their writes queue on it.
 - `cleanFactInto(buf, fact)` — fact normalization for the line-oriented store (unit-tested).
+- `isNodeDocScope(scope)` — whether a scope is a stored node's document scope (`<base>__n<digits>`), the only kind `forgetNodeDocs` empties (unit-tested).
 - `preambleText(buf)` / `baseText(buf)` / `drift()` — decode the generated tables; `drift()` feeds the actual on-disk db filename `Mem.run` targets.
 
 ## Dependencies

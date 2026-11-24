@@ -26,6 +26,10 @@ conv_buf is never addressed by byte offset here. A reasoning-echo heal rewrites 
 
 `assemble(items, budget)` builds one request: the turn's assembled prefix, then ONE system message (`NET_HEAD`) holding the net unfolded from where the work stands over the whole store (past turns plus this one, read as one DAG by `net.Graph.fromSpanWith(.store)`, with long-range links on rare words), then the newest `KEEP_ROUNDS` rounds verbatim. Net lines carry `n<id>`; the `recall_node` tool returns a node whole by that id (`nodeLine`). The engine budgets the net at a third of the working span budget. With the flag on, the turn runs no fold, no carry, no roll and no rolling summary; the spend ceiling stays as a runaway backstop.
 
+## Declined rounds
+
+When the provider declines a request (`finish_reason` `content_filter`, `llm.Step.refused`), the engine takes the round that request was the newest work in back out of conv_buf and calls `decline(removed)` with the removed message indices. Their stored nodes get a marker line (`"_k":"declined"`, `"_lo"`/`"_hi"` naming the id range) in `graph.jsonl`, so this turn and every later one read them the same way through the [net](#doc=worker/chat/net): never the frontier, each result a RULED OUT line with the tool's name and no payload or arguments. Their pending neuron-db documents are dropped (documents already imported are the engine's to withdraw, by the id range `decline` returns), `nodeLine` returns a declined node as its id and that one line, and every other node's message index follows the removal (`DROPPED_OBJ` marks a node with no message left).
+
 ## Measured (2026-10-16, stub model)
 
 One scripted conversation (six facts planted mid-file in tool output, 12 filler turns, 5 probes): the v1.1.22 fold-and-carry path recalled 0 of 5, the store 5 of 5, at 14% more request bytes on average. Graph build is linear in the stored conversation (63 ms at 250 rounds, 620 ms at 2,000 rounds and 8 MB); the unfold itself takes 2-38 ms. Not yet measured on a real hosted model, against prompt caching, or over one very long turn.
@@ -34,5 +38,5 @@ One scripted conversation (six facts planted mid-file in tool output, 12 filler 
 
 - `FILE`, `NET_HEAD`, `KEEP_ROUNDS`, `DOC_MAX`, `DOC_LINE_MAX`, `DOC_LINES_MAX`
 - `Gate`, `GateFn`, `Obj`, `ObjIter`, `countObjects`
-- `Store`: `init`, `deinit`, `setPrefix`, `resync`, `captureAsk`, `capture`, `takeDocs`, `assemble`, `cuts`, and the counters `refused`, `refused_told`, `torn`, `last_nodes`, `last_net_bytes`
-- `nodeLine(gpa, io, conv_dir, id)`: one stored node by id, for `recall_node`
+- `Store`: `init`, `deinit`, `setPrefix`, `resync`, `captureAsk`, `capture`, `decline`, `takeDocs`, `assemble`, `cuts`, `PREFIX_OBJ`, `DROPPED_OBJ`, and the counters `refused`, `refused_told`, `torn`, `last_nodes`, `last_net_bytes`
+- `nodeLine(gpa, io, conv_dir, id)`: one stored node by id, for `recall_node` (a declined node: its id and `net.DECLINED_SHOWN` only)
