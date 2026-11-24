@@ -78,7 +78,7 @@ Two consequences worth copying:
 
 ## Cost: count it, never time it
 
-A wall-clock budget on a dev box measures Defender, OneDrive and whatever else is running. It
+A wall-clock budget on a dev box measures antivirus scans, file sync and whatever else is running. It
 flakes, it gets muted, and the muting becomes the habit — worse than no gate at all. Assert a
 **count** instead: process spawns, allocations, round trips. Those are deterministic, identical on
 every machine, and can be pinned EXACTLY rather than with a slack factor that hides drift.

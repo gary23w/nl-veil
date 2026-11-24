@@ -30,7 +30,7 @@ Get-CimInstance Win32_Process -Filter "Name='veil.exe'" -ErrorAction SilentlyCon
 } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 Start-Sleep -Seconds 2
 
-# Dedicated cache. The repo lives under OneDrive and a repo-local .zig-cache goes stale against it —
+# Dedicated cache. A repo inside a cloud-synced folder makes a repo-local .zig-cache go stale —
 # builds "succeed" while installing yesterday's exe. If a build ever looks ignored again: delete this
 # directory and rebuild.
 $cache = "C:\zig-nlveil"

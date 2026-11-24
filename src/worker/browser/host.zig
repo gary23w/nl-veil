@@ -211,7 +211,7 @@ test "discovery file: a real round trip, and every malformed shape reads as abse
 }
 
 test "discoveryPath prefers local temp, and falls back rather than failing" {
-    // It must NOT land under the repo/OneDrive (the header's reason: OneDrive locks and delays it).
+    // It must NOT land under the repo or a synced folder (the header's reason: sync locks and delays it).
     const gpa = std.testing.allocator;
     var env = std.process.Environ.Map.init(gpa);
     defer env.deinit();

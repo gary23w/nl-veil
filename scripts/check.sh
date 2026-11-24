@@ -16,8 +16,8 @@ set -u
 repo="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo"
 
-# Windows (Git Bash): the pinned toolchain + the off-OneDrive cache. Elsewhere: zig from PATH,
-# default cache (no OneDrive staleness problem to dodge).
+# Windows (Git Bash): the pinned toolchain + the cache outside the repo. Elsewhere: zig from PATH,
+# default cache (no synced-folder staleness to dodge).
 case "$(uname -s)" in
   MINGW*|MSYS*)
     ZIG="${ZIG:-$USERPROFILE/zig-0.16.0/zig-x86_64-windows-0.16.0/zig.exe}"

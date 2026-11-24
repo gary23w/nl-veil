@@ -2,7 +2,7 @@
 #
 # A worker's definition of done: this script exits 0. It never touches the running app and never
 # installs over zig-out\ (a live veil.exe can hold that path open) -- artifacts go to a throwaway
-# prefix under the off-OneDrive cache. dev.ps1 is the only script that stops/starts the app.
+# prefix under the cache outside the repo. dev.ps1 is the only script that stops/starts the app.
 #
 # NOTE: keep this file pure ASCII. PowerShell 5.1 reads BOM-less scripts as ANSI and non-ASCII
 # characters corrupt the parse.
@@ -18,7 +18,7 @@ param(
 
 $repo  = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 $zig   = "$env:USERPROFILE\zig-0.16.0\zig-x86_64-windows-0.16.0\zig.exe"
-# Dedicated cache OUTSIDE OneDrive -- a repo-local .zig-cache goes stale against OneDrive and
+# Dedicated cache OUTSIDE the repo -- a repo-local .zig-cache in a cloud-synced folder goes stale and
 # "successful" builds install yesterday's exe. Same cache dev.ps1 uses.
 $cache  = "C:\zig-nlveil"
 $prefix = Join-Path $cache "check-out"
@@ -127,7 +127,7 @@ if ($Scan) {
 
     # 0) in-flight work: dirty tracked files touched in the last 20 min are probably someone ELSE's
     #    mid-feature edits (the owner may share this tree with you). Their reds are not yours --
-    #    report, don't fix (see CLAUDE.md hard rules).
+    #    report, don't fix.
     $hot = @()
     foreach ($d in @(git -C $repo diff --name-only HEAD 2>$null)) {
         $p = Join-Path $repo ($d -replace '/', '\')
@@ -650,7 +650,7 @@ function Invoke-XTests([string]$label) {
 $ok = (Confirm-Gate (Invoke-XTests "tests cross-compile (linux)")) -and $ok
 # The note here used to say the desk suite's net test "needs a live server on :8787" and to "treat
 # the earlier tests as the verdict" -- citing an item ledger 0006 had already CLOSED. 0062 corrected
-# that in CLAUDE.md and MISSED this copy, which is the worse of the two: it prints at the exact
+# that in the working notes and MISSED this copy, which is the worse of the two: it prints at the exact
 # moment the desk gate is red, when someone is deciding whether a hang is expected. It is not.
 $ok = (Confirm-Gate (Invoke-ZigTests "desk suite" (Join-Path $repo "desk") 300 "The desk suite is HERMETIC (ledger 0006): netcli early-returns without ../data/.desktop_key and every call is timeout-bounded, so a hang here is a REAL failure, not the known one. If a server happens to be running, that test casts a 1-minute mock swarm at it.")) -and $ok
 if ($Full) {

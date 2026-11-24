@@ -628,7 +628,7 @@ pub const Poller = struct {
     /// Append any new log lines to <data>/veil-desk.log — APPEND-ONLY (positioned write at end, the
     /// http.appendFile idiom). The old shape rewrote the ENTIRE accumulated buffer (up to 512KB) on every
     /// tick that produced a line; with trace defaulting on, that was a ~0.5MB disk write EVERY SECOND into
-    /// the OneDrive-synced data dir — the desk, OneDrive, and Defender all burned CPU on it around the
+    /// a cloud-synced data dir — the desk, the sync client, and Defender all burned CPU on it around the
     /// clock. Now a flush writes only the NEW lines (typically <1KB), and a 1MB ceiling rotates the file
     /// by rewriting it with just those fresh lines (old diagnostics age out; the F12 overlay still has the
     /// in-memory ring).

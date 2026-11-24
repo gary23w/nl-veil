@@ -2694,7 +2694,7 @@ const StandIn = struct {
         \\
         \\[vars]
         \\LLMS_URL  = "https://raw.githubusercontent.com/gary23w/garrettstimpson.ca/refs/heads/main/llms.txt"
-        \\SITE_NAME = "Garrett Stimpson Security Research"
+        \\SITE_NAME = "Security Research"
         \\CTF_SAFE_MODE = "true"
         \\CTF_REQUIRE_CONFIRM = "true"
         \\AGENT_ALLOW_ACTIVE_TOOLS = "false"

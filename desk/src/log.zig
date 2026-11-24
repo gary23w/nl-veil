@@ -39,7 +39,7 @@ var g_held = std.atomic.Value(bool).init(false);
 
 /// Function-entry tracing toggle (see `trace`). Defaults OFF: default-on tracing put ≥1 line in the ring
 /// EVERY second forever (poller tick + netcli lines), which kept the log flusher writing to the
-/// (OneDrive-synced) data dir every second — measurable idle CPU in the desk, OneDrive, AND Defender.
+/// (cloud-synced) data dir every second — measurable idle CPU in the desk, the sync client, AND Defender.
 /// Flip on for a diagnosis session via the SIM hook ("trace on") or log.setTraceEnabled(true). Atomic:
 /// the poller thread and UI thread both call `trace`.
 var g_trace_on = std.atomic.Value(bool).init(false);
@@ -84,7 +84,7 @@ pub fn warn(comptime fmt: []const u8, args: anytype) void {
     emit(.warn, fmt, args);
 }
 /// Diagnostic chatter (per-request http lines etc.) — gated with `trace`: ungated, these landed a line in
-/// the ring every few seconds forever, which kept the log flusher writing to the (OneDrive-synced) data
+/// the ring every few seconds forever, which kept the log flusher writing to the (cloud-synced) data
 /// dir around the clock — the surviving half of the idle-churn problem after trace itself went quiet.
 pub fn dbg(comptime fmt: []const u8, args: anytype) void {
     if (!g_trace_on.load(.monotonic)) return;
@@ -242,7 +242,7 @@ test "a line longer than the ring's line buffer is truncated to it, and its neig
 test "silencing the trace firehose never silences an error" {
     const was = traceEnabled();
     defer setTraceEnabled(was);
-    // trace/dbg default OFF because default-on tracing kept the flusher writing to the OneDrive-synced data
+    // trace/dbg default OFF because default-on tracing kept the flusher writing to the cloud-synced data
     // dir every second. That fix must never have cost the log its errors.
     setTraceEnabled(false);
     testDrainPending();

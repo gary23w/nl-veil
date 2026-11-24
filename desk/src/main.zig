@@ -4678,7 +4678,7 @@ fn drawThinkingMark(x: f32, y: f32) f32 {
     return 26;
 }
 
-/// A rotating set of playful gerunds (in the spirit of the Claude Code CLI) shown while the veil works, so
+/// A rotating set of playful gerunds shown while the veil works, so
 /// the wait reads as a lively, transforming process rather than a frozen spinner. Cycles on a slow clock,
 /// independent of stream energy so the word is legible.
 const think_words = [_][:0]const u8{

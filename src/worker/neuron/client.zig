@@ -9,7 +9,7 @@ const keyed = @import("keyed.zig");
 /// COST PROBE — bumped only in test builds. Every neuron-db call in the app funnels through `exec`,
 /// so this counts PROCESS SPAWNS, which is what this file's startup-cost claims are actually about.
 ///
-/// COUNTED, NOT TIMED, deliberately. A wall-clock budget on a dev box measures Defender, OneDrive
+/// COUNTED, NOT TIMED, deliberately. A wall-clock budget on a dev box measures antivirus scans, file sync
 /// and whatever else is running; it flakes, and a gate that cries wolf gets muted — worse than no
 /// gate, because now the muting is a habit. A spawn count is deterministic and identical on every
 /// machine, so it can be asserted EXACTLY. See harness/TESTING.md.

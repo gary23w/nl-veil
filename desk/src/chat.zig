@@ -5802,7 +5802,7 @@ pub const Chat = struct {
     /// a cached index of the oldest of them — the EVICTION FLOOR.
     ///
     /// WHY THE FLOOR IS CACHED, AND WHY NO TITLE IS READ HERE: refreshConvs runs on the chat worker every ~5s —
-    /// the same thread that pumps the live stream — over a directory under OneDrive, where stat and small reads
+    /// the same thread that pumps the live stream — over a cloud-synced directory, where stat and small reads
     /// are both slow, and the scan is unbounded in the number of stored conversations. So per-entry cost is the
     /// whole game. One stat decides whether an entry can reach the sidebar at all; `admits` then rejects it in
     /// O(1) against the floor, and only an entry that actually displaces something pays the O(CONV_STAGE)
@@ -5870,7 +5870,7 @@ pub const Chat = struct {
     }
 
     /// Fill `row.title` from the head of its conv file — the EXPENSIVE half of a refresh, and the reason
-    /// selection happens on stat alone: this is a 4KB read per conversation on a OneDrive-backed tree, on the
+    /// selection happens on stat alone: this is a 4KB read per conversation on a cloud-synced tree, on the
     /// worker thread that also pumps the live stream. Called only for rows that survived selection AND made the
     /// sidebar's cap, so a refresh does at most MAX_CONVS of them however many chats are stored.
     ///
@@ -9867,7 +9867,7 @@ fn parseRememberBody(body_in: []const u8) RememberSpec {
 
 /// Should we run the self-check (reflect) pass for this completed turn? Only a SUBSTANTIVE answer to a
 /// SUBSTANTIVE request qualifies — a greeting or a one-liner must NOT recurse ("hello" -> short reply -> no
-/// second pass). This mirrors how Claude Code iterates on real TASKS, not on chit-chat. Control lines
+/// second pass). This mirrors how an agentic coding loop iterates on real TASKS, not on chit-chat. Control lines
 /// (TOOL:/CAST:) and the non-answer turns (collect/reflect/idle) never reflect.
 fn shouldReflectPass(kind: Turn, user_msg: []const u8, full: []const u8) bool {
     if (kind != .user and kind != .tool_follow) return false;

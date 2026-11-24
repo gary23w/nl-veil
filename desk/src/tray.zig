@@ -567,9 +567,9 @@ const WindowsTray = struct {
     ///    under HKCU\Control Panel\NotifyIconSettings\<decimal id>: one subkey per exe path, holding
     ///    ExecutablePath (REG_SZ: the exe's path, literal or in the {KNOWNFOLDERID}\rest spelling
     ///    execPathIsOurs describes) and InitialTooltip (REG_SZ "veil-desk"); the Settings page "Other system
-    ///    tray icons" toggles write IsPromoted (REG_DWORD 1/0) there. Measured on this machine (Windows 11 Home
-    ///    10.0.26300, 2026-10-21): 39 such subkeys, 15 of them veil.exe / veil-desk.exe paths run here,
-    ///    IsPromoted ABSENT on every veil one (present on exactly one subkey in all, OneDrive.exe, value 1).
+    ///    tray icons" toggles write IsPromoted (REG_DWORD 1/0) there. Measured on a Windows 11 development machine
+    ///    (2026-10-21): 39 such subkeys, 15 of them veil.exe / veil-desk.exe paths run here,
+    ///    IsPromoted ABSENT on every veil one (present on exactly one subkey in all, another app's, value 1).
     ///    The shell creates the subkey itself after the app's first NIM_ADD, so the probe retries
     ///    (~20 x 500 ms) until the subkey for this exe exists; promoteIcon says what it does there. An
     ///    IsPromoted that already exists (0 or 1) is the user's choice and is never touched.
