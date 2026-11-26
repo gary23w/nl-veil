@@ -2,6 +2,8 @@
 
 # the veil
 
+__Agent Harness boiler plate__
+
 **An AI coding team that remembers your project.**
 
 the Veil (nl-veil) is an open-source desktop app for building software with AI. Give it a task,
